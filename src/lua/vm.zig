@@ -1764,6 +1764,15 @@ const DebugHookState = struct {
     /// PUC C hooks may yield; ordinary Lua hooks may not. testC installs its
     /// emulated C hook through a private marker after debug.sethook.
     allow_yield: bool = false,
+    /// PUC `L->hook` (lstate.c): C hook function installed by `lua_sethook`.
+    /// When non-null, the VM calls this function at hook events instead of
+    /// the Lua-level `func`. PUC has a single hook slot per thread: setting
+    /// a C hook clears `func` (and vice versa). The mask/count/budget fields
+    /// above are SHARED between C and Lua hooks — `lua_sethook` mirrors the
+    /// PUC mask bits into `has_call`/`has_return`/`has_line`/`count`, and the
+    /// existing trigger sites fire for both C and Lua hooks.
+    /// P15.83h: Moved from Vm to DebugHookState (per-thread, PUC-faithful).
+    c_hook: ?*const fn (?*anyopaque, ?*anyopaque) callconv(.c) void = null,
     /// P15.38f: Per-thread "hook is currently running" flag, mirroring PUC
     /// Lua's `L->allowhook` (inverted sense: PUC sets allowhook=0 while a
     /// hook runs; we set in_debug_hook=true). Stored on DebugHookState
@@ -1779,7 +1788,7 @@ const DebugHookState = struct {
         self.mask = self.mask_buf[0..self.mask_len];
     }
 
-    fn clear(self: *DebugHookState) void {
+    pub fn clear(self: *DebugHookState) void {
         self.func = null;
         self.mask = "";
         self.mask_len = 0;
@@ -1795,6 +1804,7 @@ const DebugHookState = struct {
         self.skip_bc_line_once = false;
         self.allow_yield = false;
         self.in_debug_hook = false;
+        self.c_hook = null;
     }
 };
 
@@ -2837,26 +2847,11 @@ pub const Vm = struct {
     /// Paired with `c_warnf`; set together by `lua_setwarnf`.
     c_warn_ud: ?*anyopaque = null,
 
-    /// PUC `L->hook` (lstate.c): C hook function installed by `lua_sethook`.
-    /// When non-null and the corresponding mask bit is set, the VM calls this
-    /// function at hook events (call/return/line/count). This is the C-API
-    /// hook slot — PUC Lua has a single hook slot per thread, so when this is
-    /// set, the Lua-level `DebugHookState.func` is cleared (and vice versa).
-    /// The signature matches PUC `lua_Hook = void (*)(lua_State*, lua_Debug*)`;
-    /// both args are `?*anyopaque` here because vm.zig does not depend on
-    /// c_api.zig (which defines `lua_Debug`). The dispatch code casts both
-    /// pointers to the correct types before calling.
-    c_hook: ?*const fn (?*anyopaque, ?*anyopaque) callconv(.c) void = null,
-
-    /// PUC `L->hookmask` (lstate.c): bitmask of active hook events
-    /// (LUA_MASKCALL | LUA_MASKRET | LUA_MASKLINE | LUA_MASKCOUNT).
-    /// Paired with `c_hook`; set together by `lua_sethook`.
-    c_hook_mask: c_int = 0,
-
-    /// PUC `L->basehookcount` (lstate.c): the count interval for count hooks,
-    /// as set by `lua_sethook(L, func, mask, count)`. The VM decrements a
-    /// running counter and fires the hook when it reaches zero.
-    c_hook_count: c_int = 0,
+    // P15.83h: C hook state (c_hook/c_hook_mask/c_hook_count) moved from Vm
+    // to DebugHookState (per-thread). PUC stores L->hook/hookmask/
+    // basehookcount per lua_State; DebugHookState lives on Thread, which is
+    // the PUC-faithful home. lua_sethook/lua_gethook etc. resolve the thread
+    // via the handle and access the thread's DebugHookState.
 
     /// PUC `G->panic` (lstate.c:142): the panic function called by `luaD_throw`
     /// when an error propagates past the last protected call boundary. Set by
@@ -3111,13 +3106,10 @@ pub const Vm = struct {
     /// on this flag to decide whether to skip the return hook dispatch.
     pub fn refreshHooksCached(self: *Vm) void {
         const hs = self.activeHookState();
-        // P15.82h: Include the C-API hook slot (c_hook). When lua_sethook
-        // installs a C hook, it mirrors the mask/count into the active
-        // thread's DebugHookState so existing trigger sites fire, and sets
-        // c_hook != null. The cached flag must be true for the fast path to
-        // reach the dispatch sites.
-        const c_hook_active = self.c_hook != null and self.c_hook_mask != 0;
-        self.hooks_active_cached = c_hook_active or
+        // P15.83h: C hook state is now per-thread in DebugHookState.c_hook.
+        // The mask/count are mirrored into has_call/has_return/has_line/count
+        // by lua_sethook, so the existing check covers C hooks too.
+        self.hooks_active_cached =
             hs.has_line or hs.count > 0 or hs.has_call or hs.has_return;
     }
 
@@ -22314,18 +22306,24 @@ pub const Vm = struct {
         if (self.isInDebugHook()) return;
         const hook_state = self.activeHookState();
 
-        // P15.82h: C-API hook dispatch (PUC luaD_hook). PUC Lua has a single
-        // hook slot per thread: when lua_sethook installs a C hook, it clears
-        // the Lua-level DebugHookState.func, and vice versa. So if c_hook is
-        // set, there is no Lua hook to check — dispatch directly to the C
-        // function. The mask/count are mirrored into DebugHookState by
-        // lua_sethook so the existing trigger sites (line/count/call/return)
-        // fire and reach this dispatch point.
-        if (self.c_hook) |hook_fn| {
-            if (self.c_hook_mask != 0) {
+        // P15.83h: C-API hook dispatch (PUC luaD_hook). The C hook function
+        // pointer now lives in DebugHookState.c_hook (per-thread, PUC-faithful).
+        // PUC has a single hook slot per thread: when lua_sethook installs a C
+        // hook, it clears the Lua-level DebugHookState.func, and vice versa.
+        // The mask/count are mirrored into DebugHookState by lua_sethook so
+        // the existing trigger sites (line/count/call/return) fire and reach
+        // this dispatch point.
+        if (hook_state.c_hook) |hook_fn| {
+            // Reconstruct the PUC mask from the shared DebugHookState fields.
+            // LUA_MASKCALL=1, LUA_MASKRET=2, LUA_MASKLINE=4, LUA_MASKCOUNT=8.
+            const c_hook_mask: c_int =
+                (if (hook_state.has_call) @as(c_int, 1) else 0) |
+                (if (hook_state.has_return) @as(c_int, 2) else 0) |
+                (if (hook_state.has_line) @as(c_int, 4) else 0) |
+                (if (hook_state.count > 0) @as(c_int, 8) else 0);
+            if (c_hook_mask != 0) {
                 // Map the event string to a PUC mask bit and check c_hook_mask.
-                // LUA_MASKCALL=1, LUA_MASKRET=2, LUA_MASKLINE=4, LUA_MASKCOUNT=8
-                // (lua.h:464-467). "tail call" shares LUA_MASKCALL with "call".
+                // "tail call" shares LUA_MASKCALL with "call".
                 const mask_bit: c_int = if (std.mem.eql(u8, event, "call") or std.mem.eql(u8, event, "tail call"))
                     1 // LUA_MASKCALL
                 else if (std.mem.eql(u8, event, "return"))
@@ -22336,7 +22334,7 @@ pub const Vm = struct {
                     8 // LUA_MASKCOUNT
                 else
                     0;
-                if (mask_bit != 0 and (self.c_hook_mask & mask_bit) != 0) {
+                if (mask_bit != 0 and (c_hook_mask & mask_bit) != 0) {
                     // Map event string to PUC event code (lua.h:454-457):
                     // LUA_HOOKCALL=0, LUA_HOOKRET=1, LUA_HOOKLINE=2,
                     // LUA_HOOKCOUNT=3, LUA_HOOKTAILCALL=4
@@ -22363,7 +22361,14 @@ pub const Vm = struct {
                     self.debug_hook_event_calllike = std.mem.eql(u8, event, "call") or std.mem.eql(u8, event, "tail call");
                     self.debug_hook_event_tailcall = std.mem.eql(u8, event, "tail call");
                     self.debug_hook_event_is_count = std.mem.eql(u8, event, "count");
-                    self.debug_hook_allow_yield = false; // C hooks cannot yield in sync path
+                    // P15.83h: PUC allows count/line C hooks to yield (luaG_traceexec
+                    // checks L->status == LUA_YIELD after the hook). Call/return
+                    // hooks cannot yield. Set debug_hook_allow_yield = true for
+                    // count/line events so builtinCoroutineYield's yieldability
+                    // check passes. The thread's yieldable() check still guards
+                    // against yielding across a non-yieldable C-call boundary.
+                    const is_line_or_count = std.mem.eql(u8, event, "line") or std.mem.eql(u8, event, "count");
+                    self.debug_hook_allow_yield = is_line_or_count;
                     defer {
                         self.debug_transfer_values = saved_transfer;
                         self.debug_transfer_start = saved_transfer_start;
@@ -22380,6 +22385,27 @@ pub const Vm = struct {
                     hook_state_for_flag.in_debug_hook = true;
                     defer hook_state_for_flag.in_debug_hook = false;
 
+                    // P15.83h: Set ar.i_ci to the current Lua frame index
+                    // (1-based, matching lua_getstack's encoding). For line/
+                    // count events, the topmost frame IS the current Lua frame.
+                    // For call events, the callee's frame hasn't been pushed
+                    // yet in the sync path, so we use the caller's frame (best
+                    // available — PUC passes the new ci, but luazig's sync
+                    // path fires before the frame is pushed). For return
+                    // events, the topmost frame is the returning frame.
+                    const th_for_ci = self.current_thread orelse self.main_thread orelse return;
+                    var ci_frame_idx: usize = 0;
+                    {
+                        var fi: usize = th_for_ci.call_frames.len();
+                        while (fi > 0) {
+                            fi -= 1;
+                            const cf = th_for_ci.call_frames.getConstPtr(fi);
+                            if (cf.isHidden()) continue;
+                            ci_frame_idx = fi;
+                            break;
+                        }
+                    }
+
                     // Build lua_Debug on the stack (PUC luaD_hook: ar.event,
                     // ar.currentline, ar.i_ci). Only event and currentline are
                     // set by luaD_hook; the rest are zero-initialized (PUC
@@ -22388,13 +22414,41 @@ pub const Vm = struct {
                     var ar: LuaDebug = .{};
                     ar.event = event_code;
                     ar.currentline = if (line) |l| @intCast(l) else -1;
-                    ar.i_ci = null; // PUC sets ar.i_ci = ci; we don't expose ci
+                    ar.i_ci = @ptrFromInt(ci_frame_idx + 1); // 1-based, matching lua_getstack
 
                     // Call the C hook: (*hook)(L, &ar).
                     // PUC luaD_hook: lua_unlock(L); (*hook)(L, &ar); lua_lock(L);
                     // We don't have a lock, so we just call directly.
+                    //
+                    // P15.83h: Wrap the C hook call with a setjmp boundary so
+                    // lua_yieldk can _longjmp back here (PUC's lua_yield
+                    // longjmps to the resume boundary). Without this boundary,
+                    // _longjmp would target a stale/outer C-function boundary.
+                    // On yield (sj==2): propagate error.Yield so the bytecode
+                    // loop's catch block calls parkBytecodeIrHookYield (sets
+                    // bytecode_inplace_suspended + skip flag). On error (sj==1):
+                    // propagate error.RuntimeError.
                     const hook_ptr: *const fn (?*anyopaque, ?*anyopaque) callconv(.c) void = hook_fn;
-                    hook_ptr(@ptrCast(self.cur_handle.?), @ptrCast(&ar));
+                    var jb: JmpBuf = undefined;
+                    const prev_jmp = self.c_error_jmp;
+                    self.c_error_jmp = @ptrCast(&jb);
+                    defer self.c_error_jmp = prev_jmp;
+
+                    const sj = _setjmp(@ptrCast(&jb));
+                    if (sj == 0) {
+                        hook_ptr(@ptrCast(self.cur_handle.?), @ptrCast(&ar));
+                    } else if (sj == 2) {
+                        // Hook yielded via lua_yieldk: the yield values are
+                        // already stored in th.yielded by builtinCoroutineYield.
+                        // Propagate error.Yield so the bytecode loop parks the
+                        // hook yield (parkBytecodeIrHookYield sets
+                        // bytecode_inplace_suspended + skip flag).
+                        return error.Yield;
+                    } else {
+                        // Hook errored via lua_error: the error object is in
+                        // self.err / self.err_obj. Propagate as RuntimeError.
+                        return error.RuntimeError;
+                    }
                     return;
                 }
             }
@@ -23030,10 +23084,7 @@ pub const Vm = struct {
 
         if (i >= args.len or args[i] == .Nil) {
             hook_state.clear();
-            // P15.82h: Single hook slot — clear the C-API hook too.
-            self.c_hook = null;
-            self.c_hook_mask = 0;
-            self.c_hook_count = 0;
+            // P15.83h: clear() now clears c_hook too (single hook slot).
             self.refreshHooksCached();
             return;
         }
@@ -23044,12 +23095,10 @@ pub const Vm = struct {
             else => return self.fail("debug.sethook expects function or nil", .{}),
         }
         hook_state.func = hook;
-        // P15.82h: Single hook slot — clear the C-API hook when a Lua hook
+        // P15.83h: Single hook slot — clear the C-API hook when a Lua hook
         // is installed. PUC Lua has one hook slot per thread; setting a Lua
         // hook via debug.sethook replaces any C hook set via lua_sethook.
-        self.c_hook = null;
-        self.c_hook_mask = 0;
-        self.c_hook_count = 0;
+        hook_state.c_hook = null;
         // Every public debug.sethook installation is a Lua hook by default.
         // Native-hook compatibility callers opt in atomically after this call.
         hook_state.allow_yield = false;

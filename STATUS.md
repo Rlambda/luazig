@@ -2112,6 +2112,65 @@ luazig) passes.
 coroutine.lua --testc exit 0, smoke 54/54, matrix zig_fail=0 (only big.lua
 both_fail), zig build test exit 0.
 
+### P15.83h — Per-thread C hooks + lua_Debug.i_ci + yieldable count/line hooks
+
+**Item 9.1: Hook state is per-thread.** Moved the C hook function pointer from
+`Vm.c_hook` (Vm-level) to `DebugHookState.c_hook` (per-thread, PUC-faithful).
+Removed `Vm.c_hook`, `Vm.c_hook_mask`, `Vm.c_hook_count`. The mask/count/budget
+fields in `DebugHookState` (has_call/has_return/has_line/count/budget) are
+SHARED between C and Lua hooks — PUC has ONE L->hook slot per thread.
+`lua_sethook` resolves the thread via the handle (`L.thread orelse main_thread`)
+and sets/clears `DebugHookState.c_hook` + the shared mask/count fields. Setting
+a C hook clears `DebugHookState.func` (single slot); `builtinDebugSethook`
+clears `DebugHookState.c_hook` when a Lua hook is installed.
+`lua_gethook`/`lua_gethookmask`/`lua_gethookcount` read from the handle's
+thread. `lua_gethookmask` reconstructs the PUC bitmask from has_call/
+has_return/has_line/count. `refreshHooksCached` no longer needs a separate
+`c_hook_active` check — the mirrored mask fields already cover C hooks.
+`DebugHookState.clear()` now clears `c_hook` too (made `pub` for c_api access).
+
+**Item 9.2: lua_Debug.i_ci.** `debugDispatchHookTransfer` now sets `ar.i_ci`
+to the topmost non-hidden frame's index (1-based, matching `lua_getstack`'s
+`@ptrFromInt(frame_idx + 1)` encoding). For line/count/return events, the
+topmost frame IS the current Lua frame (correct, matches PUC's `ar.i_ci = ci`).
+For call events, the callee's frame hasn't been pushed yet in the sync path,
+so `i_ci` points to the caller's frame (best available — PUC passes the new ci,
+but luazig's sync path fires before the frame is pushed). `lua_getinfo(L, "l",
+ar)` from a line hook now returns a sensible currentline.
+
+**Item 9.3: Yieldable count/line C hooks.** PUC allows count/line hooks to
+yield (`luaG_traceexec` checks `L->status == LUA_YIELD`). Previously,
+`debug_hook_allow_yield = false` for C hooks. Now: `debug_hook_allow_yield` is
+set to `true` for count/line C hook events (call/return hooks remain
+non-yieldable, matching PUC). The C hook call is wrapped with a `_setjmp`
+boundary (like `callCFunctionWithBoundary`) so `lua_yieldk`'s `_longjmp` lands
+back in `debugDispatchHookTransfer`. On yield (sj==2): `error.Yield` propagates
+to the bytecode loop's catch block, which calls `parkBytecodeIrHookYield`
+(sets `bytecode_inplace_suspended` + skip flag). On resume, the bytecode loop
+continues from the same instruction, with the skip flag preventing immediate
+re-firing. The `in_debug_hook` branch in `builtinCoroutineYield` finds no hook
+frame (sync path doesn't push one) — this is correct: there's nothing to
+unwind, and `parkBytecodeIrHookYield` handles the parking.
+
+**Item 10: API-check enforcement.** PUC's `api_check(L, k == NULL ||
+!isLua(L->ci), "cannot use continuations inside hooks")` compiles out in
+release builds (`lua_assert` → `((void)0)` without `LUA_USE_APICHECK`).
+luazig's existing behavior is already SAFE: `luaYieldKShared` silently skips
+k-saving for debug hook frames (`if (!fr.isDebugHook())`), preventing state
+corruption. No runtime enforcement needed — matches PUC's release behavior.
+For `lua_yieldk` in hooks: PUC's `api_check(L, nresults == 0, ...)` also
+compiles out; luazig handles any nresults value correctly.
+
+**Tests** (`tests/c_api/12_chook.c`): Added t5 (hook_thread_isolation — co1/co2
+independent hooks), t6 (hook_getinfo — lua_getinfo "l" from line hook), t7
+(hook_yield — line hook yields via lua_yieldk, resume1 YIELD, resume2 OK
+result 2), t8 (hook_exec_isolation — co1 count hook fires, co2 without hook
+stays 0). All differential (PUC + luazig) PASS.
+
+**Regression gate:** 15/15 c_api suites, test-diff DIFF: PASS (5 suites),
+coroutine.lua --testc exit 0, smoke 54/54, matrix zig_fail=0 (only big.lua
+both_fail), zig build test exit 0.
+
 ### P15.83g — lua_status error preservation + closethread discards suspended k (reset, not resume)
 
 **Item 7: lua_status preserves error status.** Added `api_status: c_int = 0`

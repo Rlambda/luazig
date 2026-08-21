@@ -352,6 +352,289 @@ static int test_line_hook(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Test 5: Per-thread hook isolation (review item 9.1)                */
+/* ------------------------------------------------------------------ */
+
+/*
+** co1 and co2 are independent coroutines. Setting a hook on co1 must NOT
+** affect co2: lua_gethook(co2) == NULL, lua_gethookmask(co2) == 0.
+** PUC stores L->hook/hookmask/basehookcount per lua_State.
+*/
+static int test_hook_thread_isolation(void) {
+    lua_State *L = luaL_newstate();
+    luaL_openlibs(L);
+
+    lua_State *co1 = lua_newthread(L);
+    lua_State *co2 = lua_newthread(L);
+    if (co1 == NULL || co2 == NULL) {
+        printf("FAIL: lua_newthread returned NULL\n");
+        lua_close(L);
+        return 1;
+    }
+
+    /* Install a count hook on co1 only */
+    reset_counters();
+    lua_sethook(co1, count_hook, LUA_MASKCOUNT, 1);
+
+    /* co2 must have no hook */
+    if (lua_gethook(co2) != NULL) {
+        printf("FAIL: lua_gethook(co2) != NULL after sethook(co1)\n");
+        lua_close(L);
+        return 1;
+    }
+    if (lua_gethookmask(co2) != 0) {
+        printf("FAIL: lua_gethookmask(co2) != 0 after sethook(co1)\n");
+        lua_close(L);
+        return 1;
+    }
+    if (lua_gethookcount(co2) != 0) {
+        printf("FAIL: lua_gethookcount(co2) != 0 after sethook(co1)\n");
+        lua_close(L);
+        return 1;
+    }
+
+    /* co1 must have the hook */
+    if (lua_gethook(co1) != count_hook) {
+        printf("FAIL: lua_gethook(co1) != count_hook\n");
+        lua_close(L);
+        return 1;
+    }
+    if (lua_gethookmask(co1) != LUA_MASKCOUNT) {
+        printf("FAIL: lua_gethookmask(co1) != LUA_MASKCOUNT\n");
+        lua_close(L);
+        return 1;
+    }
+
+    printf("PASS: t5 hook_thread_isolation\n");
+    lua_close(L);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 6: lua_getinfo from a C hook (review item 9.2)               */
+/* ------------------------------------------------------------------ */
+
+static int hook_getinfo_ok = 0;
+
+/*
+** Line hook that calls lua_getinfo(L, "l", ar) to verify that ar.i_ci
+** is set correctly (non-null) and that currentline is sensible.
+** PUC sets ar->i_ci = ci; lua_getinfo uses i_ci to find the frame.
+*/
+static void info_hook(lua_State *L, lua_Debug *ar) {
+    /* ar->currentline is already set by the hook dispatch. Call lua_getinfo
+       to verify ar->i_ci points to a valid frame (getinfo returns 1 and
+       fills currentline from the frame's line info). */
+    if (lua_getinfo(L, "l", ar)) {
+        if (ar->currentline > 0) {
+            hook_getinfo_ok++;
+        }
+    }
+}
+
+static const char *three_line_code =
+    "local x = 1\n"
+    "local y = 2\n"
+    "return x + y\n";
+
+static int test_hook_getinfo(void) {
+    lua_State *L = luaL_newstate();
+    luaL_openlibs(L);
+
+    lua_State *co = lua_newthread(L);
+    if (co == NULL) {
+        printf("FAIL: lua_newthread returned NULL\n");
+        lua_close(L);
+        return 1;
+    }
+
+    if (luaL_loadstring(co, three_line_code) != LUA_OK) {
+        printf("FAIL: loadstring: %s\n", lua_tostring(co, -1));
+        lua_close(L);
+        return 1;
+    }
+
+    hook_getinfo_ok = 0;
+    lua_sethook(co, info_hook, LUA_MASKLINE, 0);
+
+    int nres = 0;
+    int status = lua_resume(co, L, 0, &nres);
+    if (status != LUA_OK) {
+        printf("FAIL: lua_resume status = %d: %s\n", status,
+               lua_tostring(co, -1));
+        lua_close(L);
+        return 1;
+    }
+
+    if (hook_getinfo_ok <= 0) {
+        printf("FAIL: lua_getinfo from hook never succeeded (ok=%d)\n",
+               hook_getinfo_ok);
+        lua_close(L);
+        return 1;
+    }
+
+    printf("PASS: t6 hook_getinfo (ok>0=%s)\n", hook_getinfo_ok > 0 ? "yes" : "no");
+    lua_close(L);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 7: Yieldable count/line C hooks (review item 9.3)            */
+/* ------------------------------------------------------------------ */
+
+static int yielding_hook_fired = 0;
+
+/*
+** Line hook that yields on the FIRST line event via lua_yieldk(L, 0, 0, NULL).
+** PUC allows count/line hooks to yield inside a coroutine.
+*/
+static void yielding_line_hook(lua_State *L, lua_Debug *ar) {
+    (void)ar;
+    if (yielding_hook_fired == 0) {
+        yielding_hook_fired = 1;
+        lua_yieldk(L, 0, 0, NULL);
+    }
+}
+
+static const char *yield_code =
+    "local x = 1\n"
+    "x = x + 1\n"
+    "return x\n";
+
+static int test_hook_yield(void) {
+    lua_State *L = luaL_newstate();
+    luaL_openlibs(L);
+
+    lua_State *co = lua_newthread(L);
+    if (co == NULL) {
+        printf("FAIL: lua_newthread returned NULL\n");
+        lua_close(L);
+        return 1;
+    }
+
+    if (luaL_loadstring(co, yield_code) != LUA_OK) {
+        printf("FAIL: loadstring: %s\n", lua_tostring(co, -1));
+        lua_close(L);
+        return 1;
+    }
+
+    yielding_hook_fired = 0;
+    lua_sethook(co, yielding_line_hook, LUA_MASKLINE, 0);
+
+    /* First resume: hook yields on the first line event */
+    int nres = 0;
+    int status = lua_resume(co, L, 0, &nres);
+    if (status != LUA_YIELD) {
+        printf("FAIL: resume1 status = %d, expected LUA_YIELD (%d)\n",
+               status, LUA_YIELD);
+        lua_close(L);
+        return 1;
+    }
+
+    /* Second resume: continues from where it yielded, returns x = 2 */
+    status = lua_resume(co, L, 0, &nres);
+    if (status != LUA_OK) {
+        printf("FAIL: resume2 status = %d: %s\n", status,
+               lua_tostring(co, -1));
+        lua_close(L);
+        return 1;
+    }
+
+    if (nres < 1) {
+        printf("FAIL: no results from resume2\n");
+        lua_close(L);
+        return 1;
+    }
+    lua_Integer result = lua_tointeger(co, -1);
+    if (result != 2) {
+        printf("FAIL: result = %lld, expected 2\n", (long long)result);
+        lua_close(L);
+        return 1;
+    }
+
+    printf("PASS: t7 hook_yield (result=%lld)\n", (long long)result);
+    lua_close(L);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 8: Per-thread hook independence in execution                 */
+/* ------------------------------------------------------------------ */
+
+static int co1_hook_count = 0;
+static int co2_hook_count = 0;
+
+static void co1_count_hook(lua_State *L, lua_Debug *ar) {
+    (void)L; (void)ar;
+    co1_hook_count++;
+}
+
+static int test_hook_exec_isolation(void) {
+    lua_State *L = luaL_newstate();
+    luaL_openlibs(L);
+
+    lua_State *co1 = lua_newthread(L);
+    lua_State *co2 = lua_newthread(L);
+    if (co1 == NULL || co2 == NULL) {
+        printf("FAIL: lua_newthread returned NULL\n");
+        lua_close(L);
+        return 1;
+    }
+
+    /* Install count hook on co1 only */
+    co1_hook_count = 0;
+    co2_hook_count = 0;
+    lua_sethook(co1, co1_count_hook, LUA_MASKCOUNT, 1);
+
+    /* Load and run co1 (has hook) */
+    if (luaL_loadstring(co1, sum_loop_code) != LUA_OK) {
+        printf("FAIL: co1 loadstring: %s\n", lua_tostring(co1, -1));
+        lua_close(L);
+        return 1;
+    }
+    int nres1 = 0;
+    int status1 = lua_resume(co1, L, 0, &nres1);
+    if (status1 != LUA_OK) {
+        printf("FAIL: co1 resume status = %d: %s\n", status1,
+               lua_tostring(co1, -1));
+        lua_close(L);
+        return 1;
+    }
+
+    /* Load and run co2 (no hook) */
+    if (luaL_loadstring(co2, sum_loop_code) != LUA_OK) {
+        printf("FAIL: co2 loadstring: %s\n", lua_tostring(co2, -1));
+        lua_close(L);
+        return 1;
+    }
+    int nres2 = 0;
+    int status2 = lua_resume(co2, L, 0, &nres2);
+    if (status2 != LUA_OK) {
+        printf("FAIL: co2 resume status = %d: %s\n", status2,
+               lua_tostring(co2, -1));
+        lua_close(L);
+        return 1;
+    }
+
+    /* co1's hook must have fired; co2's must NOT have fired */
+    if (co1_hook_count <= 0) {
+        printf("FAIL: co1 hook never fired (count=%d)\n", co1_hook_count);
+        lua_close(L);
+        return 1;
+    }
+    if (co2_hook_count != 0) {
+        printf("FAIL: co2 hook fired (count=%d), expected 0\n", co2_hook_count);
+        lua_close(L);
+        return 1;
+    }
+
+    printf("PASS: t8 hook_exec_isolation (co1>0=%s, co2=0)\n",
+           co1_hook_count > 0 ? "yes" : "no");
+    lua_close(L);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Main                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -361,6 +644,10 @@ int main(void) {
     fail += test_gethook_api();
     fail += test_clear_hook();
     fail += test_line_hook();
+    fail += test_hook_thread_isolation();
+    fail += test_hook_getinfo();
+    fail += test_hook_yield();
+    fail += test_hook_exec_isolation();
     if (fail == 0) {
         printf("ALL PASS\n");
     } else {

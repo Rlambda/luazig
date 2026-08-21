@@ -264,15 +264,23 @@ pub const State = struct {
     }
 
     /// PUC `lua_status` (lapi.c:lua_status): return the status of the
-    /// thread. For the main VM (always running when C code executes),
-    /// returns LUA_OK (0). For coroutine threads, maps the Thread status
-    /// to PUC status codes.
+    /// thread. PUC returns LUA_YIELD (1) when the thread is suspended
+    /// after a yield, LUA_OK (0) for running/main threads, and error
+    /// codes when dead-with-error.
+    ///
+    /// luazig's `Thread.status` enum has only {suspended, running, dead}
+    /// — errors collapse into `dead` (documented limitation: callers use
+    /// `lua_resume`'s return value for error codes). If `c_api_thread`
+    /// is set (created via `lua_newthread`), return its status; otherwise
+    /// the main thread is always LUA_OK.
     pub fn status(self: *State) c_int {
-        // The main VM is always in the OK state when C code is running.
-        // Coroutine threads have their own status field, but lua_status is
-        // called on L (the main thread), not on a coroutine.
-        _ = self;
-        return 0; // LUA_OK
+        if (self.vm.c_api_thread) |th| {
+            return switch (th.status) {
+                .suspended => if (th.started) 1 else 0, // LUA_YIELD if yielded, LUA_OK if fresh
+                .running, .dead => 0, // LUA_OK
+            };
+        }
+        return 0; // LUA_OK — main thread
     }
 
     /// PUC `lua_pushthread` (lapi.c:lua_pushthread): push the current thread

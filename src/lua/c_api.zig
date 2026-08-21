@@ -177,17 +177,68 @@ pub export fn lua_newthread(L: ?*lua_State) ?*lua_State {
     return vm;
 }
 
-/// PUC `lua_closethread` (lstate.c:lua_closethread): reset a thread to a clean
-/// state. In PUC this closes all upvalues, clears the stack, and sets status to
-/// `LUA_OK`. `from` is the thread that initiated the close (may be NULL).
+/// PUC `lua_closethread` (lstate.c:324-333): reset a thread to a clean
+/// state. `from` is the thread that initiated the close (may be NULL).
 ///
-/// Returns `LUA_OK` (0) on success. luazig does not yet expose a per-thread
-/// status reset; returning `LUA_OK` is correct for the main thread (which is
-/// always in a valid state). TODO: wire thread status reset.
+/// PUC semantics:
+///   1. `L->nCcalls = (from) ? getCcalls(from) : 0` — inherit C-call
+///      depth from the caller (or zero if no caller).
+///   2. `status = luaE_resetthread(L, L->status)` — drop all CallInfos,
+///      close all upvalues/TBCs (run `__close`), set status to OK/dead.
+///      A `__close` error replaces the status (last error wins).
+///   3. `if (L == from) luaD_throwbaselevel(L, status)` — closing itself
+///      never returns. DEFERRED: see TODO below.
+///   4. Return `APIstatus(status)`: LUA_OK (0) on success; LUA_ERRRUN (2)
+///      if a `__close` errored. The error object is on top of the
+///      thread's stack (PUC `luaD_seterrorobj`).
+///
+/// Delegates to `builtinCoroutineClose` via `apiCloseThread`, which
+/// implements the full close semantics (forced-close unwind for
+/// suspended threads with frames, `__close` metamethod execution,
+/// close_has_err latch, idempotent dead-thread handling).
 pub export fn lua_closethread(L: ?*lua_State, from: ?*lua_State) c_int {
-    _ = from;
-    _ = L orelse return 1; // LUA_ERRRUN if null
-    return 0; // LUA_OK
+    const vm = L orelse return 1; // LUA_ERRRUN if null
+
+    // PUC lua_closethread operates on L (the thread itself). In luazig,
+    // lua_State = Vm, so we resolve the thread via c_api_thread (set by
+    // lua_newthread). If null, L is the main thread — PUC allows closing
+    // it (resets to clean state), but luazig's main thread is always in a
+    // valid state, so return LUA_OK.
+    const th = vm.c_api_thread orelse return 0; // LUA_OK — main thread
+
+    // PUC lstate.c:327: L->nCcalls = (from) ? getCcalls(from) : 0
+    if (from) |from_ptr| {
+        const from_s = api.State.fromVm(from_ptr);
+        if (from_s.vm.current_thread) |from_th| {
+            th.nCcalls = @as(u32, from_th.getCcalls());
+        } else {
+            th.nCcalls = 0;
+        }
+    } else {
+        th.nCcalls = 0;
+    }
+
+    // PUC lstate.c:328: status = luaE_resetthread(L, L->status)
+    const result = vm.apiCloseThread(th) catch |err| switch (err) {
+        error.OutOfMemory => return 2,
+        error.RuntimeError => {
+            // This occurs when closing the currently-running thread from
+            // within itself (L == from in PUC). PUC calls
+            // luaD_throwbaselevel which never returns. We cannot throw
+            // from the C API; defer this case.
+            // TODO: implement luaD_throwbaselevel for L == from case.
+            // lua_resetthread(L) macro uses from==NULL so it's not hit
+            // by the primary use case.
+            return 2;
+        },
+        error.Yield => return 2,
+    };
+
+    if (result.status == 0) return 0; // LUA_OK
+
+    // Error: push the error object on c_stack (PUC luaD_seterrorobj).
+    vm.c_stack.append(vm.alloc, result.err) catch {};
+    return 2; // LUA_ERRRUN
 }
 
 /// PUC `lua_atpanic` (lapi.c:lua_atpanic): install a panic function called when

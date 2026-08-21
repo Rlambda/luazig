@@ -1,3 +1,13 @@
+> **STATUS: COMPLETE (2026-08-21).** All tasks implemented across
+> P15.78–P15.82h (see STATUS.md). Final verification: matrix zig_fail=0
+> (only big.lua both_fail, identical in PUC), coroutine.lua --testc
+> PASSES the full suite including the testC coroutine-API section,
+> smoke 54/54, c_api suites all PASS (incl. 10_continuations,
+> 11_closethread, 12_chook), zig build test OK. The remaining plan-adjacent
+> gaps (pcallk error continuation, finishpcallk TBC close, pcallk errfunc,
+> lua_closethread, c_hook dispatch, lua_resume status) were closed by
+> commits d2dcb5d(P15.82d) → e19df2d(P15.82h).
+
 # PUC Lua 5.5 C Continuations Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -39,7 +49,7 @@
 **Files:**
 - Modify: `src/lua/vm.zig:1069-1084`
 
-- [ ] **Step 1: Add all PUC CIST constants**
+- [x] **Step 1: Add all PUC CIST constants**
 
 Replace the current CIST constants block (lines 1069-1084) with PUC-faithful bit positions:
 
@@ -81,7 +91,7 @@ const CIST_FIN: u32 = 1 << 24;
 const CIST_HIDE: u32 = 1 << 25;
 ```
 
-- [ ] **Step 2: Add CIST_RECST helper functions**
+- [x] **Step 2: Add CIST_RECST helper functions**
 
 After the `encodeNresults`/`decodeNresults` functions, add:
 
@@ -107,12 +117,12 @@ inline fn getoah(callstatus: u32) bool {
 }
 ```
 
-- [ ] **Step 3: Build to verify compilation**
+- [x] **Step 3: Build to verify compilation**
 
 Run: `zig build -Doptimize=ReleaseFast 2>&1 | head -30`
 Expected: Build succeeds (existing CIST_TAIL/CIST_HOOKED/CIST_HOOKYIELD/CIST_HIDE references still work because the constants are now at new bit positions but the accessor functions use the constant names)
 
-- [ ] **Step 4: Run tests to verify no regression**
+- [x] **Step 4: Run tests to verify no regression**
 
 Run: `zig build -Doptimize=ReleaseFast && python3 tools/testes_matrix.py --testc 2>&1 | tail -5`
 Expected: 30/31 (same as before — only big.lua fails)
@@ -120,7 +130,7 @@ Expected: 30/31 (same as before — only big.lua fails)
 Run: `for f in tests/smoke/*.lua; do ./zig-out/bin/luazig "$f" 2>&1 | grep -q "FAIL" && echo "FAIL: $f"; done; echo "smoke done"`
 Expected: No failures
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/lua/vm.zig
@@ -141,7 +151,7 @@ Add getcistrecst/setcistrecst/setoah/getoah helpers."
 **Files:**
 - Modify: `src/lua/vm.zig:1185-1229` (CallFrame accessor methods)
 
-- [ ] **Step 1: Update accessor methods to use new bit positions**
+- [x] **Step 1: Update accessor methods to use new bit positions**
 
 The accessor functions already reference the constants by name (e.g., `CIST_TAIL`), so they automatically use the new bit positions. But we need to add new accessors for the new flags. Replace the accessor block (lines 1185-1229) with:
 
@@ -196,7 +206,7 @@ The accessor functions already reference the constants by name (e.g., `CIST_TAIL
     }
 ```
 
-- [ ] **Step 2: Build and test**
+- [x] **Step 2: Build and test**
 
 Run: `zig build -Doptimize=ReleaseFast 2>&1 | head -30`
 Expected: Build succeeds
@@ -204,7 +214,7 @@ Expected: Build succeeds
 Run: `python3 tools/testes_matrix.py --testc 2>&1 | tail -5`
 Expected: 30/31
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/lua/vm.zig
@@ -234,18 +244,18 @@ In `pushBuiltinCFrame`, after `slot.* = .{ ... }` and before `slot.clearHidden()
         slot.clearHidden();
 ```
 
-- [ ] **Step 2: Search for all other C-frame creation sites**
+- [x] **Step 2: Search for all other C-frame creation sites**
 
 Run: `grep -n "proto = null\|proto =\s*null" src/lua/vm.zig | head -20`
 
 Any site that creates a CallFrame with `proto = null` (implicitly or explicitly) is a C-frame and must set CIST_C. Check each one.
 
-- [ ] **Step 3: Build and test**
+- [x] **Step 3: Build and test**
 
 Run: `zig build -Doptimize=ReleaseFast && python3 tools/testes_matrix.py --testc 2>&1 | tail -5`
 Expected: 30/31
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/lua/vm.zig
@@ -259,7 +269,7 @@ git commit -m "P15.78: set CIST_C on C-frames in pushBuiltinCFrame"
 **Files:**
 - Modify: `src/lua/vm.zig` (before CallFrame struct definition)
 
-- [ ] **Step 1: Add StackOffset type**
+- [x] **Step 1: Add StackOffset type**
 
 Before the CallFrame struct (around line 1098), add:
 
@@ -269,7 +279,7 @@ Before the CallFrame struct (around line 1098), add:
 const StackOffset = usize;
 ```
 
-- [ ] **Step 2: Add CFrameAux union**
+- [x] **Step 2: Add CFrameAux union**
 
 ```zig
 /// PUC `CallInfo.u2` — mutually exclusive C-frame auxiliary state.
@@ -281,7 +291,7 @@ const CFrameAux = union {
 };
 ```
 
-- [ ] **Step 3: Add CFrameState struct**
+- [x] **Step 3: Add CFrameState struct**
 
 ```zig
 /// PUC `CallInfo.u.c` — C function frame state.
@@ -300,7 +310,7 @@ const CFrameState = struct {
 };
 ```
 
-- [ ] **Step 4: Add LuaFrameState struct**
+- [x] **Step 4: Add LuaFrameState struct**
 
 ```zig
 /// PUC `CallInfo.u.l` — Lua function frame state.
@@ -329,12 +339,12 @@ const LuaFrameState = struct {
 };
 ```
 
-- [ ] **Step 5: Build to verify structs compile**
+- [x] **Step 5: Build to verify structs compile**
 
 Run: `zig build -Doptimize=ReleaseFast 2>&1 | head -30`
 Expected: Build succeeds (structs defined but not yet used)
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/lua/vm.zig
@@ -354,7 +364,7 @@ migration."
 
 This is the largest mechanical change. The CallFrame struct transitions from a flat layout with `proto: ?*const bc.Proto` as discriminator to a union layout with `CIST_C` as discriminator.
 
-- [ ] **Step 1: Replace CallFrame struct with union layout**
+- [x] **Step 1: Replace CallFrame struct with union layout**
 
 Replace the entire CallFrame struct (lines 1099-1243) with:
 
@@ -483,7 +493,7 @@ pub const CallFrame = struct {
 
 **IMPORTANT:** This step will NOT compile yet because all existing code accesses `fr.proto` as a field (not a function), `fr.pc`, `fr.func_slot_base`, `fr.frame_cap`, `fr.nextraargs`, `fr.nvarstack`, `fr.has_open_upvalues`, `fr.resume_pc`, `fr.last_line_pc`, `fr.skip_line_hook_pc`, `fr.skip_call_hook_pc`, `fr.resume_skip_count_pc` directly. These fields now live inside `fr.u.lua`. The next steps fix all access sites.
 
-- [ ] **Step 2: Add proto to LuaFrameState and update the union**
+- [x] **Step 2: Add proto to LuaFrameState and update the union**
 
 Actually, `proto` needs to be in `LuaFrameState`. Update `LuaFrameState` to include `proto`:
 
@@ -505,7 +515,7 @@ And update the `proto()` accessor in CallFrame:
     }
 ```
 
-- [ ] **Step 3: Find all direct field accesses that need migration**
+- [x] **Step 3: Find all direct field accesses that need migration**
 
 Run these searches to find all sites that access fields now in `u.lua`:
 
@@ -519,7 +529,7 @@ grep -n '\.nvarstack\b' src/lua/vm.zig | wc -l
 grep -n '\.has_open_upvalues\b' src/lua/vm.zig | wc -l
 ```
 
-- [ ] **Step 4: Migrate all `fr.proto` / `frame.proto` accesses**
+- [x] **Step 4: Migrate all `fr.proto` / `frame.proto` accesses**
 
 Every `fr.proto` becomes `fr.proto()` (function call) OR `fr.u.lua.proto` (direct union access). Use `fr.proto()` for read-only access. For writes, use `fr.u.lua.proto = ...`.
 
@@ -531,11 +541,11 @@ Search and replace pattern:
 
 **NOTE:** This is a large mechanical change. Use `grep` to find all sites, then update each one. Be careful with struct initialization (`.{ .proto = ... }`) — these need `.u = .{ .lua = .{ .proto = ... } }`.
 
-- [ ] **Step 5: Migrate `fr.pc` → `fr.u.lua.pc`**
+- [x] **Step 5: Migrate `fr.pc` → `fr.u.lua.pc`**
 
 Every `fr.pc` becomes `fr.u.lua.pc`. Search for all `.pc` accesses on CallFrame variables and update.
 
-- [ ] **Step 6: Migrate remaining Lua-only fields**
+- [x] **Step 6: Migrate remaining Lua-only fields**
 
 Update all accesses:
 - `fr.func_slot_base` → `fr.u.lua.func_slot_base`
@@ -549,7 +559,7 @@ Update all accesses:
 - `fr.skip_call_hook_pc` → `fr.u.lua.skip_call_hook_pc`
 - `fr.resume_skip_count_pc` → `fr.u.lua.resume_skip_count_pc`
 
-- [ ] **Step 7: Update struct initialization sites**
+- [x] **Step 7: Update struct initialization sites**
 
 Every site that creates a CallFrame with `.{ .proto = ..., .pc = ..., ... }` must be updated to use the union:
 
@@ -570,7 +580,7 @@ For C-frames:
 .{ .func_slot = fs, .base = fs + 1, .u = .{ .c = .{} } }
 ```
 
-- [ ] **Step 8: Build and fix compilation errors**
+- [x] **Step 8: Build and fix compilation errors**
 
 Run: `zig build -Doptimize=ReleaseFast 2>&1 | head -50`
 
@@ -579,7 +589,7 @@ Fix errors iteratively. Common issues:
 - Field accesses need `.u.lua.` prefix
 - Struct initialization needs union syntax
 
-- [ ] **Step 9: Run tests**
+- [x] **Step 9: Run tests**
 
 Run: `zig build -Doptimize=ReleaseFast && python3 tools/testes_matrix.py --testc 2>&1 | tail -5`
 Expected: 30/31
@@ -587,12 +597,12 @@ Expected: 30/31
 Run: `for f in tests/smoke/*.lua; do ./zig-out/bin/luazig "$f" 2>&1 | grep -q "FAIL" && echo "FAIL: $f"; done; echo "smoke done"`
 Expected: No failures
 
-- [ ] **Step 10: Check CallFrame size**
+- [x] **Step 10: Check CallFrame size**
 
 Run: `zig build -Doptimize=ReleaseFast && zig run tests/check_sizes.zig`
 Expected: CallFrame ~100B (up from 96B, due to CFrameState in union)
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
 
 ```bash
 git add src/lua/vm.zig
@@ -611,7 +621,7 @@ state (k/ctx/old_errfunc/aux) in u.c. All field accesses migrated."
 - Modify: `src/lua/vm.zig` (Thread struct, Vm struct, all errfunc access sites)
 - Modify: `src/lua/c_api.zig` (lua_pcallk errfunc parameter)
 
-- [ ] **Step 1: Add errfunc field to Thread**
+- [x] **Step 1: Add errfunc field to Thread**
 
 In the Thread struct (around line 1342, after `status`), add:
 
@@ -621,7 +631,7 @@ In the Thread struct (around line 1342, after `status`), add:
     errfunc: StackOffset = 0,
 ```
 
-- [ ] **Step 2: Remove errfunc from Vm**
+- [x] **Step 2: Remove errfunc from Vm**
 
 Remove `errfunc: ?Value = null` (line 2625) and `errfunc_running: bool = false` (line 2630) from the Vm struct. Keep `errfunc_running` on Thread too:
 
@@ -629,7 +639,7 @@ Remove `errfunc: ?Value = null` (line 2625) and `errfunc_running: bool = false` 
     errfunc_running: bool = false,
 ```
 
-- [ ] **Step 3: Update all errfunc access sites**
+- [x] **Step 3: Update all errfunc access sites**
 
 Search for all `self.errfunc` / `vm.errfunc` references and update to `th.errfunc` (where `th` is the active thread). Key sites:
 
@@ -640,17 +650,17 @@ Search for all `self.errfunc` / `vm.errfunc` references and update to `th.errfun
 - testC pcall (vm.zig:31100): same pattern
 - All save/restore sites in vm.zig
 
-- [ ] **Step 4: Build and fix errors**
+- [x] **Step 4: Build and fix errors**
 
 Run: `zig build -Doptimize=ReleaseFast 2>&1 | head -50`
 Fix iteratively.
 
-- [ ] **Step 5: Run tests**
+- [x] **Step 5: Run tests**
 
 Run: `zig build -Doptimize=ReleaseFast && python3 tools/testes_matrix.py --testc 2>&1 | tail -5`
 Expected: 30/31
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/lua/vm.zig src/lua/c_api.zig
@@ -667,7 +677,7 @@ StackOffset (8B, 0=none). All save/restore sites updated."
 **Files:**
 - Modify: `src/lua/vm.zig` (Thread struct, Vm struct, all access sites)
 
-- [ ] **Step 1: Add allowhook and nCcalls to Thread**
+- [x] **Step 1: Add allowhook and nCcalls to Thread**
 
 In the Thread struct, add:
 
@@ -679,7 +689,7 @@ In the Thread struct, add:
     nCcalls: u32 = 0,
 ```
 
-- [ ] **Step 2: Add yieldable/incnny/decnny helpers**
+- [x] **Step 2: Add yieldable/incnny/decnny helpers**
 
 Add helper functions (as methods on Thread or as free functions):
 
@@ -698,11 +708,11 @@ Add helper functions (as methods on Thread or as free functions):
     }
 ```
 
-- [ ] **Step 3: Remove non_yieldable_c_depth from Vm**
+- [x] **Step 3: Remove non_yieldable_c_depth from Vm**
 
 Remove `non_yieldable_c_depth: usize = 0` (line 2639) and `max_non_yieldable_c_depth` (line 898).
 
-- [ ] **Step 4: Update all non_yieldable_c_depth access sites**
+- [x] **Step 4: Update all non_yieldable_c_depth access sites**
 
 Search for all `self.non_yieldable_c_depth` references and update to use `th.incnny()`/`th.decnny()`/`th.yieldable()`:
 
@@ -711,7 +721,7 @@ Search for all `self.non_yieldable_c_depth` references and update to use `th.inc
 - Metamethod call sites (vm.zig:25654-25656, 25683-25685): `self.non_yieldable_c_depth += 1; defer self.non_yieldable_c_depth -= 1;` → `th.incnny(); defer th.decnny();`
 - testC closeslot (vm.zig:31004): same
 
-- [ ] **Step 5: Update lua_resume to inherit nCcalls from `from`**
+- [x] **Step 5: Update lua_resume to inherit nCcalls from `from`**
 
 In `lua_resume` (c_api.zig:1214), update to set `co.nCcalls` from `from`:
 
@@ -731,16 +741,16 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
 }
 ```
 
-- [ ] **Step 6: Build and fix errors**
+- [x] **Step 6: Build and fix errors**
 
 Run: `zig build -Doptimize=ReleaseFast 2>&1 | head -50`
 
-- [ ] **Step 7: Run tests**
+- [x] **Step 7: Run tests**
 
 Run: `zig build -Doptimize=ReleaseFast && python3 tools/testes_matrix.py --testc 2>&1 | tail -5`
 Expected: 30/31
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add src/lua/vm.zig src/lua/c_api.zig
@@ -761,7 +771,7 @@ Replace Vm.non_yieldable_c_depth with Thread.nCcalls."
 - Modify: `src/lua/c_api.zig:1229-1235` (lua_yieldk)
 - Modify: `src/lua/vm.zig` (builtinCoroutineYield, apiYield)
 
-- [ ] **Step 1: Implement lua_yieldk to save k/ctx in C-frame**
+- [x] **Step 1: Implement lua_yieldk to save k/ctx in C-frame**
 
 Replace `lua_yieldk` (c_api.zig:1229-1235):
 
@@ -807,12 +817,12 @@ pub export fn lua_yieldk(L: ?*lua_State, nresults: c_int, ctx: isize, k: ?*const
 }
 ```
 
-- [ ] **Step 2: Build and test**
+- [x] **Step 2: Build and test**
 
 Run: `zig build -Doptimize=ReleaseFast && python3 tools/testes_matrix.py --testc 2>&1 | tail -5`
 Expected: 30/31 (no regression — k/ctx saved but not yet used on resume)
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/lua/c_api.zig
@@ -829,7 +839,7 @@ PUC API-check: hooks cannot use continuations."
 **Files:**
 - Modify: `src/lua/c_api.zig:245-271` (lua_callk, lua_callkImpl)
 
-- [ ] **Step 1: Implement lua_callk to save k/ctx**
+- [x] **Step 1: Implement lua_callk to save k/ctx**
 
 Replace `lua_callk` and `lua_callkImpl` (c_api.zig:244-271):
 
@@ -872,12 +882,12 @@ pub export fn lua_callk(
 }
 ```
 
-- [ ] **Step 2: Build and test**
+- [x] **Step 2: Build and test**
 
 Run: `zig build -Doptimize=ReleaseFast && python3 tools/testes_matrix.py --testc 2>&1 | tail -5`
 Expected: 30/31
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/lua/c_api.zig
@@ -893,7 +903,7 @@ k==NULL → non-yieldable (incnny). k!=NULL → save k/ctx in C-frame."
 **Files:**
 - Modify: `src/lua/c_api.zig:1264-1270` (lua_pcallk)
 
-- [ ] **Step 1: Implement lua_pcallk with yieldable path**
+- [x] **Step 1: Implement lua_pcallk with yieldable path**
 
 Replace `lua_pcallk` (c_api.zig:1264-1270):
 
@@ -976,12 +986,12 @@ pub export fn lua_pcallk(
 }
 ```
 
-- [ ] **Step 2: Build and test**
+- [x] **Step 2: Build and test**
 
 Run: `zig build -Doptimize=ReleaseFast && python3 tools/testes_matrix.py --testc 2>&1 | tail -5`
 Expected: 30/31
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/lua/c_api.zig
@@ -1102,7 +1112,7 @@ poscallCFrame: move results and pop C-frame."
 **Files:**
 - Modify: `src/lua/vm.zig`
 
-- [ ] **Step 1: Implement finishpcallk**
+- [x] **Step 1: Implement finishpcallk**
 
 ```zig
     /// PUC `finishpcallk` (ldo.c:804-821): error recovery for yieldable pcall.
@@ -1139,7 +1149,7 @@ poscallCFrame: move results and pop C-frame."
     }
 ```
 
-- [ ] **Step 2: Implement findpcall**
+- [x] **Step 2: Implement findpcall**
 
 ```zig
     /// PUC `findpcall` (ldo.c:884-891): scan call_frames for CIST_YPCALL.
@@ -1155,7 +1165,7 @@ poscallCFrame: move results and pop C-frame."
     }
 ```
 
-- [ ] **Step 3: Implement precover**
+- [x] **Step 3: Implement precover**
 
 ```zig
     /// PUC `precover` (ldo.c:955-963): error recovery loop.
@@ -1174,12 +1184,12 @@ poscallCFrame: move results and pop C-frame."
     }
 ```
 
-- [ ] **Step 4: Build and test**
+- [x] **Step 4: Build and test**
 
 Run: `zig build -Doptimize=ReleaseFast && python3 tools/testes_matrix.py --testc 2>&1 | tail -5`
 Expected: 30/31
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/lua/vm.zig
@@ -1200,28 +1210,28 @@ precover: error recovery loop — find pcall, save status, re-enter."
 **Files:**
 - Modify: `src/lua/vm.zig` (testC command implementations)
 
-- [ ] **Step 1: Find all testC callk/pcallk/yieldk command implementations**
+- [x] **Step 1: Find all testC callk/pcallk/yieldk command implementations**
 
 Run: `grep -n "callk\|pcallk\|yieldk\|T\.callk\|T\.pcallk\|T\.yieldk" src/lua/vm.zig | head -30`
 
-- [ ] **Step 2: Update testC callk to use real lua_callk**
+- [x] **Step 2: Update testC callk to use real lua_callk**
 
 The testC `callk` command should call `lua_callk` with a real `k` callback instead of using `saveTestcPendingContinuation`. The `k` callback re-executes the remaining testC script.
 
-- [ ] **Step 3: Update testC pcallk to use real lua_pcallk**
+- [x] **Step 3: Update testC pcallk to use real lua_pcallk**
 
 Same pattern — use real `lua_pcallk` with `k` callback.
 
-- [ ] **Step 4: Update testC yieldk to use real lua_yieldk**
+- [x] **Step 4: Update testC yieldk to use real lua_yieldk**
 
 Same pattern — use real `lua_yieldk` with `k` callback.
 
-- [ ] **Step 5: Build and test**
+- [x] **Step 5: Build and test**
 
 Run: `zig build -Doptimize=ReleaseFast && python3 tools/testes_matrix.py --testc 2>&1 | tail -5`
 Expected: 30/31
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/lua/vm.zig
@@ -1238,27 +1248,27 @@ callbacks instead of TestcPendingContinuation."
 **Files:**
 - Modify: `src/lua/vm.zig`
 
-- [ ] **Step 1: Remove TestcPendingContinuation struct**
+- [x] **Step 1: Remove TestcPendingContinuation struct**
 
 Delete the struct definition (vm.zig:1502-1513).
 
-- [ ] **Step 2: Remove testc_pending_conts field from Thread**
+- [x] **Step 2: Remove testc_pending_conts field from Thread**
 
 Delete `testc_pending_conts: std.ArrayListUnmanaged(TestcPendingContinuation) = .empty` (vm.zig:1441).
 
-- [ ] **Step 3: Remove saveTestcPendingContinuation**
+- [x] **Step 3: Remove saveTestcPendingContinuation**
 
 Delete the function (vm.zig:31326-31377).
 
-- [ ] **Step 4: Remove resumePendingTestcContinuation**
+- [x] **Step 4: Remove resumePendingTestcContinuation**
 
 Delete the function (vm.zig:29520-29605).
 
-- [ ] **Step 5: Remove resumeTestcCloseReturnContinuation**
+- [x] **Step 5: Remove resumeTestcCloseReturnContinuation**
 
 Delete the function (vm.zig:28696-28730).
 
-- [ ] **Step 6: Remove all references to testc_pending_conts**
+- [x] **Step 6: Remove all references to testc_pending_conts**
 
 Search for all remaining references and remove them:
 
@@ -1271,16 +1281,16 @@ Remove each reference. Key sites:
 - `builtinCoroutineYield`: testC continuation saving
 - Any other references
 
-- [ ] **Step 7: Remove testc_close_current/testc_close_return_values/testc_close_remaining from Thread**
+- [x] **Step 7: Remove testc_close_current/testc_close_return_values/testc_close_remaining from Thread**
 
 Delete these fields (vm.zig:1442-1444) if no longer used.
 
-- [ ] **Step 8: Build and fix errors**
+- [x] **Step 8: Build and fix errors**
 
 Run: `zig build -Doptimize=ReleaseFast 2>&1 | head -50`
 Fix any remaining references.
 
-- [ ] **Step 9: Run tests**
+- [x] **Step 9: Run tests**
 
 Run: `zig build -Doptimize=ReleaseFast && python3 tools/testes_matrix.py --testc 2>&1 | tail -5`
 Expected: 30/31
@@ -1288,7 +1298,7 @@ Expected: 30/31
 Run: `for f in tests/smoke/*.lua; do ./zig-out/bin/luazig "$f" 2>&1 | grep -q "FAIL" && echo "FAIL: $f"; done; echo "smoke done"`
 Expected: No failures
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add src/lua/vm.zig
@@ -1309,7 +1319,7 @@ functions, and all references."
 - Create: `tests/c_api/10_continuations.c`
 - Modify: `tests/c_api/Makefile`
 
-- [ ] **Step 1: Write the test**
+- [x] **Step 1: Write the test**
 
 Create `tests/c_api/10_continuations.c`:
 
@@ -1465,7 +1475,7 @@ int main(void) {
 }
 ```
 
-- [ ] **Step 2: Update Makefile**
+- [x] **Step 2: Update Makefile**
 
 Add `10_continuations` to the TESTS list in `tests/c_api/Makefile`:
 
@@ -1473,12 +1483,12 @@ Add `10_continuations` to the TESTS list in `tests/c_api/Makefile`:
 TESTS = 00_smoke 01_core 02_tables 03_arith 04_misc 05_auxlib 06_buffer 07_libs 08_debug 09_upvalues 10_continuations
 ```
 
-- [ ] **Step 3: Build and run the test**
+- [x] **Step 3: Build and run the test**
 
 Run: `zig build -Doptimize=ReleaseFast && make -C tests/c_api 10_continuations && ./tests/c_api/10_continuations`
 Expected: `ALL PASS`
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add tests/c_api/10_continuations.c tests/c_api/Makefile
@@ -1495,7 +1505,7 @@ callee. Differential tests against PUC Lua behavior."
 **Files:**
 - Modify: `tests/c_api/10_continuations.c`
 
-- [ ] **Step 1: Add lua_pcallk with yield test**
+- [x] **Step 1: Add lua_pcallk with yield test**
 
 Add to `10_continuations.c`:
 
@@ -1552,7 +1562,7 @@ static int test_pcallk_yield(void) {
 }
 ```
 
-- [ ] **Step 2: Add lua_pcallk with error test**
+- [x] **Step 2: Add lua_pcallk with error test**
 
 ```c
 /* Test 5: lua_pcallk with error in callee */
@@ -1604,7 +1614,7 @@ static int test_pcallk_error(void) {
 }
 ```
 
-- [ ] **Step 3: Add non-yieldable boundary test**
+- [x] **Step 3: Add non-yieldable boundary test**
 
 ```c
 /* Test 6: lua_call (k==NULL) is non-yieldable */
@@ -1639,7 +1649,7 @@ static int test_nonyieldable(void) {
 }
 ```
 
-- [ ] **Step 4: Update main() to run all tests**
+- [x] **Step 4: Update main() to run all tests**
 
 ```c
 int main(void) {
@@ -1659,12 +1669,12 @@ int main(void) {
 }
 ```
 
-- [ ] **Step 5: Build and run**
+- [x] **Step 5: Build and run**
 
 Run: `zig build -Doptimize=ReleaseFast && make -C tests/c_api 10_continuations && ./tests/c_api/10_continuations`
 Expected: `ALL PASS`
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add tests/c_api/10_continuations.c
@@ -1678,37 +1688,37 @@ git commit -m "P15.78: add pcallk yield/error and non-yieldable boundary tests"
 **Files:**
 - Modify: `STATUS.md`
 
-- [ ] **Step 1: Build ReleaseFast**
+- [x] **Step 1: Build ReleaseFast**
 
 Run: `zig build -Doptimize=ReleaseFast`
 Expected: Build succeeds
 
-- [ ] **Step 2: Run matrix tests**
+- [x] **Step 2: Run matrix tests**
 
 Run: `python3 tools/testes_matrix.py --testc 2>&1 | tail -10`
 Expected: 30/31 (no new regressions)
 
-- [ ] **Step 3: Run smoke tests**
+- [x] **Step 3: Run smoke tests**
 
 Run: `for f in tests/smoke/*.lua; do ./zig-out/bin/luazig "$f" 2>&1 | grep -q "FAIL" && echo "FAIL: $f"; done; echo "smoke done"`
 Expected: No failures (49/49)
 
-- [ ] **Step 4: Run Zig unit tests**
+- [x] **Step 4: Run Zig unit tests**
 
 Run: `zig build test 2>&1 | tail -5`
 Expected: All tests pass
 
-- [ ] **Step 5: Run C API tests**
+- [x] **Step 5: Run C API tests**
 
 Run: `make -C tests/c_api test 2>&1`
 Expected: All tests pass (including 10_continuations)
 
-- [ ] **Step 6: Check CallFrame size**
+- [x] **Step 6: Check CallFrame size**
 
 Run: `zig run tests/check_sizes.zig`
 Expected: CallFrame ~100B
 
-- [ ] **Step 7: Update STATUS.md**
+- [x] **Step 7: Update STATUS.md**
 
 Add a new section for C continuations:
 
@@ -1741,7 +1751,7 @@ Add a new section for C continuations:
 - C API tests: 11/11 (including continuations)
 ```
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add STATUS.md

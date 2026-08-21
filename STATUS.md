@@ -1779,14 +1779,31 @@ propagating). Matrix 30/32 (same zig_fail/both_fail counts as before:
 coroutine.lua + big.lua pre-existing), smoke 54/54, c_api 18/18.
 
 **Next blockers (open):**
-- [ ] pcallk error continuation: `T.testC("pushstring x; pcallk 1 0 2")`
-      must run k with status ERRRUN on error (coroutine.lua:~1078,
-      repro `/tmp/test_apico.lua`); today the error propagates uncaught.
-- [ ] finishpcallk C-frame TBC close (plan Task 12).
-- [ ] lua_pcallk errfunc/message handler (plan Task 10).
+- [x] ~~pcallk error continuation: `T.testC("pushstring x; pcallk 1 0 2")`
+      must run k with status ERRRUN on error (coroutine.lua:~1078).~~ —
+      done (P15.82e): callBuiltin CIST_YPCALL guard + single-C-frame
+      testC pcallk/callk/yieldk + iterative unroll. coroutine.lua
+      --testc now PASSES the entire suite.
+- [x] ~~finishpcallk C-frame TBC close (plan Task 12).~~ — done via the
+      P15.82e single-frame redesign: each continuation state snapshots
+      its closers (collectTestcClosers) and testcContShim runs them
+      after the script, with yield/error state machine. The f407b3c4a
+      regression test (coroutine.lua:1116, toclose+pcallk) passes.
+- [x] ~~lua_pcallk errfunc/message handler (plan Task 10).~~ — done
+      (P15.82f): lua_error folds the thrown object into err_obj and
+      runs invokeErrfunc BEFORE the longjmp (PUC luaG_errormsg), so a
+      yieldable pcallk's k receives the handler-transformed object.
+      Differential vs PUC: identical.
 - [x] ~~lua_closethread is still a stub returning LUA_OK.~~ — done (P15.82g).
 - [x] ~~C hook dispatch via `c_hook` (set by lua_sethook) never fires.~~ — done (P15.82h).
 - [x] ~~Direct `lua_resume` stack/status semantics (lua_status stays 0).~~ — done (P15.82g).
+
+**Known micro-gap (not exercised by any test):** PUC reports LUA_ERRERR
+(5) for "error in error handling"; luazig reports LUA_ERRRUN (2) — the
+error-in-handler STATUS code is collapsed (the message and control flow
+match PUC; only the numeric status differs). Upstream statcodes define
+"ERRERR" but no test asserts it. Fix would thread an err-in-errfunc
+flag through precover's setcistrecst.
 
 ### P15.82g — Implement lua_closethread (was stub) + lua_status thread status
 

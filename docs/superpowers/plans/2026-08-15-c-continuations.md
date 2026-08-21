@@ -1,18 +1,23 @@
-> **STATUS: OPEN — final PUC-parity blockers remain (reopened 2026-08-21
-> after independent review).** The P15.82d–P15.82h improvements stand
-> (iterative C-frame unroll, nested callk chain, non-yieldable yieldk
-> longjmp, basic lua_closethread, basic C-hook dispatch, CallFrame
-> ~104B), but the following are NOT yet PUC-equivalent and block
-> completion (differential-tested against vendored PUC 5.5.0):
-> errfunc stack-index-0 sentinel collision; LUA_ERRERR collapsed to
-> LUA_ERRRUN; finishpcallk C-frame TBC close (yield/error during
-> __close); c_toclose_slots activation scoping; testC still using a
-> handwritten *k lifecycle instead of the production one; lua_State=Vm
-> single-handle model (per-thread C stacks, identity, hooks, status);
-> lua_status error preservation; lua_closethread must discard suspended
-> k, not run it; per-thread/i_ci/yieldable C hooks; spec API-check
-> correction; expanded differential gate. Tasks 10, 12, 13, 16, 17 are
-> reopened accordingly.
+> **STATUS: COMPLETE (2026-08-22, after the reopened blockers were closed
+> by P15.83a–P15.83i).** Everything from the independent review was
+> implemented and differential-tested against vendored PUC Lua 5.5.0:
+> ERRFUNC_NONE sentinel + real LUA_ERRERR (5) [P15.83b]; C-frame TBC
+> activation scoping + finishpcallk pcall-error close state machine with
+> yield/error during __close [P15.83c]; testC callk/pcallk/yieldk routed
+> through the shared production lua_*k helpers (single implementation
+> with c_api) [P15.83d]; real per-lua_State handle architecture —
+> distinct lua_newthread handles, per-handle C API stacks, real
+> lua_xmove, GC stack roots [P15.83e/f]; lua_status error preservation
+> via Thread.api_status + lua_closethread discarding suspended
+> continuations (reset, not resume) + throwbaselevel [P15.83g];
+> per-thread C hooks with lua_Debug.i_ci and yieldable count/line hooks
+> [P15.83h]; spec API-check section corrected [P15.83a]; differential
+> gate expanded to 6 suites + stress/leak coverage [P15.83c/i].
+> Final gate: matrix zig_fail=0 (big.lua accurately recorded both_fail),
+> coroutine.lua --testc full-suite PASS, smoke 54/54 byte-identical to
+> PUC, c_api 16/16 suites + test-diff DIFF: PASS, leak_bench 25/25,
+> CallFrame = 104B, Debug + ReleaseFast builds and tests green.
+> Documented intentional deviations are listed in STATUS.md (P15.83i).
 
 # PUC Lua 5.5 C Continuations Implementation Plan
 
@@ -909,7 +914,7 @@ k==NULL → non-yieldable (incnny). k!=NULL → save k/ctx in C-frame."
 **Files:**
 - Modify: `src/lua/c_api.zig:1264-1270` (lua_pcallk)
 
-- [ ] **Step 1: Implement lua_pcallk with yieldable path**
+- [x] **Step 1: Implement lua_pcallk with yieldable path**
 
 Replace `lua_pcallk` (c_api.zig:1264-1270):
 
@@ -992,12 +997,12 @@ pub export fn lua_pcallk(
 }
 ```
 
-- [ ] **Step 2: Build and test**
+- [x] **Step 2: Build and test**
 
 Run: `zig build -Doptimize=ReleaseFast && python3 tools/testes_matrix.py --testc 2>&1 | tail -5`
 Expected: 30/31
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/lua/c_api.zig
@@ -1511,7 +1516,7 @@ callee. Differential tests against PUC Lua behavior."
 **Files:**
 - Modify: `tests/c_api/10_continuations.c`
 
-- [ ] **Step 1: Add lua_pcallk with yield test**
+- [x] **Step 1: Add lua_pcallk with yield test**
 
 Add to `10_continuations.c`:
 
@@ -1568,7 +1573,7 @@ static int test_pcallk_yield(void) {
 }
 ```
 
-- [ ] **Step 2: Add lua_pcallk with error test**
+- [x] **Step 2: Add lua_pcallk with error test**
 
 ```c
 /* Test 5: lua_pcallk with error in callee */
@@ -1620,7 +1625,7 @@ static int test_pcallk_error(void) {
 }
 ```
 
-- [ ] **Step 3: Add non-yieldable boundary test**
+- [x] **Step 3: Add non-yieldable boundary test**
 
 ```c
 /* Test 6: lua_call (k==NULL) is non-yieldable */
@@ -1655,7 +1660,7 @@ static int test_nonyieldable(void) {
 }
 ```
 
-- [ ] **Step 4: Update main() to run all tests**
+- [x] **Step 4: Update main() to run all tests**
 
 ```c
 int main(void) {
@@ -1675,12 +1680,12 @@ int main(void) {
 }
 ```
 
-- [ ] **Step 5: Build and run**
+- [x] **Step 5: Build and run**
 
 Run: `zig build -Doptimize=ReleaseFast && make -C tests/c_api 10_continuations && ./tests/c_api/10_continuations`
 Expected: `ALL PASS`
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add tests/c_api/10_continuations.c
@@ -1694,37 +1699,37 @@ git commit -m "P15.78: add pcallk yield/error and non-yieldable boundary tests"
 **Files:**
 - Modify: `STATUS.md`
 
-- [ ] **Step 1: Build ReleaseFast**
+- [x] **Step 1: Build ReleaseFast**
 
 Run: `zig build -Doptimize=ReleaseFast`
 Expected: Build succeeds
 
-- [ ] **Step 2: Run matrix tests**
+- [x] **Step 2: Run matrix tests**
 
 Run: `python3 tools/testes_matrix.py --testc 2>&1 | tail -10`
 Expected: 30/31 (no new regressions)
 
-- [ ] **Step 3: Run smoke tests**
+- [x] **Step 3: Run smoke tests**
 
 Run: `for f in tests/smoke/*.lua; do ./zig-out/bin/luazig "$f" 2>&1 | grep -q "FAIL" && echo "FAIL: $f"; done; echo "smoke done"`
 Expected: No failures (49/49)
 
-- [ ] **Step 4: Run Zig unit tests**
+- [x] **Step 4: Run Zig unit tests**
 
 Run: `zig build test 2>&1 | tail -5`
 Expected: All tests pass
 
-- [ ] **Step 5: Run C API tests**
+- [x] **Step 5: Run C API tests**
 
 Run: `make -C tests/c_api test 2>&1`
 Expected: All tests pass (including 10_continuations)
 
-- [ ] **Step 6: Check CallFrame size**
+- [x] **Step 6: Check CallFrame size**
 
 Run: `zig run tests/check_sizes.zig`
 Expected: CallFrame ~100B
 
-- [ ] **Step 7: Update STATUS.md**
+- [x] **Step 7: Update STATUS.md**
 
 Add a new section for C continuations:
 
@@ -1757,7 +1762,7 @@ Add a new section for C continuations:
 - C API tests: 11/11 (including continuations)
 ```
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add STATUS.md

@@ -1,4 +1,4 @@
-# luazig — Project Status & Development History
+> Last updated: 2026-08-22 (P15.83i: reopened blockers closed — plan COMPLETE; final gates green)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -2170,6 +2170,58 @@ stays 0). All differential (PUC + luazig) PASS.
 **Regression gate:** 15/15 c_api suites, test-diff DIFF: PASS (5 suites),
 coroutine.lua --testc exit 0, smoke 54/54, matrix zig_fail=0 (only big.lua
 both_fail), zig build test exit 0.
+
+### P15.83i — Final gates + stress/leak coverage + plan closure
+
+**Stress/leak coverage** (review item 15): new `tests/c_api/15_stress_leak.c`
+(3 workloads × 2000 iterations, memory bounded after full GC, identical
+PASS output on PUC and luazig): repeated coroutine create + yieldk(k) +
+closethread (k discarded, k_calls==0); repeated nested C-frame TBC marks
+(lua_toclose in outer + inner C calls); repeated callk/pcallk chains with
+yields. Added to TESTS and the DIFF_TESTS differential gate (now 6 suites).
+
+**Final Definition-of-Done gate (all green):**
+- zig build Debug + `zig build test -Doptimize=Debug`: exit 0.
+- zig build ReleaseFast + `zig build test -Doptimize=ReleaseFast`: exit 0.
+- make -C tests/c_api clean/test/test-diff: 16/16 suites, DIFF: PASS.
+- Differential coverage (all identical PUC vs luazig): basic yieldk,
+  ctx/status, callk yielding callee, pcallk yield + error, multi-yield,
+  non-yieldable boundary, nested C continuations (t8), main-state pcallk
+  errfunc, LUA_ERRERR (+message, +lua_status after), C-frame TBC +
+  pcallk yield→error, nested C-frame TBC ownership, C return close +
+  yield, closethread suspended-C-continuation discard (+close error,
+  +TBC still runs), lua_status after yield/error, direct lua_resume
+  stack/result placement, per-thread C hooks, hook getinfo/i_ci,
+  line-hook yield.
+- testC: coroutine.lua --testc full-suite exit 0; matrix zig_fail=0
+  (big.lua accurately recorded as both_fail — identical failure in PUC);
+  testC callk/pcallk/yieldk verified to use the shared production
+  lifecycle (P15.83d static gate).
+- Smoke: 54/54 byte-identical output AND exit codes vs PUC (true
+  differential, not grep-FAIL).
+- Leak: tools/leak_bench.py 25/25 PASS + 15_stress_leak bounded.
+- Size: @sizeOf(CallFrame) == 104 B (requirement <= 104B).
+
+**Plan re-closed:** docs/superpowers/plans/2026-08-15-c-continuations.md
+→ STATUS: COMPLETE (2026-08-22). Spec API-check section corrected in
+P15.83a (PUC lapi.c DOES forbid k!=NULL inside hooks). Stale TODOs
+removed (C-frame TBC "NOT closed here" gone since P15.83c).
+
+**Intentional, documented deviations from PUC (non-blocking):**
+1. Count-hook absolute fire counts differ (instruction density: luazig
+   codegen emits different opcode counts; documented TODO
+   count-hook-codegen-parity). Semantics (sum, line events) identical.
+2. lua_Debug.i_ci for CALL events points at the caller frame in the
+   sync dispatch path (the callee frame is not pushed yet); line/count/
+   return events carry the correct current frame. lua_getinfo "l" from
+   hooks works.
+3. api_check-style enforcement (k!=NULL inside hooks; yieldk nresults
+   in hooks) is not raised as a runtime error — matching PUC RELEASE
+   builds where api_check compiles out; the state stays SAFE (hook
+   frames never save k).
+4. lua_gc(LUA_GCCOUNT) accounting differs slightly (stress runs report
+   small negative growth after collect vs PUC's 0) — GC accounting
+   granularity, not a leak (leak_bench 25/25).
 
 ### P15.83g — lua_status error preservation + closethread discards suspended k (reset, not resume)
 

@@ -156,8 +156,7 @@ static int test_count_hook(void) {
         return 1;
     }
 
-    printf("PASS: t1 count_hook (fired %d times, sum=%lld)\n",
-           hook_call_count, (long long)result);
+    printf("PASS: t1 count_hook (fired>0=%s, sum=%lld)\n", hook_call_count > 0 ? "yes" : "no", (long long)result);
     lua_close(L);
     return 0;
 }

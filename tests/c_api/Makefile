@@ -21,11 +21,23 @@ all: $(TESTS)
 test: $(TESTS)
 	@for t in $(TESTS); do ./$$t || exit 1; done
 
-# Differential test: run against both PUC Lua and luazig, compare output
-test-diff: 10_continuations 10_continuations-puc
-	@echo "=== PUC Lua ===" && ./10_continuations-puc > /tmp/puc_out.txt 2>&1; \
-	 echo "=== luazig ===" && ./10_continuations > /tmp/zig_out.txt 2>&1; \
-	 diff /tmp/puc_out.txt /tmp/zig_out.txt && echo "DIFF: PASS (identical output)" || echo "DIFF: FAIL (output differs)"
+# Differential gate: suites that must behave identically on both runtimes.
+# A mismatch FAILS the target (diff non-zero exit aborts under set -e).
+DIFF_TESTS = \
+    10_continuations \
+    11_closethread \
+    12_chook \
+    13_p15_completion
+
+test-diff: $(DIFF_TESTS) $(DIFF_TESTS:%=%-puc)
+	@set -e; \
+	for t in $(DIFF_TESTS); do \
+		echo "=== $$t ==="; \
+		./$$t-puc > /tmp/$$t-puc.txt 2>&1 || true; \
+		./$$t > /tmp/$$t-luazig.txt 2>&1 || true; \
+		diff -u /tmp/$$t-puc.txt /tmp/$$t-luazig.txt; \
+	done; \
+	echo "DIFF: PASS"
 
 clean:
 	rm -f $(TESTS) $(TESTS:%=%-puc)

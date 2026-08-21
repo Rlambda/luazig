@@ -338,26 +338,57 @@ pub export fn lua_callk(
         return;
     };
 
-    if (k) |kf| {
-        if (th.yieldable()) {
-            // Save k/ctx in the current C-frame
-            if (th.call_frames.len() > 0) {
-                const fr = th.call_frames.getPtr(th.call_frames.len() - 1);
-                if (fr.isC()) {
-                    fr.u.c.k = @ptrCast(@alignCast(kf));
-                    fr.u.c.ctx = ctx;
-                }
-            }
+    // Read callee/args from c_stack (PUC: func = L->top - (nargs+1)).
+    const nargs_usize: usize = @intCast(@max(nargs, 0));
+    if (vm.c_stack.items.len < nargs_usize + 1) {
+        if (vm.c_error_jmp) |jb| {
+            vm.c_error_value = .Nil;
+            _longjmp(jb, 1);
         }
-    } else {
-        // PUC: luaD_callnoyield — non-yieldable boundary
-        th.incnny();
+        @panic("lua_call without an active C-function boundary");
     }
-    defer {
-        if (k == null) th.decnny();
-    }
+    const fn_idx = vm.c_stack.items.len - nargs_usize - 1;
+    const callee = vm.c_stack.items[fn_idx];
+    const call_args = vm.c_stack.items[fn_idx + 1 ..];
 
-    lua_callkImpl(L, nargs, nresults);
+    // Delegate k/ctx saving + apiCall to the shared helper (PUC lapi.c:1047-1053).
+    const kfn: ?*const fn (?*Vm, c_int, isize) callconv(.c) c_int = if (k) |kf|
+        @ptrCast(@alignCast(kf))
+    else
+        null;
+
+    const ret = vm.luaCallKShared(th, callee, call_args, kfn, ctx) catch |err| switch (err) {
+        error.Yield => {
+            if (vm.c_error_jmp) |jb| {
+                _longjmp(jb, 2);
+            }
+            @panic("lua_call yield without an active C-function boundary");
+        },
+        error.RuntimeError => {
+            if (vm.c_error_jmp) |jb| {
+                vm.c_error_value = vm.err_obj;
+                _longjmp(jb, 1);
+            }
+            @panic("lua_call without an active C-function boundary");
+        },
+        error.OutOfMemory => {
+            if (vm.c_error_jmp) |jb| {
+                vm.c_error_value = .Nil;
+                _longjmp(jb, 1);
+            }
+            @panic("lua_call OOM without an active C-function boundary");
+        },
+    };
+    defer vm.alloc.free(ret);
+    vm.c_stack.items.len = fn_idx;
+    const want: usize = if (nresults < 0) ret.len else @min(ret.len, @as(usize, @intCast(nresults)));
+    vm.c_stack.appendSlice(vm.alloc, ret[0..want]) catch {
+        if (vm.c_error_jmp) |jb| {
+            vm.c_error_value = .Nil;
+            _longjmp(jb, 1);
+        }
+        @panic("lua_call OOM without an active C-function boundary");
+    };
 }
 
 /// Unprotected call: on failure, rethrows through the active C-function
@@ -1488,60 +1519,36 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
 pub export fn lua_yieldk(L: ?*lua_State, nresults: c_int, ctx: isize, k: ?*const anyopaque) c_int {
     const vm = if (L) |v| v else return 2;
 
-    // PUC: ci->u2.nyield = nresults — save number of yielded values so
-    // lua_resume can report the result count at yield time. Then save k/ctx
-    // in u.c for the continuation (invoked on resume by finishCcall).
-    // PUC API-check: hooks (CIST_HOOKED) cannot use continuations — a hook
-    // frame that yields must not save k (PUC asserts k == NULL for hooks).
-    if (vm.current_thread) |th| {
-        if (th.call_frames.len() > 0) {
-            const fr = th.call_frames.getPtr(th.call_frames.len() - 1);
-            if (fr.isC()) {
-                fr.u.c.aux.nyield = nresults;
-                if (k) |kf| {
-                    if (!fr.isDebugHook()) {
-                        fr.u.c.k = @ptrCast(@alignCast(kf));
-                        fr.u.c.ctx = ctx;
-                    }
-                }
-            }
-        }
-    }
-
-    // Read the yielded values from c_stack and pass them to apiYield, which
-    // calls builtinCoroutineYield. builtinCoroutineYield performs the full
-    // yieldable check (raising "attempt to yield from outside a coroutine" /
-    // "across a C-call boundary" on failure), stores the yielded values in
-    // th.yielded, and returns error.Yield on success.
-    //
-    // We call apiYield DIRECTLY (not through s.yield()) because s.yield()
-    // catches error.Yield and converts it to error.Runtime — which would
-    // prevent us from longjmp'ing. By calling apiYield directly, we can
-    // catch error.Yield ourselves and perform the longjmp.
+    // Read the yielded values from c_stack (PUC: api_checkpop + L->top - nresults).
     const nresults_usize: usize = @intCast(@max(nresults, 0));
     if (nresults_usize > vm.c_stack.items.len) return 2;
     const base = vm.c_stack.items.len - nresults_usize;
-    vm.apiYield(vm.c_stack.items[base..]) catch |err| switch (err) {
+
+    // Delegate nyield + k/ctx saving + apiYield to the shared helper
+    // (PUC ldo.c:1019-1029). The helper saves nyield on the top C-frame,
+    // saves k/ctx (unless a debug hook), and calls apiYield which calls
+    // builtinCoroutineYield. On success, apiYield returns error.Yield.
+    const th = vm.current_thread orelse {
+        // No thread — can't yield. Match PUC: luaG_runerror.
+        return 2;
+    };
+    const kfn: ?*const fn (?*Vm, c_int, isize) callconv(.c) c_int = if (k) |kf|
+        @ptrCast(@alignCast(kf))
+    else
+        null;
+
+    vm.luaYieldKShared(th, vm.c_stack.items[base..], nresults, kfn, ctx) catch |err| switch (err) {
         // Yield succeeded: builtinCoroutineYield stored the values in
         // th.yielded and returned error.Yield. Now longjmp to the
         // callCFunctionWithBoundary setjmp point (value 2 = yield).
-        // This unwinds the C function's stack frame, just like PUC's
-        // lua_yield which does a longjmp to the lua_resume boundary.
         error.Yield => {
             if (vm.c_error_jmp) |jb| {
                 _longjmp(jb, 2);
             }
-            // No C-function boundary set up — can't yield. This happens
-            // when lua_yieldk is called outside a C function called from
-            // the bytecode VM (e.g., called directly from C without a
-            // coroutine). Return LUA_ERRRUN.
             return 2;
         },
         // Non-yieldable (incnny set by lua_call with k==NULL): the yield
-        // was rejected. PUC lua_yieldk calls luaD_throw(L, LUA_ERRRUN)
-        // which longjmps to the nearest pcall/resume boundary. We must
-        // do the same — longjmp with value 1 (error), NOT return 2
-        // (which the C caller would interpret as "2 return values").
+        // was rejected. PUC lua_yieldk calls luaD_throw(L, LUA_ERRRUN).
         error.RuntimeError => {
             if (vm.c_error_jmp) |jb| {
                 _longjmp(jb, 1);
@@ -1550,9 +1557,7 @@ pub export fn lua_yieldk(L: ?*lua_State, nresults: c_int, ctx: isize, k: ?*const
         },
         error.OutOfMemory => return 4,
     };
-    // apiYield returned normally (no error) — shouldn't happen for a yield,
-    // but handle it gracefully.
-    return 1; // LUA_YIELD
+    return 1; // LUA_YIELD — shouldn't happen
 }
 
 /// PUC `lua_status` (lapi.c:lua_status): return the status of thread L.
@@ -1643,63 +1648,29 @@ pub export fn lua_pcallk(
         }
     }
 
-    // ── Yieldable pcall: save state in C-frame ──
-    // PUC lua_pcallk yieldable path (lapi.c:1097-1117):
-    //   ci->u.c.k = k;  ci->u.c.ctx = ctx;
-    //   ci->u2.funcidx = savestack(L, L->top - nargs - 1);
-    //   ci->u.c.old_errfunc = L->errfunc;
-    //   L->errfunc = func;
-    //   setoah(ci, L->allowhook);
-    //   ci->callstatus |= CIST_YPCALL;
-    //   status = luaD_call(L, f_call, nresults);
-    //   finishpcallk(L, status);
-    if (th.call_frames.len() == 0) return 2;
-    const fr = th.call_frames.getPtr(th.call_frames.len() - 1);
-    if (!fr.isC()) return 2;
-
-    // PUC validates errfunc and computes func BEFORE saving any state.
-    // Normalize the c_stack index to a 0-based absolute position.
+    // ── Yieldable pcall: delegate to shared helper ──
+    // PUC lua_pcallk yieldable path (lapi.c:1097-1117): save k/ctx/funcidx/
+    // old_errfunc/OAH on L->ci, set CIST_YPCALL, call the callee. On normal
+    // return, clear CIST_YPCALL + restore errfunc. On error/yield, C-frame
+    // stays for precover.
+    //
+    // Read callee/args from c_stack and compute errfunc_val, then delegate
+    // the production lifecycle (k/ctx/funcidx/old_errfunc/OAH/YPCALL saving
+    // + apiCall + normal-return cleanup) to luaPcallKShared.
     const nargs_usize: usize = @intCast(@max(nargs, 0));
     if (vm.c_stack.items.len < nargs_usize + 1) return 2;
+    const fn_idx = vm.c_stack.items.len - nargs_usize - 1;
+    const callee = vm.c_stack.items[fn_idx];
+    const call_args = vm.c_stack.items[fn_idx + 1 ..];
     const errfunc_val: ?Value = if (errfunc != 0) blk: {
         const abs = api.normalizeIndex(errfunc, vm.c_stack.items.len) orelse return 2;
         break :blk vm.c_stack.items[abs];
     } else null;
 
-    // Save k/ctx in ci->u.c (PUC lapi.c:1098-1099)
-    fr.u.c.k = @ptrCast(@alignCast(k.?));
-    fr.u.c.ctx = ctx;
+    const kfn: *const fn (?*Vm, c_int, isize) callconv(.c) c_int =
+        @ptrCast(@alignCast(k.?));
 
-    // Save funcidx in ci->u2.funcidx — callee position on c_stack for error
-    // recovery in finishpcallk (PUC lapi.c:1100).
-    fr.u.c.aux.funcidx = vm.c_stack.items.len - nargs_usize - 1;
-
-    // Save old_errfunc, set new errfunc (PUC lapi.c:1101-1104)
-    fr.u.c.old_errfunc = th.errfunc;
-    if (errfunc_val) |ef| vm.setErrfuncValue(ef);
-
-    // setoah(ci, L->allowhook) — save allowhook via CIST_OAH (PUC lapi.c:1105)
-    fr.setOah(th.allowhook);
-    // Set CIST_YPCALL (PUC lapi.c:1106)
-    fr.setYpcall();
-
-    // P15.78: Call the callee directly via apiCall (not s.call, which catches
-    // error.Yield and converts it to error.Runtime). If the callee yields,
-    // we longjmp with value 2 (yield) so callCFunction can propagate
-    // error.Yield and leave the C-frame in place for finishCcall on resume.
-    const nargs_usize2: usize = @intCast(@max(nargs, 0));
-    if (vm.c_stack.items.len < nargs_usize2 + 1) {
-        fr.clearYpcall();
-        if (errfunc_val != null) {
-            vm.setErrfuncValue(null);
-            th.errfunc = fr.u.c.old_errfunc;
-        }
-        return 2;
-    }
-    const fn_idx = vm.c_stack.items.len - nargs_usize2 - 1;
-    const callee = vm.c_stack.items[fn_idx];
-    const call_args = vm.c_stack.items[fn_idx + 1 ..];
-    const ret = vm.apiCall(callee, call_args) catch |err| switch (err) {
+    const ret = vm.luaPcallKShared(th, callee, call_args, errfunc_val, fn_idx, kfn, ctx) catch |err| switch (err) {
         error.Yield => {
             // P15.78: Callee yielded. Longjmp with value 2 (yield) so
             // callCFunction can propagate error.Yield and leave the C-frame
@@ -1708,53 +1679,41 @@ pub export fn lua_pcallk(
             if (vm.c_error_jmp) |jb| {
                 _longjmp(jb, 2);
             }
-            // No C-function boundary — can't yield
-            fr.clearYpcall();
+            // No C-function boundary — can't yield. Fallback cleanup.
+            const fr2 = th.call_frames.getPtr(th.call_frames.len() - 1);
+            fr2.clearYpcall();
             if (errfunc_val != null) {
                 vm.setErrfuncValue(null);
-                th.errfunc = fr.u.c.old_errfunc;
             }
+            th.errfunc = fr2.u.c.old_errfunc;
             return 2;
         },
         error.RuntimeError => {
             // PUC: lua_pcallk's yieldable path does NOT catch errors locally.
-            // It calls `luaD_call` which can longjmp on error. The C-frame
-            // (with CIST_YPCALL set) stays in place for `precover` to find.
-            // `callCFunctionWithBoundary` catches the longjmp and returns -1;
-            // `callCFunction` then checks CIST_YPCALL and leaves the C-frame
-            // in place, propagating `error.RuntimeError` up to the trampoline.
-            // The trampoline calls `precover` → `finishCcall` → `finishpcallk`
-            // → k to complete error recovery.
+            // The C-frame (with CIST_YPCALL set) stays in place for precover.
             if (vm.c_error_jmp) |jb| {
                 _longjmp(jb, 1);
             }
-            // No C-function boundary — shouldn't happen in yieldable path.
-            // Fall back to the old local-catch behavior as a safety net.
-            fr.clearYpcall();
+            // No C-function boundary — fallback cleanup.
+            const fr2 = th.call_frames.getPtr(th.call_frames.len() - 1);
+            fr2.clearYpcall();
             if (errfunc_val != null) {
                 vm.setErrfuncValue(null);
-                th.errfunc = fr.u.c.old_errfunc;
             }
-            // PUC: LUA_ERRERR (5) if message handler errored, LUA_ERRRUN (2) otherwise.
+            th.errfunc = fr2.u.c.old_errfunc;
             return if (vm.err_is_errerr) 5 else 2;
         },
         error.OutOfMemory => {
-            fr.clearYpcall();
+            const fr2 = th.call_frames.getPtr(th.call_frames.len() - 1);
+            fr2.clearYpcall();
             if (errfunc_val != null) {
                 vm.setErrfuncValue(null);
-                th.errfunc = fr.u.c.old_errfunc;
             }
+            th.errfunc = fr2.u.c.old_errfunc;
             return 4; // LUA_ERRMEM
         },
     };
     defer vm.alloc.free(ret);
-
-    // Normal return: clear CIST_YPCALL, restore errfunc
-    fr.clearYpcall();
-    if (errfunc_val != null) {
-        vm.setErrfuncValue(null);
-        th.errfunc = fr.u.c.old_errfunc;
-    }
 
     // Put results on c_stack
     vm.c_stack.items.len = fn_idx;

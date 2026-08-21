@@ -1966,6 +1966,55 @@ A C hook that calls `lua_yield` will be rejected by the existing
 non-yieldable check. PUC allows hook yields only inside coroutines with
 proper CIST_HOOKED machinery; this is a future enhancement.
 
+### P15.83d — testC callk/pcallk/yieldk use the shared production lua_*k lifecycle
+
+Reopened plan Task 13: upstream testC must validate the SAME production
+implementation external C code uses, not a handwritten copy.
+
+**Shared helpers** (vm.zig, near apiYield): `luaCallKShared` (PUC
+lapi.c:1047-1053 k/ctx save, yieldable-conditional; k==NULL → incnny),
+`luaPcallKShared` (lapi.c:1097-1117 yieldable path: k/ctx/funcidx/
+old_errfunc/OAH/CIST_YPCALL save + apiCall + normal-return clearYpcall/
+errfunc restore; error path leaves the frame for precover),
+`luaYieldKShared` (ldo.c:1020-1028 nyield + k/ctx save — hooks never
+save k — + apiYield). All return Zig errors; the CALLER converts to its
+regime (c_api wrappers `_longjmp`; testC branches propagate through
+callBuiltin).
+
+**c_api.zig** `lua_callk`/`lua_pcallk` (yieldable path)/`lua_yieldk` are
+now thin wrappers: read callee/args from c_stack, delegate, convert
+errors via the existing `_longjmp` logic, marshal results.
+
+**testC branches** (`.callk`/`.pcallk`/`.yieldk`/`.yield` non-hook path)
+no longer write ANY production C-frame state — they keep only payload:
+the reuse_cframe provisioning decision (testC chained-continuation
+ownership), pushBuiltinCFrame under `!reuse_cframe`, prev_state/
+allocTestcState, bytecode_resume_boundary (regime difference: callBuiltin
+has no setjmp), last_status strings, and st marshalling. Static gate
+(`rg 'u\.c\.k|u\.c\.ctx|setYpcall|aux\.funcidx|builtinCoroutineYield|pushBuiltinCFrame'`
+over the testC region) shows zero production writes left; the single
+remaining `apiCall` in the region is the plain `.pcall` command (ltests
+runC implements its pcall with local error handling too — payload).
+
+Behavior deltas from unification (both PUC-ward): testC pcallk now sets
+`th.errfunc = ERRFUNC_NONE` for the call duration (PUC `L->errfunc = 0`)
+and restores on return; testC yieldk now records `aux.nyield` (PUC
+`u2.nyield`); callk k-saving is yieldable-conditional as in PUC.
+
+**Test (item 11):** `10_continuations.c` t8 nested_callk — Lua → C outer
+(lua_callk C mid, k_outer) → C mid (lua_callk Lua f, k_mid) → Lua f
+yields → resume → k_mid → k_outer; final value "outer". Identical output
+on PUC and luazig.
+
+**Regression gate:** 14/14 c_api suites, test-diff DIFF: PASS (4 suites),
+coroutine.lua --testc exit 0, smoke 54/54, matrix zig_fail=0 (only
+big.lua both_fail), zig build test exit 0.
+
+**Remaining from the reopened plan:** per-lua_State handle architecture
+(item 6), lua_status error preservation (7), closethread discards
+suspended k (8), per-thread/i_ci/yieldable C hooks (9), hook API-check
+enforcement (10), full differential coverage + final gates (15/16/17).
+
 ## Открытые задачи
 
 Статус проверен 2026-08-06.

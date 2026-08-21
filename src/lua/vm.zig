@@ -3984,6 +3984,144 @@ pub const Vm = struct {
         return exposeDispatchResult(void, self.builtinCoroutineYield(args, out[0..]));
     }
 
+    /// Shared core of PUC `lua_callk` (lapi.c:1037-1056): save k/ctx on the
+    /// current top C-frame (PUC `ci->u.c.k = k`), then invoke `apiCall` with
+    /// the caller-supplied callee/args. Returns callee results (caller-owned
+    /// slice, free with `alloc.free`). On `error.Yield`/`error.RuntimeError`
+    /// the C-frame is left for `finishCcall`/`precover` — callers convert
+    /// (c_api: `_longjmp`; testC: propagate through `callBuiltin`).
+    /// `k == null` → `incnny` (non-yieldable boundary, PUC `luaD_callnoyield`)
+    /// with `decnny` on return.
+    ///
+    /// Both c_api (`lua_callk`) and testC (`.callk` branch) delegate here so
+    /// the production k/ctx lifecycle has a single implementation. The caller
+    /// is responsible for reading callee/args from its stack (c_stack or st),
+    /// marshalling results back, and converting errors to its regime
+    /// (`_longjmp` or Zig error propagation).
+    pub fn luaCallKShared(
+        self: *Vm,
+        th: *Thread,
+        callee: Value,
+        args: []const Value,
+        k: ?*const fn (?*Vm, c_int, isize) callconv(.c) c_int,
+        ctx: isize,
+    ) Error![]Value {
+        // PUC lapi.c:1047-1053: if k != NULL and yieldable, save k/ctx on
+        // L->ci (the current top C-frame); else callnoyield (incnny).
+        if (k) |kf| {
+            if (th.yieldable()) {
+                if (th.call_frames.len() > 0) {
+                    const fr = th.call_frames.getPtr(th.call_frames.len() - 1);
+                    if (fr.isC()) {
+                        fr.u.c.k = kf;
+                        fr.u.c.ctx = ctx;
+                    }
+                }
+            }
+        } else {
+            th.incnny();
+        }
+        defer {
+            if (k == null) th.decnny();
+        }
+        return self.apiCall(callee, args);
+    }
+
+    /// Shared core of PUC `lua_pcallk` yieldable path (lapi.c:1097-1117):
+    /// save k/ctx/funcidx/old_errfunc/OAH on the current top C-frame, set
+    /// `CIST_YPCALL`, invoke `apiCall`. Normal return: `clearYpcall` +
+    /// restore errfunc (lapi.c:1110-1112) and return results. `error.Yield` /
+    /// `error.RuntimeError`: C-frame stays (`CIST_YPCALL`) for `precover` —
+    /// propagate to the caller's regime.
+    ///
+    /// `errfunc_val` null = no handler for the duration (`th.errfunc := ERRFUNC_NONE`,
+    /// matching PUC `L->errfunc = func` where `func = 0` when `errfunc == 0`).
+    /// On normal return, `th.errfunc` is restored to the saved `old_errfunc`.
+    ///
+    /// Both c_api (`lua_pcallk` yieldable path) and testC (`.pcallk` branch)
+    /// delegate here. The caller handles error conversion (`_longjmp` or Zig
+    /// propagation) and result marshalling. On error, the caller's fallback
+    /// (no `_longjmp` boundary) must `clearYpcall` + restore errfunc itself.
+    pub fn luaPcallKShared(
+        self: *Vm,
+        th: *Thread,
+        callee: Value,
+        args: []const Value,
+        errfunc_val: ?Value,
+        funcidx: usize,
+        k: *const fn (?*Vm, c_int, isize) callconv(.c) c_int,
+        ctx: isize,
+    ) Error![]Value {
+        if (th.call_frames.len() == 0) return error.RuntimeError;
+        const fr = th.call_frames.getPtr(th.call_frames.len() - 1);
+        if (!fr.isC()) return error.RuntimeError;
+
+        // PUC lapi.c:1101-1108: save k/ctx, funcidx, old_errfunc, set new
+        // errfunc, save OAH, set CIST_YPCALL.
+        fr.u.c.k = k;
+        fr.u.c.ctx = ctx;
+        fr.u.c.aux.funcidx = @intCast(funcidx);
+        fr.u.c.old_errfunc = th.errfunc;
+        if (errfunc_val) |ef| {
+            self.setErrfuncValue(ef);
+        } else {
+            th.errfunc = ERRFUNC_NONE;
+        }
+        fr.setOah(th.allowhook);
+        fr.setYpcall();
+
+        const ret = self.apiCall(callee, args) catch |e| {
+            // PUC: on error/yield, `luaD_call` longjmps — CIST_YPCALL stays,
+            // errfunc stays set. `precover`/`finishpcallk` handles cleanup on
+            // resume. Propagate to the caller's regime.
+            return e;
+        };
+
+        // Normal return: clear CIST_YPCALL, restore errfunc
+        // (PUC lapi.c:1110-1112).
+        fr.clearYpcall();
+        if (errfunc_val != null) {
+            self.setErrfuncValue(null);
+        }
+        th.errfunc = fr.u.c.old_errfunc;
+        return ret;
+    }
+
+    /// Shared core of PUC `lua_yieldk` (ldo.c:1006-1034): save `nyield` and
+    /// k/ctx on the current top C-frame (hooks do not save k — PUC
+    /// `api_check`), then invoke `apiYield`. Returns `error.Yield` on success
+    /// (the caller converts: c_api `_longjmp(jb, 2)`; testC propagates through
+    /// `callBuiltin`). On `error.RuntimeError` (non-yieldable), the C-frame
+    /// state is left as-is for the caller to handle.
+    ///
+    /// Both c_api (`lua_yieldk`) and testC (`.yieldk` / `.yield` non-hook
+    /// path) delegate here. The caller is responsible for reading yielded
+    /// values from its stack and converting errors to its regime.
+    pub fn luaYieldKShared(
+        self: *Vm,
+        th: *Thread,
+        yielded: []const Value,
+        nresults: i32,
+        k: ?*const fn (?*Vm, c_int, isize) callconv(.c) c_int,
+        ctx: isize,
+    ) Error!void {
+        // PUC ldo.c:1020-1028: ci->u2.nyield = nresults; if not a hook,
+        // ci->u.c.k = k; ci->u.c.ctx = ctx.
+        if (th.call_frames.len() > 0) {
+            const fr = th.call_frames.getPtr(th.call_frames.len() - 1);
+            if (fr.isC()) {
+                fr.u.c.aux.nyield = nresults;
+                if (k) |kf| {
+                    if (!fr.isDebugHook()) {
+                        fr.u.c.k = kf;
+                        fr.u.c.ctx = ctx;
+                    }
+                }
+            }
+        }
+        return self.apiYield(yielded);
+    }
+
     pub fn apiIsYieldable(self: *Vm, th: ?*Thread) Error!bool {
         var out: [1]Value = .{.Nil};
         if (th) |t| {
@@ -32804,8 +32942,6 @@ pub const Vm = struct {
                     try self.pushBuiltinCFrame(callee);
                 }
                 const cframe = th.call_frames.getPtr(th.call_frames.len() - 1);
-                cframe.u.c.k = &testcContShim;
-                cframe.u.c.ctx = 0;
                 // P15.82e: remember the previous state (owned by an outer
                 // testcContShim invocation or null) — restored on normal
                 // return. NOT destroyed here: testcContShim's defer owns it.
@@ -32853,7 +32989,12 @@ pub const Vm = struct {
                 // boundary_depth when it pushes its own frame).
                 th.bytecode_resume_boundary = th.call_frames.len();
 
-                const ret = self.apiCall(callee, call_args) catch |e| switch (e) {
+                // PRODUCTION lifecycle (P15.83d): PUC lua_callk's k/ctx
+                // saving (yieldable-conditional, lapi.c:1047-1053) and the
+                // apiCall invocation live in the shared helper — the SAME
+                // implementation c_api lua_callk uses. The branch below only
+                // handles testC payload (continuation state) around it.
+                const ret = self.luaCallKShared(th, callee, call_args, &testcContShim, 0) catch |e| switch (e) {
                     error.Yield => {
                         // C-frame stays; the new continuation state stays
                         // (prev_state, if any, is freed by the running
@@ -33744,8 +33885,6 @@ pub const Vm = struct {
                     // function), same as yieldk.
                     try self.pushBuiltinCFrame(.{ .Thread = th });
                     const cframe = th.call_frames.getPtr(th.call_frames.len() - 1);
-                    cframe.u.c.k = &testcContShim;
-                    cframe.u.c.ctx = 0;
 
                     // Save continuation state on the C-frame (free old state
                     // if any). script="return *" returns all resume values
@@ -33798,8 +33937,22 @@ pub const Vm = struct {
                     // bytecode_inplace_suspended = true.
                     th.bytecode_resume_boundary = 0;
                 }
-                var outv: [0]Value = .{};
-                try self.builtinCoroutineYield(st.items[base..], outv[0..]);
+                // PRODUCTION lifecycle (P15.83d): PUC runC's `lua_yield(L, n)`
+                // is lua_yieldk with k=NULL; the nyield save and apiYield
+                // invocation live in the shared helper (the SAME
+                // implementation c_api lua_yieldk uses). The non-hook path
+                // passes k=testcContShim so the "return *" payload delivers
+                // the resume values as the C call's results (PUC: k==NULL
+                // poscall delivers them — same observable behavior through
+                // luazig's shim). The hook path passes k=NULL (PUC hooks
+                // cannot use continuations).
+                try self.luaYieldKShared(
+                    th,
+                    st.items[base..],
+                    @intCast(nres_i),
+                    if (self.isInDebugHook()) null else &testcContShim,
+                    0,
+                );
             },
             .yieldk => {
                 if (cargs.len != 2) return self.fail("testC yieldk expects 2 args", .{});
@@ -33833,8 +33986,6 @@ pub const Vm = struct {
                     try self.pushBuiltinCFrame(.{ .Thread = th });
                 }
                 const cframe = th.call_frames.getPtr(th.call_frames.len() - 1);
-                cframe.u.c.k = &testcContShim;
-                cframe.u.c.ctx = 0;
                 // P15.82e: an old state (if any) is owned by the running
                 // testcContShim invocation — replace without destroying.
                 cframe.u.c.testc_state = null;
@@ -33875,8 +34026,11 @@ pub const Vm = struct {
                 // runBytecodeInternal errdefer preserves ALL frames.
                 th.bytecode_resume_boundary = 0;
 
-                var outv: [0]Value = .{};
-                try self.builtinCoroutineYield(st.items[base..], outv[0..]);
+                // PRODUCTION lifecycle (P15.83d): PUC lua_yieldk's nyield +
+                // k/ctx saving and the apiYield invocation live in the shared
+                // helper — the SAME implementation c_api lua_yieldk uses.
+                // testC only contributes its payload (continuation state).
+                try self.luaYieldKShared(th, st.items[base..], @intCast(nres), &testcContShim, 0);
             },
             .setmetatable => {
                 if (cargs.len != 1) return self.fail("testC setmetatable expects 1 arg", .{});
@@ -34164,20 +34318,6 @@ pub const Vm = struct {
                     try self.pushBuiltinCFrame(callee);
                 }
                 const cframe = th.call_frames.getPtr(th.call_frames.len() - 1);
-                // PUC lua_pcallk: ci->u.c.k = k; ci->u.c.ctx = ctx;
-                // ci->u2.funcidx = savestack(L, c.func);
-                // ci->u.c.old_errfunc = L->errfunc; setoah(ci, L->allowhook);
-                // ci->callstatus |= CIST_YPCALL.
-                // luazig: funcidx = cframe.base (callee stack position,
-                // same convention as builtinPcall). errfunc arg is always 0
-                // for testC pcallk (ltests lua_pcallk(L1, narg, nres, 0, i,
-                // Cfunck)), so old_errfunc = current th.errfunc.
-                cframe.u.c.k = &testcContShim;
-                cframe.u.c.ctx = 0;
-                cframe.u.c.old_errfunc = th.errfunc;
-                cframe.u.c.aux.funcidx = cframe.base;
-                cframe.callstatus = setoah(cframe.callstatus, th.allowhook);
-                cframe.setYpcall();
 
                 // P15.82e single-frame ownership: the frame's previous state
                 // (if any) is owned by the OUTER running testcContShim
@@ -34221,7 +34361,17 @@ pub const Vm = struct {
 
                 th.bytecode_resume_boundary = th.call_frames.len();
 
-                const ret = self.apiCall(callee, call_args) catch |e| switch (e) {
+                // PRODUCTION lifecycle (P15.83d): PUC lua_pcallk's yieldable
+                // path (k/ctx/funcidx/old_errfunc/OAH/CIST_YPCALL saving, the
+                // apiCall invocation, and the normal-return clearYpcall +
+                // errfunc restore, lapi.c:1097-1117) lives in the shared
+                // helper — the SAME implementation c_api lua_pcallk uses.
+                // funcidx = cframe.base (callee stack position, same
+                // convention as builtinPcall); errfunc arg is always 0 for
+                // testC pcallk (ltests passes errfunc=0), so errfunc_val =
+                // null (th.errfunc := ERRFUNC_NONE for the duration, exactly
+                // PUC's `L->errfunc = func` with func = 0).
+                const ret = self.luaPcallKShared(th, callee, call_args, null, cframe.base, &testcContShim, 0) catch |e| switch (e) {
                     error.Yield => {
                         th.bytecode_inplace_suspended = true;
                         last_status.* = "YIELD";
@@ -34244,17 +34394,14 @@ pub const Vm = struct {
                     },
                 };
 
-                // Normal return — PUC lua_pcallk (lapi.c:1110-1112):
-                //   ci->callstatus &= ~CIST_YPCALL;
-                //   L->errfunc = ci->u.c.old_errfunc;
-                // The C-frame itself is NOT popped here: callBuiltin's defer
+                // Normal return — the shared helper already performed PUC
+                // lapi.c:1110-1112 (clearYpcall + errfunc restore). The
+                // C-frame itself is NOT popped here: callBuiltin's defer
                 // pops it (fresh call, cframe_preserved == false on normal
                 // return) — or poscallCFrame pops it later when pcallk ran
                 // inside a continuation (finishCcall context). Destroy the
                 // new state and restore prev_state so the outer shim
                 // invocation still finds its own state on the frame.
-                cframe.clearYpcall();
-                th.errfunc = cframe.u.c.old_errfunc;
                 if (cframe.u.c.testc_state) |s| {
                     self.destroyTestcState(s);
                 }

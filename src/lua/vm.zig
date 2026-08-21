@@ -2789,7 +2789,13 @@ pub const Vm = struct {
     /// distinct from in-flight bytecode registers — with a dedicated
     /// `ArrayListUnmanaged(Value)`, which avoids entangling C-API operations
     /// with the bytecode dispatch loop's active register window.
-    c_stack: std.ArrayListUnmanaged(Value) = .empty,
+    ///
+    /// **Phase 2:** This is a pointer to the active handle's `c_stack` field
+    /// (`&cur_handle.c_stack`). It is reassigned only during coroutine
+    /// resume/return (switching to/from the coroutine's handle). During
+    /// `callCFunction`/`finishCcall` stack swaps, the pointer itself stays
+    /// fixed — the swap operates on `cur_c_stack.*` (the value pointed to).
+    cur_c_stack: *std.ArrayListUnmanaged(Value) = undefined,
 
     /// Active `jmp_buf` for the C-function error boundary (PUC's
     /// `L->errorjmp`). `null` while no C extension runs through the boundary.
@@ -3225,6 +3231,7 @@ pub const Vm = struct {
         h.* = .{ .vm = self, .is_main = true };
         self.main_handle = h;
         self.cur_handle = h;
+        self.cur_c_stack = &h.c_stack;
         return h;
     }
 
@@ -3784,9 +3791,10 @@ pub const Vm = struct {
         // safe. Without this, every sub-VM (checkpanic) leaks both buffers.
         self.long_string_cache.deinit(self.alloc);
         self.testc_warn_buff.deinit(self.alloc);
-        // C API stack: owns only its backing array, never the Values themselves
-        // (those are GC objects freed by drainGcRegistries). Safe to release here.
-        self.c_stack.deinit(self.alloc);
+        // C API stack: no longer owned by Vm directly (Phase 2: per-handle
+        // stacks). The main handle's c_stack is freed by lua_close /
+        // api.State.deinit; coroutine handles' c_stacks are freed by
+        // gcFreeObject(.thread). Nothing to deinit here.
         // C API to-close slots: owns only the index list, not the Values.
         self.c_toclose_slots.deinit(self.alloc);
         // C library cache (c_libs): free the dupe'd path keys and the HashMap
@@ -4908,8 +4916,8 @@ pub const Vm = struct {
         defer tbc_vals.deinit(self.alloc);
         while (self.c_toclose_slots.items.len > tbc_base) {
             const tbc_idx = self.c_toclose_slots.pop().?;
-            if (tbc_idx < self.c_stack.items.len) {
-                tbc_vals.append(self.alloc, self.c_stack.items[tbc_idx]) catch return;
+            if (tbc_idx < self.cur_c_stack.items.len) {
+                tbc_vals.append(self.alloc, self.cur_c_stack.items[tbc_idx]) catch return;
             }
         }
 
@@ -7840,8 +7848,8 @@ pub const Vm = struct {
             // raw status: LUA_YIELD (1) for plain yield, or the error status
             // for pcallk errors.
             const api_status: c_int = @intCast(status);
-            const saved_c_stack = self.c_stack;
-            self.c_stack = .empty;
+            const saved_c_stack = self.cur_c_stack.*;
+            self.cur_c_stack.* = .empty;
 
             // PUC: if error status (not LUA_YIELD), luaD_seterrorobj has
             // already placed the error object on the Lua stack at func.
@@ -7851,9 +7859,9 @@ pub const Vm = struct {
             // luaD_seterrorobj(L, status, func) which sets L->top = func + 1.
             if (status != 1) { // not LUA_YIELD — error status
                 if (self.err_has_obj) {
-                    self.c_stack.append(self.alloc, self.err_obj) catch {
-                        self.c_stack.deinit(self.alloc);
-                        self.c_stack = saved_c_stack;
+                    self.cur_c_stack.append(self.alloc, self.err_obj) catch {
+                        self.cur_c_stack.deinit(self.alloc);
+                        self.cur_c_stack.* = saved_c_stack;
                         return error.OutOfMemory;
                     };
                 }
@@ -7884,8 +7892,8 @@ pub const Vm = struct {
                 // is preserved (testc_state stays). Clean up c_stack and
                 // propagate ThreadSwitch so the trampoline processes the
                 // switch request.
-                self.c_stack.deinit(self.alloc);
-                self.c_stack = saved_c_stack;
+                self.cur_c_stack.deinit(self.alloc);
+                self.cur_c_stack.* = saved_c_stack;
                 return error.ThreadSwitch;
             }
 
@@ -7899,8 +7907,8 @@ pub const Vm = struct {
                 // P15.83c FIX B: Snapshot TBC values from k's c_stack before
                 // freeing it, so they can be closed on resume-error.
                 self.snapshotYieldedTbc(th_bc.len() - 1);
-                self.c_stack.deinit(self.alloc);
-                self.c_stack = saved_c_stack;
+                self.cur_c_stack.deinit(self.alloc);
+                self.cur_c_stack.* = saved_c_stack;
                 return error.Yield;
             }
 
@@ -7911,8 +7919,8 @@ pub const Vm = struct {
                 // err_obj directly without going through c_error_value).
                 // Don't overwrite err_obj if c_error_value is null — the
                 // error builtin may have already set it.
-                self.c_stack.deinit(self.alloc);
-                self.c_stack = saved_c_stack;
+                self.cur_c_stack.deinit(self.alloc);
+                self.cur_c_stack.* = saved_c_stack;
                 if (self.c_error_value) |cv| {
                     self.c_error_value = null;
                     self.err_obj = cv;
@@ -7936,16 +7944,16 @@ pub const Vm = struct {
             const n: i32 = nret_signed;
             const n_usize: usize = @intCast(@max(n, 0));
             if (n_usize > 0) {
-                const c_top = self.c_stack.items.len;
+                const c_top = self.cur_c_stack.items.len;
                 const src_start = if (c_top >= n_usize) c_top - n_usize else 0;
                 const actual_n = if (c_top >= n_usize) n_usize else c_top;
                 const results = self.alloc.alloc(Value, actual_n) catch {
-                    self.c_stack.deinit(self.alloc);
-                    self.c_stack = saved_c_stack;
+                    self.cur_c_stack.deinit(self.alloc);
+                    self.cur_c_stack.* = saved_c_stack;
                     return error.OutOfMemory;
                 };
                 for (0..actual_n) |i| {
-                    results[i] = self.c_stack.items[src_start + i];
+                    results[i] = self.cur_c_stack.items[src_start + i];
                 }
                 if (th.resume_inbox) |old| self.alloc.free(old);
                 th.resume_inbox = results;
@@ -7954,8 +7962,8 @@ pub const Vm = struct {
                 th.resume_inbox = null;
             }
             // Restore c_stack
-            self.c_stack.deinit(self.alloc);
-            self.c_stack = saved_c_stack;
+            self.cur_c_stack.deinit(self.alloc);
+            self.cur_c_stack.* = saved_c_stack;
             // Set isHookYield on the Lua frame below the C-frame so the
             // OP_CALL dispatch uses resume_inbox values instead of re-calling.
             // P15.78: Skip stale C-frames (testc_state=null, k=testcContShim)
@@ -17740,6 +17748,31 @@ pub const Vm = struct {
             try self.gcMarkValue(.{ .String = state.s });
             try self.gcMarkValue(.{ .String = state.p });
         }
+
+        // P15.83f: Mark all live C-API handle stacks as GC roots. Each
+        // lua_State handle has its own c_stack, and values pushed via the
+        // C API (lua_pushstring, lua_newtable, etc.) are only reachable
+        // through the handle's c_stack. Without this, a GC cycle during
+        // C extension code could collect values sitting on a handle stack.
+        //
+        // PUC Lua marks L->stack[0..L->top] for every live lua_State. We
+        // mirror this by marking the main handle's c_stack here, and each
+        // Thread's api_handle c_stack in the .thread case of gcMarkValue.
+        if (self.main_handle) |mh| {
+            for (mh.c_stack.items) |value| {
+                if (GcObject.fromValue(value) != null) try self.gcMarkValue(value);
+            }
+            // cur_c_stack may point to a coroutine's c_stack during
+            // lua_resume. If it differs from main_handle, mark it too
+            // (the coroutine's Thread may not yet be marked if it was
+            // just created). Skip if main_handle is null (test VMs that
+            // don't call setupMainHandle have cur_c_stack = undefined).
+            if (self.cur_c_stack != &mh.c_stack) {
+                for (self.cur_c_stack.items) |value| {
+                    if (GcObject.fromValue(value) != null) try self.gcMarkValue(value);
+                }
+            }
+        }
     }
 
     /// Run at most `budget` collector work units. A propagation unit scans one
@@ -18889,6 +18922,16 @@ pub const Vm = struct {
                         if (GcObject.fromValue(yv) != null) {
                             try self.gcMarkValue(yv);
                         }
+                    }
+                }
+                // P15.83f: Mark the coroutine's C-API handle stack. Each
+                // Thread has an api_handle (lua_State) with its own c_stack.
+                // Values pushed via the C API on the coroutine's stack are
+                // only reachable through this c_stack. PUC Lua marks
+                // L->stack[0..L->top] for every live lua_State.
+                if (th.api_handle) |ah| {
+                    for (ah.c_stack.items) |value| {
+                        if (GcObject.fromValue(value) != null) try self.gcMarkValue(value);
                     }
                 }
                 // P15.78 Task 13: Trace per-C-frame testc_state for GC mark
@@ -30430,8 +30473,8 @@ pub const Vm = struct {
             }
             // No error — return saved return values.
             const rv = state.close_return_values.?;
-            vm.c_stack.clearRetainingCapacity();
-            vm.c_stack.appendSlice(vm.alloc, rv) catch return -1;
+            vm.cur_c_stack.clearRetainingCapacity();
+            vm.cur_c_stack.appendSlice(vm.alloc, rv) catch return -1;
 
             return @intCast(rv.len);
         }
@@ -30457,8 +30500,8 @@ pub const Vm = struct {
         // For yield status, add resume values from resume_inbox.
         if (status != 0 and status != 1) {
             // Error status: read error object from c_stack (placed by finishCcall).
-            if (vm.c_stack.items.len > 0) {
-                st.append(vm.alloc, vm.c_stack.items[0]) catch return -1;
+            if (vm.cur_c_stack.items.len > 0) {
+                st.append(vm.alloc, vm.cur_c_stack.items[0]) catch return -1;
             }
         } else if (th.resume_inbox) |ri| {
             st.appendSlice(vm.alloc, ri) catch return -1;
@@ -30578,8 +30621,8 @@ pub const Vm = struct {
                 return -1;
             }
             // No error — return saved return values.
-            vm.c_stack.clearRetainingCapacity();
-            vm.c_stack.appendSlice(vm.alloc, rv) catch return -1;
+            vm.cur_c_stack.clearRetainingCapacity();
+            vm.cur_c_stack.appendSlice(vm.alloc, rv) catch return -1;
 
             return @intCast(rv.len);
         }
@@ -30587,11 +30630,11 @@ pub const Vm = struct {
         // No closers. Transfer results from st to c_stack.
         // PUC Lua `return n` returns the LAST n items from the stack
         // (using negative indices). Mirror this here.
-        vm.c_stack.clearRetainingCapacity();
+        vm.cur_c_stack.clearRetainingCapacity();
         const spec = rr.return_spec orelse testc.ReturnSpec{ .fixed = 0 };
         switch (spec) {
             .all => {
-                vm.c_stack.appendSlice(vm.alloc, st.items) catch return -1;
+                vm.cur_c_stack.appendSlice(vm.alloc, st.items) catch return -1;
 
                 return @intCast(st.items.len);
             },
@@ -30599,7 +30642,7 @@ pub const Vm = struct {
                 const count = @min(n, st.items.len);
                 // Take the LAST `count` items from st.
                 const start = st.items.len - count;
-                vm.c_stack.appendSlice(vm.alloc, st.items[start..]) catch return -1;
+                vm.cur_c_stack.appendSlice(vm.alloc, st.items[start..]) catch return -1;
 
                 return @intCast(count);
             },
@@ -30653,8 +30696,8 @@ pub const Vm = struct {
         args: []const Value,
     ) DispatchError![]Value {
         // Swap in a fresh C-API stack holding exactly the arguments.
-        const saved_stack = self.c_stack;
-        self.c_stack = .empty;
+        const saved_stack = self.cur_c_stack.*;
+        self.cur_c_stack.* = .empty;
         // P15.82: results_owned tracks whether saved_results is owned by
         // the C-frame (CIST_CLSRET yield) and should NOT be freed by errdefer.
         // This flag is checked by the errdefer to prevent dangling pointer.
@@ -30663,12 +30706,12 @@ pub const Vm = struct {
             if (!results_owned) {
                 // saved_results will be freed by its own errdefer below
             }
-            self.c_stack.deinit(self.alloc);
-            self.c_stack = saved_stack;
+            self.cur_c_stack.deinit(self.alloc);
+            self.cur_c_stack.* = saved_stack;
         }
         // Place the arguments at c_stack[0..nargs] so that lua_to*(L, 1..n)
         // resolves them via the absolute positive-index convention.
-        try self.c_stack.appendSlice(self.alloc, args);
+        try self.cur_c_stack.appendSlice(self.alloc, args);
 
         // P15.78: Push a C-frame so `lua_yieldk` can save k/ctx and
         // `finishCcall` can invoke k on resume. This mirrors PUC Lua's
@@ -30770,8 +30813,8 @@ pub const Vm = struct {
                         defer tbc_vals.deinit(self.alloc);
                         while (self.c_toclose_slots.items.len > tbc_base) {
                             const tbc_idx = self.c_toclose_slots.pop().?;
-                            if (tbc_idx < self.c_stack.items.len) {
-                                tbc_vals.append(self.alloc, self.c_stack.items[tbc_idx]) catch return error.OutOfMemory;
+                            if (tbc_idx < self.cur_c_stack.items.len) {
+                                tbc_vals.append(self.alloc, self.cur_c_stack.items[tbc_idx]) catch return error.OutOfMemory;
                             }
                         }
                         // Allocate CClsretState in pcall_error_close mode.
@@ -30834,10 +30877,10 @@ pub const Vm = struct {
         // P15.82: Only close TBC slots belonging to THIS C-frame (using
         // toclose_base). This mirrors PUC's per-call-info TBC scope.
         const nret: usize = if (nret_signed > 0) @intCast(nret_signed) else 0;
-        const total = self.c_stack.items.len;
+        const total = self.cur_c_stack.items.len;
         const result_start: usize = if (total >= nret) total - nret else 0;
         const actual_nret: usize = if (total >= nret) nret else total;
-        const saved_results = try self.alloc.dupe(Value, self.c_stack.items[result_start .. result_start + actual_nret]);
+        const saved_results = try self.alloc.dupe(Value, self.cur_c_stack.items[result_start .. result_start + actual_nret]);
         // P15.82: errdefer checks results_owned to avoid freeing
         // saved_results when it's owned by clsret_state (CIST_CLSRET yield).
         errdefer if (!results_owned) self.alloc.free(saved_results);
@@ -30851,8 +30894,8 @@ pub const Vm = struct {
         defer tbc_values.deinit(self.alloc);
         while (self.c_toclose_slots.items.len > tbc_base) {
             const tbc_idx = self.c_toclose_slots.pop().?;
-            if (tbc_idx < self.c_stack.items.len) {
-                try tbc_values.append(self.alloc, self.c_stack.items[tbc_idx]);
+            if (tbc_idx < self.cur_c_stack.items.len) {
+                try tbc_values.append(self.alloc, self.cur_c_stack.items[tbc_idx]);
             }
         }
 
@@ -30913,8 +30956,8 @@ pub const Vm = struct {
 
         // Restore the caller's C-API stack view (PUC leaves the caller's
         // `L->top`/`L->base` intact after luaD_poscall).
-        self.c_stack.deinit(self.alloc);
-        self.c_stack = saved_stack;
+        self.cur_c_stack.deinit(self.alloc);
+        self.cur_c_stack.* = saved_stack;
         // Results were already extracted from c_stack before TBC close.
         // Mark as owned so errdefer doesn't free them.
         results_owned = true;
@@ -35481,9 +35524,9 @@ test "vm: callCFunction dispatches a c_func closure" {
     // extension function interacts with the VM through the C API shim.
     const doubler = struct {
         fn run(L: ?*lua_State) callconv(.c) c_int {
-            const v = L.?.vm.c_stack.items[0];
+            const v = L.?.vm.cur_c_stack.items[0];
             const n: i64 = switch (v) { .Int => |i| i, else => 0 };
-            L.?.vm.c_stack.append(L.?.vm.alloc, .{ .Int = n * 2 }) catch {};
+            L.?.vm.cur_c_stack.append(L.?.vm.alloc, .{ .Int = n * 2 }) catch {};
             return 1;
         }
     }.run;
@@ -35504,7 +35547,7 @@ test "vm: callCFunction dispatches a c_func closure" {
 
     // The C-API stack must be restored to its pre-call state (empty here) —
     // the swap-in/swap-out in callCFunction must not leak the temp stack.
-    try testing.expectEqual(@as(usize, 0), vm.c_stack.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.cur_c_stack.items.len);
 }
 
 test "vm: callCFunction with zero results" {
@@ -35534,7 +35577,7 @@ test "vm: callCFunction with zero results" {
     defer vm.alloc.free(ret);
 
     try testing.expectEqual(@as(usize, 0), ret.len);
-    try testing.expectEqual(@as(usize, 0), vm.c_stack.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.cur_c_stack.items.len);
 }
 
 test "vm: table constructor and access" {

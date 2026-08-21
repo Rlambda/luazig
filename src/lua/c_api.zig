@@ -307,6 +307,8 @@ pub export fn lua_error(L: ?*lua_State) noreturn {
         vm.err_source = null;
         vm.err_line = -1;
     }
+    // Fresh error: reset LUA_ERRERR signal before invokeErrfunc.
+    vm.err_is_errerr = false;
     vm.invokeErrfunc() catch {};
     if (vm.c_error_jmp) |jb| {
         _longjmp(jb, 1);
@@ -1422,7 +1424,8 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
             vm.c_stack.append(vm.alloc, .Nil) catch {};
         }
         if (nres) |p| p.* = @intCast(if (vm.c_stack.items.len > 0) vm.c_stack.items.len - lua_resume_base else 0);
-        return 2; // LUA_ERRRUN
+        // PUC: LUA_ERRERR (5) if message handler errored, LUA_ERRRUN (2) otherwise.
+        return if (vm.err_is_errerr) 5 else 2;
     };
     // Success or yield: replace function+args with results on c_stack.
     vm.c_stack.items.len = lua_resume_base;
@@ -1703,7 +1706,8 @@ pub export fn lua_pcallk(
                 vm.setErrfuncValue(null);
                 th.errfunc = fr.u.c.old_errfunc;
             }
-            return 2; // LUA_ERRRUN
+            // PUC: LUA_ERRERR (5) if message handler errored, LUA_ERRRUN (2) otherwise.
+            return if (vm.err_is_errerr) 5 else 2;
         },
         error.OutOfMemory => {
             fr.clearYpcall();

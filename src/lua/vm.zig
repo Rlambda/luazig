@@ -2758,11 +2758,14 @@ pub const Vm = struct {
 
     /// PUC `L->hook` (lstate.c): C hook function installed by `lua_sethook`.
     /// When non-null and the corresponding mask bit is set, the VM calls this
-    /// function at hook events (call/return/line/count). luazig's Lua-side
-    /// hook system (`DebugHookState`) is separate — this field is for the C
-    /// API hook only. Currently stored but not yet wired into the dispatch
-    /// loop (TODO: integrate C hook invocation into the bytecode dispatcher).
-    c_hook: ?*const fn (?*Vm, *anyopaque) callconv(.c) void = null,
+    /// function at hook events (call/return/line/count). This is the C-API
+    /// hook slot — PUC Lua has a single hook slot per thread, so when this is
+    /// set, the Lua-level `DebugHookState.func` is cleared (and vice versa).
+    /// The signature matches PUC `lua_Hook = void (*)(lua_State*, lua_Debug*)`;
+    /// both args are `?*anyopaque` here because vm.zig does not depend on
+    /// c_api.zig (which defines `lua_Debug`). The dispatch code casts both
+    /// pointers to the correct types before calling.
+    c_hook: ?*const fn (?*anyopaque, ?*anyopaque) callconv(.c) void = null,
 
     /// PUC `L->hookmask` (lstate.c): bitmask of active hook events
     /// (LUA_MASKCALL | LUA_MASKRET | LUA_MASKLINE | LUA_MASKCOUNT).
@@ -3006,9 +3009,16 @@ pub const Vm = struct {
     /// state. Called after every debug.sethook / hook clear.
     /// P15.35: Now includes call/return hooks — the OP_RETURN fast path relies
     /// on this flag to decide whether to skip the return hook dispatch.
-    fn refreshHooksCached(self: *Vm) void {
+    pub fn refreshHooksCached(self: *Vm) void {
         const hs = self.activeHookState();
-        self.hooks_active_cached = hs.has_line or hs.count > 0 or hs.has_call or hs.has_return;
+        // P15.82h: Include the C-API hook slot (c_hook). When lua_sethook
+        // installs a C hook, it mirrors the mask/count into the active
+        // thread's DebugHookState so existing trigger sites fire, and sets
+        // c_hook != null. The cached flag must be true for the fast path to
+        // reach the dispatch sites.
+        const c_hook_active = self.c_hook != null and self.c_hook_mask != 0;
+        self.hooks_active_cached = c_hook_active or
+            hs.has_line or hs.count > 0 or hs.has_call or hs.has_return;
     }
 
     /// P15.35: Returns true if `ret` points into the VM's `bc_return_scratch`
@@ -4906,7 +4916,7 @@ pub const Vm = struct {
         return &self.debug_hook_main;
     }
 
-    fn hookStateFor(self: *Vm, target_thread: ?*Thread) *DebugHookState {
+    pub fn hookStateFor(self: *Vm, target_thread: ?*Thread) *DebugHookState {
         if (target_thread) |th| return &th.debug_hook;
         if (self.current_thread) |th| return &th.debug_hook;
         if (self.main_thread) |th| return &th.debug_hook;
@@ -21664,6 +21674,96 @@ pub const Vm = struct {
         if (self.debug_hooks_suppressed != 0) return;
         if (self.isInDebugHook()) return;
         const hook_state = self.activeHookState();
+
+        // P15.82h: C-API hook dispatch (PUC luaD_hook). PUC Lua has a single
+        // hook slot per thread: when lua_sethook installs a C hook, it clears
+        // the Lua-level DebugHookState.func, and vice versa. So if c_hook is
+        // set, there is no Lua hook to check — dispatch directly to the C
+        // function. The mask/count are mirrored into DebugHookState by
+        // lua_sethook so the existing trigger sites (line/count/call/return)
+        // fire and reach this dispatch point.
+        if (self.c_hook) |hook_fn| {
+            if (self.c_hook_mask != 0) {
+                // Map the event string to a PUC mask bit and check c_hook_mask.
+                // LUA_MASKCALL=1, LUA_MASKRET=2, LUA_MASKLINE=4, LUA_MASKCOUNT=8
+                // (lua.h:464-467). "tail call" shares LUA_MASKCALL with "call".
+                const mask_bit: c_int = if (std.mem.eql(u8, event, "call") or std.mem.eql(u8, event, "tail call"))
+                    1 // LUA_MASKCALL
+                else if (std.mem.eql(u8, event, "return"))
+                    2 // LUA_MASKRET
+                else if (std.mem.eql(u8, event, "line"))
+                    4 // LUA_MASKLINE
+                else if (std.mem.eql(u8, event, "count"))
+                    8 // LUA_MASKCOUNT
+                else
+                    0;
+                if (mask_bit != 0 and (self.c_hook_mask & mask_bit) != 0) {
+                    // Map event string to PUC event code (lua.h:454-457):
+                    // LUA_HOOKCALL=0, LUA_HOOKRET=1, LUA_HOOKLINE=2,
+                    // LUA_HOOKCOUNT=3, LUA_HOOKTAILCALL=4
+                    const event_code: c_int = if (std.mem.eql(u8, event, "call"))
+                        0
+                    else if (std.mem.eql(u8, event, "return"))
+                        1
+                    else if (std.mem.eql(u8, event, "line"))
+                        2
+                    else if (std.mem.eql(u8, event, "count"))
+                        3
+                    else // "tail call"
+                        4;
+
+                    // Save/restore transfer state (same as Lua hook path).
+                    const saved_transfer = self.debug_transfer_values;
+                    const saved_transfer_start = self.debug_transfer_start;
+                    const saved_calllike = self.debug_hook_event_calllike;
+                    const saved_tailcall = self.debug_hook_event_tailcall;
+                    const saved_is_count = self.debug_hook_event_is_count;
+                    const saved_allow_yield = self.debug_hook_allow_yield;
+                    self.debug_transfer_values = transfer;
+                    self.debug_transfer_start = transfer_start;
+                    self.debug_hook_event_calllike = std.mem.eql(u8, event, "call") or std.mem.eql(u8, event, "tail call");
+                    self.debug_hook_event_tailcall = std.mem.eql(u8, event, "tail call");
+                    self.debug_hook_event_is_count = std.mem.eql(u8, event, "count");
+                    self.debug_hook_allow_yield = false; // C hooks cannot yield in sync path
+                    defer {
+                        self.debug_transfer_values = saved_transfer;
+                        self.debug_transfer_start = saved_transfer_start;
+                        self.debug_hook_event_calllike = saved_calllike;
+                        self.debug_hook_event_tailcall = saved_tailcall;
+                        self.debug_hook_event_is_count = saved_is_count;
+                        self.debug_hook_allow_yield = saved_allow_yield;
+                    }
+
+                    // P15.38f: Set per-thread in_debug_hook (PUC's allowhook=0)
+                    // so isInDebugHook() returns true and prevents re-entrant
+                    // hook dispatch while the C hook is running.
+                    const hook_state_for_flag = self.activeHookState();
+                    hook_state_for_flag.in_debug_hook = true;
+                    defer hook_state_for_flag.in_debug_hook = false;
+
+                    // Build lua_Debug on the stack (PUC luaD_hook: ar.event,
+                    // ar.currentline, ar.i_ci). Only event and currentline are
+                    // set by luaD_hook; the rest are zero-initialized (PUC
+                    // uses a stack-local `lua_Debug ar`).
+                    const LuaDebug = @import("c_api.zig").lua_Debug;
+                    var ar: LuaDebug = .{};
+                    ar.event = event_code;
+                    ar.currentline = if (line) |l| @intCast(l) else -1;
+                    ar.i_ci = null; // PUC sets ar.i_ci = ci; we don't expose ci
+
+                    // Call the C hook: (*hook)(L, &ar).
+                    // PUC luaD_hook: lua_unlock(L); (*hook)(L, &ar); lua_lock(L);
+                    // We don't have a lock, so we just call directly.
+                    const hook_ptr: *const fn (?*anyopaque, ?*anyopaque) callconv(.c) void = hook_fn;
+                    hook_ptr(@ptrCast(self), @ptrCast(&ar));
+                    return;
+                }
+            }
+            // C hook is set but mask doesn't match this event — no dispatch.
+            return;
+        }
+
+        // Lua-level hook dispatch (DebugHookState.func).
         const hook = hook_state.func orelse return;
         if (hook == .Nil) return;
 
@@ -22291,6 +22391,10 @@ pub const Vm = struct {
 
         if (i >= args.len or args[i] == .Nil) {
             hook_state.clear();
+            // P15.82h: Single hook slot — clear the C-API hook too.
+            self.c_hook = null;
+            self.c_hook_mask = 0;
+            self.c_hook_count = 0;
             self.refreshHooksCached();
             return;
         }
@@ -22301,6 +22405,12 @@ pub const Vm = struct {
             else => return self.fail("debug.sethook expects function or nil", .{}),
         }
         hook_state.func = hook;
+        // P15.82h: Single hook slot — clear the C-API hook when a Lua hook
+        // is installed. PUC Lua has one hook slot per thread; setting a Lua
+        // hook via debug.sethook replaces any C hook set via lua_sethook.
+        self.c_hook = null;
+        self.c_hook_mask = 0;
+        self.c_hook_count = 0;
         // Every public debug.sethook installation is a Lua hook by default.
         // Native-hook compatibility callers opt in atomically after this call.
         hook_state.allow_yield = false;

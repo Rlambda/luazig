@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-21 (P15.82g: implement lua_closethread + lua_status thread status)
+> Last updated: 2026-08-21 (P15.82h: wire c_hook dispatch into the hook machinery)
 
 ---
 
@@ -1785,7 +1785,7 @@ coroutine.lua + big.lua pre-existing), smoke 54/54, c_api 18/18.
 - [ ] finishpcallk C-frame TBC close (plan Task 12).
 - [ ] lua_pcallk errfunc/message handler (plan Task 10).
 - [x] ~~lua_closethread is still a stub returning LUA_OK.~~ — done (P15.82g).
-- [ ] C hook dispatch via `c_hook` (set by lua_sethook) never fires.
+- [x] ~~C hook dispatch via `c_hook` (set by lua_sethook) never fires.~~ — done (P15.82h).
 - [x] ~~Direct `lua_resume` stack/status semantics (lua_status stays 0).~~ — done (P15.82g).
 
 ### P15.82g — Implement lua_closethread (was stub) + lua_status thread status
@@ -1812,6 +1812,64 @@ close, `lua_status` after yield/completion). Verified identical output
 on PUC Lua 5.5.0 and luazig. c_api 19/19, smoke 54/54, matrix
 zig_fail=0 (only big.lua both_fail pre-existing), coroutine.lua --testc
 exit 0, zig build test exit 0.
+
+### P15.82h — Wire c_hook dispatch into the hook machinery (PUC luaD_hook)
+
+**Problem:** `Vm.c_hook` (set by `lua_sethook`) was stored but never
+invoked — dead code. The Lua-level hook system (`DebugHookState` on
+`Thread`) was completely separate, and `debugDispatchHookTransfer`
+returned early when `DebugHookState.func` was null (which it always is
+for a C-only hook).
+
+**Implementation (PUC-faithful single-slot unification):**
+
+- **Signature fix** (vm.zig): `c_hook` changed from
+  `?*const fn (?*Vm, *anyopaque)` to `?*const fn (?*anyopaque, ?*anyopaque)`
+  matching PUC `lua_Hook = void (*)(lua_State*, lua_Debug*)`. Both args
+  are `?*anyopaque` because vm.zig does not import c_api.zig (which
+  defines `lua_Debug`); the dispatch code casts via `@import("c_api.zig")`.
+
+- **lua_sethook** (c_api.zig): Mirrors PUC ldebug.c:133 — `func==NULL or
+  mask==0` clears the hook; otherwise stores hook/mask/count on `Vm` and
+  mirrors the mask/count into the target thread's `DebugHookState`
+  (has_call/has_return/has_line/count/budget) so existing trigger sites
+  (line/count/call/return dispatch in the bytecode loop) fire and reach
+  `debugDispatchHookTransfer`. The Lua-level `DebugHookState.func` is
+  cleared (single slot, PUC has one hook per thread).
+
+- **Dispatch** (vm.zig `debugDispatchHookTransfer`): After the fast-path
+  checks (hooks_active_cached, debug_hooks_suppressed, isInDebugHook), if
+  `c_hook` is set and `c_hook_mask` has the matching bit, the C hook is
+  called mirroring PUC `luaD_hook` (ldo.c:439): build `lua_Debug{event,
+  currentline}`, set `in_debug_hook=true` (PUC `allowhook=0`), save/restore
+  transfer state, call `(*hook)(L, &ar)`, restore. C hooks cannot yield
+  in this sync path — the existing "attempt to yield across a C-call
+  boundary" check in `builtinCoroutineYield` rejects it (same as PUC
+  outside coroutines with proper CIST_HOOKED machinery).
+
+- **Single-slot unification**: `builtinDebugSethook` clears `c_hook` when
+  setting a Lua hook; `lua_sethook` clears `DebugHookState.func` when
+  setting a C hook. Only one hook type is active at a time, matching
+  PUC's singular `L->hook` slot.
+
+- **refreshHooksCached** (vm.zig): Includes `c_hook != null and
+  c_hook_mask != 0` so the fast path reaches the dispatch sites.
+
+**Test:** `tests/c_api/12_chook.c` (4 tests: count hook on coroutine
+loop, gethook/gethookmask/gethookcount API, clear with NULL/0/0, line
+hook on multi-line code). Verified identical "ALL PASS" output on PUC
+Lua 5.5.0 and luazig. Count hook fires different absolute counts (206
+PUC vs 307 zig) due to bytecode density differences — this is expected
+and correct (the sum is 5050 on both).
+
+**Regression gate:** c_api 25/25, smoke 54/54, matrix zig_fail=0 (only
+big.lua both_fail pre-existing), coroutine.lua --testc exit 0, zig build
+test exit 0.
+
+**Known limitation:** C hooks cannot yield in the sync dispatch path.
+A C hook that calls `lua_yield` will be rejected by the existing
+non-yieldable check. PUC allows hook yields only inside coroutines with
+proper CIST_HOOKED machinery; this is a future enhancement.
 
 ## Открытые задачи
 

@@ -568,6 +568,81 @@ static int test_nonyieldable(void) {
 
 /* ------------------------------------------------------------------ */
 
+/* t8: nested C continuations — validates the PUC `unroll` loop.
+ * Lua → C outer (lua_callk C mid, k_outer) → C mid (lua_callk Lua f,
+ * k_mid) → Lua f yields. resume → unroll runs k_mid (poscall pops mid's
+ * frame) then k_outer — the LAST continuation's result wins:
+ * expected final value "outer", not "mid-done". */
+
+static int nk_outer(lua_State *L, int status, lua_KContext ctx) {
+    (void)status; (void)ctx;
+    lua_pushliteral(L, "outer");
+    return 1;
+}
+
+static int nk_mid(lua_State *L, int status, lua_KContext ctx) {
+    (void)status; (void)ctx;
+    lua_pushliteral(L, "mid-done");
+    return 1;
+}
+
+/* arg 1 = Lua f (a function that yields) */
+static int nc_mid(lua_State *L) {
+    lua_pushvalue(L, 1);
+    lua_callk(L, 0, 1, 0, nk_mid);
+    return 1;
+}
+
+/* arg 1 = Lua f, forwarded through c_mid */
+static int nc_outer(lua_State *L) {
+    lua_pushcfunction(L, nc_mid);
+    lua_pushvalue(L, 1);
+    lua_callk(L, 1, 1, 0, nk_outer);
+    return 1;
+}
+
+static int test_nested_callk(void) {
+    lua_State *L = luaL_newstate();
+    if (!L) { fprintf(stderr, "FAIL: newstate\n"); return 1; }
+    luaL_openlibs(L);
+
+    lua_pushcfunction(L, nc_outer);
+    lua_setglobal(L, "c_nested_outer");
+
+    const char *code =
+        "local co = coroutine.create(function()\n"
+        "  return c_nested_outer(function()\n"
+        "    coroutine.yield('Y')\n"
+        "    return 'f-ret'\n"
+        "  end)\n"
+        "end)\n"
+        "local ok1, v1 = coroutine.resume(co)\n"
+        "local ok2, v2 = coroutine.resume(co)\n"
+        "return tostring(ok1), tostring(v1), tostring(ok2), tostring(v2)\n";
+    if (luaL_loadstring(L, code) != LUA_OK ||
+        lua_pcallk(L, 0, 4, 0, 0, NULL) != LUA_OK) {
+        fprintf(stderr, "FAIL t8: driver: %s\n", lua_tostring(L, -1));
+        lua_close(L); return 1;
+    }
+    const char *ok1 = lua_tostring(L, -4);
+    const char *v1  = lua_tostring(L, -3);
+    const char *ok2 = lua_tostring(L, -2);
+    const char *v2  = lua_tostring(L, -1);
+    if (!ok1 || !v1 || !ok2 || !v2 ||
+        strcmp(ok1, "true") != 0 || strcmp(v1, "Y") != 0 ||
+        strcmp(ok2, "true") != 0 || strcmp(v2, "outer") != 0) {
+        fprintf(stderr, "FAIL t8: ok1=%s v1=%s ok2=%s v2=%s (expected true/Y/true/outer)\n",
+                ok1 ? ok1 : "?", v1 ? v1 : "?", ok2 ? ok2 : "?", v2 ? v2 : "?");
+        lua_close(L); return 1;
+    }
+
+    lua_close(L);
+    printf("PASS: t8 nested_callk\n");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+
 int main(void) {
     if (test_yieldk_basic())   return 1;
     if (test_pcallk())         return 1;
@@ -576,6 +651,7 @@ int main(void) {
     if (test_pcallk_error())   return 1;
     if (test_ctx_propagation()) return 1;
     if (test_nonyieldable())   return 1;
+    if (test_nested_callk())   return 1;
     printf("PASS: 10_continuations\n");
     return 0;
 }

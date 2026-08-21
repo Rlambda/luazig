@@ -1118,7 +1118,7 @@ poscallCFrame: move results and pop C-frame."
 **Files:**
 - Modify: `src/lua/vm.zig`
 
-- [ ] **Step 1: Implement finishpcallk**
+- [x] **Step 1: Implement finishpcallk**
 
 ```zig
     /// PUC `finishpcallk` (ldo.c:804-821): error recovery for yieldable pcall.
@@ -1155,7 +1155,7 @@ poscallCFrame: move results and pop C-frame."
     }
 ```
 
-- [ ] **Step 2: Implement findpcall**
+- [x] **Step 2: Implement findpcall**
 
 ```zig
     /// PUC `findpcall` (ldo.c:884-891): scan call_frames for CIST_YPCALL.
@@ -1171,7 +1171,7 @@ poscallCFrame: move results and pop C-frame."
     }
 ```
 
-- [ ] **Step 3: Implement precover**
+- [x] **Step 3: Implement precover**
 
 ```zig
     /// PUC `precover` (ldo.c:955-963): error recovery loop.
@@ -1190,12 +1190,12 @@ poscallCFrame: move results and pop C-frame."
     }
 ```
 
-- [ ] **Step 4: Build and test**
+- [x] **Step 4: Build and test**
 
 Run: `zig build -Doptimize=ReleaseFast && python3 tools/testes_matrix.py --testc 2>&1 | tail -5`
 Expected: 30/31
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/lua/vm.zig
@@ -1216,28 +1216,28 @@ precover: error recovery loop — find pcall, save status, re-enter."
 **Files:**
 - Modify: `src/lua/vm.zig` (testC command implementations)
 
-- [ ] **Step 1: Find all testC callk/pcallk/yieldk command implementations**
+- [x] **Step 1: Find all testC callk/pcallk/yieldk command implementations**
 
 Run: `grep -n "callk\|pcallk\|yieldk\|T\.callk\|T\.pcallk\|T\.yieldk" src/lua/vm.zig | head -30`
 
-- [ ] **Step 2: Update testC callk to use real lua_callk**
+- [x] **Step 2: Update testC callk to use real lua_callk**
 
 The testC `callk` command should call `lua_callk` with a real `k` callback instead of using `saveTestcPendingContinuation`. The `k` callback re-executes the remaining testC script.
 
-- [ ] **Step 3: Update testC pcallk to use real lua_pcallk**
+- [x] **Step 3: Update testC pcallk to use real lua_pcallk**
 
 Same pattern — use real `lua_pcallk` with `k` callback.
 
-- [ ] **Step 4: Update testC yieldk to use real lua_yieldk**
+- [x] **Step 4: Update testC yieldk to use real lua_yieldk**
 
 Same pattern — use real `lua_yieldk` with `k` callback.
 
-- [ ] **Step 5: Build and test**
+- [x] **Step 5: Build and test**
 
 Run: `zig build -Doptimize=ReleaseFast && python3 tools/testes_matrix.py --testc 2>&1 | tail -5`
 Expected: 30/31
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/lua/vm.zig

@@ -305,6 +305,209 @@ static int test_status(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Test 6: lua_status after error (must preserve LUA_ERRRUN)          */
+/* ------------------------------------------------------------------ */
+
+static int test_status_after_error(void) {
+    lua_State *L = luaL_newstate();
+    if (!L) { fprintf(stderr, "FAIL: newstate\n"); return 1; }
+    luaL_openlibs(L);
+
+    lua_State *co = lua_newthread(L);
+    lua_pop(L, 1);
+    if (luaL_loadstring(co, "error('boom')") != LUA_OK) {
+        fprintf(stderr, "FAIL t6: load failed\n");
+        lua_close(L);
+        return 1;
+    }
+
+    int nres;
+    int st = lua_resume(co, L, 0, &nres);
+    if (st != LUA_ERRRUN) {
+        fprintf(stderr, "FAIL t6: resume returned %d, expected LUA_ERRRUN(%d)\n",
+                st, LUA_ERRRUN);
+        lua_close(L);
+        return 1;
+    }
+
+    /* lua_status must return LUA_ERRRUN after a runtime error */
+    st = lua_status(co);
+    if (st != LUA_ERRRUN) {
+        fprintf(stderr, "FAIL t6: lua_status after error = %d, expected LUA_ERRRUN(%d)\n",
+                st, LUA_ERRRUN);
+        lua_close(L);
+        return 1;
+    }
+
+    lua_close(L);
+    printf("PASS: t6 status_after_error\n");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 7: lua_closethread discards suspended C continuation (k)      */
+/* ------------------------------------------------------------------ */
+
+static int t7_close_k_calls = 0;
+
+static int t7_k_must_not_run(lua_State *L, int status, lua_KContext ctx) {
+    (void)L; (void)status; (void)ctx;
+    t7_close_k_calls++;
+    return 0;
+}
+
+static int t7_yield_with_k(lua_State *L) {
+    return lua_yieldk(L, 0, 0, t7_k_must_not_run);
+}
+
+static int test_closethread_suspended_c_cont(void) {
+    lua_State *L = luaL_newstate();
+    if (!L) { fprintf(stderr, "FAIL: newstate\n"); return 1; }
+    luaL_openlibs(L);
+
+    lua_State *co = lua_newthread(L);
+    lua_pop(L, 1);
+    lua_pushcfunction(co, t7_yield_with_k);
+
+    int nres;
+    int st = lua_resume(co, L, 0, &nres);
+    if (st != LUA_YIELD) {
+        fprintf(stderr, "FAIL t7: resume returned %d, expected LUA_YIELD(%d)\n",
+                st, LUA_YIELD);
+        lua_close(L);
+        return 1;
+    }
+
+    /* Close the suspended coroutine — k must NOT be called */
+    t7_close_k_calls = 0;
+    st = lua_closethread(co, L);
+    if (st != LUA_OK) {
+        fprintf(stderr, "FAIL t7: lua_closethread returned %d, expected LUA_OK(%d)\n",
+                st, LUA_OK);
+        lua_close(L);
+        return 1;
+    }
+    if (t7_close_k_calls != 0) {
+        fprintf(stderr, "FAIL t7: close_k_calls = %d, expected 0 (k was called!)\n",
+                t7_close_k_calls);
+        lua_close(L);
+        return 1;
+    }
+    if (lua_gettop(co) != 0) {
+        fprintf(stderr, "FAIL t7: lua_gettop(co) = %d, expected 0\n",
+                (int)lua_gettop(co));
+        lua_close(L);
+        return 1;
+    }
+    if (lua_status(co) != LUA_OK) {
+        fprintf(stderr, "FAIL t7: lua_status(co) = %d, expected LUA_OK(%d)\n",
+                lua_status(co), LUA_OK);
+        lua_close(L);
+        return 1;
+    }
+
+    lua_close(L);
+    printf("PASS: t7 closethread_suspended_c_cont\n");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 8: lua_closethread close error with suspended C continuation  */
+/* ------------------------------------------------------------------ */
+
+static int test_closethread_close_error(void) {
+    lua_State *L = luaL_newstate();
+    if (!L) { fprintf(stderr, "FAIL: newstate\n"); return 1; }
+    luaL_openlibs(L);
+
+    lua_State *co = lua_newthread(L);
+    lua_pop(L, 1);
+    luaL_loadstring(co,
+        "local x <close> = setmetatable({}, {\n"
+        "  __close = function() error('close_err') end\n"
+        "})\n"
+        "coroutine.yield()\n");
+
+    int nres;
+    int st = lua_resume(co, L, 0, &nres);
+    if (st != LUA_YIELD) {
+        fprintf(stderr, "FAIL t8: resume returned %d, expected LUA_YIELD(%d)\n",
+                st, LUA_YIELD);
+        lua_close(L);
+        return 1;
+    }
+
+    st = lua_closethread(co, L);
+    if (st != LUA_ERRRUN) {
+        fprintf(stderr, "FAIL t8: lua_closethread returned %d, expected LUA_ERRRUN(%d)\n",
+                st, LUA_ERRRUN);
+        lua_close(L);
+        return 1;
+    }
+
+    const char *msg = lua_tolstring(co, -1, NULL);
+    if (!msg || strstr(msg, "close_err") == NULL) {
+        fprintf(stderr, "FAIL t8: error msg '%s' doesn't contain 'close_err'\n",
+                msg ? msg : "(null)");
+        lua_close(L);
+        return 1;
+    }
+
+    lua_close(L);
+    printf("PASS: t8 closethread_close_error\n");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 9: lua_closethread runs __close for TBC even when k discarded */
+/* ------------------------------------------------------------------ */
+
+static int test_closethread_tbc_still_runs(void) {
+    lua_State *L = luaL_newstate();
+    if (!L) { fprintf(stderr, "FAIL: newstate\n"); return 1; }
+    luaL_openlibs(L);
+
+    lua_State *co = lua_newthread(L);
+    lua_pop(L, 1);
+    luaL_loadstring(co,
+        "local x <close> = setmetatable({}, {\n"
+        "  __close = function() _G.CLOSE_COUNT = (_G.CLOSE_COUNT or 0) + 1 end\n"
+        "})\n"
+        "coroutine.yield()\n");
+
+    int nres;
+    int st = lua_resume(co, L, 0, &nres);
+    if (st != LUA_YIELD) {
+        fprintf(stderr, "FAIL t9: resume returned %d, expected LUA_YIELD(%d)\n",
+                st, LUA_YIELD);
+        lua_close(L);
+        return 1;
+    }
+
+    st = lua_closethread(co, L);
+    if (st != LUA_OK) {
+        fprintf(stderr, "FAIL t9: lua_closethread returned %d, expected LUA_OK(%d)\n",
+                st, LUA_OK);
+        lua_close(L);
+        return 1;
+    }
+
+    lua_getglobal(L, "CLOSE_COUNT");
+    int count = (int)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    if (count != 1) {
+        fprintf(stderr, "FAIL t9: CLOSE_COUNT = %d, expected 1 (__close did not run)\n",
+                count);
+        lua_close(L);
+        return 1;
+    }
+
+    lua_close(L);
+    printf("PASS: t9 closethread_tbc_still_runs\n");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 
 int main(void) {
     if (test_close_fresh())    return 1;
@@ -312,6 +515,10 @@ int main(void) {
     if (test_close_error())    return 1;
     if (test_double_close())   return 1;
     if (test_status())         return 1;
+    if (test_status_after_error()) return 1;
+    if (test_closethread_suspended_c_cont()) return 1;
+    if (test_closethread_close_error()) return 1;
+    if (test_closethread_tbc_still_runs()) return 1;
     printf("PASS: 11_closethread\n");
     return 0;
 }

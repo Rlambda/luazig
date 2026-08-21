@@ -16,6 +16,7 @@
 #include <assert.h>
 #include "lua.h"
 #include "lauxlib.h"
+#include "lualib.h"
 
 /* Test 1: lua_newthread returns a distinct handle */
 static void test_newthread_distinct(void) {
@@ -273,6 +274,46 @@ static void test_multiple_coroutines_independent(void) {
     printf("test_multiple_coroutines_independent: PASS\n");
 }
 
+/* Test 12: lua_status preserves error status after runtime error */
+static void test_status_after_error(void) {
+    lua_State *L = luaL_newstate();
+    assert(L != NULL);
+    luaL_openlibs(L);
+    lua_State *co = lua_newthread(L);
+    lua_pop(L, 1);
+    luaL_loadstring(co, "error('boom')");
+    int nres = 0;
+    int st = lua_resume(co, L, 0, &nres);
+    assert(st == LUA_ERRRUN);
+    assert(lua_status(co) == LUA_ERRRUN);
+    lua_close(L);
+    printf("test_status_after_error: PASS\n");
+}
+
+/* Test 13: lua_status after yield and after completion (via handle) */
+static void test_status_yield_complete(void) {
+    lua_State *L = luaL_newstate();
+    assert(L != NULL);
+    luaL_openlibs(L);
+    lua_State *co = lua_newthread(L);
+    lua_pop(L, 1);
+    luaL_loadstring(co, "coroutine.yield(42) return 99");
+
+    assert(lua_status(co) == LUA_OK); /* fresh */
+
+    int nres = 0;
+    int st = lua_resume(co, L, 0, &nres);
+    assert(st == LUA_YIELD);
+    assert(lua_status(co) == LUA_YIELD);
+
+    st = lua_resume(co, L, 0, &nres);
+    assert(st == LUA_OK);
+    assert(lua_status(co) == LUA_OK);
+
+    lua_close(L);
+    printf("test_status_yield_complete: PASS\n");
+}
+
 int main(void) {
     test_newthread_distinct();
     test_two_newthreads_distinct();
@@ -285,6 +326,8 @@ int main(void) {
     test_xmove_self();
     test_coroutine_yield_independent();
     test_multiple_coroutines_independent();
+    test_status_after_error();
+    test_status_yield_complete();
     printf("ALL PASS\n");
     return 0;
 }

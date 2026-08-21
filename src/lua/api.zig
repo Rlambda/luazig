@@ -291,17 +291,14 @@ pub const State = struct {
     /// after a yield, LUA_OK (0) for running/main threads, and error
     /// codes when dead-with-error.
     ///
-    /// luazig's `Thread.status` enum has only {suspended, running, dead}
-    /// — errors collapse into `dead` (documented limitation: callers use
-    /// `lua_resume`'s return value for error codes). If `c_api_thread`
-    /// is set (created via `lua_newthread`), return its status; otherwise
-    /// the main thread is always LUA_OK.
+    /// luazig stores the PUC status code in `Thread.api_status` (mirroring
+    /// PUC's `L->status`), updated at every lifecycle transition. This
+    /// Zig API resolves the thread from `vm.c_api_thread` (the Zig API's
+    /// thread); the C API (`lua_status` in c_api.zig) resolves from the
+    /// handle's `thread` field for per-handle correctness.
     pub fn status(self: *State) c_int {
         if (self.vm.c_api_thread) |th| {
-            return switch (th.status) {
-                .suspended => if (th.started) 1 else 0, // LUA_YIELD if yielded, LUA_OK if fresh
-                .running, .dead => 0, // LUA_OK
-            };
+            return th.api_status;
         }
         return 0; // LUA_OK — main thread
     }

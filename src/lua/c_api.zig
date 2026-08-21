@@ -2475,14 +2475,56 @@ pub export fn lua_upvaluejoin(L: ?*lua_State, fidx1: c_int, n1: c_int, fidx2: c_
     cl1.upvalues[idx1].value = cl2.upvalues[idx2].value;
 }
 
-pub export fn lua_sethook(L: ?*lua_State, func: ?*const fn (?*lua_State, *anyopaque) callconv(.c) void, mask: c_int, count: c_int) void {
+/// PUC `lua_sethook` (ldebug.c:133): install/clear a C hook function.
+/// PUC has a single hook slot per thread: `L->hook`, `L->hookmask`,
+/// `L->basehookcount`. When `func == NULL` or `mask == 0`, the hook is
+/// turned off. Otherwise the hook, mask, and count are stored and the
+/// running count is reset (`resethookcount`).
+///
+/// P15.82h: luazig stores the C hook in `Vm.c_hook` (function pointer) and
+/// mirrors the mask/count into the active thread's `DebugHookState` so that
+/// existing trigger sites (line/count/call/return dispatch in the bytecode
+/// loop) fire and reach `debugDispatchHookTransfer`, which checks `c_hook`
+/// and calls the C function. The Lua-level `DebugHookState.func` is cleared
+/// (single slot), mirroring PUC's singular hook design.
+pub export fn lua_sethook(L: ?*lua_State, func: ?*const fn (?*anyopaque, ?*anyopaque) callconv(.c) void, mask: c_int, count: c_int) void {
     const vm = L orelse return;
+    // PUC lua_sethook: if func==NULL or mask==0, turn off hooks.
+    if (func == null or mask == 0) {
+        vm.c_hook = null;
+        vm.c_hook_mask = 0;
+        vm.c_hook_count = 0;
+        // Clear the mirrored DebugHookState so trigger sites stop firing.
+        const hs = vm.hookStateFor(vm.c_api_thread);
+        hs.has_call = false;
+        hs.has_return = false;
+        hs.has_line = false;
+        hs.count = 0;
+        hs.budget = 0;
+        hs.func = null;
+        vm.refreshHooksCached();
+        return;
+    }
     vm.c_hook = func;
     vm.c_hook_mask = mask;
     vm.c_hook_count = count;
+    // P15.82h: Single hook slot — clear the Lua-level hook.
+    // Mirror mask/count into DebugHookState so existing trigger sites fire.
+    const hs = vm.hookStateFor(vm.c_api_thread);
+    hs.func = null;
+    hs.has_call = (mask & 1) != 0; // LUA_MASKCALL
+    hs.has_return = (mask & 2) != 0; // LUA_MASKRET
+    hs.has_line = (mask & 4) != 0; // LUA_MASKLINE
+    const count_i64: i64 = @intCast(@max(count, 0));
+    hs.count = if ((mask & 8) != 0) count_i64 else 0; // LUA_MASKCOUNT
+    hs.budget = hs.count;
+    hs.tick = 0;
+    hs.allow_yield = false;
+    vm.refreshHooksCached();
 }
 
-pub export fn lua_gethook(L: ?*lua_State) ?*const fn (?*lua_State, *anyopaque) callconv(.c) void {
+/// PUC `lua_gethook` (ldebug.c:152): return the current hook function.
+pub export fn lua_gethook(L: ?*lua_State) ?*const fn (?*anyopaque, ?*anyopaque) callconv(.c) void {
     const vm = L orelse return null;
     return vm.c_hook;
 }

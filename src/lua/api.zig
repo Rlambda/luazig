@@ -77,6 +77,7 @@ pub const State = struct {
         const alloc = opts.allocator;
         const ptr = alloc.create(vm_mod.Vm) catch @panic("api.State.init: out of memory");
         ptr.* = vm_mod.Vm.init(alloc, false);
+        _ = ptr.setupMainHandle() catch @panic("api.State.init: out of memory");
         return .{ .vm = ptr };
     }
 
@@ -88,6 +89,11 @@ pub const State = struct {
         // Save the allocator before deinit'ing the Vm — after deinit the Vm's
         // fields are invalid, but the allocator (a value type) is safe to copy.
         const alloc = self.vm.alloc;
+        // Free the main handle (coroutine handles are freed by GC).
+        if (self.vm.main_handle) |h| {
+            h.c_stack.deinit(alloc);
+            alloc.destroy(h);
+        }
         self.vm.deinit();
         alloc.destroy(self.vm);
     }
@@ -96,6 +102,14 @@ pub const State = struct {
     /// Used by c_api.zig to create a State from a lua_State*.
     pub fn fromVm(vm: *vm_mod.Vm) State {
         return .{ .vm = vm };
+    }
+
+    /// Wrap an existing `*lua_State` handle without taking ownership.
+    /// Used by c_api.zig to create a State from a `?*lua_State` parameter.
+    /// The handle's `vm` field provides the `*Vm`; all stack operations go
+    /// through `vm.c_stack` (Phase 1: single shared stack).
+    pub fn fromHandle(h: *vm_mod.lua_State) State {
+        return .{ .vm = h.vm };
     }
 
     pub fn gettop(self: *const State) usize {
@@ -453,7 +467,7 @@ pub const State = struct {
 
     /// PUC `lua_tocfunction` (lapi.c:lua_tocfunction): return the C function
     /// pointer from a Closure, or null if the value is not a C closure.
-    pub fn tocfunction(self: *const State, idx: i32) ?*const fn (?*vm_mod.Vm) callconv(.c) c_int {
+    pub fn tocfunction(self: *const State, idx: i32) ?*const fn (?*vm_mod.lua_State) callconv(.c) c_int {
         const v = self.valueAtConst(idx) orelse return null;
         return switch (v.*) {
             .Closure => |c| c.c_func,
@@ -853,7 +867,7 @@ pub const State = struct {
 
     /// Push a C closure wrapping `fn_` with `n` upvalues from the stack.
     /// Currently only n=0 is supported (upvalues need Phase 9).
-    pub fn pushcclosure(self: *State, fn_: ?*const fn (?*vm_mod.Vm) callconv(.c) c_int, n: usize) ApiError!void {
+    pub fn pushcclosure(self: *State, fn_: ?*const fn (?*vm_mod.lua_State) callconv(.c) c_int, n: usize) ApiError!void {
         if (n == 0) {
             const cl = try self.vm.alloc.create(vm_mod.Closure);
             cl.* = .{ .upvalues = &.{}, .c_func = fn_ };
@@ -880,7 +894,7 @@ pub const State = struct {
     }
 
     /// Convenience: push a C function as a closure with 0 upvalues.
-    pub fn pushcfunction(self: *State, fn_: ?*const fn (?*vm_mod.Vm) callconv(.c) c_int) ApiError!void {
+    pub fn pushcfunction(self: *State, fn_: ?*const fn (?*vm_mod.lua_State) callconv(.c) c_int) ApiError!void {
         try self.pushcclosure(fn_, 0);
     }
 
@@ -994,7 +1008,7 @@ pub const State = struct {
     /// PUC `luaL_Reg`: a {name, func} pair terminated by a sentinel.
     pub const Reg = extern struct {
         name: ?[*:0]const u8,
-        func: ?*const fn (?*vm_mod.Vm) callconv(.c) c_int,
+        func: ?*const fn (?*vm_mod.lua_State) callconv(.c) c_int,
     };
 
     /// Return the bytes of the string at `arg`, or "" on type mismatch.

@@ -26,7 +26,7 @@ const Value = vm_mod.Value;
 // lua_error/longjmp, lua_pushfstring vararg, lua_callk boundary, etc.)
 // remain here with their full implementation.
 
-pub const lua_State = Vm;
+pub const lua_State = vm_mod.lua_State;
 
 /// PUC `lua_Alloc` (lua.h:125): the allocator signature.
 pub const lua_Alloc = ?*const fn (
@@ -113,15 +113,25 @@ pub const luaL_Buffer = extern struct {
 
 pub export fn luaL_newstate() ?*lua_State {
     const alloc = std.heap.c_allocator;
-    const ptr = alloc.create(lua_State) catch return null;
-    ptr.* = lua_State.init(alloc, false);
-    return ptr;
+    const vm = alloc.create(Vm) catch return null;
+    vm.* = Vm.init(alloc, false);
+    return vm.setupMainHandle() catch {
+        vm.deinit();
+        alloc.destroy(vm);
+        return null;
+    };
 }
 
 pub export fn lua_close(L: ?*lua_State) void {
-    const vm = L orelse return;
+    const h = L orelse return;
+    const vm = h.vm;
     vm.deinit();
-    std.heap.c_allocator.destroy(vm);
+    const alloc = vm.alloc;
+    // Free the main handle (coroutine handles are freed by GC via
+    // gcFreeObject(.thread) → Thread.api_handle).
+    h.c_stack.deinit(alloc);
+    alloc.destroy(h);
+    alloc.destroy(vm);
 }
 
 // ===========================================================================
@@ -144,37 +154,41 @@ pub export fn lua_newstate(
 ) ?*lua_State {
     _ = seed; // PRNG seeding not yet wired (PUC uses it for table hash randomization)
     const alloc = std.heap.c_allocator;
-    const ptr = alloc.create(lua_State) catch return null;
-    ptr.* = lua_State.init(alloc, false);
-    ptr.c_alloc_fn = f;
-    ptr.c_alloc_ud = ud;
-    return ptr;
+    const vm = alloc.create(Vm) catch return null;
+    vm.* = Vm.init(alloc, false);
+    vm.c_alloc_fn = f;
+    vm.c_alloc_ud = ud;
+    return vm.setupMainHandle() catch {
+        vm.deinit();
+        alloc.destroy(vm);
+        return null;
+    };
 }
 
 /// PUC `lua_newthread` (lstate.c:lua_newthread): create a new coroutine
 /// ("thread") that shares the global state of `L`. The new thread has its own
-/// stack but shares globals, registry, and metatables.
+/// `lua_State` handle but shares globals, registry, and metatables.
 ///
-/// luazig's internal coroutine type (`Thread`) is distinct from `Vm` (the
-/// `lua_State` handle). A full C-API `lua_newthread` would require allocating a
-/// new `Vm` that shares the same `global_State` — an architectural change
-/// planned for the coroutine phase. For now we return the same state, which is
-/// safe for the main thread (PUC permits this) and lets C code that only needs
-/// a scratch state compile and link. TODO: implement proper thread creation.
+/// The handle is allocated on the heap and its lifetime is tied to the
+/// Thread's GC lifetime: `gcFreeObject(.thread)` frees the handle via
+/// `Thread.api_handle`. The handle's `c_stack` is unused in Phase 1 (all
+/// stack ops go through `Vm.c_stack`); Phase 2 gives each handle its own
+/// stack.
 pub export fn lua_newthread(L: ?*lua_State) ?*lua_State {
-    const vm = L orelse return null;
-    // PUC lua_newthread: create a new Thread, push it on the stack as a
-    // Thread value, return the new lua_State*. In luazig, lua_State = Vm,
-    // so we return the same Vm pointer. The new Thread is stored in
-    // vm.c_api_thread so lua_resume can find it.
+    const parent = L orelse return null;
+    const vm = parent.vm;
     const th = vm.alloc.create(vm_mod.Thread) catch return null;
     th.* = .{ .status = .suspended, .callee = .Nil };
     vm.gcRegisterThread(th) catch {};
     vm.gcNoteAlloc(@sizeOf(vm_mod.Thread));
     vm.c_api_thread = th;
+    // Create the coroutine handle. Its c_stack is unused in Phase 1.
+    const handle = vm.alloc.create(lua_State) catch return null;
+    handle.* = .{ .vm = vm, .thread = th, .is_main = false };
+    th.api_handle = handle;
     // Push the thread value on c_stack (PUC pushes it on L->top).
     vm.c_stack.append(vm.alloc, .{ .Thread = th }) catch {};
-    return vm;
+    return handle;
 }
 
 /// PUC `lua_closethread` (lstate.c:324-333): reset a thread to a clean
@@ -197,18 +211,18 @@ pub export fn lua_newthread(L: ?*lua_State) ?*lua_State {
 /// suspended threads with frames, `__close` metamethod execution,
 /// close_has_err latch, idempotent dead-thread handling).
 pub export fn lua_closethread(L: ?*lua_State, from: ?*lua_State) c_int {
-    const vm = L orelse return 1; // LUA_ERRRUN if null
+    const h = L orelse return 1; // LUA_ERRRUN if null
+    const vm = h.vm;
 
-    // PUC lua_closethread operates on L (the thread itself). In luazig,
-    // lua_State = Vm, so we resolve the thread via c_api_thread (set by
-    // lua_newthread). If null, L is the main thread — PUC allows closing
-    // it (resets to clean state), but luazig's main thread is always in a
-    // valid state, so return LUA_OK.
-    const th = vm.c_api_thread orelse return 0; // LUA_OK — main thread
+    // PUC lua_closethread operates on L (the thread itself). Resolve the
+    // thread from the handle (set by lua_newthread). If null, L is the main
+    // thread — PUC allows closing it (resets to clean state), but luazig's
+    // main thread is always in a valid state, so return LUA_OK.
+    const th = h.thread orelse vm.c_api_thread orelse return 0; // LUA_OK — main thread
 
     // PUC lstate.c:327: L->nCcalls = (from) ? getCcalls(from) : 0
     if (from) |from_ptr| {
-        const from_s = api.State.fromVm(from_ptr);
+        const from_s = api.State.fromHandle(from_ptr);
         if (from_s.vm.current_thread) |from_th| {
             th.nCcalls = @as(u32, from_th.getCcalls());
         } else {
@@ -248,7 +262,7 @@ pub export fn lua_atpanic(
     L: ?*lua_State,
     panicf: ?*const fn (?*lua_State) callconv(.c) c_int,
 ) ?*const fn (?*lua_State) callconv(.c) c_int {
-    const vm = L orelse return null;
+    const vm = if (L) |h| h.vm else return null;
     const old = vm.c_panicf;
     vm.c_panicf = panicf;
     return old;
@@ -270,13 +284,19 @@ pub export fn lua_getextraspace(L: ?*lua_State) ?*anyopaque {
 /// Operates on the C-API stack (`c_stack`), which is the stack visible to C
 /// code via `lua_pushvalue` / `lua_to*`. Negative `n` is clamped to zero.
 pub export fn lua_xmove(from: ?*lua_State, to: ?*lua_State, n: c_int) void {
-    const src = from orelse return;
-    const dst = to orelse return;
+    const src_h = from orelse return;
+    const dst_h = to orelse return;
+    // Phase 1: both handles share the same Vm.c_stack, so this is a self-move.
+    // Phase 2 will use src_h.c_stack / dst_h.c_stack for a real cross-stack move.
+    const vm = src_h.vm;
     const count: usize = @intCast(@max(n, 0));
-    if (count > src.c_stack.items.len) return;
-    const start = src.c_stack.items.len - count;
-    dst.c_stack.appendSlice(dst.alloc, src.c_stack.items[start..]) catch {};
-    src.c_stack.items.len -= count;
+    if (count > vm.c_stack.items.len) return;
+    const start = vm.c_stack.items.len - count;
+    // Self-move: copy top `count` items and truncate. Since src == dst (same
+    // c_stack), appendSlice would duplicate; instead just leave them in place.
+    _ = start;
+    _ = dst_h;
+    // No-op for self-move (src and dst share the same stack).
 }
 
 // `_longjmp` from libc. Using `_longjmp` (not `longjmp`) matches PUC's
@@ -286,7 +306,7 @@ extern fn _longjmp(jb: *anyopaque, val: c_int) noreturn;
 /// PUC `lua_error` (noreturn): captures the error object from c_stack top into
 /// `c_error_value`, then `_longjmp` to the nearest C-function boundary.
 pub export fn lua_error(L: ?*lua_State) noreturn {
-    const vm = L orelse @panic("lua_error: null state");
+    const vm = if (L) |h| h.vm else @panic("lua_error: null state");
     if (vm.c_stack.items.len > 0) {
         vm.c_error_value = vm.c_stack.items[vm.c_stack.items.len - 1];
     } else {
@@ -332,7 +352,7 @@ pub export fn lua_callk(
     ctx: isize,
     k: ?*const anyopaque,
 ) void {
-    const vm = if (L) |v| v else return;
+    const vm = if (L) |h| h.vm else return;
     const th = vm.current_thread orelse {
         lua_callkImpl(L, nargs, nresults);
         return;
@@ -352,7 +372,7 @@ pub export fn lua_callk(
     const call_args = vm.c_stack.items[fn_idx + 1 ..];
 
     // Delegate k/ctx saving + apiCall to the shared helper (PUC lapi.c:1047-1053).
-    const kfn: ?*const fn (?*Vm, c_int, isize) callconv(.c) c_int = if (k) |kf|
+    const kfn: ?*const fn (?*vm_mod.lua_State, c_int, isize) callconv(.c) c_int = if (k) |kf|
         @ptrCast(@alignCast(kf))
     else
         null;
@@ -400,7 +420,7 @@ pub export fn lua_callk(
 /// distinguish yield from error and propagate `error.Yield` up to the
 /// trampoline, leaving the C-frame in place for `finishCcall` on resume.
 fn lua_callkImpl(L: ?*lua_State, nargs: c_int, nresults: c_int) void {
-    const vm = L orelse return;
+    const vm = if (L) |h| h.vm else return;
     const nargs_usize: usize = @intCast(@max(nargs, 0));
     if (vm.c_stack.items.len < nargs_usize + 1) {
         // Stack underflow — treat as error
@@ -479,7 +499,7 @@ pub export fn lua_pushvfstring(
     fmt: [*:0]const u8,
     argp: *std.builtin.VaList,
 ) [*:0]const u8 {
-    const vm = L orelse return "".ptr;
+    const vm = if (L) |h| h.vm else return "".ptr;
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(vm.alloc);
@@ -566,7 +586,8 @@ fn cApiAllocWrapper(
     osize: usize,
     nsize: usize,
 ) callconv(.c) ?*anyopaque {
-    const vm: *Vm = @ptrCast(@alignCast(ud orelse return null));
+    const h: *lua_State = @ptrCast(@alignCast(ud orelse return null));
+    const vm = h.vm;
     if (nsize == 0) {
         if (ptr) |p| {
             const old_buf: [*]u8 = @ptrCast(p);
@@ -588,7 +609,7 @@ fn cApiAllocWrapper(
 /// returns that function and its user-data — matching PUC's contract.
 /// Otherwise returns the internal `cApiAllocWrapper` and `L` as user-data.
 pub export fn lua_getallocf(L: ?*lua_State, ud: ?*?*anyopaque) lua_Alloc {
-    const vm = L orelse return null;
+    const vm = if (L) |h| h.vm else return null;
     if (vm.c_alloc_fn) |f| {
         if (ud) |u| u.* = vm.c_alloc_ud;
         return f;
@@ -603,7 +624,7 @@ pub export fn lua_getallocf(L: ?*lua_State, ud: ?*?*anyopaque) lua_Alloc {
 /// The VM's actual allocations continue through `std.heap.c_allocator`;
 /// see the comment on `Vm.c_alloc_fn` for the rationale.
 pub export fn lua_setallocf(L: ?*lua_State, f: lua_Alloc, ud: ?*anyopaque) void {
-    const vm = L orelse return;
+    const vm = if (L) |h| h.vm else return;
     vm.c_alloc_fn = f;
     vm.c_alloc_ud = ud;
 }
@@ -628,7 +649,7 @@ pub export fn lua_load(
     mode: ?[*:0]const u8,
 ) c_int {
     _ = mode;
-    const vm = L orelse return 2; // LUA_ERRRUN
+    const vm = if (L) |h| h.vm else return 2; // LUA_ERRRUN
 
     // Collect all chunks from the reader into a buffer (PUC's `luaD_protectedparser`
     // does the same via `luaZ_read` into a growable buffer before parsing).
@@ -663,7 +684,7 @@ pub export fn lua_dump(
     data: ?*anyopaque,
     strip: c_int,
 ) c_int {
-    const vm = L orelse return 1;
+    const vm = if (L) |h| h.vm else return 1;
     if (writer == null) return 1;
 
     // Get the function at the top of c_stack (PUC uses index2value(L, -1)).
@@ -708,7 +729,7 @@ pub export fn lua_setwarnf(
     f: ?*const fn (?*anyopaque, [*:0]const u8, c_int) callconv(.c) void,
     ud: ?*anyopaque,
 ) void {
-    const vm = L orelse return;
+    const vm = if (L) |h| h.vm else return;
     vm.c_warnf = f;
     vm.c_warn_ud = ud;
 }
@@ -718,7 +739,7 @@ pub export fn lua_setwarnf(
 /// is 1 if more warning text follows (multi-part warnings). If no handler is
 /// installed, the warning is silently dropped (PUC's default behavior).
 pub export fn lua_warning(L: ?*lua_State, msg: ?[*:0]const u8, tocont: c_int) void {
-    const vm = L orelse return;
+    const vm = if (L) |h| h.vm else return;
     if (vm.c_warnf) |wf| {
         if (msg) |m| wf(vm.c_warn_ud, m, tocont);
     }
@@ -737,7 +758,7 @@ pub export fn lua_warning(L: ?*lua_State, msg: ?[*:0]const u8, tocont: c_int) vo
 /// (`l_str2d`). Both trim leading/trailing whitespace and require the entire
 /// string to be a valid number. Returns `strlen(s) + 1` on success.
 pub export fn lua_stringtonumber(L: ?*lua_State, s: [*:0]const u8) usize {
-    const vm = L orelse return 0;
+    const vm = if (L) |h| h.vm else return 0;
     const str = std.mem.span(s);
     const trimmed = std.mem.trim(u8, str, " \t\n\x0b\x0c\r");
     if (trimmed.len == 0) return 0;
@@ -766,7 +787,7 @@ pub export fn lua_stringtonumber(L: ?*lua_State, s: [*:0]const u8) usize {
 /// (with ".0" appended if the result looks like an integer). luazig uses
 /// Zig's `{d}` format, which produces the shortest round-trip representation.
 pub export fn lua_numbertocstring(L: ?*lua_State, idx: c_int, buff: [*]u8) c_uint {
-    const vm = L orelse return 0;
+    const vm = if (L) |h| h.vm else return 0;
     const abs = normalizeIndex(idx, vm.c_stack.items.len) orelse return 0;
     const val = vm.c_stack.items[abs];
 
@@ -816,7 +837,7 @@ pub export fn lua_numbertocstring(L: ?*lua_State, idx: c_int, buff: [*]u8) c_uin
 /// (`L->ci->tbclist`). We store absolute indices in `c_toclose_slots`;
 /// duplicate marks are ignored, matching PUC's idempotent behavior.
 pub export fn lua_toclose(L: ?*lua_State, idx: c_int) void {
-    const vm = L orelse return;
+    const vm = if (L) |h| h.vm else return;
     const abs = normalizeIndex(idx, vm.c_stack.items.len) orelse return;
     // P15.83c FIX A: Scope the dedup scan to the current C-frame's segment
     // [toclose_base, len). Each C-frame gets a fresh c_stack (callCFunction
@@ -859,7 +880,7 @@ pub export fn lua_toclose(L: ?*lua_State, idx: c_int) void {
 /// slot from the to-close list. PUC calls `lua_callvalue` for the metamethod;
 /// we use `lua_pcallk` to protect against errors in the closer.
 pub export fn lua_closeslot(L: ?*lua_State, idx: c_int) void {
-    const vm = L orelse return;
+    const vm = if (L) |h| h.vm else return;
     const abs = normalizeIndex(idx, vm.c_stack.items.len) orelse return;
 
     // PUC lua_closeslot (lapi.c): calls __close via luaD_call (NOT luaD_pcall).
@@ -906,7 +927,7 @@ fn removeTocloseMark(vm: *Vm, abs: usize) void {
 /// Delegates to `Vm.compileChunkValue` (shared with `api.State.compileChunk`).
 pub export fn luaL_loadbufferx(L: ?*lua_State, buff: [*]const u8, sz: usize, name: [*:0]const u8, mode: ?[*:0]const u8) c_int {
     _ = mode;
-    const vm = L orelse return 2;
+    const vm = if (L) |h| h.vm else return 2;
     const compiled = vm.compileChunkValue(buff[0..sz], std.mem.span(name)) catch |e|
         return statusCode(mapCompileError(e));
     vm.c_stack.append(vm.alloc, compiled) catch return statusCode(.memory_error);
@@ -916,7 +937,7 @@ pub export fn luaL_loadbufferx(L: ?*lua_State, buff: [*]const u8, sz: usize, nam
 /// PUC `luaL_loadfilex`: load and compile a source file.
 pub export fn luaL_loadfilex(L: ?*lua_State, filename: [*:0]const u8, mode: ?[*:0]const u8) c_int {
     _ = mode;
-    const vm = L orelse return 2;
+    const vm = if (L) |h| h.vm else return 2;
     const source = source_mod.Source.loadFile(vm.alloc, stdio.activeIo(), std.mem.span(filename)) catch
         return statusCode(.memory_error);
     defer vm.alloc.free(source.name);
@@ -954,28 +975,28 @@ pub export fn luaL_checkversion_(L: ?*lua_State, ver: f64, sz: usize) void {
 // --- Stack manipulation ---
 
 pub export fn lua_gettop(L: ?*lua_State) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return @intCast(s.gettop());
 }
 
 pub export fn lua_settop(L: ?*lua_State, idx: c_int) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.settop(idx) catch {};
 }
 
 pub export fn lua_pop(L: ?*lua_State, n: c_int) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     if (n <= 0) return;
     s.pop(@intCast(n)) catch {};
 }
 
 pub export fn lua_rotate(L: ?*lua_State, idx: c_int, n: c_int) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.rotate(idx, n) catch {};
 }
 
 pub export fn lua_copy(L: ?*lua_State, fromidx: c_int, toidx: c_int) void {
-    const vm = L orelse return;
+    const vm = if (L) |h| h.vm else return;
     // Handle upvalue pseudo-index as destination (write to upvalue)
     if (toidx < -1001000 and toidx >= -1001255) {
         const src = upvalueAt(vm, fromidx) orelse blk: {
@@ -1002,22 +1023,22 @@ pub export fn lua_copy(L: ?*lua_State, fromidx: c_int, toidx: c_int) void {
 }
 
 pub export fn lua_insert(L: ?*lua_State, idx: c_int) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.insert(idx) catch {};
 }
 
 pub export fn lua_remove(L: ?*lua_State, idx: c_int) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.remove(idx) catch {};
 }
 
 pub export fn lua_absindex(L: ?*lua_State, idx: c_int) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return @intCast(s.absindex(idx) catch 0);
 }
 
 pub export fn lua_checkstack(L: ?*lua_State, n: c_int) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     if (n < 0) return 0;
     s.checkstack(@intCast(n)) catch return 0;
     return 1;
@@ -1026,27 +1047,27 @@ pub export fn lua_checkstack(L: ?*lua_State, n: c_int) c_int {
 // --- Push functions ---
 
 pub export fn lua_pushnil(L: ?*lua_State) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.pushnil() catch {};
 }
 
 pub export fn lua_pushboolean(L: ?*lua_State, b: c_int) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.pushboolean(b != 0) catch {};
 }
 
 pub export fn lua_pushinteger(L: ?*lua_State, v: i64) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.pushinteger(v) catch {};
 }
 
 pub export fn lua_pushnumber(L: ?*lua_State, v: f64) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.pushnumber(v) catch {};
 }
 
 pub export fn lua_pushstring(L: ?*lua_State, s: [*:0]const u8) void {
-    var st = api.State.fromVm(L orelse return);
+    var st = api.State.fromHandle(L orelse return);
     st.pushstring(std.mem.span(s)) catch {};
 }
 
@@ -1055,27 +1076,27 @@ pub export fn lua_pushliteral(L: ?*lua_State, s: [*:0]const u8) void {
 }
 
 pub export fn lua_pushlstring(L: ?*lua_State, s: [*]const u8, len: usize) void {
-    var st = api.State.fromVm(L orelse return);
+    var st = api.State.fromHandle(L orelse return);
     st.pushlstring(s[0..len]) catch {};
 }
 
 pub export fn lua_pushvalue(L: ?*lua_State, idx: c_int) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.pushvalue(idx) catch {};
 }
 
 pub export fn lua_pushlightuserdata(L: ?*lua_State, p: ?*anyopaque) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.pushlightuserdata(p) catch {};
 }
 
 pub export fn lua_pushcclosure(L: ?*lua_State, f: ?*const fn (?*lua_State) callconv(.c) c_int, n: c_int) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.pushcclosure(f, @intCast(@max(n, 0))) catch {};
 }
 
 pub export fn lua_pushcfunction(L: ?*lua_State, f: ?*const fn (?*lua_State) callconv(.c) c_int) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.pushcfunction(f) catch {};
 }
 
@@ -1086,21 +1107,21 @@ pub export fn lua_pushexternalstring(
     falloc: lua_Alloc,
     ud: ?*anyopaque,
 ) void {
-    var st = api.State.fromVm(L orelse return);
+    var st = api.State.fromHandle(L orelse return);
     st.pushexternalString(s, len, falloc, ud) catch {};
 }
 
 // --- Type / conversion ---
 
 pub export fn lua_type(L: ?*lua_State, idx: c_int) c_int {
-    const vm = L orelse return -1;
+    const vm = if (L) |h| h.vm else return -1;
     if (upvalueAt(vm, idx)) |v| return typeCode(api.valueType(v));
     var s = api.State.fromVm(vm);
     return if (s.typeOf(idx)) |t| typeCode(t) else -1;
 }
 
 pub export fn lua_toboolean(L: ?*lua_State, idx: c_int) c_int {
-    const vm = L orelse return 0;
+    const vm = if (L) |h| h.vm else return 0;
     if (upvalueAt(vm, idx)) |v| return switch (v) {
         .Nil => 0, .Bool => |b| if (b) 1 else 0, else => 1,
     };
@@ -1109,7 +1130,7 @@ pub export fn lua_toboolean(L: ?*lua_State, idx: c_int) c_int {
 }
 
 pub export fn lua_tointegerx(L: ?*lua_State, idx: c_int, isnum: ?*c_int) i64 {
-    const vm = L orelse {
+    const vm = if (L) |h| h.vm else {
         if (isnum) |p| p.* = 0;
         return 0;
     };
@@ -1134,7 +1155,7 @@ pub export fn lua_tointegerx(L: ?*lua_State, idx: c_int, isnum: ?*c_int) i64 {
 }
 
 pub export fn lua_tonumberx(L: ?*lua_State, idx: c_int, isnum: ?*c_int) f64 {
-    const vm = L orelse {
+    const vm = if (L) |h| h.vm else {
         if (isnum) |p| p.* = 0;
         return 0;
     };
@@ -1161,32 +1182,32 @@ pub export fn lua_tonumberx(L: ?*lua_State, idx: c_int, isnum: ?*c_int) f64 {
 // --- Type predicates (PUC lapi.c:lua_is*) ---
 
 pub export fn lua_isnumber(L: ?*lua_State, idx: c_int) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return if (s.isnumber(idx)) 1 else 0;
 }
 
 pub export fn lua_isstring(L: ?*lua_State, idx: c_int) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return if (s.isstring(idx)) 1 else 0;
 }
 
 pub export fn lua_isinteger(L: ?*lua_State, idx: c_int) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return if (s.isinteger(idx)) 1 else 0;
 }
 
 pub export fn lua_iscfunction(L: ?*lua_State, idx: c_int) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return if (s.iscfunction(idx)) 1 else 0;
 }
 
 pub export fn lua_isuserdata(L: ?*lua_State, idx: c_int) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return if (s.isuserdata(idx)) 1 else 0;
 }
 
 pub export fn lua_isyieldable(L: ?*lua_State) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return if (s.isyieldable(null) catch false) 1 else 0;
 }
 
@@ -1196,7 +1217,7 @@ pub export fn lua_isyieldable(L: ?*lua_State) c_int {
 /// pointer. Writes byte length to `*len` if non-null. Returns NULL for
 /// non-convertible types.
 pub export fn lua_tolstring(L: ?*lua_State, idx: c_int, len: ?*usize) [*:0]const u8 {
-    var s = api.State.fromVm(L orelse {
+    var s = api.State.fromHandle(L orelse {
         if (len) |p| p.* = 0;
         return "";
     });
@@ -1231,20 +1252,25 @@ pub export fn lua_typename(L: ?*lua_State, tp: c_int) [*:0]const u8 {
 
 /// PUC `lua_rawlen` (lapi.c:lua_rawlen): raw length without metamethods.
 pub export fn lua_rawlen(L: ?*lua_State, idx: c_int) c_uint {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return @intCast(s.rawlen(idx));
 }
 
 /// PUC `lua_tocfunction` (lapi.c:lua_tocfunction): return C function pointer.
 pub export fn lua_tocfunction(L: ?*lua_State, idx: c_int) ?*const fn (?*lua_State) callconv(.c) c_int {
-    var s = api.State.fromVm(L orelse return null);
+    var s = api.State.fromHandle(L orelse return null);
     return s.tocfunction(idx);
 }
 
 /// PUC `lua_tothread` (lapi.c:lua_tothread): return Thread pointer.
 pub export fn lua_tothread(L: ?*lua_State, idx: c_int) ?*lua_State {
-    var s = api.State.fromVm(L orelse return null);
-    if (s.tothread(idx)) |th| return @ptrCast(th);
+    var s = api.State.fromHandle(L orelse return null);
+    if (s.tothread(idx)) |th| {
+        // Return the thread's C API handle (set by lua_newthread). For
+        // Lua-created coroutines (no C handle), return null — a deviation
+        // from PUC which returns the lua_State* for all threads.
+        return th.api_handle;
+    }
     return null;
 }
 
@@ -1260,97 +1286,97 @@ pub export fn lua_version(L: ?*lua_State) f64 {
 pub export fn lua_createtable(L: ?*lua_State, narr: c_int, nrec: c_int) void {
     _ = narr;
     _ = nrec;
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.newtable() catch {};
 }
 
 pub export fn lua_setglobal(L: ?*lua_State, name: [*:0]const u8) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.setglobal(std.mem.span(name)) catch {};
 }
 
 pub export fn lua_getglobal(L: ?*lua_State, name: [*:0]const u8) c_int {
-    var s = api.State.fromVm(L orelse return -1);
+    var s = api.State.fromHandle(L orelse return -1);
     return typeCode(s.getglobal(std.mem.span(name)) catch return 0);
 }
 
 pub export fn lua_setfield(L: ?*lua_State, idx: c_int, k: [*:0]const u8) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.setfield(idx, std.mem.span(k)) catch {};
 }
 
 pub export fn lua_getfield(L: ?*lua_State, idx: c_int, k: [*:0]const u8) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return typeCode(s.getfield(idx, std.mem.span(k)) catch return 0);
 }
 
 pub export fn lua_rawset(L: ?*lua_State, idx: c_int) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.rawset(idx) catch {};
 }
 
 pub export fn lua_rawget(L: ?*lua_State, idx: c_int) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return typeCode(s.rawget(idx) catch return 0);
 }
 
 /// PUC `lua_gettable` (lapi.c): `t[k]` with metamethods. Pops the key,
 /// pushes the value. Returns the value's type code.
 pub export fn lua_gettable(L: ?*lua_State, idx: c_int) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return typeCode(s.gettable(idx) catch return 0);
 }
 
 /// PUC `lua_settable` (lapi.c): `t[k] = v` with metamethods. Pops both
 /// key and value.
 pub export fn lua_settable(L: ?*lua_State, idx: c_int) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.settable(idx) catch {};
 }
 
 /// PUC `lua_geti` (lapi.c): `t[n]` with metamethods. Pushes the value.
 /// Returns the value's type code.
 pub export fn lua_geti(L: ?*lua_State, idx: c_int, n: i64) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return typeCode(s.geti(idx, n) catch return 0);
 }
 
 /// PUC `lua_seti` (lapi.c): `t[n] = v` with metamethods. Pops the value.
 pub export fn lua_seti(L: ?*lua_State, idx: c_int, n: i64) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.seti(idx, n) catch {};
 }
 
 /// PUC `lua_rawgeti` (lapi.c): `t[n]` without metamethods. Pushes the
 /// value. Returns the value's type code.
 pub export fn lua_rawgeti(L: ?*lua_State, idx: c_int, n: i64) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return typeCode(s.rawgeti(idx, n) catch return 0);
 }
 
 /// PUC `lua_rawseti` (lapi.c): `t[n] = v` without metamethods. Pops the
 /// value.
 pub export fn lua_rawseti(L: ?*lua_State, idx: c_int, n: i64) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.rawseti(idx, n) catch {};
 }
 
 /// PUC `lua_rawgetp` (lapi.c): `t[p]` without metamethods, where `p` is a
 /// light userdata key. Pushes the value. Returns the value's type code.
 pub export fn lua_rawgetp(L: ?*lua_State, idx: c_int, p: ?*anyopaque) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return typeCode(s.rawgetp(idx, p) catch return 0);
 }
 
 /// PUC `lua_rawsetp` (lapi.c): `t[p] = v` without metamethods, where `p`
 /// is a light userdata key. Pops the value.
 pub export fn lua_rawsetp(L: ?*lua_State, idx: c_int, p: ?*anyopaque) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.rawsetp(idx, p) catch {};
 }
 
 pub export fn lua_next(L: ?*lua_State, idx: c_int) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return if (s.next(idx) catch false) 1 else 0;
 }
 
@@ -1360,7 +1386,7 @@ pub export fn lua_next(L: ?*lua_State, idx: c_int) c_int {
 /// the top 1–2 stack values. For binary ops: operands at -2 and -1. For
 /// unary ops (UNM, BNOT): operand at -1. Pops operands, pushes result.
 pub export fn lua_arith(L: ?*lua_State, op: c_int) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     const arith_op: api.ArithOp = switch (op) {
         0 => .add,
         1 => .sub,
@@ -1384,7 +1410,7 @@ pub export fn lua_arith(L: ?*lua_State, op: c_int) void {
 /// PUC `lua_rawequal` (lapi.c:lua_rawequal): raw equality (no __eq
 /// metamethod). Returns 1 if equal, 0 otherwise.
 pub export fn lua_rawequal(L: ?*lua_State, idx1: c_int, idx2: c_int) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return if (s.rawequal(idx1, idx2)) 1 else 0;
 }
 
@@ -1392,7 +1418,7 @@ pub export fn lua_rawequal(L: ?*lua_State, idx1: c_int, idx2: c_int) c_int {
 /// op is LUA_OPEQ (0), LUA_OPLT (1), or LUA_OPLE (2). Returns 1 if the
 /// comparison holds, 0 otherwise.
 pub export fn lua_compare(L: ?*lua_State, idx1: c_int, idx2: c_int, op: c_int) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     const cmp_op: api.CompareOp = switch (op) {
         0 => .eq,
         1 => .lt,
@@ -1405,7 +1431,7 @@ pub export fn lua_compare(L: ?*lua_State, idx1: c_int, idx2: c_int, op: c_int) c
 /// PUC `lua_concat` (lapi.c:lua_concat): concatenate n values from the
 /// top of the stack. Pops all n values, pushes the result string.
 pub export fn lua_concat(L: ?*lua_State, n: c_int) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     if (n <= 0) return;
     s.concat(@intCast(n)) catch {};
 }
@@ -1414,7 +1440,7 @@ pub export fn lua_concat(L: ?*lua_State, n: c_int) void {
 /// For strings: byte length. For tables: border length (or __len). Pops
 /// nothing, pushes the length value.
 pub export fn lua_len(L: ?*lua_State, idx: c_int) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.len(idx) catch {};
 }
 
@@ -1427,10 +1453,11 @@ pub export fn lua_len(L: ?*lua_State, idx: c_int) void {
 /// to *nres. Returns LUA_OK on completion, LUA_YIELD on yield, or an error
 /// code.
 pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: ?*c_int) c_int {
-    const vm = L orelse return 2;
-    // P15.82b: Use c_api_thread (set by lua_newthread) if available.
-    // Fall back to current_thread for the main thread / Lua-driven resumes.
-    const co = vm.c_api_thread orelse vm.current_thread orelse return 2;
+    const h = L orelse return 2;
+    const vm = h.vm;
+    // Resolve the coroutine thread from the handle (set by lua_newthread).
+    // Fall back to c_api_thread / current_thread for legacy / Lua-driven resumes.
+    const co = h.thread orelse vm.c_api_thread orelse vm.current_thread orelse return 2;
     // DON'T set vm.current_thread here — builtinCoroutineResume saves/restores
     // current_thread internally. Setting it here would cause the defer in
     // builtinCoroutineResume to restore co's status to its pre-resume value,
@@ -1438,7 +1465,7 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
     // PUC ldo.c:lua_resume — the resumed coroutine inherits the caller's
     // C-call depth + 1, so nested resumes share the LUAI_MAXCCALLS budget.
     if (from) |from_ptr| {
-        const from_s = api.State.fromVm(from_ptr);
+        const from_s = api.State.fromHandle(from_ptr);
         if (from_s.vm.current_thread) |from_th| {
             co.nCcalls = @as(u32, from_th.getCcalls()) + 1;
         } else {
@@ -1517,7 +1544,7 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
 /// `callCFunction` catches the yield (return value -2) and propagates
 /// `error.Yield` up through the Zig call stack to `driveBytecodeCoroutineTrampoline`.
 pub export fn lua_yieldk(L: ?*lua_State, nresults: c_int, ctx: isize, k: ?*const anyopaque) c_int {
-    const vm = if (L) |v| v else return 2;
+    const vm = if (L) |h| h.vm else return 2;
 
     // Read the yielded values from c_stack (PUC: api_checkpop + L->top - nresults).
     const nresults_usize: usize = @intCast(@max(nresults, 0));
@@ -1532,7 +1559,7 @@ pub export fn lua_yieldk(L: ?*lua_State, nresults: c_int, ctx: isize, k: ?*const
         // No thread — can't yield. Match PUC: luaG_runerror.
         return 2;
     };
-    const kfn: ?*const fn (?*Vm, c_int, isize) callconv(.c) c_int = if (k) |kf|
+    const kfn: ?*const fn (?*vm_mod.lua_State, c_int, isize) callconv(.c) c_int = if (k) |kf|
         @ptrCast(@alignCast(kf))
     else
         null;
@@ -1564,14 +1591,14 @@ pub export fn lua_yieldk(L: ?*lua_State, nresults: c_int, ctx: isize, k: ?*const
 /// Returns LUA_OK (0) for the main thread, or the thread's error/yield
 /// status code.
 pub export fn lua_status(L: ?*lua_State) c_int {
-    var s = api.State.fromVm(L orelse return 2);
+    var s = api.State.fromHandle(L orelse return 2);
     return s.status();
 }
 
 /// PUC `lua_pushthread` (lapi.c:lua_pushthread): push the current thread
 /// onto the stack. Returns 1 if L is the main thread, 0 otherwise.
 pub export fn lua_pushthread(L: ?*lua_State) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return s.pushthread();
 }
 
@@ -1581,7 +1608,7 @@ pub export fn lua_pushthread(L: ?*lua_State) c_int {
 /// LUA_GC* constant. Returns context-dependent values (memory in KB for
 /// GCCOUNT, running status for GCISRUNNING, 0 for most others).
 pub export fn lua_gc(L: ?*lua_State, what: c_int, data: c_int) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return s.gc(what, data);
 }
 
@@ -1607,7 +1634,7 @@ pub export fn lua_pcallk(
     ctx: isize,
     k: ?*const anyopaque,
 ) c_int {
-    const vm = if (L) |v| v else return 2;
+    const vm = if (L) |h| h.vm else return 2;
     const th = vm.current_thread orelse {
         // No thread — conventional pcall without errfunc.
         // P15.78: Even on the main thread (no current_thread), errfunc must
@@ -1667,7 +1694,7 @@ pub export fn lua_pcallk(
         break :blk vm.c_stack.items[abs];
     } else null;
 
-    const kfn: *const fn (?*Vm, c_int, isize) callconv(.c) c_int =
+    const kfn: *const fn (?*vm_mod.lua_State, c_int, isize) callconv(.c) c_int =
         @ptrCast(@alignCast(k.?));
 
     const ret = vm.luaPcallKShared(th, callee, call_args, errfunc_val, fn_idx, kfn, ctx) catch |err| switch (err) {
@@ -1725,45 +1752,45 @@ pub export fn lua_pcallk(
 // --- Userdata ---
 
 pub export fn lua_newuserdatauv(L: ?*lua_State, sz: usize, nuvalue: c_int) ?*anyopaque {
-    var s = api.State.fromVm(L orelse return null);
+    var s = api.State.fromHandle(L orelse return null);
     return s.newuserdatauv(sz, @intCast(@max(nuvalue, 0))) catch null;
 }
 
 pub export fn lua_touserdata(L: ?*lua_State, idx: c_int) ?*anyopaque {
-    var s = api.State.fromVm(L orelse return null);
+    var s = api.State.fromHandle(L orelse return null);
     return s.touserdata(idx);
 }
 
 pub export fn lua_topointer(L: ?*lua_State, idx: c_int) ?*anyopaque {
-    var s = api.State.fromVm(L orelse return null);
+    var s = api.State.fromHandle(L orelse return null);
     return s.topointer(idx);
 }
 
 pub export fn lua_setmetatable(L: ?*lua_State, objindex: c_int) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     s.setmetatable(objindex) catch return 0;
     return 1;
 }
 
 pub export fn lua_getmetatable(L: ?*lua_State, objindex: c_int) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return if (s.getmetatable(objindex) catch false) 1 else 0;
 }
 
 pub export fn lua_setiuservalue(L: ?*lua_State, idx: c_int, n: c_int) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return if (s.setiuservalue(idx, @intCast(@max(n, 0))) catch false) 1 else 0;
 }
 
 pub export fn lua_getiuservalue(L: ?*lua_State, idx: c_int, n: c_int) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return typeCode(s.getiuservalue(idx, @intCast(@max(n, 0))) catch return 0);
 }
 
 // --- lauxlib ---
 
 pub export fn luaL_checklstring(L: ?*lua_State, arg: c_int, l: ?*usize) [*:0]const u8 {
-    var s = api.State.fromVm(L orelse {
+    var s = api.State.fromHandle(L orelse {
         if (l) |p| p.* = 0;
         return "";
     });
@@ -1773,42 +1800,42 @@ pub export fn luaL_checklstring(L: ?*lua_State, arg: c_int, l: ?*usize) [*:0]con
 }
 
 pub export fn luaL_setfuncs(L: ?*lua_State, reg: [*]const luaL_Reg, nup: c_int) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.registerfuncs(reg, @intCast(@max(nup, 0))) catch {};
 }
 
 pub export fn luaL_newlib(L: ?*lua_State, reg: [*]const luaL_Reg) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.newlib(reg) catch {};
 }
 
 pub export fn luaL_ref(L: ?*lua_State, t: c_int) c_int {
-    var s = api.State.fromVm(L orelse return LUA_NOREF);
+    var s = api.State.fromHandle(L orelse return LUA_NOREF);
     return s.ref(t);
 }
 
 pub export fn luaL_unref(L: ?*lua_State, t: c_int, ref: c_int) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.unref(t, ref);
 }
 
 pub export fn luaL_newmetatable(L: ?*lua_State, tname: [*:0]const u8) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return if (s.newmetatable(std.mem.span(tname)) catch false) 1 else 0;
 }
 
 pub export fn luaL_getmetatable(L: ?*lua_State, tname: [*:0]const u8) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.getRegisteredMetatable(std.mem.span(tname)) catch {};
 }
 
 pub export fn luaL_setmetatable(L: ?*lua_State, tname: [*:0]const u8) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.setRegisteredMetatable(std.mem.span(tname)) catch {};
 }
 
 pub export fn luaL_testudata(L: ?*lua_State, ud: c_int, tname: [*:0]const u8) ?*anyopaque {
-    var s = api.State.fromVm(L orelse return null);
+    var s = api.State.fromHandle(L orelse return null);
     return s.testudata(ud, std.mem.span(tname));
 }
 
@@ -1819,7 +1846,7 @@ pub export fn luaL_checkudata(L: ?*lua_State, ud: c_int, tname: [*:0]const u8) ?
 }
 
 pub export fn luaL_checkinteger(L: ?*lua_State, arg: c_int) i64 {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     return s.checkinteger(arg) catch {
         lua_pushstring(L, "bad argument: integer expected");
         lua_error(L);
@@ -1827,7 +1854,7 @@ pub export fn luaL_checkinteger(L: ?*lua_State, arg: c_int) i64 {
 }
 
 pub export fn luaL_optinteger(L: ?*lua_State, arg: c_int, def: i64) i64 {
-    var s = api.State.fromVm(L orelse return def);
+    var s = api.State.fromHandle(L orelse return def);
     return s.optinteger(arg, def) catch def;
 }
 
@@ -1836,7 +1863,7 @@ pub export fn luaL_optinteger(L: ?*lua_State, arg: c_int, def: i64) i64 {
 // ===========================================================================
 
 pub export fn luaL_checktype(L: ?*lua_State, arg: c_int, t: c_int) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     const actual = if (s.typeOf(arg)) |ty| typeCode(ty) else @as(c_int, -1);
     if (actual != t) {
         _ = lua_pushfstring(L, "bad argument #%d (%s expected, got %s)", arg, lua_typename(L, t), lua_typename(L, actual));
@@ -1845,7 +1872,7 @@ pub export fn luaL_checktype(L: ?*lua_State, arg: c_int, t: c_int) void {
 }
 
 pub export fn luaL_checkany(L: ?*lua_State, arg: c_int) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     if (s.typeOf(arg) == null) {
         _ = lua_pushfstring(L, "bad argument #%d (value expected)", arg);
         lua_error(L);
@@ -1853,7 +1880,7 @@ pub export fn luaL_checkany(L: ?*lua_State, arg: c_int) void {
 }
 
 pub export fn luaL_checkstack(L: ?*lua_State, sz: c_int, msg: ?[*:0]const u8) void {
-    const vm = L orelse return;
+    const vm = if (L) |h| h.vm else return;
     vm.c_stack.ensureUnusedCapacity(vm.alloc, @intCast(@max(sz, 0))) catch {
         lua_pushstring(L, if (msg) |m| m else "stack overflow");
         lua_error(L);
@@ -1861,7 +1888,7 @@ pub export fn luaL_checkstack(L: ?*lua_State, sz: c_int, msg: ?[*:0]const u8) vo
 }
 
 pub export fn luaL_checknumber(L: ?*lua_State, arg: c_int) f64 {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     if (s.tonumber(arg)) |n| return n;
     const ty = if (s.typeOf(arg)) |t| typeCode(t) else @as(c_int, -1);
     _ = lua_pushfstring(L, "bad argument #%d (number expected, got %s)", arg, lua_typename(L, ty));
@@ -1869,7 +1896,7 @@ pub export fn luaL_checknumber(L: ?*lua_State, arg: c_int) f64 {
 }
 
 pub export fn luaL_optnumber(L: ?*lua_State, arg: c_int, def: f64) f64 {
-    var s = api.State.fromVm(L orelse return def);
+    var s = api.State.fromHandle(L orelse return def);
     const ty = s.typeOf(arg);
     if (ty == null or ty.? == .nil) return def;
     if (s.tonumber(arg)) |n| return n;
@@ -1877,7 +1904,7 @@ pub export fn luaL_optnumber(L: ?*lua_State, arg: c_int, def: f64) f64 {
 }
 
 pub export fn luaL_optlstring(L: ?*lua_State, arg: c_int, def: ?[*:0]const u8, l: ?*usize) [*:0]const u8 {
-    var s = api.State.fromVm(L orelse {
+    var s = api.State.fromHandle(L orelse {
         if (l) |p| { if (def) |d| { p.* = std.mem.len(d); } else { p.* = 0; } }
         return def orelse "";
     });
@@ -1892,7 +1919,7 @@ pub export fn luaL_optlstring(L: ?*lua_State, arg: c_int, def: ?[*:0]const u8, l
 }
 
 pub export fn luaL_checkoption(L: ?*lua_State, arg: c_int, def: ?[*:0]const u8, lst: [*]const ?[*:0]const u8) c_int {
-    var s = api.State.fromVm(L orelse return -1);
+    var s = api.State.fromHandle(L orelse return -1);
     var bytes: []const u8 = undefined;
     if (s.tostring(arg)) |str| {
         bytes = str;
@@ -1920,7 +1947,7 @@ pub export fn luaL_checkoption(L: ?*lua_State, arg: c_int, def: ?[*:0]const u8, 
 /// frame that called the C function. Internal callers (`luaL_argerror`,
 /// `luaL_error`) therefore use `luaL_where(L, 0)` instead of PUC's `(L, 1)`.
 pub export fn luaL_where(L: ?*lua_State, lvl: c_int) void {
-    const vm = L orelse return;
+    const vm = if (L) |h| h.vm else return;
     var ar: lua_Debug = .{};
     if (lua_getstack(L, lvl, &ar) != 0) {
         _ = lua_getinfo(L, "Sl", &ar);
@@ -1941,7 +1968,7 @@ pub export fn luaL_where(L: ?*lua_State, lvl: c_int) void {
 }
 
 pub export fn luaL_typeerror(L: ?*lua_State, arg: c_int, tname: [*:0]const u8) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     const ty = if (s.typeOf(arg)) |t| typeCode(t) else @as(c_int, -1);
     _ = lua_pushfstring(L, "bad argument #%d (%s expected, got %s)", arg, tname, lua_typename(L, ty));
     lua_error(L);
@@ -1981,7 +2008,7 @@ pub export fn luaL_traceback(L: ?*lua_State, L1: ?*lua_State, msg: ?[*:0]const u
     // L1 is the state to introspect; in luazig L and L1 are the same Vm
     // (lua_newthread returns the same state). Use L for both.
     _ = L1;
-    const vm = L orelse return;
+    const vm = if (L) |h| h.vm else return;
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(vm.alloc);
@@ -2013,7 +2040,7 @@ pub export fn luaL_traceback(L: ?*lua_State, L1: ?*lua_State, msg: ?[*:0]const u
 }
 
 pub export fn luaL_tolstring(L: ?*lua_State, idx: c_int, l: ?*usize) [*:0]const u8 {
-    var s = api.State.fromVm(L orelse { if (l) |p| p.* = 0; return ""; });
+    var s = api.State.fromHandle(L orelse { if (l) |p| p.* = 0; return ""; });
     if (s.tolstring(idx)) |bytes| {
         if (l) |p| p.* = bytes.len;
         return @ptrCast(@constCast(bytes.ptr));
@@ -2035,7 +2062,7 @@ pub export fn luaL_tolstring(L: ?*lua_State, idx: c_int, l: ?*usize) [*:0]const 
 }
 
 pub export fn luaL_len(L: ?*lua_State, idx: c_int) i64 {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     s.len(idx) catch return 0;
     const result = s.tointeger(-1) orelse 0;
     s.vm.c_stack.items.len -= 1;
@@ -2043,7 +2070,7 @@ pub export fn luaL_len(L: ?*lua_State, idx: c_int) i64 {
 }
 
 pub export fn luaL_gsub(L: ?*lua_State, s_str: [*:0]const u8, p: [*:0]const u8, r: [*:0]const u8) [*:0]const u8 {
-    const vm = L orelse return s_str;
+    const vm = if (L) |h| h.vm else return s_str;
     const src = std.mem.span(s_str);
     const pat = std.mem.span(p);
     const rep = std.mem.span(r);
@@ -2065,7 +2092,7 @@ pub export fn luaL_gsub(L: ?*lua_State, s_str: [*:0]const u8, p: [*:0]const u8, 
 }
 
 pub export fn luaL_getmetafield(L: ?*lua_State, obj: c_int, event: [*:0]const u8) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     const abs = normalizeIndex(obj, s.vm.c_stack.items.len) orelse return 0;
     const mt: ?*vm_mod.Table = switch (s.vm.c_stack.items[abs]) {
         .Table => |t| t.metatable,
@@ -2084,13 +2111,13 @@ pub export fn luaL_getmetafield(L: ?*lua_State, obj: c_int, event: [*:0]const u8
 
 pub export fn luaL_callmeta(L: ?*lua_State, obj: c_int, event: [*:0]const u8) c_int {
     if (luaL_getmetafield(L, obj, event) == 0) return 0;
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     s.pushvalue(obj) catch return 0;
     return lua_pcallk(L, 1, 1, 0, 0, null);
 }
 
 pub export fn luaL_requiref(L: ?*lua_State, modname: [*:0]const u8, openf: ?*const fn (?*lua_State) callconv(.c) c_int, glb: c_int) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
     s.pushcfunction(openf) catch return;
     s.pushstring(std.mem.span(modname)) catch return;
     s.call(1, 1) catch return;
@@ -2117,7 +2144,7 @@ pub export fn luaL_loadstring(L: ?*lua_State, s_str: [*:0]const u8) c_int {
 }
 
 pub export fn luaL_fileresult(L: ?*lua_State, stat: c_int, fname: ?[*:0]const u8) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     if (stat >= 0) {
         s.pushboolean(true) catch {};
         return 1;
@@ -2208,7 +2235,7 @@ fn fillShortSrc(buf: *[60]u8, source: []const u8) void {
 /// frames where `hide_from_debug == true`. The frame index (1-based, to
 /// distinguish from null) is stored in `ar.i_ci` as an opaque pointer.
 pub export fn lua_getstack(L: ?*lua_State, level: c_int, ar: *lua_Debug) c_int {
-    const vm = L orelse return 0;
+    const vm = if (L) |h| h.vm else return 0;
     if (level < 0) return 0;
     // call_frames lives on Thread, not Vm. Access via current_thread/main_thread.
     const th = vm.current_thread orelse vm.main_thread orelse return 0;
@@ -2239,7 +2266,7 @@ pub export fn lua_getstack(L: ?*lua_State, level: c_int, ar: *lua_Debug) c_int {
 ///
 /// Returns 1 on success, 0 on invalid frame handle.
 pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c_int {
-    const vm = L orelse return 0;
+    const vm = if (L) |h| h.vm else return 0;
     // Recover the frame index from ar.i_ci (1-based, stored by lua_getstack).
     const ci_raw = @intFromPtr(ar.i_ci orelse return 0);
     if (ci_raw == 0) return 0;
@@ -2334,7 +2361,7 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
 /// the frame's current `pc`. The n-th active local's value lives at
 /// `bc_stack[frame.base + locvar.reg]` — pushed onto `c_stack` for C access.
 pub export fn lua_getlocal(L: ?*lua_State, ar: *lua_Debug, n: c_int) ?[*:0]const u8 {
-    const vm = L orelse return null;
+    const vm = if (L) |h| h.vm else return null;
     // Recover the frame index from ar.i_ci (1-based, stored by lua_getstack).
     const ci_raw = @intFromPtr(ar.i_ci orelse return null);
     if (ci_raw == 0) return null;
@@ -2371,7 +2398,7 @@ pub export fn lua_getlocal(L: ?*lua_State, ar: *lua_Debug, n: c_int) ?[*:0]const
 /// Pops the value from `c_stack` and writes it to the bytecode register at
 /// `bc_stack[frame.base + locvar.reg]`, mirroring PUC's `setobjs2s(L, pos, --L->top)`.
 pub export fn lua_setlocal(L: ?*lua_State, ar: *lua_Debug, n: c_int) ?[*:0]const u8 {
-    const vm = L orelse return null;
+    const vm = if (L) |h| h.vm else return null;
     if (vm.c_stack.items.len < 1) return null; // need a value on the stack
 
     // Recover the frame index from ar.i_ci (1-based, stored by lua_getstack).
@@ -2405,7 +2432,7 @@ pub export fn lua_setlocal(L: ?*lua_State, ar: *lua_Debug, n: c_int) ?[*:0]const
 }
 
 pub export fn lua_getupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]const u8 {
-    var s = api.State.fromVm(L orelse return null);
+    var s = api.State.fromHandle(L orelse return null);
     const abs = normalizeIndex(funcindex, s.vm.c_stack.items.len) orelse return null;
     // C closures: direct upvalue access
     if (s.vm.c_stack.items[abs] == .Closure) {
@@ -2424,7 +2451,7 @@ pub export fn lua_getupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]c
 }
 
 pub export fn lua_setupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]const u8 {
-    var s = api.State.fromVm(L orelse return null);
+    var s = api.State.fromHandle(L orelse return null);
     const abs = normalizeIndex(funcindex, s.vm.c_stack.items.len) orelse return null;
     // C closures: direct upvalue write
     if (s.vm.c_stack.items[abs] == .Closure) {
@@ -2445,7 +2472,7 @@ pub export fn lua_setupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]c
 }
 
 pub export fn lua_upvalueid(L: ?*lua_State, fidx: c_int, n: c_int) ?*anyopaque {
-    const s = api.State.fromVm(L orelse return null);
+    const s = api.State.fromHandle(L orelse return null);
     const abs = normalizeIndex(fidx, s.vm.c_stack.items.len) orelse return null;
     if (s.vm.c_stack.items[abs] != .Closure) return null;
     const cl = s.vm.c_stack.items[abs].Closure;
@@ -2455,7 +2482,7 @@ pub export fn lua_upvalueid(L: ?*lua_State, fidx: c_int, n: c_int) ?*anyopaque {
 }
 
 pub export fn lua_upvaluejoin(L: ?*lua_State, fidx1: c_int, n1: c_int, fidx2: c_int, n2: c_int) void {
-    const s = api.State.fromVm(L orelse return);
+    const s = api.State.fromHandle(L orelse return);
     const abs1 = normalizeIndex(fidx1, s.vm.c_stack.items.len) orelse return;
     const abs2 = normalizeIndex(fidx2, s.vm.c_stack.items.len) orelse return;
     if (s.vm.c_stack.items[abs1] != .Closure or s.vm.c_stack.items[abs2] != .Closure) return;
@@ -2480,7 +2507,7 @@ pub export fn lua_upvaluejoin(L: ?*lua_State, fidx1: c_int, n1: c_int, fidx2: c_
 /// and calls the C function. The Lua-level `DebugHookState.func` is cleared
 /// (single slot), mirroring PUC's singular hook design.
 pub export fn lua_sethook(L: ?*lua_State, func: ?*const fn (?*anyopaque, ?*anyopaque) callconv(.c) void, mask: c_int, count: c_int) void {
-    const vm = L orelse return;
+    const vm = if (L) |h| h.vm else return;
     // PUC lua_sethook: if func==NULL or mask==0, turn off hooks.
     if (func == null or mask == 0) {
         vm.c_hook = null;
@@ -2517,17 +2544,17 @@ pub export fn lua_sethook(L: ?*lua_State, func: ?*const fn (?*anyopaque, ?*anyop
 
 /// PUC `lua_gethook` (ldebug.c:152): return the current hook function.
 pub export fn lua_gethook(L: ?*lua_State) ?*const fn (?*anyopaque, ?*anyopaque) callconv(.c) void {
-    const vm = L orelse return null;
+    const vm = if (L) |h| h.vm else return null;
     return vm.c_hook;
 }
 
 pub export fn lua_gethookmask(L: ?*lua_State) c_int {
-    const vm = L orelse return 0;
+    const vm = if (L) |h| h.vm else return 0;
     return vm.c_hook_mask;
 }
 
 pub export fn lua_gethookcount(L: ?*lua_State) c_int {
-    const vm = L orelse return 0;
+    const vm = if (L) |h| h.vm else return 0;
     return vm.c_hook_count;
 }
 
@@ -2562,7 +2589,7 @@ const LUA_UTF8LIBK: c_int = LUA_TABLIBK << 1;
 /// sets `_G` and `_VERSION`, and returns 1. In luazig, base functions are
 /// already in `_G` when `Vm.init` runs, so we push the global table directly.
 pub export fn luaopen_base(L: ?*lua_State) c_int {
-    const vm = L orelse return 0;
+    const vm = if (L) |h| h.vm else return 0;
     vm.c_stack.append(vm.alloc, .{ .Table = vm.global_env }) catch return 0;
     return 1;
 }
@@ -2570,63 +2597,63 @@ pub export fn luaopen_base(L: ?*lua_State) c_int {
 /// PUC `luaopen_package` (loadlib.c): opens the package library.
 /// The `package` table is already in `_G.package`; push it.
 pub export fn luaopen_package(L: ?*lua_State) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     _ = s.getglobal("package") catch return 0;
     return 1;
 }
 
 /// PUC `luaopen_coroutine` (lcorolib.c): opens the coroutine library.
 pub export fn luaopen_coroutine(L: ?*lua_State) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     _ = s.getglobal("coroutine") catch return 0;
     return 1;
 }
 
 /// PUC `luaopen_debug` (ldblib.c): opens the debug library.
 pub export fn luaopen_debug(L: ?*lua_State) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     _ = s.getglobal("debug") catch return 0;
     return 1;
 }
 
 /// PUC `luaopen_io` (liolib.c): opens the I/O library.
 pub export fn luaopen_io(L: ?*lua_State) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     _ = s.getglobal("io") catch return 0;
     return 1;
 }
 
 /// PUC `luaopen_math` (lmathlib.c): opens the math library.
 pub export fn luaopen_math(L: ?*lua_State) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     _ = s.getglobal("math") catch return 0;
     return 1;
 }
 
 /// PUC `luaopen_os` (loslib.c): opens the os library.
 pub export fn luaopen_os(L: ?*lua_State) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     _ = s.getglobal("os") catch return 0;
     return 1;
 }
 
 /// PUC `luaopen_string` (lstrlib.c): opens the string library.
 pub export fn luaopen_string(L: ?*lua_State) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     _ = s.getglobal("string") catch return 0;
     return 1;
 }
 
 /// PUC `luaopen_table` (ltablib.c): opens the table library.
 pub export fn luaopen_table(L: ?*lua_State) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     _ = s.getglobal("table") catch return 0;
     return 1;
 }
 
 /// PUC `luaopen_utf8` (lutf8lib.c): opens the utf8 library.
 pub export fn luaopen_utf8(L: ?*lua_State) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    var s = api.State.fromHandle(L orelse return 0);
     _ = s.getglobal("utf8") catch return 0;
     return 1;
 }
@@ -2637,7 +2664,7 @@ pub export fn luaopen_utf8(L: ?*lua_State) c_int {
 /// `package.preload` (so `require` will call the openf on first use).
 /// `luaL_openlibs(L)` is `luaL_openselectedlibs(L, ~0, 0)`.
 pub export fn luaL_openselectedlibs(L: ?*lua_State, load: c_int, preload: c_int) void {
-    var s = api.State.fromVm(L orelse return);
+    var s = api.State.fromHandle(L orelse return);
 
     // PUC: luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_PRELOAD_TABLE)
     // Get the PRELOAD table from the registry. The VM stores it under
@@ -2705,7 +2732,7 @@ pub export fn luaL_buffinit(L: ?*lua_State, B: *luaL_Buffer) void {
 /// space after `n`. If the inline buffer is exhausted, spills to heap via the
 /// VM's allocator. Returns a pointer to the free space starting at `b[n]`.
 pub export fn luaL_prepbuffsize(B: *luaL_Buffer, sz: usize) [*c]u8 {
-    const vm = B.L orelse return &B.init[0];
+    const vm = if (B.L) |h| h.vm else return &B.init[0];
     if (B.n + sz <= B.size) return &B.b[B.n];
 
     // Need to grow. Compute new capacity (at least double, at least n+sz).
@@ -2744,10 +2771,11 @@ pub export fn luaL_addstring(B: *luaL_Buffer, s: [*c]const u8) void {
 /// PUC `luaL_addvalue` (lauxlib.c:589): pop the top value from the Lua stack,
 /// convert to string (via lua_tolstring), and append to B.
 pub export fn luaL_addvalue(B: *luaL_Buffer) void {
-    const vm = B.L orelse return;
+    const h = B.L orelse return;
+    const vm = h.vm;
     if (vm.c_stack.items.len == 0) return;
     var l: usize = 0;
-    const s = lua_tolstring(vm, -1, &l);
+    const s = lua_tolstring(h, -1, &l);
     luaL_addlstring(B, s, l);
     vm.c_stack.items.len -= 1;
 }
@@ -2761,7 +2789,7 @@ pub export fn luaL_pushresult(B: *luaL_Buffer) void {
 /// PUC `luaL_pushresultsize` (lauxlib.c:593): push the first `sz` bytes of
 /// the buffer as a Lua string, then free heap allocation if any.
 pub export fn luaL_pushresultsize(B: *luaL_Buffer, sz: usize) void {
-    const vm = B.L orelse return;
+    const vm = if (B.L) |h| h.vm else return;
     B.n = sz;
     const ls = vm.internStr(B.b[0..sz]) catch {
         // Free heap if spilled
@@ -3004,9 +3032,9 @@ test "c api lua_error crosses the setjmp boundary into pcall" {
     const status = lua_pcallk(L, 0, 0, 0, 0, null);
     try std.testing.expectEqual(@as(c_int, 2), status);
 
-    try std.testing.expect(L.err_has_obj);
-    try std.testing.expectEqualStrings("boom from C", L.err_obj.String.bytes());
-    try std.testing.expect(L.c_error_value == null);
+    try std.testing.expect(L.vm.err_has_obj);
+    try std.testing.expectEqualStrings("boom from C", L.vm.err_obj.String.bytes());
+    try std.testing.expect(L.vm.c_error_value == null);
     // PUC luaD_pcall → luaD_seterrorobj: on error, the error object is
     // pushed onto the stack. lua_gettop should be 1 (the error object).
     try std.testing.expectEqual(@as(c_int, 1), lua_gettop(L));
@@ -3021,7 +3049,7 @@ test "c api boundary success path returns results normally" {
     try std.testing.expectEqual(@as(c_int, 0), status);
     try std.testing.expectEqual(@as(c_int, 1), lua_gettop(L));
     try std.testing.expectEqual(@as(i64, 42), intAt(L, -1));
-    try std.testing.expect(!L.err_has_obj);
+    try std.testing.expect(!L.vm.err_has_obj);
 }
 
 test "c api lua_getallocf: alloc/realloc/free roundtrip" {

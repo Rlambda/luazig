@@ -32,10 +32,12 @@
 /* Core types                                                              */
 /* ----------------------------------------------------------------------- */
 
-/* `lua_State` is opaque to C code. In luazig it is `Vm`; the C shim
-** (c_api.zig) casts the pointer to `*Vm` on every entry point. */
-struct Vm;
-typedef struct Vm lua_State;
+/* `lua_State` is opaque to C code. In luazig it is a handle struct defined
+** in vm.zig (wrapping a *Vm pointer and optional *Thread for coroutines).
+** C code never accesses the struct's fields — it only passes the opaque
+** pointer to lua_* functions. */
+struct lua_State;
+typedef struct lua_State lua_State;
 
 /* PUC `lua_CFunction` (lua.h:101): int (*)(lua_State *). */
 typedef int (*lua_CFunction)(lua_State *L);

@@ -1055,6 +1055,11 @@ fn interpreterMain(init: std.process.Init) !void {
 
     // --- Create VM and open libraries ---
     var vm = lua.internal.vm.Vm.init(runtime_alloc, disable_env);
+    // Create the main lua_State handle so C API functions (callCFunction,
+    // hooks, continuations) receive a valid ?*lua_State. The handle stores
+    // a pointer to `vm`, so it must be created AFTER `vm` is at its final
+    // location (stack-local here, stable for the duration of main).
+    _ = try vm.setupMainHandle();
     //vm.tracker_total = &tracker.total_bytes;
     vm.tracker_alloc_count = &tracker.alloc_count;
     vm.tracker_free_count = &tracker.free_count;

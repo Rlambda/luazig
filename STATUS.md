@@ -2015,6 +2015,53 @@ big.lua both_fail), zig build test exit 0.
 suspended k (8), per-thread/i_ci/yieldable C hooks (9), hook API-check
 enforcement (10), full differential coverage + final gates (15/16/17).
 
+### P15.83e — Per-lua_State handle architecture (Phase 1: struct + c_func ABI)
+
+Replaced `pub const lua_State = Vm` with a real handle struct. `lua_newthread`
+now returns distinct handles (`co != L`), and C functions receive `?*lua_State`
+(the handle) instead of `?*Vm`.
+
+**Handle struct** (`vm.zig`): `lua_State = struct { vm: *Vm, thread: ?*Thread,
+c_stack: ArrayListUnmanaged(Value), is_main: bool }`. The handle is
+heap-allocated by `luaL_newstate`/`lua_newstate` (main) and `lua_newthread`
+(coroutine). `Thread.api_handle: ?*lua_State` ties coroutine handle lifetime
+to the Thread's GC lifetime — `gcFreeObject(.thread)` frees the handle. The
+main handle is freed by `lua_close`/`api.State.deinit`.
+
+**Vm fields**: `cur_handle: ?*lua_State` (active handle, passed to C functions
+via `callCFunctionWithBoundary`), `main_handle: ?*lua_State` (freed by
+`lua_close`). `Vm.setupMainHandle()` creates the main handle after `Vm.init`
+(the handle stores `self` as `vm`, so it must be created after the `*Vm` is
+at its final location).
+
+**c_func ABI change**: `Closure.c_func` type changed from
+`?*const fn (?*Vm)` to `?*const fn (?*lua_State)`. `callCFunctionWithBoundary`
+passes `self.cur_handle.?` to the C function. `callContShim`/`testcContShim`
+receive `?*lua_State` and pass the handle to `k`. Hook dispatch passes
+`cur_handle` to the hook function. `c_panicf`/`c_cont_k` types updated.
+`api.State.Reg.func`, `pushcclosure`/`pushcfunction` types updated.
+`luaCallKShared`/`luaPcallKShared`/`luaYieldKShared` k parameter types updated.
+
+**L-unpacking**: All 162 C API exports changed from `const vm = L orelse ...`
+to `const vm = if (L) |h| h.vm else ...` (or `api.State.fromHandle(L orelse ...)`).
+`api.State.fromHandle(h)` resolves `h.vm` — same `*Vm` as before, so all
+`vm.c_stack` access is unchanged.
+
+**Phase 1 limitation**: All handles share `Vm.c_stack` (single shared stack).
+`lua_xmove` is a no-op (self-move). Per-handle stacks, real xmove, and GC
+roots for c_stack are Phase 2.
+
+**lua.h**: `typedef struct Vm lua_State` → `typedef struct lua_State lua_State`
+(forward declaration, opaque to C).
+
+**Test** (`tests/c_api/14_state_handles.c`): 5 tests — newthread distinct,
+two newthreads distinct, resume via handle, status fresh, tothread returns
+handle. Differential test (PUC + luazig) passes.
+
+**Regression gate:** 15/15 c_api suites, test-diff DIFF: PASS (5 suites),
+coroutine.lua --testc exit 0, smoke 54/54, matrix zig_fail=0 (only big.lua
+both_fail), zig build test exit 0.
+
 ## Открытые задачи
 
 Статус проверен 2026-08-06.

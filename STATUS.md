@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-20 (P15.82d: PUC-faithful coroutine.close result + hook-yield frame preservation)
+> Last updated: 2026-08-21 (P15.82g: implement lua_closethread + lua_status thread status)
 
 ---
 
@@ -1784,9 +1784,34 @@ coroutine.lua + big.lua pre-existing), smoke 54/54, c_api 18/18.
       repro `/tmp/test_apico.lua`); today the error propagates uncaught.
 - [ ] finishpcallk C-frame TBC close (plan Task 12).
 - [ ] lua_pcallk errfunc/message handler (plan Task 10).
-- [ ] lua_closethread is still a stub returning LUA_OK.
+- [x] ~~lua_closethread is still a stub returning LUA_OK.~~ — done (P15.82g).
 - [ ] C hook dispatch via `c_hook` (set by lua_sethook) never fires.
-- [ ] Direct `lua_resume` stack/status semantics (lua_status stays 0).
+- [x] ~~Direct `lua_resume` stack/status semantics (lua_status stays 0).~~ — done (P15.82g).
+
+### P15.82g — Implement lua_closethread (was stub) + lua_status thread status
+
+**lua_closethread** (c_api.zig:187): Replaced the stub with a real
+implementation delegating to `builtinCoroutineClose` via a new
+`apiCloseThread` wrapper on Vm (vm.zig:3924). PUC semantics mapped:
+nCcalls inheritance from `from` (lstate.c:327), `luaE_resetthread`
+(close all upvalues/TBCs, run `__close`, set status dead), error object
+pushed on `c_stack` on `__close` error (PUC `luaD_seterrorobj`). The
+`L == from` case (PUC `luaD_throwbaselevel`) is deferred with a TODO —
+`lua_resetthread` macro uses `from==NULL` so the primary use case works.
+
+**lua_status** (api.zig:270): Was `return 0`. Now maps `c_api_thread`
+status: `.suspended` with `started=true` → `LUA_YIELD` (1), fresh/running/
+dead → `LUA_OK` (0). The `started` field distinguishes a fresh thread
+(PUC `LUA_OK`) from a yielded thread (PUC `LUA_YIELD`). Errors collapse
+into `dead` → `LUA_OK` (documented limitation: callers use `lua_resume`'s
+return value for error codes).
+
+**Test:** `tests/c_api/11_closethread.c` (5 tests: fresh close,
+suspended close with `<close>`, close with `__close` error, double
+close, `lua_status` after yield/completion). Verified identical output
+on PUC Lua 5.5.0 and luazig. c_api 19/19, smoke 54/54, matrix
+zig_fail=0 (only big.lua both_fail pre-existing), coroutine.lua --testc
+exit 0, zig build test exit 0.
 
 ## Открытые задачи
 

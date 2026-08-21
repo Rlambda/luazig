@@ -3921,6 +3921,23 @@ pub const Vm = struct {
         return self.last_builtin_out_count;
     }
 
+    /// PUC `lua_closethread` → `luaE_resetthread` (lstate.c:324-333).
+    /// Delegates to `builtinCoroutineClose`, which implements the full
+    /// reset semantics: close all upvalues/TBCs, run `__close`
+    /// metamethods (a `__close` error replaces the status — last error
+    /// wins), set thread status to dead.
+    ///
+    /// Returns the PUC status code (0 = `LUA_OK`, 2 = `LUA_ERRRUN`) and
+    /// the error object (`Nil` on success). The caller
+    /// (`c_api.zig:lua_closethread`) is responsible for pushing the error
+    /// object onto `c_stack` on error, matching PUC `luaD_seterrorobj`.
+    pub fn apiCloseThread(self: *Vm, th: *Thread) Error!struct { status: i32, err: Value } {
+        var out = [_]Value{ .Nil, .Nil };
+        try exposeDispatchResult(void, self.builtinCoroutineClose(&[_]Value{.{ .Thread = th }}, out[0..]));
+        const ok = out[0] == .Bool and out[0].Bool;
+        return .{ .status = if (ok) 0 else 2, .err = out[1] };
+    }
+
     pub fn apiYield(self: *Vm, args: []const Value) Error!void {
         var out: [0]Value = .{};
         return exposeDispatchResult(void, self.builtinCoroutineYield(args, out[0..]));

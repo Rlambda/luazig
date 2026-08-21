@@ -787,9 +787,38 @@ pub export fn lua_numbertocstring(L: ?*lua_State, idx: c_int, buff: [*]u8) c_uin
 pub export fn lua_toclose(L: ?*lua_State, idx: c_int) void {
     const vm = L orelse return;
     const abs = normalizeIndex(idx, vm.c_stack.items.len) orelse return;
-    // Check if already marked — PUC's TBC list is idempotent.
-    for (vm.c_toclose_slots.items) |s| {
-        if (s == abs) return;
+    // P15.83c FIX A: Scope the dedup scan to the current C-frame's segment
+    // [toclose_base, len). Each C-frame gets a fresh c_stack (callCFunction
+    // swaps it), so outer arg 1 and inner arg 1 are different Lua slots that
+    // collide numerically as absolute indices. Scoping the dedup to the
+    // topmost C-frame's range allows both to coexist — mirroring PUC's
+    // per-CallInfo tbclist linked list.
+    const th = vm.current_thread orelse vm.main_thread orelse {
+        // No thread: no C-frame, scan whole list (legacy fallback).
+        for (vm.c_toclose_slots.items) |s| {
+            if (s == abs) return;
+        }
+        vm.c_toclose_slots.append(vm.alloc, abs) catch {};
+        return;
+    };
+    const th_bc = th.call_frames;
+    // Find the topmost C-frame to get its toclose_base. This is the
+    // activation whose segment applies — the C-frame pushed by
+    // callCFunction/callBuiltin that is currently executing.
+    var fi = th_bc.len();
+    while (fi > 0) {
+        fi -= 1;
+        const f = th_bc.getConstPtr(fi);
+        if (f.isC()) {
+            const tbc_base = f.u.c.toclose_base;
+            // Dedup: only scan slots belonging to THIS C-frame.
+            var i = vm.c_toclose_slots.items.len;
+            while (i > tbc_base) {
+                i -= 1;
+                if (vm.c_toclose_slots.items[i] == abs) return;
+            }
+            break;
+        }
     }
     vm.c_toclose_slots.append(vm.alloc, abs) catch {};
 }

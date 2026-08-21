@@ -1160,6 +1160,13 @@ fn interpreterMain(init: std.process.Init) !void {
 }
 
 pub fn main(init: std.process.Init) !void {
+    // P15.83c: Verify CallFrame size stays within budget.
+    // Adding yielded_tbc (?[]Value = 17 bytes on 64-bit) to CFrameState
+    // may have grown CallFrame. Verify it's still reasonable.
+    comptime {
+        const cs = @sizeOf(lua.internal.vm.CallFrame);
+        if (cs > 104) @compileError("CallFrame grew beyond 104B: " ++ std.fmt.comptimePrint("{d}", .{cs}));
+    }
     // Bytecode execution owns Lua activations in Thread.bytecode_frames. The
     // interpreter no longer needs a giant host stack to survive Lua-controlled
     // recursion, so run directly on the process' normal stack.

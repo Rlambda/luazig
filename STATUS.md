@@ -1798,6 +1798,52 @@ coroutine.lua + big.lua pre-existing), smoke 54/54, c_api 18/18.
 - [x] ~~C hook dispatch via `c_hook` (set by lua_sethook) never fires.~~ — done (P15.82h).
 - [x] ~~Direct `lua_resume` stack/status semantics (lua_status stays 0).~~ — done (P15.82g).
 
+### P15.83c — C-frame TBC activation scoping + finishpcallk pcall-error close
+
+**FIX A: lua_toclose dedup scoping** (c_api.zig): `lua_toclose` was deduping
+against ALL entries in `c_toclose_slots`, but each C-frame owns only the
+segment `[toclose_base, len)`. A nested C call's `lua_toclose` could find
+an outer C-frame's TBC slot and skip marking, causing the wrong slot to be
+closed. Fixed by scoping dedup to the topmost C-frame's segment using
+`vm.current_thread orelse vm.main_thread`. Also: `popBuiltinCFrame` now
+truncates `c_toclose_slots` to the popped frame's `toclose_base` (scoping
+hygiene, mirrors PUC per-CallInfo TBC scope).
+
+**FIX B: finishpcallk C-frame TBC close on resume-error** (vm.zig): When a
+yieldable `lua_pcallk`'s C-frame has TBC values and the resumed callee errors,
+PUC's `finishpcallk` calls `luaF_close(L, func, status, 1)` to close them. In
+luazig, `c_stack` is per-C-frame and freed by `callCFunction`'s errdefer on
+yield — TBC Values are lost. Two mechanisms:
+
+1. **Yield snapshot** (`snapshotYieldedTbc`): On yield (both `callCFunction`
+   and `finishCcall` k-yield paths), TBC Values are snapshotted from `c_stack`
+   into `fr.u.c.clsret_state` (reused as `?*CClsretState` in
+   `pcall_error_close` mode, CIST_CLSRET NOT set). `c_toclose_slots` is
+   truncated to `toclose_base` (indices about to become stale).
+
+2. **Resume-error close** (`finishCcall`): On resume, if `clsret_state !=
+   null` and CIST_YPCALL and CIST_RECST has error status, sets CIST_CLSRET
+   and enters the CLSRET close loop (calls `__close` with error value as
+   arg, last-error-wins LIFO semantics). On completion, does finishpcallk
+   completion (set error obj at funcidx, clear YPCALL/RECST/CLSRET, restore
+   allowhook/errfunc) and falls through to k invocation with error status.
+   If resume is NOT an error (normal yield resume), frees the snapshot.
+
+3. **No-yield error path** (`callCFunction` error path): When `lua_error`
+   fires directly from the C function (no yield), c_stack is still alive.
+   TBC Values are collected from `c_stack` into `clsret_state` before the
+   errdefer frees it. Same CLSRET close loop runs on `finishCcall`.
+
+**CallFrame size**: Reused `clsret_state` (existing `?*CClsretState` = 8 bytes)
+instead of adding a new field — CallFrame stays ≤ 104B.
+
+**Test:** Repro tests at `/tmp/tbc_pcallk.c` (yield→error→TBC close) and
+`/tmp/nested_tbc.c` (nested C-frame TBC scope). Both match PUC Lua 5.5.0
+exactly: `tbc_close_count=1`, `status_seen=2`, `inner,outer`.
+
+**Regression gate:** c_api 29/29, smoke 54/54, matrix zig_fail=0 (only
+big.lua both_fail pre-existing), zig build test exit 0, CallFrame ≤ 104B.
+
 ### P15.83b — ERRFUNC_NONE sentinel + real LUA_ERRERR status
 
 **FIX A: ERRFUNC_NONE sentinel** (vm.zig): `Thread.errfunc` used `0` as

@@ -1555,14 +1555,20 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
             if (h.c_stack.items.len < nargs_usize + 1) return 2;
             const fi = h.c_stack.items.len - nargs_usize - 1;
             co.callee = h.c_stack.items[fi];
-            // Save base for truncating after resume.
-            lua_resume_base = fi;
+            // P15.83j: remember the function position (PUC ci->func). Every
+            // later resume truncates back to it before pushing results, so
+            // stale yielded values never remain under the new results.
+            h.resume_func_base = fi;
             break :blk h.c_stack.items[fi + 1 ..];
         } else {
-            // Subsequent resume: only args on c_stack.
+            // Subsequent resume: args sit on top of the stack (above any
+            // stale values left by the previous yield). PUC `resume()` reads
+            // `firstArg = L->top - n` the same way; results are later moved
+            // down to ci->func + 1 by luaD_poscall. Use the remembered
+            // func base as the truncation target (PUC ci->func).
             if (h.c_stack.items.len < nargs_usize) return 2;
-            lua_resume_base = h.c_stack.items.len - nargs_usize;
-            break :blk h.c_stack.items[lua_resume_base..];
+            lua_resume_base = h.resume_func_base orelse (h.c_stack.items.len - nargs_usize);
+            break :blk h.c_stack.items[h.c_stack.items.len - nargs_usize ..];
         }
     };
     // Switch cur_handle and cur_c_stack to the coroutine's handle so that

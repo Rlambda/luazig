@@ -676,6 +676,14 @@ pub const lua_State = struct {
     /// `true` for the main state (created by `luaL_newstate` / `lua_newstate`).
     /// `false` for coroutine states (created by `lua_newthread`).
     is_main: bool = false,
+    /// PUC `ci->func` position for coroutine states (P15.83j): the index in
+    /// `c_stack` where the coroutine's function was placed by the FIRST
+    /// `lua_resume`. Every subsequent resume truncates the stack back to
+    /// this base and pushes results there (PUC `lua_resume`: results end at
+    /// `L->top`, start at `ci->func + 1` — `*nresults = top - (func + 1)`),
+    /// so stale yielded values from a previous yield can never remain under
+    /// the new results.
+    resume_func_base: ?usize = null,
 };
 
 pub const Closure = struct {

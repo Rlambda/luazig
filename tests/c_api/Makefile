@@ -29,15 +29,14 @@ DIFF_TESTS = \
     12_chook \
     13_p15_completion \
     14_state_handles \
-    15_stress_leak \
-    14_state_handles
+    15_stress_leak
 
 test-diff: $(DIFF_TESTS) $(DIFF_TESTS:%=%-puc)
 	@set -e; \
 	for t in $(DIFF_TESTS); do \
 		echo "=== $$t ==="; \
-		./$$t-puc > /tmp/$$t-puc.txt 2>&1 || true; \
-		./$$t > /tmp/$$t-luazig.txt 2>&1 || true; \
+		./$$t-puc > /tmp/$$t-puc.txt 2>&1; \
+		./$$t > /tmp/$$t-luazig.txt 2>&1; \
 		diff -u /tmp/$$t-puc.txt /tmp/$$t-luazig.txt; \
 	done; \
 	echo "DIFF: PASS"

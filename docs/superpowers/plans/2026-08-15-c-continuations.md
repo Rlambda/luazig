@@ -1,23 +1,20 @@
-> **STATUS: COMPLETE (2026-08-22, after the reopened blockers were closed
-> by P15.83a–P15.83i).** Everything from the independent review was
-> implemented and differential-tested against vendored PUC Lua 5.5.0:
-> ERRFUNC_NONE sentinel + real LUA_ERRERR (5) [P15.83b]; C-frame TBC
-> activation scoping + finishpcallk pcall-error close state machine with
-> yield/error during __close [P15.83c]; testC callk/pcallk/yieldk routed
-> through the shared production lua_*k helpers (single implementation
-> with c_api) [P15.83d]; real per-lua_State handle architecture —
-> distinct lua_newthread handles, per-handle C API stacks, real
-> lua_xmove, GC stack roots [P15.83e/f]; lua_status error preservation
-> via Thread.api_status + lua_closethread discarding suspended
-> continuations (reset, not resume) + throwbaselevel [P15.83g];
-> per-thread C hooks with lua_Debug.i_ci and yieldable count/line hooks
-> [P15.83h]; spec API-check section corrected [P15.83a]; differential
-> gate expanded to 6 suites + stress/leak coverage [P15.83c/i].
-> Final gate: matrix zig_fail=0 (big.lua accurately recorded both_fail),
-> coroutine.lua --testc full-suite PASS, smoke 54/54 byte-identical to
-> PUC, c_api 16/16 suites + test-diff DIFF: PASS, leak_bench 25/25,
-> CallFrame = 104B, Debug + ReleaseFast builds and tests green.
-> Documented intentional deviations are listed in STATUS.md (P15.83i).
+> **STATUS: FINAL VERIFICATION — direct-resume stack + CALL-hook parity + API-check enforcement remain (2026-08-22, second independent review).**
+> P15.83a–P15.83i stand (do not revert). Remaining before COMPLETE:
+> 1. direct lua_resume stack replacement on subsequent resumes (old yielded
+>    results must not remain under new results; exact top/nres/value
+>    differential + CIST_CLSRET variant);
+> 2. LUA_HOOKCALL must fire for the correct CALLEE activation (ar.i_ci →
+>    callee frame, lua_getinfo identity) and the main chunk must receive
+>    its CALL event;
+> 3. API-check invariants (k==NULL inside hooks; yieldk nresults==0) must
+>    be enforced non-silently in the shared production helpers — the spec
+>    requires it; documenting them away contradicts the spec;
+> 4. lua_pushthread / per-handle identity migration completion;
+> 5. test-diff must fail hard (no `|| true`, no duplicate suites);
+> 6. smoke 45_userdata_capi must actually load udatatest (true 54/54);
+> 7. stale plan/self-review/source comments cleanup.
+> Acceptable deviations (only): absolute COUNT-hook firing totals
+> (instruction density); small GCCOUNT accounting granularity.
 
 # PUC Lua 5.5 C Continuations Implementation Plan
 

@@ -552,28 +552,38 @@ All access sites updated:
 - **`frame_loop`** — unchanged. C-continuation replay happens in
   `driveBytecodeCoroutineTrampoline`, not in `frame_loop`.
 
-### 7. API checks (PUC-faithful)
+### 7. API checks (PUC-faithful) — IMPLEMENTED (P15.83m)
 
-PUC enforces several API invariants via `api_check`. luazig must replicate these:
+PUC enforces several API invariants via `api_check`. luazig replicates all of
+them, centralized in `Vm.apiCheckHookContinuationInvariant` (vm.zig), which
+the shared `lua_yieldk`/`lua_callk`/`lua_pcallk` helpers call before touching
+any continuation state:
 
-- **`lua_yieldk` inside a hook**: `api_check(L, k == NULL, "hooks cannot continue
-  after yielding")`. If the topmost frame is a hook frame (`CIST_HOOKED` /
-  `CIST_HOOKYIELD`), `k` must be NULL. A non-NULL `k` in a hook context is an
-  API violation.
+- **`lua_yieldk` inside a hook**: PUC `api_check(L, k == NULL, "hooks cannot
+  continue after yielding")` and `api_check(L, nresults == 0, "hooks cannot
+  yield values")` (ldo.c hook branch). If the topmost frame is a hook frame,
+  both a non-NULL `k` and non-zero `nresults` are API violations. The
+  `nresults` check runs first, matching PUC's order.
 - **`lua_yieldk` yieldability**: `api_check(L, yieldable(L), "attempt to yield
   across a C-call boundary")`. Enforced via `!th.yieldable()` check
   (upper 16 bits of `nCcalls` nonzero).
-- **`lua_callk`/`lua_pcallk` continuation in hook**: PUC `lapi.c` DOES
-  explicitly forbid continuations inside hooks — both `lua_callk` and
-  `lua_pcallk` have:
+- **`lua_callk`/`lua_pcallk` continuation in hook**: PUC `lapi.c` explicitly
+  forbids continuations inside hooks — both have:
   `api_check(L, k == NULL || !isLua(L->ci), "cannot use continuations inside hooks")`.
   (CORRECTION 2026-08-21: this spec previously claimed no check exists —
-  that was wrong for vendored Lua 5.5.) luazig must enforce the same
-  invariant: when the current frame is a Lua hook frame
-  (`CIST_HOOKED`), a non-NULL `k` is an API violation. Additionally,
-  `lua_yieldk` inside a hook must enforce `api_check(L, nresults == 0,
-  "hooks cannot yield values")` alongside `k == NULL`. Violations must
-  not be silently ignored (e.g. by dropping `k`).
+  that was wrong for vendored Lua 5.5.) When the current frame is a Lua hook
+  frame, a non-NULL `k` is an API violation; `lua_callk` checks it
+  unconditionally (PUC semantics), `lua_pcallk` before pcall setup.
+
+**Enforcement model**: PUC compiles `api_check` out of release builds (under
+LUA_USE_APICHECK it aborts via `lua_assert`). luazig never silently ignores a
+violation (dropping `k` would leave the continuation half-installed): the
+check raises a deterministic runtime error carrying the exact PUC message
+text, converted at the C boundary (`_longjmp` regime) so `lua_pcallk` /
+`lua_resume` report LUA_ERRRUN with the message and the coroutine dies — no
+continuation state is mutated. Verified by the ZIG-only `16_apicheck` suite
+(release PUC compiles these checks out, so no byte-identical differential is
+possible there; see tests/c_api/Makefile and STATUS.md P15.83m).
 
 ## Testing
 

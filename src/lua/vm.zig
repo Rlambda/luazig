@@ -651,16 +651,16 @@ pub const Cell = struct {
 /// thread. In PUC, `lua_State` IS the thread — it contains the stack, call
 /// info, and global state pointer. In luazig, the `Vm` struct holds the global
 /// state and the main thread's runtime; `lua_State` is a **handle** that
-/// wraps a `*Vm` and optionally a `*Thread` (for coroutines).
+/// wraps a `*Vm` and a `*Thread` (the thread this handle represents).
 ///
 /// C code receives `?*lua_State` from `luaL_newstate` / `lua_newthread` and
 /// passes it to every `lua_*` function. The handle is always heap-allocated
 /// (never on the C stack) and its lifetime is tied to the VM (main handle) or
 /// the Thread's GC lifetime (coroutine handle, freed in `gcFreeObject(.thread)`).
 ///
-/// **Phase 1 (current):** The handle struct exists and `lua_newthread` returns
-/// distinct handles, but all C API stack operations still go through `Vm.c_stack`
-/// (single shared stack). Per-handle stacks are Phase 2.
+/// Since P15.83f every handle owns its own C API stack (`c_stack`), with
+/// `Vm.cur_c_stack` pointing at the active handle's stack — mirrors of PUC's
+/// per-`lua_State` stacks. All live handle stacks are marked as GC roots.
 pub const lua_State = struct {
     /// The VM this handle belongs to. Always non-null after creation.
     /// C API functions resolve `vm = L.vm` to access the shared global state.
@@ -673,9 +673,11 @@ pub const lua_State = struct {
     /// `is_main` distinguishes the main handle where behavior differs
     /// (lua_pushthread return, lua_status, handle lifetime).
     thread: ?*Thread = null,
-    /// Per-handle C API stack. **Phase 2:** each handle has its own stack,
-    /// and `Vm.cur_c_stack` points to the active handle's stack.
-    /// **Phase 1 (current):** unused — all stack ops go through `Vm.c_stack`.
+    /// Per-handle C API stack (PUC `L->stack`; landed in P15.83f). Each
+    /// handle — main and coroutine alike — operates on its own stack, and
+    /// `Vm.cur_c_stack` points to the active handle's stack so the VM's
+    /// C-dispatch paths (callCFunction etc.) address the right one. All
+    /// live handle stacks are GC roots (see the GC mark phase).
     c_stack: std.ArrayListUnmanaged(Value) = .empty,
     /// `true` for the main state (created by `luaL_newstate` / `lua_newstate`).
     /// `false` for coroutine states (created by `lua_newthread`).
@@ -2879,18 +2881,21 @@ pub const Vm = struct {
     /// (lua_upvalueindex) in the C API.
     c_active_closure: ?*Closure = null,
 
-    /// P15.82b: Thread handle for C API `lua_resume`. In PUC Lua,
-    /// `lua_newthread` returns a new `lua_State*` (a thread). In luazig,
-    /// `lua_State = Vm`, so `lua_newthread` returns the same Vm pointer.
-    /// This field stores the most recently created thread so `lua_resume`
-    /// can find it. When null, `lua_resume` falls back to `current_thread`.
+    /// The thread most recently created via C API `lua_newthread`. The
+    /// internal Zig-level `api.State` helpers (`api.zig` `status` /
+    /// `pushthread`) use it as "the current thread" because they carry no
+    /// handle context; the C API proper ignores it and resolves threads from
+    /// each handle's own `lua_State.thread` field (P15.83e/k) — `lua_resume`
+    /// in particular resolves the thread exclusively via the handle.
     c_api_thread: ?*Thread = null,
 
     /// The active `lua_State` handle for C function calls. `callCFunction`
     /// passes `cur_handle` to the C function as its `?*lua_State` argument,
     /// matching PUC's `(*f)(L)` contract. Set by `setupMainHandle` (main
-    /// state) and updated on coroutine resume (Phase 2). `null` before
-    /// `setupMainHandle` is called — `callCFunction` asserts non-null.
+    /// state) and switched to the coroutine's handle for the duration of a
+    /// C API `lua_resume` (restored afterwards; c_api.zig:lua_resume).
+    /// `null` before `setupMainHandle` is called — `callCFunction` asserts
+    /// non-null.
     cur_handle: ?*lua_State = null,
 
     /// The main state handle (created by `luaL_newstate` / `lua_newstate`).
@@ -2927,9 +2932,11 @@ pub const Vm = struct {
     c_alloc_ud: ?*anyopaque = null,
 
     /// PUC `L->ci->tbclist` (ldo.c): C-stack slots marked for auto-closing
-    /// by `lua_toclose`. Stored as absolute indices into `c_stack`. When
-    /// `lua_closeslot` is called (or the C function returns — not yet
-    /// wired), the VM invokes the `__close` metamethod on the value at
+    /// by `lua_toclose`. Stored as absolute indices into the handle's
+    /// `c_stack`. When `lua_closeslot` is called, or when the owning C
+    /// function returns (each C frame snapshots `toclose_base` in
+    /// `callCFunction` and closes slots in `[toclose_base, len)` on unwind —
+    /// P15.83c), the VM invokes the `__close` metamethod on the value at
     /// each marked slot. PUC chains these as a linked list on the stack;
     /// we use a simple ArrayList since the C API typically marks few slots.
     c_toclose_slots: std.ArrayListUnmanaged(usize) = .empty,

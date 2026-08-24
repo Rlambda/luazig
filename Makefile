@@ -50,7 +50,7 @@ test-upstream: lua-c zig
 	@python3 tools/run_tests.py --mode compare --prelude "" --suite "$(FILE)"
 
 test-smoke: lua-c zig
-	@python3 tools/smoke_compare.py --no-build
+	@python3 tools/smoke_compare.py
 
 test-guard: zig
 	@python3 tools/regression_guard.py --no-build

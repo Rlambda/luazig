@@ -253,8 +253,7 @@ LUA_API lua_Number (lua_version)(lua_State *L);
 /* ----------------------------------------------------------------------- */
 /* Garbage-collection options (PUC lua.h:331-340)                          */
 /*                                                                         */
-/* Used by lua_gc(). luazig does not yet export lua_gc, but the            */
-/* constants are defined for header completeness.                          */
+/* Used by lua_gc(), exported by luazig (c_api.zig:lua_gc).                */
 /* ----------------------------------------------------------------------- */
 
 #define LUA_GCSTOP 0
@@ -284,8 +283,8 @@ LUA_API lua_Number (lua_version)(lua_State *L);
 /* ----------------------------------------------------------------------- */
 /* Debug API: hook events and masks (PUC lua.h:454-467)                    */
 /*                                                                         */
-/* Used by lua_sethook/lua_gethookmask. luazig does not yet export the     */
-/* debug API, but the constants are defined for header completeness.       */
+/* Used by lua_sethook/lua_gethookmask, exported by luazig since P15.83h   */
+/* (c_api.zig:lua_sethook/lua_gethook/lua_gethookmask/lua_gethookcount).   */
 /* ----------------------------------------------------------------------- */
 
 #define LUA_HOOKCALL 0

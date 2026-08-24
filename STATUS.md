@@ -2197,8 +2197,11 @@ yields. Added to TESTS and the DIFF_TESTS differential gate (now 6 suites).
   (big.lua accurately recorded as both_fail — identical failure in PUC);
   testC callk/pcallk/yieldk verified to use the shared production
   lifecycle (P15.83d static gate).
-- Smoke: 54/54 byte-identical output AND exit codes vs PUC (true
-  differential, not grep-FAIL).
+- Smoke: originally 53/54 exact + 1 mismatch (45_userdata_capi: udatatest.so
+  was NOT built → BOTH runtimes failed require("udatatest") with DIFFERENT
+  diagnostics — the earlier "54/54 byte-identical" wording in this entry was
+  made with a laxer comparison and was wrong). Real 54/54 byte-identical
+  output AND exit codes achieved in P15.83n via per-runtime udatatest builds.
 - Leak: tools/leak_bench.py 25/25 PASS + 15_stress_leak bounded.
 - Size: @sizeOf(CallFrame) == 104 B (requirement <= 104B).
 
@@ -2400,6 +2403,85 @@ ReleaseFast exit 0; make -C tests/c_api test 17/17 exit 0; test-diff
 DIFF: PASS (6 suites, unchanged); coroutine.lua --testc exit 0
 (ulimit -v 2000000, timeout 30); smoke 54/54 exit 0; matrix zig_fail=0
 (big.lua both_fail, pre-existing infra).
+
+### P15.83n — real 54/54 smoke parity via per-runtime udatatest modules + stale docs/comments cleanup (review items 6-7)
+
+**Item 6 — smoke 45_userdata_capi now REALLY passes the differential.**
+Before this step `tools/smoke_compare.py` reported 53 exact + 1 mismatch:
+`tests/smoke/45_userdata_capi.lua` requires the C module `udatatest`, but no
+.so was built by any harness step, so BOTH runtimes failed require() with
+DIFFERENT diagnostics. (The standalone-zig gate passed only thanks to a
+leftover untracked lua-5.5.0/testes/libs/udatatest.so; earlier "54/54"
+wordings in P15.83c..m meant standalone exit-0, not the differential.)
+
+**Build strategy:** the single upstream source (lua-5.5.0/testes/libs/
+udatatest.c) is compiled TWICE by `tools/smoke_compare.py`
+(`build_udatatest_modules`, runs unless --no-build):
+- `lua-5.5.0/testes/libs/udatatest.so` — `gcc -I lua-5.5.0/src -fPIC -shared`;
+- `tests/smoke/zig-libs/udatatest.so` — `gcc -I src/lua -fPIC -shared`.
+Both follow the upstream testes/libs makefile pattern: NO -llua; lua_*
+symbols stay undefined and resolve from the HOST interpreter's exported
+dynamic symbols (build/lua-c/lua and zig-out/bin/luazig both export the full
+C API — 156/162 symbols). Linking a hosted module against liblua (as first
+considered) would map a second VM image into the process; host resolution
+keeps one VM, exactly like PUC's own test libraries. Both artifacts are
+gitignored; `make test-smoke` no longer passes --no-build so modules are
+always rebuilt.
+
+**Runtime selection (explicit + consistent):** smoke scripts cannot branch
+on the runtime (differential = same script), so the harness injects a
+per-runtime startup chunk via the LUA_INIT_5_5 env var that PREPENDS the
+runtime's module dir to package.cpath — PUC runs resolve the PUC-headers
+build, luazig runs the luazig-headers build. LUA_INIT_5_5 (PUC
+handle_luainit, implemented in luazig) is used instead of `-e` because `-e`
+shifts the arg table (arg[-1] etc.) which 29_platform_process_io.lua
+observes. The smoke file itself appends only ./tests/smoke/zig-libs/?.so so
+standalone zig runs (AGENTS gate: all tests/smoke exit 0 on zig-out/bin/
+luazig) load the zig build; verified real by removing the module (require
+fails → non-zero exit). Result: `python3 tools/smoke_compare.py --no-build`
+→ PASS, 54/54 ok, 0 mismatches (exact stdout + exit codes), 45_userdata
+exercising lua_newuserdatauv/metatable/luaL_checkudata/__tostring/GC on both
+runtimes. No VM bugs surfaced by userdata module loading.
+
+**Item 7 — stale comments/docs fixed (all verified against current code):**
+- vm.zig lua_State struct doc + c_stack field doc: removed false "Phase 1
+  (current): unused — all stack ops go through Vm.c_stack" (per-handle
+  stacks landed in P15.83f; Vm.cur_c_stack points at the active handle's
+  stack; handle stacks are GC roots).
+- vm.zig c_api_thread field doc: removed false "lua_State = Vm, so
+  lua_newthread returns the same Vm pointer ... lua_resume falls back to
+  current_thread" (P15.83e/k made handles per-thread; lua_resume resolves
+  via handle.thread; field now documented as the Zig-level api.State thread).
+- vm.zig cur_handle doc: "updated on coroutine resume (Phase 2)" → switched
+  to the coroutine handle for the duration of C API lua_resume.
+- vm.zig c_toclose_slots doc: removed false "or the C function returns —
+  not yet wired" (C-frame auto-close on return implemented in P15.83c via
+  toclose_base snapshots in callCFunction).
+- c_api.zig lua_newstate: "PRNG seeding not yet wired" → deliberately
+  unused, fixed hash seed by design (see Vm.hash_seed).
+- lua.h: removed stale "luazig does not yet export lua_gc" and "does not
+  yet export the debug API" block comments (lua_gc exported; hooks
+  exported since P15.83h).
+- lualib.h header comment: removed "not yet all exported ... Phase 7"
+  (all 10 luaopen_* + luaL_openselectedlibs exported).
+- plan 2026-08-15-c-continuations.md Self-Review "Placeholder scan":
+  updated to reality (finishpcallk TBC close implemented in P15.83c; testC
+  migrated to shared production lua_*k helpers in P15.83d).
+- spec 2026-08-15-c-continuations-design.md §7: now DESCRIBES the
+  implemented enforcement (Vm.apiCheckHookContinuationInvariant in the
+  shared helpers, deterministic LUA_ERRRUN with PUC messages through the C
+  boundary, 16_apicheck coverage) instead of speculating.
+- STATUS.md P15.83i smoke claim corrected (see above).
+- Checked and left accurate as-is: api.zig pushthread/status comments
+  (already updated by P15.83k, no "cannot be pushed" text remains),
+  c_api.zig lua_resume historical note about the removed fallback,
+  "TODO: integrate C hook invocation" (already gone).
+
+**Gates (all green):** see P15.83n verification in the iteration log —
+make -C tests/c_api test 17/17; test-diff DIFF: PASS (strict); coroutine.lua
+--testc exit 0; all tests/smoke/*.lua exit 0 standalone on zig;
+zig build test exit 0; matrix zig_fail=0; smoke_compare --no-build
+54/54 PASS (exact).
 
 ### P15.83k — Exact resume-stack differentials + lua_pushthread/tothread per-handle identity
 

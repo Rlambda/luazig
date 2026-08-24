@@ -5,10 +5,8 @@
 ** `luaopen_*` entry points for each standard library and the
 ** `luaL_openselectedlibs` function for selective library loading.
 **
-** The `luaopen_*` functions are declared here but not yet all exported
-** by luazig's C API shim (c_api.zig). They will be implemented in
-** Phase 7 of the C API drop-in plan. Until then, the declarations
-** exist so that C code including lualib.h compiles correctly.
+** All `luaopen_*` functions and `luaL_openselectedlibs` are exported
+** by luazig's C API shim (c_api.zig), matching PUC's contract.
 */
 #ifndef lualib_h
 #define lualib_h

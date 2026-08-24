@@ -3435,6 +3435,66 @@ pub const Vm = struct {
         };
     }
 
+    /// PUC `getfuncname` (ldebug.c:323) — how was the function running in
+    /// `call_frames[frame_idx]` called? The name comes from the CALLER's
+    /// bytecode at its current instruction (funcnamefromcall →
+    /// funcnamefromcode, ldebug.c:615/659):
+    ///   - OP_CALL/OP_TAILCALL: getobjname on the callee's register —
+    ///     "local"/"upvalue"/"global"/"field"/"method" (luazig:
+    ///     debugBytecodeOperandName, the same backward trace used for
+    ///     "attempt to call a nil value" messages).
+    ///   - OP_TFORCALL: "for iterator".
+    ///   - other call-capable instructions: the metamethod name recorded on
+    ///     the caller's pending call (setDebugName), matching PUC's
+    ///     tmname[tm]+2 with namewhat "metamethod".
+    ///   - caller is the hook frame: "?" / "hook" (PUC CIST_HOOKED).
+    ///   - tail-called frames have no name (PUC: CIST_TAIL → NULL).
+    ///   - C callers (no proto) and frames without a caller: no name.
+    /// Returns null when PUC's getfuncname returns NULL (auxgetinfo then
+    /// sets namewhat="" and name=NULL).
+    pub fn getFuncNameForFrame(self: *Vm, th: *Thread, frame_idx: usize) ?struct { namewhat: []const u8, name: ?[]const u8 } {
+        if (frame_idx >= th.call_frames.len()) return null;
+        const frame = th.call_frames.getConstPtr(frame_idx);
+        // PUC getfuncname: no way to find a name for a tail-called frame.
+        if (frame.isTailCall()) return null;
+        if (frame_idx == 0) return null;
+        const parent = th.call_frames.getConstPtr(frame_idx - 1);
+        // Caller executing inside a hook (PUC CIST_HOOKED): "?" / "hook".
+        if (parent.isDebugHook()) return .{ .namewhat = "hook", .name = "?" };
+        const proto = parent.proto() orelse return null; // C caller: no name
+        const pc = parent.u.lua.pc;
+        if (pc >= proto.code.len) return null;
+        const inst = proto.code[pc];
+        const op: bc.Op = @enumFromInt(inst.op);
+        switch (op) {
+            .call, .tailcall => {
+                // The callee's register: the caller-relative position the
+                // callee frame was pushed at. Frames NOT pushed from this
+                // caller's registers (entry chunks, pcall bodies pushed at
+                // bc_stack_top) carry an out-of-range offset — PUC's
+                // equivalent (a C-function caller) yields no name.
+                const off = frame.u.lua.func_slot_base - parent.base;
+                if (off >= proto.maxstacksize) return null;
+                const dn = debugBytecodeOperandName(proto, pc, @intCast(off));
+                if (dn.name) |nm| return .{ .namewhat = dn.namewhat, .name = nm };
+                return .{ .namewhat = "", .name = null };
+            },
+            .tforcall => return .{ .namewhat = "for iterator", .name = "for iterator" },
+            else => {
+                // Metamethod-calling instruction: the pending-call debug
+                // name carries the metamethod identity (PUC
+                // funcnamefromcode's tmname[tm]+2, namewhat "metamethod").
+                if (self.getDebugName(parent)) |dn| {
+                    return .{
+                        .namewhat = dn.namewhat orelse "",
+                        .name = dn.name,
+                    };
+                }
+                return null;
+            },
+        }
+    }
+
     /// P15.51n: Allocate a pending call slot on the Vm.
     /// Returns the slot index, or error.OutOfMemory if allocation fails.
     fn allocPendingCall(self: *Vm) error{OutOfMemory}!u32 {
@@ -5629,7 +5689,9 @@ pub const Vm = struct {
         line: ?i64,
         transfer: ?[]const Value,
     ) DispatchError!void {
-        try self.debugDispatchHookTransfer(event, line, transfer, 1);
+        // Line/count/return events reference the topmost visible frame
+        // (PUC luaD_hook's `ar.i_ci = L->ci`).
+        try self.debugDispatchHookTransfer(event, line, transfer, 1, null);
     }
 
     noinline fn dispatchBytecodeHookWithCallee(
@@ -5638,7 +5700,64 @@ pub const Vm = struct {
         callee: Value,
         transfer: ?[]const Value,
     ) DispatchError!void {
-        try self.debugDispatchHookWithCalleeTransfer(event, null, callee, transfer, 1);
+        try self.debugDispatchHookWithCalleeTransfer(event, null, callee, transfer, 1, null);
+    }
+
+    /// Fire the CALL hook for a Lua activation that has just been pushed
+    /// onto `exec_frames` — PUC's luaD_hookcall ordering (ldo.c:476,
+    /// ldebug.c:918 luaG_tracecall): the callee's CallInfo exists FIRST,
+    /// then the hook fires with ar.i_ci referencing the callee frame.
+    /// Used by every site that pushes a bytecode frame as a function call:
+    /// OP_CALL, entry chunks (runBytecodeInternal), pcall'd bodies,
+    /// metamethod activations, and for-in iterators.
+    ///
+    /// `callee` is the closure being called; `nargs` the actual argument
+    /// count (PUC passes ntransfer = p->numparams to luaD_hook — the fixed
+    /// parameters are what the 'r' (transfer) flag exposes; we slice the
+    /// fixed params from the just-built frame registers).
+    fn dispatchCalleeActivationHook(
+        self: *Vm,
+        exec_frames: *FrameStack,
+        callee: Value,
+        nargs: usize,
+    ) DispatchError!void {
+        // Same guards as the dispatch fast path (PUC checks hookmask and
+        // allowhook in luaD_hook; luaG_tracecall additionally checks that
+        // hooks are enabled for the event).
+        if (!self.hooks_active_cached) return;
+        if (self.debug_hooks_suppressed != 0) return;
+        if (self.isInDebugHook()) return;
+        const hook_state = self.activeHookState();
+        if (!hook_state.has_call) return;
+
+        const frame_idx = exec_frames.len() - 1;
+        const fr = exec_frames.getConstPtr(frame_idx);
+        // PUC luaD_hookcall (ldo.c:476): `ci->u.l.savedpc++; luaD_hook(...);
+        // ci->u.l.savedpc--;` — the hook observes the pc of the instruction
+        // AFTER the first one. For a vararg function the first instruction
+        // is OP_VARARGPREP (lvm.c:1958 fires luaD_hookcall right after it
+        // adjusts the varargs), so getinfo('l') must report the line of
+        // instruction 1, not 0. Mirror the temporary bump by index (the
+        // frame array may realloc while the hook runs).
+        const vararg_bump = if (fr.proto()) |p| p.is_vararg else false;
+        if (vararg_bump) exec_frames.getPtr(frame_idx).u.lua.pc = 1;
+        defer {
+            if (vararg_bump) exec_frames.getPtr(frame_idx).u.lua.pc = 0;
+        }
+        // PUC luaD_hookcall: ftransfer=1, ntransfer=p->numparams. The fixed
+        // parameters sit contiguously at the frame base for both VAHID and
+        // non-VAHID frames (buildhiddenargs copies them there).
+        const nparams: usize = if (fr.proto()) |p| p.numparams else 0;
+        const n_transfer = @min(nargs, nparams);
+        const transfer = self.bc_stack[fr.base .. fr.base + n_transfer];
+        try self.debugDispatchHookWithCalleeTransfer(
+            "call",
+            null,
+            callee,
+            transfer,
+            1,
+            frame_idx,
+        );
     }
 
     fn saveBytecodeProtectedError(self: *Vm) BytecodeSavedError {
@@ -5918,6 +6037,9 @@ pub const Vm = struct {
                     return push_err;
                 };
                 self.setDebugName(exec_frames.getPtr(parent_index), "metamethod", "close");
+                // PUC luaF_close → luaD_call → luaG_tracecall: the __close
+                // metamethod activation gets its LUA_HOOKCALL here.
+                try self.dispatchCalleeActivationHook(exec_frames, resolved.callee, resolved.args.len);
                 return .resume_dispatch;
             }
 
@@ -6084,7 +6206,14 @@ pub const Vm = struct {
             else => -1,
         };
         try self.pushBytecodeExecFrame(exec_frames, proto, resolved.args, cl, self.bc_stack_top, cont_nresults);
+        // The debug name must be recorded BEFORE the CALL hook fires: PUC's
+        // hook-time getinfo('n') resolves the metamethod name from the
+        // caller's instruction (funcnamefromcode "metamethod" branch).
         self.setDebugName(exec_frames.getPtr(parent_index), debug_namewhat, debug_name);
+        // Metamethod/continuation activations get their CALL event when the
+        // frame exists (PUC: luaT_calltm → luaD_call → luaD_precall →
+        // luaG_tracecall fires LUA_HOOKCALL for the metamethod function).
+        try self.dispatchCalleeActivationHook(exec_frames, resolved.callee, resolved.args.len);
         return true;
     }
 
@@ -8180,12 +8309,22 @@ pub const Vm = struct {
 
             if (needs_call_hook) {
                 needs_call_hook = false;
-                self.debugDispatchHookWithCalleeTransfer(
+                // Bytecode-Closure bodies get their CALL event at the body
+                // frame's creation (runBytecodeInternal →
+                // dispatchCalleeActivationHook, mirroring PUC luaG_tracecall);
+                // this trampoline site only covers bodies without bytecode
+                // frames (C/builtin bodies). See builtinCoroutineResume.
+                const switch_body_is_bc = switch (active.callee) {
+                    .Closure => |cl| cl.proto != null,
+                    else => false,
+                };
+                if (!switch_body_is_bc) self.debugDispatchHookWithCalleeTransfer(
                     "call",
                     null,
                     active.callee,
                     active.entry_args orelse &[_]Value{},
                     1,
+                    null,
                 ) catch |hook_err| {
                     switch (hook_err) {
                         error.RuntimeError => step = .{ .failed = try self.currentRuntimeErrorValue() },
@@ -8706,9 +8845,12 @@ pub const Vm = struct {
         // debugBuildCurrentTraceback synthetically insert [C]: in global
         // 'pcall'/'xpcall' lines by checking pending_call.protection.
         try self.pushBytecodeExecFrame(exec_frames, proto, child_args, cl, self.bc_stack_top, -1);
+        // The pcall/xpcall target gets its CALL event here (PUC: pcall runs
+        // the target via luaD_call → luaD_precall → luaG_tracecall).
         if (child_debug_pairs) {
             self.setDebugName(exec_frames.getPtr(parent_index), "metamethod", "pairs");
         }
+        try self.dispatchCalleeActivationHook(exec_frames, .{ .Closure = cl }, child_args.len);
         return true;
     }
 
@@ -8867,6 +9009,10 @@ pub const Vm = struct {
                         self.bc_stack_top = MAXSTACK;
                     }
                     try self.pushBytecodeExecFrame(exec_frames, proto, resolved.args, cl, self.bc_stack_top, -1);
+                    // PUC luaG_errormsg → luaD_callnoyield(handler) →
+                    // luaD_precall → luaG_tracecall: the error handler's
+                    // activation gets its LUA_HOOKCALL here.
+                    try self.dispatchCalleeActivationHook(exec_frames, resolved.callee, resolved.args.len);
                     return null;
                 } else {
                     const handler_ret = self.runClosure(cl, resolved.args) catch {
@@ -9785,6 +9931,13 @@ pub const Vm = struct {
             exec_thread.bytecode_inplace_suspended = false;
         } else {
             try self.pushBytecodeExecFrame(exec_frames, proto_in, args, effective_callee, self.bc_stack_top, -1);
+            // PUC luaG_tracecall (ldebug.c:903-921): when a fresh activation
+            // starts executing, the CALL hook fires with the NEW ci — the
+            // main chunk of a lua_pcall/dostring, a C-API-called function,
+            // or a coroutine body on first resume all get their LUA_HOOKCALL
+            // here (ar.i_ci = the entry frame). Resumed activations skip it:
+            // they already fired before yielding (ldebug.c:910).
+            try self.dispatchCalleeActivationHook(exec_frames, .{ .Closure = effective_callee }, args.len);
         }
 
         var yielded_in_place = false;
@@ -12758,6 +12911,10 @@ pub const Vm = struct {
                 });
                 // Call from R[A+4] — above the close value at R[A+3].
                 try self.pushBytecodeExecFrame(ctx.exec_frames, child_proto, rargs, cl, ctx.base + a + 4, @intCast(nresults));
+                // PUC OP_TFORCALL (lvm.c): the iterator is invoked via
+                // luaD_call → luaG_tracecall → LUA_HOOKCALL with
+                // name="for iterator" (ldebug.c funcnamefromcode).
+                try self.dispatchCalleeActivationHook(ctx.exec_frames, callee_val, effective_nargs);
                 return .continue_frame_loop;
             }
         }
@@ -13090,13 +13247,25 @@ pub const Vm = struct {
             .Closure => |cl| debugCallTransferArgsForClosure(cl, call_args),
             else => call_args,
         };
+        // PUC event selection for tail calls (lvm.c OP_TAILCALL →
+        // luaD_pretailcall): a bytecode callee reuses the current frame and
+        // fires LUA_HOOKTAILCALL when the new function starts (ldebug.c:918
+        // luaG_tracecall sees CIST_TAIL). A C-function callee goes through
+        // precallC (ldo.c:652) which pushes a FRESH CallInfo without
+        // CIST_TAIL — firing a plain LUA_HOOKCALL.
+        const callee_is_bytecode = switch (callee_val) {
+            .Closure => |cl| cl.proto != null,
+            else => false,
+        };
+        const tc_event: []const u8 = if (callee_is_bytecode) "tail call" else "call";
+        var deferred_tail_hook = false;
         const skip_tail_hook = ctx.exec_frames.getPtr(ctx.frame_index).u.lua.skip_call_hook_pc == @as(u32, @intCast(ctx.pc));
         if (skip_tail_hook) {
             ctx.exec_frames.getPtr(ctx.frame_index).u.lua.skip_call_hook_pc = INVALID_PC;
         } else if (try self.tryPushBytecodeDebugHook(
             ctx.exec_frames,
             ctx.frame_index,
-            "tail call",
+            tc_event,
             null,
             callee_val,
             hook_args,
@@ -13104,13 +13273,19 @@ pub const Vm = struct {
             .retry_call,
         )) {
             return .continue_frame_loop;
+        } else if (callee_is_bytecode) {
+            // Bytecode callee: fire the TAILCALL hook AFTER the frame is
+            // reused for the new function (PUC fires at the new function's
+            // first instruction, with ci->func already swapped).
+            deferred_tail_hook = true;
         } else {
             try self.debugDispatchHookWithCalleeTransfer(
-                "tail call",
+                "call",
                 null,
                 callee_val,
                 hook_args,
                 1,
+                null,
             );
         }
 
@@ -13276,6 +13451,34 @@ pub const Vm = struct {
                 ctx.pc = 0;
                 fr2.u.lua.nvarstack = np;
                 fr2.reg_top = np;
+
+                // PUC luaG_tracecall (ldebug.c:918): the TAILCALL hook fires
+                // when the reused frame starts executing the NEW function —
+                // ci->func already points at the new callee (ldo.c:480 picks
+                // LUA_HOOKTAILCALL from CIST_TAIL). Fire it here, after the
+                // frame swap, with ar.i_ci referencing this frame.
+                // (hook_args is stale: the reuse may have reallocated
+                // bc_stack; PUC passes ntransfer=p->numparams — the fixed
+                // params now live contiguously at the new frame base.)
+                if (deferred_tail_hook) {
+                    const n_transfer = @min(effective_nargs, np);
+                    // PUC luaD_hookcall savedpc++ (see
+                    // dispatchCalleeActivationHook): a vararg callee's hook
+                    // observes the instruction after VARARGPREP.
+                    const tc_vararg_bump = new_proto.is_vararg;
+                    if (tc_vararg_bump) fr2.u.lua.pc = 1;
+                    defer if (tc_vararg_bump) {
+                        ctx.exec_frames.getPtr(ctx.frame_index).u.lua.pc = 0;
+                    };
+                    try self.debugDispatchHookWithCalleeTransfer(
+                        "tail call",
+                        null,
+                        callee_val,
+                        self.bc_stack[fr2.base .. fr2.base + n_transfer],
+                        1,
+                        ctx.frame_index,
+                    );
+                }
                 return .continue_no_advance;
             },
             .Builtin => {},
@@ -13494,6 +13697,18 @@ pub const Vm = struct {
 
         const resolved_callee = ctx.regs[a];
         const skip_call_hook = ctx.exec_frames.getPtr(ctx.frame_index).u.lua.skip_call_hook_pc == @as(u32, @intCast(ctx.pc));
+        // PUC ordering (luaD_precall ldo.c:715 + luaG_tracecall ldebug.c:918):
+        // the callee's CallInfo is created FIRST; the CALL hook fires with
+        // ar.i_ci = the callee frame. For bytecode callees we therefore defer
+        // the sync (C-hook) dispatch until after pushBytecodeExecFrame below.
+        // The async (Lua-hook) path keeps firing here: it pushes its own hook
+        // frame as a child of the caller and installs the callee at the
+        // caller's func_slot for the duration of the hook (debug.getinfo
+        // parity for Lua hooks is covered by the upstream db.lua suite).
+        // Builtin/IR-closure callees run synchronously without a CallFrame
+        // (documented gap: no C-function CallInfo), so their sync dispatch
+        // stays at the call site referencing the caller frame.
+        var deferred_call_hook = false;
         if (skip_call_hook) {
             ctx.exec_frames.getPtr(ctx.frame_index).u.lua.skip_call_hook_pc = INVALID_PC;
         } else if (!self.hooks_active_cached) {
@@ -13509,6 +13724,13 @@ pub const Vm = struct {
             .retry_call,
         )) {
             return .continue_frame_loop;
+        } else if (switch (resolved_callee) {
+            // Bytecode callee: fire after the callee frame exists (see
+            // comment above). Evaluated lazily — only on the hook path.
+            .Closure => |cl| cl.proto != null,
+            else => false,
+        }) {
+            deferred_call_hook = true;
         } else {
             try self.dispatchBytecodeHookWithCallee("call", resolved_callee, rargs);
         }
@@ -13691,6 +13913,13 @@ pub const Vm = struct {
                     // (CIST_NRESULTS) and func_slot (dst derivation). No
                     // pending_call needed for ordinary Lua CALL.
                     try self.pushBytecodeExecFrame(ctx.exec_frames, proto2, rargs, cl, ctx.base + a, nresults);
+                    // CALL hook on the callee activation (PUC luaD_hookcall:
+                    // the new ci exists, then the hook fires). rargs may be
+                    // stale after the push (bc_stack realloc) — the helper
+                    // re-derives the transfer slice from the new frame.
+                    if (deferred_call_hook) {
+                        try self.dispatchCalleeActivationHook(ctx.exec_frames, resolved_callee, effective_nargs);
+                    }
                     return .continue_frame_loop;
                 }
 
@@ -16676,8 +16905,21 @@ pub const Vm = struct {
         var payload: []Value = &[_]Value{};
         var payload_heap: bool = false;
 
-        if (th.trace_yields == 0 and !self.isInDebugHook()) {
-            try self.debugDispatchHookWithCalleeTransfer("call", null, th.callee, call_args, 1);
+        // Coroutine-body CALL hook. For a bytecode-Closure body, PUC fires
+        // LUA_HOOKCALL when the body's CallInfo starts executing (luaD_call →
+        // luaD_precall → luaG_tracecall) and does NOT re-fire on subsequent
+        // resumes after a yield (ldebug.c:910 "Functions coming from an yield
+        // already called luaD_hookcall before yielding"). luazig therefore
+        // fires it at the body frame's creation (runBytecodeInternal →
+        // dispatchCalleeActivationHook) — once per fresh activation — and this
+        // pre-trampoline site only covers bodies that never get a bytecode
+        // frame (C/builtin bodies, run synchronously without CallInfo).
+        const body_is_bytecode_closure = switch (th.callee) {
+            .Closure => |cl| cl.proto != null,
+            else => false,
+        };
+        if (th.trace_yields == 0 and !self.isInDebugHook() and !body_is_bytecode_closure) {
+            try self.debugDispatchHookWithCalleeTransfer("call", null, th.callee, call_args, 1, null);
         }
 
         const use_saved_entry = th.bytecode_inplace_suspended and
@@ -22323,7 +22565,15 @@ pub const Vm = struct {
         try self.gcForwardBarrierCell(f1, f2.upvalues[idx2]);
     }
 
-    fn debugDispatchHookTransfer(self: *Vm, event: []const u8, line: ?i64, transfer: ?[]const Value, transfer_start: i64) DispatchError!void {
+    /// PUC `luaD_hook` (ldo.c:439): dispatch a hook event. The `event`
+    /// string selects the mask bit and the PUC event code; `line` is the
+    /// event's line (-1 for call/return/count); `transfer`/`transfer_start`
+    /// mirror PUC's transferinfo (ftransfer/ntransfer for call/return
+    /// events); `hook_frame_idx` is the activation the hook's `ar.i_ci`
+    /// must reference — PUC passes `L->ci` (the callee's CallInfo for
+    /// call events, set by luaD_hookcall/precallC AFTER the frame exists).
+    /// `null` selects the topmost visible frame (line/count/return).
+    fn debugDispatchHookTransfer(self: *Vm, event: []const u8, line: ?i64, transfer: ?[]const Value, transfer_start: i64, hook_frame_idx: ?usize) DispatchError!void {
         // P15.38f: Fast path — if no hooks are active on the current thread,
         // skip the whole hook dispatch (linear search + string compare + deref).
         // Mirrors PUC Lua's `if (l_unlikely(hookmask & mask))` check: when
@@ -22423,7 +22673,32 @@ pub const Vm = struct {
                     // events, the topmost frame is the returning frame.
                     const th_for_ci = self.current_thread orelse self.main_thread orelse return;
                     var ci_frame_idx: usize = 0;
-                    {
+                    if (hook_frame_idx) |explicit_idx| {
+                        // Explicit frame identity supplied by the dispatch
+                        // site (PUC luaD_hook's `ci` argument). Call sites
+                        // pass the CALLEE frame for call events; null means
+                        // "topmost visible frame" (line/count/return events).
+                        if (explicit_idx < th_for_ci.call_frames.len()) {
+                            ci_frame_idx = explicit_idx;
+                        } else {
+                            // Defensive: stale index (frame popped between
+                            // dispatch request and here) — fall back to
+                            // topmost visible frame below.
+                            var fi: usize = th_for_ci.call_frames.len();
+                            while (fi > 0) {
+                                fi -= 1;
+                                const cf = th_for_ci.call_frames.getConstPtr(fi);
+                                if (cf.isHidden()) continue;
+                                ci_frame_idx = fi;
+                                break;
+                            }
+                        }
+                    } else {
+                        // PUC luaD_hook sets ar.i_ci = L->ci — the current
+                        // (topmost) CallInfo. For line/count events that is
+                        // the executing Lua frame; for return events it is
+                        // the returning frame's caller context (luazig fires
+                        // return hooks after the frame is popped).
                         var fi: usize = th_for_ci.call_frames.len();
                         while (fi > 0) {
                             fi -= 1;
@@ -22555,13 +22830,13 @@ pub const Vm = struct {
         return call_args[0..n];
     }
 
-    fn debugDispatchHookWithCalleeTransfer(self: *Vm, event: []const u8, line: ?i64, callee: Value, transfer: ?[]const Value, transfer_start: i64) DispatchError!void {
+    fn debugDispatchHookWithCalleeTransfer(self: *Vm, event: []const u8, line: ?i64, callee: Value, transfer: ?[]const Value, transfer_start: i64, hook_frame_idx: ?usize) DispatchError!void {
         // P15.38f: Fast path — no hooks active, skip callee save/restore + dispatch.
         if (!self.hooks_active_cached) return;
         _ = callee; // Callee save/restore was only meaningful for IR frames
                     // (Vm.call_frames), which is always empty now. The hook
                     // receives the event/line/transfer directly.
-        try self.debugDispatchHookTransfer(event, line, transfer, transfer_start);
+        try self.debugDispatchHookTransfer(event, line, transfer, transfer_start, hook_frame_idx);
     }
 
     fn builtinDebugGethook(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {

@@ -2445,27 +2445,24 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
                 ar.istailcall = if (frame.isTailCall()) 1 else 0;
             },
             'n' => {
-                // P15.51n: Debug name stored in parent frame's continuation.
-                const parent_frame: ?*const vm_mod.CallFrame = if (frame_idx > 0)
-                    th.call_frames.getConstPtr(frame_idx - 1)
-                else
-                    null;
-                if (vm.getDebugName(parent_frame)) |dn| {
-                    if (dn.name) |name| {
-                        const ls = vm.internStr(name) catch return 0;
-                        ar.name = @ptrCast(@constCast(ls.bytes().ptr));
-                    } else {
-                        ar.name = null;
-                    }
-                    if (dn.namewhat) |nw| {
-                        const ls = vm.internStr(nw) catch return 0;
-                        ar.namewhat = @ptrCast(@constCast(ls.bytes().ptr));
-                    } else {
-                        ar.namewhat = null;
-                    }
+                // PUC auxgetinfo 'n' (ldebug.c:369-373): namewhat comes from
+                // getfuncname (the CALLER's bytecode at the call site,
+                // ldebug.c:323 funcnamefromcall); when it returns NULL the
+                // namewhat is "" (empty string) and name is NULL — never a
+                // NULL namewhat.
+                var resolved_namewhat: []const u8 = "";
+                var resolved_name: ?[]const u8 = null;
+                if (vm.getFuncNameForFrame(th, frame_idx)) |dn| {
+                    resolved_namewhat = dn.namewhat;
+                    resolved_name = dn.name;
+                }
+                const nw_ls = vm.internStr(resolved_namewhat) catch return 0;
+                ar.namewhat = @ptrCast(@constCast(nw_ls.bytes().ptr));
+                if (resolved_name) |nm| {
+                    const ls = vm.internStr(nm) catch return 0;
+                    ar.name = @ptrCast(@constCast(ls.bytes().ptr));
                 } else {
                     ar.name = null;
-                    ar.namewhat = null;
                 }
             },
             else => {}, // ignore unknown flags (PUC default)

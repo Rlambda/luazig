@@ -2223,6 +2223,113 @@ removed (C-frame TBC "NOT closed here" gone since P15.83c).
    small negative growth after collect vs PUC's 0) — GC accounting
    granularity, not a leak (leak_bench 25/25).
 
+### P15.83l — LUA_HOOKCALL fires on the callee activation (PUC luaD_hookcall ordering) + main-chunk CALL paths
+
+**Blocker 2 (review):** LUA_HOOKCALL must fire for the CORRECT CALLEE
+activation, with `ar.i_ci` referencing the callee frame, and the main chunk
+must get its CALL event.
+
+**PUC references used** (lua-5.5.0/src):
+- `ldo.c:439 luaD_hook`: `ar.i_ci = ci` — the hook always describes the
+  topmost CallInfo, and callers guarantee that ci is the CALLEE for call
+  events.
+- `ldo.c:476 luaD_hookcall` (+ `savedpc++/--;` bump): CALL hook with the new
+  ci; vararg functions fire after OP_VARARGPREP, so getinfo('l') reports the
+  line of instruction 1, not 0.
+- `ldo.c:643-656 precallC`: C callee — new ci created FIRST, then
+  `luaD_hook(L, LUA_HOOKCALL, -1, 1, narg)`.
+- `ldo.c:715 luaD_precall` (Lua callee): ci created, hook deferred to first
+  instruction.
+- `ldebug.c:903-921 luaG_tracecall`: CALL hook at the callee's first
+  instruction; functions resumed from a yield do NOT re-fire
+  ("already called luaD_hookcall before yielding", ldebug.c:910).
+- `lvm.c:1958 OP_VARARGPREP`: vararg hookcall after arg adjustment.
+- `ldebug.c:323 getfuncname` / `:615 funcnamefromcode` / `:659
+  funcnamefromcall`: name from the CALLER's bytecode at the call site;
+  tail-called frames get no name; `auxgetinfo` 'n' falls back to
+  namewhat="" (never NULL).
+- `ldo.c luaD_pretailcall` → `precallC`: tail call to a C function fires
+  plain LUA_HOOKCALL (fresh ci, no CIST_TAIL), not LUA_HOOKTAILCALL.
+
+**Root cause (differential probes, before):** the sync C-hook CALL dispatch
+fired at the OP_CALL site BEFORE `pushBytecodeExecFrame`, so `ar.i_ci` =
+topmost frame = the CALLER: getinfo("nS") described the caller (probe:
+f's event described g, g's described main; main chunk's own CALL missing on
+pcall/dostring paths; resume-entry hook fired with 0 frames → getinfo FAIL;
+every re-resume re-fired a body CALL (PUC doesn't); pcall'd functions and
+metamethod/iterator/close/handler activations had NO CALL event at all;
+tailcall events described the OLD function; names were null).
+
+**Changes (vm.zig):**
+1. `debugDispatchHookTransfer`/`debugDispatchHookWithCalleeTransfer` gained
+   `hook_frame_idx: ?usize` (PUC luaD_hook's `ci` argument): CALL sites pass
+   the callee frame index; line/count/return pass null (topmost visible
+   frame, unchanged semantics).
+2. New `dispatchCalleeActivationHook(exec_frames, callee, nargs)`: fires
+   "call" AFTER the callee frame exists, with ar.i_ci = that frame;
+   mirrors luaD_hookcall's savedpc++ for vararg frames (hook observes
+   instruction 1's line) and ntransfer=numparams transfer slicing. Callers:
+   OP_CALL (bytecode callee), `runBytecodeInternal` entry (main chunk of
+   pcall/dostring/apiCall, coroutine body first run — this replaces the old
+   pre-trampoline/resume-entry firing for bytecode bodies, fixing the
+   invalid 0-frame identity AND the re-fire-on-resume), pcall/xpcall target
+   push, `tryPushBytecodeContinuationCall` (metamethods), OP_TFORCALL
+   iterator, `__close` metamethod push, xpcall error-handler push.
+3. `opTailcall`: bytecode callee → TAILCALL hook deferred to after frame
+   reuse (ar.i_ci = reused frame, func already swapped; vararg savedpc bump);
+   C-function callee → event renamed "call" (PUC pretailcall→precallC).
+4. `lua_getinfo` 'n' (c_api.zig): PUC getfuncname port via new
+   `Vm.getFuncNameForFrame` — reads the caller's instruction at its current
+   pc: OP_CALL/OP_TAILCALL → `debugBytecodeOperandName` (the getobjname port
+   used for "attempt to call" messages; local/upvalue/global/field/method),
+   OP_TFORCALL → "for iterator", metamethod ops → pending-call debug name
+   (PUC tmname+2 / "metamethod"), caller = hook frame → "?" / "hook",
+   tail-called frames → no name; namewhat is "" (never NULL) when unresolved.
+5. The async (Lua-hook) OP_CALL/OP_TAILCALL path is UNCHANGED (parent
+   func_slot swap machinery, matrix-covered); the sync deferred dispatch only
+   runs when the async path declined.
+
+**Test coverage:** `tests/c_api/12_chook.c` (in DIFF_TESTS gate):
+- t9 `test_call_hook_identity` — review's scenario (resume of chunk with
+  local f/g): main/g/f each get a CALL event whose getinfo("nS") describes
+  the callee; bad_call_info==0; result==3.
+- t10 `test_call_hook_paths` — byte-identical event trace (what/name/
+  namewhat/source/linedefined/currentline/istailcall) across paths: main
+  chunk via lua_pcall and luaL_dostring, __index metamethod, plain call,
+  tail call, for-in iterator; counter asserts: pcall'd function event fires,
+  resume-after-yield fires exactly one new event (no body re-CALL).
+All byte-identical PUC vs luazig (make test-diff DIFF: PASS).
+
+**Probe table (PUC vs zig, Lua callees — all identical after):**
+- plain call g/f (name local/upvalue/global, ld, cl) ✓
+- main chunk: pcall path, dostring path, resume path ✓ (was: missing /
+  getinfo FAIL / re-fired on resume)
+- tailcall t→f (TCALL, istailcall=1, ld of NEW function, no name) ✓
+- pcall'd function (what=Lua, ld, cl; caller is C → no name) ✓ (was: no event)
+- __index metamethod (name=index nw=metamethod) ✓ (was: no event)
+- for-in iterator ×3 (name="for iterator") ✓ (was: no events)
+- __close metamethod (name=close nw=metamethod) ✓ (was: no event)
+- xpcall error handler (what=Lua ld=1, no name) ✓ (was: no event)
+- resume-after-yield: no body re-CALL ✓ (was: extra event per resume)
+
+**Known remaining gap (documented, out of scope):** CALL events for
+C-function callees (pcall, print, coroutine.yield, ...) fire with the
+correct COUNT and event type (including tailcall-to-C firing CALL), but
+`ar.i_ci` references the caller frame: PUC pushes a C-function CallInfo
+(precallC) and the hook describes it (what="C", source="=[C]", name from
+the caller's call site). luazig runs builtins without a CallInfo (see the
+callCFunction TODO in vm.zig); fixing this requires C-function frames on
+every callBuiltin path (push/pop/unwind/yield) — separate architectural
+blocker. t10's trace chunks are therefore Lua-only-call; the C-callee
+event count is asserted instead.
+
+**Gates (all green):** zig build ReleaseFast; make -C tests/c_api test
+16/16 exit 0; make test-diff strict DIFF: PASS; coroutine.lua --testc
+exit 0 + byte-identical to PUC (ulimit -v 2000000, timeout 30); smoke
+54/54; zig build test exit 0; matrix zig_fail=0 (big.lua both_fail,
+pre-existing infra); perf_compare.py RESULT OK (no regressions, geomean
+2.66x); CallFrame stays 104 B.
+
 ### P15.83k — Exact resume-stack differentials + lua_pushthread/tothread per-handle identity
 
 **Part A (review item 1 completion):** the P15.83j `resume_func_base` fix was

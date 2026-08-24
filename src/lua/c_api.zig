@@ -403,6 +403,23 @@ pub export fn lua_callk(
 ) void {
     const h = L orelse return;
     const vm = h.vm;
+    // PUC lapi.c:1041-1042: api_check(k == NULL || !isLua(L->ci),
+    // "cannot use continuations inside hooks") — unconditional in PUC.
+    // Placed BEFORE the current_thread fallback so a C hook on the MAIN
+    // state (current_thread == null there; the hook flag lives on
+    // main_thread.debug_hook) is checked too. Enforcement: deterministic
+    // runtime error converted to the C boundary via _longjmp (PUC aborts
+    // via lua_assert only in apicheck builds).
+    if (vm.current_thread orelse vm.main_thread) |th_check| {
+        vm.apiCheckHookContinuationInvariant(th_check, k != null, false, 0) catch {
+            if (vm.c_error_jmp) |jb| {
+                vm.c_error_value = vm.err_obj;
+                _longjmp(jb, 1);
+            }
+            @panic("lua_call hook api_check violation without an active C-function boundary");
+        };
+    }
+
     const th = vm.current_thread orelse {
         lua_callkImpl(L, nargs, nresults);
         return;
@@ -1751,6 +1768,28 @@ pub export fn lua_pcallk(
 ) c_int {
     const h = L orelse return 2;
     const vm = h.vm;
+
+    // PUC lapi.c:1082-1083: api_check(k == NULL || !isLua(L->ci),
+    // "cannot use continuations inside hooks") runs BEFORE the yieldable
+    // branch — k != NULL inside a hook is a violation even on a
+    // non-yieldable thread, where the conventional-pcall path below would
+    // never reach luaPcallKShared's own check. Placed before the
+    // current_thread fallback so a C hook on the MAIN state
+    // (current_thread == null there; the hook flag lives on
+    // main_thread.debug_hook) is checked too. Enforcement model: same as
+    // the shared helpers — deterministic runtime error, converted here to
+    // the C boundary via _longjmp (PUC aborts via lua_assert only in
+    // apicheck builds).
+    if (vm.current_thread orelse vm.main_thread) |th_check| {
+        vm.apiCheckHookContinuationInvariant(th_check, k != null, false, 0) catch {
+            if (vm.c_error_jmp) |jb| {
+                vm.c_error_value = vm.err_obj;
+                _longjmp(jb, 1);
+            }
+            return if (vm.err_is_errerr) 5 else 2;
+        };
+    }
+
     const th = vm.current_thread orelse {
         // No thread — conventional pcall without errfunc.
         // P15.78: Even on the main thread (no current_thread), errfunc must

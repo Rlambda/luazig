@@ -4145,6 +4145,58 @@ pub const Vm = struct {
         return exposeDispatchResult(void, self.builtinCoroutineYield(args, out[0..]));
     }
 
+    /// PUC api_check invariants for C continuations used inside debug hooks
+    /// (spec §7 "API checks"). The PUC sources:
+    ///   lapi.c:1041-1042 (lua_callk) and lapi.c:1082-1083 (lua_pcallk):
+    ///     api_check(L, k == NULL || !isLua(L->ci),
+    ///               "cannot use continuations inside hooks");
+    ///   ldo.c:1023-1024 (lua_yieldk, hook branch):
+    ///     api_check(L, nresults == 0, "hooks cannot yield values");
+    ///     api_check(L, k == NULL, "hooks cannot continue after yielding");
+    ///
+    /// Why the condition is `isInDebugHook()`: while a hook runs, PUC's
+    /// current CallInfo is the hooked Lua frame (luaD_hook sets CIST_HOOKED
+    /// on L->ci and calls the hook with that ci on top), so isLua(L->ci) is
+    /// true and any non-NULL k is an API violation; a yielding hook may
+    /// pass neither results nor a continuation. luazig's equivalent of
+    /// "the hook is running" is the per-thread `in_debug_hook` flag,
+    /// maintained around every hook dispatch: sync C hooks
+    /// (debugDispatchHookTransfer), sync Lua/testC hooks, and async
+    /// Lua-hook frames (tryPushBytecodeDebugHook / popBytecodeExecFrame).
+    /// At every call site `th` is `current_thread`, so the flag on `th`
+    /// and isInDebugHook() are the same condition — both are checked for
+    /// robustness against future call-site drift.
+    ///
+    /// Enforcement model: PUC compiles api_check out of release builds
+    /// (under LUA_USE_APICHECK it aborts via lua_assert). Silently
+    /// ignoring the violation would leave the continuation half-installed
+    /// (the old P15.83i deviation #3), which the spec explicitly forbids
+    /// ("Violations must not be silently ignored"). Instead the check
+    /// raises a deterministic runtime error carrying the PUC message text:
+    /// the callers (c_api wrappers / testC) convert error.RuntimeError to
+    /// their regime (`_longjmp` to the C boundary / Zig error), so
+    /// lua_resume / lua_pcall report LUA_ERRRUN with the message and the
+    /// coroutine dies — no continuation state is mutated. `is_yield`
+    /// selects the lua_yieldk variant of the checks (PUC checks nresults
+    /// first, then k — same order here).
+    pub fn apiCheckHookContinuationInvariant(
+        self: *Vm,
+        th: *Thread,
+        k_nonnull: bool,
+        is_yield: bool,
+        nresults: i32,
+    ) Error!void {
+        if (!th.debug_hook.in_debug_hook and !self.isInDebugHook()) return;
+        if (is_yield) {
+            if (nresults != 0)
+                return self.fail("hooks cannot yield values", .{});
+            if (k_nonnull)
+                return self.fail("hooks cannot continue after yielding", .{});
+        } else if (k_nonnull) {
+            return self.fail("cannot use continuations inside hooks", .{});
+        }
+    }
+
     /// Shared core of PUC `lua_callk` (lapi.c:1037-1056): save k/ctx on the
     /// current top C-frame (PUC `ci->u.c.k = k`), then invoke `apiCall` with
     /// the caller-supplied callee/args. Returns callee results (caller-owned
@@ -4167,6 +4219,12 @@ pub const Vm = struct {
         k: ?*const fn (?*lua_State, c_int, isize) callconv(.c) c_int,
         ctx: isize,
     ) Error![]Value {
+        // PUC lapi.c:1041-1042: api_check(k == NULL || !isLua(L->ci),
+        // "cannot use continuations inside hooks"). Checked BEFORE the
+        // yieldable branch (PUC's check is unconditional) and BEFORE any
+        // frame state is saved — a violation must not leave k/ctx
+        // half-installed.
+        try self.apiCheckHookContinuationInvariant(th, k != null, false, 0);
         // PUC lapi.c:1047-1053: if k != NULL and yieldable, save k/ctx on
         // L->ci (the current top C-frame); else callnoyield (incnny).
         if (k) |kf| {
@@ -4213,6 +4271,11 @@ pub const Vm = struct {
         k: *const fn (?*lua_State, c_int, isize) callconv(.c) c_int,
         ctx: isize,
     ) Error![]Value {
+        // PUC lapi.c:1082-1083: api_check(k == NULL || !isLua(L->ci),
+        // "cannot use continuations inside hooks") — unconditional in PUC,
+        // before any state is saved. Checked before reading/writing the
+        // C-frame so a violation leaves no k/ctx/funcidx/errfunc residue.
+        try self.apiCheckHookContinuationInvariant(th, true, false, 0);
         if (th.call_frames.len() == 0) return error.RuntimeError;
         const fr = th.call_frames.getPtr(th.call_frames.len() - 1);
         if (!fr.isC()) return error.RuntimeError;
@@ -4248,12 +4311,15 @@ pub const Vm = struct {
         return ret;
     }
 
-    /// Shared core of PUC `lua_yieldk` (ldo.c:1006-1034): save `nyield` and
-    /// k/ctx on the current top C-frame (hooks do not save k — PUC
-    /// `api_check`), then invoke `apiYield`. Returns `error.Yield` on success
-    /// (the caller converts: c_api `_longjmp(jb, 2)`; testC propagates through
-    /// `callBuiltin`). On `error.RuntimeError` (non-yieldable), the C-frame
-    /// state is left as-is for the caller to handle.
+    /// Shared core of PUC `lua_yieldk` (ldo.c:1006-1034): enforce the hook
+    /// api_checks (nresults == 0, k == NULL — violations raise a runtime
+    /// error with the PUC message, see
+    /// `apiCheckHookContinuationInvariant`), save `nyield` and k/ctx on the
+    /// current top C-frame, then invoke `apiYield`. Returns `error.Yield`
+    /// on success (the caller converts: c_api `_longjmp(jb, 2)`; testC
+    /// propagates through `callBuiltin`). On `error.RuntimeError`
+    /// (non-yieldable or hook api_check violation), the C-frame state is
+    /// left as-is for the caller to handle.
     ///
     /// Both c_api (`lua_yieldk`) and testC (`.yieldk` / `.yield` non-hook
     /// path) delegate here. The caller is responsible for reading yielded
@@ -4266,8 +4332,21 @@ pub const Vm = struct {
         k: ?*const fn (?*lua_State, c_int, isize) callconv(.c) c_int,
         ctx: isize,
     ) Error!void {
+        // PUC ldo.c:1021-1024 (hook branch of lua_yieldk):
+        //   api_check(nresults == 0, "hooks cannot yield values");
+        //   api_check(k == NULL, "hooks cannot continue after yielding");
+        // (PUC checks nresults first, then k — apiCheckHookContinuationInvariant
+        // preserves that order.) The check runs BEFORE nyield/k/ctx are
+        // saved: a violating yield must fail cleanly instead of parking a
+        // hook yield with bogus nresults or a continuation the hook is
+        // forbidden to have.
+        try self.apiCheckHookContinuationInvariant(th, k != null, true, nresults);
         // PUC ldo.c:1020-1028: ci->u2.nyield = nresults; if not a hook,
-        // ci->u.c.k = k; ci->u.c.ctx = ctx.
+        // ci->u.c.k = k; ci->u.c.ctx = ctx. The isDebugHook() guard below
+        // is now defense-in-depth only: the api_check above already
+        // rejected k != NULL inside hooks, so this branch is unreachable
+        // for hook frames — kept in case a future dispatch path runs a
+        // hook without setting in_debug_hook.
         if (th.call_frames.len() > 0) {
             const fr = th.call_frames.getPtr(th.call_frames.len() - 1);
             if (fr.isC()) {

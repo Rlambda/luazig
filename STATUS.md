@@ -1,4 +1,4 @@
-> Last updated: 2026-08-24 (P15.83k: exact resume-stack differentials + lua_pushthread/tothread per-handle identity; gates green)
+> Last updated: 2026-08-25 (P15.83m: hook-continuation API-check invariants enforced in the shared helpers; gates green)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -2215,10 +2215,13 @@ removed (C-frame TBC "NOT closed here" gone since P15.83c).
    sync dispatch path (the callee frame is not pushed yet); line/count/
    return events carry the correct current frame. lua_getinfo "l" from
    hooks works.
-3. api_check-style enforcement (k!=NULL inside hooks; yieldk nresults
-   in hooks) is not raised as a runtime error — matching PUC RELEASE
-   builds where api_check compiles out; the state stays SAFE (hook
-   frames never save k).
+3. ~~api_check-style enforcement (k!=NULL inside hooks; yieldk nresults
+   in hooks) is not raised as a runtime error~~ — RESOLVED in P15.83m:
+   the shared helpers now raise LUA_ERRRUN with the PUC message text
+   ("cannot use continuations inside hooks" / "hooks cannot yield
+   values" / "hooks cannot continue after yielding"); zig-only suite
+   16_apicheck covers rejection + valid usage (release PUC compiles
+   api_check out, so no byte-identical differential is possible).
 4. lua_gc(LUA_GCCOUNT) accounting differs slightly (stress runs report
    small negative growth after collect vs PUC's 0) — GC accounting
    granularity, not a leak (leak_bench 25/25).
@@ -2329,6 +2332,74 @@ exit 0 + byte-identical to PUC (ulimit -v 2000000, timeout 30); smoke
 54/54; zig build test exit 0; matrix zig_fail=0 (big.lua both_fail,
 pre-existing infra); perf_compare.py RESULT OK (no regressions, geomean
 2.66x); CallFrame stays 104 B.
+
+### P15.83m — hook-continuation API-check invariants enforced (review item 3)
+
+**What changed:** the P15.83i deviation #3 ("api_check-style enforcement
+is not raised as a runtime error; hook frames silently never save k") is
+RESOLVED. The shared production helpers now enforce the PUC api_check
+invariants for continuations inside debug hooks, raising deterministic
+runtime errors instead of silently dropping k.
+
+**Checker:** `Vm.apiCheckHookContinuationInvariant(th, k_nonnull,
+is_yield, nresults)` (vm.zig, next to luaCallKShared/luaPcallKShared/
+luaYieldKShared). PUC sources enforced:
+- lapi.c:1041-1042 (lua_callk) + lapi.c:1082-1083 (lua_pcallk):
+  `api_check(k == NULL || !isLua(L->ci), "cannot use continuations
+  inside hooks")`;
+- ldo.c:1023-1024 (lua_yieldk hook branch): `api_check(nresults == 0,
+  "hooks cannot yield values")` then `api_check(k == NULL, "hooks cannot
+  continue after yielding")` (same order preserved).
+
+"Inside a hook" test: per-thread `in_debug_hook` (th.debug_hook +
+isInDebugHook() fallback) — true for sync C hooks, sync Lua/testC hooks,
+and async Lua-hook frames (the analog of PUC's CIST_HOOKED current
+CallInfo while luaD_hook runs). At every call site th == current_thread,
+both expressions name the same flag.
+
+**Wiring (single implementation, all routes covered):**
+- `luaCallKShared`: check BEFORE the yieldable branch and BEFORE any
+  k/ctx saving (PUC's api_check is unconditional); c_api lua_callk,
+  testC .callk.
+- `luaPcallKShared`: check at top, before k/ctx/funcidx/errfunc/OAH are
+  saved; c_api lua_pcallk yieldable path, testC .pcallk.
+- `luaYieldKShared`: check BEFORE nyield/k/ctx saving; c_api lua_yieldk,
+  testC .yieldk/.yield. The old "hooks silently don't save k" skip
+  (fr.isDebugHook()) stays as documented defense-in-depth (unreachable
+  for the error cases now).
+- c_api lua_callk + lua_pcallk wrappers: the check ALSO runs before the
+  `current_thread orelse` fallback so a C hook on the MAIN state
+  (current_thread == null there) and pcallk's conventional non-yieldable
+  branch are covered — PUC's api_check runs at function top,
+  unconditionally.
+- Error conversion verified per wrapper: lua_callk/lua_pcallk set
+  c_error_value = err_obj and _longjmp(jb, 1); lua_yieldk _longjmps to
+  the C hook boundary which reads err/err_obj — violations surface as
+  LUA_ERRRUN from lua_resume / the enclosing pcall, coroutine dies, no
+  continuation state mutated. testC routes propagate as Zig errors.
+
+**Test design decision:** invalid-call tests CANNOT be in the
+byte-for-byte DIFF gate — PUC release compiles api_check out (the same
+program RUNS NORMALLY there; only LUA_USE_APICHECK builds abort, via
+assert → SIGABRT, also not byte-comparable). Per the review, new suite
+`tests/c_api/16_apicheck.c` is ZIG-ONLY: added to TESTS (`make test`,
+17 suites), excluded from DIFF_TESTS (Makefile comment documents why).
+Tests: t1 callk k!=null in C count-hook → LUA_ERRRUN + message +
+lua_status(ERRRUN) + second-resume error + k never ran; t2 pcallk k!=null
+in hook (yieldable, shared-helper path); t3 pcallk k!=null in a MAIN-state
+hook (wrapper pre-branch path, error via dostring's pcall); t4 yieldk
+nresults=2/k=NULL line-hook → "hooks cannot yield values"; t5 yieldk
+k!=null/nresults=0 → "hooks cannot continue after yielding"; t6-t7 VALID
+regression guards: yieldk(0,0,NULL) count-hook yield resumes to
+completion (5050) and callk k==NULL in a hook still works. testC hook
+routes (T.sethook("yield 0", ...)) stay covered by coroutine.lua --testc
+(exit 0) and the matrix.
+
+**Gates (all green):** zig build ReleaseFast + zig build test
+ReleaseFast exit 0; make -C tests/c_api test 17/17 exit 0; test-diff
+DIFF: PASS (6 suites, unchanged); coroutine.lua --testc exit 0
+(ulimit -v 2000000, timeout 30); smoke 54/54 exit 0; matrix zig_fail=0
+(big.lua both_fail, pre-existing infra).
 
 ### P15.83k — Exact resume-stack differentials + lua_pushthread/tothread per-handle identity
 

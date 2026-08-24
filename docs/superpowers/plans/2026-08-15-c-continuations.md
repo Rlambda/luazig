@@ -1,18 +1,18 @@
-> **STATUS: FINAL VERIFICATION — direct-resume stack + CALL-hook parity + API-check enforcement remain (2026-08-22, second independent review).**
-> P15.83a–P15.83i stand (do not revert). Remaining before COMPLETE:
-> 1. direct lua_resume stack replacement on subsequent resumes (old yielded
->    results must not remain under new results; exact top/nres/value
->    differential + CIST_CLSRET variant);
-> 2. LUA_HOOKCALL must fire for the correct CALLEE activation (ar.i_ci →
->    callee frame, lua_getinfo identity) and the main chunk must receive
->    its CALL event;
-> 3. API-check invariants (k==NULL inside hooks; yieldk nresults==0) must
->    be enforced non-silently in the shared production helpers — the spec
->    requires it; documenting them away contradicts the spec;
-> 4. lua_pushthread / per-handle identity migration completion;
-> 5. test-diff must fail hard (no `|| true`, no duplicate suites);
-> 6. smoke 45_userdata_capi must actually load udatatest (true 54/54);
-> 7. stale plan/self-review/source comments cleanup.
+> **STATUS: FINAL VERIFICATION — API-check enforcement done (P15.83m, 2026-08-25); see below for history.**
+> P15.83a–P15.83i stand (do not revert). Items resolved after the second
+> independent review:
+> 1. [x] direct lua_resume stack replacement on subsequent resumes
+>    (P15.83j/P15.83k — exact differentials);
+> 2. [x] LUA_HOOKCALL fires for the correct CALLEE activation (P15.83l);
+> 3. [x] API-check invariants (k==NULL inside hooks; yieldk nresults==0)
+>    enforced non-silently in the shared production helpers
+>    (P15.83m: `apiCheckHookContinuationInvariant` + zig-only suite
+>    tests/c_api/16_apicheck.c; release PUC compiles api_check out, so
+>    the rejection tests are not in the DIFF gate);
+> 4. [x] lua_pushthread / per-handle identity migration (P15.83k);
+> 5. [x] test-diff fails hard (P15.83j — strict, no `|| true`);
+> 6. [x] smoke 45_userdata_capi loads udatatest (54/54);
+> 7. [x] stale plan/self-review/source comments cleanup.
 > Acceptable deviations (only): absolute COUNT-hook firing totals
 > (instruction density); small GCCOUNT accounting granularity.
 

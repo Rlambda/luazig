@@ -1,24 +1,28 @@
-> **STATUS: FINAL VERIFICATION — API-check enforcement done (P15.83m, 2026-08-25); see below for history.**
-> P15.83a–P15.83i stand (do not revert). Items resolved after the second
-> independent review:
-> 1. [x] direct lua_resume stack replacement on subsequent resumes
->    (P15.83j/P15.83k — exact differentials);
-> 2. [x] LUA_HOOKCALL fires for the correct CALLEE activation (P15.83l);
-> 3. [x] API-check invariants (k==NULL inside hooks; yieldk nresults==0)
->    enforced non-silently in the shared production helpers
->    (P15.83m: `apiCheckHookContinuationInvariant` + zig-only suite
->    tests/c_api/16_apicheck.c; release PUC compiles api_check out, so
->    the rejection tests are not in the DIFF gate);
-> 4. [x] lua_pushthread / per-handle identity migration (P15.83k);
-> 5. [x] test-diff fails hard (P15.83j — strict, no `|| true`);
-> 6. [x] smoke 45_userdata_capi loads udatatest — made REAL in P15.83n
->    (per-runtime udatatest .so builds + per-runtime LUA_INIT_5_5 cpath
->    selection in tools/smoke_compare.py; before that the differential was
->    53 exact + 1 module-missing mismatch, and the original "54/54" claim
->    here rested on a laxer comparison / leftover untracked .so);
-> 7. [x] stale plan/self-review/source comments cleanup.
-> Acceptable deviations (only): absolute COUNT-hook firing totals
-> (instruction density); small GCCOUNT accounting granularity.
+> **STATUS: COMPLETE (2026-08-22, final verification passed).**
+> History: P15.78–P15.82h (initial implementation) → reopened by review →
+> P15.83a–P15.83i (first verification round: ERRFUNC_NONE + LUA_ERRERR,
+> TBC scoping + finishpcallk close state machine, shared production
+> lua_*k helpers, per-lua_State handles + per-handle stacks, lua_status
+> error preservation, closethread k-discard, per-thread C hooks) →
+> second review → P15.83j–P15.83n (final verification round:
+> lua_resume stale-yield replacement [resume_func_base], strict
+> test-diff gate, exact resume-stack + CIST_CLSRET differentials,
+> lua_pushthread/tothread identity, LUA_HOOKCALL on the callee
+> activation + main-chunk CALL paths + PUC getfuncname port, API-check
+> invariants enforced in the shared helpers, real 54/54 smoke parity
+> via per-runtime udatatest modules, stale docs/comments cleanup).
+> Final gate (exact commands + exit codes in STATUS.md P15.83o):
+> zig build/test Debug 0/0, ReleaseFast 0/0; make -C tests/c_api
+> clean/test/test-diff 0/0/0 (17/17 suites, DIFF: PASS strict);
+> coroutine.lua --testc exit 0; matrix zig_fail=0 (big.lua accurately
+> both_fail); smoke_compare 54/54 exact PASS; leak_bench 25/25 PASS;
+> 15_stress_leak both runtimes exit 0; CallFrame == 104 B.
+> Acceptable documented deviations (only): absolute COUNT-hook firing
+> totals (instruction density); small GCCOUNT accounting granularity;
+> C-callee CALL-hook identity requires builtin C-frames (P15.83l,
+> pre-existing callCFunction TODO); error-path stack residue layout;
+> tothread NULL for Lua-created coroutines; fresh-main resume
+> unsupported. See STATUS.md for the full list.
 
 # PUC Lua 5.5 C Continuations Implementation Plan
 

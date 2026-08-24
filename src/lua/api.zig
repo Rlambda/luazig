@@ -96,12 +96,16 @@ pub const State = struct {
         // Save the allocator before deinit'ing the Vm — after deinit the Vm's
         // fields are invalid, but the allocator (a value type) is safe to copy.
         const alloc = self.vm.alloc;
-        // Free the main handle (coroutine handles are freed by GC).
+        // Tear the Vm down FIRST (matching lua_close in c_api.zig): finalizers
+        // running inside vm.deinit may touch main_thread.api_handle (whose
+        // c_stack is a GC root), so the main handle must stay alive until
+        // then. gcFreeObject(.thread) skips main handles (P15.83k), so the
+        // handle is freed exactly once, here.
+        self.vm.deinit();
         if (self.vm.main_handle) |h| {
             h.c_stack.deinit(alloc);
             alloc.destroy(h);
         }
-        self.vm.deinit();
         alloc.destroy(self.vm);
     }
 
@@ -304,14 +308,19 @@ pub const State = struct {
     }
 
     /// PUC `lua_pushthread` (lapi.c:lua_pushthread): push the current thread
-    /// onto the stack. Returns 1 if L is the main thread, 0 otherwise.
-    /// In luazig, the Vm IS the main thread (not a Thread object), so we
-    /// push nil (the main thread cannot be used as a coroutine value) and
-    /// return 1. This is a justified deviation: luazig's Vm is not a Thread
-    /// object and cannot be pushed as one.
+    /// onto the stack as a thread Value. Returns 1 if the pushed thread is
+    /// the main thread, 0 otherwise (PUC: `cast_int(L == mainthread(G(L)))`).
+    ///
+    /// P15.83k: threads are first-class Values for every state, including
+    /// the main one (`Vm.main_thread`). This Zig-level API has no handle
+    /// context, so it resolves the "current" thread like `status` above
+    /// (c_api_thread, else main_thread). The C API (`lua_pushthread` in
+    /// c_api.zig) uses the handle's own Thread directly.
     pub fn pushthread(self: *State) c_int {
-        self.stack.append(self.vm.alloc, .Nil) catch {};
-        return 1; // ismainthread(L) == 1
+        const th = self.vm.c_api_thread orelse self.vm.main_thread orelse return 0;
+        const is_main = self.vm.main_thread == th;
+        self.stack.append(self.vm.alloc, .{ .Thread = th }) catch return 0;
+        return if (is_main) 1 else 0;
     }
 
     pub fn pushnil(self: *State) ApiError!void {

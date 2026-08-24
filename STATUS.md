@@ -1,4 +1,4 @@
-> Last updated: 2026-08-22 (P15.83i: reopened blockers closed — plan COMPLETE; final gates green)
+> Last updated: 2026-08-24 (P15.83k: exact resume-stack differentials + lua_pushthread/tothread per-handle identity; gates green)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -2222,6 +2222,102 @@ removed (C-frame TBC "NOT closed here" gone since P15.83c).
 4. lua_gc(LUA_GCCOUNT) accounting differs slightly (stress runs report
    small negative growth after collect vs PUC's 0) — GC accounting
    granularity, not a leak (leak_bench 25/25).
+
+### P15.83k — Exact resume-stack differentials + lua_pushthread/tothread per-handle identity
+
+**Part A (review item 1 completion):** the P15.83j `resume_func_base` fix was
+verified against PUC with /tmp differential probes compiled against BOTH
+runtimes (gcc PUC liblua vs zig liblua, outputs must be byte-identical):
+1. nargs==0 subsequent resume — stale Y replaced, exact top/nres ✓ identical.
+2. Multiple yield→resume cycles (A/B/CD) — each cycle replaces, no
+   accumulation ✓ identical.
+3. Error after yield — invariants identical (LUA_ERRRUN, error object on
+   top, stale Y absent from the whole visible window); see deviation 1 below
+   for the error-path stack layout.
+4. CIST_CLSRET verbatim review variant (`c_return_with_tbc`:
+   settop/toclose/pushliteral/return 1 + yielding Lua `__close`) —
+   resume1 LUA_YIELD nres=1 top=1 [Y]; resume2 LUA_OK nres=1 top=1 [done]
+   ✓ identical, no lua_resume code change needed.
+5. Resume-arg count mixed vs previous yield count (0/1, 1/2, 2/3, 3/0) ✓
+   identical.
+
+Permanent differential tests added to `tests/c_api/14_state_handles.c`
+(7 new, all byte-identical PUC vs luazig, suite already in DIFF_TESTS):
+`test_direct_resume_stack_exact` (review verbatim: absolute-index
+lua_tostring(co,1)/(co,2) checks + final lua_status),
+`test_resume_clsret_stack_exact`, `test_resume_nargs0_replacement`,
+`test_resume_multi_cycle_exact`, `test_resume_args_mix_exact`,
+`test_resume_error_replacement` (invariant-level: error on top, Y absent),
+`test_pushthread_identity`.
+
+**lua_tolstring NULL fix** (found by the verbatim test):
+`lua_tolstring` returned `""` (non-NULL) for non-convertible values and
+out-of-range indices — PUC returns NULL; the lua_tostring macro's NULL
+check contract was broken. Return type is now `?[*:0]const u8` (c_api.zig).
+
+**Part B (review item 4): lua_pushthread/lua_tothread identity.**
+Every lua_State now maps to a Lua thread Value INCLUDING the main state.
+Design: option (a) — `setupMainHandle` links the main handle to the
+EXISTING `Vm.main_thread` (`.thread` field + `main_thread.api_handle`
+reverse link); no new Thread object is created. `is_main` guards the
+places where main behavior differs. Rationale: Vm.main_thread already
+exists, is a GC root (gcMarkVmRoots), is already the value that
+Lua-level `coroutine.running()` returns at main level — reusing it makes
+C-API and Lua-level views of "the main thread" the same object.
+- `lua_pushthread`: pushes `.{ .Thread = h.thread }`, returns
+  `is_main ? 1 : 0` (PUC lapi.c pushthread).
+- `lua_tothread`: reverse-maps via `Thread.api_handle` — for the main
+  thread this now yields the main handle automatically.
+- `api.State.pushthread` (Zig API): pushes c_api_thread orelse
+  main_thread as a real thread Value (was: push Nil — stale Vm==thread
+  assumption; deviation note at STATUS "P15.39" line ~1159 is obsolete).
+
+**Audit of stale `lua_State == Vm` assumptions:**
+- `lua_resume`: removed the `h.thread orelse vm.c_api_thread orelse
+  vm.current_thread` fallback — it resumed an UNRELATED thread when
+  called on the main handle. Now resolves `h.thread` directly; resuming
+  the main state hits builtinCoroutineResume's guard and returns
+  LUA_ERRRUN "cannot resume non-suspended coroutine" (PUC's error for a
+  live main thread; see deviation 2).
+- `lua_status`: is_main → LUA_OK (pinned; main never takes coroutine
+  lifecycle transitions).
+- `lua_closethread`: is_main → LUA_OK early return (unchanged behavior,
+  now explicit); removed the c_api_thread fallback.
+- `lua_xmove`: already asserts same-vm ✓. sethook/gethook* family:
+  resolve `h.thread orelse vm.main_thread` — same result before/after ✓.
+- GC safety: `gcFreeObject(.thread)` skips freeing main handles
+  (`h.is_main`) — Vm.deinit's drainGcRegistries destroys main_thread too,
+  and the main handle is owned by lua_close / api.State.deinit (api.zig
+  deinit reordered to deinit-the-Vm first, matching lua_close, so
+  finalizers during close never see a dangling main_thread.api_handle).
+- `coroutine.running()`/`isyieldable` Lua-level behavior unchanged
+  (Thread values internally, pointer-equality with main_thread still
+  holds — and now the C-pushed main value equals the Lua-seen one).
+- 11_closethread close-via-handles behavior unchanged (gate green).
+
+**Known deviations from PUC (documented, non-blocking):**
+1. Error-path resume stack layout: PUC leaves frame-relative residue on
+   error (lua_gettop is ci->func-relative): error('boom') after yield
+   gives nres=3 top=3 ['boom', msg, msg] (seterrorobj duplicates top-1;
+   residue varies by error kind — nil-call gives nres=5). luazig exposes
+   the clean documented contract: nres=1 top=1 [error object on top].
+   Pre-existing behavior (first-resume errors were already this way),
+   orthogonal to stale-yield replacement (verified absent). Matching
+   would require emulating ci-relative C-API windows.
+2. Fresh-main resume: PUC allows lua_resume on a NEVER-executed main
+   state (ci == base_ci → runs the function, st=0). luazig returns
+   LUA_ERRRUN "cannot resume non-suspended coroutine" (main_thread
+   status is .running from init). Open gap: needs ci==base_ci start
+   semantics + yield-from-main-thread paths through
+   builtinCoroutineResume; zero coverage in any suite. Resolution
+   identity is correct (main handle → main thread).
+3. `lua_tothread` returns NULL for Lua-created coroutines (no C handle)
+   — pre-existing documented deviation (PUC returns their lua_State*).
+
+**Gates (all green):** zig build ReleaseFast; make -C tests/c_api test
+16/16 exit 0; make test-diff strict DIFF: PASS; coroutine.lua --testc
+exit 0 (ulimit -v 2000000, timeout 30); smoke 54/54; zig build test
+exit 0; matrix zig_fail=0 (big.lua both_fail, pre-existing infra).
 
 ### P15.83g — lua_status error preservation + closethread discards suspended k (reset, not resume)
 

@@ -665,9 +665,13 @@ pub const lua_State = struct {
     /// The VM this handle belongs to. Always non-null after creation.
     /// C API functions resolve `vm = L.vm` to access the shared global state.
     vm: *Vm,
-    /// The Thread object for coroutines, or `null` for the main state.
-    /// `lua_resume(co, ...)` resolves `co.thread` to find the coroutine.
-    /// `null` means this is the main state (the Vm itself is the "main thread").
+    /// The Thread object this handle represents. For coroutine states this
+    /// is the coroutine's Thread (set by `lua_newthread`); for the main
+    /// state it is `Vm.main_thread` (set by `setupMainHandle`, P15.83k) —
+    /// every lua_State maps to a Lua thread Value, including the main one
+    /// (PUC: lua_State IS the thread; the main lua_State is the main thread).
+    /// `is_main` distinguishes the main handle where behavior differs
+    /// (lua_pushthread return, lua_status, handle lifetime).
     thread: ?*Thread = null,
     /// Per-handle C API stack. **Phase 2:** each handle has its own stack,
     /// and `Vm.cur_c_stack` points to the active handle's stack.
@@ -1729,8 +1733,12 @@ pub const Thread = struct {
     /// PUC `lua_State` lifetime is tied to the Thread's GC lifetime. When a
     /// coroutine handle is created via `lua_newthread`, this field stores the
     /// handle so `gcFreeObject(.thread)` can free it when the Thread is
-    /// collected. `null` for Lua-created coroutines (no C handle) or the main
-    /// thread (whose handle is freed by `lua_close`, not GC).
+    /// collected. The main thread also carries its handle here (P15.83k, set
+    /// by `setupMainHandle`) so `lua_tothread` can reverse-map the main
+    /// thread Value to the main handle; the main handle itself is freed by
+    /// `lua_close` / `api.State.deinit`, never by GC (the main thread is a
+    /// permanent root, and `gcFreeObject(.thread)` skips main handles).
+    /// `null` for Lua-created coroutines (no C handle).
     api_handle: ?*lua_State = null,
 
     /// PUC `isyieldable` (ldo.c): the thread may yield iff no non-yieldable
@@ -3241,7 +3249,14 @@ pub const Vm = struct {
     /// (C API) or `api.State.deinit` (Zig API) alongside the Vm.
     pub fn setupMainHandle(self: *Vm) !*lua_State {
         const h = try self.alloc.create(lua_State);
-        h.* = .{ .vm = self, .is_main = true };
+        // P15.83k: the main handle references the main Thread (PUC: the main
+        // lua_State IS the main thread). This makes every lua_State map to a
+        // Lua thread Value: lua_pushthread pushes a real thread value for the
+        // main state too, and lua_tothread reverse-maps main_thread.api_handle
+        // back to the main handle. `is_main` distinguishes behavior where the
+        // main state differs (pushthread return value, status, lifetime).
+        h.* = .{ .vm = self, .thread = self.main_thread, .is_main = true };
+        self.main_thread.?.api_handle = h;
         self.main_handle = h;
         self.cur_handle = h;
         self.cur_c_stack = &h.c_stack;
@@ -18696,10 +18711,15 @@ pub const Vm = struct {
             },
             .thread => |th| {
                 // Free the coroutine's C API handle (created by lua_newthread).
-                // The main handle is freed by lua_close / api.State.deinit, not GC.
+                // The main handle (main_thread.api_handle, P15.83k) is owned
+                // by lua_close / api.State.deinit — and Vm.deinit's
+                // drainGcRegistries destroys the main_thread too, so freeing
+                // its handle here as well would double-free.
                 if (th.api_handle) |h| {
-                    h.c_stack.deinit(self.alloc);
-                    self.alloc.destroy(h);
+                    if (!h.is_main) {
+                        h.c_stack.deinit(self.alloc);
+                        self.alloc.destroy(h);
+                    }
                 }
                 self.freeThreadWrapBuffers(th);
                 self.freeThreadBytecodeFrames(th);

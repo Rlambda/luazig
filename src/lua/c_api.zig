@@ -152,7 +152,9 @@ pub export fn lua_newstate(
     ud: ?*anyopaque,
     seed: c_uint,
 ) ?*lua_State {
-    _ = seed; // PRNG seeding not yet wired (PUC uses it for table hash randomization)
+    _ = seed; // deliberately unused: the VM hash seed is fixed by design
+    // (see Vm.hash_seed — deterministic behavior instead of PUC's
+    // luai_makeseed randomization; a documented deviation)
     const alloc = std.heap.c_allocator;
     const vm = alloc.create(Vm) catch return null;
     vm.* = Vm.init(alloc, false);

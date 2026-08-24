@@ -29,5 +29,10 @@ third_party/lua-upstream/testes/libs/*.so
 third_party/lua-upstream/testes/libs/*.dll
 third_party/lua-upstream/testes/libs/*.dylib
 
+# Per-runtime udatatest builds for the smoke differential harness
+# (built by tools/smoke_compare.py; see build_udatatest_modules there)
+lua-5.5.0/testes/libs/udatatest.so
+tests/smoke/zig-libs/
+
 # Stray tool marker
 .codex

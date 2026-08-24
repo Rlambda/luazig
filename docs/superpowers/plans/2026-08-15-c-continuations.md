@@ -11,7 +11,11 @@
 >    the rejection tests are not in the DIFF gate);
 > 4. [x] lua_pushthread / per-handle identity migration (P15.83k);
 > 5. [x] test-diff fails hard (P15.83j — strict, no `|| true`);
-> 6. [x] smoke 45_userdata_capi loads udatatest (54/54);
+> 6. [x] smoke 45_userdata_capi loads udatatest — made REAL in P15.83n
+>    (per-runtime udatatest .so builds + per-runtime LUA_INIT_5_5 cpath
+>    selection in tools/smoke_compare.py; before that the differential was
+>    53 exact + 1 module-missing mismatch, and the original "54/54" claim
+>    here rested on a laxer comparison / leftover untracked .so);
 > 7. [x] stale plan/self-review/source comments cleanup.
 > Acceptable deviations (only): absolute COUNT-hook firing totals
 > (instruction density); small GCCOUNT accounting granularity.
@@ -1799,8 +1803,14 @@ TestcPendingContinuation removed (~200 lines)."
 - ✅ adjustresults(LUA_MULTRET) (Task 11)
 
 ### Placeholder scan
-- Task 12 finishpcallk has a TODO for TBC close integration — this is acknowledged as a limitation that will be addressed when TBC close continuations are unified with C continuations. The existing PendingCallSlot machinery handles TBC close.
-- Task 13 (testC migration) is intentionally high-level because the exact testC command structure needs to be studied during implementation. The subagent will need to explore the testC command dispatch code.
+- Task 12 finishpcallk TBC close integration — implemented in P15.83c (C-frame
+  TBC activation scoping via `toclose_base` snapshots in `callCFunction` +
+  `finishpcallk` closes TBC slots on pcall-error recovery). No TODO remains.
+- Task 13 (testC migration) — completed in P15.83d: testC `callk`/`pcallk`/
+  `yieldk` dispatch directly through the shared production `lua_*k` helpers
+  (no testC-private continuation machinery). The pre-implementation
+  "subagent will need to explore the testC command dispatch code" note is
+  obsolete.
 
 ### Type consistency
 - `StackOffset = usize` — consistent across all tasks

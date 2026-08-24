@@ -1,5 +1,10 @@
 -- Smoke test: C extension userdata round-trip via C API
-package.cpath = package.cpath .. ";./lua-5.5.0/testes/libs/?.so;./libs/?.so"
+-- udatatest.so is built per-runtime (gcc -fPIC -shared against each
+-- runtime's headers) by tools/smoke_compare.py. The differential harness
+-- prepends the PUC-flavored build's directory to package.cpath via -e when
+-- running the reference interpreter; for standalone luazig runs this cpath
+-- entry finds the luazig-flavored build in tests/smoke/zig-libs/.
+package.cpath = package.cpath .. ";./tests/smoke/zig-libs/?.so"
 
 require("udatatest")
 

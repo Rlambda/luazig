@@ -214,10 +214,13 @@ pub export fn lua_closethread(L: ?*lua_State, from: ?*lua_State) c_int {
     const vm = h.vm;
 
     // PUC lua_closethread operates on L (the thread itself). Resolve the
-    // thread from the handle (set by lua_newthread). If null, L is the main
-    // thread — PUC allows closing it (resets to clean state), but luazig's
-    // main thread is always in a valid state, so return LUA_OK.
-    const th = h.thread orelse vm.c_api_thread orelse return 0; // LUA_OK — main thread
+    // thread from the handle. For the main state, PUC allows closing it
+    // (resets to clean state), but luazig's main thread is always in a
+    // valid state, so return LUA_OK — the main state is torn down by
+    // lua_close, and the main thread can never be suspended (it cannot
+    // yield), so there is nothing to reset.
+    if (h.is_main) return 0; // LUA_OK — main thread
+    const th = h.thread orelse return 0;
 
     // PUC lstate.c:327: L->nCcalls = (from) ? getCcalls(from) : 0
     if (from) |from_ptr| {
@@ -1280,11 +1283,12 @@ pub export fn lua_isyieldable(L: ?*lua_State) c_int {
 
 /// PUC `lua_tolstring`: convert value to string, return NUL-terminated C
 /// pointer. Writes byte length to `*len` if non-null. Returns NULL for
-/// non-convertible types.
-pub export fn lua_tolstring(L: ?*lua_State, idx: c_int, len: ?*usize) [*:0]const u8 {
+/// non-convertible values and out-of-range indices (PUC: lua_tolstringx →
+/// NULL; callers like the lua_tostring macro rely on the NULL check).
+pub export fn lua_tolstring(L: ?*lua_State, idx: c_int, len: ?*usize) ?[*:0]const u8 {
     var s = api.State.fromHandle(L orelse {
         if (len) |p| p.* = 0;
-        return "";
+        return null;
     });
     if (s.tolstring(idx)) |bytes| {
         // luazig's LuaString storage is NUL-terminated (createLuaString writes
@@ -1293,7 +1297,7 @@ pub export fn lua_tolstring(L: ?*lua_State, idx: c_int, len: ?*usize) [*:0]const
         return @ptrCast(@constCast(bytes.ptr));
     }
     if (len) |p| p.* = 0;
-    return "";
+    return null;
 }
 
 /// PUC `lua_typename` (lapi.c:lua_typename): return the name of the type
@@ -1331,9 +1335,11 @@ pub export fn lua_tocfunction(L: ?*lua_State, idx: c_int) ?*const fn (?*lua_Stat
 pub export fn lua_tothread(L: ?*lua_State, idx: c_int) ?*lua_State {
     var s = api.State.fromHandle(L orelse return null);
     if (s.tothread(idx)) |th| {
-        // Return the thread's C API handle (set by lua_newthread). For
-        // Lua-created coroutines (no C handle), return null — a deviation
-        // from PUC which returns the lua_State* for all threads.
+        // Reverse-map the thread Value to its lua_State handle: coroutine
+        // handles are set by lua_newthread, the main thread's handle by
+        // setupMainHandle (P15.83k). For Lua-created coroutines (no C
+        // handle), return null — a deviation from PUC which returns the
+        // lua_State* for all threads.
         return th.api_handle;
     }
     return null;
@@ -1520,9 +1526,14 @@ pub export fn lua_len(L: ?*lua_State, idx: c_int) void {
 pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: ?*c_int) c_int {
     const h = L orelse return 2;
     const vm = h.vm;
-    // Resolve the coroutine thread from the handle (set by lua_newthread).
-    // Fall back to c_api_thread / current_thread for legacy / Lua-driven resumes.
-    const co = h.thread orelse vm.c_api_thread orelse vm.current_thread orelse return 2;
+    // P15.83k: resolve the thread directly from the handle. Every handle
+    // carries its Thread (coroutine handles from lua_newthread, the main
+    // handle from setupMainHandle). Resuming the main state resolves the
+    // main thread, which builtinCoroutineResume rejects with PUC's
+    // "cannot resume non-suspended coroutine" while it is running — the
+    // previous fallback (c_api_thread orelse current_thread) silently
+    // resumed an unrelated thread instead (stale lua_State==Vm assumption).
+    const co = h.thread orelse return 2;
     // DON'T set vm.current_thread here — builtinCoroutineResume saves/restores
     // current_thread internally. Setting it here would cause the defer in
     // builtinCoroutineResume to restore co's status to its pre-resume value,
@@ -1684,18 +1695,26 @@ pub export fn lua_yieldk(L: ?*lua_State, nresults: c_int, ctx: isize, k: ?*const
 /// handle is the main thread, whose status is always LUA_OK.
 pub export fn lua_status(L: ?*lua_State) c_int {
     const h = L orelse return 2;
-    // Resolve the thread from the handle (set by lua_newthread).
     // PUC: main thread status is always LUA_OK (errors in the main thread
-    // either longjmp to a pcall boundary or abort the process).
-    if (h.thread) |th| return th.api_status;
-    return 0; // LUA_OK — main thread
+    // either longjmp to a pcall boundary or abort the process). The main
+    // handle's .thread is the main Thread (P15.83k), whose api_status tracks
+    // coroutine lifecycle transitions it never takes — is_main pins LUA_OK.
+    if (h.is_main) return 0; // LUA_OK
+    const th = h.thread orelse return 0;
+    return th.api_status;
 }
 
 /// PUC `lua_pushthread` (lapi.c:lua_pushthread): push the current thread
-/// onto the stack. Returns 1 if L is the main thread, 0 otherwise.
+/// onto the stack as a thread Value. Returns 1 if L is the main thread,
+/// 0 otherwise (PUC: `return cast_int(L == mainthread(G(L)))`).
+/// P15.83k: every handle carries its Thread (coroutines from lua_newthread,
+/// the main handle from setupMainHandle), so the pushed value is a real
+/// thread Value and lua_tothread on it returns this exact handle.
 pub export fn lua_pushthread(L: ?*lua_State) c_int {
-    var s = api.State.fromHandle(L orelse return 0);
-    return s.pushthread();
+    const h = L orelse return 0;
+    const th = h.thread orelse return 0;
+    h.c_stack.append(h.vm.alloc, .{ .Thread = th }) catch return 0;
+    return if (h.is_main) 1 else 0;
 }
 
 // --- Garbage collection (PUC lapi.c:lua_gc) ---

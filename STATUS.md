@@ -1,4 +1,4 @@
-> Last updated: 2026-08-25 (P15.83r: C-callee CALL hooks fire on the C activation — PUC precallC ordering)
+> Last updated: 2026-08-22 (P15.83s: third review round closed — error/hook-yield resume exposure + C-callee CALL identity; plan COMPLETE)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).

@@ -192,6 +192,8 @@ def main() -> int:
                     help=f"CPU core to pin via taskset (default {DEFAULT_CORE})")
     ap.add_argument("--no-build", action="store_true",
                     help="skip zig build + make lua-c (use existing binaries)")
+    ap.add_argument("--json-out", default="",
+                    help="write the current run result dict to PATH (baseline untouched)")
     args = ap.parse_args()
 
     if args.runs < 1:
@@ -225,6 +227,13 @@ def main() -> int:
         "puc": puc,
         "ratios": {n: zig[n] / puc[n] for n in zig if n in puc and puc[n]},
     }
+
+    if args.json_out:
+        out_path = Path(args.json_out)
+        if out_path.parent != Path("."):
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
+        print(f"\njson: {out_path}")
 
     if args.update_baseline:
         BASELINE.parent.mkdir(parents=True, exist_ok=True)

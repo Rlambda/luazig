@@ -1,9 +1,7 @@
-> Last updated: 2026-08-22 (P15.83s: third review round closed — error/hook-yield resume exposure + C-callee CALL identity; plan COMPLETE)
+> Last updated: 2026-08-25 (P16.0a: generated status summary — one source of truth for parity/perf numbers)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
-
-> Last updated: 2026-08-21 (P15.82h: wire c_hook dispatch into the hook machinery)
 
 ---
 
@@ -26,12 +24,17 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 
 Проект находится в **pre-release / parity-focused** состоянии.
 
+> Единственный источник количественных чисел (generated source of truth) —
+> status-блок в [README.md](README.md), генерируемый `tools/status_summary.py`
+> из JSON-отчётов линий (matrix/smoke/perf). Числа ниже — копия для удобства;
+> при расхождении приоритет у README-блока.
+
 | Metric | Result |
 |--------|--------|
-| Upstream matrix (`testes/*.lua`) | **31/32** pass (exit code parity) |
+| Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests | **54/54** pass |
-| Performance (geomean vs PUC) | **2.67x** |
+| Performance (geomean vs PUC) | **2.71x** |
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
 IR VM полностью удалена из кодовой базы.
@@ -40,8 +43,8 @@ IR VM полностью удалена из кодовой базы.
 
 ## Производительность
 
-Geomean замедления vs PUC Lua: **2.67x** (цель: 1.0x).
-Подробная таблица workload'ов — в [README.md](README.md).
+Geomean замедления vs PUC Lua: **2.71x** (цель: 1.0x; run-dependent).
+Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 
 Архитектурные решения и находки — [DESIGN.md](DESIGN.md).
 

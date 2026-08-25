@@ -13,6 +13,7 @@ fn usage(out: anytype) !void {
         \\  --vm=ir|bc    select VM backend (default: bc)
         \\  --dump-bytecode  print bytecode disassembly (like luac -l) and exit
         \\  --bc-coverage-out <file.json>   write BC lowering/fallback coverage stats
+        \\  --stats <file.json>             write default-off VM runtime counters (P16.0b)
         \\  --testc       enable test-only module `T` (ltests compatibility path)
         \\
         \\Compatibility:
@@ -847,6 +848,7 @@ fn readLine(aalloc: std.mem.Allocator, io: std.Io, buf: *std.ArrayListUnmanaged(
 const LuazigOptions = struct {
     backend: VmBackend = .bc,
     bc_coverage_out: ?[]const u8 = null,
+    stats_out: ?[]const u8 = null,
     enable_testc: bool = false,
     dump_bytecode: bool = false,
     show_help: bool = false,
@@ -959,6 +961,18 @@ fn extractLuazigOptions(alloc: std.mem.Allocator, args: []const []const u8) !Lua
             opts.bc_coverage_out = args[i];
             continue;
         }
+        // --stats <path> (P16.0b): enable the default-off Vm runtime counters
+        // for the whole process run; JSON is serialized at exit.
+        if (std.mem.eql(u8, a, "--stats")) {
+            if (i + 1 >= args.len) {
+                var errw = stdio.stderr();
+                try errw.print("{s}: --stats requires a path\n", .{args[0]});
+                return error.InvalidArgument;
+            }
+            i += 1;
+            opts.stats_out = args[i];
+            continue;
+        }
         // --testc
         if (std.mem.eql(u8, a, "--testc")) {
             opts.enable_testc = true;
@@ -1066,6 +1080,9 @@ fn interpreterMain(init: std.process.Init) !void {
     defer vm.deinit();
     if (opts.backend == .bc) vm.setDynamicBytecodeCompiler(compileDynamicBytecode);
     if (opts.enable_testc) try vm.enableTestcModule();
+    // P16.0b: --stats <out.json> — flip the counters on for the whole
+    // process run (default off = zero gated cost). Serialized at exit.
+    if (opts.stats_out != null) vm.stats.enabled = true;
 
     // --- PUC createargtable (lua.c:185-194) ---
     // Build the `arg` table from the full PUC argv, aligned so that
@@ -1161,7 +1178,121 @@ fn interpreterMain(init: std.process.Init) !void {
         defer alloc.free(payload);
         try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = out_path, .data = payload });
     }
+
+    // P16.0b: serialize the Vm runtime counters (only when --stats was
+    // passed — the counters stayed disabled and all-zero otherwise).
+    // Shape documented on VmStats / T.stats.
+    if (opts.stats_out) |out_path| {
+        try writeVmStatsJson(alloc, init.io, out_path, &vm.stats);
+    }
     return;
+}
+
+/// P16.0b: serialize VmStats to a JSON file:
+/// {
+///   "instructions_total": N,
+///   "instructions_by_op": { "<opname>": count, ... },
+///   "calls":   { "fast": .., "slow": .., "lua_frames": .., "builtin": ..,
+///                "metamethod": .., "c": .. },
+///   "tables":  { "get_fast_int": .., "get_fast_str": .., "get_generic": ..,
+///                "set_fast_int": .., "set_fast_str": .., "set_generic": ..,
+///                "insert": .., "update": .., "rehash": .. },
+///   "allocs":  { "table": .., "closure": .., "thread": .., "string": ..,
+///                "cell": .., "userdata": .., "bytes_total": .. },
+///   "gc":      { "steps_auto": .., "steps_manual": .. },
+///   "yield_resume": { "yields": .., "resumes": ..,
+///                     "yield_allocs": .., "resume_allocs": .. }
+/// }
+fn writeVmStatsJson(alloc: std.mem.Allocator, io: std.Io, out_path: []const u8, s: *const lua.internal.vm.VmStats) !void {
+    var aw = std.Io.Writer.Allocating.init(alloc);
+    defer aw.deinit();
+    var js = std.json.Stringify{ .writer = &aw.writer };
+
+    try js.beginObject();
+
+    try js.objectField("instructions_total");
+    try js.write(s.instructions_total);
+
+    try js.objectField("instructions_by_op");
+    try js.beginObject();
+    inline for (@typeInfo(lua.internal.bytecode.Op).@"enum".fields) |f| {
+        try js.objectField(f.name);
+        try js.write(s.instructions_by_op[f.value]);
+    }
+    try js.endObject();
+
+    try js.objectField("calls");
+    try js.beginObject();
+    try js.objectField("fast");
+    try js.write(s.calls_fast);
+    try js.objectField("slow");
+    try js.write(s.calls_slow);
+    try js.objectField("lua_frames");
+    try js.write(s.calls_lua_frames);
+    try js.objectField("builtin");
+    try js.write(s.calls_builtin);
+    try js.objectField("metamethod");
+    try js.write(s.calls_metamethod);
+    try js.objectField("c");
+    try js.write(s.calls_c);
+    try js.endObject();
+
+    try js.objectField("tables");
+    try js.beginObject();
+    try js.objectField("get_fast_int");
+    try js.write(s.tbl_get_fast_int);
+    try js.objectField("get_fast_str");
+    try js.write(s.tbl_get_fast_str);
+    try js.objectField("get_generic");
+    try js.write(s.tbl_get_generic);
+    try js.objectField("set_fast_int");
+    try js.write(s.tbl_set_fast_int);
+    try js.objectField("set_fast_str");
+    try js.write(s.tbl_set_fast_str);
+    try js.objectField("set_generic");
+    try js.write(s.tbl_set_generic);
+    try js.objectField("insert");
+    try js.write(s.tbl_insert);
+    try js.objectField("update");
+    try js.write(s.tbl_update);
+    try js.objectField("rehash");
+    try js.write(s.tbl_rehash);
+    try js.endObject();
+
+    try js.objectField("allocs");
+    try js.beginObject();
+    inline for (@typeInfo(lua.internal.vm.GcObject).@"union".fields, 0..) |f, i| {
+        try js.objectField(f.name);
+        try js.write(s.alloc_by_type[i]);
+    }
+    try js.objectField("bytes_total");
+    try js.write(s.alloc_bytes_total);
+    try js.endObject();
+
+    try js.objectField("gc");
+    try js.beginObject();
+    try js.objectField("steps_auto");
+    try js.write(s.gc_steps_auto);
+    try js.objectField("steps_manual");
+    try js.write(s.gc_steps_manual);
+    try js.endObject();
+
+    try js.objectField("yield_resume");
+    try js.beginObject();
+    try js.objectField("yields");
+    try js.write(s.yields);
+    try js.objectField("resumes");
+    try js.write(s.resumes);
+    try js.objectField("yield_allocs");
+    try js.write(s.yield_allocs);
+    try js.objectField("resume_allocs");
+    try js.write(s.resume_allocs);
+    try js.endObject();
+
+    try js.endObject();
+    try aw.writer.writeByte('\n');
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = aw.writer.buffered() });
 }
 
 pub fn main(init: std.process.Init) !void {

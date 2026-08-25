@@ -311,6 +311,7 @@ pub const BuiltinId = enum(u8) {
     testc_udataval,
     testc_pushuserdata,
     testc_checkpanic,
+    testc_stats,
     /// CLI message handler — PUC `msghandler` (lua.c:136-148). Set as
     /// `vm.errfunc` by the CLI entry point so error objects are formatted
     /// (string/__tostring/(error object is a %s value)) and a traceback is
@@ -479,6 +480,7 @@ pub const BuiltinId = enum(u8) {
             .testc_udataval => "T._udataval",
             .testc_pushuserdata => "T._pushuserdata",
             .testc_checkpanic => "T._checkpanic",
+            .testc_stats => "T.stats",
             .cli_msghandler => "msghandler",
         };
     }
@@ -2499,6 +2501,90 @@ fn makeRandomSeed() u64 {
     return @as(u64, @bitCast(t)) ^ (addr +% 0x9e3779b97f4a7c15);
 }
 
+/// P16.0b: Default-off runtime VM counters, surfaced two ways:
+///   * CLI `--stats <out.json>` (src/bin/luazig.zig serializes at exit),
+///   * testC module `T.stats()` (returns a Lua table snapshot).
+///
+/// GATING DESIGN (zero aggregate cost when disabled — A/B measured on
+/// ReleaseFast, see STATUS.md "P16.0b"): the struct lives INLINE on the
+/// (singleton) Vm. Every instrumented site — including the
+/// per-instruction histogram site — checks `self.stats.enabled` directly:
+/// one L1 byte-load + predictable never-taken branch (`enabled` is placed
+/// right after the per-instruction-written `dispatch_pc`, so it shares a
+/// cache line). Two alternatives were measured and REJECTED: (a) a cached
+/// `?*VmStats` loop-local pointer costs a register across the whole
+/// dispatch switch (+3% on branchy microbenchmarks); (b) converting every
+/// counter site to @branchHint(.unlikely) block form — reproducibly WORSE
+/// on some benches (+12% comparisons) because the extra block form shifts
+/// hot code layout; the codegen layout lottery dominates sub-cycle branch
+/// costs. `enabled` is flipped only by the CLI/tests BEFORE execution
+/// starts; execution semantics never read these counters.
+pub const VmStats = struct {
+    enabled: bool = false,
+
+    // ── Instruction histogram (runBytecodeDispatch fetch site) ──
+    instructions_total: u64 = 0,
+    instructions_by_op: [@typeInfo(bc.Op).@"enum".fields.len]u64 =
+        [_]u64{0} ** @typeInfo(bc.Op).@"enum".fields.len,
+
+    // ── Call funnel ──
+    /// OP_CALL inline fast path (Lua closure w/ proto, no hooks, no replay).
+    calls_fast: u64 = 0,
+    /// opCall slow entry (builtin callee / __call chain / hooks / resume).
+    calls_slow: u64 = 0,
+    /// pushBytecodeExecFrame: EVERY Lua activation (calls_fast + tailcall +
+    /// resume + pcall/hook routes). Superset of calls_fast.
+    calls_lua_frames: u64 = 0,
+    /// callBuiltin entry. A builtin invoked AS a metamethod additionally
+    /// counts once in calls_metamethod (documented overlap).
+    calls_builtin: u64 = 0,
+    calls_metamethod: u64 = 0,
+    /// callCFunction entry (C-ABI closures/extensions).
+    calls_c: u64 = 0,
+
+    // ── Table access split ──
+    // Fast-path counters fire at the typed opcode sites (GETTABLE/GETI/
+    // GETFIELD/GETTABUP, SETTABLE/SETI/SETFIELD/SETTABUP). The generic
+    // funnels rawGet/rawSet count everything that was NOT served by an
+    // inline fast path (incl. non-dispatch callers: helpers, C API, next).
+    // Fast-path misses fall through to the funnels, so generic counts also
+    // include those. rawSet outcomes are split into insert/update/rehash.
+    tbl_get_fast_int: u64 = 0,
+    tbl_get_fast_str: u64 = 0,
+    tbl_get_generic: u64 = 0,
+    tbl_set_fast_int: u64 = 0,
+    tbl_set_fast_str: u64 = 0,
+    tbl_set_generic: u64 = 0,
+    /// New key inserted (nodeInsert sites, incl. post-rehash insertion).
+    tbl_insert: u64 = 0,
+    /// Existing key written in place (update or nil-delete).
+    tbl_update: u64 = 0,
+    tbl_rehash: u64 = 0,
+
+    // ── Allocations ──
+    /// Count per GC object type, indexed by GcObject tag order
+    /// (table, closure, thread, string, cell, userdata).
+    alloc_by_type: [@typeInfo(GcObject).@"union".fields.len]u64 =
+        [_]u64{0} ** @typeInfo(GcObject).@"union".fields.len,
+    /// Approximate pacing bytes as seen by gcNoteAlloc. Exact live total
+    /// remains T.totalmem() (tracker-based); this counts allocation volume.
+    alloc_bytes_total: u64 = 0,
+
+    // ── GC steps (entries that pass the gc_busy guard) ──
+    gc_steps_auto: u64 = 0,
+    gc_steps_manual: u64 = 0,
+
+    // ── Coroutines ──
+    yields: u64 = 0,
+    resumes: u64 = 0,
+    /// Allocs performed on the yield path (th.yielded copies incl. wrap
+    /// mode, suspended_builtin_args copy, appendThreadWrapYield copy).
+    yield_allocs: u64 = 0,
+    /// Allocs performed on the resume path (resume inbox copy, entry_args
+    /// save, trampoline args_copy + BytecodeCoroutineContinuation).
+    resume_allocs: u64 = 0,
+};
+
 pub const Vm = struct {
     const Frame = CallFrame;
 
@@ -2829,6 +2915,12 @@ pub const Vm = struct {
     /// the current pc without the dispatch loop syncing to the frame.
     /// Written at the top of the inner dispatch loop.
     dispatch_pc: usize = 0,
+
+    /// P16.0b: default-off runtime counters (see VmStats). Inline on the
+    /// singleton Vm: ~250 bytes of cold-when-disabled state is acceptable
+    /// on a heap singleton, and the `enabled` bool gates every counter
+    /// site with one predictable branch.
+    stats: VmStats = .{},
 
     // ── Shared bytecode stack (PUC Lua model) ──
     // A single contiguous array that serves as the register file for ALL
@@ -5478,6 +5570,7 @@ pub const Vm = struct {
     ///    table has deleted entries, add 25% to avoid repeated resizings.
     /// 5. `tableResize` to the computed sizes.
     fn tableRehash(self: *Vm, tbl: *Table, ek: Value) DispatchError!void {
+        if (self.stats.enabled) self.stats.tbl_rehash += 1; // P16.0b
         var ct = ltable.Counters{};
         ct.total = 1; // count the extra key that triggered the rehash
         if (ek == .Int) {
@@ -5627,6 +5720,7 @@ pub const Vm = struct {
         const kb: f64 = @as(f64, @floatFromInt(bytes)) / 1024.0;
         self.gc_count_kb += kb;
         self.gc_step_debt_kb -= kb;
+        if (self.stats.enabled) self.stats.alloc_bytes_total += bytes; // P16.0b
     }
     /// an object. The tracker's total_bytes is updated automatically by
     /// the allocator's free callback.
@@ -5678,6 +5772,10 @@ pub const Vm = struct {
     /// `gc_index` is the object's position in `gc_objects`, used by
     /// `gcUnregisterObject` for O(1) `swapRemove`.
     fn gcRegisterObject(self: *Vm, obj: GcObject) std.mem.Allocator.Error!void {
+        // P16.0b: per-type allocation counts. GcObject is a tagged union,
+        // so @intFromEnum yields the active tag (declaration order: table,
+        // closure, thread, string, cell, userdata — matches alloc_by_type).
+        if (self.stats.enabled) self.stats.alloc_by_type[@intFromEnum(obj)] += 1;
         try self.gc_objects.ensureUnusedCapacity(self.alloc, 1);
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
             try self.gc_young_objects.ensureUnusedCapacity(self.alloc, 1);
@@ -7639,12 +7737,14 @@ pub const Vm = struct {
         if (exec_frames.getPtr(parent_index).pending_call_index != INVALID_PENDING) return false;
 
         const args_copy = try self.alloc.dupe(Value, target.args);
+        if (self.stats.enabled) self.stats.resume_allocs += 1; // P16.0b (trampoline resume args)
         errdefer self.alloc.free(args_copy);
         const saved_error = self.saveBytecodeProtectedError();
         var saved_error_owned = true;
         errdefer if (saved_error_owned) self.restoreBytecodeSavedError(saved_error);
 
         const co_state = try self.alloc.create(BytecodeCoroutineContinuation);
+        if (self.stats.enabled) self.stats.resume_allocs += 1; // P16.0b (trampoline continuation)
         co_state.* = .{
             .target = target.thread,
             .kind = target.kind,
@@ -9601,6 +9701,7 @@ pub const Vm = struct {
         caller_func_slot: usize,
         nresults: i32,
     ) DispatchError!void {
+        if (self.stats.enabled) self.stats.calls_lua_frames += 1; // P16.0b: ALL Lua activations
         // Resolve string constants to VM-interned pointers on first use.
         // This is a one-time cost per Proto that eliminates per-execution
         // re-hashing in bcConstToValue (~12.4% of cycles on microbench).
@@ -10564,6 +10665,21 @@ pub const Vm = struct {
                 const b = inst.b;
                 const c = inst.c;
 
+                // P16.0b: default-off instruction histogram. When disabled
+                // this is one L1 byte-load + predictable not-taken branch
+                // (the `enabled` field sits in the same cache line as the
+                // per-instruction-written `dispatch_pc`). Deliberately NOT
+                // a cached `?*VmStats` local: a loop-wide live pointer
+                // costs a register across the whole dispatch switch, which
+                // measured +3% on branchy microbenchmarks (see STATUS.md
+                // "P16.0b" for the A/B history). The hint keeps the
+                // increments out of the hot instruction stream.
+                if (self.stats.enabled) {
+                    @branchHint(.unlikely);
+                    self.stats.instructions_total += 1;
+                    self.stats.instructions_by_op[@intFromEnum(op)] += 1;
+                }
+
                 // Publish the current pc so fail() and GC safepoints can read
                 // it without the dispatch loop syncing to the frame first.
                 // This mirrors PUC's `ci->u.l.savedpc` but is kept per-instruction.
@@ -10864,6 +10980,7 @@ pub const Vm = struct {
                         // env is an upvalue, not a register — no ctx.regs slice
                         // invalidation possible.
                         if (env == .Table and env.Table.metatable == null) {
+                            if (self.stats.enabled) self.stats.tbl_get_fast_str += 1; // P16.0b (constant string key)
                             ctx.regs[a] = self.rawGet(env.Table, key);
                         } else {
                             @branchHint(.unlikely);
@@ -10900,6 +11017,7 @@ pub const Vm = struct {
                             return self.fail("attempt to index a {s} value (upvalue '{s}')", .{ tn, upv_name });
                         }
                         if (env.Table.metatable == null) {
+                            if (self.stats.enabled) self.stats.tbl_set_fast_str += 1; // P16.0b (constant string key; outcome counted in rawSet funnel)
                             try self.rawSet(env.Table, key, val);
                         } else {
                             @branchHint(.unlikely);
@@ -10922,6 +11040,7 @@ pub const Vm = struct {
                         if (obj == .Table and obj.Table.metatable == null) {
                             const tbl = obj.Table;
                             if (key == .Int and key.Int >= 1) {
+                                if (self.stats.enabled) self.stats.tbl_get_fast_int += 1; // P16.0b
                                 const arr_len: i64 = @intCast(tbl.asize);
                                 if (key.Int <= arr_len) {
                                     ctx.regs[a] = tbl.array[@intCast(key.Int - 1)];
@@ -10932,6 +11051,7 @@ pub const Vm = struct {
                                         .Nil;
                                 }
                             } else if (key == .String) {
+                                if (self.stats.enabled) self.stats.tbl_get_fast_str += 1; // P16.0b
                                 ctx.regs[a] = if (ltable.nodeLookup(tbl.hash, key, self.hash_seed)) |node|
                                     node.value
                                 else
@@ -10961,6 +11081,7 @@ pub const Vm = struct {
                             const tbl = obj.Table;
                             const k: usize = c; // c is u8, 1-based
                             if (k >= 1 and k <= tbl.asize) {
+                                if (self.stats.enabled) self.stats.tbl_get_fast_int += 1; // P16.0b
                                 ctx.regs[a] = tbl.array[k - 1];
                             } else {
                                 @branchHint(.unlikely);
@@ -10988,6 +11109,7 @@ pub const Vm = struct {
                             // eliminates the function call to rawGet and
                             // inlines nodeLookup into the dispatch loop.
                             const tbl = obj.Table;
+                            if (self.stats.enabled) self.stats.tbl_get_fast_str += 1; // P16.0b
                             ctx.regs[a] = if (ltable.nodeLookup(tbl.hash, key, self.hash_seed)) |node|
                                 node.value
                             else
@@ -11090,8 +11212,10 @@ pub const Vm = struct {
                         if (obj == .Table and obj.Table.metatable == null) {
                             const tbl = obj.Table;
                             if (key == .String) {
+                                if (self.stats.enabled) self.stats.tbl_set_fast_str += 1; // P16.0b
                                 try self.gcTableWriteBarrier(tbl, key, val);
                                 if (ltable.nodeLookup(tbl.hash, key, self.hash_seed)) |node| {
+                                    if (self.stats.enabled) self.stats.tbl_update += 1; // P16.0b (existing key)
                                     if (val == .Nil) {
                                         _ = ltable.nodeDelete(tbl.hash, key, self.hash_seed);
                                     } else {
@@ -11124,6 +11248,7 @@ pub const Vm = struct {
                             const tbl = obj.Table;
                             const k: usize = b; // b is u8, 1-based
                             if (k >= 1 and k <= tbl.asize) {
+                                if (self.stats.enabled) self.stats.tbl_set_fast_int += 1; // P16.0b
                                 tbl.array[k - 1] = val;
                                 try self.gcWriteBarrierTable(tbl, val);
                             } else {
@@ -11153,8 +11278,10 @@ pub const Vm = struct {
                             // again — harmless (idempotent).
                             const tbl = obj.Table;
                             try self.gcTableWriteBarrier(tbl, key, val);
+                            if (self.stats.enabled) self.stats.tbl_set_fast_str += 1; // P16.0b
                             if (ltable.nodeLookup(tbl.hash, key, self.hash_seed)) |node| {
                                 // Existing key: update in place (or delete).
+                                if (self.stats.enabled) self.stats.tbl_update += 1; // P16.0b
                                 if (val == .Nil) {
                                     _ = ltable.nodeDelete(tbl.hash, key, self.hash_seed);
                                 } else {
@@ -12440,6 +12567,7 @@ pub const Vm = struct {
                         if (callee == .Closure and !self.hooks_active_cached and !exec_frames.getPtr(ctx.frame_index).isHookYield()) {
                             const cl = callee.Closure;
                             if (cl.proto) |proto| {
+                                if (self.stats.enabled) self.stats.calls_fast += 1; // P16.0b
                                 const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
                                 const nargs: usize = if (b == 0) exec_frames.getPtr(ctx.frame_index).reg_top - a - 1 else b - 1;
 
@@ -14008,6 +14136,7 @@ pub const Vm = struct {
             return .continue_dispatch;
         }
         const nargs: usize = if (b == 0) fr_call.reg_top - a - 1 else b - 1;
+        if (self.stats.enabled) self.stats.calls_slow += 1; // P16.0b (after hook-yield replay: a real call)
 
         // ── PUC luaD_precall: inline callee type resolution ──
         var effective_nargs = nargs;
@@ -14793,6 +14922,7 @@ pub const Vm = struct {
     }
 
     fn callBuiltin(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value) DispatchError!void {
+        if (self.stats.enabled) self.stats.calls_builtin += 1; // P16.0b
         // P15.38i: Track whether outs points into bc_stack. When true, builtins
         // with re-entry (pcall, xpcall, tostring with __tostring, etc.) can
         // re-derive their outs slice via refreshBuiltinOuts() after nested Lua
@@ -15169,6 +15299,7 @@ pub const Vm = struct {
             .testc_makecfunc => try self.builtinTestcMakeCfunc(args, outs),
             .testc_allowhookyield => try self.builtinTestcAllowHookYield(args, outs),
             .testc_totalmem => try self.builtinTestcTotalmem(args, outs),
+            .testc_stats => try self.builtinTestcStats(args, outs),
             .testc_gcage => try self.builtinTestcGcage(args, outs),
             .testc_gccolor => try self.builtinTestcGccolor(args, outs),
             .testc_codeparam => try self.builtinTestcCodeparam(args, outs),
@@ -15301,6 +15432,7 @@ pub const Vm = struct {
         try self.setField(t, "_makecfunc", .{ .Builtin = .testc_makecfunc });
         try self.setField(t, "_allowhookyield", .{ .Builtin = .testc_allowhookyield });
         try self.setField(t, "totalmem", .{ .Builtin = .testc_totalmem });
+        try self.setField(t, "stats", .{ .Builtin = .testc_stats });
         try self.setField(t, "gcage", .{ .Builtin = .testc_gcage });
         try self.setField(t, "gccolor", .{ .Builtin = .testc_gccolor });
         try self.setField(t, "codeparam", .{ .Builtin = .testc_codeparam });
@@ -16015,6 +16147,7 @@ pub const Vm = struct {
 
     fn gcStep(self: *Vm, requested_kb: i64) DispatchError!bool {
         if (self.gc_busy) return false;
+        if (self.stats.enabled) self.stats.gc_steps_manual += 1; // P16.0b
 
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             try self.gcMinorCollection();
@@ -16966,6 +17099,7 @@ pub const Vm = struct {
 
     fn appendThreadWrapYield(self: *Vm, th: *Thread, values: []const Value) DispatchError!void {
         const copy = try self.alloc.alloc(Value, values.len);
+        if (self.stats.enabled) self.stats.yield_allocs += 1; // P16.0b
         for (values, 0..) |v, i| copy[i] = v;
         try th.wrap_yields.append(self.alloc, .{ .values = copy });
     }
@@ -16973,6 +17107,7 @@ pub const Vm = struct {
     fn setThreadResumeInbox(self: *Vm, th: *Thread, values: []const Value) DispatchError!void {
         if (th.resume_inbox) |old| self.alloc.free(old);
         const copy = try self.alloc.alloc(Value, values.len);
+        if (self.stats.enabled) self.stats.resume_allocs += 1; // P16.0b
         for (values, 0..) |v, i| copy[i] = v;
         th.resume_inbox = copy;
     }
@@ -17031,6 +17166,7 @@ pub const Vm = struct {
             (in_debug_hook and !self.activeDebugHookAllowsYield()))
             return self.fail("attempt to yield across a C-call boundary", .{});
         if (th.close_mode) return self.fail("attempt to yield across a C-call boundary", .{});
+        if (self.stats.enabled) self.stats.yields += 1; // P16.0b (yield committed)
         // A fresh yield supersedes previously captured continuation snapshots.
         th.capture_yield_id = th.next_yield_id;
         th.next_yield_id +%= 1;
@@ -17053,6 +17189,7 @@ pub const Vm = struct {
             try self.appendThreadWrapYield(th, args);
             if (th.yielded) |old| self.alloc.free(old);
             const ys = try self.alloc.alloc(Value, args.len);
+            if (self.stats.enabled) self.stats.yield_allocs += 1; // P16.0b
             for (args, 0..) |v, i| ys[i] = v;
             th.yielded = ys;
             self.last_builtin_out_count = args.len;
@@ -17060,6 +17197,7 @@ pub const Vm = struct {
         }
         if (th.yielded) |ys| self.alloc.free(ys);
         const ys = try self.alloc.alloc(Value, args.len);
+        if (self.stats.enabled) self.stats.yield_allocs += 1; // P16.0b
         for (args, 0..) |v, i| ys[i] = v;
         th.yielded = ys;
         if (self.active_builtin) |id| {
@@ -17070,6 +17208,7 @@ pub const Vm = struct {
             }
             if (self.active_builtin_args) |builtin_args| {
                 const copy = try self.alloc.alloc(Value, builtin_args.len);
+                if (self.stats.enabled) self.stats.yield_allocs += 1; // P16.0b
                 for (builtin_args, 0..) |v, i| copy[i] = v;
                 th.suspended_builtin_args = copy;
             }
@@ -17294,6 +17433,7 @@ pub const Vm = struct {
 
         th.status = .running;
         th.api_status = 0; // LUA_OK — running (PUC: L->status = 0 before resume)
+        if (self.stats.enabled) self.stats.resumes += 1; // P16.0b (resume committed)
         th.in_resume = true;
         th.resume_pop_consumed = false;
         th.resume_recursive_mode = false;
@@ -17354,6 +17494,7 @@ pub const Vm = struct {
         // frames. This is runtime call context, not replay re-execution state.
         if (!th.started and th.entry_args == null) {
             const saved = try self.alloc.alloc(Value, call_args.len);
+            if (self.stats.enabled) self.stats.resume_allocs += 1; // P16.0b
             for (call_args, 0..) |v, i| saved[i] = v;
             th.entry_args = saved;
         }
@@ -18458,6 +18599,7 @@ pub const Vm = struct {
     /// advanced even when the heap threshold has already been rescheduled.
     fn gcAutomaticStep(self: *Vm) DispatchError!void {
         if (self.gc_busy) return;
+        if (self.stats.enabled) self.stats.gc_steps_auto += 1; // P16.0b
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             if (!self.gc_finalizer_tick_pending and !self.gcAutoCycleDue()) return;
             try self.gcMinorCollection();
@@ -24197,6 +24339,20 @@ pub const Vm = struct {
     // PUC luaH_get: look up `key` without invoking any __index metamethod.
     // Returns Nil if absent (including a logically-deleted node with value Nil).
     fn rawGet(self: *Vm, tbl: *const Table, key: Value) Value {
+        // P16.0b: generic funnel counter. The .Num branch delegates to an
+        // inner rawGet with an .Int key (which counts itself); skip counting
+        // here for that case so integral-float lookups count exactly once.
+        // Pure computation — dead-code-eliminated when stats are disabled.
+        if (self.stats.enabled) {
+            const delegates: bool = switch (key) {
+                .Num => |n| std.math.isFinite(n) and
+                    n >= -9_223_372_036_854_775_808.0 and
+                    n < 9_223_372_036_854_775_808.0 and
+                    @floor(n) == n,
+                else => false,
+            };
+            if (!delegates) self.stats.tbl_get_generic += 1;
+        }
         switch (key) {
             .Int => |k| {
                 if (k >= 1) {
@@ -24240,6 +24396,19 @@ pub const Vm = struct {
     /// `luaH_newkey`). Setting val==.Nil deletes the entry (PUC: do not
     /// insert nils); deleting an absent key is a no-op.
     fn rawSet(self: *Vm, tbl: *Table, key: Value, val: Value) DispatchError!void {
+        // P16.0b: generic funnel counter. The .Num branch delegates to an
+        // inner rawSet with an .Int key (which counts itself); skip counting
+        // here for that case so integral-float stores count exactly once.
+        if (self.stats.enabled) {
+            const delegates: bool = switch (key) {
+                .Num => |n| std.math.isFinite(n) and
+                    n >= -9_223_372_036_854_775_808.0 and
+                    n < 9_223_372_036_854_775_808.0 and
+                    @floor(n) == n,
+                else => false,
+            };
+            if (!delegates) self.stats.tbl_set_generic += 1;
+        }
         try self.gcTableWriteBarrier(tbl, key, val);
         switch (key) {
             .Nil => return self.fail("table index is nil", .{}),
@@ -24270,6 +24439,7 @@ pub const Vm = struct {
 
         // Hash-part lookup: update existing node, or delete if val==.Nil.
         if (ltable.nodeLookup(tbl.hash, key, self.hash_seed)) |node| {
+            if (self.stats.enabled) self.stats.tbl_update += 1; // P16.0b (existing key)
             if (val == .Nil) {
                 // Logical delete: leave node in chain with value Nil (PUC).
                 _ = ltable.nodeDelete(tbl.hash, key, self.hash_seed);
@@ -24300,6 +24470,7 @@ pub const Vm = struct {
         // belongs in the array part (e.g. `t[1]=x` → asize=1 → array).
         if (tbl.hash.len != 0) {
             if (ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, key, val, self.hash_seed)) |_| {
+                if (self.stats.enabled) self.stats.tbl_insert += 1; // P16.0b
                 // P15.37c: new key inserted — invalidate metamethod cache.
                 // (PUC ltable.c:1112 calls invalidateTMcache after insertkey.)
                 tbl.flags &= ~TableFlags.MASK;
@@ -24331,6 +24502,7 @@ pub const Vm = struct {
         std.debug.assert(tbl.hash.len != 0);
         const inserted = ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, key, val, self.hash_seed);
         std.debug.assert(inserted != null);
+        if (self.stats.enabled) self.stats.tbl_insert += 1; // P16.0b (post-rehash insert)
         tbl.flags &= ~TableFlags.MASK;
     }
 
@@ -30969,6 +31141,7 @@ pub const Vm = struct {
     }
 
     fn callMetamethod(self: *Vm, mmv: Value, opname: []const u8, args: []const Value) DispatchError!Value {
+        if (self.stats.enabled) self.stats.calls_metamethod += 1; // P16.0b
         const saved_nwo = self.debug_namewhat_override;
         const saved_no = self.debug_name_override;
         self.debug_namewhat_override = "metamethod";
@@ -31709,6 +31882,7 @@ pub const Vm = struct {
         cf: *const fn (?*lua_State) callconv(.c) c_int,
         args: []const Value,
     ) DispatchError![]Value {
+        if (self.stats.enabled) self.stats.calls_c += 1; // P16.0b
         // Swap in a fresh C-API stack holding exactly the arguments.
         const saved_stack = self.cur_c_stack.*;
         self.cur_c_stack.* = .empty;
@@ -32681,6 +32855,95 @@ pub const Vm = struct {
             },
             else => return self.fail("T.totalmem expects integer limit or type name", .{}),
         }
+    }
+
+    /// P16.0b: T.stats() — read-only snapshot of the default-off runtime
+    /// counters (see VmStats). No side effects on VM state beyond allocating
+    /// the result table. Counters are 0 unless someone enabled them (the
+    /// CLI does so for the whole process via `--stats <out.json>`; enabling
+    /// mid-run is not exposed — `enabled` is set before execution starts).
+    ///
+    /// Returned shape (all values are integers):
+    ///   {
+    ///     instructions = N,                       -- total dispatched instrs
+    ///     op_histogram = { [opname] = count },    -- per-opcode histogram
+    ///     calls = { fast=, slow=, lua_frames=, builtin=, metamethod=, c= },
+    ///     tables = { get_fast_int=, get_fast_str=, get_generic=,
+    ///                set_fast_int=, set_fast_str=, set_generic=,
+    ///                insert=, update=, rehash= },
+    ///     allocs = { table=, closure=, thread=, string=, cell=, userdata=,
+    ///                bytes_total= },
+    ///     gc = { steps_auto=, steps_manual= },
+    ///     yield_resume = { yields=, resumes=, yield_allocs=, resume_allocs= },
+    ///   }
+    ///
+    /// Counter semantics (incl. the documented overlaps: calls_fast ⊂
+    /// calls_lua_frames; a builtin metamethod counts in both calls_builtin
+    /// and calls_metamethod; fast-path misses also enter the rawGet/rawSet
+    /// generic funnels) are documented on VmStats above.
+    fn builtinTestcStats(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        _ = args;
+        if (outs.len == 0) return;
+        const s = &self.stats;
+        // u64 → Lua Int (i64) with saturation; counters cannot realistically
+        // reach 2^63 but saturate rather than trap if they somehow do.
+        const statVal = struct {
+            fn f(x: u64) Value {
+                return .{ .Int = @intCast(@min(x, @as(u64, std.math.maxInt(i64)))) };
+            }
+        }.f;
+
+        const root = try self.allocTable();
+        try self.setField(root, "instructions", statVal(s.instructions_total));
+
+        const ops = try self.allocTable();
+        inline for (@typeInfo(bc.Op).@"enum".fields) |f| {
+            try self.setField(ops, f.name, statVal(s.instructions_by_op[f.value]));
+        }
+        try self.setField(root, "op_histogram", .{ .Table = ops });
+
+        const calls = try self.allocTable();
+        try self.setField(calls, "fast", statVal(s.calls_fast));
+        try self.setField(calls, "slow", statVal(s.calls_slow));
+        try self.setField(calls, "lua_frames", statVal(s.calls_lua_frames));
+        try self.setField(calls, "builtin", statVal(s.calls_builtin));
+        try self.setField(calls, "metamethod", statVal(s.calls_metamethod));
+        try self.setField(calls, "c", statVal(s.calls_c));
+        try self.setField(root, "calls", .{ .Table = calls });
+
+        const tables = try self.allocTable();
+        try self.setField(tables, "get_fast_int", statVal(s.tbl_get_fast_int));
+        try self.setField(tables, "get_fast_str", statVal(s.tbl_get_fast_str));
+        try self.setField(tables, "get_generic", statVal(s.tbl_get_generic));
+        try self.setField(tables, "set_fast_int", statVal(s.tbl_set_fast_int));
+        try self.setField(tables, "set_fast_str", statVal(s.tbl_set_fast_str));
+        try self.setField(tables, "set_generic", statVal(s.tbl_set_generic));
+        try self.setField(tables, "insert", statVal(s.tbl_insert));
+        try self.setField(tables, "update", statVal(s.tbl_update));
+        try self.setField(tables, "rehash", statVal(s.tbl_rehash));
+        try self.setField(root, "tables", .{ .Table = tables });
+
+        const allocs = try self.allocTable();
+        inline for (@typeInfo(GcObject).@"union".fields, 0..) |f, i| {
+            try self.setField(allocs, f.name, statVal(s.alloc_by_type[i]));
+        }
+        try self.setField(allocs, "bytes_total", statVal(s.alloc_bytes_total));
+        try self.setField(root, "allocs", .{ .Table = allocs });
+
+        const gc = try self.allocTable();
+        try self.setField(gc, "steps_auto", statVal(s.gc_steps_auto));
+        try self.setField(gc, "steps_manual", statVal(s.gc_steps_manual));
+        try self.setField(root, "gc", .{ .Table = gc });
+
+        const yr = try self.allocTable();
+        try self.setField(yr, "yields", statVal(s.yields));
+        try self.setField(yr, "resumes", statVal(s.resumes));
+        try self.setField(yr, "yield_allocs", statVal(s.yield_allocs));
+        try self.setField(yr, "resume_allocs", statVal(s.resume_allocs));
+        try self.setField(root, "yield_resume", .{ .Table = yr });
+
+        outs[0] = .{ .Table = root };
+        self.last_builtin_out_count = 1;
     }
 
     fn gcAgeName(age: GcAge) []const u8 {
@@ -35915,6 +36178,7 @@ pub const Vm = struct {
             .testc_makecfunc => 1,
             .testc_allowhookyield => 0,
             .testc_totalmem => 3,
+            .testc_stats => 1,
             .testc_querytab => 3,
             .testc_gcstate => 1,
             .loadfile, .load => 2,

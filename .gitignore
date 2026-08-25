@@ -36,3 +36,7 @@ tests/smoke/zig-libs/
 
 # Stray tool marker
 .codex
+
+# perf record data + rendered reports (tools/perf_profile.py artifacts,
+# reproducible from the script; only the script + counters JSON are committed)
+tools/perf/profiles/

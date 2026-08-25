@@ -2,8 +2,17 @@
 -- Each workload is a tight loop isolating one VM subsystem.
 -- Usage: luazig --vm=bc tools/microbench.lua [label]
 -- Prints: label\telapsed_seconds
+--
+-- Workload selector: passing a label as the first script argument runs ONLY
+-- that workload (script args arrive as `...` — identical on luazig and PUC
+-- lua). Without an argument all 16 workloads run (backward compatible).
+-- Used by tools/perf_compare.py --counters and tools/perf_profile.py to keep
+-- per-workload perf-stat/perf-record sessions short.
+
+local only = ...
 
 local function bench(label, n, fn)
+    if only and label ~= only then return end
     -- Warmup
     fn(math.max(1, math.floor(n / 100)))
     local start = os.clock()

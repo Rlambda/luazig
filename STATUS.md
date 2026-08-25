@@ -1,4 +1,4 @@
-> Last updated: 2026-08-25 (P16.0a: generated status summary — one source of truth for parity/perf numbers)
+> Last updated: 2026-08-25 (P16.0c: per-workload hardware counters + perf record profiling pipeline)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -2411,6 +2411,68 @@ ReleaseFast exit 0; make -C tests/c_api test 17/17 exit 0; test-diff
 DIFF: PASS (6 suites, unchanged); coroutine.lua --testc exit 0
 (ulimit -v 2000000, timeout 30); smoke 54/54 exit 0; matrix zig_fail=0
 (big.lua both_fail, pre-existing infra).
+
+### P16.0c — per-workload hardware counters + perf record profiling pipeline
+
+P16.0-B1/B3: два perf-инструмента для per-workload анализа (снимок
+`tools/perf/counters-2026-08-25.json` закоммичен как вход для следующей фазы).
+
+**1. Селектор workload'ов** (`tools/microbench.lua`): первый script-arg
+(`...`) запускает только один workload — идентично на luazig и PUC
+(script args = PUC argv-семантика). Без аргумента — все 16 (обратная
+совместимость; timing lane не изменена).
+
+**2. `tools/perf_compare.py --counters`** (B1): режим per-workload hardware
+counters, медиана `--counters-runs N` (default 3), pinned core:
+`taskset -c CORE perf stat -j -e cycles:u,instructions:u,branches:u,
+branch-misses:u,cache-misses:u,cache-references:u BIN microbench.lua WL`.
+Парсер `-j` JSON-lines нормализует event-имена (`cpu_core/cycles/u` →
+`cycles`), отбрасывает `<not counted>` и cpu_atom-строки (hybrid CPU: run
+пинится к P-core). IPC / branch-miss% / cache-miss% на workload×binary.
+Max-RSS + CPU-time — через промежуточный `python3 -c`: свежий процесс с
+ровно одним child (taskset exec → bench), поэтому его
+`getrusage(RUSAGE_CHILDREN)` точен (ru_maxrss родителя — MAX по всем
+children, для per-workload непригоден; паттерн задокументирован в
+`_RSS_HELPER`). Инструкция-инфляция — прокси `instrX = zig
+--stats instructions_total / puc perf instructions:u`; caveat: PUC-счётчик
+включает C-runtime, не только интерпретацию байткода. Тайминговая lane
+(median-of-7 + baseline gate) не изменена; `--json-out` пишет всё.
+
+**3. `tools/perf_profile.py`** (B3): `perf record --call-graph lbr -e
+cycles:u` на 7 дефолтных workload'ах × {zig,puc} + два `perf report --stdio`
+(--no-children ≥1%: default-sort и `--sort symbol`) + `index.json` в
+`tools/perf/profiles/<UTC-date>/`. Профили-артефакты (`*.perf`, отчёты,
+index) в .gitignore — воспроизводимы из скрипта; коммитится только .py.
+
+**Снимок counters-2026-08-25 (headline, полный JSON — в файле):**
+- IPC zig 2.10–5.77 vs puc 2.97–5.32: zig не IPC-bound (кроме
+  string_concat 2.10 и hash_access 2.99) — узкие места вне pipelining.
+- **RSS-разрыв в alloc-heavy**: temp_table_alloc 88MB, string_concat 103MB,
+  string_loop 101MB, dynamic_load 71MB, metamethod_add 75MB — против ровно
+  ~15.6MB у PUC на ВСЕХ workload'ах. GC luazig не удерживает peak (пейсинг
+  steps_auto не режет пик при высокой скорости аллокации таблиц/строк).
+- hash_access: zig cache-miss 11.8% vs puc 50.7% (Node 32B окупается), но
+  zig всё равно 3.74x медленнее → остаток — dispatch, не memory.
+- coroutine_yield: puc branch-miss 1.62% vs zig 0.01% — медленность zig
+  не в mispredict'ах; профиль показывает `compiler_rt.memset` 13.9%.
+- lua_calls профиль: ~39% времени вне dispatch в call-frame machinery
+  (complete/pushBytecodeExecFrame + setPendingCall +
+  applyBytecodePendingResults ≈ 39%) — подтверждает bottleneck №5.
+- temp_table_alloc профиль: Wyhash.final 13.1% + string-intern getIndex
+  5.3% (хэширование строк при NEWTABLE/SETLIST) + SmpAllocator 22.6%.
+- field_access профиль: rawSet 30.2% вне dispatch — generic set path тяжёл.
+- instrX (прокси, см. caveat): 0.003–0.05x — native/PUC инструкции на
+  Lua-итерацию на порядок больше VM-опкодов, абсолютные значения между
+  движками напрямую не сравнимы, полезно только в динамике.
+
+**Gates (all green):** zig build ReleaseFast + `zig build test` exit 0;
+make -C tests/c_api test ALL PASS (17); test-diff DIFF: PASS;
+coroutine.lua --testc exit 0 (ulimit -v 2000000, timeout 30); smoke 54/54;
+matrix zig_fail=0 (big.lua both_fail, pre-existing); perf_compare --runs 7:
+geomean 2.69x, RESULT: OK (no regressions). (Примечание: make-цель `zig`
+пинится к устаревшему `tools/zig-bin` без `std.Io.File` — pre-existing
+env-расхождение с системным zig; smoke запущен напрямую
+`tools/smoke_compare.py`.)
 
 ### P16.0b — default-off Vm runtime counters (--stats JSON + T.stats)
 

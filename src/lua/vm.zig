@@ -1107,11 +1107,9 @@ const PendingCallSlot = struct {
 /// - `proto` made optional (was non-optional in BytecodeExecFrame)
 ///
 /// Removed: `runtime_frame_index` (no longer needed — single array).
-
 /// Removed: `bc_dummy_func_global` — the placeholder function that
 /// existed only because `Closure.func`/`CallFrame.func` needed a value.
 /// All closures now carry a bytecode `proto`; the old `func` field is gone.
-
 /// PUC `CIST_NRESULTS` (`lstate.h:223`): low 8 bits of callstatus encode
 /// `nresults + 1`. MULTRET (`LUA_MULTRET = -1`) encodes as `0`.
 /// `MAXRESULTS = 250` fits (`251 <= 255`).
@@ -1121,10 +1119,10 @@ const MAXRESULTS: i32 = 250;
 /// PUC callstatus flag bits (`lstate.h:222-254`).
 /// Low 8 bits are CIST_NRESULTS (nresults+1). Upper bits are flags.
 /// Bits 8-11: CIST_CCMT — __call metamethod count.
-const CIST_CCMT: u32 = 8;  // shift count, not mask
+const CIST_CCMT: u32 = 8; // shift count, not mask
 const MAX_CCMT: u32 = 0xf << CIST_CCMT;
 /// Bits 12-14: CIST_RECST — recover status (error during pcallk).
-const CIST_RECST: u32 = 12;  // shift count
+const CIST_RECST: u32 = 12; // shift count
 /// Bit 15: CIST_C — C function frame (discriminator).
 const CIST_C: u32 = 1 << 15;
 /// Bit 16: CIST_FRESH — fresh luaV_execute frame.
@@ -1388,7 +1386,6 @@ pub const CallFrame = struct {
     }
 
     /// P15.51i: callstatus flag accessors (PUC CIST_* bits).
-
     /// CIST_C discriminator: distinguishes C function frames from Lua
     /// bytecode frames. Mirrors PUC `CIST_C` (`lstate.h:223`).
     pub fn isLua(fr: CallFrame) bool {
@@ -2332,10 +2329,30 @@ const TmsEvent = enum(u5) {
     len = 4, // __len
     eq = 5, // __eq — last "fast" (cached) event
     // Non-cached events follow (not stored in flags bitfield):
-    add, sub, mul, mod, pow, div, idiv,
-    band, bor, bxor, shl, shr,
-    unm, bnot, lt, le, concat,
-    call, iter, close, tostring, name, pairs, metatable,
+    add,
+    sub,
+    mul,
+    mod,
+    pow,
+    div,
+    idiv,
+    band,
+    bor,
+    bxor,
+    shl,
+    shr,
+    unm,
+    bnot,
+    lt,
+    le,
+    concat,
+    call,
+    iter,
+    close,
+    tostring,
+    name,
+    pairs,
+    metatable,
 };
 
 /// Maximum event index cached in `Table.flags`. Matches PUC's
@@ -2481,7 +2498,6 @@ fn makeRandomSeed() u64 {
     // Mix time and address like PUC's addbuff + XOR fold.
     return @as(u64, @bitCast(t)) ^ (addr +% 0x9e3779b97f4a7c15);
 }
-
 
 pub const Vm = struct {
     const Frame = CallFrame;
@@ -3061,6 +3077,19 @@ pub const Vm = struct {
     builtin_outs_base: usize = 0,
     builtin_outs_len: usize = 0,
     builtin_outs_on_bc_stack: bool = false,
+    /// P15.83r: set by the OP_CALL/OP_TAILCALL/OP_TFORCALL dispatch sites when
+    /// they pre-pushed the builtin's C-frame so the CALL hook could fire on
+    /// the C activation (PUC precallC ordering). callBuiltin consumes (clears)
+    /// it at entry and REUSES that frame instead of pushing its own — exactly
+    /// one frame per builtin invocation, whoever pushed it. The diverting
+    /// fast-path branches (pairs/pcall/coroutine-switch/gsub) pop the
+    /// pre-pushed frame themselves before installing their continuations,
+    /// because the iterative completion machinery requires the callee body
+    /// frame to sit directly above its pending-call owner (see the
+    /// `parent.isC()` return routing in runBytecodeInternal's frame-return
+    /// path — a plain builtin C-frame there has no continuation k and would
+    /// be misrouted to finishCcall).
+    builtin_cframe_pre_pushed: bool = false,
     debug_transfer_values: ?[]const Value = null,
     debug_transfer_start: i64 = 1,
     debug_hook_event_calllike: bool = false,
@@ -3502,7 +3531,19 @@ pub const Vm = struct {
                 // caller's registers (entry chunks, pcall bodies pushed at
                 // bc_stack_top) carry an out-of-range offset — PUC's
                 // equivalent (a C-function caller) yields no name.
-                const off = frame.u.lua.func_slot_base - parent.base;
+                //
+                // P15.83r: C frames (builtin/C-closure callees) are pushed at
+                // bc_stack_top, so `u.lua.func_slot_base` is NOT valid (union
+                // member mismatch — the frame is `.c`). PUC instead places
+                // ci->func at the caller's stack slot holding the callee and
+                // funcnamefromcode reads the call instruction's A operand
+                // directly (ldebug.c:615 funcnamefromcode OP_CALL branch).
+                // Mirror that: for C frames take the operand register from
+                // the instruction itself.
+                const off: usize = if (frame.isC())
+                    inst.a
+                else
+                    frame.u.lua.func_slot_base - parent.base;
                 if (off >= proto.maxstacksize) return null;
                 const dn = debugBytecodeOperandName(proto, pc, @intCast(off));
                 if (dn.name) |nm| return .{ .namewhat = dn.namewhat, .name = nm };
@@ -5914,6 +5955,44 @@ pub const Vm = struct {
         );
     }
 
+    /// Fire the CALL hook for a C-function activation whose CallFrame has
+    /// just been pushed (PUC ldo.c:642-656 precallC): the C CallInfo is
+    /// created FIRST (prepCallInfo ... | CIST_C), then
+    /// `luaD_hook(L, LUA_HOOKCALL, -1, 1, narg)` fires with ar.i_ci = that
+    /// frame. Differences from the Lua-callee helper above, all mirroring
+    /// precallC vs luaD_hookcall:
+    ///   - ntransfer is the ACTUAL argument count narg (precallC), not the
+    ///     fixed numparams (luaD_hookcall);
+    ///   - no savedpc bump — C frames have no bytecode pc;
+    ///   - the event is always plain "call": PUC routes tail calls to C
+    ///     through luaD_pretailcall → precallC, which pushes a FRESH ci
+    ///     without CIST_TAIL (never a "tail call" event).
+    ///
+    /// `cframe_idx` is the just-pushed C-frame's index in call_frames;
+    /// `args` the callee's arguments (the transfer values, ftransfer=1).
+    fn dispatchCCalleeActivationHook(
+        self: *Vm,
+        cframe_idx: usize,
+        callee: Value,
+        args: []const Value,
+    ) DispatchError!void {
+        // Same guards as the dispatch fast path (PUC checks hookmask and
+        // allowhook in luaD_hook before doing any work).
+        if (!self.hooks_active_cached) return;
+        if (self.debug_hooks_suppressed != 0) return;
+        if (self.isInDebugHook()) return;
+        const hook_state = self.activeHookState();
+        if (!hook_state.has_call) return;
+        try self.debugDispatchHookWithCalleeTransfer(
+            "call",
+            null,
+            callee,
+            args,
+            1,
+            cframe_idx,
+        );
+    }
+
     fn saveBytecodeProtectedError(self: *Vm) BytecodeSavedError {
         const th = self.activeBytecodeThread();
         var saved: BytecodeSavedError = .{
@@ -6302,12 +6381,14 @@ pub const Vm = struct {
             .concat => |cont| self.alloc.free(cont.values),
             .gsub => |cont| {
                 const state = cont;
-                self.deinitBytecodeGsub(state); self.alloc.destroy(state);
+                self.deinitBytecodeGsub(state);
+                self.alloc.destroy(state);
             },
             .close => |cont| {
                 const state = cont;
                 self.releaseBytecodeCloseChild(state);
-                self.freeBytecodeClosePost(state.post); self.alloc.destroy(state);
+                self.freeBytecodeClosePost(state.post);
+                self.alloc.destroy(state);
             },
             .hook => |cont| {
                 if (owner_runtime) |runtime| {
@@ -6315,7 +6396,8 @@ pub const Vm = struct {
                     runtime.setTailCallBool(cont.saved_parent_tailcall);
                 }
                 self.alloc.free(cont.transfer);
-                self.freeBytecodeHookPost(cont.post); self.alloc.destroy(cont);
+                self.freeBytecodeHookPost(cont.post);
+                self.alloc.destroy(cont);
             },
             .coroutine_resume => |cont| self.discardBytecodeSavedError(cont.saved_error),
             else => {},
@@ -7450,6 +7532,41 @@ pub const Vm = struct {
             .return_frame => |values| {
                 return try self.completeBytecodeExecFrame(exec_frames, boundary_depth, values);
             },
+        }
+    }
+
+    /// P15.83r: builtins whose OP_CALL/OP_TAILCALL dispatch may be REPLACED by
+    /// the iterative fast paths (tryPushBytecodePairsMetamethod,
+    /// tryPushBytecodeProtectedCall, tryRequestBytecodeCoroutineSwitch,
+    /// tryStartBytecodeGsub) before callBuiltin ever runs. These keep the
+    /// legacy caller-frame CALL identity because the fast-path completion
+    /// machinery requires the callee body frame to sit directly above its
+    /// pending-call owner (a plain builtin C-frame in between would be
+    /// misrouted by the `parent.isC()` return routing in
+    /// completeBytecodeExecFrame).
+    ///
+    /// `pairs` is the one exactly-predictable case: the metamethod fast path
+    /// applies iff the first argument is a table with a BYTECODE __pairs
+    /// metamethod (tryPushBytecodePairsMetamethod's own conditions), so a
+    /// plain-table `pairs(t)` gets the full PUC precallC identity.
+    ///
+    /// The rest are conservative by id only: a false "divert" (e.g. pcall
+    /// with a C target) merely keeps the caller-frame identity for that
+    /// invocation; it can never duplicate or lose an event.
+    fn builtinCallMayDivert(self: *Vm, id: BuiltinId, args: []const Value) bool {
+        switch (id) {
+            .pairs => {
+                if (args.len == 0 or args[0] != .Table) return false;
+                const mm = self.metamethodValue(args[0], "__pairs") orelse return false;
+                return mm == .Closure and mm.Closure.proto != null;
+            },
+            .pcall,
+            .xpcall,
+            .string_gsub,
+            .coroutine_resume,
+            .coroutine_wrap_iter,
+            => return true,
+            else => return false,
         }
     }
 
@@ -8605,167 +8722,166 @@ pub const Vm = struct {
 
                 if (!have_step) {
                     const closure: *Closure = if (first_run) initial_closure else blk: {
-                    if (active.callee != .Closure or active.callee.Closure.proto == null)
-                        return self.fail("coroutine.resume: bad thread", .{});
-                    break :blk active.callee.Closure;
-                };
-                const args = if (first_run) initial_args else active.entry_args orelse &[_]Value{};
-                first_run = false;
-
-                const ret_opt: ?[]Value = retblk: {
-                    const values = self.runClosure(closure, args) catch |run_err| switch (run_err) {
-                        error.ThreadSwitch => {
-                            const request = self.bytecode_coroutine_switch_request orelse unreachable;
-                            self.bytecode_coroutine_switch_request = null;
-                            // PUC-faithful C-stack-overflow check: the only
-                            // limit is the resume-chain depth (analogous to
-                            // LUAI_MAXCCALLS).  Each coroutine switch adds 1
-                            // to the chain, matching PUC's lua_resume which
-                            // does getCcalls(from)+1 per nesting level.
-                            if (coroutine_resume_chain >= luai_maxccalls)
-                            {
-                                self.alloc.free(request.args);
-                                request.target.caller = request.caller;
-                                active = request.target;
-                                coroutine_resume_chain += 1;
-                                step = .{ .failed = .{ .String = try self.internStr("C stack overflow") } };
-                                break :retblk null;
-                            }
-                            const first_start = try self.prepareBytecodeCoroutineSwitch(request);
-                            coroutine_resume_chain += 1;
-                            active = request.target;
-                            needs_call_hook = first_start and !self.isInDebugHook();
-                            first_run = false;
-                            continue :drive;
-                        },
-                        error.Yield => {
-                            step = try self.bytecodeCoroutineYieldStep(active, active == initial);
-                            break :retblk null;
-                        },
-                        error.RuntimeError => {
-                            // PUC precover (ldo.c:955-963): find the innermost
-                            // CIST_YPCALL frame for error recovery. If found,
-                            // save the error status, pop frames above it, and
-                            // continue the drive loop — the C-frame on top will
-                            // be handled by finishCcall → finishpcallk → k.
-                            if (self.precover(active)) {
-                                // Recovered: continue the drive loop. The
-                                // C-frame with CIST_YPCALL is on top;
-                                // finishCcall will handle it.
-                                continue :drive;
-                            }
-                            // Not recovered: unrecoverable error
-                            if (active.yielded != null and active.capture_yield_id != 0) {
-                                step = try self.bytecodeCoroutineYieldStep(active, active == initial);
-                            } else if (self.forced_close_thread == active and active.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
-                                step = .forced_close;
-                            } else {
-                                step = .{ .failed = try self.currentRuntimeErrorValue() };
-                            }
-                            break :retblk null;
-                        },
-                        error.OutOfMemory => return error.OutOfMemory,
+                        if (active.callee != .Closure or active.callee.Closure.proto == null)
+                            return self.fail("coroutine.resume: bad thread", .{});
+                        break :blk active.callee.Closure;
                     };
-                    break :retblk values;
-                };
-                post_runclosure: {
-                    if (ret_opt) |values| {
-                        // P15.78 Task 13: After runClosure returns (resuming a
-                        // callee that yielded via callk/pcallk), check if a C-frame
-                        // is now on top. If so, the callee's return values go to
-                        // resume_inbox, and finishCcall → testcContShim runs the
-                        // continuation. This mirrors PUC's `unroll` which, after
-                        // resuming a Lua frame that returns, checks if the next
-                        // frame is C and calls finishCcall.
-                        if (active.call_frames.len() > 0) {
-                            const top_fr = active.call_frames.getConstPtr(active.call_frames.len() - 1);
-                            if (top_fr.isC()) {
-                                // Put callee's return values in resume_inbox.
-                                try self.setThreadResumeInbox(active, values);
-                                self.alloc.free(values);
+                    const args = if (first_run) initial_args else active.entry_args orelse &[_]Value{};
+                    first_run = false;
 
-                                // P15.78: Clear bytecode_inplace_suspended before
-                                // calling finishCcall, because testcContShim may
-                                // call runTestcCloseMetamethod → runClosure →
-                                // runBytecodeInternal. If bytecode_inplace_suspended
-                                // is true, runBytecodeInternal would try resume_in_place
-                                // instead of pushing a new Lua frame for the __close
-                                // metamethod, causing a crash or silent skip.
-                                // NOTE: Do NOT save/restore bytecode_inplace_suspended
-                                // here. If finishCcall yields, parkDirectBytecodeYield
-                                // (called from within finishCcall → testcContShim →
-                                // runBytecodeInternal) sets bytecode_inplace_suspended
-                                // = true for the __close frame. Restoring the old
-                                // value (false) would break resume_in_place on the
-                                // next resume, causing runBytecodeInternal to push a
-                                // new Lua wrapper frame instead of resuming the
-                                // __close frame.
-                                active.bytecode_inplace_suspended = false;
-
-                                const fc_result = self.finishCcall(active) catch |e| switch (e) {
-                                    error.Yield => {
-                                        step = try self.bytecodeCoroutineYieldStep(active, active == initial);
-                                        have_step = true;
-                                        break :post_runclosure;
-                                    },
-                                    error.ThreadSwitch => {
-                                        const request = self.bytecode_coroutine_switch_request orelse return @as(DispatchError, e);
-                                        self.bytecode_coroutine_switch_request = null;
-                                        if (coroutine_resume_chain >= luai_maxccalls) {
-                                            self.alloc.free(request.args);
-                                            request.target.caller = request.caller;
-                                            active = request.target;
-                                            coroutine_resume_chain += 1;
-                                            step = .{ .failed = .{ .String = try self.internStr("C stack overflow") } };
-                                            have_step = true;
-                                            continue :drive;
-                                        }
-                                        const first_start = try self.prepareBytecodeCoroutineSwitch(request);
-                                        coroutine_resume_chain += 1;
-                                        active = request.target;
-                                        needs_call_hook = first_start and !self.isInDebugHook();
-                                        first_run = false;
-                                        continue :drive;
-                                    },
-                                    error.RuntimeError => {
-                                        // PUC precover: find the innermost
-                                        // CIST_YPCALL frame for error recovery.
-                                        if (self.precover(active)) {
-                                            continue :drive;
-                                        }
-                                        // Not recovered: unrecoverable error
-                                        step = .{ .failed = try self.currentRuntimeErrorValue() };
-                                        have_step = true;
-                                        break :post_runclosure;
-                                    },
-                                    else => return @as(DispatchError, e),
-                                };
-                                try self.poscallCFrame(active, fc_result);
-
-                                // Set up for resuming the Lua frame below.
-                                if (active.call_frames.len() > 0) {
-                                    const below = active.call_frames.getConstPtr(active.call_frames.len() - 1);
-                                    if (!below.isC()) {
-                                        active.bytecode_inplace_suspended = true;
-                                        active.bytecode_resume_boundary = active.call_frames.len() - 1;
-                                    }
-                                } else {
-                                    // P15.78: No more frames — coroutine is
-                                    // complete. Results are in resume_inbox.
-                                    const ri = active.resume_inbox orelse &[_]Value{};
-                                    const results = try self.alloc.alloc(Value, ri.len);
-                                    for (ri, 0..) |v, i| results[i] = v;
-                                    if (active.resume_inbox) |old| self.alloc.free(old);
-                                    active.resume_inbox = null;
-                                    step = .{ .returned = results };
-                                    have_step = true;
+                    const ret_opt: ?[]Value = retblk: {
+                        const values = self.runClosure(closure, args) catch |run_err| switch (run_err) {
+                            error.ThreadSwitch => {
+                                const request = self.bytecode_coroutine_switch_request orelse unreachable;
+                                self.bytecode_coroutine_switch_request = null;
+                                // PUC-faithful C-stack-overflow check: the only
+                                // limit is the resume-chain depth (analogous to
+                                // LUAI_MAXCCALLS).  Each coroutine switch adds 1
+                                // to the chain, matching PUC's lua_resume which
+                                // does getCcalls(from)+1 per nesting level.
+                                if (coroutine_resume_chain >= luai_maxccalls) {
+                                    self.alloc.free(request.args);
+                                    request.target.caller = request.caller;
+                                    active = request.target;
+                                    coroutine_resume_chain += 1;
+                                    step = .{ .failed = .{ .String = try self.internStr("C stack overflow") } };
+                                    break :retblk null;
                                 }
+                                const first_start = try self.prepareBytecodeCoroutineSwitch(request);
+                                coroutine_resume_chain += 1;
+                                active = request.target;
+                                needs_call_hook = first_start and !self.isInDebugHook();
+                                first_run = false;
                                 continue :drive;
+                            },
+                            error.Yield => {
+                                step = try self.bytecodeCoroutineYieldStep(active, active == initial);
+                                break :retblk null;
+                            },
+                            error.RuntimeError => {
+                                // PUC precover (ldo.c:955-963): find the innermost
+                                // CIST_YPCALL frame for error recovery. If found,
+                                // save the error status, pop frames above it, and
+                                // continue the drive loop — the C-frame on top will
+                                // be handled by finishCcall → finishpcallk → k.
+                                if (self.precover(active)) {
+                                    // Recovered: continue the drive loop. The
+                                    // C-frame with CIST_YPCALL is on top;
+                                    // finishCcall will handle it.
+                                    continue :drive;
+                                }
+                                // Not recovered: unrecoverable error
+                                if (active.yielded != null and active.capture_yield_id != 0) {
+                                    step = try self.bytecodeCoroutineYieldStep(active, active == initial);
+                                } else if (self.forced_close_thread == active and active.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
+                                    step = .forced_close;
+                                } else {
+                                    step = .{ .failed = try self.currentRuntimeErrorValue() };
+                                }
+                                break :retblk null;
+                            },
+                            error.OutOfMemory => return error.OutOfMemory,
+                        };
+                        break :retblk values;
+                    };
+                    post_runclosure: {
+                        if (ret_opt) |values| {
+                            // P15.78 Task 13: After runClosure returns (resuming a
+                            // callee that yielded via callk/pcallk), check if a C-frame
+                            // is now on top. If so, the callee's return values go to
+                            // resume_inbox, and finishCcall → testcContShim runs the
+                            // continuation. This mirrors PUC's `unroll` which, after
+                            // resuming a Lua frame that returns, checks if the next
+                            // frame is C and calls finishCcall.
+                            if (active.call_frames.len() > 0) {
+                                const top_fr = active.call_frames.getConstPtr(active.call_frames.len() - 1);
+                                if (top_fr.isC()) {
+                                    // Put callee's return values in resume_inbox.
+                                    try self.setThreadResumeInbox(active, values);
+                                    self.alloc.free(values);
+
+                                    // P15.78: Clear bytecode_inplace_suspended before
+                                    // calling finishCcall, because testcContShim may
+                                    // call runTestcCloseMetamethod → runClosure →
+                                    // runBytecodeInternal. If bytecode_inplace_suspended
+                                    // is true, runBytecodeInternal would try resume_in_place
+                                    // instead of pushing a new Lua frame for the __close
+                                    // metamethod, causing a crash or silent skip.
+                                    // NOTE: Do NOT save/restore bytecode_inplace_suspended
+                                    // here. If finishCcall yields, parkDirectBytecodeYield
+                                    // (called from within finishCcall → testcContShim →
+                                    // runBytecodeInternal) sets bytecode_inplace_suspended
+                                    // = true for the __close frame. Restoring the old
+                                    // value (false) would break resume_in_place on the
+                                    // next resume, causing runBytecodeInternal to push a
+                                    // new Lua wrapper frame instead of resuming the
+                                    // __close frame.
+                                    active.bytecode_inplace_suspended = false;
+
+                                    const fc_result = self.finishCcall(active) catch |e| switch (e) {
+                                        error.Yield => {
+                                            step = try self.bytecodeCoroutineYieldStep(active, active == initial);
+                                            have_step = true;
+                                            break :post_runclosure;
+                                        },
+                                        error.ThreadSwitch => {
+                                            const request = self.bytecode_coroutine_switch_request orelse return @as(DispatchError, e);
+                                            self.bytecode_coroutine_switch_request = null;
+                                            if (coroutine_resume_chain >= luai_maxccalls) {
+                                                self.alloc.free(request.args);
+                                                request.target.caller = request.caller;
+                                                active = request.target;
+                                                coroutine_resume_chain += 1;
+                                                step = .{ .failed = .{ .String = try self.internStr("C stack overflow") } };
+                                                have_step = true;
+                                                continue :drive;
+                                            }
+                                            const first_start = try self.prepareBytecodeCoroutineSwitch(request);
+                                            coroutine_resume_chain += 1;
+                                            active = request.target;
+                                            needs_call_hook = first_start and !self.isInDebugHook();
+                                            first_run = false;
+                                            continue :drive;
+                                        },
+                                        error.RuntimeError => {
+                                            // PUC precover: find the innermost
+                                            // CIST_YPCALL frame for error recovery.
+                                            if (self.precover(active)) {
+                                                continue :drive;
+                                            }
+                                            // Not recovered: unrecoverable error
+                                            step = .{ .failed = try self.currentRuntimeErrorValue() };
+                                            have_step = true;
+                                            break :post_runclosure;
+                                        },
+                                        else => return @as(DispatchError, e),
+                                    };
+                                    try self.poscallCFrame(active, fc_result);
+
+                                    // Set up for resuming the Lua frame below.
+                                    if (active.call_frames.len() > 0) {
+                                        const below = active.call_frames.getConstPtr(active.call_frames.len() - 1);
+                                        if (!below.isC()) {
+                                            active.bytecode_inplace_suspended = true;
+                                            active.bytecode_resume_boundary = active.call_frames.len() - 1;
+                                        }
+                                    } else {
+                                        // P15.78: No more frames — coroutine is
+                                        // complete. Results are in resume_inbox.
+                                        const ri = active.resume_inbox orelse &[_]Value{};
+                                        const results = try self.alloc.alloc(Value, ri.len);
+                                        for (ri, 0..) |v, i| results[i] = v;
+                                        if (active.resume_inbox) |old| self.alloc.free(old);
+                                        active.resume_inbox = null;
+                                        step = .{ .returned = results };
+                                        have_step = true;
+                                    }
+                                    continue :drive;
+                                }
                             }
+                            step = .{ .returned = values };
                         }
-                        step = .{ .returned = values };
                     }
-                }
                 }
             }
 
@@ -8810,7 +8926,8 @@ pub const Vm = struct {
                             const call_values = try self.wrapBytecodeCoroutineValues(cont.kind, false, one);
                             applied = self.completeBytecodeCoroutineResult(exec_frames, parent_index, call_values, cont);
                         } else {
-                            self.discardBytecodeSavedError(cont.saved_error); self.alloc.destroy(cont);
+                            self.discardBytecodeSavedError(cont.saved_error);
+                            self.alloc.destroy(cont);
                             self.clearPendingCall(exec_frames.getPtr(parent_index));
                             self.restoreRuntimeErrorValue(error_value);
                             applied = error.RuntimeError;
@@ -9565,9 +9682,9 @@ pub const Vm = struct {
         //                                                  ^ new ci->func
         // Extra args stay at their original positions and become hidden varargs
         // at [new_func - nextra .. new_func].
-                const nargs = args.len;
-                const func_slot: usize = if (is_vahid) func_slot_in + nargs + 1 else func_slot_in;
-                const base = func_slot + 1;
+        const nargs = args.len;
+        const func_slot: usize = if (is_vahid) func_slot_in + nargs + 1 else func_slot_in;
+        const base = func_slot + 1;
 
         if (is_vahid) {
             // Ensure space for the shifted func+params + frame_cap.
@@ -10081,7 +10198,8 @@ pub const Vm = struct {
         const boundary_depth: usize = if (resume_in_place)
             exec_thread.bytecode_resume_boundary
         else
-            exec_frames.len();        if (resume_in_place) {
+            exec_frames.len();
+        if (resume_in_place) {
             exec_thread.bytecode_inplace_suspended = false;
         } else {
             try self.pushBytecodeExecFrame(exec_frames, proto_in, args, effective_callee, self.bc_stack_top, -1);
@@ -10280,7 +10398,8 @@ pub const Vm = struct {
         cur_proto: *const bc.Proto,
         cur_upvalues: []const *Cell,
         base: usize,
-        frame_cap: u32,        regs: []Value,
+        frame_cap: u32,
+        regs: []Value,
         boxed: []?*Cell,
         pc: usize,
     };
@@ -10384,7 +10503,7 @@ pub const Vm = struct {
 
             if (self.getPendingCallConst(exec_frames.getPtr(ctx.frame_index).pending_call_index)) |pending| {
                 switch (pending.completion) {
-                    .results => {},  // IR closure resume removed — all closures have proto
+                    .results => {}, // IR closure resume removed — all closures have proto
                     .close => |cont| if (cont.waiting_builtin_yield and !cont.child_active) {
                         switch (try self.continueBytecodeClose(exec_frames, boundary_depth, ctx.frame_index)) {
                             .resume_dispatch => continue :frame_loop,
@@ -10484,173 +10603,173 @@ pub const Vm = struct {
                     // P15.51n: current_line derived from proto.lineinfo[pc].
                     const hook_state = self.activeHookState();
                     const th = self.activeBytecodeThread();
-                if (hook_state.has_line and !self.isInDebugHook() and self.debug_hooks_suppressed == 0) {
-                    const has_line_info = fr.u.lua.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[fr.u.lua.pc] != 0;
-                    if (has_line_info) {
-                        const current_line: i64 = @intCast(ctx.cur_proto.lineinfo[fr.u.lua.pc]);
+                    if (hook_state.has_line and !self.isInDebugHook() and self.debug_hooks_suppressed == 0) {
+                        const has_line_info = fr.u.lua.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[fr.u.lua.pc] != 0;
+                        if (has_line_info) {
+                            const current_line: i64 = @intCast(ctx.cur_proto.lineinfo[fr.u.lua.pc]);
 
-                        // A direct coroutine yield resumes by replaying the
-                        // suspended CALL/TAILCALL opcode. That replay is a VM
-                        // continuation, not a new source-line transition.
-                        var skip_replayed_hook = fr.isHookYield() and fr.u.lua.pc == @as(usize, fr.u.lua.resume_pc);
-                        {
-                            const skip_pc = exec_frames.getPtr(ctx.frame_index).u.lua.skip_line_hook_pc;
-                            if (skip_pc != INVALID_PC) {
-                                if (skip_pc == @as(u32, @intCast(fr.u.lua.pc))) skip_replayed_hook = true;
-                                exec_frames.getPtr(ctx.frame_index).u.lua.skip_line_hook_pc = INVALID_PC;
+                            // A direct coroutine yield resumes by replaying the
+                            // suspended CALL/TAILCALL opcode. That replay is a VM
+                            // continuation, not a new source-line transition.
+                            var skip_replayed_hook = fr.isHookYield() and fr.u.lua.pc == @as(usize, fr.u.lua.resume_pc);
+                            {
+                                const skip_pc = exec_frames.getPtr(ctx.frame_index).u.lua.skip_line_hook_pc;
+                                if (skip_pc != INVALID_PC) {
+                                    if (skip_pc == @as(u32, @intCast(fr.u.lua.pc))) skip_replayed_hook = true;
+                                    exec_frames.getPtr(ctx.frame_index).u.lua.skip_line_hook_pc = INVALID_PC;
+                                }
+                            }
+                            if (!skip_replayed_hook and hook_state.skip_bc_line_once) {
+                                skip_replayed_hook = true;
+                                hook_state.skip_bc_line_once = false;
+                            }
+
+                            // PUC starts tracing a vararg function after OP_VARARGPREP:
+                            // the first source-visible line is the instruction that
+                            // follows it. Record OP_VARARGPREP as oldpc, but do not
+                            // dispatch a line event for it.
+                            const suppress_varargprep = fr.u.lua.pc == 0 and op == .varargprep;
+                            const previous_pc = exec_frames.getPtr(ctx.frame_index).u.lua.last_line_pc;
+                            var should_dispatch = false;
+                            if (!skip_replayed_hook and !suppress_varargprep) {
+                                if (previous_pc != INVALID_PC) {
+                                    const old_pc: usize = previous_pc;
+                                    const old_line: i64 = if (old_pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[old_pc] != 0)
+                                        @intCast(ctx.cur_proto.lineinfo[old_pc])
+                                    else
+                                        current_line;
+                                    should_dispatch = fr.u.lua.pc <= old_pc or old_line != current_line;
+                                } else {
+                                    should_dispatch = true;
+                                }
+                            }
+
+                            // Track every opcode, not only opcodes that emitted a
+                            // hook. This is luaG_traceexec's oldpc invariant, kept
+                            // per activation so returning from a child on the same
+                            // source line does not create a synthetic event merely
+                            // because our bytecode density differs from PUC's.
+                            if (!suppress_varargprep) {
+                                exec_frames.getPtr(ctx.frame_index).u.lua.last_line_pc = @intCast(fr.u.lua.pc);
+                            }
+
+                            if (should_dispatch) {
+                                th.last_hook_line = current_line;
+                                if (try self.tryPushBytecodeDebugHook(
+                                    exec_frames,
+                                    ctx.frame_index,
+                                    "line",
+                                    current_line,
+                                    null,
+                                    null,
+                                    1,
+                                    .{ .resume_instruction = .{ .skip_line = true } },
+                                )) {
+                                    continue :frame_loop;
+                                }
+                                self.dispatchBytecodeHook("line", current_line, null) catch |hook_err| {
+                                    if (hook_err == error.Yield) {
+                                        self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.u.lua.pc, false, yielded_in_place);
+                                    }
+                                    return hook_err;
+                                };
+                                // The hook can execute Lua and grow both the shared
+                                // value stack and runtime-frame array.
+                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
+                                fr = exec_frames.getPtr(ctx.frame_index);
+                                ctx.pc = fr.u.lua.pc;
+                            }
+                        } else if (ctx.cur_proto.lineinfo.len == 0 and th.last_hook_line != -2) {
+                            // Stripped chunks still produce one line event at the
+                            // first instruction, with no line number.
+                            const skip_replayed_hook = hook_state.skip_bc_line_once;
+                            if (skip_replayed_hook) hook_state.skip_bc_line_once = false;
+                            th.last_hook_line = -2;
+                            if (!skip_replayed_hook) {
+                                if (try self.tryPushBytecodeDebugHook(
+                                    exec_frames,
+                                    ctx.frame_index,
+                                    "line",
+                                    null,
+                                    null,
+                                    null,
+                                    1,
+                                    .{ .resume_instruction = .{ .skip_line = true } },
+                                )) {
+                                    continue :frame_loop;
+                                }
+                                self.dispatchBytecodeHook("line", null, null) catch |hook_err| {
+                                    if (hook_err == error.Yield) {
+                                        self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.u.lua.pc, false, yielded_in_place);
+                                    }
+                                    return hook_err;
+                                };
+                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
+                                fr = exec_frames.getPtr(ctx.frame_index);
+                                ctx.pc = fr.u.lua.pc;
                             }
                         }
-                        if (!skip_replayed_hook and hook_state.skip_bc_line_once) {
-                            skip_replayed_hook = true;
-                            hook_state.skip_bc_line_once = false;
-                        }
+                    }
 
-                        // PUC starts tracing a vararg function after OP_VARARGPREP:
-                        // the first source-visible line is the instruction that
-                        // follows it. Record OP_VARARGPREP as oldpc, but do not
-                        // dispatch a line event for it.
-                        const suppress_varargprep = fr.u.lua.pc == 0 and op == .varargprep;
-                        const previous_pc = exec_frames.getPtr(ctx.frame_index).u.lua.last_line_pc;
-                        var should_dispatch = false;
-                        if (!skip_replayed_hook and !suppress_varargprep) {
-                            if (previous_pc != INVALID_PC) {
-                                const old_pc: usize = previous_pc;
-                                const old_line: i64 = if (old_pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[old_pc] != 0)
-                                    @intCast(ctx.cur_proto.lineinfo[old_pc])
-                                else
-                                    current_line;
-                                should_dispatch = fr.u.lua.pc <= old_pc or old_line != current_line;
+                    if (hook_state.count > 0 and !self.isInDebugHook() and self.debug_hooks_suppressed == 0) {
+                        // TODO(count-hook-codegen-parity, remove before 1.0.0):
+                        // The direct bytecode codegen currently emits MOVE and
+                        // LOADNIL as register-allocation/cleanup bookkeeping more
+                        // often than PUC Lua. Do not charge those implementation
+                        // details to the user-visible instruction count; otherwise
+                        // tight loops fire count hooks roughly twice as often as
+                        // the reference VM. Removal criterion: db.lua count-hook
+                        // assertions pass when every dispatched instruction
+                        // decrements the hook budget.
+                        var count_this_inst = op != .move and op != .loadnil and op != .close;
+                        if (fr.u.lua.resume_skip_count_pc != INVALID_PC) {
+                            const skip_pc = fr.u.lua.resume_skip_count_pc;
+                            if (skip_pc == @as(u32, @intCast(fr.u.lua.pc))) {
+                                // A count hook yielded before this opcode ran. On
+                                // resume, execute that opcode without immediately
+                                // firing the same hook again.
+                                count_this_inst = false;
+                                fr.u.lua.resume_skip_count_pc = INVALID_PC;
                             } else {
-                                should_dispatch = true;
+                                fr.u.lua.resume_skip_count_pc = INVALID_PC;
                             }
-                        }
-
-                        // Track every opcode, not only opcodes that emitted a
-                        // hook. This is luaG_traceexec's oldpc invariant, kept
-                        // per activation so returning from a child on the same
-                        // source line does not create a synthetic event merely
-                        // because our bytecode density differs from PUC's.
-                        if (!suppress_varargprep) {
-                            exec_frames.getPtr(ctx.frame_index).u.lua.last_line_pc = @intCast(fr.u.lua.pc);
-                        }
-
-                        if (should_dispatch) {
-                            th.last_hook_line = current_line;
-                            if (try self.tryPushBytecodeDebugHook(
-                                exec_frames,
-                                ctx.frame_index,
-                                "line",
-                                current_line,
-                                null,
-                                null,
-                                1,
-                                .{ .resume_instruction = .{ .skip_line = true } },
-                            )) {
-                                continue :frame_loop;
-                            }
-                            self.dispatchBytecodeHook("line", current_line, null) catch |hook_err| {
-                                if (hook_err == error.Yield) {
-                                    self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.u.lua.pc, false, yielded_in_place);
-                                }
-                                return hook_err;
-                            };
-                            // The hook can execute Lua and grow both the shared
-                            // value stack and runtime-frame array.
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
-                            fr = exec_frames.getPtr(ctx.frame_index);
-                            ctx.pc = fr.u.lua.pc;
-                        }
-                    } else if (ctx.cur_proto.lineinfo.len == 0 and th.last_hook_line != -2) {
-                        // Stripped chunks still produce one line event at the
-                        // first instruction, with no line number.
-                        const skip_replayed_hook = hook_state.skip_bc_line_once;
-                        if (skip_replayed_hook) hook_state.skip_bc_line_once = false;
-                        th.last_hook_line = -2;
-                        if (!skip_replayed_hook) {
-                            if (try self.tryPushBytecodeDebugHook(
-                                exec_frames,
-                                ctx.frame_index,
-                                "line",
-                                null,
-                                null,
-                                null,
-                                1,
-                                .{ .resume_instruction = .{ .skip_line = true } },
-                            )) {
-                                continue :frame_loop;
-                            }
-                            self.dispatchBytecodeHook("line", null, null) catch |hook_err| {
-                                if (hook_err == error.Yield) {
-                                    self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.u.lua.pc, false, yielded_in_place);
-                                }
-                                return hook_err;
-                            };
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
-                            fr = exec_frames.getPtr(ctx.frame_index);
-                            ctx.pc = fr.u.lua.pc;
-                        }
-                    }
-                }
-
-                if (hook_state.count > 0 and !self.isInDebugHook() and self.debug_hooks_suppressed == 0) {
-                    // TODO(count-hook-codegen-parity, remove before 1.0.0):
-                    // The direct bytecode codegen currently emits MOVE and
-                    // LOADNIL as register-allocation/cleanup bookkeeping more
-                    // often than PUC Lua. Do not charge those implementation
-                    // details to the user-visible instruction count; otherwise
-                    // tight loops fire count hooks roughly twice as often as
-                    // the reference VM. Removal criterion: db.lua count-hook
-                    // assertions pass when every dispatched instruction
-                    // decrements the hook budget.
-                    var count_this_inst = op != .move and op != .loadnil and op != .close;
-                    if (fr.u.lua.resume_skip_count_pc != INVALID_PC) {
-                        const skip_pc = fr.u.lua.resume_skip_count_pc;
-                        if (skip_pc == @as(u32, @intCast(fr.u.lua.pc))) {
-                            // A count hook yielded before this opcode ran. On
-                            // resume, execute that opcode without immediately
-                            // firing the same hook again.
+                        } else if (hook_state.skip_count_once) {
+                            hook_state.skip_count_once = false;
                             count_this_inst = false;
-                            fr.u.lua.resume_skip_count_pc = INVALID_PC;
-                        } else {
-                            fr.u.lua.resume_skip_count_pc = INVALID_PC;
                         }
-                    } else if (hook_state.skip_count_once) {
-                        hook_state.skip_count_once = false;
-                        count_this_inst = false;
-                    }
 
-                    if (count_this_inst) {
-                        hook_state.budget -= 1;
-                        if (hook_state.budget <= 0) {
-                            hook_state.budget = hook_state.count;
-                            if (try self.tryPushBytecodeDebugHook(
-                                exec_frames,
-                                ctx.frame_index,
-                                "count",
-                                null,
-                                null,
-                                null,
-                                1,
-                                .{ .resume_instruction = .{ .skip_count = true } },
-                            )) {
-                                continue :frame_loop;
-                            }
-                            self.dispatchBytecodeHook("count", null, null) catch |hook_err| {
-                                if (hook_err == error.Yield) {
-                                    self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.u.lua.pc, true, yielded_in_place);
+                        if (count_this_inst) {
+                            hook_state.budget -= 1;
+                            if (hook_state.budget <= 0) {
+                                hook_state.budget = hook_state.count;
+                                if (try self.tryPushBytecodeDebugHook(
+                                    exec_frames,
+                                    ctx.frame_index,
+                                    "count",
+                                    null,
+                                    null,
+                                    null,
+                                    1,
+                                    .{ .resume_instruction = .{ .skip_count = true } },
+                                )) {
+                                    continue :frame_loop;
                                 }
-                                return hook_err;
-                            };
-                            // A hook can recursively run Lua and reallocate
-                            // both arrays used by the explicit dispatch loop.
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
-                            fr = exec_frames.getPtr(ctx.frame_index);
-                            ctx.pc = fr.u.lua.pc;
+                                self.dispatchBytecodeHook("count", null, null) catch |hook_err| {
+                                    if (hook_err == error.Yield) {
+                                        self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.u.lua.pc, true, yielded_in_place);
+                                    }
+                                    return hook_err;
+                                };
+                                // A hook can recursively run Lua and reallocate
+                                // both arrays used by the explicit dispatch loop.
+                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
+                                fr = exec_frames.getPtr(ctx.frame_index);
+                                ctx.pc = fr.u.lua.pc;
+                            }
                         }
-                    }
                     }
                 }
                 // PUC does not check GC every instruction. GC steps happen
@@ -10766,7 +10885,9 @@ pub const Vm = struct {
                         if (env != .Table) {
                             @branchHint(.unlikely);
                             const upv_name = if (a < ctx.cur_proto.upvalues.len)
-                                ctx.cur_proto.upvalues[a].name else "";
+                                ctx.cur_proto.upvalues[a].name
+                            else
+                                "";
                             const tn = switch (env) {
                                 .Nil => "nil",
                                 .Int, .Num => "number",
@@ -10935,7 +11056,7 @@ pub const Vm = struct {
                                             const n: i64 = @intFromFloat(f);
                                             if (@as(usize, @intCast(n)) <= nextra) {
                                                 ctx.regs[a] = self.bc_stack[va_base_idx + @as(usize, @intCast(n - 1))];
-                    } else {
+                                            } else {
                                                 ctx.regs[a] = .Nil;
                                             }
                                         } else {
@@ -12065,8 +12186,7 @@ pub const Vm = struct {
                                     "__eq",
                                     "eq",
                                     .{ .compare = .{ .invert = c != 0 } },
-                                ))
-                                {
+                                )) {
                                     continue :frame_loop;
                                 }
                             }
@@ -12347,7 +12467,12 @@ pub const Vm = struct {
                                     } },
                                 });
                                 try self.pushBytecodeExecFrame(
-                                    ctx.exec_frames, proto, rargs, cl, ctx.base + a, nresults,
+                                    ctx.exec_frames,
+                                    proto,
+                                    rargs,
+                                    cl,
+                                    ctx.base + a,
+                                    nresults,
                                 );
                                 // Defer block syncs parent frame state (pc,
                                 // regs, etc.) before the frame_loop starts
@@ -12588,8 +12713,7 @@ pub const Vm = struct {
                                 const np = ctx.cur_proto.numparams;
                                 const va_start = ctx.base + np;
                                 break :blk self.bc_stack[va_start .. va_start + nextra_vp];
-                            } else
-                                &.{};
+                            } else &.{};
                             try self.tableResizeArray(t, @intCast(va_slice.len));
                             for (va_slice, 0..) |v, i| {
                                 t.array[i] = v;
@@ -13016,7 +13140,13 @@ pub const Vm = struct {
                     if (chain_depth >= 16) return self.fail("'__call' chain too long", .{});
                     const current_callee = ctx.regs[a + 4];
                     self.tryCallMetamethodInPlace(
-                        ctx.base, a + 4, &effective_nargs, &ctx.frame_cap, &ctx.regs, &ctx.boxed, &chain_depth,
+                        ctx.base,
+                        a + 4,
+                        &effective_nargs,
+                        &ctx.frame_cap,
+                        &ctx.regs,
+                        &ctx.boxed,
+                        &chain_depth,
                     ) catch |err| {
                         if (err == error.RuntimeError and self.err != null and
                             std.mem.startsWith(u8, self.err.?, "attempt to call a "))
@@ -13085,8 +13215,31 @@ pub const Vm = struct {
                 };
                 defer if (outs_heap) |h| self.alloc.free(h);
                 ctx.exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                // P15.83r (PUC precallC ordering): a builtin iterator called
+                // by OP_TFORCALL goes through luaD_call → precallC in PUC —
+                // the C CallInfo exists before LUA_HOOKCALL fires, and the
+                // name resolves to "for iterator" (getFuncNameForFrame's
+                // .tforcall branch reads this caller's instruction).
+                var iter_cframe_pushed = false;
+                if (id != .collectgarbage and id != .string_sub) {
+                    try self.pushBuiltinCFrame(callee_val);
+                    iter_cframe_pushed = true;
+                    const cf_idx = self.activeBytecodeThread().call_frames.len() - 1;
+                    const iter_hook_args = self.bc_stack[ctx.base + a + 5 .. ctx.base + a + 5 + effective_nargs];
+                    self.dispatchCCalleeActivationHook(cf_idx, callee_val, iter_hook_args) catch |hook_err| {
+                        self.popBuiltinCFrame();
+                        return hook_err;
+                    };
+                    self.builtin_cframe_pre_pushed = true;
+                }
                 // P15.51l: reg_top/nvarstack are already on the CallFrame.
-                try self.callBuiltin(id, rargs_builtin, outs);
+                // pushBuiltinCFrame may have reallocated bc_stack — re-derive
+                // the args slice for callBuiltin.
+                const rargs_builtin_fresh = if (iter_cframe_pushed)
+                    self.bc_stack[ctx.base + a + 5 .. ctx.base + a + 5 + effective_nargs]
+                else
+                    rargs_builtin;
+                try self.callBuiltin(id, rargs_builtin_fresh, outs);
                 const produced: usize = if (builtinHasDynamicOutCount(id))
                     @min(self.last_builtin_out_count, outs.len)
                 else
@@ -13375,7 +13528,13 @@ pub const Vm = struct {
                     if (chain_depth >= 16) return self.fail("'__call' chain too long", .{});
                     const current_callee = ctx.regs[a];
                     self.tryCallMetamethodInPlace(
-                        ctx.base, a, &effective_nargs, &ctx.frame_cap, &ctx.regs, &ctx.boxed, &chain_depth,
+                        ctx.base,
+                        a,
+                        &effective_nargs,
+                        &ctx.frame_cap,
+                        &ctx.regs,
+                        &ctx.boxed,
+                        &chain_depth,
                     ) catch |err| {
                         if (err == error.RuntimeError and self.err != null and
                             std.mem.startsWith(u8, self.err.?, "attempt to call a "))
@@ -13395,7 +13554,7 @@ pub const Vm = struct {
         }
 
         const callee_val = ctx.regs[a];
-        const call_args = ctx.regs[a + 1 .. a + 1 + effective_nargs];
+        var call_args = ctx.regs[a + 1 .. a + 1 + effective_nargs];
 
         const hook_args = switch (callee_val) {
             .Closure => |cl| debugCallTransferArgsForClosure(cl, call_args),
@@ -13413,6 +13572,7 @@ pub const Vm = struct {
         };
         const tc_event: []const u8 = if (callee_is_bytecode) "tail call" else "call";
         var deferred_tail_hook = false;
+        var deferred_builtin_call_hook = false;
         const skip_tail_hook = ctx.exec_frames.getPtr(ctx.frame_index).u.lua.skip_call_hook_pc == @as(u32, @intCast(ctx.pc));
         if (skip_tail_hook) {
             ctx.exec_frames.getPtr(ctx.frame_index).u.lua.skip_call_hook_pc = INVALID_PC;
@@ -13432,15 +13592,42 @@ pub const Vm = struct {
             // reused for the new function (PUC fires at the new function's
             // first instruction, with ci->func already swapped).
             deferred_tail_hook = true;
-        } else {
-            try self.debugDispatchHookWithCalleeTransfer(
-                "call",
-                null,
-                callee_val,
-                hook_args,
-                1,
-                null,
-            );
+        } else switch (callee_val) {
+            .Builtin => |id| {
+                // P15.83r (PUC precallC via luaD_pretailcall): plain
+                // LUA_HOOKCALL on a FRESH C CallInfo. Divert-bound and
+                // frameless builtins keep the legacy caller-frame identity
+                // (see opCall's dispatch block); sync-bound builtins defer
+                // to the callBuiltin site below.
+                if (self.builtinCallMayDivert(id, hook_args) or id == .collectgarbage or id == .string_sub) {
+                    try self.debugDispatchHookWithCalleeTransfer(
+                        "call",
+                        null,
+                        callee_val,
+                        hook_args,
+                        1,
+                        null,
+                    );
+                } else {
+                    deferred_builtin_call_hook = true;
+                }
+            },
+            .Closure => |cl| {
+                if (cl.c_func == null) {
+                    // IR closure: no C activation exists — legacy
+                    // caller-frame identity.
+                    try self.debugDispatchHookWithCalleeTransfer(
+                        "call",
+                        null,
+                        callee_val,
+                        hook_args,
+                        1,
+                        null,
+                    );
+                }
+                // C closure: callCFunction fires the event on its C-frame.
+            },
+            else => unreachable,
         }
 
         // P15.51l: tbc_mark is a rare field, read from CallFrame.
@@ -13651,6 +13838,25 @@ pub const Vm = struct {
                 };
                 defer if (outs_heap) |h| self.alloc.free(h);
                 ctx.exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                // P15.83r (PUC precallC ordering via luaD_pretailcall): the
+                // C CallInfo exists BEFORE the CALL hook fires. Push the
+                // builtin's C-frame, fire on it, and reuse the frame inside
+                // callBuiltin. (This is the tail-call-to-C path: PUC pushes
+                // a FRESH ci without CIST_TAIL, so the event is a plain
+                // "call" — see the tc_event selection above.)
+                if (deferred_builtin_call_hook) {
+                    try self.pushBuiltinCFrame(callee_val);
+                    const cf_idx = self.activeBytecodeThread().call_frames.len() - 1;
+                    // call_args may be stale after pushBuiltinCFrame grew
+                    // bc_stack — re-derive from the caller's registers.
+                    const tc_hook_args = self.bc_stack[ctx.base + a + 1 .. ctx.base + a + 1 + effective_nargs];
+                    self.dispatchCCalleeActivationHook(cf_idx, callee_val, tc_hook_args) catch |hook_err| {
+                        self.popBuiltinCFrame();
+                        return hook_err;
+                    };
+                    self.builtin_cframe_pre_pushed = true;
+                    call_args = self.bc_stack[ctx.base + a + 1 .. ctx.base + a + 1 + effective_nargs];
+                }
                 // P15.51l: reg_top/nvarstack are already on the CallFrame.
                 self.callBuiltin(id, call_args, outs) catch |call_err| switch (call_err) {
                     error.Yield => {
@@ -13813,7 +14019,13 @@ pub const Vm = struct {
                     if (chain_depth >= 16) return self.fail("'__call' chain too long", .{});
                     const current_callee = ctx.regs[a];
                     self.tryCallMetamethodInPlace(
-                        ctx.base, a, &effective_nargs, &ctx.frame_cap, &ctx.regs, &ctx.boxed, &chain_depth,
+                        ctx.base,
+                        a,
+                        &effective_nargs,
+                        &ctx.frame_cap,
+                        &ctx.regs,
+                        &ctx.boxed,
+                        &chain_depth,
                     ) catch |err| {
                         if (err == error.RuntimeError and self.err != null and
                             std.mem.startsWith(u8, self.err.?, "attempt to call a "))
@@ -13859,10 +14071,29 @@ pub const Vm = struct {
         // frame as a child of the caller and installs the callee at the
         // caller's func_slot for the duration of the hook (debug.getinfo
         // parity for Lua hooks is covered by the upstream db.lua suite).
-        // Builtin/IR-closure callees run synchronously without a CallFrame
-        // (documented gap: no C-function CallInfo), so their sync dispatch
-        // stays at the call site referencing the caller frame.
+        //
+        // P15.83r: C-function callees mirror PUC precallC (ldo.c:642-656) —
+        // the C CallInfo exists BEFORE the hook fires:
+        //   - sync-bound builtin callee: the dispatch is deferred to the
+        //     synchronous callBuiltin site below, which pushes the C-frame,
+        //     fires on it (ar.i_ci = the C activation), and reuses the frame
+        //     inside callBuiltin via `builtin_cframe_pre_pushed`.
+        //   - divert-bound builtin callee (builtinCallMayDivert): the OP_CALL
+        //     fast paths below (pairs/__pairs, pcall target, coroutine
+        //     switch, gsub) replace the call with bytecode continuations
+        //     whose completion machinery requires the body frame to sit
+        //     directly above the pending-call owner (a plain builtin C-frame
+        //     in between would be misrouted by the `parent.isC()` return
+        //     routing). These keep the legacy caller-frame identity —
+        //     documented sub-deviation (see STATUS.md P15.83r).
+        //   - frameless builtins (collectgarbage/string_sub) and IR-closure
+        //     callees: legacy caller-frame identity (no C activation exists).
+        //   - C-closure callee (c_func set): no dispatch here — callCFunction
+        //     fires the event on its own C-frame push, which also covers
+        //     lua_call/lua_pcall entries from C code (PUC precallC fires for
+        //     every C activation).
         var deferred_call_hook = false;
+        var deferred_builtin_call_hook = false;
         if (skip_call_hook) {
             ctx.exec_frames.getPtr(ctx.frame_index).u.lua.skip_call_hook_pc = INVALID_PC;
         } else if (!self.hooks_active_cached) {
@@ -13885,8 +14116,27 @@ pub const Vm = struct {
             else => false,
         }) {
             deferred_call_hook = true;
-        } else {
-            try self.dispatchBytecodeHookWithCallee("call", resolved_callee, rargs);
+        } else switch (resolved_callee) {
+            .Builtin => |id| {
+                if (self.builtinCallMayDivert(id, rargs) or id == .collectgarbage or id == .string_sub) {
+                    // Legacy caller-frame identity for divert-bound and
+                    // frameless builtins.
+                    try self.dispatchBytecodeHookWithCallee("call", resolved_callee, rargs);
+                } else {
+                    // Sync-bound builtin: C-frame push + dispatch happen at
+                    // the callBuiltin site below (precallC ordering).
+                    deferred_builtin_call_hook = true;
+                }
+            },
+            .Closure => |cl| {
+                if (cl.c_func == null) {
+                    // IR closure: no C activation exists — keep the legacy
+                    // caller-frame sync dispatch.
+                    try self.dispatchBytecodeHookWithCallee("call", resolved_callee, rargs);
+                }
+                // C closure: callCFunction fires the event on its C-frame.
+            },
+            else => unreachable,
         }
 
         const callee_val = resolved_callee;
@@ -13971,7 +14221,7 @@ pub const Vm = struct {
                 try self.bcGrowFrame(ctx.base, outs_start + out_len, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
                 // Re-derive rargs after bcGrowFrame: it may have reallocated
                 // bc_stack, invalidating the old rargs slice (use-after-free).
-                const rargs_fresh = ctx.regs[a + 1 .. a + 1 + effective_nargs];
+                var rargs_fresh = ctx.regs[a + 1 .. a + 1 + effective_nargs];
                 var outs = ctx.regs[outs_start .. outs_start + out_len];
                 // Sync pc and frame_cap to frame before callBuiltin — the
                 // builtin may trigger GC (reads live_reg_top[pc]) or shrink
@@ -13983,6 +14233,27 @@ pub const Vm = struct {
                 const fr_pre_call = ctx.exec_frames.getPtr(ctx.frame_index);
                 fr_pre_call.u.lua.pc = ctx.pc;
                 if (!fr_pre_call.isC()) fr_pre_call.u.lua.frame_cap = ctx.frame_cap;
+                // P15.83r (PUC ldo.c:642-656 precallC ordering): the C
+                // CallInfo exists BEFORE the CALL hook fires. Push the
+                // builtin's C-frame, fire the event on it (ar.i_ci = the C
+                // activation), then run the builtin reusing this frame.
+                if (deferred_builtin_call_hook) {
+                    try self.pushBuiltinCFrame(callee_val);
+                    const cf_idx = self.activeBytecodeThread().call_frames.len() - 1;
+                    // pushBuiltinCFrame may have reallocated bc_stack —
+                    // re-derive the caller-window slices (the C-frame's
+                    // func_slot sits above the window, which is unchanged).
+                    ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                    ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
+                    rargs_fresh = ctx.regs[a + 1 .. a + 1 + effective_nargs];
+                    outs = ctx.regs[outs_start .. outs_start + out_len];
+                    const hook_args = rargs_fresh;
+                    self.dispatchCCalleeActivationHook(cf_idx, callee_val, hook_args) catch |hook_err| {
+                        self.popBuiltinCFrame();
+                        return hook_err;
+                    };
+                    self.builtin_cframe_pre_pushed = true;
+                }
                 self.callBuiltin(id, rargs_fresh, outs) catch |call_err| switch (call_err) {
                     error.Yield => {
                         if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
@@ -14518,7 +14789,7 @@ pub const Vm = struct {
     /// callers that pass local buffers). Mirrors PUC Lua's restorestack macro.
     fn refreshBuiltinOuts(self: *Vm) ?[]Value {
         if (!self.builtin_outs_on_bc_stack) return null;
-        return self.bc_stack[self.builtin_outs_base..self.builtin_outs_base + self.builtin_outs_len];
+        return self.bc_stack[self.builtin_outs_base .. self.builtin_outs_base + self.builtin_outs_len];
     }
 
     fn callBuiltin(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value) DispatchError!void {
@@ -14557,16 +14828,23 @@ pub const Vm = struct {
         const args_base = if (args_on_bc) (args_ptr - bc_start) / @sizeOf(Value) else 0;
 
         const callee_val: Value = .{ .Builtin = id };
-        const cframe_pushed = id != .collectgarbage and id != .string_sub;
-        if (cframe_pushed) try self.pushBuiltinCFrame(callee_val);
+        // P15.83r: the OP_CALL/OP_TAILCALL/OP_TFORCALL dispatch sites may
+        // have already pushed this builtin's C-frame so the CALL hook could
+        // fire on the C activation (PUC precallC ordering). Consume the flag
+        // (exactly one callBuiltin entry per push) and REUSE that frame —
+        // exactly one C-frame per builtin invocation, whoever pushed it.
+        const cframe_pre_pushed = self.builtin_cframe_pre_pushed;
+        self.builtin_cframe_pre_pushed = false;
+        const cframe_pushed = cframe_pre_pushed or (id != .collectgarbage and id != .string_sub);
+        if (!cframe_pre_pushed and cframe_pushed) try self.pushBuiltinCFrame(callee_val);
         // Re-derive args from the (possibly reallocated) bc_stack.
         const args_fresh: []const Value = if (args_on_bc)
-            self.bc_stack[args_base..args_base + args.len]
+            self.bc_stack[args_base .. args_base + args.len]
         else
             args;
         // Re-derive outs from the (possibly reallocated) bc_stack.
         const outs_fresh: []Value = if (self.builtin_outs_on_bc_stack)
-            self.bc_stack[self.builtin_outs_base..self.builtin_outs_base + self.builtin_outs_len]
+            self.bc_stack[self.builtin_outs_base .. self.builtin_outs_base + self.builtin_outs_len]
         else
             outs;
         var cframe_preserved = false;
@@ -16854,40 +17132,40 @@ pub const Vm = struct {
                     const parent_idx = hi - 1;
                     const hook_frame = frames.getPtr(hi);
                     if (hook_frame.isDebugHook()) {
-                    // The pending_call is on the PARENT frame (set by
-                    // tryPushBytecodeDebugHook), not on the hook frame.
-                    const parent = frames.getPtr(parent_idx);
-                    if (self.getPendingCallPtr(parent.pending_call_index)) |pending| {
-                        if (pending.completion == .hook) {
-                            const cont = pending.completion.hook;
-                            self.bc_stack[parent.func_slot] = cont.saved_parent_callee;
-                            parent.setTailCallBool(cont.saved_parent_tailcall);
-                            // For count hooks, set resume_skip_count_pc so the
-                            // count hook doesn't immediately re-fire on resume.
-                            if (cont.post == .resume_instruction and cont.post.resume_instruction.skip_count) {
-                                parent.u.lua.resume_skip_count_pc = @intCast(parent.u.lua.pc);
+                        // The pending_call is on the PARENT frame (set by
+                        // tryPushBytecodeDebugHook), not on the hook frame.
+                        const parent = frames.getPtr(parent_idx);
+                        if (self.getPendingCallPtr(parent.pending_call_index)) |pending| {
+                            if (pending.completion == .hook) {
+                                const cont = pending.completion.hook;
+                                self.bc_stack[parent.func_slot] = cont.saved_parent_callee;
+                                parent.setTailCallBool(cont.saved_parent_tailcall);
+                                // For count hooks, set resume_skip_count_pc so the
+                                // count hook doesn't immediately re-fire on resume.
+                                if (cont.post == .resume_instruction and cont.post.resume_instruction.skip_count) {
+                                    parent.u.lua.resume_skip_count_pc = @intCast(parent.u.lua.pc);
+                                }
+                                // For line hooks, set skip_bc_line_once so the
+                                // line hook doesn't immediately re-fire on resume.
+                                // This mirrors PUC's CIST_HOOKYIELD: on resume,
+                                // luaG_traceexec sees the flag, clears it, and
+                                // returns without calling the hook. The instruction
+                                // executes, and the next instruction's line-change
+                                // check proceeds normally.
+                                if (cont.post == .resume_instruction and cont.post.resume_instruction.skip_line) {
+                                    self.activeHookState().skip_bc_line_once = true;
+                                }
+                                self.alloc.free(cont.transfer);
+                                self.clearPendingCall(parent);
                             }
-                            // For line hooks, set skip_bc_line_once so the
-                            // line hook doesn't immediately re-fire on resume.
-                            // This mirrors PUC's CIST_HOOKYIELD: on resume,
-                            // luaG_traceexec sees the flag, clears it, and
-                            // returns without calling the hook. The instruction
-                            // executes, and the next instruction's line-change
-                            // check proceeds normally.
-                            if (cont.post == .resume_instruction and cont.post.resume_instruction.skip_line) {
-                                self.activeHookState().skip_bc_line_once = true;
-                            }
-                            self.alloc.free(cont.transfer);
-                            self.clearPendingCall(parent);
                         }
-                    }
-                    // Clear in_debug_hook (mirrors popBytecodeExecFrame).
-                    self.activeHookState().in_debug_hook = false;
-                    // Pop the hook frame.
-                    self.popBytecodeExecFrame(frames);
-                    // Mark as suspended so errdefer in runBytecodeInternal
-                    // does not unwind the parent frame.
-                    th.bytecode_inplace_suspended = true;
+                        // Clear in_debug_hook (mirrors popBytecodeExecFrame).
+                        self.activeHookState().in_debug_hook = false;
+                        // Pop the hook frame.
+                        self.popBytecodeExecFrame(frames);
+                        // Mark as suspended so errdefer in runBytecodeInternal
+                        // does not unwind the parent frame.
+                        th.bytecode_inplace_suspended = true;
                     }
                 }
             }
@@ -17184,167 +17462,167 @@ pub const Vm = struct {
                 th.bytecode_resume_boundary = 0;
             } else {
                 cframe_processed = true;
-            while (th.call_frames.len() > 0) {
-                const top_fr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
-                if (!top_fr.isC()) break;
-                // P15.78: Skip stale C-frames (testc_state already consumed
-                // by a prior finishCcall). These frames have k=testcContShim
-                // but no continuation state — they're leftovers from the
-                // yieldk chain below a pcallk that was processed by precover.
-                // Just pop them without calling finishCcall (which would
-                // clear resume_inbox, destroying the 4th continuation's results).
-                if (top_fr.u.c.k == &testcContShim and top_fr.u.c.testc_state == null) {
-                    try self.poscallCFrame(th, 0);
-                    continue;
-                }
-                // Clear bytecode_inplace_suspended before calling finishCcall,
-                // because testcContShim may call runTestcCloseMetamethod →
-                // runClosure → runBytecodeInternal. If bytecode_inplace_suspended
-                // is true, runBytecodeInternal would try resume_in_place on the
-                // C-frame instead of pushing a new Lua frame for the __close
-                // metamethod, causing a crash.
-                // NOTE: Do NOT save/restore bytecode_inplace_suspended here.
-                // If finishCcall yields, parkDirectBytecodeYield (called from
-                // within finishCcall → testcContShim → runBytecodeInternal) sets
-                // bytecode_inplace_suspended = true for the __close frame.
-                // Restoring the old value would break resume_in_place on the
-                // next resume, causing runBytecodeInternal to push a new Lua
-                // wrapper frame instead of resuming the __close frame.
-                th.bytecode_inplace_suspended = false;
+                while (th.call_frames.len() > 0) {
+                    const top_fr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
+                    if (!top_fr.isC()) break;
+                    // P15.78: Skip stale C-frames (testc_state already consumed
+                    // by a prior finishCcall). These frames have k=testcContShim
+                    // but no continuation state — they're leftovers from the
+                    // yieldk chain below a pcallk that was processed by precover.
+                    // Just pop them without calling finishCcall (which would
+                    // clear resume_inbox, destroying the 4th continuation's results).
+                    if (top_fr.u.c.k == &testcContShim and top_fr.u.c.testc_state == null) {
+                        try self.poscallCFrame(th, 0);
+                        continue;
+                    }
+                    // Clear bytecode_inplace_suspended before calling finishCcall,
+                    // because testcContShim may call runTestcCloseMetamethod →
+                    // runClosure → runBytecodeInternal. If bytecode_inplace_suspended
+                    // is true, runBytecodeInternal would try resume_in_place on the
+                    // C-frame instead of pushing a new Lua frame for the __close
+                    // metamethod, causing a crash.
+                    // NOTE: Do NOT save/restore bytecode_inplace_suspended here.
+                    // If finishCcall yields, parkDirectBytecodeYield (called from
+                    // within finishCcall → testcContShim → runBytecodeInternal) sets
+                    // bytecode_inplace_suspended = true for the __close frame.
+                    // Restoring the old value would break resume_in_place on the
+                    // next resume, causing runBytecodeInternal to push a new Lua
+                    // wrapper frame instead of resuming the __close frame.
+                    th.bytecode_inplace_suspended = false;
 
-                // C-frame on top: call finishCcall to run the continuation.
-                const fc_result = self.finishCcall(th) catch |e| switch (e) {
-                    error.Yield => {
-                        // The continuation itself yielded. The C-frame
-                        // stays in place. bytecode_inplace_suspended was
-                        // set by parkDirectBytecodeYield inside finishCcall —
-                        // do NOT restore the old value.
-                        // Return yield results.
-                        yielded = true;
-                        const ys = th.yielded orelse &[_]Value{};
-                        if (ys.len > 0) {
-                            payload = try self.alloc.alloc(Value, ys.len);
-                            payload_heap = true;
-                            for (ys, 0..) |v, i| payload[i] = v;
-                        }
-                        if (th.yielded) |owned| {
-                            self.alloc.free(owned);
-                            th.yielded = null;
-                        }
-                        break;
-                    },
-                    error.RuntimeError => {
-                        // PUC luaD_throwbaselevel: self-close
-                        // (lua_closethread(co, co)) longjmps to the base
-                        // boundary. The error propagates through finishCcall
-                        // to here. If forced close is active, discard all
-                        // remaining C-frames (PUC resetCI) and let the unroll
-                        // loop process Lua frames (which runs __close via
-                        // the close_mode branch in runBytecodeInternal).
-                        if (self.forced_close_thread == th and th.close_mode) {
-                            while (th.call_frames.len() > 0 and
-                                th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
-                            {
-                                self.discardCFrame(th);
+                    // C-frame on top: call finishCcall to run the continuation.
+                    const fc_result = self.finishCcall(th) catch |e| switch (e) {
+                        error.Yield => {
+                            // The continuation itself yielded. The C-frame
+                            // stays in place. bytecode_inplace_suspended was
+                            // set by parkDirectBytecodeYield inside finishCcall —
+                            // do NOT restore the old value.
+                            // Return yield results.
+                            yielded = true;
+                            const ys = th.yielded orelse &[_]Value{};
+                            if (ys.len > 0) {
+                                payload = try self.alloc.alloc(Value, ys.len);
+                                payload_heap = true;
+                                for (ys, 0..) |v, i| payload[i] = v;
                             }
-                            if (th.call_frames.len() == 0) {
-                                // No Lua frames — no TBC to close.
-                                forced_close_ok = true;
-                            } else {
-                                // Lua frames remain — set up for close_mode
-                                // resume so the unroll loop runs __close.
-                                th.bytecode_inplace_suspended = true;
-                                th.bytecode_resume_boundary = 0;
+                            if (th.yielded) |owned| {
+                                self.alloc.free(owned);
+                                th.yielded = null;
                             }
                             break;
-                        }
-                        // P15.78: k (testcContShim) called lua_error inside
-                        // a pcallk continuation. The C-frame was NOT popped
-                        // (finishCcall leaves it in place on error). Call
-                        // precover to find the CIST_YPCALL C-frame, pop
-                        // frames above it, and set up for finishCcall →
-                        // finishpcallk → testcContShim with error status.
-                        // This mirrors PUC Lua's luaD_throw → precover chain.
-                        if (self.precover(th)) {
-                            // precover found the CIST_YPCALL C-frame.
-                            // Continue the while loop — the CIST_YPCALL
-                            // C-frame is now on top, and finishCcall will
-                            // be called again for it.
-                            th.bytecode_inplace_suspended = false;
-                            continue;
-                        }
-                        // No CIST_YPCALL C-frame found. The error is
-                        // uncaught — propagate it.
-                        return e;
-                    },
-                    else => return e,
-                };
-                if (yielded) break;
+                        },
+                        error.RuntimeError => {
+                            // PUC luaD_throwbaselevel: self-close
+                            // (lua_closethread(co, co)) longjmps to the base
+                            // boundary. The error propagates through finishCcall
+                            // to here. If forced close is active, discard all
+                            // remaining C-frames (PUC resetCI) and let the unroll
+                            // loop process Lua frames (which runs __close via
+                            // the close_mode branch in runBytecodeInternal).
+                            if (self.forced_close_thread == th and th.close_mode) {
+                                while (th.call_frames.len() > 0 and
+                                    th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
+                                {
+                                    self.discardCFrame(th);
+                                }
+                                if (th.call_frames.len() == 0) {
+                                    // No Lua frames — no TBC to close.
+                                    forced_close_ok = true;
+                                } else {
+                                    // Lua frames remain — set up for close_mode
+                                    // resume so the unroll loop runs __close.
+                                    th.bytecode_inplace_suspended = true;
+                                    th.bytecode_resume_boundary = 0;
+                                }
+                                break;
+                            }
+                            // P15.78: k (testcContShim) called lua_error inside
+                            // a pcallk continuation. The C-frame was NOT popped
+                            // (finishCcall leaves it in place on error). Call
+                            // precover to find the CIST_YPCALL C-frame, pop
+                            // frames above it, and set up for finishCcall →
+                            // finishpcallk → testcContShim with error status.
+                            // This mirrors PUC Lua's luaD_throw → precover chain.
+                            if (self.precover(th)) {
+                                // precover found the CIST_YPCALL C-frame.
+                                // Continue the while loop — the CIST_YPCALL
+                                // C-frame is now on top, and finishCcall will
+                                // be called again for it.
+                                th.bytecode_inplace_suspended = false;
+                                continue;
+                            }
+                            // No CIST_YPCALL C-frame found. The error is
+                            // uncaught — propagate it.
+                            return e;
+                        },
+                        else => return e,
+                    };
+                    if (yielded) break;
 
-                // finishCcall returned normally. Pop the C-frame.
-                try self.poscallCFrame(th, fc_result);
-                // bytecode_inplace_suspended will be set explicitly below
-                // (line ~15678) if there are Lua frames to resume. Do NOT
-                // restore the old value — it may be stale.
+                    // finishCcall returned normally. Pop the C-frame.
+                    try self.poscallCFrame(th, fc_result);
+                    // bytecode_inplace_suspended will be set explicitly below
+                    // (line ~15678) if there are Lua frames to resume. Do NOT
+                    // restore the old value — it may be stale.
 
-                // Check if there are more C-frames or if we're done.
-                if (th.call_frames.len() == 0) {
-                    // No more frames — coroutine is complete. The
-                    // continuation's results are in resume_inbox.
-                    const ri = th.resume_inbox orelse &[_]Value{};
-                    payload = try self.alloc.alloc(Value, ri.len);
-                    payload_heap = true;
-                    for (ri, 0..) |v, i| payload[i] = v;
-                    if (th.resume_inbox) |old| self.alloc.free(old);
-                    th.resume_inbox = null;
-                    // Mark as completed — skip the normal resume path.
-                    ok = true;
-                    yielded = false;
-                    th.status = .dead;
-                    th.api_status = 0; // LUA_OK — completed
+                    // Check if there are more C-frames or if we're done.
+                    if (th.call_frames.len() == 0) {
+                        // No more frames — coroutine is complete. The
+                        // continuation's results are in resume_inbox.
+                        const ri = th.resume_inbox orelse &[_]Value{};
+                        payload = try self.alloc.alloc(Value, ri.len);
+                        payload_heap = true;
+                        for (ri, 0..) |v, i| payload[i] = v;
+                        if (th.resume_inbox) |old| self.alloc.free(old);
+                        th.resume_inbox = null;
+                        // Mark as completed — skip the normal resume path.
+                        ok = true;
+                        yielded = false;
+                        th.status = .dead;
+                        th.api_status = 0; // LUA_OK — completed
+                        th.started = true;
+                        th.finished = true;
+                        th.close_has_err = false;
+                        outs[0] = .{ .Bool = true };
+                        const n = @min(payload.len, if (outs.len > 1) outs.len - 1 else 0);
+                        for (0..n) |i| outs[1 + i] = payload[i];
+                        self.last_builtin_out_count = 1 + n;
+                        self.clearThreadContinuationScratch(th, .{});
+                        return;
+                    }
+                    // More frames — loop to check if the next one is also C.
+                }
+
+                if (yielded) {
+                    // The continuation yielded. Return yield results.
+                    th.status = .suspended;
+                    th.api_status = 1; // LUA_YIELD
                     th.started = true;
-                    th.finished = true;
+                    th.finished = false;
                     th.close_has_err = false;
                     outs[0] = .{ .Bool = true };
                     const n = @min(payload.len, if (outs.len > 1) outs.len - 1 else 0);
                     for (0..n) |i| outs[1 + i] = payload[i];
                     self.last_builtin_out_count = 1 + n;
-                    self.clearThreadContinuationScratch(th, .{});
                     return;
                 }
-                // More frames — loop to check if the next one is also C.
-            }
 
-            if (yielded) {
-                // The continuation yielded. Return yield results.
-                th.status = .suspended;
-                th.api_status = 1; // LUA_YIELD
-                th.started = true;
-                th.finished = false;
-                th.close_has_err = false;
-                outs[0] = .{ .Bool = true };
-                const n = @min(payload.len, if (outs.len > 1) outs.len - 1 else 0);
-                for (0..n) |i| outs[1 + i] = payload[i];
-                self.last_builtin_out_count = 1 + n;
-                return;
-            }
-
-            // If C-frames were processed but there are still Lua frames,
-            // set up for resuming the bytecode VM.
-            // P15.78: Set bytecode_resume_boundary = 0 so runBytecodeInternal
-            // resumes with boundary_depth = 0 (the outermost call). This is
-            // correct regardless of what value was set by pcallk/callk
-            // (which set it to call_frames.len() including the C-frame, now
-            // stale after the C-frame is popped). With boundary_depth = 0,
-            // runBytecodeInternal will resume the topmost Lua frame and
-            // continue through all frames until completion or next yield.
-            if (th.call_frames.len() > 0) {
-                const below = th.call_frames.getConstPtr(th.call_frames.len() - 1);
-                if (!below.isC()) {
-                    th.bytecode_inplace_suspended = true;
-                    th.bytecode_resume_boundary = 0;
+                // If C-frames were processed but there are still Lua frames,
+                // set up for resuming the bytecode VM.
+                // P15.78: Set bytecode_resume_boundary = 0 so runBytecodeInternal
+                // resumes with boundary_depth = 0 (the outermost call). This is
+                // correct regardless of what value was set by pcallk/callk
+                // (which set it to call_frames.len() including the C-frame, now
+                // stale after the C-frame is popped). With boundary_depth = 0,
+                // runBytecodeInternal will resume the topmost Lua frame and
+                // continue through all frames until completion or next yield.
+                if (th.call_frames.len() > 0) {
+                    const below = th.call_frames.getConstPtr(th.call_frames.len() - 1);
+                    if (!below.isC()) {
+                        th.bytecode_inplace_suspended = true;
+                        th.bytecode_resume_boundary = 0;
+                    }
                 }
-            }
             } // end else (non-close_mode C-frame processing)
         }
 
@@ -18357,9 +18635,9 @@ pub const Vm = struct {
                     }
                 }
             }
-            }
+        }
 
-            for (self.gc_temp_roots.items) |value| try self.gcMarkValue(value);
+        for (self.gc_temp_roots.items) |value| try self.gcMarkValue(value);
         if (self.debug_transfer_values) |values| for (values) |value| try self.gcMarkValue(value);
         if (self.err_has_obj) try self.gcMarkValue(self.err_obj);
         // c_error_value holds the object thrown by lua_error between the
@@ -19098,8 +19376,7 @@ pub const Vm = struct {
                 // (swapRemove moves the last element into this slot), then
                 // free its memory. We must NOT advance the cursor so the
                 // swapped-in element gets examined next iteration.
-                if (obj == .closure) {
-                }
+                if (obj == .closure) {}
                 self.gcUnregisterObject(obj);
                 self.gcFreeObject(obj);
             } else {
@@ -20138,7 +20415,10 @@ pub const Vm = struct {
         if (mode.weak_k or mode.weak_v) {
             var seen = false;
             for (self.gc_fin_weak_tables.items) |t| {
-                if (t == tbl) { seen = true; break; }
+                if (t == tbl) {
+                    seen = true;
+                    break;
+                }
             }
             if (!seen) try self.gc_fin_weak_tables.append(self.alloc, tbl);
         }
@@ -21214,7 +21494,9 @@ pub const Vm = struct {
         // PUC loadfunc: dots → underscores in the module name.
         const modname_norm = try self.alloc.dupe(u8, modname);
         defer self.alloc.free(modname_norm);
-        for (modname_norm) |*ch| if (ch.* == '.') { ch.* = '_'; };
+        for (modname_norm) |*ch| if (ch.* == '.') {
+            ch.* = '_';
+        };
 
         // LUA_IGMARK ('-'): try prefix before dash, then suffix.
         // E.g. "lib2-v2" → try "luaopen_lib2" first, then "luaopen_v2".
@@ -22025,7 +22307,7 @@ pub const Vm = struct {
                         const current_line: i64 = self.frameCurrentLine(fr);
                         try self.setField(t, "currentline", .{ .Int = current_line });
                         if (what.len == 0 or debugInfoHasOpt(what, 't')) {
-                        const extraargs: i64 = if (fr.isVararg()) @intCast(self.frameVarargs(fr, th).len) else 0;
+                            const extraargs: i64 = if (fr.isVararg()) @intCast(self.frameVarargs(fr, th).len) else 0;
                             try self.setField(t, "istailcall", .{ .Bool = fr.isTailCall() });
                             try self.setField(t, "extraargs", .{ .Int = extraargs });
                         }
@@ -23052,8 +23334,8 @@ pub const Vm = struct {
         // P15.38f: Fast path — no hooks active, skip callee save/restore + dispatch.
         if (!self.hooks_active_cached) return;
         _ = callee; // Callee save/restore was only meaningful for IR frames
-                    // (Vm.call_frames), which is always empty now. The hook
-                    // receives the event/line/transfer directly.
+        // (Vm.call_frames), which is always empty now. The hook
+        // receives the event/line/transfer directly.
         try self.debugDispatchHookTransfer(event, line, transfer, transfer_start, hook_frame_idx);
     }
 
@@ -23810,9 +24092,9 @@ pub const Vm = struct {
             var mm_args = [_]Value{args[0]};
             const resolved = try self.resolveCallable(mmv, mm_args[0..], .{ .namewhat = "metamethod", .name = "__pairs" });
             defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-        switch (resolved.callee) {
-            .Builtin => |id| {
-                     try self.callBuiltin(id, resolved.args, outs);
+            switch (resolved.callee) {
+                .Builtin => |id| {
+                    try self.callBuiltin(id, resolved.args, outs);
                     if (builtinHasDynamicOutCount(id)) {
                         var i = self.last_builtin_out_count;
                         while (i < outs.len) : (i += 1) outs[i] = .Nil;
@@ -30833,8 +31115,7 @@ pub const Vm = struct {
     };
 
     fn resolveCallable(self: *Vm, initial_callee: Value, initial_args: []const Value, call_name: ?CallName) DispatchError!ResolvedCall {
-        if (initial_callee != .Builtin and initial_callee != .Closure) {
-        }
+        if (initial_callee != .Builtin and initial_callee != .Closure) {}
         var callee = initial_callee;
         var args: []const Value = initial_args;
         var owned: ?[]Value = null;
@@ -31018,13 +31299,14 @@ pub const Vm = struct {
     /// safe with no C wrapper). The thrown object is carried in `c_error_value`
     /// and folded into the VM's normal `err_obj` error state on this path.
     ///
-    /// TODO(PUC-parity): debug.getinfo does not see C function frames. PUC
-    /// pushes a CallInfo for C functions (ldo.c luaD_precall CIAFFULL /
-    /// `luaD_poscall` updates `ci`). luazig invokes `cf` synchronously without
-    /// recording a CallInfo, so getinfo-level reflection on C closures returns
-    /// incomplete info. Track and fix when the debug library is exercised
-    /// against C extensions.
-
+    /// P15.83r: C-function frames ARE visible to the debug library through
+    /// the C-hook path — callCFunction pushes a CallInfo (pushBuiltinCFrame)
+    /// and fires LUA_HOOKCALL on it (PUC precallC ordering); lua_getinfo on
+    /// the event's ar describes the C activation (what="C", source="=[C]",
+    /// name from the caller's call site). Note: builtin C-frames are hidden
+    /// from lua_getstack level walks (P15.79 design — luazig pushes them for
+    /// ALL builtins), so only hook-supplied ar identities reach them.
+    ///
     /// P15.78: C-callable shim that dispatches to the saved continuation `k`
     /// (stored in `c_cont_k`/`c_cont_status`/`c_cont_ctx`). `finishCcall`
     /// stores the continuation parameters here because `k` has signature
@@ -31217,7 +31499,6 @@ pub const Vm = struct {
         // nothing more to do — return 0 and let the yieldk continuation's
         // results propagate via resume_inbox.
         if (state.script_run) {
-
             return 0;
         }
 
@@ -31468,6 +31749,15 @@ pub const Vm = struct {
             const cur_fr = cur_th.call_frames.getPtr(my_cframe_idx);
             cur_fr.u.c.toclose_base = self.c_toclose_slots.items.len;
         }
+        // P15.83r (PUC ldo.c:642-656 precallC): the C CallInfo exists FIRST,
+        // then `luaD_hook(L, LUA_HOOKCALL, -1, 1, narg)` fires with ar.i_ci =
+        // the C activation. This covers EVERY route into callCFunction: C
+        // closures called from Lua bytecode (OP_CALL/OP_TAILCALL → runClosure),
+        // C-closure for-in iterators (OP_TFORCALL), lua_call/lua_pcall from C
+        // code (apiCall), and continuation re-entry. A C caller yields no
+        // name (getFuncNameForFrame: parent C-frame → null), matching PUC's
+        // getfuncname for a C-function caller.
+        try self.dispatchCCalleeActivationHook(my_cframe_idx, callee_val, args);
         // NOTE: Do NOT use `defer popBuiltinCFrame()` — the C-frame must
         // stay on `call_frames` when the C function yields via `lua_yieldk`,
         // so that `finishCcall` can invoke k on the next resume. We pop
@@ -33050,8 +33340,7 @@ pub const Vm = struct {
                             return;
                         },
                         error.OutOfMemory => return error.OutOfMemory,
-                        error.Yield, error.ThreadSwitch =>
-                            return self.fail("checkpanic: unexpected control flow in panic script", .{}),
+                        error.Yield, error.ThreadSwitch => return self.fail("checkpanic: unexpected control flow in panic script", .{}),
                     };
                     // PUC returns lua_tostring(L1, -1): the sub-VM stack top
                     // after the panic script. Fall back to the error message
@@ -33077,8 +33366,7 @@ pub const Vm = struct {
                 return;
             },
             error.OutOfMemory => return error.OutOfMemory,
-            error.Yield, error.ThreadSwitch =>
-                return self.fail("checkpanic: unexpected control flow", .{}),
+            error.Yield, error.ThreadSwitch => return self.fail("checkpanic: unexpected control flow", .{}),
         };
 
         // No error occurred — PUC pushes "no errors". Tests never hit this path
@@ -33173,43 +33461,43 @@ pub const Vm = struct {
                 // report errors from __close. PUC: OOM in __close is terminal.
                 if (err == error.OutOfMemory) {} else {
 
-                // Run remaining closers in LIFO order (PUC luaF_close).
-                // Skip closers already run by the C-frame closer loop
-                // (tracked by already_closed == close_current_index).
-                var current_err: ?Value = null;
-                if (self.err_has_obj) {
-                    current_err = self.err_obj;
-                } else if (self.err) |msg| {
-                    current_err = .{ .String = self.internStrAssume(msg) };
-                }
-                var skip_count: usize = already_closed;
-                var idx = st.items.len;
-                while (idx > 0) {
-                    idx -= 1;
-                    if (!testcIsMarked(toclose.items, idx)) continue;
-                    if (skip_count > 0) {
-                        skip_count -= 1;
-                        continue;
+                    // Run remaining closers in LIFO order (PUC luaF_close).
+                    // Skip closers already run by the C-frame closer loop
+                    // (tracked by already_closed == close_current_index).
+                    var current_err: ?Value = null;
+                    if (self.err_has_obj) {
+                        current_err = self.err_obj;
+                    } else if (self.err) |msg| {
+                        current_err = .{ .String = self.internStrAssume(msg) };
                     }
-                    self.runTestcCloseMetamethod(st.items[idx], current_err) catch |e| switch (e) {
-                        error.RuntimeError => {
-                            // PUC luaF_close: __close error replaces current
-                            // error (LIFO). Continue running remaining closers.
-                            if (self.err_has_obj) {
-                                current_err = self.err_obj;
-                            } else if (self.err) |msg| {
-                                current_err = .{ .String = self.internStrAssume(msg) };
-                            }
-                        },
-                        // Yield/OOM/ThreadSwitch in errdefer cleanup: stop
-                        // closing. The C-frame is already popped, so yield
-                        // can't be resumed. This is best-effort cleanup for
-                        // the error-before-closer-loop path (not the normal
-                        // resumable path, which goes through the C-frame
-                        // closer loop).
-                        else => break,
-                    };
-                }
+                    var skip_count: usize = already_closed;
+                    var idx = st.items.len;
+                    while (idx > 0) {
+                        idx -= 1;
+                        if (!testcIsMarked(toclose.items, idx)) continue;
+                        if (skip_count > 0) {
+                            skip_count -= 1;
+                            continue;
+                        }
+                        self.runTestcCloseMetamethod(st.items[idx], current_err) catch |e| switch (e) {
+                            error.RuntimeError => {
+                                // PUC luaF_close: __close error replaces current
+                                // error (LIFO). Continue running remaining closers.
+                                if (self.err_has_obj) {
+                                    current_err = self.err_obj;
+                                } else if (self.err) |msg| {
+                                    current_err = .{ .String = self.internStrAssume(msg) };
+                                }
+                            },
+                            // Yield/OOM/ThreadSwitch in errdefer cleanup: stop
+                            // closing. The C-frame is already popped, so yield
+                            // can't be resumed. This is best-effort cleanup for
+                            // the error-before-closer-loop path (not the normal
+                            // resumable path, which goes through the C-frame
+                            // closer loop).
+                            else => break,
+                        };
+                    }
                 } // end else (not OOM)
             }
         }
@@ -35063,10 +35351,10 @@ pub const Vm = struct {
                 // PUC luaD_pcall: clear errfunc for the protected child.
                 // In testC mode, errfunc might be set from the CLI handler.
                 // Clear it so the error message isn't modified by the handler.
-        const th_xpcall = self.activeBytecodeThread();
-        const saved_errfunc = th_xpcall.errfunc;
-        th_xpcall.errfunc = ERRFUNC_NONE;
-        defer th_xpcall.errfunc = saved_errfunc;
+                const th_xpcall = self.activeBytecodeThread();
+                const saved_errfunc = th_xpcall.errfunc;
+                th_xpcall.errfunc = ERRFUNC_NONE;
+                defer th_xpcall.errfunc = saved_errfunc;
                 const ret = self.apiCall(callee, call_args) catch {
                     const errv = self.protectedErrorValue();
                     if (isTestcMemoryErrorValue(errv)) {
@@ -36258,7 +36546,10 @@ test "vm: callCFunction dispatches a c_func closure" {
     const doubler = struct {
         fn run(L: ?*lua_State) callconv(.c) c_int {
             const v = L.?.vm.cur_c_stack.items[0];
-            const n: i64 = switch (v) { .Int => |i| i, else => 0 };
+            const n: i64 = switch (v) {
+                .Int => |i| i,
+                else => 0,
+            };
             L.?.vm.cur_c_stack.append(L.?.vm.alloc, .{ .Int = n * 2 }) catch {};
             return 1;
         }

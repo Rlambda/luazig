@@ -1208,7 +1208,9 @@ pub export fn lua_toboolean(L: ?*lua_State, idx: c_int) c_int {
     const h = L orelse return 0;
     const vm = h.vm;
     if (upvalueAt(vm, idx)) |v| return switch (v) {
-        .Nil => 0, .Bool => |b| if (b) 1 else 0, else => 1,
+        .Nil => 0,
+        .Bool => |b| if (b) 1 else 0,
+        else => 1,
     };
     var s = api.State.fromHandle(h);
     return if (s.toboolean(idx)) 1 else 0;
@@ -2132,12 +2134,24 @@ pub export fn luaL_optnumber(L: ?*lua_State, arg: c_int, def: f64) f64 {
 
 pub export fn luaL_optlstring(L: ?*lua_State, arg: c_int, def: ?[*:0]const u8, l: ?*usize) [*:0]const u8 {
     var s = api.State.fromHandle(L orelse {
-        if (l) |p| { if (def) |d| { p.* = std.mem.len(d); } else { p.* = 0; } }
+        if (l) |p| {
+            if (def) |d| {
+                p.* = std.mem.len(d);
+            } else {
+                p.* = 0;
+            }
+        }
         return def orelse "";
     });
     const ty = s.typeOf(arg);
     if (ty == null or ty.? == .nil) {
-        if (l) |p| { if (def) |d| { p.* = std.mem.len(d); } else { p.* = 0; } }
+        if (l) |p| {
+            if (def) |d| {
+                p.* = std.mem.len(d);
+            } else {
+                p.* = 0;
+            }
+        }
         return def orelse "";
     }
     const bytes = s.checklstring(arg);
@@ -2269,19 +2283,29 @@ pub export fn luaL_traceback(L: ?*lua_State, L1: ?*lua_State, msg: ?[*:0]const u
 }
 
 pub export fn luaL_tolstring(L: ?*lua_State, idx: c_int, l: ?*usize) [*:0]const u8 {
-    var s = api.State.fromHandle(L orelse { if (l) |p| p.* = 0; return ""; });
+    var s = api.State.fromHandle(L orelse {
+        if (l) |p| p.* = 0;
+        return "";
+    });
     if (s.tolstring(idx)) |bytes| {
         if (l) |p| p.* = bytes.len;
         return @ptrCast(@constCast(bytes.ptr));
     }
     if (s.typeOf(idx)) |t| {
         const name = switch (t) {
-            .nil => "nil", .boolean => "true", .table => "table: 0x0",
-            .function => "function: 0x0", .userdata => "userdata: 0x0",
-            .thread => "thread: 0x0", .lightuserdata => "lightuserdata: 0x0",
+            .nil => "nil",
+            .boolean => "true",
+            .table => "table: 0x0",
+            .function => "function: 0x0",
+            .userdata => "userdata: 0x0",
+            .thread => "thread: 0x0",
+            .lightuserdata => "lightuserdata: 0x0",
             .number, .string => "value",
         };
-        const ls = s.vm.internStr(name) catch { if (l) |p| p.* = 0; return ""; };
+        const ls = s.vm.internStr(name) catch {
+            if (l) |p| p.* = 0;
+            return "";
+        };
         s.stack.append(s.vm.alloc, .{ .String = ls }) catch {};
         if (l) |p| p.* = name.len;
         return @ptrCast(@constCast(ls.bytes().ptr));
@@ -2546,9 +2570,20 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
                     ar.nparams = p.numparams;
                     ar.isvararg = if (p.is_vararg) 1 else 0;
                 } else {
-                    ar.nups = @intCast(vm.frameUpvalues(frame, null).len);
+                    // PUC ldebug.c:344-348 (auxgetinfo 'u' for C functions):
+                    // nups = nupvalues of the called function (0 for light C
+                    // functions / builtins), nparams = 0, isvararg = 1 — C
+                    // functions accept any number of arguments.
+                    const func = if (frame.func_slot < vm.bc_stack.len)
+                        vm.bc_stack[frame.func_slot]
+                    else
+                        .Nil;
+                    ar.nups = if (func == .Closure)
+                        @intCast(func.Closure.upvalues.len)
+                    else
+                        0;
                     ar.nparams = 0;
-                    ar.isvararg = 0;
+                    ar.isvararg = 1;
                 }
             },
             't' => {
@@ -3053,7 +3088,7 @@ pub export fn luaL_addgsub(B: *luaL_Buffer, s: [*c]const u8, p: [*c]const u8, r:
             luaL_addlstring(B, @ptrCast(rep.ptr), rep.len);
             i += pat.len;
         } else {
-            const ch = src[i..i + 1];
+            const ch = src[i .. i + 1];
             luaL_addlstring(B, @ptrCast(ch.ptr), 1);
             i += 1;
         }

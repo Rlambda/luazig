@@ -936,10 +936,167 @@ static int test_call_hook_paths(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Test 11: C-callee CALL identity (review item 3, PUC precallC)       */
+/* ------------------------------------------------------------------ */
+
+/*
+** PUC model (ldo.c:642-656 precallC): for EVERY C-function callee
+** (light C function, C closure, or stdlib builtin) luaD_precall pushes
+** the C CallInfo FIRST (prepCallInfo ... | CIST_C), THEN fires
+** luaD_hook(L, LUA_HOOKCALL, -1, 1, narg). The hook's ar references the
+** C activation, so lua_getinfo(L, "nSlut", ar) must describe the CALLEE:
+**   what="C", source/short_src="=[C]", linedefined=-1, currentline=-1,
+**   istailcall=0 (fresh ci, no CIST_TAIL — even for a tail call to C,
+**   ldo.c luaD_pretailcall routes C callees through precallC and fires
+**   plain LUA_HOOKCALL), nups=nupvalues, nparams=0, isvararg=1
+**   (ldebug.c:345-348: C functions report isvararg=1), and name/namewhat
+**   resolved from the CALLER's call-site bytecode (ldebug.c:323
+**   getfuncname): global / upvalue / field / method / "".
+**
+** Prints one line per CALL/TAILCALL event; byte-identical PUC vs luazig.
+*/
+
+static void c_id_hook(lua_State *L, lua_Debug *ar) {
+    if (ar->event != LUA_HOOKCALL && ar->event != LUA_HOOKTAILCALL) return;
+    const char *ev = ar->event == LUA_HOOKCALL ? "CALL" : "TCALL";
+    if (!lua_getinfo(L, "nSlut", ar)) {
+        printf("%s getinfo=FAIL\n", ev);
+        return;
+    }
+    printf("%s what=%s name=%s nw=%s src=%.10s ld=%d cl=%d tail=%d nups=%d nparams=%d va=%d\n",
+           ev,
+           ar->what ? ar->what : "?",
+           ar->name ? ar->name : "~",
+           ar->namewhat ? ar->namewhat : "~",
+           ar->short_src,
+           (int)ar->linedefined, (int)ar->currentline,
+           (int)ar->istailcall, (int)ar->nups,
+           (int)ar->nparams, (int)ar->isvararg);
+}
+
+/* The registered C function: returns its integer argument plus one. */
+static int cf_bump(lua_State *L) {
+    lua_pushinteger(L, lua_tointeger(L, 1) + 1);
+    return 1;
+}
+
+/* C closure with one upvalue: returns upvalue + argument. */
+static int cc_add_up(lua_State *L) {
+    lua_Integer up = 0;
+    lua_getupvalue(L, 1, 1);  /* push upvalue, return its name */
+    up = lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    lua_pushinteger(L, up + lua_tointeger(L, 1));
+    return 1;
+}
+
+/* C-closure for-in iterator: yields 1 then 2 then stops. PUC OP_TFORCALL
+   calls it via luaD_call → precallC → CALL with name="for iterator". */
+static int c_iter(lua_State *L) {
+    lua_Integer n = lua_tointeger(L, 2);
+    if (n >= 2) return 0;
+    lua_pushinteger(L, n + 1);
+    return 1;
+}
+
+static int test_c_callee_call_identity(void) {
+    lua_State *L = luaL_newstate();
+    luaL_openlibs(L);
+
+    lua_pushcfunction(L, cf_bump);
+    lua_setglobal(L, "cf");
+    lua_pushinteger(L, 100);
+    lua_pushcclosure(L, cc_add_up, 1);
+    lua_setglobal(L, "cc");
+    lua_pushcfunction(L, c_iter);
+    lua_setglobal(L, "c_iter");
+
+    lua_sethook(L, c_id_hook, LUA_MASKCALL, 0);
+
+    printf("== c_callee: global C fn from named fn ==\n");
+    if (luaL_dostring(L,
+            "local function caller(x) return cf(x) end\n"
+            "return caller(41)\n") != LUA_OK) {
+        printf("FAIL: t11 global: %s\n", lua_tostring(L, -1));
+        lua_close(L);
+        return 1;
+    }
+
+    printf("== c_callee: C fn via upvalue ==\n");
+    if (luaL_dostring(L,
+            "local lcf = cf\n"
+            "local function caller2(x) return lcf(x) end\n"
+            "return caller2(1)\n") != LUA_OK) {
+        printf("FAIL: t11 upvalue: %s\n", lua_tostring(L, -1));
+        lua_close(L);
+        return 1;
+    }
+
+    printf("== c_callee: builtin print ==\n");
+    if (luaL_dostring(L, "print(1)\n") != LUA_OK) {
+        printf("FAIL: t11 print: %s\n", lua_tostring(L, -1));
+        lua_close(L);
+        return 1;
+    }
+
+    printf("== c_callee: builtin field call string.format ==\n");
+    if (luaL_dostring(L, "return string.format('%d', 7)\n") != LUA_OK) {
+        printf("FAIL: t11 format: %s\n", lua_tostring(L, -1));
+        lua_close(L);
+        return 1;
+    }
+
+    printf("== c_callee: method call s:upper ==\n");
+    if (luaL_dostring(L, "local s = 'ab'\nreturn s:upper()\n") != LUA_OK) {
+        printf("FAIL: t11 upper: %s\n", lua_tostring(L, -1));
+        lua_close(L);
+        return 1;
+    }
+
+    printf("== c_callee: tail call to C fn ==\n");
+    if (luaL_dostring(L,
+            "local function tcf(x) return cf(x) end\n"
+            "return tcf(9)\n") != LUA_OK) {
+        printf("FAIL: t11 tail: %s\n", lua_tostring(L, -1));
+        lua_close(L);
+        return 1;
+    }
+
+    printf("== c_callee: C closure with upvalue ==\n");
+    if (luaL_dostring(L, "return cc(23)\n") != LUA_OK) {
+        printf("FAIL: t11 closure: %s\n", lua_tostring(L, -1));
+        lua_close(L);
+        return 1;
+    }
+
+    printf("== c_callee: for-in over builtin iterator (pairs/next) ==\n");
+    if (luaL_dostring(L, "local t = {10,20}\nfor k in pairs(t) do end\n") != LUA_OK) {
+        printf("FAIL: t11 iter: %s\n", lua_tostring(L, -1));
+        lua_close(L);
+        return 1;
+    }
+
+    printf("== c_callee: for-in over C-closure iterator ==\n");
+    if (luaL_dostring(L, "for x in c_iter, nil, 0 do end\n") != LUA_OK) {
+        printf("FAIL: t11 c_iter: %s\n", lua_tostring(L, -1));
+        lua_close(L);
+        return 1;
+    }
+
+    printf("PASS: t11 c_callee_call_identity\n");
+    lua_close(L);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Main                                                               */
 /* ------------------------------------------------------------------ */
 
 int main(void) {
+    /* Unbuffered stdout: luazig's `print` writes through its own channel
+       (not the C stdio buffer the hooks use), so buffering would reorder
+       builtin output vs hook-trace lines between the two runtimes. */
+    setvbuf(stdout, NULL, _IONBF, 0);
     int fail = 0;
     fail += test_count_hook();
     fail += test_gethook_api();
@@ -951,6 +1108,7 @@ int main(void) {
     fail += test_hook_exec_isolation();
     fail += test_call_hook_identity();
     fail += test_call_hook_paths();
+    fail += test_c_callee_call_identity();
     if (fail == 0) {
         printf("ALL PASS\n");
     } else {

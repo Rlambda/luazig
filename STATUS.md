@@ -1,4 +1,4 @@
-> Last updated: 2026-08-25 (P15.83q: exact PUC resume-boundary stack exposure for error and hook-yield resumes)
+> Last updated: 2026-08-25 (P15.83r: C-callee CALL hooks fire on the C activation — PUC precallC ordering)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -2214,10 +2214,15 @@ removed (C-frame TBC "NOT closed here" gone since P15.83c).
 1. Count-hook absolute fire counts differ (instruction density: luazig
    codegen emits different opcode counts; documented TODO
    count-hook-codegen-parity). Semantics (sum, line events) identical.
-2. lua_Debug.i_ci for CALL events points at the caller frame in the
-   sync dispatch path (the callee frame is not pushed yet); line/count/
-   return events carry the correct current frame. lua_getinfo "l" from
-   hooks works.
+ 2. ~~lua_Debug.i_ci for CALL events points at the caller frame in the
+    sync dispatch path (the callee frame is not pushed yet); line/count/
+    return events carry the correct current frame. lua_getinfo "l" from
+    hooks works.~~ — RESOLVED: P15.83l fixed Lua-callee CALL identity
+    (callee frame pushed before the hook); P15.83r fixed C-callee CALL
+    identity (C-frame pushed before the hook, PUC precallC ordering).
+    Remaining scoped-out sub-cases (divert-bound builtins, frameless
+    collectgarbage/string_sub, IR closures) keep caller-frame identity —
+    see P15.83r for the full list.
 3. ~~api_check-style enforcement (k!=NULL inside hooks; yieldk nresults
    in hooks) is not raised as a runtime error~~ — RESOLVED in P15.83m:
    the shared helpers now raise LUA_ERRRUN with the PUC message text
@@ -2318,16 +2323,16 @@ All byte-identical PUC vs luazig (make test-diff DIFF: PASS).
 - xpcall error handler (what=Lua ld=1, no name) ✓ (was: no event)
 - resume-after-yield: no body re-CALL ✓ (was: extra event per resume)
 
-**Known remaining gap (documented, out of scope):** CALL events for
+**Known remaining gap (documented, out of scope):** ~~CALL events for
 C-function callees (pcall, print, coroutine.yield, ...) fire with the
 correct COUNT and event type (including tailcall-to-C firing CALL), but
-`ar.i_ci` references the caller frame: PUC pushes a C-function CallInfo
-(precallC) and the hook describes it (what="C", source="=[C]", name from
-the caller's call site). luazig runs builtins without a CallInfo (see the
-callCFunction TODO in vm.zig); fixing this requires C-function frames on
-every callBuiltin path (push/pop/unwind/yield) — separate architectural
-blocker. t10's trace chunks are therefore Lua-only-call; the C-callee
-event count is asserted instead.
+`ar.i_ci` references the caller frame~~ — RESOLVED in P15.83r: C-callee
+CALL events now fire on the C activation's CallFrame (PUC precallC
+ordering) for sync-bound builtins, builtin/C-closure for-in iterators,
+tail calls to C, C closures from Lua and from C (lua_call/lua_pcall),
+and C metamethods. The remaining divert-bound/frameless sub-cases are
+listed in P15.83r. t10's trace chunks stay Lua-only-call (historical);
+t11 covers the C-callee identity byte-identically.
 
 **Gates (all green):** zig build ReleaseFast; make -C tests/c_api test
 16/16 exit 0; make test-diff strict DIFF: PASS; coroutine.lua --testc
@@ -2403,6 +2408,108 @@ ReleaseFast exit 0; make -C tests/c_api test 17/17 exit 0; test-diff
 DIFF: PASS (6 suites, unchanged); coroutine.lua --testc exit 0
 (ulimit -v 2000000, timeout 30); smoke 54/54 exit 0; matrix zig_fail=0
 (big.lua both_fail, pre-existing infra).
+
+### P15.83r — C-callee CALL hooks fire on the C activation (PUC precallC ordering)
+
+**Review item 3 (P15.83o list):** CALL events for C-function/builtin callees
+exposed the CALLER frame in `ar.i_ci`. RESOLVED the PUC-faithful way: the
+C CallFrame now exists BEFORE the CALL hook fires, and the hook describes
+it.
+
+**PUC reference** (lua-5.5.0/src/ldo.c:642-656 precallC): for a C callee
+(light C function, C closure, stdlib builtin), `precallC` runs
+`L->ci = ci = prepCallInfo(L, func, status | CIST_C, ...)` FIRST, then
+`luaD_hook(L, LUA_HOOKCALL, -1, 1, narg)` — so the hook's `ar.i_ci` is the
+C activation and `lua_getinfo(L, "nSlut", ar)` reports: `what="C"`,
+`source/short_src="=[C]"`, `linedefined=-1`, `currentline=-1`,
+`istailcall=0` (fresh ci — even for tail calls to C, since
+`luaD_pretailcall` routes C callees through precallC without CIST_TAIL,
+firing a plain LUA_HOOKCALL), `nups=nupvalues`, `nparams=0`,
+`isvararg=1` (ldebug.c:344-348 — C functions report isvararg=1), and
+name/namewhat from the CALLER's call-site bytecode (ldebug.c:323
+getfuncname → global/upvalue/field/method; a C caller yields no name).
+Probe-verified on PUC 5.5.0 before implementation (probe table in the
+iteration log; all fields byte-identical after the fix).
+
+**Changes (src/lua/vm.zig):**
+1. New `dispatchCCalleeActivationHook(cframe_idx, callee, args)` — fires
+   "call" with the explicit C-frame index; ntransfer = actual narg
+   (precallC), no savedpc bump (no bytecode pc), always a plain "call"
+   event. Same guards as the Lua-callee helper
+   (hooks_active_cached / suppressed / in_debug_hook / has_call).
+2. OP_CALL: the sync (C-hook) dispatch for sync-bound builtins moved to
+   the callBuiltin site — `pushBuiltinCFrame` → fire on the C-frame →
+   `builtin_cframe_pre_pushed = true` → `callBuiltin` REUSES the frame
+   (new Vm flag, consumed at callBuiltin entry; exactly one C-frame per
+   builtin invocation, whoever pushed it). C-closure callees skip the
+   opCall-site dispatch entirely (callCFunction fires). IR-closure
+   callees keep the legacy caller-frame dispatch.
+3. OP_TAILCALL: same split — tail call to C fires a plain "call" on a
+   fresh C-frame at the sync callBuiltin site (PUC pretailcall→precallC).
+4. OP_TFORCALL: builtin iterators (e.g. `next` from `pairs(t)`) now fire
+   CALL at all (previously NO event) — on the C-frame, name resolves to
+   "for iterator" (getFuncNameForFrame .tforcall branch). C-closure
+   iterators fire via callCFunction.
+5. `callCFunction`: fires the CALL event right after its C-frame push +
+   toclose_base setup — covering C closures from Lua bytecode, for-in
+   iterators, `lua_call`/`lua_pcall` from C, continuations, and C
+   metamethods (C caller → no name, matching PUC getfuncname).
+6. `getFuncNameForFrame` (.call/.tailcall branch): C frames no longer
+   read `u.lua.func_slot_base` (union member mismatch); PUC-style name
+   recovery reads the call instruction's A operand directly
+   (funcnamefromcode's own approach) because luazig's builtin C-frames
+   live at bc_stack_top, not at the caller's callee register.
+7. `callBuiltin`: consumes `builtin_cframe_pre_pushed` (see 2).
+
+**Changes (src/lua/c_api.zig):** `lua_getinfo` 'u' for C frames now
+matches PUC auxgetinfo exactly: `isvararg=1`, `nparams=0`, `nups` = the
+called function's upvalue count (0 for light C functions/builtins,
+N for C closures) — read from `bc_stack[frame.func_slot]`.
+
+**Scoped-out sub-cases (documented deviations, correct count/type, caller
+frame identity in the event):**
+- Divert-bound builtins — pcall/xpcall (bytecode-target fast path),
+  coroutine.resume/wrap (thread switch), string.gsub (function repl),
+  pairs with a bytecode `__pairs` metamethod: the iterative fast paths
+  replace the call with bytecode continuations whose completion machinery
+  requires the body frame to sit directly above the pending-call owner
+  (a plain builtin C-frame in between would be misrouted by the
+  `parent.isC()` return routing in completeBytecodeExecFrame — the
+  structural wall confirmed by reading the frame-return flow). Predicate:
+  `builtinCallMayDivert` — exact for pairs (metamethod check), otherwise
+  conservative by id; a misprediction can only affect WHICH identity an
+  event gets, never duplicate or lose events. NOTE: plain-table
+  `pairs(t)` gets the full C identity (exact predicate).
+- Frameless builtins `collectgarbage`/`string_sub` (pre-existing hot-path
+  C-frame exclusion, predates P15.83r).
+- IR-closure callees (luazig-internal, no PUC equivalent).
+- `lua_call` from C on a BUILTIN (C closures are covered; builtins called
+  via the C API fire no event — PUC's precallC would).
+- getstack LEVEL WALKS from inside a C hook still skip builtin C-frames
+  (P15.79 hidden-C-frames design — luazig pushes C-frames for ALL
+  builtins, unhiding would break level numbering globally). Only
+  hook-supplied `ar` identities reach C-frames. Same limitation as
+  before P15.83r; the event identity itself is now PUC-exact.
+
+**Test coverage:** tests/c_api/12_chook.c t11 `test_c_callee_call_identity`
+(in DIFF gate) — byte-identical PUC vs luazig per-event lines for:
+registered C fn as global (`name=cf nw=global`), via upvalue
+(`nw=upvalue`), `print(1)` (`name=print`), `string.format` (`nw=field`),
+`s:upper()` (`nw=method`), tail call to C (plain CALL, `tail=0`),
+C closure with upvalue (`nups=1`), for-in over `pairs`/`next` (3×
+`name=for iterator`) and over a C-closure iterator. stdout unbuffered so
+builtin output interleaves chronologically in both runtimes.
+
+**Gates (all green, final binary):** make -C tests/c_api test exit 0
+(17 suites); make test-diff strict DIFF: PASS; coroutine.lua --testc
+exit 0, output identical to pre-change baseline (ulimit -v 2000000,
+timeout 30); smoke_compare 54/54 PASS; zig build test exit 0; matrix
+zig_fail=0 (big.lua both_fail, pre-existing infra); perf_compare.py
+--no-build --runs 7 RESULT OK, geomean 2.52x (P15.83q: 2.67x; the box
+showed ±10% noise during measurement — verified with stash-control A/B
+that the change adds no hot-path cost when no hooks are set: all new
+code sits behind the hooks_active_cached guard; callBuiltin pays two
+flag instructions).
 
 ### P15.83q — Exact PUC resume-boundary stack exposure for error and hook-yield resumes (review blockers 1-2)
 

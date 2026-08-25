@@ -516,11 +516,142 @@ static void test_resume_args_mix_exact(void) {
     printf("test_resume_args_mix_exact: PASS\n");
 }
 
-/* Test 19 (P15.83k edge case 3): error after a yield — the error object is
- * on top, the stale yielded value is gone, and lua_status preserves the
- * error. (Checked via invariants that hold identically on PUC and luazig:
- * PUC's error-path stack keeps frame-relative residue whose exact layout
- * is not part of the API contract; luazig exposes just the error object.) */
+/* Test 19 (P15.83q, review blocker 1): error-resume stack exposure is
+ * EXACT. PUC lua_resume's error path runs luaD_seterrorobj with
+ * oldtop == L->top (ldo.c:983-988 + ldo.c:112-122), which DUPLICATES the
+ * top-1 error object on top of the residue: the visible window (relative
+ * to the innermost CallInfo at throw time) is [err, err] with
+ * *nresults == 2 for errors surfacing from a C-function frame (error(),
+ * assert(), ...). Byte-identical on PUC and luazig. */
+static void test_resume_error_stack_exact(void) {
+    lua_State *L = luaL_newstate();
+    assert(L != NULL);
+    luaL_openlibs(L);
+    lua_State *co = lua_newthread(L);
+    lua_pop(L, 1);
+    assert(luaL_loadstring(co, "coroutine.yield('Y'); error('boom', 0)") == LUA_OK);
+
+    int nres = 0;
+    int status = lua_resume(co, L, 0, &nres);
+    assert(status == LUA_YIELD);
+    assert(nres == 1);
+    assert(lua_gettop(co) == 1);
+    assert(strcmp(lua_tostring(co, 1), "Y") == 0);
+
+    status = lua_resume(co, L, 0, &nres);
+    assert(status == LUA_ERRRUN);
+    assert(lua_status(co) == LUA_ERRRUN);
+    assert(nres == 2);
+    assert(lua_gettop(co) == 2);
+    for (int i = 1; i <= lua_gettop(co); i++) {
+        const char *s = lua_tostring(co, i);
+        assert(lua_type(co, i) == LUA_TSTRING);
+        assert(s != NULL && strcmp(s, "boom") == 0);
+    }
+
+    /* same shape with the error raised DEEPER in Lua calls: the window is
+     * relative to the innermost (C) frame, intermediate frames' registers
+     * are below it and not visible */
+    lua_State *c2 = lua_newthread(L);
+    lua_pop(L, 1);
+    assert(luaL_loadstring(c2,
+        "coroutine.yield('Y'); "
+        "local f = function() error('deep', 0) end; "
+        "f(); return 1") == LUA_OK);
+    status = lua_resume(c2, L, 0, &nres);
+    assert(status == LUA_YIELD);
+    status = lua_resume(c2, L, 0, &nres);
+    assert(status == LUA_ERRRUN);
+    assert(nres == 2);
+    assert(lua_gettop(c2) == 2);
+    assert(strcmp(lua_tostring(c2, 1), "deep") == 0);
+    assert(strcmp(lua_tostring(c2, 2), "deep") == 0);
+
+    /* same shape with a non-string error object */
+    lua_State *c3 = lua_newthread(L);
+    lua_pop(L, 1);
+    assert(luaL_loadstring(c3,
+        "coroutine.yield('Y'); "
+        "local t = setmetatable({}, {__tostring=function() return 'TBL' end}); "
+        "error(t, 0)") == LUA_OK);
+    status = lua_resume(c3, L, 0, &nres);
+    assert(status == LUA_YIELD);
+    status = lua_resume(c3, L, 0, &nres);
+    assert(status == LUA_ERRRUN);
+    assert(nres == 2);
+    assert(lua_gettop(c3) == 2);
+    assert(lua_type(c3, 1) == LUA_TTABLE);
+    assert(lua_type(c3, 2) == LUA_TTABLE);
+    assert(lua_rawequal(c3, 1, 2));  /* the SAME object, duplicated */
+
+    /* same shape after a pcall-recovered inner error */
+    lua_State *c4 = lua_newthread(L);
+    lua_pop(L, 1);
+    assert(luaL_loadstring(c4,
+        "coroutine.yield('Y'); "
+        "local ok, err = pcall(function() error('inner', 0) end); "
+        "error('after:' .. tostring(ok), 0)") == LUA_OK);
+    status = lua_resume(c4, L, 0, &nres);
+    assert(status == LUA_YIELD);
+    status = lua_resume(c4, L, 0, &nres);
+    assert(status == LUA_ERRRUN);
+    assert(nres == 2);
+    assert(lua_gettop(c4) == 2);
+    assert(strcmp(lua_tostring(c4, 1), "after:false") == 0);
+    assert(strcmp(lua_tostring(c4, 2), "after:false") == 0);
+
+    /* level-1 error(msg): error()'s C frame keeps the ORIGINAL string
+     * below the built message — window [orig, prefixed, prefixed], and
+     * assert(false, msg) goes through the same luaB_error path */
+    lua_State *c5 = lua_newthread(L);
+    lua_pop(L, 1);
+    assert(luaL_loadstring(c5,
+        "coroutine.yield('Y'); local f = function() error('lvl2', 2) end; f()") == LUA_OK);
+    status = lua_resume(c5, L, 0, &nres);
+    assert(status == LUA_YIELD);
+    status = lua_resume(c5, L, 0, &nres);
+    assert(status == LUA_ERRRUN);
+    assert(nres == 3);
+    assert(lua_gettop(c5) == 3);
+    assert(strcmp(lua_tostring(c5, 1), "lvl2") == 0);
+    assert(strstr(lua_tostring(c5, 2), "lvl2") != NULL);
+    assert(strstr(lua_tostring(c5, 3), "lvl2") != NULL);
+
+    lua_State *c6 = lua_newthread(L);
+    lua_pop(L, 1);
+    assert(luaL_loadstring(c6, "coroutine.yield('Y'); assert(false, 'am')") == LUA_OK);
+    status = lua_resume(c6, L, 0, &nres);
+    assert(status == LUA_YIELD);
+    status = lua_resume(c6, L, 0, &nres);
+    assert(status == LUA_ERRRUN);
+    assert(nres == 3);
+    assert(lua_gettop(c6) == 3);
+    assert(strcmp(lua_tostring(c6, 1), "am") == 0);
+    assert(strstr(lua_tostring(c6, 2), "am") != NULL);
+    assert(strstr(lua_tostring(c6, 3), "am") != NULL);
+
+    /* non-string assert message: raised as-is, no prefix, no residue */
+    lua_State *c7 = lua_newthread(L);
+    lua_pop(L, 1);
+    assert(luaL_loadstring(c7, "coroutine.yield('Y'); assert(false, {})") == LUA_OK);
+    status = lua_resume(c7, L, 0, &nres);
+    assert(status == LUA_YIELD);
+    status = lua_resume(c7, L, 0, &nres);
+    assert(status == LUA_ERRRUN);
+    assert(nres == 2);
+    assert(lua_gettop(c7) == 2);
+    assert(lua_type(c7, 1) == LUA_TTABLE);
+    assert(lua_type(c7, 2) == LUA_TTABLE);
+    assert(lua_rawequal(c7, 1, 2));
+
+    lua_close(L);
+    printf("test_resume_error_stack_exact: PASS\n");
+}
+
+/* Test 19b (P15.83k edge case 3, superseded by test_resume_error_stack_exact
+ * but kept for the yield-side replacement invariants): error after a yield
+ * — the error object is on top, the stale yielded value is gone, and
+ * lua_status preserves the error. */
 static void test_resume_error_replacement(void) {
     lua_State *L = luaL_newstate();
     assert(L != NULL);
@@ -539,9 +670,16 @@ static void test_resume_error_replacement(void) {
     status = lua_resume(co, L, 0, &nres);
     assert(status == LUA_ERRRUN);
     assert(lua_status(co) == LUA_ERRRUN);
-    /* error object on top of the stack */
-    assert(lua_isstring(co, -1));
-    assert(strstr(lua_tostring(co, -1), "boom") != NULL);
+    /* exact PUC window for error(msg) with level 1 (default): the error()
+     * C frame keeps the ORIGINAL string below the built message, so the
+     * window is [orig, prefixed-msg, prefixed-msg-dup] (nres == 3) */
+    assert(nres == 3);
+    assert(lua_gettop(co) == 3);
+    assert(lua_type(co, 1) == LUA_TSTRING);
+    assert(strcmp(lua_tostring(co, 1), "boom") == 0);
+    for (int i = 2; i <= lua_gettop(co); i++)
+        assert(lua_type(co, i) == LUA_TSTRING &&
+               strstr(lua_tostring(co, i), "boom") != NULL);
     /* stale 'Y' must not remain anywhere in the visible window */
     for (int i = 1; i <= lua_gettop(co); i++)
         assert(!(lua_type(co, i) == LUA_TSTRING &&
@@ -549,6 +687,172 @@ static void test_resume_error_replacement(void) {
 
     lua_close(L);
     printf("test_resume_error_replacement: PASS\n");
+}
+
+/* ---- P15.83q hook-yield visibility tests (review blocker 2) ---- */
+
+/* Shared dump helper: print the visible window of a suspended coroutine.
+ * Reads values WITHOUT conversion — lua_tostring would convert number
+ * slots to strings in place (C API in-place number→string), breaking any
+ * later numeric assert on the same slot. */
+static void dump_window(lua_State *co, const char *tag) {
+    printf("%s top=%d", tag, lua_gettop(co));
+    for (int i = 1; i <= lua_gettop(co); i++) {
+        int t = lua_type(co, i);
+        printf(" [v%d:%s", i, lua_typename(co, t));
+        if (t == LUA_TNUMBER)
+            printf("=%g", (double)lua_tonumber(co, i));
+        else if (t == LUA_TSTRING)
+            printf("=%s", lua_tostring(co, i));
+        printf("]");
+    }
+    printf("\n");
+}
+
+/* Test 21 (P15.83q, review blocker 2): a line hook yielding inside a C
+ * continuation chain. PUC mechanics: luaG_traceexec raises L->top to the
+ * suspended Lua frame's full register window BEFORE dispatching the hook
+ * (ldebug.c:954); lua_yieldk in a hook just returns (ldo.c:1025-1028) and
+ * the following luaD_throw(L, LUA_YIELD) longjmps PAST luaD_hook's top
+ * restore (ldo.c:458-465). So at the resume boundary: *nresults = nyield
+ * = 0 while lua_gettop exposes the ENTIRE register file of the suspended
+ * frame (maxstacksize slots). The next resume must NOT re-fire the hook
+ * (CIST_HOOKYIELD) and must complete the continuation chain. */
+static int hookcont_did_yield;
+static void hookcont_line_hook(lua_State *L, lua_Debug *ar) {
+    (void)ar;
+    if (!hookcont_did_yield) {
+        hookcont_did_yield = 1;
+        (void)lua_yieldk(L, 0, 0, NULL);
+    }
+}
+static int hookcont_outer_k(lua_State *L, int status, lua_KContext ctx) {
+    (void)status; (void)ctx;
+    lua_pushliteral(L, "K");
+    return 1;
+}
+static int hookcont_outer(lua_State *L) {
+    lua_pushvalue(L, 1);
+    lua_callk(L, 0, 1, 0, hookcont_outer_k);
+    return 1;
+}
+static void test_hook_yield_inside_c_continuation(void) {
+    lua_State *L = luaL_newstate();
+    assert(L != NULL);
+    luaL_openlibs(L);
+    lua_State *co = lua_newthread(L);
+    lua_pop(L, 1);
+    lua_pushcfunction(co, hookcont_outer);
+    assert(luaL_loadstring(co, "local x=1; x=x+1; return x") == LUA_OK);
+    hookcont_did_yield = 0;
+    lua_sethook(co, hookcont_line_hook, LUA_MASKLINE, 0);
+    int nres = 0;
+    int st = lua_resume(co, L, 1, &nres);
+    /* suspension: nres == nyield == 0, but the window shows the chunk's
+     * whole register file: 2 nil slots */
+    assert(st == LUA_YIELD);
+    assert(nres == 0);
+    assert(lua_gettop(co) == 2);
+    dump_window(co, "hookcont-r1");
+    for (int i = 1; i <= lua_gettop(co); i++)
+        assert(lua_type(co, i) == LUA_TNIL);
+    /* resume: hook does not re-fire, continuation chain completes with K */
+    assert(hookcont_did_yield == 1);
+    st = lua_resume(co, L, 0, &nres);
+    assert(st == LUA_OK);
+    assert(nres == 1);
+    assert(lua_gettop(co) == 1);
+    assert(strcmp(lua_tostring(co, -1), "K") == 0);
+
+    lua_close(L);
+    printf("test_hook_yield_inside_c_continuation: PASS\n");
+}
+
+/* Test 22 (P15.83q generalized probes): hook-yield window contents are
+ * the suspended frame's LIVE registers — parameters and already-written
+ * locals are visible; never-written slots are nil on a fresh thread.
+ * Both line-hook and count-hook variants; window from a frame deeper
+ * than the chunk; and the PUC rule that resume args are DISCARDED for a
+ * hook-yield resume (PUC resume(), ldo.c:930-934: L->top = firstArg). */
+static int hy_probe_fired;
+static int hy_probe_target;
+static void hy_probe_hook(lua_State *L, lua_Debug *ar) {
+    (void)ar;
+    if (hy_probe_fired >= hy_probe_target) return;
+    hy_probe_fired++;
+    if (hy_probe_fired == hy_probe_target)
+        (void)lua_yieldk(L, 0, 0, NULL);
+}
+static void check_window_is(lua_State *co, const char *tag, int want_top) {
+    assert(lua_gettop(co) == want_top);
+    dump_window(co, tag);
+}
+static void test_hook_yield_window_general(void) {
+    lua_State *L = luaL_newstate();
+    assert(L != NULL);
+    luaL_openlibs(L);
+
+    /* (a) line hook at chunk entry: params/locals all nil (nothing
+     * executed yet), window = maxstacksize slots */
+    lua_State *ca = lua_newthread(L);
+    lua_pop(L, 1);
+    assert(luaL_loadstring(ca,
+        "local a, b = ...; local x = a + b; x = x + 1; return x") == LUA_OK);
+    hy_probe_fired = 0; hy_probe_target = 1;
+    lua_sethook(ca, hy_probe_hook, LUA_MASKLINE, 0);
+    lua_pushnumber(ca, 10);
+    lua_pushnumber(ca, 20);
+    int nres = 0;
+    int st = lua_resume(ca, L, 2, &nres);
+    assert(st == LUA_YIELD && nres == 0);
+    check_window_is(ca, "hy-line-entry", 3);
+    for (int i = 1; i <= 3; i++) assert(lua_type(ca, i) == LUA_TNIL);
+    /* resume WITH an argument: PUC discards it (hook-yield resumes never
+     * deliver args); execution completes with x = 31 */
+    lua_pushstring(ca, "R");
+    st = lua_resume(ca, L, 1, &nres);
+    assert(st == LUA_OK && nres == 1);
+    assert(lua_gettop(ca) == 1);
+    assert(lua_tonumber(ca, 1) == 31.0);
+
+    /* (b) count hook, same chunk, same deterministic window */
+    lua_State *cb = lua_newthread(L);
+    lua_pop(L, 1);
+    assert(luaL_loadstring(cb,
+        "local a, b = ...; local x = a + b; x = x + 1; return x") == LUA_OK);
+    hy_probe_fired = 0; hy_probe_target = 1;
+    lua_sethook(cb, hy_probe_hook, LUA_MASKCOUNT, 1);
+    lua_pushnumber(cb, 10);
+    lua_pushnumber(cb, 20);
+    st = lua_resume(cb, L, 2, &nres);
+    assert(st == LUA_YIELD && nres == 0);
+    check_window_is(cb, "hy-count-entry", 3);
+    for (int i = 1; i <= 3; i++) assert(lua_type(cb, i) == LUA_TNIL);
+    st = lua_resume(cb, L, 0, &nres);
+    assert(st == LUA_OK && nres == 1);
+    assert(lua_tonumber(cb, 1) == 31.0);
+
+    /* (c) line hook yielding inside a function DEEPER than the chunk:
+     * the suspended frame is g's; its parameter p is LIVE in the window */
+    lua_State *cc = lua_newthread(L);
+    lua_pop(L, 1);
+    assert(luaL_loadstring(cc,
+        "local function g(p) local y = p * 2; return y + 1; end; "
+        "local r = g(5); return r") == LUA_OK);
+    hy_probe_fired = 0; hy_probe_target = 2;  /* 2nd line event = g entry */
+    lua_sethook(cc, hy_probe_hook, LUA_MASKLINE, 0);
+    st = lua_resume(cc, L, 0, &nres);
+    assert(st == LUA_YIELD && nres == 0 && hy_probe_fired == 2);
+    check_window_is(cc, "hy-deep-frame", 3);
+    assert(lua_tonumber(cc, 1) == 5.0);  /* g's parameter p */
+    assert(lua_type(cc, 2) == LUA_TNIL); /* y not yet written */
+    assert(lua_type(cc, 3) == LUA_TNIL);
+    st = lua_resume(cc, L, 0, &nres);
+    assert(st == LUA_OK && nres == 1);
+    assert(lua_tonumber(cc, 1) == 11.0);
+
+    lua_close(L);
+    printf("test_hook_yield_window_general: PASS\n");
 }
 
 /* Test 20 (P15.83k review item 4): every lua_State maps to a Lua thread
@@ -609,6 +913,9 @@ int main(void) {
     test_resume_multi_cycle_exact();
     test_resume_args_mix_exact();
     test_resume_error_replacement();
+    test_resume_error_stack_exact();
+    test_hook_yield_inside_c_continuation();
+    test_hook_yield_window_general();
     test_pushthread_identity();
     printf("ALL PASS\n");
     return 0;

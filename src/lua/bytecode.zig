@@ -660,10 +660,17 @@ pub const ProtoBuilder = struct {
     }
 
     /// Update maxstacksize to ensure at least `n` registers are available.
+    /// PUC `luaK_checkstack` (lcode.c): `newstack = freereg + n;
+    /// if (newstack > maxstacksize) maxstacksize = newstack`. Callers pass
+    /// the register count they need (including the one about to be
+    /// allocated), so `n` IS the PUC `newstack` — no extra margin. (A
+    /// former `+1 for safety margin` here inflated every proto's register
+    /// file by one slot, which became observable through the hook-yield
+    /// resume window of P15.83q: PUC exposes exactly
+    /// `ci->func + 1 .. ci->func + 1 + maxstacksize` live registers.)
     pub fn checkStack(self: *ProtoBuilder, n: u8) void {
-        const needed = @as(u16, n) + 1; // +1 for safety margin
-        if (needed > self.maxstacksize) {
-            self.maxstacksize = @intCast(@min(needed, 255));
+        if (n > self.maxstacksize) {
+            self.maxstacksize = @min(n, 255);
         }
     }
 
@@ -840,7 +847,7 @@ test "proto builder: emit and finish" {
 
     try std.testing.expectEqual(@as(usize, 4), proto.code.len);
     try std.testing.expectEqual(@as(usize, 2), proto.k.len);
-    try std.testing.expectEqual(@as(u8, 4), proto.maxstacksize);
+    try std.testing.expectEqual(@as(u8, 3), proto.maxstacksize);
     try std.testing.expectEqual(Op.add, @as(Op, @enumFromInt(proto.code[2].op)));
 }
 

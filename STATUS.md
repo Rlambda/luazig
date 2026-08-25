@@ -2412,6 +2412,75 @@ DIFF: PASS (6 suites, unchanged); coroutine.lua --testc exit 0
 (ulimit -v 2000000, timeout 30); smoke 54/54 exit 0; matrix zig_fail=0
 (big.lua both_fail, pre-existing infra).
 
+### P16.0b — default-off Vm runtime counters (--stats JSON + T.stats)
+
+P16.0-B2: диагностические счётчики VM, по умолчанию выключенные, с двумя
+способами чтения: CLI `--stats <out.json>` (сериализация при выходе,
+src/bin/luazig.zig) и Lua-visible `T.stats()` (testC-модуль, read-only
+снапшот-таблица). Счётчики никогда не участвуют в семантике исполнения.
+
+**Gating-дизайн (измерен A/B на ReleaseFast):** `VmStats` живёт inline на
+singleton-Vm; каждая точка проверяет `self.stats.enabled` — один L1
+byte-load + предсказуемый not-taken branch (`enabled` стоит сразу за
+пишущимся на каждую инструкцию `dispatch_pc` → общий cache line).
+Отвергнутые альтернативы (обе измерены): (a) кэш `?*VmStats` локальным
+указателем в dispatch-loop — держит регистр через весь switch, +3% на
+branchy-бенчах; (b) `@branchHint(.unlikely)` block-form на всех точках —
+воспроизводимо хуже на части бенчей (+12% comparisons) из-за layout-
+lottery в codegen. Финальная форма: hint только на per-instruction сайте.
+
+**A/B perf (stats OFF, HEAD 8d4550c vs P16.0b, median-of-7, zig-time
+geomean):** HEAD 0.3173 → 0.3148/0.3186 (два прогона финального бинаря;
+-0.78%/+0.41%, среднее ≈ -0.2% — в пределах шума коробки; её собственный
+разброс на multi-second бенчах ±8-15%, напр. global_arith 1.23–1.49 на
+идентичных бинарях). Остаточные стабильные дельты: branch_loop +3%,
+temp_table_alloc +3-5%, metamethod_add +2% — физический потолок цены
+одного check/instruction и layout-чувствительность; comparisons и
+float_arith стали быстрее HEAD (1.03 vs 1.06, 0.42 vs 0.44). Fallback-
+дизайн (per-basic-block counting по предвычисленной карте лидеров) не
+понадобился: geomean-цена <1%.
+
+**Точки инструментирования** (vm.zig, имена полей — в `VmStats`):
+- гистограмма инструкций: fetch-сайт в runBytecodeDispatch
+  (`instructions_total`, `instructions_by_op` — суммы сходятся);
+- call funnel: `.call` inline fast path (`calls_fast`), opCall после
+  hook-yield replay (`calls_slow`), pushBytecodeExecFrame
+  (`calls_lua_frames` ⊇ fast — все Lua-активации), callBuiltin,
+  callMetamethod, callCFunction. Задокументированные пересечения:
+  builtin-метаметод считается и в builtin, и в metamethod;
+- таблицы: типизированные fast-path счётчики на opcode-сайтах (GETTABLE
+  int/str, GETI, GETFIELD, GETTABUP, SETTABLE str, SETI, SETFIELD,
+  SETTABUP), generic-воронки rawGet/rawSet (с dedup-гвардом от
+  float→int рекурсии, чтобы integral-float ключи считались один раз),
+  insert/update-сплит (nodeInsert-сайты + nodeLookup-хиты, включая
+  inline fast paths) и `tbl_rehash` в tableRehash;
+- аллокации: `alloc_by_type` по тегу GcObject в gcRegisterObject
+  (table/closure/thread/string/cell/userdata), `alloc_bytes_total` в
+  gcNoteAlloc (пейсинговые байты; точный live-total остаётся T.totalmem);
+- GC: gcAutomaticStep/gcStep после gc_busy-гарда;
+- корутины: `yields`/`resumes` (коммит yield/resume), `yield_allocs`
+  (th.yielded ×2 маршрута, suspended_builtin_args, appendThreadWrapYield),
+  `resume_allocs` (resume inbox, entry_args, trampoline args_copy+co_state).
+
+**Форма JSON** (`--stats`): `{instructions_total, instructions_by_op:
+{<opname>:count,...}, calls:{fast,slow,lua_frames,builtin,metamethod,c},
+tables:{get_fast_int,get_fast_str,get_generic,set_fast_int,set_fast_str,
+set_generic,insert,update,rehash}, allocs:{table,closure,thread,string,
+cell,userdata,bytes_total}, gc:{steps_auto,steps_manual}, yield_resume:
+{yields,resumes,yield_allocs,resume_allocs}}`. `T.stats()` возвращает ту
+же форму Lua-таблицей (плюс `op_histogram` вместо `instructions_by_op`);
+при выключенных счётчиках — нули.
+
+**Проверка функциональности:** `--stats` на coroutine-скрипте —
+yields=1/resumes=2/yield_allocs=2/resume_allocs=3, гистограмма сходится с
+total; microbench.lua — 1.5G инструкций, calls_fast=5.15M, lua_frames
+(5.66M) ⊇ fast; `T.stats()` под `--testc --stats` растёт между вызовами.
+
+**Gates (all green):** zig build ReleaseFast + `zig build test` exit 0;
+make -C tests/c_api test ALL PASS; test-diff DIFF: PASS; coroutine.lua
+--testc exit 0 (ulimit -v 2000000, timeout 30); smoke 54/54 exit 0;
+matrix zig_fail=0 (big.lua both_fail, pre-existing).
+
 ### P15.83r — C-callee CALL hooks fire on the C activation (PUC precallC ordering)
 
 **Review item 3 (P15.83o list):** CALL events for C-function/builtin callees

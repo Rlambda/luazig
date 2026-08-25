@@ -1,28 +1,22 @@
-> **STATUS: COMPLETE (2026-08-22, final verification passed).**
-> History: P15.78–P15.82h (initial implementation) → reopened by review →
-> P15.83a–P15.83i (first verification round: ERRFUNC_NONE + LUA_ERRERR,
-> TBC scoping + finishpcallk close state machine, shared production
-> lua_*k helpers, per-lua_State handles + per-handle stacks, lua_status
-> error preservation, closethread k-discard, per-thread C hooks) →
-> second review → P15.83j–P15.83n (final verification round:
-> lua_resume stale-yield replacement [resume_func_base], strict
-> test-diff gate, exact resume-stack + CIST_CLSRET differentials,
-> lua_pushthread/tothread identity, LUA_HOOKCALL on the callee
-> activation + main-chunk CALL paths + PUC getfuncname port, API-check
-> invariants enforced in the shared helpers, real 54/54 smoke parity
-> via per-runtime udatatest modules, stale docs/comments cleanup).
-> Final gate (exact commands + exit codes in STATUS.md P15.83o):
-> zig build/test Debug 0/0, ReleaseFast 0/0; make -C tests/c_api
-> clean/test/test-diff 0/0/0 (17/17 suites, DIFF: PASS strict);
-> coroutine.lua --testc exit 0; matrix zig_fail=0 (big.lua accurately
-> both_fail); smoke_compare 54/54 exact PASS; leak_bench 25/25 PASS;
-> 15_stress_leak both runtimes exit 0; CallFrame == 104 B.
-> Acceptable documented deviations (only): absolute COUNT-hook firing
-> totals (instruction density); small GCCOUNT accounting granularity;
-> C-callee CALL-hook identity requires builtin C-frames (P15.83l,
-> pre-existing callCFunction TODO); error-path stack residue layout;
-> tothread NULL for Lua-created coroutines; fresh-main resume
-> unsupported. See STATUS.md for the full list.
+> **STATUS: FINAL VERIFICATION — remaining observable PUC-parity blockers
+> (2026-08-22, third review round).** P15.83a–P15.83o stand (do not undo;
+> independently verified list in the review). Remaining before COMPLETE:
+> 1. exact error-path lua_resume stack/result parity (PUC exposes
+>    ci-relative residue — top=2 [boom,boom] after error resume; zig top=1)
+>    — permanent exact differential in DIFF_TESTS, no weak invariants;
+> 2. hook-yield while a C continuation is active: first resume must expose
+>    the PUC-visible stack (PUC top=2; zig top=0) while keeping k discarded
+>    for hook yields, nresults==0, surviving outer continuation, no spurious
+>    re-fire, final result K;
+> 3. C-callee LUA_HOOKCALL identity: either give builtin/C calls a C-frame
+>    activation before firing CALL (recommended test in review) or scope it
+>    out explicitly in the spec/plan;
+> 4. lua_tothread-for-Lua-coroutines and fresh-main resume: scope decision —
+>    track in a separate C-API follow-up plan or fix here (no "full C API
+>    parity" claim meanwhile).
+> Then full gates (Debug/RF builds+tests, make lua-c, c_api clean/test/
+> test-diff, smoke with built udatatest modules, leak_bench, matrix) and
+> honest Self-Review/STATUS updates.
 
 # PUC Lua 5.5 C Continuations Implementation Plan
 

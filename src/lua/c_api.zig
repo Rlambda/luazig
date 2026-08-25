@@ -1617,18 +1617,78 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
 
     var out: [64]vm_mod.Value = undefined;
     for (&out) |*v| v.* = .Nil;
+    // P15.83q: pre-call status snapshot. A thread that is already dead
+    // can only produce PUC's `resume_error` boundary ("cannot resume
+    // dead coroutine", ldo.c:895-903 + 970): the pushed args are popped,
+    // the message is APPENDED to the existing stack window, and
+    // *nresults is left UNTOUCHED (resume_error returns before
+    // lua_resume's *nresults assignment). This is structurally distinct
+    // from an error raised inside the coroutine, which flows through
+    // luaD_seterrorobj (the [err, err] duplicated window below).
+    const dead_before_call = co.status == .dead;
     const produced = vm.apiResumeThread(co, args, out[0..]) catch {
-        // Error: push error object on c_stack.
+        // Error path (PUC ldo.c:983-988): `L->status = status`, then
+        // luaD_seterrorobj(L, status, L->top) and `L->ci->top = L->top`.
+        // luaD_seterrorobj (ldo.c:112-122) COPIES the top-1 error object
+        // to oldtop == L->top — i.e. it DUPLICATES the error object on
+        // top of the stack residue — leaving [.., err, err].
+        // `*nresults = top - (ci->func + 1)` with ci = the innermost
+        // CallInfo at throw time. For errors surfacing from a C-function
+        // frame (error(), assert(), metamethod failures, ...) the
+        // innermost frame is that C call's frame, so the visible window
+        // is exactly the duplicated pair: [err, err], nres == 2 (verified
+        // against PUC 5.5.0 with /tmp probes: plain, deeper-Lua-call,
+        // table error object, and pcall-recovered-then-error variants).
+        // Known divergence (documented in STATUS.md P15.83q): errors
+        // raised from a LUA frame via luaG_runerror (index/call nil, ...)
+        // keep the frame's register + varinfo residue in PUC's window;
+        // luazig's message building does not use the Lua-visible stack,
+        // so it exposes the [err, err] pair only.
         h.c_stack.items.len = lua_resume_base;
-        if (vm.err_has_obj) {
-            h.c_stack.append(vm.alloc, vm.err_obj) catch {};
-        } else {
-            h.c_stack.append(vm.alloc, .Nil) catch {};
-        }
-        if (nres) |p| p.* = @intCast(if (h.c_stack.items.len > 0) h.c_stack.items.len - lua_resume_base else 0);
+        const ev: vm_mod.Value = if (vm.err_has_obj) vm.err_obj else .Nil;
+        h.c_stack.append(vm.alloc, ev) catch {};
+        h.c_stack.append(vm.alloc, ev) catch {};
+        if (nres) |p|
+            p.* = @intCast(if (h.c_stack.items.len > lua_resume_base)
+                h.c_stack.items.len - lua_resume_base
+            else
+                0);
         // PUC: LUA_ERRERR (5) if message handler errored, LUA_ERRRUN (2) otherwise.
         return if (vm.err_is_errerr) 5 else 2;
     };
+    const failed = produced > 0 and !(out[0] == .Bool and out[0].Bool);
+    if (failed) {
+        if (dead_before_call) {
+            // PUC resume_error (ldo.c:895-903): pop the pushed args,
+            // append the message to the existing window, leave *nresults
+            // untouched. The engine's only failure for an already-dead
+            // thread is "cannot resume dead coroutine".
+            h.c_stack.items.len -= @min(nargs_usize, h.c_stack.items.len);
+            h.c_stack.append(vm.alloc, out[1]) catch {};
+            return 2;
+        }
+        // Real error inside the coroutine: PUC error window (luaD_seterrorobj
+        // duplicates the top-1 error object) = [residue?, err, err], where
+        // `residue` is the value the raising C function left below the error
+        // object on its frame — error()/assert() with a string message and
+        // level >= 1 leave the ORIGINAL unprefixed string there (PUC
+        // lbaselib luaB_error pushes where + a copy of the argument, then
+        // concatenates). builtinCoroutineResume snapshots it onto the thread
+        // as api_err_residue. nres = window size.
+        h.c_stack.items.len = lua_resume_base;
+        if (co.api_err_residue) |r| h.c_stack.append(vm.alloc, r) catch {};
+        h.c_stack.append(vm.alloc, out[1]) catch {};
+        h.c_stack.append(vm.alloc, out[1]) catch {};
+        if (nres) |p|
+            p.* = @intCast(if (h.c_stack.items.len > lua_resume_base)
+                h.c_stack.items.len - lua_resume_base
+            else
+                0);
+        // PUC APIstatus: LUA_ERRERR (5) if the message handler itself
+        // errored, LUA_ERRRUN (2) otherwise (mirrored in th.api_status
+        // by builtinCoroutineResume's error tail).
+        return if (co.api_status == 5) 5 else 2;
+    }
     // Success or yield: replace function+args with results on c_stack.
     h.c_stack.items.len = lua_resume_base;
     const nres_usize: usize = if (produced > 0) produced - 1 else 0;
@@ -1636,12 +1696,21 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
     if (nres) |p| p.* = @intCast(nres_usize);
     // Return LUA_YIELD (1) if suspended, LUA_OK (0) if done.
     const st_result: c_int = if (co.status == .suspended) 1 else 0;
-    if (st_result == 0 and produced > 0) {
-        const ok = out[0] == .Bool and out[0].Bool;
-        if (!ok) {
-            if (nres) |p| p.* = @intCast(nres_usize);
-            return 2;
-        }
+    if (st_result == 1) {
+        // Hook-yield visibility (P15.83q): a suspension caused by a debug
+        // hook yielding reports *nresults = nyield = 0, but PUC's one-stack
+        // model still exposes the suspended Lua frame's ENTIRE register
+        // window (luaG_traceexec raised L->top to ci->top before the hook,
+        // ldebug.c:954, and the yield longjmp skips luaD_hook's restore).
+        // Materialize the register window onto the handle stack above the
+        // (empty) results. The values are a snapshot-copy: PUC would show
+        // the live registers, but between suspends nothing can observe
+        // mutations, and the next resume truncates to lua_resume_base
+        // before pushing results, so stale window values can never leak
+        // into a later resume's results or be mistaken for its arguments
+        // (args are read from the top; the window sits below them).
+        if (vm.apiHookYieldWindow(co)) |window|
+            h.c_stack.appendSlice(vm.alloc, window) catch {};
     }
     return st_result;
 }

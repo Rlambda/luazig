@@ -1,4 +1,4 @@
-> Last updated: 2026-08-22 (P15.83o: final verification round complete — plan COMPLETE with gates)
+> Last updated: 2026-08-25 (P15.83q: exact PUC resume-boundary stack exposure for error and hook-yield resumes)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -30,7 +30,7 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 |--------|--------|
 | Upstream matrix (`testes/*.lua`) | **31/32** pass (exit code parity) |
 | Differential output (`--diff`) | **0 output_diff** |
-| Smoke tests | **51/51** pass |
+| Smoke tests | **54/54** pass |
 | Performance (geomean vs PUC) | **2.67x** |
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -2403,6 +2403,143 @@ ReleaseFast exit 0; make -C tests/c_api test 17/17 exit 0; test-diff
 DIFF: PASS (6 suites, unchanged); coroutine.lua --testc exit 0
 (ulimit -v 2000000, timeout 30); smoke 54/54 exit 0; matrix zig_fail=0
 (big.lua both_fail, pre-existing infra).
+
+### P15.83q — Exact PUC resume-boundary stack exposure for error and hook-yield resumes (review blockers 1-2)
+
+**Derived PUC rules** (verified against PUC 5.5.0 sources + /tmp probes
+compiled against BOTH runtimes, outputs byte-identical):
+
+The C-visible stack at a `lua_resume` boundary is a WINDOW into PUC's one
+stack: `lua_gettop = L->top - (L->ci->func + 1)` where `ci` is the
+innermost CallInfo at the suspend point (luaD_throw longjmps; the CallInfo
+chain and stack residue are never unwound on the way out).
+
+1. **Error resume** (`lua_resume`, ldo.c:983-988): unrecoverable error →
+   `luaD_seterrorobj(L, status, L->top)` + `L->ci->top = L->top` +
+   `*nresults = top - (ci->func + 1)`. `luaD_seterrorobj` (ldo.c:112-122)
+   COPIES the top-1 error object to oldtop == L->top — i.e. DUPLICATES it:
+   window = [.., err, err]. The slots below the pair are the raising
+   C-function frame's residue:
+   - `error(obj, 0)` → [err, err], nres=2 (any error object type);
+   - `error(str, level>=1)` / `assert(false, str)` / `assert(false)` →
+     lbaselib luaB_error pushes `luaL_where` + a copy of the argument and
+     concatenates, leaving the ORIGINAL string below the built message:
+     [orig, prefixed-msg, prefixed-msg], nres=3;
+   - `assert(false, non-string)` → [err, err], nres=2 (no prefix path);
+   - error raised deeper in Lua calls → same shapes (window is relative to
+     the INNERMOST frame; intermediate frames' registers are below
+     ci->func and invisible);
+   - after a pcall-recovered inner error → same shapes (recovery resets
+     the window to the pcall frame).
+   Known remaining divergences (PUC exposes live-stack artifacts that
+   luazig's error machinery does not materialize on any Lua-visible
+   stack): runtime errors raised from a Lua frame via luaG_runerror
+   (index/call nil: PUC keeps frame registers + the " (local 'x')"
+   varinfo string pushed by the error builder → e.g. nres=5
+   [nil,"Y"," (local 't')",msg,msg]; luazig exposes [err, err]); and a
+   C-API c-function that pushes values before lua_error (PUC exposes its
+   whole frame residue [pushes..., err, err]; luazig exposes [err, err]
+   because callCFunction's errdefer frees the C-frame stack before the
+   resume boundary). Both are stack-residue artifacts of PUC's one-stack
+   error builder, not semantic API contract; transcribing them needs the
+   error-message builder to use a Lua-visible stack — future work.
+2. **resume_error boundary** ("cannot resume dead coroutine", ldo.c:895-903
+   + 970): pops the pushed args, APPENDS the message to the existing
+   window, and leaves `*nresults` UNTOUCHED (early return before the
+   *nresults assignment). So after [boom,boom] a dead re-resume shows
+   [boom,boom,"cannot resume dead coroutine"] with nres unchanged.
+3. **Hook-yield resume** (blocker 2): luaG_traceexec raises `L->top =
+   ci->top` BEFORE dispatching the hook (ldebug.c:954); lua_yieldk in a
+   hook just returns after setting status/nyield (ldo.c:1025-1028); the
+   following `luaD_throw(L, LUA_YIELD)` (ldebug.c:971-977) longjmps PAST
+   luaD_hook's top restore (ldo.c:458-465). Result at the boundary:
+   `*nresults = nyield = 0` while `lua_gettop` exposes the suspended Lua
+   frame's ENTIRE register file (ci->top = func+1+maxstacksize slots) —
+   live parameter/local values visible (probe: g(p) at entry → [5,nil,nil]).
+   The next resume DISCARDS its args (PUC resume() ldo.c:930-934
+   `L->top = firstArg`) and does not re-fire the hook (CIST_HOOKYIELD).
+   Window VALUE parity holds wherever the register slots were actually
+   written by the program or nil on a fresh thread; never-written slots
+   in PUC hold stale stack residue (e.g. loader strings) — luazig shows
+   nil (its loader does not use the Lua-visible stack) — deterministic
+   tests use written/nil slots only.
+
+**Root-cause fix — `ProtoBuilder.checkStack` (bytecode.zig):** an artificial
+`+1 for safety margin` inflated EVERY proto's maxstacksize by one slot vs
+PUC's `luaK_checkstack` (lcode.c: `maxstacksize = freereg + n`, no margin).
+Invisible until now (runtime uses maxstacksize+EXTRA_MARGIN), it broke the
+hook-yield window SIZE parity (PUC 3 slots vs zig 4). Removed; instruction
+streams were already byte-parity, only the slot count differed.
+
+**Fix — assert() message prefix (found by the residue probes):** zig's
+`assert(false, "m")` raised bare "m"; PUC routes through luaB_error level 1
+→ "chunk:line: m". builtinAssert now applies the same luaL_where prefixing
+(+ residue) as error(); non-string messages stay as-is.
+
+**Transcription design (c_api.zig lua_resume + vm.zig):**
+- error path: c_stack := [err_cframe_residue?, err, err]; the residue for
+  error()/assert() string-prefix raises is carried in `Vm.err_cframe_residue`
+  (?Value), set ONLY in those two builtins' prefix paths, cleared at fresh
+  raise and at every protected-boundary save/restore (pcall/xpcall/resume/
+  debug.debug — a recovered error's residue dies at the recovery point,
+  transcribing PUC's stack reset there), snapshotted to
+  `Thread.api_err_residue` by builtinCoroutineResume's error tail (the vm
+  error state is caller-restored after the builtin returns), GC-marked with
+  the other thread-held values, exposed as the window's leading slot.
+- resume_error path (dead thread): pop args, append message, *nresults
+  untouched (pre-call `dead_before_call` structural check — no
+  message-text branching).
+- hook-yield path: `Vm.apiHookYieldWindow(th)` returns the parked top Lua
+  frame's registers [base..base+maxstacksize) (borrowed, snapshot-copied
+  onto c_stack; PUC shows live registers, but nothing can observe mutations
+  between suspends; the next resume truncates to resume_func_base so the
+  window can never leak into results or be mistaken for resume args).
+  Detection: th.status==.suspended && th.yielded_from_debug_hook (refreshed
+  on every yield by builtinCoroutineYield, so it always describes THIS
+  suspension; hooks cannot yield values → yielded slice is empty, which
+  distinguishes hook yields from 0-value normal yields only together with
+  the flag).
+
+**Permanent differential tests** (`tests/c_api/14_state_handles.c`, all
+byte-identical PUC vs luazig, suite in DIFF_TESTS):
+`test_resume_error_stack_exact` (review verbatim repro: error('boom',0) →
+[Y] then [boom,boom] nres=2 with the v1..vN loop; + deeper-Lua-call, table
+object, pcall-recovered, error(str,2), assert(false,'am'), assert(false,{})
+variants), `test_hook_yield_inside_c_continuation` (review verbatim blocker
+2: hook-yield r1 nres=0 top=2 [nil,nil], r2 completes with K, hook not
+re-fired), `test_hook_yield_window_general` (line+count hooks at chunk
+entry → 3 nils; args DISCARDED on hook-yield resume — "R" pushed, result
+still 31; line hook inside g(p) → [5,nil,nil] live register window);
+`test_resume_error_replacement` upgraded from invariant-level to exact
+(nres=3 [boom, prefixed, prefixed]).
+
+**Probe evidence table** (PUC vs zig, after the fix — all identical except
+the two documented residue-artifact rows):
+
+| case | PUC == zig |
+|------|-----------|
+| error('boom',0) resume | ✓ [boom,boom] nres=2 |
+| error deeper in Lua calls | ✓ [deep,deep] nres=2 |
+| table error object | ✓ [t,t] nres=2 (rawequal) |
+| pcall-recovered then error | ✓ [after:false ×2] nres=2 |
+| error(str,1/2), assert msg | ✓ [orig,prefix,prefix] nres=3 |
+| assert(false) | ✓ [assertion failed!,prefix,prefix] nres=3 |
+| assert(false,table) | ✓ [t,t] nres=2 |
+| runtime error in Lua frame | ✗ PUC nres=5 residue vs zig 2 (documented) |
+| C c_func pushes + luaL_error | ✗ PUC nres=5 residue vs zig 2 (documented) |
+| dead-resume after error | ✓ append + nres untouched |
+| hook-yield (line/count, entry) | ✓ top=maxstacksize nils, nres=0 |
+| hook-yield deep frame | ✓ [5,nil,nil] live params |
+| hook-yield r2 | ✓ args discarded, no hook re-fire |
+| count-hook at chunk instr 2 | ✓ size 3=3; values differ (PUC loader residue vs zig nils — excluded from tests) |
+
+**Gates (all green):** make -C tests/c_api test → 17/17 exit 0 (78 PASS
+lines); test-diff → DIFF: PASS (strict); coroutine.lua --testc exit 0
+(ulimit/timeout); zig build test exit 0; all tests/smoke/*.lua exit 0 +
+smoke_compare --no-build PASS 54/54; matrix zig_fail=0 (31/32 parity,
+big.lua both_fail pre-existing); perf_compare --runs 7 → RESULT: OK, no
+regressions (geomean 2.67x; most workloads faster after the maxstacksize
+fix — string_loop -41.7%, lua_calls -16.9%).
 
 ### P15.83n — real 54/54 smoke parity via per-runtime udatatest modules + stale docs/comments cleanup (review items 6-7)
 

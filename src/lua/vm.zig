@@ -1719,6 +1719,14 @@ pub const Thread = struct {
     in_resume: bool = false,
     suspended_builtin: ?BuiltinId = null,
     suspended_builtin_args: ?[]Value = null,
+    /// P15.83q: C-frame residue of the error that killed this thread
+    /// (PUC: the value the raising C function left below the error object
+    /// on its frame — e.g. error()'s original string argument). Set by
+    /// builtinCoroutineResume's error tail from vm.err_cframe_residue;
+    /// read by c_api lua_resume to expose the PUC error window
+    /// [residue?, err, err]. Persists for the thread's lifetime, like
+    /// the stack residue it transcribes.
+    api_err_residue: ?Value = null,
     capture_from_debug_hook: bool = false,
     capture_from_count_hook: bool = false,
     /// P15.68: True if the last yield was from inside a debug hook. Unlike
@@ -2977,6 +2985,20 @@ pub const Vm = struct {
     err: ?[]const u8 = null,
     err_obj: Value = .Nil,
     err_has_obj: bool = false,
+    /// P15.83q: C-frame residue of the raising builtin (PUC lbaselib
+    /// luaB_error, level >= 1 with a string argument): luaB_error pushes
+    /// `luaL_where` + a copy of the argument and concatenates them, so the
+    /// ORIGINAL argument string remains on the error() C-frame BELOW the
+    /// built message. At a lua_resume error boundary, PUC's visible window
+    /// is that whole C-frame area: [orig, prefixed-msg, prefixed-msg-dup]
+    /// (luaD_seterrorobj duplicates top-1). This field transcribes the
+    /// `orig` slot: set by error()/assert() when they prefix a string
+    /// message, snapshotted onto the failing thread by
+    /// builtinCoroutineResume's error tail, exposed by c_api lua_resume as
+    /// the window's leading slot. Save/restored alongside the other err_*
+    /// fields at every protected boundary (pcall/xpcall/resume), so a
+    /// recovered error never leaks a stale residue into a later window.
+    err_cframe_residue: ?Value = null,
     /// PUC LUA_ERRERR signal (PUC luaD_rawrunprotected in ldo.c): set by
     /// invokeErrfunc when the message handler itself errors, signalling that
     /// the error status should be LUA_ERRERR (5) instead of LUA_ERRRUN (2).
@@ -4128,6 +4150,52 @@ pub const Vm = struct {
         for (args, 0..) |v, i| resume_args[i + 1] = v;
         try exposeDispatchResult(void, self.builtinCoroutineResume(resume_args, outs));
         return self.last_builtin_out_count;
+    }
+
+    /// PUC hook-yield visibility window (P15.83q). When a coroutine
+    /// suspends because a debug hook yielded, `lua_resume` reports
+    /// `*nresults = ci->u2.nyield = 0` (hooks cannot yield values, PUC
+    /// ldo.c:1023-1024) while `lua_gettop` exposes the ENTIRE register
+    /// window of the suspended Lua frame:
+    ///
+    ///   1. luaG_traceexec sets `L->top.p = ci->top.p` BEFORE dispatching
+    ///      the hook (ldebug.c:954) — top spans the frame's whole
+    ///      register file (ci->top = ci->func + 1 + maxstacksize).
+    ///   2. lua_yieldk inside a hook (isLua(ci)) merely returns
+    ///      (ldo.c:1025-1028) after setting `L->status = LUA_YIELD` and
+    ///      `ci->u2.nyield = 0`; luaG_traceexec then marks
+    ///      CIST_HOOKYIELD and `luaD_throw(L, LUA_YIELD)` (ldebug.c:971-977).
+    ///   3. The longjmp skips luaD_hook's `ci->top`/`L->top` restore
+    ///      (ldo.c:458-465), so at the lua_resume boundary top still
+    ///      equals the frame's register window end. `lua_gettop` =
+    ///      `L->top - (ci->func + 1)` = maxstacksize slots.
+    ///
+    /// Returns that window as a BORROWED slice of the thread's parked
+    /// register stack (callers must copy before mutating anything that
+    /// could reallocate it), or null when `th` is not suspended in a
+    /// hook-yield state (last yield not from a debug hook, or no parked
+    /// Lua frame — e.g. a C-function yield, where PUC's window is the
+    /// yielded values themselves).
+    pub fn apiHookYieldWindow(self: *Vm, th: *Thread) ?[]const Value {
+        if (th.status != .suspended) return null;
+        // yielded_from_debug_hook is refreshed on EVERY yield
+        // (builtinCoroutineYield), so at the resume boundary it says
+        // whether THIS suspension came from a debug hook. Hooks cannot
+        // yield values (api_check), so the yielded slice is empty.
+        if (!th.yielded_from_debug_hook) return null;
+        // The suspended frame whose trap fired the hook: topmost parked
+        // Lua frame (C-hook frames never park a CallFrame, mirroring PUC
+        // where the hook runs with the Lua frame's own CallInfo).
+        const fr = threadCurrentParkedRuntimeFrame(th) orelse return null;
+        const proto = fr.proto() orelse return null;
+        const stack = stackForThread(self, th);
+        // PUC window: ci->func + 1 .. ci->func + 1 + maxstacksize. Zig
+        // frames may grow frame_cap beyond maxstacksize (EXTRA_MARGIN /
+        // bcGrowFrame for multret) — the exposed window is exactly the
+        // proto's register file, matching PUC's ci->top.
+        const n: usize = proto.maxstacksize;
+        if (fr.base + n > stack.len) return null;
+        return stack[fr.base .. fr.base + n];
     }
 
     /// PUC `lua_closethread` → `luaE_resetthread` (lstate.c:324-333).
@@ -14578,6 +14646,9 @@ pub const Vm = struct {
             .@"error" => {
                 // Fresh error: reset LUA_ERRERR signal before invokeErrfunc.
                 self.err_is_errerr = false;
+                // P15.83q: fresh raise — no C-frame residue yet (only the
+                // string-prefix path below can set one).
+                self.err_cframe_residue = null;
                 if (args.len == 0 or args[0] == .Nil) {
                     self.err = null;
                     self.err_obj = .Nil;
@@ -14615,6 +14686,15 @@ pub const Vm = struct {
                     self.errorLocationFrameIndex(@intCast(level))
                 else
                     null;
+                // P15.83q: PUC luaB_error builds `where .. msg` by pushing
+                // luaL_where + a COPY of the argument on the error() C-frame
+                // and concatenating — the ORIGINAL string stays on the frame
+                // below the built message, for ANY level >= 1 string error
+                // (even when the prefix ends up empty). Transcribe it as the
+                // C-frame residue exposed at the lua_resume error boundary:
+                // [orig, msg, msg] (luaD_seterrorobj adds the dup).
+                if (args[0] == .String and level > 0)
+                    self.err_cframe_residue = args[0];
                 if (location_frame) |fr_ptr| {
                     const fr = fr_ptr.*;
                     // P15.51n: current_line derived from proto.lineinfo[pc].
@@ -15460,34 +15540,56 @@ pub const Vm = struct {
     }
 
     fn builtinAssert(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        self.last_builtin_out_count = 0;
+        // P15.83q: fresh raise — no C-frame residue yet.
+        self.err_cframe_residue = null;
         if (args.len == 0) return self.fail("bad argument #1 to 'assert' (value expected)", .{});
         if (!isTruthy(args[0])) {
-            if (args.len > 1 and args[1] != .Nil) {
-                self.err = switch (args[1]) {
-                    .String => |s| s.bytes(),
-                    else => null,
-                };
-                self.err_obj = args[1];
-                self.err_has_obj = true;
-                self.err_source = null;
-                self.err_line = -1;
-                self.captureErrorTraceback();
-                return error.RuntimeError;
-            }
-            // Check Thread.call_frames (bytecode frames) for source location
-            // to include in the assert error message.
-            // Skip hidden C-frames (pushed by callBuiltin for assert) to find
-            // the calling Lua frame, matching PUC's luaL_where(L, 1) which
-            // finds the caller of the C function.
-            if (self.errorLocationFrameIndex(1)) |fr_ptr| {
-                const fr = fr_ptr.*;
-                const src = fr.sourceName();
-                const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
-                self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: assertion failed!", .{ chunk, self.frameCurrentLine(fr_ptr) }) catch "assertion failed!";
+            // PUC luaB_assert (lbaselib.c): remove the condition, leave only
+            // the message (default "assertion failed!"), then call luaB_error
+            // — i.e. error(msg, 1). A STRING message from a Lua frame gets
+            // the "source:line: " prefix, and the original stays on the C
+            // frame as residue, exactly like error(msg, 1).
+            const msg_value: Value = if (args.len > 1 and args[1] != .Nil)
+                args[1]
+            else
+                .{ .String = try self.internStr("assertion failed!") };
+            self.err_cfunc_label = "global 'assert'";
+            if (msg_value == .String) {
+                if (self.errorLocationFrameIndex(1)) |fr_ptr| {
+                    const line: i64 = self.frameCurrentLine(fr_ptr);
+                    if (line > 0) {
+                        const src = fr_ptr.sourceName();
+                        var id_buf: [59]u8 = undefined;
+                        const chunk = diag.chunkId(id_buf[0..], src);
+                        self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: {s}", .{ chunk, line, msg_value.String.bytes() }) catch blk: {
+                            const stable_len = @min(msg_value.String.bytes().len, self.err_buf.len);
+                            @memcpy(self.err_buf[0..stable_len], msg_value.String.bytes()[0..stable_len]);
+                            break :blk self.err_buf[0..stable_len];
+                        };
+                        self.err_obj = .{ .String = try self.internStr(self.err.?) };
+                        // PUC leaves the unprefixed message below the built
+                        // one on the C frame (luaB_error residue).
+                        self.err_cframe_residue = msg_value;
+                    } else {
+                        // C-function caller: luaL_where pushes "" — the built
+                        // message equals the original, but the frame still
+                        // holds the original below it.
+                        self.err = msg_value.String.bytes();
+                        self.err_obj = msg_value;
+                        self.err_cframe_residue = msg_value;
+                    }
+                } else {
+                    self.err = msg_value.String.bytes();
+                    self.err_obj = msg_value;
+                    self.err_cframe_residue = msg_value;
+                }
             } else {
-                self.err = "assertion failed!";
+                // Non-string message: luaB_error raises it as-is, no prefix,
+                // no residue.
+                self.err = null;
+                self.err_obj = msg_value;
             }
-            self.err_obj = .{ .String = try self.internStr(self.err.?) };
             self.err_has_obj = true;
             self.err_source = null;
             self.err_line = -1;
@@ -15886,6 +15988,7 @@ pub const Vm = struct {
         const prev_err = self.err;
         const prev_err_obj = self.err_obj;
         const prev_err_has_obj = self.err_has_obj;
+        const prev_residue = self.err_cframe_residue;
         const prev_err_source = self.err_source;
         const prev_err_line = self.err_line;
         const prev_err_traceback = self.err_traceback;
@@ -15897,6 +16000,12 @@ pub const Vm = struct {
                 self.err = prev_err;
                 self.err_obj = prev_err_obj;
                 self.err_has_obj = prev_err_has_obj;
+                // P15.83q: PUC resets the stack at the pcall recovery point
+                // (luaD_throw lands with L->ci/L->top rolled back to the
+                // pcall frame) — the recovered error's C-frame residue dies
+                // with it. Restore ours the same way so a recovered error()
+                // never leaks a stale residue into a later error window.
+                self.err_cframe_residue = prev_residue;
                 self.err_source = prev_err_source;
                 self.err_line = prev_err_line;
             }
@@ -16189,6 +16298,7 @@ pub const Vm = struct {
         const prev_err = self.err;
         const prev_err_obj = self.err_obj;
         const prev_err_has_obj = self.err_has_obj;
+        const prev_residue = self.err_cframe_residue;
         const prev_err_source = self.err_source;
         const prev_err_line = self.err_line;
         const prev_err_traceback = self.err_traceback;
@@ -16200,6 +16310,9 @@ pub const Vm = struct {
                 self.err = prev_err;
                 self.err_obj = prev_err_obj;
                 self.err_has_obj = prev_err_has_obj;
+                // P15.83q: as in builtinPcall — a recovered error's C-frame
+                // residue dies at the recovery point (PUC stack reset).
+                self.err_cframe_residue = prev_residue;
                 self.err_source = prev_err_source;
                 self.err_line = prev_err_line;
             }
@@ -16936,15 +17049,21 @@ pub const Vm = struct {
         const prev_err = self.err;
         const prev_err_obj = self.err_obj;
         const prev_err_has_obj = self.err_has_obj;
+        const prev_residue = self.err_cframe_residue;
         const prev_err_source = self.err_source;
         const prev_err_line = self.err_line;
         const prev_err_traceback = self.err_traceback;
         self.err_traceback = null;
+        // P15.83q: fresh resume — a residue from an earlier raise (e.g. an
+        // error() inside a pcall recovered in a previous resume) must not
+        // leak into this resume's error window.
+        self.err_cframe_residue = null;
         defer {
             self.clearErrorTraceback();
             self.err = prev_err;
             self.err_obj = prev_err_obj;
             self.err_has_obj = prev_err_has_obj;
+            self.err_cframe_residue = prev_residue;
             self.err_source = prev_err_source;
             self.err_line = prev_err_line;
             self.err_traceback = prev_err_traceback;
@@ -17571,6 +17690,11 @@ pub const Vm = struct {
             th.api_status = if (self.err_is_errerr) 5 else 2; // LUA_ERRERR or LUA_ERRRUN
             th.close_has_err = true;
             th.close_err = if (self.err_has_obj) self.err_obj else .{ .String = try self.internStr(self.errorString()) };
+            // P15.83q: snapshot the raising C-frame residue onto the thread
+            // (c_api lua_resume reads it AFTER this function restored the
+            // caller's vm error state). PUC's residue lives on the dead
+            // thread's frozen stack; ours lives here.
+            th.api_err_residue = self.err_cframe_residue;
             self.clearThreadContinuationScratch(th, .{});
             return;
         }
@@ -19396,6 +19520,14 @@ pub const Vm = struct {
                         if (GcObject.fromValue(yv) != null) {
                             try self.gcMarkValue(yv);
                         }
+                    }
+                }
+                // P15.83q: the dead thread's error C-frame residue is part
+                // of its exposed resume window (interned string in practice,
+                // but mark defensively like the other thread-held values).
+                if (th.api_err_residue) |rv| {
+                    if (GcObject.fromValue(rv) != null) {
+                        try self.gcMarkValue(rv);
                     }
                 }
                 for (th.wrap_yields.items) |item| {
@@ -23143,6 +23275,7 @@ pub const Vm = struct {
             const prev_err = self.err;
             const prev_err_obj = self.err_obj;
             const prev_err_has_obj = self.err_has_obj;
+            const prev_residue = self.err_cframe_residue;
             const prev_err_source = self.err_source;
             const prev_err_line = self.err_line;
             const prev_err_traceback = self.err_traceback;
@@ -23167,6 +23300,7 @@ pub const Vm = struct {
                     self.err = prev_err;
                     self.err_obj = prev_err_obj;
                     self.err_has_obj = prev_err_has_obj;
+                    self.err_cframe_residue = prev_residue;
                     self.err_source = prev_err_source;
                     self.err_line = prev_err_line;
                     self.err_traceback = prev_err_traceback;
@@ -23184,6 +23318,7 @@ pub const Vm = struct {
             self.err = prev_err;
             self.err_obj = prev_err_obj;
             self.err_has_obj = prev_err_has_obj;
+            self.err_cframe_residue = prev_residue;
             self.err_source = prev_err_source;
             self.err_line = prev_err_line;
             self.err_traceback = prev_err_traceback;

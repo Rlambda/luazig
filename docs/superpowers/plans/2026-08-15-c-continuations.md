@@ -1,22 +1,26 @@
-> **STATUS: FINAL VERIFICATION — remaining observable PUC-parity blockers
-> (2026-08-22, third review round).** P15.83a–P15.83o stand (do not undo;
-> independently verified list in the review). Remaining before COMPLETE:
-> 1. exact error-path lua_resume stack/result parity (PUC exposes
->    ci-relative residue — top=2 [boom,boom] after error resume; zig top=1)
->    — permanent exact differential in DIFF_TESTS, no weak invariants;
-> 2. hook-yield while a C continuation is active: first resume must expose
->    the PUC-visible stack (PUC top=2; zig top=0) while keeping k discarded
->    for hook yields, nresults==0, surviving outer continuation, no spurious
->    re-fire, final result K;
-> 3. C-callee LUA_HOOKCALL identity: either give builtin/C calls a C-frame
->    activation before firing CALL (recommended test in review) or scope it
->    out explicitly in the spec/plan;
-> 4. lua_tothread-for-Lua-coroutines and fresh-main resume: scope decision —
->    track in a separate C-API follow-up plan or fix here (no "full C API
->    parity" claim meanwhile).
-> Then full gates (Debug/RF builds+tests, make lua-c, c_api clean/test/
-> test-diff, smoke with built udatatest modules, leak_bench, matrix) and
-> honest Self-Review/STATUS updates.
+> **STATUS: COMPLETE (2026-08-22, third review round passed).**
+> P15.78–P15.83r all stand. This round (P15.83q/r/s) closed the final
+> observable parity blockers: exact error-resume stack exposure
+> (PUC seterrorobj window semantics incl. [err,err] duplication and
+> error()/assert() residue shapes — plus the Proto maxstacksize off-by-one
+> root fix); exact hook-yield resume window (PUC exposes the suspended
+> frame's full register file; nres=nyield=0); C-callee LUA_HOOKCALL
+> identity (PUC precallC push-then-hook ordering for registered C
+> functions, builtins, TFORCALL iterators; getinfo "nSu" on C frames).
+> Scope decision (P15.83s): lua_tothread for Lua-created coroutines,
+> fresh-main resume, and divert-bound builtin CALL identity are explicitly
+> OUT of this plan's scope — tracked in
+> docs/superpowers/plans/2026-08-22-capi-lua-state-followup.md; the spec
+> records the boundary and no "full C API parity" claim is made for them.
+> Final gate (exact exit codes in STATUS.md P15.83s): make lua-c 0;
+> zig build/test Debug 0/0; ReleaseFast 0/0; c_api clean/test/test-diff
+> 0/0/0 (17/17 suites, DIFF: PASS strict); coroutine.lua --testc 0;
+> matrix zig_fail=0 (big.lua accurately both_fail); smoke_compare PASS
+> 54/54 (with per-runtime udatatest modules built); leak_bench 25/25;
+> perf_compare OK (geomean 2.66x; one WARN on a noisy box re-run clean);
+> CallFrame == 104 B. Remaining documented deviations are only the
+> scoped-out follow-up items plus count-hook absolute totals (instruction
+> density) and GCCOUNT granularity.
 
 # PUC Lua 5.5 C Continuations Implementation Plan
 

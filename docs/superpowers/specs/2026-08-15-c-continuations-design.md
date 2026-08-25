@@ -585,6 +585,17 @@ continuation state is mutated. Verified by the ZIG-only `16_apicheck` suite
 (release PUC compiles these checks out, so no byte-identical differential is
 possible there; see tests/c_api/Makefile and STATUS.md P15.83m).
 
+## Scope boundary (P15.83s)
+
+This spec covers C-continuation semantics (yieldk/callk/pcallk lifecycle,
+resume-boundary stack exposure including error and hook-yield windows,
+C-frame TBC, errfunc/ERRERR, hooks near continuations, lua_State handle
+identity required by those semantics). It does NOT claim full C API
+parity for the whole lua_State abstraction: `lua_tothread` for
+Lua-created coroutines, fresh-main-state resume, and divert-bound builtin
+CALL-hook identity are tracked in
+docs/superpowers/plans/2026-08-22-capi-lua-state-followup.md.
+
 ## Testing
 
 ### C API differential tests

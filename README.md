@@ -17,39 +17,42 @@ The goal is not to write a similar language, but to gradually achieve drop-in co
 
 The project is in a **pre-release / parity-focused** state.
 
+<!-- BEGIN GENERATED STATUS (tools/status_summary.py) -->
 ### Parity
 
 | Metric | Result |
 |--------|--------|
-| Upstream matrix (`testes/*.lua`) | **30/31** pass (exit code parity) |
-| Differential output (`--diff` mode) | **0 output_diff** — all behavioral differences resolved |
-| Smoke tests (`tests/smoke/*.lua`) | **49/49** pass |
-| `big.lua` | `both_fail` — pre-existing (expects `coroutine.wrap` harness in `all.lua`) |
+| Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
+| Matrix non-pass | both_fail: big.lua |
+| Smoke tests (`tests/smoke/*.lua`) | **54/54** match (byte-identical stdout+stderr+exit) |
+| C API suites (`tests/c_api`) | 17 suites (gate: `make -C tests/c_api test`) |
 
-Matrix is run with `_port=true; _soft=true` prelude (disables non-portable OS/shell/locale checks and resource-heavy branches).
+Regression lane: `python3 tools/testes_matrix.py --testc` (no `_port`/`_soft` prelude overrides).
 
 ### Performance
 
-Geomean slowdown vs PUC Lua: **2.76x** (lower is better; 1.0x = parity).
+Geomean slowdown vs PUC Lua: **2.71x** (lower is better; 1.0x = parity).
+Method: median-of-7 per workload, pinned CPU core (`tools/perf_compare.py`).
 
 | Workload | Zig/PUC |
 |----------|--------:|
-| string_concat | 1.56x |
-| dynamic_load | 1.65x |
-| comparisons | 1.75x |
-| float_arith | 2.36x |
-| int_arith | 2.61x |
-| global_arith | 2.65x |
-| branch_loop | 2.50x |
-| field_access | 2.80x |
-| temp_table_alloc | 2.96x |
-| string_loop | 3.18x |
-| mixed_arith | 3.26x |
-| metamethod_add | 3.39x |
-| lua_calls | 3.65x |
-| coroutine_yield | 3.69x |
-| array_access | 3.79x |
-| hash_access | 4.15x |
+| hash_access | 3.75x |
+| mixed_arith | 3.73x |
+| metamethod_add | 3.64x |
+| coroutine_yield | 3.59x |
+| array_access | 3.52x |
+| lua_calls | 3.44x |
+| temp_table_alloc | 3.22x |
+| int_arith | 2.98x |
+| field_access | 2.85x |
+| global_arith | 2.58x |
+| float_arith | 2.49x |
+| string_loop | 2.07x |
+| branch_loop | 2.07x |
+| dynamic_load | 1.87x |
+| comparisons | 1.74x |
+| string_concat | 1.58x |
+<!-- END GENERATED STATUS -->
 
 See [STATUS.md](STATUS.md) for detailed profiling methodology, hotspot analysis, and optimization history.
 
@@ -155,10 +158,10 @@ The test strategy is based on **differential testing**: the same upstream Lua te
 
 ### Common commands
 
-Run the full safe matrix:
+Run the regression matrix lane (the gate used in STATUS/commits; no prelude overrides):
 
 ```sh
-python3 tools/testes_matrix.py --no-build --timeout 120
+python3 tools/testes_matrix.py --testc
 ```
 
 Run the matrix with differential output comparison:
@@ -183,11 +186,17 @@ python3 tools/perf_compare.py --update-baseline  # rewrite baseline
 
 ### Interpreting results
 
-The matrix runs upstream tests with the prelude `_port=true; _soft=true`:
+The regression lane (`tools/testes_matrix.py --testc`) runs each upstream test
+without any prelude. The `_port`/`_soft` prelude is an opt-in mode (`--port`,
+`--soft` flags) used by timing-oriented lanes such as `tools/perf_core_snapshot.py`:
 
 - `_port=true` disables non-portable OS/shell/locale/filesystem checks.
 - `_soft=true` disables or shortens resource-heavy branches.
-- `big.lua` in this mode returns early (`if _soft then return 'a' end`); standalone execution without `_soft` requires a `coroutine.wrap` harness (as in `all.lua`).
+- `big.lua` under `_soft` returns early (`if _soft then return 'a' end`); standalone execution without `_soft` requires a `coroutine.wrap` harness (as in `all.lua`).
+
+The quantitative Parity/Performance block at the top of this README is
+generated from lane JSON reports by `tools/status_summary.py --write-readme`
+(single source of truth — do not edit those numbers by hand).
 
 ## Release Gate
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -105,6 +106,7 @@ def main() -> int:
     ap.add_argument("--no-build", action="store_true", help="do not build reference/zig binaries")
     ap.add_argument("--ref-lua", default="build/lua-c/lua")
     ap.add_argument("--zig-lua", default="zig-out/bin/luazig")
+    ap.add_argument("--json-out", default="", help="optional path for JSON report")
     args = ap.parse_args()
 
     root = repo_root()
@@ -134,11 +136,13 @@ def main() -> int:
     zig_env = {**os.environ, "LUA_INIT_5_5": udatatest_cpath_preamble(root, zig=True)}
 
     bad = 0
+    results: list[dict[str, object]] = []
     for rel in files:
         p = (root / rel).resolve()
         if not p.exists():
             print(f"missing: {rel}")
             bad += 1
+            results.append({"file": rel, "match": False})
             continue
 
         ref_code, ref_out = run(
@@ -149,6 +153,7 @@ def main() -> int:
         )
 
         ok = (ref_code == zig_code) and (ref_out == zig_out)
+        results.append({"file": rel, "match": ok})
         if ok:
             print(f"ok  {rel}")
             continue
@@ -164,10 +169,25 @@ def main() -> int:
 
     if bad:
         print(f"FAIL ({bad} mismatches)")
-        return 1
+        status = 1
+    else:
+        print("PASS")
+        status = 0
 
-    print("PASS")
-    return 0
+    if args.json_out:
+        payload = {
+            "total": len(results),
+            "ok": sum(1 for r in results if r["match"]),
+            "mismatches": bad,
+            "results": results,
+        }
+        out_path = Path(args.json_out)
+        if out_path.parent != Path("."):
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+        print(f"json: {out_path}")
+
+    return status
 
 
 if __name__ == "__main__":

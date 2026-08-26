@@ -529,6 +529,11 @@ const FINALIZEDBIT: u8 = 1 << 6;
 const WHITEBITS: u8 = WHITE0BIT | WHITE1BIT;
 const MASKCOLORS: u8 = BLACKBIT | WHITEBITS;
 
+/// PUC lgc.h:213-215: GC stop bits for `g->gcstp`.
+const GCSTPUSR: u8 = 1; // stopped by user
+const GCSTPGC: u8 = 2; // stopped by GC itself
+const GCSTPCLS: u8 = 4; // closing Lua state
+
 /// Check if object is white (has either white bit set).
 fn gcIsWhite(marked: u8) bool {
     return (marked & WHITEBITS) != 0;
@@ -2834,12 +2839,18 @@ pub const Vm = struct {
     gc_running: bool = true,
     gc_mode: enum { incremental, generational } = .incremental,
     gc_gen_phase: GcGenPhase = .minor,
-    gc_pause: i64 = 250,
-    gc_stepmul: i64 = 200,
-    gc_stepsize: i64 = 10, // PUC LUAI_GCSTEPSIZE = 200 * sizeof(Table) ≈ 9.6 KB
-    gc_gen_minormul: i64 = 20,
-    gc_gen_minormajor: i64 = 70,
-    gc_gen_majorminor: i64 = 50,
+    /// PUC `g->gcparams[LUA_GCPN]` (lstate.h:338) — 6 coded `lu_byte` values.
+    /// Each param is a floating-point byte (eeee xxxx format) decoded by
+    /// `gcApplyParam`. Index order matches PUC lua.h:347-354:
+    ///   [0]=MINORMUL(20), [1]=MAJORMINOR(50), [2]=MINORMAJOR(70),
+    ///   [3]=PAUSE(250), [4]=STEPMUL(200), [5]=STEPSIZE(9600).
+    /// Initialized in `init` via `gcCodeParam` with PUC defaults.
+    gcparams: [6]u8 = .{ 0, 0, 0, 0, 0, 0 },
+    /// PUC `g->gcstp` (lgc.h:213-215): GC stop bits.
+    ///   GCSTPUSR=1 (user stop), GCSTPGC=2 (internal stop),
+    ///   GCSTPCLS=4 (closing state). `gcrunning(g)` = (gcstp == 0).
+    /// `gc_running` is kept as a hot-path cache of `(gc_stp == 0)`.
+    gc_stp: u8 = 0,
     gc_gen_major_base_kb: f64 = 0.0,
     gc_gen_major_start_kb: f64 = 0.0,
     gc_gen_added_old_kb: f64 = 0.0,
@@ -3468,6 +3479,18 @@ pub const Vm = struct {
                     vm.internStr(entry.s) catch @panic("oom");
             }
         }
+        // PUC lstate.c:375-380: setgcparam for all 6 GC params with PUC
+        // defaults. Each param is coded via gcCodeParam (floating-point byte).
+        //   [0]=MINORMUL(20), [1]=MAJORMINOR(50), [2]=MINORMAJOR(70),
+        //   [3]=PAUSE(250), [4]=STEPMUL(200), [5]=STEPSIZE(9600).
+        vm.gcparams = .{
+            Vm.gcCodeParam(20),   // LUA_GCPMINORMUL
+            Vm.gcCodeParam(50),   // LUA_GCPMAJORMINOR
+            Vm.gcCodeParam(70),   // LUA_GCPMINORMAJOR (decodes to 68)
+            Vm.gcCodeParam(250),  // LUA_GCPPAUSE
+            Vm.gcCodeParam(200),  // LUA_GCPSTEPMUL
+            Vm.gcCodeParam(9600), // LUA_GCPSTEPSIZE (200 * sizeof(Table))
+        };
         return vm;
     }
 
@@ -4299,40 +4322,81 @@ pub const Vm = struct {
         return exposeDispatchResult(Value, self.evalUnOp(.Hash, v));
     }
 
-    /// PUC `lua_gc` (lapi.c:lua_gc): garbage collector control. Maps LUA_GC*
-    /// constants to VM GC operations. Returns context-dependent values
-    /// (memory in KB for GCCOUNT, running status for GCISRUNNING, 0 otherwise).
-    pub fn apiGc(self: *Vm, what: i32, data: i32) i32 {
+    /// PUC `lua_gc` (lapi.c:lua_gc): garbage collector control. This is the
+    /// ONE unified implementation used by both the C API (`lua_gc` via
+    /// `luazigGcFixed`/`luazigGcParam` in c_api.zig) and the Lua builtin
+    /// (`collectgarbage` via `builtinCollectgarbage`). Maps LUA_GC* constants
+    /// to VM GC operations following the PUC lapi.c switch table exactly.
+    ///
+    /// `what` is a LUA_GC* constant. `param` and `value` are used only for
+    /// LUA_GCPARAM (param=LUA_GCP* index, value=new value or -1 for getter).
+    /// Returns context-dependent values per PUC semantics.
+    pub fn gcControl(self: *Vm, what: i32, param: i32, value: i32) i32 {
+        // PUC lapi.c:1174: if gcstp & (GCSTPGC|GCSTPCLS) return -1.
+        if (self.gc_stp & (GCSTPGC | GCSTPCLS) != 0) return -1;
         return switch (what) {
-            0 => blk: { // LUA_GCSTOP
+            0 => blk: { // LUA_GCSTOP: gcstp = GCSTPUSR
+                self.gc_stp = GCSTPUSR;
                 self.gc_running = false;
                 break :blk 0;
             },
-            1 => blk: { // LUA_GCRESTART
+            1 => blk: { // LUA_GCRESTART: luaE_setdebt(g,0); gcstp = 0
+                self.gc_step_debt_kb = 0;
+                self.gc_auto_threshold_kb = self.gc_count_kb;
+                self.gc_stp = 0;
                 self.gc_running = true;
                 break :blk 0;
             },
-            2 => blk: { // LUA_GCCOLLECT
+            2 => blk: { // LUA_GCCOLLECT: fullgc
                 self.gcFullCollectionForUser() catch {};
                 break :blk 0;
             },
-            3 => @as(i32, @intFromFloat(@max(0.0, self.gc_count_kb))), // LUA_GCCOUNT
-            4 => 0, // LUA_GCCOUNTB (byte remainder — not tracked separately)
+            3 => @as(i32, @intFromFloat(@max(0.0, self.gc_count_kb))), // LUA_GCCOUNT: totalbytes >> 10
+            4 => blk: { // LUA_GCCOUNTB: totalbytes & 0x3ff
+                const total_bytes: u64 = @intFromFloat(@max(0.0, self.gc_count_kb * 1024.0));
+                break :blk @intCast(total_bytes & 0x3ff);
+            },
             5 => blk: { // LUA_GCSTEP
-                self.gcFullCollectionForUser() catch {};
-                break :blk 0;
+                const oldstp = self.gc_stp;
+                self.gc_stp = 0; // allow GC to run
+                const n: i64 = if (param <= 0) 0 else param; // param carries the size_t n
+                const completed = self.gcStep(n) catch false;
+                self.gc_stp = oldstp; // restore previous state
+                self.gc_running = (self.gc_stp == 0);
+                break :blk if (completed) 1 else 0;
             },
-            6 => if (self.gc_running) 1 else 0, // LUA_GCISRUNNING
-            7 => blk: { // LUA_GCGEN
-                self.gc_mode = .generational;
-                break :blk 0;
+            6 => if (self.gc_running) 1 else 0, // LUA_GCISRUNNING: gcrunning
+            7 => blk: { // LUA_GCGEN: changemode(KGC_GENMINOR); ret previous mode
+                const prev_was_inc = (self.gc_mode == .incremental);
+                if (prev_was_inc) self.gcEnterGenerational() catch {};
+                break :blk if (prev_was_inc) 8 else 7; // LUA_GCINC=8, LUA_GCGEN=7
             },
-            8 => blk: { // LUA_GCINC
-                self.gc_mode = .incremental;
-                break :blk 0;
+            8 => blk: { // LUA_GCINC: changemode(KGC_INC); ret previous mode
+                const prev_was_gen = (self.gc_mode == .generational);
+                if (prev_was_gen) self.gcLeaveGenerational();
+                break :blk if (prev_was_gen) 7 else 8; // LUA_GCGEN=7, LUA_GCINC=8
             },
-            else => @intCast(data),
+            9 => blk: { // LUA_GCPARAM: res = applyparam(gcparams[param], 100)
+                if (param < 0 or param >= 6) break :blk -1;
+                const idx: usize = @intCast(param);
+                const res = gcApplyParam(self.gcparams[idx], 100);
+                if (value >= 0) {
+                    self.gcparams[idx] = gcCodeParam(@intCast(value));
+                    if (idx == 3 or idx == 0) self.gcScheduleNextAutomaticCycle();
+                }
+                break :blk @intCast(@min(res, @as(u64, std.math.maxInt(i32))));
+            },
+            else => -1, // invalid option
         };
+    }
+
+    /// Legacy 2-arg entry point for the Zig API (`api.State.gc`). Delegates
+    /// to `gcControl` with param=value=0 (unused for non-GCPARAM options).
+    pub fn apiGc(self: *Vm, what: i32, data: i32) i32 {
+        // For LUA_GCSTEP, `data` carries the step size (PUC's vararg n).
+        // For LUA_GCPARAM, `data` is unused (param/value come separately).
+        if (what == 5) return self.gcControl(what, data, -1);
+        return self.gcControl(what, 0, -1);
     }
 
     pub fn apiCall(self: *Vm, callee: Value, args: []const Value) Error![]Value {
@@ -4768,8 +4832,7 @@ pub const Vm = struct {
         // both the `os.exit(_, true)` path (via `closeStateForExit`) and the
         // `Vm.deinit()` path (normal teardown).
         self.is_closing = true;
-        //
-        // Closing finalizers may allocate or call collectgarbage themselves.
+        self.gc_stp |= GCSTPCLS; // PUC: gcstp = GCSTPCLS
         // Keep the collector non-reentrant while registry ownership is being
         // torn down; allocations remain owned by the registries and are
         // drained immediately after all closing finalizers return.
@@ -16316,8 +16379,15 @@ pub const Vm = struct {
             return false;
         }
 
-        const step_size = if (requested_kb > 0) requested_kb else self.gc_stepsize;
-        if (step_size == 0) {
+        // PUC STEPSIZE is in bytes (9600 default); gcStepBudget takes KB.
+        // When no explicit size is given (n <= 0 in PUC), use the default
+        // stepsize converted from bytes to KB. If stepsize is 0, PUC's
+        // incstep does a full cycle via runtilstate(fast=1).
+        const stepsize_bytes = gcApplyParam(self.gcparams[5], 100);
+        const default_stepsize_kb: i64 = @intCast(stepsize_bytes / 1024);
+        const step_size = if (requested_kb > 0) requested_kb else default_stepsize_kb;
+        if (step_size <= 0) {
+            // stepsize param is 0 → full cycle (PUC incstep with stepsize=0).
             try self.gcCycleFull();
             return true;
         }
@@ -16332,45 +16402,22 @@ pub const Vm = struct {
 
     fn builtinCollectgarbage(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         const want_out = outs.len > 0;
-        // PUC GCSTPCLS: when the state is closing (lua_close →
-        // luaC_freeallobjects sets g->gcstp = GCSTPCLS), the collector is
-        // fully stopped. `collectgarbage()` with no args returns false
-        // because `luaC_collect` checks `gcstp & GCSTP` and bails out.
-        // The test at main.lua:327 calls `collectgarbage()` from a __gc
-        // finalizer during state close and expects `false`.
-        if (self.is_closing) {
-            if (args.len == 0) {
-                if (want_out) outs[0] = .{ .Bool = false };
-                return;
-            }
-            // For explicit options like "collect", "step", etc. during close,
-            // also return false/0 — the collector is stopped.
-            if (want_out) outs[0] = .{ .Bool = false };
-            return;
-        }
-        // Lua collector is not reentrant. Calls that would start/advance a
-        // collection cycle from inside `__gc` should return false.
-        if (self.gc_busy and args.len == 0) {
-            if (want_out) outs[0] = .{ .Bool = false };
-            return;
-        }
+        // PUC lbaslib.c:201-257: collectgarbage forwards all options to lua_gc.
+        // gcControl implements the PUC lua_gc switch table (including the
+        // GCSTPCLS guard returning -1). We only add the Lua-visible result
+        // conversion: count → fractional number, step/isrunning → boolean,
+        // gen/inc → mode string, param → integer.
+
+        // Default option is "collect" (PUC luaL_checkoption default).
         if (args.len == 0) {
-            if (self.testc_gc_pending_finalize_kb >= 8.0 and !self.testc_gc_pending_finalize_seen) {
-                self.testc_gc_pending_finalize_seen = true;
+            // PUC: lua_gc(L, LUA_GCCOLLECT) → default case: checkvalres + push int.
+            const res = self.gcControl(2, 0, -1); // LUA_GCCOLLECT
+            if (res < 0) {
+                // checkvalres: GCSTPGC/GCSTPCLS → push false (not reentrant).
+                if (want_out) outs[0] = .{ .Bool = false };
+            } else {
                 if (want_out) outs[0] = .{ .Int = 0 };
-                return;
             }
-            try self.gcFullCollectionForUser();
-            if (self.testc_gc_pending_finalize_kb > 0.0) {
-                if (self.testc_gc_pending_finalize_seen) {
-                    self.testc_gc_manual_kb = @max(0.0, self.testc_gc_manual_kb - self.testc_gc_pending_finalize_kb);
-                    self.testc_gc_pending_finalize_kb = 0.0;
-                    self.testc_gc_pending_finalize_seen = false;
-                } else {
-                    self.testc_gc_pending_finalize_seen = true;
-                }
-            }
-            if (want_out) outs[0] = .{ .Int = 0 };
             return;
         }
 
@@ -16380,48 +16427,46 @@ pub const Vm = struct {
         };
 
         if (std.mem.eql(u8, what, "count")) {
+            // PUC: k = lua_gc(COUNT); b = lua_gc(COUNTB); push k + b/1024.
+            const k = self.gcControl(3, 0, -1); // LUA_GCCOUNT
+            const b = self.gcControl(4, 0, -1); // LUA_GCCOUNTB
             if (want_out) {
                 const live_ud_kb = self.testcLiveUserdataKb();
-                outs[0] = .{ .Num = self.gc_count_kb + live_ud_kb + self.testc_gc_manual_kb + self.testc_gc_count_bonus_once_kb };
+                const total_kb: f64 = @as(f64, @floatFromInt(k)) + @as(f64, @floatFromInt(b)) / 1024.0;
+                outs[0] = .{ .Num = total_kb + live_ud_kb + self.testc_gc_manual_kb + self.testc_gc_count_bonus_once_kb };
             }
             self.testc_gc_count_bonus_once_kb = 0.0;
             return;
         }
+        if (std.mem.eql(u8, what, "step")) {
+            // PUC: n = optinteger(2, 0); res = lua_gc(STEP, n); push boolean.
+            const n: i64 = if (args.len >= 2) switch (args[1]) {
+                .Int => |x| x,
+                else => return self.fail("collectgarbage('step', size) expects integer size", .{}),
+            } else 0;
+            const res = self.gcControl(5, @intCast(n), -1); // LUA_GCSTEP
+            if (res < 0) {
+                // GCSTPCLS guard: collector stopped → push false (PUC checkvalres).
+                if (want_out) outs[0] = .{ .Bool = false };
+                return;
+            }
+            if (want_out) outs[0] = .{ .Bool = res != 0 };
+            return;
+        }
         if (std.mem.eql(u8, what, "isrunning")) {
-            if (want_out) outs[0] = .{ .Bool = self.gc_running };
-            return;
-        }
-        if (std.mem.eql(u8, what, "stop")) {
-            self.gc_running = false;
-            if (want_out) outs[0] = .{ .Bool = true };
-            return;
-        }
-        if (std.mem.eql(u8, what, "restart")) {
-            self.gc_running = true;
-            // PUC Lua resets GC debt to zero on restart, so the next
-            // allocation immediately gets a chance to advance the collector.
-            // Leaving the old post-cycle threshold here can defer progress by
-            // hundreds of kilobytes and makes the upstream pace test diverge.
-            self.gc_auto_threshold_kb = self.gc_count_kb;
-            // PUC: luaC_restart sets debt to 0 so the next allocation
-            // immediately triggers a step. Our gc_step_debt_kb is the debt
-            // analogue; reset it to 0.
-            self.gc_step_debt_kb = 0;
-            self.gc_alloc_tables = self.gc_alloc_threshold;
-            self.gc_tick = self.gc_tick_threshold;
-            if (want_out) outs[0] = .{ .Bool = true };
-            return;
-        }
-        if (std.mem.eql(u8, what, "incremental")) {
-            const prev = self.gc_mode;
-            if (prev == .generational) self.gcLeaveGenerational();
-            if (want_out) outs[0] = .{ .String = try self.internStr(if (prev == .incremental) "incremental" else "generational") };
+            const res = self.gcControl(6, 0, -1); // LUA_GCISRUNNING
+            if (want_out) outs[0] = .{ .Bool = res != 0 };
             return;
         }
         if (std.mem.eql(u8, what, "generational")) {
-            const prev = self.gc_mode;
-            if (prev == .incremental) try self.gcEnterGenerational();
-            if (want_out) outs[0] = .{ .String = try self.internStr(if (prev == .incremental) "incremental" else "generational") };
+            const res = self.gcControl(7, 0, -1); // LUA_GCGEN
+            // PUC pushmode: 8→"incremental", 7→"generational"
+            if (want_out) outs[0] = .{ .String = try self.internStr(if (res == 8) "incremental" else "generational") };
+            return;
+        }
+        if (std.mem.eql(u8, what, "incremental")) {
+            const res = self.gcControl(8, 0, -1); // LUA_GCINC
+            if (want_out) outs[0] = .{ .String = try self.internStr(if (res == 7) "generational" else "incremental") };
             return;
         }
         if (std.mem.eql(u8, what, "param")) {
@@ -16430,53 +16475,49 @@ pub const Vm = struct {
                 .String => |s| s.bytes(),
                 else => return self.fail("collectgarbage('param', ...) expects parameter name", .{}),
             };
-
-            var target: *i64 = undefined;
-            if (std.mem.eql(u8, pname, "pause"))
-                target = &self.gc_pause
-            else if (std.mem.eql(u8, pname, "stepmul"))
-                target = &self.gc_stepmul
-            else if (std.mem.eql(u8, pname, "stepsize"))
-                target = &self.gc_stepsize
-            else if (std.mem.eql(u8, pname, "minormul"))
-                target = &self.gc_gen_minormul
-            else if (std.mem.eql(u8, pname, "minormajor"))
-                target = &self.gc_gen_minormajor
-            else if (std.mem.eql(u8, pname, "majorminor"))
-                target = &self.gc_gen_majorminor
-            else
-                return self.fail("collectgarbage: unknown param '{s}'", .{pname});
-
-            const old = target.*;
-            if (args.len >= 3) {
-                const newv = switch (args[2]) {
-                    .Int => |x| x,
-                    else => return self.fail("collectgarbage('param', ..., value) expects integer value", .{}),
-                };
-                target.* = newv;
-                if (std.mem.eql(u8, pname, "pause") or std.mem.eql(u8, pname, "minormul")) self.gcScheduleNextAutomaticCycle();
-            }
-            if (want_out) outs[0] = .{ .Int = old };
+            // PUC lbaslib.c:237-244 maps param names to LUA_GCP* indices.
+            const idx: i32 = if (std.mem.eql(u8, pname, "minormul")) 0
+                else if (std.mem.eql(u8, pname, "majorminor")) 1
+                else if (std.mem.eql(u8, pname, "minormajor")) 2
+                else if (std.mem.eql(u8, pname, "pause")) 3
+                else if (std.mem.eql(u8, pname, "stepmul")) 4
+                else if (std.mem.eql(u8, pname, "stepsize")) 5
+                else return self.fail("collectgarbage: unknown param '{s}'", .{pname});
+            // PUC: value = optinteger(3, -1); push lua_gc(GCPARAM, p, value).
+            const value: i32 = if (args.len >= 3) switch (args[2]) {
+                .Int => |x| @intCast(x),
+                else => return self.fail("collectgarbage('param', ..., value) expects integer value", .{}),
+            } else -1;
+            const res = self.gcControl(9, idx, value); // LUA_GCPARAM
+            if (want_out) outs[0] = .{ .Int = res };
             return;
         }
-        if (std.mem.eql(u8, what, "step")) {
-            const requested_kb: i64 = if (args.len >= 2) switch (args[1]) {
-                .Int => |n| n,
-                else => return self.fail("collectgarbage('step', size) expects integer size", .{}),
-            } else 0;
-            const completed = try self.gcStep(requested_kb);
-            if (want_out) outs[0] = .{ .Bool = completed };
+        // stop, restart, collect → PUC default case: push integer res.
+        if (std.mem.eql(u8, what, "stop")) {
+            const res = self.gcControl(0, 0, -1); // LUA_GCSTOP
+            if (res < 0) {
+                if (want_out) outs[0] = .{ .Bool = false };
+            } else {
+                if (want_out) outs[0] = .{ .Bool = true };
+            }
+            return;
+        }
+        if (std.mem.eql(u8, what, "restart")) {
+            const res = self.gcControl(1, 0, -1); // LUA_GCRESTART
+            if (res < 0) {
+                if (want_out) outs[0] = .{ .Bool = false };
+            } else {
+                if (want_out) outs[0] = .{ .Bool = true };
+            }
             return;
         }
         if (std.mem.eql(u8, what, "collect")) {
-            if (self.gc_busy) {
+            const res = self.gcControl(2, 0, -1); // LUA_GCCOLLECT
+            if (res < 0) {
                 if (want_out) outs[0] = .{ .Bool = false };
-                return;
+            } else {
+                if (want_out) outs[0] = .{ .Int = res };
             }
-            // `stop` disables automatic collection only. Explicit collection
-            // remains available and must not change the running/stopped state.
-            try self.gcFullCollectionForUser();
-            if (want_out) outs[0] = .{ .Int = 0 };
             return;
         }
 
@@ -18787,7 +18828,9 @@ pub const Vm = struct {
             self.gc_step_debt_kb = self.gc_auto_threshold_kb - self.gc_count_kb;
         } else {
             // Still in cycle — throttle next step (PUC luaE_setdebt(stepsize)).
-            self.gc_step_debt_kb = @floatFromInt(@max(self.gc_stepsize, 1));
+            // gcApplyParam returns bytes; convert to KB for gc_step_debt_kb.
+            const stepsize_kb: f64 = @as(f64, @floatFromInt(gcApplyParam(self.gcparams[5], 100))) / 1024.0;
+            self.gc_step_debt_kb = @max(stepsize_kb, 1.0);
         }
     }
 
@@ -18797,32 +18840,35 @@ pub const Vm = struct {
     /// of a kilobyte.
     fn gcScheduleNextAutomaticCycle(self: *Vm) void {
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
-            const minor_mul: f64 = @floatFromInt(@max(self.gc_gen_minormul, 0));
+            // PUC setminordebt: debt = applygcparam(MINORMUL, GCmajorminor).
+            // luazig uses threshold = count * (100 + minormul%) / 100.
+            const minor_mul: f64 = @floatFromInt(gcApplyParam(self.gcparams[0], 100));
             const by_growth = self.gc_count_kb * (100.0 + minor_mul) / 100.0;
             self.gc_auto_threshold_kb = @max(by_growth, self.gc_count_kb + 64.0);
             return;
         }
-        const pause: f64 = @floatFromInt(@max(self.gc_pause, 100));
+        // PUC setpause: threshold = applygcparam(PAUSE, GCmarked).
+        const pause: f64 = @floatFromInt(gcApplyParam(self.gcparams[3], 100));
         const by_pause = self.gc_count_kb * pause / 100.0;
         self.gc_auto_threshold_kb = @max(by_pause, self.gc_count_kb + 256.0);
     }
 
     fn gcStepBudget(self: *const Vm, requested_kb: i64) usize {
         const request: u128 = @intCast(@max(requested_kb, 1));
-        const multiplier: u128 = @intCast(@max(self.gc_stepmul, 1));
+        const multiplier: u128 = @intCast(@max(gcApplyParam(self.gcparams[4], 100), 1));
         const scaled = @max(@as(u128, 1), (request * multiplier + 99) / 100);
         return @intCast(@min(scaled, std.math.maxInt(usize)));
     }
 
     /// PUC incstep: work2do = applygcparam(STEPMUL, stepsize / sizeof(void*)).
-    /// stepsize is in bytes; gc_stepsize is in KB. sizeof(void*) = 8 on 64-bit.
+    /// stepsize is in bytes (gcApplyParam returns 9600 for default STEPSIZE).
     /// PUC singlestep in sweep does GCSWEEPMAX=20 objects; gcAdvance does
     /// one object per work unit, so multiply by GCSWEEPMAX.
     fn gcAutomaticBudget(self: *const Vm) usize {
         const puc_sweep_batch: usize = 20;
-        const stepsize_bytes: u128 = @intCast(@max(self.gc_stepsize, 1) * 1024);
+        const stepsize_bytes: u128 = @intCast(@max(gcApplyParam(self.gcparams[5], 100), 1));
         const work_units: u128 = stepsize_bytes / @sizeOf(*anyopaque);
-        const multiplier: u128 = @intCast(@max(self.gc_stepmul, 1));
+        const multiplier: u128 = @intCast(@max(gcApplyParam(self.gcparams[4], 100), 1));
         const scaled = @max(@as(u128, 1), (work_units * multiplier + 99) / 100);
         return @intCast(@min(scaled * puc_sweep_batch, std.math.maxInt(usize)));
     }
@@ -19632,7 +19678,7 @@ pub const Vm = struct {
         // PUC paces the next cycle via setpause/setminordebt, not via a
         // finalizer-driven tick flag. See gcFinishCycle for rationale.
         self.gc_finalizer_tick_pending = false;
-        const limit = self.gc_gen_major_base_kb * @as(f64, @floatFromInt(@max(self.gc_gen_minormajor, 0))) / 100.0;
+        const limit = self.gc_gen_major_base_kb * @as(f64, @floatFromInt(@max(gcApplyParam(self.gcparams[2], 100), 0))) / 100.0;
         if (limit > 0 and self.gc_gen_added_old_kb >= limit) {
             self.gc_gen_phase = .major;
             self.gc_gen_major_start_kb = self.gc_count_kb;
@@ -19827,7 +19873,7 @@ pub const Vm = struct {
         if (self.gc_mode == .generational and self.gc_gen_phase == .major) {
             const added = @max(0.0, self.gc_gen_major_start_kb - self.gc_gen_major_base_kb);
             const reclaimed = @max(0.0, self.gc_gen_major_start_kb - self.gc_count_kb);
-            const limit = added * @as(f64, @floatFromInt(@max(self.gc_gen_majorminor, 0))) / 100.0;
+            const limit = added * @as(f64, @floatFromInt(@max(gcApplyParam(self.gcparams[1], 100), 0))) / 100.0;
             if (reclaimed > limit) {
                 try self.gcMakeAllOld();
                 return;
@@ -20757,6 +20803,12 @@ pub const Vm = struct {
         const ordered = try self.alloc.dupe(GcObject, to_finalize);
         defer self.alloc.free(ordered);
         std.sort.block(GcObject, ordered, self, gcFinalizeLessThan);
+        // PUC lgc.c:978-987: set GCSTPGC during finalizer execution to
+        // prevent reentrant GC. `collectgarbage()` called from __gc returns
+        // false (lua_gc returns -1, checkvalres pushes fail).
+        const old_gcstp = self.gc_stp;
+        self.gc_stp |= GCSTPGC;
+        defer self.gc_stp = old_gcstp;
         for (ordered) |obj| {
             _ = self.finalizables.remove(obj);
             // Get the metatable and __gc metamethod for this object type.
@@ -26576,6 +26628,7 @@ pub const Vm = struct {
     /// within finalizers become no-ops (PUC GCSTPCLS behavior).
     fn closeStateForExit(self: *Vm) DispatchError!void {
         self.is_closing = true;
+        self.gc_stp |= GCSTPCLS; // PUC: gcstp = GCSTPCLS
 
         // Phase 1: Close all to-be-closed variables.
         // PUC `luaD_closeprotected(L, 1, LUA_OK)` closes all upvalues from
@@ -38030,7 +38083,8 @@ test "vm: generational GC enters and leaves incremental major mode" {
     const root = try vm.allocTableNoGc();
     try vm.rawSet(vm.global_env, .{ .String = try vm.internStr("gen-major-root") }, .{ .Table = root });
     try vm.gcEnterGenerational();
-    vm.gc_gen_minormajor = 1;
+    // Set minormajor to 1% to force a quick minor→major transition.
+    vm.gcparams[2] = Vm.gcCodeParam(1);
 
     var i: usize = 0;
     while (i < 256) : (i += 1) {
@@ -38049,7 +38103,8 @@ test "vm: generational GC enters and leaves incremental major mode" {
     while (i < 256) : (i += 1) {
         try vm.rawSet(root, .{ .Int = @intCast(i + 1) }, .Nil);
     }
-    vm.gc_gen_majorminor = 0;
+    // Set majorminor to 0% to force a quick major→minor transition.
+    vm.gcparams[1] = Vm.gcCodeParam(0);
     try vm.gcCycleFull();
     try testing.expectEqual(Vm.GcGenPhase.minor, vm.gc_gen_phase);
     try testing.expectEqual(@as(usize, 0), vm.gc_young_objects.items.len);

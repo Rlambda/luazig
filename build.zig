@@ -69,6 +69,14 @@ pub fn build(b: *std.Build) void {
     liblua_static.root_module.link_libc = true;
     b.installArtifact(liblua_static);
 
+    // C variadic shim for lua_gc (Zig cannot export variadic functions).
+    // lua_gc_shim.c is in src/lua/ alongside lua.h, so #include "lua.h"
+    // resolves without extra include paths. Added to the lua module so it
+    // is included in both liblua.so and liblua.a.
+    lua_mod.addCSourceFile(.{
+        .file = b.path("src/lua/lua_gc_shim.c"),
+    });
+
     const run_luazig_cmd = b.addRunArtifact(luazig_exe);
     run_luazig_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_luazig_cmd.addArgs(args);

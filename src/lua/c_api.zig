@@ -1809,12 +1809,25 @@ pub export fn lua_pushthread(L: ?*lua_State) c_int {
 
 // --- Garbage collection (PUC lapi.c:lua_gc) ---
 
-/// PUC `lua_gc` (lapi.c:lua_gc): garbage collector control. `what` is a
-/// LUA_GC* constant. Returns context-dependent values (memory in KB for
-/// GCCOUNT, running status for GCISRUNNING, 0 for most others).
-pub export fn lua_gc(L: ?*lua_State, what: c_int, data: c_int) c_int {
+/// PUC `lua_gc` is variadic: `int lua_gc(lua_State *L, int what, ...)`.
+/// For LUA_GCPARAM, it takes two varargs (param, value); for LUA_GCSTEP,
+/// one vararg (size_t n); for all others, one vararg (int data).
+/// We expose two fixed-arg Zig functions and provide a C variadic shim
+/// (`src/lua/lua_gc_shim.c`) that dispatches to them. This avoids Zig's
+/// lack of C variadic export support while maintaining ABI compatibility.
+///
+/// `luazigGcFixed` handles all non-GCPARAM options. For LUA_GCSTEP, `data`
+/// carries the step size (PUC's vararg `size_t n`).
+pub export fn luazigGcFixed(L: ?*lua_State, what: c_int, data: c_int) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    return s.gc(what, data);
+    return s.vm.gcControl(what, data, -1);
+}
+
+/// `luazigGcParam` handles LUA_GCPARAM: `param` is the LUA_GCP* index,
+/// `value` is the new value (or -1 for getter-only).
+pub export fn luazigGcParam(L: ?*lua_State, param: c_int, value: c_int) c_int {
+    var s = api.State.fromHandle(L orelse return 0);
+    return s.vm.gcControl(9, param, value); // LUA_GCPARAM = 9
 }
 
 // --- Call / pcall ---

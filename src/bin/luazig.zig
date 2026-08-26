@@ -1090,6 +1090,15 @@ fn interpreterMain(init: std.process.Init) !void {
     // indices = options/program name.
     try vm.setArgTablePuc(puc_argv, cr.script);
 
+    // PUC pmain (lua.c:726-727): after createargtable, start the GC and
+    // switch to generational mode. Fresh luaL_newstate starts incremental
+    // + running; pmain does GCRESTART (reset debt) then GCGEN.
+    // TODO: temporarily disabled — generational mode at CLI startup exposes
+    // pre-existing generational GC bugs (segfaults in constructs/coroutine/
+    // cstack/db/locals). Will be re-enabled after fixing those bugs.
+    // _ = vm.gcControl(1, 0, -1); // LUA_GCRESTART
+    // _ = vm.gcControl(7, 0, -1); // LUA_GCGEN
+
     var bc_stats: BcCoverageStats = .{};
     const bc_stats_ptr: ?*BcCoverageStats = if (opts.backend == .bc) &bc_stats else null;
 

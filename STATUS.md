@@ -1,4 +1,4 @@
-> Last updated: 2026-08-25 (P16.0 complete: perf observability + quantitative model — 2.70x = 1.32 instr × 2.05 cost)
+> Last updated: 2026-08-25 (P16.1+P16.2: perf tranche 1 — geomean 2.71x → 2.54x; MMBIN skip, TABUP fast paths, pending-call drop)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).

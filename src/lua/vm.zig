@@ -17712,8 +17712,16 @@ pub const Vm = struct {
         const use_saved_entry = th.bytecode_inplace_suspended and
             th.entry_args != null;
         const exec_args = if (use_saved_entry) th.entry_args.? else call_args;
-        const resolved = try self.resolveCallable(th.callee, exec_args, null);
-        defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+        // P16.2c: resolveCallable is LAZY — the direct-resume path (the
+        // dominant resumed-yield case) reads the top frame's closure from
+        // bc_stack and never touches `resolved`; resolving here cost a call
+        // + ResolvedCall construction on every resume (5.2% of the
+        // coroutine profile). Only the fresh-body/switch path below needs it.
+        var resolved: ResolvedCall = undefined;
+        var resolved_valid = false;
+        defer if (resolved_valid) {
+            if (resolved.owned_args) |owned| self.alloc.free(owned);
+        };
 
         // P15.78 Task 13: If a C-frame is on top (from a prior
         // callk/pcallk/yieldk that yielded), we need to call finishCcall → k
@@ -18148,7 +18156,11 @@ pub const Vm = struct {
                 }
                 continue :unroll_loop;
             }
-        } else switch (resolved.callee) {
+        } else {
+            // P16.2c: fresh body (or no preserved Lua frame) — resolve here.
+            resolved = try self.resolveCallable(th.callee, exec_args, null);
+            resolved_valid = true;
+            switch (resolved.callee) {
             .Builtin => |id| {
                 // Normal path: first run or no preserved Lua frame.
                 if (nouts != 0) {
@@ -18222,6 +18234,7 @@ pub const Vm = struct {
                 }
             },
             else => return self.fail("coroutine.resume: bad thread", .{}),
+            }
         }
 
         defer if (payload_heap) self.alloc.free(payload);

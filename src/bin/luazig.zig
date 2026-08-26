@@ -1093,9 +1093,15 @@ fn interpreterMain(init: std.process.Init) !void {
     // PUC pmain (lua.c:726-727): after createargtable, start the GC and
     // switch to generational mode. Fresh luaL_newstate starts incremental
     // + running; pmain does GCRESTART (reset debt) then GCGEN.
-    // TODO: temporarily disabled — generational mode at CLI startup exposes
-    // pre-existing generational GC bugs (segfaults in constructs/coroutine/
-    // cstack/db/locals). Will be re-enabled after fixing those bugs.
+    //
+    // Both GCRESTART and GCGEN are temporarily disabled:
+    // - GCRESTART resets GC debt to 0, which causes 3 matrix failures
+    //   (bitwise, nextvar, vararg) due to premature GC triggering.
+    // - GCGEN crashes due to pre-existing generational GC bugs in
+    //   gcMinorCollection (reproducible via `collectgarbage("generational")`
+    //   at script start — crashes even without P16.4a changes).
+    // TODO(P16.4b): enable both after fixing the generational GC and
+    //   verifying GCRESTART doesn't cause premature GC issues.
     // _ = vm.gcControl(1, 0, -1); // LUA_GCRESTART
     // _ = vm.gcControl(7, 0, -1); // LUA_GCGEN
 

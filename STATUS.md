@@ -1,4 +1,4 @@
-> Last updated: 2026-08-26 (P16.4a: unified gcControl + variadic lua_gc shim + coded GC params)
+> Last updated: 2026-08-26 (P16.4b: fix generational GC full-collection crash — gcMakeAllWhite before pending cycle)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -3159,6 +3159,42 @@ th.yielded / resume_inbox / suspended_builtin_args dupes). InlineValues
     GCRESTART doesn't cause premature GC issues.
 - **Gate**: matrix 31/32 (big.lua both_fail pre-existing), smoke 54/54,
   c_api 17/17 + DIFF PASS, zig build test 0, leak_bench 25/25 PASS.
+
+### P16.4b — Fix generational GC full-collection crash (gcMakeAllWhite before pending cycle)
+
+- **Root cause**: `gcFullCollectionForUser` (generational path) called
+  `gcMakeAllWhite()` BEFORE finishing any pending incremental cycle.
+  `collectgarbage("step")` in major phase starts an incremental cycle
+  (gc_state=propagate). When `collectgarbage("collect")` is then called,
+  `gcMakeAllWhite` resets ALL objects' marks to current white — including
+  objects already marked (black/gray) during the pending cycle's propagation.
+  `gcCycleFull` then finishes the pending cycle: its sweep sees the reset
+  marks and frees objects that are actually alive (but whose marks were
+  corrupted). `gcCycleFull` then starts a SECOND cycle; during the second
+  cycle's propagation, live tables' references to the freed objects are
+  followed → `gcQueueScanObject` adds freed memory to the gray list →
+  `gcPropagateOne` iterates freed table's hash → crash (`switch on corrupt
+  value` in `Node.getKey()`).
+- **Fix**: Finish the pending incremental cycle BEFORE calling
+  `gcMakeAllWhite`. PUC's `fullgen` (lgc.c:1458) does the same:
+  `minor2inc` enters sweep, then `entergen` runs to pause (finishing the
+  sweep) before starting a new cycle. The fix replaces the single
+  `gcCycleFull()` call with: (1) finish pending cycle to pause,
+  (2) `gcMakeAllWhite()`, (3) `gcStartCycle(true)`, (4) run to pause.
+- **Repro**: `/tmp/gm_e.lua` — `collectgarbage("generational")`, loop 100
+  rounds with nested tables + `collectgarbage("step")` every 10 rounds,
+  then `collectgarbage("collect")`. Crashes in Debug and ReleaseFast
+  before fix; passes after.
+- **GCGEN at startup**: The gen-mode full-collection crash is fixed, but
+  enabling `LUA_GCGEN` at CLI startup reveals a SEPARATE pre-existing
+  gen-mode bug: minor collection frees Cell (upvalue) objects still
+  referenced by live coroutines. Repro: `collectgarbage("generational")`
+  + coroutine sieve chain (coroutine.lua lines 99-124). Crash at
+  `Cell.get` (vm.zig:621) — `bc_stack_idx` dereferences freed Cell.
+  This is NOT the same bug as the full-collection crash; it requires
+  a separate fix (P16.4c). GCGEN remains disabled at startup.
+- **Gate**: matrix 31/32 (big.lua both_fail pre-existing), smoke 54/54,
+  c_api 17/17, zig build test 0 — no regressions.
 
 ## История закрытых фаз
 

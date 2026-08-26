@@ -18776,14 +18776,28 @@ pub const Vm = struct {
             return;
         }
         self.gc_mode = .incremental;
+        // PUC fullgen: minor2inc enters sweep, then entergen runs to pause
+        // (finishing the pending sweep) before starting a new cycle.
+        // We must finish any pending incremental cycle BEFORE resetting marks.
+        // If gcMakeAllWhite runs while a cycle is mid-propagation, it corrupts
+        // that cycle's color invariant: objects already marked (black/gray)
+        // are reset to white, causing the pending sweep to free live objects.
+        // This is the root cause of the gen-mode full-collection crash:
+        // collectgarbage("step") in major phase starts an incremental cycle
+        // (gc_state=propagate); collectgarbage("collect") then calls
+        // gcMakeAllWhite before finishing that cycle, corrupting its marks.
+        while (self.gc_state != .pause) {
+            _ = try self.gcAdvance(std.math.maxInt(usize), false);
+        }
         // PUC fullgen: reset all objects to current white so the incremental
         // mark/sweep can distinguish reachable (will be marked black) from
         // unreachable (stays old-white, swept after the white flip).
         self.gcMakeAllWhite();
-        self.gcCycleFull() catch |err| {
-            self.gc_mode = .generational;
-            return err;
-        };
+        // Start and run a fresh full cycle to completion.
+        try self.gcStartCycle(true);
+        while (self.gc_state != .pause) {
+            _ = try self.gcAdvance(std.math.maxInt(usize), false);
+        }
         // No second cycle: finalized objects survive the first cycle and
         // will be freed in the next collectgarbage() call.
         self.gc_mode = .generational;
@@ -19085,6 +19099,26 @@ pub const Vm = struct {
     /// to grayagain. The value is NOT marked, allowing weak value pruning
     /// and keeping newly created objects white.
     inline fn gcWriteBarrierTable(self: *Vm, owner: *Table, value: Value) DispatchError!void {
+        // Generational mode: backward barrier via gcRememberObject.
+        // When an old (black) table stores a reference to a young (white)
+        // object, the table must be re-traversed in the next minor cycle
+        // so the young value gets marked. Without this, the young value
+        // is only reachable from the old table and gets swept during the
+        // next minor collection — use-after-free.
+        // PUC luaC_barrierback (lgc.h:251): iscollectable(v) && isblack(p)
+        // && iswhite(gcvalue(v)) → luaC_barrierback_(L, p). In gen mode all
+        // old objects are black, so isOld(owner) + isYoung(value) is the
+        // equivalent check.
+        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
+            if (owner.gc_age.isOld()) {
+                if (gcValueAge(value)) |age| {
+                    if (age.isYoung()) {
+                        try self.gcRememberObject(.{ .table = owner });
+                    }
+                }
+            }
+            return;
+        }
         if (self.gc_state == .pause) return;
         if (!gcIsBlack(owner.gc_marked)) return;
         // Only fire if value is collectable and white.
@@ -19134,6 +19168,26 @@ pub const Vm = struct {
     /// the cell is black. This matches PUC's luaC_barrier(L, owner, val)
     /// used by lua_setupvalue and OP_SETUPVAL.
     inline fn gcWriteBarrierCell(self: *Vm, cell: *Cell, value: Value) DispatchError!void {
+        // Generational mode: forward barrier — mark the value and promote
+        // it to old0 if the cell is old and the value is young.
+        // PUC luaC_barrier (lgc.h:245) → luaC_barrier_ (lgc.c:246):
+        // reallymarkobject(v) + setage(v, G_OLD0). This fires for upvalue
+        // writes (luaF_close, lua_setupvalue). Without it, a young value
+        // stored in an old closed upvalue would be swept — use-after-free.
+        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
+            if (cell.gc_age.isOld()) {
+                if (gcValueAge(value)) |age| {
+                    if (age.isYoung()) {
+                        // PUC luaC_barrier_: mark value + promote to old0.
+                        const child_obj = GcObject.fromValue(value) orelse return;
+                        if (gcIsWhite(gcPtr(child_obj).marked.*)) gcSetBlack(gcPtr(child_obj).marked);
+                        gcPtr(child_obj).age.* = .old0;
+                        try self.gc_old1.append(self.alloc, child_obj);
+                    }
+                }
+            }
+            return;
+        }
         if (self.gc_state == .pause) return;
         if (!gcIsBlack(cell.gc_marked)) return;
         // PUC luaC_barrier_: if keepinvariant (propagate/atomic), mark the
@@ -19249,7 +19303,9 @@ pub const Vm = struct {
             if (table.gc_age.isOld()) {
                 const key_young = if (gcValueAge(key)) |age| age.isYoung() else false;
                 const value_young = if (gcValueAge(value)) |age| age.isYoung() else false;
-                if (key_young or value_young) try self.gcRememberValue(.{ .Table = table });
+                if (key_young or value_young) {
+                    try self.gcRememberValue(.{ .Table = table });
+                }
             }
             return;
         }

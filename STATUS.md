@@ -1,4 +1,4 @@
-> Last updated: 2026-08-25 (P16.3: zero-alloc yield/resume — 0 heap allocs/iter, coroutine_yield -5.8%)
+> Last updated: 2026-08-25 (P16.2b/c: yield memset drop + lazy resolve — coroutine_yield 3.69x → 3.16x total, geomean 2.53x)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).

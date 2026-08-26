@@ -12648,17 +12648,21 @@ pub const Vm = struct {
                                 ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                                 ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
 
-                                // Set return continuation on parent frame —
-                                // when the child returns, applyBytecodePendingResults
-                                // stores results at reg[a] and advances pc.
+                                // P16.2: no pending-call slot for a plain
+                                // Lua→Lua call — the P15.51c direct contract
+                                // applies (same as opCall's plain-Lua branch:
+                                // dst derived from the child's func_slot_base,
+                                // nresults decoded from the child's
+                                // callstatus; applyBytecodeResultsDirect
+                                // advances pc). The pending slot served no
+                                // purpose for plain .results completions —
+                                // protection/tail_return/append_nil are not
+                                // this call's cases — and cost an
+                                // allocPendingCall + payload store at setup,
+                                // plus the pending lookup/union switch/
+                                // clearPendingCall on every return
+                                // (setPendingCall was 9.3% of lua_calls).
                                 const rargs = ctx.regs[a + 1 .. a + 1 + nargs];
-                                try self.setPendingCall(ctx.exec_frames.getPtr(ctx.frame_index), .{
-                                    .callee = callee,
-                                    .completion = .{ .results = .{
-                                        .dst = a,
-                                        .nresults = nresults,
-                                    } },
-                                });
                                 try self.pushBytecodeExecFrame(
                                     ctx.exec_frames,
                                     proto,

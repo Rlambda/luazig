@@ -11483,21 +11483,10 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(rc.Int)) };
                         } else {
                             @branchHint(.unlikely);
-                            // Slow path: string coercion or metamethod.
-                            if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                "__add",
-                                "add",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
-                            }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Plus, b, c, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // Slow path: string coercion or metamethod. Cold —
+                            // outlined (P16.2b) to keep the numeric fast-path
+                            // basic blocks compact in the dispatch layout.
+                            if (try self.addSlowPath(&ctx, exec_frames, a, b, c, lb, rc)) continue :frame_loop;
                         }
                         // P16.1a (PUC 5.5 op_arith pc-skip, lvm.c:997):
                         // on inline completion (fast path or coercion eval)
@@ -13118,6 +13107,28 @@ pub const Vm = struct {
     /// OP_SETLIST: R[A][C+i] := R[A+i] for 1<=i<=B. When C==255, the actual
     /// base index is in the following EXTRAARG instruction (consumed here).
     /// Returns `.continue_dispatch` so the dispatcher advances past SETLIST.
+    /// P16.2b: outlined cold path of OP_ADD — string coercion, __add
+    /// metamethod, or the "attempt to perform arithmetic" error. Kept out of
+    /// the dispatch switch body so the four numeric fast-path blocks stay
+    /// contiguous and µop-cache friendly.
+    fn addSlowPath(self: *Vm, ctx: *BytecodeDispatchCtx, exec_frames: *FrameStack, a: u8, b: usize, c: usize, lb: Value, rc: Value) DispatchError!bool {
+        if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
+            exec_frames,
+            ctx.frame_index,
+            lb,
+            rc,
+            "__add",
+            "add",
+            .{ .value = .{ .dst = a } },
+        )) {
+            return true; // caller must continue :frame_loop (child frame pushed)
+        }
+        const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Plus, @intCast(b), @intCast(c), lb, rc);
+        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+        ctx.regs[a] = result;
+        return false; // coercion eval completed inline; caller applies the MMBIN skip
+    }
+
     fn opSetlist(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
         const inst = ctx.cur_proto.code[ctx.pc];
         const a: usize = inst.a;
@@ -17302,7 +17313,13 @@ pub const Vm = struct {
     }
 
     fn builtinCoroutineYield(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
-        for (outs) |*o| o.* = .Nil;
+        // P16.2b: no outs pre-Nil here. The dominant path (plain yield)
+        // returns error.Yield and the caller NEVER reads outs — the parked
+        // resume delivers values via th.yielded; a 128-byte Nil memset per
+        // yield was pure waste (9.2% memset in the coroutine profile).
+        // The wrap_eager branch below returns normally, so its outs ARE
+        // read by the caller — Nil-fill only there (behavior preserved:
+        // the wrap driver consumes values from th.wrap_yields, not outs).
         // PUC luaG_runerror: coroutine.yield is a C function, so isLua(ci) is
         // false and luaG_addinfo is NOT called — no "file:line:" prefix on the
         // error message. Use failC (C-function variant) to match this.
@@ -17336,6 +17353,7 @@ pub const Vm = struct {
         }
         self.snapshotThreadTraceFrames(th);
         if (th.wrap_eager_mode) {
+            for (outs) |*o| o.* = .Nil;
             try self.appendThreadWrapYield(th, args);
             th.yielded.deinit(self.alloc);
             if (args.len > INLINE_VALUES_CAP) {

@@ -10980,8 +10980,16 @@ pub const Vm = struct {
                         // env is an upvalue, not a register — no ctx.regs slice
                         // invalidation possible.
                         if (env == .Table and env.Table.metatable == null) {
+                            // P16.1b: inline nodeLookup (same as GETFIELD).
+                            // The key is always a constant String here —
+                            // rawGet's key-type switch and call overhead are
+                            // unnecessary. (Was: rawGet funnel; rawGet was
+                            // 10% of the field_access profile.)
                             if (self.stats.enabled) self.stats.tbl_get_fast_str += 1; // P16.0b (constant string key)
-                            ctx.regs[a] = self.rawGet(env.Table, key);
+                            ctx.regs[a] = if (ltable.nodeLookup(env.Table.hash, key, self.hash_seed)) |node|
+                                node.value
+                            else
+                                .Nil;
                         } else {
                             @branchHint(.unlikely);
                             if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, env, key, a)) {
@@ -11017,8 +11025,33 @@ pub const Vm = struct {
                             return self.fail("attempt to index a {s} value (upvalue '{s}')", .{ tn, upv_name });
                         }
                         if (env.Table.metatable == null) {
-                            if (self.stats.enabled) self.stats.tbl_set_fast_str += 1; // P16.0b (constant string key; outcome counted in rawSet funnel)
-                            try self.rawSet(env.Table, key, val);
+                            // P16.1b: inline rawSet fast path (same as
+                            // SETFIELD): barrier + direct nodeLookup for an
+                            // existing key, update in place; fall back to
+                            // rawSet only for new-key insertion (possible
+                            // rehash). The key is always a constant String —
+                            // rawSet's array-part check and call overhead are
+                            // unnecessary. (Was: unconditional rawSet funnel;
+                            // rawSet was 30% of the field_access profile.)
+                            const tbl = env.Table;
+                            try self.gcTableWriteBarrier(tbl, key, val);
+                            if (self.stats.enabled) self.stats.tbl_set_fast_str += 1; // P16.0b (constant string key)
+                            if (ltable.nodeLookup(tbl.hash, key, self.hash_seed)) |node| {
+                                if (self.stats.enabled) self.stats.tbl_update += 1; // P16.0b
+                                if (val == .Nil) {
+                                    _ = ltable.nodeDelete(tbl.hash, key, self.hash_seed);
+                                } else {
+                                    // Reviving a dead node (old value nil):
+                                    // invalidate TM cache (PUC luaV_finishset).
+                                    if (node.value == .Nil) {
+                                        tbl.flags &= ~TableFlags.MASK;
+                                    }
+                                    node.value = val;
+                                }
+                            } else {
+                                @branchHint(.unlikely);
+                                try self.rawSet(tbl, key, val);
+                            }
                         } else {
                             @branchHint(.unlikely);
                             if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, ctx.frame_index, env, key, val)) {

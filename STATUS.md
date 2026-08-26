@@ -1,4 +1,4 @@
-> Last updated: 2026-08-25 (P16.0c: per-workload hardware counters + perf record profiling pipeline)
+> Last updated: 2026-08-25 (P16.0 complete: perf observability + quantitative model — 2.70x = 1.32 instr × 2.05 cost)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).

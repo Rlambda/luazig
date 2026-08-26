@@ -1583,6 +1583,84 @@ const FrameStack = struct {
     }
 };
 
+/// P16.3: small-vector storage for per-thread yield/resume value lists.
+/// The overwhelmingly common case is 0-4 values (coroutine.yield(42),
+/// resume with no args), which must not pay a heap round-trip per
+/// iteration. Values beyond the inline capacity spill to a heap slice.
+/// API mirrors the old `?[]Value` field semantics:
+///   - `slice()` returns null when empty (was: null field)
+///   - `setFrom()` copies (replaces alloc.dupe into the field)
+///   - `setOwned()` adopts an existing heap slice without copying
+///   - `take()` moves the contents out (emptying the storage)
+///   - `deinit()` frees the heap spill if any
+const INLINE_VALUES_CAP: usize = 4;
+
+const InlineValues = struct {
+    inline_buf: [INLINE_VALUES_CAP]Value = undefined,
+    heap: ?[]Value = null,
+    len: usize = 0,
+
+    /// `?[]Value` view: null when empty (matches the old null-field
+    /// semantics at every read site).
+    fn slice(self: *const InlineValues) ?[]Value {
+        if (self.len == 0) return null;
+        if (self.heap) |h| return h[0..self.len];
+        return @constCast(self).inline_buf[0..self.len];
+    }
+
+    /// Replace contents with a copy of `vals` (inline when it fits).
+    /// Frees any previous heap spill. Errors only on heap spill OOM.
+    fn setFrom(self: *InlineValues, alloc: std.mem.Allocator, vals: []const Value) error{OutOfMemory}!void {
+        self.deinit(alloc);
+        self.len = vals.len;
+        if (vals.len == 0) return;
+        if (vals.len <= INLINE_VALUES_CAP) {
+            @memcpy(self.inline_buf[0..vals.len], vals);
+        } else {
+            self.heap = try alloc.alloc(Value, vals.len);
+            @memcpy(self.heap.?, vals);
+        }
+    }
+
+    /// Adopt an already-owned heap slice (replaces `field = slice`
+    /// assignments; no copy). Frees any previous heap spill first.
+    fn setOwned(self: *InlineValues, alloc: std.mem.Allocator, vals: []Value) void {
+        self.deinit(alloc);
+        if (vals.len == 0) {
+            // Empty owned slice: nothing to keep. Callers historically
+            // stored empty slices and freed them later; storing empty is
+            // equivalent to clearing.
+            if (vals.len == 0) {} // (keep; documented no-op)
+            return;
+        }
+        if (vals.len <= INLINE_VALUES_CAP) {
+            // Small owned slice: copy inline and free the donor (avoids a
+            // long-lived tiny heap block). This changes ownership: the
+            // caller must NOT free vals afterwards. All setOwned call sites
+            // previously transferred ownership to the field, which freed it
+            // on the next replacement — semantics preserved.
+            @memcpy(self.inline_buf[0..vals.len], vals);
+            self.len = vals.len;
+            alloc.free(vals);
+            return;
+        }
+        self.len = vals.len;
+        self.heap = vals;
+    }
+
+    /// True when the storage currently holds a heap spill (debug/audit).
+    fn isHeap(self: *const InlineValues) bool {
+        return self.heap != null;
+    }
+
+    /// Free heap storage and reset to empty (replaces `field = null`).
+    fn deinit(self: *InlineValues, alloc: std.mem.Allocator) void {
+        if (self.heap) |h| alloc.free(h);
+        self.heap = null;
+        self.len = 0;
+    }
+};
+
 pub const Thread = struct {
     const WrapYield = struct {
         values: []Value,
@@ -1630,7 +1708,9 @@ pub const Thread = struct {
     /// True while errfunc handler is running. Prevents infinite recursion.
     errfunc_running: bool = false,
     callee: Value, // .Closure or .Builtin
-    yielded: ?[]Value = null,
+    /// P16.3: inline small-vector (0-4 values stay off the heap; the
+    /// yield/resume hot loop must be allocation-free).
+    yielded: InlineValues = .{},
     wrap_eager_mode: bool = false,
     wrap_started: bool = false,
     wrap_yields: std.ArrayListUnmanaged(WrapYield) = .empty,
@@ -1707,7 +1787,7 @@ pub const Thread = struct {
     bytecode_unwinds: std.ArrayListUnmanaged(BytecodeUnwindState) = .empty,
     bytecode_close_metamethod_depth: usize = 0,
     bytecode_close_metamethod_err_depth: usize = 0,
-    resume_inbox: ?[]Value = null,
+    resume_inbox: InlineValues = .{},
     tail_resume_inbox: ?[]Value = null,
     suspended_pc: usize = 0,
     suspended_direct_yield: bool = false,
@@ -1717,7 +1797,8 @@ pub const Thread = struct {
     yield_origin_depth: usize = 0,
     in_resume: bool = false,
     suspended_builtin: ?BuiltinId = null,
-    suspended_builtin_args: ?[]Value = null,
+    /// P16.3: inline small-vector (0-4 values off-heap; see InlineValues).
+    suspended_builtin_args: InlineValues = .{},
     /// P15.83q: C-frame residue of the error that killed this thread
     /// (PUC: the value the raising C function left below the error object
     /// on its frame — e.g. error()'s original string argument). Set by
@@ -5970,10 +6051,20 @@ pub const Vm = struct {
         proto.constants_resolved = true;
     }
 
-    fn takeBytecodeResumeValues(th: *Thread) ?[]Value {
-        const vals = th.resume_inbox orelse return null;
-        th.resume_inbox = null;
-        return vals;
+    fn takeBytecodeResumeValues(th: *Thread, alloc: std.mem.Allocator) ?[]Value {
+        // P16.3: move the inbox contents out. Inline contents are duped to a
+        // heap slice (the caller owns and frees it); heap spills are adopted
+        // as-is. The inbox is emptied either way.
+        const cur = th.resume_inbox.slice() orelse return null;
+        if (th.resume_inbox.heap) |h| {
+            const out = h[0..th.resume_inbox.len];
+            th.resume_inbox.heap = null;
+            th.resume_inbox.len = 0;
+            return out;
+        }
+        const out = alloc.dupe(Value, cur) catch return null;
+        th.resume_inbox.len = 0;
+        return out;
     }
 
     noinline fn dispatchBytecodeHook(
@@ -7795,10 +7886,7 @@ pub const Vm = struct {
         const first_start = !target.started and target.entry_args == null;
         if (first_start) target.entry_args = try self.alloc.dupe(Value, request.args);
         try self.setThreadResumeInbox(target, request.args);
-        if (target.yielded) |values| {
-            self.alloc.free(values);
-            target.yielded = null;
-        }
+        target.yielded.deinit(self.alloc);
 
         request.caller.status = .suspended;
         target.status = .running;
@@ -7836,8 +7924,7 @@ pub const Vm = struct {
                 self.clearThreadContinuationScratch(thread, .{});
             },
             .yielded => {
-                if (thread.yielded) |values| self.alloc.free(values);
-                thread.yielded = null;
+                thread.yielded.deinit(self.alloc);
                 thread.trace_yields += 1;
                 thread.status = .suspended;
                 thread.close_has_err = false;
@@ -7845,8 +7932,7 @@ pub const Vm = struct {
                 thread.finished = false;
             },
             .failed => |error_value| {
-                if (thread.yielded) |values| self.alloc.free(values);
-                thread.yielded = null;
+                thread.yielded.deinit(self.alloc);
                 thread.trace_had_error = true;
                 thread.status = .dead;
                 thread.close_has_err = true;
@@ -7943,7 +8029,7 @@ pub const Vm = struct {
         }
         // Nested coroutine: bubble path needs owned values because
         // finishNestedBytecodeCoroutine frees thread.yielded.
-        const values = thread.yielded orelse &[_]Value{};
+        const values = thread.yielded.slice() orelse &[_]Value{};
         return .{ .yielded = try self.alloc.dupe(Value, values) };
     }
 
@@ -8242,8 +8328,8 @@ pub const Vm = struct {
                     // trampoline after finishCcall returns) will pop it.
                     // Put results in resume_inbox for the Lua frame to pick up.
                     if (saved_results.len > 0) {
-                        if (th.resume_inbox) |old| self.alloc.free(old);
-                        th.resume_inbox = saved_results;
+                        if (th.resume_inbox.slice()) |old| self.alloc.free(old);
+                        th.resume_inbox.setOwned(self.alloc, saved_results);
                     } else {
                         self.alloc.free(saved_results);
                     }
@@ -8483,11 +8569,9 @@ pub const Vm = struct {
                 for (0..actual_n) |i| {
                     results[i] = self.cur_c_stack.items[src_start + i];
                 }
-                if (th.resume_inbox) |old| self.alloc.free(old);
-                th.resume_inbox = results;
+                th.resume_inbox.setOwned(self.alloc, results);
             } else {
-                if (th.resume_inbox) |old| self.alloc.free(old);
-                th.resume_inbox = null;
+                th.resume_inbox.deinit(self.alloc);
             }
             // Restore c_stack
             self.cur_c_stack.deinit(self.alloc);
@@ -8537,8 +8621,8 @@ pub const Vm = struct {
                 const results = try self.alloc.alloc(Value, 2);
                 results[0] = .{ .Bool = false };
                 results[1] = errv;
-                if (th.resume_inbox) |old| self.alloc.free(old);
-                th.resume_inbox = results;
+                if (th.resume_inbox.slice()) |old| self.alloc.free(old);
+                th.resume_inbox.setOwned(self.alloc, results);
                 // Set isHookYield on the Lua frame below so the OP_CALL
                 // dispatch uses resume_inbox values instead of re-calling
                 // the C function (pcall). Without this, runBytecodeInternal
@@ -8573,7 +8657,7 @@ pub const Vm = struct {
                     }
                 }
             }
-            const nargs = if (th.resume_inbox) |ri| @as(i32, @intCast(ri.len)) else 0;
+            const nargs = if (th.resume_inbox.slice()) |ri| @as(i32, @intCast(ri.len)) else 0;
             return nargs;
         }
     }
@@ -8760,11 +8844,10 @@ pub const Vm = struct {
                                     // complete. The continuation's results are
                                     // in resume_inbox. Return them as the
                                     // coroutine's return values.
-                                    const ri = active.resume_inbox orelse &[_]Value{};
+                                    const ri = active.resume_inbox.slice() orelse &[_]Value{};
                                     const results = try self.alloc.alloc(Value, ri.len);
                                     for (ri, 0..) |v, i| results[i] = v;
-                                    if (active.resume_inbox) |old| self.alloc.free(old);
-                                    active.resume_inbox = null;
+                                    active.resume_inbox.deinit(self.alloc);
                                     step = .{ .returned = results };
                                     have_step = true;
                                 }
@@ -8871,7 +8954,7 @@ pub const Vm = struct {
                                     continue :drive;
                                 }
                                 // Not recovered: unrecoverable error
-                                if (active.yielded != null and active.capture_yield_id != 0) {
+                                if (active.yielded.slice() != null and active.capture_yield_id != 0) {
                                     step = try self.bytecodeCoroutineYieldStep(active, active == initial);
                                 } else if (self.forced_close_thread == active and active.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
                                     step = .forced_close;
@@ -8968,11 +9051,10 @@ pub const Vm = struct {
                                     } else {
                                         // P15.78: No more frames — coroutine is
                                         // complete. Results are in resume_inbox.
-                                        const ri = active.resume_inbox orelse &[_]Value{};
+                                        const ri = active.resume_inbox.slice() orelse &[_]Value{};
                                         const results = try self.alloc.alloc(Value, ri.len);
                                         for (ri, 0..) |v, i| results[i] = v;
-                                        if (active.resume_inbox) |old| self.alloc.free(old);
-                                        active.resume_inbox = null;
+                                        active.resume_inbox.deinit(self.alloc);
                                         step = .{ .returned = results };
                                         have_step = true;
                                     }
@@ -13689,7 +13771,7 @@ pub const Vm = struct {
         // read directly from the CallFrame.
         const fr_tc = ctx.exec_frames.getPtr(ctx.frame_index);
         if (fr_tc.isHookYield() and ctx.pc == @as(usize, fr_tc.u.lua.resume_pc)) {
-            const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
+            const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th, self.alloc) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
             var vals_owned = true;
             errdefer if (vals_owned) self.alloc.free(vals);
             fr_tc.clearHookYield();
@@ -14162,7 +14244,7 @@ pub const Vm = struct {
         // read directly from the CallFrame.
         const fr_call = ctx.exec_frames.getPtr(ctx.frame_index);
         if (fr_call.isHookYield() and ctx.pc == @as(usize, fr_call.u.lua.resume_pc)) {
-            const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
+            const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th, self.alloc) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
             var vals_owned = true;
             errdefer if (vals_owned) self.alloc.free(vals);
             fr_call.clearHookYield();
@@ -17131,10 +17213,7 @@ pub const Vm = struct {
             }
         }
         if (opts.clear_yielded) {
-            if (th.yielded) |vals| {
-                self.alloc.free(vals);
-                th.yielded = null;
-            }
+            th.yielded.deinit(self.alloc);
         }
     }
 
@@ -17174,11 +17253,13 @@ pub const Vm = struct {
     }
 
     fn setThreadResumeInbox(self: *Vm, th: *Thread, values: []const Value) DispatchError!void {
-        if (th.resume_inbox) |old| self.alloc.free(old);
-        const copy = try self.alloc.alloc(Value, values.len);
-        if (self.stats.enabled) self.stats.resume_allocs += 1; // P16.0b
-        for (values, 0..) |v, i| copy[i] = v;
-        th.resume_inbox = copy;
+        // P16.3: setFrom stores inline for <= INLINE_VALUES_CAP values — the
+        // plain `resume(co)` with no args (the dominant case) does not touch
+        // the heap at all.
+        if (values.len > INLINE_VALUES_CAP) {
+            if (self.stats.enabled) self.stats.resume_allocs += 1; // P16.0b (heap spill only)
+        }
+        try th.resume_inbox.setFrom(self.alloc, values);
     }
 
     fn bumpClosureNumericUpvalues(self: *Vm, cl: *Closure, delta: i64) bool {
@@ -17256,37 +17337,35 @@ pub const Vm = struct {
         self.snapshotThreadTraceFrames(th);
         if (th.wrap_eager_mode) {
             try self.appendThreadWrapYield(th, args);
-            if (th.yielded) |old| self.alloc.free(old);
-            const ys = try self.alloc.alloc(Value, args.len);
-            if (self.stats.enabled) self.stats.yield_allocs += 1; // P16.0b
-            for (args, 0..) |v, i| ys[i] = v;
-            th.yielded = ys;
+            th.yielded.deinit(self.alloc);
+            if (args.len > INLINE_VALUES_CAP) {
+                if (self.stats.enabled) self.stats.yield_allocs += 1; // P16.0b (heap spill only)
+            }
+            try th.yielded.setFrom(self.alloc, args);
             self.last_builtin_out_count = args.len;
             return;
         }
-        if (th.yielded) |ys| self.alloc.free(ys);
-        const ys = try self.alloc.alloc(Value, args.len);
-        if (self.stats.enabled) self.stats.yield_allocs += 1; // P16.0b
-        for (args, 0..) |v, i| ys[i] = v;
-        th.yielded = ys;
+        // P16.3: setFrom stores inline for <= INLINE_VALUES_CAP values — the
+        // dominant `coroutine.yield(v)` (0-4 values) does not touch the heap.
+        th.yielded.deinit(self.alloc);
+        if (args.len > INLINE_VALUES_CAP) {
+            if (self.stats.enabled) self.stats.yield_allocs += 1; // P16.0b (heap spill only)
+        }
+        try th.yielded.setFrom(self.alloc, args);
         if (self.active_builtin) |id| {
             th.suspended_builtin = id;
-            if (th.suspended_builtin_args) |vals| {
-                self.alloc.free(vals);
-                th.suspended_builtin_args = null;
-            }
+            th.suspended_builtin_args.deinit(self.alloc);
             if (self.active_builtin_args) |builtin_args| {
-                const copy = try self.alloc.alloc(Value, builtin_args.len);
-                if (self.stats.enabled) self.stats.yield_allocs += 1; // P16.0b
-                for (builtin_args, 0..) |v, i| copy[i] = v;
-                th.suspended_builtin_args = copy;
+                // P16.3: inline for <= INLINE_VALUES_CAP (the dominant yield
+                // from a builtin carries 0-2 args).
+                if (builtin_args.len > INLINE_VALUES_CAP) {
+                    if (self.stats.enabled) self.stats.yield_allocs += 1; // P16.0b (heap spill only)
+                }
+                try th.suspended_builtin_args.setFrom(self.alloc, builtin_args);
             }
         } else {
             th.suspended_builtin = null;
-            if (th.suspended_builtin_args) |vals| {
-                self.alloc.free(vals);
-                th.suspended_builtin_args = null;
-            }
+            th.suspended_builtin_args.deinit(self.alloc);
         }
         self.last_builtin_out_count = args.len;
 
@@ -17527,10 +17606,7 @@ pub const Vm = struct {
             }
         }
 
-        if (th.yielded) |ys| {
-            self.alloc.free(ys);
-            th.yielded = null;
-        }
+        th.yielded.deinit(self.alloc);
 
         // Preserve error string; resume should not permanently clobber it.
         const prev_err = self.err;
@@ -17709,16 +17785,13 @@ pub const Vm = struct {
                             // do NOT restore the old value.
                             // Return yield results.
                             yielded = true;
-                            const ys = th.yielded orelse &[_]Value{};
+                            const ys = th.yielded.slice() orelse &[_]Value{};
                             if (ys.len > 0) {
                                 payload = try self.alloc.alloc(Value, ys.len);
                                 payload_heap = true;
                                 for (ys, 0..) |v, i| payload[i] = v;
                             }
-                            if (th.yielded) |owned| {
-                                self.alloc.free(owned);
-                                th.yielded = null;
-                            }
+                            th.yielded.deinit(self.alloc);
                             break;
                         },
                         error.RuntimeError => {
@@ -17779,12 +17852,11 @@ pub const Vm = struct {
                     if (th.call_frames.len() == 0) {
                         // No more frames — coroutine is complete. The
                         // continuation's results are in resume_inbox.
-                        const ri = th.resume_inbox orelse &[_]Value{};
+                        const ri = th.resume_inbox.slice() orelse &[_]Value{};
                         payload = try self.alloc.alloc(Value, ri.len);
                         payload_heap = true;
                         for (ri, 0..) |v, i| payload[i] = v;
-                        if (th.resume_inbox) |old| self.alloc.free(old);
-                        th.resume_inbox = null;
+                        th.resume_inbox.deinit(self.alloc);
                         // Mark as completed — skip the normal resume path.
                         ok = true;
                         yielded = false;
@@ -17858,14 +17930,13 @@ pub const Vm = struct {
                 // (A) All frames popped: the last poscall left the final
                 // results in resume_inbox.
                 if (th.call_frames.len() == 0) {
-                    const ri = th.resume_inbox orelse &[_]Value{};
+                    const ri = th.resume_inbox.slice() orelse &[_]Value{};
                     if (ri.len > 0) {
                         payload = try self.alloc.alloc(Value, ri.len);
                         payload_heap = true;
                         for (ri, 0..) |v, i| payload[i] = v;
                     }
-                    if (th.resume_inbox) |old| self.alloc.free(old);
-                    th.resume_inbox = null;
+                    th.resume_inbox.deinit(self.alloc);
                     break :unroll_loop;
                 }
 
@@ -18110,7 +18181,7 @@ pub const Vm = struct {
                                 break :retblk null;
                             },
                             error.RuntimeError => {
-                                if (th.yielded != null and th.capture_yield_id != 0) {
+                                if (th.yielded.slice() != null and th.capture_yield_id != 0) {
                                     yielded = true;
                                     break :retblk null;
                                 }
@@ -18147,11 +18218,8 @@ pub const Vm = struct {
 
         if (!want_out) {
             // Caller ignores results. Still follow resume semantics and do not throw.
-            if (yielded or th.yielded != null) {
-                if (th.yielded) |ys| {
-                    self.alloc.free(ys);
-                    th.yielded = null;
-                }
+            if (yielded or th.yielded.slice() != null) {
+                th.yielded.deinit(self.alloc);
                 th.status = .suspended;
                 th.api_status = 1; // LUA_YIELD
                 th.started = true;
@@ -18169,10 +18237,7 @@ pub const Vm = struct {
             outs[0] = .{ .Bool = false };
             if (outs.len > 1) outs[1] = if (self.err_has_obj) self.err_obj else .{ .String = try self.internStr(self.errorString()) };
             self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
-            if (th.yielded) |ys| {
-                self.alloc.free(ys);
-                th.yielded = null;
-            }
+            th.yielded.deinit(self.alloc);
             th.trace_had_error = true;
             th.status = .dead;
             th.api_status = if (self.err_is_errerr) 5 else 2; // LUA_ERRERR or LUA_ERRRUN
@@ -18188,14 +18253,13 @@ pub const Vm = struct {
         }
 
         // Yield path: return yielded values (set by coroutine.yield).
-        if (yielded or th.yielded != null) {
-            const ys = th.yielded orelse &[_]Value{};
+        if (yielded or th.yielded.slice() != null) {
+            const ys = th.yielded.slice() orelse &[_]Value{};
             outs[0] = .{ .Bool = true };
             const n = @min(ys.len, outs.len - 1);
             for (0..n) |i| outs[1 + i] = ys[i];
             self.last_builtin_out_count = 1 + n;
-            if (th.yielded) |owned| self.alloc.free(owned);
-            th.yielded = null;
+            th.yielded.deinit(self.alloc);
             th.trace_yields += 1;
             th.status = .suspended;
             th.api_status = 1; // LUA_YIELD
@@ -19667,10 +19731,10 @@ pub const Vm = struct {
                 // currently active one (its runtime is shared with the VM).
                 if (self.active_runtime_thread != th) self.freeParkedThreadRuntime(th);
                 // Free all optional []Value buffers on the Thread.
-                if (th.yielded) |values| self.alloc.free(values);
-                if (th.resume_inbox) |inbox| self.alloc.free(inbox);
+                th.yielded.deinit(self.alloc);
+                th.resume_inbox.deinit(self.alloc);
                 if (th.tail_resume_inbox) |inbox| self.alloc.free(inbox);
-                if (th.suspended_builtin_args) |args| self.alloc.free(args);
+                th.suspended_builtin_args.deinit(self.alloc);
                 self.gcNoteFree(@sizeOf(Thread));
                 self.alloc.destroy(th);
             },
@@ -20003,7 +20067,7 @@ pub const Vm = struct {
                         try self.gcMarkValue(hv);
                     }
                 }
-                if (th.yielded) |ys| {
+                if (th.yielded.slice()) |ys| {
                     for (ys) |yv| {
                         if (GcObject.fromValue(yv) != null) {
                             try self.gcMarkValue(yv);
@@ -20038,7 +20102,7 @@ pub const Vm = struct {
                 if (th.dofile_entry_closure) |cl| {
                     try self.gcMarkValue(.{ .Closure = cl });
                 }
-                if (th.resume_inbox) |vals| {
+                if (th.resume_inbox.slice()) |vals| {
                     for (vals) |yv| {
                         if (GcObject.fromValue(yv) != null) {
                             try self.gcMarkValue(yv);
@@ -20557,7 +20621,7 @@ pub const Vm = struct {
             self.gc_mark_epoch += 1;
         }
         try self.gcMarkValueFinalizerReach(th.callee);
-        if (th.yielded) |ys| {
+        if (th.yielded.slice()) |ys| {
             for (ys) |yv| {
                 try self.gcMarkValueFinalizerReach(yv);
             }
@@ -20578,7 +20642,7 @@ pub const Vm = struct {
         if (th.dofile_entry_closure) |cl| {
             try self.gcMarkValueFinalizerReach(.{ .Closure = cl });
         }
-        if (th.resume_inbox) |vals| {
+        if (th.resume_inbox.slice()) |vals| {
             for (vals) |yv| {
                 try self.gcMarkValueFinalizerReach(yv);
             }
@@ -23070,7 +23134,7 @@ pub const Vm = struct {
                             if (outs.len > 1) outs[1] = .Nil;
                             return;
                         }
-                        if (th.suspended_builtin_args) |vals| {
+                        if (th.suspended_builtin_args.slice()) |vals| {
                             const pos: usize = @intCast(local_index - 1);
                             if (pos < vals.len) {
                                 if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(C temporary)") };
@@ -31759,7 +31823,7 @@ pub const Vm = struct {
             if (vm.cur_c_stack.items.len > 0) {
                 st.append(vm.alloc, vm.cur_c_stack.items[0]) catch return -1;
             }
-        } else if (th.resume_inbox) |ri| {
+        } else if (th.resume_inbox.slice()) |ri| {
             st.appendSlice(vm.alloc, ri) catch return -1;
         }
 

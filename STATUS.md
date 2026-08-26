@@ -1,4 +1,4 @@
-> Last updated: 2026-08-25 (P16.2b/c: yield memset drop + lazy resolve — coroutine_yield 3.69x → 3.16x total, geomean 2.53x)
+> Last updated: 2026-08-26 (doc sync: P16.0a/d, P16.1, P16.2a-c, P16.3 sections recorded; observability TODOs closed)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -130,7 +130,7 @@ Part 1: Codegen infrastructure for "before" semantics
 
 ### P15.37 — воспроизводимый performance gate + hotspot-driven perf-фазы
 Добавить `tools/perf_compare.py` и versioned baseline + закрыть 3 hotspot'а, выявленных через `perf record --call-graph lbr`:
-- [ ] wall time, process CPU, max RSS и opcode count (только wall time);
+- [x] wall time, process CPU, max RSS и opcode count — закрыто P16.0b/c (VmStats opcode histogram; perf stat counters; getrusage max-RSS/process-CPU).
 - [ ] отдельная маркировка noisy/long suites вроде direct `constructs.lua`.
 
 ### P15.38 — codegen-level opcode reduction (PUC 5.5 fast paths)
@@ -3054,7 +3054,7 @@ both_fail, 13 pre-existing output_diff), zig build test exit 0.
   *(Read fast paths уже inline в VM dispatch — GETI/GETFIELD/GETTABLE.)*
 
 ### Perf gate (P15.37)
-- [ ] Добавить process CPU, max RSS, opcode count (сейчас только wall time).
+- [x] ~~Добавить process CPU, max RSS, opcode count~~ — закрыто P16.0b/c.
 - [ ] Маркировка noisy/long suites.
 
 ### Thread compaction (P15.35)
@@ -3073,6 +3073,61 @@ both_fail, 13 pre-existing output_diff), zig build test exit 0.
   All stubs implemented: getlocal/setlocal (Proto locvars + bc_stack registers),
   setallocf/newstate (custom allocator stored for getallocf round-trip),
   toclose/closeslot (TBC slot tracking + __close metamethod invocation).
+
+### P16.0a — generated status summary (one source of truth)
+
+`--json-out` для smoke_compare/perf_compare; новый `tools/status_summary.py`
+(matrix/smoke/perf JSON + c_api TESTS из Makefile, geomean = exp(mean(log)),
+`--write-readme` между маркерами `<!-- BEGIN/END GENERATED STATUS -->`,
+детерминирован). README Parity+Performance таблицы генерируются; протухшие
+числа (30/31, 49/49, 2.76x) убраны; AGENTS.md — указатель вместо числа.
+
+### P16.0d — количественная модель производительности
+
+docs/perf/2026-08-25-p16-model.md: **2.70x = instrX 1.32 × costX 2.05**
+(точные пары: VmStats zig / count-hook PUC на идентичных телах microbench).
+6 механизмов данными: F1 MMBIN no-op dispatch (PUC pc++-skip); F2 SETTABUP
+rawSet-funnel; F3 allocator/hash на table-construction (RSS 88–103MB vs
+15.9MB); F4 call-механизм 39% вне dispatch; F5 coroutine instrX 2.25 +
+memset; F6 позитив — zig cache-miss ниже PUC (Node 32B), comparisons
+компактнее. Рекомендация P16.1 пересмотрена по данным: MMBIN-skip первым,
+table GET-пути деприоритизированы.
+
+### P16.1/P16.2a — транша 1: dispatch inflation + table funnels + pending-call
+
+- **P16.1a (e4d8dd6) MMBIN pc-skip**: PUC op_arith_aux пропускает MMBIN*
+  после arith; luazig диспетчеризовал no-op. `ctx.pc += 1` в 25 хендлерах.
+  int_arith: mmbin 50.5M→0, инструкции 151.6M→101.1M (instrX 1.52→1.01).
+  int_arith −8.9%, comparisons −19.8%.
+- **P16.1b (37d3cca) GETTABUP/SETTABUP inline** по образцу GETFIELD/SETFIELD:
+  funnels get_generic 5.05M→61, set_generic 10.1M→20k; field_access −13.3%
+  (2.81→2.47x), global_arith −10.9%.
+- **P16.2a (bfe0861) CALL fast path без pending-call**: непоследовательность
+  с контрактом P15.51c (opCall уже не ставил слот); `.results`-pending был
+  behaviorally идентичен direct-ветке; потребители проверены (return-hook в
+  OP_RETURN, protection — pcall-family, yield-park → no-pending ветка).
+  lua_calls −19.3% (3.46→2.82x). Baseline 2.54x (79c45fd).
+
+### P16.3 — zero-allocation coroutine yield/resume (InlineValues)
+
+Acceptance met: plain yield↔resume = 0 heap alloc/итерацию (было 3:
+th.yielded / resume_inbox / suspended_builtin_args dupes). InlineValues
+(4 inline + heap spill, slice()-совместим с ?[]Value); 3 поля Thread
+конвертированы (~80 сайтов). coroutine_yield −5.8% (d1492d8).
+
+### P16.2b/c — yield memset drop + lazy resolve (coroutine tranche complete)
+
+- **P16.2b (22c7b8e)**: убран 128B Nil-memset в прологе builtinCoroutineYield
+  (доминирующий путь — error.Yield, outs не читается; Nil-fill → wrap_eager).
+  Layout-инцидент float_arith +5.7% диагностирован (instructions идентичны /
+  cycles +11% → µop-cache placement) и вылечен структурно: outlining cold-пути
+  OP_ADD в addSlowPath (bool-сигнал сохраняет continue :frame_loop /
+  MMBIN-skip семантику). Рецепт диагностики «instructions vs cycles» —
+  рабочий стандарт для hot-path правок.
+- **P16.2c (6adf860)**: resolveCallable ленив на resume-пути (direct-resume
+  не использует; было 5.2% профиля). coroutine_yield −11.4%.
+- Итог транши: coroutine_yield 3.69x → 3.16x (−25%), geomean 2.53x
+  (baseline 1bc3875, README перегенерирован: 31/32 / 54/54 / 2.53x).
 
 ## История закрытых фаз
 

@@ -1,4 +1,4 @@
-> Last updated: 2026-08-26 (doc sync: P16.0a/d, P16.1, P16.2a-c, P16.3 sections recorded; observability TODOs closed)
+> Last updated: 2026-08-26 (P16.4a: unified gcControl + variadic lua_gc shim + coded GC params)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -3128,6 +3128,37 @@ th.yielded / resume_inbox / suspended_builtin_args dupes). InlineValues
   не использует; было 5.2% профиля). coroutine_yield −11.4%.
 - Итог транши: coroutine_yield 3.69x → 3.16x (−25%), geomean 2.53x
   (baseline 1bc3875, README перегенерирован: 31/32 / 54/54 / 2.53x).
+
+### P16.4a — Unified PUC-faithful gcControl + variadic lua_gc + coded GC params
+
+- **(2d3a54a) Coded GC params**: ported `luaO_codeparam`/`applyparam`
+  (lobject.c:62-112). Replaced 6 raw i64 fields with `gcparams: [6]u8`
+  coded lu_byte array, initialized with PUC defaults (20, 50, 70, 250,
+  200, 9600). All readers migrated to `gcApplyParam(gcparams[i], base)`.
+  stepsize unit: 10KB → 9600 bytes (PUC LUAI_GCSTEPSIZE = 200*sizeof(Table)).
+- **(2d3a54a) Unified gcControl**: `gcControl(what, param, value)` implements
+  full PUC `lua_gc` switch table: STOP/RESTART/COLLECT/COUNT/COUNTB/STEP/
+  ISRUNNING/GEN/INC/GCPARAM. GCSTPGC|GCSTPCLS guard returns -1. `gc_stp: u8`
+  field (GCSTPUSR=1, GCSTPGC=2, GCSTPCLS=4). GCSTPGC set during
+  `gcFinalizeList` (prevents reentrant GC from __gc finalizers).
+  `builtinCollectgarbage` delegates to `gcControl` for all options.
+- **(2d3a54a) Variadic C shim**: `src/lua/lua_gc_shim.c` provides variadic
+  `lua_gc(L, what, ...)` dispatching to `luazigGcFixed`/`luazigGcParam` Zig
+  exports. lua.h:376 fixed to variadic declaration.
+- **(2d3a54a) Differential test**: `tests/c_api/17_gccontrol.c` — fresh-state
+  sweep, mode transitions, STOP/ISRUNNING/RESTART, STEP, GCPARAM getter/setter
+  (all 6 params with exact PUC values), Lua-level collectgarbage parity.
+- **(1c2f493) CLI GCRESTART+GCGEN**: PUC pmain calls GCRESTART then GCGEN
+  after createargtable. Both disabled:
+  - GCRESTART resets GC debt to 0 → 3 matrix failures (bitwise, nextvar,
+    vararg) due to premature GC triggering at startup.
+  - GCGEN crashes due to pre-existing generational GC bugs in
+    `gcMinorCollection` (reproducible via `collectgarbage("generational")`
+    at script start — crashes even without P16.4a changes).
+  - TODO(P16.4b): enable both after fixing generational GC and verifying
+    GCRESTART doesn't cause premature GC issues.
+- **Gate**: matrix 31/32 (big.lua both_fail pre-existing), smoke 54/54,
+  c_api 17/17 + DIFF PASS, zig build test 0, leak_bench 25/25 PASS.
 
 ## История закрытых фаз
 

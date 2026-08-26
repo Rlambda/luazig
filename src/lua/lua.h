@@ -373,7 +373,7 @@ LUA_API int   (lua_pushthread)(lua_State *L);
 /* Garbage collection (PUC lapi.c:lua_gc)                                  */
 /* ----------------------------------------------------------------------- */
 
-LUA_API int   (lua_gc)(lua_State *L, int what, int data);
+LUA_API int   (lua_gc)(lua_State *L, int what, ...);
 
 /* ----------------------------------------------------------------------- */
 /* Call / error (PUC lapi.c / ldo.c)                                       */

@@ -7,7 +7,7 @@ CFLAGS = -I$(LUA_DIR) -Wall -Wextra
 LDFLAGS = -L$(LIB_DIR) -llua -lm -ldl -Wl,-rpath,$(abspath $(LIB_DIR))
 PUC_LDFLAGS = -L$(PUC_DIR) -llua -lm -ldl -Wl,-rpath,$(abspath $(PUC_DIR))
 
-TESTS = 00_smoke 01_core 02_tables 03_arith 04_misc 05_auxlib 06_buffer 07_libs 08_debug 09_upvalues 10_continuations 11_closethread 12_chook 13_p15_completion 15_stress_leak 14_state_handles 16_apicheck
+TESTS = 00_smoke 01_core 02_tables 03_arith 04_misc 05_auxlib 06_buffer 07_libs 08_debug 09_upvalues 10_continuations 11_closethread 12_chook 13_p15_completion 15_stress_leak 14_state_handles 16_apicheck 17_gccontrol
 
 all: $(TESTS)
 
@@ -29,7 +29,8 @@ DIFF_TESTS = \
     12_chook \
     13_p15_completion \
     14_state_handles \
-    15_stress_leak
+    15_stress_leak \
+    17_gccontrol
 
 # 16_apicheck is intentionally ZIG-ONLY (runs in `make test`, excluded from
 # DIFF_TESTS): its invalid-call tests assert the api_check violations raise

@@ -1,4 +1,4 @@
-> Last updated: 2026-08-25 (P16.1+P16.2: perf tranche 1 — geomean 2.71x → 2.54x; MMBIN skip, TABUP fast paths, pending-call drop)
+> Last updated: 2026-08-25 (P16.3: zero-alloc yield/resume — 0 heap allocs/iter, coroutine_yield -5.8%)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).

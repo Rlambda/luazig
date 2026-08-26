@@ -11384,6 +11384,14 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        // P16.1a (PUC 5.5 op_arith pc-skip, lvm.c:997):
+                        // on inline completion (fast path or coercion eval)
+                        // skip the following MMBIN* no-op — metamethods are
+                        // handled here, so MMBIN dispatch is pure waste. The
+                        // metamethod push above exited via continue
+                        // :frame_loop; its pending-completion lands on the
+                        // MMBIN and dispatches it as a no-op (rare path).
+                        ctx.pc += 1;
                     },
                     .sub => {
                         const lb = ctx.regs[b];
@@ -11413,6 +11421,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .mul => {
                         const lb = ctx.regs[b];
@@ -11442,6 +11451,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .div => {
                         const lb = ctx.regs[b];
@@ -11472,6 +11482,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .mod => {
                         const lb = ctx.regs[b];
@@ -11519,6 +11530,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .pow => {
                         const lb = ctx.regs[b];
@@ -11549,6 +11561,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .idiv => {
                         const lb = ctx.regs[b];
@@ -11592,6 +11605,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .band => {
                         const lb = ctx.regs[b];
@@ -11618,6 +11632,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .bor => {
                         const lb = ctx.regs[b];
@@ -11641,6 +11656,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .bxor => {
                         const lb = ctx.regs[b];
@@ -11664,6 +11680,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .shl => {
                         const lb = ctx.regs[b];
@@ -11687,6 +11704,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .shr => {
                         const lb = ctx.regs[b];
@@ -11710,6 +11728,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
 
                     // --- Arithmetic: immediate/constant variants (PUC 5.5 style) ---
@@ -11779,6 +11798,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
 
                     // ADDK: R[A] = R[B] + K[C]:number
@@ -11816,6 +11836,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
 
                     // SUBK: R[A] = R[B] - K[C]:number
@@ -11847,6 +11868,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
 
                     // MULK: R[A] = R[B] * K[C]:number
@@ -11881,6 +11903,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
 
                     // MODK: R[A] = R[B] % K[C]:number
@@ -11925,6 +11948,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
 
                     // POWK: R[A] = R[B] ^ K[C]:number
@@ -11956,6 +11980,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
 
                     // DIVK: R[A] = R[B] / K[C]:number
@@ -11987,6 +12012,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
 
                     // IDIVK: R[A] = R[B] // K[C]:number
@@ -12028,6 +12054,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
 
                     // --- Bitwise: constant variants ---
@@ -12057,6 +12084,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .bork => {
                         const lb = ctx.regs[b];
@@ -12083,6 +12111,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .bxork => {
                         const lb = ctx.regs[b];
@@ -12109,6 +12138,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
 
                     // --- Shifts: immediate variants ---
@@ -12143,6 +12173,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     // SHRI: R[A] = R[B] >> sC  (sC = C - 127)
                     // Also used for `x << K` via finishbinexpneg: the shift is
@@ -12202,6 +12233,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
+                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
 
                     // --- Metamethod bookkeeping (PUC 5.5 MMBIN family) ---

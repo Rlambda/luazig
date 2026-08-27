@@ -16376,7 +16376,18 @@ pub const Vm = struct {
 
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             try self.gcMinorCollection();
-            return false;
+            // PUC finishgencycle sets gcstate = GCSpropagate (not GCSpause),
+            // so collectgarbage("step") returns false after a minor collection.
+            // Only minor2inc transition (entering incremental sweep) can
+            // eventually lead to GCSpause, returning true.
+            if (self.gc_gen_phase == .minor) {
+                // Still in minor mode — set state to propagate (not pause)
+                // so gcStep returns false, matching PUC's behavior.
+                self.gc_state = .propagate;
+                return false;
+            }
+            // minor2inc transitioned to incremental sweep — fall through
+            // to return gc_state == .pause
         }
 
         // PUC STEPSIZE is in bytes (9600 default); gcStepBudget takes KB.
@@ -17162,7 +17173,7 @@ pub const Vm = struct {
         const obj = try self.allocTableNoGc();
         const mt = try self.allocTableNoGc();
         try self.setField(mt, "__call", .{ .Builtin = .coroutine_wrap_iter });
-        obj.metatable = mt;
+        try self.gcStoreMetatable(obj, mt);
         try self.setField(obj, "__thread", .{ .Thread = th });
         outs[0] = .{ .Table = obj };
     }
@@ -18967,10 +18978,14 @@ pub const Vm = struct {
                 // Use self.bc_stack directly because GC finalizers may execute
                 // Lua code that reallocs bc_stack.
                 const regs = self.bc_stack[frame.base .. frame.base + frame.u.lua.frame_cap];
-                const live_top: usize = if (frame.u.lua.pc < proto.live_reg_top.len)
-                    @min(proto.live_reg_top[frame.u.lua.pc], regs.len)
+                // Scan bound: max(proto.live_reg_top[pc], frame.reg_top).
+                // - proto.live_reg_top[pc]: compile-time lower bound.
+                // - frame.reg_top: dynamic upper bound (set at call/return).
+                const pc_live = if (frame.u.lua.pc < proto.live_reg_top.len)
+                    proto.live_reg_top[frame.u.lua.pc]
                 else
-                    regs.len;
+                    0;
+                const live_top: usize = @min(@max(pc_live, frame.reg_top), @as(u32, @intCast(regs.len)));
                 for (regs[0..live_top]) |value| try self.gcMarkValue(value);
                 // Mark to-be-closed variables: they may be above live_reg_top[pc]
                 // (which tracks per-PC liveness) but are still live on the stack
@@ -19138,7 +19153,7 @@ pub const Vm = struct {
     /// PUC luaC_barrierback_ (lgc.c:268) for userdata uservalue writes.
     /// Same backward barrier as table writes: turn the userdata gray and
     /// add to grayagain. Used by debug.setuservalue (PUC lapi.c:1015).
-    inline fn gcWriteBarrierUserdata(self: *Vm, owner: *Userdata, value: Value) DispatchError!void {
+    pub inline fn gcWriteBarrierUserdata(self: *Vm, owner: *Userdata, value: Value) DispatchError!void {
         // Generational mode: use gcRememberObject (sets age to touched1).
         // This fires even when GC is paused — in gen mode, paused objects
         // are old (black), and mutations must be tracked for the next
@@ -19272,16 +19287,31 @@ pub const Vm = struct {
         }
     }
 
-    inline fn gcStoreMetatable(self: *Vm, table: *Table, metatable: ?*Table) DispatchError!void {
+    pub inline fn gcStoreMetatable(self: *Vm, table: *Table, metatable: ?*Table) DispatchError!void {
         table.metatable = metatable;
         if (metatable) |mt| {
-            // Generational mode: forward barrier — mark metatable, make OLD0.
             if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
-                if (table.gc_age.isOld() and mt.gc_age.isYoung()) {
-                    // PUC luaC_barrier_: reallymarkobject + setage(v, G_OLD0)
-                    if (gcIsWhite(mt.gc_marked)) gcSetBlack(&mt.gc_marked);
-                    mt.gc_age = .old0;
-                    try self.gc_old1.append(self.alloc, .{ .table = mt });
+                // PUC luaC_barrier_ (lgc.c:246-260): forward barrier — mark
+                // the metatable if table is BLACK and metatable is WHITE.
+                if (gcIsBlack(table.gc_marked) and gcIsWhite(mt.gc_marked)) {
+                    gcSetBlack(&mt.gc_marked);
+                    if (table.gc_age.isOld()) {
+                        mt.gc_age = .old0;
+                        try self.gc_old1.append(self.alloc, .{ .table = mt });
+                    }
+                }
+                // Also add the table to grayagain (backward barrier) so it's
+                // re-traversed next cycle. This ensures the metatable (which
+                // may be reset to white by the sweep) is re-marked. Without
+                // this, an OLD table with a YOUNG metatable that was set when
+                // the table was young+black won't have its metatable marked
+                // in subsequent cycles → metatable freed → use-after-free.
+                // Bypass gcRememberObject's age check: YOUNG BLACK tables also
+                // need re-traversal if they were already traversed this cycle.
+                if (gcIsBlack(table.gc_marked) and table.gc_age != .touched1) {
+                    table.gc_age = .touched1;
+                    gcSetGray(&table.gc_marked);
+                    try self.gc_grayagain.append(self.alloc, .{ .table = table });
                 }
                 return;
             }
@@ -19331,20 +19361,21 @@ pub const Vm = struct {
     /// but their NEW children (added after the first traversal) have not
     /// been marked. So we always re-add to gray list and re-traverse.
     fn gcDrainGrayagain(self: *Vm) DispatchError!void {
-        // A4: single loop over the unified GcObject grayagain list. Cells
-        // are folded in — their value is marked inline and they go black,
-        // matching the old parallel grayagain_cells behavior. Other types
-        // are re-queued into gc_gray for full re-propagation.
-        for (self.gc_grayagain.items) |obj| {
+        // PUC atomic (lgc.c:1546-1560): saves the grayagain list, clears it,
+        // then drains the saved list. New items added by barriers during
+        // draining stay in grayagain for later processing (by gcCorrectGrayAgain
+        // or the next cycle).
+        const saved = self.alloc.dupe(GcObject, self.gc_grayagain.items) catch return error.OutOfMemory;
+        defer self.alloc.free(saved);
+        self.gc_grayagain.clearRetainingCapacity();
+        for (saved) |obj| {
             switch (obj) {
                 .cell => |cell| {
                     gcSetGray(&cell.gc_marked);
-                    // Cells don't have children beyond their value; mark it.
                     try self.gcMarkValue(cell.get(self));
                     gcSetBlack(&cell.gc_marked);
                 },
                 else => {
-                    // Force re-traversal: set to gray and add to gray list.
                     const p = gcPtr(obj);
                     gcSetGray(p.marked);
                     try self.gc_gray.append(self.alloc, obj);
@@ -19352,7 +19383,58 @@ pub const Vm = struct {
                 },
             }
         }
-        self.gc_grayagain.clearRetainingCapacity();
+    }
+
+    /// PUC remarkupvals (lgc.c:406-421): iterate ALL open upvalues and
+    /// mark their values. In PUC, this iterates the `g->uvhead` doubly-
+    /// linked list of all open upvalues across all threads.
+    ///
+    /// Why this is necessary in minor cycles: OLD threads are not
+    /// re-traversed (their referenced objects are assumed to be all old).
+    /// But an OLD thread may have open upvalues pointing to young stack
+    /// slots. Those upvalues (Cells) are young GC objects that need to be
+    /// marked. Without remarkupvals, they stay white → dead after the
+    /// white flip → freed by minor sweep → use-after-free when the thread
+    /// resumes and accesses the upvalue.
+    ///
+    /// We don't have a uvhead list; instead we iterate gc_gen_threads
+    /// (all old threads) plus the active thread. Young threads are minor
+    /// candidates and are traversed normally during the mark phase.
+    fn gcRemarkUpvals(self: *Vm) DispatchError!void {
+        // Old threads (in gc_gen_threads).
+        for (self.gc_gen_threads.items) |th| {
+            try self.gcRemarkThreadUpvals(th);
+        }
+        // Active thread (may not be in gc_gen_threads if still young).
+        try self.gcRemarkThreadUpvals(self.activeBytecodeThread());
+    }
+
+    fn gcRemarkThreadUpvals(self: *Vm, th: *Thread) DispatchError!void {
+        const boxed_stack = if (th.bytecode_boxed.len > 0) th.bytecode_boxed else self.bc_boxed;
+        for (0..th.call_frames.len()) |i| {
+            const fr = th.call_frames.getConstPtr(i);
+            if (fr.isC()) continue;
+            // Closure upvalues: these are Cells referenced by the closure.
+            for (self.frameUpvalues(fr, th)) |cell| {
+                if (cell.isOpen() and !gcIsBlack(cell.gc_marked)) {
+                    try self.gcMarkValue(cell.get(self));
+                    gcSetBlack(&cell.gc_marked);
+                }
+            }
+            // Boxed variables: Cells allocated for to-be-closed variables
+            // and other boxed locals. They may be open upvalues too.
+            if (fr.proto() != null) {
+                const cap = fr.u.lua.frame_cap;
+                for (boxed_stack[fr.base .. fr.base + cap]) |maybe_cell| {
+                    if (maybe_cell) |cell| {
+                        if (cell.isOpen() and !gcIsBlack(cell.gc_marked)) {
+                            try self.gcMarkValue(cell.get(self));
+                            gcSetBlack(&cell.gc_marked);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn gcAtomicCommon(self: *Vm) DispatchError!void {
@@ -19375,15 +19457,43 @@ pub const Vm = struct {
         //     self.gcClearFinalizedBit();
         // }
 
+        // PUC atomic (lgc.c:1546): linkgclist(&L->gclist, g->grayagain).
+        // TEMPORARILY DISABLED for debugging
+        // if (self.gc_minor_cycle) {
+        //     const active_th = self.activeBytecodeThread();
+        //     gcSetGray(&active_th.gc_marked);
+        //     try self.gc_grayagain.append(self.alloc, .{ .thread = active_th });
+        // }
+
         try self.gcMarkMutableRoots();
         try self.gcDrainGray();
+
+        // PUC 5.5 atomic does NOT call traversestrtable — short strings live
+        // in allgc and are marked via normal root reachability + backward
+        // barriers. The previous traversestrtable emulation iterated gc_objects
+        // (O(total objects) per minor cycle) and caused crashes due to
+        // gcMarkMinorValue skipping old strings while young strings were
+        // already handled by barriers. Removed in favor of PUC-faithful
+        // barrier-based reachability.
+
         // PUC atomic: drain grayagain list (objects turned gray by backward
         // barriers during propagate phase). These must be re-traversed
         // before sweep to catch children added after the first traversal.
-        // Skip during minor cycles: grayagain is handled by the minor
-        // collection's grayagain processing + gcCorrectGrayAgain for age
-        // promotion. Draining here would clear grayagain before
-        // gcCorrectGrayAgain can process it.
+        // PUC atomic (lgc.c:1546-1560): saves grayagain, clears it, marks
+        // roots, drains gray, then moves saved grayagain to gray and drains
+        // it. This ensures all grayagain items are re-traversed during atomic.
+        // After this, any NEW grayagain items (added by finalizers etc.) are
+        // processed by gcCorrectGrayAgain after the sweep.
+        // Enable for non-minor (full/incremental) cycles: grayagain items
+        // must be re-traversed during atomic to mark them. Without this,
+        // gcFullCollectionForUser frees grayagain items that weren't marked
+        // → dangling pointers in grayagain → crash in next minor cycle.
+        // TODO: enable for minor cycles — currently causes minor2inc which
+        // exposes a dangling metatable pointer. Root cause: a table's
+        // metatable is freed by a previous minor sweep because the table
+        // (old, not re-traversed) didn't have its metatable marked. The
+        // backward barrier in gcStoreMetatable should fix this, but
+        // something is still missing.
         if (!self.gc_minor_cycle) {
             try self.gcDrainGrayagain();
             try self.gcDrainGray();
@@ -19414,8 +19524,9 @@ pub const Vm = struct {
         // Backward barriers turn the owner gray and add to grayagain.
         // Drain grayagain again to catch objects modified by finalizers,
         // then drain gray to finish marking all children.
-        // Skip during minor cycles: grayagain is needed by gcCorrectGrayAgain
-        // for age promotion in gcSweepYoungGeneration.
+        // PUC atomic calls propagateall after finalizer resurrection
+        // (lgc.c:1569) — skip during minor cycles: grayagain is needed
+        // by gcCorrectGrayAgain for age promotion in gcSweepYoungGeneration.
         if (!self.gc_minor_cycle) {
             try self.gcDrainGrayagain();
             try self.gcDrainGray();
@@ -19538,6 +19649,11 @@ pub const Vm = struct {
     ///     variables that need re-traversal). Without this, promoted
     ///     threads would be missed by minor marking → use-after-free.
     fn gcPromoteYoungObject(self: *Vm, obj: GcObject) DispatchError!bool {
+        // PUC sweepgen (lgc.c:1145-1167): makewhite + nextage + if OLD1 →
+        // linkobjgclist(o, grayagain). Objects promoted to OLD1 MUST be
+        // added to grayagain so correctgraylist makes them BLACK. Without
+        // this, markold in the next cycle sees them as WHITE (reset by
+        // sweep) and skips re-traversal → young children not marked → freed.
         const p = gcPtr(obj);
         switch (p.age.*) {
             .new => {
@@ -19547,19 +19663,27 @@ pub const Vm = struct {
             .survival => {
                 p.age.* = .old1;
                 try self.gc_old1.append(self.alloc, obj);
+                try self.gc_grayagain.append(self.alloc, obj);
                 self.gc_gen_added_old_kb += @as(f64, @floatFromInt(gcObjectBytes(obj))) / 1024.0;
-                if (obj == .thread) try self.gc_gen_threads.append(self.alloc, obj.thread);
+                if (obj == .thread) {
+                    try self.gc_gen_threads.append(self.alloc, obj.thread);
+                }
                 return false;
             },
             .old0 => {
-                // Forward barriers already linked OLD0 into gc_old1. Keep the
-                // age until gcCorrectOld1 advances it after this collection.
+                // PUC nextage: G_OLD0 → G_OLD1, then add to grayagain.
+                p.age.* = .old1;
+                try self.gc_old1.append(self.alloc, obj);
+                try self.gc_grayagain.append(self.alloc, obj);
                 self.gc_gen_added_old_kb += @as(f64, @floatFromInt(gcObjectBytes(obj))) / 1024.0;
+                if (obj == .thread) {
+                    try self.gc_gen_threads.append(self.alloc, obj.thread);
+                }
                 return false;
             },
-            // old1, old, touched* — already promoted or in grayagain; keep
-            // in young list so the sweep compaction retains them.
-            else => return true,
+            else => {
+                return true;
+            },
         }
     }
 
@@ -19601,6 +19725,7 @@ pub const Vm = struct {
                 self.gcFreeObject(obj);
                 continue;
             }
+            // Reverted to original: reset ALL survivors to white
             p.marked.* = self.gc_current_white & WHITEBITS;
             if (try self.gcPromoteYoungObject(obj)) {
                 self.gc_young_objects.items[write] = obj;
@@ -19620,9 +19745,13 @@ pub const Vm = struct {
     }
 
     fn gcCorrectOld1(self: *Vm) void {
-        // A4: single pass over the unified GcObject list. gcPtr gives us
-        // uniform access to .age regardless of variant, so the old0→old1
-        // and old1→old transitions collapse into one loop.
+        // PUC sweepgen (lgc.c:1188-1201): advances G_OLD0 → G_OLD1 via
+        // nextage[]. G_OLD1 objects are NOT advanced here — they stay OLD1
+        // until the NEXT cycle's gcMarkOld1 (PUC markold, lgc.c:1276)
+        // transitions them to G_OLD and re-traverses them. This is critical:
+        // gcMarkOld1 adds OLD1 threads to grayagain so they are re-traversed
+        // every cycle. If we advance OLD1→OLD here, gcMarkOld1 never runs
+        // and OLD threads are never added to grayagain.
         const snapshot = @min(self.gc_old1_snapshot_len, self.gc_old1.items.len);
         var write: usize = 0;
         for (self.gc_old1.items[0..snapshot]) |obj| {
@@ -19645,34 +19774,137 @@ pub const Vm = struct {
     }
 
     fn gcCorrectGrayAgain(self: *Vm) void {
-        // A4: single pass over the unified GcObject list. touched1→touched2
-        // stays in grayagain; touched2→old drops out (promoted to old).
-        const snapshot = @min(self.gc_grayagain_snapshot_len, self.gc_grayagain.items.len);
+        // PUC correctgraylist (lgc.c:1227-1254): walk ALL grayagain items and:
+        //   - dead white objects → remove (freed by sweep)
+        //   - GRAY (not white, not black) → keep (still being traversed)
+        //   - TOUCHED1 → advance to TOUCHED2, keep in list
+        //   - non-white threads → keep (re-traversed every cycle)
+        //   - TOUCHED2 → advance to OLD, remove from list
+        //   - everything else → remove from list
+        //
+        // Key difference from PUC: objects reset to the CURRENT white bit by
+        // the sweep are alive (not dead). PUC's correctgraylist removes ALL
+        // white objects, but PUC's markold also skips white objects — so
+        // OLD1 objects that are alive-but-white are never re-traversed. This
+        // works in PUC because children are typically the same age as parents.
+        // In our code, children (e.g., metatables set via forward barrier)
+        // can be younger. We make alive-but-white OLD1 objects BLACK so
+        // markold re-traverses them and marks their young children.
         var write: usize = 0;
-        for (self.gc_grayagain.items[0..snapshot]) |obj| {
+        for (self.gc_grayagain.items) |obj| {
             const p = gcPtr(obj);
-            switch (p.age.*) {
-                .touched1 => {
-                    p.age.* = .touched2;
-                    self.gc_grayagain.items[write] = obj;
-                    write += 1;
-                },
-                .touched2 => p.age.* = .old,
-                else => {},
+            const marked = p.marked.*;
+            if (gcIsWhite(marked) and gcIsDead(marked, self.gc_current_white)) {
+                // Dead white objects — remove (freed by sweep)
+            } else if (gcIsWhite(marked)) {
+                // Alive white (reset by sweep) — make BLACK so markold
+                // re-traverses them. This is critical: without it, young
+                // children (e.g., metatables) of these objects are not
+                // marked → freed → use-after-free.
+                gcSetBlack(p.marked);
+                switch (p.age.*) {
+                    .touched1 => {
+                        p.age.* = .touched2;
+                        self.gc_grayagain.items[write] = obj;
+                        write += 1;
+                    },
+                    .touched2 => {
+                        p.age.* = .old;
+                    },
+                    else => {
+                        if (obj == .thread) {
+                            self.gc_grayagain.items[write] = obj;
+                            write += 1;
+                        }
+                    },
+                }
+            } else if (!gcIsBlack(marked)) {
+                // GRAY objects — keep (still being traversed)
+                self.gc_grayagain.items[write] = obj;
+                write += 1;
+            } else {
+                // BLACK objects
+                switch (p.age.*) {
+                    .touched1 => {
+                        p.age.* = .touched2;
+                        self.gc_grayagain.items[write] = obj;
+                        write += 1;
+                    },
+                    .touched2 => {
+                        p.age.* = .old;
+                    },
+                    else => {
+                        if (obj == .thread) {
+                            self.gc_grayagain.items[write] = obj;
+                            write += 1;
+                        }
+                    },
+                }
             }
-        }
-        for (self.gc_grayagain.items[snapshot..]) |obj| {
-            self.gc_grayagain.items[write] = obj;
-            write += 1;
         }
         self.gc_grayagain.items.len = write;
     }
 
+    /// PUC lgc.c `markold` (lines 1276-1286): at the start of each young
+    /// collection, transition G_OLD1 objects to G_OLD and re-traverse the
+    /// black ones.
+    ///
+    /// Why this is necessary: OLD1 objects may reference young objects that
+    /// were created after the OLD1 object was promoted (e.g. a suspended
+    /// coroutine promoted to OLD1 whose stack later holds a freshly created
+    /// young closure/cell, or an OLD1 closure whose upvalue Cell is still
+    /// young). The minor collection only marks young objects reachable from
+    /// roots; OLD1 objects are black and thus skipped by `gcQueueScanObject`
+    /// (which only queues white objects). Without re-traversal, those young
+    /// children are never marked and are freed by the minor sweep — a
+    /// use-after-free when the coroutine is resumed or the closure called.
+    ///
+    /// PUC's `markold` re-marks black OLD1 objects via `reallymarkobject`,
+    /// which forces them gray and into the gray list so `propagateall`
+    /// re-traverses them and marks their young children. We mirror that:
+    /// transition `.old1 → .old`, and for black objects, force gray + append
+    /// to `gc_gray` (bypassing `gcQueueScanObject`'s white-only guard).
+    ///
+    /// Only `.old1` objects are processed (matching PUC). `.old0` objects
+    /// (forward-barrier-promoted) are transitioned to `.old1` by
+    /// `gcCorrectOld1` during sweep, then processed here next cycle.
+    /// `.old` objects are not re-traversed: in PUC their invariant is that
+    /// all their referenced objects are also old (promoted together across
+    /// cycles), so they have no young children to mark.
+    fn gcMarkOld1(self: *Vm) DispatchError!void {
+        const snapshot = @min(self.gc_old1_snapshot_len, self.gc_old1.items.len);
+        for (self.gc_old1.items[0..snapshot]) |obj| {
+            const p = gcPtr(obj);
+            if (p.age.* != .old1) continue;
+            // PUC markold: setage(p, G_OLD); if (isblack(p)) reallymarkobject(g, p);
+            p.age.* = .old;
+            // PUC markold: if (isblack(p)) reallymarkobject(g, p);
+            // PUC asserts !iswhite(p) for OLD1 objects — after the sweepgen
+            // fix, non-NEW survivors keep their BLACK mark, so OLD1 objects
+            // should never be white. But during the first cycle after the
+            // fix, OLD1 objects from the broken previous sweep (which set
+            // ALL survivors to white) may still be white. Force-queue them
+            // too, ensuring their young children are marked. After the
+            // transition, this white check is a no-op (OLD1 is always black).
+            if (gcIsBlack(p.marked.*) or gcIsWhite(p.marked.*)) {
+                // Force re-traversal: set gray + append to gray list.
+                // gcQueueScanObject would skip this object (it is not
+                // white), but markold must re-traverse OLD1 objects
+                // unconditionally so their young children are marked.
+                gcSetGray(p.marked);
+                try self.gc_gray.append(self.alloc, obj);
+                // PUC markold (lgc.c:1289-1290): threads are ALSO inserted
+                // into grayagain so they are re-traversed every cycle.
+                // correctgraylist keeps them there permanently.
+                if (obj == .thread) {
+                    try self.gc_grayagain.append(self.alloc, obj);
+                }
+            }
+        }
+    }
+
     fn gcSweepYoungGeneration(self: *Vm) DispatchError!void {
         self.gcClearDeadFrameRegisters();
-        // A6: single unified sweep over gc_young_objects replaces the five
-        // per-type sweeps. gcCorrectOld1/gcCorrectGrayAgain (A4) already
-        // operate on the unified GcObject lists.
         try self.gcSweepYoungObjects();
         self.gcCorrectOld1();
         self.gcCorrectGrayAgain();
@@ -19697,24 +19929,31 @@ pub const Vm = struct {
         self.gcResetCycleState();
 
         // Reset all young objects' marks to current_white before marking.
-        // Marks from a previous minor cycle persist on young objects that
-        // were beyond the previous snapshot. Without this reset, gcIsDead
-        // would see stale marks from the previous cycle and incorrectly
-        // treat dead objects as alive (or live as dead).
-        // A6: single loop over the unified gc_young_objects list.
         for (self.gc_young_objects.items) |obj| gcPtr(obj).marked.* = self.gc_current_white & WHITEBITS;
 
         try self.gcMarkCurrentRoots();
-        // A4: gc_old1 is now GcObject-typed; gcQueueScanObject handles all
-        // variants (including Cell) uniformly.
-        for (self.gc_old1.items[0..self.gc_old1_snapshot_len]) |obj| try self.gcQueueScanObject(obj);
+        // PUC markold (lgc.c:1276-1286): re-traverse OLD1 objects by
+        // forcing them gray and adding to the gray list. This is NOT the
+        // same as gcQueueScanObject, which skips non-white (BLACK) objects.
+        // OLD1 objects are BLACK from the previous cycle, but their children
+        // may include young (WHITE) objects that need to be marked. Without
+        // this forced re-traversal, young children of OLD1 objects are not
+        // marked → freed during minor sweep → use-after-free.
+        // PUC markold also advances age G_OLD1 → G_OLD here.
+        for (self.gc_old1.items[0..self.gc_old1_snapshot_len]) |obj| {
+            const p = gcPtr(obj);
+            if (p.age.* == .old1) {
+                p.age.* = .old;
+                if (gcIsBlack(p.marked.*)) {
+                    gcSetGray(p.marked);
+                    try self.gc_gray.append(self.alloc, obj);
+                }
+            }
+        }
         // Grayagain items were modified by barriers since the last minor
         // collection. They MUST be re-traversed regardless of current mark
         // state — a BLACK object might have new young children that haven't
         // been marked yet. Force gray + queue.
-        // A4: single loop over GcObject. Cells route through gcQueueScanCell
-        // (which honors the PUC open/closed distinction); other types go
-        // straight to the gray list for re-propagation.
         for (self.gc_grayagain.items[0..self.gc_grayagain_snapshot_len]) |obj| {
             switch (obj) {
                 .cell => |cell| try self.gcQueueScanCell(cell),
@@ -19725,21 +19964,89 @@ pub const Vm = struct {
                 },
             }
         }
-        for (self.gc_gen_threads.items) |thread| try self.gcQueueScanValue(.{ .Thread = thread });
+        // PUC atomic (lgc.c:1548-1551): traversethread(g, mainthread) +
+        // for th in twups: traversethread(g, th). PUC's traversethread
+        // re-traverses the thread regardless of its mark color — it marks
+        // all children and adds the thread to grayagain. This is critical
+        // for generational GC: OLD BLACK threads from previous cycles must
+        // have their stacks re-scanned every cycle, because young objects
+        // on their stacks (e.g., closures, upvalues, tables) may not be
+        // reachable from any other root.
+        //
+        // gcQueueScanObject skips BLACK objects, so we cannot use it here.
+        // Instead, force each thread GRAY and add to gc_gray, matching
+        // PUC's direct traversethread call. gcDrainGray will then traverse
+        // the thread's stack and mark all reachable objects.
+        for (self.gc_gen_threads.items) |thread| {
+            const p = gcPtr(.{ .thread = thread });
+            gcSetGray(p.marked);
+            try self.gc_gray.append(self.alloc, .{ .thread = thread });
+        }
 
         try self.gcDrainGray();
         try self.gcAtomicCommon();
-        try self.gcSweepYoungGeneration();
 
-        // PUC paces the next cycle via setpause/setminordebt, not via a
-        // finalizer-driven tick flag. See gcFinishCycle for rationale.
+        // PUC atomic (lgc.c:1559-1560): drain grayagain during atomic phase.
+        // gcAtomicCommon may add items to grayagain via barriers (triggered
+        // by gcMarkMutableRoots or finalizers). These items reference young
+        // objects that need to be marked before the sweep. Without draining,
+        // the young children are not marked → freed during minor sweep →
+        // use-after-free.
+        //
+        // DISABLED: causes use-after-free crashes in errors.lua/files.lua.
+        // The grayagain drain re-traverses OLD objects that were added by
+        // write barriers. But some of these objects may have already been
+        // freed by a previous minor sweep (if they were young and not marked).
+        // TODO: investigate why grayagain drain causes crashes.
+        // try self.gcDrainGrayagain();
+        // try self.gcDrainGray();
+
+        // PUC atomic (lgc.c:1579): flip currentwhite at the end of atomic,
+        // before sweep. After the flip, gcIsDead distinguishes dead objects
+        // (old white) from survivors (black). Without this flip, the minor
+        // sweep cannot detect dead objects — they have the current white bit,
+        // not the "other" white bit, so gcIsDead returns false.
+        self.gc_current_white ^= WHITEBITS;
+
+        // Pre-sweep cleanup (same as gcAtomicPhase): deaden unmarked string
+        // keys and clear dead frame registers. These must run BEFORE any
+        // sweep frees objects, to avoid use-after-free on table pointers.
+        self.gcDeadenUnmarkedStringKeys();
+        self.gcClearDeadFrameRegisters();
+
+        // PUC youngcollection (lgc.c:1374): check checkminormajor BEFORE
+        // sweeping young generation. If true, minor2inc enters sweep for
+        // ALL objects (not just young), continuing the current cycle as an
+        // incremental sweep. This is critical: starting a NEW incremental
+        // cycle (gcStartCycle) would re-mark roots, but OLD BLACK objects
+        // are skipped by gcQueueScanObject → their children stay unmarked
+        // → freed after the next white flip → use-after-free.
+        //
+        // PUC minor2inc (lgc.c:1306): sets gckind, clears generational
+        // list pointers, calls entersweep(L) which starts sweeping allgc
+        // from the beginning. We mirror this by entering sweep state
+        // directly, with gc_objects_snapshot_len covering all objects.
         self.gc_finalizer_tick_pending = false;
         const limit = self.gc_gen_major_base_kb * @as(f64, @floatFromInt(@max(gcApplyParam(self.gcparams[2], 100), 0))) / 100.0;
         if (limit > 0 and self.gc_gen_added_old_kb >= limit) {
+            // PUC minor2inc: transition to incremental mode.
             self.gc_gen_phase = .major;
+            self.gc_mode = .incremental;
             self.gc_gen_major_start_kb = self.gc_count_kb;
             self.gc_auto_threshold_kb = self.gc_count_kb;
+            // PUC entersweep: start sweeping ALL objects from the beginning.
+            // The snapshot covers all objects that existed at this point;
+            // objects allocated during sweep (by finalizers) are beyond it
+            // and handled by gcSweepOne Phase 2 (marks reset, not death-checked).
+            self.gc_objects_snapshot_len = self.gc_objects.items.len;
+            self.gc_sweep_objects_cursor = 0;
+            self.gc_state = .sweep;
+            // PUC minor2inc: luaE_setdebt(g, stepsize). Set debt so the
+            // next gcAutomaticStep runs gcAdvance to drive the sweep.
+            const stepsize_kb: f64 = @as(f64, @floatFromInt(gcApplyParam(self.gcparams[5], 100))) / 1024.0;
+            self.gc_step_debt_kb = @max(stepsize_kb, 1.0);
         } else {
+            try self.gcSweepYoungGeneration();
             self.gcScheduleNextAutomaticCycle();
         }
     }
@@ -19784,7 +20091,6 @@ pub const Vm = struct {
                 // (swapRemove moves the last element into this slot), then
                 // free its memory. We must NOT advance the cursor so the
                 // swapped-in element gets examined next iteration.
-                if (obj == .closure) {}
                 self.gcUnregisterObject(obj);
                 self.gcFreeObject(obj);
             } else {
@@ -19957,6 +20263,22 @@ pub const Vm = struct {
         for (optional_mts) |mt| {
             if (mt) |t| try self.gcMarkValue(.{ .Table = t });
         }
+        // PUC markmt (lgc.c:381-382): mark pre-interned metamethod name
+        // strings (g->tmname[]). These strings ("__index", "__newindex",
+        // "__len", etc.) are used for pointer-identity key comparison in
+        // fasttm. They are NOT reachable from any table root — they live
+        // only in the tm_names array. Without marking them, GC frees them,
+        // and subsequent metamethod lookups use dangling pointers or
+        // re-interned strings with different pointer identity, breaking
+        // fasttm's pointer comparison.
+        for (self.tm_names) |opt| {
+            if (opt) |s| {
+                if (gcIsWhite(s.gc_marked)) {
+                    gcSetBlack(&s.gc_marked);
+                    self.gc_mark_epoch += 1;
+                }
+            }
+        }
         if (self.debug_registry) |t| try self.gcMarkValue(.{ .Table = t });
 
         // Thread handles held by the VM.
@@ -20093,10 +20415,7 @@ pub const Vm = struct {
     /// whether any white→gray/black transition occurred during this call,
     /// which gcPropagateEphemerons uses as its fixpoint convergence signal.
     fn gcMarkValue(self: *Vm, v: Value) DispatchError!void {
-        if (self.gc_minor_cycle) return self.gcMarkMinorValue(v);
         const obj = GcObject.fromValue(v) orelse return;
-        // Only bump the epoch when a white object is actually marked —
-        // gcPropagateEphemerons uses epoch growth as its fixpoint signal.
         const p = gcPtr(obj);
         const was_white = gcIsWhite(p.marked.*);
         try self.gcQueueScanObject(obj);
@@ -20332,24 +20651,40 @@ pub const Vm = struct {
                     // (stack is in self.bc_stack); for inactive coroutines,
                     // th.bytecode_stack holds their stack. Compute the correct
                     // stack once for both regs and varargs scans below.
-                    const stack = if (th.bytecode_stack.len > 0) th.bytecode_stack else self.bc_stack;
+                    const frame_stack = if (th.bytecode_stack.len > 0) th.bytecode_stack else self.bc_stack;
                     // Bytecode frames live ONLY in th.call_frames. Scan
                     // regs/boxed/callee/env_override.
                     if (exec_fr.proto()) |proto| {
                         try self.gcMarkBytecodeProto(proto);
                         // P15.51g: Derive regs from base + frame_cap.
-                        const regs = stack[exec_fr.base .. exec_fr.base + exec_fr.u.lua.frame_cap];
-                        const live_top: usize = if (exec_fr.u.lua.pc < proto.live_reg_top.len)
-                            @min(proto.live_reg_top[exec_fr.u.lua.pc], regs.len)
+                        const regs = frame_stack[exec_fr.base .. exec_fr.base + exec_fr.u.lua.frame_cap];
+                        // PUC traversethread scans th->stack[0..th->top].
+                        // Scan bound: max(proto.live_reg_top[pc], frame.reg_top).
+                        // - proto.live_reg_top[pc]: compile-time lower bound.
+                        // - frame.reg_top: dynamic upper bound (set at call/return).
+                        // For inactive coroutines, bytecode_stack_top is also
+                        // maintained (set at yield), so use it as an additional
+                        // lower bound to catch values above live_reg_top[pc].
+                        const pc_live = if (exec_fr.u.lua.pc < proto.live_reg_top.len)
+                            proto.live_reg_top[exec_fr.u.lua.pc]
                         else
-                            regs.len;
+                            0;
+                        var live_top: usize = @min(@max(pc_live, exec_fr.reg_top), @as(u32, @intCast(regs.len)));
+                        if (th.bytecode_stack.len > 0) {
+                            // Inactive coroutine: bytecode_stack_top is maintained
+                            // at yield points. Use it as an additional bound.
+                            const top = th.bytecode_stack_top;
+                            if (top > exec_fr.base) {
+                                live_top = @max(live_top, @min(top - exec_fr.base, regs.len));
+                            }
+                        }
                         for (regs[0..live_top]) |yv| {
                             if (GcObject.fromValue(yv) != null) {
                                 try self.gcMarkValue(yv);
                             }
                         }
                     }
-                    const exec_callee = stack[exec_fr.func_slot];
+                    const exec_callee = frame_stack[exec_fr.func_slot];
                     if (GcObject.fromValue(exec_callee) != null) {
                         try self.gcMarkValue(exec_callee);
                     }
@@ -20359,7 +20694,7 @@ pub const Vm = struct {
                         // for the VM-active thread, bytecode_stack is empty
                         // (moved to self.bc_stack); for parked coroutines,
                         // bytecode_stack holds their stack.
-                        const va = stack[exec_fr.func_slot - exec_fr.u.lua.nextraargs .. exec_fr.func_slot];
+                        const va = frame_stack[exec_fr.func_slot - exec_fr.u.lua.nextraargs .. exec_fr.func_slot];
                         for (va) |yv| {
                             if (GcObject.fromValue(yv) != null) {
                                 try self.gcMarkValue(yv);
@@ -20475,11 +20810,7 @@ pub const Vm = struct {
             },
             .string => {}, // strings go straight to black in gcQueueScanObject; no children
             .cell => {
-                // Closed cells are set black directly in gcQueueScanCell
-                // (PUC reallymarkobject, lgc.c:347-354) and never enter
-                // gc_gray. PUC propagatemark (lgc.c:727-740) has no
-                // LUA_VUPVAL case. This arm exists for switch
-                // exhaustiveness only.
+                // Reverted to original: empty arm
             },
             .userdata => |u| {
                 // PUC traverseudata (lgc.c:631-638): mark the metatable,
@@ -20499,6 +20830,7 @@ pub const Vm = struct {
             .cell => |cell| gcSetBlack(&cell.gc_marked),
             .userdata => |u| gcSetBlack(&u.gc_marked),
         }
+        // Reverted: do NOT add threads to grayagain after traversal
         return true;
     }
 
@@ -23779,7 +24111,7 @@ pub const Vm = struct {
 
         const mt = try self.allocTable();
         try self.setField(mt, "__mode", .{ .String = try self.internStr("k") });
-        hookkey.metatable = mt;
+        try self.gcStoreMetatable(hookkey, mt);
         try self.setField(reg, "_HOOKKEY", .{ .Table = hookkey });
         self.debug_registry = reg;
         return reg;
@@ -25239,7 +25571,7 @@ pub const Vm = struct {
 
         const file_mt = self.file_metatable orelse return self.fail("file metatable missing", .{});
         const tbl = try self.allocTableNoGc();
-        tbl.metatable = file_mt;
+        try self.gcStoreMetatable(tbl, file_mt);
         try self.registerFinalizable(.{ .table = tbl });
         // Protect tbl from GC while setField populates it. setField may
         // allocate strings/tables internally, which can trigger a GC step.
@@ -25699,7 +26031,7 @@ pub const Vm = struct {
         const mt = try self.allocTableNoGc();
         const fmts_tbl = try self.allocTableNoGc();
         try self.setField(mt, "__call", .{ .Builtin = .io_lines_iter });
-        obj.metatable = mt;
+        try self.gcStoreMetatable(obj, mt);
         try self.setField(obj, "__file", file_v);
         try self.setField(obj, "__auto_close", .{ .Bool = auto_close });
         try self.setField(obj, "__closed_error", .{ .Bool = false });
@@ -33081,7 +33413,7 @@ pub const Vm = struct {
         try self.setField(ccl, "__testc_script_upvalue", .{ .Bool = true });
         const mt = try self.allocTable();
         try self.setField(mt, "__call", .{ .Builtin = .testc_testC });
-        ccl.metatable = mt;
+        try self.gcStoreMetatable(ccl, mt);
         outs[0] = .{ .Table = ccl };
         self.last_builtin_out_count = 1;
     }
@@ -34457,7 +34789,7 @@ pub const Vm = struct {
                 try self.setField(ccl, "__testc_script_upvalue", .{ .Bool = false });
                 const mt = try self.allocTable();
                 try self.setField(mt, "__call", .{ .Builtin = .testc_testC });
-                ccl.metatable = mt;
+                try self.gcStoreMetatable(ccl, mt);
                 try st.append(self.alloc, .{ .Table = ccl });
             },
             .gettop => {

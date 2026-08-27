@@ -1,4 +1,4 @@
-> Last updated: 2026-08-27 (P16.4c: gen GC grayagain drain for full cycles + metatable barrier fixes)
+> Last updated: 2026-08-27 (P16.4d: gen GC sweepgen color, checkmajorminor, gcMakeAllOld BLACK)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -3229,14 +3229,62 @@ th.yielded / resume_inbox / suspended_builtin_args dupes). InlineValues
   Root cause: a table's metatable is freed because the table (old, not
   re-traversed) didn't have its metatable marked. The backward barrier in
   `gcStoreMetatable` should fix this, but something is still missing.
-  TODO(P16.4d): investigate and enable minor-cycle grayagain drain.
-- `gc.lua`, `gengc.lua` — pre-existing failures (not gen-specific).
-- `api.lua` — pre-existing assertion failure.
+  TODO(P16.4e): investigate and enable minor-cycle grayagain drain.
+- `gengc.lua` — pre-existing failure at line 90 (coroutine upvalue collection).
 - `big.lua` — both_fail (pre-existing).
 
 **Gate**: matrix 28/32 (errors.lua, files.lua pass with gen enabled),
 smoke 55/55 (all pass including 43_generational_minor.lua),
 c_api 17/17, zig build test 0 — no regressions vs gen-disabled baseline.
+
+### P16.4d — Gen GC sweepgen color, checkmajorminor, gcMakeAllOld BLACK
+
+**Goal:** Fix gc.lua, api.lua, gengc.lua:48-50 regressions from P16.4c and
+implement missing checkmajorminor for major→minor transition.
+
+**Changes:**
+- **gcMakeAllOld sets objects to BLACK** (not just OLD): PUC's `atomic2gen` →
+  `sweep2old` keeps surviving objects BLACK (via `nw2black`). Our code was
+  leaving them WHITE (reset by the preceding full cycle's sweep). Without
+  BLACK, forward barriers (e.g., `gcStoreMetatable` checking `gcIsBlack`)
+  never fire after entering gen mode, breaking metatable age promotion
+  (gengc.lua:48).
+- **gcSweepYoungObjects: only reset G_NEW to white**: PUC's `sweepgen` only
+  resets G_NEW objects to white; all other survivors keep BLACK. Our code
+  was resetting ALL survivors to white, breaking OLD0 objects (forward-barrier
+  promoted) which need to stay BLACK for the next cycle's markold.
+- **gcCorrectOld1: do NOT advance OLD1→OLD**: PUC's `sweepgen` advances
+  OLD0→OLD1, but OLD1→OLD is done by `markold` at the START of the NEXT
+  cycle. Our code was advancing OLD1→OLD in the same cycle, skipping the
+  OLD1 state entirely (gengc.lua:50 expects OLD1 after collectgarbage("step")).
+- **checkminormajor after sweep, not before**: PUC's `youngcollection` calls
+  `sweepgen` (which promotes SURVIVAL→OLD1 and increments `addedold1`) BEFORE
+  `checkminormajor`. Our code checked before the sweep, seeing `addedold1=0`
+  and never triggering the minor→major transition.
+- **Implement checkmajorminor in gcAtomicPhase**: PUC calls
+  `checkmajorminor` after `atomic` in major mode. If enough memory was
+  collected, `atomic2gen` returns to gen minor mode. Our code was missing
+  this entirely — major mode never returned to minor. Added
+  `gc_gen_marked_kb` tracking (PUC `GCmarked` equivalent) in
+  `gcQueueScanObject`.
+- **gcMarkMutableRoots: use live_reg_top[pc] as primary bound**: Reverted
+  P16.4c's `@max(pc_live, frame.reg_top)` which kept dead registers alive
+  after for loops, breaking gc.lua:382 and api.lua:1039.
+- **gcLeaveGenerational: add gcMakeAllWhite + gc_state=pause**: Match PUC's
+  `minor2inc` which resets all objects to current white so the next
+  incremental cycle can distinguish reachable from unreachable.
+
+**Results:**
+- gc.lua: PASS (was failing at line 382)
+- api.lua: PASS (was failing at line 1039)
+- gengc.lua: lines 48-50 PASS (was failing at line 48), pre-existing
+  failure at line 90 (coroutine upvalue collection) remains
+- zig build test: 146/146 (was 144/146 — fixed 2 pre-existing test failures)
+- matrix: 30/32 (was 28/32), smoke 54/54, c_api 25/25
+
+**Gate**: matrix 30/32 (gengc.lua zig_fail pre-existing line 90,
+big.lua both_fail pre-existing), smoke 54/54, c_api 25/25,
+zig build test 0 — no regressions.
 
 ## История закрытых фаз
 

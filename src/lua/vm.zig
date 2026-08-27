@@ -2854,6 +2854,10 @@ pub const Vm = struct {
     gc_gen_major_base_kb: f64 = 0.0,
     gc_gen_major_start_kb: f64 = 0.0,
     gc_gen_added_old_kb: f64 = 0.0,
+    /// PUC GCmarked equivalent for major mode: total KB of objects marked
+    /// during the atomic phase. Used by checkmajorminor to compute
+    /// tobecollected = total - marked.
+    gc_gen_marked_kb: f64 = 0.0,
 
     // Generational registries mirror PUC's nursery/survival/old1 and
     // grayagain lists without requiring intrusive links in every object.
@@ -18577,6 +18581,11 @@ pub const Vm = struct {
     fn gcQueueScanObject(self: *Vm, obj: GcObject) DispatchError!void {
         const p = gcPtr(obj);
         if (!gcIsWhite(p.marked.*)) return;
+        // PUC reallymarkobject: GCmarked += objsize(o). Track marked KB
+        // for checkmajorminor (tobecollected = total - marked).
+        if (self.gc_gen_phase == .major) {
+            self.gc_gen_marked_kb += @as(f64, @floatFromInt(gcObjectBytes(obj))) / 1024.0;
+        }
         if (obj == .string) {
             // Strings have no children — go straight to black.
             gcSetBlack(p.marked);
@@ -18730,6 +18739,21 @@ pub const Vm = struct {
     /// per-type lists. Preserves the `gc_busy` guard (prevents spurious
     /// minor collections during the transition) and the generational
     /// phase/KB resets that the per-type predecessor performed.
+    ///
+    /// PUC `atomic2gen` → `sweep2old` (lgc.c:1136-1158): after the atomic
+    /// phase marks all reachable objects BLACK, `sweep2old` frees dead
+    /// (white) objects and sets surviving objects to age=G_OLD. For most
+    /// types it calls `nw2black` (a no-op since they're already BLACK from
+    /// atomic). Threads are linked to grayagain for re-traversal. Open
+    /// upvalues are set to gray.
+    ///
+    /// In our architecture, `gcMakeAllOld` is called AFTER a full cycle
+    /// (gcCycleFull or gcFullCollectionForUser), where the sweep phase has
+    /// already reset alive objects to current white. To match PUC's
+    /// post-atomic2gen state (OLD + BLACK), we must explicitly set objects
+    /// to BLACK here. Without this, forward barriers (e.g., gcStoreMetatable
+    /// checking `gcIsBlack`) never fire after entering gen mode, breaking
+    /// metatable age promotion (gengc.lua:48).
     fn gcMakeAllOld(self: *Vm) std.mem.Allocator.Error!void {
         // Prevent automatic GC from firing during this transition.
         // Allocations inside (e.g., gc_gen_threads.append) could trigger
@@ -18741,14 +18765,23 @@ pub const Vm = struct {
 
         self.gcClearGenerationalLists();
         for (self.gc_objects.items) |obj| {
-            gcPtr(obj).age.* = .old;
+            const o = gcPtr(obj);
+            o.age.* = .old;
+            // Match PUC sweep2old: surviving objects become BLACK.
+            // Threads are also BLACK (PUC keeps their color, just links
+            // to grayagain). Open upvalues would need set2gray, but we
+            // handle that separately if it becomes an issue.
+            gcSetBlack(o.marked);
             if (obj == .thread) {
                 try self.gc_gen_threads.append(self.alloc, obj.thread);
             }
         }
         // Short strings are now in gc_objects. Only long literals separate.
         var literal_it = self.long_literals.table.iterator();
-        while (literal_it.next()) |entry| entry.value_ptr.*.gc_age = .old;
+        while (literal_it.next()) |entry| {
+            entry.value_ptr.*.gc_age = .old;
+            entry.value_ptr.*.gc_marked = (entry.value_ptr.*.gc_marked & ~WHITEBITS) | BLACKBIT;
+        }
         self.gc_gen_phase = .minor;
         self.gc_gen_major_base_kb = self.gc_count_kb;
         self.gc_gen_major_start_kb = self.gc_count_kb;
@@ -18764,9 +18797,31 @@ pub const Vm = struct {
     }
 
     fn gcLeaveGenerational(self: *Vm) void {
+        // PUC minor2inc (lgc.c:1306-1314): transition from generational to
+        // incremental mode. PUC clears gen lists, calls entersweep (which
+        // starts an incremental sweep that resets all alive objects to the
+        // current white + G_NEW), and sets debt.
+        //
+        // In our architecture, gcMinorCollection is monolithic (it does
+        // mark+atomic+sweep in one shot), so after it returns gc_state is
+        // .propagate but there is no actual pending cycle to finish. We must:
+        //   1. Set gc_state = .pause (no pending cycle to finish)
+        //   2. Clear gen lists
+        //   3. Reset all objects to current white (equivalent to PUC's sweep
+        //      which resets alive objects to white + G_NEW)
+        //
+        // Without step 3, old objects remain BLACK from the gen era. The next
+        // incremental cycle's sweep uses gcIsDead (checks for the OTHER white
+        // bit) — BLACK objects have no white bits, so gcIsDead returns false
+        // and unreachable old objects survive forever. gcMakeAllWhite resets
+        // all objects to the current white so the next cycle can properly
+        // distinguish reachable (will be marked black) from unreachable
+        // (stays white, freed by sweep).
+        self.gc_state = .pause;
         self.gc_mode = .incremental;
         self.gc_gen_phase = .minor;
         self.gcClearGenerationalLists();
+        self.gcMakeAllWhite();
         self.gcScheduleNextAutomaticCycle();
     }
 
@@ -18931,6 +18986,8 @@ pub const Vm = struct {
         self.gc_fin_threads.clearRetainingCapacity();
         self.gc_to_finalize.clearRetainingCapacity();
         self.gc_fin_weak_tables.clearRetainingCapacity();
+        // Reset marked KB counter for checkmajorminor (PUC GCmarked per cycle).
+        self.gc_gen_marked_kb = 0;
     }
 
     fn gcStartCycle(self: *Vm, do_sweep: bool) DispatchError!void {
@@ -18978,14 +19035,18 @@ pub const Vm = struct {
                 // Use self.bc_stack directly because GC finalizers may execute
                 // Lua code that reallocs bc_stack.
                 const regs = self.bc_stack[frame.base .. frame.base + frame.u.lua.frame_cap];
-                // Scan bound: max(proto.live_reg_top[pc], frame.reg_top).
-                // - proto.live_reg_top[pc]: compile-time lower bound.
-                // - frame.reg_top: dynamic upper bound (set at call/return).
-                const pc_live = if (frame.u.lua.pc < proto.live_reg_top.len)
-                    proto.live_reg_top[frame.u.lua.pc]
+                // Scan bound: proto.live_reg_top[pc] is the compile-time
+                // liveness bound — it includes exactly the registers that are
+                // live at the current PC. Using @max(pc_live, frame.reg_top)
+                // would also scan dead registers above the live range (e.g.,
+                // locals that went out of scope at the end of a for loop),
+                // keeping unreachable objects alive and breaking finalization
+                // tests (gc.lua:382, api.lua:1039). When pc is out of range,
+                // scan all registers as a conservative fallback.
+                const live_top: usize = if (frame.u.lua.pc < proto.live_reg_top.len)
+                    @min(proto.live_reg_top[frame.u.lua.pc], regs.len)
                 else
-                    0;
-                const live_top: usize = @min(@max(pc_live, frame.reg_top), @as(u32, @intCast(regs.len)));
+                    regs.len;
                 for (regs[0..live_top]) |value| try self.gcMarkValue(value);
                 // Mark to-be-closed variables: they may be above live_reg_top[pc]
                 // (which tracks per-PC liveness) but are still live on the stack
@@ -19555,6 +19616,40 @@ pub const Vm = struct {
             return;
         }
 
+        // PUC checkmajorminor (lgc.c:1471-1484): in gen major mode, check
+        // whether enough memory was collected to return to gen minor mode.
+        // If so, atomic2gen sweeps all objects to OLD+BLACK and sets gen mode,
+        // skipping the normal incremental sweep. This is how PUC transitions
+        // back from major to minor after collecting enough garbage.
+        if (self.gc_gen_phase == .major) {
+            const addedbytes_kb = self.gc_count_kb - self.gc_gen_major_base_kb;
+            const addedbytes_bytes: u64 = @intFromFloat(@max(addedbytes_kb * 1024.0, 0.0));
+            const limit_bytes = gcApplyParam(self.gcparams[1], addedbytes_bytes);
+            // tobecollected: bytes that won't survive this cycle.
+            // After atomic, marked objects are BLACK. We estimate
+            // tobecollected as total bytes minus marked bytes.
+            // For majorminor=0%, limit=0, so any tobecollected>0 returns to gen.
+            // Track marked bytes via gc_gen_marked_kb (set during atomic).
+            const tobecollected_kb = self.gc_count_kb - self.gc_gen_marked_kb;
+            if (tobecollected_kb > 0 and tobecollected_kb * 1024.0 > @as(f64, @floatFromInt(limit_bytes))) {
+                // PUC atomic2gen: flip white, sweep all (free dead), set OLD+BLACK
+                self.gc_current_white ^= WHITEBITS;
+                self.gcDeadenUnmarkedStringKeys();
+                self.gcClearDeadFrameRegisters();
+                self.gc_objects_snapshot_len = self.gc_objects.items.len;
+                self.gc_sweep_objects_cursor = 0;
+                self.gc_state = .sweep;
+                while (try self.gcSweepOne()) {}
+                // Set all surviving objects to OLD+BLACK, return to gen mode
+                self.gc_mode = .generational;
+                try self.gcMakeAllOld();
+                self.gc_state = .propagate; // PUC finishgencycle: GCSpropagate
+                return;
+            }
+            // Not enough collected: stay in major mode for another cycle
+            self.gc_gen_major_base_kb = self.gc_gen_marked_kb;
+        }
+
         // PUC entersweep (lgc.c): flip currentwhite before sweep begins.
         // After the flip, gcIsDead distinguishes dead objects (old white)
         // from survivors (black or new white). Surviving objects are reset
@@ -19711,6 +19806,12 @@ pub const Vm = struct {
     /// `gcFreeObject` (A2/A5) dispatches per-type teardown uniformly;
     /// `gcUnregisterObject` removes from `gc_objects` via `gc_index`.
     fn gcSweepYoungObjects(self: *Vm) DispatchError!void {
+        // PUC sweepgen (lgc.c:1172-1213): walks young objects, freeing dead
+        // ones and promoting survivors. Only G_NEW objects are reset to white;
+        // all other survivors KEEP their color (BLACK stays BLACK). This is
+        // critical: OLD0 objects (forward-barrier promoted) must remain BLACK
+        // after sweep so the next cycle's markold can distinguish them from
+        // dead objects.
         const snapshot = @min(self.gc_young_objects_snapshot_len, self.gc_young_objects.items.len);
         var write: usize = 0;
         for (self.gc_young_objects.items[0..snapshot]) |obj| {
@@ -19725,8 +19826,11 @@ pub const Vm = struct {
                 self.gcFreeObject(obj);
                 continue;
             }
-            // Reverted to original: reset ALL survivors to white
-            p.marked.* = self.gc_current_white & WHITEBITS;
+            // PUC sweepgen: only G_NEW objects are reset to white + promoted
+            // to G_SURVIVAL. All other survivors keep their color (BLACK).
+            if (p.age.* == .new) {
+                p.marked.* = self.gc_current_white & WHITEBITS;
+            }
             if (try self.gcPromoteYoungObject(obj)) {
                 self.gc_young_objects.items[write] = obj;
                 write += 1;
@@ -19752,6 +19856,13 @@ pub const Vm = struct {
         // gcMarkOld1 adds OLD1 threads to grayagain so they are re-traversed
         // every cycle. If we advance OLD1→OLD here, gcMarkOld1 never runs
         // and OLD threads are never added to grayagain.
+        //
+        // IMPORTANT: Only advance OLD0→OLD1 here. Do NOT advance OLD1→OLD.
+        // Objects promoted to OLD1 by gcPromoteYoungObject (from gc_young_objects)
+        // are also in this list (added by forward barriers). Advancing them to
+        // OLD in the same cycle skips the OLD1 state, breaking age assertions
+        // (gengc.lua:50 expects OLD1 after collectgarbage("step")).
+        // OLD1→OLD is handled by markold at the START of the next cycle.
         const snapshot = @min(self.gc_old1_snapshot_len, self.gc_old1.items.len);
         var write: usize = 0;
         for (self.gc_old1.items[0..snapshot]) |obj| {
@@ -19762,7 +19873,11 @@ pub const Vm = struct {
                     self.gc_old1.items[write] = obj;
                     write += 1;
                 },
-                .old1 => p.age.* = .old,
+                .old1 => {
+                    // Keep OLD1 objects in the list for next cycle's markold.
+                    self.gc_old1.items[write] = obj;
+                    write += 1;
+                },
                 else => {},
             }
         }
@@ -20027,6 +20142,12 @@ pub const Vm = struct {
         // from the beginning. We mirror this by entering sweep state
         // directly, with gc_objects_snapshot_len covering all objects.
         self.gc_finalizer_tick_pending = false;
+        // PUC youngcollection (lgc.c:1350-1379): sweep young generation FIRST,
+        // then check checkminormajor. sweepgen promotes SURVIVAL→OLD1 and
+        // increments addedold1, which checkminormajor uses to decide the
+        // minor→major transition. Checking before the sweep would see
+        // addedold1=0 and never trigger the transition.
+        try self.gcSweepYoungGeneration();
         const limit = self.gc_gen_major_base_kb * @as(f64, @floatFromInt(@max(gcApplyParam(self.gcparams[2], 100), 0))) / 100.0;
         if (limit > 0 and self.gc_gen_added_old_kb >= limit) {
             // PUC minor2inc: transition to incremental mode.
@@ -20046,7 +20167,6 @@ pub const Vm = struct {
             const stepsize_kb: f64 = @as(f64, @floatFromInt(gcApplyParam(self.gcparams[5], 100))) / 1024.0;
             self.gc_step_debt_kb = @max(stepsize_kb, 1.0);
         } else {
-            try self.gcSweepYoungGeneration();
             self.gcScheduleNextAutomaticCycle();
         }
     }
@@ -20658,27 +20778,25 @@ pub const Vm = struct {
                         try self.gcMarkBytecodeProto(proto);
                         // P15.51g: Derive regs from base + frame_cap.
                         const regs = frame_stack[exec_fr.base .. exec_fr.base + exec_fr.u.lua.frame_cap];
-                        // PUC traversethread scans th->stack[0..th->top].
-                        // Scan bound: max(proto.live_reg_top[pc], frame.reg_top).
-                        // - proto.live_reg_top[pc]: compile-time lower bound.
-                        // - frame.reg_top: dynamic upper bound (set at call/return).
-                        // For inactive coroutines, bytecode_stack_top is also
-                        // maintained (set at yield), so use it as an additional
-                        // lower bound to catch values above live_reg_top[pc].
-                        const pc_live = if (exec_fr.u.lua.pc < proto.live_reg_top.len)
-                            proto.live_reg_top[exec_fr.u.lua.pc]
+                        // Scan bound: proto.live_reg_top[pc] is the compile-time
+                        // liveness bound. Using @max(pc_live, exec_fr.reg_top)
+                        // would scan dead registers (locals out of scope after
+                        // for loops), keeping unreachable objects alive. For
+                        // inactive coroutines, bytecode_stack_top (set at yield)
+                        // is used as an additional bound to catch values above
+                        // live_reg_top[pc] at yield points.
+                        const live_top: usize = if (exec_fr.u.lua.pc < proto.live_reg_top.len)
+                            @min(proto.live_reg_top[exec_fr.u.lua.pc], regs.len)
                         else
-                            0;
-                        var live_top: usize = @min(@max(pc_live, exec_fr.reg_top), @as(u32, @intCast(regs.len)));
-                        if (th.bytecode_stack.len > 0) {
-                            // Inactive coroutine: bytecode_stack_top is maintained
-                            // at yield points. Use it as an additional bound.
+                            regs.len;
+                        const final_live_top = if (th.bytecode_stack.len > 0) blk: {
                             const top = th.bytecode_stack_top;
-                            if (top > exec_fr.base) {
-                                live_top = @max(live_top, @min(top - exec_fr.base, regs.len));
-                            }
-                        }
-                        for (regs[0..live_top]) |yv| {
+                            break :blk if (top > exec_fr.base)
+                                @max(live_top, @min(top - exec_fr.base, regs.len))
+                            else
+                                live_top;
+                        } else live_top;
+                        for (regs[0..final_live_top]) |yv| {
                             if (GcObject.fromValue(yv) != null) {
                                 try self.gcMarkValue(yv);
                             }

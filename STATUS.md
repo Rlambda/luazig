@@ -1,4 +1,4 @@
-> Last updated: 2026-08-26 (P16.4b: fix generational GC full-collection crash — gcMakeAllWhite before pending cycle)
+> Last updated: 2026-08-27 (P16.4c: gen GC grayagain drain for full cycles + metatable barrier fixes)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -3195,6 +3195,48 @@ th.yielded / resume_inbox / suspended_builtin_args dupes). InlineValues
   a separate fix (P16.4c). GCGEN remains disabled at startup.
 - **Gate**: matrix 31/32 (big.lua both_fail pre-existing), smoke 54/54,
   c_api 17/17, zig build test 0 — no regressions.
+
+### P16.4c — Gen GC grayagain drain for full cycles + metatable barrier fixes
+
+**Goal:** Fix generational GC crashes blocking GCGEN startup.
+
+**Changes:**
+- **Grayagain drain for full cycles**: Enable `gcDrainGrayagain` in
+  `gcAtomicCommon` for non-minor (full/incremental) cycles. Without this,
+  `gcFullCollectionForUser` frees grayagain items that weren't marked →
+  dangling pointers → crash in next minor cycle. Fixes
+  `43_generational_minor.lua` smoke test crash.
+- **gcStoreMetatable barrier fix**: Check `gcIsBlack&&gcIsWhite` instead of
+  age-based check. A YOUNG BLACK table (already traversed) needs the barrier
+  to mark its new metatable.
+- **Backward barrier in gcStoreMetatable**: Add table to grayagain so it's
+  re-traversed next cycle, ensuring metatable is re-marked after sweep.
+- **gcPromoteYoungObject fix**: Advance OLD0→OLD1 (was: return false without
+  advancing), add OLD1 objects to `gc_grayagain` so `gcCorrectGrayAgain` can
+  make them BLACK for `markold` re-traversal.
+- **gcCorrectGrayAgain fix**: Process ALL items (not just pre-snapshot), make
+  alive-white objects BLACK (distinguish dead-white from alive-white using
+  `gcIsDead`), match PUC `correctgraylist` age transitions.
+- **gcDrainGrayagain fix**: Save/clear/drain pattern matching PUC atomic —
+  new items added by barriers during draining stay in grayagain for later.
+- **Route all direct `.metatable=` through barriers**: All table metatable
+  assignments now go through `gcStoreMetatable`; userdata through
+  `gcWriteBarrierUserdata`. Fixed in `vm.zig` and `api.zig`.
+
+**Remaining issues:**
+- Minor-cycle grayagain drain still disabled (causes minor2inc transition
+  which exposes a dangling metatable pointer from a previous minor sweep).
+  Root cause: a table's metatable is freed because the table (old, not
+  re-traversed) didn't have its metatable marked. The backward barrier in
+  `gcStoreMetatable` should fix this, but something is still missing.
+  TODO(P16.4d): investigate and enable minor-cycle grayagain drain.
+- `gc.lua`, `gengc.lua` — pre-existing failures (not gen-specific).
+- `api.lua` — pre-existing assertion failure.
+- `big.lua` — both_fail (pre-existing).
+
+**Gate**: matrix 28/32 (errors.lua, files.lua pass with gen enabled),
+smoke 55/55 (all pass including 43_generational_minor.lua),
+c_api 17/17, zig build test 0 — no regressions vs gen-disabled baseline.
 
 ## История закрытых фаз
 

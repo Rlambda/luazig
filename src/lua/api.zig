@@ -808,7 +808,7 @@ pub const State = struct {
         const mt = if (mt_val == .Table) mt_val.Table else null;
         switch (self.stack.items[abs]) {
             .Table => |t| {
-                t.metatable = mt;
+                self.vm.gcStoreMetatable(t, mt) catch {};
                 if (mt) |m| {
                     if (self.vm.metamethodValue(.{ .Table = m }, "__gc") != null) {
                         self.vm.registerFinalizable(.{ .table = t }) catch {};
@@ -818,6 +818,7 @@ pub const State = struct {
             .Userdata => |ud| {
                 ud.metatable = mt;
                 if (mt) |m| {
+                    self.vm.gcWriteBarrierUserdata(ud, .{ .Table = m }) catch {};
                     if (self.vm.metamethodValue(.{ .Table = m }, "__gc") != null) {
                         self.vm.registerFinalizable(.{ .userdata = ud }) catch {};
                     }

@@ -1093,15 +1093,8 @@ fn interpreterMain(init: std.process.Init) !void {
     // PUC pmain (lua.c:726-727): after createargtable, start the GC and
     // switch to generational mode. Fresh luaL_newstate starts incremental
     // + running; pmain does GCRESTART (reset debt) then GCGEN.
-    //
-    // GCRESTART is currently disabled because it resets GC debt to 0,
-    // causing premature GC triggering and matrix failures (bitwise,
-    // nextvar, vararg, etc.). This is a separate issue from the gen-mode
-    // full-collection crash (P16.4b), which is now fixed.
-    // TODO: investigate GCRESTART debt reset interaction with our GC
-    //   threshold computation.
-    // _ = vm.gcControl(1, 0, -1); // LUA_GCRESTART
-    // _ = vm.gcControl(7, 0, -1); // LUA_GCGEN
+    _ = vm.gcControl(1, 0, -1); // LUA_GCRESTART
+    _ = vm.gcControl(7, 0, -1); // LUA_GCGEN
 
     var bc_stats: BcCoverageStats = .{};
     const bc_stats_ptr: ?*BcCoverageStats = if (opts.backend == .bc) &bc_stats else null;

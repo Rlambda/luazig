@@ -3345,6 +3345,76 @@ coroutine.lua --testc 0, zig build test 0, leak_bench 25/25 PASS.
 Perf: geomean 2.55x, no new regressions vs baseline (global_arith +20.7%
 pre-existing from P16.4 gen startup).
 
+### P16.4f — PUC-faithful gen-GC byte accounting + chained stringtable + temp-buffer leak fixes (17_gccontrol diff green)
+
+Closed the last P16.4 blocker: `17_gccontrol` STEP differential
+(`reached_1=yes` PUC vs `no` zig). Root-cause chain (each fix verified by
+instrumented traces against vendored PUC):
+
+- [x] **STEP debt semantics** (gcControl STEP arm, PUC lapi.c:1200+):
+  `n<=0 → debt := 0` (force due), `n>0 → debt -= n`; manual gen-minor step
+  applies setminordebt-equivalent after the collection; full/incremental
+  steps apply setpause / setdebt(stepsize) per PUC incstep (lgc.c:1724).
+- [x] **GCGEN/GCINC return values** distinguish KGC_GENMAJOR
+  (gc_gen_phase == .major) like PUC lapi.c:1220-1224.
+- [x] **setminordebt pacing** (gcScheduleNextAutomaticCycle): gen-minor
+  threshold = count + GCmajorminor×MINORMUL% (lgc.c:1417). Removed the
+  +64KB floor that postponed minors past whole workloads.
+- [x] **Table parts byte accounting**: tableResize charges new array/hash
+  parts (gcNoteAlloc) and credits freed old parts (gcNoteFree), matching
+  gcFreeObject's full-size credit; removed the duplicate C-API newtable
+  charge. Without it the count collapsed to 0 after minor sweeps.
+- [x] **Cell charge at the hot OP_CLOSURE upvalue-capture path** — the
+  missing charge collapsed gc_count_kb (every freed cell over-credited),
+  which froze AutoCycleDue permanently true → GC livelock (cstack timeout).
+- [x] **Chained interned-string table** (PUC stringtable, lstring.c):
+  `StringTable` with bucket chains via new `LuaString.next`, O(1)
+  removeString (luaS_remove), grow-at-full ×2 (growstrtab), shrink at
+  nuse<size/4 during atomic (checkSizes), MINSTRTABSIZE=128 init.
+  Replaces the Zig HashMapUnmanaged whose tombstones degraded to O(N)
+  probes under gen-GC string churn (perf: string_concat −25%, string_loop
+  −34%).
+- [x] **Fixed string-hash seed**: `hash_seed` (set once, like PUC g->seed)
+  instead of the live `rng_state[0]^rng_state[2]` that math.random mutates
+  (latent correctness bug: re-hashing after randomseed broke intern lookups).
+- [x] **internStr resurrect** of dead-but-unswept strings on hit
+  (PUC internshrstr lstring.c:223-226); removed the non-PUC age-touch.
+- [x] **Temp-buffer leaks** (found via systemd-oomd kills + a
+  TrackingAllocator leak-map): concatValuesDirect `result`,
+  string.rep `buf`, and two error-format `tb_result` buffers were never
+  freed after interning (PUC frees the temp copy immediately). Accumulator
+  `s = s .. x` loops turned this into quadratic memory blowups (OOM at
+  200K iterations; now passes under 3GB ulimit, output parity with PUC).
+
+**Workload robustness**: smoke `34_gc_stop_and_step.lua` steps_to_cycle
+workload 100→300 tables — the minor→major threshold is footprint-relative
+(minormajor% of post-full-collect base); Zig's larger struct footprint put
+100 tables below the limit (63% vs PUC's 72%, threshold ~67%). Semantics
+unchanged, verified against PUC on the same file.
+
+**Results:**
+- 17_gccontrol test-diff: **PASS** (`reached_1=yes` both runtimes; /tmp/sp3.c
+  parity at iteration 69 vs PUC's 0 — pacing-equivalent, test only checks
+  termination via major cycle)
+- matrix --testc: zig_fail=1 (nextvar.lua — **pre-existing, fails 5/5 on
+  clean HEAD 84559f7 too**: "invalid key to 'next'" in gen-GC minor stack
+  scanning; NOT a regression of this step; open for the next investigation)
+- c_api 17/17 + DIFF PASS, smoke 54/54, gengc.lua FULL PASS,
+  coroutine.lua --testc 0, zig build test 0, leak_bench PASS
+- Memory: 30K/200K accumulator-concat workloads pass under 2–3GB ulimit
+  (were OOM at 6–8GB); lengths match PUC exactly (138894 / 1088895)
+- Perf: geomean **2.53x → 2.39x**; string_concat −25.3%, string_loop
+  −34.4%, temp_table_alloc −29.5%; field_access/global_arith flapped
+  (+10.2%/+18% in full-suite runs) but isolated instructions-vs-cycles A/B
+  shows identical instructions (89.8G) and BETTER cycles (21.5–23.2G vs
+  HEAD's 23.5–23.7G) — measurement noise on a loaded host, not a real
+  regression. Baseline updated to the 2.39x run; README regenerated.
+
+**Open (known, not from this step)**: nextvar.lua gen-GC "invalid key to
+'next'" (fails on HEAD; suspect minor-collection stack scanning missing a
+live key register); global_arith noise investigation if it reappears
+against the new baseline.
+
 ## История закрытых фаз
 
 P3–P15.12 — краткая сводка. P15.13+ — см. «История разработки» выше.

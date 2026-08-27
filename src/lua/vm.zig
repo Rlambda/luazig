@@ -3595,6 +3595,40 @@ pub const Vm = struct {
         self.refreshHooksCached();
     }
 
+    /// PUC luaE_freethread → luaF_closeupval: close all open upvalues of a
+    /// thread before its stack is freed. Called from gcFreeObject(.thread).
+    ///
+    /// Open upvalue cells live in th.bytecode_boxed (for a parked/suspended
+    /// coroutine) — each non-null entry is a *Cell with bc_stack_idx pointing
+    /// into th.bytecode_stack. Closing copies the stack value into cell.value
+    /// and clears bc_stack_idx/bc_stack_thread, so the cell becomes
+    /// self-contained and survives the thread's stack deallocation.
+    ///
+    /// For the active_runtime_thread (main thread at Vm.deinit), th.bytecode_boxed
+    /// is empty — its open upvalues (if any) live in vm.bc_boxed, which is freed
+    /// separately in Vm.deinit before drainGcRegistries. The main thread should
+    /// have no open upvalues at teardown (the main chunk returns and closes them).
+    ///
+    /// PUC uses luaF_closeupval (not luaF_close): no __close metamethods are
+    /// invoked — the thread is being freed and cannot run Lua code. This mirrors
+    /// closeBytecodeUpvaluesFrom but operates on the whole th.bytecode_boxed
+    /// array rather than a single frame's slice.
+    fn closeThreadOpenUpvalues(self: *Vm, th: *Thread) void {
+        for (th.bytecode_boxed) |maybe_cell| {
+            if (maybe_cell) |cell| {
+                // PUC luaF_closeupval: setobj(slot, uv->v.p); uv->v.p = slot.
+                // cell.close copies the stack value into cell.value and
+                // clears bc_stack_idx/bc_stack_thread.
+                cell.close(self);
+                // PUC luaF_closeupval: nw2black + luaC_barrier — fire the
+                // write barrier for the now-closed cell so GC invariants
+                // hold (the cell's value changed from a stack reference to
+                // an inline value).
+                self.gcWriteBarrierCell(cell, cell.value) catch {};
+            }
+        }
+    }
+
     fn freeParkedThreadRuntime(self: *Vm, th: *Thread) void {
         std.debug.assert(self.active_runtime_thread != th);
         if (th.bytecode_stack.len != 0) self.alloc.free(th.bytecode_stack);
@@ -18618,8 +18652,15 @@ pub const Vm = struct {
             // A4: open cells now ride the unified gc_grayagain (GcObject)
             // list, matching PUC's single gclist per object.
             try self.gc_grayagain.append(self.alloc, .{ .cell = cell });
-            // Open upvalue: value is on the thread's stack, which is
-            // scanned separately. Don't mark the value here.
+            // PUC reallymarkobject: markvalue(g, uv->v.p) — mark the
+            // upvalue's content (the stack value) even for open upvalues.
+            // This is critical when the owning thread is UNREACHABLE: its
+            // stack is not scanned, so the value would be unmarked and
+            // freed by sweep. The cell survives (reachable via a closure),
+            // but its stack reference would dangle after the thread is
+            // freed. Marking the value here ensures it survives GC.
+            // cell.get(self) reads the current stack value for open cells.
+            try self.gcMarkValue(cell.get(self));
             return;
         }
         // Closed upvalue: mark content inline (PUC-faithful).
@@ -20286,6 +20327,19 @@ pub const Vm = struct {
                 }
                 self.freeThreadWrapBuffers(th);
                 self.freeThreadBytecodeFrames(th);
+                // PUC luaE_freethread (lstate.c:301): luaF_closeupval(L1,
+                // L1->stack.p) — close ALL open upvalues before freeing the
+                // stack. Open upvalue cells (in th.bytecode_boxed for a parked
+                // thread) still point into th.bytecode_stack via bc_stack_idx.
+                // If a live closure references such a cell (e.g. a closure
+                // capturing a local from a now-unreachable suspended coroutine),
+                // the cell survives GC but its stack reference would dangle
+                // after freeParkedThreadRuntime frees th.bytecode_stack.
+                // Closing the cell copies the stack value into cell.value and
+                // clears bc_stack_idx, making the cell self-contained.
+                // PUC uses luaF_closeupval (not luaF_close): no __close
+                // metamethods are run — the thread is dead, no Lua code.
+                self.closeThreadOpenUpvalues(th);
                 // Only free the parked runtime if this thread isn't the
                 // currently active one (its runtime is shared with the VM).
                 if (self.active_runtime_thread != th) self.freeParkedThreadRuntime(th);

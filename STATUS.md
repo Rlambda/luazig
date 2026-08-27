@@ -1,4 +1,4 @@
-> Last updated: 2026-08-27 (P16.4d: gen GC sweepgen color, checkmajorminor, gcMakeAllOld BLACK)
+> Last updated: 2026-08-27 (P16.4e: close open upvalues on thread collection — gengc green, matrix zig_fail=0)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -3285,6 +3285,65 @@ implement missing checkmajorminor for major→minor transition.
 **Gate**: matrix 30/32 (gengc.lua zig_fail pre-existing line 90,
 big.lua both_fail pre-existing), smoke 54/54, c_api 25/25,
 zig build test 0 — no regressions.
+
+### P16.4e — Close open upvalues on thread collection (PUC luaE_freethread/luaF_closeupval)
+
+**Goal:** Fix gengc.lua:90 ("another bug in 5.4.0" upstream test) — collecting
+a suspended coroutine with open upvalues referenced by live closures caused
+use-after-free: the closure's cell kept pointing into the freed coroutine
+stack.
+
+**Root cause** (two bugs, both PUC-faithful fixes):
+1. **gcQueueScanCell did not mark open cell values**: PUC's `reallymarkobject`
+   for LUA_VUPVAL calls `markvalue(g, uv->v.p)` — it marks the upvalue's
+   content (the stack value) even for OPEN upvalues. Our `gcQueueScanCell`
+   skipped marking for open cells ("value is on the thread's stack, which is
+   scanned separately"). This is correct when the owning thread is REACHABLE
+   (its stack is scanned), but WRONG when the thread is UNREACHABLE: the
+   stack is never scanned, so the value is never marked → freed by sweep →
+   the cell's stack reference dangles after the thread is freed.
+2. **gcFreeObject(.thread) did not close open upvalues**: PUC's
+   `luaE_freethread` calls `luaF_closeupval(L1, L1->stack.p)` to close ALL
+   open upvalues before freeing the stack. Our `gcFreeObject(.thread)` freed
+   `th.bytecode_stack` via `freeParkedThreadRuntime` without closing the open
+   upvalue cells in `th.bytecode_boxed` first. Live closures referencing those
+   cells then read through dangling `bc_stack_idx` into freed/reused memory.
+
+**Fix:**
+- **gcQueueScanCell**: for open cells, now calls `gcMarkValue(cell.get(self))`
+  to mark the stack value (PUC `markvalue(g, uv->v.p)`). This ensures the
+  value is marked regardless of whether the owning thread is reachable.
+- **closeThreadOpenUpvalues** (new function): called from `gcFreeObject(.thread)`
+  before `freeParkedThreadRuntime`. Iterates `th.bytecode_boxed` and closes
+  each open cell (copies stack value into `cell.value`, clears
+  `bc_stack_idx`/`bc_stack_thread`). Mirrors PUC `luaF_closeupval` (not
+  `luaF_close` — no `__close` metamethods are run, the thread is dead).
+  Fires `gcWriteBarrierCell` for each closed cell (PUC `nw2black` + barrier).
+
+**Scope**: Both incremental and generational modes affected (same bug). The
+gen startup (P16.4c) exposed it because gengc.lua:81-104 tests this exact
+pattern (coroutine upvalue survival after thread collection under gen GC).
+
+**Pre-existing DIFF note**: `tests/c_api/17_gccontrol.c` `reached_1` diff
+(gen GC step pacing — `LUA_GCSTEP, 0` doesn't complete a cycle within 100
+iterations) is pre-existing from P16.4c (GCGEN startup enabled), not caused
+by this fix. The root cause is `gcStepBudget` using `requested_kb` (9) instead
+of PUC's `stepsize / sizeof(void*)` (1200) — a 133x difference in work budget.
+Fixing it caused regressions (gc.lua, nextvar.lua, smoke) and is deferred to
+a separate investigation.
+
+**Results:**
+- gengc.lua: FULL PASS (was failing at line 90)
+- matrix: 31/32 zig_fail=0 (was 30/32 zig_fail=1 on gengc.lua)
+- t3.lua (surgical repro): all checkpoints OK
+- Regression probes (gm_e, gencrash3, t1): all pass
+- smoke 54/54, c_api 17/17, zig build test 0, leak_bench 25/25
+
+**Gate**: matrix 31/32 (big.lua both_fail pre-existing), smoke 54/54,
+c_api 17/17 (DIFF: 17_gccontrol `reached_1` pre-existing from P16.4c),
+coroutine.lua --testc 0, zig build test 0, leak_bench 25/25 PASS.
+Perf: geomean 2.55x, no new regressions vs baseline (global_arith +20.7%
+pre-existing from P16.4 gen startup).
 
 ## История закрытых фаз
 

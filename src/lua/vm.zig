@@ -1969,6 +1969,10 @@ pub const LuaString = struct {
     gc_age: GcAge = .new,
     gc_index: usize = 0,
     gc_seq: u64 = 0,
+    /// PUC `u.hnext`: chain link inside the interned-string table bucket
+    /// (lstring.c `stringtable`). Owned by `StringTable`; null when the
+    /// string is not currently in a bucket.
+    next: ?*LuaString = null,
 
     /// External string support (PUC 5.5 `lua_pushexternalstring` / LSTRMEM).
     /// When true, the string's content is NOT stored inline after the header
@@ -2087,6 +2091,114 @@ pub fn destroyLuaString(alloc: std.mem.Allocator, ls: *LuaString) void {
 // mapping to the canonical `*LuaString`. Mirrors PUC `lstring.c` stringtable:
 // at most one entry per distinct content, so string equality becomes pointer
 // comparison.
+/// PUC `stringtable` (lstring.c): an array of bucket heads with each string
+/// linked into its bucket through `LuaString.next`. Chained storage gives
+/// O(1) removal (luaS_remove just unlinks), which is the property Zig's
+/// open-addressing HashMap lacks: its tombstones accumulate under constant
+/// alloc-intern-free churn into O(N) probe chains. With PUC-faithful
+/// generational pacing (a minor collection every MINORMUL% of the base
+/// heap) that churn is steady-state, so the chained layout is required
+/// for parity in both semantics and asymptotics.
+pub const StringTable = struct {
+    /// PUC MINSTRTABSIZE: initial bucket count (power of two).
+    const min_size: usize = 128;
+
+    buckets: []?*LuaString = &.{},
+    nuse: u32 = 0,
+
+    fn bucketOf(self: *const StringTable, hash: u64) usize {
+        // PUC lmod(h, size): power-of-two modulo (size is always a pow2).
+        return @intCast(hash & (self.buckets.len - 1));
+    }
+
+    /// PUC internshrstr lookup: walk the bucket chain comparing length and
+    /// content (lstring.c:219-229). The cached hash need not be compared —
+    /// content equality implies hash equality.
+    pub fn lookup(self: *const StringTable, raw: []const u8, hash: u64) ?*LuaString {
+        if (self.buckets.len == 0) return null;
+        var cur = self.buckets[self.bucketOf(hash)];
+        while (cur) |ls| : (cur = ls.next) {
+            if (ls.len == raw.len and std.mem.eql(u8, ls.bytes(), raw)) return ls;
+        }
+        return null;
+    }
+
+    /// PUC luaS_resize / tablerehash (lstring.c:70-113): relink every chain
+    /// into a fresh bucket array. On allocation failure the old table is
+    /// kept intact (PUC: "any non-zero size should work correctly").
+    fn resize(self: *StringTable, alloc: std.mem.Allocator, new_size: usize) std.mem.Allocator.Error!void {
+        const old = self.buckets;
+        const fresh = try alloc.alloc(?*LuaString, new_size);
+        @memset(fresh, null);
+        // PUC tablerehash: for each old bucket, walk the chain and relink each
+        // node into its new bucket. The old `next` link MUST be saved before
+        // it is overwritten (PUC: `hnext = p->u.hnext` before `p->u.hnext = vect[h]`),
+        // otherwise the loop continuation reads the just-clobbered link and
+        // silently drops every subsequent node in the old chain.
+        for (old) |head| {
+            var p = head;
+            while (p) |ls| {
+                const save_next = ls.next;
+                const b: usize = @intCast(ls.hash & (new_size - 1));
+                ls.next = fresh[b];
+                fresh[b] = ls;
+                p = save_next;
+            }
+        }
+        if (old.len != 0) alloc.free(old);
+        self.buckets = fresh;
+    }
+
+    /// PUC internshrstr insert (lstring.c:230-239): grow when the table is
+    /// full (nuse >= size, doubling like growstrtab), then push to the head
+    /// of the bucket.
+    pub fn insert(self: *StringTable, alloc: std.mem.Allocator, ls: *LuaString) std.mem.Allocator.Error!void {
+        if (self.nuse >= self.buckets.len) {
+            const target = @max(self.buckets.len * 2, min_size);
+            self.resize(alloc, target) catch return; // PUC: OOM keeps old size
+        }
+        const b = self.bucketOf(ls.hash);
+        ls.next = self.buckets[b];
+        self.buckets[b] = ls;
+        self.nuse += 1;
+    }
+
+    /// PUC luaS_remove (lstring.c:190-196): unlink from its bucket chain.
+    /// The string must currently be in the table (callers only remove at
+    /// free time, and insertion happens exactly once per live string).
+    pub fn removeString(self: *StringTable, ls: *LuaString) void {
+        if (self.buckets.len == 0) return;
+        var p: *?*LuaString = &self.buckets[self.bucketOf(ls.hash)];
+        while (p.*) |cur| : (p = &cur.next) {
+            if (cur == ls) {
+                p.* = cur.next;
+                cur.next = null;
+                self.nuse -= 1;
+                return;
+            }
+        }
+    }
+
+    /// PUC checkSizes (lgc.c:936-938): during atomic, if the table is less
+    /// than a quarter full, halve it. Keeps the bucket array proportional to
+    /// the live string population after churn episodes.
+    pub fn shrinkIfNeeded(self: *StringTable, alloc: std.mem.Allocator) void {
+        if (self.buckets.len > min_size and self.nuse < self.buckets.len / 4) {
+            self.resize(alloc, self.buckets.len / 2) catch {};
+        }
+    }
+
+    /// Free every string and the bucket array (close-time teardown).
+    pub fn deinit(self: *StringTable, alloc: std.mem.Allocator) void {
+        for (self.buckets) |head| {
+            var p = head;
+            while (p) |ls| : (p = ls.next) destroyLuaString(alloc, ls);
+        }
+        if (self.buckets.len != 0) alloc.free(self.buckets);
+        self.* = .{};
+    }
+};
+
 pub const StringIntern = struct {
     const Map = std.HashMapUnmanaged(
         []const u8,
@@ -2671,6 +2783,7 @@ pub const VmStats = struct {
     resume_allocs: u64 = 0,
 };
 
+
 pub const Vm = struct {
     const Frame = CallFrame;
 
@@ -2779,7 +2892,7 @@ pub const Vm = struct {
 
     // Content→canonical *LuaString dedup table. All `Value.String` pointers
     // come from here, so string equality reduces to pointer comparison.
-    string_intern: StringIntern = .{},
+    string_intern: StringTable = .{},
     /// Dedup cache for long string constants (> 40 bytes) loaded from
     /// bytecode constant pools. PUC Lua shares these across functions
     /// in the same chunk; we replicate that here.
@@ -4398,6 +4511,15 @@ pub const Vm = struct {
                 const oldstp = self.gc_stp;
                 self.gc_stp = 0; // allow GC to run
                 const n: i64 = if (param <= 0) 0 else param; // param carries the size_t n
+                // PUC lapi.c:1206-1208: n<=0 → n=GCdebt; setdebt(GCdebt-n)=0
+                // (force due). n>0 → setdebt(GCdebt-n) (debt -= n).
+                // Our gc_step_debt_kb fires at <=0 and decrements on alloc.
+                // n<=0 → debt := 0 (force due); n>0 → debt -= n_kb.
+                if (n <= 0) {
+                    self.gc_step_debt_kb = 0;
+                } else {
+                    self.gc_step_debt_kb -= @as(f64, @floatFromInt(n)) / 1024.0;
+                }
                 const completed = self.gcStep(n) catch false;
                 self.gc_stp = oldstp; // restore previous state
                 self.gc_running = (self.gc_stp == 0);
@@ -4405,14 +4527,34 @@ pub const Vm = struct {
             },
             6 => if (self.gc_running) 1 else 0, // LUA_GCISRUNNING: gcrunning
             7 => blk: { // LUA_GCGEN: changemode(KGC_GENMINOR); ret previous mode
-                const prev_was_inc = (self.gc_mode == .incremental);
-                if (prev_was_inc) self.gcEnterGenerational() catch {};
-                break :blk if (prev_was_inc) 8 else 7; // LUA_GCINC=8, LUA_GCGEN=7
+                // PUC lapi.c:1220: res = (g->gckind == KGC_INC) ? LUA_GCINC : LUA_GCGEN.
+                // KGC_GENMAJOR is NOT KGC_INC → returns LUA_GCGEN (7).
+                // Our gc_mode == .incremental covers both KGC_INC and KGC_GENMAJOR;
+                // gc_gen_phase == .major distinguishes KGC_GENMAJOR from KGC_INC.
+                const prev_was_pure_inc = (self.gc_mode == .incremental and self.gc_gen_phase != .major);
+                if (prev_was_pure_inc) {
+                    self.gcEnterGenerational() catch {};
+                } else if (self.gc_mode == .incremental and self.gc_gen_phase == .major) {
+                    // PUC luaC_changemode: KGC_GENMAJOR → KGC_INC (rename), then
+                    // newmode (KGC_GENMINOR) != KGC_INC → entergen.
+                    self.gc_gen_phase = .minor;
+                    self.gcEnterGenerational() catch {};
+                }
+                break :blk if (prev_was_pure_inc) 8 else 7; // LUA_GCINC=8, LUA_GCGEN=7
             },
             8 => blk: { // LUA_GCINC: changemode(KGC_INC); ret previous mode
-                const prev_was_gen = (self.gc_mode == .generational);
-                if (prev_was_gen) self.gcLeaveGenerational();
-                break :blk if (prev_was_gen) 7 else 8; // LUA_GCGEN=7, LUA_GCINC=8
+                // PUC lapi.c:1224: res = (g->gckind == KGC_INC) ? LUA_GCINC : LUA_GCGEN.
+                // KGC_GENMAJOR is NOT KGC_INC → returns LUA_GCGEN (7).
+                const prev_was_pure_inc = (self.gc_mode == .incremental and self.gc_gen_phase != .major);
+                if (!prev_was_pure_inc) {
+                    if (self.gc_mode == .generational) {
+                        self.gcLeaveGenerational();
+                    } else {
+                        // PUC luaC_changemode: KGC_GENMAJOR → KGC_INC (rename only).
+                        self.gc_gen_phase = .minor;
+                    }
+                }
+                break :blk if (prev_was_pure_inc) 8 else 7; // LUA_GCINC=8, LUA_GCGEN=7
             },
             9 => blk: { // LUA_GCPARAM: res = applyparam(gcparams[param], 100)
                 if (param < 0 or param >= 6) break :blk -1;
@@ -4993,6 +5135,7 @@ pub const Vm = struct {
         if (err_obj == .String) {
             const msg = self.protectedErrorString();
             const result = self.formatErrorWithTraceback(self.alloc, msg) catch return error.OutOfMemory;
+            defer self.alloc.free(result); // temp; internStr copies
             outs[0] = .{ .String = self.internStr(result) catch return error.OutOfMemory };
             return;
         }
@@ -5006,6 +5149,7 @@ pub const Vm = struct {
                 const msg = std.fmt.allocPrint(self.alloc, "(error object is a {s} value)", .{type_name}) catch return error.OutOfMemory;
                 defer self.alloc.free(msg);
                 const tb_result = self.formatErrorWithTraceback(self.alloc, msg) catch return error.OutOfMemory;
+                defer self.alloc.free(tb_result); // temp; internStr copies
                 outs[0] = .{ .String = self.internStr(tb_result) catch return error.OutOfMemory };
                 return;
             };
@@ -5021,6 +5165,7 @@ pub const Vm = struct {
         const msg = std.fmt.allocPrint(self.alloc, "(error object is a {s} value)", .{type_name}) catch return error.OutOfMemory;
         defer self.alloc.free(msg);
         const tb_result = self.formatErrorWithTraceback(self.alloc, msg) catch return error.OutOfMemory;
+        defer self.alloc.free(tb_result); // temp; internStr copies
         outs[0] = .{ .String = self.internStr(tb_result) catch return error.OutOfMemory };
     }
 
@@ -5642,6 +5787,12 @@ pub const Vm = struct {
             // and alloc count. `testcChargeMemory` does both.
             try self.testcChargeMemory(hsize * @sizeOf(ltable.Node));
             new_hash = try self.alloc.alloc(ltable.Node, hsize);
+            // PUC luaM_realloc_ adds the new block's bytes to totalbytes.
+            // gc_count_kb mirrors totalbytes: charge the new hash part here
+            // so gcFreeObject's full-size credit (header + array + hash)
+            // stays symmetric. Without this, every freed table with a hash
+            // part over-decrements the count (P16.4f bug B).
+        self.gcNoteAlloc(hsize * @sizeOf(ltable.Node));
             for (new_hash) |*n| n.* = .{};
             new_hash_lastfree = hsize;
         }
@@ -5688,6 +5839,9 @@ pub const Vm = struct {
         } else if (new_asize > 0) blk: {
             try self.testcChargeMemory(new_asize * @sizeOf(Value));
             const arr = try self.alloc.alloc(Value, new_asize);
+            // Charge the new array part (PUC luaM_realloc_ → totalbytes).
+            // See the hash-part charge above for the symmetry argument.
+        self.gcNoteAlloc(new_asize * @sizeOf(Value));
             const copy_len = @min(old_asize, new_asize);
             if (copy_len > 0) @memcpy(arr[0..copy_len], tbl.array[0..copy_len]);
             for (arr[copy_len..]) |*slot| slot.* = .Nil;
@@ -5698,7 +5852,12 @@ pub const Vm = struct {
         //    asize. PUC does this between `exchangehashpart` and
         //    `reinserthash`: the table now points at the new array, and the
         //    new hash will be swapped in next.
-        if (new_asize != old_asize and tbl.array.len != 0) self.alloc.free(tbl.array);
+        if (new_asize != old_asize and tbl.array.len != 0) {
+            // Credit the replaced array part back (PUC frees the old block
+            // through luaM_free_, subtracting from totalbytes).
+            self.gcNoteFree(tbl.array.len * @sizeOf(Value));
+            self.alloc.free(tbl.array);
+        }
         tbl.array = new_array;
         tbl.asize = new_asize;
 
@@ -5729,7 +5888,11 @@ pub const Vm = struct {
         }
 
         // Free old hash part (PUC `freehash` on the temporary `newt`).
-        if (old_hash.len != 0) self.alloc.free(old_hash);
+        if (old_hash.len != 0) {
+            // Credit the replaced hash part back (see array credit above).
+            self.gcNoteFree(old_hash.len * @sizeOf(ltable.Node));
+            self.alloc.free(old_hash);
+        }
 
         // Set lenhint (PUC: `*lenhint(t) = newasize / 2u`).
         tbl.lenhint = new_asize / 2;
@@ -10463,7 +10626,7 @@ pub const Vm = struct {
                 .upvalues = owned_upvalues,
             };
             try self.gcRegisterClosure(cl);
-            self.gcNoteAlloc(@sizeOf(Closure) + upvalues_in.len * @sizeOf(*Cell));
+        self.gcNoteAlloc(@sizeOf(Closure) + upvalues_in.len * @sizeOf(*Cell));
             self.testc_obj_functions += 1;
             break :blk cl;
         };
@@ -11169,7 +11332,7 @@ pub const Vm = struct {
                             // unnecessary. (Was: rawGet funnel; rawGet was
                             // 10% of the field_access profile.)
                             if (self.stats.enabled) self.stats.tbl_get_fast_str += 1; // P16.0b (constant string key)
-                            ctx.regs[a] = if (ltable.nodeLookup(env.Table.hash, key, self.hash_seed)) |node|
+            ctx.regs[a] = if (ltable.nodeLookup(env.Table.hash, key, self.hash_seed)) |node|
                                 node.value
                             else
                                 .Nil;
@@ -13457,6 +13620,14 @@ pub const Vm = struct {
                         .bc_stack_thread = th,
                     };
                     try self.gcRegisterCell(cell);
+                    // PUC luaC_newobj charges every new GC object to
+                    // totalbytes (GCdebt). This is the hottest Cell-creation
+                    // path (closure capturing a local from the current
+                    // frame); without the charge, gcFreeObject's credit at
+                    // collection time over-decrements gc_count_kb, which
+                    // collapses the count to 0 and breaks all gen-GC pacing
+                    // (P16.4f bug B, cell variant).
+                    self.gcNoteAlloc(@sizeOf(Cell));
                     ctx.boxed[uv.idx] = cell;
                     cells[i] = cell;
                     // Mark the frame as having open upvalues so that
@@ -14835,8 +15006,15 @@ pub const Vm = struct {
             total += s.len;
         }
 
-        // Build result.
+        // Build result. PUC luaV_concat fills a temporary buffer, then
+        // luaS_createlngstrobj COPIES it into the final string object and the
+        // temporary is released. The temporary must be freed on BOTH intern
+        // outcomes: a hit returns the existing canonical string (this buffer
+        // is then garbage), a miss copies the bytes into a new LuaString.
+        // Leaking it here turned accumulator-style `s = s .. x` loops into
+        // quadratic memory blowups (found via systemd-oomd kills).
         var result = try self.alloc.alloc(u8, total);
+        defer self.alloc.free(result);
         var pos: usize = 0;
         for (vals, 0..) |v, i| {
             const s = if (i < bufs.len) bufs[i] else switch (v) {
@@ -14856,7 +15034,13 @@ pub const Vm = struct {
     // per-VM RNG so the cached hash is randomized (matches PUC Lua's
     // random-seed string hashing).
     pub fn internStr(self: *Vm, raw: []const u8) std.mem.Allocator.Error!*LuaString {
-        const seed = self.rng_state[0] ^ self.rng_state[2];
+        // PUC luaS_hash uses g->seed — fixed for the state's lifetime and
+        // never mutated (math.random runs on a separate RNG). Using a live
+        // RNG word here would re-hash the same content differently after
+        // math.random/math.randomseed calls, breaking intern-table lookups
+        // for strings interned earlier. The VM-wide `hash_seed` (also used
+        // for table keys) is the stable equivalent.
+        const seed = self.hash_seed;
         var h = std.hash.Wyhash.init(seed);
         h.update(raw);
         const hash = h.final();
@@ -14865,15 +15049,20 @@ pub const Vm = struct {
         // Long strings are allocated fresh every time, matching PUC
         // luaS_createlngstrobj (not interned).
         if (raw.len <= lua_string_max_short_len) {
-            if (self.string_intern.table.get(raw)) |existing| {
-                if (self.gc_mode == .generational and self.gc_gen_phase == .minor) existing.gc_age = .old;
+            if (self.string_intern.lookup(raw, hash)) |existing| {
+                // PUC internshrstr (lstring.c:223-226): a dead-but-not-yet-
+                // swept string found in the table is resurrected (changewhite)
+                // instead of re-creating an identical copy.
+                if (gcIsDead(existing.gc_marked, self.gc_current_white)) {
+                    existing.gc_marked = self.gc_current_white & WHITEBITS;
+                }
                 return existing;
             }
             const ls = try createLuaString(self.alloc, raw, hash);
             // PUC luaC_newobj: set current=white on all new objects.
             ls.gc_marked = self.gc_current_white & WHITEBITS;
             if (self.gc_mode == .generational and self.gc_gen_phase == .minor) ls.gc_age = .old;
-            try self.string_intern.table.put(self.alloc, ls.bytes(), ls);
+            try self.string_intern.insert(self.alloc, ls);
             // Register in gc_objects (PUC allgc) so the normal per-object
             // incremental sweep handles short string collection. This is the
             // PUC-faithful approach: PUC keeps all short strings in allgc.
@@ -14918,7 +15107,13 @@ pub const Vm = struct {
         falloc: ?*const fn (?*anyopaque, ?*anyopaque, usize, usize) callconv(.c) ?*anyopaque,
         ud: ?*anyopaque,
     ) std.mem.Allocator.Error!*LuaString {
-        const seed = self.rng_state[0] ^ self.rng_state[2];
+        // PUC luaS_hash uses g->seed — fixed for the state's lifetime and
+        // never mutated (math.random runs on a separate RNG). Using a live
+        // RNG word here would re-hash the same content differently after
+        // math.random/math.randomseed calls, breaking intern-table lookups
+        // for strings interned earlier. The VM-wide `hash_seed` (also used
+        // for table keys) is the stable equivalent.
+        const seed = self.hash_seed;
         var h = std.hash.Wyhash.init(seed);
         h.update(content[0..len]);
         // PUC lstring.c:327-330: if header creation fails (OOM), the caller has
@@ -14996,7 +15191,13 @@ pub const Vm = struct {
             if (self.gc_mode == .generational and self.gc_gen_phase == .minor) existing.gc_age = .old;
             return existing;
         }
-        const seed = self.rng_state[0] ^ self.rng_state[2];
+        // PUC luaS_hash uses g->seed — fixed for the state's lifetime and
+        // never mutated (math.random runs on a separate RNG). Using a live
+        // RNG word here would re-hash the same content differently after
+        // math.random/math.randomseed calls, breaking intern-table lookups
+        // for strings interned earlier. The VM-wide `hash_seed` (also used
+        // for table keys) is the stable equivalent.
+        const seed = self.hash_seed;
         var h = std.hash.Wyhash.init(seed);
         h.update(raw);
         const ls = try createLuaString(self.alloc, raw, h.final());
@@ -16413,19 +16614,22 @@ pub const Vm = struct {
         if (self.stats.enabled) self.stats.gc_steps_manual += 1; // P16.0b
 
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
+            // PUC luaC_step (GENMINOR): youngcollection + setminordebt.
             try self.gcMinorCollection();
-            // PUC finishgencycle sets gcstate = GCSpropagate (not GCSpause),
-            // so collectgarbage("step") returns false after a minor collection.
-            // Only minor2inc transition (entering incremental sweep) can
-            // eventually lead to GCSpause, returning true.
             if (self.gc_gen_phase == .minor) {
-                // Still in minor mode — set state to propagate (not pause)
-                // so gcStep returns false, matching PUC's behavior.
+                // PUC setminordebt (lgc.c:1417): debt = applygcparam(MINORMUL,
+                // GCmajorminor). gcMinorCollection already called
+                // gcScheduleNextAutomaticCycle (which set gc_auto_threshold_kb).
+                // Set gc_step_debt_kb so condGcFromDispatch doesn't fire
+                // spuriously on every allocation (debt must be positive).
+                self.gc_step_debt_kb = self.gc_auto_threshold_kb - self.gc_count_kb;
+                // PUC finishgencycle: gcstate = GCSpropagate (not GCSpause).
                 self.gc_state = .propagate;
-                return false;
+                return self.gc_state == .pause; // false
             }
             // minor2inc transitioned to incremental sweep — fall through
-            // to return gc_state == .pause
+            // to the incremental path. gcMinorCollection already set
+            // gc_step_debt_kb for the sweep (stepsize).
         }
 
         // PUC STEPSIZE is in bytes (9600 default); gcStepBudget takes KB.
@@ -16438,6 +16642,9 @@ pub const Vm = struct {
         if (step_size <= 0) {
             // stepsize param is 0 → full cycle (PUC incstep with stepsize=0).
             try self.gcCycleFull();
+            // PUC setpause after full cycle.
+            self.gcScheduleNextAutomaticCycle();
+            self.gc_step_debt_kb = self.gc_auto_threshold_kb - self.gc_count_kb;
             return true;
         }
         if (self.gc_state == .pause) {
@@ -16446,7 +16653,16 @@ pub const Vm = struct {
             }
             try self.gcStartCycle(true);
         }
-        return self.gcAdvance(self.gcStepBudget(step_size), true);
+        const completed = try self.gcAdvance(self.gcStepBudget(step_size), true);
+        // PUC incstep (lgc.c:1724-1727): if pause → setpause; else → setdebt(stepsize).
+        if (self.gc_state == .pause) {
+            self.gcScheduleNextAutomaticCycle();
+            self.gc_step_debt_kb = self.gc_auto_threshold_kb - self.gc_count_kb;
+        } else {
+            const stepsize_kb: f64 = @as(f64, @floatFromInt(gcApplyParam(self.gcparams[5], 100))) / 1024.0;
+            self.gc_step_debt_kb = @max(stepsize_kb, 1.0);
+        }
+        return completed;
     }
 
     fn builtinCollectgarbage(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -18961,14 +19177,20 @@ pub const Vm = struct {
     /// of a kilobyte.
     fn gcScheduleNextAutomaticCycle(self: *Vm) void {
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
-            // PUC setminordebt: debt = applygcparam(MINORMUL, GCmajorminor).
-            // luazig uses threshold = count * (100 + minormul%) / 100.
+            // PUC setminordebt (lgc.c:1417): debt = applygcparam(MINORMUL,
+            // GCmajorminor). The next minor collection fires when totalbytes
+            // grows by MINORMUL% of GCmajorminor (the live bytes after the
+            // last major collection). Our gc_gen_major_base_kb is GCmajorminor.
+            // threshold = current_count + base * minormul / 100.
             const minor_mul: f64 = @floatFromInt(gcApplyParam(self.gcparams[0], 100));
-            const by_growth = self.gc_count_kb * (100.0 + minor_mul) / 100.0;
-            self.gc_auto_threshold_kb = @max(by_growth, self.gc_count_kb + 64.0);
+            const growth_kb = self.gc_gen_major_base_kb * minor_mul / 100.0;
+            self.gc_auto_threshold_kb = self.gc_count_kb + growth_kb;
             return;
         }
-        // PUC setpause: threshold = applygcparam(PAUSE, GCmarked).
+        // PUC setpause (lgc.c:1122): threshold = applygcparam(PAUSE, GCmarked).
+        // debt = threshold - gettotalbytes(g). The next incremental cycle fires
+        // when totalbytes reaches PAUSE% of GCmarked (bytes marked in the
+        // just-completed cycle).
         const pause: f64 = @floatFromInt(gcApplyParam(self.gcparams[3], 100));
         const by_pause = self.gc_count_kb * pause / 100.0;
         self.gc_auto_threshold_kb = @max(by_pause, self.gc_count_kb + 256.0);
@@ -19633,6 +19855,11 @@ pub const Vm = struct {
             try self.gcDrainGrayagain();
             try self.gcDrainGray();
         }
+
+        // PUC atomic → checkSizes (lgc.c:936-938): shrink the interned-
+        // string table when it is less than a quarter full. Without this,
+        // long churn episodes leave an oversized bucket array.
+        self.string_intern.shrinkIfNeeded(self.alloc);
     }
 
     /// Clear FINALIZEDBIT on all GC-managed objects. Called at the start of
@@ -20068,6 +20295,8 @@ pub const Vm = struct {
 
     fn gcMinorCollection(self: *Vm) DispatchError!void {
         if (self.gc_busy) return;
+
+
         self.gc_busy = true;
         self.gc_minor_cycle = true;
         defer {
@@ -20182,7 +20411,6 @@ pub const Vm = struct {
         // list pointers, calls entersweep(L) which starts sweeping allgc
         // from the beginning. We mirror this by entering sweep state
         // directly, with gc_objects_snapshot_len covering all objects.
-        self.gc_finalizer_tick_pending = false;
         // PUC youngcollection (lgc.c:1350-1379): sweep young generation FIRST,
         // then check checkminormajor. sweepgen promotes SURVIVAL→OLD1 and
         // increments addedold1, which checkminormajor uses to decide the
@@ -20275,12 +20503,9 @@ pub const Vm = struct {
             return true;
         }
 
-        // Phase 3: sweep long string literals + rehash string_intern.
+        // Phase 3: sweep long string literals. (The chained intern table
+        // needs no rehash: removals unlink in O(1) and never degrade.)
         try self.long_literals.sweep(self.alloc, self.gc_current_white);
-        // Rehash string_intern.table to clear tombstones left by per-object
-        // sweep removing dead strings. Without this, Zig's HashMapUnmanaged
-        // accumulates tombstones → probe chains degrade to O(N).
-        self.string_intern.table.rehash(@as(StringIntern.Context, .{}));
         return false;
     }
 
@@ -20357,7 +20582,8 @@ pub const Vm = struct {
                 // Short strings are in string_intern; long literals in
                 // long_literals. HashMap.remove is a no-op if not found.
                 if (s.len <= lua_string_max_short_len) {
-                    _ = self.string_intern.table.remove(s.bytes());
+                    // PUC luaS_remove: O(1) chain unlink.
+                    self.string_intern.removeString(s);
                 }
                 // External strings only own the header; regular strings own
                 // header + inline content. `destroyLuaString` handles the
@@ -30336,6 +30562,7 @@ pub const Vm = struct {
         const total = std.math.add(usize, total0, std.math.mul(usize, sep.len, sep_total) catch return self.fail("string.rep: result too large", .{})) catch return self.fail("string.rep: result too large", .{});
         if (total > 1_000_000_000) return self.fail("string.rep: result too large", .{});
         var buf = try self.alloc.alloc(u8, total);
+        defer self.alloc.free(buf); // temp copy; internStr copies into the string object
         var off: usize = 0;
         for (0..n) |i| {
             if (i != 0 and sep.len != 0) {
@@ -30787,8 +31014,9 @@ pub const Vm = struct {
         if (narray != 0 or nhash != 0) {
             try self.tableResize(t, @intCast(narray), @intCast(nhash));
         }
-        // GC pacing for testc newtable.
-        self.gcNoteAlloc(narray * 8 + nhash * 16);
+        // No extra gcNoteAlloc here: tableResize charges the array/hash
+        // parts (PUC luaM_realloc_ → totalbytes), so charging again would
+        // double-count the parts.
         outs[0] = .{ .Table = t };
     }
 
@@ -31891,7 +32119,9 @@ pub const Vm = struct {
         // Fast path: if the name is already interned (very likely — all
         // metamethod names are short and pre-interned at VM init), the
         // hashmap lookup is a single hash + probe.
-        const s = self.string_intern.table.get(name) orelse return null;
+        var h = std.hash.Wyhash.init(self.hash_seed);
+        h.update(name);
+        const s = self.string_intern.lookup(name, h.final()) orelse return null;
         for (self.tm_names, 0..) |opt, i| {
             if (opt) |ns| {
                 if (ns == s) return @enumFromInt(i);

@@ -28,25 +28,24 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 > status-блок в [README.md](README.md), генерируемый `tools/status_summary.py`
 > из JSON-отчётов линий (matrix/smoke/perf). Числа ниже — копия для удобства;
 > при расхождении приоритет у README-блока.
-
+<!-- BEGIN GENERATED SUMMARY (tools/status_summary.py) -->
 | Metric | Result |
 |--------|--------|
 | Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
+| Matrix non-pass | both_fail: big.lua |
 | Differential output (`--diff`) | **0 output_diff** |
-| Smoke tests | **54/54** pass |
-| Performance (geomean vs PUC) | **2.71x** |
+| Smoke tests (`tests/smoke/*.lua`) | **56/56** pass |
+| C API suites (`tests/c_api`) | 18 suites |
+| Performance (geomean vs PUC) | **2.29x** |
+
+Geomean замедления vs PUC Lua: **2.29x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+<!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
 IR VM полностью удалена из кодовой базы.
 
-`big.lua` — `both_fail` (pre-existing: требует `coroutine.wrap` harness из `all.lua`).
-
-## Производительность
-
-Geomean замедления vs PUC Lua: **2.71x** (цель: 1.0x; run-dependent).
-Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
-
-Архитектурные решения и находки — [DESIGN.md](DESIGN.md).
+`big.lua` — `both_fail` (pre-existing: требует `coroutine.wrap` harness из
+`all.lua`).
 
 ### Методика
 

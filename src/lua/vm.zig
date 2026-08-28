@@ -9146,18 +9146,35 @@ pub const Vm = struct {
     // `bc_stack[func_slot + 1 .. func_slot + 1 + n]` via the normal
     // OP_CALL result handling.
     fn poscallCFrame(self: *Vm, th: *Thread, n: i32) DispatchError!void {
+        _ = n; // Results are consumed via resume_inbox, not bc_stack.
         const th_bc = &th.call_frames;
         const cur_len = th_bc.len();
         if (cur_len == 0) return;
         const fr = th_bc.getPtr(cur_len - 1);
-        // Restore bc_stack_top to func_slot + n results
-        const n_usize: usize = @intCast(@max(n, 0));
-        const saved_func_slot = fr.func_slot;
         // P15.80: Free heap-allocated testc_state before shrinking.
         // Without this, the pointer is lost and the allocation leaks.
         if (fr.isC()) self.freeCFrameOwnedState(fr);
-        self.bc_stack_top = saved_func_slot + 1 + n_usize;
         th_bc.shrinkTo(cur_len - 1);
+        // PUC model: restore bc_stack_top to the caller's frame capacity,
+        // mirroring popBytecodeExecFrame (line ~10533). The C-frame's results
+        // are consumed via resume_inbox (set by finishCcall), NOT from
+        // bc_stack — so bc_stack_top must point to the caller's register
+        // limit, not to saved_func_slot + 1 + n. Without this, bc_stack_top
+        // grows by 2 per yield/resume cycle (pushBuiltinCFrame +1,
+        // poscallCFrame +1), causing unbounded bc_stack/bc_boxed growth.
+        if (th_bc.len() > 0) {
+            const caller = th_bc.getConstPtr(th_bc.len() - 1);
+            if (!caller.isC()) {
+                self.bc_stack_top = caller.base + caller.u.lua.frame_cap;
+            } else {
+                // C-frame caller: restore bc_stack_top to the C-frame's base
+                // (= func_slot + 1), matching popBytecodeExecFrame's C-frame
+                // caller path.
+                self.bc_stack_top = caller.base;
+            }
+        } else {
+            self.bc_stack_top = 0;
+        }
     }
 
     /// Discard a C-frame WITHOUT calling its continuation (k).

@@ -511,7 +511,7 @@ const GcAge = enum(u3) {
 ///   bit 3 (WHITE0BIT): object is white type 0
 ///   bit 4 (WHITE1BIT): object is white type 1
 ///   bit 5 (BLACKBIT):  object is black (fully traversed)
-///   bit 6 (FINALIZEDBIT): object marked for finalization
+///   bit 6 (FINALIZEDBIT): object is registered for finalization
 ///
 /// Color semantics (PUC lgc.h:91-94):
 ///   white = one of WHITE0BIT/WHITE1BIT set (matches currentwhite)
@@ -522,6 +522,38 @@ const GcAge = enum(u3) {
 /// is active for the current cycle. It flips at the end of each cycle
 /// (PUC lgc.c:1579). New objects are created with the current white bit
 /// (PUC lgc.c:301: `o->marked = luaC_white(g)`).
+///
+/// === PUC FINALIZEDBIT audit (lgc.c / lgc.h) ===
+///
+/// (a) What FINALIZEDBIT means in PUC:
+///   FINALIZEDBIT means "this object is registered for finalization" — it
+///   lives in the `finobj` list (or `tobefnz` after separation). It is NOT a
+///   recursive visited-bit for the finalizer-reachable graph.
+///   - SET: `luaC_checkfinalizer` (lgc.c:1088) sets it when an object with a
+///     `__gc` metamethod is moved from `allgc` to `finobj` (registration).
+///   - CLEARED: `udata2finalize` (lgc.c:953) clears it when the object is
+///     moved back from `tobefnz` to `allgc` after its finalizer runs — the
+///     object becomes "normal" again.
+///   - PRESERVED: `sweeplist` (lgc.c `maskmarks = ~(BLACKBIT|WHITEBITS)`)
+///     preserves FINALIZEDBIT during sweep, so registered objects keep it
+///     across cycles until their finalizer runs.
+///   - `separatetobefnz` (lgc.c:1023) does NOT touch FINALIZEDBIT — it only
+///     relinks objects from `finobj` to `tobefnz`.
+///
+/// (b) FINALIZEDBIT is NOT a recursive visited-bit:
+///   CONFIRMED. PUC keeps the finalizer-reachable graph alive through ORDINARY
+///   marking: `markbeingfnz` (lgc.c:388) calls `markobject` on each `tobefnz`
+///   object (ordinary gray/black mark), then `propagateall` (lgc.c:1569)
+///   drains the gray list normally. No FINALIZEDBIT is set on merely-reachable
+///   objects — only on the registered objects themselves.
+///
+/// (c) Which types can be registered for finalization in PUC 5.5:
+///   Only TABLES and USERDATA. `luaC_checkfinalizer` is called exclusively
+///   from `lua_setmetatable` (lapi.c:981,989) for LUA_TTABLE and LUA_TUSERDATA.
+///   Threads, closures, and other types go through the `default` case which
+///   sets a type-level metatable but does NOT call `luaC_checkfinalizer`.
+///   Verified empirically: a thread/closure with a type-level `__gc` metatable
+///   does NOT get its finalizer called in PUC 5.5.
 const WHITE0BIT: u8 = 1 << 3;
 const WHITE1BIT: u8 = 1 << 4;
 const BLACKBIT: u8 = 1 << 5;
@@ -1928,8 +1960,8 @@ const DebugHookState = struct {
 /// P15.78 Task 13: Continuation state for testC callk/pcallk/yieldk.
 /// Stored per-C-frame in `CFrameState.testc_state` — each chained callk
 /// gets its own C-frame with its own state, enabling "chain of suspendable
-/// C calls" (coroutine.lua:1191). GC-traced in `gcMarkThreadFinalizerReach`
-/// and `gcPropagateOne`'s `.thread` case via C-frame iteration — without
+/// C calls" (coroutine.lua:1191). GC-traced in `gcPropagateOne`'s `.thread`
+/// case via C-frame iteration — without
 /// GC tracing, the GC collects objects referenced by these slices, causing
 /// "switch on corrupt value" crashes.
 const TestcContState = struct {
@@ -2561,11 +2593,13 @@ fn gcObjectBytes(obj: GcObject) usize {
 }
 
 /// Whether this object type can have a finalizer (__gc metamethod).
-/// PUC: only tables, closures, threads, and userdata support finalization.
+/// PUC: only tables and userdata support finalization — `luaC_checkfinalizer`
+/// is called exclusively from `lua_setmetatable` (lapi.c:981,989) for
+/// LUA_TTABLE and LUA_TUSERDATA. See the FINALIZEDBIT audit above.
 fn gcCanFinalize(obj: GcObject) bool {
     return switch (obj) {
-        .table, .closure, .thread, .userdata => true,
-        .string, .cell => false,
+        .table, .userdata => true,
+        .closure, .thread, .string, .cell => false,
     };
 }
 
@@ -3105,7 +3139,6 @@ pub const Vm = struct {
     gc_fin_closures: std.AutoHashMapUnmanaged(*Closure, void) = .{},
     gc_fin_threads: std.AutoHashMapUnmanaged(*Thread, void) = .{},
     gc_to_finalize: std.ArrayListUnmanaged(GcObject) = .empty,
-    gc_fin_weak_tables: std.ArrayListUnmanaged(*Table) = .empty,
     /// Incremental sweep cursor over `gc_objects`. Walks from 0 to
     /// `gc_objects_snapshot_len` (set at cycle start in `gcStartCycle`).
     /// PUC-faithful: sweeps `allgc` in allocation order.
@@ -4449,7 +4482,6 @@ pub const Vm = struct {
         self.gc_fin_closures.deinit(self.alloc);
         self.gc_fin_threads.deinit(self.alloc);
         self.gc_to_finalize.deinit(self.alloc);
-        self.gc_fin_weak_tables.deinit(self.alloc);
         self.gc_old1.deinit(self.alloc);
         self.gc_grayagain.deinit(self.alloc);
         self.gc_gen_threads.deinit(self.alloc);
@@ -6173,9 +6205,15 @@ pub const Vm = struct {
     }
 
     /// Register an object (table or userdata) for finalization.
-    /// PUC sets FINALIZEDBIT on the object; we use a HashSet for the same
-    /// purpose. During the atomic phase, white (unreachable) objects in
-    /// this set are queued for __gc finalization.
+    /// PUC `luaC_checkfinalizer` (lgc.c:1068-1090): moves the object from
+    /// `allgc` to `finobj` and sets FINALIZEDBIT. We use a HashSet
+    /// (`finalizables`) as the non-intrusive equivalent of `finobj`, and set
+    /// FINALIZEDBIT on the object's `marked` byte as PUC does — the bit is the
+    /// fast-check for "is this object registered for finalization?" (PUC
+    /// `tofinalize(o)`, lgc.h:96), used by the sweep and weak-key pruning to
+    /// avoid a HashMap lookup on every object.
+    /// During the atomic phase, white (unreachable) objects in this set are
+    /// queued for __gc finalization.
     pub fn registerFinalizable(self: *Vm, obj: GcObject) std.mem.Allocator.Error!void {
         // PUC GCSTPCLS: when the state is closing (lua_close →
         // luaC_freeallobjects sets g->gcstp = GCSTPCLS), `luaC_checkfinalizer`
@@ -6187,6 +6225,8 @@ pub const Vm = struct {
         if (self.is_closing) return;
         if (self.finalizables.contains(obj)) return;
         try self.finalizables.put(self.alloc, obj, {});
+        // PUC luaC_checkfinalizer (lgc.c:1088): l_setbit(o->marked, FINALIZEDBIT)
+        gcPtr(obj).marked.* |= FINALIZEDBIT;
         self.gc_finalizer_epoch +%= 1;
         // Do NOT set gc_finalizer_tick_pending here. In PUC Lua, registering
         // a finalizer does not force the next GC step to run; the finalizer
@@ -19068,28 +19108,32 @@ pub const Vm = struct {
         return age == .new or age == .survival or age == .old0;
     }
 
-    /// PUC lgc.h: iscleared(o) = !isblack(o) && !tofinalize(o).
+    /// PUC lgc.h: iscleared(o) = iswhite(o) for non-strings.
     /// Used during atomic phase (before white flip) to check if a weak
-    /// value/key will be swept. An object is "cleared" if it's not black
-    /// (not marked as reachable) and not marked for finalization.
+    /// value/key will be swept. After the atomic-phase drain, all reachable
+    /// objects are black; finalizer-reachable objects are also black (resurrected
+    /// by ordinary marking, PUC markbeingfnz + propagateall). So "not black"
+    /// is equivalent to PUC's iswhite at this point. No FINALIZEDBIT check
+    /// is needed: FINALIZEDBIT means "registered for finalization" (set at
+    /// registration, cleared after finalizer runs), NOT "finalizer-reachable".
     fn gcTableDead(self: *const Vm, table: *Table) bool {
         if (self.gc_minor_cycle and !gcMinorCandidate(table.gc_age)) return false;
-        return !gcIsBlack(table.gc_marked) and (table.gc_marked & FINALIZEDBIT) == 0;
+        return !gcIsBlack(table.gc_marked);
     }
 
     fn gcClosureDead(self: *const Vm, closure: *Closure) bool {
         if (self.gc_minor_cycle and !gcMinorCandidate(closure.gc_age)) return false;
-        return !gcIsBlack(closure.gc_marked) and (closure.gc_marked & FINALIZEDBIT) == 0;
+        return !gcIsBlack(closure.gc_marked);
     }
 
     fn gcThreadDead(self: *const Vm, thread: *Thread) bool {
         if (self.gc_minor_cycle and !gcMinorCandidate(thread.gc_age)) return false;
-        return !gcIsBlack(thread.gc_marked) and (thread.gc_marked & FINALIZEDBIT) == 0;
+        return !gcIsBlack(thread.gc_marked);
     }
 
     fn gcUserdataDead(self: *const Vm, ud: *Userdata) bool {
         if (self.gc_minor_cycle and !gcMinorCandidate(ud.gc_age)) return false;
-        return !gcIsBlack(ud.gc_marked) and (ud.gc_marked & FINALIZEDBIT) == 0;
+        return !gcIsBlack(ud.gc_marked);
     }
 
     /// PUC lgc.c `reallymarkobject`: mark a Value's referent gray (or black
@@ -19273,9 +19317,11 @@ pub const Vm = struct {
     /// `long_literals`) because they are keyed by content, not appended
     /// to `gc_objects` during migration.
     fn gcMakeAllWhite(self: *Vm) void {
-        const w = self.gc_current_white & WHITEBITS;
+        // gcMakeWhite preserves FINALIZEDBIT (PUC maskmarks), so registered
+        // objects keep their finalization flag across the mode switch.
+        const w = self.gc_current_white;
         for (self.gc_objects.items) |obj| {
-            gcPtr(obj).marked.* = w;
+            gcMakeWhite(&gcPtr(obj).marked.*, w);
         }
         // Short strings are now in gc_objects (registered via gcRegisterString).
         // Only long literals remain in a separate store.
@@ -19377,7 +19423,8 @@ pub const Vm = struct {
         if (self.gc_mode != .generational) {
             // PUC fullinc: run one complete cycle (mark → atomic → sweep →
             // callfin). Finalized objects are marked black during atomic
-            // (gcMarkFinalizerReach), survive the sweep, then have __gc
+            // (ordinary marking via markbeingfnz + propagateall), survive
+            // the sweep, then have __gc
             // called. They're reset to white by sweep and will be freed in
             // the NEXT collectgarbage() call. We do NOT run a second cycle
             // here — that would free the finalized objects immediately,
@@ -19546,7 +19593,6 @@ pub const Vm = struct {
         self.gc_fin_closures.clearRetainingCapacity();
         self.gc_fin_threads.clearRetainingCapacity();
         self.gc_to_finalize.clearRetainingCapacity();
-        self.gc_fin_weak_tables.clearRetainingCapacity();
         // Reset marked KB counter for checkmajorminor (PUC GCmarked per cycle).
         self.gc_gen_marked_kb = 0;
     }
@@ -20106,18 +20152,6 @@ pub const Vm = struct {
         // and transient VM fields are not write-barriered — they must be
         // re-scanned here, exactly as PUC does in atomic().
 
-        // Clear FINALIZEDBIT from previous cycles before gcMarkFinalizerReach
-        // sets fresh bits. In full cycles the sweep clears it, but minor
-        // cycles don't sweep old objects — stale FINALIZEDBIT would prevent
-        // weak-key pruning of finalized-reachable objects.
-        // DISABLED: causes use-after-free when FINALIZEDBIT is cleared from
-        // an object that was kept alive ONLY by FINALIZEDBIT in a previous
-        // minor cycle, then swept in a subsequent minor cycle.
-        // TODO: implement targeted clear instead of O(n) sweep.
-        // if (self.gc_minor_cycle) {
-        //     self.gcClearFinalizedBit();
-        // }
-
         // PUC atomic (lgc.c:1546): linkgclist(&L->gclist, g->grayagain).
         // TEMPORARILY DISABLED for debugging
         // if (self.gc_minor_cycle) {
@@ -20166,17 +20200,35 @@ pub const Vm = struct {
         const to_finalize = try self.gcCollectFinalizables();
         defer self.alloc.free(to_finalize);
         try self.gc_to_finalize.appendSlice(self.alloc, to_finalize);
-        try self.gcMarkFinalizerReach(self.gc_to_finalize.items);
 
-        // Weak finalizable tables were collected into gc_fin_weak_tables
-        // during gcMarkFinalizerReach (folded into the traversal instead of
-        // a separate post-hoc HashSet iteration).
-        if (self.gc_fin_weak_tables.items.len > 0) {
-            try self.gcPruneWeakValues(self.gc_fin_weak_tables.items);
-            try self.gcPruneWeakKeys(self.gc_fin_weak_tables.items);
+        // PUC atomic (lgc.c:1567-1569): separatetobefnz + markbeingfnz +
+        // propagateall. Dead finalizable objects have been separated into
+        // gc_to_finalize (equivalent of tobefnz). Now mark them with ORDINARY
+        // GC marking — this is PUC's markbeingfnz (lgc.c:388: markobject on
+        // each tobefnz object) followed by propagateall (drain the gray list).
+        // The "visited" mechanism for the finalizer-reachable graph IS the
+        // ordinary GC mark: marking the to-finalize objects gray/black and
+        // draining the gray list propagates through their entire reachable
+        // graph, keeping it alive for finalization. No FINALIZEDBIT is used
+        // as a recursive visited-bit — FINALIZEDBIT only means "registered
+        // for finalization" (set at registration, cleared after finalizer runs).
+        for (self.gc_to_finalize.items) |obj| {
+            if (obj.toValue()) |v| try self.gcMarkValue(v);
         }
+        try self.gcDrainGray();
 
+        // PUC atomic (lgc.c:1570): convergeephemerons after resurrection.
+        // Newly-reached weak tables (via the ordinary marking above) are now
+        // in gc_weak_tables. Prune their dead values, then converge ephemerons
+        // and prune weak keys — matching PUC's post-resurrection ordering:
+        //   clearbyvalues(g, g->weak, origweak)  — new weak tables' dead values
+        //   clearbykeys(g, g->ephemeron)          — dead keys from all ephemerons
+        //   clearbykeys(g, g->allweak)            — dead keys from allweak
+        try self.gcPropagateEphemerons(&self.gc_weak_tables);
+        try self.gcDrainGray();
+        try self.gcPruneWeakValues(self.gc_weak_tables.items);
         try self.gcPruneWeakKeys(self.gc_weak_tables.items);
+
         try self.gcFinalizeList(self.gc_to_finalize.items);
 
         // Finalizers may publish newly allocated objects into live tables.
@@ -20195,21 +20247,6 @@ pub const Vm = struct {
         // string table when it is less than a quarter full. Without this,
         // long churn episodes leave an oversized bucket array.
         self.string_intern.shrinkIfNeeded(self.alloc);
-    }
-
-    /// Clear FINALIZEDBIT on all GC-managed objects. Called at the start of
-    /// minor-cycle atomic to prevent stale FINALIZEDBIT from the previous
-    /// cycle's gcMarkFinalizerReach from interfering with weak-key pruning.
-    /// TODO: Replace with a targeted clear-list once gc_fin_* removal is
-    /// complete; this O(n) sweep is a transitional measure.
-    /// A6: Unified `gcClearFinalizedBit`. Iterates `gc_objects` instead of
-    /// per-type lists. FINALIZEDBIT is only ever set on tables/closures/
-    /// threads (per `gcCanFinalize`), so clearing it on all objects is
-    /// harmless and uniform.
-    fn gcClearFinalizedBit(self: *Vm) void {
-        for (self.gc_objects.items) |obj| {
-            gcPtr(obj).marked.* &= ~FINALIZEDBIT;
-        }
     }
 
     fn gcAtomicPhase(self: *Vm) DispatchError!void {
@@ -20396,15 +20433,13 @@ pub const Vm = struct {
     ///
     /// Liveness check (PUC `isdead` + `testbit(FINALIZEDBIT)`):
     ///   alive = !gcIsDead(marked, current_white)   // marked this cycle
-    ///        or (marked & FINALIZEDBIT) != 0        // pending finalization
+    ///        or (marked & FINALIZEDBIT) != 0        // registered for finalization
     ///        or age == .old0                        // forward-barrier promoted
     ///
-    /// The `finalizables.contains(table)` check from the old per-type
-    /// `gcSweepYoungTables` is intentionally dropped: A5's `gcSweepOne`
-    /// (incremental major sweep) already relies solely on FINALIZEDBIT,
-    /// and the minor sweep must be consistent with it. FINALIZEDBIT is
-    /// set by `gcMarkFinalizerReach` for any object reachable from a
-    /// finalizer, which subsumes the `finalizables` set's purpose.
+    /// FINALIZEDBIT is set at registration time (registerFinalizable, mirroring
+    /// PUC luaC_checkfinalizer lgc.c:1088) and preserved across sweeps (PUC
+    /// maskmarks). It is the fast-check for "registered for finalization"
+    /// (PUC tofinalize(o)), NOT a recursive visited-bit for finalizer-reach.
     ///
     /// `gcFreeObject` (A2/A5) dispatches per-type teardown uniformly;
     /// `gcUnregisterObject` removes from `gc_objects` via `gc_index`.
@@ -20431,8 +20466,9 @@ pub const Vm = struct {
             }
             // PUC sweepgen: only G_NEW objects are reset to white + promoted
             // to G_SURVIVAL. All other survivors keep their color (BLACK).
+            // gcMakeWhite preserves FINALIZEDBIT (PUC maskmarks).
             if (p.age.* == .new) {
-                p.marked.* = self.gc_current_white & WHITEBITS;
+                gcMakeWhite(&p.marked.*, self.gc_current_white);
             }
             if (try self.gcPromoteYoungObject(obj)) {
                 self.gc_young_objects.items[write] = obj;
@@ -20444,7 +20480,7 @@ pub const Vm = struct {
         // so the next cycle starts with a clean white slate, then keep
         // them in the young list (they haven't been age-promoted yet).
         for (self.gc_young_objects.items[snapshot..]) |obj| {
-            gcPtr(obj).marked.* = self.gc_current_white & WHITEBITS;
+            gcMakeWhite(&gcPtr(obj).marked.*, self.gc_current_white);
             self.gc_young_objects.items[write] = obj;
             write += 1;
         }
@@ -20787,11 +20823,14 @@ pub const Vm = struct {
             const p = gcPtr(obj);
             // PUC isdead: object has the OTHER white bit (created in a
             // previous cycle, never marked in this one).
-            // FINALIZEDBIT prevents sweeping — objects pending finalization
-            // are kept alive until finalizers run and reset the bit.
+            // FINALIZEDBIT prevents sweeping — objects registered for
+            // finalization (PUC tofinalize(o), lgc.h:96) are kept alive
+            // until their finalizer runs and clears the bit (udata2finalize,
+            // lgc.c:953). This is the fast-check equivalent of PUC keeping
+            // finobj/tobefnz objects in separate lists that the sweep never
+            // touches.
             const is_dead = gcIsDead(p.marked.*, self.gc_current_white) and
                 (p.marked.* & FINALIZEDBIT) == 0;
-            // Only tables can have finalizers (__gc metamethod) in practice.
             // `gcCanFinalize` is the type-level check; `gcHasFinalizer` is
             // the instance-level check (registered in `finalizables` set).
             const has_finalizer = gcCanFinalize(obj) and self.gcHasFinalizer(obj);
@@ -20806,8 +20845,11 @@ pub const Vm = struct {
             } else {
                 // Object is alive (or has a finalizer to run) — reset its
                 // mark to the current white for the next cycle.
-                // PUC sweeplist: `makewhite(g, o)` clears color + finalized bits.
-                p.marked.* = self.gc_current_white & WHITEBITS;
+                // PUC sweeplist (lgc.c): `curr->marked = (marked & maskmarks) | white`
+                // where maskmarks = ~(BLACKBIT|WHITEBITS) preserves FINALIZEDBIT.
+                // gcMakeWhite does the same: clears color bits, preserves
+                // FINALIZEDBIT, sets current white.
+                gcMakeWhite(&p.marked.*, self.gc_current_white);
                 self.gc_sweep_objects_cursor += 1;
             }
             return true;
@@ -20819,7 +20861,7 @@ pub const Vm = struct {
         // appended to `allgc` during sweep the same way.
         if (self.gc_sweep_objects_cursor < self.gc_objects.items.len) {
             const obj = self.gc_objects.items[self.gc_sweep_objects_cursor];
-            gcPtr(obj).marked.* = self.gc_current_white & WHITEBITS;
+            gcMakeWhite(&gcPtr(obj).marked.*, self.gc_current_white);
             self.gc_sweep_objects_cursor += 1;
             return true;
         }
@@ -20928,10 +20970,11 @@ pub const Vm = struct {
     }
 
     /// Check if an object has a registered finalizer (__gc metamethod).
-    /// Currently only tables can have finalizers (the `finalizables` set).
-    /// Closures and threads support finalization in PUC but are not yet
-    /// wired to the `finalizables` set — they return `false` here, matching
-    /// the old per-type sweep behavior.
+    /// PUC: only tables and userdata can be registered for finalization
+    /// (via lua_setmetatable → luaC_checkfinalizer, lapi.c:981,989).
+    /// The `finalizables` set is the non-intrusive equivalent of PUC's
+    /// `finobj` list. FINALIZEDBIT on the object mirrors PUC's
+    /// `tofinalize(o)` (lgc.h:96) as a fast-check.
     fn gcHasFinalizer(self: *Vm, obj: GcObject) bool {
         return self.finalizables.contains(obj);
     }
@@ -21654,11 +21697,12 @@ pub const Vm = struct {
             const mode = self.gcWeakMode(tbl);
             if (!mode.weak_v) continue;
             // PUC iscleared (lgc.c:223): a value is cleared if it is white
-            // (unmarked). For table/closure/thread, we use gc*Dead which
-            // also checks age in minor cycles (though weak pruning only
-            // runs in full cycles). For userdata, gcIsWhite matches PUC
-            // iscleared exactly. No FINALIZEDBIT check for values — only
-            // keys can be kept alive by finalization.
+            // (unmarked). gc*Dead checks !gcIsBlack, which is equivalent to
+            // PUC's iswhite at this point (after atomic-phase drain, all
+            // reachable objects are black). No FINALIZEDBIT check for values
+            // — PUC clears weak values BEFORE resurrection (clearbyvalues,
+            // lgc.c:1564), so dead finalizable objects are cleared from weak
+            // values even though they'll be resurrected moments later.
 
             // Array part: clear entries whose value is white (unmarked).
             for (tbl.array, 0..) |v, i| {
@@ -21700,36 +21744,17 @@ pub const Vm = struct {
             for (tbl.hash) |*node| {
                 if (node.key_tt == .empty or node.key_tt == .dead) continue;
                 if (node.value == .Nil) continue;
-                // Drop entries whose collectable key is no longer reachable
-                // (dead AND not pending finalization). FINALIZEDBIT on the
-                // key object means it is reachable from a to-be-finalized
-                // object and must survive this cycle.
-                // For table/closure/thread, we use gc*Dead (checks OTHER
-                // white bit + age). For userdata, we use gcIsWhite (checks
-                // ANY white bit, matching PUC iscleared) because userdata
-                // created in the current cycle with the current white bit
-                // should be pruned from weak tables if unmarked.
+                // PUC clearbykeys (lgc.c:1573-1574): drop entries whose
+                // collectable key is dead (not marked). After resurrection
+                // (markbeingfnz + propagateall), finalizer-reachable objects
+                // are BLACK, so gc*Dead returns false for them — they survive
+                // as weak keys. No FINALIZEDBIT check is needed: FINALIZEDBIT
+                // means "registered for finalization", not "finalizer-reachable".
                 const drop = switch (node.key_tt) {
-                    .table => blk: {
-                        const t = node.key_val.table;
-                        break :blk self.gcTableDead(t) and
-                            (t.gc_marked & FINALIZEDBIT) == 0;
-                    },
-                    .closure => blk: {
-                        const cl = node.key_val.closure;
-                        break :blk self.gcClosureDead(cl) and
-                            (cl.gc_marked & FINALIZEDBIT) == 0;
-                    },
-                    .thread => blk: {
-                        const th = node.key_val.thread;
-                        break :blk self.gcThreadDead(th) and
-                            (th.gc_marked & FINALIZEDBIT) == 0;
-                    },
-                    .userdata => blk: {
-                        const ud = node.key_val.userdata;
-                        break :blk self.gcUserdataDead(ud) and
-                            (ud.gc_marked & FINALIZEDBIT) == 0;
-                    },
+                    .table => self.gcTableDead(node.key_val.table),
+                    .closure => self.gcClosureDead(node.key_val.closure),
+                    .thread => self.gcThreadDead(node.key_val.thread),
+                    .userdata => self.gcUserdataDead(node.key_val.userdata),
                     else => false,
                 };
                 if (drop) node.value = .Nil;
@@ -21738,213 +21763,28 @@ pub const Vm = struct {
     }
 
     fn gcCollectFinalizables(self: *Vm) DispatchError![]GcObject {
+        // PUC separatetobefnz (lgc.c:1023): move dead (white) finalizable
+        // objects from finobj to tobefnz. We iterate the finalizables set
+        // (our finobj equivalent) and collect white (unreachable) objects
+        // into the result (our tobefnz equivalent).
+        // FINALIZEDBIT is set on ALL registered objects (at registration time,
+        // mirroring PUC luaC_checkfinalizer lgc.c:1088). It does NOT mean
+        // "already queued" — it means "registered for finalization". The
+        // white check is the sole liveness criterion, exactly as PUC's
+        // separatetobefnz uses iswhite(curr).
         var to_finalize = std.ArrayListUnmanaged(GcObject).empty;
         var it = self.finalizables.iterator();
         while (it.next()) |entry| {
             const obj = entry.key_ptr.*;
             const p = gcPtr(obj);
             if (self.gc_minor_cycle and !gcMinorCandidate(p.age.*)) continue;
-            // PUC finalize: skip objects already finalized (FINALIZEDBIT set).
-            // They will be swept in the sweep phase instead.
-            if ((p.marked.* & FINALIZEDBIT) != 0) continue;
             // After atomic-phase drain, all reachable objects are black.
             // A white object here is unreachable — queue it for __gc.
             if (gcIsWhite(p.marked.*)) {
-
                 try to_finalize.append(self.alloc, obj);
             }
         }
         return to_finalize.toOwnedSlice(self.alloc);
-    }
-
-    fn gcMarkFinalizerReach(
-        self: *Vm,
-        objs: []const GcObject,
-    ) DispatchError!void {
-        for (objs) |obj| {
-            if (obj.toValue()) |v| {
-                try self.gcMarkValueFinalizerReach(v);
-            }
-        }
-    }
-
-    fn gcMarkValueFinalizerReach(self: *Vm, v: Value) DispatchError!void {
-        switch (v) {
-            .Table => |t| try self.gcMarkTableFinalizerReach(t),
-            .Userdata => |ud| {
-                // PUC markfinalizer: mark the userdata black (keep it alive
-                // for finalization) and set FINALIZEDBIT. The bit serves as
-                // the visited-flag for finalizer-reach marking (preventing
-                // infinite recursion) and tells gcPruneWeakKeys that this
-                // key is pending finalization (must survive this cycle).
-                if ((ud.gc_marked & FINALIZEDBIT) != 0) return;
-                ud.gc_marked |= FINALIZEDBIT;
-                if (gcIsWhite(ud.gc_marked)) {
-                    gcSetBlack(&ud.gc_marked);
-                    self.gc_mark_epoch += 1;
-                }
-                // Also mark the metatable so __gc is reachable.
-                if (ud.metatable) |mt| try self.gcMarkValueFinalizerReach(.{ .Table = mt });
-                // Mark uservalues so they survive until __gc runs.
-                for (ud.uservalues) |uv| try self.gcMarkValueFinalizerReach(uv);
-            },
-            .Closure => |cl| try self.gcMarkClosureFinalizerReach(cl),
-            .Thread => |th| try self.gcMarkThreadFinalizerReach(th),
-            .String => |str| if (gcIsWhite(str.gc_marked)) {
-                gcSetBlack(&str.gc_marked);
-                self.gc_mark_epoch += 1;
-            },
-            else => {},
-        }
-    }
-
-    fn gcMarkClosureFinalizerReach(self: *Vm, cl: *Closure) DispatchError!void {
-        // FINALIZEDBIT serves as the visited-flag for finalizer-reach marking,
-        // exactly as PUC uses `testbit(o, FINALIZEDBIT)` in markfinalizer.
-        if ((cl.gc_marked & FINALIZEDBIT) != 0) return;
-        // Debug: check if closure is valid
-        if (cl.gc_index >= self.gc_objects.items.len or
-            self.gc_objects.items[cl.gc_index] != .closure or
-            self.gc_objects.items[cl.gc_index].closure != cl)
-        {
-            return;
-        }
-        cl.gc_marked |= FINALIZEDBIT;
-        // PUC markfinalizer: mark the object black (keep it alive for
-        // finalization). Without this, the closure stays white and is
-        // swept (freed) — causing use-after-free when its upvalues are
-        // later traversed by another finalizable object.
-        if (gcIsWhite(cl.gc_marked)) {
-            gcSetBlack(&cl.gc_marked);
-            self.gc_mark_epoch += 1;
-        }
-        for (cl.upvalues) |cell| {
-            // PUC markfinalizer: mark upvalue cells and their values as
-            // finalizer-reachable. Open upvalues kept gray (PUC model).
-            // PUC reallymarkobject: open upvalues set GRAY, value marked
-            // inline, NOT added to grayagain. Closed upvalues set BLACK,
-            // value marked inline.
-            if (gcIsWhite(cell.gc_marked)) {
-                if (cell.isOpen()) {
-                    gcSetGray(&cell.gc_marked);
-                    // Open upvalue: value is on the thread's stack, scanned
-                    // separately by remarkupvals. Don't mark here.
-                    continue;
-                } else {
-                    gcSetBlack(&cell.gc_marked);
-                }
-            }
-            try self.gcMarkValueFinalizerReach(cell.value);
-        }
-    }
-
-    fn gcMarkThreadFinalizerReach(self: *Vm, th: *Thread) DispatchError!void {
-        if ((th.gc_marked & FINALIZEDBIT) != 0) return;
-        th.gc_marked |= FINALIZEDBIT;
-        // PUC markfinalizer: mark the object black (keep it alive).
-        if (gcIsWhite(th.gc_marked)) {
-            gcSetBlack(&th.gc_marked);
-            self.gc_mark_epoch += 1;
-        }
-        try self.gcMarkValueFinalizerReach(th.callee);
-        if (th.yielded.slice()) |ys| {
-            for (ys) |yv| {
-                try self.gcMarkValueFinalizerReach(yv);
-            }
-        }
-        for (th.wrap_yields.items) |item| {
-            for (item.values) |yv| {
-                try self.gcMarkValueFinalizerReach(yv);
-            }
-        }
-        if (th.wrap_final_values) |vals| {
-            for (vals) |yv| {
-                try self.gcMarkValueFinalizerReach(yv);
-            }
-        }
-        if (th.wrap_repeat_closure) |cl| {
-            try self.gcMarkValueFinalizerReach(.{ .Closure = cl });
-        }
-        if (th.dofile_entry_closure) |cl| {
-            try self.gcMarkValueFinalizerReach(.{ .Closure = cl });
-        }
-        if (th.resume_inbox.slice()) |vals| {
-            for (vals) |yv| {
-                try self.gcMarkValueFinalizerReach(yv);
-            }
-        }
-        if (th.tail_resume_inbox) |vals| {
-            for (vals) |yv| {
-                try self.gcMarkValueFinalizerReach(yv);
-            }
-        }
-        // P15.78 Task 13: Trace per-C-frame testc_state — without this, the
-        // GC collects objects referenced by the continuation's stack_prefix,
-        // upvalues, closers, upenv, state, and first_arg, causing
-        // "switch on corrupt value" crashes during GC mark phase.
-        for (0..th.call_frames.len()) |i| {
-            const fr = th.call_frames.getConstPtr(i);
-            if (!fr.isC()) continue;
-            if (fr.u.c.testc_state) |tcs| {
-                for (tcs.stack_prefix) |v| try self.gcMarkValueFinalizerReach(v);
-                if (tcs.upvalues) |vals| for (vals) |v| try self.gcMarkValueFinalizerReach(v);
-                if (tcs.closers) |vals| for (vals) |v| try self.gcMarkValueFinalizerReach(v);
-                try self.gcMarkValueFinalizerReach(tcs.upenv);
-                if (tcs.state) |t| try self.gcMarkValueFinalizerReach(.{ .Table = t });
-                if (tcs.first_arg) |v| try self.gcMarkValueFinalizerReach(v);
-                // P15.78: close_err and close_return_values must survive GC
-                // while the C-frame is suspended across yield.
-                if (tcs.close_err) |v| try self.gcMarkValueFinalizerReach(v);
-                if (tcs.close_return_values) |vals| for (vals) |v| try self.gcMarkValueFinalizerReach(v);
-            }
-        }
-    }
-
-    fn gcMarkTableFinalizerReach(self: *Vm, tbl: *Table) DispatchError!void {
-        if ((tbl.gc_marked & FINALIZEDBIT) != 0) return;
-        tbl.gc_marked |= FINALIZEDBIT;
-        // PUC markfinalizer: mark the object black (keep it alive).
-        if (gcIsWhite(tbl.gc_marked)) {
-            gcSetBlack(&tbl.gc_marked);
-            self.gc_mark_epoch += 1;
-        }
-
-        // Collect weak tables encountered during finalizer-reach traversal.
-        // Previously done by iterating the gc_fin_tables HashSet afterwards;
-        // now folded into the traversal to avoid the external side-table.
-        const mode = self.gcWeakMode(tbl);
-        if (mode.weak_k or mode.weak_v) {
-            var seen = false;
-            for (self.gc_fin_weak_tables.items) |t| {
-                if (t == tbl) {
-                    seen = true;
-                    break;
-                }
-            }
-            if (!seen) try self.gc_fin_weak_tables.append(self.alloc, tbl);
-        }
-
-        if (tbl.metatable) |mt| try self.gcMarkValueFinalizerReach(.{ .Table = mt });
-
-        if (!mode.weak_v) {
-            for (tbl.array) |vv| try self.gcMarkValueFinalizerReach(vv);
-        }
-
-        // Unified hash part: walk every live node. Same shape as gcMarkValue's
-        // hash traversal — mark key (unless weak-k) and value (unless weak-v
-        // and weak-k together, which makes the value an ephemeron).
-        for (tbl.hash) |*node| {
-            if (node.key_tt == .empty or node.key_tt == .dead) continue;
-            if (node.value == .Nil) continue; // tombstone
-            const k = node.getKey();
-            const vv = node.value;
-            if (!mode.weak_k) {
-                try self.gcMarkValueFinalizerReach(k);
-            }
-            if (!mode.weak_v and !mode.weak_k) {
-                try self.gcMarkValueFinalizerReach(vv);
-            }
-        }
     }
 
     fn gcFinalizeList(self: *Vm, to_finalize: []const GcObject) DispatchError!void {

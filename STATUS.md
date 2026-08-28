@@ -47,6 +47,8 @@ IR VM полностью удалена из кодовой базы.
 `big.lua` — `both_fail` (pre-existing: требует `coroutine.wrap` harness из
 `all.lua`).
 
+Архитектурные решения и находки — [DESIGN.md](DESIGN.md).
+
 ### Методика
 
 - PUC Lua 5.5 (vendored) vs luazig (ReleaseFast), `taskset -c 0`, медиана 7 прогонов.

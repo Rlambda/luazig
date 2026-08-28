@@ -3654,3 +3654,80 @@ Per-type GC списки → единый GcObject tagged union (PUC allgc). Ful
 ## fasttm
 
 PUC fasttm (ltm.h:63): Table.flags bitmask. __eq/__len/__gc/__mode/__index/__newindex через fasttm.
+
+## P16.4h — GC-invariants: atomic grayagain order, active-thread linkgclist proof, stale-entry lifecycle fix
+
+### Task 5 — non-minor atomic grayagain order
+**Finding:** `gcAtomicCommon` drained grayagain at TWO different positions depending on mode:
+- Minor: drained at PUC position (after remarkupvals+propagate, before ephemerons) — correct.
+- Non-minor (incremental): drained AFTER finalizers — diverged from PUC `atomic()` (lgc.c:1559-1560),
+  which drains grayagain right after remarkupvals+propagate, BEFORE convergeephemerons.
+
+This meant ephemerons were converged and weak values pruned before grayagain children were marked
+in the non-minor path — a semantic divergence from PUC.
+
+**Fix:** Restructured `gcAtomicCommon` with numbered comments mapping 1:1 to PUC `atomic()` (lgc.c:1543-1581).
+The grayagain drain (Step 6) now runs at the PUC position for BOTH modes uniformly. The post-finalizer
+drain (Step 13, luazig-specific because finalizers run during atomic, not in a separate callfin phase)
+remains non-minor only — minor cycles defer to gcCorrectGrayAgain for age promotion.
+
+### Task 6 — active-thread grayagain linkgclist
+**Finding:** PUC `atomic()` (lgc.c:1546) calls `linkgclist(&L->gclist, g->grayagain)` to re-queue the
+running thread for a second traversal during the grayagain drain. The luazig equivalent was disabled
+("TEMPORARILY DISABLED for debugging"), compensated by `gcMarkMutableRoots`.
+
+**Variant A proof (equivalence, no requeue needed):**
+1. `gcMarkMutableRoots` re-scans the active thread's live registers (`live_reg_top[pc]`) for every
+   bytecode frame — MORE precise than PUC's `traversethread` (which scans `L->stack[0..top]`).
+2. Parked threads' stacks don't change during atomic (mutator is paused).
+3. `gcRemarkUpvals` (Step 3) covers PUC's `remarkupvals`.
+4. No mutations occur between `gcMarkMutableRoots` (Step 1) and `gcDrainGrayagain` (Step 6): Steps 2-5
+   are pure collector operations. A second traversal via grayagain would be redundant.
+5. In generational mode, OLD threads are re-traversed every minor cycle via `gc_gen_threads`.
+6. Finalizer mutations (Step 12) are handled by the post-finalizer drain (Step 13) or gcCorrectGrayAgain.
+
+**Conclusion:** No gap found. The disabled requeue code has been removed. The proof is documented as a
+precise comment in `gcMarkMutableRoots` (vm.zig:19626).
+
+### Task 7 — stale grayagain entries: lifecycle fix, defensive masks removed
+**Root cause:** The defensive checks in `gcQueueScanObject` (vm.zig:19163) and `gcDrainGrayagain`
+(vm.zig:20106) skipped entries via `gc_index`-based validation. These were historical artifacts from
+when the grayagain drain was disabled/buggy, allowing entries to accumulate across cycles. The guard
+also DEREFERENCED the entry pointer to read `gc_index` metadata — not a real dangling-pointer protection.
+
+**Lifecycle proof (why stale entries are impossible with the correct drain):**
+1. `gcDrainGrayagain` saves+clears grayagain at atomic start (equivalent to PUC lgc.c:1546-1547).
+2. All saved entries are force-marked black (non-cell: unconditional `gcSetBlack`; cell: checked).
+   Black objects survive sweep.
+3. `gcCorrectGrayAgain` (after sweep) compacts grayagain, removing dead entries and advancing ages.
+4. No object is freed while it's in grayagain: sweep frees only dead (unmarked) objects, but grayagain
+   entries were all marked black in step 2.
+5. Between cycles, grayagain entries are valid (survived sweep). The next cycle's drain processes them.
+
+**Fix:** Replaced defensive runtime skips with stats-gated `std.debug.assert(false)` + debug counters
+(`gc_stale_queue_scan`, `gc_stale_grayagain` in VmStats). The asserts are default-off (only fire when
+`stats.enabled` is set via `--stats`).
+
+**Audit of other GC lists:**
+- `gc_gray`: cleared by gcDrainGray + gcFinishCycle. Always drained to empty during atomic. Safe.
+- `gc_young_objects`: compacted by gcSweepYoungObjects (write-pointer). Dead objects removed. Safe.
+- `gc_old1`: compacted by gcCorrectOld1. Only contains OLD1/OLD0 objects (not freed by young sweep). Safe.
+- `gc_gen_threads`: rebuilt by gcMakeAllOld from gc_objects (all valid). Safe.
+- `gc_weak_tables`, `gc_marked_*`, `gc_fin_*`, `gc_to_finalize`: cleared by gcResetCycleState. Safe.
+
+**Counter results (full suite, stats enabled):** 0 stale hits across all 16 upstream suites + 57 smoke
+tests + C API tests. The asserts never fire.
+
+### Gate results
+| Gate | Result |
+|------|--------|
+| `zig build test` (Debug) | PASS |
+| `zig build -Doptimize=ReleaseFast` | PASS |
+| `make -C tests/c_api clean test test-diff` | PASS |
+| `matrix --testc` | 31/32 pass (big.lua both_fail, pre-existing) |
+| Smoke 57/57 | PASS |
+| nextvar 5x | 5/5 exit=0 |
+| coroutine/gengc/gc/closure/events/errors/files 5x each | all exit=0 |
+| leak_bench | PASS (all within 1.0 KB) |
+| `@sizeOf(CallFrame) <= 104` | PASS (assert at vm.zig:1561) |
+| Stale-entry counters (full suite, stats enabled) | 0 hits |

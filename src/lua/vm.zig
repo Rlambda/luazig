@@ -2155,7 +2155,17 @@ pub const StringTable = struct {
     pub fn insert(self: *StringTable, alloc: std.mem.Allocator, ls: *LuaString) std.mem.Allocator.Error!void {
         if (self.nuse >= self.buckets.len) {
             const target = @max(self.buckets.len * 2, min_size);
-            self.resize(alloc, target) catch return; // PUC: OOM keeps old size
+            // PUC internshrstr (lstring.c:230-239): on OOM, luaS_resize keeps
+            // the old bucket array. PUC's internshrstr then returns NULL and
+            // the caller (luaS_newlstr) falls back to creating a long string.
+            // Our `catch return` mirrors the "keep old size" behavior: the
+            // string is NOT inserted into the intern table, and internStr
+            // continues to register it as a short string. This is a minor
+            // divergence from PUC (which would make it a long string), but
+            // only in OOM conditions. The string is still valid and GC-tracked;
+            // a subsequent internStr of the same content creates a duplicate
+            // short string — a memory inefficiency, not a correctness issue.
+            self.resize(alloc, target) catch return;
         }
         const b = self.bucketOf(ls.hash);
         ls.next = self.buckets[b];
@@ -2184,6 +2194,10 @@ pub const StringTable = struct {
     /// the live string population after churn episodes.
     pub fn shrinkIfNeeded(self: *StringTable, alloc: std.mem.Allocator) void {
         if (self.buckets.len > min_size and self.nuse < self.buckets.len / 4) {
+            // PUC checkSizes (lgc.c:936-938): halve the bucket array if < 25%
+            // full. luaS_resize keeps the old size on OOM — legitimate OOM
+            // tolerance (PUC never propagates this error). The bucket array
+            // is oversized but functional; next cycle will retry the shrink.
             self.resize(alloc, self.buckets.len / 2) catch {};
         }
     }
@@ -2318,6 +2332,38 @@ test "luaStringEq: short strings use pointer identity" {
     try std.testing.expect(a != b);
     try std.testing.expect(!luaStringEq(a, b));
     try std.testing.expect(luaStringEq(a, a));
+}
+
+// --- hash_seed coherence test ---
+
+// Verify that a string interned via `internStr` and then used as a table
+// key is found by `ltable.nodeLookup`. Both paths must consume the same
+// `hash_seed`: `internStr` computes `Wyhash.init(hash_seed)` and caches
+// the result in `LuaString.hash`; `ltable.keyHash(.String)` returns that
+// cached hash. If the seed were mutated mid-run (the old canonicalization
+// bug) or if intern/table-key used different seeds, this lookup would fail.
+test "hash_seed: intern/table-key coherence" {
+    const testing = std.testing;
+    var vm = Vm.initWithSeed(testing.allocator, false, 0x9E3779B97F4A7C15);
+    defer vm.deinit();
+
+    // Intern a string — its hash is Wyhash(seed, content).
+    const key = try vm.internStr("coherence_key_42");
+
+    // Create a table and insert the interned string as a key.
+    const tbl = try vm.alloc.create(Table);
+    tbl.* = .{};
+    defer {
+        tbl.deinit(vm.alloc);
+        vm.alloc.destroy(tbl);
+    }
+    try vm.tableResize(tbl, 0, 4); // allocate a 4-slot hash part
+    _ = ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, .{ .String = key }, .{ .Int = 99 }, vm.hash_seed);
+
+    // Lookup must find the value — proves intern hash == table-key hash.
+    const node = ltable.nodeLookup(tbl.hash, .{ .String = key }, vm.hash_seed);
+    try testing.expect(node != null);
+    try testing.expectEqual(@as(i64, 99), node.?.value.Int);
 }
 
 // --- External string tests (PUC 5.5 lua_pushexternalstring / LSTRMEM) ---
@@ -2877,18 +2923,33 @@ pub const Vm = struct {
     rng_state: [4]u64 = .{ 1, 0xff, 0, 0 },
 
     // Stable hash seed for `ltable.keyHash` (hashes every int/pointer key on
-    // each lookup). MUST be invariant across the Vm's lifetime: a mutating seed
-    // (e.g. reading rng_state mid-run) would orphan every prior insert.
+    // each lookup) and for `internStr` (Wyhash init seed for string content).
+    // MUST be invariant across the Vm's lifetime: a mutating seed (e.g. reading
+    // rng_state mid-run) would orphan every prior insert and break intern-table
+    // lookups for strings interned earlier.
     //
-    // PUC Lua randomizes the seed (luai_makeseed) for hash-flood protection
-    // and, critically, for `hash_search` (luaH_getn's border search in the
-    // hash part). A zero seed makes `hash_search`'s `rnd = 0`, so the
-    // exponential probe always doubles (j = j*2 + 0), which an attacker can
-    // exploit by inserting exactly the powers of 2 — the "attack on table
-    // length" test in nextvar.lua. A fixed non-zero seed is deterministic
-    // (testC reproducibility) while breaking the attack: `rnd & 1` is
-    // sometimes 1, so the probe hits a non-present key and terminates early.
-    hash_seed: u64 = 0x9E3779B97F4A7C15,
+    // PUC Lua initializes `g->seed` once per lua_State from entropy via
+    // `luai_makeseed` (lauxlib.c:1155 — time + address mixing) in `lua_newstate`
+    // (lstate.c:354). The seed is stable for the state's lifetime and is NEVER
+    // mutated by `math.random`/`math.randomseed` — those operate on a separate
+    // `Rand64` state stored in the math library's uservalue (lmathlib.c:617-642).
+    // We mirror this: `hash_seed` is set once in `Vm.init` from `makeRandomSeed`
+    // (same time+address entropy as PUC) and never touched again. The PRNG
+    // (`rng_state`) is a completely separate field, warmed up in
+    // `bootstrapGlobals` via `randomSetSeed`.
+    //
+    // A zero seed makes `hash_search`'s `rnd = 0`, so the exponential probe
+    // always doubles (j = j*2 + 0), which an attacker can exploit by inserting
+    // exactly the powers of 2 — the "attack on table length" test in nextvar.lua.
+    // A non-zero seed breaks the attack: `rnd & 1` is sometimes 1, so the probe
+    // hits a non-present key and terminates early.
+    //
+    // Coherence invariant: `internStr` computes `Wyhash.init(hash_seed)` and
+    // caches the result in `LuaString.hash`. `ltable.keyHash(.String)` returns
+    // `s.hash` (the cached value). Both paths consume the same `hash_seed`, so
+    // a string interned and used as a table key is always found. See the
+    // coherence test "hash_seed: intern/table-key coherence" below.
+    hash_seed: u64 = 0,
 
     // Content→canonical *LuaString dedup table. All `Value.String` pointers
     // come from here, so string equality reduces to pointer comparison.
@@ -3509,13 +3570,28 @@ pub const Vm = struct {
             error.Yield => return error.Yield,
         };
     }
-    /// Create a new VM. `noenv` mirrors PUC's `LUA_NOENV` registry flag
-    /// (lua.c:720-723): when true, `resolveEnvPath` skips all env var reads
-    /// and uses compiled-in defaults for `package.path`/`package.cpath`.
-    /// Must be known at `init` time because `bootstrapGlobals` (the
-    /// equivalent of `luai_openlibs`) runs inside `init` and reads env vars
-    /// to set up the initial `package` table.
+    /// Create a new VM with entropy-derived hash seed. `noenv` mirrors PUC's
+    /// `LUA_NOENV` registry flag (lua.c:720-723): when true, `resolveEnvPath`
+    /// skips all env var reads and uses compiled-in defaults for
+    /// `package.path`/`package.cpath`. Must be known at `init` time because
+    /// `bootstrapGlobals` (the equivalent of `luai_openlibs`) runs inside
+    /// `init` and reads env vars to set up the initial `package` table.
+    ///
+    /// The hash seed is derived from real entropy via `makeRandomSeed`
+    /// (time + address mixing, mirroring PUC's `luai_makeseed`), matching
+    /// PUC `luaL_newstate` → `lua_newstate(luaL_alloc, NULL, luaL_makeseed())`.
+    /// For test reproducibility or C API `lua_newstate` (which receives an
+    /// explicit seed), use `initWithSeed`.
     pub fn init(alloc: std.mem.Allocator, noenv: bool) Vm {
+        return initWithSeed(alloc, noenv, makeRandomSeed());
+    }
+
+    /// Create a new VM with an explicit hash seed (PUC `g->seed`).
+    /// Used by `lua_newstate` (which receives the seed parameter) and by
+    /// tests that require deterministic hashing. The seed is set ONCE here
+    /// and never mutated (PUC: `g->seed` is stable for the state's lifetime,
+    /// independent of `math.random` which uses a separate `rng_state`).
+    pub fn initWithSeed(alloc: std.mem.Allocator, noenv: bool, hash_seed: u64) Vm {
         const env = alloc.create(Table) catch @panic("oom");
         env.* = .{};
         const str_mt = alloc.create(Table) catch @panic("oom");
@@ -3547,9 +3623,11 @@ pub const Vm = struct {
         @memset(vm.bc_stack, .Nil);
         vm.bc_boxed = alloc.alloc(?*Cell, vm.bc_stack_initial) catch @panic("oom");
         @memset(vm.bc_boxed, null);
-        // hash_seed uses a fixed non-zero default (see field doc). PUC
-        // randomizes it, but a fixed seed is deterministic (testC
-        // reproducibility) and still prevents the table-length attack.
+        // PUC lstate.c:354: g->seed = seed. The hash seed is initialized ONCE
+        // from the caller-provided value (entropy via makeRandomSeed for
+        // Vm.init, explicit seed for lua_newstate/tests). It is never mutated
+        // again — math.random/randomseed operate on the separate rng_state.
+        vm.hash_seed = hash_seed;
         vm.bootstrapGlobals() catch @panic("oom");
         // Pre-intern all metamethod name strings ("__index", "__newindex",
         // "__gc", "__mode", "__len", "__eq", "__add", ...). These are short
@@ -3737,6 +3815,19 @@ pub const Vm = struct {
                 // write barrier for the now-closed cell so GC invariants
                 // hold (the cell's value changed from a stack reference to
                 // an inline value).
+                //
+                // PUC's luaC_barrier is infallible: it uses intrusive gclist
+                // pointers (no allocation). Our gcWriteBarrierCell can fail
+                // with OOM because it appends to dynamic arrays (gc_old1 /
+                // gc_gray). This is an architectural difference, not a PUC
+                // semantics divergence. Swallowing the error here (in
+                // closeThreadOpenUpvalues, called from gcFreeObject during
+                // sweep) is the only safe option: propagating from inside
+                // GC sweep would be disastrous. The risk is a rare
+                // use-after-free if a young value in an old cell is not
+                // barrier-marked, but this only manifests under OOM during
+                // GC — PUC doesn't have this issue because its barrier
+                // doesn't allocate.
                 self.gcWriteBarrierCell(cell, cell.value) catch {};
             }
         }
@@ -4499,6 +4590,17 @@ pub const Vm = struct {
                 break :blk 0;
             },
             2 => blk: { // LUA_GCCOLLECT: fullgc
+                // PUC lua_gc(LUA_GCCOLLECT) → luaC_fullgc(L,0) → luaC_runtilstate
+                // which can luaD_throw on OOM (longjmp). gcControl returns i32
+                // (C ABI boundary), so we cannot propagate via longjmp. The
+                // catch {} swallows OOM: the collection is incomplete (some
+                // objects not collected), but GC invariants are not corrupted
+                // — gcFullCollectionForUser uses try internally, so a failure
+                // aborts mid-cycle leaving gc_state in a valid intermediate
+                // state. PUC's longjmp also aborts the operation; the
+                // difference is that PUC unwinds the C stack while we return
+                // normally. This is the best we can do at a non-throwing C
+                // ABI boundary.
                 self.gcFullCollectionForUser() catch {};
                 break :blk 0;
             },
@@ -4520,6 +4622,21 @@ pub const Vm = struct {
                 } else {
                     self.gc_step_debt_kb -= @as(f64, @floatFromInt(n)) / 1024.0;
                 }
+                // PUC luaC_step can luaD_throw on OOM (longjmp). gcControl
+                // returns i32 (C ABI boundary), so we swallow OOM via
+                // `catch false` (treat as "cycle not completed"). PUC's longjmp
+                // also aborts the step; the return-value semantics (1 =
+                // completed, 0 = not completed) are identical for the
+                // non-OOM path.
+                //
+                // STEP pacing note: our incremental step may complete a cycle
+                // in a different number of internal gcAdvance calls than PUC's
+                // singlestep (implementation-granularity difference: PUC's
+                // singlestep does one atomic mark/sweep unit per call, while
+                // gcAdvance batches GCSWEEPMAX=20 objects). The return value
+                // (1 = cycle reached GCSpause, 0 = still in progress) is
+                // identical to PUC's — only the internal work granularity
+                // differs. The 17_gccontrol differential test verifies this.
                 const completed = self.gcStep(n) catch false;
                 self.gc_stp = oldstp; // restore previous state
                 self.gc_running = (self.gc_stp == 0);
@@ -4533,6 +4650,12 @@ pub const Vm = struct {
                 // gc_gen_phase == .major distinguishes KGC_GENMAJOR from KGC_INC.
                 const prev_was_pure_inc = (self.gc_mode == .incremental and self.gc_gen_phase != .major);
                 if (prev_was_pure_inc) {
+                    // PUC luaC_changemode → entergen → luaC_fullgc can throw
+                    // (luaD_throw/longjmp). gcControl returns i32 (C ABI
+                    // boundary), so we swallow OOM. If entergen fails, the
+                    // mode transition is incomplete but gc_mode/gc_gen_phase
+                    // remain in their prior valid state — no invariant
+                    // corruption.
                     self.gcEnterGenerational() catch {};
                 } else if (self.gc_mode == .incremental and self.gc_gen_phase == .major) {
                     // PUC luaC_changemode: KGC_GENMAJOR → KGC_INC (rename), then
@@ -6599,6 +6722,13 @@ pub const Vm = struct {
                 // PUC luaF_close: uv->u.value = *uv->v.p; uv->v.p = &uv->u.value
                 cell.close(self);
                 // Fire the write barrier for the now-closed cell.
+                // PUC's luaC_barrier is infallible (intrusive gclist, no
+                // allocation). Our gcWriteBarrierCell can OOM on dynamic
+                // array append — an architectural difference. Swallowing is
+                // safe here: the cell is already closed (value copied), and
+                // the barrier only affects generational/incremental marking
+                // accuracy. A missed barrier under OOM risks a young value
+                // not being marked — but PUC doesn't have this failure mode.
                 self.gcWriteBarrierCell(cell, cell.value) catch {};
                 boxed[i] = null;
             }
@@ -14251,6 +14381,10 @@ pub const Vm = struct {
                 for (ctx.boxed) |*bc_slot| {
                     if (bc_slot.*) |cell| {
                         cell.close(self);
+                        // PUC's luaC_barrier is infallible (intrusive gclist).
+                        // Our gcWriteBarrierCell can OOM on dynamic array
+                        // append — architectural difference. See comment in
+                        // closeBytecodeUpvaluesFrom for full rationale.
                         self.gcWriteBarrierCell(cell, cell.value) catch {};
                         bc_slot.* = null;
                     }

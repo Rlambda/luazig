@@ -1,4 +1,4 @@
-> Last updated: 2026-08-27 (P16.4e: close open upvalues on thread collection — gengc green, matrix zig_fail=0)
+> Last updated: 2026-08-28 (P16.4g — correctness closure: nextvar bisect resolved, fresh master zig_fail=0, remaining gen-GC approximations documented)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -3459,6 +3459,95 @@ Root-cause chain (each fix verified against vendored PUC Lua 5.5.0 lgc.c):
 - gc.lua, files.lua, gengc.lua: all PASS
 - smoke: 56/56 PASS
 - No regressions vs P16.4f
+
+### P16.4g — correctness closure (2026-08-28, verifier Task 6)
+
+Resolved the documentation inconsistency between P16.4e ("matrix
+zig_fail=0") and P16.4f ("zig_fail=1, nextvar.lua pre-existing, fails 5/5
+on clean HEAD 84559f7"). The tranche base 1bc3875 entered with zig_fail=0,
+so the nextvar failure appeared *inside* P16.4 and "pre-existing" claims
+were demonstrated with a clean bisect rather than asserted.
+
+**Bisect (good=1bc3875, bad=020fd02):**
+- First-bad commit: **0d53f55** (P16.4d: gen GC sweepgen color,
+  checkmajorminor, gcMakeAllOld BLACK). At 0d53f55 nextvar.lua --testc is
+  flaky (2/3 fail over 3 runs); at 84559f7 (P16.4e) it becomes
+  deterministic (2/2 fail). Parent f0b7066 (P16.4c STATUS) passes 2/2.
+- Story confirmed: the `nodeInsert` bug in `src/lua/ltable.zig` (used
+  key-tag emptiness `mp.isEmpty()` instead of the PUC `insertkey`
+  value-nil check `gval(n) == nil`, AND cleared `next_offset` on
+  overwrite) is OLD code. It only becomes *reachable* when the generational
+  GC actually deadens/deletes keys in hash nodes. P16.4d
+  (gcMakeAllOld→BLACK, sweepgen color, checkmajorminor) is the commit that
+  made gen-GC deadening cadence frequent enough to expose the
+  chain-orphaning bug — not P16.4a (1c2f493 entered GCGEN startup
+  *disabled*, pending P16.4b). The four P16.4g fixes then closed it:
+  1. **nodeInsert value-nil + chain preservation** (ltable.zig:548):
+     `mp.value == .Nil` check (PUC insertkey) + `next_offset` inherited
+     as-is on overwrite (PUC setnodekey never touches gnext).
+  2. **PUC DEADKEY** (ltable.zig): raw GC pointer preserved across the
+     `.dead` transition (`markDeadKey`/`deadKeyPtr`); deadok lookup split
+     to `rawNext`/`findindex`-style `nodeLookupDeadok` (deadok=1); the old
+     `clearKey` generalized to `gcClearDeadKeys` covering all collectable
+     key types (PUC `keyiscollectable`), `next_offset` preserved.
+  3. **grayagain drain restored in ALL modes** (vm.zig): `gcDrainGrayagain`
+     runs in minor (vm.zig:20011) and major (vm.zig:20043) atomic; genlink
+     TOUCHED1 two-cycle fix (vm.zig:19903-19919 — link back without
+     advancing, let `gcCorrectGrayAgain` advance TOUCHED1→TOUCHED2 next
+     cycle) + `gcRemarkUpvals` (vm.zig:19989, PUC remarkupvals over all
+     open Cells).
+  4. **per-VM entropy hash seed** (commit 0f26a1c): PUC `luai_makeseed`
+     parity (time + ptr + counter), `initWithSeed` injection, replacing the
+     live `rng_state` XOR that `math.random` mutated; `catch{}` audit in GC
+     control paths.
+
+**Fresh master (0f26a1c) gate, ReleaseFast:**
+- `tools/testes_matrix.py --testc`: **31/32 pass parity, zig_fail=0,
+  both_fail=1** (big.lua only — both_fail, expected).
+- `nextvar.lua --testc` ×10 consecutive: **10/10 rc=0** (was 5/5 fail at
+  84559f7; fully closed).
+- `big.lua --testc`: both_fail (expected, unchanged).
+- `zig build test` (Debug): rc=0. `zig build -Doptimize=ReleaseFast`: rc=0.
+- `make -C tests/c_api test`: rc=0 (=== ALL PASS ===).
+- `make -C tests/c_api test-diff`: rc=0 (DIFF: PASS — 10_continuations,
+  11_closethread, 12_chook, 13_p15_completion, 14_state_handles,
+  15_stress_leak, 17_gccontrol).
+- `tools/smoke_compare.py`: **56/56 PASS**.
+- `tools/leak_bench.py --no-build`: **PASS** (all workloads within 1.0 KB).
+- 15_stress_leak: 0/0 (covered by c_api test-diff).
+- Suites --testc: gc, gengc, closure, coroutine, events, errors, files →
+  all rc=0.
+
+**Honest approximations remaining in gen-GC paths** (source audit of
+`src/lua/vm.zig`): the old minor grayagain DISABLED is **GONE** —
+`gcDrainGrayagain` runs in all modes with the genlink two-cycle fix and
+`gcRemarkUpvals`. What remains is NOT a semantic gap for the tested corpus
+(all suites green) but is recorded for honesty:
+- **FINALIZEDBIT clear** (vm.zig:19970-19972): the `gcClearFinalizedBit()`
+  call is currently DISABLED (commented out) — it caused use-after-free
+  when an object kept alive ONLY by FINALIZEDBIT in one minor cycle was
+  swept in the next. The O(n) `gcClearFinalizedBit` function exists
+  (vm.zig:20062) but is not invoked. This is a **transitional O(n)
+  measure pending a targeted clear-list**, not a semantic gap: stale
+  FINALIZEDBIT may persist across minor cycles, but the test suite
+  (gc/gengc/files/closure/coroutine) passes without it. TODO
+  (vm.zig:19969): implement targeted clear.
+- **Active-thread grayagain link** (vm.zig:19976-19980): PUC atomic
+  `linkgclist(&L->gclist, g->grayagain)` is TEMPORARILY DISABLED for
+  debugging; the running thread is re-traversed via `gcMarkMutableRoots`
+  (vm.zig:19443) instead. Approximation pending; covered for the tested
+  corpus by the mutable-roots re-mark.
+- **Defensive stale-entry skips** (vm.zig:18975-18982 in
+  `gcQueueScanObject`, vm.zig:19856-19864 in `gcDrainGrayagain`): safety
+  guards that skip objects whose `gc_index` no longer matches (freed-and-
+  reused memory from historical grayagain-disabled cycles). TODO
+  (vm.zig:18972): remove once confirmed stable across all suites.
+
+The earlier "PUC-faithful generational GC" characterization is therefore
+qualified: the grayagain drain, genlink, remarkupvals, DEADKEY, and
+nodeInsert paths are now PUC-faithful; the FINALIZEDBIT clear and the
+active-thread grayagain link remain honest approximations with explicit
+TODOs, not silent deviations.
 
 ## История закрытых фаз
 

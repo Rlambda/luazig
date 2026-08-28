@@ -34,11 +34,11 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
 | Differential output (`--diff`) | **0 output_diff** |
-| Smoke tests (`tests/smoke/*.lua`) | **56/56** pass |
+| Smoke tests (`tests/smoke/*.lua`) | **57/57** pass |
 | C API suites (`tests/c_api`) | 18 suites |
-| Performance (geomean vs PUC) | **2.29x** |
+| Performance (geomean vs PUC) | **2.36x** |
 
-Geomean замедления vs PUC Lua: **2.29x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **2.36x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -3593,6 +3593,83 @@ mws-llm-guard-proxy, git init) — фикс `dd9c2c6`: reasoning-only completion
 ретраит. Диагноз: ретраи 429 работали всегда, умирал loop на
 reasoning-only завершениях (доказано по БД opencode: последняя часть
 умерших сессий — `reasoning` без `text`).
+
+## P16.4h — finalization + atomic invariants (2026-08-28, verifier closure)
+
+Полная фаза по заданию верификатора; сабагенты A/B/C + гейт лично.
+
+### Task 0 — единый generated source для README+STATUS
+`status_summary.py --write-status`: компактная summary-секция STATUS.md теперь
+генерируется из тех же JSON, что README-блок (свои маркеры). Устранён дрейф
+«54/54 + 2.71x» вверху STATUS. Исторические записи не переписывались.
+
+### Tasks 1-2 — FINALIZEDBIT = PUC модель (`688606f`)
+PUC-аудит (lgc.c): бит = «объект ЗАРЕГИСТРИРОВАН на финализацию»
+(luaC_checkfinalizer lgc.c:1088), снимается в udata2finalize (lgc.c:953),
+сохраняется свипом через maskmarks. Рекурсивным visited-битом для графа,
+достижимого из финализируемого, НЕ является — граф живёт обычным маркингом
+(markbeingfnz + propagateall). В PUC 5.5 финализация регистрируется ТОЛЬКО
+для table и userdata (call-sites lua_setmetatable) — старый комментарий
+luazig («tables, closures, threads, userdata») был неверен, исправлен.
+Переработка: состояния разделены (finalizables=finobj, gc_to_finalize=tobefnz,
+обычные GC-цвета, «нормальный объект» = бит снят в gcFinalizeList).
+Рекурсивные FINALIZEDBIT-записи из FinalizerReach удалены; **gcClearFinalizedBit
+и его disabled-call не понадобились — удалены** (−160净 строк).
+
+### Tasks 3-4 — постоянные дифф-тесты (`ea00265`)
+`tests/smoke/57_finalizer_reach.lua` (byte-identical оба рантайма, стабилен 3×3,
+Debug-прогон чист): A потомок переживает цикл финализации родителя; B/C
+weak-key/weak-value потомки — закреплён PUC-инвариант аcимметрии atomic
+(lgc.c:1543): weak-values чистятся ДО resurrect, weak-keys ПОСЛЕ; D циклы
+a↔b из финализатора (терминация без рекурсивного visited); E resurrection +
+finalizer ровно один раз; F мусор между сборками.
+
+### Task 5 — grayagain в PUC-позиции для всех режимов (`e13e40a`)
+Non-minor путь дрейнировал grayagain ПОСЛЕ финализаторов (расхождение с
+lgc.c:1559-1560). gcAtomicCommon переструктурирован с нумерованными
+комментариями 1:1 к atomic(); drain в позиции PUC для обоих режимов;
+пост-финалайзерный drain — luazig-специфика (финалайзеры в atomic, не в
+отдельном callfin). Двойной обработки saved-списка нет (save+clear до итерации).
+
+### Task 6 — active-thread linkgclist: Variant A (эквивалентность доказана)
+PUC перевязываёт L->gclist в grayagain для повторного обхода активного треда
+в atomic. luazig: мутатор на паузе между gcMarkMutableRoots (шаг 1) и drain
+(шаг 6); gcMarkMutableRoots пересканирует live-регистры активного треда
+(live_reg_top[pc] — ТОЧНЕЕ PUC traversethread, который сканирует [0..top] с
+мёртвыми регистрами) + parked-треды + TBC + varargs + C-хендлы. Повторный
+обход избыточен; disabled-блок удалён, инвариант задокументирован в
+комментарии у gcMarkMutableRoots. Gen-режим: OLD-треды переобходятся каждым
+минором через gc_gen_threads.
+
+### Task 7 — stale entries: lifecycle вместо масок (`e13e40a`)
+Защитные skip-проверки (gcQueueScanObject/gcDrainGrayagain) были артефактом
+эпохи disabled-drain и разыменовывали entry для чтения метаданных (не защита).
+Lifecycle-доказательство: drain делает save+clear → все entries помечены
+чёрным → переживают свип → gcCorrectGrayAgain компактирует. Заменены на
+stats-gated debug-ассерты + счётчики gc_stale_*; полный suite — **0 срабатываний**.
+Аудит остальных GcObject-списков (gc_gray/young/old1/gen_threads/weak/fin) —
+таблица в описании фазы.
+
+### Task 8 — полный гейт (лично, чистые сборки)
+Debug+RF builds/tests 0; c_api 18/18 + strict DIFF PASS; matrix zig_fail=0
+(big.lua both_fail); smoke 57/57; **nextvar 10/10**; gc/gengc/closure/
+coroutine/events/errors/files --testc 0; leak_bench PASS; CallFrame ≤104.
+
+### Task 9 — свежий профиль (после correctness)
+geomean 2.31x против baseline 2.33x (−0.9%, нейтрально). Таблица 8 ворклоудов
+(instr ratio/CPI/allocations/top-5) — в /tmp-артефактах агента. Вердикты:
+- **P16.2d исчерпан**: push 16.4% + complete <0.01% < 20% порога.
+- hash_access 3.75x — CPI-bound (2.15x худший; instr 1.94x лучший): cache-miss
+  на пробинге Node → задача №1 (инлайн keyMatches в GETTABLE + ревизия layout
+  Node).
+- coroutine_yield 3.08x — instr-bound 4.26x (CPI лучше PUC 0.71x); найдена
+  **RSS-утечка ~24B/yield (238MB на 10M)** — correctness-смежный блокер, чинить
+  в задаче №2 вместе с прямым fast-path мимо callBuiltin.
+- lua_calls 2.26x: осталось instr-count в самом CALL-хендлере; syncFrame 4.8%
+  → задача №3 (merge/eliminate).
+
+Ранжирование следующих перф-задач: (1) hash Node/keyMatches −2..3% geomean,
+(2) coroutine fast-path + утечка −1.5..2.5%, (3) syncFrame −0.5..1.2%.
 
 ## История закрытых фаз
 

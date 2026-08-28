@@ -3670,6 +3670,49 @@ geomean 2.31x против baseline 2.33x (−0.9%, нейтрально). Та�
 Ранжирование следующих перф-задач: (1) hash Node/keyMatches −2..3% geomean,
 (2) coroutine fast-path + утечка −1.5..2.5%, (3) syncFrame −0.5..1.2%.
 
+## P16.5 — coroutine native-memory + table lookup specialization (2026-08-29)
+
+### T0 — воспроизводимость perf-статуса (`74fd184`)
+Версионированные артефакты tools/perf/current{,-counters,-profile-index}.json
+(per-workload times/ratio/geomean; instr/cycles/IPC/branch+cache/RSS; top-10
+символов 8 hotspot-ворклоудов). Оркестратор tools/perf_snapshot.py
+--regenerate-docs; status_summary --perf-current генерирует README+STATUS из
+одного снапшота. Regression baseline (p15.37.json) и current — раздельные.
+
+### P16.5a — native RSS growth coroutine path (`2568531`, `2e657e3`)
+Root cause: poscallCFrame ставил bc_stack_top = saved_func_slot+1+n, где
+saved_func_slot — func_slot C-фрейма НАД регистрами Lua-кадра; результаты
+потребляются через resume_inbox, НЕ из bc_stack → top рос +2 за yield/resume
+цикл → безграничный 1.5x-realloc bc_stack/bc_boxed. Фикс: восстановление
+top по кадру под C-фреймом (зеркально popBytecodeExecFrame). Диагностика:
+TrackingAllocator leak-map (LUAZIG_TRACK_ALLOC=1) + tools/native_mem_check.py
+(BOUNDED/LINEAR verdict lane). Результаты: RSS 45.4MB→4.4MB flat @1M (PUC
+2.4MB); tracker outstanding flat 2876B; матрица вариантов (wrap/y0/y5+/
+ignored/rargs/nested) — все плоские 100k==1M.
+
+### P16.5b — coroutine fast path + table specializations
+- `edea40c` coroutine resume/yield direct fast path: guards (no hooks, no
+  C-frames на стеке треда, wrap/close/trampoline excluded); A/B изолированно
+  instr −20% / cycles −26%. coroutine_yield: 3.22x → 2.09x.
+- `2e86007` nodeLookupInt (PUC getintfromhash): GETTABLE/GETI/SETTABLE-int/
+  hashIntIsPresent; hash_access −6.1% isolated.
+- `491d0d6` nodeLookupStr (PUC getstr; pointer-eq interned, content-eq long):
+  GETTABUP/SETTABUP/GETTABLE/GETFIELD/SETTABLE/SETFIELD; field_access −15.3%,
+  global_arith −13.3%; keyMatches-доля field_access 28.9% → 8.3%.
+- Node 32B→24B: ЧЕСТНЫЙ АБОРТ — естественный layout достигнут (offsets
+  0/8/16, выравнивание доказано), полный аудит ~90 node.value-сайтов,
+  гейт зелёный, НО hash_access +8.7% / field_access +15.4% / geomean +4.5%
+  (accessor-switch против прямой 16B Value-загрузки; C-bitfield-приём PUC
+  в Zig union(enum) не переносится без стоимости). @sizeOf(Node)==32
+  остаётся с обоснованием в комментарии.
+
+### Task 7 — syncFrame: SKIP по свежему профилю
+syncFrame = 3.48% lua_calls (было 4.8% до P16.2d/P16.5) — вклад в geomean
+<0.3%; порог «заметной доли» не достигнут.
+
+### Финал: geomean 2.38x → **2.21x** (baseline 2.22x); коридор сессии
+P16.4f→P16.5: 2.53x → 2.21x (−13%). Полный гейт зелёный на каждом шаге.
+
 ## История закрытых фаз
 
 P3–P15.12 — краткая сводка. P15.13+ — см. «История разработки» выше.

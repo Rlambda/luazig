@@ -968,7 +968,7 @@ pub export fn lua_closeslot(L: ?*lua_State, idx: c_int) void {
     // Errors from __close propagate through lua_closeslot to the caller.
     // The caller is responsible for protecting with pcall if needed.
     const val = h.c_stack.items[abs];
-    const mm = vm.metamethodValue(val, "__close") orelse {
+    const mm = vm.getTmByObj(val, .close) orelse {
         removeTocloseMark(vm, abs);
         return;
     };

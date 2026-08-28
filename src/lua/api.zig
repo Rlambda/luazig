@@ -810,7 +810,7 @@ pub const State = struct {
             .Table => |t| {
                 self.vm.gcStoreMetatable(t, mt) catch {};
                 if (mt) |m| {
-                    if (self.vm.metamethodValue(.{ .Table = m }, "__gc") != null) {
+                    if (self.vm.getTmByObj(.{ .Table = m }, .gc) != null) {
                         self.vm.registerFinalizable(.{ .table = t }) catch {};
                     }
                 }
@@ -819,7 +819,7 @@ pub const State = struct {
                 ud.metatable = mt;
                 if (mt) |m| {
                     self.vm.gcWriteBarrierUserdata(ud, .{ .Table = m }) catch {};
-                    if (self.vm.metamethodValue(.{ .Table = m }, "__gc") != null) {
+                    if (self.vm.getTmByObj(.{ .Table = m }, .gc) != null) {
                         self.vm.registerFinalizable(.{ .userdata = ud }) catch {};
                     }
                 }

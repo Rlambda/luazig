@@ -103,7 +103,7 @@ Generational mode больше не является compatibility-веткой,
 ### P15.34 — compact tables и однопоточный VM allocator
 Уменьшить hash `Node` с 56 до 48 байт. **P15.37b:** `next: ?*Node` (8 B +
 Результат: global_arith -54%, field_access -59%, metamethod_add -13%.
-- [ ] Специализированные integer и interned-string lookup/insert paths.
+- [x] Специализированные integer и interned-string lookup/insert paths. (закрыто задним числом: выполнено P16.1b — GETI/GETFIELD/GETTABUP/SETI/SETFIELD/SETTABUP inline nodeLookup/array fast paths; верифицировано P16.2d-анализом)
 - [ ] Сначала проверить libc allocator как безопасный промежуточный default для
 - [ ] Затем добавить VM-local pools/pages для `Table`, `Node`, `Closure`,
 - [ ] Освобождать пустые pages после major sweep.
@@ -3548,6 +3548,50 @@ qualified: the grayagain drain, genlink, remarkupvals, DEADKEY, and
 nodeInsert paths are now PUC-faithful; the FINALIZEDBIT clear and the
 active-thread grayagain link remain honest approximations with explicit
 TODOs, not silent deviations.
+
+### P16.2d — frame path slimming (2026-08-28)
+
+Profile-driven tranche (verifier-approved: push+complete = 26.7% of lua_calls,
+above the 20-25% threshold). Analysis (perf annotate, ranked) → three commits:
+
+- [x] **8134f90 — frame-init slimming**: removed provably-dead callstatus
+  bit-clears after encodeNresults (mask 0xff zeroes all flag bits); removed
+  dead `proto` write-back in syncFrame (ctx.cur_proto only ever loaded FROM
+  the frame or written together with it in opTailcall); `ensureBcStackCap`
+  inlined (one-compare fast path, growth outlined cold); union activation
+  `undefined` with full 12-field explicit-init audit (Debug 0xaa catches
+  regressions); comptime assert `@sizeOf(CallFrame) <= 104` added.
+  lua_calls −7.4%, geomean 2.42→2.36x.
+- [x] **9f30da3 — bcGrowFrame guard on return**: skip slice re-derivation
+  when `dst + nstore <= frame_cap` (semantically identical to the internal
+  check); neutral on single-value micro (noise-level), correct by construction.
+- [x] **a6a5d9f — inline return hot path (opReturn1/0)**: fast arms guarded
+  by (no open upvalues, no TBC regs, Lua parent in-bounds, not external
+  boundary, no pending call, no debug hooks, nresults ∈ {1,0,<0×1val});
+  pop sequence mirrors popBytecodeExecFrame verbatim; single-copy result
+  write replaces the double copy (scratch buffer eliminated).
+  lua_calls −18.8% (isolated instr −11.8%/cycles −10.9%), geomean →2.33x
+  (best run 2.29x).
+
+Gate (verified per step + final): zig build test Debug+RF 0; c_api 18/18 +
+DIFF PASS; matrix zig_fail=0 (big.lua both_fail pre-existing); smoke 56/56;
+nextvar 10x+5x+3x green; coroutine/gengc/gc/closure/events/errors/files
+--testc 0; leak_bench + 15_stress_leak pair PASS; perf_compare no >5%
+regressions vs the refreshed baseline (comparisons/field_access/global_arith
+flap ±7-12% run-to-run on a hot host with geomean simultaneously improving —
+layout/thermal noise, isolated instr-vs-cycles checks clean, documented).
+
+Perf arc of the session: 2.53x (вход в транш) → 2.42x (P16.4g baseline) →
+**2.33x** (P16.2d, зафиксировано; лучший прогон 2.29x). lua_calls суммарно
+≈ −26% за транш.
+
+Infrastructure (вне репозитория): `~/codes/llm-guard-proxy` (переименован из
+mws-llm-guard-proxy, git init) — фикс `dd9c2c6`: reasoning-only completions
+больше не считаются meaningful (glm-5.2 выжигал output-бюджет на reasoning →
+пустые финальные сообщения сабагентов); прокси теперь отдаёт 502 → клиент
+ретраит. Диагноз: ретраи 429 работали всегда, умирал loop на
+reasoning-only завершениях (доказано по БД opencode: последняя часть
+умерших сессий — `reasoning` без `text`).
 
 ## История закрытых фаз
 

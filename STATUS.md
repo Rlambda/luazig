@@ -3807,3 +3807,46 @@ tests + C API tests. The asserts never fire.
 | leak_bench | PASS (all within 1.0 KB) |
 | `@sizeOf(CallFrame) <= 104` | PASS (assert at vm.zig:1561) |
 | Stale-entry counters (full suite, stats enabled) | 0 hits |
+
+## P16.5a — native RSS growth on coroutine resume/yield (2026-08-28)
+
+### Root cause
+`poscallCFrame` set `bc_stack_top = saved_func_slot + 1 + n_usize` after popping
+a C-frame. `saved_func_slot` was the C-frame's `func_slot`, which sits ABOVE the
+Lua frame's register space (placed by `pushBuiltinCFrame` at `bc_stack_top`).
+The results were consumed via `resume_inbox`, NOT from `bc_stack` — so
+`bc_stack_top` was set to a meaningless high value and never reset.
+
+Each yield/resume cycle grew `bc_stack_top` by 2 (+1 from `pushBuiltinCFrame`,
++1 from `poscallCFrame`), causing exponential `bc_stack`/`bc_boxed` growth via
+`mremap` (1.5x realloc factor). At 1M iterations: bc_stack ~21MB, bc_boxed ~10MB.
+
+### Fix
+`poscallCFrame` now restores `bc_stack_top` based on the frame below the popped
+C-frame, mirroring `popBytecodeExecFrame` (vm.zig:10533):
+- Lua frame below: `bc_stack_top = caller.base + caller.u.lua.frame_cap`
+- C-frame below: `bc_stack_top = caller.base`
+- No frame below: `bc_stack_top = 0`
+
+This is PUC-faithful: PUC's `luaD_poscall` sets `L->top` based on the caller's
+frame, not the C function's position. In PUC, the C function's `ci->func` is
+within the caller's registers (at OP_CALL's `ra`), so `L->top = ra + 1 + nresults`
+stays within the frame. In luazig, `pushBuiltinCFrame` places the callee at
+`bc_stack_top` (above the frame), so we must explicitly restore to the caller's
+frame capacity.
+
+### Diagnostic tooling
+- `TrackingAllocator` (`src/lua/tracking_alloc.zig`): leak-map with
+  `enableLeakTracking()`, `reportLeaks()`, `deinitLeakMap()`. Enabled via
+  `LUAZIG_TRACK_ALLOC=1` env var. Zero overhead when unset.
+- `tools/native_mem_check.py`: runs lua file at 2+ iteration counts, reads
+  VmHWM from `/proc/self/status`, prints LINEAR/BOUNDED verdict.
+
+### Verification
+| Check | Result |
+|-------|--------|
+| VmHWM 100k/300k/1M | 4360/4360/4360 kB (FLAT) |
+| TrackingAllocator outstanding 100k/300k/1M | 2876/2876/2876 bytes (FLAT) |
+| native_mem_check verdict | BOUNDED (0.00 MB/decade) |
+| matrix --testc | 31/32 pass (big.lua both_fail, pre-existing) |
+| Smoke 57/57 | PASS |

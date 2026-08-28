@@ -1025,7 +1025,21 @@ fn interpreterMain(init: std.process.Init) !void {
     // Do not layer it on the CLI's lifetime arena; use a normal process
     // allocator so load-heavy programs do not retain every temporary AST.
     var tracker = tracking_alloc.TrackingAllocator.init(std.heap.smp_allocator);
-    const runtime_alloc = std.heap.smp_allocator;
+
+    // P16.5a: LUAZIG_TRACK_ALLOC=1 routes the VM through the tracker's
+    // allocator interface AND enables the leak map. At exit, a full leak
+    // report is printed to stderr. Zero production overhead when the env
+    // var is unset (the tracker is created but its allocator() is never
+    // called — the VM uses smp_allocator directly).
+    const env = stdio.activeEnviron();
+    const track_env_val = env.getAlloc(alloc, "LUAZIG_TRACK_ALLOC") catch null;
+    defer if (track_env_val) |v| alloc.free(v);
+    const track_alloc = track_env_val != null and
+        (std.mem.eql(u8, track_env_val.?, "1") or std.mem.eql(u8, track_env_val.?, "true"));
+    const runtime_alloc: std.mem.Allocator = if (track_alloc)
+        tracker.allocator()
+    else
+        std.heap.smp_allocator;
 
     const args = try collectArgs(alloc, init);
     defer freeArgs(alloc, args);
@@ -1077,6 +1091,14 @@ fn interpreterMain(init: std.process.Init) !void {
     //vm.tracker_total = &tracker.total_bytes;
     vm.tracker_alloc_count = &tracker.alloc_count;
     vm.tracker_free_count = &tracker.free_count;
+    // P16.5a: Enable leak-map tracking when LUAZIG_TRACK_ALLOC=1.
+    if (track_alloc) tracker.enableLeakTracking();
+    defer {
+        if (track_alloc) {
+            tracker.reportLeaks();
+            tracker.deinitLeakMap();
+        }
+    }
     defer vm.deinit();
     if (opts.backend == .bc) vm.setDynamicBytecodeCompiler(compileDynamicBytecode);
     if (opts.enable_testc) try vm.enableTestcModule();

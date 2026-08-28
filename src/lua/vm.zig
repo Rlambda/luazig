@@ -13609,6 +13609,45 @@ pub const Vm = struct {
             ctx.exec_frames.getPtr(ctx.frame_index).tbc_mark;
         // P15.51l: hooks_active is read from self.hooks_active_cached.
         if (!has_pending_tbc and !self.hooks_active_cached) {
+            // P16.2d: inline return fast arm (same conditions as opReturn1).
+            // opReturn0 returns 0 values, so the fast arm handles nresults==0
+            // (no stores needed) and nresults<0 (multret: set reg_top=dst, no
+            // stores). nresults>=1 would require nil-padding — fall back.
+            // See opReturn1 for the full safety proof and condition rationale.
+            {
+                const child = ctx.exec_frames.getConstPtr(ctx.frame_index);
+                if (!child.u.lua.has_open_upvalues and
+                    !child.isDebugHook() and
+                    ctx.frame_index > 0 and
+                    ctx.frame_index != ctx.boundary_depth)
+                {
+                    const parent_idx = ctx.frame_index - 1;
+                    const parent_c = ctx.exec_frames.getConstPtr(parent_idx);
+                    if (parent_c.isLua() and
+                        parent_c.pending_call_index == INVALID_PENDING)
+                    {
+                        const nresults = decodeNresults(child.callstatus);
+                        if (nresults == 0 or nresults < 0) {
+                            const dst = child.u.lua.func_slot_base - parent_c.base;
+                            // Pop child frame — mirror popBytecodeExecFrame
+                            // (same skip rationale as opReturn1).
+                            const child_m = ctx.exec_frames.getPtr(ctx.frame_index);
+                            child_m.callstatus = 0;
+                            self.bc_stack_top = parent_c.base + parent_c.u.lua.frame_cap;
+                            ctx.exec_frames.shrinkTo(ctx.frame_index);
+                            // No value to store (opReturn0 returns 0 values).
+                            const parent_m = ctx.exec_frames.getPtr(parent_idx);
+                            if (nresults < 0) {
+                                // Multret: 0 values → reg_top = dst.
+                                parent_m.reg_top = @intCast(dst);
+                            }
+                            parent_m.u.lua.pc += 1;
+                            return .continue_frame_loop;
+                        }
+                    }
+                }
+            }
+            // Fallback: scratch + completeBytecodeExecFrame.
             const empty: []Value = self.bc_return_scratch[0..0];
             if (try self.completeBytecodeExecFrame(
                 ctx.exec_frames,
@@ -13660,6 +13699,84 @@ pub const Vm = struct {
             ctx.exec_frames.getPtr(ctx.frame_index).tbc_mark;
         // P15.51l: hooks_active is read from self.hooks_active_cached.
         if (!has_pending_tbc and !self.hooks_active_cached) {
+            // P16.2d: inline return fast arm. When the return is a simple
+            // Lua-to-Lua call completion (no open upvalues, no TBC closers,
+            // no hooks, no pending call, not at an external boundary, parent
+            // is Lua), inline the pop + single-copy directly, bypassing
+            // completeBytecodeExecFrame + applyBytecodeResultsDirect. This
+            // eliminates:
+            //   (1) the bc_return_scratch intermediate copy,
+            //   (2) the completeBytecodeExecFrame call + its multiple
+            //       getConstPtr/getPtr traversals,
+            //   (3) the applyBytecodeResultsDirect call + its slice
+            //       re-derivation + bcGrowFrame guard,
+            //   (4) the returnSliceIsOwned check + free pair.
+            //
+            // Safety proof (single-copy cannot clobber source): the RHS
+            // (ctx.regs[a]) is read into a local BEFORE the write. The write
+            // target (self.bc_stack[parent.base + dst]) is in the parent's
+            // register window, which may overlap the child's window (shared
+            // stack). But since we read the source value first and perform a
+            // single Value assignment, there is no aliasing hazard.
+            // Multi-value forward-copy COULD clobber (if src and dst overlap),
+            // which is why the multret fast arm is restricted to
+            // exactly-1-value opReturn1.
+            {
+                const child = ctx.exec_frames.getConstPtr(ctx.frame_index);
+                // Condition (a): no open upvalues to close.
+                // Condition (b): !has_pending_tbc (checked above).
+                // Condition (f): no hooks — !hooks_active_cached (above) +
+                //   !child.isDebugHook() (popBytecodeExecFrame clears
+                //   in_debug_hook for debug-hook frames; skip that path).
+                if (!child.u.lua.has_open_upvalues and
+                    !child.isDebugHook() and
+                    ctx.frame_index > 0 and // (c): parent exists
+                    ctx.frame_index != ctx.boundary_depth) // (d): not boundary
+                {
+                    const parent_idx = ctx.frame_index - 1;
+                    const parent_c = ctx.exec_frames.getConstPtr(parent_idx);
+                    // Condition (c): parent is a Lua frame.
+                    // Condition (e): no pending call.
+                    if (parent_c.isLua() and
+                        parent_c.pending_call_index == INVALID_PENDING)
+                    {
+                        const nresults = decodeNresults(child.callstatus);
+                        // Condition (g): fast arm handles nresults==1 (fixed
+                        // 1 result) and nresults<0 (multret with exactly 1
+                        // value). Other nresults fall back.
+                        if (nresults == 1 or nresults < 0) {
+                            // Read source BEFORE pop (child reg still valid).
+                            const src_val = ctx.regs[a];
+                            const dst = child.u.lua.func_slot_base - parent_c.base;
+                            // Pop child frame — mirror popBytecodeExecFrame
+                            // exactly, skipping the parts guarded by fast-arm
+                            // conditions: pending-call cancel (none per (e)),
+                            // in_debug_hook clear (guarded by
+                            // !child.isDebugHook()), tbc_regs shrink (guarded
+                            // by !has_pending_tbc above — tbc_mark == len).
+                            const child_m = ctx.exec_frames.getPtr(ctx.frame_index);
+                            child_m.callstatus = 0;
+                            // Restore bc_stack_top to parent's frame capacity
+                            // (parent is Lua per (c) — the !caller.isC() arm).
+                            self.bc_stack_top = parent_c.base + parent_c.u.lua.frame_cap;
+                            ctx.exec_frames.shrinkTo(ctx.frame_index);
+                            // Single-copy: write return value directly into
+                            // parent's register window. dst < frame_cap is
+                            // guaranteed because func_slot_base is within the
+                            // parent's window (it's where the function was).
+                            self.bc_stack[parent_c.base + dst] = src_val;
+                            const parent_m = ctx.exec_frames.getPtr(parent_idx);
+                            if (nresults < 0) {
+                                // Multret: set reg_top to dst + 1 (1 value).
+                                parent_m.reg_top = @intCast(dst + 1);
+                            }
+                            parent_m.u.lua.pc += 1;
+                            return .continue_frame_loop;
+                        }
+                    }
+                }
+            }
+            // Fallback: scratch + completeBytecodeExecFrame.
             self.bc_return_scratch[0] = ctx.regs[a];
             if (try self.completeBytecodeExecFrame(
                 ctx.exec_frames,

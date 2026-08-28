@@ -1523,6 +1523,12 @@ fn stackForThread(self: *Vm, th: ?*Thread) []Value {
 /// the arrays directly from outside this struct.
 const INLINE_FRAME_CAP: usize = 32;
 
+// P16.2d: CallFrame size invariant — must stay <= 104 bytes to keep the
+// inline frame cache (32 entries) within a reasonable L1 footprint.
+comptime {
+    std.debug.assert(@sizeOf(CallFrame) <= 104);
+}
+
 const FrameStack = struct {
     inline_frames: [INLINE_FRAME_CAP]CallFrame = undefined,
     inline_count: usize = 0,
@@ -4183,8 +4189,19 @@ pub const Vm = struct {
     /// Ensure the shared bytecode stack can hold at least `needed` slots.
     /// Grows by doubling + `needed`, reallocating both bc_stack and bc_boxed.
     /// After realloc, all frame `base` offsets remain valid (they're indices).
-    fn ensureBcStackCap(self: *Vm, needed: usize) DispatchError!void {
-        if (needed <= self.bc_stack.len) return;
+    // P16.2d: Fast path is a single comparison (needed <= bc_stack.len).
+    // Inlining avoids call overhead (~40% of this symbol's 3.2% in perf
+    // annotate). The rare growth path is outlined into growBcStackCapSlow
+    // to keep the inlined fast path minimal and avoid code bloat at every
+    // call site.
+    inline fn ensureBcStackCap(self: *Vm, needed: usize) DispatchError!void {
+        if (needed > self.bc_stack.len) {
+            @branchHint(.cold);
+            try self.growBcStackCapSlow(needed);
+        }
+    }
+
+    fn growBcStackCapSlow(self: *Vm, needed: usize) DispatchError!void {
         const old_len = self.bc_stack.len;
         // PUC luaD_growstack: newsize = size + size/2 (1.5x growth),
         // capped at MAXSTACK. If needed > MAXSTACK, the overflow check
@@ -10377,14 +10394,17 @@ pub const Vm = struct {
         // access. `addOne` doesn't zero-init — the slot may contain stale data
         // from a previous C-frame (where .u.c was active). Activating .lua
         // with default values first, then overwriting individual fields below.
-        ef_slot.u = .{ .lua = .{} };
+        //
+        // P16.2d: `undefined` is safe: every LuaFrameState field is explicitly
+        // initialized below (audited against the struct definition). Debug
+        // mode's 0xaa fill catches regressions if a field is missed.
+        ef_slot.u = .{ .lua = undefined };
 
         // Common fields (shared with IR RuntimeFrame semantics)
         ef_slot.u.lua.proto = proto;
         // P15.51k: callee is at bc_stack[func_slot] (PUC's ci->func).
         // No duplicated callee field — derived on demand.
         ef_slot.u.lua.pc = 0;
-        ef_slot.clearTailCall();
         ef_slot.u.lua.nvarstack = @intCast(nparams);
 
         // Bytecode-specific fields
@@ -10394,12 +10414,17 @@ pub const Vm = struct {
         ef_slot.u.lua.func_slot_base = func_slot_in;
         ef_slot.u.lua.frame_cap = frame_cap;
         ef_slot.u.lua.nextraargs = @intCast(nextra);
+        // P16.2d: encodeNresults masks with CIST_NRESULTS (0xff, low 8 bits),
+        // so ALL flag bits (CIST_TAIL, CIST_HOOKED, CIST_HOOKYIELD, CIST_HIDE,
+        // CIST_C, ...) are provably 0 after this assignment. The per-bit
+        // clearTailCall/clearHookYield/clearHidden/clearDebugHook calls and
+        // the isDebugHook block that were here were all dead — they operated
+        // on bits already guaranteed zero by this mask.
         ef_slot.callstatus = encodeNresults(nresults);
         ef_slot.u.lua.resume_pc = INVALID_PC;
         ef_slot.reg_top = @intCast(nparams);
         ef_slot.u.lua.last_line_pc = INVALID_PC;
         ef_slot.u.lua.skip_line_hook_pc = INVALID_PC;
-        ef_slot.clearHookYield();
         ef_slot.tbc_mark = tbc_mark;
         // P15.51n: Initialize pending_call_index (addOne doesn't zero-init).
         ef_slot.pending_call_index = INVALID_PENDING;
@@ -10412,21 +10437,6 @@ pub const Vm = struct {
 
         // Debug fields (must set explicitly — defaults don't re-apply on reuse)
         ef_slot.u.lua.resume_skip_count_pc = INVALID_PC;
-        ef_slot.clearHidden();
-        // P15.51n: debug name override is stored in BytecodePendingCall and
-        // cleared automatically when the pending call is cleared/consumed.
-        // P15.51n: Clear hook frame index when popping a debug hook frame.
-        if (ef_slot.isDebugHook()) {
-            const th = self.activeBytecodeThread();
-            th.hook_frame_index = INVALID_HOOK_FRAME;
-            th.debug_hook_transfer = null;
-            th.debug_hook_transfer_start = 1;
-            th.debug_hook_event_calllike = false;
-            th.debug_hook_event_tailcall = false;
-            th.debug_hook_event_is_count = false;
-            th.debug_hook_allow_yield = false;
-        }
-        ef_slot.clearDebugHook();
     }
 
     inline fn popBytecodeExecFrame(
@@ -11025,7 +11035,11 @@ pub const Vm = struct {
             fr.u.lua.pc = ctx.pc;
             fr.base = ctx.base;
             fr.u.lua.frame_cap = ctx.frame_cap;
-            fr.u.lua.proto = ctx.cur_proto;
+            // P16.2d: proto write removed — provably dead. ctx.cur_proto is
+            // only set at frame_loop entry (loaded FROM fr.proto(), so writing
+            // it back is identity) and in OP_TAILCALL (where fr.u.lua.proto is
+            // already written directly at the same time). No dispatch path
+            // mutates ctx.cur_proto without also writing the frame.
             // P15.51n: upvalues derived from bc_stack[func_slot], not stored in frame.
         }
     }

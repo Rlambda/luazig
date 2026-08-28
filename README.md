@@ -31,27 +31,27 @@ Regression lane: `python3 tools/testes_matrix.py --testc` (no `_port`/`_soft` pr
 
 ### Performance
 
-Geomean slowdown vs PUC Lua: **2.43x** (lower is better; 1.0x = parity).
+Geomean slowdown vs PUC Lua: **2.29x** (lower is better; 1.0x = parity).
 Method: median-of-7 per workload, pinned CPU core (`tools/perf_compare.py`).
 
 | Workload | Zig/PUC |
 |----------|--------:|
-| hash_access | 3.77x |
-| metamethod_add | 3.63x |
-| array_access | 3.49x |
-| mixed_arith | 3.40x |
-| coroutine_yield | 3.20x |
-| lua_calls | 2.87x |
-| int_arith | 2.77x |
-| global_arith | 2.68x |
-| field_access | 2.67x |
-| float_arith | 2.46x |
-| temp_table_alloc | 2.19x |
-| branch_loop | 2.04x |
-| dynamic_load | 1.82x |
-| comparisons | 1.56x |
-| string_loop | 1.34x |
-| string_concat | 1.16x |
+| hash_access | 3.58x |
+| metamethod_add | 3.55x |
+| mixed_arith | 3.38x |
+| array_access | 3.34x |
+| coroutine_yield | 3.01x |
+| int_arith | 2.78x |
+| float_arith | 2.43x |
+| field_access | 2.42x |
+| global_arith | 2.34x |
+| lua_calls | 2.30x |
+| temp_table_alloc | 2.01x |
+| branch_loop | 1.99x |
+| dynamic_load | 1.75x |
+| comparisons | 1.49x |
+| string_loop | 1.27x |
+| string_concat | 1.15x |
 <!-- END GENERATED STATUS -->
 
 See [STATUS.md](STATUS.md) for detailed profiling methodology, hotspot analysis, and optimization history.

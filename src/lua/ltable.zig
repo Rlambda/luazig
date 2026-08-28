@@ -552,6 +552,121 @@ test "nodeLookupInt skips dead keys and non-int keys in the chain" {
     try std.testing.expectEqual(@as(i64, 42), found.value.Int);
 }
 
+/// Specialized string-key hash lookup — PUC `getstr` (ltable.c:944-955).
+///
+/// PUC has a dedicated `getstr(Table *t, TString *key)` that hashes via
+/// `hashstr(t, key)` (= `key->hash & (sizenode(t)-1)`, using the string's
+/// **cached** hash) and walks the chain comparing ONLY `keyisshrstr(n) &&
+/// keystrval(n) == key` for short strings (pointer identity) or the generic
+/// `keyeq` for long strings. This is the Zig equivalent.
+///
+/// **Hash-source proof:** the generic `nodeLookup` computes
+/// `mainPosition(len, .{ .String = key }, seed)` = `keyHash(.{ .String = key },
+/// seed) & (len - 1)`. `keyHash(.{ .String = s })` returns `s.hash` directly
+/// (ltable.zig:382 — the `.String => |s| s.hash` arm, no switch, no
+/// computation). So the generic main position is `key.hash & (len - 1)`. This
+/// function computes `key.hash & (nodes.len - 1)` — the exact same expression.
+/// Positions match EXACTLY.
+///
+/// **Chain-walk equivalence:** the generic path calls `n.keyMatches(key)`,
+/// which for `.string` nodes evaluates `key == .String and
+/// vm.luaStringEq(self.key_val.string, key.String)` (ltable.zig:275). Since
+/// the caller guarantees `key` is a `*LuaString`, `key == .String` is always
+/// true, so the check reduces to `vm.luaStringEq(self.key_val.string, key)` —
+/// identical to this function's chain compare. `luaStringEq` is pointer-eq for
+/// interned short strings and content-eq for long strings (vm.zig:2055-2058),
+/// so short/interned pairs hit the fast pointer-compare path while long
+/// strings keep full content equality. For `.empty`/`.dead`/other-tag nodes,
+/// `n.key_tt == .string` is false, matching `keyMatches`'s `.empty, .dead
+/// => false` and the tag-mismatch arms. Empty-bucket termination (`isEmpty`)
+/// and chain-end termination (`nextNode orelse null`) are identical to
+/// `nodeLookup`.
+pub inline fn nodeLookupStr(nodes: []Node, key: *LuaString, seed: u64) ?*Node {
+    _ = seed; // seed is baked into key.hash at intern time — not used here.
+    if (nodes.len == 0) return null;
+    // Same hash as the generic .String path: key.hash & (len-1).
+    // keyHash(.{ .String = key }) = key.hash (ltable.zig:382, no computation).
+    const mp: usize = key.hash & (nodes.len - 1);
+    var n: *Node = &nodes[mp];
+    if (n.isEmpty()) return null; // bucket unused => key not present
+    while (true) {
+        // Direct string compare — no Value construction, no tag switch.
+        // luaStringEq: pointer-eq for interned shorts, content-eq for longs.
+        if (n.key_tt == .string and vm.luaStringEq(n.key_val.string, key)) return n;
+        n = n.nextNode(nodes) orelse return null;
+    }
+}
+
+test "nodeLookupStr returns null for empty hash part" {
+    const nodes = try std.testing.allocator.alloc(Node, 4);
+    defer std.testing.allocator.free(nodes);
+    for (nodes) |*n| n.* = .{};
+    // Build a dummy LuaString with a known hash.
+    var ls: LuaString = .{ .hash = 0, .len = 0, .is_short = true };
+    try std.testing.expect(nodeLookupStr(nodes, &ls, 0) == null);
+}
+
+test "nodeLookupStr finds an interned string key at its main position" {
+    const nodes = try std.testing.allocator.alloc(Node, 4);
+    defer std.testing.allocator.free(nodes);
+    for (nodes) |*n| n.* = .{};
+    // Simulate an interned short string: hash is pre-cached.
+    var ls: LuaString = .{ .hash = 0xDEAD_BEEF, .len = 3, .is_short = true };
+    const mp: usize = ls.hash & (nodes.len - 1);
+    nodes[mp].setKey(.{ .String = &ls });
+    nodes[mp].value = .{ .Int = 77 };
+    const found = nodeLookupStr(nodes, &ls, 0).?;
+    try std.testing.expectEqual(@as(i64, 77), found.value.Int);
+}
+
+test "nodeLookupStr agrees with nodeLookup for string keys" {
+    const cap = 16;
+    const nodes = try std.testing.allocator.alloc(Node, cap);
+    defer std.testing.allocator.free(nodes);
+    for (nodes) |*n| n.* = .{};
+    var lastfree: usize = nodes.len;
+    // Insert 15 string keys (leave one free slot for chain appends).
+    var keys: [15]LuaString = undefined;
+    var i: usize = 0;
+    while (i < 15) : (i += 1) {
+        keys[i] = .{ .hash = (i + 1) *% 0x9E3779B97F4A7C15, .len = @intCast(i), .is_short = true };
+        _ = nodeInsert(nodes, &lastfree, .{ .String = &keys[i] }, .{ .Int = @intCast(i * 10) }, 0);
+    }
+    // Every key must be found by BOTH paths, with identical results.
+    var k: usize = 0;
+    while (k < 15) : (k += 1) {
+        const generic = nodeLookup(nodes, .{ .String = &keys[k] }, 0);
+        const specialized = nodeLookupStr(nodes, &keys[k], 0);
+        try std.testing.expect(generic != null);
+        try std.testing.expect(specialized != null);
+        try std.testing.expectEqual(generic.?.value, specialized.?.value);
+    }
+    // Absent key: both return null.
+    var absent: LuaString = .{ .hash = 0x1234_5678, .len = 0, .is_short = true };
+    try std.testing.expect(nodeLookup(nodes, .{ .String = &absent }, 0) == null);
+    try std.testing.expect(nodeLookupStr(nodes, &absent, 0) == null);
+}
+
+test "nodeLookupStr skips dead keys and non-string keys in the chain" {
+    const nodes = try std.testing.allocator.alloc(Node, 4);
+    defer std.testing.allocator.free(nodes);
+    for (nodes) |*n| n.* = .{};
+    // Place a dead node at the main position, and a live string node chained.
+    var ls: LuaString = .{ .hash = 0xCAFE_BABE, .len = 2, .is_short = true };
+    const mp: usize = ls.hash & (nodes.len - 1);
+    nodes[mp].key_tt = .table; // non-string key at main position
+    nodes[mp].key_val = .{ .table = @ptrFromInt(@as(usize, 0x1234) & ~@as(usize, @alignOf(*Table) - 1)) };
+    nodes[mp].value = .Nil;
+    nodes[mp].markDeadKey();
+    // Chain to a free slot holding the real string key.
+    const free_idx: usize = (mp + 1) % nodes.len;
+    nodes[free_idx].setKey(.{ .String = &ls });
+    nodes[free_idx].value = .{ .Int = 42 };
+    nodes[mp].next_offset = @intCast(@as(i64, @intCast(free_idx)) - @as(i64, @intCast(mp)));
+    const found = nodeLookupStr(nodes, &ls, 0).?;
+    try std.testing.expectEqual(@as(i64, 42), found.value.Int);
+}
+
 /// Raw GC pointer from a collectable Value (PUC `gcvalue(k1)`, ltable.c:260).
 /// Returns null for non-collectable values (Nil/Int/Num/Bool/Builtin/
 /// LightUserdata). Used by `keyMatchesDeadok` to compare a live collectable

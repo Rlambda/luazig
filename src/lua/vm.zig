@@ -11700,7 +11700,7 @@ pub const Vm = struct {
                             // unnecessary. (Was: rawGet funnel; rawGet was
                             // 10% of the field_access profile.)
                             if (self.stats.enabled) self.stats.tbl_get_fast_str += 1; // P16.0b (constant string key)
-            ctx.regs[a] = if (ltable.nodeLookup(env.Table.hash, key, self.hash_seed)) |node|
+            ctx.regs[a] = if (ltable.nodeLookupStr(env.Table.hash, key.String, self.hash_seed)) |node|
                                 node.value
                             else
                                 .Nil;
@@ -11750,7 +11750,7 @@ pub const Vm = struct {
                             const tbl = env.Table;
                             try self.gcTableWriteBarrier(tbl, key, val);
                             if (self.stats.enabled) self.stats.tbl_set_fast_str += 1; // P16.0b (constant string key)
-                            if (ltable.nodeLookup(tbl.hash, key, self.hash_seed)) |node| {
+                            if (ltable.nodeLookupStr(tbl.hash, key.String, self.hash_seed)) |node| {
                                 if (self.stats.enabled) self.stats.tbl_update += 1; // P16.0b
                                 if (val == .Nil) {
                                     _ = ltable.nodeDelete(tbl.hash, key, self.hash_seed);
@@ -11803,7 +11803,7 @@ pub const Vm = struct {
                                 }
                             } else if (key == .String) {
                                 if (self.stats.enabled) self.stats.tbl_get_fast_str += 1; // P16.0b
-                                ctx.regs[a] = if (ltable.nodeLookup(tbl.hash, key, self.hash_seed)) |node|
+                                ctx.regs[a] = if (ltable.nodeLookupStr(tbl.hash, key.String, self.hash_seed)) |node|
                                     node.value
                                 else
                                     .Nil;
@@ -11868,7 +11868,7 @@ pub const Vm = struct {
                             // inlines nodeLookup into the dispatch loop.
                             const tbl = obj.Table;
                             if (self.stats.enabled) self.stats.tbl_get_fast_str += 1; // P16.0b
-                            ctx.regs[a] = if (ltable.nodeLookup(tbl.hash, key, self.hash_seed)) |node|
+                            ctx.regs[a] = if (ltable.nodeLookupStr(tbl.hash, key.String, self.hash_seed)) |node|
                                 node.value
                             else
                                 .Nil;
@@ -11972,7 +11972,7 @@ pub const Vm = struct {
                             if (key == .String) {
                                 if (self.stats.enabled) self.stats.tbl_set_fast_str += 1; // P16.0b
                                 try self.gcTableWriteBarrier(tbl, key, val);
-                                if (ltable.nodeLookup(tbl.hash, key, self.hash_seed)) |node| {
+                                if (ltable.nodeLookupStr(tbl.hash, key.String, self.hash_seed)) |node| {
                                     if (self.stats.enabled) self.stats.tbl_update += 1; // P16.0b (existing key)
                                     if (val == .Nil) {
                                         _ = ltable.nodeDelete(tbl.hash, key, self.hash_seed);
@@ -12087,7 +12087,7 @@ pub const Vm = struct {
                             const tbl = obj.Table;
                             try self.gcTableWriteBarrier(tbl, key, val);
                             if (self.stats.enabled) self.stats.tbl_set_fast_str += 1; // P16.0b
-                            if (ltable.nodeLookup(tbl.hash, key, self.hash_seed)) |node| {
+                            if (ltable.nodeLookupStr(tbl.hash, key.String, self.hash_seed)) |node| {
                                 // Existing key: update in place (or delete).
                                 if (self.stats.enabled) self.stats.tbl_update += 1; // P16.0b
                                 if (val == .Nil) {

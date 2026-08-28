@@ -1673,7 +1673,6 @@ const InlineValues = struct {
             // Empty owned slice: nothing to keep. Callers historically
             // stored empty slices and freed them later; storing empty is
             // equivalent to clearing.
-            if (vals.len == 0) {} // (keep; documented no-op)
             return;
         }
         if (vals.len <= INLINE_VALUES_CAP) {
@@ -3551,12 +3550,6 @@ pub const Vm = struct {
     last_builtin_out_count: usize = 0,
     active_builtin: ?BuiltinId = null,
     active_builtin_args: ?[]const Value = null,
-    /// The active_builtin of the caller of the current builtin. Set by
-    /// callBuiltin before calling the builtin. Used by error() to detect
-    /// C-function callers (matching PUC's luaL_where which pushes "" for
-    /// currentline=-1). When non-null, the caller is a builtin (C function),
-    /// so error() skips the source prefix.
-    caller_builtin_id: ?BuiltinId = null,
     gmatch_state: ?GmatchState = null,
     wrap_thread: ?*Thread = null,
     main_thread: ?*Thread = null,
@@ -8340,11 +8333,17 @@ pub const Vm = struct {
     ///
     /// The C-frame exists in PUC Lua as a CallInfo on L->ci (pushed by
     /// luaD_precall for C functions). In luazig, the synthetic C-frame
-    /// (pushBuiltinCFrame) adds overhead that PUC doesn't have: a heap
-    /// allocation (call_frames.addOne), bc_stack_top bookkeeping, and a
-    /// Nil-memset of the outs buffer. For the hot coroutine.resume/yield
-    /// cycle (the dominant coroutine workload), this overhead is ~12% of
-    /// cycles (pushBuiltinCFrame 5.2% + memset 6.9%).
+    /// (pushBuiltinCFrame) adds overhead that PUC doesn't have: CallFrame
+    /// init/bookkeeping (func_slot/base/setC/setHidden), bc_stack_top
+    /// manipulation, the generic callBuiltin context (outs tracking,
+    /// args re-derivation, Nil-init of outs — memset was 6.9% of
+    /// coroutine_yield cycles), and the callBuiltinSwitch dispatch
+    /// indirection. FrameStack.addOne itself is inline storage for the
+    /// common case (depth <= INLINE_FRAME_CAP=32, no heap); a heap spill
+    /// only occurs when call depth exceeds the inline cap (rare). For the
+    /// hot coroutine.resume/yield cycle (the dominant coroutine workload),
+    /// this overhead is ~12% of cycles (pushBuiltinCFrame 5.2% + memset
+    /// 6.9%).
     ///
     /// Guards exclude ALL cases where the C-frame is semantically needed:
     /// - Debug hooks (CALL/RETURN hook dispatch requires the C-frame)
@@ -8405,8 +8404,11 @@ pub const Vm = struct {
                 // no C-frame at all). Don't double-handle.
                 if (self.bytecode_coroutine_trampoline_active) return false;
                 // Target must be a thread (builtinCoroutineResume's first
-                // check — if it fails, the error path needs caller_builtin_id
-                // for the error message, which callBuiltin sets up).
+                // check — if it fails, the builtin raises a "bad argument"
+                // error). Bail to the generic callBuiltin path so the error
+                // is raised with the full C-frame + error-recovery context
+                // (YPCALL guard, cframe_preserved defer) that the fast path
+                // skips.
                 if (args.len == 0 or args[0] != .Thread) return false;
                 const target = args[0].Thread;
                 // Target not in close mode — close mode has special C-frame
@@ -8432,9 +8434,10 @@ pub const Vm = struct {
     /// This mirrors what PUC Lua does natively: luaD_precall pushes a
     /// CallInfo for the C function, calls it, and pops the CallInfo — all
     /// on the C stack with no heap allocation. luazig's synthetic C-frame
-    /// (pushBuiltinCFrame) adds heap allocation + bc_stack bookkeeping that
-    /// PUC doesn't have. This fast path eliminates that overhead for the
-    /// hot coroutine.resume/yield cycle.
+    /// (pushBuiltinCFrame) adds CallFrame init/bookkeeping + bc_stack
+    /// manipulation + generic callBuiltin context that PUC doesn't have.
+    /// This fast path eliminates that overhead for the hot
+    /// coroutine.resume/yield cycle.
     ///
     /// Sets up the active_builtin context (needed by builtinCoroutineYield
     /// for th.suspended_builtin, and by the coroutine body's yield to
@@ -8456,19 +8459,14 @@ pub const Vm = struct {
     ) DispatchError!void {
         // Set active_builtin context — needed by builtinCoroutineYield
         // (th.suspended_builtin = self.active_builtin) and by the coroutine
-        // body's yield to detect it's yielding from a builtin. Also set
-        // caller_builtin_id for error() source-prefix detection (PUC's
-        // luaL_where checks currentline == -1 for C functions).
+        // body's yield to detect it's yielding from a builtin.
         const prev_active_builtin = self.active_builtin;
         const prev_active_builtin_args = self.active_builtin_args;
-        const prev_caller_builtin = self.caller_builtin_id;
         self.active_builtin = id;
         self.active_builtin_args = args;
-        self.caller_builtin_id = prev_active_builtin;
         defer {
             self.active_builtin = prev_active_builtin;
             self.active_builtin_args = prev_active_builtin_args;
-            self.caller_builtin_id = prev_caller_builtin;
         }
 
         switch (id) {
@@ -16081,16 +16079,9 @@ pub const Vm = struct {
         const prev_active_builtin_args = self.active_builtin_args;
         self.active_builtin = id;
         self.active_builtin_args = args_fresh;
-        // Save the caller's active_builtin so error() can detect C-function
-        // callers. When non-null, the caller is a builtin (C function), and
-        // error() skips the source prefix (matching PUC's luaL_where which
-        // pushes "" for currentline=-1).
-        const prev_caller_builtin = self.caller_builtin_id;
-        self.caller_builtin_id = prev_active_builtin;
         defer {
             self.active_builtin = prev_active_builtin;
             self.active_builtin_args = prev_active_builtin_args;
-            self.caller_builtin_id = prev_caller_builtin;
         }
         self.callBuiltinSwitch(id, args_fresh, outs_fresh) catch |err| {
             if (err == error.Yield or err == error.ThreadSwitch) {
@@ -16171,15 +16162,16 @@ pub const Vm = struct {
                 // (no source prefix). For Lua functions (currentline > 0),
                 // it pushes "source:line: ".
                 //
-                // P15.79: caller_builtin_id workaround removed. Now that
-                // builtin C-frames are pushed (hidden) for all builtins,
-                // errorLocationFrameIndex correctly skips hidden C-frames
-                // and finds the Lua frame at the requested level. The old
-                // caller_builtin_id check was wrong: when a builtin (like
-                // table.sort) calls a Lua callback that calls error(),
-                // caller_builtin_id was set to table.sort, causing error()
-                // to suppress the source prefix — even though the actual
-                // caller of error() is the Lua callback, not table.sort.
+                // P15.79: The former caller_builtin_id field (used to detect
+                // C-function callers for source-prefix suppression) has been
+                // removed entirely. Now that builtin C-frames are pushed
+                // (hidden) for all builtins, errorLocationFrameIndex correctly
+                // skips hidden C-frames and finds the Lua frame at the requested
+                // level. The old caller_builtin_id check was wrong: when a
+                // builtin (like table.sort) calls a Lua callback that calls
+                // error(), caller_builtin_id was set to table.sort, causing
+                // error() to suppress the source prefix — even though the
+                // actual caller of error() is the Lua callback, not table.sort.
                 const location_frame = if (args[0] == .String and level > 0)
                     self.errorLocationFrameIndex(@intCast(level))
                 else

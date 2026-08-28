@@ -3893,3 +3893,56 @@ frame capacity.
 | native_mem_check verdict | BOUNDED (0.00 MB/decade) |
 | matrix --testc | 31/32 pass (big.lua both_fail, pre-existing) |
 | Smoke 57/57 | PASS |
+
+## P16.6 — dead-code cleanup + fast-path comment audit (2026-08-29, verifier Task 1 + Task 8)
+
+### A. `caller_builtin_id` dead state removed
+Grep proof: 12 matches in `src/lua/vm.zig` — 1 field declaration, 6 write/save/restore
+sites (3 in `callCoroutineBuiltinDirect`, 3 in `callBuiltin`), 5 comment references.
+**Zero semantic read sites** — the only reads were `const prev = self.caller_builtin_id`
+save-then-restore pairs, a dead save/restore cycle. The field was set but never read
+for any decision or error message (confirmed by the P15.79 comment: "caller_builtin_id
+workaround removed").
+
+Removed:
+- Field declaration (`Vm.caller_builtin_id`)
+- Save/restore in `callBuiltin` (3 lines)
+- Save/restore in `callCoroutineBuiltinDirect` (3 lines)
+- Stale comment in `coroutineBuiltinFastPathEligible` guard (the `args.len == 0 or
+  args[0] != .Thread` guard is kept — its true purpose is bailing to the generic
+  `callBuiltin` path so the error is raised with full C-frame + YPCALL error-recovery
+  context that the fast path skips; the old comment wrongly attributed this to
+  `caller_builtin_id`)
+- Updated the P15.79 historical comment in `error()` to note the field is fully removed
+
+### B. Coroutine fast-path cost comment corrected
+The old comment claimed `pushBuiltinCFrame` does "a heap allocation (call_frames.addOne)".
+Reality: `FrameStack` has `INLINE_FRAME_CAP=32`; `addOne` uses inline storage for the
+common case (depth ≤ 32, no heap). Heap spill only when depth exceeds the inline cap
+(rare). Rewrote both the `coroutineBuiltinFastPathEligible` and
+`callCoroutineBuiltinDirect` doc comments to reflect measured truths: CallFrame
+init/bookkeeping, bc_stack_top manipulation, generic callBuiltin context, outs Nil-init
+(memset was 6.9%), dispatch overhead; heap spill only when depth > inline cap.
+
+### C. `InlineValues.setOwned` redundant nested check
+Removed `if (vals.len == 0) {}` no-op inside the `if (vals.len == 0)` early-return block.
+
+### Task 8 — coroutine fast-path clean-code audit
+- **No semantic duplication:** `callCoroutineBuiltinDirect` (vm.zig:8475-8476) delegates
+  to the same `builtinCoroutineResume`/`builtinCoroutineYield` bodies as the generic
+  `callBuiltinSwitch` (vm.zig:16382-16383). Both paths call identical builtin functions —
+  no logic duplication, no extraction needed.
+- Guard list unchanged (reviewed in P16.5, correct and understandable).
+- No remaining clean-code observations beyond the comment fixes above.
+
+### Verification
+| Check | Result |
+|-------|--------|
+| Debug build + test | PASS |
+| ReleaseFast build + test | PASS |
+| matrix --testc | zig_fail=0 (big.lua both_fail pre-existing) |
+| Smoke 57/57 | PASS |
+| c_api test + test-diff | PASS (DIFF: PASS) |
+| coroutine.lua --testc | OK |
+| nextvar 3x | OK/OK/OK |
+| CallFrame ≤ 104 | comptime assert PASS |

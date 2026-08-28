@@ -1,0 +1,254 @@
+{
+  "created_utc": "2026-08-28T18:30:17.836516+00:00",
+  "core": "0",
+  "workloads": {
+    "lua_calls": [
+      {
+        "symbol": "vm.Vm.runBytecodeDispatch",
+        "overhead_pct": 82.83
+      },
+      {
+        "symbol": "vm.Vm.pushBytecodeExecFrame",
+        "overhead_pct": 11.98
+      },
+      {
+        "symbol": "vm.Vm.syncFrame",
+        "overhead_pct": 3.8
+      },
+      {
+        "symbol": "vm.FrameStack.addOne",
+        "overhead_pct": 1.38
+      }
+    ],
+    "hash_access": [
+      {
+        "symbol": "vm.Vm.runBytecodeDispatch",
+        "overhead_pct": 89.65
+      },
+      {
+        "symbol": "ltable.Node.keyMatches",
+        "overhead_pct": 10.33
+      }
+    ],
+    "field_access": [
+      {
+        "symbol": "vm.Vm.runBytecodeDispatch",
+        "overhead_pct": 75.7
+      },
+      {
+        "symbol": "ltable.Node.keyMatches",
+        "overhead_pct": 24.26
+      }
+    ],
+    "coroutine_yield": [
+      {
+        "symbol": "vm.Vm.runBytecodeDispatch",
+        "overhead_pct": 40.44
+      },
+      {
+        "symbol": "vm.Vm.builtinCoroutineResume",
+        "overhead_pct": 10.45
+      },
+      {
+        "symbol": "compiler_rt.memset",
+        "overhead_pct": 8.61
+      },
+      {
+        "symbol": "vm.Vm.builtinCoroutineYield",
+        "overhead_pct": 7.47
+      },
+      {
+        "symbol": "vm.Vm.callBuiltin",
+        "overhead_pct": 7.29
+      },
+      {
+        "symbol": "vm.Vm.pushBuiltinCFrame",
+        "overhead_pct": 5.35
+      },
+      {
+        "symbol": "ltable.Node.keyMatches",
+        "overhead_pct": 4.24
+      },
+      {
+        "symbol": "vm.Vm.switchRuntime",
+        "overhead_pct": 3.97
+      },
+      {
+        "symbol": "vm.Vm.finishCcall",
+        "overhead_pct": 1.54
+      },
+      {
+        "symbol": "vm.Vm.runBytecodeInternal",
+        "overhead_pct": 1.49
+      }
+    ],
+    "string_concat": [
+      {
+        "symbol": "heap.SmpAllocator.alloc",
+        "overhead_pct": 23.56
+      },
+      {
+        "symbol": "heap.SmpAllocator.free",
+        "overhead_pct": 22.87
+      },
+      {
+        "symbol": "vm.Vm.advanceBytecodeConcat",
+        "overhead_pct": 8.42
+      },
+      {
+        "symbol": "vm.Vm.runBytecodeDispatch",
+        "overhead_pct": 8.38
+      },
+      {
+        "symbol": "compiler_rt.memcpy.memcpyFast",
+        "overhead_pct": 7.94
+      },
+      {
+        "symbol": "vm.Vm.internStr",
+        "overhead_pct": 7.25
+      },
+      {
+        "symbol": "vm.Vm.gcRegisterObject",
+        "overhead_pct": 3.48
+      },
+      {
+        "symbol": "hash.wyhash.Wyhash.final",
+        "overhead_pct": 3.05
+      },
+      {
+        "symbol": "array_list.Aligned(vm.GcObject,null).ensureTotalCapacity",
+        "overhead_pct": 3.04
+      },
+      {
+        "symbol": "vm.Vm.gcMinorCollection",
+        "overhead_pct": 1.84
+      }
+    ],
+    "string_loop": [
+      {
+        "symbol": "vm.Vm.runBytecodeDispatch",
+        "overhead_pct": 13.86
+      },
+      {
+        "symbol": "heap.SmpAllocator.alloc",
+        "overhead_pct": 13.45
+      },
+      {
+        "symbol": "heap.SmpAllocator.free",
+        "overhead_pct": 12.06
+      },
+      {
+        "symbol": "vm.Vm.internStr",
+        "overhead_pct": 9.11
+      },
+      {
+        "symbol": "compiler_rt.memcpy.memcpyFast",
+        "overhead_pct": 5.37
+      },
+      {
+        "symbol": "vm.Vm.valueToInternedStr",
+        "overhead_pct": 5.21
+      },
+      {
+        "symbol": "hash.wyhash.Wyhash.final",
+        "overhead_pct": 4.6
+      },
+      {
+        "symbol": "vm.Vm.gcRegisterObject",
+        "overhead_pct": 4.43
+      },
+      {
+        "symbol": "vm.Vm.advanceBytecodeConcat",
+        "overhead_pct": 3.82
+      },
+      {
+        "symbol": "vm.Vm.callBuiltin",
+        "overhead_pct": 3.44
+      }
+    ],
+    "metamethod_add": [
+      {
+        "symbol": "vm.Vm.runBytecodeDispatch",
+        "overhead_pct": 19.87
+      },
+      {
+        "symbol": "hash.wyhash.Wyhash.final",
+        "overhead_pct": 8.13
+      },
+      {
+        "symbol": "heap.SmpAllocator.alloc",
+        "overhead_pct": 7.59
+      },
+      {
+        "symbol": "heap.SmpAllocator.free",
+        "overhead_pct": 7.35
+      },
+      {
+        "symbol": "vm.Vm.internStr",
+        "overhead_pct": 3.61
+      },
+      {
+        "symbol": "hash_map.HashMapUnmanaged(vm.GcObject,void,hash_map.AutoContext(vm.GcObject),80).getIndex__anon_48293",
+        "overhead_pct": 3.39
+      },
+      {
+        "symbol": "vm.Vm.setPendingCall",
+        "overhead_pct": 3.25
+      },
+      {
+        "symbol": "vm.Vm.rawGet",
+        "overhead_pct": 2.53
+      },
+      {
+        "symbol": "vm.Vm.metamethodValue",
+        "overhead_pct": 2.43
+      },
+      {
+        "symbol": "vm.Vm.callBuiltin",
+        "overhead_pct": 2.42
+      }
+    ],
+    "temp_table_alloc": [
+      {
+        "symbol": "vm.Vm.runBytecodeDispatch",
+        "overhead_pct": 13.62
+      },
+      {
+        "symbol": "heap.SmpAllocator.alloc",
+        "overhead_pct": 11.14
+      },
+      {
+        "symbol": "hash.wyhash.Wyhash.final",
+        "overhead_pct": 10.24
+      },
+      {
+        "symbol": "heap.SmpAllocator.free",
+        "overhead_pct": 10.23
+      },
+      {
+        "symbol": "ltable.Node.keyMatches",
+        "overhead_pct": 6.39
+      },
+      {
+        "symbol": "vm.Vm.internStr",
+        "overhead_pct": 6.02
+      },
+      {
+        "symbol": "mem.eql__anon_3110",
+        "overhead_pct": 4.23
+      },
+      {
+        "symbol": "vm.Vm.rawGet",
+        "overhead_pct": 4.11
+      },
+      {
+        "symbol": "vm.Vm.gcRegisterObject",
+        "overhead_pct": 3.38
+      },
+      {
+        "symbol": "vm.Vm.allocTable",
+        "overhead_pct": 3.38
+      }
+    ]
+  }
+}

@@ -14,6 +14,7 @@ Usage:
   perf_compare.py --runs N           # override number of median runs (default 7)
   perf_compare.py --no-build         # skip zig build + make lua-c (use existing)
   perf_compare.py --counters         # per-workload hardware counters mode (B1)
+  perf_compare.py --snapshot-out DIR # versioned snapshot: timing + counters + profile
 """
 from __future__ import annotations
 
@@ -79,6 +80,208 @@ WORKLOADS = [
 COUNTER_EVENTS = "cycles:u,instructions:u,branches:u,branch-misses:u,cache-misses:u,cache-references:u"
 
 DEFAULT_COUNTERS_RUNS = 3
+
+# ---------------------------------------------------------------------------
+# Profile index (`--snapshot-out`, P16.5 Task 0)
+# ---------------------------------------------------------------------------
+
+# The 8 hotspot workloads for top-symbol profiling — the workloads where
+# luazig shows the largest slowdown vs PUC and where optimisation work is
+# most likely to pay off.
+PROFILE_WORKLOADS = [
+    "lua_calls", "hash_access", "field_access", "coroutine_yield",
+    "string_concat", "string_loop", "metamethod_add", "temp_table_alloc",
+]
+
+# Standalone Lua scripts for each hotspot workload, with iteration counts
+# tuned so each runs ~2-4 s under luazig ReleaseFast — long enough for perf
+# record to collect thousands of cycle samples. The function bodies are
+# extracted from tools/microbench.lua bench() definitions; only the iteration
+# count differs (10-50x the microbench default, calibrated from the zig
+# median times in the current baseline).
+PROFILE_SCRIPTS: Dict[str, str] = {
+    "lua_calls": (
+        "local function inc(x) return x + 1 end\n"
+        "local function workload(n)\n"
+        "    local s = 0\n"
+        "    for i = 1, n do s = inc(s) end\n"
+        "    return s\n"
+        "end\n"
+        "workload(1000)\n"
+        "local start = os.clock()\n"
+        "workload(75000000)\n"
+        'io.write(string.format("%.6f\\n", os.clock() - start))\n'
+    ),
+    "hash_access": (
+        "local ht = {}\n"
+        "for i = 1, 10000 do ht[i * 100] = i end\n"
+        "local function workload(n)\n"
+        "    local s = 0\n"
+        "    for i = 1, n do s = ht[((i % 10000) + 1) * 100] end\n"
+        "    return s\n"
+        "end\n"
+        "workload(1000)\n"
+        "local start = os.clock()\n"
+        "workload(60000000)\n"
+        'io.write(string.format("%.6f\\n", os.clock() - start))\n'
+    ),
+    "field_access": (
+        "local fields = {}\n"
+        "local function workload(n)\n"
+        "    for i = 1, n do\n"
+        "        fields.x = i\n"
+        "        fields.y = fields.x\n"
+        "    end\n"
+        "end\n"
+        "workload(1000)\n"
+        "local start = os.clock()\n"
+        "workload(100000000)\n"
+        'io.write(string.format("%.6f\\n", os.clock() - start))\n'
+    ),
+    "coroutine_yield": (
+        "local function yielder()\n"
+        "    while true do coroutine.yield(42) end\n"
+        "end\n"
+        "local co = coroutine.create(yielder)\n"
+        "local function workload(n)\n"
+        "    for i = 1, n do coroutine.resume(co) end\n"
+        "end\n"
+        "workload(1000)\n"
+        "local start = os.clock()\n"
+        "workload(10000000)\n"
+        'io.write(string.format("%.6f\\n", os.clock() - start))\n'
+    ),
+    "string_concat": (
+        "local function workload(n)\n"
+        '    local s = ""\n'
+        '    for i = 1, n do s = "x" .. i end\n'
+        "    return s\n"
+        "end\n"
+        "workload(1000)\n"
+        "local start = os.clock()\n"
+        "workload(15000000)\n"
+        'io.write(string.format("%.6f\\n", os.clock() - start))\n'
+    ),
+    "string_loop": (
+        "local function workload(n)\n"
+        '    local s = ""\n'
+        '    for i = 1, n do s = tostring(i) .. ":" end\n'
+        "    return s\n"
+        "end\n"
+        "workload(1000)\n"
+        "local start = os.clock()\n"
+        "workload(12000000)\n"
+        'io.write(string.format("%.6f\\n", os.clock() - start))\n'
+    ),
+    "metamethod_add": (
+        "local mt = { __add = function(a, b) return setmetatable({v = a.v + b.v}, mt) end }\n"
+        "local box = setmetatable({v = 0}, mt)\n"
+        "local function workload(n)\n"
+        "    local s = box\n"
+        "    for i = 1, n do s = s + box end\n"
+        "    return s\n"
+        "end\n"
+        "workload(1000)\n"
+        "local start = os.clock()\n"
+        "workload(7000000)\n"
+        'io.write(string.format("%.6f\\n", os.clock() - start))\n'
+    ),
+    "temp_table_alloc": (
+        "local function workload(n)\n"
+        "    for i = 1, n do local t = {1, 2, 3} end\n"
+        "end\n"
+        "workload(1000)\n"
+        "local start = os.clock()\n"
+        "workload(25000000)\n"
+        'io.write(string.format("%.6f\\n", os.clock() - start))\n'
+    ),
+}
+
+
+def parse_perf_report(text: str, top_n: int = 10) -> list[dict]:
+    """Parse `perf report --stdio --no-children` output into top-N symbols.
+
+    Extracts data lines like:
+        54.19%  luazig   luazig   [.] vm.Vm.runBytecodeDispatch
+    Returns a list of {"symbol": str, "overhead_pct": float} dicts,
+    sorted by overhead descending. Comment/header lines (starting with #)
+    and blank lines are skipped.
+    """
+    entries: list[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Data lines: "54.19%  command  shared_obj  [.] symbol"
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pct = float(parts[0].rstrip("%"))
+        except ValueError:
+            continue
+        symbol_field = parts[3]
+        # Symbol is after "[.] " — strip the prefix if present.
+        if symbol_field.startswith("[.] "):
+            symbol = symbol_field[4:]
+        else:
+            symbol = symbol_field
+        entries.append({"symbol": symbol, "overhead_pct": pct})
+    entries.sort(key=lambda e: e["overhead_pct"], reverse=True)
+    return entries[:top_n]
+
+
+def collect_profile_index(core: str, out_dir: Path) -> dict:
+    """Run perf record + report for each hotspot workload, collect top symbols.
+
+    For each workload in PROFILE_WORKLOADS:
+    1. Write the standalone Lua script to /tmp.
+    2. perf record -e cycles:u -o /tmp/<wl>.perf -- luazig /tmp/<wl>.lua
+    3. perf report --stdio --no-children -i /tmp/<wl>.perf
+    4. Parse top-10 symbols (>=0.1% overhead).
+
+    Writes the index to out_dir/current-profile-index.json and returns it.
+    """
+    results: Dict[str, list[dict]] = {}
+    for wl in PROFILE_WORKLOADS:
+        script = PROFILE_SCRIPTS[wl]
+        script_path = Path(tempfile.gettempdir()) / f"perf_profile_{wl}.lua"
+        script_path.write_text(script, encoding="utf-8")
+        data_file = Path(tempfile.gettempdir()) / f"perf_profile_{wl}.perf"
+
+        print(f"  profile {wl}: perf record ...", flush=True)
+        subprocess.run(
+            ["taskset", "-c", core, "perf", "record",
+             "-e", "cycles:u", "-o", str(data_file),
+             str(ZIG_LUA), str(script_path)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=BENCH_TIMEOUT_S, check=True,
+        )
+
+        report_proc = subprocess.run(
+            ["perf", "report", "--stdio", "--no-children",
+             "-i", str(data_file), "--percent-limit", "0.1"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=BENCH_TIMEOUT_S, check=True,
+        )
+        symbols = parse_perf_report(report_proc.stdout, top_n=10)
+        results[wl] = symbols
+        if symbols:
+            top = symbols[0]
+            print(f"    top: {top['symbol']} ({top['overhead_pct']:.1f}%)")
+
+        # Clean up perf.data to avoid filling /tmp.
+        data_file.unlink(missing_ok=True)
+
+    index = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "core": core,
+        "workloads": results,
+    }
+    out_path = out_dir / "current-profile-index.json"
+    out_path.write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
+    print(f"  wrote {out_path}")
+    return index
 
 # Intermediate-python helper for exact per-workload max-RSS.
 #
@@ -195,12 +398,12 @@ def derived(c: Dict[str, float]) -> Dict[str, float]:
     return out
 
 
-def run_counters_mode(args) -> int:
-    """B1 mode: per-workload hardware counters for zig and puc."""
-    print(f"\n>> counters mode: {args.counters_runs} median runs per workload, "
-          f"pinned to core {args.core}")
-    print(f">> zig: {ZIG_LUA}")
-    print(f">> puc: {PUC_LUA}")
+def collect_counters(args) -> Dict[str, dict]:
+    """Collect per-workload hardware counters for zig and puc.
+
+    Shared core of `--counters` and `--snapshot-out`. Returns the results
+    dict (same structure as the ``workloads`` key in the counters JSON).
+    """
     results: Dict[str, dict] = {}
     for wl in WORKLOADS:
         entry: dict = {}
@@ -209,9 +412,11 @@ def run_counters_mode(args) -> int:
             raw = perf_stat_workload(lua_bin, wl, args.core, args.counters_runs)
             # RSS + CPU come from a plain (perf-less) run: perf adds overhead.
             rsrc = rss_cpu_workload(lua_bin, wl, args.core)
+            cpi = (raw["cycles"] / raw["instructions"]) if raw.get("cycles") and raw.get("instructions") else None
             entry[label] = {
                 "counters": raw,
                 "ipc": derived(raw).get("ipc"),
+                "cpi": cpi,
                 "branch_miss_ratio": derived(raw).get("branch_miss_ratio"),
                 "cache_miss_ratio": derived(raw).get("cache_miss_ratio"),
                 "maxrss_kb": rsrc["maxrss_kb"],
@@ -226,6 +431,16 @@ def run_counters_mode(args) -> int:
         entry["zig_vm_instructions"] = zig_instrs
         entry["instr_ratio"] = (zig_instrs / puc_instrs) if puc_instrs else None
         results[wl] = entry
+    return results
+
+
+def run_counters_mode(args) -> int:
+    """B1 mode: per-workload hardware counters for zig and puc."""
+    print(f"\n>> counters mode: {args.counters_runs} median runs per workload, "
+          f"pinned to core {args.core}")
+    print(f">> zig: {ZIG_LUA}")
+    print(f">> puc: {PUC_LUA}")
+    results = collect_counters(args)
 
     # Human table (full detail goes to --json-out).
     print(f"\n{'Workload':<18} {'zigIPC':>7} {'pucIPC':>7} {'zigBr%':>7} {'pucBr%':>7} "
@@ -259,6 +474,90 @@ def run_counters_mode(args) -> int:
             out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
         print(f"\njson: {out_path}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Snapshot mode (`--snapshot-out`, P16.5 Task 0)
+# ---------------------------------------------------------------------------
+
+def run_snapshot_mode(args) -> int:
+    """Produce the versioned perf snapshot — three JSON artifacts.
+
+    Writes to the --snapshot-out directory:
+      current.json               — per-workload timing + geomean + zig version
+      current-counters.json      — per-workload hardware counters (zig + puc)
+      current-profile-index.json — top-N symbols for 8 hotspot workloads
+
+    This is the reproducible artifact that roadmap decisions cite. It is
+    SEPARATE from the regression baseline (baseline-p15.37.json): the baseline
+    is for regression checking, current.json is the versioned snapshot.
+    """
+    out_dir = Path(args.snapshot_out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    zig_version = subprocess.check_output(["zig", "version"], text=True).strip()
+
+    # --- 1. Timing: median-of-N → current.json ---
+    print(f"\n>> snapshot: timing {args.runs} runs each, pinned to core {args.core}")
+    print(f">> zig: {ZIG_LUA}")
+    print(f">> puc: {PUC_LUA}")
+    zig = median_runs(ZIG_LUA, args.runs, args.core, "zig")
+    puc = median_runs(PUC_LUA, args.runs, args.core, "puc")
+    print_table(zig, puc)
+
+    ratios = {n: zig[n] / puc[n] for n in zig if n in puc and puc[n]}
+    geomean = math.exp(sum(math.log(r) for r in ratios.values()) / len(ratios)) if ratios else 0.0
+
+    current = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "zig_version": zig_version,
+        "host": {
+            "platform": platform.platform(),
+            "python": platform.python_version(),
+        },
+        "runs": args.runs,
+        "core": args.core,
+        "geomean": geomean,
+        "workloads": {
+            n: {"zig_s": zig[n], "puc_s": puc[n], "ratio": ratios[n]}
+            for n in zig if n in puc
+        },
+        # Legacy fields for backward compat with status_summary --perf-json
+        "zig": zig,
+        "puc": puc,
+        "ratios": ratios,
+    }
+    current_path = out_dir / "current.json"
+    current_path.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
+    print(f"\n>> wrote {current_path} (geomean {geomean:.2f}x)")
+
+    # --- 2. Counters: reduced runs → current-counters.json ---
+    print(f"\n>> snapshot: counters {args.counters_runs} runs each, pinned to core {args.core}")
+    counters_results = collect_counters(args)
+    counters_doc = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "zig_version": zig_version,
+        "mode": "counters",
+        "runs": args.counters_runs,
+        "core": args.core,
+        "host": {
+            "platform": platform.platform(),
+            "python": platform.python_version(),
+        },
+        "events": COUNTER_EVENTS,
+        "workloads": counters_results,
+    }
+    counters_path = out_dir / "current-counters.json"
+    counters_path.write_text(json.dumps(counters_doc, indent=2) + "\n", encoding="utf-8")
+    print(f">> wrote {counters_path}")
+
+    # --- 3. Profile index: 8 hotspot workloads → current-profile-index.json ---
+    print(f"\n>> snapshot: profile index for {len(PROFILE_WORKLOADS)} hotspot workloads")
+    collect_profile_index(args.core, out_dir)
+
+    print(f"\n>> snapshot complete: {out_dir}/")
+    print(f">> geomean: {geomean:.2f}x")
     return 0
 
 
@@ -406,6 +705,9 @@ def main() -> int:
                     help=f"median runs per workload in --counters mode (default {DEFAULT_COUNTERS_RUNS})")
     ap.add_argument("--json-out", default="",
                     help="write the current run result dict to PATH (baseline untouched)")
+    ap.add_argument("--snapshot-out", default="",
+                    help="produce versioned snapshot (current.json + current-counters.json + "
+                         "current-profile-index.json) in DIR; supersedes --counters/--json-out")
     args = ap.parse_args()
 
     if args.runs < 1:
@@ -417,6 +719,9 @@ def main() -> int:
         build_all()
     else:
         ensure_built()
+
+    if args.snapshot_out:
+        return run_snapshot_mode(args)
 
     if args.counters:
         return run_counters_mode(args)

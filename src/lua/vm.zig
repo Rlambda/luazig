@@ -7386,7 +7386,23 @@ pub const Vm = struct {
         var regs = self.bc_stack[parent.base .. parent.base + parent.u.lua.frame_cap];
         var boxed = self.bc_boxed[parent.base .. parent.base + parent.u.lua.frame_cap];
         const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
-        try self.bcGrowFrame(parent.base, dst + nstore, &parent.u.lua.frame_cap, &regs, &boxed);
+        // P16.2e (CHANGE 5): Guard bcGrowFrame — only call when growth is
+        // actually needed. bcGrowFrame unconditionally re-derives regs/boxed
+        // slices even when no growth occurs, which is pure overhead on the
+        // return hot path. The guard condition (dst + nstore > frame_cap) is
+        // semantically identical to bcGrowFrame's internal check.
+        //
+        // Safety: the slices derived above are always valid because they are
+        // computed from the current self.bc_stack pointer. No code between the
+        // derivation and the write below can reallocate bc_stack (it is a
+        // simple loop copy). If a previous operation in this caller did
+        // reallocate bc_stack, the slices were derived AFTER that realloc, so
+        // they point into the current allocation. The parent frame's
+        // frame_cap field is always up-to-date (frames are not moved by stack
+        // realloc — only the bc_stack/bc_boxed arrays grow).
+        if (dst + nstore > parent.u.lua.frame_cap) {
+            try self.bcGrowFrame(parent.base, dst + nstore, &parent.u.lua.frame_cap, &regs, &boxed);
+        }
         for (0..nstore) |i| regs[dst + i] = if (i < ret.len) ret[i] else .Nil;
         if (nresults < 0) parent.reg_top = @intCast(@as(usize, dst) + ret.len);
         parent.u.lua.pc += 1;

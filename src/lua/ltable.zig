@@ -450,6 +450,108 @@ pub inline fn nodeLookup(nodes: []Node, key: Value, seed: u64) ?*Node {
     }
 }
 
+/// Specialized integer-key hash lookup — PUC `getintfromhash` (ltable.c:929-942).
+///
+/// PUC has a dedicated `getintfromhash(Table *t, lua_Integer key)` that hashes
+/// via `hashint(t, key)` and walks the chain comparing ONLY `keyisinteger(n) &&
+/// keyival(n) == key` — no `keyeq` macro, no `TValue` construction, no tag
+/// switch per chain step. This is the Zig equivalent.
+///
+/// **Position-match proof vs generic path:** the generic `nodeLookup` computes
+/// `mainPosition(len, .{ .Int = key }, seed)` = `keyHash(.{ .Int = key }, seed)
+/// & (len - 1)` = `hashInt(key, seed) & (len - 1)`. This function computes
+/// `hashInt(key, seed) & (nodes.len - 1)` — the exact same expression, using
+/// the same `hashInt` function (ltable.zig:406) with the same `seed` parameter.
+/// Positions match EXACTLY.
+///
+/// **Chain-walk equivalence:** the generic path calls `n.keyMatches(key)`,
+/// which for `.int` nodes evaluates `key == .Int and self.key_val.int == key.Int`.
+/// Since the caller guarantees `key` is an integer, `key == .Int` is always
+/// true, so the check reduces to `self.key_val.int == key.Int` — identical to
+/// this function's `n.key_val.int == key`. For `.empty`/`.dead`/other-tag
+/// nodes, `n.key_tt == .int` is false, matching `keyMatches`'s `.empty, .dead
+/// => false` and the tag-mismatch arms. Empty-bucket termination (`isEmpty`)
+/// and chain-end termination (`nextNode orelse null`) are identical to
+/// `nodeLookup`.
+pub inline fn nodeLookupInt(nodes: []Node, key: i64, seed: u64) ?*Node {
+    if (nodes.len == 0) return null;
+    // Same hash as the generic .Int path: hashInt(key, seed) & (len-1).
+    const mp: usize = hashInt(key, seed) & (nodes.len - 1);
+    var n: *Node = &nodes[mp];
+    if (n.isEmpty()) return null; // bucket unused => key not present
+    while (true) {
+        // Direct field compare — no Value construction, no tag switch.
+        // PUC ltable.c:933: `if (keyisinteger(n) && keyival(n) == key)`.
+        if (n.key_tt == .int and n.key_val.int == key) return n;
+        n = n.nextNode(nodes) orelse return null;
+    }
+}
+
+test "nodeLookupInt returns null for empty hash part" {
+    const nodes = try std.testing.allocator.alloc(Node, 4);
+    defer std.testing.allocator.free(nodes);
+    for (nodes) |*n| n.* = .{};
+    try std.testing.expect(nodeLookupInt(nodes, 7, 0) == null);
+}
+
+test "nodeLookupInt finds an inserted key at its main position" {
+    const nodes = try std.testing.allocator.alloc(Node, 4);
+    defer std.testing.allocator.free(nodes);
+    for (nodes) |*n| n.* = .{};
+    const key: i64 = 7;
+    const mp: usize = hashInt(key, 0) & (nodes.len - 1);
+    nodes[mp].setKey(.{ .Int = key });
+    nodes[mp].value = .{ .Int = 70 };
+    const found = nodeLookupInt(nodes, key, 0).?;
+    try std.testing.expectEqual(@as(i64, 70), found.value.Int);
+}
+
+test "nodeLookupInt agrees with nodeLookup for int keys across a range" {
+    const cap = 16;
+    const nodes = try std.testing.allocator.alloc(Node, cap);
+    defer std.testing.allocator.free(nodes);
+    for (nodes) |*n| n.* = .{};
+    var lastfree: usize = nodes.len;
+    // Insert 15 int keys (leave one free slot for chain appends).
+    var i: i64 = 1;
+    while (i < cap) : (i += 1) {
+        _ = nodeInsert(nodes, &lastfree, .{ .Int = i }, .{ .Int = i * 10 }, 0);
+    }
+    // Every key must be found by BOTH paths, with identical results.
+    var k: i64 = 1;
+    while (k < cap) : (k += 1) {
+        const generic = nodeLookup(nodes, .{ .Int = k }, 0);
+        const specialized = nodeLookupInt(nodes, k, 0);
+        try std.testing.expect(generic != null);
+        try std.testing.expect(specialized != null);
+        try std.testing.expectEqual(generic.?.value, specialized.?.value);
+    }
+    // Absent key: both return null.
+    try std.testing.expect(nodeLookupInt(nodes, 99999, 0) == null);
+}
+
+test "nodeLookupInt skips dead keys and non-int keys in the chain" {
+    const nodes = try std.testing.allocator.alloc(Node, 4);
+    defer std.testing.allocator.free(nodes);
+    for (nodes) |*n| n.* = .{};
+    // Place a dead node at the main position for key 7, and a live int node
+    // chained after it. nodeLookupInt must skip the dead node and find the
+    // live one — same as the generic nodeLookup.
+    const key: i64 = 7;
+    const mp: usize = hashInt(key, 0) & (nodes.len - 1);
+    nodes[mp].key_tt = .table; // non-int key at main position
+    nodes[mp].key_val = .{ .table = @ptrFromInt(@as(usize, 0x1234) & ~@as(usize, @alignOf(*Table) - 1)) };
+    nodes[mp].value = .Nil;
+    nodes[mp].markDeadKey();
+    // Chain to a free slot holding the real int key.
+    const free_idx: usize = (mp + 1) % nodes.len;
+    nodes[free_idx].setKey(.{ .Int = key });
+    nodes[free_idx].value = .{ .Int = 42 };
+    nodes[mp].next_offset = @intCast(@as(i64, @intCast(free_idx)) - @as(i64, @intCast(mp)));
+    const found = nodeLookupInt(nodes, key, 0).?;
+    try std.testing.expectEqual(@as(i64, 42), found.value.Int);
+}
+
 /// Raw GC pointer from a collectable Value (PUC `gcvalue(k1)`, ltable.c:260).
 /// Returns null for non-collectable values (Nil/Int/Num/Bool/Builtin/
 /// LightUserdata). Used by `keyMatchesDeadok` to compare a live collectable

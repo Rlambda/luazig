@@ -11792,7 +11792,11 @@ pub const Vm = struct {
                                 if (key.Int <= arr_len) {
                                     ctx.regs[a] = tbl.array[@intCast(key.Int - 1)];
                                 } else {
-                                    ctx.regs[a] = if (ltable.nodeLookup(tbl.hash, key, self.hash_seed)) |node|
+                                    // P16.6: specialized int hash lookup (PUC
+                                    // getintfromhash, ltable.c:929-942). Key is
+                                    // provably .Int — skip Value construction
+                                    // and the generic keyMatches tag switch.
+                                    ctx.regs[a] = if (ltable.nodeLookupInt(tbl.hash, key.Int, self.hash_seed)) |node|
                                         node.value
                                     else
                                         .Nil;
@@ -11832,7 +11836,14 @@ pub const Vm = struct {
                                 ctx.regs[a] = tbl.array[k - 1];
                             } else {
                                 @branchHint(.unlikely);
-                                ctx.regs[a] = self.rawGet(tbl, .{ .Int = @intCast(c) });
+                                // P16.6: specialized int hash lookup (PUC
+                                // getintfromhash). Key is provably .Int (c is
+                                // u8, 1-based) and outside array range — skip
+                                // rawGet's switch + redundant array check.
+                                ctx.regs[a] = if (ltable.nodeLookupInt(tbl.hash, @intCast(c), self.hash_seed)) |node|
+                                    node.value
+                                else
+                                    .Nil;
                             }
                         } else {
                             @branchHint(.unlikely);
@@ -11971,6 +11982,56 @@ pub const Vm = struct {
                                 } else {
                                     // Slow path: new key insertion (may rehash).
                                     try self.rawSet(tbl, key, val);
+                                }
+                            } else if (key == .Int) {
+                                // P16.6: Int-key fast path mirroring the String
+                                // path. For keys in array range, direct array
+                                // write (PUC ikeyinarray). For hash-part keys,
+                                // specialized nodeLookupInt (PUC getintfromhash)
+                                // for existing-key update; falls back to rawSet
+                                // for new-key insertion (may rehash).
+                                if (self.stats.enabled) self.stats.tbl_set_fast_int += 1; // P16.0b
+                                const k = key.Int;
+                                if (k >= 1) {
+                                    const arr_len: i64 = @intCast(tbl.asize);
+                                    if (k <= arr_len) {
+                                        tbl.array[@intCast(k - 1)] = val;
+                                        try self.gcWriteBarrierTable(tbl, val);
+                                    } else {
+                                        // Hash-part lookup: specialized int path.
+                                        try self.gcTableWriteBarrier(tbl, key, val);
+                                        if (ltable.nodeLookupInt(tbl.hash, k, self.hash_seed)) |node| {
+                                            if (self.stats.enabled) self.stats.tbl_update += 1; // P16.0b
+                                            if (val == .Nil) {
+                                                _ = ltable.nodeDelete(tbl.hash, key, self.hash_seed);
+                                            } else {
+                                                // Reviving a dead node: invalidate TM cache.
+                                                if (node.value == .Nil) {
+                                                    tbl.flags &= ~TableFlags.MASK;
+                                                }
+                                                node.value = val;
+                                            }
+                                        } else {
+                                            // Slow path: new key insertion.
+                                            try self.rawSet(tbl, key, val);
+                                        }
+                                    }
+                                } else {
+                                    // Negative/zero int key: hash part only.
+                                    try self.gcTableWriteBarrier(tbl, key, val);
+                                    if (ltable.nodeLookupInt(tbl.hash, k, self.hash_seed)) |node| {
+                                        if (self.stats.enabled) self.stats.tbl_update += 1; // P16.0b
+                                        if (val == .Nil) {
+                                            _ = ltable.nodeDelete(tbl.hash, key, self.hash_seed);
+                                        } else {
+                                            if (node.value == .Nil) {
+                                                tbl.flags &= ~TableFlags.MASK;
+                                            }
+                                            node.value = val;
+                                        }
+                                    } else {
+                                        try self.rawSet(tbl, key, val);
+                                    }
                                 }
                             } else {
                                 @branchHint(.unlikely);
@@ -32465,7 +32526,9 @@ pub const Vm = struct {
     fn hashIntIsPresent(self: *const Vm, tbl: *const Table, key: u64) bool {
         if (tbl.hash.len == 0) return false;
         const ikey: i64 = @bitCast(key);
-        const node = ltable.nodeLookup(tbl.hash, .{ .Int = ikey }, self.hash_seed) orelse return false;
+        // P16.6: specialized int hash lookup (PUC getintfromhash). Key is
+        // provably integer — skip Value construction + generic tag switch.
+        const node = ltable.nodeLookupInt(tbl.hash, ikey, self.hash_seed) orelse return false;
         return node.value != .Nil;
     }
 

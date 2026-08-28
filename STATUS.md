@@ -3946,3 +3946,79 @@ Removed `if (vals.len == 0) {}` no-op inside the `if (vals.len == 0)` early-retu
 | coroutine.lua --testc | OK |
 | nextvar 3x | OK/OK/OK |
 | CallFrame ≤ 104 | comptime assert PASS |
+
+## P16.6 — typed TmsEvent (PUC order) + MetaField separation; getTm/getTmByObj/fastTm primitives (2026-08-29, verifier P16.6 Tasks 2+3)
+
+### A. TmsEvent enum migrated to PUC-only order
+Removed non-PUC members from `TmsEvent`: `iter`, `tostring`, `name`, `pairs`, `metatable`.
+The enum now matches PUC `ltm.h:18-45` exactly (24 members, `index`..`close`).
+- **`.iter`** (`__iter`): dead code — initialized in `tm_names` but never looked up by any
+  dispatch path. PUC 5.5 has no `__iter` TMS. Removed entirely; no replacement needed.
+- **`.tostring`, `.pairs`**: moved to `MetaField` enum. Were used indirectly via
+  `matchTmsEvent` → `metamethodValueByEvent`. Now accessed via `getMetaFieldByObj(v, .tostring/.pairs)`.
+- **`.name`, `.metatable`**: moved to `MetaField` enum. Were dead in `TmsEvent` (never looked up
+  via `matchTmsEvent` — `__name`/`__metatable` used `getFieldOpt` directly). Now accessed via
+  `getMetaField(mt, .name/.metatable)`.
+
+### B. MetaField enum + metafield_names
+New `MetaField = enum(u8) { pairs, tostring, name, metatable }` with `metafield_names: [4]?*LuaString`
+pre-interned at VM init (same pattern as `tm_names`). GC marking extended to pin
+`metafield_names` strings (same as `tm_names`).
+
+### C. getTm / getTmByObj / fastTm primitives (ltm.c parity)
+- **`getTm(mt, event)`** — PUC `luaT_gettm` without flags cache: hash lookup via `nodeLookupStr`
+  (pointer-identity for interned names). For ALL events (cached and non-cached).
+- **`getTmByObj(v, event)`** — PUC `luaT_gettmbyobj`: resolves metatable for `v`, then `getTm`.
+  Does NOT use flags cache — matches PUC exactly. Every lookup hits the metatable, so dynamic
+  `mt.__add` mutation is visible immediately (verifier red line).
+- **`fastTm(mt, event)`** — PUC `gfasttm`/`fasttm`: flags cache + `getTm` + cache-on-miss.
+  ONLY for events `<= .eq` (index, newindex, gc, mode, len, eq). Renamed from `fasttm`.
+- **`getMetaField(mt, field)`** / **`getMetaFieldByObj(v, field)`** — non-TMS metafield lookup
+  via `metafield_names` (same `nodeLookupStr` fast path).
+
+### D. nodeLookupStr signature cleaned
+Dropped unused `seed` parameter from `nodeLookupStr(nodes, key)` (was `nodeLookupStr(nodes, key, seed)`).
+The `seed` was baked into `key.hash` at intern time and explicitly discarded (`_ = seed`).
+Updated all 6 call sites in `vm.zig` and 5 test call sites in `ltable.zig`.
+
+### E. Table.flags fastTm semantics + invalidation proof
+`fastTm` mirrors PUC `gfasttm` exactly:
+- **Cache check**: `mt.flags & bit(event)` → return null if set ("absent").
+- **Cache-on-miss**: on nil lookup result, set the bit (`mt.flags |= bit`).
+- **Invalidation**: `rawSet` invalidates ALL flags (`mt.flags &= ~TableFlags.MASK`) on:
+  (1) new key insertion (`nodeInsert` success), (2) dead-node revival (nil→non-nil update),
+  (3) post-rehash insertion. This matches PUC `invalidateTMcache` called from
+  `luaH_newkey`/`luaH_finishset` — PUC also clears ALL flags unconditionally.
+- **No caching for events > .eq**: `getTmByObj` uses `getTm` (no flags) for ALL events.
+  `fastTm` is only called directly from opcode fast paths (GETTABLE/SETTABLE/GETFIELD/SETFIELD/LEN)
+  with events <= .eq. The arithmetic/compare/concat/call/close paths all use `getTmByObj`.
+
+### F. Call site migration
+Migrated all string-based metamethod lookups to typed events:
+- **TMS sites** (arithmetic/compare/concat/index/newindex/len/eq/call/close/gc/mode):
+  `metamethodValue(v, "__xxx")` → `getTmByObj(v, .xxx)`. Count: ~20 sites in vm.zig + 2 in api.zig + 1 in c_api.zig.
+- **MetaField sites** (tostring/pairs): `metamethodValue(v, "__tostring/__pairs")` → `getMetaFieldByObj(v, .tostring/.pairs)`. Count: ~9 sites.
+- **MetaField sites** (name/metatable): `getFieldOpt(mt, "__name/__metatable")` → `getMetaField(mt, .name/.metatable)`. Count: 4 sites.
+- **`callBinaryMetamethod`/`callUnaryMetamethod`**: changed `mm_name: []const u8` → `event: TmsEvent`,
+  use `getTmByObj` internally. All ~45 call sites updated (`"__add"` → `.add`, etc.).
+- **`tryPushBytecodeBinaryMetamethod`/`tryPushBytecodeUnaryMetamethod`**: same signature change.
+  All ~35 call sites updated. Two `tm_str` variables (ADDI/SHRI negation peephole) changed from
+  `[]const u8` to `TmsEvent`.
+
+### G. matchTmsEvent fate: DELETED
+`matchTmsEvent` (string→TmsEvent linear scan over `tm_names`), `metamethodValue` (string-based
+metamethod lookup), and `metamethodValueByEvent` (non-cached event lookup) are all DELETED.
+Zero call sites remain — all migrated to typed `getTmByObj`/`getTm`/`fastTm`/`getMetaFieldByObj`/`getMetaField`.
+
+### Verification
+| Check | Result |
+|-------|--------|
+| Debug build + test | PASS |
+| ReleaseFast build + test | PASS |
+| matrix --testc | zig_fail=0 (big.lua both_fail pre-existing) |
+| Smoke 57/57 | PASS (incl. 57_finalizer_reach — gc/mode/eq events) |
+| c_api test + test-diff | PASS (DIFF: PASS) |
+| nextvar 3x | OK/OK/OK |
+| gengc/gc/closure/events/coroutine --testc | all OK |
+| CallFrame ≤ 104 | comptime assert PASS |
+| perf_compare --runs 5 | OK (no regressions, geomean 2.22x, metamethod_add -6.1%) |

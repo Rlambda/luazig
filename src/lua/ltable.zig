@@ -581,8 +581,7 @@ test "nodeLookupInt skips dead keys and non-int keys in the chain" {
 /// => false` and the tag-mismatch arms. Empty-bucket termination (`isEmpty`)
 /// and chain-end termination (`nextNode orelse null`) are identical to
 /// `nodeLookup`.
-pub inline fn nodeLookupStr(nodes: []Node, key: *LuaString, seed: u64) ?*Node {
-    _ = seed; // seed is baked into key.hash at intern time — not used here.
+pub inline fn nodeLookupStr(nodes: []Node, key: *LuaString) ?*Node {
     if (nodes.len == 0) return null;
     // Same hash as the generic .String path: key.hash & (len-1).
     // keyHash(.{ .String = key }) = key.hash (ltable.zig:382, no computation).
@@ -603,7 +602,7 @@ test "nodeLookupStr returns null for empty hash part" {
     for (nodes) |*n| n.* = .{};
     // Build a dummy LuaString with a known hash.
     var ls: LuaString = .{ .hash = 0, .len = 0, .is_short = true };
-    try std.testing.expect(nodeLookupStr(nodes, &ls, 0) == null);
+    try std.testing.expect(nodeLookupStr(nodes, &ls) == null);
 }
 
 test "nodeLookupStr finds an interned string key at its main position" {
@@ -615,7 +614,7 @@ test "nodeLookupStr finds an interned string key at its main position" {
     const mp: usize = ls.hash & (nodes.len - 1);
     nodes[mp].setKey(.{ .String = &ls });
     nodes[mp].value = .{ .Int = 77 };
-    const found = nodeLookupStr(nodes, &ls, 0).?;
+    const found = nodeLookupStr(nodes, &ls).?;
     try std.testing.expectEqual(@as(i64, 77), found.value.Int);
 }
 
@@ -636,7 +635,7 @@ test "nodeLookupStr agrees with nodeLookup for string keys" {
     var k: usize = 0;
     while (k < 15) : (k += 1) {
         const generic = nodeLookup(nodes, .{ .String = &keys[k] }, 0);
-        const specialized = nodeLookupStr(nodes, &keys[k], 0);
+        const specialized = nodeLookupStr(nodes, &keys[k]);
         try std.testing.expect(generic != null);
         try std.testing.expect(specialized != null);
         try std.testing.expectEqual(generic.?.value, specialized.?.value);
@@ -644,7 +643,7 @@ test "nodeLookupStr agrees with nodeLookup for string keys" {
     // Absent key: both return null.
     var absent: LuaString = .{ .hash = 0x1234_5678, .len = 0, .is_short = true };
     try std.testing.expect(nodeLookup(nodes, .{ .String = &absent }, 0) == null);
-    try std.testing.expect(nodeLookupStr(nodes, &absent, 0) == null);
+    try std.testing.expect(nodeLookupStr(nodes, &absent) == null);
 }
 
 test "nodeLookupStr skips dead keys and non-string keys in the chain" {
@@ -663,7 +662,7 @@ test "nodeLookupStr skips dead keys and non-string keys in the chain" {
     nodes[free_idx].setKey(.{ .String = &ls });
     nodes[free_idx].value = .{ .Int = 42 };
     nodes[mp].next_offset = @intCast(@as(i64, @intCast(free_idx)) - @as(i64, @intCast(mp)));
-    const found = nodeLookupStr(nodes, &ls, 0).?;
+    const found = nodeLookupStr(nodes, &ls).?;
     try std.testing.expectEqual(@as(i64, 42), found.value.Int);
 }
 

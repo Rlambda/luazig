@@ -2602,10 +2602,14 @@ fn gcCanFinalize(obj: GcObject) bool {
     };
 }
 
-/// PUC Lua tag-method events (`ltm.h:19-27`). The ordering MUST match PUC:
-/// only events `<= .eq` are cached in `Table.flags` (PUC `checknoTM` /
-/// `gfasttm`, `ltm.h:63-68`). Events above `.eq` (arithmetic, comparison,
-/// call, iter, close) are NOT cached — they always do a hash lookup.
+/// PUC Lua tag-method events (`ltm.h:18-45`). The ordering MUST match PUC
+/// exactly: only events `<= .eq` are cached in `Table.flags` (PUC
+/// `checknoTM` / `gfasttm`, `ltm.h:63-68`). Events above `.eq` (arithmetic,
+/// comparison, call, close) are NOT cached — they always do a hash lookup.
+///
+/// Non-TMS metafields (`__pairs`, `__tostring`, `__name`, `__metatable`) are
+/// NOT part of this enum — PUC handles them via `luaL_getmetafield` (direct
+/// string lookup), not via `tmname[]`. They live in `MetaField` below.
 const TmsEvent = enum(u5) {
     index = 0, // __index
     newindex = 1, // __newindex
@@ -2632,12 +2636,24 @@ const TmsEvent = enum(u5) {
     le,
     concat,
     call,
-    iter,
     close,
-    tostring,
-    name,
-    pairs,
-    metatable,
+};
+
+/// Non-TMS metafields — metamethod names that PUC Lua does NOT include in
+/// the `TMS` enum (`ltm.h:18-45`). PUC handles these via `luaL_getmetafield`
+/// (lauxlib.c) or direct `luaH_Hgetshortstr` calls (ltm.c:95 for `__name`),
+/// not via `tmname[]`. They are pre-interned separately in `metafield_names`
+/// for pointer-identity lookups, mirroring how PUC interns them on demand
+/// via `luaS_new(L, "__name")` etc.
+///
+/// `__iter` does not exist in PUC 5.5 at all (no TMS entry, no metafield
+/// lookup). The old luazig `TmsEvent.iter` was dead code — initialized in
+/// `tm_names` but never looked up by any dispatch path. Removed entirely.
+const MetaField = enum(u8) {
+    pairs, // __pairs (lbaselib.c:287 via luaL_getmetafield)
+    tostring, // __tostring (lauxlib.c:924 via luaL_callmeta)
+    name, // __name (ltm.c:95 via luaH_Hgetshortstr)
+    metatable, // __metatable (lbaselib.c:134 via luaL_getmetafield)
 };
 
 /// Maximum event index cached in `Table.flags`. Matches PUC's
@@ -2955,15 +2971,21 @@ pub const Vm = struct {
     // userdata.
     light_userdata_metatable: ?*Table = null,
     /// Pre-interned metamethod name strings, indexed by `TmsEvent`.
-    /// Used by `fasttm` for pointer-identity key comparison (avoids
+    /// Used by `fastTm`/`getTm` for pointer-identity key comparison (avoids
     /// `internStrAssume` hashmap lookup on every metamethod check).
     /// Populated in `Vm.init` after `string_intern` is ready.
     /// Entries for events <= TM_FAST_MAX are the 6 cached metamethods;
     /// entries above are for non-cached events (still useful for key
-    /// comparison in `rawSet` invalidation, though we invalidate all
-    /// bits unconditionally like PUC).
+    /// comparison in `getTm` lookups).
     tm_names: [@typeInfo(TmsEvent).@"enum".fields.len]?*LuaString =
         [_]?*LuaString{null} ** @typeInfo(TmsEvent).@"enum".fields.len,
+    /// Pre-interned non-TMS metafield name strings, indexed by `MetaField`.
+    /// These are the metamethod names that PUC does NOT include in `TMS`
+    /// (`__pairs`, `__tostring`, `__name`, `__metatable`). PUC looks them up
+    /// via `luaL_getmetafield` / `luaH_Hgetshortstr` with on-demand interning.
+    /// We pre-intern them for the same pointer-identity fast path as `tm_names`.
+    metafield_names: [@typeInfo(MetaField).@"enum".fields.len]?*LuaString =
+        [_]?*LuaString{null} ** @typeInfo(MetaField).@"enum".fields.len,
     /// PUC lmathlib.c `setrandfunc`: the initial seed comes from
     /// `luaL_makeseed` which mixes `time(NULL)` + a stack address.
     /// We approximate with `std.time.timestamp()` + address of a local.
@@ -3673,9 +3695,9 @@ pub const Vm = struct {
         // Pre-intern all metamethod name strings ("__index", "__newindex",
         // "__gc", "__mode", "__len", "__eq", "__add", ...). These are short
         // strings so they go through `string_intern` and deduplicate to a
-        // single canonical *LuaString pointer. `fasttm` uses pointer identity
-        // for key comparison, avoiding `internStrAssume` on every lookup.
-        // Mirrors PUC's `luaT_init` (ltm.c:89-94) which pre-interns
+        // single canonical *LuaString pointer. `fastTm`/`getTm` uses pointer
+        // identity for key comparison, avoiding `internStrAssume` on every
+        // lookup. Mirrors PUC's `luaT_init` (ltm.c:38-53) which pre-interns
         // `tmname[]` at VM startup.
         {
             const names = [_]struct { ev: TmsEvent, s: []const u8 }{
@@ -3703,15 +3725,26 @@ pub const Vm = struct {
                 .{ .ev = .le, .s = "__le" },
                 .{ .ev = .concat, .s = "__concat" },
                 .{ .ev = .call, .s = "__call" },
-                .{ .ev = .iter, .s = "__iter" },
                 .{ .ev = .close, .s = "__close" },
-                .{ .ev = .tostring, .s = "__tostring" },
-                .{ .ev = .name, .s = "__name" },
-                .{ .ev = .pairs, .s = "__pairs" },
-                .{ .ev = .metatable, .s = "__metatable" },
             };
             inline for (names) |entry| {
                 vm.tm_names[@intFromEnum(entry.ev)] =
+                    vm.internStr(entry.s) catch @panic("oom");
+            }
+        }
+        // Pre-intern non-TMS metafield names ("__pairs", "__tostring",
+        // "__name", "__metatable"). PUC does NOT include these in `tmname[]`
+        // — it interns them on demand via `luaS_new`. We pre-intern them for
+        // the same pointer-identity fast path as `tm_names`.
+        {
+            const mf_names = [_]struct { mf: MetaField, s: []const u8 }{
+                .{ .mf = .pairs, .s = "__pairs" },
+                .{ .mf = .tostring, .s = "__tostring" },
+                .{ .mf = .name, .s = "__name" },
+                .{ .mf = .metatable, .s = "__metatable" },
+            };
+            inline for (mf_names) |entry| {
+                vm.metafield_names[@intFromEnum(entry.mf)] =
                     vm.internStr(entry.s) catch @panic("oom");
             }
         }
@@ -5219,7 +5252,7 @@ pub const Vm = struct {
                 else => null,
             };
             const m = mt orelse continue;
-            const gc = self.fasttm(m, .gc) orelse continue;
+            const gc = self.fastTm(m, .gc) orelse continue;
             const self_val: Value = obj.toValue() orelse continue;
             const call_args = &[_]Value{self_val};
             _ = self.callFinalizer(gc, call_args) catch |e| switch (e) {
@@ -5315,7 +5348,7 @@ pub const Vm = struct {
         }
 
         // Case 2: error object is not a string → try `__tostring` metamethod.
-        if (self.metamethodValue(err_obj, "__tostring")) |mm| {
+        if (self.getMetaFieldByObj(err_obj, .tostring)) |mm| {
             var call_args = [_]Value{err_obj};
             const result = self.callMetamethod(mm, "__tostring", call_args[0..]) catch {
                 // Metamethod errored → fall through to "(error object is a %s value)".
@@ -5368,7 +5401,7 @@ pub const Vm = struct {
 
         // Case 2: error object is not a string.
         // PUC: `lua_tostring` returns NULL → try `__tostring` metamethod.
-        if (self.metamethodValue(err_obj, "__tostring")) |mm| {
+        if (self.getMetaFieldByObj(err_obj, .tostring)) |mm| {
             // Save the error state — calling the metamethod may clobber it.
             const saved_err = self.err;
             const saved_err_obj = self.err_obj;
@@ -6867,7 +6900,7 @@ pub const Vm = struct {
             const obj = regs[tbc_reg];
             if (obj == .Nil or (obj == .Bool and !obj.Bool)) continue;
 
-            const mm = self.metamethodValue(obj, "__close") orelse {
+            const mm = self.getTmByObj(obj, .close) orelse {
                 _ = self.fail("metamethod 'close' is nil", .{}) catch {};
                 try self.recordBytecodeCloseError(state);
                 continue;
@@ -7126,7 +7159,7 @@ pub const Vm = struct {
         result: BytecodeResultContinuation,
     ) DispatchError!bool {
         if (args.len == 0 or args[0] != .Table) return false;
-        const mm = self.metamethodValue(args[0], "__pairs") orelse return false;
+        const mm = self.getMetaFieldByObj(args[0], .pairs) orelse return false;
         var mm_args = [_]Value{args[0]};
         var pairs_result = result;
         pairs_result.append_nil = true;
@@ -7262,7 +7295,7 @@ pub const Vm = struct {
                 const mt = table.metatable orelse return false;
                 // PUC fasttm: check flags bit, cache-on-miss via fasttm.
                 // (lua-5.5.0/src/ltm.h:63 checknoTM + luaT_gettm.)
-                const mm = self.fasttm(mt, .index) orelse return false;
+                const mm = self.fastTm(mt, .index) orelse return false;
                 if (mm == .Table) {
                     object = .{ .Table = mm.Table };
                     continue;
@@ -7281,7 +7314,7 @@ pub const Vm = struct {
                 return false;
             }
 
-            const mm = metamethodValue(self, object, "__index") orelse return false;
+            const mm = self.getTmByObj(object, .index) orelse return false;
             if (mm == .Table) {
                 object = .{ .Table = mm.Table };
                 continue;
@@ -7319,7 +7352,7 @@ pub const Vm = struct {
                 const raw = try self.tableGetRawValue(table, key);
                 if (raw != .Nil or table.metatable == null) return false;
                 // PUC fasttm: check flags bit, cache-on-miss via fasttm.
-                const mm = self.fasttm(table.metatable.?, .newindex) orelse return false;
+                const mm = self.fastTm(table.metatable.?, .newindex) orelse return false;
                 if (mm == .Table) {
                     object = .{ .Table = mm.Table };
                     continue;
@@ -7338,7 +7371,7 @@ pub const Vm = struct {
                 return false;
             }
 
-            const mm = metamethodValue(self, object, "__newindex") orelse return false;
+            const mm = self.getTmByObj(object, .newindex) orelse return false;
             if (mm == .Table) {
                 object = .{ .Table = mm.Table };
                 continue;
@@ -7365,12 +7398,12 @@ pub const Vm = struct {
         parent_index: usize,
         lhs: Value,
         rhs: Value,
-        mm_name: []const u8,
+        event: TmsEvent,
         opname: []const u8,
         completion: BytecodePendingCompletion,
     ) DispatchError!bool {
-        const mm = metamethodValue(self, lhs, mm_name) orelse
-            metamethodValue(self, rhs, mm_name) orelse return false;
+        const mm = self.getTmByObj(lhs, event) orelse
+            self.getTmByObj(rhs, event) orelse return false;
         if (mm != .Closure or mm.Closure.proto == null) return false;
         const args = [_]Value{ lhs, rhs };
         return self.tryPushBytecodeMetamethod(
@@ -7388,11 +7421,11 @@ pub const Vm = struct {
         exec_frames: *FrameStack,
         parent_index: usize,
         operand: Value,
-        mm_name: []const u8,
+        event: TmsEvent,
         opname: []const u8,
         dst: u8,
     ) DispatchError!bool {
-        const mm = metamethodValue(self, operand, mm_name) orelse return false;
+        const mm = self.getTmByObj(operand, event) orelse return false;
         if (mm != .Closure or mm.Closure.proto == null) return false;
         // PUC supplies two copies for unary metamethods.
         const args = [_]Value{ operand, operand };
@@ -7650,8 +7683,8 @@ pub const Vm = struct {
                 continue;
             }
 
-            const mm = metamethodValue(self, lhs, "__concat") orelse
-                metamethodValue(self, acc, "__concat") orelse {
+            const mm = self.getTmByObj(lhs, .concat) orelse
+                self.getTmByObj(acc, .concat) orelse {
                 const bad = if (!isDirectConcatOperand(lhs)) lhs else acc;
                 return self.fail("attempt to concatenate a {s} value", .{bad.typeName()});
             };
@@ -7886,7 +7919,7 @@ pub const Vm = struct {
             if (try self.tableGetRawValue(table, key) != .Nil) return false;
             const mt = table.metatable orelse return false;
             // PUC fasttm: check flags bit, cache-on-miss via fasttm.
-            const mm = self.fasttm(mt, .index) orelse return false;
+            const mm = self.fastTm(mt, .index) orelse return false;
             if (mm == .Table) {
                 object = .{ .Table = mm.Table };
                 continue;
@@ -8213,7 +8246,7 @@ pub const Vm = struct {
         switch (id) {
             .pairs => {
                 if (args.len == 0 or args[0] != .Table) return false;
-                const mm = self.metamethodValue(args[0], "__pairs") orelse return false;
+                const mm = self.getMetaFieldByObj(args[0], .pairs) orelse return false;
                 return mm == .Closure and mm.Closure.proto != null;
             },
             .pcall,
@@ -9840,7 +9873,7 @@ pub const Vm = struct {
             .Closure => |closure| break :child closure,
             .Builtin => |builtin_id| {
                 if (builtin_id != .pairs or resolved.args.len == 0 or resolved.args[0] != .Table) return false;
-                const mm = self.metamethodValue(resolved.args[0], "__pairs") orelse return false;
+                const mm = self.getMetaFieldByObj(resolved.args[0], .pairs) orelse return false;
                 pairs_arg_buf[0] = resolved.args[0];
                 const mm_resolved = self.resolveCallable(mm, pairs_arg_buf[0..], null) catch return false;
                 child_owned_args = mm_resolved.owned_args;
@@ -11698,7 +11731,7 @@ pub const Vm = struct {
                             // unnecessary. (Was: rawGet funnel; rawGet was
                             // 10% of the field_access profile.)
                             if (self.stats.enabled) self.stats.tbl_get_fast_str += 1; // P16.0b (constant string key)
-            ctx.regs[a] = if (ltable.nodeLookupStr(env.Table.hash, key.String, self.hash_seed)) |node|
+            ctx.regs[a] = if (ltable.nodeLookupStr(env.Table.hash, key.String)) |node|
                                 node.value
                             else
                                 .Nil;
@@ -11748,7 +11781,7 @@ pub const Vm = struct {
                             const tbl = env.Table;
                             try self.gcTableWriteBarrier(tbl, key, val);
                             if (self.stats.enabled) self.stats.tbl_set_fast_str += 1; // P16.0b (constant string key)
-                            if (ltable.nodeLookupStr(tbl.hash, key.String, self.hash_seed)) |node| {
+                            if (ltable.nodeLookupStr(tbl.hash, key.String)) |node| {
                                 if (self.stats.enabled) self.stats.tbl_update += 1; // P16.0b
                                 if (val == .Nil) {
                                     _ = ltable.nodeDelete(tbl.hash, key, self.hash_seed);
@@ -11801,7 +11834,7 @@ pub const Vm = struct {
                                 }
                             } else if (key == .String) {
                                 if (self.stats.enabled) self.stats.tbl_get_fast_str += 1; // P16.0b
-                                ctx.regs[a] = if (ltable.nodeLookupStr(tbl.hash, key.String, self.hash_seed)) |node|
+                                ctx.regs[a] = if (ltable.nodeLookupStr(tbl.hash, key.String)) |node|
                                     node.value
                                 else
                                     .Nil;
@@ -11866,7 +11899,7 @@ pub const Vm = struct {
                             // inlines nodeLookup into the dispatch loop.
                             const tbl = obj.Table;
                             if (self.stats.enabled) self.stats.tbl_get_fast_str += 1; // P16.0b
-                            ctx.regs[a] = if (ltable.nodeLookupStr(tbl.hash, key.String, self.hash_seed)) |node|
+                            ctx.regs[a] = if (ltable.nodeLookupStr(tbl.hash, key.String)) |node|
                                 node.value
                             else
                                 .Nil;
@@ -11970,7 +12003,7 @@ pub const Vm = struct {
                             if (key == .String) {
                                 if (self.stats.enabled) self.stats.tbl_set_fast_str += 1; // P16.0b
                                 try self.gcTableWriteBarrier(tbl, key, val);
-                                if (ltable.nodeLookupStr(tbl.hash, key.String, self.hash_seed)) |node| {
+                                if (ltable.nodeLookupStr(tbl.hash, key.String)) |node| {
                                     if (self.stats.enabled) self.stats.tbl_update += 1; // P16.0b (existing key)
                                     if (val == .Nil) {
                                         _ = ltable.nodeDelete(tbl.hash, key, self.hash_seed);
@@ -12085,7 +12118,7 @@ pub const Vm = struct {
                             const tbl = obj.Table;
                             try self.gcTableWriteBarrier(tbl, key, val);
                             if (self.stats.enabled) self.stats.tbl_set_fast_str += 1; // P16.0b
-                            if (ltable.nodeLookupStr(tbl.hash, key.String, self.hash_seed)) |node| {
+                            if (ltable.nodeLookupStr(tbl.hash, key.String)) |node| {
                                 // Existing key: update in place (or delete).
                                 if (self.stats.enabled) self.stats.tbl_update += 1; // P16.0b
                                 if (val == .Nil) {
@@ -12206,7 +12239,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 lb,
                                 rc,
-                                "__sub",
+                                .sub,
                                 "sub",
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12236,7 +12269,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 lb,
                                 rc,
-                                "__mul",
+                                .mul,
                                 "mul",
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12267,7 +12300,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 lb,
                                 rc,
-                                "__div",
+                                .div,
                                 "div",
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12315,7 +12348,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 lb,
                                 rc,
-                                "__mod",
+                                .mod,
                                 "mod",
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12346,7 +12379,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 lb,
                                 rc,
-                                "__pow",
+                                .pow,
                                 "pow",
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12390,7 +12423,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 lb,
                                 rc,
-                                "__idiv",
+                                .idiv,
                                 "idiv",
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12417,7 +12450,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 lb,
                                 rc,
-                                "__band",
+                                .band,
                                 "band",
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12441,7 +12474,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 lb,
                                 rc,
-                                "__bor",
+                                .bor,
                                 "bor",
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12465,7 +12498,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 lb,
                                 rc,
-                                "__bxor",
+                                .bxor,
                                 "bxor",
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12489,7 +12522,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 lb,
                                 rc,
-                                "__shl",
+                                .shl,
                                 "shl",
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12513,7 +12546,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 lb,
                                 rc,
-                                "__shr",
+                                .shr,
                                 "shr",
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12552,7 +12585,7 @@ pub const Vm = struct {
                             // When TMS_SUB, the original operand is K
                             // (non-negated), stored in the MMBINI's B field as
                             // int2sC(K); the metamethod is __sub, not __add.
-                            var tm_str: []const u8 = "__add";
+                            var tm_event: TmsEvent = .add;
                             var tm_name: []const u8 = "add";
                             var orig_imm = imm;
                             const next_pc = ctx.pc + 1;
@@ -12561,7 +12594,7 @@ pub const Vm = struct {
                                 if (@as(bc.Op, @enumFromInt(next_inst.op)) == .mmbini) {
                                     const event = next_inst.c;
                                     if (event == TMS_SUB) {
-                                        tm_str = "__sub";
+                                        tm_event = .sub;
                                         tm_name = "sub";
                                         // MMBINI's B field carries int2sC(K)
                                         // (the original, non-negated K).
@@ -12578,7 +12611,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 m1,
                                 m2,
-                                tm_str,
+                                tm_event,
                                 tm_name,
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12588,7 +12621,7 @@ pub const Vm = struct {
                             // (.Minus when TMS_SUB, .Plus otherwise) so error
                             // messages and fallback semantics match the
                             // source-level operation.
-                            const orig_op: TokenKind = if (std.mem.eql(u8, tm_str, "__sub")) .Minus else .Plus;
+                            const orig_op: TokenKind = if (tm_event == .sub) .Minus else .Plus;
                             const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, orig_op, b, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
@@ -12621,7 +12654,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 m1,
                                 m2,
-                                "__add",
+                                .add,
                                 "add",
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12653,7 +12686,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 lb,
                                 rc,
-                                "__sub",
+                                .sub,
                                 "sub",
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12688,7 +12721,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 m1,
                                 m2,
-                                "__mul",
+                                .mul,
                                 "mul",
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12733,7 +12766,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 lb,
                                 rc,
-                                "__mod",
+                                .mod,
                                 "mod",
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12765,7 +12798,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 lb,
                                 rc,
-                                "__pow",
+                                .pow,
                                 "pow",
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12797,7 +12830,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 lb,
                                 rc,
-                                "__div",
+                                .div,
                                 "div",
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12839,7 +12872,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 lb,
                                 rc,
-                                "__idiv",
+                                .idiv,
                                 "idiv",
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12869,7 +12902,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 if (flip) rc else lb,
                                 if (flip) lb else rc,
-                                "__band",
+                                .band,
                                 "band",
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12896,7 +12929,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 if (flip) rc else lb,
                                 if (flip) lb else rc,
-                                "__bor",
+                                .bor,
                                 "bor",
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12923,7 +12956,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 if (flip) rc else lb,
                                 if (flip) lb else rc,
-                                "__bxor",
+                                .bxor,
                                 "bxor",
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12958,7 +12991,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 m1,
                                 m2,
-                                "__shl",
+                                .shl,
                                 "shl",
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -12990,7 +13023,7 @@ pub const Vm = struct {
                             // When TMS_SHL, the original shift amount is K
                             // (non-negated), stored in the MMBINI's B field as
                             // int2sC(K); the metamethod is __shl, not __shr.
-                            var tm_str: []const u8 = "__shr";
+                            var tm_event: TmsEvent = .shr;
                             var tm_name: []const u8 = "shr";
                             var orig_imm = imm;
                             const next_pc = ctx.pc + 1;
@@ -12999,7 +13032,7 @@ pub const Vm = struct {
                                 if (@as(bc.Op, @enumFromInt(next_inst.op)) == .mmbini) {
                                     const event = next_inst.c;
                                     if (event == TMS_SHL) {
-                                        tm_str = "__shl";
+                                        tm_event = .shl;
                                         tm_name = "shl";
                                         // MMBINI's B field carries int2sC(K)
                                         // (the original, non-negated K).
@@ -13013,7 +13046,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 lb,
                                 rc,
-                                tm_str,
+                                tm_event,
                                 tm_name,
                                 .{ .value = .{ .dst = a } },
                             )) {
@@ -13023,7 +13056,7 @@ pub const Vm = struct {
                             // (.Shl when TMS_SHL, .Shr otherwise) so error
                             // messages and fallback semantics match the
                             // source-level operation.
-                            const orig_op: TokenKind = if (std.mem.eql(u8, tm_str, "__shl")) .Shl else .Shr;
+                            const orig_op: TokenKind = if (tm_event == .shl) .Shl else .Shr;
                             const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, orig_op, b, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
@@ -13052,7 +13085,7 @@ pub const Vm = struct {
                                 exec_frames,
                                 ctx.frame_index,
                                 val,
-                                "__unm",
+                                .unm,
                                 "unm",
                                 a,
                             )) {
@@ -13073,7 +13106,7 @@ pub const Vm = struct {
                                 exec_frames,
                                 ctx.frame_index,
                                 val,
-                                "__bnot",
+                                .bnot,
                                 "bnot",
                                 a,
                             )) {
@@ -13087,12 +13120,12 @@ pub const Vm = struct {
                     .not => ctx.regs[a] = try self.evalUnOp(.Not, ctx.regs[b]),
                     .len => {
                         const val = ctx.regs[b];
-                        const needs_len_metamethod = val != .String and metamethodValue(self, val, "__len") != null;
+                        const needs_len_metamethod = val != .String and self.getTmByObj(val, .len) != null;
                         if (needs_len_metamethod and try self.tryPushBytecodeUnaryMetamethod(
                             exec_frames,
                             ctx.frame_index,
                             val,
-                            "__len",
+                            .len,
                             "len",
                             a,
                         )) {
@@ -13137,7 +13170,7 @@ pub const Vm = struct {
                                     ctx.frame_index,
                                     la,
                                     lb,
-                                    "__eq",
+                                    .eq,
                                     "eq",
                                     .{ .compare = .{ .invert = c != 0 } },
                                 )) {
@@ -13166,7 +13199,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 la,
                                 lb,
-                                "__lt",
+                                .lt,
                                 "lt",
                                 .{ .compare = .{ .invert = c != 0 } },
                             )) {
@@ -13194,7 +13227,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 la,
                                 lb,
-                                "__le",
+                                .le,
                                 "le",
                                 .{ .compare = .{ .invert = c != 0 } },
                             )) {
@@ -13254,7 +13287,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 la,
                                 rb_val,
-                                "__lt",
+                                .lt,
                                 "lt",
                                 .{ .compare = .{ .invert = (c & 1) != 0 } },
                             )) {
@@ -13284,7 +13317,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 la,
                                 rb_val,
-                                "__le",
+                                .le,
                                 "le",
                                 .{ .compare = .{ .invert = (c & 1) != 0 } },
                             )) {
@@ -13315,7 +13348,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 rb_val,
                                 la,
-                                "__lt",
+                                .lt,
                                 "lt",
                                 .{ .compare = .{ .invert = (c & 1) != 0 } },
                             )) {
@@ -13346,7 +13379,7 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 rb_val,
                                 la,
-                                "__le",
+                                .le,
                                 "le",
                                 .{ .compare = .{ .invert = (c & 1) != 0 } },
                             )) {
@@ -13638,7 +13671,7 @@ pub const Vm = struct {
                         // declaration becomes active; validating only at scope
                         // exit would incorrectly execute the function body.
                         if (value != .Nil and !(value == .Bool and !value.Bool)) {
-                            if (self.metamethodValue(value, "__close") == null) {
+                            if (self.getTmByObj(value, .close) == null) {
                                 const local_name = bytecodeLocalNameAt(ctx.cur_proto, a, ctx.pc) orelse "?";
                                 exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                                 return self.fail("variable '{s}' got a non-closable value", .{local_name});
@@ -13808,7 +13841,7 @@ pub const Vm = struct {
             ctx.frame_index,
             lb,
             rc,
-            "__add",
+            .add,
             "add",
             .{ .value = .{ .dst = a } },
         )) {
@@ -16116,7 +16149,7 @@ pub const Vm = struct {
             .tostring => {
                 if (outs.len == 0) return;
                 if (args.len == 0) return self.fail("bad argument #1 to 'tostring' (value expected)", .{});
-                if (metamethodValue(self, args[0], "__tostring")) |mm| {
+                if (self.getMetaFieldByObj(args[0], .tostring)) |mm| {
                     var call_args = [_]Value{args[0]};
                     const v = try self.callMetamethod(mm, "__tostring", call_args[0..]);
                     if (v != .String) return self.fail("'__tostring' must return a string", .{});
@@ -17143,7 +17176,7 @@ pub const Vm = struct {
             .String => |s| outs[0] = .{ .Int = @intCast(s.len) },
             .Table => |t| {
                 if (t.metatable) |mt| {
-                    if (self.getFieldOpt(mt, "__name")) |nm| {
+                    if (self.getMetaField(mt, .name)) |nm| {
                         if (nm == .String and nm.String == self.internStrAssume("FILE*")) {
                             return self.fail("bad argument #1 to 'rawlen' (table or string expected)", .{});
                         }
@@ -19380,7 +19413,7 @@ pub const Vm = struct {
 
     fn gcWeakMode(self: *Vm, tbl: *Table) struct { weak_k: bool, weak_v: bool } {
         const mt = tbl.metatable orelse return .{ .weak_k = false, .weak_v = false };
-        const m = self.fasttm(mt, .mode) orelse return .{ .weak_k = false, .weak_v = false };
+        const m = self.fastTm(mt, .mode) orelse return .{ .weak_k = false, .weak_v = false };
         const s = switch (m) {
             .String => |x| x.bytes(),
             else => return .{ .weak_k = false, .weak_v = false },
@@ -21435,12 +21468,25 @@ pub const Vm = struct {
         // PUC markmt (lgc.c:381-382): mark pre-interned metamethod name
         // strings (g->tmname[]). These strings ("__index", "__newindex",
         // "__len", etc.) are used for pointer-identity key comparison in
-        // fasttm. They are NOT reachable from any table root — they live
+        // fastTm. They are NOT reachable from any table root — they live
         // only in the tm_names array. Without marking them, GC frees them,
         // and subsequent metamethod lookups use dangling pointers or
         // re-interned strings with different pointer identity, breaking
-        // fasttm's pointer comparison.
+        // fastTm's pointer comparison.
+        //
+        // The same applies to metafield_names (__pairs, __tostring, __name,
+        // __metatable) — PUC interns these on demand via luaS_new and pins
+        // them via luaC_fix in luaT_init only for tmname[] entries. Our
+        // metafield_names are pinned here the same way.
         for (self.tm_names) |opt| {
+            if (opt) |s| {
+                if (gcIsWhite(s.gc_marked)) {
+                    gcSetBlack(&s.gc_marked);
+                    self.gc_mark_epoch += 1;
+                }
+            }
+        }
+        for (self.metafield_names) |opt| {
             if (opt) |s| {
                 if (gcIsWhite(s.gc_marked)) {
                     gcSetBlack(&s.gc_marked);
@@ -22212,7 +22258,7 @@ pub const Vm = struct {
                 else => null,
             };
             const m = mt orelse continue;
-            const gc = self.fasttm(m, .gc) orelse continue;
+            const gc = self.fastTm(m, .gc) orelse continue;
             // The self argument is the object being finalized.
             const self_val: Value = obj.toValue() orelse continue;
             const call_args = &[_]Value{self_val};
@@ -23495,7 +23541,7 @@ pub const Vm = struct {
         if (args.len < 2) return self.fail("bad argument #2 to 'setmetatable' (nil or table expected)", .{});
         const tbl = try self.expectTable(args[0]);
         if (tbl.metatable) |cur| {
-            if (self.getFieldOpt(cur, "__metatable") != null) return self.fail("cannot change a protected metatable", .{});
+            if (self.getMetaField(cur, .metatable) != null) return self.fail("cannot change a protected metatable", .{});
         }
         switch (args[1]) {
             .Nil => {
@@ -23504,7 +23550,7 @@ pub const Vm = struct {
             },
             .Table => |mt| {
                 try self.gcStoreMetatable(tbl, mt);
-                if (self.fasttm(mt, .gc) != null) {
+                if (self.fastTm(mt, .gc) != null) {
                     try self.registerFinalizable(.{ .table = tbl });
                 } else {
                     _ = self.finalizables.remove(.{ .table = tbl });
@@ -23519,7 +23565,7 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("getmetatable expects value", .{});
         if (valueMetatable(self, args[0])) |mt| {
-            outs[0] = self.getFieldOpt(mt, "__metatable") orelse .{ .Table = mt };
+            outs[0] = self.getMetaField(mt, .metatable) orelse .{ .Table = mt };
         } else {
             outs[0] = .Nil;
         }
@@ -25141,7 +25187,7 @@ pub const Vm = struct {
             .Table => |tbl| {
                 try self.gcStoreMetatable(tbl, mt);
                 if (mt) |m| {
-                    if (self.fasttm(m, .gc) != null) {
+                    if (self.fastTm(m, .gc) != null) {
                         try self.registerFinalizable(.{ .table = tbl });
                     } else {
                         _ = self.finalizables.remove(.{ .table = tbl });
@@ -25182,7 +25228,7 @@ pub const Vm = struct {
                     // through the userdata. During the atomic phase, white
                     // (unreachable) userdatas in the finalizables set are
                     // queued for __gc finalization.
-                    if (self.fasttm(m, .gc) != null) {
+                    if (self.fastTm(m, .gc) != null) {
                         try self.registerFinalizable(.{ .userdata = ud });
                     } else {
                         _ = self.finalizables.remove(.{ .userdata = ud });
@@ -25839,7 +25885,7 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("bad argument #1 to 'pairs' (value expected)", .{});
         if (args[0] != .Table) return self.fail("bad argument #1 to 'pairs' (table expected, got {s})", .{self.valueTypeName(args[0])});
         for (outs) |*out| out.* = .Nil;
-        const mm = metamethodValue(self, args[0], "__pairs");
+        const mm = self.getMetaFieldByObj(args[0], .pairs);
         if (mm) |mmv| {
             var mm_args = [_]Value{args[0]};
             const resolved = try self.resolveCallable(mmv, mm_args[0..], .{ .namewhat = "metamethod", .name = "__pairs" });
@@ -26372,7 +26418,7 @@ pub const Vm = struct {
         if (v != .Table) return null;
         const t = v.Table;
         const mt = t.metatable orelse return null;
-        const nm = self.getFieldOpt(mt, "__name") orelse return null;
+        const nm = self.getMetaField(mt, .name) orelse return null;
         if (nm != .String or nm.String != self.internStrAssume("FILE*")) return null;
         return t;
     }
@@ -32186,7 +32232,7 @@ pub const Vm = struct {
     }
 
     pub fn valueToStringAlloc(self: *Vm, v: Value) DispatchError![]const u8 {
-        if (metamethodValue(self, v, "__tostring")) |mm| {
+        if (self.getMetaFieldByObj(v, .tostring)) |mm| {
             var call_args = [_]Value{v};
             const tv = try self.callMetamethod(mm, "__tostring", call_args[0..]);
             if (tv != .String) return self.fail("'__tostring' must return a string", .{});
@@ -32278,7 +32324,7 @@ pub const Vm = struct {
                 // (e.g. "file (closed)", __tostring result bytes). We must
                 // not free those. Handle the non-allocating cases directly,
                 // then fall through to heap-allocating allocPrint for the rest.
-                if (metamethodValue(self, v, "__tostring")) |mm| {
+                if (self.getMetaFieldByObj(v, .tostring)) |mm| {
                     var call_args = [_]Value{v};
                     const tv = try self.callMetamethod(mm, "__tostring", call_args[0..]);
                     if (tv != .String) return self.fail("'__tostring' must return a string", .{});
@@ -32535,7 +32581,7 @@ pub const Vm = struct {
         const mt = tbl.metatable orelse return .Nil;
         // PUC fasttm: check flags bit, cache-on-miss via fasttm.
         // (lua-5.5.0/src/ltm.h:63 checknoTM + luaT_gettm.)
-        const mm = self.fasttm(mt, .index) orelse return .Nil;
+        const mm = self.fastTm(mt, .index) orelse return .Nil;
         const saved_nwo = self.debug_namewhat_override;
         const saved_no = self.debug_name_override;
         self.debug_namewhat_override = "metamethod";
@@ -32573,7 +32619,7 @@ pub const Vm = struct {
             else => {},
         }
 
-        const mm = metamethodValue(self, object, "__index") orelse {
+        const mm = self.getTmByObj(object, .index) orelse {
             return self.fail("attempt to index a {s} value", .{object.typeName()});
         };
         const saved_nwo = self.debug_namewhat_override;
@@ -32615,7 +32661,7 @@ pub const Vm = struct {
                 return self.tableSetValue(tbl, key, val);
             }
             // PUC fasttm: check flags bit, cache-on-miss via fasttm.
-            const mm = self.fasttm(tbl.metatable.?, .newindex) orelse
+            const mm = self.fastTm(tbl.metatable.?, .newindex) orelse
                 return self.tableSetValue(tbl, key, val);
             switch (mm) {
                 .Table => |t| return self.setIndexValueDepth(.{ .Table = t }, key, val, depth + 1),
@@ -32634,7 +32680,7 @@ pub const Vm = struct {
             }
         }
 
-        const mm = metamethodValue(self, object, "__newindex") orelse {
+        const mm = self.getTmByObj(object, .newindex) orelse {
             return self.fail("attempt to index a {s} value", .{object.typeName()});
         };
         switch (mm) {
@@ -32670,83 +32716,91 @@ pub const Vm = struct {
 
     fn valueTypeName(self: *Vm, v: Value) []const u8 {
         if (valueMetatable(self, v)) |mt| {
-            if (self.getFieldOpt(mt, "__name")) |namev| {
+            if (self.getMetaField(mt, .name)) |namev| {
                 if (namev == .String) return namev.String.bytes();
             }
         }
         return v.typeName();
     }
 
-    /// PUC `fasttm` (ltm.h:63-68): fast metamethod lookup with flags cache.
-    /// If the metatable's `flags` bit for `event` is set (meaning "this
-    /// metamethod is absent"), returns `null` immediately — no hash lookup.
-    /// Otherwise does `rawGet` on the metatable. On miss (field is nil),
+    /// PUC `luaT_gettm` (ltm.c:60-68): look up a metamethod by event in a
+    /// metatable using the pre-interned name string. This is the non-cached
+    /// path — it always does a hash lookup via `nodeLookupStr` (pointer-identity
+    /// for interned shorts, content-eq for longs). Returns `null` if the field
+    /// is absent (Nil).
+    ///
+    /// PUC's `luaT_gettm` also caches-on-miss (sets the flags bit), but ONLY
+    /// for events <= TM_EQ — and that caching is done by `fastTm` (which wraps
+    /// `getTm`). This function itself does NOT touch flags, matching PUC's
+    /// `luaT_gettmbyobj` which calls `luaH_Hgetshortstr` directly without flags.
+    fn getTm(self: *Vm, mt: *Table, event: TmsEvent) ?Value {
+        const name_str = self.tm_names[@intFromEnum(event)] orelse return null;
+        const node = ltable.nodeLookupStr(mt.hash, name_str) orelse return null;
+        if (node.value == .Nil) return null;
+        return node.value;
+    }
+
+    /// PUC `luaT_gettmbyobj` (ltm.c:71-84): look up a metamethod by event for
+    /// a value `v`. Resolves the metatable for `v` (per-type metatable from
+    /// `G(L)->mt[]` for primitives, or the object's own `.metatable` for
+    /// tables/userdata), then calls `getTm`. Does NOT use the flags cache —
+    /// matches PUC exactly (every lookup hits the metatable, so dynamic
+    /// `mt.__add` mutation is visible immediately).
+    pub fn getTmByObj(self: *Vm, v: Value, event: TmsEvent) ?Value {
+        const mt = valueMetatable(self, v) orelse return null;
+        return self.getTm(mt, event);
+    }
+
+    /// PUC `gfasttm` / `fasttm` (ltm.h:63-68): fast metamethod lookup with
+    /// flags cache. If the metatable's `flags` bit for `event` is set (meaning
+    /// "this metamethod is absent"), returns `null` immediately — no hash
+    /// lookup. Otherwise does `getTm` on the metatable. On miss (field is nil),
     /// sets the bit (cache-on-miss) so subsequent calls skip the lookup.
-    /// Only valid for events `<= TM_FAST_MAX` (index, newindex, gc, mode,
-    /// len, eq). For non-cached events, use `metamethodValueByEvent` which
-    /// always does the hash lookup.
-    fn fasttm(self: *Vm, mt: *Table, event: TmsEvent) ?Value {
+    ///
+    /// ONLY valid for events `<= TM_FAST_MAX` (index, newindex, gc, mode, len,
+    /// eq). For non-cached events (add..close), use `getTm` or `getTmByObj`.
+    /// This mirrors PUC's `gfasttm` which is only called with events <= TM_EQ.
+    fn fastTm(self: *Vm, mt: *Table, event: TmsEvent) ?Value {
         const bit = TableFlags.bit(event);
         if ((mt.flags & bit) != 0) return null;
         // Bit is clear — metamethod might be present. Do the hash lookup
         // using the pre-interned name string (pointer-identity key, no
         // internStrAssume hashmap lookup needed).
         const name_str = self.tm_names[@intFromEnum(event)] orelse return null;
-        const val = self.rawGet(mt, .{ .String = name_str });
-        if (val == .Nil) {
+        const node = ltable.nodeLookupStr(mt.hash, name_str) orelse {
+            // No node at all — cache-on-miss.
+            mt.flags |= bit;
+            return null;
+        };
+        if (node.value == .Nil) {
             // Cache-on-miss: metamethod is absent. Set the bit so future
             // calls skip the hash lookup entirely (PUC luaT_gettm does this
-            // via `setnodefault' / `luaT_gettm` returning NULL → bit stays).
+            // via `events->flags |= cast_byte(1u<<event)`).
             mt.flags |= bit;
             return null;
         }
-        return val;
+        return node.value;
     }
 
-    /// Like `fasttm` but for events above `TM_FAST_MAX` (arithmetic, call,
-    /// etc.) that are NOT cached in `flags`. Always does the hash lookup.
-    fn metamethodValueByEvent(self: *Vm, mt: *Table, event: TmsEvent) ?Value {
-        const name_str = self.tm_names[@intFromEnum(event)] orelse return null;
-        const val = self.rawGet(mt, .{ .String = name_str });
-        if (val == .Nil) return null;
-        return val;
+    /// Look up a non-TMS metafield (`__pairs`, `__tostring`, `__name`,
+    /// `__metatable`) in a metatable using the pre-interned name string.
+    /// These fields are NOT part of PUC's `TMS` enum and do NOT participate
+    /// in the flags cache. PUC looks them up via `luaL_getmetafield` /
+    /// `luaH_Hgetshortstr` with on-demand interning. We pre-intern them in
+    /// `metafield_names` for the same pointer-identity fast path as `getTm`.
+    fn getMetaField(self: *Vm, mt: *Table, field: MetaField) ?Value {
+        const name_str = self.metafield_names[@intFromEnum(field)] orelse return null;
+        const node = ltable.nodeLookupStr(mt.hash, name_str) orelse return null;
+        if (node.value == .Nil) return null;
+        return node.value;
     }
 
-    pub fn metamethodValue(self: *Vm, v: Value, mm_name: []const u8) ?Value {
+    /// Like `getMetaField` but resolves the metatable for value `v` first.
+    /// Mirrors `luaL_getmetafield(L, idx, name)` which does
+    /// `lua_getmetatable` + `lua_getfield`.
+    pub fn getMetaFieldByObj(self: *Vm, v: Value, field: MetaField) ?Value {
         const mt = valueMetatable(self, v) orelse return null;
-        // Try to match mm_name against known metamethod names for fasttm.
-        // All metamethod names are pre-interned, so we can compare by
-        // pointer identity after a single intern lookup.
-        if (self.matchTmsEvent(mm_name)) |event| {
-            if (@intFromEnum(event) <= TM_FAST_MAX) {
-                return self.fasttm(mt, event);
-            }
-            return self.metamethodValueByEvent(mt, event);
-        }
-        // Unknown name (not a standard metamethod) — slow path.
-        const mm = self.getFieldOpt(mt, mm_name) orelse return null;
-        if (mm == .Nil) return null;
-        return mm;
-    }
-
-    /// Match a `[]const u8` metamethod name against the pre-interned
-    /// `tm_names` table. Returns the `TmsEvent` if the name matches a
-    /// known metamethod, `null` otherwise. Uses a single `internStrAssume`
-    /// call (hashmap lookup in `string_intern`) to get the canonical
-    /// `*LuaString`, then pointer-compares against `tm_names`.
-    fn matchTmsEvent(self: *Vm, name: []const u8) ?TmsEvent {
-        // Fast path: if the name is already interned (very likely — all
-        // metamethod names are short and pre-interned at VM init), the
-        // hashmap lookup is a single hash + probe.
-        var h = std.hash.Wyhash.init(self.hash_seed);
-        h.update(name);
-        const s = self.string_intern.lookup(name, h.final()) orelse return null;
-        for (self.tm_names, 0..) |opt, i| {
-            if (opt) |ns| {
-                if (ns == s) return @enumFromInt(i);
-            }
-        }
-        return null;
+        return self.getMetaField(mt, field);
     }
 
     /// Close bytecode TBC slots in reverse declaration order. During normal
@@ -32792,8 +32846,9 @@ pub const Vm = struct {
         }
     }
 
-    fn callBinaryMetamethod(self: *Vm, lhs: Value, rhs: Value, mm_name: []const u8, opname: []const u8) DispatchError!?Value {
-        const mm = metamethodValue(self, lhs, mm_name) orelse metamethodValue(self, rhs, mm_name) orelse return null;
+    fn callBinaryMetamethod(self: *Vm, lhs: Value, rhs: Value, event: TmsEvent, opname: []const u8) DispatchError!?Value {
+        const mm = self.getTmByObj(lhs, event) orelse
+            self.getTmByObj(rhs, event) orelse return null;
         var call_args = [_]Value{ lhs, rhs };
         return try self.callMetamethod(mm, opname, call_args[0..]);
     }
@@ -32809,7 +32864,7 @@ pub const Vm = struct {
                 return;
             }
         }
-        const mm = metamethodValue(self, obj, "__close") orelse {
+        const mm = self.getTmByObj(obj, .close) orelse {
             return self.fail("metamethod 'close' is nil", .{});
         };
         self.close_metamethod_depth += 1;
@@ -32895,8 +32950,8 @@ pub const Vm = struct {
         // object from error(), not the annotated diagnostic message.
     }
 
-    fn callUnaryMetamethod(self: *Vm, v: Value, mm_name: []const u8, opname: []const u8) DispatchError!?Value {
-        const mm = metamethodValue(self, v, mm_name) orelse return null;
+    fn callUnaryMetamethod(self: *Vm, v: Value, event: TmsEvent, opname: []const u8) DispatchError!?Value {
+        const mm = self.getTmByObj(v, event) orelse return null;
         // Lua passes the operand twice for unary metamethod dispatch.
         var call_args = [_]Value{ v, v };
         return try self.callMetamethod(mm, opname, call_args[0..]);
@@ -32925,7 +32980,7 @@ pub const Vm = struct {
                 .Builtin, .Closure => return .{ .callee = callee, .args = args, .owned_args = owned },
                 else => {
                     if (depth >= 16) return self.fail("attempt to call a value (chain too long)", .{});
-                    const mm = metamethodValue(self, callee, "__call") orelse {
+                    const mm = self.getTmByObj(callee, .call) orelse {
                         if (call_name) |cn| {
                             if (cn.name) |nm| {
                                 return self.fail("attempt to call a {s} value ({s} '{s}')", .{ callee.typeName(), cn.namewhat, nm });
@@ -32995,11 +33050,11 @@ pub const Vm = struct {
         std.debug.assert(chain_depth.* < 16);
         const current_callee = regs.*[a];
         // Look up __call metamethod on the current (non-callable) value.
-        const mm = metamethodValue(self, current_callee, "__call") orelse {
+        const mm = self.getTmByObj(current_callee, .call) orelse {
             return self.fail("attempt to call a {s} value", .{current_callee.typeName()});
         };
 
-        // metamethodValue may have triggered GC (via allocTable inside table
+        // getTmByObj may have triggered GC (via allocTable inside table
         // lookup), which can realloc bc_stack and invalidate regs.*.
         // Always refresh regs.* here, even if bcGrowFrame is not needed.
         regs.* = self.bc_stack[base .. base + frame_cap.*];
@@ -33862,24 +33917,24 @@ pub const Vm = struct {
                             else => unreachable,
                         };
                     }
-                    if (try self.callUnaryMetamethod(src, "__unm", "unm")) |v| return v;
+                    if (try self.callUnaryMetamethod(src, .unm, "unm")) |v| return v;
                     return self.fail("type error: unary '-' expects number, got {s}", .{src.typeName()});
                 },
             },
             .Hash => return switch (src) {
                 .String => |s| .{ .Int = @intCast(s.len) },
                 .Table => |t| blk: {
-                    if (try self.callUnaryMetamethod(src, "__len", "len")) |v| break :blk v;
+                    if (try self.callUnaryMetamethod(src, .len, "len")) |v| break :blk v;
                     break :blk .{ .Int = self.tableBorderLen(t) };
                 },
                 else => {
-                    if (try self.callUnaryMetamethod(src, "__len", "len")) |v| return v;
+                    if (try self.callUnaryMetamethod(src, .len, "len")) |v| return v;
                     return self.fail("attempt to get length of a {s} value", .{src.typeName()});
                 },
             },
             .Tilde => {
                 if (valueToIntForBitwise(src)) |iv| return .{ .Int = ~iv };
-                if (try self.callUnaryMetamethod(src, "__bnot", "bnot")) |v| return v;
+                if (try self.callUnaryMetamethod(src, .bnot, "bnot")) |v| return v;
                 if (isNumWithoutInteger(src)) return self.fail("number has no integer representation", .{});
                 return self.fail("attempt to perform bitwise operation on a {s} value", .{self.valueTypeName(src)});
             },
@@ -34201,10 +34256,10 @@ pub const Vm = struct {
         // etc.). Different types → false without metamethod (events.lua:347:
         // u2 (Userdata) vs {} (Table) → __eq NOT called → false).
         if (lhs == .Table and rhs == .Table) {
-            if (try self.callBinaryMetamethod(lhs, rhs, "__eq", "eq")) |v| return isTruthy(v);
+            if (try self.callBinaryMetamethod(lhs, rhs, .eq, "eq")) |v| return isTruthy(v);
         }
         if (lhs == .Userdata and rhs == .Userdata) {
-            if (try self.callBinaryMetamethod(lhs, rhs, "__eq", "eq")) |v| return isTruthy(v);
+            if (try self.callBinaryMetamethod(lhs, rhs, .eq, "eq")) |v| return isTruthy(v);
         }
         return false;
     }
@@ -36175,7 +36230,7 @@ pub const Vm = struct {
                         .Int => |iv| Value{ .Int = -%iv },
                         .Num => |nv| Value{ .Num = -nv },
                         else => blk: {
-                            if (try self.callUnaryMetamethod(v, "__unm", "unm")) |mv| break :blk mv;
+                            if (try self.callUnaryMetamethod(v, .unm, "unm")) |mv| break :blk mv;
                             return self.fail("attempt to negate a {s} value", .{v.typeName()});
                         },
                     };
@@ -36612,7 +36667,7 @@ pub const Vm = struct {
                 if (cargs.len != 1) return self.fail("testC toclose expects 1 arg", .{});
                 const idx = try self.parseTestcIndex(cargs[0], st.items.len);
                 const obj = st.items[idx];
-                if (obj != .Nil and !(obj == .Bool and !obj.Bool) and metamethodValue(self, obj, "__close") == null) {
+                if (obj != .Nil and !(obj == .Bool and !obj.Bool) and self.getTmByObj(obj, .close) == null) {
                     switch (obj) {
                         .Table, .Thread => return self.fail("non-closable value", .{}),
                         else => return self.fail("non-closable value (C temporary)", .{}),
@@ -37671,9 +37726,9 @@ pub const Vm = struct {
             else => null,
         };
         if (mt) |m| {
-            const has_index = !what.read or (self.fasttm(m, .index) orelse .Nil) != .Nil;
-            const has_newindex = !what.write or (self.fasttm(m, .newindex) orelse .Nil) != .Nil;
-            const has_len = !what.len or (self.fasttm(m, .len) orelse .Nil) != .Nil;
+            const has_index = !what.read or (self.fastTm(m, .index) orelse .Nil) != .Nil;
+            const has_newindex = !what.write or (self.fastTm(m, .newindex) orelse .Nil) != .Nil;
+            const has_len = !what.len or (self.fastTm(m, .len) orelse .Nil) != .Nil;
             if (has_index and has_newindex and has_len) {
                 return; // all required metamethods present
             }
@@ -37924,7 +37979,7 @@ pub const Vm = struct {
                 if (call_args.len == 0 or call_args[0] != .Table) break :blk 0;
                 const tbl = call_args[0].Table;
                 if (tbl.metatable) |mt| {
-                    if (self.fasttm(mt, .len) != null) break :blk 256;
+                    if (self.fastTm(mt, .len) != null) break :blk 256;
                 }
                 const start_idx0: i64 = if (call_args.len >= 2) switch (call_args[1]) {
                     .Nil => 1,
@@ -37970,15 +38025,15 @@ pub const Vm = struct {
                 else => switch (r) {
                     .Int => |ri| .{ .Int = li +% ri },
                     .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) + rn },
-                    else => if (try self.callBinaryMetamethod(lhs, rhs, "__add", "add")) |v| v else self.failArithmeticOperands(lhs, rhs),
+                    else => if (try self.callBinaryMetamethod(lhs, rhs, .add, "add")) |v| v else self.failArithmeticOperands(lhs, rhs),
                 },
             },
             .Num => |ln| switch (r) {
                 .Int => |ri| .{ .Num = ln + @as(f64, @floatFromInt(ri)) },
                 .Num => |rn| .{ .Num = ln + rn },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__add", "add")) |v| v else self.failArithmeticOperands(lhs, rhs),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, .add, "add")) |v| v else self.failArithmeticOperands(lhs, rhs),
             },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, "__add", "add")) |v| v else self.failArithmeticOperands(lhs, rhs),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, .add, "add")) |v| v else self.failArithmeticOperands(lhs, rhs),
         };
     }
 
@@ -37989,14 +38044,14 @@ pub const Vm = struct {
             .Int => |li| switch (r) {
                 .Int => |ri| .{ .Int = li -% ri },
                 .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) - rn },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__sub", "sub")) |v| v else self.failArithmeticOperands(lhs, rhs),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, .sub, "sub")) |v| v else self.failArithmeticOperands(lhs, rhs),
             },
             .Num => |ln| switch (r) {
                 .Int => |ri| .{ .Num = ln - @as(f64, @floatFromInt(ri)) },
                 .Num => |rn| .{ .Num = ln - rn },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__sub", "sub")) |v| v else self.failArithmeticOperands(lhs, rhs),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, .sub, "sub")) |v| v else self.failArithmeticOperands(lhs, rhs),
             },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, "__sub", "sub")) |v| v else self.failArithmeticOperands(lhs, rhs),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, .sub, "sub")) |v| v else self.failArithmeticOperands(lhs, rhs),
         };
     }
 
@@ -38007,14 +38062,14 @@ pub const Vm = struct {
             .Int => |li| switch (r) {
                 .Int => |ri| .{ .Int = li *% ri },
                 .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) * rn },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mul", "mul")) |v| v else self.failArithmeticOperands(lhs, rhs),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, .mul, "mul")) |v| v else self.failArithmeticOperands(lhs, rhs),
             },
             .Num => |ln| switch (r) {
                 .Int => |ri| .{ .Num = ln * @as(f64, @floatFromInt(ri)) },
                 .Num => |rn| .{ .Num = ln * rn },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mul", "mul")) |v| v else self.failArithmeticOperands(lhs, rhs),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, .mul, "mul")) |v| v else self.failArithmeticOperands(lhs, rhs),
             },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, "__mul", "mul")) |v| v else self.failArithmeticOperands(lhs, rhs),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, .mul, "mul")) |v| v else self.failArithmeticOperands(lhs, rhs),
         };
     }
 
@@ -38025,7 +38080,7 @@ pub const Vm = struct {
             .Int => |li| @as(f64, @floatFromInt(li)),
             .Num => |n| n,
             else => {
-                if (try self.callBinaryMetamethod(lhs, rhs, "__div", "div")) |v| return v;
+                if (try self.callBinaryMetamethod(lhs, rhs, .div, "div")) |v| return v;
                 return self.failArithmeticOperands(lhs, rhs);
             },
         };
@@ -38033,7 +38088,7 @@ pub const Vm = struct {
             .Int => |ri| @as(f64, @floatFromInt(ri)),
             .Num => |n| n,
             else => {
-                if (try self.callBinaryMetamethod(lhs, rhs, "__div", "div")) |v| return v;
+                if (try self.callBinaryMetamethod(lhs, rhs, .div, "div")) |v| return v;
                 return self.failArithmeticOperands(lhs, rhs);
             },
         };
@@ -38053,7 +38108,7 @@ pub const Vm = struct {
                 .Num => |rn| {
                     return .{ .Num = std.math.floor(@as(f64, @floatFromInt(li)) / rn) };
                 },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__idiv", "idiv")) |v| v else self.failArithmeticOperands(lhs, rhs),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, .idiv, "idiv")) |v| v else self.failArithmeticOperands(lhs, rhs),
             },
             .Num => |ln| switch (r) {
                 .Int => |ri| {
@@ -38062,9 +38117,9 @@ pub const Vm = struct {
                 .Num => |rn| {
                     return .{ .Num = std.math.floor(ln / rn) };
                 },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__idiv", "idiv")) |v| v else self.failArithmeticOperands(lhs, rhs),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, .idiv, "idiv")) |v| v else self.failArithmeticOperands(lhs, rhs),
             },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, "__idiv", "idiv")) |v| v else self.failArithmeticOperands(lhs, rhs),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, .idiv, "idiv")) |v| v else self.failArithmeticOperands(lhs, rhs),
         };
     }
 
@@ -38087,7 +38142,7 @@ pub const Vm = struct {
                     const ln = @as(f64, @floatFromInt(li));
                     return .{ .Num = luaNumMod(ln, rn) };
                 },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.failArithmeticOperands(lhs, rhs),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, .mod, "mod")) |v| v else self.failArithmeticOperands(lhs, rhs),
             },
             .Num => |ln| switch (r) {
                 .Int => |ri| {
@@ -38101,9 +38156,9 @@ pub const Vm = struct {
                     // Float % float: no zero check (fmod handles it).
                     return .{ .Num = luaNumMod(ln, rn) };
                 },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.failArithmeticOperands(lhs, rhs),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, .mod, "mod")) |v| v else self.failArithmeticOperands(lhs, rhs),
             },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.failArithmeticOperands(lhs, rhs),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, .mod, "mod")) |v| v else self.failArithmeticOperands(lhs, rhs),
         };
     }
 
@@ -38120,7 +38175,7 @@ pub const Vm = struct {
             .Int => |li| @as(f64, @floatFromInt(li)),
             .Num => |n| n,
             else => {
-                if (try self.callBinaryMetamethod(lhs, rhs, "__pow", "pow")) |v| return v;
+                if (try self.callBinaryMetamethod(lhs, rhs, .pow, "pow")) |v| return v;
                 return self.failArithmeticOperands(lhs, rhs);
             },
         };
@@ -38128,7 +38183,7 @@ pub const Vm = struct {
             .Int => |ri| @as(f64, @floatFromInt(ri)),
             .Num => |n| n,
             else => {
-                if (try self.callBinaryMetamethod(lhs, rhs, "__pow", "pow")) |v| return v;
+                if (try self.callBinaryMetamethod(lhs, rhs, .pow, "pow")) |v| return v;
                 return self.failArithmeticOperands(lhs, rhs);
             },
         };
@@ -38139,7 +38194,7 @@ pub const Vm = struct {
         if (valueToIntForBitwise(lhs)) |li| {
             if (valueToIntForBitwise(rhs)) |ri| return .{ .Int = li & ri };
         }
-        if (try self.callBinaryMetamethod(lhs, rhs, "__band", "band")) |v| return v;
+        if (try self.callBinaryMetamethod(lhs, rhs, .band, "band")) |v| return v;
         if (isNumWithoutInteger(lhs) or isNumWithoutInteger(rhs)) return self.fail("number has no integer representation", .{});
         return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
     }
@@ -38148,7 +38203,7 @@ pub const Vm = struct {
         if (valueToIntForBitwise(lhs)) |li| {
             if (valueToIntForBitwise(rhs)) |ri| return .{ .Int = li | ri };
         }
-        if (try self.callBinaryMetamethod(lhs, rhs, "__bor", "bor")) |v| return v;
+        if (try self.callBinaryMetamethod(lhs, rhs, .bor, "bor")) |v| return v;
         if (isNumWithoutInteger(lhs) or isNumWithoutInteger(rhs)) return self.fail("number has no integer representation", .{});
         return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
     }
@@ -38157,7 +38212,7 @@ pub const Vm = struct {
         if (valueToIntForBitwise(lhs)) |li| {
             if (valueToIntForBitwise(rhs)) |ri| return .{ .Int = li ^ ri };
         }
-        if (try self.callBinaryMetamethod(lhs, rhs, "__bxor", "bxor")) |v| return v;
+        if (try self.callBinaryMetamethod(lhs, rhs, .bxor, "bxor")) |v| return v;
         if (isNumWithoutInteger(lhs) or isNumWithoutInteger(rhs)) return self.fail("number has no integer representation", .{});
         return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
     }
@@ -38168,7 +38223,7 @@ pub const Vm = struct {
                 return .{ .Int = shiftLeft(li, ri) };
             }
         }
-        if (try self.callBinaryMetamethod(lhs, rhs, "__shl", "shl")) |v| return v;
+        if (try self.callBinaryMetamethod(lhs, rhs, .shl, "shl")) |v| return v;
         if (isNumWithoutInteger(lhs) or isNumWithoutInteger(rhs)) return self.fail("number has no integer representation", .{});
         return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
     }
@@ -38196,7 +38251,7 @@ pub const Vm = struct {
                 return .{ .Int = shiftRight(li, ri) };
             }
         }
-        if (try self.callBinaryMetamethod(lhs, rhs, "__shr", "shr")) |v| return v;
+        if (try self.callBinaryMetamethod(lhs, rhs, .shr, "shr")) |v| return v;
         if (isNumWithoutInteger(lhs) or isNumWithoutInteger(rhs)) return self.fail("number has no integer representation", .{});
         return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
     }
@@ -38222,18 +38277,18 @@ pub const Vm = struct {
             .Int => |li| switch (rhs) {
                 .Int => |ri| li < ri,
                 .Num => |rn| intLtNum(li, rn),
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__lt", "lt")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, .lt, "lt")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
             .Num => |ln| switch (rhs) {
                 .Int => |ri| numLtInt(ln, ri),
                 .Num => |rn| ln < rn,
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__lt", "lt")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, .lt, "lt")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
             .String => |ls| switch (rhs) {
                 .String => |rs| std.mem.order(u8, ls.bytes(), rs.bytes()) == .lt,
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__lt", "lt")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, .lt, "lt")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, "__lt", "lt")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, .lt, "lt")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
         };
     }
 
@@ -38242,21 +38297,21 @@ pub const Vm = struct {
             .Int => |li| switch (rhs) {
                 .Int => |ri| li <= ri,
                 .Num => |rn| intLeNum(li, rn),
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__le", "le")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, .le, "le")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
             .Num => |ln| switch (rhs) {
                 .Int => |ri| numLeInt(ln, ri),
                 .Num => |rn| ln <= rn,
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__le", "le")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, .le, "le")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
             .String => |ls| switch (rhs) {
                 .String => |rs| {
                     const ord = std.mem.order(u8, ls.bytes(), rs.bytes());
                     return ord == .lt or ord == .eq;
                 },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__le", "le")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, .le, "le")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, "__le", "le")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, .le, "le")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
         };
     }
 
@@ -38359,12 +38414,12 @@ pub const Vm = struct {
             return .{ .String = try self.internStr(out) };
         }
         const a = self.concatOperandToString(lhs) catch {
-            if (try self.callBinaryMetamethod(lhs, rhs, "__concat", "concat")) |v| return v;
+            if (try self.callBinaryMetamethod(lhs, rhs, .concat, "concat")) |v| return v;
             return self.fail("attempt to concatenate a {s} value", .{lhs.typeName()});
         };
         defer if (a.owned) self.alloc.free(a.bytes);
         const b = self.concatOperandToString(rhs) catch {
-            if (try self.callBinaryMetamethod(lhs, rhs, "__concat", "concat")) |v| return v;
+            if (try self.callBinaryMetamethod(lhs, rhs, .concat, "concat")) |v| return v;
             return self.fail("attempt to concatenate a {s} value", .{rhs.typeName()});
         };
         defer if (b.owned) self.alloc.free(b.bytes);

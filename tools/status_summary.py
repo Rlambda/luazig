@@ -33,6 +33,10 @@ CAPI_MAKEFILE = ROOT / "tests" / "c_api" / "Makefile"
 BEGIN_MARKER = "<!-- BEGIN GENERATED STATUS (tools/status_summary.py) -->"
 END_MARKER = "<!-- END GENERATED STATUS -->"
 
+# STATUS.md compact summary uses its own markers so the same generated data
+# feeds both files and they cannot drift apart again.
+STATUS_BEGIN_MARKER = "<!-- BEGIN GENERATED SUMMARY (tools/status_summary.py) -->"
+STATUS_END_MARKER = "<!-- END GENERATED SUMMARY -->"
 
 # ---------------------------------------------------------------------------
 # Input loading
@@ -169,6 +173,72 @@ def build_block(matrix: dict | None, smoke: dict | None, perf: dict | None) -> s
 
 
 # ---------------------------------------------------------------------------
+# STATUS.md compact summary rewrite
+# ---------------------------------------------------------------------------
+
+def build_status_summary_block(matrix: dict | None, smoke: dict | None,
+                               perf: dict | None) -> str:
+    """Compact summary for the top of STATUS.md, from the same JSON inputs as
+    the README block. One generated source of truth for both files."""
+    lines: list[str] = ["| Metric | Result |", "|--------|--------|"]
+
+    if matrix:
+        s = matrix.get("summary", {})
+        lines.append(
+            f"| Upstream matrix (`testes/*.lua`, `--testc`) | **{s.get('pass', 0)}/{s.get('total', 0)}** pass "
+            "(exit code parity) |"
+        )
+        lines.append(f"| Matrix non-pass | {matrix_nonpass_detail(matrix)} |")
+        lines.append(f"| Differential output (`--diff`) | **{s.get('output_diff', 0)} output_diff** |")
+    else:
+        lines.append("| Upstream matrix (`testes/*.lua`, `--testc`) | _not run — no matrix JSON provided_ |")
+        lines.append("| Differential output (`--diff`) | _not run_ |")
+
+    if smoke:
+        lines.append(f"| Smoke tests (`tests/smoke/*.lua`) | **{smoke.get('ok', 0)}/{smoke.get('total', 0)}** pass |")
+    else:
+        lines.append("| Smoke tests (`tests/smoke/*.lua`) | _not run — no smoke JSON provided_ |")
+
+    capi_n = parse_capi_suite_count(CAPI_MAKEFILE)
+    if capi_n is not None:
+        lines.append(f"| C API suites (`tests/c_api`) | {capi_n} suites |")
+    else:
+        lines.append("| C API suites (`tests/c_api`) | _Makefile TESTS not found_ |")
+
+    ratios = (perf or {}).get("ratios", {})
+    if ratios:
+        geomean = math.exp(sum(math.log(r) for r in ratios.values()) / len(ratios))
+        lines.append(f"| Performance (geomean vs PUC) | **{geomean:.2f}x** |")
+    else:
+        lines.append("| Performance (geomean vs PUC) | _not run — no perf JSON provided_ |")
+
+    lines.append("")
+    if ratios:
+        lines.append(
+            f"Geomean замедления vs PUC Lua: **{geomean:.2f}x** (цель: 1.0x; run-dependent). "
+            "Подробная таблица workload'ов — в generated status-блоке [README.md](README.md)."
+        )
+    else:
+        lines.append(
+            "Geomean замедления vs PUC Lua: _not run_. "
+            "Подробная таблица workload'ов — в generated status-блоке [README.md](README.md)."
+        )
+    return "\n".join(lines)
+
+
+def write_status_summary(block: str) -> None:
+    """Replace the content between the STATUS.md summary markers."""
+    path = ROOT / "STATUS.md"
+    text = path.read_text(encoding="utf-8")
+    begin = text.find(STATUS_BEGIN_MARKER)
+    end = text.find(STATUS_END_MARKER)
+    if begin == -1 or end == -1 or end < begin:
+        raise SystemExit("STATUS.md generated-summary markers not found")
+    new_text = text[: begin + len(STATUS_BEGIN_MARKER)] + "\n" + block + "\n" + text[end:]
+    path.write_text(new_text, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
 # README rewrite
 # ---------------------------------------------------------------------------
 
@@ -197,6 +267,8 @@ def main() -> int:
     ap.add_argument("--perf-json", default="", help="perf_compare.py --json-out report")
     ap.add_argument("--write-readme", action="store_true",
                     help="replace the generated block in README.md instead of printing")
+    ap.add_argument("--write-status", action="store_true",
+                    help="also replace the generated compact summary in STATUS.md")
     args = ap.parse_args()
 
     matrix = load_json(args.matrix_json)
@@ -206,6 +278,8 @@ def main() -> int:
     block = build_block(matrix, smoke, perf)
     if args.write_readme:
         write_readme(block)
+    if args.write_status:
+        write_status_summary(build_status_summary_block(matrix, smoke, perf))
     else:
         print(block)
     return 0

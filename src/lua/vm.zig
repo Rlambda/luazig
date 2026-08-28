@@ -8334,6 +8334,150 @@ pub const Vm = struct {
         return true;
     }
 
+    /// P16.5b: Check if a coroutine.resume/yield builtin call is eligible for
+    /// the fast path — direct call without pushBuiltinCFrame/callBuiltin
+    /// dispatch overhead.
+    ///
+    /// The C-frame exists in PUC Lua as a CallInfo on L->ci (pushed by
+    /// luaD_precall for C functions). In luazig, the synthetic C-frame
+    /// (pushBuiltinCFrame) adds overhead that PUC doesn't have: a heap
+    /// allocation (call_frames.addOne), bc_stack_top bookkeeping, and a
+    /// Nil-memset of the outs buffer. For the hot coroutine.resume/yield
+    /// cycle (the dominant coroutine workload), this overhead is ~12% of
+    /// cycles (pushBuiltinCFrame 5.2% + memset 6.9%).
+    ///
+    /// Guards exclude ALL cases where the C-frame is semantically needed:
+    /// - Debug hooks (CALL/RETURN hook dispatch requires the C-frame)
+    /// - Debug hook context (special yield handling via the hook frame)
+    /// - C continuations (callk/pcallk/yieldk testc_state on C-frames)
+    /// - Close mode (special C-frame discard in builtinCoroutineResume)
+    /// - Wrap eager mode (wrap has its own yield semantics — outs consumed)
+    /// - Non-yieldable boundary (C-call boundary — yield must error)
+    /// - Trampoline active for resume (nested case handled by
+    ///   tryRequestBytecodeCoroutineSwitch)
+    fn coroutineBuiltinFastPathEligible(
+        self: *Vm,
+        id: BuiltinId,
+        args: []const Value,
+    ) bool {
+        // No debug hooks — C-frame is needed for CALL/RETURN hook dispatch.
+        if (self.hooks_active_cached) return false;
+        // Not inside a debug hook — debug hooks have special yield handling
+        // that uses the hook frame's pending_call state.
+        if (self.isInDebugHook()) return false;
+
+        switch (id) {
+            .coroutine_yield => {
+                const th = self.current_thread orelse return false;
+                // Wrap eager mode has its own yield semantics: outs are
+                // consumed by the wrap driver (not error.Yield). The fast
+                // path skips Nil-fill of outs, which wrap_eager_mode needs.
+                if (th.wrap_eager_mode) return false;
+                // Close mode has special C-frame discard logic in
+                // builtinCoroutineResume (resetCI drops all C-frames).
+                if (th.close_mode) return false;
+                // Thread must be yieldable (PUC lua_yield: L->ci must be
+                // yieldable — nCcalls < LUAI_MAXCCALLS).
+                if (!th.yieldable()) return false;
+                // No non-yieldable boundary (gsub pending call — PUC's
+                // CIST_YPCALL makes lua_yield fail with "C-call boundary").
+                if (self.hasActiveBytecodeNonYieldableBoundary()) return false;
+                // No C-frames on the stack at all. When yielding from within
+                // a builtin C-frame (e.g. pcall(foo) where foo yields),
+                // builtinCoroutineYield's P15.79 path expects the yield's
+                // own C-frame at len()-1 to find the Lua frame at len()-2.
+                // Without the C-frame (fast path), the P15.79 path sees the
+                // pcall C-frame at len()-2 and doesn't set
+                // bytecode_inplace_suspended. On resume, the pcall C-frame
+                // would be incorrectly popped by finishCcall. The C-frame
+                // is also needed on resume: builtinCoroutineResume checks
+                // for a C-frame on top and calls finishCcall to pop the
+                // yield's C-frame (not the pcall's).
+                const th_bc = self.activeBytecodeThread();
+                for (0..th_bc.call_frames.len()) |i| {
+                    if (th_bc.call_frames.getConstPtr(i).isC()) return false;
+                }
+                return true;
+            },
+            .coroutine_resume => {
+                // Trampoline active — nested resume is handled by
+                // tryRequestBytecodeCoroutineSwitch (iterative switch,
+                // no C-frame at all). Don't double-handle.
+                if (self.bytecode_coroutine_trampoline_active) return false;
+                // Target must be a thread (builtinCoroutineResume's first
+                // check — if it fails, the error path needs caller_builtin_id
+                // for the error message, which callBuiltin sets up).
+                if (args.len == 0 or args[0] != .Thread) return false;
+                const target = args[0].Thread;
+                // Target not in close mode — close mode has special C-frame
+                // discard logic (resetCI drops ALL C-frames without calling
+                // continuations).
+                if (target.close_mode) return false;
+                // No C-frames with testc_state on target thread — the
+                // continuation k must be invoked via finishCcall on resume,
+                // which requires the C-frame.
+                for (0..target.call_frames.len()) |i| {
+                    const fr = target.call_frames.getConstPtr(i);
+                    if (fr.isC() and fr.u.c.testc_state != null) return false;
+                }
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    /// P16.5b: Call a coroutine builtin directly, without the generic
+    /// pushBuiltinCFrame/callBuiltin dispatch cycle.
+    ///
+    /// This mirrors what PUC Lua does natively: luaD_precall pushes a
+    /// CallInfo for the C function, calls it, and pops the CallInfo — all
+    /// on the C stack with no heap allocation. luazig's synthetic C-frame
+    /// (pushBuiltinCFrame) adds heap allocation + bc_stack bookkeeping that
+    /// PUC doesn't have. This fast path eliminates that overhead for the
+    /// hot coroutine.resume/yield cycle.
+    ///
+    /// Sets up the active_builtin context (needed by builtinCoroutineYield
+    /// for th.suspended_builtin, and by the coroutine body's yield to
+    /// detect that it's yielding from a builtin) and calls the builtin
+    /// function directly.
+    ///
+    /// Skips vs generic callBuiltin:
+    /// - pushBuiltinCFrame/popBuiltinCFrame (5.2% of coroutine_yield cycles)
+    /// - Nil-fill of outs (6.9% memset — neither builtin reads outs before
+    ///   writing; the OP_CALL post-call handler Nil-fills result slots)
+    /// - callBuiltin dispatch switch (part of 7.6%)
+    /// - builtin_outs_on_bc_stack tracking (neither builtin uses
+    ///   refreshBuiltinOuts — the target thread's bc_stack is separate)
+    fn callCoroutineBuiltinDirect(
+        self: *Vm,
+        id: BuiltinId,
+        args: []const Value,
+        outs: []Value,
+    ) DispatchError!void {
+        // Set active_builtin context — needed by builtinCoroutineYield
+        // (th.suspended_builtin = self.active_builtin) and by the coroutine
+        // body's yield to detect it's yielding from a builtin. Also set
+        // caller_builtin_id for error() source-prefix detection (PUC's
+        // luaL_where checks currentline == -1 for C functions).
+        const prev_active_builtin = self.active_builtin;
+        const prev_active_builtin_args = self.active_builtin_args;
+        const prev_caller_builtin = self.caller_builtin_id;
+        self.active_builtin = id;
+        self.active_builtin_args = args;
+        self.caller_builtin_id = prev_active_builtin;
+        defer {
+            self.active_builtin = prev_active_builtin;
+            self.active_builtin_args = prev_active_builtin_args;
+            self.caller_builtin_id = prev_caller_builtin;
+        }
+
+        switch (id) {
+            .coroutine_resume => try self.builtinCoroutineResume(args, outs),
+            .coroutine_yield => try self.builtinCoroutineYield(args, outs),
+            else => unreachable,
+        }
+    }
+
     fn resetBytecodeCoroutineResumeState(th: *Thread) void {
         th.in_resume = false;
         th.resume_pop_consumed = false;
@@ -14736,6 +14880,15 @@ pub const Vm = struct {
         // Non-bytecode tail call: execute the callee and return its results.
         const ret = switch (callee_val) {
             .Builtin => |id| blk: {
+                // P16.5b: Fast path for coroutine.resume/yield — skip
+                // pushBuiltinCFrame/callBuiltin dispatch (same guards as
+                // OP_CALL's fast path).
+                const co_fast_path = (id == .coroutine_resume or id == .coroutine_yield) and
+                    !deferred_builtin_call_hook and
+                    !deferred_tail_hook and
+                    ctx.exec_frames.getPtr(ctx.frame_index).pending_call_index == INVALID_PENDING and
+                    self.coroutineBuiltinFastPathEligible(id, call_args);
+
                 const out_len = @max(self.builtinOutLen(id, call_args), 1);
                 var outs_small: [8]Value = undefined;
                 var outs_heap: ?[]Value = null;
@@ -14751,7 +14904,8 @@ pub const Vm = struct {
                 // callBuiltin. (This is the tail-call-to-C path: PUC pushes
                 // a FRESH ci without CIST_TAIL, so the event is a plain
                 // "call" — see the tc_event selection above.)
-                if (deferred_builtin_call_hook) {
+                // P16.5b: Skip the C-frame push on the coroutine fast path.
+                if (!co_fast_path and deferred_builtin_call_hook) {
                     try self.pushBuiltinCFrame(callee_val);
                     const cf_idx = self.activeBytecodeThread().call_frames.len() - 1;
                     // call_args may be stale after pushBuiltinCFrame grew
@@ -14765,31 +14919,57 @@ pub const Vm = struct {
                     call_args = self.bc_stack[ctx.base + a + 1 .. ctx.base + a + 1 + effective_nargs];
                 }
                 // P15.51l: reg_top/nvarstack are already on the CallFrame.
-                self.callBuiltin(id, call_args, outs) catch |call_err| switch (call_err) {
-                    error.Yield => {
-                        if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
-                            const th = self.current_thread.?;
-                            const fr_y = ctx.exec_frames.getPtr(ctx.frame_index);
-                            // P15.51l: resumed_direct_yield is a CIST_HOOKYIELD
-                            // flag bit, not a bool field. Use a local and set
-                            // the flag after parkDirectBytecodeYield.
-                            var resumed = false;
-                            self.parkDirectBytecodeYield(
-                                th,
-                                ctx.pc,
-                                &fr_y.u.lua.resume_pc,
-                                &resumed,
-                                ctx.boundary_depth,
-                            );
-                            if (resumed) fr_y.setHookYield();
-                            ctx.yielded_in_place.* = true;
-                        }
-                        return error.Yield;
-                    },
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.RuntimeError => return error.RuntimeError,
-                    error.ThreadSwitch => return error.ThreadSwitch,
-                };
+                // P16.5b: Use direct call for coroutine fast path.
+                if (co_fast_path) {
+                    self.callCoroutineBuiltinDirect(id, call_args, outs) catch |call_err| switch (call_err) {
+                        error.Yield => {
+                            if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
+                                const th = self.current_thread.?;
+                                const fr_y = ctx.exec_frames.getPtr(ctx.frame_index);
+                                var resumed = false;
+                                self.parkDirectBytecodeYield(
+                                    th,
+                                    ctx.pc,
+                                    &fr_y.u.lua.resume_pc,
+                                    &resumed,
+                                    ctx.boundary_depth,
+                                );
+                                if (resumed) fr_y.setHookYield();
+                                ctx.yielded_in_place.* = true;
+                            }
+                            return error.Yield;
+                        },
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.RuntimeError => return error.RuntimeError,
+                        error.ThreadSwitch => return error.ThreadSwitch,
+                    };
+                } else {
+                    self.callBuiltin(id, call_args, outs) catch |call_err| switch (call_err) {
+                        error.Yield => {
+                            if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
+                                const th = self.current_thread.?;
+                                const fr_y = ctx.exec_frames.getPtr(ctx.frame_index);
+                                // P15.51l: resumed_direct_yield is a CIST_HOOKYIELD
+                                // flag bit, not a bool field. Use a local and set
+                                // the flag after parkDirectBytecodeYield.
+                                var resumed = false;
+                                self.parkDirectBytecodeYield(
+                                    th,
+                                    ctx.pc,
+                                    &fr_y.u.lua.resume_pc,
+                                    &resumed,
+                                    ctx.boundary_depth,
+                                );
+                                if (resumed) fr_y.setHookYield();
+                                ctx.yielded_in_place.* = true;
+                            }
+                            return error.Yield;
+                        },
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.RuntimeError => return error.RuntimeError,
+                        error.ThreadSwitch => return error.ThreadSwitch,
+                    };
+                }
                 const used = if (builtinHasDynamicOutCount(id))
                     @min(self.last_builtin_out_count, outs.len)
                 else
@@ -15121,6 +15301,17 @@ pub const Vm = struct {
                     }
                 }
 
+                // P16.5b: Fast path for coroutine.resume/yield — skip the
+                // generic pushBuiltinCFrame/callBuiltin dispatch cycle when
+                // the C-frame is provably unnecessary (no hooks, no C
+                // continuations, no close mode, no wrap eager, etc.).
+                // See coroutineBuiltinFastPathEligible for the full guard list.
+                const co_fast_path = (id == .coroutine_resume or id == .coroutine_yield) and
+                    !deferred_builtin_call_hook and
+                    !deferred_call_hook and
+                    ctx.exec_frames.getPtr(ctx.frame_index).pending_call_index == INVALID_PENDING and
+                    self.coroutineBuiltinFastPathEligible(id, rargs);
+
                 const out_len: usize = if (nresults >= 0)
                     @max(@as(usize, @intCast(nresults)), self.builtinOutLen(id, rargs))
                 else
@@ -15145,7 +15336,9 @@ pub const Vm = struct {
                 // CallInfo exists BEFORE the CALL hook fires. Push the
                 // builtin's C-frame, fire the event on it (ar.i_ci = the C
                 // activation), then run the builtin reusing this frame.
-                if (deferred_builtin_call_hook) {
+                // P16.5b: Skip the C-frame push entirely on the coroutine
+                // fast path — guards guarantee no hooks need it.
+                if (!co_fast_path and deferred_builtin_call_hook) {
                     try self.pushBuiltinCFrame(callee_val);
                     const cf_idx = self.activeBytecodeThread().call_frames.len() - 1;
                     // pushBuiltinCFrame may have reallocated bc_stack —
@@ -15162,31 +15355,58 @@ pub const Vm = struct {
                     };
                     self.builtin_cframe_pre_pushed = true;
                 }
-                self.callBuiltin(id, rargs_fresh, outs) catch |call_err| switch (call_err) {
-                    error.Yield => {
-                        if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
-                            const th = self.current_thread.?;
-                            const fr_y2 = ctx.exec_frames.getPtr(ctx.frame_index);
-                            // P15.51l: resumed_direct_yield is a CIST_HOOKYIELD
-                            // flag bit, not a bool field. Use a local and set
-                            // the flag after parkDirectBytecodeYield.
-                            var resumed2 = false;
-                            self.parkDirectBytecodeYield(
-                                th,
-                                ctx.pc,
-                                &fr_y2.u.lua.resume_pc,
-                                &resumed2,
-                                ctx.boundary_depth,
-                            );
-                            if (resumed2) fr_y2.setHookYield();
-                            ctx.yielded_in_place.* = true;
-                        }
-                        return error.Yield;
-                    },
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.RuntimeError => return error.RuntimeError,
-                    error.ThreadSwitch => return error.ThreadSwitch,
-                };
+                // P16.5b: Use the direct call (no C-frame) for the coroutine
+                // fast path; generic callBuiltin for everything else.
+                if (co_fast_path) {
+                    self.callCoroutineBuiltinDirect(id, rargs_fresh, outs) catch |call_err| switch (call_err) {
+                        error.Yield => {
+                            if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
+                                const th = self.current_thread.?;
+                                const fr_y2 = ctx.exec_frames.getPtr(ctx.frame_index);
+                                var resumed2 = false;
+                                self.parkDirectBytecodeYield(
+                                    th,
+                                    ctx.pc,
+                                    &fr_y2.u.lua.resume_pc,
+                                    &resumed2,
+                                    ctx.boundary_depth,
+                                );
+                                if (resumed2) fr_y2.setHookYield();
+                                ctx.yielded_in_place.* = true;
+                            }
+                            return error.Yield;
+                        },
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.RuntimeError => return error.RuntimeError,
+                        error.ThreadSwitch => return error.ThreadSwitch,
+                    };
+                } else {
+                    self.callBuiltin(id, rargs_fresh, outs) catch |call_err| switch (call_err) {
+                        error.Yield => {
+                            if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
+                                const th = self.current_thread.?;
+                                const fr_y2 = ctx.exec_frames.getPtr(ctx.frame_index);
+                                // P15.51l: resumed_direct_yield is a CIST_HOOKYIELD
+                                // flag bit, not a bool field. Use a local and set
+                                // the flag after parkDirectBytecodeYield.
+                                var resumed2 = false;
+                                self.parkDirectBytecodeYield(
+                                    th,
+                                    ctx.pc,
+                                    &fr_y2.u.lua.resume_pc,
+                                    &resumed2,
+                                    ctx.boundary_depth,
+                                );
+                                if (resumed2) fr_y2.setHookYield();
+                                ctx.yielded_in_place.* = true;
+                            }
+                            return error.Yield;
+                        },
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.RuntimeError => return error.RuntimeError,
+                        error.ThreadSwitch => return error.ThreadSwitch,
+                    };
+                }
                 ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                 ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
                 outs = ctx.regs[outs_start .. outs_start + out_len];
@@ -18167,16 +18387,26 @@ pub const Vm = struct {
             // (boundary_depth == bytecode_resume_boundary), preserving
             // foo2's frame for resume.
             //
-            // The top frame is the coroutine.yield C-frame (pushed by
-            // callBuiltin). The Lua frame below it is foo2's frame.
-            // boundary_depth = foo2's frame index = len() - 2.
+            // P16.5b: When the coroutine fast path is active, no C-frame
+            // was pushed for coroutine.yield. The top frame IS the Lua
+            // frame (at len()-1), not the C-frame. The normal path expects
+            // the C-frame at len()-1 and the Lua frame at len()-2. Without
+            // the C-frame, the Lua frame is at len()-1.
             const th_bc2 = self.activeBytecodeThread();
-            if (th_bc2.call_frames.len() >= 2) {
-                const lua_fr_idx = th_bc2.call_frames.len() - 2;
-                const lua_fr = th_bc2.call_frames.getConstPtr(lua_fr_idx);
-                if (!lua_fr.isC()) {
-                    th.bytecode_inplace_suspended = true;
-                    th.bytecode_resume_boundary = lua_fr_idx;
+            if (th_bc2.call_frames.len() >= 1) {
+                const top_idx_y = th_bc2.call_frames.len() - 1;
+                const top_fr_y = th_bc2.call_frames.getConstPtr(top_idx_y);
+                // P16.5b fast path: no C-frame on top → top IS the Lua frame.
+                const lua_fr_idx = if (top_fr_y.isC())
+                    (if (th_bc2.call_frames.len() >= 2) th_bc2.call_frames.len() - 2 else null)
+                else
+                    top_idx_y;
+                if (lua_fr_idx) |idx| {
+                    const lua_fr = th_bc2.call_frames.getConstPtr(idx);
+                    if (!lua_fr.isC()) {
+                        th.bytecode_inplace_suspended = true;
+                        th.bytecode_resume_boundary = idx;
+                    }
                 }
             }
         }

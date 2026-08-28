@@ -265,6 +265,9 @@ def main() -> int:
     ap.add_argument("--matrix-json", default="", help="testes_matrix.py --json-out report")
     ap.add_argument("--smoke-json", default="", help="smoke_compare.py --json-out report")
     ap.add_argument("--perf-json", default="", help="perf_compare.py --json-out report")
+    ap.add_argument("--perf-current", action="store_true",
+                    help="read the versioned snapshot from tools/perf/current.json "
+                         "(takes precedence over --perf-json)")
     ap.add_argument("--write-readme", action="store_true",
                     help="replace the generated block in README.md instead of printing")
     ap.add_argument("--write-status", action="store_true",
@@ -273,7 +276,10 @@ def main() -> int:
 
     matrix = load_json(args.matrix_json)
     smoke = load_json(args.smoke_json)
-    perf = load_json(args.perf_json)
+    if args.perf_current:
+        perf = load_json(str(ROOT / "tools" / "perf" / "current.json"))
+    else:
+        perf = load_json(args.perf_json)
 
     block = build_block(matrix, smoke, perf)
     if args.write_readme:

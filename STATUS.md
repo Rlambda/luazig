@@ -3415,6 +3415,51 @@ unchanged, verified against PUC on the same file.
 live key register); global_arith noise investigation if it reappears
 against the new baseline.
 
+### P16.4g — PUC-faithful gcRemarkUpvals + genlink fix for generational GC
+
+Closed the generational GC grayagain/remarkupvals blocker chain that caused
+files.lua SIGSEGV (line 757 "input file is closed") and gc.lua assertion
+failure (line 583, upvalue of dead coroutine not marked).
+
+Root-cause chain (each fix verified against vendored PUC Lua 5.5.0 lgc.c):
+
+- [x] **genlink in gcDrainGrayagain** (PUC lgc.c:470-477): TOUCHED1 objects
+  must link back to grayagain WITHOUT advancing age. Previously advanced
+  TOUCHED1→TOUCHED2 immediately, then gcCorrectGrayAgain advanced
+  TOUCHED2→OLD in the same cycle — objects left grayagain after ONE cycle
+  instead of TWO (PUC takes two). Young children (SURVIVAL with
+  currentwhite) were not re-marked in the second cycle → collected
+  prematurely → files.lua crash. Fix: genlink only links TOUCHED1 back to
+  grayagain (no age change); TOUCHED2→OLD. This matches PUC exactly.
+- [x] **gcRemarkUpvals** (PUC lgc.c:406-426): re-mark values of open
+  upvalues during atomic. Open upvalues' values may change after propagate
+  (e.g., coroutine resumed, creating new objects on its stack). Without
+  remarkupvals, the new value is not marked → freed by sweep → use-after-free.
+  PUC iterates `g->twups` (threads with open upvalues) and marks values of
+  non-white open upvalues. We don't have twups; instead we iterate all
+  Cells in gc_objects and mark values of open, non-white Cells. Cells are
+  separate GC objects — they survive even if their referencing closure is
+  freed by a previous sweep. This avoids the use-after-free that occurred
+  when accessing freed closures via `frameUpvalues()`.
+- [x] **gcQueueScanObject safety check**: verify object is registered in
+  gc_objects before marking. Stale grayagain entries (from cycles where the
+  drain was disabled) can reference freed-and-reused memory.
+- [x] **gcFullCollectionForUser**: clear generational lists
+  (gcClearGenerationalLists) before starting full incremental cycle, matching
+  PUC minor2inc (lgc.c:1306-1314). Without this, stale grayagain entries
+  from the generational era corrupt the incremental cycle's reachability.
+- [x] **DEADKEY fix**: gcPropagateOne for tables uses PUC-faithful DEADKEY
+  sentinel (key marked dead) instead of setting key to Nil.
+- [x] **nodeInsert chain fix**: table node insertion maintains the chain
+  correctly for the chained stringtable.
+
+**Results:**
+- matrix --testc: **31/32 pass parity, zig_fail=0** (big.lua both_fail
+  pre-existing)
+- gc.lua, files.lua, gengc.lua: all PASS
+- smoke: 56/56 PASS
+- No regressions vs P16.4f
+
 ## История закрытых фаз
 
 P3–P15.12 — краткая сводка. P15.13+ — см. «История разработки» выше.

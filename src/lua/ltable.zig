@@ -75,6 +75,17 @@ const NodeKeyPayload = extern union {
     builtin: BuiltinId,
     lightuserdata: ?*anyopaque,
     userdata: *vm.Userdata,
+    /// Raw GC-pointer view of the payload. All collectable key variants
+    /// (string/table/closure/thread/userdata) store an 8-byte pointer at
+    /// offset 0 of this extern union, so they all alias `gc_ptr`. Used ONLY
+    /// for dead-key identity: after `markDeadKey` sets `key_tt = .dead`, the
+    /// original variant is forgotten and the raw pointer is all that remains
+    /// (PUC's `gcvalueraw(keyval(n))`, ltable.c:260). Never written directly;
+    /// read only via `Node.deadKeyPtr()` on a `.dead` node. Non-collectable
+    /// keys (int/num/bool/builtin/lightuserdata) never become dead keys
+    /// (PUC `clearkey` checks `keyiscollectable`), so this field is never
+    /// read on a node whose payload was written as a non-pointer variant.
+    gc_ptr: ?*anyopaque,
 };
 
 /// PUC-faithful compact Node for hash tables. Field layout:
@@ -85,10 +96,15 @@ const NodeKeyPayload = extern union {
 ///   padding                     (3 B)
 /// Total: 32 B → two full Nodes per 64-byte cache line (was 1 at 48 B).
 ///
-/// Dead keys (GC'd string keys in live-deleted nodes) are marked by
-/// `key_tt = .dead`; the payload is cleared so the GC can't follow a stale
-/// pointer. Chain position (`next_offset`) is preserved so `nodeLookup` can
-/// still walk past them — mirrors PUC's `LUA_TDEADKEY` (lobject.h:24).
+/// Dead keys (GC'd collectable keys in live-deleted nodes) are marked by
+/// `key_tt = .dead`; the raw collectable pointer is PRESERVED in `key_val`
+/// (via the `gc_ptr` union alias) so that `next()`/traversal can match a
+/// live collectable key against a dead node by raw pointer identity (PUC
+/// `equalkey` with deadok=1, ltable.c:258-260). The pointer is never
+/// dereferenced after death — all normal lookups, GC marking, rehash, and
+/// key reconstruction skip `.dead` nodes. Chain position (`next_offset`)
+/// is preserved so `nodeLookup` can walk past them — mirrors PUC's
+/// `LUA_TDEADKEY` (lobject.h:24).
 ///
 /// We do NOT cache the hash in the node (PUC doesn't either — ltable.c calls
 /// `hashint`/`hashstr`/`hashpointer`/`hashboolean` at each use site). The
@@ -113,14 +129,53 @@ pub const Node = struct {
         return self.key_tt == .dead;
     }
 
-    /// Mark this node's key as dead. The payload is cleared so the GC can
-    /// never follow a stale pointer; only the chain position (governed by
-    /// `next_offset`) is preserved, which is all that `nodeLookup` needs to
-    /// walk past this node. Matches PUC's `clearkey` (ltable.c) which sets
-    /// `gval(n).tt = LUA_TDEADKEY` and leaves the node in place.
+    /// PUC `setdeadkey` (lobject.h:814): `keytt(node) = LUA_TDEADKEY` — ONLY
+    /// the tag changes; the raw collectable pointer in `key_val` is PRESERVED.
+    /// This lets `equalkey(..., deadok=1)` match a live collectable key
+    /// against this dead node by raw GC-pointer identity (ltable.c:258-260).
+    /// The pointer is never dereferenced after this — `.dead` nodes are
+    /// skipped by all normal lookups (`keyMatches` returns false), GC marking
+    /// (the table-traversal loop skips `.dead`), rehash (skips `.dead`), and
+    /// key reconstruction (`getKey` returns `.Nil`). Only `deadKeyPtr()` reads
+    /// the preserved pointer, and only for raw comparison (never dereference).
+    ///
+    /// Only collectable keys (string/table/closure/thread/userdata) can become
+    /// dead keys — PUC `clearkey` (lgc.c:209-213) checks `keyiscollectable(n)`
+    /// before calling `setdeadkey`. Their payloads are 8-byte pointers that
+    /// alias `gc_ptr` in the extern union, so leaving `key_val` untouched
+    /// preserves the raw pointer. Non-collectable keys (int/num/bool/builtin/
+    /// lightuserdata) never reach here.
     pub fn markDeadKey(self: *Node) void {
         self.key_tt = .dead;
-        self.key_val = .{ .int = 0 };
+        // Do NOT touch key_val: the raw pointer is preserved for deadok
+        // matching (PUC setdeadkey does not touch keyval either).
+    }
+
+    /// Raw GC pointer preserved in a dead key (PUC `gcvalueraw(keyval(n))`,
+    /// ltable.c:260). Valid ONLY on `.dead` nodes. All collectable key
+    /// variants alias `gc_ptr` in the extern union, so this reads the
+    /// original pointer regardless of which collectable type the key was
+    /// before death. The returned pointer may point to freed memory — it must
+    /// NEVER be dereferenced; it is valid only for raw pointer comparison.
+    pub fn deadKeyPtr(self: *const Node) ?*anyopaque {
+        std.debug.assert(self.key_tt == .dead);
+        return self.key_val.gc_ptr;
+    }
+
+    /// For a node with a live collectable key (string/table/closure/thread/
+    /// userdata), return the raw GC pointer. Returns null for non-collectable
+    /// keys (int/num/bool/builtin/lightuserdata) and for empty/dead nodes.
+    /// PUC `keyiscollectable` + `gckeyN`. Used by the GC deadening pass to
+    /// check key liveness (`gcIsDead`) for any collectable key type.
+    pub fn collectableKeyPtr(self: *const Node) ?*anyopaque {
+        return switch (self.key_tt) {
+            .string => @ptrCast(self.key_val.string),
+            .table => @ptrCast(self.key_val.table),
+            .closure => @ptrCast(self.key_val.closure),
+            .thread => @ptrCast(self.key_val.thread),
+            .userdata => @ptrCast(self.key_val.userdata),
+            .empty, .dead, .int, .num, .bool_, .builtin, .lightuserdata => null,
+        };
     }
 
     /// Compute the hash of this node's key from `key_tt` + `key_val`. Called
@@ -130,6 +185,11 @@ pub const Node = struct {
     /// hash seed.
     pub fn rawHash(self: *const Node, seed: u64) u64 {
         return switch (self.key_tt) {
+            // Dead nodes are never re-hashed: rehash skips them (value == Nil),
+            // and nodeInsert overwrites them in place. The preserved raw pointer
+            // must NOT be dereferenced for hashing — it may point to freed
+            // memory. Returning 0 is safe because no caller uses the result
+            // for a .dead node (all paths skip .dead before hashing).
             .empty, .dead => 0,
             .int => hashInt(self.key_val.int, seed),
             .num => hashNum(self.key_val.num, seed),
@@ -170,6 +230,12 @@ pub const Node = struct {
     /// slots (callers that care must check `isEmpty()`/`isDeadKey()` first).
     /// This is the bridge between the compact Node key representation and
     /// the rest of the VM, which works in terms of `Value`.
+    ///
+    /// MUST NOT be called on a `.dead` node in production paths: the payload
+    /// holds a raw pointer to potentially-freed memory, and reconstructing it
+    /// as a typed Value would create a dangling reference. The `.dead => .Nil`
+    /// arm is a defensive fallback only; all production callers skip `.dead`
+    /// nodes before reaching `getKey()`.
     pub fn getKey(self: *const Node) Value {
         return switch (self.key_tt) {
             .empty, .dead => .Nil,
@@ -198,6 +264,11 @@ pub const Node = struct {
     /// has `key == .Nil`, since Nil cannot be a Lua table key).
     pub fn keyMatches(self: *const Node, key: Value) bool {
         return switch (self.key_tt) {
+            // deadok=false: dead keys NEVER match a normal lookup. This arm
+            // is FIRST so the hot path (nodeLookup) stays branch-cheap — a
+            // single tag check eliminates dead nodes without inspecting the
+            // payload. PUC equalkey with deadok=0 (ltable.c:252-263): the
+            // `keyisdead(n2)` branch is only taken when deadok=1.
             .empty, .dead => false,
             .int => key == .Int and self.key_val.int == key.Int,
             .num => key == .Num and self.key_val.num == key.Num,
@@ -209,6 +280,32 @@ pub const Node = struct {
             .builtin => key == .Builtin and self.key_val.builtin == key.Builtin,
             .lightuserdata => key == .LightUserdata and self.key_val.lightuserdata == key.LightUserdata,
             .userdata => key == .Userdata and self.key_val.userdata == key.Userdata,
+        };
+    }
+
+    /// Dead-key-aware match (PUC `equalkey` with deadok=1, ltable.c:252-282).
+    /// Used ONLY by traversal (`rawNext`/`findindex`): a live collectable key
+    /// matches a DEADKEY node by raw GC-pointer identity. Normal lookups must
+    /// NOT use this — they use `keyMatches` (deadok=0), where `.dead => false`.
+    ///
+    /// PUC ltable.c:258-260:
+    ///   deadok && keyisdead(n2) && iscollectable(k1)
+    ///     => gcvalue(k1) == gcvalueraw(keyval(n2))
+    ///
+    /// For non-dead nodes, this delegates to `keyMatches` (deadok is
+    /// irrelevant when the node is not dead — the same-variant comparison
+    /// applies). The deadok path only adds the dead-key-by-pointer match.
+    pub fn keyMatchesDeadok(self: *const Node, key: Value) bool {
+        return switch (self.key_tt) {
+            .dead => blk: {
+                // Only a collectable key can match a dead key (PUC
+                // iscollectable(k1)). Non-collectable keys (int/num/bool/
+                // builtin/lightuserdata) never match a dead node.
+                const kptr = gcValuePtr(key) orelse break :blk false;
+                break :blk kptr == self.deadKeyPtr();
+            },
+            .empty => false,
+            else => self.keyMatches(key),
         };
     }
 
@@ -340,6 +437,7 @@ pub inline fn mainPosition(len: usize, key: Value, seed: u64) usize {
 
 // Look up `key` in a hash part. Returns the matching node, or null if absent.
 // Walks the chain from the main position (PUC getgeneric/getintfromhash).
+// deadok=false: dead keys NEVER match (PUC getgeneric with deadok=0).
 pub inline fn nodeLookup(nodes: []Node, key: Value, seed: u64) ?*Node {
     if (nodes.len == 0) return null;
     var n: *Node = &nodes[mainPosition(nodes.len, key, seed)];
@@ -348,6 +446,40 @@ pub inline fn nodeLookup(nodes: []Node, key: Value, seed: u64) ?*Node {
         // Inline comparison (Node.keyMatches) — avoids reconstructing a full
         // Value on every chain step, matching PUC's `keyeq` macro hot path.
         if (n.keyMatches(key)) return n;
+        n = n.nextNode(nodes) orelse return null;
+    }
+}
+
+/// Raw GC pointer from a collectable Value (PUC `gcvalue(k1)`, ltable.c:260).
+/// Returns null for non-collectable values (Nil/Int/Num/Bool/Builtin/
+/// LightUserdata). Used by `keyMatchesDeadok` to compare a live collectable
+/// key against a dead node's preserved raw pointer.
+pub inline fn gcValuePtr(v: Value) ?*anyopaque {
+    return switch (v) {
+        .String => |s| @ptrCast(s),
+        .Table => |t| @ptrCast(t),
+        .Closure => |c| @ptrCast(c),
+        .Thread => |t| @ptrCast(t),
+        .Userdata => |u| @ptrCast(u),
+        else => null,
+    };
+}
+
+/// Dead-key-aware lookup (PUC `getgeneric(t, key, deadok=1)`, ltable.c:291-303).
+/// Used ONLY by `rawNext`/traversal to find the node for a control key that
+/// may have been collected and turned into a DEADKEY. A live collectable key
+/// matches a DEADKEY node by raw GC-pointer identity (PUC equalkey deadok=1).
+///
+/// Normal lookups must use `nodeLookup` (deadok=0) and never match dead nodes.
+/// The deadok path is safe even with a dangling key pointer: it compares raw
+/// pointer values only, never dereferences them (PUC "garbage in, garbage out"
+/// semantics, ltable.c:242-250).
+pub inline fn nodeLookupDeadok(nodes: []Node, key: Value, seed: u64) ?*Node {
+    if (nodes.len == 0) return null;
+    var n: *Node = &nodes[mainPosition(nodes.len, key, seed)];
+    if (n.isEmpty()) return null; // bucket unused => key not present
+    while (true) {
+        if (n.keyMatchesDeadok(key)) return n;
         n = n.nextNode(nodes) orelse return null;
     }
 }
@@ -399,13 +531,29 @@ pub fn nodeInsert(
     const h = keyHash(key, seed);
     const mp_idx: usize = h & (nodes.len - 1);
     const mp: *Node = &nodes[mp_idx];
-    if (mp.isEmpty()) {
+    // PUC `insertkey` (ltable.c:863): the main position is available for
+    // direct overwrite iff its VALUE is nil/empty — NOT iff its key tag is
+    // "empty". A deleted node (key still set, value == .Nil) or a dead-key
+    // node (key_tt == .dead, value == .Nil) is available for overwrite, and
+    // crucially its `next_offset` chain link MUST be preserved so the rest
+    // of the collision chain stays reachable. The old code used `mp.isEmpty()`
+    // (key-tag check) and cleared `next_offset`, which orphaned every node
+    // after a deleted/dead node at the main position.
+    //
+    // Dead-key safety: when overwriting a .dead node, `setKey` fully replaces
+    // `key_val` with the new key's payload, so the stale dead pointer is
+    // completely overwritten and never read again. The preserved raw pointer
+    // in the dead node is only read by `deadKeyPtr()` (deadok traversal), and
+    // only while the node remains `.dead` — once overwritten, it is gone.
+    if (mp.value == .Nil) {
         mp.setKey(key);
         mp.value = value;
-        mp.next_offset = 0;
+        // Do NOT touch `next_offset`: PUC's `setnodekey`/`setobj2t`
+        // (ltable.c:891-893) never modify `gnext`. The chain link from the
+        // previous occupant (deleted or dead-key node) is inherited as-is.
         return mp;
     }
-    // Main position occupied. Decide Brent evict vs chain-append.
+    // Main position occupied by a live entry. Decide Brent evict vs chain-append.
     const free = getFreePos(nodes, lastfree) orelse return null;
     const free_idx: usize = (@intFromPtr(free) - @intFromPtr(nodes.ptr)) / @sizeOf(Node);
     const other_idx: usize = mp.rawHash(seed) & (nodes.len - 1);
@@ -566,23 +714,37 @@ pub fn nodeDelete(nodes: []Node, key: Value, seed: u64) bool {
     return true;
 }
 
-pub fn deadenStringKey(node: *Node) void {
-    if (node.key_tt != .string or node.value != .Nil) return;
-    // PUC turns collectable keys in dead nodes into DEADKEY so the GC may
-    // reclaim the object while collision-chain placement stays intact.
-    // `markDeadKey` flips the tag to `.dead` and clears the payload (severing
-    // the stale pointer); `next_offset` is preserved so chain structure
-    // survives across GC.
+/// PUC `clearkey` (lgc.c:209-213): turn a collectable key in a Nil-valued
+/// (logically empty) hash node into a DEADKEY, preserving the raw pointer
+/// for deadok traversal. Applies to ANY collectable key type (string/table/
+/// closure/thread/userdata), not just strings — PUC `clearkey` checks
+/// `keyiscollectable(n)`, which is true for all GC-managed key types.
+/// Non-collectable keys (int/num/bool/builtin/lightuserdata) are left as-is
+/// (they can never become dead keys). The node's `next_offset` chain link is
+/// preserved so collision chains stay intact across GC.
+pub fn clearKey(node: *Node) void {
+    // Only collectable keys can become dead keys (PUC keyiscollectable).
+    if (node.collectableKeyPtr() == null) return;
+    // PUC clearkey asserts isempty(gval(n)) — the value must be Nil.
+    // Callers (gcClearDeadKeys) ensure this; the assert documents the
+    // invariant for any future caller.
+    std.debug.assert(node.value == .Nil);
     node.markDeadKey();
 }
 
 // Index of the first live (value != Nil) node at or after `start`, scanning
 // nodes in memory order (PUC luaH_next hash-part loop, ltable.c:372-379).
-// Returns null if there is no live node at/after `start`.
+// Returns null if there is no live node at/after `start`. Dead-key nodes
+// (key_tt == .dead) are always skipped — they are logically empty (value is
+// Nil) and their payload holds a raw pointer that must not be dereferenced.
 pub fn nextLiveIndex(nodes: []Node, start: usize) ?usize {
     var i: usize = start;
     while (i < nodes.len) : (i += 1) {
-        if (!nodes[i].isEmpty() and nodes[i].value != .Nil) return i;
+        // Skip empty, dead, and deleted (Nil-valued) nodes. A .dead node
+        // always has value == Nil (clearkey is only called on empty-valued
+        // nodes), but the explicit isDeadKey() check is a safety net.
+        if (nodes[i].isEmpty() or nodes[i].isDeadKey()) continue;
+        if (nodes[i].value != .Nil) return i;
     }
     return null;
 }
@@ -619,6 +781,191 @@ test "nextLiveIndex scans nodes in memory order, skipping deleted/empty" {
     try std.testing.expect(nextLiveIndex(nodes, 4) == null); // past end
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Dead-key semantics tests (PUC DEADKEY, ltable.c:252-282 + lgc.c:209-213)
+// ─────────────────────────────────────────────────────────────────────
+//
+// These tests verify the PUC-faithful dead-key behavior:
+//   A. markDeadKey preserves the raw pointer (does NOT zero it).
+//   B. keyMatches (deadok=0) never matches a .dead node; keyMatchesDeadok
+//      (deadok=1) matches a live collectable key against a .dead node by
+//      raw pointer identity.
+//   C. clearKey applies to any collectable key type, not just strings.
+//   D. rehash skips dead nodes; nodeInsert overwrites dead nodes in place.
+
+test "markDeadKey preserves the raw pointer (PUC setdeadkey)" {
+    // PUC setdeadkey (lobject.h:814) sets ONLY the tag; keyval is untouched.
+    // The raw pointer must survive so deadok matching can compare by identity.
+    var n: Node = .{};
+    n.setKey(.{ .Int = 42 });
+    n.value = .{ .Int = 420 };
+    // Simulate a collectable key: use a dummy pointer via the table variant.
+    const dummy_ptr: *Table = @ptrFromInt(0x1000);
+    n.key_tt = .table;
+    n.key_val = .{ .table = dummy_ptr };
+    n.value = .Nil; // clearkey requires empty value
+    n.markDeadKey();
+    try std.testing.expectEqual(NodeKeyTag.dead, n.key_tt);
+    // The raw pointer must be preserved (NOT zeroed).
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(dummy_ptr)), n.deadKeyPtr());
+}
+
+test "keyMatches (deadok=0) never matches a dead node" {
+    // Normal lookups must never match dead keys (PUC equalkey deadok=0).
+    var n: Node = .{};
+    n.setKey(.{ .Int = 7 });
+    n.value = .Nil;
+    n.markDeadKey();
+    // A dead node must not match any key, even the original.
+    try std.testing.expect(!n.keyMatches(.{ .Int = 7 }));
+    try std.testing.expect(!n.keyMatches(.{ .Int = 999 }));
+}
+
+test "keyMatchesDeadok (deadok=1) matches by raw pointer identity" {
+    // PUC equalkey with deadok=1 (ltable.c:258-260): a collectable key k1
+    // matches a dead node n2 iff gcvalue(k1) == gcvalueraw(keyval(n2)).
+    var n: Node = .{};
+    const dummy_ptr: *Table = @ptrFromInt(0x2000);
+    n.key_tt = .table;
+    n.key_val = .{ .table = dummy_ptr };
+    n.value = .Nil;
+    n.markDeadKey();
+
+    // A live table key with the SAME pointer must match (deadok=1).
+    const live_key: Value = .{ .Table = dummy_ptr };
+    try std.testing.expect(n.keyMatchesDeadok(live_key));
+
+    // A live table key with a DIFFERENT pointer must NOT match.
+    const other_ptr: *Table = @ptrFromInt(0x3000);
+    const other_key: Value = .{ .Table = other_ptr };
+    try std.testing.expect(!n.keyMatchesDeadok(other_key));
+
+    // A non-collectable key must NOT match a dead node (PUC iscollectable).
+    try std.testing.expect(!n.keyMatchesDeadok(.{ .Int = 42 }));
+    try std.testing.expect(!n.keyMatchesDeadok(.{ .Bool = true }));
+}
+
+test "nodeLookupDeadok finds a dead node; nodeLookup does not" {
+    // deadok=0 (nodeLookup) must NOT find a dead node.
+    // deadok=1 (nodeLookupDeadok) MUST find it by raw pointer.
+    const nodes = try std.testing.allocator.alloc(Node, 4);
+    defer std.testing.allocator.free(nodes);
+    for (nodes) |*n| n.* = .{};
+
+    const dummy_ptr: *Table = @ptrFromInt(0x4000);
+    const key: Value = .{ .Table = dummy_ptr };
+    const mp = mainPosition(nodes.len, key, 0);
+    nodes[mp].key_tt = .table;
+    nodes[mp].key_val = .{ .table = dummy_ptr };
+    nodes[mp].value = .Nil;
+    nodes[mp].markDeadKey();
+
+    // Normal lookup (deadok=0): must return null (dead node not matched).
+    try std.testing.expect(nodeLookup(nodes, key, 0) == null);
+    // Deadok lookup (deadok=1): must find the dead node.
+    const found = nodeLookupDeadok(nodes, key, 0).?;
+    try std.testing.expectEqual(NodeKeyTag.dead, found.key_tt);
+}
+
+test "clearKey deadens any collectable key type, not just strings" {
+    // PUC clearkey (lgc.c:209-213) applies to ANY collectable key
+    // (keyiscollectable), not just strings. Verify table/closure/thread/
+    // userdata keys are all deadened.
+    var n: Node = .{};
+
+    // Table key
+    n.setKey(.{ .Table = @ptrFromInt(0x5000) });
+    n.value = .Nil;
+    clearKey(&n);
+    try std.testing.expectEqual(NodeKeyTag.dead, n.key_tt);
+
+    // Closure key
+    n.setKey(.{ .Closure = @ptrFromInt(0x6000) });
+    n.value = .Nil;
+    clearKey(&n);
+    try std.testing.expectEqual(NodeKeyTag.dead, n.key_tt);
+
+    // Thread key
+    n.setKey(.{ .Thread = @ptrFromInt(0x7000) });
+    n.value = .Nil;
+    clearKey(&n);
+    try std.testing.expectEqual(NodeKeyTag.dead, n.key_tt);
+
+    // Userdata key
+    n.setKey(.{ .Userdata = @ptrFromInt(0x8000) });
+    n.value = .Nil;
+    clearKey(&n);
+    try std.testing.expectEqual(NodeKeyTag.dead, n.key_tt);
+}
+
+test "clearKey does not deaden non-collectable keys" {
+    // Non-collectable keys (int/num/bool/builtin/lightuserdata) never become
+    // dead keys (PUC keyiscollectable returns false for them).
+    var n: Node = .{};
+    n.setKey(.{ .Int = 42 });
+    n.value = .Nil;
+    clearKey(&n);
+    try std.testing.expectEqual(NodeKeyTag.int, n.key_tt); // unchanged
+
+    n.setKey(.{ .Bool = true });
+    n.value = .Nil;
+    clearKey(&n);
+    try std.testing.expectEqual(NodeKeyTag.bool_, n.key_tt); // unchanged
+}
+
+test "rehash skips dead nodes (dead pointer never dereferenced)" {
+    // rehash must skip .dead nodes — getKey() must not be called on them
+    // (it would return .Nil, but the point is the dead pointer is never read).
+    const old = try std.testing.allocator.alloc(Node, 4);
+    defer std.testing.allocator.free(old);
+    for (old) |*n| n.* = .{};
+
+    // Place a live entry and a dead entry.
+    old[0].setKey(.{ .Int = 10 });
+    old[0].value = .{ .Int = 100 };
+    old[1].key_tt = .table;
+    old[1].key_val = .{ .table = @ptrFromInt(0x9000) };
+    old[1].value = .Nil;
+    old[1].markDeadKey(); // dead node with a raw pointer
+
+    const result = try rehash(std.testing.allocator, old, 2, 0);
+    defer std.testing.allocator.free(result.nodes);
+
+    // Only the live entry should be present in the new hash.
+    const found = nodeLookup(result.nodes, .{ .Int = 10 }, 0).?;
+    try std.testing.expectEqual(@as(i64, 100), found.value.Int);
+    // The dead node must not have been reinserted.
+    try std.testing.expect(nodeLookup(result.nodes, .{ .Int = 999 }, 0) == null);
+}
+
+test "nodeInsert overwrites a dead node in place (stale pointer fully replaced)" {
+    // A .dead node at the main position is available for overwrite (value == Nil).
+    // setKey must fully replace key_val so the stale dead pointer is gone.
+    const nodes = try std.testing.allocator.alloc(Node, 4);
+    defer std.testing.allocator.free(nodes);
+    for (nodes) |*n| n.* = .{};
+
+    // Insert a key, delete it, deaden it.
+    const key1: Value = .{ .Int = 7 };
+    var lastfree: usize = nodes.len;
+    _ = nodeInsert(nodes, &lastfree, key1, .{ .Int = 70 }, 0);
+    _ = nodeDelete(nodes, key1, 0);
+    const mp = mainPosition(nodes.len, key1, 0);
+    nodes[mp].markDeadKey();
+    try std.testing.expectEqual(NodeKeyTag.dead, nodes[mp].key_tt);
+
+    // Insert a different key that maps to the same main position.
+    // (With seed=0 and 4 slots, key 7 and key 7+4=11 may collide; use same key
+    // to guarantee same main position — the dead node is overwritten.)
+    const key2: Value = .{ .Int = 7 };
+    _ = nodeInsert(nodes, &lastfree, key2, .{ .Int = 77 }, 0);
+
+    // The node must no longer be dead — it's a live entry now.
+    const found = nodeLookup(nodes, key2, 0).?;
+    try std.testing.expectEqual(@as(i64, 77), found.value.Int);
+    try std.testing.expect(found.key_tt != .dead);
+}
+
 // Rebuild the hash part at a new (power-of-two) size, reinserting only live
 // entries (dropping deleted/Nil-valued ones). PUC `reinserthash`/`luaH_resize`
 // (ltable.c:637-746). Frees the old slice; returns the new one + lastfree.
@@ -634,7 +981,11 @@ pub fn rehash(
     for (new_nodes) |*n| n.* = .{};
     var lastfree: usize = new_len;
     for (old) |*o| {
-        if (o.isEmpty() or o.value == .Nil) continue; // skip free + deleted
+        // Skip empty, dead, and deleted (Nil-valued) nodes. Dead nodes hold
+        // a raw pointer to potentially-freed memory — getKey() must not be
+        // called on them. PUC reinserthash (ltable.c:637-746) skips dead
+        // nodes the same way (they have empty values and are not reinserted).
+        if (o.isEmpty() or o.isDeadKey() or o.value == .Nil) continue;
         // new_len is chosen large enough that reinsert cannot fail.
         _ = nodeInsert(new_nodes, &lastfree, o.getKey(), o.value, seed);
     }
@@ -712,6 +1063,221 @@ test "rehash preserves live entries and drops deleted ones" {
     // Deleted key is gone (not reinserted).
     const deleted = nodeLookup(r.nodes, .{ .Int = 2 }, 0);
     try std.testing.expect(deleted == null or deleted.?.value == .Nil);
+}
+
+// =========================================================================
+// Chain-integrity regression tests for the nodeInsert fix (PUC ltable.c:863).
+//
+// Before the fix, nodeInsert used `mp.isEmpty()` (key-tag check) instead of
+// `mp.value == .Nil` (value check) to decide if the main position was
+// available for direct overwrite. It also cleared `next_offset` on overwrite.
+// Together these two bugs orphaned every node after a deleted or dead-key
+// node at the main position, corrupting the collision chain and making
+// pairs()/next() fail with "invalid key to 'next'" after insert/delete churn.
+// =========================================================================
+
+// Insert several colliding keys, delete the one at the main position, then
+// re-insert a new key that lands at the same main position. The new key must
+// overwrite the deleted node in place WITHOUT clearing `next_offset`, so the
+// rest of the chain remains reachable. Every previously inserted key must
+// still be findable via nodeLookup.
+test "nodeInsert: overwrite deleted node at main position preserves chain" {
+    const cap = 8;
+    const nodes = try std.testing.allocator.alloc(Node, cap);
+    defer std.testing.allocator.free(nodes);
+    for (nodes) |*n| n.* = .{};
+    var lastfree: usize = nodes.len;
+
+    // Insert 7 int keys (filling all but one slot). With seed=0 the golden-
+    // ratio hash distributes them, but some will collide and chain.
+    var i: i64 = 1;
+    while (i < cap) : (i += 1) {
+        _ = nodeInsert(nodes, &lastfree, .{ .Int = i }, .{ .Int = i * 10 }, 0) orelse {
+            try std.testing.expect(false);
+            return;
+        };
+    }
+
+    // Pick the key whose node is at its own main position (index 0 of the
+    // chain). We find it by scanning: the main-position node's rawHash must
+    // equal its index masked by (cap-1).
+    var mp_key: Value = .Nil;
+    for (nodes, 0..) |*n, idx| {
+        if (n.isEmpty() or n.value == .Nil) continue;
+        if ((n.rawHash(0) & (cap - 1)) == idx) {
+            mp_key = n.getKey();
+            break;
+        }
+    }
+    try std.testing.expect(mp_key != .Nil);
+
+    // If this main-position node has a chain (next_offset != 0), delete it
+    // and re-insert a new key at the same main position. The chain must
+    // survive.
+    const mp_node = nodeLookup(nodes, mp_key, 0).?;
+    const had_chain = mp_node.next_offset != 0;
+    if (had_chain) {
+        // Delete the main-position key.
+        try std.testing.expect(nodeDelete(nodes, mp_key, 0));
+        // Verify the node is now Nil-valued but still has its chain link.
+        const deleted_node = nodeLookup(nodes, mp_key, 0).?;
+        try std.testing.expect(deleted_node.value == .Nil);
+        try std.testing.expect(deleted_node.next_offset != 0);
+
+        // Insert a new key that hashes to the same main position. We use a
+        // key with the same hash: since keyHash(.Int = k, 0) = hashInt(k, 0),
+        // and hashInt uses the golden ratio, we find a colliding key by
+        // scanning for an int whose hash mod cap equals the main position.
+        const mp_idx = mp_node.rawHash(0) & (cap - 1);
+        var new_key: i64 = 1000;
+        while (new_key < 10000) : (new_key += 1) {
+            if ((hashInt(new_key, 0) & (cap - 1)) == mp_idx and new_key != mp_key.Int) break;
+        }
+        try std.testing.expect(new_key < 10000);
+
+        _ = nodeInsert(nodes, &lastfree, .{ .Int = new_key }, .{ .Int = 999 }, 0) orelse {
+            try std.testing.expect(false);
+            return;
+        };
+
+        // The new key must be findable.
+        const found_new = nodeLookup(nodes, .{ .Int = new_key }, 0).?;
+        try std.testing.expectEqual(@as(i64, 999), found_new.value.Int);
+
+        // The deleted key's node is now overwritten with the new key; its
+        // chain link (next_offset) must still point to the same successor.
+        try std.testing.expectEqual(mp_node.next_offset, found_new.next_offset);
+    }
+
+    // Every non-deleted key must still be findable.
+    i = 1;
+    while (i < cap) : (i += 1) {
+        if (i == mp_key.Int and had_chain) continue; // deleted, overwritten
+        const found = nodeLookup(nodes, .{ .Int = i }, 0) orelse {
+            try std.testing.expect(false);
+            return;
+        };
+        try std.testing.expectEqual(i * 10, found.value.Int);
+    }
+}
+
+// Simulate the nextvar.lua:135-141 churn pattern at the nodeInsert level:
+// fill the hash part, then repeatedly insert and delete keys that collide
+// with existing main positions. After churn, every surviving key must be
+// findable — no chain links orphaned.
+test "nodeInsert: insert/delete churn preserves chain integrity" {
+    const cap = 16;
+    const nodes = try std.testing.allocator.alloc(Node, cap);
+    defer std.testing.allocator.free(nodes);
+    for (nodes) |*n| n.* = .{};
+    var lastfree: usize = nodes.len;
+
+    // Fill with 15 int keys (leave one free slot).
+    var i: i64 = 1;
+    while (i < cap) : (i += 1) {
+        _ = nodeInsert(nodes, &lastfree, .{ .Int = i }, .{ .Int = i }, 0) orelse {
+            try std.testing.expect(false);
+            return;
+        };
+    }
+
+    // Churn: insert and delete keys 100..1000. These collide with existing
+    // main positions, forcing nodeInsert to either overwrite a deleted node
+    // (the fix path) or Brent-evict a live node. Each delete leaves a
+    // Nil-valued node at some main position; the next insert at that main
+    // position must overwrite in place, preserving the chain.
+    var k: i64 = 100;
+    while (k < 1000) : (k += 1) {
+        _ = nodeInsert(nodes, &lastfree, .{ .Int = k }, .{ .Int = k }, 0) orelse continue;
+        _ = nodeDelete(nodes, .{ .Int = k }, 0);
+    }
+
+    // Every original key (1..15) must still be findable with its value.
+    i = 1;
+    while (i < cap) : (i += 1) {
+        const found = nodeLookup(nodes, .{ .Int = i }, 0) orelse {
+            try std.testing.expect(false);
+            return;
+        };
+        try std.testing.expectEqual(i, found.value.Int);
+    }
+}
+
+// A dead-key node (key_tt == .dead, value == .Nil) at the main position must
+// be overwritten in place by nodeInsert, just like a deleted node. The chain
+// link (next_offset) must be preserved. This mirrors PUC's `insertkey` which
+// treats any nil-valued main position as available, regardless of key tag.
+test "nodeInsert: overwrite dead-key node at main position preserves chain" {
+    const cap = 8;
+    const nodes = try std.testing.allocator.alloc(Node, cap);
+    defer std.testing.allocator.free(nodes);
+    for (nodes) |*n| n.* = .{};
+    var lastfree: usize = nodes.len;
+
+    // Insert two int keys that collide at the same main position.
+    // Find a colliding pair: keys k1, k2 where hashInt(k1,0)&7 == hashInt(k2,0)&7.
+    var k1: i64 = 1;
+    var k2: i64 = 2;
+    outer: while (k1 < 100) : (k1 += 1) {
+        k2 = k1 + 1;
+        while (k2 < 100) : (k2 += 1) {
+            if ((hashInt(k1, 0) & 7) == (hashInt(k2, 0) & 7)) break :outer;
+        }
+    }
+    try std.testing.expect(k1 < 100);
+
+    _ = nodeInsert(nodes, &lastfree, .{ .Int = k1 }, .{ .Int = 11 }, 0) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    _ = nodeInsert(nodes, &lastfree, .{ .Int = k2 }, .{ .Int = 22 }, 0) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+
+    // Find the main-position node (the one whose index == its hash & 7).
+    const mp_idx = hashInt(k1, 0) & 7;
+    const mp_node = &nodes[mp_idx];
+
+    // Determine which key is at the main position and which is chained.
+    const mp_key = mp_node.getKey();
+    const chained_key: Value = if (mp_key == .Int and mp_key.Int == k1) .{ .Int = k2 } else .{ .Int = k1 };
+
+    // Simulate GC deadening: mark the main-position node as dead-key.
+    // (In real GC, this happens when the string key is collected. Here we
+    // use an int key and manually call markDeadKey to simulate the state.)
+    _ = nodeDelete(nodes, mp_key, 0); // value -> .Nil
+    mp_node.markDeadKey(); // key_tt -> .dead, key_val cleared
+
+    // Verify the dead node still has its chain link.
+    const saved_next = mp_node.next_offset;
+    try std.testing.expect(saved_next != 0); // must have a chain
+
+    // Insert a new key that hashes to the same main position.
+    var new_key: i64 = 1000;
+    while (new_key < 10000) : (new_key += 1) {
+        if ((hashInt(new_key, 0) & 7) == mp_idx) break;
+    }
+    try std.testing.expect(new_key < 10000);
+
+    _ = nodeInsert(nodes, &lastfree, .{ .Int = new_key }, .{ .Int = 333 }, 0) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+
+    // The new key must be at the main position (overwrote the dead node).
+    const found_new = nodeLookup(nodes, .{ .Int = new_key }, 0).?;
+    try std.testing.expectEqual(@as(i64, 333), found_new.value.Int);
+    try std.testing.expectEqual(@as(usize, @intFromPtr(found_new)), @as(usize, @intFromPtr(mp_node)));
+
+    // The chain link must be preserved (not cleared to 0).
+    try std.testing.expectEqual(saved_next, found_new.next_offset);
+
+    // The chained key must still be findable.
+    const found_chained = nodeLookup(nodes, chained_key, 0).?;
+    try std.testing.expect(chained_key == .Int);
+    const expected_val: i64 = if (chained_key.Int == k1) 11 else 22;
+    try std.testing.expectEqual(expected_val, found_chained.value.Int);
 }
 
 // =========================================================================

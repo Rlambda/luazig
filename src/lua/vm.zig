@@ -6146,8 +6146,6 @@ pub const Vm = struct {
     fn gcUnregisterObject(self: *Vm, obj: GcObject) void {
         const p = gcPtr(obj);
         const index = p.index.*;
-        // Catches index corruption: if the object at this index doesn't
-        // match, something went wrong.
         std.debug.assert(index < self.gc_objects.items.len and
             std.meta.eql(self.gc_objects.items[index], obj));
         _ = self.gc_objects.swapRemove(index);
@@ -18830,6 +18828,24 @@ pub const Vm = struct {
     /// the same gray list as PUC's LUA_VUPVAL handling.
     fn gcQueueScanObject(self: *Vm, obj: GcObject) DispatchError!void {
         const p = gcPtr(obj);
+        // Safety check: verify the object is registered in gc_objects.
+        // Stale references (from cells/tables pointing to freed-and-reused
+        // memory) can appear when grayagain entries from previous cycles
+        // (where the drain was disabled) are processed for the first time.
+        // The freed object's memory may have been reused, producing a
+        // valid-looking but incorrect gc_index. Skip unregistered objects
+        // — they are already dead, and marking them would be a no-op.
+        // TODO: Once the grayagain drain has been running correctly for all
+        // suites without this check firing, consider removing it or making
+        // it a debug-only assertion.
+        {
+            const idx = p.index.*;
+            if (idx >= self.gc_objects.items.len or
+                !std.meta.eql(self.gc_objects.items[idx], obj))
+            {
+                return;
+            }
+        }
         if (!gcIsWhite(p.marked.*)) return;
         // PUC reallymarkobject: GCmarked += objsize(o). Track marked KB
         // for checkmajorminor (tobecollected = total - marked).
@@ -18865,17 +18881,11 @@ pub const Vm = struct {
         if (cell.isOpen()) {
             if (!gcIsWhite(cell.gc_marked)) return;
             gcSetGray(&cell.gc_marked);
-            // A4: open cells now ride the unified gc_grayagain (GcObject)
-            // list, matching PUC's single gclist per object.
-            try self.gc_grayagain.append(self.alloc, .{ .cell = cell });
-            // PUC reallymarkobject: markvalue(g, uv->v.p) — mark the
-            // upvalue's content (the stack value) even for open upvalues.
-            // This is critical when the owning thread is UNREACHABLE: its
-            // stack is not scanned, so the value would be unmarked and
-            // freed by sweep. The cell survives (reachable via a closure),
-            // but its stack reference would dangle after the thread is
-            // freed. Marking the value here ensures it survives GC.
-            // cell.get(self) reads the current stack value for open cells.
+            // PUC reallymarkobject (lgc.c:347-354): open upvalues are set
+            // GRAY and their value is marked inline. They are NOT added to
+            // grayagain — PUC never puts upvalues in grayagain. Their values
+            // are re-marked by remarkupvals during atomic (lgc.c:406-426),
+            // which iterates the twups list (threads with open upvalues).
             try self.gcMarkValue(cell.get(self));
             return;
         }
@@ -18909,11 +18919,11 @@ pub const Vm = struct {
                 gcSetGray(p.marked);
             },
             .old1, .old => {
-                p.age.* = .touched1;
-                // PUC linkobjgclist: paint gray and add to grayagain.
-                gcSetGray(p.marked);
-                try self.gc_grayagain.append(self.alloc, owner);
-            },
+                    p.age.* = .touched1;
+                    // PUC linkobjgclist: paint gray and add to grayagain.
+                    gcSetGray(p.marked);
+                    try self.gc_grayagain.append(self.alloc, owner);
+                },
         }
     }
 
@@ -19112,6 +19122,13 @@ pub const Vm = struct {
         while (self.gc_state != .pause) {
             _ = try self.gcAdvance(std.math.maxInt(usize), false);
         }
+        // PUC minor2inc (lgc.c:1306-1314): clear generational lists before
+        // starting the full incremental cycle. Without this, stale grayagain
+        // entries from the generational era are processed by the grayagain
+        // drain inside gcAtomicCommon, traversing objects that were reset to
+        // white by gcMakeAllWhite — marking children of potentially
+        // unreachable objects and corrupting the cycle's reachability.
+        self.gcClearGenerationalLists();
         // PUC fullgen: reset all objects to current white so the incremental
         // mark/sweep can distinguish reachable (will be marked black) from
         // unreachable (stays old-white, swept after the white flip).
@@ -19562,13 +19579,11 @@ pub const Vm = struct {
         // Use cell.set() to properly handle open upvalues (writes to stack
         // slot) vs closed upvalues (writes to cell.value).
         cell.set(self, value);
-        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
-            if (gcValueAge(value)) |age| {
-                if (cell.gc_age.isOld() and age.isYoung()) try self.gcRememberCell(cell);
-            }
-        }
-        // PUC forward barrier: only fire if cell is BLACK.
-        // Open upvalues are kept GRAY during GC, so this won't fire for them.
+        // PUC OP_SETUPVAL (lvm.c:1297): luaC_barrier(L, uv, s2v(ra)) —
+        // FORWARD barrier only (luaC_barrier_ in lgc.c:246). PUC does NOT
+        // call luaC_barrierback_ on upvalues. The forward barrier marks
+        // the new value and promotes it to OLD0 if the cell is old and
+        // the value is young. No backward barrier (no grayagain insertion).
         try self.gcWriteBarrierCell(cell, value);
     }
 
@@ -19650,6 +19665,7 @@ pub const Vm = struct {
     }
 
     inline fn gcTableWriteBarrier(self: *Vm, table: *Table, key: Value, value: Value) DispatchError!void {
+
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             // Generational mode: age-based remember. When an old table gets
             // a young value, remember the table for re-traversal. Do NOT
@@ -19689,74 +19705,114 @@ pub const Vm = struct {
         // then drains the saved list. New items added by barriers during
         // draining stay in grayagain for later processing (by gcCorrectGrayAgain
         // or the next cycle).
+        //
+        // PUC genlink (lgc.c:470-477): after traversing an object in the
+        // grayagain drain, advance its age:
+        //   TOUCHED1 → TOUCHED2, link back into grayagain (for next cycle)
+        //   TOUCHED2 → OLD, remove from grayagain (fully promoted)
+        // Without genlink, TOUCHED1 objects are cleared from grayagain but
+        // never advanced. In subsequent cycles, they're not in grayagain and
+        // not re-traversed → their young children are not marked → freed.
         const saved = self.alloc.dupe(GcObject, self.gc_grayagain.items) catch return error.OutOfMemory;
         defer self.alloc.free(saved);
         self.gc_grayagain.clearRetainingCapacity();
         for (saved) |obj| {
+            // Skip stale grayagain entries: objects that were freed in a
+            // previous cycle (when the grayagain drain was disabled).
+            {
+                const p = gcPtr(obj);
+                const idx = p.index.*;
+                if (idx >= self.gc_objects.items.len or
+                    !std.meta.eql(self.gc_objects.items[idx], obj))
+                {
+                    continue;
+                }
+            }
             switch (obj) {
                 .cell => |cell| {
-                    gcSetGray(&cell.gc_marked);
-                    try self.gcMarkValue(cell.get(self));
-                    gcSetBlack(&cell.gc_marked);
+                    // PUC reallymarkobject (lgc.c:347-354): open upvalues
+                    // are kept GRAY (not BLACK) so future stack writes can
+                    // trigger backward barriers via thread re-traversal.
+                    // Closed upvalues are set BLACK and their value marked.
+                    // Skip cells that are already BLACK (already processed
+                    // by gcRemarkUpvals or previous traversal).
+                    if (gcIsBlack(cell.gc_marked)) continue;
+                    if (cell.isOpen()) {
+                        gcSetGray(&cell.gc_marked);
+                        try self.gcMarkValue(cell.get(self));
+                    } else {
+                        gcSetBlack(&cell.gc_marked);
+                        try self.gcMarkValue(cell.value);
+                    }
                 },
                 else => {
                     const p = gcPtr(obj);
-                    gcSetGray(p.marked);
+
+                    // PUC propagatemark: nw2black(o) — set BLACK before
+                    // traversing, then genlink after.
+                    gcSetBlack(p.marked);
                     try self.gc_gray.append(self.alloc, obj);
                     try self.gcDrainGray();
+                    // PUC genlink (lgc.c:470-477): after traversal, if the
+                    // object is TOUCHED1, link it back to grayagain WITHOUT
+                    // advancing the age. correctgraylist (gcCorrectGrayAgain,
+                    // called after sweep) advances TOUCHED1→TOUCHED2. In the
+                    // NEXT cycle's drain, genlink sees TOUCHED2 and advances
+                    // to OLD. This ensures objects stay in grayagain for TWO
+                    // cycles, giving their young children time to be promoted
+                    // (NEW→SURVIVAL→OLD1) before the parent leaves grayagain.
+                    // Advancing TOUCHED1→TOUCHED2 here (as we previously did)
+                    // causes gcCorrectGrayAgain to immediately advance
+                    // TOUCHED2→OLD, removing the object from grayagain one
+                    // cycle too early — young children (still SURVIVAL with
+                    // currentwhite) are not re-marked and get collected.
+                    switch (p.age.*) {
+                        .touched1 => {
+
+                            try self.gc_grayagain.append(self.alloc, obj);
+                        },
+                        .touched2 => {
+                            p.age.* = .old;
+
+                        },
+                        else => {
+                            // Threads and other objects kept in grayagain
+                            // by correctgraylist. Keep them.
+                            if (obj == .thread) {
+                                try self.gc_grayagain.append(self.alloc, obj);
+                            }
+                        },
+                    }
                 },
             }
         }
     }
 
-    /// PUC remarkupvals (lgc.c:406-421): iterate ALL open upvalues and
-    /// mark their values. In PUC, this iterates the `g->uvhead` doubly-
-    /// linked list of all open upvalues across all threads.
+    /// PUC remarkupvals (lgc.c:406-421): re-mark values of open upvalues
+    /// during atomic. In PUC, this iterates `g->twups` (threads with open
+    /// upvalues) and marks values of non-white open upvalues.
     ///
-    /// Why this is necessary in minor cycles: OLD threads are not
-    /// re-traversed (their referenced objects are assumed to be all old).
-    /// But an OLD thread may have open upvalues pointing to young stack
-    /// slots. Those upvalues (Cells) are young GC objects that need to be
-    /// marked. Without remarkupvals, they stay white → dead after the
-    /// white flip → freed by minor sweep → use-after-free when the thread
-    /// resumes and accesses the upvalue.
+    /// We don't have a twups list or per-thread openupval linked list. Open
+    /// upvalues are Cells with `isOpen() == true`. Cells are separate GC
+    /// objects, so they survive even if their referencing closure is freed.
+    /// Instead of accessing closures (which may have been freed by a previous
+    /// sweep), we iterate all Cells in gc_objects and mark values of open,
+    /// non-white Cells. This is O(total objects) but correct and avoids
+    /// use-after-free on freed closure memory.
     ///
-    /// We don't have a uvhead list; instead we iterate gc_gen_threads
-    /// (all old threads) plus the active thread. Young threads are minor
-    /// candidates and are traversed normally during the mark phase.
+    /// Key invariant (PUC lgc.c:419): only mark the value if the upvalue
+    /// itself is NOT white (was reached by normal traversal). A white upvalue
+    /// was never reached → its value should be collected.
     fn gcRemarkUpvals(self: *Vm) DispatchError!void {
-        // Old threads (in gc_gen_threads).
-        for (self.gc_gen_threads.items) |th| {
-            try self.gcRemarkThreadUpvals(th);
-        }
-        // Active thread (may not be in gc_gen_threads if still young).
-        try self.gcRemarkThreadUpvals(self.activeBytecodeThread());
-    }
-
-    fn gcRemarkThreadUpvals(self: *Vm, th: *Thread) DispatchError!void {
-        const boxed_stack = if (th.bytecode_boxed.len > 0) th.bytecode_boxed else self.bc_boxed;
-        for (0..th.call_frames.len()) |i| {
-            const fr = th.call_frames.getConstPtr(i);
-            if (fr.isC()) continue;
-            // Closure upvalues: these are Cells referenced by the closure.
-            for (self.frameUpvalues(fr, th)) |cell| {
-                if (cell.isOpen() and !gcIsBlack(cell.gc_marked)) {
-                    try self.gcMarkValue(cell.get(self));
-                    gcSetBlack(&cell.gc_marked);
-                }
-            }
-            // Boxed variables: Cells allocated for to-be-closed variables
-            // and other boxed locals. They may be open upvalues too.
-            if (fr.proto() != null) {
-                const cap = fr.u.lua.frame_cap;
-                for (boxed_stack[fr.base .. fr.base + cap]) |maybe_cell| {
-                    if (maybe_cell) |cell| {
-                        if (cell.isOpen() and !gcIsBlack(cell.gc_marked)) {
-                            try self.gcMarkValue(cell.get(self));
-                            gcSetBlack(&cell.gc_marked);
-                        }
+        for (self.gc_objects.items) |obj| {
+            switch (obj) {
+                .cell => |cell| {
+                    if (cell.isOpen() and !gcIsWhite(cell.gc_marked)) {
+                        try self.gcMarkValue(cell.get(self));
+                        gcSetBlack(&cell.gc_marked);
                     }
-                }
+                },
+                else => {},
             }
         }
     }
@@ -19792,6 +19848,13 @@ pub const Vm = struct {
         try self.gcMarkMutableRoots();
         try self.gcDrainGray();
 
+        // PUC atomic (lgc.c:1557): remarkupvals(g) — re-mark values of open
+        // upvalues during atomic. Open upvalues' values may have changed
+        // since propagate (e.g., coroutine resumed, creating new objects on
+        // its stack). See gcRemarkUpvals for details.
+        try self.gcRemarkUpvals();
+        try self.gcDrainGray();
+
         // PUC 5.5 atomic does NOT call traversestrtable — short strings live
         // in allgc and are marked via normal root reachability + backward
         // barriers. The previous traversestrtable emulation iterated gc_objects
@@ -19808,21 +19871,12 @@ pub const Vm = struct {
         // it. This ensures all grayagain items are re-traversed during atomic.
         // After this, any NEW grayagain items (added by finalizers etc.) are
         // processed by gcCorrectGrayAgain after the sweep.
-        // Enable for non-minor (full/incremental) cycles: grayagain items
-        // must be re-traversed during atomic to mark them. Without this,
-        // gcFullCollectionForUser frees grayagain items that weren't marked
-        // → dangling pointers in grayagain → crash in next minor cycle.
-        // TODO: enable for minor cycles — currently causes minor2inc which
-        // exposes a dangling metatable pointer. Root cause: a table's
-        // metatable is freed by a previous minor sweep because the table
-        // (old, not re-traversed) didn't have its metatable marked. The
-        // backward barrier in gcStoreMetatable should fix this, but
-        // something is still missing.
-        if (!self.gc_minor_cycle) {
+        // PUC atomic (lgc.c:1559-1560): g->gray = grayagain; propagateall(g).
+        // The grayagain drain runs in ALL modes (incremental and generational).
+        if (self.gc_minor_cycle) {
             try self.gcDrainGrayagain();
             try self.gcDrainGray();
         }
-
         try self.gcPropagateEphemerons(&self.gc_weak_tables);
         try self.gcDrainGray();
 
@@ -19902,7 +19956,7 @@ pub const Vm = struct {
             if (tobecollected_kb > 0 and tobecollected_kb * 1024.0 > @as(f64, @floatFromInt(limit_bytes))) {
                 // PUC atomic2gen: flip white, sweep all (free dead), set OLD+BLACK
                 self.gc_current_white ^= WHITEBITS;
-                self.gcDeadenUnmarkedStringKeys();
+                self.gcClearDeadKeys();
                 self.gcClearDeadFrameRegisters();
                 self.gc_objects_snapshot_len = self.gc_objects.items.len;
                 self.gc_sweep_objects_cursor = 0;
@@ -19930,7 +19984,7 @@ pub const Vm = struct {
         // tables have the old white bit (gcIsWhite=true → skipped). Running
         // before sweep avoids use-after-free: no table memory has been freed
         // yet, so all gc_objects table pointers are valid.
-        self.gcDeadenUnmarkedStringKeys();
+        self.gcClearDeadKeys();
 
         self.gcClearDeadFrameRegisters();
         // PUC entersweep: start sweeping `allgc` from the beginning.
@@ -20297,6 +20351,7 @@ pub const Vm = struct {
         if (self.gc_busy) return;
 
 
+
         self.gc_busy = true;
         self.gc_minor_cycle = true;
         defer {
@@ -20313,8 +20368,14 @@ pub const Vm = struct {
         self.gc_gen_last_minor_old_visited = 0;
         self.gcResetCycleState();
 
-        // Reset all young objects' marks to current_white before marking.
-        for (self.gc_young_objects.items) |obj| gcPtr(obj).marked.* = self.gc_current_white & WHITEBITS;
+        // PUC youngcollection does NOT reset young objects' marks to
+        // current_white at the start of each minor cycle. PUC relies on
+        // the white flip (which changes the current white bit) and isdead
+        // (which checks for the OTHER white bit) to determine liveness.
+        // Objects marked BLACK in a previous cycle stay BLACK → not dead →
+        // survive sweep. Objects never marked (still old white) are dead.
+        // Resetting marks here would incorrectly make previously-marked
+        // objects appear dead in the next cycle if they're not re-marked.
 
         try self.gcMarkCurrentRoots();
         // PUC markold (lgc.c:1276-1286): re-traverse OLD1 objects by
@@ -20335,20 +20396,14 @@ pub const Vm = struct {
                 }
             }
         }
-        // Grayagain items were modified by barriers since the last minor
-        // collection. They MUST be re-traversed regardless of current mark
-        // state — a BLACK object might have new young children that haven't
-        // been marked yet. Force gray + queue.
-        for (self.gc_grayagain.items[0..self.gc_grayagain_snapshot_len]) |obj| {
-            switch (obj) {
-                .cell => |cell| try self.gcQueueScanCell(cell),
-                else => {
-                    const p = gcPtr(obj);
-                    gcSetGray(p.marked);
-                    try self.gc_gray.append(self.alloc, obj);
-                },
-            }
-        }
+        // PUC atomic (lgc.c:1546-1560): grayagain items are saved and cleared
+        // at the START of atomic, then drained AFTER the gray list. PUC does
+        // NOT re-queue grayagain items before atomic — they are only processed
+        // inside atomic via `g->gray = grayagain; propagateall(g)`. Our
+        // gcDrainGrayagain inside gcAtomicCommon handles this. Re-queueing
+        // here would process items twice and interfere with genlink's age
+        // advancement (the drain sets BLACK and advances age, but re-queueing
+        // would set GRAY again, confusing gcCorrectGrayAgain).
         // PUC atomic (lgc.c:1548-1551): traversethread(g, mainthread) +
         // for th in twups: traversethread(g, th). PUC's traversethread
         // re-traverses the thread regardless of its mark color — it marks
@@ -20371,21 +20426,6 @@ pub const Vm = struct {
         try self.gcDrainGray();
         try self.gcAtomicCommon();
 
-        // PUC atomic (lgc.c:1559-1560): drain grayagain during atomic phase.
-        // gcAtomicCommon may add items to grayagain via barriers (triggered
-        // by gcMarkMutableRoots or finalizers). These items reference young
-        // objects that need to be marked before the sweep. Without draining,
-        // the young children are not marked → freed during minor sweep →
-        // use-after-free.
-        //
-        // DISABLED: causes use-after-free crashes in errors.lua/files.lua.
-        // The grayagain drain re-traverses OLD objects that were added by
-        // write barriers. But some of these objects may have already been
-        // freed by a previous minor sweep (if they were young and not marked).
-        // TODO: investigate why grayagain drain causes crashes.
-        // try self.gcDrainGrayagain();
-        // try self.gcDrainGray();
-
         // PUC atomic (lgc.c:1579): flip currentwhite at the end of atomic,
         // before sweep. After the flip, gcIsDead distinguishes dead objects
         // (old white) from survivors (black). Without this flip, the minor
@@ -20396,7 +20436,7 @@ pub const Vm = struct {
         // Pre-sweep cleanup (same as gcAtomicPhase): deaden unmarked string
         // keys and clear dead frame registers. These must run BEFORE any
         // sweep frees objects, to avoid use-after-free on table pointers.
-        self.gcDeadenUnmarkedStringKeys();
+        self.gcClearDeadKeys();
         self.gcClearDeadFrameRegisters();
 
         // PUC youngcollection (lgc.c:1374): check checkminormajor BEFORE
@@ -20769,29 +20809,55 @@ pub const Vm = struct {
         }
     }
 
-    fn gcDeadenUnmarkedStringKeys(self: *Vm) void {
+    /// PUC `clearkey` generalization (lgc.c:209-213): turn dead collectable
+    /// keys in Nil-valued hash nodes into DEADKEYs. Applies to ANY collectable
+    /// key type (string/table/closure/thread/userdata), not just strings — PUC
+    /// `clearkey` checks `keyiscollectable(n)`, which is true for all GC-managed
+    /// key types. The raw pointer is preserved (PUC `setdeadkey` sets ONLY the
+    /// tag) so `next()`/traversal can match a live collectable key against a
+    /// dead node by raw pointer identity (deadok=1, ltable.c:258-260).
+    ///
+    /// Runs AFTER the white flip (in gcAtomicPhase / gcSweepYoungGeneration):
+    /// at that point, dead objects have the old white bit (gcIsDead returns
+    /// true), alive objects are black. Only truly-dead keys are deadened —
+    /// alive keys in Nil-valued nodes keep their live tag (so `next(t, k)`
+    /// with deadok=0 finds them, which is simpler and faster than PUC's
+    /// approach of deadening all empty-node keys and requiring deadok=1).
+    ///
+    /// Weak-key tables: `gcPruneWeakKeys` (called before the flip in
+    /// gcAtomicCommon) already set value=Nil for entries with dead keys. So
+    /// by the time this runs, weak-key entries with dead keys have value==Nil
+    /// and are deadened here. The `!mode.weak_k and node.value != .Nil` guard
+    /// is a safety net: for strong tables, skip non-Nil values (the key is
+    /// still in use); for weak-key tables, process regardless (the key may
+    /// be dead even with a live value — but gcPruneWeakKeys already nilled it).
+    fn gcClearDeadKeys(self: *Vm) void {
         var it = self.gc_marked_tables.iterator();
         while (it.next()) |entry| {
             const tbl = entry.key_ptr.*;
             // Only tables that survived marking (not white) can have live
-            // entries worth scanning for dead string keys.
+            // entries worth scanning for dead keys.
             if (gcIsWhite(tbl.gc_marked)) continue;
-            // Check if this is a weak-key table — dead string keys in
+            // Check if this is a weak-key table — dead collectable keys in
             // weak-key tables must be deadened even with non-Nil values,
             // because the key can be collected while the value survives.
             const mode = self.gcWeakMode(tbl);
             for (tbl.hash) |*node| {
-                if (node.key_tt != .string) continue;
-                // Strong tables: only deaden logically deleted entries (Nil value).
-                // Weak-key tables: deaden any unmarked string key.
+                // Only collectable keys can become dead keys (PUC
+                // keyiscollectable). Non-collectable keys (int/num/bool/
+                // builtin/lightuserdata) are skipped.
+                const kobj = GcObject.fromValue(node.getKey()) orelse continue;
+                // Strong tables: only deaden logically deleted entries (Nil
+                // value). Weak-key tables: deaden any dead collectable key.
                 if (!mode.weak_k and node.value != .Nil) continue;
                 // Use gcIsDead (checks for OLD white bit) instead of gcIsWhite
                 // (which matches BOTH old and new white). After the white flip,
-                // only strings with the OTHER white bit are truly dead. Strings
+                // only objects with the OTHER white bit are truly dead. Objects
                 // with the NEW current white were created during this cycle and
                 // are alive — they must NOT be deadened.
-                if (!gcIsDead(node.key_val.string.gc_marked, self.gc_current_white)) continue;
-                ltable.deadenStringKey(node);
+                const kmarked = gcPtr(kobj).marked.*;
+                if (!gcIsDead(kmarked, self.gc_current_white)) continue;
+                ltable.clearKey(node);
             }
         }
     }
@@ -20826,6 +20892,9 @@ pub const Vm = struct {
     /// persistent gray list and will be processed by later work units.
     fn gcPropagateOne(self: *Vm) DispatchError!bool {
         const cur = self.gc_gray.pop() orelse return false;
+        if (cur == .table and cur.table.gc_seq == 139) {
+
+        }
         if (self.gc_minor_cycle) {
             self.gc_gen_last_minor_visited += 1;
             // A3: cur is now GcObject; read age through gcPtr.
@@ -20835,7 +20904,7 @@ pub const Vm = struct {
         switch (cur) {
             .table => |tbl| {
                 // Record this table as marked during the current cycle so
-                // gcDeadenUnmarkedStringKeys can iterate only marked tables
+                // gcClearDeadKeys can iterate only marked tables
                 // (O(marked)) instead of all gc_objects (O(total)). The
                 // HashMap dedupes via put — repeated references to the same
                 // table are a no-op.
@@ -20878,13 +20947,26 @@ pub const Vm = struct {
                 // Thread/Int/String/Bool/Num), not the old tagged PtrKey, so
                 // we mark them through the same switch as the value.
                 for (tbl.hash) |*node| {
-                    if (node.key_tt == .empty or node.key_tt == .dead) continue; // empty slot or dead key
+                    // Skip empty slots and dead keys. A .dead node holds a raw
+                    // pointer to potentially-freed memory in key_val — it must
+                    // NOT be marked as a GC reference (the object is dead or
+                    // already collected). getKey() is never called on .dead
+                    // nodes (it would return .Nil anyway). This is the critical
+                    // GC-safety invariant for non-zeroed dead keys: the dead
+                    // pointer is preserved for deadok traversal identity only,
+                    // never followed as a live reference.
+                    if (node.key_tt == .empty or node.key_tt == .dead) continue;
                     if (node.value == .Nil) continue; // logically deleted
+                    // Safety: verify key_tt is valid
+                    if (@intFromEnum(node.key_tt) > @intFromEnum(@TypeOf(node.key_tt).userdata)) {
+                        return error.RuntimeError;
+                    }
                     // Mark string keys even in weak-key tables — hash nodes
                     // retain key references and keyEq dereferences strings,
                     // so sweeping a live string key would cause UAF. Deleted
-                    // string keys are converted to dead keys before string
-                    // sweep, mirroring PUC's DEADKEY transition.
+                    // collectable keys are converted to dead keys before sweep
+                    // by gcClearDeadKeys (PUC clearkey/DEADKEY transition),
+                    // so no stale pointer is ever marked here.
                     const k = node.getKey();
                     if (k == .String) {
                         try self.gcMarkValue(k);
@@ -20896,6 +20978,7 @@ pub const Vm = struct {
                     // Thread values are marked only in strong tables;
                     // weak-key tables resolve them via gcPropagateEphemerons.
                     const val = node.value;
+
                     if (val == .String) {
                         try self.gcMarkValue(val);
                     } else if (!mode.weak_v and !mode.weak_k) {
@@ -21386,6 +21469,7 @@ pub const Vm = struct {
             // After atomic-phase drain, all reachable objects are black.
             // A white object here is unreachable — queue it for __gc.
             if (gcIsWhite(p.marked.*)) {
+
                 try to_finalize.append(self.alloc, obj);
             }
         }
@@ -21456,20 +21540,18 @@ pub const Vm = struct {
         for (cl.upvalues) |cell| {
             // PUC markfinalizer: mark upvalue cells and their values as
             // finalizer-reachable. Open upvalues kept gray (PUC model).
+            // PUC reallymarkobject: open upvalues set GRAY, value marked
+            // inline, NOT added to grayagain. Closed upvalues set BLACK,
+            // value marked inline.
             if (gcIsWhite(cell.gc_marked)) {
                 if (cell.isOpen()) {
                     gcSetGray(&cell.gc_marked);
-                    try self.gc_grayagain.append(self.alloc, .{ .cell = cell });
                     // Open upvalue: value is on the thread's stack, scanned
-                    // separately. Don't mark here.
+                    // separately by remarkupvals. Don't mark here.
                     continue;
                 } else {
                     gcSetBlack(&cell.gc_marked);
                 }
-            }
-            // Debug: log cell.value when it's a closure
-            switch (cell.value) {
-                else => {},
             }
             try self.gcMarkValueFinalizerReach(cell.value);
         }
@@ -25535,7 +25617,11 @@ pub const Vm = struct {
                 } else {
                     // Int outside array: must be (or have been) a hash key.
                     in_array = false;
-                    const node = ltable.nodeLookup(tbl.hash, cc, self.hash_seed) orelse {
+                    // PUC `findindex` uses `getgeneric(t, key, deadok=1)`
+                    // (ltable.c:351): a deleted key whose node was deadened
+                    // by GC (DEADKEY) is a valid control key, matched by raw
+                    // pointer identity. Use nodeLookupDeadok (deadok=1).
+                    const node = ltable.nodeLookupDeadok(tbl.hash, cc, self.hash_seed) orelse {
                         return self.fail("invalid key to 'next'", .{});
                     };
                     // PUC `getgeneric(key, deadok=1)` accepts a deleted (Nil-
@@ -25547,7 +25633,9 @@ pub const Vm = struct {
                 }
             } else {
                 in_array = false;
-                const node = ltable.nodeLookup(tbl.hash, cc, self.hash_seed) orelse {
+                // deadok=1: a deleted key whose node was deadened by GC
+                // (DEADKEY) is a valid control key (PUC findindex, ltable.c:351).
+                const node = ltable.nodeLookupDeadok(tbl.hash, cc, self.hash_seed) orelse {
                     return self.fail("invalid key to 'next'", .{});
                 };
                 // Deleted (Nil-valued) node is a valid control (see above).
@@ -25727,6 +25815,7 @@ pub const Vm = struct {
             return;
         }
         const io_tbl = io_v.Table;
+
         if (args.len == 0) {
             outs[0] = self.getFieldOpt(io_tbl, "input_stream") orelse (self.getFieldOpt(io_tbl, "stdin") orelse .Nil);
             return;
@@ -25739,6 +25828,7 @@ pub const Vm = struct {
                 return self.fail("cannot open file '{s}' ({s})", .{ args[0].String.bytes(), msg });
             };
             try self.setField(io_tbl, "input_stream", file_v);
+
             self.maybeCloseReplacedDefault(old_in, file_v);
             outs[0] = file_v;
             return;
@@ -26836,6 +26926,7 @@ pub const Vm = struct {
         _ = outs;
         if (args.len == 0) return self.fail("no value", .{});
         const file_tbl = asFileTable(self, args[0]) orelse return;
+
         // Standard streams are long-lived (referenced from `io.stdin`/
         // `io.stdout`/`io.stderr`) and must never be closed by GC, matching
         // PUC Lua where `io.stdin`/`io.stdout`/`io.stderr` are never finalized.

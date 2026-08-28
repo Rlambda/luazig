@@ -2858,6 +2858,15 @@ pub const VmStats = struct {
     gc_steps_auto: u64 = 0,
     gc_steps_manual: u64 = 0,
 
+    // ── GC stale-entry debug counters (Task 7) ──
+    // Count hits at the gcQueueScanObject/gcDrainGrayagain stale-entry
+    // asserts. These should ALWAYS be zero: with the correct grayagain
+    // lifecycle (save+clear at atomic, gcCorrectGrayAgain after sweep),
+    // no freed object can remain in any GC aux list. Non-zero indicates
+    // a lifecycle bug.
+    gc_stale_queue_scan: u64 = 0,
+    gc_stale_grayagain: u64 = 0,
+
     // ── Coroutines ──
     yields: u64 = 0,
     resumes: u64 = 0,
@@ -19153,22 +19162,22 @@ pub const Vm = struct {
     /// the same gray list as PUC's LUA_VUPVAL handling.
     fn gcQueueScanObject(self: *Vm, obj: GcObject) DispatchError!void {
         const p = gcPtr(obj);
-        // Safety check: verify the object is registered in gc_objects.
-        // Stale references (from cells/tables pointing to freed-and-reused
-        // memory) can appear when grayagain entries from previous cycles
-        // (where the drain was disabled) are processed for the first time.
-        // The freed object's memory may have been reused, producing a
-        // valid-looking but incorrect gc_index. Skip unregistered objects
-        // — they are already dead, and marking them would be a no-op.
-        // TODO: Once the grayagain drain has been running correctly for all
-        // suites without this check firing, consider removing it or making
-        // it a debug-only assertion.
-        {
+        // Task 7: invariant — every GcObject passed to gcQueueScanObject is
+        // registered in gc_objects. Stale entries (freed objects remaining
+        // in gc_grayagain or other aux lists) are impossible with the correct
+        // lifecycle: gcDrainGrayagain saves+clears grayagain at atomic, all
+        // entries are force-marked black (survive sweep), and
+        // gcCorrectGrayAgain compacts the list after sweep removing dead
+        // entries. The old defensive skip (which dereferenced the entry
+        // pointer to read gc_index, providing no real dangling-pointer
+        // protection) has been replaced with a stats-gated assert.
+        if (self.stats.enabled) {
             const idx = p.index.*;
             if (idx >= self.gc_objects.items.len or
                 !std.meta.eql(self.gc_objects.items[idx], obj))
             {
-                return;
+                self.stats.gc_stale_queue_scan += 1;
+                std.debug.assert(false);
             }
         }
         if (!gcIsWhite(p.marked.*)) return;
@@ -19626,6 +19635,60 @@ pub const Vm = struct {
     /// Re-scan roots that can change while mutator code runs between GC slices.
     /// Tables use write barriers, while registers/cells and transient VM fields
     /// are sampled at each safe point before the collector resumes.
+    ///
+    /// ── Task 6: active-thread grayagain linkgclist equivalence proof ──
+    ///
+    /// PUC `atomic()` (lgc.c:1546) calls `linkgclist(&L->gclist, g->grayagain)`
+    /// to link the running thread into grayagain, then `markobject(g, L)` marks
+    /// it. During `propagateall` (lgc.c:1555), `traversethread` is called on
+    /// the running thread, which scans `L->stack[0..L->top]` and links the
+    /// thread into grayagain AGAIN (lgc.c:~470). The grayagain drain
+    /// (lgc.c:1559-1560) then re-traverses the thread a second time.
+    ///
+    /// The purpose of the second traversal is to catch stack mutations that
+    /// occurred between the first traversal (during propagateall) and the
+    /// grayagain drain. However, during atomic the mutator is PAUSED — no
+    /// stack mutations occur between Steps 2 and 6. The only mutator code
+    /// that runs during atomic is finalizers (Step 12), which run AFTER
+    /// the grayagain drain (Step 6).
+    ///
+    /// luazig equivalence (Variant A — proof, no requeue needed):
+    ///
+    /// 1. gcMarkMutableRoots re-scans the ACTIVE thread's live registers
+    ///    (live_reg_top[pc]) for every bytecode frame, plus to-be-closed
+    ///    variables, varargs, upvalues, and boxed cells. This is MORE
+    ///    precise than PUC's traversethread (which scans L->stack[0..top],
+    ///    including dead registers) — live_reg_top[pc] excludes dead
+    ///    registers that hold no live references.
+    ///
+    /// 2. gcMarkMutableRoots also marks all parked threads (wrap_thread,
+    ///    current_thread, forced_close_thread) via gcMarkValue. Parked
+    ///    threads' stacks do not change during atomic (they are not
+    ///    running), so no re-traversal is needed.
+    ///
+    /// 3. gcRemarkUpvals (Step 3) re-marks open upvalue values, covering
+    ///    PUC's remarkupvals (lgc.c:1557).
+    ///
+    /// 4. No mutations occur between gcMarkMutableRoots (Step 1) and
+    ///    gcDrainGrayagain (Step 6): Steps 2-5 are pure collector
+    ///    operations (drain gray, remark upvals, drain gray). The mutator
+    ///    is paused. Therefore, the single re-scan in gcMarkMutableRoots
+    ///    is sufficient — a second traversal via grayagain would be
+    ///    redundant.
+    ///
+    /// 5. In generational mode, OLD threads are re-traversed every minor
+    ///    cycle via gc_gen_threads (gcMinorCollection, line ~20737), which
+    ///    force-grays each thread and adds it to gc_gray. This is the
+    ///    equivalent of PUC's grayagain re-traversal for old threads.
+    ///
+    /// 6. Finalizer mutations (Step 12) are handled by the post-finalizer
+    ///    grayagain drain (Step 13, non-minor) or by gcCorrectGrayAgain
+    ///    (minor). This is a luazig-specific extension, not related to
+    ///    PUC's linkgclist.
+    ///
+    /// Conclusion: gcMarkMutableRoots fully covers what PUC's
+    /// linkgclist(&L->gclist, g->grayagain) + traversethread re-traversal
+    /// achieves. The disabled requeue code has been removed. No gap found.
     fn gcMarkMutableRoots(self: *Vm) DispatchError!void {
         if (self.debug_hook_main.func) |hook| try self.gcMarkValue(hook);
         if (self.wrap_thread) |thread| try self.gcMarkValue(.{ .Thread = thread });
@@ -20044,15 +20107,26 @@ pub const Vm = struct {
         defer self.alloc.free(saved);
         self.gc_grayagain.clearRetainingCapacity();
         for (saved) |obj| {
-            // Skip stale grayagain entries: objects that were freed in a
-            // previous cycle (when the grayagain drain was disabled).
-            {
+            // Task 7: invariant — all grayagain entries are valid (registered
+            // in gc_objects). The lifecycle guarantee:
+            //   1. gcDrainGrayagain saves+clears grayagain at atomic start.
+            //   2. All saved entries are force-marked black (survive sweep).
+            //   3. gcCorrectGrayAgain (after sweep) compacts grayagain,
+            //      removing dead entries and advancing ages.
+            //   4. No object is freed while it's in grayagain: sweep frees
+            //      only dead (unmarked) objects, but grayagain entries were
+            //      all marked black in step 2.
+            // The old defensive skip (which dereferenced the entry pointer
+            // to read gc_index — not a real dangling-pointer protection)
+            // has been replaced with a stats-gated assert.
+            if (self.stats.enabled) {
                 const p = gcPtr(obj);
                 const idx = p.index.*;
                 if (idx >= self.gc_objects.items.len or
                     !std.meta.eql(self.gc_objects.items[idx], obj))
                 {
-                    continue;
+                    self.stats.gc_stale_grayagain += 1;
+                    std.debug.assert(false);
                 }
             }
             switch (obj) {
@@ -20144,108 +20218,139 @@ pub const Vm = struct {
         }
     }
 
+    /// PUC `atomic()` (lgc.c:1543-1581). Each step is numbered to map
+    /// 1:1 to PUC lines. The grayagain drain (Step 6) runs at the PUC
+    /// position — after remarkupvals+propagate, before ephemerons — for
+    /// BOTH incremental and generational modes uniformly.
+    ///
+    /// luazig-specific extension: finalizers run DURING atomic (Step 12),
+    /// not in a separate callfin phase as in PUC. This requires a
+    /// post-finalizer grayagain drain (Step 13) to catch barrier-modified
+    /// objects from finalizer code. The post-finalizer drain is skipped
+    /// in minor cycles because gcCorrectGrayAgain (run during
+    /// gcSweepYoungGeneration) handles the age promotion, and
+    /// finalizer-created young objects survive this cycle's sweep (they
+    /// are beyond the young-objects snapshot).
     fn gcAtomicCommon(self: *Vm) DispatchError!void {
-        // PUC atomic: markobject(g, L) + markvalue(g, l_registry) + markmt(g).
-        // Re-mark mutable roots here (running thread, frames, registers)
-        // because they may have changed since cycle start. Between cycle
-        // start and atomic, write barriers handle mutations, but registers
-        // and transient VM fields are not write-barriered — they must be
-        // re-scanned here, exactly as PUC does in atomic().
-
-        // PUC atomic (lgc.c:1546): linkgclist(&L->gclist, g->grayagain).
-        // TEMPORARILY DISABLED for debugging
-        // if (self.gc_minor_cycle) {
-        //     const active_th = self.activeBytecodeThread();
-        //     gcSetGray(&active_th.gc_marked);
-        //     try self.gc_grayagain.append(self.alloc, .{ .thread = active_th });
-        // }
-
+        // ── Step 1 (lgc.c:1551-1554): mark roots ──
+        // PUC: markobject(g, L) + markvalue(g, &g->l_registry) + markmt(g).
+        // luazig: gcMarkMutableRoots covers all three PUC operations AND
+        // re-scans the active thread's live registers (live_reg_top[pc])
+        // and parked threads' stacks. This is the equivalent of PUC's
+        // traversethread, which runs during propagateall (Step 2).
+        //
+        // [PUC lgc.c:1546-1547 saves+clears grayagain HERE, before
+        // markobject. luazig defers the save+clear to gcDrainGrayagain
+        // (Step 6). This is semantically equivalent because no backward
+        // barriers fire during Steps 1-5: atomic is mutator-paused, and
+        // only finalizers (Step 12, after Step 6) run mutator code.]
+        //
+        // [PUC lgc.c:1546: linkgclist(&L->gclist, g->grayagain) — the
+        // running thread is linked to grayagain for re-traversal. luazig
+        // does NOT need this: gcMarkMutableRoots re-scans the active
+        // thread's live registers directly. See the Task 6 equivalence
+        // proof in gcMarkMutableRoots. No second traversal is needed
+        // because no mutations occur between gcMarkMutableRoots and
+        // gcDrainGrayagain.]
         try self.gcMarkMutableRoots();
+
+        // ── Step 2 (lgc.c:1555): propagateall(g) — drain gray list ──
         try self.gcDrainGray();
 
-        // PUC atomic (lgc.c:1557): remarkupvals(g) — re-mark values of open
-        // upvalues during atomic. Open upvalues' values may have changed
-        // since propagate (e.g., coroutine resumed, creating new objects on
-        // its stack). See gcRemarkUpvals for details.
+        // ── Step 3 (lgc.c:1557): remarkupvals(g) ──
+        // Re-mark values of open upvalues. Their values may have changed
+        // since propagate (e.g., coroutine resumed, creating new objects
+        // on its stack). See gcRemarkUpvals for details.
         try self.gcRemarkUpvals();
+
+        // ── Step 4 (lgc.c:1558): propagateall(g) — propagate remarkupvals ──
         try self.gcDrainGray();
 
-        // PUC 5.5 atomic does NOT call traversestrtable — short strings live
-        // in allgc and are marked via normal root reachability + backward
-        // barriers. The previous traversestrtable emulation iterated gc_objects
-        // (O(total objects) per minor cycle) and caused crashes due to
-        // gcMarkMinorValue skipping old strings while young strings were
-        // already handled by barriers. Removed in favor of PUC-faithful
+        // ── Step 5: (PUC 5.5 does NOT call traversestrtable) ──
+        // Short strings live in allgc and are marked via normal root
+        // reachability + backward barriers. Removed in favor of PUC-faithful
         // barrier-based reachability.
 
-        // PUC atomic: drain grayagain list (objects turned gray by backward
-        // barriers during propagate phase). These must be re-traversed
-        // before sweep to catch children added after the first traversal.
-        // PUC atomic (lgc.c:1546-1560): saves grayagain, clears it, marks
-        // roots, drains gray, then moves saved grayagain to gray and drains
-        // it. This ensures all grayagain items are re-traversed during atomic.
-        // After this, any NEW grayagain items (added by finalizers etc.) are
-        // processed by gcCorrectGrayAgain after the sweep.
-        // PUC atomic (lgc.c:1559-1560): g->gray = grayagain; propagateall(g).
-        // The grayagain drain runs in ALL modes (incremental and generational).
-        if (self.gc_minor_cycle) {
-            try self.gcDrainGrayagain();
-            try self.gcDrainGray();
-        }
+        // ── Step 6 (lgc.c:1559-1560): g->gray = grayagain; propagateall(g) ──
+        // Drain the saved grayagain list (objects turned gray by backward
+        // barriers during the propagate phase). gcDrainGrayagain saves+
+        // clears the list internally (equivalent to PUC's save+clear at
+        // lgc.c:1546-1547), then traverses each entry and drains gray
+        // after each one. The genlink age logic (touched1→keep,
+        // touched2→old) runs inside gcDrainGrayagain.
+        //
+        // UNIFIED for both incremental and generational modes (PUC-faithful).
+        // Previously, the non-minor path deferred this drain to after
+        // finalizers (Step 13), which diverged from PUC's order: ephemerons
+        // were converged and weak values pruned before grayagain children
+        // were marked. Now both modes drain at the PUC position.
+        try self.gcDrainGrayagain();
+        try self.gcDrainGray();
+
+        // ── Step 7 (lgc.c:1561): convergeephemerons(g) ──
         try self.gcPropagateEphemerons(&self.gc_weak_tables);
         try self.gcDrainGray();
 
+        // ── Step 8 (lgc.c:1564-1565): clearbyvalues(g, g->weak, NULL) ──
+        // Clear dead weak values before checking finalizers.
         try self.gcPruneWeakValues(self.gc_weak_tables.items);
 
+        // ── Step 9 (lgc.c:1567): separatetobefnz(g, 0) ──
+        // Separate finalizable objects into gc_to_finalize (PUC's tobefnz).
         const to_finalize = try self.gcCollectFinalizables();
         defer self.alloc.free(to_finalize);
         try self.gc_to_finalize.appendSlice(self.alloc, to_finalize);
 
-        // PUC atomic (lgc.c:1567-1569): separatetobefnz + markbeingfnz +
-        // propagateall. Dead finalizable objects have been separated into
-        // gc_to_finalize (equivalent of tobefnz). Now mark them with ORDINARY
-        // GC marking — this is PUC's markbeingfnz (lgc.c:388: markobject on
-        // each tobefnz object) followed by propagateall (drain the gray list).
-        // The "visited" mechanism for the finalizer-reachable graph IS the
-        // ordinary GC mark: marking the to-finalize objects gray/black and
-        // draining the gray list propagates through their entire reachable
-        // graph, keeping it alive for finalization. No FINALIZEDBIT is used
-        // as a recursive visited-bit — FINALIZEDBIT only means "registered
-        // for finalization" (set at registration, cleared after finalizer runs).
+        // ── Step 10 (lgc.c:1568-1569): markbeingfnz(g) + propagateall(g) ──
+        // Mark to-be-finalized objects with ORDINARY GC marking. This is
+        // PUC's markbeingfnz (lgc.c:388: markobject on each tobefnz object)
+        // followed by propagateall. The "visited" mechanism for the
+        // finalizer-reachable graph IS the ordinary GC mark: marking the
+        // to-finalize objects and draining gray propagates through their
+        // entire reachable graph, keeping it alive for finalization.
+        // FINALIZEDBIT only means "registered for finalization" (set at
+        // registration, cleared after finalizer runs) — NOT a recursive
+        // visited-bit.
         for (self.gc_to_finalize.items) |obj| {
             if (obj.toValue()) |v| try self.gcMarkValue(v);
         }
         try self.gcDrainGray();
 
-        // PUC atomic (lgc.c:1570): convergeephemerons after resurrection.
-        // Newly-reached weak tables (via the ordinary marking above) are now
-        // in gc_weak_tables. Prune their dead values, then converge ephemerons
-        // and prune weak keys — matching PUC's post-resurrection ordering:
-        //   clearbyvalues(g, g->weak, origweak)  — new weak tables' dead values
-        //   clearbykeys(g, g->ephemeron)          — dead keys from all ephemerons
-        //   clearbykeys(g, g->allweak)            — dead keys from allweak
+        // ── Step 11 (lgc.c:1570-1577): post-resurrection convergence ──
+        // PUC: convergeephemerons + clearbykeys(ephemeron) +
+        // clearbykeys(allweak) + clearbyvalues(weak, origweak) +
+        // clearbyvalues(allweak, origall).
+        // luazig: converge ephemerons, prune weak values (resurrected
+        // weak tables), then prune weak keys.
         try self.gcPropagateEphemerons(&self.gc_weak_tables);
         try self.gcDrainGray();
         try self.gcPruneWeakValues(self.gc_weak_tables.items);
         try self.gcPruneWeakKeys(self.gc_weak_tables.items);
 
+        // ── Step 12 (luazig-specific): run finalizers during atomic ──
+        // PUC runs finalizers in the callfin phase AFTER sweep. luazig
+        // runs them during atomic (architectural choice). Finalizers are
+        // mutator code and can trigger backward barriers that add to
+        // grayagain.
         try self.gcFinalizeList(self.gc_to_finalize.items);
 
-        // Finalizers may publish newly allocated objects into live tables.
-        // Backward barriers turn the owner gray and add to grayagain.
-        // Drain grayagain again to catch objects modified by finalizers,
-        // then drain gray to finish marking all children.
-        // PUC atomic calls propagateall after finalizer resurrection
-        // (lgc.c:1569) — skip during minor cycles: grayagain is needed
-        // by gcCorrectGrayAgain for age promotion in gcSweepYoungGeneration.
+        // ── Step 13 (luazig-specific): post-finalizer grayagain drain ──
+        // Drain grayagain entries created by finalizer barriers. PUC does
+        // not need this because finalizers run in a separate phase.
+        // Skip during minor cycles: grayagain is needed by
+        // gcCorrectGrayAgain for age promotion in gcSweepYoungGeneration.
+        // Finalizer-created young objects survive this cycle's sweep
+        // (they are beyond the young-objects snapshot) and will be
+        // marked when the grayagain entry is drained in the next cycle.
         if (!self.gc_minor_cycle) {
             try self.gcDrainGrayagain();
             try self.gcDrainGray();
         }
 
-        // PUC atomic → checkSizes (lgc.c:936-938): shrink the interned-
-        // string table when it is less than a quarter full. Without this,
-        // long churn episodes leave an oversized bucket array.
+        // ── Step 14 (lgc.c:1578): luaS_clearcache(g) ──
+        // Shrink the interned-string table when it is less than a quarter
+        // full. Without this, long churn episodes leave an oversized
+        // bucket array.
         self.string_intern.shrinkIfNeeded(self.alloc);
     }
 

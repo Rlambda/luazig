@@ -61,7 +61,7 @@ PERF_WORKLOAD = (
 # Per-workload hardware counters (`--counters`, P16.0c)
 # ---------------------------------------------------------------------------
 
-# The 16 microbench workloads (must match the bench() labels in
+# The 18 microbench workloads (must match the bench() labels in
 # tools/microbench.lua; a mismatch fails loudly at run time because the
 # expected `name\tseconds` line will be missing from the bench output).
 WORKLOADS = [
@@ -69,6 +69,7 @@ WORKLOADS = [
     "array_access", "hash_access", "temp_table_alloc", "string_loop",
     "coroutine_yield", "dynamic_load", "mixed_arith", "float_arith",
     "string_concat", "metamethod_add", "field_access", "comparisons",
+    "metamethod_call_noalloc", "table_alloc_setmetatable",
 ]
 
 # Userspace-only events so this works with perf_event_paranoid=2.
@@ -91,6 +92,7 @@ DEFAULT_COUNTERS_RUNS = 3
 PROFILE_WORKLOADS = [
     "lua_calls", "hash_access", "field_access", "coroutine_yield",
     "string_concat", "string_loop", "metamethod_add", "temp_table_alloc",
+    "metamethod_call_noalloc", "table_alloc_setmetatable",
 ]
 
 # Standalone Lua scripts for each hotspot workload, with iteration counts
@@ -189,6 +191,28 @@ PROFILE_SCRIPTS: Dict[str, str] = {
     "temp_table_alloc": (
         "local function workload(n)\n"
         "    for i = 1, n do local t = {1, 2, 3} end\n"
+        "end\n"
+        "workload(1000)\n"
+        "local start = os.clock()\n"
+        "workload(25000000)\n"
+        'io.write(string.format("%.6f\\n", os.clock() - start))\n'
+    ),
+    "metamethod_call_noalloc": (
+        "local mt = { __add = function(a, b) return a end }\n"
+        "local box = setmetatable({}, mt)\n"
+        "local function workload(n)\n"
+        "    local s = box\n"
+        "    for i = 1, n do s = s + box end\n"
+        "end\n"
+        "workload(1000)\n"
+        "local start = os.clock()\n"
+        "workload(25000000)\n"
+        'io.write(string.format("%.6f\\n", os.clock() - start))\n'
+    ),
+    "table_alloc_setmetatable": (
+        "local mt = {}\n"
+        "local function workload(n)\n"
+        "    for i = 1, n do local x = setmetatable({v = i}, mt) end\n"
         "end\n"
         "workload(1000)\n"
         "local start = os.clock()\n"

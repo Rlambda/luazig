@@ -4262,3 +4262,79 @@ false since P16.6 where the MMBIN family became semantic handlers.
 | Bytecode listing `a-5` (before vs after) | IDENTICAL (MMBINI C=7) |
 | Bytecode listing `a<<2` (before vs after) | IDENTICAL (MMBINI C=16) |
 | mm_check.lua (zig vs PUC) | byte-identical |
+
+## P16.7 Task 1 — decompose metamethod_add into isolated microbenchmarks (2026-08-29)
+
+### Problem
+The existing `metamethod_add` workload (#14) allocates a new table +
+`setmetatable` inside `__add` every iteration, so its 3.34x Zig/PUC ratio
+conflates metamethod dispatch cost with allocation/GC cost.  Two new
+workloads decompose the ratio into its constituent parts.
+
+### New workloads (tools/microbench.lua #17–#18)
+- **`metamethod_call_noalloc`** (#17): `__add = function(a,b) return a end` —
+  no allocation in the metamethod.  Isolates ADD→MMBIN→CALL→RETURN dispatch.
+- **`table_alloc_setmetatable`** (#18): `setmetatable({v=i}, mt)` in a tight
+  loop, mt defined outside.  Isolates table alloc + setmetatable, no dispatch.
+
+### Bytecode proof (noalloc loop body)
+```
+function <workload> (10 instructions)
+     5  [5]  FORPREP   2    ; to 9
+     6  [5]  GETUPVAL  6           ; load box
+     7  [5]  ADD       1  1  6     ; s = s + box  (table+table → fails)
+     8  [5]  MMBIN     1  6  6     ; metamethod dispatch (__add)
+     9  [5]  FORLOOP   2    ; to 5
+```
+The `__add` closure is `RETURN1` only — zero allocation per iteration.
+
+### Measured data (5-run median, ReleaseFast, core 0, N=500000)
+
+| Workload | PUC (s) | Zig (s) | Zig/PUC | Zig CPI | PUC CPI | Zig IPC | PUC IPC |
+|---|---|---|---|---|---|---|---|
+| metamethod_add (combined) | 0.0618 | 0.2063 | **3.34x** | 0.272 | 0.223 | 3.67 | 4.48 |
+| metamethod_call_noalloc | 0.0087 | 0.0391 | **4.49x** | 0.204 | 0.192 | 4.90 | 5.21 |
+| table_alloc_setmetatable | 0.0430 | 0.1184 | **2.75x** | 0.264 | 0.224 | 3.78 | 4.47 |
+| temp_table_alloc | 0.0304 | 0.0655 | **2.16x** | 0.228 | 0.210 | 4.39 | 4.75 |
+
+### Per-iteration decomposition (ns)
+
+| Component | PUC ns/iter | Zig ns/iter | Excess ns/iter | % of excess |
+|---|---|---|---|---|
+| dispatch/call (noalloc) | 17.4 | 78.1 | 60.7 | 21.0% |
+| alloc/setmetatable | 86.0 | 236.7 | 150.7 | 52.2% |
+| remainder (field access, arith, interaction) | 20.2 | 97.7 | 77.5 | 26.8% |
+| **combined (metamethod_add)** | **123.6** | **412.5** | **288.9** | 100% |
+
+### Decomposition conclusion
+
+**Call-only cost: 4.49x** — the metamethod dispatch + Lua call path is the
+worst component by ratio.  Top symbols: `runBytecodeDispatch` (32.4%),
+`tryPushBytecodeContinuationCall` (11.3%), `completeBytecodeExecFrame`
+(11.2%), `resolveCallable` (9.4%), `getTmByObj` (8.7%).
+
+**Allocation/setmetatable cost: 2.75x** — allocation is relatively closer to
+PUC parity.  Top symbols: `runBytecodeDispatch` (24.6%), `Wyhash.final`
+(10.9%), `SmpAllocator.alloc` (6.9%), `HashMap.getIndex` (6.3%),
+`SmpAllocator.free` (6.2%).
+
+**Combined: 3.34x** — the allocation component (2.75x) DILUTES the combined
+ratio downward from the dispatch-only 4.49x.  The 3.34x is NOT primarily an
+allocation/GC problem; by ratio, the metamethod dispatch/call path is the
+worse offender.  By absolute excess time, allocation contributes ~52%,
+dispatch ~21%, remainder ~27%.
+
+**setmetatable isolation**: table_alloc_setmetatable (2.75x) vs
+temp_table_alloc (2.16x) → the `setmetatable` call alone adds 52.8 ms (Zig)
+vs 12.6 ms (PUC) = **4.19x** for the setmetatable portion, comparable to the
+dispatch ratio.
+
+### Verification
+| Check | Result |
+|-------|--------|
+| `zig build test` (ReleaseFast) | PASS |
+| Smoke tests (58) | 58/58 PASS |
+| microbench.lua on luazig | rc=0, 18 workloads |
+| microbench.lua on PUC lua | rc=0, 18 workloads |
+| Bytecode proof (noalloc ADD+MMBIN) | confirmed (listing above) |
+| No VM behaviour changes | microbench-only + perf tooling |

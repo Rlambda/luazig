@@ -154,4 +154,30 @@ bench("comparisons", N, function(n)
     return s
 end)
 
+-- 17. Metamethod call (__add) with NO allocation inside __add — isolates
+-- metamethod dispatch + Lua call overhead from alloc/GC cost.  The __add
+-- closure simply returns its first operand, so every iteration executes
+-- ADD → MMBIN (metamethod lookup) → CALL (the closure) → RETURN, with no
+-- table creation or GC pressure.  Contrast with workload #14 where __add
+-- allocates a new table every iteration.
+local mt_noalloc = { __add = function(a, b) return a end }
+local box_noalloc = setmetatable({}, mt_noalloc)
+bench("metamethod_call_noalloc", N // 100, function(n)
+    local s = box_noalloc
+    for i = 1, n do s = s + box_noalloc end
+end)
+
+-- 18. Table allocation + setmetatable in isolation — isolates the cost of
+-- creating a table and attaching a metatable, with NO metamethod dispatch.
+-- The metatable is defined outside the loop (same as temp_table_alloc's
+-- pattern); the loop body only does `setmetatable({v = i}, mt)`.  Paired
+-- with #17 (noalloc) this decomposes the old metamethod_add (#14) into:
+--   dispatch/call cost  = #17
+--   alloc/setmetatable  = #18
+--   combined            = #14
+local mt_alloc = {}
+bench("table_alloc_setmetatable", N // 100, function(n)
+    for i = 1, n do local x = setmetatable({v = i}, mt_alloc) end
+end)
+
 io.write("done\n")

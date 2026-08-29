@@ -3820,7 +3820,9 @@ compare-флаг, bits2..6 = event (25), bit1 = invert; dst: 0..254 value /
 255=NONE. Хелперы setSimpleValueResult/setSimpleCompareResult/clearSimpleResult
 (невозможные состояния неконструируемы), Debug-ассерты инварианта
 (compare⇒dst==NO_REG). CallFrame — 0 байт роста, ≤104. Регрессия: source-level
-(254 локальных → результат ADD в R254, --dump-bytecode-доказано) + VM unit-тест
+(unit-тест + [уточнение P16.8a: source-level форма — 198 обычных локальных +
+захваченный box + вызов с 54 аргументами, последним box+box → ADD 254;
+«254 локальных» было неточностью — PUC лимит 200])
 обоих режимов; старый дизайн падает.
 
 ### Task 3 — yield-инвариант приведён к коду (`6b8d4c7`)
@@ -3840,7 +3842,9 @@ checkfinalizer вовсе. takeFinalizable: set.remove + CLEAR FINALIZEDBIT ДО
 (в luazig финалайзеры в atomic, не после sweep — makewhite дал бы «мёртвый»
 белый после flip и same-cycle free; объект остаётся BLACK до sweep'а).
 Членство: FINALIZEDBIT = семантический тест (tofinalize-parity), HashSet —
-итератор/insert/remove. closeManagedFile — единственная легитимная
+итератор/insert/remove. [Исправлено в P16.8a: closeManagedFile больше НЕ
+дерегистрирует — io.close закрывает только ресурс; регистрация живёт до
+GC-события; дифф 60_file_finalizer_lifecycle.] Ранее считалась легитимной
 дерегистрация (архитектурная divergence, задокументирована).
 [corrected in P16.8a: closeManagedFile больше НЕ дерегистрирует —
 см. P16.8a correction ниже; обе sweep-ветви уже защищают FINALIZEDBIT]

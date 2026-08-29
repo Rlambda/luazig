@@ -1,4 +1,4 @@
-> Last updated: 2026-08-29 (P16.8a — file close finalizer fix: explicit close no longer touches finalizer registration)
+> Last updated: 2026-08-29 (P16.8a Tasks 2+3+4 — captured-local storage invariant proof + coherence differential)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -4726,7 +4726,55 @@ No exceptions: `closeManagedFile` no longer touches finalizer registration
 | Check | Result |
 |-------|--------|
 | Matrix `--testc` | 31/32 pass (zig_fail=0, both_fail=1 big.lua pre-existing) |
-| Smoke tests (60) | 60/60 PASS |
+| Smoke tests (61) | 61/61 PASS |
 | C API tests (17) | 17/17 PASS + DIFF: PASS |
 | nextvar 3× | 3/3 PASS |
 | native_mem | BOUNDED |
+
+---
+
+## P16.8a Tasks 2+3+4 — captured-local storage invariant (2026-08-29)
+
+### The invariant
+
+For an active bytecode frame: if `boxed[reg]` holds an open Cell, that Cell
+observes exactly `bc_stack[reg]` (Cell.get/set = stack reads/writes). On
+close: current stack value is copied into the Cell, and the frame's boxed
+slot no longer represents an open stack-backed upvalue.
+
+Consequence: direct writes to a captured local's register (arithmetic ADD,
+MOVE, direct-store) are immediately visible to closures that captured it,
+because the open Cell reads from the same stack slot. This makes the old
+codegen workaround (emit MOVE to a temp for captured locals in
+`dischargeVars(.local)`) obsolete.
+
+### Audit (12 sites, all hold the invariant today)
+
+| # | Site | file:line | Verdict |
+|---|------|-----------|---------|
+| 1 | dischargeVars(.local) | codegen_bc.zig:530-545 | Obsolete workaround (temp MOVE for captured local). Invariant holds: `regs[ridx]` is live. Remove in Commit 2. |
+| 2 | vararg_var handling | codegen_bc.zig:551-561 | Same stale workaround as #1. Remove in Commit 2. |
+| 3 | direct-store arithmetic | codegen_bc.zig:5490-5504 | `captured_regs.contains` guard skips direct-store. Obsolete: ADD into `regs[local_reg]` is visible to open Cell. Remove in Commit 2. |
+| 4 | SETUPVAL | vm.zig:12055 | `gcStoreCellValue(cell, regs[a])` → `cell.set` writes stack slot for open cells. HOLDS. |
+| 5 | GETUPVAL | vm.zig:12054 | `cell.get` reads stack slot for open cells. HOLDS. |
+| 6 | Cell.get | vm.zig:667-675 | Open: reads `resolveStack(vm)[idx]` = stack slot. HOLDS. |
+| 7 | Cell.set | vm.zig:680-686 | Open: writes `resolveStack(vm)[idx]` = stack slot. HOLDS. |
+| 8 | gcStoreCellValue | vm.zig:20444-20453 | `cell.set` + barrier. Open: writes stack slot. HOLDS. |
+| 9 | closeBytecodeUpvaluesFrom | vm.zig:6974-6995 | Copies `stack[idx]`→`cell.value`, nulls `bc_stack_idx` + `boxed[i]`. HOLDS. |
+| 10 | tail calls | vm.zig:14949-14960 | Closes all `ctx.boxed` (cell.close + null slot) before frame reuse. HOLDS. |
+| 11 | coroutine susp/resume | vm.zig:652-658,3962-3965 | `resolveStack` returns `th.bytecode_stack` (suspended) / `vm.bc_stack` (active). Cell always reads correct stack. HOLDS. |
+| 12 | frame reloc/stack growth | vm.zig:4363-4397 | `bc_stack_idx` is an index (not pointer); realloc preserves indices. HOLDS. |
+
+No bugs found: all 12 sites satisfy the invariant. Sites 1-3 are obsolete
+workarounds to remove (Commit 2); they don't violate the invariant, just
+add unnecessary temp MOVEs and skip direct-store optimizations.
+
+### Commit 1 — invariant proof + coherence differential
+
+- `src/lua/vm.zig` — invariant documentation block before `Cell` struct.
+- `tests/smoke/61_captured_local_coherence.lua` — 10 scenarios: set/get
+  closures, direct arithmetic on captured local, loop-accumulate, nested
+  closures, multiple closures sharing one upvalue, coroutine yield while
+  upvalue open, close-of-upvalue (return inner closure), arithmetic
+  direct-store, assignment via nested closure then direct read, captured
+  table field. Byte-identical PUC vs luazig.

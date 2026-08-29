@@ -1036,8 +1036,16 @@ fn interpreterMain(init: std.process.Init) !void {
     defer if (track_env_val) |v| alloc.free(v);
     const track_alloc = track_env_val != null and
         (std.mem.eql(u8, track_env_val.?, "1") or std.mem.eql(u8, track_env_val.?, "true"));
+    // LUAZIG_C_ALLOC=1 selects the libc allocator for diagnostic A/B runs
+    // (default remains smp_allocator; measured neutral on table workloads).
+    const c_alloc_env = env.getAlloc(alloc, "LUAZIG_C_ALLOC") catch null;
+    defer if (c_alloc_env) |v| alloc.free(v);
+    const use_c_alloc = c_alloc_env != null and
+        (std.mem.eql(u8, c_alloc_env.?, "1") or std.mem.eql(u8, c_alloc_env.?, "true"));
     const runtime_alloc: std.mem.Allocator = if (track_alloc)
         tracker.allocator()
+    else if (use_c_alloc)
+        std.heap.c_allocator
     else
         std.heap.smp_allocator;
 

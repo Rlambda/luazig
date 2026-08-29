@@ -1,4 +1,4 @@
-> Last updated: 2026-08-29 (P16.8 — finalizer lifecycle: PUC-faithful persistent registration, takeFinalizable, bit-test gcHasFinalizer)
+> Last updated: 2026-08-29 (P16.8 — R254 fix, PUC finalizer lifecycle, parity-driven -17% cycles on setmetatable; geomean(18) 1.92x)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -35,9 +35,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | _not run_ |
 | Smoke tests (`tests/smoke/*.lua`) | _not run — no smoke JSON provided_ |
 | C API suites (`tests/c_api`) | 18 suites |
-| Performance (geomean vs PUC) | **1.94x** |
+| Performance (geomean vs PUC) | **1.92x** |
 
-Geomean замедления vs PUC Lua: **1.94x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.92x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -3807,6 +3807,63 @@ noalloc 2.83x, table_alloc_smt 2.63x, global_arith 2.26x, hash 2.20x.
 Гейт полный: Debug+RF tests 0; c_api 18/18 ALL PASS + strict DIFF;
 matrix zig_fail=0; smoke 58/58 (58 byte-identical); nextvar 10/10;
 6 сьютов --testc; leak_bench; native_mem BOUNDED; CallFrame ≤104; Node 32B.
+
+## P16.8 — simple_result R254 + PUC finalizer lifecycle + allocator A/B (2026-08-29)
+
+### Task 0 — фактические TMS-доки (`c0176b9`)
+25 событий (0..24) + TM_N; MMBANK→MMBINK (2 в tag_method.zig, 7 в STATUS).
+
+### Tasks 1+2 — R254-коллизия (`cd38e1b`)
+SIMPLE_RESULT_COMPARE=0xFE крал ЛЕГАЛЬНЫЙ R254 (lopcodes.h: MAX_FSTACK=255,
+старший валидный 254, NO_REG=255). Новое представление: packed_flags bit7 =
+compare-флаг, bits2..6 = event (25), bit1 = invert; dst: 0..254 value /
+255=NONE. Хелперы setSimpleValueResult/setSimpleCompareResult/clearSimpleResult
+(невозможные состояния неконструируемы), Debug-ассерты инварианта
+(compare⇒dst==NO_REG). CallFrame — 0 байт роста, ≤104. Регрессия: source-level
+(254 локальных → результат ADD в R254, --dump-bytecode-доказано) + VM unit-тест
+обоих режимов; старый дизайн падает.
+
+### Task 3 — yield-инвариант приведён к коду (`6b8d4c7`)
+Аудит 5 вопросов: inline-состояние переживает suspension (heap-resident
+CallFrame), НЕ конвертируется в pending_calls (взаимоисключительность
+заассерчена), error/unwind чистит один раз (pop), debug-name корректен после
+resume, вложенные не затирают (per-frame поля). STATUS-коррекция + секция J
+в 58-smoke (nested-yield, debug-name-after-resume).
+
+### Tasks 4-6 — PUC finalizer lifecycle (`e443d56`)
+Регистрация персистентна до события финализации (PUC luaC_checkfinalizer):
+eager-дерегистрация удалена из builtinSetmetatable (2) и
+builtinDebugSetmetatable (4); lua_setmetatable(nil) не вызывает
+checkfinalizer вовсе. takeFinalizable: set.remove + CLEAR FINALIZEDBIT ДО
+резолюции текущего __gc (udata2finalize-порядок — фикс зомби-бага: старый код
+пропускал очистку бита при continue). НЮАНС: gcMakeWhite в take НЕ вызывается
+(в luazig финалайзеры в atomic, не после sweep — makewhite дал бы «мёртвый»
+белый после flip и same-cycle free; объект остаётся BLACK до sweep'а).
+Членство: FINALIZEDBIT = семантический тест (tofinalize-parity), HashSet —
+итератор/insert/remove. closeManagedFile — единственная легитимная
+дерегистрация (архитектурная divergence, задокументирована).
+
+### Task 7 — differential `tests/smoke/59_finalizer_registration.lua`
+Регистрация→снятие-mt (обсервебл PUC: без mt НЕТ вызова __gc), mt1/f1→mt2/f2
+(текущий метод), регистрация→без-__gc→новый-__gc (f3, динамическая резолюция),
+финалайзер ровно один раз. Table + userdata. Byte-identical, 59/59.
+
+### Task 8 — профиль после паритет-фикса
+table_alloc_setmetatable: **instr −6.4%, cycles −17%** чисто от удаления
+семантически неверного finalizables.remove (HashMap Wyhash/getIndex ушли из
+топа). tas 2.63x→2.22x; geomean(18) → **1.92x**; metamethod_add 2.77x;
+temp_table 1.82x.
+
+### Tasks 12-14 — allocator A/B, пулы — НЕ обоснованы
+Честный smp-vs-c A/B (env-свитч LUAZIG_C_ALLOC=1, дефолт smp): tas
+2.618G vs 2.578G cycles — c быстрее на 1.5%. Пул таблиц (Task 13) SKIP:
+аллокатор не корень после паритет-фикса; профили alloc+free ~14% — это сама
+работа аллокации, не накладные. Node 32B (Task 14) — без изменений.
+
+### Гейт: полный, зелёный (лично)
+Debug+RF tests 6/6 прогонов; c_api 18/18 ALL PASS + strict DIFF; matrix
+zig_fail=0; smoke 59/59; nextvar 3x; gc/gengc/closure/coroutine/events
+--testc; leak_bench PASS; native_mem BOUNDED; CallFrame ≤104; Node 32B.
 
 ## История закрытых фаз
 

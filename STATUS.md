@@ -1,4 +1,4 @@
-> Last updated: 2026-08-29 (P16.6 — typed TMS, real MMBIN, string-mt arithmetic; geomean 2.21x→1.91x; native_mem_check fixed)
+> Last updated: 2026-08-29 (P16.7 — clean TMS + simple_result continuation; noalloc 4.49x→2.83x; geomean(18) 1.94x)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -35,9 +35,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | _not run_ |
 | Smoke tests (`tests/smoke/*.lua`) | _not run — no smoke JSON provided_ |
 | C API suites (`tests/c_api`) | 18 suites |
-| Performance (geomean vs PUC) | **2.02x** |
+| Performance (geomean vs PUC) | **1.94x** |
 
-Geomean замедления vs PUC Lua: **2.02x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.94x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -3767,6 +3767,46 @@ selftest PASS + coroutine BOUNDED; CallFrame≤104; Node 32B (24B-экспери
 Perf: **geomean 2.21x → 1.91x** (isolated int_arith ~1.6x: 27.7G/4.69G instr/cyc
 vs PUC 13.9G/2.94G — упрощение dispatch-хендлеров реальное). Top: metamethod_add
 3.42x, lua_calls 2.29x, hash_access 2.28x.
+
+## P16.7 — clean TMS architecture + measured metamethod-call optimization (2026-08-29)
+
+### Task 0 — единый источник TmsEvent (`77299e6`)
+src/lua/tag_method.zig (dependency-free): enum(u5) PUC-порядка + isFastCached
++ opname. Удалены: 2 vm.zig + 12 codegen_bc.zig числовых TMS_*-констант,
+"must match"-комментарии, 3 лживых «MMBIN is a no-op». Bytecode-листинги
+до/после идентичны (кодирование через @intFromEnum).
+
+### Task 1 — декомпозиция metamethod_add (`f5b4d51`)
++metamethod_call_noalloc (bytecode-доказан ADD+MMBIN на итерацию) и
++table_alloc_setmetatable. Замер: noalloc 4.49x vs alloc 2.75x vs combined
+3.34x → ДИСПАТЧ хуже аллокаций; continuation-механика = 42.6% noalloc.
+Geomean теперь по 18 ворклоудам (несравним напрямую с 16-ворклоудным 1.91x).
+
+### Tasks 2+3+4 — resolve-once архитектура (`6c48f16`, `350fd8f`, `8325c1b`)
+findBinaryTm/findUnaryTm (один lookup, lhs→rhs) + tryPushResolvedMetamethod
+(вызов уже разрешённого значения: resolveCallable/__call сохранены).
+MMBIN/MMBINI/MMBANK/UNM/BNOT/LEN/EQ/LT/LE/GT/GE/INDEX/NEWINDEX — разрешение
+один раз, значение проводится через slow-path (аудит-таблица в диффе).
+event+opname-двойственность устранена: opname выводится на холодной границе.
+
+### Task 5+6 — simple_result completion (`9f95f62`)
+Инвариант: simple_result_dst != NONE ⟹ pending_call_index == INVALID;
+yield/error/unwind → полный pending-механизм (fallback), поле чистится на pop.
+Замыкание-метаметод вызывается inline (runClosure), 1 результат → регистр
+родителя, pending_calls не касается. Разделяется: MMBIN/UNM/BNOT/LEN/
+comparisons/simple-index. 58-smoke расширен (0 значений, multi-values,
+__call-метаметод, non-callable error, traceback-имя).
+A/B: noalloc −35.1%, metamethod_add −6.9%, lua_calls −3.0%.
+
+### Task 8 — примитивы без налога
+int_arith 1.63x / float 1.70x / mixed 1.79x / comparisons 1.41x — без
+изменений через всю фазу (инструкции стабильны).
+
+### Финал: geomean (18 ворклоудов) **1.94x**; metamethod_add 3.06x,
+noalloc 2.83x, table_alloc_smt 2.63x, global_arith 2.26x, hash 2.20x.
+Гейт полный: Debug+RF tests 0; c_api 18/18 ALL PASS + strict DIFF;
+matrix zig_fail=0; smoke 58/58 (58 byte-identical); nextvar 10/10;
+6 сьютов --testc; leak_bench; native_mem BOUNDED; CallFrame ≤104; Node 32B.
 
 ## История закрытых фаз
 

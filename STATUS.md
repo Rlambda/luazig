@@ -4731,6 +4731,31 @@ No exceptions: `closeManagedFile` no longer touches finalizer registration
 | nextvar 3× | 3/3 PASS |
 | native_mem | BOUNDED |
 
+### Commit 4 — OP_MOVE boxed handling audit + reduction
+
+**Classification of every branch of OP_MOVE's boxed/open-upvalue logic:**
+
+| Branch | Invariant analysis | Decision |
+|--------|-------------------|----------|
+| Source read via `cell.get()` when `boxed[b]` non-null | `boxed[b]` only holds OPEN cells (close nulls on close). For open cells, `cell.get()` reads `resolveStack(vm)[bc_stack_idx]` = `ctx.regs[b]`. Redundant. | REMOVED |
+| Destination sync via `gcStoreCellValue` when `boxed[a]` holds closed cell | `boxed[a]` never holds closed cells (close nulls `boxed[i]`). `!cell.isOpen()` always false. Dead code. | REMOVED |
+| `hasOpenUpvalues()` fast/slow path split | Both branches produce identical results under the invariant. The split adds a branch + 2 boxed probes on every MOVE. | REMOVED |
+| GC write barrier on destination | PUC OP_MOVE fires NO barrier. Open upvalues point to stack; stack writes auto-update them. Barrier only needed on CLOSE. | REMOVED (was semantically wrong) |
+
+**Result:** OP_MOVE reduced to `ctx.regs[a] = ctx.regs[b]` — a plain TValue copy,
+exactly matching PUC's `setobjs2s(L, ra, RB(i))`. No boxed probes, no barrier,
+no hasOpenUpvalues branch.
+
+**MOVE A/B micro-benchmark** (10M iterations, captured-local-heavy):
+- OLD (boxed slow path): median ~621 ms
+- NEW (reduced): median ~591 ms
+- Improvement: ~5% faster on MOVE-heavy code with open upvalues
+
+**Register pressure comparison** (`box + box` with captured `box`):
+- OLD: 16 instructions, 3 extra MOVEs + 2-3 extra temp registers
+- NEW: 13 instructions, 0 extra MOVEs, matches PUC (12 instructions)
+- R254 test: OLD fails ("too many registers"), NEW passes
+
 ### Commit 3 — R254 permanent regression test
 
 `tests/smoke/62_r254_captured_local_arith.lua`: 198 ordinary locals (R0-R197)

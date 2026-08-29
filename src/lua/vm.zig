@@ -12011,35 +12011,48 @@ pub const Vm = struct {
                 switch (op) {
                     .move => {
                         // PUC OP_MOVE: setobjs2s(L, ra, RB(i)) — a single
-                        // struct copy, no upvalue check. When no open upvalues
-                        // exist (the common case), skip both boxed[] probes.
-                        // P15.51l: has_open_upvalues is read directly from
-                        // the CallFrame (rare field, 5 accesses).
-                        if (exec_frames.getPtr(ctx.frame_index).u.lua.hasOpenUpvalues()) {
-                            // Slow path: source register may be ctx.boxed
-                            // (captured as upvalue). Read from the cell — a
-                            // closure may have modified it via SETUPVAL.
-                            // Use cell.get() to read through the stack slot
-                            // for open upvalues.
-                            ctx.regs[a] = if (b < ctx.boxed.len) if (ctx.boxed[b]) |cell|
-                                cell.get(self)
-                            else
-                                ctx.regs[b] else ctx.regs[b];
-                            // If destination register is ctx.boxed, sync the
-                            // cell. For OPEN cells, the register write already
-                            // updated the stack slot (which is the cell's value),
-                            // so no sync needed. For CLOSED cells, sync the
-                            // cell value and fire the write barrier.
-                            if (a < ctx.boxed.len) if (ctx.boxed[a]) |cell| {
-                                if (!cell.isOpen()) {
-                                    try self.gcStoreCellValue(cell, ctx.regs[a]);
-                                }
-                            };
-                        } else {
-                            // Fast path: no open upvalues, direct copy.
-                            // This is the overwhelmingly common case.
-                            ctx.regs[a] = ctx.regs[b];
-                        }
+                        // TValue copy, no upvalue check, no barrier.
+                        //
+                        // P16.8a invariant proof (OP_MOVE classification):
+                        //
+                        // The old code had a hasOpenUpvalues() slow path that:
+                        //   (a) read the source through cell.get() when boxed[b]
+                        //       held an open cell, and
+                        //   (b) synced the destination cell via gcStoreCellValue
+                        //       when boxed[a] held a closed cell.
+                        //
+                        // Both branches are redundant under the captured-local
+                        // storage invariant (see the Cell invariant block at
+                        // vm.zig:627):
+                        //
+                        // (a) Source: boxed[b] is non-null ONLY for open cells
+                        //     (closeBytecodeUpvaluesFrom:6974 nulls boxed[i] on
+                        //     close). For an open cell, cell.get() reads
+                        //     resolveStack(vm)[bc_stack_idx] = ctx.regs[b]
+                        //     (bc_stack_idx = base + b, ctx.regs = bc_stack[base..]).
+                        //     Therefore cell.get() == ctx.regs[b] always. The
+                        //     source read through the cell is REDUNDANT.
+                        //
+                        // (b) Destination: boxed[a] is non-null ONLY for open
+                        //     cells. The check `!cell.isOpen()` is always false
+                        //     (boxed[] never holds closed cells). Even if it
+                        //     could: for an open cell, ctx.regs[a] = ... already
+                        //     updates the stack slot (which IS the cell's
+                        //     storage), so no sync is needed. The destination
+                        //     sync branch is DEAD CODE.
+                        //
+                        // (c) GC barrier: PUC OP_MOVE fires NO barrier. Open
+                        //     upvalues point to the stack; stack writes
+                        //     automatically update them. The barrier is only
+                        //     needed on CLOSE (luaF_closeupval → luaC_barrier).
+                        //     The old gcStoreCellValue call was not just dead
+                        //     code — it was semantically wrong (PUC doesn't
+                        //     barrier MOVE).
+                        //
+                        // Conclusion: the entire hasOpenUpvalues() slow path is
+                        // unnecessary. OP_MOVE is a plain TValue copy, exactly
+                        // matching PUC's setobjs2s(L, ra, RB(i)).
+                        ctx.regs[a] = ctx.regs[b];
                     },
                     .loadk => {
                         const kid: u32 = b;

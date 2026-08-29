@@ -645,12 +645,11 @@ fn llAccessible(L: ?*lua_State) callconv(.c) c_int {
 /// `boxed[reg]` is set to null. The frame's boxed slot no longer represents
 /// an open stack-backed upvalue. A closed Cell is NEVER present in `boxed[]`.
 ///
-/// This invariant makes the old codegen workaround (emit MOVE to a temp for
-/// captured locals in `dischargeVars(.local)`) obsolete: the register holds
-/// the live value directly, so non-MOVE instructions that read `regs[reg]`
-/// see the correct value. It also makes the OP_MOVE boxed slow path redundant
-/// (source read through `cell.get()` == `regs[b]`; destination sync for a
-/// closed cell never fires because `boxed[]` only holds open cells).
+/// Consequence for codegen: the register holds the live value directly, so
+/// no temp MOVE is needed for captured locals in `dischargeVars(.local)`.
+/// OP_MOVE needs no boxed slow path: source read through `cell.get()` ==
+/// `regs[b]`, and `boxed[]` only holds open cells, so a destination sync for
+/// a closed cell never fires.
 /// ═══════════════════════════════════════════════════════════════════════
 pub const Cell = struct {
     value: Value,

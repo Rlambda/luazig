@@ -4959,28 +4959,52 @@ Verified: test FAILS when errdefer is temporarily disabled (stale
 - coroutine --testc: PASS
 - nextvar 3x: PASS
 
-## P16.8a Task 7 — global_arith per-opcode decomposition (2026-08-29)
+## P16.8a Task 7 — global_arith per-opcode decomposition (2026-08-29; P16.9 T3 re-measured)
 
 ### Method
 
-Isolated single-opcode workloads at N=1B under `perf stat -e instructions`
-(forloop_only, int_arith, gettabup_only, settabup_only) + `luazig --stats`
-per-opcode histogram + `perf record`/`annotate` of the hot loop. Per-opcode
-(dispatch+handler) costs derived by subtracting the forloop_only baseline and
-cross-checking against the global_arith total (430 zig / 208 puc instr/iter).
+Direct measurements: isolated single-opcode workloads (forloop_only, int_arith,
+gettabup_only, settabup_only) + combined global_arith, each under
+`perf stat -e instructions:u` (user-mode only — raw `instructions` counts
+kernel/interrupt noise) at N=1B (isolated) / N=100M (global_arith), **5 repeated
+runs** per runtime. Report median instr/iter + max spread (max−min).
 
-Artifact: `tools/perf/current-global-arith-decomposition.json` (regenerable
-via `python3 tools/perf_global_arith_decomp.py`).
+Derived estimates: per-opcode (handler+dispatch) cost via isolated-workload
+subtraction (e.g. ADD = int_arith − forloop_only). Labeled `derived_estimate`;
+uncertainty = sum of component max_spreads. Non-additive branch/layout effects
+are possible — the global_arith cross-check residual quantifies the
+additive-model error.
 
-### Per-opcode instruction table
+**Determinism finding:** FORLOOP and ADD (no hash-table access) are perfectly
+deterministic (spread = 0). GETTABUP and SETTABUP have a ~9 instr/iter spread
+because both PUC (`luai_makeseed`: time+address) and luazig (`makeRandomSeed`:
+time+address) use a **per-process random hash seed** for string interning.
+Different seeds → different hash-table bucket for `g_count` → different
+collision-chain length → different instruction count per lookup. This is the
+root cause of the historical "208 vs 190" PUC global_arith discrepancy: it is
+NOT measurement error but a genuine property of hash-seed randomization.
 
-| Opcode    | Zig  | PUC  | Delta | Ratio | % of inflation |
-|-----------|------|------|-------|-------|----------------|
-| SETTABUP  | 184  | 80   | 104   | 2.30x | 46.8%          |
-| FORLOOP   | 75   | 28   | 47    | 2.68x | 21.2%          |
-| GETTABUP  | 113  | 68   | 45    | 1.66x | 20.3%          |
-| ADD       | 58   | 32   | 26    | 1.81x | 11.7%          |
-| **Total** | 430  | 208  | 222   | 2.07x | 100%           |
+Artifact (single source of truth for all numbers below):
+`tools/perf/current-global-arith-decomposition.json` (regenerable via
+`python3 tools/perf_global_arith_decomp.py`).
+
+### Per-opcode instruction table (derived_estimate, isolated subtraction)
+
+| Opcode    | Zig        | PUC       | Delta   | Ratio | % of inflation |
+|-----------|------------|-----------|---------|-------|----------------|
+| SETTABUP  | 266 ±19    | 71 ±9     | 195     | 3.75x | ≈81% [70–93%]  |
+| FORLOOP   | 75 ±0      | 28 ±0     | 47      | 2.68x | ≈20%           |
+| GETTABUP  | 94 ±0      | 68 ±9     | 26      | 1.38x | ≈11% [7–15%]   |
+| ADD       | 58 ±0      | 32 ±0     | 26      | 1.81x | ≈11%           |
+| **Total (direct global_arith)** | **430 ±38** | **190 ±18** | **240** | **2.26x** | 100% |
+
+Percentages are `≈` (delta / direct-total-delta) and do NOT sum to 100% because
+isolated-workload subtraction is non-additive: the additive-model sum (zig 493)
+exceeds the direct global_arith total (430) by a residual of −63 instr/iter.
+The in-context SETTABUP (global_arith subtraction: 430−75−94−58 = 203 zig,
+190−28−68−32 = 62 puc, delta ≈141, ≈59%) is lower than the isolated SETTABUP
+(266) because the 2-opcode isolated loop has worse dispatch/BTB behavior than
+the 4-opcode global_arith loop. PUC is nearly additive (residual ≈ −9).
 
 (Both runtimes LIST 5 opcodes/iter incl. MMBIN; on the int+int fast path
 op_arith_aux does pc++ to SKIP MMBIN, so only 4 opcodes are EXECUTED/iter
@@ -4988,32 +5012,34 @@ in both PUC and zig — verified via PUC count hook: N=10→52, N=20→92, Δ=40
 
 ### Top-3 instruction-inflation contributors
 
-1. **SETTABUP (46.8%, 2.30x)** — `gcTableWriteBarrier` makes outlined function
-   calls (`gcValueAge` ×2, `gcRememberValue` ×1) on every SETTABUP, even for
-   integer values. PUC's barrier is a single inline `iscollectable(val)` check
-   → 1 branch (false for integers). Secondary: 16-byte Value spills to stack
-   before the calls (14.38% hot annotate line `vmovaps`).
+1. **SETTABUP (≈81% isolated / ≈59% in-context, 3.75x)** — `gcTableWriteBarrier`
+   makes outlined function calls (`gcValueAge` ×2, `gcRememberValue` ×1) on
+   every SETTABUP, even for integer values. PUC's barrier is a single inline
+   `iscollectable(val)` check → 1 branch (false for integers). Secondary:
+   16-byte Value spills to stack before the calls.
    *Fix direction:* inline the barrier — check `Value` tag inline, skip
    `gcRememberValue` for non-collectable values without any function call.
-   *ROI:* SETTABUP 184→~120 → global_arith 430→~366 → ratio 2.07x→~1.76x.
+   *ROI:* SETTABUP 266→~120 (isolated) → global_arith 430→~360 → ratio ≈1.9x.
    Affects ~5 of 16 workloads.
 
-2. **FORLOOP (21.2%, 2.68x)** — Dispatch overhead dominates (D≈60 vs Dp≈15).
+2. **FORLOOP (≈20%, 2.68x)** — Dispatch overhead dominates (D≈60 vs Dp≈15).
    FORLOOP handler itself is ~15 instr (similar to PUC). The 4x dispatch
    overhead comes from `switch`+`continue` (single branch target) vs PUC's
    computed gotos (per-handler branch target → better BTB prediction).
    *Fix direction:* reduce dispatch overhead — tighten fetch/decode/gating
    sequence, or Zig equivalent of computed goto.
    *ROI:* D 60→~30 → every opcode saves ~30 instr → global_arith 430→~310 →
-   ratio 2.07x→~1.49x. Affects ~12 of 16 workloads (highest breadth).
+   ratio ≈1.6x. Affects ~12 of 16 workloads (highest breadth).
 
-3. **GETTABUP (20.3%, 1.66x)** — `nodeLookupStr` has more branches than PUC's
+3. **GETTABUP (≈11%, 1.38x)** — `nodeLookupStr` has more branches than PUC's
    `luaH_getshortstr`: is_short checks (×2), external vs inline string path,
    key_tt == .string tag check. For interned short strings (common case), PUC
-   does a single pointer comparison after one hash+index.
+   does a single pointer comparison after one hash+index. The ≈11% (was ≈20%
+   in the old single-run measurement) reflects hash-seed-randomization spread:
+   the isolated GETTABUP zig cost is 94 (favorable hash) vs 113 (unfavorable).
    *Fix direction:* specialize for interned-short-string case (skip is_short
    checks for constant string keys from resolved_values).
-   *ROI:* GETTABUP 113→~90 → global_arith 430→~407 → ratio 2.07x→~1.96x.
+   *ROI:* GETTABUP 94→~70 → global_arith 430→~406 → ratio ≈2.1x.
    Affects ~5 of 16 workloads.
 
 ### Frame-push verdict

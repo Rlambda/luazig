@@ -26764,17 +26764,25 @@ pub const Vm = struct {
                 entry.value.close(stdio.activeIo());
             }
         }
-        // Architectural divergence: luazig uses an external HashSet for
-        // finalizables, while PUC uses embedded linked lists in GCObject
-        // headers (sweep never touches finobj/tobefnz list elements). If
-        // we don't remove the table from finalizables here, the sweep
-        // frees the table and leaves a dangling pointer in the HashSet.
-        // PUC does NOT need this removal because its sweep skips the
-        // finobj list entirely. This is the ONLY legitimate eager
-        // deregistration site; all others (setmetatable, debug.setmetatable)
-        // have been removed to match PUC's persistent-registration model.
-        _ = self.finalizables.remove(.{ .table = tbl });
-        gcPtr(.{ .table = tbl }).marked.* &= ~FINALIZEDBIT;
+        // PUC separation of concerns: explicit close (f:close() / io.close)
+        // only closes the OS resource — it does NOT touch the finalizer
+        // registration. The userdata STAYS in the finalization lifecycle
+        // (FINALIZEDBIT remains set, stays in `finalizables`). The bit is
+        // cleared only at the GC finalization event via `takeFinalizable`
+        // (lgc.c:947-960 udata2finalize), which runs BEFORE resolving __gc.
+        //
+        // This mirrors PUC's architecture: `aux_close` (liolib.c:213-218)
+        // sets `closef = NULL` (marking the stream as closed) but does NOT
+        // remove the userdata from `finobj`. The userdata remains in finobj
+        // until the GC's `separatetobefnz` → `udata2finalize` path dequeues
+        // it. If the metatable still has __gc at finalization time, `f_gc`
+        // (liolib.c:234-238) checks `isclosed(p)` and no-ops on an already-
+        // closed file. If the metatable was changed (no __gc), no callback
+        // fires but the object is consumed normally by the next cycle.
+        //
+        // The `__closed` field (set by callers) is the file-state equivalent
+        // of PUC's `closef == NULL` — it tracks "OS resource already closed"
+        // independently of finalizer registration state.
 
         if (self.open_processes.fetchRemove(id)) |entry| {
             var child = entry.value;
@@ -27665,6 +27673,12 @@ pub const Vm = struct {
         // `io.stdout`/`io.stderr`) and must never be closed by GC, matching
         // PUC Lua where `io.stdin`/`io.stdout`/`io.stderr` are never finalized.
         if (self.isStdFile(args[0])) return;
+        // PUC f_gc (liolib.c:234-238): ignore already-closed files.
+        // `isclosed(p)` checks `closef == NULL`; our equivalent is the
+        // `__closed` field set by explicit close / __close / auto-close.
+        if (self.getFieldOpt(file_tbl, "__closed")) |v| {
+            if (v == .Bool and v.Bool) return;
+        }
         _ = self.closeManagedFile(file_tbl);
         _ = self.setField(file_tbl, "__closed", .{ .Bool = true }) catch {};
     }

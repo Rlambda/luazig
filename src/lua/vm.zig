@@ -20623,7 +20623,10 @@ pub const Vm = struct {
     // new reference. If the barrier succeeds and a LATER operation fails,
     // the extra grayagain entry is harmless (conservatively grayer — the
     // table will be re-traversed even though the store may not have happened,
-    // which is safe wasted work, not a correctness violation).
+    // which is safe wasted work, not a correctness violation). This includes
+    // the rawSet new-key rehash path: if tableResize OOMs after the barriers
+    // at 26440-26441 succeeded, the store never happens but the table is
+    // conservatively gray — safe.
     //
     // Invariant: every call site MUST call the barrier BEFORE the store.
     // Proof per call site (verified in Commits 2+3):
@@ -20632,9 +20635,13 @@ pub const Vm = struct {
     //     between barrier and store. ✓
     //   - rawSet existing-slot: barrier → node.value = val. ✓
     //   - rawSet new-key: barrier → nodeInsert (no allocation — hash part
-    //     already has room) → set value. If rehash is needed, barrier is
-    //     called again after rehash (the rehashed table may have a different
-    //     mark state). ✓
+    //     already has room) → set value. If rehash is needed, tableResize
+    //     runs between the pre-barrier and the store — but tableResize is
+    //     collector-free (allocations go through self.alloc, a raw
+    //     std.mem.Allocator, + gcNoteAlloc/gcNoteFree accounting only; no
+    //     gcAutomaticStep/condGC call inside tableResize/tableRehash). Mark
+    //     state cannot change between the prepare-barrier and the store, so
+    //     the single pre-barrier is correct. ✓
     //   - rawSet array: barrier → tbl.array[k] = val. ✓
     // ─────────────────────────────────────────────────────────────────
 
@@ -20672,9 +20679,12 @@ pub const Vm = struct {
     /// `luaC_objbarrierback` → `luaC_barrierback_` (incremental) or
     /// `luaC_barrierback_` (generational).
     ///
-    /// `noinline` to keep the inline callers small — the slow path is only
-    /// reached when the value/key is collectable AND the table is old/black
-    /// AND the child is young/white (a rare event in steady state).
+    /// `inline` (not `noinline`): noinline was measured and caused a code-
+    /// layout regression on the comparisons workload (+18%; see STATUS P16.9).
+    /// Inlining the slow helper keeps one call-site shape and lets the
+    /// compiler cold-outline when profitable. The slow path is only reached
+    /// when the value/key is collectable AND the table is old/black AND the
+    /// child is young/white (a rare event in steady state).
     ///
     /// Uses the DIRECT *Table owner: `gcRememberObject(.{ .table = table })`
     /// — no Value→GcObject→Table round-trip (Task 7). Age/transition logic

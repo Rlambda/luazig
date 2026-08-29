@@ -76,6 +76,10 @@ pub fn isFastCached(event: TmsEvent) bool {
 /// only has entries for the arithmetic/comparison/concat/len/eq events.
 pub fn opname(event: TmsEvent) []const u8 {
     return switch (event) {
+        .index => "index",
+        .newindex => "newindex",
+        .gc => "gc",
+        .mode => "mode",
         .add => "add",
         .sub => "sub",
         .mul => "mul",
@@ -95,6 +99,7 @@ pub fn opname(event: TmsEvent) []const u8 {
         .eq => "eq",
         .lt => "lt",
         .le => "le",
-        else => "metamethod",
+        .call => "call",
+        .close => "close",
     };
 }

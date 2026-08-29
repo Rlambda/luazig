@@ -1,4 +1,4 @@
-> Last updated: 2026-08-29 (P16.7 — clean TMS + simple_result continuation; noalloc 4.49x→2.83x; geomean(18) 1.94x)
+> Last updated: 2026-08-29 (P16.8 — finalizer lifecycle: PUC-faithful persistent registration, takeFinalizable, bit-test gcHasFinalizer)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -4583,3 +4583,79 @@ No regressions vs baseline (all OK).
 | native_mem_check selftest | PASS |
 | leak_bench | PASS (all within 1.0 KB) |
 | CallFrame size | 104 bytes (unchanged) |
+
+---
+
+## P16.8 Tasks 4-8: PUC-faithful finalizer lifecycle
+
+**Goal:** Fix eager deregistration, clear-order bug, and membership
+duplication in the GC finalizer system to match PUC Lua's persistent
+registration model.
+
+### Problems fixed
+
+1. **Eager deregistration in setmetatable/debug.setmetatable** (Task 4):
+   When setting metatable to nil or to a table without `__gc`, luazig
+   removed the object from `finalizables`. PUC NEVER deregisters —
+   `luaC_checkfinalizer` only registers, never removes. The `__gc` is
+   resolved dynamically at finalization time (GCTM looks up the CURRENT
+   metatable). Fix: removed all `finalizables.remove` calls from
+   `builtinSetmetatable` (2 sites) and `builtinDebugSetmetatable` (4 sites).
+
+2. **Clear-order bug in gcFinalizeList/gcFinalizeAtClose** (Task 5):
+   FINALIZEDBIT was cleared AFTER the finalizer ran. If the finalizer
+   threw an error (caught by the error handler), the bit was never
+   cleared, creating a zombie: bit set but not in finalizables. Next
+   cycle, sweep kept it alive (bit set) but it was never finalized
+   (not in set) → memory leak. Fix: introduced `takeFinalizable` which
+   dequeues and clears FINALIZEDBIT BEFORE resolving `__gc`, matching
+   PUC's `udata2finalize` (lgc.c:947-960).
+
+3. **gcMakeWhite NOT called in takeFinalizable** (Task 5 correction):
+   PUC's `udata2finalize` calls `makewhite` only when `issweepphase(g)`
+   is true. In PUC, finalizers run AFTER sweep, so it IS sweep phase.
+   In luazig, finalizers run DURING atomic (BEFORE sweep), so it is NOT
+   sweep phase. Calling `gcMakeWhite` set the object to pre-flip white,
+   which became "dead" white after the atomic→sweep white flip, causing
+   the sweep to free finalized objects in the SAME cycle (breaking the
+   two-cycle finalization contract — api.lua:939 assertion failure).
+   Fix: do NOT call `gcMakeWhite`. The object stays BLACK (from atomic
+   Step 10 marking), survives the sweep, and the sweep's own
+   `gcMakeWhite` (gcSweepOne line ~21422) resets it to the new current
+   white for the next cycle.
+
+4. **gcHasFinalizer/registerFinalizable used finalizables.contains** (Task 6):
+   Changed to use FINALIZEDBIT test, matching PUC's `tofinalize(o)` macro.
+   This is the PUC-faithful approach: the bit IS the membership test.
+
+5. **closeManagedFile eager deregistration** (Task 7):
+   Kept `finalizables.remove` + added `FINALIZEDBIT` clear. This is the
+   ONLY legitimate eager deregistration site, due to an architectural
+   divergence: luazig uses an external HashSet for finalizables (PUC uses
+   embedded linked lists in GCObject headers, sweep never touches
+   finobj/tobefnz list elements). Without removal, sweep frees the table
+   and leaves a dangling pointer in the HashSet.
+
+### Invariant
+
+FINALIZEDBIT ⟺ object is in `finalizables` set. The bit is the fast
+membership test (PUC `tofinalize(o)`). Set at registration
+(`registerFinalizable`), cleared at finalization (`takeFinalizable`).
+The only exception is `closeManagedFile` (architectural divergence,
+documented above).
+
+### Files changed
+- `src/lua/vm.zig` — `takeFinalizable` (new), `gcFinalizeList`,
+  `gcFinalizeAtClose`, `builtinSetmetatable`, `builtinDebugSetmetatable`,
+  `gcHasFinalizer`, `registerFinalizable`, `closeManagedFile`
+- `tests/smoke/59_finalizer_registration.lua` — 6 scenarios (A-F),
+  byte-identical PUC vs luazig, both GC modes
+
+### Verification
+| Check | Result |
+|-------|--------|
+| Matrix `--testc` | 31/32 pass (zig_fail=0, both_fail=1 big.lua pre-existing) |
+| Smoke tests (59) | 59/59 PASS |
+| C API tests (17) | 17/17 PASS |
+| nextvar 3× | 3/3 PASS |
+| leak_bench | PASS (all within 1.0 KB) |

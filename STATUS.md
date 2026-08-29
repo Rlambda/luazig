@@ -31,9 +31,10 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 <!-- BEGIN GENERATED SUMMARY (tools/status_summary.py) -->
 | Metric | Result |
 |--------|--------|
-| Upstream matrix (`testes/*.lua`, `--testc`) | _not run — no matrix JSON provided_ |
-| Differential output (`--diff`) | _not run_ |
-| Smoke tests (`tests/smoke/*.lua`) | _not run — no smoke JSON provided_ |
+| Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
+| Matrix non-pass | both_fail: big.lua |
+| Differential output (`--diff`) | **0 output_diff** |
+| Smoke tests (`tests/smoke/*.lua`) | **62/62** pass |
 | C API suites (`tests/c_api`) | 18 suites |
 | Performance (geomean vs PUC) | **1.93x** |
 

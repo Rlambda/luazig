@@ -22,8 +22,9 @@ The project is in a **pre-release / parity-focused** state.
 
 | Metric | Result |
 |--------|--------|
-| Upstream matrix (`testes/*.lua`, `--testc`) | _not run — no matrix JSON provided_ |
-| Smoke tests (`tests/smoke/*.lua`) | _not run — no smoke JSON provided_ |
+| Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
+| Matrix non-pass | both_fail: big.lua |
+| Smoke tests (`tests/smoke/*.lua`) | **62/62** match (byte-identical stdout+stderr+exit) |
 | C API suites (`tests/c_api`) | 18 suites (gate: `make -C tests/c_api test`) |
 
 Regression lane: `python3 tools/testes_matrix.py --testc` (no `_port`/`_soft` prelude overrides).

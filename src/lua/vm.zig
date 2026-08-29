@@ -624,6 +624,34 @@ fn llAccessible(L: ?*lua_State) callconv(.c) c_int {
     return 0;
 }
 
+/// ═══════════════════════════════════════════════════════════════════════
+/// CAPTURED-LOCAL STORAGE INVARIANT (P16.8a)
+/// ═══════════════════════════════════════════════════════════════════════
+///
+/// For an active bytecode frame: if `boxed[reg]` holds an open Cell, that
+/// Cell observes exactly `bc_stack[reg]` — `Cell.get` reads the stack slot,
+/// `Cell.set` writes the stack slot. The stack register IS the authoritative
+/// storage while the Cell is open.
+///
+/// Consequence: any direct write to `regs[reg]` (arithmetic ADD, MOVE,
+/// direct-store, LOADNIL, etc.) is immediately visible to closures that
+/// captured the local, because the open Cell reads from the same slot.
+/// Conversely, any SETUPVAL from a nested closure (which calls `Cell.set`)
+/// writes through to the parent frame's `regs[reg]`, so the parent sees the
+/// new value on a direct read.
+///
+/// On close (`closeBytecodeUpvaluesFrom` / `cell.close`): the current stack
+/// value is copied into `cell.value`, `bc_stack_idx` is set to null, and
+/// `boxed[reg]` is set to null. The frame's boxed slot no longer represents
+/// an open stack-backed upvalue. A closed Cell is NEVER present in `boxed[]`.
+///
+/// This invariant makes the old codegen workaround (emit MOVE to a temp for
+/// captured locals in `dischargeVars(.local)`) obsolete: the register holds
+/// the live value directly, so non-MOVE instructions that read `regs[reg]`
+/// see the correct value. It also makes the OP_MOVE boxed slow path redundant
+/// (source read through `cell.get()` == `regs[b]`; destination sync for a
+/// closed cell never fires because `boxed[]` only holds open cells).
+/// ═══════════════════════════════════════════════════════════════════════
 pub const Cell = struct {
     value: Value,
     gc_age: GcAge = .new,

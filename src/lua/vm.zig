@@ -1206,12 +1206,16 @@ const INVALID_PC: u32 = std.math.maxInt(u32);
 /// P15.51n: Sentinel for CallFrame.pending_call_index meaning "no pending call".
 const INVALID_PENDING: u32 = std.math.maxInt(u32);
 
-/// P16.7 Task 6: Sentinel values for LuaFrameState.simple_result_dst.
-/// NONE (0xFF) = no simple-result pending.
-/// COMPARE (0xFE) = compare mode (check truthiness, adjust pc).
-/// 0x00–0xFD = value mode (put result in register).
-const SIMPLE_RESULT_NONE: u8 = 0xFF;
-const SIMPLE_RESULT_COMPARE: u8 = 0xFE;
+/// P16.8 Task 1: Sentinel for LuaFrameState.simple_result_dst.
+/// NO_REG (0xFF = 255) = no value-mode destination (PUC lopcodes.h NO_REG).
+/// In compare mode, simple_result_dst is always NO_REG (invariant).
+/// In value mode, 0..254 = destination register (R254 is VALID).
+const SIMPLE_RESULT_NONE: u8 = 0xFF; // == NO_REG
+
+/// P16.8 Task 1: Bit 7 of lua_packed_flags — simple_result_compare flag.
+/// When set, the simple-result completion is in compare mode (check
+/// truthiness, adjust pc). When clear, value mode if dst != NONE.
+const SIMPLE_RESULT_COMPARE_FLAG: u8 = 0x80;
 
 /// Encode nresults into callstatus low 8 bits (PUC `ldo.c:716`).
 /// MULTRET (-1) encodes as 0. Non-negative encodes as nresults + 1.
@@ -1372,39 +1376,45 @@ const LuaFrameState = struct {
     skip_line_hook_pc: u32 = INVALID_PC,
     skip_call_hook_pc: u32 = INVALID_PC,
     resume_skip_count_pc: u32 = INVALID_PC,
-    /// P16.7 Task 6: Packed Lua-frame flags (1 byte).
+    /// P16.8 Task 1: Packed Lua-frame flags (1 byte).
     /// Bit 0: has_open_upvalues (was a separate bool field).
     /// Bit 1: simple_result_invert (compare mode only).
     /// Bits 2-6: simple_result_event (TmsEvent, u5, 25 events, max 24).
-    /// Bit 7: unused.
+    /// Bit 7: simple_result_compare flag (compare mode indicator).
     lua_packed_flags: u8 = 0,
-    /// P16.7 Task 6: Inline simple-result completion destination.
-    /// 0xFF = no simple-result pending (SIMPLE_RESULT_NONE).
-    /// 0xFE = compare mode (SIMPLE_RESULT_COMPARE).
-    /// 0x00-0xFD = value mode: put 1 result into register `simple_result_dst`.
+    /// P16.8 Task 1: Inline simple-result completion destination.
+    /// 0xFF (NO_REG) = no value destination (NONE or compare mode).
+    /// 0x00-0xFE (0..254) = value mode: put 1 result into register.
+    /// R254 (0xFE) is a VALID register — PUC MAX_FSTACK=255, NO_REG=255.
     simple_result_dst: u8 = 0xFF,
 
-    /// P16.7 Task 6: INVARIANT — When `simple_result_dst != SIMPLE_RESULT_NONE`,
-    /// a metamethod child frame is executing on top of this frame.
-    ///   - Value mode (0x00–0xFD): put 1 result into register `simple_result_dst`,
-    ///     advance pc by 1. Zero returns → nil (matches PUC `luaT_callTMres`).
-    ///   - Compare mode (0xFE): check truthiness of 1 result; advance pc by 1,
-    ///     then by 1 more if (truthy != simpleResultInvert()). Zero returns → false.
-    ///   - NONE (0xFF): no simple-result pending.
+    /// P16.8 Task 1: INVARIANT — The simple-result state machine has
+    /// exactly three states, encoded by (compare_flag, simple_result_dst):
+    ///
+    ///   1. NONE  (compare=0, dst=NO_REG): no simple-result pending.
+    ///   2. VALUE (compare=0, dst=0..254): put 1 result into register
+    ///      `simple_result_dst`, advance pc by 1. Zero returns → nil
+    ///      (matches PUC `luaT_callTMres`).
+    ///   3. COMPARE (compare=1, dst=NO_REG): check truthiness of 1 result;
+    ///      advance pc by 1, then by 1 more if (truthy != invert).
+    ///      Zero returns → false.
+    ///
+    /// Representation invariant: compare=1 ⟹ dst=NO_REG.
+    /// R254 is fully valid in value mode — the old 0xFE sentinel is gone.
     ///
     /// This bypasses the pending_calls array entirely. The completion info
     /// lives inline in LuaFrameState (packed into 2 bytes: lua_packed_flags +
     /// simple_result_dst), using the 2 bytes of slack at the end of the
     /// 56-byte struct (was 1 bool + 1 byte padding).
     ///
-    /// Resume equivalence: a frame with simple_result_dst != NONE that is
-    /// suspended (coroutine yield) resumes identically to the old `.value`/
-    /// `.compare` completion. The inline fields persist on the CallFrame
-    /// (heap-resident in thread.call_frames), and the return path checks
-    /// `simple_result_dst` before `pending_call_index`. The metamethod child
-    /// frame is also heap-resident and persists across yield/resume. The ONLY
-    /// difference from the old path is WHERE the completion info is stored
-    /// (inline vs. pending_calls array); the semantics are identical.
+    /// Resume equivalence: a frame with hasSimpleResult() that is suspended
+    /// (coroutine yield) resumes identically to the old `.value`/`.compare`
+    /// completion. The inline fields persist on the CallFrame (heap-resident
+    /// in thread.call_frames), and the return path checks `hasSimpleResult()`
+    /// before `pending_call_index`. The metamethod child frame is also
+    /// heap-resident and persists across yield/resume. The ONLY difference
+    /// from the old path is WHERE the completion info is stored (inline vs.
+    /// pending_calls array); the semantics are identical.
     ///
     /// `pending_call_index` remains `INVALID_PENDING` while a simple-result is
     /// pending — the two completion mechanisms are mutually exclusive.
@@ -1415,17 +1425,54 @@ const LuaFrameState = struct {
     pub fn setOpenUpvalues(self: *LuaFrameState, v: bool) void {
         self.lua_packed_flags = if (v) self.lua_packed_flags | 0x01 else self.lua_packed_flags & ~@as(u8, 0x01);
     }
+
+    // ── P16.8 Task 1: Simple-result state machine helpers ──
+    // All simple_result access goes through these typed helpers. Callers
+    // cannot construct impossible states (compare+dst, stale flags, etc.).
+
+    /// True if a simple-result completion is pending (value OR compare mode).
+    pub fn hasSimpleResult(self: *const LuaFrameState) bool {
+        return (self.lua_packed_flags & SIMPLE_RESULT_COMPARE_FLAG) != 0 or
+            self.simple_result_dst != SIMPLE_RESULT_NONE;
+    }
+
+    /// True if the pending simple-result is in compare mode.
+    pub fn simpleResultIsCompare(self: *const LuaFrameState) bool {
+        return (self.lua_packed_flags & SIMPLE_RESULT_COMPARE_FLAG) != 0;
+    }
+
     pub fn simpleResultEvent(self: *const LuaFrameState) TmsEvent {
         return @enumFromInt((self.lua_packed_flags >> 2) & 0x1f);
     }
-    pub fn setSimpleResultEvent(self: *LuaFrameState, event: TmsEvent) void {
-        self.lua_packed_flags = (self.lua_packed_flags & 0x03) | (@as(u8, @intFromEnum(event)) << 2);
-    }
+
     pub fn simpleResultInvert(self: *const LuaFrameState) bool {
         return (self.lua_packed_flags & 0x02) != 0;
     }
-    pub fn setSimpleResultInvert(self: *LuaFrameState, v: bool) void {
-        self.lua_packed_flags = if (v) self.lua_packed_flags | 0x02 else self.lua_packed_flags & ~@as(u8, 0x02);
+
+    /// Value mode: put 1 result into register `dst` (0..254), advance pc by 1.
+    /// Clears compare flag, sets dst and event.
+    pub fn setSimpleValueResult(self: *LuaFrameState, dst: u8, event: TmsEvent) void {
+        std.debug.assert(dst != SIMPLE_RESULT_NONE); // dst must be a real register
+        self.lua_packed_flags = (self.lua_packed_flags & 0x01) | // keep has_open_upvalues
+            (@as(u8, @intFromEnum(event)) << 2); // clear compare+invert, set event
+        self.simple_result_dst = dst;
+    }
+
+    /// Compare mode: check truthiness of 1 result, advance pc by 1, then by
+    /// 1 more if (truthy != invert). Sets compare flag, dst=NONE, event, invert.
+    pub fn setSimpleCompareResult(self: *LuaFrameState, event: TmsEvent, invert: bool) void {
+        self.lua_packed_flags = (self.lua_packed_flags & 0x01) | // keep has_open_upvalues
+            SIMPLE_RESULT_COMPARE_FLAG |
+            (if (invert) @as(u8, 0x02) else 0) |
+            (@as(u8, @intFromEnum(event)) << 2);
+        self.simple_result_dst = SIMPLE_RESULT_NONE; // invariant: compare ⟹ dst=NONE
+    }
+
+    /// Clear all simple-result state (back to NONE). Called on completion,
+    /// error-unwind, and frame initialization.
+    pub fn clearSimpleResult(self: *LuaFrameState) void {
+        self.lua_packed_flags &= 0x01; // keep only has_open_upvalues
+        self.simple_result_dst = SIMPLE_RESULT_NONE;
     }
 };
 
@@ -4045,10 +4092,10 @@ pub const Vm = struct {
     /// `parent_frame` is the frame BELOW the current frame (the caller).
     pub fn getDebugName(self: *Vm, parent_frame: ?*const CallFrame) ?struct { namewhat: ?[]const u8, name: ?[]const u8 } {
         const parent = parent_frame orelse return null;
-        // P16.7 Task 6: Check inline simple-result completion first.
+        // P16.8 Task 1: Check inline simple-result completion first.
         // The debug name is derived from simple_result_event — no pending_calls
         // slot is involved.
-        if (parent.isLua() and parent.u.lua.simple_result_dst != SIMPLE_RESULT_NONE) {
+        if (parent.isLua() and parent.u.lua.hasSimpleResult()) {
             const event: TmsEvent = parent.u.lua.simpleResultEvent();
             return .{
                 .namewhat = "metamethod",
@@ -7163,9 +7210,9 @@ pub const Vm = struct {
         const proto = cl.proto orelse return false;
 
         std.debug.assert(!(exec_frames.getPtr(parent_index).pending_call_index != INVALID_PENDING));
-        // P16.7 Task 6: simple_result and pending_calls are mutually exclusive.
+        // P16.8 Task 1: simple_result and pending_calls are mutually exclusive.
         if (!exec_frames.getPtr(parent_index).isC()) {
-            std.debug.assert(exec_frames.getPtr(parent_index).u.lua.simple_result_dst == SIMPLE_RESULT_NONE);
+            std.debug.assert(!exec_frames.getPtr(parent_index).u.lua.hasSimpleResult());
         }
         try self.setPendingCall(exec_frames.getPtr(parent_index), .{
             .callee = resolved.callee,
@@ -7288,17 +7335,15 @@ pub const Vm = struct {
         // Set inline simple-result completion — no pending_calls slot needed.
         const parent = exec_frames.getPtr(parent_index);
         std.debug.assert(parent.pending_call_index == INVALID_PENDING);
-        std.debug.assert(parent.u.lua.simple_result_dst == SIMPLE_RESULT_NONE);
+        std.debug.assert(!parent.u.lua.hasSimpleResult());
         switch (completion) {
             .value => |dst| {
-                parent.u.lua.simple_result_dst = dst;
+                parent.u.lua.setSimpleValueResult(dst, event);
             },
             .compare => |invert| {
-                parent.u.lua.simple_result_dst = SIMPLE_RESULT_COMPARE;
-                parent.u.lua.setSimpleResultInvert(invert);
+                parent.u.lua.setSimpleCompareResult(event, invert);
             },
         }
-        parent.u.lua.setSimpleResultEvent(event);
 
         // Push the child frame with MULTRET (same as .value/.compare in the
         // old path: cont_nresults = -1 for non-.results completions).
@@ -10888,8 +10933,8 @@ pub const Vm = struct {
         // P15.51n: Initialize pending_call_index (addOne doesn't zero-init).
         ef_slot.pending_call_index = INVALID_PENDING;
         ef_slot.u.lua.skip_call_hook_pc = INVALID_PC;
-        // P16.7 Task 6: Initialize simple_result_dst (no simple-result pending).
-        ef_slot.u.lua.simple_result_dst = SIMPLE_RESULT_NONE;
+        // P16.8 Task 1: Initialize simple_result state (no simple-result pending).
+        ef_slot.u.lua.clearSimpleResult();
 
         // P15.51g: regs/boxed are no longer cached in the frame — they are
         // derived on demand from base + frame_cap. The local `regs`/`boxed`
@@ -10912,11 +10957,11 @@ pub const Vm = struct {
             self.cancelBytecodePendingCall(pending, frame);
             self.clearPendingCall(frame);
         }
-        // P16.7 Task 6: Clear inline simple-result completion if set.
+        // P16.8 Task 1: Clear inline simple-result completion if set.
         // Handles the error-unwind case where the parent frame is popped
-        // without the normal return path clearing simple_result_dst.
+        // without the normal return path clearing simple_result state.
         if (!frame.isC()) {
-            frame.u.lua.simple_result_dst = SIMPLE_RESULT_NONE;
+            frame.u.lua.clearSimpleResult();
         }
         // P15.38f: Clear in_debug_hook if this was a debug hook frame.
         // Since isInDebugHook() prevents nested hooks, at most one hook frame
@@ -11026,16 +11071,15 @@ pub const Vm = struct {
         }
 
         const parent_index = exec_frames.len() - 1;
-        // P16.7 Task 6: Check for inline simple-result completion BEFORE
+        // P16.8 Task 1: Check for inline simple-result completion BEFORE
         // the pending_call_index check. simple_result and pending_calls are
         // mutually exclusive (asserted in tryPushBytecodeContinuationCall
-        // and tryPushSimpleResultMetamethod). When simple_result_dst is set,
+        // and tryPushSimpleResultMetamethod). When hasSimpleResult() is true,
         // the completion is handled inline — no pending_calls slot involved.
         {
             const parent_ptr = exec_frames.getPtr(parent_index);
-            if (parent_ptr.isLua() and parent_ptr.u.lua.simple_result_dst != SIMPLE_RESULT_NONE) {
-                const sr_dst = parent_ptr.u.lua.simple_result_dst;
-                if (sr_dst == SIMPLE_RESULT_COMPARE) {
+            if (parent_ptr.isLua() and parent_ptr.u.lua.hasSimpleResult()) {
+                if (parent_ptr.u.lua.simpleResultIsCompare()) {
                     // Compare mode: check truthiness, adjust pc.
                     const invert = parent_ptr.u.lua.simpleResultInvert();
                     const result = ret.len != 0 and isTruthy(ret[0]);
@@ -11043,13 +11087,14 @@ pub const Vm = struct {
                     if (result != invert) parent_ptr.u.lua.pc += 1;
                 } else {
                     // Value mode: put 1 result into register, advance pc.
+                    const sr_dst = parent_ptr.u.lua.simple_result_dst;
                     var regs = self.bc_stack[parent_ptr.base .. parent_ptr.base + parent_ptr.u.lua.frame_cap];
                     var boxed = self.bc_boxed[parent_ptr.base .. parent_ptr.base + parent_ptr.u.lua.frame_cap];
                     try self.bcGrowFrame(parent_ptr.base, @as(usize, sr_dst) + 1, &parent_ptr.u.lua.frame_cap, &regs, &boxed);
                     regs[sr_dst] = if (ret.len == 0) .Nil else ret[0];
                     parent_ptr.u.lua.pc += 1;
                 }
-                parent_ptr.u.lua.simple_result_dst = SIMPLE_RESULT_NONE;
+                parent_ptr.u.lua.clearSimpleResult();
                 if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
                 return null;
             }
@@ -13869,7 +13914,7 @@ pub const Vm = struct {
                     const parent_c = ctx.exec_frames.getConstPtr(parent_idx);
                     if (parent_c.isLua() and
                         parent_c.pending_call_index == INVALID_PENDING and
-                        parent_c.u.lua.simple_result_dst == SIMPLE_RESULT_NONE)
+                        !parent_c.u.lua.hasSimpleResult())
                     {
                         const nresults = decodeNresults(child.callstatus);
                         if (nresults == 0 or nresults < 0) {
@@ -13890,33 +13935,33 @@ pub const Vm = struct {
                             return .continue_frame_loop;
                         }
                     }
-                    // P16.7 Task 6: simple_result fast arm for opReturn0.
+                    // P16.8 Task 1: simple_result fast arm for opReturn0.
                     // 0 values returned: value mode → nil; compare mode → false.
                     if (parent_c.isLua() and
                         parent_c.pending_call_index == INVALID_PENDING and
-                        parent_c.u.lua.simple_result_dst != SIMPLE_RESULT_NONE)
+                        parent_c.u.lua.hasSimpleResult())
                     {
                         const nresults = decodeNresults(child.callstatus);
                         if (nresults < 0) {
-                            const sr_dst = parent_c.u.lua.simple_result_dst;
                             // Pop child frame — same as ordinary fast arm.
                             const child_m = ctx.exec_frames.getPtr(ctx.frame_index);
                             child_m.callstatus = 0;
                             self.bc_stack_top = parent_c.base + parent_c.u.lua.frame_cap;
                             ctx.exec_frames.shrinkTo(ctx.frame_index);
                             const parent_m = ctx.exec_frames.getPtr(parent_idx);
-                            if (sr_dst == SIMPLE_RESULT_COMPARE) {
+                            if (parent_m.u.lua.simpleResultIsCompare()) {
                                 // Compare mode: 0 values → false.
                                 const invert = parent_m.u.lua.simpleResultInvert();
                                 parent_m.u.lua.pc += 1;
                                 if (false != invert) parent_m.u.lua.pc += 1;
                             } else {
                                 // Value mode: 0 values → nil.
+                                const sr_dst = parent_m.u.lua.simple_result_dst;
                                 self.bc_stack[parent_c.base + sr_dst] = .Nil;
                                 parent_m.reg_top = @intCast(sr_dst + 1);
                                 parent_m.u.lua.pc += 1;
                             }
-                            parent_m.u.lua.simple_result_dst = SIMPLE_RESULT_NONE;
+                            parent_m.u.lua.clearSimpleResult();
                             return .continue_frame_loop;
                         }
                     }
@@ -14012,10 +14057,10 @@ pub const Vm = struct {
                     const parent_c = ctx.exec_frames.getConstPtr(parent_idx);
                     // Condition (c): parent is a Lua frame.
                     // Condition (e): no pending call.
-                    // P16.7 Task 6: also exclude simple_result (handled below).
+                    // P16.8 Task 1: also exclude simple_result (handled below).
                     if (parent_c.isLua() and
                         parent_c.pending_call_index == INVALID_PENDING and
-                        parent_c.u.lua.simple_result_dst == SIMPLE_RESULT_NONE)
+                        !parent_c.u.lua.hasSimpleResult())
                     {
                         const nresults = decodeNresults(child.callstatus);
                         // Condition (g): fast arm handles nresults==1 (fixed
@@ -14051,29 +14096,28 @@ pub const Vm = struct {
                             return .continue_frame_loop;
                         }
                     }
-                    // P16.7 Task 6: simple_result fast arm. When the return
+                    // P16.8 Task 1: simple_result fast arm. When the return
                     // is from a metamethod child frame with an inline
                     // simple_result completion, inline the pop + single-copy
                     // (value mode) or truthiness check (compare mode) directly,
                     // bypassing completeBytecodeExecFrame entirely. Same
                     // conditions as the ordinary fast arm except
-                    // simple_result_dst != NONE replaces the no-simple_result
-                    // check. simple_result always uses MULTRET (nresults < 0).
+                    // hasSimpleResult() replaces the no-simple_result check.
+                    // simple_result always uses MULTRET (nresults < 0).
                     if (parent_c.isLua() and
                         parent_c.pending_call_index == INVALID_PENDING and
-                        parent_c.u.lua.simple_result_dst != SIMPLE_RESULT_NONE)
+                        parent_c.u.lua.hasSimpleResult())
                     {
                         const nresults = decodeNresults(child.callstatus);
                         if (nresults < 0) {
                             const src_val = ctx.regs[a];
-                            const sr_dst = parent_c.u.lua.simple_result_dst;
                             // Pop child frame — same as ordinary fast arm.
                             const child_m = ctx.exec_frames.getPtr(ctx.frame_index);
                             child_m.callstatus = 0;
                             self.bc_stack_top = parent_c.base + parent_c.u.lua.frame_cap;
                             ctx.exec_frames.shrinkTo(ctx.frame_index);
                             const parent_m = ctx.exec_frames.getPtr(parent_idx);
-                            if (sr_dst == SIMPLE_RESULT_COMPARE) {
+                            if (parent_m.u.lua.simpleResultIsCompare()) {
                                 // Compare mode: check truthiness, adjust pc.
                                 const result = isTruthy(src_val);
                                 const invert = parent_m.u.lua.simpleResultInvert();
@@ -14081,11 +14125,12 @@ pub const Vm = struct {
                                 if (result != invert) parent_m.u.lua.pc += 1;
                             } else {
                                 // Value mode: single-copy into parent register.
+                                const sr_dst = parent_m.u.lua.simple_result_dst;
                                 self.bc_stack[parent_c.base + sr_dst] = src_val;
                                 parent_m.reg_top = @intCast(sr_dst + 1);
                                 parent_m.u.lua.pc += 1;
                             }
-                            parent_m.u.lua.simple_result_dst = SIMPLE_RESULT_NONE;
+                            parent_m.u.lua.clearSimpleResult();
                             return .continue_frame_loop;
                         }
                     }
@@ -39737,4 +39782,65 @@ test "vm: generational GC enters and leaves incremental major mode" {
     try testing.expectEqual(Vm.GcGenPhase.minor, vm.gc_gen_phase);
     try testing.expectEqual(@as(usize, 0), vm.gc_young_objects.items.len);
     try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
+}
+
+// =========================================================================
+// P16.8 Task 2: R254 simple_result regression test.
+//
+// R254 (0xFE) was previously stolen as SIMPLE_RESULT_COMPARE sentinel,
+// making it impossible for a metamethod result to land in R254 — the VM
+// would have misinterpreted value mode as compare mode. This test verifies
+// the new design: R254 is a valid value-mode destination, and the compare
+// flag lives in lua_packed_flags bit 7 (not in simple_result_dst).
+//
+// The old 0xFE design would FAIL this test: setSimpleValueResult(254, .add)
+// would store 0xFE in simple_result_dst, and hasSimpleResult() would check
+// simple_result_dst != 0xFF (true), but simpleResultIsCompare() would check
+// the compare flag bit (false in the old design — 0xFE was the sentinel,
+// not a bit flag). The old code checked `sr_dst == SIMPLE_RESULT_COMPARE`
+// (0xFE), which would have been TRUE, misrouting value mode into compare
+// mode. The new design uses a dedicated bit flag, so 0xFE is just a normal
+// register.
+// =========================================================================
+test "vm: P16.8 R254 is valid simple_result value-mode destination" {
+    const testing = std.testing;
+
+    var frame_state = LuaFrameState{};
+
+    // Initially: no simple result pending.
+    try testing.expect(!frame_state.hasSimpleResult());
+    try testing.expectEqual(@as(u8, 0xFF), frame_state.simple_result_dst);
+
+    // Set value-mode result to R254 (0xFE) — the old sentinel.
+    frame_state.setSimpleValueResult(254, .add);
+    try testing.expect(frame_state.hasSimpleResult());
+    try testing.expect(!frame_state.simpleResultIsCompare());
+    try testing.expectEqual(@as(u8, 254), frame_state.simple_result_dst);
+    try testing.expectEqual(TmsEvent.add, frame_state.simpleResultEvent());
+
+    // Set compare-mode result — dst must be NO_REG (invariant).
+    frame_state.clearSimpleResult();
+    frame_state.setSimpleCompareResult(.lt, true);
+    try testing.expect(frame_state.hasSimpleResult());
+    try testing.expect(frame_state.simpleResultIsCompare());
+    try testing.expectEqual(@as(u8, 0xFF), frame_state.simple_result_dst);
+    try testing.expectEqual(TmsEvent.lt, frame_state.simpleResultEvent());
+    try testing.expect(frame_state.simpleResultInvert());
+
+    // Clear back to NONE.
+    frame_state.clearSimpleResult();
+    try testing.expect(!frame_state.hasSimpleResult());
+    try testing.expectEqual(@as(u8, 0xFF), frame_state.simple_result_dst);
+
+    // Verify R0 and R254 are both valid value-mode destinations.
+    frame_state.setSimpleValueResult(0, .index);
+    try testing.expectEqual(@as(u8, 0), frame_state.simple_result_dst);
+    try testing.expect(!frame_state.simpleResultIsCompare());
+    frame_state.clearSimpleResult();
+
+    frame_state.setSimpleValueResult(254, .len);
+    try testing.expectEqual(@as(u8, 254), frame_state.simple_result_dst);
+    try testing.expect(!frame_state.simpleResultIsCompare());
+    try testing.expectEqual(TmsEvent.len, frame_state.simpleResultEvent());
+    frame_state.clearSimpleResult();
 }

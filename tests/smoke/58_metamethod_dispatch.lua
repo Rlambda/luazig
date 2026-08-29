@@ -313,3 +313,77 @@ do
 end
 
 print("metamethod_dispatch_ok")
+
+-- =========================================================================
+-- I. P16.7 Task 6: simple_result completion edge cases.
+--   I1. metamethod returning no values → nil (value mode)
+--   I2. metamethod returning multiple values → first only (value mode)
+--   I3. __call-valued metamethod
+--   I4. non-callable metamethod error
+--   I5. error traceback name "metamethod 'add'"
+--   I6. __len returning no values → nil
+--   I7. __eq returning no values → false (compare mode)
+--   I8. __lt returning no values → false (compare mode)
+--   I9. yielding __len metamethod (value mode + yield)
+--   I10. yielding __eq metamethod (compare mode + yield)
+-- =========================================================================
+do
+  -- I1: __add returning no values → result is nil.
+  local a = setmetatable({}, {__add = function() return end})
+  print("I1:add_noret", tostring(a + 1))
+
+  -- I2: __add returning multiple values → caller takes first only.
+  local b = setmetatable({}, {__add = function() return 10, 20, 30 end})
+  local r1, r2, r3 = b + 1
+  print("I2:add_multi", tostring(r1), tostring(r2), tostring(r3))
+
+  -- I3: __call-valued metamethod.
+  local c = setmetatable({}, {__call = function(self, x) return x * 2 end})
+  print("I3:call_mm", c(21))
+
+  -- I4: non-callable metamethod → error.
+  local d = setmetatable({}, {__add = 42})
+  local ok, err = pcall(function() return d + 1 end)
+  print("I4:noncall_ok", ok)
+  print("I4:noncall_err", err)
+
+  -- I5: error traceback name "metamethod 'add'".
+  local e = setmetatable({}, {__add = function() error("boom") end})
+  local ok2, err2 = pcall(function() return e + 1 end)
+  print("I5:err_ok", ok2)
+  print("I5:err_msg", err2)
+
+  -- I6: __len returning no values → nil.
+  local f = setmetatable({}, {__len = function() return end})
+  print("I6:len_noret", tostring(#f))
+
+  -- I7: __eq returning no values → false (compare mode).
+  local g = setmetatable({}, {__eq = function() return end})
+  print("I7:eq_noret", g == g)
+
+  -- I8: __lt returning no values → false (compare mode).
+  local h = setmetatable({}, {__lt = function() return end})
+  print("I8:lt_noret", h < h)
+
+  -- I9: yielding __len metamethod (value mode + yield).
+  local co_len = coroutine.create(function()
+    local obj = setmetatable({}, {__len = function()
+      coroutine.yield("len_yield")
+      return 42
+    end})
+    return #obj
+  end)
+  print("I9:len_yield", coroutine.resume(co_len))
+  print("I9:len_result", coroutine.resume(co_len))
+
+  -- I10: yielding __eq metamethod (compare mode + yield).
+  local co_eq = coroutine.create(function()
+    local obj = setmetatable({}, {__eq = function()
+      coroutine.yield("eq_yield")
+      return true
+    end})
+    if obj == obj then return "eq_yes" else return "eq_no" end
+  end)
+  print("I10:eq_yield", coroutine.resume(co_eq))
+  print("I10:eq_result", coroutine.resume(co_eq))
+end

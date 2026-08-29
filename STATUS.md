@@ -35,9 +35,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | _not run_ |
 | Smoke tests (`tests/smoke/*.lua`) | _not run — no smoke JSON provided_ |
 | C API suites (`tests/c_api`) | 18 suites |
-| Performance (geomean vs PUC) | **1.91x** |
+| Performance (geomean vs PUC) | **2.02x** |
 
-Geomean замедления vs PUC Lua: **1.91x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **2.02x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -4436,3 +4436,99 @@ dual-parameter pattern existed in 4 functions and ~30 call sites.
   c_api clean, nextvar 3x, coroutine/gc/closure/events/gengc OK.
 - Perf: no regressions vs baseline.
 - Net code reduction: -79 lines (33 insertions, 79 deletions).
+
+## P16.7 Task 5 — simple_result completion for metamethod calls (2026-08-29)
+
+### Problem
+Metamethod calls (MMBIN/MMBINI/MMBANK/UNM/BNOT/LEN/__index/EQ/LT/LE) always
+went through the `pending_calls` array — a heap-resident `PendingCallSlot`
+(64B) + `BytecodePendingCall` (56B) — even for the overwhelmingly common case
+of "call metamethod, put 1 result into parent register, advance pc".  This
+added allocation pressure, indirection, and per-call bookkeeping for a case
+that PUC Lua handles via `luaD_poscall` + `luaV_execute` + `RETURN` with no
+special continuation state.
+
+### Mechanism
+Added a "simple_result" completion mode stored entirely in the existing
+`LuaFrameState` (0 bytes growth — reused 1 byte of padding):
+
+- **`lua_packed_flags: u8`** replaces `has_open_upvalues: bool`:
+  - bit 0 = `has_open_upvalues`
+  - bit 1 = `simple_result_invert` (for compare mode: invert result)
+  - bits 2-6 = `simple_result_event` (u5, `TmsEvent` enum value)
+  - bit 7 = unused
+- **`simple_result_dst: u8`** uses the former padding byte:
+  - `0x00-0xFD` = parent register index (value mode: 1 result → `regs[dst]`)
+  - `0xFE` = `SIMPLE_RESULT_COMPARE` (compare mode: result → boolean test)
+  - `0xFF` = `SIMPLE_RESULT_NONE` (inactive, normal pending_calls path)
+
+`tryPushSimpleResultMetamethod()` is called at each metamethod call site
+instead of `tryPushBytecodeContinuationCall`.  If the metamethod is a
+Closure with a Proto (the common case), it sets `simple_result_dst` +
+`simple_result_event` on the PARENT frame and calls the metamethod via
+`runClosure` (inline, no pending_calls).  If the metamethod is a builtin or
+the call would yield, it falls back to `tryPushBytecodeContinuationCall`.
+
+On `opReturn0`/`opReturn1`, a fast arm checks `simple_result_dst !=
+SIMPLE_RESULT_NONE`: if value mode, copies the result directly to
+`parent.regs[dst]`; if compare mode, applies the boolean test (with
+optional invert).  No `completeBytecodeExecFrame` pending-call machinery
+is invoked.
+
+`pending_call_index` stays `INVALID_PENDING` when simple_result is active —
+the mechanisms are mutually exclusive (asserted in
+`tryPushBytecodeContinuationCall`).
+
+### Invariants
+1. `simple_result_dst == SIMPLE_RESULT_NONE` ⟹ normal pending_calls path.
+2. `simple_result_dst != SIMPLE_RESULT_NONE` ⟹ `pending_call_index ==
+   INVALID_PENDING` (asserted).
+3. `simple_result_dst` is cleared in `popBytecodeExecFrame` (error-unwind
+   safety) and in `completeBytecodeExecFrame` (normal completion).
+4. Yielding metamethods fall back to pending_calls (simple_result is
+   skipped when `runClosure` returns `error.Yield`).
+5. `SIMPLE_RESULT_COMPARE` (0xFE) and `SIMPLE_RESULT_NONE` (0xFF) are
+   sentinels — value mode uses 0x00-0xFD (max register 253, well above
+   MAXSTACK).
+
+### Call sites redirected
+- **Value mode**: MMBIN, MMBINI, MMBANK, UNM, BNOT, LEN, __index (2 paths)
+- **Compare mode**: EQ, LT/LE (via `slowCmp`)
+
+### Files changed
+- `src/lua/vm.zig` — LuaFrameState, `tryPushSimpleResultMetamethod`,
+  `completeBytecodeExecFrame`, `opReturn0`/`opReturn1` fast arms,
+  `getDebugName`, `popBytecodeExecFrame`, `pushBytecodeExecFrame`,
+  all metamethod call sites, mutual-exclusion assertion
+- `src/lua/tag_method.zig` — `opname()` extended to handle ALL `TmsEvent`
+  variants (was missing index, newindex, gc, mode, call, close)
+- `tests/smoke/58_metamethod_dispatch.lua` — Section I: 10 new test cases
+  (zero returns, multiple returns, __call-valued, non-callable error,
+  error traceback name, __len/__eq/__lt zero-return, yielding __len/__eq)
+
+### A/B perf comparison (7-run median, ReleaseFast, core 0)
+
+| Workload | Before (s) | After (s) | Delta |
+|---|---|---|---|
+| metamethod_call_noalloc | 0.037 | 0.024 | **-35.1%** |
+| metamethod_add | 0.203 | 0.189 | **-6.9%** |
+| lua_calls | 0.203 | 0.197 | -3.0% |
+| geomean (16 workloads) | 1.98x | 1.95x | -1.5% |
+
+No regressions vs baseline (all OK).
+
+### Verification
+| Check | Result |
+|-------|--------|
+| `zig build test` (Debug) | PASS |
+| `zig build test` (ReleaseFast) | PASS |
+| Matrix `--testc` | zig_fail=0, both_fail=1 (big.lua pre-existing) |
+| Smoke tests (58) | 58/58 PASS |
+| C API tests (17) | 17/17 PASS |
+| C API diff tests | DIFF: PASS |
+| mm_check.lua (zig vs PUC) | byte-identical |
+| nextvar 5× | 5/5 PASS |
+| coroutine/gc/closure/events/gengc | all PASS |
+| native_mem_check selftest | PASS |
+| leak_bench | PASS (all within 1.0 KB) |
+| CallFrame size | 104 bytes (unchanged) |

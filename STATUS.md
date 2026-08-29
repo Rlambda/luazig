@@ -1,4 +1,4 @@
-> Last updated: 2026-08-29 (P16.10 — dispatch floor: jump-table verified (computed-goto не диагноз), stack-poll+SIGINT cleanups, 75→70 instr/iter)
+> Last updated: 2026-08-30 (P16.10a — callable non-function metamethod fields: PUC two-stage invocation model, 64/64 smoke)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).

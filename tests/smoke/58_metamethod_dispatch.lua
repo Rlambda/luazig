@@ -337,7 +337,9 @@ do
   local r1, r2, r3 = b + 1
   print("I2:add_multi", tostring(r1), tostring(r2), tostring(r3))
 
-  -- I3: __call-valued metamethod.
+  -- I3: Ordinary callable table (direct __call, NOT a metamethod field).
+  -- Callable non-function metamethod FIELDS are covered in
+  -- 64_callable_metamethods.lua (P16.10a Task 10).
   local c = setmetatable({}, {__call = function(self, x) return x * 2 end})
   print("I3:call_mm", c(21))
 

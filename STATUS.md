@@ -4338,3 +4338,101 @@ dispatch ratio.
 | microbench.lua on PUC lua | rc=0, 18 workloads |
 | Bytecode proof (noalloc ADD+MMBIN) | confirmed (listing above) |
 | No VM behaviour changes | microbench-only + perf tooling |
+
+## P16.7 Task 2 — resolve-once metamethod architecture (2026-08-29, commit 6c48f16)
+
+### Problem
+MMBIN/MMBINI/MMBINK/UNM/BNOT handlers performed 2+ metamethod lookups per
+slow-path invocation: one in `tryPushBytecodeMetamethod` (via
+`getTmByObj`) and another in `callMetamethod` (via `getTmByObj` again).
+PUC Lua resolves the metamethod exactly once in `callbinTM`/`callbinTMres`.
+
+### Changes
+- Added `findBinaryTm(lhs, rhs, event)` and `findUnaryTm(operand, event)`
+  near `getTmByObj` — single-lookup resolution matching PUC `callbinTM`.
+- Added `tryPushResolvedMetamethod(mm, args, event, completion)` near
+  `tryPushBytecodeMetamethod` — takes an already-resolved metamethod Value,
+  fast-filters non-Closure-with-proto, derives opname via
+  `tag_method.opname(event)`.
+- Refactored `callBinaryMetamethod`/`callUnaryMetamethod` to use
+  `findBinaryTm`/`findUnaryTm` (single lookup).
+- Updated MMBIN/MMBINI/MMBINK/UNM/BNOT handlers to resolve once via
+  `findBinaryTm`/`findUnaryTm` → `tryPushResolvedMetamethod` →
+  `callMetamethod` (no re-lookup).
+
+### Results
+- ~10.3% fewer instructions on metamethod_call_noalloc (perf stat).
+- Gates: matrix 32/33 (big.lua both_fail pre-existing), smoke 58/58,
+  c_api clean, nextvar 3x, coroutine/gc/closure/events/gengc OK.
+- Perf: no regressions vs baseline.
+
+## P16.7 Task 3 — repeated-lookup audit: resolve-once in all slow paths (2026-08-29, commit 350fd8f)
+
+### Problem
+After Task 2, MMBIN/UNM/BNOT were resolve-once, but all other metamethod
+slow paths still performed redundant lookups:
+- LEN: 3 lookups (tryPush + callMetamethod + tableLen/error)
+- EQ: 2 lookups (findBinaryTm + callMetamethod)
+- LT/LE/GT/GE: 4 lookups (tryPush + cmpLt/cmpLte re-lookup)
+- INDEX: 3 lookups (tryPush + callResolvedIndexMetamethod + indexValue)
+- NEWINDEX: 3 lookups (tryPush + callResolvedNewIndexMetamethod + setIndexValue)
+
+### Changes
+- **LEN handler**: resolve once via `findUnaryTm`, try push, call
+  synchronously, or `tableBorderLen`/error. 3-lookup → 1-lookup.
+- **EQ handler**: resolve once via `findBinaryTm` for Table/Table and
+  Userdata/Userdata.
+- **LT/LE/LTI/LEI/GTI/GEI handlers**: `slowCmp` helper function resolves
+  once via `findBinaryTm`, pushes or calls synchronously. 4-lookup →
+  2-lookup (tryPush + cmpLt/cmpLte re-lookup eliminated).
+- **INDEX/NEWINDEX**: `bytecodeGetIndex`/`bytecodeSetIndex` helper functions
+  replace inline switch statements at 9 call sites. Return type
+  `TryPushIndexResult` union (`.pushed`/`.not_found`/`.resolved`).
+  `callResolvedIndexMetamethod`/`callResolvedNewIndexMetamethod` helpers
+  for callable mm use `callMetamethod`, for non-callable follow PUC chain
+  via `indexValue`/`setIndexValue` (correct "attempt to index a {type}
+  value" error, matching PUC). 3-lookup → 1-lookup.
+- `errors.lua` test fixed (non-callable `__index=10` now produces correct
+  "attempt to index a number value" error).
+
+### Perf regression fix
+Initial implementation with inline switch statements at INDEX/NEWINDEX
+call sites caused code size increase in dispatch loop → `lua_calls` +7.4%
+and `coroutine_yield` +7.4% (WARN). Fixed by extracting
+`bytecodeGetIndex`/`bytecodeSetIndex` helper functions, reducing dispatch
+loop code size. After fix: `lua_calls` +1.7%, `coroutine_yield` -0.2%.
+
+### Results
+- Gates: matrix 32/33 (big.lua both_fail pre-existing), smoke 58/58,
+  c_api clean, nextvar 3x, coroutine/gc/closure/events/gengc OK.
+- Perf: no regressions vs baseline, metamethod_add -2.9%.
+
+## P16.7 Task 4 — kill redundant event+opname dual params (2026-08-29, commit 8325c1b)
+
+### Problem
+`callBinaryMetamethod` and `callUnaryMetamethod` took both `event:
+TmsEvent` and `opname: []const u8` parameters, even though `opname` is
+derivable from `event` via `tag_method.opname(event)`. This redundant
+dual-parameter pattern existed in 4 functions and ~30 call sites.
+
+### Changes
+- Removed `opname` parameter from `callBinaryMetamethod` — now derives
+  `opname` internally via `tag_method.opname(event)`.
+- Removed `opname` parameter from `callUnaryMetamethod` — same internal
+  derivation.
+- Removed dead code: `tryPushBytecodeBinaryMetamethod` and
+  `tryPushBytecodeUnaryMetamethod` (no callers after Task 3 moved all
+  bytecode metamethod dispatch to `tryPushResolvedMetamethod` via
+  `bytecodeGetIndex`/`bytecodeSetIndex` helpers).
+- Updated all ~30 call sites: `callBinaryMetamethod(lhs, rhs, .add,
+  "add")` → `callBinaryMetamethod(lhs, rhs, .add)`, etc.
+- `callMetamethod` retains its `opname` string parameter — it is the
+  single cold boundary where the debug name is consumed. Callers that
+  pass literal strings (`__gc`, `__tostring`, `__close`, `index`,
+  `newindex`) are not `TmsEvent`-derivable and remain unchanged.
+
+### Results
+- Gates: matrix 32/33 (big.lua both_fail pre-existing), smoke 58/58,
+  c_api clean, nextvar 3x, coroutine/gc/closure/events/gengc OK.
+- Perf: no regressions vs baseline.
+- Net code reduction: -79 lines (33 insertions, 79 deletions).

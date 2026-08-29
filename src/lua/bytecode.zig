@@ -23,7 +23,8 @@ const vm = @import("vm.zig");
 // packed structs are LSB-first, so the bit layout matches PUC's binary format
 // exactly: [C:8 B:8 k:1 A:8 op:7] from MSB to LSB.
 //
-// Registers are u8 (0–255), matching PUC Lua's MAX_FSTACK = 255.
+// Registers are u8 (0–254 valid; 255 = NO_REG sentinel, PUC lopcodes.h:
+// MAX_FSTACK = MAXARG_A = 255, NO_REG = MAX_FSTACK).
 
 pub const Instruction = packed struct(u32) {
     op: u7, // opcode (128 max)
@@ -478,7 +479,7 @@ pub const Proto = struct {
     /// at statement boundaries. Indexed by PC; one byte per instruction.
     live_reg_top: []const u8 = &.{},
 
-    /// Maximum register count (frame capacity). ≤ 255.
+    /// Maximum register count (frame capacity). 0–254 valid (255 = NO_REG).
     maxstacksize: u8,
     /// Number of fixed (named) parameters.
     numparams: u8,

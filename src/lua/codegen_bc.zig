@@ -18,47 +18,45 @@ const ast = @import("ast.zig");
 const bc = @import("bytecode.zig");
 const ltable = @import("ltable.zig");
 const vm = @import("vm.zig");
+const tag_method = @import("tag_method.zig");
+const TmsEvent = tag_method.TmsEvent;
 const TokenKind = @import("token.zig").TokenKind;
 
 // ---------------------------------------------------------------------------
 // PUC ltm.h TMS event numbers for MMBIN C field.
 //
-// PUC Lua 5.5 emits a companion MMBIN/MMBINI/MMBINK instruction after every
+// PUC Lua 5.5 emits a companion MMBIN/MMBINI/MMBANK instruction after every
 // arithmetic and bitwise opcode. The C field carries the TMS event index so
 // the VM knows which metamethod to dispatch when the operands don't support
-// the native operation. luazig's VM handles metamethods inline, so MMBIN is
-// a no-op at runtime — it exists solely for bytecode parity (T.listcode).
+// the native operation. When native arithmetic succeeds (both operands are
+// numeric), the VM skips the companion MMBIN instruction (pc += 1). When it
+// fails (non-numeric operands without coercion path), the VM falls through
+// to the MMBIN instruction, which performs typed TMS dispatch: it reads C
+// to get the `TmsEvent`, looks up the corresponding metamethod on the
+// operand(s), and calls it. If no metamethod is found, the MMBIN handler
+// raises the appropriate type error.
+//
+// The TMS event values are derived from `tag_method.TmsEvent` (the single
+// source of truth, mirroring PUC's `ltm.h:19-43`). The C field is encoded
+// via `@intFromEnum(TmsEvent.<event>)`.
 // ---------------------------------------------------------------------------
 
-const TMS_ADD: u8 = 6;
-const TMS_SUB: u8 = 7;
-const TMS_MUL: u8 = 8;
-const TMS_MOD: u8 = 9;
-const TMS_POW: u8 = 10;
-const TMS_DIV: u8 = 11;
-const TMS_IDIV: u8 = 12;
-const TMS_BAND: u8 = 13;
-const TMS_BOR: u8 = 14;
-const TMS_BXOR: u8 = 15;
-const TMS_SHL: u8 = 16;
-const TMS_SHR: u8 = 17;
-
-/// Map a luazig TokenKind to its PUC TMS event number.
+/// Map a luazig TokenKind to its PUC TmsEvent.
 /// Returns null for non-arithmetic/non-bitwise operators.
-fn tokenToTms(op: TokenKind) ?u8 {
+fn tokenToTms(op: TokenKind) ?TmsEvent {
     return switch (op) {
-        .Plus => TMS_ADD,
-        .Minus => TMS_SUB,
-        .Star => TMS_MUL,
-        .Percent => TMS_MOD,
-        .Caret => TMS_POW,
-        .Slash => TMS_DIV,
-        .Idiv => TMS_IDIV,
-        .Amp => TMS_BAND,
-        .Pipe => TMS_BOR,
-        .Tilde => TMS_BXOR,
-        .Shl => TMS_SHL,
-        .Shr => TMS_SHR,
+        .Plus => .add,
+        .Minus => .sub,
+        .Star => .mul,
+        .Percent => .mod,
+        .Caret => .pow,
+        .Slash => .div,
+        .Idiv => .idiv,
+        .Amp => .band,
+        .Pipe => .bor,
+        .Tilde => .bxor,
+        .Shl => .shl,
+        .Shr => .shr,
         else => null,
     };
 }
@@ -3254,7 +3252,7 @@ pub const Codegen = struct {
                     _ = try self.builder.emitABCk(.shli, dst, lhs_reg, int2sC(lc.ival), true, line);
                     // MMBINI carries the plain TMS event in C (no 0x80 hack).
                     // The flip flag is now in the preceding SHLI's k-bit.
-                    _ = try self.builder.emitABCk(.mmbini, lhs_reg, int2sC(lc.ival), TMS_SHL, true, line);
+                    _ = try self.builder.emitABCk(.mmbini, lhs_reg, int2sC(lc.ival), @intFromEnum(TmsEvent.shl), true, line);
                     return dst;
                 }
             }
@@ -3267,8 +3265,8 @@ pub const Codegen = struct {
         // This is the `finishbinexpneg` pattern (lcode.c:1545).
         // The SHRI's C field carries int2sC(-K); the following MMBINI's B
         // field carries int2sC(K) (the original, non-negated value, so the
-        // metamethod receives the correct operand) and C carries TMS_SHL
-        // (the original event, NOT TMS_SHR — the VM peeks this to dispatch
+        // metamethod receives the correct operand) and C carries TmsEvent.shl
+        // (the original event, NOT TmsEvent.shr — the VM peeks this to dispatch
         // __shl instead of __shr).
         // SHL is NOT commutative, so this cannot go through the commutative
         // swap above. Only applies when RHS is a small int constant.
@@ -3298,8 +3296,8 @@ pub const Codegen = struct {
                         // `R << K` operand order for metamethod dispatch.
                         _ = try self.builder.emitABCk(.shri, dst, lhs_reg, int2sC(negated), false, line);
                         // MMBINI: B = int2sC(K) (original value for metamethod),
-                        // C = TMS_SHL (original event), k = 0 (no flip).
-                        _ = try self.builder.emitABCk(.mmbini, lhs_reg, int2sC(nc.ival), TMS_SHL, false, line);
+                        // C = TmsEvent.shl (original event), k = 0 (no flip).
+                        _ = try self.builder.emitABCk(.mmbini, lhs_reg, int2sC(nc.ival), @intFromEnum(TmsEvent.shl), false, line);
                         return dst;
                     }
                 }
@@ -3326,7 +3324,8 @@ pub const Codegen = struct {
                     // The B field carries the same operand encoding as the arithmetic
                     // opcode's C field: int2sC(ival) for I-variants, K index for K-variants.
                     // The C field carries the TMS event number for metamethod dispatch.
-                    // luazig's VM treats these as no-ops (metamethods are handled inline).
+                    // When native arithmetic succeeds, the VM skips the MMBIN instruction;
+                    // when it fails, the MMBIN handler dispatches the typed metamethod.
                     // Determine MMBIN variant from the LAST EMITTED instruction's
                     // opcode, NOT from the original NumConst. tryEmitConstBinOp may
                     // intern a small integer constant (e.g. `x * -127`) producing a
@@ -3356,10 +3355,10 @@ pub const Codegen = struct {
                                 int2sC(nc.ival)
                             else
                                 last_inst.c;
-                            _ = try self.builder.emitABCk(.mmbini, lhs_reg, b_field, event, flip, line);
+                            _ = try self.builder.emitABCk(.mmbini, lhs_reg, b_field, @intFromEnum(event), flip, line);
                         } else {
                             // K-variant: B = constant pool index (same as opcode's C).
-                            _ = try self.builder.emitABCk(.mmbink, lhs_reg, last_inst.c, event, flip, line);
+                            _ = try self.builder.emitABCk(.mmbink, lhs_reg, last_inst.c, @intFromEnum(event), flip, line);
                         }
                     }
                     return dst;
@@ -3388,9 +3387,10 @@ pub const Codegen = struct {
             _ = try self.builder.emitABCk(op, dst, lhs_reg, rhs_reg, flip, line);
             // PUC 5.5: emit MMBIN after each arithmetic/bitwise opcode.
             // The C field carries the TMS event number for metamethod dispatch.
-            // luazig's VM treats MMBIN as a no-op (metamethods are handled inline).
+            // When native arithmetic succeeds, the VM skips MMBIN (pc += 1);
+            // when it fails, MMBIN dispatches the typed metamethod lookup.
             if (tokenToTms(n.op)) |event| {
-                _ = try self.builder.emitABC(.mmbin, lhs_reg, rhs_reg, event, line);
+                _ = try self.builder.emitABC(.mmbin, lhs_reg, rhs_reg, @intFromEnum(event), line);
             }
             return dst;
         }

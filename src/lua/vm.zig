@@ -80,13 +80,8 @@ pub fn restoreSigintHandler() void {
 // rehash); the VM owns all the policy around array-part promotion and GC.
 const ltable = @import("ltable.zig");
 const diag = @import("diag.zig");
-
-// PUC TMS event numbers (ltm.h:TM_SH, ltm.h:TM_SHR). Used by the SHRI
-// handler to peek the following MMBINI and determine whether the shift
-// encodes a genuine `>>` (TMS_SHR) or a `<<` transformed via
-// finishbinexpneg (TMS_SHL). Must match the constants in codegen_bc.zig.
-const TMS_SUB: u8 = 7;
-const TMS_SHL: u8 = 16;
+const tag_method = @import("tag_method.zig");
+const TmsEvent = tag_method.TmsEvent;
 
 // ---------------------------------------------------------------------------
 // setjmp/longjmp error boundary for C extension functions (Task B2).
@@ -2622,61 +2617,14 @@ fn gcCanFinalize(obj: GcObject) bool {
     };
 }
 
-/// PUC Lua tag-method events (`ltm.h:18-45`). The ordering MUST match PUC
-/// exactly: only events `<= .eq` are cached in `Table.flags` (PUC
-/// `checknoTM` / `gfasttm`, `ltm.h:63-68`). Events above `.eq` (arithmetic,
-/// comparison, call, close) are NOT cached — they always do a hash lookup.
+/// `TmsEvent` and `opname` are imported from `tag_method.zig` — the single
+/// source of truth for the PUC TMS enum (`ltm.h:19-43`) and its debug
+/// opname strings. See `tag_method.zig` for the enum definition and the
+/// `isFastCached` / `opname` helpers.
 ///
 /// Non-TMS metafields (`__pairs`, `__tostring`, `__name`, `__metatable`) are
-/// NOT part of this enum — PUC handles them via `luaL_getmetafield` (direct
-/// string lookup), not via `tmname[]`. They live in `MetaField` below.
-const TmsEvent = enum(u5) {
-    index = 0, // __index
-    newindex = 1, // __newindex
-    gc = 2, // __gc
-    mode = 3, // __mode
-    len = 4, // __len
-    eq = 5, // __eq — last "fast" (cached) event
-    // Non-cached events follow (not stored in flags bitfield):
-    add,
-    sub,
-    mul,
-    mod,
-    pow,
-    div,
-    idiv,
-    band,
-    bor,
-    bxor,
-    shl,
-    shr,
-    unm,
-    bnot,
-    lt,
-    le,
-    concat,
-    call,
-    close,
-};
-
-/// PUC ltm.c:luaT_eventname[] — short opname strings for debug/traceback.
-/// Used ONLY on the cold metamethod path (MMBIN/UNM/BNOT handlers) to set
-/// the debug name of the child frame. The hot arithmetic fast path carries
-/// no string at all. This is the SINGLE derivation point for opname strings
-/// from TmsEvent (P16.6 Task 4+5+6 requirement: "ONE opname-string
-/// derivation from the enum for debug/traceback only where needed").
-fn tmsEventOpname(event: TmsEvent) []const u8 {
-    return switch (event) {
-        .add => "add",     .sub => "sub",     .mul => "mul",
-        .mod => "mod",     .pow => "pow",     .div => "div",
-        .idiv => "idiv",   .band => "band",   .bor => "bor",
-        .bxor => "bxor",   .shl => "shl",     .shr => "shr",
-        .unm => "unm",     .bnot => "bnot",
-        .concat => "concat", .len => "len",   .eq => "eq",
-        .lt => "lt",       .le => "le",
-        else => "metamethod",
-    };
-}
+/// NOT part of the TMS enum — PUC handles them via `luaL_getmetafield`
+/// (direct string lookup), not via `tmname[]`. They live in `MetaField` below.
 
 /// Non-TMS metafields — metamethod names that PUC Lua does NOT include in
 /// the `TMS` enum (`ltm.h:18-45`). PUC handles these via `luaL_getmetafield`
@@ -2695,17 +2643,17 @@ const MetaField = enum(u8) {
     metatable, // __metatable (lbaselib.c:134 via luaL_getmetafield)
 };
 
-/// Maximum event index cached in `Table.flags`. Matches PUC's
-/// `TM_FAST_MAX` boundary (events <= TM_EQ use the flags cache).
-const TM_FAST_MAX: u5 = @intFromEnum(TmsEvent.eq);
-
 /// PUC BITRAS-style metamethod cache. Bit set (1) = "this table does NOT
 /// have the corresponding metamethod field". All bits start set (no
 /// metamethods). Cleared on new-key insertion to force re-check.
-/// Checked before hash lookup in `fasttm` / `indexValueDepth` /
+/// Checked before hash lookup in `fastTm` / `indexValueDepth` /
 /// `tryPushBytecode*Metamethod`.
 /// Mirrors lua-5.5.0/src/ltm.h:54 (`maskflags`, `checknoTM`,
 /// `invalidateTMcache`) and lua-5.5.0/src/ltable.h:23.
+///
+/// Only events in the "fast access" zone (`tag_method.isFastCached`,
+/// i.e. index..eq) participate in the flags cache. Events above `.eq`
+/// always do a full hash lookup.
 const TableFlags = struct {
     pub const TM_INDEX: u8 = 1 << @intFromEnum(TmsEvent.index);
     pub const TM_NEWINDEX: u8 = 1 << @intFromEnum(TmsEvent.newindex);
@@ -2716,7 +2664,8 @@ const TableFlags = struct {
     /// All fast-access metamethod bits. Bits set = "no metamethods present".
     pub const MASK: u8 = 0x3F;
 
-    /// Return the bit for a cached event. Only valid for events <= TM_FAST_MAX.
+    /// Return the bit for a cached event. Only valid for fast-cached
+    /// events (index..eq, see `tag_method.isFastCached`).
     pub fn bit(event: TmsEvent) u8 {
         return @as(u8, 1) << @intCast(@intFromEnum(event));
     }
@@ -3013,9 +2962,9 @@ pub const Vm = struct {
     /// Used by `fastTm`/`getTm` for pointer-identity key comparison (avoids
     /// `internStrAssume` hashmap lookup on every metamethod check).
     /// Populated in `Vm.init` after `string_intern` is ready.
-    /// Entries for events <= TM_FAST_MAX are the 6 cached metamethods;
-    /// entries above are for non-cached events (still useful for key
-    /// comparison in `getTm` lookups).
+    /// Entries for fast-cached events (index..eq) are the 6 cached
+    /// metamethods; entries above are for non-cached events (still useful
+    /// for key comparison in `getTm` lookups).
     tm_names: [@typeInfo(TmsEvent).@"enum".fields.len]?*LuaString =
         [_]?*LuaString{null} ** @typeInfo(TmsEvent).@"enum".fields.len,
     /// Pre-interned non-TMS metafield name strings, indexed by `MetaField`.
@@ -12499,7 +12448,7 @@ pub const Vm = struct {
                     // ADDI: R[A] = R[B] + sC  (sC = C - 127, signed 8-bit)
                     // Also used for `x - K` via finishbinexpneg: the subtraction
                     // is coded as `x + (-K)`, with the following MMBINI carrying
-                    // TMS_SUB (not TMS_ADD) and B = int2sC(K) (original K).
+                    // TmsEvent.sub (not .add) and B = int2sC(K) (original K).
                     // The MMBINI handler decodes the correct event + operands;
                     // ADDI just computes R[B] + sC and falls through on failure.
                     .addi => {
@@ -12768,7 +12717,7 @@ pub const Vm = struct {
                     // SHRI: R[A] = R[B] >> sC  (sC = C - 127)
                     // Also used for `x << K` via finishbinexpneg: the shift is
                     // coded as `x >> (-K)`, with the following MMBINI carrying
-                    // TMS_SHL (not TMS_SHR). The MMBINI handler decodes the
+                    // TmsEvent.shl (not .shr). The MMBINI handler decodes the
                     // correct event + operands; SHRI just computes R[B] >> sC
                     // and falls through on failure.
                     .shri => {
@@ -12816,7 +12765,7 @@ pub const Vm = struct {
                             lhs,
                             rhs,
                             event,
-                            tmsEventOpname(event),
+                            tag_method.opname(event),
                             .{ .value = .{ .dst = pi.a } },
                         )) {
                             continue :frame_loop;
@@ -12826,7 +12775,7 @@ pub const Vm = struct {
                         // callMetamethod produces PUC's call error for
                         // non-callable values (luaG_callerror).
                         exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                        const result = try self.callMetamethod(tm.?, tmsEventOpname(event), &.{ lhs, rhs });
+                        const result = try self.callMetamethod(tm.?, tag_method.opname(event), &.{ lhs, rhs });
                         ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                         ctx.regs[pi.a] = result;
                     },
@@ -12852,13 +12801,13 @@ pub const Vm = struct {
                             lhs,
                             rhs,
                             event,
-                            tmsEventOpname(event),
+                            tag_method.opname(event),
                             .{ .value = .{ .dst = pi.a } },
                         )) {
                             continue :frame_loop;
                         }
                         exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                        const result = try self.callMetamethod(tm.?, tmsEventOpname(event), &.{ lhs, rhs });
+                        const result = try self.callMetamethod(tm.?, tag_method.opname(event), &.{ lhs, rhs });
                         ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                         ctx.regs[pi.a] = result;
                     },
@@ -12886,13 +12835,13 @@ pub const Vm = struct {
                             lhs,
                             rhs,
                             event,
-                            tmsEventOpname(event),
+                            tag_method.opname(event),
                             .{ .value = .{ .dst = pi.a } },
                         )) {
                             continue :frame_loop;
                         }
                         exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                        const result = try self.callMetamethod(tm.?, tmsEventOpname(event), &.{ lhs, rhs });
+                        const result = try self.callMetamethod(tm.?, tag_method.opname(event), &.{ lhs, rhs });
                         ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                         ctx.regs[pi.a] = result;
                     },
@@ -12920,14 +12869,14 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 val,
                                 .unm,
-                                tmsEventOpname(.unm),
+                                tag_method.opname(.unm),
                                 a,
                             )) {
                                 continue :frame_loop;
                             }
                             // Not a bytecode Closure — call synchronously.
                             exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                            const result = try self.callMetamethod(tm.?, tmsEventOpname(.unm), &.{ val, val });
+                            const result = try self.callMetamethod(tm.?, tag_method.opname(.unm), &.{ val, val });
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -12958,14 +12907,14 @@ pub const Vm = struct {
                                     ctx.frame_index,
                                     val,
                                     .bnot,
-                                    tmsEventOpname(.bnot),
+                                    tag_method.opname(.bnot),
                                     a,
                                 )) {
                                     continue :frame_loop;
                                 }
                                 // Not a bytecode Closure — call synchronously.
                                 exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                                const result = try self.callMetamethod(tm.?, tmsEventOpname(.bnot), &.{ val, val });
+                                const result = try self.callMetamethod(tm.?, tag_method.opname(.bnot), &.{ val, val });
                                 ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                                 ctx.regs[a] = result;
                             }
@@ -31151,7 +31100,7 @@ pub const Vm = struct {
 
         if (args.len < 1) {
             return self.fail("attempt to {s} a '{s}' with a '{s}'", .{
-                tmsEventOpname(event), "no value", "no value",
+                tag_method.opname(event), "no value", "no value",
             });
         }
 
@@ -31178,7 +31127,7 @@ pub const Vm = struct {
         if (rhs != .String) {
             if (self.getTmByObj(rhs, event)) |mm| {
                 // Call rhs's metamethod with (lhs, rhs) in source order.
-                const result = try self.callMetamethod(mm, tmsEventOpname(event), args);
+                const result = try self.callMetamethod(mm, tag_method.opname(event), args);
                 const outs_fresh = self.refreshBuiltinOuts() orelse outs;
                 outs_fresh[0] = result;
                 return;
@@ -31188,7 +31137,7 @@ pub const Vm = struct {
         // Error: "attempt to {opname} a '{typename(lhs)}' with a '{typename(rhs)}'"
         // PUC uses luaL_typename (plain type name, NOT __name).
         return self.fail("attempt to {s} a '{s}' with a '{s}'", .{
-            tmsEventOpname(event),
+            tag_method.opname(event),
             lhs.typeName(),
             rhs.typeName(),
         });
@@ -32710,8 +32659,9 @@ pub const Vm = struct {
     /// lookup. Otherwise does `getTm` on the metatable. On miss (field is nil),
     /// sets the bit (cache-on-miss) so subsequent calls skip the lookup.
     ///
-    /// ONLY valid for events `<= TM_FAST_MAX` (index, newindex, gc, mode, len,
-    /// eq). For non-cached events (add..close), use `getTm` or `getTmByObj`.
+    /// ONLY valid for fast-cached events (index..eq, see
+    /// `tag_method.isFastCached`). For non-cached events (add..close),
+    /// use `getTm` or `getTmByObj`.
     /// This mirrors PUC's `gfasttm` which is only called with events <= TM_EQ.
     fn fastTm(self: *Vm, mt: *Table, event: TmsEvent) ?Value {
         const bit = TableFlags.bit(event);

@@ -4212,3 +4212,53 @@ Permanent differential smoke covering verifier sections A–H:
 | Debug build (0xaa/panic sanity) | PASS (no panic, output matches) |
 | ReleaseFast rebuild + re-verify | PASS |
 | Full smoke_compare | 58 passes; 29 + 45_userdata_capi pre-existing (unrelated) |
+
+## P16.7 — shared tag_method.zig TmsEvent source of truth (2026-08-29, verifier P16.7 Task 0)
+
+### Problem
+`vm.zig` had a local `TmsEvent = enum(u5)` while `codegen_bc.zig` independently
+defined 12 numeric `TMS_*: u8` constants (`TMS_ADD=6`..`TMS_SHR=17`), plus
+`vm.zig` had its own `TMS_SUB`/`TMS_SHL` constants with "must match the
+constants in codegen_bc.zig" comments. Additionally, codegen_bc.zig had stale
+comments claiming "MMBIN is a no-op at runtime" / "treats MMBIN as a no-op" —
+false since P16.6 where the MMBIN family became semantic handlers.
+
+### Fix
+- **Created `src/lua/tag_method.zig`** — dependency-free module containing:
+  - `pub const TmsEvent = enum(u5)` with the exact PUC 5.5 order (verified
+    against vendored `lua-5.5.0/src/ltm.h:19-43`).
+  - `pub fn isFastCached(e) bool` — events index..eq (the PUC table-flags zone).
+  - `pub fn opname(e) []const u8` — PUC debug names (moved from vm.zig's
+    `tmsEventOpname`).
+- **vm.zig**: imports `TmsEvent` from `tag_method.zig`; removed local enum,
+  `TMS_SUB`/`TMS_SHL` constants, `TM_FAST_MAX` constant, `tmsEventOpname`
+  function; all `tmsEventOpname` calls → `tag_method.opname`; comments updated
+  to reference `TmsEvent.sub`/`TmsEvent.shl` instead of `TMS_SUB`/`TMS_SHL`.
+- **codegen_bc.zig**: imports `TmsEvent` from `tag_method.zig`; deleted all 12
+  `TMS_*` numeric constants; `tokenToTms` returns `?TmsEvent` (type-safe); C
+  fields encoded via `@intFromEnum(TmsEvent.<event>)`; two stale no-op comments
+  replaced with accurate PUC model description (arith succeeds → skip MMBIN;
+  fails → MMBIN dispatches typed metamethod).
+- **root.zig**: added `tag_method` to `internal` struct + test block.
+- **`MetaField`** stays VM-local (no cross-module consumer — not moved).
+
+### Deletions
+- vm.zig: 2 `TMS_*` constants + 1 "must match" comment block + `TM_FAST_MAX`
+  constant + `tmsEventOpname` function (12 lines) + local `TmsEvent` enum
+  (28 lines).
+- codegen_bc.zig: 12 `TMS_*` numeric constants + stale no-op comment block +
+  2 stale inline no-op comments.
+
+### Verification
+| Check | Result |
+|-------|--------|
+| `zig build test -Doptimize=Debug` | PASS |
+| `zig build test -Doptimize=ReleaseFast` | PASS |
+| `make -C tests/c_api clean test test-diff` | PASS (DIFF: PASS) |
+| `python3 tools/testes_matrix.py --testc` | zig_fail=0 |
+| Smoke tests (58) | 58/58 PASS |
+| nextvar 3× stability | 3/3 PASS |
+| Bytecode listing `a+b` (before vs after) | IDENTICAL (MMBIN C=6) |
+| Bytecode listing `a-5` (before vs after) | IDENTICAL (MMBINI C=7) |
+| Bytecode listing `a<<2` (before vs after) | IDENTICAL (MMBINI C=16) |
+| mm_check.lua (zig vs PUC) | byte-identical |

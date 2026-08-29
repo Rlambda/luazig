@@ -20591,26 +20591,146 @@ pub const Vm = struct {
         }
     }
 
-    inline fn gcTableWriteBarrier(self: *Vm, table: *Table, key: Value, value: Value) DispatchError!void {
+    // ─────────────────────────────────────────────────────────────────
+    // PUC-faithful table write barriers (Task 4 — semantic model)
+    // ─────────────────────────────────────────────────────────────────
+    //
+    // PUC Lua has TWO distinct barrier events for table writes, each with a
+    // different operand:
+    //
+    // 1. EXISTING-SLOT UPDATE (luaV_finishfastset, lvm.h:105):
+    //    When a table slot (hash or array) that already holds a value is
+    //    overwritten, the KEY is already owned by the table — no new key
+    //    reference was created. Only the VALUE might be a new young/white
+    //    reference into an old/black table. PUC barriers the TABLE (backward)
+    //    based on the VALUE only:
+    //      luaV_finishfastset(L, t, v) = luaC_barrierback(L, gcvalue(t), v)
+    //    where luaC_barrierback(L, p, v) =  (lgc.h:251)
+    //      iscollectable(v) ? luaC_objbarrierback(L, p, gcvalue(v)) : no-op
+    //    and luaC_objbarrierback(L, p, o) =  (lgc.h:248)
+    //      (isblack(p) && iswhite(o)) ? luaC_barrierback_(L, p) : no-op
+    //
+    // 2. NEW-KEY INSERTION (luaH_newkey, ltable.c:922):
+    //    When a NEW key is inserted into the hash part, the KEY is a new
+    //    reference into the table. PUC barriers the TABLE based on the KEY:
+    //      luaH_newkey → luaC_barrierback(L, obj2gco(t), key)
+    //    The surrounding luaV_finishset then barriers the VALUE:
+    //      luaV_finishset → luaC_barrierback(L, obj2gco(h), val)
+    //    Both barrier the same table — the second is naturally idempotent
+    //    (luaC_barrierback_ checks if already in grayagain via age state).
+    //
+    // 3. NIL/ABSENT ASSIGNMENT:
+    //    No barrier at all — no new reference is created. PUC luaH_newkey
+    //    skips entirely when value is nil ("do not insert nil values").
+    //
+    // PUC macro shape: `iscollectable(v) ? real : no-op` — primitive values
+    // (Int/Num/Bool/Nil/Builtin/LightUserdata) exit BEFORE any collector-phase
+    // work. This is the critical fast path: the vast majority of table writes
+    // store primitive values (counters, flags, numeric indices), and these
+    // must never enter GC-mode logic or call gcValueAge/gcIsBlack.
+    //
+    // OOM/transactional safety (Task 9 — CRITICAL):
+    // PUC's barriers are infallible (intrusive linked lists — linkobjgclist
+    // just sets a pointer). Luazig's barriers can FAIL (allocator append to
+    // gc_grayagain). The safe order is: PREPARE the barrier (the fallible
+    // part: grayagain append) BEFORE the store. No Lua/GC can run between
+    // the barrier and the store (we're inside a single VM instruction
+    // handler with no allocation points between them). If the barrier fails,
+    // the store must NOT happen — the table must not hold an unremembered
+    // new reference. If the barrier succeeds and a LATER operation fails,
+    // the extra grayagain entry is harmless (conservatively grayer — the
+    // table will be re-traversed even though the store may not have happened,
+    // which is safe wasted work, not a correctness violation).
+    //
+    // Invariant: every call site MUST call the barrier BEFORE the store.
+    // Proof per call site (verified in Commits 2+3):
+    //   - Opcode fast paths (SETTABUP/SETTABLE/SETFIELD/SETI):
+    //     barrier → node.value = val (or tbl.array[k] = val). No allocation
+    //     between barrier and store. ✓
+    //   - rawSet existing-slot: barrier → node.value = val. ✓
+    //   - rawSet new-key: barrier → nodeInsert (no allocation — hash part
+    //     already has room) → set value. If rehash is needed, barrier is
+    //     called again after rehash (the rehashed table may have a different
+    //     mark state). ✓
+    //   - rawSet array: barrier → tbl.array[k] = val. ✓
+    // ─────────────────────────────────────────────────────────────────
 
+    /// PUC `luaV_finishfastset(L, t, v)` = `luaC_barrierback(L, gcvalue(t), v)`.
+    /// Existing-slot update barrier: barrier the TABLE (backward) based on the
+    /// VALUE only. The key is already owned by the table (found by lookup),
+    /// so no key barrier is needed.
+    ///
+    /// Fast exit: `GcObject.fromValue(value)` returns null for primitive values
+    /// (Int/Num/Bool/Nil/Builtin/LightUserdata) — they exit BEFORE any GC-mode
+    /// or phase check. No gcValueAge call, no gcIsBlack check, no phase
+    /// comparison. This is the PUC `iscollectable(v)` fast exit.
+    ///
+    /// OOM safety: the barrier (grayagain append) is called BEFORE the store.
+    /// If it fails, the store must not happen. See the invariant comment above.
+    inline fn gcTableBarrierBackValue(self: *Vm, table: *Table, value: Value) DispatchError!void {
+        const child = GcObject.fromValue(value) orelse return; // PUC iscollectable(v)
+        try self.gcTableBarrierBackSlow(table, child);
+    }
+
+    /// PUC `luaH_newkey` → `luaC_barrierback(L, obj2gco(t), key)`.
+    /// New-key insertion barrier: barrier the TABLE (backward) based on the
+    /// KEY. The key is a NEW reference into the table — if the table is old/
+    /// black and the key is young/white, the table must be re-traversed.
+    ///
+    /// Same fast-exit and OOM-safety semantics as gcTableBarrierBackValue.
+    inline fn gcTableBarrierBackNewKey(self: *Vm, table: *Table, key: Value) DispatchError!void {
+        const child = GcObject.fromValue(key) orelse return; // PUC iscollectable(v)
+        try self.gcTableBarrierBackSlow(table, child);
+    }
+
+    /// Shared slow path for both gcTableBarrierBackValue and
+    /// gcTableBarrierBackNewKey. This is the ONE place where gray/age
+    /// mutation + grayagain append happens for table write barriers. PUC
+    /// `luaC_objbarrierback` → `luaC_barrierback_` (incremental) or
+    /// `luaC_barrierback_` (generational).
+    ///
+    /// `noinline` to keep the inline callers small — the slow path is only
+    /// reached when the value/key is collectable AND the table is old/black
+    /// AND the child is young/white (a rare event in steady state).
+    ///
+    /// Uses the DIRECT *Table owner: `gcRememberObject(.{ .table = table })`
+    /// — no Value→GcObject→Table round-trip (Task 7). Age/transition logic
+    /// is centralized here and in `gcRememberObject` only.
+    fn gcTableBarrierBackSlow(self: *Vm, table: *Table, child: GcObject) DispatchError!void {
+        // Generational mode: PUC luaC_barrierback → luaC_objbarrierback →
+        // luaC_barrierback_ (lgc.c:268). When an old table gets a young
+        // value/key, remember the table for re-traversal in the next minor
+        // cycle. Do NOT mark the child — weak value pruning needs it to
+        // stay white.
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
-            // Generational mode: age-based remember. When an old table gets
-            // a young value, remember the table for re-traversal. Do NOT
-            // mark the value — weak value pruning needs it to stay white.
             if (table.gc_age.isOld()) {
-                const key_young = if (gcValueAge(key)) |age| age.isYoung() else false;
-                const value_young = if (gcValueAge(value)) |age| age.isYoung() else false;
-                if (key_young or value_young) {
-                    try self.gcRememberValue(.{ .Table = table });
+                const child_age = gcPtr(child).age.*;
+                if (child_age.isYoung()) {
+                    try self.gcRememberObject(.{ .table = table });
                 }
             }
             return;
         }
-        // Incremental mode: PUC backward barrier (turn owner gray, add to
-        // grayagain). The value is NOT marked — this keeps newly created
-        // objects white and allows weak value pruning.
-        try self.gcWriteBarrierTable(table, key);
-        try self.gcWriteBarrierTable(table, value);
+        // Incremental mode: PUC luaC_objbarrierback — isblack(p) && iswhite(o).
+        // The value is NOT marked — this keeps newly created objects white and
+        // allows weak value pruning (same as gcWriteBarrierTable).
+        if (self.gc_state == .pause) return;
+        if (!gcIsBlack(table.gc_marked)) return;
+        if (!gcIsWhite(gcPtr(child).marked.*)) return;
+        // Backward barrier: turn owner gray, add to grayagain.
+        gcSetGray(&table.gc_marked);
+        try self.gc_grayagain.append(self.alloc, .{ .table = table });
+    }
+
+    /// DEPRECATED shim — replaced by gcTableBarrierBackValue +
+    /// gcTableBarrierBackNewKey. Kept temporarily during migration of call
+    /// sites in Commits 2+3. Delete after all callers are converted.
+    /// Calls the new typed barriers: key → gcTableBarrierBackNewKey,
+    /// value → gcTableBarrierBackValue. Both barrier the same table, so the
+    /// second is a no-op if the first already added it to grayagain.
+    inline fn gcTableWriteBarrier(self: *Vm, table: *Table, key: Value, value: Value) DispatchError!void {
+        try self.gcTableBarrierBackNewKey(table, key);
+        try self.gcTableBarrierBackValue(table, value);
     }
 
     fn gcDrainGray(self: *Vm) DispatchError!void {

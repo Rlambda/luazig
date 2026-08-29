@@ -4726,10 +4726,27 @@ No exceptions: `closeManagedFile` no longer touches finalizer registration
 | Check | Result |
 |-------|--------|
 | Matrix `--testc` | 31/32 pass (zig_fail=0, both_fail=1 big.lua pre-existing) |
-| Smoke tests (61) | 61/61 PASS |
+| Smoke tests (62) | 62/62 PASS |
 | C API tests (17) | 17/17 PASS + DIFF: PASS |
 | nextvar 3× | 3/3 PASS |
 | native_mem | BOUNDED |
+
+### Commit 3 — R254 permanent regression test
+
+`tests/smoke/62_r254_captured_local_arith.lua`: 198 ordinary locals (R0-R197)
++ `local box` (R198) + `local function f() return box end` (R199, captures
+box) = 200 locals (PUC MAXVARS=200). Call `f(1,2,...,53, box+box)` — 54 args,
+f at R200, args at R201-R254. PUC luac emits `ADD 254 198 198; MMBIN 198 198 6`
+— ADD dest = R254, the maximum valid register.
+
+Old temp-MOVE implementation fails: `dischargeVars(.local)` allocates a temp
+for captured `box`, pushing freereg to 255 (MAX_FSTACK), then the second `box`
+operand triggers "too many registers" (freereg+1 = 256 > 255). Verified:
+```
+zig-out/bin/luazig: tests/smoke/62_r254_captured_local_arith.lua:208: too many registers
+```
+New implementation (Commit 2) passes: captured local uses its register
+directly, no temp MOVE, ADD writes to R254 as PUC does.
 
 ### Commit 2 — remove stale captured-local workarounds
 

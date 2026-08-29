@@ -1,4 +1,4 @@
-> Last updated: 2026-08-29 (P16.8a Task 5 — transactional simple_result setup)
+> Last updated: 2026-08-29 (P16.8a Task 7 — global_arith per-opcode decomposition)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -4911,3 +4911,67 @@ Verified: test FAILS when errdefer is temporarily disabled (stale
 - c_api test + test-diff: PASS
 - coroutine --testc: PASS
 - nextvar 3x: PASS
+
+## P16.8a Task 7 — global_arith per-opcode decomposition (2026-08-29)
+
+### Method
+
+Isolated single-opcode workloads at N=1B under `perf stat -e instructions`
+(forloop_only, int_arith, gettabup_only, settabup_only) + `luazig --stats`
+per-opcode histogram + `perf record`/`annotate` of the hot loop. Per-opcode
+(dispatch+handler) costs derived by subtracting the forloop_only baseline and
+cross-checking against the global_arith total (430 zig / 208 puc instr/iter).
+
+Artifact: `tools/perf/current-global-arith-decomposition.json` (regenerable
+via `python3 tools/perf_global_arith_decomp.py`).
+
+### Per-opcode instruction table
+
+| Opcode    | Zig  | PUC  | Delta | Ratio | % of inflation |
+|-----------|------|------|-------|-------|----------------|
+| SETTABUP  | 184  | 80   | 104   | 2.30x | 46.8%          |
+| FORLOOP   | 75   | 28   | 47    | 2.68x | 21.2%          |
+| GETTABUP  | 113  | 68   | 45    | 1.66x | 20.3%          |
+| ADD       | 58   | 32   | 26    | 1.81x | 11.7%          |
+| **Total** | 430  | 208  | 222   | 2.07x | 100%           |
+
+(PUC ADD includes MMBIN no-op; PUC total = 5 opcodes/iter vs zig 4.)
+
+### Top-3 instruction-inflation contributors
+
+1. **SETTABUP (46.8%, 2.30x)** — `gcTableWriteBarrier` makes outlined function
+   calls (`gcValueAge` ×2, `gcRememberValue` ×1) on every SETTABUP, even for
+   integer values. PUC's barrier is a single inline `iscollectable(val)` check
+   → 1 branch (false for integers). Secondary: 16-byte Value spills to stack
+   before the calls (14.38% hot annotate line `vmovaps`).
+   *Fix direction:* inline the barrier — check `Value` tag inline, skip
+   `gcRememberValue` for non-collectable values without any function call.
+   *ROI:* SETTABUP 184→~120 → global_arith 430→~366 → ratio 2.07x→~1.76x.
+   Affects ~5 of 16 workloads.
+
+2. **FORLOOP (21.2%, 2.68x)** — Dispatch overhead dominates (D≈60 vs Dp≈15).
+   FORLOOP handler itself is ~15 instr (similar to PUC). The 4x dispatch
+   overhead comes from `switch`+`continue` (single branch target) vs PUC's
+   computed gotos (per-handler branch target → better BTB prediction).
+   *Fix direction:* reduce dispatch overhead — tighten fetch/decode/gating
+   sequence, or Zig equivalent of computed goto.
+   *ROI:* D 60→~30 → every opcode saves ~30 instr → global_arith 430→~310 →
+   ratio 2.07x→~1.49x. Affects ~12 of 16 workloads (highest breadth).
+
+3. **GETTABUP (20.3%, 1.66x)** — `nodeLookupStr` has more branches than PUC's
+   `luaH_getshortstr`: is_short checks (×2), external vs inline string path,
+   key_tt == .string tag check. For interned short strings (common case), PUC
+   does a single pointer comparison after one hash+index.
+   *Fix direction:* specialize for interned-short-string case (skip is_short
+   checks for constant string keys from resolved_values).
+   *ROI:* GETTABUP 113→~90 → global_arith 430→~407 → ratio 2.07x→~1.96x.
+   Affects ~5 of 16 workloads.
+
+### Frame-push verdict
+
+**NO** — frame-push (`pushBytecodeExecFrame`/`syncFrame`) is NOT the right
+next target for global_arith. The loop body has NO function calls; 99.16% of
+cycles are in `runBytecodeDispatch`. Frame-push is the right target for
+`lua_calls` (pushBytecodeExecFrame=11.46%, syncFrame=3.62%), but for
+global_arith the inflation comes from SETTABUP GC barrier, dispatch overhead,
+and GETTABUP string comparison — none of which involve frame-push.

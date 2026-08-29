@@ -1,0 +1,100 @@
+{
+  "created_utc": "2026-08-29T16:23:42.122973+00:00",
+  "task": "P16.8a Task 7 \u2014 global_arith decomposition",
+  "head": "8620116",
+  "workload": {
+    "name": "global_arith",
+    "shape": "g_count = 0; for i=1,n do g_count = g_count + i end; return g_count",
+    "source": "tools/microbench.lua:34-38",
+    "N_reference": 100000000,
+    "ratio_instr": 2.26
+  },
+  "bytecode": {
+    "loop_body_zig": [
+      "GETTABUP",
+      "ADD",
+      "SETTABUP",
+      "FORLOOP"
+    ],
+    "loop_body_puc": [
+      "GETTABUP",
+      "ADD",
+      "MMBIN",
+      "SETTABUP",
+      "FORLOOP"
+    ],
+    "note": "ADD int+int fast path skips MMBIN. PUC executes MMBIN as a no-op fast check.",
+    "ops_per_iter_zig": 4,
+    "ops_per_iter_puc": 5
+  },
+  "opcode_histogram_zig": {
+    "source": "luazig --vm=bc --stats",
+    "N": 100000000,
+    "total": 400000031,
+    "per_op": {
+      "add": 100000000,
+      "forloop": 100000000,
+      "gettabup": 100000007,
+      "settabup": 100000001
+    }
+  },
+  "per_opcode_costs": {
+    "method": "Isolated single-opcode workloads at N=1B, perf stat -e instructions.",
+    "workloads": {
+      "forloop_only": {
+        "zig_instr_per_iter": 75.014476194,
+        "puc_instr_per_iter": 28.005774791
+      },
+      "int_arith": {
+        "zig_instr_per_iter": 133.019117667,
+        "puc_instr_per_iter": 60.008434427
+      },
+      "gettabup_only": {
+        "zig_instr_per_iter": 188.018301143,
+        "puc_instr_per_iter": 87.009804526
+      },
+      "settabup_only": {
+        "zig_instr_per_iter": 341.013076424,
+        "puc_instr_per_iter": 108.000750006
+      }
+    },
+    "table": [
+      {
+        "opcode": "SETTABUP",
+        "zig_instr": 184.1,
+        "puc_instr": 71.1,
+        "delta": 113.0,
+        "ratio": 2.59,
+        "pct_of_inflation": 47.1
+      },
+      {
+        "opcode": "GETTABUP",
+        "zig_instr": 113.0,
+        "puc_instr": 59.0,
+        "delta": 54.0,
+        "ratio": 1.92,
+        "pct_of_inflation": 22.5
+      },
+      {
+        "opcode": "FORLOOP",
+        "zig_instr": 75.0,
+        "puc_instr": 28.0,
+        "delta": 47.0,
+        "ratio": 2.68,
+        "pct_of_inflation": 19.6
+      },
+      {
+        "opcode": "ADD",
+        "zig_instr": 58.0,
+        "puc_instr": 32.0,
+        "delta": 26.0,
+        "ratio": 1.81,
+        "pct_of_inflation": 10.8
+      }
+    ],
+    "total_zig": 430.1,
+    "total_puc": 190.1,
+    "total_delta": 240.0,
+    "total_ratio": 2.26
+  }
+}

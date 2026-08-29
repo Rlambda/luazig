@@ -7294,10 +7294,25 @@ pub const Vm = struct {
         return true;
     }
 
+    /// Result of trying to push an INDEX/NEWINDEX metamethod as a bytecode
+    /// continuation frame. Carries the resolved metamethod value when it was
+    /// found but not pushable (Builtin, Closure without proto), so the caller
+    /// can invoke it synchronously without re-resolving.
+    const TryPushIndexResult = union(enum) {
+        /// Bytecode frame pushed — caller does `continue :frame_loop`.
+        pushed,
+        /// No metamethod found — caller uses `indexValue`/`setIndexValue`.
+        not_found,
+        /// Metamethod resolved but not pushable. Caller calls
+        /// `callMetamethod(mm, ...)` directly — no re-lookup.
+        resolved: struct { mm: Value, obj: Value },
+    };
+
     /// Probe the `__index` chain without executing a Lua closure.  The common
-    /// raw/table-only path returns false and is completed by `indexValue`; when
-    /// the first callable slow path is a bytecode closure we push it directly
-    /// and let the parent continuation store its first result.
+    /// raw/table-only path returns `.not_found` and is completed by `indexValue`;
+    /// when the first callable slow path is a bytecode closure we push it directly
+    /// and let the parent continuation store its first result.  When a metamethod
+    /// is found but not pushable, `.resolved` carries it out — no re-lookup.
     fn tryPushBytecodeIndexMetamethod(
         self: *Vm,
         exec_frames: *FrameStack,
@@ -7305,24 +7320,24 @@ pub const Vm = struct {
         initial_object: Value,
         key: Value,
         dst: u8,
-    ) DispatchError!bool {
+    ) DispatchError!TryPushIndexResult {
         var object = initial_object;
         var depth: usize = 0;
         while (depth < 200) : (depth += 1) {
             if (object == .Table) {
                 const table = object.Table;
-                if (try self.tableGetRawValue(table, key) != .Nil) return false;
-                const mt = table.metatable orelse return false;
+                if (try self.tableGetRawValue(table, key) != .Nil) return .not_found;
+                const mt = table.metatable orelse return .not_found;
                 // PUC fasttm: check flags bit, cache-on-miss via fasttm.
                 // (lua-5.5.0/src/ltm.h:63 checknoTM + luaT_gettm.)
-                const mm = self.fastTm(mt, .index) orelse return false;
+                const mm = self.fastTm(mt, .index) orelse return .not_found;
                 if (mm == .Table) {
                     object = .{ .Table = mm.Table };
                     continue;
                 }
                 if (mm == .Closure and mm.Closure.proto != null) {
                     const args = [_]Value{ object, key };
-                    return self.tryPushBytecodeMetamethod(
+                    const pushed = try self.tryPushBytecodeMetamethod(
                         exec_frames,
                         parent_index,
                         mm,
@@ -7330,18 +7345,21 @@ pub const Vm = struct {
                         args[0..],
                         .{ .value = .{ .dst = dst } },
                     );
+                    if (pushed) return .pushed;
+                    // tryPushBytecodeMetamethod returned false (rare:
+                    // resolveCallable failed). Fall through to resolved.
                 }
-                return false;
+                return .{ .resolved = .{ .mm = mm, .obj = object } };
             }
 
-            const mm = self.getTmByObj(object, .index) orelse return false;
+            const mm = self.getTmByObj(object, .index) orelse return .not_found;
             if (mm == .Table) {
                 object = .{ .Table = mm.Table };
                 continue;
             }
             if (mm == .Closure and mm.Closure.proto != null) {
                 const args = [_]Value{ object, key };
-                return self.tryPushBytecodeMetamethod(
+                const pushed = try self.tryPushBytecodeMetamethod(
                     exec_frames,
                     parent_index,
                     mm,
@@ -7349,10 +7367,11 @@ pub const Vm = struct {
                     args[0..],
                     .{ .value = .{ .dst = dst } },
                 );
+                if (pushed) return .pushed;
             }
-            return false;
+            return .{ .resolved = .{ .mm = mm, .obj = object } };
         }
-        return false;
+        return .not_found;
     }
 
     /// `__newindex` counterpart of `tryPushBytecodeIndexMetamethod`.
@@ -7363,23 +7382,23 @@ pub const Vm = struct {
         initial_object: Value,
         key: Value,
         value: Value,
-    ) DispatchError!bool {
+    ) DispatchError!TryPushIndexResult {
         var object = initial_object;
         var depth: usize = 0;
         while (depth < 200) : (depth += 1) {
             if (object == .Table) {
                 const table = object.Table;
                 const raw = try self.tableGetRawValue(table, key);
-                if (raw != .Nil or table.metatable == null) return false;
+                if (raw != .Nil or table.metatable == null) return .not_found;
                 // PUC fasttm: check flags bit, cache-on-miss via fasttm.
-                const mm = self.fastTm(table.metatable.?, .newindex) orelse return false;
+                const mm = self.fastTm(table.metatable.?, .newindex) orelse return .not_found;
                 if (mm == .Table) {
                     object = .{ .Table = mm.Table };
                     continue;
                 }
                 if (mm == .Closure and mm.Closure.proto != null) {
                     const args = [_]Value{ object, key, value };
-                    return self.tryPushBytecodeMetamethod(
+                    const pushed = try self.tryPushBytecodeMetamethod(
                         exec_frames,
                         parent_index,
                         mm,
@@ -7387,18 +7406,19 @@ pub const Vm = struct {
                         args[0..],
                         .{ .ignore = .{} },
                     );
+                    if (pushed) return .pushed;
                 }
-                return false;
+                return .{ .resolved = .{ .mm = mm, .obj = object } };
             }
 
-            const mm = self.getTmByObj(object, .newindex) orelse return false;
+            const mm = self.getTmByObj(object, .newindex) orelse return .not_found;
             if (mm == .Table) {
                 object = .{ .Table = mm.Table };
                 continue;
             }
             if (mm == .Closure and mm.Closure.proto != null) {
                 const args = [_]Value{ object, key, value };
-                return self.tryPushBytecodeMetamethod(
+                const pushed = try self.tryPushBytecodeMetamethod(
                     exec_frames,
                     parent_index,
                     mm,
@@ -7406,8 +7426,74 @@ pub const Vm = struct {
                     args[0..],
                     .{ .ignore = .{} },
                 );
+                if (pushed) return .pushed;
             }
-            return false;
+            return .{ .resolved = .{ .mm = mm, .obj = object } };
+        }
+        return .not_found;
+    }
+
+    /// Complete an INDEX operation: try push as bytecode frame, else fall
+    /// through to `indexValue` (for upvalues) or `bytecodeIndexValue` (for
+    /// register-based opcodes). Returns true if pushed (caller does
+    /// `continue :frame_loop`).
+    fn bytecodeGetIndex(
+        self: *Vm,
+        exec_frames: *FrameStack,
+        ctx: *BytecodeDispatchCtx,
+        obj: Value,
+        key: Value,
+        a: u8,
+        b: u8,
+        use_bytecode_fallback: bool,
+    ) DispatchError!bool {
+        switch (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, obj, key, a)) {
+            .pushed => return true,
+            .not_found => {
+                if (use_bytecode_fallback) {
+                    const result = try self.bytecodeIndexValue(ctx.cur_proto, ctx.pc, b, obj, key);
+                    ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                    ctx.regs[a] = result;
+                } else {
+                    ctx.regs[a] = try self.indexValue(obj, key);
+                }
+            },
+            .resolved => |r| {
+                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                ctx.regs[a] = try self.callResolvedIndexMetamethod(r.mm, r.obj, key);
+                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+            },
+        }
+        return false;
+    }
+
+    /// Complete a NEWINDEX operation: try push as bytecode frame, else fall
+    /// through to `setIndexValue` (for upvalues) or `bytecodeSetIndexValue`
+    /// (for register-based opcodes). Returns true if pushed.
+    fn bytecodeSetIndex(
+        self: *Vm,
+        exec_frames: *FrameStack,
+        ctx: *BytecodeDispatchCtx,
+        obj: Value,
+        key: Value,
+        val: Value,
+        a: u8,
+        use_bytecode_fallback: bool,
+    ) DispatchError!bool {
+        switch (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, ctx.frame_index, obj, key, val)) {
+            .pushed => return true,
+            .not_found => {
+                if (use_bytecode_fallback) {
+                    try self.bytecodeSetIndexValue(ctx.cur_proto, ctx.pc, a, obj, key, val);
+                } else {
+                    try self.setIndexValue(obj, key, val);
+                }
+            },
+            .resolved => |r| {
+                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                try self.callResolvedNewIndexMetamethod(r.mm, r.obj, key, val);
+                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+            },
         }
         return false;
     }
@@ -11417,7 +11503,6 @@ pub const Vm = struct {
                 // ensureBcStackCap; bcGrowFrame updates ctx.regs/ctx.boxed
                 // directly via out-parameters.
                 if (self.bc_stack.ptr != stack_ptr) {
-                    @branchHint(.unlikely);
                     ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                     ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
                     stack_ptr = self.bc_stack.ptr;
@@ -11439,7 +11524,6 @@ pub const Vm = struct {
                 // "P16.0b" for the A/B history). The hint keeps the
                 // increments out of the hot instruction stream.
                 if (self.stats.enabled) {
-                    @branchHint(.unlikely);
                     self.stats.instructions_total += 1;
                     self.stats.instructions_by_op[@intFromEnum(op)] += 1;
                 }
@@ -11470,7 +11554,6 @@ pub const Vm = struct {
                 }
 
                 if (self.hooks_active_cached) {
-                    @branchHint(.unlikely);
                     // Slow path: hooks may fire. Use a local `fr` that can be
                     // re-derived after hooks execute Lua code (which may grow
                     // exec_frames and invalidate stale pointers).
@@ -11665,7 +11748,6 @@ pub const Vm = struct {
                         // P15.51l: has_open_upvalues is read directly from
                         // the CallFrame (rare field, 5 accesses).
                         if (exec_frames.getPtr(ctx.frame_index).u.lua.has_open_upvalues) {
-                            @branchHint(.unlikely);
                             // Slow path: source register may be ctx.boxed
                             // (captured as upvalue). Read from the cell — a
                             // closure may have modified it via SETUPVAL.
@@ -11755,11 +11837,9 @@ pub const Vm = struct {
                             else
                                 .Nil;
                         } else {
-                            @branchHint(.unlikely);
-                            if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, env, key, a)) {
+                            if (try self.bytecodeGetIndex(exec_frames, &ctx, env, key, a, 0, false)) {
                                 continue :frame_loop;
                             }
-                            ctx.regs[a] = try self.indexValue(env, key);
                         }
                     },
                     .settabup => {
@@ -11772,7 +11852,6 @@ pub const Vm = struct {
                         // upvalue name in the error message (like GETUPVAL+
                         // SETFIELD does via debugBytecodeOperandName).
                         if (env != .Table) {
-                            @branchHint(.unlikely);
                             const upv_name = if (a < ctx.cur_proto.upvalues.len)
                                 ctx.cur_proto.upvalues[a].name
                             else
@@ -11813,15 +11892,12 @@ pub const Vm = struct {
                                     node.value = val;
                                 }
                             } else {
-                                @branchHint(.unlikely);
                                 try self.rawSet(tbl, key, val);
                             }
                         } else {
-                            @branchHint(.unlikely);
-                            if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, ctx.frame_index, env, key, val)) {
+                            if (try self.bytecodeSetIndex(exec_frames, &ctx, env, key, val, 0, false)) {
                                 continue :frame_loop;
                             }
-                            try self.setIndexValue(env, key, val);
                         }
                     },
 
@@ -11858,17 +11934,12 @@ pub const Vm = struct {
                                 else
                                     .Nil;
                             } else {
-                                @branchHint(.unlikely);
                                 ctx.regs[a] = self.rawGet(tbl, key);
                             }
                         } else {
-                            @branchHint(.unlikely);
-                            if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, obj, key, a)) {
+                            if (try self.bytecodeGetIndex(exec_frames, &ctx, obj, key, a, b, true)) {
                                 continue :frame_loop;
                             }
-                            const result = try self.bytecodeIndexValue(ctx.cur_proto, ctx.pc, b, obj, key);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
                         }
                     },
                     .geti => {
@@ -11885,7 +11956,6 @@ pub const Vm = struct {
                                 if (self.stats.enabled) self.stats.tbl_get_fast_int += 1; // P16.0b
                                 ctx.regs[a] = tbl.array[k - 1];
                             } else {
-                                @branchHint(.unlikely);
                                 // P16.6: specialized int hash lookup (PUC
                                 // getintfromhash). Key is provably .Int (c is
                                 // u8, 1-based) and outside array range — skip
@@ -11896,14 +11966,10 @@ pub const Vm = struct {
                                     .Nil;
                             }
                         } else {
-                            @branchHint(.unlikely);
                             const key: Value = .{ .Int = @intCast(c) };
-                            if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, obj, key, a)) {
+                            if (try self.bytecodeGetIndex(exec_frames, &ctx, obj, key, a, b, true)) {
                                 continue :frame_loop;
                             }
-                            const result = try self.bytecodeIndexValue(ctx.cur_proto, ctx.pc, b, obj, key);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
                         }
                     },
                     .getfield => {
@@ -11923,13 +11989,9 @@ pub const Vm = struct {
                             else
                                 .Nil;
                         } else {
-                            @branchHint(.unlikely);
-                            if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, obj, key, a)) {
+                            if (try self.bytecodeGetIndex(exec_frames, &ctx, obj, key, a, b, true)) {
                                 continue :frame_loop;
                             }
-                            const result = try self.bytecodeIndexValue(ctx.cur_proto, ctx.pc, b, obj, key);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
                         }
                     },
                     .getvarg => {
@@ -12084,15 +12146,12 @@ pub const Vm = struct {
                                     }
                                 }
                             } else {
-                                @branchHint(.unlikely);
                                 try self.rawSet(tbl, key, val);
                             }
                         } else {
-                            @branchHint(.unlikely);
-                            if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, ctx.frame_index, obj, key, val)) {
+                            if (try self.bytecodeSetIndex(exec_frames, &ctx, obj, key, val, a, true)) {
                                 continue :frame_loop;
                             }
-                            try self.bytecodeSetIndexValue(ctx.cur_proto, ctx.pc, a, obj, key, val);
                         }
                     },
                     .seti => {
@@ -12110,16 +12169,14 @@ pub const Vm = struct {
                                 tbl.array[k - 1] = val;
                                 try self.gcWriteBarrierTable(tbl, val);
                             } else {
-                                @branchHint(.unlikely);
                                 try self.rawSet(tbl, .{ .Int = @intCast(b) }, val);
                             }
                         } else {
                             @branchHint(.unlikely);
                             const key: Value = .{ .Int = @intCast(b) };
-                            if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, ctx.frame_index, obj, key, val)) {
+                            if (try self.bytecodeSetIndex(exec_frames, &ctx, obj, key, val, a, true)) {
                                 continue :frame_loop;
                             }
-                            try self.bytecodeSetIndexValue(ctx.cur_proto, ctx.pc, a, obj, key, val);
                         }
                     },
                     .setfield => {
@@ -12157,11 +12214,9 @@ pub const Vm = struct {
                                 try self.rawSet(tbl, key, val);
                             }
                         } else {
-                            @branchHint(.unlikely);
-                            if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, ctx.frame_index, obj, key, val)) {
+                            if (try self.bytecodeSetIndex(exec_frames, &ctx, obj, key, val, a, true)) {
                                 continue :frame_loop;
                             }
-                            try self.bytecodeSetIndexValue(ctx.cur_proto, ctx.pc, a, obj, key, val);
                         }
                     },
 
@@ -12199,12 +12254,9 @@ pub const Vm = struct {
                         const obj = ctx.regs[b];
                         ctx.regs[a + 1] = obj;
                         const key = ctx.cur_proto.resolved_values[c];
-                        if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, obj, key, a)) {
+                        if (try self.bytecodeGetIndex(exec_frames, &ctx, obj, key, a, b, true)) {
                             continue :frame_loop;
                         }
-                        const result = try self.bytecodeIndexValue(ctx.cur_proto, ctx.pc, b, obj, key);
-                        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                        ctx.regs[a] = result;
                     },
 
                     // --- Arithmetic ---
@@ -12229,7 +12281,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(rc.Int)) };
                             ctx.pc += 1;
                         } else {
-                            @branchHint(.unlikely);
                             // Fall through to MMBIN: string operands handled by
                             // string metatable __add (PUC lstrlib.c arith_add).
                         }
@@ -12250,7 +12301,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = lb.Num - @as(f64, @floatFromInt(rc.Int)) };
                             ctx.pc += 1;
                         } else {
-                            @branchHint(.unlikely);
                             // Fall through to MMBIN (string mt __sub).
                         }
                     },
@@ -12270,7 +12320,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = lb.Num * @as(f64, @floatFromInt(rc.Int)) };
                             ctx.pc += 1;
                         } else {
-                            @branchHint(.unlikely);
                             // Fall through to MMBIN (string mt __mul).
                         }
                     },
@@ -12291,7 +12340,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = lb.Num / @as(f64, @floatFromInt(rc.Int)) };
                             ctx.pc += 1;
                         } else {
-                            @branchHint(.unlikely);
                             // Fall through to MMBIN (string mt __div).
                         }
                     },
@@ -12310,7 +12358,6 @@ pub const Vm = struct {
                             if (li == std.math.minInt(i64) and ri == -1) {
                                 ctx.regs[a] = .{ .Int = 0 };
                             } else {
-                                @branchHint(.unlikely);
                                 var rem = @rem(li, ri);
                                 // PUC Lua mod: result takes sign of divisor.
                                 if (rem != 0 and ((rem ^ ri) < 0)) rem += ri;
@@ -12327,7 +12374,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = luaNumMod(lb.Num, @as(f64, @floatFromInt(rc.Int))) };
                             ctx.pc += 1;
                         } else {
-                            @branchHint(.unlikely);
                             // Fall through to MMBIN (string mt __mod).
                         }
                     },
@@ -12348,7 +12394,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = std.math.pow(f64, lb.Num, @as(f64, @floatFromInt(rc.Int))) };
                             ctx.pc += 1;
                         } else {
-                            @branchHint(.unlikely);
                             // Fall through to MMBIN (string mt __pow).
                         }
                     },
@@ -12367,7 +12412,6 @@ pub const Vm = struct {
                             if (li == std.math.minInt(i64) and ri == -1) {
                                 ctx.regs[a] = .{ .Int = std.math.minInt(i64) };
                             } else {
-                                @branchHint(.unlikely);
                                 ctx.regs[a] = .{ .Int = @divFloor(li, ri) };
                             }
                             ctx.pc += 1; // skip MMBIN
@@ -12381,7 +12425,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = std.math.floor(lb.Num / @as(f64, @floatFromInt(rc.Int))) };
                             ctx.pc += 1;
                         } else {
-                            @branchHint(.unlikely);
                             // Fall through to MMBIN (string mt __idiv).
                         }
                     },
@@ -12392,7 +12435,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Int = lb.Int & rc.Int };
                             ctx.pc += 1; // skip MMBIN
                         } else {
-                            @branchHint(.unlikely);
                             const li = valueToIntForBitwise(lb);
                             const ri = valueToIntForBitwise(rc);
                             if (li != null and ri != null) {
@@ -12409,7 +12451,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Int = lb.Int | rc.Int };
                             ctx.pc += 1; // skip MMBIN
                         } else {
-                            @branchHint(.unlikely);
                             const li = valueToIntForBitwise(lb);
                             const ri = valueToIntForBitwise(rc);
                             if (li != null and ri != null) {
@@ -12426,7 +12467,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Int = lb.Int ^ rc.Int };
                             ctx.pc += 1; // skip MMBIN
                         } else {
-                            @branchHint(.unlikely);
                             const li = valueToIntForBitwise(lb);
                             const ri = valueToIntForBitwise(rc);
                             if (li != null and ri != null) {
@@ -12443,7 +12483,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Int = shiftLeft(lb.Int, rc.Int) };
                             ctx.pc += 1; // skip MMBIN
                         } else {
-                            @branchHint(.unlikely);
                             const li = valueToIntForBitwise(lb);
                             const ri = valueToIntForBitwise(rc);
                             if (li != null and ri != null) {
@@ -12460,7 +12499,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Int = shiftRight(lb.Int, rc.Int) };
                             ctx.pc += 1; // skip MMBIN
                         } else {
-                            @branchHint(.unlikely);
                             const li = valueToIntForBitwise(lb);
                             const ri = valueToIntForBitwise(rc);
                             if (li != null and ri != null) {
@@ -12492,7 +12530,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(imm)) };
                             ctx.pc += 1;
                         } else {
-                            @branchHint(.unlikely);
                             // Fall through to MMBINI (string mt __add).
                         }
                     },
@@ -12514,7 +12551,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(rc.Int)) };
                             ctx.pc += 1;
                         } else {
-                            @branchHint(.unlikely);
                             // Fall through to MMBINK (string mt __add).
                         }
                     },
@@ -12536,7 +12572,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = lb.Num - @as(f64, @floatFromInt(rc.Int)) };
                             ctx.pc += 1;
                         } else {
-                            @branchHint(.unlikely);
                             // Fall through to MMBINK (string mt __sub).
                         }
                     },
@@ -12558,7 +12593,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = lb.Num * @as(f64, @floatFromInt(rc.Int)) };
                             ctx.pc += 1;
                         } else {
-                            @branchHint(.unlikely);
                             // Fall through to MMBINK (string mt __mul).
                         }
                     },
@@ -12577,7 +12611,6 @@ pub const Vm = struct {
                             if (li == std.math.minInt(i64) and ri == -1) {
                                 ctx.regs[a] = .{ .Int = 0 };
                             } else {
-                                @branchHint(.unlikely);
                                 var rem = @rem(li, ri);
                                 if (rem != 0 and ((rem ^ ri) < 0)) rem += ri;
                                 ctx.regs[a] = .{ .Int = rem };
@@ -12593,7 +12626,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = luaNumMod(lb.Num, @as(f64, @floatFromInt(rc.Int))) };
                             ctx.pc += 1;
                         } else {
-                            @branchHint(.unlikely);
                             // Fall through to MMBINK (string mt __mod).
                         }
                     },
@@ -12615,7 +12647,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = std.math.pow(f64, lb.Num, @as(f64, @floatFromInt(rc.Int))) };
                             ctx.pc += 1;
                         } else {
-                            @branchHint(.unlikely);
                             // Fall through to MMBINK (string mt __pow).
                         }
                     },
@@ -12637,7 +12668,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = lb.Num / @as(f64, @floatFromInt(rc.Int)) };
                             ctx.pc += 1;
                         } else {
-                            @branchHint(.unlikely);
                             // Fall through to MMBINK (string mt __div).
                         }
                     },
@@ -12655,7 +12685,6 @@ pub const Vm = struct {
                             if (lb.Int == std.math.minInt(i64) and ri == -1) {
                                 ctx.regs[a] = .{ .Int = std.math.minInt(i64) };
                             } else {
-                                @branchHint(.unlikely);
                                 ctx.regs[a] = .{ .Int = @divFloor(lb.Int, ri) };
                             }
                             ctx.pc += 1; // skip MMBINK
@@ -12669,7 +12698,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = @floor(lb.Num / @as(f64, @floatFromInt(rc.Int))) };
                             ctx.pc += 1;
                         } else {
-                            @branchHint(.unlikely);
                             // Fall through to MMBINK (string mt __idiv).
                         }
                     },
@@ -12683,7 +12711,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Int = lb.Int & rc.Int };
                             ctx.pc += 1; // skip MMBINK
                         } else {
-                            @branchHint(.unlikely);
                             const li = valueToIntForBitwise(lb);
                             const ri = valueToIntForBitwise(rc);
                             if (li != null and ri != null) {
@@ -12700,7 +12727,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Int = lb.Int | rc.Int };
                             ctx.pc += 1; // skip MMBINK
                         } else {
-                            @branchHint(.unlikely);
                             const li = valueToIntForBitwise(lb);
                             const ri = valueToIntForBitwise(rc);
                             if (li != null and ri != null) {
@@ -12717,7 +12743,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Int = lb.Int ^ rc.Int };
                             ctx.pc += 1; // skip MMBINK
                         } else {
-                            @branchHint(.unlikely);
                             const li = valueToIntForBitwise(lb);
                             const ri = valueToIntForBitwise(rc);
                             if (li != null and ri != null) {
@@ -12737,7 +12762,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Int = shiftLeft(imm, lb.Int) };
                             ctx.pc += 1; // skip MMBINI
                         } else {
-                            @branchHint(.unlikely);
                             if (valueToIntForBitwise(lb)) |ri| {
                                 ctx.regs[a] = .{ .Int = shiftLeft(imm, ri) };
                                 ctx.pc += 1; // skip MMBINI
@@ -12758,7 +12782,6 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Int = shiftRight(lb.Int, imm) };
                             ctx.pc += 1; // skip MMBINI
                         } else {
-                            @branchHint(.unlikely);
                             if (valueToIntForBitwise(lb)) |li| {
                                 ctx.regs[a] = .{ .Int = shiftRight(li, imm) };
                                 ctx.pc += 1; // skip MMBINI
@@ -12883,7 +12906,6 @@ pub const Vm = struct {
                         } else if (val == .Num) {
                             ctx.regs[a] = .{ .Num = -val.Num };
                         } else {
-                            @branchHint(.unlikely);
                             // PUC OP_UNM: luaT_trybinTM(L, rb, rb, ra, TM_UNM).
                             // String operands handled by string mt __unm
                             // (PUC lstrlib.c arith_unm).
@@ -12917,7 +12939,6 @@ pub const Vm = struct {
                         if (val == .Int) {
                             ctx.regs[a] = .{ .Int = ~val.Int };
                         } else {
-                            @branchHint(.unlikely);
                             // Coercion: valueToIntForBitwise handles Int and
                             // Num-with-integer-value (NOT string — matches PUC
                             // tointegerns). On failure, try __bnot metamethod
@@ -12953,20 +12974,39 @@ pub const Vm = struct {
                     .not => ctx.regs[a] = try self.evalUnOp(.Not, ctx.regs[b]),
                     .len => {
                         const val = ctx.regs[b];
-                        const needs_len_metamethod = val != .String and self.getTmByObj(val, .len) != null;
-                        if (needs_len_metamethod and try self.tryPushBytecodeUnaryMetamethod(
-                            exec_frames,
-                            ctx.frame_index,
-                            val,
-                            .len,
-                            "len",
-                            a,
-                        )) {
-                            continue :frame_loop;
+                        // PUC OP_LEN: luaT_trybinTM(L, rb, rb, ra, TM_LEN).
+                        // Strings have a fast path (no metamethod lookup).
+                        // For all other types, resolve __len ONCE and carry
+                        // the resolved value through push + synchronous fallback.
+                        if (val == .String) {
+                            ctx.regs[a] = .{ .Int = @intCast(val.String.len) };
+                        } else {
+                            const tm = self.findUnaryTm(val, .len);
+                            if (tm) |mm| {
+                                if (try self.tryPushResolvedMetamethod(
+                                    exec_frames,
+                                    ctx.frame_index,
+                                    mm,
+                                    &.{ val, val },
+                                    .len,
+                                    .{ .value = .{ .dst = a } },
+                                )) {
+                                    continue :frame_loop;
+                                }
+                                // Not a bytecode Closure — call synchronously.
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                const result = try self.callMetamethod(mm, tag_method.opname(.len), &.{ val, val });
+                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                ctx.regs[a] = result;
+                            } else {
+                                // No __len metamethod: Table → border length,
+                                // anything else → type error (matches evalUnOp).
+                                ctx.regs[a] = switch (val) {
+                                    .Table => |t| .{ .Int = self.tableBorderLen(t) },
+                                    else => return self.fail("attempt to get length of a {s} value", .{val.typeName()}),
+                                };
+                            }
                         }
-                        const result = try self.evalUnOp(.Hash, val);
-                        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                        ctx.regs[a] = result;
                     },
 
                     .concat => {
@@ -12998,16 +13038,24 @@ pub const Vm = struct {
                             if ((la == .Table and lb == .Table) or
                                 (la == .Userdata and lb == .Userdata))
                             {
-                                if (try self.tryPushBytecodeBinaryMetamethod(
-                                    exec_frames,
-                                    ctx.frame_index,
-                                    la,
-                                    lb,
-                                    .eq,
-                                    "eq",
-                                    .{ .compare = .{ .invert = c != 0 } },
-                                )) {
-                                    continue :frame_loop;
+                                // Resolve __eq ONCE — no re-lookup.
+                                const tm = self.findBinaryTm(la, lb, .eq);
+                                if (tm) |mm| {
+                                    if (try self.tryPushResolvedMetamethod(
+                                        exec_frames,
+                                        ctx.frame_index,
+                                        mm,
+                                        &.{ la, lb },
+                                        .eq,
+                                        .{ .compare = .{ .invert = c != 0 } },
+                                    )) {
+                                        continue :frame_loop;
+                                    }
+                                    // Not a bytecode Closure — call synchronously.
+                                    exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                    const ret = try self.callMetamethod(mm, tag_method.opname(.eq), &.{ la, lb });
+                                    ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                    break :blk isTruthy(ret);
                                 }
                             }
                             break :blk false;
@@ -13026,19 +13074,11 @@ pub const Vm = struct {
                             if (la == .Int and lb == .Num) break :blk intLtNum(la.Int, lb.Num);
                             if (la == .Num and lb == .Int) break :blk numLtInt(la.Num, lb.Int);
                             if (la == .String and lb == .String) break :blk std.mem.order(u8, la.String.bytes(), lb.String.bytes()) == .lt;
-                            // Slow path: metamethod or error.
-                            if (try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                la,
-                                lb,
-                                .lt,
-                                "lt",
-                                .{ .compare = .{ .invert = c != 0 } },
-                            )) {
-                                continue :frame_loop;
+                            // Slow path: resolve ONCE, push or call — no re-lookup.
+                            switch (try self.slowCmp(exec_frames, ctx.frame_index, ctx.pc, la, lb, .lt, c != 0)) {
+                                .pushed => continue :frame_loop,
+                                .value => |v| break :blk v,
                             }
-                            break :blk try self.cmpLt(la, lb);
                         };
                         const invert = (c != 0);
                         if (result != invert) ctx.pc += 1;
@@ -13055,23 +13095,15 @@ pub const Vm = struct {
                                 const ord = std.mem.order(u8, la.String.bytes(), lb.String.bytes());
                                 break :blk ord == .lt or ord == .eq;
                             }
-                            if (try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                la,
-                                lb,
-                                .le,
-                                "le",
-                                .{ .compare = .{ .invert = c != 0 } },
-                            )) {
-                                continue :frame_loop;
+                            // Slow path: resolve ONCE, push or call — no re-lookup.
+                            switch (try self.slowCmp(exec_frames, ctx.frame_index, ctx.pc, la, lb, .le, c != 0)) {
+                                .pushed => continue :frame_loop,
+                                .value => |v| break :blk v,
                             }
-                            break :blk try self.cmpLte(la, lb);
                         };
                         const invert = (c != 0);
                         if (result != invert) ctx.pc += 1;
                     },
-
                     // P15.38d: Immediate comparison opcodes (PUC EQI/LTI/LEI/GTI/GEI/EQK).
                     // These compare R[A] against a signed immediate (sB) or constant
                     // pool entry (K[B]), eliminating a preceding LOADI/LOADK.
@@ -13110,23 +13142,15 @@ pub const Vm = struct {
                         const result: bool = blk: {
                             if (la == .Int) break :blk la.Int < im;
                             if (la == .Num) break :blk la.Num < @as(f64, @floatFromInt(im));
-                            // Slow path: metamethod or error.
+                            // Slow path: resolve ONCE, push or call — no re-lookup.
                             const rb_val: Value = if (isfloat)
                                 .{ .Num = @as(f64, @floatFromInt(im)) }
                             else
                                 .{ .Int = im };
-                            if (try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                la,
-                                rb_val,
-                                .lt,
-                                "lt",
-                                .{ .compare = .{ .invert = (c & 1) != 0 } },
-                            )) {
-                                continue :frame_loop;
+                            switch (try self.slowCmp(exec_frames, ctx.frame_index, ctx.pc, la, rb_val, .lt, (c & 1) != 0)) {
+                                .pushed => continue :frame_loop,
+                                .value => |v| break :blk v,
                             }
-                            break :blk try self.cmpLt(la, rb_val);
                         };
                         const invert = (c & 1) != 0;
                         if (result != invert) ctx.pc += 1;
@@ -13140,23 +13164,15 @@ pub const Vm = struct {
                         const result: bool = blk: {
                             if (la == .Int) break :blk la.Int <= im;
                             if (la == .Num) break :blk la.Num <= @as(f64, @floatFromInt(im));
-                            // Slow path: metamethod or error.
+                            // Slow path: resolve ONCE, push or call — no re-lookup.
                             const rb_val: Value = if (isfloat)
                                 .{ .Num = @as(f64, @floatFromInt(im)) }
                             else
                                 .{ .Int = im };
-                            if (try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                la,
-                                rb_val,
-                                .le,
-                                "le",
-                                .{ .compare = .{ .invert = (c & 1) != 0 } },
-                            )) {
-                                continue :frame_loop;
+                            switch (try self.slowCmp(exec_frames, ctx.frame_index, ctx.pc, la, rb_val, .le, (c & 1) != 0)) {
+                                .pushed => continue :frame_loop,
+                                .value => |v| break :blk v,
                             }
-                            break :blk try self.cmpLte(la, rb_val);
                         };
                         const invert = (c & 1) != 0;
                         if (result != invert) ctx.pc += 1;
@@ -13170,24 +13186,16 @@ pub const Vm = struct {
                         const result: bool = blk: {
                             if (la == .Int) break :blk la.Int > im;
                             if (la == .Num) break :blk la.Num > @as(f64, @floatFromInt(im));
-                            // Slow path: metamethod or error.
-                            // GTI uses __lt with swapped operands: (im < la).
+                            // Slow path: GTI uses __lt with swapped operands: (im < la).
+                            // Resolve ONCE, push or call — no re-lookup.
                             const rb_val: Value = if (isfloat)
                                 .{ .Num = @as(f64, @floatFromInt(im)) }
                             else
                                 .{ .Int = im };
-                            if (try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                rb_val,
-                                la,
-                                .lt,
-                                "lt",
-                                .{ .compare = .{ .invert = (c & 1) != 0 } },
-                            )) {
-                                continue :frame_loop;
+                            switch (try self.slowCmp(exec_frames, ctx.frame_index, ctx.pc, rb_val, la, .lt, (c & 1) != 0)) {
+                                .pushed => continue :frame_loop,
+                                .value => |v| break :blk v,
                             }
-                            break :blk try self.cmpLt(rb_val, la);
                         };
                         const invert = (c & 1) != 0;
                         if (result != invert) ctx.pc += 1;
@@ -13201,24 +13209,16 @@ pub const Vm = struct {
                         const result: bool = blk: {
                             if (la == .Int) break :blk la.Int >= im;
                             if (la == .Num) break :blk la.Num >= @as(f64, @floatFromInt(im));
-                            // Slow path: metamethod or error.
-                            // GEI uses __le with swapped operands: (im <= la).
+                            // Slow path: GEI uses __le with swapped operands: (im <= la).
+                            // Resolve ONCE, push or call — no re-lookup.
                             const rb_val: Value = if (isfloat)
                                 .{ .Num = @as(f64, @floatFromInt(im)) }
                             else
                                 .{ .Int = im };
-                            if (try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                rb_val,
-                                la,
-                                .le,
-                                "le",
-                                .{ .compare = .{ .invert = (c & 1) != 0 } },
-                            )) {
-                                continue :frame_loop;
+                            switch (try self.slowCmp(exec_frames, ctx.frame_index, ctx.pc, rb_val, la, .le, (c & 1) != 0)) {
+                                .pushed => continue :frame_loop,
+                                .value => |v| break :blk v,
                             }
-                            break :blk try self.cmpLte(rb_val, la);
                         };
                         const invert = (c & 1) != 0;
                         if (result != invert) ctx.pc += 1;
@@ -13236,7 +13236,6 @@ pub const Vm = struct {
                         if (!is_truthy == skip_if_falsy) {
                             ctx.pc += 1;
                         } else {
-                            @branchHint(.unlikely);
                             ctx.regs[a] = ctx.regs[b];
                         }
                     },
@@ -13396,7 +13395,6 @@ pub const Vm = struct {
                                 continue;
                             }
                         } else {
-                            @branchHint(.unlikely);
                             // ── Float loop ──
                             const limit_f = ctx.regs[a].Num;
                             const step_f = ctx.regs[a + 1].Num;
@@ -32544,6 +32542,29 @@ pub const Vm = struct {
         return self.indexValueDepth(object, key, 0);
     }
 
+    /// Invoke a resolved `__index` metamethod. Callable values (Builtin,
+    /// Closure) are called via `callMetamethod`. Non-callable values follow
+    /// PUC's `luaV_finishget` chain: `t = tm` and loop, which means trying
+    /// to index the metamethod value itself (via `indexValue`). This produces
+    /// PUC's "attempt to index a {type} value" error when the value has no
+    /// `__index` metamethod.
+    fn callResolvedIndexMetamethod(self: *Vm, mm: Value, obj: Value, key: Value) DispatchError!Value {
+        return switch (mm) {
+            .Builtin, .Closure => try self.callMetamethod(mm, "index", &.{ obj, key }),
+            else => try self.indexValue(mm, key),
+        };
+    }
+
+    /// Invoke a resolved `__newindex` metamethod. Callable values are called
+    /// via `callMetamethod`. Non-callable values follow PUC's `luaV_finishset`
+    /// chain: `t = tm` and loop (via `setIndexValue`).
+    fn callResolvedNewIndexMetamethod(self: *Vm, mm: Value, obj: Value, key: Value, val: Value) DispatchError!void {
+        switch (mm) {
+            .Builtin, .Closure => _ = try self.callMetamethod(mm, "newindex", &.{ obj, key, val }),
+            else => try self.setIndexValue(mm, key, val),
+        }
+    }
+
     fn indexValueDepth(self: *Vm, object: Value, key: Value, depth: usize) DispatchError!Value {
         if (depth >= 200) return self.fail("loop in gettable", .{});
         switch (object) {
@@ -33984,6 +34005,46 @@ pub const Vm = struct {
 
     fn isNumWithoutInteger(v: Value) bool {
         return v == .Num and valueToIntForBitwise(v) == null;
+    }
+
+    /// Result of a comparison slow-path helper: either the metamethod was
+    /// pushed as a bytecode frame (caller does `continue :frame_loop`), or a
+    /// boolean result was computed synchronously.
+    const CmpSlowResult = union(enum) {
+        pushed,
+        value: bool,
+    };
+
+    /// Shared comparison slow path: resolve the metamethod ONCE via
+    /// `findBinaryTm`, then push or call synchronously — no re-lookup.
+    /// Used by LT/LE/LTI/LEI/GTI/GEI handlers.
+    fn slowCmp(
+        self: *Vm,
+        exec_frames: *FrameStack,
+        frame_index: usize,
+        pc: usize,
+        la: Value,
+        lb: Value,
+        event: TmsEvent,
+        invert: bool,
+    ) DispatchError!CmpSlowResult {
+        const tm = self.findBinaryTm(la, lb, event);
+        if (tm) |mm| {
+            if (try self.tryPushResolvedMetamethod(
+                exec_frames,
+                frame_index,
+                mm,
+                &.{ la, lb },
+                event,
+                .{ .compare = .{ .invert = invert } },
+            )) {
+                return .pushed;
+            }
+            exec_frames.getPtr(frame_index).u.lua.pc = pc;
+            const ret = try self.callMetamethod(mm, tag_method.opname(event), &.{ la, lb });
+            return .{ .value = isTruthy(ret) };
+        }
+        return self.failCompare(la, lb);
     }
 
     fn failCompare(self: *Vm, lhs: Value, rhs: Value) Error {

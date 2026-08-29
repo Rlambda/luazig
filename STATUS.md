@@ -1,4 +1,4 @@
-> Last updated: 2026-08-29 (P16.8a Tasks 2+3+4 — captured-local storage invariant proof + coherence differential)
+> Last updated: 2026-08-29 (P16.8a Task 5 — transactional simple_result setup)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -4843,3 +4843,67 @@ add unnecessary temp MOVEs and skip direct-store optimizations.
   upvalue open, close-of-upvalue (return inner closure), arithmetic
   direct-store, assignment via nested closure then direct read, captured
   table field. Byte-identical PUC vs luazig.
+
+---
+
+## P16.8a Task 5 — transactional simple_result setup (2026-08-29)
+
+### Problem
+
+`tryPushSimpleResultMetamethod` set the parent's `simple_result` state
+BEFORE the fallible child-activation operations (`pushBytecodeExecFrame` +
+`dispatchCalleeActivationHook`). If child-frame creation failed (OOM from
+stack growth) after the parent state was set, the parent retained a STALE
+`simple_result`. The general pending-call path (`tryPushBytecodeContinuationCall`)
+already rolled back transactionally via `errdefer clearPendingCall`.
+
+### Fix
+
+Added `errdefer exec_frames.getPtr(parent_index).u.lua.clearSimpleResult()`
+after setting the simple_result state, before the fallible operations —
+mirroring the `errdefer clearPendingCall` pattern in
+`tryPushBytecodeContinuationCall`. The `getPtr` re-fetch is critical:
+`pushBytecodeExecFrame` may realloc the FrameStack, invalidating the `parent`
+pointer captured above.
+
+### Three-boundary analysis
+
+1. **push failed** — child frame never joined the call stack. errdefer
+   clears `simple_result`; parent is exactly as it was. No child frame
+   left (pushBytecodeExecFrame's own errdefer or addOne failure handles
+   this).
+2. **hook dispatch failed after child exists** — child frame IS on
+   exec_frames. errdefer clears `simple_result` on the parent; the child
+   frame is unwound by the general error-recovery machinery
+   (`recoverBytecodeDispatchError` → `appendBytecodeUnwind`), exactly as
+   in the pending-call path.
+3. **child began execution** — normal return consumes `simple_result`
+   once; yield preserves; error/unwind clears via `popBytecodeExecFrame`
+   (P16.8 Task 3 audit). No errdefer needed here.
+
+### Test
+
+`test "vm: P16.8a transactional simple_result setup — errdefer rollback on
+push failure"` — uses `std.testing.FailingAllocator` (fail_index=0,
+resize_fail_index=0) to force `pushBytecodeExecFrame` failure during
+`simple_result` setup. Runs 5 failure iterations + 1 success iteration.
+
+- **Failure iterations**: `bc_stack_top` set near end of `bc_stack` so the
+  child frame's `needed_for_args` exceeds `bc_stack.len`, forcing
+  `growBcStackCapSlow`. The FailingAllocator makes the first realloc return
+  null. After the error: asserts `simple_result == NONE`, frame count
+  unchanged, `pending_call_index == INVALID_PENDING`.
+- **Success iteration**: high fail_index (100) — call completes. Asserts
+  `simple_result` IS set, child frame IS pushed. Then cleans up.
+
+Verified: test FAILS when errdefer is temporarily disabled (stale
+`simple_result` detected), PASSES when enabled.
+
+### Gates
+
+- `zig build test` (Debug + ReleaseFast): all pass
+- smoke 62/62: PASS
+- matrix --testc: zig_fail=0
+- c_api test + test-diff: PASS
+- coroutine --testc: PASS
+- nextvar 3x: PASS

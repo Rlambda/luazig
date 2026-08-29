@@ -7423,8 +7423,25 @@ pub const Vm = struct {
         const proto = cl.proto orelse return false;
 
         // Set inline simple-result completion — no pending_calls slot needed.
+        // P16.8a Task 5: The simple_result state is set BEFORE the fallible
+        // child-activation operations (pushBytecodeExecFrame + hook dispatch).
+        // The errdefer below rolls it back if either fails, mirroring the
+        // errdefer clearPendingCall pattern in tryPushBytecodeContinuationCall.
+        //
+        // Three-boundary analysis:
+        //   1. push failed — child frame never joined the call stack.
+        //      errdefer clears simple_result; parent is exactly as it was.
+        //   2. hook dispatch failed after child exists — child frame IS on
+        //      exec_frames. errdefer clears simple_result on the parent; the
+        //      child frame is unwound by the general error-recovery machinery
+        //      (recoverBytecodeDispatchError → appendBytecodeUnwind), exactly
+        //      as in the pending-call path.
+        //   3. child began execution — normal return consumes simple_result
+        //      once; yield preserves; error/unwind clears via popBytecodeExecFrame
+        //      (P16.8 Task 3 audit). No errdefer needed here.
         const parent = exec_frames.getPtr(parent_index);
         std.debug.assert(parent.pending_call_index == INVALID_PENDING);
+        // On entry to the fallible window, simple_result must be NONE.
         std.debug.assert(!parent.u.lua.hasSimpleResult());
         switch (completion) {
             .value => |dst| {
@@ -7434,6 +7451,10 @@ pub const Vm = struct {
                 parent.u.lua.setSimpleCompareResult(event, invert);
             },
         }
+        // Roll back simple_result if child-frame push or hook dispatch fails.
+        // Re-fetch via getPtr: pushBytecodeExecFrame may realloc FrameStack,
+        // invalidating the `parent` pointer captured above.
+        errdefer exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
 
         // Push the child frame with MULTRET (same as .value/.compare in the
         // old path: cont_nresults = -1 for non-.results completions).
@@ -39958,4 +39979,178 @@ test "vm: P16.8 R254 is valid simple_result value-mode destination" {
     try testing.expect(!frame_state.simpleResultIsCompare());
     try testing.expectEqual(TmsEvent.len, frame_state.simpleResultEvent());
     frame_state.clearSimpleResult();
+}
+
+// =========================================================================
+// P16.8a Task 5: Transactional simple_result setup — errdefer rollback.
+//
+// When tryPushSimpleResultMetamethod sets the parent's simple_result state
+// and then pushBytecodeExecFrame (or dispatchCalleeActivationHook) fails,
+// the errdefer clearSimpleResult() must roll the parent back to its exact
+// prior state. This test forces the failure with a FailingAllocator and
+// verifies the invariant across N iterations.
+//
+// Test mechanics:
+//   - bc_stack_top is set near the end of bc_stack so the child frame's
+//     needed_for_args exceeds bc_stack.len, forcing growBcStackCapSlow.
+//   - A FailingAllocator (fail_index=0, resize_fail_index=0) makes the
+//     very first realloc inside growBcStackCapSlow return null.
+//   - The proto's constants are pre-resolved so resolveProtoConstants is
+//     a no-op (the failure is isolated to the stack-growth path).
+//   - After the error, we assert: simple_result == NONE, frame count
+//     unchanged, pending_call_index == INVALID_PENDING.
+//
+// A final iteration with a high fail_index verifies the happy path: the
+// call succeeds, simple_result IS set, and a child frame IS pushed.
+// =========================================================================
+test "vm: P16.8a transactional simple_result setup — errdefer rollback on push failure" {
+    const testing = std.testing;
+    const Source = @import("source.zig").Source;
+    const Lexer = @import("lexer.zig").Lexer;
+    const Parser = @import("parser.zig").Parser;
+    const ast = @import("ast.zig");
+    const CodegenBc = @import("codegen_bc.zig").Codegen;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    // Compile a simple parent proto and a simple metamethod proto.
+    const compileProto = struct {
+        fn run(alloc: std.mem.Allocator, src_bytes: []const u8) !*bc.Proto {
+            const src = Source{ .name = "<test>", .bytes = src_bytes };
+            var lex = Lexer.init(src);
+            var p = try Parser.init(&lex);
+            var ast_arena = ast.AstArena.init(alloc);
+            defer ast_arena.deinit();
+            const chunk = try p.parseChunkAst(&ast_arena);
+            var cg = CodegenBc.init(alloc, src.name, src.bytes);
+            defer cg.deinit();
+            return try cg.compileChunk(chunk);
+        }
+    }.run;
+
+    const parent_proto = try compileProto(aalloc, "return 1\n");
+    const mm_proto = try compileProto(aalloc, "return 1\n");
+
+    var vm = Vm.init(aalloc, false);
+    defer vm.deinit();
+
+    // Create bytecode closures for both protos.
+    const parent_cl = try aalloc.create(Closure);
+    parent_cl.* = .{ .proto = parent_proto, .upvalues = &.{} };
+    try vm.gcRegisterClosure(parent_cl);
+
+    const mm_cl = try aalloc.create(Closure);
+    mm_cl.* = .{ .proto = mm_proto, .upvalues = &.{} };
+    try vm.gcRegisterClosure(mm_cl);
+
+    // Pre-resolve the metamethod proto's constants so resolveProtoConstants
+    // is a no-op during the test call (failure isolated to stack growth).
+    try vm.resolveProtoConstants(mm_proto);
+
+    // Push a parent Lua frame onto the active thread's call_frames.
+    const exec_frames = &vm.activeBytecodeThread().call_frames;
+    try vm.pushBytecodeExecFrame(exec_frames, parent_proto, &.{}, parent_cl, 0, -1);
+    const parent_index: usize = 0;
+    const saved_frame_count = exec_frames.len();
+    const saved_bc_stack_top = vm.bc_stack_top;
+
+    // ── Failure iterations: force pushBytecodeExecFrame to fail ──
+    // Each iteration: set bc_stack_top near the end so the child frame
+    // needs stack growth, then use a FailingAllocator to make the growth
+    // fail. The errdefer must clear simple_result on the parent.
+    var iter: usize = 0;
+    while (iter < 5) : (iter += 1) {
+        // Ensure clean slate for each iteration.
+        exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
+        // bc_stack_top near the end forces growBcStackCapSlow in
+        // pushBytecodeExecFrame (needed_for_args > bc_stack.len).
+        vm.bc_stack_top = vm.bc_stack.len - 2;
+
+        var failing = std.testing.FailingAllocator.init(aalloc, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        const saved_alloc = vm.alloc;
+        vm.alloc = failing.allocator();
+        defer vm.alloc = saved_alloc;
+
+        const args = [_]Value{ .Nil, .Nil };
+        const result = vm.tryPushSimpleResultMetamethod(
+            exec_frames,
+            parent_index,
+            .{ .Closure = mm_cl },
+            args[0..],
+            .add,
+            .{ .value = 0 },
+        );
+
+        // Restore allocator immediately (defer above is a safety net).
+        vm.alloc = saved_alloc;
+
+        // The call must fail with OOM (stack growth allocation failed).
+        try testing.expectError(error.OutOfMemory, result);
+
+        // Invariant: parent is EXACTLY as it was before the call.
+        // 1. simple_result must be NONE (errdefer cleared it).
+        try testing.expect(
+            !exec_frames.getPtr(parent_index).u.lua.hasSimpleResult(),
+        );
+        // 2. No child frame was left on the call stack.
+        try testing.expectEqual(
+            saved_frame_count,
+            exec_frames.len(),
+        );
+        // 3. pending_call_index must still be INVALID (no pending call).
+        try testing.expectEqual(
+            @as(u32, INVALID_PENDING),
+            exec_frames.getPtr(parent_index).pending_call_index,
+        );
+    }
+
+    // ── Success iteration: high fail_index, call completes ──
+    // Verifies the errdefer does NOT fire spuriously on success: the
+    // parent keeps its simple_result and the child frame is on the stack.
+    {
+        exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
+        vm.bc_stack_top = vm.bc_stack.len - 2;
+
+        var failing = std.testing.FailingAllocator.init(aalloc, .{
+            .fail_index = 100,
+            .resize_fail_index = 100,
+        });
+        const saved_alloc = vm.alloc;
+        vm.alloc = failing.allocator();
+        defer vm.alloc = saved_alloc;
+
+        const args = [_]Value{ .Nil, .Nil };
+        const pushed = try vm.tryPushSimpleResultMetamethod(
+            exec_frames,
+            parent_index,
+            .{ .Closure = mm_cl },
+            args[0..],
+            .add,
+            .{ .value = 0 },
+        );
+
+        vm.alloc = saved_alloc;
+
+        try testing.expect(pushed);
+        // Parent must have simple_result set (errdefer did NOT fire).
+        try testing.expect(
+            exec_frames.getPtr(parent_index).u.lua.hasSimpleResult(),
+        );
+        // Child frame must be on the call stack.
+        try testing.expectEqual(
+            saved_frame_count + 1,
+            exec_frames.len(),
+        );
+        // Clean up: pop the child frame and clear simple_result.
+        vm.popBytecodeExecFrame(exec_frames);
+        exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
+    }
+
+    // Restore bc_stack_top for clean deinit.
+    vm.bc_stack_top = saved_bc_stack_top;
 }

@@ -7289,8 +7289,32 @@ pub const Vm = struct {
         debug_namewhat: ?[]const u8,
         debug_name: ?[]const u8,
     ) DispatchError!bool {
+        // Resolve through normal callable semantics (handles __call chains).
+        // Errors are caught → return false so the caller can fall through to
+        // the synchronous path. This is the resolve-once entry point for
+        // callers that do NOT pre-resolve (pairs, debug hooks, etc.).
         const resolved = self.resolveCallable(callee_value, args, null) catch return false;
         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+        return self.tryPushResolvedContinuationCall(
+            exec_frames, parent_index, resolved, completion, debug_namewhat, debug_name,
+        );
+    }
+
+    /// Push a pre-resolved `ResolvedCall` as a bytecode continuation frame.
+    /// This is the invocation half of the resolve→invoke split for the
+    /// `pending_calls`-based continuation path (CONCAT, pairs, hooks, etc.).
+    /// Returns false if the resolved callee is not a bytecode Closure (Builtin,
+    /// C-closure) — the caller handles the synchronous case using the same
+    /// `ResolvedCall`, avoiding double resolution (Task 5).
+    fn tryPushResolvedContinuationCall(
+        self: *Vm,
+        exec_frames: *FrameStack,
+        parent_index: usize,
+        resolved: ResolvedCall,
+        completion: BytecodePendingCompletion,
+        debug_namewhat: ?[]const u8,
+        debug_name: ?[]const u8,
+    ) DispatchError!bool {
         const cl = switch (resolved.callee) {
             .Closure => |closure| closure,
             else => return false,
@@ -7384,21 +7408,43 @@ pub const Vm = struct {
         compare: bool, // invert
     };
 
-    /// P16.7 Task 6: Push a metamethod as a bytecode child frame with an
-    /// inline simple-result completion — bypassing the pending_calls array
-    /// entirely. The completion info (dst/event/invert) is stored directly
-    /// in the parent CallFrame's LuaFrameState, not in a pending_calls slot.
+    /// Outcome of `tryPushSimpleResultMetamethod`: either a continuation frame
+    /// was pushed (caller continues `:frame_loop`), or the metamethod was
+    /// invoked synchronously and the result is available directly.
+    const SimpleResultOutcome = union(enum) {
+        pushed, // continuation frame pushed — caller does continue :frame_loop
+        value: Value, // synchronous result for `.value` completion
+        compare: bool, // synchronous result for `.compare` completion
+    };
+
+    /// PUC two-stage metamethod invocation for the bytecode VM (Task 1+3+5+6+7+8).
     ///
-    /// This is the inline equivalent of `tryPushResolvedMetamethod` for the
-    /// `.value` and `.compare` completion cases. It eliminates:
-    ///   - `allocPendingCall` (free-list or array grow)
-    ///   - `setPendingCall` (payload store + active flag)
-    ///   - `setDebugName` (debug name store in pending_calls slot)
-    ///   - `clearPendingCall` (free-list return + index reset)
-    ///   - The completion dispatch switch in `completeBytecodeExecFrame`
+    /// Stage 1 (caller): `findBinaryTm`/`findUnaryTm` resolves the TMS field
+    /// — UNCHANGED, no `__call` logic inside lookup.
     ///
-    /// Returns false for non-bytecode metamethods (Builtin, Closure without
-    /// proto, non-callable) so the caller falls through to `callMetamethod`.
+    /// Stage 2 (this function): Call the resolved VALUE via normal callable
+    /// semantics — exactly once per invocation (Task 5: NO resolve→fallback→
+    /// resolve-again). `resolveCallable` handles `__call` chains with the
+    /// standard argument transformation (self prepended, original operands
+    /// follow — Task 7: NO special metamethod convention). Then invoke the
+    /// `ResolvedCall`:
+    ///   - bytecode Closure → push child-frame continuation with `simple_result`
+    ///     completion (SAME state as direct-Closure metamethods, so yielding
+    ///     works — Task 6: continuation semantics, NOT forced synchronous
+    ///     host-recursion).
+    ///   - Builtin/C-closure → existing synchronous call boundary.
+    ///
+    /// **Error naming (Task 8):** `resolveCallable` receives
+    /// `.{ .namewhat = "metamethod", .name = opname(event) }` so non-callable
+    /// values produce PUC's exact error text:
+    ///   "attempt to call a number value (metamethod 'add')"
+    ///
+    /// **`__index`/`__newindex` boundary (Task 2):** This function is NOT used
+    /// for `__index`/`__newindex` — their non-function values follow table-index
+    /// chaining (PUC `luaV_finishget`/`luaV_finishset`), not `__call` resolution.
+    /// The `__index`/`__newindex` bytecode paths pre-filter to bytecode Closures
+    /// before calling this function, so the `__call` resolution path is never
+    /// triggered for them.
     fn tryPushSimpleResultMetamethod(
         self: *Vm,
         exec_frames: *FrameStack,
@@ -7407,60 +7453,94 @@ pub const Vm = struct {
         args: []const Value,
         event: TmsEvent,
         completion: SimpleResultCompletion,
-    ) DispatchError!bool {
-        // Fast filter: only bytecode Closures with proto can be pushed as
-        // continuation frames. Same filter as tryPushResolvedMetamethod.
-        if (metamethod != .Closure or metamethod.Closure.proto == null) return false;
+    ) DispatchError!SimpleResultOutcome {
+        const opname = tag_method.opname(event);
 
-        const resolved = self.resolveCallable(metamethod, args, null) catch return false;
+        // Stage 2: resolve ONCE through normal callable semantics.
+        // resolveCallable handles __call chains (self prepended, operands
+        // follow) and produces PUC's exact error text for non-callable values.
+        const resolved = try self.resolveCallable(metamethod, args, .{
+            .namewhat = "metamethod",
+            .name = opname,
+        });
         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-        const cl = switch (resolved.callee) {
-            .Closure => |closure| closure,
-            else => return false,
-        };
-        const proto = cl.proto orelse return false;
 
-        // Set inline simple-result completion — no pending_calls slot needed.
-        // P16.8a Task 5: The simple_result state is set BEFORE the fallible
-        // child-activation operations (pushBytecodeExecFrame + hook dispatch).
-        // The errdefer below rolls it back if either fails, mirroring the
-        // errdefer clearPendingCall pattern in tryPushBytecodeContinuationCall.
-        //
-        // Three-boundary analysis:
-        //   1. push failed — child frame never joined the call stack.
-        //      errdefer clears simple_result; parent is exactly as it was.
-        //   2. hook dispatch failed after child exists — child frame IS on
-        //      exec_frames. errdefer clears simple_result on the parent; the
-        //      child frame is unwound by the general error-recovery machinery
-        //      (recoverBytecodeDispatchError → appendBytecodeUnwind), exactly
-        //      as in the pending-call path.
-        //   3. child began execution — normal return consumes simple_result
-        //      once; yield preserves; error/unwind clears via popBytecodeExecFrame
-        //      (P16.8 Task 3 audit). No errdefer needed here.
-        const parent = exec_frames.getPtr(parent_index);
-        std.debug.assert(parent.pending_call_index == INVALID_PENDING);
-        // On entry to the fallible window, simple_result must be NONE.
-        std.debug.assert(!parent.u.lua.hasSimpleResult());
-        switch (completion) {
-            .value => |dst| {
-                parent.u.lua.setSimpleValueResult(dst, event);
+        switch (resolved.callee) {
+            .Closure => |cl| {
+                const proto = cl.proto orelse {
+                    // C closure (c_func set, proto null) — synchronous.
+                    return .{ .value = try self.callResolvedMetamethodSync(
+                        resolved, opname,
+                    ) };
+                };
+                // Bytecode closure — push continuation frame with simple_result
+                // completion. This is the SAME continuation state as direct-
+                // Closure metamethods, so yielding works (Task 6).
+                //
+                // P16.8a Task 5: The simple_result state is set BEFORE the
+                // fallible child-activation operations (pushBytecodeExecFrame +
+                // hook dispatch). The errdefer below rolls it back if either
+                // fails, mirroring the errdefer clearPendingCall pattern in
+                // tryPushBytecodeContinuationCall.
+                const parent = exec_frames.getPtr(parent_index);
+                std.debug.assert(parent.pending_call_index == INVALID_PENDING);
+                std.debug.assert(!parent.u.lua.hasSimpleResult());
+                switch (completion) {
+                    .value => |dst| parent.u.lua.setSimpleValueResult(dst, event),
+                    .compare => |invert| parent.u.lua.setSimpleCompareResult(event, invert),
+                }
+                // Roll back simple_result if child-frame push or hook dispatch
+                // fails. Re-fetch via getPtr: pushBytecodeExecFrame may realloc.
+                errdefer exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
+
+                try self.pushBytecodeExecFrame(
+                    exec_frames, proto, resolved.args, cl, self.bc_stack_top, -1,
+                );
+                // No setDebugName — debug name is derived from simple_result_event
+                // at read time via getDebugName().
+                try self.dispatchCalleeActivationHook(exec_frames, resolved.callee, resolved.args.len);
+                return .pushed;
             },
-            .compare => |invert| {
-                parent.u.lua.setSimpleCompareResult(event, invert);
+            .Builtin => {
+                return .{ .value = try self.callResolvedMetamethodSync(
+                    resolved, opname,
+                ) };
             },
+            else => unreachable, // resolveCallable errors on non-callable
         }
-        // Roll back simple_result if child-frame push or hook dispatch fails.
-        // Re-fetch via getPtr: pushBytecodeExecFrame may realloc FrameStack,
-        // invalidating the `parent` pointer captured above.
-        errdefer exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
+    }
 
-        // Push the child frame with MULTRET (same as .value/.compare in the
-        // old path: cont_nresults = -1 for non-.results completions).
-        try self.pushBytecodeExecFrame(exec_frames, proto, resolved.args, cl, self.bc_stack_top, -1);
-        // No setDebugName — debug name is derived from simple_result_event
-        // at read time via getDebugName().
-        try self.dispatchCalleeActivationHook(exec_frames, resolved.callee, resolved.args.len);
-        return true;
+    /// Synchronous invocation of a resolved metamethod for the non-continuation
+    /// case (Builtin or C-closure). Sets debug name overrides matching
+    /// `callMetamethod`'s behavior, then invokes via `callBuiltin`/`runClosure`.
+    /// Returns the raw result Value — the caller handles `.value`/`.compare`
+    /// completion transformation.
+    fn callResolvedMetamethodSync(
+        self: *Vm,
+        resolved: ResolvedCall,
+        opname: []const u8,
+    ) DispatchError!Value {
+        const saved_nwo = self.debug_namewhat_override;
+        const saved_no = self.debug_name_override;
+        self.debug_namewhat_override = "metamethod";
+        self.debug_name_override = opname;
+        defer {
+            self.debug_namewhat_override = saved_nwo;
+            self.debug_name_override = saved_no;
+        }
+        return switch (resolved.callee) {
+            .Builtin => |id| blk: {
+                var out: [1]Value = .{.Nil};
+                try self.callBuiltin(id, resolved.args, out[0..]);
+                break :blk out[0];
+            },
+            .Closure => |cl| blk: {
+                const ret = try self.runClosure(cl, resolved.args);
+                defer self.alloc.free(ret);
+                break :blk if (ret.len > 0) ret[0] else .Nil;
+            },
+            else => unreachable,
+        };
     }
 
     /// `pairs` is one of the standard-library C functions that Lua makes
@@ -7634,17 +7714,21 @@ pub const Vm = struct {
                 }
                 if (mm == .Closure and mm.Closure.proto != null) {
                     const args = [_]Value{ object, key };
-                    const pushed = try self.tryPushSimpleResultMetamethod(
+                    // Task 2: __index pre-filters to bytecode Closures —
+                    // tryPushSimpleResultMetamethod only pushes (no __call
+                    // resolution for __index; non-function values follow
+                    // table-index chaining via .resolved below).
+                    switch (try self.tryPushSimpleResultMetamethod(
                         exec_frames,
                         parent_index,
                         mm,
                         args[0..],
                         .index,
                         .{ .value = dst },
-                    );
-                    if (pushed) return .pushed;
-                    // tryPushSimpleResultMetamethod returned false (rare:
-                    // resolveCallable failed). Fall through to resolved.
+                    )) {
+                        .pushed => return .pushed,
+                        else => {},
+                    }
                 }
                 return .{ .resolved = .{ .mm = mm, .obj = object } };
             }
@@ -7656,15 +7740,17 @@ pub const Vm = struct {
             }
             if (mm == .Closure and mm.Closure.proto != null) {
                 const args = [_]Value{ object, key };
-                const pushed = try self.tryPushSimpleResultMetamethod(
+                switch (try self.tryPushSimpleResultMetamethod(
                     exec_frames,
                     parent_index,
                     mm,
                     args[0..],
                     .index,
                     .{ .value = dst },
-                );
-                if (pushed) return .pushed;
+                )) {
+                    .pushed => return .pushed,
+                    else => {},
+                }
             }
             return .{ .resolved = .{ .mm = mm, .obj = object } };
         }
@@ -8045,6 +8131,17 @@ pub const Vm = struct {
                 return self.fail("attempt to concatenate a {s} value", .{bad.typeName()});
             };
             const args = [_]Value{ lhs, acc };
+
+            // PUC two-stage: resolve ONCE through normal callable semantics
+            // (handles __call chains), then invoke — bytecode Closure as
+            // continuation frame (yieldable), Builtin/C-closure synchronously.
+            // No double resolution (Task 5).
+            const resolved = try self.resolveCallable(mm, args[0..], .{
+                .namewhat = "metamethod",
+                .name = "concat",
+            });
+            defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+
             const concat_state = try self.alloc.create(BytecodeConcatContinuation);
             concat_state.* = .{
                 .dst = dst,
@@ -8052,20 +8149,41 @@ pub const Vm = struct {
                 .remaining = remaining - 1,
                 .acc = acc,
             };
-            if (try self.tryPushBytecodeMetamethod(
+            if (try self.tryPushResolvedContinuationCall(
                 exec_frames,
                 parent_index,
-                mm,
-                "concat",
-                args[0..],
+                resolved,
                 .{ .concat = concat_state },
+                "metamethod",
+                "concat",
             )) {
                 owns_values = false;
                 return .pushed;
             }
             self.alloc.destroy(concat_state);
 
-            acc = try self.callMetamethod(mm, "concat", args[0..]);
+            // Synchronous invocation (Builtin or C-closure).
+            const saved_nwo = self.debug_namewhat_override;
+            const saved_no = self.debug_name_override;
+            self.debug_namewhat_override = "metamethod";
+            self.debug_name_override = "concat";
+            defer {
+                self.debug_namewhat_override = saved_nwo;
+                self.debug_name_override = saved_no;
+            }
+            acc = switch (resolved.callee) {
+                .Builtin => |id| blk: {
+                    var out: [1]Value = .{.Nil};
+                    try self.callBuiltin(id, resolved.args, out[0..]);
+                    break :blk out[0];
+                },
+                .Closure => |cl| blk: {
+                    const ret = try self.runClosure(cl, resolved.args);
+                    defer self.alloc.free(ret);
+                    break :blk if (ret.len > 0) ret[0] else .Nil;
+                },
+                else => unreachable,
+            };
             try roots.add(acc);
             remaining -= 1;
         }
@@ -13137,8 +13255,12 @@ pub const Vm = struct {
                         if (tm == null) {
                             return self.failBinaryMmbin(lhs, rhs, event, ctx.cur_proto, ctx.pc - 1, a, b);
                         }
-                        // Try to push as bytecode frame (Lua Closure with proto).
-                        if (try self.tryPushSimpleResultMetamethod(
+                        // PUC two-stage: resolve the TMS value through normal
+                        // callable semantics (handles __call chains), then
+                        // invoke — bytecode Closure as continuation frame
+                        // (yieldable), Builtin/C-closure synchronously.
+                        exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                        switch (try self.tryPushSimpleResultMetamethod(
                             exec_frames,
                             ctx.frame_index,
                             tm.?,
@@ -13146,16 +13268,13 @@ pub const Vm = struct {
                             event,
                             .{ .value = pi.a },
                         )) {
-                            continue :frame_loop;
+                            .pushed => continue :frame_loop,
+                            .value => |result| {
+                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                ctx.regs[pi.a] = result;
+                            },
+                            .compare => unreachable, // MMBIN never uses .compare
                         }
-                        // Not a bytecode Closure — call synchronously
-                        // (Builtin, Closure without proto, or not callable).
-                        // callMetamethod produces PUC's call error for
-                        // non-callable values (luaG_callerror).
-                        exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                        const result = try self.callMetamethod(tm.?, tag_method.opname(event), &.{ lhs, rhs });
-                        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                        ctx.regs[pi.a] = result;
                     },
                     // PUC lvm.c:1566 OP_MMBINI: A=lhs_reg, sB=imm, C=event, k=flip.
                     // flip=0 → (R[A], Int(sB)); flip=1 → (Int(sB), R[A]).
@@ -13173,7 +13292,8 @@ pub const Vm = struct {
                             // Bad operand is always R[A] (immediate is always valid).
                             return self.failBinaryMmbin(lhs, rhs, event, ctx.cur_proto, ctx.pc - 1, a, a);
                         }
-                        if (try self.tryPushSimpleResultMetamethod(
+                        exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                        switch (try self.tryPushSimpleResultMetamethod(
                             exec_frames,
                             ctx.frame_index,
                             tm.?,
@@ -13181,12 +13301,13 @@ pub const Vm = struct {
                             event,
                             .{ .value = pi.a },
                         )) {
-                            continue :frame_loop;
+                            .pushed => continue :frame_loop,
+                            .value => |result| {
+                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                ctx.regs[pi.a] = result;
+                            },
+                            .compare => unreachable, // MMBINI never uses .compare
                         }
-                        exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                        const result = try self.callMetamethod(tm.?, tag_method.opname(event), &.{ lhs, rhs });
-                        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                        ctx.regs[pi.a] = result;
                     },
                     // PUC lvm.c:1576 OP_MMBANK: A=lhs_reg, B=K_idx, C=event, k=flip.
                     // flip=0 → (R[A], K[B]); flip=1 → (K[B], R[A]).
@@ -13206,7 +13327,8 @@ pub const Vm = struct {
                             const p2_reg: u8 = if (flip) a else 255;
                             return self.failBinaryMmbin(lhs, rhs, event, ctx.cur_proto, ctx.pc - 1, p1_reg, p2_reg);
                         }
-                        if (try self.tryPushSimpleResultMetamethod(
+                        exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                        switch (try self.tryPushSimpleResultMetamethod(
                             exec_frames,
                             ctx.frame_index,
                             tm.?,
@@ -13214,12 +13336,13 @@ pub const Vm = struct {
                             event,
                             .{ .value = pi.a },
                         )) {
-                            continue :frame_loop;
+                            .pushed => continue :frame_loop,
+                            .value => |result| {
+                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                ctx.regs[pi.a] = result;
+                            },
+                            .compare => unreachable, // MMBANK never uses .compare
                         }
-                        exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                        const result = try self.callMetamethod(tm.?, tag_method.opname(event), &.{ lhs, rhs });
-                        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                        ctx.regs[pi.a] = result;
                     },
 
                     // PUC lvm.c:1586 OP_UNM: no following MMBIN — handles
@@ -13240,7 +13363,8 @@ pub const Vm = struct {
                                 exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                                 return self.failBinaryMmbin(val, val, .unm, ctx.cur_proto, ctx.pc, b, b);
                             }
-                            if (try self.tryPushSimpleResultMetamethod(
+                            exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                            switch (try self.tryPushSimpleResultMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
                                 tm.?,
@@ -13248,13 +13372,13 @@ pub const Vm = struct {
                                 .unm,
                                 .{ .value = a },
                             )) {
-                                continue :frame_loop;
+                                .pushed => continue :frame_loop,
+                                .value => |result| {
+                                    ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                    ctx.regs[a] = result;
+                                },
+                                .compare => unreachable,
                             }
-                            // Not a bytecode Closure — call synchronously.
-                            exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                            const result = try self.callMetamethod(tm.?, tag_method.opname(.unm), &.{ val, val });
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
                         }
                     },
                     // PUC lvm.c:1598 OP_BNOT: no following MMBIN — handles
@@ -13278,7 +13402,8 @@ pub const Vm = struct {
                                     exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                                     return self.failBinaryMmbin(val, val, .bnot, ctx.cur_proto, ctx.pc, b, b);
                                 }
-                                if (try self.tryPushSimpleResultMetamethod(
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                switch (try self.tryPushSimpleResultMetamethod(
                                     exec_frames,
                                     ctx.frame_index,
                                     tm.?,
@@ -13286,13 +13411,13 @@ pub const Vm = struct {
                                     .bnot,
                                     .{ .value = a },
                                 )) {
-                                    continue :frame_loop;
+                                    .pushed => continue :frame_loop,
+                                    .value => |result| {
+                                        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                        ctx.regs[a] = result;
+                                    },
+                                    .compare => unreachable,
                                 }
-                                // Not a bytecode Closure — call synchronously.
-                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                                const result = try self.callMetamethod(tm.?, tag_method.opname(.bnot), &.{ val, val });
-                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                                ctx.regs[a] = result;
                             }
                         }
                     },
@@ -13308,7 +13433,8 @@ pub const Vm = struct {
                         } else {
                             const tm = self.findUnaryTm(val, .len);
                             if (tm) |mm| {
-                                if (try self.tryPushSimpleResultMetamethod(
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                switch (try self.tryPushSimpleResultMetamethod(
                                     exec_frames,
                                     ctx.frame_index,
                                     mm,
@@ -13316,13 +13442,13 @@ pub const Vm = struct {
                                     .len,
                                     .{ .value = a },
                                 )) {
-                                    continue :frame_loop;
+                                    .pushed => continue :frame_loop,
+                                    .value => |result| {
+                                        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                        ctx.regs[a] = result;
+                                    },
+                                    .compare => unreachable,
                                 }
-                                // Not a bytecode Closure — call synchronously.
-                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                                const result = try self.callMetamethod(mm, tag_method.opname(.len), &.{ val, val });
-                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                                ctx.regs[a] = result;
                             } else {
                                 // No __len metamethod: Table → border length,
                                 // anything else → type error (matches evalUnOp).
@@ -13366,7 +13492,8 @@ pub const Vm = struct {
                                 // Resolve __eq ONCE — no re-lookup.
                                 const tm = self.findBinaryTm(la, lb, .eq);
                                 if (tm) |mm| {
-                                    if (try self.tryPushSimpleResultMetamethod(
+                                    exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                    switch (try self.tryPushSimpleResultMetamethod(
                                         exec_frames,
                                         ctx.frame_index,
                                         mm,
@@ -13374,13 +13501,13 @@ pub const Vm = struct {
                                         .eq,
                                         .{ .compare = c != 0 },
                                     )) {
-                                        continue :frame_loop;
+                                        .pushed => continue :frame_loop,
+                                        .value => |ret| {
+                                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                            break :blk isTruthy(ret);
+                                        },
+                                        .compare => |cmp| break :blk cmp,
                                     }
-                                    // Not a bytecode Closure — call synchronously.
-                                    exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                                    const ret = try self.callMetamethod(mm, tag_method.opname(.eq), &.{ la, lb });
-                                    ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                                    break :blk isTruthy(ret);
                                 }
                             }
                             break :blk false;
@@ -33345,6 +33472,29 @@ pub const Vm = struct {
         return null;
     }
 
+    /// Invoke a resolved metamethod value through the NORMAL call machinery.
+    ///
+    /// PUC two-stage model (ltm.c:103-135, ldo.c:523-536):
+    ///   Stage 1: TMS/metafield resolution (findBinaryTm/getTmByObj/getMetaField)
+    ///            — performed by the caller, produces the raw metamethod TValue.
+    ///   Stage 2: Call the resolved VALUE via normal callable semantics.
+    ///            PUC's `luaT_callTMres` pushes the metamethod value onto the
+    ///            stack and calls `luaD_call`, which enters `luaD_precall` →
+    ///            `tryfuncTM` — the SAME `__call` chain resolution used for
+    ///            ordinary calls. A table-valued `__add` with a `__call`
+    ///            metamethod is dispatched through the identical path as a
+    ///            direct function-valued `__add`.
+    ///
+    /// This function implements Stage 2 for the synchronous (non-continuation)
+    /// path: `resolveCallable` handles `__call` chains (self prepended,
+    /// original operands follow — the standard argument transformation, NO
+    /// special metamethod convention), then the resolved callee is invoked
+    /// synchronously via `callBuiltin` or `runClosure`.
+    ///
+    /// **Error naming (Task 8):** `resolveCallable` receives
+    /// `.{ .namewhat = "metamethod", .name = opname }` so that non-callable
+    /// values produce PUC's exact error text:
+    ///   "attempt to call a number value (metamethod 'add')"
     fn callMetamethod(self: *Vm, mmv: Value, opname: []const u8, args: []const Value) DispatchError!Value {
         if (self.stats.enabled) self.stats.calls_metamethod += 1; // P16.0b
         const saved_nwo = self.debug_namewhat_override;
@@ -33356,19 +33506,28 @@ pub const Vm = struct {
             self.debug_name_override = saved_no;
         }
 
-        switch (mmv) {
-            .Builtin => |id| {
+        // Stage 2: resolve through normal callable semantics (handles __call
+        // chains), then invoke synchronously. resolveCallable produces PUC's
+        // exact error text for non-callable values via the call_name parameter.
+        const resolved = try self.resolveCallable(mmv, args, .{
+            .namewhat = "metamethod",
+            .name = opname,
+        });
+        defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+
+        return switch (resolved.callee) {
+            .Builtin => |id| blk: {
                 var out: [1]Value = .{.Nil};
-                try self.callBuiltin(id, args, out[0..]);
-                return out[0];
+                try self.callBuiltin(id, resolved.args, out[0..]);
+                break :blk out[0];
             },
-            .Closure => |cl| {
-                const ret = try self.runClosure(cl, args);
+            .Closure => |cl| blk: {
+                const ret = try self.runClosure(cl, resolved.args);
                 defer self.alloc.free(ret);
-                return if (ret.len > 0) ret[0] else .Nil;
+                break :blk if (ret.len > 0) ret[0] else .Nil;
             },
-            else => return self.fail("attempt to call a {s} value (metamethod '{s}')", .{ mmv.typeName(), opname }),
-        }
+            else => unreachable, // resolveCallable errors on non-callable
+        };
     }
 
     fn callBinaryMetamethod(self: *Vm, lhs: Value, rhs: Value, event: TmsEvent) DispatchError!?Value {
@@ -34584,7 +34743,8 @@ pub const Vm = struct {
     ) DispatchError!CmpSlowResult {
         const tm = self.findBinaryTm(la, lb, event);
         if (tm) |mm| {
-            if (try self.tryPushSimpleResultMetamethod(
+            exec_frames.getPtr(frame_index).u.lua.pc = pc;
+            switch (try self.tryPushSimpleResultMetamethod(
                 exec_frames,
                 frame_index,
                 mm,
@@ -34592,11 +34752,10 @@ pub const Vm = struct {
                 event,
                 .{ .compare = invert },
             )) {
-                return .pushed;
+                .pushed => return .pushed,
+                .value => |ret| return .{ .value = isTruthy(ret) },
+                .compare => |cmp| return .{ .value = cmp },
             }
-            exec_frames.getPtr(frame_index).u.lua.pc = pc;
-            const ret = try self.callMetamethod(mm, tag_method.opname(event), &.{ la, lb });
-            return .{ .value = isTruthy(ret) };
         }
         return self.failCompare(la, lb);
     }
@@ -40294,7 +40453,7 @@ test "vm: P16.8a transactional simple_result setup — errdefer rollback on push
         defer vm.alloc = saved_alloc;
 
         const args = [_]Value{ .Nil, .Nil };
-        const pushed = try vm.tryPushSimpleResultMetamethod(
+        const outcome = try vm.tryPushSimpleResultMetamethod(
             exec_frames,
             parent_index,
             .{ .Closure = mm_cl },
@@ -40305,7 +40464,7 @@ test "vm: P16.8a transactional simple_result setup — errdefer rollback on push
 
         vm.alloc = saved_alloc;
 
-        try testing.expect(pushed);
+        try testing.expect(outcome == .pushed);
         // Parent must have simple_result set (errdefer did NOT fire).
         try testing.expect(
             exec_frames.getPtr(parent_index).u.lua.hasSimpleResult(),

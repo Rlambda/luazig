@@ -4731,6 +4731,29 @@ No exceptions: `closeManagedFile` no longer touches finalizer registration
 | nextvar 3× | 3/3 PASS |
 | native_mem | BOUNDED |
 
+### Commit 2 — remove stale captured-local workarounds
+
+Removed three codegen sites that were based on the obsolete VM model
+(SETUPVAL writes to cell.value, not the stack slot). Under the P16.8a
+invariant, the stack register IS the authoritative storage for an open
+Cell, so these workarounds are dead weight:
+
+- `dischargeVars(.local)` (codegen_bc.zig:530): captured local now uses
+  its register directly — no temp MOVE. Eliminates a redundant MOVE +
+  temp register allocation on every captured-local discharge.
+- `dischargeVars(.vararg_var)` (codegen_bc.zig:551): same fix.
+- Direct-store arithmetic (codegen_bc.zig:5497): removed the
+  `!captured_regs.contains(local_reg)` guard. Arithmetic ADD/MUL/etc.
+  now writes directly to the captured local's register, visible to
+  closures via the open Cell. Restores the PUC `luaK_storevar` VLOCAL
+  direct-store optimization for captured locals.
+
+Sites NOT touched (correct behavior, not workarounds):
+- `captured_regs.contains` in CLOSE emission (codegen_bc.zig:1132) —
+  correct: captured locals must be closed on scope exit (PUC `leaveblock`).
+- `anyCapturedInRange` (codegen_bc.zig:1350) — correct: determines
+  whether loop back-edges need OP_CLOSE.
+
 ---
 
 ## P16.8a Tasks 2+3+4 — captured-local storage invariant (2026-08-29)

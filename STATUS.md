@@ -1,4 +1,4 @@
-> Last updated: 2026-08-28 (P16.4g — correctness closure: nextvar bisect resolved, fresh master zig_fail=0, remaining gen-GC approximations documented)
+> Last updated: 2026-08-29 (P16.6 — typed TMS, real MMBIN, string-mt arithmetic; geomean 2.21x→1.91x; native_mem_check fixed)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -35,9 +35,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | _not run_ |
 | Smoke tests (`tests/smoke/*.lua`) | _not run — no smoke JSON provided_ |
 | C API suites (`tests/c_api`) | 18 suites |
-| Performance (geomean vs PUC) | **2.21x** |
+| Performance (geomean vs PUC) | **1.91x** |
 
-Geomean замедления vs PUC Lua: **2.21x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.91x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -3712,6 +3712,61 @@ syncFrame = 3.48% lua_calls (было 4.8% до P16.2d/P16.5) — вклад в 
 
 ### Финал: geomean 2.38x → **2.21x** (baseline 2.22x); коридор сессии
 P16.4f→P16.5: 2.53x → 2.21x (−13%). Полный гейт зелёный на каждом шаге.
+
+## P16.6 — typed TMS / real MMBIN / string-mt arithmetic (2026-08-29)
+
+### Task 0 — native_mem_check false-green fix (`643a772`)
+Старый lane читал /proc/<pid> ПОСЛЕ wait() — процесс уже reaped → VmHWM=0 →
+BOUNDED всегда. Фикс: os.wait4 + rusage.ru_maxrss, проверка exit-статуса/
+сигналов, selftest с bounded/growing детьми (дискриминация доказана:
+15.6MB flat vs 56→522MB LINEAR). Coroutine 100k/300k/1M: 15.68MB flat.
+
+### Task 1+8 — dead-state cleanup + fast-path audit (`2daba78`)
+caller_builtin_id: grep-доказано write-only (6 write / 0 read) — поле и
+save/restore удалены; комментарий fast-path переписан на измеренные стоимости
+(addOne — inline storage ≤32 кадров, heap-спилл редок); InlineValues.setOwned
+no-op удалён; audit: callCoroutineBuiltinDirect делегирует тем же builtin-
+телам, дублей семантики нет.
+
+### Tasks 2+3 — typed TmsEvent + getTm primitives (`dc38fb6`)
+TmsEvent = PUC ltm.h порядок (24 события; <=eq — flags-зона). luazig-only
+члены (tostring/name/pairs/metatable) вынесены в MetaField + pre-interned
+names; .iter удалён (мёртвый). getTm/getTmByObj (pre-interned + nodeLookupStr
+без seed-параметра) + fastTm (Table.flags cache ТОЛЬКО <=eq, инвалидация на
+newkey/revival/rehash — PUC invalidateTMcache). **Кэширование арифметических
+TMS отсутствует — mt.__add мутации видны немедленно.** matchTmsEvent и
+metamethodValue удалены (~20 TMS + ~9 MetaField сайтов мигрировано).
+
+### Tasks 4+5+6 — real MMBIN family (`2b4d978`)
+MMBIN/MMBINI/MMBANK — семантические хендлеры (PUC luaT_trybinTM): previous-
+instruction dest, typed event из C, lhs→rhs precedence, PUC error-shapes,
+вызов через общий continuation-mechanism (yield-безопасно). 15 арифметических
+хендлеров редуцированы до primitive+skip (coercion-ветки убраны позже — см.
+ниже); UNM/BNOT typed; dead evalBinOp/addSlowPath удалены (−147 строк).
+ADDI-flip: x−K → __SUB(x,K), K−x → __SUB(K,x) — source-порядок сохранён.
+
+### Task 7 — differential tests (`dcbd569`)
+tests/smoke/58_metamethod_dispatch.lua: A-H (precedence, anti-cache мутация
+f1→f2→nil→f3 для __add/__sub, 12 событий, MMBINI/MMBINK flip с "event:left/right"
+тегами, unary, yielding+nested metamethod, hooks cr-trace). Subtleties: PUC
+flip меняет ПОИСК metamethod, но НЕ порядок операндов; numeric-string
+coercion — только арифметика (bitwise строки отвергает).
+
+### Parity-гэпы → PUC string-metatable arithmetic (`b183a82`)
+Найдено при тестировании: PUC coercion строк — через string-mt metamethod'ы
+(lstrlib arith/trymt), не inline. Реализовано: 8 metamethod'ов на string mt,
+inline-coercion удалена из 15 хендлеров + C API lua_arith; двухоперандные
+trymt-форматы ошибок ("attempt to add a 'table' with a 'string'");
+getmetatable("").__add("3","4")==7. Все кейсы byte-identical.
+
+### Финал
+Гейт: Debug+RF builds/tests 0; c_api 18/18 + strict DIFF; matrix zig_fail=0;
+smoke 58/58; nextvar 10/10; 6 сьютов --testc; leak_bench; native_mem_check
+selftest PASS + coroutine BOUNDED; CallFrame≤104; Node 32B (24B-эксперимент
+не возобновлялся).
+Perf: **geomean 2.21x → 1.91x** (isolated int_arith ~1.6x: 27.7G/4.69G instr/cyc
+vs PUC 13.9G/2.94G — упрощение dispatch-хендлеров реальное). Top: metamethod_add
+3.42x, lua_calls 2.29x, hash_access 2.28x.
 
 ## История закрытых фаз
 

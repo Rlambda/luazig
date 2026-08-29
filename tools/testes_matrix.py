@@ -8,11 +8,30 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
+
+
+def lane_metadata(argv: list[str]) -> dict:
+    """Metadata stamped into the versioned JSON artifact so a reader can tell
+    exactly which lane/flags/host produced it. Zig version is captured cheaply
+    via `zig version` (fails soft to None)."""
+    zig_ver: str | None = None
+    try:
+        zig_ver = subprocess.check_output(
+            ["zig", "version"], stderr=subprocess.DEVNULL, text=True).strip()
+    except Exception:
+        zig_ver = None
+    return {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "lane": "testes_matrix",
+        "argv": argv,
+        "zig_version": zig_ver,
+    }
 
 
 def parse_timeout_overrides(raw: str) -> dict[str, int]:
@@ -357,6 +376,7 @@ def main() -> int:
     if args.json_out:
         out_path = Path(args.json_out)
         payload = {
+            "meta": lane_metadata(sys.argv),
             "summary": {
                 "total": total,
                 "pass": pass_n,

@@ -73,9 +73,12 @@ def parse_capi_suite_count(makefile: Path) -> int | None:
 # Section builders
 # ---------------------------------------------------------------------------
 
-def parity_rows(matrix: dict | None, smoke: dict | None, capi_n: int | None) -> list[str]:
+def parity_rows(matrix: dict | None, smoke: dict | None, capi_n: int | None,
+                versioned: bool = False) -> list[str]:
     """Build the Parity table rows from the provided inputs."""
     rows: list[str] = []
+    not_run_matrix = "_not run (no versioned artifact)_" if versioned else "_not run — no matrix JSON provided_"
+    not_run_smoke = "_not run (no versioned artifact)_" if versioned else "_not run — no smoke JSON provided_"
 
     if matrix:
         s = matrix.get("summary", {})
@@ -89,7 +92,7 @@ def parity_rows(matrix: dict | None, smoke: dict | None, capi_n: int | None) -> 
         rows.append(f"| Matrix non-pass | {detail} |")
     else:
         rows.append(
-            "| Upstream matrix (`testes/*.lua`, `--testc`) | _not run — no matrix JSON provided_ |"
+            f"| Upstream matrix (`testes/*.lua`, `--testc`) | {not_run_matrix} |"
         )
 
     if smoke:
@@ -98,7 +101,7 @@ def parity_rows(matrix: dict | None, smoke: dict | None, capi_n: int | None) -> 
             "match (byte-identical stdout+stderr+exit) |"
         )
     else:
-        rows.append("| Smoke tests (`tests/smoke/*.lua`) | _not run — no smoke JSON provided_ |")
+        rows.append(f"| Smoke tests (`tests/smoke/*.lua`) | {not_run_smoke} |")
 
     if capi_n is not None:
         rows.append(
@@ -125,14 +128,15 @@ def matrix_nonpass_detail(matrix: dict) -> str:
     return "; ".join(f"{cls}: {', '.join(files)}" for cls, files in sorted(by_class.items()))
 
 
-def perf_section(perf: dict | None) -> list[str]:
+def perf_section(perf: dict | None, versioned: bool = False) -> list[str]:
     """Build the Performance section: geomean + per-workload table (worst first).
 
     Geomean mirrors perf_compare.py's print_table: exp(mean(log(ratio))).
     """
     lines: list[str] = ["### Performance", ""]
+    not_run = "_not run (no versioned artifact)_" if versioned else "_not run — no perf JSON provided._"
     if not perf:
-        lines.append("Geomean slowdown vs PUC Lua: _not run — no perf JSON provided._")
+        lines.append(f"Geomean slowdown vs PUC Lua: {not_run}")
         lines.append("")
         return lines
 
@@ -157,15 +161,16 @@ def perf_section(perf: dict | None) -> list[str]:
     return lines
 
 
-def build_block(matrix: dict | None, smoke: dict | None, perf: dict | None) -> str:
+def build_block(matrix: dict | None, smoke: dict | None, perf: dict | None,
+                versioned: bool = False) -> str:
     """Assemble the full generated status block (without the markers)."""
     capi_n = parse_capi_suite_count(CAPI_MAKEFILE)
     lines: list[str] = ["### Parity", "", "| Metric | Result |", "|--------|--------|"]
-    lines.extend(parity_rows(matrix, smoke, capi_n))
+    lines.extend(parity_rows(matrix, smoke, capi_n, versioned))
     lines.append("")
     lines.append("Regression lane: `python3 tools/testes_matrix.py --testc` (no `_port`/`_soft` prelude overrides).")
     lines.append("")
-    lines.extend(perf_section(perf))
+    lines.extend(perf_section(perf, versioned))
     # Trim the trailing blank line; the END marker follows on its own line.
     while lines and lines[-1] == "":
         lines.pop()
@@ -177,10 +182,13 @@ def build_block(matrix: dict | None, smoke: dict | None, perf: dict | None) -> s
 # ---------------------------------------------------------------------------
 
 def build_status_summary_block(matrix: dict | None, smoke: dict | None,
-                               perf: dict | None) -> str:
+                               perf: dict | None, versioned: bool = False) -> str:
     """Compact summary for the top of STATUS.md, from the same JSON inputs as
     the README block. One generated source of truth for both files."""
     lines: list[str] = ["| Metric | Result |", "|--------|--------|"]
+    nr_matrix = "_not run (no versioned artifact)_" if versioned else "_not run — no matrix JSON provided_"
+    nr_smoke = "_not run (no versioned artifact)_" if versioned else "_not run — no smoke JSON provided_"
+    nr_perf = "_not run (no versioned artifact)_" if versioned else "_not run — no perf JSON provided_"
 
     if matrix:
         s = matrix.get("summary", {})
@@ -191,13 +199,13 @@ def build_status_summary_block(matrix: dict | None, smoke: dict | None,
         lines.append(f"| Matrix non-pass | {matrix_nonpass_detail(matrix)} |")
         lines.append(f"| Differential output (`--diff`) | **{s.get('output_diff', 0)} output_diff** |")
     else:
-        lines.append("| Upstream matrix (`testes/*.lua`, `--testc`) | _not run — no matrix JSON provided_ |")
+        lines.append(f"| Upstream matrix (`testes/*.lua`, `--testc`) | {nr_matrix} |")
         lines.append("| Differential output (`--diff`) | _not run_ |")
 
     if smoke:
         lines.append(f"| Smoke tests (`tests/smoke/*.lua`) | **{smoke.get('ok', 0)}/{smoke.get('total', 0)}** pass |")
     else:
-        lines.append("| Smoke tests (`tests/smoke/*.lua`) | _not run — no smoke JSON provided_ |")
+        lines.append(f"| Smoke tests (`tests/smoke/*.lua`) | {nr_smoke} |")
 
     capi_n = parse_capi_suite_count(CAPI_MAKEFILE)
     if capi_n is not None:
@@ -210,7 +218,7 @@ def build_status_summary_block(matrix: dict | None, smoke: dict | None,
         geomean = math.exp(sum(math.log(r) for r in ratios.values()) / len(ratios))
         lines.append(f"| Performance (geomean vs PUC) | **{geomean:.2f}x** |")
     else:
-        lines.append("| Performance (geomean vs PUC) | _not run — no perf JSON provided_ |")
+        lines.append(f"| Performance (geomean vs PUC) | {nr_perf} |")
 
     lines.append("")
     if ratios:
@@ -268,24 +276,34 @@ def main() -> int:
     ap.add_argument("--perf-current", action="store_true",
                     help="read the versioned snapshot from tools/perf/current.json "
                          "(takes precedence over --perf-json)")
+    ap.add_argument("--use-current", action="store_true",
+                    help="read ALL versioned artifacts: tools/status/current-matrix.json, "
+                         "tools/status/current-smoke.json, tools/perf/current.json. "
+                         "Takes precedence over the explicit --*-json flags. A missing "
+                         "artifact yields an honest '_not run (no versioned artifact)_' row.")
     ap.add_argument("--write-readme", action="store_true",
                     help="replace the generated block in README.md instead of printing")
     ap.add_argument("--write-status", action="store_true",
                     help="also replace the generated compact summary in STATUS.md")
     args = ap.parse_args()
 
-    matrix = load_json(args.matrix_json)
-    smoke = load_json(args.smoke_json)
-    if args.perf_current:
+    if args.use_current:
+        matrix = load_json(str(ROOT / "tools" / "status" / "current-matrix.json"))
+        smoke = load_json(str(ROOT / "tools" / "status" / "current-smoke.json"))
         perf = load_json(str(ROOT / "tools" / "perf" / "current.json"))
     else:
-        perf = load_json(args.perf_json)
+        matrix = load_json(args.matrix_json)
+        smoke = load_json(args.smoke_json)
+        if args.perf_current:
+            perf = load_json(str(ROOT / "tools" / "perf" / "current.json"))
+        else:
+            perf = load_json(args.perf_json)
 
-    block = build_block(matrix, smoke, perf)
+    block = build_block(matrix, smoke, perf, versioned=args.use_current)
     if args.write_readme:
         write_readme(block)
     if args.write_status:
-        write_status_summary(build_status_summary_block(matrix, smoke, perf))
+        write_status_summary(build_status_summary_block(matrix, smoke, perf, versioned=args.use_current))
     else:
         print(block)
     return 0

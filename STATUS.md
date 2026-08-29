@@ -5050,3 +5050,66 @@ cycles are in `runBytecodeDispatch`. Frame-push is the right target for
 `lua_calls` (pushBytecodeExecFrame=11.46%, syncFrame=3.62%), but for
 global_arith the inflation comes from SETTABUP GC barrier, dispatch overhead,
 and GETTABUP string comparison — none of which involve frame-push.
+
+## P16.9a Tasks 4-10 — barrier semantic split (2026-08-29)
+
+### What changed
+
+Replaced composite `gcTableWriteBarrier(table, key, value)` with PUC-faithful
+typed barrier vocabulary:
+
+- `gcTableBarrierBackValue(table, value)` — existing-slot update barrier
+  (VALUE only; PUC `luaV_finishfastset`).
+- `gcTableBarrierBackNewKey(table, key)` — new-key insertion barrier
+  (KEY only; PUC `luaH_newkey`).
+- `gcTableBarrierBackSlow(table, child)` — shared inline slow helper (one
+  place for gray/age mutation + grayagain append).
+
+Fast exit: `GcObject.fromValue(value)` returns null for primitives
+(Int/Num/Bool/Nil/Builtin/LightUserdata) — exits BEFORE any gcValueAge/
+gcIsBlack/phase check. PUC `iscollectable(v)` fast exit.
+
+rawSet restructured to 5-step flow: canonicalize key ONCE (no recursion),
+array→value-barrier→store, existing-hash→value-barrier→update/delete,
+absent+nil→return (NO barrier), new-key→key+value barriers→insert/rehash.
+
+Opcode fast paths (SETTABUP/SETTABLE/SETFIELD/SETI/SETLIST): removed 6
+duplicate-barrier sites. Existing-slot: value-barrier once BEFORE store.
+New-key: rawSet owns semantics. Nil delete: no barrier. Array write:
+barrier BEFORE store (was AFTER — OOM safety fix).
+
+### OOM/transactional safety (Task 9)
+
+PUC barriers are infallible (intrusive linked lists). Luazig barriers can
+FAIL (allocator append to gc_grayagain). Safe order: PREPARE barrier
+(fallible grayagain append) BEFORE store. No Lua/GC can run between barrier
+and store (single VM instruction handler, no allocation points between).
+If barrier fails → store does not happen. If barrier succeeds + later op
+fails → extra grayagain entry is harmless (conservatively grayer).
+
+### Performance results
+
+| Metric | Before | After | Delta |
+|--------|--------|-------|-------|
+| SETTABUP isolated (instr/iter) | 322 | 231 | -28.3% |
+| global_arith isolated (instr/iter) | 468 | 377 | -19.4% |
+| global_arith timing (s) | 1.262 | 1.159 | -8.1% |
+| geomean (vs PUC) | 1.92x | 1.91x | -0.5% |
+
+`gcTableBarrierBackSlow`: `inline` (not `noinline`) — `noinline` caused
+code layout regression on comparisons workload (+18%); `inline` preserves
+the SETTABUP improvement with no layout side effects.
+
+### Gate results
+
+- gengc/gc/events/closure/coroutine/errors/nextvar: all green
+- matrix zig_fail=0 (big.lua both_fail pre-existing)
+- smoke 62/62
+- c_api 18 suites clean
+- zig build test (Debug + RF): pass
+
+### Commits
+
+- `a23ea01` T4-7+9: barrier semantic split — typed API + noinline slow helper + OOM invariant
+- `ac72c43` T8: rawSet restructured — 5-step flow, no recursion, no premature barrier
+- `f83b257` T10: opcode fast paths — remove duplicate barriers, fix barrier-before-store order

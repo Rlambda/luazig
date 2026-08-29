@@ -4982,7 +4982,9 @@ via `python3 tools/perf_global_arith_decomp.py`).
 | ADD       | 58   | 32   | 26    | 1.81x | 11.7%          |
 | **Total** | 430  | 208  | 222   | 2.07x | 100%           |
 
-(PUC ADD includes MMBIN no-op; PUC total = 5 opcodes/iter vs zig 4.)
+(Both runtimes LIST 5 opcodes/iter incl. MMBIN; on the int+int fast path
+op_arith_aux does pc++ to SKIP MMBIN, so only 4 opcodes are EXECUTED/iter
+in both PUC and zig — verified via PUC count hook: N=10→52, N=20→92, Δ=40.)
 
 ### Top-3 instruction-inflation contributors
 

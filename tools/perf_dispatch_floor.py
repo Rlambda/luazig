@@ -758,15 +758,26 @@ def run_stash_experiments(baseline: dict, n: int) -> dict:
         # Ensure clean src/
         git_checkout_src()
 
-        # Apply the diagnostic edit
-        edit_fn()
+        # Apply the diagnostic edit; rebuild inside try/finally so a failed
+        # build (e.g. an edit that no longer matches the current source
+        # structure) NEVER leaves experiment residue in the worktree.
+        try:
+            edit_fn()
+            rebuild()
 
-        # Rebuild
-        rebuild()
+            # Measure
+            measured = perf_instr_median(str(ZIG_LUA), n, runs=3,
+                                         extra_args=["--vm=bc"])
+        except subprocess.CalledProcessError as e:
+            print(f"      SKIPPED (edit no longer applies / build failed: {e})")
+            results[label] = {
+                "description": desc,
+                "status": "skipped_stale_edit",
+            }
+            continue
+        finally:
+            git_checkout_src()
 
-        # Measure
-        measured = perf_instr_median(str(ZIG_LUA), n, runs=3,
-                                     extra_args=["--vm=bc"])
 
         # Compute deltas vs baseline
         d_instr = baseline["instr_per_iter"] - measured["instr_per_iter"]

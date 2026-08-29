@@ -1,4 +1,4 @@
-> Last updated: 2026-08-29 (P16.9)
+> Last updated: 2026-08-29 (P16.10 — dispatch floor: jump-table verified (computed-goto не диагноз), stack-poll+SIGINT cleanups, 75→70 instr/iter)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -36,9 +36,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **63/63** pass |
 | C API suites (`tests/c_api`) | 18 suites |
-| Performance (geomean vs PUC) | **1.91x** |
+| Performance (geomean vs PUC) | **1.82x** |
 
-Geomean замедления vs PUC Lua: **1.91x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.82x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.

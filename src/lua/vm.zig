@@ -269,6 +269,18 @@ pub const BuiltinId = enum(u8) {
     string_gmatch_iter,
     string_gsub,
     string_rep,
+    // String metatable arithmetic metamethods (PUC lstrlib.c:299-329).
+    // Registered as __add/__sub/__mul/__mod/__pow/__div/__idiv/__unm on the
+    // string metatable. Each implements PUC's `arith` helper: tonum both
+    // operands → compute via lua_arith; else trymt two-operand error.
+    str_arith_add,
+    str_arith_sub,
+    str_arith_mul,
+    str_arith_mod,
+    str_arith_pow,
+    str_arith_div,
+    str_arith_idiv,
+    str_arith_unm,
     utf8_char,
     utf8_codepoint,
     utf8_len,
@@ -438,6 +450,14 @@ pub const BuiltinId = enum(u8) {
             .string_gmatch_iter => "string.gmatch_iter",
             .string_gsub => "string.gsub",
             .string_rep => "string.rep",
+            .str_arith_add => "__add",
+            .str_arith_sub => "__sub",
+            .str_arith_mul => "__mul",
+            .str_arith_mod => "__mod",
+            .str_arith_pow => "__pow",
+            .str_arith_div => "__div",
+            .str_arith_idiv => "__idiv",
+            .str_arith_unm => "__unm",
             .utf8_char => "utf8.char",
             .utf8_codepoint => "utf8.codepoint",
             .utf8_len => "utf8.len",
@@ -12210,9 +12230,9 @@ pub const Vm = struct {
                     // --- Arithmetic ---
                     // PUC op_arith_aux (lvm.c:992): tonumberns on both operands.
                     // Success → compute + skip MMBIN. Failure → fall through to
-                    // MMBIN (metamethod or error). luazig extends the cold path
-                    // with string coercion (coerceArithmeticValue) since luazig
-                    // lacks PUC's string metatable __add/__sub/etc. (lstrlib.c).
+                    // MMBIN (metamethod or error). String operands are handled
+                    // by the string metatable's __add/__sub/etc. metamethods
+                    // (PUC lstrlib.c), dispatched via MMBIN → getTmByObj.
                     .add => {
                         const lb = ctx.regs[b];
                         const rc = ctx.regs[c];
@@ -12230,17 +12250,8 @@ pub const Vm = struct {
                             ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            // String coercion (luazig lacks PUC string
-                            // metatable __add). On failure, fall through to
-                            // MMBIN (metamethod or error via failBinaryMmbin).
-                            const cl = coerceArithmeticValue(lb);
-                            const cr = coerceArithmeticValue(rc);
-                            if (cl != null and cr != null) {
-                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                                ctx.regs[a] = try self.binAdd(cl.?, cr.?);
-                                ctx.pc += 1; // skip MMBIN
-                            }
-                            // else: fall through to MMBIN (default pc advance).
+                            // Fall through to MMBIN: string operands handled by
+                            // string metatable __add (PUC lstrlib.c arith_add).
                         }
                     },
                     .sub => {
@@ -12260,14 +12271,7 @@ pub const Vm = struct {
                             ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            const cl = coerceArithmeticValue(lb);
-                            const cr = coerceArithmeticValue(rc);
-                            if (cl != null and cr != null) {
-                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                                ctx.regs[a] = try self.binSub(cl.?, cr.?);
-                                ctx.pc += 1; // skip MMBIN
-                            }
-                            // else: fall through to MMBIN.
+                            // Fall through to MMBIN (string mt __sub).
                         }
                     },
                     .mul => {
@@ -12287,14 +12291,7 @@ pub const Vm = struct {
                             ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            const cl = coerceArithmeticValue(lb);
-                            const cr = coerceArithmeticValue(rc);
-                            if (cl != null and cr != null) {
-                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                                ctx.regs[a] = try self.binMul(cl.?, cr.?);
-                                ctx.pc += 1; // skip MMBIN
-                            }
-                            // else: fall through to MMBIN.
+                            // Fall through to MMBIN (string mt __mul).
                         }
                     },
                     .div => {
@@ -12315,14 +12312,7 @@ pub const Vm = struct {
                             ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            const cl = coerceArithmeticValue(lb);
-                            const cr = coerceArithmeticValue(rc);
-                            if (cl != null and cr != null) {
-                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                                ctx.regs[a] = try self.binDiv(cl.?, cr.?);
-                                ctx.pc += 1; // skip MMBIN
-                            }
-                            // else: fall through to MMBIN.
+                            // Fall through to MMBIN (string mt __div).
                         }
                     },
                     .mod => {
@@ -12358,14 +12348,7 @@ pub const Vm = struct {
                             ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            const cl = coerceArithmeticValue(lb);
-                            const cr = coerceArithmeticValue(rc);
-                            if (cl != null and cr != null) {
-                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                                ctx.regs[a] = try self.binMod(cl.?, cr.?);
-                                ctx.pc += 1; // skip MMBIN
-                            }
-                            // else: fall through to MMBIN.
+                            // Fall through to MMBIN (string mt __mod).
                         }
                     },
                     .pow => {
@@ -12386,14 +12369,7 @@ pub const Vm = struct {
                             ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            const cl = coerceArithmeticValue(lb);
-                            const cr = coerceArithmeticValue(rc);
-                            if (cl != null and cr != null) {
-                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                                ctx.regs[a] = try self.binPow(cl.?, cr.?);
-                                ctx.pc += 1; // skip MMBIN
-                            }
-                            // else: fall through to MMBIN.
+                            // Fall through to MMBIN (string mt __pow).
                         }
                     },
                     .idiv => {
@@ -12426,14 +12402,7 @@ pub const Vm = struct {
                             ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            const cl = coerceArithmeticValue(lb);
-                            const cr = coerceArithmeticValue(rc);
-                            if (cl != null and cr != null) {
-                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                                ctx.regs[a] = try self.binIdiv(cl.?, cr.?);
-                                ctx.pc += 1; // skip MMBIN
-                            }
-                            // else: fall through to MMBIN.
+                            // Fall through to MMBIN (string mt __idiv).
                         }
                     },
                     .band => {
@@ -12544,18 +12513,7 @@ pub const Vm = struct {
                             ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            // String coercion (luazig lacks PUC string
-                            // metatable __add). On failure, fall through to
-                            // MMBINI (metamethod or error via failBinaryMmbin).
-                            if (coerceArithmeticValue(lb)) |cl| {
-                                if (cl == .Int) {
-                                    ctx.regs[a] = .{ .Int = cl.Int +% imm };
-                                } else {
-                                    ctx.regs[a] = .{ .Num = cl.Num + @as(f64, @floatFromInt(imm)) };
-                                }
-                                ctx.pc += 1; // skip MMBINI
-                            }
-                            // else: fall through to MMBINI.
+                            // Fall through to MMBINI (string mt __add).
                         }
                     },
 
@@ -12577,14 +12535,7 @@ pub const Vm = struct {
                             ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            const cl = coerceArithmeticValue(lb);
-                            const cr = coerceArithmeticValue(rc);
-                            if (cl != null and cr != null) {
-                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                                ctx.regs[a] = try self.binAdd(cl.?, cr.?);
-                                ctx.pc += 1; // skip MMBINK
-                            }
-                            // else: fall through to MMBINK.
+                            // Fall through to MMBINK (string mt __add).
                         }
                     },
 
@@ -12606,14 +12557,7 @@ pub const Vm = struct {
                             ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            const cl = coerceArithmeticValue(lb);
-                            const cr = coerceArithmeticValue(rc);
-                            if (cl != null and cr != null) {
-                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                                ctx.regs[a] = try self.binSub(cl.?, cr.?);
-                                ctx.pc += 1; // skip MMBINK
-                            }
-                            // else: fall through to MMBINK.
+                            // Fall through to MMBINK (string mt __sub).
                         }
                     },
 
@@ -12635,14 +12579,7 @@ pub const Vm = struct {
                             ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            const cl = coerceArithmeticValue(lb);
-                            const cr = coerceArithmeticValue(rc);
-                            if (cl != null and cr != null) {
-                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                                ctx.regs[a] = try self.binMul(cl.?, cr.?);
-                                ctx.pc += 1; // skip MMBINK
-                            }
-                            // else: fall through to MMBINK.
+                            // Fall through to MMBINK (string mt __mul).
                         }
                     },
 
@@ -12677,14 +12614,7 @@ pub const Vm = struct {
                             ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            const cl = coerceArithmeticValue(lb);
-                            const cr = coerceArithmeticValue(rc);
-                            if (cl != null and cr != null) {
-                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                                ctx.regs[a] = try self.binMod(cl.?, cr.?);
-                                ctx.pc += 1; // skip MMBINK
-                            }
-                            // else: fall through to MMBINK.
+                            // Fall through to MMBINK (string mt __mod).
                         }
                     },
 
@@ -12706,14 +12636,7 @@ pub const Vm = struct {
                             ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            const cl = coerceArithmeticValue(lb);
-                            const cr = coerceArithmeticValue(rc);
-                            if (cl != null and cr != null) {
-                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                                ctx.regs[a] = try self.binPow(cl.?, cr.?);
-                                ctx.pc += 1; // skip MMBINK
-                            }
-                            // else: fall through to MMBINK.
+                            // Fall through to MMBINK (string mt __pow).
                         }
                     },
 
@@ -12735,14 +12658,7 @@ pub const Vm = struct {
                             ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            const cl = coerceArithmeticValue(lb);
-                            const cr = coerceArithmeticValue(rc);
-                            if (cl != null and cr != null) {
-                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                                ctx.regs[a] = try self.binDiv(cl.?, cr.?);
-                                ctx.pc += 1; // skip MMBINK
-                            }
-                            // else: fall through to MMBINK.
+                            // Fall through to MMBINK (string mt __div).
                         }
                     },
 
@@ -12774,14 +12690,7 @@ pub const Vm = struct {
                             ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            const cl = coerceArithmeticValue(lb);
-                            const cr = coerceArithmeticValue(rc);
-                            if (cl != null and cr != null) {
-                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                                ctx.regs[a] = try self.binIdiv(cl.?, cr.?);
-                                ctx.pc += 1; // skip MMBINK
-                            }
-                            // else: fall through to MMBINK.
+                            // Fall through to MMBINK (string mt __idiv).
                         }
                     },
 
@@ -12998,38 +12907,29 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = -val.Num };
                         } else {
                             @branchHint(.unlikely);
-                            // String coercion (luazig lacks PUC string
-                            // metatable __unm). On failure, try __unm
-                            // metamethod or produce type error inline.
-                            if (coerceArithmeticValue(val)) |cv| {
-                                if (cv == .Int) {
-                                    ctx.regs[a] = .{ .Int = -%cv.Int };
-                                } else {
-                                    ctx.regs[a] = .{ .Num = -cv.Num };
-                                }
-                            } else {
-                                // PUC OP_UNM: luaT_trybinTM(L, rb, rb, ra, TM_UNM).
-                                const tm = self.getTmByObj(val, .unm);
-                                if (tm == null) {
-                                    exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                                    return self.failBinaryMmbin(val, val, .unm, ctx.cur_proto, ctx.pc, b, b);
-                                }
-                                if (try self.tryPushBytecodeUnaryMetamethod(
-                                    exec_frames,
-                                    ctx.frame_index,
-                                    val,
-                                    .unm,
-                                    tmsEventOpname(.unm),
-                                    a,
-                                )) {
-                                    continue :frame_loop;
-                                }
-                                // Not a bytecode Closure — call synchronously.
+                            // PUC OP_UNM: luaT_trybinTM(L, rb, rb, ra, TM_UNM).
+                            // String operands handled by string mt __unm
+                            // (PUC lstrlib.c arith_unm).
+                            const tm = self.getTmByObj(val, .unm);
+                            if (tm == null) {
                                 exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                                const result = try self.callMetamethod(tm.?, tmsEventOpname(.unm), &.{ val, val });
-                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                                ctx.regs[a] = result;
+                                return self.failBinaryMmbin(val, val, .unm, ctx.cur_proto, ctx.pc, b, b);
                             }
+                            if (try self.tryPushBytecodeUnaryMetamethod(
+                                exec_frames,
+                                ctx.frame_index,
+                                val,
+                                .unm,
+                                tmsEventOpname(.unm),
+                                a,
+                            )) {
+                                continue :frame_loop;
+                            }
+                            // Not a bytecode Closure — call synchronously.
+                            exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                            const result = try self.callMetamethod(tm.?, tmsEventOpname(.unm), &.{ val, val });
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
                     // PUC lvm.c:1598 OP_BNOT: no following MMBIN — handles
@@ -16318,6 +16218,14 @@ pub const Vm = struct {
             .string_gmatch_iter => try self.builtinStringGmatchIter(args, outs),
             .string_gsub => try self.builtinStringGsub(args, outs),
             .string_rep => try self.builtinStringRep(args, outs),
+            .str_arith_add => try self.strArithMetamethod(.add, args, outs),
+            .str_arith_sub => try self.strArithMetamethod(.sub, args, outs),
+            .str_arith_mul => try self.strArithMetamethod(.mul, args, outs),
+            .str_arith_mod => try self.strArithMetamethod(.mod, args, outs),
+            .str_arith_pow => try self.strArithMetamethod(.pow, args, outs),
+            .str_arith_div => try self.strArithMetamethod(.div, args, outs),
+            .str_arith_idiv => try self.strArithMetamethod(.idiv, args, outs),
+            .str_arith_unm => try self.strArithMetamethod(.unm, args, outs),
             .utf8_char => try self.builtinUtf8Char(args, outs),
             .utf8_codepoint => try self.builtinUtf8Codepoint(args, outs),
             .utf8_len => try self.builtinUtf8Len(args, outs),
@@ -16855,6 +16763,21 @@ pub const Vm = struct {
         try self.setField(string_tbl, "rep", .{ .Builtin = .string_rep });
         try self.setGlobal("string", .{ .Table = string_tbl });
         try self.setField(self.string_metatable, "__index", .{ .Table = string_tbl });
+
+        // PUC lstrlib.c:332-343 stringmetamethods: register __add/__sub/__mul/
+        // __mod/__pow/__div/__idiv/__unm on the string metatable. These are
+        // C functions (arith_add..arith_unm) that implement PUC's `arith`
+        // helper: tonum both operands → lua_arith; else trymt two-operand
+        // error. Bitwise metamethods are NOT registered (PUC does not register
+        // them), so "x" & 1 falls through to luaG_opinterror.
+        try self.setField(self.string_metatable, "__add", .{ .Builtin = .str_arith_add });
+        try self.setField(self.string_metatable, "__sub", .{ .Builtin = .str_arith_sub });
+        try self.setField(self.string_metatable, "__mul", .{ .Builtin = .str_arith_mul });
+        try self.setField(self.string_metatable, "__mod", .{ .Builtin = .str_arith_mod });
+        try self.setField(self.string_metatable, "__pow", .{ .Builtin = .str_arith_pow });
+        try self.setField(self.string_metatable, "__div", .{ .Builtin = .str_arith_div });
+        try self.setField(self.string_metatable, "__idiv", .{ .Builtin = .str_arith_idiv });
+        try self.setField(self.string_metatable, "__unm", .{ .Builtin = .str_arith_unm });
 
         // table = { unpack = builtin }
         const table_tbl = try self.allocTableNoGc();
@@ -23724,6 +23647,27 @@ pub const Vm = struct {
                     const kidx: usize = inst.c;
                     if (kidx < proto.k.len and proto.k[kidx] == .str) {
                         return .{ .name = proto.k[kidx].str.bytes(), .namewhat = "method" };
+                    }
+                    return .{};
+                },
+                // PUC basicgetobjname (ldebug.c:527-528): LOADK/LOADKX
+                // report the constant's string value as "constant 'name'".
+                .loadk => {
+                    if (inst.a != reg) continue;
+                    if (debugBytecodeDefinitionIsConditional(proto, cursor, call_pc)) return .{};
+                    const kidx: usize = inst.b;
+                    if (kidx < proto.k.len and proto.k[kidx] == .str) {
+                        return .{ .name = proto.k[kidx].str.bytes(), .namewhat = "constant" };
+                    }
+                    return .{};
+                },
+                .loadkx => {
+                    if (inst.a != reg) continue;
+                    if (debugBytecodeDefinitionIsConditional(proto, cursor, call_pc)) return .{};
+                    if (cursor + 1 >= proto.code.len) return .{};
+                    const kidx: usize = proto.code[cursor + 1].extraArg();
+                    if (kidx < proto.k.len and proto.k[kidx] == .str) {
+                        return .{ .name = proto.k[kidx].str.bytes(), .namewhat = "constant" };
                     }
                     return .{};
                 },
@@ -31173,6 +31117,83 @@ pub const Vm = struct {
         outs[0] = .{ .String = try self.internStr(buf) };
     }
 
+    /// PUC `arith` helper (lstrlib.c:290-296) + `trymt` (lstrlib.c:279-287):
+    /// String metatable arithmetic metamethod. Called as __add/__sub/__mul/
+    /// __mod/__pow/__div/__idiv/__unm on the string metatable.
+    ///
+    /// Algorithm (mirrors PUC exactly):
+    /// 1. `tonum` both operands (lstrlib.c:259-268): if already a number →
+    ///    use as-is; if string → `lua_stringtonumber` (luaO_str2num).
+    /// 2. If both succeed → `lua_arith(L, op)` (rawArithCompute).
+    /// 3. Else → `trymt` (lstrlib.c:279-287):
+    ///    a. If operand 2 is a string (same string metatable → same
+    ///       metamethod would be called → infinite recursion) → error.
+    ///    b. If operand 2 has no metamethod for this event → error.
+    ///    c. Otherwise → call operand 2's metamethod.
+    ///
+    /// Error format (PUC trymt): "attempt to {opname} a '{typename(lhs)}'
+    /// with a '{typename(rhs)}'" where opname = mtname+2 (e.g. "__add" →
+    /// "add") and typename = luaL_typename (plain type name, NOT __name).
+    fn strArithMetamethod(
+        self: *Vm,
+        event: TmsEvent,
+        args: []const Value,
+        outs: []Value,
+    ) DispatchError!void {
+        if (outs.len == 0) return;
+        // PUC arith_unm: when called directly from Lua (mm.__unm("5")), only
+        // 1 argument is on the stack. PUC's `arith` calls tonum(L,1) which
+        // pushes a converted copy, then tonum(L,2) accesses that copy —
+        // effectively both operands are the same value. When called from the
+        // VM's OP_UNM handler, 2 copies are passed. Handle both cases.
+        const lhs = args[0];
+        const rhs = if (event == .unm and args.len < 2) args[0] else (if (args.len >= 2) args[1] else .Nil);
+
+        if (args.len < 1) {
+            return self.fail("attempt to {s} a '{s}' with a '{s}'", .{
+                tmsEventOpname(event), "no value", "no value",
+            });
+        }
+
+        // PUC arith: tonum(L, 1) && tonum(L, 2) → lua_arith.
+        const nl = strTonum(lhs);
+        const nr = strTonum(rhs);
+        if (nl != null and nr != null) {
+            // Both operands are numeric (or numeric strings) → compute.
+            if (rawArithCompute(event, nl.?, nr.?)) |result| {
+                outs[0] = result;
+                return;
+            }
+            // rawArithCompute returns null only for int div/mod by zero.
+            // PUC luaV_mod/luaV_idiv raise these errors (lvm.c:769,789).
+            return switch (event) {
+                .mod => self.fail("attempt to perform 'n%0'", .{}),
+                .idiv => self.fail("attempt to divide by zero", .{}),
+                else => self.fail("attempt to perform arithmetic", .{}),
+            };
+        }
+
+        // PUC trymt (lstrlib.c:279-287): if rhs is a string or rhs has no
+        // metamethod for this event → error. Otherwise call rhs's metamethod.
+        if (rhs != .String) {
+            if (self.getTmByObj(rhs, event)) |mm| {
+                // Call rhs's metamethod with (lhs, rhs) in source order.
+                const result = try self.callMetamethod(mm, tmsEventOpname(event), args);
+                const outs_fresh = self.refreshBuiltinOuts() orelse outs;
+                outs_fresh[0] = result;
+                return;
+            }
+        }
+
+        // Error: "attempt to {opname} a '{typename(lhs)}' with a '{typename(rhs)}'"
+        // PUC uses luaL_typename (plain type name, NOT __name).
+        return self.fail("attempt to {s} a '{s}' with a '{s}'", .{
+            tmsEventOpname(event),
+            lhs.typeName(),
+            rhs.typeName(),
+        });
+    }
+
     const Utf8Decode = struct {
         cp: u32,
         end: usize, // 1-based inclusive end byte
@@ -33788,27 +33809,178 @@ pub const Vm = struct {
         };
     }
 
-    fn isNumberLikeForArithmetic(v: Value) bool {
+    /// PUC `tonum` (lstrlib.c:259-268): convert a value to a number for the
+    /// string metatable's arithmetic metamethods. If the value is already a
+    /// number (Int/Num), return it as-is. If it's a string, parse it using the
+    /// same `luaO_str2num` semantics as `tonumber()` (hex integers, decimal
+    /// integers, hex floats, decimal floats; inf/nan rejected). Returns null
+    /// for non-numeric strings or non-number/non-string values.
+    ///
+    /// This is the string-coercion counterpart to the VM's `tonumberns` (which
+    /// does NOT coerce strings). The fast path in the arithmetic opcode
+    /// handlers uses `tonumberns` semantics (Int/Num only); when that fails,
+    /// MMBIN dispatches to the string metatable's __add/__sub/etc. metamethod,
+    /// which calls `strTonum` to attempt string-to-number conversion.
+    fn strTonum(v: Value) ?Value {
         return switch (v) {
-            .Int, .Num => true,
-            .String => |s| blk: {
-                _ = std.fmt.parseFloat(f64, s.bytes()) catch break :blk false;
-                break :blk true;
+            .Int, .Num => v,
+            .String => |s0| blk: {
+                const s = std.mem.trim(u8, s0.bytes(), " \t\r\n");
+                if (s.len == 0) break :blk null;
+                // PUC luaO_str2num: try integer first (handles hex 0x... and
+                // decimal, with leading/trailing space skipping).
+                if (parseHexStringIntWrap(s)) |iv| {
+                    break :blk Value{ .Int = iv };
+                }
+                if (std.fmt.parseInt(i64, s, 0)) |iv| {
+                    break :blk Value{ .Int = iv };
+                } else |_| {}
+                // Reject inf/nan (PUC l_str2d rejects them).
+                const s_no_sign = if (s.len > 0 and (s[0] == '+' or s[0] == '-')) s[1..] else s;
+                if (std.ascii.eqlIgnoreCase(s_no_sign, "inf") or
+                    std.ascii.eqlIgnoreCase(s_no_sign, "infinity") or
+                    std.ascii.eqlIgnoreCase(s_no_sign, "nan"))
+                {
+                    break :blk null;
+                }
+                // Try hex float, then decimal float.
+                if (parseHexFloatFastPath(s)) |hv| {
+                    break :blk Value{ .Num = hv };
+                }
+                if (std.fmt.parseFloat(f64, s)) |nv| {
+                    break :blk Value{ .Num = nv };
+                } else |_| {}
+                break :blk null;
             },
-            else => false,
+            else => null,
         };
     }
 
-    fn coerceArithmeticValue(v: Value) ?Value {
-        return switch (v) {
-            .Int, .Num => v,
-            .String => |s| blk: {
-                const t = std.mem.trim(u8, s.bytes(), " \t\r\n");
-                const n = std.fmt.parseFloat(f64, t) catch break :blk null;
-                if (std.math.isFinite(n) and @floor(n) == n and n >= -9_223_372_036_854_775_808.0 and n < 9_223_372_036_854_775_808.0) {
-                    break :blk Value{ .Int = @as(i64, @intFromFloat(n)) };
+    /// PUC `luaO_rawarith` (lobject.c:151-185): raw arithmetic on Int/Num
+    /// only. Returns null if either operand is not a number (mirrors PUC's
+    /// `tonumberns` which does NOT coerce strings). Used by the string
+    /// metatable's arith metamethod after `strTonum` has converted both
+    /// operands to numbers.
+    fn rawArithCompute(event: TmsEvent, lhs: Value, rhs: Value) ?Value {
+        return switch (event) {
+            .add => switch (lhs) {
+                .Int => |li| switch (rhs) {
+                    .Int => |ri| .{ .Int = li +% ri },
+                    .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) + rn },
+                    else => null,
+                },
+                .Num => |ln| switch (rhs) {
+                    .Int => |ri| .{ .Num = ln + @as(f64, @floatFromInt(ri)) },
+                    .Num => |rn| .{ .Num = ln + rn },
+                    else => null,
+                },
+                else => null,
+            },
+            .sub => switch (lhs) {
+                .Int => |li| switch (rhs) {
+                    .Int => |ri| .{ .Int = li -% ri },
+                    .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) - rn },
+                    else => null,
+                },
+                .Num => |ln| switch (rhs) {
+                    .Int => |ri| .{ .Num = ln - @as(f64, @floatFromInt(ri)) },
+                    .Num => |rn| .{ .Num = ln - rn },
+                    else => null,
+                },
+                else => null,
+            },
+            .mul => switch (lhs) {
+                .Int => |li| switch (rhs) {
+                    .Int => |ri| .{ .Int = li *% ri },
+                    .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) * rn },
+                    else => null,
+                },
+                .Num => |ln| switch (rhs) {
+                    .Int => |ri| .{ .Num = ln * @as(f64, @floatFromInt(ri)) },
+                    .Num => |rn| .{ .Num = ln * rn },
+                    else => null,
+                },
+                else => null,
+            },
+            // DIV always produces a float (PUC LUA_OPDIV).
+            .div => switch (lhs) {
+                .Int => |li| switch (rhs) {
+                    .Int => |ri| .{ .Num = @as(f64, @floatFromInt(li)) / @as(f64, @floatFromInt(ri)) },
+                    .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) / rn },
+                    else => null,
+                },
+                .Num => |ln| switch (rhs) {
+                    .Int => |ri| .{ .Num = ln / @as(f64, @floatFromInt(ri)) },
+                    .Num => |rn| .{ .Num = ln / rn },
+                    else => null,
+                },
+                else => null,
+            },
+            .mod => blk: {
+                // MOD: int operands yield int (PUC floor-mod), float yields float.
+                if (lhs == .Int and rhs == .Int) {
+                    const li = lhs.Int;
+                    const ri = rhs.Int;
+                    if (ri == 0) break :blk null; // PUC raises error; caller handles
+                    if (li == std.math.minInt(i64) and ri == -1) {
+                        break :blk .{ .Int = 0 };
+                    }
+                    var rem = @rem(li, ri);
+                    if (rem != 0 and ((rem ^ ri) < 0)) rem += ri;
+                    break :blk .{ .Int = rem };
                 }
-                break :blk Value{ .Num = n };
+                if (lhs == .Num and rhs == .Num) {
+                    break :blk .{ .Num = luaNumMod(lhs.Num, rhs.Num) };
+                }
+                if (lhs == .Int and rhs == .Num) {
+                    break :blk .{ .Num = luaNumMod(@as(f64, @floatFromInt(lhs.Int)), rhs.Num) };
+                }
+                if (lhs == .Num and rhs == .Int) {
+                    break :blk .{ .Num = luaNumMod(lhs.Num, @as(f64, @floatFromInt(rhs.Int))) };
+                }
+                break :blk null;
+            },
+            // POW always produces a float (PUC LUA_OPPOW).
+            .pow => switch (lhs) {
+                .Int => |li| switch (rhs) {
+                    .Int => |ri| .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(li)), @as(f64, @floatFromInt(ri))) },
+                    .Num => |rn| .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(li)), rn) },
+                    else => null,
+                },
+                .Num => |ln| switch (rhs) {
+                    .Int => |ri| .{ .Num = std.math.pow(f64, ln, @as(f64, @floatFromInt(ri))) },
+                    .Num => |rn| .{ .Num = std.math.pow(f64, ln, rn) },
+                    else => null,
+                },
+                else => null,
+            },
+            .idiv => blk: {
+                // IDIV: int operands yield int (floor division), float yields float.
+                if (lhs == .Int and rhs == .Int) {
+                    const li = lhs.Int;
+                    const ri = rhs.Int;
+                    if (ri == 0) break :blk null; // PUC raises error; caller handles
+                    if (li == std.math.minInt(i64) and ri == -1) {
+                        break :blk .{ .Int = std.math.minInt(i64) };
+                    }
+                    break :blk .{ .Int = @divFloor(li, ri) };
+                }
+                if (lhs == .Num and rhs == .Num) {
+                    break :blk .{ .Num = @floor(lhs.Num / rhs.Num) };
+                }
+                if (lhs == .Int and rhs == .Num) {
+                    break :blk .{ .Num = @floor(@as(f64, @floatFromInt(lhs.Int)) / rhs.Num) };
+                }
+                if (lhs == .Num and rhs == .Int) {
+                    break :blk .{ .Num = @floor(lhs.Num / @as(f64, @floatFromInt(rhs.Int))) };
+                }
+                break :blk null;
+            },
+            // UNM: unary minus (both operands are the same value).
+            .unm => switch (lhs) {
+                .Int => |li| .{ .Int = -%li },
+                .Num => |ln| .{ .Num = -ln },
+                else => null,
             },
             else => null,
         };
@@ -33842,15 +34014,11 @@ pub const Vm = struct {
                 .Int => |i| .{ .Int = -%i },
                 .Num => |n| .{ .Num = -n },
                 else => {
-                    if (coerceArithmeticValue(src)) |cv| {
-                        return switch (cv) {
-                            .Int => |i| .{ .Int = -%i },
-                            .Num => |n| .{ .Num = -n },
-                            else => unreachable,
-                        };
-                    }
+                    // PUC luaO_arith: raw arithmetic fails for non-numbers,
+                    // then luaT_trybinTM dispatches to the metamethod (string
+                    // mt __unm for strings, custom __unm for tables/userdata).
                     if (try self.callUnaryMetamethod(src, .unm, "unm")) |v| return v;
-                    return self.fail("type error: unary '-' expects number, got {s}", .{src.typeName()});
+                    return self.fail("attempt to perform arithmetic on a {s} value", .{self.valueTypeName(src)});
                 },
             },
             .Hash => return switch (src) {
@@ -33875,7 +34043,9 @@ pub const Vm = struct {
     }
 
     fn failArithmeticOperands(self: *Vm, lhs: Value, rhs: Value) Error {
-        const bad = if (!isNumberLikeForArithmetic(lhs)) lhs else rhs;
+        // PUC luaG_opinterror (ldebug.c:788-793): if !ttisnumber(p1) → blame
+        // p1; else blame p2. ttisnumber = Int or Num only (NOT string).
+        const bad = if (lhs != .Int and lhs != .Num) lhs else rhs;
         return self.fail("attempt to perform arithmetic on a {s} value", .{self.valueTypeName(bad)});
     }
 
@@ -36079,12 +36249,13 @@ pub const Vm = struct {
                 if (std.mem.eql(u8, op, "_")) {
                     if (st.items.len == 0) return self.fail("testC stack underflow", .{});
                     const v = st.pop().?;
-                    const neg = switch (coerceArithmeticValue(v) orelse v) {
+                    const neg = switch (v) {
                         .Int => |iv| Value{ .Int = -%iv },
                         .Num => |nv| Value{ .Num = -nv },
                         else => blk: {
+                            // PUC lua_arith(UNM): raw fails → metamethod.
                             if (try self.callUnaryMetamethod(v, .unm, "unm")) |mv| break :blk mv;
-                            return self.fail("attempt to negate a {s} value", .{v.typeName()});
+                            return self.fail("attempt to perform arithmetic on a {s} value", .{self.valueTypeName(v)});
                         },
                     };
                     try st.append(self.alloc, neg);
@@ -37869,150 +38040,45 @@ pub const Vm = struct {
     }
 
     fn binAdd(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
-        const l = coerceArithmeticValue(lhs) orelse lhs;
-        const r = coerceArithmeticValue(rhs) orelse rhs;
-        return switch (l) {
-            .Int => |li| switch (r) {
-                .Int => |ri| .{ .Int = li +% ri },
-                .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) + rn },
-                else => switch (r) {
-                    .Int => |ri| .{ .Int = li +% ri },
-                    .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) + rn },
-                    else => if (try self.callBinaryMetamethod(lhs, rhs, .add, "add")) |v| v else self.failArithmeticOperands(lhs, rhs),
-                },
-            },
-            .Num => |ln| switch (r) {
-                .Int => |ri| .{ .Num = ln + @as(f64, @floatFromInt(ri)) },
-                .Num => |rn| .{ .Num = ln + rn },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, .add, "add")) |v| v else self.failArithmeticOperands(lhs, rhs),
-            },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, .add, "add")) |v| v else self.failArithmeticOperands(lhs, rhs),
-        };
+        if (rawArithCompute(.add, lhs, rhs)) |result| return result;
+        if (try self.callBinaryMetamethod(lhs, rhs, .add, "add")) |v| return v;
+        return self.failArithmeticOperands(lhs, rhs);
     }
 
     fn binSub(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
-        const l = coerceArithmeticValue(lhs) orelse lhs;
-        const r = coerceArithmeticValue(rhs) orelse rhs;
-        return switch (l) {
-            .Int => |li| switch (r) {
-                .Int => |ri| .{ .Int = li -% ri },
-                .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) - rn },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, .sub, "sub")) |v| v else self.failArithmeticOperands(lhs, rhs),
-            },
-            .Num => |ln| switch (r) {
-                .Int => |ri| .{ .Num = ln - @as(f64, @floatFromInt(ri)) },
-                .Num => |rn| .{ .Num = ln - rn },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, .sub, "sub")) |v| v else self.failArithmeticOperands(lhs, rhs),
-            },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, .sub, "sub")) |v| v else self.failArithmeticOperands(lhs, rhs),
-        };
+        if (rawArithCompute(.sub, lhs, rhs)) |result| return result;
+        if (try self.callBinaryMetamethod(lhs, rhs, .sub, "sub")) |v| return v;
+        return self.failArithmeticOperands(lhs, rhs);
     }
 
     fn binMul(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
-        const l = coerceArithmeticValue(lhs) orelse lhs;
-        const r = coerceArithmeticValue(rhs) orelse rhs;
-        return switch (l) {
-            .Int => |li| switch (r) {
-                .Int => |ri| .{ .Int = li *% ri },
-                .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) * rn },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, .mul, "mul")) |v| v else self.failArithmeticOperands(lhs, rhs),
-            },
-            .Num => |ln| switch (r) {
-                .Int => |ri| .{ .Num = ln * @as(f64, @floatFromInt(ri)) },
-                .Num => |rn| .{ .Num = ln * rn },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, .mul, "mul")) |v| v else self.failArithmeticOperands(lhs, rhs),
-            },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, .mul, "mul")) |v| v else self.failArithmeticOperands(lhs, rhs),
-        };
+        if (rawArithCompute(.mul, lhs, rhs)) |result| return result;
+        if (try self.callBinaryMetamethod(lhs, rhs, .mul, "mul")) |v| return v;
+        return self.failArithmeticOperands(lhs, rhs);
     }
 
     fn binDiv(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
-        const l = coerceArithmeticValue(lhs) orelse lhs;
-        const r = coerceArithmeticValue(rhs) orelse rhs;
-        const ln = switch (l) {
-            .Int => |li| @as(f64, @floatFromInt(li)),
-            .Num => |n| n,
-            else => {
-                if (try self.callBinaryMetamethod(lhs, rhs, .div, "div")) |v| return v;
-                return self.failArithmeticOperands(lhs, rhs);
-            },
-        };
-        const rn = switch (r) {
-            .Int => |ri| @as(f64, @floatFromInt(ri)),
-            .Num => |n| n,
-            else => {
-                if (try self.callBinaryMetamethod(lhs, rhs, .div, "div")) |v| return v;
-                return self.failArithmeticOperands(lhs, rhs);
-            },
-        };
-        return .{ .Num = ln / rn };
+        if (rawArithCompute(.div, lhs, rhs)) |result| return result;
+        if (try self.callBinaryMetamethod(lhs, rhs, .div, "div")) |v| return v;
+        return self.failArithmeticOperands(lhs, rhs);
     }
 
     fn binIdiv(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
-        const l = coerceArithmeticValue(lhs) orelse lhs;
-        const r = coerceArithmeticValue(rhs) orelse rhs;
-        return switch (l) {
-            .Int => |li| switch (r) {
-                .Int => |ri| {
-                    if (ri == 0) return self.fail("divide by zero", .{});
-                    if (li == std.math.minInt(i64) and ri == -1) return .{ .Int = std.math.minInt(i64) };
-                    return .{ .Int = @divFloor(li, ri) };
-                },
-                .Num => |rn| {
-                    return .{ .Num = std.math.floor(@as(f64, @floatFromInt(li)) / rn) };
-                },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, .idiv, "idiv")) |v| v else self.failArithmeticOperands(lhs, rhs),
-            },
-            .Num => |ln| switch (r) {
-                .Int => |ri| {
-                    return .{ .Num = std.math.floor(ln / @as(f64, @floatFromInt(ri))) };
-                },
-                .Num => |rn| {
-                    return .{ .Num = std.math.floor(ln / rn) };
-                },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, .idiv, "idiv")) |v| v else self.failArithmeticOperands(lhs, rhs),
-            },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, .idiv, "idiv")) |v| v else self.failArithmeticOperands(lhs, rhs),
-        };
+        if (rawArithCompute(.idiv, lhs, rhs)) |result| return result;
+        // rawArithCompute returns null for int // 0 (PUC luaV_idiv error).
+        if (lhs == .Int and rhs == .Int and rhs.Int == 0)
+            return self.fail("attempt to divide by zero", .{});
+        if (try self.callBinaryMetamethod(lhs, rhs, .idiv, "idiv")) |v| return v;
+        return self.failArithmeticOperands(lhs, rhs);
     }
 
     fn binMod(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
-        const l = coerceArithmeticValue(lhs) orelse lhs;
-        const r = coerceArithmeticValue(rhs) orelse rhs;
-        return switch (l) {
-            .Int => |li| switch (r) {
-                .Int => |ri| {
-                    if (ri == 0) return self.fail("attempt to perform 'n%0'", .{});
-                    if (li == std.math.minInt(i64) and ri == -1) return .{ .Int = 0 };
-                    var rem = @rem(li, ri);
-                    if (rem != 0 and ((rem ^ ri) < 0)) rem += ri;
-                    return .{ .Int = rem };
-                },
-                .Num => |rn| {
-                    // PUC Lua: float modulus uses fmod without a zero check.
-                    // fmod(x, 0) returns NaN per IEEE 754, which is the
-                    // correct result for 'n % 0' when n is a float.
-                    const ln = @as(f64, @floatFromInt(li));
-                    return .{ .Num = luaNumMod(ln, rn) };
-                },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, .mod, "mod")) |v| v else self.failArithmeticOperands(lhs, rhs),
-            },
-            .Num => |ln| switch (r) {
-                .Int => |ri| {
-                    // PUC Lua: 'n % 0' is an error only for integers. When
-                    // the dividend is a float, the divisor is converted to
-                    // float and fmod is used — fmod(x, 0.0) = NaN.
-                    const rn = @as(f64, @floatFromInt(ri));
-                    return .{ .Num = luaNumMod(ln, rn) };
-                },
-                .Num => |rn| {
-                    // Float % float: no zero check (fmod handles it).
-                    return .{ .Num = luaNumMod(ln, rn) };
-                },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, .mod, "mod")) |v| v else self.failArithmeticOperands(lhs, rhs),
-            },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, .mod, "mod")) |v| v else self.failArithmeticOperands(lhs, rhs),
-        };
+        if (rawArithCompute(.mod, lhs, rhs)) |result| return result;
+        // rawArithCompute returns null for int % 0 (PUC luaV_mod error).
+        if (lhs == .Int and rhs == .Int and rhs.Int == 0)
+            return self.fail("attempt to perform 'n%0'", .{});
+        if (try self.callBinaryMetamethod(lhs, rhs, .mod, "mod")) |v| return v;
+        return self.failArithmeticOperands(lhs, rhs);
     }
 
     fn luaNumMod(a: f64, b: f64) f64 {
@@ -38022,25 +38088,9 @@ pub const Vm = struct {
     }
 
     fn binPow(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
-        const l = coerceArithmeticValue(lhs) orelse lhs;
-        const r = coerceArithmeticValue(rhs) orelse rhs;
-        const ln = switch (l) {
-            .Int => |li| @as(f64, @floatFromInt(li)),
-            .Num => |n| n,
-            else => {
-                if (try self.callBinaryMetamethod(lhs, rhs, .pow, "pow")) |v| return v;
-                return self.failArithmeticOperands(lhs, rhs);
-            },
-        };
-        const rn = switch (r) {
-            .Int => |ri| @as(f64, @floatFromInt(ri)),
-            .Num => |n| n,
-            else => {
-                if (try self.callBinaryMetamethod(lhs, rhs, .pow, "pow")) |v| return v;
-                return self.failArithmeticOperands(lhs, rhs);
-            },
-        };
-        return .{ .Num = std.math.pow(f64, ln, rn) };
+        if (rawArithCompute(.pow, lhs, rhs)) |result| return result;
+        if (try self.callBinaryMetamethod(lhs, rhs, .pow, "pow")) |v| return v;
+        return self.failArithmeticOperands(lhs, rhs);
     }
 
     fn binBand(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {

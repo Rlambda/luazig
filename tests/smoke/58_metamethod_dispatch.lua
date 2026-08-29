@@ -149,20 +149,16 @@ do
 end
 
 -- =========================================================================
--- E. MMBINK constant-pool numeric keys + numeric-string coercion.
--- PUC coerces numeric strings in arithmetic (tonumber path in lvm.c
--- arith). "123" + 1 == 124. This is the STRING-constant success path
--- through MMBINK (string K that IS numeric).
+-- E. MMBANK constant-pool numeric keys + numeric-string coercion.
+-- PUC coerces numeric strings in arithmetic via the string metatable's
+-- __add/__sub/etc. metamethods (lstrlib.c arith_add..arith_unm). The fast
+-- path (tonumberns) does NOT coerce strings; failure falls through to MMBIN
+-- → getTmByObj(string, event) → string-mt metamethod → tonum → lua_arith.
 --
--- NOTE: the string-constant ERROR path (e.g. t + "hello" where t has no
--- metamethod) currently DIVERGES: PUC 5.5 emits
---   "attempt to add a 'table' with a 'string'"
--- while luazig emits
---   "attempt to perform arithmetic on a table value (upvalue 't')".
--- Bitwise ops on strings also diverge (PUC rejects even numeric strings
--- for bitwise; luazig's message + traceback differ). Those divergent
--- cases are intentionally excluded to keep this differential test
--- byte-identical; they are tracked as a parity gap.
+-- Error cases (t+"5", "x"+1, "3"&t, "x"&"y") are now byte-identical vs PUC:
+-- arithmetic errors use the two-operand format from trymt
+-- ("attempt to add a 'table' with a 'string'"), and bitwise errors use
+-- the single-operand format from luaG_opinterror with constant annotation.
 -- =========================================================================
 do
   -- Numeric K constants (constant pool) with a metamethod: success path.
@@ -181,6 +177,37 @@ do
   print("E:str-idiv", "100" // "7")
   print("E:str-mod",  "100" % "7")
   print("E:str-pow",  "2" ^ "10")
+
+  -- Previously-excluded parity gaps (now byte-identical vs PUC):
+  -- Arithmetic errors: two-operand format from trymt (lstrlib.c:283).
+  local t = {}
+  print("E:t+str_err",  pcall(function() return t + "5" end))
+  print("E:str+n_err",  pcall(function() return "x" + 1 end))
+  print("E:n-str_err",  pcall(function() return 5 - "x" end))
+  -- Bitwise errors: single-operand format from luaG_opinterror with
+  -- constant annotation. PUC has no __band on the string metatable.
+  print("E:str&t_err",  pcall(function() return "3" & t end))
+  print("E:str&str_err", pcall(function() return "x" & "y" end))
+  print("E:str&n_err",   pcall(function() return "3" & 1 end))
+  print("E:t&str_err",   pcall(function() return t & "5" end))
+  print("E:bnot_str_err", pcall(function() return ~"5" end))
+
+  -- getmetatable("").__add existence + call (PUC lstrlib.c arith_add).
+  local mm = getmetatable("")
+  print("E:mm_add_exists", mm.__add ~= nil, type(mm.__add))
+  print("E:mm_add_call",   mm.__add("3", "4"))
+  print("E:mm_sub_call",   mm.__sub("10", "3"))
+  print("E:mm_mul_call",   mm.__mul("3", "4"))
+  print("E:mm_div_call",   mm.__div("10", "4"))
+  print("E:mm_idiv_call",  mm.__idiv("10", "3"))
+  print("E:mm_mod_call",   mm.__mod("10", "3"))
+  print("E:mm_pow_call",   mm.__pow("2", "10"))
+  print("E:mm_unm_call",   mm.__unm("5"))
+  -- Metamethod error: non-numeric string → trymt two-operand error.
+  print("E:mm_add_err",    pcall(function() return mm.__add("x", "y") end))
+  -- Metamethod delegates to rhs's __add when rhs has one.
+  local t2 = setmetatable({}, {__add = function(a, b) return "custom" end})
+  print("E:str+t2_mt",     "x" + t2)
 end
 
 -- =========================================================================

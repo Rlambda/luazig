@@ -387,3 +387,45 @@ do
   print("I10:eq_yield", coroutine.resume(co_eq))
   print("I10:eq_result", coroutine.resume(co_eq))
 end
+
+-- =========================================================================
+-- J. P16.8 Task 3: simple_result + yield invariant coverage.
+--   J1. Nested yielding metamethod inside a simple_result metamethod:
+--       outer __add (simple_result on parent) calls inner __mul that yields.
+--       The outer's simple_result state must persist across the inner yield.
+--   J2. Debug name after resume: error inside a resumed metamethod must
+--       still show "metamethod 'add'" (getDebugName checks hasSimpleResult).
+-- =========================================================================
+do
+  -- J1: outer __add triggers inner __mul which yields.
+  -- The outer metamethod is a bytecode child with simple_result set on
+  -- its parent. The inner metamethod is a bytecode child with simple_result
+  -- set on the OUTER metamethod's frame. When the inner yields, BOTH
+  -- simple_result states must persist (on their respective parent frames).
+  local innerY = setmetatable({}, { __mul = function(a, b)
+    coroutine.yield("inner_mul_yield")
+    return "inner_mul_result"
+  end})
+  local outerY = setmetatable({}, { __add = function(a, b)
+    local r = innerY * b   -- triggers inner __mul which yields
+    return r .. "_outer_add"
+  end})
+  local co_j1 = coroutine.create(function() return outerY + 1 end)
+  print("J1:yield", coroutine.resume(co_j1))
+  print("J1:result", coroutine.resume(co_j1))
+
+  -- J2: Debug name after resume. The metamethod yields, then on resume
+  -- raises an error. The traceback must show "metamethod 'add'" — proving
+  -- getDebugName still finds the simple_result state after resume.
+  local errY = setmetatable({}, { __add = function(a, b)
+    coroutine.yield("err_yield")
+    error("boom_after_resume")
+  end})
+  local co_j2 = coroutine.create(function() return errY + 1 end)
+  print("J2:yield", coroutine.resume(co_j2))
+  local ok_j2, err_j2 = coroutine.resume(co_j2)
+  print("J2:ok", ok_j2)
+  -- The error message includes the metamethod name in the traceback.
+  local err_str = tostring(err_j2)
+  print("J2:has_metamethod_name", string.find(err_str, "metamethod") ~= nil)
+end

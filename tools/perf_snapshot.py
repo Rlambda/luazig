@@ -44,6 +44,8 @@ def main() -> int:
     ap.add_argument("--no-build", action="store_true", help="skip zig build + make lua-c")
     ap.add_argument("--regenerate-docs", action="store_true",
                     help="also regenerate README + STATUS top block from the snapshot")
+    ap.add_argument("--decomp", action="store_true",
+                    help="also regenerate global_arith per-opcode decomposition")
     args = ap.parse_args()
 
     cmd = [
@@ -70,6 +72,16 @@ def main() -> int:
         ]
         print(f"\n>> {' '.join(docs_cmd)}")
         ret = subprocess.call(docs_cmd, cwd=ROOT)
+        if ret != 0:
+            return ret
+
+    if args.decomp:
+        decomp_cmd = [
+            "python3", str(ROOT / "tools" / "perf_global_arith_decomp.py"),
+            "--no-build",
+        ]
+        print(f"\n>> {' '.join(decomp_cmd)}")
+        ret = subprocess.call(decomp_cmd, cwd=ROOT)
         if ret != 0:
             return ret
 

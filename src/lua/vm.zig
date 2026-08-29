@@ -26372,77 +26372,80 @@ pub const Vm = struct {
 
     /// PUC `luaH_set` / `luaH_newkey` (ltable.c:914). Store `val` at `key`.
     ///
-    /// Flow mirrors PUC `luaH_newkey`:
-    ///   1. `insertkey` — try to place the key in an existing free slot.
-    ///   2. On overflow → `rehash` (grow table, redistribute keys between
-    ///      array/hash parts via `computeSizes`).
-    ///   3. `newcheckedkey` — after rehash, integer keys that now fall in the
-    ///      array range go to the array part; everything else goes through
-    ///      `insertkey` again (guaranteed to succeed in the grown table).
+    /// Restructured around the real write event (Task 8 — 5-step flow):
+    ///   1. Canonicalize key ONCE (nil→error, NaN→error, integral-float→Int).
+    ///      No recursion — the old recursive self-call for integral-float keys
+    ///      caused a double funnel + double barrier.
+    ///   2. Array slot in range → value-barrier(prepare)→store.
+    ///   3. Existing hash node → value-barrier(prepare)→update/delete.
+    ///   4. Absent + nil value → return (NO barrier — no new reference).
+    ///   5. Genuine new key → key+value barriers exactly once → insert/rehash.
     ///
-    /// Integer keys in [1..asize] go directly to the array part (PUC
-    /// `keyinarray` fast path, also used by `luaH_set` before calling
-    /// `luaH_newkey`). Setting val==.Nil deletes the entry (PUC: do not
-    /// insert nils); deleting an absent key is a no-op.
+    /// Barrier semantics per PUC:
+    ///   - Existing-slot update → gcTableBarrierBackValue(table, VALUE only).
+    ///     No key barrier (key already owned).
+    ///   - New-key insertion → gcTableBarrierBackNewKey(table, KEY) +
+    ///     gcTableBarrierBackValue(table, VALUE). Both barrier the same table;
+    ///     the second is idempotent (table already in grayagain/touched1).
+    ///   - Nil/absent → no barrier at all (no new reference).
+    ///
+    /// OOM safety: every barrier (fallible grayagain append) is called BEFORE
+    /// the store. If the barrier fails, the store does not happen. See the
+    /// invariant comment at gcTableBarrierBackValue.
     fn rawSet(self: *Vm, tbl: *Table, key: Value, val: Value) DispatchError!void {
-        // P16.0b: generic funnel counter. The .Num branch delegates to an
-        // inner rawSet with an .Int key (which counts itself); skip counting
-        // here for that case so integral-float stores count exactly once.
-        if (self.stats.enabled) {
-            const delegates: bool = switch (key) {
-                .Num => |n| std.math.isFinite(n) and
-                    n >= -9_223_372_036_854_775_808.0 and
-                    n < 9_223_372_036_854_775_808.0 and
-                    @floor(n) == n,
-                else => false,
-            };
-            if (!delegates) self.stats.tbl_set_generic += 1;
-        }
-        try self.gcTableWriteBarrier(tbl, key, val);
-        switch (key) {
+        if (self.stats.enabled) self.stats.tbl_set_generic += 1;
+
+        // Step 1: Canonicalize key ONCE (PUC luaH_finishset HNOTFOUND path,
+        // ltable.c:1154-1174). Nil→error, NaN→error, integral-float→Int.
+        // No recursion — the old recursive self-call doubled the funnel and
+        // ran the barrier twice.
+        const canon_key: Value = switch (key) {
             .Nil => return self.fail("table index is nil", .{}),
-            .Num => |n| {
+            .Num => |n| blk: {
                 if (std.math.isNan(n)) return self.fail("table index is NaN", .{});
                 if (std.math.isFinite(n) and
                     n >= -9_223_372_036_854_775_808.0 and
                     n < 9_223_372_036_854_775_808.0 and
                     @floor(n) == n)
                 {
-                    return self.rawSet(tbl, .{ .Int = @as(i64, @intFromFloat(n)) }, val);
+                    break :blk .{ .Int = @as(i64, @intFromFloat(n)) };
                 }
                 // Non-integer float key: hash via hashNum (matching keyHash's
                 // .Num branch and Node.rawHash's .num branch — see ltable.zig).
+                break :blk key;
             },
-            else => {},
-        }
+            else => key,
+        };
 
-        // Integer keys in [1..asize] go to the array part (PUC keyinarray).
-        // This is the fast path that `luaH_set` takes before `luaH_newkey`.
-        if (key == .Int) {
-            const k = key.Int;
+        // Step 2: Array slot in range → value-barrier(prepare)→store.
+        // PUC keyinarray fast path (ltable.c:329-339), used by luaH_set
+        // before calling luaH_newkey.
+        if (canon_key == .Int) {
+            const k = canon_key.Int;
             if (k >= 1 and @as(u64, @intCast(k)) <= tbl.asize) {
+                try self.gcTableBarrierBackValue(tbl, val); // VALUE only, BEFORE store
                 tbl.array[@intCast(k - 1)] = val;
                 return;
             }
         }
 
-        // Hash-part lookup: update existing node, or delete if val==.Nil.
-        if (ltable.nodeLookup(tbl.hash, key, self.hash_seed)) |node| {
-            if (self.stats.enabled) self.stats.tbl_update += 1; // P16.0b (existing key)
+        // Step 3: Existing hash node → value-barrier(prepare)→update/delete.
+        // PUC luaH_pset → finishnodeset (existing key found by lookup).
+        if (ltable.nodeLookup(tbl.hash, canon_key, self.hash_seed)) |node| {
+            if (self.stats.enabled) self.stats.tbl_update += 1;
             if (val == .Nil) {
                 // Logical delete: leave node in chain with value Nil (PUC).
-                _ = ltable.nodeDelete(tbl.hash, key, self.hash_seed);
+                // No barrier — no new reference created.
+                _ = ltable.nodeDelete(tbl.hash, canon_key, self.hash_seed);
             } else {
+                // Existing-slot update: VALUE barrier only (key already owned).
+                // PUC luaV_finishfastset(L, t, val) = luaC_barrierback(L, t, val).
+                try self.gcTableBarrierBackValue(tbl, val); // BEFORE store
                 // PUC luaV_finishset (lvm.c:347) calls invalidateTMcache
-                // unconditionally after luaH_finishset. The fast path
-                // (luaH_psetshortstr returning HOK for non-nil→non-nil
-                // updates) skips invalidation — but that's safe because
-                // updating a non-nil value to another non-nil value cannot
-                // change whether a metamethod is present.
-                // The case that matters: nil→non-nil (reviving a dead node).
-                // That goes through luaH_finishset → invalidateTMcache.
-                // We replicate this here: invalidate when the old value was
-                // nil (dead node being revived).
+                // after luaH_finishset. Invalidate when reviving a dead node
+                // (old value was nil → new non-nil value). Non-nil→non-nil
+                // updates skip invalidation (safe: cannot change metamethod
+                // presence). luaH_psetshortstr returns HOK for this case.
                 if (node.value == .Nil) {
                     tbl.flags &= ~TableFlags.MASK;
                 }
@@ -26450,16 +26453,29 @@ pub const Vm = struct {
             }
             return;
         }
-        if (val == .Nil) return; // PUC: deleting an absent key is a no-op.
 
-        // New key: try insertkey (PUC `insertkey`). If the hash part is empty
-        // (PUC "dummy"), insertkey returns 0 (no free place) — this forces a
-        // rehash, which is exactly what PUC does: the first insert into a
-        // table triggers rehash so `computeSizes` can decide whether the key
-        // belongs in the array part (e.g. `t[1]=x` → asize=1 → array).
+        // Step 4: Absent + nil value → return (NO barrier).
+        // PUC luaH_psetshortstr: "if (ttisnil(val)) return HOK" (value is
+        // already nil/absent). PUC luaH_newkey: "if (!ttisnil(value))" —
+        // nil values are never inserted. No barrier: no new reference.
+        if (val == .Nil) return;
+
+        // Step 5: Genuine new key → key+value barriers exactly once → insert/rehash.
+        // PUC luaH_newkey → luaC_barrierback(L, obj2gco(t), key) — KEY barrier.
+        // PUC luaV_finishset → luaC_barrierback(L, obj2gco(h), val) — VALUE barrier.
+        // Both barrier the same table; the second is idempotent (table already
+        // in grayagain/touched1 after the first).
+        try self.gcTableBarrierBackNewKey(tbl, canon_key); // KEY barrier, BEFORE insert
+        try self.gcTableBarrierBackValue(tbl, val); // VALUE barrier (idempotent), BEFORE insert
+
+        // Try insertkey (PUC `insertkey`). If the hash part is empty
+        // (PUC "dummy"), insertkey returns null (no free place) — this
+        // forces a rehash, which is exactly what PUC does: the first insert
+        // into a table triggers rehash so `computeSizes` can decide whether
+        // the key belongs in the array part (e.g. `t[1]=x` → asize=1 → array).
         if (tbl.hash.len != 0) {
-            if (ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, key, val, self.hash_seed)) |_| {
-                if (self.stats.enabled) self.stats.tbl_insert += 1; // P16.0b
+            if (ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, canon_key, val, self.hash_seed)) |_| {
+                if (self.stats.enabled) self.stats.tbl_insert += 1;
                 // P15.37c: new key inserted — invalidate metamethod cache.
                 // (PUC ltable.c:1112 calls invalidateTMcache after insertkey.)
                 tbl.flags &= ~TableFlags.MASK;
@@ -26473,13 +26489,13 @@ pub const Vm = struct {
         // and rebuilds chains from scratch. `tableResize` charges
         // `testcConsumeAllocCount` for each actual allocation (hash and/or
         // array) it makes, matching PUC's allocation model.
-        try self.tableRehash(tbl, key);
+        try self.tableRehash(tbl, canon_key);
 
         // newcheckedkey: after rehash, integer keys that now fall in the
         // array range go to the array part; everything else goes through
         // insertkey again (guaranteed to succeed in the grown table).
-        if (key == .Int) {
-            const k = key.Int;
+        if (canon_key == .Int) {
+            const k = canon_key.Int;
             if (k >= 1 and @as(u64, @intCast(k)) <= tbl.asize) {
                 tbl.array[@intCast(k - 1)] = val;
                 tbl.flags &= ~TableFlags.MASK;
@@ -26489,9 +26505,9 @@ pub const Vm = struct {
         // The key is not an array index, so rehash must have allocated a
         // hash part with room for it (nsize >= 1).
         std.debug.assert(tbl.hash.len != 0);
-        const inserted = ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, key, val, self.hash_seed);
+        const inserted = ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, canon_key, val, self.hash_seed);
         std.debug.assert(inserted != null);
-        if (self.stats.enabled) self.stats.tbl_insert += 1; // P16.0b (post-rehash insert)
+        if (self.stats.enabled) self.stats.tbl_insert += 1; // post-rehash insert
         tbl.flags &= ~TableFlags.MASK;
     }
 

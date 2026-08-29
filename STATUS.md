@@ -4022,3 +4022,79 @@ Zero call sites remain — all migrated to typed `getTmByObj`/`getTm`/`fastTm`/`
 | gengc/gc/closure/events/coroutine --testc | all OK |
 | CallFrame ≤ 104 | comptime assert PASS |
 | perf_compare --runs 5 | OK (no regressions, geomean 2.22x, metamethod_add -6.1%) |
+
+## P16.6 — real MMBIN/MMBINI/MMBANK handlers + simplified arith/UNM/BNOT (2026-08-29, verifier P16.6 Tasks 4+5+6)
+
+### A. Real MMBIN/MMBINI/MMBANK handlers
+Replaced the no-op `.mmbin, .mmbini, .mmbink => {},` with real handlers that
+implement PUC `luaT_trybinTM` (ltm.c:150-166):
+- Read previous instruction (`pi = code[ctx.pc - 1]`) to get result dest (`pi.a`).
+- Decode `TmsEvent` from C field via `@enumFromInt(@as(u5, @truncate(c)))`.
+- Determine operands per instruction format and flip bit:
+  - MMBIN: (R[A], R[B])
+  - MMBINI: sB2int(b) = `@as(i64, b) - 127`; flip=0→(R[A], imm); flip=1→(imm, R[A])
+  - MMBANK: K[B]; flip=0→(R[A], K[B]); flip=1→(K[B], R[A])
+- Try metamethod via `tryPushBytecodeBinaryMetamethod` (bytecode Closure push).
+- If not a bytecode Closure, call synchronously via `callMetamethod` (handles
+  Builtin, Closure-without-proto, and not-callable → PUC call error).
+- If no metamethod found → `failBinaryMmbin` (PUC luaG_opinterror/luaG_tointerror).
+
+### B. Simplified arithmetic handlers (ADD through SHR, ADDK through BXORK, ADDI/SHLI/SHRI)
+Each handler now follows the PUC `op_arith_aux` pattern:
+- **Fast path** (Int/Num combos): compute inline, `ctx.pc += 1` to skip MMBIN.
+- **String coercion** (luazig extension for missing PUC string metatable __add):
+  `coerceArithmeticValue` both operands → if both coerce, compute via `binAdd`/
+  `binSub`/etc. (preserves Int vs Num semantics), `ctx.pc += 1`.
+- **Fall-through**: if coercion fails, do nothing (no pc skip). Default pc
+  advance lands on MMBIN, which handles metamethod/error.
+- **ADDI no longer peeks at MMBINI**: ADDI just computes `R[B] + sC`. The
+  MMBINI handler decodes the correct event (TMS_ADD vs TMS_SUB) and operands.
+- **SHRI no longer peeks at MMBINI**: same simplification for shift negation.
+
+### C. Simplified UNM/BNOT
+- UNM: fast path (Int/Num) + string coercion + `tryPushBytecodeUnaryMetamethod`
+  + `callMetamethod` fallback + `failBinaryMmbin` error.
+- BNOT: fast path (Int) + `valueToIntForBitwise` coercion + same fallback chain.
+- Both use `tmsEventOpname(event)` for the single opname derivation point.
+
+### D. tmsEventOpname helper
+New `tmsEventOpname(event: TmsEvent) []const u8` — single derivation point for
+opname strings from TmsEvent. Used ONLY on the cold metamethod path (MMBIN/
+UNM/BNOT handlers) to set the debug name of the child frame. The hot arithmetic
+fast path carries no string at all.
+
+### E. failBinaryMmbin helper
+New `failBinaryMmbin(p1, p2, event, proto, arith_pc, p1_reg, p2_reg)` —
+implements PUC luaT_trybinTM error logic:
+- Bitwise event + both numbers → `luaG_tointerror`: "number (kind 'name') has
+  no integer representation" (PUC format: annotation in the MIDDLE).
+- Else → `luaG_opinterror`: "attempt to perform arithmetic/bitwise operation on
+  a X value (kind 'name')" (PUC format: annotation at the END).
+- `luaG_opinterror` blame logic: `!ttisnumber(p1)` (Int/Num only, NOT string)
+  → blame p1; else blame p2.
+
+### F. callMetamethod error message fixed
+Changed from "metamethod 'add' is not callable (number value)" to PUC's format:
+"attempt to call a number value (metamethod 'add')" (luaG_callerror).
+
+### G. Dead code removed
+- `addSlowPath` — outlined cold path for OP_ADD (replaced by inline coercion).
+- `evalBytecodeBinOp` — error-annotating wrapper for binary ops (replaced by
+  `failBinaryMmbin` in MMBIN handler).
+- `evalBytecodeBinOpValues` — same for K/I-variant ops (replaced by MMBINK/MMBINI).
+- `evalBytecodeUnOp` — error-annotating wrapper for unary ops (replaced by
+  `failBinaryMmbin` in UNM/BNOT handlers).
+Net: -147 lines (524 insertions, 671 deletions).
+
+### Verification
+| Check | Result |
+|-------|--------|
+| Debug build + test | PASS |
+| ReleaseFast build + test | PASS |
+| mm_probe.lua byte-identical PUC vs zig | PASS (0 diff) |
+| matrix --testc | zig_fail=0 (big.lua both_fail pre-existing) |
+| Smoke 57/57 | PASS |
+| c_api test | ALL PASS |
+| nextvar/coroutine/gc/gengc/closure/events/errors | all PASS |
+| CallFrame ≤ 104 | comptime assert PASS |
+| perf_compare --runs 7 | OK (no regressions, geomean 2.23x) |

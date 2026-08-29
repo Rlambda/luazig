@@ -2639,6 +2639,25 @@ const TmsEvent = enum(u5) {
     close,
 };
 
+/// PUC ltm.c:luaT_eventname[] — short opname strings for debug/traceback.
+/// Used ONLY on the cold metamethod path (MMBIN/UNM/BNOT handlers) to set
+/// the debug name of the child frame. The hot arithmetic fast path carries
+/// no string at all. This is the SINGLE derivation point for opname strings
+/// from TmsEvent (P16.6 Task 4+5+6 requirement: "ONE opname-string
+/// derivation from the enum for debug/traceback only where needed").
+fn tmsEventOpname(event: TmsEvent) []const u8 {
+    return switch (event) {
+        .add => "add",     .sub => "sub",     .mul => "mul",
+        .mod => "mod",     .pow => "pow",     .div => "div",
+        .idiv => "idiv",   .band => "band",   .bor => "bor",
+        .bxor => "bxor",   .shl => "shl",     .shr => "shr",
+        .unm => "unm",     .bnot => "bnot",
+        .concat => "concat", .len => "len",   .eq => "eq",
+        .lt => "lt",       .le => "le",
+        else => "metamethod",
+    };
+}
+
 /// Non-TMS metafields — metamethod names that PUC Lua does NOT include in
 /// the `TMS` enum (`ltm.h:18-45`). PUC handles these via `luaL_getmetafield`
 /// (lauxlib.c) or direct `luaH_Hgetshortstr` calls (ltm.c:95 for `__name`),
@@ -12189,97 +12208,94 @@ pub const Vm = struct {
                     },
 
                     // --- Arithmetic ---
-                    // Snapshot operands before evalBinOp (may trigger metamethod →
-                    // bc_stack realloc → stale ctx.regs). Write result after refresh.
+                    // PUC op_arith_aux (lvm.c:992): tonumberns on both operands.
+                    // Success → compute + skip MMBIN. Failure → fall through to
+                    // MMBIN (metamethod or error). luazig extends the cold path
+                    // with string coercion (coerceArithmeticValue) since luazig
+                    // lacks PUC's string metatable __add/__sub/etc. (lstrlib.c).
                     .add => {
                         const lb = ctx.regs[b];
                         const rc = ctx.regs[c];
-                        // Fast path: both operands are already numeric (Int or Num).
-                        // Avoids 4x coerceArithmeticValue calls + function call
-                        // overhead for the common Int+Int / Num+Num cases.
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Int = lb.Int +% rc.Int };
+                            ctx.pc += 1; // skip MMBIN
                         } else if (lb == .Num and rc == .Num) {
                             ctx.regs[a] = .{ .Num = lb.Num + rc.Num };
+                            ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
                             ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) + rc.Num };
+                            ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            // Slow path: string coercion or metamethod. Cold —
-                            // outlined (P16.2b) to keep the numeric fast-path
-                            // basic blocks compact in the dispatch layout.
-                            if (try self.addSlowPath(&ctx, exec_frames, a, b, c, lb, rc)) continue :frame_loop;
+                            // String coercion (luazig lacks PUC string
+                            // metatable __add). On failure, fall through to
+                            // MMBIN (metamethod or error via failBinaryMmbin).
+                            const cl = coerceArithmeticValue(lb);
+                            const cr = coerceArithmeticValue(rc);
+                            if (cl != null and cr != null) {
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                ctx.regs[a] = try self.binAdd(cl.?, cr.?);
+                                ctx.pc += 1; // skip MMBIN
+                            }
+                            // else: fall through to MMBIN (default pc advance).
                         }
-                        // P16.1a (PUC 5.5 op_arith pc-skip, lvm.c:997):
-                        // on inline completion (fast path or coercion eval)
-                        // skip the following MMBIN* no-op — metamethods are
-                        // handled here, so MMBIN dispatch is pure waste. The
-                        // metamethod push above exited via continue
-                        // :frame_loop; its pending-completion lands on the
-                        // MMBIN and dispatches it as a no-op (rare path).
-                        ctx.pc += 1;
                     },
                     .sub => {
                         const lb = ctx.regs[b];
                         const rc = ctx.regs[c];
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Int = lb.Int -% rc.Int };
+                            ctx.pc += 1; // skip MMBIN
                         } else if (lb == .Num and rc == .Num) {
                             ctx.regs[a] = .{ .Num = lb.Num - rc.Num };
+                            ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
                             ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) - rc.Num };
+                            ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = lb.Num - @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                .sub,
-                                "sub",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
+                            const cl = coerceArithmeticValue(lb);
+                            const cr = coerceArithmeticValue(rc);
+                            if (cl != null and cr != null) {
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                ctx.regs[a] = try self.binSub(cl.?, cr.?);
+                                ctx.pc += 1; // skip MMBIN
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Minus, b, c, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBIN.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .mul => {
                         const lb = ctx.regs[b];
                         const rc = ctx.regs[c];
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Int = lb.Int *% rc.Int };
+                            ctx.pc += 1; // skip MMBIN
                         } else if (lb == .Num and rc == .Num) {
                             ctx.regs[a] = .{ .Num = lb.Num * rc.Num };
+                            ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
                             ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) * rc.Num };
+                            ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = lb.Num * @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                .mul,
-                                "mul",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
+                            const cl = coerceArithmeticValue(lb);
+                            const cr = coerceArithmeticValue(rc);
+                            if (cl != null and cr != null) {
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                ctx.regs[a] = try self.binMul(cl.?, cr.?);
+                                ctx.pc += 1; // skip MMBIN
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Star, b, c, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBIN.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .div => {
                         const lb = ctx.regs[b];
@@ -12287,30 +12303,27 @@ pub const Vm = struct {
                         // DIV always produces a float result (PUC LUA_OPDIV).
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.pc += 1; // skip MMBIN
                         } else if (lb == .Num and rc == .Num) {
                             ctx.regs[a] = .{ .Num = lb.Num / rc.Num };
+                            ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
                             ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / rc.Num };
+                            ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = lb.Num / @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                .div,
-                                "div",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
+                            const cl = coerceArithmeticValue(lb);
+                            const cr = coerceArithmeticValue(rc);
+                            if (cl != null and cr != null) {
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                ctx.regs[a] = try self.binDiv(cl.?, cr.?);
+                                ctx.pc += 1; // skip MMBIN
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Slash, b, c, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBIN.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .mod => {
                         const lb = ctx.regs[b];
@@ -12333,32 +12346,27 @@ pub const Vm = struct {
                                 if (rem != 0 and ((rem ^ ri) < 0)) rem += ri;
                                 ctx.regs[a] = .{ .Int = rem };
                             }
+                            ctx.pc += 1; // skip MMBIN
                         } else if (lb == .Num and rc == .Num) {
-                            // PUC Lua: float % float uses fmod without zero
-                            // check — fmod(x, 0) returns NaN per IEEE 754.
                             ctx.regs[a] = .{ .Num = luaNumMod(lb.Num, rc.Num) };
+                            ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
                             ctx.regs[a] = .{ .Num = luaNumMod(@as(f64, @floatFromInt(lb.Int)), rc.Num) };
+                            ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = luaNumMod(lb.Num, @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                .mod,
-                                "mod",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
+                            const cl = coerceArithmeticValue(lb);
+                            const cr = coerceArithmeticValue(rc);
+                            if (cl != null and cr != null) {
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                ctx.regs[a] = try self.binMod(cl.?, cr.?);
+                                ctx.pc += 1; // skip MMBIN
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Percent, b, c, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBIN.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .pow => {
                         const lb = ctx.regs[b];
@@ -12366,30 +12374,27 @@ pub const Vm = struct {
                         // POW always produces a float result (PUC LUA_OPPOW).
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.pc += 1; // skip MMBIN
                         } else if (lb == .Num and rc == .Num) {
                             ctx.regs[a] = .{ .Num = std.math.pow(f64, lb.Num, rc.Num) };
+                            ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
                             ctx.regs[a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), rc.Num) };
+                            ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = std.math.pow(f64, lb.Num, @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                .pow,
-                                "pow",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
+                            const cl = coerceArithmeticValue(lb);
+                            const cr = coerceArithmeticValue(rc);
+                            if (cl != null and cr != null) {
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                ctx.regs[a] = try self.binPow(cl.?, cr.?);
+                                ctx.pc += 1; // skip MMBIN
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Caret, b, c, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBIN.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .idiv => {
                         const lb = ctx.regs[b];
@@ -12404,159 +12409,117 @@ pub const Vm = struct {
                                 return self.fail("divide by zero", .{});
                             }
                             if (li == std.math.minInt(i64) and ri == -1) {
-                                // PUC Lua: minint // -1 wraps to minint (overflow).
                                 ctx.regs[a] = .{ .Int = std.math.minInt(i64) };
                             } else {
                                 @branchHint(.unlikely);
                                 ctx.regs[a] = .{ .Int = @divFloor(li, ri) };
                             }
+                            ctx.pc += 1; // skip MMBIN
                         } else if (lb == .Num and rc == .Num) {
                             ctx.regs[a] = .{ .Num = std.math.floor(lb.Num / rc.Num) };
+                            ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
                             ctx.regs[a] = .{ .Num = std.math.floor(@as(f64, @floatFromInt(lb.Int)) / rc.Num) };
+                            ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = std.math.floor(lb.Num / @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                .idiv,
-                                "idiv",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
+                            const cl = coerceArithmeticValue(lb);
+                            const cr = coerceArithmeticValue(rc);
+                            if (cl != null and cr != null) {
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                ctx.regs[a] = try self.binIdiv(cl.?, cr.?);
+                                ctx.pc += 1; // skip MMBIN
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Idiv, b, c, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBIN.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .band => {
                         const lb = ctx.regs[b];
                         const rc = ctx.regs[c];
-                        // Fast path: both operands are Int — the overwhelmingly
-                        // common case for bitwise ops. Avoids valueToIntForBitwise
-                        // calls and function call overhead.
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Int = lb.Int & rc.Int };
+                            ctx.pc += 1; // skip MMBIN
                         } else {
                             @branchHint(.unlikely);
-                            if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                .band,
-                                "band",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
+                            const li = valueToIntForBitwise(lb);
+                            const ri = valueToIntForBitwise(rc);
+                            if (li != null and ri != null) {
+                                ctx.regs[a] = .{ .Int = li.? & ri.? };
+                                ctx.pc += 1; // skip MMBIN
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Amp, b, c, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBIN.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .bor => {
                         const lb = ctx.regs[b];
                         const rc = ctx.regs[c];
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Int = lb.Int | rc.Int };
+                            ctx.pc += 1; // skip MMBIN
                         } else {
                             @branchHint(.unlikely);
-                            if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                .bor,
-                                "bor",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
+                            const li = valueToIntForBitwise(lb);
+                            const ri = valueToIntForBitwise(rc);
+                            if (li != null and ri != null) {
+                                ctx.regs[a] = .{ .Int = li.? | ri.? };
+                                ctx.pc += 1; // skip MMBIN
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Pipe, b, c, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBIN.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .bxor => {
                         const lb = ctx.regs[b];
                         const rc = ctx.regs[c];
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Int = lb.Int ^ rc.Int };
+                            ctx.pc += 1; // skip MMBIN
                         } else {
                             @branchHint(.unlikely);
-                            if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                .bxor,
-                                "bxor",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
+                            const li = valueToIntForBitwise(lb);
+                            const ri = valueToIntForBitwise(rc);
+                            if (li != null and ri != null) {
+                                ctx.regs[a] = .{ .Int = li.? ^ ri.? };
+                                ctx.pc += 1; // skip MMBIN
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Tilde, b, c, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBIN.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .shl => {
                         const lb = ctx.regs[b];
                         const rc = ctx.regs[c];
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Int = shiftLeft(lb.Int, rc.Int) };
+                            ctx.pc += 1; // skip MMBIN
                         } else {
                             @branchHint(.unlikely);
-                            if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                .shl,
-                                "shl",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
+                            const li = valueToIntForBitwise(lb);
+                            const ri = valueToIntForBitwise(rc);
+                            if (li != null and ri != null) {
+                                ctx.regs[a] = .{ .Int = shiftLeft(li.?, ri.?) };
+                                ctx.pc += 1; // skip MMBIN
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Shl, b, c, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBIN.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .shr => {
                         const lb = ctx.regs[b];
                         const rc = ctx.regs[c];
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Int = shiftRight(lb.Int, rc.Int) };
+                            ctx.pc += 1; // skip MMBIN
                         } else {
                             @branchHint(.unlikely);
-                            if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                .shr,
-                                "shr",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
+                            const li = valueToIntForBitwise(lb);
+                            const ri = valueToIntForBitwise(rc);
+                            if (li != null and ri != null) {
+                                ctx.regs[a] = .{ .Int = shiftRight(li.?, ri.?) };
+                                ctx.pc += 1; // skip MMBIN
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Shr, b, c, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBIN.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
 
                     // --- Arithmetic: immediate/constant variants (PUC 5.5 style) ---
@@ -12568,65 +12531,32 @@ pub const Vm = struct {
                     // Also used for `x - K` via finishbinexpneg: the subtraction
                     // is coded as `x + (-K)`, with the following MMBINI carrying
                     // TMS_SUB (not TMS_ADD) and B = int2sC(K) (original K).
-                    // The handler peeks the next MMBINI to determine which
-                    // metamethod to call and what the original operand was.
+                    // The MMBINI handler decodes the correct event + operands;
+                    // ADDI just computes R[B] + sC and falls through on failure.
                     .addi => {
                         const lb = ctx.regs[b];
                         const imm: i64 = @as(i64, c) - 127; // sC2int
                         if (lb == .Int) {
                             ctx.regs[a] = .{ .Int = lb.Int +% imm };
+                            ctx.pc += 1; // skip MMBINI
                         } else if (lb == .Num) {
                             ctx.regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(imm)) };
+                            ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            // Peek the next instruction (MMBINI) to determine
-                            // whether this ADDI encodes a genuine `+` (TMS_ADD)
-                            // or a `-` transformed via finishbinexpneg (TMS_SUB).
-                            // When TMS_SUB, the original operand is K
-                            // (non-negated), stored in the MMBINI's B field as
-                            // int2sC(K); the metamethod is __sub, not __add.
-                            var tm_event: TmsEvent = .add;
-                            var tm_name: []const u8 = "add";
-                            var orig_imm = imm;
-                            const next_pc = ctx.pc + 1;
-                            if (next_pc < ctx.cur_proto.code.len) {
-                                const next_inst = ctx.cur_proto.code[next_pc];
-                                if (@as(bc.Op, @enumFromInt(next_inst.op)) == .mmbini) {
-                                    const event = next_inst.c;
-                                    if (event == TMS_SUB) {
-                                        tm_event = .sub;
-                                        tm_name = "sub";
-                                        // MMBINI's B field carries int2sC(K)
-                                        // (the original, non-negated K).
-                                        orig_imm = @as(i64, next_inst.b) - 127;
-                                    }
+                            // String coercion (luazig lacks PUC string
+                            // metatable __add). On failure, fall through to
+                            // MMBINI (metamethod or error via failBinaryMmbin).
+                            if (coerceArithmeticValue(lb)) |cl| {
+                                if (cl == .Int) {
+                                    ctx.regs[a] = .{ .Int = cl.Int +% imm };
+                                } else {
+                                    ctx.regs[a] = .{ .Num = cl.Num + @as(f64, @floatFromInt(imm)) };
                                 }
+                                ctx.pc += 1; // skip MMBINI
                             }
-                            const rc: Value = .{ .Int = orig_imm };
-                            const flip = inst.k != 0;
-                            const m1 = if (flip) rc else lb;
-                            const m2 = if (flip) lb else rc;
-                            if (coerceArithmeticValue(lb) == null and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                m1,
-                                m2,
-                                tm_event,
-                                tm_name,
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
-                            }
-                            // For the eval path, use the original operator
-                            // (.Minus when TMS_SUB, .Plus otherwise) so error
-                            // messages and fallback semantics match the
-                            // source-level operation.
-                            const orig_op: TokenKind = if (tm_event == .sub) .Minus else .Plus;
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, orig_op, b, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBINI.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
 
                     // ADDK: R[A] = R[B] + K[C]:number
@@ -12635,36 +12565,27 @@ pub const Vm = struct {
                         const rc = ctx.cur_proto.resolved_values[c];
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Int = lb.Int +% rc.Int };
+                            ctx.pc += 1; // skip MMBINK
                         } else if (lb == .Num and rc == .Num) {
                             ctx.regs[a] = .{ .Num = lb.Num + rc.Num };
+                            ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
                             ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) + rc.Num };
+                            ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            // PUC flip: if next instruction is MMBINK with
-                            // flip bit (C & 0x80), swap metamethod operands
-                            // to match original source order.
-                            const flip = inst.k != 0;
-                            const m1 = if (flip) rc else lb;
-                            const m2 = if (flip) lb else rc;
-                            if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                m1,
-                                m2,
-                                .add,
-                                "add",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
+                            const cl = coerceArithmeticValue(lb);
+                            const cr = coerceArithmeticValue(rc);
+                            if (cl != null and cr != null) {
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                ctx.regs[a] = try self.binAdd(cl.?, cr.?);
+                                ctx.pc += 1; // skip MMBINK
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Plus, b, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBINK.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
 
                     // SUBK: R[A] = R[B] - K[C]:number
@@ -12673,30 +12594,27 @@ pub const Vm = struct {
                         const rc = ctx.cur_proto.resolved_values[c];
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Int = lb.Int -% rc.Int };
+                            ctx.pc += 1; // skip MMBINK
                         } else if (lb == .Num and rc == .Num) {
                             ctx.regs[a] = .{ .Num = lb.Num - rc.Num };
+                            ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
                             ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) - rc.Num };
+                            ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = lb.Num - @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                .sub,
-                                "sub",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
+                            const cl = coerceArithmeticValue(lb);
+                            const cr = coerceArithmeticValue(rc);
+                            if (cl != null and cr != null) {
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                ctx.regs[a] = try self.binSub(cl.?, cr.?);
+                                ctx.pc += 1; // skip MMBINK
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Minus, b, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBINK.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
 
                     // MULK: R[A] = R[B] * K[C]:number
@@ -12705,33 +12623,27 @@ pub const Vm = struct {
                         const rc = ctx.cur_proto.resolved_values[c];
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Int = lb.Int *% rc.Int };
+                            ctx.pc += 1; // skip MMBINK
                         } else if (lb == .Num and rc == .Num) {
                             ctx.regs[a] = .{ .Num = lb.Num * rc.Num };
+                            ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
                             ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) * rc.Num };
+                            ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = lb.Num * @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            const flip = inst.k != 0;
-                            const m1 = if (flip) rc else lb;
-                            const m2 = if (flip) lb else rc;
-                            if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                m1,
-                                m2,
-                                .mul,
-                                "mul",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
+                            const cl = coerceArithmeticValue(lb);
+                            const cr = coerceArithmeticValue(rc);
+                            if (cl != null and cr != null) {
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                ctx.regs[a] = try self.binMul(cl.?, cr.?);
+                                ctx.pc += 1; // skip MMBINK
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Star, b, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBINK.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
 
                     // MODK: R[A] = R[B] % K[C]:number
@@ -12753,30 +12665,27 @@ pub const Vm = struct {
                                 if (rem != 0 and ((rem ^ ri) < 0)) rem += ri;
                                 ctx.regs[a] = .{ .Int = rem };
                             }
+                            ctx.pc += 1; // skip MMBINK
                         } else if (lb == .Num and rc == .Num) {
                             ctx.regs[a] = .{ .Num = luaNumMod(lb.Num, rc.Num) };
+                            ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
                             ctx.regs[a] = .{ .Num = luaNumMod(@as(f64, @floatFromInt(lb.Int)), rc.Num) };
+                            ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = luaNumMod(lb.Num, @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                .mod,
-                                "mod",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
+                            const cl = coerceArithmeticValue(lb);
+                            const cr = coerceArithmeticValue(rc);
+                            if (cl != null and cr != null) {
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                ctx.regs[a] = try self.binMod(cl.?, cr.?);
+                                ctx.pc += 1; // skip MMBINK
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Percent, b, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBINK.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
 
                     // POWK: R[A] = R[B] ^ K[C]:number
@@ -12785,30 +12694,27 @@ pub const Vm = struct {
                         const rc = ctx.cur_proto.resolved_values[c];
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.pc += 1; // skip MMBINK
                         } else if (lb == .Num and rc == .Num) {
                             ctx.regs[a] = .{ .Num = std.math.pow(f64, lb.Num, rc.Num) };
+                            ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
                             ctx.regs[a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), rc.Num) };
+                            ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = std.math.pow(f64, lb.Num, @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                .pow,
-                                "pow",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
+                            const cl = coerceArithmeticValue(lb);
+                            const cr = coerceArithmeticValue(rc);
+                            if (cl != null and cr != null) {
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                ctx.regs[a] = try self.binPow(cl.?, cr.?);
+                                ctx.pc += 1; // skip MMBINK
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Caret, b, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBINK.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
 
                     // DIVK: R[A] = R[B] / K[C]:number
@@ -12817,30 +12723,27 @@ pub const Vm = struct {
                         const rc = ctx.cur_proto.resolved_values[c];
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.pc += 1; // skip MMBINK
                         } else if (lb == .Num and rc == .Num) {
                             ctx.regs[a] = .{ .Num = lb.Num / rc.Num };
+                            ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
                             ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / rc.Num };
+                            ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = lb.Num / @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                .div,
-                                "div",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
+                            const cl = coerceArithmeticValue(lb);
+                            const cr = coerceArithmeticValue(rc);
+                            if (cl != null and cr != null) {
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                ctx.regs[a] = try self.binDiv(cl.?, cr.?);
+                                ctx.pc += 1; // skip MMBINK
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Slash, b, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBINK.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
 
                     // IDIVK: R[A] = R[B] // K[C]:number
@@ -12859,30 +12762,27 @@ pub const Vm = struct {
                                 @branchHint(.unlikely);
                                 ctx.regs[a] = .{ .Int = @divFloor(lb.Int, ri) };
                             }
+                            ctx.pc += 1; // skip MMBINK
                         } else if (lb == .Num and rc == .Num) {
                             ctx.regs[a] = .{ .Num = @floor(lb.Num / rc.Num) };
+                            ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
                             ctx.regs[a] = .{ .Num = @floor(@as(f64, @floatFromInt(lb.Int)) / rc.Num) };
+                            ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = @floor(lb.Num / @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.pc += 1;
                         } else {
                             @branchHint(.unlikely);
-                            if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                .idiv,
-                                "idiv",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
+                            const cl = coerceArithmeticValue(lb);
+                            const cr = coerceArithmeticValue(rc);
+                            if (cl != null and cr != null) {
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                ctx.regs[a] = try self.binIdiv(cl.?, cr.?);
+                                ctx.pc += 1; // skip MMBINK
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Idiv, b, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBINK.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
 
                     // --- Bitwise: constant variants ---
@@ -12890,83 +12790,53 @@ pub const Vm = struct {
                     .bandk => {
                         const lb = ctx.regs[b];
                         const rc = ctx.cur_proto.resolved_values[c];
-                        const li = valueToIntForBitwise(lb);
-                        const ri = valueToIntForBitwise(rc);
-                        if (li != null and ri != null) {
-                            ctx.regs[a] = .{ .Int = li.? & ri.? };
+                        if (lb == .Int and rc == .Int) {
+                            ctx.regs[a] = .{ .Int = lb.Int & rc.Int };
+                            ctx.pc += 1; // skip MMBINK
                         } else {
                             @branchHint(.unlikely);
-                            const flip = inst.k != 0;
-                            if (try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                if (flip) rc else lb,
-                                if (flip) lb else rc,
-                                .band,
-                                "band",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
+                            const li = valueToIntForBitwise(lb);
+                            const ri = valueToIntForBitwise(rc);
+                            if (li != null and ri != null) {
+                                ctx.regs[a] = .{ .Int = li.? & ri.? };
+                                ctx.pc += 1; // skip MMBINK
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Amp, b, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBINK.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .bork => {
                         const lb = ctx.regs[b];
                         const rc = ctx.cur_proto.resolved_values[c];
-                        const li = valueToIntForBitwise(lb);
-                        const ri = valueToIntForBitwise(rc);
-                        if (li != null and ri != null) {
-                            ctx.regs[a] = .{ .Int = li.? | ri.? };
+                        if (lb == .Int and rc == .Int) {
+                            ctx.regs[a] = .{ .Int = lb.Int | rc.Int };
+                            ctx.pc += 1; // skip MMBINK
                         } else {
                             @branchHint(.unlikely);
-                            const flip = inst.k != 0;
-                            if (try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                if (flip) rc else lb,
-                                if (flip) lb else rc,
-                                .bor,
-                                "bor",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
+                            const li = valueToIntForBitwise(lb);
+                            const ri = valueToIntForBitwise(rc);
+                            if (li != null and ri != null) {
+                                ctx.regs[a] = .{ .Int = li.? | ri.? };
+                                ctx.pc += 1; // skip MMBINK
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Pipe, b, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBINK.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     .bxork => {
                         const lb = ctx.regs[b];
                         const rc = ctx.cur_proto.resolved_values[c];
-                        const li = valueToIntForBitwise(lb);
-                        const ri = valueToIntForBitwise(rc);
-                        if (li != null and ri != null) {
-                            ctx.regs[a] = .{ .Int = li.? ^ ri.? };
+                        if (lb == .Int and rc == .Int) {
+                            ctx.regs[a] = .{ .Int = lb.Int ^ rc.Int };
+                            ctx.pc += 1; // skip MMBINK
                         } else {
                             @branchHint(.unlikely);
-                            const flip = inst.k != 0;
-                            if (try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                if (flip) rc else lb,
-                                if (flip) lb else rc,
-                                .bxor,
-                                "bxor",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
+                            const li = valueToIntForBitwise(lb);
+                            const ri = valueToIntForBitwise(rc);
+                            if (li != null and ri != null) {
+                                ctx.regs[a] = .{ .Int = li.? ^ ri.? };
+                                ctx.pc += 1; // skip MMBINK
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Tilde, b, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBINK.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
 
                     // --- Shifts: immediate variants ---
@@ -12974,147 +12844,231 @@ pub const Vm = struct {
                     .shli => {
                         const lb = ctx.regs[b];
                         const imm: i64 = @as(i64, c) - 127;
-                        const ri = valueToIntForBitwise(lb);
-                        if (ri != null) {
-                            ctx.regs[a] = .{ .Int = shiftLeft(imm, ri.?) };
+                        if (lb == .Int) {
+                            ctx.regs[a] = .{ .Int = shiftLeft(imm, lb.Int) };
+                            ctx.pc += 1; // skip MMBINI
                         } else {
                             @branchHint(.unlikely);
-                            const rc: Value = .{ .Int = imm };
-                            // PUC 5.5: k-bit carries the commutative flip flag.
-                            // SHLI always has k=1 (constant on LEFT), so the
-                            // metamethod receives (constant, register) = (LHS, RHS).
-                            const flip = inst.k != 0;
-                            const m1 = if (flip) rc else lb;
-                            const m2 = if (flip) lb else rc;
-                            if (try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                m1,
-                                m2,
-                                .shl,
-                                "shl",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
+                            if (valueToIntForBitwise(lb)) |ri| {
+                                ctx.regs[a] = .{ .Int = shiftLeft(imm, ri) };
+                                ctx.pc += 1; // skip MMBINI
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Shl, b, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBINI.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
                     // SHRI: R[A] = R[B] >> sC  (sC = C - 127)
                     // Also used for `x << K` via finishbinexpneg: the shift is
                     // coded as `x >> (-K)`, with the following MMBINI carrying
-                    // TMS_SHL (not TMS_SHR) and B = int2sC(K) (original K).
-                    // The handler peeks the next MMBINI to determine which
-                    // metamethod to call and what the original operand was.
+                    // TMS_SHL (not TMS_SHR). The MMBINI handler decodes the
+                    // correct event + operands; SHRI just computes R[B] >> sC
+                    // and falls through on failure.
                     .shri => {
                         const lb = ctx.regs[b];
                         const imm: i64 = @as(i64, c) - 127;
-                        const li = valueToIntForBitwise(lb);
-                        if (li != null) {
-                            ctx.regs[a] = .{ .Int = shiftRight(li.?, imm) };
+                        if (lb == .Int) {
+                            ctx.regs[a] = .{ .Int = shiftRight(lb.Int, imm) };
+                            ctx.pc += 1; // skip MMBINI
                         } else {
                             @branchHint(.unlikely);
-                            // Peek the next instruction (MMBINI) to determine
-                            // whether this SHRI encodes a genuine `>>` (TMS_SHR)
-                            // or a `<<` transformed via finishbinexpneg (TMS_SHL).
-                            // When TMS_SHL, the original shift amount is K
-                            // (non-negated), stored in the MMBINI's B field as
-                            // int2sC(K); the metamethod is __shl, not __shr.
-                            var tm_event: TmsEvent = .shr;
-                            var tm_name: []const u8 = "shr";
-                            var orig_imm = imm;
-                            const next_pc = ctx.pc + 1;
-                            if (next_pc < ctx.cur_proto.code.len) {
-                                const next_inst = ctx.cur_proto.code[next_pc];
-                                if (@as(bc.Op, @enumFromInt(next_inst.op)) == .mmbini) {
-                                    const event = next_inst.c;
-                                    if (event == TMS_SHL) {
-                                        tm_event = .shl;
-                                        tm_name = "shl";
-                                        // MMBINI's B field carries int2sC(K)
-                                        // (the original, non-negated K).
-                                        orig_imm = @as(i64, next_inst.b) - 127;
-                                    }
-                                }
+                            if (valueToIntForBitwise(lb)) |li| {
+                                ctx.regs[a] = .{ .Int = shiftRight(li, imm) };
+                                ctx.pc += 1; // skip MMBINI
                             }
-                            const rc: Value = .{ .Int = orig_imm };
-                            if (try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                tm_event,
-                                tm_name,
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
-                            }
-                            // For the eval path, use the original operator
-                            // (.Shl when TMS_SHL, .Shr otherwise) so error
-                            // messages and fallback semantics match the
-                            // source-level operation.
-                            const orig_op: TokenKind = if (tm_event == .shl) .Shl else .Shr;
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, orig_op, b, lb, rc);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
+                            // else: fall through to MMBINI.
                         }
-                        ctx.pc += 1; // P16.1a: skip MMBIN* no-op (see .add)
                     },
 
                     // --- Metamethod bookkeeping (PUC 5.5 MMBIN family) ---
-                    // No-ops in luazig: metamethods are handled inline in the
-                    // arithmetic/bitwise opcodes above. These exist for bytecode
-                    // parity with PUC 5.5 and will be emitted by the compiler
-                    // in a later task.
-                    .mmbin, .mmbini, .mmbink => {},
+                    // Real handlers: when the preceding arithmetic op failed to
+                    // compute (non-numeric operands without coercion path), it
+                    // falls through to MMBIN/MMBINI/MMBANK. These handlers try
+                    // the metamethod (luaT_trybinTM) or produce the type error.
+                    //
+                    // PUC lvm.c:1556 OP_MMBIN: A=lhs_reg, B=rhs_reg, C=event, k=0.
+                    // Result dest = pi.a (previous instruction's A field).
+                    // Operands: (R[A], R[B]).
+                    .mmbin => {
+                        const pi = ctx.cur_proto.code[ctx.pc - 1];
+                        const event: TmsEvent = @enumFromInt(@as(u5, @truncate(c)));
+                        const lhs = ctx.regs[a];
+                        const rhs = ctx.regs[b];
+                        // PUC luaT_trybinTM (ltm.c:150-166): try metamethod
+                        // on lhs, then rhs. No metamethod → type error.
+                        // Metamethod not callable → call error.
+                        const tm = self.getTmByObj(lhs, event) orelse
+                            self.getTmByObj(rhs, event);
+                        if (tm == null) {
+                            return self.failBinaryMmbin(lhs, rhs, event, ctx.cur_proto, ctx.pc - 1, a, b);
+                        }
+                        // Try to push as bytecode frame (Lua Closure with proto).
+                        if (try self.tryPushBytecodeBinaryMetamethod(
+                            exec_frames,
+                            ctx.frame_index,
+                            lhs,
+                            rhs,
+                            event,
+                            tmsEventOpname(event),
+                            .{ .value = .{ .dst = pi.a } },
+                        )) {
+                            continue :frame_loop;
+                        }
+                        // Not a bytecode Closure — call synchronously
+                        // (Builtin, Closure without proto, or not callable).
+                        // callMetamethod produces PUC's call error for
+                        // non-callable values (luaG_callerror).
+                        exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                        const result = try self.callMetamethod(tm.?, tmsEventOpname(event), &.{ lhs, rhs });
+                        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                        ctx.regs[pi.a] = result;
+                    },
+                    // PUC lvm.c:1566 OP_MMBINI: A=lhs_reg, sB=imm, C=event, k=flip.
+                    // flip=0 → (R[A], Int(sB)); flip=1 → (Int(sB), R[A]).
+                    .mmbini => {
+                        const pi = ctx.cur_proto.code[ctx.pc - 1];
+                        const event: TmsEvent = @enumFromInt(@as(u5, @truncate(c)));
+                        const imm: i64 = @as(i64, b) - 127; // sB2int
+                        const imm_val: Value = .{ .Int = imm };
+                        const flip = inst.k != 0;
+                        const lhs = if (flip) imm_val else ctx.regs[a];
+                        const rhs = if (flip) ctx.regs[a] else imm_val;
+                        const tm = self.getTmByObj(lhs, event) orelse
+                            self.getTmByObj(rhs, event);
+                        if (tm == null) {
+                            // Bad operand is always R[A] (immediate is always valid).
+                            return self.failBinaryMmbin(lhs, rhs, event, ctx.cur_proto, ctx.pc - 1, a, a);
+                        }
+                        if (try self.tryPushBytecodeBinaryMetamethod(
+                            exec_frames,
+                            ctx.frame_index,
+                            lhs,
+                            rhs,
+                            event,
+                            tmsEventOpname(event),
+                            .{ .value = .{ .dst = pi.a } },
+                        )) {
+                            continue :frame_loop;
+                        }
+                        exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                        const result = try self.callMetamethod(tm.?, tmsEventOpname(event), &.{ lhs, rhs });
+                        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                        ctx.regs[pi.a] = result;
+                    },
+                    // PUC lvm.c:1576 OP_MMBANK: A=lhs_reg, B=K_idx, C=event, k=flip.
+                    // flip=0 → (R[A], K[B]); flip=1 → (K[B], R[A]).
+                    .mmbink => {
+                        const pi = ctx.cur_proto.code[ctx.pc - 1];
+                        const event: TmsEvent = @enumFromInt(@as(u5, @truncate(c)));
+                        const kv = ctx.cur_proto.resolved_values[b];
+                        const flip = inst.k != 0;
+                        const lhs = if (flip) kv else ctx.regs[a];
+                        const rhs = if (flip) ctx.regs[a] else kv;
+                        const tm = self.getTmByObj(lhs, event) orelse
+                            self.getTmByObj(rhs, event);
+                        if (tm == null) {
+                            // For error annotation: register side is `a`,
+                            // constant side has no register (sentinel 255).
+                            const p1_reg: u8 = if (flip) 255 else a;
+                            const p2_reg: u8 = if (flip) a else 255;
+                            return self.failBinaryMmbin(lhs, rhs, event, ctx.cur_proto, ctx.pc - 1, p1_reg, p2_reg);
+                        }
+                        if (try self.tryPushBytecodeBinaryMetamethod(
+                            exec_frames,
+                            ctx.frame_index,
+                            lhs,
+                            rhs,
+                            event,
+                            tmsEventOpname(event),
+                            .{ .value = .{ .dst = pi.a } },
+                        )) {
+                            continue :frame_loop;
+                        }
+                        exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                        const result = try self.callMetamethod(tm.?, tmsEventOpname(event), &.{ lhs, rhs });
+                        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                        ctx.regs[pi.a] = result;
+                    },
 
+                    // PUC lvm.c:1586 OP_UNM: no following MMBIN — handles
+                    // metamethod/error inline (luaT_trybinTM with rb,rb).
                     .unm => {
                         const val = ctx.regs[b];
-                        // Fast path: numeric operands avoid coerceArithmeticValue
-                        // and function call overhead.
                         if (val == .Int) {
                             ctx.regs[a] = .{ .Int = -%val.Int };
                         } else if (val == .Num) {
                             ctx.regs[a] = .{ .Num = -val.Num };
                         } else {
                             @branchHint(.unlikely);
-                            if (coerceArithmeticValue(val) == null and try self.tryPushBytecodeUnaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                val,
-                                .unm,
-                                "unm",
-                                a,
-                            )) {
-                                continue :frame_loop;
+                            // String coercion (luazig lacks PUC string
+                            // metatable __unm). On failure, try __unm
+                            // metamethod or produce type error inline.
+                            if (coerceArithmeticValue(val)) |cv| {
+                                if (cv == .Int) {
+                                    ctx.regs[a] = .{ .Int = -%cv.Int };
+                                } else {
+                                    ctx.regs[a] = .{ .Num = -cv.Num };
+                                }
+                            } else {
+                                // PUC OP_UNM: luaT_trybinTM(L, rb, rb, ra, TM_UNM).
+                                const tm = self.getTmByObj(val, .unm);
+                                if (tm == null) {
+                                    exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                    return self.failBinaryMmbin(val, val, .unm, ctx.cur_proto, ctx.pc, b, b);
+                                }
+                                if (try self.tryPushBytecodeUnaryMetamethod(
+                                    exec_frames,
+                                    ctx.frame_index,
+                                    val,
+                                    .unm,
+                                    tmsEventOpname(.unm),
+                                    a,
+                                )) {
+                                    continue :frame_loop;
+                                }
+                                // Not a bytecode Closure — call synchronously.
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                const result = try self.callMetamethod(tm.?, tmsEventOpname(.unm), &.{ val, val });
+                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                ctx.regs[a] = result;
                             }
-                            const result = try self.evalBytecodeUnOp(ctx.cur_proto, ctx.pc, .Minus, b, val);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
                         }
                     },
+                    // PUC lvm.c:1598 OP_BNOT: no following MMBIN — handles
+                    // metamethod/error inline (luaT_trybinTM with rb,rb).
                     .bnot => {
                         const val = ctx.regs[b];
                         if (val == .Int) {
                             ctx.regs[a] = .{ .Int = ~val.Int };
                         } else {
                             @branchHint(.unlikely);
-                            if (valueToIntForBitwise(val) == null and try self.tryPushBytecodeUnaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                val,
-                                .bnot,
-                                "bnot",
-                                a,
-                            )) {
-                                continue :frame_loop;
+                            // Coercion: valueToIntForBitwise handles Int and
+                            // Num-with-integer-value (NOT string — matches PUC
+                            // tointegerns). On failure, try __bnot metamethod
+                            // or produce type error inline.
+                            if (valueToIntForBitwise(val)) |iv| {
+                                ctx.regs[a] = .{ .Int = ~iv };
+                            } else {
+                                // PUC OP_BNOT: luaT_trybinTM(L, rb, rb, ra, TM_BNOT).
+                                const tm = self.getTmByObj(val, .bnot);
+                                if (tm == null) {
+                                    exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                    return self.failBinaryMmbin(val, val, .bnot, ctx.cur_proto, ctx.pc, b, b);
+                                }
+                                if (try self.tryPushBytecodeUnaryMetamethod(
+                                    exec_frames,
+                                    ctx.frame_index,
+                                    val,
+                                    .bnot,
+                                    tmsEventOpname(.bnot),
+                                    a,
+                                )) {
+                                    continue :frame_loop;
+                                }
+                                // Not a bytecode Closure — call synchronously.
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                                const result = try self.callMetamethod(tm.?, tmsEventOpname(.bnot), &.{ val, val });
+                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                ctx.regs[a] = result;
                             }
-                            const result = try self.evalBytecodeUnOp(ctx.cur_proto, ctx.pc, .Tilde, b, val);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.regs[a] = result;
                         }
                     },
                     .not => ctx.regs[a] = try self.evalUnOp(.Not, ctx.regs[b]),
@@ -13831,28 +13785,6 @@ pub const Vm = struct {
     /// OP_SETLIST: R[A][C+i] := R[A+i] for 1<=i<=B. When C==255, the actual
     /// base index is in the following EXTRAARG instruction (consumed here).
     /// Returns `.continue_dispatch` so the dispatcher advances past SETLIST.
-    /// P16.2b: outlined cold path of OP_ADD — string coercion, __add
-    /// metamethod, or the "attempt to perform arithmetic" error. Kept out of
-    /// the dispatch switch body so the four numeric fast-path blocks stay
-    /// contiguous and µop-cache friendly.
-    fn addSlowPath(self: *Vm, ctx: *BytecodeDispatchCtx, exec_frames: *FrameStack, a: u8, b: usize, c: usize, lb: Value, rc: Value) DispatchError!bool {
-        if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-            exec_frames,
-            ctx.frame_index,
-            lb,
-            rc,
-            .add,
-            "add",
-            .{ .value = .{ .dst = a } },
-        )) {
-            return true; // caller must continue :frame_loop (child frame pushed)
-        }
-        const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Plus, @intCast(b), @intCast(c), lb, rc);
-        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-        ctx.regs[a] = result;
-        return false; // coercion eval completed inline; caller applies the MMBIN skip
-    }
-
     fn opSetlist(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
         const inst = ctx.cur_proto.code[ctx.pc];
         const a: usize = inst.a;
@@ -32842,7 +32774,7 @@ pub const Vm = struct {
                 defer self.alloc.free(ret);
                 return if (ret.len > 0) ret[0] else .Nil;
             },
-            else => return self.fail("metamethod '{s}' is not callable ({s} value)", .{ opname, mmv.typeName() }),
+            else => return self.fail("attempt to call a {s} value (metamethod '{s}')", .{ mmv.typeName(), opname }),
         }
     }
 
@@ -33947,6 +33879,83 @@ pub const Vm = struct {
         return self.fail("attempt to perform arithmetic on a {s} value", .{self.valueTypeName(bad)});
     }
 
+    /// PUC luaT_trybinTM type error (ltm.c:150-166 + ldebug.c:788-803).
+    /// Called from MMBIN/MMBINI/MMBANK handlers when no metamethod is found
+    /// on either operand. Mirrors PUC's error logic exactly:
+    ///
+    /// - Bitwise event (BAND..SHR, BNOT) + both operands are numbers (Int/Num):
+    ///   luaG_tointerror → "number has no integer representation" (one operand
+    ///   is a float without integer form, e.g. math.huge in `math.huge & 1`).
+    /// - Bitwise event + at least one non-number:
+    ///   luaG_opinterror("perform bitwise operation on")
+    /// - Arithmetic event (ADD..IDIV, UNM):
+    ///   luaG_opinterror("perform arithmetic on")
+    ///
+    /// luaG_opinterror (ldebug.c:788-793): if p1 is NOT a number (ttisnumber =
+    /// Int or Num, NOT string) → blame p1; else blame p2. This matches PUC
+    /// exactly: a string is "not a number" for this check even if it was
+    /// coercible (the coercion would have happened in the arith op or the
+    /// string metatable __add, not here).
+    ///
+    /// `arith_pc` is the pc of the original arithmetic instruction (ctx.pc - 1
+    /// in the MMBIN handler). `p1_reg`/`p2_reg` are the register numbers for
+    /// the blamed operand annotation (via debugBytecodeOperandName, mirroring
+    /// PUC's varinfo).
+    fn failBinaryMmbin(
+        self: *Vm,
+        p1: Value,
+        p2: Value,
+        event: TmsEvent,
+        proto: *const bc.Proto,
+        arith_pc: usize,
+        p1_reg: u8,
+        p2_reg: u8,
+    ) Error {
+        const is_bitwise = switch (event) {
+            .band, .bor, .bxor, .shl, .shr, .bnot => true,
+            else => false,
+        };
+        // PUC ttisnumber: Int or Num only (NOT string).
+        const p1_is_num = p1 == .Int or p1 == .Num;
+        const p2_is_num = p2 == .Int or p2 == .Num;
+
+        if (is_bitwise and p1_is_num and p2_is_num) {
+            // luaG_tointerror (ldebug.c:799-803): if p1 has no integer
+            // representation → blame p1; else blame p2.
+            const p1_bad = valueToIntForBitwise(p1) == null;
+            const bad_reg = if (p1_bad) p1_reg else p2_reg;
+            const inferred = debugBytecodeOperandName(proto, arith_pc, bad_reg);
+            if (inferred.name) |name| {
+                // PUC luaG_tointerror (ldebug.c:803): format is
+                // "number%s has no integer representation" where %s is
+                // varinfo = " (kind 'name')" — annotation in the MIDDLE.
+                return self.fail(
+                    "number ({s} '{s}') has no integer representation",
+                    .{ inferred.namewhat, name },
+                );
+            }
+            return self.fail("number has no integer representation", .{});
+        }
+
+        // luaG_opinterror (ldebug.c:788-793):
+        // if !ttisnumber(p1) → blame p1; else blame p2.
+        const blame_p1 = !p1_is_num;
+        const bad = if (blame_p1) p1 else p2;
+        const bad_reg = if (blame_p1) p1_reg else p2_reg;
+        const op = if (is_bitwise) "perform bitwise operation on" else "perform arithmetic on";
+        const inferred = debugBytecodeOperandName(proto, arith_pc, bad_reg);
+        if (inferred.name) |name| {
+            return self.fail(
+                "attempt to {s} a {s} value ({s} '{s}')",
+                .{ op, self.valueTypeName(bad), inferred.namewhat, name },
+            );
+        }
+        return self.fail(
+            "attempt to {s} a {s} value",
+            .{ op, self.valueTypeName(bad) },
+        );
+    }
+
     fn evalBinOp(self: *Vm, op: TokenKind, lhs: Value, rhs: Value) DispatchError!Value {
         switch (op) {
             .Plus => return self.binAdd(lhs, rhs),
@@ -33972,47 +33981,6 @@ pub const Vm = struct {
             .Concat => return self.binConcat(lhs, rhs),
             else => return self.fail("unsupported binary operator: {s}", .{op.name()}),
         }
-    }
-
-    fn evalBytecodeUnOp(
-        self: *Vm,
-        proto: *const bc.Proto,
-        pc: usize,
-        op: TokenKind,
-        src_reg: u8,
-        src: Value,
-    ) DispatchError!Value {
-        return self.evalUnOp(op, src) catch |err| {
-            if (err != error.RuntimeError or self.err == null) return err;
-            const inferred = debugBytecodeOperandName(proto, pc, src_reg);
-            if (inferred.name) |name| {
-                if (op == .Minus and
-                    std.mem.startsWith(u8, self.err.?, "type error: unary '-' expects number"))
-                {
-                    return self.fail(
-                        "attempt to perform arithmetic on a {s} value ({s} '{s}')",
-                        .{ self.valueTypeName(src), inferred.namewhat, name },
-                    );
-                }
-                if (op == .Tilde and
-                    std.mem.startsWith(u8, self.err.?, "number has no integer representation"))
-                {
-                    return self.fail(
-                        "number has no integer representation ({s} '{s}')",
-                        .{ inferred.namewhat, name },
-                    );
-                }
-                if (op == .Tilde and
-                    std.mem.startsWith(u8, self.err.?, "attempt to perform bitwise operation on a "))
-                {
-                    return self.fail(
-                        "attempt to perform bitwise operation on a {s} value ({s} '{s}')",
-                        .{ self.valueTypeName(src), inferred.namewhat, name },
-                    );
-                }
-            }
-            return err;
-        };
     }
 
     fn bytecodeIndexValue(
@@ -34072,121 +34040,6 @@ pub const Vm = struct {
                     );
                 }
             }
-            return err;
-        };
-    }
-
-    fn evalBytecodeBinOp(
-        self: *Vm,
-        proto: *const bc.Proto,
-        pc: usize,
-        op: TokenKind,
-        lhs_reg: u8,
-        rhs_reg: u8,
-        lhs: Value,
-        rhs: Value,
-    ) DispatchError!Value {
-        return self.evalBinOp(op, lhs, rhs) catch |err| {
-            if (err != error.RuntimeError or self.err == null) return err;
-
-            if (std.mem.startsWith(u8, self.err.?, "attempt to perform arithmetic on a ")) {
-                const bad_reg = if (!isNumberLikeForArithmetic(lhs)) lhs_reg else rhs_reg;
-                const bad = if (!isNumberLikeForArithmetic(lhs)) lhs else rhs;
-                const inferred = debugBytecodeOperandName(proto, pc, bad_reg);
-                if (inferred.name) |name| {
-                    return self.fail(
-                        "attempt to perform arithmetic on a {s} value ({s} '{s}')",
-                        .{ self.valueTypeName(bad), inferred.namewhat, name },
-                    );
-                }
-            }
-
-            if (std.mem.startsWith(u8, self.err.?, "number has no integer representation")) {
-                const bad_reg = if (isNumWithoutInteger(lhs)) lhs_reg else rhs_reg;
-                const inferred = debugBytecodeOperandName(proto, pc, bad_reg);
-                if (inferred.name) |name| {
-                    return self.fail(
-                        "number has no integer representation ({s} '{s}')",
-                        .{ inferred.namewhat, name },
-                    );
-                }
-            }
-
-            return err;
-        };
-    }
-
-    /// Like evalBytecodeBinOp but for cases where the RHS is a constant
-    /// (K-variant opcodes) or immediate (I-variant opcodes), not a register.
-    /// The register operand is always at lhs_reg (which is the B field of
-    /// the instruction). For most K-variants, the register value is `lhs`.
-    /// For SHLI (imm << R[B]), the register value is `rhs`.
-    /// Error messages annotate the register operand when it's the bad one.
-    fn evalBytecodeBinOpValues(
-        self: *Vm,
-        proto: *const bc.Proto,
-        pc: usize,
-        op: TokenKind,
-        lhs_reg: u8,
-        lhs: Value,
-        rhs: Value,
-    ) DispatchError!Value {
-        return self.evalBinOp(op, lhs, rhs) catch |err| {
-            if (err != error.RuntimeError or self.err == null) return err;
-
-            // The register operand is lhs_reg. Check if it's the bad one.
-            // For most ops, register value = lhs. For SHLI, register value = rhs.
-            //
-            // Two distinct error predicates:
-            // 1. "attempt to perform arithmetic on a X value" — the bad
-            //    operand is a non-number (string, nil, table, etc.).
-            //    Predicate: !isNumberLikeForArithmetic (the value is not
-            //    coercible to a number at all).
-            // 2. "number has no integer representation" — the bad operand
-            //    IS a number but has no integer form (inf, nan, non-integer
-            //    float like math.huge). Predicate: isNumWithoutInteger.
-            //    The constant/immediate side is always a valid integer, so
-            //    when this error fires, the register side must be the culprit.
-            //    Using isNumberLikeForArithmetic here (as before) would miss
-            //    math.huge: it IS number-like, so should_annotate was false,
-            //    and the annotation was skipped — producing a bare "number
-            //    has no integer representation" without the (field 'huge')
-            //    suffix that PUC emits.
-            const lhs_not_num = !isNumberLikeForArithmetic(lhs);
-            const rhs_not_num = !isNumberLikeForArithmetic(rhs);
-            const reg_val = if (rhs_not_num) rhs else lhs;
-
-            if (lhs_not_num or rhs_not_num) {
-                if (std.mem.startsWith(u8, self.err.?, "attempt to perform arithmetic on a ")) {
-                    const inferred = debugBytecodeOperandName(proto, pc, lhs_reg);
-                    if (inferred.name) |name| {
-                        return self.fail(
-                            "attempt to perform arithmetic on a {s} value ({s} '{s}')",
-                            .{ self.valueTypeName(reg_val), inferred.namewhat, name },
-                        );
-                    }
-                }
-            }
-
-            // "number has no integer representation": the register operand
-            // is a float without integer representation (e.g. math.huge in
-            // `math.huge << 1`, compiled to SHRI via finishbinexpneg).
-            // isNumWithoutInteger is the correct predicate: it returns true
-            // only for Num values that valueToIntForBitwise rejects (inf,
-            // nan, non-integer). The immediate/constant side is always a
-            // valid integer, so only the register side can be at fault.
-            if (isNumWithoutInteger(lhs)) {
-                if (std.mem.startsWith(u8, self.err.?, "number has no integer representation")) {
-                    const inferred = debugBytecodeOperandName(proto, pc, lhs_reg);
-                    if (inferred.name) |name| {
-                        return self.fail(
-                            "number has no integer representation ({s} '{s}')",
-                            .{ inferred.namewhat, name },
-                        );
-                    }
-                }
-            }
-
             return err;
         };
     }

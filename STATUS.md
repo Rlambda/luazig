@@ -4098,3 +4098,62 @@ Net: -147 lines (524 insertions, 671 deletions).
 | nextvar/coroutine/gc/gengc/closure/events/errors | all PASS |
 | CallFrame ≤ 104 | comptime assert PASS |
 | perf_compare --runs 7 | OK (no regressions, geomean 2.23x) |
+
+## P16.6 — permanent metamethod dispatch differential smoke (2026-08-29, verifier Task 7)
+
+### tests/smoke/58_metamethod_dispatch.lua
+Permanent differential smoke covering verifier sections A–H:
+- **A**: left/right `__add` lookup precedence (both directions; left operand wins).
+- **B**: dynamic mt mutation (anti-cache): `f1 → f2 → nil(pcall error) → f3` for
+  `__add` AND `__sub`; proves no metamethod caching across calls.
+- **C**: all 12 binary events firing (add/sub/mul/mod/pow/div/idiv/band/bor/
+  bxor/shl/shr) + flip paths (number on LEFT) for sub/div/idiv/mod — these
+  exercise ADDI/MMBINI/MMBINK flip and prove operand order is preserved
+  (metamethod receives `(number, table)` in source order, NOT swapped).
+- **D**: MMBINI/MMBINK immediates + constant-pool flips; metamethod prints
+  `"event:left/right"` tags proving event identity + operand order for every
+  path (ADDI/SUBI/SUBI-flip/SHLI/SHLI-flip/SHRI/SHRI-flip/ADDK/SUBK/SUBK-flip/
+  MULK/MULK-flip/ADDK-flip/DIVK-flip/IDIVK-flip/MODK-flip).
+- **E**: MMBINK constant-pool numeric keys + numeric-string coercion (PUC
+  coerces `"123" → 123` in arithmetic; success path only).
+- **F**: unary `__unm`/`__bnot` (firing + error without metamethod).
+- **G**: yielding Lua metamethod (yield mid-call, resume completes) + nested
+  metamethod-on-metamethod + nested+yield combined.
+- **H**: `debug.sethook` call/return trace around metamethod calls (full
+  sequence + kind/count summary). Count-mask hooks intentionally excluded
+  (instruction counts differ by design between PUC and luazig bytecodes).
+
+### PUC-verified subtleties discovered
+- **Flip operand order**: for non-commutative events (sub/div/mod/idiv) with a
+  number on the LEFT, PUC flips the TM lookup (uses the table's metamethod) but
+  PRESERVES source operand order — the metamethod receives `(number, table)`,
+  not `(table, number)`. luazig matches byte-identically.
+- **Shifts flip identically**: `3 << x` calls `__shl(3, x)` (number, table).
+- **Numeric-string coercion** is arithmetic-only: PUC coerces numeric strings
+  for +,-,*,/,//,%,^ but REJECTS strings for bitwise (&,|,~,<<,>>) even when
+  numeric. luazig matches the arithmetic coercion path.
+
+### Known parity gaps (excluded from this differential test to keep it byte-identical)
+- **String-constant arithmetic ERROR path diverges**: `t + "hello"` (t has no
+  metamethod) → PUC emits `attempt to add a 'table' with a 'string'`; luazig
+  emits `attempt to perform arithmetic on a table value (upvalue 't')`. PUC
+  5.5 introduced a new two-operand error format (`add a 'X' with a 'Y'`) for
+  the MMBIN path when both operands are non-numbers; luazig still uses the
+  older single-operand format. Tracked for a future src fix.
+- **Bitwise-on-string ERROR path diverges**: PUC rejects even numeric strings
+  for bitwise with `attempt to perform bitwise operation on a string value
+  (constant '12')`; luazig emits a different message + duplicate stack
+  traceback. Tracked for a future src fix.
+- **Count-mask hooks diverge**: count events fire every N VM instructions;
+  PUC vs luazig instruction counts differ by design (different bytecode
+  shapes), so count-event traces are not byte-stable. Only call/return ("cr")
+  hooks are used in section H.
+
+### Verification
+| Check | Result |
+|-------|--------|
+| PUC vs zig byte-identical (58_metamethod_dispatch.lua) | PASS (0 diff) |
+| 3× stability runs both runtimes (identical md5) | PASS |
+| Debug build (0xaa/panic sanity) | PASS (no panic, output matches) |
+| ReleaseFast rebuild + re-verify | PASS |
+| Full smoke_compare | 58 passes; 29 + 45_userdata_capi pre-existing (unrelated) |

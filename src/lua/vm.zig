@@ -5350,7 +5350,9 @@ pub const Vm = struct {
         std.sort.block(GcObject, to_finalize.items, self, gcFinalizeLessThan);
 
         for (to_finalize.items) |obj| {
-            _ = self.finalizables.remove(obj);
+            // PUC udata2finalize (lgc.c:947-960): dequeue and clear
+            // FINALIZEDBIT BEFORE resolving __gc on the current metatable.
+            self.takeFinalizable(obj);
             const mt: ?*Table = switch (obj) {
                 .table => |t| t.metatable,
                 .userdata => |u| u.metatable,
@@ -5384,9 +5386,6 @@ pub const Vm = struct {
                 },
                 else => return,
             };
-            // PUC udata2finalize (lgc.c:953): reset FINALIZEDBIT after
-            // finalization so the object is "normal" again.
-            gcPtr(obj).marked.* &= ~FINALIZEDBIT;
         }
     }
 
@@ -6344,6 +6343,29 @@ pub const Vm = struct {
         return .{ .vm = self, .snapshot = self.gc_temp_roots.items.len };
     }
 
+    // === FINALIZER REGISTRATION INVARIANT ===
+    //
+    // FINALIZEDBIT set ⟺ object is in the registered-finalizable lifecycle
+    // (PUC `finobj`/`tobefnz` equivalent). The bit is the O(1) semantic
+    // membership test (PUC `tofinalize(o)`, lgc.h:96); the `finalizables`
+    // HashSet is the iterable container (insert at registration, remove at
+    // dequeue). They MUST agree at every boundary:
+    //
+    //   registerFinalizable(obj):  set bit  ⟺  set.insert(obj)
+    //   takeFinalizable(obj):      clear bit ⟺  set.remove(obj)
+    //
+    // Registration is PERSISTENT (PUC luaC_checkfinalizer, lgc.c:1068-1090):
+    // changing or removing the metatable NEVER deregisters. The __gc
+    // metamethod is resolved DYNAMICALLY at finalization time (PUC GCTM,
+    // lgc.c:968, calls luaT_gettmbyobj on the CURRENT metatable).
+    // lua_setmetatable(nil) does not call checkfinalizer at all (lapi.c:964).
+    //
+    // Dequeue (takeFinalizable) clears the bit BEFORE resolving __gc (PUC
+    // udata2finalize, lgc.c:947-960, resets FINALIZEDBIT before GCTM looks
+    // up the metamethod). If the current metatable is nil or has no __gc,
+    // no callback fires, but the object is "normal" again and will be
+    // collected on the next cycle.
+
     /// Register an object (table or userdata) for finalization.
     /// PUC `luaC_checkfinalizer` (lgc.c:1068-1090): moves the object from
     /// `allgc` to `finobj` and sets FINALIZEDBIT. We use a HashSet
@@ -6363,7 +6385,10 @@ pub const Vm = struct {
         // finalizers called (main.lua:324-326: object 3 created during
         // object 2's finalizer must NOT be finalized).
         if (self.is_closing) return;
-        if (self.finalizables.contains(obj)) return;
+        // PUC luaC_checkfinalizer (lgc.c:1072): `if (tofinalize(o) || ...) return;`
+        // The bit test IS the PUC `tofinalize(o)` check — if already
+        // registered, keep the registration untouched (PUC returns early).
+        if ((gcPtr(obj).marked.* & FINALIZEDBIT) != 0) return;
         try self.finalizables.put(self.alloc, obj, {});
         // PUC luaC_checkfinalizer (lgc.c:1088): l_setbit(o->marked, FINALIZEDBIT)
         gcPtr(obj).marked.* |= FINALIZEDBIT;
@@ -6373,6 +6398,43 @@ pub const Vm = struct {
         // will run when the object is collected. Setting the tick flag here
         // causes spurious automatic minor collections that promote young
         // objects' ages prematurely, breaking gengc.lua age assertions.
+    }
+
+    /// PUC `udata2finalize` (lgc.c:947-960): atomic semantic transition that
+    /// dequeues a finalizable object for finalization. Removes from the
+    /// `finalizables` set (our finobj/tobefnz equivalent) and clears
+    /// FINALIZEDBIT — the object is "normal" again. Called BEFORE resolving
+    /// the current __gc metamethod (PUC GCTM does the lookup AFTER
+    /// udata2finalize returns). If the current metatable is nil or has no
+    /// __gc, no callback fires, but the bit is already cleared so the object
+    /// will be collected on the next cycle.
+    ///
+    /// ARCHITECTURE NOTE: luazig runs finalizers during the atomic phase
+    /// (BEFORE sweep), while PUC runs them AFTER sweep. To prevent the
+    /// sweep from freeing the just-finalized object in the current cycle
+    /// (PUC's sweep has already passed when finalizers run), we call
+    /// `gcMakeWhite` to set the object to the current white — making it
+    /// "not dead" for this sweep. This mirrors PUC's `makewhite(g, o)` in
+    /// `udata2finalize` when `issweepphase(g)` is true. The object is
+    /// collected on the NEXT cycle if still unreachable.
+    fn takeFinalizable(self: *Vm, obj: GcObject) void {
+        _ = self.finalizables.remove(obj);
+        gcPtr(obj).marked.* &= ~FINALIZEDBIT;
+        // PUC udata2finalize (lgc.c:953-955): resetbit + makewhite-if-sweep.
+        // In PUC, finalizers run AFTER sweep (callfin phase), so
+        // issweepphase(g) is true and makewhite is called to make the
+        // object white for the NEXT cycle's sweep.
+        // In luazig, finalizers run DURING atomic (BEFORE sweep). The
+        // object was marked BLACK in atomic Step 10 (gcMarkValue on each
+        // to-finalize object). We must NOT call gcMakeWhite here: the
+        // white flip happens after atomic (line ~20868), so gcMakeWhite
+        // would set the object to the PRE-flip white, which becomes the
+        // "other" (dead) white after the flip — causing the sweep to free
+        // it in the SAME cycle (breaking the two-cycle finalization
+        // contract). Instead, leave the object BLACK: gcIsDead returns
+        // false for black objects, so it survives the sweep. The sweep's
+        // own gcMakeWhite (gcSweepOne line ~21422) then resets it to the
+        // new current white for the next cycle.
     }
 
     /// PUC luaC_condGC pacing: decrement GC debt at Lua-object allocation
@@ -21491,11 +21553,12 @@ pub const Vm = struct {
     /// Check if an object has a registered finalizer (__gc metamethod).
     /// PUC: only tables and userdata can be registered for finalization
     /// (via lua_setmetatable → luaC_checkfinalizer, lapi.c:981,989).
-    /// The `finalizables` set is the non-intrusive equivalent of PUC's
-    /// `finobj` list. FINALIZEDBIT on the object mirrors PUC's
-    /// `tofinalize(o)` (lgc.h:96) as a fast-check.
+    /// Uses FINALIZEDBIT as the O(1) semantic membership test (PUC
+    /// `tofinalize(o)`, lgc.h:96). The `finalizables` HashSet is the
+    /// iterable container only — the bit is the single truth for membership.
     fn gcHasFinalizer(self: *Vm, obj: GcObject) bool {
-        return self.finalizables.contains(obj);
+        _ = self;
+        return (gcPtr(obj).marked.* & FINALIZEDBIT) != 0;
     }
 
     fn gcFinishCycle(self: *Vm) DispatchError!void {
@@ -22331,7 +22394,15 @@ pub const Vm = struct {
         self.gc_stp |= GCSTPGC;
         defer self.gc_stp = old_gcstp;
         for (ordered) |obj| {
-            _ = self.finalizables.remove(obj);
+            // PUC udata2finalize (lgc.c:947-960): dequeue from tobefnz,
+            // return to allgc, reset FINALIZEDBIT, and makewhite — BEFORE
+            // GCTM resolves __gc on the current metatable. This ensures
+            // the bit is cleared even if the metatable is nil or has no
+            // __gc at finalization time. The makewhite prevents the sweep
+            // (which runs after atomic in luazig) from freeing the object
+            // in the current cycle — matching PUC where finalizers run
+            // after sweep and the object survives to the next cycle.
+            self.takeFinalizable(obj);
             // Get the metatable and __gc metamethod for this object type.
             const mt: ?*Table = switch (obj) {
                 .table => |t| t.metatable,
@@ -22373,10 +22444,6 @@ pub const Vm = struct {
                 },
                 else => return e,
             };
-            // PUC udata2finalize (lgc.c:953): reset FINALIZEDBIT after
-            // finalization. The object is "normal" again — in the next
-            // cycle, if unreachable, it will be swept (freed).
-            gcPtr(obj).marked.* &= ~FINALIZEDBIT;
         }
     }
 
@@ -23626,15 +23693,18 @@ pub const Vm = struct {
         }
         switch (args[1]) {
             .Nil => {
+                // PUC lua_setmetatable (lapi.c:964-996): setting metatable
+                // to nil does NOT call luaC_checkfinalizer — registration
+                // is persistent. The __gc is resolved dynamically at
+                // finalization time (GCTM looks up CURRENT metatable).
                 try self.gcStoreMetatable(tbl, null);
-                _ = self.finalizables.remove(.{ .table = tbl });
             },
             .Table => |mt| {
                 try self.gcStoreMetatable(tbl, mt);
+                // PUC lua_setmetatable → luaC_checkfinalizer (lapi.c:981):
+                // only registers when __gc is present; never deregisters.
                 if (self.fastTm(mt, .gc) != null) {
                     try self.registerFinalizable(.{ .table = tbl });
-                } else {
-                    _ = self.finalizables.remove(.{ .table = tbl });
                 }
             },
             else => return self.fail("bad argument #2 to 'setmetatable' (nil or table expected)", .{}),
@@ -25288,14 +25358,12 @@ pub const Vm = struct {
         switch (args[0]) {
             .Table => |tbl| {
                 try self.gcStoreMetatable(tbl, mt);
+                // PUC lua_setmetatable → luaC_checkfinalizer: only registers
+                // when __gc is present; never deregisters.
                 if (mt) |m| {
                     if (self.fastTm(m, .gc) != null) {
                         try self.registerFinalizable(.{ .table = tbl });
-                    } else {
-                        _ = self.finalizables.remove(.{ .table = tbl });
                     }
-                } else {
-                    _ = self.finalizables.remove(.{ .table = tbl });
                 }
             },
             .String => {
@@ -25313,30 +25381,12 @@ pub const Vm = struct {
             .Thread => self.thread_metatable = mt,
             .LightUserdata => self.light_userdata_metatable = mt,
             .Userdata => |ud| {
-                // PUC debug.setmetatable on userdata sets the per-object
-                // metatable directly (ldblib.c:354-357). Unlike tables,
-                // userdata metatables don't use the BITRAS flags cache.
                 ud.metatable = mt;
-                // PUC luaC_objbarrier: forward write barrier — if the userdata
-                // is old/black and the metatable is young/white, the barrier
-                // marks the metatable (generational) or restores the tri-color
-                // invariant (incremental). Without this, a young metatable
-                // could be swept while still referenced by an old userdata.
                 if (mt) |m| {
                     try self.gcForwardBarrierValue(.{ .Userdata = ud }, .{ .Table = m });
-                    // PUC: if the metatable has __gc, register the userdata
-                    // (not the metatable) as finalizable. The userdata is
-                    // what becomes unreachable; the metatable stays alive
-                    // through the userdata. During the atomic phase, white
-                    // (unreachable) userdatas in the finalizables set are
-                    // queued for __gc finalization.
                     if (self.fastTm(m, .gc) != null) {
                         try self.registerFinalizable(.{ .userdata = ud });
-                    } else {
-                        _ = self.finalizables.remove(.{ .userdata = ud });
                     }
-                } else {
-                    _ = self.finalizables.remove(.{ .userdata = ud });
                 }
             },
         }
@@ -26714,7 +26764,17 @@ pub const Vm = struct {
                 entry.value.close(stdio.activeIo());
             }
         }
+        // Architectural divergence: luazig uses an external HashSet for
+        // finalizables, while PUC uses embedded linked lists in GCObject
+        // headers (sweep never touches finobj/tobefnz list elements). If
+        // we don't remove the table from finalizables here, the sweep
+        // frees the table and leaves a dangling pointer in the HashSet.
+        // PUC does NOT need this removal because its sweep skips the
+        // finobj list entirely. This is the ONLY legitimate eager
+        // deregistration site; all others (setmetatable, debug.setmetatable)
+        // have been removed to match PUC's persistent-registration model.
         _ = self.finalizables.remove(.{ .table = tbl });
+        gcPtr(.{ .table = tbl }).marked.* &= ~FINALIZEDBIT;
 
         if (self.open_processes.fetchRemove(id)) |entry| {
             var child = entry.value;

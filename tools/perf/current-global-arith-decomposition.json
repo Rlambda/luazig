@@ -1,7 +1,7 @@
 {
-  "created_utc": "2026-08-29T17:49:05.702843+00:00",
+  "created_utc": "2026-08-29T19:07:42.136694+00:00",
   "task": "P16.9 T3 \u2014 honest instruction numbers (direct + derived)",
-  "head": "f6717f5",
+  "head": "d8f3a36",
   "measurement": {
     "runs_per_workload": 5,
     "n_isolated": 1000000000,
@@ -15,27 +15,27 @@
     "shape": "g_count = 0; for i=1,n do g_count = g_count + i end; return g_count",
     "source": "tools/microbench.lua:34-38",
     "N_reference": 100000000,
-    "ratio_instr": 2.26,
+    "ratio_instr": 1.78,
     "zig_direct": {
-      "median_instr_per_iter": 430.1,
-      "max_spread": 38.08,
+      "median_instr_per_iter": 339.11,
+      "max_spread": 38.0,
       "all_runs": [
-        430.1,
-        430.03,
-        468.11,
-        468.11,
-        430.09
+        377.09,
+        377.08,
+        339.11,
+        339.1,
+        339.1
       ]
     },
     "puc_direct": {
-      "median_instr_per_iter": 190.09,
-      "max_spread": 18.02,
+      "median_instr_per_iter": 190.1,
+      "max_spread": 17.99,
       "all_runs": [
         190.09,
-        190.08,
         190.09,
-        208.1,
-        190.08
+        208.08,
+        190.1,
+        208.01
       ]
     }
   },
@@ -86,24 +86,24 @@
     "workloads": {
       "forloop_only": {
         "zig": {
-          "median_instr_per_iter": 75.01,
-          "max_spread": 0.01,
+          "median_instr_per_iter": 75.02,
+          "max_spread": 0.02,
           "all_runs": [
             75.02,
+            75.02,
             75.01,
-            75.01,
-            75.01,
-            75.02
+            75.02,
+            75.01
           ]
         },
         "puc": {
           "median_instr_per_iter": 28.01,
-          "max_spread": 0.0,
+          "max_spread": 0.01,
           "all_runs": [
-            28.01,
+            28.0,
             28.0,
             28.01,
-            28.0,
+            28.01,
             28.01
           ]
         }
@@ -111,9 +111,9 @@
       "int_arith": {
         "zig": {
           "median_instr_per_iter": 133.02,
-          "max_spread": 0.01,
+          "max_spread": 0.0,
           "all_runs": [
-            133.01,
+            133.02,
             133.02,
             133.02,
             133.02,
@@ -122,35 +122,35 @@
         },
         "puc": {
           "median_instr_per_iter": 60.01,
-          "max_spread": 0.0,
+          "max_spread": 0.01,
           "all_runs": [
             60.01,
             60.01,
             60.01,
-            60.01,
+            60.0,
             60.01
           ]
         }
       },
       "gettabup_only": {
         "zig": {
-          "median_instr_per_iter": 169.02,
-          "max_spread": 0.01,
+          "median_instr_per_iter": 188.01,
+          "max_spread": 19.0,
           "all_runs": [
-            169.01,
+            188.01,
             169.02,
             169.02,
-            169.02,
-            169.01
+            188.02,
+            188.02
           ]
         },
         "puc": {
-          "median_instr_per_iter": 96.01,
+          "median_instr_per_iter": 96.0,
           "max_spread": 9.01,
           "all_runs": [
+            96.0,
             96.01,
-            87.01,
-            96.01,
+            96.0,
             96.01,
             87.0
           ]
@@ -158,25 +158,25 @@
       },
       "settabup_only": {
         "zig": {
-          "median_instr_per_iter": 341.02,
+          "median_instr_per_iter": 250.01,
           "max_spread": 19.0,
           "all_runs": [
-            341.02,
-            322.02,
-            341.02,
-            341.02,
-            341.01
+            250.03,
+            250.01,
+            231.02,
+            250.02,
+            231.02
           ]
         },
         "puc": {
           "median_instr_per_iter": 99.01,
-          "max_spread": 8.99,
+          "max_spread": 0.01,
           "all_runs": [
-            108.0,
             99.01,
             99.01,
             99.01,
-            99.01
+            99.01,
+            99.0
           ]
         }
       }
@@ -189,14 +189,14 @@
         "opcode": "SETTABUP",
         "kind": "derived_estimate",
         "method": "isolated-workload subtraction; non-additive branch/layout effects possible; uncertainty = sum of component max_spreads (conservative)",
-        "zig_instr": 266.0,
+        "zig_instr": 175.0,
         "zig_uncertainty": 19.0,
         "puc_instr": 71.0,
-        "puc_uncertainty": 9.0,
-        "delta": 195.0,
-        "ratio": 3.75,
-        "pct_of_inflation": "\u224881%",
-        "pct_range": "[70%, 93%]"
+        "puc_uncertainty": 0.0,
+        "delta": 104.0,
+        "ratio": 2.46,
+        "pct_of_inflation": "\u224870%",
+        "pct_range": "[57%, 83%]"
       },
       {
         "opcode": "FORLOOP",
@@ -208,21 +208,21 @@
         "puc_uncertainty": 0.0,
         "delta": 47.0,
         "ratio": 2.68,
-        "pct_of_inflation": "\u224820%",
-        "pct_range": "[20%, 20%]"
+        "pct_of_inflation": "\u224832%",
+        "pct_range": "[32%, 32%]"
       },
       {
         "opcode": "GETTABUP",
         "kind": "derived_estimate",
         "method": "isolated-workload subtraction; non-additive branch/layout effects possible; uncertainty = sum of component max_spreads (conservative)",
-        "zig_instr": 94.0,
-        "zig_uncertainty": 0.0,
+        "zig_instr": 113.0,
+        "zig_uncertainty": 19.0,
         "puc_instr": 68.0,
         "puc_uncertainty": 9.0,
-        "delta": 26.0,
-        "ratio": 1.38,
-        "pct_of_inflation": "\u224811%",
-        "pct_range": "[7%, 15%]"
+        "delta": 45.0,
+        "ratio": 1.66,
+        "pct_of_inflation": "\u224830%",
+        "pct_range": "[11%, 49%]"
       },
       {
         "opcode": "ADD",
@@ -234,25 +234,25 @@
         "puc_uncertainty": 0.0,
         "delta": 26.0,
         "ratio": 1.81,
-        "pct_of_inflation": "\u224811%",
-        "pct_range": "[11%, 11%]"
+        "pct_of_inflation": "\u224817%",
+        "pct_range": "[17%, 17%]"
       }
     ],
-    "total_zig_direct": 430.1,
+    "total_zig_direct": 339.1,
     "total_puc_direct": 190.1,
-    "total_delta": 240.0,
-    "total_ratio": 2.26,
-    "additive_model_sum_zig": 493.0,
+    "total_delta": 149.0,
+    "total_ratio": 1.78,
+    "additive_model_sum_zig": 421.0,
     "additive_model_sum_puc": 199.0,
-    "residual_zig": -62.9,
+    "residual_zig": -81.9,
     "residual_puc": -8.9,
     "residual_note": "Residual = direct global_arith \u2212 sum of derived per-opcode. Non-zero residual reflects non-additive branch/layout effects (e.g. code layout, BTB state differences between isolated and combined workloads).",
     "in_context_settabup": {
       "method": "global_arith subtraction (forces additivity): SETTABUP = global_arith \u2212 FORLOOP \u2212 ADD \u2212 GETTABUP.",
-      "zig_instr": 203.1,
+      "zig_instr": 93.1,
       "puc_instr": 62.1,
-      "delta": 141.0,
-      "pct_of_inflation": "\u224859%",
+      "delta": 31.0,
+      "pct_of_inflation": "\u224821%",
       "note": "In-context SETTABUP (inside global_arith) vs isolated SETTABUP: the gap is the non-additive branch/layout effect. PUC is nearly additive (residual \u2248 0); zig's isolated SETTABUP overestimates because the 2-opcode isolated loop has worse dispatch/BTB behavior than the 4-opcode global_arith loop."
     }
   }

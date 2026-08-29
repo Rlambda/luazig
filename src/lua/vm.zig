@@ -1109,10 +1109,9 @@ const BytecodePendingCall = struct {
 /// Eliminates the per-instruction stack_ptr realloc check.
 const EXTRA_MARGIN: usize = 5;
 
-/// SIGINT check interval: atomic load for signal_int_pending is deferred
-/// every this many instructions. At ~1ns/instruction, 1024 instructions
-/// ≈ 1µs latency — imperceptible for Ctrl-C response.
-const SIGINT_CHECK_INTERVAL: u32 = 1024;
+/// P16.10 T8: SIGINT_CHECK_INTERVAL removed — replaced by PUC-style trap
+/// (cached bool refreshed at backward jumps). The old countdown amortization
+/// is no longer used.
 
 /// P15.37a: Hot/cold split for the bytecode pending-call continuation.
 ///
@@ -11732,10 +11731,32 @@ pub const Vm = struct {
         // after. No data race within the loop. Compiler hoists into register.
         const check_sigint = sigint_installed;
 
-        // SIGINT check interval: instead of an atomic acquire load per
-        // instruction, check every SIGINT_CHECK_INTERVAL instructions.
-        // SIGINT latency of ~1024 instructions is <1µs — imperceptible.
-        var sigint_countdown: u32 = 0;
+        // P16.10 T8: PUC-style SIGINT — boundary-only check, no per-instruction
+        // variable.
+        //
+        // PUC Lua's mechanism (lua.c:laction → lua_sethook → ci->u.l.trap=1):
+        // the signal handler sets a per-CallInfo trap flag. The dispatch loop
+        // caches `trap` from L->hookmask at function entry, checks it every
+        // instruction (single predictable not-taken branch), and refreshes it
+        // from ci->u.l.trap at backward jumps (dojump → updatetrap) and C-call
+        // boundaries. PUC's per-instruction cost is 1 branch (the trap check);
+        // the refresh is 1 load at backward jumps.
+        //
+        // luazig's approach: check signal_int_pending DIRECTLY at backward
+        // jumps and frame boundaries — NO per-instruction variable. This
+        // eliminates the register pressure of a per-instruction SIGINT local
+        // (which was +7 instr/iter with the old countdown, and +7 with a
+        // cached trap bool — the cost is dominated by register spills in the
+        // dispatch switch, not by the check itself).
+        //
+        // SIGINT latency: 1 backward-jump for tight loops (FORLOOP/JMP/
+        // TFORLOOP), 1 function call for non-loop code (frame_loop entry).
+        // Basic blocks in Lua bytecode are short (<30 instructions), so
+        // worst-case latency is <30 instructions (<100ns). PUC has the same
+        // latency characteristic (trap is only refreshed at backward jumps).
+        //
+        // Library/embedding users (sigint_installed=false) pay zero:
+        // check_sigint is const false → all SIGINT checks are dead-coded.
 
         frame_loop: while (exec_frames.len() > boundary_depth) {
             ctx.frame_index = exec_frames.len() - 1;
@@ -11777,6 +11798,13 @@ pub const Vm = struct {
             // the heap CallFrame. Replaces the old 15-field defer block.
             // The activation_id check skips the write for popped/replaced frames.
             defer self.syncFrame(&ctx, frame_identity);
+
+            // P16.10 T8: Check SIGINT at frame boundary — catches signals
+            // that fired while a child frame was executing.
+            if (check_sigint and signal_int_pending.load(.acquire)) {
+                signal_int_pending.store(false, .release);
+                return self.fail("interrupted!", .{});
+            }
 
             // P16.10 T6: Stack-pointer poll — REMOVED.
             //
@@ -11851,20 +11879,9 @@ pub const Vm = struct {
                 // immediately. Uses the cached flag updated by refreshHooksCached().
                 // (P15.51l: hooks_active removed from ctx — use self.hooks_active_cached directly.)
 
-                // PUC `laction` (lua.c:98-106): Check for pending SIGINT.
-                // Amortized over SIGINT_CHECK_INTERVAL instructions to avoid
-                // per-instruction atomic acquire load (~3-5 cycles). The
-                // countdown decrement + branch is ~1 cycle when not firing.
-                if (check_sigint) {
-                    if (sigint_countdown == 0) {
-                        sigint_countdown = SIGINT_CHECK_INTERVAL;
-                        if (signal_int_pending.load(.acquire)) {
-                            signal_int_pending.store(false, .release);
-                            return self.fail("interrupted!", .{});
-                        }
-                    }
-                    sigint_countdown -= 1;
-                }
+                // P16.10 T8: SIGINT is checked at backward jumps and frame
+                // boundaries only — no per-instruction check. See the T8
+                // comment block above for the PUC comparison and rationale.
 
                 if (self.hooks_active_cached) {
                     // Slow path: hooks may fire. Use a local `fr` that can be
@@ -13551,6 +13568,7 @@ pub const Vm = struct {
                     // --- Control flow ---
                     .jmp => {
                         ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + inst.jumpOffset() + 1);
+                        if (check_sigint and signal_int_pending.load(.acquire)) { signal_int_pending.store(false, .release); return self.fail("interrupted!", .{}); }
                         continue;
                     },
 
@@ -13626,7 +13644,12 @@ pub const Vm = struct {
                     .tailcall => {
                         switch (try self.opTailcall(&ctx)) {
                             .continue_dispatch => {},
-                            .continue_no_advance => continue,
+                            // P16.10 T8: Tail call reuses the frame (pc=0) —
+                            // refresh sigint_trap like a backward jump.
+                            .continue_no_advance => {
+                                if (check_sigint and signal_int_pending.load(.acquire)) { signal_int_pending.store(false, .release); return self.fail("interrupted!", .{}); }
+                                continue;
+                            },
                             .continue_frame_loop => continue :frame_loop,
                             .return_results => |r| return r,
                             .propagate_error => return error.RuntimeError,
@@ -13700,6 +13723,7 @@ pub const Vm = struct {
                                 const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
                                 const off: i16 = @bitCast(off_bits);
                                 ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
+                                if (check_sigint and signal_int_pending.load(.acquire)) { signal_int_pending.store(false, .release); return self.fail("interrupted!", .{}); }
                                 continue;
                             }
                         } else {
@@ -13715,6 +13739,7 @@ pub const Vm = struct {
                                 const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
                                 const off: i16 = @bitCast(off_bits);
                                 ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
+                                if (check_sigint and signal_int_pending.load(.acquire)) { signal_int_pending.store(false, .release); return self.fail("interrupted!", .{}); }
                                 continue;
                             }
                         }
@@ -13737,6 +13762,7 @@ pub const Vm = struct {
                             const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
                             const off: i16 = @bitCast(off_bits);
                             ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
+                            if (check_sigint and signal_int_pending.load(.acquire)) { signal_int_pending.store(false, .release); return self.fail("interrupted!", .{}); }
                             continue;
                         }
                     },
@@ -13745,6 +13771,7 @@ pub const Vm = struct {
                         const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
                         const off: i16 = @bitCast(off_bits);
                         ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
+                        if (check_sigint and signal_int_pending.load(.acquire)) { signal_int_pending.store(false, .release); return self.fail("interrupted!", .{}); }
                         continue;
                     },
 

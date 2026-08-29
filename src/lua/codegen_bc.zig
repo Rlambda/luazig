@@ -528,19 +528,11 @@ pub const Codegen = struct {
     fn dischargeVars(self: *Codegen, e: *ExpDesc) Error!void {
         switch (e.val) {
             .local => |v| {
-                // Local becomes non-relocatable: value is in a fixed register.
-                //
-                // P16.8a invariant: if this local is captured as an upvalue
-                // (boxed), the open Cell observes exactly bc_stack[ridx]
-                // (Cell.get/set read/write the stack slot). Therefore the
-                // register holds the live value directly — no temp MOVE is
-                // needed. The old workaround (emit MOVE to a fresh temp so
-                // "non-MOVE instructions see a non-stale value") was based on
-                // a stale VM model where SETUPVAL wrote to cell.value instead
-                // of the stack slot. Under the current Cell semantics, the
-                // stack register IS the authoritative storage while open.
-                // Audit evidence: vm.zig Cell.get:667, Cell.set:680,
-                // gcStoreCellValue:20444, closeBytecodeUpvaluesFrom:6974.
+                // Local becomes non-relocatable: value lives in a fixed
+                // register. Under the P16.8a captured-local invariant
+                // (vm.zig Cell invariant block), an open Cell observes
+                // bc_stack[ridx] directly, so the register is the
+                // authoritative storage — no temp MOVE is needed.
                 e.val = .{ .non_reloc = v.ridx };
             },
             // Virtual vararg parameter discharged to a register — the
@@ -549,8 +541,7 @@ pub const Codegen = struct {
             // (lcode.c:808): needvatab(fs->f); var->k = VLOCAL.
             .vararg_var => |v| {
                 self.needVarargTable();
-                // P16.8a: same invariant as .local above — the register holds
-                // the live value directly, no temp MOVE needed.
+                // Same captured-local invariant as .local above.
                 e.val = .{ .non_reloc = v.ridx };
             },
             // Virtual vararg index discharged — the vararg escapes.
@@ -5480,14 +5471,10 @@ pub const Codegen = struct {
             // `ADD tmp, s, i; MOVE s, tmp`). Mirrors PUC `luaK_storevar`
             // VLOCAL → `exp2reg(fs, ex, var->u.var.ridx)`.
             //
-            // P16.8a: The old code skipped direct-store for captured locals
-            // (captured_regs.contains), fearing arithmetic writes to regs[a]
-            // would not sync the boxed cell. Under the captured-local storage
-            // invariant (vm.zig Cell invariant block), an open Cell observes
-            // exactly bc_stack[reg] — so a direct ADD into the local's
-            // register IS visible to closures that captured it. The guard is
-            // obsolete and removed. Audit: Cell.set:680 writes stack slot for
-            // open cells; closeBytecodeUpvaluesFrom:6974 snapshots on close.
+            // P16.8a: direct-store applies to captured locals too — an open
+            // Cell observes bc_stack[reg] (vm.zig Cell invariant block), so a
+            // direct ADD into the local's register is visible to closures
+            // that captured it.
             if (n.lhs[0].node == .Name) {
                 const name = n.lhs[0].node.Name.slice(self.source);
                 // Skip direct-store when the name is a forced global (declared
@@ -6146,9 +6133,8 @@ pub const Codegen = struct {
                 },
                 else => {
                     // PUC Lua luaK_exp2anyreg: discharge to any register.
-                    // For non-captured locals returns the local's register
-                    // directly (no MOVE); for captured locals emits MOVE to
-                    // sync cell.value → stack.
+                    // Locals (captured or not) resolve to their own register
+                    // directly — no MOVE (P16.8a captured-local invariant).
                     var ed = try self.genExpDesc(n.values[0]);
                     const reg = try self.exp2anyreg(&ed);
                     _ = try self.builder.emitABC(.return1, reg, 0, 0, line);

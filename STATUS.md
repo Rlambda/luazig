@@ -1,4 +1,4 @@
-> Last updated: 2026-08-29 (P16.8 — R254 fix, PUC finalizer lifecycle, parity-driven -17% cycles on setmetatable; geomean(18) 1.92x)
+> Last updated: 2026-08-29 (P16.8a — file close finalizer fix: explicit close no longer touches finalizer registration)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -3842,6 +3842,8 @@ checkfinalizer вовсе. takeFinalizable: set.remove + CLEAR FINALIZEDBIT ДО
 Членство: FINALIZEDBIT = семантический тест (tofinalize-parity), HashSet —
 итератор/insert/remove. closeManagedFile — единственная легитимная
 дерегистрация (архитектурная divergence, задокументирована).
+[corrected in P16.8a: closeManagedFile больше НЕ дерегистрирует —
+см. P16.8a correction ниже; обе sweep-ветви уже защищают FINALIZEDBIT]
 
 ### Task 7 — differential `tests/smoke/59_finalizer_registration.lua`
 Регистрация→снятие-mt (обсервебл PUC: без mt НЕТ вызова __gc), mt1/f1→mt2/f2
@@ -4685,21 +4687,25 @@ registration model.
    Changed to use FINALIZEDBIT test, matching PUC's `tofinalize(o)` macro.
    This is the PUC-faithful approach: the bit IS the membership test.
 
-5. **closeManagedFile eager deregistration** (Task 7):
-   Kept `finalizables.remove` + added `FINALIZEDBIT` clear. This is the
-   ONLY legitimate eager deregistration site, due to an architectural
-   divergence: luazig uses an external HashSet for finalizables (PUC uses
-   embedded linked lists in GCObject headers, sweep never touches
-   finobj/tobefnz list elements). Without removal, sweep frees the table
-   and leaves a dangling pointer in the HashSet.
+ 5. **closeManagedFile eager deregistration** (Task 7) [corrected in P16.8a]:
+    Originally kept `finalizables.remove` + `FINALIZEDBIT` clear as "the ONLY
+    legitimate eager deregistration site", citing a dangling-pointer risk.
+    **P16.8a correction:** this was wrong. Both sweep paths (incremental
+    `gcSweepOne` and generational `gcSweepYoungObjects`) already guard against
+    freeing objects with FINALIZEDBIT set — the dangling-pointer concern was
+    unfounded. The eager deregistration broke PUC parity: explicit `f:close()`
+    must NOT touch finalizer registration (PUC `aux_close` only sets
+    `closef=NULL`, never removes from `finobj`). Removed in P16.8a; the
+    `__closed` field (set by callers) tracks "OS resource closed" state
+    independently, mirroring PUC's `isclosed(p)` / `closef==NULL`.
 
 ### Invariant
 
 FINALIZEDBIT ⟺ object is in `finalizables` set. The bit is the fast
 membership test (PUC `tofinalize(o)`). Set at registration
 (`registerFinalizable`), cleared at finalization (`takeFinalizable`).
-The only exception is `closeManagedFile` (architectural divergence,
-documented above).
+No exceptions: `closeManagedFile` no longer touches finalizer registration
+(corrected in P16.8a).
 
 ### Files changed
 - `src/lua/vm.zig` — `takeFinalizable` (new), `gcFinalizeList`,
@@ -4708,11 +4714,19 @@ documented above).
 - `tests/smoke/59_finalizer_registration.lua` — 6 scenarios (A-F),
   byte-identical PUC vs luazig, both GC modes
 
+### P16.8a correction (Task 1)
+- `src/lua/vm.zig` — `closeManagedFile`: removed eager
+  `finalizables.remove` + `FINALIZEDBIT` clear; `builtinFileGc`: added
+  `__closed` guard (PUC `f_gc` `isclosed(p)` check)
+- `tests/smoke/60_file_finalizer_lifecycle.lua` — 5 scenarios (A-E):
+  explicit close + metatable mutation, __gc after close, repeated close
+  error, auto-finalization of open file, metatable mutation after close
+
 ### Verification
 | Check | Result |
 |-------|--------|
 | Matrix `--testc` | 31/32 pass (zig_fail=0, both_fail=1 big.lua pre-existing) |
-| Smoke tests (59) | 59/59 PASS |
-| C API tests (17) | 17/17 PASS |
+| Smoke tests (60) | 60/60 PASS |
+| C API tests (17) | 17/17 PASS + DIFF: PASS |
 | nextvar 3× | 3/3 PASS |
-| leak_bench | PASS (all within 1.0 KB) |
+| native_mem | BOUNDED |

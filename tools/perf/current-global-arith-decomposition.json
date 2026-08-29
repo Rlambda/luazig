@@ -10,22 +10,35 @@
     "ratio_instr": 2.26
   },
   "bytecode": {
-    "loop_body_zig": [
-      "GETTABUP",
-      "ADD",
-      "SETTABUP",
-      "FORLOOP"
-    ],
-    "loop_body_puc": [
+    "listed_loop_body_zig": [
       "GETTABUP",
       "ADD",
       "MMBIN",
       "SETTABUP",
       "FORLOOP"
     ],
-    "note": "ADD int+int fast path skips MMBIN. PUC executes MMBIN as a no-op fast check.",
-    "ops_per_iter_zig": 4,
-    "ops_per_iter_puc": 5
+    "listed_loop_body_puc": [
+      "GETTABUP",
+      "ADD",
+      "MMBIN",
+      "SETTABUP",
+      "FORLOOP"
+    ],
+    "executed_loop_body_zig_fast_int": [
+      "GETTABUP",
+      "ADD",
+      "SETTABUP",
+      "FORLOOP"
+    ],
+    "executed_loop_body_puc_fast_int": [
+      "GETTABUP",
+      "ADD",
+      "SETTABUP",
+      "FORLOOP"
+    ],
+    "note": "Both runtimes LIST 5 opcodes per iteration (GETTABUP, ADD, MMBIN, SETTABUP, FORLOOP). On the int+int fast path, op_arith_aux does pc++ to SKIP the companion MMBIN (PUC lvm.c luaV_arith + luazig ADD handler), so only 4 opcodes are EXECUTED per iteration. The previous claim 'PUC executes MMBIN as a no-op fast check; ops_per_iter_puc = 5' was FALSE — verified via PUC count hook: N=10 -> 52 hits, N=20 -> 92 hits, delta = 40, i.e. 4.0 ops/iter.",
+    "ops_listed_per_iter": 5,
+    "ops_executed_per_iter_fast_int": 4
   },
   "opcode_histogram_zig": {
     "source": "luazig --vm=bc --stats",

@@ -12169,30 +12169,29 @@ pub const Vm = struct {
                             return self.fail("attempt to index a {s} value (upvalue '{s}')", .{ tn, upv_name });
                         }
                         if (env.Table.metatable == null) {
-                            // P16.1b: inline rawSet fast path (same as
-                            // SETFIELD): barrier + direct nodeLookup for an
-                            // existing key, update in place; fall back to
-                            // rawSet only for new-key insertion (possible
-                            // rehash). The key is always a constant String —
-                            // rawSet's array-part check and call overhead are
-                            // unnecessary. (Was: unconditional rawSet funnel;
-                            // rawSet was 30% of the field_access profile.)
+                            // Inline fast path: direct nodeLookup for existing
+                            // key → value-barrier → store; absent → rawSet owns
+                            // new-key semantics. The key is always a constant
+                            // String — rawSet's array-part check and call
+                            // overhead are unnecessary.
                             const tbl = env.Table;
-                            try self.gcTableWriteBarrier(tbl, key, val);
-                            if (self.stats.enabled) self.stats.tbl_set_fast_str += 1; // P16.0b (constant string key)
+                            if (self.stats.enabled) self.stats.tbl_set_fast_str += 1;
                             if (ltable.nodeLookupStr(tbl.hash, key.String)) |node| {
-                                if (self.stats.enabled) self.stats.tbl_update += 1; // P16.0b
+                                if (self.stats.enabled) self.stats.tbl_update += 1;
                                 if (val == .Nil) {
-                                    _ = ltable.nodeDelete(tbl.hash, key, self.hash_seed);
+                                    // Delete: no barrier (no new reference).
+                                    node.value = .Nil;
                                 } else {
-                                    // Reviving a dead node (old value nil):
-                                    // invalidate TM cache (PUC luaV_finishset).
+                                    // Existing-slot update: VALUE barrier only
+                                    // (key already owned), BEFORE store.
+                                    try self.gcTableBarrierBackValue(tbl, val);
                                     if (node.value == .Nil) {
                                         tbl.flags &= ~TableFlags.MASK;
                                     }
                                     node.value = val;
                                 }
                             } else {
+                                // New key: rawSet owns new-key semantics.
                                 try self.rawSet(tbl, key, val);
                             }
                         } else {
@@ -12371,72 +12370,59 @@ pub const Vm = struct {
                         const obj = ctx.regs[a];
                         const key = ctx.regs[b];
                         const val = if (inst.k == 1) ctx.cur_proto.resolved_values[c] else ctx.regs[c];
-                        // P15.38g: Fast path — table without metatable, single
-                        // rawSet. Without this, SETTABLE always calls
-                        // tryPushBytecodeNewIndexMetamethod (which does a
-                        // rawGet to check key existence) + bytecodeSetIndexValue
-                        // (which does another rawGet) — a double lookup.
-                        // P15.52: Inline fast path for String keys: GC barrier
-                        // + direct nodeLookup for existing key update. Int keys
-                        // and other types fall back to rawSet (which has array
-                        // fast path + float→int coercion).
+                        // Fast path: table without metatable. For String and Int
+                        // keys, inline lookup → value-barrier → store; absent →
+                        // rawSet owns new-key semantics. Other types fall back
+                        // to rawSet (which has float→int coercion).
                         if (obj == .Table and obj.Table.metatable == null) {
                             const tbl = obj.Table;
                             if (key == .String) {
-                                if (self.stats.enabled) self.stats.tbl_set_fast_str += 1; // P16.0b
-                                try self.gcTableWriteBarrier(tbl, key, val);
+                                if (self.stats.enabled) self.stats.tbl_set_fast_str += 1;
                                 if (ltable.nodeLookupStr(tbl.hash, key.String)) |node| {
-                                    if (self.stats.enabled) self.stats.tbl_update += 1; // P16.0b (existing key)
+                                    if (self.stats.enabled) self.stats.tbl_update += 1;
                                     if (val == .Nil) {
-                                        _ = ltable.nodeDelete(tbl.hash, key, self.hash_seed);
+                                        node.value = .Nil;
                                     } else {
+                                        try self.gcTableBarrierBackValue(tbl, val);
                                         node.value = val;
                                     }
                                 } else {
-                                    // Slow path: new key insertion (may rehash).
                                     try self.rawSet(tbl, key, val);
                                 }
                             } else if (key == .Int) {
-                                // P16.6: Int-key fast path mirroring the String
-                                // path. For keys in array range, direct array
-                                // write (PUC ikeyinarray). For hash-part keys,
-                                // specialized nodeLookupInt (PUC getintfromhash)
-                                // for existing-key update; falls back to rawSet
-                                // for new-key insertion (may rehash).
-                                if (self.stats.enabled) self.stats.tbl_set_fast_int += 1; // P16.0b
+                                if (self.stats.enabled) self.stats.tbl_set_fast_int += 1;
                                 const k = key.Int;
                                 if (k >= 1) {
                                     const arr_len: i64 = @intCast(tbl.asize);
                                     if (k <= arr_len) {
+                                        // Array range: value-barrier → store.
+                                        try self.gcTableBarrierBackValue(tbl, val);
                                         tbl.array[@intCast(k - 1)] = val;
-                                        try self.gcWriteBarrierTable(tbl, val);
                                     } else {
                                         // Hash-part lookup: specialized int path.
-                                        try self.gcTableWriteBarrier(tbl, key, val);
                                         if (ltable.nodeLookupInt(tbl.hash, k, self.hash_seed)) |node| {
-                                            if (self.stats.enabled) self.stats.tbl_update += 1; // P16.0b
+                                            if (self.stats.enabled) self.stats.tbl_update += 1;
                                             if (val == .Nil) {
-                                                _ = ltable.nodeDelete(tbl.hash, key, self.hash_seed);
+                                                node.value = .Nil;
                                             } else {
-                                                // Reviving a dead node: invalidate TM cache.
+                                                try self.gcTableBarrierBackValue(tbl, val);
                                                 if (node.value == .Nil) {
                                                     tbl.flags &= ~TableFlags.MASK;
                                                 }
                                                 node.value = val;
                                             }
                                         } else {
-                                            // Slow path: new key insertion.
                                             try self.rawSet(tbl, key, val);
                                         }
                                     }
                                 } else {
                                     // Negative/zero int key: hash part only.
-                                    try self.gcTableWriteBarrier(tbl, key, val);
                                     if (ltable.nodeLookupInt(tbl.hash, k, self.hash_seed)) |node| {
-                                        if (self.stats.enabled) self.stats.tbl_update += 1; // P16.0b
+                                        if (self.stats.enabled) self.stats.tbl_update += 1;
                                         if (val == .Nil) {
-                                            _ = ltable.nodeDelete(tbl.hash, key, self.hash_seed);
+                                            node.value = .Nil;
                                         } else {
+                                            try self.gcTableBarrierBackValue(tbl, val);
                                             if (node.value == .Nil) {
                                                 tbl.flags &= ~TableFlags.MASK;
                                             }
@@ -12461,14 +12447,14 @@ pub const Vm = struct {
                         const obj = ctx.regs[a];
                         const val = if (inst.k == 1) ctx.cur_proto.resolved_values[c] else ctx.regs[c];
                         // Fast path: table without metatable, key in array
-                        // range — direct array write (PUC obj2arr).
+                        // range — value-barrier → store (PUC obj2arr).
                         if (obj == .Table and obj.Table.metatable == null) {
                             const tbl = obj.Table;
                             const k: usize = b; // b is u8, 1-based
                             if (k >= 1 and k <= tbl.asize) {
-                                if (self.stats.enabled) self.stats.tbl_set_fast_int += 1; // P16.0b
+                                if (self.stats.enabled) self.stats.tbl_set_fast_int += 1;
+                                try self.gcTableBarrierBackValue(tbl, val);
                                 tbl.array[k - 1] = val;
-                                try self.gcWriteBarrierTable(tbl, val);
                             } else {
                                 try self.rawSet(tbl, .{ .Int = @intCast(b) }, val);
                             }
@@ -12487,31 +12473,27 @@ pub const Vm = struct {
                         const key = ctx.cur_proto.resolved_values[b];
                         const val = if (inst.k == 1) ctx.cur_proto.resolved_values[c] else ctx.regs[c];
                         if (obj == .Table and obj.Table.metatable == null) {
-                            // Inline rawSet fast path: GC barrier + direct
-                            // nodeLookup for existing key. Falls back to
-                            // rawSet for new key insertion (slow path with
-                            // possible rehash). rawSet calls gcTableWriteBarrier
-                            // again — harmless (idempotent).
+                            // Inline fast path: direct nodeLookup for existing
+                            // key → value-barrier → store; absent → rawSet
+                            // owns new-key semantics.
                             const tbl = obj.Table;
-                            try self.gcTableWriteBarrier(tbl, key, val);
-                            if (self.stats.enabled) self.stats.tbl_set_fast_str += 1; // P16.0b
+                            if (self.stats.enabled) self.stats.tbl_set_fast_str += 1;
                             if (ltable.nodeLookupStr(tbl.hash, key.String)) |node| {
-                                // Existing key: update in place (or delete).
-                                if (self.stats.enabled) self.stats.tbl_update += 1; // P16.0b
+                                if (self.stats.enabled) self.stats.tbl_update += 1;
                                 if (val == .Nil) {
-                                    _ = ltable.nodeDelete(tbl.hash, key, self.hash_seed);
+                                    // Delete: no barrier (no new reference).
+                                    node.value = .Nil;
                                 } else {
-                                    // PUC luaV_finishset (lvm.c:347) calls
-                                    // invalidateTMcache after luaH_finishset.
-                                    // Invalidate when reviving a dead node
-                                    // (old value was nil → new non-nil value).
+                                    // Existing-slot update: VALUE barrier only
+                                    // (key already owned), BEFORE store.
+                                    try self.gcTableBarrierBackValue(tbl, val);
                                     if (node.value == .Nil) {
                                         tbl.flags &= ~TableFlags.MASK;
                                     }
                                     node.value = val;
                                 }
                             } else {
-                                // Slow path: new key insertion (may rehash).
+                                // New key: rawSet owns new-key semantics.
                                 try self.rawSet(tbl, key, val);
                             }
                         } else {
@@ -13997,9 +13979,10 @@ pub const Vm = struct {
                 }
                 for (0..count) |i| {
                     const idx = start + i;
+                    // Value-barrier BEFORE store (OOM safety: if barrier
+                    // fails, the store must not happen).
+                    try self.gcTableBarrierBackValue(tbl, ctx.regs[a + 1 + i]);
                     tbl.array[idx] = ctx.regs[a + 1 + i];
-                    // PUC backward barrier on the table being written to.
-                    try self.gcWriteBarrierTable(tbl, ctx.regs[a + 1 + i]);
                 }
                 tbl.flags &= ~TableFlags.MASK;
             } else {
@@ -20696,7 +20679,7 @@ pub const Vm = struct {
     /// Uses the DIRECT *Table owner: `gcRememberObject(.{ .table = table })`
     /// — no Value→GcObject→Table round-trip (Task 7). Age/transition logic
     /// is centralized here and in `gcRememberObject` only.
-    fn gcTableBarrierBackSlow(self: *Vm, table: *Table, child: GcObject) DispatchError!void {
+    inline fn gcTableBarrierBackSlow(self: *Vm, table: *Table, child: GcObject) DispatchError!void {
         // Generational mode: PUC luaC_barrierback → luaC_objbarrierback →
         // luaC_barrierback_ (lgc.c:268). When an old table gets a young
         // value/key, remember the table for re-traversal in the next minor
@@ -20720,17 +20703,6 @@ pub const Vm = struct {
         // Backward barrier: turn owner gray, add to grayagain.
         gcSetGray(&table.gc_marked);
         try self.gc_grayagain.append(self.alloc, .{ .table = table });
-    }
-
-    /// DEPRECATED shim — replaced by gcTableBarrierBackValue +
-    /// gcTableBarrierBackNewKey. Kept temporarily during migration of call
-    /// sites in Commits 2+3. Delete after all callers are converted.
-    /// Calls the new typed barriers: key → gcTableBarrierBackNewKey,
-    /// value → gcTableBarrierBackValue. Both barrier the same table, so the
-    /// second is a no-op if the first already added it to grayagain.
-    inline fn gcTableWriteBarrier(self: *Vm, table: *Table, key: Value, value: Value) DispatchError!void {
-        try self.gcTableBarrierBackNewKey(table, key);
-        try self.gcTableBarrierBackValue(table, value);
     }
 
     fn gcDrainGray(self: *Vm) DispatchError!void {

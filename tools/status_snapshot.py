@@ -37,6 +37,7 @@ STATUS_DIR = ROOT / "tools" / "status"
 
 MATRIX_ARTIFACT = STATUS_DIR / "current-matrix.json"
 SMOKE_ARTIFACT = STATUS_DIR / "current-smoke.json"
+PHASE_FILE = STATUS_DIR / "phase.txt"
 
 
 def build() -> int:
@@ -72,6 +73,17 @@ def run_lane_atomic(name: str, cmd: list[str], artifact: Path) -> int:
             tmp.unlink()
 
 
+def write_phase(phase: str) -> None:
+    """Write the current phase identifier to tools/status/phase.txt.
+
+    status_summary.py reads this file to machine-generate the ``> Last
+    updated:`` line in STATUS.md, eliminating hand-edit drift.
+    """
+    STATUS_DIR.mkdir(parents=True, exist_ok=True)
+    PHASE_FILE.write_text(phase + "\n", encoding="utf-8")
+    print(f"   wrote {PHASE_FILE} ({phase})")
+
+
 def regenerate_docs() -> int:
     cmd = [
         "python3", str(ROOT / "tools" / "status_summary.py"),
@@ -91,7 +103,14 @@ def main() -> int:
                     help="skip the (slow) matrix lane; smoke + docs only")
     ap.add_argument("--skip-docs", action="store_true",
                     help="do not regenerate README/STATUS blocks afterwards")
+    ap.add_argument("--phase", default="",
+                    help="phase identifier for the STATUS.md 'Last updated' line "
+                         "(e.g. P16.9). Written to tools/status/phase.txt; "
+                         "status_summary.py reads it to eliminate hand-edit drift.")
     args = ap.parse_args()
+
+    if args.phase:
+        write_phase(args.phase)
 
     if not args.no_build:
         ret = build()

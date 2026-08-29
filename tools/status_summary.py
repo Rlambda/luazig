@@ -29,6 +29,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
 CAPI_MAKEFILE = ROOT / "tests" / "c_api" / "Makefile"
+PHASE_FILE = ROOT / "tools" / "status" / "phase.txt"
 
 BEGIN_MARKER = "<!-- BEGIN GENERATED STATUS (tools/status_summary.py) -->"
 END_MARKER = "<!-- END GENERATED STATUS -->"
@@ -37,6 +38,11 @@ END_MARKER = "<!-- END GENERATED STATUS -->"
 # feeds both files and they cannot drift apart again.
 STATUS_BEGIN_MARKER = "<!-- BEGIN GENERATED SUMMARY (tools/status_summary.py) -->"
 STATUS_END_MARKER = "<!-- END GENERATED SUMMARY -->"
+
+# The "Last updated" line at the very top of STATUS.md.  Machine-generated
+# from tools/status/phase.txt (written by status_snapshot.py --phase) so it
+# never suffers hand-edit drift.
+LAST_UPDATED_RE = re.compile(r"^> Last updated: .*$", re.MULTILINE)
 
 # ---------------------------------------------------------------------------
 # Input loading
@@ -246,6 +252,37 @@ def write_status_summary(block: str) -> None:
     path.write_text(new_text, encoding="utf-8")
 
 
+def update_last_updated() -> None:
+    """Update the ``> Last updated:`` line in STATUS.md from phase.txt.
+
+    Reads ``tools/status/phase.txt`` (written by ``status_snapshot.py
+    --phase``).  If the file is absent the line is left untouched, so
+    ``status_summary.py`` called without the orchestrator never clobbers a
+    hand-written phase.  When present, the line becomes::
+
+        > Last updated: YYYY-MM-DD (PHASE)
+
+    where PHASE is the full contents of phase.txt and the date is today
+    (UTC).  This eliminates hand-edit drift on the phase identifier.
+    """
+    if not PHASE_FILE.exists():
+        return
+    phase = PHASE_FILE.read_text(encoding="utf-8").strip()
+    if not phase:
+        return
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    replacement = f"> Last updated: {today} ({phase})"
+    path = ROOT / "STATUS.md"
+    text = path.read_text(encoding="utf-8")
+    new_text, n = LAST_UPDATED_RE.subn(replacement, text, count=1)
+    if n == 0:
+        # No existing line — insert one after the first line.
+        new_text = text.split("\n", 1)[0] + "\n" + replacement + "\n" + text.split("\n", 1)[1]
+    path.write_text(new_text, encoding="utf-8")
+    print(f"STATUS.md last-updated line updated: {replacement}")
+
+
 # ---------------------------------------------------------------------------
 # README rewrite
 # ---------------------------------------------------------------------------
@@ -304,6 +341,7 @@ def main() -> int:
         write_readme(block)
     if args.write_status:
         write_status_summary(build_status_summary_block(matrix, smoke, perf, versioned=args.use_current))
+        update_last_updated()
     else:
         print(block)
     return 0

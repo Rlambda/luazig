@@ -1,4 +1,4 @@
-> Last updated: 2026-08-29 (P16.8a — file-finalizer parity, captured-local invariant cleanup + R254 source case, transactional simple_result, global_arith decomposition)
+> Last updated: 2026-08-29 (P16.9)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -5089,12 +5089,24 @@ fails → extra grayagain entry is harmless (conservatively grayer).
 
 ### Performance results
 
-| Metric | Before | After | Delta |
-|--------|--------|-------|-------|
-| SETTABUP isolated (instr/iter) | 322 | 231 | -28.3% |
-| global_arith isolated (instr/iter) | 468 | 377 | -19.4% |
+Figures are **median user-mode instr/iter** from
+`tools/perf/current-global-arith-decomposition.json` (5 repeated runs,
+`perf stat -e instructions`, pinned CPU core 0). "Before" = pre-split
+single-run reference; "After" = median ± max_spread across runs.
+
+| Metric | Before | After (median ± spread) | Delta |
+|--------|--------|-------------------------|-------|
+| SETTABUP isolated (instr/iter) | 322 | 250.0 ±19 | -22.4% |
+| global_arith direct (instr/iter) | 468 | 339.1 ±38 | -27.5% |
+| global_arith PUC direct (instr/iter) | — | 190.1 ±18 | — |
 | global_arith timing (s) | 1.262 | 1.159 | -8.1% |
 | geomean (vs PUC) | 1.92x | 1.91x | -0.5% |
+
+The large spread (±38 on 339.1) is genuine: both PUC and luazig use a
+per-process random hash seed, so different runs hit different hash-table
+bucket collision-chain lengths for `g_count` (see artifact
+`determinism_note`). The "377" figure recorded in earlier drafts was a
+single run, not the median.
 
 `gcTableBarrierBackSlow`: `inline` (not `noinline`) — `noinline` caused
 code layout regression on comparisons workload (+18%); `inline` preserves

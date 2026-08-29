@@ -5113,3 +5113,43 @@ the SETTABUP improvement with no layout side effects.
 - `a23ea01` T4-7+9: barrier semantic split — typed API + noinline slow helper + OOM invariant
 - `ac72c43` T8: rawSet restructured — 5-step flow, no recursion, no premature barrier
 - `f83b257` T10: opcode fast paths — remove duplicate barriers, fix barrier-before-store order
+
+## P16.9 Task 11 — permanent barrier-semantics differential test (2026-08-29)
+
+### What changed
+
+Added `tests/smoke/63_table_barrier_semantics.lua` — permanent differential
+test verifying table write-barrier semantics match PUC Lua 5.5 byte-for-byte
+across strong/weak tables × value/new-key mutations × inc/gen GC modes.
+
+### Scenarios encoded (PUC behavior prototyped side-by-side, 3× stable)
+
+- **A**: existing key → young collectable value in old table; 1 collect →
+  young value SURVIVES (barrier marks it). Probe: direct read + entry count.
+- **B**: existing int + string keys → primitive values round-trip correctly.
+- **C**: new collectable hash key in strong table; 1 collect → key SURVIVES
+  (barrier on new-key insertion). Probe: weak-key sentinel non-emptiness.
+- **D**: weak-KEY table; 1 collect → entry DISAPPEARS (barrier must NOT
+  strengthen weak key). Probe: `next(w) == nil`.
+- **E**: weak-VALUE table; existing-key update to young value; 1 collect →
+  entry DISAPPEARS (barrier must NOT strengthen weak value). Probe: `next(w) == nil` + `w.existing == nil`.
+- **F**: `t[k]=nil` removes existing entry; `t[absent]=nil` creates nothing.
+  Probe: `next(t) == nil` after each.
+- **G** (hardening): mixed insert collectable key → delete → re-insert
+  primitive; correct state at each step.
+- **H** (hardening): collectable metatable on old table; 1 collect →
+  metatable SURVIVES (barrier on setmetatable); `__index` still works.
+- **I** (hardening): weak-value with collectable value; 1 collect →
+  entry DISAPPEARS (same as E, fresh key).
+
+Gen-mode aging: prototyped 0–4 collects-to-age; barrier works regardless
+(young value survives even with 0 pre-age collects). Encoded 2 collects
+pre-age for robustness; 1 post-assignment collect suffices for survival;
+2 post-collects for weak disappearance (gen-mode safety margin).
+
+### Gate results
+
+- smoke 63/63 (byte-identical stdout+exit on zig AND PUC, 3× stable)
+- matrix zig_fail=0 (testes_matrix --testc)
+- Debug build: 0xaa sanity pass, exit 0
+- ReleaseFast rebuild: pass

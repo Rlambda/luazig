@@ -4520,16 +4520,27 @@ the mechanisms are mutually exclusive (asserted in
 `tryPushBytecodeContinuationCall`).
 
 ### Invariants
-1. `simple_result_dst == SIMPLE_RESULT_NONE` ⟹ normal pending_calls path.
-2. `simple_result_dst != SIMPLE_RESULT_NONE` ⟹ `pending_call_index ==
+1. `!hasSimpleResult()` ⟹ normal pending_calls path.
+2. `hasSimpleResult()` ⟹ `pending_call_index ==
    INVALID_PENDING` (asserted).
-3. `simple_result_dst` is cleared in `popBytecodeExecFrame` (error-unwind
-   safety) and in `completeBytecodeExecFrame` (normal completion).
-4. Yielding metamethods fall back to pending_calls (simple_result is
-   skipped when `runClosure` returns `error.Yield`).
-5. `SIMPLE_RESULT_COMPARE` (0xFE) and `SIMPLE_RESULT_NONE` (0xFF) are
-   sentinels — value mode uses 0x00-0xFD (max register 253, well above
-   MAXSTACK).
+3. `simple_result` state is cleared in `popBytecodeExecFrame` (error-unwind
+   safety) and in `completeBytecodeExecFrame` / opReturn0/opReturn1 fast arms
+   (normal completion).
+4. Yielding metamethods do NOT fall back to pending_calls. The inline
+   simple_result state persists on the parent CallFrame (heap-resident in
+   `thread.call_frames`) across coroutine yield/resume. The metamethod child
+   frame is also heap-resident and persists. `bytecode_inplace_suspended`
+   prevents the errdefer in `runBytecodeInternal` from unwinding frames. On
+   resume, the child continues; when it returns, the return path checks
+   `hasSimpleResult()` and completes inline — identical to the non-yielding
+   path. (P16.8 correction: the P16.7 STATUS text claimed "fall back to
+   pending_calls" — this was wrong. The code never converts simple_result to
+   pending_calls on yield.)
+5. P16.8: `SIMPLE_RESULT_NONE` (0xFF = NO_REG) is the ONLY sentinel.
+   Compare mode is indicated by `lua_packed_flags` bit 7
+   (`SIMPLE_RESULT_COMPARE_FLAG`), NOT by a sentinel in `simple_result_dst`.
+   Value mode uses `simple_result_dst` 0..254 (R254 is VALID; the old 0xFE
+   sentinel is gone).
 
 ### Call sites redirected
 - **Value mode**: MMBIN, MMBINI, MMBINK, UNM, BNOT, LEN, __index (2 paths)

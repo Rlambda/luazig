@@ -7134,6 +7134,38 @@ pub const Vm = struct {
         );
     }
 
+    /// Invoke an ALREADY-RESOLVED metamethod value as a bytecode continuation
+    /// frame. This is the invocation half of the resolve→invoke split:
+    /// `findBinaryTm`/`findUnaryTm` resolve, this function invokes.
+    ///
+    /// The resolved value may be non-callable or a Builtin/Closure-without-proto
+    /// — in that case this returns `false` so the caller can fall through to
+    /// `callMetamethod` (the synchronous path), which handles all value types.
+    /// The `event` parameter is used solely to derive the debug opname via
+    /// `tag_method.opname(event)` — no lookup is performed here.
+    fn tryPushResolvedMetamethod(
+        self: *Vm,
+        exec_frames: *FrameStack,
+        parent_index: usize,
+        metamethod: Value,
+        args: []const Value,
+        event: TmsEvent,
+        completion: BytecodePendingCompletion,
+    ) DispatchError!bool {
+        // Fast filter: only bytecode Closures with proto can be pushed as
+        // continuation frames. This avoids the resolveCallable call for
+        // Builtin/non-Closure values (the common synchronous fallback).
+        if (metamethod != .Closure or metamethod.Closure.proto == null) return false;
+        return self.tryPushBytecodeMetamethod(
+            exec_frames,
+            parent_index,
+            metamethod,
+            tag_method.opname(event),
+            args,
+            completion,
+        );
+    }
+
     /// `pairs` is one of the standard-library C functions that Lua makes
     /// yieldable across its `__pairs` call.  Running the metamethod inside
     /// builtinPairs would re-enter runBytecode and replay the builtin after a
@@ -7390,16 +7422,15 @@ pub const Vm = struct {
         opname: []const u8,
         completion: BytecodePendingCompletion,
     ) DispatchError!bool {
-        const mm = self.getTmByObj(lhs, event) orelse
-            self.getTmByObj(rhs, event) orelse return false;
-        if (mm != .Closure or mm.Closure.proto == null) return false;
+        _ = opname; // Commit C will remove this parameter
+        const mm = self.findBinaryTm(lhs, rhs, event) orelse return false;
         const args = [_]Value{ lhs, rhs };
-        return self.tryPushBytecodeMetamethod(
+        return self.tryPushResolvedMetamethod(
             exec_frames,
             parent_index,
             mm,
-            opname,
             args[0..],
+            event,
             completion,
         );
     }
@@ -7413,16 +7444,16 @@ pub const Vm = struct {
         opname: []const u8,
         dst: u8,
     ) DispatchError!bool {
-        const mm = self.getTmByObj(operand, event) orelse return false;
-        if (mm != .Closure or mm.Closure.proto == null) return false;
+        _ = opname; // Commit C will remove this parameter
+        const mm = self.findUnaryTm(operand, event) orelse return false;
         // PUC supplies two copies for unary metamethods.
         const args = [_]Value{ operand, operand };
-        return self.tryPushBytecodeMetamethod(
+        return self.tryPushResolvedMetamethod(
             exec_frames,
             parent_index,
             mm,
-            opname,
             args[0..],
+            event,
             .{ .value = .{ .dst = dst } },
         );
     }
@@ -12753,19 +12784,18 @@ pub const Vm = struct {
                         // PUC luaT_trybinTM (ltm.c:150-166): try metamethod
                         // on lhs, then rhs. No metamethod → type error.
                         // Metamethod not callable → call error.
-                        const tm = self.getTmByObj(lhs, event) orelse
-                            self.getTmByObj(rhs, event);
+                        // Resolve ONCE — no re-lookup in the push/call path.
+                        const tm = self.findBinaryTm(lhs, rhs, event);
                         if (tm == null) {
                             return self.failBinaryMmbin(lhs, rhs, event, ctx.cur_proto, ctx.pc - 1, a, b);
                         }
                         // Try to push as bytecode frame (Lua Closure with proto).
-                        if (try self.tryPushBytecodeBinaryMetamethod(
+                        if (try self.tryPushResolvedMetamethod(
                             exec_frames,
                             ctx.frame_index,
-                            lhs,
-                            rhs,
+                            tm.?,
+                            &.{ lhs, rhs },
                             event,
-                            tag_method.opname(event),
                             .{ .value = .{ .dst = pi.a } },
                         )) {
                             continue :frame_loop;
@@ -12789,19 +12819,18 @@ pub const Vm = struct {
                         const flip = inst.k != 0;
                         const lhs = if (flip) imm_val else ctx.regs[a];
                         const rhs = if (flip) ctx.regs[a] else imm_val;
-                        const tm = self.getTmByObj(lhs, event) orelse
-                            self.getTmByObj(rhs, event);
+                        // Resolve ONCE — no re-lookup in the push/call path.
+                        const tm = self.findBinaryTm(lhs, rhs, event);
                         if (tm == null) {
                             // Bad operand is always R[A] (immediate is always valid).
                             return self.failBinaryMmbin(lhs, rhs, event, ctx.cur_proto, ctx.pc - 1, a, a);
                         }
-                        if (try self.tryPushBytecodeBinaryMetamethod(
+                        if (try self.tryPushResolvedMetamethod(
                             exec_frames,
                             ctx.frame_index,
-                            lhs,
-                            rhs,
+                            tm.?,
+                            &.{ lhs, rhs },
                             event,
-                            tag_method.opname(event),
                             .{ .value = .{ .dst = pi.a } },
                         )) {
                             continue :frame_loop;
@@ -12820,8 +12849,8 @@ pub const Vm = struct {
                         const flip = inst.k != 0;
                         const lhs = if (flip) kv else ctx.regs[a];
                         const rhs = if (flip) ctx.regs[a] else kv;
-                        const tm = self.getTmByObj(lhs, event) orelse
-                            self.getTmByObj(rhs, event);
+                        // Resolve ONCE — no re-lookup in the push/call path.
+                        const tm = self.findBinaryTm(lhs, rhs, event);
                         if (tm == null) {
                             // For error annotation: register side is `a`,
                             // constant side has no register (sentinel 255).
@@ -12829,13 +12858,12 @@ pub const Vm = struct {
                             const p2_reg: u8 = if (flip) a else 255;
                             return self.failBinaryMmbin(lhs, rhs, event, ctx.cur_proto, ctx.pc - 1, p1_reg, p2_reg);
                         }
-                        if (try self.tryPushBytecodeBinaryMetamethod(
+                        if (try self.tryPushResolvedMetamethod(
                             exec_frames,
                             ctx.frame_index,
-                            lhs,
-                            rhs,
+                            tm.?,
+                            &.{ lhs, rhs },
                             event,
-                            tag_method.opname(event),
                             .{ .value = .{ .dst = pi.a } },
                         )) {
                             continue :frame_loop;
@@ -12859,18 +12887,19 @@ pub const Vm = struct {
                             // PUC OP_UNM: luaT_trybinTM(L, rb, rb, ra, TM_UNM).
                             // String operands handled by string mt __unm
                             // (PUC lstrlib.c arith_unm).
-                            const tm = self.getTmByObj(val, .unm);
+                            // Resolve ONCE — no re-lookup in the push/call path.
+                            const tm = self.findUnaryTm(val, .unm);
                             if (tm == null) {
                                 exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                                 return self.failBinaryMmbin(val, val, .unm, ctx.cur_proto, ctx.pc, b, b);
                             }
-                            if (try self.tryPushBytecodeUnaryMetamethod(
+                            if (try self.tryPushResolvedMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
-                                val,
+                                tm.?,
+                                &.{ val, val },
                                 .unm,
-                                tag_method.opname(.unm),
-                                a,
+                                .{ .value = .{ .dst = a } },
                             )) {
                                 continue :frame_loop;
                             }
@@ -12897,18 +12926,19 @@ pub const Vm = struct {
                                 ctx.regs[a] = .{ .Int = ~iv };
                             } else {
                                 // PUC OP_BNOT: luaT_trybinTM(L, rb, rb, ra, TM_BNOT).
-                                const tm = self.getTmByObj(val, .bnot);
+                                // Resolve ONCE — no re-lookup in the push/call path.
+                                const tm = self.findUnaryTm(val, .bnot);
                                 if (tm == null) {
                                     exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                                     return self.failBinaryMmbin(val, val, .bnot, ctx.cur_proto, ctx.pc, b, b);
                                 }
-                                if (try self.tryPushBytecodeUnaryMetamethod(
+                                if (try self.tryPushResolvedMetamethod(
                                     exec_frames,
                                     ctx.frame_index,
-                                    val,
+                                    tm.?,
+                                    &.{ val, val },
                                     .bnot,
-                                    tag_method.opname(.bnot),
-                                    a,
+                                    .{ .value = .{ .dst = a } },
                                 )) {
                                     continue :frame_loop;
                                 }
@@ -32653,6 +32683,23 @@ pub const Vm = struct {
         return self.getTm(mt, event);
     }
 
+    /// PUC `callbinTM` (ltm.c:135-148) resolution half: try lhs first, then
+    /// rhs. This is the SINGLE resolution point for binary metamethods —
+    /// callers receive the resolved value and pass it to
+    /// `tryPushResolvedMetamethod` or `callMetamethod` without re-looking-up.
+    /// Returns null when neither operand has the metamethod.
+    fn findBinaryTm(self: *Vm, lhs: Value, rhs: Value, event: TmsEvent) ?Value {
+        return self.getTmByObj(lhs, event) orelse
+            self.getTmByObj(rhs, event);
+    }
+
+    /// Unary metamethod resolution: single `getTmByObj` on the operand.
+    /// PUC passes the operand twice to the metamethod (luaT_trybinTM with
+    /// rb, rb), but the lookup itself is singular.
+    fn findUnaryTm(self: *Vm, operand: Value, event: TmsEvent) ?Value {
+        return self.getTmByObj(operand, event);
+    }
+
     /// PUC `gfasttm` / `fasttm` (ltm.h:63-68): fast metamethod lookup with
     /// flags cache. If the metatable's `flags` bit for `event` is set (meaning
     /// "this metamethod is absent"), returns `null` immediately — no hash
@@ -32750,8 +32797,7 @@ pub const Vm = struct {
     }
 
     fn callBinaryMetamethod(self: *Vm, lhs: Value, rhs: Value, event: TmsEvent, opname: []const u8) DispatchError!?Value {
-        const mm = self.getTmByObj(lhs, event) orelse
-            self.getTmByObj(rhs, event) orelse return null;
+        const mm = self.findBinaryTm(lhs, rhs, event) orelse return null;
         var call_args = [_]Value{ lhs, rhs };
         return try self.callMetamethod(mm, opname, call_args[0..]);
     }
@@ -32854,7 +32900,7 @@ pub const Vm = struct {
     }
 
     fn callUnaryMetamethod(self: *Vm, v: Value, event: TmsEvent, opname: []const u8) DispatchError!?Value {
-        const mm = self.getTmByObj(v, event) orelse return null;
+        const mm = self.findUnaryTm(v, event) orelse return null;
         // Lua passes the operand twice for unary metamethod dispatch.
         var call_args = [_]Value{ v, v };
         return try self.callMetamethod(mm, opname, call_args[0..]);

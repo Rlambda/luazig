@@ -5223,3 +5223,96 @@ Key insight: SIGINT countdown/check is the largest single contributor
 (+2 each), then dispatch_pc (+1). The "all removed" lower bound is 61
 instr/iter — still 2.18x PUC's 28, indicating the dispatch switch + FORLOOP
 handler semantics themselves account for the remaining 61 instr/iter gap.
+
+## P16.10 Tasks 4-8, 10 — dispatch loop audit + clean wins (2026-08-30)
+
+### Task 4 — P15.33 compact loop audit
+
+**Finding:** NO separate compact loop ever existed. Commit c4f4983 (original
+P15.33) was always a single inner loop with a conditional
+`hooks_active_cached` branch that skips hook checks when hooks are inactive.
+The STATUS claim "Отдельный compact loop" was aspirational/incorrect from the
+start — the implementation was always a single-loop design with a fast-path
+branch, not two separate loops.
+
+### Task 6 — stack-pointer poll removal (COMMITTED as f943e3b)
+
+Removed the per-instruction `if (self.bc_stack.ptr != stack_ptr)` check
+entirely. A classification table proves every `bc_stack` realloc path
+reachable from the inner loop either explicitly refreshes `ctx.regs`/
+`ctx.boxed` or exits to `frame_loop`. The per-instruction check was a
+safety net from P15.33 that became redundant once explicit refreshes were
+added at all realloc sites.
+
+- forloop_only: 75.0 → 72.0 instr/iter (-3.0)
+- Gates: smoke 63/63, matrix zig_fail=0, c_api 9/9 clean
+
+### Task 8 — SIGINT redesign (COMMITTED as 5b26e58)
+
+**Root cause of +7 instr/iter:** The old SIGINT implementation used a
+per-instruction countdown variable (`sigint_countdown: u32`). The cost was
+NOT from the compare/decrement instructions themselves — it was from
+REGISTER PRESSURE: any per-instruction variable (countdown OR cached trap
+bool) occupies a callee-saved register across the entire dispatch switch,
+causing spills in the FORLOOP handler.
+
+**Experiment 1 (PUC-style trap):** Implemented a cached `sigint_trap` bool,
+refreshed at backward jumps (mirroring PUC's `updatetrap(ci)` in
+`dojump`/`Protect`). Measured 72.0 instr/iter — SAME as before, because
+register pressure is identical (one bool local live across the switch).
+
+**Experiment 2 (trap disabled entirely):** Measured 65.0 instr/iter,
+confirming the +7 is pure register pressure from any per-instruction SIGINT
+variable.
+
+**Final approach — boundary-only check, no per-instruction variable:**
+Eliminate the per-instruction SIGINT variable entirely. Check
+`signal_int_pending.load(.acquire)` directly at backward jumps only
+(FORLOOP, JMP, TFORLOOP, TFORPREP, opTailcall `.continue_no_advance`) and
+at `frame_loop` entry. No per-instruction variable = no register pressure =
+0 per-instruction cost.
+
+This is CHEAPER than PUC: PUC pays 1 branch/instruction for
+`if (l_unlikely(trap))`; we pay 0/instruction + 1 load+branch at backward
+jumps. SIGINT latency is identical: 1 backward-jump for tight loops, 1
+function call for non-loop code.
+
+- forloop_only: 72.0 → 70.0 instr/iter (-2.0)
+- SIGINT verified: for-loop, while-loop, generic-for all interrupt correctly
+- Gates: smoke 63/63, matrix zig_fail=0, c_api 9/9 clean
+
+### Task 10 — FORLOOP micro-audit + dispatch_pc investigation
+
+**dispatch_pc per-instruction store:** Investigated removing the
+`self.dispatch_pc = ctx.pc` store from the per-instruction path (syncing
+only at backward jumps + frame_loop entry, mirroring PUC's `savedpc` which
+is synced via `Protect()` at C-call boundaries). **Result: BROKEN** —
+`fail()` (954 call sites) and coroutine yield/resume paths read
+`dispatch_pc` directly and need the CURRENT PC. Without a Protect-like
+macro syncing before every C-call/error path, the per-instruction store is
+architecturally necessary. PUC's `Protect()` macro syncs `savedpc` before
+every C call that might error or yield; we have no equivalent, and adding
+one requires changing 954 `fail()` call sites. The 1 instr/iter cost is
+not worth the complexity. **Reverted, no change.**
+
+**Current component breakdown (post T6+T8):**
+
+| Component         | Cost  | Status      |
+|-------------------|------:|-------------|
+| stack_ptr_check   |   0   | Removed (T6) |
+| sigint            |  ~2-3 | Backward-jump-only (T8) |
+| vmstats_gate      |   ~2  | Kept (diagnostic, default-off) |
+| dispatch_pc store |   ~1  | Kept (architecturally necessary) |
+| hooks_gate        |   ~2  | Kept (PUC parity) |
+| FORLOOP handler   |  ~61  | Floor (switch + handler semantics) |
+| **Total**         | **70**|              |
+
+### Summary
+
+- Baseline: 75.0 instr/iter
+- After T6 (stack_ptr removal): 72.0 (-3.0)
+- After T8 (SIGINT redesign): 70.0 (-2.0)
+- Total improvement: -5.0 instr/iter (75.0 → 70.0, 6.7% reduction)
+- Remaining gap to floor: 70.0 - 61.0 = 9.0 instr/iter
+  (vmstats_gate ~2 + dispatch_pc ~1 + hooks_gate ~2 + SIGINT ~2-3)
+- Remaining gap to PUC: 70.0 vs 28.0 = 2.50x (floor 61.0 vs 28.0 = 2.18x)

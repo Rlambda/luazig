@@ -1,4 +1,4 @@
-> Last updated: 2026-08-29 (P16.8a Task 7 — global_arith per-opcode decomposition)
+> Last updated: 2026-08-29 (P16.8a — file-finalizer parity, captured-local invariant cleanup + R254 source case, transactional simple_result, global_arith decomposition)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -35,9 +35,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | _not run_ |
 | Smoke tests (`tests/smoke/*.lua`) | _not run — no smoke JSON provided_ |
 | C API suites (`tests/c_api`) | 18 suites |
-| Performance (geomean vs PUC) | **1.92x** |
+| Performance (geomean vs PUC) | **1.93x** |
 
-Geomean замедления vs PUC Lua: **1.92x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.93x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -3870,6 +3870,52 @@ temp_table 1.82x.
 Debug+RF tests 6/6 прогонов; c_api 18/18 ALL PASS + strict DIFF; matrix
 zig_fail=0; smoke 59/59; nextvar 3x; gc/gengc/closure/coroutine/events
 --testc; leak_bench PASS; native_mem BOUNDED; CallFrame ≤104; Node 32B.
+
+## P16.8a — инвариантная зачистка перед frame-оптимизациями (2026-08-29)
+
+### T1 — file-close финализация (`74555f7`)
+closeManagedFile больше НЕ дерегистрирует (io.close = только ресурс; __closed
+-флаг отдельно, PUC isclosed-guard в f_gc). Дифф 60_file_finalizer_lifecycle:
+PUC "1 0" == zig (было "0 0").
+
+### T2-T4 — captured-local инвариант (`6c2e728`, `5c2a68a`, `47c0a93`, `fcab2ae`)
+Инвариант: boxed[reg] с открытым Cell ⟺ Cell наблюдает bc_stack[reg]; close
+копирует и снимает boxed-слот. Аудит 12 сайтов — все держат. Удалены: temp-MOVE
+в dischargeVars(.local/.vararg_var), captured_regs-guard прямых арифм-записей,
+спец-путь OP_MOVE (теперь плоская копия, PUC setobjs2s). R254 source-level:
+198 локальных + захваченный box + 54-арг вызов → ADD 254 (PUC-листинг
+подтверждён; старый код — "too many registers"). MOVE-heavy −5%, регистровое
+давление на captured-кодe совпало с PUC. Smoke 61 (coherence, 10 сценариев),
+62 (R254).
+
+### T5 — транзакционный simple_result (`3858a5c`)
+errdefer clearSimpleResult между set и активацией (getPtr re-fetch после
+возможного FrameStack-realloc); FailingAllocator unit-тест (5 отказов push →
+родитель нетронут; 1 успех → errdefer не срабатывает ложно; тест красный при
+отключённом errdefer).
+
+### T6 — корректность документации (`8620116`)
+STATUS: closeManagedFile-«легитимность» и «254 локальных» исправлены
+(скобочные уточнения, история не переписана). Top-N виден из generated
+README-таблицы (versioned current.json — единственный источник).
+
+### T7 — global_arith декомпозиция (`18b4a56`)
+Инфляция 430 vs 208 instr/iter: SETTABUP 46.8% (gcTableWriteBarrier делает
+OUTLINED CALLS даже для integer — PUC: один inline iscollectable-бранч!),
+FORLOOP 21.2% (dispatch overhead: switch+continue vs computed-goto),
+GETTABUP 20.3%. Артефакт tools/perf/current-global-arith-decomposition.json
+(+perf_global_arith_decomp.py). Frame-push НЕ является таргетом global_arith.
+
+### T8-T9 — свежий профиль; frame-push отложен по данным
+geomean(18) 1.94x; top: noalloc 2.94x, metamethod_add 2.89x, global_arith
+2.50x, lua_calls 2.26x, hash 2.20x. Task 9 (frame-push) — не первая задача:
+dispatch-инфляция шире (12/16 ворклоудов) и барьер конкретнее.
+
+### Гейт: полный, зелёный (лично)
+Debug+RF tests; c_api 18/18 + strict DIFF; matrix zig_fail=0; smoke 62/62;
+nextvar 10/10; 58-62 byte-identical; mm_check IDENTICAL; gc/gengc/closure/
+coroutine/events/errors 0/0 оба рантайма; leak_bench; native_mem BOUNDED;
+CallFrame ≤104; Node 32B.
 
 ## История закрытых фаз
 

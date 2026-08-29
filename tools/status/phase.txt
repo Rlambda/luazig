@@ -1,1 +1,1 @@
-P16.9
+P16.10 — dispatch floor: jump-table verified (computed-goto не диагноз), stack-poll+SIGINT cleanups, 75→70 instr/iter

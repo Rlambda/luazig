@@ -529,20 +529,19 @@ pub const Codegen = struct {
         switch (e.val) {
             .local => |v| {
                 // Local becomes non-relocatable: value is in a fixed register.
-                // However, if this local is captured as an upvalue (boxed),
-                // the VM's SETUPVAL writes to cell.value, not to the stack
-                // register. Non-MOVE instructions read from the stack directly
-                // and would see a stale value. Emit MOVE to a fresh temp so
-                // the value is read through MOVE's boxed-register workaround.
-                // For non-captured locals, the register is valid directly —
-                // this preserves the ExpDesc optimization for hot loops.
-                if (self.captured_regs.get(v.ridx)) |_|{
-                    const tmp = try self.allocReg();
-                    _ = try self.builder.emitABC(.move, tmp, v.ridx, 0, self.line_hint);
-                    e.val = .{ .non_reloc = tmp };
-                } else {
-                    e.val = .{ .non_reloc = v.ridx };
-                }
+                //
+                // P16.8a invariant: if this local is captured as an upvalue
+                // (boxed), the open Cell observes exactly bc_stack[ridx]
+                // (Cell.get/set read/write the stack slot). Therefore the
+                // register holds the live value directly — no temp MOVE is
+                // needed. The old workaround (emit MOVE to a fresh temp so
+                // "non-MOVE instructions see a non-stale value") was based on
+                // a stale VM model where SETUPVAL wrote to cell.value instead
+                // of the stack slot. Under the current Cell semantics, the
+                // stack register IS the authoritative storage while open.
+                // Audit evidence: vm.zig Cell.get:667, Cell.set:680,
+                // gcStoreCellValue:20444, closeBytecodeUpvaluesFrom:6974.
+                e.val = .{ .non_reloc = v.ridx };
             },
             // Virtual vararg parameter discharged to a register — the
             // vararg is escaping. Materialize a real table (PF_VATAB)
@@ -550,15 +549,9 @@ pub const Codegen = struct {
             // (lcode.c:808): needvatab(fs->f); var->k = VLOCAL.
             .vararg_var => |v| {
                 self.needVarargTable();
-                e.val = .{ .local = .{ .ridx = v.ridx } };
-                // Now discharge as a local (fallthrough to .local above).
-                if (self.captured_regs.get(v.ridx)) |_|{
-                    const tmp = try self.allocReg();
-                    _ = try self.builder.emitABC(.move, tmp, v.ridx, 0, self.line_hint);
-                    e.val = .{ .non_reloc = tmp };
-                } else {
-                    e.val = .{ .non_reloc = v.ridx };
-                }
+                // P16.8a: same invariant as .local above — the register holds
+                // the live value directly, no temp MOVE needed.
+                e.val = .{ .non_reloc = v.ridx };
             },
             // Virtual vararg index discharged — the vararg escapes.
             // Materialize a real table (PF_VATAB) and convert to a regular
@@ -5487,11 +5480,14 @@ pub const Codegen = struct {
             // `ADD tmp, s, i; MOVE s, tmp`). Mirrors PUC `luaK_storevar`
             // VLOCAL → `exp2reg(fs, ex, var->u.var.ridx)`.
             //
-            // IMPORTANT: Skip direct-store when the local is captured as an
-            // upvalue (boxed). Arithmetic handlers write `regs[a]` directly
-            // without syncing the boxed cell, so a captured local would
-            // become stale — closures would see the old value. The normal
-            // genExp + genSet path uses MOVE, which syncs the cell.
+            // P16.8a: The old code skipped direct-store for captured locals
+            // (captured_regs.contains), fearing arithmetic writes to regs[a]
+            // would not sync the boxed cell. Under the captured-local storage
+            // invariant (vm.zig Cell invariant block), an open Cell observes
+            // exactly bc_stack[reg] — so a direct ADD into the local's
+            // register IS visible to closures that captured it. The guard is
+            // obsolete and removed. Audit: Cell.set:680 writes stack slot for
+            // open cells; closeBytecodeUpvaluesFrom:6974 snapshots on close.
             if (n.lhs[0].node == .Name) {
                 const name = n.lhs[0].node.Name.slice(self.source);
                 // Skip direct-store when the name is a forced global (declared
@@ -5501,7 +5497,7 @@ pub const Codegen = struct {
                 // in an outer scope.
                 if (!self.isForcedGlobalName(name)) {
                     if (self.lookupLocal(name)) |local_reg| {
-                    if (!self.isReadonlyLocal(local_reg) and !self.captured_regs.contains(local_reg)) {
+                    if (!self.isReadonlyLocal(local_reg)) {
                         const store_line = self.spanLastTokenLine(n.rhs[0].span);
                         // Check if RHS is a compile-time nil constant (either
                         // a `nil` literal or a <const> nil local/upvalue).

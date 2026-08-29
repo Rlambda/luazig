@@ -5165,3 +5165,61 @@ pre-age for robustness; 1 post-assignment collect suffices for survival;
 - matrix zig_fail=0 (testes_matrix --testc)
 - Debug build: 0xaa sanity pass, exit 0
 - ReleaseFast rebuild: pass
+
+## P16.10 Tasks 1+2+3 — dispatch floor measurement (2026-08-30)
+
+Measurement-only phase; no production code changes committed. Artifact:
+`tools/perf/current-dispatch-floor.json` (regenerable via
+`tools/perf_dispatch_floor.py`).
+
+### Part 1 — forloop_only steady-state (n-vs-2n delta, pinned core 0, 5 runs)
+
+| Counter        |   Zig |   PUC | Ratio  |
+|----------------|------:|------:|-------:|
+| instructions   | 75.0  | 28.0  | 2.68x  |
+| cycles         | 13.9  | 10.3  | 1.34x  |
+| branches       | 11.0  |  5.0  | 2.20x  |
+| branch-misses  | ~0    | ~0    | —      |
+| IPC            | 5.40  | 2.71  |        |
+| wall ns/iter   | 3.58  | 2.72  | 1.31x  |
+
+Steady state: FORPREP once, then FORLOOP N times (empty body). The n-vs-2n
+delta cancels setup/epilogue, isolating pure FORLOOP dispatch+handler cost.
+
+### Part 2 — switch lowering classification
+
+- **Classification**: jump table (32-bit signed offsets, 128 entries for
+  7-bit opcode space).
+- **Main table**: `0x100c688`, **2 dispatch sites** using it.
+- **FORLOOP handler**: `0x10be904` → `jmp 0x10c0f01` (pc computation) →
+  shared tail at `0x10c72c7` (`inc %rax; cmp; jb` back to dispatch top).
+- **Hot path**: uses only ONE of the 2 main-table dispatch sites (the first,
+  after preamble checks). The 2nd site is a cold path (after hooks processing).
+- **Remaining 74 indirect jumps**: nested switches within opcode handlers
+  (type-dispatch in arithmetic, etc.).
+- **Computed-goto framing**: since the hot path already uses a single shared
+  indirect-branch site with a jump table, "replace switch with computed goto"
+  is NOT a valid diagnosis — the computed-goto advantage (consolidating
+  multiple per-handler dispatch sites into one shared site for BTB prediction)
+  is already realized for the hot path.
+
+### Part 3 — per-component diagnostic deltas (stash-dance, ALL reverted)
+
+| Component         | Baseline | Removed | Δinstr | Δcycles |
+|-------------------|---------:|--------:|-------:|--------:|
+| A stack_ptr_check |     75.0 |    72.0 |   +3.0 |    +0.1 |
+| B vmstats_gate    |     75.0 |    73.0 |   +2.0 |    -0.5 |
+| C dispatch_pc     |     75.0 |    74.0 |   +1.0 |    -0.8 |
+| D sigint          |     75.0 |    68.0 |   +7.0 |    -0.3 |
+| E hooks_gate      |     75.0 |    73.0 |   +2.0 |    -0.4 |
+| F all_removed     |     75.0 |    61.0 |  +14.0 |    -0.9 |
+
+Additivity: sum of individual Δinstr = +15.0, measured all-removed = +14.0,
+residual = -1.0 (synergy — removing together saves ~1 instr/iter more than
+the sum of parts, due to branch layout / register allocation effects).
+
+Key insight: SIGINT countdown/check is the largest single contributor
+(+7 instr/iter), followed by stack_ptr check (+3), then vmstats/hooks gates
+(+2 each), then dispatch_pc (+1). The "all removed" lower bound is 61
+instr/iter — still 2.18x PUC's 28, indicating the dispatch switch + FORLOOP
+handler semantics themselves account for the remaining 61 instr/iter gap.

@@ -11778,23 +11778,48 @@ pub const Vm = struct {
             // The activation_id check skips the write for popped/replaced frames.
             defer self.syncFrame(&ctx, frame_identity);
 
-            // P15.33: Track the stack pointer to avoid re-deriving ctx.regs/ctx.boxed
-            // on every iteration. The shared stack may be realloc'd by a callee
-            // (CALL, metamethod, builtin), invalidating our slice pointers.
-            // With EXTRA_MARGIN, bcGrowFrame is a no-op for typical multiret,
-            // so frame_cap changes are rare — checking only the pointer is safe.
-            var stack_ptr = self.bc_stack.ptr;
+            // P16.10 T6: Stack-pointer poll — REMOVED.
+            //
+            // The per-instruction `if (self.bc_stack.ptr != stack_ptr)` check
+            // was +3 instr/iter. It is unnecessary because every bc_stack
+            // realloc path reachable from the inner loop either (a) explicitly
+            // refreshes ctx.regs/ctx.boxed afterward, or (b) exits to
+            // frame_loop (which re-derives slices at lines 11771-11772).
+            //
+            // Classification table (all realloc paths reachable from the inner
+            // loop, including hooks-active handler-level hook dispatches):
+            //
+            //   Site                          | Realloc via         | Refreshes? | Exits to frame_loop?
+            //   ------------------------------+---------------------+------------+--------------------
+            //   OP_CALL inline (vm.zig:13557) | ensureBcStackCap    | YES (13558)| YES (13587)
+            //   opCall builtin (vm.zig:15402) | ensureBcStackCap    | YES (15403)| YES (via .continue_frame_loop)
+            //   opCall pushBuiltinCFrame(598)| pushBuiltinCFrame   | YES (15603)| YES (refresh at 15666 before .continue_dispatch)
+            //   opCall IR closure (15781)     | bcGrowFrame         | YES (out-params) | NO (.continue_dispatch)
+            //   opTforcall (vm.zig:14479)     | ensureBcStackCap    | YES (14480)| YES (via .continue_frame_loop)
+            //   opTailcall bc-to-bc (15029)   | ensureBcStackCap    | YES (15060+15066) | NO (.continue_no_advance)
+            //   opTailcall VAHID (15051)      | ensureBcStackCap    | YES (15060+15066) | NO (.continue_no_advance)
+            //   opVararg (vm.zig:14306,14318)| bcGrowFrame         | YES (out-params) | NO (.continue_dispatch)
+            //   opConcat value path (14771)   | none (string alloc) | YES (14771)| NO (.continue_dispatch)
+            //   opClosure (vm.zig:14335)      | none (heap alloc)   | N/A        | NO (.continue_dispatch)
+            //   opSetlist (vm.zig:13948)      | none (table alloc)  | N/A        | NO (.continue_dispatch)
+            //   opForprep (vm.zig:14608)      | none                | N/A        | NO (.continue_dispatch)
+            //
+            // Handler-level hook dispatches (dispatchBytecodeHook* called from
+            // within switch handlers) can also realloc bc_stack via C hook
+            // functions that call lua_call. These sites refresh ctx.regs/
+            // ctx.boxed after the hook dispatch (e.g., opCall builtin return
+            // hook at vm.zig:15666, opTailcall return hook refreshes via
+            // bcGrowFrame at 15781). The hooks block at the top of the loop
+            // (line 11844) also refreshes after synchronous line/count hooks.
+            //
+            // Every path that actually reallocs bc_stack either refreshes
+            // ctx.regs/ctx.boxed explicitly or exits to frame_loop. The
+            // per-instruction check is therefore unnecessary and has been
+            // removed. (P15.33 original rationale: safety net before explicit
+            // refreshes were added at all realloc sites. P16.10 T6: explicit
+            // refreshes now cover all sites — see table above.)
 
             while (ctx.pc < ctx.cur_proto.code.len) {
-                // Single pointer comparison — cheaper than the old 3-way check.
-                // bc_stack and bc_boxed are always realloc'd together by
-                // ensureBcStackCap; bcGrowFrame updates ctx.regs/ctx.boxed
-                // directly via out-parameters.
-                if (self.bc_stack.ptr != stack_ptr) {
-                    ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                    ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
-                    stack_ptr = self.bc_stack.ptr;
-                }
 
                 const inst = ctx.cur_proto.code[ctx.pc];
                 const op: bc.Op = @enumFromInt(inst.op);

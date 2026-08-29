@@ -18,9 +18,9 @@
 // This module is dependency-free: it imports nothing from vm.zig or
 // codegen_bc.zig, only `std` if needed (currently not needed).
 
-/// PUC Lua tag-method events (`ltm.h:19-43`). Backed by `u5` — 24 events
+/// PUC Lua tag-method events (`ltm.h:19-43`). Backed by `u5` — 25 events
 /// fit comfortably (5 bits → range 0..31). The integer values are the
-/// C-field encoding used in MMBIN/MMBINI/MMBANK bytecode instructions:
+/// C-field encoding used in MMBIN/MMBINI/MMBINK bytecode instructions:
 /// when the preceding arithmetic op fails (non-numeric operands), the
 /// VM reads C to determine which metamethod to dispatch.
 pub const TmsEvent = enum(u5) {
@@ -65,7 +65,7 @@ pub fn isFastCached(event: TmsEvent) bool {
 
 /// PUC `luaT_eventname[]` (ltm.c) — short opname strings for
 /// debug/traceback. Used ONLY on the cold metamethod path
-/// (MMBIN/MMBINI/MMBANK/UNM/BNOT handlers) to set the debug name of
+/// (MMBIN/MMBINI/MMBINK/UNM/BNOT handlers) to set the debug name of
 /// the child frame. The hot arithmetic fast path carries no string
 /// at all — this function is never called when native arithmetic
 /// succeeds.

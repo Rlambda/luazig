@@ -1375,7 +1375,7 @@ const LuaFrameState = struct {
     /// P16.7 Task 6: Packed Lua-frame flags (1 byte).
     /// Bit 0: has_open_upvalues (was a separate bool field).
     /// Bit 1: simple_result_invert (compare mode only).
-    /// Bits 2-6: simple_result_event (TmsEvent, u5, max 23).
+    /// Bits 2-6: simple_result_event (TmsEvent, u5, 25 events, max 24).
     /// Bit 7: unused.
     lua_packed_flags: u8 = 0,
     /// P16.7 Task 6: Inline simple-result completion destination.

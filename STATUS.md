@@ -34,11 +34,11 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
 | Differential output (`--diff`) | **0 output_diff** |
-| Smoke tests (`tests/smoke/*.lua`) | **62/62** pass |
+| Smoke tests (`tests/smoke/*.lua`) | **63/63** pass |
 | C API suites (`tests/c_api`) | 18 suites |
-| Performance (geomean vs PUC) | **1.93x** |
+| Performance (geomean vs PUC) | **1.91x** |
 
-Geomean замедления vs PUC Lua: **1.93x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.91x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.

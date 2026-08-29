@@ -1,16 +1,16 @@
 {
   "meta": {
-    "created_utc": "2026-08-29T17:17:35.708283+00:00",
+    "created_utc": "2026-08-29T19:09:35.829304+00:00",
     "lane": "smoke_compare",
     "argv": [
       "/home/boss/codes/luazig/tools/smoke_compare.py",
       "--json-out",
-      "/home/boss/codes/luazig/tools/status/.tmp.smoke.86zf5l7x.json"
+      "/home/boss/codes/luazig/tools/status/.tmp.smoke.ajesjcfm.json"
     ],
     "zig_version": "0.16.0"
   },
-  "total": 62,
-  "ok": 62,
+  "total": 63,
+  "ok": 63,
   "mismatches": 0,
   "results": [
     {
@@ -259,6 +259,10 @@
     },
     {
       "file": "tests/smoke/62_r254_captured_local_arith.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/63_table_barrier_semantics.lua",
       "match": true
     }
   ]

@@ -1,12 +1,12 @@
 {
   "meta": {
-    "created_utc": "2026-08-29T17:17:34.674902+00:00",
+    "created_utc": "2026-08-29T19:09:34.841546+00:00",
     "lane": "testes_matrix",
     "argv": [
       "/home/boss/codes/luazig/tools/testes_matrix.py",
       "--testc",
       "--json-out",
-      "/home/boss/codes/luazig/tools/status/.tmp.matrix.726bg0b5.json"
+      "/home/boss/codes/luazig/tools/status/.tmp.matrix.izq3cw0z.json"
     ],
     "zig_version": "0.16.0"
   },

@@ -7498,52 +7498,6 @@ pub const Vm = struct {
         return false;
     }
 
-    fn tryPushBytecodeBinaryMetamethod(
-        self: *Vm,
-        exec_frames: *FrameStack,
-        parent_index: usize,
-        lhs: Value,
-        rhs: Value,
-        event: TmsEvent,
-        opname: []const u8,
-        completion: BytecodePendingCompletion,
-    ) DispatchError!bool {
-        _ = opname; // Commit C will remove this parameter
-        const mm = self.findBinaryTm(lhs, rhs, event) orelse return false;
-        const args = [_]Value{ lhs, rhs };
-        return self.tryPushResolvedMetamethod(
-            exec_frames,
-            parent_index,
-            mm,
-            args[0..],
-            event,
-            completion,
-        );
-    }
-
-    fn tryPushBytecodeUnaryMetamethod(
-        self: *Vm,
-        exec_frames: *FrameStack,
-        parent_index: usize,
-        operand: Value,
-        event: TmsEvent,
-        opname: []const u8,
-        dst: u8,
-    ) DispatchError!bool {
-        _ = opname; // Commit C will remove this parameter
-        const mm = self.findUnaryTm(operand, event) orelse return false;
-        // PUC supplies two copies for unary metamethods.
-        const args = [_]Value{ operand, operand };
-        return self.tryPushResolvedMetamethod(
-            exec_frames,
-            parent_index,
-            mm,
-            args[0..],
-            event,
-            .{ .value = .{ .dst = dst } },
-        );
-    }
-
     fn bytecodeComparisonHasFastPath(lhs: Value, rhs: Value) bool {
         const lhs_number = lhs == .Int or lhs == .Num;
         const rhs_number = rhs == .Int or rhs == .Num;
@@ -32817,10 +32771,10 @@ pub const Vm = struct {
         }
     }
 
-    fn callBinaryMetamethod(self: *Vm, lhs: Value, rhs: Value, event: TmsEvent, opname: []const u8) DispatchError!?Value {
+    fn callBinaryMetamethod(self: *Vm, lhs: Value, rhs: Value, event: TmsEvent) DispatchError!?Value {
         const mm = self.findBinaryTm(lhs, rhs, event) orelse return null;
         var call_args = [_]Value{ lhs, rhs };
-        return try self.callMetamethod(mm, opname, call_args[0..]);
+        return try self.callMetamethod(mm, tag_method.opname(event), call_args[0..]);
     }
 
     fn runCloseMetamethod(self: *Vm, obj: Value, err_obj: ?Value) DispatchError!void {
@@ -32920,11 +32874,11 @@ pub const Vm = struct {
         // object from error(), not the annotated diagnostic message.
     }
 
-    fn callUnaryMetamethod(self: *Vm, v: Value, event: TmsEvent, opname: []const u8) DispatchError!?Value {
+    fn callUnaryMetamethod(self: *Vm, v: Value, event: TmsEvent) DispatchError!?Value {
         const mm = self.findUnaryTm(v, event) orelse return null;
         // Lua passes the operand twice for unary metamethod dispatch.
         var call_args = [_]Value{ v, v };
-        return try self.callMetamethod(mm, opname, call_args[0..]);
+        return try self.callMetamethod(mm, tag_method.opname(event), call_args[0..]);
     }
 
     const ResolvedCall = struct {
@@ -34074,24 +34028,24 @@ pub const Vm = struct {
                     // PUC luaO_arith: raw arithmetic fails for non-numbers,
                     // then luaT_trybinTM dispatches to the metamethod (string
                     // mt __unm for strings, custom __unm for tables/userdata).
-                    if (try self.callUnaryMetamethod(src, .unm, "unm")) |v| return v;
+                    if (try self.callUnaryMetamethod(src, .unm)) |v| return v;
                     return self.fail("attempt to perform arithmetic on a {s} value", .{self.valueTypeName(src)});
                 },
             },
             .Hash => return switch (src) {
                 .String => |s| .{ .Int = @intCast(s.len) },
                 .Table => |t| blk: {
-                    if (try self.callUnaryMetamethod(src, .len, "len")) |v| break :blk v;
+                    if (try self.callUnaryMetamethod(src, .len)) |v| break :blk v;
                     break :blk .{ .Int = self.tableBorderLen(t) };
                 },
                 else => {
-                    if (try self.callUnaryMetamethod(src, .len, "len")) |v| return v;
+                    if (try self.callUnaryMetamethod(src, .len)) |v| return v;
                     return self.fail("attempt to get length of a {s} value", .{src.typeName()});
                 },
             },
             .Tilde => {
                 if (valueToIntForBitwise(src)) |iv| return .{ .Int = ~iv };
-                if (try self.callUnaryMetamethod(src, .bnot, "bnot")) |v| return v;
+                if (try self.callUnaryMetamethod(src, .bnot)) |v| return v;
                 if (isNumWithoutInteger(src)) return self.fail("number has no integer representation", .{});
                 return self.fail("attempt to perform bitwise operation on a {s} value", .{self.valueTypeName(src)});
             },
@@ -34336,10 +34290,10 @@ pub const Vm = struct {
         // etc.). Different types → false without metamethod (events.lua:347:
         // u2 (Userdata) vs {} (Table) → __eq NOT called → false).
         if (lhs == .Table and rhs == .Table) {
-            if (try self.callBinaryMetamethod(lhs, rhs, .eq, "eq")) |v| return isTruthy(v);
+            if (try self.callBinaryMetamethod(lhs, rhs, .eq)) |v| return isTruthy(v);
         }
         if (lhs == .Userdata and rhs == .Userdata) {
-            if (try self.callBinaryMetamethod(lhs, rhs, .eq, "eq")) |v| return isTruthy(v);
+            if (try self.callBinaryMetamethod(lhs, rhs, .eq)) |v| return isTruthy(v);
         }
         return false;
     }
@@ -36311,7 +36265,7 @@ pub const Vm = struct {
                         .Num => |nv| Value{ .Num = -nv },
                         else => blk: {
                             // PUC lua_arith(UNM): raw fails → metamethod.
-                            if (try self.callUnaryMetamethod(v, .unm, "unm")) |mv| break :blk mv;
+                            if (try self.callUnaryMetamethod(v, .unm)) |mv| break :blk mv;
                             return self.fail("attempt to perform arithmetic on a {s} value", .{self.valueTypeName(v)});
                         },
                     };
@@ -38098,25 +38052,25 @@ pub const Vm = struct {
 
     fn binAdd(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
         if (rawArithCompute(.add, lhs, rhs)) |result| return result;
-        if (try self.callBinaryMetamethod(lhs, rhs, .add, "add")) |v| return v;
+        if (try self.callBinaryMetamethod(lhs, rhs, .add)) |v| return v;
         return self.failArithmeticOperands(lhs, rhs);
     }
 
     fn binSub(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
         if (rawArithCompute(.sub, lhs, rhs)) |result| return result;
-        if (try self.callBinaryMetamethod(lhs, rhs, .sub, "sub")) |v| return v;
+        if (try self.callBinaryMetamethod(lhs, rhs, .sub)) |v| return v;
         return self.failArithmeticOperands(lhs, rhs);
     }
 
     fn binMul(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
         if (rawArithCompute(.mul, lhs, rhs)) |result| return result;
-        if (try self.callBinaryMetamethod(lhs, rhs, .mul, "mul")) |v| return v;
+        if (try self.callBinaryMetamethod(lhs, rhs, .mul)) |v| return v;
         return self.failArithmeticOperands(lhs, rhs);
     }
 
     fn binDiv(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
         if (rawArithCompute(.div, lhs, rhs)) |result| return result;
-        if (try self.callBinaryMetamethod(lhs, rhs, .div, "div")) |v| return v;
+        if (try self.callBinaryMetamethod(lhs, rhs, .div)) |v| return v;
         return self.failArithmeticOperands(lhs, rhs);
     }
 
@@ -38125,7 +38079,7 @@ pub const Vm = struct {
         // rawArithCompute returns null for int // 0 (PUC luaV_idiv error).
         if (lhs == .Int and rhs == .Int and rhs.Int == 0)
             return self.fail("attempt to divide by zero", .{});
-        if (try self.callBinaryMetamethod(lhs, rhs, .idiv, "idiv")) |v| return v;
+        if (try self.callBinaryMetamethod(lhs, rhs, .idiv)) |v| return v;
         return self.failArithmeticOperands(lhs, rhs);
     }
 
@@ -38134,7 +38088,7 @@ pub const Vm = struct {
         // rawArithCompute returns null for int % 0 (PUC luaV_mod error).
         if (lhs == .Int and rhs == .Int and rhs.Int == 0)
             return self.fail("attempt to perform 'n%0'", .{});
-        if (try self.callBinaryMetamethod(lhs, rhs, .mod, "mod")) |v| return v;
+        if (try self.callBinaryMetamethod(lhs, rhs, .mod)) |v| return v;
         return self.failArithmeticOperands(lhs, rhs);
     }
 
@@ -38146,7 +38100,7 @@ pub const Vm = struct {
 
     fn binPow(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
         if (rawArithCompute(.pow, lhs, rhs)) |result| return result;
-        if (try self.callBinaryMetamethod(lhs, rhs, .pow, "pow")) |v| return v;
+        if (try self.callBinaryMetamethod(lhs, rhs, .pow)) |v| return v;
         return self.failArithmeticOperands(lhs, rhs);
     }
 
@@ -38154,7 +38108,7 @@ pub const Vm = struct {
         if (valueToIntForBitwise(lhs)) |li| {
             if (valueToIntForBitwise(rhs)) |ri| return .{ .Int = li & ri };
         }
-        if (try self.callBinaryMetamethod(lhs, rhs, .band, "band")) |v| return v;
+        if (try self.callBinaryMetamethod(lhs, rhs, .band)) |v| return v;
         if (isNumWithoutInteger(lhs) or isNumWithoutInteger(rhs)) return self.fail("number has no integer representation", .{});
         return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
     }
@@ -38163,7 +38117,7 @@ pub const Vm = struct {
         if (valueToIntForBitwise(lhs)) |li| {
             if (valueToIntForBitwise(rhs)) |ri| return .{ .Int = li | ri };
         }
-        if (try self.callBinaryMetamethod(lhs, rhs, .bor, "bor")) |v| return v;
+        if (try self.callBinaryMetamethod(lhs, rhs, .bor)) |v| return v;
         if (isNumWithoutInteger(lhs) or isNumWithoutInteger(rhs)) return self.fail("number has no integer representation", .{});
         return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
     }
@@ -38172,7 +38126,7 @@ pub const Vm = struct {
         if (valueToIntForBitwise(lhs)) |li| {
             if (valueToIntForBitwise(rhs)) |ri| return .{ .Int = li ^ ri };
         }
-        if (try self.callBinaryMetamethod(lhs, rhs, .bxor, "bxor")) |v| return v;
+        if (try self.callBinaryMetamethod(lhs, rhs, .bxor)) |v| return v;
         if (isNumWithoutInteger(lhs) or isNumWithoutInteger(rhs)) return self.fail("number has no integer representation", .{});
         return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
     }
@@ -38183,7 +38137,7 @@ pub const Vm = struct {
                 return .{ .Int = shiftLeft(li, ri) };
             }
         }
-        if (try self.callBinaryMetamethod(lhs, rhs, .shl, "shl")) |v| return v;
+        if (try self.callBinaryMetamethod(lhs, rhs, .shl)) |v| return v;
         if (isNumWithoutInteger(lhs) or isNumWithoutInteger(rhs)) return self.fail("number has no integer representation", .{});
         return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
     }
@@ -38211,7 +38165,7 @@ pub const Vm = struct {
                 return .{ .Int = shiftRight(li, ri) };
             }
         }
-        if (try self.callBinaryMetamethod(lhs, rhs, .shr, "shr")) |v| return v;
+        if (try self.callBinaryMetamethod(lhs, rhs, .shr)) |v| return v;
         if (isNumWithoutInteger(lhs) or isNumWithoutInteger(rhs)) return self.fail("number has no integer representation", .{});
         return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
     }
@@ -38237,18 +38191,18 @@ pub const Vm = struct {
             .Int => |li| switch (rhs) {
                 .Int => |ri| li < ri,
                 .Num => |rn| intLtNum(li, rn),
-                else => if (try self.callBinaryMetamethod(lhs, rhs, .lt, "lt")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, .lt)) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
             .Num => |ln| switch (rhs) {
                 .Int => |ri| numLtInt(ln, ri),
                 .Num => |rn| ln < rn,
-                else => if (try self.callBinaryMetamethod(lhs, rhs, .lt, "lt")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, .lt)) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
             .String => |ls| switch (rhs) {
                 .String => |rs| std.mem.order(u8, ls.bytes(), rs.bytes()) == .lt,
-                else => if (try self.callBinaryMetamethod(lhs, rhs, .lt, "lt")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, .lt)) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, .lt, "lt")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, .lt)) |v| isTruthy(v) else self.failCompare(lhs, rhs),
         };
     }
 
@@ -38257,21 +38211,21 @@ pub const Vm = struct {
             .Int => |li| switch (rhs) {
                 .Int => |ri| li <= ri,
                 .Num => |rn| intLeNum(li, rn),
-                else => if (try self.callBinaryMetamethod(lhs, rhs, .le, "le")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, .le)) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
             .Num => |ln| switch (rhs) {
                 .Int => |ri| numLeInt(ln, ri),
                 .Num => |rn| ln <= rn,
-                else => if (try self.callBinaryMetamethod(lhs, rhs, .le, "le")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, .le)) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
             .String => |ls| switch (rhs) {
                 .String => |rs| {
                     const ord = std.mem.order(u8, ls.bytes(), rs.bytes());
                     return ord == .lt or ord == .eq;
                 },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, .le, "le")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, .le)) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, .le, "le")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, .le)) |v| isTruthy(v) else self.failCompare(lhs, rhs),
         };
     }
 
@@ -38374,12 +38328,12 @@ pub const Vm = struct {
             return .{ .String = try self.internStr(out) };
         }
         const a = self.concatOperandToString(lhs) catch {
-            if (try self.callBinaryMetamethod(lhs, rhs, .concat, "concat")) |v| return v;
+            if (try self.callBinaryMetamethod(lhs, rhs, .concat)) |v| return v;
             return self.fail("attempt to concatenate a {s} value", .{lhs.typeName()});
         };
         defer if (a.owned) self.alloc.free(a.bytes);
         const b = self.concatOperandToString(rhs) catch {
-            if (try self.callBinaryMetamethod(lhs, rhs, .concat, "concat")) |v| return v;
+            if (try self.callBinaryMetamethod(lhs, rhs, .concat)) |v| return v;
             return self.fail("attempt to concatenate a {s} value", .{rhs.typeName()});
         };
         defer if (b.owned) self.alloc.free(b.bytes);

@@ -3738,7 +3738,7 @@ TMS отсутствует — mt.__add мутации видны немедле
 metamethodValue удалены (~20 TMS + ~9 MetaField сайтов мигрировано).
 
 ### Tasks 4+5+6 — real MMBIN family (`2b4d978`)
-MMBIN/MMBINI/MMBANK — семантические хендлеры (PUC luaT_trybinTM): previous-
+MMBIN/MMBINI/MMBINK — семантические хендлеры (PUC luaT_trybinTM): previous-
 instruction dest, typed event из C, lhs→rhs precedence, PUC error-shapes,
 вызов через общий continuation-mechanism (yield-безопасно). 15 арифметических
 хендлеров редуцированы до primitive+skip (coercion-ветки убраны позже — см.
@@ -3785,7 +3785,7 @@ Geomean теперь по 18 ворклоудам (несравним напря
 ### Tasks 2+3+4 — resolve-once архитектура (`6c48f16`, `350fd8f`, `8325c1b`)
 findBinaryTm/findUnaryTm (один lookup, lhs→rhs) + tryPushResolvedMetamethod
 (вызов уже разрешённого значения: resolveCallable/__call сохранены).
-MMBIN/MMBINI/MMBANK/UNM/BNOT/LEN/EQ/LT/LE/GT/GE/INDEX/NEWINDEX — разрешение
+MMBIN/MMBINI/MMBINK/UNM/BNOT/LEN/EQ/LT/LE/GT/GE/INDEX/NEWINDEX — разрешение
 один раз, значение проводится через slow-path (аудит-таблица в диффе).
 event+opname-двойственность устранена: opname выводится на холодной границе.
 
@@ -4118,9 +4118,9 @@ Zero call sites remain — all migrated to typed `getTmByObj`/`getTm`/`fastTm`/`
 | CallFrame ≤ 104 | comptime assert PASS |
 | perf_compare --runs 5 | OK (no regressions, geomean 2.22x, metamethod_add -6.1%) |
 
-## P16.6 — real MMBIN/MMBINI/MMBANK handlers + simplified arith/UNM/BNOT (2026-08-29, verifier P16.6 Tasks 4+5+6)
+## P16.6 — real MMBIN/MMBINI/MMBINK handlers + simplified arith/UNM/BNOT (2026-08-29, verifier P16.6 Tasks 4+5+6)
 
-### A. Real MMBIN/MMBINI/MMBANK handlers
+### A. Real MMBIN/MMBINI/MMBINK handlers
 Replaced the no-op `.mmbin, .mmbini, .mmbink => {},` with real handlers that
 implement PUC `luaT_trybinTM` (ltm.c:150-166):
 - Read previous instruction (`pi = code[ctx.pc - 1]`) to get result dest (`pi.a`).
@@ -4128,7 +4128,7 @@ implement PUC `luaT_trybinTM` (ltm.c:150-166):
 - Determine operands per instruction format and flip bit:
   - MMBIN: (R[A], R[B])
   - MMBINI: sB2int(b) = `@as(i64, b) - 127`; flip=0→(R[A], imm); flip=1→(imm, R[A])
-  - MMBANK: K[B]; flip=0→(R[A], K[B]); flip=1→(K[B], R[A])
+  - MMBINK: K[B]; flip=0→(R[A], K[B]); flip=1→(K[B], R[A])
 - Try metamethod via `tryPushBytecodeBinaryMetamethod` (bytecode Closure push).
 - If not a bytecode Closure, call synchronously via `callMetamethod` (handles
   Builtin, Closure-without-proto, and not-callable → PUC call error).
@@ -4480,7 +4480,7 @@ dual-parameter pattern existed in 4 functions and ~30 call sites.
 ## P16.7 Task 5 — simple_result completion for metamethod calls (2026-08-29)
 
 ### Problem
-Metamethod calls (MMBIN/MMBINI/MMBANK/UNM/BNOT/LEN/__index/EQ/LT/LE) always
+Metamethod calls (MMBIN/MMBINI/MMBINK/UNM/BNOT/LEN/__index/EQ/LT/LE) always
 went through the `pending_calls` array — a heap-resident `PendingCallSlot`
 (64B) + `BytecodePendingCall` (56B) — even for the overwhelmingly common case
 of "call metamethod, put 1 result into parent register, advance pc".  This
@@ -4532,7 +4532,7 @@ the mechanisms are mutually exclusive (asserted in
    MAXSTACK).
 
 ### Call sites redirected
-- **Value mode**: MMBIN, MMBINI, MMBANK, UNM, BNOT, LEN, __index (2 paths)
+- **Value mode**: MMBIN, MMBINI, MMBINK, UNM, BNOT, LEN, __index (2 paths)
 - **Compare mode**: EQ, LT/LE (via `slowCmp`)
 
 ### Files changed

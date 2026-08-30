@@ -1,4 +1,4 @@
-> Last updated: 2026-08-30 (P16.10a — callable non-function metamethod fields: PUC two-stage invocation model, 64/64 smoke)
+> Last updated: 2026-08-30 (P16.10a — callable metamethods (PUC two-stage), resolveCallable eliminated from hot path, lazy handler-limit, 64 smoke)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -36,9 +36,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **64/64** pass |
 | C API suites (`tests/c_api`) | 18 suites |
-| Performance (geomean vs PUC) | **1.81x** |
+| Performance (geomean vs PUC) | **1.84x** |
 
-Geomean замедления vs PUC Lua: **1.82x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.84x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.

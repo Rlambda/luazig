@@ -5790,13 +5790,22 @@ pub const Vm = struct {
             // (err_obj) is the full "source:line: msg" string, matching
             // PUC's luaO_pushfstring(L, "%s:%d: %s", chunk, line, msg).
             // protectedErrorValue() returns err_obj as-is — no reconstruction.
-            var id_buf: [59]u8 = undefined;
-            const chunk = diag.chunkId(id_buf[0..], self.err_source.?);
-            const line = self.err_line;
-            const full = if (line >= 1)
-                std.fmt.allocPrint(self.alloc, "{s}:{d}: {s}", .{ chunk, line, msg }) catch msg
-            else
-                std.fmt.allocPrint(self.alloc, "{s}:?: {s}", .{ chunk, msg }) catch msg;
+            // A NULL source (empty source_name — a stripped proto, which
+            // has no line info either) takes PUC's luaG_addinfo NULL branch:
+            // "?:?: msg" (same condition as protectedErrorString below).
+            const src = self.err_source.?;
+            const null_source = (src.len == 0 or std.mem.eql(u8, src, "=?")) and self.err_line < 1;
+            const full = if (null_source)
+                std.fmt.allocPrint(self.alloc, "?:?: {s}", .{msg}) catch msg
+            else blk: {
+                var id_buf: [59]u8 = undefined;
+                const chunk = diag.chunkId(id_buf[0..], src);
+                const line = self.err_line;
+                break :blk if (line >= 1)
+                    std.fmt.allocPrint(self.alloc, "{s}:{d}: {s}", .{ chunk, line, msg }) catch msg
+                else
+                    std.fmt.allocPrint(self.alloc, "{s}:?: {s}", .{ chunk, msg }) catch msg;
+            };
             self.err_obj = .{ .String = self.internStrAssume(full) };
             self.err_has_obj = true;
         } else {
@@ -6279,7 +6288,12 @@ pub const Vm = struct {
             if (std.mem.indexOf(u8, base, ":") != null) return base;
             var tmp: [256]u8 = undefined;
             const base_copy = std.fmt.bufPrint(tmp[0..], "{s}", .{base}) catch base;
-            if (std.mem.eql(u8, src, "=?")) {
+            // PUC luaG_addinfo (ldebug.c): a NULL source (no debug info —
+            // a stripped proto) renders as "?:?: msg". NULL-source in
+            // luazig is the empty source_name (dumped stripped chunks);
+            // requiring err_line < 1 keeps a real empty chunk name
+            // (load(s, ""), which has lines) on the normal path below.
+            if ((src.len == 0 or std.mem.eql(u8, src, "=?")) and self.err_line < 1) {
                 return std.fmt.bufPrint(self.err_render_buf[0..], "?:?: {s}", .{base_copy}) catch base;
             }
             // PUC luaG_addinfo uses luaO_chunkid to format the source name.
@@ -23163,36 +23177,28 @@ pub const Vm = struct {
         };
         const strip = if (args.len > 1) isTruthy(args[1]) else false;
 
-        // PUC Lua's `luaU_dump` (ldump.c) serializes the Closure's Proto tree
-        // into a binary chunk. When `strip` is set, it clones the Proto with
-        // debug info removed first (so the original is untouched). We mirror
-        // that: for `strip=true`, `cloneStrippedProto` produces a shallow
-        // clone sharing the immutable `code`/`k` arrays but with empty
-        // lineinfo/locvars/source_name. The clone is registered with the GC
-        // so it survives until the dumped bytes are consumed by `load`.
-        const dump_proto: ?*const bc.Proto = if (strip) blk: {
-            var seen_bc = std.AutoHashMapUnmanaged(*const bc.Proto, *bc.Proto){};
-            defer seen_bc.deinit(self.alloc);
-            break :blk if (cl.proto) |proto|
-                try self.cloneStrippedProto(proto, &seen_bc)
-            else
-                null;
-        } else cl.proto;
-
-        // Serialize the Proto tree via `DumpWriter.dumpChunk`. This writes the
-        // 40-byte PUC Lua 5.5 header, the main function's upvalue count, then
-        // the Proto body (source name, code, constants, upvalues, nested
-        // protos, line info, locals). The result is a self-contained binary
-        // chunk that `undump.UndumpReader.undumpChunk` can reconstruct.
-        var writer = dump_mod.DumpWriter.init(self.alloc);
-        defer writer.deinit();
-        if (dump_proto) |proto| {
-            try writer.dumpChunk(proto);
-        } else {
+        // PUC Lua's `luaU_dump` (ldump.c) serializes the Closure's Proto
+        // tree into a binary chunk. `strip` is a property of the
+        // serialization, carried in DumpState and consulted field-by-field
+        // while writing — PUC never clones the Proto. We mirror that
+        // directly: DumpOptions.strip makes the writer omit debug fields
+        // (source, names, line info, locals, upvalue names) while writing
+        // the semantic fields unchanged.
+        const proto = cl.proto orelse {
             // C closures (no Proto) cannot be dumped. PUC Lua's `string.dump`
             // raises "unable to dump given function" for non-Lua functions.
             return self.fail("string.dump: unable to dump given function", .{});
-        }
+        };
+
+        // Serialize the Proto tree via `DumpWriter.dumpChunk`. This writes
+        // the 40-byte PUC Lua 5.5 header, the main function's upvalue
+        // count, then the Proto body (source name, code, constants,
+        // upvalues, nested protos, line info, locals). The result is a
+        // self-contained binary chunk that `undump.UndumpReader.undumpChunk`
+        // can reconstruct.
+        var writer = dump_mod.DumpWriter.init(self.alloc);
+        defer writer.deinit();
+        try writer.dumpChunk(proto, .{ .strip = strip });
         const bytes = try writer.toOwnedSlice();
         // Intern the serialized bytes as a Lua string. The caller owns the
         // resulting string; `internStr` copies the bytes into a GC-managed
@@ -23398,73 +23404,17 @@ pub const Vm = struct {
         }
     }
 
-    /// Clone a bytecode Proto while removing only debug metadata.
-    ///
-    /// PUC Lua's stripped chunks execute the exact same bytecode as the source
-    /// function; stripping removes source names, line tables, local names, and
-    /// upvalue names, but it must not switch execution to another backend.  The
-    /// semantic arrays (`code` and constants) are immutable and can therefore be
-    /// shared with the original Proto.  Child Proto nodes and the debug-bearing
-    /// descriptor arrays are cloned recursively.
-    pub fn cloneStrippedProto(
-        self: *Vm,
-        proto: *const bc.Proto,
-        seen: *std.AutoHashMapUnmanaged(*const bc.Proto, *bc.Proto),
-    ) DispatchError!*bc.Proto {
-        if (seen.get(proto)) |existing| return existing;
-
-        const cloned = try self.alloc.create(bc.Proto);
-        try seen.put(self.alloc, proto, cloned);
-
-        const children = try self.alloc.alloc(*bc.Proto, proto.p.len);
-        for (proto.p, 0..) |child, i| {
-            children[i] = try self.cloneStrippedProto(child, seen);
-        }
-
-        const upvalues = try self.alloc.alloc(bc.Upvaldesc, proto.upvalues.len);
-        for (proto.upvalues, 0..) |uv, i| {
-            upvalues[i] = .{
-                .instack = uv.instack,
-                .idx = uv.idx,
-                .is_const = uv.is_const,
-                .name = "",
-            };
-        }
-
-        const locvars = try self.alloc.alloc(bc.LocVar, proto.locvars.len);
-        for (proto.locvars, 0..) |local, i| {
-            locvars[i] = .{
-                .name = "",
-                .reg = local.reg,
-                .startpc = local.startpc,
-                .endpc = local.endpc,
-            };
-        }
-
-        cloned.* = .{
-            .code = proto.code,
-            .k = proto.k,
-            .p = children,
-            .upvalues = upvalues,
-            .lineinfo = &.{},
-            .locvars = locvars,
-            .live_reg_top = proto.live_reg_top,
-            .maxstacksize = proto.maxstacksize,
-            .numparams = proto.numparams,
-            .is_vararg = proto.is_vararg,
-            .name = "",
-            .source_name = "=?",
-            .line_defined = proto.line_defined,
-            .last_line_defined = proto.last_line_defined,
-            .vararg_table_reg = proto.vararg_table_reg,
-            // Share resolved_values and constants_resolved flag with the
-            // original proto. The cloned proto borrows these slices — it
-            // must NOT free them in deinit. Setting constants_resolved=true
-            // prevents deinit from freeing strings in k (also borrowed).
-            .constants_resolved = proto.constants_resolved,
-            .resolved_values = proto.resolved_values,
-        };
-        return cloned;
+    /// PUC model for protos without debug information (stripped chunks):
+    /// `f->source == NULL` and `f->lineinfo == NULL` (lundump.c loads a
+    /// stripped chunk with exactly those two fields empty). luazig's
+    /// `[]const u8` source_name has no NULL state, so the empty slice
+    /// plays that role; requiring `lineinfo.len == 0` as well keeps this
+    /// distinct from a real empty chunk name (`load(s, "")`), which keeps
+    /// its line information. Used by debug.getinfo and the error/traceback
+    /// renderers, mirroring PUC's `p->source == NULL` checks
+    /// (ldebug.c:269-273, luaG_addinfo).
+    fn protoIsStripped(p: *const bc.Proto) bool {
+        return p.source_name.len == 0 and p.lineinfo.len == 0;
     }
 
     fn builtinLoad(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -24645,16 +24595,21 @@ pub const Vm = struct {
                     const has_s = what.len == 0 or debugInfoHasOpt(what, 'S');
                     const has_u = what.len == 0 or debugInfoHasOpt(what, 'u');
                     if (has_s) {
-                        // PUC: stripped chunks (source=NULL) get short_src="?".
-                        // We detect stripped protos by empty source_name AND
-                        // empty lineinfo (cloneStrippedProto clears both).
-                        const is_stripped = p.source_name.len == 0 and p.lineinfo.len == 0;
+                        // PUC: protos from stripped chunks have a NULL
+                        // source; lua_getinfo 'S' then reports source "=?"
+                        // and short_src "?" (ldebug.c:269-273 + chunkid).
+                        // protoIsStripped is our NULL-source detector (a
+                        // stripped dump serializes an empty source and no
+                        // line info — see dump.zig DumpOptions.strip).
+                        const is_stripped = protoIsStripped(p);
                         const short_src = try self.debugShortSourceEx(p.source_name, is_stripped);
                         const looks_like_path = p.source_name.len != 0 and
                             (std.mem.endsWith(u8, p.source_name, ".lua") or
                                 std.mem.indexOfScalar(u8, p.source_name, '/') != null or
                                 std.mem.indexOfScalar(u8, p.source_name, '\\') != null);
-                        const src = if (p.source_name.len != 0 and p.source_name[0] != '@' and p.source_name[0] != '=' and looks_like_path)
+                        const src = if (is_stripped)
+                            "=?"
+                        else if (p.source_name.len != 0 and p.source_name[0] != '@' and p.source_name[0] != '=' and looks_like_path)
                             try std.fmt.allocPrint(self.alloc, "@{s}", .{p.source_name})
                         else
                             p.source_name;
@@ -26086,14 +26041,29 @@ pub const Vm = struct {
         // Resolve source name via PUC luaO_chunkid (lobject.c:682-718).
         // This produces the short_src used in tracebacks: strips '@'/'='
         // prefixes and truncates long file names with '...' prefix.
+        // A stripped proto (NULL source in PUC) reports short_src "?"
+        // (auxgetinfo 'S' renders a NULL source as "=?" and chunkid maps
+        // that to "?").
         const src_raw = fr.sourceName();
+        const is_stripped = if (fr.proto()) |p| protoIsStripped(p) else false;
         var id_buf: [59]u8 = undefined;
-        const src = diag.chunkId(id_buf[0..], src_raw);
-        const shown_src: []const u8 = if (src.len != 0) src else "?";
+        const shown_src: []const u8 = if (is_stripped)
+            "?"
+        else blk: {
+            const src = diag.chunkId(id_buf[0..], src_raw);
+            break :blk if (src.len != 0) src else "?";
+        };
 
         // P15.51n: current_line derived from proto.lineinfo[pc].
+        // PUC luaL_traceback (lauxlib.c:148-151) appends the line number
+        // ONLY when currentline > 0; a frame without line information
+        // (a stripped proto — currentline is -1) renders just "src: in ...",
+        // with no line and no linedefined fallback.
         const cur_line: i64 = self.frameCurrentLine(fr);
-        const line: i64 = if (cur_line > 0) cur_line else @as(i64, fr.lineDefined());
+        const loc = if (cur_line > 0)
+            try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in ", .{ shown_src, cur_line })
+        else
+            try std.fmt.allocPrint(self.alloc, "\t{s}: in ", .{shown_src});
 
         // PUC pushfuncname (lauxlib.c:96-109): resolve function name from the
         // call site (caller frame). debugInferNameFromCaller returns namewhat
@@ -26128,25 +26098,25 @@ pub const Vm = struct {
         if (namewhat) |nw| {
             if (name) |nm| {
                 if (std.mem.eql(u8, nw, "metamethod")) {
-                    return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in metamethod '{s}'", .{ shown_src, line, nm });
+                    return try std.fmt.allocPrint(self.alloc, "{s}metamethod '{s}'", .{ loc, nm });
                 }
-                return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in {s} '{s}'", .{ shown_src, line, nw, nm });
+                return try std.fmt.allocPrint(self.alloc, "{s}{s} '{s}'", .{ loc, nw, nm });
             }
         }
 
         // No name from code: main chunk, anonymous function, or ?
         if (fr.lineDefined() == 0) {
-            return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in main chunk", .{ shown_src, line });
+            return try std.fmt.allocPrint(self.alloc, "{s}main chunk", .{loc});
         }
 
         // PUC pushglobalfuncname: try to find the function in _G (loaded table).
         // If found, show "function 'name'". Otherwise, show "function <src:linedefined>".
         if (self.debugFindGlobalFuncName(self.bc_stack[fr.func_slot])) |gname| {
-            return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in function '{s}'", .{ shown_src, line, gname });
+            return try std.fmt.allocPrint(self.alloc, "{s}function '{s}'", .{ loc, gname });
         }
 
         // PUC: for Lua functions without a name, use function <src:linedefined>
-        return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in function <{s}:{d}>", .{ shown_src, line, shown_src, fr.lineDefined() });
+        return try std.fmt.allocPrint(self.alloc, "{s}function <{s}:{d}>", .{ loc, shown_src, fr.lineDefined() });
     }
 
     /// PUC pushglobalfuncname (lauxlib.c:74-93): search _G for a function

@@ -5467,3 +5467,62 @@ computing `lua_max_call_frames` lazily only when `exec_frames.len() >= 10000`.
 every activation for stale-data prevention but only read when hooks are active.
 Estimated ~4-6% of function overhead. Fix: lazy initialization when hooks are
 first activated for a frame.
+
+## P16.10a T16 — Proto constant-resolution ownership audit (2026-08-30, ANALYSIS ONLY)
+
+**Question:** Can one Proto be shared across two independent Vm instances? Is
+moving resolution to closure/load/VM-binding time clean?
+
+**Verdict: NOT CLEAN** — the mutable `constants_resolved` design needs
+architectural attention first. The Proto is NOT strictly VM-bound.
+
+Artifact: `tools/perf/current-proto-ownership-audit.json`
+
+### Evidence
+
+**Proto is VM-bound after resolution:**
+- `resolveProtoConstants` (vm.zig:6694-6722) mutates `proto.k` in-place,
+  replacing compile-time `*LuaString` pointers (seed-0 hash) with VM-interned
+  pointers (VM-seed hash) — vm.zig:6696-6704.
+- `resolved_values` is allocated from `self.alloc` (VM allocator) — vm.zig:6710.
+- After resolution, `k` is still read by: debug name resolution
+  (vm.zig:24296-24430), OP_TAILCALL (vm.zig:14174), GC marking
+  (vm.zig:22271), `cloneStrippedProto` (vm.zig:23427).
+
+**No VM-binding enforcement:**
+- `Closure.proto` is `?*const bc.Proto` — raw pointer, no VM association
+  (vm.zig:782).
+- No `vm_owner` field on Proto. No check in `resolveProtoConstants`.
+- Nothing prevents a Proto from being used by two different VMs.
+
+**Cross-VM scenario:** VM1 resolves Proto (mutates `k`, allocates
+`resolved_values` from VM1 allocator). Proto shared with VM2.
+`resolveProtoConstants` sees `constants_resolved=true`, returns early. VM2
+uses VM1's interned string pointers. If VM1 is destroyed → dangling pointers
+→ VM2 crashes.
+
+**`resolveProtoConstants` does NOT recurse** (vm.zig:6694-6722) — child protos
+in `proto.p` are resolved lazily on first `pushBytecodeExecFrame`. A shared
+Proto tree may have protos resolved by different VMs. In contrast,
+`preResolveUndumpedConstants` (vm.zig:23320) DOES recurse (vm.zig:23334).
+
+**`cloneStrippedProto`** (vm.zig:23390-23449) shares `k`, `resolved_values`,
+and `constants_resolved` with the original — fragile borrowing with no
+reference counting. Dangling pointers if original freed first.
+
+### Required changes before moving resolution earlier
+
+1. Stop mutating `k` — build `resolved_values` directly from compile-time
+   strings without modifying `k`.
+2. Make `resolved_values` Proto-owned (not VM-allocator-owned).
+3. Add VM-binding mechanism (`vm_owner` field + check in `resolveProtoConstants`).
+4. Make `resolveProtoConstants` recurse into child protos.
+5. Rethink `cloneStrippedProto` sharing (reference counting or independent
+   resolution).
+
+**PUC comparison:** PUC Lua stores constants in runtime `TValue` format
+directly in `Proto.k` (lobject.h:614). The compiler interns strings through
+the same global string table as the runtime, so constants are already
+interned and VM-neutral (one global state per `lua_State`). Our design defers
+resolution to first execution and mutates `k` in-place, creating VM-specific
+state that prevents Proto sharing.

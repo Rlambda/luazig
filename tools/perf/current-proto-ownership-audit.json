@@ -1,0 +1,137 @@
+{
+  "created_utc": "2026-08-30T00:38:18.595371+00:00",
+  "head": "7e6241c",
+  "task": "P16.10a T16 \u2014 Proto constant-resolution ownership audit (ANALYSIS ONLY)",
+  "question": "Can one Proto be shared across two independent Vm instances? Is moving resolution to closure/load/VM-binding time clean?",
+  "verdict": "NOT CLEAN \u2014 the mutable constants_resolved design needs architectural attention first. The Proto is NOT strictly VM-bound.",
+  "evidence": {
+    "proto_structure": {
+      "file": "src/lua/bytecode.zig:445-530",
+      "fields": {
+        "k": "[]Constant \u2014 mutable constant pool. resolveProtoConstants mutates .str entries in-place, replacing compile-time LuaString pointers (seed-0 hash) with VM-interned pointers (VM-seed hash).",
+        "constants_resolved": "bool \u2014 mutable flag. Set true by resolveProtoConstants. Prevents re-resolution. After resolution, deinit skips freeing strings in k (they are VM-owned).",
+        "resolved_values": "[]vm.Value \u2014 VM-allocated array. Allocated from self.alloc (VM allocator) in resolveProtoConstants. Contains VM-interned string pointers.",
+        "p": "[]const *Proto \u2014 child protos. resolveProtoConstants does NOT recurse into p."
+      },
+      "deinit_ownership": "bytecode.zig:503-529: deinit checks constants_resolved to decide whether to free strings in k. If resolved, strings are VM-owned (not freed). resolved_values is freed if len > 0."
+    },
+    "resolution_paths": {
+      "resolveProtoConstants": {
+        "file": "src/lua/vm.zig:6694-6722",
+        "called_from": "pushBytecodeExecFrame (vm.zig:11075) \u2014 per-activation, lazy",
+        "mutates": [
+          "proto.k: replaces .str constants with VM-interned pointers (vm.zig:6696-6704)",
+          "proto.resolved_values: allocates from self.alloc (vm.zig:6710)",
+          "proto.constants_resolved: sets to true (vm.zig:6721)"
+        ],
+        "recurses": false,
+        "recursion_note": "Does NOT recurse into proto.p. Child protos are resolved lazily on their first pushBytecodeExecFrame call. This means a Proto tree may be partially resolved \u2014 some protos by VM1, others by VM2 if shared."
+      },
+      "preResolveUndumpedConstants": {
+        "file": "src/lua/vm.zig:23320-23337",
+        "called_from": "undump path \u2014 after loading bytecode file",
+        "mutates": [
+          "proto.resolved_values: allocates from self.alloc (vm.zig:23322)",
+          "proto.constants_resolved: sets to true (vm.zig:23333)"
+        ],
+        "recurses": true,
+        "recursion_note": "DOES recurse into proto.p (vm.zig:23334-23336). This is the correct pattern for tree-wide resolution.",
+        "key_difference": "Does NOT mutate proto.k (strings were already interned during undump via undumpInternCallback). Only builds resolved_values from existing k."
+      }
+    },
+    "k_read_after_resolution": {
+      "locations": [
+        "vm.zig:14174-14185: OP_TAILCALL handler \u2014 reads k for debug name resolution",
+        "vm.zig:22271-22278: gcMarkBytecodeProto \u2014 marks string constants in k for GC",
+        "vm.zig:24296-24430: funcnamefromcode equivalent \u2014 reads k[kidx].str.bytes() for debug names",
+        "vm.zig:23427: cloneStrippedProto \u2014 shares k with clone",
+        "vm.zig:23323: preResolveUndumpedConstants \u2014 reads k to build resolved_values"
+      ],
+      "implication": "After resolution, k contains VM-interned string pointers. All these read sites use VM-specific pointers. If the Proto is shared with another VM, these reads return pointers from the wrong VM string table."
+    },
+    "proto_sharing_paths": {
+      "cloneStrippedProto": {
+        "file": "src/lua/vm.zig:23390-23449",
+        "shares_with_original": [
+          "code",
+          "k",
+          "live_reg_top",
+          "resolved_values",
+          "constants_resolved"
+        ],
+        "borrowing_note": "vm.zig:23441-23444: The cloned proto borrows resolved_values and k \u2014 it must NOT free them in deinit. Setting constants_resolved=true prevents deinit from freeing strings in k (also borrowed).",
+        "risk": "If original is freed first, clone has dangling pointers to k strings and resolved_values. If clone is freed first, it skips freeing (correct), but original may double-free."
+      },
+      "closure_proto_field": {
+        "file": "src/lua/vm.zig:782",
+        "type": "?*const bc.Proto \u2014 raw pointer, no VM association",
+        "implication": "A Closure holds a raw Proto pointer. Nothing prevents the same Proto from being referenced by Closures in different VMs."
+      },
+      "dump_undump": {
+        "dump": "src/lua/dump.zig:231-290: Serializes k constants to binary format (string bytes). Does NOT share Proto pointers. Safe.",
+        "undump": "src/lua/undump.zig:424-432: Creates fresh protos with constants_resolved=false. Safe \u2014 fresh protos, VM-bound at undump time."
+      }
+    },
+    "vm_binding_mechanism": {
+      "exists": false,
+      "evidence": "No vm_owner field on Proto. No VM association check in resolveProtoConstants. No mechanism prevents a Proto from being used by two different VMs."
+    }
+  },
+  "cross_vm_scenario": {
+    "description": "VM1 loads a chunk, resolves Proto (mutates k, allocates resolved_values from VM1 allocator). Proto pointer is shared with VM2 (via cloneStrippedProto or direct pointer sharing).",
+    "vm1_resolution": [
+      "proto.k .str entries replaced with VM1-interned pointers",
+      "proto.resolved_values allocated from VM1.alloc",
+      "proto.constants_resolved = true"
+    ],
+    "vm2_usage": [
+      "pushBytecodeExecFrame calls resolveProtoConstants",
+      "resolveProtoConstants sees constants_resolved=true, returns early",
+      "VM2 uses VM1-interned string pointers in k and resolved_values",
+      "VM2 GC does not track VM1 strings \u2192 GC may collect them"
+    ],
+    "vm1_destruction": [
+      "VM1 string table freed \u2192 k .str entries become dangling pointers",
+      "VM1 allocator freed \u2192 resolved_values becomes dangling pointer",
+      "VM2 crashes on next access to k or resolved_values"
+    ]
+  },
+  "architectural_issues": [
+    {
+      "issue": "k mutation makes Proto VM-specific",
+      "evidence": "vm.zig:6696-6704: resolveProtoConstants replaces .str in k with VM-interned pointers. After mutation, k contains VM-specific pointers that cannot be used by another VM.",
+      "fix_direction": "Stop mutating k. Build resolved_values directly from compile-time strings without modifying k. Free compile-time strings separately (or not at all if arena-allocated)."
+    },
+    {
+      "issue": "resolved_values is VM-allocator-owned",
+      "evidence": "vm.zig:6710: resolved_values allocated from self.alloc (VM allocator). If Proto is shared, cross-VM allocation ownership issue.",
+      "fix_direction": "Make resolved_values Proto-owned (with Proto-owned allocator or reference counting). Or allocate from a Proto-owned arena."
+    },
+    {
+      "issue": "cloneStrippedProto shares resolved state via fragile borrowing",
+      "evidence": "vm.zig:23441-23446: Clone shares resolved_values and constants_resolved with original. No reference counting. Dangling pointers if original freed first.",
+      "fix_direction": "Either give the clone its own resolved_values, or reference-count the shared array."
+    },
+    {
+      "issue": "No VM-binding enforcement",
+      "evidence": "No vm_owner field on Proto. No check in resolveProtoConstants. Closure.proto is a raw ?*const bc.Proto pointer.",
+      "fix_direction": "Add vm_owner: ?*Vm field on Proto. Check in resolveProtoConstants: if vm_owner != null and vm_owner != self, either re-resolve or error."
+    },
+    {
+      "issue": "resolveProtoConstants does not recurse",
+      "evidence": "vm.zig:6694-6722: No loop over proto.p. Child protos resolved lazily. A shared Proto tree may have protos resolved by different VMs.",
+      "fix_direction": "Make resolveProtoConstants recurse into proto.p (like preResolveUndumpedConstants does at vm.zig:23334-23336)."
+    }
+  ],
+  "conclusion": {
+    "verdict": "Moving resolution to closure/load/VM-binding time is NOT clean with the current design. The mutable constants_resolved design needs architectural attention first.",
+    "required_changes_before_moving_resolution": [
+      "1. Stop mutating k (build resolved_values directly from compile-time strings)",
+      "2. Make resolved_values Proto-owned (not VM-allocator-owned)",
+      "3. Add VM-binding mechanism (vm_owner field + check in resolveProtoConstants)",
+      "4. Make resolveProtoConstants recurse into child protos",
+      "5. Rethink cloneStrippedProto sharing (reference counting or independent resolution)"
+    ],
+    "puc_comparison": "PUC Lua stores constants in runtime TValue format directly in Proto.k (lobject.h:614). The compiler interns strings through the same global string table as the runtime, so constant pool strings are already interned and VM-neutral (there is only one global state per lua_State). Our design defers resolution to first execution and mutates k in-place, creating VM-specific state that prevents Proto sharing."
+  }
+}

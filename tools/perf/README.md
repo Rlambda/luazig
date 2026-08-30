@@ -36,3 +36,22 @@ snapshot is a versioned record of absolute performance at a point in time.
 |------|----------|
 | `counters-2026-08-25.json` | One-off counters run (pre-snapshot era) |
 | `profiles/2026-08-25/` | One-off perf record/report run (pre-snapshot era) |
+
+## Native-memory lanes (leak gates)
+
+Permanent RSS-slope workloads for `tools/native_mem_check.py` live in
+`tools/native_mem_lanes/`. Run each with:
+
+```sh
+python3 tools/native_mem_check.py tools/native_mem_lanes/<lane>.lua
+```
+
+| Lane | Verdicts |
+|------|----------|
+| `repeated_dynamic_load.lua` | `load("return 1")` + call + collectgarbage every 100 iters. Detects Proto-tree retention on the dynamic-load path. LINEAR while the retention blocker is open; must become BOUNDED when the load path is fixed. |
+| `repeated_stripped_dump.lua` | `string.dump(f, true)` loop (P16.10 Blocker 2 reproducer). LINEAR while strip builds unfreeable Proto clones; BOUNDED since P16.10b (strip is a serialization property, no clone). |
+| `repeated_plain_dump.lua` | `string.dump(f, false)` control for the lane above — BOUNDED always; isolates any stripped-lane growth to the strip path. |
+
+Exit code 0 = BOUNDED, 1 = LINEAR (leak), so the dump lanes are directly
+usable as gates; `repeated_dynamic_load.lua` stays LINEAR until its fix
+lands.

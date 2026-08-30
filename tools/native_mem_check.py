@@ -20,6 +20,9 @@ Usage:
     python3 tools/native_mem_check.py /tmp/co_mem.lua 100000 300000 1000000
     python3 tools/native_mem_check.py --selftest
 
+Permanent leak-gate workloads live in tools/native_mem_lanes/ (dynamic
+load retention, stripped/plain string.dump loops) — see tools/perf/README.md.
+
 Defaults to 100000, 300000, 1000000 iterations.
 Exit code: 0 = BOUNDED, 1 = LINEAR (leak detected), 2 = usage/error,
            3 = child crashed (signal termination) — treated as a hard failure.

@@ -780,6 +780,15 @@ pub const Closure = struct {
     /// PUC `marked` byte — tri-color mark bits. See constants above.
     gc_marked: u8 = 0,
     proto: ?*const bc.Proto = null, // bytecode proto (non-null for bytecode closures)
+    /// The proto tree's lifetime owner (P16.10b Task 4/5). Every bytecode
+    /// closure RETAINS the owner at creation; `gcFreeObject(.closure)`
+    /// releases it, and the last release frees the whole tree. This is
+    /// what makes OP_CLOSURE sharing safe: many closures over one child
+    /// proto, child closures outliving the root closure — the tree stays
+    /// alive while ANY closure of ANY of its nodes lives. Null for C
+    /// closures (c_func) and builtin closures. Invariant for bytecode
+    /// closures: `tree == proto.?.tree` (Debug-asserted at creation).
+    tree: ?*bc.ProtoTreeOwner = null,
     upvalues: []const *Cell,
     env_override: ?Value = null,
     /// C function pointer (PUC CClosure.f / `lua_CFunction`). Non-null when
@@ -6699,40 +6708,99 @@ pub const Vm = struct {
     // resolveCallable, etc.). The dispatch loop decodes 32-bit instructions
     // and switches on the opcode.
 
-    /// Resolve all string constants in a Proto to VM-interned pointers.
-    /// Called once per Proto on first execution. After resolution, string
-    /// constants are owned by the VM's intern table (not by the Proto),
-    /// matching PUC Lua's ownership model. This eliminates per-execution
-    /// re-hashing in `bcConstToValue` — the #1 perf hotspot (~12.4% of
-    /// cycles on the microbench).
+    /// Resolve a proto's constants to VM-canonical form. TREE-WIDE and
+    /// idempotent: the readiness flag lives on the tree owner, so the first
+    /// execution of ANY proto of a tree adopts the whole tree (constants
+    /// VM-interned, `resolved_values` built everywhere). Called from
+    /// `pushBytecodeExecFrame` and the OP_TAILCALL frame-reuse path.
     inline fn resolveProtoConstants(self: *Vm, proto: *bc.Proto) DispatchError!void {
-        if (proto.constants_resolved) return;
-        for (proto.k) |*c| {
-            if (c.* == .str) {
-                const old = c.str;
-                const new = try self.internStrAll(old.bytes());
-                // Free the compile-time LuaString (created with hash seed 0).
-                // The VM-interned version is now the canonical pointer.
-                destroyLuaString(self.alloc, old);
-                c.str = new;
+        const owner = proto.tree orelse return; // owner-less: unit-test protos
+        if (owner.constants_resolved) return;
+        try self.resolveTreeConstants(owner);
+    }
+
+    /// Tree-wide constant resolution (P16.10b Task 9). Two-phase so that a
+    /// partial failure NEVER leaves the tree mutated — fixing the latent
+    /// re-resolution bug where `intern` failed AFTER in-place destroys and
+    /// a retry destroyed already-VM-owned strings:
+    ///
+    ///   Phase 1 (fallible, no mutation): for every proto of the tree,
+    ///   allocate the `resolved_values` array and intern every `.str`
+    ///   constant into the VM's string table, staging the interned pointers
+    ///   inside the fresh array. An OOM here frees the staged arrays and
+    ///   returns; the tree is byte-identical to before, so a retry is safe.
+    ///
+    ///   Phase 2 (infallible): publish — store each `resolved_values`,
+    ///   swap the k pool's `.str` pointers to the staged VM strings,
+    ///   destroy the old seed-0 strings (text trees only; undumped trees
+    ///   are VM-owned from birth — `k_strings_vm_owned`), flip the owner
+    ///   flags. Frees and stores cannot fail.
+    /// Staging record for tree-wide constant resolution (see
+    /// resolveTreeConstants): the fresh resolved_values array for one proto,
+    /// with string constants staged as VM-interned pointers.
+    const ResolveStage = struct { proto: *bc.Proto, vals: []Value };
+
+    fn resolveTreeConstants(self: *Vm, owner: *bc.ProtoTreeOwner) DispatchError!void {
+        var built: std.ArrayListUnmanaged(ResolveStage) = .empty;
+        defer {
+            // On error: free every staged array. On success the arrays were
+            // published to the protos and `built` was drained — nothing to
+            // free but the list storage itself.
+            for (built.items) |b| {
+                if (b.vals.len > 0) self.alloc.free(b.vals);
+            }
+            built.deinit(self.alloc);
+        }
+        // Phase 1. The walk is recursive over the tree, staging interned
+        // pointers in Value form (this mirrors PUC Lua, whose compiler
+        // interns constants through the same string table as the runtime
+        // and stores them in runtime TValue format from birth).
+        try self.stageResolveTree(owner.root, &built);
+        // Phase 2: publish (infallible).
+        for (built.items) |b| {
+            b.proto.resolved_values = b.vals;
+            for (b.proto.k, 0..) |*c, i| {
+                if (c.* == .str) {
+                    const new = b.vals[i].String;
+                    if (!owner.k_strings_vm_owned) {
+                        // Destroy the compile-time LuaString (seed-0). The
+                        // VM-interned version is now the canonical pointer.
+                        // Seed strings were created by the compiler with the
+                        // TREE's allocator, not the VM's (same family in
+                        // production; possibly a test arena otherwise).
+                        destroyLuaString(owner.allocator, c.str);
+                    }
+                    c.str = new;
+                }
             }
         }
-        // Pre-resolve all constants into runtime Value format (PUC Lua stores
-        // TValue k[] in Proto — constants are already in runtime format).
-        // This eliminates the per-execution switch in bcConstToValue: opcode
-        // handlers read resolved_values[kid] directly — a single array access.
+        owner.k_strings_vm_owned = true;
+        owner.constants_resolved = true;
+        // Ownership of the staged arrays moved to the protos — drain the
+        // list so the defer above does not free them.
+        built.clearRetainingCapacity();
+    }
+
+    fn stageResolveTree(
+        self: *Vm,
+        proto: *bc.Proto,
+        built: *std.ArrayListUnmanaged(ResolveStage),
+    ) DispatchError!void {
         const vals = try self.alloc.alloc(Value, proto.k.len);
+        errdefer if (vals.len > 0) self.alloc.free(vals);
         for (proto.k, 0..) |c, i| {
             vals[i] = switch (c) {
                 .nil => .Nil,
                 .bool => |b| .{ .Bool = b },
                 .int => |i64_val| .{ .Int = i64_val },
                 .num_bits => |n| .{ .Num = @bitCast(n) },
-                .str => |s| .{ .String = s },
+                .str => |s| .{ .String = try self.internStrAll(s.bytes()) },
             };
         }
-        proto.resolved_values = vals;
-        proto.constants_resolved = true;
+        try built.append(self.alloc, .{ .proto = proto, .vals = vals });
+        for (proto.p) |child| {
+            try self.stageResolveTree(@constCast(child), built);
+        }
     }
 
     fn takeBytecodeResumeValues(th: *Thread, alloc: std.mem.Allocator) ?[]Value {
@@ -11705,6 +11773,7 @@ pub const Vm = struct {
             errdefer self.alloc.destroy(cl);
             cl.* = .{
                 .proto = proto_in,
+                .tree = self.retainTreeForClosure(proto_in),
                 .upvalues = owned_upvalues,
             };
             try self.gcRegisterClosure(cl);
@@ -14742,6 +14811,10 @@ pub const Vm = struct {
         const cl = try self.alloc.create(Closure);
         cl.* = .{
             .proto = child_proto,
+            // OP_CLOSURE shares the parent's tree: the child closure takes
+            // its own reference, so children safely outlive the root
+            // closure (P16.10b S5 — supported sharing, not theoretical).
+            .tree = self.retainTreeForClosure(child_proto),
             .upvalues = cells,
         };
         try self.gcRegisterClosure(cl);
@@ -17300,6 +17373,9 @@ pub const Vm = struct {
         var cg_bc = lua_codegen_bc.Codegen.init(self.alloc, source.name, source.bytes);
         defer cg_bc.deinit();
         const proto = cg_bc.compileChunk(chunk) catch return self.fail("{s}", .{cg_bc.diagString()});
+        // Producing reference discipline (P16.10b Task 4): closure creation
+        // retains its own; drop ours on success, free on failure.
+        errdefer proto.tree.?.release();
 
         // Create a proper closure with _ENV upvalue, matching how
         // compileTextChunk + builtinDofile load chunks. The bootstrap source
@@ -17308,6 +17384,7 @@ pub const Vm = struct {
         // an out-of-bounds access in gettabup. createBytecodeChunkClosure
         // allocates the upvalue cells; applyLoadEnv sets _ENV to global_env.
         const cl = try self.createBytecodeChunkClosure(proto);
+        proto.tree.?.release();
         try self.applyLoadEnv(cl, .{ .Table = self.global_env }, false);
         const ret = try self.runClosure(cl, &.{});
         self.alloc.free(ret);
@@ -21997,6 +22074,11 @@ pub const Vm = struct {
                 // PUC freeobj for LClosure: free upvalue array (luaF_freecupvals).
                 // Each Cell is a separate GC object freed by its own gcFreeObject;
                 // only the pointer array is freed here.
+                // P16.10b Task 4/5: release the proto tree's lifetime owner.
+                // The LAST release frees the whole tree exactly once — this
+                // is what closes the dynamic-load retention blocker (many
+                // closures share one tree; children may outlive the root).
+                if (c.tree) |t| t.release();
                 if (c.upvalues.len > 0) self.alloc.free(c.upvalues);
                 self.gcNoteFree(@sizeOf(Closure) + c.upvalues.len * @sizeOf(*Cell));
                 self.alloc.destroy(c);
@@ -22995,19 +23077,48 @@ pub const Vm = struct {
         diagnostic: []u8,
     };
 
+    /// Take a retained reference to a proto's tree owner for a Closure
+    /// being created over it (P16.10b Task 4/5). Binds the VM identity on
+    /// first use: no production path shares a tree across VMs (see
+    /// tools/ownership/proto-inventory.json), so a cheap Debug-time
+    /// pointer check is the honest cross-VM invariant enforcement.
+    fn retainTreeForClosure(self: *Vm, proto: *const bc.Proto) ?*bc.ProtoTreeOwner {
+        const owner = proto.tree orelse return null; // owner-less test protos
+        owner.retain();
+        const self_opaque: *anyopaque = @ptrCast(self);
+        if (owner.vm == null) owner.vm = self_opaque;
+        std.debug.assert(owner.vm == self_opaque); // one VM per tree
+        return owner;
+    }
+
     pub fn createBytecodeChunkClosure(self: *Vm, proto: *const bc.Proto) DispatchError!*Closure {
         const cells = try self.alloc.alloc(*Cell, proto.upvalues.len);
+        var n_cells: usize = 0;
+        errdefer {
+            // Partial cell-creation failure (P16.10b Task 13 hygiene):
+            // fully undo every cell created so far — unregister from the
+            // GC list, credit the accounting, free the object — then the
+            // array. No leak, no dangling registry entry.
+            for (cells[0..n_cells]) |c| {
+                self.gcUnregisterObject(.{ .cell = c });
+                self.gcNoteFree(@sizeOf(Cell));
+                self.alloc.destroy(c);
+            }
+            self.alloc.free(cells);
+        }
         for (cells) |*slot| {
             const cell = try self.alloc.create(Cell);
             cell.* = .{ .value = .Nil };
             try self.gcRegisterCell(cell);
             self.gcNoteAlloc(@sizeOf(Cell));
             slot.* = cell;
+            n_cells += 1;
         }
         try self.testcChargeMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
         cl.* = .{
             .proto = proto,
+            .tree = self.retainTreeForClosure(proto),
             .upvalues = cells,
         };
         try self.gcRegisterClosure(cl);
@@ -23037,7 +23148,13 @@ pub const Vm = struct {
         var cg_bc = lua_codegen_bc.Codegen.init(self.alloc, src.name, src.bytes);
         defer cg_bc.deinit();
         const proto = cg_bc.compileChunk(chunk) catch return error.Syntax;
+        // The compiled tree carries its producing reference (owner
+        // ref_count == 1); closure creation retains its own. Drop the
+        // producing reference on every path — success transfers lifetime
+        // to the closure, failure must free the tree (P16.10b Task 4).
+        errdefer proto.tree.?.release();
         const cl = try self.createBytecodeChunkClosure(proto);
+        proto.tree.?.release();
         // Set _ENV upvalue to the global environment, matching PUC's
         // lua_load behavior: the main chunk's first upvalue is _ENV = _G.
         // Without this, global lookups (GETTABUP on upvalue 0) return nil
@@ -23065,7 +23182,14 @@ pub const Vm = struct {
             const result = try compile_bc(self.alloc, source, chunk);
             return switch (result) {
                 .proto => |proto| {
-                    return .{ .closure = try self.createBytecodeChunkClosure(proto) };
+                    // Compiled tree carries its producing reference; the
+                    // closure takes its own. Drop the producer's on every
+                    // path (P16.10b Task 4): success → lifetime belongs to
+                    // the closure; failure → the tree must free itself.
+                    errdefer proto.tree.?.release();
+                    const cl = try self.createBytecodeChunkClosure(proto);
+                    proto.tree.?.release();
+                    return .{ .closure = cl };
                 },
                 .diagnostic => |diagnostic| .{ .diagnostic = diagnostic },
             };
@@ -23329,22 +23453,53 @@ pub const Vm = struct {
         }
         cl.* = .{
             .proto = proto,
+            .tree = self.retainTreeForClosure(proto),
             .upvalues = cells,
-            .env_override = null,
         };
         try self.gcRegisterClosure(cl);
         self.gcNoteAlloc(@sizeOf(Closure));
         return cl;
     }
 
-    /// Pre-resolve constants for undumped protos. String constants were
-    /// already VM-interned via `undumpInternCallback`, so we populate
-    /// `resolved_values` directly and set `constants_resolved = true`.
-    /// This prevents `resolveProtoConstants` from re-interning and freeing
-    /// already-interned strings (which would corrupt the string table).
-    pub fn preResolveUndumpedConstants(self: *Vm, proto: *bc.Proto) DispatchError!void {
-        if (proto.constants_resolved) return;
+    /// Resolve constants for undumped trees (P16.10b Task 9). String
+    /// constants were already VM-interned during undump
+    /// (`undumpInternCallback`/`undumpFixedInternCallback`), so resolution
+    /// is alloc-only: build `resolved_values` for EVERY proto of the tree
+    /// and flip the owner's readiness flags. Prevents
+    /// `resolveTreeConstants` from re-interning (its phase 2 would be a
+    /// no-op swap, but staging it costs a full interning pass — skipping
+    /// it also keeps fixed-buffer external strings as the canonical k
+    /// pointers). On OOM the staged arrays are freed, the tree stays
+    /// unmutated, and execution falls back to `resolveTreeConstants`,
+    /// which is safe for VM-owned pools.
+    pub fn preResolveUndumpedConstants(self: *Vm, root: *bc.Proto) DispatchError!void {
+        const owner = root.tree orelse return; // owner-less: unit-test protos
+        if (owner.constants_resolved) return;
+        var built: std.ArrayListUnmanaged(ResolveStage) = .empty;
+        defer {
+            for (built.items) |b| {
+                if (b.vals.len > 0) self.alloc.free(b.vals);
+            }
+            built.deinit(self.alloc);
+        }
+        try self.stageUndumpedTree(root, &built);
+        // Publish (infallible): strings are already VM-canonical, so only
+        // the resolved_values arrays move.
+        for (built.items) |b| {
+            b.proto.resolved_values = b.vals;
+        }
+        owner.k_strings_vm_owned = true;
+        owner.constants_resolved = true;
+        built.clearRetainingCapacity();
+    }
+
+    fn stageUndumpedTree(
+        self: *Vm,
+        proto: *bc.Proto,
+        built: *std.ArrayListUnmanaged(ResolveStage),
+    ) DispatchError!void {
         const vals = try self.alloc.alloc(Value, proto.k.len);
+        errdefer if (vals.len > 0) self.alloc.free(vals);
         for (proto.k, 0..) |c, i| {
             vals[i] = switch (c) {
                 .nil => .Nil,
@@ -23354,10 +23509,9 @@ pub const Vm = struct {
                 .str => |s| .{ .String = s },
             };
         }
-        proto.resolved_values = vals;
-        proto.constants_resolved = true;
+        try built.append(self.alloc, .{ .proto = proto, .vals = vals });
         for (proto.p) |child| {
-            try self.preResolveUndumpedConstants(@constCast(child));
+            try self.stageUndumpedTree(@constCast(child), built);
         }
     }
 
@@ -23575,6 +23729,11 @@ pub const Vm = struct {
                 if (outs.len > 1) outs[1] = .{ .String = try self.internStr(msg) };
                 return;
             };
+            // The undumped tree carries its producing reference; every
+            // failure from here to closure creation must release it, and
+            // success drops it once the closure holds its own (P16.10b
+            // Task 4).
+            errdefer loaded_proto.tree.?.release();
             if (fixed) {
                 // In fixed-buffer mode, code/lineinfo/long-strings point into
                 // the source buffer. Pin it so GC doesn't sweep it while the
@@ -23589,13 +23748,15 @@ pub const Vm = struct {
             }
             // String constants were already VM-interned during undump (via
             // undumpInternCallback or undumpFixedInternCallback). Pre-populate
-            // resolved_values and mark constants_resolved=true so
-            // resolveProtoConstants does NOT attempt to re-intern + free the
-            // already-interned strings (which would corrupt the string table).
+            // resolved_values tree-wide so resolveTreeConstants does NOT
+            // re-intern (which would churn the string table and displace
+            // fixed-buffer external strings).
             try self.preResolveUndumpedConstants(loaded_proto);
-            // Wrap the deserialized Proto in an executable Closure. The Closure
-            // owns the Proto (freed via GC when the Closure is collected).
+            // Wrap the deserialized Proto in an executable Closure. The
+            // closure retains the tree owner (freed via GC when the last
+            // closure of the tree is collected).
             const cl = try self.closureFromProto(loaded_proto);
+            loaded_proto.tree.?.release(); // drop the producing reference
             try roots.add(.{ .Closure = cl });
             // lua_load always initializes the loaded main closure's first
             // upvalue with the selected environment. A stripped chunk has no
@@ -35883,9 +36044,12 @@ pub const Vm = struct {
         // Ensure constants are resolved into runtime Value format.
         // PUC Lua's compiler stores constants in runtime (TValue) format
         // directly; our compiler stores them as bc.Constant and resolves
-        // lazily on first execution. listk may be called before execution.
-        if (!proto.constants_resolved) {
-            try self.resolveProtoConstants(@constCast(proto));
+        // tree-wide before first execution. listk may be called before
+        // execution (readiness flag lives on the tree owner).
+        if (proto.tree) |tree| {
+            if (!tree.constants_resolved) {
+                try self.resolveProtoConstants(@constCast(proto));
+            }
         }
 
         const t = try self.apiNewTable();
@@ -37503,7 +37667,10 @@ pub const Vm = struct {
                     try st.append(self.alloc, .{ .String = try self.internStr(cg_bc.diagString()) });
                     return null;
                 };
+                // Producing reference discipline (P16.10b Task 4).
+                errdefer proto.tree.?.release();
                 const clv = try self.createBytecodeChunkClosure(proto);
+                proto.tree.?.release();
                 try st.append(self.alloc, .{ .Closure = clv });
             },
             .newthread => {
@@ -40497,13 +40664,14 @@ test "vm: P16.8a transactional simple_result setup — errdefer rollback on push
     var vm = Vm.init(aalloc, false);
     defer vm.deinit();
 
-    // Create bytecode closures for both protos.
+    // Create bytecode closures for both protos. Each closure retains the
+    // tree owner (gcFreeObject releases it at vm.deinit drain).
     const parent_cl = try aalloc.create(Closure);
-    parent_cl.* = .{ .proto = parent_proto, .upvalues = &.{} };
+    parent_cl.* = .{ .proto = parent_proto, .tree = vm.retainTreeForClosure(parent_proto), .upvalues = &.{} };
     try vm.gcRegisterClosure(parent_cl);
 
     const mm_cl = try aalloc.create(Closure);
-    mm_cl.* = .{ .proto = mm_proto, .upvalues = &.{} };
+    mm_cl.* = .{ .proto = mm_proto, .tree = vm.retainTreeForClosure(mm_proto), .upvalues = &.{} };
     try vm.gcRegisterClosure(mm_cl);
 
     // Pre-resolve the metamethod proto's constants so resolveProtoConstants

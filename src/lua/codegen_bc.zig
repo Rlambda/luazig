@@ -6927,10 +6927,7 @@ test "codegen: simple arithmetic" {
     var cg = Codegen.init(testing.allocator, "test", source);
     defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
-    defer {
-        proto.deinit(testing.allocator);
-        testing.allocator.destroy(proto);
-    }
+    defer proto.tree.?.release(); // frees the whole tree + owner
 
     // Verify bytecode (constant folding collapses "1 + 2" → 3):
     // 0: VARARGPREP
@@ -6957,10 +6954,7 @@ test "codegen: if/else" {
     var cg = Codegen.init(testing.allocator, "test", source);
     defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
-    defer {
-        proto.deinit(testing.allocator);
-        testing.allocator.destroy(proto);
-    }
+    defer proto.tree.?.release(); // frees the whole tree + owner
 
     // Should compile without error.
     try testing.expect(proto.code.len > 0);
@@ -6979,10 +6973,7 @@ test "codegen: for loop" {
     var cg = Codegen.init(testing.allocator, "test", source);
     defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
-    defer {
-        proto.deinit(testing.allocator);
-        testing.allocator.destroy(proto);
-    }
+    defer proto.tree.?.release(); // frees the whole tree + owner
 
     // Should compile with FORPREP and FORLOOP.
     var has_forprep = false;
@@ -7044,10 +7035,7 @@ test "codegen: hot loop instruction count regression" {
     var cg = Codegen.init(testing.allocator, "test", source);
     defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
-    defer {
-        proto.deinit(testing.allocator);
-        testing.allocator.destroy(proto);
-    }
+    defer proto.tree.?.release(); // frees the whole tree + owner
 
     // Find FORPREP and FORLOOP to measure the loop body.
     var forprep_pc: ?usize = null;
@@ -7087,10 +7075,7 @@ test "codegen: K-variant opcodes for constant operands" {
     var cg = Codegen.init(testing.allocator, "test", source);
     defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
-    defer {
-        proto.deinit(testing.allocator);
-        testing.allocator.destroy(proto);
-    }
+    defer proto.tree.?.release(); // frees the whole tree + owner
 
     // Should contain ADDI (x + 5, where 5 fits in sC).
     var has_addi = false;
@@ -7114,10 +7099,7 @@ test "codegen: function call" {
     var cg = Codegen.init(testing.allocator, "test", source);
     defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
-    defer {
-        proto.deinit(testing.allocator);
-        testing.allocator.destroy(proto);
-    }
+    defer proto.tree.?.release(); // frees the whole tree + owner
 
     // Should have a CALL instruction.
     var has_call = false;
@@ -7141,10 +7123,7 @@ test "codegen: table constructor" {
     var cg = Codegen.init(testing.allocator, "test", source);
     defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
-    defer {
-        proto.deinit(testing.allocator);
-        testing.allocator.destroy(proto);
-    }
+    defer proto.tree.?.release(); // frees the whole tree + owner
 
     // Should have NEWTABLE and SETLIST.
     var has_newtable = false;
@@ -7171,10 +7150,7 @@ test "codegen: closure" {
     var cg = Codegen.init(testing.allocator, "test", source);
     defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
-    defer {
-        proto.deinit(testing.allocator);
-        testing.allocator.destroy(proto);
-    }
+    defer proto.tree.?.release(); // frees the whole tree + owner
 
     // Should have CLOSURE instruction and an inner proto.
     var has_closure = false;
@@ -7199,10 +7175,7 @@ test "codegen+vm: end-to-end arithmetic" {
     var cg = Codegen.init(testing.allocator, "test", source);
     defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
-    defer {
-        proto.deinit(testing.allocator);
-        testing.allocator.destroy(proto);
-    }
+    defer proto.tree.?.release(); // frees the whole tree + owner
 
     // Create a Vm and execute the proto.
     var v = vm.Vm.init(testing.allocator, false);
@@ -7237,10 +7210,7 @@ test "codegen+vm: inner global declaration shadows outer local" {
     var cg = Codegen.init(testing.allocator, "test", source);
     defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
-    defer {
-        proto.deinit(testing.allocator);
-        testing.allocator.destroy(proto);
-    }
+    defer proto.tree.?.release(); // frees the whole tree + owner
 
     var v = vm.Vm.init(testing.allocator, false);
     defer v.deinit();
@@ -7273,10 +7243,7 @@ test "codegen+vm: global declaration expands final call" {
     var cg = Codegen.init(testing.allocator, "test", source);
     defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
-    defer {
-        proto.deinit(testing.allocator);
-        testing.allocator.destroy(proto);
-    }
+    defer proto.tree.?.release(); // frees the whole tree + owner
 
     var v = vm.Vm.init(testing.allocator, false);
     defer v.deinit();
@@ -7314,10 +7281,7 @@ test "codegen+vm: direct bytecode yield parks thread-owned continuation" {
     var cg = Codegen.init(testing.allocator, "test", source);
     defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
-    defer {
-        proto.deinit(testing.allocator);
-        testing.allocator.destroy(proto);
-    }
+    defer proto.tree.?.release(); // frees the whole tree + owner
 
     var v = vm.Vm.init(testing.allocator, false);
     defer v.deinit();
@@ -7375,10 +7339,7 @@ test "codegen+vm: yielding generic iterator stays on explicit frame stack" {
     var cg = Codegen.init(testing.allocator, "test", source);
     defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
-    defer {
-        proto.deinit(testing.allocator);
-        testing.allocator.destroy(proto);
-    }
+    defer proto.tree.?.release(); // frees the whole tree + owner
 
     var v = vm.Vm.init(testing.allocator, false);
     defer v.deinit();

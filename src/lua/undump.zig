@@ -334,6 +334,15 @@ pub const UndumpReader = struct {
         // 8. vararg_table_reg — only present when flags bit 1 is set.
         const vararg_table_reg: ?u8 = if (has_vtr) try self.readByte() else null;
 
+        // ── Error-path discipline (P16.10b Task 4/C4) ──
+        // Every allocation below carries an errdefer so a truncated or
+        // corrupt chunk frees exactly what was built — no partial-tree
+        // leak. Completed children free their own subtrees through their
+        // own errdefers; the `n_*` counters track how many entries of the
+        // incrementally-filled arrays are valid. String constants are
+        // VM-owned when deserialized through the intern callback (and
+        // `undefined` without one) — they are NEVER tree-owned here, so
+        // error cleanup passes k_strings_vm_owned = true (skip them).
         // 9. Code: length prefix, then each instruction as a raw u32 LE word.
         const code_len = try self.readU32();
         // In fixed-buffer mode, point directly into the input buffer (PUC's
@@ -356,23 +365,31 @@ pub const UndumpReader = struct {
             }
             break :blk c;
         };
+        errdefer alloc.free(code);
 
         // 10. Constants: length prefix, then each via undumpConstant.
         const k_len = try self.readU32();
         const k = try alloc.alloc(bc.Constant, @intCast(k_len));
-        for (0..k_len) |i| {
-            k[i] = try self.undumpConstant();
+        // Entries carry no tree ownership (string constants are VM-owned
+        // via the intern callback, or `undefined` without one), so the
+        // errdefer frees just the array.
+        errdefer alloc.free(k);
+        var n_k: usize = 0;
+        while (n_k < k_len) : (n_k += 1) {
+            k[n_k] = try self.undumpConstant();
         }
 
         // 11. Upvalues: length prefix, then each as (instack, idx, is_const, name).
         const upv_len = try self.readU32();
         const upvalues = try alloc.alloc(bc.Upvaldesc, @intCast(upv_len));
-        for (0..upv_len) |i| {
+        errdefer alloc.free(upvalues); // names alias the input buffer
+        var n_upv: usize = 0;
+        while (n_upv < upv_len) : (n_upv += 1) {
             const instack_byte = try self.readByte();
             const idx = try self.readByte();
             const is_const_byte = try self.readByte();
             const uv_name = try self.readStringDedup();
-            upvalues[i] = .{
+            upvalues[n_upv] = .{
                 .instack = instack_byte != 0,
                 .idx = idx,
                 .is_const = is_const_byte != 0,
@@ -383,8 +400,17 @@ pub const UndumpReader = struct {
         // 12. Inner protos: length prefix, then each child recursively.
         const p_len = try self.readU32();
         const protos = try alloc.alloc(*bc.Proto, @intCast(p_len));
-        for (0..p_len) |i| {
-            protos[i] = try self.undumpProto();
+        var n_p: usize = 0;
+        errdefer {
+            // Completed children own whole subtrees (their own errdefers
+            // cleaned up their partials); k strings are VM-owned here.
+            for (protos[0..n_p]) |child| {
+                bc.destroyProtoTree(alloc, child, true);
+            }
+            alloc.free(protos);
+        }
+        while (n_p < p_len) : (n_p += 1) {
+            protos[n_p] = try self.undumpProto();
         }
 
         // 13. Line info: length prefix, then each absolute line number as u32.
@@ -394,19 +420,23 @@ pub const UndumpReader = struct {
         // compactness. Always read varint-by-varint.
         const li_len = try self.readU32();
         const lineinfo = try alloc.alloc(u32, @intCast(li_len));
-        for (0..li_len) |i| {
-            lineinfo[i] = try self.readU32();
+        errdefer alloc.free(lineinfo);
+        var n_li: usize = 0;
+        while (n_li < li_len) : (n_li += 1) {
+            lineinfo[n_li] = try self.readU32();
         }
 
         // 14. Locals: length prefix, then each as (name, reg, startpc, endpc).
         const lv_len = try self.readU32();
         const locvars = try alloc.alloc(bc.LocVar, @intCast(lv_len));
-        for (0..lv_len) |i| {
+        errdefer alloc.free(locvars); // names alias the input buffer
+        var n_lv: usize = 0;
+        while (n_lv < lv_len) : (n_lv += 1) {
             const lv_name = try self.readStringDedup();
             const lv_reg = try self.readByte();
             const lv_startpc = try self.readU32();
             const lv_endpc = try self.readU32();
-            locvars[i] = .{
+            locvars[n_lv] = .{
                 .name = lv_name,
                 .reg = lv_reg,
                 .startpc = lv_startpc,
@@ -417,19 +447,16 @@ pub const UndumpReader = struct {
         // Build the Proto. Fields not present in the binary format get
         // their defaults. String constants were interned through `internFn`
         // during `undumpConstant` (if the callback was set), so the constant
-        // pool is immediately usable. `constants_resolved` stays false: the
-        // VM still needs to run `resolveProtoConstants` on first execution to
-        // build the `resolved_values` runtime array (PUC Lua stores constants
-        // in runtime TValue format directly; we defer that to first use).
+        // pool is immediately usable and VM-owned (or `undefined` without a
+        // callback — the caller must patch those before execution). The
+        // readiness bookkeeping lives on the tree owner attached by
+        // `undumpChunk` (the production entry); protos returned from
+        // undumpProto directly (unit tests) stay owner-less and must be
+        // freed via `bc.destroyProtoTree`.
         const proto = try alloc.create(bc.Proto);
         proto.* = .{
             .code = code,
             .k = k,
-            // The VM resolves `.str` constants to VM-interned pointers on
-            // first execution. Until then, string constants are `undefined`
-            // and `constants_resolved` stays false.
-            .constants_resolved = false,
-            .resolved_values = &.{},
             .p = protos,
             .upvalues = upvalues,
             .lineinfo = lineinfo,
@@ -452,7 +479,10 @@ pub const UndumpReader = struct {
     // --- Entry point ---
 
     /// Deserialize a complete binary chunk: 40-byte header, upvalue count
-    /// for the main function, then the main Proto tree.
+    /// for the main function, then the main Proto tree. Attaches the tree's
+    /// `ProtoTreeOwner` (ref_count = 1, the producing reference held by the
+    /// caller) before returning, so the tree is production-shaped the moment
+    /// it exists: VM-owned k strings, every proto's `.tree` bound.
     ///
     /// The single byte after the header is the main function's upvalue count
     /// (PUC writes `sizeupvalues` here). We read it for cursor alignment but
@@ -464,7 +494,23 @@ pub const UndumpReader = struct {
         try self.checkHeader();
         const upvalue_count = try self.readByte();
         _ = upvalue_count; // body already has the right count
-        return try self.undumpProto();
+        const root = try self.undumpProto();
+        // Attach the tree owner. Its creation is the only fallible step
+        // after a fully successful deserialize; on failure the finished
+        // (still owner-less) tree is freed structurally. Undumped k
+        // strings were interned into the VM during undumpConstant (or are
+        // `undefined` in no-callback tests) — never tree-owned.
+        errdefer bc.destroyProtoTree(self.alloc, root, true);
+        const owner = try self.alloc.create(bc.ProtoTreeOwner);
+        owner.* = .{
+            .root = root,
+            .allocator = self.alloc,
+            .ref_count = 1,
+            // Constants interned into the VM at deserialization time.
+            .k_strings_vm_owned = true,
+        };
+        bc.bindOwnerRecursive(root, owner);
+        return root;
     }
 };
 
@@ -619,10 +665,9 @@ test "UndumpReader: undumpProto round-trips a simple Proto" {
     var r = UndumpReader.init(std.testing.allocator, w.buf.items);
     defer r.deinit();
     const out = try r.undumpProto();
-    defer {
-        out.deinit(std.testing.allocator);
-        std.testing.allocator.destroy(out);
-    }
+    // undumpProto does not attach an owner (undumpChunk does); free the
+    // tree structurally. k strings are VM-owned/undefined on this path.
+    defer bc.destroyProtoTree(std.testing.allocator, out, true);
 
     try std.testing.expectEqualSlices(u8, "test.lua", out.source_name);
     try std.testing.expectEqualSlices(u8, "test", out.name);
@@ -644,8 +689,9 @@ test "UndumpReader: undumpProto round-trips a simple Proto" {
     try std.testing.expectEqual(@as(u32, 1), out.lineinfo[0]);
     try std.testing.expectEqual(@as(u32, 2), out.lineinfo[1]);
     try std.testing.expectEqual(@as(usize, 0), out.locvars.len);
-    // Defaults for VM-resolved fields.
-    try std.testing.expectEqual(false, out.constants_resolved);
+    // Defaults for VM-resolved fields: no owner/readiness until
+    // undumpChunk binds the tree / the VM resolves constants.
+    try std.testing.expect(out.tree == null);
     try std.testing.expectEqual(@as(usize, 0), out.resolved_values.len);
     try std.testing.expectEqual(@as(usize, 0), out.live_reg_top.len);
 }
@@ -690,10 +736,9 @@ test "UndumpReader: undumpProto round-trips vararg + upvalues + locvars" {
     var r = UndumpReader.init(std.testing.allocator, w.buf.items);
     defer r.deinit();
     const out = try r.undumpProto();
-    defer {
-        out.deinit(std.testing.allocator);
-        std.testing.allocator.destroy(out);
-    }
+    // undumpProto does not attach an owner (undumpChunk does); free the
+    // tree structurally. k strings are VM-owned/undefined on this path.
+    defer bc.destroyProtoTree(std.testing.allocator, out, true);
 
     try std.testing.expectEqual(true, out.is_vararg);
     try std.testing.expectEqual(@as(?u8, 5), out.vararg_table_reg);
@@ -746,10 +791,7 @@ test "UndumpReader: undumpChunk round-trips a full chunk" {
     var r = UndumpReader.init(std.testing.allocator, w.buf.items);
     defer r.deinit();
     const out = try r.undumpChunk();
-    defer {
-        out.deinit(std.testing.allocator);
-        std.testing.allocator.destroy(out);
-    }
+    defer out.tree.?.release(); // frees the whole tree + owner
 
     try std.testing.expectEqualSlices(u8, "chunk.lua", out.source_name);
     try std.testing.expectEqualSlices(u8, "main", out.name);
@@ -820,10 +862,9 @@ test "UndumpReader: undumpProto round-trips nested protos" {
     var r = UndumpReader.init(std.testing.allocator, w.buf.items);
     defer r.deinit();
     const out = try r.undumpProto();
-    defer {
-        out.deinit(std.testing.allocator);
-        std.testing.allocator.destroy(out);
-    }
+    // undumpProto does not attach an owner (undumpChunk does); free the
+    // tree structurally. k strings are VM-owned/undefined on this path.
+    defer bc.destroyProtoTree(std.testing.allocator, out, true);
 
     try std.testing.expectEqualSlices(u8, "outer", out.name);
     try std.testing.expectEqual(@as(usize, 1), out.p.len);

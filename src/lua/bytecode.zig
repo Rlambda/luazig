@@ -439,6 +439,170 @@ pub const LocVar = struct {
 };
 
 // ---------------------------------------------------------------------------
+// ProtoTreeOwner — refcounted per-tree lifetime owner (P16.10b Tasks 4/5/9)
+// ---------------------------------------------------------------------------
+//
+// Ownership model (mirrors how PUC Lua frees Proto trees via luaF_freeprotoL
+// from freeobj, extended for luazig's shared closures):
+//
+//   * Exactly ONE owner per compiled Proto tree (a root plus every proto
+//     reachable through `p`). It is created at the two production
+//     construction funnels — `ProtoBuilder.finish()` (text compilation) and
+//     `UndumpReader.undumpChunk()` (binary load) — with ref_count = 1, the
+//     "producer's reference" held by whoever receives the root proto.
+//
+//   * EVERY Closure created over any proto of the tree retains the owner
+//     (`ref_count += 1`). This is what makes OP_CLOSURE sharing safe: many
+//     closures may reference one child proto, child closures routinely
+//     outlive the root closure, and the tree must stay alive while ANY
+//     closure of ANY of its nodes lives.
+//
+//   * `gcFreeObject(.closure)` releases the owner's reference. The LAST
+//     release performs the full recursive tree deinit EXACTLY ONCE and
+//     destroys the owner struct.
+//
+// Structural ownership rules for the deinit:
+//   - arrays (code, k, p, upvalues, lineinfo, locvars, live_reg_top,
+//     resolved_values) and the Proto structs themselves are owned by the
+//     tree and freed by the tree deinit;
+//   - interned LuaStrings are owned by the VM string table and are NEVER
+//     destroyed by the tree deinit (`k_strings_vm_owned` records when the
+//     k pool stopped being tree-owned; see below);
+//   - debug lexeme slices (name, source_name, locvar/upvalue names) are
+//     borrowed from the source bytes and are not freed here (their backing
+//     is owned by `source_backing`, P16.10b Task 6).
+//
+// The `k_strings_vm_owned` flag is the structural replacement for the old
+// per-proto `constants_resolved` boolean's *ownership* meaning:
+//   - text-compiled trees are born with seed-0 LuaStrings owned by the tree
+//     (flag = false); constant resolution interns them into the VM and
+//     flips the flag tree-wide;
+//   - undumped trees intern their constants into the VM during
+//     deserialization, so the flag is true from construction.
+//
+// The `constants_resolved` flag on the OWNER carries the *readiness*
+// meaning (resolved_values built, k pool canonical) tree-wide: resolution
+// is all-or-nothing for the whole tree.
+
+pub const ProtoTreeOwner = struct {
+    /// Tree root (the proto returned to the loader). Only used for the
+    /// deinit walk and debugging; every proto in the tree also points back
+    /// here via `Proto.tree`.
+    root: *Proto,
+    /// Allocator the tree was compiled/undumped with. Trees are created
+    /// inside exactly one allocator family (the VM's, or the CLI's
+    /// runtime allocator which is the same family); the owner frees the
+    /// tree with THIS allocator regardless of which VM releases it last.
+    allocator: std.mem.Allocator,
+    /// Number of live references (producing reference + one per Closure).
+    /// Reaching 0 in `release` performs the one-time tree deinit.
+    ref_count: usize = 1,
+    /// VM identity binding (P16.10b Task 8): the `*Vm` (as `*anyopaque`
+    /// to avoid a circular import) this tree's constants were interned
+    /// into / this tree executes on. No production path shares a tree
+    /// across VMs (see tools/ownership/proto-inventory.json); the field
+    /// exists so closure-creation boundaries can Debug-assert the
+    /// invariant cheaply.
+    vm: ?*anyopaque = null,
+    /// Source backing (P16.10b Task 6, milestone 2): keeps alive the bytes
+    /// that the tree's debug lexeme slices borrow. Dropped at last release.
+    source_backing: SourceBacking = .none,
+    /// See the struct doc above: true once the k pool's `.str` pointers
+    /// belong to the VM string table (undumped trees: from birth;
+    /// text-compiled trees: flipped by constant resolution, tree-wide).
+    k_strings_vm_owned: bool = false,
+    /// Readiness (tree-wide): all protos of this tree have their
+    /// `resolved_values` built and their k pool is VM-canonical. Flipped
+    /// once, never reset. Replaces the per-proto `constants_resolved`.
+    constants_resolved: bool = false,
+
+    /// What keeps the source bytes alive for a tree that borrows debug
+    /// slices from them (P16.10b Task 6). Populated by the load paths at
+    /// owner creation; consumed (dropped) by the last release.
+    pub const SourceBacking = union(enum) {
+        /// Tree borrows nothing (e.g. undumped non-fixed trees whose name
+        /// slices were duplicated, or unit-test trees over static bytes).
+        none,
+        /// A GC-managed LuaString whose bytes the tree borrows (load from
+        /// a Lua string, fixed-buffer undump). NOT owned — never destroyed
+        /// here; the VM string table / GC owns it. Dropping the backing
+        /// only removes the tree's pin so the GC may reclaim the string
+        /// once no other reference exists. Retaining is the loader's job.
+        pinned_string: *vm.LuaString,
+        /// Heap bytes owned by the tree (reader-fn buffers, shebang
+        /// prefixed buffers, caller-owned name/bytes copies for the
+        /// Zig/C API compile paths). Freed at last release.
+        owned_bytes: []u8,
+    };
+
+    /// Add one reference (a Closure was created over this tree).
+    pub fn retain(self: *ProtoTreeOwner) void {
+        self.ref_count += 1;
+    }
+
+    /// Drop one reference. The LAST release performs the full recursive
+    /// tree deinit exactly once and destroys the owner struct. `void`:
+    /// freeing with the creating allocator cannot fail.
+    pub fn release(self: *ProtoTreeOwner) void {
+        std.debug.assert(self.ref_count > 0);
+        self.ref_count -= 1;
+        if (self.ref_count != 0) return;
+        const alloc = self.allocator;
+        // Structural deinit of the whole tree (arrays + structs). Interned
+        // LuaStrings are NEVER destroyed here — `k_strings_vm_owned` says
+        // whether the k pool still belongs to the tree.
+        destroyProtoTree(alloc, self.root, self.k_strings_vm_owned);
+        // Source backing (Task 6): drop owned bytes; unpinned strings are
+        // left to the GC (we never held an owning reference).
+        switch (self.source_backing) {
+            .none => {},
+            .pinned_string => |s| {
+                // Unpin only if still registered with the VM's pin list is
+                // the VM's job (milestone 2 wires this); a plain unpinned
+                // owner must not touch GC objects.
+                _ = s;
+            },
+            .owned_bytes => |bytes| alloc.free(bytes),
+        }
+        alloc.destroy(self);
+    }
+};
+
+/// Free an entire proto tree structurally: every array, every seed-0
+/// string constant that is still tree-owned, every Proto struct —
+/// recursively. This is the single deinit implementation shared by
+/// `ProtoTreeOwner.release` (production) and construction error paths
+/// (Codegen.deinit leftovers, undump partial trees) that have no owner.
+///
+/// `k_strings_vm_owned` mirrors `ProtoTreeOwner.k_strings_vm_owned`: when
+/// false (unresolved text tree) the `.str` constants are seed-0 LuaStrings
+/// owned by the tree and destroyed here; when true they belong to the VM
+/// string table (or are `undefined` in no-callback undump unit tests) and
+/// are never touched.
+pub fn destroyProtoTree(alloc: std.mem.Allocator, root: *Proto, k_strings_vm_owned: bool) void {
+    alloc.free(root.code);
+    if (!k_strings_vm_owned) {
+        for (root.k) |c| {
+            if (c == .str) vm.destroyLuaString(alloc, c.str);
+        }
+    }
+    alloc.free(root.k);
+    // Recursive call frees each child's subtree INCLUDING the child struct.
+    for (root.p) |child| {
+        destroyProtoTree(alloc, child, k_strings_vm_owned);
+    }
+    alloc.free(root.p);
+    alloc.free(root.upvalues);
+    alloc.free(root.lineinfo);
+    alloc.free(root.locvars);
+    if (root.live_reg_top.len > 0) alloc.free(root.live_reg_top);
+    if (root.resolved_values.len > 0) alloc.free(root.resolved_values);
+    alloc.destroy(root);
+    // name/source_name/locvar names are borrowed from the source bytes;
+    // they are NOT freed here (backing owned by the tree owner, Task 6).
+}
+
+// ---------------------------------------------------------------------------
 // Proto — the compiled function object
 // ---------------------------------------------------------------------------
 
@@ -446,24 +610,26 @@ pub const Proto = struct {
     /// Bytecode instructions.
     code: []const Instruction,
     /// Deduplicated constant pool. Mutable so the VM can resolve string
-    /// constants in-place: at first execution, compile-time `*LuaString`
+    /// constants in-place: at adoption, compile-time `*LuaString`
     /// objects (hashed with seed 0) are replaced by VM-interned pointers
     /// (hashed with the VM's per-instance seed). After resolution,
-    /// `bcConstToValue` returns string constants directly — no re-hashing
-    /// on every GETTABUP/GETFIELD/SETFIELD execution. This mirrors PUC Lua,
-    /// where the compiler interns strings through the same string table as
-    /// the runtime, so constant pool strings are already interned.
+    /// string constants are owned by the VM's intern table — whether the
+    /// pool is still tree-owned is recorded STRUCTURALLY on the tree
+    /// owner (`ProtoTreeOwner.k_strings_vm_owned`), never per-proto.
     k: []Constant,
-    /// True after the VM has resolved all `.str` constants to VM-interned
-    /// pointers. When true, string constants are owned by the VM's intern
-    /// table (not by this Proto) and must NOT be freed in `deinit`.
-    constants_resolved: bool = false,
+    /// The tree this proto belongs to. Null only while the tree is under
+    /// construction (before `ProtoBuilder.finish()` binds the finished
+    /// tree / before `undumpChunk` binds the deserialized tree). Every
+    /// production proto is bound for its whole observable lifetime.
+    tree: ?*ProtoTreeOwner = null,
     /// Pre-resolved constant values in runtime `Value` format. Populated
-    /// lazily by `resolveProtoConstants` on first execution. After
-    /// resolution, opcode handlers read `resolved_values[kid]` directly —
-    /// no per-execution switch on `Constant` tag. This mirrors PUC Lua,
-    /// where `TValue k[]` in Proto is already in runtime format
-    /// (lobject.h:614). Empty slice until resolved; freed in `deinit`.
+    /// tree-wide by constant resolution (`resolveProtoConstants`) before
+    /// first execution. After resolution, opcode handlers read
+    /// `resolved_values[kid]` directly — no per-execution switch on
+    /// `Constant` tag. This mirrors PUC Lua, where `TValue k[]` in Proto
+    /// is already in runtime format (lobject.h:614). Empty until the tree
+    /// is adopted; freed by the tree deinit. Readiness lives on the OWNER
+    /// (`constants_resolved`), not per-proto.
     resolved_values: []vm.Value = &.{},
     /// Inner prototypes (for OP_CLOSURE — child functions).
     p: []const *Proto,
@@ -498,35 +664,10 @@ pub const Proto = struct {
     /// table at function entry and stores it in this register.
     vararg_table_reg: ?u8 = null,
 
-    /// Deinitialize all owned data. Call once when the Proto is no longer
-    /// referenced. Inner protos (in `p`) are recursively deinitialized.
-    pub fn deinit(self: *Proto, alloc: std.mem.Allocator) void {
-        alloc.free(self.code);
-        // Constant pool: free owned strings — but only if they haven't been
-        // resolved to VM-interned pointers. After resolution, string
-        // constants are owned by the VM's string intern table, not by this
-        // Proto (matching PUC Lua's ownership model where TString objects
-        // belong to the global string table, not to the Proto).
-        if (!self.constants_resolved) {
-            for (self.k) |c| {
-                if (c == .str) vm.destroyLuaString(alloc, c.str);
-            }
-        }
-        alloc.free(self.k);
-        // Recursively deinitialize inner protos.
-        for (self.p) |child| {
-            child.deinit(alloc);
-            alloc.destroy(child);
-        }
-        alloc.free(self.p);
-        alloc.free(self.upvalues);
-        alloc.free(self.lineinfo);
-        alloc.free(self.locvars);
-        if (self.live_reg_top.len > 0) alloc.free(self.live_reg_top);
-        if (self.resolved_values.len > 0) alloc.free(self.resolved_values);
-        // name/source_name/locvar names are borrowed from the source arena;
-        // they are NOT freed here.
-    }
+    // NOTE: there is no `deinit` method. The tree deinit is STRUCTURAL and
+    // lives in `destroyProtoTree` above, invoked either through
+    // `ProtoTreeOwner.release` (production: the last closure of the tree
+    // died) or directly on construction error paths (no owner exists yet).
 };
 
 // ---------------------------------------------------------------------------
@@ -576,8 +717,15 @@ pub const ProtoBuilder = struct {
         self.code.deinit(self.alloc);
         self.lineinfo.deinit(self.alloc);
         self.const_pool.deinit(self.alloc);
-        // Inner protos are owned by the final Proto; if finish() was not
-        // called, they leak. Callers should always finish().
+        // Finished-but-unclaimed protos (compile failed after a child
+        // finished but before this builder's own finish() adopted them)
+        // still carry their own per-subtree owners with exactly the one
+        // producing reference. Release each: the subtree frees itself and
+        // its owner. After a successful finish() this list is empty
+        // (toOwnedSlice). (P16.10b Task 4/C4 — was a partial-tree leak.)
+        for (self.protos.items) |child| {
+            child.tree.?.release();
+        }
         self.upvalues.deinit(self.alloc);
         self.locvars.deinit(self.alloc);
     }
@@ -686,9 +834,16 @@ pub const ProtoBuilder = struct {
     }
 
     /// Add an inner proto (child function). Returns its index for OP_CLOSURE.
+    /// The child must be a freshly finished proto tree still holding its
+    /// producing reference (ref_count == 1); this builder takes over that
+    /// reference. On append failure the child is released so the finished
+    /// subtree cannot leak (P16.10b Task 4 error-path hygiene).
     pub fn addProto(self: *ProtoBuilder, child: *Proto) !u8 {
         const idx: u8 = @intCast(self.protos.items.len);
-        try self.protos.append(self.alloc, child);
+        self.protos.append(self.alloc, child) catch |e| {
+            child.tree.?.release();
+            return e;
+        };
         return idx;
     }
 
@@ -719,18 +874,42 @@ pub const ProtoBuilder = struct {
         self.locvars.items[index].endpc = endpc;
     }
 
-    /// Finalize: transfer all data into a heap-allocated Proto.
+    /// Finalize: transfer all data into a heap-allocated Proto, create the
+    /// per-tree `ProtoTreeOwner`, and bind the whole tree (this proto plus
+    /// every adopted descendant) to it. The returned root's owner carries
+    /// ref_count = 1 — the PRODUCER's reference, owned by whoever receives
+    /// the proto; closure creation retains, failure paths release.
     /// The ProtoBuilder is consumed and should be deinit'd after.
     pub fn finish(self: *ProtoBuilder) !*Proto {
         const alloc = self.alloc;
         const proto = try alloc.create(Proto);
+        errdefer alloc.destroy(proto);
         const code_slice = try self.code.toOwnedSlice(alloc);
+        errdefer alloc.free(code_slice);
         const k_slice = try self.const_pool.items.toOwnedSlice(alloc);
+        errdefer {
+            // The pool is still tree-owned here (nothing resolves constants
+            // before a tree exists): destroy the seed-0 strings with it.
+            for (k_slice) |c| {
+                if (c == .str) vm.destroyLuaString(alloc, c.str);
+            }
+            alloc.free(k_slice);
+        }
         const p_slice = try self.protos.toOwnedSlice(alloc);
+        errdefer {
+            // Adopted children still carry their own per-subtree owners
+            // (rebinding happens only after the new owner exists below).
+            for (p_slice) |child| child.tree.?.release();
+            alloc.free(p_slice);
+        }
         const upv_slice = try self.upvalues.toOwnedSlice(alloc);
+        errdefer alloc.free(upv_slice);
         const li_slice = try self.lineinfo.toOwnedSlice(alloc);
+        errdefer alloc.free(li_slice);
         const lv_slice = try self.locvars.toOwnedSlice(alloc);
+        errdefer alloc.free(lv_slice);
         const lrt_slice = try self.live_reg_top.toOwnedSlice(alloc);
+        errdefer if (lrt_slice.len > 0) alloc.free(lrt_slice);
         proto.* = .{
             .code = code_slice,
             .k = k_slice,
@@ -748,6 +927,24 @@ pub const ProtoBuilder = struct {
             .line_defined = self.line_defined,
             .last_line_defined = self.last_line_defined,
         };
+        // ── Tree binding ──
+        // Every adopted child was finished by its own builder and therefore
+        // carries a per-subtree owner with ref_count == 1 (its producing
+        // reference, which this builder now holds). Detach those owners —
+        // the reference transfers to THIS tree's owner — then bind every
+        // proto in the tree to the new owner. `alloc.create` below is the
+        // last fallible operation; everything after it is stores and frees.
+        const owner = try alloc.create(ProtoTreeOwner);
+        owner.* = .{
+            .root = proto,
+            .allocator = alloc,
+            .ref_count = 1,
+            // Text-compiled trees are born owning their seed-0 constants;
+            // resolution flips this tree-wide (see ProtoTreeOwner doc).
+            .k_strings_vm_owned = false,
+        };
+        for (p_slice) |child| detachOwnerGroup(alloc, child);
+        bindOwnerRecursive(proto, owner);
         // Transfer ownership of the const pool's internal maps to nothing —
         // they were temporary dedup indices. The actual constants are now in
         // proto.k. We need to clear the maps without freeing the strings
@@ -772,6 +969,33 @@ pub const ProtoBuilder = struct {
         return proto;
     }
 };
+
+/// Detach a finished subtree's own owner at adoption time (called from
+/// `ProtoBuilder.finish` for every adopted child). The child's owner holds
+/// exactly its producing reference (ref_count == 1 — no closures can exist
+/// for an un-adopted subtree); destroy the owner STRUCT without touching
+/// the tree, and null the subtree's `tree` pointers so the subsequent
+/// `bindOwnerRecursive` rebinds them to the parent's new owner.
+fn detachOwnerGroup(alloc: std.mem.Allocator, group_root: *Proto) void {
+    const old = group_root.tree orelse return;
+    std.debug.assert(old.ref_count == 1); // only the producer's reference
+    clearTreePtrs(group_root);
+    alloc.destroy(old);
+}
+
+/// Null every `.tree` pointer in a subtree (used while detaching an owner
+/// group; the pointers are immediately rebind by bindOwnerRecursive).
+fn clearTreePtrs(proto: *Proto) void {
+    proto.tree = null;
+    for (proto.p) |child| clearTreePtrs(child);
+}
+
+/// Point every proto of a subtree at `owner` (post-detach rebinding).
+/// Also used by `undump.undumpChunk` to bind a freshly deserialized tree.
+pub fn bindOwnerRecursive(proto: *Proto, owner: *ProtoTreeOwner) void {
+    proto.tree = owner;
+    for (proto.p) |child| bindOwnerRecursive(child, owner);
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -841,10 +1065,7 @@ test "proto builder: emit and finish" {
     builder.checkStack(3);
 
     const proto = try builder.finish();
-    defer {
-        proto.deinit(std.testing.allocator);
-        std.testing.allocator.destroy(proto);
-    }
+    defer proto.tree.?.release(); // frees the whole tree + owner
 
     try std.testing.expectEqual(@as(usize, 4), proto.code.len);
     try std.testing.expectEqual(@as(usize, 2), proto.k.len);
@@ -865,10 +1086,7 @@ test "proto builder: jump backpatching" {
     builder.patchJump(jmp_pc, target_pc);
 
     const proto = try builder.finish();
-    defer {
-        proto.deinit(std.testing.allocator);
-        std.testing.allocator.destroy(proto);
-    }
+    defer proto.tree.?.release();
 
     // The jump should skip 1 instruction (the LOADK).
     const offset = proto.code[jmp_pc].jumpOffset();

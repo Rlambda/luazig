@@ -132,6 +132,11 @@ fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: 
             lMessage(progname, msg);
             return error.RuntimeError;
         };
+        // The undumped tree carries its producing reference (P16.10b
+        // Task 4): release it when this function is done with the raw
+        // proto — the executing closure created inside runBytecode takes
+        // its own retained reference.
+        defer loaded_proto.tree.?.release();
         // Pre-resolve constants (strings already interned via callback).
         vm.preResolveUndumpedConstants(loaded_proto) catch return error.OutOfMemory;
         // Execute directly with _ENV = global_env.
@@ -176,6 +181,10 @@ fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: 
                 lMessage(progname, cg_bc.diagString());
                 return error.CodegenError;
             };
+            // The compiled tree carries its producing reference (P16.10b
+            // Task 4); the executing closure inside runBytecode retains
+            // its own. Release ours on every exit of this path.
+            defer proto.tree.?.release();
             // If --dump-bytecode was requested, print disassembly and exit.
             if (dump_bytecode) {
                 var out = stdio.stdout();
@@ -740,7 +749,10 @@ fn doREPL(
                                 const src2 = lua.internal.Source{ .name = "=stdin", .bytes = multiline_buf.items };
                                 const eof_result = tryCompile(aalloc, vm, src2);
                                 switch (eof_result) {
-                                    .proto => {},
+                                    // The recompiled proto is dropped without
+                                    // execution — release its producing
+                                    // reference so the tree frees (P16.10b).
+                                    .proto => |eof_p| eof_p.tree.?.release(),
                                     .oom => break,
                                     .err_msg => |eof_msg| {
                                         var errw = stdio.stderr();
@@ -760,6 +772,11 @@ fn doREPL(
         }
 
         if (proto) |p| {
+            // The tree's producing reference is ours; the executing closure
+            // inside runBytecode retains its own. Release ours on every exit
+            // of this block (P16.10b Task 4 — REPL no longer leaks a tree
+            // per compiled line).
+            defer p.tree.?.release();
             // Execute the compiled chunk using the shared _ENV upvalue cell.
             // PUC doREPL calls docall which sets msghandler as errfunc
             // (lua.c:155-166). Without this, errors in REPL show no traceback.

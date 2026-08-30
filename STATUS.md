@@ -3918,6 +3918,36 @@ nextvar 10/10; 58-62 byte-identical; mm_check IDENTICAL; gc/gengc/closure/
 coroutine/events/errors 0/0 оба рантайма; leak_bench; native_mem BOUNDED;
 CallFrame ≤104; Node 32B.
 
+## P16.10b (продолжение) — корень locals.lua SIGSEGV найден (2026-08-30)
+
+### Расследование матричного -11 (локализация через coredump + бисект)
+1. Backtrace (coredumpctl, gdb): SIGSEGV в luaStringEq ← nodeLookupStr ←
+   fastTm ← **gcWeakMode ← gcPropagateOne** ← gcMinorCollection — маркировка
+   таблицы с **висячей метатаблицей** (mt с мусорным gc_index — освобождена
+   в прошлом цикле).
+2. Найдены и закрыты 3 ДУБЛИРОВАННЫХ varargs-слайса `[func_slot-nextra..]`
+   без учёта vararg-TABLE-режима (аргументы при base+numparams, НЕ ниже
+   func_slot): gcMarkMutableRoots, select-vararg (opReturn), gcPropagateOne
+   parked-thread walk (591f120, e33daf6). Для таблиц-режима старый слайс
+   читал ЧУЖИЕ регистры → маркировал мусор как объекты → dead-mt.
+   frameVarargs() теперь единый mode-aware accessor.
+3. ПОСЛЕ varargs-фиксов матрица ВСЁ ЕЩЁ -11 на locals → глубже:
+   минимальный репро /tmp/tbcz.lua (инструмент: tools/known_divergence_tbc_close_yield.lua):
+   ```
+   PUC:  k2=false "attempt to yield across a C-call boundary"
+   ZIG:  k2=false "A:2" (yield из __close при ошибке РАЗРЕШЁН; res.n=2)
+   ```
+   ЦЕПОЧКА PUC: ошибка в корутине без внутреннего pcall → luaD_throw (нет
+   errorJmp) → luaE_resetthread → luaD_closeprotected → luaF_close(yy=0,
+   lfunc.c:119 luaD_callnoyield) → yield из __close = ОШИБКА C-boundary.
+   luazig: trampoline failed-path НЕ выполняет noyield-закрытие TBC
+   корутины; close идёт yieldable → неполное закрытие → в RF при GC-тайминге
+   мусорные ссылки → SIGSEGV (в dbg — assert; в обоих — res.n=2).
+4. СЛЕДУЮЩИЙ ШАГ (открыт): при unrecoverable ошибке корутины закрыть её TBC
+   noyield-путём (аналог resetthread-closeprotected), yield из __close в
+   этом пути → "attempt to yield across a C-call boundary" (ldo.c:125-148,
+   lstate.c resetthread, lfunc.c:108-120).
+
 ## История закрытых фаз
 
 P3–P15.12 — краткая сводка. P15.13+ — см. «История разработки» выше.

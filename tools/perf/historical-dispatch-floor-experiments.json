@@ -1,0 +1,217 @@
+{
+  "source_head": "03422b1",
+  "source_head_description": "P16.10 T1+T2+T3: dispatch floor measurement (pre-T6+T8 cleanups, baseline 75 instr/iter)",
+  "baseline_instr_per_iter": 75.02,
+  "experiments": {
+    "A_stack_ptr_check": {
+      "description": "bc_stack.ptr != stack_ptr refresh in inner loop",
+      "baseline_instr_per_iter": 75.02,
+      "removed_instr_per_iter": 72.03,
+      "delta_instr_per_iter": 3.0,
+      "baseline_cycles_per_iter": 13.52,
+      "removed_cycles_per_iter": 13.45,
+      "delta_cycles_per_iter": 0.06,
+      "baseline_branch_misses_per_iter": 0.001,
+      "removed_branch_misses_per_iter": 0.001,
+      "delta_branch_misses_per_iter": 0.0,
+      "measured": {
+        "instr_per_iter": 72.025802312,
+        "cycles_per_iter": 13.452304998,
+        "branch_misses_per_iter": 0.000996722,
+        "all_runs": [
+          {
+            "instructions": 36018043559,
+            "cycles": 6734744999,
+            "branch-misses": 498361
+          },
+          {
+            "instructions": 36011418413,
+            "cycles": 6720816172,
+            "branch-misses": 498396
+          },
+          {
+            "instructions": 36012901156,
+            "cycles": 6726152499,
+            "branch-misses": 498291
+          }
+        ]
+      }
+    },
+    "B_vmstats_gate": {
+      "description": "if (self.stats.enabled) histogram check when disabled",
+      "baseline_instr_per_iter": 75.02,
+      "removed_instr_per_iter": 73.03,
+      "delta_instr_per_iter": 2.0,
+      "baseline_cycles_per_iter": 13.52,
+      "removed_cycles_per_iter": 13.98,
+      "delta_cycles_per_iter": -0.46,
+      "baseline_branch_misses_per_iter": 0.001,
+      "removed_branch_misses_per_iter": 0.001,
+      "delta_branch_misses_per_iter": -0.0,
+      "measured": {
+        "instr_per_iter": 73.025534576,
+        "cycles_per_iter": 13.977912662,
+        "branch_misses_per_iter": 0.000997772,
+        "all_runs": [
+          {
+            "instructions": 36519088992,
+            "cycles": 7641646742,
+            "branch-misses": 498886
+          },
+          {
+            "instructions": 36512767288,
+            "cycles": 6988956331,
+            "branch-misses": 498860
+          },
+          {
+            "instructions": 36503297296,
+            "cycles": 6982235169,
+            "branch-misses": 501384
+          }
+        ]
+      }
+    },
+    "C_dispatch_pc": {
+      "description": "self.dispatch_pc = ctx.pc publication",
+      "baseline_instr_per_iter": 75.02,
+      "removed_instr_per_iter": 74.02,
+      "delta_instr_per_iter": 1.0,
+      "baseline_cycles_per_iter": 13.52,
+      "removed_cycles_per_iter": 14.33,
+      "delta_cycles_per_iter": -0.81,
+      "baseline_branch_misses_per_iter": 0.001,
+      "removed_branch_misses_per_iter": 0.001,
+      "delta_branch_misses_per_iter": -0.0,
+      "measured": {
+        "instr_per_iter": 74.021857252,
+        "cycles_per_iter": 14.3315535,
+        "branch_misses_per_iter": 0.000997582,
+        "all_runs": [
+          {
+            "instructions": 37003292323,
+            "cycles": 7165776750,
+            "branch-misses": 501791
+          },
+          {
+            "instructions": 37010928626,
+            "cycles": 7104886302,
+            "branch-misses": 498786
+          },
+          {
+            "instructions": 37016827314,
+            "cycles": 7216784691,
+            "branch-misses": 498791
+          }
+        ]
+      }
+    },
+    "D_sigint": {
+      "description": "SIGINT countdown/check amortization",
+      "baseline_instr_per_iter": 75.02,
+      "removed_instr_per_iter": 68.02,
+      "delta_instr_per_iter": 7.01,
+      "baseline_cycles_per_iter": 13.52,
+      "removed_cycles_per_iter": 13.81,
+      "delta_cycles_per_iter": -0.3,
+      "baseline_branch_misses_per_iter": 0.001,
+      "removed_branch_misses_per_iter": 0.0,
+      "delta_branch_misses_per_iter": 0.001,
+      "measured": {
+        "instr_per_iter": 68.019383354,
+        "cycles_per_iter": 13.813553048,
+        "branch_misses_per_iter": 2.0396e-05,
+        "all_runs": [
+          {
+            "instructions": 34015470368,
+            "cycles": 6906776524,
+            "branch-misses": 10062
+          },
+          {
+            "instructions": 34009691677,
+            "cycles": 6950164551,
+            "branch-misses": 10198
+          },
+          {
+            "instructions": 34001340955,
+            "cycles": 6767323410,
+            "branch-misses": 13112
+          }
+        ]
+      }
+    },
+    "E_hooks_gate": {
+      "description": "hooks_active_cached gate (when no hooks active)",
+      "baseline_instr_per_iter": 75.02,
+      "removed_instr_per_iter": 73.03,
+      "delta_instr_per_iter": 2.0,
+      "baseline_cycles_per_iter": 13.52,
+      "removed_cycles_per_iter": 13.89,
+      "delta_cycles_per_iter": -0.38,
+      "baseline_branch_misses_per_iter": 0.001,
+      "removed_branch_misses_per_iter": 0.001,
+      "delta_branch_misses_per_iter": 0.0,
+      "measured": {
+        "instr_per_iter": 73.02594572,
+        "cycles_per_iter": 13.893410218,
+        "branch_misses_per_iter": 0.000997078,
+        "all_runs": [
+          {
+            "instructions": 36517916719,
+            "cycles": 7066558538,
+            "branch-misses": 498539
+          },
+          {
+            "instructions": 36512972860,
+            "cycles": 6934123544,
+            "branch-misses": 498556
+          },
+          {
+            "instructions": 36511455406,
+            "cycles": 6946705109,
+            "branch-misses": 498429
+          }
+        ]
+      }
+    },
+    "F_all_removed": {
+      "description": "ALL housekeeping removed (A+B+C+D+E) \u2014 lower bound",
+      "baseline_instr_per_iter": 75.02,
+      "removed_instr_per_iter": 61.02,
+      "delta_instr_per_iter": 14.0,
+      "baseline_cycles_per_iter": 13.52,
+      "removed_cycles_per_iter": 14.45,
+      "delta_cycles_per_iter": -0.93,
+      "baseline_branch_misses_per_iter": 0.001,
+      "removed_branch_misses_per_iter": 0.0,
+      "delta_branch_misses_per_iter": 0.001,
+      "measured": {
+        "instr_per_iter": 61.019894134,
+        "cycles_per_iter": 14.44677149,
+        "branch_misses_per_iter": 1.9376e-05,
+        "all_runs": [
+          {
+            "instructions": 30514290055,
+            "cycles": 7223385745,
+            "branch-misses": 9723
+          },
+          {
+            "instructions": 30509947067,
+            "cycles": 7201555010,
+            "branch-misses": 9581
+          },
+          {
+            "instructions": 30508121133,
+            "cycles": 7233769056,
+            "branch-misses": 9688
+          }
+        ]
+      }
+    },
+    "_additivity_check": {
+      "sum_of_individual_deltas_instr": 15.01,
+      "measured_all_removed_delta_instr": 14.0,
+      "non_additivity_residual": -1.01,
+      "note": "Sum of individual component deltas vs measured all-removed delta. Non-zero residual = non-additive effects (branch layout, register allocation, instruction scheduling changes when multiple components are removed simultaneously). A negative residual means the all-removed measurement is LESS than the sum of parts (synergy \u2014 removing together saves more than the sum). A positive residual means all-removed saves LESS than the sum (interference \u2014 removing together is less beneficial)."
+    }
+  }
+}

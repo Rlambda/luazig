@@ -1,23 +1,23 @@
 {
-  "created_utc": "2026-08-29T22:56:25.737635+00:00",
+  "created_utc": "2026-08-30T00:33:10.968234+00:00",
   "core": "0",
   "workloads": {
     "lua_calls": [
       {
         "symbol": "vm.Vm.runBytecodeDispatch",
-        "overhead_pct": 82.45
+        "overhead_pct": 78.34
       },
       {
         "symbol": "vm.Vm.pushBytecodeExecFrame",
-        "overhead_pct": 12.4
+        "overhead_pct": 16.4
       },
       {
         "symbol": "vm.Vm.syncFrame",
-        "overhead_pct": 3.49
+        "overhead_pct": 3.46
       },
       {
         "symbol": "vm.FrameStack.addOne",
-        "overhead_pct": 1.62
+        "overhead_pct": 1.36
       }
     ],
     "hash_access": [
@@ -245,35 +245,35 @@
     "metamethod_call_noalloc": [
       {
         "symbol": "vm.Vm.runBytecodeDispatch",
-        "overhead_pct": 51.83
-      },
-      {
-        "symbol": "vm.Vm.resolveCallable",
-        "overhead_pct": 12.65
+        "overhead_pct": 52.41
       },
       {
         "symbol": "vm.Vm.pushBytecodeExecFrame",
-        "overhead_pct": 12.24
-      },
-      {
-        "symbol": "vm.Vm.getTmByObj",
-        "overhead_pct": 10.46
+        "overhead_pct": 16.56
       },
       {
         "symbol": "vm.Vm.tryPushSimpleResultMetamethod",
-        "overhead_pct": 10.18
+        "overhead_pct": 10.72
+      },
+      {
+        "symbol": "vm.Vm.getTmByObj",
+        "overhead_pct": 8.93
+      },
+      {
+        "symbol": "vm.Vm.pushResolvedBytecodeClosure",
+        "overhead_pct": 3.87
+      },
+      {
+        "symbol": "vm.Vm.dispatchCalleeActivationHook",
+        "overhead_pct": 1.61
+      },
+      {
+        "symbol": "vm.Vm.tableResize",
+        "overhead_pct": 1.03
       },
       {
         "symbol": "vm.Vm.syncFrame",
         "overhead_pct": 1.03
-      },
-      {
-        "symbol": "vm.FrameStack.addOne",
-        "overhead_pct": 1.02
-      },
-      {
-        "symbol": "vm.Vm.dispatchCalleeActivationHook",
-        "overhead_pct": 0.51
       }
     ],
     "table_alloc_setmetatable": [
@@ -318,5 +318,6 @@
         "overhead_pct": 2.47
       }
     ]
-  }
+  },
+  "note": "metamethod_call_noalloc + lua_calls refreshed post-P16.10a T4+11 (resolveCallable eliminated). Source: tools/perf/profiles/2026-08-30/"
 }

@@ -17,17 +17,20 @@ three parts:
            actual dispatch-branch instructions, jump-table presence/size,
            and handler entry/exit shape (shared tail vs per-handler branch).
 
-  Part 3 — per-component diagnostic deltas (stash-dance experiments).
-           For each generic housekeeping component in the dispatch preamble,
-           measure forloop_only instr/cycles/branch-misses with the component
-           diagnostically removed (throwaway build, measurement only).
-           ALL src/ changes are reverted after each experiment.
+  Part 3 — historical diagnostic component experiments (stash-dance).
+           Measured at the P16.10 T1+T2+T3 era (commit 03422b1, baseline
+           75 instr/iter, BEFORE T6+T8 cleanups). These experiments cannot
+           be re-run on current source because T6+T8 already applied the
+           cleanups they measured. The data is preserved as a historical
+           diagnostic reference in diagnostic_component_experiments with
+           the source revision recorded. Use --stash to force fresh runs
+           (experimental; edit functions may not match current source).
 
 Usage:
-  python3 tools/perf_dispatch_floor.py             # full regenerate
+  python3 tools/perf_dispatch_floor.py             # full regenerate (historical Part 3)
   python3 tools/perf_dispatch_floor.py --no-build  # skip build step
   python3 tools/perf_dispatch_floor.py --runs 7    # more repeated runs
-  python3 tools/perf_dispatch_floor.py --no-stash  # skip Part 3 experiments
+  python3 tools/perf_dispatch_floor.py --stash     # re-run Part 3 experiments (experimental)
 """
 from __future__ import annotations
 
@@ -47,6 +50,7 @@ ZIG_LUA = ROOT / "zig-out" / "bin" / "luazig"
 PUC_LUA = ROOT / "build" / "lua-c" / "lua"
 LUAC_BIN = ROOT / "build" / "lua-c" / "luac"
 OUT = PERF_DIR / "current-dispatch-floor.json"
+HISTORICAL_EXPERIMENTS = PERF_DIR / "historical-dispatch-floor-experiments.json"
 TMP = Path("/tmp/dispatch_floor")
 
 # Steady-state: n and 2n, per-iter = delta (subtracts setup + epilogue).
@@ -548,6 +552,37 @@ def get_cpu_info() -> dict:
     return {"model": model, "flags": flags}
 
 
+def get_binary_identity(binary: Path) -> dict:
+    """Stamp binary identity: sha256, size, mtime for reproducibility tracking."""
+    import hashlib
+    stat = binary.stat()
+    sha = hashlib.sha256(binary.read_bytes()).hexdigest()
+    return {
+        "path": str(binary),
+        "sha256": sha,
+        "size_bytes": stat.st_size,
+        "mtime_unix": stat.st_mtime,
+    }
+
+
+def load_historical_experiments() -> dict:
+    """Load historical stash-dance experiments from the versioned file.
+
+    These experiments were measured at the P16.10 T1+T2+T3 era (commit
+    03422b1, baseline 75 instr/iter, BEFORE the T6 stack_ptr removal and
+    T8 SIGINT redesign). They cannot be re-run on the current source because
+    T6+T8 already applied the cleanups the experiments measured (the edit
+    functions target source patterns that no longer exist).
+
+    The data is preserved as a historical diagnostic reference: it shows the
+    per-component cost breakdown that motivated the T6+T8 cleanups.
+    """
+    if not HISTORICAL_EXPERIMENTS.exists():
+        return {"error": f"Historical experiments file not found: {HISTORICAL_EXPERIMENTS}"}
+    with open(HISTORICAL_EXPERIMENTS) as f:
+        return json.load(f)
+
+
 # ── Part 3: per-component diagnostic deltas (stash-dance) ───────────────────
 
 def perf_instr_median(binary: str, n: int, runs: int = 3,
@@ -845,8 +880,8 @@ def main() -> int:
     ap.add_argument("--no-build", action="store_true")
     ap.add_argument("--runs", type=int, default=DEFAULT_RUNS,
                     help=f"repeated runs for Part 1 (default {DEFAULT_RUNS})")
-    ap.add_argument("--no-stash", action="store_true",
-                    help="skip Part 3 stash-dance experiments")
+    ap.add_argument("--stash", action="store_true",
+                    help="re-run Part 3 stash-dance experiments (default: use historical data)")
     args = ap.parse_args()
 
     if not args.no_build:
@@ -902,11 +937,13 @@ def main() -> int:
     if "handler_addr" in forloop_path:
         print(f"   FORLOOP handler: {forloop_path['handler_addr']}")
 
-    # ── Part 3: stash-dance experiments ──
-    part3 = {}
-    if not args.no_stash:
-        print(f"\n>> Part 3: per-component diagnostic deltas (stash-dance)")
-        # First verify baseline
+    # ── Part 3: diagnostic component experiments ──
+    # By default, use HISTORICAL experiments (measured at P16.10 T1+T2+T3 era,
+    # commit 03422b1, baseline 75 instr/iter). The stash-dance experiments
+    # cannot be re-run on current source because T6+T8 already applied the
+    # cleanups they measured. Use --stash to force re-running (experimental).
+    if args.stash:
+        print(f"\n>> Part 3: per-component diagnostic deltas (fresh stash-dance)")
         git_checkout_src()
         rebuild()
         baseline = perf_instr_median(str(ZIG_LUA), N_FLOOR, runs=3,
@@ -914,25 +951,40 @@ def main() -> int:
         print(f"   Baseline: {baseline['instr_per_iter']:.1f} instr/iter, "
               f"{baseline['cycles_per_iter']:.1f} cycles/iter")
 
-        part3 = run_stash_experiments(baseline, N_FLOOR)
+        fresh_experiments = run_stash_experiments(baseline, N_FLOOR)
 
         # Final revert + rebuild
         git_checkout_src()
         rebuild()
-        # Verify we're back to baseline
         verify = perf_instr_median(str(ZIG_LUA), N_FLOOR, runs=2,
                                    extra_args=["--vm=bc"])
         print(f"   Post-experiment verify: {verify['instr_per_iter']:.1f} instr/iter "
               f"(baseline={baseline['instr_per_iter']:.1f})")
+
+        diagnostic_experiments = {
+            "source_head": head,
+            "source_head_description": "fresh stash-dance at regeneration time",
+            "baseline_instr_per_iter": round(baseline["instr_per_iter"], 2),
+            "experiments": fresh_experiments,
+        }
     else:
-        part3 = {"skipped": True, "reason": "--no-stash flag"}
+        print(f"\n>> Part 3: loading historical diagnostic experiments")
+        diagnostic_experiments = load_historical_experiments()
+        print(f"   Historical source: {diagnostic_experiments.get('source_head', 'unknown')} "
+              f"(baseline {diagnostic_experiments.get('baseline_instr_per_iter', '?')} instr/iter)")
 
     # ── Assemble artifact ──
+    zig_identity = get_binary_identity(ZIG_LUA)
+    puc_identity = get_binary_identity(PUC_LUA)
     artifact = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
-        "task": "P16.10 T1+T2+T3 — dispatch floor measurement + lowering analysis + component deltas",
+        "task": "P16.10 dispatch floor measurement + lowering analysis + historical component deltas",
         "head": head,
         "zig_version": zig_version,
+        "binary_identity": {
+            "zig": zig_identity,
+            "puc": puc_identity,
+        },
         "cpu_info": cpu_info,
         "measurement": {
             "method": "n-vs-2n delta (steady-state subtraction); pinned core 0; user-mode counters",
@@ -961,6 +1013,7 @@ def main() -> int:
         },
         "bytecode": bytecode,
         "part2_lowering_analysis": {
+            "binary_identity": zig_identity,
             "binary": str(ZIG_LUA),
             "symbol": sym_info,
             "cpu_target": cpu_info,
@@ -994,7 +1047,7 @@ def main() -> int:
                 ),
             },
         },
-        "part3_component_deltas": part3,
+        "diagnostic_component_experiments": diagnostic_experiments,
     }
 
     OUT.write_text(json.dumps(artifact, indent=2) + "\n")
@@ -1021,20 +1074,22 @@ def main() -> int:
     print(f"  Indirect jumps: {classification['indirect_jump_count']}")
     print(f"  Handler shape: {handler_shape['shape']}")
 
-    if not args.no_stash and part3:
+    if "experiments" in diagnostic_experiments:
+        exps = diagnostic_experiments["experiments"]
         print(f"\n{'='*72}")
-        print(f"Part 3: Per-component deltas (instr/iter)")
+        print(f"Part 3: Diagnostic component experiments "
+              f"(source: {diagnostic_experiments.get('source_head', '?')})")
         print(f"{'='*72}")
         print(f"{'Component':<24} {'Baseline':>10} {'Removed':>10} {'Δinstr':>10} {'Δcycles':>10}")
         print(f"{'-'*64}")
         for label, _, _ in EXPERIMENTS:
-            if label in part3:
-                e = part3[label]
+            if label in exps:
+                e = exps[label]
                 print(f"{label:<24} {e['baseline_instr_per_iter']:>10.1f} "
                       f"{e['removed_instr_per_iter']:>10.1f} "
                       f"{e['delta_instr_per_iter']:>+10.1f} "
                       f"{e['delta_cycles_per_iter']:>+10.1f}")
-        ac = part3.get("_additivity_check", {})
+        ac = exps.get("_additivity_check", {})
         if ac:
             print(f"\n  Additivity: sum={ac.get('sum_of_individual_deltas_instr',0):+.1f} "
                   f"all-removed={ac.get('measured_all_removed_delta_instr',0):+.1f} "

@@ -5174,14 +5174,19 @@ Measurement-only phase; no production code changes committed. Artifact:
 
 ### Part 1 — forloop_only steady-state (n-vs-2n delta, pinned core 0, 5 runs)
 
+Artifact regenerated at head `1f35e70` (post-T6+T8 cleanups). Original
+T1+T2+T3 measurement was 75.0 instr/iter / 11.0 branches (pre-T6+T8);
+the artifact now reflects the final state after T6 (stack_ptr removal,
+−3) and T8 (SIGINT redesign, −2).
+
 | Counter        |   Zig |   PUC | Ratio  |
 |----------------|------:|------:|-------:|
-| instructions   | 75.0  | 28.0  | 2.68x  |
-| cycles         | 13.9  | 10.3  | 1.34x  |
-| branches       | 11.0  |  5.0  | 2.20x  |
+| instructions   | 70.0  | 28.0  | 2.50x  |
+| cycles         | 14.1  | 10.3  | 1.36x  |
+| branches       |  9.0  |  5.0  | 1.80x  |
 | branch-misses  | ~0    | ~0    | —      |
-| IPC            | 5.40  | 2.71  |        |
-| wall ns/iter   | 3.58  | 2.72  | 1.31x  |
+| IPC            | 4.97  | 2.71  |        |
+| wall ns/iter   | 3.70  | 2.73  | 1.36x  |
 
 Steady state: FORPREP once, then FORLOOP N times (empty body). The n-vs-2n
 delta cancels setup/epilogue, isolating pure FORLOOP dispatch+handler cost.
@@ -5190,12 +5195,13 @@ delta cancels setup/epilogue, isolating pure FORLOOP dispatch+handler cost.
 
 - **Classification**: jump table (32-bit signed offsets, 128 entries for
   7-bit opcode space).
-- **Main table**: `0x100c688`, **2 dispatch sites** using it.
-- **FORLOOP handler**: `0x10be904` → `jmp 0x10c0f01` (pc computation) →
-  shared tail at `0x10c72c7` (`inc %rax; cmp; jb` back to dispatch top).
-- **Hot path**: uses only ONE of the 2 main-table dispatch sites (the first,
-  after preamble checks). The 2nd site is a cold path (after hooks processing).
-- **Remaining 74 indirect jumps**: nested switches within opcode handlers
+- **Main table**: `0x100c65c`, **4 dispatch sites** using it.
+- **FORLOOP handler**: `0x10be2b0` → `jmp 0x10c0940` (pc computation) →
+  shared tail (`inc %rax; cmp; jb` back to dispatch top).
+- **Hot path**: uses only ONE of the 4 main-table dispatch sites (the first,
+  after preamble checks). The other sites are cold paths (after hooks/special
+  handlers).
+- **Remaining 67 indirect jumps**: nested switches within opcode handlers
   (type-dispatch in arithmetic, etc.).
 - **Computed-goto framing**: since the hot path already uses a single shared
   indirect-branch site with a jump table, "replace switch with computed goto"
@@ -5203,7 +5209,12 @@ delta cancels setup/epilogue, isolating pure FORLOOP dispatch+handler cost.
   multiple per-handler dispatch sites into one shared site for BTB prediction)
   is already realized for the hot path.
 
-### Part 3 — per-component diagnostic deltas (stash-dance, ALL reverted)
+### Part 3 — historical diagnostic component experiments (stash-dance, ALL reverted)
+
+Measured at commit `03422b1` (P16.10 T1+T2+T3 era, baseline 75.0 instr/iter,
+BEFORE T6+T8 cleanups). These experiments cannot be re-run on current source
+because T6+T8 already applied the cleanups they measured. Preserved as
+`diagnostic_component_experiments` in the artifact with source revision recorded.
 
 | Component         | Baseline | Removed | Δinstr | Δcycles |
 |-------------------|---------:|--------:|-------:|--------:|

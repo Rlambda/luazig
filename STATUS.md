@@ -5593,6 +5593,50 @@ no Proto clone. luazig now mirrors that architecture:
 - nextvar 3x: identical (only the time-seeded "seeds 0X…" line varies;
   PUC-vs-PUC varies there too).
 
+### Task 2 — strip semantic tests (permanent, differential)
+
+- `tests/smoke/65_strip_dump_semantics.lua` (differential, byte-identical):
+  A. plain roundtrip — executes; debug info PRESENT (source "=dumpsrc",
+  short_src, linedefined, activelines populated, local names, upvalue names,
+  exact "plainbad:2: … (local 'x')" error).
+  B. stripped roundtrip — executes; debug info ABSENT exactly where PUC
+  removes it (source "=?" / short_src "?", empty activelines,
+  getlocal nil, "(no name)" upvalues) while semantic metadata survives
+  (linedefined/lastlinedefined, nups/nparams); double roundtrip still works.
+  C. error inside a stripped roundtrip: "?:?" prefix.
+  D. traceback through stripped frames: "?:" entries with NO line number;
+  "\t?: in function <?:2>" frame (short_src "?", linedefined kept).
+  E. nested Proto trees, both modes, recursively.
+  F. stripped chunk never larger than plain; both carry "\27Lua".
+  Deliberately excluded (pre-existing, NOT strip-specific, reproduced on
+  plain source): raw function tostring (addresses), getlocal-on-function
+  return arity, bare path-like chunkname source rendering ("@x.lua" vs
+  "x.lua"), "(field 'x')"/"(upvalue …)" error-name enrichment, tailcall
+  traceback markers, metamethod traceback frames.
+- `tests/c_api/18_dump.c` (new DIFF_TESTS suite): C API `lua_dump` strip=0/1
+  — status 0, LUA_SIGNATURE on both chunks, strict size ordering, identical
+  12-byte signature+version+format prefix between plain/stripped. C-function
+  dump NOT asserted: PUC 5.5 lua_dump only api_checks isLfunction (no-op in
+  release) then dereferences as Lua closure → SIGBUS on release PUC; no
+  byte-identical differential possible. C-side reload of binary chunks is
+  NOT covered: luazig's luaL_loadbufferx/lua_load are text-only today
+  (pre-existing load-path gap; reload semantics covered by the smoke's
+  Lua-level load(dump(f)) in both modes; extend this suite when the C-side
+  binary loader lands).
+
+### Gates after Task 2 (final, all green)
+
+- `zig build test` Debug + ReleaseFast: 169/169.
+- smoke: 65/65 byte-identical (23/31/58/64 re-verified among them);
+  65_ stable 3x.
+- matrix `--testc`: zig_fail=0.
+- c_api `make test` (now 19 suites) + `make test-diff` (now 8 diff suites):
+  ALL PASS / DIFF: PASS.
+- nextvar 3x: identical (time-seeded line only).
+- native-mem lanes (ReleaseFast): stripped dump BOUNDED 0.16 MB/decade,
+  plain dump BOUNDED 0.19 MB/decade, dynamic load LINEAR (unchanged —
+  next agent's scope).
+
 ### Open (next steps)
 
 - `repeated_dynamic_load` lane still LINEAR — dynamic-load retention fix is

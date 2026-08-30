@@ -22743,14 +22743,16 @@ pub const Vm = struct {
                     if (GcObject.fromValue(exec_callee) != null) {
                         try self.gcMarkValue(exec_callee);
                     }
-                    // PUC model: hidden varargs at [func_slot-nextraargs..func_slot].
+                    // P16.10b: mode-aware varargs accessor — the old inline
+                    // func_slot-nextra slice is wrong for vararg-TABLE frames
+                    // (see frameVarargs) and underflowed in Debug when
+                    // func_slot < nextraargs.
                     if (exec_fr.proto() != null and exec_fr.u.lua.nextraargs != 0) {
                         // Use the same `stack` variable as the regs scan above:
                         // for the VM-active thread, bytecode_stack is empty
                         // (moved to self.bc_stack); for parked coroutines,
                         // bytecode_stack holds their stack.
-                        const va = frame_stack[exec_fr.func_slot - exec_fr.u.lua.nextraargs .. exec_fr.func_slot];
-                        for (va) |yv| {
+                        for (self.frameVarargs(exec_fr, th)) |yv| {
                             if (GcObject.fromValue(yv) != null) {
                                 try self.gcMarkValue(yv);
                             }

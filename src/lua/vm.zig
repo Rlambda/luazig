@@ -4095,12 +4095,28 @@ pub const Vm = struct {
     /// IR/C frames (proto == null): no varargs (return empty slice).
     /// P15.51g: Accept optional thread to resolve correct stack for parked coroutines.
     fn frameVarargs(self: *Vm, frame: *const CallFrame, th: ?*Thread) []Value {
-        if (frame.proto() != null and frame.u.lua.nextraargs != 0) {
-            // PUC model: hidden varargs below ci->func.
-            const stack = stackForThread(self, th);
-            return stack[frame.func_slot - frame.u.lua.nextraargs .. frame.func_slot];
+        const proto = frame.proto() orelse return &.{};
+        const nextra: usize = frame.u.lua.nextraargs;
+        if (nextra == 0) return &.{};
+        const stack = stackForThread(self, th);
+        // P16.10b fix: the two vararg storage modes keep the extra args in
+        // DIFFERENT places, and this accessor must respect the mode:
+        //  - vahid (vararg_table_reg == null): buildhiddenargs shifted func
+        //    past the extras — hidden args at [func_slot-nextra, func_slot).
+        //  - table mode (named `...` table): extras stay INSIDE the frame at
+        //    [base+numparams, base+numparams+nextra) (read once by OP_VARARGPREP,
+        //    VATAB layout). The old func_slot-nextra computation was WRONG for
+        //    this mode — it marked the PARENT's registers below the frame and
+        //    underflowed whenever func_slot < nextraargs (first frames; latent
+        //    since the vararg-table feature landed, exposed by P16.10b GC
+        //    timing shifts in locals.lua to-be-closed coroutine sections).
+        if (proto.vararg_table_reg != null) {
+            const start = frame.base + proto.numparams;
+            if (start + nextra > stack.len) return &.{}; // frame being torn down
+            return stack[start .. start + nextra];
         }
-        return &.{};
+        // PUC model: hidden varargs below ci->func.
+        return stack[frame.func_slot - nextra .. frame.func_slot];
     }
 
     /// P15.51n: Derive current line from proto.lineinfo[pc].
@@ -11152,11 +11168,15 @@ pub const Vm = struct {
         nresults: i32,
     ) DispatchError!void {
         if (self.stats.enabled) self.stats.calls_lua_frames += 1; // P16.0b: ALL Lua activations
-        // Resolve string constants to VM-interned pointers on first use.
-        // This is a one-time cost per Proto that eliminates per-execution
-        // re-hashing in bcConstToValue (~12.4% of cycles on microbench).
-        // Protos are always heap-allocated, so @constCast is safe here.
-        try self.resolveProtoConstants(@constCast(proto));
+        // P16.10b Task 15: constants are runtime-ready by construction —
+        // every closure-creation path adopts its tree at the
+        // createBytecodeChunkClosure boundary (see there). The old lazy
+        // first-call resolveProtoConstants is GONE from the hot path;
+        // this Debug assert is the invariant's tripwire. Owner-less
+        // protos are unit-test constructs and pass freely.
+        if (@import("builtin").mode == .Debug) {
+            if (proto.tree) |t| std.debug.assert(t.constants_resolved);
+        }
         // PUC Lua limits the value stack, not the number of Lua activations.
         // Bytecode calls are represented by heap-resident CallInfo-like
         // descriptors. PUC-faithful iterative dispatch (`goto startfunc` in
@@ -11754,6 +11774,26 @@ pub const Vm = struct {
     /// Public direct-bytecode entry point. Internal coroutine trampoline
     /// control flow is narrowed at this boundary and cannot escape to callers.
     pub fn runBytecode(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure) Error![]Value {
+        // P16.10b Task 7+15 (adoption): this is the VM-bind boundary for
+        // directly executed protos (CLI source/binary execution and any
+        // embedding caller that compiled a Proto and runs it without an
+        // intermediate Closure). Trees adopted at closure creation are
+        // already ready and skip this in O(1).
+        if (proto_in.tree) |t| {
+            // resolveTreeConstants is pure allocation+interning: it can
+            // never yield or switch threads, but its signature carries the
+            // full DispatchError set. Map the impossible arm explicitly.
+            if (!t.constants_resolved) {
+                self.resolveTreeConstants(t) catch |e| switch (e) {
+                    error.ThreadSwitch => unreachable, // pure allocation+interning: no control flow inside
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.RuntimeError => return error.RuntimeError,
+                    error.Yield => return error.Yield,
+                };
+            }
+        }
+        // exposeDispatchResult performs the DispatchError→Error narrowing
+        // (ThreadSwitch is unreachable at this boundary; see doc comment).
         return exposeDispatchResult([]Value, self.runBytecodeInternal(proto_in, upvalues_in, args, callee_cl));
     }
 
@@ -14717,15 +14757,12 @@ pub const Vm = struct {
         const c: u8 = inst.c;
 
         const named_varargs = try self.getBytecodeVarargTable(ctx.cur_proto, ctx.regs);
-        // PUC model: hidden varargs at [func_slot - nextraargs .. func_slot].
-        // P15.51l: nextraargs/func_slot are rare fields, read from CallFrame.
+        // P16.10b: mode-aware varargs accessor (vahid: below func_slot;
+        // table mode: base+numparams). The old unconditional
+        // func_slot-nextra slice underflowed for table-mode frames whose
+        // func_slot < nextraargs.
         const fr_va = ctx.exec_frames.getPtr(ctx.frame_index);
-        const nextra_va: usize = fr_va.u.lua.nextraargs;
-        const func_slot_va: usize = fr_va.func_slot;
-        const va_slice: []Value = if (nextra_va != 0)
-            self.bc_stack[func_slot_va - nextra_va .. func_slot_va]
-        else
-            &.{};
+        const va_slice: []Value = self.frameVarargs(fr_va, null);
         const source_len = if (named_varargs) |src| src.len else va_slice.len;
         const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
         if (nresults >= 0) {
@@ -15419,7 +15456,12 @@ pub const Vm = struct {
         switch (callee_val) {
             .Closure => |cl| if (cl.proto) |new_proto| {
                 // ── Bytecode-to-bytecode tail call: frame reuse ──
-                try self.resolveProtoConstants(@constCast(new_proto));
+                // P16.10b Task 15: constants are runtime-ready by
+                // construction (adopted at closure creation); Debug
+                // tripwire mirrors pushBytecodeExecFrame.
+                if (@import("builtin").mode == .Debug) {
+                    if (new_proto.tree) |t| std.debug.assert(t.constants_resolved);
+                }
 
                 // 1. Close all ctx.boxed upvalues.
                 for (ctx.boxed) |*bc_slot| {
@@ -20691,10 +20733,11 @@ pub const Vm = struct {
             // u.lua.nextraargs or u.lua.frame_cap. Guard prevents union field
             // mismatch panic when GC runs during an active C-frame.
             if (!frame.isC()) {
-                if (frame.u.lua.nextraargs != 0) {
-                    const va = self.bc_stack[frame.func_slot - frame.u.lua.nextraargs .. frame.func_slot];
-                    for (va) |value| try self.gcMarkValue(value);
-                }
+                // P16.10b: use the mode-aware frameVarargs accessor — the
+                // old inline func_slot-nextra slice was wrong for vararg-TABLE
+                // frames (see frameVarargs). th=null: the active thread's
+                // bc_stack is authoritative here.
+                for (self.frameVarargs(frame, null)) |value| try self.gcMarkValue(value);
                 for (self.frameUpvalues(frame, null)) |cell| {
                     try self.gcQueueScanCell(cell);
                 }
@@ -23135,6 +23178,16 @@ pub const Vm = struct {
         try self.gcRegisterClosure(cl);
         self.testc_obj_functions += 1;
         self.gcNoteAlloc(@sizeOf(Closure));
+        // P16.10b Task 7+15 (adoption): resolve the tree's constants HERE,
+        // at the closure-creation boundary, so every executable Proto is
+        // runtime-ready BEFORE any frame push (PUC invariant: bytecode
+        // constants are already runtime-ready at execution). This is the
+        // single adoption point for load/undump/api-created trees;
+        // OP_CLOSURE children adopt implicitly — their parent's tree was
+        // adopted when the parent closure was created.
+        if (cl.tree) |t| {
+            if (!t.constants_resolved) try self.resolveTreeConstants(t);
+        }
         return cl;
     }
 
@@ -40794,8 +40847,10 @@ test "vm: P16.8a transactional simple_result setup — errdefer rollback on push
     mm_cl.* = .{ .proto = mm_proto, .tree = vm.retainTreeForClosure(mm_proto), .upvalues = &.{} };
     try vm.gcRegisterClosure(mm_cl);
 
-    // Pre-resolve the metamethod proto's constants so resolveProtoConstants
-    // is a no-op during the test call (failure isolated to stack growth).
+    // P16.10b: constants are adopted at closure creation in production;
+    // this hand-built-frame test adopts both trees explicitly so the
+    // push-time Debug readiness tripwire holds.
+    try vm.resolveProtoConstants(parent_proto);
     try vm.resolveProtoConstants(mm_proto);
 
     // Push a parent Lua frame onto the active thread's call_frames.

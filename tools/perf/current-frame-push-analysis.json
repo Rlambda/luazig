@@ -1,0 +1,413 @@
+{
+  "created_utc": "2026-08-30T00:32:55.972300+00:00",
+  "head": "e4e384b",
+  "zig_version": "0.16.0",
+  "binary_identity": {
+    "path": "/home/boss/codes/luazig/zig-out/bin/luazig",
+    "sha256": "88c8bf5c31f1fc5ba9e2f59b87ef8e8d239323fb73acae5a0e01f3544be11ff9"
+  },
+  "profile_source": "tools/perf/profiles/2026-08-30/ (perf record, cycles:u, LBR)",
+  "profile_shares": {
+    "metamethod_call_noalloc": {
+      "runBytecodeDispatch": 52.41,
+      "pushBytecodeExecFrame": 16.56,
+      "tryPushSimpleResultMetamethod": 10.72,
+      "getTmByObj": 8.93,
+      "pushResolvedBytecodeClosure": 3.87,
+      "dispatchCalleeActivationHook": 1.61,
+      "tableResize": 1.03,
+      "syncFrame": 1.03,
+      "FrameStack.addOne": 0.0,
+      "resolveCallable": 0.0
+    },
+    "lua_calls": {
+      "runBytecodeDispatch": 78.34,
+      "pushBytecodeExecFrame": 16.4,
+      "syncFrame": 3.46,
+      "FrameStack.addOne": 1.36
+    }
+  },
+  "perf_annotate_hot_lines": {
+    "workload": "lua_calls",
+    "symbol": "vm.Vm.pushBytecodeExecFrame",
+    "hottest_instructions": [
+      {
+        "overhead_pct": 11.32,
+        "addr": "116dfc3",
+        "instruction": "mov %rcx,-0x88(%rbp)",
+        "source": "line 11085: const lua_max_call_frames = if (self.activeErrorHandlerDepth() != 0) 10000 else 1000000;",
+        "note": "Stack spill of lua_max_call_frames result \u2014 register pressure from per-activation activeErrorHandlerDepth() call"
+      },
+      {
+        "overhead_pct": 6.77,
+        "addr": "116e6b6",
+        "instruction": "movl $0xffffffff,0x5c(%rax)",
+        "source": "CallFrame field write (INVALID_PC to resume_pc/last_line_pc)",
+        "note": "Field write to CallFrame struct \u2014 one of ~20 field writes"
+      },
+      {
+        "overhead_pct": 6.76,
+        "addr": "116e64b",
+        "instruction": "movzwl -0xa8(%rbp),%eax",
+        "source": "Loading frame_cap or nparams from stack spill",
+        "note": "Register pressure: 16-bit value spilled to stack, reloaded"
+      },
+      {
+        "overhead_pct": 6.03,
+        "addr": "116e420",
+        "instruction": "mov -0x78(%rbp),%rcx",
+        "source": "Loading exec_frames pointer from stack spill",
+        "note": "Register pressure: exec_frames pointer spilled/reloaded"
+      },
+      {
+        "overhead_pct": 5.28,
+        "addr": "116e67d",
+        "instruction": "mov %ecx,0x50(%rax)",
+        "source": "CallFrame field write (base or func_slot)",
+        "note": "Field write to CallFrame struct"
+      }
+    ],
+    "note": "The hottest single instruction (11.32%) is a stack spill of lua_max_call_frames \u2014 the result of activeErrorHandlerDepth() call that runs every activation but is only consumed in the near-overflow branch. This is pure register pressure: the result occupies a callee-saved register across the entire function, causing spills in the field-write section."
+  },
+  "classification": {
+    "description": "Classification of every operation in pushBytecodeExecFrame for the common non-vararg Lua-to-Lua case (args_on_stack=true, is_vahid=false, no overflow).",
+    "categories": [
+      "required-every-activation",
+      "required-on-first-Proto-execution",
+      "required-host-args-only",
+      "varargs-only",
+      "near-stack-overflow-only",
+      "error-handler-overflow-only",
+      "hooks-debug-only",
+      "derivable",
+      "provably-redundant"
+    ],
+    "operations": [
+      {
+        "operation": "stats increment (if self.stats.enabled)",
+        "source_line": "vm.zig:11070",
+        "category": "required-every-activation",
+        "note": "Diagnostic counter, gated by stats.enabled (default-off). The branch is per-activation; the increment is conditional. Could be classified as hooks-debug-only since the value is only consumed by diagnostics, but the branch itself is per-activation overhead."
+      },
+      {
+        "operation": "resolveProtoConstants(proto)",
+        "source_line": "vm.zig:11075",
+        "category": "required-on-first-Proto-execution",
+        "note": "Checks proto.constants_resolved flag, returns early if already done. One-time cost per Proto: interns string constants + pre-resolves all constants into resolved_values array. After first execution, this is a single branch (predicted-not-taken)."
+      },
+      {
+        "operation": "activeErrorHandlerDepth() for lua_max_call_frames",
+        "source_line": "vm.zig:11085",
+        "category": "provably-redundant",
+        "note": "Calls activeErrorHandlerDepth() (which calls activeBytecodeThread() + reads 2 fields) every activation. The result (lua_max_call_frames = 10000 or 1000000) is ONLY consumed in the near-overflow branch (exec_frames.len() >= lua_max_call_frames). In the common case (frame count << 10000), the specific value is irrelevant. The call causes register pressure: its result is spilled to stack (11.32% of function overhead per perf annotate). Could be deferred to inside the overflow branch."
+      },
+      {
+        "operation": "comptime constants (ERRORSTACKSIZE, lua_max_stack_slots, lua_stack_overflow_limit)",
+        "source_line": "vm.zig:11092-11094",
+        "category": "derivable",
+        "note": "Compile-time constants, zero runtime cost. Listed for completeness."
+      },
+      {
+        "operation": "frame_cap = @intCast(proto.maxstacksize + EXTRA_MARGIN)",
+        "source_line": "vm.zig:11095",
+        "category": "required-every-activation",
+        "note": "Needed for needed_top computation, regs slice, and frame field write."
+      },
+      {
+        "operation": "nparams = proto.numparams",
+        "source_line": "vm.zig:11097",
+        "category": "required-every-activation",
+        "note": "Needed for nextra, nil-fill, nvarstack, reg_top field writes."
+      },
+      {
+        "operation": "nextra computation (proto.is_vararg and args.len > nparams)",
+        "source_line": "vm.zig:11010-11013",
+        "category": "varargs-only",
+        "note": "For non-vararg: proto.is_vararg is false, short-circuits to 0. The branch is predicted-not-taken but still per-activation. Result (0) is written to nextraargs field."
+      },
+      {
+        "operation": "is_vahid computation",
+        "source_line": "vm.zig:11015",
+        "category": "varargs-only",
+        "note": "For non-vararg: false via short-circuit on proto.is_vararg. Used to gate buildhiddenargs and func_slot computation."
+      },
+      {
+        "operation": "func_slot_in = caller_func_slot (alias)",
+        "source_line": "vm.zig:11018",
+        "category": "derivable",
+        "note": "Pure alias, zero runtime cost."
+      },
+      {
+        "operation": "args_on_stack pointer test",
+        "source_line": "vm.zig:11022-11027",
+        "category": "required-every-activation",
+        "note": "Pointer comparison: args.ptr == bc_stack.ptr + (func_slot_in + 1) * @sizeOf(Value). For OP_CALL fast path: true (args already on stack). The check itself is the per-activation cost \u2014 it decides whether to copy args."
+      },
+      {
+        "operation": "argument copy path (if !args_on_stack)",
+        "source_line": "vm.zig:11029-11044",
+        "category": "required-host-args-only",
+        "note": "Only executed when args come from heap/host (runBytecodeInternal, builtin pcall, metamethods, debug hooks, coroutine resume). NOT executed on OP_CALL fast path. Includes ensureBcStackCap + func write + args copy loop."
+      },
+      {
+        "operation": "nargs = args.len (alias)",
+        "source_line": "vm.zig:11052",
+        "category": "derivable",
+        "note": "Pure alias, zero runtime cost."
+      },
+      {
+        "operation": "func_slot computation (if is_vahid)",
+        "source_line": "vm.zig:11053",
+        "category": "required-every-activation",
+        "note": "For non-vararg: func_slot = func_slot_in (predicted branch). Result needed for base computation and all field writes."
+      },
+      {
+        "operation": "base = func_slot + 1",
+        "source_line": "vm.zig:11054",
+        "category": "required-every-activation",
+        "note": "Needed for regs slice, needed_top, and all field writes. Core frame geometry."
+      },
+      {
+        "operation": "buildhiddenargs (if is_vahid)",
+        "source_line": "vm.zig:11056-11072",
+        "category": "varargs-only",
+        "note": "PUC ltm.c buildhiddenargs: shifts func+params UP past extra args. NOT executed for non-vararg. Includes ensureBcStackCap + copy + nil-fill."
+      },
+      {
+        "operation": "needed_top = base + frame_cap",
+        "source_line": "vm.zig:11075",
+        "category": "required-every-activation",
+        "note": "Needed for overflow check and ensureBcStackCap."
+      },
+      {
+        "operation": "handling_overflow check (bc_stack.len > 1M and activeErrorHandlerDepth() > 0)",
+        "source_line": "vm.zig:11084-11085",
+        "category": "error-handler-overflow-only",
+        "note": "The bc_stack.len > 1M comparison runs every activation (cheap, almost always false). The activeErrorHandlerDepth() call is only reached when bc_stack.len > 1M (short-circuit AND). The body (handler overflow check) is error-handler-only."
+      },
+      {
+        "operation": "stack overflow checks (exec_frames.len() >= lua_max_call_frames or needed_top > lua_stack_overflow_limit)",
+        "source_line": "vm.zig:11096-11219",
+        "category": "near-stack-overflow-only",
+        "note": "The comparisons run every activation but are almost always false (frame count << 10000, stack pre-allocated). The body (realloc to ERRORSTACKSIZE + fail) only executes on actual overflow."
+      },
+      {
+        "operation": "ensureBcStackCap(needed_top)",
+        "source_line": "vm.zig:11221",
+        "category": "required-every-activation",
+        "note": "Capacity check is per-activation (compares needed_top vs bc_stack.len). The grow path is near-stack-overflow-only. In the common case, this is a single comparison + branch."
+      },
+      {
+        "operation": "bc_stack_top update (old_stack_top + new value + errdefer)",
+        "source_line": "vm.zig:11223-11225",
+        "category": "required-every-activation",
+        "note": "Must set bc_stack_top to needed_top for the new frame. errdefer restores on error (zero cost on success path)."
+      },
+      {
+        "operation": "regs slice derivation (bc_stack[base..base+frame_cap])",
+        "source_line": "vm.zig:11227",
+        "category": "required-every-activation",
+        "note": "Needed for nil-fill and returned to caller via ctx. Pure slice arithmetic (pointer + length)."
+      },
+      {
+        "operation": "missing-param nil fill (if !is_vahid)",
+        "source_line": "vm.zig:11233-11237",
+        "category": "required-every-activation",
+        "note": "For common case (nargs >= nparams): ncopy = nparams, loop for (ncopy..nparams) does not execute. Just the @min + branch. The nil-fill only runs when nargs < nparams (host-recursion with fewer args)."
+      },
+      {
+        "operation": "tbc_mark capture + errdefer",
+        "source_line": "vm.zig:11239-11240",
+        "category": "required-every-activation",
+        "note": "Saves bc_tbc_regs.items.len for errdefer rollback on frame pop. Zero cost on success path (just a field read + errdefer setup)."
+      },
+      {
+        "operation": "activation_owner = activeBytecodeThread()",
+        "source_line": "vm.zig:11244",
+        "category": "required-every-activation",
+        "note": "3rd call to activeBytecodeThread() in the function. Cannot be CSE-d with earlier calls because ensureBcStackCap (line 11221) is between them and may modify self. However, activeBytecodeThread() only reads self.current_thread/self.main_thread which ensureBcStackCap does not modify \u2014 so the compiler MAY CSE this in ReleaseFast with inlining."
+      },
+      {
+        "operation": "bytecode_activation_counter increment + wrap protection",
+        "source_line": "vm.zig:11245-11246",
+        "category": "required-every-activation",
+        "note": "Incrementing overflow counter for frame identity in syncFrame. Wrap protection (if == 0, set to 1) is rarely taken but the check is per-activation."
+      },
+      {
+        "operation": "FrameStack.addOne(self.alloc)",
+        "source_line": "vm.zig:11264",
+        "category": "required-every-activation",
+        "note": "Grows frame stack by one. Checks inline_count < INLINE_FRAME_CAP: returns inline slot (cheap) or heap.addOne (alloc). In common case (shallow call depth), uses inline slot \u2014 just a counter increment + pointer arithmetic."
+      },
+      {
+        "operation": "errdefer shrinkTo (frame rollback)",
+        "source_line": "vm.zig:11265",
+        "category": "required-every-activation",
+        "note": "Error handling infrastructure. Zero cost on success path."
+      },
+      {
+        "operation": "union activation (ef_slot.u = .{ .lua = undefined })",
+        "source_line": "vm.zig:11276",
+        "category": "required-every-activation",
+        "note": "Must activate .lua variant before writing .u.lua fields. In ReleaseFast: zero cost (undefined = no-op). In Debug: safety check. Required for correctness when reusing a slot that previously held a .c variant."
+      },
+      {
+        "operation": "ef_slot.u.lua.proto = proto",
+        "source_line": "vm.zig:11279",
+        "category": "required-every-activation",
+        "note": "Core frame field: needed for dispatch (opcode fetch, constant access)."
+      },
+      {
+        "operation": "ef_slot.u.lua.pc = 0",
+        "source_line": "vm.zig:11282",
+        "category": "required-every-activation",
+        "note": "Initial program counter for the new frame."
+      },
+      {
+        "operation": "ef_slot.u.lua.nvarstack = @intCast(nparams)",
+        "source_line": "vm.zig:11283",
+        "category": "required-every-activation",
+        "note": "Number of stack-visible variables. Needed for VARARG, return handling, stack top tracking."
+      },
+      {
+        "operation": "ef_slot.activation_id = activation_owner.bytecode_activation_counter",
+        "source_line": "vm.zig:11286",
+        "category": "required-every-activation",
+        "note": "Frame identity for syncFrame validation. syncFrame checks activation_id == frame_identity to detect frame realloc invalidation."
+      },
+      {
+        "operation": "ef_slot.base = base",
+        "source_line": "vm.zig:11287",
+        "category": "required-every-activation",
+        "note": "Stack base for the frame. Needed for regs/boxed slice derivation, stack top restoration on pop."
+      },
+      {
+        "operation": "ef_slot.func_slot = func_slot",
+        "source_line": "vm.zig:11288",
+        "category": "required-every-activation",
+        "note": "Callee position on bc_stack (PUC ci->func). Needed for callee access, upvalue derivation, tail call."
+      },
+      {
+        "operation": "ef_slot.u.lua.func_slot_base = func_slot_in",
+        "source_line": "vm.zig:11289",
+        "category": "required-every-activation",
+        "note": "Original func slot before VAHID shift. Needed for VAHID unwind and tail call base restoration. For non-vararg: equals func_slot (redundant write, but needed for the vararg case)."
+      },
+      {
+        "operation": "ef_slot.u.lua.frame_cap = frame_cap",
+        "source_line": "vm.zig:11290",
+        "category": "required-every-activation",
+        "note": "Frame capacity (maxstacksize + EXTRA_MARGIN). Needed for regs/boxed slice derivation, stack top computation."
+      },
+      {
+        "operation": "ef_slot.u.lua.nextraargs = @intCast(nextra)",
+        "source_line": "vm.zig:11291",
+        "category": "varargs-only",
+        "note": "For non-vararg: always 0. Only read by VARARG/return paths for vararg functions. The write itself is per-activation but the value is only consumed for vararg functions."
+      },
+      {
+        "operation": "ef_slot.callstatus = encodeNresults(nresults)",
+        "source_line": "vm.zig:11298",
+        "category": "required-every-activation",
+        "note": "Encodes nresults + clears all flag bits (CIST_TAIL, CIST_HOOKED, etc.). Needed for return handling."
+      },
+      {
+        "operation": "ef_slot.u.lua.resume_pc = INVALID_PC",
+        "source_line": "vm.zig:11299",
+        "category": "required-every-activation",
+        "note": "Needed for coroutine yield/resume. Must be initialized to avoid stale data from frame reuse."
+      },
+      {
+        "operation": "ef_slot.reg_top = @intCast(nparams)",
+        "source_line": "vm.zig:11300",
+        "category": "required-every-activation",
+        "note": "Register top (number of live registers). Needed for stack top tracking, GC scanning."
+      },
+      {
+        "operation": "ef_slot.u.lua.last_line_pc = INVALID_PC",
+        "source_line": "vm.zig:11301",
+        "category": "hooks-debug-only",
+        "note": "Only read by line hooks (debug.sethook with \"l\" mask). Written every activation to prevent stale data from frame reuse. Could be lazily initialized when hooks are first activated."
+      },
+      {
+        "operation": "ef_slot.u.lua.skip_line_hook_pc = INVALID_PC",
+        "source_line": "vm.zig:11302",
+        "category": "hooks-debug-only",
+        "note": "Only read by line hook dispatch. Written every activation for stale-data prevention. Could be lazily initialized."
+      },
+      {
+        "operation": "ef_slot.tbc_mark = tbc_mark",
+        "source_line": "vm.zig:11303",
+        "category": "required-every-activation",
+        "note": "TBC (to-be-closed) mark for frame pop cleanup. Needed for correct TBC variable scoping."
+      },
+      {
+        "operation": "ef_slot.pending_call_index = INVALID_PENDING",
+        "source_line": "vm.zig:11305",
+        "category": "required-every-activation",
+        "note": "Must clear stale state from frame reuse. pending_call_index is read by return/continue paths to check if a pending call exists."
+      },
+      {
+        "operation": "ef_slot.u.lua.skip_call_hook_pc = INVALID_PC",
+        "source_line": "vm.zig:11306",
+        "category": "hooks-debug-only",
+        "note": "Only read by call hook dispatch. Written every activation for stale-data prevention. Could be lazily initialized."
+      },
+      {
+        "operation": "ef_slot.u.lua.clearSimpleResult()",
+        "source_line": "vm.zig:11308",
+        "category": "required-every-activation",
+        "note": "Must clear stale simple-result state from frame reuse. simple_result is read by return paths to check if a simple-result completion is pending."
+      },
+      {
+        "operation": "ef_slot.u.lua.setOpenUpvalues(false)",
+        "source_line": "vm.zig:11313",
+        "category": "required-every-activation",
+        "note": "Must clear stale open-upvalues flag from frame reuse. Read by upvalue scanning paths."
+      },
+      {
+        "operation": "ef_slot.u.lua.resume_skip_count_pc = INVALID_PC",
+        "source_line": "vm.zig:11316",
+        "category": "hooks-debug-only",
+        "note": "Only read by count hook dispatch after coroutine resume. Written every activation for stale-data prevention. Could be lazily initialized."
+      }
+    ]
+  },
+  "summary": {
+    "total_operations_classified": 44,
+    "by_category": {
+      "required-every-activation": 28,
+      "required-on-first-Proto-execution": 1,
+      "required-host-args-only": 1,
+      "varargs-only": 4,
+      "near-stack-overflow-only": 1,
+      "error-handler-overflow-only": 1,
+      "hooks-debug-only": 4,
+      "derivable": 3,
+      "provably-redundant": 1
+    },
+    "optimization_opportunities": [
+      {
+        "category": "provably-redundant",
+        "operation": "activeErrorHandlerDepth() for lua_max_call_frames",
+        "impact": "11.32% of pushBytecodeExecFrame overhead (hottest single instruction \u2014 stack spill of result)",
+        "fix": "Defer the activeErrorHandlerDepth() call to inside the near-overflow branch. Compute lua_max_call_frames lazily only when exec_frames.len() >= 10000 (the lower limit). This eliminates the per-activation call + stack spill.",
+        "risk": "Low \u2014 the error handler depth cannot change during pushBytecodeExecFrame. The only semantic change is that the overflow check uses 10000 (the error-handler limit) as the threshold for calling activeErrorHandlerDepth(), which is correct since 10000 is the lower of the two limits."
+      },
+      {
+        "category": "hooks-debug-only",
+        "operation": "Debug field writes (last_line_pc, skip_line_hook_pc, skip_call_hook_pc, resume_skip_count_pc)",
+        "impact": "~4 field writes per activation, each costing a mov instruction. Estimated ~4-6% of function overhead based on perf annotate (INVALID_PC writes are among the hottest instructions).",
+        "fix": "Lazy initialization: write these fields only when hooks are first activated for a frame. Requires a \"hooks ever active\" flag per frame or a generation check. Alternatively, batch-clear all debug fields in a single memset when entering hook mode.",
+        "risk": "Medium \u2014 must ensure no code path reads these fields before they are initialized. The frame reuse stale-data concern must be addressed by the lazy-init mechanism."
+      },
+      {
+        "category": "varargs-only",
+        "operation": "nextraargs field write (always 0 for non-vararg)",
+        "impact": "1 field write per activation. Small but nonzero.",
+        "fix": "Could skip the write for non-vararg functions (the field is already 0 from a previous non-vararg frame, or could be set to 0 by addOne). But frame reuse means the slot may contain stale data from a previous vararg frame.",
+        "risk": "Low \u2014 but requires proving that nextraargs is only read for vararg functions, and that no non-vararg frame ever reads it."
+      }
+    ]
+  }
+}

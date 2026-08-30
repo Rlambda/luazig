@@ -5413,3 +5413,57 @@ After:
 - coroutine.lua: PASS (yield continuations)
 - nextvar 3×: PASS
 - CallFrame ≤ 104 bytes: PASS (Debug assert)
+
+## P16.10a T15 — frame-push field classification (2026-08-30, ANALYSIS ONLY)
+
+Fresh profile (post-P16.10a T4+11, head `1f35e70`, perf record LBR):
+
+| Workload | pushBytecodeExecFrame | syncFrame | FrameStack.addOne | resolveCallable |
+|----------|----------------------:|----------:|------------------:|----------------:|
+| metamethod_call_noalloc | 16.56% | 1.03% | <1% | 0% (eliminated) |
+| lua_calls | 16.40% | 3.46% | 1.36% | — |
+
+Artifact: `tools/perf/current-frame-push-analysis.json` (44 operations classified
+into 9 categories).
+
+### Perf annotate hottest lines (lua_calls, pushBytecodeExecFrame)
+
+- **11.32%** — `mov %rcx,-0x88(%rbp)` — stack spill of `lua_max_call_frames`
+  (result of `activeErrorHandlerDepth()` call). Pure register pressure: the
+  result occupies a callee-saved register across the entire function.
+- **6.77%** — `movl $0xffffffff,0x5c(%rax)` — INVALID_PC field write to
+  CallFrame (one of ~4 debug-only field writes per activation).
+- **6.76%** — `movzwl -0xa8(%rbp),%eax` — 16-bit value (frame_cap/nparams)
+  spilled to stack, reloaded.
+- **6.03%** — `mov -0x78(%rbp),%rcx` — exec_frames pointer spill/reload.
+- **5.28%** — `mov %ecx,0x50(%rax)` — CallFrame field write (base/func_slot).
+
+### Classification summary (9 categories)
+
+| Category | Count | Key operations |
+|----------|------:|----------------|
+| required-every-activation | 28 | frame geometry, field writes, addOne, activation counter |
+| required-on-first-Proto-execution | 1 | resolveProtoConstants (one-time per Proto) |
+| required-host-args-only | 1 | argument copy path (not on OP_CALL fast path) |
+| varargs-only | 4 | nextra, is_vahid, buildhiddenargs, nextraargs write |
+| near-stack-overflow-only | 1 | overflow check body (realloc + fail) |
+| error-handler-overflow-only | 1 | handling_overflow check body |
+| hooks-debug-only | 4 | last_line_pc, skip_line_hook_pc, skip_call_hook_pc, resume_skip_count_pc |
+| derivable | 3 | comptime constants, aliases (zero runtime cost) |
+| provably-redundant | 1 | activeErrorHandlerDepth() for lua_max_call_frames |
+
+### Top optimization opportunity
+
+**`activeErrorHandlerDepth()` for `lua_max_call_frames`** (vm.zig:11085) —
+**provably-redundant** in the common case. The call runs every activation but
+its result (10000 vs 1000000) is only consumed in the near-overflow branch
+(`exec_frames.len() >= lua_max_call_frames`). The call causes register pressure:
+its result is spilled to stack (11.32% of function overhead — the hottest
+single instruction). Fix: defer the call to inside the overflow branch,
+computing `lua_max_call_frames` lazily only when `exec_frames.len() >= 10000`.
+
+**Debug field writes** (4 fields: `last_line_pc`, `skip_line_hook_pc`,
+`skip_call_hook_pc`, `resume_skip_count_pc`) — **hooks-debug-only**. Written
+every activation for stale-data prevention but only read when hooks are active.
+Estimated ~4-6% of function overhead. Fix: lazy initialization when hooks are
+first activated for a frame.

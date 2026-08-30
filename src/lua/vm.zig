@@ -3199,9 +3199,12 @@ pub const Vm = struct {
     /// `swapRemove` during sweep), `gc_seq` is set once at allocation
     /// and never changed.
     gc_creation_seq: u64 = 0,
-    /// Source LuaStrings from `load(string)` calls, pinned as GC roots so
-    /// their bytes (referenced by compiled Proto lexeme slices) survive sweep.
-    pinned_source_strings: std.ArrayListUnmanaged(*LuaString) = .empty,
+    // (P16.10b Task 6) The old VM-global `pinned_source_strings` list is
+    // RETIRED: source pins now live on each tree's ProtoTreeOwner
+    // (`source_backing.pinned`) and are marked through the closure
+    // traversal (gcMarkBytecodeProto), like PUC's traverseLClosure. Pins
+    // therefore die with their trees instead of accumulating for the VM's
+    // whole lifetime.
     /// Temporary GC roots (Handle API). Builtins push Values here to protect
     /// newly-allocated objects held in Zig locals across subsequent allocations
     /// that may trigger GC. The scope helper `gcTempRoots()` snapshots the
@@ -4660,7 +4663,6 @@ pub const Vm = struct {
         self.gc_old1.deinit(self.alloc);
         self.gc_grayagain.deinit(self.alloc);
         self.gc_gen_threads.deinit(self.alloc);
-        self.pinned_source_strings.deinit(self.alloc);
         self.gc_temp_roots.deinit(self.alloc);
         // Now safe to deinit string_intern — all GC objects (including
         // short strings) have been freed by drainGcRegistries above.
@@ -17374,7 +17376,9 @@ pub const Vm = struct {
         defer cg_bc.deinit();
         const proto = cg_bc.compileChunk(chunk) catch return self.fail("{s}", .{cg_bc.diagString()});
         // Producing reference discipline (P16.10b Task 4): closure creation
-        // retains its own; drop ours on success, free on failure.
+        // retains its own; drop ours on success, free on failure. No source
+        // backing needed: the bootstrap source is a string literal in the
+        // binary (static for the process lifetime).
         errdefer proto.tree.?.release();
 
         // Create a proper closure with _ENV upvalue, matching how
@@ -22251,14 +22255,8 @@ pub const Vm = struct {
             if (oth) |th| try self.gcMarkValue(.{ .Thread = th });
         }
 
-        // Pinned source strings from load(string) — compiled Proto lexemes
-        // reference their bytes, so they must survive sweep.
-        for (self.pinned_source_strings.items) |s| {
-            if (gcIsWhite(s.gc_marked)) {
-                gcSetBlack(&s.gc_marked);
-                self.gc_mark_epoch += 1;
-            }
-        }
+        // (P16.10b Task 6) Source-string pins moved to the per-tree
+        // ProtoTreeOwner and are marked via gcMarkBytecodeProto.
 
         // Bytecode long constants loaded through `internStrAll` are
         // GC-managed strings deduplicated in this cache. The cache is a VM
@@ -22383,6 +22381,19 @@ pub const Vm = struct {
     }
 
     fn gcMarkBytecodeProto(self: *Vm, proto: *const bc.Proto) DispatchError!void {
+        // P16.10b Task 6 (PUC-faithful): the tree's source-backing pins are
+        // marked through the closure traversal, like PUC's traverseLClosure
+        // which reallymarkobject's p->source and the upvalue-name strings
+        // (lgc.c). While any closure of this tree is live, the bytes its
+        // debug lexemes borrow from stay pinned against sweep.
+        if (proto.tree) |owner| {
+            for (owner.source_backing.pinned.items) |s| {
+                if (gcIsWhite(s.gc_marked)) {
+                    gcSetBlack(&s.gc_marked);
+                    self.gc_mark_epoch += 1;
+                }
+            }
+        }
         for (proto.k) |k| {
             if (k == .str) {
                 if (gcIsWhite(k.str.gc_marked)) {
@@ -23139,7 +23150,19 @@ pub const Vm = struct {
         bytes: []const u8,
         chunk_name: []const u8,
     ) !Value {
-        const src: LuaSource = .{ .name = chunk_name, .bytes = bytes };
+        // P16.10b Task 6 (inventory S1b): `bytes`/`chunk_name` are BORROWED
+        // from the caller (a C buffer, or a temp collected by lua_load and
+        // freed at return). The compiled tree's debug lexeme slices must
+        // outlive them — so compile against OWNED COPIES and attach them
+        // as the tree's source backing. This closes the latent use-after-
+        // free every compileChunkValue caller had.
+        var backing: bc.ProtoTreeOwner.SourceBacking = .{};
+        defer backing.deinit(self.alloc); // consumed on success
+        const owned_bytes = try self.alloc.dupe(u8, bytes);
+        try backing.owned.append(self.alloc, owned_bytes);
+        const owned_name = try self.alloc.dupe(u8, chunk_name);
+        try backing.owned.append(self.alloc, owned_name);
+        const src: LuaSource = .{ .name = owned_name, .bytes = owned_bytes };
         var lex = LuaLexer.init(src);
         var p = LuaParser.init(&lex) catch return error.Syntax;
         var arena = lua_ast.AstArena.init(self.alloc);
@@ -23153,6 +23176,10 @@ pub const Vm = struct {
         // producing reference on every path — success transfers lifetime
         // to the closure, failure must free the tree (P16.10b Task 4).
         errdefer proto.tree.?.release();
+        // Attach the owned source copies (move; compileTextChunk is not
+        // used here — inline the attach before closure creation).
+        proto.tree.?.source_backing = backing;
+        backing = .{};
         const cl = try self.createBytecodeChunkClosure(proto);
         proto.tree.?.release();
         // Set _ENV upvalue to the global environment, matching PUC's
@@ -23163,7 +23190,20 @@ pub const Vm = struct {
         return Value{ .Closure = cl };
     }
 
-    fn compileTextChunk(self: *Vm, source: LuaSource) DispatchError!TextCompileResult {
+    /// Compile a text chunk and wrap it in a chunk closure. `backing`
+    /// (CONSUMED — always left empty on return) carries the
+    /// source-lifetime objects for THIS tree (P16.10b Task 6): pins for
+    /// LuaString sources, owned buffers for heap sources. On success the
+    /// backing is attached to the tree's owner (dies with the tree); on
+    /// ANY failure path it is freed here. Callers transfer ownership of
+    /// any buffers they put in and must not free them again — keep a
+    /// `defer backing.deinit(...)` for pre-call failures only.
+    fn compileTextChunk(
+        self: *Vm,
+        source: LuaSource,
+        backing: *bc.ProtoTreeOwner.SourceBacking,
+    ) DispatchError!TextCompileResult {
+        defer backing.deinit(self.alloc); // no-op once attached (moved)
         var lex = LuaLexer.init(source);
         lex.global_reserved = self.testc_module_enabled;
         var p = LuaParser.init(&lex) catch {
@@ -23182,7 +23222,13 @@ pub const Vm = struct {
             const result = try compile_bc(self.alloc, source, chunk);
             return switch (result) {
                 .proto => |proto| {
-                    // Compiled tree carries its producing reference; the
+                    // Attach the source backing to the tree (Task 6): the
+                    // debug lexeme slices borrow these bytes/pins for the
+                    // tree's whole lifetime. Move semantics — the defer
+                    // above finds an empty backing after this.
+                    proto.tree.?.source_backing = backing.*;
+                    backing.* = .{};
+                    // The compiled tree carries its producing reference; the
                     // closure takes its own. Drop the producer's on every
                     // path (P16.10b Task 4): success → lifetime belongs to
                     // the closure; failure → the tree must free itself.
@@ -23217,7 +23263,15 @@ pub const Vm = struct {
 
             const source = LuaSource.loadFile(self.alloc, stdio.activeIo(), path) catch |e| return self.fail("dofile: cannot read '{s}': {s}", .{ path, @errorName(e) });
 
-            const compiled = try self.compileTextChunk(source);
+            // The compiled tree borrows the file bytes and the "@path"
+            // chunk name for its whole lifetime — transfer both buffers
+            // into the tree's source backing (P16.10b Task 6; freed when
+            // the tree dies, on compile failure freed by compileTextChunk).
+            var backing: bc.ProtoTreeOwner.SourceBacking = .{};
+            defer backing.deinit(self.alloc); // consumed on success
+            try backing.owned.append(self.alloc, @constCast(source.bytes));
+            try backing.owned.append(self.alloc, @constCast(source.name));
+            const compiled = try self.compileTextChunk(source, &backing);
             const cl = switch (compiled) {
                 .closure => |closure| closure,
                 .diagnostic => |diagnostic| {
@@ -23277,6 +23331,11 @@ pub const Vm = struct {
             if (outs.len > 1) outs[1] = .{ .String = try self.internStr(try std.fmt.allocPrint(self.alloc, "loadfile: cannot read '{s}': {s}", .{ path, @errorName(e) })) };
             return;
         };
+        // The file bytes/name are interned into fresh LuaStrings below;
+        // the originals are then freed (they were leaked before P16.10b
+        // Task 6). builtinLoad's tree backing pins the INTERNED copies.
+        defer self.alloc.free(source.name);
+        defer self.alloc.free(source.bytes);
         var load_args: [4]Value = .{ .Nil, .Nil, .Nil, .Nil };
         load_args[0] = .{ .String = try self.internStr(source.bytes) };
         load_args[1] = .{ .String = try self.internStr(source.name) };
@@ -23428,7 +23487,8 @@ pub const Vm = struct {
         }
         // Long string: create an external string pointing into the source
         // buffer. falloc=null means LSTRFIX (no deallocation) — the caller
-        // owns the buffer and keeps it alive via pinned_source_strings.
+        // owns the buffer and keeps it alive via the tree's source backing
+        // (P16.10b Task 6; previously a VM-lifetime pin list).
         const ls = try v.createExternalLuaString(bytes.ptr, bytes.len, null, null);
         return @ptrCast(ls);
     }
@@ -23519,12 +23579,23 @@ pub const Vm = struct {
     /// owns its strings (not borrowing from the binary buffer which may be
     /// GC'd). Recursively processes nested protos.
     pub fn cloneUndumpedStrings(self: *Vm, proto: *bc.Proto) DispatchError!void {
+        const owner = proto.tree.?;
+        // Helper: dupe and register on the owner so the last release frees
+        // every copy (P16.10b Task 6 — previously the dupes leaked with
+        // the tree).
+        const dupeOwned = struct {
+            fn run(vm: *Vm, ow: *bc.ProtoTreeOwner, bytes: []const u8) DispatchError![]u8 {
+                const d = try vm.alloc.dupe(u8, bytes);
+                try ow.source_backing.name_copies.append(vm.alloc, d);
+                return d;
+            }
+        }.run;
         // source_name and name
         if (proto.source_name.len > 0) {
-            proto.source_name = try self.alloc.dupe(u8, proto.source_name);
+            proto.source_name = try dupeOwned(self, owner, proto.source_name);
         }
         if (proto.name.len > 0) {
-            proto.name = try self.alloc.dupe(u8, proto.name);
+            proto.name = try dupeOwned(self, owner, proto.name);
         }
         // upvalue names — upvalues is []const, need mutable copy
         if (proto.upvalues.len > 0) {
@@ -23534,7 +23605,7 @@ pub const Vm = struct {
                     .instack = uv.instack,
                     .idx = uv.idx,
                     .is_const = uv.is_const,
-                    .name = if (uv.name.len > 0) try self.alloc.dupe(u8, uv.name) else uv.name,
+                    .name = if (uv.name.len > 0) try dupeOwned(self, owner, uv.name) else uv.name,
                 };
             }
             proto.upvalues = uvs;
@@ -23544,7 +23615,7 @@ pub const Vm = struct {
             const lvs = try self.alloc.alloc(bc.LocVar, proto.locvars.len);
             for (proto.locvars, 0..) |lv, i| {
                 lvs[i] = .{
-                    .name = if (lv.name.len > 0) try self.alloc.dupe(u8, lv.name) else lv.name,
+                    .name = if (lv.name.len > 0) try dupeOwned(self, owner, lv.name) else lv.name,
                     .reg = lv.reg,
                     .startpc = lv.startpc,
                     .endpc = lv.endpc,
@@ -23615,6 +23686,14 @@ pub const Vm = struct {
 
         var source_owned: ?[]u8 = null;
         var prefixed_owned: ?[]u8 = null;
+        // P16.10b Task 6: these buffers become the tree's source backing on
+        // the load path (ownership transferred, nulled there). Every other
+        // exit of this builtin must free whatever was not transferred —
+        // previously both leaked on every early return.
+        defer {
+            if (source_owned) |b| self.alloc.free(b);
+            if (prefixed_owned) |b| self.alloc.free(b);
+        }
         const source_is_reader = reader_val != .String;
         const source_str: ?*LuaString = switch (reader_val) {
             .String => |x| x,
@@ -23736,14 +23815,17 @@ pub const Vm = struct {
             errdefer loaded_proto.tree.?.release();
             if (fixed) {
                 // In fixed-buffer mode, code/lineinfo/long-strings point into
-                // the source buffer. Pin it so GC doesn't sweep it while the
-                // Proto is alive. This mirrors PUC's assumption that the fixed
-                // buffer remains valid for the Proto's lifetime.
-                if (source_str) |x| try self.pinned_source_strings.append(self.alloc, x);
+                // the source buffer. Pin it ON THE TREE (P16.10b Task 6) so
+                // GC doesn't sweep it while the tree is alive — the pin dies
+                // with the tree instead of living for the VM's lifetime.
+                if (source_str) |x| {
+                    try loaded_proto.tree.?.source_backing.pinned.append(self.alloc, x);
+                }
             } else {
                 // The undumped proto's string fields (source_name, name, locvar
                 // names, upvalue names) point into the binary buffer which may be
-                // garbage-collected. Duplicate them so the proto owns its strings.
+                // garbage-collected. Duplicate them so the proto owns its strings
+                // (the dupes are registered on the owner and freed with it).
                 try self.cloneUndumpedStrings(loaded_proto);
             }
             // String constants were already VM-interned during undump (via
@@ -23780,13 +23862,35 @@ pub const Vm = struct {
             .String => |nm| nm.bytes(),
             else => return self.fail("load: chunk name must be string", .{}),
         };
-        // Pin the source LuaString as a GC root so it's not swept while the
-        // compiled function's lexeme slices point into it. Binary chunks
-        // don't need this — `cloneUndumpedStrings` makes the proto
-        // self-contained. Same lifetime as PUC Lua's proto owning its source.
-        if (source_str) |x| try self.pinned_source_strings.append(self.alloc, x);
+        // Source backing (P16.10b Task 6): the tree borrows its debug
+        // lexemes from these bytes for its whole lifetime. LuaString
+        // sources pin the string (marked via closure traversal); heap
+        // buffers (reader-fn collection, shebang prefix) transfer
+        // ownership to the tree. A distinct chunk-name string is pinned
+        // as well — source_name borrows from it. The backing is consumed
+        // by compileTextChunk on every path (attached on success, freed
+        // on failure), so the reader-fn/prefixed buffers can no longer
+        // leak and the REPL-style per-load pin accumulation is gone.
+        var backing: bc.ProtoTreeOwner.SourceBacking = .{};
+        defer backing.deinit(self.alloc); // consumed on success
+        if (source_str) |x| {
+            try backing.pinned.append(self.alloc, x);
+            if (chunk_name_val == .String and chunk_name_val.String != x) {
+                try backing.pinned.append(self.alloc, chunk_name_val.String);
+            }
+        }
+        if (prefixed_owned) |buf| {
+            // Shebang-prefixed copy — the tree borrows THIS buffer, not
+            // the string above; transfer ownership.
+            prefixed_owned = null;
+            try backing.owned.append(self.alloc, buf);
+        } else if (source_owned) |buf| {
+            // Reader-fn collected source — same transfer (was a leak).
+            source_owned = null;
+            try backing.owned.append(self.alloc, buf);
+        }
         const source = LuaSource{ .name = chunk_name, .bytes = chunk_bytes };
-        const compiled = try self.compileTextChunk(source);
+        const compiled = try self.compileTextChunk(source, &backing);
         const cl = switch (compiled) {
             .closure => |closure| closure,
             .diagnostic => |diagnostic| {
@@ -26105,9 +26209,15 @@ pub const Vm = struct {
             if (line_buf.items.len == 0) continue;
 
             // Compile the line as a Lua text chunk with the canonical
-            // debug-command chunk name "=(debug command)".
-            const source = LuaSource{ .name = "=(debug command)", .bytes = line_buf.items };
-            const compiled = try self.compileTextChunk(source);
+            // debug-command chunk name "=(debug command)". The line buffer
+            // is REUSED next iteration, so the tree gets an owned copy
+            // (P16.10b Task 6).
+            var backing: bc.ProtoTreeOwner.SourceBacking = .{};
+            defer backing.deinit(self.alloc); // consumed on success
+            const line_copy = try self.alloc.dupe(u8, line_buf.items);
+            try backing.owned.append(self.alloc, line_copy);
+            const source = LuaSource{ .name = "=(debug command)", .bytes = line_copy };
+            const compiled = try self.compileTextChunk(source, &backing);
             const cl = switch (compiled) {
                 .closure => |closure| closure,
                 .diagnostic => |diagnostic| {
@@ -37642,10 +37752,16 @@ pub const Vm = struct {
                     try st.append(self.alloc, .{ .String = try self.internStr(em) });
                     return null;
                 };
-                defer {
-                    self.alloc.free(source.name);
-                    self.alloc.free(source.bytes);
-                }
+                // P16.10b Task 6: the compiled tree borrows the file bytes
+                // and "@path" name — ownership transfers into the tree's
+                // source backing (previously the defer-free below was a
+                // use-after-free against the tree's lexeme slices, masked
+                // by allocator timing). On every failure path the backing
+                // frees them here.
+                var backing: bc.ProtoTreeOwner.SourceBacking = .{};
+                defer backing.deinit(self.alloc); // consumed on success
+                try backing.owned.append(self.alloc, @constCast(source.bytes));
+                try backing.owned.append(self.alloc, @constCast(source.name));
                 var lex = LuaLexer.init(source);
                 lex.global_reserved = self.testc_module_enabled;
                 var p = LuaParser.init(&lex) catch {
@@ -37669,6 +37785,10 @@ pub const Vm = struct {
                 };
                 // Producing reference discipline (P16.10b Task 4).
                 errdefer proto.tree.?.release();
+                // Attach the source backing (move; the defer above then
+                // frees nothing).
+                proto.tree.?.source_backing = backing;
+                backing = .{};
                 const clv = try self.createBytecodeChunkClosure(proto);
                 proto.tree.?.release();
                 try st.append(self.alloc, .{ .Closure = clv });

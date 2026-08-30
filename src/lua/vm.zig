@@ -7300,12 +7300,104 @@ pub const Vm = struct {
         );
     }
 
+    /// P16.10a T4: Push a KNOWN resolved bytecode Closure as a child frame
+    /// with already-resolved args and the given continuation. This is the
+    /// single invocation primitive for directly-pushed bytecode Closures —
+    /// it does NO callable resolution (no `resolveCallable`, no `__call`
+    /// chain handling).
+    ///
+    /// **Resolution-once invariant (Task 5):** The caller MUST have already
+    /// resolved the callee (via `resolveCallable` or by proving it is a
+    /// bytecode Closure with `proto != null`). This primitive never calls
+    /// `resolveCallable`. Resolution happens exactly once per invocation:
+    /// either in the caller (generic path) or not at all (proven-Closure
+    /// fast path — a Closure is already callable, `__call` is irrelevant).
+    ///
+    /// **Order (unchanged from the pre-P16.10a paths):**
+    /// 1. Assert no conflicting continuation state on the parent.
+    /// 2. Install continuation state (pending_call or simple_result).
+    /// 3. Push the child bytecode exec frame (`pushBytecodeExecFrame`).
+    /// 4. Set debug name override (pending path only; simple_result derives
+    ///    name from `event` at read time via `getDebugName()`).
+    /// 5. Dispatch the CALL hook (`dispatchCalleeActivationHook`).
+    fn pushResolvedBytecodeClosure(
+        self: *Vm,
+        exec_frames: *FrameStack,
+        parent_index: usize,
+        closure: *Closure,
+        args: []const Value,
+        completion: ResolvedClosureCompletion,
+    ) DispatchError!void {
+        const proto = closure.proto orelse unreachable; // caller proves proto != null
+        const parent = exec_frames.getPtr(parent_index);
+        std.debug.assert(parent.pending_call_index == INVALID_PENDING);
+        // P16.8 Task 1: simple_result and pending_calls are mutually exclusive.
+        if (!parent.isC()) {
+            std.debug.assert(!parent.u.lua.hasSimpleResult());
+        }
+
+        switch (completion) {
+            .pending => |p| {
+                // Install pending_call continuation state BEFORE the fallible
+                // child-frame push (mirrors PUC luaD_precall → setobj2s).
+                try self.setPendingCall(parent, .{
+                    .callee = .{ .Closure = closure },
+                    .completion = p.completion,
+                });
+                // Roll back if child-frame push or hook dispatch fails.
+                // Re-fetch via getPtr: pushBytecodeExecFrame may realloc.
+                errdefer self.clearPendingCall(exec_frames.getPtr(parent_index));
+                const cont_nresults: i32 = switch (p.completion) {
+                    .results => |r| r.nresults,
+                    else => -1,
+                };
+                try self.pushBytecodeExecFrame(
+                    exec_frames, proto, args, closure, self.bc_stack_top, cont_nresults,
+                );
+                // The debug name must be recorded BEFORE the CALL hook fires:
+                // PUC's hook-time getinfo('n') resolves the metamethod name
+                // from the caller's instruction (funcnamefromcode "metamethod"
+                // branch).
+                self.setDebugName(exec_frames.getPtr(parent_index), p.debug_namewhat, p.debug_name);
+            },
+            .simple_result => |sr| {
+                // P16.8a Task 5: The simple_result state is set BEFORE the
+                // fallible child-activation operations (pushBytecodeExecFrame +
+                // hook dispatch). The errdefer below rolls it back if either
+                // fails, mirroring the errdefer clearPendingCall pattern above.
+                switch (sr.completion) {
+                    .value => |dst| parent.u.lua.setSimpleValueResult(dst, sr.event),
+                    .compare => |invert| parent.u.lua.setSimpleCompareResult(sr.event, invert),
+                }
+                // Re-fetch via getPtr: pushBytecodeExecFrame may realloc.
+                errdefer exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
+                // simple_result always consumes exactly 1 result (nresults=-1
+                // means "the continuation handles result count" — the
+                // simple_result completion reads exactly 1 value from the
+                // child's return slot).
+                try self.pushBytecodeExecFrame(
+                    exec_frames, proto, args, closure, self.bc_stack_top, -1,
+                );
+                // No setDebugName — debug name is derived from simple_result_event
+                // at read time via getDebugName().
+            },
+        }
+        // Metamethod/continuation activations get their CALL event when the
+        // frame exists (PUC: luaT_calltm → luaD_call → luaD_precall →
+        // luaG_tracecall fires LUA_HOOKCALL for the metamethod function).
+        try self.dispatchCalleeActivationHook(exec_frames, .{ .Closure = closure }, args.len);
+    }
+
     /// Push a pre-resolved `ResolvedCall` as a bytecode continuation frame.
     /// This is the invocation half of the resolve→invoke split for the
     /// `pending_calls`-based continuation path (CONCAT, pairs, hooks, etc.).
     /// Returns false if the resolved callee is not a bytecode Closure (Builtin,
     /// C-closure) — the caller handles the synchronous case using the same
     /// `ResolvedCall`, avoiding double resolution (Task 5).
+    ///
+    /// P16.10a T4: Delegates to `pushResolvedBytecodeClosure` — the shared
+    /// primitive for all directly-pushed bytecode Closures. Resolution already
+    /// happened in the caller (exactly once per invocation).
     fn tryPushResolvedContinuationCall(
         self: *Vm,
         exec_frames: *FrameStack,
@@ -7319,31 +7411,15 @@ pub const Vm = struct {
             .Closure => |closure| closure,
             else => return false,
         };
-        const proto = cl.proto orelse return false;
+        if (cl.proto == null) return false;
 
-        std.debug.assert(!(exec_frames.getPtr(parent_index).pending_call_index != INVALID_PENDING));
-        // P16.8 Task 1: simple_result and pending_calls are mutually exclusive.
-        if (!exec_frames.getPtr(parent_index).isC()) {
-            std.debug.assert(!exec_frames.getPtr(parent_index).u.lua.hasSimpleResult());
-        }
-        try self.setPendingCall(exec_frames.getPtr(parent_index), .{
-            .callee = resolved.callee,
-            .completion = completion,
+        try self.pushResolvedBytecodeClosure(exec_frames, parent_index, cl, resolved.args, .{
+            .pending = .{
+                .completion = completion,
+                .debug_namewhat = debug_namewhat,
+                .debug_name = debug_name,
+            },
         });
-        errdefer self.clearPendingCall(exec_frames.getPtr(parent_index));
-        const cont_nresults: i32 = switch (completion) {
-            .results => |r| r.nresults,
-            else => -1,
-        };
-        try self.pushBytecodeExecFrame(exec_frames, proto, resolved.args, cl, self.bc_stack_top, cont_nresults);
-        // The debug name must be recorded BEFORE the CALL hook fires: PUC's
-        // hook-time getinfo('n') resolves the metamethod name from the
-        // caller's instruction (funcnamefromcode "metamethod" branch).
-        self.setDebugName(exec_frames.getPtr(parent_index), debug_namewhat, debug_name);
-        // Metamethod/continuation activations get their CALL event when the
-        // frame exists (PUC: luaT_calltm → luaD_call → luaD_precall →
-        // luaG_tracecall fires LUA_HOOKCALL for the metamethod function).
-        try self.dispatchCalleeActivationHook(exec_frames, resolved.callee, resolved.args.len);
         return true;
     }
 
@@ -7376,6 +7452,14 @@ pub const Vm = struct {
     /// `callMetamethod` (the synchronous path), which handles all value types.
     /// The `event` parameter is used solely to derive the debug opname via
     /// `tag_method.opname(event)` — no lookup is performed here.
+    ///
+    /// P16.10a T4: The pre-filter proves `metamethod` is a bytecode Closure
+    /// with `proto != null`. Since a Closure is already callable (`__call` is
+    /// irrelevant), `resolveCallable` would be a no-op wrapper returning
+    /// `{same callee, same args, owned_args=null}`. Skip it — push directly
+    /// via the shared `pushResolvedBytecodeClosure` primitive (zero resolution).
+    /// Resolution happens exactly once per invocation (Task 5): here it is
+    /// the trivial "already callable" case (zero-cost).
     fn tryPushResolvedMetamethod(
         self: *Vm,
         exec_frames: *FrameStack,
@@ -7389,14 +7473,18 @@ pub const Vm = struct {
         // continuation frames. This avoids the resolveCallable call for
         // Builtin/non-Closure values (the common synchronous fallback).
         if (metamethod != .Closure or metamethod.Closure.proto == null) return false;
-        return self.tryPushBytecodeMetamethod(
+        try self.pushResolvedBytecodeClosure(
             exec_frames,
             parent_index,
-            metamethod,
-            tag_method.opname(event),
+            metamethod.Closure,
             args,
-            completion,
+            .{ .pending = .{
+                .completion = completion,
+                .debug_namewhat = "metamethod",
+                .debug_name = tag_method.opname(event),
+            } },
         );
+        return true;
     }
 
     /// P16.7 Task 6: Inline simple-result completion type.
@@ -7406,6 +7494,41 @@ pub const Vm = struct {
     const SimpleResultCompletion = union(enum) {
         value: u8, // dst register
         compare: bool, // invert
+    };
+
+    /// P16.10a T4: Completion for `pushResolvedBytecodeClosure` — the
+    /// continuation state to install on the parent frame when pushing a
+    /// KNOWN resolved bytecode Closure as a child frame. This is the single
+    /// representation of "how the parent frame consumes the child's result"
+    /// for a directly-pushed bytecode Closure.
+    ///
+    /// **Resolution-once invariant (Task 5):** `pushResolvedBytecodeClosure`
+    /// does NO callable resolution. The caller MUST have already resolved
+    /// the callee through `resolveCallable` (generic path) or proven it is a
+    /// bytecode Closure with `proto != null` (fast path — a Closure is
+    /// already callable, `__call` is irrelevant, so `resolveCallable` would
+    /// be a no-op wrapper returning `{callee, args, owned_args=null}`).
+    /// Resolution happens exactly once per invocation: either in the caller
+    /// (generic path) or not at all (proven-Closure fast path).
+    const ResolvedClosureCompletion = union(enum) {
+        /// Pending-call continuation (CONCAT, pairs, hooks, etc.).
+        /// Installs `pending_call` state + explicit debug name override.
+        /// The debug name is recorded AFTER the child frame is pushed and
+        /// BEFORE the CALL hook fires (PUC: hook-time getinfo('n') resolves
+        /// the metamethod name from the caller's instruction).
+        pending: struct {
+            completion: BytecodePendingCompletion,
+            debug_namewhat: ?[]const u8,
+            debug_name: ?[]const u8,
+        },
+        /// Inline simple-result completion (arithmetic/comparison metamethods).
+        /// Installs `simple_result` state; debug name derived from `event`
+        /// at read time via `getDebugName()` — no explicit name stored.
+        /// Only valid for Lua (bytecode) parent frames.
+        simple_result: struct {
+            event: TmsEvent,
+            completion: SimpleResultCompletion,
+        },
     };
 
     /// Outcome of `tryPushSimpleResultMetamethod`: either a continuation frame
@@ -7434,6 +7557,16 @@ pub const Vm = struct {
     ///     host-recursion).
     ///   - Builtin/C-closure → existing synchronous call boundary.
     ///
+    /// **P16.10a T4 (direct-Closure fast path):** When the metamethod value
+    /// is already a bytecode Closure (`proto != null`), `resolveCallable` is
+    /// a no-op wrapper (a Closure is already callable, `__call` is irrelevant)
+    /// returning `{same callee, same args, owned_args=null}`. Skip it — push
+    /// directly via `pushResolvedBytecodeClosure` (zero resolution). This
+    /// eliminates ~12% of `metamethod_call_noalloc` that was spent in
+    /// `resolveCallable` on the proven-Closure hot path. Non-Closure values
+    /// (tables with `__call`, numbers, etc.) still go through `resolveCallable`
+    /// for `__call` chain handling and PUC's exact error text.
+    ///
     /// **Error naming (Task 8):** `resolveCallable` receives
     /// `.{ .namewhat = "metamethod", .name = opname(event) }` so non-callable
     /// values produce PUC's exact error text:
@@ -7456,9 +7589,36 @@ pub const Vm = struct {
     ) DispatchError!SimpleResultOutcome {
         const opname = tag_method.opname(event);
 
-        // Stage 2: resolve ONCE through normal callable semantics.
-        // resolveCallable handles __call chains (self prepended, operands
-        // follow) and produces PUC's exact error text for non-callable values.
+        // P16.10a T4: Fast path for proven bytecode Closures — skip
+        // resolveCallable entirely. A Closure is already callable (__call is
+        // irrelevant), so resolveCallable would return {same callee, same
+        // args, owned_args=null} — a no-op wrapper. Resolution happens exactly
+        // once per invocation (Task 5): here it is the trivial "already
+        // callable" case (zero-cost).
+        if (metamethod == .Closure) {
+            if (metamethod.Closure.proto) |_| {
+                // Bytecode closure — push continuation frame with simple_result
+                // completion via the shared primitive. This is the SAME
+                // continuation state as direct-Closure metamethods, so
+                // yielding works (Task 6).
+                try self.pushResolvedBytecodeClosure(
+                    exec_frames,
+                    parent_index,
+                    metamethod.Closure,
+                    args,
+                    .{ .simple_result = .{ .event = event, .completion = completion } },
+                );
+                return .pushed;
+            }
+            // C closure (c_func set, proto null) — fall through to
+            // resolveCallable path (handles __call chains + error text
+            // for consistency with non-Closure values).
+        }
+
+        // Non-Closure (or C-closure): resolve ONCE through normal callable
+        // semantics. resolveCallable handles __call chains (self prepended,
+        // operands follow) and produces PUC's exact error text for non-callable
+        // values.
         const resolved = try self.resolveCallable(metamethod, args, .{
             .namewhat = "metamethod",
             .name = opname,
@@ -7467,38 +7627,22 @@ pub const Vm = struct {
 
         switch (resolved.callee) {
             .Closure => |cl| {
-                const proto = cl.proto orelse {
+                if (cl.proto == null) {
                     // C closure (c_func set, proto null) — synchronous.
                     return .{ .value = try self.callResolvedMetamethodSync(
                         resolved, opname,
                     ) };
-                };
-                // Bytecode closure — push continuation frame with simple_result
-                // completion. This is the SAME continuation state as direct-
-                // Closure metamethods, so yielding works (Task 6).
-                //
-                // P16.8a Task 5: The simple_result state is set BEFORE the
-                // fallible child-activation operations (pushBytecodeExecFrame +
-                // hook dispatch). The errdefer below rolls it back if either
-                // fails, mirroring the errdefer clearPendingCall pattern in
-                // tryPushBytecodeContinuationCall.
-                const parent = exec_frames.getPtr(parent_index);
-                std.debug.assert(parent.pending_call_index == INVALID_PENDING);
-                std.debug.assert(!parent.u.lua.hasSimpleResult());
-                switch (completion) {
-                    .value => |dst| parent.u.lua.setSimpleValueResult(dst, event),
-                    .compare => |invert| parent.u.lua.setSimpleCompareResult(event, invert),
                 }
-                // Roll back simple_result if child-frame push or hook dispatch
-                // fails. Re-fetch via getPtr: pushBytecodeExecFrame may realloc.
-                errdefer exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
-
-                try self.pushBytecodeExecFrame(
-                    exec_frames, proto, resolved.args, cl, self.bc_stack_top, -1,
+                // Bytecode closure reached via __call chain — push continuation
+                // frame via the shared primitive. Resolution already happened
+                // above (exactly once — Task 5).
+                try self.pushResolvedBytecodeClosure(
+                    exec_frames,
+                    parent_index,
+                    cl,
+                    resolved.args,
+                    .{ .simple_result = .{ .event = event, .completion = completion } },
                 );
-                // No setDebugName — debug name is derived from simple_result_event
-                // at read time via getDebugName().
-                try self.dispatchCalleeActivationHook(exec_frames, resolved.callee, resolved.args.len);
                 return .pushed;
             },
             .Builtin => {

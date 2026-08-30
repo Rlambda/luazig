@@ -34,9 +34,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
 | Differential output (`--diff`) | **0 output_diff** |
-| Smoke tests (`tests/smoke/*.lua`) | **63/63** pass |
+| Smoke tests (`tests/smoke/*.lua`) | **64/64** pass |
 | C API suites (`tests/c_api`) | 18 suites |
-| Performance (geomean vs PUC) | **1.82x** |
+| Performance (geomean vs PUC) | **1.81x** |
 
 Geomean замедления vs PUC Lua: **1.82x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
@@ -5316,3 +5316,89 @@ not worth the complexity. **Reverted, no change.**
 - Remaining gap to floor: 70.0 - 61.0 = 9.0 instr/iter
   (vmstats_gate ~2 + dispatch_pc ~1 + hooks_gate ~2 + SIGINT ~2-3)
 - Remaining gap to PUC: 70.0 vs 28.0 = 2.50x (floor 61.0 vs 28.0 = 2.18x)
+
+## P16.10a T4+11 — direct bytecode-Closure metamethods skip resolveCallable (2026-08-30)
+
+### Problem
+
+`tryPushSimpleResultMetamethod()` first proved `metamethod == .Closure and
+.Closure.proto != null`, then immediately called `resolveCallable(metamethod,
+args, ...)` — for a Closure the resolver provably returns `{same callee, same
+args, owned_args=null}` (a Closure is already callable; `__call` irrelevant).
+Same redundancy in `tryPushResolvedMetamethod()` → `tryPushBytecodeMetamethod`
+→ `tryPushBytecodeContinuationCall` → `resolveCallable`.
+
+Profile (pre-P16.10a): `resolveCallable` ≈ 13.67% of `metamethod_call_noalloc`
+— ABOVE `pushBytecodeExecFrame` (14.94%). No frame surgery while this dead
+generic call ranked above it.
+
+### Fix
+
+Extracted `pushResolvedBytecodeClosure` — the single primitive for pushing a
+KNOWN resolved bytecode Closure with already-resolved args and a continuation.
+It does NO callable resolution: direct frame push + continuation setup + hook
+activation (order unchanged from the pre-P16.10a paths). The primitive takes a
+`ResolvedClosureCompletion` union covering both completion flavours:
+- `.pending` — pending_call continuation (CONCAT, pairs, hooks, etc.)
+- `.simple_result` — inline simple-result (arithmetic/comparison metamethods)
+
+**Resolution-once invariant (Task 5):** The caller MUST have already resolved
+the callee (via `resolveCallable` or by proving it is a bytecode Closure with
+`proto != null`). The primitive never calls `resolveCallable`. Resolution
+happens exactly once per invocation.
+
+Call sites refactored:
+- `tryPushSimpleResultMetamethod`: proven-Closure branch → primitive directly
+  (zero resolution). Non-Closure → existing resolveCallable path (unchanged).
+- `tryPushResolvedMetamethod`: pre-filtered Closure+proto → primitive directly
+  (skips `tryPushBytecodeMetamethod` → `tryPushBytecodeContinuationCall` →
+  `resolveCallable`).
+- `tryPushResolvedContinuationCall`: delegates to the primitive (thin wrapper
+  that checks Closure+proto, returns false for non-bytecode).
+
+### Results
+
+**A/B perf stat (3 interleaved rounds, median):**
+
+| Workload | Before (s) | After (s) | Delta |
+|----------|-----------|----------|-------|
+| metamethod_call_noalloc | 0.0284 | 0.0260 | -8.5% |
+| metamethod_add | 0.1780 | 0.1696 | -4.7% |
+| lua_calls | 0.2302 | 0.2222 | -3.5% |
+
+**perf_compare.py --runs 5 vs baseline:**
+
+| Workload | base (s) | cur (s) | delta | status |
+|----------|---------|---------|-------|--------|
+| metamethod_call_noalloc | 0.025 | 0.023 | -8.6% | OK |
+| metamethod_add | 0.172 | 0.168 | -2.1% | OK |
+| lua_calls | 0.203 | 0.197 | -3.0% | OK |
+
+Geomean: 1.82x → 1.81x.
+
+**perf record top-symbols (metamethod_call_noalloc):**
+
+Before:
+- runBytecodeDispatch: 48.73%
+- pushBytecodeExecFrame: 14.94%
+- **resolveCallable: 13.67%** ← eliminated
+- tryPushSimpleResultMetamethod: 12.92%
+
+After:
+- runBytecodeDispatch: 32.69%
+- pushBytecodeExecFrame: 24.50%
+- tryPushSimpleResultMetamethod: 17.58%
+- getTmByObj: 11.40%
+- pushResolvedBytecodeClosure: 9.55%
+- **resolveCallable: 0%** (not in top symbols)
+
+### Gates
+
+- zig build test Debug + RF: PASS
+- /tmp/mm_check.lua: IDENTICAL (before vs after)
+- Smoke 64/64: byte-identical
+- matrix --testc: zig_fail=0 (big.lua both_fail pre-existing)
+- c_api test + test-diff: PASS (DIFF: PASS)
+- coroutine.lua: PASS (yield continuations)
+- nextvar 3×: PASS
+- CallFrame ≤ 104 bytes: PASS (Debug assert)

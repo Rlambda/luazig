@@ -504,9 +504,14 @@ pub const ProtoTreeOwner = struct {
     /// exists so closure-creation boundaries can Debug-assert the
     /// invariant cheaply.
     vm: ?*anyopaque = null,
-    /// Source backing (P16.10b Task 6, milestone 2): keeps alive the bytes
-    /// that the tree's debug lexeme slices borrow. Dropped at last release.
-    source_backing: SourceBacking = .none,
+    /// Source backing (P16.10b Task 6): keeps alive the bytes that the
+    /// tree's debug lexeme slices borrow (locvar/upvalue names, function
+    /// name, source_name; fixed-buffer undump also borrows long-string
+    /// constants). Attached by the load paths at owner scope; dropped at
+    /// last release. All buffers in here MUST be allocated with the
+    /// owner's allocator (they are, by construction: every attach site
+    /// compiles/undumps with the same allocator it backs with).
+    source_backing: SourceBacking = .{},
     /// See the struct doc above: true once the k pool's `.str` pointers
     /// belong to the VM string table (undumped trees: from birth;
     /// text-compiled trees: flipped by constant resolution, tree-wide).
@@ -519,20 +524,34 @@ pub const ProtoTreeOwner = struct {
     /// What keeps the source bytes alive for a tree that borrows debug
     /// slices from them (P16.10b Task 6). Populated by the load paths at
     /// owner creation; consumed (dropped) by the last release.
-    pub const SourceBacking = union(enum) {
-        /// Tree borrows nothing (e.g. undumped non-fixed trees whose name
-        /// slices were duplicated, or unit-test trees over static bytes).
-        none,
-        /// A GC-managed LuaString whose bytes the tree borrows (load from
-        /// a Lua string, fixed-buffer undump). NOT owned — never destroyed
-        /// here; the VM string table / GC owns it. Dropping the backing
-        /// only removes the tree's pin so the GC may reclaim the string
-        /// once no other reference exists. Retaining is the loader's job.
-        pinned_string: *vm.LuaString,
-        /// Heap bytes owned by the tree (reader-fn buffers, shebang
-        /// prefixed buffers, caller-owned name/bytes copies for the
-        /// Zig/C API compile paths). Freed at last release.
-        owned_bytes: []u8,
+    pub const SourceBacking = struct {
+        /// GC-managed LuaStrings whose bytes this tree borrows (source
+        /// text of load(string), fixed-buffer undump chunks, distinct
+        /// chunk-name strings). NOT owned — never destroyed here; the VM
+        /// string table / GC owns them. Uniqueness is NOT enforced
+        /// (marking is idempotent); attach sites avoid obvious dupes.
+        pinned: std.ArrayListUnmanaged(*vm.LuaString) = .empty,
+        /// Heap byte buffers the tree owns outright: reader-fn collection
+        /// buffers, shebang-prefixed buffers, copies of caller-owned
+        /// name/bytes for the Zig/C API compile path (S1b), CLI/REPL
+        /// source copies. Freed at last release.
+        owned: std.ArrayListUnmanaged([]u8) = .empty,
+        /// Individually-allocated debug-name copies made by
+        /// `cloneUndumpedStrings` (undumped non-fixed trees). Freed at
+        /// last release.
+        name_copies: std.ArrayListUnmanaged([]u8) = .empty,
+
+        /// Free everything tree-owned; pins are GC-owned and simply stop
+        /// being pinned (their survival is the GC's business).
+        pub fn deinit(self: *SourceBacking, alloc: std.mem.Allocator) void {
+            for (self.owned.items) |b| alloc.free(b);
+            for (self.name_copies.items) |b| alloc.free(b);
+            // pinned entries are GC-owned; only the list storage is ours.
+            self.pinned.deinit(alloc);
+            self.owned.deinit(alloc);
+            self.name_copies.deinit(alloc);
+            self.* = .{};
+        }
     };
 
     /// Add one reference (a Closure was created over this tree).
@@ -552,18 +571,9 @@ pub const ProtoTreeOwner = struct {
         // LuaStrings are NEVER destroyed here — `k_strings_vm_owned` says
         // whether the k pool still belongs to the tree.
         destroyProtoTree(alloc, self.root, self.k_strings_vm_owned);
-        // Source backing (Task 6): drop owned bytes; unpinned strings are
-        // left to the GC (we never held an owning reference).
-        switch (self.source_backing) {
-            .none => {},
-            .pinned_string => |s| {
-                // Unpin only if still registered with the VM's pin list is
-                // the VM's job (milestone 2 wires this); a plain unpinned
-                // owner must not touch GC objects.
-                _ = s;
-            },
-            .owned_bytes => |bytes| alloc.free(bytes),
-        }
+        // Source backing (Task 6): drop owned buffers and name copies;
+        // pinned strings are GC-owned and simply stop being pinned.
+        self.source_backing.deinit(alloc);
         alloc.destroy(self);
     }
 };

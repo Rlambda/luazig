@@ -135,7 +135,9 @@ fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: 
         // The undumped tree carries its producing reference (P16.10b
         // Task 4): release it when this function is done with the raw
         // proto — the executing closure created inside runBytecode takes
-        // its own retained reference.
+        // its own retained reference. (Non-fixed undump borrows debug
+        // name slices from the chunk bytes; the CLI's file buffer is
+        // process-lifetime, so no backing copy is needed here.)
         defer loaded_proto.tree.?.release();
         // Pre-resolve constants (strings already interned via callback).
         vm.preResolveUndumpedConstants(loaded_proto) catch return error.OutOfMemory;
@@ -185,6 +187,12 @@ fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: 
             // Task 4); the executing closure inside runBytecode retains
             // its own. Release ours on every exit of this path.
             defer proto.tree.?.release();
+            // Source backing (P16.10b Task 6): no copies needed here —
+            // the CLI's script buffers (loadFile/loadStdin in
+            // interpreterMain, never freed) are PROCESS-lifetime, so the
+            // tree's lexeme borrows are safe by construction. The REPL
+            // (reused per-line buffers) attaches owned copies instead —
+            // see tryCompile.
             // If --dump-bytecode was requested, print disassembly and exit.
             if (dump_bytecode) {
                 var out = stdio.stdout();
@@ -582,6 +590,30 @@ fn tryCompile(
     defer cg_bc.deinit();
     const proto = cg_bc.compileChunk(chunk) catch {
         return .{ .err_msg = std.fmt.allocPrint(aalloc, "{s}", .{cg_bc.diagString()}) catch return .oom };
+    };
+    // Source backing (P16.10b Task 6): the REPL reuses/frees its line
+    // buffers every iteration while the compiled tree (and closures that
+    // escaped into globals) may live much longer — the tree gets its own
+    // copies of the line bytes and chunk name. Failure to copy is OOM:
+    // release the tree and report it honestly.
+    const owner = proto.tree.?;
+    const bytes_copy = aalloc.dupe(u8, source.bytes) catch {
+        owner.release();
+        return .oom;
+    };
+    owner.source_backing.owned.append(aalloc, bytes_copy) catch {
+        aalloc.free(bytes_copy);
+        owner.release();
+        return .oom;
+    };
+    const name_copy = aalloc.dupe(u8, source.name) catch {
+        owner.release();
+        return .oom;
+    };
+    owner.source_backing.owned.append(aalloc, name_copy) catch {
+        aalloc.free(name_copy);
+        owner.release();
+        return .oom;
     };
     return .{ .proto = proto };
 }

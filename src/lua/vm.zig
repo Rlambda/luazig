@@ -11082,7 +11082,13 @@ pub const Vm = struct {
         // limit (LUAI_MAXSTACK). We use a high limit to prevent runaway
         // recursion from exhausting memory, but it should be high enough
         // that normal stack overflow occurs first.
-        const lua_max_call_frames: usize = if (self.activeErrorHandlerDepth() != 0) 10000 else 1000000;
+        // P16.10a T17: the error-handler-dependent frame limit is computed
+        // LAZILY inside the overflow branch below — calling
+        // activeErrorHandlerDepth() on every activation was measured at
+        // ~11% of this function (frame-push analysis artifact) and is
+        // provably needed only when the limit check actually trips.
+        const default_max_call_frames: usize = 1000000;
+        const error_handler_call_frames: usize = 10000;
         // PUC: LUAI_MAXSTACK = 1000000. Physical stack is LUAI_MAXSTACK +
         // ERRORSTACKSIZE. Overflow triggers at LUAI_MAXSTACK uniformly.
         // The extra ERRORSTACKSIZE slots are physical headroom so error
@@ -11191,11 +11197,23 @@ pub const Vm = struct {
         // the overflow check.
         if (handling_overflow) {
             if (needed_top > self.bc_stack.len) {
-                return self.fail("stack overflow error", .{});
+                return self.fail("stack overflow", .{});
             }
-        } else if (exec_frames.len() >= lua_max_call_frames or
-            needed_top > lua_stack_overflow_limit)
+        } else if (needed_top > lua_stack_overflow_limit or
+            exec_frames.len() >= error_handler_call_frames)
         {
+            // P16.10a T17: activeErrorHandlerDepth() was measured at ~11%
+            // of this function and is provably needed only when the limit
+            // check actually trips. The outer condition is a cheap
+            // superset (the smallest possible frame limit); the exact
+            // error-handler-dependent limit is resolved only here.
+            const effective_max_call_frames: usize = if (self.activeErrorHandlerDepth() != 0)
+                error_handler_call_frames
+            else
+                default_max_call_frames;
+            if (needed_top > lua_stack_overflow_limit or
+                exec_frames.len() >= effective_max_call_frames)
+            {
             // PUC luaD_growstack: on overflow, realloc to ERRORSTACKSIZE
             // (MAXSTACK + 200) to give the error handler room, then raise
             // the error. This bypasses ensureBcStackCap's MAXSTACK cap
@@ -11204,10 +11222,10 @@ pub const Vm = struct {
             if (self.bc_stack.len < PHYSICAL_LIMIT) {
                 const old_len = self.bc_stack.len;
                 self.bc_stack = self.alloc.realloc(self.bc_stack, PHYSICAL_LIMIT) catch {
-                    return self.fail("stack overflow error", .{});
+                    return self.fail("stack overflow", .{});
                 };
                 self.bc_boxed = self.alloc.realloc(self.bc_boxed, PHYSICAL_LIMIT) catch {
-                    return self.fail("stack overflow error", .{});
+                    return self.fail("stack overflow", .{});
                 };
                 // Initialize new slots.
                 @memset(self.bc_stack[old_len..], .Nil);
@@ -11215,7 +11233,8 @@ pub const Vm = struct {
                 // P15.51g: No per-frame slice refresh needed — regs/boxed
                 // are derived on demand from base + frame_cap.
             }
-            return self.fail("stack overflow error", .{});
+            return self.fail("stack overflow", .{});
+            }
         }
 
         try self.ensureBcStackCap(needed_top);

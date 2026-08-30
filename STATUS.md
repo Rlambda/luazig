@@ -1,4 +1,4 @@
-> Last updated: 2026-08-30 (P16.10a — callable metamethods (PUC two-stage), resolveCallable eliminated from hot path, lazy handler-limit, 64 smoke)
+> Last updated: 2026-08-30 (P16.10b — strip as serialization property (DumpOptions), cloneStrippedProto deleted, native-mem lanes, 65 smoke)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -5487,7 +5487,9 @@ Artifact: `tools/perf/current-proto-ownership-audit.json`
 - `resolved_values` is allocated from `self.alloc` (VM allocator) — vm.zig:6710.
 - After resolution, `k` is still read by: debug name resolution
   (vm.zig:24296-24430), OP_TAILCALL (vm.zig:14174), GC marking
-  (vm.zig:22271), `cloneStrippedProto` (vm.zig:23427).
+  (vm.zig:22271), `cloneStrippedProto` (vm.zig:23427)
+  [cloneStrippedProto removed in P16.10b — strip became a serialization
+  property of DumpWriter; this reader no longer exists].
 
 **No VM-binding enforcement:**
 - `Closure.proto` is `?*const bc.Proto` — raw pointer, no VM association
@@ -5509,6 +5511,11 @@ Proto tree may have protos resolved by different VMs. In contrast,
 **`cloneStrippedProto`** (vm.zig:23390-23449) shares `k`, `resolved_values`,
 and `constants_resolved` with the original — fragile borrowing with no
 reference counting. Dangling pointers if original freed first.
+**[Removed in P16.10b:** strip is now a serialization property
+(`dump.DumpOptions.strip`) applied field-by-field while writing, mirroring
+PUC `DumpState.strip`; no Proto clone exists anymore, and with it the
+borrowing hazard and its linear native-memory leak (see the P16.10b entry).
+**]**
 
 ### Required changes before moving resolution earlier
 
@@ -5517,8 +5524,9 @@ reference counting. Dangling pointers if original freed first.
 2. Make `resolved_values` Proto-owned (not VM-allocator-owned).
 3. Add VM-binding mechanism (`vm_owner` field + check in `resolveProtoConstants`).
 4. Make `resolveProtoConstants` recurse into child protos.
-5. Rethink `cloneStrippedProto` sharing (reference counting or independent
-   resolution).
+5. ~~Rethink `cloneStrippedProto` sharing (reference counting or independent
+   resolution).~~ [obsolete: clone removed in P16.10b — nothing borrows
+   `k`/`resolved_values` from another Proto anymore].
 
 **PUC comparison:** PUC Lua stores constants in runtime `TValue` format
 directly in `Proto.k` (lobject.h:614). The compiler interns strings through
@@ -5526,3 +5534,66 @@ the same global string table as the runtime, so constants are already
 interned and VM-neutral (one global state per `lua_State`). Our design defers
 resolution to first execution and mutates `k` in-place, creating VM-specific
 state that prevents Proto sharing.
+
+## P16.10b Tasks 0+1+2 — strip as serialization property; cloneStrippedProto deleted (2026-08-30)
+
+**Confirmed blocker (measured via tools/native_mem_check.py, wait4/rusage):**
+`string.dump(f, true)` in a loop grew RSS linearly — the strip path built a
+`cloneStrippedProto()` tree per dump (shallow/borrowed for
+code/k/live_reg_top/resolved_values/constants_resolved) that was never freed;
+generic `Proto.deinit` would have been wrong for it anyway (hidden borrow
+ownership). Lane reproducer: `tools/native_mem_lanes/repeated_stripped_dump.lua`
+— LINEAR at 611 MB/decade pre-fix.
+
+### Task 0 — permanent native-memory lanes
+
+`tools/native_mem_lanes/` (run with `tools/native_mem_check.py`; docs in
+`tools/perf/README.md`):
+
+| Lane | Before Task 1 | After Task 1 |
+|------|---------------|--------------|
+| `repeated_stripped_dump.lua` (dump(f,true) loop) | **LINEAR 611.09 MB/decade** | **BOUNDED 0.16 MB/decade** |
+| `repeated_plain_dump.lua` (dump(f,false) control) | BOUNDED 0.00 | BOUNDED 0.19 |
+| `repeated_dynamic_load.lua` (load("return 1") loop — verifier reproducer) | LINEAR 2333.00 | LINEAR 2332.99 (load-path fix is the next step; load paths untouched here) |
+
+### Task 1 — DumpOptions.strip: strip while serializing, never clone
+
+PUC `ldump.c` carries `DumpState.strip` and omits debug info while writing —
+no Proto clone. luazig now mirrors that architecture:
+
+- `dump.DumpOptions = struct { strip: bool = false }`;
+  `dumpProto`/`dumpChunk` take options. When strip: source_name serialized
+  as the empty string (PUC's `dumpString(NULL)`; the loader's
+  `readStringDedup` maps it to "" exactly like PUC's `loadString` returns
+  NULL), name empty, lineinfo length 0, locvars length 0 (PUC writes n=0 —
+  not "same count with empty names"), upvalue *names* empty while the
+  descriptors (count + instack/idx/is_const) stay — execution needs them.
+  Children stripped recursively. line_defined/last_line_defined, code, k,
+  flags, numparams/maxstacksize unchanged (PUC dumps them unconditionally).
+  No clone anywhere; a future PUC-compat dumper reuses the same option.
+- `builtinStringDump` and C API `lua_dump` pass `.strip` straight through.
+- **`cloneStrippedProto` deleted** (with its seen-maps and borrowing
+  comments); zero references remain in src/.
+- NULL-source rendering parity (empty `source_name` + empty `lineinfo` =
+  PUC's NULL-source/proto-stripped state, `protoIsStripped`):
+  - `debug.getinfo` 'S': source `"=?"`, short_src `"?"` (PUC ldebug.c:269-273);
+  - runtime errors inside stripped functions: `"?:?: msg"` (PUC `luaG_addinfo`
+    NULL-source branch; unified across `fail()` err_obj baking and
+    `protectedErrorString`);
+  - traceback: line number appended only when `currentline > 0` and
+    stripped frames render `?:` (PUC lauxlib.c:148-151) — this also fixed a
+    pre-existing `?:0:` vs `?:` traceback divergence for stripped frames.
+
+### Gates after Task 1 (all green)
+
+- `zig build test` Debug + ReleaseFast: 169/169.
+- smoke: 64/64 byte-identical (23/31/58/64 re-verified).
+- matrix `--testc`: zig_fail=0 (big.lua both_fail — pre-existing, infra).
+- c_api `make test` + `make test-diff`: ALL PASS / DIFF: PASS.
+- nextvar 3x: identical (only the time-seeded "seeds 0X…" line varies;
+  PUC-vs-PUC varies there too).
+
+### Open (next steps)
+
+- `repeated_dynamic_load` lane still LINEAR — dynamic-load retention fix is
+  the next agent's step (load paths deliberately untouched here).

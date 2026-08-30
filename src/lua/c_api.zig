@@ -773,17 +773,11 @@ pub export fn lua_dump(
     const proto = cl.proto orelse return 1; // C closure — cannot dump
 
     // Serialize the Proto tree into a binary chunk via DumpWriter.
-    // When `strip` is set, PUC clones the Proto with debug info removed.
-    // We mirror that via `cloneStrippedProto` (same as `string.dump`).
-    const dump_proto: *const bc.Proto = if (strip != 0) blk: {
-        var seen_bc = std.AutoHashMapUnmanaged(*const bc.Proto, *bc.Proto){};
-        defer seen_bc.deinit(vm.alloc);
-        break :blk vm.cloneStrippedProto(proto, &seen_bc) catch return 1;
-    } else proto;
-
+    // `strip` is a serialization property (PUC DumpState.strip): the
+    // writer omits debug fields while serializing — no Proto clone.
     var dw = dump_mod.DumpWriter.init(vm.alloc);
     defer dw.deinit();
-    dw.dumpChunk(dump_proto) catch return 1;
+    dw.dumpChunk(proto, .{ .strip = strip != 0 }) catch return 1;
     const bytes = dw.toOwnedSlice() catch return 1;
     defer vm.alloc.free(bytes);
 

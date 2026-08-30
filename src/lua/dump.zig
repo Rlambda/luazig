@@ -16,6 +16,36 @@ const std = @import("std");
 const bc = @import("bytecode.zig");
 
 // ---------------------------------------------------------------------------
+// DumpOptions — serialization-time strip control (PUC DumpState.strip)
+// ---------------------------------------------------------------------------
+
+/// Options controlling how a Proto tree is serialized. This mirrors PUC
+/// Lua's `DumpState` (ldump.c), which carries a `strip` flag through the
+/// whole dump and *omits debug information while serializing* — no Proto
+/// clone is ever built. Keeping strip a property of the writer (rather
+/// than of the data) also means a future PUC-compatible dumper needs no
+/// clone: it would pass the same option down its own field writers.
+pub const DumpOptions = struct {
+    /// When true, debug information is omitted from the output:
+    ///   - source name is written as the empty string (PUC's `dumpString`
+    ///     with a NULL source: the loader maps it back to a NULL-ish
+    ///     source and `debug.getinfo` renders it as "=?" / "?"),
+    ///   - function name is written empty,
+    ///   - line info length is written as 0 (no entries),
+    ///   - local variables length is written as 0 (no entries),
+    ///   - upvalue *names* are written empty (the descriptors themselves —
+    ///     count, instack/idx/is_const — stay: execution needs them),
+    ///   - nested protos are stripped recursively.
+    /// Everything semantic — bytecode, constants, parameter/register
+    /// counts, line-defined range, flags — is byte-for-byte identical to
+    /// a non-stripped dump, so a stripped chunk executes exactly like the
+    /// original function. This matches PUC `dumpFunction`/`dumpDebug`
+    /// (ldump.c), which dump the semantic fields unconditionally and gate
+    /// only the debug fields on `D->strip`.
+    strip: bool = false,
+};
+
+// ---------------------------------------------------------------------------
 // DumpWriter — buffered binary writer with primitive encoders
 // ---------------------------------------------------------------------------
 
@@ -228,17 +258,30 @@ pub const DumpWriter = struct {
     ///  12.  p.len                 u32, then each child Proto recursively
     ///  13.  lineinfo.len          u32, then each entry as u32 (absolute line numbers)
     ///  14.  locvars.len           u32, then each: name string, reg byte, startpc u32, endpc u32
-    pub fn dumpProto(self: *DumpWriter, proto: *const bc.Proto) !void {
-        _ = self.dumpProtoImpl(proto, true) catch return error.OutOfMemory;
+    ///
+    /// With `options.strip`, the debug fields are omitted per
+    /// `DumpOptions` — the Proto itself is never copied or mutated.
+    pub fn dumpProto(self: *DumpWriter, proto: *const bc.Proto, options: DumpOptions) !void {
+        _ = self.dumpProtoImpl(proto, true, options) catch return error.OutOfMemory;
     }
 
-    fn dumpProtoImpl(self: *DumpWriter, proto: *const bc.Proto, is_main: bool) !void {
-        // 1. Source name — PUC writes f->source for ALL protos (main + inner).
-        // When strip=true, cloneStrippedProto already cleared source_name.
+    fn dumpProtoImpl(self: *DumpWriter, proto: *const bc.Proto, is_main: bool, options: DumpOptions) !void {
         _ = is_main;
-        try self.writeStringDedup(proto.source_name);
-        // 2. Function name.
-        try self.writeStringDedup(proto.name);
+        // 1. Source name — PUC writes f->source for ALL protos (main +
+        // inner). When stripping, PUC dumps NULL instead; the empty
+        // string is our NULL-source marker on the wire (the loader
+        // returns "" for it exactly like PUC's loadString returns NULL).
+        if (options.strip) {
+            try self.writeStringDedup("");
+        } else {
+            try self.writeStringDedup(proto.source_name);
+        }
+        // 2. Function name (debug-only field — stripped to empty).
+        if (options.strip) {
+            try self.writeStringDedup("");
+        } else {
+            try self.writeStringDedup(proto.name);
+        }
         // 3-4. Line range.
         try self.writeU32(proto.line_defined);
         try self.writeU32(proto.last_line_defined);
@@ -271,33 +314,54 @@ pub const DumpWriter = struct {
         }
 
         // 11. Upvalues: length prefix, then each as (instack, idx, is_const, name).
+        // The descriptors (count + instack/idx/is_const) are semantic —
+        // the loader needs them to bind upvalues — so they are never
+        // stripped. Only the *names* are debug info (PUC dumps upvalue
+        // names in dumpDebug, gated on strip): write them empty instead.
         try self.writeU32(@intCast(proto.upvalues.len));
         for (proto.upvalues) |uv| {
             try self.writeByte(@intFromBool(uv.instack));
             try self.writeByte(uv.idx);
             try self.writeByte(@intFromBool(uv.is_const));
-            try self.writeStringDedup(uv.name);
+            if (options.strip) {
+                try self.writeStringDedup("");
+            } else {
+                try self.writeStringDedup(uv.name);
+            }
         }
 
-        // 12. Inner protos: length prefix, then each child recursively.
+        // 12. Inner protos: length prefix, then each child recursively
+        // (strip applies to the whole tree).
         try self.writeU32(@intCast(proto.p.len));
         for (proto.p) |child| {
-            try self.dumpProtoImpl(child, false);
+            try self.dumpProtoImpl(child, false, options);
         }
 
         // 13. Line info: length prefix, then each absolute line number as u32.
-        try self.writeU32(@intCast(proto.lineinfo.len));
-        for (proto.lineinfo) |line| {
-            try self.writeU32(line);
+        // Stripped: length 0 only (PUC dumpDebug writes n=0 for lineinfo).
+        if (options.strip) {
+            try self.writeU32(0);
+        } else {
+            try self.writeU32(@intCast(proto.lineinfo.len));
+            for (proto.lineinfo) |line| {
+                try self.writeU32(line);
+            }
         }
 
         // 14. Locals: length prefix, then each as (name, reg, startpc, endpc).
-        try self.writeU32(@intCast(proto.locvars.len));
-        for (proto.locvars) |lv| {
-            try self.writeStringDedup(lv.name);
-            try self.writeByte(lv.reg);
-            try self.writeU32(lv.startpc);
-            try self.writeU32(lv.endpc);
+        // Stripped: length 0 only (PUC dumpDebug writes n=0 for locvars —
+        // not "same count with empty names", which would carry useless
+        // entries on the wire and resurrect phantom locals in the loader).
+        if (options.strip) {
+            try self.writeU32(0);
+        } else {
+            try self.writeU32(@intCast(proto.locvars.len));
+            for (proto.locvars) |lv| {
+                try self.writeStringDedup(lv.name);
+                try self.writeByte(lv.reg);
+                try self.writeU32(lv.startpc);
+                try self.writeU32(lv.endpc);
+            }
         }
     }
 
@@ -308,11 +372,13 @@ pub const DumpWriter = struct {
     ///
     /// The single byte after the header is the main function's upvalue count
     /// (PUC writes `sizeupvalues` here). The body that follows is the main
-    /// Proto serialized via `dumpProto`.
-    pub fn dumpChunk(self: *DumpWriter, main: *const bc.Proto) !void {
+    /// Proto serialized via `dumpProto` with the given options (strip is a
+    /// property of the serialization, exactly like PUC's `luaU_dump`
+    /// passing its `strip` argument into `DumpState`).
+    pub fn dumpChunk(self: *DumpWriter, main: *const bc.Proto, options: DumpOptions) !void {
         try self.writeHeader();
         try self.writeByte(@intCast(main.upvalues.len));
-        try self.dumpProto(main);
+        try self.dumpProto(main, options);
     }
 };
 
@@ -453,4 +519,120 @@ test "DumpWriter: dumpConstant nil/bool/int/num" {
     const n_bits = std.mem.readInt(u64, w.buf.items[13..21], .little);
     const nf: f64 = @bitCast(n_bits);
     try std.testing.expectEqual(@as(f64, 3.14), nf);
+}
+
+// ---------------------------------------------------------------------------
+// Strip (DumpOptions) tests
+// ---------------------------------------------------------------------------
+
+// A two-level Proto tree with debug info on both levels, used by the strip
+// tests below. Built statically so the assertions are stable.
+test "DumpWriter: strip omits debug fields, keeps semantic fields" {
+    const undump = @import("undump.zig");
+
+    const inner_insts = [_]bc.Instruction{
+        bc.Instruction.make(.return1, 0, 0, 0),
+    };
+    const inner_ks = [_]bc.Constant{.{ .int = 7 }};
+    const empty_uvs = [_]bc.Upvaldesc{};
+    const empty_ps = [_]*bc.Proto{};
+    const inner_lis = [_]u32{ 3, 3 };
+    const inner_lvs = [_]bc.LocVar{.{ .name = "a", .reg = 0, .startpc = 0, .endpc = 1 }};
+    const inner = bc.Proto{
+        .code = &inner_insts,
+        .k = @constCast(&inner_ks),
+        .p = &empty_ps,
+        .upvalues = &empty_uvs,
+        .lineinfo = &inner_lis,
+        .locvars = &inner_lvs,
+        .maxstacksize = 2,
+        .numparams = 1,
+        .is_vararg = false,
+        .vararg_table_reg = null,
+        .name = "inner",
+        .source_name = "src.lua",
+        .line_defined = 2,
+        .last_line_defined = 3,
+    };
+
+    const outer_uvs = [_]bc.Upvaldesc{
+        .{ .instack = false, .idx = 0, .is_const = true, .name = "x" },
+    };
+    const outer_ps = [_]*bc.Proto{@constCast(&inner)};
+    const outer_lis = [_]u32{ 1, 1, 2 };
+    const outer = bc.Proto{
+        .code = &inner_insts,
+        .k = @constCast(&inner_ks),
+        .p = &outer_ps,
+        .upvalues = &outer_uvs,
+        .lineinfo = &outer_lis,
+        .locvars = &inner_lvs,
+        .maxstacksize = 3,
+        .numparams = 0,
+        .is_vararg = true,
+        .vararg_table_reg = null,
+        .name = "outer",
+        .source_name = "src.lua",
+        .line_defined = 0,
+        .last_line_defined = 4,
+    };
+
+    // Strip must produce a strictly smaller chunk (debug bytes dropped).
+    var w_plain = DumpWriter.init(std.testing.allocator);
+    defer w_plain.deinit();
+    try w_plain.dumpChunk(&outer, .{});
+
+    var w_strip = DumpWriter.init(std.testing.allocator);
+    defer w_strip.deinit();
+    try w_strip.dumpChunk(&outer, .{ .strip = true });
+
+    try std.testing.expect(w_strip.buf.items.len < w_plain.buf.items.len);
+    // Both carry the same 40-byte header.
+    try std.testing.expectEqualSlices(
+        u8,
+        w_plain.buf.items[0..40],
+        w_strip.buf.items[0..40],
+    );
+
+    // Round-trip the stripped chunk and verify semantics vs debug fields.
+    var r = undump.UndumpReader.init(std.testing.allocator, w_strip.buf.items);
+    defer r.deinit();
+    const out = try r.undumpChunk();
+    defer {
+        out.deinit(std.testing.allocator);
+        std.testing.allocator.destroy(out);
+    }
+
+    // Debug info: gone (NULL source = "", no name, no lines, no locals,
+    // no upvalue names) — on BOTH levels of the tree.
+    try std.testing.expectEqualSlices(u8, "", out.source_name);
+    try std.testing.expectEqualSlices(u8, "", out.name);
+    try std.testing.expectEqual(@as(usize, 0), out.lineinfo.len);
+    try std.testing.expectEqual(@as(usize, 0), out.locvars.len);
+    try std.testing.expectEqual(@as(usize, 1), out.upvalues.len);
+    try std.testing.expectEqualSlices(u8, "", out.upvalues[0].name);
+    // The upvalue *descriptor* survives: execution needs it.
+    try std.testing.expectEqual(false, out.upvalues[0].instack);
+    try std.testing.expectEqual(@as(u8, 0), out.upvalues[0].idx);
+    try std.testing.expectEqual(true, out.upvalues[0].is_const);
+
+    try std.testing.expectEqual(@as(usize, 1), out.p.len);
+    const child = out.p[0];
+    try std.testing.expectEqualSlices(u8, "", child.source_name);
+    try std.testing.expectEqualSlices(u8, "", child.name);
+    try std.testing.expectEqual(@as(usize, 0), child.lineinfo.len);
+    try std.testing.expectEqual(@as(usize, 0), child.locvars.len);
+
+    // Semantic metadata: unchanged (PUC keeps linedefined etc. in strips).
+    try std.testing.expectEqual(@as(u32, 0), out.line_defined);
+    try std.testing.expectEqual(@as(u32, 4), out.last_line_defined);
+    try std.testing.expectEqual(@as(u8, 0), out.numparams);
+    try std.testing.expectEqual(@as(u8, 3), out.maxstacksize);
+    try std.testing.expectEqual(true, out.is_vararg);
+    try std.testing.expectEqual(@as(usize, 1), out.code.len);
+    try std.testing.expectEqual(@as(usize, 1), out.k.len);
+    try std.testing.expectEqual(@as(i64, 7), out.k[0].int);
+    try std.testing.expectEqual(@as(u32, 2), child.line_defined);
+    try std.testing.expectEqual(@as(u32, 3), child.last_line_defined);
+    try std.testing.expectEqual(@as(u8, 1), child.numparams);
 }

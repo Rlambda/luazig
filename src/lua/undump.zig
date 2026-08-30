@@ -614,7 +614,7 @@ test "UndumpReader: undumpProto round-trips a simple Proto" {
         .last_line_defined = 2,
     };
 
-    try w.dumpProto(&proto);
+    try w.dumpProto(&proto, .{});
 
     var r = UndumpReader.init(std.testing.allocator, w.buf.items);
     defer r.deinit();
@@ -685,7 +685,7 @@ test "UndumpReader: undumpProto round-trips vararg + upvalues + locvars" {
         .last_line_defined = 6,
     };
 
-    try w.dumpProto(&proto);
+    try w.dumpProto(&proto, .{});
 
     var r = UndumpReader.init(std.testing.allocator, w.buf.items);
     defer r.deinit();
@@ -741,7 +741,7 @@ test "UndumpReader: undumpChunk round-trips a full chunk" {
         .last_line_defined = 0,
     };
 
-    try w.dumpChunk(&proto);
+    try w.dumpChunk(&proto, .{});
 
     var r = UndumpReader.init(std.testing.allocator, w.buf.items);
     defer r.deinit();
@@ -815,7 +815,7 @@ test "UndumpReader: undumpProto round-trips nested protos" {
         .last_line_defined = 6,
     };
 
-    try w.dumpProto(&outer);
+    try w.dumpProto(&outer, .{});
 
     var r = UndumpReader.init(std.testing.allocator, w.buf.items);
     defer r.deinit();

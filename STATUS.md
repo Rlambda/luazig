@@ -1,4 +1,4 @@
-> Last updated: 2026-08-30 (P16.10b — strip as serialization property (DumpOptions), cloneStrippedProto deleted, native-mem lanes, 65 smoke)
+> Last updated: 2026-08-30 (P16.10b — Proto tree lifetime: ownership inventory, ProtoTreeOwner, source backing, adoption; 66 smoke)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -5641,3 +5641,28 @@ no Proto clone. luazig now mirrors that architecture:
 
 - `repeated_dynamic_load` lane still LINEAR — dynamic-load retention fix is
   the next agent's step (load paths deliberately untouched here).
+
+## P16.10b Tasks 3–15 — Proto tree lifetime owner (2026-08-30, in progress)
+
+Verifier P16.10b follow-up: the confirmed dynamic-load blocker
+(`gcFreeObject(.closure)` never frees `closure.proto`; many closures share one
+tree; children outlive parents) plus the supporting ownership mechanisms
+(source pinning, lazy constant resolution, ownership-hack deinit, missing GC
+accounting).
+
+- [x] Task 3 — ownership inventory artifact `tools/ownership/proto-inventory.json`:
+  every production Proto creation audited (compile sites, undump, CLI, OP_CLOSURE
+  sharing, C API); SUPPORTED sharing = OP_CLOSURE children (parent-dies-child-lives);
+  cross-VM sharing: none found → runtime trees one-VM-bound; borrowing map for
+  lexemes/source_name/k-str provenance; latent hazards documented (reader-fn
+  `source_owned`/`prefixed_owned` leaks, compileChunkValue dangling-name UAF,
+  resolveProtoConstants OOM re-destroy of VM strings).
+- [ ] Task 4/5 — `ProtoTreeOwner` (refcounted per-tree lifetime owner; structural
+  deinit; error paths; GC accounting).
+- [ ] Task 6 — source backing tied to the tree; `pinned_source_strings` retired;
+  repeated_dynamic_load lane BOUNDED.
+- [ ] Task 7/8/15 — adoption at closure-creation/load/VM-bind; no first-call
+  mutation; per-call A/B.
+- [ ] Task 9 — structural tree deinit (constants_resolved hack deleted).
+- [ ] Task 11 — proto-tree GC accounting via gcNoteAlloc/gcNoteFree.
+- [ ] Task 12/13 — child-outlives-root differential smoke; FailingAllocator tests.

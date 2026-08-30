@@ -1,0 +1,123 @@
+{
+  "created_utc": "2026-08-30T10:20:00Z",
+  "head": "c455b9c",
+  "task": "P16.10b Task 3 — production Proto creation ownership inventory",
+  "purpose": "Grep-audit of EVERY production Proto creation path. Drives the ProtoTreeOwner design (Tasks 4-9) from actual creation sites, not hypotheticals. Verified by reading each call site; file:line refer to c455b9c.",
+  "method": "All Proto allocations funnel through exactly two constructors: bc.ProtoBuilder.finish() (text compiler) and undump.UndumpReader.undumpProto() (binary loader). Every caller of those two was traced to its Lua/CLI/C-API trigger, its allocator, and its error paths. OP_CLOSURE creates NO new Proto (shares an existing tree node). string.dump creates NO Proto since P16.10b T1 (DumpOptions.strip).",
+
+  "sites": [
+    {
+      "id": "S1",
+      "path": "src/lua/codegen_bc.zig:6851 Codegen.compileChunk -> ProtoBuilder.finish (bytecode.zig:724)",
+      "trigger": "text compilation (all of S1a-S1d below)",
+      "creation": "one heap Proto per function; children finish() first (compileChildFunction:4630), then parent adopts via addProto; root returned",
+      "allocator": "the Codegen's allocator == its caller's allocator (see S1a-S1d)",
+      "tree_shape": "root + recursive children via proto.p; acyclic by construction (children never reference parents)",
+      "keeps_alive_today": "NOTHING. gcFreeObject(.closure) (vm.zig:21996) frees upvalues + struct only; the 'Closure owns the Proto' comments (vm.zig:23312-23316, 23596-23597) are FALSE — no production code path ever frees a Proto. Proto.deinit is called only from unit tests (bytecode.zig:845,869; codegen_bc.zig:6931..7379).",
+      "releases_today": "none -> repeated load() grows linearly (lane repeated_dynamic_load: ~2333 MB/decade)",
+      "error_before_closure": "compile error after some children finished: finished children sit in Codegen.builder.protos; Codegen.deinit (codegen_bc.zig:575) frees only the builder's ArrayList storage, NOT the finished Proto trees -> partial-tree leak on error. Callers then return error.Syntax; no closure exists, nobody owns the orphans.",
+      "sharing": "parent->children static; OP_CLOSURE (S5) shares children"
+    },
+    {
+      "id": "S1a",
+      "path": "src/lua/vm.zig:23064 compileTextChunk -> dynamic_bytecode_compiler (CLI: src/bin/luazig.zig:49 compileDynamicBytecode)",
+      "trigger": "Lua load(text), loadfile, dofile; the ONLY path for dynamic text loads in the CLI",
+      "allocator": "vm.alloc (the compiler callback receives self.alloc)",
+      "keeps_alive_extra": "Vm.pinned_source_strings pins the source LuaString forever (vm.zig:23626) because compiled protos borrow lexeme slices (locvar names, upvalue names, function name, source_name when default) from the source bytes; compileChunkValue callers additionally pass caller-owned buffers (see S2)",
+      "notes": "load(reader-fn) collects pieces into source_owned heap slice (vm.zig:23519) that is NEVER freed (leak) and IS borrowed by the tree; shebang chunks build prefixed_owned heap slice (vm.zig:23533) likewise never freed and borrowed. Both are un-pinned hazards/leaks the tree owner must absorb."
+    },
+    {
+      "id": "S1b",
+      "path": "src/lua/vm.zig:23026 compileChunkValue",
+      "trigger": "Zig API State.load/compileChunk (api.zig:750,1204) and C API lua_load (c_api.zig:742), luaL_loadbufferx (c_api.zig:1007), luaL_loadstring (c_api.zig:1022)",
+      "allocator": "vm.alloc",
+      "keeps_alive_extra": "bytes/name are BORROWED from the caller: lua_load/luaL_loadbufferx collect into a temporary buffer that is deinit'd at return (c_api.zig:732) or point at a caller C buffer -> compiled protos' name slices dangle today (latent UAF, masked because tests keep the buffer alive / use literals)",
+      "notes": "owner must take a copy of name+bytes for this path (no GC object exists to retain)"
+    },
+    {
+      "id": "S1c",
+      "path": "src/lua/vm.zig:17302 testc bootstrap; vm.zig:37501 testc loadfile",
+      "trigger": "T module enable; T.loadfile testC command",
+      "allocator": "vm.alloc",
+      "notes": "same lifetime shape as S1a; bounded count (once per VM for bootstrap; per T.loadfile call for loadfile)"
+    },
+    {
+      "id": "S2",
+      "path": "src/lua/undump.zig:314 undumpProto / :463 undumpChunk",
+      "trigger": "Lua load(binary-chunk-string) (vm.zig:23567), CLI execution of a binary script (src/bin/luazig.zig:121-136)",
+      "creation": "recursive deserialize; every array freshly allocated; name slices (source_name, name, upvalue/locvar names) alias the input chunk bytes",
+      "allocator": "reader.alloc == vm.alloc (load path) / runtime_alloc (CLI)",
+      "keeps_alive_today": "nothing for the Proto itself; fixed-buffer mode ('B'): code/lineinfo/long-string constants + all name slices alias the chunk buffer -> Vm.pinned_source_strings pins the source LuaString forever (vm.zig:23583). non-fixed: cloneUndumpedStrings (vm.zig:23367) dupes name slices into vm.alloc (self-contained tree; the dupes leak with the tree)",
+      "releases_today": "none",
+      "error_before_closure": "TruncatedChunk/BadHeader/OOM mid-undump: no errdefer in undumpProto -> partially built tree + interned strings leak (invisible under test arenas, real under smp)",
+      "sharing": "constant strings are interned INTO the VM during undump (undumpInternCallback vm.zig:23282) — the tree is born VM-string-bound"
+    },
+    {
+      "id": "S3",
+      "path": "src/bin/luazig.zig:175 (script), :574 tryCompile (REPL), :121 (binary script)",
+      "trigger": "CLI script execution / REPL line / luac-style binary run",
+      "allocator": "runtime_alloc == the VM's allocator family (smp_allocator, tracked, or c_allocator — interpreterMain:1035-1042); NOT an arena",
+      "keeps_alive_today": "runBytecode (vm.zig:11690) creates + GC-registers the chunk closure; the proto tree itself is kept alive by the same nobody-as-S1 (leak per REPL line today)",
+      "releases_today": "none (REPL grows per compiled line)",
+      "error_before_closure": "compile failure -> message printed, tree orphans leak as S1",
+      "notes": "no closure is created before runBytecode; the VM-bind boundary (runBytecodeInternal) is where this tree first meets the GC world"
+    },
+    {
+      "id": "S5",
+      "path": "src/lua/vm.zig:14690 OP_CLOSURE handler",
+      "trigger": "executing a closure-creating instruction",
+      "creation": "NO new Proto. closure.proto = parent_tree.p[b] — the child proto is SHARED: many closures may reference one child, and child closures routinely outlive the root closure (returning nested functions is idiomatic)",
+      "sharing_verdict": "SUPPORTED sharing, not theoretical: every Lua program returning an inner function exercises parent-dies-child-lives. Any ownership model MUST keep the tree alive while ANY closure of ANY node lives.",
+      "release_implication": "freeing the tree when the ROOT closure dies (naive 'closure owns proto') is incorrect; gcFreeObject(.closure) must release a per-TREE reference, not free a per-closure proto"
+    },
+    {
+      "id": "S6",
+      "path": "string.dump / lua_dump (vm.zig:23171, c_api.zig:756)",
+      "trigger": "serialization",
+      "creation": "NONE since P16.10b T1 (strip is a DumpOptions serialization property; cloneStrippedProto deleted)",
+      "notes": "read-only consumer of the tree; byte-source for the S2 roundtrip lane"
+    },
+    {
+      "id": "S7",
+      "path": "tests: bytecode.zig:830-876, codegen_bc.zig:6925-7382, undump.zig:581-838, dump.zig:586-601, vm.zig:40467+ (P16.8a manual closures)",
+      "trigger": "unit tests only",
+      "allocator": "std.testing.allocator / arenas",
+      "keeps_alive_today": "tests call proto.deinit(alloc) + destroy(proto) manually",
+      "notes": "test-only; will be migrated to the tree-owner deinit (Proto.deinit's constants_resolved hack is deleted with it)"
+    }
+  ],
+
+  "cross_vm_sharing": {
+    "found": false,
+    "evidence": "every text compile and every undump happens inside exactly one Vm (compiler callback and undump intern callback both close over self: *Vm); the CLI runs a single Vm per process; c_api suites create a fresh Vm per test and load fresh chunks into it. No production path hands a Proto tree to a second Vm.",
+    "implication_for_task_8": "runtime trees are one-VM-bound in practice -> VM-interned constants living in the tree are legitimate; enforce with a Debug assert (owner.vm == executing vm) at the execution boundary rather than runtime machinery."
+  },
+
+  "borrowing_map": {
+    "text_compiled_tree_borrows": [
+      "proto.locvars[*].name, proto.upvalues[*].name, proto.name — lexeme slices into the SOURCE BYTES (codegen slices ast spans against self.source)",
+      "proto.source_name — chunk name bytes: either the source string itself (default), a distinct caller name string (load(s, name)), or caller memory (compileChunkValue/S1b)"
+    ],
+    "undumped_tree_borrows": [
+      "non-fixed: name slices alias the chunk buffer -> currently duped by cloneUndumpedStrings (self-contained)",
+      "fixed ('B'): code/lineinfo arrays conceptually + ALL name slices + long-string constants (external LuaStrings) alias the chunk buffer -> currently VM-pinned forever"
+    ],
+    "resolution_state_borrows": [
+      "post-resolution k.str entries are VM-interned (owned by VM string table); pre-resolution they are seed-0 LuaStrings owned by the tree (Proto.deinit's constants_resolved hack encodes exactly this ambiguity per-proto)"
+    ]
+  },
+
+  "gc_accounting_today": {
+    "charged": "Closure struct+upvalue-ptrs (gcNoteAlloc at 11711/14751/23015/23336), Cells, strings interned at resolution",
+    "not_charged": "ALL Proto-tree memory (structs, code, k, p, lineinfo, locvars, live_reg_top, resolved_values, cloneUndumpedStrings dupes) and the pinned source strings' extra retention is charged only via their original string alloc",
+    "result": "collectgarbage('count') under-reports by every live chunk's tree size; gcNoteFree in gcFreeObject(.closure) credits only the Closure — balanced but blind to trees"
+  },
+
+  "design_conclusions": [
+    "C1: A per-TREE refcounted owner is the smallest clean fit: sharing is per-tree (S5), roots die before children (S5), and exactly two construction sites (S1, S2) plus one VM-bind site (S3) must create it. VM-global retention is wrong (a long-lived VM must collect dead chunks) and no site needs cross-VM sharing (cross_vm_sharing).",
+    "C2: Owner must absorb source backing: retained LuaString refs for load(string)/fixed-undump, owned heap copies for reader-fn buffers, prefixed buffers, and compileChunkValue caller memory (S1a/S1b/S2). This retires Vm.pinned_source_strings entirely.",
+    "C3: k-string ownership must become structural: provenance (text-compiled vs undumped) + a single atomic tree-wide 'adopted' flip on the owner — replacing per-proto constants_resolved and fixing the latent re-resolution destroy-VM-string OOM bug in resolveProtoConstants (intern fallible AFTER in-place destroys).",
+    "C4: Error paths to fix while introducing the owner: Codegen.deinit must free finished-but-unclaimed protos (S1); undumpProto needs errdefer partial-tree cleanup (S2); closure-alloc failure after compile must release the tree (Tasks 13).",
+    "C5: Charge tree bytes to the VM when the tree is bound to it (all load paths + CLI runBytecode bind with the same allocator family today); credit on last release. resolved_values charged when built."
+  ]
+}

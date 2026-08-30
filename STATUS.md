@@ -5657,12 +5657,39 @@ accounting).
   lexemes/source_name/k-str provenance; latent hazards documented (reader-fn
   `source_owned`/`prefixed_owned` leaks, compileChunkValue dangling-name UAF,
   resolveProtoConstants OOM re-destroy of VM strings).
-- [ ] Task 4/5 — `ProtoTreeOwner` (refcounted per-tree lifetime owner; structural
-  deinit; error paths; GC accounting).
+- [x] Task 4/5 (Milestone 1) — `ProtoTreeOwner` refcounted per-tree lifetime
+  owner in bytecode.zig: created at the two construction funnels
+  (`ProtoBuilder.finish` rebinds adopted child owners; `undumpChunk` binds the
+  deserialized tree, k strings VM-owned from birth). Every bytecode Closure
+  carries `tree: ?*ProtoTreeOwner` (+8 B, Debug-asserted == proto.tree);
+  closure creation retains (`retainTreeForClosure`, binds owner.vm identity),
+  `gcFreeObject(.closure)` releases — last release runs `destroyProtoTree`
+  exactly once. Producer-reference discipline at ALL inventory sites (S1a-d,
+  S2, S3, testc, T.loadfile, CLI script/binary/REPL/--dump-bytecode):
+  errdefer-release before closure, explicit drop after. Error paths fixed:
+  `Codegen.deinit` releases finished-but-unclaimed protos; `addProto` releases
+  the child on append failure; `finish()` errdefers free partial slices;
+  `undumpProto` errdefers free partial trees (truncated-chunk loop in
+  calls.lua exercises them); `createBytecodeChunkClosure` errdefer unregisters
+  partial cells. Undumped trees: `k_strings_vm_owned = true` from construction.
+- [x] Task 9 (Milestone 1) — per-proto `constants_resolved` DELETED. Ownership
+  meaning → structural `ProtoTreeOwner.k_strings_vm_owned` (provenance:
+  text=false until resolution, undump=true from birth); readiness meaning →
+  tree-wide `ProtoTreeOwner.constants_resolved`. `resolveProtoConstants` is
+  now TREE-WIDE and two-phase (stage interned resolved_values for the whole
+  tree first — no mutation; then publish: swap k pointers, destroy seed
+  strings iff !k_strings_vm_owned, flip flags) — kills the latent OOM
+  re-resolution bug (intern fallible AFTER in-place destroys).
+  `preResolveUndumpedConstants` is tree-wide alloc-only on the same flag.
+  Lane repeated_dynamic_load: 141.7/313.0/2254.1 MB (100k/300k/1M) →
+  **15.6/15.6/15.4 MB — BOUNDED** (Proto-tree retention blocker CLOSED;
+  LUAZIG_TRACK_ALLOC leak map: 1×64B VM singleton outstanding, trees fully
+  cycle). Remaining M2 work: `pinned_source_strings` still grows per load
+  (same-pointer pins) and is scanned by every GC cycle → O(pins×cycles)
+  quadratic TIME on the lane (300k: 23.9s), retired in Task 6.
 - [ ] Task 6 — source backing tied to the tree; `pinned_source_strings` retired;
   repeated_dynamic_load lane BOUNDED.
 - [ ] Task 7/8/15 — adoption at closure-creation/load/VM-bind; no first-call
   mutation; per-call A/B.
-- [ ] Task 9 — structural tree deinit (constants_resolved hack deleted).
 - [ ] Task 11 — proto-tree GC accounting via gcNoteAlloc/gcNoteFree.
 - [ ] Task 12/13 — child-outlives-root differential smoke; FailingAllocator tests.

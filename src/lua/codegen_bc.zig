@@ -3839,7 +3839,12 @@ pub const Codegen = struct {
         if (nc.kid == null) return true; // small int: all comparison ops
         if (nc.is_float) {
             // Integer-valued float (e.g. -4.0, 128.0): usable as immediate
-            // if the integer value fits sC. Mirrors PUC isSCnumber.
+            // if the integer value fits sC. Mirrors PUC isSCnumber. The
+            // range guard BEFORE @intFromFloat is required: constants like
+            // 1e308 are finite but out of i64 range — Debug panics on the
+            // conversion, ReleaseFast is UB (matrix SIGABRT in math/api/
+            // strings comparison folding).
+            if (!std.math.isFinite(nc.fval) or @abs(nc.fval) >= 9.2e18) return false;
             const as_int: i64 = @intFromFloat(nc.fval);
             if (@as(f64, @floatFromInt(as_int)) != nc.fval) return false;
             return fitsSC(as_int);
@@ -3858,6 +3863,9 @@ pub const Codegen = struct {
     /// isSCnumber → sC encoding in codeeq/codeorder.
     fn normalizeCmpConst(nc: NumConst) NumConst {
         if (nc.kid != null and nc.is_float) {
+            // Same i64-range guard as rhsConstUsableForCmp: out-of-range
+            // finite floats (1e308) must not reach @intFromFloat.
+            if (!std.math.isFinite(nc.fval) or @abs(nc.fval) >= 9.2e18) return nc;
             const as_int: i64 = @intFromFloat(nc.fval);
             if (@as(f64, @floatFromInt(as_int)) == nc.fval and fitsSC(as_int)) {
                 return .{ .ival = as_int, .is_float = true, .fval = nc.fval };

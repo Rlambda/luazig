@@ -1,4 +1,4 @@
-> Last updated: 2026-08-30 (P16.10b — Proto tree lifetime: ownership inventory, ProtoTreeOwner, source backing, adoption; 66 smoke)
+> Last updated: 2026-08-31 (P16.10b — GC forward barrier fix: gcQueueScanObject instead of gcSetBlack; gcResetCycleState preserves gc_gray for minor cycles; gcAtomicCommon Step 13 always drains gc_gray; noyield TBC-close; weak-key clearKey; locals.lua 10/10)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -3917,6 +3917,63 @@ Debug+RF tests; c_api 18/18 + strict DIFF; matrix zig_fail=0; smoke 62/62;
 nextvar 10/10; 58-62 byte-identical; mm_check IDENTICAL; gc/gengc/closure/
 coroutine/events/errors 0/0 оба рантайма; leak_bench; native_mem BOUNDED;
 CallFrame ≤104; Node 32B.
+
+## P16.10b (продолжение) — GC forward barrier fix: locals.lua 10/10 (2026-08-31)
+
+### Корневая причина
+Две ошибки в GC generational mode:
+
+1. **Forward barriers used `gcSetBlack` instead of `gcQueueScanObject`**:
+   `gcWriteBarrierCell`, `gcStoreClosureEnv`, `gcStoreMetatable` marked values
+   BLACK directly without adding to gray list. PUC's `luaC_barrier_` calls
+   `reallymarkobject` which links tables/closures/threads to gray list for
+   traversal. Result: value survives (BLACK) but its children (e.g.,
+   metatable) stay WHITE → freed by sweep → use-after-free.
+
+2. **`gcResetCycleState` cleared `gc_gray` at minor cycle start**:
+   PUC's `youngcollection` does NOT clear `g->gray`. Forward barriers during
+   mutator code add young objects to `g->gray` via `reallymarkobject`. If
+   cleared, those objects are lost — they stay GRAY but are never traversed.
+
+### Исправления
+- **`gcResetCycleState`**: no longer clears `gc_gray` (matches PUC
+  `youngcollection`). `gcStartCycle` (incremental mode only) clears
+  `gc_gray` separately (matches PUC `startcycle`).
+- **Forward barriers** (`gcWriteBarrierCell`, `gcStoreClosureEnv`,
+  `gcStoreMetatable`): replaced `gcSetBlack` with `gcQueueScanObject` —
+  queues non-string objects for traversal by `gcDrainGray`, ensuring
+  children are marked.
+- **`gcAtomicCommon` Step 13**: separated `gcDrainGrayagain` (skip in minor)
+  from `gcDrainGray` (always call) — finalizers may add to `gc_gray` via
+  forward barriers; without draining, queued objects' children stay unmarked.
+- **`gcPropagateOne` parked coroutine scan**: use `live_reg_top[pc]` (not
+  `@max(live_top, bytecode_stack_top - base)`) as scan bound for parked
+  coroutines — matches PUC's `L->stack[0..L->top]` behavior. Scanning above
+  `live_reg_top[pc]` would mark dead registers with stale pointers.
+- **Weak-key clearKey fix**: PUC weak-key handling first empties the value
+  (`setempty`), then clears the key. `if (mode.weak_k) node.value = .Nil`
+  before `ltable.clearKey(node)`.
+- **Noyield TBC-close**: TBC closes are non-yieldable while the innermost
+  pending error-unwind is a bottom-propagate (no protected frame — PUC
+  `luaD_throw` → `luaE_resetthread` → `closeprotected(yy=0)`).
+
+### Отложено
+- **`gcPropagateOne` cell arm** (PUC `traverseupvalue`): marking
+  `cell.value` during traversal is PUC-faithful but exposes a pre-existing
+  bug where cell values are freed by sweep (cells not properly traversed in
+  previous cycles). Causes db.lua --testc SIGABRT. Left as TODO comment.
+- **`gcClearDeadFrameRegisters` for all threads**: clearing dead registers
+  in parked coroutine stacks is needed for stale-pointer prevention but
+  causes regressions (sort.lua, db.lua, events.lua). The parked-coroutine
+  scan bound fix (`live_reg_top[pc]` instead of `bytecode_stack_top`) is a
+  sufficient alternative.
+
+### Результаты
+- `python3 tools/testes_matrix.py --testc`: **zig_fail=0**, both_fail=1 (big.lua, pre-existing)
+- `locals.lua --testc` ×10: **10/10 OK** (Debug + ReleaseFast)
+- Smoke 66/66 pass
+- `zig build test` Debug + ReleaseFast pass
+- Repros (/tmp/t1245_6.lua, /tmp/t2345_6.lua, /tmp/pfx6.lua): all pass
 
 ## P16.10b (продолжение) — корень locals.lua SIGSEGV найден (2026-08-30)
 

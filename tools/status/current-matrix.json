@@ -1,23 +1,23 @@
 {
   "meta": {
-    "created_utc": "2026-08-29T22:56:34.954955+00:00",
+    "created_utc": "2026-08-31T00:42:35.250987+00:00",
     "lane": "testes_matrix",
     "argv": [
       "/home/boss/codes/luazig/tools/testes_matrix.py",
       "--testc",
       "--json-out",
-      "/home/boss/codes/luazig/tools/status/.tmp.matrix.xo9aklxu.json"
+      "/home/boss/codes/luazig/tools/status/.tmp.matrix.jzt5ooly.json"
     ],
     "zig_version": "0.16.0"
   },
   "summary": {
     "total": 32,
-    "pass": 31,
+    "pass": 30,
     "output_diff": 0,
     "zig_fail": 0,
     "both_fail": 1,
     "both_fail_infra": 0,
-    "zig_only_pass": 0
+    "zig_only_pass": 1
   },
   "rows": [
     {
@@ -31,11 +31,11 @@
     },
     {
       "file": "attrib.lua",
-      "class": "pass",
-      "ref_exit": 0,
+      "class": "zig_only_pass",
+      "ref_exit": 1,
       "zig_exit": 0,
       "zig_reason": "",
-      "ref_reason": "",
+      "ref_reason": "assertion failed",
       "diff": ""
     },
     {

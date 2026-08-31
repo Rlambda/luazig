@@ -22,38 +22,37 @@ The project is in a **pre-release / parity-focused** state.
 
 | Metric | Result |
 |--------|--------|
-| Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
-| Matrix non-pass | both_fail: big.lua |
-| Smoke tests (`tests/smoke/*.lua`) | **64/64** match (byte-identical stdout+stderr+exit) |
-| C API suites (`tests/c_api`) | 18 suites (gate: `make -C tests/c_api test`) |
+| Upstream matrix (`testes/*.lua`, `--testc`) | _not run — no matrix JSON provided_ |
+| Smoke tests (`tests/smoke/*.lua`) | _not run — no smoke JSON provided_ |
+| C API suites (`tests/c_api`) | 19 suites (gate: `make -C tests/c_api test`) |
 
 Regression lane: `python3 tools/testes_matrix.py --testc` (no `_port`/`_soft` prelude overrides).
 
 ### Performance
 
-Geomean slowdown vs PUC Lua: **1.84x** (lower is better; 1.0x = parity).
+Geomean slowdown vs PUC Lua: **1.80x** (lower is better; 1.0x = parity).
 Method: median-of-5 per workload, pinned CPU core (`tools/perf_compare.py`).
 
 | Workload | Zig/PUC |
 |----------|--------:|
-| metamethod_add | 2.80x |
-| metamethod_call_noalloc | 2.71x |
-| table_alloc_setmetatable | 2.18x |
-| lua_calls | 2.17x |
+| metamethod_add | 2.69x |
+| metamethod_call_noalloc | 2.65x |
+| lua_calls | 2.15x |
 | hash_access | 2.11x |
-| coroutine_yield | 2.11x |
-| field_access | 2.09x |
+| coroutine_yield | 2.09x |
+| table_alloc_setmetatable | 2.00x |
+| field_access | 1.94x |
 | array_access | 1.92x |
 | branch_loop | 1.89x |
-| temp_table_alloc | 1.77x |
-| global_arith | 1.70x |
-| mixed_arith | 1.69x |
-| dynamic_load | 1.65x |
-| comparisons | 1.62x |
-| float_arith | 1.59x |
-| int_arith | 1.50x |
+| global_arith | 1.74x |
+| temp_table_alloc | 1.72x |
+| mixed_arith | 1.63x |
+| dynamic_load | 1.56x |
+| comparisons | 1.55x |
+| float_arith | 1.54x |
+| int_arith | 1.54x |
 | string_loop | 1.28x |
-| string_concat | 1.16x |
+| string_concat | 1.10x |
 <!-- END GENERATED STATUS -->
 
 See [STATUS.md](STATUS.md) for detailed profiling methodology, hotspot analysis, and optimization history.

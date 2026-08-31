@@ -1,1 +1,1 @@
-P16.10 — dispatch floor: jump-table verified (computed-goto не диагноз), stack-poll+SIGINT cleanups, 75→70 instr/iter
+P16.10b — Proto lifetime (tree owner, source backing, adoption), strip-serialization, load lane BOUNDED, GC forward-barrier/gray-lifecycle fixes, noyield TBC-close; matrix green

@@ -1,4 +1,4 @@
-> Last updated: 2026-08-31 (P16.10b — GC forward barrier fix: gcQueueScanObject instead of gcSetBlack; gcResetCycleState preserves gc_gray for minor cycles; gcAtomicCommon Step 13 always drains gc_gray; noyield TBC-close; weak-key clearKey; locals.lua 10/10)
+> Last updated: 2026-08-31 (P16.10 — dispatch floor: jump-table verified (computed-goto не диагноз), stack-poll+SIGINT cleanups, 75→70 instr/iter)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -31,14 +31,13 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 <!-- BEGIN GENERATED SUMMARY (tools/status_summary.py) -->
 | Metric | Result |
 |--------|--------|
-| Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
-| Matrix non-pass | both_fail: big.lua |
-| Differential output (`--diff`) | **0 output_diff** |
-| Smoke tests (`tests/smoke/*.lua`) | **64/64** pass |
-| C API suites (`tests/c_api`) | 18 suites |
-| Performance (geomean vs PUC) | **1.84x** |
+| Upstream matrix (`testes/*.lua`, `--testc`) | _not run — no matrix JSON provided_ |
+| Differential output (`--diff`) | _not run_ |
+| Smoke tests (`tests/smoke/*.lua`) | _not run — no smoke JSON provided_ |
+| C API suites (`tests/c_api`) | 19 suites |
+| Performance (geomean vs PUC) | **1.80x** |
 
-Geomean замедления vs PUC Lua: **1.84x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.80x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -4004,6 +4003,31 @@ CallFrame ≤104; Node 32B.
    noyield-путём (аналог resetthread-closeprotected), yield из __close в
    этом пути → "attempt to yield across a C-call boundary" (ldo.c:125-148,
    lstate.c resetthread, lfunc.c:108-120).
+
+## P16.10b (финал) — GC-lifecycle фиксы закрывают locals.lua (2026-08-30)
+
+### Цепочка закрытия (после root-cause 29ae846)
+1. **Прямые барьеры не траверсили детей**: gcWriteBarrierCell /
+   gcStoreClosureEnv / gcStoreMetatable делали gcSetBlack БЕЗ обхода —
+   PUC luaC_barrier_ вызывает reallymarkobject (gray-list). Дети оставались
+   белыми → sweep освобождал → UAF (крэш-цепочка в locals TBC-корутинах).
+   Фикс: gcQueueScanObject.
+2. **gcResetCycleState чистил gc_gray в минорных циклах** — PUC
+   youngcollection НЕ чистит g->gray (барьеры мутатора добавляют туда).
+   Фикс: gc_gray чистится только gcStartCycle (инкрементальный режим).
+3. **gcAtomicCommon Step 13** всегда дренирует gc_gray (финалайзеры).
+4. **Паркованные корутины**: обход по live_reg_top[pc] (не stack_top) —
+   PUC L->stack[0..top].
+5. Noyield TBC-close (bottom-propagate unwind) + weak-key clearKey
+   (setempty до deaden — lgc.c:796-798) + 3 mode-aware varargs-слайса
+   (591f120, e33daf6) + codegen i64-guard (@intFromFloat на 1e308 —
+   math/api/strings Debug-crash).
+   Отложено (TODO в коде): traverseupvalue-эквивалент для cell-arm —
+   exposes предсуществующий бф — отдельная задача.
+
+### Гейт: matrix zig_fail=0; locals --testc 10/10; smoke 66/66; c_api
+18+diff; nv10; 6 сьютов; leak/native BOUNDED; tbcw = PUC-identical
+(«attempt to yield across a C-call boundary»).
 
 ## История закрытых фаз
 

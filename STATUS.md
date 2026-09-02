@@ -3968,6 +3968,60 @@ Can Cell enter gc_gray? NO. Can Cell enter gc_grayagain? NO.
 - smoke 66/66 pass
 - zig build test Debug + ReleaseFast pass
 
+## P16.10c (verifier Tasks 5+6) — upvalue GC lifetime smoke + Cell sweep invariant (2026-09-02)
+
+### Task 5 — tests/smoke/67_upvalue_gc_lifetime.lua
+Permanent differential smoke covering the verifier's 9 upvalue/Cell GC-lifetime
+scenarios. Byte-identical stdout+exit on PUC 5.5 and luazig, deterministic
+(identical sha256 ×3 on both runtimes), <5ms. Each scenario runs under BOTH GC
+modes (incremental + generational) via the 63-smoke `under_mode` pattern. Probes
+use weak-key/weak-value sentinels, booleans, ordered traces — no
+`collectgarbage("count")`, no addresses, no `count()` of internals.
+
+Encoded PUC behavior (prototyped against the oracle first):
+1. live closure → closed Cell → collectable table → full GC → child SURVIVES;
+   weak-value sentinel alive.
+2. open captured local on an active frame → GC mid-frame → child reads correct
+   (open cell reads the stack; active frame is a root).
+3. open captured local in a SUSPENDED coroutine → GC from caller → resume →
+   correct (suspended thread's stack is GC-reachable).
+4. parent frame dies, child closure survives → UpVal closes (stack value
+   snapshotted into cell.value) → child valid (P16.4e/P16.10 pattern).
+5. multiple closures share one Cell; drop one → other unaffected (shared cell).
+6. SETUPVAL stores young collectable into AGED cell → minor+full GC → SURVIVES
+   (write barrier marks the young value); clear cell → COLLECTED (weak-value
+   sentinel clears).
+7. repeated open/close/collect transitions (loop create-capture-close-collect).
+8. incremental AND generational modes (exercised by `under_mode`).
+9. weak-key + weak-value sentinels proving SURVIVAL (closure live) and
+   COLLECTION (closure dropped + local strong ref cleared).
+
+`tests/smoke/48_finalizer_upvalue.lua` EXISTS (verifier-listed) — covers the
+gc.lua ">>> closing state <<<" finalizer-uses-upvalue gap; green.
+
+### Task 6 — Cell sweep invariant (Debug-only, env-gated)
+`gcFreeObject` `.cell` case: Debug-only diagnostic capturing WHY the cell died
+(open/closed state, color, age, gc_index), printed when
+`LUAZIG_CELL_SWEEP_DEBUG=1` is set. Gated by `@import("builtin").mode == .Debug`
+(comptime-eliminated in ReleaseFast → zero cost) AND
+`stdio.activeEnviron().containsConstant(...)` (env-gated, matching the existing
+`LUAZIG_TRACE_OOM` pattern). No behavior change when unset.
+
+Targeted matrix run with the flag ON (Debug build):
+db.lua/locals.lua/closure.lua/coroutine.lua/gc.lua/gengc.lua --testc + full
+smoke 67 — observed-dead-cell count at sweep: 0 anomalies (no reachable Cell
+observed dead; expected). Cells freed at sweep are genuinely unreachable.
+
+### Результаты (Tasks 5+6)
+- smoke 67/67 green (45_userdata_capi = pre-existing .so symbol build artifact,
+  not in retained-green list; 48/57/63/66 all green)
+- matrix --testc: zig_fail=0, output_diff=0 (big.lua both_fail pre-existing;
+  attrib.lua zig_only_pass — ref assertion, not a regression)
+- db.lua --testc: OK
+- 67 ×3 stability: identical sha256 on both runtimes
+- Debug run of 67 with LUAZIG_CELL_SWEEP_DEBUG=1: clean (no anomalies)
+
+
 ## P16.10b (продолжение) — GC forward barrier fix: locals.lua 10/10 (2026-08-31)
 
 ### Корневая причина

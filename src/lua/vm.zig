@@ -4014,28 +4014,21 @@ pub const Vm = struct {
     fn closeThreadOpenUpvalues(self: *Vm, th: *Thread) void {
         for (th.bytecode_boxed) |maybe_cell| {
             if (maybe_cell) |cell| {
-                // PUC luaF_closeupval: setobj(slot, uv->v.p); uv->v.p = slot.
-                // cell.close copies the stack value into cell.value and
-                // clears bc_stack_idx/bc_stack_thread.
+                // PUC luaF_closeupval (lfunc.c:197-210): setobj(slot, uv->v.p);
+                // uv->v.p = slot. cell.close copies the stack value into
+                // cell.value and clears bc_stack_idx/bc_stack_thread.
                 cell.close(self);
-                // PUC luaF_closeupval: nw2black + luaC_barrier — fire the
-                // write barrier for the now-closed cell so GC invariants
-                // hold (the cell's value changed from a stack reference to
-                // an inline value).
-                //
-                // PUC's luaC_barrier is infallible: it uses intrusive gclist
-                // pointers (no allocation). Our gcWriteBarrierCell can fail
-                // with OOM because it appends to dynamic arrays (gc_old1 /
-                // gc_gray). This is an architectural difference, not a PUC
-                // semantics divergence. Swallowing the error here (in
-                // closeThreadOpenUpvalues, called from gcFreeObject during
-                // sweep) is the only safe option: propagating from inside
-                // GC sweep would be disastrous. The risk is a rare
-                // use-after-free if a young value in an old cell is not
-                // barrier-marked, but this only manifests under OOM during
-                // GC — PUC doesn't have this issue because its barrier
-                // doesn't allocate.
-                self.gcWriteBarrierCell(cell, cell.value) catch {};
+                // PUC luaF_closeupval (lfunc.c:205-208): if !iswhite(uv):
+                //   nw2black(uv) + luaC_barrier(L, uv, slot).
+                // Closed upvalues cannot be gray — fix color to black.
+                // The forward barrier marks the copied value. Do NOT rely
+                // on the child having been marked earlier (PUC barriers
+                // explicitly, and this runs during gcFreeObject sweep where
+                // the thread's stack is about to be freed).
+                if (!gcIsWhite(cell.gc_marked)) {
+                    gcSetBlack(&cell.gc_marked);
+                    self.gcWriteBarrierCell(cell, cell.value) catch {};
+                }
             }
         }
     }
@@ -7106,15 +7099,16 @@ pub const Vm = struct {
                 // then mark as closed (bc_stack_idx = null).
                 // PUC luaF_close: uv->u.value = *uv->v.p; uv->v.p = &uv->u.value
                 cell.close(self);
-                // Fire the write barrier for the now-closed cell.
-                // PUC's luaC_barrier is infallible (intrusive gclist, no
-                // allocation). Our gcWriteBarrierCell can OOM on dynamic
-                // array append — an architectural difference. Swallowing is
-                // safe here: the cell is already closed (value copied), and
-                // the barrier only affects generational/incremental marking
-                // accuracy. A missed barrier under OOM risks a young value
-                // not being marked — but PUC doesn't have this failure mode.
-                self.gcWriteBarrierCell(cell, cell.value) catch {};
+                // PUC luaF_closeupval (lfunc.c:205-208): if !iswhite(uv):
+                //   nw2black(uv) + luaC_barrier(L, uv, slot).
+                // Closed upvalues cannot be gray — fix color to black.
+                // The forward barrier marks the copied value if the cell
+                // is black and the value is white. Do NOT rely on the
+                // child having been marked earlier (PUC barriers explicitly).
+                if (!gcIsWhite(cell.gc_marked)) {
+                    gcSetBlack(&cell.gc_marked);
+                    self.gcWriteBarrierCell(cell, cell.value) catch {};
+                }
                 boxed[i] = null;
             }
         }
@@ -15471,11 +15465,12 @@ pub const Vm = struct {
                 for (ctx.boxed) |*bc_slot| {
                     if (bc_slot.*) |cell| {
                         cell.close(self);
-                        // PUC's luaC_barrier is infallible (intrusive gclist).
-                        // Our gcWriteBarrierCell can OOM on dynamic array
-                        // append — architectural difference. See comment in
-                        // closeBytecodeUpvaluesFrom for full rationale.
-                        self.gcWriteBarrierCell(cell, cell.value) catch {};
+                        // PUC luaF_closeupval (lfunc.c:205-208): if !iswhite:
+                        //   nw2black + luaC_barrier. Fix color, then barrier.
+                        if (!gcIsWhite(cell.gc_marked)) {
+                            gcSetBlack(&cell.gc_marked);
+                            self.gcWriteBarrierCell(cell, cell.value) catch {};
+                        }
                         bc_slot.* = null;
                     }
                 }
@@ -20185,6 +20180,14 @@ pub const Vm = struct {
                 std.debug.assert(false);
             }
         }
+        // Cell is structurally excluded from gc_gray: PUC propagatemark
+        // (lgc.c:727-740) has no LUA_VUPVAL case. Delegate immediately to
+        // markCell (PUC reallymarkobject LUA_VUPVAL), which sets open→gray
+        // or closed→black and marks the value inline — never queues.
+        if (obj == .cell) {
+            try self.markCell(obj.cell);
+            return;
+        }
         if (!gcIsWhite(p.marked.*)) return;
         // PUC reallymarkobject: GCmarked += objsize(o). Track marked KB
         // for checkmajorminor (tobecollected = total - marked).
@@ -20207,35 +20210,132 @@ pub const Vm = struct {
         try self.gcQueueScanObject(obj);
     }
 
-    fn gcQueueScanCell(self: *Vm, cell: *Cell) DispatchError!void {
-        // PUC reallymarkobject for LUA_VUPVAL (lgc.c:347-354):
-        //   - open upvalues are kept GRAY (not black) to avoid barriers;
-        //     their values live on the thread's stack and are revisited
-        //     by the thread scan or remarkupvals.
-        //   - closed upvalues are set BLACK DIRECTLY and their content
-        //     is marked inline via markvalue. They do NOT enter the gray
-        //     list — PUC propagatemark (lgc.c:727-740) has no LUA_VUPVAL
-        //     case. Routing closed cells through gc_gray would queue them
-        //     for deferred propagation, which is the opposite of PUC.
+    // ═══════════════════════════════════════════════════════════════════════
+    // CELL GC INVENTORY — source-of-truth table for every Cell path.
+    //
+    // PUC facts (lgc.c, lfunc.c):
+    //   - reallymarkobject LUA_VUPVAL (lgc.c:347-354): open→gray+markvalue
+    //     inline; closed→black+markvalue inline. NO gray-list enqueue.
+    //   - propagatemark (lgc.c:727-740): NO LUA_VUPVAL case (default
+    //     lua_assert(0)). Cell never enters gc_gray as a work item.
+    //   - remarkupvals (lgc.c:406-426): iterates twups list; for each
+    //     non-white open upvalue (assert isgray), markvalue(uv->v.p).
+    //     Does NOT change the upvalue's color — stays gray.
+    //   - luaF_closeupval (lfunc.c:197-210): on close, if !iswhite(uv):
+    //     nw2black(uv) + luaC_barrier(L, uv, slot). Forward barrier.
+    //   - luaC_barrier (lgc.h:245-246): forward barrier — isblack(p) &&
+    //     iswhite(o) → luaC_barrier_ (reallymarkobject(v) + setage).
+    //   - luaC_barrierback_ (lgc.c:268): backward barrier — used for
+    //     tables/userdata, NEVER for upvalues.
+    //
+    // ┌─────────────────────────────┬──────────┬─────────────────────┬──────────────┬────────────────────┐
+    // │ operation                   │ open/cld │ color transition    │ list entered │ marks value inline?│
+    // ├─────────────────────────────┼──────────┼─────────────────────┼──────────────┼────────────────────┤
+    // │ markCell (reallymarkobject) │ open     │ white→gray          │ NONE         │ YES (cell.get)     │
+    // │ markCell (reallymarkobject) │ closed   │ white→black         │ NONE         │ YES (cell.value)   │
+    // │ markCellForce (markold)     │ open     │ black→gray          │ NONE         │ YES (cell.get)     │
+    // │ markCellForce (markold)     │ closed   │ black→black         │ NONE         │ YES (cell.value)   │
+    // │ gcQueueScanObject(.cell)    │ both     │ delegates to markCell│ NONE        │ (via markCell)     │
+    // │ gcQueueScanCell             │ both     │ delegates to markCell│ NONE        │ (via markCell)     │
+    // │ gcPropagateOne(.cell)       │ N/A      │ unreachable         │ N/A          │ N/A                │
+    // │ gcRemarkUpvals              │ open     │ gray→gray (no chg)  │ NONE         │ YES (cell.get)     │
+    // │ gcDrainGrayagain(.cell)     │ N/A      │ unreachable         │ N/A          │ N/A                │
+    // │ gcWriteBarrierCell          │ open     │ no-op (PUC no barr) │ NONE         │ no                 │
+    // │ gcWriteBarrierCell          │ closed   │ forward barrier     │ NONE         │ marks value if blk │
+    // │ gcForwardBarrierCell        │ N/A      │ closure→cell fwd    │ gc_old1(gen)│ marks cell.get     │
+    // │ gcStoreCellValue            │ open     │ stack write+noop   │ NONE         │ no (stack author.) │
+    // │ gcStoreCellValue            │ closed   │ value write+fwd barr│ NONE        │ via barrier        │
+    // │ closeBytecodeUpvaluesFrom   │ open→cld │ nw2black+barrier    │ NONE         │ barrier marks val  │
+    // │ closeThreadOpenUpvalues     │ open→cld │ nw2black+barrier    │ NONE         │ barrier marks val  │
+    // │ OP_CLOSURE (cell creation)  │ open     │ white (new)         │ NONE         │ no (stack author.) │
+    // │ SETUPVAL (gcStoreCellValue) │ closed   │ value write+barrier │ NONE         │ via barrier        │
+    // │ gcFreeObject(.cell)         │ both     │ freed               │ NONE         │ N/A                │
+    // │ gcCorrectGrayAgain          │ N/A      │ unreachable         │ N/A          │ N/A                │
+    // │ gcRememberCell              │ N/A      │ dead code (never    │ N/A          │ N/A                │
+    // │                             │          │ called)             │              │                    │
+    // └─────────────────────────────┴──────────┴─────────────────────┴──────────────┴────────────────────┘
+    //
+    // Can Cell enter gc_gray?      NO — markCell never appends; gcQueueScanObject(.cell) delegates to markCell.
+    // Can Cell enter gc_grayagain? NO — gcRememberCell is never called; gcPromoteYoungObject skips cells for
+    //                                 grayagain (cells processed by markold via markCellForce, not grayagain).
+    //
+    // Every call site that marks a Cell delegates to markCell:
+    //   - gcQueueScanObject(.cell) at ~line 20194
+    //   - gcQueueScanCell (this function) — called from gcPropagateOne closure traversal,
+    //     gcPropagateOne thread frame boxed-slot scan, gcMarkMutableRoots boxed-slot scan
+    //   - gcRemarkUpvals (open-cell value re-mark, PUC remarkupvals)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// PUC reallymarkobject for LUA_VUPVAL (lgc.c:347-354). The ONE primitive
+    /// for marking a Cell. Implements the PUC rule exactly:
+    ///   - open + white  → set GRAY, mark stack-backed value (cell.get) inline.
+    ///     Never append to gc_gray — PUC propagatemark has no LUA_VUPVAL case.
+    ///     The value is re-marked by gcRemarkUpvals (PUC remarkupvals) during
+    ///     atomic, which iterates open upvalues of marked threads.
+    ///   - closed + white → set BLACK, mark cell.value inline.
+    ///     Never append to gc_gray — closed upvalues are fully traversed here.
+    ///   - non-white → no-op (already visited, like PUC's valiswhite guard).
+    ///
+    /// Accounting preserved: gc_gen_marked_kb (major-cycle marked tracking)
+    /// and gc_mark_epoch (ephemeron convergence signal) are bumped when the
+    /// cell transitions from white, matching gcQueueScanObject's accounting.
+    fn markCell(self: *Vm, cell: *Cell) DispatchError!void {
         if (cell.isOpen()) {
+            // Open: PUC reallymarkobject — only process white cells.
+            // Non-white open upvalues are already visited (gray from a
+            // previous mark). Their values are re-marked by gcRemarkUpvals.
             if (!gcIsWhite(cell.gc_marked)) return;
+            if (self.gc_gen_phase == .major) {
+                self.gc_gen_marked_kb += @as(f64, @floatFromInt(gcObjectBytes(.{ .cell = cell }))) / 1024.0;
+            }
+            // PUC lgc.c:349-350: set2gray(uv) — open upvalues kept gray.
             gcSetGray(&cell.gc_marked);
-            // PUC reallymarkobject (lgc.c:347-354): open upvalues are set
-            // GRAY and their value is marked inline. They are NOT added to
-            // grayagain — PUC never puts upvalues in grayagain. Their values
-            // are re-marked by remarkupvals during atomic (lgc.c:406-426),
-            // which iterates the twups list (threads with open upvalues).
+            // PUC lgc.c:353: markvalue(g, uv->v.p) — mark stack-backed value.
             try self.gcMarkValue(cell.get(self));
-            return;
+            self.gc_mark_epoch += 1;
+        } else {
+            // Closed: mark value unconditionally. Some cells are unregistered
+            // (e.g. the main chunk's _ENV cell created in luazig.zig) with
+            // gc_marked=0 — they never go through the normal mark cycle, so
+            // their value must be marked here regardless of the cell's color.
+            // Color transition and accounting only for white cells (PUC
+            // reallymarkobject: set2black + GCmarked += objsize).
+            if (gcIsWhite(cell.gc_marked)) {
+                if (self.gc_gen_phase == .major) {
+                    self.gc_gen_marked_kb += @as(f64, @floatFromInt(gcObjectBytes(.{ .cell = cell }))) / 1024.0;
+                }
+                // PUC lgc.c:352: set2black(uv) — closed upvalues visited here.
+                gcSetBlack(&cell.gc_marked);
+                self.gc_mark_epoch += 1;
+            }
+            // PUC lgc.c:353: markvalue(g, uv->v.p) — mark inline value.
+            try self.gcMarkValue(cell.value);
         }
-        // Closed upvalue: mark content inline (PUC-faithful).
-        // The cell's own color is managed separately (it may be unregistered
-        // — e.g. the main chunk's _ENV cell created in luazig.zig — so we
-        // must mark cell.value regardless of the cell's own mark state,
-        // exactly as A2 did and as PUC's reallymarkobject does for
-        // closed upvalues: the value is traversed unconditionally.
-        if (gcIsWhite(cell.gc_marked)) gcSetBlack(&cell.gc_marked);
-        try self.gcMarkValue(cell.value);
+    }
+
+    /// PUC `reallymarkobject` called from `markold` (lgc.c:1283) on BLACK
+    /// OLD1 objects. Unlike `markCell`, this has NO white guard — markold
+    /// re-traverses already-marked objects to catch young children added
+    /// after the initial mark. Matches PUC exactly: set color (open→gray,
+    /// closed→black) + markvalue inline. Never appends to gc_gray.
+    fn markCellForce(self: *Vm, cell: *Cell) DispatchError!void {
+        if (cell.isOpen()) {
+            // PUC lgc.c:349-350: set2gray(uv) — open upvalues kept gray.
+            gcSetGray(&cell.gc_marked);
+            // PUC lgc.c:353: markvalue(g, uv->v.p) — mark stack-backed value.
+            try self.gcMarkValue(cell.get(self));
+        } else {
+            // PUC lgc.c:352: set2black(uv) — closed upvalues visited here.
+            gcSetBlack(&cell.gc_marked);
+            // PUC lgc.c:353: markvalue(g, uv->v.p) — mark inline value.
+            try self.gcMarkValue(cell.value);
+        }
+    }
+
+    /// Named entry point for call sites that identify the operand as a *Cell
+    /// (not a GcObject or Value). Delegates to markCell — the single primitive.
+    fn gcQueueScanCell(self: *Vm, cell: *Cell) DispatchError!void {
+        try self.markCell(cell);
     }
 
     /// PUC luaC_barrierback_ (lgc.c:208-222) for generational mode.
@@ -20930,11 +21030,26 @@ pub const Vm = struct {
         try self.gc_grayagain.append(self.alloc, .{ .userdata = owner });
     }
 
-    /// PUC forward barrier for cell/upvalue writes (lgc.h:238 `luaC_barrier`):
+    /// PUC forward barrier for cell/upvalue writes (lgc.h:245 `luaC_barrier`):
     /// Cell value assignment uses the FORWARD barrier — mark the VALUE if
     /// the cell is black. This matches PUC's luaC_barrier(L, owner, val)
     /// used by lua_setupvalue and OP_SETUPVAL.
+    ///
+    /// OPEN cells: NO barrier. PUC never barriers open upvalue writes —
+    /// the stack slot is authoritative and is marked by thread traversal
+    /// (gcMarkMutableRoots / gcPropagateOne thread scan) and re-marked by
+    /// gcRemarkUpvals (PUC remarkupvals). Open upvalues are kept GRAY
+    /// (not black) by markCell, so isblack(uv) is false — the PUC
+    /// luaC_barrier macro is a no-op for gray owners.
+    ///
+    /// CLOSED cells: forward barrier. PUC luaC_barrier (lua_setupvalue,
+    /// OP_SETUPVAL): isblack(uv) && iswhite(v) → luaC_barrier_ (mark v).
     inline fn gcWriteBarrierCell(self: *Vm, cell: *Cell, value: Value) DispatchError!void {
+        // OPEN cells: no barrier (PUC never barriers open upvalue writes).
+        // The stack slot is the authoritative location; thread traversal
+        // and remarkupvals handle marking. Early return prevents any
+        // black-owner forward barrier invention for open cells.
+        if (cell.isOpen()) return;
         // Generational mode: forward barrier — mark the value and promote
         // it to old0 if the cell is old and the value is young.
         // PUC luaC_barrier (lgc.h:245) → luaC_barrier_ (lgc.c:246):
@@ -21279,21 +21394,15 @@ pub const Vm = struct {
                 }
             }
             switch (obj) {
-                .cell => |cell| {
-                    // PUC reallymarkobject (lgc.c:347-354): open upvalues
-                    // are kept GRAY (not BLACK) so future stack writes can
-                    // trigger backward barriers via thread re-traversal.
-                    // Closed upvalues are set BLACK and their value marked.
-                    // Skip cells that are already BLACK (already processed
-                    // by gcRemarkUpvals or previous traversal).
-                    if (gcIsBlack(cell.gc_marked)) continue;
-                    if (cell.isOpen()) {
-                        gcSetGray(&cell.gc_marked);
-                        try self.gcMarkValue(cell.get(self));
-                    } else {
-                        gcSetBlack(&cell.gc_marked);
-                        try self.gcMarkValue(cell.value);
+                .cell => {
+                    // PUC never puts upvalues in grayagain: luaC_barrierback_
+                    // (lgc.c:268) is used for tables/userdata, never upvalues.
+                    // gcRememberCell is dead code (never called). If we reach
+                    // here, a Cell was illegally appended to gc_grayagain.
+                    if (@import("builtin").mode == .Debug) {
+                        @panic("Cell must never enter gc_grayagain");
                     }
+                    continue;
                 },
                 else => {
                     const p = gcPtr(obj);
@@ -21354,12 +21463,18 @@ pub const Vm = struct {
     /// itself is NOT white (was reached by normal traversal). A white upvalue
     /// was never reached → its value should be collected.
     fn gcRemarkUpvals(self: *Vm) DispatchError!void {
+        // PUC remarkupvals (lgc.c:406-426): iterate open upvalues of marked
+        // threads; for each non-white open upvalue (assert isgray), markvalue
+        // (re-mark the stack-backed value). Does NOT change the upvalue's
+        // color — it stays gray. Open upvalues are never set black by PUC.
         for (self.gc_objects.items) |obj| {
             switch (obj) {
                 .cell => |cell| {
                     if (cell.isOpen() and !gcIsWhite(cell.gc_marked)) {
+                        // PUC lgc.c:420-421: lua_assert(upisopen(uv) && isgray(uv));
+                        // markvalue(g, uv->v.p) — re-mark the stack-backed value.
+                        // Does NOT set black — PUC keeps open upvalues gray.
                         try self.gcMarkValue(cell.get(self));
-                        gcSetBlack(&cell.gc_marked);
                     }
                 },
                 else => {},
@@ -21652,7 +21767,14 @@ pub const Vm = struct {
             .survival => {
                 p.age.* = .old1;
                 try self.gc_old1.append(self.alloc, obj);
-                try self.gc_grayagain.append(self.alloc, obj);
+                // PUC sweepgen adds OLD1 to the old1 list only, NOT to
+                // grayagain. Cells are NEVER added to grayagain — PUC never
+                // puts upvalues in grayagain, and markold handles them via
+                // markCellForce (inline mark). Non-cell OLD1 objects are
+                // added to grayagain so correctgraylist makes them BLACK.
+                if (obj != .cell) {
+                    try self.gc_grayagain.append(self.alloc, obj);
+                }
                 self.gc_gen_added_old_kb += @as(f64, @floatFromInt(gcObjectBytes(obj))) / 1024.0;
                 if (obj == .thread) {
                     try self.gc_gen_threads.append(self.alloc, obj.thread);
@@ -21663,7 +21785,9 @@ pub const Vm = struct {
                 // PUC nextage: G_OLD0 → G_OLD1, then add to grayagain.
                 p.age.* = .old1;
                 try self.gc_old1.append(self.alloc, obj);
-                try self.gc_grayagain.append(self.alloc, obj);
+                if (obj != .cell) {
+                    try self.gc_grayagain.append(self.alloc, obj);
+                }
                 self.gc_gen_added_old_kb += @as(f64, @floatFromInt(gcObjectBytes(obj))) / 1024.0;
                 if (obj == .thread) {
                     try self.gc_gen_threads.append(self.alloc, obj.thread);
@@ -21895,14 +22019,19 @@ pub const Vm = struct {
             // too, ensuring their young children are marked. After the
             // transition, this white check is a no-op (OLD1 is always black).
             if (gcIsBlack(p.marked.*) or gcIsWhite(p.marked.*)) {
-                // Force re-traversal: set gray + append to gray list.
-                // gcQueueScanObject would skip this object (it is not
-                // white), but markold must re-traverse OLD1 objects
-                // unconditionally so their young children are marked.
-                gcSetGray(p.marked);
-                try self.gc_gray.append(self.alloc, obj);
-                // into grayagain so they are re-traversed every cycle.
-                // correctgraylist keeps them there permanently.
+                // PUC markold calls reallymarkobject(g, p) which for cells
+                // does inline marking (set color + markvalue) — NEVER adds
+                // to gc_gray (propagatemark has no LUA_VUPVAL case). For all
+                // other types, reallymarkobject adds to the gray list.
+                if (obj == .cell) {
+                    try self.markCellForce(obj.cell);
+                } else {
+                    // Force re-traversal: set gray + append to gray list.
+                    gcSetGray(p.marked);
+                    try self.gc_gray.append(self.alloc, obj);
+                }
+                // Threads are linked into grayagain so they are re-traversed
+                // every cycle. correctgraylist keeps them there permanently.
                 if (obj == .thread) {
                     try self.gc_grayagain.append(self.alloc, obj);
                 }
@@ -21960,8 +22089,15 @@ pub const Vm = struct {
             if (p.age.* == .old1) {
                 p.age.* = .old;
                 if (gcIsBlack(p.marked.*)) {
-                    gcSetGray(p.marked);
-                    try self.gc_gray.append(self.alloc, obj);
+                    // PUC markold: reallymarkobject(g, p). For cells, this
+                    // does inline marking — never adds to gc_gray. For other
+                    // types, it adds to the gray list for propagation.
+                    if (obj == .cell) {
+                        try self.markCellForce(obj.cell);
+                    } else {
+                        gcSetGray(p.marked);
+                        try self.gc_gray.append(self.alloc, obj);
+                    }
                 }
             }
         }
@@ -22908,12 +23044,16 @@ pub const Vm = struct {
             },
             .string => {}, // strings go straight to black in gcQueueScanObject; no children
             .cell => {
-                // PUC traverseupvalue (lgc.c:486-489): mark the upvalue's
-                // content. Closed upvalues hold a Value that may reference
-                // GC objects. Without marking it, those objects would be
-                // freed by sweep → use-after-free.
-                // TODO: re-enable after investigating db.lua --testc regression
-                // try self.gcMarkValue(cell.value);
+                // PUC propagatemark (lgc.c:727-740) has NO LUA_VUPVAL case
+                // (default: lua_assert(0)). Cell never enters gc_gray:
+                // markCell (PUC reallymarkobject LUA_VUPVAL) sets open→gray
+                // or closed→black and marks the value inline — never appends
+                // to gc_gray. gcQueueScanObject(.cell) delegates to markCell.
+                // If we reach here, a Cell was illegally appended to gc_gray.
+                if (@import("builtin").mode == .Debug) {
+                    @panic("Cell must never enter gc_gray (gcPropagateOne)");
+                }
+                return true;
             },
             .userdata => |u| {
                 // PUC traverseudata (lgc.c:631-638): mark the metatable,
@@ -22930,7 +23070,8 @@ pub const Vm = struct {
             .closure => |c| gcSetBlack(&c.gc_marked),
             .thread => |th| gcSetBlack(&th.gc_marked),
             .string => {}, // already set black in gcQueueScanObject
-            .cell => |cell| gcSetBlack(&cell.gc_marked),
+            // Cell never reaches here (gcPropagateOne .cell arm is unreachable).
+            .cell => {},
             .userdata => |u| gcSetBlack(&u.gc_marked),
         }
         // Reverted: do NOT add threads to grayagain after traversal

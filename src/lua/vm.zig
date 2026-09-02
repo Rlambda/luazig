@@ -6798,6 +6798,23 @@ pub const Vm = struct {
     const ResolveStage = struct { proto: *bc.Proto, vals: []Value };
 
     fn resolveTreeConstants(self: *Vm, owner: *bc.ProtoTreeOwner) DispatchError!void {
+        // CUT1: for undumped trees (k_strings_vm_owned==true from birth),
+        // the k strings are already VM-interned at deserialization time.
+        // Alias resolved_values onto the SAME allocation as k via in-place
+        // Constant→Value conversion (both 16B, align 8; .int→.Int,
+        // .num_bits→.Num, .str→.String are value-preserving rewrites).
+        // After conversion, k.len==0 and resolved_values is the single
+        // constant array — matching PUC Lua where Proto.k IS the runtime
+        // TValue array. This eliminates the dual Constant[]+Value[] storage
+        // for undumped trees (compiled trees still need both: k holds
+        // compile-time Constant that must survive for source/debug info).
+        if (owner.k_strings_vm_owned) {
+            aliasUndumpConstantsTree(owner.root);
+            owner.constants_resolved = true;
+            return;
+        }
+        // Compiled tree: two-phase resolution (allocates resolved_values,
+        // swaps k string pointers to VM-interned, destroys old seed-0 strings).
         var built: std.ArrayListUnmanaged(ResolveStage) = .empty;
         defer {
             // On error: free every staged array. On success the arrays were
@@ -6858,6 +6875,37 @@ pub const Vm = struct {
         for (proto.p) |child| {
             try self.stageResolveTree(@constCast(child), built);
         }
+    }
+
+    /// CUT1: alias resolved_values onto the k allocation for undumped trees.
+    /// Converts each Constant slot in-place to its Value equivalent (both are
+    /// 16B, align 8). The .str pointers are already VM-interned at undump
+    /// time (k_strings_vm_owned==true), so .str→.String is a pointer-preserving
+    /// rewrite. After conversion, k.len==0 (signaling aliased) and
+    /// resolved_values is the single constant array. Recursive over the tree.
+    /// Infallible: no allocation, no interning — pure in-place rewrites.
+    fn aliasUndumpConstantsTree(proto: *bc.Proto) void {
+        const k = proto.k;
+        if (k.len > 0) {
+            // In-place Constant→Value conversion. Both types are 16B with
+            // alignment 8, so the allocation is reinterpret-safe.
+            const vals: [*]Value = @ptrCast(@alignCast(k.ptr));
+            for (k, 0..) |c, i| {
+                vals[i] = switch (c) {
+                    .nil => .Nil,
+                    .bool => |b| .{ .Bool = b },
+                    .int => |v| .{ .Int = v },
+                    .num_bits => |n| .{ .Num = @bitCast(n) },
+                    .str => |s| .{ .String = s },
+                };
+            }
+            proto.resolved_values = vals[0..k.len];
+            // k.len=0 signals aliased; the ptr stays (for alloc.free via
+            // resolved_values). destroyProtoTree detects k_aliased and
+            // frees the single allocation via resolved_values.
+            proto.k = k[0..0];
+        }
+        for (proto.p) |child| aliasUndumpConstantsTree(@constCast(child));
     }
 
     fn takeBytecodeResumeValues(th: *Thread, alloc: std.mem.Allocator) ?[]Value {
@@ -22736,11 +22784,28 @@ pub const Vm = struct {
                 }
             }
         }
-        for (proto.k) |k| {
-            if (k == .str) {
-                if (gcIsWhite(k.str.gc_marked)) {
-                    gcSetBlack(&k.str.gc_marked);
-                    self.gc_mark_epoch += 1;
+        // CUT1: for compiled trees (k.len > 0), mark string constants from
+        // proto.k (seed-0 before resolution, VM-interned after). For undumped
+        // trees after adoption (k.len==0, resolved_values aliased), mark from
+        // resolved_values. PUC's traverseshorthandproto marks f->k[] which IS
+        // the runtime TValue array; our k and resolved_values are the split
+        // representation (compiled) or aliased single array (undumped).
+        if (proto.k.len > 0) {
+            for (proto.k) |k| {
+                if (k == .str) {
+                    if (gcIsWhite(k.str.gc_marked)) {
+                        gcSetBlack(&k.str.gc_marked);
+                        self.gc_mark_epoch += 1;
+                    }
+                }
+            }
+        } else {
+            for (proto.resolved_values) |v| {
+                if (v == .String) {
+                    if (gcIsWhite(v.String.gc_marked)) {
+                        gcSetBlack(&v.String.gc_marked);
+                        self.gc_mark_epoch += 1;
+                    }
                 }
             }
         }
@@ -24006,46 +24071,22 @@ pub const Vm = struct {
     /// unmutated, and execution falls back to `resolveTreeConstants`,
     /// which is safe for VM-owned pools.
     pub fn preResolveUndumpedConstants(self: *Vm, root: *bc.Proto) DispatchError!void {
+        _ = self;
         const owner = root.tree orelse return; // owner-less: unit-test protos
         if (owner.constants_resolved) return;
-        var built: std.ArrayListUnmanaged(ResolveStage) = .empty;
-        defer {
-            for (built.items) |b| {
-                if (b.vals.len > 0) self.alloc.free(b.vals);
-            }
-            built.deinit(self.alloc);
-        }
-        try self.stageUndumpedTree(root, &built);
-        // Publish (infallible): strings are already VM-canonical, so only
-        // the resolved_values arrays move.
-        for (built.items) |b| {
-            b.proto.resolved_values = b.vals;
-        }
+        // CUT1: alias resolved_values onto the k allocation via in-place
+        // Constant→Value conversion (both 16B, align 8). The k strings are
+        // already VM-interned at undump time (k_strings_vm_owned will be set
+        // below), so .str→.String is a pointer-preserving rewrite. After
+        // conversion, k.len==0 and resolved_values is the single constant
+        // array — matching PUC Lua where Proto.k IS the runtime TValue array.
+        // This eliminates the dual Constant[]+Value[] storage for undumped
+        // trees (the 48-byte duplicate k array in the api.lua fixed-load
+        // shape). Infallible: no allocation, no interning — pure in-place
+        // rewrites.
+        aliasUndumpConstantsTree(root);
         owner.k_strings_vm_owned = true;
         owner.constants_resolved = true;
-        built.clearRetainingCapacity();
-    }
-
-    fn stageUndumpedTree(
-        self: *Vm,
-        proto: *bc.Proto,
-        built: *std.ArrayListUnmanaged(ResolveStage),
-    ) DispatchError!void {
-        const vals = try self.alloc.alloc(Value, proto.k.len);
-        errdefer if (vals.len > 0) self.alloc.free(vals);
-        for (proto.k, 0..) |c, i| {
-            vals[i] = switch (c) {
-                .nil => .Nil,
-                .bool => |b| .{ .Bool = b },
-                .int => |i64_val| .{ .Int = i64_val },
-                .num_bits => |n| .{ .Num = @bitCast(n) },
-                .str => |s| .{ .String = s },
-            };
-        }
-        try built.append(self.alloc, .{ .proto = proto, .vals = vals });
-        for (proto.p) |child| {
-            try self.stageUndumpedTree(@constCast(child), built);
-        }
     }
 
     /// Duplicate all string fields in an undumped proto tree so the proto
@@ -25268,8 +25309,9 @@ pub const Vm = struct {
                 .loadk => {
                     if (inst.a != reg) continue;
                     const kidx: usize = inst.b;
-                    if (kidx < proto.k.len and proto.k[kidx] == .str) {
-                        return proto.k[kidx].str.bytes();
+                    // CUT1: read from k (compiled) or resolved_values (undumped aliased).
+                    if (bc.protoConstAt(proto, kidx)) |c| {
+                        if (c == .str) return c.str.bytes();
                     }
                     return null;
                 },
@@ -25279,8 +25321,8 @@ pub const Vm = struct {
                     const extra = proto.code[cursor + 1];
                     if (@as(bc.Op, @enumFromInt(extra.op)) != .extraarg) return null;
                     const kidx: usize = extra.extraArg();
-                    if (kidx < proto.k.len and proto.k[kidx] == .str) {
-                        return proto.k[kidx].str.bytes();
+                    if (bc.protoConstAt(proto, kidx)) |c| {
+                        if (c == .str) return c.str.bytes();
                     }
                     return null;
                 },
@@ -25348,16 +25390,19 @@ pub const Vm = struct {
                     if (inst.a != reg) continue;
                     if (debugBytecodeDefinitionIsConditional(proto, cursor, call_pc)) return .{};
                     const kidx: usize = inst.c;
-                    if (kidx < proto.k.len and proto.k[kidx] == .str) {
-                        // PUC getfuncname: GETTABUP reports "global" when the
-                        // upvalue is _ENV, "field" otherwise (e.g. upvalue.x).
-                        const upidx: usize = inst.b;
-                        const is_env = upidx < proto.upvalues.len and
-                            std.mem.eql(u8, proto.upvalues[upidx].name, "_ENV");
-                        if (is_env) {
-                            return .{ .name = proto.k[kidx].str.bytes(), .namewhat = "global" };
+                    // CUT1: read from k (compiled) or resolved_values (undumped aliased).
+                    if (bc.protoConstAt(proto, kidx)) |c| {
+                        if (c == .str) {
+                            // PUC getfuncname: GETTABUP reports "global" when the
+                            // upvalue is _ENV, "field" otherwise (e.g. upvalue.x).
+                            const upidx: usize = inst.b;
+                            const is_env = upidx < proto.upvalues.len and
+                                std.mem.eql(u8, proto.upvalues[upidx].name, "_ENV");
+                            if (is_env) {
+                                return .{ .name = c.str.bytes(), .namewhat = "global" };
+                            }
+                            return .{ .name = c.str.bytes(), .namewhat = "field" };
                         }
-                        return .{ .name = proto.k[kidx].str.bytes(), .namewhat = "field" };
                     }
                     return .{};
                 },

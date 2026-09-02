@@ -1,7 +1,7 @@
 {
-  "created_utc": "2026-09-02T22:31:22.157632+00:00",
+  "created_utc": "2026-09-02T23:19:16.400222+00:00",
   "zig_version": "0.16.0",
-  "git_head": "50097f4",
+  "git_head": "b17de3b",
   "zig_sizes": {
     "Proto": 184,
     "Closure": 88,
@@ -29,7 +29,7 @@
   },
   "zig_components": {
     "Proto_struct": 184,
-    "k_array": 48,
+    "k_array": 0,
     "upvalues_array": 24,
     "resolved_values": 48,
     "ProtoTreeOwner": 144,
@@ -39,9 +39,9 @@
     "Cell_GC": 64,
     "code_borrowed": 0,
     "lineinfo_borrowed": 0,
-    "tree_total": 544,
+    "tree_total": 496,
     "gc_objects": 152,
-    "honest_total": 696
+    "honest_total": 648
   },
   "puc_components": {
     "Proto_struct": 128,
@@ -54,12 +54,12 @@
     "honest_total": 272
   },
   "actual_delta": {
-    "delta": 680,
+    "delta": 632,
     "m1": 82127,
-    "m2": 82807
+    "m2": 82759
   },
   "verdict": "DEVIATION",
   "gate_threshold": 400,
-  "deviation_bytes": 296,
+  "deviation_bytes": 248,
   "deviation_explanation": "Honest charge exceeds PUC's 400-byte gate due to structural overhead: ProtoTreeOwner (144B, PUC has none), SourceBacking (96B, PUC has none), resolved_values (48B, PUC's k IS runtime format), larger GC structs (Proto +56, Closure +48, Cell +24, Upvaldesc +8). Getting under 400 requires eliminating ProtoTreeOwner + SourceBacking + resolved_values \u2014 larger structural changes (Proto-as-GC-object, lazy resolved_values, or per-exec k-pool conversion). Per verifier allowance, honest accounting is kept and the deviation is documented."
 }

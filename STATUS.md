@@ -1,4 +1,4 @@
-> Last updated: 2026-09-02 (P16.10a T12 — pushBytecodeExecFrame cold-path outlining + dead-code deletion; matrix zig_fail=0, smoke 67/67, c_api ALL PASS, geomean 1.79-1.80x)
+> Last updated: 2026-09-02 (P16.10c closed — Cell GC PUC alignment, Proto accounting/failpaths, fixed-buffer borrow, frame-push outlining; fresh geomean below)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -36,9 +36,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **67/67** pass |
 | C API suites (`tests/c_api`) | 19 suites |
-| Performance (geomean vs PUC) | **1.80x** |
+| Performance (geomean vs PUC) | **1.81x** |
 
-Geomean замедления vs PUC Lua: **1.80x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.81x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -4199,6 +4199,61 @@ observed dead; expected). Cells freed at sweep are genuinely unreachable.
 ### Гейт: matrix zig_fail=0; locals --testc 10/10; smoke 66/66; c_api
 18+diff; nv10; 6 сьютов; leak/native BOUNDED; tbcw = PUC-identical
 («attempt to yield across a C-call boundary»).
+
+## P16.10c — Cell GC PUC-alignment + Proto accounting + fixed-buffer borrow (2026-08-31)
+
+### Вердикт верификатора → архитектура
+PUC 5.5: propagatemark НЕ имеет UpVal-кейса; reallymarkobject(LUA_VUPVAL)
+инлайн: open→gray+markvalue, closed→black+markvalue (lgc.c:347-354,
+727-740). Cell — GC-объект, но НЕ рабочий элемент gc_gray.
+
+### T1-T4 (`4412cb1`): markCell-примитив + структурное исключение
+Инвентарь-таблица всех Cell-путей (комментарий у gcQueueScanCell).
+markCell: open+white→gray+инлайн-значение; closed+white→black+инлайн;
+закрытые non-white → markvalue безусловно (_ENV-edge). Cell в gc_gray/
+gc_grayagain НЕ попадает (gcQueueScanObject(.cell)→markCell; markold→
+markCellForce; gcRememberCell — мёртвый код). gcPropagateOne(.cell) →
+Debug-паника «Cell must never enter gc_gray». Барьеры: OPEN — без
+барьера (стек авторитарен, PUC luaC_upvalbarrier только для closed);
+CLOSED — forward-барьер на child; OPEN→CLOSED (lfunc.c:205-208):
+!iswhite → nw2black + барьер скопированного значения. TODO с неверным
+описанием «traverseupvalue» УДАЛЁН; db.lua --testc зелёный БЕЗ него.
+
+### T5+T6 (`10d84c7`, `d4106ed`)
+smoke 67_upvalue_gc_lifetime (9 сценариев, inc+gen, weak-сентинелы) —
+byte-identical; 48_finalizer_upvalue существует/зелёный. Sweep-инвариант
+LUAZIG_CELL_SWEEP_DEBUG=1 (Debug-only env-gated): под целевой матрицей
+0 достижимых Cell умерло на sweep.
+
+### T7+T8 (`267cbd1`, `44a72df`)
+Proto-tree footprint: chargeTreeFootprint на adoption (gc_charged-
+идемпотентно), кредит на последнем release; interned-строки исключены;
+66-smoke секция F (rose/fell). FailingAllocator 8.1-8.6 (owner fail /
+closure fail / staging fail / nested fail / undump fail / backing fail):
+no-leak, refcount-инварианты, no half-bound tree; попутные фиксы:
+ProtoBuilder.deinit терял live_reg_top (leak на finish-OOM); errdefer в
+createBytecodeChunkClosure/closureFromProto после retain (tree-ref leak).
+
+### Fixed-buffer borrow (`0904492`) — закрыт api.lua:580
+PUC mode 'B' → fixed undump: code/lineinfo BORROWED из буфера (getaddr),
+PF_FIXED-флаг → freeproto пропускает. luazig: fixed_arrays-флаг Proto;
+borrow через writeAlign/skipAlign-контракт (lineinfo → u32); буфер
+закреплён source_backing.pinned; footprint исключает заимствованное;
+m2-m1=224B < 400. До фикса тест проходил лишь потому, что аллокации
+undump были невидимы count'у.
+
+### T9-T12: артефакты + финал
+smoke-p16.10c-final.json 67/67 (stale 65/65 удалён). Frame-push:
+реаудит классификации (старая протухла после T17) + cold-outlining
+(`d0dc4c9`): prepareHostArgs/prepareVahidShift/raiseFrameOverflow
+noinline; A/B lua_calls −1.3% cycles / noalloc −1.9%; rejected с
+доказательствами: cached-total (+6-7% layout), branched-len (+7%),
+args_on_stack-param (stale-slice risk).
+
+### Гейт: matrix zig_fail=0; smoke 67/67 (57-67 byte-identical);
+c_api 19+diff; nv10/loc10; 8 сьютов; leak/native BOUNDED; CallFrame≤104;
+Node 32B; zig 0.16.0. Fresh geomean **1.79-1.81x**; top: noalloc 2.87x,
+metamethod_add 2.56x, coroutine_yield 2.17x, lua_calls 2.14x.
 
 ## История закрытых фаз
 

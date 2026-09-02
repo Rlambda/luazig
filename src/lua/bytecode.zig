@@ -809,6 +809,7 @@ pub const ProtoBuilder = struct {
         }
         self.upvalues.deinit(self.alloc);
         self.locvars.deinit(self.alloc);
+        self.live_reg_top.deinit(self.alloc);
     }
 
     /// Current PC (index of the next instruction to emit).

@@ -5919,4 +5919,15 @@ accounting).
   100 closures, falls back >10KB after drop+GC — byte-identical booleans vs
   PUC. dynamic_load perf +0.1% (OK). smoke 67/67, matrix zig_fail=0 (pre-existing
   api.lua only).
-- [ ] Task 12/13 — child-outlives-root differential smoke; FailingAllocator tests.
+- [x] Task 12/13 — FailingAllocator ownership-path tests (Task 8). Six Zig
+  unit tests in vm.zig: 8.1 (ProtoBuilder.finish exhaustive OOM → no leak,
+  fixed missing `live_reg_top.deinit` in ProtoBuilder.deinit), 8.2 (closure
+  creation refcount invariant: compile→1, createClosure→2, release caller→1,
+  vm.deinit→0), 8.3 (resolveTreeConstants OOM → tree stays unresolved, retry
+  succeeds), 8.4 (nested tree adoption OOM → no partial publish), 8.5 (undump
+  OOM → cleanup complete via reader.deinit), 8.6 (source-backing append OOM →
+  no pin leak). Also fixed errdefer in `createBytecodeChunkClosure` and
+  `closureFromProto`: after `retainTreeForClosure` increments ref_count, if
+  `gcRegisterClosure` or `resolveTreeConstants` fails, the errdefer releases
+  the tree ref and frees/unregisters the closure (was a tree-ref leak on OOM
+  after retain). smoke 67/67, matrix zig_fail=1 (pre-existing api.lua only).

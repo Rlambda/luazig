@@ -40,3 +40,5 @@ tests/smoke/zig-libs/
 # perf record data + rendered reports (tools/perf_profile.py artifacts,
 # reproducible from the script; only the script + counters JSON are committed)
 tools/perf/profiles/
+report.md
+report2.md

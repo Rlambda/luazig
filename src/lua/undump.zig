@@ -537,21 +537,14 @@ pub const UndumpReader = struct {
         const upvalue_count = try self.readByte();
         _ = upvalue_count; // body already has the right count
         const root = try self.undumpProto();
-        // Attach the tree owner. Its creation is the only fallible step
-        // after a fully successful deserialize; on failure the finished
-        // (still owner-less) tree is freed structurally. Undumped k
-        // strings were interned into the VM during undumpConstant (or are
+        // CUT2: the root Proto IS the owner. Set owner fields directly
+        // (no separate ProtoTreeOwner allocation). On failure the finished
+        // (still owner-less) tree is freed structurally. Undumped k strings
+        // were interned into the VM during undumpConstant (or are
         // `undefined` in no-callback tests) — never tree-owned.
-        errdefer bc.destroyProtoTree(self.alloc, root, true);
-        const owner = try self.alloc.create(bc.ProtoTreeOwner);
-        owner.* = .{
-            .root = root,
-            .allocator = self.alloc,
-            .ref_count = 1,
-            // Constants interned into the VM at deserialization time.
-            .k_strings_vm_owned = true,
-        };
-        bc.bindOwnerRecursive(root, owner);
+        root.ref_count = 1; // producing reference
+        root.k_strings_vm_owned = true; // constants interned at undump time
+        bc.bindTreeRecursive(root, root); // root.tree = self, children → root
         return root;
     }
 };
@@ -833,7 +826,7 @@ test "UndumpReader: undumpChunk round-trips a full chunk" {
     var r = UndumpReader.init(std.testing.allocator, w.buf.items);
     defer r.deinit();
     const out = try r.undumpChunk();
-    defer out.tree.?.release(); // frees the whole tree + owner
+    defer out.tree.?.releaseTree(std.testing.allocator); // frees the whole tree + owner
 
     try std.testing.expectEqualSlices(u8, "chunk.lua", out.source_name);
     try std.testing.expectEqualSlices(u8, "main", out.name);

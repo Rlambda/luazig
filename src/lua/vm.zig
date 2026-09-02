@@ -788,7 +788,7 @@ pub const Closure = struct {
     /// alive while ANY closure of ANY of its nodes lives. Null for C
     /// closures (c_func) and builtin closures. Invariant for bytecode
     /// closures: `tree == proto.?.tree` (Debug-asserted at creation).
-    tree: ?*bc.ProtoTreeOwner = null,
+    tree: ?*bc.Proto = null,
     upvalues: []const *Cell,
     env_override: ?Value = null,
     /// C function pointer (PUC CClosure.f / `lua_CFunction`). Non-null when
@@ -3222,7 +3222,7 @@ pub const Vm = struct {
     /// and never changed.
     gc_creation_seq: u64 = 0,
     // (P16.10b Task 6) The old VM-global `pinned_source_strings` list is
-    // RETIRED: source pins now live on each tree's ProtoTreeOwner
+    // RETIRED: source pins now live on each tree's root Proto (CUT2)
     // (`source_backing.pinned`) and are marked through the closure
     // traversal (gcMarkBytecodeProto), like PUC's traverseLClosure. Pins
     // therefore die with their trees instead of accumulating for the VM's
@@ -6797,7 +6797,7 @@ pub const Vm = struct {
     /// with string constants staged as VM-interned pointers.
     const ResolveStage = struct { proto: *bc.Proto, vals: []Value };
 
-    fn resolveTreeConstants(self: *Vm, owner: *bc.ProtoTreeOwner) DispatchError!void {
+    fn resolveTreeConstants(self: *Vm, owner: *bc.Proto) DispatchError!void {
         // CUT1: for undumped trees (k_strings_vm_owned==true from birth),
         // the k strings are already VM-interned at deserialization time.
         // Alias resolved_values onto the SAME allocation as k via in-place
@@ -6809,7 +6809,7 @@ pub const Vm = struct {
         // for undumped trees (compiled trees still need both: k holds
         // compile-time Constant that must survive for source/debug info).
         if (owner.k_strings_vm_owned) {
-            aliasUndumpConstantsTree(owner.root);
+            aliasUndumpConstantsTree(owner);
             owner.constants_resolved = true;
             return;
         }
@@ -6829,7 +6829,7 @@ pub const Vm = struct {
         // pointers in Value form (this mirrors PUC Lua, whose compiler
         // interns constants through the same string table as the runtime
         // and stores them in runtime TValue format from birth).
-        try self.stageResolveTree(owner.root, &built);
+        try self.stageResolveTree(owner, &built);
         // Phase 2: publish (infallible).
         for (built.items) |b| {
             b.proto.resolved_values = b.vals;
@@ -6840,9 +6840,12 @@ pub const Vm = struct {
                         // Destroy the compile-time LuaString (seed-0). The
                         // VM-interned version is now the canonical pointer.
                         // Seed strings were created by the compiler with the
-                        // TREE's allocator, not the VM's (same family in
-                        // production; possibly a test arena otherwise).
-                        destroyLuaString(owner.allocator, c.str);
+                        // VM's allocator (same family in production; possibly
+                        // a test arena otherwise — arena free is a no-op).
+                        // CUT2: allocator no longer stored in Proto; use
+                        // self.alloc (the tree's creating allocator in
+                        // production, same family in tests).
+                        destroyLuaString(self.alloc, c.str);
                     }
                     c.str = new;
                 }
@@ -17554,7 +17557,7 @@ pub const Vm = struct {
         // retains its own; drop ours on success, free on failure. No source
         // backing needed: the bootstrap source is a string literal in the
         // binary (static for the process lifetime).
-        errdefer proto.tree.?.release();
+        errdefer proto.tree.?.releaseTree(self.alloc);
 
         // Create a proper closure with _ENV upvalue, matching how
         // compileTextChunk + builtinDofile load chunks. The bootstrap source
@@ -17563,7 +17566,7 @@ pub const Vm = struct {
         // an out-of-bounds access in gettabup. createBytecodeChunkClosure
         // allocates the upvalue cells; applyLoadEnv sets _ENV to global_env.
         const cl = try self.createBytecodeChunkClosure(proto);
-        proto.tree.?.release();
+        proto.tree.?.releaseTree(self.alloc);
         try self.applyLoadEnv(cl, .{ .Table = self.global_env }, false);
         const ret = try self.runClosure(cl, &.{});
         self.alloc.free(ret);
@@ -22435,7 +22438,7 @@ pub const Vm = struct {
                 // The LAST release frees the whole tree exactly once — this
                 // is what closes the dynamic-load retention blocker (many
                 // closures share one tree; children may outlive the root).
-                if (c.tree) |t| t.release();
+                if (c.tree) |t| t.releaseTree(self.alloc);
                 if (c.upvalues.len > 0) self.alloc.free(c.upvalues);
                 self.gcNoteFree(@sizeOf(Closure) + c.upvalues.len * @sizeOf(*Cell));
                 self.alloc.destroy(c);
@@ -22637,7 +22640,7 @@ pub const Vm = struct {
         }
 
         // (P16.10b Task 6) Source-string pins moved to the per-tree
-        // ProtoTreeOwner and are marked via gcMarkBytecodeProto.
+        // root Proto (CUT2) and are marked via gcMarkBytecodeProto.
 
         // Bytecode long constants loaded through `internStrAll` are
         // GC-managed strings deduplicated in this cache. The cache is a VM
@@ -22777,10 +22780,20 @@ pub const Vm = struct {
         // (lgc.c). While any closure of this tree is live, the bytes its
         // debug lexemes borrow from stay pinned against sweep.
         if (proto.tree) |owner| {
-            for (owner.source_backing.pinned.items) |s| {
+            // CUT2: source_backing is now compact (inline pin + extra).
+            // Mark the inline pin and any extra pins.
+            if (owner.source_backing.pin) |s| {
                 if (gcIsWhite(s.gc_marked)) {
                     gcSetBlack(&s.gc_marked);
                     self.gc_mark_epoch += 1;
+                }
+            }
+            if (owner.source_backing.extra) |e| {
+                for (e.pinned.items) |s| {
+                    if (gcIsWhite(s.gc_marked)) {
+                        gcSetBlack(&s.gc_marked);
+                        self.gc_mark_epoch += 1;
+                    }
                 }
             }
         }
@@ -23516,9 +23529,9 @@ pub const Vm = struct {
     /// first use: no production path shares a tree across VMs (see
     /// tools/ownership/proto-inventory.json), so a cheap Debug-time
     /// pointer check is the honest cross-VM invariant enforcement.
-    fn retainTreeForClosure(self: *Vm, proto: *const bc.Proto) ?*bc.ProtoTreeOwner {
+    fn retainTreeForClosure(self: *Vm, proto: *const bc.Proto) ?*bc.Proto {
         const owner = proto.tree orelse return null; // owner-less test protos
-        owner.retain();
+        owner.retainTree();
         const self_opaque: *anyopaque = @ptrCast(self);
         if (owner.vm == null) owner.vm = self_opaque;
         std.debug.assert(owner.vm == self_opaque); // one VM per tree
@@ -23530,10 +23543,10 @@ pub const Vm = struct {
     /// `gc_charged` on the owner prevents double-accounting when
     /// OP_CLOSURE creates additional closures over an already-adopted tree.
     /// The footprint includes Proto structs, all owned arrays, the
-    /// ProtoTreeOwner struct, and SourceBacking buffers — everything freed
-    /// by `ProtoTreeOwner.release` at last release. Interned LuaStrings are
+    /// root Proto owner fields and SourceBacking buffers — everything freed
+    /// by `releaseTree (CUT2: merged into root Proto)` at last release. Interned LuaStrings are
     /// excluded (owned by the VM string table, already charged by `internStr`).
-    fn chargeTreeFootprint(self: *Vm, owner: *bc.ProtoTreeOwner) void {
+    fn chargeTreeFootprint(self: *Vm, owner: *bc.Proto) void {
         if (owner.gc_charged) return;
         // PUC PF_FIXED parity (P16.10d honest accounting): charge ALL
         // tree-owned memory honestly, for BOTH fixed-buffer and heap trees.
@@ -23545,7 +23558,7 @@ pub const Vm = struct {
         // Proto + k + p + locvars + upvalues (plus luazig-specific
         // live_reg_top and resolved_values that PUC doesn't have).
         //
-        // Additionally, the ProtoTreeOwner struct and SourceBacking buffers
+        // Additionally, SourceBacking buffers (CUT2: owner fields merged into root Proto)
         // are charged — these are luazig-specific management overhead (PUC
         // has no separate owner; Proto IS a GC object). This makes
         // `collectgarbage("count")` honestly reflect all native memory freed
@@ -23553,25 +23566,24 @@ pub const Vm = struct {
         //
         // DEVIATION from PUC's 400-byte gate (api.lua:580): the honest
         // charge for a fixed-buffer load of the api.lua chunk shape (1000×
-        // "X=X+1" + 1000-char string, stripped, mode 'B') is ~696 bytes,
+        // "X=X+1" + 1000-char string, stripped, mode 'B') is ~456 bytes,
         // exceeding PUC's < 400 assertion. The gap is structural:
-        //   - ProtoTreeOwner  144B  (PUC has none — Proto IS the GC object)
-        //   - SourceBacking    96B  (PUC has no explicit backing tracking)
+        //   - SourceBacking    32B  (PUC has no explicit backing tracking)
         //   - resolved_values  48B  (PUC's k IS already runtime TValue format)
-        //   - Proto          +56B   (184 vs 128: Zig slices + live_reg_top)
+        //   - Proto          +56B   (184 vs 128: Zig slices + live_reg_top + owner fields)
         //   - Closure        +48B   (88 vs 40: larger GC header + upvalues slice)
         //   - Cell           +24B   (64 vs 40: eager UpVal vs PUC's lazy)
         //   - Upvaldesc       +8B   (24 vs 16: Zig slice name vs C pointer)
-        // Getting under 400 requires eliminating ProtoTreeOwner + SourceBacking
-        // + resolved_values (larger structural changes: Proto-as-GC-object,
+        // CUT2 eliminated ProtoTreeOwner (144B) by merging owner fields
+        // into the root Proto. Getting under 400 requires eliminating
+        // resolved_values (larger structural change: Proto-as-GC-object,
         // lazy resolved_values at first frame push, or per-exec k-pool
         // conversion). Per the verifier's allowance, we keep the honest
         // accounting and document this deviation rather than hiding tree
         // memory behind a gc_footprint=0 exemption. The api.lua m2-m1<400
         // assertion fails honestly, documenting a real parity gap.
-        const fp = bc.protoTreeFootprint(owner.root) +
-            bc.sourceBackingFootprint(owner.source_backing) +
-            @sizeOf(bc.ProtoTreeOwner);
+        const fp = bc.protoTreeFootprint(owner) +
+            bc.sourceBackingFootprint(owner.source_backing);
         self.gcChargeTreeMemory(fp);
         owner.gc_charged = true;
         owner.gc_footprint = fp;
@@ -23614,7 +23626,7 @@ pub const Vm = struct {
                 self.testc_obj_functions -= 1;
                 self.gcNoteFree(@sizeOf(Closure));
             }
-            if (cl.tree) |t| t.release();
+            if (cl.tree) |t| t.releaseTree(self.alloc);
             self.alloc.destroy(cl);
         }
         cl.* = .{
@@ -23662,12 +23674,12 @@ pub const Vm = struct {
         // outlive them — so compile against OWNED COPIES and attach them
         // as the tree's source backing. This closes the latent use-after-
         // free every compileChunkValue caller had.
-        var backing: bc.ProtoTreeOwner.SourceBacking = .{};
+        var backing: bc.SourceBacking = .{};
         defer backing.deinit(self.alloc); // consumed on success
         const owned_bytes = try self.alloc.dupe(u8, bytes);
-        try backing.owned.append(self.alloc, owned_bytes);
+        try backing.addOwned(self.alloc, owned_bytes);
         const owned_name = try self.alloc.dupe(u8, chunk_name);
-        try backing.owned.append(self.alloc, owned_name);
+        try backing.addOwned(self.alloc, owned_name);
         const src: LuaSource = .{ .name = owned_name, .bytes = owned_bytes };
         var lex = LuaLexer.init(src);
         var p = LuaParser.init(&lex) catch return error.Syntax;
@@ -23681,13 +23693,13 @@ pub const Vm = struct {
         // ref_count == 1); closure creation retains its own. Drop the
         // producing reference on every path — success transfers lifetime
         // to the closure, failure must free the tree (P16.10b Task 4).
-        errdefer proto.tree.?.release();
+        errdefer proto.tree.?.releaseTree(self.alloc);
         // Attach the owned source copies (move; compileTextChunk is not
         // used here — inline the attach before closure creation).
         proto.tree.?.source_backing = backing;
         backing = .{};
         const cl = try self.createBytecodeChunkClosure(proto);
-        proto.tree.?.release();
+        proto.tree.?.releaseTree(self.alloc);
         // Set _ENV upvalue to the global environment, matching PUC's
         // lua_load behavior: the main chunk's first upvalue is _ENV = _G.
         // Without this, global lookups (GETTABUP on upvalue 0) return nil
@@ -23707,7 +23719,7 @@ pub const Vm = struct {
     fn compileTextChunk(
         self: *Vm,
         source: LuaSource,
-        backing: *bc.ProtoTreeOwner.SourceBacking,
+        backing: *bc.SourceBacking,
     ) DispatchError!TextCompileResult {
         defer backing.deinit(self.alloc); // no-op once attached (moved)
         var lex = LuaLexer.init(source);
@@ -23738,9 +23750,9 @@ pub const Vm = struct {
                     // closure takes its own. Drop the producer's on every
                     // path (P16.10b Task 4): success → lifetime belongs to
                     // the closure; failure → the tree must free itself.
-                    errdefer proto.tree.?.release();
+                    errdefer proto.tree.?.releaseTree(self.alloc);
                     const cl = try self.createBytecodeChunkClosure(proto);
-                    proto.tree.?.release();
+                    proto.tree.?.releaseTree(self.alloc);
                     return .{ .closure = cl };
                 },
                 .diagnostic => |diagnostic| .{ .diagnostic = diagnostic },
@@ -23773,10 +23785,10 @@ pub const Vm = struct {
             // chunk name for its whole lifetime — transfer both buffers
             // into the tree's source backing (P16.10b Task 6; freed when
             // the tree dies, on compile failure freed by compileTextChunk).
-            var backing: bc.ProtoTreeOwner.SourceBacking = .{};
+            var backing: bc.SourceBacking = .{};
             defer backing.deinit(self.alloc); // consumed on success
-            try backing.owned.append(self.alloc, @constCast(source.bytes));
-            try backing.owned.append(self.alloc, @constCast(source.name));
+            try backing.addOwned(self.alloc, @constCast(source.bytes));
+            try backing.addOwned(self.alloc, @constCast(source.name));
             const compiled = try self.compileTextChunk(source, &backing);
             const cl = switch (compiled) {
                 .closure => |closure| closure,
@@ -24040,7 +24052,7 @@ pub const Vm = struct {
                 self.gcUnregisterObject(.{ .closure = cl });
                 self.gcNoteFree(@sizeOf(Closure));
             }
-            if (cl.tree) |t| t.release();
+            if (cl.tree) |t| t.releaseTree(self.alloc);
             self.alloc.destroy(cl);
         }
         cl.* = .{
@@ -24098,9 +24110,10 @@ pub const Vm = struct {
         // every copy (P16.10b Task 6 — previously the dupes leaked with
         // the tree).
         const dupeOwned = struct {
-            fn run(vm: *Vm, ow: *bc.ProtoTreeOwner, bytes: []const u8) DispatchError![]const u8 {
+            fn run(vm: *Vm, ow: *bc.Proto, bytes: []const u8) DispatchError![]const u8 {
                 const d = try vm.alloc.dupe(u8, bytes);
-                try ow.source_backing.name_copies.append(vm.alloc, d);
+                const e = try ow.source_backing.ensureExtra(vm.alloc);
+                try e.name_copies.append(vm.alloc, d);
                 return d;
             }
         }.run;
@@ -24351,7 +24364,7 @@ pub const Vm = struct {
         };
         // The undumped tree carries its producing reference; every failure
         // from here to closure creation must release it (P16.10b Task 4).
-        errdefer loaded_proto.tree.?.release();
+        errdefer loaded_proto.tree.?.releaseTree(self.alloc);
 
         if (fixed) {
             // Fixed-buffer mode: code/lineinfo/long-strings point into the
@@ -24368,13 +24381,14 @@ pub const Vm = struct {
                 .owned => |owned_bytes| {
                     // Owned buffer (lua_load reader collection with 'B'):
                     // the tree owns it; freed at last release.
-                    try loaded_proto.tree.?.source_backing.owned.append(self.alloc, owned_bytes);
+                    const e = try loaded_proto.tree.?.source_backing.ensureExtra(self.alloc);
+                    try e.owned.append(self.alloc, owned_bytes);
                     input_consumed = true; // ownership transferred to tree
                 },
                 .pinned => |str| {
                     // Pinned LuaString (builtinLoadEx load(string, 'B')):
                     // GC-pinned for the tree's lifetime.
-                    try loaded_proto.tree.?.source_backing.pinned.append(self.alloc, str);
+                    try loaded_proto.tree.?.source_backing.addPin(self.alloc, str);
                 },
             }
         } else {
@@ -24401,7 +24415,7 @@ pub const Vm = struct {
 
         // Wrap the deserialized Proto in an executable Closure.
         const cl = try self.closureFromProto(loaded_proto);
-        loaded_proto.tree.?.release(); // drop the producing reference
+        loaded_proto.tree.?.releaseTree(self.alloc); // drop the producing reference
 
         // PUC lua_load (lapi.c:1133-1141): set _ENV upvalue.
         try self.applyLoadEnv(cl, env, true);
@@ -24423,18 +24437,18 @@ pub const Vm = struct {
         // Source backing (P16.10b Task 6): the tree borrows its debug
         // lexemes from the source bytes for its whole lifetime. Set up
         // the backing based on the input kind.
-        var backing: bc.ProtoTreeOwner.SourceBacking = .{};
+        var backing: bc.SourceBacking = .{};
         defer backing.deinit(self.alloc); // consumed on success
 
         // Helper: ensure chunk_name is kept alive in the backing. If
         // pinned_chunk_name is provided, pin it; otherwise copy.
         const pinOrCopyName = struct {
-            fn run(vm: *Vm, b: *bc.ProtoTreeOwner.SourceBacking, cn: ?*LuaString, name: []const u8) error{OutOfMemory}!void {
+            fn run(vm: *Vm, b: *bc.SourceBacking, cn: ?*LuaString, name: []const u8) error{OutOfMemory}!void {
                 if (cn) |s| {
-                    try b.pinned.append(vm.alloc, s);
+                    try b.addPin(vm.alloc, s);
                 } else {
                     const owned_name = try vm.alloc.dupe(u8, name);
-                    try b.owned.append(vm.alloc, owned_name);
+                    try b.addOwned(vm.alloc, owned_name);
                 }
             }
         }.run;
@@ -24443,23 +24457,23 @@ pub const Vm = struct {
             .borrowed => {
                 // C buffer: copy bytes and chunk_name into owned buffers.
                 const owned_bytes = try self.alloc.dupe(u8, bytes);
-                try backing.owned.append(self.alloc, owned_bytes);
+                try backing.addOwned(self.alloc, owned_bytes);
                 try pinOrCopyName(self, &backing, pinned_chunk_name, chunk_name);
             },
             .owned => |owned_bytes| {
                 // Owned buffer: transfer ownership of bytes, pin/copy name.
-                try backing.owned.append(self.alloc, owned_bytes);
+                try backing.addOwned(self.alloc, owned_bytes);
                 try pinOrCopyName(self, &backing, pinned_chunk_name, chunk_name);
             },
             .pinned => |str| {
                 // Pinned LuaString: pin the source string. The chunk_name
                 // is pinned if it's a distinct LuaString, or copied.
-                try backing.pinned.append(self.alloc, str);
+                try backing.addPin(self.alloc, str);
                 if (pinned_chunk_name) |cn| {
-                    if (cn != str) try backing.pinned.append(self.alloc, cn);
+                    if (cn != str) try backing.addPin(self.alloc, cn);
                 } else {
                     const owned_name = try self.alloc.dupe(u8, chunk_name);
-                    try backing.owned.append(self.alloc, owned_name);
+                    try backing.addOwned(self.alloc, owned_name);
                 }
             },
         }
@@ -24471,7 +24485,7 @@ pub const Vm = struct {
         // substring after BOM/shebang stripping, but it's within the
         // backing's memory region).
         const src_bytes: []const u8 = switch (input) {
-            .borrowed => backing.owned.items[0],
+            .borrowed => backing.ownedAt(0),
             .owned => bytes,
             .pinned => bytes,
         };
@@ -24480,7 +24494,7 @@ pub const Vm = struct {
         // LuaString's bytes. For borrowed/owned with a pinned name,
         // src_name points to the pinned string's bytes.
         const src_name: []const u8 = switch (input) {
-            .borrowed, .owned => if (pinned_chunk_name) |cn| cn.bytes() else backing.owned.items[backing.owned.items.len - 1],
+            .borrowed, .owned => if (pinned_chunk_name) |cn| cn.bytes() else backing.ownedAt(backing.ownedCount() - 1),
             .pinned => chunk_name,
         };
 
@@ -26998,10 +27012,10 @@ pub const Vm = struct {
             // debug-command chunk name "=(debug command)". The line buffer
             // is REUSED next iteration, so the tree gets an owned copy
             // (P16.10b Task 6).
-            var backing: bc.ProtoTreeOwner.SourceBacking = .{};
+            var backing: bc.SourceBacking = .{};
             defer backing.deinit(self.alloc); // consumed on success
             const line_copy = try self.alloc.dupe(u8, line_buf.items);
-            try backing.owned.append(self.alloc, line_copy);
+            try backing.addOwned(self.alloc, line_copy);
             const source = LuaSource{ .name = "=(debug command)", .bytes = line_copy };
             const compiled = try self.compileTextChunk(source, &backing);
             const cl = switch (compiled) {
@@ -38544,10 +38558,10 @@ pub const Vm = struct {
                 // use-after-free against the tree's lexeme slices, masked
                 // by allocator timing). On every failure path the backing
                 // frees them here.
-                var backing: bc.ProtoTreeOwner.SourceBacking = .{};
+                var backing: bc.SourceBacking = .{};
                 defer backing.deinit(self.alloc); // consumed on success
-                try backing.owned.append(self.alloc, @constCast(source.bytes));
-                try backing.owned.append(self.alloc, @constCast(source.name));
+                try backing.addOwned(self.alloc, @constCast(source.bytes));
+                try backing.addOwned(self.alloc, @constCast(source.name));
                 var lex = LuaLexer.init(source);
                 lex.global_reserved = self.testc_module_enabled;
                 var p = LuaParser.init(&lex) catch {
@@ -38570,13 +38584,13 @@ pub const Vm = struct {
                     return null;
                 };
                 // Producing reference discipline (P16.10b Task 4).
-                errdefer proto.tree.?.release();
+                errdefer proto.tree.?.releaseTree(self.alloc);
                 // Attach the source backing (move; the defer above then
                 // frees nothing).
                 proto.tree.?.source_backing = backing;
                 backing = .{};
                 const clv = try self.createBytecodeChunkClosure(proto);
-                proto.tree.?.release();
+                proto.tree.?.releaseTree(self.alloc);
                 try st.append(self.alloc, .{ .Closure = clv });
             },
             .newthread => {
@@ -41758,7 +41772,7 @@ test "vm: Task 8.1 — ProtoBuilder.finish owner creation fails → no leak" {
         builder.deinit();
 
         if (result) |proto| {
-            proto.tree.?.release();
+            proto.tree.?.releaseTree(falloc);
             break;
         } else |err| {
             try testing.expectEqual(error.OutOfMemory, err);
@@ -41801,7 +41815,7 @@ test "vm: Task 8.2 — closure creation refcount invariant (retain/release balan
     try testing.expectEqual(p.tree.?, cl.tree.?);
 
     // Caller releases its producing reference (compileChunkValue pattern).
-    p.tree.?.release();
+    p.tree.?.releaseTree(aalloc);
     try testing.expectEqual(@as(usize, 1), p.tree.?.ref_count);
 
     // The closure's tree reference (ref_count == 1) is released by
@@ -41843,7 +41857,7 @@ test "vm: Task 8.3 — constant-resolution staging OOM → tree unresolved, retr
         vm.alloc = saved_alloc;
 
         if (result) |_| {
-            p.tree.?.release();
+            p.tree.?.releaseTree(aalloc);
             try testing.expect(p.tree.?.constants_resolved);
             try testing.expectEqual(@as(usize, 0), tracker.total_bytes);
             break;
@@ -41856,7 +41870,7 @@ test "vm: Task 8.3 — constant-resolution staging OOM → tree unresolved, retr
             vm.alloc = aalloc;
             try vm.resolveTreeConstants(p.tree.?);
             try testing.expect(p.tree.?.constants_resolved);
-            p.tree.?.release();
+            p.tree.?.releaseTree(aalloc);
             break;
         }
     }
@@ -41898,7 +41912,7 @@ test "vm: Task 8.4 — nested tree adoption fails partway → no partial publish
         vm.alloc = saved_alloc;
 
         if (result) |_| {
-            p.tree.?.release();
+            p.tree.?.releaseTree(aalloc);
             try testing.expect(p.tree.?.constants_resolved);
             try testing.expectEqual(@as(usize, 0), tracker.total_bytes);
             break;
@@ -41915,7 +41929,7 @@ test "vm: Task 8.4 — nested tree adoption fails partway → no partial publish
             vm.alloc = aalloc;
             try vm.resolveTreeConstants(p.tree.?);
             try testing.expect(p.tree.?.constants_resolved);
-            p.tree.?.release();
+            p.tree.?.releaseTree(aalloc);
             break;
         }
     }
@@ -41938,7 +41952,7 @@ test "vm: Task 8.5 — undump fails partway → cleanup complete" {
     try writer.dumpChunk(proto, .{ .strip = false });
     const serialized = try writer.toOwnedSlice();
     defer aalloc.free(serialized);
-    proto.tree.?.release();
+    proto.tree.?.releaseTree(aalloc);
 
     var fail_idx: usize = 0;
     while (true) : (fail_idx += 1) {
@@ -41955,7 +41969,7 @@ test "vm: Task 8.5 — undump fails partway → cleanup complete" {
         reader.deinit(); // free string_dedup before checking total_bytes
 
         if (result) |root| {
-            root.tree.?.release();
+            root.tree.?.releaseTree(falloc);
             try testing.expectEqual(@as(usize, 0), tracker.total_bytes);
             break;
         } else |err| {
@@ -41976,7 +41990,7 @@ test "vm: Task 8.6 — source-backing append fails → no pin leak" {
     var tracker = TrackingAllocator.init(std.heap.page_allocator);
     const track_alloc = tracker.allocator();
 
-    var backing = bc.ProtoTreeOwner.SourceBacking{};
+    var backing = bc.SourceBacking{};
 
     // Allocate a buffer to attempt to append.
     const buf1 = try track_alloc.dupe(u8, "source1");
@@ -41988,14 +42002,14 @@ test "vm: Task 8.6 — source-backing append fails → no pin leak" {
         .resize_fail_index = 0,
     });
     const falloc = failing.allocator();
-    const append_result = backing.owned.append(falloc, buf1);
+    const append_result = backing.addOwned(falloc, buf1);
 
     try testing.expectError(error.OutOfMemory, append_result);
     // buf1 was allocated but NOT appended (the append failed). Free it.
     track_alloc.free(buf1);
 
     // The backing is empty — no partial append.
-    try testing.expectEqual(@as(usize, 0), backing.owned.items.len);
+    try testing.expectEqual(@as(usize, 0), backing.ownedCount());
     // Clean up: deinit is a no-op (empty backing).
     backing.deinit(track_alloc);
     try testing.expectEqual(@as(usize, 0), tracker.total_bytes);
@@ -42016,7 +42030,7 @@ test "vm: Task 8.6 — source-backing append fails → no pin leak" {
 /// the serialized bytes. The caller owns the slice.
 fn dumpTestProtoStripped(alloc: std.mem.Allocator, src_bytes: []const u8) ![]u8 {
     const proto = try compileTestProto(alloc, src_bytes);
-    defer proto.tree.?.release();
+    defer proto.tree.?.releaseTree(alloc);
     var writer = dump_mod.DumpWriter.init(alloc);
     defer writer.deinit();
     try writer.dumpChunk(proto, .{ .strip = true });
@@ -42029,7 +42043,7 @@ test "vm: Task 7.1 — fixed undump metadata allocation failure → no leak" {
 
     // Exhaustively test every OOM point in undumpChunk with fixed=true.
     // Fixed mode borrows code/lineinfo (fewer allocation points than non-fixed),
-    // but k array, upvalues array, p array, Proto struct, and ProtoTreeOwner
+    // but k array, upvalues array, p array, Proto struct, and Proto owner fields (CUT2)
     // are still allocated. Each failure must clean up — no leak.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -42057,7 +42071,7 @@ test "vm: Task 7.1 — fixed undump metadata allocation failure → no leak" {
         reader.deinit();
 
         if (result) |root| {
-            root.tree.?.release();
+            root.tree.?.releaseTree(falloc);
             try testing.expectEqual(@as(usize, 0), tracker.total_bytes);
             break;
         } else |err| {
@@ -42196,7 +42210,8 @@ test "vm: Task 7.3 — source-backing .owned append in fixed mode (happy path)" 
         .closure => |cl| {
             // Verify the closure is valid and the tree has the owned buffer.
             try testing.expect(cl.tree != null);
-            try testing.expectEqual(@as(usize, 1), cl.tree.?.source_backing.owned.items.len);
+            try testing.expect(cl.tree.?.source_backing.extra != null);
+            try testing.expectEqual(@as(usize, 1), cl.tree.?.source_backing.extra.?.owned.items.len);
         },
         .err_msg => |msg| {
             aalloc.free(msg);
@@ -42232,7 +42247,7 @@ test "vm: Task 7.4 — truncated fixed chunk at aligned blocks → clean error" 
         if (result) |root| {
             // A successful undump at a truncation point would be a bug —
             // the chunk is incomplete. This should never happen.
-            root.tree.?.release();
+            root.tree.?.releaseTree(aalloc);
             try testing.expect(false); // should not succeed on truncated chunk
         } else |err| {
             // Must be TruncatedChunk or BadHeader or BadConstant — never

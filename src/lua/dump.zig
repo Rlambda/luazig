@@ -630,7 +630,7 @@ test "DumpWriter: strip omits debug fields, keeps semantic fields" {
     var r = undump.UndumpReader.init(std.testing.allocator, w_strip.buf.items);
     defer r.deinit();
     const out = try r.undumpChunk();
-    defer out.tree.?.release(); // frees the whole tree + owner
+    defer out.tree.?.releaseTree(std.testing.allocator); // frees the whole tree + owner
 
     // Debug info: gone (NULL source = "", no name, no lines, no locals,
     // no upvalue names) — on BOTH levels of the tree.

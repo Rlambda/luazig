@@ -22349,6 +22349,34 @@ pub const Vm = struct {
                 destroyLuaString(self.alloc, s);
             },
             .cell => |c| {
+                // P16.10c verifier Task 6: Debug-only, env-gated sweep
+                // diagnostic. Captures WHY the cell died — open/closed state,
+                // tri-color, age, gc_index — so a reachable Cell dying at
+                // sweep (an invariant violation) is observable. A Cell freed
+                // here MUST be genuinely unreachable: the closure(s) holding
+                // it were already swept, and no live frame's boxed[]/open
+                // chain references it. An OPEN cell at sweep is suspicious
+                // (its owning frame should still be a root); a BLACK cell at
+                // sweep is a hard invariant violation (black = marked =
+                // reachable this cycle).
+                //
+                // Comptime-eliminated in ReleaseFast (zero cost — the branch
+                // is `if (false)`); env-gated in Debug via
+                // LUAZIG_CELL_SWEEP_DEBUG=1, matching the LUAZIG_TRACE_OOM
+                // pattern (vm.zig setOutOfMemoryError). No behavior change
+                // when unset: the print is the only effect.
+                if (@import("builtin").mode == .Debug) {
+                    if (stdio.activeEnviron().containsConstant("LUAZIG_CELL_SWEEP_DEBUG")) {
+                        const color: []const u8 =
+                            if ((c.gc_marked & BLACKBIT) != 0) "black"
+                            else if ((c.gc_marked & WHITEBITS) != 0) "white"
+                            else "gray";
+                        std.debug.print(
+                            "cell sweep: open={} color={s} age={s} gc_index={} gc_seq={}\n",
+                            .{ c.isOpen(), color, @tagName(c.gc_age), c.gc_index, c.gc_seq },
+                        );
+                    }
+                }
                 self.gcNoteFree(@sizeOf(Cell));
                 self.alloc.destroy(c);
             },

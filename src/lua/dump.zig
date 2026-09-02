@@ -115,6 +115,22 @@ pub const DumpWriter = struct {
         try self.buf.appendSlice(self.alloc, &b);
     }
 
+    /// Write alignment padding so the current buffer position is a multiple
+    /// of `align_`. Mirrors PUC's `loadAlign` (lundump.c:64-71): the padding
+    /// is computed relative to the chunk start (offset 0 = the first byte of
+    /// the header). The padding content is zeros (PUC writes an uninitialized
+    /// `lua_Integer`; we write zeros for determinism). This alignment is what
+    /// enables fixed-buffer undump to BORROW code/lineinfo directly from the
+    /// input buffer — the borrowed pointer is naturally aligned because the
+    /// writer padded the position to the element's alignment.
+    pub fn writeAlign(self: *DumpWriter, align_: usize) !void {
+        const pos = self.buf.items.len;
+        const padding = align_ - (pos % align_);
+        if (padding < align_) {
+            try self.buf.appendNTimes(self.alloc, 0, padding);
+        }
+    }
+
     /// A raw i64 in fixed little-endian layout. Used for integer constants.
     pub fn writeI64LE(self: *DumpWriter, value: i64) !void {
         var b: [8]u8 = undefined;
@@ -300,8 +316,12 @@ pub const DumpWriter = struct {
             try self.writeByte(proto.vararg_table_reg.?);
         }
 
-        // 9. Code: length prefix, then each instruction as a raw u32 LE word.
+        // 9. Code: length prefix, alignment padding, then each instruction
+        // as a raw u32 LE word. The alignment (PUC loadAlign) pads the
+        // position to sizeof(Instruction) so fixed-buffer undump can borrow
+        // the code block directly from the input buffer (PF_FIXED parity).
         try self.writeU32(@intCast(proto.code.len));
+        try self.writeAlign(@sizeOf(bc.Instruction));
         for (proto.code) |inst| {
             const raw: u32 = @bitCast(inst);
             try self.writeU32LE(raw);
@@ -337,14 +357,21 @@ pub const DumpWriter = struct {
             try self.dumpProtoImpl(child, false, options);
         }
 
-        // 13. Line info: length prefix, then each absolute line number as u32.
-        // Stripped: length 0 only (PUC dumpDebug writes n=0 for lineinfo).
+        // 13. Line info: length prefix, alignment padding, then each absolute
+        // line number as a raw u32 LE word. The alignment (PUC loadAlign)
+        // enables fixed-buffer undump to borrow the lineinfo block directly
+        // from the input buffer (PF_FIXED parity). PUC stores lineinfo as
+        // raw ls_byte (relative offsets); luazig stores absolute u32 values
+        // as raw LE words — both are raw (not varint) so fixed-buffer undump
+        // can borrow them. Stripped: length 0 only (PUC dumpDebug writes
+        // n=0 for lineinfo).
         if (options.strip) {
             try self.writeU32(0);
         } else {
             try self.writeU32(@intCast(proto.lineinfo.len));
+            try self.writeAlign(@sizeOf(u32));
             for (proto.lineinfo) |line| {
-                try self.writeU32(line);
+                try self.writeU32LE(line);
             }
         }
 

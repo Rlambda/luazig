@@ -116,6 +116,20 @@ pub const UndumpReader = struct {
         return slice;
     }
 
+    /// Skip alignment padding so the cursor is a multiple of `align_`
+    /// from the start of the input buffer. Mirrors PUC's `loadAlign`
+    /// (lundump.c:64-71). The writer (DumpWriter.writeAlign) inserts this
+    /// padding before code/lineinfo blocks so fixed-buffer undump can
+    /// borrow them as naturally-aligned slices. The padding content is
+    /// unspecified (zeros in our writer; PUC writes uninitialized bytes).
+    pub fn skipAlign(self: *UndumpReader, align_: usize) UndumpError!void {
+        const padding = align_ - (self.pos % align_);
+        if (padding < align_) {
+            if (self.pos + padding > self.data.len) return error.TruncatedChunk;
+            self.pos += padding;
+        }
+    }
+
     /// Read a raw u32 in fixed little-endian layout. Used for Instruction
     /// words, which the VM reinterprets directly via `@bitCast`.
     pub fn readU32LE(self: *UndumpReader) UndumpError!u32 {
@@ -343,21 +357,28 @@ pub const UndumpReader = struct {
         // VM-owned when deserialized through the intern callback (and
         // `undefined` without one) — they are NEVER tree-owned here, so
         // error cleanup passes k_strings_vm_owned = true (skip them).
-        // 9. Code: length prefix, then each instruction as a raw u32 LE word.
+        // 9. Code: length prefix, alignment padding, then each instruction
+        // as a raw u32 LE word. The alignment (PUC loadAlign) pads the
+        // cursor to sizeof(Instruction) so fixed-buffer undump can BORROW
+        // the code block directly from the input buffer (PUC PF_FIXED
+        // parity: lundump.c:187-193 loadCode + getaddr).
         const code_len = try self.readU32();
+        try self.skipAlign(@sizeOf(bc.Instruction));
         // In fixed-buffer mode, point directly into the input buffer (PUC's
-        // `f->code = getaddr(...)`). Otherwise allocate and copy.
-        const code: []bc.Instruction = if (self.fixed)
-            blk: {
-                // Zero-copy path: point directly into the input buffer.
-                // Copy to aligned allocation — @alignCast panics in Debug
-                // if the buffer position isn't naturally aligned for Instruction.
-                const raw = try self.getaddr(@intCast(code_len * @sizeOf(bc.Instruction)));
-                const c = try alloc.alloc(bc.Instruction, @intCast(code_len));
-                @memcpy(std.mem.sliceAsBytes(c), raw);
-                break :blk c;
-            }
-        else blk: {
+        // `f->code = getaddr(...)`). The writer's alignment padding guarantees
+        // the borrowed pointer is naturally aligned for Instruction. In
+        // non-fixed mode, allocate and copy instruction-by-instruction.
+        const code_borrowed = self.fixed;
+        const code: []const bc.Instruction = if (self.fixed) blk: {
+            const byte_len = code_len * @sizeOf(bc.Instruction);
+            const raw = try self.getaddr(byte_len);
+            // Debug assert: the borrowed pointer must be Instruction-aligned.
+            // The writer's writeAlign guarantees this; the assert catches
+            // corrupted chunks or misaligned input buffers.
+            std.debug.assert(@intFromPtr(raw.ptr) % @alignOf(bc.Instruction) == 0);
+            const ptr: [*]const bc.Instruction = @ptrCast(@alignCast(raw.ptr));
+            break :blk ptr[0..code_len];
+        } else blk: {
             const c = try alloc.alloc(bc.Instruction, @intCast(code_len));
             for (0..code_len) |i| {
                 const raw = try self.readU32LE();
@@ -365,7 +386,7 @@ pub const UndumpReader = struct {
             }
             break :blk c;
         };
-        errdefer alloc.free(code);
+        errdefer if (!code_borrowed) alloc.free(@constCast(code));
 
         // 10. Constants: length prefix, then each via undumpConstant.
         const k_len = try self.readU32();
@@ -413,18 +434,33 @@ pub const UndumpReader = struct {
             protos[n_p] = try self.undumpProto();
         }
 
-        // 13. Line info: length prefix, then each absolute line number as u32.
-        // NOTE: lineinfo is stored as varint-encoded u32 values (not raw u32
-        // LE like code), so we cannot use getaddr for fixed-buffer mode.
-        // PUC stores lineinfo as raw ls_byte, but luazig uses varints for
-        // compactness. Always read varint-by-varint.
+        // 13. Line info: length prefix, alignment padding, then each absolute
+        // line number as a raw u32 LE word. The alignment (PUC loadAlign)
+        // enables fixed-buffer undump to BORROW the lineinfo block directly
+        // from the input buffer (PUC PF_FIXED parity: lundump.c:283-294
+        // loadDebug + getaddr). PUC stores lineinfo as raw ls_byte (1-byte
+        // relative offsets); luazig stores absolute u32 as raw LE words —
+        // both are raw (not varint) so fixed-buffer undump can borrow them.
         const li_len = try self.readU32();
-        const lineinfo = try alloc.alloc(u32, @intCast(li_len));
-        errdefer alloc.free(lineinfo);
-        var n_li: usize = 0;
-        while (n_li < li_len) : (n_li += 1) {
-            lineinfo[n_li] = try self.readU32();
-        }
+        const li_borrowed = self.fixed;
+        const lineinfo: []const u32 = if (self.fixed) blk: {
+            if (li_len == 0) break :blk &.{};
+            try self.skipAlign(@sizeOf(u32));
+            const byte_len = li_len * @sizeOf(u32);
+            const raw = try self.getaddr(byte_len);
+            std.debug.assert(@intFromPtr(raw.ptr) % @alignOf(u32) == 0);
+            const ptr: [*]const u32 = @ptrCast(@alignCast(raw.ptr));
+            break :blk ptr[0..li_len];
+        } else blk: {
+            if (li_len == 0) break :blk &.{};
+            try self.skipAlign(@sizeOf(u32));
+            const li = try alloc.alloc(u32, @intCast(li_len));
+            for (0..li_len) |i| {
+                li[i] = try self.readU32LE();
+            }
+            break :blk li;
+        };
+        errdefer if (!li_borrowed) alloc.free(@constCast(lineinfo));
 
         // 14. Locals: length prefix, then each as (name, reg, startpc, endpc).
         const lv_len = try self.readU32();
@@ -472,6 +508,12 @@ pub const UndumpReader = struct {
             .source_name = source_name,
             .line_defined = line_defined,
             .last_line_defined = last_line_defined,
+            // PUC PF_FIXED parity: when fixed-buffer mode borrows code and
+            // lineinfo from the input buffer, flag the Proto so the tree
+            // deinit (destroyProtoTree) skips freeing them and the GC
+            // footprint (protoTreeFootprint) excludes them. PUC sets this
+            // via `f->flag |= PF_FIXED` in lundump.c:332-333.
+            .fixed_arrays = self.fixed,
         };
         return proto;
     }

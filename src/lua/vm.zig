@@ -2915,6 +2915,28 @@ pub const DynamicBytecodeCompiler = *const fn (
     chunk: *const lua_ast.Chunk,
 ) std.mem.Allocator.Error!DynamicBytecodeCompileResult;
 
+/// Default bytecode compiler used when no host-specific compiler is installed
+/// (C API states created via `luaL_newstate`/`lua_newstate`). This mirrors
+/// `compileDynamicBytecode` in `src/bin/luazig.zig` — the same codegen_bc
+/// backend — so C API states have the same compilation path as CLI states.
+/// Without this, `compileTextChunk` (used by `loadChunk` for text loading)
+/// would fail with "no bytecode compiler configured" on C API states.
+pub fn defaultBytecodeCompiler(
+    alloc: std.mem.Allocator,
+    source: LuaSource,
+    chunk: *const lua_ast.Chunk,
+) std.mem.Allocator.Error!DynamicBytecodeCompileResult {
+    var codegen = lua_codegen_bc.Codegen.init(alloc, source.name, source.bytes);
+    defer codegen.deinit();
+    const proto = codegen.compileChunk(chunk) catch {
+        if (codegen.diag) |d| {
+            return .{ .diagnostic = try std.fmt.allocPrint(alloc, ":{d}: {s}", .{ d.line, d.msg }) };
+        }
+        return .{ .diagnostic = try alloc.dupe(u8, codegen.diagString()) };
+    };
+    return .{ .proto = proto };
+}
+
 /// PUC lauxlib.c:1074-1128 default warnf 3-state machine states. Mirrors
 /// PUC's function-pointer swap between `warnfon`/`warnfoff`/`warnfcont`.
 /// Initial state is `.on` (warnfon), matching `luaL_newstate` (lauxlib.c:1188).
@@ -20228,11 +20250,14 @@ pub const Vm = struct {
 
     /// PUC lgc.c `reallymarkobject` core: the type-generic entry point that
     /// operates on GcObject (not Value). This is the single place where the
-    /// white→gray/black transition + gray-list enqueue happens for all GC
-    /// types. Strings go straight to black (no outgoing edges, PUC lgc.c:344);
-    /// everything else goes gray and waits for `gcPropagateOne` to scan its
-    /// children. Cell is included here so closed upvalues traverse through
-    /// the same gray list as PUC's LUA_VUPVAL handling.
+    /// white→gray/black transition + gray-list enqueue happens for GC types
+    /// that PUC's `propagatemark` can legally process: tables, closures,
+    /// threads, userdata go gray and wait for `gcPropagateOne` to scan
+    /// their children; strings go straight to black (no outgoing edges,
+    /// lgc.c:344). Cell is the PUC-5.5 exception (`propagatemark` has NO
+    /// `LUA_VUPVAL` case — lgc.c:727-740): it is handled INLINE by
+    /// `markCell` (open→gray+value, closed→black+value, lgc.c:347-354)
+    /// and is structurally excluded from the gray list below.
     fn gcQueueScanObject(self: *Vm, obj: GcObject) DispatchError!void {
         const p = gcPtr(obj);
         // Task 7: invariant — every GcObject passed to gcQueueScanObject is
@@ -23718,12 +23743,16 @@ pub const Vm = struct {
         self.last_builtin_out_count = ret.len;
     }
 
-    const ChunkPrefix = struct {
+    pub const ChunkPrefix = struct {
         bytes: []const u8,
         had_shebang: bool = false,
     };
 
-    fn stripChunkPrefix(bytes: []const u8, allow_shebang: bool) ChunkPrefix {
+    /// PUC lauxlib.c:790-806 `skipcomment` + `skipBOM` equivalent: strip
+    /// a UTF-8 BOM (0xEF 0xBB 0xBF) and, when `allow_shebang` is true, a
+    /// first-line `#` comment (Unix exec. file shebang). Returns the
+    /// remaining bytes and whether a shebang was stripped.
+    pub fn stripChunkPrefix(bytes: []const u8, allow_shebang: bool) ChunkPrefix {
         var s = bytes;
         if (s.len >= 3 and s[0] == 0xEF and s[1] == 0xBB and s[2] == 0xBF) {
             s = s[3..];
@@ -24031,7 +24060,7 @@ pub const Vm = struct {
         // every copy (P16.10b Task 6 — previously the dupes leaked with
         // the tree).
         const dupeOwned = struct {
-            fn run(vm: *Vm, ow: *bc.ProtoTreeOwner, bytes: []const u8) DispatchError![]u8 {
+            fn run(vm: *Vm, ow: *bc.ProtoTreeOwner, bytes: []const u8) DispatchError![]const u8 {
                 const d = try vm.alloc.dupe(u8, bytes);
                 try ow.source_backing.name_copies.append(vm.alloc, d);
                 return d;
@@ -24089,6 +24118,351 @@ pub const Vm = struct {
         return p.source_name.len == 0 and p.lineinfo.len == 0;
     }
 
+    // =========================================================================
+    // Unified load primitive (Task 1: shared loadChunk)
+    // =========================================================================
+    //
+    // PUC's loading architecture has a single chokepoint: `f_parser`
+    // (ldo.c:1123-1141), called by `luaD_protectedparser` from both the C
+    // API (`lua_load` → `luaL_loadbufferx` / `luaL_loadfilex`) and the
+    // Lua-level `load` / `loadfile` (via `luaB_load` / `luaB_loadfile` in
+    // lbaselib.c). `f_parser` reads the first byte, dispatches binary vs
+    // text, applies `checkmode` (ldo.c:1114-1119), and calls `luaU_undump`
+    // or `luaY_parser`.
+    //
+    // `loadChunk` is our equivalent: a single method that expresses the
+    // PUC `f_parser` + `checkmode` semantics, taking already-collected
+    // bytes (no reader collection or shebang stripping — those are caller
+    // concerns). Every load path — C API (`lua_load`, `luaL_loadbufferx`,
+    // `luaL_loadfilex`) and Lua-level (`builtinLoadEx` / `testC`) —
+    // delegates to this primitive. This eliminates the text-only
+    // `_ = mode;` shortcut that was the confirmed blocker.
+
+    /// How the input bytes reach `loadChunk`. Determines source-backing
+    /// behavior (who owns the memory, who keeps it alive).
+    pub const LoadInput = union(enum) {
+        /// Borrowed contiguous bytes from a C buffer (`luaL_loadbufferx`,
+        /// `lua_load` reader collection). The caller owns the memory.
+        /// For mode 'B' (fixed binary), the primitive borrows directly
+        /// (no copy) — the caller MUST keep the buffer alive until the
+        /// closure is dropped and GC'd. For all other paths, the primitive
+        /// copies the bytes into the tree's source backing.
+        borrowed: []const u8,
+        /// Owned bytes (`luaL_loadfilex` file read, `builtinLoadEx`
+        /// reader-function collection). The primitive takes ownership;
+        /// frees on failure or after copying (non-fixed binary), attaches
+        /// to the tree on success (text, fixed binary).
+        owned: []const u8,
+        /// Pinned LuaString (`builtinLoadEx` load(string)). The string is
+        /// GC-pinned for the tree's lifetime (text, fixed binary) or used
+        /// temporarily (non-fixed binary, then the GC owns it as usual).
+        pinned: *LuaString,
+    };
+
+    /// Result of `loadChunk`: either a ready-to-execute closure (with
+    /// _ENV applied) or an owned error message (caller must free).
+    pub const LoadChunkResult = union(enum) {
+        closure: *Closure,
+        err_msg: []u8,
+    };
+
+    /// PUC `f_parser` (ldo.c:1123-1141) + `checkmode` (ldo.c:1114-1119):
+    /// the unified load primitive. Takes already-collected bytes (no
+    /// reader collection, no shebang stripping — those are caller
+    /// concerns) and dispatches binary vs text based on the first byte,
+    /// applying PUC's mode semantics exactly.
+    ///
+    /// **Mode semantics** (PUC ldo.c:1126-1138):
+    ///   - `null` → `"bt"` (both binary and text allowed)
+    ///   - Contains `'b'` → binary allowed
+    ///   - Contains `'t'` → text allowed
+    ///   - Contains `'B'` → binary + fixed-buffer borrowing (input must
+    ///     be contiguous and kept alive by the caller)
+    ///   - Unknown chars: PUC's `f_parser` does NOT validate mode chars
+    ///     (it only uses `strchr`); we match that (no rejection).
+    ///
+    /// **First byte == LUA_SIGNATURE[0]** (0x1b) → binary:
+    ///   - `'B'` in mode → `fixed = true` (undump borrows code/lineinfo
+    ///     directly from the input buffer, PUC lundump.c:190-191)
+    ///   - else → `checkmode(L, mode, "binary")`: if `'b'` not in mode →
+    ///     error `"attempt to load a binary chunk (mode is '<mode>')"`
+    ///     (PUC ldo.c:1115-1118)
+    ///   - Then undump + closure creation + _ENV application.
+    ///
+    /// **Else** → text:
+    ///   - `checkmode(L, mode, "text")`: if `'t'` not in mode → error
+    ///     `"attempt to load a text chunk (mode is '<mode>')"`
+    ///   - Then compile + closure creation + _ENV application.
+    ///
+    /// `pinned_chunk_name`: for the Lua-level `load(string)` where the
+    /// chunk name is a GC-managed LuaString. null for C API paths (the
+    /// chunk name is a C string, copied by the primitive for text
+    /// compilation; ignored for binary — the proto's source_name comes
+    /// from the binary chunk itself, PUC lundump.c).
+    ///
+    /// Returns `LoadChunkResult`: `.closure` on success, `.err_msg` on
+    /// syntax/mode/undump errors (owned, caller must free). OOM and
+    /// runtime errors propagate as `Vm.Error`.
+    pub fn loadChunk(
+        self: *Vm,
+        input: LoadInput,
+        bytes: []const u8,
+        chunk_name: []const u8,
+        mode: ?[]const u8,
+        env: Value,
+        pinned_chunk_name: ?*LuaString,
+    ) Error!LoadChunkResult {
+        // Delegate to the internal implementation (which may return
+        // DispatchError including ThreadSwitch), then filter out
+        // ThreadSwitch — it can't occur during loading (no bytecode
+        // execution happens, only parsing/compilation/undump which are
+        // synchronous and never yield).
+        return self.loadChunkImpl(input, bytes, chunk_name, mode, env, pinned_chunk_name) catch |err| switch (err) {
+            error.OutOfMemory, error.RuntimeError, error.Yield => |e| return e,
+            error.ThreadSwitch => unreachable, // can't happen during loading
+        };
+    }
+
+    fn loadChunkImpl(
+        self: *Vm,
+        input: LoadInput,
+        bytes: []const u8,
+        chunk_name: []const u8,
+        mode: ?[]const u8,
+        env: Value,
+        pinned_chunk_name: ?*LuaString,
+    ) DispatchError!LoadChunkResult {
+        const mode_str = mode orelse "bt";
+        const allow_binary = std.mem.indexOfAny(u8, mode_str, "bB") != null;
+        const allow_text = std.mem.indexOfAny(u8, mode_str, "tT") != null;
+        const fixed = std.mem.indexOfScalar(u8, mode_str, 'B') != null;
+
+        // PUC f_parser (ldo.c:1128): first byte determines binary vs text.
+        if (bytes.len > 0 and bytes[0] == 0x1b) {
+            // --- Binary chunk ---
+            // PUC f_parser (ldo.c:1129-1131): if 'B' in mode → fixed;
+            // else checkmode "binary" (reject if no 'b').
+            if (!fixed and !allow_binary) {
+                const msg = try std.fmt.allocPrint(
+                    self.alloc,
+                    "attempt to load a binary chunk (mode is '{s}')",
+                    .{mode_str},
+                );
+                return .{ .err_msg = msg };
+            }
+            return try self.loadBinaryChunk(input, bytes, chunk_name, env, fixed, pinned_chunk_name);
+        }
+
+        // --- Text chunk ---
+        // PUC f_parser (ldo.c:1136-1137): checkmode "text".
+        if (!allow_text) {
+            const msg = try std.fmt.allocPrint(
+                self.alloc,
+                "attempt to load a text chunk (mode is '{s}')",
+                .{mode_str},
+            );
+            return .{ .err_msg = msg };
+        }
+        return try self.loadTextChunk(input, bytes, chunk_name, env, pinned_chunk_name);
+    }
+
+    /// Binary load path: undump the binary chunk and wrap it in a closure.
+    /// For `fixed=true` (mode 'B'), code/lineinfo/long-strings are borrowed
+    /// directly from the input buffer (PUC lundump.c:190-191, 286-287).
+    /// For `fixed=false`, all arrays are copied during undump and proto
+    /// strings are cloned via `cloneUndumpedStrings`.
+    fn loadBinaryChunk(
+        self: *Vm,
+        input: LoadInput,
+        bytes: []const u8,
+        chunk_name: []const u8,
+        env: Value,
+        fixed: bool,
+        pinned_chunk_name: ?*LuaString,
+    ) DispatchError!LoadChunkResult {
+        _ = chunk_name; // binary proto's source_name comes from the chunk, not the caller
+        _ = pinned_chunk_name; // only used for text path
+
+        // Track input ownership. On any return path where the input hasn't
+        // been consumed (freed or attached to tree), free it. Only `.owned`
+        // inputs need this — `.borrowed` is caller-owned, `.pinned` is
+        // GC-owned.
+        var input_consumed = false;
+        defer if (!input_consumed) switch (input) {
+            .owned => |b| self.alloc.free(b),
+            else => {},
+        };
+
+        var reader = undump_mod.UndumpReader.init(self.alloc, bytes);
+        reader.fixed = fixed;
+        if (fixed) {
+            reader.fixedInternFn = undumpFixedInternCallback;
+        } else {
+            reader.internFn = undumpInternCallback;
+        }
+        reader.internCtx = @ptrCast(self);
+        const loaded_proto = reader.undumpChunk() catch |err| {
+            const msg: []const u8 = switch (err) {
+                error.TruncatedChunk => "truncated precompiled chunk",
+                error.BadHeader => "bad binary format (corrupted header)",
+                error.BadConstant => "bad binary format (corrupted constant)",
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            const owned = try self.alloc.dupe(u8, msg);
+            return .{ .err_msg = owned }; // input freed by defer
+        };
+        // The undumped tree carries its producing reference; every failure
+        // from here to closure creation must release it (P16.10b Task 4).
+        errdefer loaded_proto.tree.?.release();
+
+        if (fixed) {
+            // Fixed-buffer mode: code/lineinfo/long-strings point into the
+            // input buffer. Record the source backing so the tree knows
+            // what keeps the buffer alive (P16.10b Task 6).
+            switch (input) {
+                .borrowed => {
+                    // C buffer (luaL_loadbufferx('B')): external borrow.
+                    // The caller owns the memory; never freed, never
+                    // GC-marked. The caller must keep it alive until the
+                    // closure is dropped and GC'd (Task 5).
+                    loaded_proto.tree.?.source_backing.external_borrow = bytes;
+                },
+                .owned => |owned_bytes| {
+                    // Owned buffer (lua_load reader collection with 'B'):
+                    // the tree owns it; freed at last release.
+                    try loaded_proto.tree.?.source_backing.owned.append(self.alloc, owned_bytes);
+                    input_consumed = true; // ownership transferred to tree
+                },
+                .pinned => |str| {
+                    // Pinned LuaString (builtinLoadEx load(string, 'B')):
+                    // GC-pinned for the tree's lifetime.
+                    try loaded_proto.tree.?.source_backing.pinned.append(self.alloc, str);
+                },
+            }
+        } else {
+            // Non-fixed: clone proto strings so they don't point into the
+            // (borrowed) input buffer. The copies are registered on the
+            // tree owner and freed with it (P16.10b Task 6).
+            try self.cloneUndumpedStrings(loaded_proto);
+            // For owned input, the bytes are no longer needed after undump
+            // + string cloning — free them now.
+            switch (input) {
+                .owned => |owned_bytes| {
+                    self.alloc.free(owned_bytes);
+                    input_consumed = true;
+                },
+                else => {},
+            }
+        }
+
+        // String constants were VM-interned during undump. Pre-populate
+        // resolved_values tree-wide so resolveTreeConstants does NOT
+        // re-intern (which would churn the string table and displace
+        // fixed-buffer external strings).
+        try self.preResolveUndumpedConstants(loaded_proto);
+
+        // Wrap the deserialized Proto in an executable Closure.
+        const cl = try self.closureFromProto(loaded_proto);
+        loaded_proto.tree.?.release(); // drop the producing reference
+
+        // PUC lua_load (lapi.c:1133-1141): set _ENV upvalue.
+        try self.applyLoadEnv(cl, env, true);
+
+        return .{ .closure = cl };
+    }
+
+    /// Text load path: compile the source chunk and wrap it in a closure.
+    /// The tree's debug lexemes borrow from the source bytes for the
+    /// tree's lifetime, so the source backing must keep them alive.
+    fn loadTextChunk(
+        self: *Vm,
+        input: LoadInput,
+        bytes: []const u8,
+        chunk_name: []const u8,
+        env: Value,
+        pinned_chunk_name: ?*LuaString,
+    ) DispatchError!LoadChunkResult {
+        // Source backing (P16.10b Task 6): the tree borrows its debug
+        // lexemes from the source bytes for its whole lifetime. Set up
+        // the backing based on the input kind.
+        var backing: bc.ProtoTreeOwner.SourceBacking = .{};
+        defer backing.deinit(self.alloc); // consumed on success
+
+        // Helper: ensure chunk_name is kept alive in the backing. If
+        // pinned_chunk_name is provided, pin it; otherwise copy.
+        const pinOrCopyName = struct {
+            fn run(vm: *Vm, b: *bc.ProtoTreeOwner.SourceBacking, cn: ?*LuaString, name: []const u8) error{OutOfMemory}!void {
+                if (cn) |s| {
+                    try b.pinned.append(vm.alloc, s);
+                } else {
+                    const owned_name = try vm.alloc.dupe(u8, name);
+                    try b.owned.append(vm.alloc, owned_name);
+                }
+            }
+        }.run;
+
+        switch (input) {
+            .borrowed => {
+                // C buffer: copy bytes and chunk_name into owned buffers.
+                const owned_bytes = try self.alloc.dupe(u8, bytes);
+                try backing.owned.append(self.alloc, owned_bytes);
+                try pinOrCopyName(self, &backing, pinned_chunk_name, chunk_name);
+            },
+            .owned => |owned_bytes| {
+                // Owned buffer: transfer ownership of bytes, pin/copy name.
+                try backing.owned.append(self.alloc, owned_bytes);
+                try pinOrCopyName(self, &backing, pinned_chunk_name, chunk_name);
+            },
+            .pinned => |str| {
+                // Pinned LuaString: pin the source string. The chunk_name
+                // is pinned if it's a distinct LuaString, or copied.
+                try backing.pinned.append(self.alloc, str);
+                if (pinned_chunk_name) |cn| {
+                    if (cn != str) try backing.pinned.append(self.alloc, cn);
+                } else {
+                    const owned_name = try self.alloc.dupe(u8, chunk_name);
+                    try backing.owned.append(self.alloc, owned_name);
+                }
+            },
+        }
+
+        // For borrowed input, the source bytes that compileTextChunk sees
+        // must point to the backing-owned COPY (not the original C buffer,
+        // which may be freed after this call). For owned/pinned input, the
+        // bytes point into the backing-owned/pinned memory (bytes may be a
+        // substring after BOM/shebang stripping, but it's within the
+        // backing's memory region).
+        const src_bytes: []const u8 = switch (input) {
+            .borrowed => backing.owned.items[0],
+            .owned => bytes,
+            .pinned => bytes,
+        };
+        // For borrowed/owned input with a copied name, src_name points to
+        // the owned copy. For pinned input, src_name points to the pinned
+        // LuaString's bytes. For borrowed/owned with a pinned name,
+        // src_name points to the pinned string's bytes.
+        const src_name: []const u8 = switch (input) {
+            .borrowed, .owned => if (pinned_chunk_name) |cn| cn.bytes() else backing.owned.items[backing.owned.items.len - 1],
+            .pinned => chunk_name,
+        };
+
+        const source = LuaSource{ .name = src_name, .bytes = src_bytes };
+        const compiled = try self.compileTextChunk(source, &backing);
+        const cl = switch (compiled) {
+            .closure => |c| c,
+            .diagnostic => |d| {
+                defer self.alloc.free(d);
+                const owned = try self.alloc.dupe(u8, d);
+                return .{ .err_msg = owned };
+            },
+        };
+
+        // PUC lua_load (lapi.c:1133-1141): set _ENV upvalue.
+        try self.applyLoadEnv(cl, env, true);
+
+        return .{ .closure = cl };
+    }
+
     fn builtinLoad(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         return self.builtinLoadEx(args, outs, false);
     }
@@ -24097,6 +24471,11 @@ pub const Vm = struct {
     /// binary-only) is accepted and enables fixed-buffer mode (PUC's C API
     /// `luaL_loadbufferx`). When false, 'B' is rejected with "invalid mode"
     /// (PUC's `getMode` in lbaselib.c, used by Lua's `load`/`loadfile`).
+    ///
+    /// Delegates to `loadChunk` (the unified primitive) after collecting the
+    /// source bytes (reader-function collection, shebang stripping). The
+    /// mode semantics (checkmode, binary/text dispatch, fixed-buffer) are
+    /// handled entirely by `loadChunk`.
     fn builtinLoadEx(self: *Vm, args: []const Value, outs: []Value, allow_fixed: bool) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("load expects string or function", .{});
@@ -24111,7 +24490,7 @@ pub const Vm = struct {
         try roots.add(mode_val);
         try roots.add(env_val);
         const mode = switch (mode_val) {
-            .Nil => "bt",
+            .Nil => @as(?[]const u8, null),
             .String => |m| m.bytes(),
             else => return self.fail("load: mode must be string", .{}),
         };
@@ -24120,28 +24499,21 @@ pub const Vm = struct {
         // Only the C API (`luaL_loadbufferx`) supports 'B'. Since `builtinLoad`
         // is shared between Lua's `load` and testC's `loadstring`, we reject
         // 'B' here and have testC's `loadstring` call `builtinLoadEx(true)`.
-        for (mode) |ch| {
-            switch (ch) {
-                'b', 't' => {},
-                'B' => if (allow_fixed) {} else return self.fail("invalid mode", .{}),
-                'T' => if (allow_fixed) {} else return self.fail("invalid mode", .{}),
-                else => return self.fail("load: invalid mode", .{}),
+        if (mode) |md| {
+            for (md) |ch| {
+                switch (ch) {
+                    'b', 't' => {},
+                    'B' => if (allow_fixed) {} else return self.fail("invalid mode", .{}),
+                    'T' => if (allow_fixed) {} else return self.fail("invalid mode", .{}),
+                    else => return self.fail("load: invalid mode", .{}),
+                }
             }
         }
-        const allow_binary = if (allow_fixed) std.mem.indexOfAny(u8, mode, "bB") != null else std.mem.indexOfScalar(u8, mode, 'b') != null;
-        const allow_text = if (allow_fixed) std.mem.indexOfAny(u8, mode, "tT") != null else std.mem.indexOfScalar(u8, mode, 't') != null;
 
-        var source_owned: ?[]u8 = null;
-        var prefixed_owned: ?[]u8 = null;
-        // P16.10b Task 6: these buffers become the tree's source backing on
-        // the load path (ownership transferred, nulled there). Every other
-        // exit of this builtin must free whatever was not transferred —
-        // previously both leaked on every early return.
-        defer {
-            if (source_owned) |b| self.alloc.free(b);
-            if (prefixed_owned) |b| self.alloc.free(b);
-        }
+        // --- Collect source bytes (reader-function or string) ---
         const source_is_reader = reader_val != .String;
+        var source_owned: ?[]const u8 = null;
+        defer { if (source_owned) |b| self.alloc.free(b); }
         const source_str: ?*LuaString = switch (reader_val) {
             .String => |x| x,
             else => null,
@@ -24200,6 +24572,8 @@ pub const Vm = struct {
                 break :blk source_owned.?;
             },
         };
+
+        // --- Shebang stripping (PUC lauxlib.c skipcomment equivalent) ---
         const default_chunk_name: []const u8 = if (source_is_reader) "=(load)" else s;
         const chunk_name_hint = switch (chunk_name_val) {
             .Nil => default_chunk_name,
@@ -24209,151 +24583,74 @@ pub const Vm = struct {
         const allow_shebang = chunk_name_hint.len != 0 and chunk_name_hint[0] == '@';
         const prefix = stripChunkPrefix(s, allow_shebang);
         var chunk_bytes = prefix.bytes;
+        var prefixed_buf: ?[]u8 = null;
+        defer { if (prefixed_buf) |b| self.alloc.free(b); }
         if (prefix.had_shebang and !(chunk_bytes.len > 0 and chunk_bytes[0] == 0x1b)) {
-            prefixed_owned = try self.alloc.alloc(u8, chunk_bytes.len + 1);
-            prefixed_owned.?[0] = '\n';
-            @memcpy(prefixed_owned.?[1..], chunk_bytes);
-            chunk_bytes = prefixed_owned.?;
+            prefixed_buf = try self.alloc.alloc(u8, chunk_bytes.len + 1);
+            prefixed_buf.?[0] = '\n';
+            @memcpy(prefixed_buf.?[1..], chunk_bytes);
+            chunk_bytes = prefixed_buf.?;
         }
 
-        if (chunk_bytes.len > 0 and chunk_bytes[0] == 0x1b) {
-            if (!allow_binary) {
-                outs[0] = .Nil;
-                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("attempt to load a binary chunk") };
-                return;
-            }
-            // PUC Lua's `luaU_undump` (lundump.c) reconstructs the Proto tree
-            // directly from the binary chunk. We mirror that: feed the bytes
-            // to `UndumpReader.undumpChunk`, which validates the 40-byte header
-            // and deserializes the body. String constants are interned into the
-            // VM's string table during undump via `undumpInternCallback`, so the
-            // reconstructed Proto is immediately executable (matching PUC's
-            // `luaS_new` call in `loadString`).
-            //
-            // PUC's `f_parser` (ldo.c:1129-1131) sets `fixed=1` when the mode
-            // contains 'B' (uppercase binary-only). In fixed mode, `luaU_undump`
-            // points code/lineinfo/long-strings directly into the source buffer
-            // instead of copying, keeping memory overhead minimal. The source
-            // buffer must stay alive for the Proto's lifetime.
-            const fixed = std.mem.indexOfScalar(u8, mode, 'B') != null;
-            var reader = undump_mod.UndumpReader.init(self.alloc, chunk_bytes);
-            reader.fixed = fixed;
-            if (fixed) {
-                reader.fixedInternFn = undumpFixedInternCallback;
-            } else {
-                reader.internFn = undumpInternCallback;
-            }
-            reader.internCtx = @ptrCast(self);
-            const loaded_proto = reader.undumpChunk() catch |err| {
-                outs[0] = .Nil;
-                const msg: []const u8 = switch (err) {
-                    error.TruncatedChunk => "truncated precompiled chunk",
-                    error.BadHeader => "bad binary format (corrupted header)",
-                    error.BadConstant => "bad binary format (corrupted constant)",
-                    error.OutOfMemory => "out of memory",
-                };
-                if (outs.len > 1) outs[1] = .{ .String = try self.internStr(msg) };
-                return;
-            };
-            // The undumped tree carries its producing reference; every
-            // failure from here to closure creation must release it, and
-            // success drops it once the closure holds its own (P16.10b
-            // Task 4).
-            errdefer loaded_proto.tree.?.release();
-            if (fixed) {
-                // In fixed-buffer mode, code/lineinfo/long-strings point into
-                // the source buffer. Pin it ON THE TREE (P16.10b Task 6) so
-                // GC doesn't sweep it while the tree is alive — the pin dies
-                // with the tree instead of living for the VM's lifetime.
-                if (source_str) |x| {
-                    try loaded_proto.tree.?.source_backing.pinned.append(self.alloc, x);
-                }
-            } else {
-                // The undumped proto's string fields (source_name, name, locvar
-                // names, upvalue names) point into the binary buffer which may be
-                // garbage-collected. Duplicate them so the proto owns its strings
-                // (the dupes are registered on the owner and freed with it).
-                try self.cloneUndumpedStrings(loaded_proto);
-            }
-            // String constants were already VM-interned during undump (via
-            // undumpInternCallback or undumpFixedInternCallback). Pre-populate
-            // resolved_values tree-wide so resolveTreeConstants does NOT
-            // re-intern (which would churn the string table and displace
-            // fixed-buffer external strings).
-            try self.preResolveUndumpedConstants(loaded_proto);
-            // Wrap the deserialized Proto in an executable Closure. The
-            // closure retains the tree owner (freed via GC when the last
-            // closure of the tree is collected).
-            const cl = try self.closureFromProto(loaded_proto);
-            loaded_proto.tree.?.release(); // drop the producing reference
-            try roots.add(.{ .Closure = cl });
-            // lua_load always initializes the loaded main closure's first
-            // upvalue with the selected environment. A stripped chunk has no
-            // upvalue names, so name-based _ENV discovery is insufficient.
-            try self.applyLoadEnv(cl, env_val, true);
-            {
-                const o = self.refreshBuiltinOuts() orelse outs;
-                o[0] = .{ .Closure = cl };
-                if (o.len > 1) o[1] = .Nil;
-            }
-            return;
-        }
-        if (!allow_text) {
-            outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("attempt to load a text chunk") };
-            return;
-        }
-
+        // --- Determine LoadInput and chunk_name for loadChunk ---
         const chunk_name = switch (chunk_name_val) {
             .Nil => default_chunk_name,
             .String => |nm| nm.bytes(),
             else => return self.fail("load: chunk name must be string", .{}),
         };
-        // Source backing (P16.10b Task 6): the tree borrows its debug
-        // lexemes from these bytes for its whole lifetime. LuaString
-        // sources pin the string (marked via closure traversal); heap
-        // buffers (reader-fn collection, shebang prefix) transfer
-        // ownership to the tree. A distinct chunk-name string is pinned
-        // as well — source_name borrows from it. The backing is consumed
-        // by compileTextChunk on every path (attached on success, freed
-        // on failure), so the reader-fn/prefixed buffers can no longer
-        // leak and the REPL-style per-load pin accumulation is gone.
-        var backing: bc.ProtoTreeOwner.SourceBacking = .{};
-        defer backing.deinit(self.alloc); // consumed on success
-        if (source_str) |x| {
-            try backing.pinned.append(self.alloc, x);
-            if (chunk_name_val == .String and chunk_name_val.String != x) {
-                try backing.pinned.append(self.alloc, chunk_name_val.String);
+        // For Lua-level load, the chunk_name may be a GC-managed LuaString
+        // that should be pinned rather than copied.
+        const pinned_chunk_name: ?*LuaString = if (chunk_name_val == .String) chunk_name_val.String else source_str;
+
+        // Build the LoadInput. For shebang-prefixed text, the input is the
+        // prefixed_owned buffer (.owned). For string source without shebang
+        // (or binary after shebang), the input is the pinned LuaString
+        // (.pinned). For reader-fn source, the input is the collected
+        // buffer (.owned).
+        var input: LoadInput = undefined;
+        if (prefixed_buf) |buf| {
+            // Shebang-prefixed text: the tree borrows from the prefixed
+            // buffer. The original source_owned is no longer needed.
+            input = .{ .owned = buf };
+            prefixed_buf = null; // ownership transferred to loadChunk
+            if (source_owned) |so| {
+                self.alloc.free(so);
+                source_owned = null;
             }
-        }
-        if (prefixed_owned) |buf| {
-            // Shebang-prefixed copy — the tree borrows THIS buffer, not
-            // the string above; transfer ownership.
-            prefixed_owned = null;
-            try backing.owned.append(self.alloc, buf);
+        } else if (source_str) |str| {
+            // String source, no shebang (or binary after shebang): the
+            // tree borrows from the pinned LuaString. chunk_bytes is a
+            // substring of the string's bytes.
+            input = .{ .pinned = str };
         } else if (source_owned) |buf| {
-            // Reader-fn collected source — same transfer (was a leak).
-            source_owned = null;
-            try backing.owned.append(self.alloc, buf);
+            // Reader-fn source, no shebang: the tree borrows from the
+            // owned buffer.
+            input = .{ .owned = buf };
+            source_owned = null; // ownership transferred to loadChunk
+        } else {
+            // Empty source: use a borrowed empty slice.
+            input = .{ .borrowed = chunk_bytes };
         }
-        const source = LuaSource{ .name = chunk_name, .bytes = chunk_bytes };
-        const compiled = try self.compileTextChunk(source, &backing);
-        const cl = switch (compiled) {
-            .closure => |closure| closure,
-            .diagnostic => |diagnostic| {
-                defer self.alloc.free(diagnostic);
+
+        // --- Delegate to loadChunk (the unified primitive) ---
+        const result = self.loadChunk(input, chunk_bytes, chunk_name, mode, env_val, pinned_chunk_name) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.RuntimeError => return error.RuntimeError,
+            error.Yield => return error.Yield,
+        };
+        switch (result) {
+            .closure => |cl| {
+                try roots.add(.{ .Closure = cl });
+                const o = self.refreshBuiltinOuts() orelse outs;
+                o[0] = .{ .Closure = cl };
+                if (o.len > 1) o[1] = .Nil;
+            },
+            .err_msg => |msg| {
+                defer self.alloc.free(msg);
                 const o = self.refreshBuiltinOuts() orelse outs;
                 o[0] = .Nil;
-                if (o.len > 1) o[1] = .{ .String = try self.internStr(diagnostic) };
-                return;
+                if (o.len > 1) o[1] = .{ .String = try self.internStr(msg) };
             },
-        };
-        try roots.add(.{ .Closure = cl });
-        try self.applyLoadEnv(cl, env_val, true);
-        {
-            const o = self.refreshBuiltinOuts() orelse outs;
-            o[0] = .{ .Closure = cl };
-            if (o.len > 1) o[1] = .Nil;
         }
     }
 

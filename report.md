@@ -1,232 +1,241 @@
-# Отчёт: P16.4g (correctness closure) + P16.2d (frame path) + инфраструктура LLM-прокси
+# Отчёт: P16.10a→P16.10b — callable-метаметоды, dispatch-floor, Proto lifetime (4b6d6af..f2dc7d1)
 
-Период: 28 августа 2026. 9 коммитов в luazig (`a3eb382..d966b48`), 3 коммита
-в новом репозитории `llm-guard-proxy`. Входное состояние: `020fd02` (P16.4f),
-matrix zig_fail=1 (nextvar.lua — блокер корректности), geomean 2.39x.
-Выходное состояние: `d966b48`, полный гейт зелёный, geomean **2.33x**
-(лучший прогон 2.29x), lua_calls суммарно ≈ −26% за период.
+Период: 29–30 августа 2026. 19 коммитов. Вход: `4b6d6af` (P16.10a final,
+geomean 1.84x). Выход: `f2dc7d1` (P16.10b final) — **geomean 1.79x**, полный
+гейт зелёный, закрыты три блока корректности (callable-семантика,
+dispatch-floor модель, Proto lifetime + цепочка GC-багов).
 
-Задание поступило от верификатора («P16.4g correctness closure before
-further performance work»): 7 задач — от репродукции nextvar до аудита
-catch{}, с жёстким запретом перф-работы до зелёного гейта.
-
----
-
-## Часть 1. P16.4g — закрытие корректности генерационного GC
-
-### Task 1 — nextvar.lua: репродукция и root cause
-
-**Симптом**: `nextvar.lua --testc` — «invalid key to 'next'» (nextvar.lua:30,
-countentries), детерминированно 3/3–5/5.
-
-**Расследование** (сабагент, изоляция усечением файла до <20 строк):
-контрольный ключ-строка **жив** (не собрана GC), её узел **присутствует** в
-таблице — но `nodeLookup` не находит узел: цепочка коллизий от main-position
-оборвана. 23 354 зафиксированных случая порчи цепочек за прогон.
-
-**Root cause** — `nodeInsert` (src/lua/ltable.zig), две ошибки против PUC
-`insertkey` (ltable.c:863):
-1. Доступность main-position проверялась по тегу ключа (`isEmpty()`), а не по
-   значению (PUC: `isempty(gval(mp))`). Удалённый узел (ключ жив, value=Nil)
-   ошибочно уходил в Brent-эвикцию.
-2. При перезаписи затирался `next_offset` (PUC никогда не трогает `gnext`) —
-   все узлы цепочки после перезаписанного сиротели.
-3. Бонус: у `.dead`-узлов `rawHash` = 0 → Brent ходил по чужой цепочке.
-
-Не виноваты: GC-освобождение ключа, TFOR-liveness, корутины, deadkey-логика.
-
-### Task 2 — PUC-faithful DEADKEY
-
-Реализована архитектура PUC `setdeadkey`/`equalkey(deadok)`:
-- `NodeKeyPayload.gc_ptr` — все collectable-варианты алиасят один указатель;
-  `markDeadKey` сохраняет сырой указатель (раньше затирался нулём).
-- `keyMatchesDeadok`/`nodeLookupDeadok` — deadok-поиск по указателю, доступен
-  ТОЛЬКО из `rawNext` (обычные lookup'и `.dead => false` на первом месте —
-  горячий путь не утяжелён).
-- `clearKey` (был string-only `deadenStringKey`) + `gcClearDeadKeys` — деден
-  ЛЮБОГО collectable-ключа с Nil-значением; weak-key-таблицы сохранены.
-- Аудит 15 путей чтения `key_val` (rehash/nextLiveIndex/GC-traversal/ephemerons/
-  weak-prune/resize) — ни один не разыменовывает мёртвый указатель; 8 unit-тестов.
-
-### Task 3 — корутин-liveness
-
-Инструментально подтверждено отсутствие бага (ключ жив и маркирован).
-Постоянные дифференциальные тесты (оба рантайма):
-`tests/smoke/55_table_chain_integrity.lua` (churn 2^11 ключей + pairs-подсчёт +
-саспенсion итератора + delete-key-during-iteration + GC + resume) и
-`tests/smoke/56_deadkey_semantics.lua` (next() с удалёнными ключами классов
-short/long string, table, closure).
-
-### Task 4 — восстановление grayagain-drain в минорах
-
-Disabled-PUC-блок («causes use-after-free») убран: drain работает во ВСЕХ
-режимах. Две реальные причины исторического UAF:
-1. **genlink**: TOUCHED1→TOUCHED2→OLD за один цикл вместо двух (PUC lgc.c:470
-   держит TOUCHED1 в grayagain два цикла) → молодые дети не перемечались на
-   втором цикле → преждевременный сбор → SIGSEGV в files.lua:757.
-2. **Отсутствие remarkupvals**: значения открытых upvalue меняются после
-   propagate (возобновление корутины) → добавлен `gcRemarkUpvals` (lgc.c:406):
-   перемечание значений открытых Cells поверх gc_objects (Cells переживают
-   фриз замыканий — обходит UAF через frameUpvalues).
-
-### Task 5 — per-VM энтропийный hash seed
-
-`Vm.init` → делегирует в `initWithSeed(alloc, noenv, seed)`; прод-путь берёт
-`makeRandomSeed()` (PUC luai_makeseed: время+адрес), `lua_newstate` передаёт
-C-API seed (lstate.c:354), тесты инъектируют фиксированный. Seed не мутирует,
-от rng_state (math.random) не зависит. Coherence-тест intern↔table-key.
-
-### Task 6 — честность документации + бисект
-
-`git bisect 1bc3875..020fd02`: **first-bad = `0d53f55` (P16.4d)** — не P16.4a,
-как предполагалось. История: баг `nodeInsert` старый, но ген-GC-режим
-(P16.4d: sweepgen-цвета, gcMakeAllOld→BLACK) сделал деден/удаление ключей
-настолько частым, что порча цепочек стала воспроизводимой. STATUS.md:
-аппенд «P16.4g — correctness closure» с бисект-фактом, свежими числами и
-списком оставшихся приближений (FINALIZEDBIT-очистка O(n) как транзит,
-defensive stale-entry скипы); «Last updated» синхронизирован. Претензии
-«pre-existing» заменены доказанным бисектом.
-
-### Task 7 — аудит catch{} в GC-контроле
-
-8 сайтов классифицированы с цитатами PUC: StringTable insert/shrink —
-легитимная OOM-толерантность (luaS_resize/checkSizes); gcControl catch —
-C-ABI граница (PUC бросает luaD_throw, мы возвращаем i32); барьеры —
-архитектурная разница (PUC intrusive gclist инфаллибелен). Наблюдаемых
-PUC-расхождений возвращаемых значений нет; STEP-гранулярность задокументирована.
-
-### Верификация P16.4g (полный гейт, проверен лично)
-
-Debug+RF builds/tests 0; c_api 18/18 + DIFF PASS; matrix **zig_fail=0**
-(big.lua both_fail — предсуществующий, честно); **nextvar 10/10**; smoke
-56/56; leak_bench PASS; 15_stress_leak 0/0; gc/gengc/closure/coroutine/
-events/errors/files --testc — все 0. Perf-baseline обновлён (`c8fee6c`,
-geomean 2.42x; comparisons/field_access изолированно чисты — лотерея полного
-прогона на горячей машине, задокументировано).
+Задания поступали от верификатора тремя порциями: P16.10 (dispatch-floor
+analysis), P16.10a (callable-metamethod parity), P16.10b (Proto lifetime /
+ownership closure). Часть работы потеряна/восстановлена после трёх OOM-обрывов
+хоста (включая один инцидент с бинарным мусором в vm.zig) — отмечено в
+хронологии.
 
 ---
 
-## Часть 2. P16.2d — frame path (после зелёного гейта, по профилю)
+## Часть 1. P16.10 — dispatch floor (measurement-first)
 
-Профиль lua_calls (perf annotate): dispatch 65%, **push 14.3% + complete
-12.4% = 26.7%** — выше порога 20–25%, транша одобрена верификатором.
-Агент-аналитик классифицировал каждое поле кадра (hot/warm/cold/dead) и
-выдал ранжированный план с annotate-доказательствами.
+Верификатор запретил computed-goto «потому что PUC использует» — сначала
+доказать, что генерирует ReleaseFast.
 
-### `8134f90` — frame-init slimming (lua_calls −7.4%)
+### T0 — зачистка P16.9 (`796de88`)
+- Комментарий `gcTableBarrierBackSlow` приведён к факту (inline — измеренное
+  решение; noinline давал layout-регрессию).
+- rawSet rehash-барьер: доказано по цепочке file:line, что tableResize
+  collector-free (сырой alloc + чистый учёт) → единственный pre-барьер
+  корректен; комментарий исправлен, код не тронут.
+- STATUS «Last updated» автоматизирован (tools/status/phase.txt, пишет
+  status_snapshot --phase).
+- Числа P16.9 приведены к артефакту: медианы 339.1±38 / 190.1±18 (было
+  скопировано «377» из одного прогона).
 
-- Удалены доказанно мёртвые записи: 4×callstatus-очистки бит (после
-  encodeNresults с маской 0xff все флаговые биты уже нулевые) и мёртвый
-  isDebugHook-блок; запись `proto` в syncFrame (ctx.cur_proto загружается ИЗ
-  кадра и пишется в кадр только в push/opTailcall — доказано полным grep).
-- `ensureBcStackCap` → inline (быстрая ветка = одно сравнение; рост вынесен в
-  cold `growBcStackCapSlow`).
-- Активация union `undefined` вместо `.{}` (−56B memset) с аудитом всех 12
-  полей LuaFrameState: каждое пишется явно; Debug 0xaa-филл ловит пропуски.
-- comptime-ассерт `@sizeOf(CallFrame) <= 104`.
+### T1-T3 — измерение пола (`03422b1`)
+Versioned-артефакт `tools/perf/current-dispatch-floor.json` +
+`tools/perf_dispatch_floor.py`:
+- **forloop_only steady-state**: zig 75.0 instr/iter vs PUC 28.0 (cycles
+  13.9 vs 10.3; wall 3.58 vs 2.72 ns/iter).
+- **Lowering switch(op)**: ПЛОТНАЯ JUMP-TABLE (128 записей, 32-бит offsets),
+  2 dispatch-сайта, горячий путь использует ОДИН → «computed goto» не
+  диагноз: преимущество (единый BTB-сайт) уже реализовано.
+- **Компонентные дельты** (stash-dance, всё откачено): SIGINT +7, stack-poll
+  +3, vmstats +2, hooks +2, dispatch_pc +1; all-removed floor +14 из 47
+  лишних инструкций.
 
-### `9f30da3` — guard bcGrowFrame на возврате
-
-`applyBytecodeResultsDirect` вызывает bcGrowFrame даже когда роста нет —
-только чтобы пересчитать слайсы. Guard `dst + nstore > frame_cap` (семантически
-идентичен внутренней проверке). Нейтрален на single-value микро, корректен по
-построению.
-
-### `a6a5d9f` — inline return hot path (lua_calls −18.8%)
-
-Быстрые ветки в opReturn1/opReturn0, минующие completeBytecodeExecFrame +
-applyBytecodeResultsDirect. Guard-условия (все обязательны, иначе fallback):
-нет открытых upvalue; нет TBC-регистров; родитель Lua и в границах; не внешняя
-граница; нет pending-call; хуки не активны; nresults ∈ {1, 0, <0×1значение}.
-Pop-последовательность зеркалит popBytecodeExecFrame построчно. Главная
-экономия: **одинарная копия результата** вместо двойной (устранён
-bc_return_scratch) — доказательство безопасности для одного значения
-(RHS читается до записи; мультизначный форвард-копи мог затирать источник,
-потому multret-ветка ограничена ровно одним значением).
-
-Изолированный A/B: инструкции −11.8%, циклы −10.9%. multret-ворклоуд
-неизменен (ожидаемо).
-
-### Числа транша
-
-| Коммит | lua_calls | geomean |
-|---|---|---|
-| вход (020fd02) | — | 2.39x (после P16.4f; вход транша P16.4 — 2.53x) |
-| `c8fee6c` baseline | — | 2.42x |
-| `8134f90` | −7.4% | 2.36x |
-| `a6a5d9f` | −18.8% | **2.33x** (лучший прогон 2.29x) |
-
-Гейт после каждого шага + финально: полный набор зелёный (matrix zig_fail=0,
-smoke 56/56, c_api+DIFF, nextvar 10x+5x+3x, 8 сьютов --testc, leak_bench,
-stress-пара, perf_compare без >5% регрессий). Итерационное требование закрыто:
-чекбокс P15.34 (специализированные integer/interned-string lookup пути —
-выполнены ещё P16.1b, закрыт задним числом с верификацией анализом).
+### T4-T8 — аудиты и чистые выиграши (`f943e3b`, `5b26e58`, `220eaf0`)
+- **P15.33-аудит**: «отдельный compact loop» НИКОГДА не существовал —
+  документационный миф; зафиксировано.
+- **Stack-poll удалён** (75→72): полная классификация realloc-путей — все
+  refresh-or-exit; инвариант записан у цикла.
+- **SIGINT передизайн** (72→70): root cause — давление регистров от любой
+  пер-инструкционной переменной; boundary-only чек без переменной;
+  embedding-пользователи платят 0 (const false → dead-code).
+- dispatch_pc (+1) и hooks (+2) — оставлены с обоснованием (PUC сам платит
+  ≥ столько; fail() на 954 сайтах).
+- Итог: **75→70 instr/iter**; fresh profile → frame-push отложен по данным
+  (SETTABUP-барьер и dispatch-инфляция выше).
 
 ---
 
-## Часть 3. Инфраструктура: llm-guard-proxy (диагностическая сага)
+## Часть 2. P16.10a — callable-metamethod parity (BLOCKER)
 
-### Эпизод 1 — «упало по OOM»
+Воспроизведён и подтверждён лично: metamethod-ПОЛЕ с callable-значением
+(`__add = mm` где `getmetatable(mm).__call`) — PUC печатает 42, zig падал
+«attempt to call a table value (metamethod 'add')». Старый smoke-кейс
+«__call-valued metamethod» тестировал лишь обычный callable-table — ложное
+покрытие.
 
-Во время P16.4f systemd-oomd убивал пользовательские сессии (4 убийства за
-день). Изначально отвергнуто (dmesg чист — а зря: systemd-oomd пишет в
-system journal, а не в kernel log). Итог двух пересмотров: ООМ-убийства были
-реальными и вызванными рабочими прогонами luazig с утечкой (найденной и
-исправленной в P16.4f), но к падениям САБАГЕНТОВ отношения не имели.
+### Архитектурный фикс (`f9eeec4`)
+PUC-двухстадийная модель: (1) TMS/metafield-резолюция — БЕЗ `__call`-логики
+внутри; (2) вызов резолвнутого Value через **обычную** callable-семантику —
+`resolveCallable` ровно один раз: direct Builtin/Closure → zero-alloc;
+иначе `__call`-цепочка со стандартной трансформацией аргументов (self
+ prepended). Покрыто: MMBIN/UNM/BNOT/LEN/EQ/LT/LE/CONCAT/__tostring/__gc.
+**__index/__newindex НЕ через generic-callable** — их non-function значения
+следуют table-index chaining (граница зафиксирована комментарием).
+Ошибки: `namewhat="metamethod"` → точные PUC-тексты трёх вариантов.
 
-### Эпизод 2 — пустые результаты сабагентов
+### Тесты (`bf4df90`) + resolve-once (`1f35e70`)
+- `64_callable_metamethods.lua` (A–H: precedence, anti-cache мутации, 12
+  событий, flips, unary, yield, hooks) — byte-identical.
+- `pushResolvedBytecodeClosure` — общий примитив «push ЗАВЕДОМО
+  резолвнутого bytecode-Closure с готовыми args»; direct-Closure-путь
+  больше НЕ вызывает resolveCallable: **noalloc −8.5%, resolveCallable 0% в
+  профиле**, geomean 1.84x.
 
-Два агента подряд (Change 6) вернули пустые результаты. Диагностика по
-opencode.log + БД (таблица part):
-- **429-ретраи работали всегда**: лог показывает циклы
-  «429 → ожидание Retry-After (42s/7s/8s) → повтор → успех».
-- Убийца: последняя часть умерших сессий — тип **`reasoning` без `text`**.
-  glm-5.2 (mws, output limit 10k) на длинных промптах выжигает бюджет вывода
-  на reasoning → сообщение без content и без tool_call → opencode завершает
-  loop → «результат» пуст.
-- Guard-прокси это пропускал: `event_is_meaningful`/`json_response_is_empty`
-  считали `reasoning_content` «meaningful».
+### T4-T11 — остальное фазы
+- simple_result **транзакционность** (`3858a5c`): errdefer-rollback между
+  set и активацией; FailingAllocator-тест (5 отказов → родитель byte-exact
+  нетронут; тест красный при отключённом errdefer).
+- dispatch-floor артефакт когерентен (Option A: head 1f35e70, sha256
+  бинарей; исторические эксперименты — отдельная секция с source-head).
+- **Frame-push классификация** (44 операции / 9 категорий): найден
+  provably-redundant `activeErrorHandlerDepth()` (11.3% функции).
+- **Proto-ownership аудит**: вердикт «NOT CLEAN» — k мутируется
+  VM-указателями, resolved_values VM-аллоцирован, resolve не рекурсивен —
+  5 обязательных изменений до переноса резолюции.
+- Lazy handler-limit + «stack overflow» паритет текста (`86de1f9`).
+- Финал: noalloc 2.93→2.71x; resolveCallable=0%; frame-push остаётся
+  легитимной целью (теперь над ним нет мёртвых generic-вызовов).
 
-### Фиксы (репозиторий `~/codes/llm-guard-proxy`)
+---
 
-Каталог переименован из `mws-llm-guard-proxy`, git init, юнит обновлён:
+## Часть 3. P16.10b — Proto lifetime / ownership (3 блокера)
 
-- `dd9c2c6`: reasoning больше не meaningful (обе проверки).
-- `e5f22db` (починка регрессии от dd9c2c6): немедленный форвард SSE вместо
-  буферизации до первого content — буферизация задерживала первый байт на
-  всю фазу reasoning; плюс подняты ZAI-таймауты (60→300s chunk, 300→1800s
-  request) — 4×504 «MWS upstream timed out» на /v4 возникли из-за легитимных
-  минутных пауз reasoning-модели между чанками. Финальная архитектура:
-  форвардить всё сразу; если стрим кончился без content/tool_call —
-  force_close (клиент видит ретраебельный обрыв) или 502, если ничего не
-  отправлено.
+### Блокер 2 → strip как свойство сериализации (`5e23caf`, `3d4cbde`, `c455b9c`)
+- `string.dump(f,true)` в цикле: **611 MB/decade LINEAR** (control flat).
+  Root: `cloneStrippedProto()` — shallow-borrow клон, никогда не
+  освобождался, generic deinit для него был бы неверен.
+- Фикс: `DumpOptions{strip}` в dump.zig — strip = опция СЕРИАЛИЗАЦИИ
+  (PUC DumpState.strip), клон удалён полностью (grep=0). Что опускается:
+  source/name→пусто, lineinfo 0, locvars 0, имена upvalue'ов — с
+  undump-совместимостью по чтению. Бонус-паритет: getinfo `=?`/`?`,
+  ошибки `?:?:`, traceback `?:` (нашли и предсуществующее `?:0:`
+  расхождение).
+- Lane'ы: repeated_stripped_dump/plain_dump/dynamic_load постоянные; тесты:
+  smoke 65 (roundtrips обоих режимов, вложенные деревья) + c_api 18_dump
+  (lua_dump strip=0/1). Результат: **611→0.16 MB/decade**.
 
-Проверка делом: сабагент Change 6, дважды умиравший, после фикса отработал
-полностью (−18.8% lua_calls).
+### Блокер 1+3 → ProtoTreeOwner (`94bf0a2`, `3b524f4`)
+- `load()` в цикле: **2333 MB/decade**; `collectgarbage("count")≈0` —
+  native-утечка вне GC-учёта. Root: `gcFreeObject(.closure)` никогда не
+  освобождал Proto (комментарий «Closure owns the Proto» был ложью);
+  `pinned_source_strings` держал источники до VM-deinit.
+- **Inventory** (`b946c7b`, tools/ownership/proto-inventory.json): все
+  production-точки создания Proto (два конструктора: ProtoBuilder.finish и
+  UndumpReader.undumpProto); OP_CLOSURE не создаёт (shares); string.dump
+  после T1 не создаёт; кросс-VM шаринга в production НЕТ.
+- **ProtoTreeOwner** (Option A — refcounted tree): root+allocator+ref_count
+  +vm-тег + source_backing; Closure несёт owner-ref; gcFreeObject
+  release'ит; ПОСЛЕДНИЙ release деинитит дерево ровно один раз
+  (структурно — без boolean-хаков владения). Parent-умер/child-живёт —
+  безопасно через общий refcount. OOM-дисциплина: producer-ref +
+  errdefer на каждой передаче.
+- **Source backing** (`3b524f4`): пины живут на дереве, GC-маркируются
+  через closure-traversal (gcMarkBytecodeProto — PUC traverseLClosure);
+  `Vm.pinned_source_strings` УДАЛЁН. **load lane → 0.00 MB/decade**.
+- **Adoption** (`591f120`, моя ручная доводка после OOM-обрыва):
+  резолюция констант на границах (createBytecodeClosure + runBytecode) —
+  `resolveProtoConstants` УДАЛЁН из push/tailcall (Debug-tripwire вместо
+  него); two-phase resolve (стадирование без мутации → публикация) —
+  retry-safe при OOM. Устранён и `constants_resolved`-хак владения.
+  Тест: smoke 66_proto_lifetime (child-outlives-root: вложенность>2,
+  несколько детей одного дерева, drop root/siblings, GC между вызовами,
+  dump после смерти root, getinfo).
+
+### Крэш-сага locals.lua (самая длинная часть фазы)
+После adoption матрица продолжала падать -11 на locals.lua, standalone —
+зелёный. Инструментарий: gdb-under-matrix, coredumpctl, reproduction-бисект
+(свыше 30 прогонов), маркерные сборки locals.lua, поэлементные комбинации
+блоков. Найденная цепочка независимых багов:
+
+1. **Три дублированных varargs-слайса** `[func_slot-nextra]` без учёта
+   vararg-TABLE-режима (аргументы при base+numparams, НЕ ниже func_slot):
+   gcMarkMutableRoots, select-варарг (opReturn), gcPropagateOne parked-walk.
+   Для таблиц-режима слайс читал ЧУЖИЕ регистры → маркировал мусор как
+   объекты → «висячая метатаблица в fastTm» (первый coredump-backtrace).
+   Fix: единый mode-aware `frameVarargs()` (`591f120`, `e33daf6`).
+2. **Callable-__close yield при смертельной ошибке**: PUC закрывает TBC
+   noyield (luaD_throw→luaE_resetthread→closeprotected(yy=0)→callnoyield) —
+   yield из __close = «C-call boundary»; luazig разрешал (минимальный репро
+   tbcz/tbcw). Fix: noyield при bottom-propagate unwind; вторая итерация —
+   вместо sticky-флага вычисление по факту из списка unwind-состояний
+   (sticky тек через interleaved-эпизоды).
+3. **`@intFromFloat` без i64-guard** в codegen (rhsConstUsableForCmp /
+   normalizeCmpConst): константы вроде 1e308 — Debug integer-overflow,
+   ReleaseFast UB (матричные SIGABRT в math/api/strings).
+4. **Weak-key clearKey без setempty**: PUC (lgc.c:796-798) сначала
+   опустошает value, потом deaden — мы деденили ключ при живом value.
+5. **ГЛАВНЫЙ (`8937c9b`)**: прямые GC-барьеры (gcWriteBarrierCell /
+   gcStoreClosureEnv / gcStoreMetatable) делали `gcSetBlack` БЕЗ траверса
+   детей — PUC luaC_barrier_ кладёт в gray-list (reallymarkobject).
+   Дети оставались белыми → sweep освобождал → вся UAF-цепочка. Плюс:
+   gcResetCycleState чистил gc_gray в минорах (PUC youngcollection не
+   чистит); gcAtomicCommon Step 13 теперь всегда дренирует gray;
+   parked-корутины обходятся по live_reg_top[pc] (не stack_top).
+
+Механика ловли: Debug-бинар в матрице → чистые panic-трейсы; coredumpctl
+для RF; комбинации t*/s*/pfx*-файлов локализовали накопительный характер;
+последний шаг (агент) доказал барьерный root-cause инструментальными
+принтами и закрыл всё пачкой фиксов.
+
+### Отложено (TODO в коде)
+`traverseupvalue`-эквивалент для cell-arm в gcPropagateOne — PUC-faithful
+путь экспонирует предсуществующий бф (cell values освобождаются sweep'ом);
+отдельная задача.
+
+---
+
+## Хронология коммитов
+
+| Хэш | Суть |
+|---|---|
+| 796de88 | T0: stale-комментарии/STATUS/числа P16.9 |
+| 03422b1 | T1-T3: dispatch-floor артефакт + jump-table + компоненты |
+| f943e3b | T6: stack-poll удалён (75→72) |
+| 5b26e58 | T8: SIGINT boundary-only (72→70) |
+| 220eaf0 | T4-T10: STATUS-аудиты фазы |
+| 6127c9d | P16.10 final: снапшот 1.82x |
+| f9eeec4 | callable-метаметоды: PUC two-stage |
+| bf4df90 | smoke 64 (A-H) |
+| 1f35e70 | pushResolvedBytecodeClosure (noalloc −8.5%) |
+| e4e384b/7e6241c/c4e641e | артефакты T13-T16 |
+| 86de1f9 | lazy handler-limit + stack overflow паритет |
+| 4b6d6af | P16.10a final (1.84x) |
+| 3d4cbde | native-mem lane'ы (load/dump) |
+| 5e23caf | DumpOptions.strip; cloneStrippedProto удалён |
+| c455b9c | smoke 65 + c_api 18_dump |
+| b946c7b | proto-inventory.json |
+| 94bf0a2 | ProtoTreeOwner (refcounted tree) |
+| 3b524f4 | source backing на дереве; load BOUNDED |
+| 591f120 | adoption на границах + первый varargs-фикс |
+| e33daf6 | третий varargs-слайс (gcPropagateOne) |
+| 29ae846 | STATUS: root-cause запись + репро |
+| 8937c9b | GC forward-barriers + gray-lifecycle + noyield + weak-key |
+| f2dc7d1 | P16.10b final: полный гейт, 1.79x |
 
 ---
 
 ## Методологические заметки
 
-- **Бисект вместо «pre-existing»**: любой вывод о происхождении фейла
-  доказывается чистыми сборками, иначе не заявляется.
-- **Recipe инструкции-vs-циклы** дважды отделил реальную регрессию от
-  layout-лотереи на горячей машине (comparisons/field_access/global_arith
-  флапают ±7–12% при УЛУЧШАЮЩЕМСЯ geomean — противоречие исключает
-  реальную деградацию; изолированные замеры инструкций стабильны).
-- **Debug 0xaa-филл** как бесплатный аудит «undefined-активации»: пропущенная
-  инициализация поля ловится мгновенно.
-- **Дифференциальные smoke-тесты** как постоянные регрессионники: каждый
-  корневой баг получает минимальный тест, проходящий на обоих рантаймах.
-- **Дихотомия OOM**: kernel OOM-killer (dmesg) ≠ systemd-oomd (system journal)
-  — проверять оба журнала.
+- **Матрица vs standalone**: несколько багов воспроизводились ТОЛЬКО внутри
+  матричного процесса (иерархия fork/env/timing). Рецепт: точная эмуляция
+  инвокации → gdb-обёртка в матричном контексте → coredumpctl + addr2line.
+- **Кумулятивные комбо-тесты**: поэлементная сборка блоков сьюта (t*/s*/pfx*)
+  быстро локализует состояние-зависимые крэши, недетектируемые блоками
+  по-отдельности.
+- **OOM-обрывы** (3 шт.): дважды работа восстановлена из коммитов + dirty
+  tree; один раз агент оставил бинарный мусор в vm.zig — восстановление
+  git checkout; вывод: коммитить малыми шагами, эксперименты только в /tmp.
+- **Perf-дисциплина**: все изолированные A/B — interleaved perf stat
+  instr/cycles (stash-dance); «стало медленнее» без инстр-countа — не
+  принимается (layout-лотерея отделялась от реальной регрессии).
 
-## Открытые пункты (следующие итерации)
+## Открытые пункты (на следующую фазу)
 
-1. FINALIZEDBIT-очистка — переходная O(n)-мера, заменить targeted clear-list.
-2. Defensive stale-entry скипы в grayagain-путях — убрать после стабилизации.
-3. Активная ссылка треда в grayagain (PUC linkgclist(&L->gclist,...)) —
-   покрыто gcMarkMutableRoots, честно задокументировано как приближение.
-4. big.lua both_fail — предсуществующий, вне транша.
-5. Свежий профиль после P16.2d: push+complete могли перестать быть доминантой
-   lua_calls — следующий перф-этап выбирать по новому профилю.
+1. traverseupvalue cell-arm (TODO в gcPropagateOne) — предсуществующий бф.
+2. Frame-push field-classification готова (44 операции) — следующий
+   perf-этап после свежего профиля: один общий инициализатор + cold-outlined
+   подготовка, CallFrame ≤104.
+3. Проверка: рамка fresh-профиля P16.10b (geomean 1.79x) — metamethod_add
+   2.69x / noalloc 2.65x / lua_calls 2.15x — выбор следующего таргета
+   строго по новым данным.

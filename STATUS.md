@@ -6106,3 +6106,45 @@ Roundtrips: smoke 65 (both strip modes) + c_api 18_dump green. db, closure,
 coroutine, gc, gengc --testc green. locals.lua pre-existing (TBC noyield).
 leak_bench PASS. repeated_dynamic_load BOUNDED. dynamic_load perf +1.2% (OK,
 under 5% threshold).
+
+### P16.11 — C-API load mode parity (lua_load/luaL_loadbufferx/luaL_loadfilex)
+
+**Goal:** PUC-faithful mode semantics for the C-API load family. PUC's
+`f_parser`+`checkmode` (ldo.c:1114-1141) dispatch on the first byte (0x1b →
+binary, else → text) and reject based on mode ('b'/'B'/'t'/'T', null→"bt").
+'B' requests fixed-buffer borrowing (lundump.c:190-191).
+
+**Tasks:**
+- [x] Task 1: `loadChunk`/`loadChunkImpl` shared primitive (vm.zig) —
+      `LoadInput` union (borrowed/owned/pinned), `LoadChunkResult` union
+      (closure/err_msg), `loadBinaryChunk`, `loadTextChunk`. Implements
+      PUC `f_parser`+`checkmode` dispatch + error messages.
+- [x] Task 2: `lua_load` rewritten (c_api.zig) — collects reader chunks
+      into owned buffer, delegates to `loadChunk(.owned)`.
+- [x] Task 3: `luaL_loadbufferx` rewritten (c_api.zig) — delegates to
+      `loadChunk(.borrowed)`; 'B' sets `external_borrow` on tree.
+- [x] Task 4: `luaL_loadfilex` rewritten (c_api.zig) — reads file, strips
+      BOM + `#` shebang (PUC lauxlib.c:790-806 via `stripChunkPrefix`),
+      delegates to `loadChunk(.owned)`.
+- [x] Task 5: `external_borrow` field on `SourceBacking` (bytecode.zig) —
+      never freed, never GC-marked; caller-owned lifetime.
+
+**Key decisions:**
+- `stripChunkPrefix` made `pub` on `Vm` (was private) so c_api.zig can call
+  it for `luaL_loadfilex` BOM/shebang stripping.
+- `loadChunk` takes `bytes` separately from `input` so a substring of the
+  input (after BOM/shebang strip) can be loaded while ownership tracks the
+  full buffer.
+- `loadBinaryChunk` tracks `input_consumed` via defer to free owned input
+  on error paths without double-free.
+- `defaultBytecodeCompiler` (pub fn in vm.zig) set on C API VMs
+  (`luaL_newstate`/`lua_newstate`) so dynamic bytecode compilation works.
+- `SourceBacking.owned` and `name_copies` changed to `[]const u8` to accept
+  const slices from `Source.bytes`.
+
+**Results:** files.lua PASS (was zig_fail — shebang not stripped). Matrix
+zig_fail=0 (big.lua both_fail pre-existing). Smoke 67/67. C API tests
+ALL PASS incl. new 19_load differential (cases A-J: b/B/t/null modes,
+binary/text rejection, nested closure roundtrip, truncated binary, stripped
+reload). Repro matches PUC exactly (mode=b/B load=0 call=0 value=42).
+zig build test (Debug) + ReleaseFast both pass.

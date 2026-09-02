@@ -115,6 +115,10 @@ pub export fn luaL_newstate() ?*lua_State {
     const alloc = std.heap.c_allocator;
     const vm = alloc.create(Vm) catch return null;
     vm.* = Vm.init(alloc, false);
+    // Install the default bytecode compiler so that text loading via
+    // loadChunk → compileTextChunk works on C API states (matching the
+    // CLI which sets this via setDynamicBytecodeCompiler).
+    vm.dynamic_bytecode_compiler = vm_mod.defaultBytecodeCompiler;
     return vm.setupMainHandle() catch {
         vm.deinit();
         alloc.destroy(vm);
@@ -161,6 +165,8 @@ pub export fn lua_newstate(
     vm.* = Vm.initWithSeed(alloc, false, @as(u64, seed));
     vm.c_alloc_fn = f;
     vm.c_alloc_ud = ud;
+    // Install the default bytecode compiler (same as luaL_newstate).
+    vm.dynamic_bytecode_compiler = vm_mod.defaultBytecodeCompiler;
     return vm.setupMainHandle() catch {
         vm.deinit();
         alloc.destroy(vm);
@@ -707,14 +713,33 @@ pub export fn lua_setallocf(L: ?*lua_State, f: lua_Alloc, ud: ?*anyopaque) void 
 // Load / dump (PUC lapi.c / ldo.c / ldump.c)
 // ===========================================================================
 
-/// PUC `lua_load` (ldo.c:lua_load): load and compile a Lua chunk from a
-/// reader callback. The reader is called repeatedly; each call returns a
-/// pointer to a chunk and writes its size to `*sz`. NULL or zero size
-/// signals end-of-input. All chunks are collected into a buffer, then
-/// compiled via `Vm.compileChunkValue` (the same path as `luaL_loadbufferx`).
+/// PUC `lua_load` (ldo.c:lua_load → lapi.c:1120): load and compile a Lua
+/// chunk from a reader callback. The reader is called repeatedly; each call
+/// returns a pointer to a chunk and writes its size to `*sz`. NULL or zero
+/// size signals end-of-input.
 ///
-/// `mode` is currently ignored (luazig always compiles source text; binary
-/// chunk loading is handled by `undump.zig` through a separate path).
+/// PUC's `lua_load` feeds the reader to a ZIO stream, then calls
+/// `luaD_protectedparser` → `f_parser` (ldo.c:1123-1141), which reads the
+/// first byte to dispatch binary vs text and applies `checkmode`
+/// (ldo.c:1114-1119). We collect all reader chunks into a contiguous buffer
+/// (PUC's ZIO does the same lazily), then delegate to `Vm.loadChunk` (our
+/// `f_parser` equivalent).
+///
+/// **Mode semantics** (PUC ldo.c:1126-1138):
+///   - `null` → `"bt"` (both binary and text allowed)
+///   - `'b'` → binary allowed; `'t'` → text allowed
+///   - `'B'` → binary + fixed-buffer borrowing (input must be contiguous)
+///
+/// **Generic-reader 'B' verdict**: PUC's ZIO borrows from the reader's
+/// current block via `luaZ_getaddr` (lzio.c:79-91). For a fragmented reader
+/// (multiple small blocks), `getaddr` returns NULL if the requested block
+/// spans two reader chunks, causing `lundump.c:80` to error "truncated fixed
+/// buffer". Our `lua_load` collects ALL reader chunks into ONE contiguous
+/// buffer before calling `loadChunk`, so 'B' mode borrowing is ALWAYS legal
+/// (the buffer is contiguous by construction). This never fails where PUC
+/// fails (PUC's auxlib `getS` also returns one block), and may succeed where
+/// PUC's generic `lua_load` with a fragmented reader would fail — an
+/// acceptable improvement, not a deviation.
 pub export fn lua_load(
     L: ?*lua_State,
     reader: ?*const fn (?*lua_State, ?*anyopaque, ?*usize) callconv(.c) ?[*]const u8,
@@ -722,27 +747,43 @@ pub export fn lua_load(
     chunkname: ?[*:0]const u8,
     mode: ?[*:0]const u8,
 ) c_int {
-    _ = mode;
-    const h = L orelse return 2;
-    const vm = h.vm; // LUA_ERRRUN
+    const h = L orelse return 2; // LUA_ERRRUN
+    const vm = h.vm;
 
-    // Collect all chunks from the reader into a buffer (PUC's `luaD_protectedparser`
-    // does the same via `luaZ_read` into a growable buffer before parsing).
+    // Collect all chunks from the reader into a contiguous buffer (PUC's
+    // `luaD_protectedparser` does the same via `luaZ_read` into a growable
+    // buffer before parsing). The buffer is owned by us and transferred to
+    // `loadChunk` as `.owned`.
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(vm.alloc);
-
     while (true) {
         var sz: usize = 0;
         const chunk = reader.?(L, data, &sz) orelse break;
         if (sz == 0) break;
         buf.appendSlice(vm.alloc, chunk[0..sz]) catch return statusCode(.memory_error);
     }
+    const owned_bytes = buf.toOwnedSlice(vm.alloc) catch return statusCode(.memory_error);
 
-    const name = if (chunkname) |n| std.mem.span(n) else "=reader";
-    const compiled = vm.compileChunkValue(buf.items, name) catch |e|
-        return statusCode(mapCompileError(e));
-    h.c_stack.append(vm.alloc, compiled) catch return statusCode(.memory_error);
-    return 0; // LUA_OK
+    const name = if (chunkname) |n| std.mem.span(n) else "=?";
+    const mode_slice: ?[]const u8 = if (mode) |m| std.mem.span(m) else null;
+    const env: Value = .{ .Table = vm.global_env };
+
+    const result = vm.loadChunk(.{ .owned = owned_bytes }, owned_bytes, name, mode_slice, env, null) catch |err| switch (err) {
+        error.OutOfMemory => return statusCode(.memory_error),
+        error.RuntimeError, error.Yield => return statusCode(.runtime_error),
+    };
+    switch (result) {
+        .closure => |cl| {
+            h.c_stack.append(vm.alloc, .{ .Closure = cl }) catch return statusCode(.memory_error);
+            return 0; // LUA_OK
+        },
+        .err_msg => |msg| {
+            defer vm.alloc.free(msg);
+            const errval = vm.internStr(msg) catch return statusCode(.memory_error);
+            h.c_stack.append(vm.alloc, .{ .String = errval }) catch return statusCode(.memory_error);
+            return statusCode(.syntax_error); // LUA_ERRSYNTAX
+        },
+    }
 }
 
 /// PUC `lua_dump` (ldo.c:lua_dump): dump the function at the top of the stack
@@ -998,31 +1039,142 @@ fn removeTocloseMark(vm: *Vm, abs: usize) void {
     }
 }
 
-/// PUC `luaL_loadbufferx`: compile a source chunk from a byte buffer.
-/// Delegates to `Vm.compileChunkValue` (shared with `api.State.compileChunk`).
+/// PUC `luaL_loadbufferx` (lauxlib.c:867-872): load a chunk from a byte
+/// buffer. PUC wraps the buffer in a `getS` reader (which returns the whole
+/// buffer in one call) and delegates to `lua_load`. We delegate directly to
+/// `Vm.loadChunk` with `.borrowed` input — the C buffer is contiguous by
+/// contract, so mode 'B' (fixed-buffer borrowing) is always legal.
+///
+/// **'B' fixed-buffer borrowing** (Task 5): when mode contains 'B', the
+/// primitive borrows code/lineinfo/long-strings directly from the caller's
+/// buffer (no copy). The caller MUST keep `buff` alive until the closure is
+/// dropped and GC'd. The tree's `source_backing.external_borrow` records
+/// this span (never freed, never GC-marked — distinct from pinned LuaStrings
+/// and owned heap buffers).
+///
+/// **Mode semantics** (PUC ldo.c:1126-1138, via lauxlib.c:872 → lua_load):
+///   - `null` → `"bt"` (both binary and text allowed)
+///   - `'b'` → binary allowed; `'t'` → text allowed
+///   - `'B'` → binary + fixed-buffer borrowing (no copy)
 pub export fn luaL_loadbufferx(L: ?*lua_State, buff: [*]const u8, sz: usize, name: [*:0]const u8, mode: ?[*:0]const u8) c_int {
-    _ = mode;
-    const h = L orelse return 2;
+    const h = L orelse return 2; // LUA_ERRRUN
     const vm = h.vm;
-    const compiled = vm.compileChunkValue(buff[0..sz], std.mem.span(name)) catch |e|
-        return statusCode(mapCompileError(e));
-    h.c_stack.append(vm.alloc, compiled) catch return statusCode(.memory_error);
-    return 0;
+    const mode_slice: ?[]const u8 = if (mode) |m| std.mem.span(m) else null;
+    const env: Value = .{ .Table = vm.global_env };
+
+    const result = vm.loadChunk(.{ .borrowed = buff[0..sz] }, buff[0..sz], std.mem.span(name), mode_slice, env, null) catch |err| switch (err) {
+        error.OutOfMemory => return statusCode(.memory_error),
+        error.RuntimeError, error.Yield => return statusCode(.runtime_error),
+    };
+    switch (result) {
+        .closure => |cl| {
+            h.c_stack.append(vm.alloc, .{ .Closure = cl }) catch return statusCode(.memory_error);
+            return 0; // LUA_OK
+        },
+        .err_msg => |msg| {
+            defer vm.alloc.free(msg);
+            const errval = vm.internStr(msg) catch return statusCode(.memory_error);
+            h.c_stack.append(vm.alloc, .{ .String = errval }) catch return statusCode(.memory_error);
+            return statusCode(.syntax_error); // LUA_ERRSYNTAX
+        },
+    }
 }
 
-/// PUC `luaL_loadfilex`: load and compile a source file.
+/// PUC `luaL_loadfilex` (lauxlib.c:808-853): load a chunk from a file.
+/// PUC reads the file via `getF` (a reader that reads BUFSIZ chunks) and
+/// delegates to `lua_load` with the mode string. We read the entire file
+/// into a buffer, then delegate to `Vm.loadChunk` with `.owned` input.
+///
+/// **loadfilex 'B' verdict**: PUC's `luaL_loadfilex` passes mode through to
+/// `lua_load`, which uses ZIO. For 'B' mode, `luaZ_getaddr` (lzio.c:79-91)
+/// borrows from the ZIO's current buffer — which is `lf.buff` filled by
+/// `fread`. If the file fits in one `getF` call (BUFSIZ), the ZIO has one
+/// contiguous block and 'B' borrowing works. If the file is larger,
+/// `getaddr` returns NULL and `lundump.c:80` errors "truncated fixed
+/// buffer". In practice, 'B' mode is only used with `luaL_loadbufferx`
+/// (where the buffer is known contiguous); `luaL_loadfilex('B')` is
+/// uncommon and PUC's behavior is fragile. Our implementation reads the
+/// whole file into ONE contiguous buffer, so 'B' borrowing is always legal
+/// — same as our `lua_load` (an acceptable improvement, not a deviation).
 pub export fn luaL_loadfilex(L: ?*lua_State, filename: [*:0]const u8, mode: ?[*:0]const u8) c_int {
-    _ = mode;
-    const h = L orelse return 2;
+    const h = L orelse return 2; // LUA_ERRRUN
     const vm = h.vm;
     const source = source_mod.Source.loadFile(vm.alloc, stdio.activeIo(), std.mem.span(filename)) catch
         return statusCode(.memory_error);
-    defer vm.alloc.free(source.name);
-    defer vm.alloc.free(source.bytes);
-    const compiled = vm.compileChunkValue(source.bytes, source.name) catch |e|
-        return statusCode(mapCompileError(e));
-    h.c_stack.append(vm.alloc, compiled) catch return statusCode(.memory_error);
-    return 0;
+    // PUC lauxlib.c:820-836: skip BOM and optional `#` first-line comment
+    // (skipcomment). The chunk name for files is "@<path>", so shebang
+    // stripping is always allowed (PUC's skipcomment doesn't check the
+    // name; it always checks for `#`).
+    const prefix = vm_mod.Vm.stripChunkPrefix(source.bytes, true);
+    var chunk_bytes = prefix.bytes;
+    var prefixed_buf: ?[]u8 = null;
+    defer { if (prefixed_buf) |b| vm.alloc.free(b); }
+    // PUC lauxlib.c:824-825: if a comment was skipped and the chunk is
+    // text (not binary), add a '\n' to correct line numbers. Binary
+    // chunks don't need line correction (lauxlib.c:827 "remove possible
+    // newline").
+    if (prefix.had_shebang and !(chunk_bytes.len > 0 and chunk_bytes[0] == 0x1b)) {
+        prefixed_buf = vm.alloc.alloc(u8, chunk_bytes.len + 1) catch {
+            vm.alloc.free(source.name);
+            vm.alloc.free(source.bytes);
+            return statusCode(.memory_error);
+        };
+        prefixed_buf.?[0] = '\n';
+        @memcpy(prefixed_buf.?[1..], chunk_bytes);
+        chunk_bytes = prefixed_buf.?;
+    }
+
+    // The file bytes are owned by us and transferred to loadChunk as .owned
+    // (or the prefixed_buf if shebang was stripped). The source name is
+    // borrowed from source.name (loadChunk copies it for text, ignores it
+    // for binary).
+    const mode_slice: ?[]const u8 = if (mode) |m| std.mem.span(m) else null;
+    const env: Value = .{ .Table = vm.global_env };
+
+    const input: vm_mod.Vm.LoadInput = if (prefixed_buf) |buf|
+        .{ .owned = buf }
+    else
+        .{ .owned = source.bytes };
+    // Track whether we need to free source.bytes (only when prefixed_buf
+    // replaced it as the input).
+    const source_bytes_freed_by_load = prefixed_buf != null;
+
+    const result = vm.loadChunk(input, chunk_bytes, source.name, mode_slice, env, null) catch |err| switch (err) {
+        error.OutOfMemory => {
+            vm.alloc.free(source.name);
+            if (!source_bytes_freed_by_load) vm.alloc.free(source.bytes);
+            if (prefixed_buf) |b| vm.alloc.free(b);
+            return statusCode(.memory_error);
+        },
+        error.RuntimeError, error.Yield => {
+            vm.alloc.free(source.name);
+            if (!source_bytes_freed_by_load) vm.alloc.free(source.bytes);
+            if (prefixed_buf) |b| vm.alloc.free(b);
+            return statusCode(.runtime_error);
+        },
+    };
+    // source.name is borrowed during loadChunk; free it now (loadChunk has
+    // either copied it for text or ignored it for binary).
+    vm.alloc.free(source.name);
+    // If loadChunk consumed source.bytes (no prefixed_buf), it's already
+    // freed or attached to the tree. If we used prefixed_buf, free
+    // source.bytes now (it's no longer needed).
+    if (source_bytes_freed_by_load) vm.alloc.free(source.bytes);
+    // prefixed_buf ownership was transferred to loadChunk (if used).
+    if (prefixed_buf) |_| prefixed_buf = null;
+
+    switch (result) {
+        .closure => |cl| {
+            h.c_stack.append(vm.alloc, .{ .Closure = cl }) catch return statusCode(.memory_error);
+            return 0; // LUA_OK
+        },
+        .err_msg => |msg| {
+            defer vm.alloc.free(msg);
+            const errval = vm.internStr(msg) catch return statusCode(.memory_error);
+            h.c_stack.append(vm.alloc, .{ .String = errval }) catch return statusCode(.memory_error);
+            return statusCode(.syntax_error); // LUA_ERRSYNTAX
+        },
+    }
 }
 
 /// PUC `luaL_checkversion` (macro): expands to luaL_checkversion_.

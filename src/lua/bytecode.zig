@@ -550,15 +550,30 @@ pub const ProtoTreeOwner = struct {
         /// Heap byte buffers the tree owns outright: reader-fn collection
         /// buffers, shebang-prefixed buffers, copies of caller-owned
         /// name/bytes for the Zig/C API compile path (S1b), CLI/REPL
-        /// source copies. Freed at last release.
-        owned: std.ArrayListUnmanaged([]u8) = .empty,
+        /// source copies. Freed at last release. Stored as `[]const u8`
+        /// because the source may come from `readFileAlloc` (which returns
+        /// `[]u8` stored as `[]const u8` in `Source`) or from `alloc.dupe`
+        /// (which returns `[]u8`); the tree never mutates these bytes.
+        owned: std.ArrayListUnmanaged([]const u8) = .empty,
         /// Individually-allocated debug-name copies made by
         /// `cloneUndumpedStrings` (undumped non-fixed trees). Freed at
-        /// last release.
-        name_copies: std.ArrayListUnmanaged([]u8) = .empty,
+        /// last release. Stored as `[]const u8` (same rationale as `owned`).
+        name_copies: std.ArrayListUnmanaged([]const u8) = .empty,
+        /// External borrow (C-API load mode 'B'): a caller-owned byte span
+        /// that the tree borrows from for fixed-buffer undump (code,
+        /// lineinfo, and long-string constants point directly into this
+        /// span). NEVER freed, NEVER GC-marked — the caller is responsible
+        /// for keeping this memory alive until the closure is dropped and
+        /// GC'd. Distinct from `pinned` (which is GC-managed) and `owned`
+        /// (which is freed at last release). Stored as a single span
+        /// because luaL_loadbufferx('B') is the only producer (one C
+        /// buffer per load). PUC's LZIO `getaddr` borrows from the reader's
+        /// contiguous block the same way (lzio.c:79-91).
+        external_borrow: []const u8 = &.{},
 
         /// Free everything tree-owned; pins are GC-owned and simply stop
-        /// being pinned (their survival is the GC's business).
+        /// being pinned (their survival is the GC's business). External
+        /// borrows are NOT freed (caller owns them).
         pub fn deinit(self: *SourceBacking, alloc: std.mem.Allocator) void {
             for (self.owned.items) |b| alloc.free(b);
             for (self.name_copies.items) |b| alloc.free(b);
@@ -566,6 +581,7 @@ pub const ProtoTreeOwner = struct {
             self.pinned.deinit(alloc);
             self.owned.deinit(alloc);
             self.name_copies.deinit(alloc);
+            // external_borrow: NOT freed — caller owns the memory.
             self.* = .{};
         }
     };
@@ -684,7 +700,9 @@ pub fn protoTreeFootprint(root: *const Proto) usize {
 /// Compute the native memory footprint of a `SourceBacking`: owned byte
 /// buffers, name copies, and the list storage for all three lists (pinned,
 /// owned, name_copies). Pinned LuaStrings are GC-owned and NOT included
-/// (only the list slot that holds the pointer is counted).
+/// (only the list slot that holds the pointer is counted). External borrows
+/// are caller-owned and NOT included (they are not our memory — the caller
+/// manages their lifetime separately).
 pub fn sourceBackingFootprint(sb: ProtoTreeOwner.SourceBacking) usize {
     var total: usize = 0;
     // Owned byte buffers (reader-fn collection, shebang prefix, API copies).
@@ -693,8 +711,9 @@ pub fn sourceBackingFootprint(sb: ProtoTreeOwner.SourceBacking) usize {
     for (sb.name_copies.items) |b| total += b.len;
     // List storage (ArrayListUnmanaged backing arrays).
     total += sb.pinned.items.len * @sizeOf(*vm.LuaString);
-    total += sb.owned.items.len * @sizeOf([]u8);
-    total += sb.name_copies.items.len * @sizeOf([]u8);
+    total += sb.owned.items.len * @sizeOf([]const u8);
+    total += sb.name_copies.items.len * @sizeOf([]const u8);
+    // external_borrow: NOT counted — caller-owned, not our memory.
     return total;
 }
 

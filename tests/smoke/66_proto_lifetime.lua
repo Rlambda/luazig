@@ -128,3 +128,29 @@ collectgarbage()
 collectgarbage()
 print("fresh", leaf2(10))          -- 132 again
 print("done")
+
+-- F. GC accounting: collectgarbage("count") rises with retained closures
+-- and falls back after dropping + full GC. Uses RELATIVE assertions printed
+-- as booleans so both PUC and luazig produce identical stdout despite
+-- different absolute count values internally.
+collectgarbage("collect")
+collectgarbage("collect")
+local base_count = collectgarbage("count")
+local closures = {}
+for i = 1, 100 do
+  closures[i] = assert(load("return " .. i .. " + " .. i))
+end
+collectgarbage("collect")
+collectgarbage("collect")
+local loaded_count = collectgarbage("count")
+-- 100 closures with code+constants must rise the count meaningfully (>10KB).
+local rose = loaded_count > base_count + 10
+print("rose", rose)
+closures = nil
+collectgarbage("collect")
+collectgarbage("collect")
+local dropped_count = collectgarbage("count")
+-- Count must fall back significantly (>10KB freed) after dropping all
+-- closures and running full GC.
+local fell = dropped_count < loaded_count - 10
+print("fell", fell)

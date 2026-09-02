@@ -5909,5 +5909,14 @@ accounting).
   repeated_dynamic_load lane BOUNDED.
 - [ ] Task 7/8/15 — adoption at closure-creation/load/VM-bind; no first-call
   mutation; per-call A/B.
-- [ ] Task 11 — proto-tree GC accounting via gcNoteAlloc/gcNoteFree.
+- [x] Task 11 — proto-tree GC accounting: `protoTreeFootprint` +
+  `sourceBackingFootprint` compute the tree's native footprint (Proto structs,
+  all owned arrays, SourceBacking buffers, ProtoTreeOwner struct — interned
+  LuaStrings excluded). `gcChargeTreeMemory`/`gcCreditTreeMemory` charge
+  `gc_count_kb` at adoption (first closure creation, idempotent via
+  `gc_charged`) and credit at last release. Behavioral test in
+  66_proto_lifetime.lua section F: `collectgarbage("count")` rises >10KB for
+  100 closures, falls back >10KB after drop+GC — byte-identical booleans vs
+  PUC. dynamic_load perf +0.1% (OK). smoke 67/67, matrix zig_fail=0 (pre-existing
+  api.lua only).
 - [ ] Task 12/13 — child-outlives-root differential smoke; FailingAllocator tests.

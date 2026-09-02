@@ -6520,6 +6520,30 @@ pub const Vm = struct {
         self.testc_total_bytes -|= bytes;
     }
 
+    // --- Native tree memory accounting (Task 7) ---
+    //
+    // Proto trees are native allocations (not GC objects). Their footprint
+    // is charged to `gc_count_kb` at adoption (first closure creation)
+    // and credited at last release, so `collectgarbage("count")` coherently
+    // reflects tree memory while closures are retained.
+    //
+    // Unlike `gcNoteAlloc`/`gcNoteFree`, these do NOT touch
+    // `testc_total_bytes` — tree memory is not tracked by the testc
+    // allocator (which tracks only GC objects via `testcChargeMemory`).
+    // Only the approximate `gc_count_kb` (which `collectgarbage("count")`
+    // reads) is updated.
+
+    pub fn gcChargeTreeMemory(self: *Vm, bytes: usize) void {
+        const kb: f64 = @as(f64, @floatFromInt(bytes)) / 1024.0;
+        self.gc_count_kb += kb;
+        self.gc_step_debt_kb -= kb;
+    }
+
+    pub fn gcCreditTreeMemory(self: *Vm, bytes: usize) void {
+        const kb: f64 = @as(f64, @floatFromInt(bytes)) / 1024.0;
+        self.gc_count_kb = @max(0, self.gc_count_kb - kb);
+    }
+
     /// Register a Table in the unified GC list. Thin wrapper for call-site
     /// type safety; delegates to the generic `gcRegisterObject`.
     fn gcRegisterTable(self: *Vm, table: *Table) std.mem.Allocator.Error!void {
@@ -23362,6 +23386,24 @@ pub const Vm = struct {
         return owner;
     }
 
+    /// Charge the tree's native memory footprint to `gc_count_kb` at
+    /// adoption (first closure creation over this tree). Idempotent:
+    /// `gc_charged` on the owner prevents double-accounting when
+    /// OP_CLOSURE creates additional closures over an already-adopted tree.
+    /// The footprint includes Proto structs, all owned arrays, the
+    /// ProtoTreeOwner struct, and SourceBacking buffers — everything freed
+    /// by `ProtoTreeOwner.release` at last release. Interned LuaStrings are
+    /// excluded (owned by the VM string table, already charged by `internStr`).
+    fn chargeTreeFootprint(self: *Vm, owner: *bc.ProtoTreeOwner) void {
+        if (owner.gc_charged) return;
+        const fp = bc.protoTreeFootprint(owner.root) +
+            bc.sourceBackingFootprint(owner.source_backing) +
+            @sizeOf(bc.ProtoTreeOwner);
+        self.gcChargeTreeMemory(fp);
+        owner.gc_charged = true;
+        owner.gc_footprint = fp;
+    }
+
     pub fn createBytecodeChunkClosure(self: *Vm, proto: *const bc.Proto) DispatchError!*Closure {
         const cells = try self.alloc.alloc(*Cell, proto.upvalues.len);
         var n_cells: usize = 0;
@@ -23404,6 +23446,11 @@ pub const Vm = struct {
         // adopted when the parent closure was created.
         if (cl.tree) |t| {
             if (!t.constants_resolved) try self.resolveTreeConstants(t);
+            // Charge the tree's native footprint to gc_count_kb at adoption
+            // (Task 7). After resolution, resolved_values arrays exist and
+            // are included in the footprint. Idempotent: OP_CLOSURE-created
+            // children over an already-adopted tree skip the charge.
+            self.chargeTreeFootprint(t);
         }
         return cl;
     }
@@ -23788,6 +23835,11 @@ pub const Vm = struct {
         };
         try self.gcRegisterClosure(cl);
         self.gcNoteAlloc(@sizeOf(Closure));
+        // Charge the tree's native footprint at adoption (Task 7). For
+        // undumped trees, constants were pre-resolved by
+        // preResolveUndumpedConstants before this call, so resolved_values
+        // arrays exist and are included in the footprint.
+        if (cl.tree) |t| self.chargeTreeFootprint(t);
         return cl;
     }
 

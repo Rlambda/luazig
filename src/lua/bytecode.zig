@@ -521,6 +521,22 @@ pub const ProtoTreeOwner = struct {
     /// once, never reset. Replaces the per-proto `constants_resolved`.
     constants_resolved: bool = false,
 
+    // --- GC memory accounting (Task 7) ---
+    //
+    // Proto trees are native allocations (not GC objects), but their
+    // lifetime is tied to closures (which ARE GC objects). To make
+    // `collectgarbage("count")` coherently reflect tree memory, the
+    // footprint is charged to `gc_count_kb` at adoption (first closure
+    // creation) and credited back at last release. This mirrors PUC Lua,
+    // where Proto IS a GC object charged at `luaC_newobj` and credited at
+    // `freeobj` → `luaF_freeproto`.
+    //
+    // `gc_charged` is false on construction (error paths release without
+    // crediting) and set true at adoption. `gc_footprint` caches the
+    // charged amount so the credit matches exactly.
+    gc_charged: bool = false,
+    gc_footprint: usize = 0,
+
     /// What keeps the source bytes alive for a tree that borrows debug
     /// slices from them (P16.10b Task 6). Populated by the load paths at
     /// owner creation; consumed (dropped) by the last release.
@@ -567,6 +583,13 @@ pub const ProtoTreeOwner = struct {
         self.ref_count -= 1;
         if (self.ref_count != 0) return;
         const alloc = self.allocator;
+        // Credit the tree's GC memory footprint (charged at adoption —
+        // see gc_charged). Only credit if the tree was actually charged:
+        // error paths that release an un-adopted tree never set gc_charged.
+        if (self.gc_charged) {
+            const vm_ptr: *vm.Vm = @ptrCast(@alignCast(self.vm.?));
+            vm_ptr.gcCreditTreeMemory(self.gc_footprint);
+        }
         // Structural deinit of the whole tree (arrays + structs). Interned
         // LuaStrings are NEVER destroyed here — `k_strings_vm_owned` says
         // whether the k pool still belongs to the tree.
@@ -610,6 +633,54 @@ pub fn destroyProtoTree(alloc: std.mem.Allocator, root: *Proto, k_strings_vm_own
     alloc.destroy(root);
     // name/source_name/locvar names are borrowed from the source bytes;
     // they are NOT freed here (backing owned by the tree owner, Task 6).
+}
+
+/// Compute the native memory footprint of a Proto tree: all Proto structs
+/// plus every owned array (code, k, p, upvalues, lineinfo, locvars,
+/// live_reg_top, resolved_values). Recursively sums children.
+///
+/// Does NOT include:
+///   - Interned LuaStrings (owned by the VM string table, already charged
+///     by `internStr`).
+///   - Seed-0 LuaStrings in unresolved text trees (transient — destroyed
+///     at resolution; the interned replacements are already charged).
+///   - The ProtoTreeOwner struct and SourceBacking (added separately by
+///     `chargeTreeFootprint` in vm.zig).
+///
+/// This is the amount charged to `gc_count_kb` at adoption and credited
+/// at last release, mirroring PUC Lua where Proto IS a GC object charged
+/// at `luaC_newobj(L, LUA_VPROTO, sizeof(Proto))`.
+pub fn protoTreeFootprint(root: *const Proto) usize {
+    var total: usize = @sizeOf(Proto);
+    total += root.code.len * @sizeOf(Instruction);
+    total += root.k.len * @sizeOf(Constant);
+    total += root.p.len * @sizeOf(*Proto);
+    total += root.upvalues.len * @sizeOf(Upvaldesc);
+    total += root.lineinfo.len * @sizeOf(u32);
+    total += root.locvars.len * @sizeOf(LocVar);
+    total += root.live_reg_top.len * @sizeOf(u8);
+    total += root.resolved_values.len * @sizeOf(vm.Value);
+    for (root.p) |child| {
+        total += protoTreeFootprint(child);
+    }
+    return total;
+}
+
+/// Compute the native memory footprint of a `SourceBacking`: owned byte
+/// buffers, name copies, and the list storage for all three lists (pinned,
+/// owned, name_copies). Pinned LuaStrings are GC-owned and NOT included
+/// (only the list slot that holds the pointer is counted).
+pub fn sourceBackingFootprint(sb: ProtoTreeOwner.SourceBacking) usize {
+    var total: usize = 0;
+    // Owned byte buffers (reader-fn collection, shebang prefix, API copies).
+    for (sb.owned.items) |b| total += b.len;
+    // Debug-name copies (cloneUndumpedStrings).
+    for (sb.name_copies.items) |b| total += b.len;
+    // List storage (ArrayListUnmanaged backing arrays).
+    total += sb.pinned.items.len * @sizeOf(*vm.LuaString);
+    total += sb.owned.items.len * @sizeOf([]u8);
+    total += sb.name_copies.items.len * @sizeOf([]u8);
+    return total;
 }
 
 // ---------------------------------------------------------------------------

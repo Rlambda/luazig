@@ -1,16 +1,17 @@
 {
   "meta": {
-    "created_utc": "2026-08-30T09:58:44.160719+00:00",
+    "created_utc": "2026-09-02T19:37:14.673737+00:00",
     "lane": "smoke_compare",
     "argv": [
       "tools/smoke_compare.py",
+      "--no-build",
       "--json-out",
-      "tools/reports/smoke-p16.10b-final.json"
+      "tools/reports/smoke-p16.10c-final.json"
     ],
     "zig_version": "0.16.0"
   },
-  "total": 65,
-  "ok": 65,
+  "total": 67,
+  "ok": 67,
   "mismatches": 0,
   "results": [
     {
@@ -271,6 +272,14 @@
     },
     {
       "file": "tests/smoke/65_strip_dump_semantics.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/66_proto_lifetime.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/67_upvalue_gc_lifetime.lua",
       "match": true
     }
   ]

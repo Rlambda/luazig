@@ -3917,6 +3917,57 @@ nextvar 10/10; 58-62 byte-identical; mm_check IDENTICAL; gc/gengc/closure/
 coroutine/events/errors 0/0 оба рантайма; leak_bench; native_mem BOUNDED;
 CallFrame ≤104; Node 32B.
 
+## P16.10c — Cell GC: PUC-faithful markCell primitive, structural exclusion from gc_gray (2026-09-02)
+
+### Контекст
+PUC 5.5 `propagatemark` (lgc.c:727-740) has NO `LUA_VUPVAL` case — Cell never
+enters the gray propagation queue. `reallymarkobject` LUA_VUPVAL (lgc.c:347-354)
+handles cells inline: open→gray+markvalue, closed→black+markvalue. luazig had
+a disabled `gcMarkValue(cell.value)` TODO in `gcPropagateOne` .cell arm and
+routed cells through gc_gray/gc_grayagain, contradicting PUC.
+
+### Изменения (Tasks 1-4, один коммит)
+1. **markCell primitive** — ONE function implementing PUC reallymarkobject
+   LUA_VUPVAL: open+white→gray+markvalue(cell.get), closed+white→black+
+   markvalue(cell.value). Closed cells mark value unconditionally (handles
+   unregistered _ENV cell with gc_marked=0). Never appends to gc_gray.
+2. **markCellForce** — PUC reallymarkobject called from markold (lgc.c:1283)
+   on BLACK OLD1 objects: same as markCell but no white guard. Used by
+   markold for cells (inline mark, never via gc_gray).
+3. **Structural exclusion** — gcQueueScanObject(.cell) delegates to markCell
+   immediately (never queues). gcPropagateOne .cell arm: Debug @panic /
+   ReleaseFast return true (unreachable invariant). gray2black .cell: no-op.
+   gcDrainGrayagain .cell: Debug @panic / ReleaseFast continue (unreachable).
+4. **gcPromoteYoungObject** — cells promoted to OLD1 go to gc_old1 only,
+   NOT gc_grayagain (PUC sweepgen adds OLD1 to old1 list, not grayagain).
+5. **gcRemarkUpvals** — PUC-faithful: re-marks open upvalue values, does NOT
+   set black (PUC keeps open upvalues gray).
+6. **gcWriteBarrierCell** — OPEN cells: early return (PUC never barriers
+   open upvalue writes; stack slot is authoritative). CLOSED cells: forward
+   barrier (PUC luaC_barrier).
+7. **closeBytecodeUpvaluesFrom / closeThreadOpenUpvalues / tail-call close**
+   — PUC luaF_closeupval (lfunc.c:205-208): if !iswhite → nw2black +
+   luaC_barrier. Fix color before barrier; do not rely on child being marked.
+
+### Inventory table
+Comment block near gcQueueScanCell documents every Cell path: operation |
+open/closed | color transition | list entered | marks value inline?
+Can Cell enter gc_gray? NO. Can Cell enter gc_grayagain? NO.
+
+### Закрыто
+- [x] gcPropagateOne .cell arm TODO (disabled gcMarkValue) — replaced with
+      unreachable invariant. db.lua --testc passes WITHOUT the disabled line.
+
+### Результаты
+- matrix --testc: zig_fail=1 (big.lua, pre-existing), 31/32 pass parity
+- db.lua --testc: OK (CRITICAL — was the regression that kept the TODO)
+- locals.lua --testc ×3: OK
+- closure.lua/coroutine.lua --testc: OK
+- nextvar.lua --testc ×3: OK
+- gengc.lua/gc.lua --testc ×3: OK
+- smoke 66/66 pass
+- zig build test Debug + ReleaseFast pass
+
 ## P16.10b (продолжение) — GC forward barrier fix: locals.lua 10/10 (2026-08-31)
 
 ### Корневая причина
@@ -3957,10 +4008,12 @@ CallFrame ≤104; Node 32B.
   `luaD_throw` → `luaE_resetthread` → `closeprotected(yy=0)`).
 
 ### Отложено
-- **`gcPropagateOne` cell arm** (PUC `traverseupvalue`): marking
-  `cell.value` during traversal is PUC-faithful but exposes a pre-existing
-  bug where cell values are freed by sweep (cells not properly traversed in
-  previous cycles). Causes db.lua --testc SIGABRT. Left as TODO comment.
+- ~~**`gcPropagateOne` cell arm** (PUC `traverseupvalue`): marking
+   `cell.value` during traversal is PUC-faithful but exposes a pre-existing
+   bug where cell values are freed by sweep (cells not properly traversed in
+   previous cycles). Causes db.lua --testc SIGABRT. Left as TODO comment.~~
+   **RESOLVED (P16.10c)**: Cell structurally excluded from gc_gray;
+   markCell primitive handles inline marking; db.lua --testc passes.
 - **`gcClearDeadFrameRegisters` for all threads**: clearing dead registers
   in parked coroutine stacks is needed for stale-pointer prevention but
   causes regressions (sort.lua, db.lua, events.lua). The parked-coroutine

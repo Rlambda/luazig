@@ -6171,42 +6171,52 @@ last release).
 `tools/perf/current-fixed-load-footprint.json` with per-component sizes
 (Zig vs PUC), the honest delta, and the verdict.
 
-**Component table (Zig vs PUC, api.lua fixed-load shape):**
+**Component table (Zig vs PUC, api.lua fixed-load shape, post-CUT2):**
 
 | Component             | Zig (B) | PUC (B) | Gap  | Notes                          |
 |-----------------------|---------|---------|------|--------------------------------|
-| Proto struct          |     184 |     128 |  +56 | Zig slices + live_reg_top      |
-| k array (3×)          |      48 |      48 |   0  | Same (Constant=TValue=16B)     |
+| Proto struct          |     248 |     128 | +120 | Zig slices + live_reg_top + owner fields (CUT2) |
+| k array (3×)          |       0 |      48 | -48  | CUT1: aliased to resolved_values |
 | upvalues (1×)         |      24 |      16 |  +8  | Zig slice name vs C pointer    |
 | resolved_values       |      48 |       0 | +48  | PUC's k IS runtime TValue      |
-| ProtoTreeOwner        |     144 |       0 | +144 | PUC has none (Proto IS GC obj) |
-| SourceBacking         |      96 |       0 |  +96 | PUC has no explicit backing    |
+| SourceBacking         |       0 |       0 |   0  | CUT2: 32B inline in Proto (already counted) |
 | Closure (GC)          |      88 |      40 | +48  | Larger GC header + upvalues    |
 | Cell/UpVal (GC)       |      64 |      40 | +24  | Eager Cell vs PUC lazy UpVal   |
-| **Total**             |   **696** |   **272** | **+424** |                          |
+| **Total**             |   **472** |   **272** | **+200** |                          |
 
-**Actual measured delta:** 680 bytes (k_len=2, not 3 — "X" and "aaa...a"
-are the string constants; `1` is an ADDI immediate, not a k-pool entry).
+**Actual measured delta:** 544 bytes (includes 72B LuaString for the 1000-char
+string constant, which is a GC object charged by internStr — present in both
+Zig and PUC but not in the component table above).
 
-**What was eliminated/lazified:** Nothing — all owned parts are genuinely
-needed. Bitfield compaction of ProtoTreeOwner's 3 bools saves 0 bytes
-(padding unchanged). Lazy resolved_values (built at first frame push instead
-of adoption) would save 48 bytes but still leaves 648 — still over 400.
-Per-exec k-pool conversion (eliminating resolved_values entirely) is too
-hot. Getting under 400 requires eliminating ProtoTreeOwner (144B, PUC has
-none — Proto IS the GC object) + SourceBacking (96B) + resolved_values (48B)
-— larger structural changes.
+**CUT1 (committed `148927c`):** Aliased resolved_values onto k for undumped
+trees via in-place Constant→Value conversion (both 16B/align 8). Eliminated
+the duplicate k array for undumped trees (-48B). Delta: 680→632.
+
+**CUT2 (this commit):** Merged ProtoTreeOwner (144B) into root Proto by adding
+owner fields (ref_count, vm, source_backing, flags, gc_charged/gc_footprint)
+directly to Proto. Compacted SourceBacking from 88B (3 ArrayListUnmanaged +
+external_borrow slice) to 32B inline (pin pointer + external_borrow slice +
+?*SourceBackingExtra for rare cases). Eliminated the separate ProtoTreeOwner
+allocation entirely. Proto grew from 184B to 248B (+64B owner fields). Net
+saving: 144 (owner) + 88 (old SourceBacking) + 8 (pinned list storage) - 64
+(Proto growth) = 176B. Delta: 632→544.
+
+**What remains over 400:** The remaining 144B gap (544-400) is structural:
+resolved_values (48B, PUC's k IS runtime TValue format), Proto owner fields
+(64B, PUC has none — Proto IS the GC object), larger Closure (+48B), larger
+Cell (+24B), larger Upvaldesc (+8B). Getting under 400 requires eliminating
+resolved_values — larger structural change (Proto-as-GC-object / lazy
+resolved_values at first frame push / per-exec k-pool conversion).
 
 **DEVIATION (documented per verifier allowance):** The honest charge is
-~680 bytes, exceeding PUC's < 400 gate. The gap is structural: ProtoTreeOwner
-(144B), SourceBacking (96B), resolved_values (48B) are luazig-specific
-overhead with no PUC equivalent; larger GC structs (Proto +56, Closure +48,
-Cell +24, Upvaldesc +8) reflect Zig's slice-based design vs C pointers.
+544 bytes, exceeding PUC's < 400 gate. The gap is structural: resolved_values
+(48B), Proto owner fields (64B), larger GC structs (Closure +48, Cell +24,
+Upvaldesc +8) reflect Zig's slice-based design vs C pointers. CUT1 eliminated
+the duplicate k array (-48B). CUT2 eliminated ProtoTreeOwner (-176B net).
 Per the verifier: "If getting under PUC's threshold requires a larger
 structural change, make that explicit and keep a measured correctness-first
 implementation." The api.lua:580 assertion fails honestly, documenting a
-real parity gap. The previous `gc_footprint=0` exemption was dishonest
-(hiding 544 bytes of tree memory); honest accounting is correctness-first.
+real parity gap.
 
 **Task 7 — FailingAllocator tests (4 tests):**
 - Task 7.1: Fixed undump metadata allocation failure — exhaustive OOM

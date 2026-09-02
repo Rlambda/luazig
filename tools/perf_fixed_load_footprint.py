@@ -81,8 +81,8 @@ pub fn main() void {
     std.debug.print("Instruction\t{}\n", .{@sizeOf(bc.Instruction)});
     std.debug.print("Upvaldesc\t{}\n", .{@sizeOf(bc.Upvaldesc)});
     std.debug.print("LocVar\t{}\n", .{@sizeOf(bc.LocVar)});
-    std.debug.print("ProtoTreeOwner\t{}\n", .{@sizeOf(bc.ProtoTreeOwner)});
-    std.debug.print("SourceBacking\t{}\n", .{@sizeOf(bc.ProtoTreeOwner.SourceBacking)});
+    std.debug.print("SourceBacking\t{}\n", .{@sizeOf(bc.SourceBacking)});
+    std.debug.print("SourceBackingExtra\t{}\n", .{@sizeOf(bc.SourceBackingExtra)});
 }
 '''
 
@@ -259,9 +259,14 @@ def main() -> int:
         zig_components["k_array"] = 0  # CUT1: aliased to resolved_values
         zig_components["upvalues_array"] = upvalues_len * zig_sizes["Upvaldesc"]
         zig_components["resolved_values"] = k_len * zig_sizes["Value"]
-        zig_components["ProtoTreeOwner"] = zig_sizes["ProtoTreeOwner"]
-        zig_components["SourceBacking_struct"] = zig_sizes["SourceBacking"]
-        zig_components["pinned_list_storage"] = 1 * 8  # 1 * sizeof(*LuaString)
+        # CUT2: ProtoTreeOwner eliminated — owner fields merged into root Proto.
+        # The Proto struct already includes owner fields (ref_count, vm,
+        # source_backing, flags, gc_charged/gc_footprint). No separate owner
+        # allocation. SourceBacking is now compact (inline pin + external_borrow
+        # + ?*SourceBackingExtra). For the common fixed-buffer case: 1 pin
+        # (inline in SourceBacking, which is inline in Proto), no extra.
+        zig_components["SourceBacking_struct"] = 0  # inline in Proto (already counted)
+        zig_components["pinned_list_storage"] = 0  # inline pin in SourceBacking (already counted)
         zig_components["Closure_GC"] = zig_sizes["Closure"]
         zig_components["Cell_GC"] = zig_sizes["Cell"]
         # Borrowed (not charged)
@@ -272,7 +277,6 @@ def main() -> int:
             zig_components["k_array"] +
             zig_components["upvalues_array"] +
             zig_components["resolved_values"] +
-            zig_components["ProtoTreeOwner"] +
             zig_components["SourceBacking_struct"] +
             zig_components["pinned_list_storage"]
         )
@@ -331,14 +335,16 @@ def main() -> int:
         "deviation_bytes": deviation_bytes,
         "deviation_explanation": (
             "Honest charge exceeds PUC's 400-byte gate due to structural "
-            "overhead: ProtoTreeOwner (144B, PUC has none), SourceBacking "
-            "(88B, PUC has none), resolved_values (48B, PUC's k IS runtime "
-            "format), larger GC structs (Proto +56, Closure +48, Cell +24, "
-            "Upvaldesc +8). CUT1 eliminated the duplicate k array for "
-            "undumped trees (aliased to resolved_values, -48B). Getting "
-            "under 400 requires eliminating ProtoTreeOwner + SourceBacking "
-            "— larger structural changes (Proto-as-GC-object / merge owner "
-            "into root Proto). Per verifier allowance, honest accounting is "
+            "overhead: SourceBacking (32B inline in Proto, PUC has none), "
+            "resolved_values (48B, PUC's k IS runtime format), larger GC "
+            "structs (Proto +56B including owner fields, Closure +48, "
+            "Cell +24, Upvaldesc +8). CUT1 eliminated the duplicate k array "
+            "for undumped trees (aliased to resolved_values, -48B). CUT2 "
+            "eliminated ProtoTreeOwner (144B) by merging owner fields into "
+            "root Proto and compacting SourceBacking (88B→32B inline). "
+            "Getting under 400 requires eliminating resolved_values — larger "
+            "structural change (Proto-as-GC-object / lazy resolved_values at "
+            "first frame push). Per verifier allowance, honest accounting is "
             "kept and the deviation is documented."
         ) if verdict == "DEVIATION" else (
             "Honest charge is under PUC's 400-byte gate."

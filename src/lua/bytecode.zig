@@ -439,183 +439,164 @@ pub const LocVar = struct {
 };
 
 // ---------------------------------------------------------------------------
-// ProtoTreeOwner — refcounted per-tree lifetime owner (P16.10b Tasks 4/5/9)
+// SourceBacking — compact source-byte lifetime tracking (CUT2)
 // ---------------------------------------------------------------------------
 //
-// Ownership model (mirrors how PUC Lua frees Proto trees via luaF_freeprotoL
-// from freeobj, extended for luazig's shared closures):
+// Keeps alive the bytes that the tree's debug lexeme slices borrow (locvar/
+// upvalue names, function name, source_name; fixed-buffer undump also borrows
+// long-string constants). PUC Lua has no explicit backing tracking — Proto
+// IS a GC object and its debug strings are GC-managed TStrings.
 //
-//   * Exactly ONE owner per compiled Proto tree (a root plus every proto
-//     reachable through `p`). It is created at the two production
-//     construction funnels — `ProtoBuilder.finish()` (text compilation) and
-//     `UndumpReader.undumpChunk()` (binary load) — with ref_count = 1, the
-//     "producer's reference" held by whoever receives the root proto.
+// CUT2 compact representation (32B inline, down from 88B):
+//   pin:           single GC-pinned source LuaString (common case: 1 pin)
+//   external_borrow: C-API load mode 'B' caller-owned byte span
+//   extra:         ?*SourceBackingExtra for rare multi-pin/owned/name_copies
 //
-//   * EVERY Closure created over any proto of the tree retains the owner
-//     (`ref_count += 1`). This is what makes OP_CLOSURE sharing safe: many
-//     closures may reference one child proto, child closures routinely
-//     outlive the root closure, and the tree must stay alive while ANY
-//     closure of ANY of its nodes lives.
-//
-//   * `gcFreeObject(.closure)` releases the owner's reference. The LAST
-//     release performs the full recursive tree deinit EXACTLY ONCE and
-//     destroys the owner struct.
-//
-// Structural ownership rules for the deinit:
-//   - arrays (code, k, p, upvalues, lineinfo, locvars, live_reg_top,
-//     resolved_values) and the Proto structs themselves are owned by the
-//     tree and freed by the tree deinit;
-//   - interned LuaStrings are owned by the VM string table and are NEVER
-//     destroyed by the tree deinit (`k_strings_vm_owned` records when the
-//     k pool stopped being tree-owned; see below);
-//   - debug lexeme slices (name, source_name, locvar/upvalue names) are
-//     borrowed from the source bytes and are not freed here (their backing
-//     is owned by `source_backing`, P16.10b Task 6).
-//
-// The `k_strings_vm_owned` flag is the structural replacement for the old
-// per-proto `constants_resolved` boolean's *ownership* meaning:
-//   - text-compiled trees are born with seed-0 LuaStrings owned by the tree
-//     (flag = false); constant resolution interns them into the VM and
-//     flips the flag tree-wide;
-//   - undumped trees intern their constants into the VM during
-//     deserialization, so the flag is true from construction.
-//
-// The `constants_resolved` flag on the OWNER carries the *readiness*
-// meaning (resolved_values built, k pool canonical) tree-wide: resolution
-// is all-or-nothing for the whole tree.
+// For the common cases (1 pin via builtinLoadEx, or external_borrow via
+// C-API 'B'), the inline fields suffice and no extra allocation is needed.
+// For rare cases (multiple pins, owned buffers, name_copies), extra is
+// heap-allocated with the full list-based backing.
 
-pub const ProtoTreeOwner = struct {
-    /// Tree root (the proto returned to the loader). Only used for the
-    /// deinit walk and debugging; every proto in the tree also points back
-    /// here via `Proto.tree`.
-    root: *Proto,
-    /// Allocator the tree was compiled/undumped with. Trees are created
-    /// inside exactly one allocator family (the VM's, or the CLI's
-    /// runtime allocator which is the same family); the owner frees the
-    /// tree with THIS allocator regardless of which VM releases it last.
-    allocator: std.mem.Allocator,
-    /// Number of live references (producing reference + one per Closure).
-    /// Reaching 0 in `release` performs the one-time tree deinit.
-    ref_count: usize = 1,
-    /// VM identity binding (P16.10b Task 8): the `*Vm` (as `*anyopaque`
-    /// to avoid a circular import) this tree's constants were interned
-    /// into / this tree executes on. No production path shares a tree
-    /// across VMs (see tools/ownership/proto-inventory.json); the field
-    /// exists so closure-creation boundaries can Debug-assert the
-    /// invariant cheaply.
-    vm: ?*anyopaque = null,
-    /// Source backing (P16.10b Task 6): keeps alive the bytes that the
-    /// tree's debug lexeme slices borrow (locvar/upvalue names, function
-    /// name, source_name; fixed-buffer undump also borrows long-string
-    /// constants). Attached by the load paths at owner scope; dropped at
-    /// last release. All buffers in here MUST be allocated with the
-    /// owner's allocator (they are, by construction: every attach site
-    /// compiles/undumps with the same allocator it backs with).
-    source_backing: SourceBacking = .{},
-    /// See the struct doc above: true once the k pool's `.str` pointers
-    /// belong to the VM string table (undumped trees: from birth;
-    /// text-compiled trees: flipped by constant resolution, tree-wide).
-    k_strings_vm_owned: bool = false,
-    /// Readiness (tree-wide): all protos of this tree have their
-    /// `resolved_values` built and their k pool is VM-canonical. Flipped
-    /// once, never reset. Replaces the per-proto `constants_resolved`.
-    constants_resolved: bool = false,
+/// Compact source backing (32B inline in Proto). Covers the common cases
+/// (1 pin, external_borrow) without allocation. Rare cases use extra.
+pub const SourceBacking = struct {
+    /// Single GC-pinned source LuaString (common: builtinLoadEx load(string)).
+    /// For multi-pin, the first pin lives here; additional pins go in extra.
+    pin: ?*vm.LuaString = null,
+    /// External borrow (C-API load mode 'B'): caller-owned byte span that
+    /// the tree borrows from. NEVER freed, NEVER GC-marked — the caller
+    /// keeps it alive until the closure is dropped and GC'd.
+    external_borrow: []const u8 = &.{},
+    /// Rare-case backing (multi-pin, owned buffers, name_copies).
+    /// Heap-allocated only when needed; null for the common cases.
+    extra: ?*SourceBackingExtra = null,
 
-    // --- GC memory accounting (Task 7) ---
-    //
-    // Proto trees are native allocations (not GC objects), but their
-    // lifetime is tied to closures (which ARE GC objects). To make
-    // `collectgarbage("count")` coherently reflect tree memory, the
-    // footprint is charged to `gc_count_kb` at adoption (first closure
-    // creation) and credited back at last release. This mirrors PUC Lua,
-    // where Proto IS a GC object charged at `luaC_newobj` and credited at
-    // `freeobj` → `luaF_freeproto`.
-    //
-    // `gc_charged` is false on construction (error paths release without
-    // crediting) and set true at adoption. `gc_footprint` caches the
-    // charged amount so the credit matches exactly.
-    gc_charged: bool = false,
-    gc_footprint: usize = 0,
-
-    /// What keeps the source bytes alive for a tree that borrows debug
-    /// slices from them (P16.10b Task 6). Populated by the load paths at
-    /// owner creation; consumed (dropped) by the last release.
-    pub const SourceBacking = struct {
-        /// GC-managed LuaStrings whose bytes this tree borrows (source
-        /// text of load(string), fixed-buffer undump chunks, distinct
-        /// chunk-name strings). NOT owned — never destroyed here; the VM
-        /// string table / GC owns them. Uniqueness is NOT enforced
-        /// (marking is idempotent); attach sites avoid obvious dupes.
-        pinned: std.ArrayListUnmanaged(*vm.LuaString) = .empty,
-        /// Heap byte buffers the tree owns outright: reader-fn collection
-        /// buffers, shebang-prefixed buffers, copies of caller-owned
-        /// name/bytes for the Zig/C API compile path (S1b), CLI/REPL
-        /// source copies. Freed at last release. Stored as `[]const u8`
-        /// because the source may come from `readFileAlloc` (which returns
-        /// `[]u8` stored as `[]const u8` in `Source`) or from `alloc.dupe`
-        /// (which returns `[]u8`); the tree never mutates these bytes.
-        owned: std.ArrayListUnmanaged([]const u8) = .empty,
-        /// Individually-allocated debug-name copies made by
-        /// `cloneUndumpedStrings` (undumped non-fixed trees). Freed at
-        /// last release. Stored as `[]const u8` (same rationale as `owned`).
-        name_copies: std.ArrayListUnmanaged([]const u8) = .empty,
-        /// External borrow (C-API load mode 'B'): a caller-owned byte span
-        /// that the tree borrows from for fixed-buffer undump (code,
-        /// lineinfo, and long-string constants point directly into this
-        /// span). NEVER freed, NEVER GC-marked — the caller is responsible
-        /// for keeping this memory alive until the closure is dropped and
-        /// GC'd. Distinct from `pinned` (which is GC-managed) and `owned`
-        /// (which is freed at last release). Stored as a single span
-        /// because luaL_loadbufferx('B') is the only producer (one C
-        /// buffer per load). PUC's LZIO `getaddr` borrows from the reader's
-        /// contiguous block the same way (lzio.c:79-91).
-        external_borrow: []const u8 = &.{},
-
-        /// Free everything tree-owned; pins are GC-owned and simply stop
-        /// being pinned (their survival is the GC's business). External
-        /// borrows are NOT freed (caller owns them).
-        pub fn deinit(self: *SourceBacking, alloc: std.mem.Allocator) void {
-            for (self.owned.items) |b| alloc.free(b);
-            for (self.name_copies.items) |b| alloc.free(b);
-            // pinned entries are GC-owned; only the list storage is ours.
-            self.pinned.deinit(alloc);
-            self.owned.deinit(alloc);
-            self.name_copies.deinit(alloc);
-            // external_borrow: NOT freed — caller owns the memory.
-            self.* = .{};
-        }
-    };
-
-    /// Add one reference (a Closure was created over this tree).
-    pub fn retain(self: *ProtoTreeOwner) void {
-        self.ref_count += 1;
+    /// Ensure extra exists (allocates if null). Returns the extra for
+    /// appending to pinned/owned/name_copies lists.
+    pub fn ensureExtra(self: *SourceBacking, alloc: std.mem.Allocator) !*SourceBackingExtra {
+        if (self.extra) |e| return e;
+        const e = try alloc.create(SourceBackingExtra);
+        e.* = .{};
+        self.extra = e;
+        return e;
     }
 
-    /// Drop one reference. The LAST release performs the full recursive
-    /// tree deinit exactly once and destroys the owner struct. `void`:
-    /// freeing with the creating allocator cannot fail.
-    pub fn release(self: *ProtoTreeOwner) void {
-        std.debug.assert(self.ref_count > 0);
-        self.ref_count -= 1;
-        if (self.ref_count != 0) return;
-        const alloc = self.allocator;
-        // Credit the tree's GC memory footprint (charged at adoption —
-        // see gc_charged). Only credit if the tree was actually charged:
-        // error paths that release an un-adopted tree never set gc_charged.
-        if (self.gc_charged) {
-            const vm_ptr: *vm.Vm = @ptrCast(@alignCast(self.vm.?));
-            vm_ptr.gcCreditTreeMemory(self.gc_footprint);
+    /// Add a GC-pinned source string. First pin goes inline; additional
+    /// pins go to extra.pinned.
+    pub fn addPin(self: *SourceBacking, alloc: std.mem.Allocator, str: *vm.LuaString) !void {
+        if (self.pin == null) {
+            self.pin = str;
+        } else {
+            const e = try self.ensureExtra(alloc);
+            // Move the first pin to extra, then set the new one inline.
+            try e.pinned.append(alloc, self.pin.?);
+            self.pin = str;
         }
-        // Structural deinit of the whole tree (arrays + structs). Interned
-        // LuaStrings are NEVER destroyed here — `k_strings_vm_owned` says
-        // whether the k pool still belongs to the tree.
-        destroyProtoTree(alloc, self.root, self.k_strings_vm_owned);
-        // Source backing (Task 6): drop owned buffers and name copies;
-        // pinned strings are GC-owned and simply stop being pinned.
-        self.source_backing.deinit(alloc);
-        alloc.destroy(self);
+    }
+
+    /// Add an owned byte buffer (reader-fn collection, shebang prefix, API
+    /// copies). Goes to extra.owned. The tree frees this at last release.
+    pub fn addOwned(self: *SourceBacking, alloc: std.mem.Allocator, bytes: []const u8) !void {
+        const e = try self.ensureExtra(alloc);
+        try e.owned.append(alloc, bytes);
+    }
+
+    /// Add a debug-name copy (cloneUndumpedStrings). Goes to
+    /// extra.name_copies. The tree frees this at last release.
+    pub fn addNameCopy(self: *SourceBacking, alloc: std.mem.Allocator, bytes: []const u8) !void {
+        const e = try self.ensureExtra(alloc);
+        try e.name_copies.append(alloc, bytes);
+    }
+
+    /// Number of owned byte buffers (for test assertions).
+    pub fn ownedCount(self: *const SourceBacking) usize {
+        if (self.extra) |e| return e.owned.items.len;
+        return 0;
+    }
+
+    /// Get owned buffer by index (for test assertions).
+    pub fn ownedAt(self: *const SourceBacking, idx: usize) []const u8 {
+        return self.extra.?.owned.items[idx];
+    }
+
+    /// Free owned buffers and extra. Pins are GC-owned (not freed here).
+    /// External borrows are caller-owned (not freed).
+    pub fn deinit(self: *SourceBacking, alloc: std.mem.Allocator) void {
+        if (self.extra) |e| {
+            e.deinit(alloc);
+            alloc.destroy(e);
+        }
+        self.* = .{};
+    }
+
+    /// Whether this backing has any pins (inline or extra).
+    pub fn hasPins(self: *const SourceBacking) bool {
+        if (self.pin != null) return true;
+        if (self.extra) |e| return e.pinned.items.len > 0;
+        return false;
+    }
+
+    /// Iterate over pinned strings (for GC marking). Returns the inline
+    /// pin first, then extra.pinned items.
+    pub fn forEachPin(self: *const SourceBacking, comptime ctx_fn: anytype, ctx: anytype) void {
+        if (self.pin) |s| ctx_fn(ctx, s);
+        if (self.extra) |e| {
+            for (e.pinned.items) |s| ctx_fn(ctx, s);
+        }
     }
 };
+
+/// Rare-case source backing (multi-pin, owned buffers, name_copies).
+/// Heap-allocated only when the compact SourceBacking's inline fields
+/// are insufficient.
+pub const SourceBackingExtra = struct {
+    /// Additional GC-pinned LuaStrings (beyond the first, which is inline).
+    pinned: std.ArrayListUnmanaged(*vm.LuaString) = .empty,
+    /// Heap byte buffers the tree owns outright (reader-fn collection,
+    /// shebang-prefixed buffers, API copies). Freed at deinit.
+    owned: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// Debug-name copies (cloneUndumpedStrings). Freed at deinit.
+    name_copies: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    pub fn deinit(self: *SourceBackingExtra, alloc: std.mem.Allocator) void {
+        for (self.owned.items) |b| alloc.free(b);
+        for (self.name_copies.items) |b| alloc.free(b);
+        self.pinned.deinit(alloc);
+        self.owned.deinit(alloc);
+        self.name_copies.deinit(alloc);
+        self.* = .{};
+    }
+};
+
+/// Compute the native memory footprint of a SourceBackingExtra (for GC
+/// accounting). Includes the struct itself, list storage, and owned/name
+/// buffer bytes. Pins are GC-owned (not counted).
+pub fn sourceBackingExtraFootprint(extra: SourceBackingExtra) usize {
+    var total: usize = @sizeOf(SourceBackingExtra);
+    for (extra.owned.items) |b| total += b.len;
+    for (extra.name_copies.items) |b| total += b.len;
+    total += extra.pinned.items.len * @sizeOf(*vm.LuaString);
+    total += extra.owned.items.len * @sizeOf([]const u8);
+    total += extra.name_copies.items.len * @sizeOf([]const u8);
+    return total;
+}
+
+// ---------------------------------------------------------------------------
+// Proto — the compiled function object (CUT2: owner fields merged in)
+// ---------------------------------------------------------------------------
+//
+// CUT2 merges ProtoTreeOwner into the root Proto, eliminating the separately
+// allocated 144B owner struct. The root Proto carries owner fields directly
+// (ref_count, vm, source_backing, flags, gc_charged/gc_footprint). Non-root
+// protos have these fields zeroed; `.tree` points to the root proto.
+//
+// PUC model: the Proto IS the ownership root. There's no separate owner.
+// CUT2 achieves the same: the root Proto IS the owner.
+//
+// `.tree` semantics:
+//   null     → owner-less (under construction, unit test proto)
+//   self     → root proto (owner fields are valid)
+//   other    → non-root proto (points to root; owner fields are zeroed)
 
 /// Free an entire proto tree structurally: every array, every seed-0
 /// string constant that is still tree-owned, every Proto struct —
@@ -638,8 +619,8 @@ pub const ProtoTreeOwner = struct {
 pub fn destroyProtoTree(alloc: std.mem.Allocator, root: *Proto, k_strings_vm_owned: bool) void {
     // PUC PF_FIXED parity: when fixed_arrays is set, code and lineinfo are
     // borrowed from the input buffer (not tree-owned). Skip freeing them —
-    // the input buffer's lifetime is managed by source_backing (pinned on
-    // the ProtoTreeOwner). PUC's luaF_freeproto (lfunc.c:285-287) does the
+    // the input buffer's lifetime is managed by source_backing (on the
+    // root proto in CUT2). PUC's luaF_freeproto (lfunc.c:285-287) does the
     // same check via `PF_FIXED` on `f->flag`.
     if (!root.fixed_arrays) alloc.free(root.code);
     // CUT1: detect k-aliased-to-resolved_values (undumped trees after
@@ -666,9 +647,15 @@ pub fn destroyProtoTree(alloc: std.mem.Allocator, root: *Proto, k_strings_vm_own
     alloc.free(root.locvars);
     if (root.live_reg_top.len > 0) alloc.free(root.live_reg_top);
     if (root.resolved_values.len > 0) alloc.free(root.resolved_values);
+    // CUT2: source_backing is now on the root proto. Deinit it before
+    // destroying the struct. For non-root protos (recursive calls),
+    // source_backing is empty (.{}) so deinit is a no-op. For the root,
+    // this frees owned buffers and name_copies; pins are GC-owned and
+    // external borrows are caller-owned (neither freed here).
+    root.source_backing.deinit(alloc);
     alloc.destroy(root);
     // name/source_name/locvar names are borrowed from the source bytes;
-    // they are NOT freed here (backing owned by the tree owner, Task 6).
+    // they are NOT freed here (backing owned by source_backing, just deinit'd).
 }
 
 /// Compute the native memory footprint of a Proto tree: all Proto structs
@@ -712,24 +699,17 @@ pub fn protoTreeFootprint(root: *const Proto) usize {
     return total;
 }
 
-/// Compute the native memory footprint of a `SourceBacking`: owned byte
-/// buffers, name copies, and the list storage for all three lists (pinned,
-/// owned, name_copies). Pinned LuaStrings are GC-owned and NOT included
-/// (only the list slot that holds the pointer is counted). External borrows
-/// are caller-owned and NOT included (they are not our memory — the caller
-/// manages their lifetime separately).
-pub fn sourceBackingFootprint(sb: ProtoTreeOwner.SourceBacking) usize {
-    var total: usize = 0;
-    // Owned byte buffers (reader-fn collection, shebang prefix, API copies).
-    for (sb.owned.items) |b| total += b.len;
-    // Debug-name copies (cloneUndumpedStrings).
-    for (sb.name_copies.items) |b| total += b.len;
-    // List storage (ArrayListUnmanaged backing arrays).
-    total += sb.pinned.items.len * @sizeOf(*vm.LuaString);
-    total += sb.owned.items.len * @sizeOf([]const u8);
-    total += sb.name_copies.items.len * @sizeOf([]const u8);
-    // external_borrow: NOT counted — caller-owned, not our memory.
-    return total;
+/// Compute the native memory footprint of a compact `SourceBacking` (CUT2):
+/// the inline struct itself (already counted via @sizeOf(Proto) on root),
+/// plus any `SourceBackingExtra` (rare case) and its owned/name buffer bytes.
+/// Pinned LuaStrings are GC-owned and NOT included. External borrows are
+/// caller-owned and NOT included. The inline `pin` pointer and
+/// `external_borrow` slice are part of @sizeOf(Proto) and not added here.
+pub fn sourceBackingFootprint(sb: SourceBacking) usize {
+    if (sb.extra) |e| {
+        return sourceBackingExtraFootprint(e.*);
+    }
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -800,11 +780,49 @@ pub const Proto = struct {
     /// pool is still tree-owned is recorded STRUCTURALLY on the tree
     /// owner (`ProtoTreeOwner.k_strings_vm_owned`), never per-proto.
     k: []Constant,
-    /// The tree this proto belongs to. Null only while the tree is under
-    /// construction (before `ProtoBuilder.finish()` binds the finished
-    /// tree / before `undumpChunk` binds the deserialized tree). Every
-    /// production proto is bound for its whole observable lifetime.
-    tree: ?*ProtoTreeOwner = null,
+    /// The tree this proto belongs to (CUT2: owner merged into root Proto).
+    ///
+    /// Semantics:
+    ///   null  → owner-less (under construction, or unit test proto)
+    ///   self  → this IS the root proto (owner fields below are valid)
+    ///   other → non-root proto (points to root; owner fields are zeroed)
+    ///
+    /// Every production proto is bound for its whole observable lifetime.
+    /// `ProtoBuilder.finish()` and `UndumpReader.undumpChunk()` bind the
+    /// finished/deserialized tree (root .tree = self, children .tree = root).
+    tree: ?*Proto = null,
+
+    // --- CUT2 owner fields (valid only on root proto where tree == self) ---
+    // These replace the former ProtoTreeOwner struct. Non-root protos have
+    // them zeroed/null/false. Only the root proto carries ownership state.
+    //
+    // PUC model: the Proto IS the ownership root (no separate owner). CUT2
+    // achieves the same: the root Proto IS the owner.
+
+    /// Number of live references (producing reference + one per Closure).
+    /// Reaching 0 in `releaseTree` performs the one-time tree deinit.
+    /// Valid only on root (tree == self).
+    ref_count: usize = 0,
+    /// VM identity binding (P16.10b Task 8): the `*Vm` (as `*anyopaque` to
+    /// avoid a circular import) this tree's constants were interned into /
+    /// executes on. Valid only on root.
+    vm: ?*anyopaque = null,
+    /// Source backing (CUT2 compact): keeps alive the bytes that the tree's
+    /// debug lexeme slices borrow. Valid only on root.
+    source_backing: SourceBacking = .{},
+    /// True once the k pool's `.str` pointers belong to the VM string table
+    /// (undumped trees: from birth; text-compiled: flipped by resolution).
+    /// Valid only on root.
+    k_strings_vm_owned: bool = false,
+    /// Readiness (tree-wide): all protos have resolved_values built and k
+    /// pool is VM-canonical. Flipped once, never reset. Valid only on root.
+    constants_resolved: bool = false,
+    /// GC memory accounting (Task 7): false on construction, set true at
+    /// adoption (first closure creation). Valid only on root.
+    gc_charged: bool = false,
+    /// Cached GC footprint charged at adoption, credited back at last
+    /// release. Valid only on root.
+    gc_footprint: usize = 0,
     /// Pre-resolved constant values in runtime `Value` format. Populated
     /// tree-wide by constant resolution (`resolveProtoConstants`) before
     /// first execution. After resolution, opcode handlers read
@@ -859,8 +877,41 @@ pub const Proto = struct {
 
     // NOTE: there is no `deinit` method. The tree deinit is STRUCTURAL and
     // lives in `destroyProtoTree` above, invoked either through
-    // `ProtoTreeOwner.release` (production: the last closure of the tree
-    // died) or directly on construction error paths (no owner exists yet).
+    // `releaseTree` (production: the last closure of the tree died) or
+    // directly on construction error paths (no owner exists yet).
+
+    // --- CUT2 owner methods (valid only on root proto where tree == self) ---
+
+    /// Add one reference (a Closure was created over this tree). Called on
+    /// the root proto. Mirrors `ProtoTreeOwner.retain` from pre-CUT2.
+    pub fn retainTree(self: *Proto) void {
+        std.debug.assert(self.tree.? == self); // must be root
+        self.ref_count += 1;
+    }
+
+    /// Drop one reference. The LAST release performs the full recursive
+    /// tree deinit exactly once. `alloc` is the allocator the tree was
+    /// compiled/undumped with (recovered from the VM in production paths,
+    /// passed explicitly here — NOT stored in Proto to save 16B). Mirrors
+    /// `ProtoTreeOwner.release` from pre-CUT2.
+    pub fn releaseTree(self: *Proto, alloc: std.mem.Allocator) void {
+        std.debug.assert(self.tree.? == self); // must be root
+        std.debug.assert(self.ref_count > 0);
+        self.ref_count -= 1;
+        if (self.ref_count != 0) return;
+        // Credit the tree's GC memory footprint (charged at adoption —
+        // see gc_charged). Only credit if the tree was actually charged:
+        // error paths that release an un-adopted tree never set gc_charged.
+        if (self.gc_charged) {
+            const vm_ptr: *vm.Vm = @ptrCast(@alignCast(self.vm.?));
+            vm_ptr.gcCreditTreeMemory(self.gc_footprint);
+        }
+        // Structural deinit of the whole tree (arrays + structs + source
+        // backing). Interned LuaStrings are NEVER destroyed here —
+        // `k_strings_vm_owned` says whether the k pool still belongs to
+        // the tree.
+        destroyProtoTree(alloc, self, self.k_strings_vm_owned);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -917,7 +968,7 @@ pub const ProtoBuilder = struct {
         // its owner. After a successful finish() this list is empty
         // (toOwnedSlice). (P16.10b Task 4/C4 — was a partial-tree leak.)
         for (self.protos.items) |child| {
-            child.tree.?.release();
+            child.tree.?.releaseTree(self.alloc);
         }
         self.upvalues.deinit(self.alloc);
         self.locvars.deinit(self.alloc);
@@ -1035,7 +1086,7 @@ pub const ProtoBuilder = struct {
     pub fn addProto(self: *ProtoBuilder, child: *Proto) !u8 {
         const idx: u8 = @intCast(self.protos.items.len);
         self.protos.append(self.alloc, child) catch |e| {
-            child.tree.?.release();
+            child.tree.?.releaseTree(self.alloc);
             return e;
         };
         return idx;
@@ -1091,9 +1142,9 @@ pub const ProtoBuilder = struct {
         }
         const p_slice = try self.protos.toOwnedSlice(alloc);
         errdefer {
-            // Adopted children still carry their own per-subtree owners
-            // (rebinding happens only after the new owner exists below).
-            for (p_slice) |child| child.tree.?.release();
+            // Adopted children still carry their own per-subtree ownership
+            // (rebinding happens only after the new root is bound below).
+            for (p_slice) |child| child.tree.?.releaseTree(alloc);
             alloc.free(p_slice);
         }
         const upv_slice = try self.upvalues.toOwnedSlice(alloc);
@@ -1121,24 +1172,16 @@ pub const ProtoBuilder = struct {
             .line_defined = self.line_defined,
             .last_line_defined = self.last_line_defined,
         };
-        // ── Tree binding ──
+        // ── Tree binding (CUT2: owner merged into root Proto) ──
         // Every adopted child was finished by its own builder and therefore
-        // carries a per-subtree owner with ref_count == 1 (its producing
-        // reference, which this builder now holds). Detach those owners —
-        // the reference transfers to THIS tree's owner — then bind every
-        // proto in the tree to the new owner. `alloc.create` below is the
-        // last fallible operation; everything after it is stores and frees.
-        const owner = try alloc.create(ProtoTreeOwner);
-        owner.* = .{
-            .root = proto,
-            .allocator = alloc,
-            .ref_count = 1,
-            // Text-compiled trees are born owning their seed-0 constants;
-            // resolution flips this tree-wide (see ProtoTreeOwner doc).
-            .k_strings_vm_owned = false,
-        };
+        // IS its own root (tree == self, ref_count == 1, its producing
+        // reference). Detach those child roots — clear their owner fields
+        // and null their tree pointers — then bind every proto in the tree
+        // to THIS proto as the new root. No separate owner allocation.
+        proto.ref_count = 1; // producing reference
+        proto.k_strings_vm_owned = false; // text-compiled: born owning seed-0 strings
         for (p_slice) |child| detachOwnerGroup(alloc, child);
-        bindOwnerRecursive(proto, owner);
+        bindTreeRecursive(proto, proto); // root.tree = self, children.tree = root
         // Transfer ownership of the const pool's internal maps to nothing —
         // they were temporary dedup indices. The actual constants are now in
         // proto.k. We need to clear the maps without freeing the strings
@@ -1164,31 +1207,43 @@ pub const ProtoBuilder = struct {
     }
 };
 
-/// Detach a finished subtree's own owner at adoption time (called from
-/// `ProtoBuilder.finish` for every adopted child). The child's owner holds
-/// exactly its producing reference (ref_count == 1 — no closures can exist
-/// for an un-adopted subtree); destroy the owner STRUCT without touching
-/// the tree, and null the subtree's `tree` pointers so the subsequent
-/// `bindOwnerRecursive` rebinds them to the parent's new owner.
+/// Detach a finished subtree's own root status at adoption time (called from
+/// `ProtoBuilder.finish` for every adopted child). In CUT2, the child IS its
+/// own root (tree == self, ref_count == 1 — no closures can exist for an
+/// un-adopted subtree). Clear the child's owner fields and null the subtree's
+/// `tree` pointers so the subsequent `bindTreeRecursive` rebinds them to the
+/// parent's new root. The child proto struct itself stays alive (it becomes
+/// a non-root member of the parent's tree).
 fn detachOwnerGroup(alloc: std.mem.Allocator, group_root: *Proto) void {
-    const old = group_root.tree orelse return;
-    std.debug.assert(old.ref_count == 1); // only the producer's reference
+    std.debug.assert(group_root.tree.? == group_root); // was its own root
+    std.debug.assert(group_root.ref_count == 1); // only the producer's reference
+    // Deinit any source_backing the child accumulated (normally empty for
+    // freshly compiled children, but safe to call).
+    group_root.source_backing.deinit(alloc);
+    // Clear owner fields (no longer a root).
+    group_root.ref_count = 0;
+    group_root.vm = null;
+    group_root.k_strings_vm_owned = false;
+    group_root.constants_resolved = false;
+    group_root.gc_charged = false;
+    group_root.gc_footprint = 0;
     clearTreePtrs(group_root);
-    alloc.destroy(old);
 }
 
-/// Null every `.tree` pointer in a subtree (used while detaching an owner
-/// group; the pointers are immediately rebind by bindOwnerRecursive).
+/// Null every `.tree` pointer in a subtree (used while detaching a tree
+/// group; the pointers are immediately rebound by bindTreeRecursive).
 fn clearTreePtrs(proto: *Proto) void {
     proto.tree = null;
     for (proto.p) |child| clearTreePtrs(child);
 }
 
-/// Point every proto of a subtree at `owner` (post-detach rebinding).
+/// Point every proto of a subtree at `root` (post-detach rebinding).
 /// Also used by `undump.undumpChunk` to bind a freshly deserialized tree.
-pub fn bindOwnerRecursive(proto: *Proto, owner: *ProtoTreeOwner) void {
-    proto.tree = owner;
-    for (proto.p) |child| bindOwnerRecursive(child, owner);
+/// CUT2: `root` is the root Proto itself (owner merged in). The root's
+/// `.tree` is set to `self` (self-pointer); children point to root.
+pub fn bindTreeRecursive(proto: *Proto, root: *Proto) void {
+    proto.tree = root;
+    for (proto.p) |child| bindTreeRecursive(child, root);
 }
 
 // ---------------------------------------------------------------------------
@@ -1259,7 +1314,7 @@ test "proto builder: emit and finish" {
     builder.checkStack(3);
 
     const proto = try builder.finish();
-    defer proto.tree.?.release(); // frees the whole tree + owner
+    defer proto.tree.?.releaseTree(std.testing.allocator); // frees the whole tree + owner
 
     try std.testing.expectEqual(@as(usize, 4), proto.code.len);
     try std.testing.expectEqual(@as(usize, 2), proto.k.len);
@@ -1280,7 +1335,7 @@ test "proto builder: jump backpatching" {
     builder.patchJump(jmp_pc, target_pc);
 
     const proto = try builder.finish();
-    defer proto.tree.?.release();
+    defer proto.tree.?.releaseTree(std.testing.allocator);
 
     // The jump should skip 1 instruction (the LOADK).
     const offset = proto.code[jmp_pc].jumpOffset();

@@ -138,7 +138,7 @@ fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: 
         // its own retained reference. (Non-fixed undump borrows debug
         // name slices from the chunk bytes; the CLI's file buffer is
         // process-lifetime, so no backing copy is needed here.)
-        defer loaded_proto.tree.?.release();
+        defer loaded_proto.tree.?.releaseTree(aalloc);
         // Pre-resolve constants (strings already interned via callback).
         vm.preResolveUndumpedConstants(loaded_proto) catch return error.OutOfMemory;
         // Execute directly with _ENV = global_env.
@@ -186,7 +186,7 @@ fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: 
             // The compiled tree carries its producing reference (P16.10b
             // Task 4); the executing closure inside runBytecode retains
             // its own. Release ours on every exit of this path.
-            defer proto.tree.?.release();
+            defer proto.tree.?.releaseTree(aalloc);
             // Source backing (P16.10b Task 6): no copies needed here —
             // the CLI's script buffers (loadFile/loadStdin in
             // interpreterMain, never freed) are PROCESS-lifetime, so the
@@ -598,21 +598,21 @@ fn tryCompile(
     // release the tree and report it honestly.
     const owner = proto.tree.?;
     const bytes_copy = aalloc.dupe(u8, source.bytes) catch {
-        owner.release();
+        owner.releaseTree(aalloc);
         return .oom;
     };
-    owner.source_backing.owned.append(aalloc, bytes_copy) catch {
+    owner.source_backing.addOwned(aalloc, bytes_copy) catch {
         aalloc.free(bytes_copy);
-        owner.release();
+        owner.releaseTree(aalloc);
         return .oom;
     };
     const name_copy = aalloc.dupe(u8, source.name) catch {
-        owner.release();
+        owner.releaseTree(aalloc);
         return .oom;
     };
-    owner.source_backing.owned.append(aalloc, name_copy) catch {
+    owner.source_backing.addOwned(aalloc, name_copy) catch {
         aalloc.free(name_copy);
-        owner.release();
+        owner.releaseTree(aalloc);
         return .oom;
     };
     return .{ .proto = proto };
@@ -784,7 +784,7 @@ fn doREPL(
                                     // The recompiled proto is dropped without
                                     // execution — release its producing
                                     // reference so the tree frees (P16.10b).
-                                    .proto => |eof_p| eof_p.tree.?.release(),
+                                    .proto => |eof_p| eof_p.tree.?.releaseTree(aalloc),
                                     .oom => break,
                                     .err_msg => |eof_msg| {
                                         var errw = stdio.stderr();
@@ -808,7 +808,7 @@ fn doREPL(
             // inside runBytecode retains its own. Release ours on every exit
             // of this block (P16.10b Task 4 — REPL no longer leaks a tree
             // per compiled line).
-            defer p.tree.?.release();
+            defer p.tree.?.releaseTree(aalloc);
             // Execute the compiled chunk using the shared _ENV upvalue cell.
             // PUC doREPL calls docall which sets msghandler as errfunc
             // (lua.c:155-166). Without this, errors in REPL show no traceback.

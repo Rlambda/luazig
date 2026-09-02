@@ -1,9 +1,9 @@
 {
-  "created_utc": "2026-09-02T23:19:16.400222+00:00",
+  "created_utc": "2026-09-02T23:44:15.123519+00:00",
   "zig_version": "0.16.0",
-  "git_head": "b17de3b",
+  "git_head": "148927c",
   "zig_sizes": {
-    "Proto": 184,
+    "Proto": 248,
     "Closure": 88,
     "Cell": 64,
     "LuaString": 72,
@@ -12,8 +12,8 @@
     "Instruction": 4,
     "Upvaldesc": 24,
     "LocVar": 32,
-    "ProtoTreeOwner": 144,
-    "SourceBacking": 88
+    "SourceBacking": 32,
+    "SourceBackingExtra": 72
   },
   "puc_sizes": {
     "Proto": 128,
@@ -28,20 +28,19 @@
     "AbsLineInfo": 8
   },
   "zig_components": {
-    "Proto_struct": 184,
+    "Proto_struct": 248,
     "k_array": 0,
     "upvalues_array": 24,
     "resolved_values": 48,
-    "ProtoTreeOwner": 144,
-    "SourceBacking_struct": 88,
-    "pinned_list_storage": 8,
+    "SourceBacking_struct": 0,
+    "pinned_list_storage": 0,
     "Closure_GC": 88,
     "Cell_GC": 64,
     "code_borrowed": 0,
     "lineinfo_borrowed": 0,
-    "tree_total": 496,
+    "tree_total": 320,
     "gc_objects": 152,
-    "honest_total": 648
+    "honest_total": 472
   },
   "puc_components": {
     "Proto_struct": 128,
@@ -54,12 +53,12 @@
     "honest_total": 272
   },
   "actual_delta": {
-    "delta": 632,
-    "m1": 82127,
-    "m2": 82759
+    "delta": 544,
+    "m1": 84095,
+    "m2": 84639
   },
   "verdict": "DEVIATION",
   "gate_threshold": 400,
-  "deviation_bytes": 248,
-  "deviation_explanation": "Honest charge exceeds PUC's 400-byte gate due to structural overhead: ProtoTreeOwner (144B, PUC has none), SourceBacking (96B, PUC has none), resolved_values (48B, PUC's k IS runtime format), larger GC structs (Proto +56, Closure +48, Cell +24, Upvaldesc +8). Getting under 400 requires eliminating ProtoTreeOwner + SourceBacking + resolved_values \u2014 larger structural changes (Proto-as-GC-object, lazy resolved_values, or per-exec k-pool conversion). Per verifier allowance, honest accounting is kept and the deviation is documented."
+  "deviation_bytes": 72,
+  "deviation_explanation": "Honest charge exceeds PUC's 400-byte gate due to structural overhead: SourceBacking (32B inline in Proto, PUC has none), resolved_values (48B, PUC's k IS runtime format), larger GC structs (Proto +56B including owner fields, Closure +48, Cell +24, Upvaldesc +8). CUT1 eliminated the duplicate k array for undumped trees (aliased to resolved_values, -48B). CUT2 eliminated ProtoTreeOwner (144B) by merging owner fields into root Proto and compacting SourceBacking (88B\u219232B inline). Getting under 400 requires eliminating resolved_values \u2014 larger structural change (Proto-as-GC-object / lazy resolved_values at first frame push). Per verifier allowance, honest accounting is kept and the deviation is documented."
 }

@@ -1,20 +1,20 @@
 {
   "meta": {
-    "created_utc": "2026-09-02T20:23:56.408690+00:00",
+    "created_utc": "2026-09-02T23:53:21.490458+00:00",
     "lane": "testes_matrix",
     "argv": [
       "/home/boss/codes/luazig/tools/testes_matrix.py",
       "--testc",
       "--json-out",
-      "/home/boss/codes/luazig/tools/status/.tmp.matrix.88527ur5.json"
+      "/home/boss/codes/luazig/tools/status/.tmp.matrix.mikz88g4.json"
     ],
     "zig_version": "0.16.0"
   },
   "summary": {
     "total": 32,
-    "pass": 31,
+    "pass": 30,
     "output_diff": 0,
-    "zig_fail": 0,
+    "zig_fail": 1,
     "both_fail": 1,
     "both_fail_infra": 0,
     "zig_only_pass": 0
@@ -22,10 +22,10 @@
   "rows": [
     {
       "file": "api.lua",
-      "class": "pass",
+      "class": "zig_fail",
       "ref_exit": 0,
-      "zig_exit": 0,
-      "zig_reason": "",
+      "zig_exit": 1,
+      "zig_reason": "assertion failed",
       "ref_reason": "",
       "diff": ""
     },

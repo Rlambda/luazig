@@ -11258,17 +11258,11 @@ pub const Vm = struct {
             // Host-recursion path (runBytecodeInternal, builtin pcall,
             // metamethods, debug hooks, coroutine resume): args may come from
             // a heap slice. Write func+args into bc_stack at the func_slot.
-            const needed_for_args = func_slot_in + 1 + args.len + frame_cap + nextra;
-            if (needed_for_args > self.bc_stack.len) {
-                try self.ensureBcStackCap(needed_for_args);
-            }
-            self.bc_stack[func_slot_in] = if (callee_cl) |cl|
-                .{ .Closure = cl }
-            else
-                .Nil;
-            for (0..args.len) |i| {
-                self.bc_stack[func_slot_in + 1 + i] = args[i];
-            }
+            // P16.10a T12: outlined to a noinline cold helper to reduce
+            // register pressure in the hot (args_on_stack) path — the host-
+            // args copy uses callee-saved registers that otherwise spill hot-
+            // path values (proto, nparams, func_slot, args.len) to the stack.
+            try self.prepareHostArgs(func_slot_in, args, callee_cl, frame_cap, nextra);
         }
 
         // ── Step 2: buildhiddenargs for VAHID ──
@@ -11277,26 +11271,16 @@ pub const Vm = struct {
         //                                                  ^ new ci->func
         // Extra args stay at their original positions and become hidden varargs
         // at [new_func - nextra .. new_func].
-        const nargs = args.len;
-        const func_slot: usize = if (is_vahid) func_slot_in + nargs + 1 else func_slot_in;
+        // P16.10a T12: `nargs` alias removed — `args.len` used directly in the
+        // cold is_vahid branch. The dead nil-fill loop `nparams..@max(nparams,
+        // nparams)` (an empty range — VAHID requires nextra>0 i.e. nargs>
+        // nparams, so missing params are impossible) was provably-redundant
+        // and deleted.
+        const func_slot: usize = if (is_vahid) func_slot_in + args.len + 1 else func_slot_in;
         const base = func_slot + 1;
 
         if (is_vahid) {
-            // Ensure space for the shifted func+params + frame_cap.
-            const needed_shift = base + frame_cap;
-            try self.ensureBcStackCap(needed_shift);
-            // Copy func to new position (PUC: setobjs2s(L, L->top++, ci->func)).
-            self.bc_stack[func_slot] = self.bc_stack[func_slot_in];
-            // Copy fixed params above the new func position.
-            for (0..nparams) |i| {
-                self.bc_stack[base + i] = self.bc_stack[func_slot_in + 1 + i];
-                // Nil original param position (PUC: for GC safety).
-                self.bc_stack[func_slot_in + 1 + i] = .Nil;
-            }
-            // Nil-fill missing params (fewer args than numparams).
-            for (nparams..@max(nparams, nparams)) |i| {
-                self.bc_stack[base + i] = .Nil;
-            }
+            try self.prepareVahidShift(func_slot_in, func_slot, base, nparams, frame_cap);
         }
 
         // PUC checkstackp overflow check: base + frame_cap must fit.
@@ -11336,26 +11320,11 @@ pub const Vm = struct {
             if (needed_top > lua_stack_overflow_limit or
                 exec_frames.len() >= effective_max_call_frames)
             {
-            // PUC luaD_growstack: on overflow, realloc to ERRORSTACKSIZE
-            // (MAXSTACK + 200) to give the error handler room, then raise
-            // the error. This bypasses ensureBcStackCap's MAXSTACK cap
-            // because ERRORSTACKSIZE > MAXSTACK by design.
-            const PHYSICAL_LIMIT: usize = lua_max_stack_slots + ERRORSTACKSIZE;
-            if (self.bc_stack.len < PHYSICAL_LIMIT) {
-                const old_len = self.bc_stack.len;
-                self.bc_stack = self.alloc.realloc(self.bc_stack, PHYSICAL_LIMIT) catch {
-                    return self.fail("stack overflow", .{});
-                };
-                self.bc_boxed = self.alloc.realloc(self.bc_boxed, PHYSICAL_LIMIT) catch {
-                    return self.fail("stack overflow", .{});
-                };
-                // Initialize new slots.
-                @memset(self.bc_stack[old_len..], .Nil);
-                @memset(self.bc_boxed[old_len..], null);
-                // P15.51g: No per-frame slice refresh needed — regs/boxed
-                // are derived on demand from base + frame_cap.
-            }
-            return self.fail("stack overflow", .{});
+                // P16.10a T12: the realloc-to-PHYSICAL_LIMIT + fail body is
+                // cold (only reached on actual overflow). Outlined to a
+                // noinline helper to keep the allocator vtable calls and
+                // bc_boxed reload out of the hot path's register pressure.
+                return self.raiseFrameOverflow();
             }
         }
 
@@ -11455,6 +11424,86 @@ pub const Vm = struct {
 
         // Debug fields (must set explicitly — defaults don't re-apply on reuse)
         ef_slot.u.lua.resume_skip_count_pc = INVALID_PC;
+    }
+
+    // P16.10a T12: Cold helpers for pushBytecodeExecFrame — noinline to keep
+    // their register usage out of the hot (args_on_stack, non-VAHID, no-
+    // overflow) path. Each is reached only on uncommon activation kinds.
+
+    /// Host-recursion arg copy: args come from a heap slice (not bc_stack).
+    /// Writes func + args at func_slot so the frame's registers are contiguous.
+    /// Cold: runBytecodeInternal, builtin pcall, metamethods, debug hooks,
+    /// coroutine resume. The OP_CALL/OP_TAILCALL fast path never enters here.
+    noinline fn prepareHostArgs(
+        self: *Vm,
+        func_slot_in: usize,
+        args: []const Value,
+        callee_cl: ?*Closure,
+        frame_cap: u32,
+        nextra: usize,
+    ) DispatchError!void {
+        const needed_for_args = func_slot_in + 1 + args.len + frame_cap + nextra;
+        if (needed_for_args > self.bc_stack.len) {
+            try self.ensureBcStackCap(needed_for_args);
+        }
+        self.bc_stack[func_slot_in] = if (callee_cl) |cl|
+            .{ .Closure = cl }
+        else
+            .Nil;
+        for (0..args.len) |i| {
+            self.bc_stack[func_slot_in + 1 + i] = args[i];
+        }
+    }
+
+    /// VAHID buildhiddenargs (PUC ltm.c): shift func+params UP past the extra
+    /// args so the extra args become hidden varargs at [func-nextra..func].
+    /// Cold: only vararg functions WITHOUT a vararg table AND with extra args.
+    noinline fn prepareVahidShift(
+        self: *Vm,
+        func_slot_in: usize,
+        func_slot: usize,
+        base: usize,
+        nparams: u8,
+        frame_cap: u32,
+    ) DispatchError!void {
+        // Ensure space for the shifted func+params + frame_cap.
+        const needed_shift = base + frame_cap;
+        try self.ensureBcStackCap(needed_shift);
+        // Copy func to new position (PUC: setobjs2s(L, L->top++, ci->func)).
+        self.bc_stack[func_slot] = self.bc_stack[func_slot_in];
+        // Copy fixed params above the new func position.
+        for (0..nparams) |i| {
+            self.bc_stack[base + i] = self.bc_stack[func_slot_in + 1 + i];
+            // Nil original param position (PUC: for GC safety).
+            self.bc_stack[func_slot_in + 1 + i] = .Nil;
+        }
+        // VAHID requires nextra > 0 (args.len > nparams), so there are never
+        // missing params to nil-fill here — the old dead nil-fill loop was
+        // `nparams..@max(nparams, nparams)` (an empty range), now removed.
+    }
+
+    /// Overflow body: realloc bc_stack/bc_boxed to PHYSICAL_LIMIT (MAXSTACK +
+    /// ERRORSTACKSIZE) to give the error handler room, then raise the error.
+    /// Cold: only reached on actual stack/frame overflow.
+    /// PUC luaD_growstack: this bypasses ensureBcStackCap's MAXSTACK cap
+    /// because ERRORSTACKSIZE > MAXSTACK by design.
+    noinline fn raiseFrameOverflow(self: *Vm) DispatchError!void {
+        const PHYSICAL_LIMIT: usize = 1_000_000 + 200;
+        if (self.bc_stack.len < PHYSICAL_LIMIT) {
+            const old_len = self.bc_stack.len;
+            self.bc_stack = self.alloc.realloc(self.bc_stack, PHYSICAL_LIMIT) catch {
+                return self.fail("stack overflow", .{});
+            };
+            self.bc_boxed = self.alloc.realloc(self.bc_boxed, PHYSICAL_LIMIT) catch {
+                return self.fail("stack overflow", .{});
+            };
+            // Initialize new slots.
+            @memset(self.bc_stack[old_len..], .Nil);
+            @memset(self.bc_boxed[old_len..], null);
+            // P15.51g: No per-frame slice refresh needed — regs/boxed
+            // are derived on demand from base + frame_cap.
+        }
+        return self.fail("stack overflow", .{});
     }
 
     inline fn popBytecodeExecFrame(

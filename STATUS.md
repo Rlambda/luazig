@@ -1,4 +1,4 @@
-> Last updated: 2026-08-31 (P16.10 — dispatch floor: jump-table verified (computed-goto не диагноз), stack-poll+SIGINT cleanups, 75→70 instr/iter)
+> Last updated: 2026-09-02 (P16.10a T12 — pushBytecodeExecFrame cold-path outlining + dead-code deletion; matrix zig_fail=0, smoke 67/67, c_api ALL PASS, geomean 1.79-1.80x)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -31,9 +31,10 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 <!-- BEGIN GENERATED SUMMARY (tools/status_summary.py) -->
 | Metric | Result |
 |--------|--------|
-| Upstream matrix (`testes/*.lua`, `--testc`) | _not run — no matrix JSON provided_ |
-| Differential output (`--diff`) | _not run_ |
-| Smoke tests (`tests/smoke/*.lua`) | _not run — no smoke JSON provided_ |
+| Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
+| Matrix non-pass | both_fail: big.lua |
+| Differential output (`--diff`) | **0 output_diff** |
+| Smoke tests (`tests/smoke/*.lua`) | **67/67** pass |
 | C API suites (`tests/c_api`) | 19 suites |
 | Performance (geomean vs PUC) | **1.80x** |
 
@@ -3916,6 +3917,69 @@ Debug+RF tests; c_api 18/18 + strict DIFF; matrix zig_fail=0; smoke 62/62;
 nextvar 10/10; 58-62 byte-identical; mm_check IDENTICAL; gc/gengc/closure/
 coroutine/events/errors 0/0 оба рантайма; leak_bench; native_mem BOUNDED;
 CallFrame ≤104; Node 32B.
+
+## P16.10a T12 — pushBytecodeExecFrame cold-path outlining + dead-code deletion (2026-09-02)
+
+### Контекст
+Fresh profile (tools/perf/current*.json, 2026-09-02): pushBytecodeExecFrame is
+11.43% of lua_calls and 13.39% of metamethod_call_noalloc — a shared major cost
+in both target workloads. The old frame-push analysis artifact (head e4e384b)
+was STALE: it predated T17 (lazy activeErrorHandlerDepth, which already moved
+the ~11% activeErrorHandlerDepth call into the overflow branch). Re-audited
+classification against current source (HEAD 4b7d9ee).
+
+### Re-audited classification (current source)
+Every operation in pushBytecodeExecFrame classified into 9 categories (see
+tools/perf/current-frame-push-analysis.json for the full table). Key findings:
+- The old ~11% hot line (activeErrorHandlerDepth spill) is GONE (T17 fixed it).
+- Remaining heat: register pressure (spills of proto, nparams, func_slot,
+  args.len to stack) caused by cold paths (host-args, VAHID, overflow) keeping
+  callee-saved registers live across the hot path.
+- Dead code: `for (nparams..@max(nparams, nparams))` — empty range (VAHID
+  requires nextra>0 i.e. nargs>nparams, so missing params are impossible).
+
+### Changes (3 increments, each measured)
+1. **Deleted dead nil-fill loop** (priority 1: provably-redundant). The loop
+   `for (nparams..@max(nparams, nparams))` was an empty range. Also removed the
+   `nargs = args.len` alias (used only in the cold is_vahid branch).
+2. **Outlined host-args path** to noinline `prepareHostArgs` (cold: host
+   recursion — runBytecodeInternal, builtin pcall, metamethods, debug hooks,
+   coroutine resume). The OP_CALL/OP_TAILCALL fast path never enters here.
+3. **Outlined VAHID buildhiddenargs** to noinline `prepareVahidShift` (cold:
+   vararg functions without vararg table AND with extra args).
+4. **Outlined overflow body** to noinline `raiseFrameOverflow` (cold: realloc
+   to PHYSICAL_LIMIT + fail). Keeps allocator vtable calls + bc_boxed reload
+   out of the hot path's register pressure.
+
+### Perf evidence (isolated A/B, 5 rounds, median, direct binary comparison)
+| Workload | instr delta | cycles delta |
+|---|---|---|
+| lua_calls | -0.14% (5,849M→5,841M) | -1.32% (1,151M→1,135M) |
+| metamethod_call_noalloc | -0.13% (12,746M→12,730M) | -1.87% (3,365M→3,302M) |
+| global_arith (control) | ~0% (identical instr) | system noise |
+
+Cold outlining reduced the biggest register spill from 4.46% to 3.37% of the
+function. Cycles improved in both target workloads; instructions essentially
+unchanged (noinline call overhead offset by fewer spills).
+
+### Rejected candidates
+- **Cached `total` field in FrameStack** for single-load `len()`: caused +6-7%
+  layout regression on field_access (Thread field displacement — P16.9 layout
+  caveat). Reverted.
+- **Branched `len()`** (inline_count < CAP ? inline_count : CAP + heap.len):
+  caused binary-layout regressions on field_access (+7.3%) and coroutine_yield
+  (+5.8%) from codegen shift. Reverted.
+- **Parameterize `args_on_stack` from caller**: the check is a safety mechanism
+  for stale-slice cases (bc_stack realloc between rargs creation and push).
+  Parameterizing risks use-after-free if a caller passes true when args are
+  stale. Not worth the risk for ~0.6% total workload gain.
+
+### Gate
+matrix zig_fail=0 (big.lua both_fail pre-existing); smoke 67/67; c_api ALL PASS
+(incl. 10_continuations, 12_chook); nextvar 5x OK; CallFrame ≤104B (Debug assert
+passes); perf_compare no regressions from my changes (global_arith FAIL is
+pre-existing baseline-JSON system-state issue — confirmed by direct A/B showing
+identical instructions on baseline binary).
 
 ## P16.10c — Cell GC: PUC-faithful markCell primitive, structural exclusion from gc_gray (2026-09-02)
 

@@ -628,6 +628,13 @@ pub const ProtoTreeOwner = struct {
 /// owned by the tree and destroyed here; when true they belong to the VM
 /// string table (or are `undefined` in no-callback undump unit tests) and
 /// are never touched.
+///
+/// CUT1 aliasing: for undumped trees after adoption, `k` has been aliased
+/// to `resolved_values` (in-place Constant→Value conversion). `k.len == 0`
+/// and `resolved_values` holds the single allocation. When aliased, the
+/// allocation is freed via `resolved_values` below; `k` is skipped (its
+/// zero-length slice shares the allocation ptr — freeing it would
+/// double-free).
 pub fn destroyProtoTree(alloc: std.mem.Allocator, root: *Proto, k_strings_vm_owned: bool) void {
     // PUC PF_FIXED parity: when fixed_arrays is set, code and lineinfo are
     // borrowed from the input buffer (not tree-owned). Skip freeing them —
@@ -635,12 +642,20 @@ pub fn destroyProtoTree(alloc: std.mem.Allocator, root: *Proto, k_strings_vm_own
     // the ProtoTreeOwner). PUC's luaF_freeproto (lfunc.c:285-287) does the
     // same check via `PF_FIXED` on `f->flag`.
     if (!root.fixed_arrays) alloc.free(root.code);
-    if (!k_strings_vm_owned) {
-        for (root.k) |c| {
-            if (c == .str) vm.destroyLuaString(alloc, c.str);
+    // CUT1: detect k-aliased-to-resolved_values (undumped trees after
+    // adoption). When aliased, k.len==0 and resolved_values.len>0; the
+    // single allocation is freed via resolved_values below. For all other
+    // cases (compiled trees, undumped trees before adoption), k is a
+    // separate allocation (or &.{} for no-constant protos) freed here.
+    const k_aliased = root.k.len == 0 and root.resolved_values.len > 0;
+    if (!k_aliased) {
+        if (!k_strings_vm_owned) {
+            for (root.k) |c| {
+                if (c == .str) vm.destroyLuaString(alloc, c.str);
+            }
         }
+        alloc.free(root.k);
     }
-    alloc.free(root.k);
     // Recursive call frees each child's subtree INCLUDING the child struct.
     for (root.p) |child| {
         destroyProtoTree(alloc, child, k_strings_vm_owned);
@@ -715,6 +730,59 @@ pub fn sourceBackingFootprint(sb: ProtoTreeOwner.SourceBacking) usize {
     total += sb.name_copies.items.len * @sizeOf([]const u8);
     // external_borrow: NOT counted — caller-owned, not our memory.
     return total;
+}
+
+// ---------------------------------------------------------------------------
+// Constant access helpers (CUT1: dual representation elimination)
+// ---------------------------------------------------------------------------
+//
+// For COMPILED (text) trees, `proto.k` (Constant[]) holds the compile-time
+// constant pool and `proto.resolved_values` (Value[]) holds the runtime
+// values built at adoption — both arrays exist (double storage, needed
+// because k holds compile-time Constant that must survive for source/debug
+// info and dump round-trips).
+//
+// For UNDUMPED (binary) trees after adoption, CUT1 aliases resolved_values
+// onto the SAME allocation as k via in-place Constant→Value conversion
+// (both are 16B, align 8; .int→.Int, .num_bits→.Num, .str→.String are
+// value-preserving rewrites). After conversion, k.len==0 and
+// resolved_values is the single constant array. This mirrors PUC Lua,
+// where Proto.k IS the runtime TValue array (no separate compile-time
+// representation).
+//
+// Invariant: "undumped trees have k.len==0 and resolved_values as the
+// single constant array (aliased onto the original k allocation);
+// compiled trees have both k (compile-time Constant) and resolved_values
+// (runtime Value)."
+//
+// These helpers let readers (dump, debug, disassembly) access constants
+// uniformly regardless of which representation is active.
+
+/// Read the constant at index `kidx` from whichever array is active:
+/// `proto.k` for compiled trees (or undumped trees before adoption),
+/// `proto.resolved_values` for undumped trees after adoption (aliased).
+/// Returns null if kidx is out of range or the Value is not a
+/// constant-type (nil/bool/int/num/string).
+pub fn protoConstAt(proto: *const Proto, kidx: usize) ?Constant {
+    if (kidx < proto.k.len) return proto.k[kidx];
+    if (kidx < proto.resolved_values.len) {
+        return switch (proto.resolved_values[kidx]) {
+            .Nil => .nil,
+            .Bool => |b| .{ .bool = b },
+            .Int => |i| .{ .int = i },
+            .Num => |n| .{ .num_bits = @bitCast(n) },
+            .String => |s| .{ .str = s },
+            else => null,
+        };
+    }
+    return null;
+}
+
+/// Number of constants in this proto. For compiled trees, k.len; for
+/// undumped trees after adoption (k.len==0), resolved_values.len.
+pub fn protoConstCount(proto: *const Proto) usize {
+    if (proto.k.len > 0) return proto.k.len;
+    return proto.resolved_values.len;
 }
 
 // ---------------------------------------------------------------------------
@@ -1351,6 +1419,7 @@ pub fn dumpProto(w: anytype, proto: *const Proto, depth: u32) !void {
     }
 
     // Summary line: params, slots, upvalues, locals, constants, functions.
+    const k_count_summary = protoConstCount(proto);
     try w.print("{s}{d}{s} params, {d} slots, {d} upvalue{s}, {d} local{s}, {d} constant{s}, {d} function{s}\n", .{
         indent,
         proto.numparams,
@@ -1360,8 +1429,8 @@ pub fn dumpProto(w: anytype, proto: *const Proto, depth: u32) !void {
         if (proto.upvalues.len != 1) "s" else "",
         proto.locvars.len,
         if (proto.locvars.len != 1) "s" else "",
-        proto.k.len,
-        if (proto.k.len != 1) "s" else "",
+        k_count_summary,
+        if (k_count_summary != 1) "s" else "",
         proto.p.len,
         if (proto.p.len != 1) "s" else "",
     });
@@ -1419,36 +1488,36 @@ pub fn dumpProto(w: anytype, proto: *const Proto, depth: u32) !void {
             .addk, .subk, .mulk, .modk, .powk, .divk, .idivk,
             .bandk, .bork, .bxork => {
                 var buf: [64]u8 = undefined;
-                const kstr = formatConst(&buf, proto.k[inst.c]);
+                const kstr = formatConst(&buf, protoConstAt(proto, inst.c) orelse .nil);
                 try w.print("\t{d}\t{d}\t{d}\t; {s}", .{ inst.a, inst.b, inst.c, kstr });
             },
 
             // LOADK: show constant value.
             .loadk => {
                 var buf: [64]u8 = undefined;
-                const kstr = formatConst(&buf, proto.k[inst.b]);
+                const kstr = formatConst(&buf, protoConstAt(proto, inst.b) orelse .nil);
                 try w.print("\t{d}\t{d}\t; {s}", .{ inst.a, inst.b, kstr });
             },
 
             // GETFIELD/SETFIELD/SELF/GETTABUP/SETTABUP: show string key.
             .getfield, .self => {
                 var buf: [64]u8 = undefined;
-                const kstr = formatConst(&buf, proto.k[inst.c]);
+                const kstr = formatConst(&buf, protoConstAt(proto, inst.c) orelse .nil);
                 try w.print("\t{d}\t{d}\t{d}\t; {s}", .{ inst.a, inst.b, inst.c, kstr });
             },
             .setfield => {
                 var buf: [64]u8 = undefined;
-                const kstr = formatConst(&buf, proto.k[inst.b]);
+                const kstr = formatConst(&buf, protoConstAt(proto, inst.b) orelse .nil);
                 try w.print("\t{d}\t{d}\t{d}\t; {s}", .{ inst.a, inst.b, inst.c, kstr });
             },
             .gettabup => {
                 var buf: [64]u8 = undefined;
-                const kstr = formatConst(&buf, proto.k[inst.c]);
+                const kstr = formatConst(&buf, protoConstAt(proto, inst.c) orelse .nil);
                 try w.print("\t{d}\t{d}\t{d}\t; {s}", .{ inst.a, inst.b, inst.c, kstr });
             },
             .settabup => {
                 var buf: [64]u8 = undefined;
-                const kstr = formatConst(&buf, proto.k[inst.b]);
+                const kstr = formatConst(&buf, protoConstAt(proto, inst.b) orelse .nil);
                 try w.print("\t{d}\t{d}\t{d}\t; {s}", .{ inst.a, inst.b, inst.c, kstr });
             },
 
@@ -1514,11 +1583,13 @@ pub fn dumpProto(w: anytype, proto: *const Proto, depth: u32) !void {
     }
 
     // Constants table.
-    if (proto.k.len > 0) {
-        try w.print("constants ({d}) for {s}:\n", .{ proto.k.len, proto.source_name });
-        for (proto.k, 0..) |c, idx| {
+    const k_count = protoConstCount(proto);
+    if (k_count > 0) {
+        try w.print("constants ({d}) for {s}:\n", .{ k_count, proto.source_name });
+        var idx: usize = 0;
+        while (idx < k_count) : (idx += 1) {
             var buf: [64]u8 = undefined;
-            const kstr = formatConst(&buf, c);
+            const kstr = formatConst(&buf, protoConstAt(proto, idx) orelse .nil);
             try w.print("{s}\t{d}\t{s}\n", .{ indent, idx, kstr });
         }
     }

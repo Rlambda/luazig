@@ -253,7 +253,10 @@ def main() -> int:
     zig_components: dict[str, int] = {}
     if zig_sizes:
         zig_components["Proto_struct"] = zig_sizes["Proto"]
-        zig_components["k_array"] = k_len * zig_sizes["Constant"]
+        # CUT1: for undumped trees after adoption, k is aliased to
+        # resolved_values (in-place Constant→Value conversion). k_array
+        # is 0 (k.len==0); resolved_values is the single constant array.
+        zig_components["k_array"] = 0  # CUT1: aliased to resolved_values
         zig_components["upvalues_array"] = upvalues_len * zig_sizes["Upvaldesc"]
         zig_components["resolved_values"] = k_len * zig_sizes["Value"]
         zig_components["ProtoTreeOwner"] = zig_sizes["ProtoTreeOwner"]
@@ -329,13 +332,14 @@ def main() -> int:
         "deviation_explanation": (
             "Honest charge exceeds PUC's 400-byte gate due to structural "
             "overhead: ProtoTreeOwner (144B, PUC has none), SourceBacking "
-            "(96B, PUC has none), resolved_values (48B, PUC's k IS runtime "
+            "(88B, PUC has none), resolved_values (48B, PUC's k IS runtime "
             "format), larger GC structs (Proto +56, Closure +48, Cell +24, "
-            "Upvaldesc +8). Getting under 400 requires eliminating "
-            "ProtoTreeOwner + SourceBacking + resolved_values — larger "
-            "structural changes (Proto-as-GC-object, lazy resolved_values, "
-            "or per-exec k-pool conversion). Per verifier allowance, honest "
-            "accounting is kept and the deviation is documented."
+            "Upvaldesc +8). CUT1 eliminated the duplicate k array for "
+            "undumped trees (aliased to resolved_values, -48B). Getting "
+            "under 400 requires eliminating ProtoTreeOwner + SourceBacking "
+            "— larger structural changes (Proto-as-GC-object / merge owner "
+            "into root Proto). Per verifier allowance, honest accounting is "
+            "kept and the deviation is documented."
         ) if verdict == "DEVIATION" else (
             "Honest charge is under PUC's 400-byte gate."
         ),

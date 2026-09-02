@@ -328,9 +328,14 @@ pub const DumpWriter = struct {
         }
 
         // 10. Constants: length prefix, then each via dumpConstant.
-        try self.writeU32(@intCast(proto.k.len));
-        for (proto.k) |c| {
-            try self.dumpConstant(c);
+        // CUT1: for undumped trees after adoption, k.len==0 and constants
+        // live in resolved_values (aliased). Use protoConstCount/At helpers
+        // to read from whichever array is active.
+        const k_count = bc.protoConstCount(proto);
+        try self.writeU32(@intCast(k_count));
+        var ki: usize = 0;
+        while (ki < k_count) : (ki += 1) {
+            try self.dumpConstant(bc.protoConstAt(proto, ki) orelse .nil);
         }
 
         // 11. Upvalues: length prefix, then each as (instack, idx, is_const, name).

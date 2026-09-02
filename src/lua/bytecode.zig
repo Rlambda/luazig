@@ -613,7 +613,12 @@ pub const ProtoTreeOwner = struct {
 /// string table (or are `undefined` in no-callback undump unit tests) and
 /// are never touched.
 pub fn destroyProtoTree(alloc: std.mem.Allocator, root: *Proto, k_strings_vm_owned: bool) void {
-    alloc.free(root.code);
+    // PUC PF_FIXED parity: when fixed_arrays is set, code and lineinfo are
+    // borrowed from the input buffer (not tree-owned). Skip freeing them —
+    // the input buffer's lifetime is managed by source_backing (pinned on
+    // the ProtoTreeOwner). PUC's luaF_freeproto (lfunc.c:285-287) does the
+    // same check via `PF_FIXED` on `f->flag`.
+    if (!root.fixed_arrays) alloc.free(root.code);
     if (!k_strings_vm_owned) {
         for (root.k) |c| {
             if (c == .str) vm.destroyLuaString(alloc, c.str);
@@ -626,7 +631,7 @@ pub fn destroyProtoTree(alloc: std.mem.Allocator, root: *Proto, k_strings_vm_own
     }
     alloc.free(root.p);
     alloc.free(root.upvalues);
-    alloc.free(root.lineinfo);
+    if (!root.fixed_arrays) alloc.free(root.lineinfo);
     alloc.free(root.locvars);
     if (root.live_reg_top.len > 0) alloc.free(root.live_reg_top);
     if (root.resolved_values.len > 0) alloc.free(root.resolved_values);
@@ -646,17 +651,27 @@ pub fn destroyProtoTree(alloc: std.mem.Allocator, root: *Proto, k_strings_vm_own
 ///     at resolution; the interned replacements are already charged).
 ///   - The ProtoTreeOwner struct and SourceBacking (added separately by
 ///     `chargeTreeFootprint` in vm.zig).
+///   - BORROWED code/lineinfo arrays when `fixed_arrays` is set (PUC
+///     PF_FIXED parity: these point into the input buffer, which is pinned
+///     by source_backing and already charged as a GC object — the LuaString
+///     holding the binary chunk). Excluding them here is what makes
+///     `collectgarbage("count")` rise < 400 bytes after a fixed-buffer
+///     binary load (api.lua:580), matching PUC Lua's behavior where
+///     `luaF_freeproto` skips freeing code when PF_FIXED is set.
 ///
 /// This is the amount charged to `gc_count_kb` at adoption and credited
 /// at last release, mirroring PUC Lua where Proto IS a GC object charged
 /// at `luaC_newobj(L, LUA_VPROTO, sizeof(Proto))`.
 pub fn protoTreeFootprint(root: *const Proto) usize {
     var total: usize = @sizeOf(Proto);
-    total += root.code.len * @sizeOf(Instruction);
+    // PUC PF_FIXED: exclude borrowed code/lineinfo from the footprint.
+    if (!root.fixed_arrays) {
+        total += root.code.len * @sizeOf(Instruction);
+        total += root.lineinfo.len * @sizeOf(u32);
+    }
     total += root.k.len * @sizeOf(Constant);
     total += root.p.len * @sizeOf(*Proto);
     total += root.upvalues.len * @sizeOf(Upvaldesc);
-    total += root.lineinfo.len * @sizeOf(u32);
     total += root.locvars.len * @sizeOf(LocVar);
     total += root.live_reg_top.len * @sizeOf(u8);
     total += root.resolved_values.len * @sizeOf(vm.Value);
@@ -744,6 +759,16 @@ pub const Proto = struct {
     /// (for named varargs like `function f(x...)`). The VM creates the
     /// table at function entry and stores it in this register.
     vararg_table_reg: ?u8 = null,
+
+    // --- PUC PF_FIXED parity (fixed-buffer undump) ---
+    /// When true, `code` and `lineinfo` are BORROWED from the input buffer
+    /// (PUC's PF_FIXED flag, set by `lundump.c` when mode contains 'B').
+    /// `destroyProtoTree` skips freeing them, and `protoTreeFootprint`
+    /// excludes them from the GC memory charge. The input buffer is pinned
+    /// alive by `ProtoTreeOwner.source_backing` for the tree's lifetime.
+    /// Only set by `UndumpReader.undumpProto` in fixed mode; text-compiled
+    /// protos always own their arrays (flag = false).
+    fixed_arrays: bool = false,
 
     // NOTE: there is no `deinit` method. The tree deinit is STRUCTURAL and
     // lives in `destroyProtoTree` above, invoked either through

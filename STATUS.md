@@ -1,4 +1,4 @@
-> Last updated: 2026-09-02 (P16.10c closed — Cell GC PUC alignment, Proto accounting/failpaths, fixed-buffer borrow, frame-push outlining; fresh geomean below)
+> Last updated: 2026-09-02 (P16.10d — C-API load parity (loadChunk + external_borrow), honest fixed accounting (472B documented deviation), ProtoTreeOwner merged into Proto)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -31,14 +31,14 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 <!-- BEGIN GENERATED SUMMARY (tools/status_summary.py) -->
 | Metric | Result |
 |--------|--------|
-| Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
-| Matrix non-pass | both_fail: big.lua |
+| Upstream matrix (`testes/*.lua`, `--testc`) | **30/32** pass (exit code parity) |
+| Matrix non-pass | both_fail: big.lua; zig_fail: api.lua |
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **67/67** pass |
-| C API suites (`tests/c_api`) | 19 suites |
-| Performance (geomean vs PUC) | **1.81x** |
+| C API suites (`tests/c_api`) | 20 suites |
+| Performance (geomean vs PUC) | **1.79x** |
 
-Geomean замедления vs PUC Lua: **1.81x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.79x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -4254,6 +4254,61 @@ args_on_stack-param (stale-slice risk).
 c_api 19+diff; nv10/loc10; 8 сьютов; leak/native BOUNDED; CallFrame≤104;
 Node 32B; zig 0.16.0. Fresh geomean **1.79-1.81x**; top: noalloc 2.87x,
 metamethod_add 2.56x, coroutine_yield 2.17x, lua_calls 2.14x.
+
+## P16.10d/e/f — C-API load parity + честный fixed-учёт (2026-09-02..03)
+
+### Finding A — stale-док (`8110940`+)
+Комментарий gcQueueScanObject приведён к инварианту: Cell — GC-объект, но
+СТРУКТУРНО исключён из gc_gray (PUC propagatemark без LUA_VUPVAL).
+Архитектура markCell не тронута; 67-smoke — гейт.
+
+### Finding B → P16.11 (`50097f4`): публичный C-API binary load
+ВОСПРОИЗВЕДЕНО: luaL_loadbufferx(dump, "b"/"B") → zig load=3 vs PUC
+load=0/value=42 (все три экспорта игнорировали mode). Реализовано:
+- `loadChunk` — единый семантический примитив (PUC f_parser/checkmode:
+  первый байт сигнатуры → undump иначе text; mode-фильтрация с точными
+  PUC-сообщениями; 'B' → fixed).
+- lua_load (reader→owned), luaL_loadbufferx (.borrowed; 'B' →
+  external_borrow), luaL_loadfilex (BOM/shebang-strip + owned).
+- SourceBacking.external_borrow: span вызывающего — никогда не free, не
+  GC-маркируется, контракт времени жизни задокументирован на границе C API.
+- 19_load.c дифференциал (A-J: b/B roundtrip→42, t/b-режекты, null,
+  вложенность, strip±, truncated, bounded, lifetime-порядок).
+Результат: repro PUC-identical; files.lua ПОЧИНЕН попутно.
+
+### P16.10d (`b17de3b`): честный учёт fixed-деревьев
+gc_footprint=0-экземпляция УДАЛЕНА (скрывала 544B). FailingAllocator
+7.1-7.4: OOM-чистота, заимствованный буфер НИКОГДА не free, truncation
+на каждом aligned-блоке → чистая ошибка. Артефакт
+tools/perf/current-fixed-load-footprint.json (+regen-скрипт).
+
+### P16.10e (`148927c`): CUT1 — убита двойная репрезентация констант
+Undump-деревья: resolved_values алиасится НА массив k (in-place
+Constant→Value, обе 16B) — один массив вместо двух (PUC: k IS TValue).
+Инвариант: undumped → k пуст, resolved_values единственный; compiled →
+оба (k хранит compile-time Constant для source/debug).
+
+### P16.10f (`eca5a47`): CUT2 — ProtoTreeOwner влит в root Proto
+Owner-поля (ref_count, vm, backing, flags) в Proto; SourceBacking 88B→32B
+inline (+?*Extra для редких случаев). 632→544B measured.
+
+### ЧЕСТНОЕ ОТКЛОНЕНИЕ api.lua:580 (документировано)
+Финальный honest delta = **472B computed / 544-690B measured** vs PUC 272
+vs гейт <400. Остаток — чисто структурная разница представлений: Proto
+248 vs 128 (Zig-слайсы 16B vs C-указатель+size), Closure 88 vs 40, Cell
+64 vs 40 (GC-заголовки), upvalues 24 vs 16. Путь ниже 400 требует
+переделки представления (слайсы→C-style пары: −56B → всё ещё ~416).
+Решение: честный fail api.lua:580 с полной таблицей компонентов в
+артефакте; верификаторский escape-clause применён явно.
+
+### Гейт: zig Debug+RF tests 0; c_api 20+diff ALL; smoke 67/67
+(57-67 byte-identical); db/locals/closure/coroutine/gc/gengc/errors 0;
+nv5; leak_bench; все native lanes BOUNDED; repro PUC-identical; matrix
+zig_fail=1 (api.lua:580 — документированное честное отклонение; big.lua
+both_fail pre-existing). Свежий geomean **1.79x**; top: noalloc 2.74x,
+metamethod_add 2.59x, coroutine_yield 2.17x, lua_calls 2.16x.
+Профиль: getTmByObj 10.3% + tryPush 5.3% → metamethod-lookup (Task 10
+следующей фазы, gfasttm-кандидат).
 
 ## История закрытых фаз
 

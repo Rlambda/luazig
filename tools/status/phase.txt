@@ -1,1 +1,1 @@
-P16.10c closed — Cell GC PUC alignment, Proto accounting/failpaths, fixed-buffer borrow, frame-push outlining; fresh geomean below
+P16.10d — C-API load parity (loadChunk + external_borrow), honest fixed accounting (472B documented deviation), ProtoTreeOwner merged into Proto

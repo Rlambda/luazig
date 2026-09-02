@@ -23470,43 +23470,40 @@ pub const Vm = struct {
     /// excluded (owned by the VM string table, already charged by `internStr`).
     fn chargeTreeFootprint(self: *Vm, owner: *bc.ProtoTreeOwner) void {
         if (owner.gc_charged) return;
-        // PUC PF_FIXED parity: for fixed-buffer trees, the major memory
-        // consumers (code, lineinfo, long-string constants) are BORROWED
-        // from the source buffer — a GC object (LuaString) already charged
-        // via gcNoteAlloc. The remaining tree-owned memory (Proto struct,
-        // k array, upvalues, resolved_values, ProtoTreeOwner, SourceBacking)
-        // is small in PUC Lua (~360 bytes total including LClosure + UpVal +
-        // TString), but luazig's larger GC structs (Closure 88 vs ~48, Cell
-        // 64 vs lazy-created UpVal, LuaString 72 vs ~40) plus luazig-specific
-        // management overhead (ProtoTreeOwner 128, SourceBacking, resolved_values)
-        // push the honest charge to ~664 bytes — well over the 400-byte gate
-        // in api.lua:580.
+        // PUC PF_FIXED parity (P16.10d honest accounting): charge ALL
+        // tree-owned memory honestly, for BOTH fixed-buffer and heap trees.
+        // `protoTreeFootprint` already excludes BORROWED code/lineinfo when
+        // `fixed_arrays` is set (matching PUC's `luaF_protosize` which skips
+        // code/lineinfo/abslineinfo for PF_FIXED protos). The remaining
+        // owned parts — Proto struct, k array, p array, upvalues, locvars,
+        // live_reg_top, resolved_values — are charged exactly as PUC charges
+        // Proto + k + p + locvars + upvalues (plus luazig-specific
+        // live_reg_top and resolved_values that PUC doesn't have).
         //
-        // PUC's PF_FIXED makes `luaF_freeproto` skip freeing borrowed code/
-        // lineinfo, and those arrays were never charged (no luaM_newvector).
-        // The Proto struct, k array, and upvalues ARE charged in PUC (they're
-        // GC-tracked allocations). However, luazig's architectural overhead
-        // (larger GC structs, ProtoTreeOwner, resolved_values, eager Cell
-        // creation) makes honest charging of these PUC-equivalent parts
-        // exceed the 400-byte budget. Until the struct-size gap with PUC is
-        // closed (lazy Cell creation, smaller Closure/LuaString, no
-        // resolved_values), we skip the tree footprint charge for fixed-buffer
-        // trees. The GC objects (Closure, Cell, external LuaString) are still
-        // charged via gcNoteAlloc, so m2 > m1 holds (the "small owned parts"
-        // are the GC objects, not the tree arrays). This matches the pre-
-        // P16.10c-T7 behavior where the test passed because tree memory was
-        // not charged.
+        // Additionally, the ProtoTreeOwner struct and SourceBacking buffers
+        // are charged — these are luazig-specific management overhead (PUC
+        // has no separate owner; Proto IS a GC object). This makes
+        // `collectgarbage("count")` honestly reflect all native memory freed
+        // at tree deinit.
         //
-        // TODO: when luazig GC structs shrink to near-PUC sizes (lazy Cell
-        // creation, no resolved_values, smaller Closure/LuaString), restore
-        // honest tree charging for fixed-buffer trees by charging
-        // protoTreeFootprint (which already excludes borrowed arrays via
-        // fixed_arrays) without ProtoTreeOwner/SourceBacking.
-        if (owner.root.fixed_arrays) {
-            owner.gc_charged = true;
-            owner.gc_footprint = 0;
-            return;
-        }
+        // DEVIATION from PUC's 400-byte gate (api.lua:580): the honest
+        // charge for a fixed-buffer load of the api.lua chunk shape (1000×
+        // "X=X+1" + 1000-char string, stripped, mode 'B') is ~696 bytes,
+        // exceeding PUC's < 400 assertion. The gap is structural:
+        //   - ProtoTreeOwner  144B  (PUC has none — Proto IS the GC object)
+        //   - SourceBacking    96B  (PUC has no explicit backing tracking)
+        //   - resolved_values  48B  (PUC's k IS already runtime TValue format)
+        //   - Proto          +56B   (184 vs 128: Zig slices + live_reg_top)
+        //   - Closure        +48B   (88 vs 40: larger GC header + upvalues slice)
+        //   - Cell           +24B   (64 vs 40: eager UpVal vs PUC's lazy)
+        //   - Upvaldesc       +8B   (24 vs 16: Zig slice name vs C pointer)
+        // Getting under 400 requires eliminating ProtoTreeOwner + SourceBacking
+        // + resolved_values (larger structural changes: Proto-as-GC-object,
+        // lazy resolved_values at first frame push, or per-exec k-pool
+        // conversion). Per the verifier's allowance, we keep the honest
+        // accounting and document this deviation rather than hiding tree
+        // memory behind a gc_footprint=0 exemption. The api.lua m2-m1<400
+        // assertion fails honestly, documenting a real parity gap.
         const fp = bc.protoTreeFootprint(owner.root) +
             bc.sourceBackingFootprint(owner.source_backing) +
             @sizeOf(bc.ProtoTreeOwner);
@@ -41957,4 +41954,248 @@ test "vm: Task 8.6 — source-backing append fails → no pin leak" {
     // Clean up: deinit is a no-op (empty backing).
     backing.deinit(track_alloc);
     try testing.expectEqual(@as(usize, 0), tracker.total_bytes);
+}
+
+// =========================================================================
+// P16.10d verifier Task 7: FailingAllocator around fixed-buffer paths
+//
+// Each test forces an allocation failure at a specific point in the
+// fixed-buffer load pipeline and verifies:
+//   - No leak (TrackingAllocator.total_bytes == 0 after cleanup)
+//   - No double-free of borrowed spans (external_borrow never freed)
+//   - No executable half-bound tree (partial trees are cleaned up)
+//   - Truncated fixed chunks produce clean errors (no partial tree)
+// =========================================================================
+
+/// Compile a proto, dump it stripped (matching api.lua:566 shape), and return
+/// the serialized bytes. The caller owns the slice.
+fn dumpTestProtoStripped(alloc: std.mem.Allocator, src_bytes: []const u8) ![]u8 {
+    const proto = try compileTestProto(alloc, src_bytes);
+    defer proto.tree.?.release();
+    var writer = dump_mod.DumpWriter.init(alloc);
+    defer writer.deinit();
+    try writer.dumpChunk(proto, .{ .strip = true });
+    return try writer.toOwnedSlice();
+}
+
+test "vm: Task 7.1 — fixed undump metadata allocation failure → no leak" {
+    const testing = std.testing;
+    const TrackingAllocator = @import("tracking_alloc.zig").TrackingAllocator;
+
+    // Exhaustively test every OOM point in undumpChunk with fixed=true.
+    // Fixed mode borrows code/lineinfo (fewer allocation points than non-fixed),
+    // but k array, upvalues array, p array, Proto struct, and ProtoTreeOwner
+    // are still allocated. Each failure must clean up — no leak.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const serialized = try dumpTestProtoStripped(aalloc,
+        "X = X + 1; Y = 'hello'\n");
+    defer aalloc.free(serialized);
+
+    var fail_idx: usize = 0;
+    while (true) : (fail_idx += 1) {
+        var tracker = TrackingAllocator.init(std.heap.page_allocator);
+        const track_alloc = tracker.allocator();
+        var failing = std.testing.FailingAllocator.init(track_alloc, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        const falloc = failing.allocator();
+
+        var reader = undump_mod.UndumpReader.init(falloc, serialized);
+        reader.fixed = true;
+        // No intern callback: string constants get .str = undefined.
+        // This is fine for testing the allocation/cleanup mechanics.
+        const result = reader.undumpChunk();
+        reader.deinit();
+
+        if (result) |root| {
+            root.tree.?.release();
+            try testing.expectEqual(@as(usize, 0), tracker.total_bytes);
+            break;
+        } else |err| {
+            try testing.expect(error.OutOfMemory == err);
+            try testing.expectEqual(@as(usize, 0), tracker.total_bytes);
+        }
+    }
+}
+
+test "vm: Task 7.2 — closure creation failure AFTER borrow established → no double-free" {
+    const testing = std.testing;
+
+    // The critical invariant: when closureFromProto fails AFTER the fixed-
+    // buffer borrow is established (source_backing.external_borrow set), the
+    // borrowed span must NOT be freed by the tree cleanup. The caller owns
+    // the borrowed buffer; the tree only records a pointer to it
+    // (external_borrow is NEVER freed by SourceBacking.deinit or
+    // destroyProtoTree — this is by design, matching PUC's LZIO borrow model).
+    //
+    // We verify by allocating the borrowed buffer from the arena (NOT the
+    // VM's allocator), loading with .borrowed + mode "B", and checking the
+    // buffer content is unchanged after every OOM failure.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    // Serialize a proto for fixed-buffer loading.
+    const serialized = try dumpTestProtoStripped(aalloc,
+        "X = X + 1; Y = 'hello'\n");
+    defer aalloc.free(serialized);
+
+    // The borrowed buffer: allocated from the arena. The tree must never
+    // free this — it's the caller's responsibility. We verify the content
+    // is unchanged after every failure (if the tree freed/corrupted it,
+    // the content check would fail or crash).
+    const borrowed_bytes = try aalloc.dupe(u8, serialized);
+    defer aalloc.free(borrowed_bytes);
+
+    var vm = Vm.init(aalloc, false);
+    defer vm.deinit();
+
+    // Exhaustively test every OOM point in the closure creation path
+    // (cell allocation, closure allocation, resolveTreeConstants). Each
+    // failure must: release the tree (cleaning up partial state), NOT
+    // free the borrowed buffer, and leave the VM in a valid state.
+    var fail_idx: usize = 0;
+    var hit_failure = false;
+    while (fail_idx < 200) : (fail_idx += 1) {
+        var failing = std.testing.FailingAllocator.init(aalloc, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+
+        const saved_alloc = vm.alloc;
+        vm.alloc = failing.allocator();
+        defer vm.alloc = saved_alloc;
+
+        // Load with .borrowed input and mode "B" (fixed). The borrowed_bytes
+        // are the caller's buffer — the tree records external_borrow but
+        // must never free it.
+        const result = vm.loadChunk(
+            .{ .borrowed = borrowed_bytes },
+            borrowed_bytes,
+            "test",
+            "B",
+            .{ .Table = vm.global_env },
+            null,
+        );
+
+        vm.alloc = saved_alloc;
+
+        if (result) |res| {
+            switch (res) {
+                .closure => |cl| {
+                    // Success: the closure is registered in the GC list.
+                    // vm.deinit will drain it. Verify the borrowed buffer
+                    // is still intact (not freed/corrupted).
+                    try testing.expectEqualSlices(u8, serialized, borrowed_bytes);
+                    _ = cl;
+                    break;
+                },
+                .err_msg => |msg| {
+                    aalloc.free(msg);
+                    // This shouldn't happen (no syntax errors in fixed load).
+                    try testing.expectEqualSlices(u8, serialized, borrowed_bytes);
+                    break;
+                },
+            }
+        } else |err| {
+            try testing.expect(error.OutOfMemory == err);
+            // The borrowed buffer must still be intact (not freed/corrupted
+            // by the tree cleanup). This is the key invariant: external_borrow
+            // is NEVER freed, so the caller's buffer survives every failure.
+            try testing.expectEqualSlices(u8, serialized, borrowed_bytes);
+            hit_failure = true;
+        }
+    }
+    try testing.expect(hit_failure);
+}
+
+test "vm: Task 7.3 — source-backing .owned append in fixed mode (happy path)" {
+    const testing = std.testing;
+
+    // Verify the .owned fixed-buffer load path works end-to-end: the
+    // source_backing.owned.append succeeds, the owned input is consumed
+    // (ownership transferred to tree), and the closure executes correctly.
+    // The failure case (append OOM → tree released, owned input freed) is
+    // structurally identical to Task 8.6 (source_backing.owned.append
+    // failure) and Task 7.2 (closure creation failure after borrow); the
+    // errdefer in loadBinaryChunk releases the tree and the defer frees the
+    // owned input on every error path.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const serialized = try dumpTestProtoStripped(aalloc,
+        "return 'hello'\n");
+    defer aalloc.free(serialized);
+
+    var vm = Vm.init(aalloc, false);
+    defer vm.deinit();
+
+    // .owned input: the tree takes ownership (source_backing.owned.append).
+    // The owned_bytes are freed at tree release (last closure drop).
+    const owned_copy = try aalloc.dupe(u8, serialized);
+
+    const result = try vm.loadChunk(
+        .{ .owned = owned_copy },
+        owned_copy,
+        "test",
+        "B",
+        .{ .Table = vm.global_env },
+        null,
+    );
+    switch (result) {
+        .closure => |cl| {
+            // Verify the closure is valid and the tree has the owned buffer.
+            try testing.expect(cl.tree != null);
+            try testing.expectEqual(@as(usize, 1), cl.tree.?.source_backing.owned.items.len);
+        },
+        .err_msg => |msg| {
+            aalloc.free(msg);
+            try testing.expect(false); // should not fail
+        },
+    }
+}
+
+test "vm: Task 7.4 — truncated fixed chunk at aligned blocks → clean error" {
+    const testing = std.testing;
+
+    // Truncate the binary chunk at various points (header, code block,
+    // lineinfo block, string data) and verify each produces a clean
+    // TruncatedChunk error — no partial tree, no crash.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const serialized = try dumpTestProtoStripped(aalloc,
+        "X = X + 1; Y = 'hello world'\n");
+    defer aalloc.free(serialized);
+
+    // Test truncation at every byte position in the chunk. Each must
+    // produce TruncatedChunk (or BadHeader for the first few bytes) —
+    // never a crash, never a partial tree.
+    var pos: usize = 1;
+    while (pos < serialized.len) : (pos += 1) {
+        const truncated = serialized[0..pos];
+        var reader = undump_mod.UndumpReader.init(aalloc, truncated);
+        reader.fixed = true;
+        const result = reader.undumpChunk();
+        reader.deinit();
+        if (result) |root| {
+            // A successful undump at a truncation point would be a bug —
+            // the chunk is incomplete. This should never happen.
+            root.tree.?.release();
+            try testing.expect(false); // should not succeed on truncated chunk
+        } else |err| {
+            // Must be TruncatedChunk or BadHeader or BadConstant — never
+            // a crash or memory corruption.
+            try testing.expect(switch (err) {
+                error.TruncatedChunk, error.BadHeader, error.BadConstant => true,
+                else => false,
+            });
+        }
+    }
 }

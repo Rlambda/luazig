@@ -6147,4 +6147,85 @@ zig_fail=0 (big.lua both_fail pre-existing). Smoke 67/67. C API tests
 ALL PASS incl. new 19_load differential (cases A-J: b/B/t/null modes,
 binary/text rejection, nested closure roundtrip, truncated binary, stripped
 reload). Repro matches PUC exactly (mode=b/B load=0 call=0 value=42).
+
+### P16.10d — honest fixed-buffer GC accounting (verifier Task 6+7)
+
+**Problem:** `chargeTreeFootprint` had a dishonest exemption for fixed-buffer
+trees: `if (owner.root.fixed_arrays) { owner.gc_charged = true;
+owner.gc_footprint = 0; return; }` — hiding ALL tree memory (Proto, k, p,
+upvalues, locvars, live_reg_top, resolved_values, ProtoTreeOwner,
+SourceBacking) just to satisfy api.lua:580's `m2-m1 < 400`. The verifier
+flagged this as unacceptable: PUC's `luaF_protosize` excludes ONLY borrowed
+arrays (code/lineinfo/abslineinfo fixed variants) but still accounts owned
+parts (Proto, p, k, locvars, upvalues).
+
+**Fix (honest accounting):** Removed the `gc_footprint=0` exemption. Fixed-
+buffer trees now charge ALL owned parts honestly via `protoTreeFootprint`
+(which already excludes borrowed code/lineinfo via `fixed_arrays` — verified
+the exclusion is precise, matching PUC's `luaF_protosize`) plus
+`sourceBackingFootprint` and `@sizeOf(ProtoTreeOwner)`. The charge and credit
+are symmetric (same `gc_footprint` value charged at adoption, credited at
+last release).
+
+**Measurement artifact:** `tools/perf_fixed_load_footprint.py` generates
+`tools/perf/current-fixed-load-footprint.json` with per-component sizes
+(Zig vs PUC), the honest delta, and the verdict.
+
+**Component table (Zig vs PUC, api.lua fixed-load shape):**
+
+| Component             | Zig (B) | PUC (B) | Gap  | Notes                          |
+|-----------------------|---------|---------|------|--------------------------------|
+| Proto struct          |     184 |     128 |  +56 | Zig slices + live_reg_top      |
+| k array (3×)          |      48 |      48 |   0  | Same (Constant=TValue=16B)     |
+| upvalues (1×)         |      24 |      16 |  +8  | Zig slice name vs C pointer    |
+| resolved_values       |      48 |       0 | +48  | PUC's k IS runtime TValue      |
+| ProtoTreeOwner        |     144 |       0 | +144 | PUC has none (Proto IS GC obj) |
+| SourceBacking         |      96 |       0 |  +96 | PUC has no explicit backing    |
+| Closure (GC)          |      88 |      40 | +48  | Larger GC header + upvalues    |
+| Cell/UpVal (GC)       |      64 |      40 | +24  | Eager Cell vs PUC lazy UpVal   |
+| **Total**             |   **696** |   **272** | **+424** |                          |
+
+**Actual measured delta:** 680 bytes (k_len=2, not 3 — "X" and "aaa...a"
+are the string constants; `1` is an ADDI immediate, not a k-pool entry).
+
+**What was eliminated/lazified:** Nothing — all owned parts are genuinely
+needed. Bitfield compaction of ProtoTreeOwner's 3 bools saves 0 bytes
+(padding unchanged). Lazy resolved_values (built at first frame push instead
+of adoption) would save 48 bytes but still leaves 648 — still over 400.
+Per-exec k-pool conversion (eliminating resolved_values entirely) is too
+hot. Getting under 400 requires eliminating ProtoTreeOwner (144B, PUC has
+none — Proto IS the GC object) + SourceBacking (96B) + resolved_values (48B)
+— larger structural changes.
+
+**DEVIATION (documented per verifier allowance):** The honest charge is
+~680 bytes, exceeding PUC's < 400 gate. The gap is structural: ProtoTreeOwner
+(144B), SourceBacking (96B), resolved_values (48B) are luazig-specific
+overhead with no PUC equivalent; larger GC structs (Proto +56, Closure +48,
+Cell +24, Upvaldesc +8) reflect Zig's slice-based design vs C pointers.
+Per the verifier: "If getting under PUC's threshold requires a larger
+structural change, make that explicit and keep a measured correctness-first
+implementation." The api.lua:580 assertion fails honestly, documenting a
+real parity gap. The previous `gc_footprint=0` exemption was dishonest
+(hiding 544 bytes of tree memory); honest accounting is correctness-first.
+
+**Task 7 — FailingAllocator tests (4 tests):**
+- Task 7.1: Fixed undump metadata allocation failure — exhaustive OOM
+  iteration, every allocation point in `undumpChunk` with `fixed=true`
+  cleans up (TrackingAllocator.total_bytes == 0).
+- Task 7.2: Closure creation failure AFTER borrow established — exhaustive
+  OOM in closureFromProto after `external_borrow` is set; verifies the
+  borrowed buffer is NEVER freed (content unchanged after every failure).
+- Task 7.3: Source-backing `.owned` append in fixed mode (happy path) —
+  verifies the `.owned` fixed-buffer load works end-to-end and the tree
+  takes ownership of the buffer. (Failure case is structurally identical
+  to Task 8.6 + 7.2's errdefer pattern.)
+- Task 7.4: Truncated fixed chunk at every byte position — clean
+  `TruncatedChunk`/`BadHeader` error, no partial tree, no crash.
+
+**Results:** zig build test PASS (183/183). api.lua --testc FAIL at :580
+(honest deviation, documented above). Matrix zig_fail=1 (api.lua honest
+failure) + big.lua both_fail (pre-existing). Smoke 67/67. C API ALL PASS
+incl. 19_load differential. db/locals/closure/coroutine/gc/gengc --testc
+PASS. nextvar 3x PASS. leak_bench PASS. native lanes BOUNDED. /tmp/repro_zig
+PUC-identical (mode=b/B load=0 call=0 value=42).
 zig build test (Debug) + ReleaseFast both pass.

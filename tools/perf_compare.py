@@ -24,11 +24,17 @@ import math
 import platform
 import statistics
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict
+
+# Shared provenance helpers live next to this script; make them importable
+# regardless of the caller's CWD.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import provenance
 
 # ---------------------------------------------------------------------------
 # Paths and constants
@@ -300,6 +306,9 @@ def collect_profile_index(core: str, out_dir: Path) -> dict:
     index = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "core": core,
+        # Provenance: zig-only lane — only luazig is profiled here, so no
+        # puc_binary_sha16 (see tools/provenance.py block()).
+        "provenance": provenance.block(zig_bin=ZIG_LUA),
         "workloads": results,
     }
     out_path = out_dir / "current-profile-index.json"
@@ -520,7 +529,10 @@ def run_snapshot_mode(args) -> int:
     out_dir = Path(args.snapshot_out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    zig_version = subprocess.check_output(["zig", "version"], text=True).strip()
+    zig_version = provenance.zig_version()
+    # Both binaries are measured in the timing and counters lanes, so both
+    # hashes apply; the profile index (zig-only) computes its own block.
+    prov = provenance.block(zig_bin=ZIG_LUA, puc_bin=PUC_LUA)
 
     # --- 1. Timing: median-of-N → current.json ---
     print(f"\n>> snapshot: timing {args.runs} runs each, pinned to core {args.core}")
@@ -536,6 +548,7 @@ def run_snapshot_mode(args) -> int:
     current = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "zig_version": zig_version,
+        "provenance": prov,
         "host": {
             "platform": platform.platform(),
             "python": platform.python_version(),
@@ -562,6 +575,7 @@ def run_snapshot_mode(args) -> int:
     counters_doc = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "zig_version": zig_version,
+        "provenance": prov,
         "mode": "counters",
         "runs": args.counters_runs,
         "core": args.core,

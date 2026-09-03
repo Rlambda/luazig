@@ -9,6 +9,11 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Shared provenance helpers live next to this script; make them importable
+# regardless of the caller's CWD.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import provenance
+
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
@@ -16,19 +21,13 @@ def repo_root() -> Path:
 
 def lane_metadata(argv: list[str]) -> dict:
     """Metadata stamped into the versioned JSON artifact so a reader can tell
-    exactly which lane/flags/host produced it. Zig version is captured cheaply
-    via `zig version` (fails soft to None)."""
-    zig_ver: str | None = None
-    try:
-        zig_ver = subprocess.check_output(
-            ["zig", "version"], stderr=subprocess.DEVNULL, text=True).strip()
-    except Exception:
-        zig_ver = None
+    exactly which lane/flags/host produced it. Zig version comes from the
+    shared provenance helper (fails soft to None)."""
     return {
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "lane": "smoke_compare",
         "argv": argv,
-        "zig_version": zig_ver,
+        "zig_version": provenance.zig_version(),
     }
 
 
@@ -196,6 +195,9 @@ def main() -> int:
     if args.json_out:
         payload = {
             "meta": lane_metadata(sys.argv),
+            # Provenance: the smoke lane executes BOTH engines, so both
+            # binary hashes apply (see tools/provenance.py block()).
+            "provenance": provenance.block(zig_bin=zig_lua, puc_bin=ref_lua),
             "total": len(results),
             "ok": sum(1 for r in results if r["match"]),
             "mismatches": bad,

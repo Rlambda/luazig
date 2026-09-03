@@ -30,11 +30,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Shared provenance helpers live next to this script; make them importable
+# regardless of the caller's CWD.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import provenance
 
 ROOT = Path(__file__).resolve().parents[1]
 ZIG_LUA = ROOT / "zig-out" / "bin" / "luazig"
@@ -44,29 +48,6 @@ PUC_LUA = ROOT / "build" / "lua-c" / "lua"
 def run(cmd: list[str], timeout_s: int = 120) -> tuple[int, str, str]:
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     return p.returncode, p.stdout, p.stderr
-
-def zig_version() -> str:
-    rc, out, _ = run(["zig", "version"])
-    return out.strip() if rc == 0 else "unknown"
-
-
-def git_head() -> str:
-    rc, out, _ = run(["git", "rev-parse", "--short", "HEAD"], )
-    return out.strip() if rc == 0 else "unknown"
-
-
-def git_dirty() -> str:
-    """Provenance: a dirty-tree measurement must never be labeled by HEAD alone."""
-    rc, out, _ = run(["git", "status", "--porcelain", "--untracked-files=no"], )
-    return "dirty" if out.strip() else "clean"
-
-
-def binary_sha(path) -> str:
-    import hashlib
-    try:
-        return hashlib.sha256(open(path, "rb").read()).hexdigest()[:16]
-    except OSError:
-        return "unknown"
 
 
 def build_all() -> None:
@@ -337,10 +318,10 @@ def main() -> int:
 
     payload = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
-        "zig_version": zig_version(),
-        "git_head": git_head(),
-        "git_dirty": git_dirty(),
-        "zig_binary_sha256_16": binary_sha(ROOT / "zig-out" / "bin" / "luazig"),
+        # Provenance: zig-only lane — the PUC side of this artifact comes from
+        # the vendored lua-5.5.0 headers (compiled by gcc for sizeof), not
+        # from the PUC binary, so no puc_binary_sha16 here.
+        "provenance": provenance.block(zig_bin=ZIG_LUA),
         "zig_sizes": zig_sizes,
         "puc_sizes": puc_sizes,
         "zig_components": zig_components,

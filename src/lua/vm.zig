@@ -3129,15 +3129,13 @@ pub const Vm = struct {
     /// Entries for fast-cached events (index..eq) are the 6 cached
     /// metamethods; entries above are for non-cached events (still useful
     /// for key comparison in `getTm` lookups).
-    tm_names: [@typeInfo(TmsEvent).@"enum".fields.len]?*LuaString =
-        [_]?*LuaString{null} ** @typeInfo(TmsEvent).@"enum".fields.len,
+    tm_names: [@typeInfo(TmsEvent).@"enum".fields.len]*LuaString = undefined,
     /// Pre-interned non-TMS metafield name strings, indexed by `MetaField`.
     /// These are the metamethod names that PUC does NOT include in `TMS`
     /// (`__pairs`, `__tostring`, `__name`, `__metatable`). PUC looks them up
     /// via `luaL_getmetafield` / `luaH_Hgetshortstr` with on-demand interning.
     /// We pre-intern them for the same pointer-identity fast path as `tm_names`.
-    metafield_names: [@typeInfo(MetaField).@"enum".fields.len]?*LuaString =
-        [_]?*LuaString{null} ** @typeInfo(MetaField).@"enum".fields.len,
+    metafield_names: [@typeInfo(MetaField).@"enum".fields.len]*LuaString = undefined,
     /// PUC lmathlib.c `setrandfunc`: the initial seed comes from
     /// `luaL_makeseed` which mixes `time(NULL)` + a stack address.
     /// We approximate with `std.time.timestamp()` + address of a local.
@@ -3846,14 +3844,21 @@ pub const Vm = struct {
         // Vm.init, explicit seed for lua_newstate/tests). It is never mutated
         // again — math.random/randomseed operate on the separate rng_state.
         vm.hash_seed = hash_seed;
-        vm.bootstrapGlobals() catch @panic("oom");
         // Pre-intern all metamethod name strings ("__index", "__newindex",
         // "__gc", "__mode", "__len", "__eq", "__add", ...). These are short
         // strings so they go through `string_intern` and deduplicate to a
         // single canonical *LuaString pointer. `fastTm`/`getTm` uses pointer
         // identity for key comparison, avoiding `internStrAssume` on every
         // lookup. Mirrors PUC's `luaT_init` (ltm.c:38-53) which pre-interns
-        // `tmname[]` at VM startup.
+        // `tmname[]` at VM startup BEFORE any other initialization that might
+        // trigger metamethod lookups (PUC lstate.c: luaT_init is called early
+        // in lua_newstate, before luaS_init/luaX_init/etc).
+        //
+        // MUST be populated BEFORE bootstrapGlobals() — bootstrapGlobals sets
+        // up the string metatable and other global tables whose operations
+        // may trigger metamethod lookups (getTmByObj → getTm → tm_names).
+        // With non-optional *LuaString (no null check), accessing tm_names
+        // before this point would read undefined memory.
         {
             const names = [_]struct { ev: TmsEvent, s: []const u8 }{
                 .{ .ev = .index, .s = "__index" },
@@ -3903,6 +3908,7 @@ pub const Vm = struct {
                     vm.internStr(entry.s) catch @panic("oom");
             }
         }
+        vm.bootstrapGlobals() catch @panic("oom");
         // PUC lstate.c:375-380: setgcparam for all 6 GC params with PUC
         // defaults. Each param is coded via gcCodeParam (floating-point byte).
         //   [0]=MINORMUL(20), [1]=MAJORMINOR(50), [2]=MINORMAJOR(70),
@@ -22611,20 +22617,16 @@ pub const Vm = struct {
         // __metatable) — PUC interns these on demand via luaS_new and pins
         // them via luaC_fix in luaT_init only for tmname[] entries. Our
         // metafield_names are pinned here the same way.
-        for (self.tm_names) |opt| {
-            if (opt) |s| {
-                if (gcIsWhite(s.gc_marked)) {
-                    gcSetBlack(&s.gc_marked);
-                    self.gc_mark_epoch += 1;
-                }
+        for (self.tm_names) |s| {
+            if (gcIsWhite(s.gc_marked)) {
+                gcSetBlack(&s.gc_marked);
+                self.gc_mark_epoch += 1;
             }
         }
-        for (self.metafield_names) |opt| {
-            if (opt) |s| {
-                if (gcIsWhite(s.gc_marked)) {
-                    gcSetBlack(&s.gc_marked);
-                    self.gc_mark_epoch += 1;
-                }
+        for (self.metafield_names) |s| {
+            if (gcIsWhite(s.gc_marked)) {
+                gcSetBlack(&s.gc_marked);
+                self.gc_mark_epoch += 1;
             }
         }
         if (self.debug_registry) |t| try self.gcMarkValue(.{ .Table = t });
@@ -34600,7 +34602,7 @@ pub const Vm = struct {
     /// `nil → f` transition. Only events `<= .eq` (index, newindex, gc, mode,
     /// len, eq) participate in the flags cache, via `fastTm`/`gfasttm`.
     fn getTm(self: *Vm, mt: *Table, event: TmsEvent) ?Value {
-        const name_str = self.tm_names[@intFromEnum(event)] orelse return null;
+        const name_str = self.tm_names[@intFromEnum(event)];
         const node = ltable.nodeLookupShortStrIdentity(mt.hash, name_str) orelse return null;
         if (node.value == .Nil) return null;
         return node.value;
@@ -34666,7 +34668,7 @@ pub const Vm = struct {
         // Bit is clear — metamethod might be present. Do the hash lookup
         // using the pre-interned name string (pointer-identity key, no
         // internStrAssume hashmap lookup needed).
-        const name_str = self.tm_names[@intFromEnum(event)] orelse return null;
+        const name_str = self.tm_names[@intFromEnum(event)];
         const node = ltable.nodeLookupShortStrIdentity(mt.hash, name_str) orelse {
             // No node at all — cache-on-miss.
             mt.flags |= bit;
@@ -34694,7 +34696,7 @@ pub const Vm = struct {
     /// `nodeLookupShortStrIdentity` — `metafield_names` entries are provably
     /// pre-interned shorts, matching PUC's `luaH_Hgetshortstr` precondition.
     fn getMetaField(self: *Vm, mt: *Table, field: MetaField) ?Value {
-        const name_str = self.metafield_names[@intFromEnum(field)] orelse return null;
+        const name_str = self.metafield_names[@intFromEnum(field)];
         const node = ltable.nodeLookupShortStrIdentity(mt.hash, name_str) orelse return null;
         if (node.value == .Nil) return null;
         return node.value;

@@ -34581,15 +34581,11 @@ pub const Vm = struct {
     ///                       for `v`, then `getTm`. NO flags cache for ANY
     ///                       event — matches PUC exactly on caching.
     ///
-    /// **Current discrepancy (to be closed by T3):** `getTm` currently uses
-    /// `nodeLookupStr`, which dispatches to `luaStringEq` — pointer-identity
-    /// for interned shorts BUT content-eq for longs. PUC's `luaH_Hgetshortstr`
-    /// is short-string pointer-identity ONLY. Since `tm_names[event]` is
-    /// always a VM-interned short string and metatable keys for metamethod
-    /// names are also interned shorts, the content-eq path is never taken in
-    /// practice — but the code path is structurally wider than PUC's. T3
-    /// introduces `nodeLookupShortStrIdentity` (pure pointer-identity, no
-    /// content path) to close this.
+    /// **Lookup primitive (final):** `getTm` uses
+    /// `nodeLookupShortStrIdentity` — pure short-string pointer-identity
+    /// (PUC `luaH_Hgetshortstr` parity). Precondition: the query key is
+    /// always a VM-interned short string (`tm_names[event]` qualifies;
+    /// Debug-asserted at the primitive boundary).
     ///
     /// **T5 PROHIBITION — no negative-cache for non-fast events:**
     /// Events `> .eq` (add, sub, mul, mod, pow, div, idiv, band, bor, bxor,
@@ -34659,10 +34655,12 @@ pub const Vm = struct {
     /// `tag_method.isFastCached`). For non-cached events (add..close),
     /// use `getTm` or `getTmByObj` — see the T5 PROHIBITION in `getTm`'s doc.
     ///
-    /// **Lookup discrepancy (T3 target):** same as `getTm` — currently uses
-    /// `nodeLookupStr` (general `luaStringEq`), T3 will switch to
-    /// `nodeLookupShortStrIdentity` to match PUC's `luaH_Hgetshortstr`.
+    /// **Lookup primitive (final):** `nodeLookupShortStrIdentity` (PUC
+    /// `luaH_Hgetshortstr` parity — short-string pointer identity only).
+    /// Debug-asserts `tag_method.isFastCached(event)` (PUC luaT_gettm
+    /// asserts `event <= TM_EQ`).
     fn fastTm(self: *Vm, mt: *Table, event: TmsEvent) ?Value {
+        std.debug.assert(tag_method.isFastCached(event)); // PUC luaT_gettm assert
         const bit = TableFlags.bit(event);
         if ((mt.flags & bit) != 0) return null;
         // Bit is clear — metamethod might be present. Do the hash lookup

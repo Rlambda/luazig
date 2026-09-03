@@ -1,16 +1,16 @@
 {
   "meta": {
-    "created_utc": "2026-09-02T23:53:22.570079+00:00",
+    "created_utc": "2026-09-03T14:22:14.903700+00:00",
     "lane": "smoke_compare",
     "argv": [
       "/home/boss/codes/luazig/tools/smoke_compare.py",
       "--json-out",
-      "/home/boss/codes/luazig/tools/status/.tmp.smoke.mwxuam4x.json"
+      "/home/boss/codes/luazig/tools/status/.tmp.smoke.k34jdv06.json"
     ],
     "zig_version": "0.16.0"
   },
-  "total": 67,
-  "ok": 67,
+  "total": 68,
+  "ok": 68,
   "mismatches": 0,
   "results": [
     {
@@ -279,6 +279,10 @@
     },
     {
       "file": "tests/smoke/67_upvalue_gc_lifetime.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/68_metamethod_mutation.lua",
       "match": true
     }
   ]

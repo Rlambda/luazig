@@ -780,17 +780,18 @@ pub const Closure = struct {
     /// PUC `marked` byte — tri-color mark bits. See constants above.
     gc_marked: u8 = 0,
     proto: ?*const bc.Proto = null, // bytecode proto (non-null for bytecode closures)
-    /// The proto tree's lifetime owner (P16.10b Task 4/5). Every bytecode
-    /// closure RETAINS the owner at creation; `gcFreeObject(.closure)`
-    /// releases it, and the last release frees the whole tree. This is
-    /// what makes OP_CLOSURE sharing safe: many closures over one child
-    /// proto, child closures outliving the root closure — the tree stays
-    /// alive while ANY closure of ANY of its nodes lives. Null for C
-    /// closures (c_func) and builtin closures. Invariant for bytecode
-    /// closures: `tree == proto.?.tree` (Debug-asserted at creation).
-    tree: ?*bc.Proto = null,
+    /// The proto tree's lifetime (P16.10b Task 4/5) is DERIVED from the
+    /// proto (P16.16 C2/T4.2): every bytecode closure RETAINS the tree
+    /// owner at creation (`retainTreeForClosure(proto)`, which returns
+    /// `proto.?.tree`), and `gcFreeObject(.closure)` releases it through
+    /// `closure.proto.?.tree` — the invariant `tree == proto.?.tree` held
+    /// at every creation site, so the field was pure duplication (8B per
+    /// closure). This is what makes OP_CLOSURE sharing safe: many closures
+    /// over one child proto, child closures outliving the root closure —
+    /// the tree stays alive while ANY closure of ANY of its nodes lives.
+    /// C closures (c_func) and builtin closures have proto == null and
+    /// never retained a tree.
     upvalues: []const *Cell,
-    env_override: ?Value = null,
     /// C function pointer (PUC CClosure.f / `lua_CFunction`). Non-null when
     /// this closure wraps a C function registered through the C API
     /// (`luaL_setfuncs`, `lua_pushcfunction`). When non-null, `proto` is null.
@@ -12079,9 +12080,10 @@ pub const Vm = struct {
             errdefer self.alloc.destroy(cl);
             cl.* = .{
                 .proto = proto_in,
-                .tree = self.retainTreeForClosure(proto_in),
                 .upvalues = owned_upvalues,
             };
+            // Retain the tree owner (P16.16 C2/T4.2: derived from proto).
+            _ = self.retainTreeForClosure(proto_in);
             try self.gcRegisterClosure(cl);
         self.gcNoteAlloc(@sizeOf(Closure) + upvalues_in.len * @sizeOf(*Cell));
             self.testc_obj_functions += 1;
@@ -15123,12 +15125,14 @@ pub const Vm = struct {
         const cl = try self.alloc.create(Closure);
         cl.* = .{
             .proto = child_proto,
-            // OP_CLOSURE shares the parent's tree: the child closure takes
-            // its own reference, so children safely outlive the root
-            // closure (P16.10b S5 — supported sharing, not theoretical).
-            .tree = self.retainTreeForClosure(child_proto),
             .upvalues = cells,
         };
+        // OP_CLOSURE shares the parent's tree: the child closure takes
+        // its own reference, so children safely outlive the root
+        // closure (P16.10b S5 — supported sharing, not theoretical).
+        // P16.16 C2/T4.2: the owner is derived from the child's proto
+        // (child.tree == root), no separate field on the closure.
+        _ = self.retainTreeForClosure(child_proto);
         try self.gcRegisterClosure(cl);
         // PUC luaM_*: every allocation decrements GCdebt via gcNoteAlloc.
         // Without this, condGcFromDispatch never triggers for closure-heavy
@@ -21401,42 +21405,6 @@ pub const Vm = struct {
         try self.gcWriteBarrierCell(cell, value);
     }
 
-    inline fn gcStoreClosureEnv(self: *Vm, closure: *Closure, value: Value) DispatchError!void {
-        closure.env_override = value;
-        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
-            // Generational mode: forward barrier — mark value, make OLD0.
-            if (closure.gc_age.isOld()) {
-                if (gcValueAge(value)) |age| {
-                    if (age.isYoung()) {
-                        // PUC luaC_barrier_: reallymarkobject + setage(v, G_OLD0).
-                        // gcQueueScanObject queues non-string objects for
-                        // traversal, ensuring children are marked.
-                        const child_obj = GcObject.fromValue(value) orelse return;
-                        try self.gcQueueScanObject(child_obj);
-                        gcSetValueAge(value, .old0);
-                        try self.gc_old1.append(self.alloc, child_obj);
-                    }
-                }
-            }
-            return;
-        }
-        // Incremental mode: forward barrier (luaC_barrier).
-        if (self.gc_state == .pause or !gcIsBlack(closure.gc_marked)) return;
-        switch (self.gc_state) {
-            .propagate, .atomic => {
-                switch (value) {
-                    .Table => |t| if (gcIsWhite(t.gc_marked)) try self.gcMarkValue(value),
-                    .Closure => |c| if (gcIsWhite(c.gc_marked)) try self.gcMarkValue(value),
-                    .Thread => |th| if (gcIsWhite(th.gc_marked)) try self.gcMarkValue(value),
-                    .String => |s| if (gcIsWhite(s.gc_marked)) try self.gcMarkValue(value),
-                    else => {},
-                }
-            },
-            .sweep => gcMakeWhite(&closure.gc_marked, self.gc_current_white),
-            .pause => {},
-        }
-    }
-
     pub inline fn gcStoreMetatable(self: *Vm, table: *Table, metatable: ?*Table) DispatchError!void {
         table.metatable = metatable;
         if (metatable) |mt| {
@@ -22570,7 +22538,12 @@ pub const Vm = struct {
                 // The LAST release frees the whole tree exactly once — this
                 // is what closes the dynamic-load retention blocker (many
                 // closures share one tree; children may outlive the root).
-                if (c.tree) |t| t.releaseTree(self.alloc);
+                // P16.16 C2/T4.2: the owner is derived from the closure's
+                // proto (invariant: closure tree == proto.?.tree); C closures
+                // (proto == null) never retained a tree.
+                if (c.proto) |p| {
+                    if (p.tree) |t| t.releaseTree(self.alloc);
+                }
                 if (c.upvalues.len > 0) self.alloc.free(c.upvalues);
                 self.gcNoteFree(@sizeOf(Closure) + c.upvalues.len * @sizeOf(*Cell));
                 self.alloc.destroy(c);
@@ -23066,7 +23039,6 @@ pub const Vm = struct {
                 for (cl.upvalues) |cell| {
                     try self.gcQueueScanCell(cell);
                 }
-                if (cl.env_override) |env| try self.gcMarkValue(env);
             },
             .thread => |th| {
                 if (GcObject.fromValue(th.callee) != null) {
@@ -23758,14 +23730,18 @@ pub const Vm = struct {
                 self.testc_obj_functions -= 1;
                 self.gcNoteFree(@sizeOf(Closure));
             }
-            if (cl.tree) |t| t.releaseTree(self.alloc);
+            if (cl.proto) |p| {
+                if (p.tree) |t| t.releaseTree(self.alloc);
+            }
             self.alloc.destroy(cl);
         }
         cl.* = .{
             .proto = proto,
-            .tree = self.retainTreeForClosure(proto),
             .upvalues = cells,
         };
+        // Retain the tree owner (P16.16 C2/T4.2: derived from proto, no
+        // separate field — see the Closure doc comment).
+        _ = self.retainTreeForClosure(proto);
         try self.gcRegisterClosure(cl);
         cl_registered = true;
         self.testc_obj_functions += 1;
@@ -23777,7 +23753,7 @@ pub const Vm = struct {
         // single adoption point for load/undump/api-created trees;
         // OP_CLOSURE children adopt implicitly — their parent's tree was
         // adopted when the parent closure was created.
-        if (cl.tree) |t| {
+        if (proto.tree) |t| {
             if (!t.constants_resolved) try self.resolveTreeConstants(t);
             // Charge the tree's native footprint to gc_count_kb at adoption
             // (Task 7). After resolution, resolved_values arrays exist and
@@ -24050,11 +24026,16 @@ pub const Vm = struct {
     }
 
     fn applyLoadEnv(self: *Vm, cl: *Closure, env_val: Value, force_first_on_missing: bool) DispatchError!void {
+        // PUC load_aux (lbaselib.c:325-331) / lua_load (lapi.c): the env is
+        // stored ONLY into the closure's upvalue cell — upvalue #1 for a
+        // main chunk, which is _ENV whenever the chunk touches globals.
+        // A chunk with no upvalues simply DROPS the env (lua_setupvalue
+        // returns NULL, the value is popped) — no hidden retention slot.
+        // P16.16 C2/T4.1: the old `env_override` field was pure redundant
+        // liveness (the _ENV Cell owns the edge; nothing ever read it for
+        // env resolution) and diverged from PUC in the no-upvalue case.
         const num_upvalues: usize = if (cl.proto) |proto| proto.upvalues.len else 0;
-        if (num_upvalues == 0) {
-            if (force_first_on_missing) try self.gcStoreClosureEnv(cl, env_val);
-            return;
-        }
+        if (num_upvalues == 0) return;
         if (cl.upvalues.len < num_upvalues) {
             const cells = try self.alloc.alloc(*Cell, num_upvalues);
             var i: usize = 0;
@@ -24072,14 +24053,12 @@ pub const Vm = struct {
                 if (i >= cl.upvalues.len) break;
                 if (std.mem.eql(u8, uv.name, "_ENV")) {
                     try self.gcStoreCellValue(cl.upvalues[i], env_val);
-                    try self.gcStoreClosureEnv(cl, env_val);
                     return;
                 }
             }
         }
         if (force_first_on_missing) {
             if (cl.upvalues.len > 0) try self.gcStoreCellValue(cl.upvalues[0], env_val);
-            try self.gcStoreClosureEnv(cl, env_val);
         }
     }
 
@@ -24184,14 +24163,17 @@ pub const Vm = struct {
                 self.gcUnregisterObject(.{ .closure = cl });
                 self.gcNoteFree(@sizeOf(Closure));
             }
-            if (cl.tree) |t| t.releaseTree(self.alloc);
+            if (cl.proto) |p| {
+                if (p.tree) |t| t.releaseTree(self.alloc);
+            }
             self.alloc.destroy(cl);
         }
         cl.* = .{
             .proto = proto,
-            .tree = self.retainTreeForClosure(proto),
             .upvalues = cells,
         };
+        // Retain the tree owner (P16.16 C2/T4.2: derived from proto).
+        _ = self.retainTreeForClosure(proto);
         try self.gcRegisterClosure(cl);
         cl_registered = true;
         self.gcNoteAlloc(@sizeOf(Closure));
@@ -24199,7 +24181,7 @@ pub const Vm = struct {
         // undumped trees, constants were pre-resolved by
         // preResolveUndumpedConstants before this call, so resolved_values
         // arrays exist and are included in the footprint.
-        if (cl.tree) |t| self.chargeTreeFootprint(t);
+        if (proto.tree) |t| self.chargeTreeFootprint(t);
         return cl;
     }
 
@@ -41766,11 +41748,13 @@ test "vm: P16.8a transactional simple_result setup — errdefer rollback on push
     // Create bytecode closures for both protos. Each closure retains the
     // tree owner (gcFreeObject releases it at vm.deinit drain).
     const parent_cl = try aalloc.create(Closure);
-    parent_cl.* = .{ .proto = parent_proto, .tree = vm.retainTreeForClosure(parent_proto), .upvalues = &.{} };
+    parent_cl.* = .{ .proto = parent_proto, .upvalues = &.{} };
+    _ = vm.retainTreeForClosure(parent_proto);
     try vm.gcRegisterClosure(parent_cl);
 
     const mm_cl = try aalloc.create(Closure);
-    mm_cl.* = .{ .proto = mm_proto, .tree = vm.retainTreeForClosure(mm_proto), .upvalues = &.{} };
+    mm_cl.* = .{ .proto = mm_proto, .upvalues = &.{} };
+    _ = vm.retainTreeForClosure(mm_proto);
     try vm.gcRegisterClosure(mm_cl);
 
     // P16.10b: constants are adopted at closure creation in production;
@@ -41938,10 +41922,12 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
     defer vm.deinit();
 
     const parent_cl = try aalloc.create(Closure);
-    parent_cl.* = .{ .proto = parent_proto, .tree = vm.retainTreeForClosure(parent_proto), .upvalues = &.{} };
+    parent_cl.* = .{ .proto = parent_proto, .upvalues = &.{} };
+    _ = vm.retainTreeForClosure(parent_proto);
     try vm.gcRegisterClosure(parent_cl);
     const mm_cl = try aalloc.create(Closure);
-    mm_cl.* = .{ .proto = mm_proto, .tree = vm.retainTreeForClosure(mm_proto), .upvalues = &.{} };
+    mm_cl.* = .{ .proto = mm_proto, .upvalues = &.{} };
+    _ = vm.retainTreeForClosure(mm_proto);
     try vm.gcRegisterClosure(mm_cl);
     try vm.resolveProtoConstants(parent_proto);
     try vm.resolveProtoConstants(mm_proto);
@@ -42172,8 +42158,10 @@ test "vm: Task 8.2 — closure creation refcount invariant (retain/release balan
 
     const cl = try vm.createBytecodeChunkClosure(p);
     try testing.expectEqual(@as(usize, 2), p.tree.?.ref_count);
-    try testing.expect(cl.tree != null);
-    try testing.expectEqual(p.tree.?, cl.tree.?);
+    // P16.16 C2/T4.2: the tree owner is derived from the closure's proto
+    // (cl.proto.?.tree); the closure itself carries no tree field.
+    try testing.expect(cl.proto == p);
+    try testing.expect(p.tree != null);
 
     // Caller releases its producing reference (compileChunkValue pattern).
     p.tree.?.releaseTree(aalloc);
@@ -42181,7 +42169,7 @@ test "vm: Task 8.2 — closure creation refcount invariant (retain/release balan
 
     // The closure's tree reference (ref_count == 1) is released by
     // vm.deinit() → drainGcRegistries → gcFreeObject(.closure) →
-    // c.tree.release(). Do NOT release it here — that would double-free
+    // proto.tree.release(). Do NOT release it here — that would double-free
     // the tree (gcFreeObject would access the dangling pointer).
 }
 
@@ -42570,9 +42558,9 @@ test "vm: Task 7.3 — source-backing .owned append in fixed mode (happy path)" 
     switch (result) {
         .closure => |cl| {
             // Verify the closure is valid and the tree has the owned buffer.
-            try testing.expect(cl.tree != null);
-            try testing.expect(cl.tree.?.source_backing.extra != null);
-            try testing.expectEqual(@as(usize, 1), cl.tree.?.source_backing.extra.?.owned.items.len);
+            const owner = cl.proto.?.tree.?;
+            try testing.expect(owner.source_backing.extra != null);
+            try testing.expectEqual(@as(usize, 1), owner.source_backing.extra.?.owned.items.len);
         },
         .err_msg => |msg| {
             aalloc.free(msg);

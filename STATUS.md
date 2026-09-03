@@ -6720,3 +6720,46 @@ PASS; smoke 68/68 PASS; c_api 20 suites + 8/8 diff PASS.
 Remaining api580 ledger (charged): 496 vs PUC 304; still need −97B
 (Proto +120 gap dominates; then Closure env_override/tree, LuaString
 union, Upvaldesc, Cell bc_stack_idx, Proto flags/footprint/ref_count).
+
+## P16.16 T4 (C2) — Closure cuts: env_override removed, tree derived from proto (2026-09-04)
+
+Structural cut 2. Closure 72 → **40** (= PUC sizeLclosure(1) = 40).
+
+### T4.1 env_override (−16B)
+
+Audit of every read/write: written ONLY by `gcStoreClosureEnv` (from
+`applyLoadEnv` — the load()-with-env path), read ONLY by the GC mark
+phase. No semantic read anywhere — the _ENV Cell owns the real
+environment edge. Pure redundant liveness, and a PUC divergence in the
+no-upvalue case: PUC load_aux (lbaselib.c:325-331) calls
+lua_setupvalue(L,-2,1) which returns NULL for a chunk with no upvalues —
+the env is popped and NOT retained; luazig's env_override kept it alive.
+Removed: field, gcStoreClosureEnv (whole write-barrier function — the
+cell store keeps its own barrier via gcStoreCellValue), the GC-mark
+branch, and all three call sites. applyLoadEnv now matches PUC: env goes
+into the _ENV (or first) upvalue cell, or is dropped when the chunk has
+no upvalues.
+
+### T4.2 tree pointer (−8B + padding)
+
+Invariant verified at every creation site: bytecode closures always set
+`.tree = retainTreeForClosure(proto)` which returns `proto.?.tree`; C
+closures / builtins (c_func) never set tree (proto == null). The field
+was pure duplication. Removed: field; retain/release now derived —
+creation sites call `_ = retainTreeForClosure(proto)`, gcFreeObject and
+the OOM errdefers release via `closure.proto.?.tree`, adoption sites
+(chargeTreeFootprint / resolveTreeConstants) read `proto.tree`.
+T4.4 upvalue slice: kept (audit only, per plan).
+
+api580 (anchored driver, 3 runs): 496 → **464** (−32 = Closure 72→40).
+@sizeOf: Closure 72→40; others unchanged.
+
+Perf A/B (3-round interleaved): dynamic_load +0.00% cyc / −0.04% instr
+(flat).
+
+Gates: zig build test (Debug) PASS; closure/coroutine/db/errors/nextvar
+--testc PASS; big/locals fail with byte-identical output to HEAD
+(pre-existing, verified by stash-dance); smoke 68/68 PASS; c_api 20
+suites + 8/8 diff PASS.
+
+Remaining api580 ledger (charged): 464 vs PUC 304; still need −65B.

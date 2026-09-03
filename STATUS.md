@@ -6367,3 +6367,57 @@ measurably affect `metamethod_add` — the win is concentrated in
 - **T4 experiment C:** fuse `valueMetatable` + `tm_names` load + `nodeLookupStr`
   into a single `getTmByObj` body (no function-call boundary). The function is
   already inlined, so this is unlikely to help — verify with A/B.
+
+### T4 results (experiments kept/reverted)
+
+**ExpA — drop isEmpty() from nodeLookupShortStrIdentity (match PUC luaH_Hgetshortstr exactly):**
+REVERTED. Interleaved A/B 5 rounds: T3 instr ~1,788M cyc ~336M vs ExpA instr
+~1,790M cyc ~337M. NEUTRAL (within noise). The isEmpty check is
+predicted-true (bucket is used for metamethod names) and costs nothing.
+
+**ExpB — tm_names/metafield_names non-optional *LuaString (eliminate null check):**
+KEPT. Interleaved A/B 5 rounds: T3 instr ~1,783M cyc ~343M vs ExpB instr
+~1,779M cyc ~345M. Consistent ~4M instruction reduction (~0.22%), cycles
+neutral (high variance, no regression). PUC-faithful: PUC's `G(L)->tmname[]`
+is bare `TString*` (never null after `luaT_init`). Init moved before
+`bootstrapGlobals()` to match PUC's `luaT_init` order (lstate.c).
+
+**ExpC — fuse valueMetatable + tm_names + lookup:** NOT TESTED. Function is
+already inlined by the compiler; T2 annotation confirmed no call boundary
+overhead. No expected gain.
+
+### T5 result
+
+T5 prohibition written into `getTm` doc comment (vm.zig, T1 commit `0f8ab5f`):
+"Events > .eq (add..close) MUST NOT be cached via Table.flags. PUC
+luaT_gettmbyobj calls luaH_Hgetshortstr directly — it never checks or sets
+flags bits for these events." The prohibition is enforced by structure:
+`getTmByObj` → `getTm` (no flags touch) for ALL events; only `fastTm`
+touches flags, and `fastTm` is only called with events <= .eq.
+
+### T6 result
+
+New smoke test `tests/smoke/68_metamethod_mutation.lua` (226 lines, 10
+sections): present↔absent __add, absent→present, callable-value swap, L/R
+precedence with mutation, debug.setmetatable primitive-type mutation, mt
+replacement, cached-event invalidation (__index/__newindex), callable-valued
+metamethod, yielding metamethod, hooks-enabled path. 3x byte-identical vs
+PUC. Smoke count: 67 → 68.
+
+### Full gates (end of P16.13)
+
+- zig build test (Debug): PASS (190/190)
+- zig build test (ReleaseFast): PASS
+- matrix --testc: zig_fail=1 (api.lua documented), both_fail=1 (big.lua pre-existing). No new regressions.
+- smoke: 68/68 PASS
+- c_api 19_load: PUC-identical
+- db/locals/closure/coroutine/gc/gengc/errors --testc: all rc=0
+- nextvar 3x: all rc=0, stable
+- leak_bench: PASS (all workloads within 1.0 KB)
+
+### Commit hashes
+
+- T1+T5: `0f8ab5f` — audit doc + T5 prohibition
+- T2+T3: `b96cd40` — nodeLookupShortStrIdentity primitive + T2 decomposition
+- T4: `e441557` — keep ExpB (non-optional tm_names), revert ExpA
+- T6: `a587e06` — differential mutation smoke (68_metamethod_mutation.lua)

@@ -1,20 +1,20 @@
 {
   "meta": {
-    "created_utc": "2026-09-03T16:45:15.843713+00:00",
+    "created_utc": "2026-09-03T19:13:56.025331+00:00",
     "lane": "testes_matrix",
     "argv": [
-      "tools/testes_matrix.py",
+      "/home/boss/codes/luazig/tools/testes_matrix.py",
       "--testc",
       "--json-out",
-      "/tmp/opencode/p1614/final/current-matrix.json"
+      "/home/boss/codes/luazig/tools/status/.tmp.matrix.rbr0omiy.json"
     ],
     "zig_version": "0.16.0"
   },
   "provenance": {
-    "git_head": "28a20dd",
-    "git_dirty": "clean",
+    "git_head": "06cc5ea",
+    "git_dirty": "dirty",
     "zig_version": "0.16.0",
-    "zig_binary_sha16": "a34ed59f91e3a4b6",
+    "zig_binary_sha16": "5651f1443dac4c36",
     "puc_binary_sha16": "d54bc45e1757b216"
   },
   "summary": {

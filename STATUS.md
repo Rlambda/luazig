@@ -1,4 +1,4 @@
-> Last updated: 2026-09-03 (P16.12/13 — tm-lookup PUC alignment (nodeLookupShortStrIdentity, luaH_Hgetshortstr parity), mutation smoke 68, artifact provenance)
+> Last updated: 2026-09-03 (P16.14/15 — provenance closure (shared helper, all current*.json stamped), staged call ABI (PUC luaT_callTMres→luaD_precall), pointer-origin guessing deleted)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -36,9 +36,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **68/68** pass |
 | C API suites (`tests/c_api`) | 20 suites |
-| Performance (geomean vs PUC) | **1.80x** |
+| Performance (geomean vs PUC) | **1.77x** |
 
-Geomean замедления vs PUC Lua: **1.80x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.77x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -4309,6 +4309,52 @@ both_fail pre-existing). Свежий geomean **1.79x**; top: noalloc 2.74x,
 metamethod_add 2.59x, coroutine_yield 2.17x, lua_calls 2.16x.
 Профиль: getTmByObj 10.3% + tryPush 5.3% → metamethod-lookup (Task 10
 следующей фазы, gfasttm-кандидат).
+
+## P16.14/15 — provenance closure + staged call ABI (2026-09-04)
+
+### T0 (`1e2e095`)
+Stale P16.13-комментарии (T3-will-switch) → финальная архитектура;
+Debug-tripwires: nodeLookupShortStrIdentity asserts key.is_short (PUC
+lua_assert(strisshr)), fastTm asserts isFastCached (PUC event<=TM_EQ).
+
+### T1 (`28a20dd`, `761df30`)
+tools/provenance.py — единый helper (git_head/git_dirty/zig_version/
+sha16(zig-bin)/sha16(puc-bin)); ВСЕ current*.json (perf×3 + status×2 +
+footprint) несут provenance-блок; dirty-измерения обязаны говорить dirty.
+Артефакты перегенерированы с clean HEAD.
+
+### T2+T3 (`2b310ce`)
+Cost model (tools/perf/current-callpath-analysis.json, 12777 сэмплов):
+args_on_stack-классификация 4.0% + host-ветка 9.2% push; prepareHostArgs
+пролог+маршалинг 37.5% символа. Инвентарь 9 call-сайтов: A (OP_CALL/
+TFORCALL — zero-copy), B (метаметоды/__close/pcall/hook/run — host-срезы),
+C (host-граница). Ответ: активация должна потреблять staged slot+count.
+
+### T4+T5+T6 (`06cc5ea`)
+**stageBytecodeCall** (PUC luaT_callTMres setobj2s-последовательность;
+резервирует func+args, не поднимает bc_stack_top) +
+**pushStagedBytecodeExecFrame** (PUC luaD_precall LUA_VLCL-тело; slot+count,
+callee_cl удалён из сигнатуры). ВСЕ 9 сайтов мигрированы; pointer-origin
+классификация + prepareHostArgs + переходная обёртка УДАЛЕНЫ (не bypass).
+rollbackBytecodeCloseChild — noinline-хелпер __close-отката.
+Транзакционность: новый тест окна staging-успех→activation-OOM (simple_result
+чист, frame count нетронут, bc_stack_top восстановлен).
+
+### A/B (3-round median)
+noalloc −4.67% instr/−4.02% cyc; lua_calls −2.65% instr; metamethod_add
+−2.49% instr/−5.80% cyc; coroutine_yield — шум. ЛОВЛЕНО и починено:
+T4-only-обёртка регрессила lua_calls +1.59% — устранено прямой миграцией
+Category-A (T5). Отклонений нет.
+
+### Гейт: zig tests 191/191 Debug+RF; matrix zig_fail=1 (api.lua:580
+ДОКУМЕНТИРОВАННО — T10 запрещает переделку представлений; big.lua
+both_fail pre-existing); smoke 68/68 (57-68 byte-identical); c_api 20+diff;
+db/locals/closure/coroutine/gc/gengc/errors 0; nv5; leak_bench; 4 native
+lanes BOUNDED; repro PUC-identical; CallFrame≤104; Cell-инвариант (67);
+T5-запрет P16.13. Fresh geomean **1.77x** (снапшот clean 06cc5ea);
+top: noalloc 2.64x, metamethod_add 2.55x, coroutine_yield 2.18x,
+hash 2.09x, lua_calls 2.08x. Профиль noalloc: dispatch 64.0%,
+getTmByObj 9.8%, pushResolved 8.4%, pushStaged 8.3%, tryPush 6.9%.
 
 ## История закрытых фаз
 

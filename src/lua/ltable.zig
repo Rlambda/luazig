@@ -708,6 +708,9 @@ test "nodeLookupStr skips dead keys and non-string keys in the chain" {
 /// (cache-on-miss via flags bits) is `fastTm`'s responsibility, and ONLY for
 /// events `<= .eq`. See the T5 PROHIBITION in `getTm`'s doc comment.
 pub inline fn nodeLookupShortStrIdentity(nodes: []Node, key: *LuaString) ?*Node {
+    // PUC luaH_Hgetshortstr lua_assert(strisshr(key)): the identity
+    // precondition. Debug-only — zero ReleaseFast cost.
+    std.debug.assert(key.is_short);
     if (nodes.len == 0) return null;
     // Same hash as PUC hashstr: key->hash & (sizenode-1).
     // keyHash(.{ .String = key }) = key.hash (ltable.zig:382, no computation).

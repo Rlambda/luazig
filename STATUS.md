@@ -6474,3 +6474,107 @@ PUC implementation stages func+args first. Plan (T4): `stageBytecodeCall`
 (PUC luaT_callTMres setobj2s sequence) + `pushStagedBytecodeExecFrame`
 (PUC luaD_precall LUA_VLCL contract: func+nargs staged at func_slot);
 `pushBytecodeExecFrame` becomes a transitional compat wrapper.
+
+## P16.15 T4+T5+T6+T9 — staged slot+count activation ABI (2026-09-03, IMPLEMENTED)
+
+### T4 — design: stageBytecodeCall + pushStagedBytecodeExecFrame
+
+The activation ABI is now PUC-faithful two-step, replacing the fused
+`pushBytecodeExecFrame(args: []const Value)`:
+
+- **`stageBytecodeCall(func_slot, callee_cl, args) → StagedCall{func_slot,
+  nargs}`** — PUC `luaT_callTMres` setobj2s sequence (ltm.c:119-131): reserve
+  func+args only, write callee at `func_slot`, args at `func_slot+1..`.
+  Does NOT bump `bc_stack_top` — the activation owns the top update,
+  preserving errdefer transactionality.
+- **`pushStagedBytecodeExecFrame(exec_frames, proto, func_slot_in, nargs,
+  nresults)`** — PUC `luaD_precall` LUA_VLCL body (ldo.c:725-735): contract
+  is "func + nargs args already staged at func_slot". No pointer test, no
+  host copy, no storage-origin classification. `callee_cl` parameter
+  dropped from the core (PUC precall reads the callee from the stack).
+
+Migrated callers:
+
+- **Category A (zero-copy, direct activation — operands already in the
+  caller's registers, exactly PUC OP_CALL which skips staging):** OP_CALL
+  fast path (vm.zig ~14265), OP_TFORCALL (~15202, `rargs` slice deleted —
+  `effective_nargs` used directly), opCall slow path (~16425). The
+  `args_on_stack` pointer classification and the `rargs = regs[...]` slice
+  construction are gone entirely.
+- **Category B (stage then activate — PUC stack-calls):**
+  `pushResolvedBytecodeClosure` both arms (continuation + simple_result,
+  ~7565/7595), TBC `__close` (~7333), debug hook (~8022), pcall target
+  (~10821), xpcall error handler (~10988), `runBytecodeInternal`
+  (~12071). Each stages at `bc_stack_top` (PUC L->top), then activates.
+
+`rollbackBytecodeCloseChild` (noinline, ~7173): shared rollback of an
+installed `__close` continuation for both failure points of the PUC
+`luaF_close → luaT_callTM → luaD_callnoyield` sequence (staging failure +
+activation failure) — replaces the duplicated inline rollback.
+
+**Follow-up criterion: Category-B migration is COMPLETE.** No caller of the
+old ABI remains; the transitional `pushBytecodeExecFrame` wrapper was
+deleted in the same change (T5), not left as compat layer.
+
+### T5 — verdict: pointer-origin classification REMOVED
+
+The `args_on_stack` pointer test (`args.ptr == &bc_stack[func_slot+1]?`,
+the decision PUC's precall never makes) and the noinline `prepareHostArgs`
+host-copy helper are fully deleted. There is no storage-origin
+classification anywhere in the activation path.
+
+Isolated A/B (stash-dance, 3 rounds, median, A = HEAD 2b310ce old ABI,
+B = working tree):
+
+| workload | T4-only (wrapper kept) | T4+T5 (direct migration) |
+|---|---|---|
+| metamethod_call_noalloc | instr −4.67% cyc +0.23% | instr −4.67% cyc −4.02% |
+| lua_calls | instr **+1.59%** cyc **+1.91%** REGRESSION | instr **−2.65%** cyc −0.55% |
+| metamethod_add | instr −2.15% cyc −4.06% | instr −2.49% cyc −5.80% |
+| coroutine_yield | instr +0.07% cyc −3.02% | instr +0.26% cyc −1.09% |
+
+The T4-only wrapper version REGRESSED lua_calls (+1.59% instr / +1.91%
+cyc) — the wrapper kept the old signature and re-derived staging, costing
+more than the fused path on the hot OP_CALL lane. T5's direct migration
+(fixing all 3 Category-A call sites to the new signature) turned it into a
+−2.65% instr win. All changes kept; nothing reverted.
+
+### T6 — transactional audit + new test
+
+The staged ABI opens a new failure window vs the fused flow: staging can
+succeed while the activation fails afterwards. New test
+"vm: P16.15 T6 transactional staged activation — failure between staging
+and activation" (vm.zig ~41852) forces each point:
+
+1. activation's frame-space growth (`ensureBcStackCap` inside
+   `pushStagedBytecodeExecFrame`) OOM after staging succeeded;
+2. `FrameStack.addOne` OOM after the top update;
+3. success iteration (errdefers do not fire spuriously).
+
+Asserts on every failure: simple_result cleared, frame count unchanged,
+`pending_call_index == INVALID_PENDING`, `bc_stack_top` restored. The
+existing P16.8a transactional test was migrated to stage+activate.
+
+GC note: staged temps above `bc_stack_top` are not GC-marked through
+bc_stack (GC marks per-frame live regions, not up to top) — identical to
+the old `prepareHostArgs` semantics; their sources remain reachable across
+the stage→activate window.
+
+### T9 — evidence summary
+
+See the A/B table in T5 above. Kept: staged ABI (all 4 workloads
+neutral-or-better after T5; metamethod_call_noalloc −4.67% instr, the
+primary target). Reverted: nothing.
+
+### Gates (all green)
+
+zig build test Debug 191/191, ReleaseFast 191/191. matrix --testc:
+zig_fail=1 (api.lua documented deviation) + big.lua both_fail
+(pre-existing) — matches baseline exactly. Smoke 68/68. c_api 50/50 PASS
+(incl. 10_continuations, 12_chook, 19_load). db/locals/closure/coroutine/
+gc/gengc/errors --testc PASS. nextvar 5x PUC-identical (modulo the
+time-seed line). leak_bench PASS (all workloads within 1.0 KB).
+/tmp/repro_zig PUC-identical (mode=b/B load=0 call=0 value=42). CallFrame
+104 B (invariant held). Smoke 67_upvalue_gc_lifetime green (Cell
+invariant). T5-prohibition (P16.13) intact: getTm touches no flags;
+fastTm caches only events <= .eq.

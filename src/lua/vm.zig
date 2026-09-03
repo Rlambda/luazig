@@ -7170,6 +7170,20 @@ pub const Vm = struct {
         state.child_active = false;
     }
 
+    /// Roll an installed __close continuation back to its exact prior state
+    /// after a failure between continuation install and child activation
+    /// (staging or frame push). Shared by both failure points of the
+    /// PUC luaF_close → luaT_callTM → luaD_callnoyield sequence.
+    fn rollbackBytecodeCloseChild(
+        self: *Vm,
+        exec_frames: *FrameStack,
+        parent_index: usize,
+        state: *BytecodeCloseContinuation,
+    ) void {
+        self.releaseBytecodeCloseChild(state);
+        self.getPendingCallPtr(exec_frames.getPtr(parent_index).pending_call_index).?.completion = .{ .close = state };
+    }
+
     fn currentRuntimeErrorValue(self: *Vm) DispatchError!Value {
         // PUC prefixes string errors before stack unwinding. Our fail helpers
         // keep source/line separately until an error crosses a protected,
@@ -7319,17 +7333,26 @@ pub const Vm = struct {
                     .callee = resolved.callee,
                     .completion = .{ .close = state },
                 });
-                self.pushBytecodeExecFrame(
+                // PUC luaF_close → luaT_callTM stages func+obj(+err) at
+                // L->top, then luaD_callnoyield activates. On any failure
+                // between continuation install and activation, roll the
+                // __close continuation back to its exact prior state.
+                const staged = self.stageBytecodeCall(
+                    self.bc_stack_top,
+                    resolved.callee.Closure,
+                    resolved.args,
+                ) catch |push_err| {
+                    self.rollbackBytecodeCloseChild(exec_frames, parent_index, state);
+                    return push_err;
+                };
+                self.pushStagedBytecodeExecFrame(
                     exec_frames,
                     resolved.callee.Closure.proto.?,
-                    resolved.args,
-                    resolved.callee.Closure,
-                    self.bc_stack_top,
+                    staged.func_slot,
+                    staged.nargs,
                     0,
                 ) catch |push_err| {
-                    const rollback = state;
-                    self.releaseBytecodeCloseChild(rollback);
-                    self.getPendingCallPtr(exec_frames.getPtr(parent_index).pending_call_index).?.completion = .{ .close = rollback };
+                    self.rollbackBytecodeCloseChild(exec_frames, parent_index, state);
                     return push_err;
                 };
                 self.setDebugName(exec_frames.getPtr(parent_index), "metamethod", "close");
@@ -7542,14 +7565,19 @@ pub const Vm = struct {
                     .completion = p.completion,
                 });
                 // Roll back if child-frame push or hook dispatch fails.
-                // Re-fetch via getPtr: pushBytecodeExecFrame may realloc.
+                // Re-fetch via getPtr: pushStagedBytecodeExecFrame may realloc.
                 errdefer self.clearPendingCall(exec_frames.getPtr(parent_index));
                 const cont_nresults: i32 = switch (p.completion) {
                     .results => |r| r.nresults,
                     else => -1,
                 };
-                try self.pushBytecodeExecFrame(
-                    exec_frames, proto, args, closure, self.bc_stack_top, cont_nresults,
+                // PUC luaT_callTMres two-step: stage [func, args...] at
+                // L->top (bc_stack_top), then activate (luaD_precall).
+                const staged = try self.stageBytecodeCall(
+                    self.bc_stack_top, closure, args,
+                );
+                try self.pushStagedBytecodeExecFrame(
+                    exec_frames, proto, staged.func_slot, staged.nargs, cont_nresults,
                 );
                 // The debug name must be recorded BEFORE the CALL hook fires:
                 // PUC's hook-time getinfo('n') resolves the metamethod name
@@ -7559,21 +7587,27 @@ pub const Vm = struct {
             },
             .simple_result => |sr| {
                 // P16.8a Task 5: The simple_result state is set BEFORE the
-                // fallible child-activation operations (pushBytecodeExecFrame +
-                // hook dispatch). The errdefer below rolls it back if either
+                // fallible child-activation operations (staging + activation +
+                // hook dispatch). The errdefer below rolls it back if any
                 // fails, mirroring the errdefer clearPendingCall pattern above.
                 switch (sr.completion) {
                     .value => |dst| parent.u.lua.setSimpleValueResult(dst, sr.event),
                     .compare => |invert| parent.u.lua.setSimpleCompareResult(sr.event, invert),
                 }
-                // Re-fetch via getPtr: pushBytecodeExecFrame may realloc.
+                // Re-fetch via getPtr: pushStagedBytecodeExecFrame may realloc.
                 errdefer exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
                 // simple_result always consumes exactly 1 result (nresults=-1
                 // means "the continuation handles result count" — the
                 // simple_result completion reads exactly 1 value from the
                 // child's return slot).
-                try self.pushBytecodeExecFrame(
-                    exec_frames, proto, args, closure, self.bc_stack_top, -1,
+                //
+                // PUC luaT_callTMres two-step: stage [func, args...] at
+                // L->top (bc_stack_top), then activate (luaD_precall).
+                const staged = try self.stageBytecodeCall(
+                    self.bc_stack_top, closure, args,
+                );
+                try self.pushStagedBytecodeExecFrame(
+                    exec_frames, proto, staged.func_slot, staged.nargs, -1,
                 );
                 // No setDebugName — debug name is derived from simple_result_event
                 // at read time via getDebugName().
@@ -7988,7 +8022,16 @@ pub const Vm = struct {
             .callee = hook,
             .completion = .{ .hook = hook_state_ptr },
         });
-        self.pushBytecodeExecFrame(exec_frames, proto, argv[0..argc], cl, self.bc_stack_top, -1) catch |err| {
+        // PUC luaD_hook: the hook function + event/line args are staged on
+        // the stack, then called via luaD_call.
+        const staged_hook = self.stageBytecodeCall(self.bc_stack_top, cl, argv[0..argc]) catch |err| {
+            self.clearPendingCall(exec_frames.getPtr(parent_index));
+            self.alloc.destroy(hook_state_ptr);
+            self.bc_stack[parent_frame.func_slot] = saved_callee;
+            exec_frames.getPtr(parent_index).setTailCallBool(saved_tailcall);
+            return err;
+        };
+        self.pushStagedBytecodeExecFrame(exec_frames, proto, staged_hook.func_slot, staged_hook.nargs, -1) catch |err| {
             self.clearPendingCall(exec_frames.getPtr(parent_index));
             self.alloc.destroy(hook_state_ptr);
             self.bc_stack[parent_frame.func_slot] = saved_callee;
@@ -10778,7 +10821,10 @@ pub const Vm = struct {
         // with the frame stack). Instead, captureErrorTraceback and
         // debugBuildCurrentTraceback synthetically insert [C]: in global
         // 'pcall'/'xpcall' lines by checking pending_call.protection.
-        try self.pushBytecodeExecFrame(exec_frames, proto, child_args, cl, self.bc_stack_top, -1);
+        // PUC luaB_pcall: the target + args are staged on the stack, then
+        // activated (luaD_pcall → luaD_precall).
+        const staged_target = try self.stageBytecodeCall(self.bc_stack_top, cl, child_args);
+        try self.pushStagedBytecodeExecFrame(exec_frames, proto, staged_target.func_slot, staged_target.nargs, -1);
         // The pcall/xpcall target gets its CALL event here (PUC: pcall runs
         // the target via luaD_call → luaD_precall → luaG_tracecall).
         if (child_debug_pairs) {
@@ -10942,7 +10988,11 @@ pub const Vm = struct {
                     if (self.bc_stack.len > MAXSTACK and self.bc_stack_top < MAXSTACK) {
                         self.bc_stack_top = MAXSTACK;
                     }
-                    try self.pushBytecodeExecFrame(exec_frames, proto, resolved.args, cl, self.bc_stack_top, -1);
+                    // PUC luaG_errormsg → luaD_callnoyield(handler): the
+                    // handler + error message are staged at L->top, then
+                    // activated.
+                    const staged_handler = try self.stageBytecodeCall(self.bc_stack_top, cl, resolved.args);
+                    try self.pushStagedBytecodeExecFrame(exec_frames, proto, staged_handler.func_slot, staged_handler.nargs, -1);
                     // PUC luaG_errormsg → luaD_callnoyield(handler) →
                     // luaD_precall → luaG_tracecall: the error handler's
                     // activation gets its LUA_HOOKCALL here.
@@ -11255,13 +11305,98 @@ pub const Vm = struct {
         return self.continueBytecodeErrorUnwind(exec_frames);
     }
 
-    fn pushBytecodeExecFrame(
+    /// PUC-faithful staged-call ABI (P16.15 T4).
+    ///
+    /// PUC splits every non-OP_CALL Lua activation into two steps:
+    ///
+    ///   1. STAGE (luaT_callTMres, ltm.c:119-131): the caller writes
+    ///      [func, args...] contiguously onto the value stack at L->top
+    ///      (setobj2s x3) — the stack IS the argument-passing ABI.
+    ///   2. ACTIVATE (luaD_precall LUA_VLCL, ldo.c:725-735): precall
+    ///      consumes only (func slot, nresults); it derives narg from
+    ///      L->top - func - 1 and NEVER classifies where the caller
+    ///      stored the arguments — they are on the stack by contract.
+    ///
+    /// luazig's previous single-step ABI (args: []const Value) forced the
+    /// activation to GUESS the argument storage origin with a pointer test
+    /// (`args.ptr == &bc_stack[func_slot+1]?`) and copy host slices through
+    /// an outlined `prepareHostArgs` — a decision PUC's precall never makes
+    /// (P16.15 T2: classification 4.0% + host-branch/call-setup 9.2% of
+    /// pushBytecodeExecFrame; prepareHostArgs prologue+marshaling 37.5% of
+    /// its own symbol on the metamethod path).
+    ///
+    /// The new ABI mirrors PUC exactly:
+    ///
+    ///   - `stageBytecodeCall`  — the setobj2s sequence: reserve space for
+    ///     func+args, write the callee at func_slot and the args at
+    ///     func_slot+1.., return {func_slot, nargs}.
+    ///   - `pushStagedBytecodeExecFrame` — the luaD_precall LUA_VLCL body:
+    ///     contract is "func + nargs args already staged at func_slot".
+    ///     No pointer test, no host copy, no storage-origin classification.
+    ///
+    /// Category-A callers (OP_CALL / OP_TFORCALL / opCall plain-Lua) have
+    /// func+args already contiguous in bc_stack and know nargs locally —
+    /// they call `pushStagedBytecodeExecFrame` directly (zero-copy, exactly
+    /// like PUC's OP_CALL which skips the staging because the operands are
+    /// already in the caller's registers).
+    ///
+    /// `bc_stack_top` is NOT bumped by staging: the activation owns the
+    /// top update (bc_stack_top = base + frame_cap) and its errdefer
+    /// restores the old top on failure — identical transactionality to the
+    /// previous prepareHostArgs-based flow. Staged values above
+    /// bc_stack_top are not GC-marked through bc_stack, exactly as before;
+    /// their sources (caller registers / host slices / metatables) remain
+    /// reachable across the stage→activate window, and the activation
+    /// makes them live as frame registers.
+    const StagedCall = struct {
+        func_slot: usize,
+        nargs: usize,
+    };
+
+    /// STAGE step (PUC luaT_callTMres setobj2s sequence, ltm.c:119-131):
+    /// write [callee, args...] contiguously onto bc_stack at `func_slot`
+    /// so the activation can consume slot+count. Shared and generic —
+    /// every Category-B caller (metamethods, __close, hooks, protected
+    /// targets, coroutine bodies) stages through this one primitive; no
+    /// caller-specific fast-path copies.
+    fn stageBytecodeCall(
+        self: *Vm,
+        func_slot: usize,
+        callee_cl: ?*Closure,
+        args: []const Value,
+    ) DispatchError!StagedCall {
+        // Reserve space for func + args only (PUC: luaT_callTMres assumes
+        // EXTRA_STACK for the staged values; the frame's own space is
+        // reserved by the activation's checkstackp equivalent).
+        const needed = func_slot + 1 + args.len;
+        if (needed > self.bc_stack.len) {
+            try self.ensureBcStackCap(needed);
+        }
+        self.bc_stack[func_slot] = if (callee_cl) |cl|
+            .{ .Closure = cl }
+        else
+            .Nil;
+        for (args, 0..) |v, i| {
+            self.bc_stack[func_slot + 1 + i] = v;
+        }
+        return .{ .func_slot = func_slot, .nargs = args.len };
+    }
+
+    /// ACTIVATE step (PUC luaD_precall LUA_VLCL branch, ldo.c:725-735).
+    ///
+    /// Contract: the callee value is at bc_stack[func_slot_in] and `nargs`
+    /// arguments are at bc_stack[func_slot_in+1 .. func_slot_in+1+nargs]
+    /// — either staged there by `stageBytecodeCall` (Category B) or
+    /// already in place as the caller's registers (Category A, zero-copy).
+    /// This function never inspects WHERE the values came from; it only
+    /// consumes the slot+count, exactly like PUC's precall derives
+    /// `narg = L->top.p - func - 1`.
+    fn pushStagedBytecodeExecFrame(
         self: *Vm,
         exec_frames: *FrameStack,
         proto: *const bc.Proto,
-        args: []const Value,
-        callee_cl: ?*Closure,
-        caller_func_slot: usize,
+        func_slot_in: usize,
+        nargs: usize,
         nresults: i32,
     ) DispatchError!void {
         if (self.stats.enabled) self.stats.calls_lua_frames += 1; // P16.0b: ALL Lua activations
@@ -11314,35 +11449,12 @@ pub const Vm = struct {
         // overwritten by register allocation (OP_VARARG reads them later).
         // For vararg functions WITH a table (PF_VATAB), no shift is needed —
         // VARARGPREP (first instruction) consumes the extra args into a table.
-        const nextra: usize = if (proto.is_vararg and args.len > nparams)
-            args.len - nparams
+        const nextra: usize = if (proto.is_vararg and nargs > nparams)
+            nargs - nparams
         else
             0;
         // VAHID: virtual varargs (no table). Needs buildhiddenargs shift.
         const is_vahid: bool = proto.is_vararg and nextra > 0 and proto.vararg_table_reg == null;
-
-        // ── Step 1: Place func + args at func_slot ──
-        const func_slot_in = caller_func_slot;
-
-        // Check if args already live on bc_stack at func_slot+1 (OP_CALL fast
-        // path). This is true when args.ptr points to bc_stack[func_slot+1].
-        const args_on_stack = blk: {
-            const args_ptr = @intFromPtr(args.ptr);
-            const bc_ptr = @intFromPtr(self.bc_stack.ptr);
-            const expected = bc_ptr + (func_slot_in + 1) * @sizeOf(Value);
-            break :blk args_ptr == expected;
-        };
-
-        if (!args_on_stack) {
-            // Host-recursion path (runBytecodeInternal, builtin pcall,
-            // metamethods, debug hooks, coroutine resume): args may come from
-            // a heap slice. Write func+args into bc_stack at the func_slot.
-            // P16.10a T12: outlined to a noinline cold helper to reduce
-            // register pressure in the hot (args_on_stack) path — the host-
-            // args copy uses callee-saved registers that otherwise spill hot-
-            // path values (proto, nparams, func_slot, args.len) to the stack.
-            try self.prepareHostArgs(func_slot_in, args, callee_cl, frame_cap, nextra);
-        }
 
         // ── Step 2: buildhiddenargs for VAHID ──
         // PUC ltm.c buildhiddenargs: shift func+params UP past the extra args.
@@ -11350,12 +11462,12 @@ pub const Vm = struct {
         //                                                  ^ new ci->func
         // Extra args stay at their original positions and become hidden varargs
         // at [new_func - nextra .. new_func].
-        // P16.10a T12: `nargs` alias removed — `args.len` used directly in the
-        // cold is_vahid branch. The dead nil-fill loop `nparams..@max(nparams,
+        // P16.10a T12: `nargs` is the staged-ABI parameter (PUC precall's
+        // derived narg). The dead nil-fill loop `nparams..@max(nparams,
         // nparams)` (an empty range — VAHID requires nextra>0 i.e. nargs>
         // nparams, so missing params are impossible) was provably-redundant
         // and deleted.
-        const func_slot: usize = if (is_vahid) func_slot_in + args.len + 1 else func_slot_in;
+        const func_slot: usize = if (is_vahid) func_slot_in + nargs + 1 else func_slot_in;
         const base = func_slot + 1;
 
         if (is_vahid) {
@@ -11417,11 +11529,11 @@ pub const Vm = struct {
         // P15.51g: boxed no longer cached in frame — derive locally for nil-fill.
         // Nil-fill missing parameters (PUC luaD_precall behavior).
         // For VAHID, params were already copied during buildhiddenargs.
-        // For non-VAHID, args are already in regs[0..nargs] from the caller's
-        // registers (OP_CALL path) or from the write above (host-recursion).
+        // For non-VAHID, args are already in regs[0..nargs] — either staged
+        // there by stageBytecodeCall (Category B) or in place as the caller's
+        // registers (Category A, zero-copy).
         if (!is_vahid) {
-            const nactual = args.len;
-            const ncopy = @min(nparams, nactual);
+            const ncopy = @min(nparams, nargs);
             for (ncopy..nparams) |i| regs[i] = .Nil;
         }
 
@@ -11503,35 +11615,6 @@ pub const Vm = struct {
 
         // Debug fields (must set explicitly — defaults don't re-apply on reuse)
         ef_slot.u.lua.resume_skip_count_pc = INVALID_PC;
-    }
-
-    // P16.10a T12: Cold helpers for pushBytecodeExecFrame — noinline to keep
-    // their register usage out of the hot (args_on_stack, non-VAHID, no-
-    // overflow) path. Each is reached only on uncommon activation kinds.
-
-    /// Host-recursion arg copy: args come from a heap slice (not bc_stack).
-    /// Writes func + args at func_slot so the frame's registers are contiguous.
-    /// Cold: runBytecodeInternal, builtin pcall, metamethods, debug hooks,
-    /// coroutine resume. The OP_CALL/OP_TAILCALL fast path never enters here.
-    noinline fn prepareHostArgs(
-        self: *Vm,
-        func_slot_in: usize,
-        args: []const Value,
-        callee_cl: ?*Closure,
-        frame_cap: u32,
-        nextra: usize,
-    ) DispatchError!void {
-        const needed_for_args = func_slot_in + 1 + args.len + frame_cap + nextra;
-        if (needed_for_args > self.bc_stack.len) {
-            try self.ensureBcStackCap(needed_for_args);
-        }
-        self.bc_stack[func_slot_in] = if (callee_cl) |cl|
-            .{ .Closure = cl }
-        else
-            .Nil;
-        for (0..args.len) |i| {
-            self.bc_stack[func_slot_in + 1 + i] = args[i];
-        }
     }
 
     /// VAHID buildhiddenargs (PUC ltm.c): shift func+params UP past the extra
@@ -11988,7 +12071,11 @@ pub const Vm = struct {
         if (resume_in_place) {
             exec_thread.bytecode_inplace_suspended = false;
         } else {
-            try self.pushBytecodeExecFrame(exec_frames, proto_in, args, effective_callee, self.bc_stack_top, -1);
+            // PUC lua_pcallk/lua_resume: the C API stages func+args on the
+            // value stack before docall — mirror it: stage at bc_stack_top
+            // (L->top), then activate.
+            const staged_entry = try self.stageBytecodeCall(self.bc_stack_top, effective_callee, args);
+            try self.pushStagedBytecodeExecFrame(exec_frames, proto_in, staged_entry.func_slot, staged_entry.nargs, -1);
             // PUC luaG_tracecall (ldebug.c:903-921): when a fresh activation
             // starts executing, the CALL hook fires with the NEW ci — the
             // main chunk of a lua_pcall/dostring, a C-API-called function,
@@ -14178,13 +14265,14 @@ pub const Vm = struct {
                                 // plus the pending lookup/union switch/
                                 // clearPendingCall on every return
                                 // (setPendingCall was 9.3% of lua_calls).
-                                const rargs = ctx.regs[a + 1 .. a + 1 + nargs];
-                                try self.pushBytecodeExecFrame(
+                                // Staged-ABI activation (PUC OP_CALL: func at
+                                // R[A], nargs args at R[A+1..] — already in
+                                // place, zero-copy, no staging needed).
+                                try self.pushStagedBytecodeExecFrame(
                                     ctx.exec_frames,
                                     proto,
-                                    rargs,
-                                    cl,
                                     ctx.base + a,
+                                    nargs,
                                     nresults,
                                 );
                                 // Defer block syncs parent frame state (pc,
@@ -15105,7 +15193,6 @@ pub const Vm = struct {
         if (callee_val == .Closure) {
             const cl = callee_val.Closure;
             if (cl.proto) |child_proto| {
-                const rargs = ctx.regs[a + 5 .. a + 5 + effective_nargs];
                 try self.setPendingCall(ctx.exec_frames.getPtr(ctx.frame_index), .{
                     .callee = callee_val,
                     .completion = .{ .results = .{
@@ -15115,7 +15202,9 @@ pub const Vm = struct {
                     } },
                 });
                 // Call from R[A+4] — above the close value at R[A+3].
-                try self.pushBytecodeExecFrame(ctx.exec_frames, child_proto, rargs, cl, ctx.base + a + 4, @intCast(nresults));
+                // Staged-ABI activation: iterator at R[A+4], args at
+                // R[A+5..] already in place (zero-copy).
+                try self.pushStagedBytecodeExecFrame(ctx.exec_frames, child_proto, ctx.base + a + 4, effective_nargs, @intCast(nresults));
                 // PUC OP_TFORCALL (lvm.c): the iterator is invoked via
                 // luaD_call → luaG_tracecall → LUA_HOOKCALL with
                 // name="for iterator" (ldebug.c funcnamefromcode).
@@ -16336,7 +16425,9 @@ pub const Vm = struct {
                     // PUC-faithful: result contract is in callee's callstatus
                     // (CIST_NRESULTS) and func_slot (dst derivation). No
                     // pending_call needed for ordinary Lua CALL.
-                    try self.pushBytecodeExecFrame(ctx.exec_frames, proto2, rargs, cl, ctx.base + a, nresults);
+                    // Staged-ABI activation: callee at R[A] (possibly the
+                    // __call-resolved value), args at R[A+1..] in place.
+                    try self.pushStagedBytecodeExecFrame(ctx.exec_frames, proto2, ctx.base + a, effective_nargs, nresults);
                     // CALL hook on the callee activation (PUC luaD_hookcall:
                     // the new ci exists, then the hook fires). rargs may be
                     // stale after the push (bc_stack realloc) — the helper
@@ -41651,7 +41742,10 @@ test "vm: P16.8a transactional simple_result setup — errdefer rollback on push
 
     // Push a parent Lua frame onto the active thread's call_frames.
     const exec_frames = &vm.activeBytecodeThread().call_frames;
-    try vm.pushBytecodeExecFrame(exec_frames, parent_proto, &.{}, parent_cl, 0, -1);
+    // Stage the parent frame at slot 0 (PUC: lua_pcallk pushes func+args
+    // onto the stack before docall) and activate.
+    const staged_parent = try vm.stageBytecodeCall(0, parent_cl, &.{});
+    try vm.pushStagedBytecodeExecFrame(exec_frames, parent_proto, staged_parent.func_slot, staged_parent.nargs, -1);
     const parent_index: usize = 0;
     const saved_frame_count = exec_frames.len();
     const saved_bc_stack_top = vm.bc_stack_top;
@@ -41753,6 +41847,185 @@ test "vm: P16.8a transactional simple_result setup — errdefer rollback on push
 
     // Restore bc_stack_top for clean deinit.
     vm.bc_stack_top = saved_bc_stack_top;
+}
+
+// =========================================================================
+// P16.15 T6: transactional STAGED activation — failure BETWEEN staging
+// and activation.
+//
+// The staged ABI (stageBytecodeCall → pushStagedBytecodeExecFrame) opens a
+// new failure window relative to the old fused flow: staging can succeed
+// (func+args written at bc_stack_top) while the activation fails afterwards
+// (frame-space growth OOM, or FrameStack.addOne OOM). This test forces each
+// failure point and verifies the PUC luaT_callTMres → luaD_precall sequence
+// rolls back exactly:
+//   1. parent simple_result state restored (NONE),
+//   2. no child frame left (frame count unchanged),
+//   3. no pending-call slot leak (pending_call_index == INVALID_PENDING),
+//   4. bc_stack_top restored to its pre-call value (staged temporaries
+//      above bc_stack_top are dead by definition — not part of any live
+//      frame region and not GC-marked through bc_stack),
+//   5. success iteration: errdefers do NOT fire spuriously.
+// =========================================================================
+test "vm: P16.15 T6 transactional staged activation — failure between staging and activation" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    // Parent: minimal frame. Child: 60 locals → large frame_cap, so the
+    // activation's needed_top (base + frame_cap) exceeds the remaining
+    // bc_stack headroom while the staged func+2 args still fit.
+    const parent_proto = try compileTestProto(aalloc, "return 1\n");
+    var many_locals_buf: [820]u8 = undefined;
+    var many_locals_len: usize = 0;
+    const writeMany = struct {
+        fn run(buf: []u8, len: *usize, bytes: []const u8) void {
+            @memcpy(buf[len.* .. len.* + bytes.len], bytes);
+            len.* += bytes.len;
+        }
+    }.run;
+    writeMany(&many_locals_buf, &many_locals_len, "local ");
+    var name_buf: [8]u8 = undefined;
+    for (1..60) |i| {
+        const name = std.fmt.bufPrint(&name_buf, "a{d},", .{i}) catch unreachable;
+        writeMany(&many_locals_buf, &many_locals_len, name);
+    }
+    writeMany(&many_locals_buf, &many_locals_len, "a60\nreturn 1\n");
+    const mm_proto = try compileTestProto(aalloc, many_locals_buf[0..many_locals_len]);
+
+    var vm = Vm.init(aalloc, false);
+    defer vm.deinit();
+
+    const parent_cl = try aalloc.create(Closure);
+    parent_cl.* = .{ .proto = parent_proto, .tree = vm.retainTreeForClosure(parent_proto), .upvalues = &.{} };
+    try vm.gcRegisterClosure(parent_cl);
+    const mm_cl = try aalloc.create(Closure);
+    mm_cl.* = .{ .proto = mm_proto, .tree = vm.retainTreeForClosure(mm_proto), .upvalues = &.{} };
+    try vm.gcRegisterClosure(mm_cl);
+    try vm.resolveProtoConstants(parent_proto);
+    try vm.resolveProtoConstants(mm_proto);
+
+    // Push the parent frame (staged ABI: stage at slot 0, activate).
+    const exec_frames = &vm.activeBytecodeThread().call_frames;
+    const staged_parent = try vm.stageBytecodeCall(0, parent_cl, &.{});
+    try vm.pushStagedBytecodeExecFrame(exec_frames, parent_proto, staged_parent.func_slot, staged_parent.nargs, -1);
+    const parent_index: usize = 0;
+    const saved_frame_count = exec_frames.len();
+
+    const args = [_]Value{ .Nil, .Nil };
+
+    // ── Failure point 1: activation's frame-space growth (ensureBcStackCap
+    // inside pushStagedBytecodeExecFrame) fails AFTER staging succeeded. ──
+    // bc_stack_top = len - 3: staging needs exactly len slots (func + 2
+    // args) → no growth, staging completes. The child's frame_cap (~66)
+    // exceeds the 2 remaining slots → growBcStackCapSlow → FailingAllocator
+    // makes the realloc fail → error.OutOfMemory.
+    {
+        exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
+        vm.bc_stack_top = vm.bc_stack.len - 3;
+        const saved_top = vm.bc_stack_top;
+
+        var failing = std.testing.FailingAllocator.init(aalloc, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        const saved_alloc = vm.alloc;
+        vm.alloc = failing.allocator();
+        defer vm.alloc = saved_alloc;
+
+        const result = vm.tryPushSimpleResultMetamethod(
+            exec_frames,
+            parent_index,
+            .{ .Closure = mm_cl },
+            args[0..],
+            .add,
+            .{ .value = 0 },
+        );
+        vm.alloc = saved_alloc;
+
+        try testing.expectError(error.OutOfMemory, result);
+        // 1. simple_result rolled back.
+        try testing.expect(!exec_frames.getPtr(parent_index).u.lua.hasSimpleResult());
+        // 2. no child frame.
+        try testing.expectEqual(saved_frame_count, exec_frames.len());
+        // 3. no pending-call slot leak.
+        try testing.expectEqual(
+            @as(u32, INVALID_PENDING),
+            exec_frames.getPtr(parent_index).pending_call_index,
+        );
+        // 4. bc_stack_top restored (staging never bumps it; the activation
+        //    failed before its own top update).
+        try testing.expectEqual(saved_top, vm.bc_stack_top);
+    }
+
+    // ── Failure point 2: FrameStack.addOne fails AFTER staging AND after
+    // the activation's stack growth + bc_stack_top update. ──
+    // Pre-grow bc_stack so the activation needs no growth: the first
+    // allocation on the path is addOne, which the FailingAllocator rejects.
+    {
+        exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
+        const child_frame_cap: usize = mm_proto.maxstacksize + EXTRA_MARGIN;
+        try vm.ensureBcStackCap(vm.bc_stack_top + 1 + args.len + child_frame_cap);
+        vm.bc_stack_top = vm.bc_stack.len - 1 - args.len - child_frame_cap;
+        const saved_top = vm.bc_stack_top;
+
+        var failing = std.testing.FailingAllocator.init(aalloc, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        const saved_alloc = vm.alloc;
+        vm.alloc = failing.allocator();
+        defer vm.alloc = saved_alloc;
+
+        const result = vm.tryPushSimpleResultMetamethod(
+            exec_frames,
+            parent_index,
+            .{ .Closure = mm_cl },
+            args[0..],
+            .add,
+            .{ .value = 0 },
+        );
+        vm.alloc = saved_alloc;
+
+        try testing.expectError(error.OutOfMemory, result);
+        try testing.expect(!exec_frames.getPtr(parent_index).u.lua.hasSimpleResult());
+        try testing.expectEqual(saved_frame_count, exec_frames.len());
+        try testing.expectEqual(
+            @as(u32, INVALID_PENDING),
+            exec_frames.getPtr(parent_index).pending_call_index,
+        );
+        // bc_stack_top was set to needed_top before addOne failed — the
+        // errdefer must have restored it.
+        try testing.expectEqual(saved_top, vm.bc_stack_top);
+    }
+
+    // ── Success iteration: staging + activation both succeed. ──
+    {
+        exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
+        const child_frame_cap: usize = mm_proto.maxstacksize + EXTRA_MARGIN;
+        try vm.ensureBcStackCap(vm.bc_stack_top + 1 + args.len + child_frame_cap);
+
+        const outcome = try vm.tryPushSimpleResultMetamethod(
+            exec_frames,
+            parent_index,
+            .{ .Closure = mm_cl },
+            args[0..],
+            .add,
+            .{ .value = 0 },
+        );
+        try testing.expect(outcome == .pushed);
+        try testing.expect(exec_frames.getPtr(parent_index).u.lua.hasSimpleResult());
+        try testing.expectEqual(saved_frame_count + 1, exec_frames.len());
+        // Clean up: pop the child frame and clear simple_result.
+        vm.popBytecodeExecFrame(exec_frames);
+        exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
+    }
+
+    // Restore bc_stack_top for clean deinit.
+    vm.bc_stack_top = exec_frames.getPtr(parent_index).base +
+        exec_frames.getPtr(parent_index).u.lua.frame_cap;
 }
 
 // =========================================================================

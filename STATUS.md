@@ -1,4 +1,4 @@
-> Last updated: 2026-09-02 (P16.10d — C-API load parity (loadChunk + external_borrow), honest fixed accounting (472B documented deviation), ProtoTreeOwner merged into Proto)
+> Last updated: 2026-09-03 (P16.12/13 — tm-lookup PUC alignment (nodeLookupShortStrIdentity, luaH_Hgetshortstr parity), mutation smoke 68, artifact provenance)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -34,11 +34,11 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Upstream matrix (`testes/*.lua`, `--testc`) | **30/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua; zig_fail: api.lua |
 | Differential output (`--diff`) | **0 output_diff** |
-| Smoke tests (`tests/smoke/*.lua`) | **67/67** pass |
+| Smoke tests (`tests/smoke/*.lua`) | **68/68** pass |
 | C API suites (`tests/c_api`) | 20 suites |
-| Performance (geomean vs PUC) | **1.79x** |
+| Performance (geomean vs PUC) | **1.80x** |
 
-Geomean замедления vs PUC Lua: **1.79x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.80x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.

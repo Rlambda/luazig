@@ -1,1 +1,1 @@
-P16.10d — C-API load parity (loadChunk + external_borrow), honest fixed accounting (472B documented deviation), ProtoTreeOwner merged into Proto
+P16.12/13 — tm-lookup PUC alignment (nodeLookupShortStrIdentity, luaH_Hgetshortstr parity), mutation smoke 68, artifact provenance

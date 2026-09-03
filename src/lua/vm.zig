@@ -12896,7 +12896,7 @@ pub const Vm = struct {
                         // SETFIELD does via debugBytecodeOperandName).
                         if (env != .Table) {
                             const upv_name = if (a < ctx.cur_proto.upvalues.len)
-                                ctx.cur_proto.upvalues[a].name
+                                ctx.cur_proto.upvalues[a].name()
                             else
                                 "";
                             const tn = switch (env) {
@@ -24075,7 +24075,7 @@ pub const Vm = struct {
         if (cl.proto) |proto| {
             for (proto.upvalues, 0..) |uv, i| {
                 if (i >= cl.upvalues.len) break;
-                if (std.mem.eql(u8, uv.name, "_ENV")) {
+                if (std.mem.eql(u8, uv.name(), "_ENV")) {
                     try self.gcStoreCellValue(cl.upvalues[i], env_val);
                     return;
                 }
@@ -24266,12 +24266,13 @@ pub const Vm = struct {
         if (proto.upvalues.len > 0) {
             const uvs = try self.alloc.alloc(bc.Upvaldesc, proto.upvalues.len);
             for (proto.upvalues, 0..) |uv, i| {
-                uvs[i] = .{
-                    .instack = uv.instack,
-                    .idx = uv.idx,
-                    .is_const = uv.is_const,
-                    .name = if (uv.name.len > 0) try dupeOwned(self, owner, uv.name) else uv.name,
-                };
+                const nm = uv.name();
+                uvs[i] = bc.Upvaldesc.make(
+                    uv.instack,
+                    uv.idx,
+                    uv.is_const,
+                    if (nm.len > 0) try dupeOwned(self, owner, nm) else nm,
+                );
             }
             proto.upvalues = uvs;
         }
@@ -25539,8 +25540,8 @@ pub const Vm = struct {
                     if (inst.a != reg) continue;
                     if (debugBytecodeDefinitionIsConditional(proto, cursor, call_pc)) return .{};
                     const idx: usize = inst.b;
-                    if (idx < proto.upvalues.len and proto.upvalues[idx].name.len != 0) {
-                        return .{ .name = proto.upvalues[idx].name, .namewhat = "upvalue" };
+                    if (idx < proto.upvalues.len and proto.upvalues[idx].name().len != 0) {
+                        return .{ .name = proto.upvalues[idx].name(), .namewhat = "upvalue" };
                     }
                     return .{};
                 },
@@ -25555,7 +25556,7 @@ pub const Vm = struct {
                             // upvalue is _ENV, "field" otherwise (e.g. upvalue.x).
                             const upidx: usize = inst.b;
                             const is_env = upidx < proto.upvalues.len and
-                                std.mem.eql(u8, proto.upvalues[upidx].name, "_ENV");
+                                std.mem.eql(u8, proto.upvalues[upidx].name(), "_ENV");
                             if (is_env) {
                                 return .{ .name = c.str.bytes(), .namewhat = "global" };
                             }
@@ -26591,7 +26592,7 @@ pub const Vm = struct {
         // For bytecode closures, upvalue names live in the Proto.
         if (cl.proto) |p| {
             if (uidx < p.upvalues.len) {
-                const nm = p.upvalues[uidx].name;
+                const nm = p.upvalues[uidx].name();
                 if (nm.len != 0) return nm;
             }
             if (uidx == 0 and p.line_defined == 0) return "_ENV";

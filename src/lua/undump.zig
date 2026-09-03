@@ -410,12 +410,12 @@ pub const UndumpReader = struct {
             const idx = try self.readByte();
             const is_const_byte = try self.readByte();
             const uv_name = try self.readStringDedup();
-            upvalues[n_upv] = .{
-                .instack = instack_byte != 0,
-                .idx = idx,
-                .is_const = is_const_byte != 0,
-                .name = uv_name,
-            };
+            upvalues[n_upv] = bc.Upvaldesc.make(
+                instack_byte != 0,
+                idx,
+                is_const_byte != 0,
+                uv_name,
+            );
         }
 
         // 12. Inner protos: length prefix, then each child recursively.
@@ -741,8 +741,8 @@ test "UndumpReader: undumpProto round-trips vararg + upvalues + locvars" {
     };
     const ks = [_]bc.Constant{};
     const uvs = [_]bc.Upvaldesc{
-        .{ .instack = true, .idx = 0, .is_const = false, .name = "x" },
-        .{ .instack = false, .idx = 1, .is_const = true, .name = "y" },
+        bc.Upvaldesc.make(true, 0, false, "x"),
+        bc.Upvaldesc.make(false, 1, true, "y"),
     };
     const ps = [_]*bc.Proto{};
     const lis = [_]u32{ 10, 20 };

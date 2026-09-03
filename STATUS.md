@@ -6808,3 +6808,27 @@ string_concat −0.21% / flat, field_access +1.79% then +0.56% on re-run
 (instr flat both times — cycle noise). No regression.
 
 Remaining api580 ledger (charged): 456 vs PUC 304; still need −57B.
+
+## P16.16 T7 (C4) — Upvaldesc name packed ptr+len: 24→16 (=PUC) (2026-09-04)
+
+Structural cut 4. The debug name was a 16B Zig slice; PUC's Upvaldesc
+carries a pointer-only `TString *name` (8B) for a 16B struct. Packed to
+`name_ptr: ?[*]const u8` + `name_len: u32` with an inline `name()`
+slice accessor and a `make()` constructor (empty name → null ptr + 0
+len = the stripped-chunk representation, PUC name == NULL). All writers
+(codegen ensureUpvalue ×3 + _ENV sites ×2, undump loadUpvalues, clone-
+UndumpedStrings, dump/undump tests) go through `make()`; all readers
+(dump.writeStringDedup, debug.getinfo name resolution, _ENV lookup,
+applyLoadEnv, bytecode debug print) through `name()`.
+
+@sizeOf: Upvaldesc 24→16 (= PUC). api580 (anchored, 3 runs):
+456 → **448** (−8 = the single _ENV upvaldesc in the ledger).
+
+Gates: db (debug.getupvalue names) / closure / strings / nextvar / gc /
+gengc / coroutine / errors --testc PASS; zig build test PASS (dump/
+undump roundtrip incl. stripped names); smoke 68/68; c_api 20 suites +
+8/8 diff (18_dump/19_load borrow paths) PASS.
+
+Perf A/B: lua_calls −1.48% cyc / instr flat (no regression).
+
+Remaining api580 ledger (charged): 448 vs PUC 304; still need −49B.

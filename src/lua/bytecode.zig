@@ -419,8 +419,30 @@ pub const Upvaldesc = struct {
     idx: u8,
     /// true = read-only (const attribute propagated through closure capture).
     is_const: bool,
-    /// Human-readable name for debug info.
-    name: []const u8,
+    /// Debug name (PUC: `TString *name` — pointer-only, 8B). Packed
+    /// ptr + u32 len instead of a 16B Zig slice (P16.16 C4/T7):
+    /// 24→16 = PUC's Upvaldesc size. Stripped chunks carry a null
+    /// pointer + 0 length (PUC: name == NULL).
+    name_ptr: ?[*]const u8 = null,
+    name_len: u32 = 0,
+
+    /// The debug name as a slice (empty when stripped/null).
+    pub inline fn name(self: Upvaldesc) []const u8 {
+        const p = self.name_ptr orelse return &.{};
+        return p[0..self.name_len];
+    }
+
+    /// Construct a descriptor from a name slice (empty slice → null ptr,
+    /// the stripped representation).
+    pub fn make(instack: bool, idx: u8, is_const: bool, name_: []const u8) Upvaldesc {
+        return .{
+            .instack = instack,
+            .idx = idx,
+            .is_const = is_const,
+            .name_ptr = if (name_.len == 0) null else name_.ptr,
+            .name_len = @intCast(name_.len),
+        };
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -1662,7 +1684,7 @@ pub fn dumpProto(w: anytype, proto: *const Proto, depth: u32) !void {
         try w.print("upvalues ({d}) for {s}:\n", .{ proto.upvalues.len, proto.source_name });
         for (proto.upvalues, 0..) |uv, idx| {
             try w.print("{s}\t{d}\t{s}\t{s}\t{d}\n", .{
-                indent, idx, uv.name,
+                indent, idx, uv.name(),
                 if (uv.instack) "register" else "upvalue",
                 uv.idx,
             });

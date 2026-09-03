@@ -351,7 +351,7 @@ pub const DumpWriter = struct {
             if (options.strip) {
                 try self.writeStringDedup("");
             } else {
-                try self.writeStringDedup(uv.name);
+                try self.writeStringDedup(uv.name());
             }
         }
 
@@ -588,7 +588,7 @@ test "DumpWriter: strip omits debug fields, keeps semantic fields" {
     };
 
     const outer_uvs = [_]bc.Upvaldesc{
-        .{ .instack = false, .idx = 0, .is_const = true, .name = "x" },
+        bc.Upvaldesc.make(false, 0, true, "x"),
     };
     const outer_ps = [_]*bc.Proto{@constCast(&inner)};
     const outer_lis = [_]u32{ 1, 1, 2 };
@@ -639,7 +639,7 @@ test "DumpWriter: strip omits debug fields, keeps semantic fields" {
     try std.testing.expectEqual(@as(usize, 0), out.lineinfo.len);
     try std.testing.expectEqual(@as(usize, 0), out.locvars.len);
     try std.testing.expectEqual(@as(usize, 1), out.upvalues.len);
-    try std.testing.expectEqualSlices(u8, "", out.upvalues[0].name);
+    try std.testing.expectEqualSlices(u8, "", out.upvalues[0].name());
     // The upvalue *descriptor* survives: execution needs it.
     try std.testing.expectEqual(false, out.upvalues[0].instack);
     try std.testing.expectEqual(@as(u8, 0), out.upvalues[0].idx);

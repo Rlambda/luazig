@@ -1375,12 +1375,9 @@ pub const Codegen = struct {
                 outer.captured_regs.put(outer.alloc, reg, {}) catch @panic("oom");
                 const is_const = outer.isReadonlyLocal(reg);
                 const idx = try self.nextUpvalueIndex();
-                try self.upvalue_descs.append(self.alloc, .{
-                    .instack = true,
-                    .idx = reg,
-                    .is_const = is_const,
-                    .name = name,
-                });
+                try self.upvalue_descs.append(self.alloc, bc.Upvaldesc.make(
+                    true, reg, is_const, name,
+                ));
                 try self.upvalues.put(self.alloc, name, idx);
                 if (is_const) self.const_upvalues.put(self.alloc, idx, {}) catch @panic("oom");
                 // Propagate the compile-time constant value (PUC VCONST):
@@ -1395,12 +1392,9 @@ pub const Codegen = struct {
             if (outer.upvalues.get(name)) |outer_idx| {
                 const is_const = outer.isConstUpvalue(outer_idx);
                 const idx = try self.nextUpvalueIndex();
-                try self.upvalue_descs.append(self.alloc, .{
-                    .instack = false,
-                    .idx = outer_idx,
-                    .is_const = is_const,
-                    .name = name,
-                });
+                try self.upvalue_descs.append(self.alloc, bc.Upvaldesc.make(
+                    false, outer_idx, is_const, name,
+                ));
                 try self.upvalues.put(self.alloc, name, idx);
                 if (is_const) self.const_upvalues.put(self.alloc, idx, {}) catch @panic("oom");
                 if (outer.const_upvalue_values.get(outer_idx)) |v| {
@@ -1415,12 +1409,9 @@ pub const Codegen = struct {
             const outer_idx = try outer.ensureUpvalue(name);
             const is_const = outer.isConstUpvalue(outer_idx);
             const idx = try self.nextUpvalueIndex();
-            try self.upvalue_descs.append(self.alloc, .{
-                .instack = false,
-                .idx = outer_idx,
-                .is_const = is_const,
-                .name = name,
-            });
+            try self.upvalue_descs.append(self.alloc, bc.Upvaldesc.make(
+                false, outer_idx, is_const, name,
+            ));
             try self.upvalues.put(self.alloc, name, idx);
             if (is_const) self.const_upvalues.put(self.alloc, idx, {}) catch @panic("oom");
             if (outer.const_upvalue_values.get(outer_idx)) |v| {
@@ -4680,12 +4671,9 @@ pub const Codegen = struct {
         // is first encountered, matching PUC Lua's singlevaraux behavior.
         if (self.outer == null) {
             const idx = try self.nextUpvalueIndex();
-            try self.upvalue_descs.append(self.alloc, .{
-                .instack = true,
-                .idx = 0,
-                .is_const = false,
-                .name = "_ENV",
-            });
+            try self.upvalue_descs.append(self.alloc, bc.Upvaldesc.make(
+                true, 0, false, "_ENV",
+            ));
             try self.upvalues.put(self.alloc, "_ENV", idx);
             self.env_upvalue_idx = idx;
         }
@@ -6866,12 +6854,7 @@ pub const Codegen = struct {
         self.is_vararg = true;
 
         // Reserve _ENV as upvalue 0 (like PUC Lua).
-        _ = try self.builder.addUpvalue(.{
-            .instack = false,
-            .idx = 0,
-            .is_const = false,
-            .name = "_ENV",
-        });
+        _ = try self.builder.addUpvalue(bc.Upvaldesc.make(false, 0, false, "_ENV"));
         try self.upvalues.put(self.alloc, "_ENV", 0);
 
         // VARARGPREP is VM bookkeeping and has no source-visible line in

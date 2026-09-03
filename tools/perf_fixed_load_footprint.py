@@ -55,6 +55,20 @@ def git_head() -> str:
     return out.strip() if rc == 0 else "unknown"
 
 
+def git_dirty() -> str:
+    """Provenance: a dirty-tree measurement must never be labeled by HEAD alone."""
+    rc, out, _ = run(["git", "status", "--porcelain", "--untracked-files=no"], )
+    return "dirty" if out.strip() else "clean"
+
+
+def binary_sha(path) -> str:
+    import hashlib
+    try:
+        return hashlib.sha256(open(path, "rb").read()).hexdigest()[:16]
+    except OSError:
+        return "unknown"
+
+
 def build_all() -> None:
     run(["zig", "build", "-Doptimize=ReleaseFast"], timeout_s=300)
     run(["make", "-C", str(ROOT / "lua-5.5.0"), "clean", "lua-c"],
@@ -325,6 +339,8 @@ def main() -> int:
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "zig_version": zig_version(),
         "git_head": git_head(),
+        "git_dirty": git_dirty(),
+        "zig_binary_sha256_16": binary_sha(ROOT / "zig-out" / "bin" / "luazig"),
         "zig_sizes": zig_sizes,
         "puc_sizes": puc_sizes,
         "zig_components": zig_components,

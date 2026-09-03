@@ -6294,3 +6294,76 @@ incl. 19_load differential. db/locals/closure/coroutine/gc/gengc --testc
 PASS. nextvar 3x PASS. leak_bench PASS. native lanes BOUNDED. /tmp/repro_zig
 PUC-identical (mode=b/B load=0 call=0 value=42).
 zig build test (Debug) + ReleaseFast both pass.
+
+## P16.13 T2 — getTmByObj decomposition (2026-09-03, ANALYSIS ONLY)
+
+**Setup:** ReleaseFast, `taskset -c 0`, isolated scripts `/tmp/t2_noalloc.lua`
+(2M iterations, metamethod_call_noalloc pattern: `s = s + box`, `__add` returns
+`a` — no alloc) and `/tmp/t2_add.lua` (2M iterations, metamethod_add pattern:
+`__add` allocates a new table). `perf record -g --call-graph=dwarf -F 9999`.
+
+### metamethod_call_noalloc (no alloc/GC — pure dispatch+lookup)
+
+Overall: 1,811M instructions, 352M cycles, 0.102s. `getTmByObj` = **6.33%**
+(64/1030 samples). The task's "fresh profile" cited 10.3% — difference is
+sample-count / run conditions; the decomposition below is from 1030 samples.
+
+Decomposition of `getTmByObj` 6.33% (annotated `perf annotate`):
+
+| Sub-component | % of getTmByObj | % of total | Evidence (annot) |
+|---|---|---|---|
+| Call overhead (push regs, sub rsp) | ~10% | ~0.63% | `push %r14` 6.64%, `sub $0x28` 3.33% |
+| `valueMetatable` switch (indirect jmp + per-type metatable load + null test) | ~15% | ~0.95% | `jmp *%rax` 4.68%, `test %rax,%rax; jne` 1.67% |
+| `tm_names[event]` load + null test | ~26% | ~1.05% | `mov 0xa8(%rsi,%rcx,8),%r14; test %r14,%r14` 16.59% |
+| `nodeLookupStr` hash compute (`key.hash & (len-1)`) + addressing | ~10% | ~0.63% | `lea -0x1(%r15); and (%r14),%r12; shl $0x5` |
+| `isEmpty()` check (bucket unused) | ~13% | ~0.52% | `cmpb $0x0,0x1c(%r13,%r12,1)` 8.25% |
+| `key_tt == .string` check | ~8% | ~0.32% | `cmpb $0x4,0x1c(%r12)` 4.99% |
+| `luaStringEq` is_short checks (both operands) | ~9% | ~0.38% | `cmpb $0x1,0x40(%rdi)` 3.01%, `cmpb $0x1,0x40(%r14)` 0% |
+| pointer eq (`a == b`) | ~0% | ~0% | `cmp %r14,%rdi` 0% — always taken (hit) |
+| content-eq fallback (NEVER executed, icache pressure) | 0% | 0% | `mov 0x8(%rdi),%rcx; cmp 0x8(%r14),%rcx` 0% — dead code in hot path |
+| Nil value check + return | ~5% | ~0.32% | after nodeLookupStr returns |
+| misc (nopw, addressing) | ~4% | ~0.25% | `nopw`, `mov %rax,-0x48(%rbp)` 6.26% |
+
+**Key findings:**
+1. **`tm_names[event]` load + null test is the largest single chunk (26%)** —
+   the optional `?*LuaString` array requires a null check per call. PUC's
+   `G(L)->tmname[event]` is a bare `TString*` (never null after `luaT_init`),
+   so PUC has no null check here. Our `?*LuaString` could be `*LuaString`
+   (guaranteed non-null after init) — a potential T4 experiment.
+2. **`luaStringEq` is_short checks (9%)** are redundant for TMS lookups:
+   `tm_names[event]` is always a pre-interned short string. The `b.is_short`
+   check (key.is_short) is always true. T3's `nodeLookupShortStrIdentity`
+   eliminates both is_short checks and the content-eq fallback.
+3. **content-eq fallback (0% samples but icache cost)** — the long-string
+   content comparison code is inlined into `getTmByObj` but never executed.
+   It pollutes the icache and increases function size. T3 removes it.
+4. **`isEmpty()` check (13%)** — PUC's `luaH_Hgetshortstr` does NOT have this;
+   it goes straight into the chain walk (first node: `keyisshrstr` false →
+   `gnext == 0` → absent). Our `isEmpty` is an extra branch. For metamethod
+   tables (typically small, non-empty buckets), this branch is usually not-taken
+   (the bucket IS used). T4 experiment candidate: drop `isEmpty`, match PUC.
+5. **`valueMetatable` switch (15%)** — indirect jump + per-type load. PUC's
+   `luaT_gettmbyobj` has the same switch. This is structural, not a regression.
+
+### metamethod_add (alloc-heavy — getTmByObj is minor)
+
+Overall: 2,590M cycles, 0.695s. `getTmByObj` = **1.92%** — dominated by
+alloc/GC (`heap.SmpAllocator.free` 6.91%, `.alloc` 6.54%) and table operations
+(`rawGet` 4.04%, `rawSet` 3.68%, `tableResize` 1.87%). The T3 primitive won't
+measurably affect `metamethod_add` — the win is concentrated in
+`metamethod_call_noalloc`.
+
+### T3/T4 targets (from decomposition)
+
+- **T3 (nodeLookupShortStrIdentity):** eliminates is_short checks (0.38% of
+  total) + content-eq icache pollution. Expected win: ~0.4-0.6% of
+  metamethod_call_noalloc.
+- **T4 experiment A:** drop `isEmpty()` check in the identity primitive (match
+  PUC `luaH_Hgetshortstr` exactly). Potential win: ~0.5% if the branch is
+  consistently not-taken.
+- **T4 experiment B:** change `tm_names` from `?*LuaString` to `*LuaString`
+  (guaranteed non-null after init). Eliminates the null check (1.05% of total).
+  Requires init-order audit.
+- **T4 experiment C:** fuse `valueMetatable` + `tm_names` load + `nodeLookupStr`
+  into a single `getTmByObj` body (no function-call boundary). The function is
+  already inlined, so this is unlikely to help — verify with A/B.

@@ -1,0 +1,401 @@
+{
+  "created_utc": "2026-09-03T22:40:06.918347+00:00",
+  "provenance": {
+    "git_head": "48ae460",
+    "git_dirty": "clean",
+    "zig_version": "0.16.0",
+    "zig_binary_sha16": "5651f1443dac4c36"
+  },
+  "gate_threshold": 400,
+  "verdict": "DEVIATION",
+  "measured_delta_anchored": 544,
+  "measured_delta_no_xy_root": 690,
+  "savings_needed_below_400": 145,
+  "zig_sizes": {
+    "Proto": 248,
+    "Closure": 88,
+    "Cell": 64,
+    "LuaString": 72,
+    "Value": 16,
+    "Upvaldesc": 24,
+    "Constant": 16
+  },
+  "puc_sizes": {
+    "Proto": 128,
+    "TValue": 16,
+    "Upvaldesc": 16,
+    "LClosure": 40,
+    "UpVal": 40,
+    "TString": 48,
+    "offsetof_TString_contents": 24,
+    "offsetof_TString_falloc": 32,
+    "offsetof_LClosure_upvals": 32,
+    "sizeLclosure_1": 40,
+    "sizestrshr_1": 26,
+    "lstrfix_header": 32
+  },
+  "zig_components": {
+    "Proto_struct": 248,
+    "k_array": 0,
+    "resolved_values": 48,
+    "upvalues_desc": 24,
+    "Closure": 88,
+    "Cell": 64,
+    "external_LuaString_header": 72,
+    "Closure_upvalues_slice": 8,
+    "string_dedup_leak": 144,
+    "xy_reintern": 0,
+    "code_borrowed": 0,
+    "lineinfo_borrowed": 0,
+    "charged_total": 544,
+    "real_outstanding_total": 696
+  },
+  "puc_components": {
+    "LClosure_incl_1_upval_ptr": 40,
+    "Proto_struct": 128,
+    "k_array": 48,
+    "upvalues_desc": 16,
+    "TString_LSTRFIX_header": 32,
+    "UpVal": 40,
+    "X_reintern": 0,
+    "Y_reintern": 0,
+    "code_borrowed": 0,
+    "lineinfo_borrowed": 0,
+    "dedup_table_transient": 0,
+    "total": 304
+  },
+  "gaps_zig_minus_puc": {
+    "Proto": 120,
+    "constants_array": 0,
+    "upvalues_desc": 8,
+    "closure_total": 56,
+    "upvalue_cell": 24,
+    "long_const_header": 40,
+    "xy_reintern": 0,
+    "string_dedup_leak": 144,
+    "charged_total": 240,
+    "real_memory_total": 392
+  },
+  "reconciliation": {
+    "rule": "collectgarbage(\"count\")*1024 == gcControl(3)*1024 + gcControl(4) == trunc(gc_count_kb * 1024); the ledger's charged components must sum EXACTLY to m2 - m1",
+    "anchored": {
+      "measured": 544,
+      "charged_total": 544,
+      "reconciled": true
+    },
+    "no_xy_root": {
+      "measured": 690,
+      "charged_total": 690,
+      "reconciled": true,
+      "note": "adds the X/Y re-intern: 2 x (sizeof(LuaString)+1) = 146 charged; the allocations are 74 bytes each (extra NUL byte not charged), so tracker bytes exceed the charge by 2"
+    },
+    "real_outstanding_anchored": {
+      "tracker_bytes": 696,
+      "uncounted_by_gc": {
+        "Closure_upvalues_slice": 8,
+        "string_dedup_leak": 144
+      }
+    }
+  },
+  "context_variance": {
+    "summary": "The delta depends on ONE context-dependent component: whether the short strings \"X\"/\"Y\" are still interned when the interval's undump runs. They are referenced by the initial compile closure AND by the enclosing chunk's own constants when it contains the api.lua:578-579 trailing statements (\"X = 0; ... X = nil; Y = nil\").",
+    "anchored_544": "In the exact api.lua shape the trailing verification statements make \"X\"/\"Y\" constants of the enclosing chunk; its frame is live for the whole run, so the constants root the short strings through every GC and the undump finds them in the intern table \u2014 no re-intern: 544 (binary-measured, stable across 20 runs; reproduced by the anchored harness variant).",
+    "no_xy_root_690": "Without the trailing statements the enclosing chunk has no X/Y constants; the initial compile closure (the only other referent) is collected by the pre-m1 GCs (probe-verified), X/Y are swept from the intern table, and the undump re-interns them: 544 + 146 = 690 (binary-measured; reproduced by the variance harness variant).",
+    "history_note": "This fully explains the historical 544-690 range recorded in STATUS.md for api.lua:580: measurement drivers that omitted the trailing X/Y statements measured 690."
+  },
+  "puc_measurement_note": "The PUC ledger is source-derived: build/lua-c/lua has no testc module, so the mode-'B' fixed-buffer loadstring interval cannot be executed under the PUC binary. Struct sizes/offsets are gcc-measured against the vendored lua-5.5.0 headers; both behavioral assumptions are verified on the PUC binary via the X/Y rooting probe (anchored shape): the initial compile closure is collected (closure_alive=false) yet \"X\"/\"Y\" stay interned (X_same_ptr=true, Y_same_ptr=true) \u2014 the enclosing chunk's constants root them, so PUC's undump also performs no re-intern. The identical probe result under luazig confirms mechanism parity between the two implementations.",
+  "findings": {
+    "string_dedup_leak": "loadBinaryChunk (src/lua/vm.zig) never calls UndumpReader.deinit(): the string_dedup ArrayList (readStringDedup, src/lua/undump.zig) leaks 144 bytes per binary-chunk load. It is not charged to gc_count_kb (plain allocator bookkeeping, not a GC object) and is never freed \u2014 it accumulates across loads and is visible in the process exit leak report. PUC's equivalent (the lundump.c:411 luaH_new dedup table) is transient and freed by the interval GC. Fix candidate: defer reader.deinit() in loadBinaryChunk (out of scope for this ledger task).",
+    "uncounted_upvalues_slice": "The Closure's upvalue-pointer array (8 bytes for 1 upvalue) is allocated with the Closure but never charged to gc_count_kb. PUC has no such array: sizeLclosure(n) embeds the upvalue pointers inline in the LClosure allocation."
+  },
+  "evidence": {
+    "harness_anchored": {
+      "m1": 86282,
+      "m2": 86826,
+      "delta": 544,
+      "m2_global_crosscheck": 86826,
+      "x_interned_m1": true,
+      "y_interned_m1": true,
+      "name_interned_m1": false,
+      "b_interned_m1": false,
+      "x_interned_m2": true,
+      "y_interned_m2": true,
+      "l1_outstanding": 652,
+      "l2_outstanding": 660,
+      "freed_in_interval_count": 0,
+      "freed_in_interval_bytes": 0,
+      "sizes": {
+        "Proto": 248,
+        "Closure": 88,
+        "Cell": 64,
+        "LuaString": 72,
+        "Value": 16,
+        "Upvaldesc": 24,
+        "Constant": 16
+      },
+      "code_closure": {
+        "ptr": 140363312796288,
+        "tree_is_root": true,
+        "upvalues_len": 1,
+        "proto": {
+          "ptr": 140363313916416,
+          "gc_charged": true,
+          "gc_footprint": 320,
+          "fixed_arrays": true,
+          "k_len": 0,
+          "resolved_values_len": 3,
+          "upvalues_len": 1,
+          "p_len": 0,
+          "code_len": 4004,
+          "lineinfo_len": 0,
+          "locvars_len": 0,
+          "live_reg_top_len": 0,
+          "ref_count": 1,
+          "source_backing_extra": false,
+          "source_backing_pin_len": 17087,
+          "constants": [
+            {
+              "type": "string",
+              "len": 1,
+              "is_short": true,
+              "is_external": false
+            },
+            {
+              "type": "string",
+              "len": 1000,
+              "is_short": false,
+              "is_external": true
+            },
+            {
+              "type": "string",
+              "len": 1,
+              "is_short": true,
+              "is_external": false
+            }
+          ]
+        }
+      },
+      "new_outstanding": [
+        {
+          "ptr": 140363309852928,
+          "len": 144,
+          "ret_addr": 18236404,
+          "label": "unmatched",
+          "symbol": "undump.UndumpReader.readStringDedup"
+        },
+        {
+          "ptr": 140363312598528,
+          "len": 72,
+          "ret_addr": 18236761,
+          "label": "external_LuaString_header",
+          "symbol": "vm.Vm.undumpFixedInternCallback"
+        },
+        {
+          "ptr": 140363309449344,
+          "len": 64,
+          "ret_addr": 18214320,
+          "label": "Cell",
+          "symbol": "vm.Vm.builtinLoadEx"
+        },
+        {
+          "ptr": 140363313916416,
+          "len": 248,
+          "ret_addr": 18219414,
+          "label": "Proto",
+          "symbol": "vm.Vm.loadChunkImpl"
+        },
+        {
+          "ptr": 140363305058336,
+          "len": 24,
+          "ret_addr": 18219414,
+          "label": "upvalues_desc",
+          "symbol": "vm.Vm.loadChunkImpl"
+        },
+        {
+          "ptr": 140363312796288,
+          "len": 88,
+          "ret_addr": 18214320,
+          "label": "Closure",
+          "symbol": "vm.Vm.builtinLoadEx"
+        },
+        {
+          "ptr": 140363309449408,
+          "len": 48,
+          "ret_addr": 18219414,
+          "label": "resolved_values",
+          "symbol": "vm.Vm.loadChunkImpl"
+        },
+        {
+          "ptr": 140363306041360,
+          "len": 8,
+          "ret_addr": 18214320,
+          "label": "Closure.upvalues slice",
+          "symbol": "vm.Vm.builtinLoadEx"
+        }
+      ],
+      "freed_in_interval": []
+    },
+    "harness_variance": {
+      "m1": 86032,
+      "m2": 86722,
+      "delta": 690,
+      "m2_global_crosscheck": 86722,
+      "x_interned_m1": false,
+      "y_interned_m1": false,
+      "name_interned_m1": false,
+      "b_interned_m1": false,
+      "x_interned_m2": true,
+      "y_interned_m2": true,
+      "l1_outstanding": 650,
+      "l2_outstanding": 660,
+      "freed_in_interval_count": 0,
+      "freed_in_interval_bytes": 0,
+      "sizes": {
+        "Proto": 248,
+        "Closure": 88,
+        "Cell": 64,
+        "LuaString": 72,
+        "Value": 16,
+        "Upvaldesc": 24,
+        "Constant": 16
+      },
+      "code_closure": {
+        "ptr": 139998310567424,
+        "tree_is_root": true,
+        "upvalues_len": 1,
+        "proto": {
+          "ptr": 139998306638592,
+          "gc_charged": true,
+          "gc_footprint": 320,
+          "fixed_arrays": true,
+          "k_len": 0,
+          "resolved_values_len": 3,
+          "upvalues_len": 1,
+          "p_len": 0,
+          "code_len": 4004,
+          "lineinfo_len": 0,
+          "locvars_len": 0,
+          "live_reg_top_len": 0,
+          "ref_count": 1,
+          "source_backing_extra": false,
+          "source_backing_pin_len": 17087,
+          "constants": [
+            {
+              "type": "string",
+              "len": 1,
+              "is_short": true,
+              "is_external": false
+            },
+            {
+              "type": "string",
+              "len": 1000,
+              "is_short": false,
+              "is_external": true
+            },
+            {
+              "type": "string",
+              "len": 1,
+              "is_short": true,
+              "is_external": false
+            }
+          ]
+        }
+      },
+      "new_outstanding": [
+        {
+          "ptr": 139998309718272,
+          "len": 72,
+          "ret_addr": 18236793,
+          "label": "external_LuaString_header",
+          "symbol": "vm.Vm.undumpFixedInternCallback"
+        },
+        {
+          "ptr": 139998306638592,
+          "len": 248,
+          "ret_addr": 18219446,
+          "label": "Proto",
+          "symbol": "vm.Vm.loadChunkImpl"
+        },
+        {
+          "ptr": 139998302896512,
+          "len": 64,
+          "ret_addr": 18214352,
+          "label": "Cell",
+          "symbol": "vm.Vm.builtinLoadEx"
+        },
+        {
+          "ptr": 139998309974336,
+          "len": 24,
+          "ret_addr": 18219446,
+          "label": "upvalues_desc",
+          "symbol": "vm.Vm.loadChunkImpl"
+        },
+        {
+          "ptr": 139998304929024,
+          "len": 144,
+          "ret_addr": 18236436,
+          "label": "unmatched",
+          "symbol": "undump.UndumpReader.readStringDedup"
+        },
+        {
+          "ptr": 139998310177664,
+          "len": 74,
+          "ret_addr": 17476965,
+          "label": "short_string_Y",
+          "symbol": "vm.Vm.internStrAll"
+        },
+        {
+          "ptr": 139998310567424,
+          "len": 88,
+          "ret_addr": 18214352,
+          "label": "Closure",
+          "symbol": "vm.Vm.builtinLoadEx"
+        },
+        {
+          "ptr": 139998310177792,
+          "len": 74,
+          "ret_addr": 17476965,
+          "label": "short_string_X",
+          "symbol": "vm.Vm.internStrAll"
+        },
+        {
+          "ptr": 139998309908736,
+          "len": 48,
+          "ret_addr": 18219446,
+          "label": "resolved_values",
+          "symbol": "vm.Vm.loadChunkImpl"
+        },
+        {
+          "ptr": 139998302437392,
+          "len": 8,
+          "ret_addr": 18214352,
+          "label": "Closure.upvalues slice",
+          "symbol": "vm.Vm.builtinLoadEx"
+        }
+      ],
+      "freed_in_interval": []
+    },
+    "driver_anchored": {
+      "delta": 544,
+      "m1": 84146,
+      "m2": 84690,
+      "under400": "false"
+    },
+    "driver_no_xy_root": {
+      "delta": 690,
+      "m1": 83932,
+      "m2": 84622,
+      "under400": "false"
+    },
+    "xy_root_probe_puc": {
+      "closure_alive": false,
+      "X_same_ptr": true,
+      "Y_same_ptr": true
+    },
+    "xy_root_probe_zig": {
+      "closure_alive": false,
+      "X_same_ptr": true,
+      "Y_same_ptr": true
+    }
+  }
+}

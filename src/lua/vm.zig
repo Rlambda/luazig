@@ -34601,7 +34601,7 @@ pub const Vm = struct {
     /// len, eq) participate in the flags cache, via `fastTm`/`gfasttm`.
     fn getTm(self: *Vm, mt: *Table, event: TmsEvent) ?Value {
         const name_str = self.tm_names[@intFromEnum(event)] orelse return null;
-        const node = ltable.nodeLookupStr(mt.hash, name_str) orelse return null;
+        const node = ltable.nodeLookupShortStrIdentity(mt.hash, name_str) orelse return null;
         if (node.value == .Nil) return null;
         return node.value;
     }
@@ -34667,7 +34667,7 @@ pub const Vm = struct {
         // using the pre-interned name string (pointer-identity key, no
         // internStrAssume hashmap lookup needed).
         const name_str = self.tm_names[@intFromEnum(event)] orelse return null;
-        const node = ltable.nodeLookupStr(mt.hash, name_str) orelse {
+        const node = ltable.nodeLookupShortStrIdentity(mt.hash, name_str) orelse {
             // No node at all — cache-on-miss.
             mt.flags |= bit;
             return null;
@@ -34695,7 +34695,7 @@ pub const Vm = struct {
     /// pre-interned shorts, matching PUC's `luaH_Hgetshortstr` precondition.
     fn getMetaField(self: *Vm, mt: *Table, field: MetaField) ?Value {
         const name_str = self.metafield_names[@intFromEnum(field)] orelse return null;
-        const node = ltable.nodeLookupStr(mt.hash, name_str) orelse return null;
+        const node = ltable.nodeLookupShortStrIdentity(mt.hash, name_str) orelse return null;
         if (node.value == .Nil) return null;
         return node.value;
     }

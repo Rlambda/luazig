@@ -6421,3 +6421,56 @@ PUC. Smoke count: 67 → 68.
 - T2+T3: `b96cd40` — nodeLookupShortStrIdentity primitive + T2 decomposition
 - T4: `e441557` — keep ExpB (non-optional tm_names), revert ExpA
 - T6: `a587e06` — differential mutation smoke (68_metamethod_mutation.lua)
+
+## P16.15 T2+T3 — metamethod call-path cost model + activation-ABI inventory (2026-09-03, ANALYSIS ONLY)
+
+Artifact: `tools/perf/current-callpath-analysis.json` (provenance-stamped:
+HEAD 761df30 clean, 12777 samples from 120 isolated metamethod_call_noalloc
+runs under one perf record session, core 2).
+
+### T2 — cost model (metamethod_call_noalloc, direct-Closure path)
+
+Symbol shares: dispatch 56.45%, pushBytecodeExecFrame 11.77%, getTmByObj
+7.59%, tryPushSimpleResultMetamethod 6.80%, prepareHostArgs 5.64%,
+pushResolvedBytecodeClosure 4.86%, addOne 1.12%.
+
+Intra-symbol decomposition (perf annotate, local % of symbol):
+
+- pushBytecodeExecFrame: proto-field reads + nextra/is_vahid 25.4%,
+  **args_on_stack pointer classification 4.0%**, host-branch + noinline
+  call setup + post-call reload 9.2%, func_slot/base 9.0%, overflow checks
+  5.6%, ensureBcStackCap/top/nil-fill-branch 12.9%, activation counter
+  9.6%, addOne+frame-init 20.5%, epilogue 4.0%.
+- prepareHostArgs: **prologue + 6-arg marshaling 37.5%** (pure noinline
+  boundary cost), capacity check 0.7%, callee write 10.2%, p1-p2 copy
+  51.6%.
+- tryPushSimpleResultMetamethod: opname jumptable 24.0%, Closure
+  fast-filter 27.1%, completion setup + call marshal 13.6%.
+- pushResolvedBytecodeClosure: prologue + asserts + switch 30.9%.
+
+Verifier hypothesis CONFIRMED: the activation ABI decides argument STORAGE
+ORIGIN via pointer test (vm.zig:11329) — a decision PUC's luaD_precall
+never makes. PUC luaT_callTMres stages func+p1+p2 on the stack first
+(ltm.c:119-131); precall derives narg from L->top - func - 1.
+
+### T3 — pushBytecodeExecFrame activation-ABI inventory (all production call sites)
+
+| Site | Caller | Category |
+|---|---|---|
+| vm.zig:14182 | OP_CALL inline fast path (rargs = regs[a+1..]) | A — zero-copy must stay |
+| vm.zig:15118 | OP_TFORCALL iterator (rargs = regs[a+5..]) | A |
+| vm.zig:16339 | opCall slow path plain-Lua (rargs = regs[a+1..]) | A |
+| vm.zig:7551/7575 | pushResolvedBytecodeClosure — ALL metamethod/continuation pushes (arith/compare/concat, __index/__newindex, __pairs, gsub, hooks) | B |
+| vm.zig:7322 | TBC __close metamethod | B |
+| vm.zig:7991 | debug-hook closure | B |
+| vm.zig:10781 | pcall/xpcall protected target | B |
+| vm.zig:10945 | xpcall error handler | B |
+| vm.zig:11991 | runBytecodeInternal (chunk entry / coroutine body / C-API) | B (C-adjacent; PUC also stages via C API pushes) |
+
+**ABI answer: YES — the activation primitive should consume a staged
+slot+count (PUC precall ABI), not args:[]const Value.** Every A site knows
+nargs locally and is already staged; every B site is a PUC stack-call whose
+PUC implementation stages func+args first. Plan (T4): `stageBytecodeCall`
+(PUC luaT_callTMres setobj2s sequence) + `pushStagedBytecodeExecFrame`
+(PUC luaD_precall LUA_VLCL contract: func+nargs staged at func_slot);
+`pushBytecodeExecFrame` becomes a transitional compat wrapper.

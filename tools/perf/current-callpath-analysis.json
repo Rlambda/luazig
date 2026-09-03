@@ -1,0 +1,269 @@
+{
+  "created_utc": "2026-09-03T17:24:49.640368+00:00",
+  "task": "T2+T3: metamethod_call_noalloc call-path cost model + pushBytecodeExecFrame activation-ABI inventory",
+  "provenance": {
+    "git_head": "761df30",
+    "git_dirty": "clean",
+    "zig_version": "0.16.0",
+    "zig_binary_sha16": "a34ed59f91e3a4b6"
+  },
+  "measurement": {
+    "method": "120 consecutive isolated runs of `luazig tools/microbench.lua metamethod_call_noalloc` (~3.1s wall) under one `perf record --call-graph lbr -e cycles:u` session pinned to core 2; symbol shares from `perf report --no-children --percent-limit 0.2`; intra-symbol regions from `perf annotate --stdio --symbol <sym>` (local-period percentages summed over instruction ranges).",
+    "samples": 12777,
+    "workload": "metamethod_call_noalloc (microbench #17): ADD -> MMBIN lookup -> __add closure call -> RETURN, no allocation",
+    "symbol_shares_pct": {
+      "vm.Vm.runBytecodeDispatch": 56.45,
+      "vm.Vm.pushBytecodeExecFrame": 11.77,
+      "vm.Vm.getTmByObj": 7.59,
+      "vm.Vm.tryPushSimpleResultMetamethod": 6.8,
+      "vm.Vm.prepareHostArgs": 5.64,
+      "vm.Vm.pushResolvedBytecodeClosure": 4.86,
+      "vm.FrameStack.addOne": 1.12,
+      "vm.Vm.syncFrame": 0.93,
+      "vm.Vm.dispatchCalleeActivationHook": 0.9,
+      "ltable.nodeInsert": 0.87,
+      "vm.Vm.rawSet": 0.74
+    }
+  },
+  "t2_cost_model": {
+    "description": "Decomposition of the direct-Closure metamethod path (MMBIN -> tryPushSimpleResultMetamethod -> pushResolvedBytecodeClosure -> pushBytecodeExecFrame -> prepareHostArgs). Region percentages are local to each symbol (perf annotate); global share = symbol share * region share / 100.",
+    "regions": [
+      {
+        "component": "TMS lookup (getTmByObj: type dispatch jumptable + mt->cache event slot)",
+        "symbol": "getTmByObj",
+        "local_pct": 100.0,
+        "global_pct": 7.59
+      },
+      {
+        "component": "tryPush: entry + opname(event) jumptable",
+        "symbol": "tryPushSimpleResultMetamethod",
+        "local_pct": 24.0,
+        "global_pct": 1.63
+      },
+      {
+        "component": "tryPush: per-event cold branches (event -> opname string)",
+        "symbol": "tryPushSimpleResultMetamethod",
+        "local_pct": 9.0,
+        "global_pct": 0.61
+      },
+      {
+        "component": "tryPush: Closure fast-filter (tag==Closure, proto!=null)",
+        "symbol": "tryPushSimpleResultMetamethod",
+        "local_pct": 27.1,
+        "global_pct": 1.84
+      },
+      {
+        "component": "tryPush: completion-union setup + call marshaling to pushResolved",
+        "symbol": "tryPushSimpleResultMetamethod",
+        "local_pct": 13.6,
+        "global_pct": 0.92
+      },
+      {
+        "component": "tryPush: post-call error check + return .pushed",
+        "symbol": "tryPushSimpleResultMetamethod",
+        "local_pct": 26.3,
+        "global_pct": 1.79
+      },
+      {
+        "component": "pushResolved: prologue + parent asserts + completion-union switch",
+        "symbol": "pushResolvedBytecodeClosure",
+        "local_pct": 30.9,
+        "global_pct": 1.5
+      },
+      {
+        "component": "pushResolved: simple_result install + pushBytecodeExecFrame call setup + hook dispatch tail",
+        "symbol": "pushResolvedBytecodeClosure",
+        "local_pct": 69.1,
+        "global_pct": 3.36
+      },
+      {
+        "component": "pushFrame: prologue + proto field reads (maxstacksize/numparams/is_vararg) + nextra/is_vahid",
+        "symbol": "pushBytecodeExecFrame",
+        "local_pct": 25.4,
+        "global_pct": 2.99
+      },
+      {
+        "component": "pushFrame: args_on_stack pointer classification (2x intFromPtr + shl + add + cmp)",
+        "symbol": "pushBytecodeExecFrame",
+        "local_pct": 4.0,
+        "global_pct": 0.47
+      },
+      {
+        "component": "pushFrame: host-args branch + noinline call setup + post-call register reload",
+        "symbol": "pushBytecodeExecFrame",
+        "local_pct": 9.2,
+        "global_pct": 1.08
+      },
+      {
+        "component": "pushFrame: func_slot/base compute (VAHID cmov)",
+        "symbol": "pushBytecodeExecFrame",
+        "local_pct": 9.0,
+        "global_pct": 1.06
+      },
+      {
+        "component": "pushFrame: stack-overflow + frame-count checks (incl. lazy error-handler limit)",
+        "symbol": "pushBytecodeExecFrame",
+        "local_pct": 5.6,
+        "global_pct": 0.66
+      },
+      {
+        "component": "pushFrame: ensureBcStackCap + bc_stack_top update + regs slice + nil-fill branch",
+        "symbol": "pushBytecodeExecFrame",
+        "local_pct": 12.9,
+        "global_pct": 1.52
+      },
+      {
+        "component": "pushFrame: activation-counter wrap guard",
+        "symbol": "pushBytecodeExecFrame",
+        "local_pct": 9.6,
+        "global_pct": 1.13
+      },
+      {
+        "component": "pushFrame: FrameStack.addOne + CallFrame field writes (~30 stores)",
+        "symbol": "pushBytecodeExecFrame",
+        "local_pct": 20.5,
+        "global_pct": 2.41
+      },
+      {
+        "component": "pushFrame: epilogue (pops + ret)",
+        "symbol": "pushBytecodeExecFrame",
+        "local_pct": 4.0,
+        "global_pct": 0.47
+      },
+      {
+        "component": "prepareHostArgs: prologue + 6-arg marshaling (noinline boundary cost)",
+        "symbol": "prepareHostArgs",
+        "local_pct": 37.5,
+        "global_pct": 2.11
+      },
+      {
+        "component": "prepareHostArgs: capacity check (needed_for_args vs bc_stack.len)",
+        "symbol": "prepareHostArgs",
+        "local_pct": 0.7,
+        "global_pct": 0.04
+      },
+      {
+        "component": "prepareHostArgs: callee write (bc_stack[func_slot] = Closure)",
+        "symbol": "prepareHostArgs",
+        "local_pct": 10.2,
+        "global_pct": 0.58
+      },
+      {
+        "component": "prepareHostArgs: p1-p2 copy loop + epilogue",
+        "symbol": "prepareHostArgs",
+        "local_pct": 51.6,
+        "global_pct": 2.91
+      },
+      {
+        "component": "return completion (child RETURN -> simple_result read -> parent regs write; inside runBytecodeDispatch)",
+        "symbol": "runBytecodeDispatch",
+        "note": "not separately attributable at symbol granularity; OP_RETURN + simple-result completion are inlined in the dispatch loop"
+      }
+    ],
+    "puc_mapping": {
+      "getTmByObj": "luaT_gettmbyobj (ltm.c) — same two-stage lookup",
+      "tryPush+pushResolved": "luaT_callTMres stages func+p1+p2 at L->top (ltm.c:119-131); no intermediate callable-resolution layer because PUC metamethods are called as plain values through luaD_call",
+      "pushBytecodeExecFrame": "luaD_precall LUA_VLCL branch (ldo.c:725-735): narg derived from L->top - func - 1; checkstackp; prepCallInfo; nil-fill missing params",
+      "prepareHostArgs": "has NO PUC counterpart as a separate decision — PUC's luaT_callTMres setobj2s writes ARE the staging; precall never classifies argument storage origin",
+      "args_on_stack classification": "NO PUC counterpart — PUC precall consumes (func slot, nresults) and derives narg from the stack top; the caller's staging decision is implicit in where it wrote the values"
+    },
+    "verifier_hypothesis_check": {
+      "hypothesis": "luazig activation decides argument STORAGE ORIGIN (pointer-test args.ptr == &bc_stack[func_slot+1]); PUC's precall never does that — callers stage on the stack first.",
+      "confirmed": true,
+      "evidence": "vm.zig:11329-11334 (args_on_stack blk) + vm.zig:11336-11345 (prepareHostArgs dispatch); measured cost of the classification + host-branch + call-setup on the metamethod path: (4.0+9.2)% of pushBytecodeExecFrame (11.77% global) = ~1.55% global, plus prepareHostArgs prologue/marshaling 2.11% global that a fused staging write would partially recover.",
+      "architectural_note": "The pointer test is not merely a perf cost: it makes the activation ABI depend on WHERE the caller stored args, which is the opposite of PUC's contract (caller stages on stack; precall consumes slot+count). Category-A callers (OP_CALL) are already staged by construction; Category-B callers pay a classification that always answers 'host' and then copies — exactly what luaT_callTMres's setobj2s would do, but reached through a guessing layer."
+    }
+  },
+  "t3_activation_abi_inventory": {
+    "description": "Every production call site of pushBytecodeExecFrame at HEAD 761df30, classified. A = func+args already contiguous in bc_stack (must stay zero-copy). B = logically a PUC stack-call (PUC stages func+args on the stack, then luaD_precall consumes slot+count) but luazig passes a host slice. C = genuine host boundary.",
+    "sites": [
+      {
+        "line": "vm.zig:14182",
+        "caller": "OP_CALL inline fast path (runBytecodeDispatch)",
+        "args_origin": "ctx.regs[a+1..a+1+nargs] — already on bc_stack at func_slot+1",
+        "category": "A",
+        "puc": "luaV_execute OP_CALL: func+args in caller registers; precall in place, zero copy"
+      },
+      {
+        "line": "vm.zig:15118",
+        "caller": "OP_TFORCALL bytecode iterator",
+        "args_origin": "ctx.regs[a+5..a+5+nargs] — on bc_stack",
+        "category": "A",
+        "puc": "OP_TFORCALL: luaD_call on the iterator staged in caller registers"
+      },
+      {
+        "line": "vm.zig:16339",
+        "caller": "opCall slow path, plain-Lua branch (after __call resolution / hooks path)",
+        "args_origin": "ctx.regs[a+1..a+1+effective_nargs] — rewritten in place by __call resolution",
+        "category": "A",
+        "puc": "luaD_precall retry after tryfuncTM inserted the metamethod at func"
+      },
+      {
+        "line": "vm.zig:7551,7575",
+        "caller": "pushResolvedBytecodeClosure — shared primitive for ALL directly-pushed bytecode Closures: arithmetic/comparison/concat metamethods (tryPushSimpleResultMetamethod, tryPushResolvedMetamethod, tryPushBytecodeMetamethod), __index/__newindex, __pairs, gsub replacement, debug-hook-adjacent continuations (tryPushResolvedContinuationCall)",
+        "args_origin": "host slices: stack arrays (&.{lhs,rhs}, [3]Value) or resolveCallable owned_args",
+        "category": "B",
+        "puc": "luaT_callTMres / luaT_callTM: setobj2s stages func+p1+p2 at L->top, then luaD_call(func,1)"
+      },
+      {
+        "line": "vm.zig:7322",
+        "caller": "TBC __close metamethod (closeUpvalues state machine)",
+        "args_origin": "resolved.args (argv stack array / owned)",
+        "category": "B",
+        "puc": "luaF_close -> luaT_callTM (stages func+obj+err at L->top) -> luaD_callnoyield"
+      },
+      {
+        "line": "vm.zig:7991",
+        "caller": "debug-hook closure (dispatchBytecodeHookWithCallee)",
+        "args_origin": "argv stack array [2]Value",
+        "category": "B",
+        "puc": "luaD_hook: hook function called via luaD_call, event+line args staged on stack"
+      },
+      {
+        "line": "vm.zig:10781",
+        "caller": "pcall/xpcall protected target (tryPushBytecodeProtectedCall)",
+        "args_origin": "child_args = resolved.args / mm_resolved.args / pairs_arg_buf (host)",
+        "category": "B",
+        "puc": "luaB_pcall: target+args staged on stack by the C API caller, then luaD_pcall -> luaD_call"
+      },
+      {
+        "line": "vm.zig:10945",
+        "caller": "xpcall error handler (startBytecodeXpcallHandler)",
+        "args_origin": "resolved.args (host)",
+        "category": "B",
+        "puc": "luaG_errormsg -> luaD_callnoyield(handler) with msg staged at L->top"
+      },
+      {
+        "line": "vm.zig:11991",
+        "caller": "runBytecodeInternal — chunk entry / coroutine body first resume / C-API-invoked function",
+        "args_origin": "args host slice from the C/API boundary",
+        "category": "B (C-adjacent)",
+        "puc": "lua_pcallk/lua_resume: the C API pushes func+args onto the stack (lua_pushvalue etc.) before docall — i.e. even here PUC stages on the stack first; the host slice is luazig's C-API boundary representation",
+        "note": "Closest thing to a genuine host boundary (Category C): the args arrive from outside the VM. But the PUC-faithful contract still holds: staging them onto bc_stack before activation is exactly what the C API does in PUC."
+      },
+      {
+        "line": "vm.zig:41654",
+        "caller": "unit test (P16.8a transactional test)",
+        "args_origin": "test-local",
+        "category": "test (non-production)",
+        "puc": "n/a"
+      }
+    ],
+    "abi_answer": {
+      "question": "Should the activation primitive consume a staged slot+count like PUC precall instead of args:[]const Value?",
+      "answer": "YES.",
+      "reasoning": [
+        "Every Category-A site already has func+args contiguous in bc_stack and knows nargs locally — a staged slot+count ABI serves them with ZERO copy and removes the pointer classification entirely (they call the core activation directly with (func_slot, nargs)).",
+        "Every Category-B site is a PUC stack-call whose PUC implementation stages func+args on the stack first (luaT_callTMres/luaT_callTM/luaD_hook/luaB_pcall/luaG_errormsg). A shared staging primitive (stageBytecodeCall: reserve, write [func, args...], return {func_slot, nargs}) reproduces the PUC sequence exactly and is reusable by ALL B sites.",
+        "The only C-adjacent site (runBytecodeInternal, vm.zig:11991) is also stack-staged in PUC (the C API pushes args before lua_pcall), so it fits the same staging primitive — no separate host ABI is needed.",
+        "The args:[]const Value ABI forces the activation to GUESS storage origin (pointer test) — a decision PUC's precall never makes. The guess is pure overhead for A (always 'stack') and pure overhead for B (always 'host' -> copy through a noinline boundary with 6-arg marshaling measured at 37.5% of prepareHostArgs).",
+        "Transition safety: a thin compatibility wrapper (accepts args slice -> stages -> activates) keeps unmigrated B callers working while the measured metamethod path migrates first."
+      ],
+      "proposed_abi": {
+        "stage": "stageBytecodeCall(func_slot, callee_cl, args) -> StagedCall{func_slot, nargs} — PUC luaT_callTMres setobj2s sequence: ensure capacity for func+args, write callee at func_slot, copy args to func_slot+1..; bc_stack_top NOT bumped (activation owns the top update, preserving today's errdefer transactionality exactly).",
+        "activate": "pushStagedBytecodeExecFrame(exec_frames, proto, func_slot, nargs, callee_cl, nresults) — PUC luaD_precall LUA_VLCL: contract is 'func + nargs args already staged at func_slot'; derives everything from the stack; no pointer test, no host copy, no storage-origin classification.",
+        "compat_wrapper": "pushBytecodeExecFrame(exec_frames, proto, args, callee_cl, caller_func_slot, nresults) — during migration only: pointer-test (transitional) -> in-place activate (A) or stage+activate (B). Deleted once A sites call the core directly and B sites stage explicitly."
+      }
+    }
+  }
+}

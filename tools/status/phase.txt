@@ -1,1 +1,1 @@
-P16.12/13 — tm-lookup PUC alignment (nodeLookupShortStrIdentity, luaH_Hgetshortstr parity), mutation smoke 68, artifact provenance
+P16.14/15 — provenance closure (shared helper, all current*.json stamped), staged call ABI (PUC luaT_callTMres→luaD_precall), pointer-origin guessing deleted

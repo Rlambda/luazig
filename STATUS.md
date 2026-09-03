@@ -6624,3 +6624,61 @@ time-seed line). leak_bench PASS (all workloads within 1.0 KB).
 104 B (invariant held). Smoke 67_upvalue_gc_lifetime green (Cell
 invariant). T5-prohibition (P16.13) intact: getTm touches no flags;
 fastTm caches only events <= .eq.
+
+## P16.16 T1 — api.lua:580 allocation ledger: 544B fully explained, zig-vs-PUC gap quantified (2026-09-04)
+
+Deliverables: `tools/perf_api580_ledger.py` (regen script: Zig test harness
+generated into a temp dir, TrackingAllocator snapshots at m1/m2, pointer-
+identity labels + nm symbolization of ret_addrs, gcc-measured PUC struct
+sizes, X/Y rooting probe run under BOTH binaries, provenance-stamped JSON)
+and `tools/perf/current-api580-ledger.json`.
+
+### Byte-exact reconciliation (anchored api.lua context)
+
+charged_total == m2-m1 EXACTLY in both contexts (rule:
+count*1024 == gcControl(3)*1024 + gcControl(4) == trunc(gc_count_kb*1024)):
+
+| component | zig | PUC | gap |
+|---|---|---|---|
+| Proto struct | 248 | 128 | +120 |
+| constants array (k=3) | 48 (resolved_values; k aliased, CUT1) | 48 | 0 |
+| upvalues desc (1) | 24 | 16 | +8 |
+| closure total | 96 (Closure 88 + upvalues slice 8 uncharged) | 40 (sizeLclosure(1)) | +56 |
+| upvalue cell (_ENV) | 64 (Cell) | 40 (UpVal) | +24 |
+| "aaa..." long const | 72 (external LuaString header) | 32 (LSTRFIX header) | +40 |
+| X/Y re-intern | 0 | 0 | 0 |
+| **charged total** | **544** (measured 544) | **304** | **+240** |
+| real outstanding | 696 (+8 slice +144 dedup leak, uncounted) | 304 | +392 |
+
+Savings needed below 400: **544-399 = 145B**. Dominant gaps: Proto +120
+(Zig slices 16B vs C ptr+size), closure/Cell GC headers +80, long-const
+header +40.
+
+### Mechanism correction (544-vs-690 range fully explained)
+
+The context-dependent component is whether "X"/"Y" are still interned when
+the interval's undump runs. In the anchored api.lua shape the trailing
+statements (api.lua:578-579 `X = 0; ... X = nil; Y = nil`) make "X"/"Y"
+constants of the ENCLOSING chunk — its live frame roots them through every
+GC, so no re-intern: 544. Drivers without those statements (earlier
+measurement drivers) leave the initial compile closure as the only
+referent; it is collected by the pre-m1 GCs (weak-table probe), X/Y are
+swept, the undump re-interns both (+146 charged): 690. This replaces the
+earlier stale-register theory for the inline context. Probe-verified on
+BOTH binaries in the anchored shape: closure_alive=false AND
+X_same_ptr=true/Y_same_ptr=true — PUC performs no re-intern either, so the
+correct PUC ledger is 304 (not 356).
+
+### Findings
+
+- string_dedup leak: loadBinaryChunk never calls UndumpReader.deinit() —
+  144B ArrayList per binary load, uncounted by gc, accumulates (PUC's
+  lundump.c:411 dedup table is transient). Fix candidate (out of scope).
+- Closure.upvalues slice (8B) allocated but never charged to gc_count_kb;
+  PUC embeds upvalue pointers inline in sizeLclosure(n).
+
+### Gates
+
+matrix --testc: zig_fail=1 (api.lua — this documented deviation) + big.lua
+both_fail (pre-existing) — no new regressions. Smoke 68/68 PASS. No src/
+changes (tools/ only).

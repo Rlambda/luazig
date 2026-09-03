@@ -6774,3 +6774,37 @@ path). Charged api580 unchanged (464 — the leak was never charged to
 gc_count_kb); real outstanding memory per load drops 144B. leak_bench:
 load_chunk/load_function now net-negative (freed) — PASS. Gates: zig
 build test, smoke 68/68, c_api 18_dump/19_load PASS.
+
+## P16.16 T6 (C3) — LuaString metadata union: 56→48 (=PUC TString) (2026-09-04)
+
+Structural cut 3. The intern-chain link (`next`, 8B) and the external
+payload (external_ptr + falloc + falloc_ud, 24B) are mutually exclusive:
+`StringTable.insert` has exactly ONE caller — internStr's short-string
+path — so only short strings ever carry a chain link, and external
+strings are always long and never interned (PUC luaS_newextlstr always
+creates LUA_VLNGSTR). PUC's own TString unions these (lobject.h:
+`u.sh.hnext` vs `u.lng.{lnglen,contents,falloc,ud}`) — this cut is
+PUC-faithful in shape, not just a size optimization.
+
+Change: `next` + `external_ptr`/`falloc`/`falloc_ud` → untagged
+`meta: union { next: ?*LuaString, external: ExtInfo }` with ExtInfo =
+{ptr, falloc, ud}; `is_external` bool remains the discriminator (a
+tagged union would cost 8B more: tag + padding).
+
+@sizeOf: LuaString 56→48 (72→48 across C1+C3; PUC TString = 48).
+api580 (anchored driver, 3 runs): 464 → **456** (−8 = the external
+"aaa..." LuaString header in the ledger).
+
+Hard gates: short-string pointer identity (strings/nextvar PASS),
+long-string content eq, external hashing, lua_pushexternalstring
+dealloc exactly-once (zig unit tests PASS incl. the falloc-invoked /
+falloc-NOT-invoked / fixed-external tests), table keys, GC/string-table
+lifecycle (gc/gengc/closure/coroutine/db/errors PASS; locals/big fail
+byte-identical to baseline — pre-existing; api.lua fails only at :580 =
+THE target). smoke 68/68; c_api 20 suites + 8/8 diff PASS.
+
+Perf A/B (3-round interleaved): hash_access +0.21% cyc / instr flat,
+string_concat −0.21% / flat, field_access +1.79% then +0.56% on re-run
+(instr flat both times — cycle noise). No regression.
+
+Remaining api580 ledger (charged): 456 vs PUC 304; still need −57B.

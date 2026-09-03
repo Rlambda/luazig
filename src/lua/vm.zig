@@ -2156,6 +2156,38 @@ const TestcContState = struct {
 // like PUC `LUA_VLNGSTR`), so equality is pointer-eq only for two short
 // strings — see `luaStringEq`.
 pub const LuaString = struct {
+    /// Mutually-exclusive per-variant metadata (P16.16 C3/T6). PUC's own
+    /// TString unions the short-string chain link with the long-string
+    /// payload (lobject.h: `u.sh.hnext` vs `u.lng.{lnglen,contents,falloc,ud}`);
+    /// we mirror that shape — the two variants can never coexist on one
+    /// string:
+    ///  - `next`: the intern-table chain link (PUC `u.hnext`), used ONLY
+    ///    by short strings — the only variant ever inserted into
+    ///    `StringTable` (`internStr`'s short path is the sole insert
+    ///    site). Long regular strings never enter the chain (stays null).
+    ///  - `external`: the external-string payload (PUC 5.5
+    ///    `lua_pushexternalstring` / LSTRMEM), used ONLY when
+    ///    `is_external`. External strings are always long and never
+    ///    interned, so they never carry a chain link.
+    const Meta = union {
+        next: ?*LuaString,
+        external: ExtInfo,
+    };
+
+    /// External-content descriptor (PUC 5.5 `luaS_newextlstr` / LSTRMEM).
+    const ExtInfo = struct {
+        /// Pointer to the external content (valid only when `is_external`).
+        /// Not owned by the LuaString — released via `falloc` during GC.
+        ptr: [*]const u8 = &.{},
+        /// Dealloc callback with PUC `lua_Alloc` signature:
+        ///   `?*anyopaque = falloc(ud, ptr, osize, nsize)`
+        /// Called as `falloc(ud, ptr, len+1, 0)` to free external content.
+        /// null = no dealloc (PUC LSTRFIX variant).
+        falloc: ?*const fn (?*anyopaque, ?*anyopaque, usize, usize) callconv(.c) ?*anyopaque = null,
+        /// User-data pointer passed through to `falloc` as its first argument.
+        ud: ?*anyopaque = null,
+    };
+
     hash: u64, // content hash, computed once at intern time (random-seeded)
     len: usize,
     is_short: bool, // <= lua_string_max_short_len => interned (PUC short variant)
@@ -2164,37 +2196,25 @@ pub const LuaString = struct {
     gc_age: GcAge = .new,
     /// Position in `Vm.gc_objects` (P16.16 C1: u32; see Cell.gc_index).
     gc_index: u32 = 0,
-    /// PUC `u.hnext`: chain link inside the interned-string table bucket
-    /// (lstring.c `stringtable`). Owned by `StringTable`; null when the
-    /// string is not currently in a bucket.
-    next: ?*LuaString = null,
+    meta: Meta = .{ .next = null },
 
     /// External string support (PUC 5.5 `lua_pushexternalstring` / LSTRMEM).
     /// When true, the string's content is NOT stored inline after the header
-    /// but lives at `external_ptr`, in memory owned by the caller. The string
-    /// header itself is a normal GC-managed allocation. When the GC collects
-    /// this string, `falloc(falloc_ud, external_ptr, len+1, 0)` is invoked to
+    /// but lives at `meta.external.ptr`, in memory owned by the caller. The
+    /// string header itself is a normal GC-managed allocation. When the GC
+    /// collects this string, `falloc(ud, ptr, len+1, 0)` is invoked to
     /// release the external content (PUC lgc.c:874-875), and only then is the
     /// header freed. External strings are always treated as "long" (never
     /// interned), matching PUC's `luaS_newextlstr` which always creates a
     /// `LUA_VLNGSTR` regardless of length.
     is_external: bool = false,
-    /// Pointer to the external content (valid only when `is_external`).
-    /// Not owned by the LuaString — released via `falloc` during GC.
-    external_ptr: [*]const u8 = &.{},
-    /// Dealloc callback with PUC `lua_Alloc` signature:
-    ///   `?*anyopaque = falloc(ud, ptr, osize, nsize)`
-    /// Called as `falloc(ud, external_ptr, len+1, 0)` to free external content.
-    /// null = no dealloc (PUC LSTRFIX variant).
-    falloc: ?*const fn (?*anyopaque, ?*anyopaque, usize, usize) callconv(.c) ?*anyopaque = null,
-    /// User-data pointer passed through to `falloc` as its first argument.
-    falloc_ud: ?*anyopaque = null,
 
     // Bytes of the string. For a regular string, the content is stored inline
     // right after the header in the same allocation (cache-friendly, one alloc
-    // per string). For an external string, the content lives at `external_ptr`.
+    // per string). For an external string, the content lives at
+    // `meta.external.ptr`.
     pub fn bytes(self: *const LuaString) []const u8 {
-        if (self.is_external) return self.external_ptr[0..self.len];
+        if (self.is_external) return self.meta.external.ptr[0..self.len];
         const header: [*]const u8 = @ptrCast(self);
         const body = header + @sizeOf(LuaString);
         return body[0..self.len];
@@ -2237,15 +2257,14 @@ pub fn createLuaString(alloc: std.mem.Allocator, raw: []const u8, hash: u64) !*L
     ls.len = raw.len;
     ls.is_short = raw.len <= lua_string_max_short_len;
     ls.gc_marked = 0;
-    // Explicitly zero the external-string fields: `bytes()` branches on
+    // Explicitly zero the variant metadata: `bytes()` branches on
     // `is_external`, so it MUST be false for regular inline strings. The
     // raw allocation comes from malloc (not zeroed), so leaving these
     // uninitialized would make `bytes()` read garbage and potentially
-    // dereference a random `external_ptr`.
+    // dereference a random external pointer. Setting the whole `meta`
+    // union to the `next` variant (null) covers both variants.
     ls.is_external = false;
-    ls.external_ptr = &.{};
-    ls.falloc = null;
-    ls.falloc_ud = null;
+    ls.meta = .{ .next = null };
     const body = buf[@sizeOf(LuaString)..];
     @memcpy(body[0..raw.len], raw);
     body[raw.len] = 0; // C-string NUL terminator (PUC `contents[len] = '\0'`)
@@ -2264,10 +2283,11 @@ pub fn destroyLuaString(alloc: std.mem.Allocator, ls: *LuaString) void {
         // content, then free only the header (allocated via `alloc.create`).
         // PUC passes `len+1` as the old size (the +1 accounts for the NUL the
         // caller promised at s[len], see lua_pushexternalstring api_check).
-        if (ls.falloc) |falloc| {
+        const ext = ls.meta.external;
+        if (ext.falloc) |falloc| {
             _ = falloc(
-                ls.falloc_ud,
-                @ptrCast(@constCast(ls.external_ptr)),
+                ext.ud,
+                @ptrCast(@constCast(ext.ptr)),
                 ls.len + 1,
                 0,
             );
@@ -2312,7 +2332,7 @@ pub const StringTable = struct {
     pub fn lookup(self: *const StringTable, raw: []const u8, hash: u64) ?*LuaString {
         if (self.buckets.len == 0) return null;
         var cur = self.buckets[self.bucketOf(hash)];
-        while (cur) |ls| : (cur = ls.next) {
+        while (cur) |ls| : (cur = ls.meta.next) {
             if (ls.len == raw.len and std.mem.eql(u8, ls.bytes(), raw)) return ls;
         }
         return null;
@@ -2333,9 +2353,9 @@ pub const StringTable = struct {
         for (old) |head| {
             var p = head;
             while (p) |ls| {
-                const save_next = ls.next;
+                const save_next = ls.meta.next;
                 const b: usize = @intCast(ls.hash & (new_size - 1));
-                ls.next = fresh[b];
+                ls.meta.next = fresh[b];
                 fresh[b] = ls;
                 p = save_next;
             }
@@ -2363,7 +2383,7 @@ pub const StringTable = struct {
             self.resize(alloc, target) catch return;
         }
         const b = self.bucketOf(ls.hash);
-        ls.next = self.buckets[b];
+        ls.meta.next = self.buckets[b];
         self.buckets[b] = ls;
         self.nuse += 1;
     }
@@ -2374,10 +2394,10 @@ pub const StringTable = struct {
     pub fn removeString(self: *StringTable, ls: *LuaString) void {
         if (self.buckets.len == 0) return;
         var p: *?*LuaString = &self.buckets[self.bucketOf(ls.hash)];
-        while (p.*) |cur| : (p = &cur.next) {
+        while (p.*) |cur| : (p = &cur.meta.next) {
             if (cur == ls) {
-                p.* = cur.next;
-                cur.next = null;
+                p.* = cur.meta.next;
+                cur.meta.next = null;
                 self.nuse -= 1;
                 return;
             }
@@ -2401,7 +2421,7 @@ pub const StringTable = struct {
     pub fn deinit(self: *StringTable, alloc: std.mem.Allocator) void {
         for (self.buckets) |head| {
             var p = head;
-            while (p) |ls| : (p = ls.next) destroyLuaString(alloc, ls);
+            while (p) |ls| : (p = ls.meta.next) destroyLuaString(alloc, ls);
         }
         if (self.buckets.len != 0) alloc.free(self.buckets);
         self.* = .{};
@@ -2598,9 +2618,11 @@ test "external string: destroyLuaString invokes falloc and frees header only" {
         .len = 5,
         .is_short = false,
         .is_external = true,
-        .external_ptr = content.ptr,
-        .falloc = testFalloc,
-        .falloc_ud = @ptrCast(&freed),
+        .meta = .{ .external = .{
+            .ptr = content.ptr,
+            .falloc = testFalloc,
+            .ud = @ptrCast(&freed),
+        } },
     };
 
     // destroyLuaString should: (1) call falloc to release external content,
@@ -2614,12 +2636,12 @@ test "external string: regular string does NOT invoke falloc" {
     const alloc = std.testing.allocator;
     var freed = false;
 
-    // A regular (non-external) string must never call falloc. Set falloc to a
-    // non-null value to verify the branch is skipped for inline strings.
+    // A regular (non-external) string must never call falloc. Set the external
+    // payload to a non-null falloc to verify the branch is skipped for inline
+    // strings (is_external is the sole discriminator).
     const ls = try createLuaString(alloc, "inline", 0);
     ls.is_external = false; // redundant but explicit — regular string
-    ls.falloc = testFalloc;
-    ls.falloc_ud = @ptrCast(&freed);
+    ls.meta = .{ .external = .{ .falloc = testFalloc, .ud = @ptrCast(&freed) } };
     destroyLuaString(alloc, ls);
     try std.testing.expect(!freed);
 }
@@ -16706,9 +16728,11 @@ pub const Vm = struct {
             .len = len,
             .is_short = false, // external strings are always "long" (PUC VLNGSTR)
             .is_external = true,
-            .external_ptr = content,
-            .falloc = falloc,
-            .falloc_ud = ud,
+            .meta = .{ .external = .{
+                .ptr = content,
+                .falloc = falloc,
+                .ud = ud,
+            } },
         };
         try self.gcRegisterString(ls);
         // Only the header is owned by the GC; the external content is accounted

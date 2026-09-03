@@ -24459,6 +24459,12 @@ pub const Vm = struct {
         };
 
         var reader = undump_mod.UndumpReader.init(self.alloc, bytes);
+        // PUC's lundump.c dedup table (luaH_new at :411, freed at :423) is
+        // transient; our equivalent is the reader's string_dedup ArrayList,
+        // which must be freed on EVERY path out of this function — without
+        // this deinit it leaked 144B per binary-chunk load (api580 ledger
+        // finding).
+        defer reader.deinit();
         reader.fixed = fixed;
         if (fixed) {
             reader.fixedInternFn = undumpFixedInternCallback;

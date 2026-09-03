@@ -6763,3 +6763,14 @@ Gates: zig build test (Debug) PASS; closure/coroutine/db/errors/nextvar
 suites + 8/8 diff PASS.
 
 Remaining api580 ledger (charged): 464 vs PUC 304; still need −65B.
+
+## P16.16 bonus — loadBinaryChunk string_dedup leak fixed (2026-09-04)
+
+The api580-ledger finding: loadBinaryChunk never called
+UndumpReader.deinit(), leaking the 144B string_dedup ArrayList per
+binary-chunk load (PUC's lundump.c:411 dedup table is transient, freed
+at :423). Fix: `defer reader.deinit()` in loadBinaryChunk (every return
+path). Charged api580 unchanged (464 — the leak was never charged to
+gc_count_kb); real outstanding memory per load drops 144B. leak_bench:
+load_chunk/load_function now net-negative (freed) — PASS. Gates: zig
+build test, smoke 68/68, c_api 18_dump/19_load PASS.

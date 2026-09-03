@@ -6682,3 +6682,41 @@ correct PUC ledger is 304 (not 356).
 matrix --testc: zig_fail=1 (api.lua — this documented deviation) + big.lua
 both_fail (pre-existing) — no new regressions. Smoke 68/68 PASS. No src/
 changes (tools/ only).
+
+## P16.16 T2 (C1) — GC header compaction: gc_seq finalizable-only, gc_index u32 (2026-09-04)
+
+Structural cut 1 of the api580 < 400 program. The flat GC header on every
+GC-managed object was `gc_age` (1B) + `gc_index: usize` (8B) + `gc_seq: u64`
+(8B) + `gc_marked` (1B) ≈ 24B with padding. Audit of `gc_seq` readers: the
+ONLY read is `gcFinalizeLessThan` (finalizer LIFO sort), which operates
+exclusively on the `finalizables` set — and `gcCanFinalize` admits only
+Table and Userdata (all `registerFinalizable` call sites pass .table or
+.userdata). No other type's sequence is ever observed.
+
+Changes (src/lua/vm.zig):
+- `gc_seq: u64` REMOVED from Cell, Closure, Thread, LuaString. Kept on
+  Table and Userdata (the finalizable types) — no fake uniform value.
+- `GcPtr` (the uniform gcPtr() field-pointer bundle) drops its `seq`
+  field; a new `gcFinalizableSeqPtr(obj) ?*u64` helper serves the two
+  finalizable types at the single sort site and the single stamp site
+  (`gcRegisterObject` now stamps seq only for table/userdata).
+- `gc_index: usize` → `u32` on all six GC types (gc_objects can never
+  exceed 4G entries; Debug assert added at registration).
+- Cell sweep debug print (env-gated, Debug-only) drops its gc_seq field.
+
+@sizeOf: Closure 88→72, Cell 64→48, LuaString 72→56, Table 80→72,
+Userdata 64→56, Thread 5032→5016.
+
+api580 (anchored driver, 3 runs): 544 → **496** (−48 = 3 ledger objects
+× 16B: Closure, Cell, external LuaString header — exactly as predicted).
+
+Perf A/B (3-round interleaved, taskset-pinned, median cycles/instr):
+table_alloc +0.53% cyc / −0.00% instr (noise), string_loop +0.02% / +0.00%
+(flat). No regression.
+
+Gates: zig build test (Debug) PASS; gc/gengc/closure/coroutine --testc
+PASS; smoke 68/68 PASS; c_api 20 suites + 8/8 diff PASS.
+
+Remaining api580 ledger (charged): 496 vs PUC 304; still need −97B
+(Proto +120 gap dominates; then Closure env_override/tree, LuaString
+union, Upvaldesc, Cell bc_stack_idx, Proto flags/footprint/ref_count).

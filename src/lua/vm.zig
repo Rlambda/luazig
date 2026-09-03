@@ -654,11 +654,11 @@ fn llAccessible(L: ?*lua_State) callconv(.c) c_int {
 pub const Cell = struct {
     value: Value,
     gc_age: GcAge = .new,
-    gc_index: usize = 0,
-    /// Monotonic creation sequence — never changes after allocation.
-    /// Used for PUC LIFO finalization order (independent of gc_index,
-    /// which is corrupted by swapRemove during sweep).
-    gc_seq: u64 = 0,
+    /// Position of this object in `Vm.gc_objects` (P16.16 C1: u32 — the
+    /// list can never exceed 4G entries). Used by `gcUnregisterObject`
+    /// for O(1) swapRemove; corrupted by the swap, never reused for
+    /// ordering.
+    gc_index: u32 = 0,
     /// PUC `marked` byte — tri-color mark bits (WHITE0/WHITE1/BLACK/
     /// FINALIZED/TEST). See constants above.
     gc_marked: u8 = 0,
@@ -775,8 +775,8 @@ pub const lua_State = struct {
 
 pub const Closure = struct {
     gc_age: GcAge = .new,
-    gc_index: usize = 0,
-    gc_seq: u64 = 0,
+    /// Position in `Vm.gc_objects` (P16.16 C1: u32; see Cell.gc_index).
+    gc_index: u32 = 0,
     /// PUC `marked` byte — tri-color mark bits. See constants above.
     gc_marked: u8 = 0,
     proto: ?*const bc.Proto = null, // bytecode proto (non-null for bytecode closures)
@@ -1865,8 +1865,8 @@ pub const Thread = struct {
         values: []Value,
     };
     gc_age: GcAge = .new,
-    gc_index: usize = 0,
-    gc_seq: u64 = 0,
+    /// Position in `Vm.gc_objects` (P16.16 C1: u32; see Cell.gc_index).
+    gc_index: u32 = 0,
     /// PUC `marked` byte — tri-color mark bits. See constants above.
     gc_marked: u8 = 0,
     status: enum { suspended, running, dead } = .suspended,
@@ -2161,8 +2161,8 @@ pub const LuaString = struct {
     /// PUC `marked` byte — tri-color mark bits. See constants above.
     gc_marked: u8 = 0,
     gc_age: GcAge = .new,
-    gc_index: usize = 0,
-    gc_seq: u64 = 0,
+    /// Position in `Vm.gc_objects` (P16.16 C1: u32; see Cell.gc_index).
+    gc_index: u32 = 0,
     /// PUC `u.hnext`: chain link inside the interned-string table bucket
     /// (lstring.c `stringtable`). Owned by `StringTable`; null when the
     /// string is not currently in a bucket.
@@ -2715,11 +2715,13 @@ pub const GcObject = union(enum) {
 /// Pointer bundle to the flat GC header fields on any GC-managed struct.
 /// Returned by `gcPtr()`, used by generic GC code to access marked/age/index
 /// without switching on GcObject variant at every access site.
+/// P16.16 C1: no `seq` here — only the finalizable types (Table, Userdata)
+/// carry a creation sequence, accessed via `gcFinalizableSeq` at the single
+/// finalizer-sort site. No fake uniform field for non-finalizable types.
 const GcPtr = struct {
     marked: *u8,
     age: *GcAge,
-    index: *usize,
-    seq: *u64,
+    index: *u32,
 };
 
 /// Access the flat GC header fields (gc_marked, gc_age, gc_index) of any
@@ -2727,12 +2729,26 @@ const GcPtr = struct {
 /// point that lets generic GC code operate on all types uniformly.
 fn gcPtr(obj: GcObject) GcPtr {
     return switch (obj) {
-        .table => |t| .{ .marked = &t.gc_marked, .age = &t.gc_age, .index = &t.gc_index, .seq = &t.gc_seq },
-        .closure => |c| .{ .marked = &c.gc_marked, .age = &c.gc_age, .index = &c.gc_index, .seq = &c.gc_seq },
-        .thread => |t| .{ .marked = &t.gc_marked, .age = &t.gc_age, .index = &t.gc_index, .seq = &t.gc_seq },
-        .string => |s| .{ .marked = &s.gc_marked, .age = &s.gc_age, .index = &s.gc_index, .seq = &s.gc_seq },
-        .cell => |c| .{ .marked = &c.gc_marked, .age = &c.gc_age, .index = &c.gc_index, .seq = &c.gc_seq },
-        .userdata => |u| .{ .marked = &u.gc_marked, .age = &u.gc_age, .index = &u.gc_index, .seq = &u.gc_seq },
+        .table => |t| .{ .marked = &t.gc_marked, .age = &t.gc_age, .index = &t.gc_index },
+        .closure => |c| .{ .marked = &c.gc_marked, .age = &c.gc_age, .index = &c.gc_index },
+        .thread => |t| .{ .marked = &t.gc_marked, .age = &t.gc_age, .index = &t.gc_index },
+        .string => |s| .{ .marked = &s.gc_marked, .age = &s.gc_age, .index = &s.gc_index },
+        .cell => |c| .{ .marked = &c.gc_marked, .age = &c.gc_age, .index = &c.gc_index },
+        .userdata => |u| .{ .marked = &u.gc_marked, .age = &u.gc_age, .index = &u.gc_index },
+    };
+}
+
+/// Creation sequence of a finalizable object (Table/Userdata only — the
+/// only types `gcCanFinalize` admits, hence the only types ever present in
+/// the `finalizables` set and its LIFO sort). Used by `gcFinalizeLessThan`
+/// for PUC LIFO finalization order and by `gcRegisterObject` to stamp the
+/// sequence at creation. Returns null for non-finalizable types (they carry
+/// no seq field — no fake uniform value).
+fn gcFinalizableSeqPtr(obj: GcObject) ?*u64 {
+    return switch (obj) {
+        .table => |t| &t.gc_seq,
+        .userdata => |u| &u.gc_seq,
+        else => null,
     };
 }
 
@@ -2815,7 +2831,13 @@ const TableFlags = struct {
 
 pub const Table = struct {
     gc_age: GcAge = .new,
-    gc_index: usize = 0,
+    /// Position in `Vm.gc_objects` (P16.16 C1: u32; see Cell.gc_index).
+    gc_index: u32 = 0,
+    /// Monotonic creation sequence — never changes after allocation.
+    /// Used for PUC LIFO finalization order (independent of gc_index,
+    /// which is corrupted by swapRemove during sweep). P16.16 C1: only
+    /// the finalizable types (Table, Userdata) carry a sequence — the
+    /// finalizer sort never sees other types, so they carry no seq field.
     gc_seq: u64 = 0,
     /// PUC `marked` byte — tri-color mark bits. See constants above.
     gc_marked: u8 = 0,
@@ -2885,7 +2907,10 @@ pub const Table = struct {
 pub const Userdata = struct {
     gc_marked: u8 = 0,
     gc_age: GcAge = .new,
-    gc_index: usize = 0,
+    /// Position in `Vm.gc_objects` (P16.16 C1: u32; see Cell.gc_index).
+    gc_index: u32 = 0,
+    /// Monotonic creation sequence for PUC LIFO finalization order
+    /// (P16.16 C1: finalizable-types-only; see Table.gc_seq).
     gc_seq: u64 = 0,
     /// Per-object metatable (PUC `Udata.metatable`). Null = no metatable.
     metatable: ?*Table = null,
@@ -6620,10 +6645,20 @@ pub const Vm = struct {
             try self.gc_young_objects.ensureUnusedCapacity(self.alloc, 1);
         const p = gcPtr(obj);
         p.marked.* = self.gc_current_white & WHITEBITS;
-        p.index.* = self.gc_objects.items.len;
-        p.seq.* = self.gc_creation_seq;
-        self.gc_creation_seq += 1;
-        self.gc_objects.appendAssumeCapacity(obj);
+        // P16.16 C1: gc_index is u32 — the list can never exceed 4G entries
+        // (each entry is 16B, so 4G entries = 64GB of list alone).
+        std.debug.assert(self.gc_objects.items.len <= std.math.maxInt(u32));
+        p.index.* = @intCast(self.gc_objects.items.len);
+        // Creation sequence: only the finalizable types (Table/Userdata)
+        // carry one — it exists solely for the finalizer LIFO sort, which
+        // never sees another type (see gcFinalizableSeq).
+        switch (obj) {
+            .table, .userdata => {
+                gcFinalizableSeqPtr(obj).?.* = self.gc_creation_seq;
+                self.gc_creation_seq += 1;
+            },
+            else => {},
+        }        self.gc_objects.appendAssumeCapacity(obj);
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             p.age.* = .new;
             self.gc_young_objects.appendAssumeCapacity(obj);
@@ -22618,8 +22653,8 @@ pub const Vm = struct {
                             else if ((c.gc_marked & WHITEBITS) != 0) "white"
                             else "gray";
                         std.debug.print(
-                            "cell sweep: open={} color={s} age={s} gc_index={} gc_seq={}\n",
-                            .{ c.isOpen(), color, @tagName(c.gc_age), c.gc_index, c.gc_seq },
+                            "cell sweep: open={} color={s} age={s} gc_index={}\n",
+                            .{ c.isOpen(), color, @tagName(c.gc_age), c.gc_index },
                         );
                     }
                 }
@@ -23598,10 +23633,14 @@ pub const Vm = struct {
         const lr = self.testcFinalizeRankObj(lhs);
         const rr = self.testcFinalizeRankObj(rhs);
         if (lr != rr) return lr > rr;
-        // Same rank: sort by gc_seq descending (LIFO creation order).
-        // gc_seq is a monotonic counter set once at creation and never
-        // changed, unlike gc_index which is corrupted by swapRemove.
-        return gcPtr(lhs).seq.* > gcPtr(rhs).seq.*;
+        // Same rank: sort by creation sequence descending (LIFO creation
+        // order). The sequence is set once at creation and never changed,
+        // unlike gc_index which is corrupted by swapRemove. Only the
+        // finalizable types carry a sequence (P16.16 C1); the sort never
+        // sees another type, so the null case is unreachable in practice.
+        const lseq = gcFinalizableSeqPtr(lhs) orelse return false;
+        const rseq = gcFinalizableSeqPtr(rhs) orelse return true;
+        return lseq.* > rseq.*;
     }
 
     /// Rank helper for testC GC finalization ordering. Table-based userdata

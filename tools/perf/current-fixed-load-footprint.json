@@ -1,7 +1,9 @@
 {
-  "created_utc": "2026-09-02T23:44:15.123519+00:00",
+  "created_utc": "2026-09-03T12:45:00.082399+00:00",
   "zig_version": "0.16.0",
-  "git_head": "148927c",
+  "git_head": "58f5a39",
+  "git_dirty": "dirty",
+  "zig_binary_sha256_16": "3e72900c36aafb96",
   "zig_sizes": {
     "Proto": 248,
     "Closure": 88,

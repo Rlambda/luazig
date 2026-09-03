@@ -34562,15 +34562,43 @@ pub const Vm = struct {
     }
 
     /// PUC `luaT_gettm` (ltm.c:60-68): look up a metamethod by event in a
-    /// metatable using the pre-interned name string. This is the non-cached
-    /// path — it always does a hash lookup via `nodeLookupStr` (pointer-identity
-    /// for interned shorts, content-eq for longs). Returns `null` if the field
-    /// is absent (Nil).
+    /// metatable using the pre-interned name string. PUC's `luaT_gettm` calls
+    /// `luaH_Hgetshortstr(events, ename)` — a SHORT-STRING POINTER-IDENTITY
+    /// lookup (ltable.c:975-988: `keyisshrstr(n) && eqshrstr(keystrval(n),
+    /// key)`, where `eqshrstr(a,b) == (a == b)`). No content fallback, no
+    /// long-string path. It also asserts `event <= TM_EQ` and caches-on-miss
+    /// via `events->flags |= (1u<<event)`.
     ///
-    /// PUC's `luaT_gettm` also caches-on-miss (sets the flags bit), but ONLY
-    /// for events <= TM_EQ — and that caching is done by `fastTm` (which wraps
-    /// `getTm`). This function itself does NOT touch flags, matching PUC's
-    /// `luaT_gettmbyobj` which calls `luaH_Hgetshortstr` directly without flags.
+    /// Our split (PUC-faithful in structure, see T1/T5 audit):
+    ///   - `getTm`        = the hash-lookup half of `luaT_gettm` (NO flags
+    ///                       touch, NO `event <= TM_EQ` assert — those are
+    ///                       `fastTm`'s responsibility).
+    ///   - `fastTm`       = `gfasttm` + `luaT_gettm` cache-on-miss for events
+    ///                       `<= .eq` (the `maskflags` zone, ltm.h:54,63-68).
+    ///   - `getTmByObj`   = `luaT_gettmbyobj` (ltm.c:71-84): resolve metatable
+    ///                       for `v`, then `getTm`. NO flags cache for ANY
+    ///                       event — matches PUC exactly on caching.
+    ///
+    /// **Current discrepancy (to be closed by T3):** `getTm` currently uses
+    /// `nodeLookupStr`, which dispatches to `luaStringEq` — pointer-identity
+    /// for interned shorts BUT content-eq for longs. PUC's `luaH_Hgetshortstr`
+    /// is short-string pointer-identity ONLY. Since `tm_names[event]` is
+    /// always a VM-interned short string and metatable keys for metamethod
+    /// names are also interned shorts, the content-eq path is never taken in
+    /// practice — but the code path is structurally wider than PUC's. T3
+    /// introduces `nodeLookupShortStrIdentity` (pure pointer-identity, no
+    /// content path) to close this.
+    ///
+    /// **T5 PROHIBITION — no negative-cache for non-fast events:**
+    /// Events `> .eq` (add, sub, mul, mod, pow, div, idiv, band, bor, bxor,
+    /// shl, shr, unm, bnot, lt, le, concat, call, close) MUST NOT be cached
+    /// via `Table.flags`. PUC `luaT_gettmbyobj` calls `luaH_Hgetshortstr`
+    /// directly — it never checks or sets flags bits for these events. This
+    /// is a SEMANTIC invariant: dynamic mutation
+    ///   `mt.__add = nil → op (error) → mt.__add = f → op (calls f)`
+    /// must be visible immediately. A negative-cache would hide the
+    /// `nil → f` transition. Only events `<= .eq` (index, newindex, gc, mode,
+    /// len, eq) participate in the flags cache, via `fastTm`/`gfasttm`.
     fn getTm(self: *Vm, mt: *Table, event: TmsEvent) ?Value {
         const name_str = self.tm_names[@intFromEnum(event)] orelse return null;
         const node = ltable.nodeLookupStr(mt.hash, name_str) orelse return null;
@@ -34581,9 +34609,19 @@ pub const Vm = struct {
     /// PUC `luaT_gettmbyobj` (ltm.c:71-84): look up a metamethod by event for
     /// a value `v`. Resolves the metatable for `v` (per-type metatable from
     /// `G(L)->mt[]` for primitives, or the object's own `.metatable` for
-    /// tables/userdata), then calls `getTm`. Does NOT use the flags cache —
-    /// matches PUC exactly (every lookup hits the metatable, so dynamic
-    /// `mt.__add` mutation is visible immediately).
+    /// tables/userdata), then calls `luaH_Hgetshortstr(mt, tmname[event])`.
+    ///
+    /// **NO flags cache for ANY event** — PUC's `luaT_gettmbyobj` does NOT
+    /// call `gfasttm`/`luaT_gettm`; it calls `luaH_Hgetshortstr` directly.
+    /// This means every lookup hits the metatable hash, so dynamic
+    /// `mt.__add` mutation is visible immediately. Our `getTmByObj` delegates
+    /// to `getTm` (which also does not touch flags) — structurally equivalent.
+    /// See the T5 PROHIBITION in `getTm`'s doc comment.
+    ///
+    /// **Lookup discrepancy (T3 target):** PUC uses `luaH_Hgetshortstr`
+    /// (short-string pointer-identity only). Our `getTm` currently uses
+    /// `nodeLookupStr` (general `luaStringEq` — content-eq for longs). T3
+    /// replaces this with `nodeLookupShortStrIdentity` to match PUC exactly.
     pub fn getTmByObj(self: *Vm, v: Value, event: TmsEvent) ?Value {
         const mt = valueMetatable(self, v) orelse return null;
         return self.getTm(mt, event);
@@ -34607,15 +34645,21 @@ pub const Vm = struct {
     }
 
     /// PUC `gfasttm` / `fasttm` (ltm.h:63-68): fast metamethod lookup with
-    /// flags cache. If the metatable's `flags` bit for `event` is set (meaning
-    /// "this metamethod is absent"), returns `null` immediately — no hash
-    /// lookup. Otherwise does `getTm` on the metatable. On miss (field is nil),
-    /// sets the bit (cache-on-miss) so subsequent calls skip the lookup.
+    /// flags cache. `gfasttm(g, mt, e)` expands to:
+    ///   `checknoTM(mt, e) ? NULL : luaT_gettm(mt, e, g->tmname[e])`
+    /// where `checknoTM` tests `(mt)->flags & (1u<<(e))` and `luaT_gettm`
+    /// does `luaH_Hgetshortstr` + cache-on-miss (`flags |= (1u<<event)`),
+    /// asserting `event <= TM_EQ`.
     ///
+    /// Our `fastTm` mirrors this exactly: check the flags bit (early null if
+    /// set), else `getTm`-style lookup, else cache-on-miss (set the bit).
     /// ONLY valid for fast-cached events (index..eq, see
     /// `tag_method.isFastCached`). For non-cached events (add..close),
-    /// use `getTm` or `getTmByObj`.
-    /// This mirrors PUC's `gfasttm` which is only called with events <= TM_EQ.
+    /// use `getTm` or `getTmByObj` — see the T5 PROHIBITION in `getTm`'s doc.
+    ///
+    /// **Lookup discrepancy (T3 target):** same as `getTm` — currently uses
+    /// `nodeLookupStr` (general `luaStringEq`), T3 will switch to
+    /// `nodeLookupShortStrIdentity` to match PUC's `luaH_Hgetshortstr`.
     fn fastTm(self: *Vm, mt: *Table, event: TmsEvent) ?Value {
         const bit = TableFlags.bit(event);
         if ((mt.flags & bit) != 0) return null;
@@ -34643,7 +34687,12 @@ pub const Vm = struct {
     /// These fields are NOT part of PUC's `TMS` enum and do NOT participate
     /// in the flags cache. PUC looks them up via `luaL_getmetafield` /
     /// `luaH_Hgetshortstr` with on-demand interning. We pre-intern them in
-    /// `metafield_names` for the same pointer-identity fast path as `getTm`.
+    /// `metafield_names` (all are short strings, `is_short == true`) for the
+    /// same pointer-identity fast path as `getTm`.
+    ///
+    /// **T3 target:** switch from `nodeLookupStr` (general `luaStringEq`) to
+    /// `nodeLookupShortStrIdentity` — `metafield_names` entries are provably
+    /// pre-interned shorts, matching PUC's `luaH_Hgetshortstr` precondition.
     fn getMetaField(self: *Vm, mt: *Table, field: MetaField) ?Value {
         const name_str = self.metafield_names[@intFromEnum(field)] orelse return null;
         const node = ltable.nodeLookupStr(mt.hash, name_str) orelse return null;

@@ -4403,6 +4403,52 @@ geomean 1.79→1.81-1.83x после пачки (+2-4 линии в table-alloc 
 структур; все точечные A/B flat; документировано, не хакнуто). Базлайн
 обновлён честно.
 
+## P16.17 — api580 в ОБОИХ режимах сборки + LSTRFIX allocated-parity (2026-09-05)
+
+### Корневая причина Debug-сбоя (`8e78559`)
+Plain Zig `union` в LuaString.Meta получал скрытый safety-tag в Debug:
+@sizeOf 48 (RF) vs 56 (Debug) → api.lua:580 delta 392 vs 400 = FAIL в
+Debug при зелёном RF. Fix: `extern union` + `extern struct ExtInfo` —
+layout билд-режимо-независим; comptime-инвариант @sizeOf==48 в каждом
+режиме сборки (регрессия ломает сборку, а не тест).
+
+### T2: LSTRFIX truncated header — PUC allocated-size parity (`cc2fd76`)
+PUC luaS_sizelngstr выделяет по-разному: LSTRREG 32+len+1, LSTRFIX 32,
+LSTRMEM 48, short 32+len+1. luazig платил 48 за fixed. Fix: StrKind
+enum(u8) (PUC shrlen-модель) вместо is_short/is_external bools; LuaString
+→ extern struct (явный layout, kind внутри префикса); fixed externals
+аллоцируются усечёнными 32B; destroy дискриминирует по kind ДО чтения
+falloc/ud (PUC lgc.c:873 mirror). api580: 392→376 в обоих режимах.
+Ledger: reconciliation точный (376==376); PUC-gap остался только
+Proto +72.
+
+### T3: настоящий гейт (`142110b`)
+tools/api580_gate.py: оба режима, delta<400 assert, исполнение X/Y,
+size-инварианты. smoke 69 переименован в helper — skipped-тест больше не
+считается parity-доказательством.
+
+### T4/T5: честный ledger + provenance (`281ba6f`, `e97b6dd`, `133213e`)
+Ledger: per-mode deltas с per-mode provenance; history-секция (544/690 —
+история); string_dedup_leak = fixed (d4fc485) или ACTIVE REGRESSION по
+замеру; charged = фактические 32B для LSTRFIX. Все lanes штампуют
+optimize_mode + measured_source_head; workflow «commit → clean measure →
+/tmp → copy → artifact commit».
+
+### T8:perf-«регрессия» P16.16 = шум сессии (measurement report)
+Commit-level A/B (10 точек, worktree-изоляция, PUC sha одинаковый во
+всех): e0bcb34 1.79x → HEAD 1.77x; инструкции flat ±2% на всех точках.
+Катапультир C1-C7 семантически нейтральны; 1.828 был layout-лотереей
+сессии замера. Свежий clean-снапшот: geomean 1.772x @133213e, регрессий
+к baseline нет (worst +4.0% field_access, все < WARN).
+
+### Гейт (13/13, сабагент-верификация)
+zig tests Debug+RF 0; api.lua --testc Debug+RF PASS (376/376);
+api580_gate GREEN; c_api 20+diff; smoke 69/69 (64/66/67/68
+byte-identical); matrix zig_fail=0 (both_fail=1 big.lua pre-existing;
+files.lua на этом хосте проходит); nextvar 10/10; leak_bench; native
+lanes 4/4 BOUNDED; repro b/B PUC-identical; CallFrame 96; Node 32;
+comptime size-инварианты в обоих режимах.
+
 ## История закрытых фаз
 
 P3–P15.12 — краткая сводка. P15.13+ — см. «История разработки» выше.

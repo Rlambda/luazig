@@ -4449,6 +4449,70 @@ files.lua на этом хосте проходит); nextvar 10/10; leak_bench;
 lanes 4/4 BOUNDED; repro b/B PUC-identical; CallFrame 96; Node 32;
 comptime size-инварианты в обоих режимах.
 
+## P16.18 — полная per-kind TString parity + StringTable OOM-корректность (2026-09-05)
+
+### T1: точность заявлений о представлении
+Различаем: full-struct parity (LuaString 48 = TString 48), per-kind
+ALLOCATED parity (достигнута в T5), semantic parity. До T5 заявление
+"string representation = PUC parity" было НЕВЕРНО для ordinary strings
+(48+len+1 вместо 24/32+len+1).
+
+### T2 (`ceb647e`): GC-аккаунтинг ordinary-строк включает NUL
+Заряд = фактическая аллокация (+1) на всех трёх сайтах
+(intern/gcObjectBytes/sweep); тест empty/1/40/41/300.
+
+### T3 (`8afdab3`): StringTable grow-OOM = PUC internshrstr
+ОШИБКА была: `catch return` пропускал вставку → uninterned short →
+второй intern равных байт = ДРУГОЙ указатель → luaStringEq (pointer-eq для
+shorts) ломался. Fix: grow-failure глотается, вставка в СТАРУЮ таблицу;
+начальный zero-bucket OOM пропагируется (PUC luaS_init fail state).
+FailingAllocator-тесты: initial-OOM, grow-OOM → interned в старой
+таблице, nuse, lookup, identity, removal, re-insert.
+
+### T5-T9 (`ea27ce7`): PUC shrlen-модель — per-kind аллокации
+srkind i8 (= short len | LSTRREG/-1 | LSTRFIX/-2 | LSTRMEM/-3):
+**short 24+len+1 (контент@24), LSTRREG 32+len+1 (@32), LSTRFIX 32,
+LSTRMEM 48 = PUC sizestrshr/luaS_sizelngstr.** Явный extern-layout: GC-
+метаданные в первых 16B (внутри любого префикса); hnext|lnglen@16;
+extptr|content@24; falloc/ud@32/40 (только LSTRMEM). Акцессоры
+len()/bytes()/nextShort/allocatedSize (единственное правило заряда — T7);
+граница sweep = isShort() (T8); external<40 остаются long-kind. Тесты:
+per-kind таблица, rehash+GC выживание string-ключей, equal-longs
+content-eq, LSTRMEM-callback ровно 1×, LSTRFIX никогда.
+
+### T10: layout перф-нейтрален (interleaved A/B, сабагент)
+geomean −0.5%; string_loop −3.4%, table-allocs −3.2/−3.9%; field_access
+бимодален (частота CPU) — 60-прогонный recheck +0.38% = шум.
+global_arith «+30%» в сессионном прогоне = hash-seed лотерея (оба
+движка; распределения перекрываются: old med 933ms vs new med 911ms; new
+легче по инструкциям в ОБОИХ модах: 14.5/16.7G vs 15.3/17.4G).
+
+### T11 (`3cc00bc`): идентичность baseline
+Guard → baseline-approved.json (явный --update-baseline
+--baseline-phase); исторический P15.37 восстановлен неизменным.
+Approved: P16.18 @4bb378b, 1.799x.
+
+### T12-T13 (`4bb378b`): дифференциальный профиль — getTmByObj НЕ цель
+current-differential-profile.json (оба бинаря, pinned): noalloc
++549 instr/iter (924 vs 375), lua_calls +482. Избыток: frame push/return
+механика (~340 vs ~135 у PUC) + фиксированные проверки на инструкцию
+(hooks 6-9%, stats 5%, ctx re-derive 4.6%). getTmByObj ≈ 5.5% у обоих —
+избыток 3-5% delta. T13: НЕ оптимизируем; негативного кэша НЕТ.
+
+### Следующий hotspot (из fresh дифпрофиля)
+1) per-instruction фиксированные проверки (hooks_active_cached,
+stats.enabled, ctx.regs/boxed re-derive, pc-инкремент) — PUC платит ~0;
+2) frame push/return путь (pushStaged/pushResolved/tryPush +
+FrameStack). Выбрать по абсолютной стоимости.
+
+### Гейт T14: 15/15 (сабагент)
+zig tests D+RF; 10 suite --testc Debug (api/strings/literals/db/locals/
+closure/coroutine/gc/gengc/errors); api580 376/376; c_api 20+diff;
+smoke 69/69; matrix zig_fail=0 (big.lua pre-existing); nextvar 10/10;
+leak_bench; 4 native lanes + selftest; repro b/B; 64/66/67/68
+byte-identical; 195 unit-тестов (5 строковых новых); comptime-инварианты;
+fixed-load GREEN (344 vs 272 PUC).
+
 ## История закрытых фаз
 
 P3–P15.12 — краткая сводка. P15.13+ — см. «История разработки» выше.

@@ -2459,17 +2459,29 @@ pub const StringTable = struct {
     pub fn insert(self: *StringTable, alloc: std.mem.Allocator, ls: *LuaString) std.mem.Allocator.Error!void {
         if (self.nuse >= self.buckets.len) {
             const target = @max(self.buckets.len * 2, min_size);
-            // PUC internshrstr (lstring.c:230-239): on OOM, luaS_resize keeps
-            // the old bucket array. PUC's internshrstr then returns NULL and
-            // the caller (luaS_newlstr) falls back to creating a long string.
-            // Our `catch return` mirrors the "keep old size" behavior: the
-            // string is NOT inserted into the intern table, and internStr
-            // continues to register it as a short string. This is a minor
-            // divergence from PUC (which would make it a long string), but
-            // only in OOM conditions. The string is still valid and GC-tracked;
-            // a subsequent internStr of the same content creates a duplicate
-            // short string — a memory inefficiency, not a correctness issue.
-            self.resize(alloc, target) catch return;
+            if (self.buckets.len == 0) {
+                // Initial bucket allocation: a zero-bucket table cannot host
+                // the string, and creating an UNINTERNED short string would
+                // break the pointer-identity invariant (a later equal short
+                // would be a different pointer, and luaStringEq compares
+                // shorts BY POINTER). PUC never reaches internshrstr with a
+                // zero-size table: luaS_init allocates MINSTRTABSIZE buckets
+                // during state creation and fails the STATE on OOM. Mirror
+                // that — propagate the failure to the caller.
+                try self.resize(alloc, target);
+            } else {
+                // Grow failure: PUC luaS_resize keeps the old bucket array
+                // ("leave table as it was"), and internshrstr then
+                // RECOMPUTES `list = &tb->hash[lmod(h, tb->size)]` with the
+                // OLD size and still creates+links the new short string
+                // (lstring.c:230-246). There is NO "demote to long string"
+                // fallback on this path in PUC 5.5. Swallowing the grow
+                // failure and inserting anyway preserves the central
+                // invariant: every live short string is interned exactly
+                // once, so equal shorts stay pointer-identical even under
+                // allocator failure.
+                self.resize(alloc, target) catch {};
+            }
         }
         const b = self.bucketOf(ls.hash);
         ls.meta.next = self.buckets[b];
@@ -2732,6 +2744,79 @@ test "external string: regular string does NOT invoke falloc" {
     ls.meta = .{ .external = .{ .falloc = testFalloc, .ud = @ptrCast(&freed) } };
     destroyLuaString(alloc, ls);
     try std.testing.expect(!freed);
+}
+
+// P16.18 T3: PUC-faithful StringTable OOM semantics.
+//
+// PUC internshrstr (lstring.c:230-246) NEVER demotes a short string to long
+// on resize failure: luaS_resize keeps the old bucket array ("leave table as
+// it was"), internshrstr recomputes the bucket with the OLD size and links
+// the new string anyway. Every live short string therefore stays interned
+// exactly once — equal shorts remain pointer-identical even under OOM.
+// (The previous luazig `catch return` skipped insertion, so a second intern
+// of equal bytes produced a DIFFERENT pointer — breaking luaStringEq, which
+// compares shorts by pointer identity.)
+
+test "StringTable: initial bucket allocation OOM propagates (no uninterned shorts)" {
+    const alloc = std.testing.allocator;
+    // fail the FIRST allocation through the wrapper (= the initial resize)
+    var failing = std.testing.FailingAllocator.init(alloc, .{
+        .fail_index = 0,
+        .resize_fail_index = 0,
+    });
+    var t: StringTable = .{};
+    const ls = try createLuaString(alloc, "abc", 0x1);
+    defer destroyLuaString(alloc, ls);
+    // The initial zero-bucket table cannot host a short string; the error
+    // must PROPAGATE (PUC fails state creation in luaS_init) instead of
+    // silently creating an uninterned short.
+    try std.testing.expectError(error.OutOfMemory, t.insert(failing.allocator(), ls));
+    try std.testing.expectEqual(@as(u32, 0), t.nuse);
+    try std.testing.expectEqual(@as(usize, 0), t.buckets.len);
+}
+
+test "StringTable: grow OOM keeps old table, still interns, identity holds" {
+    const alloc = std.testing.allocator;
+    var t: StringTable = .{};
+    // alloc #0 = initial 128-bucket array; alloc #1 = grow to 256 (fails).
+    var failing = std.testing.FailingAllocator.init(alloc, .{
+        .fail_index = 1,
+        .resize_fail_index = 1,
+    });
+    const fa = failing.allocator();
+    defer alloc.free(t.buckets);
+
+    // 129 distinct short strings; #129 trips nuse >= 128 -> grow -> OOM.
+    var strings: [129]*LuaString = undefined;
+    defer for (&strings) |s| destroyLuaString(alloc, s);
+    for (0..129) |i| {
+        var content: [6]u8 = undefined;
+        _ = std.fmt.bufPrint(&content, "s{d:0>5}", .{i}) catch unreachable;
+        strings[i] = try createLuaString(alloc, &content, (i + 1) *% 0x9E3779B97F4A7C15);
+    }
+    for (strings[0..128]) |s| try t.insert(fa, s);
+    try std.testing.expectEqual(@as(usize, 128), t.buckets.len);
+    try std.testing.expectEqual(@as(u32, 128), t.nuse);
+
+    // The failing grow must be swallowed: insert proceeds into the OLD table.
+    try t.insert(fa, strings[128]);
+    try std.testing.expectEqual(@as(usize, 128), t.buckets.len); // old kept
+    try std.testing.expectEqual(@as(u32, 129), t.nuse); // nuse grew
+
+    // Lookup finds it; repeated lookup/intern yields the SAME pointer, so
+    // luaStringEq's pointer identity for shorts survives the OOM.
+    const found = t.lookup("s00128", strings[128].hash).?;
+    try std.testing.expectEqual(strings[128], found);
+    try std.testing.expectEqual(found, t.lookup("s00128", strings[128].hash).?);
+    try std.testing.expect(luaStringEq(strings[128], found));
+
+    // Removal stays correct on the un-grown table.
+    t.removeString(strings[128]);
+    try std.testing.expectEqual(@as(u32, 128), t.nuse);
+    try std.testing.expectEqual(@as(?*LuaString, null), t.lookup("s00128", strings[128].hash));
+    // And a re-insert after the failed grow still works (grow retried).
+    try t.insert(alloc, strings[128]);
+    try std.testing.expectEqual(strings[128], t.lookup("s00128", strings[128].hash).?);
 }
 
 // P16.18 T2: ordinary-string GC accounting must equal the ACTUALLY-OWNED

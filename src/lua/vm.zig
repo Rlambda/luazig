@@ -1378,8 +1378,11 @@ const CFrameState = extern struct {
     /// P15.80: Heap-allocated pointer (was inline `?TestcContState`).
     /// TestcContState is ~184B; storing it inline in every CallFrame
     /// inflated CFrameState to 224B and CallFrame to 264B. Moving to a
-    /// pointer drops CFrameState to ~48B and CallFrame to ~88B, matching
-    /// the PUC CallInfo size (~100B). Allocated on demand only when
+    /// pointer drops CFrameState to 56B. For reference: PUC CallInfo is
+    /// 64 B on this 64-bit ABI (gcc-measured; see
+    /// tools/perf/current-callframe-layout.json) — luazig's 96-B CallFrame
+    /// is an architecture-specific larger representation (iterative
+    /// yieldable frames, inline hook-replay state). Allocated on demand only when
     /// callk/pcallk/yieldk is used; freed when the C-frame is consumed
     /// or popped.
     testc_state: ?*TestcContState = null,
@@ -12769,11 +12772,10 @@ pub const Vm = struct {
         boundary_depth: usize,
         yielded_in_place: *bool,
     ) DispatchError![]Value {
-        // P15.51l: ctx holds only the 7 hottest dispatch fields as locals
-        // (pc, base, regs, boxed, frame_cap, cur_proto, cur_upvalues — ~90%
-        // of accesses). The 11 rare fields are read/written directly on the
-        // heap CallFrame via exec_frames.getPtr(ctx.frame_index), matching
-        // PUC's pattern of accessing `ci` directly for non-hot state.
+        // P16.19/P16.20: ctx caches the hottest dispatch fields as locals
+        // (pc, base, regs, frame_cap, cur_proto, cur_upvalues; boxed was
+        // removed in P16.19 T3). Rare fields live directly on the heap
+        // CallFrame via exec_frames.getPtr, like PUC accessing `ci`.
         var ctx: BytecodeDispatchCtx = .{
             .exec_frames = exec_frames,
             .frame_index = 0, // set per-iteration below
@@ -12855,9 +12857,9 @@ pub const Vm = struct {
                 ctx.regs = self.bc_stack[fr.base .. fr.base + fr.u.lua.frame_cap];
             }
 
-            // P15.51l: syncFrame writes only the 5 hot fields that may have
-            // changed (pc, base, frame_cap, cur_proto, cur_upvalues) back to
-            // the heap CallFrame. Replaces the old 15-field defer block.
+            // P16.19 T9.1: syncFrame publishes pc + frame_cap (base write
+            // removed as provably identity; proto/upvalues are never
+            // generic sync writes).
             // The activation_id check skips the write for popped/replaced frames.
             defer self.syncFrame(&ctx, frame_identity);
 
@@ -12873,7 +12875,7 @@ pub const Vm = struct {
             // The per-instruction `if (self.bc_stack.ptr != stack_ptr)` check
             // was +3 instr/iter. It is unnecessary because every bc_stack
             // realloc path reachable from the inner loop either (a) explicitly
-            // refreshes ctx.regs/ctx.boxed afterward, or (b) exits to
+            // refreshes ctx.regs afterward, or (b) exits to
             // frame_loop (which re-derives slices at lines 11771-11772).
             //
             // Classification table (all realloc paths reachable from the inner

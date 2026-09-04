@@ -1380,7 +1380,7 @@ const CFrameState = extern struct {
     /// inflated CFrameState to 224B and CallFrame to 264B. Moving to a
     /// pointer drops CFrameState to 56B. For reference: PUC CallInfo is
     /// 64 B on this 64-bit ABI (gcc-measured; see
-    /// tools/perf/current-callframe-layout.json) — luazig's 96-B CallFrame
+    /// tools/perf/current-callframe-layout.json) — luazig's 88-B CallFrame
     /// is an architecture-specific larger representation (iterative
     /// yieldable frames, inline hook-replay state). Allocated on demand only when
     /// callk/pcallk/yieldk is used; freed when the C-frame is consumed
@@ -1531,9 +1531,10 @@ pub const CallFrame = extern struct {
     // P15.51n: current_line removed — derive from proto.lineinfo[pc].
     // P15.51n: last_hook_line moved to Thread (single-valued, PUC oldpc).
     // P15.51i: is_tailcall moved to CIST_TAIL bit in callstatus.
-    // P16.20 T1: extern layout packs by DECLARATION order — 8-aligned
-    // fields first, then the 4-byte group, so the variant union starts at
-    // offset 40 and @sizeOf(CallFrame) == 96 in BOTH build modes.
+    // P16.20 T1/T3: extern layout packs by DECLARATION order — 8-aligned
+    // fields first, then the 4-byte group; after removing the stored base,
+    // the variant union starts at offset 32 and @sizeOf(CallFrame) == 88
+    // in BOTH build modes.
     /// PUC `ci->func` equivalent: bc_stack index of the function value.
     /// The function value at `bc_stack[func_slot]` is preserved for
     /// debug.getinfo and return value placement.
@@ -2261,7 +2262,7 @@ const TestcContState = struct {
 // P16.20 T1 invariant: CallFrame layout is build-mode-stable (extern
 // struct/union — a plain Zig union here once made Debug 104 B vs RF 96 B,
 // the LuaString P16.17 bug class). The assert compiles in EVERY build
-// mode; offsets are part of the representation contract (u-variant at 40).
+// mode; offsets are part of the representation contract (u-variant at 32).
 comptime {
     std.debug.assert(@sizeOf(CallFrame) == 88);
     std.debug.assert(@offsetOf(CallFrame, "u") == 32);
@@ -12025,11 +12026,11 @@ pub const Vm = struct {
         const ef_slot = try exec_frames.addOne(self.alloc);
         errdefer exec_frames.shrinkTo(exec_frames.len() - 1);
 
-        // CRITICAL: Activate the .lua variant of the union BEFORE writing any
-        // .u.lua fields. In Debug mode, Zig panics on inactive union field
-        // access. `addOne` doesn't zero-init — the slot may contain stale data
-        // from a previous C-frame (where .u.c was active). Activating .lua
-        // with default values first, then overwriting individual fields below.
+        // Activate the .lua variant BEFORE writing .u.lua fields. Since
+        // P16.20 T1 the union is an extern union (no active-arm safety tag,
+        // no Debug panic on arm access) — this write is a plain store, kept
+        // because every LuaFrameState field is explicitly initialized below
+        // (stale data from a reused C-frame slot must not leak).
         //
         // P16.2d: `undefined` is safe: every LuaFrameState field is explicitly
         // initialized below (audited against the struct definition). Debug

@@ -4244,6 +4244,29 @@ pub const Vm = struct {
     pub const DISPATCH_GATE_HOOKS: u8 = 1;
     pub const DISPATCH_GATE_STATS: u8 = 2;
 
+    /// P16.21 T4.3: sanitize hook-replay state for every live Lua frame of
+    /// `th` when hooks transition to active. Frames created while hooks were
+    /// off carry semantically-dead (possibly stale/garbage) replay fields;
+    /// activation makes them LIVE, so they must become valid sentinels
+    /// before any hook-side read. last_line_pc is SEEDED to each frame's
+    /// current pc (the existing sethook invariant — no spurious line hook
+    /// on the install line); the skip fields become INVALID (no replay
+    /// pending). Called by BOTH installation paths: debug.sethook and
+    /// lua_sethook.
+    pub fn sanitizeHookReplayState(self: *Vm, th: *Thread) void {
+        _ = self;
+        var i: usize = 0;
+        const n = th.call_frames.len();
+        while (i < n) : (i += 1) {
+            const fr = th.call_frames.getPtr(i);
+            if (fr.isC()) continue;
+            fr.u.lua.last_line_pc = @intCast(fr.u.lua.pc);
+            fr.u.lua.skip_line_hook_pc = INVALID_PC;
+            fr.u.lua.skip_call_hook_pc = INVALID_PC;
+            fr.u.lua.resume_skip_count_pc = INVALID_PC;
+        }
+    }
+
     pub fn refreshHooksCached(self: *Vm) void {
         const hs = self.activeHookState();
         // P15.83h: C hook state is now per-thread in DebugHookState.c_hook.
@@ -12082,12 +12105,9 @@ pub const Vm = struct {
         // from scratch (CIST_HOOKYIELD clear), so a stale reused-slot value
         // is semantically dead. PUC-style validity-by-status-bit.
         ef_slot.reg_top = @intCast(nparams);
-        ef_slot.u.lua.last_line_pc = INVALID_PC;
-        ef_slot.u.lua.skip_line_hook_pc = INVALID_PC;
         ef_slot.tbc_mark = tbc_mark;
         // P15.51n: Initialize pending_call_index (addOne doesn't zero-init).
         ef_slot.pending_call_index = INVALID_PENDING;
-        ef_slot.u.lua.skip_call_hook_pc = INVALID_PC;
         // P16.8 Task 1: Initialize simple_result state (no simple-result pending).
         ef_slot.u.lua.clearSimpleResult();
 
@@ -12096,8 +12116,21 @@ pub const Vm = struct {
         // slices are used only for the nil-fill below.
         ef_slot.u.lua.setOpenUpvalues(false);
 
-        // Debug fields (must set explicitly — defaults don't re-apply on reuse)
-        ef_slot.u.lua.resume_skip_count_pc = INVALID_PC;
+        // P16.21 T4.3: hook-replay sentinels are initialized ONLY when hooks
+        // are active for this thread (one predictable branch on the common
+        // no-hooks path instead of four u32 stores). Validity model:
+        //  - frame created with hooks ON  -> initialized here;
+        //  - frame created with hooks OFF -> fields are semantically dead
+        //    (every read is inside the hooks-active dispatch block or the
+        //    hook push machinery), and BOTH hook-installation paths
+        //    (debug.sethook and lua_sethook) sanitize every live Lua frame
+        //    when hooks transition to active — see sanitizeHookReplayState.
+        if (self.dispatch_gate & DISPATCH_GATE_HOOKS != 0) {
+            ef_slot.u.lua.last_line_pc = INVALID_PC;
+            ef_slot.u.lua.skip_line_hook_pc = INVALID_PC;
+            ef_slot.u.lua.skip_call_hook_pc = INVALID_PC;
+            ef_slot.u.lua.resume_skip_count_pc = INVALID_PC;
+        }
     }
 
     /// VAHID buildhiddenargs (PUC ltm.c): shift func+params UP past the extra
@@ -16080,7 +16113,10 @@ pub const Vm = struct {
         const tc_event: []const u8 = if (callee_is_bytecode) "tail call" else "call";
         var deferred_tail_hook = false;
         var deferred_builtin_call_hook = false;
-        const skip_tail_hook = ctx.exec_frames.getPtr(ctx.frame_index).u.lua.skip_call_hook_pc == @as(u32, @intCast(ctx.pc));
+        // P16.21 T4.2: no hook-replay state is read when hooks are off
+        // (PUC checks the hook mask first — ldebug.c luaG_tracecall).
+        const skip_tail_hook = (self.dispatch_gate & DISPATCH_GATE_HOOKS != 0) and
+            ctx.exec_frames.getPtr(ctx.frame_index).u.lua.skip_call_hook_pc == @as(u32, @intCast(ctx.pc));
         if (skip_tail_hook) {
             ctx.exec_frames.getPtr(ctx.frame_index).u.lua.skip_call_hook_pc = INVALID_PC;
         } else if (try self.tryPushBytecodeDebugHook(
@@ -16610,7 +16646,8 @@ pub const Vm = struct {
         const rargs = ctx.regs[a + 1 .. a + 1 + effective_nargs];
 
         const resolved_callee = ctx.regs[a];
-        const skip_call_hook = ctx.exec_frames.getPtr(ctx.frame_index).u.lua.skip_call_hook_pc == @as(u32, @intCast(ctx.pc));
+        const skip_call_hook = (self.dispatch_gate & DISPATCH_GATE_HOOKS != 0) and
+            ctx.exec_frames.getPtr(ctx.frame_index).u.lua.skip_call_hook_pc == @as(u32, @intCast(ctx.pc));
         // PUC ordering (luaD_precall ldo.c:715 + luaG_tracecall ldebug.c:918):
         // the callee's CallInfo is created FIRST; the CALL hook fires with
         // ar.i_ci = the callee frame. For bytecode callees we therefore defer
@@ -28073,6 +28110,12 @@ pub const Vm = struct {
             // not just the top one. This mirrors PUC's invariant that
             // L->oldpc is always valid for the current Lua function.
             const seeded_thread = target_thread orelse self.activeBytecodeThread();
+            // P16.21 T4.3: hooks are transitioning to active — every live
+            // Lua frame's replay state becomes LIVE and must be sanitized
+            // (frames created while hooks were off carry dead/garbage
+            // sentinels). Seeding last_line_pc for all frames is part of
+            // the sanitize helper.
+            self.sanitizeHookReplayState(seeded_thread);
             if (seeded_thread.call_frames.len() != 0) {
                 // First, find the seed frame (skip debug hook frames).
                 // This is the frame that PUC's L->ci would point to.

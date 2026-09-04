@@ -2954,6 +2954,9 @@ pub export fn lua_sethook(L: ?*lua_State, func: ?*const fn (?*anyopaque, ?*anyop
     hs.budget = hs.count;
     hs.tick = 0;
     hs.allow_yield = false;
+    // P16.21 T4.3: hooks transitioning to active — sanitize replay state
+    // for every live Lua frame of this thread (mirrors debug.sethook).
+    vm.sanitizeHookReplayState(th);
     vm.refreshHooksCached();
 }
 

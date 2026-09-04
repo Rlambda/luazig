@@ -1,1 +1,1 @@
-P16.14/15 — provenance closure (shared helper, all current*.json stamped), staged call ABI (PUC luaT_callTMres→luaD_precall), pointer-origin guessing deleted
+P16.16 — api.lua:580 CLOSED (392B honest, zig_fail=0); representation parity: Closure 40=PUC, Cell 40=PUC, LuaString 48=PUC, Upvaldesc 16=PUC, Proto 200; staged ABI preserved

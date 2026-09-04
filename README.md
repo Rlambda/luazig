@@ -22,38 +22,38 @@ The project is in a **pre-release / parity-focused** state.
 
 | Metric | Result |
 |--------|--------|
-| Upstream matrix (`testes/*.lua`, `--testc`) | **30/32** pass (exit code parity) |
-| Matrix non-pass | both_fail: big.lua; zig_fail: api.lua |
-| Smoke tests (`tests/smoke/*.lua`) | **68/68** match (byte-identical stdout+stderr+exit) |
+| Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
+| Matrix non-pass | both_fail: big.lua |
+| Smoke tests (`tests/smoke/*.lua`) | **69/69** match (byte-identical stdout+stderr+exit) |
 | C API suites (`tests/c_api`) | 20 suites (gate: `make -C tests/c_api test`) |
 
 Regression lane: `python3 tools/testes_matrix.py --testc` (no `_port`/`_soft` prelude overrides).
 
 ### Performance
 
-Geomean slowdown vs PUC Lua: **1.77x** (lower is better; 1.0x = parity).
+Geomean slowdown vs PUC Lua: **1.83x** (lower is better; 1.0x = parity).
 Method: median-of-5 per workload, pinned CPU core (`tools/perf_compare.py`).
 
 | Workload | Zig/PUC |
 |----------|--------:|
-| metamethod_call_noalloc | 2.64x |
-| metamethod_add | 2.55x |
-| coroutine_yield | 2.18x |
-| hash_access | 2.09x |
-| lua_calls | 2.08x |
-| field_access | 2.02x |
-| table_alloc_setmetatable | 1.96x |
-| branch_loop | 1.90x |
-| array_access | 1.89x |
-| temp_table_alloc | 1.69x |
-| comparisons | 1.62x |
-| mixed_arith | 1.60x |
-| dynamic_load | 1.54x |
-| float_arith | 1.53x |
+| metamethod_call_noalloc | 2.58x |
+| metamethod_add | 2.56x |
+| coroutine_yield | 2.19x |
+| lua_calls | 2.15x |
+| hash_access | 2.12x |
+| table_alloc_setmetatable | 2.11x |
+| field_access | 2.00x |
+| array_access | 1.93x |
+| branch_loop | 1.92x |
+| temp_table_alloc | 1.87x |
+| global_arith | 1.80x |
+| mixed_arith | 1.67x |
+| dynamic_load | 1.58x |
+| comparisons | 1.58x |
+| float_arith | 1.54x |
 | int_arith | 1.51x |
-| global_arith | 1.50x |
-| string_loop | 1.27x |
-| string_concat | 1.10x |
+| string_loop | 1.35x |
+| string_concat | 1.14x |
 <!-- END GENERATED STATUS -->
 
 See [STATUS.md](STATUS.md) for detailed profiling methodology, hotspot analysis, and optimization history.

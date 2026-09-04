@@ -1,4 +1,4 @@
-> Last updated: 2026-09-03 (P16.14/15 — provenance closure (shared helper, all current*.json stamped), staged call ABI (PUC luaT_callTMres→luaD_precall), pointer-origin guessing deleted)
+> Last updated: 2026-09-04 (P16.16 — api.lua:580 CLOSED (392B honest, zig_fail=0); representation parity: Closure 40=PUC, Cell 40=PUC, LuaString 48=PUC, Upvaldesc 16=PUC, Proto 200; staged ABI preserved)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -31,14 +31,14 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 <!-- BEGIN GENERATED SUMMARY (tools/status_summary.py) -->
 | Metric | Result |
 |--------|--------|
-| Upstream matrix (`testes/*.lua`, `--testc`) | **30/32** pass (exit code parity) |
-| Matrix non-pass | both_fail: big.lua; zig_fail: api.lua |
+| Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
+| Matrix non-pass | both_fail: big.lua |
 | Differential output (`--diff`) | **0 output_diff** |
-| Smoke tests (`tests/smoke/*.lua`) | **68/68** pass |
+| Smoke tests (`tests/smoke/*.lua`) | **69/69** pass |
 | C API suites (`tests/c_api`) | 20 suites |
-| Performance (geomean vs PUC) | **1.77x** |
+| Performance (geomean vs PUC) | **1.83x** |
 
-Geomean замедления vs PUC Lua: **1.77x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.83x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -4355,6 +4355,53 @@ T5-запрет P16.13. Fresh geomean **1.77x** (снапшот clean 06cc5ea);
 top: noalloc 2.64x, metamethod_add 2.55x, coroutine_yield 2.18x,
 hash 2.09x, lua_calls 2.08x. Профиль noalloc: dispatch 64.0%,
 getTmByObj 9.8%, pushResolved 8.4%, pushStaged 8.3%, tryPush 6.9%.
+
+## P16.16 — api.lua:580 ЗАКРЫТ: представление = PUC-паритет (2026-09-05)
+
+### T0 (`48ae460`): clean-артефакты
+Все current*.json перегенерированы из clean-дерева (lanes писали в /tmp,
+потом копировались) — provenance-несогласованность закрыта.
+
+### T1 (`f6fdbcb`): полный ledger
+544B полностью объяснены: неучтённые 72B = заголовок внешней fixed-строки
+(PUC тоже аллоцирует TString для LSTRFIX — заголовок честен). Anchored-
+вариант: X/Y держатся константами объемлющего чанка (не stale register).
+PUC-ledger из исходников: 304B. Цель сокращения: ≥145B. Бонус-находка:
+loadBinaryChunk терял 144B dedup-ArrayList на загрузку — исправлено
+(`d4fc485`).
+
+### C1-C7 (343460c..042d0dd): структурные катапультир
+| Структура | до | после | PUC |
+|---|---|---|---|
+| Closure | 88 | **40** | 40 (=) |
+| Cell | 64 | **40** | 40 (=) |
+| LuaString | 72 | **48** | 48 (=) |
+| Upvaldesc | 24 | **16** | 16 (=) |
+| Proto | 248 | **200** | 128 (+72 — честные поля Zig-архитектуры: live_reg_top, resolved-механика, компактные owner-поля) |
+api580: 544 → 496 (C1) → 464 (C2: env_override удалён как чистая
+liveness-дубликация; tree выводится из proto) → 456 (C3: union intern-next
+vs external-payload) → 448 (C4: name ptr+u32) → 440 (C5: u32-CLOSED-
+sentinel) → 408 (C6: span удалён, footprint recomputed, ref_count u32,
+флаги packed) → **392 < 400**. Каждый кат: A/B 3-round interleaved — все
+flat (стэш-дэнсы по затронутым ворклоудам). gc_seq теперь ТОЛЬКО на
+финализуемых типах (Table/Userdata); gc_index u32.
+
+### Результат
+**api.lua --testc PASS; matrix zig_fail=0.** Постоянный узкий гейт
+69_api580_fixed_load_gate.lua (T11, `1ba9b1c`): fixed-B загрузка,
+delta<400 assert, исполнение проверяется; без testc — graceful skip.
+
+### Гейт (лично): zig tests Debug+RF 0; c_api 20+diff; smoke 69/69
+(57-69 byte-identical); matrix **zig_fail=0** (big.lua both_fail
+pre-existing); api/db/locals/closure/coroutine/gc/gengc/errors 0; nv10;
+leak_bench; 4 native lanes BOUNDED; repro b/B PUC-identical; CallFrame 96
+(≤104); Node 32; Cell-инвариант; T5-запрет.
+
+### Perf-заметка (честно)
+geomean 1.79→1.81-1.83x после пачки (+2-4 линии в table-alloc WARN-зоне
++6-8% — layout/alignment + честный GC-cadence сдвиг от меньших заряжаемых
+структур; все точечные A/B flat; документировано, не хакнуто). Базлайн
+обновлён честно.
 
 ## История закрытых фаз
 

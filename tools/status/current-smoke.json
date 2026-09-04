@@ -1,295 +1,300 @@
 {
- "meta": {
-  "created_utc": "2026-09-03T19:51:01.161434+00:00",
-  "lane": "smoke_compare",
-  "argv": [
-   "tools/smoke_compare.py",
-   "--json-out",
-   "/tmp/sm.json"
-  ],
-  "zig_version": "0.16.0"
- },
- "provenance": {
-  "git_head": "e0bcb34",
-  "git_dirty": "clean",
-  "zig_version": "0.16.0",
-  "zig_binary_sha16": "5651f1443dac4c36"
- },
- "total": 68,
- "ok": 68,
- "mismatches": 0,
- "results": [
-  {
-   "file": "tests/smoke/01_min.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/02_global_const_star.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/03_print.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/04_locals_scope.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/05_while_repeat_break.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/06_for_numeric.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/07_tables.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/08_and_or.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/09_strings.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/10_functions.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/11_multi_return.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/12_closures.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/13_nested_upvalues.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/14_local_function_recursion.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/15_string_index.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/16_function_fields.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/17_function_method.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/18_varargs.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/19_call_expand.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/20_return_assign_expand.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/21_named_vararg.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/22_for_generic.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/23_dump_debug_info.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/24_xpcall_error_stack.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/25_bytecode_coroutine_continuation.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/26_coroutine_resume_dynamic_results.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/27_iterative_bytecode_calls.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/28_method_call_fixed_multiret.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/29_platform_process_io.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/30_locals_tbc_unwind.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/31_debug_bytecode_parity.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/32_for_loop_locvars.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/33_os_clock_cpu_time.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/34_gc_stop_and_step.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/35_thread_owned_bytecode_frames.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/36_thread_owned_runtime_stacks.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/37_inplace_bytecode_yield.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/38_generic_for_inplace_yield.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/39_complete_iterative_dispatch.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/40_large_setlist_extraarg.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/41_strict_globals_env.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/42_gc_debt_and_generational_step.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/43_generational_minor.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/44_gc_restart_pace.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/45_p15_35_call_metamethod_inline.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/45_userdata_capi.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/47_stacktrace_display.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/48_finalizer_upvalue.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/49_coroutine_yield_error.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/50_reentrant_hook_deep_frames.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/51_pcall_cframe_ownership.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/52_threadswitch_nested_coroutine.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/53_p15_79_regression.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/54_p15_80_stress_leak.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/55_table_chain_integrity.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/56_deadkey_semantics.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/57_finalizer_reach.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/58_metamethod_dispatch.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/59_finalizer_registration.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/60_file_finalizer_lifecycle.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/61_captured_local_coherence.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/62_r254_captured_local_arith.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/63_table_barrier_semantics.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/64_callable_metamethods.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/65_strip_dump_semantics.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/66_proto_lifetime.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/67_upvalue_gc_lifetime.lua",
-   "match": true
-  },
-  {
-   "file": "tests/smoke/68_metamethod_mutation.lua",
-   "match": true
-  }
- ]
+  "meta": {
+    "created_utc": "2026-09-04T00:53:54.992987+00:00",
+    "lane": "smoke_compare",
+    "argv": [
+      "/home/boss/codes/luazig/tools/smoke_compare.py",
+      "--json-out",
+      "/home/boss/codes/luazig/tools/status/.tmp.smoke.82brvhfr.json"
+    ],
+    "zig_version": "0.16.0"
+  },
+  "provenance": {
+    "git_head": "1ba9b1c",
+    "git_dirty": "dirty",
+    "zig_version": "0.16.0",
+    "zig_binary_sha16": "9f2df256324a1ee2",
+    "puc_binary_sha16": "d54bc45e1757b216"
+  },
+  "total": 69,
+  "ok": 69,
+  "mismatches": 0,
+  "results": [
+    {
+      "file": "tests/smoke/01_min.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/02_global_const_star.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/03_print.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/04_locals_scope.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/05_while_repeat_break.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/06_for_numeric.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/07_tables.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/08_and_or.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/09_strings.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/10_functions.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/11_multi_return.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/12_closures.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/13_nested_upvalues.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/14_local_function_recursion.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/15_string_index.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/16_function_fields.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/17_function_method.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/18_varargs.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/19_call_expand.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/20_return_assign_expand.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/21_named_vararg.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/22_for_generic.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/23_dump_debug_info.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/24_xpcall_error_stack.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/25_bytecode_coroutine_continuation.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/26_coroutine_resume_dynamic_results.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/27_iterative_bytecode_calls.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/28_method_call_fixed_multiret.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/29_platform_process_io.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/30_locals_tbc_unwind.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/31_debug_bytecode_parity.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/32_for_loop_locvars.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/33_os_clock_cpu_time.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/34_gc_stop_and_step.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/35_thread_owned_bytecode_frames.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/36_thread_owned_runtime_stacks.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/37_inplace_bytecode_yield.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/38_generic_for_inplace_yield.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/39_complete_iterative_dispatch.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/40_large_setlist_extraarg.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/41_strict_globals_env.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/42_gc_debt_and_generational_step.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/43_generational_minor.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/44_gc_restart_pace.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/45_p15_35_call_metamethod_inline.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/45_userdata_capi.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/47_stacktrace_display.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/48_finalizer_upvalue.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/49_coroutine_yield_error.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/50_reentrant_hook_deep_frames.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/51_pcall_cframe_ownership.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/52_threadswitch_nested_coroutine.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/53_p15_79_regression.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/54_p15_80_stress_leak.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/55_table_chain_integrity.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/56_deadkey_semantics.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/57_finalizer_reach.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/58_metamethod_dispatch.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/59_finalizer_registration.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/60_file_finalizer_lifecycle.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/61_captured_local_coherence.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/62_r254_captured_local_arith.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/63_table_barrier_semantics.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/64_callable_metamethods.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/65_strip_dump_semantics.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/66_proto_lifetime.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/67_upvalue_gc_lifetime.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/68_metamethod_mutation.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/69_api580_fixed_load_gate.lua",
+      "match": true
+    }
+  ]
 }

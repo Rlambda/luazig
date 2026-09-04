@@ -4568,6 +4568,52 @@ branches/iter: lua_calls 117.6→109.5; noalloc 143.9→136.8. Geomean 1.7989→
 T6 (local trap) не переоткрывался: историческая регрессия +7/iter валидна;
 после T3/T5 tradeoff мог измениться — кандидат следующей фазы.
 
+## P16.20 — CallFrame representation + frame push/return gap (2026-09-05)
+
+### T1 (`b937e86`): CallFrame → extern struct/union
+Та же болезнь, что LuaString P16.17: plain u-union прятал Debug safety-tag
+— Debug 104 / RF 96. Теперь 96/96 в обоих режимах, declaration-order
+packing (u@40→32 после T3), PUC-модель: callstatus CIST_C — единственный
+дискриминант. Comptime-инварианты size/offset в каждом режиме.
+
+### T2 (`eb63328`): PUC CallInfo = 64B (gcc-замер на этой ABI)
+Артефакт current-callframe-layout.json (Debug/RF + offsets + PUC 64B).
+luazig 88B — архитектурно больше (yieldable-итеративность, hook-replay,
+simple-result, activation_id); 64B — НЕ цель. Stale-комментарии
+(~100B-заявления, «7 полей ctx incl boxed», «syncFrame 5 полей») исправлены.
+
+### T3 (`f8b71c4`): CallFrame.base УДАЛЁН
+Инвариант base == func_slot+1 доказан на всех 3 writer'ах (C-push,
+pushStaged с VAHID-сдвигом, tailcall reuse); ~25 читателей мигрированы на
+inline frameBase() (PUC updatebase). CallFrame 96→88; lua_calls −7.2/iter,
+noalloc −12/iter.
+
+### T5 (`66ec4f3`): независимый Lua frame-count limit УДАЛЁН
+Доказательство: каждая активация ест ≥3 слота bc_stack → стек-лимиты
+(1M soft/1M+200 physical) срабатывают всегда раньше 1e6 кадров; handler-
+рекурсия ограничена physical cap = PUC ERRORSTACKSIZE-семантика (второй
+"stack overflow"). Deep-recursion probe: 200k глубина ок, текст overflow
+PUC-идентичен. lua_calls −4/iter, noalloc −4/iter.
+
+### T6+T7 (`d8cc5e7`): FrameStack top/parent примитивы + RETURN-коллапс
+topPtr/topConstPtr/parentPtrOfTop (PUC L->ci / ci->previous) — одно
+ветвление вместо len()+index. RETURN0/1 fast arms: 5 FrameStack-lookup'ов
+→ 2 прямых указателя; стабильность parent через shrinkTo доказана
+(inline не двигаются; shrink не реаллоцирует heap). lua_calls −10/iter,
+noalloc −10/iter.
+
+### Итог фазы (interleaved/stable, P16.19→P16.20)
+lua_calls: 3.598→3.492G (−21.2 i/it, −3.4%); noalloc: 455→442M (−26 i/it,
+−2.9%). CallFrame 96(D104)/96 → 88/88. Geomean 1.794→1.7717. Гейт T15:
+10/10 (api580 376/376; matrix zig_fail=0; deep-recursion probe
+PUC-identical; 13 testes-сьютов incl. vararg).
+
+### Осталось (T4/T8/T9/T10/T11) — по абсолютной стоимости
+func_slot_base-деривация (T4), activation-store ledger vs prepCallInfo
+(T8), lazy INVALID_PC полей (T9), activation_id state-machine proof (T10),
+frame_cap mutation-site publishing (T11). TM staging (338 vs 188 i/it) и
+pushStaged остаются главными целями.
+
 ## История закрытых фаз
 
 P3–P15.12 — краткая сводка. P15.13+ — см. «История разработки» выше.

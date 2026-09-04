@@ -1,0 +1,74 @@
+{
+  "task": "P16.21 T7 — activation_id state-machine proof via instrumentation",
+  "worktree": "/tmp/opencode/wt21b @ c79c9bf (instrumentation only, not committed)",
+  "method": {
+    "instrumentation": "syncFrame (vm.zig:12845) instrumented with Debug-only counters: total_defers, guard_index_ok (frame_index < len), guard_id_mismatch_when_index_ok (index valid AND activation_id != frame_identity — the id guard actually fired and blocked a stale pc write into a reused slot), guard_id_match. Counters printed once at first Vm.deinit (std.debug.print). Mismatch diagnostics: new-frame kind/source, old proto/op/line, Zig stack trace. Semantically inert (Debug-only, never read by execution logic). ReleaseFast unaffected (compile-time dead).",
+    "build": "zig build (Debug) + zig build test: 195/195 passed",
+    "suites_run": "lua-5.5.0/testes with --vm=bc --testc under ulimit -v 3000000: db, coroutine, errors, gc, gengc, closure, vararg, locals; tests/smoke 57..68 plain; deep recursion 500k non-tail (pcall-wrapped, hits stack overflow) and 500k tail; hookstress.lua (pcall-wrapped; bare run fails with pre-existing 'attempt to yield across a C-call boundary', unrelated to syncFrame)"
+  },
+  "counters_per_suite": {
+    "db.lua":            { "total_defers": 20397,    "guard_index_ok": 10185,   "guard_id_match": 10185,   "guard_id_mismatch_when_index_ok": 0 },
+    "coroutine.lua":     { "total_defers": 1005990,  "guard_index_ok": 1003734, "guard_id_match": 1003729, "guard_id_mismatch_when_index_ok": 5 },
+    "errors.lua":        { "total_defers": 4257308,  "guard_index_ok": 4254611, "guard_id_match": 4254611, "guard_id_mismatch_when_index_ok": 0 },
+    "gc.lua":            { "total_defers": 41374,    "guard_index_ok": 30469,   "guard_id_match": 30469,   "guard_id_mismatch_when_index_ok": 0 },
+    "gengc.lua":         { "total_defers": 33,       "guard_index_ok": 26,      "guard_id_match": 26,      "guard_id_mismatch_when_index_ok": 0 },
+    "closure.lua":       { "total_defers": 1250,     "guard_index_ok": 1162,    "guard_id_match": 1162,    "guard_id_mismatch_when_index_ok": 0 },
+    "vararg.lua":        { "total_defers": 130,      "guard_index_ok": 78,      "guard_id_match": 78,      "guard_id_mismatch_when_index_ok": 0 },
+    "locals.lua":        { "total_defers": 504192,   "guard_index_ok": 502142,  "guard_id_match": 502130,  "guard_id_mismatch_when_index_ok": 12 },
+    "smoke 57..68 (12 files, aggregate)": { "total_defers": 1099, "guard_index_ok": 660, "guard_id_match": 660, "guard_id_mismatch_when_index_ok": 0 },
+    "deeprec 500k non-tail (stack overflow, pcall-wrapped)": { "total_defers": 499892, "guard_index_ok": 499891, "guard_id_match": 499891, "guard_id_mismatch_when_index_ok": 0 },
+    "deeprec 500k tail": { "total_defers": 4, "guard_index_ok": 2, "guard_id_match": 2, "guard_id_mismatch_when_index_ok": 0 },
+    "hookstress (pcall-wrapped)": { "total_defers": 530, "guard_index_ok": 267, "guard_id_match": 267, "guard_id_mismatch_when_index_ok": 0 }
+  },
+  "mismatch_diagnostics": {
+    "locals.lua": [
+      "MISMATCH #1: idx=2, start_len=3=cur_len, old=1337 new=1349, old_op=return0 @locals.lua:271 (func2close chain)",
+      "MISMATCH #2: idx=2, old=1398 new=1399 (consecutive id), old_op=return0 @locals.lua:452 (func2close x1 -> next __close)",
+      "MISMATCH #3: idx=2, old=1399 new=1400 (consecutive id), old_op=return0 @locals.lua:450",
+      "MISMATCH #4: idx=2, old=1409 new=1410 (consecutive id), old_op=return0 @locals.lua:491",
+      "MISMATCH #5: idx=2, old=1889 new=1891, old_op=return0 @locals.lua:710",
+      "MISMATCH #6: idx=2, old=1891 new=1892 (consecutive id), old_op=return0 @locals.lua:737",
+      "MISMATCH #7: idx=1, old lua frame (id=4) replaced by C frame (CIST_C|CIST_HIDE, callstatus 0x2008000, activation_id=0), old_op=return0 @locals.lua:938 (coroutine.yield inside __close)",
+      "MISMATCH #8: idx=2, old=6 new=7 (consecutive id), old_op=return_ @locals.lua:990 (func2close with yield + return 100,200)"
+    ],
+    "coroutine.lua": [
+      "MISMATCH #1: idx=2, old=9 new=10, old_op=return1 @coroutine.lua:266 (multiple <close> vars, error(20) in first __close)",
+      "MISMATCH #2-#5: idx=1, old=2->5, 5->8, old_op=return1 @coroutine.lua:892 (__bxor/__concat metamethods that coroutine.yield; on resume the metamethod-continuation frame at the same slot is a fresh activation)"
+    ]
+  },
+  "static_audit": {
+    "tailcall_bumps_id": false,
+    "tailcall_note": "bc-to-bc OP_TAILCALL frame reuse (vm.zig:16234-16377) rewrites proto/func_slot/pc/reg_top/nextraargs/callstatus but NEVER touches activation_id (the only write site is pushStagedBytecodeExecFrame vm.zig:12103). This is sound: tailcall returns .continue_no_advance — the SAME frame_loop iteration continues on the reused frame with ctx tracking it, so the eventual defer write targets the reused frame with the correct current ctx.pc. No stale-write hazard; the id guard is not needed (and not used) there.",
+    "activation_id_write_sites": ["vm.zig:12103 pushStagedBytecodeExecFrame (every bytecode frame push, monotonic per-thread counter bytecode_activation_counter, vm.zig:12063)"],
+    "replacement_paths_found": [
+      {
+        "path": "tbc __close chain (EMPIRICALLY CONFIRMED — all locals.lua mismatches, coroutine.lua #1)",
+        "mechanism": "A __close metamethod frame X at index N executes OP_RETURN0/1. completeBytecodeExecFrame (vm.zig:12305) pops X (len N+1 -> N); the parent at N-1 holds a pending .close continuation; applyBytecodePendingClose (vm.zig:12456) -> continueBytecodeClose finds the NEXT tbc variable and pushStagedBytecodeExecFrame (vm.zig:7916) pushes the next __close metamethod at index N — the SAME slot X occupied — all within X's iteration, before X's defer runs. Defer: frame_index=N < len ✓ but slot holds a fresh activation (consecutive ids: 1398->1399 etc.). Without the id guard, syncFrame would write X's stale ctx.pc into the new metamethod's frame, and the next iteration would resume it at the wrong pc (skipping its first instructions)."
+      },
+      {
+        "path": "tail_return pending results + tbc (vm.zig:12434)",
+        "mechanism": "completeBytecodeExecFrame .results with tail_return: after the child at index N pops, beginBytecodeClose(parent_index=N-1, .return_frame) pushes a __close metamethod child at index N — same index as the popped child, within the child's iteration."
+      },
+      {
+        "path": "yielding metamethod resume / coroutine continuation (EMPIRICALLY CONFIRMED — coroutine.lua #2-#5, locals.lua #7)",
+        "mechanism": "A metamethod frame at index N that coroutine.yields is parked; on resume the continuation machinery re-pushes a fresh activation at the same slot (coroutine.lua:892 traces: old id 2 -> new id 5 at idx=1), or a hidden C continuation frame (CIST_C|CIST_HIDE) takes the slot (locals.lua:938). The old iteration's defer then observes a valid index with a different activation."
+      },
+      {
+        "path": "xpcall error-handler push (vm.zig:11559) — same family, not independently observed in the probe runs",
+        "mechanism": "Error recovery stages the message-handler frame via pushStagedBytecodeExecFrame after unwinding; recovery runs either after runBytecodeDispatch returned (defer already ran) or inside a return-completion, where it belongs to the same pop-then-push-at-same-index family."
+      }
+    ],
+    "safe_exits_enumeration": {
+      "continue_dispatch / continue_no_advance": "Inner-loop continues; defer does not run (tailcall reuse keeps the same slot+iteration, ctx tracks the reused frame — correct write).",
+      "child push (OP_CALL, hook child via tryPushBytecodeDebugHook, __close child, metamethod child)": "Push is ON TOP; the iteration's frame stays at frame_index with unchanged activation_id — id matches, pc publish is correct and REQUIRED (child/GC/debug readers).",
+      "child pop / plain return (OP_RETURN0/1 fast arms, completeBytecodeExecFrame without pending continuation)": "len shrinks below frame_index+1; the cheap index check alone fails -> no write. Deep 500k recursion: 499891/499892 defers index-guarded, 0 mismatches.",
+      "tailcall reuse": "No pop/push; same slot, same iteration (see tailcall_note).",
+      "yield (parkDirectBytecodeYield / parkBytecodeIrHookYield / ThreadSwitch)": "Frames parked intact on the owning thread; defer sees the same activation (or index invalid after unwind).",
+      "error / boundary return": "Plain error returns leave the frame in place (id matches) or popped (index check fails); the DANGEROUS variants are the return-completion chains above, where pop+push at the same index happens inside one iteration.",
+      "hook child": "tryPushBytecodeDebugHook pushes on top (parent intact); applyBytecodePendingHook's .retry_call/.store_results do not push at the popped hook's index; .return_frame pops the parent too -> index check fails."
+    }
+  },
+  "verdict": "id_guard_necessary",
+  "evidence": "guard_id_mismatch_when_index_ok = 17 total (locals.lua 12, coroutine.lua 5) across upstream suites with all tests passing; every mismatch is a return-completion path where the returning frame at index N was popped and a NEW activation (next __close metamethod, resumed metamethod continuation, or hidden C continuation frame) was pushed at the SAME index N within the same frame_loop iteration, so frame_index < len holds but the slot is a different activation. Without the id guard, syncFrame would corrupt the replacement frame's pc (e.g. write pc=2 into a fresh __close metamethod that must start at pc=0). The cheap index-only guard is provably insufficient; the activation_id check is the only thing preventing these 17 observed stale writes.",
+  "caveats": "Coverage set: db/coroutine/errors/gc/gengc/closure/vararg/locals + smoke 57-68 + 500k deep recursion (tail and non-tail) + hookstress. Mismatches are rare (17 in ~5.8M defers) and concentrate in tbc __close chains and yielding metamethods — exactly the paths where pop+push-at-same-index occurs inside one iteration. hookstress bare run fails with a pre-existing 'yield across C-call boundary' error unrelated to this probe (same failure without instrumentation)."
+}

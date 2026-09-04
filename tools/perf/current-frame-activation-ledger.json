@@ -1,0 +1,84 @@
+{
+  "created_utc": "2026-09-04T21:43:12.726458+00:00",
+  "provenance": {
+    "git_head": "c79c9bf",
+    "measured_source_head": "c79c9bf",
+    "git_dirty": "clean",
+    "zig_version": "0.16.0",
+    "optimize_mode": "Debug+ReleaseFast",
+    "zig_binary_sha16": "5f4f1c10bfb0e4e5",
+    "note": "Ordinary non-vararg/no-hook/no-TBC/no-yield Lua->Lua activation stores, AFTER P16.21 T2/T3/T4/T5/T6."
+  },
+  "puc_reference": {
+    "prepCallInfo_plus_precall_lua": [
+      "func (ci->func)",
+      "callstatus",
+      "top (cap)",
+      "savedpc = p->code",
+      "nextraargs (vararg only)",
+      "missing-arg nil fill"
+    ]
+  },
+  "luazig_activation_stores": [
+    {
+      "field": "func_slot",
+      "class": "A common semantic state (PUC ci->func)"
+    },
+    {
+      "field": "tbc_mark",
+      "class": "F TBC (cheap usize copy of list len; PUC keeps this via stack level)"
+    },
+    {
+      "field": "activation_id",
+      "class": "H architecture (iterative defer sync guard; PROVEN necessary \u2014 see current-activation-id-proof.json)"
+    },
+    {
+      "field": "callstatus (nresults encode)",
+      "class": "A common semantic state (PUC callstatus)"
+    },
+    {
+      "field": "reg_top = nparams",
+      "class": "A result/GC contract (PUC sets top)"
+    },
+    {
+      "field": "pending_call_index = INVALID",
+      "class": "G continuation (cheap u32 sentinel; completion contract)"
+    },
+    {
+      "field": "clearSimpleResult()",
+      "class": "G continuation (packed 2-byte state; mutually exclusive with pending_call)"
+    },
+    {
+      "field": "setOpenUpvalues(false)",
+      "class": "F TBC/upvalue bit (1 bit packed in flags)"
+    },
+    {
+      "field": "u.lua.proto",
+      "class": "A common semantic state (PUC cl->p)"
+    },
+    {
+      "field": "u.lua.pc = 0",
+      "class": "A common semantic state (PUC savedpc = p->code)"
+    },
+    {
+      "field": "u.lua.frame_cap",
+      "class": "A common semantic state (PUC top)"
+    },
+    {
+      "field": "u.lua.nextraargs (vararg only)",
+      "class": "C vararg"
+    },
+    {
+      "field": "HOOK-GATED sentinels x4 (last_line_pc, skip_line/call/count)",
+      "class": "D hooks \u2014 COLD when hooks off (P16.21 T4)"
+    }
+  ],
+  "removed_this_phase": [
+    "func_slot_base store (T2: derived via originalFuncSlot)",
+    "resume_pc sentinel (T3: validity-by-CIST_HOOKYIELD)",
+    "4 hook sentinels on no-hooks path (T4: HOOKS-gate + install sanitize)",
+    "nvarstack (T5: debug-only fallback -> reg_top)",
+    "frame_cap generic sync publish (T6: mutation-site growCtxFrame)"
+  ],
+  "verdict": "Ordinary activation now initializes ONLY live state: ~11 common/contract stores + nil-fill, PUC-shape. Hook/yield sentinels are cold; duplicated positional state eliminated."
+}

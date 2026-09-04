@@ -12720,14 +12720,20 @@ pub const Vm = struct {
         {
             const fr = ctx.exec_frames.getPtr(ctx.frame_index);
             fr.u.lua.pc = ctx.pc;
-            fr.base = ctx.base;
+            // P16.19 T9.1: base write removed — provably dead. ctx.base has
+            // exactly two mutation sites: the frame_loop entry (loaded FROM
+            // fr.base, so a write-back is identity) and OP_TAILCALL frame
+            // reuse (which writes fr2.base = ctx.base directly at the same
+            // moment it sets ctx.base — see the tailcall handler). No other
+            // dispatch path mutates ctx.base.
             fr.u.lua.frame_cap = ctx.frame_cap;
-            // P16.2d: proto write removed — provably dead. ctx.cur_proto is
-            // only set at frame_loop entry (loaded FROM fr.proto(), so writing
-            // it back is identity) and in OP_TAILCALL (where fr.u.lua.proto is
-            // already written directly at the same time). No dispatch path
-            // mutates ctx.cur_proto without also writing the frame.
-            // P15.51n: upvalues derived from bc_stack[func_slot], not stored in frame.
+            // frame_cap STAYS: mutated mid-opcode by bcGrowFrame callers
+            // (&ctx.frame_cap) without publishing to the frame, and parked
+            // frames' frame_cap is read by GC register scans (gcMark boxes,
+            // parent scans) — syncFrame is the boundary publisher that keeps
+            // parked state correct. P16.2d: proto write removed — provably
+            // dead (identity at entry; tailcall writes fr directly).
+            // P15.51n: upvalues derived from bc_stack[func_slot].
         }
     }
 

@@ -2158,140 +2158,178 @@ const TestcContState = struct {
     script_run: bool = false,
 };
 
-// Interned Lua string. Layout mirrors PUC Lua's TString: a header immediately
-// followed by `len` bytes in the SAME allocation (one alloc per string,
-// cache-friendly). Short strings are interned (one pointer per content, like
-// PUC `LUA_VSHRSTR`); long strings are NOT interned (each a fresh allocation,
-// like PUC `LUA_VLNGSTR`), so equality is pointer-eq only for two short
-// strings — see `luaStringEq`.
+// Interned Lua string. P16.18 T5: layout mirrors PUC Lua's TString
+// ALLOCATION model per kind (lstring.h sizestrshr / lstring.c
+// luaS_sizelngstr), not just the full struct size:
+//
+//   kind            allocated bytes        content location
+//   short           24 + len + 1           inline at offset 24
+//   LSTRREG long    32 + len + 1           inline at offset 32
+//   LSTRFIX ext     32                     external (`c.extptr`)
+//   LSTRMEM ext     48                     external (`c.extptr`)
+//
+// Header layout (explicit extern struct — build-mode-stable, no hidden
+// tags; identical offsets in Debug and ReleaseFast):
+//
+//   0..8   hash: u64                (every kind)
+//   8..12  gc_index: u32            (every kind)
+//   12     srkind: i8               (every kind; PUC `shrlen`)
+//   13     gc_marked: u8            (every kind)
+//   14     gc_age: u8               (every kind)
+//   15     padding (never read)
+//   16..24 u: hnext (short) | lnglen (all long kinds)
+//   24..32 c: extptr (external kinds) | inline content start (short)
+//   32..40 falloc (LSTRMEM only)
+//   40..48 ud     (LSTRMEM only)
+//
+// GC metadata (hash/index/srkind/marked/age) lives within the first 16 B,
+// so it is inside EVERY variant's allocation, including the 32-B
+// truncated LSTRFIX header. Short content may extend past offset 48 (a
+// 40-byte short allocates 65 B), exactly like PUC's flexible `contents`.
 pub const LuaString = extern struct {
-    /// Mutually-exclusive per-variant metadata (P16.16 C3/T6). PUC's own
-    /// TString unions the short-string chain link with the long-string
-    /// payload (lobject.h: `u.sh.hnext` vs `u.lng.{lnglen,contents,falloc,ud}`);
-    /// we mirror that shape — the two variants can never coexist on one
-    /// string:
-    ///  - `next`: the intern-table chain link (PUC `u.hnext`), used ONLY
-    ///    by short strings — the only variant ever inserted into
-    ///    `StringTable` (`internStr`'s short path is the sole insert
-    ///    site). Long regular strings never enter the chain (stays null).
-    ///  - `external`: the external-string payload (PUC 5.5
-    ///    `lua_pushexternalstring` / LSTRMEM), used ONLY when
-    ///    `is_external`. External strings are always long and never
-    ///    interned, so they never carry a chain link.
-    /// P16.17 T1: `extern union` — build-mode-stable layout. A plain Zig
-    /// `union` grows a hidden safety tag in Debug builds (+8 B →
-    /// LuaString 48→56 → api.lua:580 delta 392→400 = FAIL in Debug).
-    /// `extern union` has guaranteed C-style layout with no hidden tag:
-    /// @sizeOf(LuaString) == 48 in BOTH Debug and ReleaseFast. The two
-    /// arms are mutually exclusive by the string-kind discriminants
-    /// (is_short/interned ⇒ uses `next`; is_external ⇒ uses `external`;
-    /// external strings are never interned), so every arm access is
-    /// provably correct — no inactive-storage reads.
-    const Meta = extern union {
-        next: ?*LuaString,
-        external: ExtInfo,
-    };
-
-    /// External-content descriptor (PUC 5.5 `luaS_newextlstr` / LSTRMEM).
-    /// `extern struct`: field of an `extern union` must have a
-    /// layout-compatible (C-ABI) type. 24 B in all build modes.
-    const ExtInfo = extern struct {
-        /// Pointer to the external content (valid only when `is_external`).
-        /// Not owned by the LuaString — released via `falloc` during GC.
-        ptr: [*]const u8 = @ptrFromInt(@alignOf([*]const u8)),
-        /// Dealloc callback with PUC `lua_Alloc` signature:
-        ///   `?*anyopaque = falloc(ud, ptr, osize, nsize)`
-        /// Called as `falloc(ud, ptr, len+1, 0)` to free external content.
-        /// null = no dealloc (PUC LSTRFIX variant).
-        falloc: ?*const fn (?*anyopaque, ?*anyopaque, usize, usize) callconv(.c) ?*anyopaque = null,
-        /// User-data pointer passed through to `falloc` as its first argument.
-        ud: ?*anyopaque = null,
-    };
-
-    hash: u64, // content hash, computed once at intern time (random-seeded)
-    len: usize,
-    /// String variant (PUC discriminates via `ts->shrlen`; see StrKind).
-    kind: StrKind = .long,
+    hash: u64,
+    /// Position in `Vm.gc_objects` (P16.16 C1: u32).
+    gc_index: u32 = 0,
+    /// PUC `shrlen` — ONE byte that is BOTH the kind discriminator and,
+    /// for shorts, the length (lobject.h: `>= 0` short of that length;
+    /// `LSTRREG -1`, `LSTRFIX -2`, `LSTRMEM -3`). This is the byte
+    /// `luaS_sizelngstr` switches on; keeping the PUC encoding makes the
+    /// allocated-size rule a single switch on this field.
+    srkind: i8,
     /// PUC `marked` byte — tri-color mark bits. See constants above.
     gc_marked: u8 = 0,
     gc_age: GcAge = .new,
-    /// Position in `Vm.gc_objects` (P16.16 C1: u32; see Cell.gc_index).
-    gc_index: u32 = 0,
-    meta: Meta = .{ .next = null },
+    _pad: u8 = 0,
+    /// Offset 16: PUC unions `u.sh.hnext` (short chain link) with
+    /// `u.lng.lnglen` (long length) — mutually exclusive by kind. The two
+    /// arms are 8 B each; no hidden tag (extern union, P16.17 T1 lesson).
+    u: extern union {
+        hnext: ?*LuaString,
+        lnglen: usize,
+    } = .{ .hnext = null },
+    /// Offset 24: PUC `u.lng.contents` — the external-content pointer for
+    /// LSTRFIX/LSTRMEM. For SHORT strings these bytes are the START of the
+    /// inline content (never read as a pointer on that path). For LSTRREG
+    /// this slot is unused (inline content begins at offset 32).
+    c: extern union {
+        extptr: ?[*]const u8,
+        content_start: u64,
+    } = .{ .content_start = 0 },
+    /// Offset 32: dealloc callback with PUC `lua_Alloc` signature, called
+    /// as `falloc(ud, ptr, len+1, 0)`. LSTRMEM only — this field lies
+    /// beyond the LSTRFIX truncation boundary, matching PUC
+    /// `offsetof(TString, falloc)`.
+    falloc: ?*const fn (?*anyopaque, ?*anyopaque, usize, usize) callconv(.c) ?*anyopaque = null,
+    /// Offset 40: user-data pointer passed through to `falloc` (LSTRMEM
+    /// only, beyond the LSTRFIX truncation boundary).
+    ud: ?*anyopaque = null,
 
-    /// PUC 5.5 discriminates string variants via `ts->shrlen`
-    /// (lobject.h): `>= 0` short, `LSTRREG -1`, `LSTRFIX -2`, `LSTRMEM -3`
-    /// — the SAME byte that `luaS_sizelngstr` switches on. We mirror that
-    /// model with one explicit kind enum (single byte, build-mode-stable).
-    /// Replacing the previous `is_short`/`is_external` bool pair also frees
-    /// the last padding byte, so a third discriminant (fixed vs. dealloc
-    /// external) costs no extra size: LuaString stays 48 B.
-    pub const StrKind = enum(u8) {
-        /// Interned short string; content inline after the header.
-        short,
-        /// Regular long string (PUC LSTRREG); content inline after the header.
-        long,
-        /// Fixed external string (PUC LSTRFIX): content owned by the caller
-        /// and never deallocated by us; header TRUNCATED to
-        /// `lstrfix_header_size` (32 B — PUC allocates `offsetof(TString,
-        /// falloc)` for this kind, lstring.c:154-156).
-        ext_fixed,
-        /// External string with deallocation (PUC LSTRMEM): content owned by
-        /// the caller, released via `falloc`; FULL 48 B header.
-        ext_mem,
-    };
+    // ------------------------------------------------------------------
+    // Kind discriminants (PUC shrlen encoding; one load + sign check).
+    // ------------------------------------------------------------------
 
-    /// PUC `luaS_sizelngstr(0, LSTRFIX)` == `offsetof(TString, falloc)` ==
-    /// 32 B on 64-bit: the LSTRFIX allocation covers the header only up to
-    /// (and excluding) the `falloc` field. Our mirror: meta starts at 24,
-    /// `ExtInfo.falloc` is the first field LSTRFIX never touches.
-    pub const lstrfix_header_size: usize =
-        @offsetOf(LuaString, "meta") + @offsetOf(LuaString.ExtInfo, "falloc");
+    /// PUC `LSTRREG`/`LSTRFIX`/`LSTRMEM` encodings (lobject.h).
+    pub const lstrreg: i8 = -1;
+    pub const lstrfix: i8 = -2;
+    pub const lstrmem: i8 = -3;
+
+    /// PUC `offsetof(TString, contents)` == 24 on 64-bit: short inline
+    /// content starts here (and the allocation is `24 + len + 1`).
+    pub const short_content_offset: usize = @offsetOf(LuaString, "c");
+    /// PUC `offsetof(TString, falloc)` == 32 on 64-bit: regular-long
+    /// inline content starts here (allocation `32 + len + 1`) and the
+    /// LSTRFIX header ends here (allocation exactly 32).
+    pub const long_content_offset: usize = @offsetOf(LuaString, "falloc");
+    /// Back-compat alias: the LSTRFIX truncated header size.
+    pub const lstrfix_header_size: usize = long_content_offset;
 
     /// PUC `isshrstr`: interned short variant (pointer-identity equality,
-    /// intern-table membership). Inline: single compare, same cost as the
-    /// old bool load.
+    /// intern-table membership).
     pub inline fn isShort(self: *const LuaString) bool {
-        return self.kind == .short;
+        return self.srkind >= 0;
     }
 
-    /// Content lives at `meta.external.ptr` instead of inline. True for BOTH
-    /// external kinds (fixed and dealloc) — mirrors PUC `isextstr`.
+    /// PUC `isextstr`: content lives at `c.extptr`, not inline. True for
+    /// BOTH external kinds (fixed and dealloc).
     pub inline fn isExternal(self: *const LuaString) bool {
-        return self.kind == .ext_fixed or self.kind == .ext_mem;
+        return self.srkind <= lstrfix;
     }
 
-    /// Fixed external string (PUC LSTRFIX): truncated header, no deallocator.
-    /// Must be checked BEFORE any access to `meta.external.falloc`/`ud`,
-    /// which lie beyond the truncated allocation.
+    /// Fixed external string (PUC LSTRFIX): truncated 32-B header, no
+    /// deallocator. Check BEFORE any access to `falloc`/`ud`.
     pub inline fn isFixedExternal(self: *const LuaString) bool {
-        return self.kind == .ext_fixed;
+        return self.srkind == lstrfix;
     }
 
-    // Bytes of the string. For a regular string, the content is stored inline
-    // right after the header in the same allocation (cache-friendly, one alloc
-    // per string). For an external string, the content lives at
-    // `meta.external.ptr`.
-    pub fn bytes(self: *const LuaString) []const u8 {
-        if (self.isExternal()) return self.meta.external.ptr[0..self.len];
+    /// Content length. Shorts read it from the discriminator byte (PUC
+    /// `shrlen`); longs from `u.lnglen` (PUC `u.lng.lnglen`).
+    pub inline fn len(self: *const LuaString) usize {
+        if (self.srkind >= 0) return @intCast(self.srkind);
+        return self.u.lnglen;
+    }
+
+    /// Intern-table chain link (SHORT strings only — the sole variant ever
+    /// inserted into `StringTable`). PUC `u.sh.hnext`.
+    pub inline fn nextShort(self: *const LuaString) ?*LuaString {
+        if (std.debug.runtime_safety) std.debug.assert(self.isShort());
+        return self.u.hnext;
+    }
+
+    pub inline fn setNextShort(self: *LuaString, next: ?*LuaString) void {
+        if (std.debug.runtime_safety) std.debug.assert(self.isShort());
+        self.u.hnext = next;
+    }
+
+    /// Content bytes. Regular strings: inline in the same allocation
+    /// (shorts at offset 24, regular longs at offset 32 — one allocation
+    /// per string, cache-friendly). External kinds: caller-owned memory at
+    /// `c.extptr`. The returned slice EXCLUDES the trailing NUL that
+    /// inline kinds store at `content[len]` for C-API `const char*` safety
+    /// (PUC `contents[len] = '\0'`).
+    pub inline fn bytes(self: *const LuaString) []const u8 {
         const header: [*]const u8 = @ptrCast(self);
-        const body = header + @sizeOf(LuaString);
-        return body[0..self.len];
+        if (self.srkind <= lstrfix) {
+            const ptr = self.c.extptr orelse @as([*]const u8, @ptrFromInt(@alignOf([*]const u8)));
+            return ptr[0..self.u.lnglen];
+        }
+        const off: usize = if (self.srkind >= 0) short_content_offset else long_content_offset;
+        const body = header + off;
+        return body[0..self.len()];
+    }
+
+    /// P16.18 T7: THE single allocated-size rule — the exact counterpart
+    /// of PUC `sizestrshr(l)` for shorts and `luaS_sizelngstr(l, kind)`
+    /// for longs. Every charge/credit/free site must use THIS helper so
+    /// accounting can never drift from the actual allocation.
+    pub inline fn allocatedSize(self: *const LuaString) usize {
+        return switch (self.srkind) {
+            0...@as(i8, @intCast(lua_string_max_short_len)) =>
+                short_content_offset + @as(usize, @intCast(self.srkind)) + 1,
+            lstrreg => long_content_offset + self.u.lnglen + 1,
+            lstrfix => lstrfix_header_size,
+            lstrmem => @sizeOf(LuaString),
+            else => unreachable,
+        };
     }
 };
 
-// P16.17 T1 invariant: LuaString's layout must be build-mode-stable.
-// A plain Zig `union` in `Meta` would silently grow a hidden Debug
-// safety tag (48→56 B), which once pushed the api.lua:580 fixed-load
-// delta to exactly 400 = upstream FAIL in Debug while ReleaseFast
-// passed at 392. The assert compiles in EVERY build mode, so any future
-// build-mode-dependent layout regression fails the build, not the test.
+// P16.17 T1 / P16.18 T5 invariants: LuaString's layout must be
+// build-mode-stable AND match PUC's TString offsets on 64-bit. A plain
+// Zig `union` in any variant slot would grow a hidden Debug safety tag
+// (48→56 B), which once pushed the api.lua:580 fixed-load delta to exactly
+// 400 = upstream FAIL in Debug while ReleaseFast passed at 392. These
+// asserts compile in EVERY build mode, so a future build-mode-dependent
+// layout regression fails the BUILD, not a test.
 comptime {
     std.debug.assert(@sizeOf(LuaString) == 48);
-    // LSTRFIX truncated header must equal PUC's offsetof(TString, falloc)
-    // on 64-bit (32 B) and stay strictly inside the full struct.
+    // PUC offsetof(TString, contents) == 24: short inline content start.
+    std.debug.assert(LuaString.short_content_offset == 24);
+    // PUC offsetof(TString, falloc) == 32: long inline content start AND
+    // the LSTRFIX truncated-header boundary.
+    std.debug.assert(LuaString.long_content_offset == 32);
     std.debug.assert(LuaString.lstrfix_header_size == 32);
-    std.debug.assert(LuaString.lstrfix_header_size < @sizeOf(LuaString));
+    // GC metadata must be inside every variant's allocation prefix.
+    std.debug.assert(@offsetOf(LuaString, "gc_age") < LuaString.short_content_offset);
 }
 
 // PUC Lua's LUAI_MAXSHORTLEN (lstring.h): strings up to this many bytes are
@@ -2304,7 +2342,7 @@ pub const lua_string_max_short_len: usize = 40;
 //   - otherwise (at least one long): content compare (length then bytes)
 pub fn luaStringEq(a: *const LuaString, b: *const LuaString) bool {
     if (a.isShort() and b.isShort()) return a == b;
-    if (a.len != b.len) return false;
+    if (a.len() != b.len()) return false;
     return std.mem.eql(u8, a.bytes(), b.bytes());
 }
 
@@ -2313,12 +2351,17 @@ pub fn luaStringEq(a: *const LuaString, b: *const LuaString) bool {
 // pre-intern string constants at chunk-build time, keeping the VM consistent
 // with the main VM's interned-string model.
 pub fn createLuaString(alloc: std.mem.Allocator, raw: []const u8, hash: u64) !*LuaString {
-    // PUC `luaS_createlngstrobj` allocates `sizeof(TString) + len + 1` and
-    // writes a trailing `'\0'` (`contents[len] = '\0'`, lstring.c). The NUL is
-    // not part of the logical length (`bytes()` returns `[0..len]`); it exists
-    // purely so C-API callers (`luaL_checklstring`, `lua_tolstring`) can hand
-    // out a `const char*` that is safe to read as a C string.
-    const total = @sizeOf(LuaString) + raw.len + 1;
+    // PUC allocates PER KIND from the moment of creation (this is the whole
+    // point of sizestrshr / luaS_sizelngstr):
+    //   short  -> 24 + len + 1  (content inline at offset 24)
+    //   long   -> 32 + len + 1  (content inline at offset 32)
+    // The trailing '\0' (`contents[len] = '\0'`, lstring.c) is not part of
+    // the logical length (`bytes()` returns `[0..len]`); it exists so C-API
+    // callers can hand out a NUL-terminated `const char*` safely.
+    const is_short = raw.len <= lua_string_max_short_len;
+    const content_off: usize =
+        if (is_short) LuaString.short_content_offset else LuaString.long_content_offset;
+    const total = content_off + raw.len + 1;
     const buf = try alloc.alignedAlloc(
         u8,
         std.mem.Alignment.fromByteUnits(@alignOf(LuaString)),
@@ -2327,18 +2370,23 @@ pub fn createLuaString(alloc: std.mem.Allocator, raw: []const u8, hash: u64) !*L
     errdefer alloc.free(buf);
     const ls: *LuaString = @ptrCast(@alignCast(buf.ptr));
     ls.hash = hash;
-    ls.len = raw.len;
-    ls.kind = if (raw.len <= lua_string_max_short_len) .short else .long;
+    // PUC shrlen: the byte IS the short length (or the long-kind code).
+    ls.srkind = if (is_short) @intCast(raw.len) else LuaString.lstrreg;
+    ls.gc_index = 0;
     ls.gc_marked = 0;
-    // Explicitly zero the variant metadata: `bytes()` branches on
-    // `is_external`, so it MUST be false for regular inline strings. The
-    // raw allocation comes from malloc (not zeroed), so leaving these
-    // uninitialized would make `bytes()` read garbage and potentially
-    // dereference a random external pointer. Setting the whole `meta`
-    // union to the `next` variant (null) covers both variants.
-    ls.meta = .{ .next = null };
-    ls.meta = .{ .next = null };
-    const body = buf[@sizeOf(LuaString)..];
+    ls.gc_age = .new;
+    ls._pad = 0;
+    // Variant slot: shorts carry the intern-chain link (null until
+    // StringTable.insert links them); regular longs carry the length.
+    // Inline content at `content_off` in the SAME allocation (the c-union
+    // region for shorts is pure content bytes — never read as a pointer
+    // on the short path).
+    if (is_short) {
+        ls.u = .{ .hnext = null };
+    } else {
+        ls.u = .{ .lnglen = raw.len };
+    }
+    const body = buf[content_off..];
     @memcpy(body[0..raw.len], raw);
     body[raw.len] = 0; // C-string NUL terminator (PUC `contents[len] = '\0'`)
     return ls;
@@ -2351,43 +2399,27 @@ pub fn createLuaString(alloc: std.mem.Allocator, raw: []const u8, hash: u64) !*L
 // content is released first via the dealloc callback (PUC lgc.c:874-875):
 //   `(*ts->falloc)(ts->ud, ts->contents, ts->u.lnglen + 1, 0);`
 pub fn destroyLuaString(alloc: std.mem.Allocator, ls: *LuaString) void {
-    if (ls.isFixedExternal()) {
-        // LSTRFIX (fixed external): the header allocation is TRUNCATED to
-        // `lstrfix_header_size` (32 B — PUC luaS_sizelngstr(0, LSTRFIX) =
-        // offsetof(TString, falloc)). Never read `meta.external.falloc`/`ud`
-        // here: those bytes lie beyond the allocation (PUC's free path makes
-        // the same discrimination via `ts->shrlen == LSTRMEM`, lgc.c:873).
-        // Fixed content is caller-owned static memory — no dealloc fires.
-        const buf: [*]align(@alignOf(LuaString)) u8 = @ptrCast(ls);
-        // `_ = &n` keeps the length runtime-known: a comptime length would
-        // turn buf[0..n] into a *[32]u8 (not a slice), which Allocator.free
-        // rejects at comptime.
-        var n: usize = LuaString.lstrfix_header_size;
-        _ = &n;
-        alloc.free(buf[0..n]);
-        return;
-    }
-    if (ls.isExternal()) {
-        // External string: invoke the dealloc callback to release the external
-        // content, then free only the header (allocated via `alloc.create`).
-        // PUC passes `len+1` as the old size (the +1 accounts for the NUL the
-        // caller promised at s[len], see lua_pushexternalstring api_check).
-        const ext = ls.meta.external;
-        if (ext.falloc) |falloc| {
-            _ = falloc(
-                ext.ud,
-                @ptrCast(@constCast(ext.ptr)),
-                ls.len + 1,
-                0,
-            );
+    // LSTRMEM: release the caller-owned content first via the dealloc
+    // callback (PUC lgc.c:873-875: `if (ts->shrlen == LSTRMEM)
+    // (*ts->falloc)(ts->ud, ts->contents, ts->u.lnglen + 1, 0);`). The
+    // +1 is the NUL the caller promised at s[len] (PUC
+    // lua_pushexternalstring api_check). LSTRFIX never runs a callback
+    // (fixed content is caller-owned static memory), and its truncated
+    // header never reaches the `falloc`/`ud` fields — the branch on
+    // srkind happens BEFORE those bytes could be read.
+    if (ls.srkind == LuaString.lstrmem) {
+        if (ls.falloc) |falloc| {
+            const content = ls.c.extptr orelse @as([*]const u8, @ptrFromInt(@alignOf([*]const u8)));
+            _ = falloc(ls.ud, @ptrCast(@constCast(content)), ls.u.lnglen + 1, 0);
         }
-        alloc.destroy(ls);
-        return;
     }
-    // Regular string: free header + inline content (matches createLuaString +1).
-    const total = @sizeOf(LuaString) + ls.len + 1;
-    const buf: [*]align(@alignOf(LuaString)) u8 = @ptrCast(@alignCast(ls));
-    alloc.free(buf[0..total]);
+    // Free EXACTLY the allocated size for every kind (PUC luaM_freemem
+    // with luaS_sizelngstr / sizestrshr). `_ = &n` keeps the length
+    // runtime-known so buf[0..n] is a slice, not *[N]u8.
+    const buf: [*]align(@alignOf(LuaString)) u8 = @ptrCast(ls);
+    var n: usize = ls.allocatedSize();
+    _ = &n;
+    alloc.free(buf[0..n]);
 }
 
 // Global table of all live interned strings. Keyed by content bytes (the inline
@@ -2421,8 +2453,8 @@ pub const StringTable = struct {
     pub fn lookup(self: *const StringTable, raw: []const u8, hash: u64) ?*LuaString {
         if (self.buckets.len == 0) return null;
         var cur = self.buckets[self.bucketOf(hash)];
-        while (cur) |ls| : (cur = ls.meta.next) {
-            if (ls.len == raw.len and std.mem.eql(u8, ls.bytes(), raw)) return ls;
+        while (cur) |ls| : (cur = ls.nextShort()) {
+            if (ls.len() == raw.len and std.mem.eql(u8, ls.bytes(), raw)) return ls;
         }
         return null;
     }
@@ -2442,9 +2474,9 @@ pub const StringTable = struct {
         for (old) |head| {
             var p = head;
             while (p) |ls| {
-                const save_next = ls.meta.next;
+                const save_next = ls.nextShort();
                 const b: usize = @intCast(ls.hash & (new_size - 1));
-                ls.meta.next = fresh[b];
+                ls.setNextShort(fresh[b]);
                 fresh[b] = ls;
                 p = save_next;
             }
@@ -2484,7 +2516,7 @@ pub const StringTable = struct {
             }
         }
         const b = self.bucketOf(ls.hash);
-        ls.meta.next = self.buckets[b];
+        ls.setNextShort(self.buckets[b]);
         self.buckets[b] = ls;
         self.nuse += 1;
     }
@@ -2495,10 +2527,10 @@ pub const StringTable = struct {
     pub fn removeString(self: *StringTable, ls: *LuaString) void {
         if (self.buckets.len == 0) return;
         var p: *?*LuaString = &self.buckets[self.bucketOf(ls.hash)];
-        while (p.*) |cur| : (p = &cur.meta.next) {
+        while (p.*) |cur| : (p = &cur.u.hnext) {
             if (cur == ls) {
-                p.* = cur.meta.next;
-                cur.meta.next = null;
+                p.* = cur.nextShort();
+                cur.setNextShort(null);
                 self.nuse -= 1;
                 return;
             }
@@ -2522,7 +2554,7 @@ pub const StringTable = struct {
     pub fn deinit(self: *StringTable, alloc: std.mem.Allocator) void {
         for (self.buckets) |head| {
             var p = head;
-            while (p) |ls| : (p = ls.meta.next) destroyLuaString(alloc, ls);
+            while (p) |ls| : (p = ls.nextShort()) destroyLuaString(alloc, ls);
         }
         if (self.buckets.len != 0) alloc.free(self.buckets);
         self.* = .{};
@@ -2592,7 +2624,7 @@ test "LuaString stores inline bytes and cached hash" {
     const h: u64 = 0xdeadbeef;
     const ls = try createLuaString(alloc, "hello", h);
     defer destroyLuaString(alloc, ls);
-    try std.testing.expectEqual(@as(usize, 5), ls.len);
+    try std.testing.expectEqual(@as(usize, 5), ls.len());
     try std.testing.expectEqual(h, ls.hash);
     try std.testing.expectEqualStrings("hello", ls.bytes());
 }
@@ -2713,16 +2745,14 @@ test "external string: destroyLuaString invokes falloc and frees header only" {
     // alloc.create, and separate external content via alloc.alloc.
     const content = try alloc.alloc(u8, 6);
     @memcpy(content[0..5], "hello");
-    const ls = try alloc.create(LuaString);
+    const ls = try alloc.create(LuaString); // full-size header (LSTRMEM)
     ls.* = .{
         .hash = 0,
-        .len = 5,
-        .kind = .ext_mem,
-        .meta = .{ .external = .{
-            .ptr = content.ptr,
-            .falloc = testFalloc,
-            .ud = @ptrCast(&freed),
-        } },
+        .srkind = LuaString.lstrmem,
+        .u = .{ .lnglen = 5 },
+        .c = .{ .extptr = content.ptr },
+        .falloc = testFalloc,
+        .ud = @ptrCast(&freed),
     };
 
     // destroyLuaString should: (1) call falloc to release external content,
@@ -2740,8 +2770,11 @@ test "external string: regular string does NOT invoke falloc" {
     // payload to a non-null falloc to verify the branch is skipped for inline
     // strings (is_external is the sole discriminator).
     const ls = try createLuaString(alloc, "inline", 0);
-    ls.meta = .{ .next = null }; // redundant but explicit — regular string
-    ls.meta = .{ .external = .{ .falloc = testFalloc, .ud = @ptrCast(&freed) } };
+    // Writing falloc on a REGULAR long is legal (its allocation is 32+7 > 40
+    // bytes — the field exists within the allocation); destroy must still
+    // never invoke it because srkind is not LSTRMEM.
+    ls.falloc = testFalloc;
+    ls.ud = @ptrCast(&freed);
     destroyLuaString(alloc, ls);
     try std.testing.expect(!freed);
 }
@@ -2825,24 +2858,117 @@ test "StringTable: grow OOM keeps old table, still interns, identity holds" {
 // gcNoteAlloc at intern, gcObjectBytes while live, gcNoteFree at sweep —
 // and must all equal @sizeOf(LuaString)+len+1 (until the per-kind layout
 // lands; then this test moves to luaStringAllocatedBytes).
-test "string GC accounting charges NUL, symmetric with allocation" {
+// P16.18 T2/T7: ordinary-string GC accounting must equal the ACTUALLY-OWNED
+// per-kind allocation (PUC sizestrshr / luaS_sizelngstr include the NUL).
+// T7 permanent table: every charge/credit site funnels through
+// allocatedSize(), so this single test pins the whole allocation model.
+// P16.18 T9: string-key survival across table rehash + a full GC cycle,
+// and content-equality of equal regular longs (longs are never interned —
+// two separate allocations with equal bytes MUST compare equal by content).
+test "string keys survive rehash+GC; equal longs compare by content" {
     const testing = std.testing;
     var vm = Vm.init(testing.allocator, false);
     defer vm.deinit();
-    const cases = [_][]const u8{ "", "a", "x" ** 40, "y" ** 41, "z" ** 300 };
-    for (cases) |raw| {
-        const before = vm.gc_count_kb;
-        const ls = try vm.internStr(raw);
-        const charged_now =
-            (vm.gc_count_kb - before) * 1024.0;
-        const expected: f64 =
-            @floatFromInt(@sizeOf(LuaString) + raw.len + 1);
-        try testing.expectEqual(expected, charged_now);
-        try testing.expectEqual(
-            @sizeOf(LuaString) + raw.len + 1,
-            gcObjectBytes(.{ .string = ls }),
-        );
+    // Two distinct longs with equal content (fresh allocations each — the
+    // regular-long model: NOT interned; internStrAll would dedupe them).
+    const long_content = "long-key-with-equal-content-AAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    // Equal content MUST hash identically (VM invariant: per-VM seed), or
+    // content-equality lookups would land in different buckets.
+    const long_hash = std.hash.Wyhash.hash(vm.hash_seed, long_content);
+    const la = try createLuaString(vm.alloc, long_content, long_hash);
+    const lb = try createLuaString(vm.alloc, long_content, long_hash);
+    defer destroyLuaString(vm.alloc, la);
+    defer destroyLuaString(vm.alloc, lb);
+    if (la.isShort() or lb.isShort()) unreachable;
+    try testing.expect(la != lb); // longs are not interned
+    try testing.expect(luaStringEq(la, lb)); // ...so equality is by content
+    const sa = try vm.internStr("sh");
+    const sb = try vm.internStr("sh");
+    try testing.expectEqual(sa, sb); // shorts ARE pointer-identical
+
+    // Table with short + long string keys, grown past a rehash, then GC'd.
+    const tbl = try vm.allocTableNoGc(); // GC-registered so its keys trace
+    // Root the table (+ its long-key strings) across the GC cycle below —
+    // a bare registered table is not otherwise reachable and would be swept.
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(.{ .Table = tbl });
+    try roots.add(.{ .String = la });
+    try roots.add(.{ .String = lb });
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        var kb: [8]u8 = undefined;
+        _ = std.fmt.bufPrint(&kb, "k{d:0>7}", .{i}) catch unreachable;
+        const key = try vm.internStr(&kb);
+        try vm.rawSet(tbl, .{ .String = key }, .{ .Int = @intCast(i) });
     }
+    try vm.rawSet(tbl, .{ .String = la }, .{ .Int = 777 });
+    try vm.rawSet(tbl, .{ .String = sa }, .{ .Int = 888 });
+    vm.gcFullCollectionForUser() catch unreachable; // full mark+sweep cycle
+    i = 0;
+    while (i < 200) : (i += 1) {
+        var kb: [8]u8 = undefined;
+        _ = std.fmt.bufPrint(&kb, "k{d:0>7}", .{i}) catch unreachable;
+        const key = try vm.internStr(&kb); // same bytes -> same pointer
+        const v = vm.rawGet(tbl, .{ .String = key });
+        try testing.expect(v == .Int and v.Int == @as(i64, @intCast(i)));
+    }
+    try testing.expectEqual(@as(Value, .{ .Int = 777 }),
+        vm.rawGet(tbl, .{ .String = lb })); // long lookup by CONTENT twin
+    try testing.expectEqual(@as(Value, .{ .Int = 888 }),
+        vm.rawGet(tbl, .{ .String = sb })); // short lookup by identity twin
+}
+
+test "string allocated-size rule: per-kind table (PUC parity)" {
+    const testing = std.testing;
+    var vm = Vm.init(testing.allocator, false);
+    defer vm.deinit();
+    const Case = struct { raw: []const u8, expected: usize };
+    const cases = [_]Case{
+        .{ .raw = "", .expected = LuaString.short_content_offset + 0 + 1 }, // short 0 -> 25
+        .{ .raw = "a", .expected = LuaString.short_content_offset + 1 + 1 }, // short 1 -> 26
+        .{ .raw = "x" ** 40, .expected = LuaString.short_content_offset + 40 + 1 }, // max short -> 65
+        .{ .raw = "y" ** 41, .expected = LuaString.long_content_offset + 41 + 1 }, // min long -> 74
+        .{ .raw = "z" ** 300, .expected = LuaString.long_content_offset + 300 + 1 },
+    };
+    for (cases) |c| {
+        const before = vm.gc_count_kb;
+        const ls = try vm.internStr(c.raw);
+        // Charged at intern == per-kind allocated size (NUL included)...
+        try testing.expectEqual(
+            c.expected,
+            @as(usize, @intFromFloat((vm.gc_count_kb - before) * 1024.0)),
+        );
+        // ... == gcObjectBytes while live ...
+        try testing.expectEqual(c.expected, gcObjectBytes(.{ .string = ls }));
+        // ... == the single-rule helper ...
+        try testing.expectEqual(c.expected, ls.allocatedSize());
+        // ... and the variant classification is semantic, not byte-length:
+        try testing.expectEqual(c.raw.len <= 40, ls.isShort());
+    }
+    // External kinds: LSTRFIX = 32 (truncated header) regardless of length,
+    // LSTRMEM = 48 (full header) — including lengths BELOW the short cutoff,
+    // which must stay long-kind (T8).
+    const fx = try vm.createExternalLuaString("tiny fixed", "tiny fixed".len, null, null);
+    try testing.expectEqual(@as(usize, 32), fx.allocatedSize());
+    try testing.expect(!fx.isShort());
+    var freed = false;
+    // LSTRMEM transfers content ownership to Lua: allocate len+1 bytes
+    // (testFalloc frees buf[0..osize] with osize = len+1, PUC contract).
+    const mem_content = try vm.alloc.alloc(u8, 2);
+    @memcpy(mem_content, "t\x00");
+    const fm = try vm.createExternalLuaString(mem_content.ptr, 1, testFalloc, @ptrCast(&freed));
+    try testing.expectEqual(@as(usize, 48), fm.allocatedSize());
+    try testing.expect(!fm.isShort());
+    // LSTRMEM dealloc fires exactly once — at destroy. Unregister from the
+    // GC list first (the test destroys manually; vm.deinit must not see it
+    // again) and credit the accounting symmetrically.
+    try testing.expect(!freed);
+    vm.gcUnregisterObject(.{ .string = fm });
+    vm.gcNoteFree(fm.allocatedSize());
+    destroyLuaString(vm.alloc, fm);
+    try testing.expect(freed);
+    // NOTE: fx is GC-registered; vm.deinit() frees it (no dealloc for LSTRFIX).
 }
 
 test "external string: createExternalLuaString content readable via bytes()" {
@@ -2858,7 +2984,7 @@ test "external string: createExternalLuaString content readable via bytes()" {
     try testing.expect(ls.isExternal());
     try testing.expect(!ls.isShort()); // external strings are always "long"
     try testing.expectEqualStrings(content, ls.bytes());
-    try testing.expectEqual(@as(usize, content.len), ls.len);
+    try testing.expectEqual(@as(usize, content.len), ls.len());
     try testing.expectEqual(LuaString.lstrfix_header_size, @as(usize, 32));
 }
 
@@ -2982,14 +3108,9 @@ fn gcObjectBytes(obj: GcObject) usize {
         .table => |t| @sizeOf(Table) + t.asize * @sizeOf(Value) + t.hash.len * @sizeOf(ltable.Node),
         .closure => @sizeOf(Closure),
         .thread => @sizeOf(Thread),
-        .string => |s| switch (s.kind) {
-            // Charged bytes == actually-allocated bytes (PUC luaC_newobj
-            // charges luaS_sizelngstr per kind): LSTRFIX truncated header,
-            // LSTRMEM full header, regular short/long header + inline content.
-            .ext_fixed => LuaString.lstrfix_header_size,
-            .ext_mem => @sizeOf(LuaString),
-            .short, .long => @sizeOf(LuaString) + s.len + 1,
-        },
+        // Charged bytes == actually-allocated bytes (PUC luaC_newobj charges
+        // luaS_sizelngstr/sizestrshr per kind) — single rule, T7.
+        .string => |s| s.allocatedSize(),
         .cell => @sizeOf(Cell),
         .userdata => |u| @sizeOf(Userdata) + u.uservalues.len * @sizeOf(Value) + u.payload.len,
     };
@@ -14222,7 +14343,7 @@ pub const Vm = struct {
                         // For all other types, resolve __len ONCE and carry
                         // the resolved value through push + synchronous fallback.
                         if (val == .String) {
-                            ctx.regs[a] = .{ .Int = @intCast(val.String.len) };
+                            ctx.regs[a] = .{ .Int = @intCast(val.String.len()) };
                         } else {
                             const tm = self.findUnaryTm(val, .len);
                             if (tm) |mm| {
@@ -16867,16 +16988,17 @@ pub const Vm = struct {
             // incremental sweep handles short string collection. This is the
             // PUC-faithful approach: PUC keeps all short strings in allgc.
             try self.gcRegisterString(ls);
-            // PUC sizestrshr/luaS_sizelngstr(LSTRREG) include the NUL.
-            self.gcNoteAlloc(@sizeOf(LuaString) + raw.len + 1);
-            self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 1 + 24);
+            // PUC sizestrshr/luaS_sizelngstr(LSTRREG) include the NUL;
+            // T7: single per-kind rule via allocatedSize().
+            self.gcNoteAlloc(ls.allocatedSize());
+            self.testcNoteMemory(ls.allocatedSize() + 24);
             self.testc_obj_strings += 1;
             return ls;
         }
         const ls = try createLuaString(self.alloc, raw, hash);
         try self.gcRegisterString(ls);
-        self.gcNoteAlloc(@sizeOf(LuaString) + raw.len + 1);
-        self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 1 + 24);
+        self.gcNoteAlloc(ls.allocatedSize());
+        self.testcNoteMemory(ls.allocatedSize() + 24);
         self.testc_obj_strings += 1;
         return ls;
     }
@@ -16957,20 +17079,25 @@ pub const Vm = struct {
             }
             self.alloc.free(buf);
         }
-        // Field-wise init: every write below stays within `header_size`.
+        // Field-wise init: every write below stays within `header_size`
+        // (for LSTRFIX that is 32 B — writing the whole struct would run
+        // past the allocation).
         ls.hash = h.final();
-        ls.len = len;
+        ls.u.lnglen = len;
         // External strings are always "long" (PUC VLNGSTR), never interned.
-        ls.kind = if (fixed) .ext_fixed else .ext_mem;
+        // PUC shrlen encodes the kind: LSTRFIX -2 / LSTRMEM -3.
+        ls.srkind = if (fixed) LuaString.lstrfix else LuaString.lstrmem;
         ls.gc_marked = 0;
         ls.gc_age = .new;
         ls.gc_index = 0;
-        ls.meta.external.ptr = content; // offset 24 — inside the LSTRFIX prefix
+        ls._pad = 0;
+        ls.c = .{ .extptr = content }; // offset 24 — inside the LSTRFIX prefix
         if (!fixed) {
-            // LSTRMEM only: falloc/ud live past the LSTRFIX prefix, so these
-            // writes are legal ONLY on the full-header allocation.
-            ls.meta.external.falloc = falloc;
-            ls.meta.external.ud = ud;
+            // LSTRMEM only: falloc/ud live past the LSTRFIX prefix (offsets
+            // 32/40), so these writes are legal ONLY on the full-header
+            // allocation.
+            ls.falloc = falloc;
+            ls.ud = ud;
         }
         try self.gcRegisterString(ls);
         // Only the header is owned by the GC; the external content is accounted
@@ -18373,7 +18500,7 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'rawlen' (value expected)", .{});
         switch (args[0]) {
-            .String => |s| outs[0] = .{ .Int = @intCast(s.len) },
+            .String => |s| outs[0] = .{ .Int = @intCast(s.len()) },
             .Table => |t| {
                 if (t.metatable) |mt| {
                     if (self.getMetaField(mt, .name)) |nm| {
@@ -22853,20 +22980,16 @@ pub const Vm = struct {
                 // (s.bytes() must be valid for the hashmap key lookup).
                 // Short strings are in string_intern; long literals in
                 // long_literals. HashMap.remove is a no-op if not found.
-                if (s.len <= lua_string_max_short_len) {
+                if (s.isShort()) {
                     // PUC luaS_remove: O(1) chain unlink.
                     self.string_intern.removeString(s);
                 }
                 // External strings only own the header; regular strings own
                 // header + inline content. `destroyLuaString` handles the
                 // external dealloc callback and frees the right amount.
-                const bytes = switch (s.kind) {
-                    .ext_fixed => LuaString.lstrfix_header_size,
-                    .ext_mem => @sizeOf(LuaString),
-                    // +1: the terminating NUL is part of the allocation.
-                    .short, .long => @sizeOf(LuaString) + s.len + 1,
-                };
-                self.gcNoteFree(bytes);
+                // Single allocated-size rule (T7): PUC luaM_freemem with
+                // sizestrshr/luaS_sizelngstr, centralized in allocatedSize().
+                self.gcNoteFree(s.allocatedSize());
                 destroyLuaString(self.alloc, s);
             },
             .cell => |c| {
@@ -24992,7 +25115,7 @@ pub const Vm = struct {
                     switch (piece) {
                         .Nil => break,
                         .String => |part| {
-                            if (part.len == 0) break;
+                            if (part.len() == 0) break;
                             try buf.appendSlice(self.alloc, part.bytes());
                         },
                         else => {
@@ -30821,7 +30944,7 @@ pub const Vm = struct {
                         .Thread => |th| try std.fmt.allocPrint(self.alloc, "0x{x}", .{@intFromPtr(th)}),
                         .Builtin => |id| try std.fmt.allocPrint(self.alloc, "0x{x}", .{@intFromEnum(id)}),
                         .String => |s| blk: {
-                            if (s.len <= 40) {
+                            if (s.len() <= 40) {
                                 break :blk try std.fmt.allocPrint(self.alloc, "0x{x}", .{std.hash_map.hashString(s.bytes())});
                             }
                             break :blk try std.fmt.allocPrint(self.alloc, "0x{x}", .{@intFromPtr(s.bytes().ptr)});
@@ -31454,10 +31577,10 @@ pub const Vm = struct {
                     ai += 1;
                     if (width <= 8) {
                         const maxv: usize = if (width == 8) std.math.maxInt(usize) else (@as(usize, 1) << @as(u6, @intCast(width * 8))) - 1;
-                        if (sv.len > maxv) return self.fail("does not fit", .{});
-                        try writeUIntBytes(&out, self.alloc, sv.len, width, little);
+                        if (sv.len() > maxv) return self.fail("does not fit", .{});
+                        try writeUIntBytes(&out, self.alloc, sv.len(), width, little);
                     } else {
-                        try writeUIntBytes(&out, self.alloc, sv.len, 8, little);
+                        try writeUIntBytes(&out, self.alloc, sv.len(), 8, little);
                         for (0..(width - 8)) |_| try out.append(self.alloc, 0);
                     }
                     try out.appendSlice(self.alloc, sv.bytes());
@@ -31844,7 +31967,7 @@ pub const Vm = struct {
             .String => |x| x,
             else => return self.fail("string.len expects string", .{}),
         };
-        outs[0] = .{ .Int = @intCast(s.len) };
+        outs[0] = .{ .Int = @intCast(s.len()) };
     }
 
     fn builtinStringByte(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -33962,7 +34085,7 @@ pub const Vm = struct {
             if (len_k > start_idx) total_len +|= sep.len;
             const v = try self.indexValue(tobj, .{ .Int = len_k });
             switch (v) {
-                .String => |sv| total_len +|= sv.len,
+                .String => |sv| total_len +|= sv.len(),
                 .Int => |iv| {
                     var buf: [64]u8 = undefined;
                     const sv = std.fmt.bufPrint(buf[0..], "{d}", .{iv}) catch "";
@@ -36421,7 +36544,7 @@ pub const Vm = struct {
                 },
             },
             .Hash => return switch (src) {
-                .String => |s| .{ .Int = @intCast(s.len) },
+                .String => |s| .{ .Int = @intCast(s.len()) },
                 .Table => |t| blk: {
                     if (try self.callUnaryMetamethod(src, .len)) |v| break :blk v;
                     break :blk .{ .Int = self.tableBorderLen(t) };
@@ -38736,7 +38859,7 @@ pub const Vm = struct {
                 const idx = try self.parseTestcIndex(cargs[0], st.items.len);
                 const v = st.items[idx];
                 const outv: Value = switch (v) {
-                    .String => |s| .{ .Int = @intCast(s.len) },
+                    .String => |s| .{ .Int = @intCast(s.len()) },
                     .Userdata => |ud| .{ .Int = @intCast(ud.payload.len) },
                     .Table => |t| .{ .Int = self.tableBorderLen(t) },
                     else => .{ .Int = 0 },
@@ -38854,7 +38977,7 @@ pub const Vm = struct {
                     break :blk switch (v) {
                         .Nil, .Bool, .Int, .Num => makeTestcPointerValue(0),
                         .String => |s| blk2: {
-                            const pid: u64 = if (s.len <= 40)
+                            const pid: u64 = if (s.isShort())
                                 std.hash.Wyhash.hash(0, s.bytes())
                             else
                                 @intCast(@intFromPtr(s.bytes().ptr));
@@ -40329,7 +40452,7 @@ pub const Vm = struct {
                 const s = call_args[0].String;
                 var start_idx: i64 = if (call_args.len >= 2 and call_args[1] == .Int) call_args[1].Int else 1;
                 var end_idx: i64 = if (call_args.len >= 3 and call_args[2] == .Int) call_args[2].Int else start_idx;
-                const len: i64 = @intCast(s.len);
+                const len: i64 = @intCast(s.len());
                 if (start_idx < 0) start_idx += len + 1;
                 if (end_idx < 0) end_idx += len + 1;
                 if (start_idx < 1) start_idx = 1;
@@ -40368,7 +40491,7 @@ pub const Vm = struct {
                     }
                 else
                     i;
-                const len: i64 = @intCast(s.len);
+                const len: i64 = @intCast(s.len());
                 if (i < 0) i += len + 1;
                 if (j < 0) j += len + 1;
                 if (i < 1 or j < 1 or i > len or j > len or i > j) break :blk 0;
@@ -40718,7 +40841,7 @@ pub const Vm = struct {
         if (lhs == .Int and rhs == .String) {
             var ibuf: [32]u8 = undefined;
             const is = std.fmt.bufPrint(ibuf[0..], "{d}", .{lhs.Int}) catch unreachable;
-            const out = try self.alloc.alloc(u8, is.len + rhs.String.len);
+            const out = try self.alloc.alloc(u8, is.len + rhs.String.len());
             std.mem.copyForwards(u8, out[0..is.len], is);
             std.mem.copyForwards(u8, out[is.len..], rhs.String.bytes());
             return .{ .String = try self.internStr(out) };
@@ -40726,9 +40849,10 @@ pub const Vm = struct {
         if (lhs == .String and rhs == .Int) {
             var ibuf: [32]u8 = undefined;
             const is = std.fmt.bufPrint(ibuf[0..], "{d}", .{rhs.Int}) catch unreachable;
-            const out = try self.alloc.alloc(u8, lhs.String.len + is.len);
-            std.mem.copyForwards(u8, out[0..lhs.String.len], lhs.String.bytes());
-            std.mem.copyForwards(u8, out[lhs.String.len..], is);
+            const llen = lhs.String.len();
+            const out = try self.alloc.alloc(u8, llen + is.len);
+            std.mem.copyForwards(u8, out[0..llen], lhs.String.bytes());
+            std.mem.copyForwards(u8, out[llen..], is);
             return .{ .String = try self.internStr(out) };
         }
         const a = self.concatOperandToString(lhs) catch {

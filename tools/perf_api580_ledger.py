@@ -334,7 +334,7 @@ test "api580 interval allocation ledger" {
     for (proto.resolved_values, 0..) |rv, i| {
         if (i > 0) w(", ", .{});
         switch (rv) {
-            .String => |s| w("{{\"type\": \"string\", \"len\": {d}, \"kind\": {d}}}", .{ s.len, @intFromEnum(s.kind) }),
+            .String => |s| w("{{\"type\": \"string\", \"len\": {d}, \"srkind\": {d}}}", .{ s.len(), s.srkind }),
             .Int => |v| w("{{\"type\": \"int\", \"value\": {d}}}", .{v}),
             .Num => |v| w("{{\"type\": \"num\", \"value\": {d}}}", .{v}),
             else => w("{{\"type\": \"{s}\"}}", .{rv.typeName()}),

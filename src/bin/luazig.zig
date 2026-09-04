@@ -1161,7 +1161,11 @@ fn interpreterMain(init: std.process.Init) !void {
     if (opts.enable_testc) try vm.enableTestcModule();
     // P16.0b: --stats <out.json> — flip the counters on for the whole
     // process run (default off = zero gated cost). Serialized at exit.
-    if (opts.stats_out != null) vm.stats.enabled = true;
+    if (opts.stats_out != null) {
+        vm.stats.enabled = true;
+        // P16.19 T5-A: stats is fixed before execution — set the gate bit.
+        vm.dispatch_gate |= lua.internal.vm.Vm.DISPATCH_GATE_STATS;
+    }
 
     // --- PUC createargtable (lua.c:185-194) ---
     // Build the `arg` table from the full PUC argv, aligned so that

@@ -3778,6 +3778,12 @@ pub const Vm = struct {
     /// needs a single bool read instead of calling activeHookState() per
     /// instruction.
     hooks_active_cached: bool = false,
+    /// P16.19 T5 (Experiment A): combined per-instruction dispatch gate.
+    /// bit0 HOOKS mirrors hooks_active_cached, bit1 STATS mirrors
+    /// stats.enabled; both maintained at exactly the sites that already
+    /// write those flags. The hot loop pays ONE load + ONE branch for both
+    /// (PUC vmfetch also pays one trap branch — this is shape parity).
+    dispatch_gate: u8 = 0,
 
     /// Current dispatch pc — mirrors PUC's `ci->u.l.savedpc` but kept
     /// up-to-date per-instruction so that fail() and GC safepoints can read
@@ -4133,6 +4139,9 @@ pub const Vm = struct {
     /// state. Called after every debug.sethook / hook clear.
     /// P15.35: Now includes call/return hooks — the OP_RETURN fast path relies
     /// on this flag to decide whether to skip the return hook dispatch.
+    pub const DISPATCH_GATE_HOOKS: u8 = 1;
+    pub const DISPATCH_GATE_STATS: u8 = 2;
+
     pub fn refreshHooksCached(self: *Vm) void {
         const hs = self.activeHookState();
         // P15.83h: C hook state is now per-thread in DebugHookState.c_hook.
@@ -4140,6 +4149,11 @@ pub const Vm = struct {
         // by lua_sethook, so the existing check covers C hooks too.
         self.hooks_active_cached =
             hs.has_line or hs.count > 0 or hs.has_call or hs.has_return;
+        if (self.hooks_active_cached) {
+            self.dispatch_gate |= DISPATCH_GATE_HOOKS;
+        } else {
+            self.dispatch_gate &= ~DISPATCH_GATE_HOOKS;
+        }
     }
 
     /// P15.35: Returns true if `ret` points into the VM's `bc_return_scratch`
@@ -12887,15 +12901,18 @@ pub const Vm = struct {
                 // measured +3% on branchy microbenchmarks (see STATUS.md
                 // "P16.0b" for the A/B history). The hint keeps the
                 // increments out of the hot instruction stream.
-                if (self.stats.enabled) {
-                    self.stats.instructions_total += 1;
-                    self.stats.instructions_by_op[@intFromEnum(op)] += 1;
-                }
-
                 // Publish the current pc so fail() and GC safepoints can read
                 // it without the dispatch loop syncing to the frame first.
                 // This mirrors PUC's `ci->u.l.savedpc` but is kept per-instruction.
                 self.dispatch_pc = ctx.pc;
+
+                // P16.19 T5-A: single combined gate; common case = one
+                // not-taken branch for BOTH stats and hooks flags.
+                if (self.dispatch_gate != 0) {
+                if (self.dispatch_gate & DISPATCH_GATE_STATS != 0) {
+                    self.stats.instructions_total += 1;
+                    self.stats.instructions_by_op[@intFromEnum(op)] += 1;
+                }
 
                 // P15.33: Re-check hooks_active_cached every iteration so that
                 // debug.sethook() called from Lua code takes effect
@@ -12906,7 +12923,7 @@ pub const Vm = struct {
                 // boundaries only — no per-instruction check. See the T8
                 // comment block above for the PUC comparison and rationale.
 
-                if (self.hooks_active_cached) {
+                if (self.dispatch_gate & DISPATCH_GATE_HOOKS != 0) {
                     // Slow path: hooks may fire. Use a local `fr` that can be
                     // re-derived after hooks execute Lua code (which may grow
                     // exec_frames and invalidate stale pointers).
@@ -13085,6 +13102,7 @@ pub const Vm = struct {
                         }
                     }
                 }
+                } // end combined dispatch gate (P16.19 T5-A)
                 // PUC does not check GC every instruction. GC steps happen
                 // only at allocation sites via condGcFromDispatch (OP_CONCAT,
                 // OP_CLOSURE) and allocTable (OP_NEWTABLE), matching PUC's

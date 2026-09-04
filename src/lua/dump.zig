@@ -266,7 +266,7 @@ pub const DumpWriter = struct {
     ///   4.  last_line_defined     u32 (varint)
     ///   5.  numparams             byte
     ///   6.  maxstacksize          byte
-    ///   7.  flags                 byte (bit 0 = is_vararg, bit 1 = has vararg_table_reg)
+    ///   7.  flags                 byte (bit 0 = flags.is_vararg, bit 1 = has vararg_table_reg)
     ///   8.  vararg_table_reg      byte (only if flags bit 1 set)
     ///   9.  code.len              u32, then each Instruction as u32 LE
     ///  10.  k.len                 u32, then each Constant via dumpConstant
@@ -290,13 +290,13 @@ pub const DumpWriter = struct {
         if (options.strip) {
             try self.writeStringDedup("");
         } else {
-            try self.writeStringDedup(proto.source_name);
+            try self.writeStringDedup(proto.sourceName());
         }
         // 2. Function name (debug-only field — stripped to empty).
         if (options.strip) {
             try self.writeStringDedup("");
         } else {
-            try self.writeStringDedup(proto.name);
+            try self.writeStringDedup(proto.name());
         }
         // 3-4. Line range.
         try self.writeU32(proto.line_defined);
@@ -305,15 +305,15 @@ pub const DumpWriter = struct {
         try self.writeByte(proto.numparams);
         try self.writeByte(proto.maxstacksize);
 
-        // 7. Flags byte: bit 0 = is_vararg, bit 1 = has vararg_table_reg.
-        const has_vararg_table = (proto.vararg_table_reg != null);
-        const flags: u8 = (@as(u8, @intFromBool(proto.is_vararg)) & 1) |
+        // 7. Flags byte: bit 0 = flags.is_vararg, bit 1 = has vararg_table_reg.
+        const has_vararg_table = (proto.vararg_table_reg != bc.Proto.no_vararg_reg);
+        const flags: u8 = (@as(u8, @intFromBool(proto.flags.is_vararg)) & 1) |
             ((@as(u8, @intFromBool(has_vararg_table)) & 1) << 1);
         try self.writeByte(flags);
 
         // 8. vararg_table_reg — only present when flags bit 1 is set.
         if (has_vararg_table) {
-            try self.writeByte(proto.vararg_table_reg.?);
+            try self.writeByte(proto.vararg_table_reg);
         }
 
         // 9. Code: length prefix, alignment padding, then each instruction
@@ -579,13 +579,14 @@ test "DumpWriter: strip omits debug fields, keeps semantic fields" {
         .locvars = &inner_lvs,
         .maxstacksize = 2,
         .numparams = 1,
-        .is_vararg = false,
-        .vararg_table_reg = null,
-        .name = "inner",
-        .source_name = "src.lua",
+        
         .line_defined = 2,
         .last_line_defined = 3,
     };
+    // Packed name fields (P16.16 C7) — set via accessors.
+    const inner_mut: *bc.Proto = @constCast(&inner);
+    inner_mut.setName("inner");
+    inner_mut.setSourceName("src.lua");
 
     const outer_uvs = [_]bc.Upvaldesc{
         bc.Upvaldesc.make(false, 0, true, "x"),
@@ -601,13 +602,13 @@ test "DumpWriter: strip omits debug fields, keeps semantic fields" {
         .locvars = &inner_lvs,
         .maxstacksize = 3,
         .numparams = 0,
-        .is_vararg = true,
-        .vararg_table_reg = null,
-        .name = "outer",
-        .source_name = "src.lua",
+        .flags = .{ .is_vararg = true },
         .line_defined = 0,
         .last_line_defined = 4,
     };
+    const outer_mut: *bc.Proto = @constCast(&outer);
+    outer_mut.setName("outer");
+    outer_mut.setSourceName("src.lua");
 
     // Strip must produce a strictly smaller chunk (debug bytes dropped).
     var w_plain = DumpWriter.init(std.testing.allocator);
@@ -634,8 +635,8 @@ test "DumpWriter: strip omits debug fields, keeps semantic fields" {
 
     // Debug info: gone (NULL source = "", no name, no lines, no locals,
     // no upvalue names) — on BOTH levels of the tree.
-    try std.testing.expectEqualSlices(u8, "", out.source_name);
-    try std.testing.expectEqualSlices(u8, "", out.name);
+    try std.testing.expectEqualSlices(u8, "", out.sourceName());
+    try std.testing.expectEqualSlices(u8, "", out.name());
     try std.testing.expectEqual(@as(usize, 0), out.lineinfo.len);
     try std.testing.expectEqual(@as(usize, 0), out.locvars.len);
     try std.testing.expectEqual(@as(usize, 1), out.upvalues.len);
@@ -647,8 +648,8 @@ test "DumpWriter: strip omits debug fields, keeps semantic fields" {
 
     try std.testing.expectEqual(@as(usize, 1), out.p.len);
     const child = out.p[0];
-    try std.testing.expectEqualSlices(u8, "", child.source_name);
-    try std.testing.expectEqualSlices(u8, "", child.name);
+    try std.testing.expectEqualSlices(u8, "", child.sourceName());
+    try std.testing.expectEqualSlices(u8, "", child.name());
     try std.testing.expectEqual(@as(usize, 0), child.lineinfo.len);
     try std.testing.expectEqual(@as(usize, 0), child.locvars.len);
 
@@ -657,7 +658,7 @@ test "DumpWriter: strip omits debug fields, keeps semantic fields" {
     try std.testing.expectEqual(@as(u32, 4), out.last_line_defined);
     try std.testing.expectEqual(@as(u8, 0), out.numparams);
     try std.testing.expectEqual(@as(u8, 3), out.maxstacksize);
-    try std.testing.expectEqual(true, out.is_vararg);
+    try std.testing.expectEqual(true, out.flags.is_vararg);
     try std.testing.expectEqual(@as(usize, 1), out.code.len);
     try std.testing.expectEqual(@as(usize, 1), out.k.len);
     try std.testing.expectEqual(@as(i64, 7), out.k[0].int);

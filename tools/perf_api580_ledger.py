@@ -303,13 +303,13 @@ test "api580 interval allocation ledger" {
     w("  }},\n", .{});
     w("  \"code_closure\": {{\n", .{});
     w("    \"ptr\": {d},\n", .{@intFromPtr(cl)});
-    w("    \"tree_is_root\": {},\n", .{cl.tree == cl.proto});
+    w("    \"tree_is_root\": {},\n", .{cl.proto.?.tree == cl.proto});
     w("    \"upvalues_len\": {d},\n", .{cl.upvalues.len});
     w("    \"proto\": {{\n", .{});
     w("      \"ptr\": {d},\n", .{@intFromPtr(proto)});
-    w("      \"gc_charged\": {},\n", .{proto.gc_charged});
-    w("      \"gc_footprint\": {d},\n", .{proto.gc_footprint});
-    w("      \"fixed_arrays\": {},\n", .{proto.fixed_arrays});
+    w("      \"gc_charged\": {},\n", .{proto.flags.gc_charged});
+    w("      \"gc_footprint\": {d},\n", .{bc.protoTreeFootprint(proto.tree.?) + bc.sourceBackingFootprint(proto.tree.?.source_backing)});
+    w("      \"fixed_arrays\": {},\n", .{proto.flags.fixed_arrays});
     w("      \"k_len\": {d},\n", .{proto.k.len});
     w("      \"resolved_values_len\": {d},\n", .{proto.resolved_values.len});
     w("      \"upvalues_len\": {d},\n", .{proto.upvalues.len});

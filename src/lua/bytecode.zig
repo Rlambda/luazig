@@ -876,29 +876,35 @@ pub const Proto = struct {
     maxstacksize: u8,
     /// Number of fixed (named) parameters.
     numparams: u8,
-    /// Whether the function accepts varargs.
-    is_vararg: bool,
 
     // --- Metadata (for error messages, debug info) ---
-    name: []const u8,
-    source_name: []const u8,
+    // P16.16 C7: packed ptr+u32 representation (same trick as Upvaldesc C4):
+    // two 16B slices → 24B. Empty string = null ptr + 0 len — the
+    // stripped-chunk representation (PUC: NULL TString* pointer).
+    name_ptr: ?[*]const u8 = null,
+    name_len: u32 = 0,
+    source_name_ptr: ?[*]const u8 = null,
+    source_name_len: u32 = 0,
     line_defined: u32,
     last_line_defined: u32,
 
     // --- Lua 5.5 named varargs ---
-    /// If non-null, this is the register index of the vararg table
+    /// If != no_vararg_reg, this is the register index of the vararg table
     /// (for named varargs like `function f(x...)`). The VM creates the
     /// table at function entry and stores it in this register.
-    vararg_table_reg: ?u8 = null,
+    /// P16.16 C7: ?u8 → u8 + sentinel (register indices are 0–254, so 255
+    /// = NO_REG is unambiguous — same sentinel PUC uses for NO_REG).
+    vararg_table_reg: u8 = no_vararg_reg,
 
     // NOTE: there is no `deinit` method. The tree deinit is STRUCTURAL and
     // lives in `destroyProtoTree` above, invoked either through
     // `releaseTree` (production: the last closure of the tree died) or
     // directly on construction error paths (no owner exists yet).
 
-    /// Tree-wide state flags (P16.16 C6): the four former standalone
+    /// Tree-wide state flags (P16.16 C6): the former standalone
     /// Proto bools packed into a single byte. Packed struct(u8) keeps
     /// plain `flags.<name>` bool read/write syntax at every call site.
+    /// P16.16 C7: `flags.is_vararg` moved in from a standalone bool (5 bits).
     pub const Flags = packed struct(u8) {
         /// True once the k pool's `.str` pointers belong to the VM string
         /// table (undumped trees: from birth; text-compiled: flipped by
@@ -918,8 +924,38 @@ pub const Proto = struct {
         /// `UndumpReader.undumpProto` in fixed mode; text-compiled protos
         /// always own their arrays (flag = false).
         fixed_arrays: bool = false,
-        _pad: u4 = 0,
+        /// Whether the function accepts varargs (PUC `flags.is_vararg`).
+        is_vararg: bool = false,
+        _pad: u3 = 0,
     };
+
+    /// "No vararg table register" sentinel (P16.16 C7): register indices
+    /// are 0–254 (255 = NO_REG, same value PUC uses), so this is
+    /// unambiguous.
+    pub const no_vararg_reg: u8 = 255;
+
+    /// Function name for error messages / debug info (PUC: NULL for
+    /// stripped chunks — represented as the empty string here).
+    pub inline fn name(self: *const Proto) []const u8 {
+        return if (self.name_ptr) |p| p[0..self.name_len] else &.{};
+    }
+
+    /// Chunk/source name (e.g. "@file.lua"); empty for stripped chunks.
+    pub inline fn sourceName(self: *const Proto) []const u8 {
+        return if (self.source_name_ptr) |p| p[0..self.source_name_len] else &.{};
+    }
+
+    /// Set the function name (empty → null ptr, the stripped form).
+    pub fn setName(self: *Proto, s: []const u8) void {
+        self.name_ptr = if (s.len == 0) null else s.ptr;
+        self.name_len = @intCast(s.len);
+    }
+
+    /// Set the source name (empty → null ptr, the stripped form).
+    pub fn setSourceName(self: *Proto, s: []const u8) void {
+        self.source_name_ptr = if (s.len == 0) null else s.ptr;
+        self.source_name_len = @intCast(s.len);
+    }
 
     // --- CUT2 owner methods (valid only on root proto where tree == self) ---
 
@@ -1211,13 +1247,15 @@ pub const ProtoBuilder = struct {
             .live_reg_top = lrt_slice,
             .maxstacksize = self.maxstacksize,
             .numparams = self.numparams,
-            .is_vararg = self.is_vararg,
-            .vararg_table_reg = self.vararg_table_reg,
-            .name = self.name,
-            .source_name = self.source_name,
+            .flags = .{ .is_vararg = self.is_vararg },
+            .vararg_table_reg = self.vararg_table_reg orelse Proto.no_vararg_reg,
             .line_defined = self.line_defined,
             .last_line_defined = self.last_line_defined,
         };
+        // Packed name fields (P16.16 C7): set via accessors — the builder
+        // keeps plain slices, the runtime Proto stores ptr+u32 len.
+        proto.setName(self.name);
+        proto.setSourceName(self.source_name);
         // ── Tree binding (CUT2: owner merged into root Proto) ──
         // Every adopted child was finished by its own builder and therefore
         // IS its own root (tree == self, ref_count == 1, its producing
@@ -1504,14 +1542,14 @@ pub fn dumpProto(w: anytype, proto: *const Proto, depth: u32) !void {
     // Header line: function name, source, line range, instruction count.
     if (depth == 0) {
         try w.print("main <{s}:{d},{d}> ({d} instructions)\n", .{
-            proto.source_name,
+            proto.sourceName(),
             proto.line_defined,
             proto.last_line_defined,
             proto.code.len,
         });
     } else {
         try w.print("function <{s}:{d},{d}> ({d} instructions)\n", .{
-            proto.source_name,
+            proto.sourceName(),
             proto.line_defined,
             proto.last_line_defined,
             proto.code.len,
@@ -1523,7 +1561,7 @@ pub fn dumpProto(w: anytype, proto: *const Proto, depth: u32) !void {
     try w.print("{s}{d}{s} params, {d} slots, {d} upvalue{s}, {d} local{s}, {d} constant{s}, {d} function{s}\n", .{
         indent,
         proto.numparams,
-        if (proto.is_vararg) "+" else "",
+        if (proto.flags.is_vararg) "+" else "",
         proto.maxstacksize,
         proto.upvalues.len,
         if (proto.upvalues.len != 1) "s" else "",
@@ -1685,7 +1723,7 @@ pub fn dumpProto(w: anytype, proto: *const Proto, depth: u32) !void {
     // Constants table.
     const k_count = protoConstCount(proto);
     if (k_count > 0) {
-        try w.print("constants ({d}) for {s}:\n", .{ k_count, proto.source_name });
+        try w.print("constants ({d}) for {s}:\n", .{ k_count, proto.sourceName() });
         var idx: usize = 0;
         while (idx < k_count) : (idx += 1) {
             var buf: [64]u8 = undefined;
@@ -1696,7 +1734,7 @@ pub fn dumpProto(w: anytype, proto: *const Proto, depth: u32) !void {
 
     // Locals table.
     if (proto.locvars.len > 0) {
-        try w.print("locals ({d}) for {s}:\n", .{ proto.locvars.len, proto.source_name });
+        try w.print("locals ({d}) for {s}:\n", .{ proto.locvars.len, proto.sourceName() });
         for (proto.locvars) |lv| {
             try w.print("{s}\t{d}\t{s}\t{d}\t{d}\n", .{ indent, lv.reg, lv.name, lv.startpc, lv.endpc });
         }
@@ -1704,7 +1742,7 @@ pub fn dumpProto(w: anytype, proto: *const Proto, depth: u32) !void {
 
     // Upvalues table.
     if (proto.upvalues.len > 0) {
-        try w.print("upvalues ({d}) for {s}:\n", .{ proto.upvalues.len, proto.source_name });
+        try w.print("upvalues ({d}) for {s}:\n", .{ proto.upvalues.len, proto.sourceName() });
         for (proto.upvalues, 0..) |uv, idx| {
             try w.print("{s}\t{d}\t{s}\t{s}\t{d}\n", .{
                 indent, idx, uv.name(),

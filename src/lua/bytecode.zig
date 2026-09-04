@@ -469,28 +469,29 @@ pub const LocVar = struct {
 // long-string constants). PUC Lua has no explicit backing tracking — Proto
 // IS a GC object and its debug strings are GC-managed TStrings.
 //
-// CUT2 compact representation (32B inline, down from 88B):
-//   pin:           single GC-pinned source LuaString (common case: 1 pin)
-//   external_borrow: C-API load mode 'B' caller-owned byte span
-//   extra:         ?*SourceBackingExtra for rare multi-pin/owned/name_copies
+// CUT2 compact representation (16B inline, down from 88B):
+//   pin:   single GC-pinned source LuaString (common case: 1 pin)
+//   extra: ?*SourceBackingExtra for rare multi-pin/owned/name_copies
 //
-// For the common cases (1 pin via builtinLoadEx, or external_borrow via
-// C-API 'B'), the inline fields suffice and no extra allocation is needed.
-// For rare cases (multiple pins, owned buffers, name_copies), extra is
-// heap-allocated with the full list-based backing.
+// For the common case (1 pin via builtinLoadEx) the inline fields suffice
+// and no extra allocation is needed. For rare cases (multiple pins, owned
+// buffers, name_copies), extra is heap-allocated with the full list-based
+// backing.
+//
+// P16.16 C6: the former `external_borrow` span (C-API load mode 'B') was
+// removed — it was written once at load and never read: the borrowed bytes
+// are CALLER-OWNED for the tree's whole lifetime (never freed, never
+// GC-marked by us), so recording the span served no lifetime-tracking
+// purpose. The borrow contract is documented at the load site instead.
 
-/// Compact source backing (32B inline in Proto). Covers the common cases
-/// (1 pin, external_borrow) without allocation. Rare cases use extra.
+/// Compact source backing (16B inline in Proto). Covers the common case
+/// (1 pin) without allocation. Rare cases use extra.
 pub const SourceBacking = struct {
     /// Single GC-pinned source LuaString (common: builtinLoadEx load(string)).
     /// For multi-pin, the first pin lives here; additional pins go in extra.
     pin: ?*vm.LuaString = null,
-    /// External borrow (C-API load mode 'B'): caller-owned byte span that
-    /// the tree borrows from. NEVER freed, NEVER GC-marked — the caller
-    /// keeps it alive until the closure is dropped and GC'd.
-    external_borrow: []const u8 = &.{},
     /// Rare-case backing (multi-pin, owned buffers, name_copies).
-    /// Heap-allocated only when needed; null for the common cases.
+    /// Heap-allocated only when needed; null for the common case.
     extra: ?*SourceBackingExtra = null,
 
     /// Ensure extra exists (allocates if null). Returns the extra for
@@ -644,7 +645,7 @@ pub fn destroyProtoTree(alloc: std.mem.Allocator, root: *Proto, k_strings_vm_own
     // the input buffer's lifetime is managed by source_backing (on the
     // root proto in CUT2). PUC's luaF_freeproto (lfunc.c:285-287) does the
     // same check via `PF_FIXED` on `f->flag`.
-    if (!root.fixed_arrays) alloc.free(root.code);
+    if (!root.flags.fixed_arrays) alloc.free(root.code);
     // CUT1: detect k-aliased-to-resolved_values (undumped trees after
     // adoption). When aliased, k.len==0 and resolved_values.len>0; the
     // single allocation is freed via resolved_values below. For all other
@@ -665,7 +666,7 @@ pub fn destroyProtoTree(alloc: std.mem.Allocator, root: *Proto, k_strings_vm_own
     }
     alloc.free(root.p);
     alloc.free(root.upvalues);
-    if (!root.fixed_arrays) alloc.free(root.lineinfo);
+    if (!root.flags.fixed_arrays) alloc.free(root.lineinfo);
     alloc.free(root.locvars);
     if (root.live_reg_top.len > 0) alloc.free(root.live_reg_top);
     if (root.resolved_values.len > 0) alloc.free(root.resolved_values);
@@ -705,7 +706,7 @@ pub fn destroyProtoTree(alloc: std.mem.Allocator, root: *Proto, k_strings_vm_own
 pub fn protoTreeFootprint(root: *const Proto) usize {
     var total: usize = @sizeOf(Proto);
     // PUC PF_FIXED: exclude borrowed code/lineinfo from the footprint.
-    if (!root.fixed_arrays) {
+    if (!root.flags.fixed_arrays) {
         total += root.code.len * @sizeOf(Instruction);
         total += root.lineinfo.len * @sizeOf(u32);
     }
@@ -725,8 +726,8 @@ pub fn protoTreeFootprint(root: *const Proto) usize {
 /// the inline struct itself (already counted via @sizeOf(Proto) on root),
 /// plus any `SourceBackingExtra` (rare case) and its owned/name buffer bytes.
 /// Pinned LuaStrings are GC-owned and NOT included. External borrows are
-/// caller-owned and NOT included. The inline `pin` pointer and
-/// `external_borrow` slice are part of @sizeOf(Proto) and not added here.
+/// caller-owned and NOT included (and, since P16.16 C6, not even recorded).
+/// The inline `pin` pointer is part of @sizeOf(Proto) and not added here.
 pub fn sourceBackingFootprint(sb: SourceBacking) usize {
     if (sb.extra) |e| {
         return sourceBackingExtraFootprint(e.*);
@@ -820,11 +821,21 @@ pub const Proto = struct {
     //
     // PUC model: the Proto IS the ownership root (no separate owner). CUT2
     // achieves the same: the root Proto IS the owner.
+    //
+    // P16.16 C6: the four former standalone bools (k_strings_vm_owned,
+    // constants_resolved, gc_charged, fixed_arrays) are packed into one
+    // `flags: Flags` byte (packed struct(u8)) — bool semantics preserved,
+    // 4 bytes → 1.
+
+    /// Tree-wide state flags (P16.16 C6: packed bools, 1 byte total).
+    /// Valid only on root (tree == self); zeroed on non-root protos.
+    flags: Flags = .{},
 
     /// Number of live references (producing reference + one per Closure).
     /// Reaching 0 in `releaseTree` performs the one-time tree deinit.
     /// Valid only on root (tree == self).
-    ref_count: usize = 0,
+    /// P16.16 C6: usize → u32 — a tree can never reach 4G live closures.
+    ref_count: u32 = 0,
     /// VM identity binding (P16.10b Task 8): the `*Vm` (as `*anyopaque` to
     /// avoid a circular import) this tree's constants were interned into /
     /// executes on. Valid only on root.
@@ -832,19 +843,12 @@ pub const Proto = struct {
     /// Source backing (CUT2 compact): keeps alive the bytes that the tree's
     /// debug lexeme slices borrow. Valid only on root.
     source_backing: SourceBacking = .{},
-    /// True once the k pool's `.str` pointers belong to the VM string table
-    /// (undumped trees: from birth; text-compiled: flipped by resolution).
-    /// Valid only on root.
-    k_strings_vm_owned: bool = false,
-    /// Readiness (tree-wide): all protos have resolved_values built and k
-    /// pool is VM-canonical. Flipped once, never reset. Valid only on root.
-    constants_resolved: bool = false,
     /// GC memory accounting (Task 7): false on construction, set true at
     /// adoption (first closure creation). Valid only on root.
-    gc_charged: bool = false,
-    /// Cached GC footprint charged at adoption, credited back at last
-    /// release. Valid only on root.
-    gc_footprint: usize = 0,
+    /// P16.16 C6: the cached `gc_footprint` was removed — the tree is
+    /// immutable after adoption, so the credit at last release simply
+    /// recomputes `protoTreeFootprint + sourceBackingFootprint` (a cheap
+    /// one-time tree walk at tree death, never hot).
     /// Pre-resolved constant values in runtime `Value` format. Populated
     /// tree-wide by constant resolution (`resolveProtoConstants`) before
     /// first execution. After resolution, opcode handlers read
@@ -887,20 +891,35 @@ pub const Proto = struct {
     /// table at function entry and stores it in this register.
     vararg_table_reg: ?u8 = null,
 
-    // --- PUC PF_FIXED parity (fixed-buffer undump) ---
-    /// When true, `code` and `lineinfo` are BORROWED from the input buffer
-    /// (PUC's PF_FIXED flag, set by `lundump.c` when mode contains 'B').
-    /// `destroyProtoTree` skips freeing them, and `protoTreeFootprint`
-    /// excludes them from the GC memory charge. The input buffer is pinned
-    /// alive by `ProtoTreeOwner.source_backing` for the tree's lifetime.
-    /// Only set by `UndumpReader.undumpProto` in fixed mode; text-compiled
-    /// protos always own their arrays (flag = false).
-    fixed_arrays: bool = false,
-
     // NOTE: there is no `deinit` method. The tree deinit is STRUCTURAL and
     // lives in `destroyProtoTree` above, invoked either through
     // `releaseTree` (production: the last closure of the tree died) or
     // directly on construction error paths (no owner exists yet).
+
+    /// Tree-wide state flags (P16.16 C6): the four former standalone
+    /// Proto bools packed into a single byte. Packed struct(u8) keeps
+    /// plain `flags.<name>` bool read/write syntax at every call site.
+    pub const Flags = packed struct(u8) {
+        /// True once the k pool's `.str` pointers belong to the VM string
+        /// table (undumped trees: from birth; text-compiled: flipped by
+        /// resolution). Valid only on root.
+        k_strings_vm_owned: bool = false,
+        /// Readiness (tree-wide): all protos have resolved_values built and
+        /// k pool is VM-canonical. Flipped once, never reset. Valid only on
+        /// root.
+        constants_resolved: bool = false,
+        /// GC memory accounting (Task 7): false on construction, set true at
+        /// adoption (first closure creation). Valid only on root.
+        gc_charged: bool = false,
+        /// PUC PF_FIXED parity (fixed-buffer undump): when true, `code` and
+        /// `lineinfo` are BORROWED from the caller-owned input buffer.
+        /// `destroyProtoTree` skips freeing them, and `protoTreeFootprint`
+        /// excludes them from the GC memory charge. Only set by
+        /// `UndumpReader.undumpProto` in fixed mode; text-compiled protos
+        /// always own their arrays (flag = false).
+        fixed_arrays: bool = false,
+        _pad: u4 = 0,
+    };
 
     // --- CUT2 owner methods (valid only on root proto where tree == self) ---
 
@@ -922,17 +941,22 @@ pub const Proto = struct {
         self.ref_count -= 1;
         if (self.ref_count != 0) return;
         // Credit the tree's GC memory footprint (charged at adoption —
-        // see gc_charged). Only credit if the tree was actually charged:
-        // error paths that release an un-adopted tree never set gc_charged.
-        if (self.gc_charged) {
+        // see flags.gc_charged). Only credit if the tree was actually
+        // charged: error paths that release an un-adopted tree never set
+        // gc_charged. P16.16 C6: the footprint is recomputed here instead
+        // of cached in the Proto — the tree is immutable after adoption,
+        // so this equals what was charged, and the walk runs once per
+        // tree death (never hot).
+        if (self.flags.gc_charged) {
             const vm_ptr: *vm.Vm = @ptrCast(@alignCast(self.vm.?));
-            vm_ptr.gcCreditTreeMemory(self.gc_footprint);
+            vm_ptr.gcCreditTreeMemory(protoTreeFootprint(self) +
+                sourceBackingFootprint(self.source_backing));
         }
         // Structural deinit of the whole tree (arrays + structs + source
         // backing). Interned LuaStrings are NEVER destroyed here —
         // `k_strings_vm_owned` says whether the k pool still belongs to
         // the tree.
-        destroyProtoTree(alloc, self, self.k_strings_vm_owned);
+        destroyProtoTree(alloc, self, self.flags.k_strings_vm_owned);
     }
 };
 
@@ -1201,7 +1225,7 @@ pub const ProtoBuilder = struct {
         // and null their tree pointers — then bind every proto in the tree
         // to THIS proto as the new root. No separate owner allocation.
         proto.ref_count = 1; // producing reference
-        proto.k_strings_vm_owned = false; // text-compiled: born owning seed-0 strings
+        proto.flags.k_strings_vm_owned = false; // text-compiled: born owning seed-0 strings
         for (p_slice) |child| detachOwnerGroup(alloc, child);
         bindTreeRecursive(proto, proto); // root.tree = self, children.tree = root
         // Transfer ownership of the const pool's internal maps to nothing —
@@ -1245,10 +1269,9 @@ fn detachOwnerGroup(alloc: std.mem.Allocator, group_root: *Proto) void {
     // Clear owner fields (no longer a root).
     group_root.ref_count = 0;
     group_root.vm = null;
-    group_root.k_strings_vm_owned = false;
-    group_root.constants_resolved = false;
-    group_root.gc_charged = false;
-    group_root.gc_footprint = 0;
+    group_root.flags.k_strings_vm_owned = false;
+    group_root.flags.constants_resolved = false;
+    group_root.flags.gc_charged = false;
     clearTreePtrs(group_root);
 }
 

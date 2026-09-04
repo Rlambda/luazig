@@ -6855,3 +6855,36 @@ Perf A/B (closure_capture — Cell get/set/close hot path): −0.00% cyc /
 +0.00% instr (flat).
 
 Remaining api580 ledger (charged): 440 vs PUC 304; still need −41B.
+
+## P16.16 T8 (C6) — Proto 248→216: flags byte, u32 ref_count, no cached footprint, no borrow span (2026-09-04)
+
+Structural cut 6, four sub-cuts on the root-owner fields (CUT2):
+
+1. `external_borrow` span REMOVED (−16B): written once at fixed-buffer
+   load, never read at runtime — the borrowed bytes are CALLER-OWNED for
+   the tree's whole lifetime (never freed/marked by us), so the span
+   served no lifetime-tracking purpose. The borrow contract is documented
+   at the load site (PUC LZIO model).
+2. Cached `gc_footprint` REMOVED (−8B): the tree is immutable after
+   adoption, so the credit at last release recomputes
+   `protoTreeFootprint + sourceBackingFootprint` — a one-time tree walk
+   at tree death, never hot (charge path unchanged).
+3. `ref_count` usize→u32 (−4B): a tree can never reach 4G live closures.
+4. Four standalone bools (k_strings_vm_owned, constants_resolved,
+   gc_charged, fixed_arrays) → `flags: Flags` packed struct(u8) (−3B):
+   plain `flags.<name>` bool read/write syntax preserved at every call
+   site (~35 sites, mechanical rename).
+
+@sizeOf: Proto 248→216. api580 (anchored, 3 runs): 440 → **408** (−32 =
+16 borrow span + 8 footprint + 4 ref_count + 4 bools/padding).
+
+Gates: closure / coroutine / gc / gengc / nextvar / db / errors / strings
+--testc PASS (gc accounting incl. recompute-at-release credit; fixed-
+buffer undump); locals fails byte-identical to baseline (pre-existing);
+smoke 68/68; c_api `make test` 20 suites + `make test-diff` 8/8 PASS;
+zig build test PASS (undump/dump roundtrip, OOM-failure leak tests).
+
+Perf A/B (dynamic_load — tree adopt/charge/release): −0.53% cyc /
++0.06% instr (flat).
+
+Remaining api580 ledger (charged): 408 vs PUC 304; still need −9B.

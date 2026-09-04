@@ -6845,7 +6845,7 @@ pub const Vm = struct {
     /// `pushBytecodeExecFrame` and the OP_TAILCALL frame-reuse path.
     inline fn resolveProtoConstants(self: *Vm, proto: *bc.Proto) DispatchError!void {
         const owner = proto.tree orelse return; // owner-less: unit-test protos
-        if (owner.constants_resolved) return;
+        if (owner.flags.constants_resolved) return;
         try self.resolveTreeConstants(owner);
     }
 
@@ -6863,7 +6863,7 @@ pub const Vm = struct {
     ///   Phase 2 (infallible): publish — store each `resolved_values`,
     ///   swap the k pool's `.str` pointers to the staged VM strings,
     ///   destroy the old seed-0 strings (text trees only; undumped trees
-    ///   are VM-owned from birth — `k_strings_vm_owned`), flip the owner
+    ///   are VM-owned from birth — `flags.k_strings_vm_owned`), flip the owner
     ///   flags. Frees and stores cannot fail.
     /// Staging record for tree-wide constant resolution (see
     /// resolveTreeConstants): the fresh resolved_values array for one proto,
@@ -6871,7 +6871,7 @@ pub const Vm = struct {
     const ResolveStage = struct { proto: *bc.Proto, vals: []Value };
 
     fn resolveTreeConstants(self: *Vm, owner: *bc.Proto) DispatchError!void {
-        // CUT1: for undumped trees (k_strings_vm_owned==true from birth),
+        // CUT1: for undumped trees (flags.k_strings_vm_owned==true from birth),
         // the k strings are already VM-interned at deserialization time.
         // Alias resolved_values onto the SAME allocation as k via in-place
         // Constant→Value conversion (both 16B, align 8; .int→.Int,
@@ -6881,9 +6881,9 @@ pub const Vm = struct {
         // TValue array. This eliminates the dual Constant[]+Value[] storage
         // for undumped trees (compiled trees still need both: k holds
         // compile-time Constant that must survive for source/debug info).
-        if (owner.k_strings_vm_owned) {
+        if (owner.flags.k_strings_vm_owned) {
             aliasUndumpConstantsTree(owner);
-            owner.constants_resolved = true;
+            owner.flags.constants_resolved = true;
             return;
         }
         // Compiled tree: two-phase resolution (allocates resolved_values,
@@ -6909,7 +6909,7 @@ pub const Vm = struct {
             for (b.proto.k, 0..) |*c, i| {
                 if (c.* == .str) {
                     const new = b.vals[i].String;
-                    if (!owner.k_strings_vm_owned) {
+                    if (!owner.flags.k_strings_vm_owned) {
                         // Destroy the compile-time LuaString (seed-0). The
                         // VM-interned version is now the canonical pointer.
                         // Seed strings were created by the compiler with the
@@ -6924,8 +6924,8 @@ pub const Vm = struct {
                 }
             }
         }
-        owner.k_strings_vm_owned = true;
-        owner.constants_resolved = true;
+        owner.flags.k_strings_vm_owned = true;
+        owner.flags.constants_resolved = true;
         // Ownership of the staged arrays moved to the protos — drain the
         // list so the defer above does not free them.
         built.clearRetainingCapacity();
@@ -6956,7 +6956,7 @@ pub const Vm = struct {
     /// CUT1: alias resolved_values onto the k allocation for undumped trees.
     /// Converts each Constant slot in-place to its Value equivalent (both are
     /// 16B, align 8). The .str pointers are already VM-interned at undump
-    /// time (k_strings_vm_owned==true), so .str→.String is a pointer-preserving
+    /// time (flags.k_strings_vm_owned==true), so .str→.String is a pointer-preserving
     /// rewrite. After conversion, k.len==0 (signaling aliased) and
     /// resolved_values is the single constant array. Recursive over the tree.
     /// Infallible: no allocation, no interning — pure in-place rewrites.
@@ -11474,7 +11474,7 @@ pub const Vm = struct {
         // this Debug assert is the invariant's tripwire. Owner-less
         // protos are unit-test constructs and pass freely.
         if (@import("builtin").mode == .Debug) {
-            if (proto.tree) |t| std.debug.assert(t.constants_resolved);
+            if (proto.tree) |t| std.debug.assert(t.flags.constants_resolved);
         }
         // PUC Lua limits the value stack, not the number of Lua activations.
         // Bytecode calls are represented by heap-resident CallInfo-like
@@ -12079,7 +12079,7 @@ pub const Vm = struct {
             // resolveTreeConstants is pure allocation+interning: it can
             // never yield or switch threads, but its signature carries the
             // full DispatchError set. Map the impossible arm explicitly.
-            if (!t.constants_resolved) {
+            if (!t.flags.constants_resolved) {
                 self.resolveTreeConstants(t) catch |e| switch (e) {
                     error.ThreadSwitch => unreachable, // pure allocation+interning: no control flow inside
                     error.OutOfMemory => return error.OutOfMemory,
@@ -15769,7 +15769,7 @@ pub const Vm = struct {
                 // construction (adopted at closure creation); Debug
                 // tripwire mirrors pushBytecodeExecFrame.
                 if (@import("builtin").mode == .Debug) {
-                    if (new_proto.tree) |t| std.debug.assert(t.constants_resolved);
+                    if (new_proto.tree) |t| std.debug.assert(t.flags.constants_resolved);
                 }
 
                 // 1. Close all ctx.boxed upvalues.
@@ -23677,18 +23677,18 @@ pub const Vm = struct {
 
     /// Charge the tree's native memory footprint to `gc_count_kb` at
     /// adoption (first closure creation over this tree). Idempotent:
-    /// `gc_charged` on the owner prevents double-accounting when
+    /// `flags.gc_charged` on the owner prevents double-accounting when
     /// OP_CLOSURE creates additional closures over an already-adopted tree.
     /// The footprint includes Proto structs, all owned arrays, the
     /// root Proto owner fields and SourceBacking buffers — everything freed
     /// by `releaseTree (CUT2: merged into root Proto)` at last release. Interned LuaStrings are
     /// excluded (owned by the VM string table, already charged by `internStr`).
     fn chargeTreeFootprint(self: *Vm, owner: *bc.Proto) void {
-        if (owner.gc_charged) return;
+        if (owner.flags.gc_charged) return;
         // PUC PF_FIXED parity (P16.10d honest accounting): charge ALL
         // tree-owned memory honestly, for BOTH fixed-buffer and heap trees.
         // `protoTreeFootprint` already excludes BORROWED code/lineinfo when
-        // `fixed_arrays` is set (matching PUC's `luaF_protosize` which skips
+        // `flags.fixed_arrays` is set (matching PUC's `luaF_protosize` which skips
         // code/lineinfo/abslineinfo for PF_FIXED protos). The remaining
         // owned parts — Proto struct, k array, p array, upvalues, locvars,
         // live_reg_top, resolved_values — are charged exactly as PUC charges
@@ -23722,8 +23722,7 @@ pub const Vm = struct {
         const fp = bc.protoTreeFootprint(owner) +
             bc.sourceBackingFootprint(owner.source_backing);
         self.gcChargeTreeMemory(fp);
-        owner.gc_charged = true;
-        owner.gc_footprint = fp;
+        owner.flags.gc_charged = true;
     }
 
     pub fn createBytecodeChunkClosure(self: *Vm, proto: *const bc.Proto) DispatchError!*Closure {
@@ -23787,7 +23786,7 @@ pub const Vm = struct {
         // OP_CLOSURE children adopt implicitly — their parent's tree was
         // adopted when the parent closure was created.
         if (proto.tree) |t| {
-            if (!t.constants_resolved) try self.resolveTreeConstants(t);
+            if (!t.flags.constants_resolved) try self.resolveTreeConstants(t);
             // Charge the tree's native footprint to gc_count_kb at adoption
             // (Task 7). After resolution, resolved_values arrays exist and
             // are included in the footprint. Idempotent: OP_CLOSURE-created
@@ -24232,10 +24231,10 @@ pub const Vm = struct {
     pub fn preResolveUndumpedConstants(self: *Vm, root: *bc.Proto) DispatchError!void {
         _ = self;
         const owner = root.tree orelse return; // owner-less: unit-test protos
-        if (owner.constants_resolved) return;
+        if (owner.flags.constants_resolved) return;
         // CUT1: alias resolved_values onto the k allocation via in-place
         // Constant→Value conversion (both 16B, align 8). The k strings are
-        // already VM-interned at undump time (k_strings_vm_owned will be set
+        // already VM-interned at undump time (flags.k_strings_vm_owned will be set
         // below), so .str→.String is a pointer-preserving rewrite. After
         // conversion, k.len==0 and resolved_values is the single constant
         // array — matching PUC Lua where Proto.k IS the runtime TValue array.
@@ -24244,8 +24243,8 @@ pub const Vm = struct {
         // shape). Infallible: no allocation, no interning — pure in-place
         // rewrites.
         aliasUndumpConstantsTree(root);
-        owner.k_strings_vm_owned = true;
-        owner.constants_resolved = true;
+        owner.flags.k_strings_vm_owned = true;
+        owner.flags.constants_resolved = true;
     }
 
     /// Duplicate all string fields in an undumped proto tree so the proto
@@ -24529,8 +24528,10 @@ pub const Vm = struct {
                     // C buffer (luaL_loadbufferx('B')): external borrow.
                     // The caller owns the memory; never freed, never
                     // GC-marked. The caller must keep it alive until the
-                    // closure is dropped and GC'd (Task 5).
-                    loaded_proto.tree.?.source_backing.external_borrow = bytes;
+                    // closure is dropped and GC'd (Task 5). P16.16 C6:
+                    // nothing is recorded in SourceBacking — the span was
+                    // never read (the borrow contract is caller-owned for
+                    // the tree's whole lifetime by definition).
                 },
                 .owned => |owned_bytes| {
                     // Owned buffer (lua_load reader collection with 'B'):
@@ -37158,7 +37159,7 @@ pub const Vm = struct {
         // tree-wide before first execution. listk may be called before
         // execution (readiness flag lives on the tree owner).
         if (proto.tree) |tree| {
-            if (!tree.constants_resolved) {
+            if (!tree.flags.constants_resolved) {
                 try self.resolveProtoConstants(@constCast(proto));
             }
         }
@@ -42231,7 +42232,7 @@ test "vm: Task 8.3 — constant-resolution staging OOM → tree unresolved, retr
     var fail_idx: usize = 0;
     while (fail_idx < 200) : (fail_idx += 1) {
         const p = try compileTestProto(aalloc, "return 'hello' .. 'world'\n");
-        try testing.expect(!p.tree.?.constants_resolved);
+        try testing.expect(!p.tree.?.flags.constants_resolved);
 
         var tracker = TrackingAllocator.init(std.heap.page_allocator);
         const track_alloc = tracker.allocator();
@@ -42247,18 +42248,18 @@ test "vm: Task 8.3 — constant-resolution staging OOM → tree unresolved, retr
 
         if (result) |_| {
             p.tree.?.releaseTree(aalloc);
-            try testing.expect(p.tree.?.constants_resolved);
+            try testing.expect(p.tree.?.flags.constants_resolved);
             try testing.expectEqual(@as(usize, 0), tracker.total_bytes);
             break;
         } else |_| {
             // Resolution failed. Tree must still be unresolved.
-            try testing.expect(!p.tree.?.constants_resolved);
+            try testing.expect(!p.tree.?.flags.constants_resolved);
             try testing.expectEqual(@as(usize, 0), tracker.total_bytes);
             hit_failure = true;
             // Retry with working allocator — idempotence proof.
             vm.alloc = aalloc;
             try vm.resolveTreeConstants(p.tree.?);
-            try testing.expect(p.tree.?.constants_resolved);
+            try testing.expect(p.tree.?.flags.constants_resolved);
             p.tree.?.releaseTree(aalloc);
             break;
         }
@@ -42285,7 +42286,7 @@ test "vm: Task 8.4 — nested tree adoption fails partway → no partial publish
         const p = try compileTestProto(aalloc,
             \\return function() return 'child' end
         );
-        try testing.expect(!p.tree.?.constants_resolved);
+        try testing.expect(!p.tree.?.flags.constants_resolved);
         try testing.expect(p.p.len >= 1);
 
         var tracker = TrackingAllocator.init(std.heap.page_allocator);
@@ -42302,12 +42303,12 @@ test "vm: Task 8.4 — nested tree adoption fails partway → no partial publish
 
         if (result) |_| {
             p.tree.?.releaseTree(aalloc);
-            try testing.expect(p.tree.?.constants_resolved);
+            try testing.expect(p.tree.?.flags.constants_resolved);
             try testing.expectEqual(@as(usize, 0), tracker.total_bytes);
             break;
         } else |_| {
             // Failed — tree must be FULLY unresolved (no partial publish).
-            try testing.expect(!p.tree.?.constants_resolved);
+            try testing.expect(!p.tree.?.flags.constants_resolved);
             try testing.expectEqual(@as(usize, 0), p.resolved_values.len);
             for (p.p) |child| {
                 try testing.expectEqual(@as(usize, 0), child.resolved_values.len);
@@ -42317,7 +42318,7 @@ test "vm: Task 8.4 — nested tree adoption fails partway → no partial publish
             // Retry succeeds (idempotence).
             vm.alloc = aalloc;
             try vm.resolveTreeConstants(p.tree.?);
-            try testing.expect(p.tree.?.constants_resolved);
+            try testing.expect(p.tree.?.flags.constants_resolved);
             p.tree.?.releaseTree(aalloc);
             break;
         }

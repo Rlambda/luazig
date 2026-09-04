@@ -16777,7 +16777,7 @@ pub const Vm = struct {
     /// PUC always creates external strings as `LUA_VLNGSTR` (long), regardless
     /// of actual length — they are never interned. Equality between two
     /// external strings (or an external and a regular long string) is by
-    /// content, handled by `luaStringEq` via the `is_short == false` path.
+    /// content, handled by `luaStringEq` via the non-`short`-kind path.
     ///
     /// The hash is computed with the same per-VM seed as `internStr` so that
     /// table-key lookups involving an external string are consistent with the
@@ -23814,30 +23814,23 @@ pub const Vm = struct {
         // Proto + k + p + locvars + upvalues (plus luazig-specific
         // live_reg_top and resolved_values that PUC doesn't have).
         //
-        // Additionally, SourceBacking buffers (CUT2: owner fields merged into root Proto)
-        // are charged — these are luazig-specific management overhead (PUC
-        // has no separate owner; Proto IS a GC object). This makes
-        // `collectgarbage("count")` honestly reflect all native memory freed
-        // at tree deinit.
+        // Additionally, SourceBacking buffers (CUT2: owner fields merged
+        // into root Proto) are charged — these are luazig-specific
+        // management overhead (PUC has no separate owner; Proto IS a GC
+        // object). This makes `collectgarbage("count")` honestly reflect
+        // all native memory freed at tree deinit.
         //
-        // DEVIATION from PUC's 400-byte gate (api.lua:580): the honest
-        // charge for a fixed-buffer load of the api.lua chunk shape (1000×
-        // "X=X+1" + 1000-char string, stripped, mode 'B') is ~456 bytes,
-        // exceeding PUC's < 400 assertion. The gap is structural:
-        //   - SourceBacking    32B  (PUC has no explicit backing tracking)
-        //   - resolved_values  48B  (PUC's k IS already runtime TValue format)
-        //   - Proto          +56B   (184 vs 128: Zig slices + live_reg_top + owner fields)
-        //   - Closure        +48B   (88 vs 40: larger GC header + upvalues slice)
-        //   - Cell           +24B   (64 vs 40: eager UpVal vs PUC's lazy)
-        //   - Upvaldesc       +8B   (24 vs 16: Zig slice name vs C pointer)
-        // CUT2 eliminated ProtoTreeOwner (144B) by merging owner fields
-        // into the root Proto. Getting under 400 requires eliminating
-        // resolved_values (larger structural change: Proto-as-GC-object,
-        // lazy resolved_values at first frame push, or per-exec k-pool
-        // conversion). Per the verifier's allowance, we keep the honest
-        // accounting and document this deviation rather than hiding tree
-        // memory behind a gc_footprint=0 exemption. The api.lua m2-m1<400
-        // assertion fails honestly, documenting a real parity gap.
+        // Accounted-vs-PUC state after the P16.16/P16.17 representation
+        // convergence (all sizes build-mode-stable): Closure 40 = PUC,
+        // Cell 40 = PUC, Upvaldesc 16 = PUC, LSTRFIX header 32 = PUC,
+        // LuaString 48 = PUC. The single remaining structural gap is the
+        // Proto struct (200 vs PUC 128): Zig slices + live_reg_top +
+        // resolved_values are honest luazig-specific representation; the
+        // upstream api.lua m2-m1<400 assertion PASSES in Debug and
+        // ReleaseFast with real headroom (376 < 400), gated permanently by
+        // tools/api580_gate.py. Historical size deltas live in
+        // STATUS.md / tools/perf/current-api580-ledger.json (history),
+        // not here.
         const fp = bc.protoTreeFootprint(owner) +
             bc.sourceBackingFootprint(owner.source_backing);
         self.gcChargeTreeMemory(fp);

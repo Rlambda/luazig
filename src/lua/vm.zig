@@ -2178,16 +2178,27 @@ pub const LuaString = struct {
     ///    `lua_pushexternalstring` / LSTRMEM), used ONLY when
     ///    `is_external`. External strings are always long and never
     ///    interned, so they never carry a chain link.
-    const Meta = union {
+    /// P16.17 T1: `extern union` — build-mode-stable layout. A plain Zig
+    /// `union` grows a hidden safety tag in Debug builds (+8 B →
+    /// LuaString 48→56 → api.lua:580 delta 392→400 = FAIL in Debug).
+    /// `extern union` has guaranteed C-style layout with no hidden tag:
+    /// @sizeOf(LuaString) == 48 in BOTH Debug and ReleaseFast. The two
+    /// arms are mutually exclusive by the string-kind discriminants
+    /// (is_short/interned ⇒ uses `next`; is_external ⇒ uses `external`;
+    /// external strings are never interned), so every arm access is
+    /// provably correct — no inactive-storage reads.
+    const Meta = extern union {
         next: ?*LuaString,
         external: ExtInfo,
     };
 
     /// External-content descriptor (PUC 5.5 `luaS_newextlstr` / LSTRMEM).
-    const ExtInfo = struct {
+    /// `extern struct`: field of an `extern union` must have a
+    /// layout-compatible (C-ABI) type. 24 B in all build modes.
+    const ExtInfo = extern struct {
         /// Pointer to the external content (valid only when `is_external`).
         /// Not owned by the LuaString — released via `falloc` during GC.
-        ptr: [*]const u8 = &.{},
+        ptr: [*]const u8 = @ptrFromInt(@alignOf([*]const u8)),
         /// Dealloc callback with PUC `lua_Alloc` signature:
         ///   `?*anyopaque = falloc(ud, ptr, osize, nsize)`
         /// Called as `falloc(ud, ptr, len+1, 0)` to free external content.
@@ -2229,6 +2240,16 @@ pub const LuaString = struct {
         return body[0..self.len];
     }
 };
+
+// P16.17 T1 invariant: LuaString's layout must be build-mode-stable.
+// A plain Zig `union` in `Meta` would silently grow a hidden Debug
+// safety tag (48→56 B), which once pushed the api.lua:580 fixed-load
+// delta to exactly 400 = upstream FAIL in Debug while ReleaseFast
+// passed at 392. The assert compiles in EVERY build mode, so any future
+// build-mode-dependent layout regression fails the build, not the test.
+comptime {
+    std.debug.assert(@sizeOf(LuaString) == 48);
+}
 
 // PUC Lua's LUAI_MAXSHORTLEN (lstring.h): strings up to this many bytes are
 // interned as short strings; longer strings are allocated fresh each time.

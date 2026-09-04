@@ -1413,8 +1413,6 @@ const LuaFrameState = extern struct {
     proto: *const bc.Proto = undefined,
     /// PUC `u.l.savedpc`: current bytecode PC.
     pc: usize = 0,
-    /// Unshifted func_slot — position before buildhiddenargs shifted it.
-    func_slot_base: usize = 0,
     /// Register window upper bound (PUC `ci->top - ci->func`).
     frame_cap: u32 = 0,
     /// Fixed params count (PUC `ci->func + 1 .. ci->base`).
@@ -1572,6 +1570,27 @@ pub const CallFrame = extern struct {
     /// Lua AND C frames (P16.20 T3 audit); inline single-add.
     pub inline fn frameBase(fr: CallFrame) usize {
         return fr.func_slot + 1;
+    }
+
+    /// P16.21 T2: the ORIGINAL (unshifted) function slot — where call
+    /// results must land. PUC does not store a second pointer: for
+    /// PF_VAHID it restores `ci->func.p -= (nextraargs + nparams1)`
+    /// (OP_VARARGPREP / OP_RETURN handling). The push invariant is
+    /// `shifted = original + nextraargs + numparams + 1` (pushStaged
+    /// buildhiddenargs, and the tailcall re-setup writes the same triple),
+    /// so the original is always derivable. VATAB/non-vararg frames are
+    /// never shifted (original == func_slot). `nextraargs` mutates only at
+    /// activation and tailcall-reuse — both rewrite the whole triple
+    /// consistently (audited).
+    pub inline fn originalFuncSlot(fr: CallFrame) usize {
+        const p = fr.u.lua.proto;
+        if (p.flags.is_vararg and fr.u.lua.nextraargs > 0 and
+            p.vararg_table_reg == bc.Proto.no_vararg_reg)
+        {
+            return fr.func_slot -
+                (@as(usize, fr.u.lua.nextraargs) + p.numparams + 1);
+        }
+        return fr.func_slot;
     }
 
     // P15.51g: regs/boxed removed — derived on demand from base + frame_cap
@@ -4711,7 +4730,7 @@ pub const Vm = struct {
                 const off: usize = if (frame.isC())
                     inst.a
                 else
-                    frame.u.lua.func_slot_base - parent.frameBase();
+                    frame.originalFuncSlot() - parent.frameBase();
                 if (off >= proto.maxstacksize) return null;
                 const dn = debugBytecodeOperandName(proto, pc, @intCast(off));
                 if (dn.name) |nm| return .{ .namewhat = dn.namewhat, .name = nm };
@@ -12047,7 +12066,6 @@ pub const Vm = struct {
         // Bytecode-specific fields
         ef_slot.activation_id = activation_owner.bytecode_activation_counter;
         ef_slot.func_slot = func_slot; // base derived: func_slot + 1
-        ef_slot.u.lua.func_slot_base = func_slot_in;
         ef_slot.u.lua.frame_cap = frame_cap;
         ef_slot.u.lua.nextraargs = @intCast(nextra);
         // P16.2d: encodeNresults masks with CIST_NRESULTS (0xff, low 8 bits),
@@ -12282,10 +12300,10 @@ pub const Vm = struct {
             }
         }
         // P15.51c: Ordinary Lua CALL has no pending_call. Result contract is
-        // fully in callee's callstatus (nresults) + func_slot_base (dst).
+        // fully in callee's callstatus (nresults) + originalFuncSlot (dst).
         if (self.getPendingCallConst(exec_frames.getPtr(parent_index).pending_call_index) == null) {
             const parent0 = exec_frames.getConstPtr(parent_index);
-            const dst = child_frame.u.lua.func_slot_base - parent0.frameBase();
+            const dst = child_frame.originalFuncSlot() - parent0.frameBase();
             try self.applyBytecodeResultsDirect(exec_frames, parent_index, ret, dst, callee_nresults);
             return null;
         }
@@ -14715,7 +14733,7 @@ pub const Vm = struct {
                                 // P16.2: no pending-call slot for a plain
                                 // Lua→Lua call — the P15.51c direct contract
                                 // applies (same as opCall's plain-Lua branch:
-                                // dst derived from the child's func_slot_base,
+                                // dst derived from the child's originalFuncSlot(),
                                 // nresults decoded from the child's
                                 // callstatus; applyBytecodeResultsDirect
                                 // advances pc). The pending slot served no
@@ -15190,7 +15208,7 @@ pub const Vm = struct {
                     {
                         const nresults = decodeNresults(child.callstatus);
                         if (nresults == 0 or nresults < 0) {
-                            const dst = child.u.lua.func_slot_base - parent_c.frameBase();
+                            const dst = child.originalFuncSlot() - parent_c.frameBase();
                             // Pop child frame — mirror popBytecodeExecFrame
                             // (same skip rationale as opReturn1). T7: stable
                             // parent reused across the shrink.
@@ -15355,7 +15373,7 @@ pub const Vm = struct {
                             const parent_m = @constCast(parent_c);
                             // Read source BEFORE pop (child reg still valid).
                             const src_val = ctx.regs[a];
-                            const dst = child.u.lua.func_slot_base - parent_c.frameBase();
+                            const dst = child.originalFuncSlot() - parent_c.frameBase();
                             // Pop child frame — mirror popBytecodeExecFrame
                             // exactly, skipping the parts guarded by fast-arm
                             // conditions. The child is the top slot: mutating
@@ -15367,7 +15385,7 @@ pub const Vm = struct {
                             ctx.exec_frames.shrinkTo(ctx.frame_index);
                             // Single-copy: write return value directly into
                             // parent's register window. dst < frame_cap is
-                            // guaranteed because func_slot_base is within the
+                            // guaranteed because the original func slot is within the
                             // parent's window (it's where the function was).
                             self.bc_stack[parent_c.frameBase() + dst] = src_val;
                             if (nresults < 0) {
@@ -16211,7 +16229,7 @@ pub const Vm = struct {
                     new_proto.vararg_table_reg == bc.Proto.no_vararg_reg;
 
                 // Reset to the original (unshifted) func_slot_base.
-                const reset_slot = ctx.exec_frames.getPtr(ctx.frame_index).u.lua.func_slot_base;
+                const reset_slot = ctx.exec_frames.getPtr(ctx.frame_index).originalFuncSlot();
                 const reset_base = reset_slot + 1;
                 try self.ensureBcStackCap(reset_base + @max(new_cap, effective_nargs + 1));
 
@@ -16270,7 +16288,6 @@ pub const Vm = struct {
                 fr2.u.lua.proto = new_proto;
                 // P15.51n: upvalues derived from bc_stack[func_slot], not stored in frame.
                 fr2.func_slot = new_func_slot; // base derived: +1 (== ctx.base)
-                fr2.u.lua.func_slot_base = reset_slot;
                 // P15.51g: regs/boxed no longer cached in the frame.
                 // P15.51k: callee is at bc_stack[func_slot] (set by TAILCALL
                 // stack setup). No duplicated field write needed.

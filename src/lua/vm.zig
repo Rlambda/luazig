@@ -1776,6 +1776,58 @@ const FrameStack = struct {
         return &self.heap.items[index - INLINE_FRAME_CAP];
     }
 
+    /// P16.20 T6: PUC `L->ci` — direct current(top) frame access. Chooses
+    /// the last heap entry when the heap is non-empty, else the last inline
+    /// slot — ONE conditional instead of len()+index arithmetic, and the
+    /// returned pointer is the same object getPtr(len()-1) yields.
+    pub fn topPtr(self: *FrameStack) *CallFrame {
+        if (self.heap.items.len != 0) {
+            return &self.heap.items[self.heap.items.len - 1];
+        }
+        std.debug.assert(self.inline_count != 0);
+        return &self.inline_frames[self.inline_count - 1];
+    }
+
+    pub fn topConstPtr(self: *const FrameStack) *const CallFrame {
+        if (self.heap.items.len != 0) {
+            return &self.heap.items[self.heap.items.len - 1];
+        }
+        std.debug.assert(self.inline_count != 0);
+        return &self.inline_frames[self.inline_count - 1];
+    }
+
+    /// PUC `ci->previous` — parent of the current top frame. NULL-equivalent
+    /// is impossible to express with a non-optional return, so callers must
+    /// check len() > 1 first (Debug assert below enforces it).
+    pub fn parentPtrOfTop(self: *FrameStack) *CallFrame {
+        std.debug.assert(self.len() > 1);
+        if (self.heap.items.len >= 2) {
+            // Top is heap; parent is the heap entry before it.
+            return &self.heap.items[self.heap.items.len - 2];
+        }
+        if (self.heap.items.len == 1) {
+            // Top is the first heap frame; parent is the last inline frame.
+            std.debug.assert(self.inline_count == INLINE_FRAME_CAP);
+            return &self.inline_frames[INLINE_FRAME_CAP - 1];
+        }
+        // Both inline.
+        std.debug.assert(self.inline_count >= 2);
+        return &self.inline_frames[self.inline_count - 2];
+    }
+
+    pub fn parentPtrOfTopConst(self: *const FrameStack) *const CallFrame {
+        std.debug.assert(self.len() > 1);
+        if (self.heap.items.len >= 2) {
+            return &self.heap.items[self.heap.items.len - 2];
+        }
+        if (self.heap.items.len == 1) {
+            std.debug.assert(self.inline_count == INLINE_FRAME_CAP);
+            return &self.inline_frames[INLINE_FRAME_CAP - 1];
+        }
+        std.debug.assert(self.inline_count >= 2);
+        return &self.inline_frames[self.inline_count - 2];
+    }
+
     /// Grow by one frame, return mutable pointer to the new slot.
     /// Mirrors `ArrayList.addOne` semantics.
     pub fn addOne(self: *FrameStack, alloc: std.mem.Allocator) !*CallFrame {
@@ -15115,7 +15167,7 @@ pub const Vm = struct {
     /// alloc(Value, 0)/free pair on every no-value return.
     fn opReturn0(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
         const has_pending_tbc = self.bc_tbc_regs.items.len >
-            ctx.exec_frames.getPtr(ctx.frame_index).tbc_mark;
+            ctx.exec_frames.topConstPtr().tbc_mark; // P16.20 T6: current == top
         // P15.51l: hooks_active is read from self.hooks_active_cached.
         if (!has_pending_tbc and !self.hooks_active_cached) {
             // P16.2d: inline return fast arm (same conditions as opReturn1).
@@ -15124,14 +15176,13 @@ pub const Vm = struct {
             // stores). nresults>=1 would require nil-padding — fall back.
             // See opReturn1 for the full safety proof and condition rationale.
             {
-                const child = ctx.exec_frames.getConstPtr(ctx.frame_index);
+                const child = ctx.exec_frames.topConstPtr();
                 if (!child.u.lua.hasOpenUpvalues() and
                     !child.isDebugHook() and
                     ctx.frame_index > 0 and
                     ctx.frame_index != ctx.boundary_depth)
                 {
-                    const parent_idx = ctx.frame_index - 1;
-                    const parent_c = ctx.exec_frames.getConstPtr(parent_idx);
+                    const parent_c = ctx.exec_frames.parentPtrOfTopConst();
                     if (parent_c.isLua() and
                         parent_c.pending_call_index == INVALID_PENDING and
                         !parent_c.u.lua.hasSimpleResult())
@@ -15140,13 +15191,14 @@ pub const Vm = struct {
                         if (nresults == 0 or nresults < 0) {
                             const dst = child.u.lua.func_slot_base - parent_c.frameBase();
                             // Pop child frame — mirror popBytecodeExecFrame
-                            // (same skip rationale as opReturn1).
-                            const child_m = ctx.exec_frames.getPtr(ctx.frame_index);
+                            // (same skip rationale as opReturn1). T7: stable
+                            // parent reused across the shrink.
+                            const child_m = @constCast(child);
                             child_m.callstatus = 0;
                             self.bc_stack_top = parent_c.frameBase() + parent_c.u.lua.frame_cap;
                             ctx.exec_frames.shrinkTo(ctx.frame_index);
                             // No value to store (opReturn0 returns 0 values).
-                            const parent_m = ctx.exec_frames.getPtr(parent_idx);
+                            const parent_m = @constCast(parent_c);
                             if (nresults < 0) {
                                 // Multret: 0 values → reg_top = dst.
                                 parent_m.reg_top = @intCast(dst);
@@ -15163,12 +15215,13 @@ pub const Vm = struct {
                     {
                         const nresults = decodeNresults(child.callstatus);
                         if (nresults < 0) {
-                            // Pop child frame — same as ordinary fast arm.
-                            const child_m = ctx.exec_frames.getPtr(ctx.frame_index);
+                            // Pop child frame — same as ordinary fast arm
+                            // (T7: stable parent reused across the shrink).
+                            const child_m = @constCast(child);
                             child_m.callstatus = 0;
                             self.bc_stack_top = parent_c.frameBase() + parent_c.u.lua.frame_cap;
                             ctx.exec_frames.shrinkTo(ctx.frame_index);
-                            const parent_m = ctx.exec_frames.getPtr(parent_idx);
+                            const parent_m = @constCast(parent_c);
                             if (parent_m.u.lua.simpleResultIsCompare()) {
                                 // Compare mode: 0 values → false.
                                 const invert = parent_m.u.lua.simpleResultInvert();
@@ -15235,8 +15288,12 @@ pub const Vm = struct {
         const inst = ctx.cur_proto.code[ctx.pc];
         const a: usize = inst.a;
 
+        // P16.20 T6/T7: during a return the executing frame IS the top of
+        // exec_frames (calls push on top; the dispatch loop sets
+        // frame_index = len()-1 at entry). topPtr() = one conditional,
+        // no len()+index arithmetic.
         const has_pending_tbc = self.bc_tbc_regs.items.len >
-            ctx.exec_frames.getPtr(ctx.frame_index).tbc_mark;
+            ctx.exec_frames.topConstPtr().tbc_mark;
         // P15.51l: hooks_active is read from self.hooks_active_cached.
         if (!has_pending_tbc and !self.hooks_active_cached) {
             // P16.2d: inline return fast arm. When the return is a simple
@@ -15262,7 +15319,7 @@ pub const Vm = struct {
             // which is why the multret fast arm is restricted to
             // exactly-1-value opReturn1.
             {
-                const child = ctx.exec_frames.getConstPtr(ctx.frame_index);
+                const child = ctx.exec_frames.topConstPtr();
                 // Condition (a): no open upvalues to close.
                 // Condition (b): !has_pending_tbc (checked above).
                 // Condition (f): no hooks — !hooks_active_cached (above) +
@@ -15287,19 +15344,24 @@ pub const Vm = struct {
                         // 1 result) and nresults<0 (multret with exactly 1
                         // value). Other nresults fall back.
                         if (nresults == 1 or nresults < 0) {
+                            // P16.20 T7: the parent pointer obtained here is
+                            // PROVEN STABLE across the pop sequence below —
+                            // inline slots never move, and shrinkTo only
+                            // decrements counts (heap memory is never
+                            // reallocated by a shrink), so re-fetching the
+                            // parent after shrinkTo (the old 4th lookup) is
+                            // dead work.
+                            const parent_m = @constCast(parent_c);
                             // Read source BEFORE pop (child reg still valid).
                             const src_val = ctx.regs[a];
                             const dst = child.u.lua.func_slot_base - parent_c.frameBase();
                             // Pop child frame — mirror popBytecodeExecFrame
                             // exactly, skipping the parts guarded by fast-arm
-                            // conditions: pending-call cancel (none per (e)),
-                            // in_debug_hook clear (guarded by
-                            // !child.isDebugHook()), tbc_regs shrink (guarded
-                            // by !has_pending_tbc above — tbc_mark == len).
-                            const child_m = ctx.exec_frames.getPtr(ctx.frame_index);
+                            // conditions. The child is the top slot: mutating
+                            // through @constCast(child) is the same object
+                            // getPtr(ctx.frame_index) returned.
+                            const child_m = @constCast(child);
                             child_m.callstatus = 0;
-                            // Restore bc_stack_top to parent's frame capacity
-                            // (parent is Lua per (c) — the !caller.isC() arm).
                             self.bc_stack_top = parent_c.frameBase() + parent_c.u.lua.frame_cap;
                             ctx.exec_frames.shrinkTo(ctx.frame_index);
                             // Single-copy: write return value directly into
@@ -15307,9 +15369,7 @@ pub const Vm = struct {
                             // guaranteed because func_slot_base is within the
                             // parent's window (it's where the function was).
                             self.bc_stack[parent_c.frameBase() + dst] = src_val;
-                            const parent_m = ctx.exec_frames.getPtr(parent_idx);
                             if (nresults < 0) {
-                                // Multret: set reg_top to dst + 1 (1 value).
                                 parent_m.reg_top = @intCast(dst + 1);
                             }
                             parent_m.u.lua.pc += 1;
@@ -15331,12 +15391,13 @@ pub const Vm = struct {
                         const nresults = decodeNresults(child.callstatus);
                         if (nresults < 0) {
                             const src_val = ctx.regs[a];
-                            // Pop child frame — same as ordinary fast arm.
-                            const child_m = ctx.exec_frames.getPtr(ctx.frame_index);
+                            // Pop child frame — same as ordinary fast arm
+                            // (T7: stable parent reused across the shrink).
+                            const child_m = @constCast(child);
                             child_m.callstatus = 0;
                             self.bc_stack_top = parent_c.frameBase() + parent_c.u.lua.frame_cap;
                             ctx.exec_frames.shrinkTo(ctx.frame_index);
-                            const parent_m = ctx.exec_frames.getPtr(parent_idx);
+                            const parent_m = @constCast(parent_c);
                             if (parent_m.u.lua.simpleResultIsCompare()) {
                                 // Compare mode: check truthiness, adjust pc.
                                 const result = isTruthy(src_val);

@@ -501,7 +501,7 @@ pub const BuiltinId = enum(u8) {
     }
 };
 
-const GcAge = enum(u3) {
+const GcAge = enum(u8) {
     new,
     survival,
     old0,
@@ -2164,7 +2164,7 @@ const TestcContState = struct {
 // PUC `LUA_VSHRSTR`); long strings are NOT interned (each a fresh allocation,
 // like PUC `LUA_VLNGSTR`), so equality is pointer-eq only for two short
 // strings — see `luaStringEq`.
-pub const LuaString = struct {
+pub const LuaString = extern struct {
     /// Mutually-exclusive per-variant metadata (P16.16 C3/T6). PUC's own
     /// TString unions the short-string chain link with the long-string
     /// payload (lobject.h: `u.sh.hnext` vs `u.lng.{lnglen,contents,falloc,ud}`);
@@ -2210,7 +2210,8 @@ pub const LuaString = struct {
 
     hash: u64, // content hash, computed once at intern time (random-seeded)
     len: usize,
-    is_short: bool, // <= lua_string_max_short_len => interned (PUC short variant)
+    /// String variant (PUC discriminates via `ts->shrlen`; see StrKind).
+    kind: StrKind = .long,
     /// PUC `marked` byte — tri-color mark bits. See constants above.
     gc_marked: u8 = 0,
     gc_age: GcAge = .new,
@@ -2218,23 +2219,61 @@ pub const LuaString = struct {
     gc_index: u32 = 0,
     meta: Meta = .{ .next = null },
 
-    /// External string support (PUC 5.5 `lua_pushexternalstring` / LSTRMEM).
-    /// When true, the string's content is NOT stored inline after the header
-    /// but lives at `meta.external.ptr`, in memory owned by the caller. The
-    /// string header itself is a normal GC-managed allocation. When the GC
-    /// collects this string, `falloc(ud, ptr, len+1, 0)` is invoked to
-    /// release the external content (PUC lgc.c:874-875), and only then is the
-    /// header freed. External strings are always treated as "long" (never
-    /// interned), matching PUC's `luaS_newextlstr` which always creates a
-    /// `LUA_VLNGSTR` regardless of length.
-    is_external: bool = false,
+    /// PUC 5.5 discriminates string variants via `ts->shrlen`
+    /// (lobject.h): `>= 0` short, `LSTRREG -1`, `LSTRFIX -2`, `LSTRMEM -3`
+    /// — the SAME byte that `luaS_sizelngstr` switches on. We mirror that
+    /// model with one explicit kind enum (single byte, build-mode-stable).
+    /// Replacing the previous `is_short`/`is_external` bool pair also frees
+    /// the last padding byte, so a third discriminant (fixed vs. dealloc
+    /// external) costs no extra size: LuaString stays 48 B.
+    pub const StrKind = enum(u8) {
+        /// Interned short string; content inline after the header.
+        short,
+        /// Regular long string (PUC LSTRREG); content inline after the header.
+        long,
+        /// Fixed external string (PUC LSTRFIX): content owned by the caller
+        /// and never deallocated by us; header TRUNCATED to
+        /// `lstrfix_header_size` (32 B — PUC allocates `offsetof(TString,
+        /// falloc)` for this kind, lstring.c:154-156).
+        ext_fixed,
+        /// External string with deallocation (PUC LSTRMEM): content owned by
+        /// the caller, released via `falloc`; FULL 48 B header.
+        ext_mem,
+    };
+
+    /// PUC `luaS_sizelngstr(0, LSTRFIX)` == `offsetof(TString, falloc)` ==
+    /// 32 B on 64-bit: the LSTRFIX allocation covers the header only up to
+    /// (and excluding) the `falloc` field. Our mirror: meta starts at 24,
+    /// `ExtInfo.falloc` is the first field LSTRFIX never touches.
+    pub const lstrfix_header_size: usize =
+        @offsetOf(LuaString, "meta") + @offsetOf(LuaString.ExtInfo, "falloc");
+
+    /// PUC `isshrstr`: interned short variant (pointer-identity equality,
+    /// intern-table membership). Inline: single compare, same cost as the
+    /// old bool load.
+    pub inline fn isShort(self: *const LuaString) bool {
+        return self.kind == .short;
+    }
+
+    /// Content lives at `meta.external.ptr` instead of inline. True for BOTH
+    /// external kinds (fixed and dealloc) — mirrors PUC `isextstr`.
+    pub inline fn isExternal(self: *const LuaString) bool {
+        return self.kind == .ext_fixed or self.kind == .ext_mem;
+    }
+
+    /// Fixed external string (PUC LSTRFIX): truncated header, no deallocator.
+    /// Must be checked BEFORE any access to `meta.external.falloc`/`ud`,
+    /// which lie beyond the truncated allocation.
+    pub inline fn isFixedExternal(self: *const LuaString) bool {
+        return self.kind == .ext_fixed;
+    }
 
     // Bytes of the string. For a regular string, the content is stored inline
     // right after the header in the same allocation (cache-friendly, one alloc
     // per string). For an external string, the content lives at
     // `meta.external.ptr`.
     pub fn bytes(self: *const LuaString) []const u8 {
-        if (self.is_external) return self.meta.external.ptr[0..self.len];
+        if (self.isExternal()) return self.meta.external.ptr[0..self.len];
         const header: [*]const u8 = @ptrCast(self);
         const body = header + @sizeOf(LuaString);
         return body[0..self.len];
@@ -2249,6 +2288,10 @@ pub const LuaString = struct {
 // build-mode-dependent layout regression fails the build, not the test.
 comptime {
     std.debug.assert(@sizeOf(LuaString) == 48);
+    // LSTRFIX truncated header must equal PUC's offsetof(TString, falloc)
+    // on 64-bit (32 B) and stay strictly inside the full struct.
+    std.debug.assert(LuaString.lstrfix_header_size == 32);
+    std.debug.assert(LuaString.lstrfix_header_size < @sizeOf(LuaString));
 }
 
 // PUC Lua's LUAI_MAXSHORTLEN (lstring.h): strings up to this many bytes are
@@ -2260,7 +2303,7 @@ pub const lua_string_max_short_len: usize = 40;
 //   - two short strings: pointer identity (both interned => same pointer)
 //   - otherwise (at least one long): content compare (length then bytes)
 pub fn luaStringEq(a: *const LuaString, b: *const LuaString) bool {
-    if (a.is_short and b.is_short) return a == b;
+    if (a.isShort() and b.isShort()) return a == b;
     if (a.len != b.len) return false;
     return std.mem.eql(u8, a.bytes(), b.bytes());
 }
@@ -2285,7 +2328,7 @@ pub fn createLuaString(alloc: std.mem.Allocator, raw: []const u8, hash: u64) !*L
     const ls: *LuaString = @ptrCast(@alignCast(buf.ptr));
     ls.hash = hash;
     ls.len = raw.len;
-    ls.is_short = raw.len <= lua_string_max_short_len;
+    ls.kind = if (raw.len <= lua_string_max_short_len) .short else .long;
     ls.gc_marked = 0;
     // Explicitly zero the variant metadata: `bytes()` branches on
     // `is_external`, so it MUST be false for regular inline strings. The
@@ -2293,7 +2336,7 @@ pub fn createLuaString(alloc: std.mem.Allocator, raw: []const u8, hash: u64) !*L
     // uninitialized would make `bytes()` read garbage and potentially
     // dereference a random external pointer. Setting the whole `meta`
     // union to the `next` variant (null) covers both variants.
-    ls.is_external = false;
+    ls.meta = .{ .next = null };
     ls.meta = .{ .next = null };
     const body = buf[@sizeOf(LuaString)..];
     @memcpy(body[0..raw.len], raw);
@@ -2308,7 +2351,23 @@ pub fn createLuaString(alloc: std.mem.Allocator, raw: []const u8, hash: u64) !*L
 // content is released first via the dealloc callback (PUC lgc.c:874-875):
 //   `(*ts->falloc)(ts->ud, ts->contents, ts->u.lnglen + 1, 0);`
 pub fn destroyLuaString(alloc: std.mem.Allocator, ls: *LuaString) void {
-    if (ls.is_external) {
+    if (ls.isFixedExternal()) {
+        // LSTRFIX (fixed external): the header allocation is TRUNCATED to
+        // `lstrfix_header_size` (32 B — PUC luaS_sizelngstr(0, LSTRFIX) =
+        // offsetof(TString, falloc)). Never read `meta.external.falloc`/`ud`
+        // here: those bytes lie beyond the allocation (PUC's free path makes
+        // the same discrimination via `ts->shrlen == LSTRMEM`, lgc.c:873).
+        // Fixed content is caller-owned static memory — no dealloc fires.
+        const buf: [*]align(@alignOf(LuaString)) u8 = @ptrCast(ls);
+        // `_ = &n` keeps the length runtime-known: a comptime length would
+        // turn buf[0..n] into a *[32]u8 (not a slice), which Allocator.free
+        // rejects at comptime.
+        var n: usize = LuaString.lstrfix_header_size;
+        _ = &n;
+        alloc.free(buf[0..n]);
+        return;
+    }
+    if (ls.isExternal()) {
         // External string: invoke the dealloc callback to release the external
         // content, then free only the header (allocated via `alloc.create`).
         // PUC passes `len+1` as the old size (the +1 accounts for the NUL the
@@ -2646,8 +2705,7 @@ test "external string: destroyLuaString invokes falloc and frees header only" {
     ls.* = .{
         .hash = 0,
         .len = 5,
-        .is_short = false,
-        .is_external = true,
+        .kind = .ext_mem,
         .meta = .{ .external = .{
             .ptr = content.ptr,
             .falloc = testFalloc,
@@ -2670,7 +2728,7 @@ test "external string: regular string does NOT invoke falloc" {
     // payload to a non-null falloc to verify the branch is skipped for inline
     // strings (is_external is the sole discriminator).
     const ls = try createLuaString(alloc, "inline", 0);
-    ls.is_external = false; // redundant but explicit — regular string
+    ls.meta = .{ .next = null }; // redundant but explicit — regular string
     ls.meta = .{ .external = .{ .falloc = testFalloc, .ud = @ptrCast(&freed) } };
     destroyLuaString(alloc, ls);
     try std.testing.expect(!freed);
@@ -2685,10 +2743,12 @@ test "external string: createExternalLuaString content readable via bytes()" {
     // static constant array so no falloc is needed (LSTRFIX-like).
     const content = "hello external world";
     const ls = try vm.createExternalLuaString(content.ptr, content.len, null, null);
-    try testing.expect(ls.is_external);
-    try testing.expect(!ls.is_short); // external strings are always "long"
+    try testing.expect(ls.isFixedExternal()); // falloc == null => LSTRFIX
+    try testing.expect(ls.isExternal());
+    try testing.expect(!ls.isShort()); // external strings are always "long"
     try testing.expectEqualStrings(content, ls.bytes());
     try testing.expectEqual(@as(usize, content.len), ls.len);
+    try testing.expectEqual(LuaString.lstrfix_header_size, @as(usize, 32));
 }
 
 pub const Value = union(enum) {
@@ -2811,7 +2871,14 @@ fn gcObjectBytes(obj: GcObject) usize {
         .table => |t| @sizeOf(Table) + t.asize * @sizeOf(Value) + t.hash.len * @sizeOf(ltable.Node),
         .closure => @sizeOf(Closure),
         .thread => @sizeOf(Thread),
-        .string => |s| if (s.is_external) @sizeOf(LuaString) else @sizeOf(LuaString) + s.len,
+        .string => |s| switch (s.kind) {
+            // Charged bytes == actually-allocated bytes (PUC luaC_newobj
+            // charges luaS_sizelngstr per kind): LSTRFIX truncated header,
+            // LSTRMEM full header, regular short/long header + inline content.
+            .ext_fixed => LuaString.lstrfix_header_size,
+            .ext_mem => @sizeOf(LuaString),
+            .short, .long => @sizeOf(LuaString) + s.len,
+        },
         .cell => @sizeOf(Cell),
         .userdata => |u| @sizeOf(Userdata) + u.uservalues.len * @sizeOf(Value) + u.payload.len,
     };
@@ -16741,36 +16808,61 @@ pub const Vm = struct {
         // must give it back by invoking falloc before propagating the error.
         // Without this, the external memory is silently leaked on allocation
         // failure.
-        const ls = self.alloc.create(LuaString) catch |e| {
+        // PUC luaS_newextlstr (lstring.c:308-332) allocates PER KIND:
+        //   LSTRFIX (falloc==null) → luaS_sizelngstr(0, LSTRFIX) = truncated
+        //     header (offsetof(TString, falloc) = 32 B) and only writes
+        //     contents/lnglen/hash — never touches falloc/ud;
+        //   LSTRMEM → full sizeof(TString) header, writes falloc/ud too.
+        // We mirror both the truncated size and the field-wise writes: on a
+        // 32-B allocation, a whole-struct `ls.* = .{...}` assign would write
+        // `meta.external` (24 B, up to offset 48) out of bounds.
+        const fixed = falloc == null;
+        const header_size: usize =
+            if (fixed) LuaString.lstrfix_header_size else @sizeOf(LuaString);
+        const buf = self.alloc.alignedAlloc(
+            u8,
+            std.mem.Alignment.fromByteUnits(@alignOf(LuaString)),
+            header_size,
+        ) catch |e| {
+            // PUC lstring.c:327-330: if header creation fails (OOM), the
+            // caller has already transferred ownership of the external
+            // content to Lua, so Lua must give it back by invoking falloc
+            // before propagating the error. Without this, the external
+            // memory is silently leaked on allocation failure.
             if (falloc) |fa| {
                 _ = fa(ud, @ptrCast(@constCast(content)), len + 1, 0);
             }
             return e;
         };
+        const ls: *LuaString = @ptrCast(@alignCast(buf.ptr));
         // If GC registration fails after the header was allocated, free both
         // the header and the external content (same ownership-transfer logic).
         errdefer {
             if (falloc) |fa| {
                 _ = fa(ud, @ptrCast(@constCast(content)), len + 1, 0);
             }
-            self.alloc.destroy(ls);
+            self.alloc.free(buf);
         }
-        ls.* = .{
-            .hash = h.final(),
-            .len = len,
-            .is_short = false, // external strings are always "long" (PUC VLNGSTR)
-            .is_external = true,
-            .meta = .{ .external = .{
-                .ptr = content,
-                .falloc = falloc,
-                .ud = ud,
-            } },
-        };
+        // Field-wise init: every write below stays within `header_size`.
+        ls.hash = h.final();
+        ls.len = len;
+        // External strings are always "long" (PUC VLNGSTR), never interned.
+        ls.kind = if (fixed) .ext_fixed else .ext_mem;
+        ls.gc_marked = 0;
+        ls.gc_age = .new;
+        ls.gc_index = 0;
+        ls.meta.external.ptr = content; // offset 24 — inside the LSTRFIX prefix
+        if (!fixed) {
+            // LSTRMEM only: falloc/ud live past the LSTRFIX prefix, so these
+            // writes are legal ONLY on the full-header allocation.
+            ls.meta.external.falloc = falloc;
+            ls.meta.external.ud = ud;
+        }
         try self.gcRegisterString(ls);
         // Only the header is owned by the GC; the external content is accounted
-        // for by the caller (and released via `falloc`).
-        self.gcNoteAlloc(@sizeOf(LuaString));
-        self.testcNoteMemory(@sizeOf(LuaString));
+        // for by the caller (and released via `falloc` for LSTRMEM).
+        self.gcNoteAlloc(header_size);
+        self.testcNoteMemory(header_size);
         self.testc_obj_strings += 1;
         return ls;
     }
@@ -22654,7 +22746,11 @@ pub const Vm = struct {
                 // External strings only own the header; regular strings own
                 // header + inline content. `destroyLuaString` handles the
                 // external dealloc callback and frees the right amount.
-                const bytes = if (s.is_external) @sizeOf(LuaString) else @sizeOf(LuaString) + s.len;
+                const bytes = switch (s.kind) {
+                    .ext_fixed => LuaString.lstrfix_header_size,
+                    .ext_mem => @sizeOf(LuaString),
+                    .short, .long => @sizeOf(LuaString) + s.len,
+                };
                 self.gcNoteFree(bytes);
                 destroyLuaString(self.alloc, s);
             },

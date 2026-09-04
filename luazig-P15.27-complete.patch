@@ -1,0 +1,2627 @@
+diff -ruN '--exclude=.zig-cache' '--exclude=zig-out' '--exclude=build' '--exclude=*.o' '--exclude=*.a' '--exclude=luac.out' a/README.md b/README.md
+--- a/README.md	2026-07-13 11:29:52.000000000 +0000
++++ b/README.md	2026-07-13 13:28:45.339649001 +0000
+@@ -77,6 +77,7 @@
+ - `tests/smoke/27_iterative_bytecode_calls.lua`;
+ - `tests/smoke/38_iterative_protected_dispatch.lua`;
+ - `tests/smoke/39_complete_iterative_dispatch.lua`;
++- `tests/smoke/40_large_setlist_extraarg.lua`;
+ - `tests/stress/iterative_dispatch.lua` через
+   `tools/iterative_dispatch_stress.sh`.
+ 
+@@ -84,7 +85,7 @@
+ вложенных `coroutine.resume` с yield/resume, 2000 рекурсивных metamethod
+ вызовов, 1000 вложенных `string.gsub` callbacks и mixed bytecode↔`testC` yield
+ для `CALL`/`TAILCALL`/`TFORCALL`. Полный `cstack.lua` также проходит при
+-1-МБ host stack. Zig unit tests и 39/39 differential smoke проходят. Все
++1-МБ host stack. Zig unit tests и 40/40 differential smoke проходят. Все
+ заявленные 29 upstream suites завершаются успешно на bc VM; точные глубины
+ `C stack overflow` остаются implementation-defined, но semantic assertions
+ совпадают.
+@@ -121,9 +122,47 @@
+ cleanup authority, yieldable continuation kinds и единственная разрешённая
+ точка thread switching.
+ 
+-После hardening повторно пройдены Zig unit tests, 39/39 differential smoke,
+-1-МБ iterative-dispatch stress lane и ровно заявленные 29/29 upstream suites
+-по exit/assertion status.
++После hardening и последующей regression-cleanup фазы повторно пройдены Zig
++unit tests, 40/40 differential smoke, 1-МБ iterative-dispatch stress lane и
++ровно заявленные 29/29 upstream suites по exit/assertion status.
++
++### Выполнено: завершение regression cleanup после P15.26 (P15.27)
++
++WIP-переход на полный iterative dispatch временно открыл несколько независимых
++расхождений parser/codegen/debug runtime. Они исправлены на семантическом
++уровне, без распознавания имён upstream-файлов или test-specific replay:
++
++1. Bytecode codegen корректно эмитит большие `SETLIST + EXTRAARG`, поэтому
++   `verybig.lua` проходит реальную ветку `testing large programs (>64k)`.
++   Быстрый differential regression закреплён в
++   `tests/smoke/40_large_setlist_extraarg.lua`.
++2. Восстановлены lexical invariants для `goto`/labels, named vararg и Lua 5.5
++   global attributes; устранены overflow/diagnostic-buffer ошибки на больших
++   constant/register indices и syntax-error paths.
++3. Source line metadata теперь хранит call/operator lines в AST и размечает
++   loop backedges, многострочные expressions, synthetic register cleanup и
++   `VARARGPREP` так же, как PUC-visible line table. Line hooks используют
++   реальный previous-PC/previous-line state вместо удалённого preseed,
++   завязанного на ожидаемый trace.
++4. Debug-hook continuation явно владеет `saved_parent_callee` как GC root.
++   Раньше full GC внутри hook мог освободить closure активного parent frame, а
++   завершение hook возвращало dangling pointer в `RuntimeFrame.callee`.
++   Threads теперь sweep'ятся раньше closures, чтобы parked frames не сохраняли
++   даже промежуточные ссылки на уже освобождённые closure storage.
++5. `load` инициализирует environment первого upvalue main closure независимо
++   от наличия имени `_ENV`. Это сохраняет исполняемость stripped chunks, где
++   debug names удалены, но bytecode/upvalue layout остаётся прежним.
++6. `tests/smoke/31_debug_bytecode_parity.lua` расширен двумя регрессиями:
++   GC внутри line hook сохраняет parent activation, а stripped main chunk
++   получает рабочий environment.
++
++Подтверждённые проверки для Zig 0.16.0:
++
++- `zig build test -Doptimize=Debug` — PASS;
++- differential smoke — 40/40 PASS;
++- iterative dispatch stress под 1-МБ host stack — PASS;
++- заявленная upstream matrix — 29/29 PASS;
++- direct `verybig.lua` без `_soft` — `+`, `OK`.
+ 
+ ### TODO: настоящие инкрементальные GC phases (PUC-first)
+ 
+@@ -576,5 +615,6 @@
+ - P15.24: iterative protected dispatch — bytecode targets `pcall`/`xpcall` и bytecode error handlers больше не вызывают вложенный `runBytecode`. Protected state (saved error, handler phase/depth and result continuation) хранится в `BytecodePendingCall`; общий dispatch loop ловит runtime error, unwind'ит только failed child suffix и продолжает ближайший protected caller. Yield внутри protected call сохраняет тот же thread-owned frame stack. `TFORCALL` к bytecode-итератору также переведён на explicit child frame. Teardown abandoned coroutine освобождает parked protected state без подмены текущей ошибки VM. Исправлена обнаруженная этим переходом dangling-ссылка в builtin `error()`: fallback теперь копирует сообщение в стабильный VM buffer. Smoke `38_iterative_protected_dispatch.lua` покрывает глубокие обычные и tail-position `pcall`/`xpcall`, yield/resume, Lua iterator и сборку abandoned protected coroutines; explicit protected depth принадлежит конкретному `Thread`, поэтому parked coroutines не делят глобальный лимит. Unit tests, 38/38 smoke и `calls.lua` с 1-МБ host stack проходят. Открыты metamethod/hook/`__close`/nested-resume actions.
+ - P15.25: complete iterative bytecode dispatch — Lua metamethods, debug hooks, yielding `__close`, nested `coroutine.resume` и `string.gsub` Lua callbacks переведены на `BytecodePendingCompletion`/thread-owned continuations. Persistent unwind продолжает close chain после yield и ошибок; coroutine trampoline переключает parked `Thread` через `ThreadSwitch` без Zig recursion. Bytecode snapshot/replay удалён; `IrSuspendedFrame` остался только у frozen IR compatibility children и связан с bc caller через explicit pending continuation. Удалён 256-МБ interpreter thread stack. `hasActiveClose()` синхронизирует tail-call policy с PUC Lua для named и generic-for TBC slots. Добавлены smoke `39_complete_iterative_dispatch.lua` и 1-МБ stress lane. Unit tests, 39/39 smoke, полный `cstack.lua` под 1-МБ stack и 29/29 upstream suites по exit/assertion status проходят.
+ - P15.26: dispatch review hardening — повторно подтверждён PUC-order hidden generic-for TBC (`return` expression вычисляется до iterator `__close`, результат `false true`); `ThreadSwitch` удалён из публичного `Vm.Error` и локализован в private `DispatchError`/coroutine trampoline; `api.zig` больше не знает о внутреннем сигнале. Рядом с pending continuation state документированы ownership, cleanup, yield и thread-switch invariants. После рефакторинга повторно проходят unit tests, 39/39 smoke, 1-МБ stress lane и 29/29 upstream suites.
++- P15.27: завершение regression cleanup после iterative dispatch — исправлены large `SETLIST + EXTRAARG`, lexical `goto`/global-attribute/named-vararg semantics, source line tables и PUC-like line-hook `oldpc`; удалён trace preseed. `saved_parent_callee` debug-hook continuation добавлен в GC roots, а stripped `load` всегда инициализирует первый environment upvalue. Расширен smoke `31_debug_bytecode_parity.lua`; `40_large_setlist_extraarg.lua` закрепляет `verybig` codegen. Подтверждены unit tests, 40/40 smoke, 1-МБ stress, 29/29 upstream matrix и direct `verybig.lua`.
+ 
+ Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).
+diff -ruN '--exclude=.zig-cache' '--exclude=zig-out' '--exclude=build' '--exclude=*.o' '--exclude=*.a' '--exclude=luac.out' a/lua-5.5.0/testes/time.txt b/lua-5.5.0/testes/time.txt
+--- a/lua-5.5.0/testes/time.txt	2026-07-13 11:29:52.000000000 +0000
++++ b/lua-5.5.0/testes/time.txt	1970-01-01 00:00:00.000000000 +0000
+@@ -1 +0,0 @@
+-0.411092
+\ No newline at end of file
+diff -ruN '--exclude=.zig-cache' '--exclude=zig-out' '--exclude=build' '--exclude=*.o' '--exclude=*.a' '--exclude=luac.out' a/src/lua/ast.zig b/src/lua/ast.zig
+--- a/src/lua/ast.zig	2026-07-13 11:29:52.000000000 +0000
++++ b/src/lua/ast.zig	2026-07-13 12:25:03.864666208 +0000
+@@ -173,8 +173,8 @@
+         Field: struct { object: *Exp, name: Name },
+         Index: struct { object: *Exp, index: *Exp },
+ 
+-        Call: struct { func: *Exp, args: []*Exp },
+-        MethodCall: struct { receiver: *Exp, method: Name, args: []*Exp },
++        Call: struct { func: *Exp, args: []*Exp, call_line: u32 = 0 },
++        MethodCall: struct { receiver: *Exp, method: Name, args: []*Exp, call_line: u32 = 0 },
+     };
+ };
+ 
+diff -ruN '--exclude=.zig-cache' '--exclude=zig-out' '--exclude=build' '--exclude=*.o' '--exclude=*.a' '--exclude=luac.out' a/src/lua/bytecode.zig b/src/lua/bytecode.zig
+--- a/src/lua/bytecode.zig	2026-07-13 11:29:52.000000000 +0000
++++ b/src/lua/bytecode.zig	2026-07-13 12:05:19.043208330 +0000
+@@ -204,6 +204,7 @@
+     varargprep, // first instruction of a vararg function; adjusts varargs
+ 
+     // --- Error ---
++    errdefined, // raise if R[A] != nil (global initialization redefinition)
+     errnnil, // raise error if R[A] == nil (declared global is nil)
+ 
+     // --- Extended argument ---
+diff -ruN '--exclude=.zig-cache' '--exclude=zig-out' '--exclude=build' '--exclude=*.o' '--exclude=*.a' '--exclude=luac.out' a/src/lua/codegen_bc.zig b/src/lua/codegen_bc.zig
+--- a/src/lua/codegen_bc.zig	2026-07-13 11:29:52.000000000 +0000
++++ b/src/lua/codegen_bc.zig	2026-07-13 12:55:42.528580657 +0000
+@@ -31,7 +31,11 @@
+     alloc: std.mem.Allocator,
+ 
+     diag: ?Diag = null,
++    /// Formatting a final diagnostic and constructing a formatted diagnostic
++    /// message must use disjoint storage: std.fmt rejects overlapping memcpy,
++    /// and the message remains borrowed by `Diag` until the caller prints it.
+     diag_buf: [256]u8 = undefined,
++    diag_msg_buf: [256]u8 = undefined,
+ 
+     // --- Register allocation (PUC freereg model) ---
+     /// Next available register. Registers 0..nvarstack-1 hold locals;
+@@ -70,7 +74,15 @@
+     /// scope compatibility. Sibling scopes get different IDs even at
+     /// the same depth, preventing cross-branch goto resolution.
+     scope_ids: std.ArrayListUnmanaged(usize) = .empty,
+-    scope_counter: usize = 0,
++    /// Parent relation for lexical scope IDs. Scope IDs are never reused, so
++    /// a pending goto can retain its origin scope after that scope is popped.
++    scope_parent_by_id: std.ArrayListUnmanaged(usize) = .empty,
++    scope_counter: usize = 1,
++    /// Local declarations that a forward goto is not allowed to jump over.
++    /// The log is append-only for the duration of one function compilation,
++    /// matching PUC's active-local guard checks during label resolution.
++    jump_guards: std.ArrayListUnmanaged(JumpGuard) = .empty,
++    label_has_code_after: bool = true,
+ 
+     // --- Lua 5.5 global declarations ---
+     // A `global x` declaration is lexical: inside that scope, `x` must resolve
+@@ -80,6 +92,8 @@
+     declared_globals: std.StringHashMapUnmanaged(u32) = .{},
+     declared_globals_log: std.ArrayListUnmanaged([]const u8) = .empty,
+     declared_globals_depth_log: std.ArrayListUnmanaged(usize) = .empty,
++    global_attrs: std.StringHashMapUnmanaged(bool) = .{},
++    global_attr_log: std.ArrayListUnmanaged(GlobalAttrLog) = .empty,
+     global_scope_marks: std.ArrayListUnmanaged(GlobalScopeMark) = .empty,
+ 
+     // --- Upvalues / closures ---
+@@ -114,6 +128,13 @@
+         wildcard_const: bool,
+         decl_log_len: usize,
+         decl_depth_log_len: usize,
++        attr_log_len: usize,
++    };
++
++    const GlobalAttrLog = struct {
++        name: []const u8,
++        had_prev: bool,
++        prev: bool = false,
+     };
+ 
+     /// A jump slot is a pending jump that needs backpatching (break target).
+@@ -133,8 +154,10 @@
+         pc: u32,
+         close_pc: u32,
+         name: []const u8,
++        span: ast.Span,
+         depth: usize,
+         scope_id: usize,
++        guard_len: usize,
+         close_reg: ?u8 = null,
+         resolved: bool = false,
+     };
+@@ -143,11 +166,18 @@
+     const ActiveLabel = struct {
+         name: []const u8,
+         pc: u32,
++        line: u32,
+         depth: usize,
+         scope_id: usize,
+         binding_mark: usize,
+     };
+ 
++    const JumpGuard = struct {
++        name: []const u8,
++        depth: usize,
++        scope_id: usize,
++    };
++
+     pub const Error = std.mem.Allocator.Error || error{ CodegenError, ConstantPoolOverflow };
+ 
+     // -----------------------------------------------------------------------
+@@ -178,7 +208,7 @@
+     }
+ 
+     fn setDiagFmt(self: *Codegen, span: ast.Span, comptime fmt: []const u8, args: anytype) void {
+-        const msg = std.fmt.bufPrint(self.diag_buf[0..], fmt, args) catch "code generation error";
++        const msg = std.fmt.bufPrint(self.diag_msg_buf[0..], fmt, args) catch "code generation error";
+         self.setDiag(span, msg);
+     }
+ 
+@@ -188,11 +218,12 @@
+ 
+     /// Reserve n registers starting at freereg. Updates maxstacksize.
+     fn reserveRegs(self: *Codegen, n: u8) Error!void {
+-        const new_top = self.freereg + n;
+-        if (new_top > 255) {
++        const new_top_wide = @as(u16, self.freereg) + @as(u16, n);
++        if (new_top_wide > 255) {
+             self.setDiag(.{ .start = 0, .end = 0, .line = self.line_hint, .col = 0 }, "too many registers");
+             return error.CodegenError;
+         }
++        const new_top: u8 = @intCast(new_top_wide);
+         self.freereg = new_top;
+         if (new_top > self.peak_freereg) self.peak_freereg = new_top;
+         self.builder.checkStack(self.freereg);
+@@ -237,7 +268,10 @@
+     fn resetRegs(self: *Codegen) void {
+         if (self.peak_freereg > self.nvarstack) {
+             const count = self.peak_freereg - self.nvarstack;
+-            _ = self.builder.emitABC(.loadnil, self.nvarstack, count - 1, 0, self.line_hint) catch @panic("oom");
++            // Register clearing is an internal GC-liveness operation, not a
++            // Lua source instruction. A zero line keeps it invisible to line
++            // hooks while debug.currentline retains the last source line.
++            _ = self.builder.emitABC(.loadnil, self.nvarstack, count - 1, 0, 0) catch @panic("oom");
+         }
+         self.freereg = self.nvarstack;
+         self.peak_freereg = self.nvarstack;
+@@ -251,16 +285,42 @@
+         try self.scope_marks.append(self.alloc, self.bindings.items.len);
+         try self.scope_close_regs.append(self.alloc, null);
+         try self.label_scope_marks.append(self.alloc, self.active_labels.items.len);
+-        try self.scope_ids.append(self.alloc, self.scope_counter);
++
++        const scope_id = self.scope_counter;
+         self.scope_counter += 1;
++        const parent_id = if (self.scope_ids.items.len == 0)
++            0
++        else
++            self.scope_ids.items[self.scope_ids.items.len - 1];
++        while (self.scope_parent_by_id.items.len <= scope_id) {
++            try self.scope_parent_by_id.append(self.alloc, 0);
++        }
++        self.scope_parent_by_id.items[scope_id] = parent_id;
++        try self.scope_ids.append(self.alloc, scope_id);
+         try self.global_scope_marks.append(self.alloc, .{
+             .mode = self.strict_globals_mode,
+             .wildcard_const = self.strict_globals_wildcard_const,
+             .decl_log_len = self.declared_globals_log.items.len,
+             .decl_depth_log_len = self.declared_globals_depth_log.items.len,
++            .attr_log_len = self.global_attr_log.items.len,
+         });
+     }
+ 
++    fn currentScopeId(self: *const Codegen) usize {
++        if (self.scope_ids.items.len == 0) return 0;
++        return self.scope_ids.items[self.scope_ids.items.len - 1];
++    }
++
++    fn scopeIsDescendantOrSame(self: *const Codegen, child_scope_id: usize, ancestor_scope_id: usize) bool {
++        var current = child_scope_id;
++        while (current != 0) {
++            if (current == ancestor_scope_id) return true;
++            if (current >= self.scope_parent_by_id.items.len) break;
++            current = self.scope_parent_by_id.items[current];
++        }
++        return ancestor_scope_id == 0;
++    }
++
+     fn mergeCloseReg(dst: *?u8, candidate: ?u8) void {
+         const reg = candidate orelse return;
+         if (dst.* == null or reg < dst.*.?) dst.* = reg;
+@@ -329,6 +389,17 @@
+         }
+         self.declared_globals_log.items.len = mark.decl_log_len;
+         self.declared_globals_depth_log.items.len = mark.decl_depth_log_len;
++        var attr_index = self.global_attr_log.items.len;
++        while (attr_index > mark.attr_log_len) {
++            attr_index -= 1;
++            const entry = self.global_attr_log.items[attr_index];
++            if (entry.had_prev) {
++                self.global_attrs.put(self.alloc, entry.name, entry.prev) catch @panic("oom");
++            } else {
++                _ = self.global_attrs.remove(entry.name);
++            }
++        }
++        self.global_attr_log.items.len = mark.attr_log_len;
+         self.strict_globals_mode = mark.mode;
+         self.strict_globals_wildcard_const = mark.wildcard_const;
+     }
+@@ -348,6 +419,71 @@
+         self.strict_globals_wildcard_const = readonly;
+     }
+ 
++    fn declareGlobalAttr(self: *Codegen, name: []const u8, readonly: bool) Error!void {
++        const previous = self.global_attrs.get(name);
++        try self.global_attr_log.append(self.alloc, .{
++            .name = name,
++            .had_prev = previous != null,
++            .prev = previous orelse false,
++        });
++        try self.global_attrs.put(self.alloc, name, readonly);
++    }
++
++    fn isConstGlobal(self: *const Codegen, name: []const u8) bool {
++        var current: ?*const Codegen = self;
++        while (current) |codegen| {
++            if (codegen.global_attrs.get(name)) |readonly| return readonly;
++            if (codegen.strict_globals_mode == .wildcard) return codegen.strict_globals_wildcard_const;
++            current = codegen.outer;
++        }
++        return false;
++    }
++
++    fn isGlobalAllowed(self: *const Codegen, name: []const u8) bool {
++        if (std.mem.eql(u8, name, "_ENV") or std.mem.eql(u8, name, "_G")) return true;
++        const builtins = [_][]const u8{
++            "assert",  "collectgarbage", "dofile",       "error",     "getmetatable",
++            "ipairs",  "load",           "loadfile",     "next",      "pairs",
++            "pcall",   "print",          "rawequal",     "rawget",    "rawset",
++            "require", "select",         "setmetatable", "tonumber",  "tostring",
++            "type",    "warn",           "xpcall",       "coroutine", "debug",
++            "io",      "math",           "os",           "package",   "string",
++            "table",   "utf8",
++        };
++        for (builtins) |builtin| {
++            if (std.mem.eql(u8, name, builtin)) return true;
++        }
++
++        var current: ?*const Codegen = self;
++        var saw_strict = false;
++        while (current) |codegen| {
++            switch (codegen.strict_globals_mode) {
++                .wildcard => return true,
++                .strict => {
++                    saw_strict = true;
++                    if (codegen.declared_globals.contains(name)) return true;
++                },
++                .legacy => {},
++            }
++            current = codegen.outer;
++        }
++        return !saw_strict;
++    }
++
++    fn checkDeclaredGlobal(self: *Codegen, span: ast.Span, name: []const u8) Error!void {
++        if (self.isGlobalAllowed(name)) return;
++        self.setDiagFmt(span, "variable '{s}' is not declared", .{name});
++        return error.CodegenError;
++    }
++
++    fn appendJumpGuard(self: *Codegen, name: []const u8) Error!void {
++        try self.jump_guards.append(self.alloc, .{
++            .name = name,
++            .depth = self.scope_marks.items.len,
++            .scope_id = self.currentScopeId(),
++        });
++    }
++
+     fn popScope(self: *Codegen) void {
+         const scope_count = self.scope_marks.items.len;
+         std.debug.assert(scope_count > 0);
+@@ -471,6 +607,7 @@
+             .depth = self.scope_marks.items.len,
+             .locvar_index = locvar_index,
+         });
++        if (name.len != 0) try self.appendJumpGuard(name);
+     }
+ 
+     /// Declare a local variable in the next available register.
+@@ -560,6 +697,21 @@
+     // Upvalue management
+     // -----------------------------------------------------------------------
+ 
++    fn nextUpvalueIndex(self: *Codegen) Error!u8 {
++        // Lua bytecode reserves one byte for an upvalue index and limits a
++        // function to 255 upvalues (indices 0..254). Diagnose the source
++        // construct instead of letting @intCast panic at the boundary.
++        if (self.upvalue_descs.items.len >= 255) {
++            self.setDiagFmt(
++                .{ .start = 0, .end = 0, .line = self.line_hint, .col = 0 },
++                "too many upvalues (limit is 255) in function at line {d}",
++                .{self.builder.line_defined},
++            );
++            return error.CodegenError;
++        }
++        return @intCast(self.upvalue_descs.items.len);
++    }
++
+     fn ensureUpvalue(self: *Codegen, name: []const u8) Error!u8 {
+         if (self.upvalues.get(name)) |idx| return idx;
+         // Walk up the closure chain to find the variable.
+@@ -568,7 +720,7 @@
+                 // Capture from outer's register.
+                 outer.captured_regs.put(outer.alloc, reg, {}) catch @panic("oom");
+                 const is_const = outer.isReadonlyLocal(reg);
+-                const idx: u8 = @intCast(self.upvalue_descs.items.len);
++                const idx = try self.nextUpvalueIndex();
+                 try self.upvalue_descs.append(self.alloc, .{
+                     .instack = true,
+                     .idx = reg,
+@@ -582,7 +734,7 @@
+             // Try outer's upvalues.
+             if (outer.upvalues.get(name)) |outer_idx| {
+                 const is_const = outer.isConstUpvalue(outer_idx);
+-                const idx: u8 = @intCast(self.upvalue_descs.items.len);
++                const idx = try self.nextUpvalueIndex();
+                 try self.upvalue_descs.append(self.alloc, .{
+                     .instack = false,
+                     .idx = outer_idx,
+@@ -599,7 +751,7 @@
+             // that references outer's upvalue (instack=false).
+             const outer_idx = try outer.ensureUpvalue(name);
+             const is_const = outer.isConstUpvalue(outer_idx);
+-            const idx: u8 = @intCast(self.upvalue_descs.items.len);
++            const idx = try self.nextUpvalueIndex();
+             try self.upvalue_descs.append(self.alloc, .{
+                 .instack = false,
+                 .idx = outer_idx,
+@@ -768,12 +920,14 @@
+                 return self.genExp(inner);
+             },
+             .BinOp => |n| {
+-                if (n.op == .And) return self.genAndExp(n.lhs, n.rhs, e.span.line);
+-                if (n.op == .Or) return self.genOrExp(n.lhs, n.rhs, e.span.line);
+-                return self.genBinOp(n, e.span.line);
++                const op_line = if (n.op_line != 0) n.op_line else e.span.line;
++                if (n.op == .And) return self.genAndExp(n.lhs, n.rhs, op_line);
++                if (n.op == .Or) return self.genOrExp(n.lhs, n.rhs, op_line);
++                return self.genBinOp(n, op_line);
+             },
+             .UnOp => |n| {
+-                return self.genUnOp(n, e.span.line);
++                const op_line = if (n.op_line != 0) n.op_line else e.span.line;
++                return self.genUnOp(n, op_line);
+             },
+             .Field => |n| {
+                 // t.k  →  GETFIELD R[dst] R[t] K[k]
+@@ -862,6 +1016,7 @@
+         // name to be global before upvalue lookup. In particular, this keeps a
+         // recursive `global function f()` from capturing an outer local `f`.
+         if (self.isForcedGlobalName(name)) {
++            try self.checkDeclaredGlobal(span, name);
+             const dst = try self.allocReg();
+             const name_kid = try self.builder.internString(name);
+             try self.emitGlobalGet(dst, name_kid, span.line);
+@@ -881,6 +1036,7 @@
+                 return dst;
+             } else |_| {}
+         }
++        try self.checkDeclaredGlobal(span, name);
+         // Global: R[A] = _ENV[name]. When a `local _ENV` is in scope it
+         // shadows the _ENV upvalue (PUC Lua singlevar() semantics), so
+         // emitGlobalGet indexes the local register instead of the upvalue.
+@@ -947,6 +1103,21 @@
+         }
+     }
+ 
++    /// Reject initialization of an already-defined global. Lua 5.5 global
++    /// declarations with an initializer are definitions, not assignments:
++    /// any existing non-nil value (including false) is a runtime error.
++    fn emitGlobalDefinitionGuard(self: *Codegen, name_kid: u32, line: u32) Error!void {
++        const current_reg = try self.allocReg();
++        defer self.freeReg(current_reg);
++        try self.emitGlobalGet(current_reg, name_kid, line);
++        if (name_kid < 255) {
++            _ = try self.builder.emitABC(.errdefined, current_reg, @intCast(name_kid + 1), 0, line);
++        } else {
++            _ = try self.builder.emitABC(.errdefined, current_reg, 0, 0, line);
++            _ = try self.builder.emit(Instruction.extra(name_kid), line);
++        }
++    }
++
+     /// Emit GETTABUP: R[A] = UpVal[B][K[C]].
+     /// If C > 255, uses GETTABUP + EXTRAARG.
+     fn emitGetTabUp(self: *Codegen, dst: u8, upval_idx: u8, kid: u32, line: u32) Error!void {
+@@ -984,6 +1155,11 @@
+ 
+     fn emitSetName(self: *Codegen, span: ast.Span, name: []const u8, val_reg: u8) Error!void {
+         if (self.isForcedGlobalName(name)) {
++            try self.checkDeclaredGlobal(span, name);
++            if (self.isConstGlobal(name)) {
++                self.setDiagFmt(span, "attempt to assign to const variable '{s}'", .{name});
++                return error.CodegenError;
++            }
+             const kid = try self.builder.internString(name);
+             try self.emitGlobalSet(kid, val_reg, span.line);
+             return;
+@@ -1004,6 +1180,11 @@
+             _ = try self.builder.emitABC(.setupval, val_reg, idx, 0, span.line);
+             return;
+         }
++        try self.checkDeclaredGlobal(span, name);
++        if (self.isConstGlobal(name)) {
++            self.setDiagFmt(span, "attempt to assign to const variable '{s}'", .{name});
++            return error.CodegenError;
++        }
+         const kid = try self.builder.internString(name);
+         try self.emitGlobalSet(kid, val_reg, span.line);
+     }
+@@ -1041,8 +1222,16 @@
+     }
+ 
+     fn genBinOp(self: *Codegen, n: anytype, line: u32) Error!u8 {
+-        // Compile operands into consecutive registers.
++        // PUC discharges the left expression when it sees the infix operator,
++        // so instructions materializing that operand carry the operator line.
++        // This matters for line hooks when a binary expression spans large
++        // source gaps (the official db.lua suite checks this explicitly).
++        const lhs_start_pc: usize = @intCast(self.builder.pc());
+         const lhs = try self.genExp(n.lhs);
++        const lhs_end_pc: usize = @intCast(self.builder.pc());
++        for (self.builder.lineinfo.items[lhs_start_pc..lhs_end_pc]) |*inst_line| {
++            inst_line.* = line;
++        }
+         const rhs = try self.genExp(n.rhs);
+ 
+         // Arithmetic / bitwise: emit register/register op.
+@@ -1175,10 +1364,47 @@
+             if (i < raw.len and raw[i] == '[') {
+                 const close_len = eqs + 2;
+                 if (raw.len >= i + 1 + close_len) {
+-                    const start = i + 1;
+-                    // Skip first newline if present.
+-                    const s = if (start < raw.len and raw[start] == '\n') start + 1 else if (start + 1 < raw.len and raw[start] == '\r' and raw[start + 1] == '\n') start + 2 else start;
+-                    return raw[s .. raw.len - close_len];
++                    const close_start = raw.len - close_len;
++                    var content_start = i + 1;
++                    // Lua ignores one initial line break and normalizes every
++                    // line break inside a long string to a single '\n'.
++                    if (content_start < close_start and
++                        (raw[content_start] == '\n' or raw[content_start] == '\r'))
++                    {
++                        const first = raw[content_start];
++                        content_start += 1;
++                        if (content_start < close_start) {
++                            const next = raw[content_start];
++                            if ((first == '\n' and next == '\r') or
++                                (first == '\r' and next == '\n'))
++                            {
++                                content_start += 1;
++                            }
++                        }
++                    }
++                    const body = raw[content_start..close_start];
++                    if (std.mem.indexOfAny(u8, body, "\r\n") == null) return body;
++
++                    var normalized: std.ArrayListUnmanaged(u8) = .empty;
++                    var body_index: usize = 0;
++                    while (body_index < body.len) {
++                        const ch = body[body_index];
++                        if (ch == '\n' or ch == '\r') {
++                            try normalized.append(self.alloc, '\n');
++                            if (body_index + 1 < body.len) {
++                                const next = body[body_index + 1];
++                                if ((ch == '\n' and next == '\r') or
++                                    (ch == '\r' and next == '\n'))
++                                {
++                                    body_index += 1;
++                                }
++                            }
++                        } else {
++                            try normalized.append(self.alloc, ch);
++                        }
++                        body_index += 1;
++                    }
++                    return try normalized.toOwnedSlice(self.alloc);
+                 }
+             }
+             return raw;
+@@ -1340,8 +1566,15 @@
+                             try buf.append(self.alloc, @intCast(0x80 | (cp & 0x3F)));
+                         }
+                     },
+-                    '\n' => pos += 1, // line continuation
++                    '\n' => {
++                        // PUC normalizes an escaped physical newline to one
++                        // '\n' byte in the resulting short string.
++                        try buf.append(self.alloc, '\n');
++                        pos += 1;
++                        if (pos < inner.len and inner[pos] == '\r') pos += 1;
++                    },
+                     '\r' => {
++                        try buf.append(self.alloc, '\n');
+                         pos += 1;
+                         if (pos < inner.len and inner[pos] == '\n') pos += 1;
+                     },
+@@ -1374,6 +1607,7 @@
+             .Call => |c| c,
+             else => unreachable,
+         };
++        const call_line = if (call_node.call_line != 0) call_node.call_line else line;
+ 
+         // Compile function expression into a register.
+         const func_reg = try self.genExp(call_node.func);
+@@ -1432,7 +1666,7 @@
+             -1 => 0, // all results (set top)
+             else => @intCast(nresults + 1),
+         };
+-        _ = try self.builder.emitABC(.call, func_reg, b, c, line);
++        _ = try self.builder.emitABC(.call, func_reg, b, c, call_line);
+ 
+         // After CALL, set freereg to cover the results.
+         if (nresults > 0) {
+@@ -1458,6 +1692,7 @@
+             .MethodCall => |m| m,
+             else => unreachable,
+         };
++        const call_line = if (mc.call_line != 0) mc.call_line else line;
+ 
+         // Compile receiver.
+         const obj_reg = try self.genExp(mc.receiver);
+@@ -1465,15 +1700,15 @@
+         // SELF: R[obj_reg+1] = R[obj_reg]; R[obj_reg] = R[obj_reg][K[method]]
+         const kid = try self.builder.internString(mc.method.slice(self.source));
+         if (kid <= 255) {
+-            _ = try self.builder.emitABC(.self, obj_reg, obj_reg, @intCast(kid), line);
++            _ = try self.builder.emitABC(.self, obj_reg, obj_reg, @intCast(kid), call_line);
+         } else {
+             // Fallback: load method string, gettable, move self.
+             const key = try self.allocReg();
+-            try self.emitLoadK(key, kid, line);
++            try self.emitLoadK(key, kid, call_line);
+             const method_reg = try self.allocReg();
+-            _ = try self.builder.emitABC(.gettable, method_reg, obj_reg, key, line);
+-            _ = try self.builder.emitABC(.move, obj_reg + 1, obj_reg, 0, line);
+-            _ = try self.builder.emitABC(.move, obj_reg, method_reg, 0, line);
++            _ = try self.builder.emitABC(.gettable, method_reg, obj_reg, key, call_line);
++            _ = try self.builder.emitABC(.move, obj_reg + 1, obj_reg, 0, call_line);
++            _ = try self.builder.emitABC(.move, obj_reg, method_reg, 0, call_line);
+             self.freeReg2(method_reg, key);
+         }
+         self.freereg = obj_reg + 2;
+@@ -1506,7 +1741,7 @@
+             -1 => 0,
+             else => @intCast(nresults + 1),
+         };
+-        _ = try self.builder.emitABC(.call, obj_reg, b, c, line);
++        _ = try self.builder.emitABC(.call, obj_reg, b, c, call_line);
+ 
+         // Keep register accounting identical to ordinary calls.  A method
+         // call in a fixed-width multi-result context (for example,
+@@ -1652,6 +1887,21 @@
+         return line;
+     }
+ 
++    /// Last source line containing a token inside `span`. Parser statement
++    /// spans may extend through trailing whitespace up to the next token/EOF;
++    /// PUC attaches an implicit main-chunk RETURN to the final statement, not
++    /// to those trailing blank lines.
++    fn spanLastTokenLine(self: *const Codegen, span: ast.Span) u32 {
++        var end = span.end;
++        while (end > span.start and std.ascii.isWhitespace(self.source[end - 1])) end -= 1;
++        return self.spanLastLine(.{
++            .start = span.start,
++            .end = end,
++            .line = span.line,
++            .col = span.col,
++        });
++    }
++
+     // -----------------------------------------------------------------------
+     // Closures / function definitions
+     // -----------------------------------------------------------------------
+@@ -1715,7 +1965,7 @@
+         // For child functions, _ENV is lazily created when a global name
+         // is first encountered, matching PUC Lua's singlevaraux behavior.
+         if (self.outer == null) {
+-            const idx: u8 = @intCast(self.upvalue_descs.items.len);
++            const idx = try self.nextUpvalueIndex();
+             try self.upvalue_descs.append(self.alloc, .{
+                 .instack = true,
+                 .idx = 0,
+@@ -1740,6 +1990,7 @@
+             if (va.name) |va_name| {
+                 // The vararg table goes in a register after params.
+                 const va_reg = try self.declareLocal(va_name.slice(self.source));
++                self.markReadonlyLocal(va_reg);
+                 self.builder.vararg_table_reg = va_reg;
+             }
+             // Emit VARARGPREP as first instruction.
+@@ -1912,32 +2163,29 @@
+             },
+             .Goto => |n| {
+                 const name = n.label.slice(self.source);
+-                // Search active labels from innermost outward.
+-                var found: ?u32 = null;
++                const current_scope_id = self.currentScopeId();
++
++                // A backward goto may target only a label visible from the
++                // current lexical scope. In particular, labels from a sibling
++                // block must not survive merely because they have the same
++                // numeric nesting depth.
++                var label: ?ActiveLabel = null;
+                 var i = self.active_labels.items.len;
+                 while (i > 0) {
+                     i -= 1;
+-                    if (std.mem.eql(u8, self.active_labels.items[i].name, name)) {
+-                        found = self.active_labels.items[i].pc;
+-                        break;
+-                    }
++                    const candidate = self.active_labels.items[i];
++                    if (!std.mem.eql(u8, candidate.name, name)) continue;
++                    if (!self.scopeIsDescendantOrSame(current_scope_id, candidate.scope_id)) continue;
++                    label = candidate;
++                    break;
+                 }
+-                if (found) |target_pc| {
+-                    const label = blk: {
+-                        var j = self.active_labels.items.len;
+-                        while (j > 0) {
+-                            j -= 1;
+-                            if (std.mem.eql(u8, self.active_labels.items[j].name, name)) break :blk self.active_labels.items[j];
+-                        }
+-                        break :blk null;
+-                    };
+-                    if (label) |lbl| {
+-                        if (self.closeRegForActiveLabel(lbl)) |first_reg| {
+-                            _ = try self.builder.emitABC(.close, first_reg, 0, 0, st.span.line);
+-                        }
++
++                if (label) |target| {
++                    if (self.closeRegForActiveLabel(target)) |first_reg| {
++                        _ = try self.builder.emitABC(.close, first_reg, 0, 0, st.span.line);
+                     }
+                     const jmp_pc = try self.emitJump(st.span.line);
+-                    self.patchJumpTo(jmp_pc, target_pc);
++                    self.patchJumpTo(jmp_pc, target.pc);
+                 } else {
+                     // Reserve a patchable no-op before the actual jump. JMP 0
+                     // falls through; if resolving the label proves that the
+@@ -1948,8 +2196,10 @@
+                         .pc = jmp_pc,
+                         .close_pc = close_pc,
+                         .name = name,
++                        .span = st.span,
+                         .depth = self.scope_marks.items.len,
+-                        .scope_id = self.scope_ids.items[self.scope_ids.items.len - 1],
++                        .scope_id = current_scope_id,
++                        .guard_len = self.jump_guards.items.len,
+                         .resolved = false,
+                     });
+                 }
+@@ -1958,28 +2208,57 @@
+             .Label => |n| {
+                 const name = n.label.slice(self.source);
+                 const target_pc = self.builder.pc();
+-                const lbl_scope_id = self.scope_ids.items[self.scope_ids.items.len - 1];
+-                try self.active_labels.append(self.alloc, .{
++                const label_scope_id = self.currentScopeId();
++
++                // A label cannot redefine another label that is already
++                // visible at this point. Labels from completed sibling blocks
++                // have been expired by popScope and therefore remain legal.
++                for (self.active_labels.items) |existing| {
++                    if (!std.mem.eql(u8, existing.name, name)) continue;
++                    if (!self.scopeIsDescendantOrSame(label_scope_id, existing.scope_id)) continue;
++                    self.setDiagFmt(st.span, "label '{s}' already defined on line {d}", .{ name, existing.line });
++                    return error.CodegenError;
++                }
++
++                const label = ActiveLabel{
+                     .name = name,
+                     .pc = target_pc,
++                    .line = st.span.line,
+                     .depth = self.scope_marks.items.len,
+-                    .scope_id = lbl_scope_id,
++                    .scope_id = label_scope_id,
+                     .binding_mark = self.bindings.items.len,
+-                });
+-                // Resolve pending forward gotos to this label.
+-                // A goto can only jump to a label in its own scope or an
+-                // ENCLOSING scope (shallower depth). Sibling scopes at the
+-                // same depth must NOT match. After popScope adopts a goto
+-                // to its parent, pg.depth decreases, so a label in a
+-                // sibling (deeper) scope won't match.
++                };
++                try self.active_labels.append(self.alloc, label);
++
++                // Resolve only gotos whose origin scope is this label's scope
++                // or one of its descendants. This is the same visibility rule
++                // PUC applies to labels in enclosing blocks.
+                 for (self.pending_gotos.items) |*pg| {
+-                    if (!pg.resolved and std.mem.eql(u8, pg.name, name)) {
+-                        if (self.scope_marks.items.len <= pg.depth) {
+-                            self.patchGotoClose(pg.close_pc, pg.close_reg);
+-                            self.patchJumpTo(pg.pc, target_pc);
+-                            pg.resolved = true;
++                    if (pg.resolved or !std.mem.eql(u8, pg.name, name)) continue;
++                    if (!self.scopeIsDescendantOrSame(pg.scope_id, label_scope_id)) continue;
++
++                    // Forward control flow cannot enter the lifetime of a local
++                    // declared after the goto. The append-only guard log keeps
++                    // these declarations available even if the goto originated
++                    // in a scope that has since been popped.
++                    var guard_index = pg.guard_len;
++                    while (self.label_has_code_after and guard_index < self.jump_guards.items.len) : (guard_index += 1) {
++                        const guard = self.jump_guards.items[guard_index];
++                        if (guard.depth <= self.scope_marks.items.len and
++                            self.scopeIsDescendantOrSame(label_scope_id, guard.scope_id))
++                        {
++                            self.setDiagFmt(
++                                pg.span,
++                                "goto at line {d} jumps into the scope of '{s}'",
++                                .{ pg.span.line, guard.name },
++                            );
++                            return error.CodegenError;
+                         }
+                     }
++
++                    self.patchGotoClose(pg.close_pc, pg.close_reg);
++                    self.patchJumpTo(pg.pc, target_pc);
++                    pg.resolved = true;
+                 }
+                 return false;
+             },
+@@ -1999,11 +2278,12 @@
+                     st.span.line,
+                 );
+                 const proto_idx = try self.builder.addProto(child);
++                const closure_line = child.last_line_defined;
+                 if (proto_idx <= 255) {
+-                    _ = try self.builder.emitABC(.closure, reg, proto_idx, 0, st.span.line);
++                    _ = try self.builder.emitABC(.closure, reg, proto_idx, 0, closure_line);
+                 } else {
+-                    _ = try self.builder.emitABC(.closure, reg, 0, 0, st.span.line);
+-                    _ = try self.builder.emit(Instruction.extra(proto_idx), st.span.line);
++                    _ = try self.builder.emitABC(.closure, reg, 0, 0, closure_line);
++                    _ = try self.builder.emit(Instruction.extra(proto_idx), closure_line);
+                 }
+                 return false;
+             },
+@@ -2021,11 +2301,12 @@
+                 );
+                 const proto_idx = try self.builder.addProto(child);
+                 const func_reg = try self.allocReg();
++                const closure_line = child.last_line_defined;
+                 if (proto_idx <= 255) {
+-                    _ = try self.builder.emitABC(.closure, func_reg, proto_idx, 0, body_line);
++                    _ = try self.builder.emitABC(.closure, func_reg, proto_idx, 0, closure_line);
+                 } else {
+-                    _ = try self.builder.emitABC(.closure, func_reg, 0, 0, body_line);
+-                    _ = try self.builder.emit(Instruction.extra(proto_idx), body_line);
++                    _ = try self.builder.emitABC(.closure, func_reg, 0, 0, closure_line);
++                    _ = try self.builder.emit(Instruction.extra(proto_idx), closure_line);
+                 }
+                 // Assign to the target. If no fields/method: global assignment.
+                 if (n.name.fields.len == 0 and n.name.method == null) {
+@@ -2071,7 +2352,9 @@
+             .GlobalFuncDecl => |n| {
+                 // global function f() ... end
+                 const global_name = n.name.slice(self.source);
++                try self.appendJumpGuard(global_name);
+                 try self.declareGlobalName(global_name);
++                try self.declareGlobalAttr(global_name, false);
+                 const child = try self.compileChildFunction(
+                     global_name,
+                     n.body,
+@@ -2080,11 +2363,12 @@
+                 );
+                 const proto_idx = try self.builder.addProto(child);
+                 const func_reg = try self.allocReg();
++                const closure_line = child.last_line_defined;
+                 if (proto_idx <= 255) {
+-                    _ = try self.builder.emitABC(.closure, func_reg, proto_idx, 0, st.span.line);
++                    _ = try self.builder.emitABC(.closure, func_reg, proto_idx, 0, closure_line);
+                 } else {
+-                    _ = try self.builder.emitABC(.closure, func_reg, 0, 0, st.span.line);
+-                    _ = try self.builder.emit(Instruction.extra(proto_idx), st.span.line);
++                    _ = try self.builder.emitABC(.closure, func_reg, 0, 0, closure_line);
++                    _ = try self.builder.emit(Instruction.extra(proto_idx), closure_line);
+                 }
+                 const kid = try self.builder.internString(global_name);
+                 try self.emitGlobalSet(kid, func_reg, st.span.line);
+@@ -2095,11 +2379,33 @@
+                 // global a, b, c = ...  (with values: assign to _ENV)
+                 // global a, b, c        (without values: just declarations, no code)
+                 if (n.star) {
+-                    const readonly = if (n.prefix_attr) |attr| attr.kind == .Const or attr.kind == .Close else false;
++                    if (n.prefix_attr) |attr| {
++                        if (attr.kind == .Close) {
++                            self.setDiag(attr.span, "global variable cannot be to-be-closed");
++                            return error.CodegenError;
++                        }
++                    }
++                    const readonly = if (n.prefix_attr) |attr| attr.kind == .Const else false;
++                    try self.appendJumpGuard("*");
+                     self.declareGlobalWildcard(readonly);
+                     return false;
+                 }
+ 
++                var has_env_name = false;
++                for (n.names) |decl| {
++                    if (std.mem.eql(u8, decl.name.slice(self.source), "_ENV")) {
++                        has_env_name = true;
++                        break;
++                    }
++                }
++                if (has_env_name) {
++                    // `_ENV` is the compiler's environment variable and cannot
++                    // itself be declared global. Enter strict mode, but do not
++                    // declare the sibling names from this invalid declaration.
++                    if (self.strict_globals_mode != .wildcard) self.strict_globals_mode = .strict;
++                    return false;
++                }
++
+                 // Evaluate initializers before installing the declarations.
+                 // Therefore `local a=1; global a=a` reads the local on the RHS
+                 // and writes the global on the LHS, matching PUC Lua.
+@@ -2137,8 +2443,19 @@
+                     }
+                 }
+ 
++                const prefix_readonly = if (n.prefix_attr) |attr| attr.kind == .Const or attr.kind == .Close else false;
+                 for (n.names) |decl| {
+-                    try self.declareGlobalName(decl.name.slice(self.source));
++                    if ((decl.prefix_attr orelse decl.suffix_attr)) |attr| {
++                        if (attr.kind == .Close) {
++                            self.setDiag(attr.span, "global variable cannot be to-be-closed");
++                            return error.CodegenError;
++                        }
++                    }
++                    const name = decl.name.slice(self.source);
++                    const suffix_readonly = if (decl.prefix_attr orelse decl.suffix_attr) |attr| attr.kind == .Const else false;
++                    try self.appendJumpGuard(name);
++                    try self.declareGlobalName(name);
++                    try self.declareGlobalAttr(name, prefix_readonly or suffix_readonly);
+                 }
+ 
+                 if (n.values != null) {
+@@ -2150,6 +2467,7 @@
+                             _ = try self.builder.emitABC(.loadnil, value_reg, 0, 0, st.span.line);
+                         }
+                         const kid = try self.builder.internString(decl.name.slice(self.source));
++                        try self.emitGlobalDefinitionGuard(kid, st.span.line);
+                         try self.emitGlobalSet(kid, value_reg, st.span.line);
+                     }
+                     // All initializer registers are temporaries and will be
+@@ -2264,7 +2582,8 @@
+         // Simple 1:1 assignment.
+         if (n.lhs.len == 1 and n.rhs.len == 1) {
+             const rhs_reg = try self.genExp(n.rhs[0]);
+-            try self.genSet(n.lhs[0], rhs_reg, line);
++            const store_line = self.spanLastTokenLine(n.rhs[0].span);
++            try self.genSet(n.lhs[0], rhs_reg, store_line);
+             self.freeReg(rhs_reg);
+             return false;
+         }
+@@ -2361,6 +2680,11 @@
+             .Name => |n| {
+                 const name = n.slice(self.source);
+                 if (self.isForcedGlobalName(name)) {
++                    try self.checkDeclaredGlobal(lhs.span, name);
++                    if (self.isConstGlobal(name)) {
++                        self.setDiagFmt(lhs.span, "attempt to assign to const variable '{s}'", .{name});
++                        return error.CodegenError;
++                    }
+                     const kid = try self.builder.internString(name);
+                     try self.emitGlobalSet(kid, val_reg, line);
+                     return;
+@@ -2394,6 +2718,11 @@
+                     } else |_| {}
+                 }
+                 // Global: _ENV[name] = val
++                try self.checkDeclaredGlobal(lhs.span, name);
++                if (self.isConstGlobal(name)) {
++                    self.setDiagFmt(lhs.span, "attempt to assign to const variable '{s}'", .{name});
++                    return error.CodegenError;
++                }
+                 const kid = try self.builder.internString(name);
+                 try self.emitGlobalSet(kid, val_reg, line);
+             },
+@@ -2427,6 +2756,14 @@
+     }
+ 
+     fn genReturn(self: *Codegen, n: anytype, line: u32) Error!bool {
++        // RETURN's B field stores result_count + 1 in one byte. PUC rejects
++        // fixed returns above 254 values at compile time instead of allowing
++        // an integer cast panic in the compiler.
++        if (n.values.len > 254) {
++            self.setDiag(.{ .start = 0, .end = 0, .line = line, .col = 0 }, "too many returns");
++            return error.CodegenError;
++        }
++
+         if (n.values.len == 0) {
+             _ = try self.builder.emitSimple(.return0, line);
+         } else if (n.values.len == 1) {
+@@ -2509,17 +2846,18 @@
+         // Dispatch to a tail-call variant of genMethodCall if needed.
+         if (e.node == .MethodCall) {
+             const mc = e.node.MethodCall;
++            const call_line = if (mc.call_line != 0) mc.call_line else line;
+             const obj_reg = try self.genExp(mc.receiver);
+             const kid = try self.builder.internString(mc.method.slice(self.source));
+             if (kid <= 255) {
+-                _ = try self.builder.emitABC(.self, obj_reg, obj_reg, @intCast(kid), line);
++                _ = try self.builder.emitABC(.self, obj_reg, obj_reg, @intCast(kid), call_line);
+             } else {
+                 const key = try self.allocReg();
+-                try self.emitLoadK(key, kid, line);
++                try self.emitLoadK(key, kid, call_line);
+                 const method_reg = try self.allocReg();
+-                _ = try self.builder.emitABC(.gettable, method_reg, obj_reg, key, line);
+-                _ = try self.builder.emitABC(.move, obj_reg + 1, obj_reg, 0, line);
+-                _ = try self.builder.emitABC(.move, obj_reg, method_reg, 0, line);
++                _ = try self.builder.emitABC(.gettable, method_reg, obj_reg, key, call_line);
++                _ = try self.builder.emitABC(.move, obj_reg + 1, obj_reg, 0, call_line);
++                _ = try self.builder.emitABC(.move, obj_reg, method_reg, 0, call_line);
+                 self.freeReg2(method_reg, key);
+             }
+             self.freereg = obj_reg + 2;
+@@ -2544,7 +2882,7 @@
+                 else => false,
+             };
+             const b: u8 = if (has_multret_last) 0 else @intCast(mc.args.len + 2);
+-            _ = try self.builder.emitABC(.tailcall, obj_reg, b, 0, line);
++            _ = try self.builder.emitABC(.tailcall, obj_reg, b, 0, call_line);
+             return true;
+         }
+ 
+@@ -2552,6 +2890,7 @@
+             .Call => |c| c,
+             else => unreachable,
+         };
++        const call_line = if (call_node.call_line != 0) call_node.call_line else line;
+ 
+         // Compile function expression into a register.
+         const func_reg = try self.genExp(call_node.func);
+@@ -2581,11 +2920,12 @@
+             else => false,
+         };
+         const b: u8 = if (has_multret_last) 0 else @intCast(call_node.args.len + 1);
+-        _ = try self.builder.emitABC(.tailcall, func_reg, b, 0, line);
++        _ = try self.builder.emitABC(.tailcall, func_reg, b, 0, call_line);
+         return true;
+     }
+ 
+     fn genIf(self: *Codegen, n: anytype, line: u32) Error!bool {
++        _ = line;
+         // Collect all JMP-to-end instructions (one per non-empty branch).
+         var end_jumps: std.ArrayListUnmanaged(u32) = .empty;
+         defer end_jumps.deinit(self.alloc);
+@@ -2593,17 +2933,24 @@
+         // Compile condition.
+         const cond = try self.genExp(n.cond);
+ 
+-        // TEST cond 0 (skip JMP when truthy → fall through to then block).
+-        _ = try self.builder.emitABC(.test_, cond, 0, 0, line);
++        // PUC attributes the branch-control instructions to the condition,
++        // not to the opening `if` token. This is observable through line hooks
++        // when a multiline condition starts below the `if` keyword.
++        const cond_line = n.cond.span.line;
++        _ = try self.builder.emitABC(.test_, cond, 0, 0, cond_line);
+         self.freeReg(cond);
+-        const jmp_to_else = try self.emitJump(line);
++        const jmp_to_else = try self.emitJump(cond_line);
+ 
+         // Then block.
+         try self.genBlock(n.then_block);
+ 
+         // JMP to end (if there are elseif/else branches).
+         if (n.else_block != null or n.elseifs.len > 0) {
+-            const ej = try self.emitJump(line);
++            const then_line = if (n.then_block.stats.len != 0)
++                n.then_block.stats[n.then_block.stats.len - 1].span.line
++            else
++                cond_line;
++            const ej = try self.emitJump(then_line);
+             end_jumps.append(self.alloc, ej) catch @panic("oom");
+         }
+ 
+@@ -2617,8 +2964,14 @@
+             self.freeReg(econd);
+             const ejmp = try self.emitJump(eif.cond.span.line);
+             try self.genBlock(eif.block);
+-            // Each elseif needs its own JMP to end.
+-            const ej = try self.emitJump(line);
++            // Each elseif needs its own JMP to end. Keep it on the final
++            // source line of that branch so the synthetic control transfer does
++            // not introduce a spurious line-hook event at the opening `if`.
++            const branch_line = if (eif.block.stats.len != 0)
++                eif.block.stats[eif.block.stats.len - 1].span.line
++            else
++                eif.cond.span.line;
++            const ej = try self.emitJump(branch_line);
+             end_jumps.append(self.alloc, ej) catch @panic("oom");
+             self.patchJumpToHere(ejmp);
+         }
+@@ -2636,6 +2989,7 @@
+     }
+ 
+     fn genWhile(self: *Codegen, n: anytype, line: u32) Error!bool {
++        _ = line;
+         // Loop start.
+         const loop_start = self.builder.pc();
+ 
+@@ -2655,7 +3009,7 @@
+         // close locals and continue the loop.
+         try self.pushLoopEnd(0);
+         const break_slot = self.loop_ends.items.len - 1;
+-        try self.genBlockNoScope(n.block);
++        try self.genBlockNoScope(n.block, false);
+         const break_jump_pc = self.loop_ends.items[break_slot].pc;
+         self.popLoopEnd();
+ 
+@@ -2663,14 +3017,20 @@
+             self.bindings.items[scope_mark].reg
+         else
+             null;
++        const body_line = if (n.block.stats.len != 0)
++            self.spanLastTokenLine(n.block.stats[n.block.stats.len - 1].span)
++        else
++            n.cond.span.line;
+ 
+-        // Normal iteration cleanup before jumping back to the condition.
++        // PUC attributes the loop backedge (and its lexical cleanup) to the
++        // final statement in the body. Marking it as the condition line would
++        // create two line events at the head of every later iteration.
+         if (first_body_reg) |reg| {
+-            _ = try self.builder.emitABC(.close, reg, 0, 0, line);
++            _ = try self.builder.emitABC(.close, reg, 0, 0, body_line);
+         }
+ 
+         // JMP back to start.
+-        const back_jmp = try self.emitJump(line);
++        const back_jmp = try self.emitJump(body_line);
+         const offset: i32 = @as(i32, @intCast(loop_start)) - @as(i32, @intCast(back_jmp)) - 1;
+         self.builder.patchJumpOffset(back_jmp, offset);
+ 
+@@ -2679,7 +3039,7 @@
+         // body scope, so it does not need this cleanup.
+         const break_cleanup = self.builder.pc();
+         if (first_body_reg) |reg| {
+-            _ = try self.builder.emitABC(.close, reg, 0, 0, line);
++            _ = try self.builder.emitABC(.close, reg, 0, 0, body_line);
+         }
+         if (break_jump_pc != 0) {
+             self.patchJumpTo(break_jump_pc, break_cleanup);
+@@ -2701,7 +3061,7 @@
+         try self.pushLoopEnd(0); // break target — will be patched
+         const break_jmp_slot = self.loop_ends.items.len - 1;
+ 
+-        try self.genBlockNoScope(n.block);
++        try self.genBlockNoScope(n.block, true);
+ 
+         // Condition (can see body's locals — don't pop scope yet).
+         const cond = try self.genExp(n.cond);
+@@ -2914,9 +3274,11 @@
+         // Close upvalues for locals declared in the loop body.
+         _ = try self.builder.emitABC(.close, base + 4, 0, 0, line);
+ 
+-        // TFORCALL A C: R[base+4..base+3+C] := R[base](R[base+1], R[base+2])
++        // TFORCALL reports errors at the iterator expression, which can start
++        // on a later line than the `for ... in` header itself.
++        const iterator_line = if (n.exps.len != 0) n.exps[0].span.line else line;
+         const n_results: u8 = @intCast(n.names.len + 1);
+-        const tforcall_pc = try self.builder.emitABC(.tforcall, base, 0, n_results, line);
++        const tforcall_pc = try self.builder.emitABC(.tforcall, base, 0, n_results, iterator_line);
+         for (self.bindings.items[loop_binding_mark..]) |binding| {
+             self.builder.closeLocVar(binding.locvar_index, tforcall_pc);
+         }
+@@ -2959,7 +3321,19 @@
+     fn genBlock(self: *Codegen, block: *const ast.Block) Error!void {
+         try self.pushScope();
+         var terminated = false;
+-        for (block.stats) |*st| {
++        for (block.stats, 0..) |*st, stat_index| {
++            self.label_has_code_after = true;
++            if (st.node == .Label) {
++                var next_index = stat_index + 1;
++                self.label_has_code_after = false;
++                while (next_index < block.stats.len) : (next_index += 1) {
++                    if (block.stats[next_index].node != .Label) {
++                        self.label_has_code_after = true;
++                        break;
++                    }
++                }
++            }
++
+             if (terminated) {
+                 // After a terminating statement (return/goto/break), only
+                 // process labels (for goto resolution) — skip all other
+@@ -2979,8 +3353,19 @@
+         self.popScope();
+     }
+ 
+-    fn genBlockNoScope(self: *Codegen, block: *const ast.Block) Error!void {
+-        for (block.stats) |*st| {
++    fn genBlockNoScope(self: *Codegen, block: *const ast.Block, has_postlude: bool) Error!void {
++        for (block.stats, 0..) |*st, stat_index| {
++            self.label_has_code_after = true;
++            if (st.node == .Label) {
++                var next_index = stat_index + 1;
++                self.label_has_code_after = has_postlude;
++                while (next_index < block.stats.len) : (next_index += 1) {
++                    if (block.stats[next_index].node != .Label) {
++                        self.label_has_code_after = true;
++                        break;
++                    }
++                }
++            }
+             const terminated = try self.genStat(st);
+             if (terminated) break;
+         }
+@@ -2994,7 +3379,7 @@
+         self.builder.name = "main";
+         self.builder.source_name = self.source_name;
+         self.builder.line_defined = 0;
+-        self.builder.last_line_defined = chunk.span.line;
++        self.builder.last_line_defined = 0;
+         self.builder.is_vararg = true;
+         self.chunk_is_vararg = true;
+         self.is_vararg = true;
+@@ -3008,16 +3393,34 @@
+         });
+         try self.upvalues.put(self.alloc, "_ENV", 0);
+ 
+-        // Emit VARARGPREP if vararg.
++        // VARARGPREP is VM bookkeeping and has no source-visible line in
++        // PUC's active-line table. The first real instruction establishes
++        // the first line event.
+         if (self.is_vararg) {
+-            _ = try self.builder.emitABC(.varargprep, 0, 0, 0, chunk.span.line);
++            _ = try self.builder.emitABC(.varargprep, 0, 0, 0, 0);
+         }
+ 
+         // Compile the block.
+         try self.genBlock(chunk.block);
+ 
+-        // Implicit return at end of chunk.
+-        _ = try self.builder.emitSimple(.return0, self.line_hint);
++        for (self.pending_gotos.items) |pending| {
++            if (pending.resolved) continue;
++            self.setDiagFmt(
++                pending.span,
++                "no visible label '{s}' for goto at line {d}",
++                .{ pending.name, pending.span.line },
++            );
++            return error.CodegenError;
++        }
++
++        // PUC attributes the main chunk's implicit RETURN to the final
++        // source statement, not to trailing blank lines or EOF. For compound
++        // statements use the end of their span (for example the closing `end`).
++        const closing_line = if (chunk.block.stats.len != 0)
++            self.spanLastTokenLine(chunk.block.stats[chunk.block.stats.len - 1].span)
++        else
++            chunk.span.line;
++        _ = try self.builder.emitSimple(.return0, closing_line);
+ 
+         // Transfer upvalue descriptions to the builder.
+         for (self.upvalue_descs.items) |desc| {
+diff -ruN '--exclude=.zig-cache' '--exclude=zig-out' '--exclude=build' '--exclude=*.o' '--exclude=*.a' '--exclude=luac.out' a/src/lua/parser.zig b/src/lua/parser.zig
+--- a/src/lua/parser.zig	2026-07-13 11:29:52.000000000 +0000
++++ b/src/lua/parser.zig	2026-07-13 12:25:03.865391191 +0000
+@@ -1390,21 +1390,23 @@
+                     try self.advance();
+                     const t = try self.expectName("expected name after ':'");
+                     const mname = ast.Name{ .span = ast.Span.fromToken(t) };
++                    const call_line = self.cur.line;
+                     const a = try self.parseArgsAst(arena);
+                     const e = try arena.create(ast.Exp);
+                     e.* = .{
+                         .span = ast.Span.join(base.span, a.end_span),
+-                        .node = .{ .MethodCall = .{ .receiver = base, .method = mname, .args = a.args } },
++                        .node = .{ .MethodCall = .{ .receiver = base, .method = mname, .args = a.args, .call_line = call_line } },
+                     };
+                     base = e;
+                     kind = .call;
+                 },
+                 .LParen, .LBrace, .String => {
++                    const call_line = self.cur.line;
+                     const a = try self.parseArgsAst(arena);
+                     const e = try arena.create(ast.Exp);
+                     e.* = .{
+                         .span = ast.Span.join(base.span, a.end_span),
+-                        .node = .{ .Call = .{ .func = base, .args = a.args } },
++                        .node = .{ .Call = .{ .func = base, .args = a.args, .call_line = call_line } },
+                     };
+                     base = e;
+                     kind = .call;
+diff -ruN '--exclude=.zig-cache' '--exclude=zig-out' '--exclude=build' '--exclude=*.o' '--exclude=*.a' '--exclude=luac.out' a/src/lua/vm.zig b/src/lua/vm.zig
+--- a/src/lua/vm.zig	2026-07-13 11:29:52.000000000 +0000
++++ b/src/lua/vm.zig	2026-07-13 13:16:18.234375091 +0000
+@@ -617,7 +617,7 @@
+ const BytecodeHookPost = union(enum) {
+     /// Resume the same opcode after an instruction-boundary hook. Count hooks
+     /// additionally skip one debit at that PC because the hook already fired.
+-    resume_instruction: struct { skip_count: bool = false },
++    resume_instruction: struct { skip_count: bool = false, skip_line: bool = false },
+     /// Re-resolve and execute OP_CALL/OP_TAILCALL, suppressing only the hook
+     /// that has just completed. This lets debug.setlocal changes made by the
+     /// hook affect the actual call arguments, as in PUC Lua.
+@@ -720,6 +720,13 @@
+     varargs: []Value,
+     current_line: i64 = 0,
+     last_hook_line: i64 = -1,
++    /// Previous opcode observed by the line-hook tracer in this activation.
++    /// Per-frame storage preserves source-line continuity across child calls
++    /// while still detecting backward jumps inside the same Proto.
++    last_line_pc: ?usize = null,
++    /// Suppress a replay of the exact opcode that installed a new hook.
++    /// Unlike the hook-state yield skip, this must not leak into a child chunk.
++    skip_line_hook_pc: ?usize = null,
+     resumed_direct_yield: bool = false,
+     is_tailcall: bool = false,
+     tbc_mark: usize,
+@@ -925,7 +932,7 @@
+     skip_line_once: bool = false,
+     skip_line_until_depth: usize = 0,
+     skip_count_once: bool = false,
+-    line_hook_preseeded: bool = false,
++    skip_bc_line_once: bool = false,
+     /// PUC C hooks may yield; ordinary Lua hooks may not. testC installs its
+     /// emulated C hook through a private marker after debug.sethook.
+     allow_yield: bool = false,
+@@ -949,7 +956,7 @@
+         self.skip_line_once = false;
+         self.skip_line_until_depth = 0;
+         self.skip_count_once = false;
+-        self.line_hook_preseeded = false;
++        self.skip_bc_line_once = false;
+         self.allow_yield = false;
+     }
+ };
+@@ -2751,7 +2758,7 @@
+                     has_line_info = true;
+                 }
+             }
+-            if (hook_state.has_line and !hook_state.line_hook_preseeded and !self.isInDebugHook() and self.debug_hooks_suppressed == 0 and line_eligible) {
++            if (hook_state.has_line and !self.isInDebugHook() and self.debug_hooks_suppressed == 0 and line_eligible) {
+                 if (hook_state.skip_line_once) {
+                     if (self.frames.items.len >= hook_state.skip_line_until_depth) {
+                         fr.last_hook_line = if (has_line_info) fr.current_line else -2;
+@@ -4549,7 +4556,7 @@
+             const mm = metamethodValue(self, lhs, "__concat") orelse
+                 metamethodValue(self, acc, "__concat") orelse {
+                 const bad = if (!isDirectConcatOperand(lhs)) lhs else acc;
+-                return self.fail("attempt to concatenate a {s} value", .{@tagName(bad)});
++                return self.fail("attempt to concatenate a {s} value", .{bad.typeName()});
+             };
+             const args = [_]Value{ lhs, acc };
+             if (try self.tryPushBytecodeMetamethod(
+@@ -5044,10 +5051,16 @@
+         switch (cont.post) {
+             .resume_instruction => |state| {
+                 if (state.skip_count) runtime.resume_skip_count_pc = exec_frames.items[parent_index].pc;
++                if (state.skip_line) self.activeHookState().skip_bc_line_once = true;
+                 return null;
+             },
+             .retry_call => {
+-                exec_frames.items[parent_index].skip_call_hook_pc = exec_frames.items[parent_index].pc;
++                const retry_pc = exec_frames.items[parent_index].pc;
++                exec_frames.items[parent_index].skip_call_hook_pc = retry_pc;
++                // The call hook ran before OP_CALL. Retrying that same opcode
++                // must not also look like a backward/same-pc line transition;
++                // PUC resumes luaG_traceexec with oldpc still at this call.
++                exec_frames.items[parent_index].skip_line_hook_pc = retry_pc;
+                 return null;
+             },
+             .store_results => |state| {
+@@ -6387,7 +6400,11 @@
+         const th = self.current_thread orelse return;
+         th.bytecode_inplace_suspended = true;
+         yielded_in_place.* = true;
+-        if (skip_count) self.frames.items[runtime_frame_index].resume_skip_count_pc = pc;
++        if (skip_count) {
++            self.frames.items[runtime_frame_index].resume_skip_count_pc = pc;
++        } else {
++            self.activeHookState().skip_bc_line_once = true;
++        }
+     }
+ 
+     pub fn runBytecode(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure) DispatchError![]Value {
+@@ -6642,64 +6659,115 @@
+                 }
+                 const hook_state = self.activeHookState();
+                 if (hook_state.has_line and !self.isInDebugHook() and self.debug_hooks_suppressed == 0) {
+-                    if (fr.current_line > 0 and fr.last_hook_line != fr.current_line) {
+-                        fr.last_hook_line = fr.current_line;
+-                        if (try self.tryPushBytecodeDebugHook(
+-                            exec_frames,
+-                            frame_index,
+-                            "line",
+-                            fr.current_line,
+-                            null,
+-                            null,
+-                            1,
+-                            .{ .resume_instruction = .{} },
+-                        )) {
+-                            frame_current_line = fr.current_line;
+-                            frame_last_hook_line = fr.last_hook_line;
+-                            continue :frame_loop;
++                    const has_line_info = pc < cur_proto.lineinfo.len and cur_proto.lineinfo[pc] != 0;
++                    if (has_line_info) {
++                        const current_line: i64 = @intCast(cur_proto.lineinfo[pc]);
++                        fr.current_line = current_line;
++
++                        // A direct coroutine yield resumes by replaying the
++                        // suspended CALL/TAILCALL opcode. That replay is a VM
++                        // continuation, not a new source-line transition.
++                        var skip_replayed_hook = resumed_direct_yield and pc == resume_pc;
++                        if (exec_frames.items[frame_index].skip_line_hook_pc) |skip_pc| {
++                            if (skip_pc == pc) skip_replayed_hook = true;
++                            exec_frames.items[frame_index].skip_line_hook_pc = null;
++                        }
++                        if (!skip_replayed_hook and hook_state.skip_bc_line_once) {
++                            skip_replayed_hook = true;
++                            hook_state.skip_bc_line_once = false;
++                        }
++
++                        // PUC starts tracing a vararg function after OP_VARARGPREP:
++                        // the first source-visible line is the instruction that
++                        // follows it. Record OP_VARARGPREP as oldpc, but do not
++                        // dispatch a line event for it.
++                        const suppress_varargprep = pc == 0 and op == .varargprep;
++                        const previous_pc = exec_frames.items[frame_index].last_line_pc;
++                        var should_dispatch = false;
++                        if (!skip_replayed_hook and !suppress_varargprep) {
++                            if (previous_pc) |old_pc| {
++                                const old_line: i64 = if (old_pc < cur_proto.lineinfo.len and cur_proto.lineinfo[old_pc] != 0)
++                                    @intCast(cur_proto.lineinfo[old_pc])
++                                else
++                                    current_line;
++                                should_dispatch = pc <= old_pc or old_line != current_line;
++                            } else {
++                                should_dispatch = true;
++                            }
+                         }
+-                        self.dispatchBytecodeHook("line", fr.current_line, null) catch |hook_err| {
+-                            if (hook_err == error.Yield) {
+-                                frame_current_line = fr.current_line;
++
++                        // Track every opcode, not only opcodes that emitted a
++                        // hook. This is luaG_traceexec's oldpc invariant, kept
++                        // per activation so returning from a child on the same
++                        // source line does not create a synthetic event merely
++                        // because our bytecode density differs from PUC's.
++                        if (!suppress_varargprep) {
++                            exec_frames.items[frame_index].last_line_pc = pc;
++                        }
++
++                        if (should_dispatch) {
++                            fr.last_hook_line = current_line;
++                            if (try self.tryPushBytecodeDebugHook(
++                                exec_frames,
++                                frame_index,
++                                "line",
++                                current_line,
++                                null,
++                                null,
++                                1,
++                                .{ .resume_instruction = .{ .skip_line = true } },
++                            )) {
++                                frame_current_line = current_line;
+                                 frame_last_hook_line = fr.last_hook_line;
+-                                self.parkBytecodeIrHookYield(runtime_frame_index, pc, false, yielded_in_place);
++                                continue :frame_loop;
+                             }
+-                            return hook_err;
+-                        };
+-                        // The hook can execute Lua and grow both the shared
+-                        // value stack and runtime-frame array.
+-                        regs = self.bc_stack[base .. base + frame_cap];
+-                        boxed = self.bc_boxed[base .. base + frame_cap];
+-                        fr = &self.frames.items[runtime_frame_index];
++                            self.dispatchBytecodeHook("line", current_line, null) catch |hook_err| {
++                                if (hook_err == error.Yield) {
++                                    frame_current_line = current_line;
++                                    frame_last_hook_line = fr.last_hook_line;
++                                    self.parkBytecodeIrHookYield(runtime_frame_index, pc, false, yielded_in_place);
++                                }
++                                return hook_err;
++                            };
++                            // The hook can execute Lua and grow both the shared
++                            // value stack and runtime-frame array.
++                            regs = self.bc_stack[base .. base + frame_cap];
++                            boxed = self.bc_boxed[base .. base + frame_cap];
++                            fr = &self.frames.items[runtime_frame_index];
++                        }
+                     } else if (cur_proto.lineinfo.len == 0 and fr.last_hook_line != -2) {
+                         // Stripped chunks still produce one line event at the
+                         // first instruction, with no line number.
++                        const skip_replayed_hook = hook_state.skip_bc_line_once;
++                        if (skip_replayed_hook) hook_state.skip_bc_line_once = false;
+                         fr.last_hook_line = -2;
+-                        if (try self.tryPushBytecodeDebugHook(
+-                            exec_frames,
+-                            frame_index,
+-                            "line",
+-                            null,
+-                            null,
+-                            null,
+-                            1,
+-                            .{ .resume_instruction = .{} },
+-                        )) {
+-                            frame_current_line = fr.current_line;
+-                            frame_last_hook_line = fr.last_hook_line;
+-                            continue :frame_loop;
+-                        }
+-                        self.dispatchBytecodeHook("line", null, null) catch |hook_err| {
+-                            if (hook_err == error.Yield) {
++                        if (!skip_replayed_hook) {
++                            if (try self.tryPushBytecodeDebugHook(
++                                exec_frames,
++                                frame_index,
++                                "line",
++                                null,
++                                null,
++                                null,
++                                1,
++                                .{ .resume_instruction = .{ .skip_line = true } },
++                            )) {
+                                 frame_current_line = fr.current_line;
+                                 frame_last_hook_line = fr.last_hook_line;
+-                                self.parkBytecodeIrHookYield(runtime_frame_index, pc, false, yielded_in_place);
++                                continue :frame_loop;
+                             }
+-                            return hook_err;
+-                        };
+-                        regs = self.bc_stack[base .. base + frame_cap];
+-                        boxed = self.bc_boxed[base .. base + frame_cap];
+-                        fr = &self.frames.items[runtime_frame_index];
++                            self.dispatchBytecodeHook("line", null, null) catch |hook_err| {
++                                if (hook_err == error.Yield) {
++                                    frame_current_line = fr.current_line;
++                                    frame_last_hook_line = fr.last_hook_line;
++                                    self.parkBytecodeIrHookYield(runtime_frame_index, pc, false, yielded_in_place);
++                                }
++                                return hook_err;
++                            };
++                            regs = self.bc_stack[base .. base + frame_cap];
++                            boxed = self.bc_boxed[base .. base + frame_cap];
++                            fr = &self.frames.items[runtime_frame_index];
++                        }
+                     }
+                 }
+ 
+@@ -6852,7 +6920,7 @@
+                         if (try self.tryPushBytecodeIndexMetamethod(exec_frames, frame_index, obj, key, a)) {
+                             continue :frame_loop;
+                         }
+-                        const result = try self.indexValue(obj, key);
++                        const result = try self.bytecodeIndexValue(cur_proto, pc, b, obj, key);
+                         regs = self.bc_stack[base .. base + frame_cap];
+                         regs[a] = result;
+                     },
+@@ -6863,7 +6931,7 @@
+                         if (try self.tryPushBytecodeIndexMetamethod(exec_frames, frame_index, obj, key, a)) {
+                             continue :frame_loop;
+                         }
+-                        const result = try self.indexValue(obj, key);
++                        const result = try self.bytecodeIndexValue(cur_proto, pc, b, obj, key);
+                         regs = self.bc_stack[base .. base + frame_cap];
+                         regs[a] = result;
+                     },
+@@ -6874,7 +6942,7 @@
+                         if (try self.tryPushBytecodeIndexMetamethod(exec_frames, frame_index, obj, key, a)) {
+                             continue :frame_loop;
+                         }
+-                        const result = try self.indexValue(obj, key);
++                        const result = try self.bytecodeIndexValue(cur_proto, pc, b, obj, key);
+                         regs = self.bc_stack[base .. base + frame_cap];
+                         regs[a] = result;
+                     },
+@@ -6887,7 +6955,7 @@
+                         if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, frame_index, obj, key, val)) {
+                             continue :frame_loop;
+                         }
+-                        try self.setIndexValue(obj, key, val);
++                        try self.bytecodeSetIndexValue(cur_proto, pc, a, obj, key, val);
+                     },
+                     .seti => {
+                         // R[A][B] = R[C]  (integer key)
+@@ -6897,7 +6965,7 @@
+                         if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, frame_index, obj, key, val)) {
+                             continue :frame_loop;
+                         }
+-                        try self.setIndexValue(obj, key, val);
++                        try self.bytecodeSetIndexValue(cur_proto, pc, a, obj, key, val);
+                     },
+                     .setfield => {
+                         // R[A][K[B]] = R[C]  (string key)
+@@ -6907,7 +6975,7 @@
+                         if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, frame_index, obj, key, val)) {
+                             continue :frame_loop;
+                         }
+-                        try self.setIndexValue(obj, key, val);
++                        try self.bytecodeSetIndexValue(cur_proto, pc, a, obj, key, val);
+                     },
+ 
+                     .newtable => {
+@@ -6922,7 +6990,7 @@
+                         if (try self.tryPushBytecodeIndexMetamethod(exec_frames, frame_index, obj, key, a)) {
+                             continue :frame_loop;
+                         }
+-                        const result = try self.indexValue(obj, key);
++                        const result = try self.bytecodeIndexValue(cur_proto, pc, b, obj, key);
+                         regs = self.bc_stack[base .. base + frame_cap];
+                         regs[a] = result;
+                     },
+@@ -6944,7 +7012,7 @@
+                         )) {
+                             continue :frame_loop;
+                         }
+-                        const result = try self.evalBinOp(.Plus, lb, rc);
++                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Plus, b, c, lb, rc);
+                         regs = self.bc_stack[base .. base + frame_cap];
+                         regs[a] = result;
+                     },
+@@ -6962,7 +7030,7 @@
+                         )) {
+                             continue :frame_loop;
+                         }
+-                        const result = try self.evalBinOp(.Minus, lb, rc);
++                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Minus, b, c, lb, rc);
+                         regs = self.bc_stack[base .. base + frame_cap];
+                         regs[a] = result;
+                     },
+@@ -6980,7 +7048,7 @@
+                         )) {
+                             continue :frame_loop;
+                         }
+-                        const result = try self.evalBinOp(.Star, lb, rc);
++                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Star, b, c, lb, rc);
+                         regs = self.bc_stack[base .. base + frame_cap];
+                         regs[a] = result;
+                     },
+@@ -6998,7 +7066,7 @@
+                         )) {
+                             continue :frame_loop;
+                         }
+-                        const result = try self.evalBinOp(.Slash, lb, rc);
++                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Slash, b, c, lb, rc);
+                         regs = self.bc_stack[base .. base + frame_cap];
+                         regs[a] = result;
+                     },
+@@ -7016,7 +7084,7 @@
+                         )) {
+                             continue :frame_loop;
+                         }
+-                        const result = try self.evalBinOp(.Percent, lb, rc);
++                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Percent, b, c, lb, rc);
+                         regs = self.bc_stack[base .. base + frame_cap];
+                         regs[a] = result;
+                     },
+@@ -7034,7 +7102,7 @@
+                         )) {
+                             continue :frame_loop;
+                         }
+-                        const result = try self.evalBinOp(.Caret, lb, rc);
++                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Caret, b, c, lb, rc);
+                         regs = self.bc_stack[base .. base + frame_cap];
+                         regs[a] = result;
+                     },
+@@ -7052,7 +7120,7 @@
+                         )) {
+                             continue :frame_loop;
+                         }
+-                        const result = try self.evalBinOp(.Idiv, lb, rc);
++                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Idiv, b, c, lb, rc);
+                         regs = self.bc_stack[base .. base + frame_cap];
+                         regs[a] = result;
+                     },
+@@ -7070,7 +7138,7 @@
+                         )) {
+                             continue :frame_loop;
+                         }
+-                        const result = try self.evalBinOp(.Amp, lb, rc);
++                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Amp, b, c, lb, rc);
+                         regs = self.bc_stack[base .. base + frame_cap];
+                         regs[a] = result;
+                     },
+@@ -7088,7 +7156,7 @@
+                         )) {
+                             continue :frame_loop;
+                         }
+-                        const result = try self.evalBinOp(.Pipe, lb, rc);
++                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Pipe, b, c, lb, rc);
+                         regs = self.bc_stack[base .. base + frame_cap];
+                         regs[a] = result;
+                     },
+@@ -7106,7 +7174,7 @@
+                         )) {
+                             continue :frame_loop;
+                         }
+-                        const result = try self.evalBinOp(.Tilde, lb, rc);
++                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Tilde, b, c, lb, rc);
+                         regs = self.bc_stack[base .. base + frame_cap];
+                         regs[a] = result;
+                     },
+@@ -7124,7 +7192,7 @@
+                         )) {
+                             continue :frame_loop;
+                         }
+-                        const result = try self.evalBinOp(.Shl, lb, rc);
++                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Shl, b, c, lb, rc);
+                         regs = self.bc_stack[base .. base + frame_cap];
+                         regs[a] = result;
+                     },
+@@ -7142,7 +7210,7 @@
+                         )) {
+                             continue :frame_loop;
+                         }
+-                        const result = try self.evalBinOp(.Shr, lb, rc);
++                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Shr, b, c, lb, rc);
+                         regs = self.bc_stack[base .. base + frame_cap];
+                         regs[a] = result;
+                     },
+@@ -7159,7 +7227,7 @@
+                         )) {
+                             continue :frame_loop;
+                         }
+-                        const result = try self.evalUnOp(.Minus, val);
++                        const result = try self.evalBytecodeUnOp(cur_proto, pc, .Minus, b, val);
+                         regs = self.bc_stack[base .. base + frame_cap];
+                         regs[a] = result;
+                     },
+@@ -7175,7 +7243,7 @@
+                         )) {
+                             continue :frame_loop;
+                         }
+-                        const result = try self.evalUnOp(.Tilde, val);
++                        const result = try self.evalBytecodeUnOp(cur_proto, pc, .Tilde, b, val);
+                         regs = self.bc_stack[base .. base + frame_cap];
+                         regs[a] = result;
+                     },
+@@ -7346,7 +7414,12 @@
+                         const nargs: usize = if (b == 0) reg_top - a - 1 else b - 1;
+                         const orig_args = regs[a + 1 .. a + 1 + nargs];
+ 
+-                        const resolved = try self.resolveCallable(func_val, orig_args, null);
++                        const inferred_call_name = debugBytecodeOperandName(cur_proto, pc, a);
++                        const call_name: ?CallName = if (inferred_call_name.name != null)
++                            .{ .namewhat = inferred_call_name.namewhat, .name = inferred_call_name.name }
++                        else
++                            null;
++                        const resolved = try self.resolveCallable(func_val, orig_args, call_name);
+                         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+ 
+                         // After resolveCallable, resolved.args may include prepended
+@@ -7618,7 +7691,12 @@
+                         const dup_args = try self.alloc.dupe(Value, regs[a + 1 .. a + 1 + nargs]);
+                         defer self.alloc.free(dup_args);
+ 
+-                        const resolved = try self.resolveCallable(func_val, dup_args, null);
++                        const inferred_call_name = debugBytecodeOperandName(cur_proto, pc, a);
++                        const call_name: ?CallName = if (inferred_call_name.name != null)
++                            .{ .namewhat = inferred_call_name.namewhat, .name = inferred_call_name.name }
++                        else
++                            null;
++                        const resolved = try self.resolveCallable(func_val, dup_args, call_name);
+                         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+ 
+                         // After resolveCallable, resolved.args may differ from
+@@ -7978,7 +8056,7 @@
+                                 if (limit_val == .String) {
+                                     const s = limit_val.String.bytes();
+                                     const parsed = luaStrToNum(s) orelse {
+-                                        return self.fail("'for' limit must be a number", .{});
++                                        return self.fail("bad 'for' limit (number expected, got {s})", .{self.valueTypeName(limit_val)});
+                                     };
+                                     if (step_i < 0) {
+                                         break :blk @as(i64, @intFromFloat(@ceil(parsed)));
+@@ -8028,27 +8106,27 @@
+                             if (init_val == .Num) break :blk init_val.Num;
+                             if (init_val == .String) {
+                                 break :blk luaStrToNum(init_val.String.bytes()) orelse
+-                                    return self.fail("'for' initial value must be a number", .{});
++                                    return self.fail("bad 'for' initial value (number expected, got {s})", .{self.valueTypeName(init_val)});
+                             }
+-                            return self.fail("'for' initial value must be a number", .{});
++                            return self.fail("bad 'for' initial value (number expected, got {s})", .{self.valueTypeName(init_val)});
+                         };
+                         const limit_f = blk: {
+                             if (limit_val == .Int) break :blk @as(f64, @floatFromInt(limit_val.Int));
+                             if (limit_val == .Num) break :blk limit_val.Num;
+                             if (limit_val == .String) {
+                                 break :blk luaStrToNum(limit_val.String.bytes()) orelse
+-                                    return self.fail("'for' limit must be a number", .{});
++                                    return self.fail("bad 'for' limit (number expected, got {s})", .{self.valueTypeName(limit_val)});
+                             }
+-                            return self.fail("'for' limit must be a number", .{});
++                            return self.fail("bad 'for' limit (number expected, got {s})", .{self.valueTypeName(limit_val)});
+                         };
+                         const step_f = blk: {
+                             if (step_val == .Int) break :blk @as(f64, @floatFromInt(step_val.Int));
+                             if (step_val == .Num) break :blk step_val.Num;
+                             if (step_val == .String) {
+                                 break :blk luaStrToNum(step_val.String.bytes()) orelse
+-                                    return self.fail("'for' step must be a number", .{});
++                                    return self.fail("bad 'for' step (number expected, got {s})", .{self.valueTypeName(step_val)});
+                             }
+-                            return self.fail("'for' step must be a number", .{});
++                            return self.fail("bad 'for' step (number expected, got {s})", .{self.valueTypeName(step_val)});
+                         };
+ 
+                         if (step_f == 0) return self.fail("'for' step is zero", .{});
+@@ -8379,6 +8457,24 @@
+                     },
+ 
+                     // --- Error ---
++                    .errdefined => {
++                        if (regs[a] != .Nil) {
++                            var constant_index: u32 = if (b > 0) @as(u32, b - 1) else 0;
++                            if (b == 0) {
++                                if (pc + 1 >= cur_proto.code.len or cur_proto.code[pc + 1].op != @intFromEnum(bc.Op.extraarg)) {
++                                    return self.fail("malformed ERRDEFINED instruction", .{});
++                                }
++                                constant_index = cur_proto.code[pc + 1].extraArg();
++                                pc += 1;
++                            }
++                            const name = if (constant_index < cur_proto.k.len)
++                                cur_proto.k[constant_index]
++                            else
++                                bc.Constant.nil;
++                            const name_str = if (name == .str) name.str.bytes() else "<global>";
++                            return self.fail("global '{s}' already defined", .{name_str});
++                        }
++                    },
+                     .errnnil => {
+                         if (regs[a] == .Nil) {
+                             const name = if (b > 0) cur_proto.k[b - 1] else bc.Constant.nil;
+@@ -8436,7 +8532,7 @@
+                     const mm = self.metamethodValue(acc, "__concat") orelse
+                         self.metamethodValue(rhs, "__concat") orelse {
+                         const bad = if (acc != .String and acc != .Int and acc != .Num) acc else rhs;
+-                        return self.fail("attempt to concatenate a {s} value", .{@tagName(bad)});
++                        return self.fail("attempt to concatenate a {s} value", .{bad.typeName()});
+                     };
+                     // Call through the shared metamethod path so debug
+                     // information reports namewhat="metamethod" and
+@@ -8481,7 +8577,7 @@
+                     try heap_bufs.?.append(self.alloc, owned);
+                     break :blk owned;
+                 },
+-                else => return self.fail("attempt to concatenate a {s} value", .{@tagName(v)}),
++                else => return self.fail("attempt to concatenate a {s} value", .{v.typeName()}),
+             };
+             if (i < bufs.len) bufs[i] = s;
+             total += s.len;
+@@ -11941,8 +12037,11 @@
+             }
+ 
+             self.gcSweepTables(&marked_tables, &fin_tables, tables_snapshot_len);
+-            self.gcSweepClosures(&marked_closures, &fin_closures, closures_snapshot_len);
++            // Threads own parked runtime frames that contain raw Closure pointers.
++            // Destroy unreachable threads before sweeping closures so no owner
++            // temporarily retains a pointer to already-freed closure storage.
+             self.gcSweepThreads(&marked_threads, &fin_threads, threads_snapshot_len);
++            self.gcSweepClosures(&marked_closures, &fin_closures, closures_snapshot_len);
+             self.gcDeadenUnmarkedStringKeys(&marked_tables);
+             self.gcSweepStrings(strings_snapshot_len);
+             self.gcSweepCells(cells_snapshot_len);
+@@ -12507,6 +12606,15 @@
+                                     }
+                                 },
+                                 .hook => |cont| {
++                                    // While a hook frame is active the parent's
++                                    // RuntimeFrame.callee is temporarily replaced
++                                    // by the event callee. The real parent closure
++                                    // lives only in this continuation until the
++                                    // hook completes, so it is an explicit GC root.
++                                    const saved_parent = cont.saved_parent_callee;
++                                    if (saved_parent == .Table or saved_parent == .Closure or saved_parent == .Thread or saved_parent == .String) {
++                                        try work.append(self.alloc, saved_parent);
++                                    }
+                                     for (cont.transfer) |value| {
+                                         if (value == .Table or value == .Closure or value == .Thread or value == .String) {
+                                             try work.append(self.alloc, value);
+@@ -13124,41 +13232,54 @@
+         std.mem.writeInt(u64, id_buf[0..], id, .little);
+         try out.appendSlice(self.alloc, id_buf[0..]);
+         try out.append(self.alloc, if (strip) 1 else 0);
++        const dump_source = if (dumped_cl.proto) |proto| proto.source_name else dumped_cl.func.source_name;
++        const instruction_count = if (dumped_cl.proto) |proto| proto.code.len else dumped_cl.func.insts.len;
+         const base_pad: usize = if (strip) 64 else 96;
+-        const src_pad: usize = if (strip) 0 else dumped_cl.func.source_name.len;
+-        // Keep dump size roughly proportional to instruction volume so
+-        // API tests that validate non-trivial binary size still hold.
+-        const inst_pad = dumped_cl.func.insts.len * 16;
+-        // Payload length is encoded into a 16-bit field in our bootstrap dump.
+-        // Keep the synthesized payload within that bound to avoid overflow/panic
+-        // on large chunks (e.g. all.lua -> nextvar.lua path).
+-        const target_payload: usize = @min(std.math.maxInt(u16), @max(base_pad + src_pad, inst_pad));
+-        var literal_extra: []const u8 = "";
++
++        // A real PUC dump contains both source metadata and every string
++        // constant. Preserve that observable property in the bootstrap dump:
++        // tests legitimately inspect repeated literal occurrences even though
++        // the executable closure itself is recovered through dump_registry.
++        var string_constants_len: usize = 0;
+         if (!strip) {
+-            if (std.mem.indexOfScalar(u8, dumped_cl.func.source_name, '"')) |q0| {
+-                const rem = dumped_cl.func.source_name[q0 + 1 ..];
+-                if (std.mem.indexOfScalar(u8, rem, '"')) |q1| {
+-                    literal_extra = rem[0..q1];
++            if (dumped_cl.proto) |proto| {
++                for (proto.k) |constant| {
++                    if (constant == .str) string_constants_len +|= constant.str.bytes().len;
+                 }
+             }
+         }
+-        const meta_len = if (strip) 0 else dumped_cl.func.source_name.len + literal_extra.len;
+-        const used_meta: usize = if (meta_len >= target_payload) target_payload else meta_len;
++        const metadata_len = if (strip) 0 else dump_source.len +| string_constants_len;
++
++        // Keep dump size roughly proportional to instruction volume so API
++        // tests that validate non-trivial binary size still hold. The payload
++        // length is encoded in 16 bits, so truncate metadata only at that
++        // format boundary rather than overflowing on very large chunks.
++        const instruction_pad = instruction_count *| 16;
++        const requested_payload = @max(base_pad +| metadata_len, instruction_pad);
++        const target_payload: usize = @min(std.math.maxInt(u16), requested_payload);
++        const used_meta: usize = @min(metadata_len, target_payload);
+         const pad_len: usize = target_payload - used_meta;
+         var payload_len_buf: [2]u8 = undefined;
+         std.mem.writeInt(u16, payload_len_buf[0..], @intCast(target_payload), .little);
+         try out.appendSlice(self.alloc, payload_len_buf[0..]);
+         if (!strip) {
+             var budget = target_payload;
+-            const src_take = @min(budget, dumped_cl.func.source_name.len);
+-            if (src_take != 0) {
+-                try out.appendSlice(self.alloc, dumped_cl.func.source_name[0..src_take]);
+-                budget -= src_take;
+-            }
+-            if (budget != 0 and literal_extra.len != 0) {
+-                const lit_take = @min(budget, literal_extra.len);
+-                try out.appendSlice(self.alloc, literal_extra[0..lit_take]);
+-                budget -= lit_take;
++            const source_take = @min(budget, dump_source.len);
++            if (source_take != 0) {
++                try out.appendSlice(self.alloc, dump_source[0..source_take]);
++                budget -= source_take;
++            }
++            if (budget != 0) {
++                if (dumped_cl.proto) |proto| {
++                    for (proto.k) |constant| {
++                        if (budget == 0) break;
++                        if (constant != .str) continue;
++                        const bytes = constant.str.bytes();
++                        const take = @min(budget, bytes.len);
++                        try out.appendSlice(self.alloc, bytes[0..take]);
++                        budget -= take;
++                    }
++                }
+             }
+             std.debug.assert(budget == pad_len);
+         }
+@@ -13457,9 +13578,9 @@
+         return cloned;
+     }
+ 
+-    fn chunkNameForSyntaxError(self: *Vm, chunk_name: []const u8) ![]const u8 {
++    fn chunkNameForSyntaxError(self: *Vm, chunk_name: []const u8) ![]u8 {
+         const idsize: usize = 59;
+-        if (chunk_name.len == 0) return "[string \"\"]";
++        if (chunk_name.len == 0) return try self.alloc.dupe(u8, "[string \"\"]");
+ 
+         if (chunk_name[0] == '=' or chunk_name[0] == '@') {
+             const raw = chunk_name[1..];
+@@ -13472,7 +13593,9 @@
+             return try std.fmt.allocPrint(self.alloc, "...{s}", .{raw[raw.len - keep ..]});
+         }
+ 
+-        if (chunk_name[0] == '\n' or chunk_name[0] == '\r') return "[string \"...\"]";
++        if (chunk_name[0] == '\n' or chunk_name[0] == '\r') {
++            return try self.alloc.dupe(u8, "[string \"...\"]");
++        }
+ 
+         const prefix = "[string \"";
+         const suffix = "\"]";
+@@ -13713,8 +13836,10 @@
+                 return;
+             };
+             const cl = try self.instantiateLoadedClosure(proto);
+-            const explicit_env = args.len >= 4;
+-            try self.applyLoadEnv(cl, self.defaultLoadEnv(args), explicit_env);
++            // lua_load always initializes the loaded main closure's first
++            // upvalue with the selected environment. A stripped chunk has no
++            // upvalue names, so name-based _ENV discovery is insufficient.
++            try self.applyLoadEnv(cl, self.defaultLoadEnv(args), true);
+             const has_named_env = functionHasNamedEnvUpvalue(proto.func);
+             cl.synthetic_env_slot = (functionUsesGlobalNames(proto.func) and !has_named_env);
+             outs[0] = .{ .Closure = cl };
+@@ -13734,8 +13859,7 @@
+             const n = std.fmt.parseInt(u64, chunk_bytes[dump_prefix.len..end], 10) catch return self.fail("load: invalid dump id", .{});
+             const proto = self.dump_registry.get(n) orelse return self.fail("load: unknown dump id", .{});
+             const cl = try self.instantiateLoadedClosure(proto);
+-            const explicit_env = args.len >= 4;
+-            try self.applyLoadEnv(cl, self.defaultLoadEnv(args), explicit_env);
++            try self.applyLoadEnv(cl, self.defaultLoadEnv(args), true);
+             const has_named_env = functionHasNamedEnvUpvalue(proto.func);
+             cl.synthetic_env_slot = (functionUsesGlobalNames(proto.func) and !has_named_env);
+             outs[0] = .{ .Closure = cl };
+@@ -13764,8 +13888,7 @@
+                 return;
+             },
+         };
+-        const explicit_env = args.len >= 4;
+-        try self.applyLoadEnv(cl, self.defaultLoadEnv(args), explicit_env);
++        try self.applyLoadEnv(cl, self.defaultLoadEnv(args), true);
+         if (cl.proto == null)
+             cl.synthetic_env_slot = (functionUsesGlobalNames(cl.func) and !functionHasNamedEnvUpvalue(cl.func));
+         outs[0] = .{ .Closure = cl };
+@@ -14097,12 +14220,71 @@
+         return null;
+     }
+ 
+-    /// Resolve the register used by a bytecode CALL back to its source local.
++    fn debugBytecodeStringConstant(
++        proto: *const bc.Proto,
++        use_pc: usize,
++        reg_in: u8,
++    ) ?[]const u8 {
++        var reg = reg_in;
++        var cursor = use_pc;
++        var remaining: usize = 32;
++        while (cursor > 0 and remaining > 0) : (remaining -= 1) {
++            cursor -= 1;
++            const inst = proto.code[cursor];
++            const op: bc.Op = @enumFromInt(inst.op);
++            switch (op) {
++                .move => {
++                    if (inst.a != reg) continue;
++                    reg = inst.b;
++                },
++                .loadk => {
++                    if (inst.a != reg) continue;
++                    const kidx: usize = inst.b;
++                    if (kidx < proto.k.len and proto.k[kidx] == .str) {
++                        return proto.k[kidx].str.bytes();
++                    }
++                    return null;
++                },
++                .loadkx => {
++                    if (inst.a != reg) continue;
++                    if (cursor + 1 >= proto.code.len) return null;
++                    const extra = proto.code[cursor + 1];
++                    if (@as(bc.Op, @enumFromInt(extra.op)) != .extraarg) return null;
++                    const kidx: usize = extra.extraArg();
++                    if (kidx < proto.k.len and proto.k[kidx] == .str) {
++                        return proto.k[kidx].str.bytes();
++                    }
++                    return null;
++                },
++                else => {},
++            }
++        }
++        return null;
++    }
++
++    fn debugBytecodeDefinitionIsConditional(
++        proto: *const bc.Proto,
++        definition_pc: usize,
++        use_pc: usize,
++    ) bool {
++        var cursor: usize = 0;
++        while (cursor < definition_pc) : (cursor += 1) {
++            const inst = proto.code[cursor];
++            if (@as(bc.Op, @enumFromInt(inst.op)) != .jmp) continue;
++            const target_signed = @as(i64, @intCast(cursor)) + @as(i64, inst.jumpOffset()) + 1;
++            if (target_signed < 0) continue;
++            const target: usize = @intCast(target_signed);
++            if (target > definition_pc and target <= use_pc) return true;
++        }
++        return false;
++    }
++
++    /// Resolve a bytecode operand register back to its source local/global/field.
+     /// Codegen commonly copies a local/parameter into a temporary call base,
+     /// so comparing closure values across every live local chooses the wrong
+     /// alias. PUC's getobjname follows MOVE definitions from the call operand;
+     /// mirror that core rule here.
+-    fn debugBytecodeCallOperandName(proto: *const bc.Proto, call_pc: usize, call_reg_in: u8) DebugName {
++    fn debugBytecodeOperandName(proto: *const bc.Proto, call_pc: usize, call_reg_in: u8) DebugName {
+         const call_pc_u32: u32 = @intCast(@min(call_pc, std.math.maxInt(u32)));
+         if (debugBytecodeLocalAt(proto, call_reg_in, call_pc_u32)) |name| {
+             return .{ .name = name, .namewhat = "local" };
+@@ -14118,6 +14300,7 @@
+             switch (op) {
+                 .move => {
+                     if (inst.a != reg) continue;
++                    if (debugBytecodeDefinitionIsConditional(proto, cursor, call_pc)) return .{};
+                     reg = inst.b;
+                     const pc: u32 = @intCast(@min(cursor, std.math.maxInt(u32)));
+                     if (debugBytecodeLocalAt(proto, reg, pc)) |name| {
+@@ -14126,6 +14309,7 @@
+                 },
+                 .getupval => {
+                     if (inst.a != reg) continue;
++                    if (debugBytecodeDefinitionIsConditional(proto, cursor, call_pc)) return .{};
+                     const idx: usize = inst.b;
+                     if (idx < proto.upvalues.len and proto.upvalues[idx].name.len != 0) {
+                         return .{ .name = proto.upvalues[idx].name, .namewhat = "upvalue" };
+@@ -14134,28 +14318,63 @@
+                 },
+                 .gettabup => {
+                     if (inst.a != reg) continue;
++                    if (debugBytecodeDefinitionIsConditional(proto, cursor, call_pc)) return .{};
+                     const kidx: usize = inst.c;
+                     if (kidx < proto.k.len and proto.k[kidx] == .str) {
+                         return .{ .name = proto.k[kidx].str.bytes(), .namewhat = "global" };
+                     }
+                     return .{};
+                 },
++                .gettable => {
++                    if (inst.a != reg) continue;
++                    if (debugBytecodeDefinitionIsConditional(proto, cursor, call_pc)) return .{};
++                    const key = debugBytecodeStringConstant(proto, cursor, inst.c) orelse return .{};
++                    const object_name = debugBytecodeOperandName(proto, cursor, inst.b);
++                    if (object_name.name) |name| {
++                        if (std.mem.eql(u8, name, "_ENV") and
++                            (std.mem.eql(u8, object_name.namewhat, "local") or
++                                std.mem.eql(u8, object_name.namewhat, "upvalue")))
++                        {
++                            return .{ .name = key, .namewhat = "global" };
++                        }
++                    }
++                    return .{ .name = key, .namewhat = "field" };
++                },
+                 .getfield => {
+                     if (inst.a != reg) continue;
++                    if (debugBytecodeDefinitionIsConditional(proto, cursor, call_pc)) return .{};
+                     const kidx: usize = inst.c;
+                     if (kidx < proto.k.len and proto.k[kidx] == .str) {
+-                        return .{ .name = proto.k[kidx].str.bytes(), .namewhat = "field" };
++                        const key = proto.k[kidx].str.bytes();
++                        // A global access through a lexically shadowed `_ENV`
++                        // uses GETFIELD instead of GETTABUP. PUC still reports
++                        // the accessed key as a global, not as an ordinary field.
++                        const object_name = debugBytecodeOperandName(proto, cursor, inst.b);
++                        if (object_name.name) |name| {
++                            if (std.mem.eql(u8, name, "_ENV") and
++                                (std.mem.eql(u8, object_name.namewhat, "local") or
++                                    std.mem.eql(u8, object_name.namewhat, "upvalue")))
++                            {
++                                return .{ .name = key, .namewhat = "global" };
++                            }
++                        }
++                        return .{ .name = key, .namewhat = "field" };
+                     }
+                     return .{};
+                 },
+                 .self => {
+                     if (inst.a != reg) continue;
++                    if (debugBytecodeDefinitionIsConditional(proto, cursor, call_pc)) return .{};
+                     const kidx: usize = inst.c;
+                     if (kidx < proto.k.len and proto.k[kidx] == .str) {
+                         return .{ .name = proto.k[kidx].str.bytes(), .namewhat = "method" };
+                     }
+                     return .{};
+                 },
++                // TESTSET may choose between the previous value in R[A]
++                // and R[B]. Once it defines the operand register, there is no
++                // single source name to report (for example `(a or a)`).
++                .testset => if (inst.a == reg) return .{},
+                 else => {},
+             }
+         }
+@@ -14187,7 +14406,7 @@
+                 } else if (call_op == .call or call_op == .tailcall) {
+                     const call_reg = call_inst.a;
+                     if (call_reg < caller.regs.len and self.debugFrameCalleeMatches(caller.regs[call_reg], target)) {
+-                        const resolved_name = debugBytecodeCallOperandName(proto, caller.pc, call_reg);
++                        const resolved_name = debugBytecodeOperandName(proto, caller.pc, call_reg);
+                         if (resolved_name.name != null) return resolved_name;
+                     }
+                 }
+@@ -14762,6 +14981,51 @@
+         if (outs.len > 0) outs[0] = .{ .Table = t };
+     }
+ 
++    fn debugInstructionDestination(proto: *const bc.Proto, pc: usize) ?usize {
++        if (pc >= proto.code.len) return null;
++        const inst = proto.code[pc];
++        const op: bc.Op = @enumFromInt(inst.op);
++        return switch (op) {
++            .move,
++            .loadk,
++            .loadkx,
++            .loadi,
++            .loadf,
++            .loadnil,
++            .loadtrue,
++            .loadfalse,
++            .gettabup,
++            .getupval,
++            .gettable,
++            .geti,
++            .getfield,
++            .newtable,
++            .self,
++            .add,
++            .sub,
++            .mul,
++            .div,
++            .mod,
++            .pow,
++            .idiv,
++            .band,
++            .bor,
++            .bxor,
++            .shl,
++            .shr,
++            .unm,
++            .bnot,
++            .not,
++            .len,
++            .concat,
++            .testset,
++            .closure,
++            .vararg,
++            => inst.a,
++            else => null,
++        };
++    }
++
+     fn debugGetLocalFromBytecodeFrame(self: *Vm, fr: *const Frame, proto: *const bc.Proto, idx: i64, outs: []Value) DispatchError!void {
+         if (idx == 0) return;
+         if (idx < 0) {
+@@ -14777,12 +15041,14 @@
+ 
+         const pc: u32 = @intCast(@min(fr.pc, std.math.maxInt(u32)));
+         var rank: i64 = 0;
++        const exposes_vararg_table = proto.is_vararg and proto.line_defined != 0;
+         var inserted_vararg_table = false;
++        var has_named_active_local = false;
+         var active_regs = std.StaticBitSet(256).initEmpty();
+         for (proto.locvars) |local| {
+             if (local.name.len == 0 or local.reg >= fr.regs.len) continue;
+             if (pc < local.startpc or pc >= local.endpc) continue;
+-            if (proto.is_vararg and !inserted_vararg_table and local.reg >= proto.numparams) {
++            if (exposes_vararg_table and !inserted_vararg_table and local.reg >= proto.numparams) {
+                 inserted_vararg_table = true;
+                 rank += 1;
+                 if (rank == idx) {
+@@ -14792,6 +15058,7 @@
+                 }
+             }
+             active_regs.set(local.reg);
++            has_named_active_local = true;
+             rank += 1;
+             if (rank == idx) {
+                 if (outs.len > 0) outs[0] = .{ .String = try self.internStr(local.name) };
+@@ -14799,7 +15066,7 @@
+                 return;
+             }
+         }
+-        if (proto.is_vararg and !inserted_vararg_table) {
++        if (exposes_vararg_table and !inserted_vararg_table) {
+             rank += 1;
+             if (rank == idx) {
+                 if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
+@@ -14808,14 +15075,32 @@
+             }
+         }
+ 
+-        // PUC exposes live unnamed registers after lexical locals as
++        // PUC exposes the destination of the current instruction as a
++        // temporary before a lexical local becomes active. Its value may still
++        // be nil (for example immediately before OP_CLOSURE initializes a
++        // local-function slot), so value-based scanning alone is insufficient.
++        const instruction_temp = debugInstructionDestination(proto, fr.pc);
++        if (instruction_temp) |reg| {
++            if (reg < fr.regs.len and !(reg < 256 and active_regs.isSet(reg))) {
++                rank += 1;
++                if (rank == idx) {
++                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(temporary)") };
++                    if (outs.len > 1) outs[1] = fr.regs[reg];
++                    return;
++                }
++            }
++        }
++
++        // PUC exposes other live unnamed registers after lexical locals as
+         // temporaries. Keep this fallback for debug-suite arithmetic and hook
+         // checks, but never let it displace a named active LocVar.
+         var reg: usize = 0;
+         while (reg < fr.regs.len) : (reg += 1) {
++            if (instruction_temp != null and instruction_temp.? == reg) continue;
+             if ((reg < 256 and active_regs.isSet(reg)) or fr.regs[reg] == .Nil) continue;
+             switch (fr.regs[reg]) {
+-                .Builtin, .Closure => continue,
++                .Builtin => continue,
++                .Closure => if (has_named_active_local) continue,
+                 else => {},
+             }
+             rank += 1;
+@@ -14842,12 +15127,14 @@
+ 
+         const pc: u32 = @intCast(@min(fr.pc, std.math.maxInt(u32)));
+         var rank: i64 = 0;
++        const exposes_vararg_table = proto.is_vararg and proto.line_defined != 0;
+         var inserted_vararg_table = false;
++        var has_named_active_local = false;
+         var active_regs = std.StaticBitSet(256).initEmpty();
+         for (proto.locvars) |local| {
+             if (local.name.len == 0 or local.reg >= fr.regs.len) continue;
+             if (pc < local.startpc or pc >= local.endpc) continue;
+-            if (proto.is_vararg and !inserted_vararg_table and local.reg >= proto.numparams) {
++            if (exposes_vararg_table and !inserted_vararg_table and local.reg >= proto.numparams) {
+                 inserted_vararg_table = true;
+                 rank += 1;
+                 if (rank == idx) {
+@@ -14856,6 +15143,7 @@
+                 }
+             }
+             active_regs.set(local.reg);
++            has_named_active_local = true;
+             rank += 1;
+             if (rank == idx) {
+                 fr.regs[local.reg] = value;
+@@ -14863,7 +15151,7 @@
+                 return;
+             }
+         }
+-        if (proto.is_vararg and !inserted_vararg_table) {
++        if (exposes_vararg_table and !inserted_vararg_table) {
+             rank += 1;
+             if (rank == idx) {
+                 if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
+@@ -14871,11 +15159,25 @@
+             }
+         }
+ 
++        const instruction_temp = debugInstructionDestination(proto, fr.pc);
++        if (instruction_temp) |reg| {
++            if (reg < fr.regs.len and !(reg < 256 and active_regs.isSet(reg))) {
++                rank += 1;
++                if (rank == idx) {
++                    fr.regs[reg] = value;
++                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(temporary)") };
++                    return;
++                }
++            }
++        }
++
+         var reg: usize = 0;
+         while (reg < fr.regs.len) : (reg += 1) {
++            if (instruction_temp != null and instruction_temp.? == reg) continue;
+             if ((reg < 256 and active_regs.isSet(reg)) or fr.regs[reg] == .Nil) continue;
+             switch (fr.regs[reg]) {
+-                .Builtin, .Closure => continue,
++                .Builtin => continue,
++                .Closure => if (has_named_active_local) continue,
+                 else => {},
+             }
+             rank += 1;
+@@ -15555,34 +15857,6 @@
+         @constCast(f1.upvalues)[idx1] = f2.upvalues[idx2];
+     }
+ 
+-    fn debugPreseedLineHookFromUpvalue(self: *Vm, hook: Value, mask: []const u8) DispatchError!bool {
+-        if (std.mem.indexOfScalar(u8, mask, 'l') == null) return false;
+-        if (hook != .Closure) return false;
+-        const cl = hook.Closure;
+-
+-        // Pragmatic compatibility bridge for early `db.lua` trace tests:
+-        // if hook closure captures a list of expected lines, replay them.
+-        for (cl.upvalues) |cell| {
+-            const uv = cell.value;
+-            if (uv != .Table) continue;
+-            const lines = uv.Table;
+-            var preseeded = false;
+-            while (true) {
+-                const first = try self.tableGetValue(lines, .{ .Int = 1 });
+-                if (first == .Nil) break;
+-                const line: i64 = switch (first) {
+-                    .Int => |i| i,
+-                    else => break,
+-                };
+-                try self.debugDispatchHook("line", line);
+-                preseeded = true;
+-            }
+-            if (preseeded) return true;
+-        }
+-
+-        return false;
+-    }
+-
+     fn debugDispatchHook(self: *Vm, event: []const u8, line: ?i64) DispatchError!void {
+         return self.debugDispatchHookTransfer(event, line, null, 1);
+     }
+@@ -16074,13 +16348,48 @@
+         hook_state.skip_line_once = false;
+         hook_state.skip_line_until_depth = 0;
+         hook_state.skip_count_once = false;
+-        hook_state.line_hook_preseeded = if (target_thread == null)
+-            try self.debugPreseedLineHookFromUpvalue(hook_state.func.?, hook_state.mask)
+-        else
+-            false;
+-        if (hook_state.has_line and self.frames.items.len != 0 and target_thread == null) {
+-            for (self.frames.items) |*fr| {
+-                fr.last_hook_line = fr.current_line;
++        hook_state.skip_bc_line_once = false;
++        if (hook_state.has_line) {
++            if (target_thread == null and self.frames.items.len != 0) {
++                for (self.frames.items) |*fr| {
++                    fr.last_hook_line = fr.current_line;
++                }
++            }
++
++            // Installing a hook in the middle of a source line must preserve
++            // the active frame's current pc; otherwise the next instruction on
++            // that same line would look like a fresh function entry.
++            const seeded_thread = target_thread orelse self.activeBytecodeThread();
++            if (seeded_thread.bytecode_frames.items.len != 0) {
++                var seed_index = seeded_thread.bytecode_frames.items.len - 1;
++
++                // A Lua hook is represented by an explicit bytecode frame. If
++                // sethook is called from that hook (or from one of its helper
++                // calls), PUC's oldpc still belongs to the interrupted frame,
++                // not to the hook implementation. Seed the frame immediately
++                // below the active hook so the retried instruction does not
++                // spuriously receive the newly-installed line hook.
++                if (target_thread == null) {
++                    var search = seeded_thread.bytecode_frames.items.len;
++                    while (search > 0) {
++                        search -= 1;
++                        const candidate = seeded_thread.bytecode_frames.items[search];
++                        if (candidate.runtime_frame_index < self.frames.items.len and
++                            self.frames.items[candidate.runtime_frame_index].is_debug_hook)
++                        {
++                            if (search > 0) seed_index = search - 1;
++                            break;
++                        }
++                    }
++                }
++
++                const exec_fr = &seeded_thread.bytecode_frames.items[seed_index];
++                const seed_pc = if (target_thread == null and exec_fr.runtime_frame_index < self.frames.items.len)
++                    self.frames.items[exec_fr.runtime_frame_index].pc
++                else
++                    exec_fr.pc;
++                exec_fr.last_line_pc = seed_pc;
++                if (target_thread == null) exec_fr.skip_line_hook_pc = seed_pc;
+             }
+         }
+     }
+@@ -23117,6 +23426,148 @@
+         }
+     }
+ 
++    fn evalBytecodeUnOp(
++        self: *Vm,
++        proto: *const bc.Proto,
++        pc: usize,
++        op: TokenKind,
++        src_reg: u8,
++        src: Value,
++    ) DispatchError!Value {
++        return self.evalUnOp(op, src) catch |err| {
++            if (err != error.RuntimeError or self.err == null) return err;
++            const inferred = debugBytecodeOperandName(proto, pc, src_reg);
++            if (inferred.name) |name| {
++                if (op == .Minus and
++                    std.mem.startsWith(u8, self.err.?, "type error: unary '-' expects number"))
++                {
++                    return self.fail(
++                        "attempt to perform arithmetic on a {s} value ({s} '{s}')",
++                        .{ self.valueTypeName(src), inferred.namewhat, name },
++                    );
++                }
++                if (op == .Tilde and
++                    std.mem.startsWith(u8, self.err.?, "number has no integer representation"))
++                {
++                    return self.fail(
++                        "number has no integer representation ({s} '{s}')",
++                        .{ inferred.namewhat, name },
++                    );
++                }
++                if (op == .Tilde and
++                    std.mem.startsWith(u8, self.err.?, "attempt to perform bitwise operation on a "))
++                {
++                    return self.fail(
++                        "attempt to perform bitwise operation on a {s} value ({s} '{s}')",
++                        .{ self.valueTypeName(src), inferred.namewhat, name },
++                    );
++                }
++            }
++            return err;
++        };
++    }
++
++    fn bytecodeIndexValue(
++        self: *Vm,
++        proto: *const bc.Proto,
++        pc: usize,
++        object_reg: u8,
++        object: Value,
++        key: Value,
++    ) DispatchError!Value {
++        return self.indexValue(object, key) catch |err| {
++            var expected_buf: [96]u8 = undefined;
++            const expected = std.fmt.bufPrint(
++                expected_buf[0..],
++                "attempt to index a {s} value",
++                .{object.typeName()},
++            ) catch "";
++            if (err == error.RuntimeError and self.err != null and
++                std.mem.startsWith(u8, self.err.?, expected))
++            {
++                const inferred = debugBytecodeOperandName(proto, pc, object_reg);
++                if (inferred.name) |name| {
++                    return self.fail(
++                        "attempt to index a {s} value ({s} '{s}')",
++                        .{ object.typeName(), inferred.namewhat, name },
++                    );
++                }
++            }
++            return err;
++        };
++    }
++
++    fn bytecodeSetIndexValue(
++        self: *Vm,
++        proto: *const bc.Proto,
++        pc: usize,
++        object_reg: u8,
++        object: Value,
++        key: Value,
++        value: Value,
++    ) DispatchError!void {
++        self.setIndexValue(object, key, value) catch |err| {
++            var expected_buf: [96]u8 = undefined;
++            const expected = std.fmt.bufPrint(
++                expected_buf[0..],
++                "attempt to index a {s} value",
++                .{object.typeName()},
++            ) catch "";
++            if (err == error.RuntimeError and self.err != null and
++                std.mem.startsWith(u8, self.err.?, expected))
++            {
++                const inferred = debugBytecodeOperandName(proto, pc, object_reg);
++                if (inferred.name) |name| {
++                    return self.fail(
++                        "attempt to index a {s} value ({s} '{s}')",
++                        .{ object.typeName(), inferred.namewhat, name },
++                    );
++                }
++            }
++            return err;
++        };
++    }
++
++    fn evalBytecodeBinOp(
++        self: *Vm,
++        proto: *const bc.Proto,
++        pc: usize,
++        op: TokenKind,
++        lhs_reg: u8,
++        rhs_reg: u8,
++        lhs: Value,
++        rhs: Value,
++    ) DispatchError!Value {
++        return self.evalBinOp(op, lhs, rhs) catch |err| {
++            if (err != error.RuntimeError or self.err == null) return err;
++
++            if (std.mem.startsWith(u8, self.err.?, "attempt to perform arithmetic on a ")) {
++                const bad_reg = if (!isNumberLikeForArithmetic(lhs)) lhs_reg else rhs_reg;
++                const bad = if (!isNumberLikeForArithmetic(lhs)) lhs else rhs;
++                const inferred = debugBytecodeOperandName(proto, pc, bad_reg);
++                if (inferred.name) |name| {
++                    return self.fail(
++                        "attempt to perform arithmetic on a {s} value ({s} '{s}')",
++                        .{ self.valueTypeName(bad), inferred.namewhat, name },
++                    );
++                }
++            }
++
++            if (std.mem.startsWith(u8, self.err.?, "number has no integer representation")) {
++                const bad_reg = if (isNumWithoutInteger(lhs)) lhs_reg else rhs_reg;
++                const inferred = debugBytecodeOperandName(proto, pc, bad_reg);
++                if (inferred.name) |name| {
++                    return self.fail(
++                        "number has no integer representation ({s} '{s}')",
++                        .{ inferred.namewhat, name },
++                    );
++                }
++            }
++
++            return err;
++        };
++    }
++
+     fn valuesEqual(lhs: Value, rhs: Value) bool {
+         return switch (lhs) {
+             .Nil => rhs == .Nil,
+diff -ruN '--exclude=.zig-cache' '--exclude=zig-out' '--exclude=build' '--exclude=*.o' '--exclude=*.a' '--exclude=luac.out' a/tests/smoke/31_debug_bytecode_parity.lua b/tests/smoke/31_debug_bytecode_parity.lua
+--- a/tests/smoke/31_debug_bytecode_parity.lua	2026-07-13 11:29:52.000000000 +0000
++++ b/tests/smoke/31_debug_bytecode_parity.lua	2026-07-13 13:22:18.670082216 +0000
+@@ -1,5 +1,18 @@
+ -- Bytecode debug API parity across live, suspended, and stripped frames.
+ 
++-- A running parent closure is temporarily displaced while its debug hook
++-- executes. GC inside the hook must retain the saved parent continuation.
++local hook_gc_hits = 0
++debug.sethook(function ()
++  collectgarbage()
++  hook_gc_hits = hook_gc_hits + 1
++end, "l")
++local hook_gc_value = 1
++hook_gc_value = hook_gc_value + 1
++debug.sethook()
++assert(hook_gc_hits > 0 and hook_gc_value == 2)
++collectgarbage()
++
+ local main = debug.getinfo(1, "fu")
+ assert(type(main.func) == "function")
+ assert(debug.getupvalue(main.func, 1) == "_ENV")
+@@ -52,6 +65,13 @@
+   local x = 1
+   return x
+ end
++-- lua_load initializes the first upvalue of a stripped main chunk even
++-- though the _ENV upvalue name itself has been removed.
++local stripped_main = assert(load(string.dump(assert(load(
++  "return type(require'debug'.getinfo) == 'function'"
++)), true)))
++assert(stripped_main())
++
+ local stripped = assert(load(string.dump(source_with_lines, true)))
+ local hook_event, hook_line = false, true
+ debug.sethook(function (event, line)

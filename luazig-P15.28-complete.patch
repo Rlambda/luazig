@@ -1,0 +1,658 @@
+diff -ruN '--exclude=.zig-cache' '--exclude=zig-cache' '--exclude=zig-out' '--exclude=build' '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=*.o' '--exclude=*.a' a/README.md b/README.md
+--- a/README.md	2026-07-13 13:51:03.000000000 +0000
++++ b/README.md	2026-07-13 15:19:53.481326191 +0000
+@@ -19,14 +19,13 @@
+ Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend (default).
+ IR VM (`--vm=ir`) заморожена: код компилируется и доступен для отладки, parity не поддерживается.
+ 
+-bc_vm проходит **29/29 test suites**: api, attrib, bitwise, bwcoercion, calls, closure, code, constructs, coroutine, cstack, db, errors, events, files, gc, gengc, goto, literals, locals, math, memerr, nextvar, pm, sort, strings, tpack, tracegc, utf8, vararg.
++bc_vm проходит **29/29 test suites**: api, attrib, bitwise, bwcoercion, calls, closure, code, constructs, coroutine, cstack, db, errors, events, files, gc, gengc, goto, literals, locals, math, memerr, nextvar, pm, sort, strings, tpack, tracegc, utf8, vararg. Матрица запускается с upstream portable/soft prelude `_port=true; _soft=true`; тяжёлые ветки `constructs.lua` и `verybig.lua` дополнительно проверяются напрямую без `_soft`.
+ 
+ IR VM (frozen snapshot) проходила 32/33 suites. Результаты сохранены как reference.
+ 
+ Ограничения:
+ 
+-- bc_vm достиг функциональной parity (29/29 suites). Производительность не профилировалась (gc.lua ~22s vs 0.2s PUC в Debug).
+-- Производительность bc_vm не профилировалась (в разработке).
++- bc_vm достиг функциональной parity (29/29 suites). Производительность всё ещё заметно ниже PUC Lua и не считается production-ready; отдельные Debug suites, например `math.lua`, близки к 60-секундному verification budget.
+ - IR VM доступна через `--vm=ir` для отладки, но не гарантируется от регрессий.
+ - C ABI shim остаётся smoke/compat слоем поверх Zig API.
+ - Production/drop-in статус пока не заявляется.
+@@ -78,6 +77,8 @@
+ - `tests/smoke/38_iterative_protected_dispatch.lua`;
+ - `tests/smoke/39_complete_iterative_dispatch.lua`;
+ - `tests/smoke/40_large_setlist_extraarg.lua`;
++- `tests/smoke/41_strict_globals_env.lua`;
++- `tests/smoke/42_gc_debt_and_generational_step.lua`;
+ - `tests/stress/iterative_dispatch.lua` через
+   `tools/iterative_dispatch_stress.sh`.
+ 
+@@ -85,7 +86,7 @@
+ вложенных `coroutine.resume` с yield/resume, 2000 рекурсивных metamethod
+ вызовов, 1000 вложенных `string.gsub` callbacks и mixed bytecode↔`testC` yield
+ для `CALL`/`TAILCALL`/`TFORCALL`. Полный `cstack.lua` также проходит при
+-1-МБ host stack. Zig unit tests и 40/40 differential smoke проходят. Все
++1-МБ host stack. Zig unit tests и 42/42 differential smoke проходят. Все
+ заявленные 29 upstream suites завершаются успешно на bc VM; точные глубины
+ `C stack overflow` остаются implementation-defined, но semantic assertions
+ совпадают.
+@@ -123,7 +124,7 @@
+ точка thread switching.
+ 
+ После hardening и последующей regression-cleanup фазы повторно пройдены Zig
+-unit tests, 40/40 differential smoke, 1-МБ iterative-dispatch stress lane и
++unit tests, 42/42 differential smoke, 1-МБ iterative-dispatch stress lane и
+ ровно заявленные 29/29 upstream suites по exit/assertion status.
+ 
+ ### Выполнено: завершение regression cleanup после P15.26 (P15.27)
+@@ -159,11 +160,44 @@
+ Подтверждённые проверки для Zig 0.16.0:
+ 
+ - `zig build test -Doptimize=Debug` — PASS;
+-- differential smoke — 40/40 PASS;
++- differential smoke — 42/42 PASS;
+ - iterative dispatch stress под 1-МБ host stack — PASS;
+-- заявленная upstream matrix — 29/29 PASS;
++- заявленная upstream matrix с `_port=true; _soft=true` и timeout 60 секунд на suite — 29/29 PASS;
++- direct `constructs.lua` без `_soft` под `timeout 60` — `OK` (56.15 с в verification-контейнере);
+ - direct `verybig.lua` без `_soft` — `+`, `OK`.
+ 
++### Выполнено: verifier follow-up и GC debt/performance hardening (P15.28)
++
++После review P15.27 закрыты все замечания, мешавшие воспроизводимому принятию
++патча:
++
++1. Автоматический GC больше не запускает полный mark+sweep по фиксированному
++   числу инструкций. Следующий цикл планируется от live-heap/debt после
++   предыдущего, поэтому тысячи динамических `load()` не вызывают повторный
++   полный scan растущего heap. Вместе с устранением лишних AST-аллокаций это
++   довело неизменённый direct `constructs.lua` до 56.15 с в Debug и позволило
++   пройти жёсткий `timeout 60`.
++2. Короткие interned strings теперь учитываются в `gc_count_kb`. Раньше цикл,
++   создающий только короткие строки, мог выделить сотни мегабайт, не увеличив
++   automatic-GC debt; upstream `closure.lua` бесконечно ждал очистки weak
++   table. Регрессия закреплена в
++   `tests/smoke/42_gc_debt_and_generational_step.lua`.
++3. В generational mode каждый явный `collectgarbage("step")` выполняет один
++   атомарный цикл и возвращает `false`, как PUC в наблюдаемом API. Это
++   сохраняет weak-table/barrier semantics при текущем collector без persistent
++   young-generation phases и возвращает `gengc.lua` в green.
++4. Публичный `runBytecode` возвращает только `Vm.Error`; приватный
++   `runBytecodeInternal` локализует `DispatchError`/`ThreadSwitch` внутри
++   execution layer.
++5. Strict-global codegen больше не содержит списка имён stdlib. `_ENV` остаётся
++   единственным специальным lexical mechanism, а `print`, `require` и прочие
++   runtime globals должны быть объявлены по тем же правилам, что и
++   пользовательские имена. Это проверяет
++   `tests/smoke/41_strict_globals_env.lua`.
++6. `lua-5.5.0/testes/time.txt` сохранён без изменений. Это не semantic fixture,
++   а tracked cache времени предыдущего запуска `all.lua`; matrix runner
++   snapshot/restore'ит его, чтобы тестовый прогон не загрязнял upstream tree.
++
+ ### TODO: настоящие инкрементальные GC phases (PUC-first)
+ 
+ Текущая реализация `collectgarbage("step", n)` использует debt-gate: первые
+@@ -566,6 +600,7 @@
+ - [x] Профилировать bc_vm после достижения parity — ReleaseFast snapshot обновлён в P15.22 (`tools/perf/core_current.json`).
+ - [ ] Развивать публичный Zig embedding API после стабилизации bc_vm.
+ - [x] Держать README, release gate и perf baselines актуальными после текущей GC/string фазы.
++- [x] Закрыть verifier follow-up P15.28: direct `constructs.lua` <60 с, 29/29 matrix, short-string GC debt и generational step regression.
+ 
+ ### Housekeeping (до или параллельно с Phase A)
+ 
+@@ -616,5 +651,6 @@
+ - P15.25: complete iterative bytecode dispatch — Lua metamethods, debug hooks, yielding `__close`, nested `coroutine.resume` и `string.gsub` Lua callbacks переведены на `BytecodePendingCompletion`/thread-owned continuations. Persistent unwind продолжает close chain после yield и ошибок; coroutine trampoline переключает parked `Thread` через `ThreadSwitch` без Zig recursion. Bytecode snapshot/replay удалён; `IrSuspendedFrame` остался только у frozen IR compatibility children и связан с bc caller через explicit pending continuation. Удалён 256-МБ interpreter thread stack. `hasActiveClose()` синхронизирует tail-call policy с PUC Lua для named и generic-for TBC slots. Добавлены smoke `39_complete_iterative_dispatch.lua` и 1-МБ stress lane. Unit tests, 39/39 smoke, полный `cstack.lua` под 1-МБ stack и 29/29 upstream suites по exit/assertion status проходят.
+ - P15.26: dispatch review hardening — повторно подтверждён PUC-order hidden generic-for TBC (`return` expression вычисляется до iterator `__close`, результат `false true`); `ThreadSwitch` удалён из публичного `Vm.Error` и локализован в private `DispatchError`/coroutine trampoline; `api.zig` больше не знает о внутреннем сигнале. Рядом с pending continuation state документированы ownership, cleanup, yield и thread-switch invariants. После рефакторинга повторно проходят unit tests, 39/39 smoke, 1-МБ stress lane и 29/29 upstream suites.
+ - P15.27: завершение regression cleanup после iterative dispatch — исправлены large `SETLIST + EXTRAARG`, lexical `goto`/global-attribute/named-vararg semantics, source line tables и PUC-like line-hook `oldpc`; удалён trace preseed. `saved_parent_callee` debug-hook continuation добавлен в GC roots, а stripped `load` всегда инициализирует первый environment upvalue. Расширен smoke `31_debug_bytecode_parity.lua`; `40_large_setlist_extraarg.lua` закрепляет `verybig` codegen. Подтверждены unit tests, 40/40 smoke, 1-МБ stress, 29/29 upstream matrix и direct `verybig.lua`.
++- P15.28: verifier follow-up — dynamic `load()`/automatic-GC scheduling переведены с fixed instruction cadence на live-heap debt, короткие interned strings включены в memory accounting, а explicit generational step выполняет атомарный цикл с PUC-compatible `false` result. `runBytecode` скрывает private dispatch signal, strict-global codegen не знает имён stdlib, `time.txt` сохраняется через snapshot/restore. Добавлен smoke `42_gc_debt_and_generational_step.lua`; подтверждены 42/42 smoke, 29/29 soft/portable matrix, direct `constructs.lua` <60 с и direct `verybig.lua`.
+ 
+ Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).
+diff -ruN '--exclude=.zig-cache' '--exclude=zig-cache' '--exclude=zig-out' '--exclude=build' '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=*.o' '--exclude=*.a' a/lua-5.5.0/testes/time.txt b/lua-5.5.0/testes/time.txt
+--- a/lua-5.5.0/testes/time.txt	1970-01-01 00:00:00.000000000 +0000
++++ b/lua-5.5.0/testes/time.txt	2026-07-13 13:59:53.000000000 +0000
+@@ -0,0 +1 @@
++0.411092
+diff -ruN '--exclude=.zig-cache' '--exclude=zig-cache' '--exclude=zig-out' '--exclude=build' '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=*.o' '--exclude=*.a' a/src/bin/luazig.zig b/src/bin/luazig.zig
+--- a/src/bin/luazig.zig	2026-07-13 13:51:03.000000000 +0000
++++ b/src/bin/luazig.zig	2026-07-13 13:59:53.000000000 +0000
+@@ -49,6 +49,7 @@
+     chunk: *const lua.internal.ast.Chunk,
+ ) std.mem.Allocator.Error!lua.internal.vm.DynamicBytecodeCompileResult {
+     var codegen = lua.internal.codegen_bc.Codegen.init(alloc, source.name, source.bytes);
++    defer codegen.deinit();
+     const proto = codegen.compileChunk(chunk) catch {
+         if (codegen.diag) |diag| {
+             return .{ .diagnostic = try std.fmt.allocPrint(alloc, ":{d}: {s}", .{ diag.line, diag.msg }) };
+@@ -93,6 +94,7 @@
+         .bc => {
+             // Bytecode VM: use new codegen_bc + bc_vm dispatch loop.
+             var cg_bc = lua.internal.codegen_bc.Codegen.init(aalloc, source.name, source.bytes);
++            defer cg_bc.deinit();
+             const proto = cg_bc.compileChunk(chunk) catch {
+                 var errw = stdio.stderr();
+                 try errw.print("{s}\n", .{cg_bc.diagString()});
+diff -ruN '--exclude=.zig-cache' '--exclude=zig-cache' '--exclude=zig-out' '--exclude=build' '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=*.o' '--exclude=*.a' a/src/lua/ast.zig b/src/lua/ast.zig
+--- a/src/lua/ast.zig	2026-07-13 13:51:03.000000000 +0000
++++ b/src/lua/ast.zig	2026-07-13 14:14:57.000000000 +0000
+@@ -189,6 +189,14 @@
+         self.arena.deinit();
+     }
+ 
++    /// Drop all AST nodes while retaining the arena's backing capacity.
++    /// Dynamic `load` compilation calls this between chunks so repeated small
++    /// compilations do not return to the general-purpose allocator for every
++    /// parser node. No AST pointer may survive code generation.
++    pub fn resetRetainingCapacity(self: *AstArena) void {
++        _ = self.arena.reset(.retain_capacity);
++    }
++
+     pub fn allocator(self: *AstArena) std.mem.Allocator {
+         return self.arena.allocator();
+     }
+diff -ruN '--exclude=.zig-cache' '--exclude=zig-cache' '--exclude=zig-out' '--exclude=build' '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=*.o' '--exclude=*.a' a/src/lua/codegen.zig b/src/lua/codegen.zig
+--- a/src/lua/codegen.zig	2026-07-13 13:51:03.000000000 +0000
++++ b/src/lua/codegen.zig	2026-07-13 14:21:06.000000000 +0000
+@@ -172,42 +172,12 @@
+     }
+ 
+     fn isGlobalAllowed(self: *Codegen, name: []const u8) bool {
+-        if (std.mem.eql(u8, name, "_ENV") or std.mem.eql(u8, name, "_G")) return true;
+-        if (std.mem.eql(u8, name, "assert") or
+-            std.mem.eql(u8, name, "collectgarbage") or
+-            std.mem.eql(u8, name, "dofile") or
+-            std.mem.eql(u8, name, "error") or
+-            std.mem.eql(u8, name, "getmetatable") or
+-            std.mem.eql(u8, name, "ipairs") or
+-            std.mem.eql(u8, name, "load") or
+-            std.mem.eql(u8, name, "loadfile") or
+-            std.mem.eql(u8, name, "next") or
+-            std.mem.eql(u8, name, "pairs") or
+-            std.mem.eql(u8, name, "pcall") or
+-            std.mem.eql(u8, name, "print") or
+-            std.mem.eql(u8, name, "rawequal") or
+-            std.mem.eql(u8, name, "rawget") or
+-            std.mem.eql(u8, name, "rawset") or
+-            std.mem.eql(u8, name, "require") or
+-            std.mem.eql(u8, name, "select") or
+-            std.mem.eql(u8, name, "setmetatable") or
+-            std.mem.eql(u8, name, "tonumber") or
+-            std.mem.eql(u8, name, "tostring") or
+-            std.mem.eql(u8, name, "type") or
+-            std.mem.eql(u8, name, "warn") or
+-            std.mem.eql(u8, name, "xpcall") or
+-            std.mem.eql(u8, name, "coroutine") or
+-            std.mem.eql(u8, name, "debug") or
+-            std.mem.eql(u8, name, "io") or
+-            std.mem.eql(u8, name, "math") or
+-            std.mem.eql(u8, name, "os") or
+-            std.mem.eql(u8, name, "package") or
+-            std.mem.eql(u8, name, "string") or
+-            std.mem.eql(u8, name, "table") or
+-            std.mem.eql(u8, name, "utf8"))
+-        {
+-            return true;
+-        }
++        // `_ENV` is the lexical mechanism used to access globals, not itself a
++        // declaration governed by `global`. Runtime library names are ordinary
++        // globals: strict mode must not depend on which standard libraries the
++        // host installed or how `_ENV` was replaced.
++        if (std.mem.eql(u8, name, "_ENV")) return true;
++
+         var cur: ?*Codegen = self;
+         var saw_strict = false;
+         while (cur) |cg| {
+diff -ruN '--exclude=.zig-cache' '--exclude=zig-cache' '--exclude=zig-out' '--exclude=build' '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=*.o' '--exclude=*.a' a/src/lua/codegen_bc.zig b/src/lua/codegen_bc.zig
+--- a/src/lua/codegen_bc.zig	2026-07-13 13:51:03.000000000 +0000
++++ b/src/lua/codegen_bc.zig	2026-07-13 13:59:53.000000000 +0000
+@@ -193,6 +193,38 @@
+         };
+     }
+ 
++    /// Release compiler-only state. The returned Proto owns the bytecode,
++    /// constants, child protos, upvalue descriptors, line tables, and local
++    /// debug records transferred by ProtoBuilder.finish(); all maps and logs
++    /// left on Codegen are scratch storage and must not accumulate across
++    /// repeated load() calls.
++    pub fn deinit(self: *Codegen) void {
++        self.builder.deinit();
++        self.bindings.deinit(self.alloc);
++        self.scope_marks.deinit(self.alloc);
++        self.scope_close_regs.deinit(self.alloc);
++        self.loop_ends.deinit(self.alloc);
++        self.active_labels.deinit(self.alloc);
++        self.label_scope_marks.deinit(self.alloc);
++        self.pending_gotos.deinit(self.alloc);
++        self.scope_ids.deinit(self.alloc);
++        self.scope_parent_by_id.deinit(self.alloc);
++        self.jump_guards.deinit(self.alloc);
++        self.declared_globals.deinit(self.alloc);
++        self.declared_globals_log.deinit(self.alloc);
++        self.declared_globals_depth_log.deinit(self.alloc);
++        self.global_attrs.deinit(self.alloc);
++        self.global_attr_log.deinit(self.alloc);
++        self.global_scope_marks.deinit(self.alloc);
++        self.upvalues.deinit(self.alloc);
++        self.upvalue_descs.deinit(self.alloc);
++        self.captured_regs.deinit(self.alloc);
++        self.const_locals.deinit(self.alloc);
++        self.readonly_locals.deinit(self.alloc);
++        self.close_locals.deinit(self.alloc);
++        self.const_upvalues.deinit(self.alloc);
++    }
++
+     pub fn diagString(self: *Codegen) []const u8 {
+         const d = self.diag orelse return "unknown error";
+         return d.bufFormat(self.diag_buf[0..]);
+@@ -440,19 +472,10 @@
+     }
+ 
+     fn isGlobalAllowed(self: *const Codegen, name: []const u8) bool {
+-        if (std.mem.eql(u8, name, "_ENV") or std.mem.eql(u8, name, "_G")) return true;
+-        const builtins = [_][]const u8{
+-            "assert",  "collectgarbage", "dofile",       "error",     "getmetatable",
+-            "ipairs",  "load",           "loadfile",     "next",      "pairs",
+-            "pcall",   "print",          "rawequal",     "rawget",    "rawset",
+-            "require", "select",         "setmetatable", "tonumber",  "tostring",
+-            "type",    "warn",           "xpcall",       "coroutine", "debug",
+-            "io",      "math",           "os",           "package",   "string",
+-            "table",   "utf8",
+-        };
+-        for (builtins) |builtin| {
+-            if (std.mem.eql(u8, name, builtin)) return true;
+-        }
++        // `_ENV` is the mechanism used to access globals, not a declaration
++        // governed by `global` statements. `_G` itself is otherwise an
++        // ordinary global and follows the same lexical rules as every name.
++        if (std.mem.eql(u8, name, "_ENV")) return true;
+ 
+         var current: ?*const Codegen = self;
+         var saw_strict = false;
+@@ -1931,6 +1954,7 @@
+         line: u32,
+     ) Error!*bc.Proto {
+         var child = Codegen.init(self.alloc, self.source_name, self.source);
++        defer child.deinit();
+         child.outer = self;
+         child.builder.name = name;
+         child.builder.source_name = self.source_name;
+diff -ruN '--exclude=.zig-cache' '--exclude=zig-cache' '--exclude=zig-out' '--exclude=build' '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=*.o' '--exclude=*.a' a/src/lua/vm.zig b/src/lua/vm.zig
+--- a/src/lua/vm.zig	2026-07-13 13:51:03.000000000 +0000
++++ b/src/lua/vm.zig	2026-07-13 15:07:00.000000000 +0000
+@@ -1331,6 +1331,10 @@
+     };
+ 
+     alloc: std.mem.Allocator,
++    /// Scratch AST arena reused by runtime `load`/`loadfile`/`dofile`. The
++    /// generated IR/Proto owns every value that survives compilation, so AST
++    /// storage can be reset immediately after each frontend invocation.
++    dynamic_ast_arena: lua_ast.AstArena,
+     dynamic_bytecode_compiler: ?DynamicBytecodeCompiler = null,
+     global_env: *Table,
+     string_metatable: *Table,
+@@ -1425,10 +1429,15 @@
+     gc_step_active: bool = false,
+     gc_step_remaining_bytes: usize = 0,
+     gc_alloc_tables: usize = 0,
+-    // Automatic GC trigger based on table allocations.
+-    // We keep the default relatively high so table-heavy benchmarks/tests
+-    // (gc.lua "long list") don't spend most of their time in GC.
++    // Allocation sites and the dispatch loop periodically *check* this debt
++    // threshold. They no longer run a full collection merely because a fixed
++    // number of VM instructions elapsed: doing so repeatedly rescanned a large
++    // live heap and made constructs.lua quadratic. Like PUC's pause/debt model,
++    // the next automatic cycle is scheduled from the live heap size left by the
++    // previous cycle.
+     gc_alloc_threshold: usize = 20000,
++    gc_auto_threshold_kb: f64 = 32768.0,
++    gc_finalizer_tick_pending: bool = false,
+     gc_in_cycle: bool = false,
+     gc_tick: usize = 0,
+     gc_inst: usize = 0,
+@@ -1554,7 +1563,12 @@
+         env.* = .{};
+         const str_mt = alloc.create(Table) catch @panic("oom");
+         str_mt.* = .{};
+-        var vm: Vm = .{ .alloc = alloc, .global_env = env, .string_metatable = str_mt };
++        var vm: Vm = .{
++            .alloc = alloc,
++            .dynamic_ast_arena = lua_ast.AstArena.init(alloc),
++            .global_env = env,
++            .string_metatable = str_mt,
++        };
+         vm.gc_tables.append(alloc, env) catch @panic("oom");
+         vm.gc_tables.append(alloc, str_mt) catch @panic("oom");
+         const main_th = alloc.create(Thread) catch @panic("oom");
+@@ -1889,6 +1903,7 @@
+         self.finalizables.deinit(self.alloc);
+         self.debug_upvalue_ids.deinit(self.alloc);
+         self.dump_registry.deinit(self.alloc);
++        self.dynamic_ast_arena.deinit();
+         self.frames.deinit(self.alloc);
+         self.alloc.free(self.bc_stack);
+         self.alloc.free(self.bc_boxed);
+@@ -2452,6 +2467,16 @@
+         return .{ .vm = self, .snapshot = self.gc_temp_roots.items.len };
+     }
+ 
++    /// Register a table for finalization and arm one prompt automatic cycle.
++    /// A reachable long-lived finalizable (for example stdout) must not force a
++    /// full collection forever; after one cycle, ordinary heap debt schedules
++    /// subsequent collections.
++    fn registerFinalizable(self: *Vm, tbl: *Table) std.mem.Allocator.Error!void {
++        if (self.finalizables.contains(tbl)) return;
++        try self.finalizables.put(self.alloc, tbl, {});
++        self.gc_finalizer_tick_pending = true;
++    }
++
+     fn allocTableNoGc(self: *Vm) std.mem.Allocator.Error!*Table {
+         self.testcNoteMemory(@sizeOf(Table) + 64);
+         const t = try self.alloc.create(Table);
+@@ -2467,21 +2492,25 @@
+         const t = try self.allocTableNoGc();
+         self.gc_alloc_tables += 1;
+         self.gc_last_table_inst = self.gc_inst;
+-        // Adaptive threshold: tests that create many __gc objects rely on
+-        // "automatic" collection happening in a reasonable number of
+-        // allocations, but most code should not run GC too frequently.
+-        const threshold = if (self.finalizables.count() != 0) 200 else self.gc_alloc_threshold;
+-        if (self.gc_running and !self.gc_in_cycle and self.gc_alloc_tables >= threshold) {
++
++        // Finalizable objects need prompt automatic progress for Lua's
++        // observable __gc semantics. Otherwise table allocation is merely a
++        // periodic place to inspect heap debt; the debt threshold itself is
++        // updated after each full cycle from the amount of surviving memory.
++        const finalizer_due = self.gc_finalizer_tick_pending;
++        const check_after = if (finalizer_due) @as(usize, 200) else self.gc_alloc_threshold;
++        if (self.gc_running and !self.gc_in_cycle and self.gc_alloc_tables >= check_after) {
+             self.gc_alloc_tables = 0;
+-            // Protect the just-allocated table: it's in the gc_tables registry
+-            // but not yet in any root (hasn't been returned to the caller).
+-            // Temp roots ensure the mark phase sees it and sweep keeps it alive.
+-            var roots = self.gcTempRoots();
+-            defer roots.end();
+-            try roots.add(.{ .Table = t });
+-            // Full cycle with sweep. Temp roots + live_regs make this safe even
+-            // mid-expression — the mark phase sees all live values.
+-            try self.gcCycleFullInternal(true);
++            if (finalizer_due or self.gcAutoCycleDue()) {
++                // Protect the just-allocated table: it is registered but has
++                // not yet been returned to the caller and therefore is not in
++                // a Lua root. This is the non-moving equivalent of keeping it
++                // on L's stack while the collector runs.
++                var roots = self.gcTempRoots();
++                defer roots.end();
++                try roots.add(.{ .Table = t });
++                try self.gcCycleFull();
++            }
+         }
+         return t;
+     }
+@@ -2831,10 +2860,12 @@
+                     self.gc_tick += 1;
+                     if (self.gc_tick >= self.gc_tick_threshold) {
+                         self.gc_tick = 0;
+-                        // Tick trigger: between instructions. Register-top tracking
+-                        // (live_regs) ensures all live registers are marked. Safe
+-                        // to sweep here — no builtin is executing.
+-                        try self.gcCycleFull();
++                        // This is a debt check, not a fixed-period full cycle.
++                        // Finalizers retain their prompt-progress guarantee;
++                        // ordinary code follows the heap-growth threshold.
++                        if (self.gc_finalizer_tick_pending or self.gcAutoCycleDue()) {
++                            try self.gcCycleFull();
++                        }
+                     }
+                 }
+             }
+@@ -6407,13 +6438,10 @@
+         }
+     }
+ 
+-    pub fn runBytecode(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure) DispatchError![]Value {
+-        return self.runBytecodeInternal(proto_in, upvalues_in, args, callee_cl) catch |err| switch (err) {
+-            error.ThreadSwitch => unreachable,
+-            error.OutOfMemory => return error.OutOfMemory,
+-            error.RuntimeError => return error.RuntimeError,
+-            error.Yield => return error.Yield,
+-        };
++    /// Public direct-bytecode entry point. Internal coroutine trampoline
++    /// control flow is narrowed at this boundary and cannot escape to callers.
++    pub fn runBytecode(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure) Error![]Value {
++        return exposeDispatchResult([]Value, self.runBytecodeInternal(proto_in, upvalues_in, args, callee_cl));
+     }
+ 
+     fn runBytecodeInternal(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure) DispatchError![]Value {
+@@ -6840,10 +6868,13 @@
+                     self.gc_tick +%= 1;
+                     if (self.gc_tick >= self.gc_tick_threshold) {
+                         self.gc_tick = 0;
+-                        try self.gcCycleFull();
+-                        // GC may have moved stack; refresh.
+-                        regs = self.bc_stack[base .. base + frame_cap];
+-                        boxed = self.bc_boxed[base .. base + frame_cap];
++                        if (self.gc_finalizer_tick_pending or self.gcAutoCycleDue()) {
++                            try self.gcCycleFull();
++                            // GC may have reallocated VM-owned bookkeeping;
++                            // refresh hot slices after a real cycle.
++                            regs = self.bc_stack[base .. base + frame_cap];
++                            boxed = self.bc_boxed[base .. base + frame_cap];
++                        }
+                     }
+                 }
+ 
+@@ -8862,6 +8893,11 @@
+             if (self.string_intern.table.get(raw)) |existing| return existing;
+             const ls = try createLuaString(self.alloc, raw, hash);
+             try self.string_intern.table.put(self.alloc, ls.bytes(), ls);
++            // Short strings are currently pinned in the intern table, but they
++            // still consume heap memory and must contribute to automatic-GC
++            // debt. Omitting them lets allocation-heavy code create hundreds
++            // of megabytes while gc_count_kb remains nearly constant.
++            self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(LuaString) + raw.len + 24)) / 1024.0;
+             self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 24);
+             self.testc_obj_strings += 1;
+             return ls;
+@@ -9963,6 +9999,18 @@
+     fn gcExplicitStep(self: *Vm, requested_kb: i64) DispatchError!bool {
+         if (self.gc_in_cycle) return false;
+ 
++        // The current collector has no persistent young-generation phases.
++        // In generational mode, an explicit step therefore performs one
++        // complete atomic collection immediately. This preserves the
++        // observable PUC contract needed by write barriers and weak tables:
++        // every `collectgarbage("step")` advances a minor collection, while
++        // its return value remains false (PUC reports false for these steps).
++        if (self.gc_mode == .generational) {
++            self.resetGcStepDebt();
++            try self.gcCycleFull();
++            return false;
++        }
++
+         if (!self.gc_step_active) {
+             const estimated_bytes = @max(self.gc_count_kb * 1024.0, 1.0);
+             const max_bytes: f64 = @floatFromInt(std.math.maxInt(usize));
+@@ -10065,6 +10113,7 @@
+                     else => return self.fail("collectgarbage('param', ..., value) expects integer value", .{}),
+                 };
+                 target.* = newv;
++                if (std.mem.eql(u8, pname, "pause")) self.gcScheduleNextAutomaticCycle();
+             }
+             if (want_out) outs[0] = .{ .Int = old };
+             return;
+@@ -11851,6 +11900,20 @@
+         };
+     }
+ 
++    fn gcAutoCycleDue(self: *const Vm) bool {
++        return self.gc_count_kb >= self.gc_auto_threshold_kb;
++    }
++
++    /// Schedule the next automatic cycle from the live heap left after this
++    /// one, mirroring PUC Lua's pause policy. A small minimum growth avoids a
++    /// tight cycle loop for tiny heaps whose accounting changes by fractions
++    /// of a kilobyte.
++    fn gcScheduleNextAutomaticCycle(self: *Vm) void {
++        const pause: f64 = @floatFromInt(@max(self.gc_pause, 100));
++        const by_pause = self.gc_count_kb * pause / 100.0;
++        self.gc_auto_threshold_kb = @max(by_pause, self.gc_count_kb + 256.0);
++    }
++
+     fn gcCycleFull(self: *Vm) DispatchError!void {
+         return self.gcCycleFullInternal(true);
+     }
+@@ -12060,6 +12123,9 @@
+             // invariant.
+             // try self.string_intern.sweep(self.alloc, &self.gc_marked_strings);
+         }
++
++        self.gcScheduleNextAutomaticCycle();
++        self.gc_finalizer_tick_pending = false;
+     }
+ 
+     /// Mark all GC roots that live directly on the Vm struct and are NOT
+@@ -13059,9 +13125,9 @@
+                 try self.alloc.dupe(u8, lex.diagString());
+             return .{ .diagnostic = @constCast(diagnostic) };
+         };
+-        var ast_arena = lua_ast.AstArena.init(self.alloc);
+-        defer ast_arena.deinit();
+-        const chunk = p.parseChunkAst(&ast_arena) catch {
++        self.dynamic_ast_arena.resetRetainingCapacity();
++        defer self.dynamic_ast_arena.resetRetainingCapacity();
++        const chunk = p.parseChunkAst(&self.dynamic_ast_arena) catch {
+             const diagnostic = if (load_error_style)
+                 try self.formatLoadSyntaxError(source, &p)
+             else
+@@ -14088,7 +14154,7 @@
+             .Table => |mt| {
+                 tbl.metatable = mt;
+                 if (self.getFieldOpt(mt, "__gc") != null) {
+-                    try self.finalizables.put(self.alloc, tbl, {});
++                    try self.registerFinalizable(tbl);
+                 } else {
+                     _ = self.finalizables.remove(tbl);
+                 }
+@@ -16012,7 +16078,7 @@
+                 tbl.metatable = mt;
+                 if (mt) |m| {
+                     if (self.getFieldOpt(m, "__gc") != null) {
+-                        try self.finalizables.put(self.alloc, tbl, {});
++                        try self.registerFinalizable(tbl);
+                         const tv: Value = .{ .Table = tbl };
+                         if (isTestcUserdata(self, tv) and !isTestcLightUserdata(self, tv)) {
+                             const tracked = switch (self.getFieldOpt(tbl, "__gc_tracked") orelse .Nil) {
+@@ -17147,7 +17213,7 @@
+         const file_mt = self.file_metatable orelse return self.fail("file metatable missing", .{});
+         const tbl = try self.allocTableNoGc();
+         tbl.metatable = file_mt;
+-        try self.finalizables.put(self.alloc, tbl, {});
++        try self.registerFinalizable(tbl);
+         try self.setField(tbl, "close", .{ .Builtin = .file_close });
+         try self.setField(tbl, "write", .{ .Builtin = .file_write });
+         try self.setField(tbl, "read", .{ .Builtin = .file_read });
+diff -ruN '--exclude=.zig-cache' '--exclude=zig-cache' '--exclude=zig-out' '--exclude=build' '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=*.o' '--exclude=*.a' a/tests/smoke/41_strict_globals_env.lua b/tests/smoke/41_strict_globals_env.lua
+--- a/tests/smoke/41_strict_globals_env.lua	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/smoke/41_strict_globals_env.lua	2026-07-13 14:25:14.000000000 +0000
+@@ -0,0 +1,16 @@
++-- Standard-library names are ordinary globals under a lexical `global`
++-- declaration. The compiler must not silently whitelist names such as
++-- `print`, because a loaded chunk can use an arbitrary environment.
++local f, err = load([[global marker; return print(marker)]], "strict-stdlib")
++assert(f == nil)
++assert(string.find(err, "variable 'print'", 1, true))
++
++local env = { marker = 41 }
++local chunk = assert(load([[global marker; return marker]], "strict-env", "t", env))
++assert(chunk() == 41)
++
++local g, gerr = load([[global marker; return _G]], "strict-g")
++assert(g == nil)
++assert(string.find(gerr, "variable '_G'", 1, true))
++
++print("strict-globals-env-ok")
+diff -ruN '--exclude=.zig-cache' '--exclude=zig-cache' '--exclude=zig-out' '--exclude=build' '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=*.o' '--exclude=*.a' a/tests/smoke/42_gc_debt_and_generational_step.lua b/tests/smoke/42_gc_debt_and_generational_step.lua
+--- a/tests/smoke/42_gc_debt_and_generational_step.lua	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/smoke/42_gc_debt_and_generational_step.lua	2026-07-13 15:11:14.000000000 +0000
+@@ -0,0 +1,22 @@
++-- Automatic collection must account for short interned strings. Otherwise a
++-- weak value can stay alive forever while the loop creates only short-string
++-- garbage and the GC debt never grows.
++collectgarbage("collect")
++local oldpause = collectgarbage("param", "pause", 100)
++local weak = setmetatable({[1] = {}}, {__mode = "v"})
++for i = 1, 20000 do
++  local garbage = tostring(i) .. ":" .. tostring(i)
++  if weak[1] == nil then break end
++end
++assert(weak[1] == nil)
++collectgarbage("param", "pause", oldpause)
++
++-- PUC advances a young collection on every explicit step in generational
++-- mode. The current atomic collector must preserve that observable behavior.
++local oldmode = collectgarbage("generational")
++local genweak = setmetatable({[1] = {10}}, {__mode = "kv"})
++assert(collectgarbage("step") == false)
++assert(genweak[1] == nil)
++collectgarbage(oldmode)
++
++print("gc-debt-generational-step-ok")
+diff -ruN '--exclude=.zig-cache' '--exclude=zig-cache' '--exclude=zig-out' '--exclude=build' '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=*.o' '--exclude=*.a' a/tools/testes_matrix.py b/tools/testes_matrix.py
+--- a/tools/testes_matrix.py	2026-07-13 13:51:03.000000000 +0000
++++ b/tools/testes_matrix.py	2026-07-13 14:29:04.000000000 +0000
+@@ -79,13 +79,26 @@
+     return ("/dev/full" in out) and ("Permission denied" in out)
+ 
+ 
+-def reset_all_lua_time_files(tests_dir: Path) -> None:
++def snapshot_all_lua_time_files(tests_dir: Path) -> dict[str, bytes | None]:
++    """Capture upstream timing fixtures before all.lua mutates them."""
++    return {
++        name: ((tests_dir / name).read_bytes() if (tests_dir / name).exists() else None)
++        for name in ("time.txt", "time-debug.txt")
++    }
++
++
++def clear_all_lua_time_files(tests_dir: Path) -> None:
+     for name in ("time.txt", "time-debug.txt"):
+-        p = tests_dir / name
+-        try:
+-            p.unlink()
+-        except FileNotFoundError:
+-            pass
++        (tests_dir / name).unlink(missing_ok=True)
++
++
++def restore_all_lua_time_files(tests_dir: Path, snapshot: dict[str, bytes | None]) -> None:
++    for name, contents in snapshot.items():
++        path = tests_dir / name
++        if contents is None:
++            path.unlink(missing_ok=True)
++        else:
++            path.write_bytes(contents)
+ 
+ 
+ def main() -> int:
+@@ -141,14 +154,19 @@
+         zig_cmd.append(rel)
+         timeout_s = timeout_overrides.get(rel, args.timeout)
+ 
++        time_snapshot: dict[str, bytes | None] | None = None
+         if rel == "all.lua":
+-            # all.lua persists elapsed-time markers; stale/corrupted files from
+-            # interrupted runs cause non-semantic assertion failures.
+-            reset_all_lua_time_files(tests_dir)
++            # all.lua persists elapsed-time markers. Run each engine from a
++            # clean state, then restore the upstream fixture exactly so the
++            # verification tool never dirties/deletes tracked test data.
++            time_snapshot = snapshot_all_lua_time_files(tests_dir)
++            clear_all_lua_time_files(tests_dir)
+         ref_code, ref_out = run(ref_cmd, cwd=tests_dir, env=base_env, timeout_s=timeout_s)
+         if rel == "all.lua":
+-            reset_all_lua_time_files(tests_dir)
++            clear_all_lua_time_files(tests_dir)
+         zig_code, zig_out = run(zig_cmd, cwd=tests_dir, env=base_env, timeout_s=timeout_s)
++        if time_snapshot is not None:
++            restore_all_lua_time_files(tests_dir, time_snapshot)
+ 
+         if ref_code == 0 and zig_code == 0:
+             cls = "pass"

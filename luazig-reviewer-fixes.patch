@@ -1,0 +1,3691 @@
+diff --git a/README.md b/README.md
+index 7a58a80dbb40c6f8908b53e634b0e0105e8f6fc6..547ed2c1f95e75ddcd5eedcb2cb3c5d935261b7b 100644
+--- a/README.md
++++ b/README.md
+@@ -56,11 +56,12 @@ backend. Как и `luaV_execute`/`CallInfo` в PUC Lua, один dispatch drive
+    новая ошибка внутри `__close` продолжает тот же LIFO scan. Уникальный
+    `activation_id` отличает заменённый child frame от нового frame с повторно
+    использованным stack base.
+-5. Вложенный `coroutine.resume` использует один trampoline и внутреннее
+-   действие `ThreadSwitch`: caller остаётся припаркованным в собственном
+-   explicit stack, а глубина цепочки coroutine больше не равна глубине Zig
+-   вызовов. Попытка resume предка остаётся обычной Lua-ошибкой, а не циклом
+-   trampoline.
++5. Вложенный `coroutine.resume` использует один trampoline и приватный
++   execution-layer сигнал `ThreadSwitch`: caller остаётся припаркованным в
++   собственном explicit stack, а глубина цепочки coroutine больше не равна
++   глубине Zig вызовов. Сигнал поглощается внутри trampoline и не входит в
++   публичный `Vm.Error`/Zig API. Попытка resume предка остаётся обычной
++   Lua-ошибкой, а не циклом trampoline.
+ 6. Bytecode-активации при yield/resume больше не сериализуются и не
+    replay'ятся: authoritative `BytecodeExecFrame` остаётся на `Thread`.
+    `IrSuspendedFrame` сохранён только для замороженного IR compatibility-кода
+@@ -105,6 +106,25 @@ locals, и скрытый четвёртый TBC slot generic-for. Поэтом
+ `BytecodeClosePost.retry_tailcall` остаётся для tailcall, где закрываются open
+ upvalues/остаточное runtime close-state, включая yield-safe продолжение.
+ 
++### Выполнено: hardening после dispatch review (P15.26)
++
++Повторно проверен blocker-кейс с ранним `return` из generic `for`: hidden TBC
++iterator close value закрывается **после** вычисления return-expression. PUC Lua
++и bc VM печатают `false  true`, а differential smoke
++`39_complete_iterative_dispatch.lua` проходит без расхождений.
++
++Внутренний coroutine control-flow отделён от публичной модели ошибок:
++`ThreadSwitch` находится только в private `DispatchError`, поглощается
++`driveBytecodeCoroutineTrampoline`, отсутствует в `Vm.Error`, а `api.zig`
++больше не содержит специальной ветки для него. Рядом с
++`BytecodePendingCompletion` зафиксированы invariants владения payload slices,
++cleanup authority, yieldable continuation kinds и единственная разрешённая
++точка thread switching.
++
++После hardening повторно пройдены Zig unit tests, 39/39 differential smoke,
++1-МБ iterative-dispatch stress lane и ровно заявленные 29/29 upstream suites
++по exit/assertion status.
++
+ ### TODO: настоящие инкрементальные GC phases (PUC-first)
+ 
+ Текущая реализация `collectgarbage("step", n)` использует debt-gate: первые
+@@ -555,5 +575,6 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
+ - P15.23: direct bytecode yield continuation — обычный `OP_CALL`/`OP_TAILCALL` к `coroutine.yield` на корневой границе bytecode dispatch оставляет `BytecodeExecFrame`, register/boxed buffers и TBC list в thread-owned storage вместо копирования в `SuspendedFrame`. `resume` продолжает тот же parked frame и записывает resume values в исходный CALL; debug API читает parked runtime frame, а GC/teardown сохраняют его как обычный Thread root. Архитектурный unit test проверяет, что после yield `suspended_frames` пуст и authoritative `bytecode_frames` остаётся жив; smoke `37_inplace_bytecode_yield.lua` покрывает nested/tail yield, debug inspection, GC и abandoned coroutine. Compatibility boundary имеет TODO удаления до 1.0.0; snapshots остаются только для re-entrant protected/metamethod/hook/`__close` paths.
+ - P15.24: iterative protected dispatch — bytecode targets `pcall`/`xpcall` и bytecode error handlers больше не вызывают вложенный `runBytecode`. Protected state (saved error, handler phase/depth and result continuation) хранится в `BytecodePendingCall`; общий dispatch loop ловит runtime error, unwind'ит только failed child suffix и продолжает ближайший protected caller. Yield внутри protected call сохраняет тот же thread-owned frame stack. `TFORCALL` к bytecode-итератору также переведён на explicit child frame. Teardown abandoned coroutine освобождает parked protected state без подмены текущей ошибки VM. Исправлена обнаруженная этим переходом dangling-ссылка в builtin `error()`: fallback теперь копирует сообщение в стабильный VM buffer. Smoke `38_iterative_protected_dispatch.lua` покрывает глубокие обычные и tail-position `pcall`/`xpcall`, yield/resume, Lua iterator и сборку abandoned protected coroutines; explicit protected depth принадлежит конкретному `Thread`, поэтому parked coroutines не делят глобальный лимит. Unit tests, 38/38 smoke и `calls.lua` с 1-МБ host stack проходят. Открыты metamethod/hook/`__close`/nested-resume actions.
+ - P15.25: complete iterative bytecode dispatch — Lua metamethods, debug hooks, yielding `__close`, nested `coroutine.resume` и `string.gsub` Lua callbacks переведены на `BytecodePendingCompletion`/thread-owned continuations. Persistent unwind продолжает close chain после yield и ошибок; coroutine trampoline переключает parked `Thread` через `ThreadSwitch` без Zig recursion. Bytecode snapshot/replay удалён; `IrSuspendedFrame` остался только у frozen IR compatibility children и связан с bc caller через explicit pending continuation. Удалён 256-МБ interpreter thread stack. `hasActiveClose()` синхронизирует tail-call policy с PUC Lua для named и generic-for TBC slots. Добавлены smoke `39_complete_iterative_dispatch.lua` и 1-МБ stress lane. Unit tests, 39/39 smoke, полный `cstack.lua` под 1-МБ stack и 29/29 upstream suites по exit/assertion status проходят.
++- P15.26: dispatch review hardening — повторно подтверждён PUC-order hidden generic-for TBC (`return` expression вычисляется до iterator `__close`, результат `false true`); `ThreadSwitch` удалён из публичного `Vm.Error` и локализован в private `DispatchError`/coroutine trampoline; `api.zig` больше не знает о внутреннем сигнале. Рядом с pending continuation state документированы ownership, cleanup, yield и thread-switch invariants. После рефакторинга повторно проходят unit tests, 39/39 smoke, 1-МБ stress lane и 29/29 upstream suites.
+ 
+ Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).
+diff --git a/src/lua/api.zig b/src/lua/api.zig
+index 75ca8fd4e235fd8c9f69957e2635a405dd3316d3..e218605b613797f5ee94fcafa35916c4e39beaca 100644
+--- a/src/lua/api.zig
++++ b/src/lua/api.zig
+@@ -313,7 +313,6 @@ pub const State = struct {
+         self.vm.apiYield(self.stack.items[base..]) catch |err| switch (err) {
+             error.RuntimeError, error.Yield => return error.Runtime,
+             error.OutOfMemory => return error.OutOfMemory,
+-            error.ThreadSwitch => unreachable,
+         };
+     }
+ 
+diff --git a/src/lua/vm.zig b/src/lua/vm.zig
+index 1b58960ab1bacbdcc4b1ee82453616645ce874bf..714dac5adb45af6a8d49281daba9d39dbf811553 100644
+--- a/src/lua/vm.zig
++++ b/src/lua/vm.zig
+@@ -650,6 +650,23 @@ const max_non_yieldable_c_depth: usize = 64;
+ // implementation-defined in PUC Lua as well.
+ const max_coroutine_close_c_depth: usize = 4;
+ 
++/// Bytecode continuation ownership and control-flow invariants.
++///
++/// * `Thread.bytecode_frames` owns every pending completion. Heap slices stored
++///   in a completion (`concat.values`, `gsub.out`, hook transfer/post values,
++///   protected layers, saved tracebacks, and return/close payloads) remain owned
++///   by that parent frame until the completion is applied or cancelled.
++/// * Successful completion transfers or frees its owned payload in the matching
++///   `applyBytecodePending*` path. Abandonment and error unwind go exclusively
++///   through `cancelBytecodePendingCall`, which is therefore the single cleanup
++///   authority for still-pending state.
++/// * `results`, `value`, `ignore`, and `compare` are pure post-call actions.
++///   `concat`, `gsub`, `hook`, and `close` may suspend because their Lua child
++///   or callback may yield. `coroutine_resume` is the only continuation allowed
++///   to request activation of another `Thread`.
++/// * A coroutine switch is represented internally by `error.ThreadSwitch`. It
++///   is consumed by `driveBytecodeCoroutineTrampoline`; no public API or API
++///   adapter may observe or handle that signal.
+ const BytecodePendingCompletion = union(enum) {
+     results: BytecodeResultContinuation,
+     value: BytecodeValueContinuation,
+@@ -1481,7 +1498,26 @@ pub const Vm = struct {
+     /// is reaped when the corresponding file is closed, matching pclose.
+     open_processes: std.AutoHashMapUnmanaged(i64, std.process.Child) = .{},
+ 
+-    pub const Error = std.mem.Allocator.Error || error{ RuntimeError, Yield, ThreadSwitch };
++    /// Errors visible to embedders and the public Zig API. Internal dispatch
++    /// control flow is deliberately excluded from this set.
++    pub const Error = std.mem.Allocator.Error || error{ RuntimeError, Yield };
++
++    /// Private execution-layer signal set. `ThreadSwitch` is raised only while
++    /// the bytecode coroutine trampoline is active and must be consumed by
++    /// `driveBytecodeCoroutineTrampoline`; it must never cross a public Vm API.
++    const DispatchError = Error || error{ThreadSwitch};
++
++    /// Narrow a private execution result at a public Vm boundary. A switch can
++    /// only be produced while an existing trampoline owns the call chain, so a
++    /// top-level API entry observing it would violate the dispatch invariant.
++    fn exposeDispatchResult(comptime T: type, result: DispatchError!T) Error!T {
++        return result catch |err| switch (err) {
++            error.ThreadSwitch => unreachable,
++            error.OutOfMemory => return error.OutOfMemory,
++            error.RuntimeError => return error.RuntimeError,
++            error.Yield => return error.Yield,
++        };
++    }
+     const VarargValues = struct {
+         values: []const Value,
+         owned: ?[]Value = null,
+@@ -1676,7 +1712,7 @@ pub const Vm = struct {
+     /// Ensure the shared bytecode stack can hold at least `needed` slots.
+     /// Grows by doubling + `needed`, reallocating both bc_stack and bc_boxed.
+     /// After realloc, all frame `base` offsets remain valid (they're indices).
+-    fn ensureBcStackCap(self: *Vm, needed: usize) Error!void {
++    fn ensureBcStackCap(self: *Vm, needed: usize) DispatchError!void {
+         if (needed <= self.bc_stack.len) return;
+         const old_len = self.bc_stack.len;
+         var new_cap = if (old_len == 0) self.bc_stack_initial else old_len;
+@@ -1716,7 +1752,7 @@ pub const Vm = struct {
+         frame_cap: *usize,
+         regs: *[]Value,
+         boxed: *[]?*Cell,
+-    ) Error!void {
++    ) DispatchError!void {
+         const old_cap = frame_cap.*;
+         if (needed_local > frame_cap.*) {
+             frame_cap.* = needed_local;
+@@ -1748,7 +1784,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn getVarargValues(self: *Vm, f: *const ir.Function, locals: []Value, fallback: []const Value) Error!VarargValues {
++    fn getVarargValues(self: *Vm, f: *const ir.Function, locals: []Value, fallback: []const Value) DispatchError!VarargValues {
+         const local_id = f.vararg_table_local orelse return .{ .values = fallback };
+         const idx: usize = @intCast(local_id);
+         if (idx >= locals.len or locals[idx] != .Table) return .{ .values = fallback };
+@@ -1777,7 +1813,7 @@ pub const Vm = struct {
+         len: usize,
+     };
+ 
+-    fn getBytecodeVarargTable(self: *Vm, proto: *const bc.Proto, regs: []Value) Error!?BytecodeVarargTable {
++    fn getBytecodeVarargTable(self: *Vm, proto: *const bc.Proto, regs: []Value) DispatchError!?BytecodeVarargTable {
+         const reg = proto.vararg_table_reg orelse return null;
+         const idx: usize = @intCast(reg);
+         if (idx >= regs.len or regs[idx] != .Table) return null;
+@@ -1890,15 +1926,15 @@ pub const Vm = struct {
+     }
+ 
+     pub fn apiSetGlobal(self: *Vm, name: []const u8, v: Value) Error!void {
+-        try self.setGlobal(name, v);
++        return exposeDispatchResult(void, self.setGlobal(name, v));
+     }
+ 
+     pub fn apiNewTable(self: *Vm) Error!*Table {
+-        return try self.allocTable();
++        return exposeDispatchResult(*Table, self.allocTable());
+     }
+ 
+     pub fn apiNewThread(self: *Vm, callee: Value) Error!*Thread {
+-        try self.testcChargeMemory(@sizeOf(Thread) + 64);
++        try exposeDispatchResult(void, self.testcChargeMemory(@sizeOf(Thread) + 64));
+         const th = try self.alloc.create(Thread);
+         th.* = .{ .status = .suspended, .callee = callee };
+         try self.gc_threads.append(self.alloc, th);
+@@ -1908,24 +1944,24 @@ pub const Vm = struct {
+     }
+ 
+     pub fn apiRawGet(self: *Vm, tbl: *Table, key: Value) Error!Value {
+-        return self.tableGetRawValue(tbl, key);
++        return exposeDispatchResult(Value, self.tableGetRawValue(tbl, key));
+     }
+ 
+     pub fn apiRawSet(self: *Vm, tbl: *Table, key: Value, value: Value) Error!void {
+-        try self.tableSetValue(tbl, key, value);
++        return exposeDispatchResult(void, self.tableSetValue(tbl, key, value));
+     }
+ 
+     pub fn apiGetTable(self: *Vm, object: Value, key: Value) Error!Value {
+-        return self.indexValue(object, key);
++        return exposeDispatchResult(Value, self.indexValue(object, key));
+     }
+ 
+     pub fn apiSetTable(self: *Vm, object: Value, key: Value, value: Value) Error!void {
+-        try self.setIndexValue(object, key, value);
++        return exposeDispatchResult(void, self.setIndexValue(object, key, value));
+     }
+ 
+     pub fn apiNext(self: *Vm, tbl: *Table, key: Value, outs: []Value) Error!usize {
+         var tmp: [2]Value = .{ .Nil, .Nil };
+-        try self.builtinNext(&[_]Value{ .{ .Table = tbl }, key }, tmp[0..]);
++        try exposeDispatchResult(void, self.builtinNext(&[_]Value{ .{ .Table = tbl }, key }, tmp[0..]));
+         if (tmp[0] == .Nil) return 0;
+         if (outs.len < 2) return error.RuntimeError;
+         outs[0] = tmp[0];
+@@ -1934,12 +1970,12 @@ pub const Vm = struct {
+     }
+ 
+     pub fn apiConcat(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+-        return try self.binConcat(lhs, rhs);
++        return exposeDispatchResult(Value, self.binConcat(lhs, rhs));
+     }
+ 
+     pub fn apiWrapFunction(self: *Vm, func: *const ir.Function) Error!Value {
+         const upvalues = try self.alloc.alloc(*Cell, 0);
+-        try self.testcChargeMemory(@sizeOf(Closure) + 64);
++        try exposeDispatchResult(void, self.testcChargeMemory(@sizeOf(Closure) + 64));
+         const cl = try self.alloc.create(Closure);
+         cl.* = .{ .func = func, .upvalues = upvalues };
+         try self.gc_closures.append(self.alloc, cl);
+@@ -1949,14 +1985,14 @@ pub const Vm = struct {
+     }
+ 
+     pub fn apiCall(self: *Vm, callee: Value, args: []const Value) Error![]Value {
+-        const resolved = try self.resolveCallable(callee, args, null);
++        const resolved = try exposeDispatchResult(ResolvedCall, self.resolveCallable(callee, args, null));
+         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+         switch (resolved.callee) {
+             .Builtin => |id| {
+                 const out_len = self.builtinOutLen(id, resolved.args);
+                 const outs = try self.alloc.alloc(Value, out_len);
+                 errdefer self.alloc.free(outs);
+-                try self.callBuiltin(id, resolved.args, outs);
++                try exposeDispatchResult(void, self.callBuiltin(id, resolved.args, outs));
+                 const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
+                 if (used == outs.len) return outs;
+                 const ret = try self.alloc.alloc(Value, used);
+@@ -1964,7 +2000,7 @@ pub const Vm = struct {
+                 self.alloc.free(outs);
+                 return ret;
+             },
+-            .Closure => |cl| return self.runClosure(cl, resolved.args, false),
++            .Closure => |cl| return exposeDispatchResult([]Value, self.runClosure(cl, resolved.args, false)),
+             else => unreachable,
+         }
+     }
+@@ -1975,21 +2011,21 @@ pub const Vm = struct {
+         defer self.alloc.free(resume_args);
+         resume_args[0] = .{ .Thread = th };
+         for (args, 0..) |v, i| resume_args[i + 1] = v;
+-        try self.builtinCoroutineResume(resume_args, outs);
++        try exposeDispatchResult(void, self.builtinCoroutineResume(resume_args, outs));
+         return self.last_builtin_out_count;
+     }
+ 
+     pub fn apiYield(self: *Vm, args: []const Value) Error!void {
+         var out: [0]Value = .{};
+-        try self.builtinCoroutineYield(args, out[0..]);
++        return exposeDispatchResult(void, self.builtinCoroutineYield(args, out[0..]));
+     }
+ 
+     pub fn apiIsYieldable(self: *Vm, th: ?*Thread) Error!bool {
+         var out: [1]Value = .{.Nil};
+         if (th) |t| {
+-            try self.builtinCoroutineIsyieldable(&[_]Value{.{ .Thread = t }}, out[0..]);
++            try exposeDispatchResult(void, self.builtinCoroutineIsyieldable(&[_]Value{.{ .Thread = t }}, out[0..]));
+         } else {
+-            try self.builtinCoroutineIsyieldable(&.{}, out[0..]);
++            try exposeDispatchResult(void, self.builtinCoroutineIsyieldable(&.{}, out[0..]));
+         }
+         return out[0] == .Bool and out[0].Bool;
+     }
+@@ -2123,7 +2159,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn callFinalizer(self: *Vm, gc: Value, args: []const Value) Error!Value {
++    fn callFinalizer(self: *Vm, gc: Value, args: []const Value) DispatchError!Value {
+         // PUC Lua does not run debug hooks while executing a finalizer body.
+         // Keep hooks installed, but suppress line/count/call events for the
+         // finalizer call itself.
+@@ -2157,7 +2193,7 @@ pub const Vm = struct {
+     }
+ 
+     /// Normalize a message-handler result the same way luaG_errormsg does.
+-    fn normalizeProtectedErrorResult(self: *Vm, value: Value) Error!Value {
++    fn normalizeProtectedErrorResult(self: *Vm, value: Value) DispatchError!Value {
+         if (value == .Nil) {
+             return .{ .String = try self.internStr("<no error object>") };
+         }
+@@ -2281,7 +2317,7 @@ pub const Vm = struct {
+         self.oom_table_array_capacity = tbl.array.capacity;
+     }
+ 
+-    fn appendTableArrayValue(self: *Vm, tbl: *Table, val: Value) Error!void {
++    fn appendTableArrayValue(self: *Vm, tbl: *Table, val: Value) DispatchError!void {
+         if (tbl.array.items.len >= tbl.array.capacity) {
+             self.noteTableArrayOomContext(tbl, "table array grow");
+             const current = tbl.array.capacity;
+@@ -2324,7 +2360,7 @@ pub const Vm = struct {
+         return &self.debug_hook_main;
+     }
+ 
+-    fn testcChargeMemory(self: *Vm, bytes: usize) Error!void {
++    fn testcChargeMemory(self: *Vm, bytes: usize) DispatchError!void {
+         if (bytes == 0) return;
+         try self.testcConsumeAllocCount();
+         const next = self.testc_total_bytes +| bytes;
+@@ -2334,7 +2370,7 @@ pub const Vm = struct {
+         self.testc_total_bytes = next;
+     }
+ 
+-    fn testcConsumeAllocCount(self: *Vm) Error!void {
++    fn testcConsumeAllocCount(self: *Vm) DispatchError!void {
+         const t_global = self.getGlobal("T");
+         if (t_global != .Table) return;
+         const cur = self.getField(t_global.Table, "_alloccount");
+@@ -2373,7 +2409,7 @@ pub const Vm = struct {
+         vm: *Vm,
+         snapshot: usize,
+ 
+-        pub fn add(self: *TempRoots, v: Value) Error!void {
++        pub fn add(self: *TempRoots, v: Value) DispatchError!void {
+             try self.vm.gc_temp_roots.append(self.vm.alloc, v);
+         }
+ 
+@@ -2396,7 +2432,7 @@ pub const Vm = struct {
+         return t;
+     }
+ 
+-    fn allocTable(self: *Vm) Error!*Table {
++    fn allocTable(self: *Vm) DispatchError!*Table {
+         try self.testcConsumeAllocCount();
+         const t = try self.allocTableNoGc();
+         self.gc_alloc_tables += 1;
+@@ -2427,7 +2463,7 @@ pub const Vm = struct {
+         return t;
+     }
+ 
+-    fn testcMaterializeDeferredVarargTable(self: *Vm, value: Value) Error!void {
++    fn testcMaterializeDeferredVarargTable(self: *Vm, value: Value) DispatchError!void {
+         if (value != .Table) return;
+         const tbl = value.Table;
+         if (!tbl.testc_deferred_vararg_accounting) return;
+@@ -2437,7 +2473,7 @@ pub const Vm = struct {
+         try self.testcChargeMemory(64);
+     }
+ 
+-    fn testcMaterializeDeferredVarargReturns(self: *Vm, values: []const Value) Error!void {
++    fn testcMaterializeDeferredVarargReturns(self: *Vm, values: []const Value) DispatchError!void {
+         for (values) |v| try self.testcMaterializeDeferredVarargTable(v);
+     }
+ 
+@@ -2447,7 +2483,9 @@ pub const Vm = struct {
+         var top_cl = Closure{ .func = f, .upvalues = top_ups[0..] };
+         return self.runFunctionArgsWithUpvalues(f, top_ups[0..], &.{}, &top_cl, false) catch |e| switch (e) {
+             error.Yield => self.fail("attempt to yield from outside coroutine", .{}),
+-            else => return e,
++            error.ThreadSwitch => unreachable,
++            error.OutOfMemory => return error.OutOfMemory,
++            error.RuntimeError => return error.RuntimeError,
+         };
+     }
+ 
+@@ -2457,11 +2495,13 @@ pub const Vm = struct {
+         var top_cl = Closure{ .func = f, .upvalues = top_ups[0..] };
+         return self.runFunctionArgsWithUpvalues(f, top_ups[0..], args, &top_cl, false) catch |e| switch (e) {
+             error.Yield => self.fail("attempt to yield from outside coroutine", .{}),
+-            else => return e,
++            error.ThreadSwitch => unreachable,
++            error.OutOfMemory => return error.OutOfMemory,
++            error.RuntimeError => return error.RuntimeError,
+         };
+     }
+ 
+-    fn runFunctionArgsWithUpvalues(self: *Vm, f: *const ir.Function, upvalues: []const *Cell, args: []const Value, callee_cl: ?*Closure, is_tailcall: bool) Error![]Value {
++    fn runFunctionArgsWithUpvalues(self: *Vm, f: *const ir.Function, upvalues: []const *Cell, args: []const Value, callee_cl: ?*Closure, is_tailcall: bool) DispatchError![]Value {
+         // This VM currently executes Lua calls via host recursion.
+         // Keep a conservative cap to avoid crashing the process before we can
+         // report a proper Lua "stack overflow" error.
+@@ -3493,7 +3533,7 @@ pub const Vm = struct {
+     // resolveCallable, etc.). The dispatch loop decodes 32-bit instructions
+     // and switches on the opcode.
+ 
+-    fn bcConstToValue(self: *Vm, c: bc.Constant) Error!Value {
++    fn bcConstToValue(self: *Vm, c: bc.Constant) DispatchError!Value {
+         return switch (c) {
+             .nil => .Nil,
+             .bool => |b| .{ .Bool = b },
+@@ -3521,7 +3561,7 @@ pub const Vm = struct {
+         event: []const u8,
+         line: ?i64,
+         transfer: ?[]const Value,
+-    ) Error!void {
++    ) DispatchError!void {
+         try self.debugDispatchHookTransfer(event, line, transfer, 1);
+     }
+ 
+@@ -3530,7 +3570,7 @@ pub const Vm = struct {
+         event: []const u8,
+         callee: Value,
+         transfer: ?[]const Value,
+-    ) Error!void {
++    ) DispatchError!void {
+         try self.debugDispatchHookWithCalleeTransfer(event, null, callee, transfer, 1);
+     }
+ 
+@@ -3645,7 +3685,7 @@ pub const Vm = struct {
+         state.child_active = false;
+     }
+ 
+-    fn currentRuntimeErrorValue(self: *Vm) Error!Value {
++    fn currentRuntimeErrorValue(self: *Vm) DispatchError!Value {
+         // PUC prefixes string errors before stack unwinding. Our fail helpers
+         // keep source/line separately until an error crosses a protected,
+         // coroutine, or __close boundary, so materialize that normalized value
+@@ -3680,7 +3720,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn recordBytecodeCloseError(self: *Vm, state: *BytecodeCloseContinuation) Error!void {
++    fn recordBytecodeCloseError(self: *Vm, state: *BytecodeCloseContinuation) DispatchError!void {
+         state.had_close_error = true;
+         state.close_all = true;
+         state.current_err = try self.currentRuntimeErrorValue();
+@@ -3696,7 +3736,7 @@ pub const Vm = struct {
+         initial_err: ?Value,
+         close_all: bool,
+         post: BytecodeClosePost,
+-    ) Error!BytecodeCloseProgress {
++    ) DispatchError!BytecodeCloseProgress {
+         std.debug.assert(exec_frames.items[parent_index].pending_call == null);
+         const owner = self.activeBytecodeThread();
+         exec_frames.items[parent_index].pending_call = .{
+@@ -3720,7 +3760,7 @@ pub const Vm = struct {
+         exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+         boundary_depth: usize,
+         parent_index: usize,
+-    ) Error!BytecodeCloseProgress {
++    ) DispatchError!BytecodeCloseProgress {
+         var state = switch (exec_frames.items[parent_index].pending_call.?.completion) {
+             .close => |cont| cont,
+             else => unreachable,
+@@ -3870,7 +3910,7 @@ pub const Vm = struct {
+         parent_index: usize,
+         ret: []Value,
+         cont: BytecodeCloseContinuation,
+-    ) Error!BytecodeCloseProgress {
++    ) DispatchError!BytecodeCloseProgress {
+         self.alloc.free(ret);
+         var state = cont;
+         self.releaseBytecodeCloseChild(&state);
+@@ -3925,7 +3965,7 @@ pub const Vm = struct {
+         args: []const Value,
+         completion: BytecodePendingCompletion,
+         min_results: usize,
+-    ) Error!BytecodeCallOutcome {
++    ) DispatchError!BytecodeCallOutcome {
+         const resolved = try self.resolveCallable(callee_value, args, null);
+         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+ 
+@@ -3974,7 +4014,7 @@ pub const Vm = struct {
+         completion: BytecodePendingCompletion,
+         debug_namewhat: ?[]const u8,
+         debug_name: ?[]const u8,
+-    ) Error!bool {
++    ) DispatchError!bool {
+         const resolved = self.resolveCallable(callee_value, args, null) catch return false;
+         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+         const cl = switch (resolved.callee) {
+@@ -4004,7 +4044,7 @@ pub const Vm = struct {
+         opname: []const u8,
+         args: []const Value,
+         completion: BytecodePendingCompletion,
+-    ) Error!bool {
++    ) DispatchError!bool {
+         return self.tryPushBytecodeContinuationCall(
+             exec_frames,
+             parent_index,
+@@ -4027,7 +4067,7 @@ pub const Vm = struct {
+         parent_index: usize,
+         args: []const Value,
+         result: BytecodeResultContinuation,
+-    ) Error!bool {
++    ) DispatchError!bool {
+         if (args.len == 0 or args[0] != .Table) return false;
+         const mm = self.metamethodValue(args[0], "__pairs") orelse return false;
+         var mm_args = [_]Value{args[0]};
+@@ -4065,7 +4105,7 @@ pub const Vm = struct {
+         transfer: ?[]const Value,
+         transfer_start: i64,
+         post: BytecodeHookPost,
+-    ) Error!bool {
++    ) DispatchError!bool {
+         if (self.debug_hooks_suppressed != 0 or self.isInDebugHook()) return false;
+         const hook_state = self.activeHookState();
+         const hook = hook_state.func orelse return false;
+@@ -4139,7 +4179,7 @@ pub const Vm = struct {
+         initial_object: Value,
+         key: Value,
+         dst: u8,
+-    ) Error!bool {
++    ) DispatchError!bool {
+         var object = initial_object;
+         var depth: usize = 0;
+         while (depth < 200) : (depth += 1) {
+@@ -4195,7 +4235,7 @@ pub const Vm = struct {
+         initial_object: Value,
+         key: Value,
+         value: Value,
+-    ) Error!bool {
++    ) DispatchError!bool {
+         var object = initial_object;
+         var depth: usize = 0;
+         while (depth < 200) : (depth += 1) {
+@@ -4252,7 +4292,7 @@ pub const Vm = struct {
+         mm_name: []const u8,
+         opname: []const u8,
+         completion: BytecodePendingCompletion,
+-    ) Error!bool {
++    ) DispatchError!bool {
+         const mm = metamethodValue(self, lhs, mm_name) orelse
+             metamethodValue(self, rhs, mm_name) orelse return false;
+         if (mm != .Closure or mm.Closure.proto == null) return false;
+@@ -4275,7 +4315,7 @@ pub const Vm = struct {
+         mm_name: []const u8,
+         opname: []const u8,
+         dst: u8,
+-    ) Error!bool {
++    ) DispatchError!bool {
+         const mm = metamethodValue(self, operand, mm_name) orelse return false;
+         if (mm != .Closure or mm.Closure.proto == null) return false;
+         // PUC supplies two copies for unary metamethods.
+@@ -4301,7 +4341,7 @@ pub const Vm = struct {
+         exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+         parent_index: usize,
+         ret: []Value,
+-    ) Error!void {
++    ) DispatchError!void {
+         errdefer self.alloc.free(ret);
+         const parent = &exec_frames.items[parent_index];
+         const pending = parent.pending_call orelse unreachable;
+@@ -4331,7 +4371,7 @@ pub const Vm = struct {
+         boundary_depth: usize,
+         parent_index: usize,
+         ret_in: []Value,
+-    ) Error!?[]Value {
++    ) DispatchError!?[]Value {
+         var ret = ret_in;
+         var ret_owned = true;
+         errdefer if (ret_owned) self.alloc.free(ret);
+@@ -4402,7 +4442,7 @@ pub const Vm = struct {
+         parent_index: usize,
+         ret: []Value,
+         cont: BytecodeValueContinuation,
+-    ) Error!void {
++    ) DispatchError!void {
+         defer self.alloc.free(ret);
+         const parent = &exec_frames.items[parent_index];
+         var regs = self.bc_stack[parent.base .. parent.base + parent.frame_cap];
+@@ -4462,7 +4502,7 @@ pub const Vm = struct {
+         values: []Value,
+         remaining_in: usize,
+         acc_in: Value,
+-    ) Error!BytecodeConcatOutcome {
++    ) DispatchError!BytecodeConcatOutcome {
+         var roots = self.gcTempRoots();
+         defer roots.end();
+         for (values) |value| try roots.add(value);
+@@ -4520,7 +4560,7 @@ pub const Vm = struct {
+         parent_index: usize,
+         ret: []Value,
+         cont: BytecodeConcatContinuation,
+-    ) Error!void {
++    ) DispatchError!void {
+         const acc = if (ret.len == 0) Value.Nil else ret[0];
+ 
+         // Root the continuation while detaching it from the parent.  The next
+@@ -4575,7 +4615,7 @@ pub const Vm = struct {
+         self: *Vm,
+         args: []const Value,
+         result: BytecodeResultContinuation,
+-    ) Error!BytecodeGsubContinuation {
++    ) DispatchError!BytecodeGsubContinuation {
+         if (args.len < 3) return self.fail("string.gsub expects (s, pattern, repl [, n])", .{});
+         const subject = args[0];
+         const pattern = args[1];
+@@ -4625,7 +4665,7 @@ pub const Vm = struct {
+         self: *Vm,
+         state: *BytecodeGsubContinuation,
+         value: Value,
+-    ) Error!void {
++    ) DispatchError!void {
+         const s = state.subject.String.bytes();
+         if (value == .Nil or (value == .Bool and !value.Bool)) {
+             try state.out.appendSlice(self.alloc, s[state.pending_start..state.pending_end]);
+@@ -4639,7 +4679,7 @@ pub const Vm = struct {
+     fn advanceBytecodeGsubAfterMatch(
+         self: *Vm,
+         state: *BytecodeGsubContinuation,
+-    ) Error!void {
++    ) DispatchError!void {
+         const s = state.subject.String.bytes();
+         state.count += 1;
+         if (state.pending_empty) {
+@@ -4660,7 +4700,7 @@ pub const Vm = struct {
+         self: *Vm,
+         state: *BytecodeGsubContinuation,
+         ret: []Value,
+-    ) Error!void {
++    ) DispatchError!void {
+         defer self.alloc.free(ret);
+         try self.appendBytecodeGsubResult(state, if (ret.len == 0) .Nil else ret[0]);
+         try self.advanceBytecodeGsubAfterMatch(state);
+@@ -4673,7 +4713,7 @@ pub const Vm = struct {
+         match_end: usize,
+         caps: *const [10]Capture,
+         storage: *[10]Value,
+-    ) Error![]const Value {
++    ) DispatchError![]const Value {
+         var count: usize = 0;
+         var cap_i: usize = 1;
+         while (cap_i < caps.len and count < storage.len) : (cap_i += 1) {
+@@ -4698,7 +4738,7 @@ pub const Vm = struct {
+         initial_table: *Table,
+         key: Value,
+         state: BytecodeGsubContinuation,
+-    ) Error!bool {
++    ) DispatchError!bool {
+         var object: Value = .{ .Table = initial_table };
+         var depth: usize = 0;
+         while (depth < 200) : (depth += 1) {
+@@ -4730,7 +4770,7 @@ pub const Vm = struct {
+     fn finishBytecodeGsub(
+         self: *Vm,
+         state: *BytecodeGsubContinuation,
+-    ) Error![]Value {
++    ) DispatchError![]Value {
+         const ret = try self.alloc.alloc(Value, 2);
+         errdefer self.alloc.free(ret);
+         if (!state.had_subst) {
+@@ -4752,7 +4792,7 @@ pub const Vm = struct {
+         parent_index: usize,
+         state_in: BytecodeGsubContinuation,
+         callback_ret: ?[]Value,
+-    ) Error!BytecodeGsubProgress {
++    ) DispatchError!BytecodeGsubProgress {
+         var state = state_in;
+         var owns_state = true;
+         defer if (owns_state) self.deinitBytecodeGsub(&state);
+@@ -4927,7 +4967,7 @@ pub const Vm = struct {
+         parent_index: usize,
+         args: []const Value,
+         result: BytecodeResultContinuation,
+-    ) Error!BytecodeGsubStart {
++    ) DispatchError!BytecodeGsubStart {
+         if (args.len < 3 or !self.bytecodeGsubHasAsyncReplacement(args[2])) return .not_handled;
+         const state = try self.initBytecodeGsub(args, result);
+         return switch (try self.advanceBytecodeGsub(exec_frames, parent_index, state, null)) {
+@@ -4943,7 +4983,7 @@ pub const Vm = struct {
+         parent_index: usize,
+         ret: []Value,
+         state: BytecodeGsubContinuation,
+-    ) Error!?[]Value {
++    ) DispatchError!?[]Value {
+         exec_frames.items[parent_index].pending_call = null;
+         switch (try self.advanceBytecodeGsub(exec_frames, parent_index, state, ret)) {
+             .pushed => return null,
+@@ -4969,7 +5009,7 @@ pub const Vm = struct {
+         parent_index: usize,
+         ret: []Value,
+         cont: BytecodeHookContinuation,
+-    ) Error!?[]Value {
++    ) DispatchError!?[]Value {
+         self.alloc.free(ret);
+         const parent_runtime_index = exec_frames.items[parent_index].runtime_frame_index;
+         const runtime = &self.frames.items[parent_runtime_index];
+@@ -5049,7 +5089,7 @@ pub const Vm = struct {
+         id: BuiltinId,
+         args: []const Value,
+         tail_return: bool,
+-    ) Error!bool {
++    ) DispatchError!bool {
+         if (!self.bytecode_coroutine_trampoline_active) return false;
+         const target = self.bytecodeCoroutineTarget(id, args) orelse return false;
+         const caller = self.activeBytecodeThread();
+@@ -5108,7 +5148,7 @@ pub const Vm = struct {
+     fn prepareBytecodeCoroutineSwitch(
+         self: *Vm,
+         request: BytecodeCoroutineSwitchRequest,
+-    ) Error!bool {
++    ) DispatchError!bool {
+         defer self.alloc.free(request.args);
+         const target = request.target;
+         std.debug.assert(self.current_thread == request.caller);
+@@ -5189,7 +5229,7 @@ pub const Vm = struct {
+         parent_index: usize,
+         ret: []Value,
+         cont: BytecodeCoroutineContinuation,
+-    ) Error!?[]Value {
++    ) DispatchError!?[]Value {
+         var result_roots = self.gcTempRoots();
+         defer result_roots.end();
+         for (ret) |value| try result_roots.add(value);
+@@ -5246,7 +5286,7 @@ pub const Vm = struct {
+         kind: BytecodeCoroutineKind,
+         ok: bool,
+         values: []Value,
+-    ) Error![]Value {
++    ) DispatchError![]Value {
+         if (kind == .wrap_call) return values;
+         const wrapped = try self.alloc.alloc(Value, values.len + 1);
+         wrapped[0] = .{ .Bool = ok };
+@@ -5255,7 +5295,7 @@ pub const Vm = struct {
+         return wrapped;
+     }
+ 
+-    fn bytecodeCoroutineYieldStep(self: *Vm, thread: *Thread) Error!BytecodeCoroutineStep {
++    fn bytecodeCoroutineYieldStep(self: *Vm, thread: *Thread) DispatchError!BytecodeCoroutineStep {
+         const values = if (thread.last_yield_payload) |payload|
+             payload
+         else if (thread.yielded) |payload|
+@@ -5268,7 +5308,7 @@ pub const Vm = struct {
+     fn recoverTrampolineParentError(
+         self: *Vm,
+         parent: *Thread,
+-    ) Error!?BytecodeCoroutineStep {
++    ) DispatchError!?BytecodeCoroutineStep {
+         const exec_frames = &parent.bytecode_frames;
+         return switch (try self.recoverBytecodeDispatchError(exec_frames, 0, error.RuntimeError)) {
+             .resumed => null,
+@@ -5288,7 +5328,7 @@ pub const Vm = struct {
+         initial: *Thread,
+         initial_closure: *Closure,
+         initial_args: []const Value,
+-    ) Error!BytecodeCoroutineStep {
++    ) DispatchError!BytecodeCoroutineStep {
+         std.debug.assert(!self.bytecode_coroutine_trampoline_active);
+         std.debug.assert(self.current_thread == initial);
+         self.bytecode_coroutine_trampoline_active = true;
+@@ -5417,7 +5457,7 @@ pub const Vm = struct {
+                 };
+                 std.debug.assert(cont.target == child);
+ 
+-                var applied: Error!?[]Value = undefined;
++                var applied: DispatchError!?[]Value = undefined;
+                 switch (child_step) {
+                     .returned => |values| {
+                         const call_values = try self.wrapBytecodeCoroutineValues(cont.kind, true, values);
+@@ -5481,7 +5521,7 @@ pub const Vm = struct {
+         id: BuiltinId,
+         args: []const Value,
+         tail_return: bool,
+-    ) Error!bool {
++    ) DispatchError!bool {
+         if (id != .pcall and id != .xpcall) return false;
+         const owner = self.activeBytecodeThread();
+         const protected_depth_before = self.protected_call_depth + owner.bytecode_protected_depth;
+@@ -5628,7 +5668,7 @@ pub const Vm = struct {
+         boundary_depth: usize,
+         parent_index: usize,
+         ret: []Value,
+-    ) Error!?[]Value {
++    ) DispatchError!?[]Value {
+         var result_roots = self.gcTempRoots();
+         defer result_roots.end();
+         for (ret) |value| try result_roots.add(value);
+@@ -5706,7 +5746,7 @@ pub const Vm = struct {
+         boundary_depth: usize,
+         parent_index: usize,
+         error_value: Value,
+-    ) Error!?[]Value {
++    ) DispatchError!?[]Value {
+         var error_root = self.gcTempRoots();
+         defer error_root.end();
+         try error_root.add(error_value);
+@@ -5727,7 +5767,7 @@ pub const Vm = struct {
+         boundary_depth: usize,
+         parent_index: usize,
+         first_error: Value,
+-    ) Error!?[]Value {
++    ) DispatchError!?[]Value {
+         var handler_roots = self.gcTempRoots();
+         defer handler_roots.end();
+         var emsg = first_error;
+@@ -5831,7 +5871,7 @@ pub const Vm = struct {
+         exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+         boundary_depth: usize,
+         parent_index: usize,
+-    ) Error!BytecodeDispatchRecovery {
++    ) DispatchError!BytecodeDispatchRecovery {
+         const pending = &exec_frames.items[parent_index].pending_call.?;
+         const protection = &pending.protection.?;
+         if (protection.kind == .pcall) {
+@@ -5913,7 +5953,7 @@ pub const Vm = struct {
+         boundary_depth: usize,
+         fault: BytecodeDispatchFault,
+         error_value: Value,
+-    ) Error!void {
++    ) DispatchError!void {
+         const recovery = self.bytecodeUnwindDisposition(exec_frames, boundary_depth);
+         try self.activeBytecodeThread().bytecode_unwinds.append(self.alloc, .{
+             .boundary_depth = boundary_depth,
+@@ -5931,7 +5971,7 @@ pub const Vm = struct {
+     fn appendBytecodeForcedCloseUnwind(
+         self: *Vm,
+         boundary_depth: usize,
+-    ) Error!void {
++    ) DispatchError!void {
+         try self.activeBytecodeThread().bytecode_unwinds.append(self.alloc, .{
+             .boundary_depth = boundary_depth,
+             .target_depth = boundary_depth,
+@@ -5944,7 +5984,7 @@ pub const Vm = struct {
+     fn continueBytecodeErrorUnwind(
+         self: *Vm,
+         exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+-    ) Error!BytecodeDispatchRecovery {
++    ) DispatchError!BytecodeDispatchRecovery {
+         const owner = self.activeBytecodeThread();
+         unwind_loop: while (owner.bytecode_unwinds.items.len != 0) {
+             const state_index = owner.bytecode_unwinds.items.len - 1;
+@@ -6047,8 +6087,8 @@ pub const Vm = struct {
+         self: *Vm,
+         exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+         boundary_depth: usize,
+-        dispatch_err: Error,
+-    ) Error!BytecodeDispatchRecovery {
++        dispatch_err: DispatchError,
++    ) DispatchError!BytecodeDispatchRecovery {
+         if (dispatch_err == error.Yield or self.shouldRethrowForcedCloseFromBytecode()) {
+             return .{ .propagate = .runtime };
+         }
+@@ -6069,7 +6109,7 @@ pub const Vm = struct {
+         upvalues: []const *Cell,
+         args: []const Value,
+         callee_cl: ?*Closure,
+-    ) Error!void {
++    ) DispatchError!void {
+         // PUC Lua limits the value stack, not the number of Lua activations.
+         // Bytecode calls are represented by heap-resident CallInfo-like
+         // descriptors, so an arbitrary 64/400-frame guard would only preserve
+@@ -6176,7 +6216,7 @@ pub const Vm = struct {
+         exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+         boundary_depth: usize,
+         ret: []Value,
+-    ) Error!?[]Value {
++    ) DispatchError!?[]Value {
+         // Return values leave the child register frame before they are copied
+         // into the parent. Keep them in the VM temporary-root stack across
+         // allocations, hooks, and protected-call wrapping.
+@@ -6327,7 +6367,16 @@ pub const Vm = struct {
+         if (skip_count) self.frames.items[runtime_frame_index].resume_skip_count_pc = pc;
+     }
+ 
+-    pub fn runBytecode(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure) Error![]Value {
++    pub fn runBytecode(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure) DispatchError![]Value {
++        return self.runBytecodeInternal(proto_in, upvalues_in, args, callee_cl) catch |err| switch (err) {
++            error.ThreadSwitch => unreachable,
++            error.OutOfMemory => return error.OutOfMemory,
++            error.RuntimeError => return error.RuntimeError,
++            error.Yield => return error.Yield,
++        };
++    }
++
++    fn runBytecodeInternal(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure) DispatchError![]Value {
+         // A directly executed chunk is still a first-class Lua function.
+         // Materialize its closure so debug.getinfo(level, "f") and
+         // debug.getupvalue can expose the running main function just like PUC
+@@ -6442,7 +6491,7 @@ pub const Vm = struct {
+         exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+         boundary_depth: usize,
+         yielded_in_place: *bool,
+-    ) Error![]Value {
++    ) DispatchError![]Value {
+         frame_loop: while (exec_frames.items.len > boundary_depth) {
+             const frame_index = exec_frames.items.len - 1;
+             if (exec_frames.items[frame_index].pending_call) |pending| {
+@@ -8326,7 +8375,7 @@ pub const Vm = struct {
+     }
+ 
+     /// Helper: concatenate values (for CONCAT instruction).
+-    fn concatValues(self: *Vm, vals: []Value) Error!Value {
++    fn concatValues(self: *Vm, vals: []Value) DispatchError!Value {
+         if (vals.len == 0) return .{ .String = try self.internLiteral("") };
+         if (vals.len == 1) return vals[0];
+ 
+@@ -8372,7 +8421,7 @@ pub const Vm = struct {
+     }
+ 
+     /// Direct string concatenation — all values must be String/Int/Num.
+-    fn concatValuesDirect(self: *Vm, vals: []Value) Error!Value {
++    fn concatValuesDirect(self: *Vm, vals: []Value) DispatchError!Value {
+         if (vals.len == 0) return .{ .String = try self.internLiteral("") };
+         if (vals.len == 1) return vals[0];
+ 
+@@ -8422,7 +8471,7 @@ pub const Vm = struct {
+         return .{ .String = try self.internStr(result) };
+     }
+ 
+-    fn decodeStringLexeme(self: *Vm, lexeme: []const u8) Error!*LuaString {
++    fn decodeStringLexeme(self: *Vm, lexeme: []const u8) DispatchError!*LuaString {
+         if (lexeme.len < 2) return try self.internLiteral(lexeme);
+         const q = lexeme[0];
+         if (q == '[') {
+@@ -8744,14 +8793,14 @@ pub const Vm = struct {
+         return self.internStr(raw) catch @panic("luazig: oom interning constant string");
+     }
+ 
+-    fn expectTable(self: *Vm, v: Value) Error!*Table {
++    fn expectTable(self: *Vm, v: Value) DispatchError!*Table {
+         return switch (v) {
+             .Table => |t| t,
+             else => self.fail("type error: expected table, got {s}", .{v.typeName()}),
+         };
+     }
+ 
+-    fn expectThread(self: *Vm, v: Value) Error!*Thread {
++    fn expectThread(self: *Vm, v: Value) DispatchError!*Thread {
+         return switch (v) {
+             .Thread => |t| t,
+             else => self.fail("type error: expected thread, got {s}", .{v.typeName()}),
+@@ -8767,7 +8816,7 @@ pub const Vm = struct {
+         return .Nil;
+     }
+ 
+-    fn setGlobal(self: *Vm, name: []const u8, v: Value) Error!void {
++    fn setGlobal(self: *Vm, name: []const u8, v: Value) DispatchError!void {
+         // Writing Nil removes the entry (rawSet semantics); no separate dup of
+         // the name is needed — the key lives inside the interned LuaString.
+         try self.setField(self.global_env, name, v);
+@@ -8793,7 +8842,7 @@ pub const Vm = struct {
+         return null;
+     }
+ 
+-    fn getNameInFrame(self: *Vm, frame_index: usize, name: []const u8) Error!Value {
++    fn getNameInFrame(self: *Vm, frame_index: usize, name: []const u8) DispatchError!Value {
+         if (frameEnvValue(self, frame_index)) |envv| {
+             if (std.mem.eql(u8, name, "_ENV")) return envv;
+             const env = switch (envv) {
+@@ -8805,7 +8854,7 @@ pub const Vm = struct {
+         return self.getGlobal(name);
+     }
+ 
+-    fn setNameInFrame(self: *Vm, frame_index: usize, name: []const u8, v: Value) Error!void {
++    fn setNameInFrame(self: *Vm, frame_index: usize, name: []const u8, v: Value) DispatchError!void {
+         if (frameEnvValue(self, frame_index)) |envv| {
+             if (std.mem.eql(u8, name, "_ENV")) return;
+             try self.setIndexValue(envv, .{ .String = try self.internStr(name) }, v);
+@@ -8857,7 +8906,7 @@ pub const Vm = struct {
+         self.protected_c_frame_count -= 1;
+     }
+ 
+-    fn callBuiltin(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value) Error!void {
++    fn callBuiltin(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value) DispatchError!void {
+         // Initialize outputs to nil.
+         for (outs) |*o| o.* = .Nil;
+         self.last_builtin_out_count = outs.len;
+@@ -9080,6 +9129,10 @@ pub const Vm = struct {
+     }
+ 
+     pub fn setArgTable(self: *Vm, argv0: []const u8, script_path: ?[]const u8, script_args: []const []const u8) Error!void {
++        return exposeDispatchResult(void, self.setArgTableInternal(argv0, script_path, script_args));
++    }
++
++    fn setArgTableInternal(self: *Vm, argv0: []const u8, script_path: ?[]const u8, script_args: []const []const u8) DispatchError!void {
+         const tbl = try self.allocTable();
+         if (script_path) |path| {
+             try self.tableSetValue(tbl, .{ .Int = -1 }, .{ .String = try self.internStr(argv0) });
+@@ -9094,6 +9147,10 @@ pub const Vm = struct {
+     }
+ 
+     pub fn enableTestcModule(self: *Vm) Error!void {
++        return exposeDispatchResult(void, self.enableTestcModuleInternal());
++    }
++
++    fn enableTestcModuleInternal(self: *Vm) DispatchError!void {
+         const t = try self.allocTableNoGc();
+         try self.setField(t, "testC", .{ .Builtin = .testc_testC });
+         try self.setField(t, "_makecfunc", .{ .Builtin = .testc_makecfunc });
+@@ -9340,7 +9397,7 @@ pub const Vm = struct {
+         self.alloc.free(ret);
+     }
+ 
+-    fn bootstrapGlobals(self: *Vm) Error!void {
++    fn bootstrapGlobals(self: *Vm) DispatchError!void {
+         // Materialize canonical globals inside `_G` itself for `_ENV`-based lookups.
+         try self.setGlobal("_G", .{ .Table = self.global_env });
+         try self.setGlobal("_VERSION", .{ .String = try self.internStr("Lua 5.5") });
+@@ -9561,7 +9618,7 @@ pub const Vm = struct {
+         try self.setField(loaded_tbl, "debug", .{ .Table = debug_tbl });
+     }
+ 
+-    fn fillDebugTable(self: *Vm, mod: *Table) Error!void {
++    fn fillDebugTable(self: *Vm, mod: *Table) DispatchError!void {
+         // Provide a growing subset of the standard debug library. The table is
+         // intentionally built in one place so `_G.debug` and `require("debug")`
+         // cannot diverge.
+@@ -9582,19 +9639,19 @@ pub const Vm = struct {
+         try self.setField(mod, "setuservalue", .{ .Builtin = .debug_setuservalue });
+     }
+ 
+-    fn createDebugTableNoGc(self: *Vm) Error!*Table {
++    fn createDebugTableNoGc(self: *Vm) DispatchError!*Table {
+         const mod = try self.allocTableNoGc();
+         try self.fillDebugTable(mod);
+         return mod;
+     }
+ 
+-    fn createDebugTable(self: *Vm) Error!*Table {
++    fn createDebugTable(self: *Vm) DispatchError!*Table {
+         const mod = try self.allocTable();
+         try self.fillDebugTable(mod);
+         return mod;
+     }
+ 
+-    fn builtinAssert(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinAssert(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (args.len == 0) return self.fail("bad argument #1 to 'assert' (value expected)", .{});
+         if (!isTruthy(args[0])) {
+             if (args.len > 1 and args[1] != .Nil) {
+@@ -9628,7 +9685,7 @@ pub const Vm = struct {
+         for (0..n) |i| outs[i] = args[i];
+     }
+ 
+-    fn builtinSelect(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinSelect(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (args.len == 0) return self.fail("bad argument #1 to 'select' (number expected)", .{});
+         switch (args[0]) {
+             .String => |s| {
+@@ -9652,7 +9709,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn builtinType(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinType(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'type' (value expected)", .{});
+         const v = args[0];
+@@ -9671,7 +9728,7 @@ pub const Vm = struct {
+         }) };
+     }
+ 
+-    fn builtinRawlen(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinRawlen(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'rawlen' (value expected)", .{});
+         switch (args[0]) {
+@@ -9690,13 +9747,13 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn builtinRawequal(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinRawequal(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len < 2) return self.fail("bad argument #2 to 'rawequal' (value expected)", .{});
+         outs[0] = .{ .Bool = valuesEqual(args[0], args[1]) };
+     }
+ 
+-    fn builtinTonumber(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinTonumber(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) {
+             return self.fail("bad argument #1 to 'tonumber' (value expected)", .{});
+@@ -9776,7 +9833,7 @@ pub const Vm = struct {
+         return @intCast(scaled_kb * 1024);
+     }
+ 
+-    fn gcExplicitStep(self: *Vm, requested_kb: i64) Error!bool {
++    fn gcExplicitStep(self: *Vm, requested_kb: i64) DispatchError!bool {
+         if (self.gc_in_cycle) return false;
+ 
+         if (!self.gc_step_active) {
+@@ -9797,7 +9854,7 @@ pub const Vm = struct {
+         return true;
+     }
+ 
+-    fn builtinCollectgarbage(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinCollectgarbage(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         const want_out = outs.len > 0;
+         // Lua collector is not reentrant. Calls that would start/advance a
+         // collection cycle from inside `__gc` should return false.
+@@ -9909,7 +9966,7 @@ pub const Vm = struct {
+         return self.fail("collectgarbage: invalid option '{s}'", .{what});
+     }
+ 
+-    fn builtinPcall(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinPcall(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         self.last_builtin_out_count = 0;
+         if (args.len == 0) return self.fail("pcall expects function", .{});
+         if (self.activeProtectedCallDepth() >= 128) {
+@@ -10118,7 +10175,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn builtinXpcall(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinXpcall(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         self.last_builtin_out_count = 0;
+         if (args.len < 2) return self.fail("xpcall expects (f, msgh [, args...])", .{});
+         if (self.activeProtectedCallDepth() >= 128) {
+@@ -10201,7 +10258,7 @@ pub const Vm = struct {
+         }
+ 
+         const setFail = struct {
+-            fn run(vm: *Vm, handler: Value, o: []Value) Error!void {
++            fn run(vm: *Vm, handler: Value, o: []Value) DispatchError!void {
+                 o[0] = .{ .Bool = false };
+                 if (o.len <= 1) {
+                     vm.last_builtin_out_count = @min(@as(usize, 1), o.len);
+@@ -10338,7 +10395,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn builtinNext(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinNext(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("next expects table", .{});
+         const tbl = try self.expectTable(args[0]);
+@@ -10352,7 +10409,7 @@ pub const Vm = struct {
+         if (outs.len > 1) outs[1] = found.value;
+     }
+ 
+-    fn builtinCoroutineCreate(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinCoroutineCreate(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("coroutine.create expects function", .{});
+         const callee = args[0];
+@@ -10366,7 +10423,7 @@ pub const Vm = struct {
+         outs[0] = .{ .Thread = th };
+     }
+ 
+-    fn builtinCoroutineWrap(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinCoroutineWrap(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         var tmp: [1]Value = .{.Nil};
+         try self.builtinCoroutineCreate(args, tmp[0..]);
+@@ -10380,7 +10437,7 @@ pub const Vm = struct {
+         outs[0] = .{ .Table = obj };
+     }
+ 
+-    fn builtinCoroutineWrapIter(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinCoroutineWrapIter(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         var th: *Thread = undefined;
+         var call_args: []const Value = args;
+         if (args.len > 0 and args[0] == .Table) {
+@@ -10574,7 +10631,7 @@ pub const Vm = struct {
+         th.capture_from_count_hook = false;
+     }
+ 
+-    fn captureThreadIrSuspendedFrame(self: *Vm, th: *Thread, fr: *const Frame, pc: usize) Error!void {
++    fn captureThreadIrSuspendedFrame(self: *Vm, th: *Thread, fr: *const Frame, pc: usize) DispatchError!void {
+         if (th.capture_yield_id == 0) {
+             th.capture_yield_id = th.next_yield_id;
+             th.next_yield_id +%= 1;
+@@ -10711,7 +10768,7 @@ pub const Vm = struct {
+         yield_id: usize,
+         parent_depth: usize,
+         callee: Value,
+-    ) Error![]Value {
++    ) DispatchError![]Value {
+         const fr = findPendingBytecodeIrCallChild(th, yield_id, parent_depth, callee) orelse
+             return self.fail("missing suspended IR call", .{});
+         const cl = switch (callee) {
+@@ -10733,7 +10790,7 @@ pub const Vm = struct {
+         return self.runFunctionArgsWithUpvalues(func, cl.upvalues, &.{}, cl, is_tailcall);
+     }
+ 
+-    fn resumePendingIrDirectYieldChildren(self: *Vm, th: *Thread, yield_id: usize, parent_depth: usize) Error!void {
++    fn resumePendingIrDirectYieldChildren(self: *Vm, th: *Thread, yield_id: usize, parent_depth: usize) DispatchError!void {
+         while (findPendingIrDirectYieldChild(th, yield_id, parent_depth)) |fr| {
+             switch (fr.callee) {
+                 .Closure => |cl| {
+@@ -10875,20 +10932,20 @@ pub const Vm = struct {
+         return self.activeBytecodeThread().bytecode_close_metamethod_depth == 0;
+     }
+ 
+-    fn appendThreadWrapYield(self: *Vm, th: *Thread, values: []const Value) Error!void {
++    fn appendThreadWrapYield(self: *Vm, th: *Thread, values: []const Value) DispatchError!void {
+         const copy = try self.alloc.alloc(Value, values.len);
+         for (values, 0..) |v, i| copy[i] = v;
+         try th.wrap_yields.append(self.alloc, .{ .values = copy });
+     }
+ 
+-    fn setThreadResumeInbox(self: *Vm, th: *Thread, values: []const Value) Error!void {
++    fn setThreadResumeInbox(self: *Vm, th: *Thread, values: []const Value) DispatchError!void {
+         if (th.resume_inbox) |old| self.alloc.free(old);
+         const copy = try self.alloc.alloc(Value, values.len);
+         for (values, 0..) |v, i| copy[i] = v;
+         th.resume_inbox = copy;
+     }
+ 
+-    fn armThreadReturnContinuation(self: *Vm, th: *Thread, f: *const ir.Function, pc: usize, values: []const Value) Error!void {
++    fn armThreadReturnContinuation(self: *Vm, th: *Thread, f: *const ir.Function, pc: usize, values: []const Value) DispatchError!void {
+         if (th.tail_resume_inbox) |old| self.alloc.free(old);
+         const copy = try self.alloc.alloc(Value, values.len);
+         for (values, 0..) |v, i| copy[i] = v;
+@@ -10915,7 +10972,7 @@ pub const Vm = struct {
+         local_active: []bool,
+         boxed: []?*Cell,
+         values: []const Value,
+-    ) Error!void {
++    ) DispatchError!void {
+         if (maybe_th) |th| {
+             try self.armThreadReturnContinuation(th, f, pc, values);
+             const prev_unwind = th.in_close_pending_unwind;
+@@ -10934,7 +10991,7 @@ pub const Vm = struct {
+         try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
+     }
+ 
+-    fn setThreadLastYieldPayload(self: *Vm, th: *Thread, values: []const Value) Error!void {
++    fn setThreadLastYieldPayload(self: *Vm, th: *Thread, values: []const Value) DispatchError!void {
+         if (th.last_yield_payload) |old| self.alloc.free(old);
+         const copy = try self.alloc.alloc(Value, values.len);
+         for (values, 0..) |v, i| copy[i] = v;
+@@ -10961,7 +11018,7 @@ pub const Vm = struct {
+         return changed;
+     }
+ 
+-    fn snapshotThreadLocalsFromFrame(self: *Vm, th: *Thread, fr: *const Frame) Error!void {
++    fn snapshotThreadLocalsFromFrame(self: *Vm, th: *Thread, fr: *const Frame) DispatchError!void {
+         self.freeThreadLocalsSnapshot(th);
+         var count: usize = 0;
+         const nlocals = @min(fr.locals.len, fr.func.local_names.len);
+@@ -10994,7 +11051,7 @@ pub const Vm = struct {
+         return n;
+     }
+ 
+-    fn snapshotThreadTraceFrames(self: *Vm, th: *Thread) Error!void {
++    fn snapshotThreadTraceFrames(self: *Vm, th: *Thread) DispatchError!void {
+         if (th.trace_frame_names) |names| {
+             self.alloc.free(names);
+             th.trace_frame_names = null;
+@@ -11027,7 +11084,7 @@ pub const Vm = struct {
+         th.trace_frame_names = out;
+     }
+ 
+-    fn setThreadFrameLocalOverride(self: *Vm, th: *Thread, frame_id: usize, slot: usize, name: []const u8, value: Value) Error!void {
++    fn setThreadFrameLocalOverride(self: *Vm, th: *Thread, frame_id: usize, slot: usize, name: []const u8, value: Value) DispatchError!void {
+         for (th.frame_local_overrides.items) |*entry| {
+             if (entry.frame_id == frame_id and entry.slot == slot) {
+                 entry.value = value;
+@@ -11037,7 +11094,7 @@ pub const Vm = struct {
+         try th.frame_local_overrides.append(self.alloc, .{ .frame_id = frame_id, .slot = slot, .name = name, .value = value });
+     }
+ 
+-    fn seedThreadFrameLocalOverridesFromSnapshot(self: *Vm, th: *Thread, fr: *const Frame) Error!void {
++    fn seedThreadFrameLocalOverridesFromSnapshot(self: *Vm, th: *Thread, fr: *const Frame) DispatchError!void {
+         const snap = th.locals_snapshot orelse return;
+         for (snap) |entry| {
+             if (!isCloseLocalIndex(fr.func, entry.slot)) continue;
+@@ -11059,7 +11116,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn seedCloseLocalOverridesFromFrames(self: *Vm, th: *Thread) Error!void {
++    fn seedCloseLocalOverridesFromFrames(self: *Vm, th: *Thread) DispatchError!void {
+         for (self.frames.items) |fr| {
+             const nlocals = @min(fr.locals.len, fr.func.local_names.len);
+             var i: usize = 0;
+@@ -11089,7 +11146,7 @@ pub const Vm = struct {
+         return null;
+     }
+ 
+-    fn rememberFrameCaptureCell(self: *Vm, frame_id: usize, slot: usize, cell: *Cell) Error!void {
++    fn rememberFrameCaptureCell(self: *Vm, frame_id: usize, slot: usize, cell: *Cell) DispatchError!void {
+         const th = self.current_thread orelse return;
+         for (th.frame_capture_cells.items) |*entry| {
+             if (entry.frame_id == frame_id and entry.slot == slot) {
+@@ -11112,7 +11169,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn builtinCoroutineYield(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinCoroutineYield(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         for (outs) |*o| o.* = .Nil;
+         const th = self.current_thread orelse return self.fail("attempt to yield from outside a coroutine", .{});
+         const in_debug_hook = self.isInDebugHook();
+@@ -11190,12 +11247,12 @@ pub const Vm = struct {
+     /// result in a following instruction is racy for count=1 hooks: the new
+     /// hook can fire before the marker runs. Keeping both steps in one builtin
+     /// mirrors lua_sethook and exposes no intermediate Lua-hook state.
+-    fn builtinTestcAllowHookYield(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinTestcAllowHookYield(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         try self.builtinDebugSethook(args, outs);
+         self.activeHookState().allow_yield = true;
+     }
+ 
+-    fn builtinCoroutineResume(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinCoroutineResume(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (args.len == 0) return self.fail("coroutine.resume expects thread", .{});
+         const th = try self.expectThread(args[0]);
+         self.last_builtin_out_count = 0;
+@@ -11529,7 +11586,7 @@ pub const Vm = struct {
+         self.clearThreadContinuationScratch(th, .{});
+     }
+ 
+-    fn builtinCoroutineStatus(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinCoroutineStatus(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("coroutine.status expects thread", .{});
+         const th = try self.expectThread(args[0]);
+@@ -11544,7 +11601,7 @@ pub const Vm = struct {
+         }) };
+     }
+ 
+-    fn builtinCoroutineRunning(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinCoroutineRunning(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         _ = args;
+         if (outs.len == 0) return;
+         outs[0] = if (self.current_thread) |th|
+@@ -11556,7 +11613,7 @@ pub const Vm = struct {
+         if (outs.len > 1) outs[1] = .{ .Bool = (self.current_thread == null) };
+     }
+ 
+-    fn builtinCoroutineIsyieldable(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinCoroutineIsyieldable(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) {
+             const in_debug_hook = self.isInDebugHook();
+@@ -11580,7 +11637,7 @@ pub const Vm = struct {
+         outs[0] = .{ .Bool = (!is_main and t.status != .dead) };
+     }
+ 
+-    fn builtinCoroutineClose(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinCoroutineClose(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         self.last_builtin_out_count = 0;
+         if (self.coroutine_close_depth >= max_coroutine_close_c_depth) return self.fail("C stack overflow", .{});
+         self.coroutine_close_depth += 1;
+@@ -11667,7 +11724,7 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn gcCycleFull(self: *Vm) Error!void {
++    fn gcCycleFull(self: *Vm) DispatchError!void {
+         return self.gcCycleFullInternal(true);
+     }
+ 
+@@ -11678,7 +11735,7 @@ pub const Vm = struct {
+     /// caller is at a statement boundary. Allocation-threshold triggers are
+     /// NOT safe points (mid-expression), so they request mark+prune+finalize
+     /// only, deferring sweep to the next explicit collection.
+-    fn gcCycleFullInternal(self: *Vm, do_sweep: bool) Error!void {
++    fn gcCycleFullInternal(self: *Vm, do_sweep: bool) DispatchError!void {
+         if (self.gc_in_cycle) return;
+         self.resetGcStepDebt();
+         self.gc_in_cycle = true;
+@@ -11883,7 +11940,7 @@ pub const Vm = struct {
+         marked_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+         marked_threads: *std.AutoHashMapUnmanaged(*Thread, void),
+         weak_tables: *std.ArrayListUnmanaged(*Table),
+-    ) Error!void {
++    ) DispatchError!void {
+         // Type metatables: every string/number/boolean/etc. value's metamethod
+         // lookup routes through these.
+         try self.gcMarkValue(.{ .Table = self.string_metatable }, marked_tables, marked_closures, marked_threads, weak_tables);
+@@ -12136,7 +12193,7 @@ pub const Vm = struct {
+         self.gc_cells.items.len = write_idx;
+     }
+ 
+-    fn gcMarkBytecodeProto(self: *Vm, proto: *const bc.Proto) Error!void {
++    fn gcMarkBytecodeProto(self: *Vm, proto: *const bc.Proto) DispatchError!void {
+         for (proto.k) |k| {
+             if (k == .str and !self.gc_marked_strings.contains(k.str)) {
+                 try self.gc_marked_strings.put(self.alloc, k.str, {});
+@@ -12152,7 +12209,7 @@ pub const Vm = struct {
+         marked_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+         marked_threads: *std.AutoHashMapUnmanaged(*Thread, void),
+         weak_tables: *std.ArrayListUnmanaged(*Table),
+-    ) Error!void {
++    ) DispatchError!void {
+         // Non-recursive marking (explicit worklist) to avoid stack overflows in
+         // deep object graphs (gc.lua "long list").
+         var work = std.ArrayListUnmanaged(Value).empty;
+@@ -12519,7 +12576,7 @@ pub const Vm = struct {
+         marked_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+         marked_threads: *std.AutoHashMapUnmanaged(*Thread, void),
+         weak_tables: *std.ArrayListUnmanaged(*Table),
+-    ) Error!void {
++    ) DispatchError!void {
+         // The weak_tables list can grow as we mark new values; iterate over it.
+         var changed = true;
+         while (changed) {
+@@ -12565,7 +12622,7 @@ pub const Vm = struct {
+         marked_tables: *const std.AutoHashMapUnmanaged(*Table, void),
+         marked_closures: *const std.AutoHashMapUnmanaged(*Closure, void),
+         marked_threads: *const std.AutoHashMapUnmanaged(*Thread, void),
+-    ) Error!void {
++    ) DispatchError!void {
+         for (weak_tbls) |tbl| {
+             const mode = self.gcWeakMode(tbl);
+             if (!mode.weak_v) continue;
+@@ -12610,7 +12667,7 @@ pub const Vm = struct {
+         fin_tables: *const std.AutoHashMapUnmanaged(*Table, void),
+         fin_closures: *const std.AutoHashMapUnmanaged(*Closure, void),
+         fin_threads: *const std.AutoHashMapUnmanaged(*Thread, void),
+-    ) Error!void {
++    ) DispatchError!void {
+         for (weak_tbls) |tbl| {
+             const mode = self.gcWeakMode(tbl);
+             if (!mode.weak_k) continue;
+@@ -12635,7 +12692,7 @@ pub const Vm = struct {
+     fn gcCollectFinalizables(
+         self: *Vm,
+         marked_tables: *const std.AutoHashMapUnmanaged(*Table, void),
+-    ) Error![]*Table {
++    ) DispatchError![]*Table {
+         var to_finalize = std.ArrayListUnmanaged(*Table).empty;
+         var it = self.finalizables.iterator();
+         while (it.next()) |entry| {
+@@ -12653,7 +12710,7 @@ pub const Vm = struct {
+         fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
+         fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+         fin_threads: *std.AutoHashMapUnmanaged(*Thread, void),
+-    ) Error!void {
++    ) DispatchError!void {
+         for (objs) |obj| {
+             try self.gcMarkValueFinalizerReach(.{ .Table = obj }, fin_tables, fin_closures, fin_threads);
+         }
+@@ -12665,7 +12722,7 @@ pub const Vm = struct {
+         fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
+         fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+         fin_threads: *std.AutoHashMapUnmanaged(*Thread, void),
+-    ) Error!void {
++    ) DispatchError!void {
+         switch (v) {
+             .Table => |t| try self.gcMarkTableFinalizerReach(t, fin_tables, fin_closures, fin_threads),
+             .Closure => |cl| try self.gcMarkClosureFinalizerReach(cl, fin_tables, fin_closures, fin_threads),
+@@ -12680,7 +12737,7 @@ pub const Vm = struct {
+         fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
+         fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+         fin_threads: *std.AutoHashMapUnmanaged(*Thread, void),
+-    ) Error!void {
++    ) DispatchError!void {
+         if (fin_closures.contains(cl)) return;
+         try fin_closures.put(self.alloc, cl, {});
+         for (cl.upvalues) |cell| {
+@@ -12694,7 +12751,7 @@ pub const Vm = struct {
+         fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
+         fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+         fin_threads: *std.AutoHashMapUnmanaged(*Thread, void),
+-    ) Error!void {
++    ) DispatchError!void {
+         if (fin_threads.contains(th)) return;
+         try fin_threads.put(self.alloc, th, {});
+         try self.gcMarkValueFinalizerReach(th.callee, fin_tables, fin_closures, fin_threads);
+@@ -12755,7 +12812,7 @@ pub const Vm = struct {
+         fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
+         fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+         fin_threads: *std.AutoHashMapUnmanaged(*Thread, void),
+-    ) Error!void {
++    ) DispatchError!void {
+         if (fin_tables.contains(tbl)) return;
+         try fin_tables.put(self.alloc, tbl, {});
+ 
+@@ -12783,7 +12840,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn gcFinalizeList(self: *Vm, to_finalize: []const *Table) Error!void {
++    fn gcFinalizeList(self: *Vm, to_finalize: []const *Table) DispatchError!void {
+         const ordered = try self.alloc.dupe(*Table, to_finalize);
+         defer self.alloc.free(ordered);
+         std.sort.block(*Table, ordered, self, gcFinalizeLessThan);
+@@ -12827,7 +12884,7 @@ pub const Vm = struct {
+         return @intFromPtr(lhs) > @intFromPtr(rhs);
+     }
+ 
+-    fn builtinDofile(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinDofile(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         var entry_cl: ?*Closure = null;
+         if (self.current_thread) |th| {
+             if (th.callee == .Builtin and th.callee.Builtin == .dofile) {
+@@ -12902,7 +12959,7 @@ pub const Vm = struct {
+         return .{ .bytes = s };
+     }
+ 
+-    fn builtinLoadfile(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinLoadfile(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         const path = if (args.len > 0) switch (args[0]) {
+             .String => |s| s.bytes(),
+@@ -12929,7 +12986,7 @@ pub const Vm = struct {
+         try self.builtinLoad(load_args[0..n], outs);
+     }
+ 
+-    fn builtinStringDump(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinStringDump(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("string.dump expects function", .{});
+         const cl = switch (args[0]) {
+@@ -13020,7 +13077,7 @@ pub const Vm = struct {
+         outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
+     }
+ 
+-    fn appendBinaryDumpHeader(self: *Vm, out: *std.ArrayList(u8)) Error!void {
++    fn appendBinaryDumpHeader(self: *Vm, out: *std.ArrayList(u8)) DispatchError!void {
+         try out.appendSlice(self.alloc, "\x1bLua");
+         try out.append(self.alloc, 0x55); // Lua 5.5 marker in upstream tests
+         try out.append(self.alloc, 0); // format
+@@ -13052,7 +13109,7 @@ pub const Vm = struct {
+         return binaryDumpHeaderSize() - 8;
+     }
+ 
+-    fn validateBinaryDumpHeader(self: *Vm, s: []const u8) Error!void {
++    fn validateBinaryDumpHeader(self: *Vm, s: []const u8) DispatchError!void {
+         var expected = std.ArrayList(u8).empty;
+         defer expected.deinit(self.alloc);
+         try self.appendBinaryDumpHeader(&expected);
+@@ -13069,7 +13126,7 @@ pub const Vm = struct {
+         return .{ .Table = self.global_env };
+     }
+ 
+-    fn applyLoadEnv(self: *Vm, cl: *Closure, env_val: Value, force_first_on_missing: bool) Error!void {
++    fn applyLoadEnv(self: *Vm, cl: *Closure, env_val: Value, force_first_on_missing: bool) DispatchError!void {
+         if (cl.func.num_upvalues == 0) {
+             if (force_first_on_missing) cl.env_override = env_val;
+             return;
+@@ -13141,7 +13198,7 @@ pub const Vm = struct {
+         return v;
+     }
+ 
+-    fn instantiateLoadedClosure(self: *Vm, proto: *Closure) Error!*Closure {
++    fn instantiateLoadedClosure(self: *Vm, proto: *Closure) DispatchError!*Closure {
+         try self.testcChargeMemory(@sizeOf(Closure) + 64);
+         const cl = try self.alloc.create(Closure);
+         self.testc_obj_functions += 1;
+@@ -13198,7 +13255,7 @@ pub const Vm = struct {
+         self: *Vm,
+         proto: *const bc.Proto,
+         seen: *std.AutoHashMapUnmanaged(*const bc.Proto, *bc.Proto),
+-    ) Error!*bc.Proto {
++    ) DispatchError!*bc.Proto {
+         if (seen.get(proto)) |existing| return existing;
+ 
+         const cloned = try self.alloc.create(bc.Proto);
+@@ -13252,7 +13309,7 @@ pub const Vm = struct {
+         self: *Vm,
+         f: *const ir.Function,
+         seen: *std.AutoHashMapUnmanaged(*const ir.Function, *ir.Function),
+-    ) Error!*ir.Function {
++    ) DispatchError!*ir.Function {
+         if (seen.get(f)) |existing| return existing;
+ 
+         const cloned = try self.alloc.create(ir.Function);
+@@ -13419,7 +13476,7 @@ pub const Vm = struct {
+         return try std.fmt.allocPrint(self.alloc, "{s}:{d}: {s} near {s}", .{ chunk_name, line, msg, near });
+     }
+ 
+-    fn builtinLoad(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinLoad(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("load expects string or function", .{});
+         var roots = self.gcTempRoots();
+@@ -13630,7 +13687,7 @@ pub const Vm = struct {
+         if (outs.len > 1) outs[1] = .Nil;
+     }
+ 
+-    fn builtinRequire(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinRequire(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("require expects module name", .{});
+         const name = switch (args[0]) {
+@@ -13739,7 +13796,7 @@ pub const Vm = struct {
+         return self.fail("{s}", .{msg});
+     }
+ 
+-    fn builtinPackageSearchpath(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinPackageSearchpath(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len > 0) outs[0] = .Nil;
+         if (outs.len > 1) outs[1] = .Nil;
+         if (args.len < 2) return self.fail("bad argument #2 to 'searchpath' (string expected)", .{});
+@@ -13809,7 +13866,7 @@ pub const Vm = struct {
+         if (outs.len > 1) outs[1] = .{ .String = try self.internStr(try std.fmt.allocPrint(self.alloc, "{s}", .{err_buf.items})) };
+     }
+ 
+-    fn builtinSetmetatable(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinSetmetatable(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (args.len < 2) return self.fail("bad argument #2 to 'setmetatable' (nil or table expected)", .{});
+         const tbl = try self.expectTable(args[0]);
+         if (tbl.metatable) |cur| {
+@@ -13833,7 +13890,7 @@ pub const Vm = struct {
+         if (outs.len > 0) outs[0] = args[0];
+     }
+ 
+-    fn builtinGetmetatable(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinGetmetatable(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("getmetatable expects value", .{});
+         if (valueMetatable(self, args[0])) |mt| {
+@@ -14124,7 +14181,7 @@ pub const Vm = struct {
+         return .{};
+     }
+ 
+-    fn debugInfoValidateOpts(self: *Vm, what: []const u8) Error!void {
++    fn debugInfoValidateOpts(self: *Vm, what: []const u8) DispatchError!void {
+         for (what) |ch| {
+             if (ch == '>') return self.fail("bad option '>' to 'getinfo'", .{});
+             if (std.mem.indexOfScalar(u8, "nSluftLr", ch) == null) {
+@@ -14133,7 +14190,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn debugShortSource(self: *Vm, src: []const u8) Error![]const u8 {
++    fn debugShortSource(self: *Vm, src: []const u8) DispatchError![]const u8 {
+         const idsize: usize = 60;
+         if (src.len == 0) return try std.fmt.allocPrint(self.alloc, "[string \"\"]", .{});
+ 
+@@ -14178,7 +14235,7 @@ pub const Vm = struct {
+             try std.fmt.allocPrint(self.alloc, "[string \"{s}\"]", .{src[0..body_end]});
+     }
+ 
+-    fn debugFillInfoFromIrFunction(self: *Vm, t: *Table, f: *const ir.Function, what: []const u8, runtime_nups: ?i64) Error!void {
++    fn debugFillInfoFromIrFunction(self: *Vm, t: *Table, f: *const ir.Function, what: []const u8, runtime_nups: ?i64) DispatchError!void {
+         const has_s = what.len == 0 or debugInfoHasOpt(what, 'S');
+         const has_u = what.len == 0 or debugInfoHasOpt(what, 'u');
+         if (has_s) {
+@@ -14221,7 +14278,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn debugFillInfoFromFunction(self: *Vm, t: *Table, fnv: Value, what: []const u8) Error!void {
++    fn debugFillInfoFromFunction(self: *Vm, t: *Table, fnv: Value, what: []const u8) DispatchError!void {
+         switch (fnv) {
+             .Builtin => |id| {
+                 const has_s = what.len == 0 or debugInfoHasOpt(what, 'S');
+@@ -14296,7 +14353,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn builtinDebugGetinfo(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinDebugGetinfo(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (args.len == 0) return self.fail("bad argument #1 to 'getinfo' (function or level expected)", .{});
+ 
+         var i: usize = 0;
+@@ -14620,7 +14677,7 @@ pub const Vm = struct {
+         if (outs.len > 0) outs[0] = .{ .Table = t };
+     }
+ 
+-    fn debugGetLocalFromBytecodeFrame(self: *Vm, fr: *const Frame, proto: *const bc.Proto, idx: i64, outs: []Value) Error!void {
++    fn debugGetLocalFromBytecodeFrame(self: *Vm, fr: *const Frame, proto: *const bc.Proto, idx: i64, outs: []Value) DispatchError!void {
+         if (idx == 0) return;
+         if (idx < 0) {
+             if (!proto.is_vararg) return;
+@@ -14685,7 +14742,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn debugSetLocalInBytecodeFrame(self: *Vm, fr: *Frame, proto: *const bc.Proto, idx: i64, value: Value, outs: []Value) Error!void {
++    fn debugSetLocalInBytecodeFrame(self: *Vm, fr: *Frame, proto: *const bc.Proto, idx: i64, value: Value, outs: []Value) DispatchError!void {
+         if (idx == 0) return;
+         if (idx < 0) {
+             if (!proto.is_vararg) return;
+@@ -14745,7 +14802,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn debugGetLocalFromFrame(self: *Vm, fr: *const Frame, idx: i64, outs: []Value) Error!void {
++    fn debugGetLocalFromFrame(self: *Vm, fr: *const Frame, idx: i64, outs: []Value) DispatchError!void {
+         if (fr.proto) |proto| return self.debugGetLocalFromBytecodeFrame(fr, proto, idx, outs);
+         if (idx == 0) return;
+         if (idx > 0) {
+@@ -14892,7 +14949,7 @@ pub const Vm = struct {
+         return fallback;
+     }
+ 
+-    fn debugGetLocalFromIrSuspendedFrame(self: *Vm, fr: *const IrSuspendedFrame, idx: i64, outs: []Value) Error!void {
++    fn debugGetLocalFromIrSuspendedFrame(self: *Vm, fr: *const IrSuspendedFrame, idx: i64, outs: []Value) DispatchError!void {
+         const fake = Frame{
+             .func = fr.func,
+             .proto = fr.proto,
+@@ -14918,7 +14975,7 @@ pub const Vm = struct {
+         try self.debugGetLocalFromFrame(&fake, idx, outs);
+     }
+ 
+-    fn debugSetLocalFromIrSuspendedFrame(self: *Vm, fr: *IrSuspendedFrame, idx: i64, value: Value, outs: []Value) Error!void {
++    fn debugSetLocalFromIrSuspendedFrame(self: *Vm, fr: *IrSuspendedFrame, idx: i64, value: Value, outs: []Value) DispatchError!void {
+         var fake = Frame{
+             .func = fr.func,
+             .proto = fr.proto,
+@@ -14944,7 +15001,7 @@ pub const Vm = struct {
+         try self.debugSetLocalInFrame(&fake, idx, value, outs);
+     }
+ 
+-    fn debugGetLocalFromThreadSnapshot(self: *Vm, th: *Thread, idx: i64, outs: []Value) Error!void {
++    fn debugGetLocalFromThreadSnapshot(self: *Vm, th: *Thread, idx: i64, outs: []Value) DispatchError!void {
+         if (idx < 1) return;
+         const snap = th.locals_snapshot orelse return;
+         const fr = threadCurrentIrSuspendedFrame(th) orelse return;
+@@ -14976,7 +15033,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn debugSetLocalFromThreadSnapshot(self: *Vm, th: *Thread, idx: i64, new_value: Value, outs: []Value) Error!void {
++    fn debugSetLocalFromThreadSnapshot(self: *Vm, th: *Thread, idx: i64, new_value: Value, outs: []Value) DispatchError!void {
+         if (idx < 1) return;
+         const snap = th.locals_snapshot orelse return;
+         const fr = threadCurrentIrSuspendedFrame(th) orelse return;
+@@ -15006,7 +15063,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn debugGetLocalNameFromProto(self: *Vm, proto: *const bc.Proto, idx: i64, outs: []Value) Error!void {
++    fn debugGetLocalNameFromProto(self: *Vm, proto: *const bc.Proto, idx: i64, outs: []Value) DispatchError!void {
+         if (idx <= 0) return;
+         const wanted: usize = @intCast(idx - 1);
+         if (wanted >= proto.numparams) return;
+@@ -15022,7 +15079,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn debugGetLocalNameFromFunction(self: *Vm, f: *const ir.Function, idx: i64, outs: []Value) Error!void {
++    fn debugGetLocalNameFromFunction(self: *Vm, f: *const ir.Function, idx: i64, outs: []Value) DispatchError!void {
+         if (idx <= 0) return;
+         const uidx: usize = @intCast(idx - 1);
+         if (uidx >= f.num_params or uidx >= f.local_names.len) return;
+@@ -15032,7 +15089,7 @@ pub const Vm = struct {
+         if (outs.len > 1) outs[1] = .Nil;
+     }
+ 
+-    fn debugSetLocalInFrame(self: *Vm, fr: *Frame, idx: i64, val: Value, outs: []Value) Error!void {
++    fn debugSetLocalInFrame(self: *Vm, fr: *Frame, idx: i64, val: Value, outs: []Value) DispatchError!void {
+         if (fr.proto) |proto| return self.debugSetLocalInBytecodeFrame(fr, proto, idx, val, outs);
+         if (idx == 0) return;
+         if (idx > 0) {
+@@ -15109,7 +15166,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn builtinDebugGetlocal(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinDebugGetlocal(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len > 0) outs[0] = .Nil;
+         if (outs.len > 1) outs[1] = .Nil;
+ 
+@@ -15207,7 +15264,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn builtinDebugSetlocal(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinDebugSetlocal(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len > 0) outs[0] = .Nil;
+ 
+         var i: usize = 0;
+@@ -15275,7 +15332,7 @@ pub const Vm = struct {
+         return "(no name)";
+     }
+ 
+-    fn builtinDebugGetupvalue(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinDebugGetupvalue(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len > 0) outs[0] = .Nil;
+         if (outs.len > 1) outs[1] = .Nil;
+         if (args.len < 2) return self.fail("debug.getupvalue expects (func, up)", .{});
+@@ -15307,7 +15364,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn builtinDebugSetupvalue(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinDebugSetupvalue(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len > 0) outs[0] = .Nil;
+         if (args.len < 3) return self.fail("debug.setupvalue expects (func, up, value)", .{});
+         const idx = switch (args[1]) {
+@@ -15333,7 +15390,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn builtinDebugUpvalueid(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinDebugUpvalueid(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len > 0) outs[0] = .Nil;
+         if (args.len < 2) return self.fail("debug.upvalueid expects (func, up)", .{});
+         const idx = switch (args[1]) {
+@@ -15377,7 +15434,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn debugLightUserdataForId(self: *Vm, id: u64) Error!Value {
++    fn debugLightUserdataForId(self: *Vm, id: u64) DispatchError!Value {
+         if (self.debug_upvalue_ids.get(id)) |obj| return .{ .Table = obj };
+         const t = try self.allocTable();
+         try self.setField(t, "__testud", .{ .Bool = true });
+@@ -15387,7 +15444,7 @@ pub const Vm = struct {
+         return .{ .Table = t };
+     }
+ 
+-    fn builtinDebugUpvaluejoin(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinDebugUpvaluejoin(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         _ = outs;
+         if (args.len < 4) return self.fail("debug.upvaluejoin expects (f1,n1,f2,n2)", .{});
+         const f1 = switch (args[0]) {
+@@ -15413,7 +15470,7 @@ pub const Vm = struct {
+         @constCast(f1.upvalues)[idx1] = f2.upvalues[idx2];
+     }
+ 
+-    fn debugPreseedLineHookFromUpvalue(self: *Vm, hook: Value, mask: []const u8) Error!bool {
++    fn debugPreseedLineHookFromUpvalue(self: *Vm, hook: Value, mask: []const u8) DispatchError!bool {
+         if (std.mem.indexOfScalar(u8, mask, 'l') == null) return false;
+         if (hook != .Closure) return false;
+         const cl = hook.Closure;
+@@ -15441,11 +15498,11 @@ pub const Vm = struct {
+         return false;
+     }
+ 
+-    fn debugDispatchHook(self: *Vm, event: []const u8, line: ?i64) Error!void {
++    fn debugDispatchHook(self: *Vm, event: []const u8, line: ?i64) DispatchError!void {
+         return self.debugDispatchHookTransfer(event, line, null, 1);
+     }
+ 
+-    fn debugDispatchHookTransfer(self: *Vm, event: []const u8, line: ?i64, transfer: ?[]const Value, transfer_start: i64) Error!void {
++    fn debugDispatchHookTransfer(self: *Vm, event: []const u8, line: ?i64, transfer: ?[]const Value, transfer_start: i64) DispatchError!void {
+         if (self.debug_hooks_suppressed != 0) return;
+         if (self.isInDebugHook()) return;
+         const hook_state = self.activeHookState();
+@@ -15514,7 +15571,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn debugDispatchHookWithCallee(self: *Vm, event: []const u8, line: ?i64, callee: Value) Error!void {
++    fn debugDispatchHookWithCallee(self: *Vm, event: []const u8, line: ?i64, callee: Value) DispatchError!void {
+         return self.debugDispatchHookWithCalleeTransfer(event, line, callee, null, 1);
+     }
+ 
+@@ -15524,7 +15581,7 @@ pub const Vm = struct {
+         return call_args[0..n];
+     }
+ 
+-    fn debugDispatchHookWithCalleeTransfer(self: *Vm, event: []const u8, line: ?i64, callee: Value, transfer: ?[]const Value, transfer_start: i64) Error!void {
++    fn debugDispatchHookWithCalleeTransfer(self: *Vm, event: []const u8, line: ?i64, callee: Value, transfer: ?[]const Value, transfer_start: i64) DispatchError!void {
+         if (self.frames.items.len == 0) {
+             try self.debugDispatchHookTransfer(event, line, transfer, transfer_start);
+             return;
+@@ -15545,7 +15602,7 @@ pub const Vm = struct {
+         try self.debugDispatchHookTransfer(event, line, transfer, transfer_start);
+     }
+ 
+-    fn builtinDebugGethook(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinDebugGethook(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         const target_thread = if (args.len > 0) try self.expectThread(args[0]) else null;
+         const hook_state = self.hookStateFor(target_thread);
+         if (outs.len == 0) return;
+@@ -15558,7 +15615,7 @@ pub const Vm = struct {
+         outs[0] = .Nil;
+     }
+ 
+-    fn ensureDebugRegistry(self: *Vm) Error!*Table {
++    fn ensureDebugRegistry(self: *Vm) DispatchError!*Table {
+         if (self.debug_registry) |r| return r;
+         var roots = self.gcTempRoots();
+         defer roots.end();
+@@ -15577,14 +15634,14 @@ pub const Vm = struct {
+         return reg;
+     }
+ 
+-    fn builtinDebugGetregistry(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinDebugGetregistry(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         _ = args;
+         if (outs.len == 0) return;
+         const reg = try self.ensureDebugRegistry();
+         outs[0] = .{ .Table = reg };
+     }
+ 
+-    fn builtinDebugSetmetatable(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinDebugSetmetatable(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (args.len < 2) return self.fail("debug.setmetatable expects (value, metatable)", .{});
+         const mt: ?*Table = switch (args[1]) {
+             .Nil => null,
+@@ -15641,7 +15698,7 @@ pub const Vm = struct {
+         if (outs.len > 0) outs[0] = args[0];
+     }
+ 
+-    fn builtinDebugTraceback(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinDebugTraceback(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+ 
+         var i: usize = 0;
+@@ -15693,7 +15750,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn tracebackFrameLabel(self: *Vm, fr: *const Frame, top_hook_frame: bool) Error![]const u8 {
++    fn tracebackFrameLabel(self: *Vm, fr: *const Frame, top_hook_frame: bool) DispatchError![]const u8 {
+         if (top_hook_frame and self.isInDebugHook()) {
+             return try std.fmt.allocPrint(self.alloc, "hook", .{});
+         }
+@@ -15726,7 +15783,7 @@ pub const Vm = struct {
+         return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in ?", .{ shown_src, line });
+     }
+ 
+-    fn debugBuildCurrentTraceback(self: *Vm, level: i64) Error![]const u8 {
++    fn debugBuildCurrentTraceback(self: *Vm, level: i64) DispatchError![]const u8 {
+         // When running inside a coroutine, only include frames created after
+         // the latest resume boundary; caller frames outside the coroutine
+         // should not leak into this traceback.
+@@ -15818,7 +15875,7 @@ pub const Vm = struct {
+         return try aw.toOwnedSlice();
+     }
+ 
+-    fn debugBuildThreadTraceback(self: *Vm, th: *Thread, level: i64) Error![]const u8 {
++    fn debugBuildThreadTraceback(self: *Vm, th: *Thread, level: i64) DispatchError![]const u8 {
+         // Pragmatic traceback used by db.lua coroutine checks:
+         // first line is the header, following lines are scanned with string.gmatch.
+         var aw: std.Io.Writer.Allocating = .init(self.alloc);
+@@ -15866,7 +15923,7 @@ pub const Vm = struct {
+         return try aw.toOwnedSlice();
+     }
+ 
+-    fn builtinDebugSethook(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinDebugSethook(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         _ = outs;
+         var i: usize = 0;
+         var target_thread: ?*Thread = null;
+@@ -15943,7 +16000,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn builtinDebugSetuservalue(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinDebugSetuservalue(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (args.len == 0) return self.fail("debug.setuservalue expects (u, value)", .{});
+         const target = args[0];
+         if (target == .Nil) return self.fail("bad argument #1 to 'setuservalue' (userdata expected, got nil)", .{});
+@@ -15976,7 +16033,7 @@ pub const Vm = struct {
+         if (outs.len > 0) outs[0] = .{ .Bool = true };
+     }
+ 
+-    fn builtinDebugGetuservalue(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinDebugGetuservalue(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (args.len == 0) return;
+         const target = args[0];
+         const idx: i64 = if (args.len >= 2 and args[1] == .Int)
+@@ -16007,7 +16064,7 @@ pub const Vm = struct {
+         if (outs.len > 1) outs[1] = .{ .Bool = true };
+     }
+ 
+-    fn builtinPairs(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinPairs(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (args.len == 0) return self.fail("bad argument #1 to 'pairs' (value expected)", .{});
+         if (args[0] != .Table) return self.fail("bad argument #1 to 'pairs' (table expected, got {s})", .{self.valueTypeName(args[0])});
+         for (outs) |*out| out.* = .Nil;
+@@ -16040,7 +16097,7 @@ pub const Vm = struct {
+         if (outs.len > 2) outs[2] = .Nil;
+     }
+ 
+-    fn builtinIpairs(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinIpairs(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'ipairs' (value expected)", .{});
+         if (args[0] != .Table) return self.fail("bad argument #1 to 'ipairs' (table expected, got {s})", .{self.valueTypeName(args[0])});
+@@ -16049,7 +16106,7 @@ pub const Vm = struct {
+         if (outs.len > 2) outs[2] = .{ .Int = 0 };
+     }
+ 
+-    fn builtinPairsIter(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinPairsIter(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len < 2) return self.fail("pairs iterator: expected state and control", .{});
+         const state = try self.expectTable(args[0]);
+@@ -16079,7 +16136,7 @@ pub const Vm = struct {
+         if (outs.len > 1) outs[1] = val;
+     }
+ 
+-    fn builtinIpairsIter(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinIpairsIter(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         outs[0] = .Nil;
+         if (outs.len > 1) outs[1] = .Nil;
+@@ -16098,7 +16155,7 @@ pub const Vm = struct {
+         if (outs.len > 1) outs[1] = val;
+     }
+ 
+-    fn builtinRawget(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinRawget(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len < 2) return self.fail("rawget expects (table, key)", .{});
+         const tbl = try self.expectTable(args[0]);
+@@ -16153,7 +16210,7 @@ pub const Vm = struct {
+     // (or extending the array part) as needed. Setting val==.Nil deletes the
+     // hash entry (PUC: don't insert nils) but leaves array entries in place as
+     // holes (PUC: array compaction is the rehash path's job).
+-    fn rawSet(self: *Vm, tbl: *Table, key: Value, val: Value) Error!void {
++    fn rawSet(self: *Vm, tbl: *Table, key: Value, val: Value) DispatchError!void {
+         switch (key) {
+             .Nil => return self.fail("table key cannot be nil", .{}),
+             .Num => |n| {
+@@ -16247,7 +16304,7 @@ pub const Vm = struct {
+     //
+     // Returns null when iteration is complete. Returns error.RuntimeError if
+     // the control key is non-Nil and not present in the table.
+-    fn rawNext(self: *Vm, tbl: *Table, control_key: Value) Error!?struct { key: Value, value: Value } {
++    fn rawNext(self: *Vm, tbl: *Table, control_key: Value) DispatchError!?struct { key: Value, value: Value } {
+         const cc = canonicalizeNextControl(control_key);
+ 
+         // Determine where to start scanning, based on the control key.
+@@ -16324,7 +16381,7 @@ pub const Vm = struct {
+     // Thin compatibility wrappers around the new primitives — kept so the many
+     // existing call sites continue to compile unchanged. They carry the same
+     // signatures as before the refactor.
+-    fn tableSetValue(self: *Vm, tbl: *Table, key: Value, val: Value) Error!void {
++    fn tableSetValue(self: *Vm, tbl: *Table, key: Value, val: Value) DispatchError!void {
+         return self.rawSet(tbl, key, val);
+     }
+ 
+@@ -16353,14 +16410,14 @@ pub const Vm = struct {
+ 
+     // Write a string-keyed field. Interns `name` once; the existing value (if
+     // any) is overwritten. Writing Nil deletes the entry (rawSet semantics).
+-    fn setField(self: *Vm, tbl: *Table, name: []const u8, val: Value) Error!void {
++    fn setField(self: *Vm, tbl: *Table, name: []const u8, val: Value) DispatchError!void {
+         const key: Value = .{ .String = try self.internStr(name) };
+         return self.rawSet(tbl, key, val);
+     }
+ 
+     // Remove a string-keyed field (if present). Equivalent to setField(Nil) but
+     // reads slightly clearer at delete-only sites.
+-    fn removeField(self: *Vm, tbl: *Table, name: []const u8) Error!void {
++    fn removeField(self: *Vm, tbl: *Table, name: []const u8) DispatchError!void {
+         return self.setField(tbl, name, .Nil);
+     }
+ 
+@@ -16384,14 +16441,14 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn builtinRawset(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinRawset(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (args.len < 3) return self.fail("rawset expects (table, key, value)", .{});
+         const tbl = try self.expectTable(args[0]);
+         try self.tableSetValue(tbl, args[1], args[2]);
+         if (outs.len > 0) outs[0] = args[0];
+     }
+ 
+-    fn builtinIoWrite(self: *Vm, to_stderr: bool, args: []const Value, outs: []Value) Error!void {
++    fn builtinIoWrite(self: *Vm, to_stderr: bool, args: []const Value, outs: []Value) DispatchError!void {
+         var out = if (to_stderr) stdio.stderr() else stdio.stdout();
+         var target_file_v: Value = .Nil;
+         var i: usize = 0;
+@@ -16458,7 +16515,7 @@ pub const Vm = struct {
+         if (outs.len > 0 and ret_file != .Nil) outs[0] = ret_file;
+     }
+ 
+-    fn builtinIoInput(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinIoInput(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         const io_v = self.getGlobal("io");
+         if (io_v != .Table) {
+@@ -16546,7 +16603,7 @@ pub const Vm = struct {
+         return true;
+     }
+ 
+-    fn writeBufferedFile(self: *Vm, v: Value, bytes: []const u8) Error!bool {
++    fn writeBufferedFile(self: *Vm, v: Value, bytes: []const u8) DispatchError!bool {
+         const f = self.getManagedFile(v) orelse return false;
+         const fb = self.getFileBuffer(v) orelse return false;
+         switch (fb.mode) {
+@@ -16591,7 +16648,7 @@ pub const Vm = struct {
+         if (fb.sequential) fb.unread_byte = byte;
+     }
+ 
+-    fn readLineAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer, keep_newline: bool) Error!?*LuaString {
++    fn readLineAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer, keep_newline: bool) DispatchError!?*LuaString {
+         var out = std.ArrayList(u8).empty;
+         defer out.deinit(self.alloc);
+         var saw_input = false;
+@@ -16610,7 +16667,7 @@ pub const Vm = struct {
+         return try self.internStr(out.items);
+     }
+ 
+-    fn readCountAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer, n: usize) Error!?*LuaString {
++    fn readCountAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer, n: usize) DispatchError!?*LuaString {
+         if (n == 0) {
+             if (!fb.sequential) {
+                 const end = file.length(stdio.activeIo()) catch return try self.internStr("");
+@@ -16641,7 +16698,7 @@ pub const Vm = struct {
+         return try self.internStr(buf[0..got]);
+     }
+ 
+-    fn readAllAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer) Error!*LuaString {
++    fn readAllAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer) DispatchError!*LuaString {
+         var out = std.ArrayList(u8).empty;
+         defer out.deinit(self.alloc);
+         var tmp: [4096]u8 = undefined;
+@@ -16689,7 +16746,7 @@ pub const Vm = struct {
+         return .regular;
+     }
+ 
+-    fn allocManagedFileObject(self: *Vm, file: std.Io.File, can_read: bool, can_write: bool, sequential: bool) Error!Value {
++    fn allocManagedFileObject(self: *Vm, file: std.Io.File, can_read: bool, can_write: bool, sequential: bool) DispatchError!Value {
+         var file_owned_locally = true;
+         errdefer if (file_owned_locally) file.close(stdio.activeIo());
+ 
+@@ -16725,7 +16782,7 @@ pub const Vm = struct {
+         return .{ .Table = tbl };
+     }
+ 
+-    fn writeProcessResult(self: *Vm, term: std.process.Child.Term, outs: []Value) Error!void {
++    fn writeProcessResult(self: *Vm, term: std.process.Child.Term, outs: []Value) DispatchError!void {
+         if (outs.len > 0) outs[0] = .Nil;
+         if (outs.len > 1) outs[1] = .Nil;
+         if (outs.len > 2) outs[2] = .Nil;
+@@ -16752,7 +16809,7 @@ pub const Vm = struct {
+         self.last_builtin_out_count = @min(outs.len, 3);
+     }
+ 
+-    fn writeManagedCloseResult(self: *Vm, result: ManagedFileClose, outs: []Value) Error!void {
++    fn writeManagedCloseResult(self: *Vm, result: ManagedFileClose, outs: []Value) DispatchError!void {
+         switch (result) {
+             .regular => {
+                 if (outs.len > 0) outs[0] = .{ .Bool = true };
+@@ -16794,7 +16851,7 @@ pub const Vm = struct {
+         return .{ .base = base, .plus = plus };
+     }
+ 
+-    fn ioOpenPath(self: *Vm, path: []const u8, mode_s: []const u8, outs: []Value) Error!?Value {
++    fn ioOpenPath(self: *Vm, path: []const u8, mode_s: []const u8, outs: []Value) DispatchError!?Value {
+         const mode = parseIoMode(mode_s) orelse return self.fail("bad argument #2 to 'open' (invalid mode)", .{});
+         const io = stdio.activeIo();
+         const cwd = std.Io.Dir.cwd();
+@@ -16891,7 +16948,7 @@ pub const Vm = struct {
+         return err_name;
+     }
+ 
+-    fn builtinIoOpen(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinIoOpen(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0 or args[0] != .String) {
+             return self.fail("bad argument #1 to 'open' (string expected)", .{});
+@@ -16905,7 +16962,7 @@ pub const Vm = struct {
+         outs[0] = file_v;
+     }
+ 
+-    fn builtinIoPopen(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinIoPopen(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len > 0) outs[0] = .Nil;
+         if (outs.len > 1) outs[1] = .Nil;
+         if (outs.len > 2) outs[2] = .Nil;
+@@ -16958,7 +17015,7 @@ pub const Vm = struct {
+         self.last_builtin_out_count = @min(outs.len, 1);
+     }
+ 
+-    fn builtinIoTmpfile(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinIoTmpfile(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         _ = args;
+         if (outs.len == 0) return;
+         var tmp_out = [_]Value{.Nil};
+@@ -16973,7 +17030,7 @@ pub const Vm = struct {
+         outs[0] = f;
+     }
+ 
+-    fn readOneFormat(self: *Vm, file_v: Value, spec: Value) Error!Value {
++    fn readOneFormat(self: *Vm, file_v: Value, spec: Value) DispatchError!Value {
+         const f = self.getManagedFile(file_v) orelse return self.fail("closed file", .{});
+         const fb = self.getFileBuffer(file_v) orelse return self.fail("closed file", .{});
+         if (spec == .Int) {
+@@ -17121,7 +17178,7 @@ pub const Vm = struct {
+         return self.getFieldOpt(io_tbl, "output_stream") orelse (self.getFieldOpt(io_tbl, "stdout") orelse .Nil);
+     }
+ 
+-    fn builtinIoRead(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinIoRead(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         const file_v = self.currentInputFile();
+         if (asFileTable(self, file_v) != null and !self.isStdFile(file_v) and self.getManagedFile(file_v) == null) {
+             return self.fail(" input file is closed", .{});
+@@ -17142,7 +17199,7 @@ pub const Vm = struct {
+         self.last_builtin_out_count = out_i + @intFromBool(out_i < outs.len and out_i < args.len and outs[out_i] == .Nil);
+     }
+ 
+-    fn makeLinesIter(self: *Vm, file_v: Value, auto_close: bool, fmts: []const Value) Error!Value {
++    fn makeLinesIter(self: *Vm, file_v: Value, auto_close: bool, fmts: []const Value) DispatchError!Value {
+         const obj = try self.allocTableNoGc();
+         const mt = try self.allocTableNoGc();
+         const fmts_tbl = try self.allocTableNoGc();
+@@ -17158,7 +17215,7 @@ pub const Vm = struct {
+         return .{ .Table = obj };
+     }
+ 
+-    fn builtinIoLines(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinIoLines(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         var file_v: Value = .Nil;
+         var auto_close = false;
+@@ -17189,7 +17246,7 @@ pub const Vm = struct {
+         self.last_builtin_out_count = @min(if (auto_close) @as(usize, 4) else @as(usize, 3), outs.len);
+     }
+ 
+-    fn builtinIoLinesIter(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinIoLinesIter(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (args.len == 0 or args[0] != .Table) return self.fail("bad argument #1 to 'lines' iterator", .{});
+         const it = args[0].Table;
+         const file_v = self.getFieldOpt(it, "__file") orelse .Nil;
+@@ -17225,7 +17282,7 @@ pub const Vm = struct {
+         self.last_builtin_out_count = out_i;
+     }
+ 
+-    fn builtinIoFlush(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinIoFlush(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         _ = args;
+         if (outs.len == 0) return;
+         const out_v = self.currentOutputFile();
+@@ -17242,7 +17299,7 @@ pub const Vm = struct {
+         outs[0] = .{ .Bool = true };
+     }
+ 
+-    fn builtinIoOutput(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinIoOutput(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         const io_v = self.getGlobal("io");
+         if (io_v != .Table) {
+@@ -17293,7 +17350,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn builtinIoClose(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinIoClose(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len > 0) {
+             outs[0] = .Nil;
+             if (outs.len > 1) outs[1] = .Nil;
+@@ -17320,7 +17377,7 @@ pub const Vm = struct {
+         try self.writeManagedCloseResult(self.closeManagedFile(file_tbl), outs);
+     }
+ 
+-    fn builtinFileClose(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinFileClose(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len > 0) {
+             outs[0] = .Nil;
+             if (outs.len > 1) outs[1] = .Nil;
+@@ -17348,7 +17405,7 @@ pub const Vm = struct {
+         try self.writeManagedCloseResult(self.closeManagedFile(file_tbl), outs);
+     }
+ 
+-    fn builtinFileMetaClose(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinFileMetaClose(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (args.len == 0) return;
+         const file_tbl = asFileTable(self, args[0]) orelse return;
+         if (self.isStdFile(args[0])) return;
+@@ -17360,7 +17417,7 @@ pub const Vm = struct {
+         if (outs.len > 0) outs[0] = .{ .Bool = true };
+     }
+ 
+-    fn builtinFileWrite(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinFileWrite(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (args.len == 0) return self.fail("bad argument #1 to 'write' (FILE* expected)", .{});
+         const file_v = args[0];
+         if (!fileCanWrite(self, file_v)) {
+@@ -17391,7 +17448,7 @@ pub const Vm = struct {
+         if (outs.len > 0) outs[0] = file_v;
+     }
+ 
+-    fn builtinFileRead(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinFileRead(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (args.len == 0) return self.fail("bad argument #1 to 'read' (FILE* expected)", .{});
+         const file_v = args[0];
+         if (!fileCanRead(self, file_v)) {
+@@ -17415,7 +17472,7 @@ pub const Vm = struct {
+         self.last_builtin_out_count = out_i + @intFromBool(out_i < outs.len and out_i + 1 < args.len and outs[out_i] == .Nil);
+     }
+ 
+-    fn builtinFileSeek(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinFileSeek(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len > 0) outs[0] = .Nil;
+         if (args.len == 0) return self.fail("bad argument #1 to 'seek' (FILE* expected)", .{});
+         const file_v = args[0];
+@@ -17459,7 +17516,7 @@ pub const Vm = struct {
+         if (outs.len > 0) outs[0] = .{ .Int = @intCast(fb.pos) };
+     }
+ 
+-    fn builtinFileFlush(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinFileFlush(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'flush' (FILE* expected)", .{});
+         _ = self.getManagedFile(args[0]) orelse {
+@@ -17475,7 +17532,7 @@ pub const Vm = struct {
+         outs[0] = .{ .Bool = true };
+     }
+ 
+-    fn builtinFileLines(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinFileLines(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (args.len == 0) return self.fail("bad argument #1 to 'lines' (FILE* expected)", .{});
+         if (args.len - 1 > 250) return self.fail("too many arguments", .{});
+         if (outs.len > 0) {
+@@ -17486,7 +17543,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn builtinFileSetvbuf(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinFileSetvbuf(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len > 0) outs[0] = .{ .Bool = true };
+         if (args.len < 2 or args[1] != .String) return self.fail("bad argument #2 to 'setvbuf' (string expected)", .{});
+         const fb = self.getFileBuffer(args[0]) orelse return;
+@@ -17501,7 +17558,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn builtinIoType(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinIoType(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) {
+             outs[0] = .Nil;
+@@ -17520,7 +17577,7 @@ pub const Vm = struct {
+         outs[0] = .{ .String = try self.internStr("file") };
+     }
+ 
+-    fn builtinFileGc(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinFileGc(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         _ = outs;
+         if (args.len == 0) return self.fail("no value", .{});
+         const file_tbl = asFileTable(self, args[0]) orelse return;
+@@ -17528,7 +17585,7 @@ pub const Vm = struct {
+         _ = self.setField(file_tbl, "__closed", .{ .Bool = true }) catch {};
+     }
+ 
+-    fn mathArgToInt(self: *Vm, v: Value, what: []const u8) Error!i64 {
++    fn mathArgToInt(self: *Vm, v: Value, what: []const u8) DispatchError!i64 {
+         return switch (v) {
+             .Int => |i| i,
+             .Num => |n| blk: {
+@@ -17587,7 +17644,7 @@ pub const Vm = struct {
+         while (i < 16) : (i += 1) _ = self.nextRandomU64();
+     }
+ 
+-    fn builtinMathRandom(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathRandom(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len > 2) return self.fail("wrong number of arguments", .{});
+         const r = self.nextRandomU64();
+@@ -17615,7 +17672,7 @@ pub const Vm = struct {
+         outs[0] = .{ .Int = @bitCast(p +% low_u) };
+     }
+ 
+-    fn builtinMathRandomseed(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathRandomseed(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         var n1: u64 = 0;
+         var n2: u64 = 0;
+         if (args.len == 0) {
+@@ -17632,7 +17689,7 @@ pub const Vm = struct {
+         if (outs.len > 1) outs[1] = .{ .Int = @bitCast(n2) };
+     }
+ 
+-    fn builtinMathTointeger(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathTointeger(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) {
+             outs[0] = .Nil;
+@@ -17666,7 +17723,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn builtinMathSin(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathSin(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'sin' (number expected, got nil)", .{});
+         const x: f64 = switch (args[0]) {
+@@ -17677,7 +17734,7 @@ pub const Vm = struct {
+         outs[0] = .{ .Num = std.math.sin(x) };
+     }
+ 
+-    fn builtinMathCos(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathCos(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'cos' (number expected, got nil)", .{});
+         const x: f64 = switch (args[0]) {
+@@ -17688,7 +17745,7 @@ pub const Vm = struct {
+         outs[0] = .{ .Num = std.math.cos(x) };
+     }
+ 
+-    fn mathArgToNum(self: *Vm, v: Value, what: []const u8, argn: usize) Error!f64 {
++    fn mathArgToNum(self: *Vm, v: Value, what: []const u8, argn: usize) DispatchError!f64 {
+         return switch (v) {
+             .Int => |i| @floatFromInt(i),
+             .Num => |n| n,
+@@ -17696,28 +17753,28 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn builtinMathTan(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathTan(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'tan' (number expected, got nil)", .{});
+         const x = try self.mathArgToNum(args[0], "tan", 1);
+         outs[0] = .{ .Num = std.math.tan(x) };
+     }
+ 
+-    fn builtinMathAsin(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathAsin(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'asin' (number expected, got nil)", .{});
+         const x = try self.mathArgToNum(args[0], "asin", 1);
+         outs[0] = .{ .Num = std.math.asin(x) };
+     }
+ 
+-    fn builtinMathAcos(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathAcos(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'acos' (number expected, got nil)", .{});
+         const x = try self.mathArgToNum(args[0], "acos", 1);
+         outs[0] = .{ .Num = std.math.acos(x) };
+     }
+ 
+-    fn builtinMathAtan(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathAtan(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'atan' (number expected, got nil)", .{});
+         const y = try self.mathArgToNum(args[0], "atan", 1);
+@@ -17729,21 +17786,21 @@ pub const Vm = struct {
+         outs[0] = .{ .Num = std.math.atan2(y, x) };
+     }
+ 
+-    fn builtinMathDeg(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathDeg(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'deg' (number expected, got nil)", .{});
+         const x = try self.mathArgToNum(args[0], "deg", 1);
+         outs[0] = .{ .Num = x * (180.0 / std.math.pi) };
+     }
+ 
+-    fn builtinMathRad(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathRad(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'rad' (number expected, got nil)", .{});
+         const x = try self.mathArgToNum(args[0], "rad", 1);
+         outs[0] = .{ .Num = x * (std.math.pi / 180.0) };
+     }
+ 
+-    fn builtinMathAbs(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathAbs(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'abs' (number expected, got nil)", .{});
+         outs[0] = switch (args[0]) {
+@@ -17753,21 +17810,21 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn builtinMathSqrt(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathSqrt(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'sqrt' (number expected, got nil)", .{});
+         const x = try self.mathArgToNum(args[0], "sqrt", 1);
+         outs[0] = .{ .Num = std.math.sqrt(x) };
+     }
+ 
+-    fn builtinMathExp(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathExp(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'exp' (number expected, got nil)", .{});
+         const x = try self.mathArgToNum(args[0], "exp", 1);
+         outs[0] = .{ .Num = std.math.exp(x) };
+     }
+ 
+-    fn builtinMathLdexp(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathLdexp(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len < 2) return self.fail("bad argument #2 to 'ldexp' (number expected, got nil)", .{});
+         const x = try self.mathArgToNum(args[0], "ldexp", 1);
+@@ -17776,7 +17833,7 @@ pub const Vm = struct {
+         outs[0] = .{ .Num = x * std.math.pow(f64, 2.0, ef) };
+     }
+ 
+-    fn builtinMathFrexp(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathFrexp(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'frexp' (number expected, got nil)", .{});
+         const x = try self.mathArgToNum(args[0], "frexp", 1);
+@@ -17804,7 +17861,7 @@ pub const Vm = struct {
+         if (outs.len > 1) outs[1] = .{ .Int = e };
+     }
+ 
+-    fn builtinMathCeil(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathCeil(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'ceil' (number expected, got nil)", .{});
+         outs[0] = switch (args[0]) {
+@@ -17820,7 +17877,7 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn builtinMathUlt(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathUlt(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len < 2) return self.fail("math.ult expects two integers", .{});
+         const a = try self.mathArgToInt(args[0], "ult");
+@@ -17828,7 +17885,7 @@ pub const Vm = struct {
+         outs[0] = .{ .Bool = @as(u64, @bitCast(a)) < @as(u64, @bitCast(b)) };
+     }
+ 
+-    fn builtinMathModf(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathModf(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'modf' (number expected, got nil)", .{});
+         switch (args[0]) {
+@@ -17850,7 +17907,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn builtinMathLog(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathLog(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'log' (number expected, got nil)", .{});
+         const x: f64 = switch (args[0]) {
+@@ -17870,7 +17927,7 @@ pub const Vm = struct {
+         outs[0] = .{ .Num = std.math.log(f64, std.math.e, x) / std.math.log(f64, std.math.e, base) };
+     }
+ 
+-    fn builtinMathFmod(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathFmod(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len < 2) return self.fail("math.fmod expects two numbers", .{});
+         if (args[0] == .Int and args[1] == .Int) {
+@@ -17890,7 +17947,7 @@ pub const Vm = struct {
+         outs[0] = .{ .Num = @rem(x, y) };
+     }
+ 
+-    fn builtinMathFloor(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathFloor(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'floor' (number expected, got nil)", .{});
+         outs[0] = switch (args[0]) {
+@@ -17906,7 +17963,7 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn builtinMathType(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathType(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) {
+             outs[0] = .Nil;
+@@ -17919,7 +17976,7 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn builtinMathMin(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathMin(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("value expected", .{});
+         // Keep it simple: treat numbers as f64 if any arg is float.
+@@ -17954,7 +18011,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn builtinMathMax(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinMathMax(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("value expected", .{});
+         var use_float = false;
+@@ -17988,7 +18045,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn builtinOsExecute(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinOsExecute(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len > 0) outs[0] = .Nil;
+         if (outs.len > 1) outs[1] = .Nil;
+         if (outs.len > 2) outs[2] = .Nil;
+@@ -18042,7 +18099,7 @@ pub const Vm = struct {
+         try self.writeProcessResult(term, outs);
+     }
+ 
+-    fn builtinOsExit(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinOsExit(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         _ = self;
+         _ = outs;
+         const code: u8 = if (args.len == 0)
+@@ -18057,7 +18114,7 @@ pub const Vm = struct {
+         std.process.exit(code);
+     }
+ 
+-    fn builtinOsClock(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinOsClock(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         _ = self;
+         _ = args;
+         if (outs.len == 0) return;
+@@ -18073,7 +18130,7 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn valueToTimeT(self: *Vm, v: Value, argn: usize, fname: []const u8) Error!i64 {
++    fn valueToTimeT(self: *Vm, v: Value, argn: usize, fname: []const u8) DispatchError!i64 {
+         return switch (v) {
+             .Int => |i| i,
+             .Num => |n| blk: {
+@@ -18157,7 +18214,7 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn formatDate(self: *Vm, fmt: []const u8, p: DateParts) Error!*LuaString {
++    fn formatDate(self: *Vm, fmt: []const u8, p: DateParts) DispatchError!*LuaString {
+         var out = std.ArrayList(u8).empty;
+         defer out.deinit(self.alloc);
+         var i: usize = 0;
+@@ -18282,7 +18339,7 @@ pub const Vm = struct {
+         return false;
+     }
+ 
+-    fn builtinOsDate(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinOsDate(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         const raw_fmt: []const u8 = if (args.len >= 1) switch (args[0]) {
+             .String => |s| s.bytes(),
+@@ -18330,7 +18387,7 @@ pub const Vm = struct {
+         outs[0] = .{ .String = try self.formatDate(fmt, p) };
+     }
+ 
+-    fn builtinOsTime(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinOsTime(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0 or args[0] == .Nil) {
+             outs[0] = .{ .Int = std.Io.Timestamp.now(stdio.activeIo(), .real).toSeconds() };
+@@ -18394,7 +18451,7 @@ pub const Vm = struct {
+         outs[0] = .{ .Int = t };
+     }
+ 
+-    fn builtinOsDifftime(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinOsDifftime(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         _ = self;
+         if (outs.len == 0) return;
+         if (args.len < 2) return;
+@@ -18411,7 +18468,7 @@ pub const Vm = struct {
+         outs[0] = .{ .Num = t1 - t2 };
+     }
+ 
+-    fn builtinOsGetenv(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinOsGetenv(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'getenv' (string expected)", .{});
+         const name = switch (args[0]) {
+@@ -18429,7 +18486,7 @@ pub const Vm = struct {
+         outs[0] = .{ .String = try self.internStr(val) };
+     }
+ 
+-    fn builtinOsTmpname(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinOsTmpname(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         _ = args;
+         if (outs.len == 0) return;
+         var buf: [128]u8 = undefined;
+@@ -18438,7 +18495,7 @@ pub const Vm = struct {
+         outs[0] = .{ .String = try self.internStr(p) };
+     }
+ 
+-    fn builtinOsRemove(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinOsRemove(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0 or args[0] != .String) return self.fail("bad argument #1 to 'remove' (string expected)", .{});
+         std.Io.Dir.cwd().deleteFile(stdio.activeIo(), args[0].String.bytes()) catch |e| {
+@@ -18450,7 +18507,7 @@ pub const Vm = struct {
+         outs[0] = .{ .Bool = true };
+     }
+ 
+-    fn builtinOsRename(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinOsRename(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len < 2 or args[0] != .String or args[1] != .String) {
+             return self.fail("bad argument to 'rename' (string expected)", .{});
+@@ -18464,7 +18521,7 @@ pub const Vm = struct {
+         outs[0] = .{ .Bool = true };
+     }
+ 
+-    fn builtinOsSetlocale(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinOsSetlocale(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         const locale_opt: ?[]const u8 = if (args.len == 0) null else switch (args[0]) {
+             .Nil => null,
+@@ -18490,7 +18547,7 @@ pub const Vm = struct {
+         outs[0] = .Nil;
+     }
+ 
+-    fn builtinStringFormat(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinStringFormat(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("string.format expects format string", .{});
+         const fmt = switch (args[0]) {
+@@ -18967,7 +19024,7 @@ pub const Vm = struct {
+         outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
+     }
+ 
+-    fn builtinStringPack(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinStringPack(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("string.pack expects format string", .{});
+         const fmt = switch (args[0]) {
+@@ -19239,7 +19296,7 @@ pub const Vm = struct {
+         outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
+     }
+ 
+-    fn builtinStringPacksize(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinStringPacksize(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("string.packsize expects format string", .{});
+         const fmt = switch (args[0]) {
+@@ -19352,7 +19409,7 @@ pub const Vm = struct {
+         outs[0] = .{ .Int = @intCast(total) };
+     }
+ 
+-    fn builtinStringUnpack(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinStringUnpack(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len < 2) return self.fail("string.unpack expects (fmt, s [, pos])", .{});
+         const fmt = switch (args[0]) {
+@@ -19608,7 +19665,7 @@ pub const Vm = struct {
+         if (out_i < outs.len) outs[out_i] = .{ .Int = @intCast(pos + 1) };
+     }
+ 
+-    fn builtinStringLen(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinStringLen(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("string.len expects string", .{});
+         const s = switch (args[0]) {
+@@ -19618,7 +19675,7 @@ pub const Vm = struct {
+         outs[0] = .{ .Int = @intCast(s.len) };
+     }
+ 
+-    fn builtinStringByte(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinStringByte(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("string.byte expects string", .{});
+         const s = switch (args[0]) {
+@@ -19653,7 +19710,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn builtinStringChar(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinStringChar(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         var out = std.ArrayList(u8).empty;
+         defer out.deinit(self.alloc);
+@@ -19674,7 +19731,7 @@ pub const Vm = struct {
+         outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
+     }
+ 
+-    fn builtinStringUpper(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinStringUpper(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'upper' (string expected, got nil)", .{});
+         const s = switch (args[0]) {
+@@ -19686,7 +19743,7 @@ pub const Vm = struct {
+         outs[0] = .{ .String = try self.internStr(out) };
+     }
+ 
+-    fn builtinStringLower(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinStringLower(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'lower' (string expected, got nil)", .{});
+         const s = switch (args[0]) {
+@@ -19698,7 +19755,7 @@ pub const Vm = struct {
+         outs[0] = .{ .String = try self.internStr(out) };
+     }
+ 
+-    fn builtinStringReverse(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinStringReverse(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'reverse' (string expected, got nil)", .{});
+         const s = switch (args[0]) {
+@@ -19711,7 +19768,7 @@ pub const Vm = struct {
+         outs[0] = .{ .String = try self.internStr(out) };
+     }
+ 
+-    fn builtinStringSub(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinStringSub(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("string.sub expects (s, i [, j])", .{});
+         const s = switch (args[0]) {
+@@ -19847,7 +19904,7 @@ pub const Vm = struct {
+         return count;
+     }
+ 
+-    fn compilePattern(self: *Vm, pat: []const u8) Error![]PatTok {
++    fn compilePattern(self: *Vm, pat: []const u8) DispatchError![]PatTok {
+         var toks = std.ArrayListUnmanaged(PatTok).empty;
+         var cap_id: u8 = 0;
+         var cap_stack: [9]u8 = undefined;
+@@ -20153,7 +20210,7 @@ pub const Vm = struct {
+         return s[0..end];
+     }
+ 
+-    fn builtinStringFind(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinStringFind(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (args.len < 2) return self.fail("string.find expects (s, pattern [, init [, plain]])", .{});
+         const s = switch (args[0]) {
+             .String => |x| x.bytes(),
+@@ -20252,7 +20309,7 @@ pub const Vm = struct {
+         if (outs.len > 0) outs[0] = .Nil;
+     }
+ 
+-    fn builtinStringMatch(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinStringMatch(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len < 2) return self.fail("string.match expects (s, pattern)", .{});
+         const s = switch (args[0]) {
+@@ -20420,7 +20477,7 @@ pub const Vm = struct {
+         outs[0] = .Nil;
+     }
+ 
+-    fn builtinStringGmatch(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinStringGmatch(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len < 2) return self.fail("string.gmatch expects (s, pattern)", .{});
+         const sls = switch (args[0]) {
+@@ -20448,7 +20505,7 @@ pub const Vm = struct {
+         outs[0] = .{ .Builtin = .string_gmatch_iter };
+     }
+ 
+-    fn builtinStringGmatchIter(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinStringGmatchIter(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         _ = args;
+         if (outs.len == 0) return;
+         var st = self.gmatch_state orelse {
+@@ -20560,7 +20617,7 @@ pub const Vm = struct {
+         return null;
+     }
+ 
+-    fn matchTokens(self: *Vm, toks: []const PatTok, ti: usize, s: []const u8, si: usize, caps: *[10]Capture, match_start: usize, must_end: bool) Error!?usize {
++    fn matchTokens(self: *Vm, toks: []const PatTok, ti: usize, s: []const u8, si: usize, caps: *[10]Capture, match_start: usize, must_end: bool) DispatchError!?usize {
+         if (self.pattern_budget_active) {
+             if (self.pattern_match_budget == 0) return self.fail("pattern too complex", .{});
+             self.pattern_match_budget -= 1;
+@@ -20734,7 +20791,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn expandReplacement(self: *Vm, repl: []const u8, s: []const u8, match_start: usize, match_end: usize, caps: *const [10]Capture) Error![]const u8 {
++    fn expandReplacement(self: *Vm, repl: []const u8, s: []const u8, match_start: usize, match_end: usize, caps: *const [10]Capture) DispatchError![]const u8 {
+         var out = std.ArrayListUnmanaged(u8).empty;
+         var i: usize = 0;
+         while (i < repl.len) : (i += 1) {
+@@ -20785,14 +20842,14 @@ pub const Vm = struct {
+         return try out.toOwnedSlice(self.alloc);
+     }
+ 
+-    fn tableGetFromNonYieldableC(self: *Vm, table: *Table, key: Value) Error!Value {
++    fn tableGetFromNonYieldableC(self: *Vm, table: *Table, key: Value) DispatchError!Value {
+         if (self.non_yieldable_c_depth >= max_non_yieldable_c_depth) return self.fail("C stack overflow", .{});
+         self.non_yieldable_c_depth += 1;
+         defer self.non_yieldable_c_depth -= 1;
+         return self.tableGetValue(table, key);
+     }
+ 
+-    fn runGsubReplacementFunction(self: *Vm, repl_fn: Value, s: []const u8, match_start: usize, match_end: usize, caps: *const [10]Capture) Error!Value {
++    fn runGsubReplacementFunction(self: *Vm, repl_fn: Value, s: []const u8, match_start: usize, match_end: usize, caps: *const [10]Capture) DispatchError!Value {
+         var call_args: [10]Value = undefined;
+         var arg_count: usize = 0;
+         var cap_i: usize = 1;
+@@ -20839,7 +20896,7 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn builtinStringGsub(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinStringGsub(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len < 3) return self.fail("string.gsub expects (s, pattern, repl [, n])", .{});
+         // gsub keeps byte slices into subject/pattern while replacement
+@@ -21074,7 +21131,7 @@ pub const Vm = struct {
+         if (outs.len > 1) outs[1] = .{ .Int = @intCast(count) };
+     }
+ 
+-    fn builtinStringRep(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinStringRep(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len < 2) return self.fail("string.rep expects (s, n [, sep])", .{});
+         const s = switch (args[0]) {
+@@ -21143,7 +21200,7 @@ pub const Vm = struct {
+         return b >= 0x80 and b <= 0xBF;
+     }
+ 
+-    fn decodeUtf8At(self: *Vm, s: []const u8, pos1: usize, nonstrict: bool) Error!Utf8Decode {
++    fn decodeUtf8At(self: *Vm, s: []const u8, pos1: usize, nonstrict: bool) DispatchError!Utf8Decode {
+         if (pos1 < 1 or pos1 > s.len) return self.fail("out of bounds", .{});
+         const lead = s[pos1 - 1];
+         if (isUtf8Continuation(lead)) return self.fail("continuation byte", .{});
+@@ -21189,7 +21246,7 @@ pub const Vm = struct {
+         return .{ .cp = cp, .end = pos1 + nbytes - 1 };
+     }
+ 
+-    fn decodeUtf8AtLoose(self: *Vm, s: []const u8, pos1: usize) Error!Utf8Decode {
++    fn decodeUtf8AtLoose(self: *Vm, s: []const u8, pos1: usize) DispatchError!Utf8Decode {
+         if (pos1 < 1 or pos1 > s.len) return self.fail("position out of bounds", .{});
+         const lead = s[pos1 - 1];
+         if (isUtf8Continuation(lead)) return self.fail("continuation byte", .{});
+@@ -21218,7 +21275,7 @@ pub const Vm = struct {
+         return .{ .cp = cp, .end = pos1 + got - 1 };
+     }
+ 
+-    fn utf8NormalizeRange(self: *Vm, s: []const u8, i_raw: i64, j_raw: i64) Error!struct { i: usize, j: usize } {
++    fn utf8NormalizeRange(self: *Vm, s: []const u8, i_raw: i64, j_raw: i64) DispatchError!struct { i: usize, j: usize } {
+         const len: i64 = @intCast(s.len);
+         var i = i_raw;
+         var j = j_raw;
+@@ -21228,14 +21285,14 @@ pub const Vm = struct {
+         return .{ .i = @intCast(i), .j = @intCast(j) };
+     }
+ 
+-    fn utf8ArgInt(self: *Vm, v: Value, what: []const u8) Error!i64 {
++    fn utf8ArgInt(self: *Vm, v: Value, what: []const u8) DispatchError!i64 {
+         return switch (v) {
+             .Int => |x| x,
+             else => self.fail("{s}", .{what}),
+         };
+     }
+ 
+-    fn encodeUtf8Scalar(self: *Vm, out: *std.ArrayListUnmanaged(u8), cp0: i64) Error!void {
++    fn encodeUtf8Scalar(self: *Vm, out: *std.ArrayListUnmanaged(u8), cp0: i64) DispatchError!void {
+         if (cp0 < 0 or cp0 > 0x7FFFFFFF) return self.fail("value out of range", .{});
+         const cp: u32 = @intCast(cp0);
+         if (cp <= 0x7F) {
+@@ -21268,7 +21325,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn builtinUtf8Char(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinUtf8Char(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         var out = std.ArrayListUnmanaged(u8).empty;
+         for (args) |a| {
+@@ -21285,7 +21342,7 @@ pub const Vm = struct {
+         outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
+     }
+ 
+-    fn builtinUtf8Codepoint(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinUtf8Codepoint(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (args.len == 0) return self.fail("out of bounds", .{});
+         const s = switch (args[0]) {
+             .String => |x| x.bytes(),
+@@ -21311,7 +21368,7 @@ pub const Vm = struct {
+         while (out_i < outs.len) : (out_i += 1) outs[out_i] = .Nil;
+     }
+ 
+-    fn builtinUtf8Len(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinUtf8Len(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0 or args[0] != .String) return self.fail("out of bounds", .{});
+         const s = args[0].String.bytes();
+@@ -21346,7 +21403,7 @@ pub const Vm = struct {
+         outs[0] = .{ .Int = count };
+     }
+ 
+-    fn builtinUtf8Offset(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinUtf8Offset(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len < 2) return self.fail("position out of bounds", .{});
+         const s = switch (args[0]) {
+@@ -21420,7 +21477,7 @@ pub const Vm = struct {
+         if (outs.len > 1) outs[1] = .{ .Int = @intCast(d.end) };
+     }
+ 
+-    fn builtinUtf8Codes(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinUtf8Codes(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0 or args[0] != .String) return self.fail("invalid UTF-8 code", .{});
+         const nonstrict = if (args.len >= 2) isTruthy(args[1]) else false;
+@@ -21429,7 +21486,7 @@ pub const Vm = struct {
+         if (outs.len > 2) outs[2] = .{ .Int = 0 };
+     }
+ 
+-    fn builtinUtf8CodesIter(self: *Vm, args: []const Value, outs: []Value, nonstrict: bool) Error!void {
++    fn builtinUtf8CodesIter(self: *Vm, args: []const Value, outs: []Value, nonstrict: bool) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len < 2 or args[0] != .String or args[1] != .Int) {
+             outs[0] = .Nil;
+@@ -21457,7 +21514,7 @@ pub const Vm = struct {
+         if (outs.len > 1) outs[1] = .{ .Int = d.cp };
+     }
+ 
+-    fn builtinTableUnpack(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinTableUnpack(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (args.len == 0) return self.fail("table.unpack expects table", .{});
+         if (args[0] != .Table) return self.fail("table.unpack expects table", .{});
+         const tobj = args[0];
+@@ -21511,7 +21568,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn tableMoveArgToInt(self: *Vm, v: Value, argn: usize) Error!i64 {
++    fn tableMoveArgToInt(self: *Vm, v: Value, argn: usize) DispatchError!i64 {
+         return switch (v) {
+             .Int => |i| i,
+             .Num => |n| blk: {
+@@ -21527,7 +21584,7 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn tableCreateArgToNonNeg(self: *Vm, v: Value, argn: usize) Error!usize {
++    fn tableCreateArgToNonNeg(self: *Vm, v: Value, argn: usize) DispatchError!usize {
+         const i: i64 = switch (v) {
+             .Int => |x| x,
+             .Num => |n| blk: {
+@@ -21546,7 +21603,7 @@ pub const Vm = struct {
+         return @intCast(i);
+     }
+ 
+-    fn builtinTableCreate(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinTableCreate(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("bad argument #1 to 'create' (out of range)", .{});
+         const narray = try self.tableCreateArgToNonNeg(args[0], 1);
+@@ -21563,7 +21620,7 @@ pub const Vm = struct {
+         outs[0] = .{ .Table = t };
+     }
+ 
+-    fn builtinTableMove(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinTableMove(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len > 0) outs[0] = .Nil;
+         if (args.len < 4) return self.fail("bad argument #1 to 'move' (table expected)", .{});
+         const src = switch (args[0]) {
+@@ -21612,7 +21669,7 @@ pub const Vm = struct {
+         if (outs.len > 0) outs[0] = .{ .Table = dst };
+     }
+ 
+-    fn builtinTableConcat(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinTableConcat(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         if (args.len == 0) return self.fail("table expected", .{});
+         if (args[0] != .Table) return self.fail("table expected", .{});
+@@ -21686,7 +21743,7 @@ pub const Vm = struct {
+         outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
+     }
+ 
+-    fn builtinTablePack(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinTablePack(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         const tbl = try self.allocTable();
+         for (args, 0..) |v, i| {
+@@ -21697,7 +21754,7 @@ pub const Vm = struct {
+         outs[0] = .{ .Table = tbl };
+     }
+ 
+-    fn builtinTableInsert(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinTableInsert(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         _ = outs;
+         if (args.len < 2 or args.len > 3) return self.fail("wrong number of arguments to 'insert'", .{});
+         if (args[0] != .Table) return self.fail("table expected", .{});
+@@ -21729,7 +21786,7 @@ pub const Vm = struct {
+         try self.setIndexValue(tobj, .{ .Int = pos }, val);
+     }
+ 
+-    fn builtinTableRemove(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinTableRemove(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (args.len == 0) return self.fail("table.remove expects table", .{});
+         if (args[0] != .Table) return self.fail("table expected", .{});
+         const tobj = args[0];
+@@ -21773,7 +21830,7 @@ pub const Vm = struct {
+         if (outs.len > 0) outs[0] = removed;
+     }
+ 
+-    fn tableSortLess(self: *Vm, cmp_fn: ?Value, a: Value, b: Value) Error!bool {
++    fn tableSortLess(self: *Vm, cmp_fn: ?Value, a: Value, b: Value) DispatchError!bool {
+         if (cmp_fn) |cf| {
+             var outv: Value = .Nil;
+             switch (cf) {
+@@ -21829,7 +21886,7 @@ pub const Vm = struct {
+         return try self.cmpLt(a, b);
+     }
+ 
+-    fn tableSortRange(self: *Vm, arr: []Value, cmp_fn: ?Value, lo: usize, hi: usize, depth: usize) Error!void {
++    fn tableSortRange(self: *Vm, arr: []Value, cmp_fn: ?Value, lo: usize, hi: usize, depth: usize) DispatchError!void {
+         if (hi <= lo) return;
+         if (depth > 128) return self.fail("invalid order function for sorting", .{});
+ 
+@@ -21856,7 +21913,7 @@ pub const Vm = struct {
+         if (i < hi) try self.tableSortRange(arr, cmp_fn, i, hi, depth + 1);
+     }
+ 
+-    fn builtinTableSort(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinTableSort(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         _ = outs;
+         if (args.len == 0) return self.fail("table.sort expects table", .{});
+         if (args[0] != .Table) return self.fail("table.sort expects table", .{});
+@@ -21892,7 +21949,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn builtinPrint(self: *Vm, args: []const Value) Error!void {
++    fn builtinPrint(self: *Vm, args: []const Value) DispatchError!void {
+         var out = stdio.stdout();
+         for (args, 0..) |v, i| {
+             if (i != 0) out.writeByte('\t') catch |e| switch (e) {
+@@ -21912,7 +21969,7 @@ pub const Vm = struct {
+ 
+     // Lua 5.5 has global 'warn'. For parity we keep it available even if warnings
+     // are not yet routed to a host warning channel.
+-    fn builtinWarn(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinWarn(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         _ = self;
+         _ = args;
+         _ = outs;
+@@ -21933,7 +21990,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn valueToStringAlloc(self: *Vm, v: Value) Error![]const u8 {
++    fn valueToStringAlloc(self: *Vm, v: Value) DispatchError![]const u8 {
+         if (metamethodValue(self, v, "__tostring")) |mm| {
+             var call_args = [_]Value{v};
+             const tv = try self.callMetamethod(mm, "__tostring", call_args[0..]);
+@@ -21959,7 +22016,7 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn numberToStringAlloc(self: *Vm, n: f64) Error![]const u8 {
++    fn numberToStringAlloc(self: *Vm, n: f64) DispatchError![]const u8 {
+         const s = try std.fmt.allocPrint(self.alloc, "{}", .{n});
+         if (!std.math.isFinite(n)) return s;
+         if (std.mem.indexOfAny(u8, s, ".eE") != null) return s;
+@@ -21968,7 +22025,7 @@ pub const Vm = struct {
+         return s2;
+     }
+ 
+-    fn parseInt(self: *Vm, lexeme: []const u8) Error!i64 {
++    fn parseInt(self: *Vm, lexeme: []const u8) DispatchError!i64 {
+         var s = lexeme;
+         var base: u8 = 10;
+         if (s.len >= 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X')) {
+@@ -22073,7 +22130,7 @@ pub const Vm = struct {
+         return null;
+     }
+ 
+-    fn parseNum(self: *Vm, lexeme: []const u8) Error!f64 {
++    fn parseNum(self: *Vm, lexeme: []const u8) DispatchError!f64 {
+         const v = std.fmt.parseFloat(f64, lexeme) catch return self.fail("invalid number literal: {s}", .{lexeme});
+         return v;
+     }
+@@ -22091,7 +22148,7 @@ pub const Vm = struct {
+         return std.fmt.parseFloat(f64, trimmed) catch null;
+     }
+ 
+-    fn tableGetRawValue(self: *Vm, tbl: *Table, key: Value) Error!Value {
++    fn tableGetRawValue(self: *Vm, tbl: *Table, key: Value) DispatchError!Value {
+         // NaN keys: rawget on NaN historically returns Nil without raising an
+         // error (the NaN check lives in rawSet / setIndexValue instead). PUC
+         // actually errors on NaN lookups in some paths but the test suite has
+@@ -22117,11 +22174,11 @@ pub const Vm = struct {
+         return @intCast(lo);
+     }
+ 
+-    fn tableGetValue(self: *Vm, tbl: *Table, key: Value) Error!Value {
++    fn tableGetValue(self: *Vm, tbl: *Table, key: Value) DispatchError!Value {
+         return self.tableGetValueDepth(tbl, key, 0);
+     }
+ 
+-    fn tableGetValueDepth(self: *Vm, tbl: *Table, key: Value, depth: usize) Error!Value {
++    fn tableGetValueDepth(self: *Vm, tbl: *Table, key: Value, depth: usize) DispatchError!Value {
+         if (depth >= 200) return self.fail("loop in gettable", .{});
+         const raw = try self.tableGetRawValue(tbl, key);
+         if (raw != .Nil) return raw;
+@@ -22153,11 +22210,11 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn indexValue(self: *Vm, object: Value, key: Value) Error!Value {
++    fn indexValue(self: *Vm, object: Value, key: Value) DispatchError!Value {
+         return self.indexValueDepth(object, key, 0);
+     }
+ 
+-    fn indexValueDepth(self: *Vm, object: Value, key: Value, depth: usize) Error!Value {
++    fn indexValueDepth(self: *Vm, object: Value, key: Value, depth: usize) DispatchError!Value {
+         if (depth >= 200) return self.fail("loop in gettable", .{});
+         switch (object) {
+             .Table => |t| return self.tableGetValueDepth(t, key, depth + 1),
+@@ -22193,11 +22250,11 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn setIndexValue(self: *Vm, object: Value, key: Value, val: Value) Error!void {
++    fn setIndexValue(self: *Vm, object: Value, key: Value, val: Value) DispatchError!void {
+         return self.setIndexValueDepth(object, key, val, 0);
+     }
+ 
+-    fn setIndexValueDepth(self: *Vm, object: Value, key: Value, val: Value, depth: usize) Error!void {
++    fn setIndexValueDepth(self: *Vm, object: Value, key: Value, val: Value, depth: usize) DispatchError!void {
+         if (depth >= 200) return self.fail("loop in settable", .{});
+         if (object == .Table) {
+             const tbl = object.Table;
+@@ -22304,7 +22361,7 @@ pub const Vm = struct {
+         min_reg: u8,
+         initial_err: ?Value,
+         unwind_all: bool,
+-    ) Error!void {
++    ) DispatchError!void {
+         var current_err = initial_err;
+         var had_close_error = false;
+         var close_all = unwind_all;
+@@ -22382,7 +22439,7 @@ pub const Vm = struct {
+     /// Call the __close metamethod on `obj`, matching PUC Lua's
+     /// callclosemethod (lfunc.c:107). The metamethod receives `obj`
+     /// as the first argument and no error object (status == LUA_OK).
+-    fn callCloseMethod(self: *Vm, obj: Value) Error!void {
++    fn callCloseMethod(self: *Vm, obj: Value) DispatchError!void {
+         const mm = self.metamethodValue(obj, "__close") orelse return;
+         const saved_nwo = self.debug_namewhat_override;
+         const saved_no = self.debug_name_override;
+@@ -22398,7 +22455,7 @@ pub const Vm = struct {
+         _ = try self.runClosure(resolved.callee.Closure, resolved.args, false);
+     }
+ 
+-    fn callMetamethod(self: *Vm, mmv: Value, opname: []const u8, args: []const Value) Error!Value {
++    fn callMetamethod(self: *Vm, mmv: Value, opname: []const u8, args: []const Value) DispatchError!Value {
+         const saved_nwo = self.debug_namewhat_override;
+         const saved_no = self.debug_name_override;
+         self.debug_namewhat_override = "metamethod";
+@@ -22423,13 +22480,13 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn callBinaryMetamethod(self: *Vm, lhs: Value, rhs: Value, mm_name: []const u8, opname: []const u8) Error!?Value {
++    fn callBinaryMetamethod(self: *Vm, lhs: Value, rhs: Value, mm_name: []const u8, opname: []const u8) DispatchError!?Value {
+         const mm = metamethodValue(self, lhs, mm_name) orelse metamethodValue(self, rhs, mm_name) orelse return null;
+         var call_args = [_]Value{ lhs, rhs };
+         return try self.callMetamethod(mm, opname, call_args[0..]);
+     }
+ 
+-    fn runCloseMetamethod(self: *Vm, obj: Value, err_obj: ?Value) Error!void {
++    fn runCloseMetamethod(self: *Vm, obj: Value, err_obj: ?Value) DispatchError!void {
+         // false/nil are explicitly allowed as non-closable sentinels.
+         if (obj == .Nil) return;
+         if (obj == .Bool and !obj.Bool) return;
+@@ -22490,7 +22547,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn runTestcCloseMetamethod(self: *Vm, obj: Value, err_obj: ?Value) Error!void {
++    fn runTestcCloseMetamethod(self: *Vm, obj: Value, err_obj: ?Value) DispatchError!void {
+         self.testc_close_metamethod_depth += 1;
+         defer self.testc_close_metamethod_depth -= 1;
+         try self.runCloseMetamethod(obj, err_obj);
+@@ -22524,7 +22581,7 @@ pub const Vm = struct {
+         local_active: []bool,
+         boxed: []?*Cell,
+         err_obj: ?Value,
+-    ) Error!void {
++    ) DispatchError!void {
+         var current_err = err_obj;
+         var had_close_error = false;
+         if (self.current_thread) |th| {
+@@ -22605,7 +22662,7 @@ pub const Vm = struct {
+         return false;
+     }
+ 
+-    fn callUnaryMetamethod(self: *Vm, v: Value, mm_name: []const u8, opname: []const u8) Error!?Value {
++    fn callUnaryMetamethod(self: *Vm, v: Value, mm_name: []const u8, opname: []const u8) DispatchError!?Value {
+         const mm = metamethodValue(self, v, mm_name) orelse return null;
+         // Lua passes the operand twice for unary metamethod dispatch.
+         var call_args = [_]Value{ v, v };
+@@ -22722,7 +22779,7 @@ pub const Vm = struct {
+         return locals[idx];
+     }
+ 
+-    fn resolveCallable(self: *Vm, initial_callee: Value, initial_args: []const Value, call_name: ?CallName) Error!ResolvedCall {
++    fn resolveCallable(self: *Vm, initial_callee: Value, initial_args: []const Value, call_name: ?CallName) DispatchError!ResolvedCall {
+         var callee = initial_callee;
+         var args: []const Value = initial_args;
+         var owned: ?[]Value = null;
+@@ -22755,7 +22812,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn runResolvedCallInto(self: *Vm, resolved: ResolvedCall, dsts: []const ir.ValueId, regs: []Value) Error!void {
++    fn runResolvedCallInto(self: *Vm, resolved: ResolvedCall, dsts: []const ir.ValueId, regs: []Value) DispatchError!void {
+         switch (resolved.callee) {
+             .Builtin => |id| {
+                 try self.runBuiltinCallInto(id, resolved.args, dsts, regs);
+@@ -22775,15 +22832,15 @@ pub const Vm = struct {
+ 
+     /// Dispatch to the correct execution engine (bytecode or IR) for a closure.
+     /// Used by runResolvedCallInto, ReturnCall handlers, builtins, and helpers.
+-    fn runClosure(self: *Vm, cl: *Closure, args: []const Value, is_tailcall: bool) Error![]Value {
++    fn runClosure(self: *Vm, cl: *Closure, args: []const Value, is_tailcall: bool) DispatchError![]Value {
+         if (cl.proto) |proto| {
+-            return try self.runBytecode(proto, cl.upvalues, args, cl);
++            return try self.runBytecodeInternal(proto, cl.upvalues, args, cl);
+         } else {
+             return try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, args, cl, is_tailcall);
+         }
+     }
+ 
+-    fn runBuiltinForIterFast(self: *Vm, id: BuiltinId, state: Value, ctrl: Value, dsts: []const ir.ValueId, regs: []Value) Error!void {
++    fn runBuiltinForIterFast(self: *Vm, id: BuiltinId, state: Value, ctrl: Value, dsts: []const ir.ValueId, regs: []Value) DispatchError!void {
+         var call_args = [_]Value{ state, ctrl };
+         var full_outs = [_]Value{ .Nil, .Nil };
+         switch (id) {
+@@ -22797,7 +22854,7 @@ pub const Vm = struct {
+         while (i < dsts.len) : (i += 1) regs[dsts[i]] = .Nil;
+     }
+ 
+-    fn runBuiltinCallInto(self: *Vm, id: BuiltinId, args: []const Value, dsts: []const ir.ValueId, regs: []Value) Error!void {
++    fn runBuiltinCallInto(self: *Vm, id: BuiltinId, args: []const Value, dsts: []const ir.ValueId, regs: []Value) DispatchError!void {
+         // Builtin arguments live in VM registers or temporary call buffers.
+         // A call/return debug hook can run arbitrary Lua and trigger GC before
+         // the builtin itself executes. PUC keeps call arguments on the Lua
+@@ -22904,7 +22961,7 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn evalUnOp(self: *Vm, op: TokenKind, src: Value) Error!Value {
++    fn evalUnOp(self: *Vm, op: TokenKind, src: Value) DispatchError!Value {
+         switch (op) {
+             .Not => return .{ .Bool = !isTruthy(src) },
+             .Minus => return switch (src) {
+@@ -22948,7 +23005,7 @@ pub const Vm = struct {
+         return self.fail("attempt to perform arithmetic on a {s} value", .{self.valueTypeName(bad)});
+     }
+ 
+-    fn evalBinOp(self: *Vm, op: TokenKind, lhs: Value, rhs: Value) Error!Value {
++    fn evalBinOp(self: *Vm, op: TokenKind, lhs: Value, rhs: Value) DispatchError!Value {
+         switch (op) {
+             .Plus => return self.binAdd(lhs, rhs),
+             .Minus => return self.binSub(lhs, rhs),
+@@ -23025,7 +23082,7 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn cmpEq(self: *Vm, lhs: Value, rhs: Value) Error!bool {
++    fn cmpEq(self: *Vm, lhs: Value, rhs: Value) DispatchError!bool {
+         if (valuesEqual(lhs, rhs)) return true;
+         if (lhs == .Table and rhs == .Table) {
+             if (try self.callBinaryMetamethod(lhs, rhs, "__eq", "eq")) |v| return isTruthy(v);
+@@ -23033,7 +23090,7 @@ pub const Vm = struct {
+         return false;
+     }
+ 
+-    fn makeClosure(self: *Vm, func: *const ir.Function, locals: []Value, boxed: []?*Cell, upvalues: []const *Cell) Error!*Closure {
++    fn makeClosure(self: *Vm, func: *const ir.Function, locals: []Value, boxed: []?*Cell, upvalues: []const *Cell) DispatchError!*Closure {
+         const n: usize = @intCast(func.num_upvalues);
+         if (func.captures.len != n) return self.fail("invalid closure metadata for function {s}", .{func.name});
+         const owner_frame_id = if (self.frames.items.len > 0) self.frames.items[self.frames.items.len - 1].frame_id else 0;
+@@ -23090,7 +23147,7 @@ pub const Vm = struct {
+         return cl;
+     }
+ 
+-    fn evalCallSpec(self: *Vm, spec: *const ir.CallSpec, regs: []Value, varargs: []const Value) Error![]Value {
++    fn evalCallSpec(self: *Vm, spec: *const ir.CallSpec, regs: []Value, varargs: []const Value) DispatchError![]Value {
+         const extra = if (spec.use_vararg) varargs.len else 0;
+         var args = try self.alloc.alloc(Value, spec.args.len + extra);
+         defer self.alloc.free(args);
+@@ -23206,7 +23263,7 @@ pub const Vm = struct {
+         return .{ .upvalues = items, .upenv = upenv, .first_arg = v };
+     }
+ 
+-    fn getOrCreateTestStateMainThread(self: *Vm, state: *Table) Error!*Thread {
++    fn getOrCreateTestStateMainThread(self: *Vm, state: *Table) DispatchError!*Thread {
+         if (self.getFieldOpt(state, "_mainthread")) |v| {
+             if (v == .Thread) return v.Thread;
+         }
+@@ -23229,7 +23286,7 @@ pub const Vm = struct {
+         return .{ .Table = self.global_env };
+     }
+ 
+-    fn builtinTestcTestC(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinTestcTestC(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (self.current_thread) |th| {
+             if (th.testc_close_return_values != null) {
+                 try self.resumeTestcCloseReturnContinuation(th, outs);
+@@ -23326,7 +23383,7 @@ pub const Vm = struct {
+         self.last_builtin_out_count = produced;
+     }
+ 
+-    fn copyTestcReturnValues(self: *Vm, st: []const Value, spec: testc.ReturnSpec) Error![]Value {
++    fn copyTestcReturnValues(self: *Vm, st: []const Value, spec: testc.ReturnSpec) DispatchError![]Value {
+         return switch (spec) {
+             .all => blk: {
+                 const vals = try self.alloc.alloc(Value, st.len);
+@@ -23351,7 +23408,7 @@ pub const Vm = struct {
+         spec: testc.ReturnSpec,
+         marks: []const usize,
+         current_idx: usize,
+-    ) Error!void {
++    ) DispatchError!void {
+         self.clearTestcCloseReturnContinuation(th);
+ 
+         const return_values = try self.copyTestcReturnValues(st, spec);
+@@ -23378,7 +23435,7 @@ pub const Vm = struct {
+         th.testc_close_remaining = remaining;
+     }
+ 
+-    fn setTestcCloseRemainingAfter(self: *Vm, th: *Thread, remaining: []const Value, current_index: usize) Error!void {
++    fn setTestcCloseRemainingAfter(self: *Vm, th: *Thread, remaining: []const Value, current_index: usize) DispatchError!void {
+         th.testc_close_current = remaining[current_index];
+         const next_index = current_index + 1;
+         const new_remaining = try self.alloc.alloc(Value, remaining.len - next_index);
+@@ -23387,7 +23444,7 @@ pub const Vm = struct {
+         th.testc_close_remaining = new_remaining;
+     }
+ 
+-    fn resumeTestcCloseReturnContinuation(self: *Vm, th: *Thread, outs: []Value) Error!void {
++    fn resumeTestcCloseReturnContinuation(self: *Vm, th: *Thread, outs: []Value) DispatchError!void {
+         const return_values = th.testc_close_return_values orelse return;
+ 
+         if (th.testc_close_current) |current| {
+@@ -23423,7 +23480,7 @@ pub const Vm = struct {
+         self.clearTestcCloseReturnContinuation(th);
+     }
+ 
+-    fn builtinTestcMakeCfunc(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinTestcMakeCfunc(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (outs.len == 0) return;
+         var roots = self.gcTempRoots();
+         defer roots.end();
+@@ -23447,7 +23504,7 @@ pub const Vm = struct {
+         self.last_builtin_out_count = 1;
+     }
+ 
+-    fn builtinTestcTotalmem(self: *Vm, args: []const Value, outs: []Value) Error!void {
++    fn builtinTestcTotalmem(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+         if (args.len == 0) {
+             if (outs.len > 0) outs[0] = .{ .Int = @intCast(self.testc_total_bytes) };
+             if (outs.len > 1) outs[1] = .{ .Int = 0 };
+@@ -23489,7 +23546,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn resumePendingTestcContinuation(self: *Vm, th: *Thread, raw_args: []const Value, outs: []Value) Error!void {
++    fn resumePendingTestcContinuation(self: *Vm, th: *Thread, raw_args: []const Value, outs: []Value) DispatchError!void {
+         if (th.testc_pending_conts.items.len == 0) return;
+         const pending = th.testc_pending_conts.orderedRemove(0);
+         const pending_script = pending.script;
+@@ -23559,7 +23616,7 @@ pub const Vm = struct {
+         self.last_builtin_out_count = produced;
+     }
+ 
+-    fn runTestcScript(self: *Vm, script: []const u8, st: *std.ArrayListUnmanaged(Value), ctx: TestcContext) Error!testc.RunResult {
++    fn runTestcScript(self: *Vm, script: []const u8, st: *std.ArrayListUnmanaged(Value), ctx: TestcContext) DispatchError!testc.RunResult {
+         var out: testc.RunResult = .{};
+         var last_status: []const u8 = "OK";
+         var stmt_count: usize = 0;
+@@ -23667,7 +23724,7 @@ pub const Vm = struct {
+         return out;
+     }
+ 
+-    fn parseTestcWords(self: *Vm, stmt: []const u8, out: [][]const u8) Error!usize {
++    fn parseTestcWords(self: *Vm, stmt: []const u8, out: [][]const u8) DispatchError!usize {
+         var argc: usize = 0;
+         var i: usize = 0;
+         while (i < stmt.len) {
+@@ -23693,7 +23750,7 @@ pub const Vm = struct {
+         return argc;
+     }
+ 
+-    fn parseTestcNumToken(self: *Vm, tok: []const u8, st: *std.ArrayListUnmanaged(Value)) Error!i64 {
++    fn parseTestcNumToken(self: *Vm, tok: []const u8, st: *std.ArrayListUnmanaged(Value)) DispatchError!i64 {
+         if (std.mem.eql(u8, tok, "*")) return @intCast(st.items.len);
+         if (std.mem.eql(u8, tok, "!G")) return 2;
+         if (std.mem.eql(u8, tok, "!M")) return 1;
+@@ -23712,7 +23769,7 @@ pub const Vm = struct {
+         return std.fmt.parseInt(i64, tok, 10) catch return self.fail("testC invalid integer", .{});
+     }
+ 
+-    fn parseTestcStackRef(self: *Vm, tok: []const u8, top: usize) Error!?usize {
++    fn parseTestcStackRef(self: *Vm, tok: []const u8, top: usize) DispatchError!?usize {
+         if (std.mem.eql(u8, tok, "0")) return null;
+         return try self.parseTestcIndex(tok, top);
+     }
+@@ -23746,7 +23803,7 @@ pub const Vm = struct {
+         ctx: TestcContext,
+         toclose: *std.ArrayListUnmanaged(usize),
+         thread_stacks: *TestcThreadStacks,
+-    ) Error!?testc.ReturnSpec {
++    ) DispatchError!?testc.ReturnSpec {
+         switch (cmd) {
+             .pushinteger, .pushint => {
+                 if (cargs.len != 1) return self.fail("testC pushint expects 1 arg", .{});
+@@ -25125,7 +25182,7 @@ pub const Vm = struct {
+         return null;
+     }
+ 
+-    fn parseTestcIndex(self: *Vm, tok: []const u8, top: usize) Error!usize {
++    fn parseTestcIndex(self: *Vm, tok: []const u8, top: usize) DispatchError!usize {
+         const idx = std.fmt.parseInt(i32, tok, 10) catch return self.fail("testC invalid index '{s}'", .{tok});
+         if (idx == 0) return self.fail("testC invalid index '{s}'", .{tok});
+         if (idx > 0) {
+@@ -25138,7 +25195,7 @@ pub const Vm = struct {
+         return top - r;
+     }
+ 
+-    fn parseTestcIndexMaybe(self: *Vm, tok: []const u8, top: usize) Error!?usize {
++    fn parseTestcIndexMaybe(self: *Vm, tok: []const u8, top: usize) DispatchError!?usize {
+         const idx = std.fmt.parseInt(i32, tok, 10) catch return self.fail("testC invalid index", .{});
+         if (idx == 0) return self.fail("testC invalid index", .{});
+         if (idx > 0) {
+@@ -25151,7 +25208,7 @@ pub const Vm = struct {
+         return top - r;
+     }
+ 
+-    fn parseTestcSettop(self: *Vm, tok: []const u8, top: usize) Error!usize {
++    fn parseTestcSettop(self: *Vm, tok: []const u8, top: usize) DispatchError!usize {
+         const idx = std.fmt.parseInt(i32, tok, 10) catch return self.fail("testC invalid settop", .{});
+         if (idx >= 0) return @intCast(idx);
+         const t: i64 = @intCast(top);
+@@ -25199,7 +25256,7 @@ pub const Vm = struct {
+         return v;
+     }
+ 
+-    fn resolveTestcContinuationScript(self: *Vm, ctx: TestcContext, st: *std.ArrayListUnmanaged(Value), tok: []const u8) Error![]const u8 {
++    fn resolveTestcContinuationScript(self: *Vm, ctx: TestcContext, st: *std.ArrayListUnmanaged(Value), tok: []const u8) DispatchError![]const u8 {
+         const v: Value = if (std.mem.eql(u8, tok, ".")) blk: {
+             if (st.items.len == 0) return self.fail("testC stack underflow", .{});
+             break :blk st.pop().?;
+@@ -25224,7 +25281,7 @@ pub const Vm = struct {
+         status: []const u8,
+         ctx_id: i64,
+         closers: []const Value,
+-    ) Error!void {
++    ) DispatchError!void {
+         const stack_copy = try self.alloc.alloc(Value, stack_vals.len);
+         for (stack_vals, 0..) |v, i| stack_copy[i] = v;
+         var upvalues_copy: ?[]Value = null;
+@@ -25262,7 +25319,7 @@ pub const Vm = struct {
+         st: *std.ArrayListUnmanaged(Value),
+         toclose: *std.ArrayListUnmanaged(usize),
+         stack_len: usize,
+-    ) Error![]Value {
++    ) DispatchError![]Value {
+         var count: usize = 0;
+         for (toclose.items) |idx| {
+             if (idx < stack_len) count += 1;
+@@ -25302,7 +25359,7 @@ pub const Vm = struct {
+         return std.fmt.parseInt(usize, tok[1..], 10) catch null;
+     }
+ 
+-    fn getTestcUpvalue(self: *Vm, ctx: TestcContext, uix: usize) Error!Value {
++    fn getTestcUpvalue(self: *Vm, ctx: TestcContext, uix: usize) DispatchError!Value {
+         if (uix == 0) return ctx.upenv orelse .Nil;
+         const upvs = ctx.upvalues orelse return .Nil;
+         const i = uix - 1;
+@@ -25310,7 +25367,7 @@ pub const Vm = struct {
+         return upvs[i];
+     }
+ 
+-    fn setTestcUpvalue(self: *Vm, ctx: TestcContext, uix: usize, v: Value) Error!void {
++    fn setTestcUpvalue(self: *Vm, ctx: TestcContext, uix: usize, v: Value) DispatchError!void {
+         if (uix == 0) {
+             _ = self;
+             return;
+@@ -25370,7 +25427,7 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn makeTestcPointerValue(self: *Vm, ptr_id: u64) Error!Value {
++    fn makeTestcPointerValue(self: *Vm, ptr_id: u64) DispatchError!Value {
+         const t_global = self.getGlobal("T");
+         if (t_global != .Table) return .Nil;
+         const t = t_global.Table;
+@@ -25643,7 +25700,7 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn binAdd(self: *Vm, lhs: Value, rhs: Value) Error!Value {
++    fn binAdd(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
+         const l = coerceArithmeticValue(lhs) orelse lhs;
+         const r = coerceArithmeticValue(rhs) orelse rhs;
+         return switch (l) {
+@@ -25665,7 +25722,7 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn binSub(self: *Vm, lhs: Value, rhs: Value) Error!Value {
++    fn binSub(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
+         const l = coerceArithmeticValue(lhs) orelse lhs;
+         const r = coerceArithmeticValue(rhs) orelse rhs;
+         return switch (l) {
+@@ -25683,7 +25740,7 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn binMul(self: *Vm, lhs: Value, rhs: Value) Error!Value {
++    fn binMul(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
+         const l = coerceArithmeticValue(lhs) orelse lhs;
+         const r = coerceArithmeticValue(rhs) orelse rhs;
+         return switch (l) {
+@@ -25701,7 +25758,7 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn binDiv(self: *Vm, lhs: Value, rhs: Value) Error!Value {
++    fn binDiv(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
+         const l = coerceArithmeticValue(lhs) orelse lhs;
+         const r = coerceArithmeticValue(rhs) orelse rhs;
+         const ln = switch (l) {
+@@ -25723,7 +25780,7 @@ pub const Vm = struct {
+         return .{ .Num = ln / rn };
+     }
+ 
+-    fn binIdiv(self: *Vm, lhs: Value, rhs: Value) Error!Value {
++    fn binIdiv(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
+         const l = coerceArithmeticValue(lhs) orelse lhs;
+         const r = coerceArithmeticValue(rhs) orelse rhs;
+         return switch (l) {
+@@ -25751,7 +25808,7 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn binMod(self: *Vm, lhs: Value, rhs: Value) Error!Value {
++    fn binMod(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
+         const l = coerceArithmeticValue(lhs) orelse lhs;
+         const r = coerceArithmeticValue(rhs) orelse rhs;
+         return switch (l) {
+@@ -25792,7 +25849,7 @@ pub const Vm = struct {
+         return m;
+     }
+ 
+-    fn binPow(self: *Vm, lhs: Value, rhs: Value) Error!Value {
++    fn binPow(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
+         const l = coerceArithmeticValue(lhs) orelse lhs;
+         const r = coerceArithmeticValue(rhs) orelse rhs;
+         const ln = switch (l) {
+@@ -25814,7 +25871,7 @@ pub const Vm = struct {
+         return .{ .Num = std.math.pow(f64, ln, rn) };
+     }
+ 
+-    fn binBand(self: *Vm, lhs: Value, rhs: Value) Error!Value {
++    fn binBand(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
+         if (valueToIntForBitwise(lhs)) |li| {
+             if (valueToIntForBitwise(rhs)) |ri| return .{ .Int = li & ri };
+         }
+@@ -25823,7 +25880,7 @@ pub const Vm = struct {
+         return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
+     }
+ 
+-    fn binBor(self: *Vm, lhs: Value, rhs: Value) Error!Value {
++    fn binBor(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
+         if (valueToIntForBitwise(lhs)) |li| {
+             if (valueToIntForBitwise(rhs)) |ri| return .{ .Int = li | ri };
+         }
+@@ -25832,7 +25889,7 @@ pub const Vm = struct {
+         return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
+     }
+ 
+-    fn binBxor(self: *Vm, lhs: Value, rhs: Value) Error!Value {
++    fn binBxor(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
+         if (valueToIntForBitwise(lhs)) |li| {
+             if (valueToIntForBitwise(rhs)) |ri| return .{ .Int = li ^ ri };
+         }
+@@ -25841,7 +25898,7 @@ pub const Vm = struct {
+         return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
+     }
+ 
+-    fn binShl(self: *Vm, lhs: Value, rhs: Value) Error!Value {
++    fn binShl(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
+         if (valueToIntForBitwise(lhs)) |li| {
+             if (valueToIntForBitwise(rhs)) |ri| {
+                 const lu: u64 = @bitCast(li);
+@@ -25862,7 +25919,7 @@ pub const Vm = struct {
+         return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
+     }
+ 
+-    fn binShr(self: *Vm, lhs: Value, rhs: Value) Error!Value {
++    fn binShr(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
+         if (valueToIntForBitwise(lhs)) |li| {
+             if (valueToIntForBitwise(rhs)) |ri| {
+                 const lu: u64 = @bitCast(li);
+@@ -25883,7 +25940,7 @@ pub const Vm = struct {
+         return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
+     }
+ 
+-    fn cmpLt(self: *Vm, lhs: Value, rhs: Value) Error!bool {
++    fn cmpLt(self: *Vm, lhs: Value, rhs: Value) DispatchError!bool {
+         return switch (lhs) {
+             .Int => |li| switch (rhs) {
+                 .Int => |ri| li < ri,
+@@ -25903,7 +25960,7 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn cmpLte(self: *Vm, lhs: Value, rhs: Value) Error!bool {
++    fn cmpLte(self: *Vm, lhs: Value, rhs: Value) DispatchError!bool {
+         return switch (lhs) {
+             .Int => |li| switch (rhs) {
+                 .Int => |ri| li <= ri,
+@@ -25926,11 +25983,11 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn cmpGt(self: *Vm, lhs: Value, rhs: Value) Error!bool {
++    fn cmpGt(self: *Vm, lhs: Value, rhs: Value) DispatchError!bool {
+         return try self.cmpLt(rhs, lhs);
+     }
+ 
+-    fn cmpGte(self: *Vm, lhs: Value, rhs: Value) Error!bool {
++    fn cmpGte(self: *Vm, lhs: Value, rhs: Value) DispatchError!bool {
+         return try self.cmpLte(rhs, lhs);
+     }
+ 
+@@ -25995,7 +26052,7 @@ pub const Vm = struct {
+         owned: bool = false,
+     };
+ 
+-    fn concatOperandToString(self: *Vm, v: Value) Error!ConcatString {
++    fn concatOperandToString(self: *Vm, v: Value) DispatchError!ConcatString {
+         return switch (v) {
+             .String => |s| .{ .bytes = s.bytes(), .owned = false },
+             .Int => |i| .{ .bytes = try std.fmt.allocPrint(self.alloc, "{d}", .{i}), .owned = true },
+@@ -26004,7 +26061,7 @@ pub const Vm = struct {
+         };
+     }
+ 
+-    fn binConcat(self: *Vm, lhs: Value, rhs: Value) Error!Value {
++    fn binConcat(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
+         // Hot path for loops like `i .. "."` in nextvar.lua:
+         // format integer operand into a stack buffer to avoid temporary heap
+         // allocation from `allocPrint`.

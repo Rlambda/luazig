@@ -1,0 +1,1843 @@
+diff --git a/README.md b/README.md
+index 64b4720..03e8236 100644
+--- a/README.md
++++ b/README.md
+@@ -79,6 +79,7 @@ backend. Как и `luaV_execute`/`CallInfo` в PUC Lua, один dispatch drive
+ - `tests/smoke/40_large_setlist_extraarg.lua`;
+ - `tests/smoke/41_strict_globals_env.lua`;
+ - `tests/smoke/42_gc_debt_and_generational_step.lua`;
++- `tests/smoke/43_generational_minor.lua`;
+ - `tests/stress/iterative_dispatch.lua` через
+   `tools/iterative_dispatch_stress.sh`.
+ 
+@@ -86,7 +87,7 @@ backend. Как и `luaV_execute`/`CallInfo` в PUC Lua, один dispatch drive
+ вложенных `coroutine.resume` с yield/resume, 2000 рекурсивных metamethod
+ вызовов, 1000 вложенных `string.gsub` callbacks и mixed bytecode↔`testC` yield
+ для `CALL`/`TAILCALL`/`TFORCALL`. Полный `cstack.lua` также проходит при
+-1-МБ host stack. Zig unit tests и 42/42 differential smoke проходят. Все
++1-МБ host stack. Zig unit tests и 43/43 differential smoke проходят. Все
+ заявленные 29 upstream suites завершаются успешно на bc VM; точные глубины
+ `C stack overflow` остаются implementation-defined, но semantic assertions
+ совпадают.
+@@ -522,6 +523,58 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
+   (~23× от ref) — реальный оставшийся gap = скорость IR-VM (отдельная работа).
+   `computesizes` (оптимальный array-sizing) не портирован — future optimization.
+ 
++### Выполнено: настоящий generational GC (P15.30)
++
++Generational mode больше не является compatibility-веткой, запускающей полный
++incremental cycle на каждый `collectgarbage("step")`. Реализована отдельная
++PUC-подобная young-generation модель поверх per-type registry luazig:
++
++1. Все управляемые GC-типы (`Table`, `Closure`, `Thread`, `Cell`, managed
++   `LuaString`) хранят возраст `NEW/SURVIVAL/OLD0/OLD1/OLD/TOUCHED1/TOUCHED2`
++   и стабильный registry index. Удаление из registry использует swap-remove с
++   обновлением индекса перемещённого объекта.
++2. Nursery хранится в отдельных per-type списках; `OLD1`, remembered
++   `grayagain`, remembered cells и old threads имеют собственные очереди.
++   Minor collection обходит young snapshots и эти очереди, а не весь old heap.
++3. Forward barrier продвигает young child старого closure/metatable/upvalue в
++   `OLD0`; backward barrier переводит изменённый old owner в
++   `TOUCHED1 → TOUCHED2 → OLD`. Barrier paths покрывают table writes, cells,
++   closure environment, upvalue join/close и смену metatable.
++4. Пережившие minor cycles переходят `NEW → SURVIVAL → OLD1 → OLD`. Weak
++   tables, ephemerons, finalizable objects и threads обрабатываются с учётом
++   поколения; старый weak container не удерживает недостижимый young value.
++5. Накопленные bytes, ставшие old, переключают collector из minor mode в
++   persistent incremental major cycle по `minormajor`; после major он
++   возвращается в minor mode по `majorminor` либо продолжает incremental
++   major cycles. Автоматический minor pacing использует `minormul`; все три
++   параметра доступны через Lua 5.5 `collectgarbage("param", ...)`.
++6. TestC `T.gcage` читает реальные возраста объектов, а `T.codeparam`/
++   `T.applyparam` используют Lua 5.5 floating-byte encoding. Поэтому полный
++   `gengc.lua --testc` проверяет upstream age/barrier transitions, а не
++   подставленные ожидаемые строки.
++
++Постоянный differential regression
++`tests/smoke/43_generational_minor.lua` проверяет old→young barrier, вложенный
++young graph, очистку young value из old weak table и параметры режима. Zig
++unit tests дополнительно проверяют, что minor collection не сканирует
++512-объектный old graph, и принудительный переход minor → major → minor.
++
++Подтверждённые проверки на Zig 0.16.0:
++
++- `zig build -Doptimize=Debug` и `zig build test -Doptimize=Debug` — PASS;
++- differential smoke — 43/43 PASS;
++- iterative dispatch stress под 1-МБ host stack — PASS;
++- заявленная portable/soft upstream matrix — 29/29 PASS;
++- `gengc.lua --testc` — `OK`;
++- portable/soft `gc.lua` — 2.08 с Debug / 0.51 с ReleaseFast;
++- direct `constructs.lua` без `_soft` — 53.94 с, `OK`;
++- direct `verybig.lua` без `_soft` — 6.93 с, `OK`.
++
++Архитектура не копирует intrusive `GCObject.next` списки PUC побайтово:
++luazig сохраняет отдельные массивы указателей. Но поколения, remembered-set
++инварианты, minor/major transitions и наблюдаемая Lua/TestC-семантика
++соответствуют модели Lua 5.5.
++
+ ### Открытые приоритеты
+ 
+ - [x] **IR VM заморожена, bc=default.** Default backend переведён на `--vm=bc`.
+@@ -680,5 +733,6 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
+ - P15.27: завершение regression cleanup после iterative dispatch — исправлены large `SETLIST + EXTRAARG`, lexical `goto`/global-attribute/named-vararg semantics, source line tables и PUC-like line-hook `oldpc`; удалён trace preseed. `saved_parent_callee` debug-hook continuation добавлен в GC roots, а stripped `load` всегда инициализирует первый environment upvalue. Расширен smoke `31_debug_bytecode_parity.lua`; `40_large_setlist_extraarg.lua` закрепляет `verybig` codegen. Подтверждены unit tests, 40/40 smoke, 1-МБ stress, 29/29 upstream matrix и direct `verybig.lua`.
+ - P15.28: verifier follow-up — dynamic `load()`/automatic-GC scheduling переведены с fixed instruction cadence на live-heap debt, короткие interned strings включены в memory accounting, а explicit generational step выполняет атомарный цикл с PUC-compatible `false` result. `runBytecode` скрывает private dispatch signal, strict-global codegen не знает имён stdlib, `time.txt` сохраняется через snapshot/restore. Добавлен smoke `42_gc_debt_and_generational_step.lua`; подтверждены 42/42 smoke, 29/29 soft/portable matrix, direct `constructs.lua` <60 с и direct `verybig.lua`.
+ - P15.29: persistent incremental GC — collector хранит `pause/propagate/atomic/sweep` state, gray queue, mark sets и sweep cursors между `collectgarbage("step", n)`; mark/sweep расходуют реальный bounded budget, mutable roots и write barriers сохраняют tri-color invariant, а registry entries удаляются до освобождения объекта. Исправлены finalizer epoch/reentrancy и escaping main-chunk `_ENV` ownership. Unit regression наблюдает отдельные phases и barrier writes. Подтверждены Debug build/tests, 42/42 smoke, 1-МБ stress, 29/29 upstream matrix, direct heavy tests и `gc.lua` 1.85 с Debug / 0.54 с ReleaseFast.
++- P15.30: настоящий generational GC — добавлены PUC-like object ages, per-type nursery, OLD1/remembered/old-thread queues, forward/back barriers и young-only sweep. Minor collections больше не вызывают полный incremental cycle и не обходят обычный old heap; `minormul/minormajor/majorminor` управляют minor → incremental major → minor transitions. `gengc.lua --testc` читает реальные age states; добавлен smoke `43_generational_minor.lua`. Подтверждены 43/43 smoke, 29/29 matrix, GC suites, 1-МБ stress и direct heavy tests.
+ 
+ Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).
+diff --git a/src/lua/vm.zig b/src/lua/vm.zig
+index b26e82a..d9a723f 100644
+--- a/src/lua/vm.zig
++++ b/src/lua/vm.zig
+@@ -164,6 +164,10 @@ pub const BuiltinId = enum {
+     testc_makecfunc,
+     testc_allowhookyield,
+     testc_totalmem,
++    testc_gcage,
++    testc_gccolor,
++    testc_codeparam,
++    testc_applyparam,
+ 
+     pub fn name(self: BuiltinId) []const u8 {
+         return switch (self) {
+@@ -312,12 +316,36 @@ pub const BuiltinId = enum {
+             .testc_makecfunc => "T._makecfunc",
+             .testc_allowhookyield => "T._allowhookyield",
+             .testc_totalmem => "T.totalmem",
++            .testc_gcage => "T.gcage",
++            .testc_gccolor => "T.gccolor",
++            .testc_codeparam => "T.codeparam",
++            .testc_applyparam => "T.applyparam",
+         };
+     }
+ };
+ 
++const GcAge = enum(u3) {
++    new,
++    survival,
++    old0,
++    old1,
++    old,
++    touched1,
++    touched2,
++
++    fn isYoung(self: GcAge) bool {
++        return self == .new or self == .survival;
++    }
++
++    fn isOld(self: GcAge) bool {
++        return !self.isYoung();
++    }
++};
++
+ pub const Cell = struct {
+     value: Value,
++    gc_age: GcAge = .new,
++    gc_index: usize = 0,
+     /// When non-null, this is an "open" upvalue that directly references
+     /// the shared bytecode stack at `bc_stack[bc_stack_idx]`. Reads and
+     /// writes go through the stack slot, not through `value`.
+@@ -356,6 +384,8 @@ pub const Cell = struct {
+ };
+ 
+ pub const Closure = struct {
++    gc_age: GcAge = .new,
++    gc_index: usize = 0,
+     func: *const ir.Function,
+     proto: ?*const bc.Proto = null, // bytecode proto (non-null for bytecode closures)
+     upvalues: []const *Cell,
+@@ -827,6 +857,8 @@ pub const Thread = struct {
+         slot: usize,
+         cell: *Cell,
+     };
++    gc_age: GcAge = .new,
++    gc_index: usize = 0,
+     status: enum { suspended, running, dead } = .suspended,
+     callee: Value, // .Closure or .Builtin
+     yielded: ?[]Value = null,
+@@ -1044,6 +1076,8 @@ pub const LuaString = struct {
+     len: usize,
+     is_short: bool, // <= lua_string_max_short_len => interned (PUC short variant)
+     marked: u8 = 0, // GC mark bit (used from Task 5)
++    gc_age: GcAge = .new,
++    gc_index: usize = 0,
+ 
+     // Bytes stored inline right after the header, in the same allocation.
+     pub fn bytes(self: *const LuaString) []const u8 {
+@@ -1245,6 +1279,9 @@ pub const Value = union(enum) {
+ };
+ 
+ pub const Table = struct {
++    gc_age: GcAge = .new,
++    gc_index: usize = 0,
++
+     // Array part: keys 1..n stored contiguously. A nil entry inside the array
+     // is a "hole"; next()/length skip holes by scanning. Untouched by this
+     // refactor — all `.array` / `.array.items` call sites stay valid.
+@@ -1318,6 +1355,7 @@ pub const Vm = struct {
+     /// Unlike the old debt gate, every non-pause state owns resumable work
+     /// that survives across `collectgarbage("step")` calls.
+     const GcState = enum { pause, propagate, atomic, sweep };
++    const GcGenPhase = enum { minor, major };
+ 
+     const GcSweepKind = enum { tables, threads, closures, strings, cells, intern_tables, done };
+     const FileBuffer = struct {
+@@ -1420,8 +1458,42 @@ pub const Vm = struct {
+ 
+     gc_running: bool = true,
+     gc_mode: enum { incremental, generational } = .incremental,
++    gc_gen_phase: GcGenPhase = .minor,
+     gc_pause: i64 = 200,
+     gc_stepmul: i64 = 100,
++    gc_stepsize: i64 = 200,
++    gc_gen_minormul: i64 = 20,
++    gc_gen_minormajor: i64 = 70,
++    gc_gen_majorminor: i64 = 50,
++    gc_gen_major_base_kb: f64 = 0.0,
++    gc_gen_major_start_kb: f64 = 0.0,
++    gc_gen_added_old_kb: f64 = 0.0,
++
++    // Generational registries mirror PUC's nursery/survival/old1 and
++    // grayagain lists without requiring intrusive links in every object.
++    // Minor collections walk only these lists, not the complete old heap.
++    gc_young_tables: std.ArrayListUnmanaged(*Table) = .empty,
++    gc_young_closures: std.ArrayListUnmanaged(*Closure) = .empty,
++    gc_young_threads: std.ArrayListUnmanaged(*Thread) = .empty,
++    gc_young_cells: std.ArrayListUnmanaged(*Cell) = .empty,
++    gc_young_strings: std.ArrayListUnmanaged(*LuaString) = .empty,
++    gc_old1: std.ArrayListUnmanaged(Value) = .empty,
++    gc_old1_cells: std.ArrayListUnmanaged(*Cell) = .empty,
++    gc_grayagain: std.ArrayListUnmanaged(Value) = .empty,
++    gc_grayagain_cells: std.ArrayListUnmanaged(*Cell) = .empty,
++    gc_gen_threads: std.ArrayListUnmanaged(*Thread) = .empty,
++    gc_young_tables_snapshot_len: usize = 0,
++    gc_young_closures_snapshot_len: usize = 0,
++    gc_young_threads_snapshot_len: usize = 0,
++    gc_young_cells_snapshot_len: usize = 0,
++    gc_young_strings_snapshot_len: usize = 0,
++    gc_gen_last_minor_visited: usize = 0,
++    gc_gen_last_minor_old_visited: usize = 0,
++    gc_minor_cycle: bool = false,
++    gc_old1_snapshot_len: usize = 0,
++    gc_old1_cells_snapshot_len: usize = 0,
++    gc_grayagain_snapshot_len: usize = 0,
++    gc_grayagain_cells_snapshot_len: usize = 0,
+ 
+     // Persistent incremental collector state. Mark sets and gray/weak queues
+     // are retained between steps, so each step performs bounded real work
+@@ -1450,7 +1522,8 @@ pub const Vm = struct {
+     // Allocation sites and the dispatch loop periodically *check* this debt
+     // threshold. They no longer run a full collection merely because a fixed
+     // number of VM instructions elapsed: doing so repeatedly rescanned a large
+-    // live heap and made constructs.lua quadratic. Like PUC's pause/debt model,
++    // live heap and made repeated dynamic-load workloads quadratic. Like PUC's
++    // pause/debt model,
+     // the next automatic cycle is scheduled from the live heap size left by the
+     // previous cycle.
+     gc_alloc_threshold: usize = 20000,
+@@ -1588,8 +1661,8 @@ pub const Vm = struct {
+             .global_env = env,
+             .string_metatable = str_mt,
+         };
+-        vm.gc_tables.append(alloc, env) catch @panic("oom");
+-        vm.gc_tables.append(alloc, str_mt) catch @panic("oom");
++        vm.gcRegisterTable(env) catch @panic("oom");
++        vm.gcRegisterTable(str_mt) catch @panic("oom");
+         const main_th = alloc.create(Thread) catch @panic("oom");
+         main_th.* = .{
+             .callee = .Nil,
+@@ -1597,7 +1670,7 @@ pub const Vm = struct {
+         };
+         vm.main_thread = main_th;
+         vm.active_runtime_thread = main_th;
+-        vm.gc_threads.append(alloc, main_th) catch @panic("oom");
++        vm.gcRegisterThread(main_th) catch @panic("oom");
+         vm.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
+         // Allocate shared bytecode stack.
+         vm.bc_stack = alloc.alloc(Value, vm.bc_stack_initial) catch @panic("oom");
+@@ -1990,6 +2063,16 @@ pub const Vm = struct {
+         self.gc_fin_threads.deinit(self.alloc);
+         self.gc_to_finalize.deinit(self.alloc);
+         self.gc_fin_weak_tables.deinit(self.alloc);
++        self.gc_young_tables.deinit(self.alloc);
++        self.gc_young_closures.deinit(self.alloc);
++        self.gc_young_threads.deinit(self.alloc);
++        self.gc_young_cells.deinit(self.alloc);
++        self.gc_young_strings.deinit(self.alloc);
++        self.gc_old1.deinit(self.alloc);
++        self.gc_old1_cells.deinit(self.alloc);
++        self.gc_grayagain.deinit(self.alloc);
++        self.gc_grayagain_cells.deinit(self.alloc);
++        self.gc_gen_threads.deinit(self.alloc);
+         self.pinned_source_strings.deinit(self.alloc);
+         self.gc_temp_roots.deinit(self.alloc);
+     }
+@@ -2011,7 +2094,7 @@ pub const Vm = struct {
+         try exposeDispatchResult(void, self.testcChargeMemory(@sizeOf(Thread) + 64));
+         const th = try self.alloc.create(Thread);
+         th.* = .{ .status = .suspended, .callee = callee };
+-        try self.gc_threads.append(self.alloc, th);
++        try self.gcRegisterThread(th);
+         self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
+         self.testc_obj_threads += 1;
+         return th;
+@@ -2052,7 +2135,7 @@ pub const Vm = struct {
+         try exposeDispatchResult(void, self.testcChargeMemory(@sizeOf(Closure) + 64));
+         const cl = try self.alloc.create(Closure);
+         cl.* = .{ .func = func, .upvalues = upvalues };
+-        try self.gc_closures.append(self.alloc, cl);
++        try self.gcRegisterClosure(cl);
+         self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
+         self.testc_obj_functions += 1;
+         return .{ .Closure = cl };
+@@ -2515,11 +2598,106 @@ pub const Vm = struct {
+         self.gc_finalizer_tick_pending = true;
+     }
+ 
++    fn gcRegisterTable(self: *Vm, table: *Table) std.mem.Allocator.Error!void {
++        try self.gc_tables.ensureUnusedCapacity(self.alloc, 1);
++        if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
++            try self.gc_young_tables.ensureUnusedCapacity(self.alloc, 1);
++        table.gc_index = self.gc_tables.items.len;
++        self.gc_tables.appendAssumeCapacity(table);
++        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
++            table.gc_age = .new;
++            self.gc_young_tables.appendAssumeCapacity(table);
++        }
++    }
++
++    fn gcRegisterClosure(self: *Vm, closure: *Closure) std.mem.Allocator.Error!void {
++        try self.gc_closures.ensureUnusedCapacity(self.alloc, 1);
++        if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
++            try self.gc_young_closures.ensureUnusedCapacity(self.alloc, 1);
++        closure.gc_index = self.gc_closures.items.len;
++        self.gc_closures.appendAssumeCapacity(closure);
++        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
++            closure.gc_age = .new;
++            self.gc_young_closures.appendAssumeCapacity(closure);
++        }
++    }
++
++    fn gcRegisterThread(self: *Vm, thread: *Thread) std.mem.Allocator.Error!void {
++        try self.gc_threads.ensureUnusedCapacity(self.alloc, 1);
++        if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
++            try self.gc_young_threads.ensureUnusedCapacity(self.alloc, 1);
++        thread.gc_index = self.gc_threads.items.len;
++        self.gc_threads.appendAssumeCapacity(thread);
++        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
++            thread.gc_age = .new;
++            self.gc_young_threads.appendAssumeCapacity(thread);
++        }
++    }
++
++    fn gcRegisterCell(self: *Vm, cell: *Cell) std.mem.Allocator.Error!void {
++        try self.gc_cells.ensureUnusedCapacity(self.alloc, 1);
++        if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
++            try self.gc_young_cells.ensureUnusedCapacity(self.alloc, 1);
++        cell.gc_index = self.gc_cells.items.len;
++        self.gc_cells.appendAssumeCapacity(cell);
++        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
++            cell.gc_age = .new;
++            self.gc_young_cells.appendAssumeCapacity(cell);
++        }
++    }
++
++    fn gcRegisterString(self: *Vm, string: *LuaString) std.mem.Allocator.Error!void {
++        try self.gc_strings.ensureUnusedCapacity(self.alloc, 1);
++        if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
++            try self.gc_young_strings.ensureUnusedCapacity(self.alloc, 1);
++        string.gc_index = self.gc_strings.items.len;
++        self.gc_strings.appendAssumeCapacity(string);
++        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
++            string.gc_age = .new;
++            self.gc_young_strings.appendAssumeCapacity(string);
++        }
++    }
++
++    fn gcUnregisterTable(self: *Vm, table: *Table) void {
++        const index = table.gc_index;
++        std.debug.assert(index < self.gc_tables.items.len and self.gc_tables.items[index] == table);
++        _ = self.gc_tables.swapRemove(index);
++        if (index < self.gc_tables.items.len) self.gc_tables.items[index].gc_index = index;
++    }
++
++    fn gcUnregisterClosure(self: *Vm, closure: *Closure) void {
++        const index = closure.gc_index;
++        std.debug.assert(index < self.gc_closures.items.len and self.gc_closures.items[index] == closure);
++        _ = self.gc_closures.swapRemove(index);
++        if (index < self.gc_closures.items.len) self.gc_closures.items[index].gc_index = index;
++    }
++
++    fn gcUnregisterThread(self: *Vm, thread: *Thread) void {
++        const index = thread.gc_index;
++        std.debug.assert(index < self.gc_threads.items.len and self.gc_threads.items[index] == thread);
++        _ = self.gc_threads.swapRemove(index);
++        if (index < self.gc_threads.items.len) self.gc_threads.items[index].gc_index = index;
++    }
++
++    fn gcUnregisterCell(self: *Vm, cell: *Cell) void {
++        const index = cell.gc_index;
++        std.debug.assert(index < self.gc_cells.items.len and self.gc_cells.items[index] == cell);
++        _ = self.gc_cells.swapRemove(index);
++        if (index < self.gc_cells.items.len) self.gc_cells.items[index].gc_index = index;
++    }
++
++    fn gcUnregisterString(self: *Vm, string: *LuaString) void {
++        const index = string.gc_index;
++        std.debug.assert(index < self.gc_strings.items.len and self.gc_strings.items[index] == string);
++        _ = self.gc_strings.swapRemove(index);
++        if (index < self.gc_strings.items.len) self.gc_strings.items[index].gc_index = index;
++    }
++
+     fn allocTableNoGc(self: *Vm) std.mem.Allocator.Error!*Table {
+         self.testcNoteMemory(@sizeOf(Table) + 64);
+         const t = try self.alloc.create(Table);
+         t.* = .{};
+-        try self.gc_tables.append(self.alloc, t);
++        try self.gcRegisterTable(t);
+         self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Table))) / 1024.0;
+         self.testc_obj_tables += 1;
+         return t;
+@@ -2556,7 +2734,7 @@ pub const Vm = struct {
+     fn allocTableEphemeral(self: *Vm) std.mem.Allocator.Error!*Table {
+         const t = try self.alloc.create(Table);
+         t.* = .{};
+-        try self.gc_tables.append(self.alloc, t);
++        try self.gcRegisterTable(t);
+         return t;
+     }
+ 
+@@ -3813,7 +3991,14 @@ pub const Vm = struct {
+         var i: usize = min_reg;
+         while (i < boxed.len) : (i += 1) {
+             if (boxed[i]) |cell| {
+-                cell.value = regs[i];
++                // Closing an old open upvalue can publish a nursery object.
++                // Preserve the remembered-set invariant before the stack slot
++                // disappears. In infallible unwind cleanup, OOM cannot be
++                // surfaced; still close the cell to avoid a dangling stack ref.
++                self.gcStoreCellValue(cell, regs[i]) catch {
++                    cell.value = regs[i];
++                };
++                cell.bc_stack_idx = null;
+                 boxed[i] = null;
+             }
+         }
+@@ -6495,7 +6680,7 @@ pub const Vm = struct {
+                 .proto = proto_in,
+                 .upvalues = upvalues_in,
+             };
+-            try self.gc_closures.append(self.alloc, cl);
++            try self.gcRegisterClosure(cl);
+             self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
+             self.testc_obj_functions += 1;
+             break :blk cl;
+@@ -7862,7 +8047,8 @@ pub const Vm = struct {
+                                 //    values into cells, then clear boxed slots.
+                                 for (boxed, 0..) |*bc_slot, i| {
+                                     if (bc_slot.*) |cell| {
+-                                        cell.value = regs[i];
++                                        try self.gcStoreCellValue(cell, regs[i]);
++                                        cell.bc_stack_idx = null;
+                                         bc_slot.* = null;
+                                     }
+                                 }
+@@ -8399,7 +8585,7 @@ pub const Vm = struct {
+                                 } else {
+                                     const cell = try self.alloc.create(Cell);
+                                     cell.* = .{ .value = regs[uv.idx] };
+-                                    try self.gc_cells.append(self.alloc, cell);
++                                    try self.gcRegisterCell(cell);
+                                     boxed[uv.idx] = cell;
+                                     cells[i] = cell;
+                                 }
+@@ -8415,7 +8601,7 @@ pub const Vm = struct {
+                             .proto = child_proto,
+                             .upvalues = cells,
+                         };
+-                        try self.gc_closures.append(self.alloc, cl);
++                        try self.gcRegisterClosure(cl);
+                         regs[a] = .{ .Closure = cl };
+                         // If this register was captured as an upvalue (boxed),
+                         // update the cell to reflect the new value. This is
+@@ -8928,8 +9114,12 @@ pub const Vm = struct {
+         // Long strings are allocated fresh every time, matching PUC
+         // luaS_createlngstrobj (not interned).
+         if (raw.len <= lua_string_max_short_len) {
+-            if (self.string_intern.table.get(raw)) |existing| return existing;
++            if (self.string_intern.table.get(raw)) |existing| {
++                if (self.gc_mode == .generational and self.gc_gen_phase == .minor) existing.gc_age = .old;
++                return existing;
++            }
+             const ls = try createLuaString(self.alloc, raw, hash);
++            if (self.gc_mode == .generational and self.gc_gen_phase == .minor) ls.gc_age = .old;
+             try self.string_intern.table.put(self.alloc, ls.bytes(), ls);
+             // Short strings are currently pinned in the intern table, but they
+             // still consume heap memory and must contribute to automatic-GC
+@@ -8941,7 +9131,7 @@ pub const Vm = struct {
+             return ls;
+         }
+         const ls = try createLuaString(self.alloc, raw, hash);
+-        try self.gc_strings.append(self.alloc, ls);
++        try self.gcRegisterString(ls);
+         self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(LuaString) + raw.len)) / 1024.0;
+         self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 24);
+         self.testc_obj_strings += 1;
+@@ -8972,11 +9162,15 @@ pub const Vm = struct {
+     // length; we dedup globally (observable only via %p across functions).
+     pub fn internLiteral(self: *Vm, raw: []const u8) std.mem.Allocator.Error!*LuaString {
+         if (raw.len <= lua_string_max_short_len) return self.internStr(raw);
+-        if (self.long_literals.table.get(raw)) |existing| return existing;
++        if (self.long_literals.table.get(raw)) |existing| {
++            if (self.gc_mode == .generational and self.gc_gen_phase == .minor) existing.gc_age = .old;
++            return existing;
++        }
+         const seed = self.rng_state[0] ^ self.rng_state[2];
+         var h = std.hash.Wyhash.init(seed);
+         h.update(raw);
+         const ls = try createLuaString(self.alloc, raw, h.final());
++        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) ls.gc_age = .old;
+         try self.long_literals.table.put(self.alloc, ls.bytes(), ls);
+         self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 24);
+         self.testc_obj_strings += 1;
+@@ -9326,6 +9520,10 @@ pub const Vm = struct {
+             .testc_makecfunc => try self.builtinTestcMakeCfunc(args, outs),
+             .testc_allowhookyield => try self.builtinTestcAllowHookYield(args, outs),
+             .testc_totalmem => try self.builtinTestcTotalmem(args, outs),
++            .testc_gcage => try self.builtinTestcGcage(args, outs),
++            .testc_gccolor => try self.builtinTestcGccolor(args, outs),
++            .testc_codeparam => try self.builtinTestcCodeparam(args, outs),
++            .testc_applyparam => try self.builtinTestcApplyparam(args, outs),
+         }
+     }
+ 
+@@ -9357,6 +9555,10 @@ pub const Vm = struct {
+         try self.setField(t, "_makecfunc", .{ .Builtin = .testc_makecfunc });
+         try self.setField(t, "_allowhookyield", .{ .Builtin = .testc_allowhookyield });
+         try self.setField(t, "totalmem", .{ .Builtin = .testc_totalmem });
++        try self.setField(t, "gcage", .{ .Builtin = .testc_gcage });
++        try self.setField(t, "gccolor", .{ .Builtin = .testc_gccolor });
++        try self.setField(t, "codeparam", .{ .Builtin = .testc_codeparam });
++        try self.setField(t, "applyparam", .{ .Builtin = .testc_applyparam });
+         try self.setGlobal("T", .{ .Table = t });
+ 
+         const bootstrap_src =
+@@ -9446,7 +9648,6 @@ pub const Vm = struct {
+             \\function T.externstr(s) return tostring(s) end
+             \\function T.checkmemory() return true end
+             \\function T.gcstate(_) return "pause" end
+-            \\function T.gccolor(_) return "black" end
+             \\function T.upvalue(f, n, v)
+             \\  if type(f) == "table" and f.__testc_upvalues then
+             \\    if v ~= nil then f.__testc_upvalues[n] = v end
+@@ -10023,16 +10224,23 @@ pub const Vm = struct {
+     fn gcStep(self: *Vm, requested_kb: i64) DispatchError!bool {
+         if (self.gc_busy) return false;
+ 
+-        // The project does not yet model separate young-generation phases.
+-        // Preserve PUC-observable generational step behaviour while both modes
+-        // share the same correct incremental full-cycle machinery.
+-        if (self.gc_mode == .generational) {
+-            try self.gcCycleFull();
++        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
++            try self.gcMinorCollection();
+             return false;
+         }
+ 
+-        if (self.gc_state == .pause) try self.gcStartCycle(true);
+-        return self.gcAdvance(self.gcStepBudget(requested_kb));
++        const step_size = if (requested_kb > 0) requested_kb else self.gc_stepsize;
++        if (step_size == 0) {
++            try self.gcCycleFull();
++            return true;
++        }
++        if (self.gc_state == .pause) {
++            if (self.gc_mode == .generational and self.gc_gen_phase == .major) {
++                self.gc_gen_major_start_kb = self.gc_count_kb;
++            }
++            try self.gcStartCycle(true);
++        }
++        return self.gcAdvance(self.gcStepBudget(step_size));
+     }
+ 
+     fn builtinCollectgarbage(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+@@ -10049,7 +10257,7 @@ pub const Vm = struct {
+                 if (want_out) outs[0] = .{ .Int = 0 };
+                 return;
+             }
+-            try self.gcCycleFull();
++            try self.gcFullCollectionForUser();
+             if (self.testc_gc_pending_finalize_kb > 0.0) {
+                 if (self.testc_gc_pending_finalize_seen) {
+                     self.testc_gc_manual_kb = @max(0.0, self.testc_gc_manual_kb - self.testc_gc_pending_finalize_kb);
+@@ -10092,13 +10300,13 @@ pub const Vm = struct {
+         }
+         if (std.mem.eql(u8, what, "incremental")) {
+             const prev = self.gc_mode;
+-            self.gc_mode = .incremental;
++            if (prev == .generational) self.gcLeaveGenerational();
+             if (want_out) outs[0] = .{ .String = try self.internStr(if (prev == .incremental) "incremental" else "generational") };
+             return;
+         }
+         if (std.mem.eql(u8, what, "generational")) {
+             const prev = self.gc_mode;
+-            self.gc_mode = .generational;
++            if (prev == .incremental) try self.gcEnterGenerational();
+             if (want_out) outs[0] = .{ .String = try self.internStr(if (prev == .incremental) "incremental" else "generational") };
+             return;
+         }
+@@ -10110,7 +10318,20 @@ pub const Vm = struct {
+             };
+ 
+             var target: *i64 = undefined;
+-            if (std.mem.eql(u8, pname, "pause")) target = &self.gc_pause else if (std.mem.eql(u8, pname, "stepmul")) target = &self.gc_stepmul else return self.fail("collectgarbage: unknown param '{s}'", .{pname});
++            if (std.mem.eql(u8, pname, "pause"))
++                target = &self.gc_pause
++            else if (std.mem.eql(u8, pname, "stepmul"))
++                target = &self.gc_stepmul
++            else if (std.mem.eql(u8, pname, "stepsize"))
++                target = &self.gc_stepsize
++            else if (std.mem.eql(u8, pname, "minormul"))
++                target = &self.gc_gen_minormul
++            else if (std.mem.eql(u8, pname, "minormajor"))
++                target = &self.gc_gen_minormajor
++            else if (std.mem.eql(u8, pname, "majorminor"))
++                target = &self.gc_gen_majorminor
++            else
++                return self.fail("collectgarbage: unknown param '{s}'", .{pname});
+ 
+             const old = target.*;
+             if (args.len >= 3) {
+@@ -10119,7 +10340,7 @@ pub const Vm = struct {
+                     else => return self.fail("collectgarbage('param', ..., value) expects integer value", .{}),
+                 };
+                 target.* = newv;
+-                if (std.mem.eql(u8, pname, "pause")) self.gcScheduleNextAutomaticCycle();
++                if (std.mem.eql(u8, pname, "pause") or std.mem.eql(u8, pname, "minormul")) self.gcScheduleNextAutomaticCycle();
+             }
+             if (want_out) outs[0] = .{ .Int = old };
+             return;
+@@ -10140,7 +10361,7 @@ pub const Vm = struct {
+             }
+             // `stop` disables automatic collection only. Explicit collection
+             // remains available and must not change the running/stopped state.
+-            try self.gcCycleFull();
++            try self.gcFullCollectionForUser();
+             if (want_out) outs[0] = .{ .Int = 0 };
+             return;
+         }
+@@ -10599,7 +10820,7 @@ pub const Vm = struct {
+         try self.testcChargeMemory(@sizeOf(Thread) + 64);
+         const th = try self.alloc.create(Thread);
+         th.* = .{ .status = .suspended, .callee = callee };
+-        try self.gc_threads.append(self.alloc, th);
++        try self.gcRegisterThread(th);
+         self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
+         self.testc_obj_threads += 1;
+         outs[0] = .{ .Thread = th };
+@@ -11906,6 +12127,204 @@ pub const Vm = struct {
+         };
+     }
+ 
++    fn gcValueAge(value: Value) ?GcAge {
++        return switch (value) {
++            .Table => |object| object.gc_age,
++            .Closure => |object| object.gc_age,
++            .Thread => |object| object.gc_age,
++            .String => |object| object.gc_age,
++            else => null,
++        };
++    }
++
++    fn gcSetValueAge(value: Value, age: GcAge) void {
++        switch (value) {
++            .Table => |object| object.gc_age = age,
++            .Closure => |object| object.gc_age = age,
++            .Thread => |object| object.gc_age = age,
++            .String => |object| object.gc_age = age,
++            else => {},
++        }
++    }
++
++    fn gcValueBytes(value: Value) usize {
++        return switch (value) {
++            .Table => |table| @sizeOf(Table) + table.array.capacity * @sizeOf(Value) + table.hash.len * @sizeOf(ltable.Node),
++            .Closure => @sizeOf(Closure),
++            .Thread => @sizeOf(Thread),
++            .String => |string| @sizeOf(LuaString) + string.len,
++            else => 0,
++        };
++    }
++
++    fn gcMinorCandidate(age: GcAge) bool {
++        return age == .new or age == .survival or age == .old0;
++    }
++
++    fn gcTableDead(self: *const Vm, table: *Table) bool {
++        if (self.gc_minor_cycle and !gcMinorCandidate(table.gc_age)) return false;
++        return !self.gc_marked_tables.contains(table);
++    }
++
++    fn gcClosureDead(self: *const Vm, closure: *Closure) bool {
++        if (self.gc_minor_cycle and !gcMinorCandidate(closure.gc_age)) return false;
++        return !self.gc_marked_closures.contains(closure);
++    }
++
++    fn gcThreadDead(self: *const Vm, thread: *Thread) bool {
++        if (self.gc_minor_cycle and !gcMinorCandidate(thread.gc_age)) return false;
++        return !self.gc_marked_threads.contains(thread);
++    }
++
++    /// Queue an object for traversal regardless of its generation. Minor
++    /// collections use this for OLD1, TOUCHED*, and old threads; ordinary
++    /// root marking still calls gcMarkValue and therefore ignores untouched
++    /// old objects.
++    fn gcQueueScanValue(self: *Vm, value: Value) DispatchError!void {
++        switch (value) {
++            .String => |string| {
++                if (!self.gc_marked_strings.contains(string)) try self.gc_marked_strings.put(self.alloc, string, {});
++            },
++            .Table => |table| {
++                if (self.gc_marked_tables.contains(table)) return;
++                try self.gc_marked_tables.put(self.alloc, table, {});
++                try self.gc_gray.append(self.alloc, value);
++            },
++            .Closure => |closure| {
++                if (self.gc_marked_closures.contains(closure)) return;
++                try self.gc_marked_closures.put(self.alloc, closure, {});
++                try self.gc_gray.append(self.alloc, value);
++            },
++            .Thread => |thread| {
++                if (self.gc_marked_threads.contains(thread)) return;
++                try self.gc_marked_threads.put(self.alloc, thread, {});
++                try self.gc_gray.append(self.alloc, value);
++            },
++            else => {},
++        }
++    }
++
++    fn gcMarkMinorValue(self: *Vm, value: Value) DispatchError!void {
++        const age = gcValueAge(value) orelse return;
++        if (!gcMinorCandidate(age)) return;
++        try self.gcQueueScanValue(value);
++    }
++
++    fn gcQueueScanCell(self: *Vm, cell: *Cell) DispatchError!void {
++        if (!self.gc_marked_cells.contains(cell)) try self.gc_marked_cells.put(self.alloc, cell, {});
++        try self.gcMarkValue(cell.get(self.bc_stack));
++    }
++
++    fn gcRememberValue(self: *Vm, owner: Value) DispatchError!void {
++        if (self.gc_mode != .generational or self.gc_gen_phase != .minor) return;
++        const age = gcValueAge(owner) orelse return;
++        switch (age) {
++            .new, .survival, .old0, .touched1 => return,
++            .touched2 => gcSetValueAge(owner, .touched1),
++            .old1, .old => {
++                gcSetValueAge(owner, .touched1);
++                try self.gc_grayagain.append(self.alloc, owner);
++            },
++        }
++    }
++
++    fn gcRememberCell(self: *Vm, cell: *Cell) DispatchError!void {
++        if (self.gc_mode != .generational or self.gc_gen_phase != .minor) return;
++        switch (cell.gc_age) {
++            .new, .survival, .old0, .touched1 => return,
++            .touched2 => cell.gc_age = .touched1,
++            .old1, .old => {
++                cell.gc_age = .touched1;
++                try self.gc_grayagain_cells.append(self.alloc, cell);
++            },
++        }
++    }
++
++    fn gcForwardBarrierValue(self: *Vm, owner: Value, child: Value) DispatchError!void {
++        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
++            const owner_age = gcValueAge(owner) orelse return;
++            const child_age = gcValueAge(child) orelse return;
++            if (owner_age.isOld() and child_age.isYoung()) {
++                gcSetValueAge(child, .old0);
++                try self.gc_old1.append(self.alloc, child);
++                try self.gcQueueScanValue(child);
++            }
++            return;
++        }
++        try self.gcWriteBarrier(child);
++    }
++
++    fn gcForwardBarrierCell(self: *Vm, owner: *Closure, child: *Cell) DispatchError!void {
++        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
++            if (owner.gc_age.isOld() and child.gc_age.isYoung()) {
++                child.gc_age = .old0;
++                try self.gc_old1_cells.append(self.alloc, child);
++                try self.gcQueueScanCell(child);
++            }
++            return;
++        }
++        try self.gcWriteBarrier(child.get(self.bc_stack));
++    }
++
++    fn gcClearGenerationalLists(self: *Vm) void {
++        self.gc_young_tables.clearRetainingCapacity();
++        self.gc_young_closures.clearRetainingCapacity();
++        self.gc_young_threads.clearRetainingCapacity();
++        self.gc_young_cells.clearRetainingCapacity();
++        self.gc_young_strings.clearRetainingCapacity();
++        self.gc_old1.clearRetainingCapacity();
++        self.gc_old1_cells.clearRetainingCapacity();
++        self.gc_grayagain.clearRetainingCapacity();
++        self.gc_grayagain_cells.clearRetainingCapacity();
++        self.gc_gen_threads.clearRetainingCapacity();
++    }
++
++    fn gcMakeAllOld(self: *Vm) std.mem.Allocator.Error!void {
++        self.gcClearGenerationalLists();
++        for (self.gc_tables.items) |table| table.gc_age = .old;
++        for (self.gc_closures.items) |closure| closure.gc_age = .old;
++        for (self.gc_cells.items) |cell| cell.gc_age = .old;
++        for (self.gc_strings.items) |string| string.gc_age = .old;
++        for (self.gc_threads.items) |thread| {
++            thread.gc_age = .old;
++            try self.gc_gen_threads.append(self.alloc, thread);
++        }
++        var short_it = self.string_intern.table.iterator();
++        while (short_it.next()) |entry| entry.value_ptr.*.gc_age = .old;
++        var literal_it = self.long_literals.table.iterator();
++        while (literal_it.next()) |entry| entry.value_ptr.*.gc_age = .old;
++        self.gc_gen_phase = .minor;
++        self.gc_gen_major_base_kb = self.gc_count_kb;
++        self.gc_gen_major_start_kb = self.gc_count_kb;
++        self.gc_gen_added_old_kb = 0;
++        self.gcScheduleNextAutomaticCycle();
++    }
++
++    fn gcEnterGenerational(self: *Vm) DispatchError!void {
++        if (self.gc_mode == .generational) return;
++        try self.gcCycleFull();
++        self.gc_mode = .generational;
++        try self.gcMakeAllOld();
++    }
++
++    fn gcLeaveGenerational(self: *Vm) void {
++        self.gc_mode = .incremental;
++        self.gc_gen_phase = .minor;
++        self.gcClearGenerationalLists();
++        self.gcScheduleNextAutomaticCycle();
++    }
++
++    fn gcFullCollectionForUser(self: *Vm) DispatchError!void {
++        if (self.gc_mode != .generational) return self.gcCycleFull();
++        self.gc_mode = .incremental;
++        self.gcCycleFull() catch |err| {
++            self.gc_mode = .generational;
++            return err;
++        };
++        self.gc_mode = .generational;
++        try self.gcMakeAllOld();
++    }
++
+     fn gcAutoCycleDue(self: *const Vm) bool {
+         return self.gc_count_kb >= self.gc_auto_threshold_kb;
+     }
+@@ -11915,6 +12334,11 @@ pub const Vm = struct {
+     /// advanced even when the heap threshold has already been rescheduled.
+     fn gcAutomaticStep(self: *Vm) DispatchError!void {
+         if (self.gc_busy) return;
++        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
++            if (!self.gc_finalizer_tick_pending and !self.gcAutoCycleDue()) return;
++            try self.gcMinorCollection();
++            return;
++        }
+         if (self.gc_state == .pause) {
+             if (!self.gc_finalizer_tick_pending and !self.gcAutoCycleDue()) return;
+             try self.gcStartCycle(true);
+@@ -11927,6 +12351,12 @@ pub const Vm = struct {
+     /// tight cycle loop for tiny heaps whose accounting changes by fractions
+     /// of a kilobyte.
+     fn gcScheduleNextAutomaticCycle(self: *Vm) void {
++        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
++            const minor_mul: f64 = @floatFromInt(@max(self.gc_gen_minormul, 0));
++            const by_growth = self.gc_count_kb * (100.0 + minor_mul) / 100.0;
++            self.gc_auto_threshold_kb = @max(by_growth, self.gc_count_kb + 64.0);
++            return;
++        }
+         const pause: f64 = @floatFromInt(@max(self.gc_pause, 100));
+         const by_pause = self.gc_count_kb * pause / 100.0;
+         self.gc_auto_threshold_kb = @max(by_pause, self.gc_count_kb + 256.0);
+@@ -11951,17 +12381,7 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn gcStartCycle(self: *Vm, do_sweep: bool) DispatchError!void {
+-        if (self.gc_state != .pause) return;
+-
+-        self.gc_do_sweep = do_sweep;
+-        self.gc_cycle_finalizer_epoch = self.gc_finalizer_epoch;
+-        self.gc_tables_snapshot_len = self.gc_tables.items.len;
+-        self.gc_closures_snapshot_len = self.gc_closures.items.len;
+-        self.gc_threads_snapshot_len = self.gc_threads.items.len;
+-        self.gc_strings_snapshot_len = self.gc_strings.items.len;
+-        self.gc_cells_snapshot_len = self.gc_cells.items.len;
+-
++    fn gcResetCycleState(self: *Vm) void {
+         self.gc_gray.clearRetainingCapacity();
+         self.gc_marked_tables.clearRetainingCapacity();
+         self.gc_marked_closures.clearRetainingCapacity();
+@@ -11974,6 +12394,20 @@ pub const Vm = struct {
+         self.gc_fin_threads.clearRetainingCapacity();
+         self.gc_to_finalize.clearRetainingCapacity();
+         self.gc_fin_weak_tables.clearRetainingCapacity();
++    }
++
++    fn gcStartCycle(self: *Vm, do_sweep: bool) DispatchError!void {
++        if (self.gc_state != .pause) return;
++
++        self.gc_do_sweep = do_sweep;
++        self.gc_cycle_finalizer_epoch = self.gc_finalizer_epoch;
++        self.gc_tables_snapshot_len = self.gc_tables.items.len;
++        self.gc_closures_snapshot_len = self.gc_closures.items.len;
++        self.gc_threads_snapshot_len = self.gc_threads.items.len;
++        self.gc_strings_snapshot_len = self.gc_strings.items.len;
++        self.gc_cells_snapshot_len = self.gc_cells.items.len;
++
++        self.gcResetCycleState();
+ 
+         try self.gcMarkCurrentRoots();
+         self.gc_state = .propagate;
+@@ -12066,7 +12500,7 @@ pub const Vm = struct {
+                 },
+                 .atomic => try self.gcAtomicPhase(),
+                 .sweep => {
+-                    if (!try self.gcSweepOne()) self.gcFinishCycle();
++                    if (!try self.gcSweepOne()) try self.gcFinishCycle();
+                 },
+             }
+         }
+@@ -12083,24 +12517,49 @@ pub const Vm = struct {
+ 
+     inline fn gcStoreCellValue(self: *Vm, cell: *Cell, value: Value) DispatchError!void {
+         cell.value = value;
+-        try self.gcWriteBarrier(value);
++        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
++            if (gcValueAge(value)) |age| {
++                if (cell.gc_age.isOld() and age.isYoung()) try self.gcRememberCell(cell);
++            }
++        } else {
++            try self.gcWriteBarrier(value);
++        }
+     }
+ 
+     inline fn gcStoreClosureEnv(self: *Vm, closure: *Closure, value: Value) DispatchError!void {
+         closure.env_override = value;
+-        try self.gcWriteBarrier(value);
++        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
++            if (gcValueAge(value)) |age| {
++                if (closure.gc_age.isOld() and age.isYoung()) try self.gcRememberValue(.{ .Closure = closure });
++            }
++        } else {
++            try self.gcWriteBarrier(value);
++        }
+     }
+ 
+     inline fn gcStoreMetatable(self: *Vm, table: *Table, metatable: ?*Table) DispatchError!void {
+         table.metatable = metatable;
+-        if (metatable) |mt| try self.gcWriteBarrier(.{ .Table = mt });
++        if (metatable) |mt| try self.gcForwardBarrierValue(.{ .Table = table }, .{ .Table = mt });
++    }
++
++    inline fn gcTableWriteBarrier(self: *Vm, table: *Table, key: Value, value: Value) DispatchError!void {
++        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
++            if (table.gc_age.isOld()) {
++                const key_young = if (gcValueAge(key)) |age| age.isYoung() else false;
++                const value_young = if (gcValueAge(value)) |age| age.isYoung() else false;
++                if (key_young or value_young) try self.gcRememberValue(.{ .Table = table });
++            }
++        } else {
++            try self.gcWriteBarrier(key);
++            try self.gcWriteBarrier(value);
++        }
+     }
+ 
+     fn gcDrainGray(self: *Vm) DispatchError!void {
+         while (try self.gcPropagateOne()) {}
+     }
+ 
+-    fn gcAtomicPhase(self: *Vm) DispatchError!void {
++    fn gcAtomicCommon(self: *Vm) DispatchError!void {
+         try self.gcPropagateEphemerons(
+             &self.gc_marked_tables,
+             &self.gc_marked_closures,
+@@ -12165,9 +12624,12 @@ pub const Vm = struct {
+         // Finalizers may publish newly allocated objects into live tables. The
+         // write barrier queues those values; finish their marking before sweep.
+         try self.gcDrainGray();
++    }
+ 
++    fn gcAtomicPhase(self: *Vm) DispatchError!void {
++        try self.gcAtomicCommon();
+         if (!self.gc_do_sweep) {
+-            self.gcFinishCycle();
++            try self.gcFinishCycle();
+             return;
+         }
+ 
+@@ -12195,6 +12657,313 @@ pub const Vm = struct {
+         }
+     }
+ 
++    fn gcPromoteYoungValue(self: *Vm, value: Value) DispatchError!bool {
++        const age = gcValueAge(value) orelse return false;
++        switch (age) {
++            .new => {
++                gcSetValueAge(value, .survival);
++                return true;
++            },
++            .survival => {
++                gcSetValueAge(value, .old1);
++                try self.gc_old1.append(self.alloc, value);
++                self.gc_gen_added_old_kb += @as(f64, @floatFromInt(gcValueBytes(value))) / 1024.0;
++                if (value == .Thread) try self.gc_gen_threads.append(self.alloc, value.Thread);
++                return false;
++            },
++            .old0 => {
++                // Forward barriers already linked OLD0 into gc_old1. Keep the
++                // age until gcCorrectOld1 advances it after this collection.
++                self.gc_gen_added_old_kb += @as(f64, @floatFromInt(gcValueBytes(value))) / 1024.0;
++                return false;
++            },
++            else => return false,
++        }
++    }
++
++    fn gcPromoteYoungCell(self: *Vm, cell: *Cell) DispatchError!bool {
++        switch (cell.gc_age) {
++            .new => {
++                cell.gc_age = .survival;
++                return true;
++            },
++            .survival => {
++                cell.gc_age = .old1;
++                try self.gc_old1_cells.append(self.alloc, cell);
++                self.gc_gen_added_old_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
++                return false;
++            },
++            .old0 => {
++                self.gc_gen_added_old_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
++                return false;
++            },
++            else => return false,
++        }
++    }
++
++    fn gcSweepYoungTables(self: *Vm) DispatchError!void {
++        const snapshot = @min(self.gc_young_tables_snapshot_len, self.gc_young_tables.items.len);
++        var write: usize = 0;
++        for (self.gc_young_tables.items[0..snapshot]) |table| {
++            const alive = self.gc_marked_tables.contains(table) or
++                self.gc_fin_tables.contains(table) or self.finalizables.contains(table) or
++                table.gc_age == .old0;
++            if (!alive) {
++                self.gcUnregisterTable(table);
++                const bytes = @sizeOf(Table) + table.array.capacity * @sizeOf(Value) + table.hash.len * @sizeOf(ltable.Node);
++                self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(bytes)) / 1024.0);
++                table.deinit(self.alloc);
++                self.alloc.destroy(table);
++                continue;
++            }
++            if (try self.gcPromoteYoungValue(.{ .Table = table })) {
++                self.gc_young_tables.items[write] = table;
++                write += 1;
++            }
++        }
++        for (self.gc_young_tables.items[snapshot..]) |table| {
++            self.gc_young_tables.items[write] = table;
++            write += 1;
++        }
++        self.gc_young_tables.items.len = write;
++    }
++
++    fn gcSweepYoungClosures(self: *Vm) DispatchError!void {
++        const snapshot = @min(self.gc_young_closures_snapshot_len, self.gc_young_closures.items.len);
++        var write: usize = 0;
++        for (self.gc_young_closures.items[0..snapshot]) |closure| {
++            const alive = self.gc_marked_closures.contains(closure) or self.gc_fin_closures.contains(closure) or closure.gc_age == .old0;
++            if (!alive) {
++                self.gcUnregisterClosure(closure);
++                self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0);
++                self.alloc.destroy(closure);
++                continue;
++            }
++            if (try self.gcPromoteYoungValue(.{ .Closure = closure })) {
++                self.gc_young_closures.items[write] = closure;
++                write += 1;
++            }
++        }
++        for (self.gc_young_closures.items[snapshot..]) |closure| {
++            self.gc_young_closures.items[write] = closure;
++            write += 1;
++        }
++        self.gc_young_closures.items.len = write;
++    }
++
++    fn gcSweepYoungThreads(self: *Vm) DispatchError!void {
++        const snapshot = @min(self.gc_young_threads_snapshot_len, self.gc_young_threads.items.len);
++        var write: usize = 0;
++        for (self.gc_young_threads.items[0..snapshot]) |thread| {
++            const alive = self.gc_marked_threads.contains(thread) or self.gc_fin_threads.contains(thread) or thread.gc_age == .old0;
++            if (!alive) {
++                self.gcUnregisterThread(thread);
++                self.freeThreadWrapBuffers(thread);
++                self.freeThreadBytecodeFrames(thread);
++                self.freeParkedThreadRuntime(thread);
++                if (thread.yielded) |values| self.alloc.free(values);
++                if (thread.locals_snapshot) |snapshot_values| self.alloc.free(snapshot_values);
++                self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0);
++                self.alloc.destroy(thread);
++                continue;
++            }
++            if (try self.gcPromoteYoungValue(.{ .Thread = thread })) {
++                self.gc_young_threads.items[write] = thread;
++                write += 1;
++            }
++        }
++        for (self.gc_young_threads.items[snapshot..]) |thread| {
++            self.gc_young_threads.items[write] = thread;
++            write += 1;
++        }
++        self.gc_young_threads.items.len = write;
++    }
++
++    fn gcSweepYoungStrings(self: *Vm) DispatchError!void {
++        const snapshot = @min(self.gc_young_strings_snapshot_len, self.gc_young_strings.items.len);
++        var write: usize = 0;
++        for (self.gc_young_strings.items[0..snapshot]) |string| {
++            const alive = self.gc_marked_strings.contains(string) or string.gc_age == .old0;
++            if (!alive) {
++                self.gcUnregisterString(string);
++                const bytes = @sizeOf(LuaString) + string.len;
++                self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(bytes)) / 1024.0);
++                destroyLuaString(self.alloc, string);
++                continue;
++            }
++            if (try self.gcPromoteYoungValue(.{ .String = string })) {
++                self.gc_young_strings.items[write] = string;
++                write += 1;
++            }
++        }
++        for (self.gc_young_strings.items[snapshot..]) |string| {
++            self.gc_young_strings.items[write] = string;
++            write += 1;
++        }
++        self.gc_young_strings.items.len = write;
++    }
++
++    fn gcSweepYoungCells(self: *Vm) DispatchError!void {
++        const snapshot = @min(self.gc_young_cells_snapshot_len, self.gc_young_cells.items.len);
++        var write: usize = 0;
++        for (self.gc_young_cells.items[0..snapshot]) |cell| {
++            const alive = self.gc_marked_cells.contains(cell) or cell.gc_age == .old0;
++            if (!alive) {
++                self.gcUnregisterCell(cell);
++                self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0);
++                self.alloc.destroy(cell);
++                continue;
++            }
++            if (try self.gcPromoteYoungCell(cell)) {
++                self.gc_young_cells.items[write] = cell;
++                write += 1;
++            }
++        }
++        for (self.gc_young_cells.items[snapshot..]) |cell| {
++            self.gc_young_cells.items[write] = cell;
++            write += 1;
++        }
++        self.gc_young_cells.items.len = write;
++    }
++
++    fn gcCorrectOld1(self: *Vm) void {
++        const snapshot = @min(self.gc_old1_snapshot_len, self.gc_old1.items.len);
++        var write: usize = 0;
++        for (self.gc_old1.items[0..snapshot]) |value| {
++            const age = gcValueAge(value) orelse continue;
++            switch (age) {
++                .old0 => {
++                    gcSetValueAge(value, .old1);
++                    self.gc_old1.items[write] = value;
++                    write += 1;
++                },
++                .old1 => gcSetValueAge(value, .old),
++                else => {},
++            }
++        }
++        for (self.gc_old1.items[snapshot..]) |value| {
++            self.gc_old1.items[write] = value;
++            write += 1;
++        }
++        self.gc_old1.items.len = write;
++
++        const cell_snapshot = @min(self.gc_old1_cells_snapshot_len, self.gc_old1_cells.items.len);
++        var cell_write: usize = 0;
++        for (self.gc_old1_cells.items[0..cell_snapshot]) |cell| {
++            switch (cell.gc_age) {
++                .old0 => {
++                    cell.gc_age = .old1;
++                    self.gc_old1_cells.items[cell_write] = cell;
++                    cell_write += 1;
++                },
++                .old1 => cell.gc_age = .old,
++                else => {},
++            }
++        }
++        for (self.gc_old1_cells.items[cell_snapshot..]) |cell| {
++            self.gc_old1_cells.items[cell_write] = cell;
++            cell_write += 1;
++        }
++        self.gc_old1_cells.items.len = cell_write;
++    }
++
++    fn gcCorrectGrayAgain(self: *Vm) void {
++        const snapshot = @min(self.gc_grayagain_snapshot_len, self.gc_grayagain.items.len);
++        var write: usize = 0;
++        for (self.gc_grayagain.items[0..snapshot]) |value| {
++            const age = gcValueAge(value) orelse continue;
++            switch (age) {
++                .touched1 => {
++                    gcSetValueAge(value, .touched2);
++                    self.gc_grayagain.items[write] = value;
++                    write += 1;
++                },
++                .touched2 => gcSetValueAge(value, .old),
++                else => {},
++            }
++        }
++        for (self.gc_grayagain.items[snapshot..]) |value| {
++            self.gc_grayagain.items[write] = value;
++            write += 1;
++        }
++        self.gc_grayagain.items.len = write;
++
++        const cell_snapshot = @min(self.gc_grayagain_cells_snapshot_len, self.gc_grayagain_cells.items.len);
++        var cell_write: usize = 0;
++        for (self.gc_grayagain_cells.items[0..cell_snapshot]) |cell| {
++            switch (cell.gc_age) {
++                .touched1 => {
++                    cell.gc_age = .touched2;
++                    self.gc_grayagain_cells.items[cell_write] = cell;
++                    cell_write += 1;
++                },
++                .touched2 => cell.gc_age = .old,
++                else => {},
++            }
++        }
++        for (self.gc_grayagain_cells.items[cell_snapshot..]) |cell| {
++            self.gc_grayagain_cells.items[cell_write] = cell;
++            cell_write += 1;
++        }
++        self.gc_grayagain_cells.items.len = cell_write;
++    }
++
++    fn gcSweepYoungGeneration(self: *Vm) DispatchError!void {
++        self.gcClearDeadFrameRegisters();
++        try self.gcSweepYoungTables();
++        try self.gcSweepYoungThreads();
++        try self.gcSweepYoungClosures();
++        try self.gcSweepYoungStrings();
++        try self.gcSweepYoungCells();
++        self.gcCorrectOld1();
++        self.gcCorrectGrayAgain();
++    }
++
++    fn gcMinorCollection(self: *Vm) DispatchError!void {
++        if (self.gc_busy) return;
++        self.gc_busy = true;
++        self.gc_minor_cycle = true;
++        defer {
++            self.gc_minor_cycle = false;
++            self.gc_busy = false;
++        }
++
++        self.gc_cycle_finalizer_epoch = self.gc_finalizer_epoch;
++        self.gc_young_tables_snapshot_len = self.gc_young_tables.items.len;
++        self.gc_young_closures_snapshot_len = self.gc_young_closures.items.len;
++        self.gc_young_threads_snapshot_len = self.gc_young_threads.items.len;
++        self.gc_young_cells_snapshot_len = self.gc_young_cells.items.len;
++        self.gc_young_strings_snapshot_len = self.gc_young_strings.items.len;
++        self.gc_old1_snapshot_len = self.gc_old1.items.len;
++        self.gc_old1_cells_snapshot_len = self.gc_old1_cells.items.len;
++        self.gc_grayagain_snapshot_len = self.gc_grayagain.items.len;
++        self.gc_grayagain_cells_snapshot_len = self.gc_grayagain_cells.items.len;
++        self.gc_gen_last_minor_visited = 0;
++        self.gc_gen_last_minor_old_visited = 0;
++        self.gcResetCycleState();
++
++        try self.gcMarkCurrentRoots();
++        for (self.gc_old1.items[0..self.gc_old1_snapshot_len]) |value| try self.gcQueueScanValue(value);
++        for (self.gc_old1_cells.items[0..self.gc_old1_cells_snapshot_len]) |cell| try self.gcQueueScanCell(cell);
++        for (self.gc_grayagain.items[0..self.gc_grayagain_snapshot_len]) |value| try self.gcQueueScanValue(value);
++        for (self.gc_grayagain_cells.items[0..self.gc_grayagain_cells_snapshot_len]) |cell| try self.gcQueueScanCell(cell);
++        for (self.gc_gen_threads.items) |thread| try self.gcQueueScanValue(.{ .Thread = thread });
++
++        try self.gcDrainGray();
++        try self.gcAtomicCommon();
++        try self.gcSweepYoungGeneration();
++
++        self.gc_finalizer_tick_pending = self.gc_finalizer_epoch != self.gc_cycle_finalizer_epoch;
++        const limit = self.gc_gen_major_base_kb * @as(f64, @floatFromInt(@max(self.gc_gen_minormajor, 0))) / 100.0;
++        if (limit > 0 and self.gc_gen_added_old_kb >= limit) {
++            self.gc_gen_phase = .major;
++            self.gc_gen_major_start_kb = self.gc_count_kb;
++            self.gc_auto_threshold_kb = self.gc_count_kb;
++        } else {
++            self.gcScheduleNextAutomaticCycle();
++        }
++    }
++
+     fn gcSweepOne(self: *Vm) DispatchError!bool {
+         while (true) {
+             if (self.gc_sweep_cursor == 0) {
+@@ -12235,7 +13004,7 @@ pub const Vm = struct {
+                         !self.gc_fin_tables.contains(table) and
+                         !self.finalizables.contains(table))
+                     {
+-                        _ = self.gc_tables.swapRemove(index);
++                        self.gcUnregisterTable(table);
+                         const bytes = @sizeOf(Table) + table.array.capacity * @sizeOf(Value) + table.hash.len * @sizeOf(ltable.Node);
+                         self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(bytes)) / 1024.0);
+                         table.deinit(self.alloc);
+@@ -12245,7 +13014,7 @@ pub const Vm = struct {
+                 .threads => {
+                     const thread = self.gc_threads.items[index];
+                     if (!self.gc_marked_threads.contains(thread) and !self.gc_fin_threads.contains(thread)) {
+-                        _ = self.gc_threads.swapRemove(index);
++                        self.gcUnregisterThread(thread);
+                         self.freeThreadWrapBuffers(thread);
+                         self.freeThreadBytecodeFrames(thread);
+                         self.freeParkedThreadRuntime(thread);
+@@ -12258,7 +13027,7 @@ pub const Vm = struct {
+                 .closures => {
+                     const closure = self.gc_closures.items[index];
+                     if (!self.gc_marked_closures.contains(closure) and !self.gc_fin_closures.contains(closure)) {
+-                        _ = self.gc_closures.swapRemove(index);
++                        self.gcUnregisterClosure(closure);
+                         self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0);
+                         self.alloc.destroy(closure);
+                     }
+@@ -12266,7 +13035,7 @@ pub const Vm = struct {
+                 .strings => {
+                     const string = self.gc_strings.items[index];
+                     if (!self.gc_marked_strings.contains(string)) {
+-                        _ = self.gc_strings.swapRemove(index);
++                        self.gcUnregisterString(string);
+                         const bytes = @sizeOf(LuaString) + string.len;
+                         self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(bytes)) / 1024.0);
+                         destroyLuaString(self.alloc, string);
+@@ -12275,7 +13044,7 @@ pub const Vm = struct {
+                 .cells => {
+                     const cell = self.gc_cells.items[index];
+                     if (!self.gc_marked_cells.contains(cell)) {
+-                        _ = self.gc_cells.swapRemove(index);
++                        self.gcUnregisterCell(cell);
+                         self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0);
+                         self.alloc.destroy(cell);
+                     }
+@@ -12286,13 +13055,25 @@ pub const Vm = struct {
+         }
+     }
+ 
+-    fn gcFinishCycle(self: *Vm) void {
++    fn gcFinishCycle(self: *Vm) DispatchError!void {
+         self.gc_state = .pause;
+         self.gc_sweep_kind = .tables;
+         self.gc_sweep_cursor = 0;
+         self.gc_gray.clearRetainingCapacity();
+-        self.gcScheduleNextAutomaticCycle();
+         self.gc_finalizer_tick_pending = self.gc_finalizer_epoch != self.gc_cycle_finalizer_epoch;
++
++        if (self.gc_mode == .generational and self.gc_gen_phase == .major) {
++            const added = @max(0.0, self.gc_gen_major_start_kb - self.gc_gen_major_base_kb);
++            const reclaimed = @max(0.0, self.gc_gen_major_start_kb - self.gc_count_kb);
++            const limit = added * @as(f64, @floatFromInt(@max(self.gc_gen_majorminor, 0))) / 100.0;
++            if (reclaimed > limit) {
++                try self.gcMakeAllOld();
++                return;
++            }
++            self.gc_gen_major_base_kb = self.gc_count_kb;
++            self.gc_gen_major_start_kb = self.gc_count_kb;
++        }
++        self.gcScheduleNextAutomaticCycle();
+     }
+ 
+     /// Mark all GC roots that live directly on the Vm struct and are NOT
+@@ -12562,6 +13343,7 @@ pub const Vm = struct {
+     /// Queue a value for incremental propagation. Strings have no outgoing
+     /// edges, so they can be marked immediately without consuming a gray slot.
+     fn gcMarkValue(self: *Vm, v: Value) DispatchError!void {
++        if (self.gc_minor_cycle) return self.gcMarkMinorValue(v);
+         switch (v) {
+             .String => |str| {
+                 if (!self.gc_marked_strings.contains(str)) {
+@@ -12591,6 +13373,12 @@ pub const Vm = struct {
+     /// persistent gray list and will be processed by later work units.
+     fn gcPropagateOne(self: *Vm) DispatchError!bool {
+         const cur = self.gc_gray.pop() orelse return false;
++        if (self.gc_minor_cycle) {
++            self.gc_gen_last_minor_visited += 1;
++            if (gcValueAge(cur)) |age| {
++                if (age.isOld()) self.gc_gen_last_minor_old_visited += 1;
++            }
++        }
+         switch (cur) {
+             .Table => |tbl| {
+                 if (tbl.metatable) |mt| try self.gcMarkValue(.{ .Table = mt });
+@@ -12972,9 +13760,9 @@ pub const Vm = struct {
+                 for (tbl.hash) |*node| {
+                     if (node.key == .Nil or node.value == .Nil) continue;
+                     const key_marked = switch (node.key) {
+-                        .Table => |table| marked_tables.contains(table),
+-                        .Closure => |closure| marked_closures.contains(closure),
+-                        .Thread => |thread| marked_threads.contains(thread),
++                        .Table => |table| (self.gc_minor_cycle and !gcMinorCandidate(table.gc_age)) or marked_tables.contains(table),
++                        .Closure => |closure| (self.gc_minor_cycle and !gcMinorCandidate(closure.gc_age)) or marked_closures.contains(closure),
++                        .Thread => |thread| (self.gc_minor_cycle and !gcMinorCandidate(thread.gc_age)) or marked_threads.contains(thread),
+                         else => true,
+                     };
+                     if (key_marked) try self.gcMarkValue(node.value);
+@@ -12995,19 +13783,22 @@ pub const Vm = struct {
+         marked_closures: *const std.AutoHashMapUnmanaged(*Closure, void),
+         marked_threads: *const std.AutoHashMapUnmanaged(*Thread, void),
+     ) DispatchError!void {
++        _ = marked_tables;
++        _ = marked_closures;
++        _ = marked_threads;
+         for (weak_tbls) |tbl| {
+             const mode = self.gcWeakMode(tbl);
+             if (!mode.weak_v) continue;
+ 
+             // Array values: clear entries whose value became dead.
+             for (tbl.array.items, 0..) |v, i| {
+-                if (v == .Table and !marked_tables.contains(v.Table)) {
++                if (v == .Table and self.gcTableDead(v.Table)) {
+                     tbl.array.items[i] = .Nil;
+                 }
+-                if (v == .Closure and !marked_closures.contains(v.Closure)) {
++                if (v == .Closure and self.gcClosureDead(v.Closure)) {
+                     tbl.array.items[i] = .Nil;
+                 }
+-                if (v == .Thread and !marked_threads.contains(v.Thread)) {
++                if (v == .Thread and self.gcThreadDead(v.Thread)) {
+                     tbl.array.items[i] = .Nil;
+                 }
+             }
+@@ -13020,9 +13811,9 @@ pub const Vm = struct {
+                 if (node.value == .Nil) continue;
+                 const v = node.value;
+                 const drop = switch (v) {
+-                    .Table => |t| !marked_tables.contains(t),
+-                    .Closure => |cl| !marked_closures.contains(cl),
+-                    .Thread => |th| !marked_threads.contains(th),
++                    .Table => |t| self.gcTableDead(t),
++                    .Closure => |cl| self.gcClosureDead(cl),
++                    .Thread => |th| self.gcThreadDead(th),
+                     else => false,
+                 };
+                 if (drop) node.value = .Nil;
+@@ -13040,6 +13831,9 @@ pub const Vm = struct {
+         fin_closures: *const std.AutoHashMapUnmanaged(*Closure, void),
+         fin_threads: *const std.AutoHashMapUnmanaged(*Thread, void),
+     ) DispatchError!void {
++        _ = marked_tables;
++        _ = marked_closures;
++        _ = marked_threads;
+         for (weak_tbls) |tbl| {
+             const mode = self.gcWeakMode(tbl);
+             if (!mode.weak_k) continue;
+@@ -13051,9 +13845,9 @@ pub const Vm = struct {
+                 // Drop entries whose collectable key is no longer reachable
+                 // (not in the marked set AND not pending finalization).
+                 const drop = switch (k) {
+-                    .Table => |t| !marked_tables.contains(t) and !fin_tables.contains(t),
+-                    .Closure => |cl| !marked_closures.contains(cl) and !fin_closures.contains(cl),
+-                    .Thread => |th| !marked_threads.contains(th) and !fin_threads.contains(th),
++                    .Table => |t| self.gcTableDead(t) and !fin_tables.contains(t),
++                    .Closure => |cl| self.gcClosureDead(cl) and !fin_closures.contains(cl),
++                    .Thread => |th| self.gcThreadDead(th) and !fin_threads.contains(th),
+                     else => false,
+                 };
+                 if (drop) node.value = .Nil;
+@@ -13069,6 +13863,7 @@ pub const Vm = struct {
+         var it = self.finalizables.iterator();
+         while (it.next()) |entry| {
+             const obj = entry.key_ptr.*;
++            if (self.gc_minor_cycle and !gcMinorCandidate(obj.gc_age)) continue;
+             if (!marked_tables.contains(obj)) {
+                 try to_finalize.append(self.alloc, obj);
+             }
+@@ -13099,6 +13894,7 @@ pub const Vm = struct {
+             .Table => |t| try self.gcMarkTableFinalizerReach(t, fin_tables, fin_closures, fin_threads),
+             .Closure => |cl| try self.gcMarkClosureFinalizerReach(cl, fin_tables, fin_closures, fin_threads),
+             .Thread => |th| try self.gcMarkThreadFinalizerReach(th, fin_tables, fin_closures, fin_threads),
++            .String => |str| if (!self.gc_marked_strings.contains(str)) try self.gc_marked_strings.put(self.alloc, str, {}),
+             else => {},
+         }
+     }
+@@ -13113,6 +13909,7 @@ pub const Vm = struct {
+         if (fin_closures.contains(cl)) return;
+         try fin_closures.put(self.alloc, cl, {});
+         for (cl.upvalues) |cell| {
++            if (!self.gc_marked_cells.contains(cell)) try self.gc_marked_cells.put(self.alloc, cell, {});
+             try self.gcMarkValueFinalizerReach(cell.value, fin_tables, fin_closures, fin_threads);
+         }
+     }
+@@ -13266,7 +14063,7 @@ pub const Vm = struct {
+         for (cells) |*slot| {
+             const cell = try self.alloc.create(Cell);
+             cell.* = .{ .value = .Nil };
+-            try self.gc_cells.append(self.alloc, cell);
++            try self.gcRegisterCell(cell);
+             self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
+             slot.* = cell;
+         }
+@@ -13277,7 +14074,7 @@ pub const Vm = struct {
+             .proto = proto,
+             .upvalues = cells,
+         };
+-        try self.gc_closures.append(self.alloc, cl);
++        try self.gcRegisterClosure(cl);
+         self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
+         self.testc_obj_functions += 1;
+         return cl;
+@@ -13317,7 +14114,7 @@ pub const Vm = struct {
+         try self.testcChargeMemory(@sizeOf(Closure) + 64);
+         const cl = try self.alloc.create(Closure);
+         cl.* = .{ .func = main_fn, .upvalues = &.{} };
+-        try self.gc_closures.append(self.alloc, cl);
++        try self.gcRegisterClosure(cl);
+         self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
+         self.testc_obj_functions += 1;
+         return .{ .closure = cl };
+@@ -13446,7 +14243,7 @@ pub const Vm = struct {
+                 .proto = stripped_proto,
+                 .upvalues = cl.upvalues,
+             };
+-            try self.gc_closures.append(self.alloc, dumped);
++            try self.gcRegisterClosure(dumped);
+             self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
+             self.testc_obj_functions += 1;
+             break :blk dumped;
+@@ -13574,7 +14371,7 @@ pub const Vm = struct {
+     fn applyLoadEnv(self: *Vm, cl: *Closure, env_val: Value, force_first_on_missing: bool) DispatchError!void {
+         const num_upvalues: usize = if (cl.proto) |proto| proto.upvalues.len else cl.func.num_upvalues;
+         if (num_upvalues == 0) {
+-            if (force_first_on_missing) cl.env_override = env_val;
++            if (force_first_on_missing) try self.gcStoreClosureEnv(cl, env_val);
+             return;
+         }
+         if (cl.upvalues.len < num_upvalues) {
+@@ -13583,7 +14380,7 @@ pub const Vm = struct {
+             while (i < num_upvalues) : (i += 1) {
+                 const c = try self.alloc.create(Cell);
+                 c.* = .{ .value = .Nil };
+-                try self.gc_cells.append(self.alloc, c);
++                try self.gcRegisterCell(c);
+                 self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
+                 cells[i] = c;
+             }
+@@ -13667,7 +14464,7 @@ pub const Vm = struct {
+         while (i < nups) : (i += 1) {
+             const c = try self.alloc.create(Cell);
+             c.* = .{ .value = .Nil };
+-            try self.gc_cells.append(self.alloc, c);
++            try self.gcRegisterCell(c);
+             self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
+             cells[i] = c;
+         }
+@@ -13678,7 +14475,7 @@ pub const Vm = struct {
+             .env_override = null,
+             .synthetic_env_slot = false,
+         };
+-        try self.gc_closures.append(self.alloc, cl);
++        try self.gcRegisterClosure(cl);
+         self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
+         return cl;
+     }
+@@ -14315,7 +15112,7 @@ pub const Vm = struct {
+         }
+         switch (args[1]) {
+             .Nil => {
+-                tbl.metatable = null;
++                try self.gcStoreMetatable(tbl, null);
+                 _ = self.finalizables.remove(tbl);
+             },
+             .Table => |mt| {
+@@ -16088,6 +16885,7 @@ pub const Vm = struct {
+         const idx2: usize = @intCast(n2 - 1);
+         if (idx1 >= f1.upvalues.len or idx2 >= f2.upvalues.len) return self.fail("invalid upvalue index", .{});
+         @constCast(f1.upvalues)[idx1] = f2.upvalues[idx2];
++        try self.gcForwardBarrierCell(f1, f2.upvalues[idx2]);
+     }
+ 
+     fn debugDispatchHook(self: *Vm, event: []const u8, line: ?i64) DispatchError!void {
+@@ -16838,8 +17636,7 @@ pub const Vm = struct {
+     // hash entry (PUC: don't insert nils) but leaves array entries in place as
+     // holes (PUC: array compaction is the rehash path's job).
+     fn rawSet(self: *Vm, tbl: *Table, key: Value, val: Value) DispatchError!void {
+-        try self.gcWriteBarrier(key);
+-        try self.gcWriteBarrier(val);
++        try self.gcTableWriteBarrier(tbl, key, val);
+         switch (key) {
+             .Nil => return self.fail("table key cannot be nil", .{}),
+             .Num => |n| {
+@@ -23885,7 +24682,7 @@ pub const Vm = struct {
+                     }
+                     const cell = try self.alloc.create(Cell);
+                     cell.* = .{ .value = locals[idx] };
+-                    try self.gc_cells.append(self.alloc, cell);
++                    try self.gcRegisterCell(cell);
+                     self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
+                     boxed[idx] = cell;
+                     if (allow_frame_capture_reuse) {
+@@ -23904,7 +24701,7 @@ pub const Vm = struct {
+         try self.testcChargeMemory(@sizeOf(Closure) + 64);
+         const cl = try self.alloc.create(Closure);
+         cl.* = .{ .func = func, .upvalues = cells };
+-        try self.gc_closures.append(self.alloc, cl);
++        try self.gcRegisterClosure(cl);
+         self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
+         self.testc_obj_functions += 1;
+         if (functionUsesGlobalNames(func) and !functionHasNamedEnvUpvalue(func)) {
+@@ -24044,7 +24841,7 @@ pub const Vm = struct {
+             .callee = .Nil,
+             .testc_state_main = true,
+         };
+-        try self.gc_threads.append(self.alloc, th);
++        try self.gcRegisterThread(th);
+         self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
+         try self.setField(state, "_mainthread", .{ .Thread = th });
+         return th;
+@@ -24317,6 +25114,101 @@ pub const Vm = struct {
+         }
+     }
+ 
++    fn gcAgeName(age: GcAge) []const u8 {
++        return switch (age) {
++            .new => "new",
++            .survival => "survival",
++            .old0 => "old0",
++            .old1 => "old1",
++            .old => "old",
++            .touched1 => "touched1",
++            .touched2 => "touched2",
++        };
++    }
++
++    fn builtinTestcGcage(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
++        if (outs.len == 0) return;
++        if (args.len == 0) return self.fail("T.gcage expects an object", .{});
++        const age = gcValueAge(args[0]) orelse return self.fail("T.gcage expects a collectable object", .{});
++        outs[0] = .{ .String = try self.internStr(gcAgeName(age)) };
++        self.last_builtin_out_count = 1;
++    }
++
++    fn builtinTestcGccolor(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
++        if (outs.len == 0) return;
++        if (args.len == 0) return self.fail("T.gccolor expects an object", .{});
++        const age = gcValueAge(args[0]) orelse return self.fail("T.gccolor expects a collectable object", .{});
++        const color: []const u8 = switch (age) {
++            // PUC's backward barrier turns the owner gray immediately.
++            .touched1 => "gray",
++            // Minor sweep returns young objects to white. All other old
++            // objects are black between young collections.
++            .new, .survival => "white",
++            .old0, .old1, .old, .touched2 => "black",
++        };
++        outs[0] = .{ .String = try self.internStr(color) };
++        self.last_builtin_out_count = 1;
++    }
++
++    fn gcCodeParam(percent: u64) u8 {
++        const max_percent: u64 = (@as(u64, 0x1f) << (0x0f - 7 - 1)) * 100;
++        if (percent >= max_percent) return 0xff;
++
++        var scaled = (percent * 128 + 99) / 100;
++        if (scaled < 0x10) return @intCast(scaled);
++
++        // ceil(log2(scaled + 1)) is the bit length of `scaled`.
++        var x = scaled;
++        var ceil_log2: u6 = 0;
++        while (x != 0) : (x >>= 1) ceil_log2 += 1;
++        const shift: u6 = ceil_log2 - 5;
++        scaled = ((scaled >> shift) - 0x10) | (@as(u64, shift + 1) << 4);
++        return @intCast(scaled);
++    }
++
++    fn gcApplyParam(encoded: u8, value: u64) u64 {
++        var mantissa: u64 = encoded & 0x0f;
++        var exponent: i8 = @intCast(encoded >> 4);
++        if (exponent > 0) {
++            exponent -= 1;
++            mantissa += 0x10;
++        }
++        exponent -= 7;
++
++        if (exponent >= 0) {
++            const shift: u6 = @intCast(exponent);
++            const max_before_mul: u64 = std.math.maxInt(u64) / 0x1f;
++            if (value < (max_before_mul >> shift)) return (value * mantissa) << shift;
++            return std.math.maxInt(u64);
++        }
++
++        const shift: u6 = @intCast(-exponent);
++        const max_before_mul: u64 = std.math.maxInt(u64) / 0x1f;
++        if (value < max_before_mul) return (value * mantissa) >> shift;
++        if ((value >> shift) < max_before_mul) return (value >> shift) * mantissa;
++        return std.math.maxInt(u64);
++    }
++
++    fn builtinTestcCodeparam(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
++        if (outs.len == 0) return;
++        if (args.len == 0 or args[0] != .Int or args[0].Int < 0)
++            return self.fail("T.codeparam expects a non-negative integer", .{});
++        outs[0] = .{ .Int = gcCodeParam(@intCast(args[0].Int)) };
++        self.last_builtin_out_count = 1;
++    }
++
++    fn builtinTestcApplyparam(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
++        if (outs.len == 0) return;
++        if (args.len < 2 or args[0] != .Int or args[1] != .Int or
++            args[0].Int < 0 or args[0].Int > 255 or args[1].Int < 0)
++        {
++            return self.fail("T.applyparam expects encoded byte and non-negative integer", .{});
++        }
++        const applied = gcApplyParam(@intCast(args[0].Int), @intCast(args[1].Int));
++        outs[0] = .{ .Int = @intCast(@min(applied, @as(u64, std.math.maxInt(i64)))) };
++        self.last_builtin_out_count = 1;
++    }
++
+     fn resumePendingTestcContinuation(self: *Vm, th: *Thread, raw_args: []const Value, outs: []Value) DispatchError!void {
+         if (th.testc_pending_conts.items.len == 0) return;
+         const pending = th.testc_pending_conts.orderedRemove(0);
+@@ -27809,3 +28701,89 @@ test "vm: incremental GC advances real phases and preserves barrier writes" {
+     try testing.expect(vm.rawGet(holder, .{ .String = try vm.internStr("value") }) == .Table);
+     try testing.expect(vm.rawGet(holder, .{ .String = try vm.internStr("value") }).Table == target);
+ }
++
++test "vm: generational GC ages barriers and nursery scope match PUC" {
++    const testing = std.testing;
++
++    var vm = Vm.init(testing.allocator);
++    defer vm.deinit();
++
++    // Build and root a sizeable old heap before entering generational mode.
++    // A minor collection must not traverse every table in this graph.
++    const old_heap = try vm.allocTableNoGc();
++    const holder = try vm.allocTableNoGc();
++    try vm.rawSet(vm.global_env, .{ .String = try vm.internStr("gen-old-heap") }, .{ .Table = old_heap });
++    try vm.rawSet(vm.global_env, .{ .String = try vm.internStr("gen-holder") }, .{ .Table = holder });
++    var i: usize = 0;
++    while (i < 512) : (i += 1) {
++        const old_entry = try vm.allocTableNoGc();
++        try vm.rawSet(old_heap, .{ .Int = @intCast(i + 1) }, .{ .Table = old_entry });
++    }
++
++    try vm.gcEnterGenerational();
++    try testing.expectEqual(GcAge.old, holder.gc_age);
++    try testing.expectEqual(GcAge.old, old_heap.gc_age);
++
++    const child = try vm.allocTableNoGc();
++    const grandchild = try vm.allocTableNoGc();
++    try vm.rawSet(child, .{ .String = try vm.internStr("nested") }, .{ .Table = grandchild });
++    try vm.rawSet(holder, .{ .String = try vm.internStr("child") }, .{ .Table = child });
++
++    try testing.expectEqual(GcAge.touched1, holder.gc_age);
++    try testing.expectEqual(GcAge.new, child.gc_age);
++    try testing.expectEqual(GcAge.new, grandchild.gc_age);
++
++    try vm.gcMinorCollection();
++    try testing.expectEqual(GcAge.touched2, holder.gc_age);
++    try testing.expectEqual(GcAge.survival, child.gc_age);
++    try testing.expectEqual(GcAge.survival, grandchild.gc_age);
++    // Old threads and the remembered holder are visited, but the 512-table
++    // old graph itself is outside the nursery/remembered sets.
++    try testing.expect(vm.gc_gen_last_minor_old_visited < 32);
++
++    try vm.gcMinorCollection();
++    try testing.expectEqual(GcAge.old, holder.gc_age);
++    try testing.expectEqual(GcAge.old1, child.gc_age);
++    try testing.expectEqual(GcAge.old1, grandchild.gc_age);
++
++    try vm.gcMinorCollection();
++    try testing.expectEqual(GcAge.old, child.gc_age);
++    try testing.expectEqual(GcAge.old, grandchild.gc_age);
++    const kept = vm.rawGet(holder, .{ .String = try vm.internStr("child") });
++    try testing.expect(kept == .Table and kept.Table == child);
++}
++
++test "vm: generational GC enters and leaves incremental major mode" {
++    const testing = std.testing;
++
++    var vm = Vm.init(testing.allocator);
++    defer vm.deinit();
++
++    const root = try vm.allocTableNoGc();
++    try vm.rawSet(vm.global_env, .{ .String = try vm.internStr("gen-major-root") }, .{ .Table = root });
++    try vm.gcEnterGenerational();
++    vm.gc_gen_minormajor = 1;
++
++    var i: usize = 0;
++    while (i < 256) : (i += 1) {
++        const child = try vm.allocTableNoGc();
++        try vm.rawSet(root, .{ .Int = @intCast(i + 1) }, .{ .Table = child });
++    }
++
++    try vm.gcMinorCollection(); // NEW -> SURVIVAL
++    try testing.expectEqual(Vm.GcGenPhase.minor, vm.gc_gen_phase);
++    try vm.gcMinorCollection(); // SURVIVAL -> OLD1; cross minormajor
++    try testing.expectEqual(Vm.GcGenPhase.major, vm.gc_gen_phase);
++
++    // Make enough of the newly-old graph unreachable that the first major
++    // cycle should return to minor mode under a zero majorminor threshold.
++    i = 0;
++    while (i < 256) : (i += 1) {
++        try vm.rawSet(root, .{ .Int = @intCast(i + 1) }, .Nil);
++    }
++    vm.gc_gen_majorminor = 0;
++    try vm.gcCycleFull();
++    try testing.expectEqual(Vm.GcGenPhase.minor, vm.gc_gen_phase);
++    try testing.expectEqual(@as(usize, 0), vm.gc_young_tables.items.len);
++    try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
++}
+diff --git a/tests/smoke/43_generational_minor.lua b/tests/smoke/43_generational_minor.lua
+new file mode 100644
+index 0000000..f31737f
+--- /dev/null
++++ b/tests/smoke/43_generational_minor.lua
+@@ -0,0 +1,28 @@
++local oldmode = collectgarbage("generational")
++
++local anchor = {}
++collectgarbage() -- make anchor old
++anchor.child = { nested = { 234 } }
++collectgarbage("step")
++assert(anchor.child.nested[1] == 234)
++collectgarbage("step")
++assert(anchor.child.nested[1] == 234)
++
++local weak = setmetatable({}, { __mode = "v" })
++collectgarbage() -- make weak table old
++weak.child = { 99 }
++collectgarbage("step")
++assert(weak.child == nil)
++
++local old_minor = collectgarbage("param", "minormul")
++local old_switch = collectgarbage("param", "minormajor")
++local old_return = collectgarbage("param", "majorminor")
++assert(type(old_minor) == "number")
++assert(type(old_switch) == "number")
++assert(type(old_return) == "number")
++collectgarbage("param", "minormul", old_minor)
++collectgarbage("param", "minormajor", old_switch)
++collectgarbage("param", "majorminor", old_return)
++
++collectgarbage(oldmode)
++print("generational-minor-ok")

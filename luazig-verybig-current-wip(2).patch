@@ -1,0 +1,337 @@
+diff --git a/src/bin/luazig.zig b/src/bin/luazig.zig
+index 998aa32..8fbeb83 100644
+--- a/src/bin/luazig.zig
++++ b/src/bin/luazig.zig
+@@ -296,7 +296,7 @@ fn interpreterMain(init: std.process.Init) !void {
+ 
+     const script_args = rest[k..];
+ 
+-    var vm = lua.internal.vm.Vm.init(aalloc);
++    var vm = lua.internal.vm.Vm.init(alloc);
+     defer vm.deinit();
+     try vm.setArgTable(argv0, script_path, script_args);
+     if (enable_testc) try vm.enableTestcModule();
+diff --git a/src/lua/codegen_bc.zig b/src/lua/codegen_bc.zig
+index 91e416f..4973202 100644
+--- a/src/lua/codegen_bc.zig
++++ b/src/lua/codegen_bc.zig
+@@ -177,6 +177,15 @@ pub const Codegen = struct {
+         };
+     }
+ 
++    fn setDiagAssignConst(self: *Codegen, span: ast.Span, name: []const u8) void {
++        const msg = std.fmt.allocPrint(
++            self.alloc,
++            ":{d}: attempt to assign to const variable '{s}'",
++            .{ span.line, name },
++        ) catch "attempt to assign to const variable";
++        self.setDiag(span, msg);
++    }
++
+     // -----------------------------------------------------------------------
+     // Register allocation (freereg model — like PUC Lua)
+     // -----------------------------------------------------------------------
+@@ -534,6 +543,8 @@ pub const Codegen = struct {
+ 
+     fn markCloseLocal(self: *Codegen, reg: u8) void {
+         self.close_locals.put(self.alloc, reg, {}) catch @panic("oom");
++        // Lua 5.4+ treats <close> variables as read-only after initialization.
++        self.markReadonlyLocal(reg);
+     }
+ 
+     fn isConstLocal(self: *Codegen, reg: u8) bool {
+@@ -982,7 +993,7 @@ pub const Codegen = struct {
+         }
+         if (self.lookupLocal(name)) |reg| {
+             if (self.isReadonlyLocal(reg)) {
+-                self.setDiag(span, "cannot assign to const local");
++                self.setDiagAssignConst(span, name);
+                 return error.CodegenError;
+             }
+             _ = try self.builder.emitABC(.move, reg, val_reg, 0, span.line);
+@@ -990,7 +1001,7 @@ pub const Codegen = struct {
+         }
+         if (self.upvalues.get(name)) |idx| {
+             if (self.isConstUpvalue(idx)) {
+-                self.setDiag(span, "cannot assign to const upvalue");
++                self.setDiagAssignConst(span, name);
+                 return error.CodegenError;
+             }
+             _ = try self.builder.emitABC(.setupval, val_reg, idx, 0, span.line);
+@@ -1521,6 +1532,18 @@ pub const Codegen = struct {
+     // Table constructors
+     // -----------------------------------------------------------------------
+ 
++    fn emitSetList(self: *Codegen, table_reg: u8, count: u8, base: u32, line: u32) Error!void {
++        if (base <= std.math.maxInt(u8)) {
++            _ = try self.builder.emitABC(.setlist, table_reg, count, @intCast(base), line);
++            return;
++        }
++
++        // C=0 is the escape form when SETLIST's array offset does not fit in
++        // the instruction. The following EXTRAARG carries the full 24-bit base.
++        _ = try self.builder.emitABC(.setlist, table_reg, count, 0, line);
++        _ = try self.builder.emit(Instruction.extra(base), line);
++    }
++
+     fn genTable(self: *Codegen, n: anytype, line: u32) Error!u8 {
+         const dst = try self.allocReg();
+         _ = try self.builder.emitABC(.newtable, dst, 0, 0, line);
+@@ -1538,7 +1561,7 @@ pub const Codegen = struct {
+                             .Call, .MethodCall => {
+                                 // Multi-value: compile call with set top, then SETLIST with B=0.
+                                 _ = try self.genCallMulti(val_e, line);
+-                                _ = try self.builder.emitABC(.setlist, dst, 0, @intCast(flush_base), line);
++                                try self.emitSetList(dst, 0, flush_base, line);
+                                 self.freereg = dst + 1;
+                                 array_count = 0;
+                                 continue;
+@@ -1550,7 +1573,7 @@ pub const Codegen = struct {
+                                 }
+                                 const va_reg = try self.allocReg();
+                                 _ = try self.builder.emitABC(.vararg, va_reg, 0, 0, val_e.span.line);
+-                                _ = try self.builder.emitABC(.setlist, dst, 0, @intCast(flush_base), line);
++                                try self.emitSetList(dst, 0, flush_base, line);
+                                 self.freereg = dst + 1;
+                                 array_count = 0;
+                                 continue;
+@@ -1562,7 +1585,7 @@ pub const Codegen = struct {
+                     array_count += 1;
+                     // Flush if we have enough values (PUC flushes at ~50).
+                     if (array_count >= 50) {
+-                        _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base), line);
++                        try self.emitSetList(dst, @intCast(array_count), flush_base, line);
+                         self.freereg = dst + 1;
+                         flush_base += array_count;
+                         array_count = 0;
+@@ -1571,7 +1594,7 @@ pub const Codegen = struct {
+                 .Name => |nv| {
+                     // Flush pending array values first.
+                     if (array_count > 0) {
+-                        _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base), line);
++                        try self.emitSetList(dst, @intCast(array_count), flush_base, line);
+                         self.freereg = dst + 1;
+                         flush_base += array_count;
+                         array_count = 0;
+@@ -1590,7 +1613,7 @@ pub const Codegen = struct {
+                 },
+                 .Index => |kv| {
+                     if (array_count > 0) {
+-                        _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base), line);
++                        try self.emitSetList(dst, @intCast(array_count), flush_base, line);
+                         self.freereg = dst + 1;
+                         flush_base += array_count;
+                         array_count = 0;
+@@ -1605,7 +1628,7 @@ pub const Codegen = struct {
+ 
+         // Flush remaining array values.
+         if (array_count > 0) {
+-            _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base), line);
++            try self.emitSetList(dst, @intCast(array_count), flush_base, line);
+             self.freereg = dst + 1;
+         }
+ 
+@@ -2333,7 +2356,7 @@ pub const Codegen = struct {
+                 }
+                 if (self.lookupLocal(name)) |reg| {
+                     if (self.isReadonlyLocal(reg)) {
+-                        self.setDiag(lhs.span, "cannot assign to const local");
++                        self.setDiagAssignConst(lhs.span, name);
+                         return error.CodegenError;
+                     }
+                     _ = try self.builder.emitABC(.move, reg, val_reg, 0, line);
+@@ -2341,7 +2364,7 @@ pub const Codegen = struct {
+                 }
+                 if (self.upvalues.get(name)) |idx| {
+                     if (self.isConstUpvalue(idx)) {
+-                        self.setDiag(lhs.span, "cannot assign to const upvalue");
++                        self.setDiagAssignConst(lhs.span, name);
+                         return error.CodegenError;
+                     }
+                     _ = try self.builder.emitABC(.setupval, val_reg, idx, 0, line);
+diff --git a/src/lua/vm.zig b/src/lua/vm.zig
+index 714dac5..58aa165 100644
+--- a/src/lua/vm.zig
++++ b/src/lua/vm.zig
+@@ -5,6 +5,7 @@ const LuaLexer = @import("lexer.zig").Lexer;
+ const LuaParser = @import("parser.zig").Parser;
+ const lua_ast = @import("ast.zig");
+ const lua_codegen = @import("codegen.zig");
++const lua_codegen_bc = @import("codegen_bc.zig");
+ const testc = @import("testc.zig");
+ const ir = @import("ir.zig");
+ const bc = @import("bytecode.zig");
+@@ -8196,7 +8197,14 @@ pub const Vm = struct {
+                         // C is the base index (0 means elements start at 1).
+                         const table_val = regs[a];
+                         const count: usize = if (b == 0) reg_top - a - 1 else b;
+-                        const base_idx: u32 = c;
++                        var base_idx: u32 = c;
++                        if (c == 0 and pc + 1 < cur_proto.code.len) {
++                            const next = cur_proto.code[pc + 1];
++                            if (@as(bc.Op, @enumFromInt(next.op)) == .extraarg) {
++                                base_idx = next.extraArg();
++                                pc += 1;
++                            }
++                        }
+ 
+                         if (table_val == .Table) {
+                             for (0..count) |i| {
+@@ -12909,17 +12917,17 @@ pub const Vm = struct {
+             defer ast_arena.deinit();
+             const chunk = p.parseChunkAst(&ast_arena) catch return self.fail("{s}", .{p.diagString()});
+ 
+-            var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
+-            const main_fn = cg.compileChunk(chunk) catch return self.fail("{s}", .{cg.diagString()});
++            var cg_bc = lua_codegen_bc.Codegen.init(self.alloc, source.name, source.bytes);
++            const proto = cg_bc.compileChunk(chunk) catch return self.fail("{s}", .{cg_bc.diagString()});
+ 
+             try self.testcChargeMemory(@sizeOf(Closure) + 64);
+             const cl = try self.alloc.create(Closure);
+-            cl.* = .{ .func = main_fn, .upvalues = &.{} };
++            cl.* = .{ .func = &bc_dummy_func, .proto = proto, .upvalues = &.{} };
+             try self.gc_closures.append(self.alloc, cl);
+             self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
+             self.testc_obj_functions += 1;
+             try self.applyLoadEnv(cl, .{ .Table = self.global_env }, false);
+-            cl.synthetic_env_slot = (functionUsesGlobalNames(main_fn) and !functionHasNamedEnvUpvalue(main_fn));
++            cl.synthetic_env_slot = false;
+             if (self.current_thread) |th| {
+                 if (th.callee == .Builtin and th.callee.Builtin == .dofile) {
+                     th.dofile_entry_closure = cl;
+@@ -13127,14 +13135,15 @@ pub const Vm = struct {
+     }
+ 
+     fn applyLoadEnv(self: *Vm, cl: *Closure, env_val: Value, force_first_on_missing: bool) DispatchError!void {
+-        if (cl.func.num_upvalues == 0) {
++        const num_upvalues: usize = if (cl.proto) |proto| proto.upvalues.len else cl.func.num_upvalues;
++        if (num_upvalues == 0) {
+             if (force_first_on_missing) cl.env_override = env_val;
+             return;
+         }
+-        if (cl.upvalues.len < cl.func.num_upvalues) {
+-            const cells = try self.alloc.alloc(*Cell, cl.func.num_upvalues);
++        if (cl.upvalues.len < num_upvalues) {
++            const cells = try self.alloc.alloc(*Cell, num_upvalues);
+             var i: usize = 0;
+-            while (i < cl.func.num_upvalues) : (i += 1) {
++            while (i < num_upvalues) : (i += 1) {
+                 const c = try self.alloc.create(Cell);
+                 c.* = .{ .value = .Nil };
+                 try self.gc_cells.append(self.alloc, c);
+@@ -13144,11 +13153,21 @@ pub const Vm = struct {
+             cl.upvalues = cells;
+         }
+         var i: usize = 0;
+-        while (i < cl.func.upvalue_names.len and i < cl.upvalues.len) : (i += 1) {
+-            if (std.mem.eql(u8, cl.func.upvalue_names[i], "_ENV")) {
+-                cl.upvalues[i].value = env_val;
+-                cl.env_override = env_val;
+-                return;
++        if (cl.proto) |proto| {
++            while (i < proto.upvalues.len and i < cl.upvalues.len) : (i += 1) {
++                if (std.mem.eql(u8, proto.upvalues[i].name, "_ENV")) {
++                    cl.upvalues[i].value = env_val;
++                    cl.env_override = env_val;
++                    return;
++                }
++            }
++        } else {
++            while (i < cl.func.upvalue_names.len and i < cl.upvalues.len) : (i += 1) {
++                if (std.mem.eql(u8, cl.func.upvalue_names[i], "_ENV")) {
++                    cl.upvalues[i].value = env_val;
++                    cl.env_override = env_val;
++                    return;
++                }
+             }
+         }
+         if (force_first_on_missing) {
+@@ -13666,23 +13685,22 @@ pub const Vm = struct {
+             return;
+         };
+ 
+-        var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
+-        cg.chunk_is_vararg = std.mem.indexOf(u8, chunk_bytes, "...") != null;
+-        const main_fn = cg.compileChunk(chunk) catch {
++        var cg_bc = lua_codegen_bc.Codegen.init(self.alloc, source.name, source.bytes);
++        const proto = cg_bc.compileChunk(chunk) catch {
+             outs[0] = .Nil;
+-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(cg.diagString()) };
++            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(cg_bc.diagString()) };
+             return;
+         };
+ 
+         try self.testcChargeMemory(@sizeOf(Closure) + 64);
+         const cl = try self.alloc.create(Closure);
+-        cl.* = .{ .func = main_fn, .upvalues = &[_]*Cell{} };
++        cl.* = .{ .func = &bc_dummy_func, .proto = proto, .upvalues = &[_]*Cell{} };
+         try self.gc_closures.append(self.alloc, cl);
+         self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
+         self.testc_obj_functions += 1;
+         const explicit_env = args.len >= 4;
+         try self.applyLoadEnv(cl, self.defaultLoadEnv(args), explicit_env);
+-        cl.synthetic_env_slot = (functionUsesGlobalNames(main_fn) and !functionHasNamedEnvUpvalue(main_fn));
++        cl.synthetic_env_slot = false;
+         outs[0] = .{ .Closure = cl };
+         if (outs.len > 1) outs[1] = .Nil;
+     }
+@@ -16496,7 +16514,20 @@ pub const Vm = struct {
+                 .String, .Int, .Num => {},
+                 else => return self.fail("bad argument #{d} to '{s}' (string expected, got {s})", .{ argn, if (to_stderr) "io.stderr:write" else "io.write", self.valueTypeName(args[i]) }),
+             }
+-            const s = try self.valueToStringAlloc(args[i]);
++            var owned: ?[]const u8 = null;
++            const s: []const u8 = switch (args[i]) {
++                .String => |str| str.bytes(),
++                .Int => |value| blk: {
++                    owned = try std.fmt.allocPrint(self.alloc, "{d}", .{value});
++                    break :blk owned.?;
++                },
++                .Num => |value| blk: {
++                    owned = try self.numberToStringAlloc(value);
++                    break :blk owned.?;
++                },
++                else => unreachable,
++            };
++            defer if (owned) |bytes| self.alloc.free(bytes);
+             if (target_file_v != .Nil) {
+                 if (!(try self.writeBufferedFile(target_file_v, s))) {
+                     return self.fail("file write error: write error", .{});
+diff --git a/tests/smoke/40_large_setlist_extraarg.lua b/tests/smoke/40_large_setlist_extraarg.lua
+new file mode 100644
+index 0000000..583b1df
+--- /dev/null
++++ b/tests/smoke/40_large_setlist_extraarg.lua
+@@ -0,0 +1,32 @@
++-- SETLIST stores its array offset in C until it outgrows one byte, then
++-- consumes the following EXTRAARG. Exercise both load() and dofile() so
++-- dynamically compiled text follows the bytecode VM path too.
++
++local parts = {"return {"}
++for i = 1, 700 do
++  parts[#parts + 1] = tostring(i)
++  parts[#parts + 1] = ","
++end
++parts[#parts + 1] = "}"
++
++local source = table.concat(parts)
++local loaded = assert(load(source, "=(large-setlist)"))
++local from_load = loaded()
++assert(#from_load == 700)
++assert(from_load[1] == 1 and from_load[256] == 256)
++assert(from_load[257] == 257 and from_load[700] == 700)
++
++local path = os.tmpname()
++assert(io.output(path))
++io.write("return {")
++for i = 1, 700 do io.write(i, ",") end
++io.write("}")
++assert(io.close())
++
++local from_file = assert(dofile(path))
++assert(os.remove(path))
++assert(#from_file == 700)
++assert(from_file[1] == 1 and from_file[256] == 256)
++assert(from_file[257] == 257 and from_file[700] == 700)
++
++print("large-setlist-extraarg-ok")

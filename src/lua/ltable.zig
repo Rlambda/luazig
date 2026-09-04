@@ -601,7 +601,7 @@ test "nodeLookupStr returns null for empty hash part" {
     defer std.testing.allocator.free(nodes);
     for (nodes) |*n| n.* = .{};
     // Build a dummy LuaString with a known hash.
-    var ls: LuaString = .{ .hash = 0, .len = 0, .is_short = true };
+    var ls: LuaString = .{ .hash = 0, .len = 0, .kind = .short };
     try std.testing.expect(nodeLookupStr(nodes, &ls) == null);
 }
 
@@ -610,7 +610,7 @@ test "nodeLookupStr finds an interned string key at its main position" {
     defer std.testing.allocator.free(nodes);
     for (nodes) |*n| n.* = .{};
     // Simulate an interned short string: hash is pre-cached.
-    var ls: LuaString = .{ .hash = 0xDEAD_BEEF, .len = 3, .is_short = true };
+    var ls: LuaString = .{ .hash = 0xDEAD_BEEF, .len = 3, .kind = .short };
     const mp: usize = ls.hash & (nodes.len - 1);
     nodes[mp].setKey(.{ .String = &ls });
     nodes[mp].value = .{ .Int = 77 };
@@ -628,7 +628,7 @@ test "nodeLookupStr agrees with nodeLookup for string keys" {
     var keys: [15]LuaString = undefined;
     var i: usize = 0;
     while (i < 15) : (i += 1) {
-        keys[i] = .{ .hash = (i + 1) *% 0x9E3779B97F4A7C15, .len = @intCast(i), .is_short = true };
+        keys[i] = .{ .hash = (i + 1) *% 0x9E3779B97F4A7C15, .len = @intCast(i), .kind = .short };
         _ = nodeInsert(nodes, &lastfree, .{ .String = &keys[i] }, .{ .Int = @intCast(i * 10) }, 0);
     }
     // Every key must be found by BOTH paths, with identical results.
@@ -641,7 +641,7 @@ test "nodeLookupStr agrees with nodeLookup for string keys" {
         try std.testing.expectEqual(generic.?.value, specialized.?.value);
     }
     // Absent key: both return null.
-    var absent: LuaString = .{ .hash = 0x1234_5678, .len = 0, .is_short = true };
+    var absent: LuaString = .{ .hash = 0x1234_5678, .len = 0, .kind = .short };
     try std.testing.expect(nodeLookup(nodes, .{ .String = &absent }, 0) == null);
     try std.testing.expect(nodeLookupStr(nodes, &absent) == null);
 }
@@ -651,7 +651,7 @@ test "nodeLookupStr skips dead keys and non-string keys in the chain" {
     defer std.testing.allocator.free(nodes);
     for (nodes) |*n| n.* = .{};
     // Place a dead node at the main position, and a live string node chained.
-    var ls: LuaString = .{ .hash = 0xCAFE_BABE, .len = 2, .is_short = true };
+    var ls: LuaString = .{ .hash = 0xCAFE_BABE, .len = 2, .kind = .short };
     const mp: usize = ls.hash & (nodes.len - 1);
     nodes[mp].key_tt = .table; // non-string key at main position
     nodes[mp].key_val = .{ .table = @ptrFromInt(@as(usize, 0x1234) & ~@as(usize, @alignOf(*Table) - 1)) };
@@ -680,11 +680,11 @@ test "nodeLookupStr skips dead keys and non-string keys in the chain" {
 ///
 /// This is the PUC-faithful primitive for metamethod/metafield lookups where
 /// the query key is ALWAYS a VM-interned short string (`tm_names[event]` and
-/// `metafield_names[field]` — all pre-interned shorts, `is_short == true`).
+/// `metafield_names[field]` — all pre-interned shorts, `kind == .short`).
 /// It replaces the general `nodeLookupStr` (which dispatches to `luaStringEq`
 /// — pointer-eq for shorts BUT content-eq for longs) in those hot paths.
 ///
-/// **Precondition:** `key` must be a VM-interned short string (`key.is_short`
+/// **Precondition:** `key` must be a VM-interned short string (`key.isShort()`
 /// is true). The caller (getTm/getMetaField) guarantees this via `tm_names` /
 /// `metafield_names` — both arrays are populated by `internStr` which produces
 /// short strings for all metamethod/metafield names (all <= 40 chars). This
@@ -692,9 +692,9 @@ test "nodeLookupStr skips dead keys and non-string keys in the chain" {
 ///
 /// **Tag mapping:** PUC has separate tags `LUA_VSHRSTR` and `LUA_VLNGSTR`. Our
 /// `NodeKeyTag` has a single `.string` variant; the short/long distinction
-/// lives in `LuaString.is_short`. So `keyisshrstr(n)` maps to
-/// `n.key_tt == .string and n.key_val.string.is_short`. A node with a LONG
-/// string key (`is_short == false`) will NOT match — matching PUC's
+/// lives in `LuaString.kind`. So `keyisshrstr(n)` maps to
+/// `n.key_tt == .string and n.key_val.string.isShort()`. A node with a LONG
+/// string key (`kind != .short`) will NOT match — matching PUC's
 /// `keyisshrstr` returning false for `LUA_VLNGSTR`-tagged nodes.
 ///
 /// **No content fallback:** unlike `nodeLookupStr` → `luaStringEq`, this
@@ -710,7 +710,7 @@ test "nodeLookupStr skips dead keys and non-string keys in the chain" {
 pub inline fn nodeLookupShortStrIdentity(nodes: []Node, key: *LuaString) ?*Node {
     // PUC luaH_Hgetshortstr lua_assert(strisshr(key)): the identity
     // precondition. Debug-only — zero ReleaseFast cost.
-    std.debug.assert(key.is_short);
+    std.debug.assert(key.isShort());
     if (nodes.len == 0) return null;
     // Same hash as PUC hashstr: key->hash & (sizenode-1).
     // keyHash(.{ .String = key }) = key.hash (ltable.zig:382, no computation).
@@ -719,10 +719,10 @@ pub inline fn nodeLookupShortStrIdentity(nodes: []Node, key: *LuaString) ?*Node 
     if (n.isEmpty()) return null; // bucket unused => key not present
     while (true) {
         // PUC keyisshrstr(n) && eqshrstr(keystrval(n), key):
-        //   keyisshrstr: node key is SHORT string (our .string + is_short)
+        //   keyisshrstr: node key is SHORT string (our .string + kind)
         //   eqshrstr:    pure pointer identity (a == b)
         // No content comparison. No long-string fallback.
-        if (n.key_tt == .string and n.key_val.string.is_short and n.key_val.string == key)
+        if (n.key_tt == .string and n.key_val.string.isShort() and n.key_val.string == key)
             return n;
         n = n.nextNode(nodes) orelse return null;
     }
@@ -732,7 +732,7 @@ test "nodeLookupShortStrIdentity returns null for empty hash part" {
     const nodes = try std.testing.allocator.alloc(Node, 4);
     defer std.testing.allocator.free(nodes);
     for (nodes) |*n| n.* = .{};
-    var ls: LuaString = .{ .hash = 0, .len = 0, .is_short = true };
+    var ls: LuaString = .{ .hash = 0, .len = 0, .kind = .short };
     try std.testing.expect(nodeLookupShortStrIdentity(nodes, &ls) == null);
 }
 
@@ -740,7 +740,7 @@ test "nodeLookupShortStrIdentity finds an interned short string at main position
     const nodes = try std.testing.allocator.alloc(Node, 4);
     defer std.testing.allocator.free(nodes);
     for (nodes) |*n| n.* = .{};
-    var ls: LuaString = .{ .hash = 0xDEAD_BEEF, .len = 3, .is_short = true };
+    var ls: LuaString = .{ .hash = 0xDEAD_BEEF, .len = 3, .kind = .short };
     const mp: usize = ls.hash & (nodes.len - 1);
     nodes[mp].setKey(.{ .String = &ls });
     nodes[mp].value = .{ .Int = 77 };
@@ -753,8 +753,8 @@ test "nodeLookupShortStrIdentity finds short string in collision chain" {
     defer std.testing.allocator.free(nodes);
     for (nodes) |*n| n.* = .{};
     // Two short strings hashing to the same bucket (collision).
-    var ls1: LuaString = .{ .hash = 0x10, .len = 2, .is_short = true };
-    var ls2: LuaString = .{ .hash = 0x10, .len = 2, .is_short = true }; // same hash, different ptr
+    var ls1: LuaString = .{ .hash = 0x10, .len = 2, .kind = .short };
+    var ls2: LuaString = .{ .hash = 0x10, .len = 2, .kind = .short }; // same hash, different ptr
     const mp: usize = ls1.hash & (nodes.len - 1); // = 0
     nodes[mp].setKey(.{ .String = &ls1 });
     nodes[mp].value = .{ .Int = 1 };
@@ -771,8 +771,8 @@ test "nodeLookupShortStrIdentity returns null for absent key" {
     const nodes = try std.testing.allocator.alloc(Node, 4);
     defer std.testing.allocator.free(nodes);
     for (nodes) |*n| n.* = .{};
-    var present: LuaString = .{ .hash = 0x20, .len = 1, .is_short = true };
-    var absent: LuaString = .{ .hash = 0x40, .len = 1, .is_short = true };
+    var present: LuaString = .{ .hash = 0x20, .len = 1, .kind = .short };
+    var absent: LuaString = .{ .hash = 0x40, .len = 1, .kind = .short };
     const mp: usize = present.hash & (nodes.len - 1);
     nodes[mp].setKey(.{ .String = &present });
     nodes[mp].value = .{ .Int = 42 };
@@ -783,7 +783,7 @@ test "nodeLookupShortStrIdentity skips dead keys and non-string keys in chain" {
     const nodes = try std.testing.allocator.alloc(Node, 4);
     defer std.testing.allocator.free(nodes);
     for (nodes) |*n| n.* = .{};
-    var ls: LuaString = .{ .hash = 0xCAFE_BABE, .len = 2, .is_short = true };
+    var ls: LuaString = .{ .hash = 0xCAFE_BABE, .len = 2, .kind = .short };
     const mp: usize = ls.hash & (nodes.len - 1);
     // Dead key at main position (non-string, dead).
     nodes[mp].key_tt = .table;
@@ -801,35 +801,35 @@ test "nodeLookupShortStrIdentity skips dead keys and non-string keys in chain" {
 
 test "nodeLookupShortStrIdentity does NOT match same-bytes long string" {
     // CRITICAL: proves no accidental content path. A node with a LONG string
-    // key (is_short == false) that collides to the same bucket as the query
+    // key (kind != .short) that collides to the same bucket as the query
     // short string must NOT match. PUC's keyisshrstr(n) returns false for
-    // LUA_VLNGSTR-tagged nodes; our check n.key_val.string.is_short == false
+    // LUA_VLNGSTR-tagged nodes; our check n.key_val.string.kind != .short
     // achieves the same. The identity primitive is PURE pointer-identity —
     // it never compares contents, so a long-string node is always skipped.
     const nodes = try std.testing.allocator.alloc(Node, 4);
     defer std.testing.allocator.free(nodes);
     for (nodes) |*n| n.* = .{};
     // Query: short string with hash 0x10.
-    var short_key: LuaString = .{ .hash = 0x10, .len = 3, .is_short = true };
-    // Node: LONG string with same hash (collision) — is_short == false.
+    var short_key: LuaString = .{ .hash = 0x10, .len = 3, .kind = .short };
+    // Node: LONG string with same hash (collision) — kind != .short.
     // Even though it has the same hash and same len, the identity primitive
-    // must NOT match it because is_short == false (not a short string).
-    var long_key: LuaString = .{ .hash = 0x10, .len = 3, .is_short = false };
+    // must NOT match it because kind != .short (not a short string).
+    var long_key: LuaString = .{ .hash = 0x10, .len = 3, .kind = .long };
     const mp: usize = short_key.hash & (nodes.len - 1);
     nodes[mp].setKey(.{ .String = &long_key });
     nodes[mp].value = .{ .Int = 99 };
     // The identity primitive must NOT find the long-string node.
     try std.testing.expect(nodeLookupShortStrIdentity(nodes, &short_key) == null);
     // The long key itself IS found (it's a valid string node, just long —
-    // the identity primitive checks is_short on the NODE's key, not the query).
-    // Wait: the query must also be short (precondition). long_key.is_short is
+    // the identity primitive checks isShort() on the NODE's key, not the query).
+    // Wait: the query must also be short (precondition). long_key.isShort() is
     // false, so calling with &long_key violates the precondition. We only
     // test that a short query does NOT match a long node.
     //
     // For a short query against a short node at the same position, it WOULD
     // match by pointer identity. Verify that a different short pointer does
     // NOT match (pointer identity, not content):
-    var other_short: LuaString = .{ .hash = 0x10, .len = 3, .is_short = true };
+    var other_short: LuaString = .{ .hash = 0x10, .len = 3, .kind = .short };
     try std.testing.expect(nodeLookupShortStrIdentity(nodes, &other_short) == null);
 }
 
@@ -844,7 +844,7 @@ test "nodeLookupShortStrIdentity agrees with nodeLookupStr for valid interned-sh
     var keys: [15]LuaString = undefined;
     var i: usize = 0;
     while (i < 15) : (i += 1) {
-        keys[i] = .{ .hash = (i + 1) *% 0x9E3779B97F4A7C15, .len = @intCast(i), .is_short = true };
+        keys[i] = .{ .hash = (i + 1) *% 0x9E3779B97F4A7C15, .len = @intCast(i), .kind = .short };
         _ = nodeInsert(nodes, &lastfree, .{ .String = &keys[i] }, .{ .Int = @intCast(i * 10) }, 0);
     }
     var k: usize = 0;
@@ -856,7 +856,7 @@ test "nodeLookupShortStrIdentity agrees with nodeLookupStr for valid interned-sh
         try std.testing.expectEqual(general.?.value, identity.?.value);
     }
     // Absent key: both return null.
-    var absent: LuaString = .{ .hash = 0x1234_5678, .len = 0, .is_short = true };
+    var absent: LuaString = .{ .hash = 0x1234_5678, .len = 0, .kind = .short };
     try std.testing.expect(nodeLookupStr(nodes, &absent) == null);
     try std.testing.expect(nodeLookupShortStrIdentity(nodes, &absent) == null);
 }

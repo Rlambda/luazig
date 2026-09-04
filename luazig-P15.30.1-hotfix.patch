@@ -1,0 +1,135 @@
+diff --git a/README.md b/README.md
+index 03e8236..837517e 100644
+--- a/README.md
++++ b/README.md
+@@ -87,7 +87,7 @@ backend. Как и `luaV_execute`/`CallInfo` в PUC Lua, один dispatch drive
+ вложенных `coroutine.resume` с yield/resume, 2000 рекурсивных metamethod
+ вызовов, 1000 вложенных `string.gsub` callbacks и mixed bytecode↔`testC` yield
+ для `CALL`/`TAILCALL`/`TFORCALL`. Полный `cstack.lua` также проходит при
+-1-МБ host stack. Zig unit tests и 43/43 differential smoke проходят. Все
++1-МБ host stack. Zig unit tests и 44/44 differential smoke проходят. Все
+ заявленные 29 upstream suites завершаются успешно на bc VM; точные глубины
+ `C stack overflow` остаются implementation-defined, но semantic assertions
+ совпадают.
+@@ -562,7 +562,7 @@ unit tests дополнительно проверяют, что minor collectio
+ Подтверждённые проверки на Zig 0.16.0:
+ 
+ - `zig build -Doptimize=Debug` и `zig build test -Doptimize=Debug` — PASS;
+-- differential smoke — 43/43 PASS;
++- differential smoke — 44/44 PASS;
+ - iterative dispatch stress под 1-МБ host stack — PASS;
+ - заявленная portable/soft upstream matrix — 29/29 PASS;
+ - `gengc.lua --testc` — `OK`;
+@@ -575,6 +575,31 @@ luazig сохраняет отдельные массивы указателей
+ инварианты, minor/major transitions и наблюдаемая Lua/TestC-семантика
+ соответствуют модели Lua 5.5.
+ 
++#### Hotfix P15.30.1: automatic GC pace после `restart`
++
++Прямой upstream `gc.lua` без `_port/_soft` выявил ошибку pacing, которую не
++покрывала portable matrix. `collectgarbage("restart")` только включал флаг
++collector, сохраняя старый post-cycle threshold; после достижения threshold
++automatic GC выполнял лишь 64 object-work units раз на 20 000 table
++allocations. В table-heavy цикле mutator поэтому создавал мусор быстрее sweep и
++проверка pace после `long strings` не завершалась.
++
++Исправление следует модели PUC Lua:
++
++- `restart` сбрасывает allocation debt: следующая аллокация сразу получает
++  возможность продвинуть GC;
++- automatic incremental slice вычисляется из `stepsize × stepmul`; коэффициент
++  20 компенсирует различие work units — PUC sweep обрабатывает до 20 объектов
++  за один sweep step, тогда как `gcAdvance` luazig считает каждый объект
++  отдельно;
++- smoke `44_gc_restart_pace.lua` останавливает collector, накапливает garbage,
++  включает его обратно и проверяет, что heap возвращается к live baseline, а
++  не растёт без ограничения.
++
++После hotfix: Debug build/unit tests, 44/44 differential smoke, 1-МБ dispatch
++stress и `gengc.lua --testc` проходят; direct `gc.lua` завершается с `OK`
++примерно за 5.4 с в текущем Debug-окружении.
++
+ ### Открытые приоритеты
+ 
+ - [x] **IR VM заморожена, bc=default.** Default backend переведён на `--vm=bc`.
+@@ -733,6 +758,6 @@ luazig сохраняет отдельные массивы указателей
+ - P15.27: завершение regression cleanup после iterative dispatch — исправлены large `SETLIST + EXTRAARG`, lexical `goto`/global-attribute/named-vararg semantics, source line tables и PUC-like line-hook `oldpc`; удалён trace preseed. `saved_parent_callee` debug-hook continuation добавлен в GC roots, а stripped `load` всегда инициализирует первый environment upvalue. Расширен smoke `31_debug_bytecode_parity.lua`; `40_large_setlist_extraarg.lua` закрепляет `verybig` codegen. Подтверждены unit tests, 40/40 smoke, 1-МБ stress, 29/29 upstream matrix и direct `verybig.lua`.
+ - P15.28: verifier follow-up — dynamic `load()`/automatic-GC scheduling переведены с fixed instruction cadence на live-heap debt, короткие interned strings включены в memory accounting, а explicit generational step выполняет атомарный цикл с PUC-compatible `false` result. `runBytecode` скрывает private dispatch signal, strict-global codegen не знает имён stdlib, `time.txt` сохраняется через snapshot/restore. Добавлен smoke `42_gc_debt_and_generational_step.lua`; подтверждены 42/42 smoke, 29/29 soft/portable matrix, direct `constructs.lua` <60 с и direct `verybig.lua`.
+ - P15.29: persistent incremental GC — collector хранит `pause/propagate/atomic/sweep` state, gray queue, mark sets и sweep cursors между `collectgarbage("step", n)`; mark/sweep расходуют реальный bounded budget, mutable roots и write barriers сохраняют tri-color invariant, а registry entries удаляются до освобождения объекта. Исправлены finalizer epoch/reentrancy и escaping main-chunk `_ENV` ownership. Unit regression наблюдает отдельные phases и barrier writes. Подтверждены Debug build/tests, 42/42 smoke, 1-МБ stress, 29/29 upstream matrix, direct heavy tests и `gc.lua` 1.85 с Debug / 0.54 с ReleaseFast.
+-- P15.30: настоящий generational GC — добавлены PUC-like object ages, per-type nursery, OLD1/remembered/old-thread queues, forward/back barriers и young-only sweep. Minor collections больше не вызывают полный incremental cycle и не обходят обычный old heap; `minormul/minormajor/majorminor` управляют minor → incremental major → minor transitions. `gengc.lua --testc` читает реальные age states; добавлен smoke `43_generational_minor.lua`. Подтверждены 43/43 smoke, 29/29 matrix, GC suites, 1-МБ stress и direct heavy tests.
++- P15.30: настоящий generational GC — добавлены PUC-like object ages, per-type nursery, OLD1/remembered/old-thread queues, forward/back barriers и young-only sweep. Minor collections больше не вызывают полный incremental cycle и не обходят обычный old heap; `minormul/minormajor/majorminor` управляют minor → incremental major → minor transitions. `gengc.lua --testc` читает реальные age states; добавлен smoke `43_generational_minor.lua`. Hotfix P15.30.1 сбрасывает automatic-GC debt при `restart`, масштабирует automatic slice по PUC sweep granularity и добавляет `44_gc_restart_pace.lua`; direct `gc.lua` без `_soft` снова завершается. Подтверждены 44/44 smoke, 29/29 matrix, GC suites, 1-МБ stress и direct heavy tests.
+ 
+ Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).
+diff --git a/src/lua/vm.zig b/src/lua/vm.zig
+index d9a723f..cbeb0e2 100644
+--- a/src/lua/vm.zig
++++ b/src/lua/vm.zig
+@@ -10295,6 +10295,13 @@ pub const Vm = struct {
+         }
+         if (std.mem.eql(u8, what, "restart")) {
+             self.gc_running = true;
++            // PUC Lua resets GC debt to zero on restart, so the next
++            // allocation immediately gets a chance to advance the collector.
++            // Leaving the old post-cycle threshold here can defer progress by
++            // hundreds of kilobytes and makes the upstream pace test diverge.
++            self.gc_auto_threshold_kb = self.gc_count_kb;
++            self.gc_alloc_tables = self.gc_alloc_threshold;
++            self.gc_tick = self.gc_tick_threshold;
+             if (want_out) outs[0] = .{ .Bool = true };
+             return;
+         }
+@@ -12343,7 +12350,7 @@ pub const Vm = struct {
+             if (!self.gc_finalizer_tick_pending and !self.gcAutoCycleDue()) return;
+             try self.gcStartCycle(true);
+         }
+-        _ = try self.gcAdvance(if (self.gc_finalizer_tick_pending) 4096 else 64);
++        _ = try self.gcAdvance(self.gcAutomaticBudget());
+     }
+ 
+     /// Schedule the next automatic cycle from the live heap left after this
+@@ -12373,6 +12380,15 @@ pub const Vm = struct {
+         return @intCast(@min(scaled, std.math.maxInt(usize)));
+     }
+ 
++    /// Convert the configured incremental step into this collector's work
++    /// units. PUC Lua sweeps up to 20 objects per single sweep step; luazig's
++    /// `gcAdvance` counts each object separately, so retain that granularity
++    /// when translating the configured step size/multiplier.
++    fn gcAutomaticBudget(self: *const Vm) usize {
++        const puc_sweep_batch: usize = 20;
++        return std.math.mul(usize, self.gcStepBudget(self.gc_stepsize), puc_sweep_batch) catch std.math.maxInt(usize);
++    }
++
+     fn gcCycleFull(self: *Vm) DispatchError!void {
+         if (self.gc_busy) return;
+         if (self.gc_state == .pause) try self.gcStartCycle(true);
+diff --git a/tests/smoke/44_gc_restart_pace.lua b/tests/smoke/44_gc_restart_pace.lua
+new file mode 100644
+index 0000000..9d80584
+--- /dev/null
++++ b/tests/smoke/44_gc_restart_pace.lua
+@@ -0,0 +1,24 @@
++-- `collectgarbage("restart")` resets GC debt in PUC Lua. The next
++-- allocations must therefore make collection progress fast enough to bring a
++-- stopped-collector heap back near its live baseline; merely scheduling tiny
++-- slices every many thousands of allocations makes this loop diverge.
++collectgarbage("collect")
++collectgarbage("collect")
++
++local baseline = collectgarbage("count")
++collectgarbage("stop")
++
++repeat
++    local dead = {}
++until collectgarbage("count") > baseline * 3
++
++collectgarbage("restart")
++
++local allocations = 0
++repeat
++    local dead = {}
++    allocations = allocations + 1
++    assert(allocations < 100000, "automatic GC did not catch up after restart")
++until collectgarbage("count") <= baseline * 2
++
++print("gc-restart-pace-ok")

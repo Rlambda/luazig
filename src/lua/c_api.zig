@@ -2704,13 +2704,13 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
                     // Intern source_name to get a NUL-terminated LuaString.
                     // Proto.source_name is []const u8 (not NUL-terminated);
                     // LuaString storage IS NUL-terminated (createLuaString).
-                    const src_ls = vm.internStr(p.source_name) catch return 0;
+                    const src_ls = vm.internStr(p.sourceName()) catch return 0;
                     const src_bytes = src_ls.bytes();
                     ar.source = @ptrCast(@constCast(src_bytes.ptr));
                     ar.srclen = src_bytes.len;
                     ar.linedefined = @intCast(p.line_defined);
                     ar.lastlinedefined = @intCast(p.last_line_defined);
-                    fillShortSrc(&ar.short_src, p.source_name);
+                    fillShortSrc(&ar.short_src, p.sourceName());
                 } else {
                     // C function: no source info.
                     ar.what = "C";
@@ -2728,7 +2728,7 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
                 if (frame.proto()) |p| {
                     ar.nups = @intCast(p.upvalues.len);
                     ar.nparams = p.numparams;
-                    ar.isvararg = if (p.is_vararg) 1 else 0;
+                    ar.isvararg = if (p.flags.is_vararg) 1 else 0;
                 } else {
                     // PUC ldebug.c:344-348 (auxgetinfo 'u' for C functions):
                     // nups = nupvalues of the called function (0 for light C

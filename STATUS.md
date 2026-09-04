@@ -6888,3 +6888,51 @@ Perf A/B (dynamic_load — tree adopt/charge/release): −0.53% cyc /
 +0.06% instr (flat).
 
 Remaining api580 ledger (charged): 408 vs PUC 304; still need −9B.
+
+## P16.16 T2-T8 (C7) — Proto 216→200: packed names, vararg sentinel, is_vararg→flags — api.lua:580 CLOSED (2026-09-04)
+
+Final structural cut of the batch. Three sub-cuts on Proto:
+
+1. `name`/`source_name` slices → packed `?[*]const u8` + `u32` len
+   (−8B): same representation as Upvaldesc C4; empty string = null ptr
+   + 0 len = the stripped-chunk form (PUC: NULL TString*). Accessors
+   `name()`/`sourceName()`/`setName()`/`setSourceName()`; the
+   ProtoBuilder keeps plain slices (transient, size irrelevant).
+2. `vararg_table_reg: ?u8` → `u8` + `no_vararg_reg = 255` sentinel
+   (−1B): register indices are 0–254, so 255 (= PUC NO_REG) is
+   unambiguous.
+3. `is_vararg` bool → `flags.is_vararg` bit (−1B): Flags now 5 bits +
+   3 pad; bit-test replaces byte load on the call path.
+
+@sizeOf: Proto 216→**200** (248→200 across C6+C7; PUC Proto = 184).
+api580 (anchored, 3 runs): 408 → **392 < 400**. **api.lua --testc now
+PASSES** (the P16.16 target assertion at lua-5.5.0/testes/api.lua:580).
+Matrix: zig_fail=0 (only big.lua both_fail — fails on PUC too,
+pre-existing). Ledger regenerated (tools/perf/current-api580-ledger.json):
+charged 392 = measured 392, verdict GREEN, savings needed 0B.
+
+Gates: closure / coroutine / gc / gengc / nextvar (5x) / db / errors /
+strings --testc PASS; big/locals fail byte-identical to baseline
+(pre-existing); smoke 68/68; c_api `make test` 50 PASS + `make
+test-diff` 8/8; zig build test PASS (dump/undump roundtrip incl.
+stripped names, vararg_table_reg sentinel, OOM leak tests); leak_bench
+PASS (load_chunk/load_function net-negative); native lanes 3/3 BOUNDED;
+structural: CallFrame=96 (≤104), Node=32, Cell=40 (=PUC UpVal),
+Closure=40 (=PUC), Proto=200; T5-prohibition grep clean.
+
+Perf A/B (stash-dance, perf-stat cycles): lua_calls +0.13%,
+closure_capture +0.03% (flat). perf_compare.py vs baseline-p15.37:
+geomean 1.79x (1.78x at pre-C1), WARN on 2/16 table-alloc workloads
+(+6.6-8.1%, below the +10% FAIL threshold). Root cause investigated:
+per-commit bisect shows the cycle delta is code-layout/alignment (C6
+binary: +7% cycles with byte-identical instruction counts on a
+table-alloc workload whose hot path C6 does not touch; same hot
+profile: runBytecodeDispatch/alloc/free/internStr) plus honest
+GC-cadence shift from smaller charged structs (Table 80→72 etc. —
+fewer charged bytes per object → different GC step frequency). No
+semantic regression: every targeted A/B on the exact workloads is
+flat. Documented, not hacked around.
+
+Batch P16.16 T2-T8 complete: api580 544 → 392 (PUC 304) via C1-C7 +
+bonus leak fix; every cut PUC-faithful, separately measured, gated,
+and committed.

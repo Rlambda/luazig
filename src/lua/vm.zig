@@ -1572,7 +1572,7 @@ pub const CallFrame = struct {
     }
 
     pub fn isVararg(fr: CallFrame) bool {
-        if (fr.proto()) |p| return p.is_vararg;
+        if (fr.proto()) |p| return p.flags.is_vararg;
         return false;
     }
 
@@ -1582,12 +1582,12 @@ pub const CallFrame = struct {
     }
 
     pub fn sourceName(fr: CallFrame) []const u8 {
-        if (fr.proto()) |p| return p.source_name;
+        if (fr.proto()) |p| return p.sourceName();
         return "=[C]";
     }
 
     pub fn funcName(fr: CallFrame) []const u8 {
-        if (fr.proto()) |p| return p.name;
+        if (fr.proto()) |p| return p.name();
         return "?";
     }
 
@@ -4188,7 +4188,7 @@ pub const Vm = struct {
         //    underflowed whenever func_slot < nextraargs (first frames; latent
         //    since the vararg-table feature landed, exposed by P16.10b GC
         //    timing shifts in locals.lua to-be-closed coroutine sections).
-        if (proto.vararg_table_reg != null) {
+        if (proto.vararg_table_reg != bc.Proto.no_vararg_reg) {
             const start = frame.base + proto.numparams;
             if (start + nextra > stack.len) return &.{}; // frame being torn down
             return stack[start .. start + nextra];
@@ -4637,7 +4637,8 @@ pub const Vm = struct {
     };
 
     fn getBytecodeVarargTable(self: *Vm, proto: *const bc.Proto, regs: []Value) DispatchError!?BytecodeVarargTable {
-        const reg = proto.vararg_table_reg orelse return null;
+        const reg = proto.vararg_table_reg;
+        if (reg == bc.Proto.no_vararg_reg) return null;
         const idx: usize = @intCast(reg);
         if (idx >= regs.len or regs[idx] != .Table) return null;
         const tbl = regs[idx].Table;
@@ -7056,7 +7057,7 @@ pub const Vm = struct {
         // adjusts the varargs), so getinfo('l') must report the line of
         // instruction 1, not 0. Mirror the temporary bump by index (the
         // frame array may realloc while the hook runs).
-        const vararg_bump = if (fr.proto()) |p| p.is_vararg else false;
+        const vararg_bump = if (fr.proto()) |p| p.flags.is_vararg else false;
         if (vararg_bump) exec_frames.getPtr(frame_idx).u.lua.pc = 1;
         defer {
             if (vararg_bump) exec_frames.getPtr(frame_idx).u.lua.pc = 0;
@@ -11516,12 +11517,12 @@ pub const Vm = struct {
         // overwritten by register allocation (OP_VARARG reads them later).
         // For vararg functions WITH a table (PF_VATAB), no shift is needed —
         // VARARGPREP (first instruction) consumes the extra args into a table.
-        const nextra: usize = if (proto.is_vararg and nargs > nparams)
+        const nextra: usize = if (proto.flags.is_vararg and nargs > nparams)
             nargs - nparams
         else
             0;
         // VAHID: virtual varargs (no table). Needs buildhiddenargs shift.
-        const is_vahid: bool = proto.is_vararg and nextra > 0 and proto.vararg_table_reg == null;
+        const is_vahid: bool = proto.flags.is_vararg and nextra > 0 and proto.vararg_table_reg == bc.Proto.no_vararg_reg;
 
         // ── Step 2: buildhiddenargs for VAHID ──
         // PUC ltm.c buildhiddenargs: shift func+params UP past the extra args.
@@ -14311,7 +14312,7 @@ pub const Vm = struct {
                                 // luaD_precall stack check). Usually a no-op
                                 // because EXTRA_MARGIN covers typical calls.
                                 const child_frame_cap: u32 = @intCast(proto.maxstacksize + EXTRA_MARGIN);
-                                const child_nextra: usize = if (proto.is_vararg and nargs > proto.numparams)
+                                const child_nextra: usize = if (proto.flags.is_vararg and nargs > proto.numparams)
                                     nargs - proto.numparams
                                 else
                                     0;
@@ -14581,7 +14582,8 @@ pub const Vm = struct {
                         // First instruction of a vararg function.
                         // If the function has a named vararg table (vararg_table_reg),
                         // create the table and store it in the designated register.
-                        if (ctx.cur_proto.vararg_table_reg) |va_reg| {
+                        if (ctx.cur_proto.vararg_table_reg != bc.Proto.no_vararg_reg) {
+                            const va_reg = ctx.cur_proto.vararg_table_reg;
                             try self.testcConsumeAllocCount(); // Table struct
                             const t = try self.allocTableEphemeral();
                             // PUC model (VATAB): extra args at base+numparams
@@ -15249,7 +15251,7 @@ pub const Vm = struct {
             else => 0,
         };
         const child_nextra: usize = switch (callee_val) {
-            .Closure => |cl| if (cl.proto) |p| (if (p.is_vararg and effective_nargs > p.numparams) effective_nargs - p.numparams else 0) else 0,
+            .Closure => |cl| if (cl.proto) |p| (if (p.flags.is_vararg and effective_nargs > p.numparams) effective_nargs - p.numparams else 0) else 0,
             else => 0,
         };
         try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap + child_nextra);
@@ -15799,12 +15801,12 @@ pub const Vm = struct {
                 //    Step 2: if new proto is VAHID, buildhiddenargs shifts
                 //    func+params UP past the extra args.
                 const np = new_proto.numparams;
-                const new_nextra: usize = if (new_proto.is_vararg and effective_nargs > np)
+                const new_nextra: usize = if (new_proto.flags.is_vararg and effective_nargs > np)
                     effective_nargs - np
                 else
                     0;
-                const new_is_vahid = new_proto.is_vararg and new_nextra > 0 and
-                    new_proto.vararg_table_reg == null;
+                const new_is_vahid = new_proto.flags.is_vararg and new_nextra > 0 and
+                    new_proto.vararg_table_reg == bc.Proto.no_vararg_reg;
 
                 // Reset to the original (unshifted) func_slot_base.
                 const reset_slot = ctx.exec_frames.getPtr(ctx.frame_index).u.lua.func_slot_base;
@@ -15896,7 +15898,7 @@ pub const Vm = struct {
                     // PUC luaD_hookcall savedpc++ (see
                     // dispatchCalleeActivationHook): a vararg callee's hook
                     // observes the instruction after VARARGPREP.
-                    const tc_vararg_bump = new_proto.is_vararg;
+                    const tc_vararg_bump = new_proto.flags.is_vararg;
                     if (tc_vararg_bump) fr2.u.lua.pc = 1;
                     defer if (tc_vararg_bump) {
                         ctx.exec_frames.getPtr(ctx.frame_index).u.lua.pc = 0;
@@ -16179,7 +16181,7 @@ pub const Vm = struct {
             else => 0,
         };
         const child_nextra: usize = switch (ctx.regs[a]) {
-            .Closure => |cl| if (cl.proto) |p| (if (p.is_vararg and nargs > p.numparams) nargs - p.numparams else 0) else 0,
+            .Closure => |cl| if (cl.proto) |p| (if (p.flags.is_vararg and nargs > p.numparams) nargs - p.numparams else 0) else 0,
             else => 0,
         };
         try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap + child_nextra);
@@ -24264,11 +24266,11 @@ pub const Vm = struct {
             }
         }.run;
         // source_name and name
-        if (proto.source_name.len > 0) {
-            proto.source_name = try dupeOwned(self, owner, proto.source_name);
+        if (proto.sourceName().len > 0) {
+            proto.setSourceName(try dupeOwned(self, owner, proto.sourceName()));
         }
-        if (proto.name.len > 0) {
-            proto.name = try dupeOwned(self, owner, proto.name);
+        if (proto.name().len > 0) {
+            proto.setName(try dupeOwned(self, owner, proto.name()));
         }
         // upvalue names — upvalues is []const, need mutable copy
         if (proto.upvalues.len > 0) {
@@ -24313,7 +24315,7 @@ pub const Vm = struct {
     /// renderers, mirroring PUC's `p->source == NULL` checks
     /// (ldebug.c:269-273, luaG_addinfo).
     fn protoIsStripped(p: *const bc.Proto) bool {
-        return p.source_name.len == 0 and p.lineinfo.len == 0;
+        return p.sourceName().len == 0 and p.lineinfo.len == 0;
     }
 
     // =========================================================================
@@ -25406,7 +25408,7 @@ pub const Vm = struct {
                 break :blk full;
             },
             .Closure => |cl| blk: {
-                const name = if (cl.proto) |proto| proto.name else "";
+                const name = if (cl.proto) |proto| proto.name() else "";
                 if (name.len == 0 or std.mem.eql(u8, name, "<anon>") or std.mem.eql(u8, name, "<bytecode>")) break :blk null;
                 break :blk name;
             },
@@ -25822,17 +25824,17 @@ pub const Vm = struct {
                         // stripped dump serializes an empty source and no
                         // line info — see dump.zig DumpOptions.strip).
                         const is_stripped = protoIsStripped(p);
-                        const short_src = try self.debugShortSourceEx(p.source_name, is_stripped);
-                        const looks_like_path = p.source_name.len != 0 and
-                            (std.mem.endsWith(u8, p.source_name, ".lua") or
-                                std.mem.indexOfScalar(u8, p.source_name, '/') != null or
-                                std.mem.indexOfScalar(u8, p.source_name, '\\') != null);
+                        const short_src = try self.debugShortSourceEx(p.sourceName(), is_stripped);
+                        const looks_like_path = p.sourceName().len != 0 and
+                            (std.mem.endsWith(u8, p.sourceName(), ".lua") or
+                                std.mem.indexOfScalar(u8, p.sourceName(), '/') != null or
+                                std.mem.indexOfScalar(u8, p.sourceName(), '\\') != null);
                         const src = if (is_stripped)
                             "=?"
-                        else if (p.source_name.len != 0 and p.source_name[0] != '@' and p.source_name[0] != '=' and looks_like_path)
-                            try std.fmt.allocPrint(self.alloc, "@{s}", .{p.source_name})
+                        else if (p.sourceName().len != 0 and p.sourceName()[0] != '@' and p.sourceName()[0] != '=' and looks_like_path)
+                            try std.fmt.allocPrint(self.alloc, "@{s}", .{p.sourceName()})
                         else
-                            p.source_name;
+                            p.sourceName();
                         const what_str: []const u8 = if (p.line_defined == 0) "main" else "Lua";
                         try self.setField(t, "what", .{ .String = try self.internStr(what_str) });
                         try self.setField(t, "source", .{ .String = try self.internStr(src) });
@@ -25841,12 +25843,12 @@ pub const Vm = struct {
                         try self.setField(t, "lastlinedefined", .{ .Int = @intCast(p.last_line_defined) });
                     }
                     if (has_u) {
-                        const is_main_like = p.line_defined == 0 and p.is_vararg and p.numparams == 0;
+                        const is_main_like = p.line_defined == 0 and p.flags.is_vararg and p.numparams == 0;
                         var nups: i64 = @intCast(cl.upvalues.len);
                         if (is_main_like and nups == 0) nups = 1;
                         try self.setField(t, "nups", .{ .Int = nups });
                         try self.setField(t, "nparams", .{ .Int = @intCast(p.numparams) });
-                        const is_vararg = if (p.line_defined == 0) true else p.is_vararg;
+                        const is_vararg = if (p.line_defined == 0) true else p.flags.is_vararg;
                         try self.setField(t, "isvararg", .{ .Bool = is_vararg });
                     }
                     if (debugInfoHasOpt(what, 'L')) {
@@ -26246,7 +26248,7 @@ pub const Vm = struct {
         const fr_regs = fr.regsSlice(stack);
         if (idx == 0) return;
         if (idx < 0) {
-            if (!proto.is_vararg) return;
+            if (!proto.flags.is_vararg) return;
             const pos_i = -idx - 1;
             if (pos_i < 0) return;
             const pos: usize = @intCast(pos_i);
@@ -26258,7 +26260,7 @@ pub const Vm = struct {
 
         const pc: u32 = @intCast(@min(fr.u.lua.pc, std.math.maxInt(u32)));
         var rank: i64 = 0;
-        const exposes_vararg_table = proto.is_vararg and proto.line_defined != 0;
+        const exposes_vararg_table = proto.flags.is_vararg and proto.line_defined != 0;
         var inserted_vararg_table = false;
         var has_named_active_local = false;
         var active_regs = std.StaticBitSet(256).initEmpty();
@@ -26347,7 +26349,7 @@ pub const Vm = struct {
         const fr_regs = fr.regsSlice(stack);
         if (idx == 0) return;
         if (idx < 0) {
-            if (!proto.is_vararg) return;
+            if (!proto.flags.is_vararg) return;
             const pos_i = -idx - 1;
             if (pos_i < 0) return;
             const pos: usize = @intCast(pos_i);
@@ -26359,7 +26361,7 @@ pub const Vm = struct {
 
         const pc: u32 = @intCast(@min(fr.u.lua.pc, std.math.maxInt(u32)));
         var rank: i64 = 0;
-        const exposes_vararg_table = proto.is_vararg and proto.line_defined != 0;
+        const exposes_vararg_table = proto.flags.is_vararg and proto.line_defined != 0;
         var inserted_vararg_table = false;
         var has_named_active_local = false;
         var active_regs = std.StaticBitSet(256).initEmpty();
@@ -34194,7 +34196,7 @@ pub const Vm = struct {
             .String => |s| try w.writeAll(s.bytes()),
             .Table => |t| try w.print("table: 0x{x}", .{@intFromPtr(t)}),
             .Builtin => |id| try w.print("function: builtin {s}", .{id.name()}),
-            .Closure => |cl| try w.print("function: {s}", .{if (cl.proto) |p| p.name else "<bytecode>"}),
+            .Closure => |cl| try w.print("function: {s}", .{if (cl.proto) |p| p.name() else "<bytecode>"}),
             .Thread => |th| try w.print("thread: 0x{x}", .{@intFromPtr(th)}),
             .LightUserdata => |p| try w.print("userdata: 0x{x}", .{@intFromPtr(p)}),
             .Userdata => |ud| try w.print("userdata: 0x{x}", .{@intFromPtr(ud)}),
@@ -34222,7 +34224,7 @@ pub const Vm = struct {
             .String => |s| s.bytes(),
             .Table => |t| try std.fmt.allocPrint(self.alloc, "{s}: 0x{x}", .{ self.valueTypeName(v), @intFromPtr(t) }),
             .Builtin => |id| try std.fmt.allocPrint(self.alloc, "function: builtin {s}", .{id.name()}),
-            .Closure => |cl| try std.fmt.allocPrint(self.alloc, "function: {s}", .{if (cl.proto) |p| p.name else "<bytecode>"}),
+            .Closure => |cl| try std.fmt.allocPrint(self.alloc, "function: {s}", .{if (cl.proto) |p| p.name() else "<bytecode>"}),
             .Thread => |th| try std.fmt.allocPrint(self.alloc, "{s}: 0x{x}", .{ self.valueTypeName(v), @intFromPtr(th) }),
             .LightUserdata => |p| try std.fmt.allocPrint(self.alloc, "{s}: 0x{x}", .{ self.valueTypeName(v), @intFromPtr(p) }),
             .Userdata => |ud| try std.fmt.allocPrint(self.alloc, "{s}: 0x{x}", .{ self.valueTypeName(v), @intFromPtr(ud) }),

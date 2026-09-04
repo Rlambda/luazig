@@ -317,7 +317,7 @@ pub const UndumpReader = struct {
     ///   4.  last_line_defined     u32 (varint)
     ///   5.  numparams             byte
     ///   6.  maxstacksize          byte
-    ///   7.  flags                 byte (bit 0 = is_vararg, bit 1 = has vararg_table_reg)
+    ///   7.  flags                 byte (bit 0 = flags.is_vararg, bit 1 = has vararg_table_reg)
     ///   8.  vararg_table_reg      byte (only if flags bit 1 set)
     ///   9.  code.len              u32, then each Instruction as u32 LE
     ///  10.  k.len                 u32, then each Constant via undumpConstant
@@ -340,13 +340,13 @@ pub const UndumpReader = struct {
         const numparams = try self.readByte();
         const maxstacksize = try self.readByte();
 
-        // 7. Flags byte: bit 0 = is_vararg, bit 1 = has vararg_table_reg.
+        // 7. Flags byte: bit 0 = flags.is_vararg, bit 1 = has vararg_table_reg.
         const flags = try self.readByte();
         const is_vararg = (flags & 1) != 0;
         const has_vtr = (flags & 2) != 0;
 
         // 8. vararg_table_reg — only present when flags bit 1 is set.
-        const vararg_table_reg: ?u8 = if (has_vtr) try self.readByte() else null;
+        const vararg_table_reg: u8 = if (has_vtr) try self.readByte() else bc.Proto.no_vararg_reg;
 
         // ── Error-path discipline (P16.10b Task 4/C4) ──
         // Every allocation below carries an errdefer so a truncated or
@@ -502,10 +502,7 @@ pub const UndumpReader = struct {
             .live_reg_top = &.{},
             .maxstacksize = maxstacksize,
             .numparams = numparams,
-            .is_vararg = is_vararg,
             .vararg_table_reg = vararg_table_reg,
-            .name = name,
-            .source_name = source_name,
             .line_defined = line_defined,
             .last_line_defined = last_line_defined,
             // PUC PF_FIXED parity: when fixed-buffer mode borrows code and
@@ -513,8 +510,11 @@ pub const UndumpReader = struct {
             // deinit (destroyProtoTree) skips freeing them and the GC
             // footprint (protoTreeFootprint) excludes them. PUC sets this
             // via `f->flag |= PF_FIXED` in lundump.c:332-333.
-            .flags = .{ .fixed_arrays = self.fixed },
+            .flags = .{ .is_vararg = is_vararg, .fixed_arrays = self.fixed },
         };
+        // Packed name fields (P16.16 C7): set via accessors.
+        proto.setName(name);
+        proto.setSourceName(source_name);
         return proto;
     }
 
@@ -687,13 +687,13 @@ test "UndumpReader: undumpProto round-trips a simple Proto" {
         .locvars = &lvs,
         .maxstacksize = 2,
         .numparams = 0,
-        .is_vararg = false,
-        .vararg_table_reg = null,
-        .name = "test",
-        .source_name = "test.lua",
+        
         .line_defined = 1,
         .last_line_defined = 2,
     };
+    const proto_mut: *bc.Proto = @constCast(&proto);
+    proto_mut.setName("test");
+    proto_mut.setSourceName("test.lua");
 
     try w.dumpProto(&proto, .{});
 
@@ -704,14 +704,14 @@ test "UndumpReader: undumpProto round-trips a simple Proto" {
     // tree structurally. k strings are VM-owned/undefined on this path.
     defer bc.destroyProtoTree(std.testing.allocator, out, true);
 
-    try std.testing.expectEqualSlices(u8, "test.lua", out.source_name);
-    try std.testing.expectEqualSlices(u8, "test", out.name);
+    try std.testing.expectEqualSlices(u8, "test.lua", out.sourceName());
+    try std.testing.expectEqualSlices(u8, "test", out.name());
     try std.testing.expectEqual(@as(u32, 1), out.line_defined);
     try std.testing.expectEqual(@as(u32, 2), out.last_line_defined);
     try std.testing.expectEqual(@as(u8, 0), out.numparams);
     try std.testing.expectEqual(@as(u8, 2), out.maxstacksize);
-    try std.testing.expectEqual(false, out.is_vararg);
-    try std.testing.expectEqual(@as(?u8, null), out.vararg_table_reg);
+    try std.testing.expectEqual(false, out.flags.is_vararg);
+    try std.testing.expectEqual(bc.Proto.no_vararg_reg, out.vararg_table_reg);
     try std.testing.expectEqual(@as(usize, 2), out.code.len);
     try std.testing.expectEqual(@as(u32, @bitCast(insts[0])), @as(u32, @bitCast(out.code[0])));
     try std.testing.expectEqual(@as(u32, @bitCast(insts[1])), @as(u32, @bitCast(out.code[1])));
@@ -758,13 +758,14 @@ test "UndumpReader: undumpProto round-trips vararg + upvalues + locvars" {
         .locvars = &lvs,
         .maxstacksize = 3,
         .numparams = 1,
-        .is_vararg = true,
+        .flags = .{ .is_vararg = true },
         .vararg_table_reg = 5,
-        .name = "f",
-        .source_name = "f.lua",
         .line_defined = 5,
         .last_line_defined = 6,
     };
+    const proto_mut: *bc.Proto = @constCast(&proto);
+    proto_mut.setName("f");
+    proto_mut.setSourceName("f.lua");
 
     try w.dumpProto(&proto, .{});
 
@@ -775,8 +776,8 @@ test "UndumpReader: undumpProto round-trips vararg + upvalues + locvars" {
     // tree structurally. k strings are VM-owned/undefined on this path.
     defer bc.destroyProtoTree(std.testing.allocator, out, true);
 
-    try std.testing.expectEqual(true, out.is_vararg);
-    try std.testing.expectEqual(@as(?u8, 5), out.vararg_table_reg);
+    try std.testing.expectEqual(true, out.flags.is_vararg);
+    try std.testing.expectEqual(@as(u8, 5), out.vararg_table_reg);
     try std.testing.expectEqual(@as(u8, 1), out.numparams);
     try std.testing.expectEqual(@as(usize, 2), out.upvalues.len);
     try std.testing.expectEqual(true, out.upvalues[0].instack);
@@ -813,13 +814,13 @@ test "UndumpReader: undumpChunk round-trips a full chunk" {
         .locvars = &lvs,
         .maxstacksize = 2,
         .numparams = 0,
-        .is_vararg = true,
-        .vararg_table_reg = null,
-        .name = "main",
-        .source_name = "chunk.lua",
+        .flags = .{ .is_vararg = true },
         .line_defined = 0,
         .last_line_defined = 0,
     };
+    const proto_mut: *bc.Proto = @constCast(&proto);
+    proto_mut.setName("main");
+    proto_mut.setSourceName("chunk.lua");
 
     try w.dumpChunk(&proto, .{});
 
@@ -828,9 +829,9 @@ test "UndumpReader: undumpChunk round-trips a full chunk" {
     const out = try r.undumpChunk();
     defer out.tree.?.releaseTree(std.testing.allocator); // frees the whole tree + owner
 
-    try std.testing.expectEqualSlices(u8, "chunk.lua", out.source_name);
-    try std.testing.expectEqualSlices(u8, "main", out.name);
-    try std.testing.expectEqual(true, out.is_vararg);
+    try std.testing.expectEqualSlices(u8, "chunk.lua", out.sourceName());
+    try std.testing.expectEqualSlices(u8, "main", out.name());
+    try std.testing.expectEqual(true, out.flags.is_vararg);
     try std.testing.expectEqual(@as(usize, 1), out.code.len);
     try std.testing.expectEqual(@as(u32, @bitCast(insts[0])), @as(u32, @bitCast(out.code[0])));
 }
@@ -857,13 +858,13 @@ test "UndumpReader: undumpProto round-trips nested protos" {
         .locvars = &inner_lvs,
         .maxstacksize = 2,
         .numparams = 0,
-        .is_vararg = false,
-        .vararg_table_reg = null,
-        .name = "inner",
-        .source_name = "outer.lua",
+        
         .line_defined = 2,
         .last_line_defined = 4,
     };
+    const inner_mut: *bc.Proto = @constCast(&inner);
+    inner_mut.setName("inner");
+    inner_mut.setSourceName("outer.lua");
 
     // Outer proto with one nested child.
     const outer_insts = [_]bc.Instruction{
@@ -884,13 +885,13 @@ test "UndumpReader: undumpProto round-trips nested protos" {
         .locvars = &outer_lvs,
         .maxstacksize = 2,
         .numparams = 0,
-        .is_vararg = true,
-        .vararg_table_reg = null,
-        .name = "outer",
-        .source_name = "outer.lua",
+        .flags = .{ .is_vararg = true },
         .line_defined = 1,
         .last_line_defined = 6,
     };
+    const outer_mut: *bc.Proto = @constCast(&outer);
+    outer_mut.setName("outer");
+    outer_mut.setSourceName("outer.lua");
 
     try w.dumpProto(&outer, .{});
 
@@ -901,11 +902,11 @@ test "UndumpReader: undumpProto round-trips nested protos" {
     // tree structurally. k strings are VM-owned/undefined on this path.
     defer bc.destroyProtoTree(std.testing.allocator, out, true);
 
-    try std.testing.expectEqualSlices(u8, "outer", out.name);
+    try std.testing.expectEqualSlices(u8, "outer", out.name());
     try std.testing.expectEqual(@as(usize, 1), out.p.len);
     const child = out.p[0];
-    try std.testing.expectEqualSlices(u8, "inner", child.name);
-    try std.testing.expectEqualSlices(u8, "outer.lua", child.source_name);
+    try std.testing.expectEqualSlices(u8, "inner", child.name());
+    try std.testing.expectEqualSlices(u8, "outer.lua", child.sourceName());
     try std.testing.expectEqual(@as(u32, 2), child.line_defined);
     try std.testing.expectEqual(@as(u32, 4), child.last_line_defined);
     try std.testing.expectEqual(@as(usize, 1), child.code.len);

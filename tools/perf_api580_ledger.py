@@ -306,6 +306,7 @@ test "api580 interval allocation ledger" {
     w("    \"Cell\": {d},\n", .{@sizeOf(vm_mod.Cell)});
     w("    \"LuaString\": {d},\n", .{@sizeOf(vm_mod.LuaString)});
     w("    \"LuaString_lstrfix\": {d},\n", .{vm_mod.LuaString.lstrfix_header_size});
+    w("    \"LuaString_short_len1\": {d},\n", .{vm_mod.LuaString.short_content_offset + 1 + 1});
     w("    \"Value\": {d},\n", .{@sizeOf(vm_mod.Value)});
     w("    \"Upvaldesc\": {d},\n", .{@sizeOf(bc.Upvaldesc)});
     w("    \"Constant\": {d}\n", .{@sizeOf(bc.Constant)});
@@ -329,7 +330,7 @@ test "api580 interval allocation ledger" {
     w("      \"live_reg_top_len\": {d},\n", .{proto.live_reg_top.len});
     w("      \"ref_count\": {d},\n", .{proto.ref_count});
     w("      \"source_backing_extra\": {},\n", .{proto.source_backing.extra != null});
-    w("      \"source_backing_pin_len\": {d},\n", .{if (proto.source_backing.pin) |p| p.len else 0});
+    w("      \"source_backing_pin_len\": {d},\n", .{if (proto.source_backing.pin) |p| p.len() else 0});
     w("      \"constants\": [", .{});
     for (proto.resolved_values, 0..) |rv, i| {
         if (i > 0) w(", ", .{});
@@ -728,7 +729,9 @@ def assemble_ledger(anchored: dict, variance: dict, driver_anchored: dict,
     measured_anchored = int(driver_anchored["delta"])
     measured_no_xy_root = int(driver_no_xy_root["delta"])
     charged_anchored = zig["charged_total"]
-    charged_no_xy_root = charged_anchored + 2 * (sizes["LuaString"] + 1)
+    # Re-intern adds 2 x per-kind short allocation (1-byte content,
+    # NUL included — PUC sizestrshr), NOT full-header strings.
+    charged_no_xy_root = charged_anchored + 2 * sizes["LuaString_short_len1"]
 
     verdict = "GREEN" if measured_anchored < 400 else "DEVIATION"
     savings_needed = max(0, measured_anchored - 399)
@@ -761,12 +764,11 @@ def assemble_ledger(anchored: dict, variance: dict, driver_anchored: dict,
                 "charged_total": charged_no_xy_root,
                 "reconciled": measured_no_xy_root == charged_no_xy_root,
                 "note": (
-                    f"adds the X/Y re-intern: 2 x "
-                    f"(sizeof(LuaString)+1) = "
-                    f"{charged_no_xy_root - charged_anchored} charged; each "
-                    f"allocation is @sizeOf(LuaString)+1 bytes (extra NUL "
-                    f"byte not charged), so tracker bytes exceed the charge "
-                    f"by 2"),
+                    f"adds the X/Y re-intern: 2 x per-kind short allocation "
+                    f"(short_content_offset+1+1) = "
+                    f"{charged_no_xy_root - charged_anchored} charged; "
+                    f"tracker bytes equal the charge (the NUL is included "
+                    f"in the per-kind rule since P16.18 T2)"),
             },
             "real_outstanding_anchored": {
                 "tracker_bytes": zig["real_outstanding_total"],

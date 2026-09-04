@@ -1,20 +1,13 @@
 {
   "provenance": {
-    "created_utc": "2026-09-04T15:11:14Z",
-    "repo": "/home/boss/codes/luazig",
     "git_head": "ea27ce7",
-    "git_head_note": "tree has unrelated local modifications in tools/perf/* (baseline-p15.37.json, perf_compare.py, baseline-approved.json untracked); no source changes made by this profile",
+    "measured_source_head": "ea27ce7",
+    "git_dirty": "clean",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "pinning": "taskset -c 0 for all measurement runs",
-    "zig_binary": "zig-out/bin/luazig",
-    "zig_sha16": "e24cc3fb776ee14d",
-    "puc_binary": "build/lua-c/lua",
-    "puc_sha16": "d54bc45e1757b216",
-    "workload_source": "tools/microbench.lua",
-    "measurement_notes": "perf stat -e instructions,task-clock,cycles x5 runs per workload/binary, median recorded; all instruction counts unimodal (spread < 0.002%), no bimodality observed despite randomized hash seeds; symbol/hot-line percentages are cycles-based samples (perf default event), instruction attribution is approximate",
-    "n_values": { "metamethod_call_noalloc": 500000, "lua_calls": 5000000 },
-    "n_note": "whole-run instruction counts include warmup (n/100 iters) + harness/startup, identical on both sides; instr_per_iter = median_instructions / n is approximate"
+    "zig_binary_sha16": "e24cc3fb776ee14d",
+    "puc_binary_sha16": "d54bc45e1757b216",
+    "note": "Differential lanes measured in-session by a pinned (taskset -c 0) subagent at clean ea27ce7; artifact committed separately \u2014 the commit below is the artifact commit, not the measured source."
   },
   "workloads": {
     "metamethod_call_noalloc": {
@@ -23,62 +16,205 @@
       "puc": {
         "sha16": "d54bc45e1757b216",
         "instr_median": 187626176,
-        "instr_modes": [{ "value": 187626176, "freq": "5/5, spread 187624712..187626891 (unimodal)" }],
+        "instr_modes": [
+          {
+            "value": 187626176,
+            "freq": "5/5, spread 187624712..187626891 (unimodal)"
+          }
+        ],
         "cycles_median": 35435256,
         "seconds_median": 0.0101,
         "instr_per_iter": 375.3,
         "symbols": [
-          { "name": "luaV_execute", "self_pct": 47.47 },
-          { "name": "luaD_precall", "self_pct": 11.32 },
-          { "name": "luaT_callTMres", "self_pct": 10.56 },
-          { "name": "luaD_call", "self_pct": 7.19 },
-          { "name": "callbinTM", "self_pct": 7.06 },
-          { "name": "luaT_trybinTM", "self_pct": 4.12 },
-          { "name": "luaT_gettmbyobj", "self_pct": 3.36 },
-          { "name": "luaH_Hgetshortstr", "self_pct": 2.10 },
-          { "name": "luaH_resize", "self_pct": 1.07 },
-          { "name": "luaH_newkey.part.0", "self_pct": 0.53 },
-          { "name": "insertkey", "self_pct": 0.50 },
-          { "name": "mainpositionTV.isra.0", "self_pct": 0.47 }
+          {
+            "name": "luaV_execute",
+            "self_pct": 47.47
+          },
+          {
+            "name": "luaD_precall",
+            "self_pct": 11.32
+          },
+          {
+            "name": "luaT_callTMres",
+            "self_pct": 10.56
+          },
+          {
+            "name": "luaD_call",
+            "self_pct": 7.19
+          },
+          {
+            "name": "callbinTM",
+            "self_pct": 7.06
+          },
+          {
+            "name": "luaT_trybinTM",
+            "self_pct": 4.12
+          },
+          {
+            "name": "luaT_gettmbyobj",
+            "self_pct": 3.36
+          },
+          {
+            "name": "luaH_Hgetshortstr",
+            "self_pct": 2.1
+          },
+          {
+            "name": "luaH_resize",
+            "self_pct": 1.07
+          },
+          {
+            "name": "luaH_newkey.part.0",
+            "self_pct": 0.53
+          },
+          {
+            "name": "insertkey",
+            "self_pct": 0.5
+          },
+          {
+            "name": "mainpositionTV.isra.0",
+            "self_pct": 0.47
+          }
         ]
       },
       "zig": {
         "sha16": "e24cc3fb776ee14d",
         "instr_median": 462158977,
-        "instr_modes": [{ "value": 462158977, "freq": "5/5, spread 462157117..462164201 (unimodal)" }],
+        "instr_modes": [
+          {
+            "value": 462158977,
+            "freq": "5/5, spread 462157117..462164201 (unimodal)"
+          }
+        ],
         "cycles_median": 92385397,
         "seconds_median": 0.02468,
         "instr_per_iter": 924.3,
         "symbols": [
-          { "name": "vm.Vm.runBytecodeDispatch", "self_pct": 54.93, "note": "nearly everything inlines here (mmbin handler, opReturn fast path, per-instruction checks, slice re-derivation) — see hot_lines for honest attribution" },
-          { "name": "vm.Vm.pushStagedBytecodeExecFrame", "self_pct": 12.63 },
-          { "name": "vm.Vm.pushResolvedBytecodeClosure", "self_pct": 11.44 },
-          { "name": "vm.Vm.tryPushSimpleResultMetamethod", "self_pct": 10.05 },
-          { "name": "vm.Vm.getTmByObj", "self_pct": 4.0 },
-          { "name": "vm.FrameStack.addOne", "self_pct": 1.37 },
-          { "name": "vm.Vm.dispatchCalleeActivationHook", "self_pct": 1.11 },
-          { "name": "ltable.nodeInsert", "self_pct": 0.62 },
-          { "name": "vm.Vm.tableResize", "self_pct": 0.61 },
-          { "name": "vm.Vm.syncFrame", "self_pct": 0.48 },
-          { "name": "vm.Vm.rawSet", "self_pct": 0.31 },
-          { "name": "vm.Vm.gcPropagateOne", "self_pct": 0.21 }
+          {
+            "name": "vm.Vm.runBytecodeDispatch",
+            "self_pct": 54.93,
+            "note": "nearly everything inlines here (mmbin handler, opReturn fast path, per-instruction checks, slice re-derivation) \u2014 see hot_lines for honest attribution"
+          },
+          {
+            "name": "vm.Vm.pushStagedBytecodeExecFrame",
+            "self_pct": 12.63
+          },
+          {
+            "name": "vm.Vm.pushResolvedBytecodeClosure",
+            "self_pct": 11.44
+          },
+          {
+            "name": "vm.Vm.tryPushSimpleResultMetamethod",
+            "self_pct": 10.05
+          },
+          {
+            "name": "vm.Vm.getTmByObj",
+            "self_pct": 4.0
+          },
+          {
+            "name": "vm.FrameStack.addOne",
+            "self_pct": 1.37
+          },
+          {
+            "name": "vm.Vm.dispatchCalleeActivationHook",
+            "self_pct": 1.11
+          },
+          {
+            "name": "ltable.nodeInsert",
+            "self_pct": 0.62
+          },
+          {
+            "name": "vm.Vm.tableResize",
+            "self_pct": 0.61
+          },
+          {
+            "name": "vm.Vm.syncFrame",
+            "self_pct": 0.48
+          },
+          {
+            "name": "vm.Vm.rawSet",
+            "self_pct": 0.31
+          },
+          {
+            "name": "vm.Vm.gcPropagateOne",
+            "self_pct": 0.21
+          }
         ],
         "hot_lines": [
-          { "file": "src/lua/vm.zig:15332", "pct": 7.48, "what": "opReturn1 simple_result fast path: self.bc_stack[parent_c.base + sr_dst] = src_val (copy metamethod result into parent register)" },
-          { "file": "src/lua/vm.zig:13105", "pct": 7.07, "what": "dispatch switch (op)" },
-          { "file": "src/lua/vm.zig:12918", "pct": 6.25, "what": "per-instruction if (self.hooks_active_cached) check" },
-          { "file": "src/lua/vm.zig:12825", "pct": 2.4, "what": "ctx.boxed = self.bc_boxed[fr.base .. fr.base + frame_cap] — per-frame slice re-derivation" },
-          { "file": "src/lua/vm.zig:1745", "pct": 2.25, "what": "FrameStack.getPtr: return &self.inline_frames[index]" },
-          { "file": "src/lua/vm.zig:12824", "pct": 2.18, "what": "ctx.regs = self.bc_stack[fr.base .. fr.base + frame_cap] — per-frame slice re-derivation" },
-          { "file": "src/lua/vm.zig:1743", "pct": 2.14, "what": "FrameStack.getPtr: if (index < INLINE_FRAME_CAP) branch" },
-          { "file": "src/lua/vm.zig:12832", "pct": 2.09, "what": "defer self.syncFrame(&ctx, frame_identity)" },
-          { "file": "src/lua/vm.zig:12809", "pct": 2.09, "what": "frame_identity = exec_frames.getPtr(ctx.frame_index).activation_id load" },
-          { "file": "src/lua/vm.zig:1779", "pct": 2.0, "what": "FrameStack.shrinkTo branch (frame pop)" },
-          { "file": "src/lua/vm.zig:1754", "pct": 1.96, "what": "FrameStack.getConstPtr inline_frames" },
-          { "file": "src/lua/vm.zig:35136", "pct": 1.53, "what": "findBinaryTm: return self.getTmByObj(lhs, event) orelse self.getTmByObj(rhs, event)" },
-          { "file": "src/lua/vm.zig:12818", "pct": 1.53, "what": "ctx.cur_proto = fr.proto().? load" },
-          { "file": "src/lua/vm.zig:14180", "pct": 1.43, "what": "mmbin handler: tm.? argument setup for tryPushSimpleResultMetamethod" },
-          { "file": "src/lua/vm.zig:14762", "pct": 1.3, "what": "integer for-loop (FORLOOP) idx update (warmup/harness loop)" }
+          {
+            "file": "src/lua/vm.zig:15332",
+            "pct": 7.48,
+            "what": "opReturn1 simple_result fast path: self.bc_stack[parent_c.base + sr_dst] = src_val (copy metamethod result into parent register)"
+          },
+          {
+            "file": "src/lua/vm.zig:13105",
+            "pct": 7.07,
+            "what": "dispatch switch (op)"
+          },
+          {
+            "file": "src/lua/vm.zig:12918",
+            "pct": 6.25,
+            "what": "per-instruction if (self.hooks_active_cached) check"
+          },
+          {
+            "file": "src/lua/vm.zig:12825",
+            "pct": 2.4,
+            "what": "ctx.boxed = self.bc_boxed[fr.base .. fr.base + frame_cap] \u2014 per-frame slice re-derivation"
+          },
+          {
+            "file": "src/lua/vm.zig:1745",
+            "pct": 2.25,
+            "what": "FrameStack.getPtr: return &self.inline_frames[index]"
+          },
+          {
+            "file": "src/lua/vm.zig:12824",
+            "pct": 2.18,
+            "what": "ctx.regs = self.bc_stack[fr.base .. fr.base + frame_cap] \u2014 per-frame slice re-derivation"
+          },
+          {
+            "file": "src/lua/vm.zig:1743",
+            "pct": 2.14,
+            "what": "FrameStack.getPtr: if (index < INLINE_FRAME_CAP) branch"
+          },
+          {
+            "file": "src/lua/vm.zig:12832",
+            "pct": 2.09,
+            "what": "defer self.syncFrame(&ctx, frame_identity)"
+          },
+          {
+            "file": "src/lua/vm.zig:12809",
+            "pct": 2.09,
+            "what": "frame_identity = exec_frames.getPtr(ctx.frame_index).activation_id load"
+          },
+          {
+            "file": "src/lua/vm.zig:1779",
+            "pct": 2.0,
+            "what": "FrameStack.shrinkTo branch (frame pop)"
+          },
+          {
+            "file": "src/lua/vm.zig:1754",
+            "pct": 1.96,
+            "what": "FrameStack.getConstPtr inline_frames"
+          },
+          {
+            "file": "src/lua/vm.zig:35136",
+            "pct": 1.53,
+            "what": "findBinaryTm: return self.getTmByObj(lhs, event) orelse self.getTmByObj(rhs, event)"
+          },
+          {
+            "file": "src/lua/vm.zig:12818",
+            "pct": 1.53,
+            "what": "ctx.cur_proto = fr.proto().? load"
+          },
+          {
+            "file": "src/lua/vm.zig:14180",
+            "pct": 1.43,
+            "what": "mmbin handler: tm.? argument setup for tryPushSimpleResultMetamethod"
+          },
+          {
+            "file": "src/lua/vm.zig:14762",
+            "pct": 1.3,
+            "what": "integer for-loop (FORLOOP) idx update (warmup/harness loop)"
+          }
         ]
       },
       "extra_cost": {
@@ -92,61 +228,201 @@
       "puc": {
         "sha16": "d54bc45e1757b216",
         "instr_median": 1285493834,
-        "instr_modes": [{ "value": 1285493834, "freq": "5/5, spread 1285491627..1285494782 (unimodal)" }],
+        "instr_modes": [
+          {
+            "value": 1285493834,
+            "freq": "5/5, spread 1285491627..1285494782 (unimodal)"
+          }
+        ],
         "cycles_median": 350091452,
         "seconds_median": 0.0957,
         "instr_per_iter": 257.1,
         "symbols": [
-          { "name": "luaV_execute", "self_pct": 84.22 },
-          { "name": "luaD_precall", "self_pct": 15.11 },
-          { "name": "luaH_finishset", "self_pct": 0.08 },
-          { "name": "luaH_resize", "self_pct": 0.08 },
-          { "name": "realloc (libc)", "self_pct": 0.05 },
-          { "name": "getintfromhash", "self_pct": 0.03 },
-          { "name": "newcheckedkey", "self_pct": 0.03 },
-          { "name": "insertkey", "self_pct": 0.03 },
-          { "name": "mainpositionTV.isra.0", "self_pct": 0.03 },
-          { "name": "codearith", "self_pct": 0.02 },
-          { "name": "internshrstr", "self_pct": 0.02 }
+          {
+            "name": "luaV_execute",
+            "self_pct": 84.22
+          },
+          {
+            "name": "luaD_precall",
+            "self_pct": 15.11
+          },
+          {
+            "name": "luaH_finishset",
+            "self_pct": 0.08
+          },
+          {
+            "name": "luaH_resize",
+            "self_pct": 0.08
+          },
+          {
+            "name": "realloc (libc)",
+            "self_pct": 0.05
+          },
+          {
+            "name": "getintfromhash",
+            "self_pct": 0.03
+          },
+          {
+            "name": "newcheckedkey",
+            "self_pct": 0.03
+          },
+          {
+            "name": "insertkey",
+            "self_pct": 0.03
+          },
+          {
+            "name": "mainpositionTV.isra.0",
+            "self_pct": 0.03
+          },
+          {
+            "name": "codearith",
+            "self_pct": 0.02
+          },
+          {
+            "name": "internshrstr",
+            "self_pct": 0.02
+          }
         ]
       },
       "zig": {
         "sha16": "e24cc3fb776ee14d",
         "instr_median": 3693655524,
-        "instr_modes": [{ "value": 3693655524, "freq": "5/5, spread 3693650876..3693661601 (unimodal)" }],
+        "instr_modes": [
+          {
+            "value": 3693655524,
+            "freq": "5/5, spread 3693650876..3693661601 (unimodal)"
+          }
+        ],
         "cycles_median": 722416669,
         "seconds_median": 0.1934,
         "instr_per_iter": 738.7,
         "symbols": [
-          { "name": "vm.Vm.runBytecodeDispatch", "self_pct": 77.06, "note": "nearly everything inlines here — see hot_lines" },
-          { "name": "vm.Vm.pushStagedBytecodeExecFrame", "self_pct": 15.42 },
-          { "name": "vm.Vm.syncFrame", "self_pct": 4.76 },
-          { "name": "vm.FrameStack.addOne", "self_pct": 2.21 },
-          { "name": "vm.Vm.tableResize", "self_pct": 0.06 },
-          { "name": "vm.Vm.rawSet", "self_pct": 0.05 },
-          { "name": "ltable.nodeInsert", "self_pct": 0.05 },
-          { "name": "vm.Vm.gcPropagateOne", "self_pct": 0.05 },
-          { "name": "compiler_rt.memcpy.memcpyFast", "self_pct": 0.03 },
-          { "name": "vm.GcObject.fromValue", "self_pct": 0.03 },
-          { "name": "ltable.Node.keyMatches", "self_pct": 0.02 },
-          { "name": "heap.SmpAllocator.alloc", "self_pct": 0.02 }
+          {
+            "name": "vm.Vm.runBytecodeDispatch",
+            "self_pct": 77.06,
+            "note": "nearly everything inlines here \u2014 see hot_lines"
+          },
+          {
+            "name": "vm.Vm.pushStagedBytecodeExecFrame",
+            "self_pct": 15.42
+          },
+          {
+            "name": "vm.Vm.syncFrame",
+            "self_pct": 4.76
+          },
+          {
+            "name": "vm.FrameStack.addOne",
+            "self_pct": 2.21
+          },
+          {
+            "name": "vm.Vm.tableResize",
+            "self_pct": 0.06
+          },
+          {
+            "name": "vm.Vm.rawSet",
+            "self_pct": 0.05
+          },
+          {
+            "name": "ltable.nodeInsert",
+            "self_pct": 0.05
+          },
+          {
+            "name": "vm.Vm.gcPropagateOne",
+            "self_pct": 0.05
+          },
+          {
+            "name": "compiler_rt.memcpy.memcpyFast",
+            "self_pct": 0.03
+          },
+          {
+            "name": "vm.GcObject.fromValue",
+            "self_pct": 0.03
+          },
+          {
+            "name": "ltable.Node.keyMatches",
+            "self_pct": 0.02
+          },
+          {
+            "name": "heap.SmpAllocator.alloc",
+            "self_pct": 0.02
+          }
         ],
         "hot_lines": [
-          { "file": "src/lua/vm.zig:12918", "pct": 9.08, "what": "per-instruction if (self.hooks_active_cached) check" },
-          { "file": "src/lua/vm.zig:13105", "pct": 7.53, "what": "dispatch switch (op)" },
-          { "file": "src/lua/vm.zig:12899", "pct": 4.95, "what": "per-instruction if (self.stats.enabled) check" },
-          { "file": "src/lua/vm.zig:14972", "pct": 3.91, "what": "ctx.pc += 1 (dispatch advance)" },
-          { "file": "src/lua/vm.zig:1745", "pct": 3.29, "what": "FrameStack.getPtr: return &self.inline_frames[index]" },
-          { "file": "src/lua/vm.zig:12884", "pct": 2.95, "what": "const inst = ctx.cur_proto.code[ctx.pc] fetch" },
-          { "file": "src/lua/vm.zig:12825", "pct": 2.83, "what": "ctx.boxed slice re-derivation" },
-          { "file": "src/lua/vm.zig:14662", "pct": 2.42, "what": "OP_CALL: try self.pushStagedBytecodeExecFrame(...)" },
-          { "file": "src/lua/vm.zig:1743", "pct": 2.03, "what": "FrameStack.getPtr INLINE_FRAME_CAP branch" },
-          { "file": "src/lua/vm.zig:1754", "pct": 2.03, "what": "FrameStack.getConstPtr inline_frames" },
-          { "file": "src/lua/vm.zig:12824", "pct": 1.99, "what": "ctx.regs slice re-derivation" },
-          { "file": "src/lua/vm.zig:12820", "pct": 1.98, "what": "ctx.cur_upvalues = self.bc_stack[fr.func_slot].Closure.upvalues" },
-          { "file": "src/lua/vm.zig:13883", "pct": 1.88, "what": "ADD Int fast path (lb == .Int)" },
-          { "file": "src/lua/vm.zig:12832", "pct": 1.76, "what": "defer self.syncFrame(&ctx, frame_identity)" },
-          { "file": "src/lua/vm.zig:12809", "pct": 1.73, "what": "frame_identity activation_id load" }
+          {
+            "file": "src/lua/vm.zig:12918",
+            "pct": 9.08,
+            "what": "per-instruction if (self.hooks_active_cached) check"
+          },
+          {
+            "file": "src/lua/vm.zig:13105",
+            "pct": 7.53,
+            "what": "dispatch switch (op)"
+          },
+          {
+            "file": "src/lua/vm.zig:12899",
+            "pct": 4.95,
+            "what": "per-instruction if (self.stats.enabled) check"
+          },
+          {
+            "file": "src/lua/vm.zig:14972",
+            "pct": 3.91,
+            "what": "ctx.pc += 1 (dispatch advance)"
+          },
+          {
+            "file": "src/lua/vm.zig:1745",
+            "pct": 3.29,
+            "what": "FrameStack.getPtr: return &self.inline_frames[index]"
+          },
+          {
+            "file": "src/lua/vm.zig:12884",
+            "pct": 2.95,
+            "what": "const inst = ctx.cur_proto.code[ctx.pc] fetch"
+          },
+          {
+            "file": "src/lua/vm.zig:12825",
+            "pct": 2.83,
+            "what": "ctx.boxed slice re-derivation"
+          },
+          {
+            "file": "src/lua/vm.zig:14662",
+            "pct": 2.42,
+            "what": "OP_CALL: try self.pushStagedBytecodeExecFrame(...)"
+          },
+          {
+            "file": "src/lua/vm.zig:1743",
+            "pct": 2.03,
+            "what": "FrameStack.getPtr INLINE_FRAME_CAP branch"
+          },
+          {
+            "file": "src/lua/vm.zig:1754",
+            "pct": 2.03,
+            "what": "FrameStack.getConstPtr inline_frames"
+          },
+          {
+            "file": "src/lua/vm.zig:12824",
+            "pct": 1.99,
+            "what": "ctx.regs slice re-derivation"
+          },
+          {
+            "file": "src/lua/vm.zig:12820",
+            "pct": 1.98,
+            "what": "ctx.cur_upvalues = self.bc_stack[fr.func_slot].Closure.upvalues"
+          },
+          {
+            "file": "src/lua/vm.zig:13883",
+            "pct": 1.88,
+            "what": "ADD Int fast path (lb == .Int)"
+          },
+          {
+            "file": "src/lua/vm.zig:12832",
+            "pct": 1.76,
+            "what": "defer self.syncFrame(&ctx, frame_identity)"
+          },
+          {
+            "file": "src/lua/vm.zig:12809",
+            "pct": 1.73,
+            "what": "frame_identity activation_id load"
+          }
         ]
       },
       "extra_cost": {
@@ -160,17 +436,17 @@
       "extra_instr_per_iter": 549,
       "where_extra_concentrates": [
         "Call/return frame machinery dominates the excess: pushStagedBytecodeExecFrame (12.63% self) + pushResolvedBytecodeClosure (11.44%) + tryPushSimpleResultMetamethod (10.05%) + opReturn simple_result fast path (vm.zig:15332, 7.48%) + FrameStack getPtr/shrinkTo/addOne lines (~8% combined) + syncFrame/defer/frame_identity (~4.5%) ~= 340 instr/iter equivalent, vs PUC's entire call path (luaD_precall 11.32% + luaT_callTMres 10.56% + luaD_call 7.19% + callbinTM 7.06% ~= 135 instr/iter). The frame push/pop machinery alone accounts for roughly +200 instr/iter of excess.",
-        "Per-instruction dispatch overhead inside runBytecodeDispatch: hooks_active_cached check (6.25%), stats.enabled check (2.58%), dispatch switch decode (7.07%), per-frame ctx.regs/ctx.boxed slice re-derivation (4.58%), cur_proto/cur_upvalues loads (~3.5%) — PUC pays none of these per instruction (no hooks flag check in the hot loop, no stats check, register window is a plain base pointer, no slice objects).",
-        "getTmByObj lookup itself is NOT the main excess: zig getTmByObj symbol (4.00%) + findBinaryTm line (1.53%) ~= 5.5% of zig samples ~= 37-51 instr/iter, vs PUC luaT_gettmbyobj (3.36%) + luaH_Hgetshortstr (2.10%) = 5.46% of PUC samples ~= 20 instr/iter. Excess is roughly +17-30 instr/iter, i.e. only ~3-5% of the +549 delta. The lookup is proportionally (and absolutely) only ~1.8-2.5x PUC — comparable to the overall 2.46x ratio, not a disproportionate hotspot."
+        "Per-instruction dispatch overhead inside runBytecodeDispatch: hooks_active_cached check (6.25%), stats.enabled check (2.58%), dispatch switch decode (7.07%), per-frame ctx.regs/ctx.boxed slice re-derivation (4.58%), cur_proto/cur_upvalues loads (~3.5%) \u2014 PUC pays none of these per instruction (no hooks flag check in the hot loop, no stats check, register window is a plain base pointer, no slice objects).",
+        "getTmByObj lookup itself is NOT the main excess: zig getTmByObj symbol (4.00%) + findBinaryTm line (1.53%) ~= 5.5% of zig samples ~= 37-51 instr/iter, vs PUC luaT_gettmbyobj (3.36%) + luaH_Hgetshortstr (2.10%) = 5.46% of PUC samples ~= 20 instr/iter. Excess is roughly +17-30 instr/iter, i.e. only ~3-5% of the +549 delta. The lookup is proportionally (and absolutely) only ~1.8-2.5x PUC \u2014 comparable to the overall 2.46x ratio, not a disproportionate hotspot."
       ],
-      "getTmByObj_vs_luaT_gettmbyobj": "zig lookup path (getTmByObj+findBinaryTm+inlined nodeLookupShortStrIdentity) ~= 5.5% of samples vs PUC (luaT_gettmbyobj+luaH_Hgetshortstr) 5.46% of samples; in absolute instr/iter ~37-51 vs ~20. Excess absolute cost exists (~2x) but is in line with the global 2.46x slowdown — the metamethod lookup is NOT where the disproportionate extra cost sits."
+      "getTmByObj_vs_luaT_gettmbyobj": "zig lookup path (getTmByObj+findBinaryTm+inlined nodeLookupShortStrIdentity) ~= 5.5% of samples vs PUC (luaT_gettmbyobj+luaH_Hgetshortstr) 5.46% of samples; in absolute instr/iter ~37-51 vs ~20. Excess absolute cost exists (~2x) but is in line with the global 2.46x slowdown \u2014 the metamethod lookup is NOT where the disproportionate extra cost sits."
     },
     "lua_calls": {
       "extra_instr_per_iter": 482,
       "where_extra_concentrates": [
-        "pushStagedBytecodeExecFrame alone is 15.42% self (~114 instr/iter) vs PUC luaD_precall 15.11% (~39 instr/iter) — the Lua-closure call setup costs ~3x more instructions in absolute terms.",
+        "pushStagedBytecodeExecFrame alone is 15.42% self (~114 instr/iter) vs PUC luaD_precall 15.11% (~39 instr/iter) \u2014 the Lua-closure call setup costs ~3x more instructions in absolute terms.",
         "Per-instruction overhead inside the dispatch loop: hooks check (9.08%) + stats check (4.95%) + pc advance (3.91%) + inst fetch (2.95%) + slice re-derivation (4.82%) + FrameStack getPtr lines (~7.4%) ~= 33% of samples ~= ~240 instr/iter, vs PUC's luaV_execute 84.22% (~217 instr/iter) which contains its equivalents nearly free (base-pointer register window, no per-instr hook/stats flags, direct ci pointer).",
-        "syncFrame (4.76% self + 1.76% defer line + frame_identity 1.73%) — PUC has no equivalent write-back; it keeps pc in the CallInfo directly."
+        "syncFrame (4.76% self + 1.76% defer line + frame_identity 1.73%) \u2014 PUC has no equivalent write-back; it keeps pc in the CallInfo directly."
       ]
     },
     "summary": "For identical workloads luazig spends 2.5-2.9x the instructions of PUC. The excess is NOT in the metamethod/TM lookup itself (getTmByObj is proportionally no worse than the whole VM); it concentrates in (1) the staged frame push/pop machinery (pushStagedBytecodeExecFrame / pushResolvedBytecodeClosure / tryPushSimpleResultMetamethod / opReturn fast path / FrameStack getPtr-shrinkTo / syncFrame write-back), and (2) fixed per-instruction dispatch overhead (hooks_active_cached + stats.enabled checks, ctx.regs/ctx.boxed slice re-derivation per frame, activation_id load, defer syncFrame). PUC's equivalents (luaD_precall + direct ci->u.l.savedpc updates, plain base pointer) are dramatically cheaper in absolute instructions."

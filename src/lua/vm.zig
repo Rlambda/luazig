@@ -11840,21 +11840,14 @@ pub const Vm = struct {
             if (proto.tree) |t| std.debug.assert(t.flags.constants_resolved);
         }
         // PUC Lua limits the value stack, not the number of Lua activations.
-        // Bytecode calls are represented by heap-resident CallInfo-like
-        // descriptors. PUC-faithful iterative dispatch (`goto startfunc` in
-        // luaV_execute OP_CALL) keeps Lua-to-Lua calls in the SAME C frame,
-        // so the limit can be very high — bounded only by bc_stack slots.
-        // PUC Lua has no call-frame count limit — only the stack size
-        // limit (LUAI_MAXSTACK). We use a high limit to prevent runaway
-        // recursion from exhausting memory, but it should be high enough
-        // that normal stack overflow occurs first.
-        // P16.10a T17: the error-handler-dependent frame limit is computed
-        // LAZILY inside the overflow branch below — calling
-        // activeErrorHandlerDepth() on every activation was measured at
-        // ~11% of this function (frame-push analysis artifact) and is
-        // provably needed only when the limit check actually trips.
-        const default_max_call_frames: usize = 1000000;
-        const error_handler_call_frames: usize = 10000;
+        // P16.20 T5: the independent frame-count machinery is REMOVED. Every
+        // Lua activation consumes >= 3 bc_stack slots (func + frame_cap,
+        // frame_cap = maxstacksize + margin >= 3), so 1M−200 soft / 1M+200
+        // physical slot limits are ALWAYS reached before 1e6 frames; inside
+        // an error handler the physical cap bounds handler recursion exactly
+        // like PUC's ERRORSTACKSIZE headroom (PUC raises a second
+        // luaD_growstack "stack overflow" there — so does the
+        // handling_overflow branch below). No separate Lua-frame limit.
         // PUC: LUAI_MAXSTACK = 1000000. Physical stack is LUAI_MAXSTACK +
         // ERRORSTACKSIZE. Overflow triggers at LUAI_MAXSTACK uniformly.
         // The extra ERRORSTACKSIZE slots are physical headroom so error
@@ -11926,27 +11919,12 @@ pub const Vm = struct {
             if (needed_top > self.bc_stack.len) {
                 return self.fail("stack overflow", .{});
             }
-        } else if (needed_top > lua_stack_overflow_limit or
-            exec_frames.len() >= error_handler_call_frames)
-        {
-            // P16.10a T17: activeErrorHandlerDepth() was measured at ~11%
-            // of this function and is provably needed only when the limit
-            // check actually trips. The outer condition is a cheap
-            // superset (the smallest possible frame limit); the exact
-            // error-handler-dependent limit is resolved only here.
-            const effective_max_call_frames: usize = if (self.activeErrorHandlerDepth() != 0)
-                error_handler_call_frames
-            else
-                default_max_call_frames;
-            if (needed_top > lua_stack_overflow_limit or
-                exec_frames.len() >= effective_max_call_frames)
-            {
-                // P16.10a T12: the realloc-to-PHYSICAL_LIMIT + fail body is
-                // cold (only reached on actual overflow). Outlined to a
-                // noinline helper to keep the allocator vtable calls and
-                // bc_boxed reload out of the hot path's register pressure.
-                return self.raiseFrameOverflow();
-            }
+        } else if (needed_top > lua_stack_overflow_limit) {
+            // P16.10a T12: the realloc-to-PHYSICAL_LIMIT + fail body is
+            // cold (only reached on actual overflow). Outlined to a
+            // noinline helper to keep the allocator vtable calls and
+            // bc_boxed reload out of the hot path's register pressure.
+            return self.raiseFrameOverflow();
         }
 
         try self.ensureBcStackCap(needed_top);

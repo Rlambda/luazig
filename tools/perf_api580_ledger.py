@@ -80,8 +80,16 @@ def run(cmd: list[str], timeout_s: int = 300,
     return p.returncode, p.stdout, p.stderr
 
 
-def build_all() -> None:
-    run(["zig", "build", "-Doptimize=ReleaseFast"], timeout_s=600)
+def build_all(modes: list[str]) -> None:
+    """Build the luazig binary once per requested optimize mode.
+
+    After the LAST mode is built, the binary on disk corresponds to the last
+    entry; per-mode driver runs below build+run inside the same mode loop, so
+    each delta is always measured with the binary just built for that mode.
+    The PUC reference is mode-independent and built once.
+    """
+    for mode in modes:
+        run(["zig", "build", f"-Doptimize={mode}"], timeout_s=600)
     run(["make", "-C", str(ROOT / "lua-5.5.0"), "clean", "lua-c"],
         timeout_s=180)
 
@@ -243,7 +251,7 @@ test "api580 interval allocation ledger" {
     if (proto.upvalues.len > 0)
         try labels.put(sa, @intFromPtr(proto.upvalues.ptr), "upvalues_desc");
     for (proto.resolved_values) |rv| switch (rv) {
-        .String => |s| if (s.is_external)
+        .String => |s| if (s.isExternal())
             try labels.put(sa, @intFromPtr(s), "external_LuaString_header"),
         else => {},
     };
@@ -297,6 +305,7 @@ test "api580 interval allocation ledger" {
     w("    \"Closure\": {d},\n", .{@sizeOf(vm_mod.Closure)});
     w("    \"Cell\": {d},\n", .{@sizeOf(vm_mod.Cell)});
     w("    \"LuaString\": {d},\n", .{@sizeOf(vm_mod.LuaString)});
+    w("    \"LuaString_lstrfix\": {d},\n", .{vm_mod.LuaString.lstrfix_header_size});
     w("    \"Value\": {d},\n", .{@sizeOf(vm_mod.Value)});
     w("    \"Upvaldesc\": {d},\n", .{@sizeOf(bc.Upvaldesc)});
     w("    \"Constant\": {d}\n", .{@sizeOf(bc.Constant)});
@@ -325,7 +334,7 @@ test "api580 interval allocation ledger" {
     for (proto.resolved_values, 0..) |rv, i| {
         if (i > 0) w(", ", .{});
         switch (rv) {
-            .String => |s| w("{{\"type\": \"string\", \"len\": {d}, \"is_short\": {}, \"is_external\": {}}}", .{ s.len, s.is_short, s.is_external }),
+            .String => |s| w("{{\"type\": \"string\", \"len\": {d}, \"kind\": {d}}}", .{ s.len, @intFromEnum(s.kind) }),
             .Int => |v| w("{{\"type\": \"int\", \"value\": {d}}}", .{v}),
             .Num => |v| w("{{\"type\": \"num\", \"value\": {d}}}", .{v}),
             else => w("{{\"type\": \"{s}\"}}", .{rv.typeName()}),
@@ -642,12 +651,16 @@ def assemble_ledger(anchored: dict, variance: dict, driver_anchored: dict,
         # charged to gc_count_kb (gcNoteAlloc at GC-object creation)
         "Closure": sizes["Closure"],
         "Cell": sizes["Cell"],  # eager _ENV upvalue cell
-        "external_LuaString_header": sizes["LuaString"],  # "aaa..." LSTRFIX
+        # "aaa..." LSTRFIX: P16.17 T2 truncated this header to the PUC
+        # prefix (offsetof-equivalent of TString.falloc = 32 B); charge the
+        # actually-allocated size, matching gcNoteAlloc at creation.
+        "external_LuaString_header": sizes["LuaString_lstrfix"],
         # NOT charged (real memory nonetheless)
         "Closure_upvalues_slice": nups * 8,  # upvalue pointer array
         "string_dedup_leak": dedup_leak,     # leaked per binary load
-        # context-dependent (0 in the anchored context; +146 charged when
-        # the enclosing chunk has no X/Y constants — see context_variance)
+        # context-dependent (0 in the anchored context; 2*(LuaString+1)
+        # charged when the enclosing chunk has no X/Y constants — see
+        # context_variance)
         "xy_reintern": 0,
         # borrowed, not charged (fixed_arrays / stripped dump)
         "code_borrowed": 0,
@@ -748,10 +761,12 @@ def assemble_ledger(anchored: dict, variance: dict, driver_anchored: dict,
                 "charged_total": charged_no_xy_root,
                 "reconciled": measured_no_xy_root == charged_no_xy_root,
                 "note": (
-                    "adds the X/Y re-intern: 2 x (sizeof(LuaString)+1) = 146 "
-                    "charged; the allocations are 74 bytes each (extra NUL "
-                    "byte not charged), so tracker bytes exceed the charge "
-                    "by 2"),
+                    f"adds the X/Y re-intern: 2 x "
+                    f"(sizeof(LuaString)+1) = "
+                    f"{charged_no_xy_root - charged_anchored} charged; each "
+                    f"allocation is @sizeOf(LuaString)+1 bytes (extra NUL "
+                    f"byte not charged), so tracker bytes exceed the charge "
+                    f"by 2"),
             },
             "real_outstanding_anchored": {
                 "tracker_bytes": zig["real_outstanding_total"],
@@ -769,25 +784,44 @@ def assemble_ledger(anchored: dict, variance: dict, driver_anchored: dict,
                 "the initial compile closure AND by the enclosing chunk's "
                 "own constants when it contains the api.lua:578-579 "
                 "trailing statements (\"X = 0; ... X = nil; Y = nil\")."),
-            "anchored_544": (
-                "In the exact api.lua shape the trailing verification "
-                "statements make \"X\"/\"Y\" constants of the enclosing "
-                "chunk; its frame is live for the whole run, so the "
-                "constants root the short strings through every GC and the "
-                "undump finds them in the intern table — no re-intern: 544 "
-                "(binary-measured, stable across 20 runs; reproduced by the "
-                "anchored harness variant)."),
-            "no_xy_root_690": (
-                "Without the trailing statements the enclosing chunk has no "
-                "X/Y constants; the initial compile closure (the only other "
-                "referent) is collected by the pre-m1 GCs (probe-verified), "
-                "X/Y are swept from the intern table, and the undump "
-                "re-interns them: 544 + 146 = 690 (binary-measured; "
-                "reproduced by the variance harness variant)."),
-            "history_note": (
-                "This fully explains the historical 544-690 range recorded "
-                "in STATUS.md for api.lua:580: measurement drivers that "
-                "omitted the trailing X/Y statements measured 690."),
+            "anchored": (
+                f"In the exact api.lua shape the trailing verification "
+                f"statements make \"X\"/\"Y\" constants of the enclosing "
+                f"chunk; its frame is live for the whole run, so the "
+                f"constants root the short strings through every GC and the "
+                f"undump finds them in the intern table — no re-intern: "
+                f"{measured_anchored} (current binary-measured; reproduced "
+                f"by the anchored harness variant)."),
+            "no_xy_root": (
+                f"Without the trailing statements the enclosing chunk has no "
+                f"X/Y constants; the initial compile closure (the only other "
+                f"referent) is collected by the pre-m1 GCs (probe-verified), "
+                f"X/Y are swept from the intern table, and the undump "
+                f"re-interns them: {measured_anchored} + re-intern charge "
+                f"= {measured_no_xy_root} (current binary-measured; "
+                f"reproduced by the variance harness variant)."),
+        },
+        "history": {
+            "p16_16_pre_cuts": {
+                "anchored": 544,
+                "no_xy_root": 690,
+                "note": (
+                    "P16.16 T1 fully explained the then-measured 544-690 "
+                    "range (STATUS.md): drivers omitting the trailing X/Y "
+                    "statements measured 690. Those were the sizes BEFORE "
+                    "the C1-C7 representation cuts; kept here as history "
+                    "only — current values live in measured_delta_* and "
+                    "context_variance above."),
+            },
+            "p16_16_post_cuts": {
+                "anchored": 392,
+                "note": (
+                    "After C1-C7 (P16.16 final, commit 042d0dd): 392 in "
+                    "ReleaseFast, but Debug measured 400 (LuaString auto-"
+                    "union safety tag, P16.17 T1) — the cross-mode failure "
+                    "that motivated the extern-union fix and this ledger's "
+                    "per-mode section."),
+            },
         },
         "puc_measurement_note": (
             "The PUC ledger is source-derived: build/lua-c/lua has no testc "
@@ -803,17 +837,24 @@ def assemble_ledger(anchored: dict, variance: dict, driver_anchored: dict,
             "parity between the two implementations."),
         "findings": {
             "string_dedup_leak": (
-                "loadBinaryChunk (src/lua/vm.zig) never calls "
-                "UndumpReader.deinit(): the string_dedup ArrayList "
-                "(readStringDedup, src/lua/undump.zig) leaks "
-                f"{dedup_leak} bytes per binary-chunk load. It is not "
-                "charged to gc_count_kb (plain allocator bookkeeping, not a "
-                "GC object) and is never freed — it accumulates across "
-                "loads and is visible in the process exit leak report. "
-                "PUC's equivalent (the lundump.c:411 luaH_new dedup table) "
-                "is transient and freed by the interval GC. Fix candidate: "
-                "defer reader.deinit() in loadBinaryChunk (out of scope for "
-                "this ledger task)."),
+                {
+                    "status": "fixed",
+                    "fixed_in_commit": "d4fc485",
+                    "fix": "loadBinaryChunk now defers reader.deinit(); the "
+                           "string_dedup ArrayList is reclaimed per load "
+                           "(current measurement: leaks "
+                           f"{dedup_leak} bytes).",
+                }
+                if dedup_leak == 0 else
+                {
+                    "status": "ACTIVE REGRESSION",
+                    "detail": (
+                        "loadBinaryChunk leaks "
+                        f"{dedup_leak} bytes per binary-chunk load again — "
+                        "reader.deinit() missing or bypassed. PUC's "
+                        "equivalent (lundump.c:411 luaH_new dedup table) is "
+                        "transient and freed by the interval GC."),
+                }),
             "uncounted_upvalues_slice": (
                 "The Closure's upvalue-pointer array (8 bytes for 1 upvalue) "
                 "is allocated with the Closure but never charged to "
@@ -841,10 +882,14 @@ def main() -> int:
                     help="Output JSON path")
     ap.add_argument("--keep-temp", action="store_true",
                     help="Keep the temporary harness directory")
+    ap.add_argument("--modes", default="ReleaseFast,Debug",
+                    help="Comma-separated Zig optimize modes to measure "
+                         "(per-mode driver deltas + provenance)")
     args = ap.parse_args()
 
+    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     if not args.no_build:
-        build_all()
+        build_all(modes)
 
     tmpdir = Path(tempfile.mkdtemp(prefix="api580_ledger_"))
     try:
@@ -852,15 +897,33 @@ def main() -> int:
                                          XY_ROOT_STMT_ANCHORED)
         variance = build_and_run_harness(tmpdir, "variance",
                                          XY_ROOT_STMT_VARIANCE)
-        driver_anchored = run_driver(DRIVER_ANCHORED)
-        driver_no_xy_root = run_driver(DRIVER_NO_XY_ROOT)
+        # Per-mode driver runs: rebuild the binary in each mode, then run
+        # both driver variants against it. Layout-sensitive deltas (and the
+        # 400-B gate) must hold in EVERY mode, so the ledger records each
+        # mode's delta with its own provenance block (T4).
+        per_mode: dict[str, dict] = {}
+        for mode in modes:
+            if not args.no_build:
+                run(["zig", "build", f"-Doptimize={mode}"], timeout_s=600)
+            per_mode[mode] = {
+                "driver_anchored": run_driver(DRIVER_ANCHORED),
+                "driver_no_xy_root": run_driver(DRIVER_NO_XY_ROOT),
+                "provenance": provenance.block(optimize_mode=mode),
+            }
+        # Charged-component harness + probes run against the LAST built
+        # mode's binary (layout is build-mode-stable since P16.17 T1; the
+        # per-mode deltas above prove that for the gate).
         xy_probe_puc = run_xy_root_probe(PUC_LUA, "PUC")
         xy_probe_zig = run_xy_root_probe(ZIG_LUA, "zig")
         puc_sizes = measure_puc_sizes(tmpdir)
 
-        payload = assemble_ledger(anchored, variance, driver_anchored,
-                                  driver_no_xy_root, xy_probe_puc,
-                                  xy_probe_zig, puc_sizes)
+        payload = assemble_ledger(anchored, variance,
+                                  per_mode[modes[0]]["driver_anchored"],
+                                  per_mode[modes[0]]["driver_no_xy_root"],
+                                  xy_probe_puc, xy_probe_zig, puc_sizes)
+        payload["per_mode"] = per_mode
+        payload["provenance"] = provenance.block(
+            optimize_mode="+".join(modes))
 
         out_path = ROOT / args.out if not Path(args.out).is_absolute() \
             else Path(args.out)

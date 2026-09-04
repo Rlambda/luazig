@@ -12075,7 +12075,12 @@ pub const Vm = struct {
         // the isDebugHook block that were here were all dead — they operated
         // on bits already guaranteed zero by this mask.
         ef_slot.callstatus = encodeNresults(nresults);
-        ef_slot.u.lua.resume_pc = INVALID_PC;
+        // P16.21 T3: resume_pc NOT initialized here — every production read
+        // is gated by isHookYield() (CIST_HOOKYIELD), and every site that
+        // sets that bit writes resume_pc first/at the same transition
+        // (value-then-flag ordering). A fresh activation writes callstatus
+        // from scratch (CIST_HOOKYIELD clear), so a stale reused-slot value
+        // is semantically dead. PUC-style validity-by-status-bit.
         ef_slot.reg_top = @intCast(nparams);
         ef_slot.u.lua.last_line_pc = INVALID_PC;
         ef_slot.u.lua.skip_line_hook_pc = INVALID_PC;

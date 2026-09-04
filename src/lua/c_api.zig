@@ -2805,7 +2805,7 @@ pub export fn lua_getlocal(L: ?*lua_State, ar: *lua_Debug, n: c_int) ?[*:0]const
             count += 1;
             if (count == n) {
                 // Push the local's value from the bytecode register file.
-                const reg_idx = frame.base + lv.reg;
+                const reg_idx = frame.frameBase() + lv.reg;
                 if (reg_idx >= vm.bc_stack.len) return null;
                 const val = vm.bc_stack[reg_idx];
                 h.c_stack.append(vm.alloc, val) catch return null;
@@ -2847,7 +2847,7 @@ pub export fn lua_setlocal(L: ?*lua_State, ar: *lua_Debug, n: c_int) ?[*:0]const
                 // Pop the value from c_stack, write to the bytecode register.
                 const val = h.c_stack.items[h.c_stack.items.len - 1];
                 h.c_stack.items.len -= 1;
-                const reg_idx = frame.base + lv.reg;
+                const reg_idx = frame.frameBase() + lv.reg;
                 if (reg_idx >= vm.bc_stack.len) return null;
                 vm.bc_stack[reg_idx] = val;
                 return @ptrCast(@constCast(lv.name.ptr));

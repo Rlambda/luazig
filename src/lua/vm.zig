@@ -4923,7 +4923,6 @@ pub const Vm = struct {
         needed_local: usize,
         frame_cap: *u32,
         regs: *[]Value,
-        boxed: *[]?*Cell,
     ) DispatchError!void {
         const old_cap = frame_cap.*;
         if (needed_local > frame_cap.*) {
@@ -4939,14 +4938,16 @@ pub const Vm = struct {
         // live registers unchanged.
         const cap: usize = frame_cap.*;
         regs.* = self.bc_stack[base .. base + cap];
-        boxed.* = self.bc_boxed[base .. base + cap];
 
         if (frame_cap.* > old_cap) {
-            // Nil-fill new register slots and clear boxed slots. This is
-            // critical for GC safety: new slots might contain stale values
-            // from a previous frame that used this stack region.
+            // Nil-fill new register slots and clear the corresponding boxed
+            // slots. Both are critical: stale register values break GC
+            // safety, and a stale boxed cell pointer would alias a captured
+            // upvalue from a previous frame (captured-local coherence,
+            // smoke 61/67). P16.19 T3: boxed slots are derived here, not
+            // carried in the hot dispatch context.
             for (regs.*[old_cap..]) |*r| r.* = .Nil;
-            for (boxed.*[old_cap..]) |*b| b.* = null;
+            for (self.bc_boxed[base + old_cap .. base + cap]) |*b| b.* = null;
         }
 
         // P15.51g: No frame slice update needed — regs/boxed are derived
@@ -7089,7 +7090,6 @@ pub const Vm = struct {
         try self.gcAutomaticStep();
         // bc_stack may have been realloc'd by GC finalizers.
         ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-        ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
     }
 
     fn allocTable(self: *Vm) DispatchError!*Table {
@@ -8675,7 +8675,6 @@ pub const Vm = struct {
         errdefer if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         const parent = exec_frames.getPtr(parent_index);
         var regs = self.bc_stack[parent.base .. parent.base + parent.u.lua.frame_cap];
-        var boxed = self.bc_boxed[parent.base .. parent.base + parent.u.lua.frame_cap];
         const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
         // P16.2e (CHANGE 5): Guard bcGrowFrame — only call when growth is
         // actually needed. bcGrowFrame unconditionally re-derives regs/boxed
@@ -8692,7 +8691,7 @@ pub const Vm = struct {
         // frame_cap field is always up-to-date (frames are not moved by stack
         // realloc — only the bc_stack/bc_boxed arrays grow).
         if (dst + nstore > parent.u.lua.frame_cap) {
-            try self.bcGrowFrame(parent.base, dst + nstore, &parent.u.lua.frame_cap, &regs, &boxed);
+            try self.bcGrowFrame(parent.base, dst + nstore, &parent.u.lua.frame_cap, &regs);
         }
         for (0..nstore) |i| regs[dst + i] = if (i < ret.len) ret[i] else .Nil;
         if (nresults < 0) parent.reg_top = @intCast(@as(usize, dst) + ret.len);
@@ -8716,9 +8715,8 @@ pub const Vm = struct {
             else => unreachable,
         };
         var regs = self.bc_stack[parent.base .. parent.base + parent.u.lua.frame_cap];
-        var boxed = self.bc_boxed[parent.base .. parent.base + parent.u.lua.frame_cap];
         const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
-        try self.bcGrowFrame(parent.base, dst + nstore, &parent.u.lua.frame_cap, &regs, &boxed);
+        try self.bcGrowFrame(parent.base, dst + nstore, &parent.u.lua.frame_cap, &regs);
         for (0..nstore) |i| regs[dst + i] = if (i < ret.len) ret[i] else .Nil;
         if (nresults < 0) parent.reg_top = @intCast(dst + ret.len);
         if (min_reg_top) |minimum| parent.reg_top = @max(parent.reg_top, minimum);
@@ -8822,8 +8820,7 @@ pub const Vm = struct {
         defer if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         const parent = exec_frames.getPtr(parent_index);
         var regs = self.bc_stack[parent.base .. parent.base + parent.u.lua.frame_cap];
-        var boxed = self.bc_boxed[parent.base .. parent.base + parent.u.lua.frame_cap];
-        try self.bcGrowFrame(parent.base, @as(usize, cont.dst) + 1, &parent.u.lua.frame_cap, &regs, &boxed);
+        try self.bcGrowFrame(parent.base, @as(usize, cont.dst) + 1, &parent.u.lua.frame_cap, &regs);
         regs[cont.dst] = if (ret.len == 0) .Nil else ret[0];
         parent.u.lua.pc += 1;
         self.clearPendingCall(parent);
@@ -8997,8 +8994,7 @@ pub const Vm = struct {
             .value => |value| {
                 const parent = exec_frames.getPtr(parent_index);
                 var regs = self.bc_stack[parent.base .. parent.base + parent.u.lua.frame_cap];
-                var boxed = self.bc_boxed[parent.base .. parent.base + parent.u.lua.frame_cap];
-                try self.bcGrowFrame(parent.base, @as(usize, cont.dst) + 1, &parent.u.lua.frame_cap, &regs, &boxed);
+                try self.bcGrowFrame(parent.base, @as(usize, cont.dst) + 1, &parent.u.lua.frame_cap, &regs);
                 regs[cont.dst] = value;
                 parent.u.lua.pc += 1;
             },
@@ -12202,8 +12198,7 @@ pub const Vm = struct {
                     // Value mode: put 1 result into register, advance pc.
                     const sr_dst = parent_ptr.u.lua.simple_result_dst;
                     var regs = self.bc_stack[parent_ptr.base .. parent_ptr.base + parent_ptr.u.lua.frame_cap];
-                    var boxed = self.bc_boxed[parent_ptr.base .. parent_ptr.base + parent_ptr.u.lua.frame_cap];
-                    try self.bcGrowFrame(parent_ptr.base, @as(usize, sr_dst) + 1, &parent_ptr.u.lua.frame_cap, &regs, &boxed);
+                    try self.bcGrowFrame(parent_ptr.base, @as(usize, sr_dst) + 1, &parent_ptr.u.lua.frame_cap, &regs);
                     regs[sr_dst] = if (ret.len == 0) .Nil else ret[0];
                     parent_ptr.u.lua.pc += 1;
                 }
@@ -12664,7 +12659,6 @@ pub const Vm = struct {
         base: usize,
         frame_cap: u32,
         regs: []Value,
-        boxed: []?*Cell,
         pc: usize,
     };
 
@@ -12728,7 +12722,6 @@ pub const Vm = struct {
     /// function that may grow the shared stack.
     fn refreshCtxSlices(self: *Vm, ctx: *BytecodeDispatchCtx) void {
         ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-        ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
     }
 
     fn runBytecodeDispatch(
@@ -12753,7 +12746,6 @@ pub const Vm = struct {
             .base = 0,
             .frame_cap = 0,
             .regs = &.{},
-            .boxed = &.{},
             .pc = 0,
         };
 
@@ -12822,7 +12814,6 @@ pub const Vm = struct {
                 ctx.frame_cap = fr.u.lua.frame_cap;
                 ctx.pc = fr.u.lua.pc;
                 ctx.regs = self.bc_stack[fr.base .. fr.base + fr.u.lua.frame_cap];
-                ctx.boxed = self.bc_boxed[fr.base .. fr.base + fr.u.lua.frame_cap];
             }
 
             // P15.51l: syncFrame writes only the 5 hot fields that may have
@@ -13001,7 +12992,6 @@ pub const Vm = struct {
                                 // The hook can execute Lua and grow both the shared
                                 // value stack and runtime-frame array.
                                 ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                                ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
                                 fr = exec_frames.getPtr(ctx.frame_index);
                                 ctx.pc = fr.u.lua.pc;
                             }
@@ -13031,7 +13021,6 @@ pub const Vm = struct {
                                     return hook_err;
                                 };
                                 ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                                ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
                                 fr = exec_frames.getPtr(ctx.frame_index);
                                 ctx.pc = fr.u.lua.pc;
                             }
@@ -13090,7 +13079,6 @@ pub const Vm = struct {
                                 // A hook can recursively run Lua and reallocate
                                 // both arrays used by the explicit dispatch loop.
                                 ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                                ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
                                 fr = exec_frames.getPtr(ctx.frame_index);
                                 ctx.pc = fr.u.lua.pc;
                             }
@@ -14640,7 +14628,6 @@ pub const Vm = struct {
                                     0;
                                 try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap + child_nextra);
                                 ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                                ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
 
                                 // P16.2: no pending-call slot for a plain
                                 // Lua→Lua call — the P15.51c direct contract
@@ -15397,7 +15384,7 @@ pub const Vm = struct {
         const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
         if (nresults >= 0) {
             const nr: usize = @intCast(nresults);
-            try self.bcGrowFrame(ctx.base, a + nr, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
+            try self.bcGrowFrame(ctx.base, a + nr, &ctx.frame_cap, &ctx.regs);
             const ncopy2 = @min(nr, source_len);
             for (0..ncopy2) |i| {
                 ctx.regs[a + i] = if (named_varargs) |src|
@@ -15409,7 +15396,7 @@ pub const Vm = struct {
             fr_va.reg_top = @max(fr_va.reg_top, @as(u32, @intCast(a + nr)));
         } else {
             // All varargs — grow frame, then copy.
-            try self.bcGrowFrame(ctx.base, a + source_len, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
+            try self.bcGrowFrame(ctx.base, a + source_len, &ctx.frame_cap, &ctx.regs);
             for (0..source_len) |i| {
                 ctx.regs[a + i] = if (named_varargs) |src|
                     try self.tableGetRawValue(src.table, .{ .Int = @intCast(i + 1) })
@@ -15436,10 +15423,14 @@ pub const Vm = struct {
         // Create upvalue cells from child's upvalue descriptions.
         const nups = child_proto.upvalues.len;
         const cells = try self.alloc.alloc(*Cell, nups);
+        // P16.19 T3: boxed slots are not hot dispatch state; derive the
+        // frame's boxed slice locally at the (comparatively cold) closure-
+        // creation point. Open-upvalue semantics unchanged (smoke 67).
+        const boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
         for (child_proto.upvalues, 0..) |uv, i| {
             if (uv.instack) {
                 // Capture from current frame's register.
-                if (ctx.boxed[uv.idx]) |cell| {
+                if (boxed[uv.idx]) |cell| {
                     cells[i] = cell;
                 } else {
                     const cell = try self.alloc.create(Cell);
@@ -15463,7 +15454,7 @@ pub const Vm = struct {
                     // collapses the count to 0 and breaks all gen-GC pacing
                     // (P16.4f bug B, cell variant).
                     self.gcNoteAlloc(@sizeOf(Cell));
-                    ctx.boxed[uv.idx] = cell;
+                    boxed[uv.idx] = cell;
                     cells[i] = cell;
                     // Mark the frame as having open upvalues so that
                     // closeBytecodeUpvaluesFrom knows to scan on return.
@@ -15499,7 +15490,7 @@ pub const Vm = struct {
         // cell to reflect the new value. Essential for recursive closures.
         // For OPEN cells, the register write already updated the stack slot.
         // For CLOSED cells, sync the cell value and fire the write barrier.
-        if (ctx.boxed[a]) |cell| {
+        if (boxed[a]) |cell| {
             if (!cell.isOpen()) {
                 try self.gcStoreCellValue(cell, ctx.regs[a]);
             }
@@ -15548,7 +15539,6 @@ pub const Vm = struct {
                         &effective_nargs,
                         &ctx.frame_cap,
                         &ctx.regs,
-                        &ctx.boxed,
                         &chain_depth,
                     ) catch |err| {
                         if (err == error.RuntimeError and self.err != null and
@@ -15578,7 +15568,6 @@ pub const Vm = struct {
         };
         try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap + child_nextra);
         ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-        ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
         // rargs are at R[A+5..] (after the copy at A+4 which may have been
         // replaced by __call resolution).
         const rargs_builtin = ctx.regs[a + 5 .. a + 5 + effective_nargs];
@@ -15937,7 +15926,6 @@ pub const Vm = struct {
                         &effective_nargs,
                         &ctx.frame_cap,
                         &ctx.regs,
-                        &ctx.boxed,
                         &chain_depth,
                     ) catch |err| {
                         if (err == error.RuntimeError and self.err != null and
@@ -16096,8 +16084,8 @@ pub const Vm = struct {
                     if (new_proto.tree) |t| std.debug.assert(t.flags.constants_resolved);
                 }
 
-                // 1. Close all ctx.boxed upvalues.
-                for (ctx.boxed) |*bc_slot| {
+                // 1. Close all boxed upvalues (derived locally, P16.19 T3).
+                for (self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap]) |*bc_slot| {
                     if (bc_slot.*) |cell| {
                         cell.close(self);
                         // PUC luaF_closeupval (lfunc.c:205-208): if !iswhite:
@@ -16113,7 +16101,7 @@ pub const Vm = struct {
                 // 2. Grow frame if needed.
                 const new_max = new_proto.maxstacksize;
                 const new_cap: usize = new_max;
-                try self.bcGrowFrame(ctx.base, new_cap, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
+                try self.bcGrowFrame(ctx.base, new_cap, &ctx.frame_cap, &ctx.regs);
 
                 // 3. PUC-faithful tail-call: reuse frame, re-setup varargs.
                 //    Step 1: copy func+args from R[A..] down to func_slot_base
@@ -16164,14 +16152,13 @@ pub const Vm = struct {
                 }
 
                 // Grow frame to new proto's register needs.
-                try self.bcGrowFrame(new_base, new_cap, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
+                try self.bcGrowFrame(new_base, new_cap, &ctx.frame_cap, &ctx.regs);
                 ctx.base = new_base;
                 // P15.51l: func_slot is a rare field, written to CallFrame below.
                 self.bc_stack_top = new_base + ctx.frame_cap;
 
                 // Re-derive register slices after potential base change.
                 ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
 
                 // P15.51l: nextraargs is a rare field, write to CallFrame.
                 const new_nextra_u16: u16 = @intCast(new_nextra);
@@ -16180,7 +16167,7 @@ pub const Vm = struct {
 
                 // Nil-fill remaining registers.
                 for (ctx.regs[np..new_max]) |*r| r.* = .Nil;
-                for (ctx.boxed[0..new_max]) |*bc_slot| bc_slot.* = null;
+                for (self.bc_boxed[new_base .. new_base + new_max]) |*bc_slot| bc_slot.* = null;
 
                 // 6. Update frame state.
                 ctx.cur_proto = new_proto;
@@ -16437,9 +16424,8 @@ pub const Vm = struct {
             }
             try self.dispatchBytecodeHookWithCallee("return", ctx.regs[a], vals);
             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-            ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
             const nstore: usize = if (nresults >= 0) @intCast(nresults) else vals.len;
-            try self.bcGrowFrame(ctx.base, a + nstore, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
+            try self.bcGrowFrame(ctx.base, a + nstore, &ctx.frame_cap, &ctx.regs);
             for (0..nstore) |i| ctx.regs[a + i] = if (i < vals.len) vals[i] else .Nil;
             // PUC Lua sets L->top = ci->top (maxstacksize) after calls.
             // We track reg_top as the runtime stack top. For multi-return
@@ -16475,7 +16461,6 @@ pub const Vm = struct {
                         &effective_nargs,
                         &ctx.frame_cap,
                         &ctx.regs,
-                        &ctx.boxed,
                         &chain_depth,
                     ) catch |err| {
                         if (err == error.RuntimeError and self.err != null and
@@ -16508,7 +16493,6 @@ pub const Vm = struct {
         };
         try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap + child_nextra);
         ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-        ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
 
         const rargs = ctx.regs[a + 1 .. a + 1 + effective_nargs];
 
@@ -16652,9 +16636,8 @@ pub const Vm = struct {
                             }
                             try self.dispatchBytecodeHookWithCallee("return", callee_val, values);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
                             const nstore: usize = if (nresults >= 0) @intCast(nresults) else values.len;
-                            try self.bcGrowFrame(ctx.base, a + nstore, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
+                            try self.bcGrowFrame(ctx.base, a + nstore, &ctx.frame_cap, &ctx.regs);
                             for (0..nstore) |i| ctx.regs[a + i] = if (i < values.len) values[i] else .Nil;
                             if (nresults < 0) ctx.exec_frames.getPtr(ctx.frame_index).reg_top = @intCast(@as(usize, a) + values.len);
                             self.alloc.free(values);
@@ -16680,7 +16663,7 @@ pub const Vm = struct {
                 else
                     self.builtinOutLen(id, rargs);
                 const outs_start = a + 1 + effective_nargs;
-                try self.bcGrowFrame(ctx.base, outs_start + out_len, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
+                try self.bcGrowFrame(ctx.base, outs_start + out_len, &ctx.frame_cap, &ctx.regs);
                 // Re-derive rargs after bcGrowFrame: it may have reallocated
                 // bc_stack, invalidating the old rargs slice (use-after-free).
                 var rargs_fresh = ctx.regs[a + 1 .. a + 1 + effective_nargs];
@@ -16708,7 +16691,6 @@ pub const Vm = struct {
                     // re-derive the caller-window slices (the C-frame's
                     // func_slot sits above the window, which is unchanged).
                     ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                    ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
                     rargs_fresh = ctx.regs[a + 1 .. a + 1 + effective_nargs];
                     outs = ctx.regs[outs_start .. outs_start + out_len];
                     const hook_args = rargs_fresh;
@@ -16771,7 +16753,6 @@ pub const Vm = struct {
                     };
                 }
                 ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
                 outs = ctx.regs[outs_start .. outs_start + out_len];
                 const produced: usize = if (builtinHasDynamicOutCount(id))
                     @min(self.last_builtin_out_count, outs.len)
@@ -16878,7 +16859,7 @@ pub const Vm = struct {
                 }
                 try self.dispatchBytecodeHookWithCallee("return", callee_val, ret);
                 const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
-                try self.bcGrowFrame(ctx.base, a + nstore, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
+                try self.bcGrowFrame(ctx.base, a + nstore, &ctx.frame_cap, &ctx.regs);
                 for (0..nstore) |i| {
                     ctx.regs[a + i] = if (i < ret.len) ret[i] else .Nil;
                 }
@@ -35477,7 +35458,6 @@ pub const Vm = struct {
         nargs: *usize,
         frame_cap: *u32,
         regs: *[]Value,
-        boxed: *[]?*Cell,
         chain_depth: *usize,
     ) DispatchError!void {
         // Defense-in-depth: PUC checks chain depth inside tryfuncTM (ldo.c:533).
@@ -35493,13 +35473,12 @@ pub const Vm = struct {
         // lookup), which can realloc bc_stack and invalidate regs.*.
         // Always refresh regs.* here, even if bcGrowFrame is not needed.
         regs.* = self.bc_stack[base .. base + frame_cap.*];
-        boxed.* = self.bc_boxed[base .. base + frame_cap.*];
 
         // Ensure the frame has space for one extra slot (the shift target).
         // PUC does this via checkstackp(L, 1, func) before the shift.
         const needed = a + 1 + nargs.* + 1;
         if (needed > frame_cap.*) {
-            try self.bcGrowFrame(base, needed, frame_cap, regs, boxed);
+            try self.bcGrowFrame(base, needed, frame_cap, regs);
         }
 
         // Shift args up by 1 slot (high-to-low for overlap safety).

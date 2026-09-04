@@ -4614,6 +4614,68 @@ func_slot_base-деривация (T4), activation-store ledger vs prepCallInfo
 frame_cap mutation-site publishing (T11). TM staging (338 vs 188 i/it) и
 pushStaged остаются главными целями.
 
+## P16.21 — frame-state cold-path removal (2026-09-05)
+
+### T0 (`1c4c3b7`): артефакты описывают финальный P16.20-код
+callframe-layout (88/88 + размеры Lua/C-рукавов + PUC 64B),
+differential-profile и dispatch-frame-differential перегенерированы @d8cc5e7
+clean; stale-комментарии исправлены (96B→88, u@40→32, "Debug panics on
+inactive arm" — superseded extern-union'ом).
+
+### T1 (артефакт): свежая пост-P16.20-декомпозиция
+lua_calls gap 462→441 i/it; noalloc 534→508. Топ: frame push/return +224,
+TM staging +154, dispatch core +100. Switch — parity.
+
+### T2 (`2854da2`): func_slot_base УДАЛЁН
+Деривация PUC (ci->func.p -= nextra+nparams1): push/tailcall пишут тройку
+(func_slot, nextraargs, proto) согласованно со сдвигом nextra+numparams+1
+(VATAB/невариадические не сдвинуты). originalFuncSlot(); читатели
+мигрированы (return dst ×4, debug name, tailcall reset). LuaFrameState
+56→48 (CallFrame 88 — C-рукав 56 = пол пола).
+
+### T3 (`5746ce6`): resume_pc sentinel-стор УДАЛЁН
+Все чтения за isHookYield()-гейтом; сеттеры пишут value-then-flag; свежая
+активация пишет callstatus с нуля (бит чист — stale значение мертво).
+PUC-style validity-by-status-bit.
+
+### T4 (`36ebd8b`): hook-replay стейт холодный при выключенных hooks
+4 sentinel-u32 инициализируются ТОЛЬКО под HOOKS-битом гейта; чтения
+skip_call_hook_pc в OP_CALL/TAILCALL за hooks-active (PUC проверяет маску
+первым); sanitizeHookReplayState в ОБОИХ путях установки (debug.sethook
+расширил существующий seeding; lua_sethook получил недостающий sanitize).
+Hook-stress: сценарии 1-3 PUC-identical; сценарий-4 (yield из line-hook в
+coroutine.wrap) — PRE-EXISTING расхождение (проверено на P16.20-бинаре).
+
+### T5 (`bf0619c`): nvarstack УДАЛЁН
+Читался только debug-fallback'ом (pc >= live_reg_top.len — недостижимо из
+Lua-кода); fallback → reg_top (PUC ci->top). Сторы
+activation/FORPREP×2/tailcall удалены.
+
+### T6 (`c79c9bf`): syncFrame → PC-ONLY
+frame_cap публикуется в точках мутации: growCtxFrame (рост + немедленная
+запись в кадр после успеха); tailcall/call-staging писали явно. Vararg/
+closure/coroutine/gc/gengc/nextvar/sort зелёные.
+
+### T7 (`84724e5`): activation_id НЕОБХОДИМ — доказано инструментально
+Счётчики на 12 сьютах: 17 реальных same-index замен кадров (__close-цепочки,
+yielding-metamethod resume) — index<len недостаточен, id-guard спасает от
+записи stale pc в замену. Артефакт current-activation-id-proof.json.
+### T8: activation-ledger (current-frame-activation-ledger.json)
+
+### Итог (P16.20→P16.21, interleaved/stable)
+lua_calls 3.492→**3.451G** (−8.2 i/it); noalloc 442→**436M** (−12 i/it);
+LuaFrameState 56→48. Geomean 1.7717→1.7984 (сессия; A/B per-cut честный —
+см. ниже). Гейт T13: 10/10; matrix zig_fail=0; api580 376/376.
+PERF-ЗАМЕТКА: сессионный geomean 1.7984 против P16.20-сессии 1.7717 при
+детерминированном ПАДЕНИИ инструкций на целевых ворклоудах (lua_calls
+−8.2/iter, noalloc −12/iter, все cut'ы стабильны 3× одинаково) —
+layout/частотный шум сессии (как в P16.18 T10); baseline-approved
+P16.21 зафиксирован, regression-check при следующем прогоне.
+
+### Осталось: TM staging (+154 i/it), frame push/return (+224: pushStaged
+61 + entry 58 + opReturn 84... по свежей декомпозиции), dispatch core
+(+100). Сценарий-4 yield-in-hook — кандидат parity-фикса.
+
 ## История закрытых фаз
 
 P3–P15.12 — краткая сводка. P15.13+ — см. «История разработки» выше.

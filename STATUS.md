@@ -4513,6 +4513,61 @@ leak_bench; 4 native lanes + selftest; repro b/B; 64/66/67/68
 byte-identical; 195 unit-тестов (5 строковых новых); comptime-инварианты;
 fixed-load GREEN (344 vs 272 PUC).
 
+## P16.19 — differential dispatch-state slimming (2026-09-05)
+
+### T1 (`a10e498`): классификация исправлена по PUC lvm.c
+vmfetch = `if (l_unlikely(trap)) {...} i = *(pc++)` — trap-ветвь и pc++
+есть PUC-эквивалентная работа (НЕ luazig-only). Категории:
+PUC-equivalent / luazig-only diagnostic (stats gate) / frame-transition /
+architecture-specific (dispatch_pc, syncFrame).
+
+### T3 (`ce1a62a`): ctx.boxed убран из горячего контекста
+boxed-слоты выводятся локально в 4 handlers (closure capture, MOVE-to-
+captured, TBC close, vararg) и внутри bcGrowFrame (null-fill новых слотов —
+когерентность captured-ячеек сохранена, smoke 67); 12 re-derivation-сайтов
+удалено. lua_calls 3.694→3.623G (−14.2/iter), noalloc −10.4/iter.
+
+### T4: cur_upvalues → cur_closure — ИЗМЕРЕНО ХУЖЕ, ОТКАЧЕНО
+PUC-shape cl-указатель: global_arith +2/iter в обеих hash-seed модах
+(15.415→15.516) при нейтрали elsewhere — срез-кэш дешевле для горячих
+upvalue-опов. Revert по T13-дисциплине.
+
+### T5 (`56e3513`): combined dispatch gate (A), comptime (B) откачен
+A: один байт (bit0 HOOKS, bit1 STATS), синхронизация в
+refreshHooksCached/CLI; общая цена — одна load+branch (PUC-trap-parity);
+pc-publish безусловно ДО гейта. lua_calls −6/iter, global_arith −4/iter.
+B (comptime collect_stats): два гигантских инстанса → lua_calls +9/iter,
+noalloc +11/iter — REVERTED. stats-on работает (--stats проверен).
+Hooks-корректность: 12_chook t1–t11 + диф-скрипт — идентично.
+
+### T9.1 (`d1e31c1`): syncFrame base write-back удалён
+ctx.base мутирует только на entry (identity) и tailcall (пишет fr2.base
+напрямую) — write-back provably dead. frame_cap ОСТАЛСЯ (bcGrowFrame
+мутирует mid-opcode; parked-frame GC-сканы читают — syncFrame =
+boundary publisher, задокументировано). lua_calls −2/iter.
+
+### T2 (artifact): dispatch-frame дифференциальная декомпозиция
+current-dispatch-frame-differential.json: opcode switch — PARITY (17.5 vs
+19.3 i/it); остающийся разрыв: (1) frame push/return механика lua_calls
+~+145 i/it (zig ~246 vs PUC ~101), (2) TM staging noalloc ~+150 (338 vs
+188), (3) dispatch-core ~+50 (bounds-checked slice fetch +32,
+dispatch_pc publish +13, memory gate byte vs loop-live trap +7).
+
+### Итог (P16.18→P16.19, interleaved/stable)
+lua_calls: 3693.7→3597.8M (−19.2 i/it, −2.6%); gap 481.6→462.4; 2.87→2.80x.
+noalloc: 462.2→454.7M (−14.9 i/it, −1.6%); gap 549.1→533.8; 2.46→2.42x.
+branches/iter: lua_calls 117.6→109.5; noalloc 143.9→136.8. Geomean 1.7989→
+1.794. Гейт T15: 11/11 (api580 376/376, matrix zig_fail=0, hooks deep-check).
+
+### Осталось (T6/T8/T10-T12) — следующие цели по АБСОЛЮТНОЙ стоимости
+1. Frame push/return (pushStaged+entry-setup+opReturn+syncFrame ~246 vs
+   PUC ~101 i/it) — T10 field-init ledger + T12 return.
+2. TM staging 338 vs 188 — tryPush/pushStaged path.
+3. dispatch_pc publish +13/iter — только если станет material (T7: НЕ
+   переписывать 954 fail()-сайта по умолчанию).
+T6 (local trap) не переоткрывался: историческая регрессия +7/iter валидна;
+после T3/T5 tradeoff мог измениться — кандидат следующей фазы.
+
 ## История закрытых фаз
 
 P3–P15.12 — краткая сводка. P15.13+ — см. «История разработки» выше.

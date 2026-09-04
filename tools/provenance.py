@@ -78,7 +78,8 @@ def file_sha16(path) -> str:
 
 
 def block(*, zig_bin: Path | None = ZIG_LUA,
-          puc_bin: Path | None = None) -> dict:
+          puc_bin: Path | None = None,
+          optimize_mode: str | None = None) -> dict:
     """Assemble the standard provenance block for an artifact payload.
 
     Binary hashes are included only for binaries the lane executes: pass
@@ -86,12 +87,29 @@ def block(*, zig_bin: Path | None = ZIG_LUA,
     matrix, smoke); omit it for zig-only lanes (profile index, fixed-load
     footprint, whose PUC side comes from the vendored headers, not the
     binary).
+
+    `optimize_mode` records which Zig optimize mode built the measured
+    binary (Debug / ReleaseFast / ...). Layout-sensitive results (struct
+    sizes, byte deltas) differ between modes, so every such artifact must
+    identify its mode — or carry one provenance block per mode.
+
+    P16.17 T5 naming rule: `git_head`/`measured_source_head` identify the
+    source the MEASURED binary was built from (captured while the tree is
+    clean; lanes that need to write outputs stage them to /tmp first). The
+    later artifact/documentation commit is a DIFFERENT commit and is
+    reported separately (STATUS / final report), never conflated with the
+    measured head.
     """
+    head = git_head()
     prov: dict = {
-        "git_head": git_head(),
+        "git_head": head,
+        # Explicit alias: this head is what the BINARY was built from.
+        "measured_source_head": head,
         "git_dirty": git_dirty(),
         "zig_version": zig_version(),
     }
+    if optimize_mode is not None:
+        prov["optimize_mode"] = optimize_mode
     if zig_bin is not None:
         prov["zig_binary_sha16"] = file_sha16(zig_bin)
     if puc_bin is not None:

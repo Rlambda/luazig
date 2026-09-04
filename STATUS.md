@@ -6832,3 +6832,26 @@ undump roundtrip incl. stripped names); smoke 68/68; c_api 20 suites +
 Perf A/B: lua_calls −1.48% cyc / instr flat (no regression).
 
 Remaining api580 ledger (charged): 448 vs PUC 304; still need −49B.
+
+## P16.16 T5 (C5) — Cell bc_stack_idx u32 + CLOSED sentinel: 48→40 (=PUC UpVal) (2026-09-04)
+
+Structural cut 5. `bc_stack_idx: ?usize` (8B) → `u32` with the CLOSED
+sentinel `maxInt(u32)` (stacks can never reach 4G slots; slot 0 stays
+unambiguous because the sentinel is maxInt, not 0). isOpen() =
+`idx != CLOSED`; get/set/close branch on isOpen() and cast the u32 once.
+Single write site (OP_CLOSURE open-cell creation, @intCast of base+idx)
+plus close()'s clear. bc_stack_thread stays a pointer (needed to address
+a suspended coroutine's own stack).
+
+@sizeOf: Cell 48→40 (= PUC UpVal 40; 64→40 across C1+C5). api580
+(anchored, 3 runs): 448 → **440** (−8 = the eager _ENV Cell).
+
+Gates: closure / coroutine / gc / gengc / nextvar / db / errors --testc
+PASS (open/closed semantics + suspended-coroutine stacks); locals fails
+byte-identical to baseline (pre-existing); smoke 68/68; zig build test
+PASS.
+
+Perf A/B (closure_capture — Cell get/set/close hot path): −0.00% cyc /
++0.00% instr (flat).
+
+Remaining api580 ledger (charged): 440 vs PUC 304; still need −41B.

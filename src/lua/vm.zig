@@ -652,6 +652,12 @@ fn llAccessible(L: ?*lua_State) callconv(.c) c_int {
 /// a closed cell never fires.
 /// ═══════════════════════════════════════════════════════════════════════
 pub const Cell = struct {
+    /// "Closed" sentinel for `bc_stack_idx` (P16.16 C5/T5): a real stack
+    /// slot index can never reach 4G (stacks are bounded far below that),
+    /// so maxInt(u32) unambiguously means "no open stack reference" — the
+    /// closed-upvalue state (PUC: `uv->v.p == &uv->u.value`).
+    pub const bc_stack_closed: u32 = std.math.maxInt(u32);
+
     value: Value,
     gc_age: GcAge = .new,
     /// Position of this object in `Vm.gc_objects` (P16.16 C1: u32 — the
@@ -662,15 +668,17 @@ pub const Cell = struct {
     /// PUC `marked` byte — tri-color mark bits (WHITE0/WHITE1/BLACK/
     /// FINALIZED/TEST). See constants above.
     gc_marked: u8 = 0,
-    /// When non-null, this is an "open" upvalue that directly references
-    /// the owning thread's bytecode stack at `bc_stack_idx`.
+    /// When != bc_stack_closed, this is an "open" upvalue that directly
+    /// references the owning thread's bytecode stack at this index
+    /// (P16.16 C5: u32 + sentinel instead of ?usize — 8B → 4B; slot 0 is
+    /// unambiguous because the sentinel is maxInt, not 0).
     /// The thread is needed because a suspended coroutine's stack lives
     /// in `th.bytecode_stack`, not in `vm.bc_stack` (which belongs to
     /// whichever thread is currently executing).
-    /// When null, `value` is the actual value (closed upvalue).
+    /// When closed, `value` is the actual value (closed upvalue).
     /// This mirrors PUC Lua's UpVal model: open upvalues point to stack,
     /// closed upvalues have their own copy.
-    bc_stack_idx: ?usize = null,
+    bc_stack_idx: u32 = bc_stack_closed,
     bc_stack_thread: ?*Thread = null,
 
     /// Resolve the correct bytecode stack slice for this cell.
@@ -692,7 +700,8 @@ pub const Cell = struct {
     /// coroutine's stack was freed while an open upvalue is still
     /// reachable by GC (e.g. coroutine.close on a running thread).
     pub fn get(self: *const Cell, vm: *const Vm) Value {
-        if (self.bc_stack_idx) |idx| {
+        if (self.isOpen()) {
+            const idx: usize = self.bc_stack_idx;
             const stack = self.resolveStack(vm);
             if (idx < stack.len) return stack[idx];
             // Stack is gone or too small — return last known value.
@@ -705,26 +714,26 @@ pub const Cell = struct {
     /// For open upvalues: writes to the owning thread's stack.
     /// For closed upvalues: writes to value.
     pub fn set(self: *Cell, vm: *Vm, v: Value) void {
-        if (self.bc_stack_idx) |idx| {
-            self.resolveStack(vm)[idx] = v;
+        if (self.isOpen()) {
+            self.resolveStack(vm)[self.bc_stack_idx] = v;
         } else {
             self.value = v;
         }
     }
 
     /// Close this upvalue: snapshot the stack value into `value`,
-    /// mark as closed (bc_stack_idx = null).
+    /// mark as closed (bc_stack_idx = bc_stack_closed).
     pub fn close(self: *Cell, vm: *const Vm) void {
-        if (self.bc_stack_idx) |idx| {
-            self.value = self.resolveStack(vm)[idx];
-            self.bc_stack_idx = null;
+        if (self.isOpen()) {
+            self.value = self.resolveStack(vm)[self.bc_stack_idx];
+            self.bc_stack_idx = bc_stack_closed;
             self.bc_stack_thread = null;
         }
     }
 
     /// Check if this cell is an open upvalue.
     pub fn isOpen(self: *const Cell) bool {
-        return self.bc_stack_idx != null;
+        return self.bc_stack_idx != bc_stack_closed;
     }
 };
 
@@ -15118,7 +15127,7 @@ pub const Vm = struct {
                     const th = self.activeBytecodeThread();
                     cell.* = .{
                         .value = ctx.regs[uv.idx],
-                        .bc_stack_idx = ctx.base + uv.idx,
+                        .bc_stack_idx = @intCast(ctx.base + uv.idx),
                         .bc_stack_thread = th,
                     };
                     try self.gcRegisterCell(cell);

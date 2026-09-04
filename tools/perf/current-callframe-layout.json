@@ -1,0 +1,47 @@
+{
+  "created_utc": "2026-09-04T19:23:33.120140+00:00",
+  "provenance": {
+    "git_head": "87c717c",
+    "measured_source_head": "87c717c",
+    "git_dirty": "clean",
+    "zig_version": "0.16.0",
+    "optimize_mode": "Debug+ReleaseFast",
+    "zig_binary_sha16": "cb0cee7199fe04d7",
+    "puc_probe": "gcc against vendored lua-5.5.0 headers (this 64-bit ABI)"
+  },
+  "luazig": {
+    "Debug": {
+      "size": 96,
+      "align": 8,
+      "offset_u": 40,
+      "offset_base": 0,
+      "offset_func_slot": 8,
+      "offset_tbc_mark": 16,
+      "offset_callstatus": 28,
+      "offset_reg_top": 32,
+      "offset_pending_call_index": 36
+    },
+    "ReleaseFast": {
+      "size": 96,
+      "align": 8,
+      "offset_u": 40,
+      "offset_base": 0,
+      "offset_func_slot": 8,
+      "offset_tbc_mark": 16,
+      "offset_callstatus": 28,
+      "offset_reg_top": 32,
+      "offset_pending_call_index": 36
+    }
+  },
+  "puc": {
+    "size": 64,
+    "align": 8,
+    "offset_func": 0,
+    "offset_top": 8,
+    "offset_previous": 16,
+    "offset_next": 24,
+    "offset_u": 32,
+    "offset_callstatus": 60
+  },
+  "notes": "PUC CallInfo is 64 B on this ABI. luazig CallFrame is 96 B in BOTH modes since P16.20 T1 (extern struct/union; previously Debug 104 vs RF 96 \u2014 hidden union safety tag). luazig frames carry architecture-specific state (iterative yieldable execution, inline hook-replay PCs, simple-result continuation, activation_id); 64 B is NOT a target \u2014 the model is."
+}

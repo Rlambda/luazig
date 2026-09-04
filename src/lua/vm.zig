@@ -4105,10 +4105,12 @@ pub const Vm = struct {
         // strings so they go through `string_intern` and deduplicate to a
         // single canonical *LuaString pointer. `fastTm`/`getTm` uses pointer
         // identity for key comparison, avoiding `internStrAssume` on every
-        // lookup. Mirrors PUC's `luaT_init` (ltm.c:38-53) which pre-interns
-        // `tmname[]` at VM startup BEFORE any other initialization that might
-        // trigger metamethod lookups (PUC lstate.c: luaT_init is called early
-        // in lua_newstate, before luaS_init/luaX_init/etc).
+        // lookup. Mirrors PUC's `luaT_init` (ltm.c:38-53), which pre-interns
+        // `tmname[]` during state creation so metamethod lookups never
+        // allocate. (PUC f_luaopen order is luaS_init -> luaT_init ->
+        // luaX_init — the string table exists FIRST; luazig populates
+        // tm_names at the equivalent bootstrap point in ITS initialization
+        // sequence, which is luazig architecture, not literal PUC order.)
         //
         // MUST be populated BEFORE bootstrapGlobals() — bootstrapGlobals sets
         // up the string metatable and other global tables whose operations
@@ -34994,10 +34996,9 @@ pub const Vm = struct {
     /// to `getTm` (which also does not touch flags) — structurally equivalent.
     /// See the T5 PROHIBITION in `getTm`'s doc comment.
     ///
-    /// **Lookup discrepancy (T3 target):** PUC uses `luaH_Hgetshortstr`
-    /// (short-string pointer-identity only). Our `getTm` currently uses
-    /// `nodeLookupStr` (general `luaStringEq` — content-eq for longs). T3
-    /// replaces this with `nodeLookupShortStrIdentity` to match PUC exactly.
+    /// Lookup parity: `getTm` uses `nodeLookupShortStrIdentity` — PUC
+    /// `luaH_Hgetshortstr` short-string pointer-identity lookup keyed by the
+    /// pre-interned `tm_names[event]` (P16.12/13 T2, landed).
     pub fn getTmByObj(self: *Vm, v: Value, event: TmsEvent) ?Value {
         const mt = valueMetatable(self, v) orelse return null;
         return self.getTm(mt, event);
@@ -35065,12 +35066,9 @@ pub const Vm = struct {
     /// These fields are NOT part of PUC's `TMS` enum and do NOT participate
     /// in the flags cache. PUC looks them up via `luaL_getmetafield` /
     /// `luaH_Hgetshortstr` with on-demand interning. We pre-intern them in
-    /// `metafield_names` (all are short strings, `is_short == true`) for the
-    /// same pointer-identity fast path as `getTm`.
-    ///
-    /// **T3 target:** switch from `nodeLookupStr` (general `luaStringEq`) to
-    /// `nodeLookupShortStrIdentity` — `metafield_names` entries are provably
-    /// pre-interned shorts, matching PUC's `luaH_Hgetshortstr` precondition.
+    /// `metafield_names` (all are short strings) for the same pointer-
+    /// identity fast path as `getTm`; the lookup itself is
+    /// `nodeLookupShortStrIdentity` (PUC `luaH_Hgetshortstr` parity, landed).
     fn getMetaField(self: *Vm, mt: *Table, field: MetaField) ?Value {
         const name_str = self.metafield_names[@intFromEnum(field)];
         const node = ltable.nodeLookupShortStrIdentity(mt.hash, name_str) orelse return null;

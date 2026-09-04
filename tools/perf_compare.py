@@ -44,7 +44,13 @@ ROOT = Path(__file__).resolve().parents[1]
 ZIG_LUA = ROOT / "zig-out" / "bin" / "luazig"
 PUC_LUA = ROOT / "build" / "lua-c" / "lua"
 BENCH = ROOT / "tools" / "microbench.lua"
-BASELINE = ROOT / "tools" / "perf" / "baseline-p15.37.json"
+# P16.18 T11: the regression guard compares against the EXPLICITLY approved
+# baseline, never against a historical file that happens to lie around.
+# `--update-baseline` rewrites baseline-approved.json (an explicit,
+# reviewable operation that stamps identity metadata); the historical
+# P15.37 measurement is preserved immutably in baseline-p15.37.json.
+BASELINE = ROOT / "tools" / "perf" / "baseline-approved.json"
+HISTORICAL_BASELINE = ROOT / "tools" / "perf" / "baseline-p15.37.json"
 
 # Pin to a single CPU core to reduce scheduler noise. Core 0 is a safe default
 # on most setups; if it is busy the user can override via --core.
@@ -684,7 +690,9 @@ def print_table(zig: Dict[str, float], puc: Dict[str, float]) -> None:
 def regression_check(zig: Dict[str, float], baseline: dict) -> tuple[bool, bool]:
     """Compare current zig times vs baseline. Returns (any_warn, any_fail)."""
     prev_zig = baseline.get("zig", {})
-    print(f"\nRegression check vs {BASELINE}:")
+    prev_ident = baseline.get("baseline_identity", {})
+    print(f"\nRegression check vs {BASELINE} "
+          f"(phase: {prev_ident.get('baseline_phase', 'unknown')}):")
     print(f"  {'Workload':<22} {'base (s)':>10} {'cur (s)':>10} {'delta':>10}  status")
     print("  " + "-" * 52)
     any_warn = False
@@ -730,6 +738,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--update-baseline", action="store_true",
                     help="rewrite baseline JSON with current results")
+    ap.add_argument("--baseline-phase", default="unlabeled",
+                    help="Phase label stamped into baseline-approved.json "
+                         "by --update-baseline (e.g. P16.18)")
     ap.add_argument("--perf", action="store_true",
                     help="also run perf stat on a representative workload")
     ap.add_argument("--runs", type=int, default=DEFAULT_RUNS,
@@ -799,8 +810,15 @@ def main() -> int:
 
     if args.update_baseline:
         BASELINE.parent.mkdir(parents=True, exist_ok=True)
+        current["baseline_identity"] = {
+            "baseline_phase": args.baseline_phase,
+            "note": ("Approved regression baseline. Updating this file is an "
+                     "EXPLICIT operation; the historical P15.37 baseline is "
+                     "preserved separately in baseline-p15.37.json and is "
+                     "never overwritten."),
+        }
         BASELINE.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
-        print(f"\nBaseline updated: {BASELINE}")
+        print(f"\nBaseline updated: {BASELINE} (phase {args.baseline_phase})")
         return 0
 
     if BASELINE.exists():

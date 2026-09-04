@@ -1355,7 +1355,7 @@ const CloseMode = enum { return_close, pcall_error_close };
 
 /// PUC `CallInfo.u.c` — C function frame state.
 /// Only valid when `callstatus & CIST_C != 0`.
-const CFrameState = struct {
+const CFrameState = extern struct {
     /// PUC `u.c.k`: continuation function, called on resume after yield.
     /// null = no continuation (plain yield or non-yieldable call).
     k: ?*const fn (?*lua_State, c_int, isize) callconv(.c) c_int = null,
@@ -1398,12 +1398,15 @@ const CFrameState = struct {
 
 /// PUC `CallInfo.u.l` — Lua function frame state.
 /// Only valid when `callstatus & CIST_C == 0`.
-const LuaFrameState = struct {
+const LuaFrameState = extern struct {
     /// PUC `Proto*` — the bytecode prototype. Non-optional for Lua frames.
     /// Invariant: isLua(fr) → fr.u.lua.proto is a valid pointer.
     /// The `undefined` default is safe because LuaFrameState is only valid
     /// when CIST_C is clear, and `pushBytecodeExecFrame` always sets `proto`
     /// before the frame becomes visible to the dispatch loop.
+    // P16.20 T1: declaration order = memory order (extern struct). The
+    // 8-aligned trio first, then u32/u32/u16/u8/u8 (10 B starting at 24),
+    // then the five hook-replay u32s at 36 — total 56 B, no tail waste.
     proto: *const bc.Proto = undefined,
     /// PUC `u.l.savedpc`: current bytecode PC.
     pc: usize = 0,
@@ -1411,27 +1414,24 @@ const LuaFrameState = struct {
     func_slot_base: usize = 0,
     /// Register window upper bound (PUC `ci->top - ci->func`).
     frame_cap: u32 = 0,
-    /// PUC `u.l.nextraargs`: extra vararg arguments.
-    nextraargs: u16 = 0,
     /// Fixed params count (PUC `ci->func + 1 .. ci->base`).
     nvarstack: u32 = 0,
+    /// PUC `u.l.nextraargs`: extra vararg arguments.
+    nextraargs: u16 = 0,
+    /// Packed Lua-frame flags: bit0 has_open_upvalues, bit1
+    /// simple_result_invert, bits 2-6 simple_result_event (TmsEvent u5),
+    /// bit7 simple_result_compare (see the invariant block below).
+    lua_packed_flags: u8 = 0,
+    /// Inline simple-result completion destination:
+    /// 0xFF (NO_REG) = no value destination (NONE or compare mode);
+    /// 0x00-0xFE = value mode register (R254 VALID — MAX_FSTACK=255).
+    simple_result_dst: u8 = 0xFF,
     /// Hook PC tracking (Lua-only, per-frame).
     resume_pc: u32 = INVALID_PC,
     last_line_pc: u32 = INVALID_PC,
     skip_line_hook_pc: u32 = INVALID_PC,
     skip_call_hook_pc: u32 = INVALID_PC,
     resume_skip_count_pc: u32 = INVALID_PC,
-    /// P16.8 Task 1: Packed Lua-frame flags (1 byte).
-    /// Bit 0: has_open_upvalues (was a separate bool field).
-    /// Bit 1: simple_result_invert (compare mode only).
-    /// Bits 2-6: simple_result_event (TmsEvent, u5, 25 events, max 24).
-    /// Bit 7: simple_result_compare flag (compare mode indicator).
-    lua_packed_flags: u8 = 0,
-    /// P16.8 Task 1: Inline simple-result completion destination.
-    /// 0xFF (NO_REG) = no value destination (NONE or compare mode).
-    /// 0x00-0xFE (0..254) = value mode: put 1 result into register.
-    /// R254 (0xFE) is a VALID register — PUC MAX_FSTACK=255, NO_REG=255.
-    simple_result_dst: u8 = 0xFF,
 
     /// P16.8 Task 1: INVARIANT — The simple-result state machine has
     /// exactly three states, encoded by (compare_flag, simple_result_dst):
@@ -1521,34 +1521,43 @@ const LuaFrameState = struct {
     }
 };
 
-pub const CallFrame = struct {
+pub const CallFrame = extern struct {
     // ── Common fields (both Lua and C frames) ──
     // P15.51k: callee field removed — derived from bc_stack[func_slot]
     // (PUC's ci->func points into the shared stack).
     // P15.51n: current_line removed — derive from proto.lineinfo[pc].
     // P15.51n: last_hook_line moved to Thread (single-valued, PUC oldpc).
     // P15.51i: is_tailcall moved to CIST_TAIL bit in callstatus.
-    activation_id: u32 = 0,
+    // P16.20 T1: extern layout packs by DECLARATION order — 8-aligned
+    // fields first, then the 4-byte group, so the variant union starts at
+    // offset 40 and @sizeOf(CallFrame) == 96 in BOTH build modes.
     base: usize = 0,
     /// PUC `ci->func` equivalent: bc_stack index of the function value.
     /// `base = func_slot + 1` for bytecode frames. The function value
     /// at `bc_stack[func_slot]` is preserved for debug.getinfo and return
     /// value placement.
     func_slot: usize = 0,
+    tbc_mark: usize = 0,
+    activation_id: u32 = 0,
     /// PUC `callstatus` (`lstate.h:208`): low 8 bits = nresults+1 (CIST_NRESULTS),
-    /// upper bits = flags (to be populated in later tasks).
+    /// upper bits = flags; CIST_C discriminates the u-variant (PUC model).
     callstatus: u32 = 0,
     reg_top: u32 = 0,
     // P15.51i: is_debug_hook moved to CIST_HOOKED bit in callstatus.
     // P15.51i: hide_from_debug moved to CIST_HIDE bit in callstatus.
     // P15.51n: debug_namewhat/debug_name moved to BytecodePendingCall.
-    tbc_mark: usize = 0,
     pending_call_index: u32 = INVALID_PENDING,
 
     // ── Variant state (PUC CallInfo.u) ──
     // Discriminator: callstatus & CIST_C. When CIST_C is set, u.c is valid;
     // otherwise u.lua is valid. Mirrors PUC `CallInfo.u` union (`lstate.h:194`).
-    u: union {
+    // P16.20 T1: extern union — build-mode-stable, NO hidden active-arm
+    // tag (a plain Zig union was 104 B in Debug vs 96 B in ReleaseFast —
+    // the same hidden-safety-tag class of bug fixed for LuaString in
+    // P16.17 T1). The semantic discriminator is `callstatus & CIST_C`,
+    // exactly like PUC CallInfo: isLua()/isC() guard every arm access, and
+    // construction sites activate the correct variant explicitly.
+    u: extern union {
         lua: LuaFrameState,
         c: CFrameState,
     } = .{ .c = .{} },
@@ -2186,6 +2195,16 @@ const TestcContState = struct {
 // so it is inside EVERY variant's allocation, including the 32-B
 // truncated LSTRFIX header. Short content may extend past offset 48 (a
 // 40-byte short allocates 65 B), exactly like PUC's flexible `contents`.
+// P16.20 T1 invariant: CallFrame layout is build-mode-stable (extern
+// struct/union — a plain Zig union here once made Debug 104 B vs RF 96 B,
+// the LuaString P16.17 bug class). The assert compiles in EVERY build
+// mode; offsets are part of the representation contract (u-variant at 40).
+comptime {
+    std.debug.assert(@sizeOf(CallFrame) == 96);
+    std.debug.assert(@offsetOf(CallFrame, "u") == 40);
+    std.debug.assert(@alignOf(CallFrame) == 8);
+}
+
 pub const LuaString = extern struct {
     hash: u64,
     /// Position in `Vm.gc_objects` (P16.16 C1: u32).

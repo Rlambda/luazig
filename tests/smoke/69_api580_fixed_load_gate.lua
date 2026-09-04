@@ -1,4 +1,7 @@
--- Permanent narrow api.lua:580 regression gate (faithful reproducer)
+-- api.lua:580 documentation/differential helper (faithful reproducer).
+-- NOT the permanent gate: the differential smoke runner has no --testc,
+-- so without T this prints a skip. The authoritative permanent gate is
+-- tools/api580_gate.py (both build modes) plus upstream api.lua --testc.
 local N = 1000
 local source = {}
 for i = 1, N do source[i] = "X = X + 1; " end
@@ -11,7 +14,7 @@ local m1 = collectgarbage("count") * 1024
 if not T then
   -- No testc: PUC-ref runs have no T; the fixed-B load is testc-driven.
   -- Upstream api.lua is the authoritative gate; this lane is zig-side.
-  print("api580-gate-skipped (no T)")
+  print("api580-helper-skipped (no testc; authoritative gate = tools/api580_gate.py + upstream api.lua --testc)")
   return
 end
 local code = T.testC([[loadstring 2 name B; return 1]], source)
@@ -21,4 +24,4 @@ local delta = m2 - m1
 assert(m2 > m1 and delta < 400, "api580 gate: delta=" .. math.floor(delta + 0.5))
 X = 0; code(); assert(X == N and Y == string.rep("a", N))
 X = nil; Y = nil
-print("api580-gate-ok delta=" .. math.floor(delta + 0.5))
+print("api580-helper delta=" .. math.floor(delta + 0.5) .. " (informational; gate = tools/api580_gate.py)")

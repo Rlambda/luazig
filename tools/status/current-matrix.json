@@ -1,22 +1,22 @@
 {
   "meta": {
-    "created_utc": "2026-09-04T20:04:47.088938+00:00",
+    "created_utc": "2026-09-04T22:01:56.222541+00:00",
     "lane": "testes_matrix",
     "argv": [
       "tools/testes_matrix.py",
       "--testc",
       "--json-out",
-      "/tmp/opencode/matrix20.json"
+      "/tmp/opencode/matrix21.json"
     ],
     "zig_version": "0.16.0"
   },
   "provenance": {
-    "git_head": "d8cc5e7",
-    "measured_source_head": "d8cc5e7",
+    "git_head": "84724e5",
+    "measured_source_head": "84724e5",
     "git_dirty": "clean",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "e73d68c901b3a82b",
+    "zig_binary_sha16": "5f4f1c10bfb0e4e5",
     "puc_binary_sha16": "d54bc45e1757b216"
   },
   "summary": {

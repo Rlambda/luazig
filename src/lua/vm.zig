@@ -1534,11 +1534,13 @@ pub const CallFrame = extern struct {
     // P16.20 T1: extern layout packs by DECLARATION order — 8-aligned
     // fields first, then the 4-byte group, so the variant union starts at
     // offset 40 and @sizeOf(CallFrame) == 96 in BOTH build modes.
-    base: usize = 0,
     /// PUC `ci->func` equivalent: bc_stack index of the function value.
-    /// `base = func_slot + 1` for bytecode frames. The function value
-    /// at `bc_stack[func_slot]` is preserved for debug.getinfo and return
-    /// value placement.
+    /// The function value at `bc_stack[func_slot]` is preserved for
+    /// debug.getinfo and return value placement.
+    /// P16.20 T3: `base` is NO LONGER STORED — the invariant
+    /// `base == func_slot + 1` is universal (audited at all three writers:
+    /// C-frame push, Lua pushStaged incl. VAHID-shifted slot, tailcall
+    /// reuse), mirroring PUC luaV_execute `base = ci->func.p + 1`.
     func_slot: usize = 0,
     tbc_mark: usize = 0,
     activation_id: u32 = 0,
@@ -1564,6 +1566,12 @@ pub const CallFrame = extern struct {
         lua: LuaFrameState,
         c: CFrameState,
     } = .{ .c = .{} },
+
+    /// PUC lvm.c `updatebase(ci)`: base = ci->func.p + 1. Universal for
+    /// Lua AND C frames (P16.20 T3 audit); inline single-add.
+    pub inline fn frameBase(fr: CallFrame) usize {
+        return fr.func_slot + 1;
+    }
 
     // P15.51g: regs/boxed removed — derived on demand from base + frame_cap
     // via regsSlice()/boxedSlice(). Eliminates stale slices after bc_stack realloc.
@@ -1702,12 +1710,12 @@ pub const CallFrame = extern struct {
     /// bc_stack realloc. Callers must pass the correct stack for the thread
     /// (self.bc_stack for the VM-active thread, th.bytecode_stack for parked).
     pub fn regsSlice(fr: CallFrame, stack: []Value) []Value {
-        return stack[fr.base .. fr.base + fr.u.lua.frame_cap];
+        return stack[fr.frameBase() .. fr.frameBase() + fr.u.lua.frame_cap];
     }
 
     /// P15.51g: Derive boxed-cell slice from base + frame_cap.
     pub fn boxedSlice(fr: CallFrame, boxed_stack: []?*Cell) []?*Cell {
-        return boxed_stack[fr.base .. fr.base + fr.u.lua.frame_cap];
+        return boxed_stack[fr.frameBase() .. fr.frameBase() + fr.u.lua.frame_cap];
     }
 };
 
@@ -2203,8 +2211,8 @@ const TestcContState = struct {
 // the LuaString P16.17 bug class). The assert compiles in EVERY build
 // mode; offsets are part of the representation contract (u-variant at 40).
 comptime {
-    std.debug.assert(@sizeOf(CallFrame) == 96);
-    std.debug.assert(@offsetOf(CallFrame, "u") == 40);
+    std.debug.assert(@sizeOf(CallFrame) == 88);
+    std.debug.assert(@offsetOf(CallFrame, "u") == 32);
     std.debug.assert(@alignOf(CallFrame) == 8);
 }
 
@@ -4547,7 +4555,7 @@ pub const Vm = struct {
         //    since the vararg-table feature landed, exposed by P16.10b GC
         //    timing shifts in locals.lua to-be-closed coroutine sections).
         if (proto.vararg_table_reg != bc.Proto.no_vararg_reg) {
-            const start = frame.base + proto.numparams;
+            const start = frame.frameBase() + proto.numparams;
             if (start + nextra > stack.len) return &.{}; // frame being torn down
             return stack[start .. start + nextra];
         }
@@ -4650,7 +4658,7 @@ pub const Vm = struct {
                 const off: usize = if (frame.isC())
                     inst.a
                 else
-                    frame.u.lua.func_slot_base - parent.base;
+                    frame.u.lua.func_slot_base - parent.frameBase();
                 if (off >= proto.maxstacksize) return null;
                 const dn = debugBytecodeOperandName(proto, pc, @intCast(off));
                 if (dn.name) |nm| return .{ .namewhat = dn.namewhat, .name = nm };
@@ -4922,7 +4930,7 @@ pub const Vm = struct {
         for (0..th.call_frames.len()) |i| {
             const fr = th.call_frames.getConstPtr(i);
             if (fr.proto() != null) {
-                const extent = fr.base + fr.u.lua.frame_cap;
+                const extent = fr.frameBase() + fr.u.lua.frame_cap;
                 if (extent > inuse) inuse = extent;
             }
         }
@@ -5455,8 +5463,9 @@ pub const Vm = struct {
         // bcGrowFrame for multret) — the exposed window is exactly the
         // proto's register file, matching PUC's ci->top.
         const n: usize = proto.maxstacksize;
-        if (fr.base + n > stack.len) return null;
-        return stack[fr.base .. fr.base + n];
+        const fb = fr.frameBase();
+        if (fb + n > stack.len) return null;
+        return stack[fb .. fb + n];
     }
 
     /// PUC `lua_closethread` → `luaE_resetthread` (lstate.c:324-333).
@@ -6375,8 +6384,7 @@ pub const Vm = struct {
             return err;
         };
         slot.* = .{
-            .func_slot = func_slot,
-            .base = func_slot + 1,
+            .func_slot = func_slot, // base derived: func_slot + 1
         };
         // P15.78: Mark this as a C function frame (PUC CIST_C). The frame
         // has no proto (no bytecode), so the CIST_C bit is the explicit
@@ -7425,7 +7433,7 @@ pub const Vm = struct {
         // non-VAHID frames (buildhiddenargs copies them there).
         const nparams: usize = if (fr.proto()) |p| p.numparams else 0;
         const n_transfer = @min(nargs, nparams);
-        const transfer = self.bc_stack[fr.base .. fr.base + n_transfer];
+        const transfer = self.bc_stack[fr.frameBase() .. fr.frameBase() + n_transfer];
         try self.debugDispatchHookWithCalleeTransfer(
             "call",
             null,
@@ -7634,7 +7642,7 @@ pub const Vm = struct {
     }
 
     fn closeBytecodeUpvaluesFrom(self: *Vm, frame: *CallFrame, min_reg: u8) void {
-        const boxed = self.bc_boxed[frame.base .. frame.base + frame.u.lua.frame_cap];
+        const boxed = self.bc_boxed[frame.frameBase() .. frame.frameBase() + frame.u.lua.frame_cap];
         var i: usize = min_reg;
         while (i < boxed.len) : (i += 1) {
             if (boxed[i]) |cell| {
@@ -7726,7 +7734,7 @@ pub const Vm = struct {
             _ = self.bc_tbc_regs.orderedRemove(close_index);
             state.scan_index = close_index;
 
-            const regs = self.bc_stack[parent.base .. parent.base + parent.u.lua.frame_cap];
+            const regs = self.bc_stack[parent.frameBase() .. parent.frameBase() + parent.u.lua.frame_cap];
             const obj = regs[tbc_reg];
             if (obj == .Nil or (obj == .Bool and !obj.Bool)) continue;
 
@@ -8698,7 +8706,7 @@ pub const Vm = struct {
     }
 
     /// PUC-faithful result application for ordinary Lua CALL (no pending_call).
-    /// dst = callee.func_slot_base - parent.base (PUC: ci->func.p is result dest).
+    /// dst = callee.func_slot_base - parent.frameBase() (PUC: ci->func.p is result dest).
     /// nresults from callee callstatus (PUC: CIST_NRESULTS).
     fn applyBytecodeResultsDirect(
         self: *Vm,
@@ -8710,7 +8718,7 @@ pub const Vm = struct {
     ) DispatchError!void {
         errdefer if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         const parent = exec_frames.getPtr(parent_index);
-        var regs = self.bc_stack[parent.base .. parent.base + parent.u.lua.frame_cap];
+        var regs = self.bc_stack[parent.frameBase() .. parent.frameBase() + parent.u.lua.frame_cap];
         const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
         // P16.2e (CHANGE 5): Guard bcGrowFrame — only call when growth is
         // actually needed. bcGrowFrame unconditionally re-derives regs/boxed
@@ -8727,7 +8735,7 @@ pub const Vm = struct {
         // frame_cap field is always up-to-date (frames are not moved by stack
         // realloc — only the bc_stack/bc_boxed arrays grow).
         if (dst + nstore > parent.u.lua.frame_cap) {
-            try self.bcGrowFrame(parent.base, dst + nstore, &parent.u.lua.frame_cap, &regs);
+            try self.bcGrowFrame(parent.frameBase(), dst + nstore, &parent.u.lua.frame_cap, &regs);
         }
         for (0..nstore) |i| regs[dst + i] = if (i < ret.len) ret[i] else .Nil;
         if (nresults < 0) parent.reg_top = @intCast(@as(usize, dst) + ret.len);
@@ -8750,9 +8758,9 @@ pub const Vm = struct {
             .results => |cont| cont.min_reg_top,
             else => unreachable,
         };
-        var regs = self.bc_stack[parent.base .. parent.base + parent.u.lua.frame_cap];
+        var regs = self.bc_stack[parent.frameBase() .. parent.frameBase() + parent.u.lua.frame_cap];
         const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
-        try self.bcGrowFrame(parent.base, dst + nstore, &parent.u.lua.frame_cap, &regs);
+        try self.bcGrowFrame(parent.frameBase(), dst + nstore, &parent.u.lua.frame_cap, &regs);
         for (0..nstore) |i| regs[dst + i] = if (i < ret.len) ret[i] else .Nil;
         if (nresults < 0) parent.reg_top = @intCast(dst + ret.len);
         if (min_reg_top) |minimum| parent.reg_top = @max(parent.reg_top, minimum);
@@ -8855,8 +8863,8 @@ pub const Vm = struct {
     ) DispatchError!void {
         defer if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         const parent = exec_frames.getPtr(parent_index);
-        var regs = self.bc_stack[parent.base .. parent.base + parent.u.lua.frame_cap];
-        try self.bcGrowFrame(parent.base, @as(usize, cont.dst) + 1, &parent.u.lua.frame_cap, &regs);
+        var regs = self.bc_stack[parent.frameBase() .. parent.frameBase() + parent.u.lua.frame_cap];
+        try self.bcGrowFrame(parent.frameBase(), @as(usize, cont.dst) + 1, &parent.u.lua.frame_cap, &regs);
         regs[cont.dst] = if (ret.len == 0) .Nil else ret[0];
         parent.u.lua.pc += 1;
         self.clearPendingCall(parent);
@@ -9029,8 +9037,8 @@ pub const Vm = struct {
             .pushed => {},
             .value => |value| {
                 const parent = exec_frames.getPtr(parent_index);
-                var regs = self.bc_stack[parent.base .. parent.base + parent.u.lua.frame_cap];
-                try self.bcGrowFrame(parent.base, @as(usize, cont.dst) + 1, &parent.u.lua.frame_cap, &regs);
+                var regs = self.bc_stack[parent.frameBase() .. parent.frameBase() + parent.u.lua.frame_cap];
+                try self.bcGrowFrame(parent.frameBase(), @as(usize, cont.dst) + 1, &parent.u.lua.frame_cap, &regs);
                 regs[cont.dst] = value;
                 parent.u.lua.pc += 1;
             },
@@ -10620,12 +10628,12 @@ pub const Vm = struct {
         if (th_bc.len() > 0) {
             const caller = th_bc.getConstPtr(th_bc.len() - 1);
             if (!caller.isC()) {
-                self.bc_stack_top = caller.base + caller.u.lua.frame_cap;
+                self.bc_stack_top = caller.frameBase() + caller.u.lua.frame_cap;
             } else {
                 // C-frame caller: restore bc_stack_top to the C-frame's base
                 // (= func_slot + 1), matching popBytecodeExecFrame's C-frame
                 // caller path.
-                self.bc_stack_top = caller.base;
+                self.bc_stack_top = caller.frameBase();
             }
         } else {
             self.bc_stack_top = 0;
@@ -12007,8 +12015,7 @@ pub const Vm = struct {
 
         // Bytecode-specific fields
         ef_slot.activation_id = activation_owner.bytecode_activation_counter;
-        ef_slot.base = base;
-        ef_slot.func_slot = func_slot;
+        ef_slot.func_slot = func_slot; // base derived: func_slot + 1
         ef_slot.u.lua.func_slot_base = func_slot_in;
         ef_slot.u.lua.frame_cap = frame_cap;
         ef_slot.u.lua.nextraargs = @intCast(nextra);
@@ -12121,7 +12128,7 @@ pub const Vm = struct {
         if (idx > 0) {
             const caller = exec_frames.getConstPtr(idx - 1);
             if (!caller.isC()) {
-                self.bc_stack_top = caller.base + caller.u.lua.frame_cap;
+                self.bc_stack_top = caller.frameBase() + caller.u.lua.frame_cap;
             } else {
                 // C-frame caller: restore bc_stack_top to the C-frame's base
                 // (= func_slot + 1). Without this, each runBytecodeInternal
@@ -12130,7 +12137,7 @@ pub const Vm = struct {
                 // bc_stack_top at the Lua frame's base + frame_cap, causing
                 // bc_stack_top to grow without bound across repeated calls
                 // and eventually triggering "stack overflow error".
-                self.bc_stack_top = caller.base;
+                self.bc_stack_top = caller.frameBase();
             }
         } else {
             self.bc_stack_top = 0;
@@ -12233,8 +12240,8 @@ pub const Vm = struct {
                 } else {
                     // Value mode: put 1 result into register, advance pc.
                     const sr_dst = parent_ptr.u.lua.simple_result_dst;
-                    var regs = self.bc_stack[parent_ptr.base .. parent_ptr.base + parent_ptr.u.lua.frame_cap];
-                    try self.bcGrowFrame(parent_ptr.base, @as(usize, sr_dst) + 1, &parent_ptr.u.lua.frame_cap, &regs);
+                    var regs = self.bc_stack[parent_ptr.frameBase() .. parent_ptr.frameBase() + parent_ptr.u.lua.frame_cap];
+                    try self.bcGrowFrame(parent_ptr.frameBase(), @as(usize, sr_dst) + 1, &parent_ptr.u.lua.frame_cap, &regs);
                     regs[sr_dst] = if (ret.len == 0) .Nil else ret[0];
                     parent_ptr.u.lua.pc += 1;
                 }
@@ -12247,7 +12254,7 @@ pub const Vm = struct {
         // fully in callee's callstatus (nresults) + func_slot_base (dst).
         if (self.getPendingCallConst(exec_frames.getPtr(parent_index).pending_call_index) == null) {
             const parent0 = exec_frames.getConstPtr(parent_index);
-            const dst = child_frame.u.lua.func_slot_base - parent0.base;
+            const dst = child_frame.u.lua.func_slot_base - parent0.frameBase();
             try self.applyBytecodeResultsDirect(exec_frames, parent_index, ret, dst, callee_nresults);
             return null;
         }
@@ -12744,8 +12751,8 @@ pub const Vm = struct {
             fr.u.lua.pc = ctx.pc;
             // P16.19 T9.1: base write removed — provably dead. ctx.base has
             // exactly two mutation sites: the frame_loop entry (loaded FROM
-            // fr.base, so a write-back is identity) and OP_TAILCALL frame
-            // reuse (which writes fr2.base = ctx.base directly at the same
+            // fr.frameBase(), so a write-back is identity) and OP_TAILCALL frame
+            // reuse (which writes fr2.frameBase() = ctx.base directly at the same
             // moment it sets ctx.base — see the tailcall handler). No other
             // dispatch path mutates ctx.base.
             fr.u.lua.frame_cap = ctx.frame_cap;
@@ -12851,10 +12858,10 @@ pub const Vm = struct {
                 ctx.cur_proto = fr.proto().?;
                 // P15.51n: Derive upvalues from bc_stack[func_slot].Closure.upvalues.
                 ctx.cur_upvalues = self.bc_stack[fr.func_slot].Closure.upvalues;
-                ctx.base = fr.base;
+                ctx.base = fr.frameBase();
                 ctx.frame_cap = fr.u.lua.frame_cap;
                 ctx.pc = fr.u.lua.pc;
-                ctx.regs = self.bc_stack[fr.base .. fr.base + fr.u.lua.frame_cap];
+                ctx.regs = self.bc_stack[fr.frameBase() .. fr.frameBase() + fr.u.lua.frame_cap];
             }
 
             // P16.19 T9.1: syncFrame publishes pc + frame_cap (base write
@@ -15153,12 +15160,12 @@ pub const Vm = struct {
                     {
                         const nresults = decodeNresults(child.callstatus);
                         if (nresults == 0 or nresults < 0) {
-                            const dst = child.u.lua.func_slot_base - parent_c.base;
+                            const dst = child.u.lua.func_slot_base - parent_c.frameBase();
                             // Pop child frame — mirror popBytecodeExecFrame
                             // (same skip rationale as opReturn1).
                             const child_m = ctx.exec_frames.getPtr(ctx.frame_index);
                             child_m.callstatus = 0;
-                            self.bc_stack_top = parent_c.base + parent_c.u.lua.frame_cap;
+                            self.bc_stack_top = parent_c.frameBase() + parent_c.u.lua.frame_cap;
                             ctx.exec_frames.shrinkTo(ctx.frame_index);
                             // No value to store (opReturn0 returns 0 values).
                             const parent_m = ctx.exec_frames.getPtr(parent_idx);
@@ -15181,7 +15188,7 @@ pub const Vm = struct {
                             // Pop child frame — same as ordinary fast arm.
                             const child_m = ctx.exec_frames.getPtr(ctx.frame_index);
                             child_m.callstatus = 0;
-                            self.bc_stack_top = parent_c.base + parent_c.u.lua.frame_cap;
+                            self.bc_stack_top = parent_c.frameBase() + parent_c.u.lua.frame_cap;
                             ctx.exec_frames.shrinkTo(ctx.frame_index);
                             const parent_m = ctx.exec_frames.getPtr(parent_idx);
                             if (parent_m.u.lua.simpleResultIsCompare()) {
@@ -15192,7 +15199,7 @@ pub const Vm = struct {
                             } else {
                                 // Value mode: 0 values → nil.
                                 const sr_dst = parent_m.u.lua.simple_result_dst;
-                                self.bc_stack[parent_c.base + sr_dst] = .Nil;
+                                self.bc_stack[parent_c.frameBase() + sr_dst] = .Nil;
                                 parent_m.reg_top = @intCast(sr_dst + 1);
                                 parent_m.u.lua.pc += 1;
                             }
@@ -15269,7 +15276,7 @@ pub const Vm = struct {
             //
             // Safety proof (single-copy cannot clobber source): the RHS
             // (ctx.regs[a]) is read into a local BEFORE the write. The write
-            // target (self.bc_stack[parent.base + dst]) is in the parent's
+            // target (self.bc_stack[parent.frameBase() + dst]) is in the parent's
             // register window, which may overlap the child's window (shared
             // stack). But since we read the source value first and perform a
             // single Value assignment, there is no aliasing hazard.
@@ -15304,7 +15311,7 @@ pub const Vm = struct {
                         if (nresults == 1 or nresults < 0) {
                             // Read source BEFORE pop (child reg still valid).
                             const src_val = ctx.regs[a];
-                            const dst = child.u.lua.func_slot_base - parent_c.base;
+                            const dst = child.u.lua.func_slot_base - parent_c.frameBase();
                             // Pop child frame — mirror popBytecodeExecFrame
                             // exactly, skipping the parts guarded by fast-arm
                             // conditions: pending-call cancel (none per (e)),
@@ -15315,13 +15322,13 @@ pub const Vm = struct {
                             child_m.callstatus = 0;
                             // Restore bc_stack_top to parent's frame capacity
                             // (parent is Lua per (c) — the !caller.isC() arm).
-                            self.bc_stack_top = parent_c.base + parent_c.u.lua.frame_cap;
+                            self.bc_stack_top = parent_c.frameBase() + parent_c.u.lua.frame_cap;
                             ctx.exec_frames.shrinkTo(ctx.frame_index);
                             // Single-copy: write return value directly into
                             // parent's register window. dst < frame_cap is
                             // guaranteed because func_slot_base is within the
                             // parent's window (it's where the function was).
-                            self.bc_stack[parent_c.base + dst] = src_val;
+                            self.bc_stack[parent_c.frameBase() + dst] = src_val;
                             const parent_m = ctx.exec_frames.getPtr(parent_idx);
                             if (nresults < 0) {
                                 // Multret: set reg_top to dst + 1 (1 value).
@@ -15349,7 +15356,7 @@ pub const Vm = struct {
                             // Pop child frame — same as ordinary fast arm.
                             const child_m = ctx.exec_frames.getPtr(ctx.frame_index);
                             child_m.callstatus = 0;
-                            self.bc_stack_top = parent_c.base + parent_c.u.lua.frame_cap;
+                            self.bc_stack_top = parent_c.frameBase() + parent_c.u.lua.frame_cap;
                             ctx.exec_frames.shrinkTo(ctx.frame_index);
                             const parent_m = ctx.exec_frames.getPtr(parent_idx);
                             if (parent_m.u.lua.simpleResultIsCompare()) {
@@ -15361,7 +15368,7 @@ pub const Vm = struct {
                             } else {
                                 // Value mode: single-copy into parent register.
                                 const sr_dst = parent_m.u.lua.simple_result_dst;
-                                self.bc_stack[parent_c.base + sr_dst] = src_val;
+                                self.bc_stack[parent_c.frameBase() + sr_dst] = src_val;
                                 parent_m.reg_top = @intCast(sr_dst + 1);
                                 parent_m.u.lua.pc += 1;
                             }
@@ -16222,8 +16229,7 @@ pub const Vm = struct {
                 const fr2 = ctx.exec_frames.getPtr(ctx.exec_frames.len() - 1);
                 fr2.u.lua.proto = new_proto;
                 // P15.51n: upvalues derived from bc_stack[func_slot], not stored in frame.
-                fr2.base = ctx.base;
-                fr2.func_slot = new_func_slot;
+                fr2.func_slot = new_func_slot; // base derived: +1 (== ctx.base)
                 fr2.u.lua.func_slot_base = reset_slot;
                 // P15.51g: regs/boxed no longer cached in the frame.
                 // P15.51k: callee is at bc_stack[func_slot] (set by TAILCALL
@@ -16261,7 +16267,7 @@ pub const Vm = struct {
                         "tail call",
                         null,
                         callee_val,
-                        self.bc_stack[fr2.base .. fr2.base + n_transfer],
+                        self.bc_stack[fr2.frameBase() .. fr2.frameBase() + n_transfer],
                         1,
                         ctx.frame_index,
                     );
@@ -18853,7 +18859,7 @@ pub const Vm = struct {
                 if (cfr.isC()) {
                     cfr.setYpcall();
                     cfr.u.c.old_errfunc = saved_errfunc;
-                    cfr.u.c.aux.funcidx = cfr.base;
+                    cfr.u.c.aux.funcidx = cfr.frameBase();
                     cfr.callstatus = setoah(cfr.callstatus, th_pcall_ef.allowhook);
                 }
             }
@@ -21522,7 +21528,7 @@ pub const Vm = struct {
                 // P15.51g: Derive regs from base + frame_cap (no cached slice).
                 // Use self.bc_stack directly because GC finalizers may execute
                 // Lua code that reallocs bc_stack.
-                const regs = self.bc_stack[frame.base .. frame.base + frame.u.lua.frame_cap];
+                const regs = self.bc_stack[frame.frameBase() .. frame.frameBase() + frame.u.lua.frame_cap];
                 // Scan bound: proto.live_reg_top[pc] is the compile-time
                 // liveness bound — it includes exactly the registers that are
                 // live at the current PC. Using @max(pc_live, frame.reg_top)
@@ -21562,7 +21568,7 @@ pub const Vm = struct {
                 for (self.frameUpvalues(frame, null)) |cell| {
                     try self.gcQueueScanCell(cell);
                 }
-                for (self.bc_boxed[frame.base .. frame.base + frame.u.lua.frame_cap]) |maybe_cell| {
+                for (self.bc_boxed[frame.frameBase() .. frame.frameBase() + frame.u.lua.frame_cap]) |maybe_cell| {
                     if (maybe_cell) |cell| {
                         try self.gcQueueScanCell(cell);
                     }
@@ -22354,7 +22360,7 @@ pub const Vm = struct {
             const frame = th.call_frames.getPtr(i);
             if (frame.proto()) |proto| {
                 const regs_len = frame.u.lua.frame_cap;
-                const regs = self.bc_stack[frame.base .. frame.base + regs_len];
+                const regs = self.bc_stack[frame.frameBase() .. frame.frameBase() + regs_len];
                 const live_top: usize = if (frame.u.lua.pc < proto.live_reg_top.len)
                     @min(proto.live_reg_top[frame.u.lua.pc], regs.len)
                 else
@@ -22375,7 +22381,7 @@ pub const Vm = struct {
                 if (i + 1 < th.call_frames.len()) {
                     const child = th.call_frames.getConstPtr(i + 1);
                     if (child.proto() != null) {
-                        const child_start = child.func_slot - frame.base;
+                        const child_start = child.func_slot - frame.frameBase();
                         if (child_start < clear_end) clear_end = child_start;
                     }
                 }
@@ -23603,7 +23609,7 @@ pub const Vm = struct {
                     if (exec_fr.proto()) |proto| {
                         try self.gcMarkBytecodeProto(proto);
                         // P15.51g: Derive regs from base + frame_cap.
-                        const regs = frame_stack[exec_fr.base .. exec_fr.base + exec_fr.u.lua.frame_cap];
+                        const regs = frame_stack[exec_fr.frameBase() .. exec_fr.frameBase() + exec_fr.u.lua.frame_cap];
                         // Scan bound: proto.live_reg_top[pc] is the compile-time
                         // liveness bound. Using @max(pc_live, exec_fr.reg_top)
                         // would scan dead registers (locals out of scope after
@@ -23662,7 +23668,7 @@ pub const Vm = struct {
                     // Use the thread's own bytecode_boxed for parked coroutines,
                     // self.bc_boxed for the VM-active thread.
                     const boxed_stack = if (th.bytecode_boxed.len > 0) th.bytecode_boxed else self.bc_boxed;
-                    for (boxed_stack[exec_fr.base .. exec_fr.base + exec_fr.u.lua.frame_cap]) |maybe_cell| {
+                    for (boxed_stack[exec_fr.frameBase() .. exec_fr.frameBase() + exec_fr.u.lua.frame_cap]) |maybe_cell| {
                         if (maybe_cell) |cell| {
                             try self.gcQueueScanCell(cell);
                         }
@@ -30405,7 +30411,7 @@ pub const Vm = struct {
                 const reg = self.bc_tbc_regs.items[i];
                 if (reg >= frame.u.lua.frame_cap) continue;
 
-                const obj = self.bc_stack[frame.base + reg];
+                const obj = self.bc_stack[frame.frameBase() + reg];
                 // PUC: nil/false are inert close sentinels — skip them.
                 if (obj == .Nil or (obj == .Bool and !obj.Bool)) continue;
 
@@ -40033,12 +40039,12 @@ pub const Vm = struct {
                 // apiCall invocation, and the normal-return clearYpcall +
                 // errfunc restore, lapi.c:1097-1117) lives in the shared
                 // helper — the SAME implementation c_api lua_pcallk uses.
-                // funcidx = cframe.base (callee stack position, same
+                // funcidx = cframe.frameBase() (callee stack position, same
                 // convention as builtinPcall); errfunc arg is always 0 for
                 // testC pcallk (ltests passes errfunc=0), so errfunc_val =
                 // null (th.errfunc := ERRFUNC_NONE for the duration, exactly
                 // PUC's `L->errfunc = func` with func = 0).
-                const ret = self.luaPcallKShared(th, callee, call_args, null, cframe.base, &testcContShim, 0) catch |e| switch (e) {
+                const ret = self.luaPcallKShared(th, callee, call_args, null, cframe.frameBase(), &testcContShim, 0) catch |e| switch (e) {
                     error.Yield => {
                         th.bytecode_inplace_suspended = true;
                         last_status.* = "YIELD";
@@ -42461,7 +42467,7 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
     }
 
     // Restore bc_stack_top for clean deinit.
-    vm.bc_stack_top = exec_frames.getPtr(parent_index).base +
+    vm.bc_stack_top = exec_frames.getPtr(parent_index).frameBase() +
         exec_frames.getPtr(parent_index).u.lua.frame_cap;
 }
 

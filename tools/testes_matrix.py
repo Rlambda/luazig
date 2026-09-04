@@ -379,7 +379,8 @@ def main() -> int:
             # Provenance: the matrix lane executes BOTH engines (PUC
             # reference + luazig), so both binary hashes apply (see
             # tools/provenance.py block()).
-            "provenance": provenance.block(zig_bin=zig_lua, puc_bin=ref_lua),
+            "provenance": provenance.block(zig_bin=zig_lua, puc_bin=ref_lua,
+                                             optimize_mode="ReleaseFast"),
             "summary": {
                 "total": total,
                 "pass": pass_n,

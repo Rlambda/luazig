@@ -197,7 +197,8 @@ def main() -> int:
             "meta": lane_metadata(sys.argv),
             # Provenance: the smoke lane executes BOTH engines, so both
             # binary hashes apply (see tools/provenance.py block()).
-            "provenance": provenance.block(zig_bin=zig_lua, puc_bin=ref_lua),
+            "provenance": provenance.block(zig_bin=zig_lua, puc_bin=ref_lua,
+                                          optimize_mode="ReleaseFast"),
             "total": len(results),
             "ok": sum(1 for r in results if r["match"]),
             "mismatches": bad,

@@ -321,7 +321,8 @@ def main() -> int:
         # Provenance: zig-only lane — the PUC side of this artifact comes from
         # the vendored lua-5.5.0 headers (compiled by gcc for sizeof), not
         # from the PUC binary, so no puc_binary_sha16 here.
-        "provenance": provenance.block(zig_bin=ZIG_LUA),
+        "provenance": provenance.block(zig_bin=ZIG_LUA,
+                                         optimize_mode="ReleaseFast"),
         "zig_sizes": zig_sizes,
         "puc_sizes": puc_sizes,
         "zig_components": zig_components,

@@ -432,23 +432,49 @@
     }
   },
   "conclusion": {
-    "metamethod_call_noalloc": {
-      "extra_instr_per_iter": 549,
-      "where_extra_concentrates": [
-        "Call/return frame machinery dominates the excess: pushStagedBytecodeExecFrame (12.63% self) + pushResolvedBytecodeClosure (11.44%) + tryPushSimpleResultMetamethod (10.05%) + opReturn simple_result fast path (vm.zig:15332, 7.48%) + FrameStack getPtr/shrinkTo/addOne lines (~8% combined) + syncFrame/defer/frame_identity (~4.5%) ~= 340 instr/iter equivalent, vs PUC's entire call path (luaD_precall 11.32% + luaT_callTMres 10.56% + luaD_call 7.19% + callbinTM 7.06% ~= 135 instr/iter). The frame push/pop machinery alone accounts for roughly +200 instr/iter of excess.",
-        "Per-instruction dispatch overhead inside runBytecodeDispatch: hooks_active_cached check (6.25%), stats.enabled check (2.58%), dispatch switch decode (7.07%), per-frame ctx.regs/ctx.boxed slice re-derivation (4.58%), cur_proto/cur_upvalues loads (~3.5%) \u2014 PUC pays none of these per instruction (no hooks flag check in the hot loop, no stats check, register window is a plain base pointer, no slice objects).",
-        "getTmByObj lookup itself is NOT the main excess: zig getTmByObj symbol (4.00%) + findBinaryTm line (1.53%) ~= 5.5% of zig samples ~= 37-51 instr/iter, vs PUC luaT_gettmbyobj (3.36%) + luaH_Hgetshortstr (2.10%) = 5.46% of PUC samples ~= 20 instr/iter. Excess is roughly +17-30 instr/iter, i.e. only ~3-5% of the +549 delta. The lookup is proportionally (and absolutely) only ~1.8-2.5x PUC \u2014 comparable to the overall 2.46x ratio, not a disproportionate hotspot."
+    "where_the_extra_absolute_cost_sits": "noalloc +549 instr/iter, lua_calls +482. Dominant: frame push/return machinery (~340 vs ~135 instr/iter PUC call path) and luazig frame-transition state (ctx slice re-derivation, FrameStack access, syncFrame). Per-instruction fixed overhead decomposes into: PUC-equivalent (fetch/pc/trap-branch) + luazig-only stats gate + excess loads of hot dispatch state (hooks_active_cached from memory vs PUC's loop-live local).",
+    "getTmByObj_verdict_unchanged": "~5.5% of samples in BOTH runtimes (zig getTmByObj+findBinaryTm vs PUC luaT_gettmbyobj+luaH_Hgetshortstr); excess ~3-5% of the delta \u2014 NOT a target. No negative cache for >TM_EQ (prohibition)."
+  },
+  "cost_classification": {
+    "preamble": "P16.19 T1 CORRECTION of the original interpretation. PUC lvm.c vmfetch() is: `if (l_unlikely(trap)) { trap = luaG_traceexec; updatebase; } i = *(pc++);` \u2014 PUC DOES pay one trap branch AND one pc increment/fetch per instruction. Those are PUC-equivalent dispatch work, NOT luazig-only overhead. Luazig may implement them less efficiently (extra loads vs PUC's loop-live local trap), but that must be shown by generated-code comparison, not asserted.",
+    "categories": {
+      "puc_equivalent_dispatch_work": [
+        "instruction fetch + pc advance (PUC `i = *(pc++)`)",
+        "one hook/trap branch per instruction (PUC `l_unlikely(trap)`)",
+        "opcode dispatch switch"
       ],
-      "getTmByObj_vs_luaT_gettmbyobj": "zig lookup path (getTmByObj+findBinaryTm+inlined nodeLookupShortStrIdentity) ~= 5.5% of samples vs PUC (luaT_gettmbyobj+luaH_Hgetshortstr) 5.46% of samples; in absolute instr/iter ~37-51 vs ~20. Excess absolute cost exists (~2x) but is in line with the global 2.46x slowdown \u2014 the metamethod lookup is NOT where the disproportionate extra cost sits."
-    },
-    "lua_calls": {
-      "extra_instr_per_iter": 482,
-      "where_extra_concentrates": [
-        "pushStagedBytecodeExecFrame alone is 15.42% self (~114 instr/iter) vs PUC luaD_precall 15.11% (~39 instr/iter) \u2014 the Lua-closure call setup costs ~3x more instructions in absolute terms.",
-        "Per-instruction overhead inside the dispatch loop: hooks check (9.08%) + stats check (4.95%) + pc advance (3.91%) + inst fetch (2.95%) + slice re-derivation (4.82%) + FrameStack getPtr lines (~7.4%) ~= 33% of samples ~= ~240 instr/iter, vs PUC's luaV_execute 84.22% (~217 instr/iter) which contains its equivalents nearly free (base-pointer register window, no per-instr hook/stats flags, direct ci pointer).",
-        "syncFrame (4.76% self + 1.76% defer line + frame_identity 1.73%) \u2014 PUC has no equivalent write-back; it keeps pc in the CallInfo directly."
+      "luazig_only_diagnostic_work": [
+        "stats.enabled gate per instruction (PUC has no counters)"
+      ],
+      "luazig_frame_transition_work": [
+        "ctx.regs / ctx.boxed slice re-derivation (per frame-loop entry, NOT per instruction)",
+        "current closure/upvalue slice derivation at frame entry",
+        "FrameStack top access at entry"
+      ],
+      "luazig_architecture_specific_state_persistence": [
+        "dispatch_pc published store (luazig iterative/yieldable design; PUC persists savedpc only at boundaries)",
+        "syncFrame bundle writes / activation_id"
       ]
     },
-    "summary": "For identical workloads luazig spends 2.5-2.9x the instructions of PUC. The excess is NOT in the metamethod/TM lookup itself (getTmByObj is proportionally no worse than the whole VM); it concentrates in (1) the staged frame push/pop machinery (pushStagedBytecodeExecFrame / pushResolvedBytecodeClosure / tryPushSimpleResultMetamethod / opReturn fast path / FrameStack getPtr-shrinkTo / syncFrame write-back), and (2) fixed per-instruction dispatch overhead (hooks_active_cached + stats.enabled checks, ctx.regs/ctx.boxed slice re-derivation per frame, activation_id load, defer syncFrame). PUC's equivalents (luaD_precall + direct ci->u.l.savedpc updates, plain base pointer) are dramatically cheaper in absolute instructions."
+    "original_conclusion_superseded": {
+      "metamethod_call_noalloc": {
+        "extra_instr_per_iter": 549,
+        "where_extra_concentrates": [
+          "Call/return frame machinery dominates the excess: pushStagedBytecodeExecFrame (12.63% self) + pushResolvedBytecodeClosure (11.44%) + tryPushSimpleResultMetamethod (10.05%) + opReturn simple_result fast path (vm.zig:15332, 7.48%) + FrameStack getPtr/shrinkTo/addOne lines (~8% combined) + syncFrame/defer/frame_identity (~4.5%) ~= 340 instr/iter equivalent, vs PUC's entire call path (luaD_precall 11.32% + luaT_callTMres 10.56% + luaD_call 7.19% + callbinTM 7.06% ~= 135 instr/iter). The frame push/pop machinery alone accounts for roughly +200 instr/iter of excess.",
+          "Per-instruction dispatch overhead inside runBytecodeDispatch: hooks_active_cached check (6.25%), stats.enabled check (2.58%), dispatch switch decode (7.07%), per-frame ctx.regs/ctx.boxed slice re-derivation (4.58%), cur_proto/cur_upvalues loads (~3.5%) \u2014 PUC pays none of these per instruction (no hooks flag check in the hot loop, no stats check, register window is a plain base pointer, no slice objects).",
+          "getTmByObj lookup itself is NOT the main excess: zig getTmByObj symbol (4.00%) + findBinaryTm line (1.53%) ~= 5.5% of zig samples ~= 37-51 instr/iter, vs PUC luaT_gettmbyobj (3.36%) + luaH_Hgetshortstr (2.10%) = 5.46% of PUC samples ~= 20 instr/iter. Excess is roughly +17-30 instr/iter, i.e. only ~3-5% of the +549 delta. The lookup is proportionally (and absolutely) only ~1.8-2.5x PUC \u2014 comparable to the overall 2.46x ratio, not a disproportionate hotspot."
+        ],
+        "getTmByObj_vs_luaT_gettmbyobj": "zig lookup path (getTmByObj+findBinaryTm+inlined nodeLookupShortStrIdentity) ~= 5.5% of samples vs PUC (luaT_gettmbyobj+luaH_Hgetshortstr) 5.46% of samples; in absolute instr/iter ~37-51 vs ~20. Excess absolute cost exists (~2x) but is in line with the global 2.46x slowdown \u2014 the metamethod lookup is NOT where the disproportionate extra cost sits."
+      },
+      "lua_calls": {
+        "extra_instr_per_iter": 482,
+        "where_extra_concentrates": [
+          "pushStagedBytecodeExecFrame alone is 15.42% self (~114 instr/iter) vs PUC luaD_precall 15.11% (~39 instr/iter) \u2014 the Lua-closure call setup costs ~3x more instructions in absolute terms.",
+          "Per-instruction overhead inside the dispatch loop: hooks check (9.08%) + stats check (4.95%) + pc advance (3.91%) + inst fetch (2.95%) + slice re-derivation (4.82%) + FrameStack getPtr lines (~7.4%) ~= 33% of samples ~= ~240 instr/iter, vs PUC's luaV_execute 84.22% (~217 instr/iter) which contains its equivalents nearly free (base-pointer register window, no per-instr hook/stats flags, direct ci pointer).",
+          "syncFrame (4.76% self + 1.76% defer line + frame_identity 1.73%) \u2014 PUC has no equivalent write-back; it keeps pc in the CallInfo directly."
+        ]
+      },
+      "summary": "For identical workloads luazig spends 2.5-2.9x the instructions of PUC. The excess is NOT in the metamethod/TM lookup itself (getTmByObj is proportionally no worse than the whole VM); it concentrates in (1) the staged frame push/pop machinery (pushStagedBytecodeExecFrame / pushResolvedBytecodeClosure / tryPushSimpleResultMetamethod / opReturn fast path / FrameStack getPtr-shrinkTo / syncFrame write-back), and (2) fixed per-instruction dispatch overhead (hooks_active_cached + stats.enabled checks, ctx.regs/ctx.boxed slice re-derivation per frame, activation_id load, defer syncFrame). PUC's equivalents (luaD_precall + direct ci->u.l.savedpc updates, plain base pointer) are dramatically cheaper in absolute instructions."
+    }
   }
 }

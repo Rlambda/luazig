@@ -1,17 +1,17 @@
 {
-  "created_utc": "2026-09-04T12:24:20.901190+00:00",
+  "created_utc": "2026-09-04T16:23:49.816782+00:00",
   "provenance": {
-    "git_head": "281ba6f",
-    "measured_source_head": "281ba6f",
-    "git_dirty": "clean",
+    "git_head": "4bb378b",
+    "measured_source_head": "4bb378b",
+    "git_dirty": "dirty",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast+Debug",
-    "zig_binary_sha16": "7c36dc6ac65d2bc9"
+    "zig_binary_sha16": "0813b0ba8e8af441"
   },
   "gate_threshold": 400,
   "verdict": "GREEN",
   "measured_delta_anchored": 376,
-  "measured_delta_no_xy_root": 474,
+  "measured_delta_no_xy_root": 428,
   "savings_needed_below_400": 0,
   "zig_sizes": {
     "Proto": 200,
@@ -19,6 +19,7 @@
     "Cell": 40,
     "LuaString": 48,
     "LuaString_lstrfix": 32,
+    "LuaString_short_len1": 26,
     "Value": 16,
     "Upvaldesc": 16,
     "Constant": 16
@@ -87,10 +88,10 @@
       "reconciled": true
     },
     "no_xy_root": {
-      "measured": 474,
-      "charged_total": 474,
+      "measured": 428,
+      "charged_total": 428,
       "reconciled": true,
-      "note": "adds the X/Y re-intern: 2 x (sizeof(LuaString)+1) = 98 charged; each allocation is @sizeOf(LuaString)+1 bytes (extra NUL byte not charged), so tracker bytes exceed the charge by 2"
+      "note": "adds the X/Y re-intern: 2 x per-kind short allocation (short_content_offset+1+1) = 52 charged; tracker bytes equal the charge (the NUL is included in the per-kind rule since P16.18 T2)"
     },
     "real_outstanding_anchored": {
       "tracker_bytes": 384,
@@ -103,7 +104,7 @@
   "context_variance": {
     "summary": "The delta depends on ONE context-dependent component: whether the short strings \"X\"/\"Y\" are still interned when the interval's undump runs. They are referenced by the initial compile closure AND by the enclosing chunk's own constants when it contains the api.lua:578-579 trailing statements (\"X = 0; ... X = nil; Y = nil\").",
     "anchored": "In the exact api.lua shape the trailing verification statements make \"X\"/\"Y\" constants of the enclosing chunk; its frame is live for the whole run, so the constants root the short strings through every GC and the undump finds them in the intern table \u2014 no re-intern: 376 (current binary-measured; reproduced by the anchored harness variant).",
-    "no_xy_root": "Without the trailing statements the enclosing chunk has no X/Y constants; the initial compile closure (the only other referent) is collected by the pre-m1 GCs (probe-verified), X/Y are swept from the intern table, and the undump re-interns them: 376 + re-intern charge = 474 (current binary-measured; reproduced by the variance harness variant)."
+    "no_xy_root": "Without the trailing statements the enclosing chunk has no X/Y constants; the initial compile closure (the only other referent) is collected by the pre-m1 GCs (probe-verified), X/Y are swept from the intern table, and the undump re-interns them: 376 + re-intern charge = 428 (current binary-measured; reproduced by the variance harness variant)."
   },
   "history": {
     "p16_16_pre_cuts": {
@@ -127,10 +128,10 @@
   },
   "evidence": {
     "harness_anchored": {
-      "m1": 76282,
-      "m2": 76658,
+      "m1": 70411,
+      "m2": 70787,
       "delta": 376,
-      "m2_global_crosscheck": 76658,
+      "m2_global_crosscheck": 70787,
       "x_interned_m1": true,
       "y_interned_m1": true,
       "name_interned_m1": false,
@@ -147,16 +148,17 @@
         "Cell": 40,
         "LuaString": 48,
         "LuaString_lstrfix": 32,
+        "LuaString_short_len1": 26,
         "Value": 16,
         "Upvaldesc": 16,
         "Constant": 16
       },
       "code_closure": {
-        "ptr": 140319734367808,
+        "ptr": 140303487731072,
         "tree_is_root": true,
         "upvalues_len": 1,
         "proto": {
-          "ptr": 140319732794624,
+          "ptr": 140303480924416,
           "gc_charged": true,
           "gc_footprint": 264,
           "fixed_arrays": true,
@@ -175,79 +177,79 @@
             {
               "type": "string",
               "len": 1,
-              "kind": 0
+              "srkind": 1
             },
             {
               "type": "string",
               "len": 1000,
-              "kind": 2
+              "srkind": -2
             },
             {
               "type": "string",
               "len": 1,
-              "kind": 0
+              "srkind": 1
             }
           ]
         }
       },
       "new_outstanding": [
         {
-          "ptr": 140319733909760,
-          "len": 40,
-          "ret_addr": 18214591,
-          "label": "Cell",
-          "symbol": "vm.Vm.builtinLoadEx"
-        },
-        {
-          "ptr": 140319734631104,
-          "len": 48,
-          "ret_addr": 18220468,
-          "label": "resolved_values",
-          "symbol": "vm.Vm.loadChunkImpl"
-        },
-        {
-          "ptr": 140319728533512,
-          "len": 8,
-          "ret_addr": 18214591,
-          "label": "Closure.upvalues slice",
-          "symbol": "vm.Vm.builtinLoadEx"
-        },
-        {
-          "ptr": 140319729254480,
+          "ptr": 140303480258688,
           "len": 16,
-          "ret_addr": 18220468,
+          "ret_addr": 18225138,
           "label": "upvalues_desc",
           "symbol": "vm.Vm.loadChunkImpl"
         },
         {
-          "ptr": 140319728730144,
-          "len": 32,
-          "ret_addr": 18238041,
-          "label": "external_LuaString_header",
-          "symbol": "vm.Vm.undumpFixedInternCallback"
+          "ptr": 140303480061968,
+          "len": 8,
+          "ret_addr": 18219298,
+          "label": "Closure.upvalues slice",
+          "symbol": "vm.Vm.builtinLoadEx"
         },
         {
-          "ptr": 140319732794624,
+          "ptr": 140303487731072,
+          "len": 40,
+          "ret_addr": 18219298,
+          "label": "Closure",
+          "symbol": "vm.Vm.builtinLoadEx"
+        },
+        {
+          "ptr": 140303487731008,
+          "len": 48,
+          "ret_addr": 18225138,
+          "label": "resolved_values",
+          "symbol": "vm.Vm.loadChunkImpl"
+        },
+        {
+          "ptr": 140303487731136,
+          "len": 40,
+          "ret_addr": 18219298,
+          "label": "Cell",
+          "symbol": "vm.Vm.builtinLoadEx"
+        },
+        {
+          "ptr": 140303480924416,
           "len": 200,
-          "ret_addr": 18220468,
+          "ret_addr": 18225138,
           "label": "Proto",
           "symbol": "vm.Vm.loadChunkImpl"
         },
         {
-          "ptr": 140319734367808,
-          "len": 40,
-          "ret_addr": 18214591,
-          "label": "Closure",
-          "symbol": "vm.Vm.builtinLoadEx"
+          "ptr": 140303487272224,
+          "len": 32,
+          "ret_addr": 18242713,
+          "label": "external_LuaString_header",
+          "symbol": "vm.Vm.undumpFixedInternCallback"
         }
       ],
       "freed_in_interval": []
     },
     "harness_variance": {
-      "m1": 76080,
-      "m2": 76554,
-      "delta": 474,
-      "m2_global_crosscheck": 76554,
+      "m1": 70255,
+      "m2": 70683,
+      "delta": 428,
+      "m2_global_crosscheck": 70683,
       "x_interned_m1": false,
       "y_interned_m1": false,
       "name_interned_m1": false,
@@ -264,16 +266,17 @@
         "Cell": 40,
         "LuaString": 48,
         "LuaString_lstrfix": 32,
+        "LuaString_short_len1": 26,
         "Value": 16,
         "Upvaldesc": 16,
         "Constant": 16
       },
       "code_closure": {
-        "ptr": 140255951326208,
+        "ptr": 140592754262912,
         "tree_is_root": true,
         "upvalues_len": 1,
         "proto": {
-          "ptr": 140255950473216,
+          "ptr": 140592753026048,
           "gc_charged": true,
           "gc_footprint": 264,
           "fixed_arrays": true,
@@ -292,98 +295,98 @@
             {
               "type": "string",
               "len": 1,
-              "kind": 0
+              "srkind": 1
             },
             {
               "type": "string",
               "len": 1000,
-              "kind": 2
+              "srkind": -2
             },
             {
               "type": "string",
               "len": 1,
-              "kind": 0
+              "srkind": 1
             }
           ]
         }
       },
       "new_outstanding": [
         {
-          "ptr": 140255951457088,
-          "len": 50,
-          "ret_addr": 17476021,
-          "label": "short_string_Y",
-          "symbol": "vm.Vm.internStrAll"
-        },
-        {
-          "ptr": 140255948832832,
-          "len": 32,
-          "ret_addr": 18238073,
-          "label": "external_LuaString_header",
-          "symbol": "vm.Vm.undumpFixedInternCallback"
-        },
-        {
-          "ptr": 140255951457024,
-          "len": 48,
-          "ret_addr": 18220500,
-          "label": "resolved_values",
-          "symbol": "vm.Vm.loadChunkImpl"
-        },
-        {
-          "ptr": 140255951128832,
-          "len": 50,
-          "ret_addr": 17476021,
-          "label": "short_string_X",
-          "symbol": "vm.Vm.internStrAll"
-        },
-        {
-          "ptr": 140255947784232,
+          "ptr": 140592752427040,
           "len": 8,
-          "ret_addr": 18214623,
+          "ret_addr": 18219330,
           "label": "Closure.upvalues slice",
           "symbol": "vm.Vm.builtinLoadEx"
         },
         {
-          "ptr": 140255951129344,
+          "ptr": 140592754262976,
           "len": 40,
-          "ret_addr": 18214623,
+          "ret_addr": 18219330,
           "label": "Cell",
           "symbol": "vm.Vm.builtinLoadEx"
         },
         {
-          "ptr": 140255951326208,
+          "ptr": 140592756425856,
+          "len": 26,
+          "ret_addr": 17478165,
+          "label": "short_string_Y",
+          "symbol": "vm.Vm.internStrAll"
+        },
+        {
+          "ptr": 140592754262912,
           "len": 40,
-          "ret_addr": 18214623,
+          "ret_addr": 18219330,
           "label": "Closure",
           "symbol": "vm.Vm.builtinLoadEx"
         },
         {
-          "ptr": 140255946866752,
+          "ptr": 140592754262848,
+          "len": 48,
+          "ret_addr": 18225170,
+          "label": "resolved_values",
+          "symbol": "vm.Vm.loadChunkImpl"
+        },
+        {
+          "ptr": 140592753026048,
+          "len": 200,
+          "ret_addr": 18225170,
+          "label": "Proto",
+          "symbol": "vm.Vm.loadChunkImpl"
+        },
+        {
+          "ptr": 140592756425792,
+          "len": 26,
+          "ret_addr": 17478165,
+          "label": "short_string_X",
+          "symbol": "vm.Vm.internStrAll"
+        },
+        {
+          "ptr": 140592752492624,
           "len": 16,
-          "ret_addr": 18220500,
+          "ret_addr": 18225170,
           "label": "upvalues_desc",
           "symbol": "vm.Vm.loadChunkImpl"
         },
         {
-          "ptr": 140255950473216,
-          "len": 200,
-          "ret_addr": 18220500,
-          "label": "Proto",
-          "symbol": "vm.Vm.loadChunkImpl"
+          "ptr": 140592756425824,
+          "len": 32,
+          "ret_addr": 18242745,
+          "label": "external_LuaString_header",
+          "symbol": "vm.Vm.undumpFixedInternCallback"
         }
       ],
       "freed_in_interval": []
     },
     "driver_anchored": {
       "delta": 376,
-      "m1": 74250,
-      "m2": 74626,
+      "m1": 68295,
+      "m2": 68671,
       "under400": "true"
     },
     "driver_no_xy_root": {
-      "delta": 474,
-      "m1": 74084,
-      "m2": 74558,
+      "delta": 428,
+      "m1": 68175,
+      "m2": 68603,
       "under400": "false"
     },
     "xy_root_probe_puc": {
@@ -401,45 +404,45 @@
     "ReleaseFast": {
       "driver_anchored": {
         "delta": 376,
-        "m1": 74250,
-        "m2": 74626,
+        "m1": 68295,
+        "m2": 68671,
         "under400": "true"
       },
       "driver_no_xy_root": {
-        "delta": 474,
-        "m1": 74084,
-        "m2": 74558,
+        "delta": 428,
+        "m1": 68175,
+        "m2": 68603,
         "under400": "false"
       },
       "provenance": {
-        "git_head": "281ba6f",
-        "measured_source_head": "281ba6f",
-        "git_dirty": "clean",
+        "git_head": "4bb378b",
+        "measured_source_head": "4bb378b",
+        "git_dirty": "dirty",
         "zig_version": "0.16.0",
         "optimize_mode": "ReleaseFast",
-        "zig_binary_sha16": "8493130e4dcf5627"
+        "zig_binary_sha16": "e24cc3fb776ee14d"
       }
     },
     "Debug": {
       "driver_anchored": {
         "delta": 376,
-        "m1": 74506,
-        "m2": 74882,
+        "m1": 68551,
+        "m2": 68927,
         "under400": "true"
       },
       "driver_no_xy_root": {
-        "delta": 474,
-        "m1": 74340,
-        "m2": 74814,
+        "delta": 428,
+        "m1": 68431,
+        "m2": 68859,
         "under400": "false"
       },
       "provenance": {
-        "git_head": "281ba6f",
-        "measured_source_head": "281ba6f",
-        "git_dirty": "clean",
+        "git_head": "4bb378b",
+        "measured_source_head": "4bb378b",
+        "git_dirty": "dirty",
         "zig_version": "0.16.0",
         "optimize_mode": "Debug",
-        "zig_binary_sha16": "7c36dc6ac65d2bc9"
+        "zig_binary_sha16": "0813b0ba8e8af441"
       }
     }
   }

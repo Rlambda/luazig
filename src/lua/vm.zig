@@ -1415,8 +1415,6 @@ const LuaFrameState = extern struct {
     pc: usize = 0,
     /// Register window upper bound (PUC `ci->top - ci->func`).
     frame_cap: u32 = 0,
-    /// Fixed params count (PUC `ci->func + 1 .. ci->base`).
-    nvarstack: u32 = 0,
     /// PUC `u.l.nextraargs`: extra vararg arguments.
     nextraargs: u16 = 0,
     /// Packed Lua-frame flags: bit0 has_open_upvalues, bit1
@@ -12084,7 +12082,6 @@ pub const Vm = struct {
         // P15.51k: callee is at bc_stack[func_slot] (PUC's ci->func).
         // No duplicated callee field — derived on demand.
         ef_slot.u.lua.pc = 0;
-        ef_slot.u.lua.nvarstack = @intCast(nparams);
 
         // Bytecode-specific fields
         ef_slot.activation_id = activation_owner.bytecode_activation_counter;
@@ -15920,9 +15917,8 @@ pub const Vm = struct {
                 ctx.regs[a + 1] = .{ .Int = step_i };
                 ctx.regs[a + 2] = .{ .Int = init_i };
                 ctx.regs[a + 3] = .{ .Int = init_i }; // loop variable
-                // P15.51l: nvarstack/reg_top are rare fields, write to CallFrame.
+                // P15.51l: reg_top is a rare field, write to CallFrame.
                 const fr_fp = ctx.exec_frames.getPtr(ctx.frame_index);
-                fr_fp.u.lua.nvarstack = a + 4;
                 fr_fp.reg_top = @max(fr_fp.reg_top, @as(u32, a) + 4);
                 return .continue_dispatch;
             }
@@ -15973,9 +15969,8 @@ pub const Vm = struct {
         ctx.regs[a + 1] = .{ .Num = step_f };
         ctx.regs[a + 2] = .{ .Num = init_f };
         ctx.regs[a + 3] = .{ .Num = init_f }; // loop variable
-        // P15.51l: nvarstack/reg_top are rare fields, write to CallFrame.
+        // P15.51l: reg_top is a rare field, write to CallFrame.
         const fr_fp2 = ctx.exec_frames.getPtr(ctx.frame_index);
-        fr_fp2.u.lua.nvarstack = a + 4;
         fr_fp2.reg_top = @max(fr_fp2.reg_top, @as(u32, a) + 4);
         return .continue_dispatch;
     }
@@ -16338,9 +16333,8 @@ pub const Vm = struct {
                 fr2.u.lua.nextraargs = new_nextra_u16;
 
                 // 8. Reset dispatch state. pc=0; skip dispatcher's pc+=1.
-                // P15.51l: nvarstack/reg_top are rare fields, write to CallFrame.
+                // P15.51l: reg_top is a rare field, write to CallFrame.
                 ctx.pc = 0;
-                fr2.u.lua.nvarstack = np;
                 fr2.reg_top = np;
 
                 // PUC luaG_tracecall (ldebug.c:918): the TAILCALL hook fires
@@ -26800,7 +26794,7 @@ pub const Vm = struct {
         const live_top: usize = if (fr.u.lua.pc < proto.live_reg_top.len)
             @min(proto.live_reg_top[fr.u.lua.pc], fr_regs.len)
         else if (proto.live_reg_top.len > 0)
-            fr.u.lua.nvarstack
+            @min(fr.reg_top, fr_regs.len) // P16.21 T5: legacy-proto fallback
         else
             fr_regs.len;
         var reg: usize = 0;
@@ -26889,7 +26883,7 @@ pub const Vm = struct {
         const live_top: usize = if (fr.u.lua.pc < proto.live_reg_top.len)
             @min(proto.live_reg_top[fr.u.lua.pc], fr_regs.len)
         else if (proto.live_reg_top.len > 0)
-            fr.u.lua.nvarstack
+            @min(fr.reg_top, fr_regs.len) // P16.21 T5: legacy-proto fallback
         else
             fr_regs.len;
         var reg: usize = 0;

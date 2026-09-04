@@ -513,7 +513,7 @@ pub const UndumpReader = struct {
             // deinit (destroyProtoTree) skips freeing them and the GC
             // footprint (protoTreeFootprint) excludes them. PUC sets this
             // via `f->flag |= PF_FIXED` in lundump.c:332-333.
-            .fixed_arrays = self.fixed,
+            .flags = .{ .fixed_arrays = self.fixed },
         };
         return proto;
     }
@@ -543,7 +543,7 @@ pub const UndumpReader = struct {
         // were interned into the VM during undumpConstant (or are
         // `undefined` in no-callback tests) — never tree-owned.
         root.ref_count = 1; // producing reference
-        root.k_strings_vm_owned = true; // constants interned at undump time
+        root.flags.k_strings_vm_owned = true; // constants interned at undump time
         bc.bindTreeRecursive(root, root); // root.tree = self, children → root
         return root;
     }

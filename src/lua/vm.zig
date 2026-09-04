@@ -5054,6 +5054,22 @@ pub const Vm = struct {
     ///
     /// Call this BEFORE writing variable-length results to regs (CALL multret,
     /// VARARG expansion, etc.).  Replaces the old fixed EXTRA_STACK margin.
+    /// P16.21 T6: dispatch-path frame growth — bcGrowFrame + immediate
+    /// publication of the new frame_cap to the CURRENT CallFrame. Parked
+    /// frames' caps are read by GC register scans and debug walkers; with
+    /// mutation-site publishing, the generic frame-exit syncFrame no longer
+    /// needs to carry frame_cap (it becomes pc-only, like PUC's savedpc).
+    /// Publication happens only after successful growth (error paths leave
+    /// both the ctx cap and the frame copy unchanged — rollback consistency).
+    fn growCtxFrame(
+        self: *Vm,
+        ctx: *BytecodeDispatchCtx,
+        needed_local: usize,
+    ) DispatchError!void {
+        try self.bcGrowFrame(ctx.base, needed_local, &ctx.frame_cap, &ctx.regs);
+        ctx.exec_frames.getPtr(ctx.frame_index).u.lua.frame_cap = ctx.frame_cap;
+    }
+
     fn bcGrowFrame(
         self: *Vm,
         base: usize,
@@ -12833,20 +12849,14 @@ pub const Vm = struct {
         {
             const fr = ctx.exec_frames.getPtr(ctx.frame_index);
             fr.u.lua.pc = ctx.pc;
-            // P16.19 T9.1: base write removed — provably dead. ctx.base has
-            // exactly two mutation sites: the frame_loop entry (loaded FROM
-            // fr.frameBase(), so a write-back is identity) and OP_TAILCALL frame
-            // reuse (which writes fr2.frameBase() = ctx.base directly at the same
-            // moment it sets ctx.base — see the tailcall handler). No other
-            // dispatch path mutates ctx.base.
-            fr.u.lua.frame_cap = ctx.frame_cap;
-            // frame_cap STAYS: mutated mid-opcode by bcGrowFrame callers
-            // (&ctx.frame_cap) without publishing to the frame, and parked
-            // frames' frame_cap is read by GC register scans (gcMark boxes,
-            // parent scans) — syncFrame is the boundary publisher that keeps
-            // parked state correct. P16.2d: proto write removed — provably
-            // dead (identity at entry; tailcall writes fr directly).
-            // P15.51n: upvalues derived from bc_stack[func_slot].
+            // P16.21 T6: syncFrame is now PC-ONLY (PUC persists savedpc
+            // at boundaries). frame_cap is published at its mutation sites:
+            // growCtxFrame (every dispatch growth, immediately after
+            // success) plus the tailcall/call-staging paths that already
+            // wrote it explicitly. Parked-frame GC/debug readers therefore
+            // always see the live cap. Base write removed P16.19 T9.1
+            // (provably identity); proto/upvalues never generic sync
+            // writes (P16.2d / P15.51n).
         }
     }
 
@@ -15529,7 +15539,7 @@ pub const Vm = struct {
         const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
         if (nresults >= 0) {
             const nr: usize = @intCast(nresults);
-            try self.bcGrowFrame(ctx.base, a + nr, &ctx.frame_cap, &ctx.regs);
+            try self.growCtxFrame(ctx, a + nr);
             const ncopy2 = @min(nr, source_len);
             for (0..ncopy2) |i| {
                 ctx.regs[a + i] = if (named_varargs) |src|
@@ -15541,7 +15551,7 @@ pub const Vm = struct {
             fr_va.reg_top = @max(fr_va.reg_top, @as(u32, @intCast(a + nr)));
         } else {
             // All varargs — grow frame, then copy.
-            try self.bcGrowFrame(ctx.base, a + source_len, &ctx.frame_cap, &ctx.regs);
+            try self.growCtxFrame(ctx, a + source_len);
             for (0..source_len) |i| {
                 ctx.regs[a + i] = if (named_varargs) |src|
                     try self.tableGetRawValue(src.table, .{ .Int = @intCast(i + 1) })
@@ -16247,7 +16257,7 @@ pub const Vm = struct {
                 // 2. Grow frame if needed.
                 const new_max = new_proto.maxstacksize;
                 const new_cap: usize = new_max;
-                try self.bcGrowFrame(ctx.base, new_cap, &ctx.frame_cap, &ctx.regs);
+                try self.growCtxFrame(ctx, new_cap);
 
                 // 3. PUC-faithful tail-call: reuse frame, re-setup varargs.
                 //    Step 1: copy func+args from R[A..] down to func_slot_base
@@ -16298,7 +16308,7 @@ pub const Vm = struct {
                 }
 
                 // Grow frame to new proto's register needs.
-                try self.bcGrowFrame(new_base, new_cap, &ctx.frame_cap, &ctx.regs);
+                try self.bcGrowFrame(new_base, new_cap, &ctx.frame_cap, &ctx.regs); // published below after base switch
                 ctx.base = new_base;
                 // P15.51l: func_slot is a rare field, written to CallFrame below.
                 self.bc_stack_top = new_base + ctx.frame_cap;
@@ -16568,7 +16578,7 @@ pub const Vm = struct {
             try self.dispatchBytecodeHookWithCallee("return", ctx.regs[a], vals);
             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
             const nstore: usize = if (nresults >= 0) @intCast(nresults) else vals.len;
-            try self.bcGrowFrame(ctx.base, a + nstore, &ctx.frame_cap, &ctx.regs);
+            try self.growCtxFrame(ctx, a + nstore);
             for (0..nstore) |i| ctx.regs[a + i] = if (i < vals.len) vals[i] else .Nil;
             // PUC Lua sets L->top = ci->top (maxstacksize) after calls.
             // We track reg_top as the runtime stack top. For multi-return
@@ -16781,7 +16791,7 @@ pub const Vm = struct {
                             try self.dispatchBytecodeHookWithCallee("return", callee_val, values);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             const nstore: usize = if (nresults >= 0) @intCast(nresults) else values.len;
-                            try self.bcGrowFrame(ctx.base, a + nstore, &ctx.frame_cap, &ctx.regs);
+                            try self.growCtxFrame(ctx, a + nstore);
                             for (0..nstore) |i| ctx.regs[a + i] = if (i < values.len) values[i] else .Nil;
                             if (nresults < 0) ctx.exec_frames.getPtr(ctx.frame_index).reg_top = @intCast(@as(usize, a) + values.len);
                             self.alloc.free(values);
@@ -16807,7 +16817,7 @@ pub const Vm = struct {
                 else
                     self.builtinOutLen(id, rargs);
                 const outs_start = a + 1 + effective_nargs;
-                try self.bcGrowFrame(ctx.base, outs_start + out_len, &ctx.frame_cap, &ctx.regs);
+                try self.growCtxFrame(ctx, outs_start + out_len);
                 // Re-derive rargs after bcGrowFrame: it may have reallocated
                 // bc_stack, invalidating the old rargs slice (use-after-free).
                 var rargs_fresh = ctx.regs[a + 1 .. a + 1 + effective_nargs];
@@ -17003,7 +17013,7 @@ pub const Vm = struct {
                 }
                 try self.dispatchBytecodeHookWithCallee("return", callee_val, ret);
                 const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
-                try self.bcGrowFrame(ctx.base, a + nstore, &ctx.frame_cap, &ctx.regs);
+                try self.growCtxFrame(ctx, a + nstore);
                 for (0..nstore) |i| {
                     ctx.regs[a + i] = if (i < ret.len) ret[i] else .Nil;
                 }

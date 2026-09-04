@@ -2734,6 +2734,32 @@ test "external string: regular string does NOT invoke falloc" {
     try std.testing.expect(!freed);
 }
 
+// P16.18 T2: ordinary-string GC accounting must equal the ACTUALLY-OWNED
+// allocation, NUL included (PUC sizestrshr / luaS_sizelngstr(LSTRREG) both
+// charge len+1). Charged bytes are observed at three symmetric sites —
+// gcNoteAlloc at intern, gcObjectBytes while live, gcNoteFree at sweep —
+// and must all equal @sizeOf(LuaString)+len+1 (until the per-kind layout
+// lands; then this test moves to luaStringAllocatedBytes).
+test "string GC accounting charges NUL, symmetric with allocation" {
+    const testing = std.testing;
+    var vm = Vm.init(testing.allocator, false);
+    defer vm.deinit();
+    const cases = [_][]const u8{ "", "a", "x" ** 40, "y" ** 41, "z" ** 300 };
+    for (cases) |raw| {
+        const before = vm.gc_count_kb;
+        const ls = try vm.internStr(raw);
+        const charged_now =
+            (vm.gc_count_kb - before) * 1024.0;
+        const expected: f64 =
+            @floatFromInt(@sizeOf(LuaString) + raw.len + 1);
+        try testing.expectEqual(expected, charged_now);
+        try testing.expectEqual(
+            @sizeOf(LuaString) + raw.len + 1,
+            gcObjectBytes(.{ .string = ls }),
+        );
+    }
+}
+
 test "external string: createExternalLuaString content readable via bytes()" {
     const testing = std.testing;
     var vm = Vm.init(testing.allocator, false);
@@ -2877,7 +2903,7 @@ fn gcObjectBytes(obj: GcObject) usize {
             // LSTRMEM full header, regular short/long header + inline content.
             .ext_fixed => LuaString.lstrfix_header_size,
             .ext_mem => @sizeOf(LuaString),
-            .short, .long => @sizeOf(LuaString) + s.len,
+            .short, .long => @sizeOf(LuaString) + s.len + 1,
         },
         .cell => @sizeOf(Cell),
         .userdata => |u| @sizeOf(Userdata) + u.uservalues.len * @sizeOf(Value) + u.payload.len,
@@ -16754,15 +16780,16 @@ pub const Vm = struct {
             // incremental sweep handles short string collection. This is the
             // PUC-faithful approach: PUC keeps all short strings in allgc.
             try self.gcRegisterString(ls);
-            self.gcNoteAlloc(@sizeOf(LuaString) + raw.len);
-            self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 24);
+            // PUC sizestrshr/luaS_sizelngstr(LSTRREG) include the NUL.
+            self.gcNoteAlloc(@sizeOf(LuaString) + raw.len + 1);
+            self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 1 + 24);
             self.testc_obj_strings += 1;
             return ls;
         }
         const ls = try createLuaString(self.alloc, raw, hash);
         try self.gcRegisterString(ls);
-        self.gcNoteAlloc(@sizeOf(LuaString) + raw.len);
-        self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 24);
+        self.gcNoteAlloc(@sizeOf(LuaString) + raw.len + 1);
+        self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 1 + 24);
         self.testc_obj_strings += 1;
         return ls;
     }
@@ -22749,7 +22776,8 @@ pub const Vm = struct {
                 const bytes = switch (s.kind) {
                     .ext_fixed => LuaString.lstrfix_header_size,
                     .ext_mem => @sizeOf(LuaString),
-                    .short, .long => @sizeOf(LuaString) + s.len,
+                    // +1: the terminating NUL is part of the allocation.
+                    .short, .long => @sizeOf(LuaString) + s.len + 1,
                 };
                 self.gcNoteFree(bytes);
                 destroyLuaString(self.alloc, s);

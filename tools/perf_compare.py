@@ -308,7 +308,8 @@ def collect_profile_index(core: str, out_dir: Path) -> dict:
         "core": core,
         # Provenance: zig-only lane — only luazig is profiled here, so no
         # puc_binary_sha16 (see tools/provenance.py block()).
-        "provenance": provenance.block(zig_bin=ZIG_LUA),
+        "provenance": provenance.block(zig_bin=ZIG_LUA,
+                                         optimize_mode="ReleaseFast"),
         "workloads": results,
     }
     out_path = out_dir / "current-profile-index.json"
@@ -532,7 +533,8 @@ def run_snapshot_mode(args) -> int:
     zig_version = provenance.zig_version()
     # Both binaries are measured in the timing and counters lanes, so both
     # hashes apply; the profile index (zig-only) computes its own block.
-    prov = provenance.block(zig_bin=ZIG_LUA, puc_bin=PUC_LUA)
+    prov = provenance.block(zig_bin=ZIG_LUA, puc_bin=PUC_LUA,
+                            optimize_mode="ReleaseFast")
 
     # --- 1. Timing: median-of-N → current.json ---
     print(f"\n>> snapshot: timing {args.runs} runs each, pinned to core {args.core}")

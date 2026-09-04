@@ -1,22 +1,24 @@
 {
-  "created_utc": "2026-09-03T16:45:18.911911+00:00",
+  "created_utc": "2026-09-04T13:21:09.830567+00:00",
   "provenance": {
-    "git_head": "28a20dd",
+    "git_head": "133213e",
+    "measured_source_head": "133213e",
     "git_dirty": "clean",
     "zig_version": "0.16.0",
-    "zig_binary_sha16": "a34ed59f91e3a4b6"
+    "optimize_mode": "ReleaseFast",
+    "zig_binary_sha16": "572adf174a0f1993"
   },
   "zig_sizes": {
-    "Proto": 248,
-    "Closure": 88,
-    "Cell": 64,
-    "LuaString": 72,
+    "Proto": 200,
+    "Closure": 40,
+    "Cell": 40,
+    "LuaString": 48,
     "Value": 16,
     "Constant": 16,
     "Instruction": 4,
-    "Upvaldesc": 24,
+    "Upvaldesc": 16,
     "LocVar": 32,
-    "SourceBacking": 32,
+    "SourceBacking": 16,
     "SourceBackingExtra": 72
   },
   "puc_sizes": {
@@ -32,19 +34,19 @@
     "AbsLineInfo": 8
   },
   "zig_components": {
-    "Proto_struct": 248,
+    "Proto_struct": 200,
     "k_array": 0,
-    "upvalues_array": 24,
+    "upvalues_array": 16,
     "resolved_values": 48,
     "SourceBacking_struct": 0,
     "pinned_list_storage": 0,
-    "Closure_GC": 88,
-    "Cell_GC": 64,
+    "Closure_GC": 40,
+    "Cell_GC": 40,
     "code_borrowed": 0,
     "lineinfo_borrowed": 0,
-    "tree_total": 320,
-    "gc_objects": 152,
-    "honest_total": 472
+    "tree_total": 264,
+    "gc_objects": 80,
+    "honest_total": 344
   },
   "puc_components": {
     "Proto_struct": 128,
@@ -57,12 +59,12 @@
     "honest_total": 272
   },
   "actual_delta": {
-    "delta": 544,
-    "m1": 84095,
-    "m2": 84639
+    "delta": 376,
+    "m1": 74199,
+    "m2": 74575
   },
-  "verdict": "DEVIATION",
+  "verdict": "GREEN",
   "gate_threshold": 400,
-  "deviation_bytes": 72,
-  "deviation_explanation": "Honest charge exceeds PUC's 400-byte gate due to structural overhead: SourceBacking (32B inline in Proto, PUC has none), resolved_values (48B, PUC's k IS runtime format), larger GC structs (Proto +56B including owner fields, Closure +48, Cell +24, Upvaldesc +8). CUT1 eliminated the duplicate k array for undumped trees (aliased to resolved_values, -48B). CUT2 eliminated ProtoTreeOwner (144B) by merging owner fields into root Proto and compacting SourceBacking (88B\u219232B inline). Getting under 400 requires eliminating resolved_values \u2014 larger structural change (Proto-as-GC-object / lazy resolved_values at first frame push). Per verifier allowance, honest accounting is kept and the deviation is documented."
+  "deviation_bytes": 0,
+  "deviation_explanation": "Honest charge is under PUC's 400-byte gate."
 }

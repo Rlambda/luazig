@@ -10106,7 +10106,6 @@ pub const Vm = struct {
     ///
     /// protected_call_depth is a DIFFERENT quantity — recovery/error
     /// ownership nesting, never a substitute for getCcalls.
-
     /// P16.24 T4: THE single PUC resume-entry semantic (lstate.c lua_resume
     /// + ldo.c resume): the resumed thread inherits the SOURCE thread's
     /// lower C depth (getCcalls(from) — upper nny bits are NOT copied),

@@ -7205,7 +7205,7 @@ pub const Vm = struct {
         return t;
     }
 
-    /// Sync the top RuntimeFrame's pc/top/nvarstack from the dispatch loop's
+    /// Sync the top frame's pc from the dispatch loop's
     /// local state before GC runs. The fast dispatch path (P15.33) defers
     /// per-instruction RuntimeFrame sync to safepoints. Any code path that
     /// triggers GC from within the dispatch loop (allocTable, callBuiltin,
@@ -8318,27 +8318,6 @@ pub const Vm = struct {
     const SimpleResultPayload = struct {
         event: TmsEvent,
         completion: SimpleResultCompletion,
-    };
-
-    const ResolvedClosureCompletion = union(enum) {
-        /// Pending-call continuation (CONCAT, pairs, hooks, etc.).
-        /// Installs `pending_call` state + explicit debug name override.
-        /// The debug name is recorded AFTER the child frame is pushed and
-        /// BEFORE the CALL hook fires (PUC: hook-time getinfo('n') resolves
-        /// the metamethod name from the caller's instruction).
-        pending: struct {
-            completion: BytecodePendingCompletion,
-            debug_namewhat: ?[]const u8,
-            debug_name: ?[]const u8,
-        },
-        /// Inline simple-result completion (arithmetic/comparison metamethods).
-        /// Installs `simple_result` state; debug name derived from `event`
-        /// at read time via `getDebugName()` — no explicit name stored.
-        /// Only valid for Lua (bytecode) parent frames.
-        simple_result: struct {
-            event: TmsEvent,
-            completion: SimpleResultCompletion,
-        },
     };
 
     /// Outcome of `tryPushSimpleResultMetamethod`: either a continuation frame
@@ -12836,8 +12815,10 @@ pub const Vm = struct {
         yielded_in_place: *bool,
 
         // Hot frame state — cached from the heap CallFrame for register
-        // performance. These 7 fields account for ~90% of ctx accesses.
-        // Synced back to CallFrame by syncFrame at frame_loop boundaries.
+        // performance. Only state touched EVERY iteration lives here;
+        // rare frame metadata stays on the CallFrame and is loaded at use
+        // sites. (ctx.boxed was removed in P16.19 T3; syncFrame publishes
+        // pc only since P16.21 T6.)
         cur_proto: *const bc.Proto,
         cur_upvalues: []const *Cell,
         base: usize,
@@ -12923,7 +12904,7 @@ pub const Vm = struct {
             .frame_index = 0, // set per-iteration below
             .boundary_depth = boundary_depth,
             .yielded_in_place = yielded_in_place,
-            // 7 hot fields — initialized from CallFrame at top of frame_loop
+            // hot fields — initialized from CallFrame at top of frame_loop
             .cur_proto = undefined,
             .cur_upvalues = &.{},
             .base = 0,
@@ -12983,7 +12964,7 @@ pub const Vm = struct {
             }
             const frame_identity = exec_frames.getPtr(ctx.frame_index).activation_id;
 
-            // P15.51l: Inline initialization of the 7 hot fields from the
+            // P15.51l: Inline initialization of the hot fields from the
             // heap CallFrame. Replaces the old loadDispatchCtx which copied
             // ~20 fields (including 11 rare ones that are now accessed
             // directly on the CallFrame). Only the hot fields that are
@@ -15846,7 +15827,7 @@ pub const Vm = struct {
                     };
                     self.builtin_cframe_pre_pushed = true;
                 }
-                // P15.51l: reg_top/nvarstack are already on the CallFrame.
+                // P15.51l: reg_top lives directly on the CallFrame.
                 // pushBuiltinCFrame may have reallocated bc_stack — re-derive
                 // the args slice for callBuiltin.
                 const rargs_builtin_fresh = if (iter_cframe_pushed)
@@ -16487,7 +16468,7 @@ pub const Vm = struct {
                     self.builtin_cframe_pre_pushed = true;
                     call_args = self.bc_stack[ctx.base + a + 1 .. ctx.base + a + 1 + effective_nargs];
                 }
-                // P15.51l: reg_top/nvarstack are already on the CallFrame.
+                // P15.51l: reg_top lives directly on the CallFrame.
                 // P16.5b: Use direct call for coroutine fast path.
                 if (co_fast_path) {
                     self.callCoroutineBuiltinDirect(id, call_args, outs) catch |call_err| switch (call_err) {
@@ -16894,7 +16875,7 @@ pub const Vm = struct {
                 // syncing frame_cap, shrinkBcStack sees the OLD (smaller)
                 // frame_cap, computes a too-small inuse, and shrinks bc_stack
                 // below ctx.base + ctx.frame_cap → OOB panic on return.
-                // P15.51l: reg_top/nvarstack are already on the CallFrame.
+                // P15.51l: reg_top lives directly on the CallFrame.
                 const fr_pre_call = ctx.exec_frames.getPtr(ctx.frame_index);
                 fr_pre_call.u.lua.pc = ctx.pc;
                 if (!fr_pre_call.isC()) fr_pre_call.u.lua.frame_cap = ctx.frame_cap;

@@ -1,0 +1,27 @@
+{
+  "created_utc": "2026-09-05T13:12:55.963153+00:00",
+  "provenance": {
+    "git_head": "ea3ed46",
+    "measured_source_head": "ea3ed46",
+    "git_dirty": "dirty",
+    "zig_version": "0.16.0",
+    "optimize_mode": "ReleaseFast",
+    "zig_binary_sha16": "b4626dbb6da469e4"
+  },
+  "entry_facts_verified": {
+    "geomean_p16_22": 1.76363,
+    "lua_calls_i_it": 675.1,
+    "noalloc_i_it": 847.8,
+    "CallFrame": "88/88",
+    "LuaFrameState": 48,
+    "smoke": "69/69",
+    "api580": "376/376",
+    "strict_matrix": "zig_fail=0, 13 classified output_diff"
+  },
+  "t0_findings": [
+    "ResolvedClosureCompletion dead union removed (19 lines, 0 usages)",
+    "stale nvarstack/7-fields comments replaced with durable architecture statements",
+    "layout artifact re-measured at current HEAD (88/88, u@32, floor 56)",
+    "strict --diff matrix + api_regression_lane + hookstress re-verified green/expected"
+  ]
+}

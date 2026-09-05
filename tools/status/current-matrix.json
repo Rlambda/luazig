@@ -1,23 +1,23 @@
 {
   "meta": {
-    "created_utc": "2026-09-05T11:31:05.520387+00:00",
+    "created_utc": "2026-09-05T13:12:19.314955+00:00",
     "lane": "testes_matrix",
     "argv": [
       "tools/testes_matrix.py",
       "--testc",
       "--diff",
       "--json-out",
-      "/tmp/opencode/matrix22c.json"
+      "/tmp/opencode/matrix23c.json"
     ],
     "zig_version": "0.16.0"
   },
   "provenance": {
-    "git_head": "9de0c55",
-    "measured_source_head": "9de0c55",
+    "git_head": "ea3ed46",
+    "measured_source_head": "ea3ed46",
     "git_dirty": "clean",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "439412a893c0f1f2",
+    "zig_binary_sha16": "b4626dbb6da469e4",
     "puc_binary_sha16": "d54bc45e1757b216"
   },
   "summary": {
@@ -342,5 +342,6 @@
       "locals+cstack: GC-pacing window alignment phase"
     ],
     "note": "Previously current-matrix.json ran WITHOUT --diff (output_diff=0 meant \"not run\"). From P16.22 the strict lane is canonical."
-  }
+  },
+  "p16_23_cstack_update": "gsub C-recursion counts now 200/199/200 (was 99977) \u2014 T6 nCcalls model; remaining: metatable-__index unit, coroutine deep-calls 4/30 (pre-existing), pure stack-depth"
 }

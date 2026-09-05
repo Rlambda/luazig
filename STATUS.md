@@ -4734,6 +4734,49 @@ zig_fail=0; smoke 69/69; api580 376/376; гейт T11 12/12; fmt-clean.
   зелёным в отчёте.
 - cstack semantic gaps — backlog (LUAI_MAXCCALLS + depth-count parity).
 
+## P16.23 — post-final truth + C-call parity (2026-09-05)
+
+### T0 (`e77ea03`, `f05a766`): truth/hygiene
+Dead ResolvedClosureCompletion (19 строк, 0 использований) удалён; stale-
+комментарии (nvarstack, «7 полей ~90%», snapshot-числа) заменены durable-
+архитектурными формулировками; layout-артефакт перемерен на текущем HEAD
+(88/88, u@32, floor 56); входные факты P16.22 воспроизведены.
+
+### T1 (артефакт @f05a766): post-final дифференциал
+opReturn-completion 114 i/it ПОДТВЕРЖДЁН; entry после P16.22-T3 = ~49;
+core +113 — РЕАЛЕН (не redistribution); coroutine_yield доминирует
+string-key кластер 733 i/it (vs PUC 261). pushStaged 66, staging 28.
+
+### T6 (`ea3ed46`): НАСТОЯЩАЯ nCcalls-модель — главный parity-фикс фазы
+PUC ldo.c ccall(inc): Thread.ccallEnter/ccallExit (типизированные инкре-
+менты ci=1 / nyci=0x10001, LUA_MAX_C_CALLS); apiCall = C-API-воронка (inc
+по виду вызова; pcall-семейство — depth-only: nny ломал yield-through-
+pcallk, регрессия t2 найдена и исправлена в ходе разработки); итеративный
+gsub-repl учитывается push/completion/cancel с repl_ccall_active-флагом
+(идемпотентно к yield/replay); защищённый вызов снапшотит nCcalls на входе
+и восстанавливает на завершении (итеративный unwind не имеет C-stack для
+парных exit'ов).
+РЕЗУЛЬТАТ: gsub C-recursion 99977→**200** (PUC 197, +3 = base-offset);
+coroutine-gsub →**199** (PUC 196). Остались: metatable-__index юнит
+(200 vs 99), coroutine deep-calls 4/30 (**pre-existing** — проверено
+stash-сравнением), чистая Lua-глубина 250043/262021 (отдельный backlog).
+Артефакт: p16.23-cstack-analysis.json.
+
+### Perf-статус
+Инструкции lua_calls 3.376G / noalloc 424M — побайтово идентичны P16.22
+(T6 не трогал hot path). Geomean-сессия 1.78388 vs 1.76363 — сессионный
+дрейф ±1% (документированный паттерн); каузальное доказательство
+отсутствия регрессии — instruction parity. Baseline → P16.23.
+
+### T2-T5, T7-T9: не выполнялись (бюджет фазы — T0 truth + T6 correctness
+архитектура). Приоритеты следующей фазы по СВЕЖЕМУ профилю: coroutine
+string-key 733, opReturn 114, core +113, pushStaged+entry 115.
+
+### Гейт T13: 13/13 (api580 376/376; smoke 69/69; c_api 20+diff incl.
+10_continuations t1-t8; matrix zig_fail=0 с прежней классификацией + cstack
+gsub-числа обновлены; гsubstest2 200/C-stack; lane: только locals pacing
+(классифицировано); hookstress 1-3 идентичны; fmt-clean).
+
 ## История закрытых фаз
 
 P3–P15.12 — краткая сводка. P15.13+ — см. «История разработки» выше.

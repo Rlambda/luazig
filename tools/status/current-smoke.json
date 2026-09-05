@@ -1,21 +1,21 @@
 {
   "meta": {
-    "created_utc": "2026-09-05T11:31:06.703636+00:00",
+    "created_utc": "2026-09-05T13:12:20.474820+00:00",
     "lane": "smoke_compare",
     "argv": [
       "tools/smoke_compare.py",
       "--json-out",
-      "/tmp/opencode/smoke22c.json"
+      "/tmp/opencode/smoke23c.json"
     ],
     "zig_version": "0.16.0"
   },
   "provenance": {
-    "git_head": "9de0c55",
-    "measured_source_head": "9de0c55",
+    "git_head": "ea3ed46",
+    "measured_source_head": "ea3ed46",
     "git_dirty": "clean",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "439412a893c0f1f2",
+    "zig_binary_sha16": "b4626dbb6da469e4",
     "puc_binary_sha16": "d54bc45e1757b216"
   },
   "total": 69,

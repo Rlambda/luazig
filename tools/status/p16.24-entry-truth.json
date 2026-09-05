@@ -1,0 +1,45 @@
+{
+  "created_utc": "2026-09-05T16:58:32.964283+00:00",
+  "provenance": {
+    "git_head": "bfe367a",
+    "measured_source_head": "bfe367a",
+    "git_dirty": "dirty",
+    "zig_version": "0.16.0",
+    "optimize_mode": "ReleaseFast",
+    "zig_binary_sha16": "b4626dbb6da469e4",
+    "input_commit": "bfe367a"
+  },
+  "blocking_reproduction": {
+    "suite": "tests/c_api/20_ccall_depth.c (new, T1)",
+    "case_A_main_recursive_lua_call": {
+      "PUC": 198,
+      "zig_P16_23": 198,
+      "status": "OK"
+    },
+    "case_B_coroutine_recursive_lua_call": {
+      "PUC": 197,
+      "zig_P16_23": 100,
+      "status": "BLOCKER \u2014 factor-of-two: luaCallKShared AND apiCall both ccallEnter the same boundary"
+    },
+    "case_D_repeat": {
+      "PUC": 197,
+      "zig": 197,
+      "status": "no leak"
+    },
+    "case_E_callk": {
+      "PUC": 198,
+      "zig": 198,
+      "status": "OK"
+    },
+    "puc_raw_resume_note": "raw lua_resume from a C host with C-recursion overflow SIGSEGVs inside vendored PUC 5.5 lua_resume (gdb-confirmed, development snapshot); the suite uses the upstream cstack.lua Lua-driven resume shape instead.",
+    "zig_B_error_message_cosmetic": "zig prefixes the chunk name twice vs PUC once (secondary diff to align)"
+  },
+  "cstack_sections_current": {
+    "gsub": "197/200",
+    "co_gsub": "196/199",
+    "metatable_gsub": "99/200",
+    "co_deep": "196/4 pre-existing",
+    "resume_nesting": "195/30 pre-existing",
+    "lua_depth": "250043/262021"
+  }
+}

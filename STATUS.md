@@ -1,4 +1,4 @@
-> Last updated: 2026-09-04 (P16.16 — api.lua:580 CLOSED (392B honest, zig_fail=0); representation parity: Closure 40=PUC, Cell 40=PUC, LuaString 48=PUC, Upvaldesc 16=PUC, Proto 200; staged ABI preserved)
+> Last updated: 2026-09-05 (P16.24 — unified single-owner C-call depth model + coroutine C-stack parity (caps removed, exact depths) + fresh post-fix differential)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -31,14 +31,14 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 <!-- BEGIN GENERATED SUMMARY (tools/status_summary.py) -->
 | Metric | Result |
 |--------|--------|
-| Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
+| Upstream matrix (`testes/*.lua`, `--testc`) | **17/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
-| Differential output (`--diff`) | **0 output_diff** |
+| Differential output (`--diff`) | **14 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **69/69** pass |
-| C API suites (`tests/c_api`) | 20 suites |
-| Performance (geomean vs PUC) | **1.83x** |
+| C API suites (`tests/c_api`) | 21 suites |
+| Performance (geomean vs PUC) | **1.79x** |
 
-Geomean замедления vs PUC Lua: **1.83x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.79x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -4776,6 +4776,62 @@ string-key 733, opReturn 114, core +113, pushStaged+entry 115.
 10_continuations t1-t8; matrix zig_fail=0 с прежней классификацией + cstack
 gsub-числа обновлены; гsubstest2 200/C-stack; lane: только locals pacing
 (классифицировано); hookstress 1-3 идентичны; fmt-clean).
+
+## P16.24 — unified C-call depth + coroutine C-stack parity (2026-09-05)
+
+### BLOCKING B1 закрыт (`d9e0e79`)
+luaCallKShared+apiCall双重ной ccallEnter — фактор-2 в coroutine.
+Сьюта 20_ccall_depth: **A 198=198, B 197=197 (было 100), D 197=197
+(no-leak), E 198=198**. Точная парити глубин.
+
+### Архитектура (T2/T3)
+- **CCallMode** enum (yieldable ci=1 / nonyieldable nyci / resume_body 0) —
+  закрытое множество, инкремент в одном месте, никаких raw-u32;
+- **один владелец границы**: apiCall — C-API-воронка; luaCallKShared
+  передаёт режим СКВОЗЬ; pcall-семейство = YIELDABLE юнит (PUC
+  pcall-with-k → docallK → luaD_call; nny ломал yield-through-pcall —
+  smoke 30/35/39/53 поймали и исправили в ходе фазы);
+- **failRunerror**: luaG_runerror-семантика позиции (C-контекст = без
+  префикса) — bare "C stack overflow" как PUC.
+
+### T4/T5: капы удалены, модель одна
+- resumeEnterC — общий helper (builtin-resume + trampoline);
+  **coroutine_resume_chain УДАЛЁН**;
+- cap-32 удалён → cstack line14: **30→198** (PUC 195);
+- cap-4 close + coroutine_close_depth поле удалены → один non-yieldable
+  юнит на close → cstack line12: **4→199** (PUC 197);
+- T.stacklevel теперь читает РЕАЛЬНЫЙ getCcalls (был protected-proxy).
+
+### cstack-таблица (PUC / P16.23 / P16.24)
+| секция | PUC | P16.23 | P16.24 | статус |
+|---|---:|---:|---:|---|
+| recursive gsub | 197 | 200 | **199** | ±2 fixed |
+| coroutine gsub | 196 | 199 | **199** | ±2 fixed |
+| metatable gsub | 99 | 200 | 199 | __index-юнит остался |
+| co deep calls | 196 | 4 | **199** | FIXED |
+| resume nesting | 195 | 30 | **198** | FIXED |
+| after errors | 197 | 200 | **199** | ±2 fixed |
+| pure Lua depth | 250043 | 262021 | 262021 | backlog |
+
+### T7 (`2c998b6`): инвариант владения документирован
+(one-owner / completion / caught-error snapshot-reclaim / uncaught outer /
+yield-parked / resume-fresh — контракт у resumeEnterC).
+
+### T9: свежий дифференциал @2c998b6
+C-boundary рефактор НЕ изменил hot-path (lua_calls 3.3755G идентично до 4
+значащих; A-G: opReturn ~110, entry ~47, pushStaged 68.6, core +119,
+cy string-key 670 i/it 2.68x). Geomean-сессия 1.79039.
+
+### Гейт (T8/T17 через сабагента): 12 пунктов; отклонения устранены
+(забытый Debug-принт, Makefile-DIFF, fmt — `a753b64`). Финал: smoke 69/69
+байт-в-байт; c_api 21 сьюта + DIFF GREEN (20 в TESTS, message-residue
+задокументирован в шапке сьюты); matrix zig_fail=0 (13 output_diff
+классифицированы, cstack-обновление внесено); api580 376/376; hooks 1-3
+идентичны; native lanes BOUNDED; lane: только locals pacing.
+
+### Perf-фаза T10-T14: отложена (бюджет фазы ушёл на correctness-
+архитектуру) — топ-5 из свежего профиля: cy string-key 670, opReturn 110,
+core +119, pushStaged+entry 116, TM staging.
 
 ## История закрытых фаз
 

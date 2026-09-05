@@ -1,0 +1,58 @@
+{
+  "created_utc": "2026-09-05T22:19:49.191783+00:00",
+  "provenance": {
+    "git_head": "ac9e086",
+    "measured_source_head": "ac9e086",
+    "git_dirty": "clean",
+    "zig_version": "0.16.0",
+    "zig_binary_sha16": "5e767e96de89b5f7",
+    "input_commit": "ac9e086"
+  },
+  "fmt_check": "FAIL (src/lua/vm.zig, blank line)",
+  "c_api": {
+    "test": "PASS 21",
+    "test_diff": "FAIL 20_ccall_depth B message-shape (depth exact 197)"
+  },
+  "ccall_depths": {
+    "main": "198/198",
+    "coroutine": "197/197",
+    "repeat": "197/197",
+    "callk": "198/198"
+  },
+  "close_semantics": {
+    "A_isyieldable": {
+      "PUC": "false",
+      "zig": "true",
+      "verdict": "BLOCKER"
+    },
+    "B_direct_yield": {
+      "PUC": "close=false \"attempt to yield across a C-call boundary\"",
+      "zig": " prefixed + close=false",
+      "verdict": "message-shape + semantics"
+    },
+    "C_pcall_yield": {
+      "PUC": "caught false/bare-error; after=true; close=true",
+      "zig": "BYPASSED: after=false, caught=nil, script CRASHES",
+      "verdict": "BLOCKER (forced-close conflated with RuntimeError)"
+    },
+    "G_error0": "not reached (crashed at C)"
+  },
+  "matrix": "zig_fail=0, output_diff=14 (files.lua timestamp-only classified)",
+  "known_pre_existing": [
+    "locals tracegc pacing",
+    "pure Lua depth 262021/250043",
+    "hookstress-4",
+    "metatable-gsub __index 199/99"
+  ],
+  "cstack_baseline": {
+    "gsub": "197/199",
+    "co_gsub": "196/199",
+    "mt_gsub": "99/199",
+    "co_deep": "196/199",
+    "close_chain": "197/199",
+    "resume_nest": "195/198",
+    "after_err": "197/199"
+  },
+  "b8_resume_body": "dead variant (no call site)",
+  "b9_lua_resume": "duplicate nCcalls writer vs resumeEnterC"
+}

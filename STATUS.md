@@ -4676,6 +4676,64 @@ P16.21 зафиксирован, regression-check при следующем пр
 61 + entry 58 + opReturn 84... по свежей декомпозиции), dispatch core
 (+100). Сценарий-4 yield-in-hook — кандидат parity-фикса.
 
+## P16.22 — measured hot-path convergence + parity/architecture cleanup (2026-09-05)
+
+### T0 (BLOCKING, `9391953`..`2a995b3`): truth baseline
+- **locals.lua strict-diff**: классифицирован PRE-EXISTING GC-pacing
+  (tracegc __gc точки: 6 коллекций в PUC-пустом окне; bisect worktree на
+  входе 882d879 + всех cut'ах P16.21; артефакт
+  locals-tracegc-divergence.json). P15.74l-заявление предшествует
+  pacing-сдвигам P16.16-21. НОРМАЛИЗАЦИЯ НЕ ПРИМЕНЕНА — backlog: pacing-
+  window alignment фаза.
+- **strict --diff matrix — каноничен впервые**: 13 output_diff
+  классифицированы: 11 structural-T (у PUC-ref нет testC-модуля; в lane-
+  среде выравниваются), locals=pacing, **cstack=РЕАЛЬНЫЕ pre-existing
+  semantic-гэпы** (stack-depth 250043 vs 262021; gsub C-recursion 197 vs
+  99977 — LUAI_MAXCCALLS не зеркалирован; точки). Прежний current-matrix
+  был без --diff (output_diff=0 означало "lane не запускался").
+- Layout truth на финальном коде: CallFrame 88/88, u@32, union floor 56,
+  LuaFrameState 48. Stale-комментарии исправлены.
+
+### T1: свежий дифференциал @2a995b3 (артефакты обновлены)
+lua_calls gap 441→433→(после cut'ов ниже ещё ниже); noalloc 508→496;
+гипотезы P16.21 пересчитаны: TM +154→+129, frame +224→+223, core +100→+123
+(частично redistribution). metamethod_add gap 2766 i/it, coroutine_yield
+3.01x (string-key lookups) — новые данные.
+
+### T4 (`b0d0d32`): pushResolvedBytecodeClosure → comptime PushClosureMode
+Runtime completion-union switch заменён comptime-специализацией с типизи-
+рованными payload (PendingPayload/SimpleResultPayload); одна реализация,
+нулевая runtime-диспетчеризация. noalloc −12 i/it, lua_calls −2.
+
+### T2 (`89de871`): ActivationId u32 alias + provably-dead zero-skip branch
+удалён (0 — не сентинел: equality-only guard). lua_calls −5 i/it.
+
+### T3 (`abd4fc6`): frame-loop entry cleanup
+Прямой Lua-arm доступ (frame_loop = bytecode → текущий кадр доказуемо Lua;
+старое proto().? платило isC-ветвь+unwrap); base/cap вычислены по разу.
+lua_calls −8 i/it, noalloc −12 i/it.
+
+### T9.1 (`9de0c55`): механический zig fmt (8 файлов) отдельным коммитом.
+
+### T6/T7/T8 — не выполнялись (бюджет фазы ушёл на T0-расследование);
+следующие по свежим цифрам: opReturn completion noalloc 114 i/it (T6),
+pushStaged 70 + entry 59 (T5/T7), core +123 (T8 — сначала verify
+redistribution).
+
+### Итог
+| | P16.21 | P16.22 | Δ |
+|---|---:|---:|---:|
+| lua_calls instr | 3.451G | **3.376G** | −15 i/it (cum. −30 vs T1) |
+| noalloc instr | 436M | **424M** | −24 i/it |
+| Geomean (session) | 1.7984 | **1.76363** | −1.9% |
+zig_fail=0; smoke 69/69; api580 376/376; гейт T11 12/12; fmt-clean.
+
+### Honest status
+- api_regression_lane: official testC lane GREEN; targeted parity —
+  locals tracegc dots (pre-existing, классифицировано) → lane НЕ называется
+  зелёным в отчёте.
+- cstack semantic gaps — backlog (LUAI_MAXCCALLS + depth-count parity).
+
 ## История закрытых фаз
 
 P3–P15.12 — краткая сводка. P15.13+ — см. «История разработки» выше.

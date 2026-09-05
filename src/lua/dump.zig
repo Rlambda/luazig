@@ -579,7 +579,7 @@ test "DumpWriter: strip omits debug fields, keeps semantic fields" {
         .locvars = &inner_lvs,
         .maxstacksize = 2,
         .numparams = 1,
-        
+
         .line_defined = 2,
         .last_line_defined = 3,
     };

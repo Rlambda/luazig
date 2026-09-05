@@ -1108,7 +1108,9 @@ pub export fn luaL_loadfilex(L: ?*lua_State, filename: [*:0]const u8, mode: ?[*:
     const prefix = vm_mod.Vm.stripChunkPrefix(source.bytes, true);
     var chunk_bytes = prefix.bytes;
     var prefixed_buf: ?[]u8 = null;
-    defer { if (prefixed_buf) |b| vm.alloc.free(b); }
+    defer {
+        if (prefixed_buf) |b| vm.alloc.free(b);
+    }
     // PUC lauxlib.c:824-825: if a comment was skipped and the chunk is
     // text (not binary), add a '\n' to correct line numbers. Binary
     // chunks don't need line correction (lauxlib.c:827 "remove possible

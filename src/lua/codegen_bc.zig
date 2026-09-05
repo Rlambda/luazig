@@ -805,7 +805,8 @@ pub const Codegen = struct {
             const j = e.val.jump;
             self.concatJumps(&e.t_list, j.info);
             e.val = .void;
-        }        if (e.t_list != 0 or e.f_list != 0) {
+        }
+        if (e.t_list != 0 or e.f_list != 0) {
             // need_value is always true in luazig (no TESTSET → all jumps
             // need a value). Emit LFALSESKIP/LOADTRUE pattern.
             // fj: skip the bool loads if the value is already in reg
@@ -1376,7 +1377,10 @@ pub const Codegen = struct {
                 const is_const = outer.isReadonlyLocal(reg);
                 const idx = try self.nextUpvalueIndex();
                 try self.upvalue_descs.append(self.alloc, bc.Upvaldesc.make(
-                    true, reg, is_const, name,
+                    true,
+                    reg,
+                    is_const,
+                    name,
                 ));
                 try self.upvalues.put(self.alloc, name, idx);
                 if (is_const) self.const_upvalues.put(self.alloc, idx, {}) catch @panic("oom");
@@ -1393,7 +1397,10 @@ pub const Codegen = struct {
                 const is_const = outer.isConstUpvalue(outer_idx);
                 const idx = try self.nextUpvalueIndex();
                 try self.upvalue_descs.append(self.alloc, bc.Upvaldesc.make(
-                    false, outer_idx, is_const, name,
+                    false,
+                    outer_idx,
+                    is_const,
+                    name,
                 ));
                 try self.upvalues.put(self.alloc, name, idx);
                 if (is_const) self.const_upvalues.put(self.alloc, idx, {}) catch @panic("oom");
@@ -1410,7 +1417,10 @@ pub const Codegen = struct {
             const is_const = outer.isConstUpvalue(outer_idx);
             const idx = try self.nextUpvalueIndex();
             try self.upvalue_descs.append(self.alloc, bc.Upvaldesc.make(
-                false, outer_idx, is_const, name,
+                false,
+                outer_idx,
+                is_const,
+                name,
             ));
             try self.upvalues.put(self.alloc, name, idx);
             if (is_const) self.const_upvalues.put(self.alloc, idx, {}) catch @panic("oom");
@@ -2058,7 +2068,7 @@ pub const Codegen = struct {
 
                     // Comparison: produce VJMP via genComparisonExp.
                     // Discharge LHS to a register first (PUC infix order).
-        const lhs_start_pc: usize = @intCast(self.builder.pc());
+                    const lhs_start_pc: usize = @intCast(self.builder.pc());
                     var lhs_ed = try self.genExpDesc(lhs_exp);
                     const lhs_reg = try self.exp2anyreg(&lhs_ed);
                     const lhs_end_pc: usize = @intCast(self.builder.pc());
@@ -2821,7 +2831,9 @@ pub const Codegen = struct {
         return switch (v) {
             .int => |i| i,
             .float => |f| if (std.math.isFinite(f) and f == @trunc(f) and @abs(f) < 9.2e18)
-                @intFromFloat(f) else null,
+                @intFromFloat(f)
+            else
+                null,
         };
     }
 
@@ -2837,8 +2849,7 @@ pub const Codegen = struct {
     /// bitwise binary operator. Comparisons, concat, and/or are NOT folded.
     fn isFoldBinOp(op: TokenKind) bool {
         return switch (op) {
-            .Plus, .Minus, .Star, .Slash, .Percent, .Caret, .Idiv,
-            .Amp, .Pipe, .Tilde, .Shl, .Shr => true,
+            .Plus, .Minus, .Star, .Slash, .Percent, .Caret, .Idiv, .Amp, .Pipe, .Tilde, .Shl, .Shr => true,
             else => false,
         };
     }
@@ -2849,8 +2860,7 @@ pub const Codegen = struct {
     ///   - Division-class ops (DIV/IDIV/MOD) cannot have a zero divisor.
     fn validFoldOp(op: TokenKind, v1: NumVal, v2: NumVal) bool {
         return switch (op) {
-            .Amp, .Pipe, .Tilde, .Shl, .Shr =>
-                numValToInt(v1) != null and numValToInt(v2) != null,
+            .Amp, .Pipe, .Tilde, .Shl, .Shr => numValToInt(v1) != null and numValToInt(v2) != null,
             .Slash, .Idiv, .Percent => !numValIsZero(v2),
             else => true,
         };
@@ -2977,7 +2987,9 @@ pub const Codegen = struct {
             .int => |i| .{ .val = .{ .k_int = i } },
             // PUC: folds neither NaN nor 0.0 (to avoid problems with -0.0).
             .float => |f| if (std.math.isNan(f) or f == 0.0)
-                null else .{ .val = .{ .k_float = f } },
+                null
+            else
+                .{ .val = .{ .k_float = f } },
         };
     }
 
@@ -4672,7 +4684,10 @@ pub const Codegen = struct {
         if (self.outer == null) {
             const idx = try self.nextUpvalueIndex();
             try self.upvalue_descs.append(self.alloc, bc.Upvaldesc.make(
-                true, 0, false, "_ENV",
+                true,
+                0,
+                false,
+                "_ENV",
             ));
             try self.upvalues.put(self.alloc, "_ENV", idx);
             self.env_upvalue_idx = idx;
@@ -5480,57 +5495,57 @@ pub const Codegen = struct {
                 // in an outer scope.
                 if (!self.isForcedGlobalName(name)) {
                     if (self.lookupLocal(name)) |local_reg| {
-                    if (!self.isReadonlyLocal(local_reg)) {
-                        const store_line = self.spanLastTokenLine(n.rhs[0].span);
-                        // Check if RHS is a compile-time nil constant (either
-                        // a `nil` literal or a <const> nil local/upvalue).
-                        // PUC discharge2reg → luaK_nil emits LOADNIL directly
-                        // to the target register, enabling merge across
-                        // consecutive nil-to-local assignments.
-                        if (self.genConstExpDesc(n.rhs[0])) |ced| {
-                            if (ced.val == .nil) {
-                                try self.emitLoadNil(local_reg, 1, store_line);
-                                return false;
-                            }
-                        }
-                        switch (n.rhs[0].node) {
-                            .BinOp => |bn| {
-                                const op_line = if (bn.op_line != 0) bn.op_line else n.rhs[0].span.line;
-                                if (bn.op != .And and bn.op != .Or and
-                                    bn.op != .EqEq and bn.op != .NotEq and
-                                    bn.op != .Lt and bn.op != .Lte and
-                                    bn.op != .Gt and bn.op != .Gte and
-                                    bn.op != .Concat)
-                                {
-                                    // Arithmetic/bitwise: pass local_reg as hint.
-                                    _ = try self.genBinOp(bn, op_line, local_reg);
+                        if (!self.isReadonlyLocal(local_reg)) {
+                            const store_line = self.spanLastTokenLine(n.rhs[0].span);
+                            // Check if RHS is a compile-time nil constant (either
+                            // a `nil` literal or a <const> nil local/upvalue).
+                            // PUC discharge2reg → luaK_nil emits LOADNIL directly
+                            // to the target register, enabling merge across
+                            // consecutive nil-to-local assignments.
+                            if (self.genConstExpDesc(n.rhs[0])) |ced| {
+                                if (ced.val == .nil) {
+                                    try self.emitLoadNil(local_reg, 1, store_line);
                                     return false;
                                 }
-                            },
-                            else => {},
-                        }
-                        // Other RHS: discharge ExpDesc directly into the
-                        // local's register. For relocatable instructions
-                        // (GETTABLE, GETI, GETFIELD), this patches A to
-                        // local_reg — no MOVE needed. For non-relocatable
-                        // (call results, other locals), a single MOVE is
-                        // emitted by discharge2reg. Mirrors PUC's
-                        // luaK_storevar VLOCAL → exp2reg(fs, ex, var->u.var.ridx).
-                        //
-                        // PUC luaK_storevar(VLOCAL, VLOCAL_same_reg): when
-                        // the RHS is the same local as the LHS, no code is
-                        // emitted (exp2reg to the same register is a no-op).
-                        // `a = a` must produce zero instructions.
-                        if (n.rhs[0].node == .Name) {
-                            const rhs_name = n.rhs[0].node.Name.slice(self.source);
-                            if (self.lookupLocal(rhs_name)) |rhs_reg| {
-                                if (rhs_reg == local_reg) return false;
                             }
+                            switch (n.rhs[0].node) {
+                                .BinOp => |bn| {
+                                    const op_line = if (bn.op_line != 0) bn.op_line else n.rhs[0].span.line;
+                                    if (bn.op != .And and bn.op != .Or and
+                                        bn.op != .EqEq and bn.op != .NotEq and
+                                        bn.op != .Lt and bn.op != .Lte and
+                                        bn.op != .Gt and bn.op != .Gte and
+                                        bn.op != .Concat)
+                                    {
+                                        // Arithmetic/bitwise: pass local_reg as hint.
+                                        _ = try self.genBinOp(bn, op_line, local_reg);
+                                        return false;
+                                    }
+                                },
+                                else => {},
+                            }
+                            // Other RHS: discharge ExpDesc directly into the
+                            // local's register. For relocatable instructions
+                            // (GETTABLE, GETI, GETFIELD), this patches A to
+                            // local_reg — no MOVE needed. For non-relocatable
+                            // (call results, other locals), a single MOVE is
+                            // emitted by discharge2reg. Mirrors PUC's
+                            // luaK_storevar VLOCAL → exp2reg(fs, ex, var->u.var.ridx).
+                            //
+                            // PUC luaK_storevar(VLOCAL, VLOCAL_same_reg): when
+                            // the RHS is the same local as the LHS, no code is
+                            // emitted (exp2reg to the same register is a no-op).
+                            // `a = a` must produce zero instructions.
+                            if (n.rhs[0].node == .Name) {
+                                const rhs_name = n.rhs[0].node.Name.slice(self.source);
+                                if (self.lookupLocal(rhs_name)) |rhs_reg| {
+                                    if (rhs_reg == local_reg) return false;
+                                }
+                            }
+                            var rhs_ed = try self.genExpDesc(n.rhs[0]);
+                            try self.discharge2reg(&rhs_ed, local_reg);
+                            return false;
                         }
-                        var rhs_ed = try self.genExpDesc(n.rhs[0]);
-                        try self.discharge2reg(&rhs_ed, local_reg);
-                        return false;
-                    }
                     }
                 }
             }

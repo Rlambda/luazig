@@ -223,7 +223,7 @@ pub const Node = struct {
         const base: usize = @intFromPtr(nodes.ptr);
         const limit: usize = base + nodes.len * @sizeOf(Node);
         if (next_addr < base or next_addr >= limit) return null;
-        return @constCast(@ptrCast(next_ptr));
+        return @ptrCast(@constCast(next_ptr));
     }
 
     /// Reconstruct the key as a full `Value`. Returns `.Nil` for empty/dead
@@ -1788,7 +1788,10 @@ pub fn numUseArray(array: []const Value, ct: *Counters) void {
     var ause: u32 = 0;
     var i: u32 = 1; // 1-based PUC index
     const asize: u32 = @intCast(array.len);
-    while (lg <= MAXABITS) : ({ lg += 1; ttlg *%= 2; }) {
+    while (lg <= MAXABITS) : ({
+        lg += 1;
+        ttlg *%= 2;
+    }) {
         var lc: u32 = 0;
         var lim = ttlg;
         if (lim > asize) {

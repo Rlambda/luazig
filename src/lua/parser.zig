@@ -630,7 +630,7 @@ pub const Parser = struct {
                 const text = self.cur.slice(self.lex.source.bytes);
                 if (std.mem.eql(u8, text, "global") and
                     (self.la.kind == .Function or self.la.kind == .Star or
-                     self.la.kind == .Lt or self.la.kind == .Name))
+                        self.la.kind == .Lt or self.la.kind == .Name))
                 {
                     // Promote .Name("global") to .Global so that
                     // parseGlobalStatFuncAst's expect(.Global) succeeds.

@@ -1,0 +1,26 @@
+{
+  "created_utc": "2026-09-05T09:39:00.224840+00:00",
+  "provenance": {
+    "git_head": "5c64bb5",
+    "measured_source_head": "5c64bb5",
+    "git_dirty": "clean",
+    "zig_version": "0.16.0",
+    "optimize_mode": "ReleaseFast",
+    "zig_binary_sha16": "9a74829e697aa8d7",
+    "note": "locals.lua strict-diff investigation (P16.22 T0.2)."
+  },
+  "finding": {
+    "classification": "PRE-EXISTING GC-pacing divergence (not a P16.21 regression)",
+    "proof": "Dot signature present at P16.21 INPUT 882d879 AND at every P16.21 cut (worktree bisect, ReleaseFast, 1 run each after the initial mis-signature grep was corrected); deterministic 5/5 per side on final HEAD.",
+    "mechanism": "tracegc.lua writes \".\" to stderr per collected __gc table. luazig runs ~6 collections in the window between the end of the \"errors in __close\" battery and the \"to-be-closed variables in coroutines\" header; the reference PUC binary runs none in that window. Collection COUNT/timing is unspecified by Lua, but strict output parity on the reference build requires the pacing windows to match.",
+    "structural_note": "A bare raw diff ALSO shows T-guarded sections (print '+' at :789, \"x coroutines in C\" :1109) because build/lua-c/lua has no testC module; in the api_regression_lane environment PUC gets the real testC module and those sections align \u2014 the only remaining lane-visible diff is the 6 dots.",
+    "why_matrix_was_green": "testes_matrix.py without --diff checks exit codes only; output_diff=0 in current-matrix.json means the diff lane was not run at all (argv lacks --diff).",
+    "p15_74l_note": "The earlier \"locals.lua passes --diff\" claim predates the P16.16-P16.21 GC-pacing shifts (per-kind string allocations P16.18, frame-state cuts P16.20/21) \u2014 plausible it was true then.",
+    "reproducer": "cd lua-5.5.0/testes && luazig locals.lua --testc (with testC module on both sides; compare stderr dot lines around the \"in coroutines\" header)",
+    "backlog": "GC-pacing window alignment: match when collections fire across the locals.lua TBC battery (requires pacing audit vs PUC lgc.c step/debt arithmetic \u2014 a dedicated semantic phase; NOT fixable by output normalization)."
+  },
+  "raw_outputs": {
+    "zig_sha256_16": "0cdd48a4f5026fca",
+    "puc_sha256_16": "73dc7606a8b31c53"
+  }
+}

@@ -1,25 +1,24 @@
 {
   "meta": {
-    "created_utc": "2026-09-05T09:39:54.594706+00:00",
+    "created_utc": "2026-09-05T11:31:05.520387+00:00",
     "lane": "testes_matrix",
     "argv": [
       "tools/testes_matrix.py",
       "--testc",
       "--diff",
       "--json-out",
-      "/tmp/opencode/matrix_diff.json"
+      "/tmp/opencode/matrix22c.json"
     ],
     "zig_version": "0.16.0"
   },
   "provenance": {
-    "git_head": "9391953",
-    "measured_source_head": "9391953",
+    "git_head": "9de0c55",
+    "measured_source_head": "9de0c55",
     "git_dirty": "clean",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "9a74829e697aa8d7",
-    "puc_binary_sha16": "d54bc45e1757b216",
-    "matrix_argv": "tools/testes_matrix.py --testc --diff --json-out ..."
+    "zig_binary_sha16": "439412a893c0f1f2",
+    "puc_binary_sha16": "d54bc45e1757b216"
   },
   "summary": {
     "total": 32,

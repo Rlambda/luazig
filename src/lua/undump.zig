@@ -687,7 +687,7 @@ test "UndumpReader: undumpProto round-trips a simple Proto" {
         .locvars = &lvs,
         .maxstacksize = 2,
         .numparams = 0,
-        
+
         .line_defined = 1,
         .last_line_defined = 2,
     };
@@ -858,7 +858,7 @@ test "UndumpReader: undumpProto round-trips nested protos" {
         .locvars = &inner_lvs,
         .maxstacksize = 2,
         .numparams = 0,
-        
+
         .line_defined = 2,
         .last_line_defined = 4,
     };

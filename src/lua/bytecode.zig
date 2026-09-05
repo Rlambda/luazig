@@ -1623,8 +1623,7 @@ pub fn dumpProto(w: anytype, proto: *const Proto, depth: u32) !void {
             },
 
             // K-variant arithmetic: show constant value.
-            .addk, .subk, .mulk, .modk, .powk, .divk, .idivk,
-            .bandk, .bork, .bxork => {
+            .addk, .subk, .mulk, .modk, .powk, .divk, .idivk, .bandk, .bork, .bxork => {
                 var buf: [64]u8 = undefined;
                 const kstr = formatConst(&buf, protoConstAt(proto, inst.c) orelse .nil);
                 try w.print("\t{d}\t{d}\t{d}\t; {s}", .{ inst.a, inst.b, inst.c, kstr });
@@ -1745,9 +1744,8 @@ pub fn dumpProto(w: anytype, proto: *const Proto, depth: u32) !void {
         try w.print("upvalues ({d}) for {s}:\n", .{ proto.upvalues.len, proto.sourceName() });
         for (proto.upvalues, 0..) |uv, idx| {
             try w.print("{s}\t{d}\t{s}\t{s}\t{d}\n", .{
-                indent, idx, uv.name(),
-                if (uv.instack) "register" else "upvalue",
-                uv.idx,
+                indent,                                    idx,    uv.name(),
+                if (uv.instack) "register" else "upvalue", uv.idx,
             });
         }
     }

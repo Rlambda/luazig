@@ -1131,7 +1131,6 @@ const EXTRA_MARGIN: usize = 5;
 /// P16.10 T8: SIGINT_CHECK_INTERVAL removed — replaced by PUC-style trap
 /// (cached bool refreshed at backward jumps). The old countdown amortization
 /// is no longer used.
-
 /// P15.37a: Hot/cold split for the bytecode pending-call continuation.
 ///
 /// `BytecodePendingCall` is 48 bytes (after P15.44 moved large continuation
@@ -1463,7 +1462,6 @@ const LuaFrameState = extern struct {
     ///
     /// `pending_call_index` remains `INVALID_PENDING` while a simple-result is
     /// pending — the two completion mechanisms are mutually exclusive.
-
     pub fn hasOpenUpvalues(self: *const LuaFrameState) bool {
         return (self.lua_packed_flags & 0x01) != 0;
     }
@@ -2411,8 +2409,7 @@ pub const LuaString = extern struct {
     /// accounting can never drift from the actual allocation.
     pub inline fn allocatedSize(self: *const LuaString) usize {
         return switch (self.srkind) {
-            0...@as(i8, @intCast(lua_string_max_short_len)) =>
-                short_content_offset + @as(usize, @intCast(self.srkind)) + 1,
+            0...@as(i8, @intCast(lua_string_max_short_len)) => short_content_offset + @as(usize, @intCast(self.srkind)) + 1,
             lstrreg => long_content_offset + self.u.lnglen + 1,
             lstrfix => lstrfix_header_size,
             lstrmem => @sizeOf(LuaString),
@@ -3021,10 +3018,8 @@ test "string keys survive rehash+GC; equal longs compare by content" {
         const v = vm.rawGet(tbl, .{ .String = key });
         try testing.expect(v == .Int and v.Int == @as(i64, @intCast(i)));
     }
-    try testing.expectEqual(@as(Value, .{ .Int = 777 }),
-        vm.rawGet(tbl, .{ .String = lb })); // long lookup by CONTENT twin
-    try testing.expectEqual(@as(Value, .{ .Int = 888 }),
-        vm.rawGet(tbl, .{ .String = sb })); // short lookup by identity twin
+    try testing.expectEqual(@as(Value, .{ .Int = 777 }), vm.rawGet(tbl, .{ .String = lb })); // long lookup by CONTENT twin
+    try testing.expectEqual(@as(Value, .{ .Int = 888 }), vm.rawGet(tbl, .{ .String = sb })); // short lookup by identity twin
 }
 
 test "string allocated-size rule: per-kind table (PUC parity)" {
@@ -3243,7 +3238,6 @@ fn gcCanFinalize(obj: GcObject) bool {
 /// Non-TMS metafields (`__pairs`, `__tostring`, `__name`, `__metatable`) are
 /// NOT part of the TMS enum — PUC handles them via `luaL_getmetafield`
 /// (direct string lookup), not via `tmname[]`. They live in `MetaField` below.
-
 /// Non-TMS metafields — metamethod names that PUC Lua does NOT include in
 /// the `TMS` enum (`ltm.h:18-45`). PUC handles these via `luaL_getmetafield`
 /// (lauxlib.c) or direct `luaH_Hgetshortstr` calls (ltm.c:95 for `__name`),
@@ -3529,7 +3523,6 @@ pub const VmStats = struct {
     /// save, trampoline args_copy + BytecodeCoroutineContinuation).
     resume_allocs: u64 = 0,
 };
-
 
 pub const Vm = struct {
     const Frame = CallFrame;
@@ -4438,11 +4431,11 @@ pub const Vm = struct {
         //   [0]=MINORMUL(20), [1]=MAJORMINOR(50), [2]=MINORMAJOR(70),
         //   [3]=PAUSE(250), [4]=STEPMUL(200), [5]=STEPSIZE(9600).
         vm.gcparams = .{
-            Vm.gcCodeParam(20),   // LUA_GCPMINORMUL
-            Vm.gcCodeParam(50),   // LUA_GCPMAJORMINOR
-            Vm.gcCodeParam(70),   // LUA_GCPMINORMAJOR (decodes to 68)
-            Vm.gcCodeParam(250),  // LUA_GCPPAUSE
-            Vm.gcCodeParam(200),  // LUA_GCPSTEPMUL
+            Vm.gcCodeParam(20), // LUA_GCPMINORMUL
+            Vm.gcCodeParam(50), // LUA_GCPMAJORMINOR
+            Vm.gcCodeParam(70), // LUA_GCPMINORMAJOR (decodes to 68)
+            Vm.gcCodeParam(250), // LUA_GCPPAUSE
+            Vm.gcCodeParam(200), // LUA_GCPSTEPMUL
             Vm.gcCodeParam(9600), // LUA_GCPSTEPSIZE (200 * sizeof(Table))
         };
         return vm;
@@ -6728,7 +6721,7 @@ pub const Vm = struct {
             // so gcFreeObject's full-size credit (header + array + hash)
             // stays symmetric. Without this, every freed table with a hash
             // part over-decrements the count (P16.4f bug B).
-        self.gcNoteAlloc(hsize * @sizeOf(ltable.Node));
+            self.gcNoteAlloc(hsize * @sizeOf(ltable.Node));
             for (new_hash) |*n| n.* = .{};
             new_hash_lastfree = hsize;
         }
@@ -6777,7 +6770,7 @@ pub const Vm = struct {
             const arr = try self.alloc.alloc(Value, new_asize);
             // Charge the new array part (PUC luaM_realloc_ → totalbytes).
             // See the hash-part charge above for the symmetry argument.
-        self.gcNoteAlloc(new_asize * @sizeOf(Value));
+            self.gcNoteAlloc(new_asize * @sizeOf(Value));
             const copy_len = @min(old_asize, new_asize);
             if (copy_len > 0) @memcpy(arr[0..copy_len], tbl.array[0..copy_len]);
             for (arr[copy_len..]) |*slot| slot.* = .Nil;
@@ -7175,7 +7168,8 @@ pub const Vm = struct {
                 self.gc_creation_seq += 1;
             },
             else => {},
-        }        self.gc_objects.appendAssumeCapacity(obj);
+        }
+        self.gc_objects.appendAssumeCapacity(obj);
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             p.age.* = .new;
             self.gc_young_objects.appendAssumeCapacity(obj);
@@ -8067,7 +8061,12 @@ pub const Vm = struct {
         const resolved = self.resolveCallable(callee_value, args, null) catch return false;
         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
         return self.tryPushResolvedContinuationCall(
-            exec_frames, parent_index, resolved, completion, debug_namewhat, debug_name,
+            exec_frames,
+            parent_index,
+            resolved,
+            completion,
+            debug_namewhat,
+            debug_name,
         );
     }
 
@@ -8117,59 +8116,71 @@ pub const Vm = struct {
 
         if (mode == .pending) {
             const p = payload;
-                // Install pending_call continuation state BEFORE the fallible
-                // child-frame push (mirrors PUC luaD_precall → setobj2s).
-                try self.setPendingCall(parent, .{
-                    .callee = .{ .Closure = closure },
-                    .completion = p.completion,
-                });
-                // Roll back if child-frame push or hook dispatch fails.
-                // Re-fetch via getPtr: pushStagedBytecodeExecFrame may realloc.
-                errdefer self.clearPendingCall(exec_frames.getPtr(parent_index));
-                const cont_nresults: i32 = switch (p.completion) {
-                    .results => |r| r.nresults,
-                    else => -1,
-                };
-                // PUC luaT_callTMres two-step: stage [func, args...] at
-                // L->top (bc_stack_top), then activate (luaD_precall).
-                const staged = try self.stageBytecodeCall(
-                    self.bc_stack_top, closure, args,
-                );
-                try self.pushStagedBytecodeExecFrame(
-                    exec_frames, proto, staged.func_slot, staged.nargs, cont_nresults,
-                );
-                // The debug name must be recorded BEFORE the CALL hook fires:
-                // PUC's hook-time getinfo('n') resolves the metamethod name
-                // from the caller's instruction (funcnamefromcode "metamethod"
-                // branch).
-                self.setDebugName(exec_frames.getPtr(parent_index), p.debug_namewhat, p.debug_name);
+            // Install pending_call continuation state BEFORE the fallible
+            // child-frame push (mirrors PUC luaD_precall → setobj2s).
+            try self.setPendingCall(parent, .{
+                .callee = .{ .Closure = closure },
+                .completion = p.completion,
+            });
+            // Roll back if child-frame push or hook dispatch fails.
+            // Re-fetch via getPtr: pushStagedBytecodeExecFrame may realloc.
+            errdefer self.clearPendingCall(exec_frames.getPtr(parent_index));
+            const cont_nresults: i32 = switch (p.completion) {
+                .results => |r| r.nresults,
+                else => -1,
+            };
+            // PUC luaT_callTMres two-step: stage [func, args...] at
+            // L->top (bc_stack_top), then activate (luaD_precall).
+            const staged = try self.stageBytecodeCall(
+                self.bc_stack_top,
+                closure,
+                args,
+            );
+            try self.pushStagedBytecodeExecFrame(
+                exec_frames,
+                proto,
+                staged.func_slot,
+                staged.nargs,
+                cont_nresults,
+            );
+            // The debug name must be recorded BEFORE the CALL hook fires:
+            // PUC's hook-time getinfo('n') resolves the metamethod name
+            // from the caller's instruction (funcnamefromcode "metamethod"
+            // branch).
+            self.setDebugName(exec_frames.getPtr(parent_index), p.debug_namewhat, p.debug_name);
         } else {
             const sr = payload;
-                // P16.8a Task 5: The simple_result state is set BEFORE the
-                // fallible child-activation operations (staging + activation +
-                // hook dispatch). The errdefer below rolls it back if any
-                // fails, mirroring the errdefer clearPendingCall pattern above.
-                switch (sr.completion) {
-                    .value => |dst| parent.u.lua.setSimpleValueResult(dst, sr.event),
-                    .compare => |invert| parent.u.lua.setSimpleCompareResult(sr.event, invert),
-                }
-                // Re-fetch via getPtr: pushStagedBytecodeExecFrame may realloc.
-                errdefer exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
-                // simple_result always consumes exactly 1 result (nresults=-1
-                // means "the continuation handles result count" — the
-                // simple_result completion reads exactly 1 value from the
-                // child's return slot).
-                //
-                // PUC luaT_callTMres two-step: stage [func, args...] at
-                // L->top (bc_stack_top), then activate (luaD_precall).
-                const staged = try self.stageBytecodeCall(
-                    self.bc_stack_top, closure, args,
-                );
-                try self.pushStagedBytecodeExecFrame(
-                    exec_frames, proto, staged.func_slot, staged.nargs, -1,
-                );
-                // No setDebugName — debug name is derived from simple_result_event
-                // at read time via getDebugName().
+            // P16.8a Task 5: The simple_result state is set BEFORE the
+            // fallible child-activation operations (staging + activation +
+            // hook dispatch). The errdefer below rolls it back if any
+            // fails, mirroring the errdefer clearPendingCall pattern above.
+            switch (sr.completion) {
+                .value => |dst| parent.u.lua.setSimpleValueResult(dst, sr.event),
+                .compare => |invert| parent.u.lua.setSimpleCompareResult(sr.event, invert),
+            }
+            // Re-fetch via getPtr: pushStagedBytecodeExecFrame may realloc.
+            errdefer exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
+            // simple_result always consumes exactly 1 result (nresults=-1
+            // means "the continuation handles result count" — the
+            // simple_result completion reads exactly 1 value from the
+            // child's return slot).
+            //
+            // PUC luaT_callTMres two-step: stage [func, args...] at
+            // L->top (bc_stack_top), then activate (luaD_precall).
+            const staged = try self.stageBytecodeCall(
+                self.bc_stack_top,
+                closure,
+                args,
+            );
+            try self.pushStagedBytecodeExecFrame(
+                exec_frames,
+                proto,
+                staged.func_slot,
+                staged.nargs,
+                -1,
+            );
+            // No setDebugName — debug name is derived from simple_result_event
+            // at read time via getDebugName().
         }
         // Metamethod/continuation activations get their CALL event when the
         // frame exists (PUC: luaT_calltm → luaD_call → luaD_precall →
@@ -8430,7 +8441,8 @@ pub const Vm = struct {
                 if (cl.proto == null) {
                     // C closure (c_func set, proto null) — synchronous.
                     return .{ .value = try self.callResolvedMetamethodSync(
-                        resolved, opname,
+                        resolved,
+                        opname,
                     ) };
                 }
                 // Bytecode closure reached via __call chain — push continuation
@@ -8448,7 +8460,8 @@ pub const Vm = struct {
             },
             .Builtin => {
                 return .{ .value = try self.callResolvedMetamethodSync(
-                    resolved, opname,
+                    resolved,
+                    opname,
                 ) };
             },
             else => unreachable, // resolveCallable errors on non-callable
@@ -12605,7 +12618,7 @@ pub const Vm = struct {
             // Retain the tree owner (P16.16 C2/T4.2: derived from proto).
             _ = self.retainTreeForClosure(proto_in);
             try self.gcRegisterClosure(cl);
-        self.gcNoteAlloc(@sizeOf(Closure) + upvalues_in.len * @sizeOf(*Cell));
+            self.gcNoteAlloc(@sizeOf(Closure) + upvalues_in.len * @sizeOf(*Cell));
             self.testc_obj_functions += 1;
             break :blk cl;
         };
@@ -13049,7 +13062,6 @@ pub const Vm = struct {
             // refreshes now cover all sites — see table above.)
 
             while (ctx.pc < ctx.cur_proto.code.len) {
-
                 const inst = ctx.cur_proto.code[ctx.pc];
                 const op: bc.Op = @enumFromInt(inst.op);
                 const a = inst.a;
@@ -13073,199 +13085,199 @@ pub const Vm = struct {
                 // P16.19 T5-A: single combined gate; common case = one
                 // not-taken branch for BOTH stats and hooks flags.
                 if (self.dispatch_gate != 0) {
-                if (self.dispatch_gate & DISPATCH_GATE_STATS != 0) {
-                    self.stats.instructions_total += 1;
-                    self.stats.instructions_by_op[@intFromEnum(op)] += 1;
-                }
+                    if (self.dispatch_gate & DISPATCH_GATE_STATS != 0) {
+                        self.stats.instructions_total += 1;
+                        self.stats.instructions_by_op[@intFromEnum(op)] += 1;
+                    }
 
-                // P15.33: Re-check hooks_active_cached every iteration so that
-                // debug.sethook() called from Lua code takes effect
-                // immediately. Uses the cached flag updated by refreshHooksCached().
-                // (P15.51l: hooks_active removed from ctx — use self.hooks_active_cached directly.)
+                    // P15.33: Re-check hooks_active_cached every iteration so that
+                    // debug.sethook() called from Lua code takes effect
+                    // immediately. Uses the cached flag updated by refreshHooksCached().
+                    // (P15.51l: hooks_active removed from ctx — use self.hooks_active_cached directly.)
 
-                // P16.10 T8: SIGINT is checked at backward jumps and frame
-                // boundaries only — no per-instruction check. See the T8
-                // comment block above for the PUC comparison and rationale.
+                    // P16.10 T8: SIGINT is checked at backward jumps and frame
+                    // boundaries only — no per-instruction check. See the T8
+                    // comment block above for the PUC comparison and rationale.
 
-                if (self.dispatch_gate & DISPATCH_GATE_HOOKS != 0) {
-                    // Slow path: hooks may fire. Use a local `fr` that can be
-                    // re-derived after hooks execute Lua code (which may grow
-                    // exec_frames and invalidate stale pointers).
-                    var fr = exec_frames.getPtr(ctx.frame_index);
-                    // Sync ctx.pc to the heap CallFrame so the hooks block and
-                    // debug.getinfo see the current instruction.
-                    // P15.51l: reg_top is now read directly from
-                    // the CallFrame (fr), so no sync needed for them.
-                    fr.u.lua.pc = ctx.pc;
-                    // P15.51n: current_line derived from proto.lineinfo[pc].
-                    const hook_state = self.activeHookState();
-                    const th = self.activeBytecodeThread();
-                    if (hook_state.has_line and !self.isInDebugHook() and self.debug_hooks_suppressed == 0) {
-                        const has_line_info = fr.u.lua.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[fr.u.lua.pc] != 0;
-                        if (has_line_info) {
-                            const current_line: i64 = @intCast(ctx.cur_proto.lineinfo[fr.u.lua.pc]);
+                    if (self.dispatch_gate & DISPATCH_GATE_HOOKS != 0) {
+                        // Slow path: hooks may fire. Use a local `fr` that can be
+                        // re-derived after hooks execute Lua code (which may grow
+                        // exec_frames and invalidate stale pointers).
+                        var fr = exec_frames.getPtr(ctx.frame_index);
+                        // Sync ctx.pc to the heap CallFrame so the hooks block and
+                        // debug.getinfo see the current instruction.
+                        // P15.51l: reg_top is now read directly from
+                        // the CallFrame (fr), so no sync needed for them.
+                        fr.u.lua.pc = ctx.pc;
+                        // P15.51n: current_line derived from proto.lineinfo[pc].
+                        const hook_state = self.activeHookState();
+                        const th = self.activeBytecodeThread();
+                        if (hook_state.has_line and !self.isInDebugHook() and self.debug_hooks_suppressed == 0) {
+                            const has_line_info = fr.u.lua.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[fr.u.lua.pc] != 0;
+                            if (has_line_info) {
+                                const current_line: i64 = @intCast(ctx.cur_proto.lineinfo[fr.u.lua.pc]);
 
-                            // A direct coroutine yield resumes by replaying the
-                            // suspended CALL/TAILCALL opcode. That replay is a VM
-                            // continuation, not a new source-line transition.
-                            var skip_replayed_hook = fr.isHookYield() and fr.u.lua.pc == @as(usize, fr.u.lua.resume_pc);
-                            {
-                                const skip_pc = exec_frames.getPtr(ctx.frame_index).u.lua.skip_line_hook_pc;
-                                if (skip_pc != INVALID_PC) {
-                                    if (skip_pc == @as(u32, @intCast(fr.u.lua.pc))) skip_replayed_hook = true;
-                                    exec_frames.getPtr(ctx.frame_index).u.lua.skip_line_hook_pc = INVALID_PC;
+                                // A direct coroutine yield resumes by replaying the
+                                // suspended CALL/TAILCALL opcode. That replay is a VM
+                                // continuation, not a new source-line transition.
+                                var skip_replayed_hook = fr.isHookYield() and fr.u.lua.pc == @as(usize, fr.u.lua.resume_pc);
+                                {
+                                    const skip_pc = exec_frames.getPtr(ctx.frame_index).u.lua.skip_line_hook_pc;
+                                    if (skip_pc != INVALID_PC) {
+                                        if (skip_pc == @as(u32, @intCast(fr.u.lua.pc))) skip_replayed_hook = true;
+                                        exec_frames.getPtr(ctx.frame_index).u.lua.skip_line_hook_pc = INVALID_PC;
+                                    }
+                                }
+                                if (!skip_replayed_hook and hook_state.skip_bc_line_once) {
+                                    skip_replayed_hook = true;
+                                    hook_state.skip_bc_line_once = false;
+                                }
+
+                                // PUC starts tracing a vararg function after OP_VARARGPREP:
+                                // the first source-visible line is the instruction that
+                                // follows it. Record OP_VARARGPREP as oldpc, but do not
+                                // dispatch a line event for it.
+                                const suppress_varargprep = fr.u.lua.pc == 0 and op == .varargprep;
+                                const previous_pc = exec_frames.getPtr(ctx.frame_index).u.lua.last_line_pc;
+                                var should_dispatch = false;
+                                if (!skip_replayed_hook and !suppress_varargprep) {
+                                    if (previous_pc != INVALID_PC) {
+                                        const old_pc: usize = previous_pc;
+                                        const old_line: i64 = if (old_pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[old_pc] != 0)
+                                            @intCast(ctx.cur_proto.lineinfo[old_pc])
+                                        else
+                                            current_line;
+                                        should_dispatch = fr.u.lua.pc <= old_pc or old_line != current_line;
+                                    } else {
+                                        should_dispatch = true;
+                                    }
+                                }
+
+                                // Track every opcode, not only opcodes that emitted a
+                                // hook. This is luaG_traceexec's oldpc invariant, kept
+                                // per activation so returning from a child on the same
+                                // source line does not create a synthetic event merely
+                                // because our bytecode density differs from PUC's.
+                                if (!suppress_varargprep) {
+                                    exec_frames.getPtr(ctx.frame_index).u.lua.last_line_pc = @intCast(fr.u.lua.pc);
+                                }
+
+                                if (should_dispatch) {
+                                    th.last_hook_line = current_line;
+                                    if (try self.tryPushBytecodeDebugHook(
+                                        exec_frames,
+                                        ctx.frame_index,
+                                        "line",
+                                        current_line,
+                                        null,
+                                        null,
+                                        1,
+                                        .{ .resume_instruction = .{ .skip_line = true } },
+                                    )) {
+                                        continue :frame_loop;
+                                    }
+                                    self.dispatchBytecodeHook("line", current_line, null) catch |hook_err| {
+                                        if (hook_err == error.Yield) {
+                                            self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.u.lua.pc, false, yielded_in_place);
+                                        }
+                                        return hook_err;
+                                    };
+                                    // The hook can execute Lua and grow both the shared
+                                    // value stack and runtime-frame array.
+                                    ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                    fr = exec_frames.getPtr(ctx.frame_index);
+                                    ctx.pc = fr.u.lua.pc;
+                                }
+                            } else if (ctx.cur_proto.lineinfo.len == 0 and th.last_hook_line != -2) {
+                                // Stripped chunks still produce one line event at the
+                                // first instruction, with no line number.
+                                const skip_replayed_hook = hook_state.skip_bc_line_once;
+                                if (skip_replayed_hook) hook_state.skip_bc_line_once = false;
+                                th.last_hook_line = -2;
+                                if (!skip_replayed_hook) {
+                                    if (try self.tryPushBytecodeDebugHook(
+                                        exec_frames,
+                                        ctx.frame_index,
+                                        "line",
+                                        null,
+                                        null,
+                                        null,
+                                        1,
+                                        .{ .resume_instruction = .{ .skip_line = true } },
+                                    )) {
+                                        continue :frame_loop;
+                                    }
+                                    self.dispatchBytecodeHook("line", null, null) catch |hook_err| {
+                                        if (hook_err == error.Yield) {
+                                            self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.u.lua.pc, false, yielded_in_place);
+                                        }
+                                        return hook_err;
+                                    };
+                                    ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                    fr = exec_frames.getPtr(ctx.frame_index);
+                                    ctx.pc = fr.u.lua.pc;
                                 }
                             }
-                            if (!skip_replayed_hook and hook_state.skip_bc_line_once) {
-                                skip_replayed_hook = true;
-                                hook_state.skip_bc_line_once = false;
-                            }
+                        }
 
-                            // PUC starts tracing a vararg function after OP_VARARGPREP:
-                            // the first source-visible line is the instruction that
-                            // follows it. Record OP_VARARGPREP as oldpc, but do not
-                            // dispatch a line event for it.
-                            const suppress_varargprep = fr.u.lua.pc == 0 and op == .varargprep;
-                            const previous_pc = exec_frames.getPtr(ctx.frame_index).u.lua.last_line_pc;
-                            var should_dispatch = false;
-                            if (!skip_replayed_hook and !suppress_varargprep) {
-                                if (previous_pc != INVALID_PC) {
-                                    const old_pc: usize = previous_pc;
-                                    const old_line: i64 = if (old_pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[old_pc] != 0)
-                                        @intCast(ctx.cur_proto.lineinfo[old_pc])
-                                    else
-                                        current_line;
-                                    should_dispatch = fr.u.lua.pc <= old_pc or old_line != current_line;
+                        if (hook_state.count > 0 and !self.isInDebugHook() and self.debug_hooks_suppressed == 0) {
+                            // TODO(count-hook-codegen-parity, remove before 1.0.0):
+                            // The direct bytecode codegen currently emits MOVE and
+                            // LOADNIL as register-allocation/cleanup bookkeeping more
+                            // often than PUC Lua. Do not charge those implementation
+                            // details to the user-visible instruction count; otherwise
+                            // tight loops fire count hooks roughly twice as often as
+                            // the reference VM. Removal criterion: db.lua count-hook
+                            // assertions pass when every dispatched instruction
+                            // decrements the hook budget.
+                            var count_this_inst = op != .move and op != .loadnil and op != .close;
+                            if (fr.u.lua.resume_skip_count_pc != INVALID_PC) {
+                                const skip_pc = fr.u.lua.resume_skip_count_pc;
+                                if (skip_pc == @as(u32, @intCast(fr.u.lua.pc))) {
+                                    // A count hook yielded before this opcode ran. On
+                                    // resume, execute that opcode without immediately
+                                    // firing the same hook again.
+                                    count_this_inst = false;
+                                    fr.u.lua.resume_skip_count_pc = INVALID_PC;
                                 } else {
-                                    should_dispatch = true;
+                                    fr.u.lua.resume_skip_count_pc = INVALID_PC;
                                 }
-                            }
-
-                            // Track every opcode, not only opcodes that emitted a
-                            // hook. This is luaG_traceexec's oldpc invariant, kept
-                            // per activation so returning from a child on the same
-                            // source line does not create a synthetic event merely
-                            // because our bytecode density differs from PUC's.
-                            if (!suppress_varargprep) {
-                                exec_frames.getPtr(ctx.frame_index).u.lua.last_line_pc = @intCast(fr.u.lua.pc);
-                            }
-
-                            if (should_dispatch) {
-                                th.last_hook_line = current_line;
-                                if (try self.tryPushBytecodeDebugHook(
-                                    exec_frames,
-                                    ctx.frame_index,
-                                    "line",
-                                    current_line,
-                                    null,
-                                    null,
-                                    1,
-                                    .{ .resume_instruction = .{ .skip_line = true } },
-                                )) {
-                                    continue :frame_loop;
-                                }
-                                self.dispatchBytecodeHook("line", current_line, null) catch |hook_err| {
-                                    if (hook_err == error.Yield) {
-                                        self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.u.lua.pc, false, yielded_in_place);
-                                    }
-                                    return hook_err;
-                                };
-                                // The hook can execute Lua and grow both the shared
-                                // value stack and runtime-frame array.
-                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                                fr = exec_frames.getPtr(ctx.frame_index);
-                                ctx.pc = fr.u.lua.pc;
-                            }
-                        } else if (ctx.cur_proto.lineinfo.len == 0 and th.last_hook_line != -2) {
-                            // Stripped chunks still produce one line event at the
-                            // first instruction, with no line number.
-                            const skip_replayed_hook = hook_state.skip_bc_line_once;
-                            if (skip_replayed_hook) hook_state.skip_bc_line_once = false;
-                            th.last_hook_line = -2;
-                            if (!skip_replayed_hook) {
-                                if (try self.tryPushBytecodeDebugHook(
-                                    exec_frames,
-                                    ctx.frame_index,
-                                    "line",
-                                    null,
-                                    null,
-                                    null,
-                                    1,
-                                    .{ .resume_instruction = .{ .skip_line = true } },
-                                )) {
-                                    continue :frame_loop;
-                                }
-                                self.dispatchBytecodeHook("line", null, null) catch |hook_err| {
-                                    if (hook_err == error.Yield) {
-                                        self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.u.lua.pc, false, yielded_in_place);
-                                    }
-                                    return hook_err;
-                                };
-                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                                fr = exec_frames.getPtr(ctx.frame_index);
-                                ctx.pc = fr.u.lua.pc;
-                            }
-                        }
-                    }
-
-                    if (hook_state.count > 0 and !self.isInDebugHook() and self.debug_hooks_suppressed == 0) {
-                        // TODO(count-hook-codegen-parity, remove before 1.0.0):
-                        // The direct bytecode codegen currently emits MOVE and
-                        // LOADNIL as register-allocation/cleanup bookkeeping more
-                        // often than PUC Lua. Do not charge those implementation
-                        // details to the user-visible instruction count; otherwise
-                        // tight loops fire count hooks roughly twice as often as
-                        // the reference VM. Removal criterion: db.lua count-hook
-                        // assertions pass when every dispatched instruction
-                        // decrements the hook budget.
-                        var count_this_inst = op != .move and op != .loadnil and op != .close;
-                        if (fr.u.lua.resume_skip_count_pc != INVALID_PC) {
-                            const skip_pc = fr.u.lua.resume_skip_count_pc;
-                            if (skip_pc == @as(u32, @intCast(fr.u.lua.pc))) {
-                                // A count hook yielded before this opcode ran. On
-                                // resume, execute that opcode without immediately
-                                // firing the same hook again.
+                            } else if (hook_state.skip_count_once) {
+                                hook_state.skip_count_once = false;
                                 count_this_inst = false;
-                                fr.u.lua.resume_skip_count_pc = INVALID_PC;
-                            } else {
-                                fr.u.lua.resume_skip_count_pc = INVALID_PC;
                             }
-                        } else if (hook_state.skip_count_once) {
-                            hook_state.skip_count_once = false;
-                            count_this_inst = false;
-                        }
 
-                        if (count_this_inst) {
-                            hook_state.budget -= 1;
-                            if (hook_state.budget <= 0) {
-                                hook_state.budget = hook_state.count;
-                                if (try self.tryPushBytecodeDebugHook(
-                                    exec_frames,
-                                    ctx.frame_index,
-                                    "count",
-                                    null,
-                                    null,
-                                    null,
-                                    1,
-                                    .{ .resume_instruction = .{ .skip_count = true } },
-                                )) {
-                                    continue :frame_loop;
-                                }
-                                self.dispatchBytecodeHook("count", null, null) catch |hook_err| {
-                                    if (hook_err == error.Yield) {
-                                        self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.u.lua.pc, true, yielded_in_place);
+                            if (count_this_inst) {
+                                hook_state.budget -= 1;
+                                if (hook_state.budget <= 0) {
+                                    hook_state.budget = hook_state.count;
+                                    if (try self.tryPushBytecodeDebugHook(
+                                        exec_frames,
+                                        ctx.frame_index,
+                                        "count",
+                                        null,
+                                        null,
+                                        null,
+                                        1,
+                                        .{ .resume_instruction = .{ .skip_count = true } },
+                                    )) {
+                                        continue :frame_loop;
                                     }
-                                    return hook_err;
-                                };
-                                // A hook can recursively run Lua and reallocate
-                                // both arrays used by the explicit dispatch loop.
-                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                                fr = exec_frames.getPtr(ctx.frame_index);
-                                ctx.pc = fr.u.lua.pc;
+                                    self.dispatchBytecodeHook("count", null, null) catch |hook_err| {
+                                        if (hook_err == error.Yield) {
+                                            self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.u.lua.pc, true, yielded_in_place);
+                                        }
+                                        return hook_err;
+                                    };
+                                    // A hook can recursively run Lua and reallocate
+                                    // both arrays used by the explicit dispatch loop.
+                                    ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                    fr = exec_frames.getPtr(ctx.frame_index);
+                                    ctx.pc = fr.u.lua.pc;
+                                }
                             }
                         }
                     }
-                }
                 } // end combined dispatch gate (P16.19 T5-A)
                 // PUC does not check GC every instruction. GC steps happen
                 // only at allocation sites via condGcFromDispatch (OP_CONCAT,
@@ -13377,7 +13389,7 @@ pub const Vm = struct {
                             // unnecessary. (Was: rawGet funnel; rawGet was
                             // 10% of the field_access profile.)
                             if (self.stats.enabled) self.stats.tbl_get_fast_str += 1; // P16.0b (constant string key)
-            ctx.regs[a] = if (ltable.nodeLookupStr(env.Table.hash, key.String)) |node|
+                            ctx.regs[a] = if (ltable.nodeLookupStr(env.Table.hash, key.String)) |node|
                                 node.value
                             else
                                 .Nil;
@@ -14779,7 +14791,10 @@ pub const Vm = struct {
                     // --- Control flow ---
                     .jmp => {
                         ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + inst.jumpOffset() + 1);
-                        if (check_sigint and signal_int_pending.load(.acquire)) { signal_int_pending.store(false, .release); return self.fail("interrupted!", .{}); }
+                        if (check_sigint and signal_int_pending.load(.acquire)) {
+                            signal_int_pending.store(false, .release);
+                            return self.fail("interrupted!", .{});
+                        }
                         continue;
                     },
 
@@ -14860,7 +14875,10 @@ pub const Vm = struct {
                             // P16.10 T8: Tail call reuses the frame (pc=0) —
                             // refresh sigint_trap like a backward jump.
                             .continue_no_advance => {
-                                if (check_sigint and signal_int_pending.load(.acquire)) { signal_int_pending.store(false, .release); return self.fail("interrupted!", .{}); }
+                                if (check_sigint and signal_int_pending.load(.acquire)) {
+                                    signal_int_pending.store(false, .release);
+                                    return self.fail("interrupted!", .{});
+                                }
                                 continue;
                             },
                             .continue_frame_loop => continue :frame_loop,
@@ -14936,7 +14954,10 @@ pub const Vm = struct {
                                 const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
                                 const off: i16 = @bitCast(off_bits);
                                 ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
-                                if (check_sigint and signal_int_pending.load(.acquire)) { signal_int_pending.store(false, .release); return self.fail("interrupted!", .{}); }
+                                if (check_sigint and signal_int_pending.load(.acquire)) {
+                                    signal_int_pending.store(false, .release);
+                                    return self.fail("interrupted!", .{});
+                                }
                                 continue;
                             }
                         } else {
@@ -14952,7 +14973,10 @@ pub const Vm = struct {
                                 const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
                                 const off: i16 = @bitCast(off_bits);
                                 ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
-                                if (check_sigint and signal_int_pending.load(.acquire)) { signal_int_pending.store(false, .release); return self.fail("interrupted!", .{}); }
+                                if (check_sigint and signal_int_pending.load(.acquire)) {
+                                    signal_int_pending.store(false, .release);
+                                    return self.fail("interrupted!", .{});
+                                }
                                 continue;
                             }
                         }
@@ -14975,7 +14999,10 @@ pub const Vm = struct {
                             const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
                             const off: i16 = @bitCast(off_bits);
                             ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
-                            if (check_sigint and signal_int_pending.load(.acquire)) { signal_int_pending.store(false, .release); return self.fail("interrupted!", .{}); }
+                            if (check_sigint and signal_int_pending.load(.acquire)) {
+                                signal_int_pending.store(false, .release);
+                                return self.fail("interrupted!", .{});
+                            }
                             continue;
                         }
                     },
@@ -14984,7 +15011,10 @@ pub const Vm = struct {
                         const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
                         const off: i16 = @bitCast(off_bits);
                         ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
-                        if (check_sigint and signal_int_pending.load(.acquire)) { signal_int_pending.store(false, .release); return self.fail("interrupted!", .{}); }
+                        if (check_sigint and signal_int_pending.load(.acquire)) {
+                            signal_int_pending.store(false, .release);
+                            return self.fail("interrupted!", .{});
+                        }
                         continue;
                     },
 
@@ -18890,13 +18920,7 @@ pub const Vm = struct {
                 else => return self.fail("collectgarbage('param', ...) expects parameter name", .{}),
             };
             // PUC lbaslib.c:237-244 maps param names to LUA_GCP* indices.
-            const idx: i32 = if (std.mem.eql(u8, pname, "minormul")) 0
-                else if (std.mem.eql(u8, pname, "majorminor")) 1
-                else if (std.mem.eql(u8, pname, "minormajor")) 2
-                else if (std.mem.eql(u8, pname, "pause")) 3
-                else if (std.mem.eql(u8, pname, "stepmul")) 4
-                else if (std.mem.eql(u8, pname, "stepsize")) 5
-                else return self.fail("collectgarbage: unknown param '{s}'", .{pname});
+            const idx: i32 = if (std.mem.eql(u8, pname, "minormul")) 0 else if (std.mem.eql(u8, pname, "majorminor")) 1 else if (std.mem.eql(u8, pname, "minormajor")) 2 else if (std.mem.eql(u8, pname, "pause")) 3 else if (std.mem.eql(u8, pname, "stepmul")) 4 else if (std.mem.eql(u8, pname, "stepsize")) 5 else return self.fail("collectgarbage: unknown param '{s}'", .{pname});
             // PUC: value = optinteger(3, -1); push lua_gc(GCPARAM, p, value).
             const value: i32 = if (args.len >= 3) switch (args[2]) {
                 .Int => |x| @intCast(x),
@@ -20636,79 +20660,79 @@ pub const Vm = struct {
             resolved = try self.resolveCallable(th.callee, exec_args, null);
             resolved_valid = true;
             switch (resolved.callee) {
-            .Builtin => |id| {
-                // Normal path: first run or no preserved Lua frame.
-                if (nouts != 0) {
-                    payload = try self.alloc.alloc(Value, nouts);
-                    payload_heap = true;
-                }
-                self.callBuiltin(id, resolved.args, payload) catch |e| switch (e) {
-                    error.Yield => {
-                        yielded = true;
-                    },
-                    error.RuntimeError => {
-                        if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
-                            forced_close_ok = true;
-                        } else {
-                            ok = false;
-                        }
-                    },
-                    else => return e,
-                };
-            },
-            .Closure => |cl| {
-                if (cl.proto != null and !self.bytecode_coroutine_trampoline_active) {
-                    const step = try self.driveBytecodeCoroutineTrampoline(th, cl, resolved.args);
-                    switch (step) {
-                        .returned => |ret| {
-                            payload = ret;
-                            payload_heap = true;
-                        },
-                        .yielded => |ret| {
-                            if (ret.len > 0) {
-                                payload = ret;
-                                payload_heap = true;
-                            }
-                            yielded = true;
-                        },
-                        .failed => {
-                            ok = false;
-                        },
-                        .forced_close => {
-                            forced_close_ok = true;
-                        },
-                    }
-                } else {
-                    const ret_opt: ?[]Value = retblk: {
-                        const r = self.runClosure(cl, resolved.args) catch |e| switch (e) {
-                            error.Yield => {
-                                yielded = true;
-                                break :retblk null;
-                            },
-                            error.RuntimeError => {
-                                if (th.yielded.slice() != null and th.capture_yield_id != 0) {
-                                    yielded = true;
-                                    break :retblk null;
-                                }
-                                if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
-                                    forced_close_ok = true;
-                                } else {
-                                    ok = false;
-                                }
-                                break :retblk null;
-                            },
-                            error.ThreadSwitch => return error.ThreadSwitch,
-                            error.OutOfMemory => return error.OutOfMemory,
-                        };
-                        break :retblk r;
-                    };
-                    if (ret_opt) |ret| {
-                        payload = ret;
+                .Builtin => |id| {
+                    // Normal path: first run or no preserved Lua frame.
+                    if (nouts != 0) {
+                        payload = try self.alloc.alloc(Value, nouts);
                         payload_heap = true;
                     }
-                }
-            },
-            else => return self.fail("coroutine.resume: bad thread", .{}),
+                    self.callBuiltin(id, resolved.args, payload) catch |e| switch (e) {
+                        error.Yield => {
+                            yielded = true;
+                        },
+                        error.RuntimeError => {
+                            if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
+                                forced_close_ok = true;
+                            } else {
+                                ok = false;
+                            }
+                        },
+                        else => return e,
+                    };
+                },
+                .Closure => |cl| {
+                    if (cl.proto != null and !self.bytecode_coroutine_trampoline_active) {
+                        const step = try self.driveBytecodeCoroutineTrampoline(th, cl, resolved.args);
+                        switch (step) {
+                            .returned => |ret| {
+                                payload = ret;
+                                payload_heap = true;
+                            },
+                            .yielded => |ret| {
+                                if (ret.len > 0) {
+                                    payload = ret;
+                                    payload_heap = true;
+                                }
+                                yielded = true;
+                            },
+                            .failed => {
+                                ok = false;
+                            },
+                            .forced_close => {
+                                forced_close_ok = true;
+                            },
+                        }
+                    } else {
+                        const ret_opt: ?[]Value = retblk: {
+                            const r = self.runClosure(cl, resolved.args) catch |e| switch (e) {
+                                error.Yield => {
+                                    yielded = true;
+                                    break :retblk null;
+                                },
+                                error.RuntimeError => {
+                                    if (th.yielded.slice() != null and th.capture_yield_id != 0) {
+                                        yielded = true;
+                                        break :retblk null;
+                                    }
+                                    if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
+                                        forced_close_ok = true;
+                                    } else {
+                                        ok = false;
+                                    }
+                                    break :retblk null;
+                                },
+                                error.ThreadSwitch => return error.ThreadSwitch,
+                                error.OutOfMemory => return error.OutOfMemory,
+                            };
+                            break :retblk r;
+                        };
+                        if (ret_opt) |ret| {
+                            payload = ret;
+                            payload_heap = true;
+                        }
+                    }
+                },
+                else => return self.fail("coroutine.resume: bad thread", .{}),
             }
         }
 
@@ -20721,7 +20745,6 @@ pub const Vm = struct {
             self.err_source = null;
             self.err_line = -1;
         }
-
 
         if (!want_out) {
             // Caller ignores results. Still follow resume semantics and do not throw.
@@ -21203,11 +21226,11 @@ pub const Vm = struct {
                 gcSetGray(p.marked);
             },
             .old1, .old => {
-                    p.age.* = .touched1;
-                    // PUC linkobjgclist: paint gray and add to grayagain.
-                    gcSetGray(p.marked);
-                    try self.gc_grayagain.append(self.alloc, owner);
-                },
+                p.age.* = .touched1;
+                // PUC linkobjgclist: paint gray and add to grayagain.
+                gcSetGray(p.marked);
+                try self.gc_grayagain.append(self.alloc, owner);
+            },
         }
     }
 
@@ -22236,12 +22259,10 @@ pub const Vm = struct {
                     // currentwhite) are not re-marked and get collected.
                     switch (p.age.*) {
                         .touched1 => {
-
                             try self.gc_grayagain.append(self.alloc, obj);
                         },
                         .touched2 => {
                             p.age.* = .old;
-
                         },
                         else => {
                             // Threads and other objects kept in grayagain
@@ -22858,7 +22879,6 @@ pub const Vm = struct {
     fn gcMinorCollection(self: *Vm) DispatchError!void {
         if (self.gc_busy) return;
 
-
         self.gc_busy = true;
         self.gc_minor_cycle = true;
         defer {
@@ -23183,9 +23203,7 @@ pub const Vm = struct {
                 if (@import("builtin").mode == .Debug) {
                     if (stdio.activeEnviron().containsConstant("LUAZIG_CELL_SWEEP_DEBUG")) {
                         const color: []const u8 =
-                            if ((c.gc_marked & BLACKBIT) != 0) "black"
-                            else if ((c.gc_marked & WHITEBITS) != 0) "white"
-                            else "gray";
+                            if ((c.gc_marked & BLACKBIT) != 0) "black" else if ((c.gc_marked & WHITEBITS) != 0) "white" else "gray";
                         std.debug.print(
                             "cell sweep: open={} color={s} age={s} gc_index={}\n",
                             .{ c.isOpen(), color, @tagName(c.gc_age), c.gc_index },
@@ -25241,7 +25259,9 @@ pub const Vm = struct {
         // --- Collect source bytes (reader-function or string) ---
         const source_is_reader = reader_val != .String;
         var source_owned: ?[]const u8 = null;
-        defer { if (source_owned) |b| self.alloc.free(b); }
+        defer {
+            if (source_owned) |b| self.alloc.free(b);
+        }
         const source_str: ?*LuaString = switch (reader_val) {
             .String => |x| x,
             else => null,
@@ -25312,7 +25332,9 @@ pub const Vm = struct {
         const prefix = stripChunkPrefix(s, allow_shebang);
         var chunk_bytes = prefix.bytes;
         var prefixed_buf: ?[]u8 = null;
-        defer { if (prefixed_buf) |b| self.alloc.free(b); }
+        defer {
+            if (prefixed_buf) |b| self.alloc.free(b);
+        }
         if (prefix.had_shebang and !(chunk_bytes.len > 0 and chunk_bytes[0] == 0x1b)) {
             prefixed_buf = try self.alloc.alloc(u8, chunk_bytes.len + 1);
             prefixed_buf.?[0] = '\n';
@@ -42961,8 +42983,7 @@ test "vm: Task 7.1 — fixed undump metadata allocation failure → no leak" {
     defer arena.deinit();
     const aalloc = arena.allocator();
 
-    const serialized = try dumpTestProtoStripped(aalloc,
-        "X = X + 1; Y = 'hello'\n");
+    const serialized = try dumpTestProtoStripped(aalloc, "X = X + 1; Y = 'hello'\n");
     defer aalloc.free(serialized);
 
     var fail_idx: usize = 0;
@@ -43011,8 +43032,7 @@ test "vm: Task 7.2 — closure creation failure AFTER borrow established → no 
     const aalloc = arena.allocator();
 
     // Serialize a proto for fixed-buffer loading.
-    const serialized = try dumpTestProtoStripped(aalloc,
-        "X = X + 1; Y = 'hello'\n");
+    const serialized = try dumpTestProtoStripped(aalloc, "X = X + 1; Y = 'hello'\n");
     defer aalloc.free(serialized);
 
     // The borrowed buffer: allocated from the arena. The tree must never
@@ -43099,8 +43119,7 @@ test "vm: Task 7.3 — source-backing .owned append in fixed mode (happy path)" 
     defer arena.deinit();
     const aalloc = arena.allocator();
 
-    const serialized = try dumpTestProtoStripped(aalloc,
-        "return 'hello'\n");
+    const serialized = try dumpTestProtoStripped(aalloc, "return 'hello'\n");
     defer aalloc.free(serialized);
 
     var vm = Vm.init(aalloc, false);
@@ -43142,8 +43161,7 @@ test "vm: Task 7.4 — truncated fixed chunk at aligned blocks → clean error" 
     defer arena.deinit();
     const aalloc = arena.allocator();
 
-    const serialized = try dumpTestProtoStripped(aalloc,
-        "X = X + 1; Y = 'hello world'\n");
+    const serialized = try dumpTestProtoStripped(aalloc, "X = X + 1; Y = 'hello world'\n");
     defer aalloc.free(serialized);
 
     // Test truncation at every byte position in the chunk. Each must

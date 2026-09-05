@@ -2157,18 +2157,36 @@ pub const Thread = struct {
     /// P16.23 T6: PUC LUAI_MAXCCALLS (llimits.h) — nested C-call limit
     /// (lower 16 bits of nCcalls). One named constant, no scattered 200s.
     pub const LUA_MAX_C_CALLS: u16 = 200;
-    /// PUC ldo.c ccall increments: plain yieldable call (+1 lower depth)...
-    pub const CCALL_INC_YIELDABLE: u32 = 1;
-    /// ...and nyci — non-yieldable (+1 upper nny AND +1 lower depth).
-    pub const CCALL_INC_NOYIELD: u32 = 0x10000 | 1;
+    /// P16.24 T3: the CLOSED set of legal C-call boundary kinds (PUC
+    /// ldo.c ccall increments), as a type — call sites say WHAT boundary
+    /// they own, never raw packed integers:
+    ///   yieldable   — luaD_call: +1 lower C depth (ci);
+    ///   nonyieldable— luaD_callnoyield: +1 lower AND +1 nny (nyci);
+    ///   resume_body — coroutine body: the resume entry already owns the
+    ///                 unit (PUC resume calls ccall with inc 0).
+    pub const CCallMode = enum {
+        yieldable,
+        nonyieldable,
+        resume_body,
+
+        /// PUC packed increment for this mode (lstate.h ci/nyci encoding).
+        pub inline fn increment(self: CCallMode) u32 {
+            return switch (self) {
+                .yieldable => 1,
+                .nonyieldable => 0x10000 | 1,
+                // PUC ldo.c resume: ccall(L, ..., 0) — no extra unit.
+                .resume_body => 0,
+            };
+        }
+    };
 
     /// PUC ldo.c `ccall` exit half: nCcalls -= inc. Pairs with
     /// `Vm.ccallEnter` via defer. (No RAII scope object: yield boundaries
     /// park the C frame ACROSS the boundary, so an automatic scope end
     /// could decrement too early — explicit enter/exit at the same
     /// control-flow level as the synchronous call.)
-    pub fn ccallExit(th: *Thread, inc: u32) void {
-        th.nCcalls -%= inc;
+    pub fn ccallExit(th: *Thread, mode: Thread.CCallMode) void {
+        th.nCcalls -%= mode.increment();
     }
 
     pub fn incnny(th: *Thread) void {
@@ -5528,15 +5546,15 @@ pub const Vm = struct {
         return self.gcControl(what, 0, -1);
     }
 
-    pub fn apiCall(self: *Vm, ccall_inc: u32, callee: Value, args: []const Value) Error![]Value {
-        // P16.23 T6: PUC ldo.c ccall — every synchronous call THROUGH the
-        // C API consumes one C-depth unit (lower 16 bits) and, for the
-        // non-yieldable variant, one nny unit. Direct VM→builtin calls do
-        // NOT pass through here (PUC precall adds no depth), preserving the
-        // PUC distinction.
+    pub fn apiCall(self: *Vm, ccall_mode: Thread.CCallMode, callee: Value, args: []const Value) Error![]Value {
+        // P16.24 T2: SINGLE-OWNER C-call boundary — this function is the
+        // one layer that owns the depth unit for calls through the C API
+        // (PUC ldo.c ccall; direct VM→builtin precall adds no depth).
+        // Callers that already own a boundary must use a raw executor, not
+        // this wrapper — never nest two owners on one boundary.
         const th = self.activeBytecodeThread();
-        try exposeDispatchResult(void, self.ccallEnter(th, ccall_inc));
-        defer th.ccallExit(ccall_inc);
+        try exposeDispatchResult(void, self.ccallEnter(th, ccall_mode));
+        defer th.ccallExit(ccall_mode);
         const resolved = try exposeDispatchResult(ResolvedCall, self.resolveCallable(callee, args, null));
         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
         switch (resolved.callee) {
@@ -5707,11 +5725,12 @@ pub const Vm = struct {
     /// luaE_checkcstack). On failure the increment is rolled back so the
     /// error path cannot underflow. This is THE single C-call boundary
     /// model — no local depth counters anywhere (P16.23 T6).
-    pub fn ccallEnter(self: *Vm, th: *Thread, inc: u32) DispatchError!void {
+    pub fn ccallEnter(self: *Vm, th: *Thread, mode: Thread.CCallMode) DispatchError!void {
+        const inc = mode.increment();
         th.nCcalls +%= inc;
         if (th.getCcalls() >= Thread.LUA_MAX_C_CALLS) {
             th.nCcalls -%= inc;
-            return self.fail("C stack overflow", .{});
+            return self.failRunerror("C stack overflow", .{});
         }
     }
 
@@ -5742,16 +5761,15 @@ pub const Vm = struct {
                 }
             }
         }
-        // P16.23 T6: PUC lua_callk — k (and yieldable) uses the yieldable
-        // increment (plain +1 depth); no k is luaD_callnoyield (nyci: nny
-        // + depth). The old bare incnny/decnny is superseded by ccall.
-        const ccall_inc: u32 = if (k != null)
-            Thread.CCALL_INC_YIELDABLE
+        // P16.24 T2: PUC lua_callk — k (and yieldable) = luaD_call
+        // (yieldable); no k = luaD_callnoyield. The boundary is owned
+        // ONCE, by apiCall — the P16.23 double ccallEnter here was the
+        // factor-of-two coroutine regression (suite 20_ccall_depth B).
+        const ccall_mode: Thread.CCallMode = if (k != null)
+            .yieldable
         else
-            Thread.CCALL_INC_NOYIELD;
-        try exposeDispatchResult(void, self.ccallEnter(th, ccall_inc));
-        defer th.ccallExit(ccall_inc);
-        return self.apiCall(ccall_inc, callee, args);
+            .nonyieldable;
+        return self.apiCall(ccall_mode, callee, args);
     }
 
     /// Shared core of PUC `lua_pcallk` yieldable path (lapi.c:1097-1117):
@@ -5805,7 +5823,7 @@ pub const Vm = struct {
         // P16.23 T6: pcallk yieldable path — DEPTH-ONLY inc (the C-frame
         // continuation machinery owns yield semantics; an nny unit would
         // block yield-through-pcallk, regressing c_api 10_continuations t2).
-        const ret = self.apiCall(Thread.CCALL_INC_YIELDABLE, callee, args) catch |e| {
+        const ret = self.apiCall(.yieldable, callee, args) catch |e| {
             // PUC: on error/yield, `luaD_call` longjmps — CIST_YPCALL stays,
             // errfunc stays set. `precover`/`finishpcallk` handles cleanup on
             // resume. Propagate to the caller's regime.
@@ -6401,6 +6419,35 @@ pub const Vm = struct {
         self.err_traceback = aw.toOwnedSlice() catch null;
     }
 
+    /// P16.24 T6-adjacent: PUC luaG_runerror position semantics — bake
+    /// "source:line:" ONLY when the CURRENT frame is a Lua frame; a raise
+    /// from a C function's dynamic extent (e.g. LUAI_MAXCCALLS overflow
+    /// inside lua_call) carries NO position in PUC (isLua(L->ci) false).
+    /// `fail()` keeps topLuaFrame() semantics for the luaL_error-family
+    /// (their positions come from luaL_where of the caller).
+    fn failRunerror(self: *Vm, comptime fmt: []const u8, args: anytype) Error {
+        // If the top frame is a Lua frame, behavior == fail() (position of
+        // the current Lua function). Otherwise: bare message.
+        const top_is_lua = blk: {
+            const th = self.activeBytecodeThread();
+            if (th.call_frames.len() == 0) break :blk false;
+            break :blk !th.call_frames.topConstPtr().isC();
+        };
+        if (top_is_lua) return self.fail(fmt, args);
+        self.err_is_errerr = false;
+        var tmp: [2048]u8 = undefined;
+        const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
+        self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
+        self.err_cfunc_label = null;
+        self.err_source = null;
+        self.err_line = -1;
+        self.err_obj = .{ .String = try self.internStr(self.err.?) };
+        self.err_has_obj = true;
+        self.captureErrorTraceback();
+        try self.invokeErrfunc();
+        return error.RuntimeError;
+    }
+
     fn fail(self: *Vm, comptime fmt: []const u8, args: anytype) Error {
         // Fresh error: reset LUA_ERRERR signal before invokeErrfunc.
         self.err_is_errerr = false;
@@ -6685,7 +6732,7 @@ pub const Vm = struct {
             // Save the error object before calling the handler.
             const err_obj = if (self.err_has_obj) self.err_obj else .Nil;
             var call_args = [_]Value{err_obj};
-            const result = self.apiCall(Thread.CCALL_INC_NOYIELD, ef, call_args[0..]) catch {
+            const result = self.apiCall(.nonyieldable, ef, call_args[0..]) catch {
                 // Handler errored — set error to "error in error handling"
                 // (PUC LUA_ERRERR). Don't re-invoke the handler.
                 // Signal LUA_ERRERR (5) to status-determination sites.
@@ -8080,7 +8127,7 @@ pub const Vm = struct {
                 // pops the frame without a completion pass). The owning
                 // protection's snapshot restore makes this belt-and-braces.
                 if (state.repl_ccall_active) {
-                    self.activeBytecodeThread().ccallExit(Thread.CCALL_INC_NOYIELD);
+                    self.activeBytecodeThread().ccallExit(.nonyieldable);
                     state.repl_ccall_active = false;
                 }
                 self.deinitBytecodeGsub(state);
@@ -9602,7 +9649,7 @@ pub const Vm = struct {
                             // protection whose finish restores the snapshot.
                             if (!state.repl_ccall_active) {
                                 const th_g = self.activeBytecodeThread();
-                                try self.ccallEnter(th_g, Thread.CCALL_INC_NOYIELD);
+                                try self.ccallEnter(th_g, .nonyieldable);
                                 state.repl_ccall_active = true;
                             }
                             return .pushed;
@@ -9664,7 +9711,7 @@ pub const Vm = struct {
         // P16.23 T6: the in-flight repl's C-depth unit is complete
         // (paired exit for the guarded enter at the push site).
         if (state.repl_ccall_active) {
-            self.activeBytecodeThread().ccallExit(Thread.CCALL_INC_NOYIELD);
+            self.activeBytecodeThread().ccallExit(.nonyieldable);
             state.repl_ccall_active = false;
         }
         self.clearPendingCall(exec_frames.getPtr(parent_index));
@@ -10028,6 +10075,19 @@ pub const Vm = struct {
 
     /// Prepare a coroutine selected by the trampoline. All allocations happen
     /// before the caller is parked, so OOM cannot leave two runtimes half-active.
+    /// P16.24 T4: THE single PUC resume-entry semantic (lstate.c lua_resume
+    /// + ldo.c resume): the resumed thread inherits the SOURCE thread's
+    /// lower C depth (getCcalls(from) — upper nny bits are NOT copied),
+    /// is limit-checked, and owns exactly one resume unit. Used by BOTH
+    /// the C API (lua_resume) and the Lua-level resume trampoline — no
+    /// second logical counter.
+    pub fn resumeEnterC(self: *Vm, co: *Thread, from: ?*Thread) DispatchError!void {
+        co.nCcalls = if (from) |f| @as(u32, f.getCcalls()) else 0;
+        if (co.getCcalls() >= Thread.LUA_MAX_C_CALLS)
+            return self.fail("C stack overflow", .{});
+        co.nCcalls += 1;
+    }
+
     fn prepareBytecodeCoroutineSwitch(
         self: *Vm,
         request: BytecodeCoroutineSwitchRequest,
@@ -10038,6 +10098,11 @@ pub const Vm = struct {
         std.debug.assert(self.active_runtime_thread == request.caller);
         std.debug.assert(canTrampolineBytecodeThread(target));
 
+        // P16.24 T4: resume-entry depth accounting — the target inherits
+        // the caller's C depth + one unit (PUC lua_resume). The old
+        // separate coroutine_resume_chain counter is superseded by this
+        // shared model.
+        try self.resumeEnterC(target, request.caller);
         const first_start = !target.started and target.entry_args == null;
         if (first_start) target.entry_args = try self.alloc.dupe(Value, request.args);
         try self.setThreadResumeInbox(target, request.args);
@@ -10914,21 +10979,16 @@ pub const Vm = struct {
         var active = initial;
         var first_run = true;
         var needs_call_hook = false;
-        // PUC Lua limits coroutine nesting via LUAI_MAXCCALLS (200): each
-        // lua_resume inherits getCcalls(from)+1, so ~200 nested resumes are
-        // possible before "C stack overflow".  The trampoline is iterative
-        // (no physical C-stack growth), so we simulate this with a logical
-        // chain-depth counter.  PUC's nCcalls tracks C-call depth, NOT total
-        // Lua stack frames — a coroutine with 1000 Lua frames still only
-        // consumes ONE C-call slot.  Do NOT conflate Lua frame count with
-        // C-call depth (the old coroutine_parked_frames metric did this,
-        // capping nesting at 5 coroutines * 1000 frames = 5000 frames).
-        const luai_maxccalls: usize = 200;
+        // P16.24 T4: resume nesting depth is the SHARED nCcalls model —
+        // resumeEnterC in prepareBytecodeCoroutineSwitch inherits
+        // getCcalls(caller)+1 per resume (PUC lua_resume), so nested
+        // resumes share the LUAI_MAXCCALLS budget naturally. A coroutine
+        // with 1000 Lua frames still consumes ONE unit (nCcalls counts
+        // C boundaries, not Lua frames).
         // The initial chain depth accounts for the C-call overhead already
         // on the stack (xpcall/pcall and builtinCoroutineResume itself).
         // This mirrors PUC where getCcalls(from) already includes those
         // frames before lua_resume adds its own +1.
-        var coroutine_resume_chain: usize = self.activeProtectedCallDepth() + 1;
 
         drive: while (true) {
             var step: BytecodeCoroutineStep = undefined;
@@ -11038,17 +11098,19 @@ pub const Vm = struct {
                                     // and continue the trampoline loop.
                                     const request = self.bytecode_coroutine_switch_request orelse return e;
                                     self.bytecode_coroutine_switch_request = null;
-                                    if (coroutine_resume_chain >= luai_maxccalls) {
-                                        self.alloc.free(request.args);
-                                        request.target.caller = request.caller;
-                                        active = request.target;
-                                        coroutine_resume_chain += 1;
-                                        step = .{ .failed = .{ .String = try self.internStr("C stack overflow") } };
-                                        have_step = true;
-                                        continue :drive;
-                                    }
-                                    const first_start = try self.prepareBytecodeCoroutineSwitch(request);
-                                    coroutine_resume_chain += 1;
+                                    // P16.24 T4: depth limit enforced by resumeEnterC inside the switch
+                                    // preparation (shared nCcalls model; the
+                                    // coroutine_resume_chain counter is removed).
+                                    const first_start = self.prepareBytecodeCoroutineSwitch(request) catch |switch_err| switch (switch_err) {
+                                        error.OutOfMemory => return switch_err,
+                                        else => {
+                                            request.target.caller = request.caller;
+                                            active = request.target;
+                                            step = .{ .failed = .{ .String = try self.internStr("C stack overflow") } };
+                                            have_step = true;
+                                            continue :drive;
+                                        },
+                                    };
                                     active = request.target;
                                     needs_call_hook = first_start and !self.isInDebugHook();
                                     first_run = false;
@@ -11094,16 +11156,18 @@ pub const Vm = struct {
                                 // LUAI_MAXCCALLS).  Each coroutine switch adds 1
                                 // to the chain, matching PUC's lua_resume which
                                 // does getCcalls(from)+1 per nesting level.
-                                if (coroutine_resume_chain >= luai_maxccalls) {
-                                    self.alloc.free(request.args);
-                                    request.target.caller = request.caller;
-                                    active = request.target;
-                                    coroutine_resume_chain += 1;
-                                    step = .{ .failed = .{ .String = try self.internStr("C stack overflow") } };
-                                    break :retblk null;
-                                }
-                                const first_start = try self.prepareBytecodeCoroutineSwitch(request);
-                                coroutine_resume_chain += 1;
+                                // P16.24 T4: depth limit enforced by resumeEnterC inside
+                                // the switch preparation (shared nCcalls model; the old
+                                // coroutine_resume_chain counter is removed).
+                                const first_start = self.prepareBytecodeCoroutineSwitch(request) catch |switch_err| switch (switch_err) {
+                                    error.OutOfMemory => return switch_err,
+                                    else => {
+                                        request.target.caller = request.caller;
+                                        active = request.target;
+                                        step = .{ .failed = .{ .String = try self.internStr("C stack overflow") } };
+                                                                            break :retblk null;
+                                    },
+                                };
                                 active = request.target;
                                 needs_call_hook = first_start and !self.isInDebugHook();
                                 first_run = false;
@@ -11182,17 +11246,18 @@ pub const Vm = struct {
                                         error.ThreadSwitch => {
                                             const request = self.bytecode_coroutine_switch_request orelse return @as(DispatchError, e);
                                             self.bytecode_coroutine_switch_request = null;
-                                            if (coroutine_resume_chain >= luai_maxccalls) {
-                                                self.alloc.free(request.args);
-                                                request.target.caller = request.caller;
-                                                active = request.target;
-                                                coroutine_resume_chain += 1;
-                                                step = .{ .failed = .{ .String = try self.internStr("C stack overflow") } };
-                                                have_step = true;
-                                                continue :drive;
-                                            }
-                                            const first_start = try self.prepareBytecodeCoroutineSwitch(request);
-                                            coroutine_resume_chain += 1;
+                                            // P16.24 T4: depth limit enforced by resumeEnterC inside the switch
+                                            // preparation (shared nCcalls model).
+                                            const first_start = self.prepareBytecodeCoroutineSwitch(request) catch |switch_err| switch (switch_err) {
+                                                error.OutOfMemory => return switch_err,
+                                                else => {
+                                                    request.target.caller = request.caller;
+                                                    active = request.target;
+                                                    step = .{ .failed = .{ .String = try self.internStr("C stack overflow") } };
+                                                    have_step = true;
+                                                    continue :drive;
+                                                },
+                                            };
                                             active = request.target;
                                             needs_call_hook = first_start and !self.isInDebugHook();
                                             first_run = false;
@@ -11247,8 +11312,6 @@ pub const Vm = struct {
                 self.current_thread = parent;
                 self.switchRuntime(parent);
                 child.caller = null;
-                std.debug.assert(coroutine_resume_chain > 1);
-                coroutine_resume_chain -= 1;
                 parent.status = .running;
                 active = parent;
 
@@ -11447,6 +11510,15 @@ pub const Vm = struct {
             .saved_error = saved_error,
             .outer_layers = outer_layers,
         };
+        // P16.24 T4/T5: PUC lua_pcallk with a continuation (lbaselib pcall
+        // passes finishpcall) → docallK → luaD_call → ccall(ci=1): the
+        // target consumes ONE YIELDABLE depth unit. The snapshot above
+        // (saved BEFORE this enter) doubles as the unit's exit: every
+        // completion path funnels through finishBytecodeProtectedCall, whose
+        // nCcalls restore removes it; uncaught unwinds are reclaimed by the
+        // OUTER protection's snapshot — one mechanism.
+        try self.ccallEnter(owner, .yieldable);
+        if (@import("builtin").mode == .Debug) std.debug.print("PCALL-UNIT enter nCcalls={d}\n", .{owner.nCcalls});
         try self.setPendingCall(exec_frames.getPtr(parent_index), .{
             .callee = .{ .Builtin = id },
             .completion = .{ .results = .{
@@ -19055,6 +19127,13 @@ pub const Vm = struct {
         }
         self.protected_call_depth += 1;
         defer self.protected_call_depth -= 1;
+        // P16.24 T4/T5: same unit as the iterative pcall path — ONE
+        // YIELDABLE depth unit (PUC pcall-with-continuation → docallK →
+        // luaD_call → ccall(ci=1)). The yieldability itself is owned by
+        // the C-frame continuation machinery (finishpcallk), not by nny.
+        const th_unit = self.activeBytecodeThread();
+        try self.ccallEnter(th_unit, .yieldable);
+        defer th_unit.ccallExit(.yieldable);
         self.enterProtectedCFrame();
         defer self.leaveProtectedCFrame();
         // PUC luaD_pcall: clear errfunc for the duration of pcall — pcall
@@ -20243,6 +20322,12 @@ pub const Vm = struct {
             if (pt.status == .running) pt.status = .suspended;
         }
         const prev_runtime_thread = self.active_runtime_thread.?;
+        // P16.24 T4: resume-entry depth semantics — the shared resumeEnterC
+        // (PUC lua_resume: inherit getCcalls(from), check, own one unit).
+        // This builtin's own runtime switch is the Lua-level equivalent of
+        // lua_resume; the trampoline switch (prepareBytecodeCoroutineSwitch)
+        // uses the SAME helper — one model, no second counter.
+        try self.resumeEnterC(th, prev_runtime_thread);
         // P15.33: Set current_thread before switchRuntime so refreshHooksCached
         // reads the target thread's hook state.
         self.current_thread = th;
@@ -33418,8 +33503,8 @@ pub const Vm = struct {
     fn tableGetFromNonYieldableC(self: *Vm, table: *Table, key: Value) DispatchError!Value {
         // P16.23 T6: PUC luaD_callnoyield equivalent — nyci (nny + depth).
         const th = self.activeBytecodeThread();
-        try self.ccallEnter(th, Thread.CCALL_INC_NOYIELD);
-        defer th.ccallExit(Thread.CCALL_INC_NOYIELD);
+        try self.ccallEnter(th, .nonyieldable);
+        defer th.ccallExit(.nonyieldable);
         return self.tableGetValue(table, key);
     }
 
@@ -33447,8 +33532,8 @@ pub const Vm = struct {
         // C-depth unit, so recursive gsub is bounded by LUAI_MAXCCALLS —
         // the general ccall model, replacing the old local guard.
         const th = self.activeBytecodeThread();
-        try self.ccallEnter(th, Thread.CCALL_INC_NOYIELD);
-        defer th.ccallExit(Thread.CCALL_INC_NOYIELD);
+        try self.ccallEnter(th, .nonyieldable);
+        defer th.ccallExit(.nonyieldable);
         return switch (resolved.callee) {
             .Builtin => |id| blk: {
                 const out_len = self.builtinOutLen(id, resolved.args);
@@ -38794,7 +38879,7 @@ pub const Vm = struct {
                 const fn_idx = st.items.len - nargs - 1;
                 const callee = st.items[fn_idx];
                 const call_args = st.items[fn_idx + 1 ..];
-                const ret = try self.apiCall(Thread.CCALL_INC_NOYIELD, callee, call_args);
+                const ret = try self.apiCall(.nonyieldable, callee, call_args);
                 defer self.alloc.free(ret);
                 st.items.len = fn_idx;
                 const want: usize = if (nresults < 0) ret.len else @as(usize, @intCast(nresults));
@@ -40048,7 +40133,7 @@ pub const Vm = struct {
                 if (t_global != .Table) return self.fail("testC sethook: T table missing", .{});
                 const mk = self.getFieldOpt(t_global.Table, "makeCfunc") orelse return self.fail("testC sethook: makeCfunc missing", .{});
                 var hook_args = [_]Value{.{ .String = try self.internStr(hook_body) }};
-                const ret = try self.apiCall(Thread.CCALL_INC_NOYIELD, mk, hook_args[0..]);
+                const ret = try self.apiCall(.nonyieldable, mk, hook_args[0..]);
                 defer self.alloc.free(ret);
                 hook_fn = if (ret.len > 0) ret[0] else .Nil;
 
@@ -40131,7 +40216,7 @@ pub const Vm = struct {
                 const saved_errfunc = th_xpcall.errfunc;
                 th_xpcall.errfunc = ERRFUNC_NONE;
                 defer th_xpcall.errfunc = saved_errfunc;
-                const ret = self.apiCall(Thread.CCALL_INC_NOYIELD, callee, call_args) catch {
+                const ret = self.apiCall(.nonyieldable, callee, call_args) catch {
                     const errv = self.protectedErrorValue();
                     if (isTestcMemoryErrorValue(errv)) {
                         // This VM does not have PUC Lua's real collector yet.
@@ -40152,7 +40237,7 @@ pub const Vm = struct {
                     st.items.len = call_idx;
                     if (handler_val) |h| {
                         var hargs = [_]Value{handler_errv};
-                        const hret = self.apiCall(Thread.CCALL_INC_NOYIELD, h, hargs[0..]) catch {
+                        const hret = self.apiCall(.nonyieldable, h, hargs[0..]) catch {
                             try st.append(self.alloc, errv);
                             last_status.* = "ERRRUN";
                             return null;
@@ -41220,7 +41305,7 @@ test "vm: callCFunction dispatches a c_func closure" {
 
     // apiCall (pub) -> resolveCallable -> runClosure -> callCFunction.
     const args = [_]Value{.{ .Int = 21 }};
-    const ret = try vm.apiCall(Thread.CCALL_INC_NOYIELD, .{ .Closure = cl }, args[0..]);
+    const ret = try vm.apiCall(.nonyieldable, .{ .Closure = cl }, args[0..]);
     defer vm.alloc.free(ret);
 
     try testing.expectEqual(@as(usize, 1), ret.len);
@@ -41254,7 +41339,7 @@ test "vm: callCFunction with zero results" {
     cl.* = .{ .upvalues = &.{}, .c_func = noop };
     try vm.gcRegisterClosure(cl);
 
-    const ret = try vm.apiCall(Thread.CCALL_INC_NOYIELD, .{ .Closure = cl }, &.{});
+    const ret = try vm.apiCall(.nonyieldable, .{ .Closure = cl }, &.{});
     defer vm.alloc.free(ret);
 
     try testing.expectEqual(@as(usize, 0), ret.len);

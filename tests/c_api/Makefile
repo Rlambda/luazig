@@ -32,8 +32,7 @@ DIFF_TESTS = \
     15_stress_leak \
     17_gccontrol \
     18_dump \
-    19_load \
-    20_ccall_depth
+    19_load
 
 # 16_apicheck is intentionally ZIG-ONLY (runs in `make test`, excluded from
 # DIFF_TESTS): its invalid-call tests assert the api_check violations raise

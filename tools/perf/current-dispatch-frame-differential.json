@@ -1227,5 +1227,9 @@
         "ratio_zig_over_puc": 3.014
       }
     }
+  },
+  "p16_24_update": {
+    "measured_source_head": "2c998b6",
+    "note": "T9 remeasure: opReturn ~110, entry ~47(+pending-check ~58 total), pushStaged 68.6, core +119 (switch-line redistribution), cy string-key cluster 670 i/it (2.68x). C-boundary refactor changed no hot-path counts (cold only)."
   }
 }

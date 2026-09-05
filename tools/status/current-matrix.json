@@ -1,29 +1,29 @@
 {
   "meta": {
-    "created_utc": "2026-09-05T13:12:19.314955+00:00",
+    "created_utc": "2026-09-05T20:26:08.641560+00:00",
     "lane": "testes_matrix",
     "argv": [
       "tools/testes_matrix.py",
       "--testc",
       "--diff",
       "--json-out",
-      "/tmp/opencode/matrix23c.json"
+      "/tmp/opencode/matrix24c.json"
     ],
     "zig_version": "0.16.0"
   },
   "provenance": {
-    "git_head": "ea3ed46",
-    "measured_source_head": "ea3ed46",
+    "git_head": "2c998b6",
+    "measured_source_head": "2c998b6",
     "git_dirty": "clean",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "b4626dbb6da469e4",
+    "zig_binary_sha16": "5e767e96de89b5f7",
     "puc_binary_sha16": "d54bc45e1757b216"
   },
   "summary": {
     "total": 32,
-    "pass": 18,
-    "output_diff": 13,
+    "pass": 17,
+    "output_diff": 14,
     "zig_fail": 0,
     "both_fail": 1,
     "both_fail_infra": 0,
@@ -127,7 +127,7 @@
       "zig_exit": 0,
       "zig_reason": "",
       "ref_reason": "",
-      "diff": "--- ref/cstack.lua\n+++ zig/cstack.lua\n@@ -4,3 +4,3 @@\n testing recursion inside pattern matching\n-testing stack-overflow in recursive 'gsub'\n+.testing stack-overflow in recursive 'gsub'\n final count:\tN\n@@ -9,5 +9,5 @@\n testing limits in coroutines inside deep calls\n-final count:\tN\n+..final count:\tN\n chain of 'coroutine.close'\n-final count:\tN\n+..final count:\tN\n nesting of resuming yielded coroutines\n... (6 more diff lines)"
+      "diff": "--- ref/cstack.lua\n+++ zig/cstack.lua\n@@ -4,3 +4,3 @@\n testing recursion inside pattern matching\n-testing stack-overflow in recursive 'gsub'\n+.testing stack-overflow in recursive 'gsub'\n final count:\tN\n@@ -9,9 +9,12 @@\n testing limits in coroutines inside deep calls\n-final count:\tN\n+..final count:\tN\n chain of 'coroutine.close'\n-final count:\tN\n+..final count:\tN\n nesting of resuming yielded coroutines\n... (8 more diff lines)"
     },
     {
       "file": "db.lua",
@@ -158,12 +158,12 @@
     },
     {
       "file": "files.lua",
-      "class": "pass",
+      "class": "output_diff",
       "ref_exit": 0,
       "zig_exit": 0,
       "zig_reason": "",
       "ref_reason": "",
-      "diff": ""
+      "diff": "--- ref/files.lua\n+++ zig/files.lua\n@@ -17,3 +17,3 @@\n   8-byte time_t\n-test done on 05/09/2026, at 23:26:06\n+test done on 05/09/2026, at 23:26:07\n Lua 5.5"
     },
     {
       "file": "gc.lua",
@@ -343,5 +343,5 @@
     ],
     "note": "Previously current-matrix.json ran WITHOUT --diff (output_diff=0 meant \"not run\"). From P16.22 the strict lane is canonical."
   },
-  "p16_23_cstack_update": "gsub C-recursion counts now 200/199/200 (was 99977) \u2014 T6 nCcalls model; remaining: metatable-__index unit, coroutine deep-calls 4/30 (pre-existing), pure stack-depth"
+  "p16_24_cstack_update": "C-depth model unified: gsub 199(PUC197), co-deep 199(PUC196), resume-nesting 198(PUC195), close-chain 199(PUC197); remaining: metatable-gsub __index unit 199 vs 99, pure Lua depth 262021 vs 250043, dots pacing"
 }

@@ -1,1231 +1,2720 @@
 {
   "provenance": {
-    "task": "P16.22 T1 fresh post-P16.21 differential at 2a995b3",
-    "git_head": "2a995b3022aa7b0bf0df464c05d21ef8fa9ee8e6",
-    "git_head_short": "2a995b3",
-    "measured_source_head": "2a995b3",
-    "git_dirty": "clean",
+    "task": "P16.23 T1: fresh post-final-P16.22 differential at f05a766",
+    "measured_source_head": "f05a766f87b8bbd76c7ab5cd2bda518cc972da03",
+    "git_head_short": "f05a766",
+    "git_dirty": "clean (dedicated worktree /tmp/opencode/wt23; main tree untouched)",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "38fd43419a734b89",
+    "zig_binary_sha16": "dd14b4f80cbf06f4",
     "puc_binary_sha16": "d54bc45e1757b216",
-    "puc_version": "lua-5.5.0 (build/lua-c; same sha as P16.20 differential \u2014 P16.19 intra-luaV_execute address-range estimates reusable)",
+    "puc_version": "lua-5.5.0 (build/lua-c; same sha as P16.20/P16.22 differentials \u2014 P16.19 intra-luaV_execute address-range estimates reusable)",
     "pinning": "all runs taskset -c 0",
     "measurement": {
-      "perf_stat": "tools/perf_compare.py --counters --counters-runs 5 --core 0 (taskset -c 0 perf stat -j -e instructions:u,cycles:u,branches:u,branch-misses:u,cache-misses:u,cache-references:u BIN tools/microbench.lua WL); medians of 5",
-      "perf_record": "one session per combo: 15 consecutive isolated microbench runs wrapped in a single perf record -e cycles:u session under taskset -c 0 (wrapper script; sh -c inline loses child samples)",
-      "symbol_attribution": "perf report --stdio --no-children --percent-limit 0.02 (session-relative self shares)",
-      "line_attribution": "perf annotate --stdio -l; per-symbol sorted summaries are SYMBOL-relative; converted to session % via symbol session share",
+      "perf_stat": "taskset -c 0 perf stat -j -e instructions:u,cycles:u,branches:u,branch-misses:u,cache-misses:u,cache-references:u BIN tools/microbench.lua WL; median of 5 runs per workload per binary (driver /tmp/opencode/p1623_counters.py, raw /tmp/opencode/p1623_counters.json)",
+      "perf_record": "one session per combo: 15 consecutive isolated microbench runs wrapped in a single perf record -e cycles:u session under taskset -c 0 (wrapper script /tmp/opencode/p1623_record.sh; sh -c inline loses child samples)",
+      "symbol_attribution": "perf report --stdio --no-children --percent-limit 0.1 (session-relative self shares)",
+      "line_attribution": "perf annotate --stdio -l; each symbol section has its own Sorted summary whose percentages are SYMBOL-relative (verified empirically vs raw sample counts at hot addresses); converted to session % via symbol session share; est i/it = session_pct * workload zig instr/iter / 100",
       "puc_line_note": "PUC binary has no DWARF line info; PUC decomposed BY SYMBOL; intra-luaV_execute splits reused from the P16.19 address-range analysis (identical binary sha + identical workload), rescaled to the fresh luaV_execute session share"
     },
-    "worktree": "measured in a dedicated git worktree /tmp/opencode/wt22 at clean 2a995b3; main tree untouched",
-    "geomean_note": "timing lane this session: geomean Zig/PUC = 1.80x (perf-baseline.json, runs=7); global_arith +11.8% vs baseline-p15.37 (pre-existing session-level flag, same shape as P16.21 session note in STATUS.md)"
+    "workload_ns": {
+      "int_arith": 50000000,
+      "branch_loop": 50000000,
+      "lua_calls": 5000000,
+      "hash_access": 5000000,
+      "coroutine_yield": 500000,
+      "metamethod_add": 500000,
+      "metamethod_call_noalloc": 500000
+    },
+    "prior_artifact": "tools/perf/current-dispatch-frame-differential.json (P16.22 T1 @ 2a995b3, zig sha 38fd43419a734b89, lua_calls 690.3 / noalloc 872.0 / cy 3007.3 i/it); f05a766 adds P16.22 T2 (ActivationId u32), T3 (frame-loop entry cleanup), T4 (comptime PushClosureMode), T9.1 fmt, P16.23 T0.x layout commits",
+    "post_t6_note": "T6 (nCcalls model) changed NO hot-path code: lua_calls 3.376G / noalloc 424M instructions identical before/after T6; the decomposition at f05a766 remains the final hot-path map."
   },
-  "workloads": {
+  "workload_counters": {
+    "int_arith": {
+      "n": 50000000,
+      "zig": {
+        "instr_per_iter": 115.38648652,
+        "cycles_per_iter": 19.8508159,
+        "branches_per_iter": 14.18453398,
+        "branch_misses_per_iter": 0.00046206,
+        "ipc": 5.812682314987366
+      },
+      "puc": {
+        "instr_per_iter": 60.75997782,
+        "cycles_per_iter": 13.36881342,
+        "branches_per_iter": 10.13260984,
+        "branch_misses_per_iter": 0.00039018,
+        "ipc": 4.544904316571724
+      },
+      "gap": {
+        "instr_per_iter_delta": 54.6265087,
+        "instr_ratio": 1.8990541250990864,
+        "cycles_per_iter_delta": 6.48200248,
+        "cycles_ratio": 1.4848599704669976
+      }
+    },
+    "branch_loop": {
+      "n": 50000000,
+      "zig": {
+        "instr_per_iter": 259.81643144,
+        "cycles_per_iter": 79.26031794,
+        "branches_per_iter": 34.88954002,
+        "branch_misses_per_iter": 0.00058846,
+        "ipc": 3.2780139948048257
+      },
+      "puc": {
+        "instr_per_iter": 141.05500068,
+        "cycles_per_iter": 40.63481908,
+        "branches_per_iter": 23.76762148,
+        "branch_misses_per_iter": 0.00042036,
+        "ipc": 3.4712840828034026
+      },
+      "gap": {
+        "instr_per_iter_delta": 118.76143075999997,
+        "instr_ratio": 1.8419512260286635,
+        "cycles_per_iter_delta": 38.62549885999999,
+        "cycles_ratio": 1.9505517616297454
+      }
+    },
     "lua_calls": {
       "n": 5000000,
-      "loop_body": "local function inc(x) return x + 1 end; local s = 0; for i = 1, n do s = inc(s) end",
-      "puc": {
-        "sha16": "d54bc45e1757b216",
-        "runs": 5,
-        "instr_median": 1285650270.0,
-        "cycles_median": 348633456.0,
-        "branches_median": 183430826.0,
-        "branch_misses_median": 19691.0,
-        "instr_per_iter": 257.1,
-        "cycles_per_iter": 69.7,
-        "branches_per_iter": 36.7,
-        "branch_misses_per_iter": 0.004,
-        "ipc": 3.688,
-        "spread_note": "median-of-5 via tools/perf_compare.py --counters; per-run spreads not retained by the tool (prior sessions were unimodal, spreads < 0.003%)",
-        "symbols": [
-          {
-            "name": "luaV_execute",
-            "self_pct": 77.47
-          },
-          {
-            "name": "luaD_precall",
-            "self_pct": 21.83
-          },
-          {
-            "name": "getintfromhash",
-            "self_pct": 0.12
-          },
-          {
-            "name": "insertkey",
-            "self_pct": 0.05
-          },
-          {
-            "name": "internshrstr",
-            "self_pct": 0.05
-          },
-          {
-            "name": "luaH_newkey.part.0",
-            "self_pct": 0.04
-          },
-          {
-            "name": "propagatemark",
-            "self_pct": 0.03
-          },
-          {
-            "name": "0x00000000001763b3",
-            "self_pct": 0.02
-          }
-        ]
-      },
       "zig": {
-        "sha16": "38fd43419a734b89",
-        "runs": 5,
-        "instr_median": 3451370290.0,
-        "cycles_median": 682976466.0,
-        "branches_median": 532475685.0,
-        "branch_misses_median": 23088.0,
-        "instr_per_iter": 690.3,
-        "cycles_per_iter": 136.6,
-        "branches_per_iter": 106.5,
-        "branch_misses_per_iter": 0.005,
-        "ipc": 5.053,
-        "spread_note": "median-of-5 via tools/perf_compare.py --counters; per-run spreads not retained by the tool (prior sessions were unimodal, spreads < 0.003%)",
-        "symbols": [
-          {
-            "name": "vm.Vm.runBytecodeDispatch",
-            "self_pct": 83.17
-          },
-          {
-            "name": "vm.Vm.pushStagedBytecodeExecFrame",
-            "self_pct": 10.1
-          },
-          {
-            "name": "vm.Vm.syncFrame",
-            "self_pct": 4.62
-          },
-          {
-            "name": "vm.FrameStack.addOne",
-            "self_pct": 1.58
-          },
-          {
-            "name": "vm.Vm.rawSet",
-            "self_pct": 0.08
-          },
-          {
-            "name": "ltable.nodeInsert",
-            "self_pct": 0.05
-          },
-          {
-            "name": "process.Environ.createMap",
-            "self_pct": 0.03
-          },
-          {
-            "name": "heap.SmpAllocator.alloc",
-            "self_pct": 0.03
-          },
-          {
-            "name": "vm.Vm.tableResize",
-            "self_pct": 0.03
-          }
-        ],
-        "hot_lines": [
-          {
-            "file": "src/lua/vm.zig:13240",
-            "sym_pct": 8.34,
-            "session_pct": 6.94,
-            "what": "dispatch switch (op)"
-          },
-          {
-            "file": "src/lua/vm.zig:15421",
-            "sym_pct": 6.61,
-            "session_pct": 5.5,
-            "what": "opReturn1: const src_val = ctx.regs[a]"
-          },
-          {
-            "file": "src/lua/vm.zig:14772",
-            "sym_pct": 5.04,
-            "session_pct": 4.19,
-            "what": "OP_CALL: child_nextra (vararg) computation"
-          },
-          {
-            "file": "src/lua/vm.zig:13324",
-            "sym_pct": 4.58,
-            "session_pct": 3.81,
-            "what": "GETUPVAL: ctx.regs[a] = ctx.cur_upvalues[b].get(self) (workload)"
-          },
-          {
-            "file": "src/lua/vm.zig:12955",
-            "sym_pct": 4.42,
-            "session_pct": 3.68,
-            "what": "ctx.cur_upvalues = bc_stack[fr.func_slot].Closure.upvalues (entry load)"
-          },
-          {
-            "file": "src/lua/vm.zig:13018",
-            "sym_pct": 3.46,
-            "session_pct": 2.88,
-            "what": "instruction fetch: const inst = ctx.cur_proto.code[ctx.pc]"
-          },
-          {
-            "file": "src/lua/vm.zig:13040",
-            "sym_pct": 3.37,
-            "session_pct": 2.8,
-            "what": "combined stats+hooks dispatch gate: if (self.dispatch_gate != 0)"
-          },
-          {
-            "file": "src/lua/vm.zig:13036",
-            "sym_pct": 2.43,
-            "session_pct": 2.02,
-            "what": "dispatch_pc publish: self.dispatch_pc = ctx.pc (unconditional, pre-gate)"
-          },
-          {
-            "file": "src/lua/vm.zig:15106",
-            "sym_pct": 3.34,
-            "session_pct": 2.78,
-            "what": "ctx.pc += 1 (dispatch advance)"
-          },
-          {
-            "file": "src/lua/vm.zig:703",
-            "sym_pct": 2.99,
-            "session_pct": 2.49,
-            "what": "Cell.get: isOpen() branch (workload GETUPVAL path)"
-          },
-          {
-            "file": "src/lua/vm.zig:15436",
-            "sym_pct": 2.64,
-            "session_pct": 2.2,
-            "what": "opReturn1 fast arm: self.bc_stack[parent_c.frameBase() + dst] = src_val (direct parent pointer)"
-          },
-          {
-            "file": "src/lua/vm.zig:13016",
-            "sym_pct": 1.94,
-            "session_pct": 1.61,
-            "what": "while (ctx.pc < code.len) loop condition"
-          }
-        ]
+        "instr_per_iter": 675.1241202,
+        "cycles_per_iter": 133.555213,
+        "branches_per_iter": 105.4851384,
+        "branch_misses_per_iter": 0.0046098,
+        "ipc": 5.055018857257186
       },
-      "components": {
-        "puc": {
-          "luaV_execute_session_share": 77.47,
-          "instr_per_iter_total": 257.1,
-          "by_symbol": {
-            "luaV_execute": {
-              "session_pct": 77.47,
-              "est_instr_per_iter": 199.2
-            },
-            "luaD_precall (prepCallInfo inlined)": {
-              "session_pct": 21.83,
-              "est_instr_per_iter": 56.1
-            },
-            "other (hash/GC residue)": {
-              "session_pct": 0.7,
-              "est_instr_per_iter": 1.8
-            }
-          },
-          "intra_luaV_execute_estimates": {
-            "note": "P16.19 instruction-address-range decomposition of the SAME binary (sha d54bc45e1757b216) on the SAME workload, rescaled 77.47/78.28 (-1.0%) to the fresh session share",
-            "luaV prologue/epilogue (fresh C invocation)": 1.2,
-            "startfunc/returning entry (cl/k/pc/base reload per frame)": 22.5,
-            "vmfetch trap test": 4.6,
-            "fetch+pc++": 5.8,
-            "opcode dispatch (decode op & jmp *disptab)": 19.1,
-            "OP_CALL inline (top/savedpc, call luaD_precall, updatetrap)": 9.8,
-            "OP_RETURN1 inline (hookmask chk, L->ci=prev, result copy, L->top)": 13.4,
-            "ret: (CIST_FRESH test; ci=ci->previous; goto returning)": 2.2,
-            "workload opcode handlers (MOVE/GETUPVAL/ADD/FORLOOP/FORPREP inline; residual)": 121.6
-          }
-        },
-        "zig": {
-          "runBytecodeDispatch_session_share": 83.17,
-          "instr_per_iter_total": 690.3,
-          "components": {
-            "dispatch core (switch 13240, gate 13040, fetch 13018, pc+=1 15106, dispatch_pc 13036, decode 13020-13022, loop cond 13016)": {
-              "session_pct": 22.12,
-              "est_instr_per_iter": 152.7
-            },
-            "opReturn completion / return+pop (14855 switch, 1480 hasSimpleResult, 15411 nresults chk, 15421 src_val, 15422 dst, 15430, 15436 store; shrinkTo 15431 below threshold)": {
-              "session_pct": 11.89,
-              "est_instr_per_iter": 82.1
-            },
-            "OP_CALL inline staging (14758 callee, 14761 Closure+hooks filter, 1637 isLua, 14763 proto, 14765 nresults, 14766 nargs, 14772 child_nextra)": {
-              "session_pct": 8.41,
-              "est_instr_per_iter": 58.0
-            },
-            "frame-loop entry+reload (12926 while, 12929 pending check, 12944 frame_identity, 12955 upvalues, 12956 base, 12959 regs slice; cur_proto 12953 / pc 12958 below threshold)": {
-              "session_pct": 8.57,
-              "est_instr_per_iter": 59.2
-            },
-            "workload handlers (MOVE 13284, GETUPVAL 13324, Cell.get 703/705/706, ADD 13761/13762/13766/14017, FORLOOP 14896/14899/14900/14901)": {
-              "session_pct": 10.85,
-              "est_instr_per_iter": 74.9
-            },
-            "FrameStack access inline (len 1777, getPtr 1793, topPtr 1815)": {
-              "session_pct": 1.91,
-              "est_instr_per_iter": 13.2
-            },
-            "vm.zig:0 no line info (in-symbol)": {
-              "session_pct": 2.76,
-              "est_instr_per_iter": 19.1
-            },
-            "other inlined lines (residual of listed)": {
-              "session_pct": 1.56,
-              "est_instr_per_iter": 10.8
-            },
-            "rbd_unlisted_tail (DWARF lines below display threshold in runBytecodeDispatch)": {
-              "session_pct": 15.08,
-              "est_instr_per_iter": 104.1
-            },
-            "pushStagedBytecodeExecFrame (push+activation, out-of-line symbol)": {
-              "session_pct": 10.1,
-              "est_instr_per_iter": 69.7
-            },
-            "syncFrame publication (out-of-line symbol; defer line below threshold)": {
-              "session_pct": 4.62,
-              "est_instr_per_iter": 31.9
-            },
-            "FrameStack.addOne (out-of-line symbol)": {
-              "session_pct": 1.58,
-              "est_instr_per_iter": 10.9
-            },
-            "ltable.nodeInsert + rawSet + alloc residue (out-of-line)": {
-              "session_pct": 0.26,
-              "est_instr_per_iter": 1.8
-            }
-          }
-        }
+      "puc": {
+        "instr_per_iter": 257.129936,
+        "cycles_per_iter": 69.8789228,
+        "branches_per_iter": 36.6861388,
+        "branch_misses_per_iter": 0.0039138,
+        "ipc": 3.67964939493887
       },
       "gap": {
-        "instr_per_iter_zig_minus_puc": 433.1,
-        "ratio_zig_over_puc": 2.685
+        "instr_per_iter_delta": 417.9941842,
+        "instr_ratio": 2.6256146238841676,
+        "cycles_per_iter_delta": 63.67629020000001,
+        "cycles_ratio": 1.9112374325266503
       }
     },
-    "metamethod_call_noalloc": {
-      "n": 500000,
-      "loop_body": "mt = {__add = function(a,b) return a end}; box = setmetatable({}, mt); local s = box; for i = 1, n do s = s + box end",
-      "puc": {
-        "sha16": "d54bc45e1757b216",
-        "runs": 5,
-        "instr_median": 187781350.0,
-        "cycles_median": 35701344.0,
-        "branches_median": 28900921.0,
-        "branch_misses_median": 19143.0,
-        "instr_per_iter": 375.6,
-        "cycles_per_iter": 71.4,
-        "branches_per_iter": 57.8,
-        "branch_misses_per_iter": 0.038,
-        "ipc": 5.26,
-        "spread_note": "median-of-5 via tools/perf_compare.py --counters; per-run spreads not retained by the tool (prior sessions were unimodal, spreads < 0.003%)",
-        "symbols": [
-          {
-            "name": "luaV_execute",
-            "self_pct": 44.52
-          },
-          {
-            "name": "luaD_precall",
-            "self_pct": 16.4
-          },
-          {
-            "name": "luaT_callTMres",
-            "self_pct": 8.65
-          },
-          {
-            "name": "luaH_Hgetshortstr",
-            "self_pct": 7.43
-          },
-          {
-            "name": "callbinTM",
-            "self_pct": 5.22
-          },
-          {
-            "name": "luaT_trybinTM",
-            "self_pct": 4.31
-          },
-          {
-            "name": "luaD_call",
-            "self_pct": 3.27
-          },
-          {
-            "name": "luaT_gettmbyobj",
-            "self_pct": 2.33
-          },
-          {
-            "name": "luaH_newkey.part.0",
-            "self_pct": 1.28
-          },
-          {
-            "name": "insertkey",
-            "self_pct": 1.09
-          },
-          {
-            "name": "getintfromhash",
-            "self_pct": 0.64
-          },
-          {
-            "name": "llex",
-            "self_pct": 0.52
-          },
-          {
-            "name": "traversearray",
-            "self_pct": 0.41
-          }
-        ]
-      },
+    "hash_access": {
+      "n": 5000000,
       "zig": {
-        "sha16": "38fd43419a734b89",
-        "runs": 5,
-        "instr_median": 436014043.0,
-        "cycles_median": 89223949.0,
-        "branches_median": 66360139.0,
-        "branch_misses_median": 22522.0,
-        "instr_per_iter": 872.0,
-        "cycles_per_iter": 178.4,
-        "branches_per_iter": 132.7,
-        "branch_misses_per_iter": 0.045,
-        "ipc": 4.887,
-        "spread_note": "median-of-5 via tools/perf_compare.py --counters; per-run spreads not retained by the tool (prior sessions were unimodal, spreads < 0.003%)",
-        "symbols": [
-          {
-            "name": "vm.Vm.runBytecodeDispatch",
-            "self_pct": 61.56
-          },
-          {
-            "name": "vm.Vm.getTmByObj",
-            "self_pct": 9.45
-          },
-          {
-            "name": "vm.Vm.pushStagedBytecodeExecFrame",
-            "self_pct": 8.23
-          },
-          {
-            "name": "vm.Vm.pushResolvedBytecodeClosure",
-            "self_pct": 6.94
-          },
-          {
-            "name": "vm.Vm.tryPushSimpleResultMetamethod",
-            "self_pct": 6.13
-          },
-          {
-            "name": "vm.Vm.syncFrame",
-            "self_pct": 1.54
-          },
-          {
-            "name": "vm.FrameStack.addOne",
-            "self_pct": 1.19
-          },
-          {
-            "name": "ltable.nodeInsert",
-            "self_pct": 0.72
-          },
-          {
-            "name": "vm.Vm.rawSet",
-            "self_pct": 0.65
-          },
-          {
-            "name": "vm.Vm.tableResize",
-            "self_pct": 0.56
-          },
-          {
-            "name": "vm.Vm.dispatchCalleeActivationHook",
-            "self_pct": 0.29
-          },
-          {
-            "name": "vm.Vm.gcPropagateOne",
-            "self_pct": 0.27
-          },
-          {
-            "name": "heap.SmpAllocator.alloc",
-            "self_pct": 0.2
-          },
-          {
-            "name": "process.Environ.createMap",
-            "self_pct": 0.17
-          }
-        ],
-        "hot_lines": [
-          {
-            "file": "src/lua/vm.zig:15475",
-            "sym_pct": 15.25,
-            "session_pct": 9.39,
-            "what": "opReturn simple_result fast arm: self.bc_stack[parent_c.frameBase() + sr_dst] = src_val"
-          },
-          {
-            "file": "src/lua/vm.zig:13240",
-            "sym_pct": 8.54,
-            "session_pct": 5.26,
-            "what": "dispatch switch (op)"
-          },
-          {
-            "file": "src/lua/vm.zig:13324",
-            "sym_pct": 4.35,
-            "session_pct": 2.68,
-            "what": "GETUPVAL (workload)"
-          },
-          {
-            "file": "src/lua/vm.zig:35278",
-            "sym_pct": 3.95,
-            "session_pct": 2.43,
-            "what": "findBinaryTm: getTmByObj(lhs) orelse getTmByObj(rhs)"
-          },
-          {
-            "file": "src/lua/vm.zig:0",
-            "sym_pct": 1.14,
-            "session_pct": 0.7,
-            "what": "no line info (DWARF gap)"
-          },
-          {
-            "file": "src/lua/vm.zig:703",
-            "sym_pct": 3.2,
-            "session_pct": 1.97,
-            "what": "Cell.get isOpen (workload GETUPVAL)"
-          },
-          {
-            "file": "src/lua/vm.zig:13762",
-            "sym_pct": 1.73,
-            "session_pct": 1.06,
-            "what": "ADD: const rc = ctx.regs[c] (workload)"
-          },
-          {
-            "file": "src/lua/vm.zig:15106",
-            "sym_pct": 3.13,
-            "session_pct": 1.93,
-            "what": "ctx.pc += 1 (dispatch advance)"
-          },
-          {
-            "file": "src/lua/vm.zig:13016",
-            "sym_pct": 1.95,
-            "session_pct": 1.2,
-            "what": "while (ctx.pc < code.len) loop condition"
-          },
-          {
-            "file": "src/lua/vm.zig:15458",
-            "sym_pct": 1.46,
-            "session_pct": 0.9,
-            "what": "opReturn: const src_val = ctx.regs[a]"
-          },
-          {
-            "file": "src/lua/vm.zig:14312",
-            "sym_pct": 2.88,
-            "session_pct": 1.77,
-            "what": "MMBIN: switch (try self.tryPushSimpleResultMetamethod(...)) call site"
-          },
-          {
-            "file": "src/lua/vm.zig:13040",
-            "sym_pct": 2.11,
-            "session_pct": 1.3,
-            "what": "combined stats+hooks dispatch gate"
-          }
-        ]
+        "instr_per_iter": 369.8991936,
+        "cycles_per_iter": 108.8937454,
+        "branches_per_iter": 55.6186962,
+        "branch_misses_per_iter": 0.0799696,
+        "ipc": 3.3968819075994423
       },
-      "components": {
-        "puc": {
-          "luaV_execute_session_share": 44.52,
-          "instr_per_iter_total": 375.6,
-          "by_symbol": {
-            "luaV_execute": {
-              "session_pct": 44.52,
-              "est_instr_per_iter": 167.2
-            },
-            "luaD_precall (prepCallInfo inlined)": {
-              "session_pct": 16.4,
-              "est_instr_per_iter": 61.6
-            },
-            "luaT_callTMres": {
-              "session_pct": 8.65,
-              "est_instr_per_iter": 32.5
-            },
-            "luaH_Hgetshortstr": {
-              "session_pct": 7.43,
-              "est_instr_per_iter": 27.9
-            },
-            "callbinTM": {
-              "session_pct": 5.22,
-              "est_instr_per_iter": 19.6
-            },
-            "luaT_trybinTM": {
-              "session_pct": 4.31,
-              "est_instr_per_iter": 16.2
-            },
-            "luaD_call": {
-              "session_pct": 3.27,
-              "est_instr_per_iter": 12.3
-            },
-            "luaT_gettmbyobj": {
-              "session_pct": 2.33,
-              "est_instr_per_iter": 8.8
-            },
-            "insertkey + hash residue": {
-              "session_pct": 3.87,
-              "est_instr_per_iter": 14.5
-            }
-          },
-          "intra_luaV_execute_estimates": {
-            "note": "P16.19 instruction-address-range decomposition of the SAME binary on the SAME workload, rescaled 44.52/43.06 (+3.4%) to the fresh session share",
-            "luaV prologue/epilogue (fresh C invocation)": 24.7,
-            "startfunc/returning entry": 22.8,
-            "vmfetch trap test": 3.7,
-            "fetch+pc++": 6.0,
-            "opcode dispatch": 11.8,
-            "OP_RETURN1 inline (hookmask chk, L->ci=prev, result copy, L->top)": 28.2,
-            "ret": 0.2,
-            "workload opcode handlers (MOVE/GETUPVAL/ADD/MMBIN/FORLOOP/FORPREP inline; residual)": 69.7
-          }
-        },
-        "zig": {
-          "runBytecodeDispatch_session_share": 61.56,
-          "instr_per_iter_total": 872.0,
-          "components": {
-            "dispatch core (switch 13240, gate 13040, fetch 13018, pc+=1 15106, dispatch_pc 13036, decode 13020-13022, loop cond 13016)": {
-              "session_pct": 11.85,
-              "est_instr_per_iter": 103.3
-            },
-            "TM lookup inline (findBinaryTm 35278: getTmByObj(lhs) orelse getTmByObj(rhs))": {
-              "session_pct": 2.43,
-              "est_instr_per_iter": 21.2
-            },
-            "MMBIN staging inline (14297 lhs, 14304 tm==null abort, 14312 tryPushSimpleResultMetamethod call, 14318 arg)": {
-              "session_pct": 4.14,
-              "est_instr_per_iter": 36.1
-            },
-            "opReturn completion (1481 hasSimpleResult, 1520 clearSimpleResult, 15361 tbc_mark, 15394 cond, 15458 src_val, 15466 compare chk, 15475 store, 15476 reg_top)": {
-              "session_pct": 13.12,
-              "est_instr_per_iter": 114.4
-            },
-            "frame-loop entry+reload (12849 activation_id, 12926 while, 12929 pending, 12944 identity, 12955 upvalues, 12956 base, 12957 frame_cap, 12959 regs)": {
-              "session_pct": 5.71,
-              "est_instr_per_iter": 49.8
-            },
-            "workload handlers (GETUPVAL 13324, Cell.get 703/705/706, ADD 13761/13762/13766, FORLOOP 14891/14896/14900)": {
-              "session_pct": 9.5,
-              "est_instr_per_iter": 82.9
-            },
-            "FrameStack access inline (len 1777, getPtr 1784/1793, topPtr 1815)": {
-              "session_pct": 2.52,
-              "est_instr_per_iter": 22.0
-            },
-            "vm.zig:0 no line info (in-symbol)": {
-              "session_pct": 0.7,
-              "est_instr_per_iter": 6.1
-            },
-            "other inlined lines (residual of listed)": {
-              "session_pct": 0.7,
-              "est_instr_per_iter": 6.1
-            },
-            "rbd_unlisted_tail (below display threshold in runBytecodeDispatch)": {
-              "session_pct": 10.89,
-              "est_instr_per_iter": 95.0
-            },
-            "direct-Closure fast filter + dispatch (tryPushSimpleResultMetamethod symbol; internal: 8373+8374 Closure/proto filter 35.6% of symbol, 8364/8379/8382/8386 call setup 40.6%, no-line 18.2%)": {
-              "session_pct": 6.13,
-              "est_instr_per_iter": 53.5
-            },
-            "staging: stageBytecodeCall (inlined in pushResolvedBytecodeClosure 11912-11920: stack ensure + func/args copy)": {
-              "session_pct": 2.86,
-              "est_instr_per_iter": 24.9
-            },
-            "simple-result continuation setup (setSimpleValueResult 1502 + completion switch 8103/8137 in pushResolvedBytecodeClosure)": {
-              "session_pct": 1.25,
-              "est_instr_per_iter": 10.9
-            },
-            "child activation (pushStagedBytecodeExecFrame symbol 8.23 + pushResolved tail: pushStaged call 8153 + activation hook 8163)": {
-              "session_pct": 9.09,
-              "est_instr_per_iter": 79.3
-            },
-            "TM lookup out-of-line (getTmByObj symbol; internal: 35269 getTm dispatch, 35189/35190 metatable fetch, 35248/35249 node value)": {
-              "session_pct": 9.45,
-              "est_instr_per_iter": 82.4
-            },
-            "syncFrame publication (out-of-line symbol)": {
-              "session_pct": 1.54,
-              "est_instr_per_iter": 13.4
-            },
-            "FrameStack.addOne (out-of-line symbol)": {
-              "session_pct": 1.19,
-              "est_instr_per_iter": 10.4
-            },
-            "ltable.nodeInsert + rawSet + tableResize + alloc residue (out-of-line)": {
-              "session_pct": 2.19,
-              "est_instr_per_iter": 19.1
-            },
-            "dispatchCalleeActivationHook + gc residue (out-of-line)": {
-              "session_pct": 0.91,
-              "est_instr_per_iter": 7.9
-            }
-          }
-        }
+      "puc": {
+        "instr_per_iter": 237.9399036,
+        "cycles_per_iter": 53.0308506,
+        "branches_per_iter": 41.7362088,
+        "branch_misses_per_iter": 0.0039536,
+        "ipc": 4.486820424487025
       },
       "gap": {
-        "instr_per_iter_zig_minus_puc": 496.5,
-        "ratio_zig_over_puc": 2.322
-      }
-    },
-    "metamethod_add": {
-      "n": 500000,
-      "loop_body": "mt = { __add = function(a, b) return setmetatable({v = a.v + b.v}, mt) end }; box = setmetatable({v = 0}, mt); local s = box; for i = 1, n do s = s + box end",
-      "puc": {
-        "sha16": "d54bc45e1757b216",
-        "runs": 5,
-        "instr_median": 1052470279.0,
-        "cycles_median": 235148462.0,
-        "branches_median": 213733699.0,
-        "branch_misses_median": 50130.0,
-        "instr_per_iter": 2104.9,
-        "cycles_per_iter": 470.3,
-        "branches_per_iter": 427.5,
-        "branch_misses_per_iter": 0.1,
-        "ipc": 4.476,
-        "spread_note": "median-of-5 via tools/perf_compare.py --counters; per-run spreads not retained by the tool (prior sessions were unimodal, spreads < 0.003%)",
-        "symbols": [
-          {
-            "name": "luaV_execute",
-            "self_pct": 20.33
-          },
-          {
-            "name": "luaH_getshortstr",
-            "self_pct": 15.08
-          },
-          {
-            "name": "cfree",
-            "self_pct": 5.61
-          },
-          {
-            "name": "luaH_resize",
-            "self_pct": 3.87
-          },
-          {
-            "name": "luaH_Hgetshortstr",
-            "self_pct": 3.61
-          },
-          {
-            "name": "luaD_poscall",
-            "self_pct": 2.63
-          },
-          {
-            "name": "luaH_psetshortstr",
-            "self_pct": 2.58
-          },
-          {
-            "name": "luaT_callTMres",
-            "self_pct": 2.43
-          },
-          {
-            "name": "luaL_alloc",
-            "self_pct": 2.2
-          },
-          {
-            "name": "luaD_precall",
-            "self_pct": 2.04
-          },
-          {
-            "name": "luaT_gettmbyobj",
-            "self_pct": 2.01
-          },
-          {
-            "name": "luaM_free_",
-            "self_pct": 1.9
-          },
-          {
-            "name": "luaM_malloc_",
-            "self_pct": 1.84
-          },
-          {
-            "name": "freeobj",
-            "self_pct": 1.82
-          }
-        ]
-      },
-      "zig": {
-        "sha16": "38fd43419a734b89",
-        "runs": 5,
-        "instr_median": 2435604810.0,
-        "cycles_median": 615190529.0,
-        "branches_median": 373323697.0,
-        "branch_misses_median": 29101.0,
-        "instr_per_iter": 4871.2,
-        "cycles_per_iter": 1230.4,
-        "branches_per_iter": 746.6,
-        "branch_misses_per_iter": 0.058,
-        "ipc": 3.959,
-        "spread_note": "median-of-5 via tools/perf_compare.py --counters; per-run spreads not retained by the tool (prior sessions were unimodal, spreads < 0.003%)",
-        "symbols": [
-          {
-            "name": "vm.Vm.runBytecodeDispatch",
-            "self_pct": 24.21
-          },
-          {
-            "name": "heap.SmpAllocator.alloc",
-            "self_pct": 10.78
-          },
-          {
-            "name": "heap.SmpAllocator.free",
-            "self_pct": 9.93
-          },
-          {
-            "name": "vm.Vm.setPendingCall",
-            "self_pct": 3.12
-          },
-          {
-            "name": "vm.Vm.rawSet",
-            "self_pct": 3.11
-          },
-          {
-            "name": "vm.Vm.internStr",
-            "self_pct": 3.01
-          },
-          {
-            "name": "vm.Vm.callBuiltin",
-            "self_pct": 2.85
-          },
-          {
-            "name": "mem.eql__anon_3045",
-            "self_pct": 2.66
-          },
-          {
-            "name": "vm.Vm.rawGet",
-            "self_pct": 2.47
-          },
-          {
-            "name": "vm.Vm.getTmByObj",
-            "self_pct": 2.37
-          },
-          {
-            "name": "vm.Vm.bytecodeGetIndex",
-            "self_pct": 2.29
-          },
-          {
-            "name": "vm.Vm.tableGetValueDepth",
-            "self_pct": 2.28
-          },
-          {
-            "name": "vm.Vm.allocTable",
-            "self_pct": 2.17
-          },
-          {
-            "name": "vm.Vm.indexValueDepth",
-            "self_pct": 2.12
-          },
-          {
-            "name": "vm.Vm.continueBytecodeClose",
-            "self_pct": 1.91
-          },
-          {
-            "name": "hash.wyhash.Wyhash.final",
-            "self_pct": 1.9
-          }
-        ],
-        "hot_lines": [
-          {
-            "file": "src/lua/vm.zig:13240",
-            "sym_pct": 5.39,
-            "session_pct": 1.3,
-            "what": "dispatch switch (op)"
-          },
-          {
-            "file": "src/lua/vm.zig:13338",
-            "sym_pct": 4.04,
-            "session_pct": 0.98,
-            "what": "GETTABUP: env==.Table and metatable==null fast filter (coroutine/mt globals)"
-          },
-          {
-            "file": "src/lua/vm.zig:703",
-            "sym_pct": 3.99,
-            "session_pct": 0.97,
-            "what": "Cell.get isOpen (upvalue access)"
-          },
-          {
-            "file": "src/lua/vm.zig:2350",
-            "sym_pct": 3.56,
-            "session_pct": 0.86,
-            "what": "LuaString.isShort: srkind >= 0 (short-string key checks)"
-          },
-          {
-            "file": "src/lua/vm.zig:13683",
-            "sym_pct": 2.94,
-            "session_pct": 0.71,
-            "what": "SETFIELD: const val (k ? resolved_values[c] : regs[c])"
-          },
-          {
-            "file": "src/lua/vm.zig:13040",
-            "sym_pct": 2.04,
-            "session_pct": 0.49,
-            "what": "combined stats+hooks dispatch gate"
-          },
-          {
-            "file": "src/lua/vm.zig:13486",
-            "sym_pct": 1.75,
-            "session_pct": 0.42,
-            "what": "GETFIELD: const obj = ctx.regs[b]"
-          },
-          {
-            "file": "src/lua/vm.zig:13488",
-            "sym_pct": 1.12,
-            "session_pct": 0.27,
-            "what": "GETFIELD: obj==.Table and metatable==null fast filter"
-          },
-          {
-            "file": "src/lua/vm.zig:12955",
-            "sym_pct": 1.13,
-            "session_pct": 0.27,
-            "what": "entry: ctx.cur_upvalues load"
-          },
-          {
-            "file": "src/lua/vm.zig:35278",
-            "sym_pct": 1.12,
-            "session_pct": 0.27,
-            "what": "findBinaryTm: getTmByObj(lhs) orelse getTmByObj(rhs)"
-          },
-          {
-            "file": "src/lua/vm.zig:13723",
-            "sym_pct": 0.62,
-            "session_pct": 0.15,
-            "what": "NEWTABLE: ctx.regs[a] = .{ .Table = t }"
-          },
-          {
-            "file": "src/lua/vm.zig:14312",
-            "sym_pct": 0.62,
-            "session_pct": 0.15,
-            "what": "MMBIN: tryPushSimpleResultMetamethod call site"
-          },
-          {
-            "file": "src/lua/vm.zig:16404",
-            "sym_pct": 0.65,
-            "session_pct": 0.16,
-            "what": "frame exit: u.lua.pc = ctx.pc publication"
-          }
-        ]
-      },
-      "components": {
-        "puc": {
-          "instr_per_iter_total": 2104.9,
-          "top3_by_symbol_group": {
-            "luaV_execute (dispatch + handlers)": {
-              "session_pct": 20.33,
-              "est_instr_per_iter": 427.9
-            },
-            "string-key hash lookups (luaH_getshortstr 15.08 + Hgetshortstr 3.61 + psetshortstr 2.58 + insertkey 1.05 + mainpositionTV 1.00 + luaH_newkey residue)": {
-              "session_pct": 23.32,
-              "est_instr_per_iter": 490.9
-            },
-            "alloc/free/GC (cfree 5.61, luaH_resize 3.87, luaL_alloc 2.20, luaM_malloc_ 1.84, luaM_free_ 1.90, freeobj 1.82, luaH_free 1.03, malloc 1.05)": {
-              "session_pct": 19.32,
-              "est_instr_per_iter": 406.7
-            }
-          },
-          "note": "lighter decomposition: symbol groups only"
-        },
-        "zig": {
-          "instr_per_iter_total": 4871.2,
-          "top3_by_symbol_group": {
-            "VM dispatch core + handlers + staging inline (runBytecodeDispatch)": {
-              "session_pct": 24.21,
-              "est_instr_per_iter": 1179.3
-            },
-            "heap alloc/free (SmpAllocator.alloc + SmpAllocator.free; __add allocates a table per iter + GC)": {
-              "session_pct": 20.71,
-              "est_instr_per_iter": 1008.8
-            },
-            "table/string access machinery (rawSet 3.11, internStr 3.01, rawGet 2.47, bytecodeGetIndex 2.29, tableGetValueDepth 2.28, allocTable 2.17, indexValueDepth 2.12, tableResize 1.39, keyMatches 1.15, nodeInsert 0.61, wyhash 2.91, mem.eql 2.66)": {
-              "session_pct": 26.17,
-              "est_instr_per_iter": 1274.8
-            }
-          },
-          "note": "lighter decomposition: symbol groups only; TM/call path (getTmByObj 2.37 + pushStaged 1.14 + pushResolved 0.98 + tryPushSimpleResult 0.85 + setPendingCall 3.12 + callBuiltin 2.85 + completeBytecodeExecFrame 1.66 + builtinSetmetatable 1.43 + getGlobal 1.24) ~= 15.6% ~= 760 i/it"
-        }
-      },
-      "gap": {
-        "instr_per_iter_zig_minus_puc": 2766.3,
-        "ratio_zig_over_puc": 2.314
+        "instr_per_iter_delta": 131.95928999999998,
+        "instr_ratio": 1.554590835767658,
+        "cycles_per_iter_delta": 55.8628948,
+        "cycles_ratio": 2.0534037106317884
       }
     },
     "coroutine_yield": {
       "n": 500000,
-      "loop_body": "local function yielder() while true do coroutine.yield(42) end end; co = coroutine.create(yielder); for i = 1, n do coroutine.resume(co) end",
-      "puc": {
-        "sha16": "d54bc45e1757b216",
-        "runs": 5,
-        "instr_median": 498865041.0,
-        "cycles_median": 170699427.0,
-        "branches_median": 91521926.0,
-        "branch_misses_median": 1534693.0,
-        "instr_per_iter": 997.7,
-        "cycles_per_iter": 341.4,
-        "branches_per_iter": 183.0,
-        "branch_misses_per_iter": 3.069,
-        "ipc": 2.922,
-        "spread_note": "median-of-5 via tools/perf_compare.py --counters; per-run spreads not retained by the tool (prior sessions were unimodal, spreads < 0.003%)",
-        "symbols": [
-          {
-            "name": "luaH_getshortstr",
-            "self_pct": 26.21
-          },
-          {
-            "name": "luaV_execute",
-            "self_pct": 21.11
-          },
-          {
-            "name": "lua_resume",
-            "self_pct": 10.4
-          },
-          {
-            "name": "auxresume",
-            "self_pct": 8.34
-          },
-          {
-            "name": "luaB_coresume",
-            "self_pct": 6.31
-          },
-          {
-            "name": "lua_xmove",
-            "self_pct": 3.52
-          },
-          {
-            "name": "lua_rotate",
-            "self_pct": 3.01
-          },
-          {
-            "name": "luaD_precall",
-            "self_pct": 2.59
-          },
-          {
-            "name": "lua_checkstack",
-            "self_pct": 2.44
-          },
-          {
-            "name": "lua_pushboolean",
-            "self_pct": 1.8
-          },
-          {
-            "name": "luaD_poscall",
-            "self_pct": 1.8
-          },
-          {
-            "name": "resume",
-            "self_pct": 1.15
-          },
-          {
-            "name": "luaB_yield",
-            "self_pct": 0.89
-          },
-          {
-            "name": "__sigsetjmp",
-            "self_pct": 0.82
-          }
-        ]
-      },
       "zig": {
-        "sha16": "38fd43419a734b89",
-        "runs": 5,
-        "instr_median": 1503630066.0,
-        "cycles_median": 360698545.0,
-        "branches_median": 256249064.0,
-        "branch_misses_median": 23135.0,
-        "instr_per_iter": 3007.3,
-        "cycles_per_iter": 721.4,
-        "branches_per_iter": 512.5,
-        "branch_misses_per_iter": 0.046,
-        "ipc": 4.169,
-        "spread_note": "median-of-5 via tools/perf_compare.py --counters; per-run spreads not retained by the tool (prior sessions were unimodal, spreads < 0.003%)",
-        "symbols": [
-          {
-            "name": "vm.Vm.runBytecodeDispatch",
-            "self_pct": 61.12
-          },
-          {
-            "name": "vm.Vm.builtinCoroutineResume",
-            "self_pct": 12.38
-          },
-          {
-            "name": "vm.Vm.builtinCoroutineYield",
-            "self_pct": 5.47
-          },
-          {
-            "name": "vm.Vm.switchRuntime",
-            "self_pct": 4.81
-          },
-          {
-            "name": "vm.Vm.coroutineBuiltinFastPathEligible",
-            "self_pct": 2.1
-          },
-          {
-            "name": "vm.Vm.runBytecodeInternal",
-            "self_pct": 2.04
-          },
-          {
-            "name": "vm.Vm.growCtxFrame",
-            "self_pct": 1.44
-          },
-          {
-            "name": "vm.Vm.callCoroutineBuiltinDirect",
-            "self_pct": 1.23
-          },
-          {
-            "name": "compiler_rt.memcpy.memcpyFast",
-            "self_pct": 0.96
-          },
-          {
-            "name": "mem.eql__anon_3045",
-            "self_pct": 0.87
-          },
-          {
-            "name": "vm.Vm.tryRequestBytecodeCoroutineSwitch",
-            "self_pct": 0.87
-          },
-          {
-            "name": "vm.Vm.builtinOutLen",
-            "self_pct": 0.82
-          },
-          {
-            "name": "vm.InlineValues.setFrom",
-            "self_pct": 0.77
-          },
-          {
-            "name": "vm.Vm.tryPushBytecodeProtectedCall",
-            "self_pct": 0.75
-          },
-          {
-            "name": "vm.Vm.syncFrame",
-            "self_pct": 0.63
-          },
-          {
-            "name": "vm.Vm.condGcFromDispatch",
-            "self_pct": 0.51
-          }
-        ],
-        "hot_lines": [
-          {
-            "file": "src/lua/vm.zig:2350",
-            "sym_pct": 7.63,
-            "session_pct": 4.66,
-            "what": "LuaString.isShort: srkind >= 0 (coroutine.resume/yield string-key GETFIELD path)"
-          },
-          {
-            "file": "src/lua/vm.zig:13240",
-            "sym_pct": 5.05,
-            "session_pct": 3.09,
-            "what": "dispatch switch (op)"
-          },
-          {
-            "file": "src/lua/vm.zig:13338",
-            "sym_pct": 4.64,
-            "session_pct": 2.84,
-            "what": "GETTABUP: env==.Table and metatable==null fast filter (_ENV.coroutine)"
-          },
-          {
-            "file": "src/lua/vm.zig:703",
-            "sym_pct": 4.25,
-            "session_pct": 2.6,
-            "what": "Cell.get isOpen (upvalue access)"
-          },
-          {
-            "file": "src/lua/vm.zig:13488",
-            "sym_pct": 2.16,
-            "session_pct": 1.32,
-            "what": "GETFIELD: obj==.Table and metatable==null fast filter (coroutine.resume/yield)"
-          },
-          {
-            "file": "src/lua/vm.zig:13020",
-            "sym_pct": 1.52,
-            "session_pct": 0.93,
-            "what": "operand decode: const a = inst.a"
-          },
-          {
-            "file": "src/lua/vm.zig:12955",
-            "sym_pct": 1.43,
-            "session_pct": 0.87,
-            "what": "entry: ctx.cur_upvalues load"
-          },
-          {
-            "file": "src/lua/vm.zig:13329",
-            "sym_pct": 1.37,
-            "session_pct": 0.84,
-            "what": "GETTABUP: const env = ctx.cur_upvalues[b].get(self)"
-          },
-          {
-            "file": "src/lua/vm.zig:13486",
-            "sym_pct": 1.29,
-            "session_pct": 0.79,
-            "what": "GETFIELD: const obj = ctx.regs[b]"
-          },
-          {
-            "file": "src/lua/vm.zig:14891",
-            "sym_pct": 1.26,
-            "session_pct": 0.77,
-            "what": "FORLOOP: regs[a+1] == .Int check (resume loop)"
-          },
-          {
-            "file": "src/lua/vm.zig:13040",
-            "sym_pct": 1.21,
-            "session_pct": 0.74,
-            "what": "combined stats+hooks dispatch gate"
-          },
-          {
-            "file": "src/lua/vm.zig:12897",
-            "sym_pct": 1.0,
-            "session_pct": 0.61,
-            "what": "check_sigint = sigint_installed (frame-loop entry)"
-          },
-          {
-            "file": "src/lua/vm.zig:14812",
-            "sym_pct": 0.89,
-            "session_pct": 0.54,
-            "what": "OP_CALL: switch (try self.opCall(&ctx)) \u2014 coroutine.resume call"
-          },
-          {
-            "file": "src/lua/vm.zig:16916",
-            "sym_pct": 0.77,
-            "session_pct": 0.47,
-            "what": "tryPushBytecodeDebugHook call site (builtin call hook gate)"
-          },
-          {
-            "file": "src/lua/vm.zig:16810",
-            "sym_pct": 0.51,
-            "session_pct": 0.31,
-            "what": "co_fast_path eligibility expression (coroutine.resume/yield)"
-          },
-          {
-            "file": "src/lua/vm.zig:12472",
-            "sym_pct": 0.55,
-            "session_pct": 0.34,
-            "what": "canParkDirectBytecodeYield: id != .coroutine_yield check"
-          }
-        ]
+        "instr_per_iter": 3003.219684,
+        "cycles_per_iter": 704.78484,
+        "branches_per_iter": 513.508686,
+        "branch_misses_per_iter": 0.045374,
+        "ipc": 4.26118655446675
       },
-      "components": {
-        "puc": {
-          "instr_per_iter_total": 997.7,
-          "top3_by_symbol_group": {
-            "resume/yield C machinery (lua_resume 10.40 + auxresume 8.34 + luaB_coresume 6.31 + resume 1.15 + luaB_yield 0.89 + lua_yieldk 0.72 + setjmp/longjmp 1.42 + rawrunprotected 0.68)": {
-              "session_pct": 29.91,
-              "est_instr_per_iter": 298.4
-            },
-            "string-key global lookups (luaH_getshortstr: coroutine.resume / coroutine.yield GETFIELD per iter)": {
-              "session_pct": 26.21,
-              "est_instr_per_iter": 261.5
-            },
-            "luaV_execute (yielder loop + resume re-entry)": {
-              "session_pct": 21.11,
-              "est_instr_per_iter": 210.6
-            }
-          },
-          "note": "lighter decomposition: symbol groups only; PUC branch-misses 3.07/iter (setjmp/longjmp + stack shuffle) vs zig 0.046 \u2014 longjmp dominates PUC mispredicts"
+      "puc": {
+        "instr_per_iter": 1006.815028,
+        "cycles_per_iter": 345.113804,
+        "branches_per_iter": 186.07269,
+        "branch_misses_per_iter": 3.069174,
+        "ipc": 2.9173420950730793
+      },
+      "gap": {
+        "instr_per_iter_delta": 1996.4046560000002,
+        "instr_ratio": 2.9828911969716847,
+        "cycles_per_iter_delta": 359.671036,
+        "cycles_ratio": 2.0421809612692283
+      }
+    },
+    "metamethod_add": {
+      "n": 500000,
+      "zig": {
+        "instr_per_iter": 4871.217192,
+        "cycles_per_iter": 1273.201168,
+        "branches_per_iter": 747.659964,
+        "branch_misses_per_iter": 0.058078,
+        "ipc": 3.8259603544441614
+      },
+      "puc": {
+        "instr_per_iter": 2104.944416,
+        "cycles_per_iter": 471.496206,
+        "branches_per_iter": 427.46858,
+        "branch_misses_per_iter": 0.098714,
+        "ipc": 4.464393115392322
+      },
+      "gap": {
+        "instr_per_iter_delta": 2766.2727760000002,
+        "instr_ratio": 2.31417853838474,
+        "cycles_per_iter_delta": 801.704962,
+        "cycles_ratio": 2.700342339552145
+      }
+    },
+    "metamethod_call_noalloc": {
+      "n": 500000,
+      "zig": {
+        "instr_per_iter": 847.793402,
+        "cycles_per_iter": 167.953858,
+        "branches_per_iter": 130.701838,
+        "branch_misses_per_iter": 0.044808,
+        "ipc": 5.047775693250226
+      },
+      "puc": {
+        "instr_per_iter": 375.563568,
+        "cycles_per_iter": 71.734262,
+        "branches_per_iter": 57.802004,
+        "branch_misses_per_iter": 0.038698,
+        "ipc": 5.235483819433453
+      },
+      "gap": {
+        "instr_per_iter_delta": 472.22983400000004,
+        "instr_ratio": 2.257389891449748,
+        "cycles_per_iter_delta": 96.219596,
+        "cycles_ratio": 2.3413338803150996
+      }
+    }
+  },
+  "sessions": {
+    "lua_calls": {
+      "zig_symbols": [
+        {
+          "name": "vm.Vm.runBytecodeDispatch",
+          "session_pct": 84.36,
+          "est_i_per_iter": 569.5
         },
-        "zig": {
-          "instr_per_iter_total": 3007.3,
-          "top3_by_symbol_group": {
-            "VM dispatch core + frame entry/return + resume continuation (runBytecodeDispatch)": {
-              "session_pct": 61.12,
-              "est_instr_per_iter": 1838.0
-            },
-            "coroutine builtins (builtinCoroutineResume 12.38 + builtinCoroutineYield 5.47 + coroutineBuiltinFastPathEligible 2.10 + callCoroutineBuiltinDirect 1.23)": {
-              "session_pct": 21.18,
-              "est_instr_per_iter": 636.9
-            },
-            "runtime switch + re-entry (switchRuntime 4.81 + runBytecodeInternal 2.04 + growCtxFrame 1.44 + tryRequestBytecodeCoroutineSwitch 0.87 + tryPushBytecodeProtectedCall 0.75)": {
-              "session_pct": 9.91,
-              "est_instr_per_iter": 298.0
-            }
+        {
+          "name": "vm.Vm.pushStagedBytecodeExecFrame",
+          "session_pct": 9.71,
+          "est_i_per_iter": 65.6
+        },
+        {
+          "name": "vm.Vm.syncFrame",
+          "session_pct": 3.72,
+          "est_i_per_iter": 25.1
+        },
+        {
+          "name": "vm.FrameStack.addOne",
+          "session_pct": 1.64,
+          "est_i_per_iter": 11.1
+        }
+      ],
+      "zig_hot_lines_top15": [
+        {
+          "file": "src/lua/vm.zig",
+          "line": 15467,
+          "sym_pct": 10.02,
+          "session_pct": 8.453,
+          "est_i_per_iter": 57.1,
+          "what": "opReturn1 fast arm: src_val = ctx.regs[a] read (+ compiler spill vmovaps)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13268,
+          "sym_pct": 6.51,
+          "session_pct": 5.492,
+          "est_i_per_iter": 37.1,
+          "what": "dispatch switch (op)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 15152,
+          "sym_pct": 4.74,
+          "session_pct": 3.999,
+          "est_i_per_iter": 27.0,
+          "what": "ctx.pc += 1 (dispatch advance)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 14803,
+          "sym_pct": 4.69,
+          "session_pct": 3.956,
+          "est_i_per_iter": 26.7,
+          "what": "OP_CALL inline: child_nextra (vararg) computation"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13352,
+          "sym_pct": 4.69,
+          "session_pct": 3.956,
+          "est_i_per_iter": 26.7,
+          "what": "GETUPVAL: regs[a] = cur_upvalues[b].get (workload)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 703,
+          "sym_pct": 3.76,
+          "session_pct": 3.172,
+          "est_i_per_iter": 21.4,
+          "what": "Cell.get isOpen() branch (workload GETUPVAL)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 12983,
+          "sym_pct": 3.49,
+          "session_pct": 2.944,
+          "est_i_per_iter": 19.9,
+          "what": "frame-loop entry: cur_upvalues = bc_stack[func_slot].Closure.upvalues"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13068,
+          "sym_pct": 3.1,
+          "session_pct": 2.615,
+          "est_i_per_iter": 17.7,
+          "what": "combined stats+hooks dispatch gate"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13048,
+          "sym_pct": 2.88,
+          "session_pct": 2.43,
+          "est_i_per_iter": 16.4,
+          "what": "decode a = inst.a"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13046,
+          "sym_pct": 2.57,
+          "session_pct": 2.168,
+          "est_i_per_iter": 14.6,
+          "what": "instruction fetch: inst = code[pc]"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 15482,
+          "sym_pct": 2.24,
+          "session_pct": 1.89,
+          "est_i_per_iter": 12.8,
+          "what": "opReturn1: store into parent window"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 0,
+          "sym_pct": 2.17,
+          "session_pct": 1.831,
+          "est_i_per_iter": 12.4,
+          "what": "no line info (DWARF gap)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 15468,
+          "sym_pct": 2.14,
+          "session_pct": 1.805,
+          "est_i_per_iter": 12.2,
+          "what": "opReturn1: dst = originalFuncSlot - parent frameBase"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 12950,
+          "sym_pct": 1.83,
+          "session_pct": 1.544,
+          "est_i_per_iter": 10.4,
+          "what": "frame-loop entry: getPendingCallConst check"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 1782,
+          "sym_pct": 1.78,
+          "session_pct": 1.502,
+          "est_i_per_iter": 10.1,
+          "what": "FrameStack.getPtr inline"
+        }
+      ],
+      "puc_symbols": [
+        {
+          "name": "luaV_execute",
+          "session_pct": 78.68,
+          "est_i_per_iter": 202.3
+        },
+        {
+          "name": "luaD_precall",
+          "session_pct": 20.42,
+          "est_i_per_iter": 52.5
+        }
+      ]
+    },
+    "metamethod_call_noalloc": {
+      "zig_symbols": [
+        {
+          "name": "vm.Vm.runBytecodeDispatch",
+          "session_pct": 59.32,
+          "est_i_per_iter": 502.9
+        },
+        {
+          "name": "vm.Vm.getTmByObj",
+          "session_pct": 11.42,
+          "est_i_per_iter": 96.8
+        },
+        {
+          "name": "vm.Vm.pushStagedBytecodeExecFrame",
+          "session_pct": 7.96,
+          "est_i_per_iter": 67.5
+        },
+        {
+          "name": "vm.Vm.tryPushSimpleResultMetamethod",
+          "session_pct": 6.77,
+          "est_i_per_iter": 57.4
+        },
+        {
+          "name": "vm.Vm.pushResolvedBytecodeClosure__anon_61927",
+          "session_pct": 6.68,
+          "est_i_per_iter": 56.6
+        },
+        {
+          "name": "vm.Vm.syncFrame",
+          "session_pct": 1.49,
+          "est_i_per_iter": 12.6
+        },
+        {
+          "name": "vm.FrameStack.addOne",
+          "session_pct": 1.38,
+          "est_i_per_iter": 11.7
+        },
+        {
+          "name": "vm.Vm.dispatchCalleeActivationHook",
+          "session_pct": 0.87,
+          "est_i_per_iter": 7.4
+        },
+        {
+          "name": "vm.Vm.gcPropagateOne",
+          "session_pct": 0.42,
+          "est_i_per_iter": 3.6
+        },
+        {
+          "name": "vm.Vm.rawSet",
+          "session_pct": 0.38,
+          "est_i_per_iter": 3.2
+        },
+        {
+          "name": "ltable.nodeInsert",
+          "session_pct": 0.36,
+          "est_i_per_iter": 3.1
+        },
+        {
+          "name": "vm.Vm.tableResize",
+          "session_pct": 0.34,
+          "est_i_per_iter": 2.9
+        }
+      ],
+      "zig_hot_lines_top15": [
+        {
+          "file": "src/lua/vm.zig",
+          "line": 15521,
+          "sym_pct": 15.74,
+          "session_pct": 9.337,
+          "est_i_per_iter": 79.2,
+          "what": "opReturn1 simple_result value arm: bc_stack[parent.frameBase+sr_dst] = src_val (single-copy store seq)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13268,
+          "sym_pct": 6.56,
+          "session_pct": 3.891,
+          "est_i_per_iter": 33.0,
+          "what": "dispatch switch (op)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 35316,
+          "sym_pct": 3.88,
+          "session_pct": 2.302,
+          "est_i_per_iter": 19.5,
+          "what": "findBinaryTm: getTmByObj(lhs) orelse getTmByObj(rhs)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13352,
+          "sym_pct": 3.75,
+          "session_pct": 2.224,
+          "est_i_per_iter": 18.9,
+          "what": "GETUPVAL (workload: box_noalloc upvalue)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13046,
+          "sym_pct": 3.58,
+          "session_pct": 2.124,
+          "est_i_per_iter": 18.0,
+          "what": "instruction fetch"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 0,
+          "sym_pct": 3.57,
+          "session_pct": 2.118,
+          "est_i_per_iter": 18.0,
+          "what": "no line info (DWARF gap)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 14925,
+          "sym_pct": 2.78,
+          "session_pct": 1.649,
+          "est_i_per_iter": 14.0,
+          "what": "FORLOOP: regs[a+1]==.Int check"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 15152,
+          "sym_pct": 2.62,
+          "session_pct": 1.554,
+          "est_i_per_iter": 13.2,
+          "what": "ctx.pc += 1"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 14332,
+          "sym_pct": 2.56,
+          "session_pct": 1.519,
+          "est_i_per_iter": 12.9,
+          "what": "MMBIN: tm==null check"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13068,
+          "sym_pct": 2.22,
+          "session_pct": 1.317,
+          "est_i_per_iter": 11.2,
+          "what": "dispatch gate"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13790,
+          "sym_pct": 2.17,
+          "session_pct": 1.287,
+          "est_i_per_iter": 10.9,
+          "what": "ADD: rc = regs[c] read (workload)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 703,
+          "sym_pct": 2.1,
+          "session_pct": 1.246,
+          "est_i_per_iter": 10.6,
+          "what": "Cell.get isOpen"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 1782,
+          "sym_pct": 1.89,
+          "session_pct": 1.121,
+          "est_i_per_iter": 9.5,
+          "what": "FrameStack.getPtr inline"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13048,
+          "sym_pct": 1.76,
+          "session_pct": 1.044,
+          "est_i_per_iter": 8.9,
+          "what": "decode a"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 15500,
+          "sym_pct": 1.65,
+          "session_pct": 0.979,
+          "est_i_per_iter": 8.3,
+          "what": "opReturn1: parent hasSimpleResult check"
+        }
+      ],
+      "puc_symbols": [
+        {
+          "name": "luaV_execute",
+          "session_pct": 39.41,
+          "est_i_per_iter": 148.0
+        },
+        {
+          "name": "luaD_precall",
+          "session_pct": 15.8,
+          "est_i_per_iter": 59.3
+        },
+        {
+          "name": "luaH_Hgetshortstr",
+          "session_pct": 11.02,
+          "est_i_per_iter": 41.4
+        },
+        {
+          "name": "luaT_callTMres",
+          "session_pct": 7.6,
+          "est_i_per_iter": 28.5
+        },
+        {
+          "name": "luaT_trybinTM",
+          "session_pct": 6.36,
+          "est_i_per_iter": 23.9
+        },
+        {
+          "name": "callbinTM",
+          "session_pct": 5.87,
+          "est_i_per_iter": 22.0
+        },
+        {
+          "name": "luaD_call",
+          "session_pct": 4.55,
+          "est_i_per_iter": 17.1
+        },
+        {
+          "name": "luaT_gettmbyobj",
+          "session_pct": 2.28,
+          "est_i_per_iter": 8.6
+        },
+        {
+          "name": "luaH_resize",
+          "session_pct": 0.93,
+          "est_i_per_iter": 3.5
+        },
+        {
+          "name": "insertkey",
+          "session_pct": 0.7,
+          "est_i_per_iter": 2.6
+        },
+        {
+          "name": "mainpositionTV.isra.0",
+          "session_pct": 0.52,
+          "est_i_per_iter": 2.0
+        }
+      ]
+    },
+    "coroutine_yield": {
+      "zig_symbols": [
+        {
+          "name": "vm.Vm.runBytecodeDispatch",
+          "session_pct": 63.56,
+          "est_i_per_iter": 1908.8
+        },
+        {
+          "name": "vm.Vm.builtinCoroutineResume",
+          "session_pct": 10.91,
+          "est_i_per_iter": 327.7
+        },
+        {
+          "name": "vm.Vm.builtinCoroutineYield",
+          "session_pct": 5.23,
+          "est_i_per_iter": 157.1
+        },
+        {
+          "name": "vm.Vm.switchRuntime",
+          "session_pct": 4.21,
+          "est_i_per_iter": 126.4
+        },
+        {
+          "name": "vm.Vm.runBytecodeInternal",
+          "session_pct": 2.05,
+          "est_i_per_iter": 61.6
+        },
+        {
+          "name": "vm.Vm.growCtxFrame",
+          "session_pct": 1.59,
+          "est_i_per_iter": 47.8
+        },
+        {
+          "name": "vm.Vm.coroutineBuiltinFastPathEligible",
+          "session_pct": 1.48,
+          "est_i_per_iter": 44.4
+        },
+        {
+          "name": "vm.Vm.tryPushBytecodeProtectedCall",
+          "session_pct": 1.1,
+          "est_i_per_iter": 33.0
+        },
+        {
+          "name": "vm.Vm.callCoroutineBuiltinDirect",
+          "session_pct": 1.1,
+          "est_i_per_iter": 33.0
+        },
+        {
+          "name": "vm.Vm.builtinOutLen",
+          "session_pct": 1.08,
+          "est_i_per_iter": 32.4
+        },
+        {
+          "name": "compiler_rt.memcpy.memcpyFast",
+          "session_pct": 1.03,
+          "est_i_per_iter": 30.9
+        },
+        {
+          "name": "vm.InlineValues.setFrom",
+          "session_pct": 0.91,
+          "est_i_per_iter": 27.3
+        },
+        {
+          "name": "vm.Vm.tryRequestBytecodeCoroutineSwitch",
+          "session_pct": 0.86,
+          "est_i_per_iter": 25.8
+        },
+        {
+          "name": "mem.eql__anon_3046",
+          "session_pct": 0.71,
+          "est_i_per_iter": 21.3
+        },
+        {
+          "name": "vm.Vm.clearErrorTraceback",
+          "session_pct": 0.55,
+          "est_i_per_iter": 16.5
+        },
+        {
+          "name": "vm.Vm.builtinHasDynamicOutCount",
+          "session_pct": 0.51,
+          "est_i_per_iter": 15.3
+        },
+        {
+          "name": "vm.Vm.condGcFromDispatch",
+          "session_pct": 0.51,
+          "est_i_per_iter": 15.3
+        },
+        {
+          "name": "vm.Vm.syncFrame",
+          "session_pct": 0.47,
+          "est_i_per_iter": 14.1
+        },
+        {
+          "name": "vm.Vm.dispatchBytecodeHookWithCallee",
+          "session_pct": 0.44,
+          "est_i_per_iter": 13.2
+        },
+        {
+          "name": "vm.Vm.hasActiveBytecodeNonYieldableBoundary",
+          "session_pct": 0.39,
+          "est_i_per_iter": 11.7
+        }
+      ],
+      "zig_hot_lines_top15": [
+        {
+          "file": "src/lua/ltable.zig",
+          "line": 125,
+          "sym_pct": 9.08,
+          "session_pct": 5.771,
+          "est_i_per_iter": 173.3,
+          "what": "ltable Node.isEmpty (nodeLookupStr bucket check; file ltable.zig)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 2355,
+          "sym_pct": 7.26,
+          "session_pct": 4.614,
+          "est_i_per_iter": 138.6,
+          "what": "LuaString.isShort srkind>=0 (luaStringEq pointer-eq; string-key lookup)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13268,
+          "sym_pct": 7.13,
+          "session_pct": 4.532,
+          "est_i_per_iter": 136.1,
+          "what": "dispatch switch (op)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13366,
+          "sym_pct": 5.44,
+          "session_pct": 3.458,
+          "est_i_per_iter": 103.9,
+          "what": "GETTABUP fast filter: env==.Table and mt==null (_ENV.coroutine)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 703,
+          "sym_pct": 3.72,
+          "session_pct": 2.364,
+          "est_i_per_iter": 71.0,
+          "what": "Cell.get isOpen (upvalue access)"
+        },
+        {
+          "file": "src/lua/ltable.zig",
+          "line": 594,
+          "sym_pct": 3.02,
+          "session_pct": 1.92,
+          "est_i_per_iter": 57.7,
+          "what": "nodeLookupStr: key_tt==.string and luaStringEq (ltable.zig)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13516,
+          "sym_pct": 2.42,
+          "session_pct": 1.538,
+          "est_i_per_iter": 46.2,
+          "what": "GETFIELD fast filter: obj==.Table and mt==null (coroutine.resume)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13048,
+          "sym_pct": 1.74,
+          "session_pct": 1.106,
+          "est_i_per_iter": 33.2,
+          "what": "decode a"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13357,
+          "sym_pct": 1.59,
+          "session_pct": 1.011,
+          "est_i_per_iter": 30.4,
+          "what": "GETTABUP: env = cur_upvalues[b].get"
+        },
+        {
+          "file": "src/lua/ltable.zig",
+          "line": 585,
+          "sym_pct": 1.47,
+          "session_pct": 0.934,
+          "est_i_per_iter": 28.0,
+          "what": "nodeLookupStr: main position hash (ltable.zig)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13046,
+          "sym_pct": 1.2,
+          "session_pct": 0.763,
+          "est_i_per_iter": 22.9,
+          "what": "instruction fetch"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13358,
+          "sym_pct": 1.15,
+          "session_pct": 0.731,
+          "est_i_per_iter": 22.0,
+          "what": "GETTABUP: key = resolved_values[c]"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13068,
+          "sym_pct": 1.11,
+          "session_pct": 0.706,
+          "est_i_per_iter": 21.2,
+          "what": "dispatch gate"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 12983,
+          "sym_pct": 1.09,
+          "session_pct": 0.693,
+          "est_i_per_iter": 20.8,
+          "what": "entry: upvalues load"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 16800,
+          "sym_pct": 1.06,
+          "session_pct": 0.674,
+          "est_i_per_iter": 20.2,
+          "what": "opCall builtin: tryRequestBytecodeCoroutineSwitch call site"
+        }
+      ],
+      "puc_symbols": [
+        {
+          "name": "luaH_getshortstr",
+          "session_pct": 26.0,
+          "est_i_per_iter": 261.8
+        },
+        {
+          "name": "luaV_execute",
+          "session_pct": 20.99,
+          "est_i_per_iter": 211.3
+        },
+        {
+          "name": "lua_resume",
+          "session_pct": 9.35,
+          "est_i_per_iter": 94.1
+        },
+        {
+          "name": "luaB_coresume",
+          "session_pct": 7.62,
+          "est_i_per_iter": 76.7
+        },
+        {
+          "name": "auxresume",
+          "session_pct": 7.25,
+          "est_i_per_iter": 73.0
+        },
+        {
+          "name": "lua_xmove",
+          "session_pct": 3.44,
+          "est_i_per_iter": 34.6
+        },
+        {
+          "name": "lua_rotate",
+          "session_pct": 2.86,
+          "est_i_per_iter": 28.8
+        },
+        {
+          "name": "luaD_precall",
+          "session_pct": 2.73,
+          "est_i_per_iter": 27.5
+        },
+        {
+          "name": "luaD_poscall",
+          "session_pct": 2.66,
+          "est_i_per_iter": 26.8
+        },
+        {
+          "name": "lua_checkstack",
+          "session_pct": 2.37,
+          "est_i_per_iter": 23.9
+        },
+        {
+          "name": "lua_pushboolean",
+          "session_pct": 1.77,
+          "est_i_per_iter": 17.8
+        },
+        {
+          "name": "resume",
+          "session_pct": 1.18,
+          "est_i_per_iter": 11.9
+        },
+        {
+          "name": "luaD_rawrunprotected",
+          "session_pct": 1.08,
+          "est_i_per_iter": 10.9
+        },
+        {
+          "name": "lua_gettop",
+          "session_pct": 0.89,
+          "est_i_per_iter": 9.0
+        },
+        {
+          "name": "__sigsetjmp+siglongjmp+plt",
+          "session_pct": 2.44,
+          "est_i_per_iter": 24.6
+        },
+        {
+          "name": "luaD_throw",
+          "session_pct": 0.71,
+          "est_i_per_iter": 7.1
+        },
+        {
+          "name": "luaV_finishOp",
+          "session_pct": 0.68,
+          "est_i_per_iter": 6.8
+        },
+        {
+          "name": "lua_yieldk",
+          "session_pct": 0.52,
+          "est_i_per_iter": 5.2
+        },
+        {
+          "name": "luaB_yield",
+          "session_pct": 0.49,
+          "est_i_per_iter": 4.9
+        }
+      ]
+    },
+    "branch_loop": {
+      "zig_symbols": [
+        {
+          "name": "vm.Vm.runBytecodeDispatch",
+          "session_pct": 99.86,
+          "est_i_per_iter": 259.5
+        }
+      ],
+      "zig_hot_lines_top15": [
+        {
+          "file": "src/lua/vm.zig",
+          "line": 0,
+          "sym_pct": 30.37,
+          "session_pct": 30.327,
+          "est_i_per_iter": 78.8,
+          "what": "no line info (DWARF gap; jump-table/decode fusion region)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13268,
+          "sym_pct": 16.31,
+          "session_pct": 16.287,
+          "est_i_per_iter": 42.3,
+          "what": "dispatch switch (op)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13048,
+          "sym_pct": 5.44,
+          "session_pct": 5.432,
+          "est_i_per_iter": 14.1,
+          "what": "decode a"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13045,
+          "sym_pct": 4.31,
+          "session_pct": 4.304,
+          "est_i_per_iter": 11.2,
+          "what": "inner while condition"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13049,
+          "sym_pct": 3.23,
+          "session_pct": 3.225,
+          "est_i_per_iter": 8.4,
+          "what": "decode b"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13050,
+          "sym_pct": 2.64,
+          "session_pct": 2.636,
+          "est_i_per_iter": 6.8,
+          "what": "decode c"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13046,
+          "sym_pct": 2.4,
+          "session_pct": 2.397,
+          "est_i_per_iter": 6.2,
+          "what": "instruction fetch"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 14652,
+          "sym_pct": 2.22,
+          "session_pct": 2.217,
+          "est_i_per_iter": 5.8,
+          "what": "MODK/eq chain (workload)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13064,
+          "sym_pct": 2.21,
+          "session_pct": 2.207,
+          "est_i_per_iter": 5.7,
+          "what": "dispatch_pc publish: self.dispatch_pc = ctx.pc"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 13068,
+          "sym_pct": 1.86,
+          "session_pct": 1.857,
+          "est_i_per_iter": 4.8,
+          "what": "dispatch gate"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 14646,
+          "sym_pct": 1.21,
+          "session_pct": 1.208,
+          "est_i_per_iter": 3.1,
+          "what": "workload op"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 15152,
+          "sym_pct": 1.15,
+          "session_pct": 1.148,
+          "est_i_per_iter": 3.0,
+          "what": "ctx.pc += 1"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 14123,
+          "sym_pct": 1.05,
+          "session_pct": 1.049,
+          "est_i_per_iter": 2.7,
+          "what": "workload op (addi/subi family)"
+        },
+        {
+          "file": "src/lua/vm.zig",
+          "line": 14122,
+          "sym_pct": 0.78,
+          "session_pct": 0.779,
+          "est_i_per_iter": 2.0,
+          "what": "workload op"
+        },
+        {
+          "file": "src/lua/bytecode.zig",
+          "line": 67,
+          "sym_pct": 0.7,
+          "session_pct": 0.699,
+          "est_i_per_iter": 1.8,
+          "what": "?"
+        }
+      ],
+      "puc_symbols": [
+        {
+          "note": "PUC perf record session not collected for branch_loop (task scope: lc/na/cy only); counters-only comparison"
+        }
+      ]
+    }
+  },
+  "decompositions": {
+    "lua_calls": {
+      "zig_total_instr_per_iter": 675.1241202,
+      "puc_total_instr_per_iter": 257.129936,
+      "zig": {
+        "runBytecodeDispatch_session_share": 84.36,
+        "components": {
+          "dispatch core (switch 13268, gate 13068, fetch 13046, pc+=1 15152, dispatch_pc 13064, decode 13047-13050, loop cond 13045)": {
+            "session_pct_listed": 18.59,
+            "session_pct_incl_below_threshold_est": 21.19,
+            "est_instr_per_iter": 143.0,
+            "lines": [
+              {
+                "line": "src/lua/vm.zig:13268",
+                "session_pct": 5.492,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:13068",
+                "session_pct": 2.615,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:13046",
+                "session_pct": 2.168,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:15152",
+                "session_pct": 3.999,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:13064",
+                "session_pct": 0.616,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:13048",
+                "session_pct": 2.43,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:13049",
+                "session_pct": 1.265,
+                "what": ""
+              }
+            ],
+            "note": "below-threshold est: cond 13045 ~1.6 + decode-c 13050 ~1.0 (scaled from branch_loop per-op costs); listed=18.60 sess=125.6 i/it"
           },
-          "note": "lighter decomposition: symbol groups only; stack shuffle residue (memcpy 0.96 + setFrom 0.77 + mem.eql 0.87) ~= 2.6%"
+          "opReturn completion / return+pop (switch site 14889, tbc check 15407, parent checks 15441/15450, nresults 15457, src_val 15467, dst 15468, stack_top 15476, store 15482)": {
+            "session_pct_listed": 16.44,
+            "session_pct_incl_below_threshold_est": 17.94,
+            "est_instr_per_iter": 121.1,
+            "lines": [
+              {
+                "line": "src/lua/vm.zig:14889",
+                "session_pct": 0.582,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:15407",
+                "session_pct": 0.633,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:15441",
+                "session_pct": 0.683,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:15450",
+                "session_pct": 0.742,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:15457",
+                "session_pct": 1.046,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:15467",
+                "session_pct": 8.453,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:15468",
+                "session_pct": 1.805,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:15476",
+                "session_pct": 0.607,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:15482",
+                "session_pct": 1.89,
+                "what": ""
+              }
+            ],
+            "note": "listed=16.44 sess=111.0 i/it; 15467 alone 8.45 sess (57.1 i/it) \u2014 includes a compiler spill (vmovaps) of src_val; below-thresh est: hasOpenUpvalues/isDebugHook/parent_idx/decodeNresults/callstatus=0/shrinkTo/pc+=1"
+          },
+          "OP_CALL inline staging (callee 14789, filter 14792, proto 14794, nresults 14796, nargs 14797, child_nextra 14803)": {
+            "session_pct_listed": 7.65,
+            "session_pct_incl_below_threshold_est": 8.15,
+            "est_instr_per_iter": 55.0,
+            "lines": [
+              {
+                "line": "src/lua/vm.zig:14789",
+                "session_pct": 0.692,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:14792",
+                "session_pct": 0.666,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:14794",
+                "session_pct": 0.97,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:14796",
+                "session_pct": 0.717,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:14797",
+                "session_pct": 0.65,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:14803",
+                "session_pct": 3.956,
+                "what": ""
+              }
+            ],
+            "note": "listed=7.66 sess=51.7 i/it; below-thresh: ensureBcStackCap 14807 + regs re-derive 14808"
+          },
+          "frame-loop entry+reload (pending 12950, upvalues 12983, pc 12987)": {
+            "session_pct_listed": 5.8,
+            "session_pct_incl_below_threshold_est": 7.3,
+            "est_instr_per_iter": 49.3,
+            "lines": [
+              {
+                "line": "src/lua/vm.zig:12950",
+                "session_pct": 1.544,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:12983",
+                "session_pct": 2.944,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:12987",
+                "session_pct": 1.308,
+                "what": ""
+              }
+            ],
+            "note": "listed=5.79 sess=39.1 i/it; 2 entries per iteration (child + return-to-parent) => ~19.5 i/it listed per entry; below-thresh est: while-cond 12947, frame_identity 12965, fr/fb/proto 12979-12982, base 12984, cap 12985, regs 12988; P16.22 T3 (direct Lua-arm) visible vs prior 8.57 sess/59.2 i/it"
+          },
+          "workload handlers (MOVE 13312, GETUPVAL 13352, Cell.get 703, ADDI 14044, FORLOOP 14925/14927/14931/14934)": {
+            "session_pct_listed": 11.25,
+            "session_pct_incl_below_threshold_est": 12.05,
+            "est_instr_per_iter": 81.4,
+            "lines": [
+              {
+                "line": "src/lua/vm.zig:13312",
+                "session_pct": 1.308,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:13352",
+                "session_pct": 3.956,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:703",
+                "session_pct": 3.172,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:14044",
+                "session_pct": 0.725,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:14925",
+                "session_pct": 0.54,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:14927",
+                "session_pct": 0.439,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:14931",
+                "session_pct": 0.498,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:14934",
+                "session_pct": 0.616,
+                "what": ""
+              }
+            ],
+            "note": "listed=11.27 sess=76.1 i/it; below-thresh: Cell.get 705/706, FORLOOP step/idx reads"
+          },
+          "FrameStack access inline (len 1775, getPtr 1782, topPtr 1813, addOne-cap 1868)": {
+            "session_pct_listed": 4.14,
+            "session_pct_incl_below_threshold_est": 4.54,
+            "est_instr_per_iter": 30.7,
+            "lines": [
+              {
+                "line": "src/lua/vm.zig:1775",
+                "session_pct": 1.476,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:1782",
+                "session_pct": 1.502,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:1813",
+                "session_pct": 0.7,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:1868",
+                "session_pct": 0.464,
+                "what": ""
+              }
+            ],
+            "note": "listed=4.14 sess=27.9 i/it"
+          },
+          "SIGINT poll (atomic load at backward jumps, std/atomic.zig:21)": {
+            "session_pct_listed": 1.41,
+            "session_pct_incl_below_threshold_est": 1.41,
+            "est_instr_per_iter": 9.5,
+            "lines": [
+              {
+                "line": "src/lua/vm.zig:21",
+                "session_pct": 1.409,
+                "what": ""
+              }
+            ],
+            "note": "attributed to std/atomic.zig:21 \u2014 signal_int_pending.load at JMP/backward-jump checks"
+          },
+          "vm.zig:0 no line info (in-symbol)": {
+            "session_pct_listed": 1.83,
+            "session_pct_incl_below_threshold_est": 1.83,
+            "est_instr_per_iter": 12.4,
+            "lines": [
+              {
+                "line": "src/lua/vm.zig:0",
+                "session_pct": 1.831,
+                "what": ""
+              }
+            ]
+          },
+          "rbd_unlisted_tail (DWARF lines below display threshold in runBytecodeDispatch)": {
+            "session_pct": 15.34,
+            "est_instr_per_iter": 103.5,
+            "note": "prior artifact: 15.08 sess / 104.1 i/it \u2014 nearly unchanged"
+          },
+          "pushStagedBytecodeExecFrame (out-of-line symbol)": {
+            "session_pct": 9.71,
+            "est_instr_per_iter": 65.6,
+            "internal_lines": [
+              {
+                "line": "src/lua/vm.zig:0",
+                "session_pct": 1.861,
+                "est_i_per_iter": 12.6
+              },
+              {
+                "line": "src/lua/vm.zig:11959",
+                "session_pct": 1.721,
+                "est_i_per_iter": 11.6
+              },
+              {
+                "line": "src/lua/vm.zig:12003",
+                "session_pct": 1.0,
+                "est_i_per_iter": 6.8
+              },
+              {
+                "line": "src/lua/vm.zig:1267",
+                "session_pct": 0.842,
+                "est_i_per_iter": 5.7
+              },
+              {
+                "line": "src/lua/vm.zig:12102",
+                "session_pct": 0.799,
+                "est_i_per_iter": 5.4
+              },
+              {
+                "line": "src/lua/vm.zig:12161",
+                "session_pct": 0.688,
+                "est_i_per_iter": 4.6
+              },
+              {
+                "line": "src/lua/vm.zig:12123",
+                "session_pct": 0.639,
+                "est_i_per_iter": 4.3
+              },
+              {
+                "line": "src/lua/vm.zig:12008",
+                "session_pct": 0.62,
+                "est_i_per_iter": 4.2
+              },
+              {
+                "line": "src/lua/vm.zig:12061",
+                "session_pct": 0.576,
+                "est_i_per_iter": 3.9
+              },
+              {
+                "line": "src/lua/vm.zig:12038",
+                "session_pct": 0.185,
+                "est_i_per_iter": 1.2
+              }
+            ],
+            "note": "prior: 10.1 sess / 69.7 i/it"
+          },
+          "syncFrame publication (out-of-line symbol, defer fires 2x/iter)": {
+            "session_pct": 3.72,
+            "est_instr_per_iter": 25.1,
+            "internal_lines": [
+              {
+                "line": "src/lua/vm.zig:12867",
+                "session_pct": 1.992
+              },
+              {
+                "line": "src/lua/vm.zig:12873",
+                "session_pct": 0.836
+              },
+              {
+                "line": "src/lua/vm.zig:12870",
+                "session_pct": 0.815
+              }
+            ],
+            "note": "prior: 4.62 sess / 31.9 i/it; plus inlined defer registration 12995 (1.16 sess)"
+          },
+          "FrameStack.addOne (out-of-line symbol)": {
+            "session_pct": 1.64,
+            "est_instr_per_iter": 11.1
+          },
+          "alloc/hash residue (out-of-line)": {
+            "session_pct": 0.26,
+            "est_instr_per_iter": 1.8
+          }
+        }
+      },
+      "puc": {
+        "luaV_execute_session_share": 78.68,
+        "instr_per_iter_total": 257.129936,
+        "by_symbol": {
+          "luaV_execute": {
+            "session_pct": 78.68,
+            "est_instr_per_iter": 202.3
+          },
+          "luaD_precall": {
+            "session_pct": 20.42,
+            "est_instr_per_iter": 52.5
+          },
+          "other": {
+            "session_pct": 0.9,
+            "est_instr_per_iter": 2.3
+          }
+        },
+        "intra_luaV_execute_estimates": {
+          "note": "P16.19 instruction-address-range decomposition of the SAME binary (sha d54bc45e1757b216) on the SAME workload, rescaled 78.68/78.28 (+0.5%) to the fresh session share",
+          "luaV prologue/epilogue (fresh C invocation)": 1.2,
+          "startfunc/returning entry (cl/k/pc/base reload per frame)": 22.6,
+          "vmfetch trap test": 4.6,
+          "fetch+pc++": 5.8,
+          "opcode dispatch (decode op & jmp *disptab)": 19.2,
+          "OP_CALL inline (top/savedpc, call luaD_precall, updatetrap)": 9.9,
+          "OP_RETURN1 inline (hookmask chk, L->ci=prev, result copy, L->top)": 13.5,
+          "ret: (CIST_FRESH test; ci=ci->previous; goto returning)": 2.2,
+          "workload opcode handlers (MOVE/GETUPVAL/ADD/FORLOOP/FORPREP inline; residual)": 122.2
         }
       },
       "gap": {
-        "instr_per_iter_zig_minus_puc": 2009.5,
-        "ratio_zig_over_puc": 3.014
+        "instr_per_iter_zig_minus_puc": 418.0,
+        "ratio_zig_over_puc": 2.6256146238841676
+      },
+      "rbd_internal_accounting": {
+        "note": "session-% ledger for the runBytecodeDispatch (rbd) share 84.36: grouped-listed + ungrouped-listed + unlisted_tail = 84.36. The per-component below_threshold_est fields PARTITION the unlisted_tail (they estimate which component owns which below-threshold lines) and must NOT be summed on top of rbd_unlisted_tail.",
+        "grouped_listed_sess": 67.11,
+        "rbd_table_total_listed_sess": 69.02,
+        "unlisted_tail_sess": 15.34,
+        "out_of_line_symbols_sess": {
+          "pushStagedBytecodeExecFrame": 9.71,
+          "syncFrame": 3.72,
+          "FrameStack.addOne": 1.64,
+          "residue": 0.26
+        }
       }
+    },
+    "metamethod_call_noalloc": {
+      "zig_total_instr_per_iter": 847.793402,
+      "puc_total_instr_per_iter": 375.563568,
+      "zig": {
+        "runBytecodeDispatch_session_share": 59.32,
+        "components": {
+          "dispatch core (switch 13268, gate 13068, fetch 13046, pc+=1 15152, dispatch_pc 13064, decode 13048/13049/13050)": {
+            "session_pct_listed": 11.24,
+            "session_pct_incl_below_threshold_est": 12.04,
+            "est_instr_per_iter": 102.1,
+            "lines": [
+              {
+                "line": "src/lua/vm.zig:13268",
+                "session_pct": 3.891,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:13068",
+                "session_pct": 1.317,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:13046",
+                "session_pct": 2.124,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:15152",
+                "session_pct": 1.554,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:13064",
+                "session_pct": 0.872,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:13048",
+                "session_pct": 1.044,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:13050",
+                "session_pct": 0.439,
+                "what": ""
+              }
+            ],
+            "note": "listed=11.83 sess=100.3 i/it; below-thresh est: cond 13045 + op decode 13047"
+          },
+          "TM lookup inline (findBinaryTm 35316 in MMBIN)": {
+            "session_pct_listed": 2.3,
+            "session_pct_incl_below_threshold_est": 2.3,
+            "est_instr_per_iter": 19.5,
+            "lines": [
+              {
+                "line": "src/lua/vm.zig:35316",
+                "session_pct": 2.302,
+                "what": ""
+              }
+            ],
+            "note": "the second getTmByObj(rhs) call is the out-of-line symbol below"
+          },
+          "TM lookup out-of-line (getTmByObj symbol: metatable fetch 35227/35228, getTm 35286, nodeLookupShortStrIdentity ltable 719/725, mis-attributed ltable.zig:2355)": {
+            "session_pct": 11.42,
+            "est_instr_per_iter": 96.8,
+            "internal_lines": [
+              {
+                "line": "src/lua/ltable.zig:2355",
+                "session_pct": 3.322,
+                "est_i_per_iter": 28.2
+              },
+              {
+                "line": "src/lua/ltable.zig:719",
+                "session_pct": 1.485,
+                "est_i_per_iter": 12.6
+              },
+              {
+                "line": "src/lua/vm.zig:35307",
+                "session_pct": 1.378,
+                "est_i_per_iter": 11.7
+              },
+              {
+                "line": "src/lua/vm.zig:0",
+                "session_pct": 1.12,
+                "est_i_per_iter": 9.5
+              },
+              {
+                "line": "src/lua/ltable.zig:0",
+                "session_pct": 0.932,
+                "est_i_per_iter": 7.9
+              },
+              {
+                "line": "src/lua/vm.zig:35305",
+                "session_pct": 0.643,
+                "est_i_per_iter": 5.5
+              },
+              {
+                "line": "src/lua/ltable.zig:725",
+                "session_pct": 0.636,
+                "est_i_per_iter": 5.4
+              },
+              {
+                "line": "src/lua/vm.zig:35227",
+                "session_pct": 0.6,
+                "est_i_per_iter": 5.1
+              },
+              {
+                "line": "src/lua/vm.zig:35228",
+                "session_pct": 0.585,
+                "est_i_per_iter": 5.0
+              },
+              {
+                "line": "src/lua/vm.zig:35286",
+                "session_pct": 0.5,
+                "est_i_per_iter": 4.2
+              }
+            ],
+            "note": "ltable.zig:2355 is beyond EOF (2074 lines) \u2014 stale DWARF line for the nodeLookupShortStrIdentity chain inside getTm; prior: 9.45 sess / 82.4 i/it \u2014 TM lookup GREW ~+14 i/it"
+          },
+          "MMBIN staging inline (pi 14323, lhs 14325, tm==null 14332, call site 14340, completion arg 14346)": {
+            "session_pct_listed": 3.42,
+            "session_pct_incl_below_threshold_est": 3.92,
+            "est_instr_per_iter": 33.3,
+            "lines": [
+              {
+                "line": "src/lua/vm.zig:14323",
+                "session_pct": 0.653,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:14325",
+                "session_pct": 0.445,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:14332",
+                "session_pct": 1.519,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:14340",
+                "session_pct": 0.362,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:14346",
+                "session_pct": 0.445,
+                "what": ""
+              }
+            ],
+            "note": "listed=3.43 sess=29.1 i/it; below-thresh: rhs 14326, pc sync 14339, .value store 14350/14351"
+          },
+          "opReturn completion (opReturn1 simple_result arm: checks 15441/15449/15500, pop 15509, single-copy 15521, reg_top 15522)": {
+            "session_pct_listed": 11.96,
+            "session_pct_incl_below_threshold_est": 13.46,
+            "est_instr_per_iter": 114.2,
+            "lines": [
+              {
+                "line": "src/lua/vm.zig:15441",
+                "session_pct": 0.421,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:15449",
+                "session_pct": 0.374,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:15500",
+                "session_pct": 0.979,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:15509",
+                "session_pct": 0.427,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:15521",
+                "session_pct": 9.337,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:15522",
+                "session_pct": 0.427,
+                "what": ""
+              }
+            ],
+            "note": "listed=11.97 sess=101.5 i/it; below-thresh est: src_val 15504, decodeNresults, has_pending_tbc 15406/15407, hasOpenUpvalues 15439, isDebugHook 15440, parent_idx 15444, callstatus=0 15508, shrinkTo 15510, pc+=1 15523/15526, clearSimpleResult 15525, switch site 14889 \u2014 total ~13.5 sess ~114 i/it, matching the prior 13.12 sess / 114.4 i/it claim"
+          },
+          "frame-loop entry+reload (pending 12950, identity 12965, upvalues 12983, pc 12987, base 12984, regs 12988)": {
+            "session_pct_listed": 4.12,
+            "session_pct_incl_below_threshold_est": 5.32,
+            "est_instr_per_iter": 45.1,
+            "lines": [
+              {
+                "line": "src/lua/vm.zig:12950",
+                "session_pct": 0.967,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:12965",
+                "session_pct": 0.825,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:12983",
+                "session_pct": 0.777,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:12987",
+                "session_pct": 0.599,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:12984",
+                "session_pct": 0.433,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:12988",
+                "session_pct": 0.522,
+                "what": ""
+              }
+            ],
+            "note": "listed=4.13 sess=35.0 i/it; 2 entries per iteration (metamethod child + return-to-bench); prior: 5.71 sess / 49.8 \u2014 P16.22 T3 visible"
+          },
+          "workload handlers (GETUPVAL 13352, Cell.get 703/705/706, ADD 13789/13790, FORLOOP 14925/14932/14934)": {
+            "session_pct_listed": 8.71,
+            "session_pct_incl_below_threshold_est": 9.21,
+            "est_instr_per_iter": 78.1,
+            "lines": [
+              {
+                "line": "src/lua/vm.zig:13352",
+                "session_pct": 2.224,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:703",
+                "session_pct": 1.246,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:705",
+                "session_pct": 0.356,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:706",
+                "session_pct": 0.362,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:13789",
+                "session_pct": 0.445,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:13790",
+                "session_pct": 1.287,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:14925",
+                "session_pct": 1.649,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:14932",
+                "session_pct": 0.706,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:14934",
+                "session_pct": 0.433,
+                "what": ""
+              }
+            ],
+            "note": "listed=8.44 sess=71.6 i/it"
+          },
+          "FrameStack access inline (len 1775/1780, getPtr 1782, heap 1809, frameBase 1569, addOne-cap 1868)": {
+            "session_pct_listed": 3.46,
+            "session_pct_incl_below_threshold_est": 3.76,
+            "est_instr_per_iter": 31.9,
+            "lines": [
+              {
+                "line": "src/lua/vm.zig:1775",
+                "session_pct": 0.575,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:1780",
+                "session_pct": 0.516,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:1782",
+                "session_pct": 1.121,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:1809",
+                "session_pct": 0.575,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:1569",
+                "session_pct": 0.374,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:1868",
+                "session_pct": 0.297,
+                "what": ""
+              }
+            ],
+            "note": "listed=3.47 sess=29.4 i/it"
+          },
+          "syncFrame inline (defer fire: identity guard 12869 + pc write 12873)": {
+            "session_pct_listed": 1.26,
+            "session_pct_incl_below_threshold_est": 1.26,
+            "est_instr_per_iter": 10.7,
+            "lines": [
+              {
+                "line": "src/lua/vm.zig:12869",
+                "session_pct": 0.522,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:12873",
+                "session_pct": 0.742,
+                "what": ""
+              }
+            ]
+          },
+          "vm.zig:0 no line info": {
+            "session_pct_listed": 2.12,
+            "session_pct_incl_below_threshold_est": 2.12,
+            "est_instr_per_iter": 18.0,
+            "lines": [
+              {
+                "line": "src/lua/vm.zig:0",
+                "session_pct": 2.118,
+                "what": ""
+              }
+            ]
+          },
+          "rbd_unlisted_tail (below display threshold in runBytecodeDispatch)": {
+            "session_pct": 10.41,
+            "est_instr_per_iter": 88.3,
+            "note": "prior: 10.89 sess / 95.0 i/it"
+          },
+          "metamethod activation filter (tryPushSimpleResultMetamethod symbol: Closure check 8387, proto check 8388, pushResolved call 8393, args 8397, opname 8378)": {
+            "session_pct": 6.77,
+            "est_instr_per_iter": 57.4,
+            "internal_lines": [
+              {
+                "line": "src/lua/vm.zig:0",
+                "session_pct": 1.514
+              },
+              {
+                "line": "src/lua/vm.zig:8378",
+                "session_pct": 1.39
+              },
+              {
+                "line": "src/lua/vm.zig:8388",
+                "session_pct": 1.366
+              },
+              {
+                "line": "src/lua/vm.zig:8387",
+                "session_pct": 1.083
+              },
+              {
+                "line": "src/lua/vm.zig:8393",
+                "session_pct": 0.544
+              },
+              {
+                "line": "src/lua/vm.zig:8397",
+                "session_pct": 0.521
+              },
+              {
+                "line": "src/lua/vm.zig:78",
+                "session_pct": 0.354
+              }
+            ],
+            "note": "prior: 6.13 sess / 53.5 i/it"
+          },
+          "stageBytecodeCall (inlined in pushResolvedBytecodeClosure: needed 11929, callee store 11937, args copy 11938)": {
+            "session_pct_listed": 3.34,
+            "session_pct_incl_below_threshold_est": 3.34,
+            "est_instr_per_iter": 28.4,
+            "lines": [
+              {
+                "line": "src/lua/vm.zig:11929",
+                "session_pct": 0.772,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:11933",
+                "session_pct": 0.048,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:11937",
+                "session_pct": 1.57,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:11938",
+                "session_pct": 0.954,
+                "what": ""
+              }
+            ],
+            "note": "listed=3.34 sess=28.3 i/it; prior: 2.86 sess / 24.9 i/at; NOT on the lua_calls path (OP_CALL fast path is Category A zero-copy)"
+          },
+          "pushResolvedBytecodeClosure tail (entry 8108, packed_flags 1499/1500, activation hook call 8188)": {
+            "session_pct_listed": 2.81,
+            "session_pct_incl_below_threshold_est": 2.81,
+            "est_instr_per_iter": 23.8,
+            "lines": [
+              {
+                "line": "src/lua/vm.zig:8108",
+                "session_pct": 1.407,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:1499",
+                "session_pct": 0.56,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:1500",
+                "session_pct": 0.075,
+                "what": ""
+              },
+              {
+                "line": "src/lua/vm.zig:8188",
+                "session_pct": 0.77,
+                "what": ""
+              }
+            ],
+            "note": "listed=2.81 sess=23.8 i/it (continuation setup + callee-activation hook dispatch)"
+          },
+          "child activation (pushStagedBytecodeExecFrame symbol)": {
+            "session_pct": 7.96,
+            "est_instr_per_iter": 67.5,
+            "internal_lines": [
+              {
+                "line": "src/lua/vm.zig:11959",
+                "session_pct": 2.336
+              },
+              {
+                "line": "src/lua/vm.zig:0",
+                "session_pct": 1.36
+              },
+              {
+                "line": "src/lua/vm.zig:12102",
+                "session_pct": 0.796
+              },
+              {
+                "line": "src/lua/vm.zig:12003",
+                "session_pct": 0.74
+              },
+              {
+                "line": "src/lua/vm.zig:1267",
+                "session_pct": 0.708
+              },
+              {
+                "line": "src/lua/vm.zig:12161",
+                "session_pct": 0.507
+              },
+              {
+                "line": "src/lua/vm.zig:12008",
+                "session_pct": 0.507
+              },
+              {
+                "line": "src/lua/vm.zig:12123",
+                "session_pct": 0.283
+              },
+              {
+                "line": "src/lua/vm.zig:12060",
+                "session_pct": 0.224
+              },
+              {
+                "line": "src/lua/vm.zig:12061",
+                "session_pct": 0.15
+              }
+            ],
+            "note": "nextra calc 11959 dominates (2.34 sess)"
+          },
+          "syncFrame publication (out-of-line symbol)": {
+            "session_pct": 1.49,
+            "est_instr_per_iter": 12.6
+          },
+          "FrameStack.addOne (out-of-line symbol)": {
+            "session_pct": 1.38,
+            "est_instr_per_iter": 11.7
+          },
+          "dispatchCalleeActivationHook (out-of-line symbol)": {
+            "session_pct": 0.87,
+            "est_instr_per_iter": 7.4
+          },
+          "gc/rawSet/nodeInsert/tableResize residue (out-of-line)": {
+            "session_pct": 1.5,
+            "est_instr_per_iter": 12.7
+          }
+        }
+      },
+      "puc": {
+        "instr_per_iter_total": 375.563568,
+        "by_symbol": {
+          "luaV_execute": {
+            "session_pct": 39.41,
+            "est_instr_per_iter": 148.0
+          },
+          "luaD_precall": {
+            "session_pct": 15.8,
+            "est_instr_per_iter": 59.3
+          },
+          "luaH_Hgetshortstr": {
+            "session_pct": 11.02,
+            "est_instr_per_iter": 41.4
+          },
+          "luaT_callTMres": {
+            "session_pct": 7.6,
+            "est_instr_per_iter": 28.5
+          },
+          "luaT_trybinTM": {
+            "session_pct": 6.36,
+            "est_instr_per_iter": 23.9
+          },
+          "callbinTM": {
+            "session_pct": 5.87,
+            "est_instr_per_iter": 22.0
+          },
+          "luaD_call": {
+            "session_pct": 4.55,
+            "est_instr_per_iter": 17.1
+          },
+          "luaT_gettmbyobj": {
+            "session_pct": 2.28,
+            "est_instr_per_iter": 8.6
+          },
+          "luaH_resize": {
+            "session_pct": 0.93,
+            "est_instr_per_iter": 3.5
+          },
+          "insertkey": {
+            "session_pct": 0.7,
+            "est_instr_per_iter": 2.6
+          },
+          "mainpositionTV.isra.0": {
+            "session_pct": 0.52,
+            "est_instr_per_iter": 2.0
+          }
+        },
+        "note": "PUC TM-lookup cluster: luaT_trybinTM 6.36 + luaT_gettmbyobj 2.28 + luaH_Hgetshortstr 11.02 = 19.66 sess = 73.8 i/it vs zig TM (inline 2.30 + symbol 11.42) = 13.72 sess = 116.3 i/it"
+      },
+      "gap": {
+        "instr_per_iter_zig_minus_puc": 472.2,
+        "ratio_zig_over_puc": 2.257389891449748
+      },
+      "rbd_internal_accounting": {
+        "note": "session-% ledger for the rbd share 59.32: rbd-internal grouped-listed + ungrouped-listed + unlisted_tail = 59.32. Components 'stage' (stageBytecodeCall inlined) and 'prtail' pull their lines from the pushResolvedBytecodeClosure__anon_61927 symbol (6.68 sess total, separate from rbd). Per-component below_threshold_est partitions the unlisted_tail \u2014 do not sum with rbd_unlisted_tail.",
+        "rbd_grouped_listed_sess": 48.6,
+        "rbd_table_total_listed_sess": 48.91,
+        "unlisted_tail_sess": 10.41,
+        "out_of_line_symbols_sess": {
+          "getTmByObj": 11.42,
+          "pushStagedBytecodeExecFrame": 7.96,
+          "tryPushSimpleResultMetamethod": 6.77,
+          "pushResolvedBytecodeClosure__anon_61927": 6.68,
+          "syncFrame": 1.49,
+          "FrameStack.addOne": 1.38,
+          "dispatchCalleeActivationHook": 0.87,
+          "residue": 1.5
+        }
+      }
+    },
+    "coroutine_yield": {
+      "zig_total_instr_per_iter": 3003.219684,
+      "puc_total_instr_per_iter": 1006.815028,
+      "zig": {
+        "runBytecodeDispatch_session_share": 63.56,
+        "string_key_lookup_cluster_in_rbd": {
+          "lines": [
+            "GETTABUP _ENV.coroutine (13357/13358/13366 + nodeLookupStr 585/594/125 + isShort 2355)",
+            "GETFIELD coroutine.resume (13514/13515/13516 + nodeLookupStr + isShort)",
+            "Cell.get 703 (upvalue reads)"
+          ],
+          "session_pct": 23.43,
+          "est_instr_per_iter": 703.6,
+          "note": "the coroutine.resume global+field lookup per iteration \u2014 the single biggest zig cluster; PUC pays the same lookup via luaH_getshortstr (26.00 sess / 261.8 i/it)"
+        },
+        "by_symbol": {
+          "vm.Vm.runBytecodeDispatch": {
+            "session_pct": 63.56,
+            "est_instr_per_iter": 1908.8
+          },
+          "vm.Vm.builtinCoroutineResume": {
+            "session_pct": 10.91,
+            "est_instr_per_iter": 327.7
+          },
+          "vm.Vm.builtinCoroutineYield": {
+            "session_pct": 5.23,
+            "est_instr_per_iter": 157.1
+          },
+          "vm.Vm.switchRuntime": {
+            "session_pct": 4.21,
+            "est_instr_per_iter": 126.4
+          },
+          "vm.Vm.runBytecodeInternal": {
+            "session_pct": 2.05,
+            "est_instr_per_iter": 61.6
+          },
+          "vm.Vm.growCtxFrame": {
+            "session_pct": 1.59,
+            "est_instr_per_iter": 47.8
+          },
+          "vm.Vm.coroutineBuiltinFastPathEligible": {
+            "session_pct": 1.48,
+            "est_instr_per_iter": 44.4
+          },
+          "vm.Vm.tryPushBytecodeProtectedCall": {
+            "session_pct": 1.1,
+            "est_instr_per_iter": 33.0
+          },
+          "vm.Vm.callCoroutineBuiltinDirect": {
+            "session_pct": 1.1,
+            "est_instr_per_iter": 33.0
+          },
+          "vm.Vm.builtinOutLen": {
+            "session_pct": 1.08,
+            "est_instr_per_iter": 32.4
+          },
+          "compiler_rt.memcpy.memcpyFast": {
+            "session_pct": 1.03,
+            "est_instr_per_iter": 30.9
+          },
+          "vm.InlineValues.setFrom": {
+            "session_pct": 0.91,
+            "est_instr_per_iter": 27.3
+          },
+          "vm.Vm.tryRequestBytecodeCoroutineSwitch": {
+            "session_pct": 0.86,
+            "est_instr_per_iter": 25.8
+          },
+          "mem.eql__anon_3046": {
+            "session_pct": 0.71,
+            "est_instr_per_iter": 21.3
+          },
+          "vm.Vm.clearErrorTraceback": {
+            "session_pct": 0.55,
+            "est_instr_per_iter": 16.5
+          },
+          "vm.Vm.builtinHasDynamicOutCount": {
+            "session_pct": 0.51,
+            "est_instr_per_iter": 15.3
+          },
+          "vm.Vm.condGcFromDispatch": {
+            "session_pct": 0.51,
+            "est_instr_per_iter": 15.3
+          },
+          "vm.Vm.syncFrame": {
+            "session_pct": 0.47,
+            "est_instr_per_iter": 14.1
+          },
+          "vm.Vm.dispatchBytecodeHookWithCallee": {
+            "session_pct": 0.44,
+            "est_instr_per_iter": 13.2
+          },
+          "vm.Vm.hasActiveBytecodeNonYieldableBoundary": {
+            "session_pct": 0.39,
+            "est_instr_per_iter": 11.7
+          }
+        },
+        "builtinCoroutineResume_internals": [
+          {
+            "line": "src/lua/vm.zig:35727",
+            "session_pct": 2.154,
+            "est_i_per_iter": 64.7
+          },
+          {
+            "line": "src/lua/vm.zig:0",
+            "session_pct": 0.828,
+            "est_i_per_iter": 24.9
+          },
+          {
+            "line": "src/lua/vm.zig:20771",
+            "session_pct": 0.595,
+            "est_i_per_iter": 17.9
+          },
+          {
+            "line": "src/lua/vm.zig:20216",
+            "session_pct": 0.408,
+            "est_i_per_iter": 12.3
+          },
+          {
+            "line": "src/lua/vm.zig:20039",
+            "session_pct": 0.314,
+            "est_i_per_iter": 9.4
+          },
+          {
+            "line": "src/lua/vm.zig:20125",
+            "session_pct": 0.301,
+            "est_i_per_iter": 9.0
+          },
+          {
+            "line": "src/lua/vm.zig:1957",
+            "session_pct": 0.285,
+            "est_i_per_iter": 8.6
+          },
+          {
+            "line": "src/lua/vm.zig:20124",
+            "session_pct": 0.265,
+            "est_i_per_iter": 8.0
+          },
+          {
+            "line": "src/lua/vm.zig:1791",
+            "session_pct": 0.249,
+            "est_i_per_iter": 7.5
+          },
+          {
+            "line": "src/lua/vm.zig:35736",
+            "session_pct": 0.249,
+            "est_i_per_iter": 7.5
+          }
+        ],
+        "builtinCoroutineYield_internals": [
+          {
+            "line": "src/lua/vm.zig:0",
+            "session_pct": 0.798,
+            "est_i_per_iter": 24.0
+          },
+          {
+            "line": "src/lua/vm.zig:19775",
+            "session_pct": 0.372,
+            "est_i_per_iter": 11.2
+          },
+          {
+            "line": "src/lua/vm.zig:6895",
+            "session_pct": 0.353,
+            "est_i_per_iter": 10.6
+          },
+          {
+            "line": "src/lua/vm.zig:19858",
+            "session_pct": 0.301,
+            "est_i_per_iter": 9.0
+          },
+          {
+            "line": "src/lua/vm.zig:19766",
+            "session_pct": 0.248,
+            "est_i_per_iter": 7.4
+          },
+          {
+            "line": "src/lua/vm.zig:4665",
+            "session_pct": 0.223,
+            "est_i_per_iter": 6.7
+          },
+          {
+            "line": "src/lua/vm.zig:1957",
+            "session_pct": 0.212,
+            "est_i_per_iter": 6.4
+          },
+          {
+            "line": "src/lua/vm.zig:4592",
+            "session_pct": 0.21,
+            "est_i_per_iter": 6.3
+          },
+          {
+            "line": "src/lua/vm.zig:19843",
+            "session_pct": 0.209,
+            "est_i_per_iter": 6.3
+          },
+          {
+            "line": "src/lua/vm.zig:19761",
+            "session_pct": 0.195,
+            "est_i_per_iter": 5.9
+          }
+        ],
+        "switchRuntime_internals": [
+          {
+            "line": "src/lua/vm.zig:4533",
+            "session_pct": 0.709,
+            "est_i_per_iter": 21.3
+          },
+          {
+            "line": "src/lua/vm.zig:0",
+            "session_pct": 0.595,
+            "est_i_per_iter": 17.9
+          },
+          {
+            "line": "src/lua/vm.zig:4504",
+            "session_pct": 0.48,
+            "est_i_per_iter": 14.4
+          },
+          {
+            "line": "src/lua/vm.zig:4509",
+            "session_pct": 0.476,
+            "est_i_per_iter": 14.3
+          },
+          {
+            "line": "src/lua/vm.zig:4275",
+            "session_pct": 0.391,
+            "est_i_per_iter": 11.7
+          },
+          {
+            "line": "src/lua/vm.zig:4486",
+            "session_pct": 0.32,
+            "est_i_per_iter": 9.6
+          },
+          {
+            "line": "src/lua/vm.zig:1210",
+            "session_pct": 0.231,
+            "est_i_per_iter": 6.9
+          },
+          {
+            "line": "src/lua/vm.zig:4491",
+            "session_pct": 0.213,
+            "est_i_per_iter": 6.4
+          },
+          {
+            "line": "src/lua/vm.zig:4511",
+            "session_pct": 0.155,
+            "est_i_per_iter": 4.7
+          },
+          {
+            "line": "src/lua/vm.zig:4489",
+            "session_pct": 0.141,
+            "est_i_per_iter": 4.2
+          }
+        ]
+      },
+      "puc": {
+        "instr_per_iter_total": 1006.815028,
+        "by_symbol": {
+          "luaH_getshortstr": {
+            "session_pct": 26.0,
+            "est_instr_per_iter": 261.8
+          },
+          "luaV_execute": {
+            "session_pct": 20.99,
+            "est_instr_per_iter": 211.3
+          },
+          "lua_resume": {
+            "session_pct": 9.35,
+            "est_instr_per_iter": 94.1
+          },
+          "luaB_coresume": {
+            "session_pct": 7.62,
+            "est_instr_per_iter": 76.7
+          },
+          "auxresume": {
+            "session_pct": 7.25,
+            "est_instr_per_iter": 73.0
+          },
+          "lua_xmove": {
+            "session_pct": 3.44,
+            "est_instr_per_iter": 34.6
+          },
+          "lua_rotate": {
+            "session_pct": 2.86,
+            "est_instr_per_iter": 28.8
+          },
+          "luaD_precall": {
+            "session_pct": 2.73,
+            "est_instr_per_iter": 27.5
+          },
+          "luaD_poscall": {
+            "session_pct": 2.66,
+            "est_instr_per_iter": 26.8
+          },
+          "lua_checkstack": {
+            "session_pct": 2.37,
+            "est_instr_per_iter": 23.9
+          },
+          "lua_pushboolean": {
+            "session_pct": 1.77,
+            "est_instr_per_iter": 17.8
+          },
+          "resume": {
+            "session_pct": 1.18,
+            "est_instr_per_iter": 11.9
+          },
+          "luaD_rawrunprotected": {
+            "session_pct": 1.08,
+            "est_instr_per_iter": 10.9
+          },
+          "lua_gettop": {
+            "session_pct": 0.89,
+            "est_instr_per_iter": 9.0
+          },
+          "__sigsetjmp+siglongjmp+plt": {
+            "session_pct": 2.44,
+            "est_instr_per_iter": 24.6
+          },
+          "luaD_throw": {
+            "session_pct": 0.71,
+            "est_instr_per_iter": 7.1
+          },
+          "luaV_finishOp": {
+            "session_pct": 0.68,
+            "est_instr_per_iter": 6.8
+          },
+          "lua_yieldk": {
+            "session_pct": 0.52,
+            "est_instr_per_iter": 5.2
+          },
+          "luaB_yield": {
+            "session_pct": 0.49,
+            "est_instr_per_iter": 4.9
+          }
+        },
+        "clusters": {
+          "string-key global lookups (luaH_getshortstr: coroutine.resume GETFIELD per iter)": {
+            "session_pct": 26.0,
+            "est_instr_per_iter": 261.8
+          },
+          "resume/yield C machinery (lua_resume+auxresume+luaB_coresume+resume+lua_yieldk+luaB_yield+setjmp/longjmp+rawrunprotected)": {
+            "session_pct": 29.91,
+            "est_instr_per_iter": 301.1
+          },
+          "luaV_execute (yielder loop + resume re-entry)": {
+            "session_pct": 20.99,
+            "est_instr_per_iter": 211.3
+          }
+        }
+      },
+      "gap": {
+        "instr_per_iter_zig_minus_puc": 1996.4,
+        "ratio_zig_over_puc": 2.9828911969716847
+      }
+    },
+    "branch_loop": {
+      "zig_total_instr_per_iter": 259.81643144,
+      "puc_total_instr_per_iter": 141.05500068,
+      "zig_rbd_share": 99.86,
+      "core_lines": [
+        {
+          "line": "src/lua/vm.zig:0",
+          "sym_pct": 30.37,
+          "session_pct": 30.327,
+          "est_i_per_iter": 78.8,
+          "what": "no line info (DWARF gap; jump-table/decode fusion region)"
+        },
+        {
+          "line": "src/lua/vm.zig:13268",
+          "sym_pct": 16.31,
+          "session_pct": 16.287,
+          "est_i_per_iter": 42.3,
+          "what": "dispatch switch (op)"
+        },
+        {
+          "line": "src/lua/vm.zig:13048",
+          "sym_pct": 5.44,
+          "session_pct": 5.432,
+          "est_i_per_iter": 14.1,
+          "what": "decode a"
+        },
+        {
+          "line": "src/lua/vm.zig:13045",
+          "sym_pct": 4.31,
+          "session_pct": 4.304,
+          "est_i_per_iter": 11.2,
+          "what": "inner while condition"
+        },
+        {
+          "line": "src/lua/vm.zig:13049",
+          "sym_pct": 3.23,
+          "session_pct": 3.225,
+          "est_i_per_iter": 8.4,
+          "what": "decode b"
+        },
+        {
+          "line": "src/lua/vm.zig:13050",
+          "sym_pct": 2.64,
+          "session_pct": 2.636,
+          "est_i_per_iter": 6.8,
+          "what": "decode c"
+        },
+        {
+          "line": "src/lua/vm.zig:13046",
+          "sym_pct": 2.4,
+          "session_pct": 2.397,
+          "est_i_per_iter": 6.2,
+          "what": "instruction fetch"
+        },
+        {
+          "line": "src/lua/vm.zig:14652",
+          "sym_pct": 2.22,
+          "session_pct": 2.217,
+          "est_i_per_iter": 5.8,
+          "what": "MODK/eq chain (workload)"
+        },
+        {
+          "line": "src/lua/vm.zig:13064",
+          "sym_pct": 2.21,
+          "session_pct": 2.207,
+          "est_i_per_iter": 5.7,
+          "what": "dispatch_pc publish: self.dispatch_pc = ctx.pc"
+        },
+        {
+          "line": "src/lua/vm.zig:13068",
+          "sym_pct": 1.86,
+          "session_pct": 1.857,
+          "est_i_per_iter": 4.8,
+          "what": "dispatch gate"
+        },
+        {
+          "line": "src/lua/vm.zig:14646",
+          "sym_pct": 1.21,
+          "session_pct": 1.208,
+          "est_i_per_iter": 3.1,
+          "what": "workload op"
+        },
+        {
+          "line": "src/lua/vm.zig:15152",
+          "sym_pct": 1.15,
+          "session_pct": 1.148,
+          "est_i_per_iter": 3.0,
+          "what": "ctx.pc += 1"
+        },
+        {
+          "line": "src/lua/vm.zig:14123",
+          "sym_pct": 1.05,
+          "session_pct": 1.049,
+          "est_i_per_iter": 2.7,
+          "what": "workload op (addi/subi family)"
+        },
+        {
+          "line": "src/lua/vm.zig:14122",
+          "sym_pct": 0.78,
+          "session_pct": 0.779,
+          "est_i_per_iter": 2.0,
+          "what": "workload op"
+        },
+        {
+          "line": "src/lua/vm.zig:67",
+          "sym_pct": 0.7,
+          "session_pct": 0.699,
+          "est_i_per_iter": 1.8,
+          "what": "?"
+        },
+        {
+          "line": "src/lua/vm.zig:14044",
+          "sym_pct": 0.62,
+          "session_pct": 0.619,
+          "est_i_per_iter": 1.6,
+          "what": "ADDI (workload)"
+        },
+        {
+          "line": "src/lua/vm.zig:14644",
+          "sym_pct": 0.6,
+          "session_pct": 0.599,
+          "est_i_per_iter": 1.6,
+          "what": "workload op"
+        },
+        {
+          "line": "src/lua/vm.zig:14925",
+          "sym_pct": 0.6,
+          "session_pct": 0.599,
+          "est_i_per_iter": 1.6,
+          "what": "FORLOOP int check"
+        },
+        {
+          "line": "src/lua/vm.zig:14645",
+          "sym_pct": 0.54,
+          "session_pct": 0.539,
+          "est_i_per_iter": 1.4,
+          "what": "workload op"
+        },
+        {
+          "line": "src/lua/vm.zig:14046",
+          "sym_pct": 0.54,
+          "session_pct": 0.539,
+          "est_i_per_iter": 1.4,
+          "what": "ADDI imm"
+        },
+        {
+          "line": "src/lua/vm.zig:14931",
+          "sym_pct": 0.53,
+          "session_pct": 0.529,
+          "est_i_per_iter": 1.4,
+          "what": "FORLOOP count"
+        }
+      ],
+      "note": "pure-dispatch workload: dispatch_pc publish = 2.21 sess = 5.7 i/it; switch = 16.29 sess = 42.3 i/it; vm.zig:0 (jump-table/decode fusion) = 30.33 sess = 78.8 i/it"
+    }
+  },
+  "answers": {
+    "A_opReturn_completion_noalloc": {
+      "current_est_i_per_iter": 114,
+      "listed_lines_sess": 11.96,
+      "listed_i_per_iter": 101.4,
+      "below_threshold_est_sess": 1.5,
+      "dominant_line": "src/lua/vm.zig:15521 (simple_result single-copy store sequence) = 9.34 sess = 79.2 i/it alone",
+      "prior_claim": "114 i/it (P16.22 STATUS 'opReturn completion noalloc 114 i/it (T6)')",
+      "verdict": "CONFIRMED UNCHANGED: ~114 i/it (13.5 sess of 847.8). The single-copy store line alone is 79 i/it \u2014 the store sequence (frameBase+sr_dst address math + 16-byte Value copy emitted as ~10 partially byte-wise stores) dominates; the surrounding checks (has_pending_tbc, hasOpenUpvalues, isDebugHook, parent isLua/pending, hasSimpleResult, decodeNresults, pop bookkeeping) add ~35 i/it."
+    },
+    "B_frame_loop_entry_lua_calls": {
+      "listed_lines_sess": 5.8,
+      "listed_i_per_iter": 39.1,
+      "below_threshold_est_sess": 1.5,
+      "total_est_i_per_iter": 49,
+      "entries_per_iteration": 2,
+      "est_i_per_entry": 25,
+      "prior": "8.57 sess / 59.2 i/it (~29.6 per entry) at 2a995b3",
+      "verdict": "P16.22 T3 (direct Lua-arm access, base/cap computed once) is visible: ~59 -> ~49 i/it (-10 i/it, matching STATUS T3 'lua_calls -8 i/it'). Remaining cost: pending-call check + activation_id read + 6-field ctx reload (proto/upvalues/base/cap/pc/regs) per frame activation; PUC's startfunc/returning entry equivalent = 22.6 i/it per frame pair."
+    },
+    "C_pushStagedBytecodeExecFrame": {
+      "lua_calls_session_pct": 9.71,
+      "lua_calls_i_per_iter": 65.6,
+      "noalloc_session_pct": 7.96,
+      "noalloc_i_per_iter": 67.5,
+      "internal_hot_lines_lc": [
+        {
+          "line": "src/lua/vm.zig:0",
+          "session_pct": 1.861,
+          "est_i_per_iter": 12.6
+        },
+        {
+          "line": "src/lua/vm.zig:11959",
+          "session_pct": 1.721,
+          "est_i_per_iter": 11.6
+        },
+        {
+          "line": "src/lua/vm.zig:12003",
+          "session_pct": 1.0,
+          "est_i_per_iter": 6.8
+        },
+        {
+          "line": "src/lua/vm.zig:1267",
+          "session_pct": 0.842,
+          "est_i_per_iter": 5.7
+        },
+        {
+          "line": "src/lua/vm.zig:12102",
+          "session_pct": 0.799,
+          "est_i_per_iter": 5.4
+        },
+        {
+          "line": "src/lua/vm.zig:12161",
+          "session_pct": 0.688,
+          "est_i_per_iter": 4.6
+        },
+        {
+          "line": "src/lua/vm.zig:12123",
+          "session_pct": 0.639,
+          "est_i_per_iter": 4.3
+        },
+        {
+          "line": "src/lua/vm.zig:12008",
+          "session_pct": 0.62,
+          "est_i_per_iter": 4.2
+        }
+      ],
+      "prior": "10.1 sess / 69.7 i/it (lua_calls)",
+      "verdict": "~66 i/it per Lua activation in lua_calls (was 69.7). Dominated by: no-line region 1.86 sess, nextra/vararg computation 11959 (1.72), addOne 12102 (0.80), encodeNresults 1267 (0.84), clearSimpleResult 12161 (0.69), activation_id 12123 (0.64), is_vahid 12008 (0.62), bc_stack_top 12061 (0.58)."
+    },
+    "D_stageBytecodeCall": {
+      "on_lua_calls_path": "NO \u2014 OP_CALL inline fast path is Category A (callee+args already in the caller's registers, zero-copy); stageBytecodeCall is not invoked",
+      "noalloc_inlined_into": "vm.Vm.pushResolvedBytecodeClosure__anon_61927",
+      "noalloc_lines_sess": 3.34,
+      "noalloc_i_per_iter": 28.3,
+      "lines": {
+        "11929 needed-cap calc": 0.77,
+        "11933 callee Nil store": 0.05,
+        "11937 callee Closure store": 1.57,
+        "11938 args copy loop (2 args)": 0.95
+      },
+      "prior": "2.86 sess / 24.9 i/it",
+      "verdict": "~28 i/it per metamethod invocation (was 24.9): func-slot store + 2-arg copy + stack-ensure check; mild increase consistent with T4 comptime-specialization sample redistribution inside pushResolvedBytecodeClosure."
+    },
+    "E_dispatch_pc_publish_line": {
+      "line": "src/lua/vm.zig:13064 (self.dispatch_pc = ctx.pc)",
+      "lua_calls": {
+        "sym_pct": 0.73,
+        "session_pct": 0.62,
+        "i_per_iter": 4.2
+      },
+      "branch_loop": {
+        "sym_pct": 2.21,
+        "session_pct": 2.21,
+        "i_per_iter": 5.7
+      },
+      "noalloc": {
+        "sym_pct": 1.47,
+        "session_pct": 0.87,
+        "i_per_iter": 7.4
+      },
+      "coroutine_yield": {
+        "sym_pct": 1.05,
+        "session_pct": 0.67,
+        "i_per_iter": 20.0
+      },
+      "prior_lua_calls": "sym 2.43 / sess 2.02 (~13.9 i/it) at 2a995b3",
+      "verdict": "Cleanest per-dispatch estimate is branch_loop (pure dispatch, rbd=99.86%): 2.21 sess = 5.7 i/it per loop iteration (~1 native store + address math per dispatched instruction). The lua_calls drop 2.02 -> 0.62 sess is NOT a semantic change (the store is identical) \u2014 it is sample redistribution across adjacent fetch/decode instructions after T2/T3/T4 codegen shifts."
+    },
+    "F_dispatch_core_total": {
+      "definition": "switch 13268 + gate 13068 + fetch 13046 + pc+=1 15152 + dispatch_pc 13064 + decode 13047-13050 + loop cond 13045 (lua_calls)",
+      "listed_sess": 18.59,
+      "listed_i_per_iter": 125.5,
+      "below_threshold_est_sess": 2.6,
+      "total_est_sess": 21.19,
+      "total_est_i_per_iter": 143.0,
+      "prior_claim": "22.12 sess / 152.7 i/it at 2a995b3 => '+123 i/it' over PUC's ~29.5 (vmfetch 4.6 + fetch+pc++ 5.8 + opcode dispatch 19.1)",
+      "puc_equivalent_i_per_iter": 29.5,
+      "verdict": "STILL REAL, mildly deflated: core = ~21.2 sess = ~143 i/it => ~+113 i/it over PUC (was +123). NOT sample redistribution: (a) the rbd_unlisted_tail stayed ~15.3 sess (103 i/it) in both sessions \u2014 core lines did not absorb the tail; (b) the deflation (~10 i/it) is proportional to the total workload drop (690.3 -> 675.1 after T2/T3/T4) plus attribution shifts on switch (6.94 -> 5.49 sess) and dispatch_pc (2.02 -> 0.62) offset by pc+=1 (2.78 -> 4.00). The dispatch core remains ~4.8x PUC's per-op dispatch cost and is the largest single lua_calls gap component after opReturn completion.",
+      "core_line_comparison": {
+        "switch_13268": {
+          "prior_sess": 6.94,
+          "now_sess": 5.49
+        },
+        "gate_13068": {
+          "prior_sess": 2.8,
+          "now_sess": 2.62
+        },
+        "fetch_13046": {
+          "prior_sess": 2.88,
+          "now_sess": 2.17
+        },
+        "pc_advance_15152": {
+          "prior_sess": 2.78,
+          "now_sess": 4.0
+        },
+        "dispatch_pc_13064": {
+          "prior_sess": 2.02,
+          "now_sess": 0.62
+        },
+        "loop_cond_13045": {
+          "prior_sess": 1.61,
+          "now_sess": "~1.6 (below threshold, est from branch_loop)"
+        }
+      }
+    },
+    "G_coroutine_yield_dominators": {
+      "zig_total_i_per_iter": 3003.219684,
+      "puc_total_i_per_iter": 1006.815028,
+      "ranked": [
+        {
+          "1": "string-key lookup cluster (GETTABUP _ENV.coroutine + GETFIELD coroutine.resume + nodeLookupStr + isShort/isEmpty + Cell.get): ~24 sess ~733 i/it inside rbd \u2014 the workload's global+field lookup per iteration; PUC equivalent luaH_getshortstr = 26.0 sess / 261.8 i/it (2.8x)"
+        },
+        {
+          "2": "builtinCoroutineResume 10.91 sess / 327.7 i/it + builtinCoroutineYield 5.23 / 157.1 \u2014 resume/yield builtin bodies (status guards, errfunc save/restore, outs fill 20771, thread state flags); PUC resume-machinery cluster = 29.9 sess / 301.1 i/it"
+        },
+        {
+          "3": "switchRuntime 4.21 sess / 126.4 i/t (park/activate runtime: bc_boxed handoff 4504/4509, bc_stack_top 4486, hooks refresh 4275) + runBytecodeInternal 2.05 / 61.6 (resume_in_place checks 12607, boundary_depth 12616, dispatch re-entry 12732) \u2014 no direct PUC equivalent (PUC pays setjmp/longjmp ~2.4 sess instead)"
+        },
+        {
+          "4": "opCall builtin-path overhead: growCtxFrame 1.59 / 47.7 (outs window growth 5069/5094), coroutineBuiltinFastPathEligible 1.48 / 44.4 (guard list incl. C-frame scan 9845/9846), tryPushBytecodeProtectedCall 1.10 / 33.0, callCoroutineBuiltinDirect 1.10 / 33.0, builtinOutLen 1.08 / 32.4"
+        },
+        {
+          "5": "stack shuffle residue: memcpy 1.03 / 30.9 + InlineValues.setFrom 0.91 / 27.3 + mem.eql 0.71 / 21.3; dispatch core inside rbd (switch 4.53 sess / 136.1)"
+        }
+      ],
+      "vs_prior": "rbd share 61.12 -> 63.56 sess; builtin cluster 21.18 -> 22.24 sess (resume 12.38 -> 10.91, yield 5.47 -> 5.23, eligibility 2.10 -> 1.48, direct-call 1.23 -> 1.10 \u2014 T4/P16.22 cuts visible); runtime-switch cluster 9.91 -> 9.91 sess (unchanged); string-lookup cluster remains the #1 dominator and the top optimization target (it is workload-shaped: coroutine.resume as a global lookup each iteration, but the 2.8x vs luaH_getshortstr is real VM cost)",
+      "branch_note": "zig branch-misses 0.046/iter vs PUC ~3.07/iter (setjmp/longjmp + stack shuffle) \u2014 zig wins mispredicts by ~66x, loses total instructions 2.98x"
     }
   }
 }

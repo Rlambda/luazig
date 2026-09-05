@@ -1,0 +1,56 @@
+{
+  "created_utc": "2026-09-05T13:12:56.001751+00:00",
+  "provenance": {
+    "git_head": "ea3ed46",
+    "measured_source_head": "ea3ed46",
+    "git_dirty": "dirty",
+    "zig_version": "0.16.0",
+    "optimize_mode": "ReleaseFast",
+    "zig_binary_sha16": "b4626dbb6da469e4"
+  },
+  "cuts": [
+    {
+      "task": "T0.4",
+      "commit": "e77ea03",
+      "change": "dead union + stale comments (behavior-neutral)",
+      "kind": "clean-code",
+      "verdict": "KEEP"
+    },
+    {
+      "task": "T0.5",
+      "commit": "f05a766",
+      "change": "layout artifact re-measured",
+      "kind": "truth",
+      "verdict": "KEEP"
+    },
+    {
+      "task": "T1",
+      "commit": "(subagent @f05a766 worktree)",
+      "change": "post-final differential: opReturn 114 confirmed, entry 49, core +113 real, cy string-key 733 i/it",
+      "kind": "evidence",
+      "verdict": "artifact"
+    },
+    {
+      "task": "T6",
+      "commit": "ea3ed46",
+      "change": "nCcalls/LUAI_MAXCCALLS general model",
+      "target": "cstack C-recursion parity",
+      "before": "gsub 99977/49989",
+      "after": "200/199/200 (PUC 197/196/197)",
+      "tests": "full gate 13/13; t2 pcallk regression found+fixed during dev (pcall-family depth-only)",
+      "verdict": "KEEP"
+    },
+    {
+      "task": "T2/T3/T4/T5/T7-T9",
+      "commit": "-",
+      "change": "not executed (phase budget consumed by T0 truth + T6 correctness architecture)",
+      "verdict": "NEXT PHASE per fresh profile"
+    }
+  ],
+  "perf_summary": {
+    "instructions": "lua_calls 3.376G / noalloc 424M \u2014 BYTE-IDENTICAL to P16.22 final (T6 touched no hot path)",
+    "geomean_session": 1.78388,
+    "geomean_p16_22": 1.76363,
+    "note": "\u00b11% session drift (pattern documented P16.18/P16.21); instruction parity is the causal no-regression evidence"
+  }
+}

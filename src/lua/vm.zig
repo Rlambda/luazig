@@ -1541,7 +1541,7 @@ pub const CallFrame = extern struct {
     /// reuse), mirroring PUC luaV_execute `base = ci->func.p + 1`.
     func_slot: usize = 0,
     tbc_mark: usize = 0,
-    activation_id: u32 = 0,
+    activation_id: ActivationId = 0,
     /// PUC `callstatus` (`lstate.h:208`): low 8 bits = nresults+1 (CIST_NRESULTS),
     /// upper bits = flags; CIST_C discriminates the u-variant (PUC model).
     callstatus: u32 = 0,
@@ -2057,7 +2057,9 @@ pub const Thread = struct {
     // P15.51n: debug_name_entries/debug_name_count removed — debug names
     // are now stored in BytecodePendingCall (parent's continuation).
     call_frames: FrameStack = .{},
-    bytecode_activation_counter: u32 = 0,
+    /// P16.22 T2: one named identity type for the activation guard (the
+    /// frame slot identity used by syncFrame's deferred-write check).
+    bytecode_activation_counter: ActivationId = 0,
     /// P15.51n: Moved from CallFrame — single-valued (only active frame's
     /// line hook matters), matching PUC's oldpc on lua_State.
     last_hook_line: i64 = -1,
@@ -2286,6 +2288,11 @@ comptime {
     std.debug.assert(@offsetOf(CallFrame, "u") == 32);
     std.debug.assert(@alignOf(CallFrame) == 8);
 }
+
+/// P16.22 T2: CallFrame slot identity (monotonic per-thread counter;
+/// compared for EQUALITY only — 0 carries no sentinel meaning, proven by
+/// audit: no activation_id == 0 / != 0 site exists).
+pub const ActivationId = u32;
 
 pub const LuaString = extern struct {
     hash: u64,
@@ -12080,8 +12087,9 @@ pub const Vm = struct {
         // P15.51k: callee lives at bc_stack[func_slot] (PUC's ci->func).
         // No duplicated callee field in CallFrame.
         const activation_owner = self.activeBytecodeThread();
+        // P16.22 T2: the old wrap-skip-to-1 branch is REMOVED — 0 is not a
+        // sentinel anywhere (equality-only guard; audit in ActivationId doc).
         activation_owner.bytecode_activation_counter +%= 1;
-        if (activation_owner.bytecode_activation_counter == 0) activation_owner.bytecode_activation_counter = 1;
 
         // P15.40b-full: Single addOne + unified field writes (was two addOne + ~50 writes).
         // The CallFrame in Thread.call_frames holds ALL fields — no runtime copy
@@ -12862,7 +12870,7 @@ pub const Vm = struct {
     /// The activation_id check ensures we don't write to a frame that was
     /// popped or replaced (e.g., after OP_RETURN pops the frame, the defer
     /// runs but the check skips the write).
-    fn syncFrame(self: *Vm, ctx: *BytecodeDispatchCtx, frame_identity: u64) void {
+    fn syncFrame(self: *Vm, ctx: *BytecodeDispatchCtx, frame_identity: ActivationId) void {
         _ = self;
         if (ctx.frame_index < ctx.exec_frames.len() and
             ctx.exec_frames.getPtr(ctx.frame_index).activation_id == frame_identity)

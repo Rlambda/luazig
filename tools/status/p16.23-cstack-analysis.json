@@ -1,0 +1,62 @@
+{
+  "created_utc": "2026-09-05T13:04:23.339185+00:00",
+  "provenance": {
+    "git_head": "f05a766",
+    "measured_source_head": "WORKING TREE (pre-commit T6)",
+    "git_dirty": "dirty",
+    "zig_version": "0.16.0",
+    "optimize_mode": "ReleaseFast",
+    "zig_binary_sha16": "b4626dbb6da469e4"
+  },
+  "puc_reference": "cstack.lua --testc, PUC d54bc45e",
+  "model": "PUC ldo.c ccall(inc): nCcalls += inc (ci=1 yieldable; nyci=0x10001 non-yieldable), getCcalls>=LUAI_MAXCCALLS \u2192 \"C stack overflow\". luazig: Thread.ccallEnter/ccallExit + LUA_MAX_C_CALLS; apiCall is the C-API funnel (inc per call kind); iterative gsub repl accounting at push/completion/cancel guarded by repl_ccall_active (idempotent to yield/replay); protected-call entry snapshots nCcalls and finish restores it (iterative unwind has no C-stack to run paired exits).",
+  "boundary_map": [
+    [
+      "apiCall NOYIELD",
+      "lua_call(lua_callkImpl k==null), __gc, errfunc, testc sync, host require/warn/print",
+      "depth+nny"
+    ],
+    [
+      "apiCall YIELDABLE",
+      "pcall/pcallk yieldable continuations (luazig continuation machinery owns yield; nny would regress t2)",
+      "depth only"
+    ],
+    [
+      "luaCallKShared",
+      "lua_callk with k: yieldable; k==null: NOYIELD",
+      "k-dependent"
+    ],
+    [
+      "gsub repl (iterative)",
+      "push(+1)/completion(-1)/cancel(-1), guarded idempotent",
+      "NOYIELD unit"
+    ],
+    [
+      "gsub repl (sync fallback)",
+      "runGsubReplacementFunction local",
+      "NOYIELD unit"
+    ],
+    [
+      "tableGetFromNonYieldableC",
+      "__index from non-yieldable C",
+      "NOYIELD unit"
+    ],
+    [
+      "coroutine resume",
+      "PUC ccall(0) for body; lua_resume inheritance unchanged",
+      "none"
+    ]
+  ],
+  "results": {
+    "gsub C-recursion (line 6)": "zig 99977 \u2192 200 (PUC 197; +3 = base-depth offset, same mechanism)",
+    "coroutine gsub (line 10)": "zig \u2192 199 (PUC 196)",
+    "plain gsub-with-error section (line 16)": "zig \u2192 200 (PUC 197)",
+    "REMAINING gaps": [
+      "metatable gsub (line 8): zig 200 vs PUC 99 \u2014 __index metamethod unit per level not yet accounted (iterative metamethod invocation path \u2014 same pattern as gsub repl, next cut)",
+      "coroutine deep-calls (lines 12/14): 4/30 \u2014 PRE-EXISTING (verified identical before T6 changes via stash), separate resume-chain accounting",
+      "pure Lua stack depth (line 3): 250043 vs 262021 \u2014 separate backlog (declared P16.22)"
+    ],
+    "regressions fixed during dev": "pcallk yieldable path initially NOYIELD \u2014 broke c_api 10_continuations t2 + coroutine.lua; fixed to depth-only (yieldability owned by continuation machinery)"
+  },
+  "tests": "unit D+RF 0; smoke 69/69; c_api 20+diff; api580 GREEN; coroutine/errors/gc/closure/strings/vararg/locals/db green"
+}

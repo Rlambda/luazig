@@ -510,7 +510,7 @@ fn lua_callkImpl(L: ?*lua_State, nargs: c_int, nresults: c_int) void {
     const fn_idx = h.c_stack.items.len - nargs_usize - 1;
     const callee = h.c_stack.items[fn_idx];
     const args = h.c_stack.items[fn_idx + 1 ..];
-    const ret = vm.apiCall(callee, args) catch |err| switch (err) {
+    const ret = vm.apiCall(vm_mod.Thread.CCALL_INC_NOYIELD, callee, args) catch |err| switch (err) {
         error.Yield => {
             // P15.78: Callee yielded. Longjmp with value 2 (yield) so
             // callCFunction can propagate error.Yield and leave the C-frame
@@ -1015,7 +1015,7 @@ pub export fn lua_closeslot(L: ?*lua_State, idx: c_int) void {
 
     // Call __close(val) with 0 results. Errors propagate (PUC luaD_call).
     var call_args = [_]Value{ mm, val };
-    _ = vm.apiCall(mm, call_args[0..]) catch {
+    _ = vm.apiCall(vm_mod.Thread.CCALL_INC_NOYIELD, mm, call_args[0..]) catch {
         // Error propagated through apiCall. The error object is in
         // vm.err_obj (set by callCFunction's error path). Push it onto
         // c_stack and re-raise via lua_error so the C caller's pcall/error

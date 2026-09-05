@@ -8084,13 +8084,21 @@ pub const Vm = struct {
     /// 4. Set debug name override (pending path only; simple_result derives
     ///    name from `event` at read time via `getDebugName()`).
     /// 5. Dispatch the CALL hook (`dispatchCalleeActivationHook`).
+    /// P16.22 T4: ONE semantic implementation, specialized per completion
+    /// mode at COMPILE TIME (Zig-native instead of the runtime union switch):
+    /// each instantiation keeps only its own arm — no runtime completion
+    /// dispatch, no dead payload loads, no duplicated function bodies.
     fn pushResolvedBytecodeClosure(
         self: *Vm,
+        comptime mode: PushClosureMode,
         exec_frames: *FrameStack,
         parent_index: usize,
         closure: *Closure,
         args: []const Value,
-        completion: ResolvedClosureCompletion,
+        payload: switch (mode) {
+            .pending => PendingPayload,
+            .simple_result => SimpleResultPayload,
+        },
     ) DispatchError!void {
         const proto = closure.proto orelse unreachable; // caller proves proto != null
         const parent = exec_frames.getPtr(parent_index);
@@ -8100,8 +8108,8 @@ pub const Vm = struct {
             std.debug.assert(!parent.u.lua.hasSimpleResult());
         }
 
-        switch (completion) {
-            .pending => |p| {
+        if (mode == .pending) {
+            const p = payload;
                 // Install pending_call continuation state BEFORE the fallible
                 // child-frame push (mirrors PUC luaD_precall → setobj2s).
                 try self.setPendingCall(parent, .{
@@ -8128,8 +8136,8 @@ pub const Vm = struct {
                 // from the caller's instruction (funcnamefromcode "metamethod"
                 // branch).
                 self.setDebugName(exec_frames.getPtr(parent_index), p.debug_namewhat, p.debug_name);
-            },
-            .simple_result => |sr| {
+        } else {
+            const sr = payload;
                 // P16.8a Task 5: The simple_result state is set BEFORE the
                 // fallible child-activation operations (staging + activation +
                 // hook dispatch). The errdefer below rolls it back if any
@@ -8155,7 +8163,6 @@ pub const Vm = struct {
                 );
                 // No setDebugName — debug name is derived from simple_result_event
                 // at read time via getDebugName().
-            },
         }
         // Metamethod/continuation activations get their CALL event when the
         // frame exists (PUC: luaT_calltm → luaD_call → luaD_precall →
@@ -8188,12 +8195,10 @@ pub const Vm = struct {
         };
         if (cl.proto == null) return false;
 
-        try self.pushResolvedBytecodeClosure(exec_frames, parent_index, cl, resolved.args, .{
-            .pending = .{
-                .completion = completion,
-                .debug_namewhat = debug_namewhat,
-                .debug_name = debug_name,
-            },
+        try self.pushResolvedBytecodeClosure(.pending, exec_frames, parent_index, cl, resolved.args, .{
+            .completion = completion,
+            .debug_namewhat = debug_namewhat,
+            .debug_name = debug_name,
         });
         return true;
     }
@@ -8249,15 +8254,16 @@ pub const Vm = struct {
         // Builtin/non-Closure values (the common synchronous fallback).
         if (metamethod != .Closure or metamethod.Closure.proto == null) return false;
         try self.pushResolvedBytecodeClosure(
+            .pending,
             exec_frames,
             parent_index,
             metamethod.Closure,
             args,
-            .{ .pending = .{
+            .{
                 .completion = completion,
                 .debug_namewhat = "metamethod",
                 .debug_name = tag_method.opname(event),
-            } },
+            },
         );
         return true;
     }
@@ -8285,6 +8291,17 @@ pub const Vm = struct {
     /// be a no-op wrapper returning `{callee, args, owned_args=null}`).
     /// Resolution happens exactly once per invocation: either in the caller
     /// (generic path) or not at all (proven-Closure fast path).
+    const PushClosureMode = enum { pending, simple_result };
+    const PendingPayload = struct {
+        completion: BytecodePendingCompletion,
+        debug_namewhat: ?[]const u8,
+        debug_name: ?[]const u8,
+    };
+    const SimpleResultPayload = struct {
+        event: TmsEvent,
+        completion: SimpleResultCompletion,
+    };
+
     const ResolvedClosureCompletion = union(enum) {
         /// Pending-call continuation (CONCAT, pairs, hooks, etc.).
         /// Installs `pending_call` state + explicit debug name override.
@@ -8377,11 +8394,12 @@ pub const Vm = struct {
                 // continuation state as direct-Closure metamethods, so
                 // yielding works (Task 6).
                 try self.pushResolvedBytecodeClosure(
+                    .simple_result,
                     exec_frames,
                     parent_index,
                     metamethod.Closure,
                     args,
-                    .{ .simple_result = .{ .event = event, .completion = completion } },
+                    .{ .event = event, .completion = completion },
                 );
                 return .pushed;
             }
@@ -8412,11 +8430,12 @@ pub const Vm = struct {
                 // frame via the shared primitive. Resolution already happened
                 // above (exactly once — Task 5).
                 try self.pushResolvedBytecodeClosure(
+                    .simple_result,
                     exec_frames,
                     parent_index,
                     cl,
                     resolved.args,
-                    .{ .simple_result = .{ .event = event, .completion = completion } },
+                    .{ .event = event, .completion = completion },
                 );
                 return .pushed;
             },

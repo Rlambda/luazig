@@ -22,38 +22,38 @@ The project is in a **pre-release / parity-focused** state.
 
 | Metric | Result |
 |--------|--------|
-| Upstream matrix (`testes/*.lua`, `--testc`) | **17/32** pass (exit code parity) |
+| Upstream matrix (`testes/*.lua`, `--testc`) | **18/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
-| Smoke tests (`tests/smoke/*.lua`) | **69/69** match (byte-identical stdout+stderr+exit) |
+| Smoke tests (`tests/smoke/*.lua`) | **69/70** match (byte-identical stdout+stderr+exit) |
 | C API suites (`tests/c_api`) | 21 suites (gate: `make -C tests/c_api test`) |
 
 Regression lane: `python3 tools/testes_matrix.py --testc` (no `_port`/`_soft` prelude overrides).
 
 ### Performance
 
-Geomean slowdown vs PUC Lua: **1.79x** (lower is better; 1.0x = parity).
+Geomean slowdown vs PUC Lua: **1.75x** (lower is better; 1.0x = parity).
 Method: median-of-7 per workload, pinned CPU core (`tools/perf_compare.py`).
 
 | Workload | Zig/PUC |
 |----------|--------:|
-| metamethod_add | 2.59x |
-| metamethod_call_noalloc | 2.46x |
-| coroutine_yield | 2.23x |
-| hash_access | 2.07x |
-| global_arith | 1.98x |
-| table_alloc_setmetatable | 1.97x |
-| branch_loop | 1.95x |
-| lua_calls | 1.92x |
-| field_access | 1.92x |
-| array_access | 1.87x |
+| metamethod_add | 2.56x |
+| metamethod_call_noalloc | 2.45x |
+| coroutine_yield | 2.21x |
+| hash_access | 2.05x |
+| table_alloc_setmetatable | 1.95x |
+| lua_calls | 1.94x |
+| branch_loop | 1.92x |
+| array_access | 1.86x |
+| field_access | 1.81x |
 | temp_table_alloc | 1.77x |
-| comparisons | 1.62x |
-| mixed_arith | 1.61x |
-| dynamic_load | 1.58x |
-| float_arith | 1.53x |
-| int_arith | 1.49x |
-| string_loop | 1.29x |
-| string_concat | 1.08x |
+| global_arith | 1.74x |
+| comparisons | 1.59x |
+| mixed_arith | 1.56x |
+| dynamic_load | 1.54x |
+| float_arith | 1.47x |
+| int_arith | 1.47x |
+| string_loop | 1.28x |
+| string_concat | 1.07x |
 <!-- END GENERATED STATUS -->
 
 See [STATUS.md](STATUS.md) for detailed profiling methodology, hotspot analysis, and optimization history.

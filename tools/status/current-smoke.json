@@ -1,26 +1,26 @@
 {
   "meta": {
-    "created_utc": "2026-09-05T20:26:11.087810+00:00",
+    "created_utc": "2026-09-05T23:22:45.710162+00:00",
     "lane": "smoke_compare",
     "argv": [
-      "/home/boss/codes/luazig/tools/smoke_compare.py",
+      "tools/smoke_compare.py",
       "--json-out",
-      "/home/boss/codes/luazig/tools/status/.tmp.smoke.7x1qzkzm.json"
+      "/tmp/opencode/smoke25c.json"
     ],
     "zig_version": "0.16.0"
   },
   "provenance": {
-    "git_head": "2c998b6",
-    "measured_source_head": "2c998b6",
-    "git_dirty": "dirty",
+    "git_head": "e143884",
+    "measured_source_head": "e143884",
+    "git_dirty": "clean",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "5e767e96de89b5f7",
+    "zig_binary_sha16": "f057bb1cbe8ff0fd",
     "puc_binary_sha16": "d54bc45e1757b216"
   },
-  "total": 69,
+  "total": 70,
   "ok": 69,
-  "mismatches": 0,
+  "mismatches": 1,
   "results": [
     {
       "file": "tests/smoke/01_min.lua",
@@ -297,6 +297,10 @@
     {
       "file": "tests/smoke/69_api580_fixed_load_gate.lua",
       "match": true
+    },
+    {
+      "file": "tests/smoke/70_coroutine_close_nonyieldable.lua",
+      "match": false
     }
   ]
 }

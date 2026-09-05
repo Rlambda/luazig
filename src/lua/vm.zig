@@ -12976,14 +12976,22 @@ pub const Vm = struct {
             // directly on the CallFrame). Only the hot fields that are
             // accessed in the inner dispatch loop are cached as locals.
             {
+                // P16.22 T3: direct Lua-arm access — the frame_loop body is
+                // BYTECODE dispatch, so the current frame is provably a Lua
+                // frame (the old `fr.proto().?` paid an isC branch + null
+                // unwrap for an invariant control flow already proves).
+                // base/frame_cap are each computed ONCE and reused for the
+                // register slice (was: frameBase() twice).
                 const fr = exec_frames.getPtr(ctx.frame_index);
-                ctx.cur_proto = fr.proto().?;
-                // P15.51n: Derive upvalues from bc_stack[func_slot].Closure.upvalues.
+                const fb = fr.frameBase();
+                ctx.cur_proto = fr.u.lua.proto;
+                // P15.51n: upvalues derived from bc_stack[func_slot].Closure.
                 ctx.cur_upvalues = self.bc_stack[fr.func_slot].Closure.upvalues;
-                ctx.base = fr.frameBase();
-                ctx.frame_cap = fr.u.lua.frame_cap;
+                ctx.base = fb;
+                const cap = fr.u.lua.frame_cap;
+                ctx.frame_cap = cap;
                 ctx.pc = fr.u.lua.pc;
-                ctx.regs = self.bc_stack[fr.frameBase() .. fr.frameBase() + fr.u.lua.frame_cap];
+                ctx.regs = self.bc_stack[fb .. fb + cap];
             }
 
             // P16.21 T6: syncFrame is PC-ONLY (frame_cap published at

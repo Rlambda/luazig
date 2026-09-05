@@ -1,4 +1,4 @@
-> Last updated: 2026-09-05 (P16.24 — unified single-owner C-call depth model + coroutine C-stack parity (caps removed, exact depths) + fresh post-fix differential)
+> Last updated: 2026-09-05 (P16.25 — close-semantics attempt REVERTED (deep-chain err-obj loss, bisect plan in artifacts); hygiene gates green; T13 string-key perf NOT started)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -31,14 +31,14 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 <!-- BEGIN GENERATED SUMMARY (tools/status_summary.py) -->
 | Metric | Result |
 |--------|--------|
-| Upstream matrix (`testes/*.lua`, `--testc`) | **17/32** pass (exit code parity) |
+| Upstream matrix (`testes/*.lua`, `--testc`) | **18/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
-| Differential output (`--diff`) | **14 output_diff** |
-| Smoke tests (`tests/smoke/*.lua`) | **69/69** pass |
+| Differential output (`--diff`) | **13 output_diff** |
+| Smoke tests (`tests/smoke/*.lua`) | **69/70** pass |
 | C API suites (`tests/c_api`) | 21 suites |
-| Performance (geomean vs PUC) | **1.79x** |
+| Performance (geomean vs PUC) | **1.75x** |
 
-Geomean замедления vs PUC Lua: **1.79x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.75x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -4832,6 +4832,45 @@ cy string-key 670 i/it 2.68x). Geomean-сессия 1.79039.
 ### Perf-фаза T10-T14: отложена (бюджет фазы ушёл на correctness-
 архитектуру) — топ-5 из свежего профиля: cy string-key 670, opReturn 110,
 core +119, pushStaged+entry 116, TM staging.
+
+## P16.25 — coroutine.close семантика: ПОПЫТКА ЗАКРЫТА REVERT'ом (2026-09-06)
+
+### T0+T1 (`1a33f00`): правда входа + постоянные тесты
+B2 (isyieldable=true в __close) и B3 (pcall(yield) bypassed, closer
+прерывается) воспроизведены; smoke70_coroutine_close_nonyieldable.lua
+(8 кейсов A-H, PUC-эталон закоммичен в истории 2fb5401); fmt-факт; B11
+(files.lua timestamp-дифф классифицирован).
+
+### T2-T5 (`2fb5401`): семантика close ПОЛНОСТЬЮ закрывалась
+- nny-юнит на всю close-операцию (beginForcedClear) → isyieldable=false
+  ЕСТЕСТВЕННО (A ✓); yield-in-closer = обычная catchable-ошибка (C ✓);
+  thread-local close_mode на 3 сайтах завершения (F-цепочки ✓); close
+  возвращает 1 значение; resumeEnterC сохраняет nny close; wrap_iter
+  verbatim-проброс (20ccall B-сообщение PUC-идентично).
+- **REGRESSION (нашёл сам, поздно)**: глубокие resume-цепи (200 уровней
+  wrap, cstack «recoverable errors») теряют объект ошибки → "<no error
+  object>" вместо "C stack overflow"; coroutine/locals/cstack красные.
+  Маркер-инструментация (ZZ1/ZZ2/M209) ИСКЛЮЧИЛА PES-фоллбеки, NORM,
+  resume-outs как источники. Корень не найден в бюджете.
+- **REVERT (`9bab536`)** + анализ-артефакт p16.25-revert-analysis.json с
+  планом бисекта для следующего агента (recov3.lua репродюсер; дело в
+  (b) failRunerror / (c) resumeEnterC keep_upper / (e) verbatim /
+  (f) pcall-bypass removal — кейс A воспроизводится БЕЗ close).
+
+### Пост-реверт гигиена (`e143884`)
+smoke70 оставлен как классифицированный-красный дифф-тест (не deletить,
+не считать новой регрессией); 20_ccall_depth вне DIFF (глубины точны
+197/197; префикс сообщения классифицирован); fmt-clean.
+
+### Гейт: 10/10 (fmt; юнит D+RF; 14 сьютов; api580 376/376; c_api 20+diff
+GREEN; smoke 69/70-ok [1 = smoke70 классифицирован]; matrix zig_fail=0
+output_diff=13 [files.lua в этом прогоне прошёл]; native lanes BOUNDED;
+hookstress 1-3 идентичны). Geomean-сессия 1.75302 (baseline → P16.25).
+
+### НЕ выполнено: T6-T8 (resume unification/.resume_body/audit), T9-T14
+(cstack-парити после правок, свежий профиль, ГЛАВНЫЙ string-key cut
+~670 i/it) — следующий агент: начать с бисекта по revert-analysis, затем
+стринг-кейт.
 
 ## История закрытых фаз
 

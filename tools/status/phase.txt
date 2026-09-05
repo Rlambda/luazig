@@ -1,1 +1,1 @@
-P16.24 — unified single-owner C-call depth model + coroutine C-stack parity (caps removed, exact depths) + fresh post-fix differential
+P16.25 — close-semantics attempt REVERTED (deep-chain err-obj loss, bisect plan in artifacts); hygiene gates green; T13 string-key perf NOT started

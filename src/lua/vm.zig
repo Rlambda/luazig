@@ -1060,7 +1060,6 @@ const BytecodeHookContinuation = struct {
 // conservative logical nesting cap so Debug builds remain safe on the 1-MB
 // minimum stack used by the dispatch regression; the exact overflow depth is
 // implementation-defined in PUC Lua as well.
-const max_coroutine_close_c_depth: usize = 4;
 
 /// Bytecode continuation ownership and control-flow invariants.
 ///
@@ -4167,7 +4166,6 @@ pub const Vm = struct {
     /// without LUA_COMPAT_GLOBAL). In normal mode, `global` is a regular name
     /// (PUC Lua compatibility mode with LUA_COMPAT_GLOBAL).
     testc_module_enabled: bool = false,
-    coroutine_close_depth: usize = 0,
     current_thread: ?*Thread = null,
     /// Thread whose runtime buffers are currently borrowed by `frames`,
     /// `bc_stack`, `bc_boxed`, and `bc_tbc_regs` below.
@@ -20216,11 +20214,11 @@ pub const Vm = struct {
 
         // Default return for resume is a tuple: (ok, ...).
         const want_out = outs.len > 0;
-        if (self.activeProtectedCallDepth() >= 32) {
-            if (want_out) outs[0] = .{ .Bool = false };
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("C stack overflow") };
-            return;
-        }
+        // P16.24 T5: the old activeProtectedCallDepth() >= 32 cap was a
+        // second implementation of the LUAI_MAXCCALLS resume invariant
+        // (cstack "30 vs 195" divergence). Resume nesting is bounded by the
+        // unified nCcalls model: resumeEnterC inherits getCcalls(from)+1
+        // and fails at LUA_MAX_C_CALLS, exactly like PUC lua_resume.
         self.protected_call_depth += 1;
         defer self.protected_call_depth -= 1;
         // PUC: coroutine.resume is a protected call — clear errfunc so
@@ -21024,9 +21022,15 @@ pub const Vm = struct {
 
     fn builtinCoroutineClose(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         self.last_builtin_out_count = 0;
-        if (self.coroutine_close_depth >= max_coroutine_close_c_depth) return self.fail("C stack overflow", .{});
-        self.coroutine_close_depth += 1;
-        defer self.coroutine_close_depth -= 1;
+        // P16.24 T5: the old max_coroutine_close_c_depth=4 cap duplicated
+        // the C-depth invariant. PUC lua_closethread runs each pending
+        // __close through luaD_callnoyield: one non-yieldable unit per
+        // close level, bounded by the shared LUAI_MAXCCALLS budget.
+        {
+            const th_close = self.activeBytecodeThread();
+            try self.ccallEnter(th_close, .nonyieldable);
+            defer th_close.ccallExit(.nonyieldable);
+        }
 
         var th: *Thread = undefined;
         if (args.len == 0) {
@@ -38051,7 +38055,10 @@ pub const Vm = struct {
         // LUAI_MAXSTACK + ERRORSTACKSIZE. We report bc_stack.len which grows
         // the same way (ensureBcStackCap grows on overflow at pushBytecodeExecFrame).
         const size: i64 = @intCast(self.bc_stack.len);
-        const n_ccalls: i64 = @intCast(self.activeProtectedCallDepth());
+        // P16.24 T6: report the REAL C-call depth (PUC ltests.c stacklevel
+// exposes L->nCcalls via getCcalls) — NOT protected-call nesting, which
+// models recovery ownership, not C-stack depth.
+const n_ccalls: i64 = @intCast(self.activeBytecodeThread().getCcalls());
         const n_ci: i64 = @intCast(th.call_frames.len());
         var dummy: usize = 0;
         const addr: i64 = @intCast(@intFromPtr(&dummy));

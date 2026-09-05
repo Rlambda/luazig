@@ -1,0 +1,21 @@
+{
+  "created_utc": "2026-09-05T23:13:11.417199+00:00",
+  "provenance": {
+    "git_head": "9bab536",
+    "measured_source_head": "9bab536",
+    "git_dirty": "clean",
+    "zig_version": "0.16.0",
+    "zig_binary_sha16": "224e905cc093e6ea",
+    "phase_state": "T2-T5 REVERTED (2fb5401 reverted by 9bab536)"
+  },
+  "what_was_attempted": {
+    "T2_T3": "nny unit in beginForcedClose/clearForcedClose (isyieldable=false naturally) \u2014 WORKED (smoke70 A/B/D/E/H identical)",
+    "T4": "forced-close RuntimeError conflation removed (pcall catches yield-in-closer; B3 fixed) \u2014 WORKED (smoke70 C identical)",
+    "T5": "wrap_iter verbatim error propagation \u2014 WORKED (20_ccall_depth B message PUC-identical)",
+    "also": "close returns 1 value; resumeEnterC preserves close nny; thread-local close_mode at 3 completion sites (nested close chains F identical)"
+  },
+  "why_reverted": "REGRESSION discovered late: deep resume chains (200-level coroutine.wrap recursion, cstack \"recoverable errors\" section) surfaced \"<no error object>\" instead of \"C stack overflow\" \u2014 the error object is lost somewhere between resumeEnterC ccallEnter-fail at depth ~200 and the outer pcall recovery. Marker instrumentation (ZZ1/ZZ2/M209) EXCLUDED protectedErrorString fallbacks, normalizeProtectedErrorResult, and the resume outs[1] path as sources. Root cause NOT identified within session budget; coroutine.lua, locals.lua, cstack.lua all red with the semantic cuts applied.",
+  "evidence_preserved": "PUC reference outputs for smoke70 (all 8 cases) captured in the test file history at 2fb5401; reproductions: /tmp/opencode/close_b2.lua, close_b3.lua, chain2.lua, recov3.lua (the regressing case: A/B print \"<no error object>\").",
+  "next_agent_plan": "Re-apply T2-T5 from 2fb5401 (git show 2fb5401), then bisect the five sub-changes against recov3.lua: (a) nny close unit, (b) failRunerror in yield/resumeEnterC, (c) resumeEnterC keep_upper, (d) thread-local close_mode x3, (e) wrap_iter verbatim, (f) pcall-bypass removal. The error-object loss reproduces WITHOUT any close involvement (case A: pure wrap chain), narrowing to (b)/(c)/(e)/(f). Likely: recoverBytecodeDispatchError receives RuntimeError with err/err_obj unset after the removed shouldRethrowForcedClose bypass changed which frame first handles the error.",
+  "smoke70_status": "kept as a permanent RED-by-classification differential test (PUC output embedded in comments at 2fb5401); do not count its mismatch as a new regression, and do not delete it"
+}

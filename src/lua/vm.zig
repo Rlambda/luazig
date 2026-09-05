@@ -10073,6 +10073,40 @@ pub const Vm = struct {
 
     /// Prepare a coroutine selected by the trampoline. All allocations happen
     /// before the caller is parked, so OOM cannot leave two runtimes half-active.
+    /// P16.24 T7 — C-depth ownership invariant (the contract every call
+    /// boundary must satisfy; enforced by suite 20_ccall_depth):
+    ///
+    ///   ONE OWNER: every PUC-equivalent C-call boundary enters exactly one
+    ///   ccall unit. apiCall owns the C-API boundary; luaCallKShared passes
+    ///   the mode THROUGH it (never wraps twice); the iterative gsub repl
+    ///   owns its unit at push and releases at completion/cancel
+    ///   (repl_ccall_active); pcall-family installs own the target's unit
+    ///   (enter after the snapshot, so finishBytecodeProtectedCall's
+    ///   nCcalls restore doubles as the exit on EVERY completion path);
+    ///   builtinCoroutineClose owns one non-yieldable unit per close.
+    ///
+    ///   NORMAL COMPLETION: every entered unit exits exactly once; the
+    ///   protection snapshot restore is a no-op at entry depth.
+    ///
+    ///   CAUGHT ERROR: the iterative unwind pops frames without running
+    ///   paired exits; the protecting call's nCcalls snapshot restore
+    ///   reclaims ALL outstanding inner units at once (the Zig analog of
+    ///   PUC's C-stack unwind reclaiming every ccall frame).
+    ///
+    ///   UNCAUGHT ERROR: reclaimed by the OUTER protection's snapshot, or
+    ///   the thread's boundary.
+    ///
+    ///   YIELD: units of parked continuations stay accounted (the snapshot
+    ///   restore only runs at completion, which may be after a resume);
+    ///   resumeEnterC gives the resumed thread a FRESH depth
+    ///   (getCcalls(from)+1), never inheriting stale parked units.
+    ///
+    ///   RESUME: one unit per resume (PUC lua_resume), inherited from the
+    ///   SOURCE thread's lower depth only.
+    ///
+    /// protected_call_depth is a DIFFERENT quantity — recovery/error
+    /// ownership nesting, never a substitute for getCcalls.
+
     /// P16.24 T4: THE single PUC resume-entry semantic (lstate.c lua_resume
     /// + ldo.c resume): the resumed thread inherits the SOURCE thread's
     /// lower C depth (getCcalls(from) — upper nny bits are NOT copied),

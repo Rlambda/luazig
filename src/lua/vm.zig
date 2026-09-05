@@ -1202,7 +1202,7 @@ const PendingCallSlot = struct {
 /// different names:
 /// - `base` (was `bc_base` in RuntimeFrame)
 /// - `reg_top` (was `top` in RuntimeFrame)
-/// - `nvarstack` widened from u8 (BytecodeExecFrame) to u32 (RuntimeFrame)
+/// - `nvarstack`: REMOVED in P16.21 T5 (debug-only fallback -> reg_top)
 /// - `proto` made optional (was non-optional in BytecodeExecFrame)
 ///
 /// Removed: `runtime_frame_index` (no longer needed — single array).
@@ -1449,7 +1449,8 @@ const LuaFrameState = extern struct {
     /// This bypasses the pending_calls array entirely. The completion info
     /// lives inline in LuaFrameState (packed into 2 bytes: lua_packed_flags +
     /// simple_result_dst), using the 2 bytes of slack at the end of the
-    /// 56-byte struct (was 1 bool + 1 byte padding).
+    /// 48-byte struct since P16.21 T2 (func_slot_base removed; the outer
+    /// CallFrame stays 88 B because the C arm is the 56-B union floor).
     ///
     /// Resume equivalence: a frame with hasSimpleResult() that is suspended
     /// (coroutine yield) resumes identically to the old `.value`/`.compare`
@@ -7239,7 +7240,7 @@ pub const Vm = struct {
         // gcMarkMutableRoots sees correct pc/reg_top for live_reg_top.
         const fr = ctx.exec_frames.getPtr(ctx.frame_index);
         fr.u.lua.pc = ctx.pc;
-        // reg_top/nvarstack are read directly from CallFrame (P15.51l).
+        // reg_top is read directly from the CallFrame (P15.51l).
         try self.gcAutomaticStep();
         // bc_stack may have been realloc'd by GC finalizers.
         ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
@@ -12778,7 +12779,7 @@ pub const Vm = struct {
     /// CallFrame is synced only at boundaries (CALL, RETURN, GC, hook, error,
     /// yield). We replicate this by keeping only the 7 hottest fields as
     /// value fields on `ctx` (362+140+104+83+76+40+9 = 814 of ~906 accesses).
-    /// The 11 rare fields (reg_top, nvarstack, nextraargs, varargs, tbc_mark,
+    /// The rare fields (reg_top, nextraargs, varargs, tbc_mark,
     /// resume_pc, func_slot, is_tailcall, resumed_direct_yield,
     /// has_open_upvalues, hooks_active — 92 accesses) are read/written
     /// directly on the heap CallFrame via `ctx.exec_frames.getPtr(ctx.frame_index)`.
@@ -12958,9 +12959,9 @@ pub const Vm = struct {
                 ctx.regs = self.bc_stack[fr.frameBase() .. fr.frameBase() + fr.u.lua.frame_cap];
             }
 
-            // P16.19 T9.1: syncFrame publishes pc + frame_cap (base write
-            // removed as provably identity; proto/upvalues are never
-            // generic sync writes).
+            // P16.21 T6: syncFrame is PC-ONLY (frame_cap published at
+            // mutation sites via growCtxFrame; base/proto/upvalues are
+            // never generic sync writes).
             // The activation_id check skips the write for popped/replaced frames.
             defer self.syncFrame(&ctx, frame_identity);
 
@@ -13058,7 +13059,7 @@ pub const Vm = struct {
                     var fr = exec_frames.getPtr(ctx.frame_index);
                     // Sync ctx.pc to the heap CallFrame so the hooks block and
                     // debug.getinfo see the current instruction.
-                    // P15.51l: reg_top/nvarstack are now read directly from
+                    // P15.51l: reg_top is now read directly from
                     // the CallFrame (fr), so no sync needed for them.
                     fr.u.lua.pc = ctx.pc;
                     // P15.51n: current_line derived from proto.lineinfo[pc].

@@ -1,12 +1,12 @@
 {
-  "created_utc": "2026-09-05T09:42:36.560865+00:00",
+  "created_utc": "2026-09-05T12:06:26.818336+00:00",
   "provenance": {
-    "git_head": "951740c",
-    "measured_source_head": "951740c",
+    "git_head": "e77ea03",
+    "measured_source_head": "e77ea03",
     "git_dirty": "clean",
     "zig_version": "0.16.0",
     "optimize_mode": "Debug+ReleaseFast",
-    "zig_binary_sha16": "9a74829e697aa8d7"
+    "zig_binary_sha16": "6ddaadc50d545b08"
   },
   "luazig": {
     "Debug": {
@@ -33,5 +33,5 @@
     "offset_callstatus": 60
   },
   "notes": "PUC CallInfo is 64 B on this ABI. luazig CallFrame is 88 B in BOTH modes at d8cc5e7 \u2014 P16.20 T1 made the layout build-mode-stable (extern struct/union; was Debug 104 vs RF 96 before), and P16.20 T3 then removed the stored `base` field (invariant base == func_slot + 1, derived via frameBase()), shrinking 96 -> 88 B and shifting every field down by 8 (func_slot 8->0, tbc_mark 16->8, activation_id 16, callstatus 28->20, reg_top 32->24, pending_call_index 36->28, u 40->32). LuaFrameState 56 B and CFrameState 56 B (equal arms, extern union, no hidden tag). luazig frames carry architecture-specific state (iterative yieldable execution, inline hook-replay PCs, simple-result continuation, activation_id); 64 B is NOT a target \u2014 the model is.",
-  "luazig_state_note": "LuaFrameState = 48 B after P16.21 T2 (func_slot_base removed; source-level fact + comptime floor: union payload = 56 B = CFrameState floor, so CallFrame stays 88)."
+  "luazig_state_note": "LuaFrameState 48 B (P16.21 T2+T5), CFrameState 56 B = union floor; CallFrame 88 B."
 }

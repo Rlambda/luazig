@@ -764,7 +764,11 @@ pub const State = struct {
         const fn_idx = self.stack.items.len - nargs - 1;
         const callee = self.stack.items[fn_idx];
         const args = self.stack.items[fn_idx + 1 ..];
-        const ret = self.vm.apiCall(callee, args) catch {
+        // P16.23 T6: pcall-family = DEPTH-ONLY increment. luazig's pcall
+        // continuation machinery (P15.78/P15.82) handles its own yield
+        // semantics — an nny unit here would wrongly make yield-through-
+        // pcallk impossible (c_api 10_continuations t2 regression).
+        const ret = self.vm.apiCall(vm_mod.Thread.CCALL_INC_YIELDABLE, callee, args) catch {
             // PUC luaD_pcall: on error, restore the stack to the base,
             // set the error object (luaD_seterrorobj), then propagate status.
             self.stack.items.len = fn_idx;
@@ -838,7 +842,7 @@ pub const State = struct {
         const dbg = try self.requireDebugModule();
         const f = self.vm.apiGetTable(dbg, .{ .String = try self.vm.internStr("getupvalue") }) catch return error.Runtime;
         var args = [_]vm_mod.Value{ fv.*, .{ .Int = @intCast(n) } };
-        const ret = self.vm.apiCall(f, args[0..]) catch return error.Runtime;
+        const ret = self.vm.apiCall(vm_mod.Thread.CCALL_INC_NOYIELD, f, args[0..]) catch return error.Runtime;
         defer self.vm.alloc.free(ret);
         if (ret.len == 0 or ret[0] == .Nil) return null;
         if (ret[0] != .String) return error.Type;
@@ -853,7 +857,7 @@ pub const State = struct {
         const dbg = try self.requireDebugModule();
         const f = self.vm.apiGetTable(dbg, .{ .String = try self.vm.internStr("setupvalue") }) catch return error.Runtime;
         var args = [_]vm_mod.Value{ fv.*, .{ .Int = @intCast(n) }, set_val };
-        const ret = self.vm.apiCall(f, args[0..]) catch return error.Runtime;
+        const ret = self.vm.apiCall(vm_mod.Thread.CCALL_INC_NOYIELD, f, args[0..]) catch return error.Runtime;
         defer self.vm.alloc.free(ret);
         self.stack.items.len -= 1;
         if (ret.len == 0 or ret[0] == .Nil) return null;
@@ -1009,7 +1013,7 @@ pub const State = struct {
         const fn_idx = self.stack.items.len - nargs - 1;
         const callee = self.stack.items[fn_idx];
         const args = self.stack.items[fn_idx + 1 ..];
-        const ret = self.vm.apiCall(callee, args) catch return error.Runtime;
+        const ret = self.vm.apiCall(vm_mod.Thread.CCALL_INC_NOYIELD, callee, args) catch return error.Runtime;
         defer self.vm.alloc.free(ret);
         self.stack.items.len = fn_idx;
         const want: usize = if (nresults < 0) ret.len else @min(ret.len, @as(usize, @intCast(nresults)));
@@ -1238,7 +1242,7 @@ pub const State = struct {
 
     fn callGlobal(self: *State, name: []const u8, args: []const vm_mod.Value) ![]vm_mod.Value {
         const callee = self.vm.apiGetGlobal(name);
-        return self.vm.apiCall(callee, args);
+        return self.vm.apiCall(vm_mod.Thread.CCALL_INC_NOYIELD, callee, args);
     }
 
     fn requireDebugModule(self: *State) ApiError!vm_mod.Value {

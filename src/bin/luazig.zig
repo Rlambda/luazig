@@ -465,7 +465,7 @@ fn dolibrary(vm: *lua.internal.vm.Vm, spec: []const u8) bool {
     const require_fn = vm.apiGetGlobal("require");
     const modname_str = vm.internStr(modname) catch return false;
     var call_args = [_]lua.internal.vm.Value{.{ .String = modname_str }};
-    const ret = vm.apiCall(require_fn, call_args[0..]) catch return false;
+    const ret = vm.apiCall(lua.internal.vm.Thread.CCALL_INC_NOYIELD, require_fn, call_args[0..]) catch return false;
     defer vm.alloc.free(ret);
     if (ret.len == 0) return false;
 
@@ -541,7 +541,7 @@ fn vmWarnControl(vm: *lua.internal.vm.Vm, msg: []const u8) void {
     const warn_fn = vm.apiGetGlobal("warn");
     const str = vm.internStr(msg) catch return;
     var args = [_]lua.internal.vm.Value{.{ .String = str }};
-    const ret = vm.apiCall(warn_fn, args[0..]) catch return;
+    const ret = vm.apiCall(lua.internal.vm.Thread.CCALL_INC_NOYIELD, warn_fn, args[0..]) catch return;
     vm.alloc.free(ret);
 }
 
@@ -829,7 +829,7 @@ fn doREPL(
             // traceback is appended (PUC uses lua_pcall with msghandler=0).
             if (rets.len > 0) {
                 const print_fn = vm.apiGetGlobal("print");
-                const print_rets = vm.apiCall(print_fn, rets) catch |err| switch (err) {
+                const print_rets = vm.apiCall(lua.internal.vm.Thread.CCALL_INC_NOYIELD, print_fn, rets) catch |err| switch (err) {
                     error.OutOfMemory => {
                         aalloc.free(rets);
                         break;

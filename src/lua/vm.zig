@@ -11163,7 +11163,7 @@ pub const Vm = struct {
                                         request.target.caller = request.caller;
                                         active = request.target;
                                         step = .{ .failed = .{ .String = try self.internStr("C stack overflow") } };
-                                                                            break :retblk null;
+                                        break :retblk null;
                                     },
                                 };
                                 active = request.target;
@@ -11516,7 +11516,6 @@ pub const Vm = struct {
         // nCcalls restore removes it; uncaught unwinds are reclaimed by the
         // OUTER protection's snapshot — one mechanism.
         try self.ccallEnter(owner, .yieldable);
-        if (@import("builtin").mode == .Debug) std.debug.print("PCALL-UNIT enter nCcalls={d}\n", .{owner.nCcalls});
         try self.setPendingCall(exec_frames.getPtr(parent_index), .{
             .callee = .{ .Builtin = id },
             .completion = .{ .results = .{
@@ -38056,9 +38055,9 @@ pub const Vm = struct {
         // the same way (ensureBcStackCap grows on overflow at pushBytecodeExecFrame).
         const size: i64 = @intCast(self.bc_stack.len);
         // P16.24 T6: report the REAL C-call depth (PUC ltests.c stacklevel
-// exposes L->nCcalls via getCcalls) — NOT protected-call nesting, which
-// models recovery ownership, not C-stack depth.
-const n_ccalls: i64 = @intCast(self.activeBytecodeThread().getCcalls());
+        // exposes L->nCcalls via getCcalls) — NOT protected-call nesting, which
+        // models recovery ownership, not C-stack depth.
+        const n_ccalls: i64 = @intCast(self.activeBytecodeThread().getCcalls());
         const n_ci: i64 = @intCast(th.call_frames.len());
         var dummy: usize = 0;
         const addr: i64 = @intCast(@intFromPtr(&dummy));

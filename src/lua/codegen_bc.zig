@@ -589,7 +589,7 @@ pub const Codegen = struct {
                 // (>255 interned strings), fall back to LOADK + GETTABLE.
                 // Mirrors emitGlobalGet's large-index path.
                 self.freeReg(ind.t);
-                if (ind.idx <= 255) {
+                if (ind.idx <= 255 and self.kidIsShortString(@intCast(ind.idx))) {
                     const pc = try self.builder.emitABC(.getfield, 0, ind.t, @intCast(ind.idx), self.line_hint);
                     e.val = .{ .reloc = @intCast(pc) };
                 } else {
@@ -1864,7 +1864,7 @@ pub const Codegen = struct {
                 const obj_reg = try self.exp2anyreg(&obj_ed);
                 // GETFIELD's C field is 8 bits; for large constant indices
                 // (>255 interned strings), fall back to indexed (GETTABLE).
-                if (kid <= 255) {
+                if (kid <= 255 and self.kidIsShortString(kid)) {
                     return .{ .val = .{ .index_str = .{
                         .idx = @intCast(kid),
                         .t = obj_reg,
@@ -1917,7 +1917,7 @@ pub const Codegen = struct {
                     var key_ed = try self.genExpDesc(n.index);
                     if (key_ed.val == .k_str) {
                         const kid = try self.builder.internString(key_ed.val.k_str);
-                        if (kid <= 255) {
+                        if (kid <= 255 and self.kidIsShortString(kid)) {
                             return .{ .val = .{ .index_up = .{
                                 .idx = @intCast(kid),
                                 .t = upval_idx,
@@ -1967,7 +1967,7 @@ pub const Codegen = struct {
                     // interned string K index in C field). PUC VINDEXSTR.
                     .k_str => |s| {
                         const kid = try self.builder.internString(s);
-                        if (kid <= 255) {
+                        if (kid <= 255 and self.kidIsShortString(kid)) {
                             return .{ .val = .{ .index_str = .{
                                 .idx = @intCast(kid),
                                 .t = obj_reg,
@@ -2380,7 +2380,7 @@ pub const Codegen = struct {
     /// Load a constant into a register. Uses LOADK for small indices,
     /// LOADKX + EXTRAARG for large indices.
     fn emitLoadK(self: *Codegen, dst: u8, kid: u32, line: u32) Error!void {
-        if (kid <= 255) {
+        if (kid <= 255 and self.kidIsShortString(kid)) {
             _ = try self.builder.emitABC(.loadk, dst, @intCast(kid), 0, line);
         } else {
             _ = try self.builder.emitABC(.loadkx, dst, 0, 0, line);
@@ -2455,10 +2455,24 @@ pub const Codegen = struct {
     /// that local register with GETFIELD/GETTABLE instead of the upvalue with
     /// GETTABUP. This helper centralises that resolution so every global-read
     /// site honours the shadowing.
+    /// P16.27 T2: PUC luaK's isKstr predicate (lcode.c) — a specialized
+    /// field opcode (GETFIELD/SETFIELD/GETTABUP/SETTABUP with a K operand)
+    /// may ONLY be emitted when the constant is a SHORT string literal
+    /// (<= lua_string_max_short_len). Long constants use the generic
+    /// LOADK+GETTABLE path — the VM handlers then rely on the invariant
+    /// (identity lookup) without a runtime key-kind branch.
+    fn kidIsShortString(self: *Codegen, kid: u32) bool {
+        const items = self.builder.const_pool.items.items;
+        if (kid >= items.len) return false;
+        const c = items[kid];
+        if (c != .str) return false;
+        return c.str.len() <= vm.lua_string_max_short_len;
+    }
+
     fn emitGlobalGet(self: *Codegen, dst: u8, name_kid: u32, line: u32) Error!void {
         if (try self.resolveEnvReg(line)) |env_reg| {
             // _ENV is shadowed by a local — index the local register directly.
-            if (name_kid <= 255) {
+            if (name_kid <= 255 and self.kidIsShortString(name_kid)) {
                 _ = try self.builder.emitABC(.getfield, dst, env_reg, @intCast(name_kid), line);
             } else {
                 const key_reg = try self.allocReg();
@@ -2479,7 +2493,7 @@ pub const Codegen = struct {
     /// SETTABUP on the `_ENV` upvalue when no such local exists.
     fn emitGlobalSet(self: *Codegen, name_kid: u32, val_reg: u8, val_k: bool, line: u32) Error!void {
         if (try self.resolveEnvReg(line)) |env_reg| {
-            if (name_kid <= 255) {
+            if (name_kid <= 255 and self.kidIsShortString(name_kid)) {
                 _ = try self.builder.emitABCk(.setfield, env_reg, @intCast(name_kid), val_reg, val_k, line);
             } else {
                 const key_reg = try self.allocReg();
@@ -2511,7 +2525,7 @@ pub const Codegen = struct {
     /// Emit GETTABUP: R[A] = UpVal[B][K[C]].
     /// If C > 255, uses GETTABUP + EXTRAARG.
     fn emitGetTabUp(self: *Codegen, dst: u8, upval_idx: u8, kid: u32, line: u32) Error!void {
-        if (kid <= 255) {
+        if (kid <= 255 and self.kidIsShortString(kid)) {
             _ = try self.builder.emitABC(.gettabup, dst, upval_idx, @intCast(kid), line);
         } else {
             // For large constant indices, load the string first then use GETTABLE.
@@ -2529,7 +2543,7 @@ pub const Codegen = struct {
 
     /// Emit SETTABUP: UpVal[A][K[B]] = RK[C].
     fn emitSetTabUp(self: *Codegen, upval_idx: u8, kid: u32, val_reg: u8, val_k: bool, line: u32) Error!void {
-        if (kid <= 255) {
+        if (kid <= 255 and self.kidIsShortString(kid)) {
             _ = try self.builder.emitABCk(.settabup, upval_idx, @intCast(kid), val_reg, val_k, line);
         } else {
             // Fallback: load string, get _ENV, use SETTABLE.
@@ -4324,7 +4338,7 @@ pub const Codegen = struct {
 
         // SELF: R[obj_reg+1] = R[obj_reg]; R[obj_reg] = R[obj_reg][K[method]]
         const kid = try self.builder.internString(mc.method.slice(self.source));
-        if (kid <= 255) {
+        if (kid <= 255 and self.kidIsShortString(kid)) {
             _ = try self.builder.emitABC(.self, obj_reg, obj_reg, @intCast(kid), call_line);
         } else {
             // Fallback: load method string, gettable, move self.
@@ -4496,7 +4510,7 @@ pub const Codegen = struct {
                     var val_ed = try self.genExpDesc(nv.value);
                     const val_rk = try self.exp2RK(&val_ed);
                     const kid = try self.builder.internString(nv.name.slice(self.source));
-                    if (kid <= 255) {
+                    if (kid <= 255 and self.kidIsShortString(kid)) {
                         _ = try self.builder.emitABCk(.setfield, dst, @intCast(kid), val_rk.c, val_rk.k, nv.name.span.line);
                     } else {
                         const key = try self.allocReg();
@@ -4528,7 +4542,7 @@ pub const Codegen = struct {
                         if (!val_rk.k) self.freeReg(val_rk.c);
                     } else if (key_ed.val == .k_str) {
                         const kid = try self.builder.internString(key_ed.val.k_str);
-                        if (kid <= 255) {
+                        if (kid <= 255 and self.kidIsShortString(kid)) {
                             // String key → SETFIELD (PUC VINDEXSTR).
                             var val_ed = try self.genExpDesc(kv.value);
                             const val_rk = try self.exp2RK(&val_ed);
@@ -5132,7 +5146,7 @@ pub const Codegen = struct {
                     const nav_count = if (n.name.method != null) n.name.fields.len else @max(n.name.fields.len, 1) - 1;
                     for (n.name.fields[0..nav_count]) |field| {
                         const kid = try self.builder.internString(field.slice(self.source));
-                        if (kid <= 255) {
+                        if (kid <= 255 and self.kidIsShortString(kid)) {
                             const next = try self.allocReg();
                             _ = try self.builder.emitABC(.getfield, next, current, @intCast(kid), field.span.line);
                             self.freeReg(current);
@@ -5149,7 +5163,7 @@ pub const Codegen = struct {
                     // SET the last field/method on the parent.
                     const last_name = if (n.name.method) |m| m else n.name.fields[n.name.fields.len - 1];
                     const kid = try self.builder.internString(last_name.slice(self.source));
-                    if (kid <= 255) {
+                    if (kid <= 255 and self.kidIsShortString(kid)) {
                         _ = try self.builder.emitABC(.setfield, current, @intCast(kid), func_reg, st.span.line);
                     } else {
                         const key = try self.allocReg();
@@ -5772,7 +5786,7 @@ pub const Codegen = struct {
         switch (lhs) {
             .direct => |e| try self.genSet(e, val_reg, val_k, self.line_hint),
             .field => |f| {
-                if (f.key <= 255) {
+                if (f.key <= 255 and self.kidIsShortString(f.key)) {
                     _ = try self.builder.emitABCk(.setfield, f.object, @intCast(f.key), val_reg, val_k, f.line);
                 } else {
                     const key_reg = try self.allocReg();
@@ -5900,7 +5914,7 @@ pub const Codegen = struct {
                 var obj_ed = try self.genExpDesc(n.object);
                 if (obj_ed.val == .upval) {
                     const kid = try self.builder.internString(n.name.slice(self.source));
-                    if (kid <= 255) {
+                    if (kid <= 255 and self.kidIsShortString(kid)) {
                         _ = try self.builder.emitABCk(.settabup, @intCast(obj_ed.val.upval), @intCast(kid), val_reg, val_k, line);
                         return;
                     }
@@ -5909,7 +5923,7 @@ pub const Codegen = struct {
                 // directly to its register without MOVE (PUC VLOCAL path).
                 const obj = try self.exp2anyreg(&obj_ed);
                 const kid = try self.builder.internString(n.name.slice(self.source));
-                if (kid <= 255) {
+                if (kid <= 255 and self.kidIsShortString(kid)) {
                     _ = try self.builder.emitABCk(.setfield, obj, @intCast(kid), val_reg, val_k, line);
                 } else {
                     const key_reg = try self.allocReg();
@@ -5953,7 +5967,7 @@ pub const Codegen = struct {
                 // SETTABUP when the table is an upvalue (PUC VINDEXUP).
                 if (key_ed.val == .k_str) {
                     const kid = try self.builder.internString(key_ed.val.k_str);
-                    if (kid <= 255) {
+                    if (kid <= 255 and self.kidIsShortString(kid)) {
                         var obj_ed = try self.genExpDesc(n.object);
                         if (obj_ed.val == .upval) {
                             _ = try self.builder.emitABCk(.settabup, @intCast(obj_ed.val.upval), @intCast(kid), val_reg, val_k, line);
@@ -6005,7 +6019,7 @@ pub const Codegen = struct {
                 var obj_ed = try self.genExpDesc(n.object);
                 if (obj_ed.val == .upval) {
                     const kid = try self.builder.internString(n.name.slice(self.source));
-                    if (kid <= 255) {
+                    if (kid <= 255 and self.kidIsShortString(kid)) {
                         // LHS prepared (upvalue table + string key). Now
                         // discharge RHS and emit SETTABUP (PUC VINDEXUP).
                         const val_rk = try self.exp2RK(rhs_ed);
@@ -6019,7 +6033,7 @@ pub const Codegen = struct {
                 const kid = try self.builder.internString(n.name.slice(self.source));
                 // LHS prepared. Now discharge RHS and emit SETFIELD.
                 const val_rk = try self.exp2RK(rhs_ed);
-                if (kid <= 255) {
+                if (kid <= 255 and self.kidIsShortString(kid)) {
                     _ = try self.builder.emitABCk(.setfield, obj, @intCast(kid), val_rk.c, val_rk.k, line);
                 } else {
                     const key_reg = try self.allocReg();
@@ -6060,7 +6074,7 @@ pub const Codegen = struct {
                 // SETTABUP when the table is an upvalue (PUC VINDEXUP).
                 if (key_ed.val == .k_str) {
                     const kid = try self.builder.internString(key_ed.val.k_str);
-                    if (kid <= 255) {
+                    if (kid <= 255 and self.kidIsShortString(kid)) {
                         var obj_ed = try self.genExpDesc(n.object);
                         if (obj_ed.val == .upval) {
                             // LHS prepared (upvalue + string key). Discharge
@@ -6209,7 +6223,7 @@ pub const Codegen = struct {
                 obj_reg = tmp;
             }
             const kid = try self.builder.internString(mc.method.slice(self.source));
-            if (kid <= 255) {
+            if (kid <= 255 and self.kidIsShortString(kid)) {
                 _ = try self.builder.emitABC(.self, obj_reg, obj_reg, @intCast(kid), call_line);
             } else {
                 const key = try self.allocReg();

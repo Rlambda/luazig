@@ -1,1 +1,1 @@
-P16.25.1 — resume-entry root cause CLOSED (typed rejection R2/R3, both P16.25 loss paths identified: err-channel-defer-erase + verbatim err=null); T2-T5 reapply still pending (sc3 noyield gap)
+P16.26 — resume-entry state machine complete (no-dead-on-reject + invariant test), single C-depth owner, short-string identity for bytecode constants, O(1) c_frame_count; geomean -3.1% same-session

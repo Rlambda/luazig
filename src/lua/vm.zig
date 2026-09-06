@@ -5022,6 +5022,7 @@ pub const Vm = struct {
                 self.clearPendingCall(frame);
             }
         }
+        th.c_frame_count = 0; // P16.27 T0.1: bulk reset — stack emptied below
         th.call_frames.clearAndFree(self.alloc);
         th.bytecode_unwinds.clearAndFree(self.alloc);
         th.bytecode_inplace_suspended = false;
@@ -6602,7 +6603,6 @@ pub const Vm = struct {
     /// field needed.
     fn pushBuiltinCFrame(self: *Vm, callee: Value) std.mem.Allocator.Error!void {
         const th = self.activeBytecodeThread();
-        th.c_frame_count += 1; // P16.26 D: O(1) C-frame presence
         // Place callee on bc_stack (PUC: ci->func points into L->stack).
         const func_slot = self.bc_stack_top;
         // Grow bc_stack + bc_boxed transactionally: realloc bc_boxed first
@@ -6645,6 +6645,10 @@ pub const Vm = struct {
         // (finishCcall, poscallCFrame, etc.) uses isC(), not isHidden(), so
         // hiding doesn't affect continuation dispatch.
         slot.setHidden();
+        // P16.27 T0.1: increment ONLY after the frame actually exists —
+        // the stack growth and addOne above can fail, and a pre-increment
+        // would leak the count on rollback.
+        th.c_frame_count += 1;
     }
 
     /// Pop the topmost CallFrame (the synthetic C-frame pushed by
@@ -6734,6 +6738,10 @@ pub const Vm = struct {
             }
             self.bc_stack_top = frame.func_slot;
             th.call_frames.shrinkTo(cur_len - 1);
+            if (frame.isC()) {
+                if (std.debug.runtime_safety) std.debug.assert(th.c_frame_count > 0);
+                th.c_frame_count -= 1; // P16.27 T0.1
+            }
         }
     }
 
@@ -6760,7 +6768,10 @@ pub const Vm = struct {
             // stack level. Without this frame, `debug.getinfo` level numbers
             // wouldn't match PUC.
             try self.pushBuiltinCFrame(ef);
-            defer self.popBuiltinCFrame();
+            defer {
+                self.popBuiltinCFrame();
+                if (std.debug.runtime_safety) self.cFrameCountAssert(self.activeBytecodeThread());
+            }
             // Save the error object before calling the handler.
             const err_obj = if (self.err_has_obj) self.err_obj else .Nil;
             var call_args = [_]Value{err_obj};
@@ -10159,6 +10170,23 @@ pub const Vm = struct {
         rejected: Value,
     };
 
+    /// P16.27 T0.1: slow physical C-frame auditor — the counter must equal
+    /// the real count at observable boundaries (Debug-only call sites).
+    fn countCFramesSlow(th: *const Thread) usize {
+        var n: usize = 0;
+        for (0..th.call_frames.len()) |i| {
+            if (th.call_frames.getConstPtr(i).isC()) n += 1;
+        }
+        return n;
+    }
+
+    fn cFrameCountAssert(self: *const Vm, th: *const Thread) void {
+        _ = self;
+        if (std.debug.runtime_safety) {
+            std.debug.assert(th.c_frame_count == countCFramesSlow(th));
+        }
+    }
+
     pub fn resumeEnterC(self: *Vm, co: *Thread, from: ?*Thread) std.mem.Allocator.Error!ResumeEnterResult {
         co.nCcalls = if (from) |f| @as(u32, f.getCcalls()) else 0;
         if (co.getCcalls() >= Thread.LUA_MAX_C_CALLS) {
@@ -10477,11 +10505,16 @@ pub const Vm = struct {
         // C-frame (e.g., error from __close during TBC close).
         {
             var fi: usize = th.call_frames.len();
+            var removed_c: u32 = 0; // P16.27 T0.1: bulk accounting
             while (fi > ci_idx + 1) {
                 fi -= 1;
                 const f = th.call_frames.getPtr(fi);
-                if (f.isC()) self.freeCFrameOwnedState(f);
+                if (f.isC()) {
+                    self.freeCFrameOwnedState(f);
+                    removed_c += 1;
+                }
             }
+            th.c_frame_count -= removed_c;
         }
         th.call_frames.shrinkTo(ci_idx + 1);
         // PUC: setcistrecst(ci, status) — save error status for finishpcallk.
@@ -10990,7 +11023,11 @@ pub const Vm = struct {
         const fr = th_bc.getPtr(cur_len - 1);
         // P15.80: Free heap-allocated testc_state before shrinking.
         // Without this, the pointer is lost and the allocation leaks.
-        if (fr.isC()) self.freeCFrameOwnedState(fr);
+        if (fr.isC()) {
+            self.freeCFrameOwnedState(fr);
+            if (std.debug.runtime_safety) std.debug.assert(th.c_frame_count > 0);
+            th.c_frame_count -= 1; // P16.27 T0.1
+        }
         th_bc.shrinkTo(cur_len - 1);
         // PUC model: restore bc_stack_top to the caller's frame capacity,
         // mirroring popBytecodeExecFrame (line ~10533). The C-frame's results
@@ -38434,6 +38471,8 @@ pub const Vm = struct {
                     // Snapshot func_slot BEFORE shrinkTo (use-after-shrink fix).
                     const saved_func_slot = fr.func_slot;
                     active_th.call_frames.shrinkTo(cframe_idx);
+                    if (std.debug.runtime_safety) std.debug.assert(active_th.c_frame_count > 0);
+                    active_th.c_frame_count -= 1; // P16.27 T0.1
                     self.bc_stack_top = saved_func_slot;
                 }
 

@@ -2027,6 +2027,11 @@ pub const Thread = struct {
     wrap_final_error: ?Value = null,
     wrap_final_delivered: bool = false,
     close_mode: bool = false,
+    /// P16.26 D: count of C-frames currently on this thread's frame stack.
+    /// Mirrors what PUC knows structurally (a C CallInfo is on L->ci stack):
+    /// lets coroutine fast-path eligibility be O(1) instead of scanning
+    /// every frame on each yield/resume (5.2% of coroutine_yield samples).
+    c_frame_count: u32 = 0,
     close_has_err: bool = false,
     close_err: Value = .Nil,
     wrap_repeat_closure: ?*Closure = null,
@@ -6597,6 +6602,7 @@ pub const Vm = struct {
     /// field needed.
     fn pushBuiltinCFrame(self: *Vm, callee: Value) std.mem.Allocator.Error!void {
         const th = self.activeBytecodeThread();
+        th.c_frame_count += 1; // P16.26 D: O(1) C-frame presence
         // Place callee on bc_stack (PUC: ci->func points into L->stack).
         const func_slot = self.bc_stack_top;
         // Grow bc_stack + bc_boxed transactionally: realloc bc_boxed first
@@ -10005,9 +10011,9 @@ pub const Vm = struct {
                 // for a C-frame on top and calls finishCcall to pop the
                 // yield's C-frame (not the pcall's).
                 const th_bc = self.activeBytecodeThread();
-                for (0..th_bc.call_frames.len()) |i| {
-                    if (th_bc.call_frames.getConstPtr(i).isC()) return false;
-                }
+                // P16.26 D: O(1) C-frame presence via c_frame_count (was
+                // a full frame-stack scan per yield — 5.2% of samples).
+                if (th_bc.c_frame_count != 0) return false;
                 return true;
             },
             .coroutine_resume => {
@@ -10029,10 +10035,13 @@ pub const Vm = struct {
                 if (target.close_mode) return false;
                 // No C-frames with testc_state on target thread — the
                 // continuation k must be invoked via finishCcall on resume,
-                // which requires the C-frame.
-                for (0..target.call_frames.len()) |i| {
-                    const fr = target.call_frames.getConstPtr(i);
-                    if (fr.isC() and fr.u.c.testc_state != null) return false;
+                // which requires the C-frame. c_frame_count==0 proves none
+                // exist without scanning (P16.26 D).
+                if (target.c_frame_count != 0) {
+                    for (0..target.call_frames.len()) |i| {
+                        const fr = target.call_frames.getConstPtr(i);
+                        if (fr.isC() and fr.u.c.testc_state != null) return false;
+                    }
                 }
                 return true;
             },
@@ -11036,6 +11045,8 @@ pub const Vm = struct {
         self.freeCFrameOwnedState(fr);
         self.bc_stack_top = saved_func_slot + 1;
         th_bc.shrinkTo(cur_len - 1);
+        if (std.debug.runtime_safety) std.debug.assert(th.c_frame_count > 0);
+        th.c_frame_count -= 1; // P16.26 D
     }
 
     /// Drive a chain of bytecode coroutine.resume/wrap calls without nesting

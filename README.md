@@ -22,7 +22,7 @@ The project is in a **pre-release / parity-focused** state.
 
 | Metric | Result |
 |--------|--------|
-| Upstream matrix (`testes/*.lua`, `--testc`) | **18/32** pass (exit code parity) |
+| Upstream matrix (`testes/*.lua`, `--testc`) | **17/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
 | Smoke tests (`tests/smoke/*.lua`) | **69/70** match (byte-identical stdout+stderr+exit) |
 | C API suites (`tests/c_api`) | 21 suites (gate: `make -C tests/c_api test`) |
@@ -36,24 +36,24 @@ Method: median-of-7 per workload, pinned CPU core (`tools/perf_compare.py`).
 
 | Workload | Zig/PUC |
 |----------|--------:|
-| metamethod_add | 2.56x |
-| metamethod_call_noalloc | 2.45x |
-| coroutine_yield | 2.21x |
+| metamethod_add | 2.55x |
+| metamethod_call_noalloc | 2.42x |
+| coroutine_yield | 2.27x |
 | hash_access | 2.05x |
-| table_alloc_setmetatable | 1.95x |
+| table_alloc_setmetatable | 2.00x |
+| branch_loop | 1.94x |
 | lua_calls | 1.94x |
-| branch_loop | 1.92x |
-| array_access | 1.86x |
-| field_access | 1.81x |
-| temp_table_alloc | 1.77x |
-| global_arith | 1.74x |
-| comparisons | 1.59x |
-| mixed_arith | 1.56x |
-| dynamic_load | 1.54x |
-| float_arith | 1.47x |
-| int_arith | 1.47x |
-| string_loop | 1.28x |
-| string_concat | 1.07x |
+| array_access | 1.88x |
+| field_access | 1.87x |
+| temp_table_alloc | 1.75x |
+| comparisons | 1.61x |
+| dynamic_load | 1.59x |
+| mixed_arith | 1.59x |
+| float_arith | 1.51x |
+| global_arith | 1.51x |
+| int_arith | 1.48x |
+| string_loop | 1.26x |
+| string_concat | 1.08x |
 <!-- END GENERATED STATUS -->
 
 See [STATUS.md](STATUS.md) for detailed profiling methodology, hotspot analysis, and optimization history.

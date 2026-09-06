@@ -1,4 +1,4 @@
-> Last updated: 2026-09-05 (P16.25 — close-semantics attempt REVERTED (deep-chain err-obj loss, bisect plan in artifacts); hygiene gates green; T13 string-key perf NOT started)
+> Last updated: 2026-09-06 (P16.25.1 — resume-entry root cause CLOSED (typed rejection R2/R3, both P16.25 loss paths identified: err-channel-defer-erase + verbatim err=null); T2-T5 reapply still pending (sc3 noyield gap))
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -31,9 +31,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 <!-- BEGIN GENERATED SUMMARY (tools/status_summary.py) -->
 | Metric | Result |
 |--------|--------|
-| Upstream matrix (`testes/*.lua`, `--testc`) | **18/32** pass (exit code parity) |
+| Upstream matrix (`testes/*.lua`, `--testc`) | **17/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
-| Differential output (`--diff`) | **13 output_diff** |
+| Differential output (`--diff`) | **14 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **69/70** pass |
 | C API suites (`tests/c_api`) | 21 suites |
 | Performance (geomean vs PUC) | **1.75x** |
@@ -4871,6 +4871,46 @@ hookstress 1-3 идентичны). Geomean-сессия 1.75302 (baseline → P
 (cstack-парити после правок, свежий профиль, ГЛАВНЫЙ string-key cut
 ~670 i/it) — следующий агент: начать с бисекта по revert-analysis, затем
 стринг-кейт.
+
+## P16.25.1 — корень resume-entry закрыт (2026-09-06)
+
+### R1 (доказательство)
+Проба R1-REJECT: на depth-отказе resumeEnterC объект СУЩЕСТВУЕТ (has_obj=true,
+target=.suspended) — стирает его saved-error defer объемлющего
+builtinCoroutineResume. Подтверждено независимо: R2 фиксит recov3 БЕЗ
+close-изменений → корень подтверждён, T2-T5 крты — лишь trigger/exposer.
+
+### R2+R3 (`7024871`)
+- **ResumeEnterResult** (entered | rejected:Value) — PUC resume_error:
+  отказ = ошибка ВЫЗОВА lua_resume, значение возвращается, статус короутины
+  нетронут, err-канал не используется;
+- builtinCoroutineResume: решение о входе ДО каких-либо коммитов
+  (статус/inbox/entry-args); rejected → (false, value), без .dead;
+- trampoline: raiseResumeEntryRejected ставит значение напрямую (без fail(),
+  без префикса, без хардкода cso в catch-сайтах).
+- recov3 PUC-идентичен; coroutine/cstack/locals зелёные.
+
+### R4 (cherry-pick 2fb5401): попыытка + честный откат
+Применён чисто (1 конфликт смержен); в сессии найдены и исправлены 3 бага:
+(1) дубль хвоста fn из merge; (2) **wrap_iter verbatim оставлял err=null для
+СТРОКОВЫХ объектов — вторая половина P16.25-потери** (restoreRuntimeErrorValue
+чинит; recov3 зелёный С этим фиксом); (3) close-failure арность 1 значение
+(coroutine.lua:195). ОСТАЛОСЬ: sc3 — yield внутри __close при ОБЫЧНОМ
+resume-завершении (без внешнего coroutine.close) должен блокироваться
+non-yieldable-контекстом; в P16.24 ловил noyield_close (unwinds
+bottom-propagate); после T2-T5 — false. coroutine:336 + locals:1090 красные →
+cherry-pick откачен. Артефакт: p16.25.1-root-cause.json (sc3.lua репродюсер).
+
+### Root vs Trigger
+КОРНИ (оба): (a) resume-entry отказ через err-канал + defer-erase; (b)
+verbatim err=null для строк. ТРИГГЕР: T2-T5 сменили, какая граница первой
+обрабатывала near-limit вызов — механизмы потери они не создавали.
+
+### Гейт: зелёный на прежних классификациях (smoke70 = classified-red,
+20ccall вне DIFF, locals pacing). Geomean-сессия 1.7533; baseline P16.25.1.
+
+### Следующему: reapply T2-T5 по одному крту (git show 2fb5401) + 3
+внутрисессионных фикса + закрыть noyield-при-обычном-завершении (sc3).
 
 ## История закрытых фаз
 

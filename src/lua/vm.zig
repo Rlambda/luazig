@@ -10112,11 +10112,31 @@ pub const Vm = struct {
     /// is limit-checked, and owns exactly one resume unit. Used by BOTH
     /// the C API (lua_resume) and the Lua-level resume trampoline — no
     /// second logical counter.
-    pub fn resumeEnterC(self: *Vm, co: *Thread, from: ?*Thread) DispatchError!void {
+    /// P16.25.1 R2: PUC ldo.c `resume_error` — a resume-ENTRY rejection is
+    /// an error of the `lua_resume` call itself, NOT of coroutine execution.
+    /// It is returned as a VALUE (coroutine status untouched); it must never
+    /// rely on the VM-global error channel surviving a protected boundary's
+    /// saved-error defer (the P16.25 object-loss root cause).
+    pub const ResumeEnterResult = union(enum) {
+        entered,
+        rejected: Value,
+    };
+
+    pub fn resumeEnterC(self: *Vm, co: *Thread, from: ?*Thread) std.mem.Allocator.Error!ResumeEnterResult {
         co.nCcalls = if (from) |f| @as(u32, f.getCcalls()) else 0;
-        if (co.getCcalls() >= Thread.LUA_MAX_C_CALLS)
-            return self.fail("C stack overflow", .{});
+        if (co.getCcalls() >= Thread.LUA_MAX_C_CALLS) {
+            return .{ .rejected = .{ .String = try self.internStr("C stack overflow") } };
+        }
         co.nCcalls += 1;
+        return .entered;
+    }
+
+    /// R3 helper: raise a resume-entry rejection as a RuntimeError WITH the
+    /// value already installed (restoreRuntimeErrorValue sets err/err_obj —
+    /// unlike fail(), no position prefix, and no dependence on later defers).
+    fn raiseResumeEntryRejected(self: *Vm, value: Value) DispatchError {
+        self.restoreRuntimeErrorValue(value);
+        return error.RuntimeError;
     }
 
     fn prepareBytecodeCoroutineSwitch(
@@ -10129,11 +10149,14 @@ pub const Vm = struct {
         std.debug.assert(self.active_runtime_thread == request.caller);
         std.debug.assert(canTrampolineBytecodeThread(target));
 
-        // P16.24 T4: resume-entry depth accounting — the target inherits
-        // the caller's C depth + one unit (PUC lua_resume). The old
-        // separate coroutine_resume_chain counter is superseded by this
-        // shared model.
-        try self.resumeEnterC(target, request.caller);
+        // P16.24 T4 / P16.25.1 R3: resume-entry depth accounting — the
+        // target inherits the caller's C depth + one unit (PUC lua_resume).
+        // A REJECTION is converted here, with the value installed directly
+        // (before any caller/target state mutation below) — the old fail()
+        // created the object into the VM-global channel where the enclosing
+        // resume's saved-error defer erased it (P16.25 root cause).
+        const entry = try self.resumeEnterC(target, request.caller);
+        if (entry == .rejected) return self.raiseResumeEntryRejected(entry.rejected);
         const first_start = !target.started and target.entry_args == null;
         if (first_start) target.entry_args = try self.alloc.dupe(Value, request.args);
         try self.setThreadResumeInbox(target, request.args);
@@ -20334,6 +20357,26 @@ pub const Vm = struct {
 
         const call_args = args[1..];
 
+        // P16.25.1 R2: resume-ENTRY ACCEPTANCE FIRST (PUC lua_resume order:
+        // the C-depth check precedes every status transition). A rejection
+        // is an error of THIS call returned as a value; the coroutine keeps
+        // its pre-call status — no runtime switch, inbox, or entry-args
+        // state is committed for the attempt (PUC resume_error).
+        {
+            const entry_th = self.activeBytecodeThread();
+            const entry = try self.resumeEnterC(th, entry_th);
+            if (entry == .rejected) {
+                if (want_out) {
+                    outs[0] = .{ .Bool = false };
+                    if (outs.len > 1) outs[1] = entry.rejected;
+                    self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
+                } else {
+                    self.last_builtin_out_count = 0;
+                }
+                return;
+            }
+        }
+
         // Builtin entrypoints (notably coroutine.create(pcall/xpcall)) need the
         // original start arguments when resuming from suspended continuation
         // frames. This is runtime call context, not replay re-execution state.
@@ -20352,12 +20395,6 @@ pub const Vm = struct {
             if (pt.status == .running) pt.status = .suspended;
         }
         const prev_runtime_thread = self.active_runtime_thread.?;
-        // P16.24 T4: resume-entry depth semantics — the shared resumeEnterC
-        // (PUC lua_resume: inherit getCcalls(from), check, own one unit).
-        // This builtin's own runtime switch is the Lua-level equivalent of
-        // lua_resume; the trampoline switch (prepareBytecodeCoroutineSwitch)
-        // uses the SAME helper — one model, no second counter.
-        try self.resumeEnterC(th, prev_runtime_thread);
         // P15.33: Set current_thread before switchRuntime so refreshHooksCached
         // reads the target thread's hook state.
         self.current_thread = th;

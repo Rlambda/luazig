@@ -979,6 +979,23 @@ const BytecodeClosePost = union(enum) {
 };
 
 const BytecodeCloseContinuation = struct {
+    /// P16.27 T1: PUC callclosemethod's 'yy' — the yieldability of the
+    /// ACTUAL __close invocation. Derived from the PUC yy table
+    /// (tools/status/p16.27-close-yy-table.json):
+    ///   .nonyieldable — luaD_closeprotected paths (coroutine.close /
+    ///     forced-close transport / dead-thread reset);
+    ///   .yieldable — ordinary OP_CLOSE/OP_RETURN/error-unwind/poscall.
+    /// The policy OWNS the nny unit for the whole closer invocation:
+    /// .nonyieldable enters it before the metamethod runs and leaves it
+    /// exactly once on completion/error (coroutine.isyieldable() naturally
+    /// returns false; a yield raises the ordinary PUC error — which stays
+    /// CATCHABLE by pcall inside the closer, exactly like
+    /// luaD_callnoyield).
+    policy: CloseCallPolicy = .yieldable,
+    /// Whether THIS continuation currently holds the nny unit for its
+    /// in-flight .nonyieldable closer child (paired leave on completion
+    /// or cancel — mirrors the sync defer above).
+    nny_active: bool = false,
     min_reg: u8,
     scan_index: usize,
     current_err: ?Value,
@@ -989,6 +1006,11 @@ const BytecodeCloseContinuation = struct {
     child_active: bool = false,
     waiting_builtin_yield: bool = false,
     post: BytecodeClosePost,
+};
+
+const CloseCallPolicy = enum {
+    yieldable,
+    nonyieldable,
 };
 
 const BytecodeCloseProgress = union(enum) {
@@ -7859,6 +7881,12 @@ pub const Vm = struct {
 
     fn releaseBytecodeCloseChild(self: *Vm, state: *BytecodeCloseContinuation) void {
         _ = self;
+        // P16.27 T1: paired leave of the non-yieldable unit here — this is
+        // THE single completion/cancel point for an in-flight closer child.
+        if (state.nny_active) {
+            state.owner_thread.decnny();
+            state.nny_active = false;
+        }
         if (!state.child_active) return;
         std.debug.assert(state.owner_thread.bytecode_close_metamethod_depth != 0);
         state.owner_thread.bytecode_close_metamethod_depth -= 1;
@@ -7951,6 +7979,13 @@ pub const Vm = struct {
         const owner = self.activeBytecodeThread();
         const close_state = try self.alloc.create(BytecodeCloseContinuation);
         close_state.* = .{
+            // P16.27 T1: PUC yy derivation — closes driven by a forced
+            // close transport (coroutine.close on a suspended thread;
+            // beginForcedClose marks close_mode) run under
+            // luaD_closeprotected(yy=0) => callclosemethod(yy=0) =>
+            // NONYIELDABLE. Ordinary OP_CLOSE/OP_RETURN/error-unwind/poscall
+            // closes are yieldable (yy=1).
+            .policy = if (owner.close_mode) .nonyieldable else .yieldable,
             .min_reg = min_reg,
             .scan_index = self.bc_tbc_regs.items.len,
             .current_err = initial_err,
@@ -8026,6 +8061,12 @@ pub const Vm = struct {
             defer if (resolved.owned_args) |owned| self.alloc.free(owned);
             if (resolved.callee == .Closure and resolved.callee.Closure.proto != null) {
                 state.child_active = true;
+                // P16.27 T1: the POLICY owns the nny unit for the whole
+                // closer invocation (PUC callclosemethod yy). Entered here
+                // (before activation) and left exactly once when this child
+                // completes (applyBytecodePendingClose) or is cancelled.
+                state.nny_active = state.policy == .nonyieldable;
+                if (state.nny_active) state.owner_thread.incnny();
                 state.owner_thread.bytecode_close_metamethod_depth += 1;
                 if (state.err_depth) state.owner_thread.bytecode_close_metamethod_err_depth += 1;
                 try self.setPendingCall(exec_frames.getPtr(parent_index), .{
@@ -8061,6 +8102,8 @@ pub const Vm = struct {
                 return .resume_dispatch;
             }
 
+            if (state.policy == .nonyieldable) state.owner_thread.incnny();
+            defer if (state.policy == .nonyieldable) state.owner_thread.decnny();
             self.runCloseMetamethod(obj, state.current_err) catch |close_err| switch (close_err) {
                 error.RuntimeError => {
                     try self.recordBytecodeCloseError(state);
@@ -11325,7 +11368,7 @@ pub const Vm = struct {
                                 // Not recovered: unrecoverable error
                                 if (active.yielded.slice() != null and active.capture_yield_id != 0) {
                                     step = try self.bytecodeCoroutineYieldStep(active, active == initial);
-                                } else if (self.forced_close_thread == active and active.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
+                                } else if (active.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
                                     step = .forced_close;
                                 } else {
                                     step = .{ .failed = try self.currentRuntimeErrorValue() };
@@ -12149,7 +12192,13 @@ pub const Vm = struct {
         boundary_depth: usize,
         dispatch_err: DispatchError,
     ) DispatchError!BytecodeDispatchRecovery {
-        if (dispatch_err == error.Yield or self.shouldRethrowForcedCloseFromBytecode()) {
+        // P16.27 T1: the old forced-close bypass is REMOVED. Errors raised
+        // while closers execute during a thread close are ORDINARY catchable
+        // runtime errors (PUC: luaD_callnoyield forbids yielding but does
+        // NOT disable protected error handling — pcall inside __close must
+        // catch a failed yield). Uncaught errors flow into the close
+        // continuation via the .close_parent disposition (last error wins).
+        if (dispatch_err == error.Yield) {
             return .{ .propagate = .runtime };
         }
         const fault: BytecodeDispatchFault = if (dispatch_err == error.OutOfMemory)
@@ -13030,31 +13079,9 @@ pub const Vm = struct {
         while (true) {
             const result = self.runBytecodeDispatch(exec_frames, boundary_depth, &yielded_in_place) catch |dispatch_err| {
                 if (dispatch_err == error.Yield or dispatch_err == error.ThreadSwitch) return dispatch_err;
-                if (self.shouldRethrowForcedCloseFromBytecode()) {
-                    // Re-entrant bytecode entries made by a C callback only
-                    // release their borrowed suffix. The root owner performs
-                    // the semantic reset so protected continuations cannot
-                    // intercept coroutine.close() and all root TBC slots run.
-                    if (boundary_depth != 0) return dispatch_err;
-                    // P15.79: If __close metamethods already errored during
-                    // the forced close, all TBC slots have been processed by
-                    // continueBytecodeErrorUnwind → close_parent →
-                    // continueBytecodeClose. The error is already set
-                    // correctly (the last __close error). Don't clear it —
-                    // just propagate. Clearing and re-running the forced
-                    // close would discard the __close error and set err_obj
-                    // to nil, causing coroutine.close to return (false, nil)
-                    // instead of (false, "last_close_error").
-                    if (self.forced_close_had_error) return error.RuntimeError;
-                    self.clearErrorTraceback();
-                    self.restoreRuntimeErrorValue(.Nil);
-                    try self.appendBytecodeForcedCloseUnwind(boundary_depth);
-                    switch (try self.continueBytecodeErrorUnwind(exec_frames)) {
-                        .resumed => continue,
-                        .completed => |ret| return ret,
-                        .propagate => return error.RuntimeError,
-                    }
-                }
+                // P16.27 T1: the forced-close bypass is REMOVED — errors
+                // in closers are ordinary catchable errors; the close
+                // continuation records uncaught ones (last error wins).
                 switch (try self.recoverBytecodeDispatchError(exec_frames, boundary_depth, dispatch_err)) {
                     .resumed => continue,
                     .completed => |ret| return ret,
@@ -19336,11 +19363,10 @@ pub const Vm = struct {
         const prev_err_source = self.err_source;
         const prev_err_line = self.err_line;
         const prev_err_traceback = self.err_traceback;
-        var rethrow_forced_close = false;
         self.err_traceback = null;
         defer {
             self.clearErrorTraceback();
-            if (!rethrow_forced_close) {
+            {
                 self.err = prev_err;
                 self.err_obj = prev_err_obj;
                 self.err_has_obj = prev_err_has_obj;
@@ -19459,10 +19485,6 @@ pub const Vm = struct {
                             self.last_builtin_out_count = @min(@as(usize, 2), outs_fresh.len);
                             return;
                         }
-                        if (self.shouldRethrowForcedClose()) {
-                            rethrow_forced_close = true;
-                            return error.RuntimeError;
-                        }
                         rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
                         setFail(self, self.refreshBuiltinOuts() orelse outs);
                         return;
@@ -19502,10 +19524,6 @@ pub const Vm = struct {
                         return;
                     },
                     else => {
-                        if (self.shouldRethrowForcedClose()) {
-                            rethrow_forced_close = true;
-                            return error.RuntimeError;
-                        }
                         self.unwindBytecodeExecFrames(&th_pcall.call_frames, saved_frame_count);
                         self.bc_stack_top = saved_bc_stack_top;
                         rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
@@ -19646,11 +19664,10 @@ pub const Vm = struct {
         const prev_err_source = self.err_source;
         const prev_err_line = self.err_line;
         const prev_err_traceback = self.err_traceback;
-        var rethrow_forced_close = false;
         self.err_traceback = null;
         defer {
             self.clearErrorTraceback();
-            if (!rethrow_forced_close) {
+            {
                 self.err = prev_err;
                 self.err_obj = prev_err_obj;
                 self.err_has_obj = prev_err_has_obj;
@@ -19670,21 +19687,12 @@ pub const Vm = struct {
             switch (resolved.callee) {
                 .Builtin => |id| self.callBuiltin(id, resolved.args, &[_]Value{}) catch |e| switch (e) {
                     error.Yield => return e,
-                    else => {
-                        if (self.shouldRethrowForcedClose()) {
-                            rethrow_forced_close = true;
-                            return error.RuntimeError;
-                        }
-                    },
+                    else => {},
                 },
                 .Closure => |cl| {
                     const ret = self.runClosure(cl, resolved.args) catch |e| switch (e) {
                         error.Yield => return e,
                         else => {
-                            if (self.shouldRethrowForcedClose()) {
-                                rethrow_forced_close = true;
-                                return error.RuntimeError;
-                            }
                             return;
                         },
                     };
@@ -19793,10 +19801,6 @@ pub const Vm = struct {
                 self.callBuiltin(id, resolved.args, tmp) catch |e| switch (e) {
                     error.Yield => return e,
                     else => {
-                        if (self.shouldRethrowForcedClose()) {
-                            rethrow_forced_close = true;
-                            return error.RuntimeError;
-                        }
                         try setFail(self, msgh, self.refreshBuiltinOuts() orelse outs);
                         return;
                     },
@@ -19829,10 +19833,6 @@ pub const Vm = struct {
                 const ret = self.runClosure(cl, resolved.args) catch |e| switch (e) {
                     error.Yield => return e,
                     else => {
-                        if (self.shouldRethrowForcedClose()) {
-                            rethrow_forced_close = true;
-                            return error.RuntimeError;
-                        }
                         // PUC luaD_pcall: L->ci = old_ci; restore stack
                         // pointer and unwind call frames so the message
                         // handler has room to run.
@@ -20013,20 +20013,6 @@ pub const Vm = struct {
         th.close_mode = false;
     }
 
-    fn shouldRethrowForcedClose(self: *Vm) bool {
-        const th = self.forced_close_thread orelse return false;
-        return th.close_mode and self.current_thread != null and self.current_thread.? == th;
-    }
-
-    fn shouldRethrowForcedCloseFromBytecode(self: *Vm) bool {
-        if (!self.shouldRethrowForcedClose()) return false;
-        // Once a bytecode __close child is active, its failures are ordinary
-        // close errors: feed them back into the parent's close continuation so
-        // later closers still run and the last error wins. Only the original
-        // coroutine.close signal, outside a close child, bypasses protection.
-        return self.activeBytecodeThread().bytecode_close_metamethod_depth == 0;
-    }
-
     fn appendThreadWrapYield(self: *Vm, th: *Thread, values: []const Value) DispatchError!void {
         const copy = try self.alloc.alloc(Value, values.len);
         if (self.stats.enabled) self.stats.yield_allocs += 1; // P16.0b
@@ -20112,8 +20098,8 @@ pub const Vm = struct {
         if (!th.yieldable() or self.hasActiveBytecodeNonYieldableBoundary() or
             noyield_close or
             (in_debug_hook and !self.activeDebugHookAllowsYield()))
-            return self.fail("attempt to yield across a C-call boundary", .{});
-        if (th.close_mode) return self.fail("attempt to yield across a C-call boundary", .{});
+            return self.failRunerror("attempt to yield across a C-call boundary", .{});
+        if (th.close_mode) return self.failRunerror("attempt to yield across a C-call boundary", .{});
         if (self.stats.enabled) self.stats.yields += 1; // P16.0b (yield committed)
         // A fresh yield supersedes previously captured continuation snapshots.
         th.capture_yield_id = th.next_yield_id;
@@ -20639,7 +20625,7 @@ pub const Vm = struct {
                             // remaining C-frames (PUC resetCI) and let the unroll
                             // loop process Lua frames (which runs __close via
                             // the close_mode branch in runBytecodeInternal).
-                            if (self.forced_close_thread == th and th.close_mode) {
+                            if (th.close_mode) {
                                 while (th.call_frames.len() > 0 and
                                     th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
                                 {
@@ -20809,7 +20795,7 @@ pub const Vm = struct {
                             // resetCI) and let the unroll loop process Lua
                             // frames (which runs __close via the close_mode
                             // branch in runBytecodeInternal).
-                            if (self.forced_close_thread == th and th.close_mode) {
+                            if (th.close_mode) {
                                 while (th.call_frames.len() > 0 and
                                     th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
                                 {
@@ -20865,7 +20851,7 @@ pub const Vm = struct {
                         // SUCCEEDED: report forced_close_ok, mirroring the
                         // checks in the .Builtin branch, the .Closure
                         // branch, and driveBytecodeCoroutineTrampoline.
-                        if (self.forced_close_thread == th and th.close_mode and
+                        if (th.close_mode and
                             !self.forced_close_had_error and
                             !self.isStackOverflowRuntimeError())
                         {
@@ -20983,7 +20969,7 @@ pub const Vm = struct {
                             yielded = true;
                         },
                         error.RuntimeError => {
-                            if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
+                            if (th.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
                                 forced_close_ok = true;
                             } else {
                                 ok = false;
@@ -21026,7 +21012,7 @@ pub const Vm = struct {
                                         yielded = true;
                                         break :retblk null;
                                     }
-                                    if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
+                                    if (th.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
                                         forced_close_ok = true;
                                     } else {
                                         ok = false;
@@ -21177,15 +21163,11 @@ pub const Vm = struct {
 
     fn builtinCoroutineClose(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         self.last_builtin_out_count = 0;
-        // P16.24 T5: the old max_coroutine_close_c_depth=4 cap duplicated
-        // the C-depth invariant. PUC lua_closethread runs each pending
-        // __close through luaD_callnoyield: one non-yieldable unit per
-        // close level, bounded by the shared LUAI_MAXCCALLS budget.
-        {
-            const th_close = self.activeBytecodeThread();
-            try self.ccallEnter(th_close, .nonyieldable);
-            defer th_close.ccallExit(.nonyieldable);
-        }
+        // P16.27 T1: PUC lua_closethread -> luaD_closeprotected(yy=0) ->
+        // callclosemethod(yy=0) -> luaD_callnoyield. The non-yieldable
+        // ownership lives on each driven __close invocation (the close
+        // continuations below carry policy=.nonyieldable), not on a lexical
+        // scope around this builtin (the P16.24 enter/exit hole).
 
         var th: *Thread = undefined;
         if (args.len == 0) {
@@ -21201,7 +21183,7 @@ pub const Vm = struct {
                 if (th.close_mode and self.forced_close_thread == th) {
                     if (outs.len > 0) outs[0] = .{ .Bool = true };
                     if (outs.len > 1) outs[1] = .Nil;
-                    self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
+                    self.last_builtin_out_count = @min(@as(usize, 1), outs.len);
                     return;
                 }
                 self.beginForcedClose(th);
@@ -21258,7 +21240,7 @@ pub const Vm = struct {
         self.clearThreadContinuationScratch(th, .{ .clear_yielded = true });
         if (outs.len > 0) outs[0] = .{ .Bool = true };
         if (outs.len > 1) outs[1] = .Nil;
-        self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
+        self.last_builtin_out_count = @min(@as(usize, 1), outs.len);
     }
 
     fn gcWeakMode(self: *Vm, tbl: *Table) struct { weak_k: bool, weak_v: bool } {
@@ -40867,7 +40849,7 @@ pub const Vm = struct {
 
     fn builtinHasDynamicOutCount(id: BuiltinId) bool {
         return switch (id) {
-            .coroutine_resume, .coroutine_wrap_iter, .coroutine_yield, .pcall, .xpcall, .utf8_codepoint, .io_lines_iter, .io_read, .file_read, .file_close, .io_close, .io_popen, .os_execute, .dofile, .io_lines, .file_lines, .testc_testC => true,
+            .coroutine_resume, .coroutine_wrap_iter, .coroutine_yield, .coroutine_close, .pcall, .xpcall, .utf8_codepoint, .io_lines_iter, .io_read, .file_read, .file_close, .io_close, .io_popen, .os_execute, .dofile, .io_lines, .file_lines, .testc_testC => true,
             else => false,
         };
     }

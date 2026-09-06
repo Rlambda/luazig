@@ -3067,6 +3067,34 @@ test "string keys survive rehash+GC; equal longs compare by content" {
     try testing.expectEqual(@as(Value, .{ .Int = 888 }), vm.rawGet(tbl, .{ .String = sb })); // short lookup by identity twin
 }
 
+// P16.26 A4: resume-ENTRY rejection must not kill the target (PUC
+// resume_error: an error of the lua_resume CALL, not of the coroutine).
+test "rejected resume entry leaves target status unchanged" {
+    const testing = std.testing;
+    var vm = Vm.init(testing.allocator, false);
+    defer vm.deinit();
+    // A suspended coroutine with a trivial C-closure body (status shape
+    // matches coroutine.create; the body kind is irrelevant to ENTRY).
+    const co = try vm.alloc.create(Thread);
+    co.* = .{ .callee = .Nil };
+    try vm.gcRegisterThread(co);
+    co.status = .suspended;
+    co.started = false;
+    // Push the active thread to the C-call limit.
+    const th = vm.activeBytecodeThread();
+    th.nCcalls = @as(u32, Thread.LUA_MAX_C_CALLS) + 5;
+    const args = [_]Value{.{ .Thread = co }};
+    var outs: [4]Value = .{ .Nil, .Nil, .Nil, .Nil };
+    try vm.builtinCoroutineResume(args[0..], outs[0..]);
+    try testing.expect(outs[0] == .Bool and outs[0].Bool == false);
+    try testing.expect(outs[1] == .String);
+    try testing.expectEqualStrings("C stack overflow", outs[1].String.bytes());
+    // THE INVARIANT: pre-call status (.suspended) intact — the target is
+    // NOT dead and remains resumable once depth frees up.
+    try testing.expect(co.status == .suspended);
+    th.nCcalls = 0;
+}
+
 test "string allocated-size rule: per-kind table (PUC parity)" {
     const testing = std.testing;
     var vm = Vm.init(testing.allocator, false);
@@ -11155,12 +11183,9 @@ pub const Vm = struct {
                                     // P16.24 T4: depth limit enforced by resumeEnterC inside the switch
                                     // preparation (shared nCcalls model; the
                                     // coroutine_resume_chain counter is removed).
-                                    const first_start = self.prepareBytecodeCoroutineSwitch(request) catch |switch_err| switch (switch_err) {
-                                        error.OutOfMemory => return switch_err,
-                                        else => {
-                                            request.target.caller = request.caller;
-                                            active = request.target;
-                                            step = .{ .failed = .{ .String = try self.internStr("C stack overflow") } };
+                                    // A resume-ENTRY rejection arrives with its value already
+                                                                                // installed (raiseResumeEntryRejected); no reconstruction.
+                                    step = .{ .failed = try self.currentRuntimeErrorValue() };
                                             have_step = true;
                                             continue :drive;
                                         },
@@ -11213,12 +11238,9 @@ pub const Vm = struct {
                                 // P16.24 T4: depth limit enforced by resumeEnterC inside
                                 // the switch preparation (shared nCcalls model; the old
                                 // coroutine_resume_chain counter is removed).
-                                const first_start = self.prepareBytecodeCoroutineSwitch(request) catch |switch_err| switch (switch_err) {
-                                    error.OutOfMemory => return switch_err,
-                                    else => {
-                                        request.target.caller = request.caller;
-                                        active = request.target;
-                                        step = .{ .failed = .{ .String = try self.internStr("C stack overflow") } };
+                                // A resume-ENTRY rejection arrives with its value already
+                                                                            // installed (raiseResumeEntryRejected); no reconstruction.
+                                step = .{ .failed = try self.currentRuntimeErrorValue() };
                                         break :retblk null;
                                     },
                                 };
@@ -11302,12 +11324,9 @@ pub const Vm = struct {
                                             self.bytecode_coroutine_switch_request = null;
                                             // P16.24 T4: depth limit enforced by resumeEnterC inside the switch
                                             // preparation (shared nCcalls model).
-                                            const first_start = self.prepareBytecodeCoroutineSwitch(request) catch |switch_err| switch (switch_err) {
-                                                error.OutOfMemory => return switch_err,
-                                                else => {
-                                                    request.target.caller = request.caller;
-                                                    active = request.target;
-                                                    step = .{ .failed = .{ .String = try self.internStr("C stack overflow") } };
+                                            // A resume-ENTRY rejection arrives with its value already
+                                                                                        // installed (raiseResumeEntryRejected); no reconstruction.
+                                            step = .{ .failed = try self.currentRuntimeErrorValue() };
                                                     have_step = true;
                                                     continue :drive;
                                                 },
@@ -20302,6 +20321,26 @@ pub const Vm = struct {
             return;
         }
 
+        // P16.25.1 R2: resume-ENTRY ACCEPTANCE FIRST (PUC lua_resume order:
+        // the C-depth check precedes every status transition). A rejection
+        // is an error of THIS call returned as a value; the coroutine keeps
+        // its pre-call status — no runtime switch, inbox, or entry-args
+        // state is committed for the attempt (PUC resume_error).
+        {
+            const entry_th = self.activeBytecodeThread();
+            const entry = try self.resumeEnterC(th, entry_th);
+            if (entry == .rejected) {
+                if (want_out) {
+                    outs[0] = .{ .Bool = false };
+                    if (outs.len > 1) outs[1] = entry.rejected;
+                    self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
+                } else {
+                    self.last_builtin_out_count = 0;
+                }
+                return;
+            }
+        }
+
         th.status = .running;
         th.api_status = 0; // LUA_OK — running (PUC: L->status = 0 before resume)
         if (self.stats.enabled) self.stats.resumes += 1; // P16.0b (resume committed)
@@ -20356,26 +20395,6 @@ pub const Vm = struct {
         }
 
         const call_args = args[1..];
-
-        // P16.25.1 R2: resume-ENTRY ACCEPTANCE FIRST (PUC lua_resume order:
-        // the C-depth check precedes every status transition). A rejection
-        // is an error of THIS call returned as a value; the coroutine keeps
-        // its pre-call status — no runtime switch, inbox, or entry-args
-        // state is committed for the attempt (PUC resume_error).
-        {
-            const entry_th = self.activeBytecodeThread();
-            const entry = try self.resumeEnterC(th, entry_th);
-            if (entry == .rejected) {
-                if (want_out) {
-                    outs[0] = .{ .Bool = false };
-                    if (outs.len > 1) outs[1] = entry.rejected;
-                    self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
-                } else {
-                    self.last_builtin_out_count = 0;
-                }
-                return;
-            }
-        }
 
         // Builtin entrypoints (notably coroutine.create(pcall/xpcall)) need the
         // original start arguments when resuming from suspended continuation

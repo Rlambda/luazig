@@ -1,0 +1,23 @@
+{
+  "created_utc": "2026-09-06T10:55:00.297284+00:00",
+  "provenance": {
+    "git_head": "7024871",
+    "measured_source_head": "7024871",
+    "git_dirty": "clean",
+    "zig_version": "0.16.0",
+    "zig_binary_sha16": "0c45b3bf62e894e9",
+    "input_commit": "dc61fb9"
+  },
+  "R1_proof": {
+    "probe": "R1-REJECT print at resumeEnterC depth-rejection: has_obj=true, target-status=.suspended \u2014 the object EXISTS at rejection; the enclosing builtinCoroutineResume saved-error defer (installed earlier) erases it before recovery",
+    "confirmation": "R2 (typed rejection, no err-channel) fixed recov3 WITHOUT any close changes \u2014 root cause CONFIRMED, independent of the T2-T5 cuts"
+  },
+  "R2_R3_applied": [
+    "ResumeEnterResult = union(enum){entered, rejected:Value} \u2014 PUC resume_error semantics",
+    "builtinCoroutineResume: entry decision BEFORE any status/inbox/entry-args commit; rejection returns (false, value), coroutine status untouched, no .dead, no runtime switch",
+    "trampoline switch: raiseResumeEntryRejected installs the value directly (no fail(), no position prefix, no hardcoded cso at catch sites)"
+  ],
+  "R4_attempt": "Cherry-pick of 2fb5401 T2-T5 applied cleanly after one conflict merge; THREE follow-up bugs found and fixed during the session: (1) duplicate fn tail from the merge; (2) wrap_iter verbatim left err=null for STRING objects (restoreRuntimeErrorValue fixes \u2014 this was the SECOND half of the P16.25 object-loss: recov3 went green with it); (3) close-failure arity regressed to 1 value (coroutine.lua:195). REMAINING divergence after all fixes: sc3.lua \u2014 yield inside a __close running at ORDINARY resume completion (no external coroutine.close) must be blocked by the non-yieldable close context; in P16.24 the noyield_close derivation (unwinds bottom-propagate) fired; with the T2-T5 control-flow cleanup it reads false at yield time. coroutine.lua:336 + locals.lua:1090 red. NOT root-caused in budget \u2014 cherry-pick REVERTED.",
+  "root_vs_trigger": "ROOT CAUSE (both P16.25 loss paths): (a) resume-entry rejection rode the VM-global error channel through a window whose saved-error defer erased it; (b) wrap_iter verbatim propagation left err=null for string objects. TRIGGER/EXPOSER: the T2-T5 cuts changed which boundary handled the near-limit call first \u2014 they did not create the loss mechanisms.",
+  "final_state": "R1-R3 committed (7024871); tree green at pre-existing classified divergences; smoke70 remains classified-red (T2-T5 not reapplied); next agent: reapply T2-T5 one cut at a time (git show 2fb5401) + the 3 in-session fixes + close the noyield-at-ordinary-completion gap (sc3.lua reproducer)."
+}

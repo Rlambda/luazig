@@ -1,1 +1,1 @@
-P16.27 — c_frame_count lifecycle repaired (auditor-wired), nested-rejection semantics root-understood, short-string invariant moved to codegen (branch-free handlers), T3 lazy-traceback reverted (dead-error capture point absent)
+P16.27 T1 CLOSED — CloseCallPolicy enum, nny owned by __close invocation, forced-close RuntimeError bypasses deleted, smoke70 70/70 PUC-identical, sc3/coroutine.lua/locals.lua close sections green

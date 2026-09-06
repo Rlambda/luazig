@@ -24,36 +24,36 @@ The project is in a **pre-release / parity-focused** state.
 |--------|--------|
 | Upstream matrix (`testes/*.lua`, `--testc`) | **18/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
-| Smoke tests (`tests/smoke/*.lua`) | **69/70** match (byte-identical stdout+stderr+exit) |
+| Smoke tests (`tests/smoke/*.lua`) | **70/70** match (byte-identical stdout+stderr+exit) |
 | C API suites (`tests/c_api`) | 21 suites (gate: `make -C tests/c_api test`) |
 
 Regression lane: `python3 tools/testes_matrix.py --testc` (no `_port`/`_soft` prelude overrides).
 
 ### Performance
 
-Geomean slowdown vs PUC Lua: **1.76x** (lower is better; 1.0x = parity).
+Geomean slowdown vs PUC Lua: **1.77x** (lower is better; 1.0x = parity).
 Method: median-of-7 per workload, pinned CPU core (`tools/perf_compare.py`).
 
 | Workload | Zig/PUC |
 |----------|--------:|
-| metamethod_add | 2.53x |
-| metamethod_call_noalloc | 2.41x |
-| coroutine_yield | 2.11x |
-| hash_access | 2.10x |
-| table_alloc_setmetatable | 2.02x |
-| branch_loop | 1.93x |
-| lua_calls | 1.90x |
-| array_access | 1.90x |
-| field_access | 1.85x |
-| temp_table_alloc | 1.82x |
-| global_arith | 1.66x |
-| mixed_arith | 1.60x |
-| comparisons | 1.58x |
-| dynamic_load | 1.55x |
-| float_arith | 1.54x |
-| int_arith | 1.49x |
-| string_loop | 1.27x |
-| string_concat | 1.08x |
+| metamethod_add | 2.67x |
+| metamethod_call_noalloc | 2.42x |
+| hash_access | 2.11x |
+| table_alloc_setmetatable | 2.06x |
+| coroutine_yield | 2.01x |
+| branch_loop | 1.95x |
+| array_access | 1.92x |
+| lua_calls | 1.92x |
+| field_access | 1.89x |
+| temp_table_alloc | 1.80x |
+| comparisons | 1.62x |
+| mixed_arith | 1.62x |
+| float_arith | 1.58x |
+| dynamic_load | 1.58x |
+| global_arith | 1.52x |
+| int_arith | 1.51x |
+| string_loop | 1.24x |
+| string_concat | 1.09x |
 <!-- END GENERATED STATUS -->
 
 See [STATUS.md](STATUS.md) for detailed profiling methodology, hotspot analysis, and optimization history.

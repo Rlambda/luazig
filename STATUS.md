@@ -1,4 +1,4 @@
-> Last updated: 2026-09-06 (P16.27 — c_frame_count lifecycle repaired (auditor-wired), nested-rejection semantics root-understood, short-string invariant moved to codegen (branch-free handlers), T3 lazy-traceback reverted (dead-error capture point absent))
+> Last updated: 2026-09-06 (P16.27 T1 CLOSED — CloseCallPolicy enum, nny owned by __close invocation, forced-close RuntimeError bypasses deleted, smoke70 70/70 PUC-identical, sc3/coroutine.lua/locals.lua close sections green)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -34,11 +34,11 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Upstream matrix (`testes/*.lua`, `--testc`) | **18/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
 | Differential output (`--diff`) | **13 output_diff** |
-| Smoke tests (`tests/smoke/*.lua`) | **69/70** pass |
+| Smoke tests (`tests/smoke/*.lua`) | **70/70** pass |
 | C API suites (`tests/c_api`) | 21 suites |
-| Performance (geomean vs PUC) | **1.76x** |
+| Performance (geomean vs PUC) | **1.77x** |
 
-Geomean замедления vs PUC Lua: **1.76x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.77x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -4992,6 +4992,25 @@ Suspended-путь работал лениво; dead-with-error traceback не �
 ### Perf: corrected B0 1.7636 → final 1.76065 (same-session; счётчик-causal:
 field/coroutine/hash instr ↓). Гейт (сабагент): все линии зелёные после
 фиксапа; matrix zig_fail=0; smoke 69-ok (70 classified-red — T1 не начат).
+
+### T1 ЗАКРЫТ (`1f0d1d8`, поверх P16.27-final): CloseCallPolicy
+- **CloseCallPolicy** (yieldable/nonyieldable) = PUC callclosemethod yy;
+  выводится в beginBytecodeClose из close_mode (PUC yy-таблица в
+  p16.27-close-yy-table.json: forced-close транспорты = yy=0;
+  обычные OP_CLOSE/RETURN/poscall = yy=1);
+- **nny-юнит владеет АКТУАЛЬНЫЙ __close-вызов** (итеративный child:
+  вход при активации, единый выход releaseBytecodeCloseChild; sync:
+  scoped defer) — coroutine.isyieldable() = false ЕСТЕСТВЕННО;
+- **ВСЕ forced-close RuntimeError байпасы УДАЛЕНЫ**:
+  shouldRethrowForcedClose* удалены; recoverBytecodeDispatchError +
+  runBytecodeInternal + pcall/xpcall — ошибки в closer'ах обычные
+  catchable (PUC luaD_callnoyield запрещает YIELD, не error-handling);
+- thread-local close_mode на всех сайтах завершения (вложенные цепи);
+- close возвращает 1 значение при успехе (dynamic-out);
+- yield-ошибки без префикса (failRunerror C-контекст);
+- **smoke70 = 70/70 PUC-ИДЕНТИЧНО**; recov3/sc3/chain2 PUC-идентичны;
+  14 сьютов --testc зелёные; c_api 20+diff GREEN; api580 376/376.
+- Geomean-сессия 1.76688 (correctness-кут; +0.35% session drift).
 
 ## История закрытых фаз
 

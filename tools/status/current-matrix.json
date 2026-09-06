@@ -1,23 +1,23 @@
 {
   "meta": {
-    "created_utc": "2026-09-06T20:02:06.027226+00:00",
+    "created_utc": "2026-09-06T22:35:02.166748+00:00",
     "lane": "testes_matrix",
     "argv": [
       "tools/testes_matrix.py",
       "--testc",
       "--diff",
       "--json-out",
-      "/tmp/opencode/matrix27c.json"
+      "/tmp/opencode/matrix27t.json"
     ],
     "zig_version": "0.16.0"
   },
   "provenance": {
-    "git_head": "914b38d",
-    "measured_source_head": "914b38d",
-    "git_dirty": "clean",
+    "git_head": "1f0d1d8",
+    "measured_source_head": "1f0d1d8",
+    "git_dirty": "dirty",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "bb5d4280adcae48e",
+    "zig_binary_sha16": "6cc66c03ab7c5577",
     "puc_binary_sha16": "d54bc45e1757b216"
   },
   "summary": {
@@ -342,5 +342,6 @@
       "locals+cstack: GC-pacing window alignment phase"
     ],
     "note": "Previously current-matrix.json ran WITHOUT --diff (output_diff=0 meant \"not run\"). From P16.22 the strict lane is canonical."
-  }
+  },
+  "p16_27_t1_update": "smoke70 NOW 70/70 byte-identical (close-policy T1 closed); cstack gsub/C-recursion sections unchanged; hookstress-4 line-attribution remains classified"
 }

@@ -1696,6 +1696,7 @@ pub export fn lua_len(L: ?*lua_State, idx: c_int) void {
 pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: ?*c_int) c_int {
     const h = L orelse return 2;
     const vm = h.vm;
+    _ = from; // P16.26 A5: depth inheritance lives in resumeEnterC (shared)
     // P15.83k: resolve the thread directly from the handle. Every handle
     // carries its Thread (coroutine handles from lua_newthread, the main
     // handle from setupMainHandle). Resuming the main state resolves the
@@ -1708,18 +1709,11 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
     // current_thread internally. Setting it here would cause the defer in
     // builtinCoroutineResume to restore co's status to its pre-resume value,
     // overwriting the .suspended status set by the yield path.
-    // PUC ldo.c:lua_resume — the resumed coroutine inherits the caller's
-    // C-call depth + 1, so nested resumes share the LUAI_MAXCCALLS budget.
-    if (from) |from_ptr| {
-        const from_s = api.State.fromHandle(from_ptr);
-        if (from_s.vm.current_thread) |from_th| {
-            co.nCcalls = @as(u32, from_th.getCcalls()) + 1;
-        } else {
-            co.nCcalls = 1;
-        }
-    } else {
-        co.nCcalls = 1;
-    }
+    // P16.26 A5: resume-entry C-depth ownership is UNIFIED — the manual
+    // nCcalls write here is removed; the shared resumeEnterC (reached via
+    // builtinCoroutineResume in apiResumeThread) is the single writer of
+    // inherited depth, the LUAI_MAXCCALLS entry check, and the one resume
+    // unit (PUC lua_resume).
     // Base index in c_stack for truncating after resume (function position on
     // first resume, or args position on subsequent resumes).
     var lua_resume_base: usize = 0;

@@ -1,1 +1,1 @@
-P16.26 — resume-entry state machine complete (no-dead-on-reject + invariant test), single C-depth owner, short-string identity for bytecode constants, O(1) c_frame_count; geomean -3.1% same-session
+P16.27 — c_frame_count lifecycle repaired (auditor-wired), nested-rejection semantics root-understood, short-string invariant moved to codegen (branch-free handlers), T3 lazy-traceback reverted (dead-error capture point absent)

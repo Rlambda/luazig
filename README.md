@@ -36,22 +36,22 @@ Method: median-of-7 per workload, pinned CPU core (`tools/perf_compare.py`).
 
 | Workload | Zig/PUC |
 |----------|--------:|
-| metamethod_add | 2.57x |
-| metamethod_call_noalloc | 2.38x |
+| metamethod_add | 2.53x |
+| metamethod_call_noalloc | 2.41x |
+| coroutine_yield | 2.11x |
 | hash_access | 2.10x |
-| coroutine_yield | 2.05x |
 | table_alloc_setmetatable | 2.02x |
-| field_access | 2.01x |
-| branch_loop | 1.92x |
-| lua_calls | 1.91x |
-| array_access | 1.86x |
-| temp_table_alloc | 1.75x |
-| global_arith | 1.73x |
-| mixed_arith | 1.59x |
-| dynamic_load | 1.57x |
-| comparisons | 1.57x |
-| float_arith | 1.51x |
-| int_arith | 1.50x |
+| branch_loop | 1.93x |
+| lua_calls | 1.90x |
+| array_access | 1.90x |
+| field_access | 1.85x |
+| temp_table_alloc | 1.82x |
+| global_arith | 1.66x |
+| mixed_arith | 1.60x |
+| comparisons | 1.58x |
+| dynamic_load | 1.55x |
+| float_arith | 1.54x |
+| int_arith | 1.49x |
 | string_loop | 1.27x |
 | string_concat | 1.08x |
 <!-- END GENERATED STATUS -->

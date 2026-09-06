@@ -1,4 +1,4 @@
-> Last updated: 2026-09-06 (P16.26 — resume-entry state machine complete (no-dead-on-reject + invariant test), single C-depth owner, short-string identity for bytecode constants, O(1) c_frame_count; geomean -3.1% same-session)
+> Last updated: 2026-09-06 (P16.27 — c_frame_count lifecycle repaired (auditor-wired), nested-rejection semantics root-understood, short-string invariant moved to codegen (branch-free handlers), T3 lazy-traceback reverted (dead-error capture point absent))
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -4952,6 +4952,46 @@ zig_fail=0; api580 376/376; c_api 20+diff; nextvar ×10; native BOUNDED.
 ### Perf: same-session entry 1.81893 → final **1.76216 (−3.1%)**
 (coroutine_yield 2.048x, lua_calls 1.913x, global_arith 1.730x).
 Baseline-approved → P16.26.
+
+## P16.27 — truth repair + codegen short-string + честные реверты (2026-09-06)
+
+### T0.1 (`cc5d734`): c_frame_count ЖИЗНЕННЫЙ ЦИКЛ ПОЧИНЕН
+P16.26-баг: increment до fallible-push; НЕТ декрементов в
+popBuiltinCFrame/poscallCFrame. Fix: increment ПОСЛЕ создания кадра;
+декременты в обоих pop-путях; bulk-пути (precover считает в существующем
+walk; testc discard; thread reset). Debug-аудитор
+cFrameCountAssert==countCFramesSlow на выходе callCFunction.
+П18.26 D-cut1 теперь настоящий инвариант.
+
+### T0.2 (`f57791d`): nested rejection — ЭКСПЕРИМЕНТ REVERTED с пониманием
+Typed-step (.resume_rejected) сломал wrap-цепь (case A): nested-in-bytecode
+rejection — PUC-КОРРЕКТНО как protected-boundary RuntimeError (running child
+ПРОДОЛЖАЕТ; resume-вызов сам возвращает false+value). Прямой builtin-путь
+(P16.26 entry-before-commit) — правильный и протестированный;
+raiseResumeEntryRejected — правильный транспорт для nested-случая.
+
+### T2 (`c551938` + `914b38d`): short-string инвариант ПЕРЕНЕСЁН В CODEGEN
+- kidIsShortString (PUC luaK isKstr) предикат; 13 field-эмишен-сайтов
+  (getfield/setfield/gettabup/settabup/self); длинные литералы → LOADK+
+  GETTABLE generic-путь (не runtime-branch);
+- 4 VM-хендлера BRANCH-FREE (identity-only);
+- СООБЩЁННЫЕ ГЕЙТОМ 4 регрессии c551938 исправлены в 914b38d (незащищённые
+  index_up-сайты; emitLoadK wrong-scope; register-order bug в long-path —
+  freeReg до alloc клякнул table-регистр; lng11-репродюсер);
+- field_access 2.042→1.946G; coroutine_yield→1.477G; hash_access→1.854G.
+
+### T3 (lazy traceback): REVERTED — изолированный backlog-пункт
+Suspended-путь работал лениво; dead-with-error traceback не имеет post-hoc
+точки захвата (iterative unwind сносит кадры ДО любого наблюдателя);
+захват внутри continueBytecodeErrorUnwind = O(frames) на КАЖДУЮ ошибку.
+Старое поведение (stale last-yield snapshot) — то, к чему настроен db.lua.
+Артефакт p16.27-t0-truth.json: репродюсер tb4.lua + гипотеза.
+
+### T1/T4/T5: не начаты (бюджет ушёл на T0-truth + T2-регрессии-фиксы).
+
+### Perf: corrected B0 1.7636 → final 1.76065 (same-session; счётчик-causal:
+field/coroutine/hash instr ↓). Гейт (сабагент): все линии зелёные после
+фиксапа; matrix zig_fail=0; smoke 69-ok (70 classified-red — T1 не начат).
 
 ## История закрытых фаз
 

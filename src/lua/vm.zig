@@ -13673,10 +13673,7 @@ pub const Vm = struct {
                             // pointer-identity chain walk for the (PUC-compiler-
                             // guaranteed) short constant key; long keys (our
                             // codegen allows >40B names) keep content equality.
-                            const node = if (key.String.isShort())
-                                ltable.nodeLookupShortStrIdentity(env.Table.hash, key.String)
-                            else
-                                ltable.nodeLookupStr(env.Table.hash, key.String);
+                            const node = ltable.nodeLookupShortStrIdentity(env.Table.hash, key.String);
                             ctx.regs[a] = if (node) |nd| nd.value else .Nil;
                         } else {
                             if (try self.bytecodeGetIndex(exec_frames, &ctx, env, key, a, 0, false)) {
@@ -13719,10 +13716,7 @@ pub const Vm = struct {
                             if (self.stats.enabled) self.stats.tbl_set_fast_str += 1;
                             // P16.26 C2: PUC luaH_psetshortstr — identity walk
                             // for the short constant key (see GETTABUP).
-                            const found = if (key.String.isShort())
-                                ltable.nodeLookupShortStrIdentity(tbl.hash, key.String)
-                            else
-                                ltable.nodeLookupStr(tbl.hash, key.String);
+                            const found = ltable.nodeLookupShortStrIdentity(tbl.hash, key.String);
                             if (found) |node| {
                                 if (self.stats.enabled) self.stats.tbl_update += 1;
                                 if (val == .Nil) {
@@ -13833,10 +13827,7 @@ pub const Vm = struct {
                             if (self.stats.enabled) self.stats.tbl_get_fast_str += 1; // P16.0b
                             // P16.26 C2: PUC luaH_getshortstr identity walk
                             // (see GETTABUP); long keys keep content equality.
-                            const node = if (key.String.isShort())
-                                ltable.nodeLookupShortStrIdentity(tbl.hash, key.String)
-                            else
-                                ltable.nodeLookupStr(tbl.hash, key.String);
+                            const node = ltable.nodeLookupShortStrIdentity(tbl.hash, key.String);
                             ctx.regs[a] = if (node) |nd| nd.value else .Nil;
                         } else {
                             if (try self.bytecodeGetIndex(exec_frames, &ctx, obj, key, a, b, true)) {

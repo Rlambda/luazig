@@ -1,1 +1,1 @@
-P16.25 — close-semantics attempt REVERTED (deep-chain err-obj loss, bisect plan in artifacts); hygiene gates green; T13 string-key perf NOT started
+P16.25.1 — resume-entry root cause CLOSED (typed rejection R2/R3, both P16.25 loss paths identified: err-channel-defer-erase + verbatim err=null); T2-T5 reapply still pending (sc3 noyield gap)

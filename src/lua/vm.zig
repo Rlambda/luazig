@@ -11180,12 +11180,16 @@ pub const Vm = struct {
                                     // and continue the trampoline loop.
                                     const request = self.bytecode_coroutine_switch_request orelse return e;
                                     self.bytecode_coroutine_switch_request = null;
-                                    // P16.24 T4: depth limit enforced by resumeEnterC inside the switch
-                                    // preparation (shared nCcalls model; the
-                                    // coroutine_resume_chain counter is removed).
-                                    // A resume-ENTRY rejection arrives with its value already
-                                                                                // installed (raiseResumeEntryRejected); no reconstruction.
-                                    step = .{ .failed = try self.currentRuntimeErrorValue() };
+                                    // P16.24 T4: the resume-entry depth limit is enforced
+                                    // by resumeEnterC inside the switch preparation; a
+                                    // rejection arrives with its value already installed
+                                    // (raiseResumeEntryRejected) — no reconstruction.
+                                    const first_start = self.prepareBytecodeCoroutineSwitch(request) catch |switch_err| switch (switch_err) {
+                                        error.OutOfMemory => return switch_err,
+                                        else => {
+                                            request.target.caller = request.caller;
+                                            active = request.target;
+                                            step = .{ .failed = try self.currentRuntimeErrorValue() };
                                             have_step = true;
                                             continue :drive;
                                         },
@@ -11235,12 +11239,16 @@ pub const Vm = struct {
                                 // LUAI_MAXCCALLS).  Each coroutine switch adds 1
                                 // to the chain, matching PUC's lua_resume which
                                 // does getCcalls(from)+1 per nesting level.
-                                // P16.24 T4: depth limit enforced by resumeEnterC inside
-                                // the switch preparation (shared nCcalls model; the old
-                                // coroutine_resume_chain counter is removed).
-                                // A resume-ENTRY rejection arrives with its value already
-                                                                            // installed (raiseResumeEntryRejected); no reconstruction.
-                                step = .{ .failed = try self.currentRuntimeErrorValue() };
+                                // P16.24 T4: the resume-entry depth limit is enforced
+                                // by resumeEnterC inside the switch preparation; a
+                                // rejection arrives with its value already installed —
+                                // no reconstruction, no hardcoded string.
+                                const first_start = self.prepareBytecodeCoroutineSwitch(request) catch |switch_err| switch (switch_err) {
+                                    error.OutOfMemory => return switch_err,
+                                    else => {
+                                        request.target.caller = request.caller;
+                                        active = request.target;
+                                        step = .{ .failed = try self.currentRuntimeErrorValue() };
                                         break :retblk null;
                                     },
                                 };
@@ -11322,11 +11330,16 @@ pub const Vm = struct {
                                         error.ThreadSwitch => {
                                             const request = self.bytecode_coroutine_switch_request orelse return @as(DispatchError, e);
                                             self.bytecode_coroutine_switch_request = null;
-                                            // P16.24 T4: depth limit enforced by resumeEnterC inside the switch
-                                            // preparation (shared nCcalls model).
-                                            // A resume-ENTRY rejection arrives with its value already
-                                                                                        // installed (raiseResumeEntryRejected); no reconstruction.
-                                            step = .{ .failed = try self.currentRuntimeErrorValue() };
+                                            // P16.24 T4: the resume-entry depth limit is
+                                            // enforced by resumeEnterC inside the switch
+                                            // preparation; a rejection arrives with its
+                                            // value already installed — no reconstruction.
+                                            const first_start = self.prepareBytecodeCoroutineSwitch(request) catch |switch_err| switch (switch_err) {
+                                                error.OutOfMemory => return switch_err,
+                                                else => {
+                                                    request.target.caller = request.caller;
+                                                    active = request.target;
+                                                    step = .{ .failed = try self.currentRuntimeErrorValue() };
                                                     have_step = true;
                                                     continue :drive;
                                                 },

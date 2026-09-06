@@ -1,0 +1,32 @@
+{
+  "created_utc": "2026-09-06T19:14:48.121422+00:00",
+  "provenance": {
+    "git_head": "f57791d",
+    "measured_source_head": "f57791d",
+    "git_dirty": "clean",
+    "zig_version": "0.16.0",
+    "zig_binary_sha16": "696ff115a7d5e7a1",
+    "input_commit": "e7bdd22"
+  },
+  "T0.1": {
+    "verdict": "FIXED (cc5d734)",
+    "bug": "c_frame_count incremented before fallible push; no decrement in popBuiltinCFrame/poscallCFrame",
+    "fix": "increment after frame creation; decrements at both pop paths; bulk paths (precover counts, testc discard, thread reset) accounted; Debug auditor cFrameCountAssert==countCFramesSlow at callCFunction exit"
+  },
+  "T0.2": {
+    "verdict": "EXPERIMENT REVERTED with root understanding (f57791d)",
+    "finding": "The nested-in-bytecode resume-entry rejection is PUC-CORRECT as a protected-boundary RuntimeError: the running child attempted a nested resume whose ENTRY was refused; that resume call returns (false, value) IN LUA while the child KEEPS EXECUTING. Converting it to a typed trampoline-level .resume_rejected step (which skips the resume builtin's protected recovery) broke the wrap-chain case A (<no error object>). The DIRECT builtin path (entry decision before state commit, from P16.26) remains the correct and tested fix; raiseResumeEntryRejected (value-installed RuntimeError) is the correct transport for the nested case."
+  },
+  "T0.3": {
+    "corrected_baseline_geomean": 1.7636,
+    "head": "f57791d",
+    "dirty": "clean"
+  },
+  "T3_lazy_traceback": {
+    "verdict": "REVERTED \u2014 isolated backlog item",
+    "what_worked": "suspended-thread traceback built lazily from retained frames (buildSuspendedFrameNames); hot yield path snapshot-free; smoke/c_api green",
+    "what_failed": "dead-with-error traceback: the iterative unwind pops frames before any post-hoc capture point (trampoline .failed, finishNested, builtin-failure all see an empty stack); capturing inside continueBytecodeErrorUnwind would put O(frames) work on EVERY Lua error (hot). The old behavior (stale last-yield names) is what db.lua:847-851 is tuned to.",
+    "reproducer": "/tmp/opencode/tb4.lua (dead co traceback must show error + full f-chain)",
+    "next_hypothesis": "capture error-frame names inside the error-boundary only for threads with trace_yields>0 (coroutines), at the single point where bytecode_unwinds is appended for a bottom-propagate"
+  }
+}

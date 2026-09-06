@@ -1,0 +1,40 @@
+{
+  "created_utc": "2026-09-06T22:01:13.866787+00:00",
+  "provenance": {
+    "git_head": "67a7f61",
+    "measured_source_head": "67a7f61",
+    "git_dirty": "clean",
+    "zig_version": "0.16.0",
+    "zig_binary_sha16": "bb5d4280adcae48e",
+    "derived_from": "vendored lua-5.5.0/src (lfunc.c/ldo.c/lvm.c/lstate.c)"
+  },
+  "puc_yy_table": [
+    [
+      "OP_CLOSE / OP_RETURN normal path (lvm.c:1637,1774 luaF_close(...,1))",
+      "yy=1 YIELDABLE"
+    ],
+    [
+      "poscall TBC result close (ldo.c:582 luaF_close(res,CLOSEKTOP,1))",
+      "yy=1 YIELDABLE"
+    ],
+    [
+      "finishpcallk error-path close (ldo.c:811 luaF_close(func,status,1))",
+      "yy=1 YIELDABLE"
+    ],
+    [
+      "luaD_closeprotected -> closepaux (ldo.c:1051 luaF_close(...,0)) \u2014 used by lua_resume error baselevel (ldo.c:1092), lua_closethread/reset (lstate.c:261)",
+      "yy=0 NONYIELDABLE"
+    ]
+  ],
+  "callprimitive": "callclosemethod (lfunc.c:107-119): yy ? luaD_call : luaD_callnoyield \u2014 the POLICY lives on the ACTUAL close invocation",
+  "luazig_mapping_plan": [
+    [
+      "normal OP_CLOSE/OP_RETURN/error-unwind/poscall closes",
+      "yieldable (default)"
+    ],
+    [
+      "coroutine.close / forced-close transport / dead-thread reset",
+      "nonyieldable"
+    ]
+  ]
+}

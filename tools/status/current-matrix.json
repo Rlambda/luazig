@@ -1,29 +1,29 @@
 {
   "meta": {
-    "created_utc": "2026-09-06T10:58:12.591435+00:00",
+    "created_utc": "2026-09-06T12:40:33.455511+00:00",
     "lane": "testes_matrix",
     "argv": [
       "tools/testes_matrix.py",
       "--testc",
       "--diff",
       "--json-out",
-      "/tmp/opencode/matrix251.json"
+      "/tmp/opencode/matrix26c.json"
     ],
     "zig_version": "0.16.0"
   },
   "provenance": {
-    "git_head": "5b5e3b9",
-    "measured_source_head": "5b5e3b9",
+    "git_head": "35e42c2",
+    "measured_source_head": "35e42c2",
     "git_dirty": "clean",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "0c45b3bf62e894e9",
+    "zig_binary_sha16": "0099c0f5ed920eb6",
     "puc_binary_sha16": "d54bc45e1757b216"
   },
   "summary": {
     "total": 32,
-    "pass": 17,
-    "output_diff": 14,
+    "pass": 18,
+    "output_diff": 13,
     "zig_fail": 0,
     "both_fail": 1,
     "both_fail_infra": 0,
@@ -158,12 +158,12 @@
     },
     {
       "file": "files.lua",
-      "class": "output_diff",
+      "class": "pass",
       "ref_exit": 0,
       "zig_exit": 0,
       "zig_reason": "",
       "ref_reason": "",
-      "diff": "--- ref/files.lua\n+++ zig/files.lua\n@@ -17,3 +17,3 @@\n   8-byte time_t\n-test done on 06/09/2026, at 13:58:10\n+test done on 06/09/2026, at 13:58:11\n Lua 5.5"
+      "diff": ""
     },
     {
       "file": "gc.lua",

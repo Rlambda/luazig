@@ -1,4 +1,4 @@
-> Last updated: 2026-09-06 (P16.25.1 — resume-entry root cause CLOSED (typed rejection R2/R3, both P16.25 loss paths identified: err-channel-defer-erase + verbatim err=null); T2-T5 reapply still pending (sc3 noyield gap))
+> Last updated: 2026-09-06 (P16.26 — resume-entry state machine complete (no-dead-on-reject + invariant test), single C-depth owner, short-string identity for bytecode constants, O(1) c_frame_count; geomean -3.1% same-session)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -31,14 +31,14 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 <!-- BEGIN GENERATED SUMMARY (tools/status_summary.py) -->
 | Metric | Result |
 |--------|--------|
-| Upstream matrix (`testes/*.lua`, `--testc`) | **17/32** pass (exit code parity) |
+| Upstream matrix (`testes/*.lua`, `--testc`) | **18/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
-| Differential output (`--diff`) | **14 output_diff** |
+| Differential output (`--diff`) | **13 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **69/70** pass |
 | C API suites (`tests/c_api`) | 21 suites |
-| Performance (geomean vs PUC) | **1.75x** |
+| Performance (geomean vs PUC) | **1.76x** |
 
-Geomean замедления vs PUC Lua: **1.75x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.76x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -4911,6 +4911,47 @@ verbatim err=null для строк. ТРИГГЕР: T2-T5 сменили, ка�
 
 ### Следующему: reapply T2-T5 по одному крту (git show 2fb5401) + 3
 внутрисессионных фикса + закрыть noyield-при-обычном-завершении (sc3).
+
+## P16.26 — resume/close архитектура + short-string + O(1) C-frame (2026-09-06)
+
+### Workstream A: resume state machine ЗАВЕРШЁН
+- **A2-A4 (`ea33461`, `7bc3c0a`)**: entry-принятие перенесено ДО коммита
+  `.running`/defer — rejected entry БОЛЬШЕ НЕ УБИВАЕТ короутину (PUC
+  resume_error); постоянный Zig-юнит инвариант (suspended→rejected→
+  suspended); 3 trampoline catch-сайта читают установленное значение
+  (currentRuntimeErrorValue) вместо хардкода "C stack overflow".
+- **A5 (`7d2dcbe`)**: ручной writer `co.nCcalls` в c_api lua_resume УДАЛЁН —
+  resumeEnterC единственный владелец наследуемой глубины/чека/юнита.
+
+### Workstream C (`fece594`): short-string identity в байткод-опкодах
+GETTABUP/GETFIELD/SETTABUP/SETFIELD fast-arms → nodeLookupShortStrIdentity
+для short-констант (PUC luaV_fastget/fastget luaH_getshortstr/psetshortstr,
+lvm.c:1304/1342/1399); длинные константы (легальные в нашем codegen, в
+отличие от PUC luaK) — content-eq fallback. Инструкции нейтральны в bench
+(nodeLookupStr уже делал pointer-eq для shorts) — кут оставлен как
+семантическая парит; long-key тест PUC-идентичен.
+
+### Workstream D-cut1 (`35e42c2`): per-thread c_frame_count (u32)
+O(1) C-frame presence вместо полного скана frame-stack в
+coroutine yield/resume fast-path eligibility (5.2% семплов coroutine_yield);
+push/discard choke-поинты с Debug-ассертами. coroutine_yield
+1.501→1.483G instr.
+
+### D-cut2 (builtinOutLenFast probe): REVERTED — фантомная ошибка
+компиляции «no member» при валидном размещении (brace-баланс подтверждён,
+кэш вычищен) — не диагностирована в бюджете, кут откачен чисто.
+
+### НЕ выполнено: Workstream B (close policy enum) — smoke70 остаётся
+classified-red; sc3/close_b2/b3 записаны гейтом. Профиль: dispatch-core
++119, pushStaged 19% lua_calls, resume/yield builtins.
+
+### Гейт (сабагент): 11/11 GREEN на прежних классификациях (smoke70 +
+hookstress-4 line-attribution + 13 структурных matrix diff). matrix
+zig_fail=0; api580 376/376; c_api 20+diff; nextvar ×10; native BOUNDED.
+
+### Perf: same-session entry 1.81893 → final **1.76216 (−3.1%)**
+(coroutine_yield 2.048x, lua_calls 1.913x, global_arith 1.730x).
+Baseline-approved → P16.26.
 
 ## История закрытых фаз
 

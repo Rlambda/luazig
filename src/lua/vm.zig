@@ -10221,7 +10221,8 @@ pub const Vm = struct {
         // created the object into the VM-global channel where the enclosing
         // resume's saved-error defer erased it (P16.25 root cause).
         const entry = try self.resumeEnterC(target, request.caller);
-        if (entry == .rejected) return self.raiseResumeEntryRejected(entry.rejected);
+        if (entry == .rejected)
+            return self.raiseResumeEntryRejected(entry.rejected);
         const first_start = !target.started and target.entry_args == null;
         if (first_start) target.entry_args = try self.alloc.dupe(Value, request.args);
         try self.setThreadResumeInbox(target, request.args);

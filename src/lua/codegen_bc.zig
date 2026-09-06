@@ -562,10 +562,10 @@ pub const Codegen = struct {
                 e.val = .{ .reloc = @intCast(pc) };
             },
             .index_up => |ind| {
-                // GETTABUP's C field is 8 bits; for large constant indices
-                // (>255 interned strings), fall back to GETUPVAL + LOADK +
-                // GETTABLE. Mirrors emitGetTabUp's large-index path.
-                if (ind.idx <= 255) {
+                // GETTABUP's C field is 8 bits AND the key must be a SHORT
+                // string (PUC isKstr); otherwise fall back to GETUPVAL +
+                // LOADK + GETTABLE (identity-only VM handler).
+                if (ind.idx <= 255 and self.kidIsShortString(@intCast(ind.idx))) {
                     const pc = try self.builder.emitABC(.gettabup, 0, ind.t, @intCast(ind.idx), self.line_hint);
                     e.val = .{ .reloc = @intCast(pc) };
                 } else {
@@ -585,11 +585,13 @@ pub const Codegen = struct {
                 e.val = .{ .reloc = @intCast(pc) };
             },
             .index_str => |ind| {
-                // GETFIELD's C field is 8 bits; for large constant indices
-                // (>255 interned strings), fall back to LOADK + GETTABLE.
-                // Mirrors emitGlobalGet's large-index path.
-                self.freeReg(ind.t);
+                // GETFIELD's C field is 8 bits AND the key must be a SHORT
+                // string (PUC isKstr); otherwise fall back to LOADK +
+                // GETTABLE. NOTE: ind.t is freed only AFTER the final emit —
+                // allocReg for key_reg happens in between and must not be
+                // handed the table's own register.
                 if (ind.idx <= 255 and self.kidIsShortString(@intCast(ind.idx))) {
+                    self.freeReg(ind.t);
                     const pc = try self.builder.emitABC(.getfield, 0, ind.t, @intCast(ind.idx), self.line_hint);
                     e.val = .{ .reloc = @intCast(pc) };
                 } else {
@@ -597,6 +599,7 @@ pub const Codegen = struct {
                     try self.emitLoadK(key_reg, @intCast(ind.idx), self.line_hint);
                     const pc = try self.builder.emitABC(.gettable, 0, ind.t, key_reg, self.line_hint);
                     self.freeReg(key_reg);
+                    self.freeReg(ind.t);
                     e.val = .{ .reloc = @intCast(pc) };
                 }
             },
@@ -1853,7 +1856,7 @@ pub const Codegen = struct {
                 var obj_ed = try self.genExpDesc(n.object);
                 const kid = try self.builder.internString(n.name.slice(self.source));
                 // PUC VINDEXUP: upvalue table + short-string key → GETTABUP.
-                if (obj_ed.val == .upval and kid <= 255) {
+                if (obj_ed.val == .upval and kid <= 255 and self.kidIsShortString(kid)) {
                     return .{ .val = .{ .index_up = .{
                         .idx = @intCast(kid),
                         .t = @intCast(obj_ed.val.upval),
@@ -2355,11 +2358,29 @@ pub const Codegen = struct {
                 .keystr = @intCast(name_kid),
             } } };
         }
-        const env_idx = try self.ensureEnvUpvalue();
-        return .{ .val = .{ .index_up = .{
+        if (self.kidIsShortString(name_kid)) {
+            const env_idx = try self.ensureEnvUpvalue();
+            return .{ .val = .{ .index_up = .{
+                .idx = @intCast(name_kid),
+                .t = env_idx,
+                .keystr = @intCast(name_kid),
+            } } };
+        }
+        // Long global name: the specialized GETTABUP invariant does not hold
+        // — resolve _ENV into a register at codegen time and index it with
+        // the generic string path (PUC does the same via luaK_indexed
+        // rejecting non-Kstr keys for the fast form).
+        const env_reg = blk: {
+            if (try self.resolveEnvReg(0)) |r| break :blk r;
+            const r = try self.allocReg();
+            const env_idx2 = try self.ensureEnvUpvalue();
+            _ = try self.builder.emitABC(.getupval, r, env_idx2, 0, 0);
+            break :blk r;
+        };
+        return .{ .val = .{ .index_str = .{
             .idx = @intCast(name_kid),
-            .t = env_idx,
-            .keystr = @intCast(name_kid),
+            .t = env_reg,
+            .ro = true,
         } } };
     }
 
@@ -2380,7 +2401,7 @@ pub const Codegen = struct {
     /// Load a constant into a register. Uses LOADK for small indices,
     /// LOADKX + EXTRAARG for large indices.
     fn emitLoadK(self: *Codegen, dst: u8, kid: u32, line: u32) Error!void {
-        if (kid <= 255 and self.kidIsShortString(kid)) {
+        if (kid <= 255) {
             _ = try self.builder.emitABC(.loadk, dst, @intCast(kid), 0, line);
         } else {
             _ = try self.builder.emitABC(.loadkx, dst, 0, 0, line);

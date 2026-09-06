@@ -13620,10 +13620,15 @@ pub const Vm = struct {
                             // unnecessary. (Was: rawGet funnel; rawGet was
                             // 10% of the field_access profile.)
                             if (self.stats.enabled) self.stats.tbl_get_fast_str += 1; // P16.0b (constant string key)
-                            ctx.regs[a] = if (ltable.nodeLookupStr(env.Table.hash, key.String)) |node|
-                                node.value
+                            // P16.26 C2: PUC luaV_fastget with luaH_getshortstr —
+                            // pointer-identity chain walk for the (PUC-compiler-
+                            // guaranteed) short constant key; long keys (our
+                            // codegen allows >40B names) keep content equality.
+                            const node = if (key.String.isShort())
+                                ltable.nodeLookupShortStrIdentity(env.Table.hash, key.String)
                             else
-                                .Nil;
+                                ltable.nodeLookupStr(env.Table.hash, key.String);
+                            ctx.regs[a] = if (node) |nd| nd.value else .Nil;
                         } else {
                             if (try self.bytecodeGetIndex(exec_frames, &ctx, env, key, a, 0, false)) {
                                 continue :frame_loop;
@@ -13663,7 +13668,13 @@ pub const Vm = struct {
                             // overhead are unnecessary.
                             const tbl = env.Table;
                             if (self.stats.enabled) self.stats.tbl_set_fast_str += 1;
-                            if (ltable.nodeLookupStr(tbl.hash, key.String)) |node| {
+                            // P16.26 C2: PUC luaH_psetshortstr — identity walk
+                            // for the short constant key (see GETTABUP).
+                            const found = if (key.String.isShort())
+                                ltable.nodeLookupShortStrIdentity(tbl.hash, key.String)
+                            else
+                                ltable.nodeLookupStr(tbl.hash, key.String);
+                            if (found) |node| {
                                 if (self.stats.enabled) self.stats.tbl_update += 1;
                                 if (val == .Nil) {
                                     // Delete: no barrier (no new reference).
@@ -13771,10 +13782,13 @@ pub const Vm = struct {
                             // inlines nodeLookup into the dispatch loop.
                             const tbl = obj.Table;
                             if (self.stats.enabled) self.stats.tbl_get_fast_str += 1; // P16.0b
-                            ctx.regs[a] = if (ltable.nodeLookupStr(tbl.hash, key.String)) |node|
-                                node.value
+                            // P16.26 C2: PUC luaH_getshortstr identity walk
+                            // (see GETTABUP); long keys keep content equality.
+                            const node = if (key.String.isShort())
+                                ltable.nodeLookupShortStrIdentity(tbl.hash, key.String)
                             else
-                                .Nil;
+                                ltable.nodeLookupStr(tbl.hash, key.String);
+                            ctx.regs[a] = if (node) |nd| nd.value else .Nil;
                         } else {
                             if (try self.bytecodeGetIndex(exec_frames, &ctx, obj, key, a, b, true)) {
                                 continue :frame_loop;

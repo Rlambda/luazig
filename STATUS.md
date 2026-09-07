@@ -1,4 +1,4 @@
-> Last updated: 2026-09-07 (P16.28 COMPLETE-ALL — T0 close-parity, T1 noyield_close removed, T2 Node tag split, T3 lazy traceback, T4 dispatch decode, T5 call-path cuts (lua_calls −8.8% instr), T7 16 dead Thread fields removed (−128B) + leak fix, T9 xpcall handler type check, T10 sweep + err_traceback leak fix; final geomean 1.66805)
+> Last updated: 2026-09-07 (P16.29 T3 codegen parity — TESTSET machinery, EQK nil/bool + codeeq swap, outermost CLOSE skip + main RETURN rewrite, SELF fresh-A (call+tailcall), count-hook mask removed; geomean 1.63x, perf OK)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -5113,6 +5113,53 @@ P16.26-entry 1.81893 → **−8.5% cumulative**).
 Гейт: matrix --testc 33/33 (big.lua both_fail pre-existing), smoke 70/70,
 db/coroutine/locals/cstack/closure/errors/strings/nextvar/gc/vararg green,
 c_api 20+diff, api580 376/376, unit D+RF.
+
+### P16.29 T3: codegen parity — TESTSET/EQK/CLOSE/SELF/count-hook (2026-09-07)
+PUC-faithful codegen: 5 фиксов из задачи P16.29 T3 + refresh устаревших
+комментариев. Все изменения в `codegen_bc.zig` (+ count-hook в `vm.zig`).
+
+- **Fix 1 — TESTSET machinery** (полный перенос lcode.c): `NO_REG=255`,
+  `getLabel`/`isConditionalOp`/`getJumpControl`/`patchTestReg`/
+  `removeValues`/`needValue`/`patchListAux`; `patchListToHere`/
+  `patchListTo` через patchListAux; `testAndJump` (TESTSET NO_REG reg c);
+  `genNotCond` (static discharge + removeValues); `exp2nextreg` split на
+  thin wrapper + PUC `exp2reg` (needValue gate, fj, getlabel перед bool
+  loads); `exp2anyreg` = PUC public semantics; `genAndExp`/`genOrExp`
+  single path с `dst_hint`; `genAssign` routes And/Or с local hint +
+  `exp2reg` (заодно закрыт pre-existing баг `r = not (a and b)`).
+  andor.lua: 28→**15 инструкций** = exact PUC parity.
+- **Fix 2 — EQK nil/bool**: `cmpConstFromExp` принимает .Nil/.True/.False
+  литералы и const-local nil/bool (internConst → kid); VM eqk через
+  valuesEqual (Nil/Bool уже поддержаны). Плюс PUC `codeeq` LHS-first swap
+  для EqEq/NotEq (infix держит константы unmaterialized — `1 == kT` →
+  `LOADTRUE; EQI` как в PUC). eqk.lua 12-инstr parity.
+- **Fix 3 — outermost CLOSE + main RETURN**: popScope не эмитит CLOSE для
+  function-outermost блока (PUC leaveblock `bl->previous != NULL`;
+  RETURN/completeBytecodeExecFrame закрывает upvalues). compileChunk
+  зеркалит `luaK_finish` rewrite (RETURN0/1→RETURN при needclose) —
+  main с captured locals/TBC заканчивается `RETURN` (не `CLOSE; RETURN0`),
+  cap.lua/tbcmain.lua PUC-shape. Документированный divergence: A=nvarstack
+  и k-bit не проставляются (VM opReturn читает только a,b) — то же
+  решение, что в compileFuncBody.
+- **Fix 4 — SELF fresh-A**: genMethodCall + genTailCall: receiver остаётся
+  в своём регистре (SELF только читает B), freeExp + fresh A (A==B recycle
+  для temp-receiver, PUC-эквивалент). Убран лишний MOVE для local
+  receiver: `t:m(x)` → `SELF 3 0 k; MOVE 5 1; CALL` = PUC. Long-name
+  fallback: LOADK+GETTABLE+MOVE (VM SELF не поддерживает k=0 register key).
+- **Fix 5 — count-hook mask removed** (vm.zig): каждый dispatched
+  instruction декрементит budget (PUC luaG_traceexec); маска
+  move/loadnil/close удалена — критерий удаления (db.lua count-hook
+  assertions) выполнен.
+- **Comments refresh**: hot-loop regression test 7→3 opcode threshold
+  (текущий body = ADD+MMBIN = 2 = exact PUC parity; старый комментарий
+  описывал MOVE/LOADNIL-эпоху); numeric/generic-for CLOSE комментарии
+  исправлены на PUC-условие (`bl->upval`, не `firstlabel`).
+
+Гейт: matrix --testc **31/32** (zig_fail=0, big.lua both_fail pre-existing),
+smoke 70/70, db.lua OK (count-hook), c_api 21+diff PASS, api580 GREEN
+(D+RF), perf_compare **OK** (branch_loop −3%, hash_access −16%,
+comparisons −1.7%; global_arith ±10% machine noise — bytecode proven
+identical vs HEAD). Не закоммичено — оставлено dirty для ревью.
 
 ## История закрытых фаз
 

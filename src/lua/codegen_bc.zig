@@ -22,6 +22,12 @@ const tag_method = @import("tag_method.zig");
 const TmsEvent = tag_method.TmsEvent;
 const TokenKind = @import("token.zig").TokenKind;
 
+/// "No register" sentinel (PUC lopcodes.h: NO_REG = MAXARG_A = 255).
+/// Used as the TESTSET destination while the final register is unknown:
+/// if the value is never needed, `patchTestReg` converts the TESTSET to
+/// a plain TEST; if a destination is later determined, it patches A.
+const NO_REG: u8 = 255;
+
 // ---------------------------------------------------------------------------
 // PUC ltm.h TMS event numbers for MMBIN C field.
 //
@@ -789,18 +795,35 @@ pub const Codegen = struct {
     }
 
     /// Materialize expression into the next free register (freereg).
-    /// Allocates a register and discharges the expression into it.
-    /// Mirrors PUC Lua `luaK_exp2nextreg` → `exp2reg`.
+    /// Mirrors PUC `luaK_exp2nextreg` (lcode.c:999-1005): discharge open
+    /// variables, free a held temporary register, allocate the next
+    /// register, then discharge the expression into it via `exp2reg`.
     fn exp2nextreg(self: *Codegen, e: *ExpDesc) Error!u8 {
         try self.dischargeVars(e);
-        // Free the register if it's a non-relocatable temp, so we can
-        // reuse it if it's at the top of the stack.
         self.freeExp(e);
         const reg = try self.allocReg();
+        try self.exp2reg(e, reg);
+        return reg;
+    }
+
+    /// Ensures the final expression result (which includes results coming
+    /// through its jump lists) is in register `reg`. Mirrors PUC `exp2reg`
+    /// (lcode.c:971-993).
+    ///
+    /// Expressions with open jump lists (`and`/`or`/`not` of values)
+    /// arrive here with TESTSET controls pending in their lists. Protocol:
+    ///   - `needValue` checks whether any list jump cannot deliver a value
+    ///     (its control is not a TESTSET). If so, the LFALSESKIP/LOADTRUE
+    ///     pair materializes the boolean result for those jumps, and `fj`
+    ///     (emitted only when the expression itself is not a test) skips
+    ///     the pair when discharge2reg already put the value in `reg`.
+    ///   - `patchListAux` then patches each list: TESTSET controls get
+    ///     their destination A patched to `reg` and jump past the bool
+    ///     loads to `final` (the TESTSET itself delivers the operand value
+    ///     into reg when its condition holds); non-TESTSET jumps go to the
+    ///     bool loads (p_f/p_t).
+    fn exp2reg(self: *Codegen, e: *ExpDesc, reg: u8) Error!void {
         try self.discharge2reg(e, reg);
-        // PUC exp2reg (lcode.c:971-993): if the expression has jump lists
-        // (from short-circuit `and`/`or`/`not`), emit the LFALSESKIP/LOADTRUE
-        // pattern to materialize the boolean result.
         const was_vjmp = e.val == .jump;
         if (was_vjmp) {
             // VJMP: the expression itself is a test. Put its JMP in t_list
@@ -810,55 +833,60 @@ pub const Codegen = struct {
             e.val = .void;
         }
         if (e.t_list != 0 or e.f_list != 0) {
-            // need_value is always true in luazig (no TESTSET → all jumps
-            // need a value). Emit LFALSESKIP/LOADTRUE pattern.
-            // fj: skip the bool loads if the value is already in reg
-            // (discharge2reg put the RHS value there). Not needed when the
-            // expression was a VJMP — the VJMP's own JMP handles the true
-            // case, and false falls through to LFALSESKIP.
-            // (PUC lcode.c:980: fj = (e->k == VJMP) ? NO_JUMP : luaK_jump)
-            if (!was_vjmp) {
-                const fj = try self.emitJump(self.line_hint);
-                // False path: LFALSESKIP loads false, skips LOADTRUE.
-                const p_f = try self.builder.emitABC(.lfalseskip, reg, 0, 0, self.line_hint);
-                // True path: LOADTRUE loads true.
-                const p_t = try self.builder.emitABC(.loadtrue, reg, 0, 0, self.line_hint);
-                // Patch fj to jump to here (after LOADTRUE, skipping bool loads).
-                self.patchJumpToHere(fj);
-                // Patch f_list → p_f (LFALSESKIP).
-                self.patchListTo(e.f_list, p_f);
-                // Patch t_list → p_t (LOADTRUE).
-                self.patchListTo(e.t_list, p_t);
-            } else {
-                // VJMP case: no fj needed. The VJMP's own JMP (now in
-                // t_list) jumps to LOADTRUE when true. False falls through
-                // to LFALSESKIP.
-                const p_f = try self.builder.emitABC(.lfalseskip, reg, 0, 0, self.line_hint);
-                const p_t = try self.builder.emitABC(.loadtrue, reg, 0, 0, self.line_hint);
-                self.patchListTo(e.f_list, p_f);
-                self.patchListTo(e.t_list, p_t);
+            var p_f: u32 = 0; // position of an eventual LOAD false
+            var p_t: u32 = 0; // position of an eventual LOAD true
+            if (self.needValue(e.t_list) or self.needValue(e.f_list)) {
+                // Some list jump cannot produce a value: emit the boolean
+                // materialization pair for it.
+                const fj: ?u32 = if (was_vjmp) null else try self.emitJump(self.line_hint);
+                // getlabel before each bool load: they are jump targets
+                // (PUC code_loadbool, lcode.c:949-953) — this also prevents
+                // LOADNIL coalescing across them.
+                _ = self.getLabel();
+                p_f = try self.builder.emitABC(.lfalseskip, reg, 0, 0, self.line_hint);
+                _ = self.getLabel();
+                p_t = try self.builder.emitABC(.loadtrue, reg, 0, 0, self.line_hint);
+                // fj jumps around the bool loads when the value is already
+                // in reg (discharge2reg put it there).
+                if (fj) |f| self.patchJumpToHere(f);
             }
+            const final = self.getLabel();
+            // When no bool loads were emitted (needValue false — all
+            // controls are TESTSETs), p_f/p_t are unused: patchTestReg
+            // returns true for TESTSETs, so every jump goes to `final`.
+            self.patchListAux(e.f_list, final, reg, p_f);
+            self.patchListAux(e.t_list, final, reg, p_t);
             e.t_list = 0;
             e.f_list = 0;
         }
         e.val = .{ .non_reloc = reg };
-        return reg;
     }
 
-    /// Materialize expression into any register. If already in a
-    /// non-relocatable register, reuse it. Otherwise allocate a new one.
-    /// Mirrors PUC Lua `luaK_exp2anyreg`.
+    /// Materialize expression into any register and return that register.
+    /// Mirrors PUC `luaK_exp2anyreg` (lcode.c:1011-1026):
+    ///   - non-relocatable without jumps: the register already holds the
+    ///     result — return it.
+    ///   - non-relocatable WITH jumps and a temp register (>= nvarstack):
+    ///     run `exp2reg` into the same register (the temp is dead, so the
+    ///     TESTSETs/bool loads can write their results into it).
+    ///   - non-relocatable WITH jumps but a local register (< nvarstack):
+    ///     the local must not be clobbered — fall through to a fresh
+    ///     register.
+    ///   - anything else: fresh register via `exp2nextreg`.
     fn exp2anyreg(self: *Codegen, e: *ExpDesc) Error!u8 {
         try self.dischargeVars(e);
         switch (e.val) {
-            .non_reloc => |reg| return reg,
-            // All other kinds (constants, reloc, call, vararg, ...) go
-            // through `exp2nextreg`, which allocates a fresh register and
-            // discharges into it. PUC folds the constant special-case into
-            // the same path because `discharge2reg` handles constants
-            // uniformly; we do the same.
-            else => return try self.exp2nextreg(e),
+            .non_reloc => |reg| {
+                if (e.t_list == 0 and e.f_list == 0) return reg;
+                if (reg >= self.nvarstack) {
+                    try self.exp2reg(e, reg);
+                    return reg;
+                }
+                // Local with open jumps: go through exp2nextreg below.
+            },
+            else => {},
         }
+        return try self.exp2nextreg(e);
     }
 
     // -----------------------------------------------------------------------
@@ -1113,14 +1141,24 @@ pub const Codegen = struct {
         }
 
         // Emit CLOSE for <close> locals (in reverse declaration order).
-        var i = self.bindings.items.len;
-        while (i > mark) {
-            i -= 1;
-            const b = self.bindings.items[i];
-            if (self.isCloseLocal(b.reg) or self.captured_regs.contains(b.reg)) {
-                _ = self.builder.emitSimple(.close, self.line_hint) catch @panic("oom");
-                // CLOSE takes the register to close from A.
-                self.builder.code.items[self.builder.code.items.len - 1].a = b.reg;
+        // PUC leaveblock (lparser.c:~600): `if (bl->previous && bl->upval)`
+        // — the FUNCTION-OUTERMOST block (scope_count == 1, no enclosing
+        // block) never emits CLOSE. Its upvalues/to-be-closed variables are
+        // closed by the function's RETURN instead (PUC: the RETURN k-flag;
+        // luazig: completeBytecodeExecFrame always closes). Emitting CLOSE
+        // here would diverge from PUC's bytecode shape (CLOSE; RETURN0
+        // instead of RETURN with the needclose rewrite in compileFuncBody /
+        // compileChunk).
+        if (scope_count >= 2) {
+            var i = self.bindings.items.len;
+            while (i > mark) {
+                i -= 1;
+                const b = self.bindings.items[i];
+                if (self.isCloseLocal(b.reg) or self.captured_regs.contains(b.reg)) {
+                    _ = self.builder.emitSimple(.close, self.line_hint) catch @panic("oom");
+                    // CLOSE takes the register to close from A.
+                    self.builder.code.items[self.builder.code.items.len - 1].a = b.reg;
+                }
             }
         }
 
@@ -1538,27 +1576,123 @@ pub const Codegen = struct {
         self.builder.patchJump(@intCast(list), @intCast(l2));
     }
 
-    /// Patch every jump in `list` to target the current PC. Mirrors PUC
-    /// `luaK_patchtohere` (lcode.c:314-317). Walks the chain reading the
-    /// NEXT target BEFORE patching (patching overwrites the link field).
-    fn patchListToHere(self: *Codegen, list: i32) void {
+    /// Mark the current PC as a jump target and return it. Mirrors PUC
+    /// `luaK_getlabel` (lcode.c:273-278): records `lasttarget` so later
+    /// peephole merges (LOADNIL coalescing in `emitLoadNil`) never fuse
+    /// instructions across a jump destination.
+    fn getLabel(self: *Codegen) u32 {
+        self.lasttarget = self.builder.pc();
+        return self.lasttarget;
+    }
+
+    /// Is `op` a conditional (test) instruction that can control a JMP?
+    /// Mirrors PUC's T opcode property (lopcodes.c `testTMode`): the
+    /// instruction skips the following JMP when its condition holds.
+    /// Only these ops (and TESTSET) can be the "control" of a jump.
+    fn isConditionalOp(op: bc.Op) bool {
+        return switch (op) {
+            .test_, .testset, .eq, .lt, .le, .eqi, .lti, .lei, .gti, .gei, .eqk => true,
+            else => false,
+        };
+    }
+
+    /// Position of the instruction "controlling" the jump at `jump_pc`
+    /// (its condition), or the jump itself if it is unconditional.
+    /// Mirrors PUC `getjumpcontrol` (lcode.c:240-247): the previous
+    /// instruction is the control when it is a conditional (test) op.
+    fn getJumpControl(self: *Codegen, jump_pc: u32) *bc.Instruction {
+        if (jump_pc >= 1 and
+            isConditionalOp(@enumFromInt(self.builder.code.items[jump_pc - 1].op)))
+        {
+            return &self.builder.code.items[jump_pc - 1];
+        }
+        return &self.builder.code.items[jump_pc];
+    }
+
+    /// Patch the destination register of the TESTSET controlling the jump
+    /// at `node`. Mirrors PUC `patchtestreg` (lcode.c:252-269).
+    ///
+    /// Returns false ("fails") when the control is not a TESTSET — the
+    /// jump cannot deliver a value, so the caller patches it to its
+    /// default target (the boolean materialization). Otherwise:
+    ///   - `reg` is a real register different from the TESTSET source B:
+    ///     set A = reg. The TESTSET then copies R[B] into R[reg] when its
+    ///     condition holds — this is how `and`/`or` preserve operand
+    ///     values (they return the operand, not a boolean).
+    ///   - `reg` is NO_REG (value not needed) or already equals B (value
+    ///     already in place): convert the TESTSET into a plain TEST,
+    ///     preserving the condition bit (our C field carries PUC's k role
+    ///     for TEST/TESTSET).
+    fn patchTestReg(self: *Codegen, node: i32, reg: u8) bool {
+        const i = self.getJumpControl(@intCast(node));
+        if (@as(bc.Op, @enumFromInt(i.op)) != .testset) return false;
+        if (reg != NO_REG and reg != i.b) {
+            i.a = reg;
+        } else {
+            i.* = bc.Instruction.make(.test_, i.b, 0, i.c);
+        }
+        return true;
+    }
+
+    /// Traverse a list of tests ensuring none produces a value (convert
+    /// all TESTSETs to TESTs). Mirrors PUC `removevalues` (lcode.c:281-287).
+    /// Used by `genNotCond` — "values are useless when negated".
+    fn removeValues(self: *Codegen, list: i32) void {
         var cur: i32 = list;
         while (cur != 0) {
             const next_opt = self.builder.getJumpTarget(@intCast(cur));
-            self.patchJumpToHere(@intCast(cur));
+            _ = self.patchTestReg(cur, NO_REG);
             cur = if (next_opt) |n| @intCast(n) else 0;
         }
     }
 
-    /// Patch all jumps in `list` to jump to `target_pc`.
-    /// Mirrors PUC `luaK_patchlist` (lcode.c:308-316).
-    fn patchListTo(self: *Codegen, list: i32, target_pc: u32) void {
+    /// Check whether `list` has any jump that cannot produce a value (its
+    /// control is not a TESTSET) or produces an inverted value. Mirrors
+    /// PUC `need_value` (lcode.c:955-963). When true, the boolean
+    /// materialization (LFALSESKIP/LOADTRUE) is required for that list.
+    fn needValue(self: *Codegen, list: i32) bool {
         var cur: i32 = list;
         while (cur != 0) {
             const next_opt = self.builder.getJumpTarget(@intCast(cur));
-            self.patchJumpTo(@intCast(cur), target_pc);
+            const ctrl = self.getJumpControl(@intCast(cur));
+            if (@as(bc.Op, @enumFromInt(ctrl.op)) != .testset) return true;
             cur = if (next_opt) |n| @intCast(n) else 0;
         }
+        return false;
+    }
+
+    /// Traverse a list of tests, patching their destination addresses and
+    /// registers: tests producing values (TESTSETs, patched to store into
+    /// `reg`) jump to `vtarget`; other tests jump to `dtarget`.
+    /// Mirrors PUC `patchlistaux` (lcode.c:290-305).
+    fn patchListAux(self: *Codegen, list: i32, vtarget: u32, reg: u8, dtarget: u32) void {
+        var cur: i32 = list;
+        while (cur != 0) {
+            const next_opt = self.builder.getJumpTarget(@intCast(cur));
+            if (self.patchTestReg(cur, reg)) {
+                self.builder.patchJump(@intCast(cur), vtarget);
+            } else {
+                self.builder.patchJump(@intCast(cur), dtarget);
+            }
+            cur = if (next_opt) |n| @intCast(n) else 0;
+        }
+    }
+
+    /// Patch every jump in `list` to target the current PC. Mirrors PUC
+    /// `luaK_patchtohere` (lcode.c:314-317): mark "here" as a jump target
+    /// first, then `luaK_patchlist` — which runs `patchListAux` with
+    /// NO_REG, converting any pending TESTSET controls in the list into
+    /// plain TESTs (the value is no longer needed on this path).
+    fn patchListToHere(self: *Codegen, list: i32) void {
+        const hr = self.getLabel();
+        self.patchListAux(list, hr, NO_REG, hr);
+    }
+
+    /// Patch all jumps in `list` to jump to `target_pc`. Mirrors PUC
+    /// `luaK_patchlist` (lcode.c:308-310): `patchListAux` with NO_REG —
+    /// TESTSET controls are converted to TEST (the value is not needed).
+    fn patchListTo(self: *Codegen, list: i32, target_pc: u32) void {
+        self.patchListAux(list, target_pc, NO_REG, target_pc);
     }
 
     /// Negate the condition of a VJMP. Mirrors PUC `negatecondition`
@@ -1594,14 +1728,35 @@ pub const Codegen = struct {
         self.builder.live_top_before = self.builder.current_live_top;
     }
 
-    /// Default "materialize to register, TEST, JMP" path for goIfTrue/
-    /// goIfFalse. `c` is the TEST C field (k-bit): 0 for goIfTrue
-    /// (jump if false = falsy → take JMP), 1 for goIfFalse (jump if
-    /// true = truthy → take JMP). Returns the JMP pc for list concat.
+    /// Default "materialize to register, TESTSET, JMP" path for goIfTrue/
+    /// goIfFalse. Mirrors PUC `jumponcond` (lcode.c:1156-1171). `c` is the
+    /// TESTSET C field (condition bit): 0 for goIfTrue (skip when truthy →
+    /// the JMP is taken when falsy → false-list), 1 for goIfFalse (the JMP
+    /// is taken when truthy → true-list). Returns the JMP pc for the list.
+    ///
+    /// The TESTSET is emitted with A = NO_REG ("no destination yet"):
+    ///   - If the surrounding expression never needs this operand's value,
+    ///     `patchTestReg` (via patchListAux with NO_REG) converts it to a
+    ///     plain TEST.
+    ///   - If a value IS needed (e.g. `r = a and b`), the TESTSET's A is
+    ///     patched to the destination register: it then copies the operand
+    ///     value R[B] into R[A] when its condition holds — preserving the
+    ///     actual operand value (PUC `and`/`or` return the operand, not a
+    ///     boolean).
     fn testAndJump(self: *Codegen, e: *ExpDesc, c: u8) Error!i32 {
-        const reg = try self.exp2anyreg(e);
+        // Static discharge2anyreg (PUC lcode.c:937-946): keep a
+        // non-relocatable register even when the expression still has open
+        // jump lists — the TESTSET below reads R[reg], and the lists stay
+        // pending for the enclosing expression to patch. Anything else
+        // (constants, relocatable instructions) is materialized to a fresh
+        // register first.
+        switch (e.val) {
+            .non_reloc => {},
+            else => _ = try self.exp2anyreg(e),
+        }
+        const reg = e.val.non_reloc;
         self.freeExp(e);
-        _ = try self.builder.emitABC(.test_, reg, 0, c, self.line_hint);
+        _ = try self.builder.emitABC(.testset, NO_REG, reg, c, self.line_hint);
         const jmp_pc = try self.emitJump(self.line_hint);
         return @intCast(jmp_pc);
     }
@@ -1811,9 +1966,9 @@ pub const Codegen = struct {
                 // through the old genExp path.
                 const op_line = if (n.op_line != 0) n.op_line else e.span.line;
                 const reg = if (n.op == .And)
-                    try self.genAndExp(n.lhs, n.rhs, op_line)
+                    try self.genAndExp(n.lhs, n.rhs, op_line, null)
                 else if (n.op == .Or)
-                    try self.genOrExp(n.lhs, n.rhs, op_line)
+                    try self.genOrExp(n.lhs, n.rhs, op_line, null)
                 else
                     try self.genBinOp(n, op_line, null);
                 return .{ .val = .{ .non_reloc = reg } };
@@ -2037,29 +2192,49 @@ pub const Codegen = struct {
                 if (n.op == .EqEq or n.op == .NotEq or n.op == .Lt or
                     n.op == .Lte or n.op == .Gt or n.op == .Gte)
                 {
-                    // P15.38d: Check if RHS is a numeric constant usable
+                    // P15.38d: Check if a constant operand can be used
                     // for an immediate/constant comparison opcode.
                     //
-                    // PUC codeeq/codeorder: if LHS is a constant and RHS is
-                    // not, swap operands so the constant lands on the RHS.
+                    // PUC codeeq (lcode.c:1666-1674): a CONSTANT LHS is
+                    // swapped to the RHS first (infix keeps constants
+                    // unmaterialized — numerals via tonumeral, strings/
+                    // nil/bool via exp2RK), so the register operand comes
+                    // first. Check LHS first, then RHS.
+                    //
+                    // PUC codeorder: if LHS is a constant and RHS is not,
+                    // swap operands so the constant lands on the RHS.
                     // For order ops, invert direction: K<a → a>K, etc.
-                    var rhs_nc = self.cmpConstFromExp(n.op, n.rhs);
+                    var rhs_nc: ?NumConst = null;
                     var cmp_op = n.op;
                     var lhs_exp: *const ast.Exp = n.lhs;
                     var rhs_exp: *const ast.Exp = n.rhs;
-                    if (rhs_nc == null) {
+                    if (n.op == .EqEq or n.op == .NotEq) {
+                        // == and ~= are symmetric: a constant LHS simply
+                        // swaps to the RHS (PUC codeeq swapexps).
                         const lhs_nc = self.cmpConstFromExp(n.op, n.lhs);
                         if (lhs_nc != null) {
                             lhs_exp = n.rhs;
                             rhs_exp = n.lhs;
-                            cmp_op = switch (n.op) {
-                                .Lt => .Gt,
-                                .Lte => .Gte,
-                                .Gt => .Lt,
-                                .Gte => .Lte,
-                                else => n.op,
-                            };
                             rhs_nc = lhs_nc;
+                        } else {
+                            rhs_nc = self.cmpConstFromExp(n.op, n.rhs);
+                        }
+                    } else {
+                        rhs_nc = self.cmpConstFromExp(n.op, n.rhs);
+                        if (rhs_nc == null) {
+                            const lhs_nc = self.cmpConstFromExp(n.op, n.lhs);
+                            if (lhs_nc != null) {
+                                lhs_exp = n.rhs;
+                                rhs_exp = n.lhs;
+                                cmp_op = switch (n.op) {
+                                    .Lt => .Gt,
+                                    .Lte => .Gte,
+                                    .Gt => .Lt,
+                                    .Gte => .Lte,
+                                    else => n.op,
+                                };
+                                rhs_nc = lhs_nc;
+                            }
                         }
                     }
                     const use_imm = rhs_nc != null and rhsConstUsableForCmp(cmp_op, rhs_nc.?);
@@ -2257,7 +2432,16 @@ pub const Codegen = struct {
                 // Value in a register: emit OP_NOT (A=0, relocatable).
                 // goIfTrue/goIfFalse will remove this NOT and emit a
                 // direct TEST with flipped k (jumponcond optimization).
-                const reg = try self.exp2anyreg(&e);
+                //
+                // Static discharge2anyreg (PUC lcode.c:937-946, used by
+                // codenot): keep a non-relocatable register even when the
+                // expression still has open jump lists — the NOT reads
+                // R[reg] and the lists stay pending (swapped below).
+                switch (e.val) {
+                    .non_reloc => {},
+                    else => _ = try self.exp2anyreg(&e),
+                }
+                const reg = e.val.non_reloc;
                 self.freeExp(&e);
                 const not_pc = try self.builder.emitABC(.not, 0, reg, 0, self.line_hint);
                 e.val = .{ .reloc = @intCast(not_pc) };
@@ -2277,6 +2461,15 @@ pub const Codegen = struct {
         const tmp = e.t_list;
         e.t_list = e.f_list;
         e.f_list = tmp;
+        // PUC codenot (lcode.c:1257-1258): removevalues on BOTH lists —
+        // "values are useless when negated". The inner `and`/`or` TESTSETs
+        // would deliver the *operand* value (e.g. `a`), but `not` produces
+        // a boolean; keeping the TESTSETs would make `r = not (a and b)`
+        // assign the operand value instead of the negated boolean. Convert
+        // them to plain TESTs so the boolean materialization
+        // (LFALSESKIP/LOADTRUE in exp2reg) handles the value.
+        self.removeValues(e.f_list);
+        self.removeValues(e.t_list);
         return e;
     }
 
@@ -2783,14 +2976,45 @@ pub const Codegen = struct {
                     const kid = self.builder.internString(decoded) catch return null;
                     return .{ .kid = kid };
                 },
-                // <const> string local/upvalue (PUC VCONST): resolve to its
+                // nil/true/false literals: intern into the constant pool
+                // for EQK (PUC luaK_exp2K: VNIL → nilK, VTRUE → boolT,
+                // VFALSE → boolF, then codeeq's exp2RK emits OP_EQK).
+                // The VM's EQK uses raw valuesEqual, which handles
+                // nil/bool operands.
+                .Nil => {
+                    const kid = self.builder.internConst(.nil) catch return null;
+                    return .{ .kid = kid };
+                },
+                .True => {
+                    const kid = self.builder.internConst(.{ .bool = true }) catch return null;
+                    return .{ .kid = kid };
+                },
+                .False => {
+                    const kid = self.builder.internConst(.{ .bool = false }) catch return null;
+                    return .{ .kid = kid };
+                },
+                // <const> local/upvalue (PUC VCONST): resolve to its
                 // compile-time value and intern. Enables EQK for
-                // `if a == kStr then` where `kStr = <const> "hi"`.
+                // `if a == kStr then` (string), `if a == kNil then` (nil),
+                // `if a == kBool then` (boolean) where the k* names are
+                // <const> declarations.
                 .Name => |name_tok| {
                     const ed = self.constValueOfName(name_tok.slice(self.source)) orelse return null;
                     return switch (ed.val) {
                         .k_str => |s| blk: {
                             const kid = self.builder.internString(s) catch return null;
+                            break :blk .{ .kid = kid };
+                        },
+                        .nil => blk: {
+                            const kid = self.builder.internConst(.nil) catch return null;
+                            break :blk .{ .kid = kid };
+                        },
+                        .true => blk: {
+                            const kid = self.builder.internConst(.{ .bool = true }) catch return null;
+                            break :blk .{ .kid = kid };
+                        },
+                        .false => blk: {
+                            const kid = self.builder.internConst(.{ .bool = false }) catch return null;
                             break :blk .{ .kid = kid };
                         },
                         else => null,
@@ -3421,17 +3645,22 @@ pub const Codegen = struct {
         if (n.op == .EqEq or n.op == .NotEq or n.op == .Lt or
             n.op == .Lte or n.op == .Gt or n.op == .Gte)
         {
-            // P15.38d: Check if RHS is a numeric constant usable for an
-            // immediate (EQI/LTI/LEI/GTI/GEI) or constant (EQK) opcode.
-            // If so, skip materializing RHS — the comparison opcode embeds
-            // the value directly, eliminating a preceding LOADI/LOADK.
+            // P15.38d: Check if a constant operand can be used for an
+            // immediate (EQI/LTI/LEI/GTI/GEI) or constant (EQK) comparison
+            // opcode. If so, skip materializing the constant — the
+            // comparison opcode embeds the value directly, eliminating a
+            // preceding LOADI/LOADK.
             //
-            // PUC codeeq/codeorder: if LHS is a constant and RHS is not,
-            // swap operands so the constant lands on the RHS (enabling the
+            // PUC codeeq (lcode.c:1666-1674): a CONSTANT LHS is swapped to
+            // the RHS first (infix keeps constants unmaterialized), so the
+            // register operand comes first. Check LHS first for == / ~=.
+            //
+            // PUC codeorder: if LHS is a constant and RHS is not, swap
+            // operands so the constant lands on the RHS (enabling the
             // immediate/constant variant). For order ops, the comparison
             // direction must be inverted: K < a → a > K, K <= a → a >= K,
             // K > a → a < K, K >= a → a <= K. == and ~= are symmetric.
-            var rhs_nc_for_cmp = self.cmpConstFromExp(n.op, n.rhs);
+            var rhs_nc_for_cmp: ?NumConst = null;
             var cmp_op = n.op;
             // When LHS is the constant and RHS is not, we swap: the
             // register operand becomes n.rhs, and the constant (from
@@ -3441,21 +3670,35 @@ pub const Codegen = struct {
             // ExpDesc from n.rhs for the register operand.
             var lhs_exp: *const ast.Exp = n.lhs;
             var rhs_exp: *const ast.Exp = n.rhs;
-            if (rhs_nc_for_cmp == null) {
+            if (n.op == .EqEq or n.op == .NotEq) {
+                // == and ~= are symmetric: a constant LHS simply swaps
+                // to the RHS (PUC codeeq swapexps).
                 const lhs_nc = self.cmpConstFromExp(n.op, n.lhs);
                 if (lhs_nc != null) {
                     lhs_exp = n.rhs;
                     rhs_exp = n.lhs;
-                    // Transform comparison direction for order ops.
-                    // == and ~= are symmetric — no direction change needed.
-                    cmp_op = switch (n.op) {
-                        .Lt => .Gt,
-                        .Lte => .Gte,
-                        .Gt => .Lt,
-                        .Gte => .Lte,
-                        else => n.op,
-                    };
                     rhs_nc_for_cmp = lhs_nc;
+                } else {
+                    rhs_nc_for_cmp = self.cmpConstFromExp(n.op, n.rhs);
+                }
+            } else {
+                rhs_nc_for_cmp = self.cmpConstFromExp(n.op, n.rhs);
+                if (rhs_nc_for_cmp == null) {
+                    const lhs_nc = self.cmpConstFromExp(n.op, n.lhs);
+                    if (lhs_nc != null) {
+                        lhs_exp = n.rhs;
+                        rhs_exp = n.lhs;
+                        // Transform comparison direction for order ops.
+                        // == and ~= are symmetric — no direction change needed.
+                        cmp_op = switch (n.op) {
+                            .Lt => .Gt,
+                            .Lte => .Gte,
+                            .Gt => .Lt,
+                            .Gte => .Lte,
+                            else => n.op,
+                        };
+                        rhs_nc_for_cmp = lhs_nc;
+                    }
                 }
             }
             const use_imm = rhs_nc_for_cmp != null and
@@ -4345,31 +4588,34 @@ pub const Codegen = struct {
         };
         const call_line = if (mc.call_line != 0) mc.call_line else line;
 
-        // Compile receiver.  SELF writes to obj_reg and obj_reg+1, so if
-        // the receiver is a local variable (returned directly by genExpDesc
-        // as .non_reloc without allocating a temp), we must MOVE it to a
-        // fresh temp to avoid clobbering the local.
+        // Compile receiver (PUC luaK_self, lcode.c:745-760): the receiver
+        // STAYS in its own register — SELF only reads B and writes A/A+1,
+        // so a local receiver is not clobbered (no MOVE to a temp).
+        // Free the receiver's temp (if it was one), then emit SELF with a
+        // FRESH A (the func+self base for the call). When the receiver was
+        // a temp at the top of the register stack, the fresh A recycles it
+        // (A == B) — safe: SELF reads R[B] before writing R[A] (PUC allows
+        // A == B for OP_SELF).
         var obj_ed = try self.genExpDesc(mc.receiver);
-        var obj_reg = try self.exp2anyreg(&obj_ed);
-        if (obj_reg < self.nvarstack) {
-            const tmp = try self.allocReg();
-            _ = try self.builder.emitABC(.move, tmp, obj_reg, 0, call_line);
-            obj_reg = tmp;
-        }
+        const recv_reg = try self.exp2anyreg(&obj_ed);
+        self.freeExp(&obj_ed);
+        const obj_reg = try self.allocReg();
 
-        // SELF: R[obj_reg+1] = R[obj_reg]; R[obj_reg] = R[obj_reg][K[method]]
+        // SELF: R[A+1] = R[B]; R[A] = R[B][K[method]]
         const kid = try self.builder.internString(mc.method.slice(self.source));
         if (kid <= 255 and self.kidIsShortString(kid)) {
-            _ = try self.builder.emitABC(.self, obj_reg, obj_reg, @intCast(kid), call_line);
+            _ = try self.builder.emitABC(.self, obj_reg, recv_reg, @intCast(kid), call_line);
         } else {
-            // Fallback: load method string, gettable, move self.
+            // Long method name (PUC: SELF with k=0 and C = key register;
+            // our VM's SELF only supports constant keys, so emit the
+            // equivalent manual sequence): LOADK key; GETTABLE A, recv,
+            // key; MOVE A+1, recv. A+1 is reserved via the freereg bump.
+            self.freereg = obj_reg + 2;
             const key = try self.allocReg();
             try self.emitLoadK(key, kid, call_line);
-            const method_reg = try self.allocReg();
-            _ = try self.builder.emitABC(.gettable, method_reg, obj_reg, key, call_line);
-            _ = try self.builder.emitABC(.move, obj_reg + 1, obj_reg, 0, call_line);
-            _ = try self.builder.emitABC(.move, obj_reg, method_reg, 0, call_line);
-            self.freeReg2(method_reg, key);
+            _ = try self.builder.emitABC(.gettable, obj_reg, recv_reg, key, call_line);
+            _ = try self.builder.emitABC(.move, obj_reg + 1, recv_reg, 0, call_line);
+            self.freeReg(key);
         }
         self.freereg = obj_reg + 2;
         if (obj_reg + 2 > self.peak_freereg) self.peak_freereg = obj_reg + 2;
@@ -4792,32 +5038,37 @@ pub const Codegen = struct {
             _ = try self.builder.addUpvalue(desc);
         }
 
-        // PUC luaK_finish (lcode.c:1940): rewrite RETURN0/RETURN1 to RETURN
-        // when the function has open upvalues (needclose). PUC uses the k-bit
-        // on RETURN to signal upvalue closing; luazig's VM always closes
-        // upvalues in completeBytecodeExecFrame, so the k-bit is not needed.
-        // But T.listcode (code.lua) expects RETURN (not RETURN0) for functions
-        // with upvalues — this rewrite produces PUC-faithful bytecode.
-        // PUC needclose: set by markupval (upvalue capture) AND
-        // marktobeclosed (<close> variable), see lparser.c:456,467.
-        // Both cause luaK_finish to rewrite RETURN0/RETURN1 → RETURN.
+        // PUC luaK_finish: rewrite RETURN0/RETURN1 to RETURN when the
+        // function has open upvalues or to-be-closed variables.
+        self.rewriteReturnsForClose();
+    }
+
+    /// PUC `luaK_finish` (lcode.c:1929-1946): rewrite RETURN0/RETURN1 to
+    /// RETURN when the function has open upvalues (needclose). PUC uses the
+    /// k-bit on RETURN to signal upvalue closing; luazig's VM always closes
+    /// upvalues in completeBytecodeExecFrame, so the k-bit is not needed.
+    /// But T.listcode (code.lua) expects RETURN (not RETURN0) for functions
+    /// with upvalues — this rewrite produces PUC-faithful bytecode.
+    /// PUC needclose: set by markupval (upvalue capture) AND
+    /// marktobeclosed (<close> variable), see lparser.c:456,467.
+    /// Both cause luaK_finish to rewrite RETURN0/RETURN1 → RETURN.
+    fn rewriteReturnsForClose(self: *Codegen) void {
         const needclose = self.captured_regs.count() > 0 or
             self.func_has_close;
-        if (needclose) {
-            for (self.builder.code.items) |*inst| {
-                const op: bc.Op = @enumFromInt(inst.op);
-                if (op == .return0) {
-                    // PUC luaK_ret: RETURN0 has A=first, B=nret+1=1.
-                    // luazig emitSimple sets A=0,B=0. Rewrite to RETURN
-                    // and set B=1 (0 return values + 1) to avoid B=0
-                    // meaning "use top" (multret) in RETURN semantics.
-                    inst.op = @intFromEnum(bc.Op.return_);
-                    inst.b = 1;
-                } else if (op == .return1) {
-                    // RETURN1 A=first B=1 → RETURN A=first B=2 (1 ret + 1)
-                    inst.op = @intFromEnum(bc.Op.return_);
-                    inst.b = 2;
-                }
+        if (!needclose) return;
+        for (self.builder.code.items) |*inst| {
+            const op: bc.Op = @enumFromInt(inst.op);
+            if (op == .return0) {
+                // PUC luaK_ret: RETURN0 has A=first, B=nret+1=1.
+                // luazig emitSimple sets A=0,B=0. Rewrite to RETURN
+                // and set B=1 (0 return values + 1) to avoid B=0
+                // meaning "use top" (multret) in RETURN semantics.
+                inst.op = @intFromEnum(bc.Op.return_);
+                inst.b = 1;
+            } else if (op == .return1) {
+                // RETURN1 A=first B=1 → RETURN A=first B=2 (1 ret + 1)
+                inst.op = @intFromEnum(bc.Op.return_);
+                inst.b = 2;
             }
         }
     }
@@ -4864,106 +5115,37 @@ pub const Codegen = struct {
     }
 
     /// `a and b` in value context. Mirrors PUC `luaK_posfix(OPR_AND)`:
-    /// `luaK_infix(OPR_AND)` calls `goIfTrue(lhs)` (go ahead only if lhs
-    /// is true), then `luaK_posfix` concats lhs.f_list into rhs.f_list.
-    /// The result is rhs_ed (an ExpDesc with jump lists). The caller
-    /// materializes it via exp2anyreg, which uses the LFALSESKIP/LOADTRUE
-    /// pattern (PUC `exp2reg` + `code_loadbool`) when the expression has
-    /// jump lists.
-    /// `a and b` in value context. Uses a hybrid approach:
+    /// `a and b`: if a is falsy the result is a, else the result is b —
+    /// the OPERAND VALUE, not a boolean (PUC semantics).
     ///
-    /// - If both operands are "jump-list expressions" (comparisons, `not`,
-    ///   `and`, `or`), use genAndExpCond + exp2nextreg (LFALSESKIP/LOADTRUE
-    ///   pattern). This is PUC-faithful because VJMP operands don't have
-    ///   values to preserve — the result is always true/false.
+    /// Single code path (PUC `luaK_infix/posfix` OPR_AND + `exp2reg`):
+    /// `genAndExpCond` builds the jump lists; the TESTSET controls in them
+    /// deliver the operand values into the destination register
+    /// (`patchTestReg` patches their A during `exp2reg`). When no TESTSET
+    /// survives (pure boolean operands — comparisons, `not`), `needValue`
+    /// triggers the LFALSESKIP/LOADTRUE pair instead.
     ///
-    /// - Otherwise (one operand is a regular value like a local or call),
-    ///   use MOVE+TEST+JMP+MOVE. This preserves the actual operand value
-    ///   (e.g., `1 and 2` → `2`), which LFALSESKIP/LOADTRUE can't do without
-    ///   TESTSET (which luazig doesn't implement).
-    /// Check whether an expression always produces a boolean value (true or
-    /// false). This is true for comparisons, `not X`, and `and`/`or` where
-    /// both operands are boolean-producing. Used by `genAndExp`/`genOrExp`
-    /// (value context) to decide whether to use the PUC VJMP→LFALSESKIP/
-    /// LOADTRUE pattern (for boolean results) or the value-preserving
-    /// MOVE+TEST+JMP+MOVE pattern (for value results).
-    ///
-    /// PUC Lua doesn't need this check because it uses TESTSET to preserve
-    /// values in the non-boolean case. luazig has no TESTSET, so the
-    /// value-preserving path must use a different code pattern.
-    fn isBoolExp(e: *const ast.Exp) bool {
-        switch (e.node) {
-            .BinOp => |n| {
-                if (n.op == .EqEq or n.op == .NotEq or n.op == .Lt or
-                    n.op == .Lte or n.op == .Gt or n.op == .Gte) return true;
-                if (n.op == .And or n.op == .Or)
-                    return isBoolExp(n.lhs) and isBoolExp(n.rhs);
-                return false;
-            },
-            .UnOp => |n| return n.op == .Not,
-            .Paren => |inner| return isBoolExp(inner),
-            else => return false,
+    /// `dst_hint` (from `genAssign`'s direct-store to a local, mirroring
+    /// PUC `luaK_storevar` VLOCAL → `exp2reg(ex, ridx)`) makes the TESTSET
+    /// write straight into the local's register — no trailing MOVE.
+    fn genAndExp(self: *Codegen, lhs_exp: *const ast.Exp, rhs_exp: *const ast.Exp, line: u32, dst_hint: ?u8) Error!u8 {
+        var ed = try self.genAndExpCond(lhs_exp, rhs_exp, line);
+        if (dst_hint) |reg| {
+            try self.exp2reg(&ed, reg);
+            return reg;
         }
+        return try self.exp2nextreg(&ed);
     }
 
-    fn genAndExp(self: *Codegen, lhs_exp: *const ast.Exp, rhs_exp: *const ast.Exp, line: u32) Error!u8 {
-        // a and b: if a is falsy, result = a; else result = b.
-        //
-        // When both operands are boolean-producing (comparisons, `not`,
-        // `and`/`or` of booleans), use the PUC VJMP→LFALSESKIP/LOADTRUE
-        // pattern via `genAndExpCond` + `exp2nextreg`. This matches PUC
-        // Lua's `luaK_posfix(OPR_AND)` which produces a VJMP result that
-        // `exp2reg` materializes as LFALSESKIP+LOADTRUE.
-        //
-        // For value operands (variables, calls, etc.), use the
-        // value-preserving MOVE+TEST+JMP+MOVE pattern. PUC uses TESTSET
-        // for this case, but luazig has no TESTSET — the MOVE pattern is
-        // the correct fallback that preserves actual operand values.
-        if (isBoolExp(lhs_exp) and isBoolExp(rhs_exp)) {
-            var ed = try self.genAndExpCond(lhs_exp, rhs_exp, line);
-            return try self.exp2nextreg(&ed);
+    /// `a or b`: if a is truthy the result is a, else the result is b.
+    /// See `genAndExp` for the code path and `dst_hint` rationale.
+    fn genOrExp(self: *Codegen, lhs_exp: *const ast.Exp, rhs_exp: *const ast.Exp, line: u32, dst_hint: ?u8) Error!u8 {
+        var ed = try self.genOrExpCond(lhs_exp, rhs_exp, line);
+        if (dst_hint) |reg| {
+            try self.exp2reg(&ed, reg);
+            return reg;
         }
-        const dst = try self.allocReg();
-        // Use genExpDesc + exp2nextreg for operand compilation. This gives
-        // GETI/GETFIELD/GETTABUP fusion (vs old genExp's always-GETTABLE),
-        // and properly materializes VJMP results (from not/and/or in value
-        // context) via the LFALSESKIP/LOADTRUE pattern inside exp2nextreg.
-        // An extra MOVE copies the result to dst — unavoidable without TESTSET.
-        var lhs_ed = try self.genExpDesc(lhs_exp);
-        const lhs_reg = try self.exp2nextreg(&lhs_ed);
-        _ = try self.builder.emitABC(.move, dst, lhs_reg, 0, line);
-        self.freeReg(lhs_reg);
-        _ = try self.builder.emitABC(.test_, dst, 0, 0, line);
-        const jmp_pc = try self.emitJump(line);
-        var rhs_ed = try self.genExpDesc(rhs_exp);
-        const rhs_reg = try self.exp2nextreg(&rhs_ed);
-        _ = try self.builder.emitABC(.move, dst, rhs_reg, 0, line);
-        self.freeReg(rhs_reg);
-        self.patchJumpToHere(jmp_pc);
-        return dst;
-    }
-
-    fn genOrExp(self: *Codegen, lhs_exp: *const ast.Exp, rhs_exp: *const ast.Exp, line: u32) Error!u8 {
-        // a or b: if a is truthy, result = a; else result = b.
-        //
-        // See `genAndExp` for the rationale on the two code paths.
-        if (isBoolExp(lhs_exp) and isBoolExp(rhs_exp)) {
-            var ed = try self.genOrExpCond(lhs_exp, rhs_exp, line);
-            return try self.exp2nextreg(&ed);
-        }
-        const dst = try self.allocReg();
-        var lhs_ed = try self.genExpDesc(lhs_exp);
-        const lhs_reg = try self.exp2nextreg(&lhs_ed);
-        _ = try self.builder.emitABC(.move, dst, lhs_reg, 0, line);
-        self.freeReg(lhs_reg);
-        _ = try self.builder.emitABC(.test_, dst, 0, 1, line);
-        const jmp_pc = try self.emitJump(line);
-        var rhs_ed = try self.genExpDesc(rhs_exp);
-        const rhs_reg = try self.exp2nextreg(&rhs_ed);
-        _ = try self.builder.emitABC(.move, dst, rhs_reg, 0, line);
-        self.freeReg(rhs_reg);
-        self.patchJumpToHere(jmp_pc);
-        return dst;
+        return try self.exp2nextreg(&ed);
     }
 
     // -----------------------------------------------------------------------
@@ -5546,8 +5728,17 @@ pub const Codegen = struct {
                             switch (n.rhs[0].node) {
                                 .BinOp => |bn| {
                                     const op_line = if (bn.op_line != 0) bn.op_line else n.rhs[0].span.line;
-                                    if (bn.op != .And and bn.op != .Or and
-                                        bn.op != .EqEq and bn.op != .NotEq and
+                                    if (bn.op == .And) {
+                                        // `r = a and b`: pass the local's register
+                                        // as the destination hint (PUC luaK_storevar
+                                        // VLOCAL → exp2reg(ex, ridx)) — the TESTSETs
+                                        // write the operand value straight into r.
+                                        _ = try self.genAndExp(bn.lhs, bn.rhs, op_line, local_reg);
+                                        return false;
+                                    } else if (bn.op == .Or) {
+                                        _ = try self.genOrExp(bn.lhs, bn.rhs, op_line, local_reg);
+                                        return false;
+                                    } else if (bn.op != .EqEq and bn.op != .NotEq and
                                         bn.op != .Lt and bn.op != .Lte and
                                         bn.op != .Gt and bn.op != .Gte and
                                         bn.op != .Concat)
@@ -5559,13 +5750,19 @@ pub const Codegen = struct {
                                 },
                                 else => {},
                             }
-                            // Other RHS: discharge ExpDesc directly into the
-                            // local's register. For relocatable instructions
-                            // (GETTABLE, GETI, GETFIELD), this patches A to
-                            // local_reg — no MOVE needed. For non-relocatable
-                            // (call results, other locals), a single MOVE is
-                            // emitted by discharge2reg. Mirrors PUC's
-                            // luaK_storevar VLOCAL → exp2reg(fs, ex, var->u.var.ridx).
+                            // Other RHS: discharge the ExpDesc directly into
+                            // the local's register via `exp2reg` (PUC
+                            // luaK_storevar VLOCAL → exp2reg(ex, ridx)).
+                            // For relocatable instructions (GETTABLE, GETI,
+                            // GETFIELD), this patches A to local_reg — no
+                            // MOVE needed. For non-relocatable (call results,
+                            // other locals), a single MOVE is emitted.
+                            // `exp2reg` (not bare discharge2reg) also handles
+                            // open jump lists: an RHS like `not x` arrives as
+                            // a relocatable NOT with pending lists — exp2reg
+                            // materializes the LFALSESKIP/LOADTRUE pattern
+                            // into local_reg (a bare discharge2reg would drop
+                            // the lists and leave a dangling no-op JMP).
                             //
                             // PUC luaK_storevar(VLOCAL, VLOCAL_same_reg): when
                             // the RHS is the same local as the LHS, no code is
@@ -5578,7 +5775,7 @@ pub const Codegen = struct {
                                 }
                             }
                             var rhs_ed = try self.genExpDesc(n.rhs[0]);
-                            try self.discharge2reg(&rhs_ed, local_reg);
+                            try self.exp2reg(&rhs_ed, local_reg);
                             return false;
                         }
                     }
@@ -6234,26 +6431,27 @@ pub const Codegen = struct {
         if (e.node == .MethodCall) {
             const mc = e.node.MethodCall;
             const call_line = if (mc.call_line != 0) mc.call_line else line;
-            // SELF writes to obj_reg and obj_reg+1 — move to a temp if the
-            // receiver is a local to avoid clobbering it.
+            // PUC compiles `return t:m(x)` as a regular method call and then
+            // patches the CALL into TAILCALL (lparser.c retstat) — so the
+            // receiver handling is identical to genMethodCall: the receiver
+            // stays in its own register (SELF only reads B), and SELF gets a
+            // FRESH A. No receiver MOVE to a temp.
             var obj_ed = try self.genExpDesc(mc.receiver);
-            var obj_reg = try self.exp2anyreg(&obj_ed);
-            if (obj_reg < self.nvarstack) {
-                const tmp = try self.allocReg();
-                _ = try self.builder.emitABC(.move, tmp, obj_reg, 0, call_line);
-                obj_reg = tmp;
-            }
+            const recv_reg = try self.exp2anyreg(&obj_ed);
+            self.freeExp(&obj_ed);
+            const obj_reg = try self.allocReg();
             const kid = try self.builder.internString(mc.method.slice(self.source));
             if (kid <= 255 and self.kidIsShortString(kid)) {
-                _ = try self.builder.emitABC(.self, obj_reg, obj_reg, @intCast(kid), call_line);
+                _ = try self.builder.emitABC(.self, obj_reg, recv_reg, @intCast(kid), call_line);
             } else {
+                // Long method name — manual sequence (our VM's SELF only
+                // supports constant keys; see genMethodCall).
+                self.freereg = obj_reg + 2;
                 const key = try self.allocReg();
                 try self.emitLoadK(key, kid, call_line);
-                const method_reg = try self.allocReg();
-                _ = try self.builder.emitABC(.gettable, method_reg, obj_reg, key, call_line);
-                _ = try self.builder.emitABC(.move, obj_reg + 1, obj_reg, 0, call_line);
-                _ = try self.builder.emitABC(.move, obj_reg, method_reg, 0, call_line);
-                self.freeReg2(method_reg, key);
+                _ = try self.builder.emitABC(.gettable, obj_reg, recv_reg, key, call_line);
+                _ = try self.builder.emitABC(.move, obj_reg + 1, recv_reg, 0, call_line);
+                self.freeReg(key);
             }
             self.freereg = obj_reg + 2;
             if (obj_reg + 2 > self.peak_freereg) self.peak_freereg = obj_reg + 2;
@@ -6581,14 +6779,13 @@ pub const Codegen = struct {
             self.patchJumpToHere(exit_jmp);
         } else if (cond_ed.f_list != 0) {
             // No upvalues: patch false-list directly to loop_start.
+            // patchListTo (PUC luaK_patchlist) also converts any TESTSET
+            // controls in the list to plain TESTs — the condition's value
+            // is not needed, only the branch. (A raw JMP patch would leave
+            // TESTSET NO_REG reaching the VM.)
             // When the condition is a constant true, f_list is empty — no
             // loop-back is emitted at all (folds to single-pass).
-            var cur: i32 = cond_ed.f_list;
-            while (cur != 0) {
-                const next_opt = self.builder.getJumpTarget(@intCast(cur));
-                self.patchJumpTo(@intCast(cur), loop_start);
-                cur = if (next_opt) |nx| @intCast(nx) else 0;
-            }
+            self.patchListTo(cond_ed.f_list, loop_start);
             cond_ed.f_list = 0;
         }
 
@@ -6692,11 +6889,15 @@ pub const Codegen = struct {
         self.popScope();
 
         // Close upvalues for locals declared in the loop body (if any were
-        // captured by nested closures).  PUC Lua's leaveblock() emits OP_CLOSE
-        // only when `bl->firstlabel` indicates upvalues are still open; we
-        // gate on captured_regs for the same effect.  Without this check,
-        // every numeric-for iteration emits a no-op CLOSE that clobbers the
-        // hot loop (e.g. `s = s + i` in int_arith).
+        // captured by nested closures).  PUC leaveblock (lparser.c) emits
+        // OP_CLOSE when the block has open upvalues (`bl->upval`); the body
+        // block's own popScope (inside genBlock) already emits that CLOSE
+        // for captured body locals — one CLOSE per iteration, matching PUC.
+        // This backstop covers captured locals still live above base+3
+        // after the body scope pop (none in practice — the body scope owns
+        // them all). Without the captured_regs gate, every numeric-for
+        // iteration would emit a no-op CLOSE that clobbers hot loops
+        // (e.g. `s = s + i` in int_arith).
         if (self.anyCapturedInRange(base + 3, self.nvarstack)) {
             _ = try self.builder.emitABC(.close, base + 3, 0, 0, line);
         }
@@ -6788,7 +6989,11 @@ pub const Codegen = struct {
         self.popScope();
 
         // Close upvalues for locals declared in the loop body (if any were
-        // captured by nested closures).
+        // captured by nested closures).  Same as the numeric-for: the body
+        // block's own popScope (inside genBlock) already emits PUC's single
+        // CLOSE for captured body locals (`bl->upval` in leaveblock); this
+        // captured_regs-gated backstop covers anything still live above
+        // base+4 after the body scope pop.
         if (self.anyCapturedInRange(base + 4, self.nvarstack)) {
             _ = try self.builder.emitABC(.close, base + 4, 0, 0, line);
         }
@@ -6941,6 +7146,15 @@ pub const Codegen = struct {
             _ = try self.builder.addUpvalue(desc);
         }
 
+        // PUC luaK_finish applies to the main chunk too: when the main
+        // chunk has open upvalues (locals captured by nested closures) or
+        // to-be-closed variables, its RETURN0/RETURN1 are rewritten to
+        // RETURN. Since PUC leaveblock never emits CLOSE for the
+        // outermost block, the main chunk ends with `RETURN` (not
+        // `CLOSE; RETURN0`) — mirror that here (the popScope outermost
+        // guard relies on this rewrite for correct bytecode shape).
+        self.rewriteReturnsForClose();
+
         const proto = try self.builder.finish();
         return proto;
     }
@@ -7036,10 +7250,8 @@ test "codegen: hot loop instruction count regression" {
     // execute a small number of opcodes per iteration. If codegen regresses
     // (e.g., unnecessary MOVE, LOADNIL, or CLOSE), this test will fail.
     //
-    // PUC Lua 5.5 emits 3 opcodes in the loop body: ADD, MMBIN, FORLOOP.
-    // luazig currently emits more due to MOVE for local reads and LOADNIL
-    // for register clearing. The regression threshold is generous to allow
-    // incremental improvement without breaking the test.
+    // PUC Lua 5.5 emits 2 opcodes in the loop body: ADD, MMBIN (FORLOOP is
+    // the back-edge, not counted). luazig matches PUC exactly.
     //
     // Expected layout (current codegen):
     //   VARARGPREP
@@ -7049,23 +7261,16 @@ test "codegen: hot loop instruction count regression" {
     //   LOADI R3 1           (step)
     //   FORPREP R1 ->exit
     //   --- loop body ---
-    //   MOVE R5 R0           (copy s to temp)
-    //   MOVE R6 R4           (copy i to temp)
-    //   ADD R5 R5 R6         (s + i)
-    //   MOVE R0 R5           (s = result)
-    //   LOADNIL R5..R6       (clear temps)
+    //   ADD R0 R0 R4         (s = s + i; loop var i lives at R4)
+    //   MMBIN R0 R4 6        (__add metamethod fallback)
     //   --- end loop body ---
     //   FORLOOP R1 ->body
-    //   LOADNIL R4           (clear i)
-    //   MOVE R1 R0           (return value)
-    //   RETURN1 R1
-    //   LOADNIL R1
-    //   LOADNIL R0
-    //   RETURN0
+    //   RETURN1 R0           (return s)
+    //   RETURN0              (implicit main return)
     //
     // Loop body = instructions between FORPREP and FORLOOP (exclusive).
-    // Currently 5 opcodes: MOVE, MOVE, ADD, MOVE, LOADNIL.
-    // Regression threshold: body must not exceed 7 opcodes.
+    // Currently 2 opcodes: ADD, MMBIN — exact PUC parity.
+    // Regression threshold: body must not exceed 3 opcodes.
     const source = "local s = 0\nfor i = 1, 10 do\ns = s + i\nend\nreturn s";
     var lexer = @import("lexer.zig").Lexer.init(.{ .name = "test", .bytes = source });
     var parser = try @import("parser.zig").Parser.init(&lexer);
@@ -7093,11 +7298,12 @@ test "codegen: hot loop instruction count regression" {
     const body_end = forloop_pc.?;
     const body_len = body_end - body_start;
 
-    // The loop body must not exceed 7 opcodes. If it does, codegen has
-    // regressed — investigate unnecessary MOVE/LOADNIL/CLOSE emissions.
-    try testing.expect(body_len <= 7);
-    if (body_len > 5) {
-        std.debug.print("warning: hot loop body has {d} opcodes (expected ≤5)\n", .{body_len});
+    // The loop body must not exceed 3 opcodes (PUC parity is 2: ADD, MMBIN).
+    // If it does, codegen has regressed — investigate unnecessary
+    // MOVE/LOADNIL/CLOSE emissions.
+    try testing.expect(body_len <= 3);
+    if (body_len > 2) {
+        std.debug.print("warning: hot loop body has {d} opcodes (PUC parity is 2)\n", .{body_len});
     }
 }
 

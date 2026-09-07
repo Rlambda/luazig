@@ -1,4 +1,4 @@
-> Last updated: 2026-09-07 (P16.27 COMPLETE — T0 truth (c_frame_count repaired, nested-rejection root-understood), T1 CloseCallPolicy (smoke70 70/70), T2 codegen short-string (branch-free), T5.A pushStaged hot/cold split, T5.B frame-entry single-getPtr; T3 lazy-traceback honest revert)
+> Last updated: 2026-09-07 (P16.28 — T2 Node short/long tag split (PUC VSHRSTR/VLNGSTR), T3 lazy coroutine traceback (eager per-yield snapshot deleted, dead-error captured at unwind boundary); coroutine_yield −170 i/it; geomean 1.75538)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -36,9 +36,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **13 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **70/70** pass |
 | C API suites (`tests/c_api`) | 21 suites |
-| Performance (geomean vs PUC) | **1.77x** |
+| Performance (geomean vs PUC) | **1.76x** |
 
-Geomean замедления vs PUC Lua: **1.77x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.76x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -5036,6 +5036,21 @@ field/coroutine/hash instr ↓). Гейт (сабагент): все линии 
 **Гейт**: 11/11; smoke **70/70**; matrix zig_fail=0; api580 376/376;
 c_api 20+diff; 14 сьютов; native BOUNDED; hookstress 1-3.
 **Geomean**: B0 1.792→**1.775** (−0.95% same-session; correctness-фаза).
+
+### P16.28 (частичная фаза): T2 Node-tag + T3 lazy traceback (2026-09-06)
+- **T2 (`8e50875`)**: NodeKeyTag split — short_string/long_string (PUC
+  LUA_VSHRSTR/LUA_VLNGSTR); классификация при setKey (один раз);
+  nodeLookupShortStrIdentity = TAG+POINTER; Node 32B; изм. instr:
+  field_access →1.871-1.941G, hash_access 1.855G, cy →1.462-1.483G.
+- **T3 (`6202669`)**: eager per-yield 64-name snapshot УДАЛЁН (−520B
+  per Thread); suspended traceback lazy (buildSuspendedFrameNames);
+  dead-error captured ONCE в appendBytecodeUnwind (propagate-to-boundary,
+  последняя точка где кадры целы; pcall-recoverable пропускает).
+  **coroutine_yield 1.477→1.392G instr (−85M = −170 i/it!)**.
+- T0: close-parity репродюсеры PUC-идентичны (обе yy-модели совпадают
+  для coroutine-контекста; артефакт p16.28-t0-close-parity.json).
+- Geomean-сессия: **1.75538** (P16.27 1.77473 → −1.1%; cumul от P16.26
+  entry 1.81893 → −3.5%).
 
 ## История закрытых фаз
 

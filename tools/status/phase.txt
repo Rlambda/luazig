@@ -1,1 +1,1 @@
-P16.27 COMPLETE — T0 truth (c_frame_count repaired, nested-rejection root-understood), T1 CloseCallPolicy (smoke70 70/70), T2 codegen short-string (branch-free), T5.A pushStaged hot/cold split, T5.B frame-entry single-getPtr; T3 lazy-traceback honest revert
+P16.28 — T2 Node short/long tag split (PUC VSHRSTR/VLNGSTR), T3 lazy coroutine traceback (eager per-yield snapshot deleted, dead-error captured at unwind boundary); coroutine_yield −170 i/it; geomean 1.75538

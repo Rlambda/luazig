@@ -2061,9 +2061,12 @@ pub const Thread = struct {
     debug_hook: DebugHookState = .{},
     trace_yields: usize = 0,
     trace_had_error: bool = false,
-    trace_currentline: i64 = 0,
-    trace_stack_depth: usize = 0,
-    trace_frame_names: [64]?[]const u8 = @splat(null),
+    /// P16.28 T3: formatted traceback captured ONCE at the terminal
+    /// error boundary (when the coroutine dies with an unrecoverable
+    /// error, before frames are cleared). Null for suspended threads —
+    /// their traceback is built lazily from retained call_frames.
+    /// Replaces the old eager [64]?[]const u8 per-yield snapshot.
+    err_traceback: ?[]const u8 = null,
     pending_close_builtin: bool = false,
     pending_close_builtin_obj: Value = .Nil,
     pending_close_err_active: bool = false,
@@ -10317,6 +10320,9 @@ pub const Vm = struct {
             .failed => |error_value| {
                 thread.yielded.deinit(self.alloc);
                 thread.trace_had_error = true;
+                // P16.28 T3: err_traceback was already captured at the
+                // unwind boundary (appendBytecodeUnwind) when frames were
+                // still intact — nothing to do here.
                 thread.status = .dead;
                 thread.close_has_err = true;
                 thread.close_err = error_value;
@@ -12061,6 +12067,32 @@ pub const Vm = struct {
         error_value: Value,
     ) DispatchError!void {
         const recovery = self.bytecodeUnwindDisposition(exec_frames, boundary_depth);
+        // P16.28 T3: when the error will ESCAPE this coroutine (propagate
+        // to the boundary — no protected frame claimed it), capture the
+        // dead-error traceback NOW. This is the last point where the
+        // coroutine's frames are intact; the unwind below is destructive.
+        // Recoverable errors (protected_parent / close_parent) skip this —
+        // pcall handles them without needing a terminal trace.
+        if (recovery.disposition == .propagate and
+            recovery.target_depth == boundary_depth)
+        {
+            const th = self.activeBytecodeThread();
+            if (th.trace_yields > 0 and th.err_traceback == null) {
+                var names: [64]?[]const u8 = undefined;
+                const cnt = self.buildSuspendedFrameNames(th, names[0..]);
+                if (cnt > 0) {
+                    var aw: std.Io.Writer.Allocating = .init(self.alloc);
+                    for (names[0..cnt]) |nm| {
+                        if (nm) |name| {
+                            aw.writer.print("\tdb.lua: in function '{s}'\n", .{name}) catch break;
+                        } else {
+                            aw.writer.writeAll("\tdb.lua: in function <db.lua>\n") catch break;
+                        }
+                    }
+                    th.err_traceback = aw.toOwnedSlice() catch null;
+                }
+            }
+        }
         try self.activeBytecodeThread().bytecode_unwinds.append(self.alloc, .{
             .boundary_depth = boundary_depth,
             .target_depth = recovery.target_depth,
@@ -20021,7 +20053,6 @@ pub const Vm = struct {
         self.clearThreadContinuationScratch(th, .{});
         th.close_mode = false;
         th.dofile_entry_closure = null;
-        th.trace_stack_depth = 0;
         th.resume_base_depth = 0;
     }
 
@@ -20052,6 +20083,13 @@ pub const Vm = struct {
         self.forced_close_thread = th;
         self.forced_close_had_error = false;
         th.close_mode = true;
+    }
+
+    fn freeErrTraceback(self: *Vm, th: *Thread) void {
+        if (th.err_traceback) |tb| {
+            self.alloc.free(@constCast(tb));
+            th.err_traceback = null;
+        }
     }
 
     fn clearForcedClose(self: *Vm, th: *Thread) void {
@@ -20100,22 +20138,24 @@ pub const Vm = struct {
         return changed;
     }
 
-    fn snapshotThreadTraceFrames(self: *Vm, th: *Thread) void {
-        th.trace_stack_depth = 0;
+    /// P16.28 T3: LAZY frame-name list for the suspended-thread traceback.
+    /// Walks the SAME retained call_frames the eager snapshot used to copy
+    /// on every yield — but only when a traceback is actually requested.
+    fn buildSuspendedFrameNames(self: *Vm, th: *Thread, out: []?[]const u8) usize {
         var oi: usize = 0;
         var i = th.call_frames.len();
         while (i > 0) {
             i -= 1;
             const fr = th.call_frames.getConstPtr(i).*;
             if (fr.isHidden()) continue;
-            if (oi < th.trace_frame_names.len) {
-                th.trace_frame_names[oi] = self.debugNameFromCallee(stackForThread(self, th)[fr.func_slot]);
+            if (oi < out.len) {
+                out[oi] = self.debugNameFromCallee(stackForThread(self, th)[fr.func_slot]);
                 oi += 1;
             } else {
                 break;
             }
         }
-        th.trace_stack_depth = oi;
+        return oi;
     }
 
     fn builtinCoroutineYield(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -20159,15 +20199,11 @@ pub const Vm = struct {
         // P15.40b-full: Bytecode frames are in Thread.call_frames.
         const th_bc = self.activeBytecodeThread();
         th.yield_origin_depth = th_bc.call_frames.len();
-        if (th_bc.call_frames.len() != 0) {
-            const frame_idx = if (self.isInDebugHook() and th_bc.call_frames.len() >= 2)
-                th_bc.call_frames.len() - 2
-            else
-                th_bc.call_frames.len() - 1;
-            const fr = th_bc.call_frames.getPtr(frame_idx);
-            th.trace_currentline = self.frameCurrentLine(fr);
-        }
-        self.snapshotThreadTraceFrames(th);
+        // P16.28 T3: NO eager traceback snapshot on yield — the suspended
+        // path builds lazily (buildSuspendedFrameNames) from retained
+        // frames; the dead-error path captures once at the terminal
+        // boundary. The old per-yield 64-name walk was hot-path work for
+        // debug output that is almost never requested.
         if (th.wrap_eager_mode) {
             for (outs) |*o| o.* = .Nil;
             try self.appendThreadWrapYield(th, args);
@@ -28383,7 +28419,9 @@ pub const Vm = struct {
 
         if (th.status == .suspended) {
             if (level <= 0) w.writeAll("\t[C]: in function 'yield'\n") catch return error.OutOfMemory;
-            const names = th.trace_frame_names[0..th.trace_stack_depth];
+            var name_buf: [64]?[]const u8 = undefined;
+            const name_len = self.buildSuspendedFrameNames(th, name_buf[0..]);
+            const names: []const ?[]const u8 = name_buf[0..name_len];
             const depth_raw: usize = if (names.len > 0) names.len else 1;
             const depth: i64 = if (depth_raw > 0) @intCast(depth_raw) else 1;
             const drop: i64 = if (level <= 1) 0 else level - 1;
@@ -28401,18 +28439,11 @@ pub const Vm = struct {
         } else if (th.status == .dead) {
             if (th.trace_had_error) {
                 w.writeAll("\t[C]: in function 'error'\n") catch return error.OutOfMemory;
-                const names = th.trace_frame_names[0..th.trace_stack_depth];
-                if (names.len != 0 and names[0] != null) {
-                    w.print("\tdb.lua: in function '{s}'\n", .{names[0].?}) catch return error.OutOfMemory;
-                }
-                for (names) |nm| {
-                    if (nm) |name| {
-                        w.print("\tdb.lua: in function '{s}'\n", .{name}) catch return error.OutOfMemory;
-                    } else {
-                        w.writeAll("\tdb.lua: in function <db.lua>\n") catch return error.OutOfMemory;
-                    }
-                }
-                if (names.len == 0) {
+                // P16.28 T3: dead-error traceback was FORMATTED once at the
+                // terminal boundary; replay the captured text.
+                if (th.err_traceback) |tb| {
+                    w.writeAll(tb) catch return error.OutOfMemory;
+                } else {
                     w.writeAll("\tdb.lua: in function <db.lua>\n") catch return error.OutOfMemory;
                 }
             }

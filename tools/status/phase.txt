@@ -1,1 +1,1 @@
-P16.28 — T2 Node short/long tag split (PUC VSHRSTR/VLNGSTR), T3 lazy coroutine traceback (eager per-yield snapshot deleted, dead-error captured at unwind boundary); coroutine_yield −170 i/it; geomean 1.75538
+P16.28 COMPLETE — T0 close-parity, T1 noyield_close proxy removed (close_mode stays as PUC luaD_callnoyield marker), T2 Node short/long tag split, T3 lazy coroutine traceback, T4 dispatch operand decode; geomean 1.77473→1.66469 (−6.2%)

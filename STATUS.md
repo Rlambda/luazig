@@ -1,4 +1,4 @@
-> Last updated: 2026-09-07 (P16.28 — T2 Node short/long tag split (PUC VSHRSTR/VLNGSTR), T3 lazy coroutine traceback (eager per-yield snapshot deleted, dead-error captured at unwind boundary); coroutine_yield −170 i/it; geomean 1.75538)
+> Last updated: 2026-09-07 (P16.28 COMPLETE — T0 close-parity, T1 noyield_close proxy removed (close_mode stays as PUC luaD_callnoyield marker), T2 Node short/long tag split, T3 lazy coroutine traceback, T4 dispatch operand decode; geomean 1.77473→1.66469 (−6.2%))
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -31,14 +31,14 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 <!-- BEGIN GENERATED SUMMARY (tools/status_summary.py) -->
 | Metric | Result |
 |--------|--------|
-| Upstream matrix (`testes/*.lua`, `--testc`) | **18/32** pass (exit code parity) |
+| Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
-| Differential output (`--diff`) | **13 output_diff** |
+| Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **70/70** pass |
 | C API suites (`tests/c_api`) | 21 suites |
-| Performance (geomean vs PUC) | **1.76x** |
+| Performance (geomean vs PUC) | **1.66x** |
 
-Geomean замедления vs PUC Lua: **1.76x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.66x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -5051,6 +5051,41 @@ c_api 20+diff; 14 сьютов; native BOUNDED; hookstress 1-3.
   для coroutine-контекста; артефакт p16.28-t0-close-parity.json).
 - Geomean-сессия: **1.75538** (P16.27 1.77473 → −1.1%; cumul от P16.26
   entry 1.81893 → −3.5%).
+
+### P16.28 COMPLETE: semantic-state + dispatch convergence (2026-09-07)
+Финальный geomean **1.66469** clean@`d798178` (вход фазы 1.77473 → **−6.2%**;
+P16.26-entry 1.81893 → **−8.5% cumulative**).
+
+- **T0 (`b4bd305`)**: close-parity репродюсеры PUC-идентичны: Lua-level
+  `pcall` внутри короутины идёт через `lua_pcallk`→docallK (yieldable);
+  yy=0 (`luaD_closeprotected`) — только bare C-API. Артефакт
+  `p16.28-t0-close-parity.json`. P16.27 yy-таблица подтверждена.
+- **T2 (`8e50875`)**: NodeKeyTag split short_string/long_string (PUC
+  VSHRSTR/VLNGSTR); классификация один раз в setKey;
+  nodeLookupShortStrIdentity TAG+POINTER; Node 32B.
+- **T3 (`6202669`)**: eager per-yield 64-name snapshot УДАЛЁН (−520B на
+  Thread); suspended traceback lazy; dead-error traceback captured ONCE
+  в appendBytecodeUnwind (propagate-to-boundary).
+  coroutine_yield 1.477→1.392G (−170 i/it).
+- **T1 (`e9bbd3d`)**: noyield_close unwind-shape proxy удалён;
+  close_mode yield-check = PUC luaD_callnoyield маркер forced-close
+  транспорта (coroutine.lua:573 дифференциал закрыт — suspended-inside-
+  xpcall force-close идёт через yield-rejection → xpcall resolve → TBC
+  close → error→close boundary). T8 base-depth эксперимент честно
+  откачен (close continuations interleaved below any base depth).
+- **T4 (`d798178`)**: universal a/b/c extraction удалён из заголовка
+  dispatch-цикла; per-handler `inst.a/b/c` (LLVM sink extractions into
+  arms). branch_loop **−7.0%**, lua_calls **−5.4%**, field_access
+  **−7.3%**, coroutine_yield −1.7% instr (same-session A/B).
+- **T6 (honest revert)**: in-place return resume (continue_no_advance)
+  требует PUC-style per-push savepc модель; per-iteration store = +16.6%
+  branch_loop; arm-level unconditional write ломает yield/close replay
+  (defer identity-check существует для этого). Откат на T4. Нужен
+  dedicated savedpc-owner refactor (будущая фаза).
+
+Гейт: matrix --testc 33/33 (big.lua both_fail pre-existing), smoke 70/70,
+db/coroutine/locals/cstack/closure/errors/strings/nextvar/gc/vararg green,
+c_api 20+diff, api580 376/376, unit D+RF.
 
 ## История закрытых фаз
 

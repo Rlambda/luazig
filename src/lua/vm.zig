@@ -12290,6 +12290,95 @@ pub const Vm = struct {
         return .{ .func_slot = func_slot, .nargs = args.len };
     }
 
+    /// P16.29: INLINE fast path of the ACTIVATE step, shared by
+    /// `pushStagedBytecodeExecFrame` (single source of truth for the ~13
+    /// other ACTIVATE call sites) and inlined directly into the dispatch
+    /// OP_CALL handler (the dominant Lua→Lua call path — no out-of-line
+    /// call, no DispatchResult enum switch, mirroring PUC's OP_CALL →
+    /// luaD_precall LUA_VLCL straight line).
+    ///
+    /// Shape (P16.27 T5.A): fixed arity (nargs == numparams, no
+    /// missing/excess), non-vararg, capacity already available (no stack
+    /// growth), no hook gate active.
+    ///
+    /// Returns true when the child frame was activated; false when the
+    /// caller must take the general slow path (varargs / VAHID / missing
+    /// args / growth / overflow / hooks). Heap-spill OOM propagates via
+    /// DispatchError exactly like FrameStack.addOne.
+    inline fn pushStagedFast(
+        self: *Vm,
+        exec_frames: *FrameStack,
+        proto: *const bc.Proto,
+        func_slot_in: usize,
+        nargs: usize,
+        nresults: i32,
+    ) DispatchError!bool {
+        if (!proto.flags.is_vararg and nargs == proto.numparams) {
+            const frame_cap32: u32 = @intCast(proto.maxstacksize + EXTRA_MARGIN);
+            const base = func_slot_in + 1;
+            const needed_top = base + frame_cap32;
+            // PUC checkstackp: the child frame must fit the CURRENT stack
+            // with ERRORSTACKSIZE headroom and no growth. Growth/overflow
+            // shapes return false — the slow path (and opCall) own
+            // ensureBcStackCap and the overflow machinery. This check also
+            // guarantees no bc_stack realloc happens on the success path,
+            // so the caller's ctx.regs slice stays valid without a refresh.
+            if (needed_top <= self.bc_stack.len and
+                needed_top <= self.bc_stack.len - 200 and // overflow headroom
+                (self.dispatch_gate & DISPATCH_GATE_HOOKS) == 0)
+            {
+                if (self.stats.enabled) self.stats.calls_lua_frames += 1; // P16.0b: ALL Lua activations
+                const th = self.activeBytecodeThread();
+                // P16.29: local activation id. The old `counter +%= 1` store
+                // followed by a re-load from `th` for the frame field forced
+                // a second memory load (the compiler cannot prove `ef_slot`
+                // and `th` don't alias). One local feeds both the counter
+                // store and activation_id.
+                const activation = th.bytecode_activation_counter +% 1;
+                th.bytecode_activation_counter = activation;
+                // P16.29: FrameStack.addOne inlined for the inline-slot case
+                // (the overwhelmingly common one): compare + increment +
+                // address compute in straight-line code instead of an
+                // out-of-line call. The heap-spill branch (>INLINE_FRAME_CAP
+                // frames deep) keeps addOne's error-propagating heap growth.
+                const ef_slot = if (exec_frames.inline_count < INLINE_FRAME_CAP) blk: {
+                    const idx = exec_frames.inline_count;
+                    exec_frames.inline_count = idx + 1;
+                    break :blk &exec_frames.inline_frames[idx];
+                } else try exec_frames.heap.addOne(self.alloc);
+                // P16.29 (corollary of P16.21 T4.3): hooks are OFF here
+                // (gated above), so the five hook-replay sentinels
+                // (resume_pc, last_line_pc, skip_line_hook_pc,
+                // skip_call_hook_pc, resume_skip_count_pc) are semantically
+                // dead for this frame: every read is inside the
+                // hooks-active dispatch block or gated by isHookYield()
+                // (fresh callstatus is masked by encodeNresults to its low
+                // 8 bits, so CIST_HOOKYIELD is clear), and BOTH hook-install
+                // paths sanitize live frames via sanitizeHookReplayState.
+                // Skip their INVALID_PC stores; write only fields with
+                // ungated readers. simple_result_dst MUST stay 0xFF —
+                // hasSimpleResult() reads it unconditionally on return.
+                ef_slot.u = .{ .lua = undefined };
+                ef_slot.u.lua.proto = proto;
+                ef_slot.u.lua.pc = 0;
+                ef_slot.u.lua.frame_cap = frame_cap32;
+                ef_slot.u.lua.nextraargs = 0;
+                ef_slot.u.lua.lua_packed_flags = 0;
+                ef_slot.u.lua.simple_result_dst = 0xFF;
+                ef_slot.activation_id = activation;
+                ef_slot.func_slot = func_slot_in; // base = func_slot + 1
+                ef_slot.callstatus = encodeNresults(nresults);
+                ef_slot.reg_top = @intCast(proto.numparams);
+                ef_slot.tbc_mark = self.bc_tbc_regs.items.len;
+                ef_slot.pending_call_index = INVALID_PENDING;
+                // Stack bookkeeping (PUC prepCallInfo + checkstack).
+                self.bc_stack_top = needed_top;
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// ACTIVATE step (PUC luaD_precall LUA_VLCL branch, ldo.c:725-735).
     ///
     /// Contract: the callee value is at bc_stack[func_slot_in] and `nargs`
@@ -12307,46 +12396,12 @@ pub const Vm = struct {
         nargs: usize,
         nresults: i32,
     ) DispatchError!void {
-        if (self.stats.enabled) self.stats.calls_lua_frames += 1; // P16.0b: ALL Lua activations
+        // P16.29: shared inline fast path first (single source of truth
+        // with the dispatch OP_CALL handler). On success the activation is
+        // complete; on false fall through to the general body below.
+        if (try self.pushStagedFast(exec_frames, proto, func_slot_in, nargs, nresults)) return;
 
-        // P16.27 T5.A: COMMON fast path — the shape that dominates every
-        // call-heavy workload (lua_calls profile: this fn = 16.6% samples):
-        //   fixed arity (nargs == numparams, no missing/excess)
-        //   non-vararg
-        //   capacity available (no stack growth)
-        //   no hook gate active
-        // PUC equivalent: the straight-line body of luaD_precall's
-        // LUA_VLCL branch when checkstack succeeds and no varargs exist.
-        if (!proto.flags.is_vararg and nargs == proto.numparams) {
-            const frame_cap32: u32 = @intCast(proto.maxstacksize + EXTRA_MARGIN);
-            const base = func_slot_in + 1;
-            const needed_top = base + frame_cap32;
-            if (needed_top <= self.bc_stack.len and
-                needed_top <= self.bc_stack.len - 200 and // overflow headroom
-                (self.dispatch_gate & DISPATCH_GATE_HOOKS) == 0)
-            {
-                const th = self.activeBytecodeThread();
-                th.bytecode_activation_counter +%= 1;
-                const ef_slot = try exec_frames.addOne(self.alloc);
-                ef_slot.u = .{ .lua = .{
-                    .proto = proto,
-                    .pc = 0,
-                    .frame_cap = frame_cap32,
-                    .nextraargs = 0,
-                    .lua_packed_flags = 0,
-                    .simple_result_dst = 0xFF,
-                } };
-                ef_slot.activation_id = th.bytecode_activation_counter;
-                ef_slot.func_slot = func_slot_in; // base = func_slot + 1
-                ef_slot.callstatus = encodeNresults(nresults);
-                ef_slot.reg_top = @intCast(proto.numparams);
-                ef_slot.tbc_mark = self.bc_tbc_regs.items.len;
-                ef_slot.pending_call_index = INVALID_PENDING;
-                // Stack bookkeeping (PUC prepCallInfo + checkstack).
-                self.bc_stack_top = needed_top;
-                return;
-            }
-        }
+        if (self.stats.enabled) self.stats.calls_lua_frames += 1; // P16.0b: ALL Lua activations
         // Slow path: varargs / VAHID / missing args / growth / overflow /
         // hooks — the full existing body below.
         // P16.10b Task 15: constants are runtime-ready by construction —
@@ -15173,17 +15228,6 @@ pub const Vm = struct {
                                 const nresults: i32 = if (inst.c == 0) -1 else @intCast(inst.c - 1);
                                 const nargs: usize = if (inst.b == 0) exec_frames.getPtr(ctx.frame_index).reg_top - inst.a - 1 else inst.b - 1;
 
-                                // Pre-grow shared stack for child frame (PUC
-                                // luaD_precall stack check). Usually a no-op
-                                // because EXTRA_MARGIN covers typical calls.
-                                const child_frame_cap: u32 = @intCast(proto.maxstacksize + EXTRA_MARGIN);
-                                const child_nextra: usize = if (proto.flags.is_vararg and nargs > proto.numparams)
-                                    nargs - proto.numparams
-                                else
-                                    0;
-                                try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap + child_nextra);
-                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-
                                 // P16.2: no pending-call slot for a plain
                                 // Lua→Lua call — the P15.51c direct contract
                                 // applies (same as opCall's plain-Lua branch:
@@ -15201,17 +15245,40 @@ pub const Vm = struct {
                                 // Staged-ABI activation (PUC OP_CALL: func at
                                 // R[A], nargs args at R[A+1..] — already in
                                 // place, zero-copy, no staging needed).
-                                try self.pushStagedBytecodeExecFrame(
+                                //
+                                // P16.29: pushStagedFast is INLINED here —
+                                // the whole activation (shape check, capacity
+                                // check, frame push, field writes) is
+                                // straight-line code in the OP_CALL handler,
+                                // and the proto.maxstacksize/flags/numparams
+                                // loads CSE with the condition checks. The
+                                // old out-of-line pushStagedBytecodeExecFrame
+                                // call and the pre-grow ensureBcStackCap +
+                                // ctx.regs refresh are gone: pushStagedFast's
+                                // own `needed_top <= bc_stack.len` check
+                                // subsumes them (success ⇒ no growth ⇒ no
+                                // realloc ⇒ ctx.regs stays valid), and every
+                                // fast-path-miss shape (vararg / missing
+                                // args / growth / hooks) falls through to
+                                // opCall below, which owns the general
+                                // precall machinery (its own ensureBcStackCap
+                                // + regs refresh + pushStagedBytecodeExecFrame
+                                // slow path). Stats note: a fast-path-miss
+                                // call now transits opCall, so it counts in
+                                // both calls_fast and calls_slow — the
+                                // counters keep their entry-path meaning.
+                                if (try self.pushStagedFast(
                                     ctx.exec_frames,
                                     proto,
                                     ctx.base + inst.a,
                                     nargs,
                                     nresults,
-                                );
-                                // Defer block syncs parent frame state (pc,
-                                // regs, etc.) before the frame_loop starts
-                                // executing the child frame.
-                                continue :frame_loop;
+                                )) {
+                                    // Defer block syncs parent frame state (pc,
+                                    // regs, etc.) before the frame_loop starts
+                                    // executing the child frame.
+                                    continue :frame_loop;
+                                }
                             }
                         }
 

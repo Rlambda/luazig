@@ -1,4 +1,4 @@
-> Last updated: 2026-09-07 (P16.28 COMPLETE — T0 close-parity, T1 noyield_close proxy removed (close_mode stays as PUC luaD_callnoyield marker), T2 Node short/long tag split, T3 lazy coroutine traceback, T4 dispatch operand decode; geomean 1.77473→1.66469 (−6.2%))
+> Last updated: 2026-09-07 (P16.28 COMPLETE-ALL — T0 close-parity, T1 noyield_close removed, T2 Node tag split, T3 lazy traceback, T4 dispatch decode, T5 call-path cuts (lua_calls −8.8% instr), T7 16 dead Thread fields removed (−128B) + leak fix, T9 xpcall handler type check, T10 sweep + err_traceback leak fix; final geomean 1.66805)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -36,9 +36,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **70/70** pass |
 | C API suites (`tests/c_api`) | 21 suites |
-| Performance (geomean vs PUC) | **1.66x** |
+| Performance (geomean vs PUC) | **1.67x** |
 
-Geomean замедления vs PUC Lua: **1.66x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.67x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -5051,6 +5051,33 @@ c_api 20+diff; 14 сьютов; native BOUNDED; hookstress 1-3.
   для coroutine-контекста; артефакт p16.28-t0-close-parity.json).
 - Geomean-сессия: **1.75538** (P16.27 1.77473 → −1.1%; cumul от P16.26
   entry 1.81893 → −3.5%).
+
+
+### P16.28 дополнение: реальный остаток закрыт (2026-09-07, `df9931a`→`727a3d1`)
+- **T9 (`df9931a`)**: xpcall handler type check (PUC lbaselib.c:503
+  luaL_checktype) — raw tag, без __call; проверка в builtinXpcall И в
+  tryPushBytecodeProtectedCall fast-path (direct + nested chains); failC =
+  C-style без file:line префикса; 13-case дифференциал PUC-идентичен.
+- **T7 (`f9cac0c`)**: 16 мёртвых Thread-полей удалены (аудит: write-only/
+  constant, осиротели после удаления IR-исполнителя 7a674a6): wrap_* группа
+  полностью, resume_base_depth (reader→literal 0), resume_yield_id и др.;
+  next_yield_id → capture_yield_id=1; Thread 3744→**3616B** (−128B).
+- **T5 (`2f2e215`)**: call-path (objdump-guided): fast path без hook-sentinel
+  init; pushStagedFast инлайн в dispatch CALL (PUC-структура); addOne
+  inline-slot инлайн; activation_id aliasing reload убит.
+  **lua_calls 3.103→2.830G instr (−8.8%)**, time −5%; coroutine_yield ratio
+  1.975→**1.821**; field_access +0.8% instr при flat time (register-pressure
+  side effect, честно зафиксирован).
+- **T10 (`727a3d1`)**: sweep — 15 мёртвых helpers, 4 stale comments;
+  **LEAK FIX**: Thread.err_traceback (T3) никогда не освобождался
+  (freeErrTraceback был dead-from-birth) — free встроен в
+  freeThreadWrapBuffers.
+- T6/T8 — обоснованные отступления (savedpc-owner и errorJmp=NULL модели
+  требуют отдельных фаз), эксперименты откачены, выводы зафиксированы.
+
+Финальный geomean **1.66805** clean@`727a3d1` (сессия-дельта vs 1.66469 =
++0.2% кросс-сессионный шум; same-session causal: lc −5%/−8.8% instr, cy −1.8%,
+fa flat). Вход фазы 1.77473 → **−6.0%**; от P16.26-entry 1.81893 → **−8.3%**.
 
 ### P16.28 COMPLETE: semantic-state + dispatch convergence (2026-09-07)
 Финальный geomean **1.66469** clean@`d798178` (вход фазы 1.77473 → **−6.2%**;

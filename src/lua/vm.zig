@@ -12306,6 +12306,47 @@ pub const Vm = struct {
         nresults: i32,
     ) DispatchError!void {
         if (self.stats.enabled) self.stats.calls_lua_frames += 1; // P16.0b: ALL Lua activations
+
+        // P16.27 T5.A: COMMON fast path — the shape that dominates every
+        // call-heavy workload (lua_calls profile: this fn = 16.6% samples):
+        //   fixed arity (nargs == numparams, no missing/excess)
+        //   non-vararg
+        //   capacity available (no stack growth)
+        //   no hook gate active
+        // PUC equivalent: the straight-line body of luaD_precall's
+        // LUA_VLCL branch when checkstack succeeds and no varargs exist.
+        if (!proto.flags.is_vararg and nargs == proto.numparams) {
+            const frame_cap32: u32 = @intCast(proto.maxstacksize + EXTRA_MARGIN);
+            const base = func_slot_in + 1;
+            const needed_top = base + frame_cap32;
+            if (needed_top <= self.bc_stack.len and
+                needed_top <= self.bc_stack.len - 200 and // overflow headroom
+                (self.dispatch_gate & DISPATCH_GATE_HOOKS) == 0)
+            {
+                const th = self.activeBytecodeThread();
+                th.bytecode_activation_counter +%= 1;
+                const ef_slot = try exec_frames.addOne(self.alloc);
+                ef_slot.u = .{ .lua = .{
+                    .proto = proto,
+                    .pc = 0,
+                    .frame_cap = frame_cap32,
+                    .nextraargs = 0,
+                    .lua_packed_flags = 0,
+                    .simple_result_dst = 0xFF,
+                } };
+                ef_slot.activation_id = th.bytecode_activation_counter;
+                ef_slot.func_slot = func_slot_in; // base = func_slot + 1
+                ef_slot.callstatus = encodeNresults(nresults);
+                ef_slot.reg_top = @intCast(proto.numparams);
+                ef_slot.tbc_mark = self.bc_tbc_regs.items.len;
+                ef_slot.pending_call_index = INVALID_PENDING;
+                // Stack bookkeeping (PUC prepCallInfo + checkstack).
+                self.bc_stack_top = needed_top;
+                return;
+            }
+        }
+        // Slow path: varargs / VAHID / missing args / growth / overflow /
+        // hooks — the full existing body below.
         // P16.10b Task 15: constants are runtime-ready by construction —
         // every closure-creation path adopts its tree at the
         // createBytecodeChunkClosure boundary (see there). The old lazy

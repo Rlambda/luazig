@@ -1,1 +1,1 @@
-P16.28 COMPLETE — T0 close-parity, T1 noyield_close proxy removed (close_mode stays as PUC luaD_callnoyield marker), T2 Node short/long tag split, T3 lazy coroutine traceback, T4 dispatch operand decode; geomean 1.77473→1.66469 (−6.2%)
+P16.28 COMPLETE-ALL — T0 close-parity, T1 noyield_close removed, T2 Node tag split, T3 lazy traceback, T4 dispatch decode, T5 call-path cuts (lua_calls −8.8% instr), T7 16 dead Thread fields removed (−128B) + leak fix, T9 xpcall handler type check, T10 sweep + err_traceback leak fix; final geomean 1.66805

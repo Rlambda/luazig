@@ -8228,13 +8228,27 @@ pub const Vm = struct {
     /// mode at COMPILE TIME (Zig-native instead of the runtime union switch):
     /// each instantiation keeps only its own arm — no runtime completion
     /// dispatch, no dead payload loads, no duplicated function bodies.
+    ///
+    /// P16.29 T4: `fixed_n` compile-time-specializes the ARGUMENT shape the
+    /// same way. `fixed_n = n` (metamethod calls — PUC `luaT_callTMres`'s
+    /// fixed `[func, p1, p2]` window) takes `args: [n]Value`: staging is
+    /// `stageFixedCall`'s unrolled stores and the activation goes through
+    /// the shared `pushStagedFast` inline arm FIRST (the same activation
+    /// primitive `pushStagedBytecodeExecFrame` and the dispatch OP_CALL
+    /// handler use), falling back to the general activation for
+    /// vararg/missing-args/growth/overflow/hooks shapes. `fixed_n = null`
+    /// (pending-path continuations, `__call` chains with runtime arity)
+    /// keeps the generic slice staging. ONE activation implementation, ONE
+    /// set of capacity/rollback rules — only the staging copy shape and the
+    /// fast-arm inlining are compile-time.
     fn pushResolvedBytecodeClosure(
         self: *Vm,
         comptime mode: PushClosureMode,
+        comptime fixed_n: ?usize,
         exec_frames: *FrameStack,
         parent_index: usize,
         closure: *Closure,
-        args: []const Value,
+        args: if (fixed_n) |n| [n]Value else []const Value,
         payload: switch (mode) {
             .pending => PendingPayload,
             .simple_result => SimpleResultPayload,
@@ -8301,18 +8315,43 @@ pub const Vm = struct {
             //
             // PUC luaT_callTMres two-step: stage [func, args...] at
             // L->top (bc_stack_top), then activate (luaD_precall).
-            const staged = try self.stageBytecodeCall(
-                self.bc_stack_top,
-                closure,
-                args,
-            );
-            try self.pushStagedBytecodeExecFrame(
-                exec_frames,
-                proto,
-                staged.func_slot,
-                staged.nargs,
-                -1,
-            );
+            if (fixed_n) |n| {
+                // P16.29 T4 fixed-arity metamethod shape: unrolled staging
+                // (PUC's three setobj2s stores) + the shared pushStagedFast
+                // inline activation arm, with the general activation as the
+                // fallback for non-fast shapes. Same transactionality as the
+                // generic arm below: every fallible step sits under the
+                // clearSimpleResult errdefer above.
+                const staged = try self.stageFixedCall(n, self.bc_stack_top, closure, args);
+                if (!try self.pushStagedFast(
+                    exec_frames,
+                    proto,
+                    staged.func_slot,
+                    staged.nargs,
+                    -1,
+                )) {
+                    try self.pushStagedBytecodeExecFrame(
+                        exec_frames,
+                        proto,
+                        staged.func_slot,
+                        staged.nargs,
+                        -1,
+                    );
+                }
+            } else {
+                const staged = try self.stageBytecodeCall(
+                    self.bc_stack_top,
+                    closure,
+                    args,
+                );
+                try self.pushStagedBytecodeExecFrame(
+                    exec_frames,
+                    proto,
+                    staged.func_slot,
+                    staged.nargs,
+                    -1,
+                );
+            }
             // No setDebugName — debug name is derived from simple_result_event
             // at read time via getDebugName().
         }
@@ -8347,7 +8386,7 @@ pub const Vm = struct {
         };
         if (cl.proto == null) return false;
 
-        try self.pushResolvedBytecodeClosure(.pending, exec_frames, parent_index, cl, resolved.args, .{
+        try self.pushResolvedBytecodeClosure(.pending, null, exec_frames, parent_index, cl, resolved.args, .{
             .completion = completion,
             .debug_namewhat = debug_namewhat,
             .debug_name = debug_name,
@@ -8407,6 +8446,7 @@ pub const Vm = struct {
         if (metamethod != .Closure or metamethod.Closure.proto == null) return false;
         try self.pushResolvedBytecodeClosure(
             .pending,
+            null,
             exec_frames,
             parent_index,
             metamethod.Closure,
@@ -8501,17 +8541,32 @@ pub const Vm = struct {
     /// The `__index`/`__newindex` bytecode paths pre-filter to bytecode Closures
     /// before calling this function, so the `__call` resolution path is never
     /// triggered for them.
+    ///
+    /// **P16.29 T4 (fixed arity):** the two operands are separate by-value
+    /// parameters — PUC `luaT_callTMres`'s `(f, p1, p2)` operand shape. Every
+    /// production site passes exactly 2 arguments (binary ops (lhs, rhs);
+    /// unary ops (v, v) — PUC's `luaT_trybinTM` rb,rb convention; comparisons
+    /// (la, lb)); PUC stages a FIXED `[func, p1, p2]` window for every
+    /// VM-level metamethod. Separate register parameters keep the staging
+    /// stores register-fed (a by-value `[2]Value` array parameter travels
+    /// by hidden pointer and forces a 32-byte stack round-trip — measured
+    /// as the entire IPC regression of the first fixed-arity cut). The
+    /// operand ARRAY is materialized only on the cold resolveCallable path
+    /// (`__call` chains, non-Closure values). `opname(event)` is computed
+    /// ONLY on that cold path (it feeds `resolveCallable`'s error text) —
+    /// on the dominant Closure fast path it was a per-call jump-table
+    /// dispatch over ~30 events with zero readers (measured ~2% of
+    /// metamethod_call_noalloc before this laziness).
     fn tryPushSimpleResultMetamethod(
         self: *Vm,
         exec_frames: *FrameStack,
         parent_index: usize,
         metamethod: Value,
-        args: []const Value,
+        p1: Value,
+        p2: Value,
         event: TmsEvent,
         completion: SimpleResultCompletion,
     ) DispatchError!SimpleResultOutcome {
-        const opname = tag_method.opname(event);
-
         // P16.10a T4: Fast path for proven bytecode Closures — skip
         // resolveCallable entirely. A Closure is already callable (__call is
         // irrelevant), so resolveCallable would return {same callee, same
@@ -8526,10 +8581,11 @@ pub const Vm = struct {
                 // yielding works (Task 6).
                 try self.pushResolvedBytecodeClosure(
                     .simple_result,
+                    2,
                     exec_frames,
                     parent_index,
                     metamethod.Closure,
-                    args,
+                    .{ p1, p2 },
                     .{ .event = event, .completion = completion },
                 );
                 return .pushed;
@@ -8539,11 +8595,18 @@ pub const Vm = struct {
             // for consistency with non-Closure values).
         }
 
+        // opname is needed ONLY here: resolveCallable's non-callable error
+        // text ("attempt to call a number value (metamethod 'add')") and
+        // the synchronous debug-name override. The Closure fast path above
+        // never reads it.
+        const opname = tag_method.opname(event);
+
         // Non-Closure (or C-closure): resolve ONCE through normal callable
         // semantics. resolveCallable handles __call chains (self prepended,
         // operands follow) and produces PUC's exact error text for non-callable
-        // values.
-        const resolved = try self.resolveCallable(metamethod, args, .{
+        // values. The operand array is materialized here — cold path only.
+        const args = [2]Value{ p1, p2 };
+        const resolved = try self.resolveCallable(metamethod, &args, .{
             .namewhat = "metamethod",
             .name = opname,
         });
@@ -8560,9 +8623,11 @@ pub const Vm = struct {
                 }
                 // Bytecode closure reached via __call chain — push continuation
                 // frame via the shared primitive. Resolution already happened
-                // above (exactly once — Task 5).
+                // above (exactly once — Task 5). Runtime arity (resolveCallable
+                // may have prepended the __call self) — generic slice staging.
                 try self.pushResolvedBytecodeClosure(
                     .simple_result,
+                    null,
                     exec_frames,
                     parent_index,
                     cl,
@@ -8802,7 +8867,8 @@ pub const Vm = struct {
                         exec_frames,
                         parent_index,
                         mm,
-                        args[0..],
+                        args[0],
+                        args[1],
                         .index,
                         .{ .value = dst },
                     )) {
@@ -8824,7 +8890,8 @@ pub const Vm = struct {
                     exec_frames,
                     parent_index,
                     mm,
-                    args[0..],
+                    args[0],
+                    args[1],
                     .index,
                     .{ .value = dst },
                 )) {
@@ -12260,6 +12327,41 @@ pub const Vm = struct {
         return .{ .func_slot = func_slot, .nargs = args.len };
     }
 
+    /// FIXED-ARITY staging (PUC `luaT_callTMres`, ltm.c:119-131): PUC stages
+    /// a FIXED window `[func, p1, p2]` with three plain `setobj2s` stores —
+    /// no loop, no slice machinery. This is the comptime-arity twin of
+    /// `stageBytecodeCall`: the capacity rule and the staged layout are
+    /// IDENTICAL (callee at `func_slot`, args at `func_slot+1..`, grow only
+    /// when func+N crosses the physical end); only the copy shape is
+    /// compile-time-specialized — `inline for` unrolls the stores so a
+    /// 2-argument metamethod call is three straight stores (PUC's exact
+    /// shape), with no runtime trip count, no vectorized-loop preheader,
+    /// and no `args.len` reloads. ONE semantic implementation: the generic
+    /// slice path and this path share the same rules; callers pick the
+    /// copy shape the way PUC picks `luaT_callTMres` (fixed 2-arg window)
+    /// vs `luaD_call` (arbitrary top-based window) at the call site.
+    fn stageFixedCall(
+        self: *Vm,
+        comptime n: usize,
+        func_slot: usize,
+        callee_cl: *Closure,
+        args: [n]Value,
+    ) DispatchError!StagedCall {
+        // Same reservation rule as stageBytecodeCall: reserve func + n args
+        // only; the activation reserves the frame's own space (PUC:
+        // luaT_callTMres assumes EXTRA_STACK for the staged values,
+        // luaD_precall's checkstack covers the frame).
+        const needed = func_slot + 1 + n;
+        if (needed > self.bc_stack.len) {
+            try self.ensureBcStackCap(needed);
+        }
+        self.bc_stack[func_slot] = .{ .Closure = callee_cl };
+        inline for (0..n) |i| {
+            self.bc_stack[func_slot + 1 + i] = args[i];
+        }
+        return .{ .func_slot = func_slot, .nargs = n };
+    }
+
     /// P16.29: INLINE fast path of the ACTIVATE step, shared by
     /// `pushStagedBytecodeExecFrame` (single source of truth for the ~13
     /// other ACTIVATE call sites) and inlined directly into the dispatch
@@ -12293,8 +12395,23 @@ pub const Vm = struct {
             // ensureBcStackCap and the overflow machinery. This check also
             // guarantees no bc_stack realloc happens on the success path,
             // so the caller's ctx.regs slice stays valid without a refresh.
+            //
+            // P16.29 T4 underflow fix + PUC headroom model: the 200-slot
+            // headroom is reserved ONLY when the stack is large enough to
+            // reserve it (`len >= 200`). For smaller stacks (the initial
+            // stack and early 1.5x growth sizes are legitimately < 200 —
+            // PUC's initial stack is 2*LUA_MINSTACK = 40) the headroom
+            // concept does not apply: PUC's checkstack accepts any frame
+            // that fits the current stack (`stack_last = stack + size`;
+            // the STACKERRSPACE=200 emergency zone exists only beyond
+            // MAXSTACK, as ERRORSTACKSIZE). The old subtraction form
+            // `needed_top <= len - 200` underflowed for len < 200: Debug
+            // panicked (locals.lua "to-be-closed variables"), ReleaseFast
+            // wrapped and accepted — identical to this form's small-stack
+            // arm, so established ReleaseFast acceptance is preserved
+            // exactly for every stack size.
             if (needed_top <= self.bc_stack.len and
-                needed_top <= self.bc_stack.len - 200 and // overflow headroom
+                (self.bc_stack.len < 200 or needed_top + 200 <= self.bc_stack.len) and
                 (self.dispatch_gate & DISPATCH_GATE_HOOKS) == 0)
             {
                 if (self.stats.enabled) self.stats.calls_lua_frames += 1; // P16.0b: ALL Lua activations
@@ -14735,7 +14852,8 @@ pub const Vm = struct {
                             exec_frames,
                             ctx.frame_index,
                             tm.?,
-                            &.{ lhs, rhs },
+                            lhs,
+                            rhs,
                             event,
                             .{ .value = pi.a },
                         )) {
@@ -14768,7 +14886,8 @@ pub const Vm = struct {
                             exec_frames,
                             ctx.frame_index,
                             tm.?,
-                            &.{ lhs, rhs },
+                            lhs,
+                            rhs,
                             event,
                             .{ .value = pi.a },
                         )) {
@@ -14803,7 +14922,8 @@ pub const Vm = struct {
                             exec_frames,
                             ctx.frame_index,
                             tm.?,
-                            &.{ lhs, rhs },
+                            lhs,
+                            rhs,
                             event,
                             .{ .value = pi.a },
                         )) {
@@ -14839,7 +14959,8 @@ pub const Vm = struct {
                                 exec_frames,
                                 ctx.frame_index,
                                 tm.?,
-                                &.{ val, val },
+                                val,
+                                val,
                                 .unm,
                                 .{ .value = inst.a },
                             )) {
@@ -14878,7 +14999,8 @@ pub const Vm = struct {
                                     exec_frames,
                                     ctx.frame_index,
                                     tm.?,
-                                    &.{ val, val },
+                                    val,
+                                    val,
                                     .bnot,
                                     .{ .value = inst.a },
                                 )) {
@@ -14909,7 +15031,8 @@ pub const Vm = struct {
                                     exec_frames,
                                     ctx.frame_index,
                                     mm,
-                                    &.{ val, val },
+                                    val,
+                                    val,
                                     .len,
                                     .{ .value = inst.a },
                                 )) {
@@ -14968,7 +15091,8 @@ pub const Vm = struct {
                                         exec_frames,
                                         ctx.frame_index,
                                         mm,
-                                        &.{ la, lb },
+                                        la,
+                                        lb,
                                         .eq,
                                         .{ .compare = inst.c != 0 },
                                     )) {
@@ -37056,7 +37180,8 @@ pub const Vm = struct {
                 exec_frames,
                 frame_index,
                 mm,
-                &.{ la, lb },
+                la,
+                lb,
                 event,
                 .{ .compare = invert },
             )) {
@@ -42742,7 +42867,8 @@ test "vm: P16.8a transactional simple_result setup — errdefer rollback on push
             exec_frames,
             parent_index,
             .{ .Closure = mm_cl },
-            args[0..],
+            args[0],
+            args[1],
             .add,
             .{ .value = 0 },
         );
@@ -42790,7 +42916,8 @@ test "vm: P16.8a transactional simple_result setup — errdefer rollback on push
             exec_frames,
             parent_index,
             .{ .Closure = mm_cl },
-            args[0..],
+            args[0],
+            args[1],
             .add,
             .{ .value = 0 },
         );
@@ -42908,7 +43035,8 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
             exec_frames,
             parent_index,
             .{ .Closure = mm_cl },
-            args[0..],
+            args[0],
+            args[1],
             .add,
             .{ .value = 0 },
         );
@@ -42952,7 +43080,8 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
             exec_frames,
             parent_index,
             .{ .Closure = mm_cl },
-            args[0..],
+            args[0],
+            args[1],
             .add,
             .{ .value = 0 },
         );
@@ -42980,7 +43109,8 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
             exec_frames,
             parent_index,
             .{ .Closure = mm_cl },
-            args[0..],
+            args[0],
+            args[1],
             .add,
             .{ .value = 0 },
         );

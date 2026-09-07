@@ -2829,10 +2829,10 @@ test "hash_seed: intern/table-key coherence" {
         vm.alloc.destroy(tbl);
     }
     try vm.tableResize(tbl, 0, 4); // allocate a 4-slot hash part
-    _ = ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, .{ .String = key }, .{ .Int = 99 }, vm.hash_seed);
+    _ = ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, .{ .String = key }, .{ .Int = 99 });
 
     // Lookup must find the value — proves intern hash == table-key hash.
-    const node = ltable.nodeLookup(tbl.hash, .{ .String = key }, vm.hash_seed);
+    const node = ltable.nodeLookup(tbl.hash, .{ .String = key });
     try testing.expect(node != null);
     try testing.expectEqual(@as(i64, 99), node.?.value.Int);
 }
@@ -6852,7 +6852,7 @@ pub const Vm = struct {
                     // PUC key for array slot i (0-based) is i+1.
                     const key: Value = .{ .Int = @intCast(i + 1) };
                     const val = tbl.array[i];
-                    const inserted = ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, key, val, self.hash_seed);
+                    const inserted = ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, key, val);
                     std.debug.assert(inserted != null);
                 }
             }
@@ -6920,7 +6920,7 @@ pub const Vm = struct {
                     continue;
                 }
             }
-            const inserted = ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, key, val, self.hash_seed);
+            const inserted = ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, key, val);
             std.debug.assert(inserted != null);
         }
 
@@ -13855,7 +13855,7 @@ pub const Vm = struct {
                                     // getintfromhash, ltable.c:929-942). Key is
                                     // provably .Int — skip Value construction
                                     // and the generic keyMatches tag switch.
-                                    ctx.regs[inst.a] = if (ltable.nodeLookupInt(tbl.hash, key.Int, self.hash_seed)) |node|
+                                    ctx.regs[inst.a] = if (ltable.nodeLookupInt(tbl.hash, key.Int)) |node|
                                         node.value
                                     else
                                         .Nil;
@@ -13893,7 +13893,7 @@ pub const Vm = struct {
                                 // getintfromhash). Key is provably .Int (c is
                                 // u8, 1-based) and outside array range — skip
                                 // rawGet's switch + redundant array check.
-                                ctx.regs[inst.a] = if (ltable.nodeLookupInt(tbl.hash, @intCast(inst.c), self.hash_seed)) |node|
+                                ctx.regs[inst.a] = if (ltable.nodeLookupInt(tbl.hash, @intCast(inst.c))) |node|
                                     node.value
                                 else
                                     .Nil;
@@ -14033,7 +14033,7 @@ pub const Vm = struct {
                                         tbl.array[@intCast(k - 1)] = val;
                                     } else {
                                         // Hash-part lookup: specialized int path.
-                                        if (ltable.nodeLookupInt(tbl.hash, k, self.hash_seed)) |node| {
+                                        if (ltable.nodeLookupInt(tbl.hash, k)) |node| {
                                             if (self.stats.enabled) self.stats.tbl_update += 1;
                                             if (val == .Nil) {
                                                 node.value = .Nil;
@@ -14050,7 +14050,7 @@ pub const Vm = struct {
                                     }
                                 } else {
                                     // Negative/zero int key: hash part only.
-                                    if (ltable.nodeLookupInt(tbl.hash, k, self.hash_seed)) |node| {
+                                    if (ltable.nodeLookupInt(tbl.hash, k)) |node| {
                                         if (self.stats.enabled) self.stats.tbl_update += 1;
                                         if (val == .Nil) {
                                             node.value = .Nil;
@@ -28679,7 +28679,7 @@ pub const Vm = struct {
             .Nil => return .Nil,
             else => {},
         }
-        const node = ltable.nodeLookup(tbl.hash, key, self.hash_seed) orelse return .Nil;
+        const node = ltable.nodeLookup(tbl.hash, key) orelse return .Nil;
         return node.value;
     }
 
@@ -28744,12 +28744,12 @@ pub const Vm = struct {
 
         // Step 3: Existing hash node → value-barrier(prepare)→update/delete.
         // PUC luaH_pset → finishnodeset (existing key found by lookup).
-        if (ltable.nodeLookup(tbl.hash, canon_key, self.hash_seed)) |node| {
+        if (ltable.nodeLookup(tbl.hash, canon_key)) |node| {
             if (self.stats.enabled) self.stats.tbl_update += 1;
             if (val == .Nil) {
                 // Logical delete: leave node in chain with value Nil (PUC).
                 // No barrier — no new reference created.
-                _ = ltable.nodeDelete(tbl.hash, canon_key, self.hash_seed);
+                _ = ltable.nodeDelete(tbl.hash, canon_key);
             } else {
                 // Existing-slot update: VALUE barrier only (key already owned).
                 // PUC luaV_finishfastset(L, t, val) = luaC_barrierback(L, t, val).
@@ -28787,7 +28787,7 @@ pub const Vm = struct {
         // into a table triggers rehash so `computeSizes` can decide whether
         // the key belongs in the array part (e.g. `t[1]=x` → asize=1 → array).
         if (tbl.hash.len != 0) {
-            if (ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, canon_key, val, self.hash_seed)) |_| {
+            if (ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, canon_key, val)) |_| {
                 if (self.stats.enabled) self.stats.tbl_insert += 1;
                 // P15.37c: new key inserted — invalidate metamethod cache.
                 // (PUC ltable.c:1112 calls invalidateTMcache after insertkey.)
@@ -28818,7 +28818,7 @@ pub const Vm = struct {
         // The key is not an array index, so rehash must have allocated a
         // hash part with room for it (nsize >= 1).
         std.debug.assert(tbl.hash.len != 0);
-        const inserted = ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, canon_key, val, self.hash_seed);
+        const inserted = ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, canon_key, val);
         std.debug.assert(inserted != null);
         if (self.stats.enabled) self.stats.tbl_insert += 1; // post-rehash insert
         tbl.flags &= ~TableFlags.MASK;
@@ -28855,7 +28855,7 @@ pub const Vm = struct {
                     // (ltable.c:351): a deleted key whose node was deadened
                     // by GC (DEADKEY) is a valid control key, matched by raw
                     // pointer identity. Use nodeLookupDeadok (deadok=1).
-                    const node = ltable.nodeLookupDeadok(tbl.hash, cc, self.hash_seed) orelse {
+                    const node = ltable.nodeLookupDeadok(tbl.hash, cc) orelse {
                         return self.fail("invalid key to 'next'", .{});
                     };
                     // PUC `getgeneric(key, deadok=1)` accepts a deleted (Nil-
@@ -28869,7 +28869,7 @@ pub const Vm = struct {
                 in_array = false;
                 // deadok=1: a deleted key whose node was deadened by GC
                 // (DEADKEY) is a valid control key (PUC findindex, ltable.c:351).
-                const node = ltable.nodeLookupDeadok(tbl.hash, cc, self.hash_seed) orelse {
+                const node = ltable.nodeLookupDeadok(tbl.hash, cc) orelse {
                     return self.fail("invalid key to 'next'", .{});
                 };
                 // Deleted (Nil-valued) node is a valid control (see above).
@@ -35262,7 +35262,7 @@ pub const Vm = struct {
         // No array part, or last array element is present.
         // Check if t[asize+1] is present in the hash part.
         const next_key: u64 = @as(u64, asize) + 1;
-        if (!self.hashIntIsPresent(tbl, next_key)) {
+        if (!hashIntIsPresent(tbl, next_key)) {
             return @intCast(asize);
         }
 
@@ -35293,21 +35293,21 @@ pub const Vm = struct {
         const incr: u64 = (rnd & mask) + 1;
         var j: u64 = if (incr <= maxint - i) i + incr else i + 1;
         rnd >>= n;
-        while (self.hashIntIsPresent(tbl, j)) {
+        while (hashIntIsPresent(tbl, j)) {
             i = j;
             if (j <= maxint / 2 - 1) {
                 j = j * 2 + (rnd & 1);
                 rnd >>= 1;
             } else {
                 j = maxint;
-                if (!self.hashIntIsPresent(tbl, j)) break;
+                if (!hashIntIsPresent(tbl, j)) break;
                 return j;
             }
         }
         // Binary search between i (present) and j (absent).
         while (j - i > 1) {
             const m = i + (j - i) / 2;
-            if (self.hashIntIsPresent(tbl, m)) {
+            if (hashIntIsPresent(tbl, m)) {
                 i = m;
             } else {
                 j = m;
@@ -35323,12 +35323,12 @@ pub const Vm = struct {
     /// `key` is a u64 matching PUC's `lua_Unsigned`, but it always represents
     /// a valid `lua_Integer` (i64) because `hash_search` bounds probes by
     /// `LUA_MAXINTEGER`. We reinterpret the bits as i64 for the lookup.
-    fn hashIntIsPresent(self: *const Vm, tbl: *const Table, key: u64) bool {
+    fn hashIntIsPresent(tbl: *const Table, key: u64) bool {
         if (tbl.hash.len == 0) return false;
         const ikey: i64 = @bitCast(key);
         // P16.6: specialized int hash lookup (PUC getintfromhash). Key is
         // provably integer — skip Value construction + generic tag switch.
-        const node = ltable.nodeLookupInt(tbl.hash, ikey, self.hash_seed) orelse return false;
+        const node = ltable.nodeLookupInt(tbl.hash, ikey) orelse return false;
         return node.value != .Nil;
     }
 
@@ -37841,7 +37841,7 @@ pub const Vm = struct {
             // Two-arg form: main position in a table's hash array.
             const tbl = args[1].Table;
             if (tbl.hash.len > 0) {
-                const mp = ltable.mainPosition(tbl.hash.len, args[0], self.hash_seed);
+                const mp = ltable.mainPosition(tbl.hash.len, args[0]);
                 if (outs.len > 0) outs[0] = .{ .Int = @intCast(mp) };
             } else {
                 if (outs.len > 0) outs[0] = .{ .Int = 0 };

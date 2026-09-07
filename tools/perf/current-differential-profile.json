@@ -1,674 +1,171 @@
 {
+  "created_utc": "2026-09-07T18:14:40Z",
   "provenance": {
-    "task": "P16.24 T9: fresh post-correctness differential at HEAD 2c998b6",
-    "measured_source_head": "2c998b637815917f089b3399f48586200ded293b",
-    "git_head_short": "2c998b6",
-    "git_dirty": "clean (dedicated worktree /tmp/opencode/wt24; main tree untouched)",
+    "git_head": "d2ef0092ecb6de1adbe8cc6a63ba6f2db9e2e667",
+    "git_dirty": "6",
     "zig_version": "0.16.0",
-    "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "183c32b952d05261",
-    "puc_binary_sha16": "d54bc45e1757b216",
-    "pinning": "all runs taskset -c 0",
-    "measurement": {
-      "perf_stat": "taskset -c 0 perf stat -j -e cycles:u,instructions:u,branches:u,branch-misses:u,cache-misses:u,cache-references:u BIN tools/microbench.lua WL; median of 5 runs per workload per binary (driver /tmp/opencode/p1624_counters.py, raw /tmp/opencode/p1624_counters.json)",
-      "perf_record": "one session per combo: 30-50 consecutive isolated microbench runs wrapped in a single perf record -e cycles:u session under taskset -c 0 (wrapper /tmp/opencode/p1624_record.sh)",
-      "symbol_attribution": "perf report --stdio --no-children --percent-limit 0.1 (session-relative self shares)",
-      "line_attribution": "perf annotate --stdio -l; symbol-section summaries are SYMBOL-relative, converted to session % via symbol session share; est i/it = session_pct * workload zig instr/iter / 100 (tables /tmp/opencode/p1624_linetables.json)",
-      "puc_line_note": "PUC binary has no DWARF line info; PUC decomposed BY SYMBOL only"
-    },
-    "workload_ns": {
-      "lua_calls": 5000000,
-      "metamethod_call_noalloc": 500000,
-      "metamethod_add": 500000,
-      "coroutine_yield": 500000,
-      "hash_access": 5000000,
-      "field_access": 5000000,
-      "branch_loop": 50000000
-    },
-    "prior_artifact": "tools/perf/current-differential-profile.json (P16.23 T1 @ f05a766, zig sha dd14b4f80cbf06f4; lua_calls 675.1 / noalloc 847.8 / cy 3003.2 i/it)",
-    "p1624_note": "P16.24 T5/T6/T7 (C-boundary refactor: unified ccall model, caps removed, ownership invariant docs) changed NO hot-path code: all hot-path counters match the P16.23-era values within noise (lua_calls instructions identical to 4 significant digits)."
+    "note": "P16.29 T0.1 regeneration from P16.28-final source"
   },
   "workloads": {
     "lua_calls": {
-      "n": 5000000,
-      "zig": {
-        "instr_per_iter": 675.0902308,
-        "cycles_per_iter": 136.9963486,
-        "branches_per_iter": 105.4788268,
-        "branch_misses_per_iter": 0.0044382,
-        "ipc": 4.927797256634327
-      },
-      "puc": {
-        "instr_per_iter": 257.0987358,
-        "cycles_per_iter": 70.409719,
-        "branches_per_iter": 36.6802544,
-        "branch_misses_per_iter": 0.0037266,
-        "ipc": 3.6514665794930954
-      },
-      "zig_puc_instr_ratio": 2.6258014404441115,
-      "zig_minus_puc_instr_per_iter": 417.991495,
-      "prior_p1623_zig_instr_per_iter": 675.1,
-      "delta_vs_prior_pct": -0.0
+      "top_symbols": [
+        {
+          "symbol": "vm.Vm.runBytecodeDispatch",
+          "percent": 95.89
+        }
+      ],
+      "source_head": "d2ef0092ecb6de1adbe8cc6a63ba6f2db9e2e667"
     },
     "metamethod_call_noalloc": {
-      "n": 500000,
-      "zig": {
-        "instr_per_iter": 847.454738,
-        "cycles_per_iter": 171.450262,
-        "branches_per_iter": 130.639024,
-        "branch_misses_per_iter": 0.041512,
-        "ipc": 4.942860559758142
-      },
-      "puc": {
-        "instr_per_iter": 375.254018,
-        "cycles_per_iter": 71.500922,
-        "branches_per_iter": 57.74412,
-        "branch_misses_per_iter": 0.036052,
-        "ipc": 5.24824026744718
-      },
-      "zig_puc_instr_ratio": 2.2583495375124807,
-      "zig_minus_puc_instr_per_iter": 472.20072000000005,
-      "prior_p1623_zig_instr_per_iter": 847.8,
-      "delta_vs_prior_pct": -0.04
+      "top_symbols": [
+        {
+          "symbol": "vm.Vm.runBytecodeDispatch",
+          "percent": 69.35
+        }
+      ],
+      "source_head": "d2ef0092ecb6de1adbe8cc6a63ba6f2db9e2e667"
     },
     "metamethod_add": {
-      "n": 500000,
-      "zig": {
-        "instr_per_iter": 4846.657752,
-        "cycles_per_iter": 1249.730366,
-        "branches_per_iter": 744.572182,
-        "branch_misses_per_iter": 0.055968,
-        "ipc": 3.8781627492277804
-      },
-      "puc": {
-        "instr_per_iter": 2104.635042,
-        "cycles_per_iter": 477.402036,
-        "branches_per_iter": 427.410536,
-        "branch_misses_per_iter": 0.099186,
-        "ipc": 4.408517105695795
-      },
-      "zig_puc_instr_ratio": 2.30284949897741,
-      "zig_minus_puc_instr_per_iter": 2742.02271,
-      "prior_p1623_zig_instr_per_iter": 4871.2,
-      "delta_vs_prior_pct": -0.5
+      "top_symbols": [
+        {
+          "symbol": "vm.Vm.runBytecodeDispatch",
+          "percent": 22.64
+        },
+        {
+          "symbol": "heap.SmpAllocator.alloc",
+          "percent": 13.29
+        }
+      ],
+      "source_head": "d2ef0092ecb6de1adbe8cc6a63ba6f2db9e2e667"
     },
     "coroutine_yield": {
-      "n": 500000,
-      "zig": {
-        "instr_per_iter": 2992.79584,
-        "cycles_per_iter": 729.806786,
-        "branches_per_iter": 511.428008,
-        "branch_misses_per_iter": 0.042976,
-        "ipc": 4.100805716542077
-      },
-      "puc": {
-        "instr_per_iter": 997.417768,
-        "cycles_per_iter": 346.092642,
-        "branches_per_iter": 182.984994,
-        "branch_misses_per_iter": 3.065898,
-        "ipc": 2.8819386688954802
-      },
-      "zig_puc_instr_ratio": 3.000543940580774,
-      "zig_minus_puc_instr_per_iter": 1995.3780720000002,
-      "prior_p1623_zig_instr_per_iter": 3003.2,
-      "delta_vs_prior_pct": -0.35
+      "top_symbols": [
+        {
+          "symbol": "vm.Vm.runBytecodeDispatch",
+          "percent": 46.95
+        }
+      ],
+      "source_head": "d2ef0092ecb6de1adbe8cc6a63ba6f2db9e2e667"
     },
     "hash_access": {
-      "n": 5000000,
-      "zig": {
-        "instr_per_iter": 369.8658002,
-        "cycles_per_iter": 110.7884608,
-        "branches_per_iter": 55.612437,
-        "branch_misses_per_iter": 0.0942912,
-        "ipc": 3.3384866756809393
-      },
-      "puc": {
-        "instr_per_iter": 237.9088302,
-        "cycles_per_iter": 53.4026664,
-        "branches_per_iter": 41.7303602,
-        "branch_misses_per_iter": 0.0037544,
-        "ipc": 4.454999089708375
-      },
-      "zig_puc_instr_ratio": 1.554653519539688,
-      "zig_minus_puc_instr_per_iter": 131.95697,
-      "prior_p1623_zig_instr_per_iter": 369.9,
-      "delta_vs_prior_pct": -0.01
+      "top_symbols": [
+        {
+          "symbol": "vm.Vm.runBytecodeDispatch",
+          "percent": 99.71
+        }
+      ],
+      "source_head": "d2ef0092ecb6de1adbe8cc6a63ba6f2db9e2e667"
     },
     "field_access": {
-      "n": 5000000,
-      "zig": {
-        "instr_per_iter": 429.6605606,
-        "cycles_per_iter": 87.725542,
-        "branches_per_iter": 81.2388192,
-        "branch_misses_per_iter": 0.0042772,
-        "ipc": 4.897781772610763
-      },
-      "puc": {
-        "instr_per_iter": 232.8594586,
-        "cycles_per_iter": 44.5210984,
-        "branches_per_iter": 42.7404254,
-        "branch_misses_per_iter": 0.0036416,
-        "ipc": 5.230317017515453
-      },
-      "zig_puc_instr_ratio": 1.845149701812456,
-      "zig_minus_puc_instr_per_iter": 196.801102
+      "top_symbols": [
+        {
+          "symbol": "vm.Vm.runBytecodeDispatch",
+          "percent": 99.57
+        }
+      ],
+      "source_head": "d2ef0092ecb6de1adbe8cc6a63ba6f2db9e2e667"
     },
     "branch_loop": {
-      "n": 50000000,
-      "zig": {
-        "instr_per_iter": 259.81310912,
-        "cycles_per_iter": 79.18460872,
-        "branches_per_iter": 34.88891266,
-        "branch_misses_per_iter": 0.000635,
-        "ipc": 3.2811061811103936
-      },
-      "puc": {
-        "instr_per_iter": 141.05191742,
-        "cycles_per_iter": 41.16883482,
-        "branches_per_iter": 23.76704294,
-        "branch_misses_per_iter": 0.00041722,
-        "ipc": 3.426181917382718
-      },
-      "zig_puc_instr_ratio": 1.8419679354402072,
-      "zig_minus_puc_instr_per_iter": 118.76119169999998,
-      "prior_p1623_zig_instr_per_iter": 259.8,
-      "delta_vs_prior_pct": 0.01
-    }
-  },
-  "decompositions": {
-    "lua_calls": {
-      "zig_total_instr_per_iter": 675.0902308,
-      "puc_total_instr_per_iter": 257.0987358,
-      "zig": {
-        "runBytecodeDispatch_session_share": 83.82,
-        "components": {
-          "dispatch_core": {
-            "lines": "switch 13464, gate 13264, fetch 13242, decode 13244/13245, pc+=1 15348, dispatch_pc 13260",
-            "session_pct_listed": 19.42,
-            "est_instr_per_iter_listed": 131.1,
-            "below_threshold_est_sess": 2.6,
-            "est_instr_per_iter_total": 148.7,
-            "puc_equivalent_i_per_iter": 29.5,
-            "gap_i_per_iter": 119.2
-          },
-          "opReturn_completion_fast_arm": {
-            "lines": "parent checks 15637/15646, nresults arm 15653, src_val 15663, dst 15664, pop 15672, single-copy store 15678, tbc 15603",
-            "session_pct_listed": 14.07,
-            "est_instr_per_iter_listed": 94.8,
-            "note": "src_val read 15663 alone = 50.0 i/it (7.41 sess); store 15678 = 13.0"
-          },
-          "opCall_inline_path": {
-            "lines": "callee fetch 14985, proto 14990, nresults 14992, nargs 14993, child_nextra 14999",
-            "session_pct_listed": 7.18,
-            "est_instr_per_iter_listed": 48.3,
-            "note": "child_nextra vararg computation 14999 alone = 24.8 i/it"
-          },
-          "frame_loop_entry": {
-            "lines": "pending check 13146, cur_upvalues reload 13179/13180, base/cap 13183/13184, pc 13191",
-            "session_pct_listed": 7.63,
-            "est_instr_per_iter_listed": 47.6,
-            "below_threshold_est_sess": 1.5,
-            "est_instr_per_iter_total": 58.1,
-            "entries_per_iteration": 2,
-            "est_i_per_entry": 29.1,
-            "note": "includes pending-call check 13146 (10.6 i/it) which was below-threshold in the P16.23 line set; without it ~47 i/it matches prior 49"
-          },
-          "upvalue_fetch_getupval": {
-            "lines": "getupval 13548 + Cell.get isOpen 703/705",
-            "session_pct_listed": 7.72,
-            "est_instr_per_iter_listed": 52.1
-          },
-          "pushStagedBytecodeExecFrame_symbol": {
-            "session_pct": 10.16,
-            "est_instr_per_iter": 68.6,
-            "internal_hot_lines": [
-              {
-                "line": "vm.zig:0",
-                "session_pct": 1.97,
-                "est_i_per_iter": 13.3
-              },
-              {
-                "line": "vm.zig:12155 (fn entry)",
-                "session_pct": 1.52,
-                "est_i_per_iter": 10.3
-              },
-              {
-                "line": "vm.zig:12199 (nextra vararg)",
-                "session_pct": 1.09,
-                "est_i_per_iter": 7.4
-              },
-              {
-                "line": "vm.zig:12298 (addOne)",
-                "session_pct": 0.81,
-                "est_i_per_iter": 5.5
-              },
-              {
-                "line": "vm.zig:12357 (hooks gate)",
-                "session_pct": 0.79,
-                "est_i_per_iter": 5.4
-              },
-              {
-                "line": "vm.zig:1277 (encodeNresults)",
-                "session_pct": 0.77,
-                "est_i_per_iter": 5.2
-              },
-              {
-                "line": "vm.zig:12319 (activation_id)",
-                "session_pct": 0.76,
-                "est_i_per_iter": 5.1
-              },
-              {
-                "line": "vm.zig:12257 (stack_top)",
-                "session_pct": 0.69,
-                "est_i_per_iter": 4.7
-              },
-              {
-                "line": "vm.zig:12204 (is_vahid)",
-                "session_pct": 0.57,
-                "est_i_per_iter": 3.8
-              }
-            ]
-          },
-          "syncFrame_symbol": {
-            "session_pct": 3.74,
-            "est_instr_per_iter": 25.2
-          },
-          "FrameStack_addOne_symbol": {
-            "session_pct": 1.52,
-            "est_instr_per_iter": 10.3
-          }
-        }
-      },
-      "puc": {
-        "top_symbols": [
-          {
-            "symbol": "luaV_execute",
-            "session_pct": 77.99,
-            "est_i_per_iter": 200.5
-          },
-          {
-            "symbol": "luaD_precall",
-            "session_pct": 21.21,
-            "est_i_per_iter": 54.5
-          }
-        ]
-      }
-    },
-    "metamethod_call_noalloc": {
-      "zig_total_instr_per_iter": 847.454738,
-      "puc_total_instr_per_iter": 375.254018,
-      "zig": {
-        "runBytecodeDispatch_session_share": 60.15,
-        "components": {
-          "opReturn_simple_result_fast_arm": {
-            "lines": "arm checks 15696/15700, src_val 15705, single-copy store 15717, reg_top 15718",
-            "session_pct_listed": 11.46,
-            "est_instr_per_iter_listed": 97.1,
-            "below_threshold_est_sess": 1.5,
-            "est_instr_per_iter_total": 109.8,
-            "note": "store line 15717 alone = 78.1 i/it (9.22 sess) \u2014 the 16-byte Value copy emitted as partially byte-wise stores dominates"
-          },
-          "metamethod_lookup_cluster": {
-            "lines": "getTmByObj symbol 10.27 sess (ltable.zig:2400 20.5 i/it, 35521/35530 arith dispatch, ltable.zig:719/725 node walk) + tryPushSimpleResultMetamethod 6.71 sess",
-            "session_pct": 16.98,
-            "est_instr_per_iter": 143.9,
-            "puc_equivalent_i_per_iter": 78.9,
-            "puc_equivalent_note": "luaT_gettmbyobj 2.53 + luaH_Hgetshortstr 7.81 + callbinTM 6.31 + luaT_trybinTM 4.38 = 21.03 sess"
-          },
-          "stageBytecodeCall_inlined": {
-            "inlined_into": "vm.Vm.pushResolvedBytecodeClosure__anon_61945",
-            "lines": {
-              "12125 needed-cap calc": 5.0,
-              "12129 callee Nil store": 0.6,
-              "12133 args copy loop (2 args)": 15.2,
-              "12134 loop body": 3.9
-            },
-            "session_pct_listed": 2.79,
-            "est_instr_per_iter": 24.7,
-            "note": "pushResolvedBytecodeClosure__anon_61945 total 6.18 sess / 52.4 i/it; the rest is closure resolution (8224 entry 11.2, 8304 activation hook 2.5, 1509 flags 6.3, 1790 getPtr 3.7)"
-          },
-          "pushStagedBytecodeExecFrame_symbol": {
-            "session_pct": 8.41,
-            "est_instr_per_iter": 71.3
-          },
-          "dispatch_core": {
-            "lines": "switch 13464 37.1, gate 13264 6.4, fetch 13242 16.5, decode 13244 11.7, pc+=1 15348 11.8, dispatch_pc 13260 9.6",
-            "session_pct_listed": 10.98,
-            "est_instr_per_iter_listed": 93.1
-          }
-        }
-      },
-      "puc": {
-        "top_symbols": [
-          {
-            "symbol": "luaV_execute",
-            "session_pct": 42.54,
-            "est_i_per_iter": 159.6
-          },
-          {
-            "symbol": "luaD_precall",
-            "session_pct": 15.89,
-            "est_i_per_iter": 59.6
-          },
-          {
-            "symbol": "luaT_callTMres",
-            "session_pct": 9.0,
-            "est_i_per_iter": 33.8
-          },
-          {
-            "symbol": "luaH_Hgetshortstr",
-            "session_pct": 7.81,
-            "est_i_per_iter": 29.3
-          },
-          {
-            "symbol": "callbinTM",
-            "session_pct": 6.31,
-            "est_i_per_iter": 23.7
-          },
-          {
-            "symbol": "luaD_call",
-            "session_pct": 4.51,
-            "est_i_per_iter": 16.9
-          },
-          {
-            "symbol": "luaT_trybinTM",
-            "session_pct": 4.38,
-            "est_i_per_iter": 16.4
-          },
-          {
-            "symbol": "luaT_gettmbyobj",
-            "session_pct": 2.53,
-            "est_i_per_iter": 9.5
-          },
-          {
-            "symbol": "getintfromhash",
-            "session_pct": 1.0,
-            "est_i_per_iter": 3.8
-          }
-        ]
-      }
-    },
-    "coroutine_yield": {
-      "zig_total_instr_per_iter": 2992.79584,
-      "puc_total_instr_per_iter": 997.417768,
-      "zig": {
-        "runBytecodeDispatch_session_share": 60.93,
-        "components": {
-          "string_key_lookup_cluster": {
-            "lines": "GETTABUP 13553/13554/13562 (env fetch+key+metatable-null check) + GETFIELD 13711/13712 + nodeLookupStr ltable.zig:594/585 + isEmpty ltable.zig:125 + isShort vm.zig:2400 + Cell.get vm.zig:703",
-            "session_pct_listed": 22.39,
-            "est_instr_per_iter_listed": 670.0,
-            "puc_equivalent_i_per_iter": 250.4,
-            "puc_equivalent_note": "luaH_getshortstr 25.10 sess",
-            "ratio_vs_puc": 2.68
-          },
-          "builtin_resume_yield_cluster": {
-            "lines": "builtinCoroutineResume 11.57 sess + builtinCoroutineYield 6.32 sess",
-            "session_pct": 17.89,
-            "est_instr_per_iter": 535.4,
-            "puc_equivalent_i_per_iter": 267.3,
-            "puc_equivalent_note": "lua_resume 10.12 + auxresume 8.50 + luaB_coresume 7.02 + resume 1.16 = 26.80 sess"
-          },
-          "runtime_switch_cluster": {
-            "lines": "switchRuntime 4.35 sess (4577 active-thread check 28.4 i/it, 4548/4553 bc_boxed handoff) + runBytecodeInternal 2.04 sess (1785 resume_in_place, 1792 getPtr)",
-            "session_pct": 6.39,
-            "est_instr_per_iter": 191.2,
-            "puc_equivalent_note": "no direct PUC equivalent \u2014 PUC pays setjmp/longjmp (luaD_rawrunprotected 0.97 sess) instead"
-          },
-          "opcall_builtin_path": {
-            "lines": "growCtxFrame 1.52 + coroutineBuiltinFastPathEligible 1.82 + tryPushBytecodeProtectedCall 1.07 + callCoroutineBuiltinDirect 1.38 + builtinOutLen 1.01",
-            "session_pct": 6.8,
-            "est_instr_per_iter": 203.5
-          },
-          "stack_shuffle_residue": {
-            "lines": "memcpy 0.98 + InlineValues.setFrom 0.85 + condGcFromDispatch 0.99",
-            "session_pct": 2.82,
-            "est_instr_per_iter": 84.4
-          },
-          "dispatch_core_in_rbd": {
-            "lines": "switch 13464 86.4, gate 13264 19.9, fetch 13242 28.8, decode 13244 21.2, dispatch_pc 13260 23.2",
-            "session_pct_listed": 5.99,
-            "est_instr_per_iter_listed": 179.5
-          }
-        }
-      },
-      "puc": {
-        "top_symbols": [
-          {
-            "symbol": "luaH_getshortstr",
-            "session_pct": 25.1,
-            "est_i_per_iter": 250.4
-          },
-          {
-            "symbol": "luaV_execute",
-            "session_pct": 20.83,
-            "est_i_per_iter": 207.8
-          },
-          {
-            "symbol": "lua_resume",
-            "session_pct": 10.12,
-            "est_i_per_iter": 100.9
-          },
-          {
-            "symbol": "auxresume",
-            "session_pct": 8.5,
-            "est_i_per_iter": 84.8
-          },
-          {
-            "symbol": "luaB_coresume",
-            "session_pct": 7.02,
-            "est_i_per_iter": 70.0
-          },
-          {
-            "symbol": "lua_xmove",
-            "session_pct": 3.74,
-            "est_i_per_iter": 37.3
-          },
-          {
-            "symbol": "luaD_precall",
-            "session_pct": 2.66,
-            "est_i_per_iter": 26.5
-          },
-          {
-            "symbol": "lua_rotate",
-            "session_pct": 2.62,
-            "est_i_per_iter": 26.1
-          },
-          {
-            "symbol": "lua_checkstack",
-            "session_pct": 2.56,
-            "est_i_per_iter": 25.5
-          },
-          {
-            "symbol": "lua_pushboolean",
-            "session_pct": 1.91,
-            "est_i_per_iter": 19.1
-          },
-          {
-            "symbol": "luaD_poscall",
-            "session_pct": 1.89,
-            "est_i_per_iter": 18.9
-          },
-          {
-            "symbol": "resume",
-            "session_pct": 1.16,
-            "est_i_per_iter": 11.6
-          }
-        ]
-      }
-    }
-  },
-  "answers": {
-    "A_opReturn_completion_noalloc": {
-      "current_est_i_per_iter": 109.8,
-      "listed_lines_sess": 11.46,
-      "listed_i_per_iter": 97.1,
-      "below_threshold_est_sess": 1.5,
-      "dominant_line": "src/lua/vm.zig:15717 (simple_result single-copy store) = 9.22 sess = 78.1 i/it alone",
-      "prior_claim": "114 i/it (P16.23 @ f05a766; store line 15521 was 79.2 i/it)",
-      "verdict": "CONFIRMED UNCHANGED: ~110 i/it (12.9 sess of 847.5) vs prior 114 \u2014 within attribution noise. Store sequence still dominates (78 i/it alone); surrounding arm checks add ~32."
-    },
-    "B_frame_loop_entry_lua_calls": {
-      "listed_lines_sess": 7.63,
-      "listed_i_per_iter": 47.6,
-      "below_threshold_est_sess": 1.5,
-      "total_est_i_per_iter": 58.1,
-      "entries_per_iteration": 2,
-      "est_i_per_entry": 29.1,
-      "prior": "5.8 sess listed / 49 i/it total (~25 per entry) at f05a766",
-      "verdict": "ESSENTIALLY UNCHANGED: excluding the pending-call check 13146 (10.6 i/it, below threshold in the P16.23 line set) the entry cost is ~47 i/it (~24/entry) vs prior 49/25; including it explicitly, 58 i/it (29/entry). The pending check + cur_upvalues reload + 6-field ctx reload structure is identical.",
-      "line_detail": {
-        "13146 pending-call check": 10.6,
-        "13179 cur_upvalues reload": 19.1,
-        "13180": 3.1,
-        "13183 base/cap": 8.9,
-        "13184": 4.5,
-        "13191 pc": 6.3
-      }
-    },
-    "C_pushStagedBytecodeExecFrame": {
-      "lua_calls_session_pct": 10.16,
-      "lua_calls_i_per_iter": 68.6,
-      "noalloc_session_pct": 8.41,
-      "noalloc_i_per_iter": 71.3,
-      "internal_hot_lines_lc": [
+      "top_symbols": [
         {
-          "line": "vm.zig:0 (no-line region)",
-          "session_pct": 1.97,
-          "est_i_per_iter": 13.3
+          "symbol": "vm.Vm.runBytecodeDispatch",
+          "percent": 99.96
         },
         {
-          "line": "vm.zig:12155 (fn entry/prologue)",
-          "session_pct": 1.52,
-          "est_i_per_iter": 10.3
+          "symbol": "vm.Vm.rawSet",
+          "percent": 0.02
         },
         {
-          "line": "vm.zig:12199 (nextra vararg computation)",
-          "session_pct": 1.09,
-          "est_i_per_iter": 7.4
+          "symbol": "hash_map.HashMapUnmanaged([]const",
+          "percent": 0.0
         },
         {
-          "line": "vm.zig:12298 (exec_frames.addOne)",
-          "session_pct": 0.81,
-          "est_i_per_iter": 5.5
+          "symbol": "bytecode.ProtoBuilder.internString",
+          "percent": 0.0
         },
         {
-          "line": "vm.zig:12357 (hooks gate)",
-          "session_pct": 0.79,
-          "est_i_per_iter": 5.4
+          "symbol": "lexer.Lexer.next",
+          "percent": 0.0
         },
         {
-          "line": "vm.zig:1277 (encodeNresults)",
-          "session_pct": 0.77,
-          "est_i_per_iter": 5.2
+          "symbol": "vm.Vm.tableResize",
+          "percent": 0.0
         },
         {
-          "line": "vm.zig:12319 (activation_id read)",
-          "session_pct": 0.76,
-          "est_i_per_iter": 5.1
+          "symbol": "hash.wyhash.Wyhash.hash",
+          "percent": 0.0
         },
         {
-          "line": "vm.zig:12257 (bc_stack_top store)",
-          "session_pct": 0.69,
-          "est_i_per_iter": 4.7
+          "symbol": "vm.Vm.gcRegisterObject",
+          "percent": 0.0
         },
         {
-          "line": "vm.zig:12204 (is_vahid)",
-          "session_pct": 0.57,
-          "est_i_per_iter": 3.8
+          "symbol": "0x000000000000b20f",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x00000000000a4dc5",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x000000000002961e",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x0000000000028ca7",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x000000000000af15",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x0000000000029691",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x0000000000019ca1",
+          "percent": 0.0
         }
       ],
-      "prior": "9.71 sess / 65.6 i/it (lua_calls), 7.96 / 67.5 (noalloc) at f05a766",
-      "verdict": "UNCHANGED within noise: ~69 i/it lua_calls (was 65.6), ~71 noalloc (was 67.5). Same internal line ranking (no-line region, nextra, addOne, encodeNresults, activation_id, is_vahid)."
+      "source_head": "d2ef0092ecb6de1adbe8cc6a63ba6f2db9e2e667"
     },
-    "D_stageBytecodeCall": {
-      "on_lua_calls_path": "NO \u2014 OP_CALL inline fast path (callee+args already in caller registers, zero-copy); stageBytecodeCall not invoked",
-      "noalloc_inlined_into": "vm.Vm.pushResolvedBytecodeClosure__anon_61945 (anon id shifted 61927 -> 61945 with P16.24 source additions)",
-      "noalloc_lines_sess": 2.79,
-      "noalloc_i_per_iter": 24.7,
-      "lines": {
-        "12125 needed-cap calc": 5.0,
-        "12129 callee Nil store": 0.6,
-        "12133 args copy loop (2 args)": 15.2,
-        "12134 loop body": 3.9
-      },
-      "prior": "3.34 sess / 24.9 i/it at f05a766 (lines 11929-11938)",
-      "verdict": "UNCHANGED: ~25 i/it per metamethod invocation (was 24.9)."
-    },
-    "E_dispatch_pc_publish_line": {
-      "line": "src/lua/vm.zig:13260 (self.dispatch_pc = ctx.pc)",
-      "lua_calls": {
-        "session_pct": 0.67,
-        "i_per_iter": 4.5
-      },
-      "noalloc": {
-        "session_pct": 1.13,
-        "i_per_iter": 9.6
-      },
-      "coroutine_yield": {
-        "session_pct": 0.77,
-        "i_per_iter": 23.2
-      },
-      "prior_lua_calls": "0.62 sess (~4.2 i/it) at f05a766",
-      "verdict": "UNCHANGED: same store, same magnitude; small share shifts are sample redistribution across adjacent fetch/decode instructions."
-    },
-    "F_dispatch_core_total": {
-      "definition": "switch 13464 + gate 13264 + fetch 13242 + decode 13244/13245 + pc+=1 15348 + dispatch_pc 13260 (lua_calls)",
-      "listed_sess": 19.42,
-      "listed_i_per_iter": 131.1,
-      "below_threshold_est_sess": 2.6,
-      "total_est_sess": 22.02,
-      "total_est_i_per_iter": 148.7,
-      "prior_claim": "21.19 sess / 143.0 i/it at f05a766 => +113 i/it over PUC ~29.5",
-      "puc_equivalent_i_per_iter": 29.5,
-      "gap_i_per_iter": 119.2,
-      "core_line_comparison": {
-        "switch_13464": {
-          "prior_sess": 5.49,
-          "now_sess": 6.08
+    "global_arith": {
+      "top_symbols": [
+        {
+          "symbol": "vm.Vm.runBytecodeDispatch",
+          "percent": 99.95
         },
-        "gate_13264": {
-          "prior_sess": 2.62,
-          "now_sess": 2.83
+        {
+          "symbol": "ltable.nodeInsert",
+          "percent": 0.03
         },
-        "fetch_13242": {
-          "prior_sess": 2.17,
-          "now_sess": 2.36
+        {
+          "symbol": "compiler_rt.memcpy.memcpyFast",
+          "percent": 0.0
         },
-        "pc_advance_15348": {
-          "prior_sess": 4.0,
-          "now_sess": 3.82
+        {
+          "symbol": "heap.SmpAllocator.alloc",
+          "percent": 0.0
         },
-        "dispatch_pc_13260": {
-          "prior_sess": 0.62,
-          "now_sess": 0.67
+        {
+          "symbol": "codegen_bc.Codegen.compileChildFunction",
+          "percent": 0.0
         },
-        "decode_13244_13245": {
-          "prior_sess": 3.7,
-          "now_sess": 3.67
+        {
+          "symbol": "codegen_bc.Codegen.ensureUpvalue",
+          "percent": 0.0
+        },
+        {
+          "symbol": "vm.Vm.gcRegisterObject",
+          "percent": 0.0
+        },
+        {
+          "symbol": "compiler_rt.memset",
+          "percent": 0.0
         }
-      },
-      "verdict": "UNCHANGED within attribution noise: core ~22.0 sess = ~149 i/it => ~+119 i/it over PUC (prior 143.0/+113). The +6 i/it is switch-line attribution (5.49 -> 6.08 sess) offset by pc_advance (4.00 -> 3.82) \u2014 sample redistribution across adjacent dispatch instructions, not a semantic change; total lua_calls instructions are identical to the prior era (675.1 i/it). The dispatch core remains ~5x PUC per-op dispatch cost and the largest single lua_calls gap component after opReturn completion."
-    },
-    "G_coroutine_yield_dominators": {
-      "zig_total_i_per_iter": 2992.79584,
-      "puc_total_i_per_iter": 997.417768,
-      "stringkey_cluster_i_per_iter": 670.0,
-      "stringkey_cluster_sess": 22.39,
-      "stringkey_vs_puc_getshortstr_ratio": 2.68,
-      "ranked": [
-        "1. string-key lookup cluster (GETTABUP 13553/13554/13562 + GETFIELD 13711/13712 + nodeLookupStr ltable.zig:594/585 + isEmpty ltable.zig:125 + isShort vm.zig:2400 + Cell.get 703): 22.39 sess = 670 i/it \u2014 still the #1 dominator; PUC luaH_getshortstr = 250.4 i/it (2.67x)",
-        "2. builtinCoroutineResume 11.57 sess / 345.9 i/it + builtinCoroutineYield 6.32 / 189.1 \u2014 resume/yield builtin bodies; PUC resume-machinery cluster (lua_resume+auxresume+luaB_coresume+resume) = 26.80 sess / 267.3 i/it",
-        "3. switchRuntime 4.35 sess / 130.2 i/it + runBytecodeInternal 2.04 / 61.1 \u2014 park/activate runtime; PUC pays setjmp/longjmp (luaD_rawrunprotected 0.97 sess) instead",
-        "4. opCall builtin-path overhead: coroutineBuiltinFastPathEligible 1.82 / 54.5, growCtxFrame 1.52 / 45.5, callCoroutineBuiltinDirect 1.38 / 41.3, tryPushBytecodeProtectedCall 1.07 / 32.0, builtinOutLen 1.01 / 30.2",
-        "5. stack shuffle residue: memcpy 0.98 / 29.3 + InlineValues.setFrom 0.85 / 25.4 + condGcFromDispatch 0.99 / 29.6; dispatch core inside rbd 5.99 sess / 179.5"
       ],
-      "vs_prior": "string-key cluster 733 -> 670 i/it (-8.6%, proportional to total drop 3003.2 -> 2992.8 plus sample redistribution); builtin cluster resume 10.91 -> 11.57, yield 5.23 -> 6.32 sess (redistribution within unchanged code); ranking unchanged.",
-      "branch_note": "zig branch-misses ~0.05/iter vs PUC ~3.1/iter (setjmp/longjmp + stack shuffle) \u2014 zig wins mispredicts ~60x, loses total instructions 3.0x."
+      "source_head": "d2ef0092ecb6de1adbe8cc6a63ba6f2db9e2e667"
     }
-  },
-  "c_boundary_refactor_verdict": {
-    "expected": "no hot-path changes (cold paths only)",
-    "observed": "CONFIRMED NO: lua_calls zig 3.3755G instructions identical (675.1 i/it both eras); noalloc 423.7M (847.5 vs 847.8, -0.04%); coroutine_yield 1496.4M (2992.8 vs 3003.2, -0.35%, within run noise); metamethod_add -0.5%; hash_access/branch_loop identical. Hot-line ranking and component magnitudes unchanged (A-G all within noise of P16.23 values)."
   }
 }

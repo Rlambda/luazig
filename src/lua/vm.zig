@@ -13452,9 +13452,6 @@ pub const Vm = struct {
             while (ctx.pc < ctx.cur_proto.code.len) {
                 const inst = ctx.cur_proto.code[ctx.pc];
                 const op: bc.Op = @enumFromInt(inst.op);
-                const a = inst.a;
-                const b = inst.b;
-                const c = inst.c;
 
                 // P16.0b: default-off instruction histogram. When disabled
                 // this is one L1 byte-load + predictable not-taken branch
@@ -13716,53 +13713,53 @@ pub const Vm = struct {
                         // Conclusion: the entire hasOpenUpvalues() slow path is
                         // unnecessary. OP_MOVE is a plain TValue copy, exactly
                         // matching PUC's setobjs2s(L, ra, RB(i)).
-                        ctx.regs[a] = ctx.regs[b];
+                        ctx.regs[inst.a] = ctx.regs[inst.b];
                     },
                     .loadk => {
-                        const kid: u32 = b;
-                        ctx.regs[a] = ctx.cur_proto.resolved_values[kid];
+                        const kid: u32 = inst.b;
+                        ctx.regs[inst.a] = ctx.cur_proto.resolved_values[kid];
                     },
                     .loadkx => {
                         // Next instruction is EXTRAARG with the constant index.
                         ctx.pc += 1;
                         const extra = ctx.cur_proto.code[ctx.pc];
                         const kid: u32 = extra.extraArg();
-                        ctx.regs[a] = ctx.cur_proto.resolved_values[kid];
+                        ctx.regs[inst.a] = ctx.cur_proto.resolved_values[kid];
                     },
                     .loadi => {
                         // 17-bit sBx: k=bit16, b=low8, c=high8.
                         // OFFSET_sBx = 65535 (PUC MAXARG_sBx >> 1).
-                        const bits: u17 = @as(u17, b) | (@as(u17, c) << 8) | (@as(u17, inst.k) << 16);
+                        const bits: u17 = @as(u17, inst.b) | (@as(u17, inst.c) << 8) | (@as(u17, inst.k) << 16);
                         const signed: i32 = @as(i32, @intCast(bits)) - 65535;
-                        ctx.regs[a] = .{ .Int = signed };
+                        ctx.regs[inst.a] = .{ .Int = signed };
                     },
                     .loadf => {
-                        const bits: u17 = @as(u17, b) | (@as(u17, c) << 8) | (@as(u17, inst.k) << 16);
+                        const bits: u17 = @as(u17, inst.b) | (@as(u17, inst.c) << 8) | (@as(u17, inst.k) << 16);
                         const signed: f64 = @floatFromInt(@as(i32, @intCast(bits)) - 65535);
-                        ctx.regs[a] = .{ .Num = signed };
+                        ctx.regs[inst.a] = .{ .Num = signed };
                     },
                     .loadnil => {
                         var i: u8 = 0;
-                        while (i <= b) : (i += 1) ctx.regs[a + i] = .Nil;
+                        while (i <= inst.b) : (i += 1) ctx.regs[inst.a + i] = .Nil;
                     },
-                    .loadtrue => ctx.regs[a] = .{ .Bool = true },
-                    .loadfalse => ctx.regs[a] = .{ .Bool = false },
+                    .loadtrue => ctx.regs[inst.a] = .{ .Bool = true },
+                    .loadfalse => ctx.regs[inst.a] = .{ .Bool = false },
                     .lfalseskip => {
                         // PUC 5.5 OP_LFALSESKIP: load false, then skip the next
                         // instruction. Used for boolean expression folding.
                         // The default ctx.pc += 1 after the switch advances past
                         // this instruction; the extra += 1 here skips the next.
-                        ctx.regs[a] = .{ .Bool = false };
+                        ctx.regs[inst.a] = .{ .Bool = false };
                         ctx.pc += 1;
                     },
 
-                    .getupval => ctx.regs[a] = ctx.cur_upvalues[b].get(self),
-                    .setupval => try self.gcStoreCellValue(ctx.cur_upvalues[b], ctx.regs[a]),
+                    .getupval => ctx.regs[inst.a] = ctx.cur_upvalues[inst.b].get(self),
+                    .setupval => try self.gcStoreCellValue(ctx.cur_upvalues[inst.b], ctx.regs[inst.a]),
 
                     .gettabup => {
                         // R[A] = UpVal[B][K[C]]
-                        const env = ctx.cur_upvalues[b].get(self);
-                        const key = ctx.cur_proto.resolved_values[c];
+                        const env = ctx.cur_upvalues[inst.b].get(self);
+                        const key = ctx.cur_proto.resolved_values[inst.c];
                         // P15.38a: PUC luaV_fastget fast path. If env is a table
                         // without metatable, do a single rawGet instead of the
                         // double lookup (tryPushBytecodeIndexMetamethod probe +
@@ -13782,9 +13779,9 @@ pub const Vm = struct {
                             // guaranteed) short constant key; long keys (our
                             // codegen allows >40B names) keep content equality.
                             const node = ltable.nodeLookupShortStrIdentity(env.Table.hash, key.String);
-                            ctx.regs[a] = if (node) |nd| nd.value else .Nil;
+                            ctx.regs[inst.a] = if (node) |nd| nd.value else .Nil;
                         } else {
-                            if (try self.bytecodeGetIndex(exec_frames, &ctx, env, key, a, 0, false)) {
+                            if (try self.bytecodeGetIndex(exec_frames, &ctx, env, key, inst.a, 0, false)) {
                                 continue :frame_loop;
                             }
                         }
@@ -13792,15 +13789,15 @@ pub const Vm = struct {
                     .settabup => {
                         // UpVal[A][K[B]] = RK[C]
                         // PUC 5.5 k-bit: k=0 → R[C], k=1 → K[C] (constant pool).
-                        const env = ctx.cur_upvalues[a].get(self);
-                        const key = ctx.cur_proto.resolved_values[b];
-                        const val = if (inst.k == 1) ctx.cur_proto.resolved_values[c] else ctx.regs[c];
+                        const env = ctx.cur_upvalues[inst.a].get(self);
+                        const key = ctx.cur_proto.resolved_values[inst.b];
+                        const val = if (inst.k == 1) ctx.cur_proto.resolved_values[inst.c] else ctx.regs[inst.c];
                         // When the upvalue is nil/non-table, include the
                         // upvalue name in the error message (like GETUPVAL+
                         // SETFIELD does via debugBytecodeOperandName).
                         if (env != .Table) {
-                            const upv_name = if (a < ctx.cur_proto.upvalues.len)
-                                ctx.cur_proto.upvalues[a].name()
+                            const upv_name = if (inst.a < ctx.cur_proto.upvalues.len)
+                                ctx.cur_proto.upvalues[inst.a].name()
                             else
                                 "";
                             const tn = switch (env) {
@@ -13852,8 +13849,8 @@ pub const Vm = struct {
 
                     .gettable => {
                         // R[A] = R[B][R[C]] — may trigger __index metamethod.
-                        const obj = ctx.regs[b];
-                        const key = ctx.regs[c];
+                        const obj = ctx.regs[inst.b];
+                        const key = ctx.regs[inst.c];
                         // Fast path: table without metatable. For integer
                         // keys in array range, direct array access (PUC
                         // ikeyinarray). For Int (non-array) and String keys,
@@ -13865,66 +13862,66 @@ pub const Vm = struct {
                                 if (self.stats.enabled) self.stats.tbl_get_fast_int += 1; // P16.0b
                                 const arr_len: i64 = @intCast(tbl.asize);
                                 if (key.Int <= arr_len) {
-                                    ctx.regs[a] = tbl.array[@intCast(key.Int - 1)];
+                                    ctx.regs[inst.a] = tbl.array[@intCast(key.Int - 1)];
                                 } else {
                                     // P16.6: specialized int hash lookup (PUC
                                     // getintfromhash, ltable.c:929-942). Key is
                                     // provably .Int — skip Value construction
                                     // and the generic keyMatches tag switch.
-                                    ctx.regs[a] = if (ltable.nodeLookupInt(tbl.hash, key.Int, self.hash_seed)) |node|
+                                    ctx.regs[inst.a] = if (ltable.nodeLookupInt(tbl.hash, key.Int, self.hash_seed)) |node|
                                         node.value
                                     else
                                         .Nil;
                                 }
                             } else if (key == .String) {
                                 if (self.stats.enabled) self.stats.tbl_get_fast_str += 1; // P16.0b
-                                ctx.regs[a] = if (ltable.nodeLookupStr(tbl.hash, key.String)) |node|
+                                ctx.regs[inst.a] = if (ltable.nodeLookupStr(tbl.hash, key.String)) |node|
                                     node.value
                                 else
                                     .Nil;
                             } else {
-                                ctx.regs[a] = self.rawGet(tbl, key);
+                                ctx.regs[inst.a] = self.rawGet(tbl, key);
                             }
                         } else {
-                            if (try self.bytecodeGetIndex(exec_frames, &ctx, obj, key, a, b, true)) {
+                            if (try self.bytecodeGetIndex(exec_frames, &ctx, obj, key, inst.a, inst.b, true)) {
                                 continue :frame_loop;
                             }
                         }
                     },
                     .geti => {
                         // R[A] = R[B][C]  (integer key)
-                        const obj = ctx.regs[b];
+                        const obj = ctx.regs[inst.b];
                         // Fast path: table without metatable, key in array
                         // range — direct array access, no function call.
                         // Mirrors PUC luaH_getint's ikeyinarray fast path
                         // (checkrange: (k-1) < asize), which C compilers inline.
                         if (obj == .Table and obj.Table.metatable == null) {
                             const tbl = obj.Table;
-                            const k: usize = c; // c is u8, 1-based
+                            const k: usize = inst.c; // c is u8, 1-based
                             if (k >= 1 and k <= tbl.asize) {
                                 if (self.stats.enabled) self.stats.tbl_get_fast_int += 1; // P16.0b
-                                ctx.regs[a] = tbl.array[k - 1];
+                                ctx.regs[inst.a] = tbl.array[k - 1];
                             } else {
                                 // P16.6: specialized int hash lookup (PUC
                                 // getintfromhash). Key is provably .Int (c is
                                 // u8, 1-based) and outside array range — skip
                                 // rawGet's switch + redundant array check.
-                                ctx.regs[a] = if (ltable.nodeLookupInt(tbl.hash, @intCast(c), self.hash_seed)) |node|
+                                ctx.regs[inst.a] = if (ltable.nodeLookupInt(tbl.hash, @intCast(inst.c), self.hash_seed)) |node|
                                     node.value
                                 else
                                     .Nil;
                             }
                         } else {
-                            const key: Value = .{ .Int = @intCast(c) };
-                            if (try self.bytecodeGetIndex(exec_frames, &ctx, obj, key, a, b, true)) {
+                            const key: Value = .{ .Int = @intCast(inst.c) };
+                            if (try self.bytecodeGetIndex(exec_frames, &ctx, obj, key, inst.a, inst.b, true)) {
                                 continue :frame_loop;
                             }
                         }
                     },
                     .getfield => {
                         // R[A] = R[B][K[C]]  (string key)
-                        const obj = ctx.regs[b];
-                        const key = ctx.cur_proto.resolved_values[c];
+                        const obj = ctx.regs[inst.b];
+                        const key = ctx.cur_proto.resolved_values[inst.c];
                         if (obj == .Table and obj.Table.metatable == null) {
                             // Inline rawGet fast path: direct nodeLookup.
                             // rawGet's switch on key type is unnecessary —
@@ -13936,9 +13933,9 @@ pub const Vm = struct {
                             // P16.26 C2: PUC luaH_getshortstr identity walk
                             // (see GETTABUP); long keys keep content equality.
                             const node = ltable.nodeLookupShortStrIdentity(tbl.hash, key.String);
-                            ctx.regs[a] = if (node) |nd| nd.value else .Nil;
+                            ctx.regs[inst.a] = if (node) |nd| nd.value else .Nil;
                         } else {
-                            if (try self.bytecodeGetIndex(exec_frames, &ctx, obj, key, a, b, true)) {
+                            if (try self.bytecodeGetIndex(exec_frames, &ctx, obj, key, inst.a, inst.b, true)) {
                                 continue :frame_loop;
                             }
                         }
@@ -13949,21 +13946,21 @@ pub const Vm = struct {
                         // If the vararg table was materialized (VATAB via
                         // needVarargTable), regs[b] is a Table — read from it.
                         // Otherwise (VAHID), read from hidden args on the stack.
-                        const va_val = ctx.regs[b];
-                        const key = ctx.regs[c];
+                        const va_val = ctx.regs[inst.b];
+                        const key = ctx.regs[inst.c];
                         if (va_val == .Table) {
                             // VATAB: read from the materialized table.
                             if (key == .Int) {
-                                ctx.regs[a] = self.rawGet(va_val.Table, key);
+                                ctx.regs[inst.a] = self.rawGet(va_val.Table, key);
                             } else if (key == .String) {
                                 const sbytes = key.String.bytes();
                                 if (sbytes.len == 1 and sbytes[0] == 'n') {
-                                    ctx.regs[a] = self.getFieldOpt(va_val.Table, "n") orelse .Nil;
+                                    ctx.regs[inst.a] = self.getFieldOpt(va_val.Table, "n") orelse .Nil;
                                 } else {
-                                    ctx.regs[a] = .Nil;
+                                    ctx.regs[inst.a] = .Nil;
                                 }
                             } else {
-                                ctx.regs[a] = .Nil;
+                                ctx.regs[inst.a] = .Nil;
                             }
                         } else {
                             // VAHID: read from hidden varargs on the stack.
@@ -13975,17 +13972,17 @@ pub const Vm = struct {
                             if (key == .Int) {
                                 const n: i64 = key.Int;
                                 if (n >= 1 and @as(usize, @intCast(n)) <= nextra) {
-                                    ctx.regs[a] = self.bc_stack[va_base_idx + @as(usize, @intCast(n - 1))];
+                                    ctx.regs[inst.a] = self.bc_stack[va_base_idx + @as(usize, @intCast(n - 1))];
                                 } else {
-                                    ctx.regs[a] = .Nil;
+                                    ctx.regs[inst.a] = .Nil;
                                 }
                             } else if (key == .String) {
                                 // Only the single-character string "n" is valid.
                                 const sbytes = key.String.bytes();
                                 if (sbytes.len == 1 and sbytes[0] == 'n') {
-                                    ctx.regs[a] = .{ .Int = @intCast(nextra) };
+                                    ctx.regs[inst.a] = .{ .Int = @intCast(nextra) };
                                 } else {
-                                    ctx.regs[a] = .Nil;
+                                    ctx.regs[inst.a] = .Nil;
                                 }
                             } else {
                                 // Float keys: PUC tries integer coercion (tointegerns).
@@ -13996,18 +13993,18 @@ pub const Vm = struct {
                                         if (f >= 1 and f <= @as(f64, @floatFromInt(std.math.maxInt(i32)))) {
                                             const n: i64 = @intFromFloat(f);
                                             if (@as(usize, @intCast(n)) <= nextra) {
-                                                ctx.regs[a] = self.bc_stack[va_base_idx + @as(usize, @intCast(n - 1))];
+                                                ctx.regs[inst.a] = self.bc_stack[va_base_idx + @as(usize, @intCast(n - 1))];
                                             } else {
-                                                ctx.regs[a] = .Nil;
+                                                ctx.regs[inst.a] = .Nil;
                                             }
                                         } else {
-                                            ctx.regs[a] = .Nil;
+                                            ctx.regs[inst.a] = .Nil;
                                         }
                                     } else {
-                                        ctx.regs[a] = .Nil;
+                                        ctx.regs[inst.a] = .Nil;
                                     }
                                 } else {
-                                    ctx.regs[a] = .Nil;
+                                    ctx.regs[inst.a] = .Nil;
                                 }
                             }
                         }
@@ -14016,9 +14013,9 @@ pub const Vm = struct {
                         // R[A][R[B]] = RK[C] — may trigger __newindex metamethod.
                         // PUC 5.5 k-bit: k=0 → R[C], k=1 → K[C] (constant pool).
                         // Snapshot all register values before the call.
-                        const obj = ctx.regs[a];
-                        const key = ctx.regs[b];
-                        const val = if (inst.k == 1) ctx.cur_proto.resolved_values[c] else ctx.regs[c];
+                        const obj = ctx.regs[inst.a];
+                        const key = ctx.regs[inst.b];
+                        const val = if (inst.k == 1) ctx.cur_proto.resolved_values[inst.c] else ctx.regs[inst.c];
                         // Fast path: table without metatable. For String and Int
                         // keys, inline lookup → value-barrier → store; absent →
                         // rawSet owns new-key semantics. Other types fall back
@@ -14085,7 +14082,7 @@ pub const Vm = struct {
                                 try self.rawSet(tbl, key, val);
                             }
                         } else {
-                            if (try self.bytecodeSetIndex(exec_frames, &ctx, obj, key, val, a, true)) {
+                            if (try self.bytecodeSetIndex(exec_frames, &ctx, obj, key, val, inst.a, true)) {
                                 continue :frame_loop;
                             }
                         }
@@ -14093,24 +14090,24 @@ pub const Vm = struct {
                     .seti => {
                         // R[A][B] = RK[C]  (integer key)
                         // PUC 5.5 k-bit: k=0 → R[C], k=1 → K[C] (constant pool).
-                        const obj = ctx.regs[a];
-                        const val = if (inst.k == 1) ctx.cur_proto.resolved_values[c] else ctx.regs[c];
+                        const obj = ctx.regs[inst.a];
+                        const val = if (inst.k == 1) ctx.cur_proto.resolved_values[inst.c] else ctx.regs[inst.c];
                         // Fast path: table without metatable, key in array
                         // range — value-barrier → store (PUC obj2arr).
                         if (obj == .Table and obj.Table.metatable == null) {
                             const tbl = obj.Table;
-                            const k: usize = b; // b is u8, 1-based
+                            const k: usize = inst.b; // b is u8, 1-based
                             if (k >= 1 and k <= tbl.asize) {
                                 if (self.stats.enabled) self.stats.tbl_set_fast_int += 1;
                                 try self.gcTableBarrierBackValue(tbl, val);
                                 tbl.array[k - 1] = val;
                             } else {
-                                try self.rawSet(tbl, .{ .Int = @intCast(b) }, val);
+                                try self.rawSet(tbl, .{ .Int = @intCast(inst.b) }, val);
                             }
                         } else {
                             @branchHint(.unlikely);
-                            const key: Value = .{ .Int = @intCast(b) };
-                            if (try self.bytecodeSetIndex(exec_frames, &ctx, obj, key, val, a, true)) {
+                            const key: Value = .{ .Int = @intCast(inst.b) };
+                            if (try self.bytecodeSetIndex(exec_frames, &ctx, obj, key, val, inst.a, true)) {
                                 continue :frame_loop;
                             }
                         }
@@ -14118,9 +14115,9 @@ pub const Vm = struct {
                     .setfield => {
                         // R[A][K[B]] = RK[C]  (string key)
                         // PUC 5.5 k-bit: k=0 → R[C], k=1 → K[C] (constant pool).
-                        const obj = ctx.regs[a];
-                        const key = ctx.cur_proto.resolved_values[b];
-                        const val = if (inst.k == 1) ctx.cur_proto.resolved_values[c] else ctx.regs[c];
+                        const obj = ctx.regs[inst.a];
+                        const key = ctx.cur_proto.resolved_values[inst.b];
+                        const val = if (inst.k == 1) ctx.cur_proto.resolved_values[inst.c] else ctx.regs[inst.c];
                         if (obj == .Table and obj.Table.metatable == null) {
                             // Inline fast path: direct nodeLookup for existing
                             // key → value-barrier → store; absent → rawSet
@@ -14146,7 +14143,7 @@ pub const Vm = struct {
                                 try self.rawSet(tbl, key, val);
                             }
                         } else {
-                            if (try self.bytecodeSetIndex(exec_frames, &ctx, obj, key, val, a, true)) {
+                            if (try self.bytecodeSetIndex(exec_frames, &ctx, obj, key, val, inst.a, true)) {
                                 continue :frame_loop;
                             }
                         }
@@ -14160,8 +14157,8 @@ pub const Vm = struct {
                         // our bytecode has no k bit, so we always emit
                         // EXTRAARG with 0 for the common case.)
                         const t = try self.allocTable();
-                        ctx.regs[a] = .{ .Table = t };
-                        const hsize_log2: u8 = b;
+                        ctx.regs[inst.a] = .{ .Table = t };
+                        const hsize_log2: u8 = inst.b;
                         // Read the EXTRAARG (always present after NEWTABLE).
                         if (ctx.pc + 1 >= ctx.cur_proto.code.len or
                             @as(bc.Op, @enumFromInt(ctx.cur_proto.code[ctx.pc + 1].op)) != .extraarg)
@@ -14169,7 +14166,7 @@ pub const Vm = struct {
                             return self.fail("NEWTABLE missing EXTRAARG", .{});
                         }
                         ctx.pc += 1;
-                        const asize: u32 = @as(u32, c) + @as(u32, ctx.cur_proto.code[ctx.pc].extraArg()) * 256;
+                        const asize: u32 = @as(u32, inst.c) + @as(u32, ctx.cur_proto.code[ctx.pc].extraArg()) * 256;
                         if (hsize_log2 > 31) {
                             return self.fail("NEWTABLE hash size out of range", .{});
                         }
@@ -14183,10 +14180,10 @@ pub const Vm = struct {
                     },
                     .self => {
                         // R[A+1] = R[B]; R[A] = R[B][K[C]]
-                        const obj = ctx.regs[b];
-                        ctx.regs[a + 1] = obj;
-                        const key = ctx.cur_proto.resolved_values[c];
-                        if (try self.bytecodeGetIndex(exec_frames, &ctx, obj, key, a, b, true)) {
+                        const obj = ctx.regs[inst.b];
+                        ctx.regs[inst.a + 1] = obj;
+                        const key = ctx.cur_proto.resolved_values[inst.c];
+                        if (try self.bytecodeGetIndex(exec_frames, &ctx, obj, key, inst.a, inst.b, true)) {
                             continue :frame_loop;
                         }
                     },
@@ -14198,19 +14195,19 @@ pub const Vm = struct {
                     // by the string metatable's __add/__sub/etc. metamethods
                     // (PUC lstrlib.c), dispatched via MMBIN → getTmByObj.
                     .add => {
-                        const lb = ctx.regs[b];
-                        const rc = ctx.regs[c];
+                        const lb = ctx.regs[inst.b];
+                        const rc = ctx.regs[inst.c];
                         if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Int = lb.Int +% rc.Int };
+                            ctx.regs[inst.a] = .{ .Int = lb.Int +% rc.Int };
                             ctx.pc += 1; // skip MMBIN
                         } else if (lb == .Num and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = lb.Num + rc.Num };
+                            ctx.regs[inst.a] = .{ .Num = lb.Num + rc.Num };
                             ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) + rc.Num };
+                            ctx.regs[inst.a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) + rc.Num };
                             ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.regs[inst.a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(rc.Int)) };
                             ctx.pc += 1;
                         } else {
                             // Fall through to MMBIN: string operands handled by
@@ -14218,66 +14215,66 @@ pub const Vm = struct {
                         }
                     },
                     .sub => {
-                        const lb = ctx.regs[b];
-                        const rc = ctx.regs[c];
+                        const lb = ctx.regs[inst.b];
+                        const rc = ctx.regs[inst.c];
                         if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Int = lb.Int -% rc.Int };
+                            ctx.regs[inst.a] = .{ .Int = lb.Int -% rc.Int };
                             ctx.pc += 1; // skip MMBIN
                         } else if (lb == .Num and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = lb.Num - rc.Num };
+                            ctx.regs[inst.a] = .{ .Num = lb.Num - rc.Num };
                             ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) - rc.Num };
+                            ctx.regs[inst.a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) - rc.Num };
                             ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = lb.Num - @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.regs[inst.a] = .{ .Num = lb.Num - @as(f64, @floatFromInt(rc.Int)) };
                             ctx.pc += 1;
                         } else {
                             // Fall through to MMBIN (string mt __sub).
                         }
                     },
                     .mul => {
-                        const lb = ctx.regs[b];
-                        const rc = ctx.regs[c];
+                        const lb = ctx.regs[inst.b];
+                        const rc = ctx.regs[inst.c];
                         if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Int = lb.Int *% rc.Int };
+                            ctx.regs[inst.a] = .{ .Int = lb.Int *% rc.Int };
                             ctx.pc += 1; // skip MMBIN
                         } else if (lb == .Num and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = lb.Num * rc.Num };
+                            ctx.regs[inst.a] = .{ .Num = lb.Num * rc.Num };
                             ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) * rc.Num };
+                            ctx.regs[inst.a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) * rc.Num };
                             ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = lb.Num * @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.regs[inst.a] = .{ .Num = lb.Num * @as(f64, @floatFromInt(rc.Int)) };
                             ctx.pc += 1;
                         } else {
                             // Fall through to MMBIN (string mt __mul).
                         }
                     },
                     .div => {
-                        const lb = ctx.regs[b];
-                        const rc = ctx.regs[c];
+                        const lb = ctx.regs[inst.b];
+                        const rc = ctx.regs[inst.c];
                         // DIV always produces a float result (PUC LUA_OPDIV).
                         if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.regs[inst.a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / @as(f64, @floatFromInt(rc.Int)) };
                             ctx.pc += 1; // skip MMBIN
                         } else if (lb == .Num and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = lb.Num / rc.Num };
+                            ctx.regs[inst.a] = .{ .Num = lb.Num / rc.Num };
                             ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / rc.Num };
+                            ctx.regs[inst.a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / rc.Num };
                             ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = lb.Num / @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.regs[inst.a] = .{ .Num = lb.Num / @as(f64, @floatFromInt(rc.Int)) };
                             ctx.pc += 1;
                         } else {
                             // Fall through to MMBIN (string mt __div).
                         }
                     },
                     .mod => {
-                        const lb = ctx.regs[b];
-                        const rc = ctx.regs[c];
+                        const lb = ctx.regs[inst.b];
+                        const rc = ctx.regs[inst.c];
                         // MOD: int operands yield int (PUC floor-mod semantics),
                         // float operands yield float via luaNumMod.
                         if (lb == .Int and rc == .Int) {
@@ -14288,50 +14285,50 @@ pub const Vm = struct {
                                 return self.fail("attempt to perform 'n%0'", .{});
                             }
                             if (li == std.math.minInt(i64) and ri == -1) {
-                                ctx.regs[a] = .{ .Int = 0 };
+                                ctx.regs[inst.a] = .{ .Int = 0 };
                             } else {
                                 var rem = @rem(li, ri);
                                 // PUC Lua mod: result takes sign of divisor.
                                 if (rem != 0 and ((rem ^ ri) < 0)) rem += ri;
-                                ctx.regs[a] = .{ .Int = rem };
+                                ctx.regs[inst.a] = .{ .Int = rem };
                             }
                             ctx.pc += 1; // skip MMBIN
                         } else if (lb == .Num and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = luaNumMod(lb.Num, rc.Num) };
+                            ctx.regs[inst.a] = .{ .Num = luaNumMod(lb.Num, rc.Num) };
                             ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = luaNumMod(@as(f64, @floatFromInt(lb.Int)), rc.Num) };
+                            ctx.regs[inst.a] = .{ .Num = luaNumMod(@as(f64, @floatFromInt(lb.Int)), rc.Num) };
                             ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = luaNumMod(lb.Num, @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.regs[inst.a] = .{ .Num = luaNumMod(lb.Num, @as(f64, @floatFromInt(rc.Int))) };
                             ctx.pc += 1;
                         } else {
                             // Fall through to MMBIN (string mt __mod).
                         }
                     },
                     .pow => {
-                        const lb = ctx.regs[b];
-                        const rc = ctx.regs[c];
+                        const lb = ctx.regs[inst.b];
+                        const rc = ctx.regs[inst.c];
                         // POW always produces a float result (PUC LUA_OPPOW).
                         if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.regs[inst.a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), @as(f64, @floatFromInt(rc.Int))) };
                             ctx.pc += 1; // skip MMBIN
                         } else if (lb == .Num and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = std.math.pow(f64, lb.Num, rc.Num) };
+                            ctx.regs[inst.a] = .{ .Num = std.math.pow(f64, lb.Num, rc.Num) };
                             ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), rc.Num) };
+                            ctx.regs[inst.a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), rc.Num) };
                             ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = std.math.pow(f64, lb.Num, @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.regs[inst.a] = .{ .Num = std.math.pow(f64, lb.Num, @as(f64, @floatFromInt(rc.Int))) };
                             ctx.pc += 1;
                         } else {
                             // Fall through to MMBIN (string mt __pow).
                         }
                     },
                     .idiv => {
-                        const lb = ctx.regs[b];
-                        const rc = ctx.regs[c];
+                        const lb = ctx.regs[inst.b];
+                        const rc = ctx.regs[inst.c];
                         // IDIV: int operands yield int (floor division), float
                         // operands yield float (floor of the quotient).
                         if (lb == .Int and rc == .Int) {
@@ -14342,99 +14339,99 @@ pub const Vm = struct {
                                 return self.fail("divide by zero", .{});
                             }
                             if (li == std.math.minInt(i64) and ri == -1) {
-                                ctx.regs[a] = .{ .Int = std.math.minInt(i64) };
+                                ctx.regs[inst.a] = .{ .Int = std.math.minInt(i64) };
                             } else {
-                                ctx.regs[a] = .{ .Int = @divFloor(li, ri) };
+                                ctx.regs[inst.a] = .{ .Int = @divFloor(li, ri) };
                             }
                             ctx.pc += 1; // skip MMBIN
                         } else if (lb == .Num and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = std.math.floor(lb.Num / rc.Num) };
+                            ctx.regs[inst.a] = .{ .Num = std.math.floor(lb.Num / rc.Num) };
                             ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = std.math.floor(@as(f64, @floatFromInt(lb.Int)) / rc.Num) };
+                            ctx.regs[inst.a] = .{ .Num = std.math.floor(@as(f64, @floatFromInt(lb.Int)) / rc.Num) };
                             ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = std.math.floor(lb.Num / @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.regs[inst.a] = .{ .Num = std.math.floor(lb.Num / @as(f64, @floatFromInt(rc.Int))) };
                             ctx.pc += 1;
                         } else {
                             // Fall through to MMBIN (string mt __idiv).
                         }
                     },
                     .band => {
-                        const lb = ctx.regs[b];
-                        const rc = ctx.regs[c];
+                        const lb = ctx.regs[inst.b];
+                        const rc = ctx.regs[inst.c];
                         if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Int = lb.Int & rc.Int };
+                            ctx.regs[inst.a] = .{ .Int = lb.Int & rc.Int };
                             ctx.pc += 1; // skip MMBIN
                         } else {
                             const li = valueToIntForBitwise(lb);
                             const ri = valueToIntForBitwise(rc);
                             if (li != null and ri != null) {
-                                ctx.regs[a] = .{ .Int = li.? & ri.? };
+                                ctx.regs[inst.a] = .{ .Int = li.? & ri.? };
                                 ctx.pc += 1; // skip MMBIN
                             }
                             // else: fall through to MMBIN.
                         }
                     },
                     .bor => {
-                        const lb = ctx.regs[b];
-                        const rc = ctx.regs[c];
+                        const lb = ctx.regs[inst.b];
+                        const rc = ctx.regs[inst.c];
                         if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Int = lb.Int | rc.Int };
+                            ctx.regs[inst.a] = .{ .Int = lb.Int | rc.Int };
                             ctx.pc += 1; // skip MMBIN
                         } else {
                             const li = valueToIntForBitwise(lb);
                             const ri = valueToIntForBitwise(rc);
                             if (li != null and ri != null) {
-                                ctx.regs[a] = .{ .Int = li.? | ri.? };
+                                ctx.regs[inst.a] = .{ .Int = li.? | ri.? };
                                 ctx.pc += 1; // skip MMBIN
                             }
                             // else: fall through to MMBIN.
                         }
                     },
                     .bxor => {
-                        const lb = ctx.regs[b];
-                        const rc = ctx.regs[c];
+                        const lb = ctx.regs[inst.b];
+                        const rc = ctx.regs[inst.c];
                         if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Int = lb.Int ^ rc.Int };
+                            ctx.regs[inst.a] = .{ .Int = lb.Int ^ rc.Int };
                             ctx.pc += 1; // skip MMBIN
                         } else {
                             const li = valueToIntForBitwise(lb);
                             const ri = valueToIntForBitwise(rc);
                             if (li != null and ri != null) {
-                                ctx.regs[a] = .{ .Int = li.? ^ ri.? };
+                                ctx.regs[inst.a] = .{ .Int = li.? ^ ri.? };
                                 ctx.pc += 1; // skip MMBIN
                             }
                             // else: fall through to MMBIN.
                         }
                     },
                     .shl => {
-                        const lb = ctx.regs[b];
-                        const rc = ctx.regs[c];
+                        const lb = ctx.regs[inst.b];
+                        const rc = ctx.regs[inst.c];
                         if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Int = shiftLeft(lb.Int, rc.Int) };
+                            ctx.regs[inst.a] = .{ .Int = shiftLeft(lb.Int, rc.Int) };
                             ctx.pc += 1; // skip MMBIN
                         } else {
                             const li = valueToIntForBitwise(lb);
                             const ri = valueToIntForBitwise(rc);
                             if (li != null and ri != null) {
-                                ctx.regs[a] = .{ .Int = shiftLeft(li.?, ri.?) };
+                                ctx.regs[inst.a] = .{ .Int = shiftLeft(li.?, ri.?) };
                                 ctx.pc += 1; // skip MMBIN
                             }
                             // else: fall through to MMBIN.
                         }
                     },
                     .shr => {
-                        const lb = ctx.regs[b];
-                        const rc = ctx.regs[c];
+                        const lb = ctx.regs[inst.b];
+                        const rc = ctx.regs[inst.c];
                         if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Int = shiftRight(lb.Int, rc.Int) };
+                            ctx.regs[inst.a] = .{ .Int = shiftRight(lb.Int, rc.Int) };
                             ctx.pc += 1; // skip MMBIN
                         } else {
                             const li = valueToIntForBitwise(lb);
                             const ri = valueToIntForBitwise(rc);
                             if (li != null and ri != null) {
-                                ctx.regs[a] = .{ .Int = shiftRight(li.?, ri.?) };
+                                ctx.regs[inst.a] = .{ .Int = shiftRight(li.?, ri.?) };
                                 ctx.pc += 1; // skip MMBIN
                             }
                             // else: fall through to MMBIN.
@@ -14453,13 +14450,13 @@ pub const Vm = struct {
                     // The MMBINI handler decodes the correct event + operands;
                     // ADDI just computes R[B] + sC and falls through on failure.
                     .addi => {
-                        const lb = ctx.regs[b];
-                        const imm: i64 = @as(i64, c) - 127; // sC2int
+                        const lb = ctx.regs[inst.b];
+                        const imm: i64 = @as(i64, inst.c) - 127; // sC2int
                         if (lb == .Int) {
-                            ctx.regs[a] = .{ .Int = lb.Int +% imm };
+                            ctx.regs[inst.a] = .{ .Int = lb.Int +% imm };
                             ctx.pc += 1; // skip MMBINI
                         } else if (lb == .Num) {
-                            ctx.regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(imm)) };
+                            ctx.regs[inst.a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(imm)) };
                             ctx.pc += 1;
                         } else {
                             // Fall through to MMBINI (string mt __add).
@@ -14468,19 +14465,19 @@ pub const Vm = struct {
 
                     // ADDK: R[A] = R[B] + K[C]:number
                     .addk => {
-                        const lb = ctx.regs[b];
-                        const rc = ctx.cur_proto.resolved_values[c];
+                        const lb = ctx.regs[inst.b];
+                        const rc = ctx.cur_proto.resolved_values[inst.c];
                         if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Int = lb.Int +% rc.Int };
+                            ctx.regs[inst.a] = .{ .Int = lb.Int +% rc.Int };
                             ctx.pc += 1; // skip MMBINK
                         } else if (lb == .Num and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = lb.Num + rc.Num };
+                            ctx.regs[inst.a] = .{ .Num = lb.Num + rc.Num };
                             ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) + rc.Num };
+                            ctx.regs[inst.a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) + rc.Num };
                             ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.regs[inst.a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(rc.Int)) };
                             ctx.pc += 1;
                         } else {
                             // Fall through to MMBINK (string mt __add).
@@ -14489,19 +14486,19 @@ pub const Vm = struct {
 
                     // SUBK: R[A] = R[B] - K[C]:number
                     .subk => {
-                        const lb = ctx.regs[b];
-                        const rc = ctx.cur_proto.resolved_values[c];
+                        const lb = ctx.regs[inst.b];
+                        const rc = ctx.cur_proto.resolved_values[inst.c];
                         if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Int = lb.Int -% rc.Int };
+                            ctx.regs[inst.a] = .{ .Int = lb.Int -% rc.Int };
                             ctx.pc += 1; // skip MMBINK
                         } else if (lb == .Num and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = lb.Num - rc.Num };
+                            ctx.regs[inst.a] = .{ .Num = lb.Num - rc.Num };
                             ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) - rc.Num };
+                            ctx.regs[inst.a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) - rc.Num };
                             ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = lb.Num - @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.regs[inst.a] = .{ .Num = lb.Num - @as(f64, @floatFromInt(rc.Int)) };
                             ctx.pc += 1;
                         } else {
                             // Fall through to MMBINK (string mt __sub).
@@ -14510,19 +14507,19 @@ pub const Vm = struct {
 
                     // MULK: R[A] = R[B] * K[C]:number
                     .mulk => {
-                        const lb = ctx.regs[b];
-                        const rc = ctx.cur_proto.resolved_values[c];
+                        const lb = ctx.regs[inst.b];
+                        const rc = ctx.cur_proto.resolved_values[inst.c];
                         if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Int = lb.Int *% rc.Int };
+                            ctx.regs[inst.a] = .{ .Int = lb.Int *% rc.Int };
                             ctx.pc += 1; // skip MMBINK
                         } else if (lb == .Num and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = lb.Num * rc.Num };
+                            ctx.regs[inst.a] = .{ .Num = lb.Num * rc.Num };
                             ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) * rc.Num };
+                            ctx.regs[inst.a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) * rc.Num };
                             ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = lb.Num * @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.regs[inst.a] = .{ .Num = lb.Num * @as(f64, @floatFromInt(rc.Int)) };
                             ctx.pc += 1;
                         } else {
                             // Fall through to MMBINK (string mt __mul).
@@ -14531,8 +14528,8 @@ pub const Vm = struct {
 
                     // MODK: R[A] = R[B] % K[C]:number
                     .modk => {
-                        const lb = ctx.regs[b];
-                        const rc = ctx.cur_proto.resolved_values[c];
+                        const lb = ctx.regs[inst.b];
+                        const rc = ctx.cur_proto.resolved_values[inst.c];
                         if (lb == .Int and rc == .Int) {
                             const li = lb.Int;
                             const ri = rc.Int;
@@ -14541,21 +14538,21 @@ pub const Vm = struct {
                                 return self.fail("attempt to perform 'n%0'", .{});
                             }
                             if (li == std.math.minInt(i64) and ri == -1) {
-                                ctx.regs[a] = .{ .Int = 0 };
+                                ctx.regs[inst.a] = .{ .Int = 0 };
                             } else {
                                 var rem = @rem(li, ri);
                                 if (rem != 0 and ((rem ^ ri) < 0)) rem += ri;
-                                ctx.regs[a] = .{ .Int = rem };
+                                ctx.regs[inst.a] = .{ .Int = rem };
                             }
                             ctx.pc += 1; // skip MMBINK
                         } else if (lb == .Num and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = luaNumMod(lb.Num, rc.Num) };
+                            ctx.regs[inst.a] = .{ .Num = luaNumMod(lb.Num, rc.Num) };
                             ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = luaNumMod(@as(f64, @floatFromInt(lb.Int)), rc.Num) };
+                            ctx.regs[inst.a] = .{ .Num = luaNumMod(@as(f64, @floatFromInt(lb.Int)), rc.Num) };
                             ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = luaNumMod(lb.Num, @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.regs[inst.a] = .{ .Num = luaNumMod(lb.Num, @as(f64, @floatFromInt(rc.Int))) };
                             ctx.pc += 1;
                         } else {
                             // Fall through to MMBINK (string mt __mod).
@@ -14564,19 +14561,19 @@ pub const Vm = struct {
 
                     // POWK: R[A] = R[B] ^ K[C]:number
                     .powk => {
-                        const lb = ctx.regs[b];
-                        const rc = ctx.cur_proto.resolved_values[c];
+                        const lb = ctx.regs[inst.b];
+                        const rc = ctx.cur_proto.resolved_values[inst.c];
                         if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.regs[inst.a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), @as(f64, @floatFromInt(rc.Int))) };
                             ctx.pc += 1; // skip MMBINK
                         } else if (lb == .Num and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = std.math.pow(f64, lb.Num, rc.Num) };
+                            ctx.regs[inst.a] = .{ .Num = std.math.pow(f64, lb.Num, rc.Num) };
                             ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), rc.Num) };
+                            ctx.regs[inst.a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), rc.Num) };
                             ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = std.math.pow(f64, lb.Num, @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.regs[inst.a] = .{ .Num = std.math.pow(f64, lb.Num, @as(f64, @floatFromInt(rc.Int))) };
                             ctx.pc += 1;
                         } else {
                             // Fall through to MMBINK (string mt __pow).
@@ -14585,19 +14582,19 @@ pub const Vm = struct {
 
                     // DIVK: R[A] = R[B] / K[C]:number
                     .divk => {
-                        const lb = ctx.regs[b];
-                        const rc = ctx.cur_proto.resolved_values[c];
+                        const lb = ctx.regs[inst.b];
+                        const rc = ctx.cur_proto.resolved_values[inst.c];
                         if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.regs[inst.a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / @as(f64, @floatFromInt(rc.Int)) };
                             ctx.pc += 1; // skip MMBINK
                         } else if (lb == .Num and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = lb.Num / rc.Num };
+                            ctx.regs[inst.a] = .{ .Num = lb.Num / rc.Num };
                             ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / rc.Num };
+                            ctx.regs[inst.a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / rc.Num };
                             ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = lb.Num / @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.regs[inst.a] = .{ .Num = lb.Num / @as(f64, @floatFromInt(rc.Int)) };
                             ctx.pc += 1;
                         } else {
                             // Fall through to MMBINK (string mt __div).
@@ -14606,8 +14603,8 @@ pub const Vm = struct {
 
                     // IDIVK: R[A] = R[B] // K[C]:number
                     .idivk => {
-                        const lb = ctx.regs[b];
-                        const rc = ctx.cur_proto.resolved_values[c];
+                        const lb = ctx.regs[inst.b];
+                        const rc = ctx.cur_proto.resolved_values[inst.c];
                         if (lb == .Int and rc == .Int) {
                             const ri = rc.Int;
                             if (ri == 0) {
@@ -14615,19 +14612,19 @@ pub const Vm = struct {
                                 return self.fail("attempt to divide by zero", .{});
                             }
                             if (lb.Int == std.math.minInt(i64) and ri == -1) {
-                                ctx.regs[a] = .{ .Int = std.math.minInt(i64) };
+                                ctx.regs[inst.a] = .{ .Int = std.math.minInt(i64) };
                             } else {
-                                ctx.regs[a] = .{ .Int = @divFloor(lb.Int, ri) };
+                                ctx.regs[inst.a] = .{ .Int = @divFloor(lb.Int, ri) };
                             }
                             ctx.pc += 1; // skip MMBINK
                         } else if (lb == .Num and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = @floor(lb.Num / rc.Num) };
+                            ctx.regs[inst.a] = .{ .Num = @floor(lb.Num / rc.Num) };
                             ctx.pc += 1;
                         } else if (lb == .Int and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = @floor(@as(f64, @floatFromInt(lb.Int)) / rc.Num) };
+                            ctx.regs[inst.a] = .{ .Num = @floor(@as(f64, @floatFromInt(lb.Int)) / rc.Num) };
                             ctx.pc += 1;
                         } else if (lb == .Num and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = @floor(lb.Num / @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.regs[inst.a] = .{ .Num = @floor(lb.Num / @as(f64, @floatFromInt(rc.Int))) };
                             ctx.pc += 1;
                         } else {
                             // Fall through to MMBINK (string mt __idiv).
@@ -14637,48 +14634,48 @@ pub const Vm = struct {
                     // --- Bitwise: constant variants ---
                     // BANDK: R[A] = R[B] & K[C]:integer
                     .bandk => {
-                        const lb = ctx.regs[b];
-                        const rc = ctx.cur_proto.resolved_values[c];
+                        const lb = ctx.regs[inst.b];
+                        const rc = ctx.cur_proto.resolved_values[inst.c];
                         if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Int = lb.Int & rc.Int };
+                            ctx.regs[inst.a] = .{ .Int = lb.Int & rc.Int };
                             ctx.pc += 1; // skip MMBINK
                         } else {
                             const li = valueToIntForBitwise(lb);
                             const ri = valueToIntForBitwise(rc);
                             if (li != null and ri != null) {
-                                ctx.regs[a] = .{ .Int = li.? & ri.? };
+                                ctx.regs[inst.a] = .{ .Int = li.? & ri.? };
                                 ctx.pc += 1; // skip MMBINK
                             }
                             // else: fall through to MMBINK.
                         }
                     },
                     .bork => {
-                        const lb = ctx.regs[b];
-                        const rc = ctx.cur_proto.resolved_values[c];
+                        const lb = ctx.regs[inst.b];
+                        const rc = ctx.cur_proto.resolved_values[inst.c];
                         if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Int = lb.Int | rc.Int };
+                            ctx.regs[inst.a] = .{ .Int = lb.Int | rc.Int };
                             ctx.pc += 1; // skip MMBINK
                         } else {
                             const li = valueToIntForBitwise(lb);
                             const ri = valueToIntForBitwise(rc);
                             if (li != null and ri != null) {
-                                ctx.regs[a] = .{ .Int = li.? | ri.? };
+                                ctx.regs[inst.a] = .{ .Int = li.? | ri.? };
                                 ctx.pc += 1; // skip MMBINK
                             }
                             // else: fall through to MMBINK.
                         }
                     },
                     .bxork => {
-                        const lb = ctx.regs[b];
-                        const rc = ctx.cur_proto.resolved_values[c];
+                        const lb = ctx.regs[inst.b];
+                        const rc = ctx.cur_proto.resolved_values[inst.c];
                         if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Int = lb.Int ^ rc.Int };
+                            ctx.regs[inst.a] = .{ .Int = lb.Int ^ rc.Int };
                             ctx.pc += 1; // skip MMBINK
                         } else {
                             const li = valueToIntForBitwise(lb);
                             const ri = valueToIntForBitwise(rc);
                             if (li != null and ri != null) {
-                                ctx.regs[a] = .{ .Int = li.? ^ ri.? };
+                                ctx.regs[inst.a] = .{ .Int = li.? ^ ri.? };
                                 ctx.pc += 1; // skip MMBINK
                             }
                             // else: fall through to MMBINK.
@@ -14688,14 +14685,14 @@ pub const Vm = struct {
                     // --- Shifts: immediate variants ---
                     // SHLI: R[A] = sC << R[B]  (sC = C - 127)
                     .shli => {
-                        const lb = ctx.regs[b];
-                        const imm: i64 = @as(i64, c) - 127;
+                        const lb = ctx.regs[inst.b];
+                        const imm: i64 = @as(i64, inst.c) - 127;
                         if (lb == .Int) {
-                            ctx.regs[a] = .{ .Int = shiftLeft(imm, lb.Int) };
+                            ctx.regs[inst.a] = .{ .Int = shiftLeft(imm, lb.Int) };
                             ctx.pc += 1; // skip MMBINI
                         } else {
                             if (valueToIntForBitwise(lb)) |ri| {
-                                ctx.regs[a] = .{ .Int = shiftLeft(imm, ri) };
+                                ctx.regs[inst.a] = .{ .Int = shiftLeft(imm, ri) };
                                 ctx.pc += 1; // skip MMBINI
                             }
                             // else: fall through to MMBINI.
@@ -14708,14 +14705,14 @@ pub const Vm = struct {
                     // correct event + operands; SHRI just computes R[B] >> sC
                     // and falls through on failure.
                     .shri => {
-                        const lb = ctx.regs[b];
-                        const imm: i64 = @as(i64, c) - 127;
+                        const lb = ctx.regs[inst.b];
+                        const imm: i64 = @as(i64, inst.c) - 127;
                         if (lb == .Int) {
-                            ctx.regs[a] = .{ .Int = shiftRight(lb.Int, imm) };
+                            ctx.regs[inst.a] = .{ .Int = shiftRight(lb.Int, imm) };
                             ctx.pc += 1; // skip MMBINI
                         } else {
                             if (valueToIntForBitwise(lb)) |li| {
-                                ctx.regs[a] = .{ .Int = shiftRight(li, imm) };
+                                ctx.regs[inst.a] = .{ .Int = shiftRight(li, imm) };
                                 ctx.pc += 1; // skip MMBINI
                             }
                             // else: fall through to MMBINI.
@@ -14733,16 +14730,16 @@ pub const Vm = struct {
                     // Operands: (R[A], R[B]).
                     .mmbin => {
                         const pi = ctx.cur_proto.code[ctx.pc - 1];
-                        const event: TmsEvent = @enumFromInt(@as(u5, @truncate(c)));
-                        const lhs = ctx.regs[a];
-                        const rhs = ctx.regs[b];
+                        const event: TmsEvent = @enumFromInt(@as(u5, @truncate(inst.c)));
+                        const lhs = ctx.regs[inst.a];
+                        const rhs = ctx.regs[inst.b];
                         // PUC luaT_trybinTM (ltm.c:150-166): try metamethod
                         // on lhs, then rhs. No metamethod → type error.
                         // Metamethod not callable → call error.
                         // Resolve ONCE — no re-lookup in the push/call path.
                         const tm = self.findBinaryTm(lhs, rhs, event);
                         if (tm == null) {
-                            return self.failBinaryMmbin(lhs, rhs, event, ctx.cur_proto, ctx.pc - 1, a, b);
+                            return self.failBinaryMmbin(lhs, rhs, event, ctx.cur_proto, ctx.pc - 1, inst.a, inst.b);
                         }
                         // PUC two-stage: resolve the TMS value through normal
                         // callable semantics (handles __call chains), then
@@ -14769,17 +14766,17 @@ pub const Vm = struct {
                     // flip=0 → (R[A], Int(sB)); flip=1 → (Int(sB), R[A]).
                     .mmbini => {
                         const pi = ctx.cur_proto.code[ctx.pc - 1];
-                        const event: TmsEvent = @enumFromInt(@as(u5, @truncate(c)));
-                        const imm: i64 = @as(i64, b) - 127; // sB2int
+                        const event: TmsEvent = @enumFromInt(@as(u5, @truncate(inst.c)));
+                        const imm: i64 = @as(i64, inst.b) - 127; // sB2int
                         const imm_val: Value = .{ .Int = imm };
                         const flip = inst.k != 0;
-                        const lhs = if (flip) imm_val else ctx.regs[a];
-                        const rhs = if (flip) ctx.regs[a] else imm_val;
+                        const lhs = if (flip) imm_val else ctx.regs[inst.a];
+                        const rhs = if (flip) ctx.regs[inst.a] else imm_val;
                         // Resolve ONCE — no re-lookup in the push/call path.
                         const tm = self.findBinaryTm(lhs, rhs, event);
                         if (tm == null) {
                             // Bad operand is always R[A] (immediate is always valid).
-                            return self.failBinaryMmbin(lhs, rhs, event, ctx.cur_proto, ctx.pc - 1, a, a);
+                            return self.failBinaryMmbin(lhs, rhs, event, ctx.cur_proto, ctx.pc - 1, inst.a, inst.a);
                         }
                         exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                         switch (try self.tryPushSimpleResultMetamethod(
@@ -14802,18 +14799,18 @@ pub const Vm = struct {
                     // flip=0 → (R[A], K[B]); flip=1 → (K[B], R[A]).
                     .mmbink => {
                         const pi = ctx.cur_proto.code[ctx.pc - 1];
-                        const event: TmsEvent = @enumFromInt(@as(u5, @truncate(c)));
-                        const kv = ctx.cur_proto.resolved_values[b];
+                        const event: TmsEvent = @enumFromInt(@as(u5, @truncate(inst.c)));
+                        const kv = ctx.cur_proto.resolved_values[inst.b];
                         const flip = inst.k != 0;
-                        const lhs = if (flip) kv else ctx.regs[a];
-                        const rhs = if (flip) ctx.regs[a] else kv;
+                        const lhs = if (flip) kv else ctx.regs[inst.a];
+                        const rhs = if (flip) ctx.regs[inst.a] else kv;
                         // Resolve ONCE — no re-lookup in the push/call path.
                         const tm = self.findBinaryTm(lhs, rhs, event);
                         if (tm == null) {
                             // For error annotation: register side is `a`,
                             // constant side has no register (sentinel 255).
-                            const p1_reg: u8 = if (flip) 255 else a;
-                            const p2_reg: u8 = if (flip) a else 255;
+                            const p1_reg: u8 = if (flip) 255 else inst.a;
+                            const p2_reg: u8 = if (flip) inst.a else 255;
                             return self.failBinaryMmbin(lhs, rhs, event, ctx.cur_proto, ctx.pc - 1, p1_reg, p2_reg);
                         }
                         exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
@@ -14837,11 +14834,11 @@ pub const Vm = struct {
                     // PUC lvm.c:1586 OP_UNM: no following MMBIN — handles
                     // metamethod/error inline (luaT_trybinTM with rb,rb).
                     .unm => {
-                        const val = ctx.regs[b];
+                        const val = ctx.regs[inst.b];
                         if (val == .Int) {
-                            ctx.regs[a] = .{ .Int = -%val.Int };
+                            ctx.regs[inst.a] = .{ .Int = -%val.Int };
                         } else if (val == .Num) {
-                            ctx.regs[a] = .{ .Num = -val.Num };
+                            ctx.regs[inst.a] = .{ .Num = -val.Num };
                         } else {
                             // PUC OP_UNM: luaT_trybinTM(L, rb, rb, ra, TM_UNM).
                             // String operands handled by string mt __unm
@@ -14850,7 +14847,7 @@ pub const Vm = struct {
                             const tm = self.findUnaryTm(val, .unm);
                             if (tm == null) {
                                 exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                                return self.failBinaryMmbin(val, val, .unm, ctx.cur_proto, ctx.pc, b, b);
+                                return self.failBinaryMmbin(val, val, .unm, ctx.cur_proto, ctx.pc, inst.b, inst.b);
                             }
                             exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                             switch (try self.tryPushSimpleResultMetamethod(
@@ -14859,12 +14856,12 @@ pub const Vm = struct {
                                 tm.?,
                                 &.{ val, val },
                                 .unm,
-                                .{ .value = a },
+                                .{ .value = inst.a },
                             )) {
                                 .pushed => continue :frame_loop,
                                 .value => |result| {
                                     ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                                    ctx.regs[a] = result;
+                                    ctx.regs[inst.a] = result;
                                 },
                                 .compare => unreachable,
                             }
@@ -14873,23 +14870,23 @@ pub const Vm = struct {
                     // PUC lvm.c:1598 OP_BNOT: no following MMBIN — handles
                     // metamethod/error inline (luaT_trybinTM with rb,rb).
                     .bnot => {
-                        const val = ctx.regs[b];
+                        const val = ctx.regs[inst.b];
                         if (val == .Int) {
-                            ctx.regs[a] = .{ .Int = ~val.Int };
+                            ctx.regs[inst.a] = .{ .Int = ~val.Int };
                         } else {
                             // Coercion: valueToIntForBitwise handles Int and
                             // Num-with-integer-value (NOT string — matches PUC
                             // tointegerns). On failure, try __bnot metamethod
                             // or produce type error inline.
                             if (valueToIntForBitwise(val)) |iv| {
-                                ctx.regs[a] = .{ .Int = ~iv };
+                                ctx.regs[inst.a] = .{ .Int = ~iv };
                             } else {
                                 // PUC OP_BNOT: luaT_trybinTM(L, rb, rb, ra, TM_BNOT).
                                 // Resolve ONCE — no re-lookup in the push/call path.
                                 const tm = self.findUnaryTm(val, .bnot);
                                 if (tm == null) {
                                     exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
-                                    return self.failBinaryMmbin(val, val, .bnot, ctx.cur_proto, ctx.pc, b, b);
+                                    return self.failBinaryMmbin(val, val, .bnot, ctx.cur_proto, ctx.pc, inst.b, inst.b);
                                 }
                                 exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                                 switch (try self.tryPushSimpleResultMetamethod(
@@ -14898,27 +14895,27 @@ pub const Vm = struct {
                                     tm.?,
                                     &.{ val, val },
                                     .bnot,
-                                    .{ .value = a },
+                                    .{ .value = inst.a },
                                 )) {
                                     .pushed => continue :frame_loop,
                                     .value => |result| {
                                         ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                                        ctx.regs[a] = result;
+                                        ctx.regs[inst.a] = result;
                                     },
                                     .compare => unreachable,
                                 }
                             }
                         }
                     },
-                    .not => ctx.regs[a] = try self.evalUnOp(.Not, ctx.regs[b]),
+                    .not => ctx.regs[inst.a] = try self.evalUnOp(.Not, ctx.regs[inst.b]),
                     .len => {
-                        const val = ctx.regs[b];
+                        const val = ctx.regs[inst.b];
                         // PUC OP_LEN: luaT_trybinTM(L, rb, rb, ra, TM_LEN).
                         // Strings have a fast path (no metamethod lookup).
                         // For all other types, resolve __len ONCE and carry
                         // the resolved value through push + synchronous fallback.
                         if (val == .String) {
-                            ctx.regs[a] = .{ .Int = @intCast(val.String.len()) };
+                            ctx.regs[inst.a] = .{ .Int = @intCast(val.String.len()) };
                         } else {
                             const tm = self.findUnaryTm(val, .len);
                             if (tm) |mm| {
@@ -14929,19 +14926,19 @@ pub const Vm = struct {
                                     mm,
                                     &.{ val, val },
                                     .len,
-                                    .{ .value = a },
+                                    .{ .value = inst.a },
                                 )) {
                                     .pushed => continue :frame_loop,
                                     .value => |result| {
                                         ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                                        ctx.regs[a] = result;
+                                        ctx.regs[inst.a] = result;
                                     },
                                     .compare => unreachable,
                                 }
                             } else {
                                 // No __len metamethod: Table → border length,
                                 // anything else → type error (matches evalUnOp).
-                                ctx.regs[a] = switch (val) {
+                                ctx.regs[inst.a] = switch (val) {
                                     .Table => |t| .{ .Int = self.tableBorderLen(t) },
                                     else => return self.fail("attempt to get length of a {s} value", .{val.typeName()}),
                                 };
@@ -14965,8 +14962,8 @@ pub const Vm = struct {
                     // EQ/LT/LE: if (R[A] op R[B]) != (C!=0) then ctx.pc++
                     // Snapshot operands — comparison may trigger metamethod.
                     .eq => {
-                        const la = ctx.regs[a];
-                        const lb = ctx.regs[b];
+                        const la = ctx.regs[inst.a];
+                        const lb = ctx.regs[inst.b];
                         // Fast path: valuesEqual handles Int/Num/Bool/String/Nil
                         // comparisons directly. Only Table==Table and
                         // Userdata==Userdata with different identity need
@@ -14988,7 +14985,7 @@ pub const Vm = struct {
                                         mm,
                                         &.{ la, lb },
                                         .eq,
-                                        .{ .compare = c != 0 },
+                                        .{ .compare = inst.c != 0 },
                                     )) {
                                         .pushed => continue :frame_loop,
                                         .value => |ret| {
@@ -15001,12 +14998,12 @@ pub const Vm = struct {
                             }
                             break :blk false;
                         };
-                        const invert = (c != 0);
+                        const invert = (inst.c != 0);
                         if (result != invert) ctx.pc += 1;
                     },
                     .lt => {
-                        const la = ctx.regs[a];
-                        const lb = ctx.regs[b];
+                        const la = ctx.regs[inst.a];
+                        const lb = ctx.regs[inst.b];
                         // Fast path: inline numeric and string comparisons to
                         // avoid bytecodeComparisonHasFastPath + cmpLt overhead.
                         const result: bool = blk: {
@@ -15016,17 +15013,17 @@ pub const Vm = struct {
                             if (la == .Num and lb == .Int) break :blk numLtInt(la.Num, lb.Int);
                             if (la == .String and lb == .String) break :blk std.mem.order(u8, la.String.bytes(), lb.String.bytes()) == .lt;
                             // Slow path: resolve ONCE, push or call — no re-lookup.
-                            switch (try self.slowCmp(exec_frames, ctx.frame_index, ctx.pc, la, lb, .lt, c != 0)) {
+                            switch (try self.slowCmp(exec_frames, ctx.frame_index, ctx.pc, la, lb, .lt, inst.c != 0)) {
                                 .pushed => continue :frame_loop,
                                 .value => |v| break :blk v,
                             }
                         };
-                        const invert = (c != 0);
+                        const invert = (inst.c != 0);
                         if (result != invert) ctx.pc += 1;
                     },
                     .le => {
-                        const la = ctx.regs[a];
-                        const lb = ctx.regs[b];
+                        const la = ctx.regs[inst.a];
+                        const lb = ctx.regs[inst.b];
                         const result: bool = blk: {
                             if (la == .Int and lb == .Int) break :blk la.Int <= lb.Int;
                             if (la == .Num and lb == .Num) break :blk la.Num <= lb.Num;
@@ -15037,12 +15034,12 @@ pub const Vm = struct {
                                 break :blk ord == .lt or ord == .eq;
                             }
                             // Slow path: resolve ONCE, push or call — no re-lookup.
-                            switch (try self.slowCmp(exec_frames, ctx.frame_index, ctx.pc, la, lb, .le, c != 0)) {
+                            switch (try self.slowCmp(exec_frames, ctx.frame_index, ctx.pc, la, lb, .le, inst.c != 0)) {
                                 .pushed => continue :frame_loop,
                                 .value => |v| break :blk v,
                             }
                         };
-                        const invert = (c != 0);
+                        const invert = (inst.c != 0);
                         if (result != invert) ctx.pc += 1;
                     },
                     // P15.38d: Immediate comparison opcodes (PUC EQI/LTI/LEI/GTI/GEI/EQK).
@@ -15053,23 +15050,23 @@ pub const Vm = struct {
                         // PUC OP_EQI: if ((R[A] == sB) ~= (C&1) then ctx.pc++
                         // C bit 0 = invert, C bit 1 = isfloat (immediate
                         // originated from a float literal, e.g. 5.0).
-                        const la = ctx.regs[a];
-                        const im: i64 = @as(i64, b) - 127; // sB2int (same encoding as sC)
+                        const la = ctx.regs[inst.a];
+                        const im: i64 = @as(i64, inst.b) - 127; // sB2int (same encoding as sC)
                         const result: bool = switch (la) {
                             .Int => |v| v == im,
                             .Num => |v| v == @as(f64, @floatFromInt(im)),
                             else => false,
                         };
-                        const invert = (c & 1) != 0;
+                        const invert = (inst.c & 1) != 0;
                         if (result != invert) ctx.pc += 1;
                     },
                     .eqk => {
                         // PUC OP_EQK: if ((R[A] == K[B]) ~= (C&1)) then ctx.pc++
                         // Raw equality (no __eq metamethod) — basic types don't use __eq.
-                        const la = ctx.regs[a];
-                        const rb = ctx.cur_proto.resolved_values[b];
+                        const la = ctx.regs[inst.a];
+                        const rb = ctx.cur_proto.resolved_values[inst.b];
                         const result = valuesEqual(la, rb);
-                        const invert = (c & 1) != 0;
+                        const invert = (inst.c & 1) != 0;
                         if (result != invert) ctx.pc += 1;
                     },
                     .lti => {
@@ -15077,9 +15074,9 @@ pub const Vm = struct {
                         // C bit 0 = invert, C bit 1 = isfloat (sB originated
                         // from a float literal like 5.0; metamethod must
                         // receive a float, not an integer).
-                        const la = ctx.regs[a];
-                        const im: i64 = @as(i64, b) - 127;
-                        const isfloat = (c & 2) != 0;
+                        const la = ctx.regs[inst.a];
+                        const im: i64 = @as(i64, inst.b) - 127;
+                        const isfloat = (inst.c & 2) != 0;
                         const result: bool = blk: {
                             if (la == .Int) break :blk la.Int < im;
                             if (la == .Num) break :blk la.Num < @as(f64, @floatFromInt(im));
@@ -15088,20 +15085,20 @@ pub const Vm = struct {
                                 .{ .Num = @as(f64, @floatFromInt(im)) }
                             else
                                 .{ .Int = im };
-                            switch (try self.slowCmp(exec_frames, ctx.frame_index, ctx.pc, la, rb_val, .lt, (c & 1) != 0)) {
+                            switch (try self.slowCmp(exec_frames, ctx.frame_index, ctx.pc, la, rb_val, .lt, (inst.c & 1) != 0)) {
                                 .pushed => continue :frame_loop,
                                 .value => |v| break :blk v,
                             }
                         };
-                        const invert = (c & 1) != 0;
+                        const invert = (inst.c & 1) != 0;
                         if (result != invert) ctx.pc += 1;
                     },
                     .lei => {
                         // PUC OP_LEI: if ((R[A] <= sB) ~= (C&1)) then ctx.pc++
                         // C bit 0 = invert, C bit 1 = isfloat.
-                        const la = ctx.regs[a];
-                        const im: i64 = @as(i64, b) - 127;
-                        const isfloat = (c & 2) != 0;
+                        const la = ctx.regs[inst.a];
+                        const im: i64 = @as(i64, inst.b) - 127;
+                        const isfloat = (inst.c & 2) != 0;
                         const result: bool = blk: {
                             if (la == .Int) break :blk la.Int <= im;
                             if (la == .Num) break :blk la.Num <= @as(f64, @floatFromInt(im));
@@ -15110,20 +15107,20 @@ pub const Vm = struct {
                                 .{ .Num = @as(f64, @floatFromInt(im)) }
                             else
                                 .{ .Int = im };
-                            switch (try self.slowCmp(exec_frames, ctx.frame_index, ctx.pc, la, rb_val, .le, (c & 1) != 0)) {
+                            switch (try self.slowCmp(exec_frames, ctx.frame_index, ctx.pc, la, rb_val, .le, (inst.c & 1) != 0)) {
                                 .pushed => continue :frame_loop,
                                 .value => |v| break :blk v,
                             }
                         };
-                        const invert = (c & 1) != 0;
+                        const invert = (inst.c & 1) != 0;
                         if (result != invert) ctx.pc += 1;
                     },
                     .gti => {
                         // PUC OP_GTI: if ((R[A] > sB) ~= (C&1)) then ctx.pc++
                         // C bit 0 = invert, C bit 1 = isfloat.
-                        const la = ctx.regs[a];
-                        const im: i64 = @as(i64, b) - 127;
-                        const isfloat = (c & 2) != 0;
+                        const la = ctx.regs[inst.a];
+                        const im: i64 = @as(i64, inst.b) - 127;
+                        const isfloat = (inst.c & 2) != 0;
                         const result: bool = blk: {
                             if (la == .Int) break :blk la.Int > im;
                             if (la == .Num) break :blk la.Num > @as(f64, @floatFromInt(im));
@@ -15133,20 +15130,20 @@ pub const Vm = struct {
                                 .{ .Num = @as(f64, @floatFromInt(im)) }
                             else
                                 .{ .Int = im };
-                            switch (try self.slowCmp(exec_frames, ctx.frame_index, ctx.pc, rb_val, la, .lt, (c & 1) != 0)) {
+                            switch (try self.slowCmp(exec_frames, ctx.frame_index, ctx.pc, rb_val, la, .lt, (inst.c & 1) != 0)) {
                                 .pushed => continue :frame_loop,
                                 .value => |v| break :blk v,
                             }
                         };
-                        const invert = (c & 1) != 0;
+                        const invert = (inst.c & 1) != 0;
                         if (result != invert) ctx.pc += 1;
                     },
                     .gei => {
                         // PUC OP_GEI: if ((R[A] >= sB) ~= (C&1)) then ctx.pc++
                         // C bit 0 = invert, C bit 1 = isfloat.
-                        const la = ctx.regs[a];
-                        const im: i64 = @as(i64, b) - 127;
-                        const isfloat = (c & 2) != 0;
+                        const la = ctx.regs[inst.a];
+                        const im: i64 = @as(i64, inst.b) - 127;
+                        const isfloat = (inst.c & 2) != 0;
                         const result: bool = blk: {
                             if (la == .Int) break :blk la.Int >= im;
                             if (la == .Num) break :blk la.Num >= @as(f64, @floatFromInt(im));
@@ -15156,28 +15153,28 @@ pub const Vm = struct {
                                 .{ .Num = @as(f64, @floatFromInt(im)) }
                             else
                                 .{ .Int = im };
-                            switch (try self.slowCmp(exec_frames, ctx.frame_index, ctx.pc, rb_val, la, .le, (c & 1) != 0)) {
+                            switch (try self.slowCmp(exec_frames, ctx.frame_index, ctx.pc, rb_val, la, .le, (inst.c & 1) != 0)) {
                                 .pushed => continue :frame_loop,
                                 .value => |v| break :blk v,
                             }
                         };
-                        const invert = (c & 1) != 0;
+                        const invert = (inst.c & 1) != 0;
                         if (result != invert) ctx.pc += 1;
                     },
 
                     // --- Test / testset ---
                     .test_ => {
-                        const is_truthy = isTruthy(ctx.regs[a]);
-                        const skip_if_falsy = (c != 0);
+                        const is_truthy = isTruthy(ctx.regs[inst.a]);
+                        const skip_if_falsy = (inst.c != 0);
                         if (!is_truthy == skip_if_falsy) ctx.pc += 1;
                     },
                     .testset => {
-                        const is_truthy = isTruthy(ctx.regs[b]);
-                        const skip_if_falsy = (c != 0);
+                        const is_truthy = isTruthy(ctx.regs[inst.b]);
+                        const skip_if_falsy = (inst.c != 0);
                         if (!is_truthy == skip_if_falsy) {
                             ctx.pc += 1;
                         } else {
-                            ctx.regs[a] = ctx.regs[b];
+                            ctx.regs[inst.a] = ctx.regs[inst.b];
                         }
                     },
 
@@ -15198,15 +15195,15 @@ pub const Vm = struct {
                         // function and DispatchResult enum switch for the
                         // overwhelmingly common case. Mirrors PUC's OP_CALL
                         // which is handled directly in luaV_execute's switch.
-                        const callee = ctx.regs[a];
+                        const callee = ctx.regs[inst.a];
                         // P15.51l: hooks_active/resumed_direct_yield are rare
                         // fields, read directly from the CallFrame.
                         if (callee == .Closure and !self.hooks_active_cached and !exec_frames.getPtr(ctx.frame_index).isHookYield()) {
                             const cl = callee.Closure;
                             if (cl.proto) |proto| {
                                 if (self.stats.enabled) self.stats.calls_fast += 1; // P16.0b
-                                const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
-                                const nargs: usize = if (b == 0) exec_frames.getPtr(ctx.frame_index).reg_top - a - 1 else b - 1;
+                                const nresults: i32 = if (inst.c == 0) -1 else @intCast(inst.c - 1);
+                                const nargs: usize = if (inst.b == 0) exec_frames.getPtr(ctx.frame_index).reg_top - inst.a - 1 else inst.b - 1;
 
                                 // Pre-grow shared stack for child frame (PUC
                                 // luaD_precall stack check). Usually a no-op
@@ -15239,7 +15236,7 @@ pub const Vm = struct {
                                 try self.pushStagedBytecodeExecFrame(
                                     ctx.exec_frames,
                                     proto,
-                                    ctx.base + a,
+                                    ctx.base + inst.a,
                                     nargs,
                                     nresults,
                                 );
@@ -15334,17 +15331,17 @@ pub const Vm = struct {
                         // After FORPREP, R[A+1] tells us the mode:
                         //   Int  → integer loop (R[A]=count, R[A+1]=step, R[A+2]=idx)
                         //   Num  → float loop   (R[A]=limit, R[A+1]=step, R[A+2]=idx)
-                        if (ctx.regs[a + 1] == .Int) {
+                        if (ctx.regs[inst.a + 1] == .Int) {
                             // ── Integer loop ──
-                            const count = @as(u64, @bitCast(ctx.regs[a].Int));
+                            const count = @as(u64, @bitCast(ctx.regs[inst.a].Int));
                             if (count > 0) {
-                                const step_i = ctx.regs[a + 1].Int;
-                                const idx = ctx.regs[a + 2].Int;
-                                ctx.regs[a] = .{ .Int = @bitCast(count -% 1) };
+                                const step_i = ctx.regs[inst.a + 1].Int;
+                                const idx = ctx.regs[inst.a + 2].Int;
+                                ctx.regs[inst.a] = .{ .Int = @bitCast(count -% 1) };
                                 const new_idx = idx +% step_i;
-                                ctx.regs[a + 2] = .{ .Int = new_idx };
-                                ctx.regs[a + 3] = .{ .Int = new_idx };
-                                const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
+                                ctx.regs[inst.a + 2] = .{ .Int = new_idx };
+                                ctx.regs[inst.a + 3] = .{ .Int = new_idx };
+                                const off_bits: u16 = @as(u16, inst.b) | (@as(u16, inst.c) << 8);
                                 const off: i16 = @bitCast(off_bits);
                                 ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
                                 if (check_sigint and signal_int_pending.load(.acquire)) {
@@ -15355,15 +15352,15 @@ pub const Vm = struct {
                             }
                         } else {
                             // ── Float loop ──
-                            const limit_f = ctx.regs[a].Num;
-                            const step_f = ctx.regs[a + 1].Num;
-                            const idx = ctx.regs[a + 2].Num;
+                            const limit_f = ctx.regs[inst.a].Num;
+                            const step_f = ctx.regs[inst.a + 1].Num;
+                            const idx = ctx.regs[inst.a + 2].Num;
                             const next_idx = idx + step_f;
                             const continues = if (step_f > 0) next_idx <= limit_f else next_idx >= limit_f;
                             if (continues) {
-                                ctx.regs[a + 2] = .{ .Num = next_idx };
-                                ctx.regs[a + 3] = .{ .Num = next_idx };
-                                const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
+                                ctx.regs[inst.a + 2] = .{ .Num = next_idx };
+                                ctx.regs[inst.a + 3] = .{ .Num = next_idx };
+                                const off_bits: u16 = @as(u16, inst.b) | (@as(u16, inst.c) << 8);
                                 const off: i16 = @bitCast(off_bits);
                                 ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
                                 if (check_sigint and signal_int_pending.load(.acquire)) {
@@ -15386,10 +15383,10 @@ pub const Vm = struct {
                     },
                     .tforloop => {
                         // A=ctx.base, offset in B:C. If R[ctx.base+2] != nil, loop continues.
-                        const ctrl = ctx.regs[a + 2];
+                        const ctrl = ctx.regs[inst.a + 2];
                         if (ctrl != .Nil) {
-                            ctx.regs[a] = ctrl;
-                            const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
+                            ctx.regs[inst.a] = ctrl;
+                            const off_bits: u16 = @as(u16, inst.b) | (@as(u16, inst.c) << 8);
                             const off: i16 = @bitCast(off_bits);
                             ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
                             if (check_sigint and signal_int_pending.load(.acquire)) {
@@ -15401,7 +15398,7 @@ pub const Vm = struct {
                     },
                     .tforprep => {
                         // A=ctx.base, offset in B:C. Jump forward to after loop.
-                        const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
+                        const off_bits: u16 = @as(u16, inst.b) | (@as(u16, inst.c) << 8);
                         const off: i16 = @bitCast(off_bits);
                         ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
                         if (check_sigint and signal_int_pending.load(.acquire)) {
@@ -15449,7 +15446,7 @@ pub const Vm = struct {
                             exec_frames,
                             boundary_depth,
                             ctx.frame_index,
-                            a,
+                            inst.a,
                             null,
                             false,
                             .advance_instruction,
@@ -15467,18 +15464,18 @@ pub const Vm = struct {
                         }
                     },
                     .tbc => {
-                        const value = ctx.regs[a];
+                        const value = ctx.regs[inst.a];
                         // Lua permits nil/false as inert <close> sentinels. Any
                         // other value must already provide __close when the
                         // declaration becomes active; validating only at scope
                         // exit would incorrectly execute the function body.
                         if (value != .Nil and !(value == .Bool and !value.Bool)) {
                             if (self.getTmByObj(value, .close) == null) {
-                                const local_name = bytecodeLocalNameAt(ctx.cur_proto, a, ctx.pc) orelse "?";
+                                const local_name = bytecodeLocalNameAt(ctx.cur_proto, inst.a, ctx.pc) orelse "?";
                                 exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                                 return self.fail("variable '{s}' got a non-closable value", .{local_name});
                             }
-                            self.bc_tbc_regs.append(self.alloc, a) catch return error.OutOfMemory;
+                            self.bc_tbc_regs.append(self.alloc, inst.a) catch return error.OutOfMemory;
                         }
                     },
 
@@ -15527,9 +15524,9 @@ pub const Vm = struct {
 
                     // --- Error ---
                     .errdefined => {
-                        if (ctx.regs[a] != .Nil) {
-                            var constant_index: u32 = if (b > 0) @as(u32, b - 1) else 0;
-                            if (b == 0) {
+                        if (ctx.regs[inst.a] != .Nil) {
+                            var constant_index: u32 = if (inst.b > 0) @as(u32, inst.b - 1) else 0;
+                            if (inst.b == 0) {
                                 if (ctx.pc + 1 >= ctx.cur_proto.code.len or ctx.cur_proto.code[ctx.pc + 1].op != @intFromEnum(bc.Op.extraarg)) {
                                     exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                                     return self.fail("malformed ERRDEFINED instruction", .{});
@@ -15547,8 +15544,8 @@ pub const Vm = struct {
                         }
                     },
                     .errnnil => {
-                        if (ctx.regs[a] == .Nil) {
-                            const name = if (b > 0) ctx.cur_proto.k[b - 1] else bc.Constant.nil;
+                        if (ctx.regs[inst.a] == .Nil) {
+                            const name = if (inst.b > 0) ctx.cur_proto.k[inst.b - 1] else bc.Constant.nil;
                             const name_str = if (name == .str) name.str.bytes() else "<global>";
                             exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                             return self.fail("attempt to use a nil value (global '{s}')", .{name_str});

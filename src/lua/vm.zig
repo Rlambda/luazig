@@ -1992,9 +1992,6 @@ const InlineValues = struct {
 };
 
 pub const Thread = struct {
-    const WrapYield = struct {
-        values: []Value,
-    };
     gc_age: GcAge = .new,
     /// Position in `Vm.gc_objects` (P16.16 C1: u32; see Cell.gc_index).
     gc_index: u32 = 0,
@@ -2041,13 +2038,6 @@ pub const Thread = struct {
     /// P16.3: inline small-vector (0-4 values stay off the heap; the
     /// yield/resume hot loop must be allocation-free).
     yielded: InlineValues = .{},
-    wrap_eager_mode: bool = false,
-    wrap_started: bool = false,
-    wrap_yields: std.ArrayListUnmanaged(WrapYield) = .empty,
-    wrap_yield_index: usize = 0,
-    wrap_final_values: ?[]Value = null,
-    wrap_final_error: ?Value = null,
-    wrap_final_delivered: bool = false,
     close_mode: bool = false,
     /// P16.26 D: count of C-frames currently on this thread's frame stack.
     /// Mirrors what PUC knows structurally (a C CallInfo is on L->ci stack):
@@ -2072,9 +2062,6 @@ pub const Thread = struct {
     pending_close_err_active: bool = false,
     pending_close_err: Value = .Nil,
     dofile_entry_closure: ?*Closure = null,
-    resume_base_depth: usize = 0,
-    resume_pop_consumed: bool = false,
-    resume_recursive_mode: bool = false,
     /// Authoritative explicit bytecode activation stack for this Lua thread.
     /// Calls, metamethods, hooks, closers, protected calls, and coroutine
     /// switches all push continuations here instead of nesting runBytecode on
@@ -2128,13 +2115,8 @@ pub const Thread = struct {
     bytecode_close_metamethod_depth: usize = 0,
     bytecode_close_metamethod_err_depth: usize = 0,
     resume_inbox: InlineValues = .{},
-    tail_resume_inbox: ?[]Value = null,
     suspended_pc: usize = 0,
-    suspended_direct_yield: bool = false,
     capture_yield_id: usize = 0,
-    next_yield_id: usize = 1,
-    resume_yield_id: usize = 0,
-    yield_origin_depth: usize = 0,
     in_resume: bool = false,
     suspended_builtin: ?BuiltinId = null,
     /// P16.3: inline small-vector (0-4 values off-heap; see InlineValues).
@@ -2147,10 +2129,8 @@ pub const Thread = struct {
     /// [residue?, err, err]. Persists for the thread's lifetime, like
     /// the stack residue it transcribes.
     api_err_residue: ?Value = null,
-    capture_from_debug_hook: bool = false,
-    capture_from_count_hook: bool = false,
-    /// P15.68: True if the last yield was from inside a debug hook. Unlike
-    /// capture_from_debug_hook, this flag persists across coroutine.resume
+    /// P15.68: True if the last yield was from inside a debug hook. This flag
+    /// persists across coroutine.resume
     /// so that debug.getinfo can distinguish hook yields (level 0 = the
     /// interrupted Lua function) from non-hook testC yields (level 0 = the
     /// builtin that yielded).
@@ -3620,7 +3600,7 @@ pub const VmStats = struct {
     yields: u64 = 0,
     resumes: u64 = 0,
     /// Allocs performed on the yield path (th.yielded copies incl. wrap
-    /// mode, suspended_builtin_args copy, appendThreadWrapYield copy).
+    /// mode, suspended_builtin_args copy).
     yield_allocs: u64 = 0,
     /// Allocs performed on the resume path (resume inbox copy, entry_args
     /// save, trampoline args_copy + BytecodeCoroutineContinuation).
@@ -5016,13 +4996,6 @@ pub const Vm = struct {
             return self.activeBytecodeThread().debug_hook_event_tailcall;
         }
         return self.debug_hook_event_tailcall;
-    }
-
-    fn activeDebugHookEventIsCount(self: *Vm) bool {
-        if (self.activeAsyncDebugHookFrame()) |_| {
-            return self.activeBytecodeThread().debug_hook_event_is_count;
-        }
-        return self.debug_hook_event_is_count;
     }
 
     fn freeThreadBytecodeFrames(self: *Vm, th: *Thread) void {
@@ -8118,8 +8091,6 @@ pub const Vm = struct {
                     const th = self.current_thread orelse return error.Yield;
                     th.bytecode_inplace_suspended = true;
                     th.capture_yield_id = 0;
-                    th.capture_from_debug_hook = false;
-                    th.capture_from_count_hook = false;
                     return error.Yield;
                 },
                 else => return close_err,
@@ -10043,10 +10014,6 @@ pub const Vm = struct {
         switch (id) {
             .coroutine_yield => {
                 const th = self.current_thread orelse return false;
-                // Wrap eager mode has its own yield semantics: outs are
-                // consumed by the wrap driver (not error.Yield). The fast
-                // path skips Nil-fill of outs, which wrap_eager_mode needs.
-                if (th.wrap_eager_mode) return false;
                 // Close mode has special C-frame discard logic in
                 // builtinCoroutineResume (resetCI drops all C-frames).
                 if (th.close_mode) return false;
@@ -10156,13 +10123,7 @@ pub const Vm = struct {
 
     fn resetBytecodeCoroutineResumeState(th: *Thread) void {
         th.in_resume = false;
-        th.resume_pop_consumed = false;
-        th.resume_recursive_mode = false;
-        th.resume_yield_id = 0;
         th.capture_yield_id = 0;
-        th.capture_from_debug_hook = false;
-        th.capture_from_count_hook = false;
-        th.resume_base_depth = 0;
     }
 
     /// Prepare a coroutine selected by the trampoline. All allocations happen
@@ -10277,13 +10238,7 @@ pub const Vm = struct {
         request.caller.status = .suspended;
         target.status = .running;
         target.in_resume = true;
-        target.resume_pop_consumed = false;
-        target.resume_recursive_mode = false;
-        target.yield_origin_depth = 0;
-        target.suspended_direct_yield = false;
         target.capture_yield_id = 0;
-        target.resume_yield_id = 0;
-        target.resume_recursive_mode = false;
         target.caller = request.caller;
 
         // P15.33: Set current_thread before switchRuntime so that
@@ -10291,7 +10246,6 @@ pub const Vm = struct {
         // target thread's hook state.
         self.current_thread = target;
         self.switchRuntime(target);
-        target.resume_base_depth = 0;
         return first_start;
     }
 
@@ -12958,8 +12912,6 @@ pub const Vm = struct {
         // coroutine context switch. Clear only the frozen IR snapshot request that
         // the shared `coroutine.yield` builtin also arms.
         th.capture_yield_id = 0;
-        th.capture_from_debug_hook = false;
-        th.capture_from_count_hook = false;
     }
 
     /// A native/testC hook is represented by the frozen IR compatibility
@@ -20065,20 +20017,10 @@ pub const Vm = struct {
     }
 
     fn freeThreadWrapBuffers(self: *Vm, th: *Thread) void {
-        for (th.wrap_yields.items) |item| self.alloc.free(item.values);
-        th.wrap_yields.clearAndFree(self.alloc);
-        th.wrap_yield_index = 0;
-        if (th.wrap_final_values) |vals| {
-            self.alloc.free(vals);
-            th.wrap_final_values = null;
-        }
-        th.wrap_final_error = null;
-        th.wrap_final_delivered = false;
         th.wrap_repeat_closure = null;
         self.clearThreadContinuationScratch(th, .{});
         th.close_mode = false;
         th.dofile_entry_closure = null;
-        th.resume_base_depth = 0;
     }
 
     const ContinuationScratchClearOpts = struct {
@@ -20123,13 +20065,6 @@ pub const Vm = struct {
             self.forced_close_had_error = false;
         }
         th.close_mode = false;
-    }
-
-    fn appendThreadWrapYield(self: *Vm, th: *Thread, values: []const Value) DispatchError!void {
-        const copy = try self.alloc.alloc(Value, values.len);
-        if (self.stats.enabled) self.stats.yield_allocs += 1; // P16.0b
-        for (values, 0..) |v, i| copy[i] = v;
-        try th.wrap_yields.append(self.alloc, .{ .values = copy });
     }
 
     fn setThreadResumeInbox(self: *Vm, th: *Thread, values: []const Value) DispatchError!void {
@@ -20184,13 +20119,12 @@ pub const Vm = struct {
     }
 
     fn builtinCoroutineYield(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        _ = outs; // P16.2b: the yield path parks values in th.yielded; the
+        // caller of a yielding builtin never reads outs.
         // P16.2b: no outs pre-Nil here. The dominant path (plain yield)
         // returns error.Yield and the caller NEVER reads outs — the parked
         // resume delivers values via th.yielded; a 128-byte Nil memset per
         // yield was pure waste (9.2% memset in the coroutine profile).
-        // The wrap_eager branch below returns normally, so its outs ARE
-        // read by the caller — Nil-fill only there (behavior preserved:
-        // the wrap driver consumes values from th.wrap_yields, not outs).
         // PUC luaG_runerror: coroutine.yield is a C function, so isLua(ci) is
         // false and luaG_addinfo is NOT called — no "file:line:" prefix on the
         // error message. Use failC (C-function variant) to match this.
@@ -20215,30 +20149,14 @@ pub const Vm = struct {
         if (th.close_mode) return self.failRunerror("attempt to yield across a C-call boundary", .{});
         if (self.stats.enabled) self.stats.yields += 1; // P16.0b (yield committed)
         // A fresh yield supersedes previously captured continuation snapshots.
-        th.capture_yield_id = th.next_yield_id;
-        th.next_yield_id +%= 1;
-        th.capture_from_debug_hook = self.isInDebugHook();
+        // Only `!= 0` is ever tested — a constant nonzero id suffices.
+        th.capture_yield_id = 1;
         th.yielded_from_debug_hook = self.isInDebugHook();
-        th.capture_from_count_hook = self.isInDebugHook() and self.activeDebugHookEventIsCount();
-        // P15.40b-full: Bytecode frames are in Thread.call_frames.
-        const th_bc = self.activeBytecodeThread();
-        th.yield_origin_depth = th_bc.call_frames.len();
         // P16.28 T3: NO eager traceback snapshot on yield — the suspended
         // path builds lazily (buildSuspendedFrameNames) from retained
         // frames; the dead-error path captures once at the terminal
         // boundary. The old per-yield 64-name walk was hot-path work for
         // debug output that is almost never requested.
-        if (th.wrap_eager_mode) {
-            for (outs) |*o| o.* = .Nil;
-            try self.appendThreadWrapYield(th, args);
-            th.yielded.deinit(self.alloc);
-            if (args.len > INLINE_VALUES_CAP) {
-                if (self.stats.enabled) self.stats.yield_allocs += 1; // P16.0b (heap spill only)
-            }
-            try th.yielded.setFrom(self.alloc, args);
-            self.last_builtin_out_count = args.len;
-            return;
-        }
         // P16.3: setFrom stores inline for <= INLINE_VALUES_CAP values — the
         // dominant `coroutine.yield(v)` (0-4 values) does not touch the heap.
         th.yielded.deinit(self.alloc);
@@ -20507,21 +20425,10 @@ pub const Vm = struct {
         th.api_status = 0; // LUA_OK — running (PUC: L->status = 0 before resume)
         if (self.stats.enabled) self.stats.resumes += 1; // P16.0b (resume committed)
         th.in_resume = true;
-        th.resume_pop_consumed = false;
-        th.resume_recursive_mode = false;
-        th.yield_origin_depth = 0;
-        th.suspended_direct_yield = false;
         th.capture_yield_id = 0;
-        th.resume_yield_id = 0;
-        th.resume_recursive_mode = false;
         defer {
             th.in_resume = false;
-            th.resume_pop_consumed = false;
-            th.resume_recursive_mode = false;
-            th.resume_yield_id = 0;
             th.capture_yield_id = 0;
-            th.capture_from_debug_hook = false;
-            th.capture_from_count_hook = false;
         }
         defer {
             if (th.status == .running) {
@@ -20581,12 +20488,10 @@ pub const Vm = struct {
         self.current_thread = th;
         self.switchRuntime(th);
         th.caller = prev_thread;
-        th.resume_base_depth = 0;
         defer {
             self.switchRuntime(prev_runtime_thread);
             self.current_thread = prev_thread;
             th.caller = null;
-            th.resume_base_depth = 0;
             if (prev_thread) |pt| {
                 if (prev_thread_status) |st| pt.status = st;
             }
@@ -23570,7 +23475,6 @@ pub const Vm = struct {
                 // Free all optional []Value buffers on the Thread.
                 th.yielded.deinit(self.alloc);
                 th.resume_inbox.deinit(self.alloc);
-                if (th.tail_resume_inbox) |inbox| self.alloc.free(inbox);
                 th.suspended_builtin_args.deinit(self.alloc);
                 self.gcNoteFree(@sizeOf(Thread));
                 self.alloc.destroy(th);
@@ -24052,20 +23956,6 @@ pub const Vm = struct {
                         try self.gcMarkValue(rv);
                     }
                 }
-                for (th.wrap_yields.items) |item| {
-                    for (item.values) |yv| {
-                        if (GcObject.fromValue(yv) != null) {
-                            try self.gcMarkValue(yv);
-                        }
-                    }
-                }
-                if (th.wrap_final_values) |vals| {
-                    for (vals) |yv| {
-                        if (GcObject.fromValue(yv) != null) {
-                            try self.gcMarkValue(yv);
-                        }
-                    }
-                }
                 if (th.wrap_repeat_closure) |cl| {
                     try self.gcMarkValue(.{ .Closure = cl });
                 }
@@ -24073,13 +23963,6 @@ pub const Vm = struct {
                     try self.gcMarkValue(.{ .Closure = cl });
                 }
                 if (th.resume_inbox.slice()) |vals| {
-                    for (vals) |yv| {
-                        if (GcObject.fromValue(yv) != null) {
-                            try self.gcMarkValue(yv);
-                        }
-                    }
-                }
-                if (th.tail_resume_inbox) |vals| {
                     for (vals) |yv| {
                         if (GcObject.fromValue(yv) != null) {
                             try self.gcMarkValue(yv);
@@ -26859,8 +26742,8 @@ pub const Vm = struct {
                         // frame is level 1. This mirrors PUC where a C
                         // function's CallInfo is on top when it yields. Our
                         // builtins don't push frames, so we detect this via
-                        // th.suspended_builtin and !th.capture_from_debug_hook.
-                        // For hook yields (capture_from_debug_hook=true), the
+                        // th.suspended_builtin and !th.yielded_from_debug_hook.
+                        // For hook yields (yielded_from_debug_hook=true), the
                         // hook frame was already popped by P15.67, so level 0
                         // is the interrupted Lua function.
                         if (th.suspended_builtin != null and !th.yielded_from_debug_hook) {
@@ -28315,24 +28198,13 @@ pub const Vm = struct {
     }
 
     fn debugBuildCurrentTraceback(self: *Vm, level: i64) DispatchError![]const u8 {
-        // When running inside a coroutine, only include frames created after
-        // the latest resume boundary; caller frames outside the coroutine
-        // should not leak into this traceback.
-        const start: usize = if (self.current_thread) |th|
-            if (self.main_thread) |main_th|
-                if (th != main_th) th.resume_base_depth else 0
-            else
-                0
-        else
-            0;
-
         // Walk bytecode frames (Thread.call_frames) (most recent first).
         // Build a list of *const CallFrame pointers so we can reference
         // frames from the array.
         var visible: usize = 0;
         const th_bc = self.activeBytecodeThread();
         const bc_len = th_bc.call_frames.len();
-        for (start..bc_len) |i| {
+        for (0..bc_len) |i| {
             if (!th_bc.call_frames.getConstPtr(i).isHidden()) visible += 1;
         }
 
@@ -28353,7 +28225,7 @@ pub const Vm = struct {
         defer frame_ptrs.deinit(self.alloc);
         {
             var i: usize = th_bc.call_frames.len();
-            while (i > start) {
+            while (i > 0) {
                 i -= 1;
                 if (th_bc.call_frames.getConstPtr(i).isHidden()) continue;
                 try frame_ptrs.append(self.alloc, th_bc.call_frames.getPtr(i));

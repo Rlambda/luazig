@@ -1,4 +1,4 @@
-> Last updated: 2026-09-07 (P16.29 T3 codegen parity — TESTSET machinery, EQK nil/bool + codeeq swap, outermost CLOSE skip + main RETURN rewrite, SELF fresh-A (call+tailcall), count-hook mask removed; geomean 1.63x, perf OK)
+> Last updated: 2026-09-08 (P16.29 T5 xpcall throw-site errfunc — invokeErrfunc rewrite, errfunc_running_idx slot guard, raiseErrerr (luaD_errerr) + SO-margin errerr, popBytecodeExecFrame C-frame teardown (c_frame_count leak fix), GC errfunc marking, getinfo C-frame fill; smoke 71/71, geomean 1.63x, perf OK)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -5227,6 +5227,93 @@ both_fail pre-existing), c_api 51+diff PASS, api580 GREEN (D+RF).
 Не закоммичено — оставлено dirty для ревью (layout-дельты branch_loop/
 int_arith вынесены на решение: accept-as-layout vs продолжение борьбы
 с lottery).
+
+### P16.29 T5: xpcall message handler — throw-site invocation (2026-09-08)
+Миграция xpcall msgh с post-unwind вызова на PUC-faithful throw-site
+вызов через `th.errfunc`/`invokeErrfunc` (PUC `luaG_errormsg`): хендлер
+запускается В МОМЕНТ броска (frames intact — getinfo/traceback видят
+кадры упавшего вызова), результат хендлера заменяет error object AS-IS.
+
+- **`invokeErrfunc` rewrite** (PUC luaG_errormsg): ранние выходы;
+  un-hide верхнего hidden C-frame для окна хендлера (defer re-hide);
+  `in_error_handler += 1`; gcTempRoots для emsg; retry-loop (PUC
+  recursion): depth ≥ 256 → "C stack overflow" emergency → errerr
+  (`err_is_errerr=true`, "error in error handling"); success: err_obj =
+  результат as-is, nil → `"<no error object>"`; **err_source/err_line
+  сбрасываются** (PUC печёт position prefix ТОЛЬКО на исходном raise —
+  результат хендлера не префиксируется на boundary; закрыто
+  ef_so/XIH-расхождение "file:1: H" vs "H").
+- **`errfunc_running_idx`** (был bool `errfunc_running`): re-entrancy
+  guard по СЛОТУ, не по факту "хендлер крутится": xpcall ВНУТРИ
+  хендлера армит свой errfunc → его хендлер обязан отработать (PUC
+  recursion); повторный вход ТОГО ЖЕ окна подавляется (retry-loop
+  заменяет recursion). Закрыто XIH-расхождение (coroutine.lua:568-класс).
+- **Slow path** (`builtinXpcall`, builtin-таргет): арминг
+  `setErrfuncValue(args[1])` + defer pop/restore; ≥128 depth-ветка
+  растит стек до ERRORSTACKSIZE + явный `invokeErrfunc`; setFail удалён
+  → `writeFailure` (false + protectedErrorValue — хендлер уже ran).
+- **Fast path** (`tryPushBytecodeProtectedCall`): `BytecodeProtectedCall.
+  armed_errfunc` (арминг после `active_armed=false`), pop в
+  finishBytecodeProtectedCall, clear в discardBytecodeProtectedCall;
+  phase/handler/handler_depth/on_error_stack УДАЛЕНЫ;
+  `startBytecodeXpcallHandler` удалён; `bytecode_error_handler_depth`
+  field удалён; `activeErrorHandlerDepth()` = только in_error_handler.
+- **errerr как OBJECT**: pcall внутри хендлера возвращает РЕАЛЬНУЮ
+  ошибку (PUC finishpcallk) — pre-existing PIH-расхождение закрыто;
+  `builtinPcall` setFail depth-check удалён; enrichment-сайты
+  (bytecodeIndexValue/SetIndexValue, __call ×2) — disarm/re-arm вокруг
+  внутреннего вызова (PUC varinfo композит на SINGLE raise site —
+  intermediate raise handler-silent, "handler runs once").
+- **`raiseErrerr` helper** (PUC luaD_errerr, ldo.c:215): errerr
+  транспортируется как object; ВТОРОЙ вызов из `pushBytecodeExecFrame`
+  handling_overflow-ветки — PUC luaD_growstack (ldo.c:355): grow-request
+  при стеке уже на ERRORSTACKSIZE = хендлер исчерпал emergency headroom
+  → "error in error handling", НЕ свежий "stack overflow". Закрыт
+  regression smoke 24 (`pcall(loop)` внутри stack-overflow хендлера).
+- **`popBytecodeExecFrame` C-frame teardown** (P16.29 T5): C-фреймы,
+  попаемые через generic pop (errdefer-fallback unwind +
+  continueBytecodeErrorUnwind — suspend/error внутри C-фреймов, напр.
+  yield внутри xpcall-builtin + coroutine.close re-drive), получают тот
+  же teardown, что `popBuiltinCFrame`: freeCFrameOwnedState,
+  c_toclose_slots truncate, **`c_frame_count` decrement**. До фикса
+  count утекал (счётчик оставался 2 при 0 C-фреймах) — pre-existing leak,
+  экспонированный новым assert'ом в invokeErrfunc defer; stale count
+  менял yieldability-решения (canParkDirectBytecodeYield читает
+  c_frame_count). Закрыт Debug-panic на coroutine.lua:568
+  (xpcall(coroutine.yield, h) + close).
+- **GC**: armed errfunc слот на bc_stack между frame windows —
+  gcMarkMutableRoots + gcMarkValue `.thread` (stackForThread) помечают
+  `bc_stack[th.errfunc]` (PUC traversethread красит L->stack[0..top]
+  wholesale).
+- **getinfo C-frame fill**: level-based getinfo для `.Builtin`
+  func_slot заполняет what/source через debugFillInfoFromFunction
+  ("C"/"=[C]") — PUC funcinfo parity (probe 6: `L2:-1/C/=[C]`).
+- **builtinCoroutineClose**: `th.errfunc = ERRFUNC_NONE` на 3 dead-
+  переходах (PUC luaE_resetthread).
+
+Гейт: zig build test D+RF 0; smoke **71/71 PASS** (новый
+`71_xpcall_errfunc_timing.lua`: TBC ordering, getinfo L2/L3, raw nil,
+"<no error object>", non-string as-is, handler-retry, errerr, SO-margin
+errerr, PIH/XIH/I3, handler-runs-once (index/call annotations), parked
+yield+error-after-resume, assert, no-re-prefix; починен
+`24_xpcall_error_stack.lua`); lanes coroutine/db/closure/errors/events/
+attrib/code/nextvar/calls/files/gc OK; locals/cstack DIFF — pre-existing
+(zig output byte-identical pre/post T5, проверено stash A/B); matrix
+--testc 31/32 (big.lua zig_fail pre-existing, output identical pre/post);
+c_api make test + test-diff PASS; api580 GREEN; mm_torture_T4/t2_torture
+PUC-identical (modulo addresses); perf_compare **OK** (geomean 1.63x,
+регрессий нет). Не закоммичено — по явной инструкции пользователя.
+
+Оставшиеся расхождения (pre-existing, вне скоупа T5):
+1. fast-path xpcall не пушит C-frame → getinfo level 3 в хендлере при
+   runtime-error показывает `main` вместо PUC `-1/C` (xpcall C-frame;
+   traceback синтезирует его, getinfo levels — нет; нужен virtual level
+   synthesis или C-frame push в fast path).
+2. slow-path yield-across: `xpcall(coroutine.yield, h, "yv")` /
+   `pcall(coroutine.yield, "yv")` в короутине теряют resume-значения
+   (zig `true yv` / `true resumed nil` vs PUC `true true resumed`).
+3. `math.max("x")`: PUC 5.5 возвращает "x", zig ошибается (math lib
+   coercion — отдельная фаза).
 
 ## История закрытых фаз
 

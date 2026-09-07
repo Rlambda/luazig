@@ -36,24 +36,24 @@ Method: median-of-7 per workload, pinned CPU core (`tools/perf_compare.py`).
 
 | Workload | Zig/PUC |
 |----------|--------:|
-| metamethod_add | 2.67x |
-| metamethod_call_noalloc | 2.42x |
+| metamethod_add | 2.56x |
+| metamethod_call_noalloc | 2.34x |
+| table_alloc_setmetatable | 2.12x |
 | hash_access | 2.11x |
-| table_alloc_setmetatable | 2.06x |
-| coroutine_yield | 2.01x |
-| branch_loop | 1.95x |
-| array_access | 1.92x |
-| lua_calls | 1.92x |
-| field_access | 1.89x |
-| temp_table_alloc | 1.80x |
-| comparisons | 1.62x |
-| mixed_arith | 1.62x |
-| float_arith | 1.58x |
+| coroutine_yield | 2.08x |
+| branch_loop | 1.96x |
+| field_access | 1.96x |
+| array_access | 1.91x |
+| lua_calls | 1.88x |
+| temp_table_alloc | 1.84x |
+| global_arith | 1.75x |
+| comparisons | 1.61x |
+| mixed_arith | 1.60x |
 | dynamic_load | 1.58x |
-| global_arith | 1.52x |
-| int_arith | 1.51x |
-| string_loop | 1.24x |
-| string_concat | 1.09x |
+| float_arith | 1.52x |
+| int_arith | 1.49x |
+| string_loop | 1.25x |
+| string_concat | 1.07x |
 <!-- END GENERATED STATUS -->
 
 See [STATUS.md](STATUS.md) for detailed profiling methodology, hotspot analysis, and optimization history.

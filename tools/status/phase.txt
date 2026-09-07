@@ -1,1 +1,1 @@
-P16.27 T1 CLOSED — CloseCallPolicy enum, nny owned by __close invocation, forced-close RuntimeError bypasses deleted, smoke70 70/70 PUC-identical, sc3/coroutine.lua/locals.lua close sections green
+P16.27 COMPLETE — T0 truth (c_frame_count repaired, nested-rejection root-understood), T1 CloseCallPolicy (smoke70 70/70), T2 codegen short-string (branch-free), T5.A pushStaged hot/cold split, T5.B frame-entry single-getPtr; T3 lazy-traceback honest revert

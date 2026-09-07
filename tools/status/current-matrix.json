@@ -1,29 +1,28 @@
 {
   "meta": {
-    "created_utc": "2026-09-07T10:46:44.035072+00:00",
+    "created_utc": "2026-09-07T13:38:49.491256+00:00",
     "lane": "testes_matrix",
     "argv": [
-      "tools/testes_matrix.py",
+      "/home/boss/codes/luazig/tools/testes_matrix.py",
       "--testc",
-      "--diff",
       "--json-out",
-      "/tmp/opencode/m27fin.json"
+      "/home/boss/codes/luazig/tools/status/.tmp.matrix.hyqbcxwc.json"
     ],
     "zig_version": "0.16.0"
   },
   "provenance": {
-    "git_head": "6eed7b3",
-    "measured_source_head": "6eed7b3",
-    "git_dirty": "clean",
+    "git_head": "d798178",
+    "measured_source_head": "d798178",
+    "git_dirty": "dirty",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "8bbcf2d0ba5ee8f4",
+    "zig_binary_sha16": "44a22b526da2143d",
     "puc_binary_sha16": "d54bc45e1757b216"
   },
   "summary": {
     "total": 32,
-    "pass": 18,
-    "output_diff": 13,
+    "pass": 31,
+    "output_diff": 0,
     "zig_fail": 0,
     "both_fail": 1,
     "both_fail_infra": 0,
@@ -32,12 +31,12 @@
   "rows": [
     {
       "file": "api.lua",
-      "class": "output_diff",
+      "class": "pass",
       "ref_exit": 0,
       "zig_exit": 0,
       "zig_reason": "",
       "ref_reason": "",
-      "diff": "--- ref/api.lua\n+++ zig/api.lua\n@@ -1,3 +1,12 @@\n-\n- >>> testC not active: skipping API tests <<<\n-\n+testing C API\n+testing panic function\n+testing stack overflow\n++\n+testing load of binaries in fixed buffers\n+testing stack overflow in unprotected thread\n++\n++\n++\n... (3 more diff lines)"
+      "diff": ""
     },
     {
       "file": "attrib.lua",
@@ -55,7 +54,7 @@
       "zig_exit": 1,
       "zig_reason": "[C]: in ?",
       "ref_reason": "[C]: in ?",
-      "diff": "--- ref/big.lua\n+++ zig/big.lua\n@@ -6 +6,5 @@\n \t[C]: in ?\n+stack traceback:\n+\t[C]: in field 'yield'\n+\tbig.lua:56: in main chunk\n+\t[C]: in ?"
+      "diff": ""
     },
     {
       "file": "bitwise.lua",
@@ -95,12 +94,12 @@
     },
     {
       "file": "code.lua",
-      "class": "output_diff",
+      "class": "pass",
       "ref_exit": 0,
       "zig_exit": 0,
       "zig_reason": "",
       "ref_reason": "",
-      "diff": "--- ref/code.lua\n+++ zig/code.lua\n@@ -1,3 +1,3 @@\n-\n- >>> testC not active: skipping opcode tests <<<\n-\n+testing code generation and optimizations\n+testing code for integer limits\n+OK"
+      "diff": ""
     },
     {
       "file": "constructs.lua",
@@ -113,21 +112,21 @@
     },
     {
       "file": "coroutine.lua",
-      "class": "output_diff",
+      "class": "pass",
       "ref_exit": 0,
       "zig_exit": 0,
       "zig_reason": "",
       "ref_reason": "",
-      "diff": "--- ref/coroutine.lua\n+++ zig/coroutine.lua\n@@ -4,5 +4,5 @@\n coroutines closing itself\n-\n- >>> testC not active: skipping coroutine API tests <<<\n-\n+testing yields inside hooks\n+testing coroutine API\n++\n +\n@@ -11,5 +11,3 @@\n testing yields inside 'for' iterators\n-\n- >>> testC not active: skipping coroutine API tests <<<\n... (3 more diff lines)"
+      "diff": ""
     },
     {
       "file": "cstack.lua",
-      "class": "output_diff",
+      "class": "pass",
       "ref_exit": 0,
       "zig_exit": 0,
       "zig_reason": "",
       "ref_reason": "",
-      "diff": "--- ref/cstack.lua\n+++ zig/cstack.lua\n@@ -4,3 +4,3 @@\n testing recursion inside pattern matching\n-testing stack-overflow in recursive 'gsub'\n+.testing stack-overflow in recursive 'gsub'\n final count:\tN\n@@ -9,9 +9,12 @@\n testing limits in coroutines inside deep calls\n-final count:\tN\n+..final count:\tN\n chain of 'coroutine.close'\n-final count:\tN\n+..final count:\tN\n nesting of resuming yielded coroutines\n... (8 more diff lines)"
+      "diff": ""
     },
     {
       "file": "db.lua",
@@ -140,21 +139,21 @@
     },
     {
       "file": "errors.lua",
-      "class": "output_diff",
+      "class": "pass",
       "ref_exit": 0,
       "zig_exit": 0,
       "zig_reason": "",
       "ref_reason": "",
-      "diff": "--- ref/errors.lua\n+++ zig/errors.lua\n@@ -1,5 +1,3 @@\n testing errors\n-\n- >>> testC not active: skipping tests for messages in C <<<\n-\n+testing memory error message\n +"
+      "diff": ""
     },
     {
       "file": "events.lua",
-      "class": "output_diff",
+      "class": "pass",
       "ref_exit": 0,
       "zig_exit": 0,
       "zig_reason": "",
       "ref_reason": "",
-      "diff": "--- ref/events.lua\n+++ zig/events.lua\n@@ -1,5 +1,2 @@\n testing metatables\n-\n- >>> testC not active: skipping tests for userdata <<<\n-\n +"
+      "diff": ""
     },
     {
       "file": "files.lua",
@@ -167,30 +166,30 @@
     },
     {
       "file": "gc.lua",
-      "class": "output_diff",
+      "class": "pass",
       "ref_exit": 0,
       "zig_exit": 0,
       "zig_reason": "",
       "ref_reason": "",
-      "diff": "--- ref/gc.lua\n+++ zig/gc.lua\n@@ -8,7 +8,6 @@\n +\n-\n- >>> testC not active: skipping userdata GC tests <<<\n-\n long list\n self-referenced threads\n++\n+emergency collections\n OK"
+      "diff": ""
     },
     {
       "file": "gengc.lua",
-      "class": "output_diff",
+      "class": "pass",
       "ref_exit": 0,
       "zig_exit": 0,
       "zig_reason": "",
       "ref_reason": "",
-      "diff": "--- ref/gengc.lua\n+++ zig/gengc.lua\n@@ -2,5 +2,3 @@\n +\n-\n- >>> testC not active: skipping some generational tests <<<\n-\n+testing stop-the-world collection\n OK"
+      "diff": ""
     },
     {
       "file": "goto.lua",
-      "class": "output_diff",
+      "class": "pass",
       "ref_exit": 0,
       "zig_exit": 0,
       "zig_reason": "",
       "ref_reason": "",
-      "diff": "--- ref/goto.lua\n+++ zig/goto.lua\n@@ -1,3 +1,2 @@\n testing goto and global declarations\n-  ('global' is not a reserved word)\n testing initialization in global declarations"
+      "diff": ""
     },
     {
       "file": "literals.lua",
@@ -203,12 +202,12 @@
     },
     {
       "file": "locals.lua",
-      "class": "output_diff",
+      "class": "pass",
       "ref_exit": 0,
       "zig_exit": 0,
       "zig_reason": "",
       "ref_reason": "",
-      "diff": "--- ref/locals.lua\n+++ zig/locals.lua\n@@ -5,4 +5,6 @@\n testing errors in __close\n+......+\n to-be-closed variables in coroutines\n-.OK\n+.to-be-closed variables x coroutines in C\n+OK\n ."
+      "diff": ""
     },
     {
       "file": "math.lua",
@@ -221,21 +220,21 @@
     },
     {
       "file": "memerr.lua",
-      "class": "output_diff",
+      "class": "pass",
       "ref_exit": 0,
       "zig_exit": 0,
       "zig_reason": "",
       "ref_reason": "",
-      "diff": "--- ref/memerr.lua\n+++ zig/memerr.lua\n@@ -1,3 +1,44 @@\n-\n- >>> testC not active: skipping memory error tests <<<\n-\n+testing memory-allocation errors\n+minimum allocations for function call: 0 allocations\n+minimum memory for function call: 0 bytes\n+minimum allocations for state creation: 12 allocations\n+minimum memory for state creation: 56 bytes\n+minimum allocations for empty-table creation: 1 allocations\n+minimum memory for empty-table creation: 0 bytes\n+minimum allocations for string creation: 0 allocations\n+minimum memory for string creation: 0 bytes\n... (35 more diff lines)"
+      "diff": ""
     },
     {
       "file": "nextvar.lua",
-      "class": "output_diff",
+      "class": "pass",
       "ref_exit": 0,
       "zig_exit": 0,
       "zig_reason": "",
       "ref_reason": "",
-      "diff": "--- ref/nextvar.lua\n+++ zig/nextvar.lua\n@@ -1,5 +1,2 @@\n testing tables, next, and for\n-\n- >>> testC not active: skipping tests for table sizes <<<\n-\n +\n@@ -10,5 +7,2 @@\n testing next x GC of deleted keys\n-\n- >>> testC not active: skipping tests for table library on non-tables <<<\n-\n +"
+      "diff": ""
     },
     {
       "file": "pm.lua",
@@ -257,12 +256,12 @@
     },
     {
       "file": "strings.lua",
-      "class": "output_diff",
+      "class": "pass",
       "ref_exit": 0,
       "zig_exit": 0,
       "zig_reason": "",
       "ref_reason": "",
-      "diff": "--- ref/strings.lua\n+++ zig/strings.lua\n@@ -4,8 +4,4 @@\n 'ctype' locale not found\n-\n- >>> testC not active: skipping 'pushfstring' tests <<<\n-\n-\n- >>> testC not active: skipping external strings tests <<<\n-\n+testing 'pushfstring'\n+testing external strings\n OK"
+      "diff": ""
     },
     {
       "file": "test_close_meta.lua",
@@ -318,29 +317,5 @@
       "ref_reason": "",
       "diff": ""
     }
-  ],
-  "diff_classification": {
-    "summary": "13 output_diff under strict --diff for the first time: 11 structural-T (reference binary has no testC module; they align in the lane environment where PUC gets the real module), 1 GC-pacing (locals), 1 real semantic (cstack: stack-depth count + LUAI_MAXCCALLS C-recursion limit + pacing dots).",
-    "per_file": {
-      "api.lua": "structural-T (PUC lacks testC module; aligns in api_regression_lane env)",
-      "code.lua": "structural-T",
-      "coroutine.lua": "structural-T (+ any lane-env residue to recheck there)",
-      "errors.lua": "structural-T",
-      "events.lua": "structural-T",
-      "gc.lua": "structural-T",
-      "gengc.lua": "structural-T",
-      "goto.lua": "structural-T (if not T branch; identical without --testc \u2014 verified)",
-      "memerr.lua": "structural-T",
-      "nextvar.lua": "structural-T",
-      "strings.lua": "structural-T",
-      "locals.lua": "GC-pacing dots (see locals-tracegc-divergence.json)",
-      "cstack.lua": "REAL pre-existing semantic gaps: (1) stack-overflow depth count 250043 vs 262021 (per-frame slot budget arithmetic); (2) gsub C-recursion limit ~197 vs 99977 (LUAI_MAXCCALLS=200 not enforced/mirrored on that path); (3) tracegc dots; (4) 196 vs 199 near-limit counts"
-    },
-    "backlog": [
-      "cstack: mirror PUC LUAI_MAXCCALLS (~200) C-call limit on the gsub/pattern path",
-      "cstack: stack-overflow depth-count parity (per-frame slot budget vs PUC)",
-      "locals+cstack: GC-pacing window alignment phase"
-    ],
-    "note": "Previously current-matrix.json ran WITHOUT --diff (output_diff=0 meant \"not run\"). From P16.22 the strict lane is canonical."
-  }
+  ]
 }

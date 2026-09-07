@@ -1,4 +1,4 @@
-> Last updated: 2026-09-06 (P16.27 T1 CLOSED — CloseCallPolicy enum, nny owned by __close invocation, forced-close RuntimeError bypasses deleted, smoke70 70/70 PUC-identical, sc3/coroutine.lua/locals.lua close sections green)
+> Last updated: 2026-09-07 (P16.27 COMPLETE — T0 truth (c_frame_count repaired, nested-rejection root-understood), T1 CloseCallPolicy (smoke70 70/70), T2 codegen short-string (branch-free), T5.A pushStaged hot/cold split, T5.B frame-entry single-getPtr; T3 lazy-traceback honest revert)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -5011,6 +5011,31 @@ field/coroutine/hash instr ↓). Гейт (сабагент): все линии 
 - **smoke70 = 70/70 PUC-ИДЕНТИЧНО**; recov3/sc3/chain2 PUC-идентичны;
   14 сьютов --testc зелёные; c_api 20+diff GREEN; api580 376/376.
 - Geomean-сессия 1.76688 (correctness-кут; +0.35% session drift).
+
+### P16.27 ИТОГ (полная фаза, e7bdd22→final)
+
+| Workstream | Статус | Коммит(ы) |
+|---|---|---|
+| T0.1 c_frame_count lifecycle | FIXED | cc5d734 |
+| T0.2 nested-rejection | REVERTED (root-understood) | f57791d |
+| T0.3 corrected baseline | 1.7636 | 6adf61c |
+| **T1 CloseCallPolicy** | **CLOSED: smoke70 70/70** | 1f0d1d8 |
+| **T2 codegen short-string** | **KEEP: branch-free handlers** | c551938+914b38d |
+| T3 lazy traceback | REVERTED (backlog: dead-error) | — |
+| **T5.A pushStaged split** | **KEEP** | 4303fa8 |
+| **T5.B frame-entry getPtr** | **KEEP** | 6eed7b3 |
+| T4 dispatch_pc | DEFERRED (2 cold readers; 1 store/instr not material) | — |
+
+**Счётчиковые куты** (instr/iter, causal):
+- lua_calls: 3.371→3.280G (T5.A −21 + T5.B −14 = **−35 i/it**)
+- field_access: 2.042→1.946G (T2)
+- coroutine_yield: 1.502→1.477G (T2 + T5)
+- hash_access: 1.880→1.854G (T2)
+- noalloc: 424→422M
+
+**Гейт**: 11/11; smoke **70/70**; matrix zig_fail=0; api580 376/376;
+c_api 20+diff; 14 сьютов; native BOUNDED; hookstress 1-3.
+**Geomean**: B0 1.792→**1.775** (−0.95% same-session; correctness-фаза).
 
 ## История закрытых фаз
 

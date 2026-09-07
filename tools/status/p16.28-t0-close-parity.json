@@ -1,0 +1,25 @@
+{
+  "created_utc": "2026-09-07T11:46:16.876137+00:00",
+  "provenance": {
+    "git_head": "90a6c31",
+    "measured_source_head": "90a6c31",
+    "git_dirty": "clean",
+    "zig_version": "0.16.0",
+    "zig_binary_sha16": "8bbcf2d0ba5ee8f4",
+    "input": "90a6c31"
+  },
+  "r1_pcall_error_close": {
+    "PUC": "true Y|suspended|iy=true",
+    "zig": "identical",
+    "note": "pcall error cleanup inside coroutine: close IS yieldable in PUC \u2014 Lua-level pcall goes through lua_pcallk(docallK)+finishpcall, NOT luaD_pcall+f_call; the yy=0 luaD_closeprotected path is for C-API lua_pcall WITHOUT k"
+  },
+  "r1b_no_yield_close": {
+    "PUC": "dead|iy=true|outer=false",
+    "zig": "identical"
+  },
+  "r2_finishpcallk": {
+    "PUC": "iy=true|outer=false err=late",
+    "zig": "identical"
+  },
+  "conclusion": "P16.27 yy table needs correction for the coroutine case: Lua-level pcall(f) inside a coroutine is yieldable-close even on error; the yy=0 luaD_closeprotected is for bare C-API lua_pcall; our CloseCallPolicy already yields the correct behavior (both r1/r2 identical)"
+}

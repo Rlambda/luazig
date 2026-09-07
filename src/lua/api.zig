@@ -3,6 +3,7 @@ const stdio = @import("util").stdio;
 
 const source_mod = @import("source.zig");
 const vm_mod = @import("vm.zig");
+const ltable = @import("ltable.zig");
 
 pub const ApiError = std.mem.Allocator.Error || error{
     Type,
@@ -1287,7 +1288,7 @@ fn isFileUserdata(tbl: *vm_mod.Table) bool {
         // `key_tt` collapses three checks into one: empty nodes, dead keys, and
         // non-string keys all fail the `!= .string` test. Only live String keys
         // reach the byte comparison below.
-        if (node.key_tt != .string) continue;
+        if (!ltable.Node.isStringTag(node.key_tt)) continue;
         if (node.value == .Nil) continue;
         if (std.mem.eql(u8, node.key_val.string.bytes(), "__name")) {
             const nm = node.value;

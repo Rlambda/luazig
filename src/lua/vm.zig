@@ -28245,7 +28245,7 @@ pub const Vm = struct {
         if (callee != .Closure) return null;
         const target_cl = callee.Closure;
         for (self.global_env.hash) |*node| {
-            if (node.key_tt != .string) continue;
+            if (!ltable.Node.isStringTag(node.key_tt)) continue;
             if (node.value == .Nil) continue;
             if (node.value == .Closure and node.value.Closure == target_cl) {
                 return node.key_val.string.bytes();

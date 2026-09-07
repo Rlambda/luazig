@@ -13314,22 +13314,30 @@ pub const Vm = struct {
         frame_loop: while (exec_frames.len() > boundary_depth) {
             ctx.frame_index = exec_frames.len() - 1;
 
-            if (self.getPendingCallConst(exec_frames.getPtr(ctx.frame_index).pending_call_index)) |pending| {
-                switch (pending.completion) {
-                    .results => {}, // IR closure resume removed — all closures have proto
-                    .close => |cont| if (cont.waiting_builtin_yield and !cont.child_active) {
-                        switch (try self.continueBytecodeClose(exec_frames, boundary_depth, ctx.frame_index)) {
-                            .resume_dispatch => continue :frame_loop,
-                            .final => |final| return final,
-                            .propagate_error => {
-                                return error.RuntimeError;
-                            },
-                        }
-                    },
-                    else => {},
+            // P16.27 T5.B: ONE frame pointer for the whole entry sequence
+            // (pending-call check + identity + hot-field init previously
+            // paid THREE separate getPtr calls — each is an inline-vs-heap
+            // branch + index computation).
+            const entry_fr = exec_frames.getPtr(ctx.frame_index);
+
+            if (entry_fr.pending_call_index != INVALID_PENDING) {
+                if (self.getPendingCallConst(entry_fr.pending_call_index)) |pending| {
+                    switch (pending.completion) {
+                        .results => {}, // IR closure resume removed — all closures have proto
+                        .close => |cont| if (cont.waiting_builtin_yield and !cont.child_active) {
+                            switch (try self.continueBytecodeClose(exec_frames, boundary_depth, ctx.frame_index)) {
+                                .resume_dispatch => continue :frame_loop,
+                                .final => |final| return final,
+                                .propagate_error => {
+                                    return error.RuntimeError;
+                                },
+                            }
+                        },
+                        else => {},
+                    }
                 }
             }
-            const frame_identity = exec_frames.getPtr(ctx.frame_index).activation_id;
+            const frame_identity = entry_fr.activation_id;
 
             // P15.51l: Inline initialization of the hot fields from the
             // heap CallFrame. Replaces the old loadDispatchCtx which copied
@@ -13343,7 +13351,7 @@ pub const Vm = struct {
                 // unwrap for an invariant control flow already proves).
                 // base/frame_cap are each computed ONCE and reused for the
                 // register slice (was: frameBase() twice).
-                const fr = exec_frames.getPtr(ctx.frame_index);
+                const fr = entry_fr;
                 const fb = fr.frameBase();
                 ctx.cur_proto = fr.u.lua.proto;
                 // P15.51n: upvalues derived from bc_stack[func_slot].Closure.

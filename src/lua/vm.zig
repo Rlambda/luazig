@@ -20175,17 +20175,16 @@ pub const Vm = struct {
             return self.failC("attempt to yield from outside a coroutine", .{});
         };
         const in_debug_hook = self.isInDebugHook();
-        // P16.10b: TBC closes are NON-YIELDABLE while the innermost pending
-        // error-unwind state is a bottom-propagate (no protected frame —
-        // PUC luaD_throw → luaE_resetthread → closeprotected(yy=0)). Derived
-        // from the unwind list on use: no cached flag to go stale across
-        // interleaved close/error episodes on the same thread.
-        const unwinds = th.bytecode_unwinds.items;
-        const noyield_close = unwinds.len != 0 and
-            unwinds[unwinds.len - 1].disposition == .propagate and
-            unwinds[unwinds.len - 1].target_depth == unwinds[unwinds.len - 1].boundary_depth;
+        // P16.28 T1: the unwind-shape proxy `noyield_close` (inferring
+        // non-yieldability from pending error-unwind disposition) is
+        // REMOVED — CloseCallPolicy's nny unit owns that fact now.
+        // The close_mode check STAYS: it is the PUC luaD_callnoyield
+        // marker for the WHOLE forced-close transport (coroutine.close →
+        // luaE_resetthread → luaD_closeprotected(yy=0)): while close_mode
+        // is active the thread is inside a yy=0 close context where any
+        // yield attempt must fail — this is how a suspended-inside-xpcall
+        // thread gets correctly unwound when force-closed.
         if (!th.yieldable() or self.hasActiveBytecodeNonYieldableBoundary() or
-            noyield_close or
             (in_debug_hook and !self.activeDebugHookAllowsYield()))
             return self.failRunerror("attempt to yield across a C-call boundary", .{});
         if (th.close_mode) return self.failRunerror("attempt to yield across a C-call boundary", .{});

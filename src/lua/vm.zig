@@ -1259,8 +1259,6 @@ const CIST_C: u32 = 1 << 15;
 const CIST_FRESH: u32 = 1 << 16;
 /// Bit 17: CIST_CLSRET — closing TBC variables on return.
 const CIST_CLSRET: u32 = 1 << 17;
-/// Bit 18: CIST_TBC — has TBC variables.
-const CIST_TBC: u32 = 1 << 18;
 /// Bit 19: CIST_OAH — saved allowhook.
 const CIST_OAH: u32 = 1 << 19;
 /// Bit 20: CIST_HOOKED — running debug hook.
@@ -1672,9 +1670,6 @@ pub const CallFrame = extern struct {
     pub fn isYpcall(fr: CallFrame) bool {
         return (fr.callstatus & CIST_YPCALL) != 0;
     }
-    pub fn isTbc(fr: CallFrame) bool {
-        return (fr.callstatus & CIST_TBC) != 0;
-    }
     pub fn isClsret(fr: CallFrame) bool {
         return (fr.callstatus & CIST_CLSRET) != 0;
     }
@@ -1688,18 +1683,11 @@ pub const CallFrame = extern struct {
     pub fn setOah(fr: *CallFrame, v: bool) void {
         fr.callstatus = setoah(fr.callstatus, v);
     }
-    /// PUC `getoah` (`lstate.h:249`): restore allowhook from CIST_OAH.
-    pub fn getOah(fr: CallFrame) bool {
-        return getoah(fr.callstatus);
-    }
     pub fn setYpcall(fr: *CallFrame) void {
         fr.callstatus |= CIST_YPCALL;
     }
     pub fn clearYpcall(fr: *CallFrame) void {
         fr.callstatus &= ~CIST_YPCALL;
-    }
-    pub fn setTbc(fr: *CallFrame) void {
-        fr.callstatus |= CIST_TBC;
     }
     pub fn setClsret(fr: *CallFrame) void {
         fr.callstatus |= CIST_CLSRET;
@@ -1729,10 +1717,6 @@ pub const CallFrame = extern struct {
     }
     pub fn setHookYield(fr: *CallFrame) void {
         fr.callstatus |= CIST_HOOKYIELD;
-    }
-    /// Set hook-yield flag from a bool (for assignment-from-bool sites).
-    pub fn setHookYieldBool(fr: *CallFrame, v: bool) void {
-        if (v) fr.callstatus |= CIST_HOOKYIELD else fr.callstatus &= ~CIST_HOOKYIELD;
     }
     pub fn setHidden(fr: *CallFrame) void {
         fr.callstatus |= CIST_HIDE;
@@ -1848,22 +1832,6 @@ const FrameStack = struct {
     /// PUC `ci->previous` — parent of the current top frame. NULL-equivalent
     /// is impossible to express with a non-optional return, so callers must
     /// check len() > 1 first (Debug assert below enforces it).
-    pub fn parentPtrOfTop(self: *FrameStack) *CallFrame {
-        std.debug.assert(self.len() > 1);
-        if (self.heap.items.len >= 2) {
-            // Top is heap; parent is the heap entry before it.
-            return &self.heap.items[self.heap.items.len - 2];
-        }
-        if (self.heap.items.len == 1) {
-            // Top is the first heap frame; parent is the last inline frame.
-            std.debug.assert(self.inline_count == INLINE_FRAME_CAP);
-            return &self.inline_frames[INLINE_FRAME_CAP - 1];
-        }
-        // Both inline.
-        std.debug.assert(self.inline_count >= 2);
-        return &self.inline_frames[self.inline_count - 2];
-    }
-
     pub fn parentPtrOfTopConst(self: *const FrameStack) *const CallFrame {
         std.debug.assert(self.len() > 1);
         if (self.heap.items.len >= 2) {
@@ -1976,11 +1944,6 @@ const InlineValues = struct {
         }
         self.len = vals.len;
         self.heap = vals;
-    }
-
-    /// True when the storage currently holds a heap spill (debug/audit).
-    fn isHeap(self: *const InlineValues) bool {
-        return self.heap != null;
     }
 
     /// Free heap storage and reset to empty (replaces `field = null`).
@@ -4824,8 +4787,9 @@ pub const Vm = struct {
                 // equivalent (a C-function caller) yields no name.
                 //
                 // P15.83r: C frames (builtin/C-closure callees) are pushed at
-                // bc_stack_top, so `u.lua.func_slot_base` is NOT valid (union
-                // member mismatch — the frame is `.c`). PUC instead places
+                // bc_stack_top, so the frame's own func_slot is NOT the
+                // caller's callee register (it points past the caller's
+                // frame). PUC instead places
                 // ci->func at the caller's stack slot holding the callee and
                 // funcnamefromcode reads the call instruction's A operand
                 // directly (ldebug.c:615 funcnamefromcode OP_CALL branch).
@@ -9012,7 +8976,7 @@ pub const Vm = struct {
     }
 
     /// PUC-faithful result application for ordinary Lua CALL (no pending_call).
-    /// dst = callee.func_slot_base - parent.frameBase() (PUC: ci->func.p is result dest).
+    /// dst = callee.originalFuncSlot() - parent.frameBase() (PUC: ci->func.p is result dest).
     /// nresults from callee callstatus (PUC: CIST_NRESULTS).
     fn applyBytecodeResultsDirect(
         self: *Vm,
@@ -16751,10 +16715,10 @@ pub const Vm = struct {
                 try self.growCtxFrame(ctx, new_cap);
 
                 // 3. PUC-faithful tail-call: reuse frame, re-setup varargs.
-                //    Step 1: copy func+args from R[A..] down to func_slot_base
-                //    (the ORIGINAL position, before any previous buildhiddenargs
-                //    shift). This prevents cumulative shifting across repeated
-                //    tail calls.
+                //    Step 1: copy func+args from R[A..] down to the original
+                //    func_slot (the ORIGINAL position, before any previous
+                //    buildhiddenargs shift). This prevents cumulative shifting
+                //    across repeated tail calls.
                 //    Step 2: if new proto is VAHID, buildhiddenargs shifts
                 //    func+params UP past the extra args.
                 const np = new_proto.numparams;
@@ -16765,7 +16729,7 @@ pub const Vm = struct {
                 const new_is_vahid = new_proto.flags.is_vararg and new_nextra > 0 and
                     new_proto.vararg_table_reg == bc.Proto.no_vararg_reg;
 
-                // Reset to the original (unshifted) func_slot_base.
+                // Reset to the original (unshifted) func_slot.
                 const reset_slot = ctx.exec_frames.getPtr(ctx.frame_index).originalFuncSlot();
                 const reset_base = reset_slot + 1;
                 try self.ensureBcStackCap(reset_base + @max(new_cap, effective_nargs + 1));
@@ -17916,27 +17880,6 @@ pub const Vm = struct {
         return null;
     }
 
-    /// Const variant of topLuaFrame for use in const methods.
-    fn topLuaFrameConst(self: *const Vm) ?*const CallFrame {
-        const th = self.activeBytecodeThreadConst();
-        var i = th.call_frames.len();
-        while (i != 0) {
-            i -= 1;
-            const fr = th.call_frames.getConstPtr(i);
-            if (fr.isLua()) return fr;
-        }
-        return null;
-    }
-
-    /// Resolve a combined 0-based index (from bottom) to a *const CallFrame
-    /// pointer. Only bytecode frames exist (in Thread.call_frames).
-    fn frameAtCombinedIndex(self: *const Vm, combined_index: usize, bc_count: usize) ?*const CallFrame {
-        if (combined_index < bc_count) {
-            return self.activeBytecodeThreadConst().call_frames.getConstPtr(combined_index);
-        }
-        return null;
-    }
-
     /// Const variant of activeBytecodeThread for use in const methods.
     fn activeBytecodeThreadConst(self: *const Vm) *const Thread {
         return self.current_thread orelse self.main_thread.?;
@@ -18426,20 +18369,6 @@ pub const Vm = struct {
             try list.appendSlice(self.alloc, path[pos + 2 ..]);
         }
         return try self.internStr(list.items);
-    }
-
-    fn setArgTableInternal(self: *Vm, argv0: []const u8, script_path: ?[]const u8, script_args: []const []const u8) DispatchError!void {
-        const tbl = try self.allocTable();
-        if (script_path) |path| {
-            try self.tableSetValue(tbl, .{ .Int = -1 }, .{ .String = try self.internStr(argv0) });
-            try self.tableSetValue(tbl, .{ .Int = 0 }, .{ .String = try self.internStr(path) });
-        } else {
-            try self.tableSetValue(tbl, .{ .Int = 0 }, .{ .String = try self.internStr(argv0) });
-        }
-        for (script_args, 0..) |arg, i| {
-            try self.tableSetValue(tbl, .{ .Int = @intCast(i + 1) }, .{ .String = try self.internStr(arg) });
-        }
-        try self.setGlobal("arg", .{ .Table = tbl });
     }
 
     /// PUC `createargtable` (lua.c:185-194): build the `arg` table from the
@@ -20088,6 +20017,14 @@ pub const Vm = struct {
         self.clearThreadContinuationScratch(th, .{});
         th.close_mode = false;
         th.dofile_entry_closure = null;
+        // P16.28 T3: the dead-error traceback captured at the unwind
+        // boundary is owned by the thread — release it at teardown.
+        // (Every thread-reset path funnels through this fn via GC sweep
+        // and Vm.deinit, so one free site covers all lifetimes.)
+        if (th.err_traceback) |tb| {
+            self.alloc.free(@constCast(tb));
+            th.err_traceback = null;
+        }
     }
 
     const ContinuationScratchClearOpts = struct {
@@ -20117,13 +20054,6 @@ pub const Vm = struct {
         self.forced_close_thread = th;
         self.forced_close_had_error = false;
         th.close_mode = true;
-    }
-
-    fn freeErrTraceback(self: *Vm, th: *Thread) void {
-        if (th.err_traceback) |tb| {
-            self.alloc.free(@constCast(tb));
-            th.err_traceback = null;
-        }
     }
 
     fn clearForcedClose(self: *Vm, th: *Thread) void {
@@ -21348,17 +21278,6 @@ pub const Vm = struct {
         };
     }
 
-    fn gcSetValueAge(value: Value, age: GcAge) void {
-        switch (value) {
-            .Table => |object| object.gc_age = age,
-            .Closure => |object| object.gc_age = age,
-            .Thread => |object| object.gc_age = age,
-            .String => |object| object.gc_age = age,
-            .Userdata => |object| object.gc_age = age,
-            else => {},
-        }
-    }
-
     fn gcMinorCandidate(age: GcAge) bool {
         return age == .new or age == .survival or age == .old0;
     }
@@ -21450,13 +21369,6 @@ pub const Vm = struct {
             gcSetGray(p.marked);
             try self.gc_gray.append(self.alloc, obj);
         }
-    }
-
-    fn gcMarkMinorValue(self: *Vm, value: Value) DispatchError!void {
-        const obj = GcObject.fromValue(value) orelse return;
-        const age = gcPtr(obj).age.*;
-        if (!gcMinorCandidate(age)) return;
-        try self.gcQueueScanObject(obj);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -21613,12 +21525,6 @@ pub const Vm = struct {
                 try self.gc_grayagain.append(self.alloc, owner);
             },
         }
-    }
-
-    /// Thin Value wrapper around gcRememberObject for call sites that
-    /// still hand us a Value. Non-GC Values are silently ignored.
-    fn gcRememberValue(self: *Vm, owner: Value) DispatchError!void {
-        if (GcObject.fromValue(owner)) |obj| try self.gcRememberObject(obj);
     }
 
     /// Cell-specific wrapper around gcRememberObject. Kept as a named
@@ -24948,11 +24854,6 @@ pub const Vm = struct {
         // LuaString, so we free the temporary buffer.
         defer self.alloc.free(bytes);
         outs[0] = .{ .String = try self.internStr(bytes) };
-    }
-
-    fn defaultLoadEnv(self: *Vm, args: []const Value) Value {
-        if (args.len >= 4) return args[3];
-        return .{ .Table = self.global_env };
     }
 
     fn applyLoadEnv(self: *Vm, cl: *Closure, env_val: Value, force_first_on_missing: bool) DispatchError!void {
@@ -40714,11 +40615,6 @@ pub const Vm = struct {
             else => return self.fail("testC continuation expects script string", .{}),
         };
         return .{ .script = script, .ctx_id = ctx_id };
-    }
-
-    fn testcContinuationCtxId(tok: []const u8) i64 {
-        if (parseTestcUpvalueToken(tok)) |uix| return @intCast(uix);
-        return std.fmt.parseInt(i64, tok, 10) catch 0;
     }
 
     fn collectTestcClosers(

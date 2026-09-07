@@ -13593,16 +13593,11 @@ pub const Vm = struct {
                         }
 
                         if (hook_state.count > 0 and !self.isInDebugHook() and self.debug_hooks_suppressed == 0) {
-                            // TODO(count-hook-codegen-parity, remove before 1.0.0):
-                            // The direct bytecode codegen currently emits MOVE and
-                            // LOADNIL as register-allocation/cleanup bookkeeping more
-                            // often than PUC Lua. Do not charge those implementation
-                            // details to the user-visible instruction count; otherwise
-                            // tight loops fire count hooks roughly twice as often as
-                            // the reference VM. Removal criterion: db.lua count-hook
-                            // assertions pass when every dispatched instruction
-                            // decrements the hook budget.
-                            var count_this_inst = op != .move and op != .loadnil and op != .close;
+                            // PUC luaG_traceexec (ldebug.c:...): every executed
+                            // instruction decrements the count-hook budget. With
+                            // PUC-parity codegen there are no extra bookkeeping
+                            // MOVE/LOADNIL/CLOSE instructions to mask out.
+                            var count_this_inst = true;
                             if (fr.u.lua.resume_skip_count_pc != INVALID_PC) {
                                 const skip_pc = fr.u.lua.resume_skip_count_pc;
                                 if (skip_pc == @as(u32, @intCast(fr.u.lua.pc))) {

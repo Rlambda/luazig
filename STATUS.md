@@ -5161,6 +5161,73 @@ smoke 70/70, db.lua OK (count-hook), c_api 21+diff PASS, api580 GREEN
 comparisons −1.7%; global_arith ±10% machine noise — bytecode proven
 identical vs HEAD). Не закоммичено — оставлено dirty для ревью.
 
+### P16.29 T2: savedpc ownership — parkActiveFrame + in-place return resume (2026-09-08)
+Реализация модели PUC `ci->u.l.savedpc` (то, что P16.28 T6 назвал
+"dedicated savedpc-owner refactor"): generic frame-exit
+`defer syncFrame` **УДАЛЁН** (вместе с `frame_identity`,
+`ActivationId` и `bytecode_activation_counter` — guard был единственным
+читателем; CallFrame 88B сохранён: 4-байтовый слот стал padding,
+`u` остался на offset 32). Вместо него — typed-owner публикация pc
+ТОЛЬКО на child-push переходах:
+
+- **`parkActiveFrame(ctx)`** (inline, 2 инструкции): пишет
+  `ctx.exec_frames[frame_index].u.lua.pc = ctx.pc`. Публикует В ТОЧНОСТИ
+  на переходах: CALL fast path (pushStagedFast success), входы
+  opCall/opTforcall/opTailcall/opConcat (до любых branch'ей, которые
+  могут пушить child: hook frames, pairs/pcall/gsub, metamethod,
+  callBuiltin), входы bytecodeGetIndex/bytecodeSetIndex (покрывают все
+  18 dispatch call sites), OP_CLOSE (после `ctx.pc += 1` — close
+  continuation резюмится на инструкции после CLOSE, как старый defer).
+  Все pending-completions (results/ignore/compare/concat/hook) делают
+  `parent.u.lua.pc += 1` — parked value всегда AT вызывающей инструкции;
+  applyBytecodePendingHook читает parked pc для retry_call/skip
+  sentinels. Синхронные reentrant-пути НЕ требуют паркинга: fail()
+  публикует dispatch_pc (per-instruction), syncTopFrameForGc/
+  condGcFromDispatch паркают перед GC — та же модель, что PUC savedpc
+  между boundaries.
+- **RETURN fast arms → in-place parent resume**: 4 arm'а opReturn0/1
+  (ordinary + simple_result) вместо `.continue_frame_loop` делают
+  `ctx.frame_index -= 1` + полный refresh ctx из parent
+  (proto/upvalues/base/frame_cap/pc/regs) + `.continue_no_advance`.
+  Пропуск frame_loop re-entry безопасен: условия arm'ов уже исключают
+  pending call / boundary / non-Lua parent / TBC / hooks-on-pop-path.
+  PUC-инвариант: heap pc родителя свежий (CALL/TFORCALL при пуше ребёнка
+  запаркал его AT call) — hazard P16.28 T6 (riding defer) структурно
+  невозможен.
+- **Комментарии**: syncFrame-упоминания обновлены (growCtxFrame, fail(),
+  BytecodeDispatchCtx, opClose, .advance_instruction close post).
+
+**A/B (ReleaseFast, taskset -c 0, vs HEAD `022192c`):**
+- lua_calls **−16% time** (0.156→0.131 median), **−10.2% instructions**
+  (2.829G→2.541G) — удалён per-frame-exit defer + skipped frame_loop
+  re-entry на каждом return.
+- metamethod_call_noalloc **−7%**, coroutine_yield −0.8% (7-run median;
+  одиночный WARN +6.8% в perf_compare — machine noise, опровергнут).
+- branch_loop: time нейтрален (−0.7% vs HEAD median; −2.2% vs official
+  baseline); **instructions +1.25%** (12.131G→12.283G) — BREACH task-guard
+  ±0.5%, root-caused: LLVM block-layout inversion sigint-check'а в
+  FORLOOP/JMP (fast path `je head` → `jne rare; jmp head` = +1 executed
+  jmp) + merged-tail сдвиг в MODK. Дизассемблер-доказано: semantic work
+  НЕ добавлен (branches identical, branch-misses identical). Эксперимент
+  `@branchHint(.unlikely)` на всех 7 sigint-блоках — нулевой эффект на
+  layout (reverted); precedent vm.zig:3484 — layout lottery доминирует,
+  hint-реструктуры reproducibly WORSE.
+- int_arith **+6.9% time** (+0.93% instructions, IPC −4.5%) vs HEAD —
+  тот же layout-artifact (bisect: variant без in-place resume даёт
+  +3.3% int_arith, но и лишь −5.4% lua_calls; in-place resume — источник
+  главного выигрыша). vs official baseline +4.2% (OK range).
+- perf_compare vs baseline-approved: geomean 1.63x, lua_calls −14.9%,
+  hash_access −16.2%, metamethod −7.3%, table_alloc −7.2%, branch_loop
+  −2.2%; WARN только coroutine_yield (noise, см. выше).
+
+Гейт: zig build test 199/199, smoke 70/70, torture (fact(5) once,
+CLOSE-after-builtin a/1/b/1, smoke 30), coroutine/db/locals/cstack/
+closure/errors/strings rc=0, matrix --testc zig_fail=0 (33 pass, big.lua
+both_fail pre-existing), c_api 51+diff PASS, api580 GREEN (D+RF).
+Не закоммичено — оставлено dirty для ревью (layout-дельты branch_loop/
+int_arith вынесены на решение: accept-as-layout vs продолжение борьбы
+с lottery).
+
 ## История закрытых фаз
 
 P3–P15.12 — краткая сводка. P15.13+ — см. «История разработки» выше.

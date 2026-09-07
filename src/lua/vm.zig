@@ -1569,7 +1569,6 @@ pub const CallFrame = extern struct {
     /// reuse), mirroring PUC luaV_execute `base = ci->func.p + 1`.
     func_slot: usize = 0,
     tbc_mark: usize = 0,
-    activation_id: ActivationId = 0,
     /// PUC `callstatus` (`lstate.h:208`): low 8 bits = nresults+1 (CIST_NRESULTS),
     /// upper bits = flags; CIST_C discriminates the u-variant (PUC model).
     callstatus: u32 = 0,
@@ -2045,9 +2044,6 @@ pub const Thread = struct {
     // P15.51n: debug_name_entries/debug_name_count removed — debug names
     // are now stored in BytecodePendingCall (parent's continuation).
     call_frames: FrameStack = .{},
-    /// P16.22 T2: one named identity type for the activation guard (the
-    /// frame slot identity used by syncFrame's deferred-write check).
-    bytecode_activation_counter: ActivationId = 0,
     /// P15.51n: Moved from CallFrame — single-valued (only active frame's
     /// line hook matters), matching PUC's oldpc on lua_State.
     last_hook_line: i64 = -1,
@@ -2304,11 +2300,6 @@ comptime {
     std.debug.assert(@offsetOf(CallFrame, "u") == 32);
     std.debug.assert(@alignOf(CallFrame) == 8);
 }
-
-/// P16.22 T2: CallFrame slot identity (monotonic per-thread counter;
-/// compared for EQUALITY only — 0 carries no sentinel meaning, proven by
-/// audit: no activation_id == 0 / != 0 site exists).
-pub const ActivationId = u32;
 
 pub const LuaString = extern struct {
     hash: u64,
@@ -5098,10 +5089,11 @@ pub const Vm = struct {
     /// P16.21 T6: dispatch-path frame growth — bcGrowFrame + immediate
     /// publication of the new frame_cap to the CURRENT CallFrame. Parked
     /// frames' caps are read by GC register scans and debug walkers; with
-    /// mutation-site publishing, the generic frame-exit syncFrame no longer
-    /// needs to carry frame_cap (it becomes pc-only, like PUC's savedpc).
-    /// Publication happens only after successful growth (error paths leave
-    /// both the ctx cap and the frame copy unchanged — rollback consistency).
+    /// mutation-site publishing, frame_cap is always fresh on the heap
+    /// CallFrame (PUC's cap is stored in ci, not cached in the interpreter
+    /// loop). Publication happens only after successful growth (error
+    /// paths leave both the ctx cap and the frame copy unchanged —
+    /// rollback consistency).
     fn growCtxFrame(
         self: *Vm,
         ctx: *BytecodeDispatchCtx,
@@ -6458,9 +6450,9 @@ pub const Vm = struct {
         // This prevents union field mismatch panic when callBuiltin pushes a
         // C-frame and a builtin calls fail().
         if (self.topLuaFrame()) |fr| {
-            // Sync pc from the dispatch loop's working copy. With the
-            // value-copy dispatch context, fr.u.lua.pc may be stale (only
-            // updated at frame_loop boundaries by syncFrame).
+            // Sync pc from the dispatch loop's working copy. The heap pc is
+            // only parked at child-push transitions (P16.29 T2
+            // parkActiveFrame), so fr.u.lua.pc may be stale here.
             // dispatch_pc is written every instruction in the inner loop.
             fr.u.lua.pc = self.dispatch_pc;
             // P15.51n: current_line derived from proto.lineinfo[pc].
@@ -8918,6 +8910,14 @@ pub const Vm = struct {
         b: u8,
         use_bytecode_fallback: bool,
     ) DispatchError!bool {
+        // P16.29 T2: park the caller's pc AT the indexing opcode before the
+        // __index metamethod child can be pushed (simple_result completion
+        // advances the parked pc by +1) or invoked synchronously (host
+        // recursion — the parked pc is the frame's fresh pc record for GC).
+        // Covers all dispatch-loop call sites (GETTABUP/GETTABLE/GETFIELD/
+        // SELF and their k-variants). Harmless on the non-push paths (same
+        // value the .resolved branch re-parks below).
+        self.parkActiveFrame(ctx);
         switch (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, obj, key, a)) {
             .pushed => return true,
             .not_found => {
@@ -8951,6 +8951,12 @@ pub const Vm = struct {
         a: u8,
         use_bytecode_fallback: bool,
     ) DispatchError!bool {
+        // P16.29 T2: park the caller's pc AT the indexing opcode before the
+        // __newindex metamethod child can be pushed (its .ignore pending
+        // completion advances the parked pc by +1) or invoked synchronously.
+        // Covers all dispatch-loop call sites (SETTABUP/SETTABLE/SETFIELD
+        // and their k-variants).
+        self.parkActiveFrame(ctx);
         switch (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, ctx.frame_index, obj, key, val)) {
             .pushed => return true,
             .not_found => {
@@ -12292,14 +12298,6 @@ pub const Vm = struct {
                 (self.dispatch_gate & DISPATCH_GATE_HOOKS) == 0)
             {
                 if (self.stats.enabled) self.stats.calls_lua_frames += 1; // P16.0b: ALL Lua activations
-                const th = self.activeBytecodeThread();
-                // P16.29: local activation id. The old `counter +%= 1` store
-                // followed by a re-load from `th` for the frame field forced
-                // a second memory load (the compiler cannot prove `ef_slot`
-                // and `th` don't alias). One local feeds both the counter
-                // store and activation_id.
-                const activation = th.bytecode_activation_counter +% 1;
-                th.bytecode_activation_counter = activation;
                 // P16.29: FrameStack.addOne inlined for the inline-slot case
                 // (the overwhelmingly common one): compare + increment +
                 // address compute in straight-line code instead of an
@@ -12329,7 +12327,6 @@ pub const Vm = struct {
                 ef_slot.u.lua.nextraargs = 0;
                 ef_slot.u.lua.lua_packed_flags = 0;
                 ef_slot.u.lua.simple_result_dst = 0xFF;
-                ef_slot.activation_id = activation;
                 ef_slot.func_slot = func_slot_in; // base = func_slot + 1
                 ef_slot.callstatus = encodeNresults(nresults);
                 ef_slot.reg_top = @intCast(proto.numparams);
@@ -12488,10 +12485,6 @@ pub const Vm = struct {
 
         // P15.51k: callee lives at bc_stack[func_slot] (PUC's ci->func).
         // No duplicated callee field in CallFrame.
-        const activation_owner = self.activeBytecodeThread();
-        // P16.22 T2: the old wrap-skip-to-1 branch is REMOVED — 0 is not a
-        // sentinel anywhere (equality-only guard; audit in ActivationId doc).
-        activation_owner.bytecode_activation_counter +%= 1;
 
         // P15.40b-full: Single addOne + unified field writes (was two addOne + ~50 writes).
         // The CallFrame in Thread.call_frames holds ALL fields — no runtime copy
@@ -12530,7 +12523,6 @@ pub const Vm = struct {
         ef_slot.u.lua.pc = 0;
 
         // Bytecode-specific fields
-        ef_slot.activation_id = activation_owner.bytecode_activation_counter;
         ef_slot.func_slot = func_slot; // base derived: func_slot + 1
         ef_slot.u.lua.frame_cap = frame_cap;
         ef_slot.u.lua.nextraargs = @intCast(nextra);
@@ -13203,8 +13195,9 @@ pub const Vm = struct {
         // Hot frame state — cached from the heap CallFrame for register
         // performance. Only state touched EVERY iteration lives here;
         // rare frame metadata stays on the CallFrame and is loaded at use
-        // sites. (ctx.boxed was removed in P16.19 T3; syncFrame publishes
-        // pc only since P16.21 T6.)
+        // sites. (ctx.boxed was removed in P16.19 T3; the heap pc is
+        // published only at child-push transitions since P16.29 T2 —
+        // parkActiveFrame, the PUC savedpc model.)
         cur_proto: *const bc.Proto,
         cur_upvalues: []const *Cell,
         base: usize,
@@ -13238,34 +13231,42 @@ pub const Vm = struct {
         propagate_error,
     };
 
-    /// Sync the 5 hot ctx fields (pc, base, frame_cap, cur_proto, cur_upvalues)
-    /// back to the heap-resident CallFrame. Called at frame_loop boundaries
-    /// (before `continue :frame_loop`, before yield/error, before GC/hooks).
+    /// P16.29 T2: park the ACTIVE dispatch frame's pc on the heap
+    /// CallFrame — the typed-owner replacement for the old generic
+    /// frame-exit `defer syncFrame` (P16.28 T6 post-mortem: the defer's
+    /// activation-id guard silently skipped the write when a return fast
+    /// arm "rode" a child's frame_loop iteration, leaving a stale heap pc
+    /// for later `.continue_frame_loop` re-entries → double execution).
     ///
-    /// PUC Lua pattern: `ci->u.l.savedpc = pc` at call/return boundaries.
-    /// We sync more fields because our iterative frame_loop (not host
-    /// recursion) requires persisting all hot state to the heap CallFrame
-    /// before switching to a different frame.
+    /// Ownership model (PUC `ci->u.l.savedpc = pc` at call/return
+    /// boundaries): the heap pc is published ONLY at child-push
+    /// transitions (and explicit yield/error sites), ALWAYS pointing AT
+    /// the suspending instruction — exactly the value the resume/replay
+    /// machinery needs:
+    ///   - CALL/TFORCALL replay parks AT the call opcode (the completion
+    ///     paths — applyBytecodeResultsDirect/PendingResults/Ignore/
+    ///     Compare/Hook and the opReturn0/1 fast arms — all do pc += 1);
+    ///   - metamethod pushes park AT the metamethod opcode;
+    ///   - OP_CLOSE parks past the CLOSE (the close continuation resumes
+    ///     at the next instruction, matching the old defer's post-increment
+    ///     publication);
+    ///   - GC/debug readers of a parked frame see live_reg_top[pc] for the
+    ///     instruction the frame is suspended at — always a correct
+    ///     liveness snapshot.
     ///
-    /// The activation_id check ensures we don't write to a frame that was
-    /// popped or replaced (e.g., after OP_RETURN pops the frame, the defer
-    /// runs but the check skips the write).
-    fn syncFrame(self: *Vm, ctx: *BytecodeDispatchCtx, frame_identity: ActivationId) void {
+    /// Between parks the heap pc is deliberately stale (the dispatch ctx
+    /// owns it), exactly like PUC's savedpc between boundaries. Every
+    /// reentrant reader inside that window publishes first: fail() writes
+    /// dispatch_pc (per-instruction), condGcFromDispatch/syncTopFrameForGc
+    /// park before GC, the hooks block parks before pushing hook frames.
+    ///
+    /// The bounds check is defensive only: every caller parks while the
+    /// frame is provably the live top-of-stack dispatch frame (before a
+    /// child push or around one) — it can never be out of range here.
+    inline fn parkActiveFrame(self: *Vm, ctx: *BytecodeDispatchCtx) void {
         _ = self;
-        if (ctx.frame_index < ctx.exec_frames.len() and
-            ctx.exec_frames.getPtr(ctx.frame_index).activation_id == frame_identity)
-        {
-            const fr = ctx.exec_frames.getPtr(ctx.frame_index);
-            fr.u.lua.pc = ctx.pc;
-            // P16.21 T6: syncFrame is now PC-ONLY (PUC persists savedpc
-            // at boundaries). frame_cap is published at its mutation sites:
-            // growCtxFrame (every dispatch growth, immediately after
-            // success) plus the tailcall/call-staging paths that already
-            // wrote it explicitly. Parked-frame GC/debug readers therefore
-            // always see the live cap. Base write removed P16.19 T9.1
-            // (provably identity); proto/upvalues never generic sync
-            // writes (P16.2d / P15.51n).
-        }
+        if (ctx.frame_index < ctx.exec_frames.len())
+            ctx.exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
     }
 
     /// Re-derive `ctx.regs` / `ctx.boxed` after a callee may have realloc'd
@@ -13356,8 +13357,6 @@ pub const Vm = struct {
                     }
                 }
             }
-            const frame_identity = entry_fr.activation_id;
-
             // P15.51l: Inline initialization of the hot fields from the
             // heap CallFrame. Replaces the old loadDispatchCtx which copied
             // ~20 fields (including 11 rare ones that are now accessed
@@ -13382,11 +13381,15 @@ pub const Vm = struct {
                 ctx.regs = self.bc_stack[fb .. fb + cap];
             }
 
-            // P16.21 T6: syncFrame is PC-ONLY (frame_cap published at
-            // mutation sites via growCtxFrame; base/proto/upvalues are
-            // never generic sync writes).
-            // The activation_id check skips the write for popped/replaced frames.
-            defer self.syncFrame(&ctx, frame_identity);
+            // P16.29 T2: the generic frame-exit `defer syncFrame` is DELETED.
+            // The heap pc is now published ONLY at child-push transitions
+            // via parkActiveFrame (CALL fast path, opCall/opTforcall/
+            // opTailcall/opConcat entries, bytecodeGetIndex/SetIndex,
+            // OP_CLOSE) and at the explicit return/yield/error sites —
+            // the PUC savedpc ownership model. See parkActiveFrame's doc
+            // comment for the full transition table and the P16.28 T6
+            // post-mortem for why the defer's activation-id guard was a
+            // correctness hazard (stale heap pc after riding iterations).
 
             // P16.10 T8: Check SIGINT at frame boundary — catches signals
             // that fired while a child frame was executing.
@@ -15233,9 +15236,18 @@ pub const Vm = struct {
                                     nargs,
                                     nresults,
                                 )) {
-                                    // Defer block syncs parent frame state (pc,
-                                    // regs, etc.) before the frame_loop starts
-                                    // executing the child frame.
+                                    // P16.29 T2: park the caller's pc AT this
+                                    // CALL before the frame_loop starts
+                                    // executing the child. Every completion
+                                    // path of a plain Lua→Lua call (the
+                                    // opReturn0/1 fast arms' pc += 1,
+                                    // applyBytecodeResultsDirect's +1)
+                                    // advances the parked pc by one — the
+                                    // parked value must be the CALL opcode
+                                    // itself. This replaces the old frame-exit
+                                    // defer (PUC: luaD_precall's caller does
+                                    // savestate/savedpc before the jump).
+                                    self.parkActiveFrame(&ctx);
                                     continue :frame_loop;
                                 }
                             }
@@ -15447,10 +15459,15 @@ pub const Vm = struct {
                         )) {
                             .resume_dispatch => {
                                 // continueBytecodeClose no longer writes
-                                // parent.u.lua.pc (PUC-faithful: dispatch loop owns
-                                // pc). Increment ctx.pc here; the defer will
-                                // persist it to the frame.
+                                // parent.u.lua.pc (PUC-faithful: dispatch loop
+                                // owns pc). Advance ctx.pc past the CLOSE and
+                                // P16.29 T2: park it here — the close
+                                // continuation resumes the frame at the
+                                // instruction AFTER the CLOSE (the parked pc
+                                // is what the frame_loop re-entry reads when
+                                // the last closer child completes).
                                 ctx.pc += 1;
+                                self.parkActiveFrame(&ctx);
                                 continue :frame_loop;
                             },
                             .final => |final| return final,
@@ -15718,7 +15735,32 @@ pub const Vm = struct {
                                 parent_m.reg_top = @intCast(dst);
                             }
                             parent_m.u.lua.pc += 1;
-                            return .continue_frame_loop;
+                            // P16.29 T2: in-place parent resume — refresh ctx
+                            // from the parent frame and stay in the inner
+                            // dispatch loop (.continue_no_advance), skipping
+                            // the frame_loop re-entry (pending-call check,
+                            // hot-field init, SIGINT poll). Safety: the
+                            // fast-arm conditions already exclude everything
+                            // the frame_loop entry sequence would handle for
+                            // this frame (no pending call, parent is Lua, not
+                            // at the boundary, no TBC, no hooks on the pop
+                            // path). The parent's heap pc is ALWAYS fresh
+                            // here: the CALL/TFORCALL that created the child
+                            // parked it AT the calling instruction
+                            // (parkActiveFrame), so the += 1 above lands on
+                            // the instruction after the call — the P16.28 T6
+                            // riding-defer hazard cannot recur.
+                            ctx.frame_index -= 1;
+                            const fb = parent_m.frameBase();
+                            ctx.cur_proto = parent_m.u.lua.proto;
+                            // P15.51n: upvalues from bc_stack[func_slot].
+                            ctx.cur_upvalues = self.bc_stack[parent_m.func_slot].Closure.upvalues;
+                            ctx.base = fb;
+                            const pcap = parent_m.u.lua.frame_cap;
+                            ctx.frame_cap = pcap;
+                            ctx.pc = parent_m.u.lua.pc;
+                            ctx.regs = self.bc_stack[fb .. fb + pcap];
+                            return .continue_no_advance;
                         }
                     }
                     // P16.8 Task 1: simple_result fast arm for opReturn0.
@@ -15749,7 +15791,21 @@ pub const Vm = struct {
                                 parent_m.u.lua.pc += 1;
                             }
                             parent_m.u.lua.clearSimpleResult();
-                            return .continue_frame_loop;
+                            // P16.29 T2: in-place parent resume (see the
+                            // ordinary fast arm above for the full safety
+                            // proof). The metamethod push parked the parent
+                            // AT the metamethod opcode; the pc adjustments
+                            // above land on the resume target.
+                            ctx.frame_index -= 1;
+                            const fb = parent_m.frameBase();
+                            ctx.cur_proto = parent_m.u.lua.proto;
+                            ctx.cur_upvalues = self.bc_stack[parent_m.func_slot].Closure.upvalues;
+                            ctx.base = fb;
+                            const pcap = parent_m.u.lua.frame_cap;
+                            ctx.frame_cap = pcap;
+                            ctx.pc = parent_m.u.lua.pc;
+                            ctx.regs = self.bc_stack[fb .. fb + pcap];
+                            return .continue_no_advance;
                         }
                     }
                 }
@@ -15887,7 +15943,23 @@ pub const Vm = struct {
                                 parent_m.reg_top = @intCast(dst + 1);
                             }
                             parent_m.u.lua.pc += 1;
-                            return .continue_frame_loop;
+                            // P16.29 T2: in-place parent resume — refresh ctx
+                            // from the parent and stay in the inner dispatch
+                            // loop, skipping the frame_loop re-entry. Safety
+                            // proof: see opReturn0's ordinary fast arm (same
+                            // conditions; the CALL/TFORCALL push parked the
+                            // parent's heap pc AT the calling instruction, so
+                            // the += 1 above is always applied to a fresh pc).
+                            ctx.frame_index -= 1;
+                            const fb = parent_m.frameBase();
+                            ctx.cur_proto = parent_m.u.lua.proto;
+                            ctx.cur_upvalues = self.bc_stack[parent_m.func_slot].Closure.upvalues;
+                            ctx.base = fb;
+                            const pcap = parent_m.u.lua.frame_cap;
+                            ctx.frame_cap = pcap;
+                            ctx.pc = parent_m.u.lua.pc;
+                            ctx.regs = self.bc_stack[fb .. fb + pcap];
+                            return .continue_no_advance;
                         }
                     }
                     // P16.8 Task 1: simple_result fast arm. When the return
@@ -15926,7 +15998,18 @@ pub const Vm = struct {
                                 parent_m.u.lua.pc += 1;
                             }
                             parent_m.u.lua.clearSimpleResult();
-                            return .continue_frame_loop;
+                            // P16.29 T2: in-place parent resume (see the
+                            // ordinary fast arm above for the safety proof).
+                            ctx.frame_index -= 1;
+                            const fb = parent_m.frameBase();
+                            ctx.cur_proto = parent_m.u.lua.proto;
+                            ctx.cur_upvalues = self.bc_stack[parent_m.func_slot].Closure.upvalues;
+                            ctx.base = fb;
+                            const pcap = parent_m.u.lua.frame_cap;
+                            ctx.frame_cap = pcap;
+                            ctx.pc = parent_m.u.lua.pc;
+                            ctx.regs = self.bc_stack[fb .. fb + pcap];
+                            return .continue_no_advance;
                         }
                     }
                 }
@@ -16113,6 +16196,13 @@ pub const Vm = struct {
         const inst = ctx.cur_proto.code[ctx.pc];
         const a: u8 = inst.a;
         const c: u8 = inst.c;
+
+        // P16.29 T2: park the caller's pc AT this TFORCALL before the
+        // iterator child can be pushed (bytecode iterator via
+        // pushStagedBytecodeExecFrame below; the builtin path re-parks the
+        // same value before its synchronous call). The pending .results
+        // completion advances the parked pc by +1 when the iterator returns.
+        self.parkActiveFrame(ctx);
 
         const nresults: u8 = if (c == 0) 0 else c - 1;
 
@@ -16446,6 +16536,14 @@ pub const Vm = struct {
         const a: u8 = inst.a;
         const b: u8 = inst.b;
 
+        // P16.29 T2: park the caller's pc AT this CONCAT before
+        // advanceBytecodeConcat can push a __concat metamethod child (its
+        // .concat pending completion advances the parked pc by +1) or run a
+        // synchronous metamethod via host recursion (the parked pc is the
+        // frame's only fresh pc record while dispatch_pc belongs to the
+        // inner dispatch loop — GC reads live_reg_top[parked pc]).
+        self.parkActiveFrame(ctx);
+
         const concat_vals = try self.alloc.dupe(Value, ctx.regs[a .. a + b]);
         const outcome = try self.advanceBytecodeConcat(
             ctx.exec_frames,
@@ -16483,6 +16581,15 @@ pub const Vm = struct {
         const inst = ctx.cur_proto.code[ctx.pc];
         const a: u8 = inst.a;
         const b: u8 = inst.b;
+
+        // P16.29 T2: park the caller's pc AT this TAILCALL before any branch
+        // can push a child (tail-call hook frame, .retry_tailcall close
+        // continuation, pairs/pcall fast paths) or replace the frame. The
+        // .retry_tailcall post and applyBytecodePendingHook's retry_call read
+        // the parked pc for their skip sentinels; the bc-to-bc frame-reuse
+        // path overwrites it with pc=0 for the fresh activation; the builtin
+        // path re-parks the same value before callBuiltin.
+        self.parkActiveFrame(ctx);
 
         // P15.51l: resumed_direct_yield/resume_pc/reg_top are rare fields,
         // read directly from the CallFrame.
@@ -16999,6 +17106,20 @@ pub const Vm = struct {
         const a: u8 = inst.a;
         const b: u8 = inst.b;
         const c: u8 = inst.c;
+
+        // P16.29 T2: park the caller's pc AT this CALL before ANY branch can
+        // push a child (hook frames — replay/call/return events, pairs/pcall/
+        // gsub continuations, the callee's exec frame) or run reentrant code
+        // (callBuiltin/runClosure host recursion). All completion paths
+        // (applyBytecodePendingResults/Ignore/Compare/Hook, the opReturn0/1
+        // fast arms) advance the parked pc by +1, and applyBytecodePendingHook
+        // reads it directly for retry_call/skip sentinels — the parked value
+        // must be the CALL opcode itself. The synchronous branches
+        // (.continue_dispatch) leave the parked pc stale-at-CALL until the
+        // next park, exactly like PUC's savedpc between boundaries (every
+        // reentrant reader — GC via syncTopFrameForGc/condGcFromDispatch,
+        // fail() via dispatch_pc — publishes its own fresh copy first).
+        self.parkActiveFrame(ctx);
 
         const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
         // P15.51l: resumed_direct_yield/resume_pc/reg_top are rare fields,

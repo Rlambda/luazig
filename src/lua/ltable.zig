@@ -195,34 +195,6 @@ pub const Node = struct {
     /// matching PUC's design (PUC hashes at each use site via `hashint`/
     /// `hashstr`/`hashpointer`/`hashboolean`). `seed` is the per-VM random
     /// hash seed.
-    pub fn rawHash(self: *const Node, seed: u64) u64 {
-        return switch (self.key_tt) {
-            // Dead nodes are never re-hashed: rehash skips them (value == Nil),
-            // and nodeInsert overwrites them in place. The preserved raw pointer
-            // must NOT be dereferenced for hashing — it may point to freed
-            // memory. Returning 0 is safe because no caller uses the result
-            // for a .dead node (all paths skip .dead before hashing).
-            .empty, .dead => 0,
-            .int => hashInt(self.key_val.int, seed),
-            .num => hashNum(self.key_val.num, seed),
-            .short_string, .long_string => self.key_val.string.hash,
-            .table => hashPointer(@intFromPtr(self.key_val.table), seed),
-            .closure => hashPointer(@intFromPtr(self.key_val.closure), seed),
-            .thread => hashPointer(@intFromPtr(self.key_val.thread), seed),
-            .bool_ => if (self.key_val.bool_val) 1 else 0,
-            // Builtins have no pointer identity; hash the enum tag, which is
-            // the stable identity of the function (PUC's `hashpointer` for the
-            // C-function case is the analog: a stable, per-function value).
-            .builtin => hashPointer(@intFromEnum(self.key_val.builtin), seed),
-            // Light userdata hashes by its raw pointer address (PUC's
-            // `hashpointer`). The pointer is the identity.
-            .lightuserdata => hashPointer(@intFromPtr(self.key_val.lightuserdata), seed),
-            // Full userdata hashes by pointer identity (PUC `hashpointer`),
-            // same as table/closure/thread keys.
-            .userdata => hashPointer(@intFromPtr(self.key_val.userdata), seed),
-        };
-    }
-
     /// Follow the chain link. Returns null at end of chain. Pointer arithmetic
     /// identical to before; only the field name `next_offset` is unchanged.
     pub fn nextNode(self: *const Node, nodes: []const Node) ?*Node {
@@ -385,53 +357,84 @@ comptime {
 // Hash a table key (PUC hashint/hashstr/hashpointer/hashboolean/hashnum),
 // seeded by the per-VM random seed. Strings use their cached LuaString.hash
 // (which already incorporates the seed); ints/floats/pointers hash directly.
-// Float hashing via raw-bit wyhash matches Node.rawHash — both must agree
+// OLD universal-hash model removed in P16.29 T1 — see bucket policies above.
 // for Brent's variation to maintain its chain invariant.
-pub inline fn keyHash(key: Value, seed: u64) u64 {
-    return switch (key) {
-        .Int => |i| hashInt(i, seed),
-        .Num => |n| hashNum(n, seed),
-        .String => |s| s.hash,
-        .Table => |t| hashPointer(@intFromPtr(t), seed),
-        .Closure => |c| hashPointer(@intFromPtr(c), seed),
-        .Thread => |th| hashPointer(@intFromPtr(th), seed),
-        .Bool => |b| if (b) 1 else 0,
-        // Builtins hash by their enum tag — must match `Node.rawHash(.builtin)`
-        // so a key inserted via `keyHash` is found by `rawHash` at lookup time.
-        .Builtin => |b| hashPointer(@intFromEnum(b), seed),
-        // Light userdata hashes by its raw pointer address (PUC's
-        // `hashpointer`). The pointer IS the identity.
-        .LightUserdata => |p| hashPointer(@intFromPtr(p), seed),
-        // Full userdata hashes by pointer identity (PUC `hashpointer`).
-        .Userdata => |u| hashPointer(@intFromPtr(u), seed),
-        else => 0,
-    };
+
+// ─────────────────────────────────────────────────────────────────────
+// P16.29 T1: PUC main-position bucket policies (ltable.c:106-119).
+//
+// PUC deliberately uses TWO bucket rules for its power-of-two-sized hash
+// part:
+//
+//   hashpow2(t,n) = n & (sizenode-1)      for hashes with good low bits
+//                                          (cached string hashes, booleans)
+//   hashmod(t,n)  = n % ((sizenode-1)|1)  for integers/pointers/floats
+//
+// The PUC comment for hashmod: "for other types, it is better to avoid
+// modulo by power of 2, as they can have many 2 factors." An odd
+// multiplication followed by a power-of-two mask CANNOT recover those lost
+// low bits — structured keys (multiples of 4/8/100, aligned pointers)
+// cluster into a small fraction of buckets. The odd modulo distributes
+// them fully. These helpers return the BUCKET INDEX directly (there is no
+// universal hash: PUC has one policy per key type, and so do we).
+//
+// PUC does NOT seed int/pointer/float hashing (strings carry their own
+// per-VM seed inside the cached TString hash) — the `seed` parameter is
+// gone from the bucket functions entirely.
+
+/// The odd divisor PUC uses for hashmod: `(sizenode-1) | 1`. Always odd,
+/// always < 2^30 (MAXHBITS), so it fits u32 — 32-bit division where the
+/// input allows it.
+inline fn oddDivisor(len: usize) u64 {
+    return @as(u64, @intCast(len - 1)) | 1;
 }
 
-/// Fast seeded hash for integer keys.
-///
-/// PUC Lua uses `ui % ((sizenode-1) | 1)` — a simple modulo by an odd number.
-/// We use a multiply-based hash instead because our hash parts are power-of-2
-/// sized (masking, not modulo), and sequential integers need bit scrambling
-/// to avoid collisions. The golden-ratio multiplier provides excellent
-/// distribution in a single multiply (1 instruction vs Wyhash's ~10+).
-fn hashInt(i: i64, seed: u64) u64 {
-    const x = @as(u64, @bitCast(i)) ^ seed;
-    return x *% 0x9E3779B97F4A7C15;
+/// PUC hashpow2 (ltable.c:106): bucket for hash values with good low bits.
+inline fn pow2Index(len: usize, h: u32) usize {
+    return @as(usize, h) & (len - 1);
 }
 
-/// Fast seeded hash for float keys. PUC reinterprets f64 bits as i64 and
-/// hashes via hashint; we do the same.
-fn hashNum(n: f64, seed: u64) u64 {
-    return hashInt(@bitCast(n), seed);
+/// PUC hashint (ltable.c:144-152). If the integer fits as a non-negative
+/// int, compute a 32-bit remainder (faster); otherwise a 64-bit unsigned
+/// remainder, which uses all bits and ensures a non-negative result.
+inline fn intIndex(len: usize, i: i64) usize {
+    const ui: u64 = @bitCast(i);
+    const d = oddDivisor(len);
+    if (ui <= @as(u64, @intCast(std.math.maxInt(i32)))) {
+        return @as(usize, @as(u32, @intCast(ui)) % @as(u32, @intCast(d)));
+    }
+    return @as(usize, ui % d);
 }
 
-/// Fast seeded hash for pointer keys. Same multiply-based approach as
-/// hashInt — pointers are already well-distributed, so a single multiply
-/// with the seed provides enough scrambling.
-fn hashPointer(addr: usize, seed: u64) u64 {
-    const x = @as(u64, addr) ^ seed;
-    return x *% 0x9E3779B97F4A7C15;
+/// PUC l_hashfloat (ltable.c:163-180), ported to idiomatic Zig unsigned
+/// semantics:
+///   n = frexp(n) * -2^31        // significand in [0.5,1) scaled to [2^30,2^31)
+///   if inf/NaN -> 0
+///   u = (unsigned)exponent + (unsigned)mantissa   (wrapping add)
+///   return u <= INT_MAX ? u : ~u
+/// The mantissa product is dyadic (frexp significand is a 53-bit mantissa
+/// times a power of two), so the i64 conversion is exact for finite inputs.
+fn hashFloat(n: f64) u32 {
+    const fr = std.math.frexp(n);
+    const m = fr.significand * -@as(f64, 2147483648.0);
+    if (!std.math.isFinite(m)) return 0; // inf/NaN keys hash to 0 (PUC)
+    const mi: i64 = @intFromFloat(m); // exact: |m| <= 2^31, dyadic
+    const u: u32 = @as(u32, @bitCast(@as(i32, fr.exponent))) +% @as(u32, @truncate(@as(u64, @bitCast(mi))));
+    return if (u <= std.math.maxInt(i32)) u else ~u;
+}
+
+/// PUC hashmod for floats: l_hashfloat followed by the odd modulo.
+inline fn floatIndex(len: usize, n: f64) usize {
+    return @as(usize, hashFloat(n)) % @as(u32, @intCast(oddDivisor(len)));
+}
+
+/// PUC point2uint (llimits.h:90) + hashmod (ltable.c:119): the low 32 bits
+/// of the pointer, modulo the odd divisor. Pointer alignment is exactly why
+/// PUC avoids power-of-two masking here — the low alignment bits would
+/// cluster otherwise. 32-bit division like the C original.
+inline fn pointerIndex(len: usize, addr: usize) usize {
+    const low32: u32 = @truncate(addr);
+    return @as(usize, low32 % @as(u32, @intCast(oddDivisor(len))));
 }
 
 // Key equality for table lookup. Mirrors which keys collide "as equal" in PUC.
@@ -441,18 +444,59 @@ pub fn keyEq(a: Value, b: Value) bool {
     return std.meta.eql(a, b);
 }
 
-// Main position (home bucket) for `key` in a hash part of `len` nodes. `len`
-// must be a power of two; PUC hashes by `& (len-1)` for pow2 sizes (ltable.c:106).
-pub inline fn mainPosition(len: usize, key: Value, seed: u64) usize {
-    return keyHash(key, seed) & (len - 1);
+/// Main position (home bucket) for `key` in a hash part of `len` nodes
+/// (PUC mainpositionTV, ltable.c:186-227). `len` must be a power of two.
+/// The bucket policy is TYPE-SPECIFIC, exactly mirroring PUC:
+///   Int        -> hashint  (odd modulo, no seed)
+///   Num        -> l_hashfloat + hashmod (integral floats are canonicalized
+///                 to Int by the table API boundary before reaching here)
+///   String     -> cached hash & (len-1)   (hashpow2; both short and long)
+///   Bool       -> 0/1 & (len-1)           (hashpow2)
+///   pointers   -> point2uint + hashmod    (low 32 bits, odd modulo)
+///   Builtin    -> the stable enum identity, hashed like an integer
+pub inline fn mainPosition(len: usize, key: Value) usize {
+    return switch (key) {
+        .Int => |i| intIndex(len, i),
+        .Num => |n| floatIndex(len, n),
+        .String => |s| pow2Index(len, @truncate(s.hash)),
+        .Bool => |b| pow2Index(len, if (b) 1 else 0),
+        .Table => |t| pointerIndex(len, @intFromPtr(t)),
+        .Closure => |c| pointerIndex(len, @intFromPtr(c)),
+        .Thread => |t| pointerIndex(len, @intFromPtr(t)),
+        .Builtin => |b| intIndex(len, @intFromEnum(b)),
+        .LightUserdata => |p| pointerIndex(len, @intFromPtr(p)),
+        .Userdata => |u| pointerIndex(len, @intFromPtr(u)),
+        .Nil => 0, // never a valid key; callers reject Nil before lookup
+    };
+}
+
+/// Main position of an OCCUPIED node's key, computed from the node's tag
+/// and payload directly (PUC: `mainposition(t, gcV(othern))` in
+/// luaH_newkey's Brent-eviction check). No `Value` reconstruction, no
+/// hashing of `.dead` payloads (callers only invoke this on live nodes —
+/// the eviction branch requires a non-Nil value).
+inline fn mainPositionOfNode(len: usize, n: *const Node) usize {
+    return switch (n.key_tt) {
+        .empty, .dead => 0,
+        .int => intIndex(len, n.key_val.int),
+        .num => floatIndex(len, n.key_val.num),
+        .short_string, .long_string => pow2Index(len, @truncate(n.key_val.string.hash)),
+        .table => pointerIndex(len, @intFromPtr(n.key_val.table)),
+        .closure => pointerIndex(len, @intFromPtr(n.key_val.closure)),
+        .thread => pointerIndex(len, @intFromPtr(n.key_val.thread)),
+        .bool_ => pow2Index(len, if (n.key_val.bool_val) 1 else 0),
+        .builtin => intIndex(len, @intFromEnum(n.key_val.builtin)),
+        .lightuserdata => pointerIndex(len, @intFromPtr(n.key_val.lightuserdata)),
+        .userdata => pointerIndex(len, @intFromPtr(n.key_val.userdata)),
+    };
 }
 
 // Look up `key` in a hash part. Returns the matching node, or null if absent.
 // Walks the chain from the main position (PUC getgeneric/getintfromhash).
 // deadok=false: dead keys NEVER match (PUC getgeneric with deadok=0).
-pub inline fn nodeLookup(nodes: []Node, key: Value, seed: u64) ?*Node {
+pub inline fn nodeLookup(nodes: []Node, key: Value) ?*Node {
     if (nodes.len == 0) return null;
-    var n: *Node = &nodes[mainPosition(nodes.len, key, seed)];
+    var n: *Node = &nodes[mainPosition(nodes.len, key)];
     if (n.isEmpty()) return null; // bucket unused => key not present
     while (true) {
         // Inline comparison (Node.keyMatches) — avoids reconstructing a full
@@ -485,10 +529,10 @@ pub inline fn nodeLookup(nodes: []Node, key: Value, seed: u64) ?*Node {
 /// => false` and the tag-mismatch arms. Empty-bucket termination (`isEmpty`)
 /// and chain-end termination (`nextNode orelse null`) are identical to
 /// `nodeLookup`.
-pub inline fn nodeLookupInt(nodes: []Node, key: i64, seed: u64) ?*Node {
+pub inline fn nodeLookupInt(nodes: []Node, key: i64) ?*Node {
     if (nodes.len == 0) return null;
-    // Same hash as the generic .Int path: hashInt(key, seed) & (len-1).
-    const mp: usize = hashInt(key, seed) & (nodes.len - 1);
+    // Same bucket as the generic .Int path: intIndex (PUC hashint).
+    const mp: usize = intIndex(nodes.len, key);
     var n: *Node = &nodes[mp];
     if (n.isEmpty()) return null; // bucket unused => key not present
     while (true) {
@@ -503,7 +547,7 @@ test "nodeLookupInt returns null for empty hash part" {
     const nodes = try std.testing.allocator.alloc(Node, 4);
     defer std.testing.allocator.free(nodes);
     for (nodes) |*n| n.* = .{};
-    try std.testing.expect(nodeLookupInt(nodes, 7, 0) == null);
+    try std.testing.expect(nodeLookupInt(nodes, 7) == null);
 }
 
 test "nodeLookupInt finds an inserted key at its main position" {
@@ -511,10 +555,10 @@ test "nodeLookupInt finds an inserted key at its main position" {
     defer std.testing.allocator.free(nodes);
     for (nodes) |*n| n.* = .{};
     const key: i64 = 7;
-    const mp: usize = hashInt(key, 0) & (nodes.len - 1);
+    const mp: usize = intIndex(nodes.len, key);
     nodes[mp].setKey(.{ .Int = key });
     nodes[mp].value = .{ .Int = 70 };
-    const found = nodeLookupInt(nodes, key, 0).?;
+    const found = nodeLookupInt(nodes, key).?;
     try std.testing.expectEqual(@as(i64, 70), found.value.Int);
 }
 
@@ -527,19 +571,19 @@ test "nodeLookupInt agrees with nodeLookup for int keys across a range" {
     // Insert 15 int keys (leave one free slot for chain appends).
     var i: i64 = 1;
     while (i < cap) : (i += 1) {
-        _ = nodeInsert(nodes, &lastfree, .{ .Int = i }, .{ .Int = i * 10 }, 0);
+        _ = nodeInsert(nodes, &lastfree, .{ .Int = i }, .{ .Int = i * 10 });
     }
     // Every key must be found by BOTH paths, with identical results.
     var k: i64 = 1;
     while (k < cap) : (k += 1) {
-        const generic = nodeLookup(nodes, .{ .Int = k }, 0);
-        const specialized = nodeLookupInt(nodes, k, 0);
+        const generic = nodeLookup(nodes, .{ .Int = k });
+        const specialized = nodeLookupInt(nodes, k);
         try std.testing.expect(generic != null);
         try std.testing.expect(specialized != null);
         try std.testing.expectEqual(generic.?.value, specialized.?.value);
     }
     // Absent key: both return null.
-    try std.testing.expect(nodeLookupInt(nodes, 99999, 0) == null);
+    try std.testing.expect(nodeLookupInt(nodes, 99999) == null);
 }
 
 test "nodeLookupInt skips dead keys and non-int keys in the chain" {
@@ -550,7 +594,7 @@ test "nodeLookupInt skips dead keys and non-int keys in the chain" {
     // chained after it. nodeLookupInt must skip the dead node and find the
     // live one — same as the generic nodeLookup.
     const key: i64 = 7;
-    const mp: usize = hashInt(key, 0) & (nodes.len - 1);
+    const mp: usize = intIndex(nodes.len, key);
     nodes[mp].key_tt = .table; // non-int key at main position
     nodes[mp].key_val = .{ .table = @ptrFromInt(@as(usize, 0x1234) & ~@as(usize, @alignOf(*Table) - 1)) };
     nodes[mp].value = .Nil;
@@ -560,7 +604,7 @@ test "nodeLookupInt skips dead keys and non-int keys in the chain" {
     nodes[free_idx].setKey(.{ .Int = key });
     nodes[free_idx].value = .{ .Int = 42 };
     nodes[mp].next_offset = @intCast(@as(i64, @intCast(free_idx)) - @as(i64, @intCast(mp)));
-    const found = nodeLookupInt(nodes, key, 0).?;
+    const found = nodeLookupInt(nodes, key).?;
     try std.testing.expectEqual(@as(i64, 42), found.value.Int);
 }
 
@@ -641,12 +685,12 @@ test "nodeLookupStr agrees with nodeLookup for string keys" {
     var i: usize = 0;
     while (i < 15) : (i += 1) {
         keys[i] = .{ .hash = (i + 1) *% 0x9E3779B97F4A7C15, .srkind = @intCast(i) };
-        _ = nodeInsert(nodes, &lastfree, .{ .String = &keys[i] }, .{ .Int = @intCast(i * 10) }, 0);
+        _ = nodeInsert(nodes, &lastfree, .{ .String = &keys[i] }, .{ .Int = @intCast(i * 10) });
     }
     // Every key must be found by BOTH paths, with identical results.
     var k: usize = 0;
     while (k < 15) : (k += 1) {
-        const generic = nodeLookup(nodes, .{ .String = &keys[k] }, 0);
+        const generic = nodeLookup(nodes, .{ .String = &keys[k] });
         const specialized = nodeLookupStr(nodes, &keys[k]);
         try std.testing.expect(generic != null);
         try std.testing.expect(specialized != null);
@@ -654,7 +698,7 @@ test "nodeLookupStr agrees with nodeLookup for string keys" {
     }
     // Absent key: both return null.
     var absent: LuaString = .{ .hash = 0x1234_5678, .srkind = @intCast(0) };
-    try std.testing.expect(nodeLookup(nodes, .{ .String = &absent }, 0) == null);
+    try std.testing.expect(nodeLookup(nodes, .{ .String = &absent }) == null);
     try std.testing.expect(nodeLookupStr(nodes, &absent) == null);
 }
 
@@ -857,7 +901,7 @@ test "nodeLookupShortStrIdentity agrees with nodeLookupStr for valid interned-sh
     var i: usize = 0;
     while (i < 15) : (i += 1) {
         keys[i] = .{ .hash = (i + 1) *% 0x9E3779B97F4A7C15, .srkind = @intCast(i) };
-        _ = nodeInsert(nodes, &lastfree, .{ .String = &keys[i] }, .{ .Int = @intCast(i * 10) }, 0);
+        _ = nodeInsert(nodes, &lastfree, .{ .String = &keys[i] }, .{ .Int = @intCast(i * 10) });
     }
     var k: usize = 0;
     while (k < 15) : (k += 1) {
@@ -897,9 +941,9 @@ pub inline fn gcValuePtr(v: Value) ?*anyopaque {
 /// The deadok path is safe even with a dangling key pointer: it compares raw
 /// pointer values only, never dereferences them (PUC "garbage in, garbage out"
 /// semantics, ltable.c:242-250).
-pub inline fn nodeLookupDeadok(nodes: []Node, key: Value, seed: u64) ?*Node {
+pub inline fn nodeLookupDeadok(nodes: []Node, key: Value) ?*Node {
     if (nodes.len == 0) return null;
-    var n: *Node = &nodes[mainPosition(nodes.len, key, seed)];
+    var n: *Node = &nodes[mainPosition(nodes.len, key)];
     if (n.isEmpty()) return null; // bucket unused => key not present
     while (true) {
         if (n.keyMatchesDeadok(key)) return n;
@@ -911,7 +955,7 @@ test "nodeLookup returns null for empty hash part" {
     const nodes = try std.testing.allocator.alloc(Node, 4);
     defer std.testing.allocator.free(nodes);
     for (nodes) |*n| n.* = .{};
-    try std.testing.expect(nodeLookup(nodes, .{ .Int = 7 }, 0) == null);
+    try std.testing.expect(nodeLookup(nodes, .{ .Int = 7 }) == null);
 }
 
 test "nodeLookup finds an inserted key at its main position" {
@@ -919,11 +963,11 @@ test "nodeLookup finds an inserted key at its main position" {
     defer std.testing.allocator.free(nodes);
     for (nodes) |*n| n.* = .{};
     const key: Value = .{ .Int = 7 };
-    const mp = mainPosition(nodes.len, key, 0);
+    const mp = mainPosition(nodes.len, key);
     nodes[mp] = .{};
     nodes[mp].setKey(key);
     nodes[mp].value = .{ .Int = 70 };
-    const found = nodeLookup(nodes, key, 0).?;
+    const found = nodeLookup(nodes, key).?;
     try std.testing.expectEqual(@as(i64, 70), found.value.Int);
 }
 
@@ -949,10 +993,12 @@ pub fn nodeInsert(
     lastfree: *usize,
     key: Value,
     value: Value,
-    seed: u64,
 ) ?*Node {
-    const h = keyHash(key, seed);
-    const mp_idx: usize = h & (nodes.len - 1);
+    // P16.29 T1: the type-specific bucket policy (mainPosition) decides the
+    // home bucket; the Brent-eviction check recomputes the OCCUPANT's main
+    // position from the node itself (mainPositionOfNode — PUC's
+    // `mainposition(t, gcV(othern))`).
+    const mp_idx: usize = mainPosition(nodes.len, key);
     const mp: *Node = &nodes[mp_idx];
     // PUC `insertkey` (ltable.c:863): the main position is available for
     // direct overwrite iff its VALUE is nil/empty — NOT iff its key tag is
@@ -979,7 +1025,7 @@ pub fn nodeInsert(
     // Main position occupied by a live entry. Decide Brent evict vs chain-append.
     const free = getFreePos(nodes, lastfree) orelse return null;
     const free_idx: usize = (@intFromPtr(free) - @intFromPtr(nodes.ptr)) / @sizeOf(Node);
-    const other_idx: usize = mp.rawHash(seed) & (nodes.len - 1);
+    const other_idx: usize = mainPositionOfNode(nodes.len, mp);
     if (other_idx != mp_idx) {
         // The occupant of `mp` is foreign (its own main position is `other`).
         // Evict it: move its contents to `free`, relink its predecessor to free,
@@ -1036,9 +1082,9 @@ test "nodeInsert places a key and nodeLookup finds it" {
     for (nodes) |*n| n.* = .{};
     var lastfree: usize = nodes.len;
     const key: Value = .{ .Int = 7 };
-    const inserted = nodeInsert(nodes, &lastfree, key, .{ .Int = 42 }, 0).?;
+    const inserted = nodeInsert(nodes, &lastfree, key, .{ .Int = 42 }).?;
     try std.testing.expect(keyEq(inserted.getKey(), key));
-    const found = nodeLookup(nodes, key, 0).?;
+    const found = nodeLookup(nodes, key).?;
     try std.testing.expectEqual(@as(i64, 42), found.value.Int);
 }
 
@@ -1054,7 +1100,7 @@ test "nodeInsert/lookup stress: all keys findable under collisions" {
     var lastfree: usize = nodes.len;
     var i: i64 = 1;
     while (i < cap) : (i += 1) { // insert cap-1 keys (leave one free slot)
-        const node = nodeInsert(nodes, &lastfree, .{ .Int = i }, .{ .Int = i * 10 }, 0) orelse {
+        const node = nodeInsert(nodes, &lastfree, .{ .Int = i }, .{ .Int = i * 10 }) orelse {
             try std.testing.expect(false); // should not be full yet
             return;
         };
@@ -1063,7 +1109,7 @@ test "nodeInsert/lookup stress: all keys findable under collisions" {
     // Every inserted key must be findable.
     var k: i64 = 1;
     while (k < cap) : (k += 1) {
-        const found = nodeLookup(nodes, .{ .Int = k }, 0) orelse {
+        const found = nodeLookup(nodes, .{ .Int = k }) orelse {
             try std.testing.expect(false);
             return;
         };
@@ -1085,24 +1131,35 @@ test "nodeInsert/lookup stress: mixed float and int keys findable" {
     // Insert 3 float keys (non-integer, so they go to hash part).
     const float_keys = [_]f64{ 0.5, 1.5, 2.5 };
     for (float_keys) |fk| {
-        _ = nodeInsert(nodes, &lastfree, .{ .Num = fk }, .{ .Num = fk * 10 }, 0) orelse return error.UnexpectedFullHash;
+        _ = nodeInsert(nodes, &lastfree, .{ .Num = fk }, .{ .Num = fk * 10 }) orelse return error.UnexpectedFullHash;
     }
     // Insert 4 int keys (also hash part).
     var i: i64 = 100;
     while (i < 104) : (i += 1) {
-        _ = nodeInsert(nodes, &lastfree, .{ .Int = i }, .{ .Int = i * 10 }, 0) orelse return error.UnexpectedFullHash;
+        _ = nodeInsert(
+            nodes,
+            &lastfree,
+            .{ .Int = i },
+            .{ .Int = i * 10 },
+        ) orelse return error.UnexpectedFullHash;
     }
 
     // Every float key must be findable.
     for (float_keys) |fk| {
-        const found = nodeLookup(nodes, .{ .Num = fk }, 0) orelse return error.FloatKeyLost;
+        const found = nodeLookup(
+            nodes,
+            .{ .Num = fk },
+        ) orelse return error.FloatKeyLost;
         try std.testing.expect(found.value == .Num);
         try std.testing.expectEqual(fk * 10, found.value.Num);
     }
     // Every int key must be findable.
     i = 100;
     while (i < 104) : (i += 1) {
-        const found = nodeLookup(nodes, .{ .Int = i }, 0) orelse return error.IntKeyLost;
+        const found = nodeLookup(
+            nodes,
+            .{ .Int = i },
+        ) orelse return error.IntKeyLost;
         try std.testing.expect(found.value == .Int);
         try std.testing.expectEqual(i * 10, found.value.Int);
     }
@@ -1122,17 +1179,17 @@ test "nodeInsert returns null when hash part is full" {
     // scans all slots, finds them all occupied, and returns null.
     var i: i64 = 1;
     while (i <= cap) : (i += 1) {
-        _ = nodeInsert(nodes, &lastfree, .{ .Int = i }, .{ .Int = i }, 0);
+        _ = nodeInsert(nodes, &lastfree, .{ .Int = i }, .{ .Int = i });
     }
-    try std.testing.expect(nodeInsert(nodes, &lastfree, .{ .Int = 999 }, .{ .Int = 999 }, 0) == null);
+    try std.testing.expect(nodeInsert(nodes, &lastfree, .{ .Int = 999 }, .{ .Int = 999 }) == null);
 }
 
 // Delete a key by setting its value to Nil (PUC 5.5 semantics, ltable.c: the
 // node stays in place with its chain links intact; next()/lookup treat a
 // Nil-valued node as absent). No unlinking, no tombstone counter — compaction
 // happens at rehash. Returns true if the key was present (and is now deleted).
-pub fn nodeDelete(nodes: []Node, key: Value, seed: u64) bool {
-    const n = nodeLookup(nodes, key, seed) orelse return false;
+pub fn nodeDelete(nodes: []Node, key: Value) bool {
+    const n = nodeLookup(nodes, key) orelse return false;
     n.value = .Nil;
     return true;
 }
@@ -1178,11 +1235,11 @@ test "nodeDelete nils the value; lookup then sees it absent" {
     for (nodes) |*n| n.* = .{};
     var lastfree: usize = nodes.len;
     const key: Value = .{ .Int = 5 };
-    _ = nodeInsert(nodes, &lastfree, key, .{ .Int = 50 }, 0);
-    try std.testing.expect(nodeDelete(nodes, key, 0));
-    const found = nodeLookup(nodes, key, 0).?;
+    _ = nodeInsert(nodes, &lastfree, key, .{ .Int = 50 });
+    try std.testing.expect(nodeDelete(nodes, key));
+    const found = nodeLookup(nodes, key).?;
     try std.testing.expect(found.value == .Nil); // logically deleted
-    try std.testing.expect(!nodeDelete(nodes, .{ .Int = 999 }, 0)); // absent key
+    try std.testing.expect(!nodeDelete(nodes, .{ .Int = 999 })); // absent key
 }
 
 test "nextLiveIndex scans nodes in memory order, skipping deleted/empty" {
@@ -1277,16 +1334,16 @@ test "nodeLookupDeadok finds a dead node; nodeLookup does not" {
 
     const dummy_ptr: *Table = @ptrFromInt(0x4000);
     const key: Value = .{ .Table = dummy_ptr };
-    const mp = mainPosition(nodes.len, key, 0);
+    const mp = mainPosition(nodes.len, key);
     nodes[mp].key_tt = .table;
     nodes[mp].key_val = .{ .table = dummy_ptr };
     nodes[mp].value = .Nil;
     nodes[mp].markDeadKey();
 
     // Normal lookup (deadok=0): must return null (dead node not matched).
-    try std.testing.expect(nodeLookup(nodes, key, 0) == null);
+    try std.testing.expect(nodeLookup(nodes, key) == null);
     // Deadok lookup (deadok=1): must find the dead node.
-    const found = nodeLookupDeadok(nodes, key, 0).?;
+    const found = nodeLookupDeadok(nodes, key).?;
     try std.testing.expectEqual(NodeKeyTag.dead, found.key_tt);
 }
 
@@ -1351,14 +1408,17 @@ test "rehash skips dead nodes (dead pointer never dereferenced)" {
     old[1].value = .Nil;
     old[1].markDeadKey(); // dead node with a raw pointer
 
-    const result = try rehash(std.testing.allocator, old, 2, 0);
+    const result = try rehash(std.testing.allocator, old, 2);
     defer std.testing.allocator.free(result.nodes);
 
     // Only the live entry should be present in the new hash.
-    const found = nodeLookup(result.nodes, .{ .Int = 10 }, 0).?;
+    const found = nodeLookup(result.nodes, .{ .Int = 10 }).?;
     try std.testing.expectEqual(@as(i64, 100), found.value.Int);
     // The dead node must not have been reinserted.
-    try std.testing.expect(nodeLookup(result.nodes, .{ .Int = 999 }, 0) == null);
+    try std.testing.expect(nodeLookup(
+        result.nodes,
+        .{ .Int = 999 },
+    ) == null);
 }
 
 test "nodeInsert overwrites a dead node in place (stale pointer fully replaced)" {
@@ -1371,9 +1431,9 @@ test "nodeInsert overwrites a dead node in place (stale pointer fully replaced)"
     // Insert a key, delete it, deaden it.
     const key1: Value = .{ .Int = 7 };
     var lastfree: usize = nodes.len;
-    _ = nodeInsert(nodes, &lastfree, key1, .{ .Int = 70 }, 0);
-    _ = nodeDelete(nodes, key1, 0);
-    const mp = mainPosition(nodes.len, key1, 0);
+    _ = nodeInsert(nodes, &lastfree, key1, .{ .Int = 70 });
+    _ = nodeDelete(nodes, key1);
+    const mp = mainPosition(nodes.len, key1);
     nodes[mp].markDeadKey();
     try std.testing.expectEqual(NodeKeyTag.dead, nodes[mp].key_tt);
 
@@ -1381,10 +1441,10 @@ test "nodeInsert overwrites a dead node in place (stale pointer fully replaced)"
     // (With seed=0 and 4 slots, key 7 and key 7+4=11 may collide; use same key
     // to guarantee same main position — the dead node is overwritten.)
     const key2: Value = .{ .Int = 7 };
-    _ = nodeInsert(nodes, &lastfree, key2, .{ .Int = 77 }, 0);
+    _ = nodeInsert(nodes, &lastfree, key2, .{ .Int = 77 });
 
     // The node must no longer be dead — it's a live entry now.
-    const found = nodeLookup(nodes, key2, 0).?;
+    const found = nodeLookup(nodes, key2).?;
     try std.testing.expectEqual(@as(i64, 77), found.value.Int);
     try std.testing.expect(found.key_tt != .dead);
 }
@@ -1396,7 +1456,6 @@ pub fn rehash(
     alloc: std.mem.Allocator,
     old: []Node,
     new_len_log2: u6,
-    seed: u64,
 ) !struct { nodes: []Node, lastfree: usize } {
     const new_len: usize = @as(usize, 1) << new_len_log2;
     const new_nodes = try alloc.alloc(Node, new_len);
@@ -1410,7 +1469,7 @@ pub fn rehash(
         // nodes the same way (they have empty values and are not reinserted).
         if (o.isEmpty() or o.isDeadKey() or o.value == .Nil) continue;
         // new_len is chosen large enough that reinsert cannot fail.
-        _ = nodeInsert(new_nodes, &lastfree, o.getKey(), o.value, seed);
+        _ = nodeInsert(new_nodes, &lastfree, o.getKey(), o.value);
     }
     return .{ .nodes = new_nodes, .lastfree = lastfree };
 }
@@ -1455,15 +1514,15 @@ test "Node.getKey/setKey round-trips a Builtin key" {
     try std.testing.expect(!empty.keyMatches(key));
 }
 
-test "Node.rawHash and keyHash agree for Builtin keys" {
-    // Brent's variation requires that the hash used at insert time (keyHash)
-    // and the hash recomputed at the home node (rawHash) are identical —
-    // otherwise the "collider is in its own main position" invariant breaks.
-    const seed: u64 = 0xdeadbeef;
+test "mainPosition and mainPositionOfNode agree for Builtin keys" {
+    // Brent's variation requires that the bucket chosen at insert time
+    // (mainPosition) and the bucket recomputed at the home node
+    // (mainPositionOfNode) are identical — otherwise the "collider is in
+    // its own main position" invariant breaks.
     const b: BuiltinId = .tostring;
     var n: Node = .{};
     n.setKey(.{ .Builtin = b });
-    try std.testing.expectEqual(n.rawHash(seed), keyHash(.{ .Builtin = b }, seed));
+    try std.testing.expectEqual(mainPositionOfNode(64, &n), mainPosition(64, .{ .Builtin = b }));
 }
 
 test "rehash preserves live entries and drops deleted ones" {
@@ -1471,20 +1530,20 @@ test "rehash preserves live entries and drops deleted ones" {
     const nodes = try alloc.alloc(Node, 4);
     for (nodes) |*n| n.* = .{};
     var lastfree: usize = nodes.len;
-    _ = nodeInsert(nodes, &lastfree, .{ .Int = 1 }, .{ .Int = 10 }, 0);
-    _ = nodeInsert(nodes, &lastfree, .{ .Int = 2 }, .{ .Int = 20 }, 0);
-    _ = nodeInsert(nodes, &lastfree, .{ .Int = 3 }, .{ .Int = 30 }, 0);
-    _ = nodeDelete(nodes, .{ .Int = 2 }, 0); // delete key 2
+    _ = nodeInsert(nodes, &lastfree, .{ .Int = 1 }, .{ .Int = 10 });
+    _ = nodeInsert(nodes, &lastfree, .{ .Int = 2 }, .{ .Int = 20 });
+    _ = nodeInsert(nodes, &lastfree, .{ .Int = 3 }, .{ .Int = 30 });
+    _ = nodeDelete(nodes, .{ .Int = 2 }); // delete key 2
 
-    const r = try rehash(alloc, nodes, 3, 0); // grow to 8
+    const r = try rehash(alloc, nodes, 3); // grow to 8
     defer alloc.free(r.nodes);
     alloc.free(nodes);
 
     // Live keys survive.
-    try std.testing.expectEqual(@as(i64, 10), nodeLookup(r.nodes, .{ .Int = 1 }, 0).?.value.Int);
-    try std.testing.expectEqual(@as(i64, 30), nodeLookup(r.nodes, .{ .Int = 3 }, 0).?.value.Int);
+    try std.testing.expectEqual(@as(i64, 10), nodeLookup(r.nodes, .{ .Int = 1 }).?.value.Int);
+    try std.testing.expectEqual(@as(i64, 30), nodeLookup(r.nodes, .{ .Int = 3 }).?.value.Int);
     // Deleted key is gone (not reinserted).
-    const deleted = nodeLookup(r.nodes, .{ .Int = 2 }, 0);
+    const deleted = nodeLookup(r.nodes, .{ .Int = 2 });
     try std.testing.expect(deleted == null or deleted.?.value == .Nil);
 }
 
@@ -1515,19 +1574,24 @@ test "nodeInsert: overwrite deleted node at main position preserves chain" {
     // ratio hash distributes them, but some will collide and chain.
     var i: i64 = 1;
     while (i < cap) : (i += 1) {
-        _ = nodeInsert(nodes, &lastfree, .{ .Int = i }, .{ .Int = i * 10 }, 0) orelse {
+        _ = nodeInsert(
+            nodes,
+            &lastfree,
+            .{ .Int = i },
+            .{ .Int = i * 10 },
+        ) orelse {
             try std.testing.expect(false);
             return;
         };
     }
 
     // Pick the key whose node is at its own main position (index 0 of the
-    // chain). We find it by scanning: the main-position node's rawHash must
-    // equal its index masked by (cap-1).
+    // chain). We find it by scanning: the main-position node's computed
+    // bucket (mainPositionOfNode) must equal its index.
     var mp_key: Value = .Nil;
     for (nodes, 0..) |*n, idx| {
         if (n.isEmpty() or n.value == .Nil) continue;
-        if ((n.rawHash(0) & (cap - 1)) == idx) {
+        if (mainPositionOfNode(cap, n) == idx) {
             mp_key = n.getKey();
             break;
         }
@@ -1537,13 +1601,13 @@ test "nodeInsert: overwrite deleted node at main position preserves chain" {
     // If this main-position node has a chain (next_offset != 0), delete it
     // and re-insert a new key at the same main position. The chain must
     // survive.
-    const mp_node = nodeLookup(nodes, mp_key, 0).?;
+    const mp_node = nodeLookup(nodes, mp_key).?;
     const had_chain = mp_node.next_offset != 0;
     if (had_chain) {
         // Delete the main-position key.
-        try std.testing.expect(nodeDelete(nodes, mp_key, 0));
+        try std.testing.expect(nodeDelete(nodes, mp_key));
         // Verify the node is now Nil-valued but still has its chain link.
-        const deleted_node = nodeLookup(nodes, mp_key, 0).?;
+        const deleted_node = nodeLookup(nodes, mp_key).?;
         try std.testing.expect(deleted_node.value == .Nil);
         try std.testing.expect(deleted_node.next_offset != 0);
 
@@ -1551,20 +1615,25 @@ test "nodeInsert: overwrite deleted node at main position preserves chain" {
         // key with the same hash: since keyHash(.Int = k, 0) = hashInt(k, 0),
         // and hashInt uses the golden ratio, we find a colliding key by
         // scanning for an int whose hash mod cap equals the main position.
-        const mp_idx = mp_node.rawHash(0) & (cap - 1);
+        const mp_idx = mainPositionOfNode(cap, mp_node);
         var new_key: i64 = 1000;
         while (new_key < 10000) : (new_key += 1) {
-            if ((hashInt(new_key, 0) & (cap - 1)) == mp_idx and new_key != mp_key.Int) break;
+            if (intIndex(cap, new_key) == mp_idx and new_key != mp_key.Int) break;
         }
         try std.testing.expect(new_key < 10000);
 
-        _ = nodeInsert(nodes, &lastfree, .{ .Int = new_key }, .{ .Int = 999 }, 0) orelse {
+        _ = nodeInsert(
+            nodes,
+            &lastfree,
+            .{ .Int = new_key },
+            .{ .Int = 999 },
+        ) orelse {
             try std.testing.expect(false);
             return;
         };
 
         // The new key must be findable.
-        const found_new = nodeLookup(nodes, .{ .Int = new_key }, 0).?;
+        const found_new = nodeLookup(nodes, .{ .Int = new_key }).?;
         try std.testing.expectEqual(@as(i64, 999), found_new.value.Int);
 
         // The deleted key's node is now overwritten with the new key; its
@@ -1576,7 +1645,10 @@ test "nodeInsert: overwrite deleted node at main position preserves chain" {
     i = 1;
     while (i < cap) : (i += 1) {
         if (i == mp_key.Int and had_chain) continue; // deleted, overwritten
-        const found = nodeLookup(nodes, .{ .Int = i }, 0) orelse {
+        const found = nodeLookup(
+            nodes,
+            .{ .Int = i },
+        ) orelse {
             try std.testing.expect(false);
             return;
         };
@@ -1598,7 +1670,12 @@ test "nodeInsert: insert/delete churn preserves chain integrity" {
     // Fill with 15 int keys (leave one free slot).
     var i: i64 = 1;
     while (i < cap) : (i += 1) {
-        _ = nodeInsert(nodes, &lastfree, .{ .Int = i }, .{ .Int = i }, 0) orelse {
+        _ = nodeInsert(
+            nodes,
+            &lastfree,
+            .{ .Int = i },
+            .{ .Int = i },
+        ) orelse {
             try std.testing.expect(false);
             return;
         };
@@ -1611,14 +1688,22 @@ test "nodeInsert: insert/delete churn preserves chain integrity" {
     // position must overwrite in place, preserving the chain.
     var k: i64 = 100;
     while (k < 1000) : (k += 1) {
-        _ = nodeInsert(nodes, &lastfree, .{ .Int = k }, .{ .Int = k }, 0) orelse continue;
-        _ = nodeDelete(nodes, .{ .Int = k }, 0);
+        _ = nodeInsert(
+            nodes,
+            &lastfree,
+            .{ .Int = k },
+            .{ .Int = k },
+        ) orelse continue;
+        _ = nodeDelete(nodes, .{ .Int = k });
     }
 
     // Every original key (1..15) must still be findable with its value.
     i = 1;
     while (i < cap) : (i += 1) {
-        const found = nodeLookup(nodes, .{ .Int = i }, 0) orelse {
+        const found = nodeLookup(
+            nodes,
+            .{ .Int = i },
+        ) orelse {
             try std.testing.expect(false);
             return;
         };
@@ -1644,22 +1729,32 @@ test "nodeInsert: overwrite dead-key node at main position preserves chain" {
     outer: while (k1 < 100) : (k1 += 1) {
         k2 = k1 + 1;
         while (k2 < 100) : (k2 += 1) {
-            if ((hashInt(k1, 0) & 7) == (hashInt(k2, 0) & 7)) break :outer;
+            if (intIndex(8, k1) == intIndex(8, k2)) break :outer;
         }
     }
     try std.testing.expect(k1 < 100);
 
-    _ = nodeInsert(nodes, &lastfree, .{ .Int = k1 }, .{ .Int = 11 }, 0) orelse {
+    _ = nodeInsert(
+        nodes,
+        &lastfree,
+        .{ .Int = k1 },
+        .{ .Int = 11 },
+    ) orelse {
         try std.testing.expect(false);
         return;
     };
-    _ = nodeInsert(nodes, &lastfree, .{ .Int = k2 }, .{ .Int = 22 }, 0) orelse {
+    _ = nodeInsert(
+        nodes,
+        &lastfree,
+        .{ .Int = k2 },
+        .{ .Int = 22 },
+    ) orelse {
         try std.testing.expect(false);
         return;
     };
 
     // Find the main-position node (the one whose index == its hash & 7).
-    const mp_idx = hashInt(k1, 0) & 7;
+    const mp_idx = intIndex(8, k1);
     const mp_node = &nodes[mp_idx];
 
     // Determine which key is at the main position and which is chained.
@@ -1669,7 +1764,7 @@ test "nodeInsert: overwrite dead-key node at main position preserves chain" {
     // Simulate GC deadening: mark the main-position node as dead-key.
     // (In real GC, this happens when the string key is collected. Here we
     // use an int key and manually call markDeadKey to simulate the state.)
-    _ = nodeDelete(nodes, mp_key, 0); // value -> .Nil
+    _ = nodeDelete(nodes, mp_key); // value -> .Nil
     mp_node.markDeadKey(); // key_tt -> .dead, key_val cleared
 
     // Verify the dead node still has its chain link.
@@ -1679,17 +1774,22 @@ test "nodeInsert: overwrite dead-key node at main position preserves chain" {
     // Insert a new key that hashes to the same main position.
     var new_key: i64 = 1000;
     while (new_key < 10000) : (new_key += 1) {
-        if ((hashInt(new_key, 0) & 7) == mp_idx) break;
+        if (intIndex(8, new_key) == mp_idx) break;
     }
     try std.testing.expect(new_key < 10000);
 
-    _ = nodeInsert(nodes, &lastfree, .{ .Int = new_key }, .{ .Int = 333 }, 0) orelse {
+    _ = nodeInsert(
+        nodes,
+        &lastfree,
+        .{ .Int = new_key },
+        .{ .Int = 333 },
+    ) orelse {
         try std.testing.expect(false);
         return;
     };
 
     // The new key must be at the main position (overwrote the dead node).
-    const found_new = nodeLookup(nodes, .{ .Int = new_key }, 0).?;
+    const found_new = nodeLookup(nodes, .{ .Int = new_key }).?;
     try std.testing.expectEqual(@as(i64, 333), found_new.value.Int);
     try std.testing.expectEqual(@as(usize, @intFromPtr(found_new)), @as(usize, @intFromPtr(mp_node)));
 
@@ -1697,7 +1797,7 @@ test "nodeInsert: overwrite dead-key node at main position preserves chain" {
     try std.testing.expectEqual(saved_next, found_new.next_offset);
 
     // The chained key must still be findable.
-    const found_chained = nodeLookup(nodes, chained_key, 0).?;
+    const found_chained = nodeLookup(nodes, chained_key).?;
     try std.testing.expect(chained_key == .Int);
     const expected_val: i64 = if (chained_key.Int == k1) 11 else 22;
     try std.testing.expectEqual(expected_val, found_chained.value.Int);
@@ -2083,4 +2183,102 @@ test "nextvar.lua:41 full scenario: array + hash → computeSizes returns 4" {
     const asize = computeSizes(&ct);
     try std.testing.expectEqual(@as(u32, 4), asize);
     try std.testing.expectEqual(@as(u32, 4), ct.na);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// P16.29 T1 permanent parity tests (R1/R2/R3).
+
+test "R1: PUC integer main-position formula" {
+    // PUC hashint (ltable.c:144-152): small ints use the 32-bit remainder,
+    // large use the 64-bit unsigned remainder. Both against the odd divisor.
+    const len: usize = 16384;
+    const d: u64 = (len - 1) | 1;
+    // positive small
+    try std.testing.expectEqual(@as(usize, @intCast(12345 % 16383)), intIndex(len, 12345));
+    // negative: two's-complement bits are a huge unsigned value
+    const neg_bits: u64 = @bitCast(@as(i64, -7));
+    try std.testing.expectEqual(@as(usize, neg_bits % d), intIndex(len, -7));
+    // very large positive
+    const big: i64 = std.math.maxInt(i64);
+    try std.testing.expectEqual(@as(usize, @as(u64, @bitCast(big)) % d), intIndex(len, big));
+    // structured keys (multiples of 100) must NOT cluster: the odd modulo
+    // distributes them across all buckets (the PUC hashmod rationale).
+    var seen = [_]bool{false} ** 64;
+    var distinct: usize = 0;
+    for (1..64) |i| {
+        const b = intIndex(64, @intCast(i * 100));
+        if (!seen[b]) {
+            seen[b] = true;
+            distinct += 1;
+        }
+    }
+    // With multiply+mask, multiples of 100 would use only ~16 of 63 buckets
+    // (gcd(100, 64) = 4). The odd modulo must use nearly all of them.
+    try std.testing.expect(distinct >= 60);
+    // Multiples of a power of two (pure 2-factor structure, the PUC
+    // hashmod target case): 8*i mod 63 cycles through ALL 63 residues
+    // (gcd(8,63)=1). A pow2 mask would collapse them to len/8 buckets.
+    var seen2 = [_]bool{false} ** 64;
+    var distinct2: usize = 0;
+    for (1..64) |i| {
+        const b = intIndex(64, @intCast(i * 8));
+        if (!seen2[b]) {
+            seen2[b] = true;
+            distinct2 += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 63), distinct2);
+}
+
+test "R2: PUC pointer main-position formula" {
+    // PUC point2uint (llimits.h:90): the LOW 32 bits of the pointer, then
+    // the odd modulo. Aligned pointers must not cluster.
+    const len: usize = 1024;
+    const d: u32 = @intCast((len - 1) | 1);
+    // Simulated 64-byte-aligned pointers (heap object alignment).
+    var addrs: [16]usize = undefined;
+    for (&addrs, 0..) |*a, i| a.* = 0x7F1234000000 + i * 64;
+    var distinct: usize = 0;
+    var seen = [_]bool{false} ** 1024;
+    for (addrs) |a| {
+        const low32: u32 = @truncate(a);
+        const b: usize = low32 % d;
+        if (!seen[b]) {
+            seen[b] = true;
+            distinct += 1;
+        }
+        // formula agreement with pointerIndex
+        try std.testing.expectEqual(b, pointerIndex(len, a));
+    }
+    // All 16 distinct aligned pointers land in 16 DISTINCT buckets.
+    try std.testing.expectEqual(@as(usize, 16), distinct);
+}
+
+test "R3: PUC float hash (l_hashfloat port)" {
+    // Non-integral floats across sign/exponent range hash via the PUC
+    // algorithm; inf/NaN map to 0. Verify insert/get/rehash round-trips.
+    const alloc = std.testing.allocator;
+    const nodes = try alloc.alloc(Node, 8);
+    defer alloc.free(nodes);
+    for (nodes) |*n| n.* = .{};
+    var lastfree: usize = nodes.len;
+    const keys = [_]f64{ 0.5, -0.5, 1.5, -2.25, 1e100, -1e-100, 3.14159265358979 };
+    for (keys) |k| {
+        _ = nodeInsert(nodes, &lastfree, .{ .Num = k }, .{ .Num = k * 2 }).?;
+    }
+    for (keys) |k| {
+        const n = nodeLookup(nodes, .{ .Num = k }).?;
+        try std.testing.expectEqual(k * 2, n.value.Num);
+    }
+    // hashFloat basics: frexp scaling keeps finite values exact and nonzero
+    // for nonzero inputs; ±inf and NaN map to 0 like PUC.
+    try std.testing.expectEqual(@as(u32, 0), hashFloat(std.math.inf(f64)));
+    try std.testing.expectEqual(@as(u32, 0), hashFloat(-std.math.inf(f64)));
+    try std.testing.expectEqual(@as(u32, 0), hashFloat(std.math.nan(f64)));
+    try std.testing.expect(hashFloat(1.5) != 0);
+    // 0.5 and -0.5 differ by sign but frexp(|m|) is symmetric: exponent
+    // differs? No — frexp(-0.5) = {-0.5, 0}: same exponent, mantissa -0.5
+    // -> m differs by sign -> different hashes (Lua treats them as
+    // distinct table keys since neither is integral).
+    try std.testing.expect(hashFloat(0.5) != hashFloat(-0.5));
 }

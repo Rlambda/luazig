@@ -837,7 +837,6 @@ const BytecodeProtectedKind = enum { pcall, xpcall };
 const BytecodeProtectedLayer = struct {
     thread: *Thread,
     kind: BytecodeProtectedKind,
-    handler: Value = .Nil,
     saved_error: BytecodeSavedError,
 };
 
@@ -850,10 +849,14 @@ const BytecodeProtectedCall = struct {
     /// the thread depth to this snapshot. Parked/continued frames across
     /// yield never pass here, preserving their live increments.
     saved_ncalls: u32 = 0,
-    phase: enum { target, handler } = .target,
-    handler: Value = .Nil,
-    handler_depth: usize = 0,
-    on_error_stack: bool = false,
+    /// PUC lua_pcallk (lapi.c): when errfunc != 0, L->errfunc is armed for
+    /// the protected call's duration. For xpcall this is the bc_stack slot
+    /// holding the message handler (staged just below the target frame);
+    /// ERRFUNC_NONE for pcall (PUC arms errfunc = 0). The handler runs at
+    /// the throw site (invokeErrfunc / PUC luaG_errormsg) — NOT after the
+    /// unwind — so finishBytecodeProtectedCall only needs to pop the slot
+    /// and let restoreBytecodeSavedError bring back the outer errfunc.
+    armed_errfunc: StackOffset = ERRFUNC_NONE,
     saved_error: BytecodeSavedError,
     /// Outermost-to-innermost protected builtins whose target is another
     /// pcall/xpcall. The innermost Lua target is the active protection above;
@@ -1994,8 +1997,15 @@ pub const Thread = struct {
     /// PUC `L->errfunc` (lstate.h:307): stack offset of error handler.
     /// ERRFUNC_NONE = no errfunc. Set by xpcall and pcallk.
     errfunc: StackOffset = ERRFUNC_NONE,
-    /// True while errfunc handler is running. Prevents infinite recursion.
-    errfunc_running: bool = false,
+    /// The errfunc slot of the message-handler window currently running
+    /// (ERRFUNC_NONE = none). PUC luaG_errormsg has no re-entrancy guard:
+    /// a handler error re-enters luaG_errormsg recursively (bounded by the
+    /// C stack). Our retry loop inside invokeErrfunc replaces that
+    /// recursion, so a raise while the SAME handler window is running must
+    /// not invoke it again at the raise site — but a DIFFERENT handler
+    /// (armed by an xpcall nested inside the running handler) must run
+    /// normally, hence the slot identity instead of a boolean.
+    errfunc_running_idx: StackOffset = ERRFUNC_NONE,
     callee: Value, // .Closure or .Builtin
     /// P16.3: inline small-vector (0-4 values stay off the heap; the
     /// yield/resume hot loop must be allocation-free).
@@ -2067,7 +2077,6 @@ pub const Thread = struct {
     /// Protected bytecode continuations are per Lua thread. Parked coroutines
     /// must not consume another thread's protected-call/error-handler budget.
     bytecode_protected_depth: usize = 0,
-    bytecode_error_handler_depth: usize = 0,
     /// Nested unwind states are possible when a yielding __close handler
     /// raises while an older error is already closing another frame.
     bytecode_unwinds: std.ArrayListUnmanaged(BytecodeUnwindState) = .empty,
@@ -4880,7 +4889,13 @@ pub const Vm = struct {
     }
 
     fn activeErrorHandlerDepth(self: *Vm) usize {
-        return self.in_error_handler + self.activeBytecodeThread().bytecode_error_handler_depth;
+        // PUC: the message handler runs inside the error-handling window
+        // (luaG_errormsg → luaD_callnoyield). invokeErrfunc holds
+        // in_error_handler for exactly that window — it grants the
+        // ERRORSTACKSIZE headroom in pushBytecodeExecFrame (PUC
+        // luaD_growstack's emergency stack) and marks handler execution
+        // for the C-stack-overflow accounting.
+        return self.in_error_handler;
     }
 
     fn hasActiveBytecodeNonYieldableBoundary(self: *Vm) bool {
@@ -6270,24 +6285,6 @@ pub const Vm = struct {
         return .{ .String = self.internStrAssume(self.protectedErrorString()) };
     }
 
-    /// Value passed to an xpcall message handler.
-    ///
-    /// PUC Lua calls the handler before normalizing a nil error object to
-    /// `"<no error object>"`.  Protected-call results use the normalized form,
-    /// but the handler must still receive the original nil object.
-    fn errorHandlerInput(self: *Vm) Value {
-        if (!self.err_has_obj) return .Nil;
-        return self.protectedErrorValue();
-    }
-
-    /// Normalize a message-handler result the same way luaG_errormsg does.
-    fn normalizeProtectedErrorResult(self: *Vm, value: Value) DispatchError!Value {
-        if (value == .Nil) {
-            return .{ .String = try self.internStr("<no error object>") };
-        }
-        return value;
-    }
-
     fn clearErrorTraceback(self: *Vm) void {
         if (self.err_traceback) |tb| self.alloc.free(tb);
         self.err_traceback = null;
@@ -6700,67 +6697,145 @@ pub const Vm = struct {
     }
 
     /// PUC `luaG_errormsg` (ldebug.c:840-854): call the message handler
-    /// (`errfunc`) BEFORE the call stack is unwound. The handler runs with
-    /// `Thread.call_frames` still intact, so `debug.getinfo(N)` works inside
-    /// `__tostring` metamethods. The handler's return value replaces the
-    /// PUC `luaG_errormsg` (ldebug.c:840-854): call the message handler
-    /// (`errfunc`) BEFORE the call stack is unwound. The handler runs with
-    /// `Thread.call_frames` still intact, so `debug.getinfo(N)` works inside
-    /// `__tostring` metamethods. The handler's return value replaces the
-    /// error object. If the handler itself errors, the error becomes
-    /// `"error in error handling"` (PUC `LUA_ERRERR`).
+    /// (`errfunc`) at the throw site, BEFORE the call stack is unwound. The
+    /// handler runs with `Thread.call_frames` still intact, so `debug.getinfo`
+    /// and traceback see the frames of the failed call. The handler's return
+    /// value replaces the error object AS-IS (no stringification); a nil
+    /// result becomes the literal string `"<no error object>"`.
+    ///
+    /// If the handler itself errors, PUC re-enters `luaG_errormsg` with the
+    /// new error object — i.e. the handler is called AGAIN. We mirror that
+    /// with a retry loop: after 256 failed attempts the handler gets one
+    /// last chance with `"C stack overflow"` (PUC's emergency stack), and if
+    /// that also errors the protected call terminates with `LUA_ERRERR`
+    /// (`"error in error handling"`).
     pub fn invokeErrfunc(self: *Vm) !void {
         const th = self.activeBytecodeThread();
-        if (th.errfunc != ERRFUNC_NONE) {
-            const ef = self.bc_stack[th.errfunc];
-            if (th.errfunc_running) return;
-            th.errfunc_running = true;
-            defer th.errfunc_running = false;
-            // Push a synthetic C-frame for the msghandler call. In PUC,
-            // `luaG_errormsg` calls the handler via `luaD_callnoyield`, which
-            // pushes a `CallInfo` (CIST_C) so `debug.getinfo` counts it as a
-            // stack level. Without this frame, `debug.getinfo` level numbers
-            // wouldn't match PUC.
+        if (th.errfunc == ERRFUNC_NONE) return;
+        const ef = self.bc_stack[th.errfunc];
+        // Re-entrancy guard (see Thread.errfunc_running_idx): a raise while
+        // the SAME handler window is running is handled by the retry loop
+        // below — do not invoke it again at the raise site. A DIFFERENT
+        // handler (armed by an xpcall nested inside the running handler)
+        // runs normally, exactly like PUC's recursive luaG_errormsg.
+        if (th.errfunc_running_idx == th.errfunc) return;
+        const prev_running_idx = th.errfunc_running_idx;
+        th.errfunc_running_idx = th.errfunc;
+        defer th.errfunc_running_idx = prev_running_idx;
+
+        // PUC luaG_errormsg: the raising C function's CallInfo (CIST_C) is
+        // VISIBLE to the handler (it sits between the raiser's caller and
+        // the handler). luazig hides builtin C-frames (P15.79 convention),
+        // so un-hide the raiser's C-frame — the top frame, if it is one —
+        // for the duration of the handler window, and re-hide it after.
+        // This is structural (any hidden C-frame at the throw site), not a
+        // name-based special case.
+        const frames = &th.call_frames;
+        var unhidden_top = false;
+        if (frames.len() > 0) {
+            const top = frames.getPtr(frames.len() - 1);
+            if (top.isC() and top.isHidden()) {
+                top.clearHidden();
+                unhidden_top = true;
+            }
+        }
+        defer if (unhidden_top) {
+            frames.getPtr(frames.len() - 1).setHidden();
+        };
+
+        // PUC luaD_growstack reserves ERRORSTACKSIZE headroom so the handler
+        // can run on an overflowed stack; pushBytecodeExecFrame's
+        // handling_overflow check grants it while activeErrorHandlerDepth()
+        // is nonzero. This also models PUC luaD_callnoyield: the handler is
+        // not yieldable and runs inside the error-handling window.
+        self.in_error_handler += 1;
+        defer self.in_error_handler -= 1;
+
+        // The handler receives the RAW error object (PUC passes the object
+        // before any nil normalization; `error(nil)` hands nil to the
+        // handler, only the protected RESULT becomes "<no error object>").
+        var emsg: Value = if (self.err_has_obj) self.err_obj else .Nil;
+        var handler_roots = self.gcTempRoots();
+        defer handler_roots.end();
+        try handler_roots.add(emsg);
+
+        var depth: usize = 0;
+        var on_error_stack = false;
+        while (true) {
+            if (depth >= 256 and !on_error_stack) {
+                // PUC reserves a small emergency stack for error handling.
+                // Give the handler one final chance with the C-stack-overflow
+                // object; if that call also errors, terminate with LUA_ERRERR.
+                emsg = .{ .String = try self.internStr("C stack overflow") };
+                try handler_roots.add(emsg);
+                on_error_stack = true;
+            }
+            depth += 1;
+
+            // Push a synthetic C-frame for the handler call. In PUC,
+            // luaG_errormsg calls the handler via luaD_callnoyield, which
+            // pushes a CallInfo (CIST_C) so debug.getinfo counts it as a
+            // stack level. Without this frame, level numbers inside the
+            // handler wouldn't match PUC.
             try self.pushBuiltinCFrame(ef);
             defer {
                 self.popBuiltinCFrame();
                 if (std.debug.runtime_safety) self.cFrameCountAssert(self.activeBytecodeThread());
             }
-            // Save the error object before calling the handler.
-            const err_obj = if (self.err_has_obj) self.err_obj else .Nil;
-            var call_args = [_]Value{err_obj};
+            var call_args = [_]Value{emsg};
             const result = self.apiCall(.nonyieldable, ef, call_args[0..]) catch {
-                // Handler errored — set error to "error in error handling"
-                // (PUC LUA_ERRERR). Don't re-invoke the handler.
-                // Signal LUA_ERRERR (5) to status-determination sites.
-                self.err_is_errerr = true;
-                self.err = "error in error handling";
-                self.err_obj = .{ .String = self.internStrAssume("error in error handling") };
-                self.err_has_obj = true;
-                self.err_source = null;
-                self.err_line = -1;
-                self.clearErrorTraceback();
-                return;
-            };
-            // Handler succeeded — replace the error object with the result.
-            if (result.len > 0) {
-                self.err_obj = result[0];
-                if (result[0] == .String) {
-                    self.err = result[0].String.bytes();
-                } else {
-                    // Non-string result: convert to string via tostring.
-                    const str = self.valueToStringAlloc(result[0]) catch {
-                        self.err = "(error object is a table value)";
-                        self.err_obj = .{ .String = self.internStrAssume("(error object is a table value)") };
-                        self.err_has_obj = true;
-                        return;
-                    };
-                    self.err = str;
-                    self.err_obj = .{ .String = self.internStrAssume(str) };
+                if (on_error_stack) {
+                    // Handler errored on the emergency object — signal
+                    // LUA_ERRERR (PUC luaD_errerr). Don't re-invoke.
+                    return self.raiseErrerr();
                 }
+                // PUC luaG_errormsg recursion: the handler's own error object
+                // goes through luaG_errormsg again — retry the handler with
+                // the new (raw) error object.
+                emsg = if (self.err_has_obj) self.err_obj else .Nil;
+                try handler_roots.add(emsg);
+                continue;
+            };
+            // Handler succeeded — its first result replaces the error object
+            // as-is (PUC luaG_errormsg: no tostring coercion). nil → the
+            // literal "<no error object>" (PUC luaD_seterrorobj semantics).
+            var value = if (result.len > 0) result[0] else .Nil;
+            if (value == .Nil) {
+                value = .{ .String = try self.internStr("<no error object>") };
             }
+            self.err_obj = value;
+            self.err = if (value == .String) value.String.bytes() else null;
             self.err_has_obj = true;
+            // PUC bakes the position prefix into the error message only at
+            // the ORIGINAL raise (luaG_addinfo in luaG_runerror/luaB_error).
+            // The handler's result is the final object — the pending
+            // position (err_source/err_line) must NOT be re-applied to it
+            // when the error crosses a protected/coroutine boundary.
+            self.err_source = null;
+            self.err_line = -1;
+            return;
         }
+    }
+
+    /// PUC luaD_errerr (ldo.c:215): throw "error in error handling" as
+    /// LUA_ERRERR. Raised when an error occurs while the machine is already
+    /// handling an error: the message-handler recursion exhausted the
+    /// emergency depth (invokeErrfunc), or a stack grow request arrived
+    /// while the stack is already at ERRORSTACKSIZE (pushBytecodeExecFrame's
+    /// handling_overflow branch — the handler itself exhausted the emergency
+    /// headroom, PUC luaD_growstack → luaD_errerr). The errerr is
+    /// transported as an OBJECT (err_is_errerr=true): an enclosing
+    /// pcall/xpcall boundary returns "error in error handling" without
+    /// re-running message handlers on it.
+    fn raiseErrerr(self: *Vm) Error {
+        self.err_is_errerr = true;
+        self.err = "error in error handling";
+        self.err_obj = .{ .String = self.internStrAssume("error in error handling") };
+        self.err_has_obj = true;
+        self.err_source = null;
+        self.err_line = -1;
+        self.clearErrorTraceback();
+        return error.RuntimeError;
     }
 
     fn setOutOfMemoryError(self: *Vm) void {
@@ -7053,7 +7128,7 @@ pub const Vm = struct {
         vm: *Vm,
         snapshot: usize,
 
-        pub fn add(self: *TempRoots, v: Value) DispatchError!void {
+        pub fn add(self: *TempRoots, v: Value) std.mem.Allocator.Error!void {
             try self.vm.gc_temp_roots.append(self.vm.alloc, v);
         }
 
@@ -7746,10 +7821,6 @@ pub const Vm = struct {
         _ = self;
         std.debug.assert(protection.thread.bytecode_protected_depth != 0);
         protection.thread.bytecode_protected_depth -= 1;
-        if (protection.phase == .handler) {
-            std.debug.assert(protection.thread.bytecode_error_handler_depth != 0);
-            protection.thread.bytecode_error_handler_depth -= 1;
-        }
     }
 
     fn releaseBytecodeProtectedLayer(self: *Vm, layer: BytecodeProtectedLayer) void {
@@ -7759,6 +7830,17 @@ pub const Vm = struct {
     }
 
     fn finishBytecodeProtectedCall(self: *Vm, protection: *BytecodeProtectedCall) void {
+        // PUC lua_pcallk completion: pop the armed errfunc handler slot from
+        // bc_stack (only if the errfunc is still ours — every nested arming
+        // restores on its own completion). restoreBytecodeSavedError below
+        // then restores the OUTER errfunc saved at protection entry.
+        if (protection.armed_errfunc != ERRFUNC_NONE) {
+            const th_ef = protection.thread;
+            if (th_ef.errfunc == protection.armed_errfunc) {
+                th_ef.errfunc = ERRFUNC_NONE;
+                if (self.bc_stack_top > protection.armed_errfunc) self.bc_stack_top = protection.armed_errfunc;
+            }
+        }
         // P16.23 T6: restore the C-call depth to the protection's entry
         // snapshot. On SUCCESS this is a no-op (paired ccall exits already
         // returned to the entry depth); on a CAUGHT error the iterative
@@ -7787,6 +7869,15 @@ pub const Vm = struct {
     /// unwound or collected.  Unlike normal completion, the current error is
     /// authoritative and must not be overwritten with the parked caller error.
     fn discardBytecodeProtectedCall(self: *Vm, protection: *BytecodeProtectedCall) void {
+        // The armed handler slot dies with this unwind; clear a matching
+        // errfunc so no later error on this thread invokes a stale handler
+        // (PUC: unwinding past a pcallk frame restores the old errfunc).
+        if (protection.armed_errfunc != ERRFUNC_NONE) {
+            const th_ef = protection.thread;
+            if (th_ef.errfunc == protection.armed_errfunc) {
+                th_ef.errfunc = ERRFUNC_NONE;
+            }
+        }
         self.discardBytecodeSavedError(protection.saved_error);
         self.releaseBytecodeProtectedDepth(protection);
         for (protection.outer_layers) |layer| {
@@ -11573,7 +11664,6 @@ pub const Vm = struct {
 
         const LayerSpec = struct {
             kind: BytecodeProtectedKind,
-            handler: Value,
         };
         var outer_specs = std.ArrayListUnmanaged(LayerSpec).empty;
         defer outer_specs.deinit(self.alloc);
@@ -11597,7 +11687,6 @@ pub const Vm = struct {
             }
             try outer_specs.append(self.alloc, .{
                 .kind = if (active_id == .pcall) .pcall else .xpcall,
-                .handler = if (active_id == .xpcall) active_args[1] else .Nil,
             });
             active_args = if (active_id == .pcall) active_args[1..] else active_args[2..];
             active_id = nested_id;
@@ -11665,7 +11754,6 @@ pub const Vm = struct {
             outer_layers[i] = .{
                 .thread = owner,
                 .kind = spec.kind,
-                .handler = spec.handler,
                 .saved_error = self.saveBytecodeProtectedError(),
             };
             owner.bytecode_protected_depth += 1;
@@ -11681,7 +11769,6 @@ pub const Vm = struct {
             var stack_protection: BytecodeProtectedCall = .{
                 .thread = owner,
                 .kind = if (active_id == .pcall) .pcall else .xpcall,
-                .handler = if (active_id == .xpcall) active_args[1] else .Nil,
                 .saved_error = saved_error,
                 .outer_layers = outer_layers,
             };
@@ -11697,7 +11784,6 @@ pub const Vm = struct {
             .thread = owner,
             .saved_ncalls = owner.nCcalls,
             .kind = if (active_id == .pcall) .pcall else .xpcall,
-            .handler = if (active_id == .xpcall) active_args[1] else .Nil,
             .saved_error = saved_error,
             .outer_layers = outer_layers,
         };
@@ -11725,6 +11811,21 @@ pub const Vm = struct {
         // xpcall targets then complete normally and prepend their own `true`.
         active_armed = false;
         initialized_outer = 0;
+        // PUC lua_pcallk (lapi.c): errfunc != 0 arms L->errfunc for the
+        // protected call's duration — for xpcall that is ITS message
+        // handler (saveBytecodeProtectedError above cleared the outer one,
+        // matching PUC pcall's errfunc=0 for the protected child). The
+        // handler slot is staged on bc_stack just below the target frame,
+        // so it stays GC-rooted and parked across yields like PUC's stack
+        // slot. Errors inside the target — including the C-stack-overflow
+        // raise below — run the handler AT THE THROW SITE (invokeErrfunc /
+        // PUC luaG_errormsg), before any unwinding. finishBytecodeProtected
+        // Call pops the slot; restoreBytecodeSavedError restores the outer
+        // errfunc.
+        if (active_id == .xpcall) {
+            protection_ptr.armed_errfunc = self.bc_stack_top;
+            self.setErrfuncValue(active_args[1]);
+        }
         if (protected_depth_before + outer_specs.items.len >= 200)
             return self.fail("C stack overflow", .{});
 
@@ -11850,173 +11951,21 @@ pub const Vm = struct {
         );
     }
 
-    fn startBytecodeXpcallHandler(
-        self: *Vm,
-        exec_frames: *FrameStack,
-        boundary_depth: usize,
-        parent_index: usize,
-        first_error: Value,
-    ) DispatchError!?[]Value {
-        var handler_roots = self.gcTempRoots();
-        defer handler_roots.end();
-        var emsg = first_error;
-        try handler_roots.add(emsg);
-        while (true) {
-            const pending = self.getPendingCallPtr(exec_frames.getPtr(parent_index).pending_call_index).?;
-            const protection = pending.protection.?;
-            const handler = protection.handler;
-
-            const one_arg = [_]Value{emsg};
-            const resolved = self.resolveCallable(handler, one_arg[0..], null) catch {
-                if (protection.on_error_stack) {
-                    return self.finishBytecodeProtectedFailure(
-                        exec_frames,
-                        boundary_depth,
-                        parent_index,
-                        .{ .String = try self.internStr("error in error handling") },
-                    );
-                }
-                protection.handler_depth += 1;
-                emsg = self.errorHandlerInput();
-                try handler_roots.add(emsg);
-                if (protection.handler_depth >= 256) {
-                    protection.on_error_stack = true;
-                    emsg = .{ .String = try self.internStr("C stack overflow") };
-                    try handler_roots.add(emsg);
-                }
-                continue;
-            };
-            defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-
-            switch (resolved.callee) {
-                .Closure => |cl| if (cl.proto) |proto| {
-                    // PUC luaG_errormsg: the error handler runs at the top
-                    // of the overflowed stack (near MAXSTACK), with only
-                    // ERRORSTACKSIZE (200) headroom.  Set bc_stack_top to
-                    // MAXSTACK so the handler's pushBytecodeExecFrame starts
-                    // near the top, and any recursion quickly hits the
-                    // ERRORSTACKSIZE limit — matching PUC behavior where
-                    // xpcall(loop, loop) produces "error in error handling".
-                    const MAXSTACK: usize = 1_000_000;
-                    if (self.bc_stack.len > MAXSTACK and self.bc_stack_top < MAXSTACK) {
-                        self.bc_stack_top = MAXSTACK;
-                    }
-                    // PUC luaG_errormsg → luaD_callnoyield(handler): the
-                    // handler + error message are staged at L->top, then
-                    // activated.
-                    const staged_handler = try self.stageBytecodeCall(self.bc_stack_top, cl, resolved.args);
-                    try self.pushStagedBytecodeExecFrame(exec_frames, proto, staged_handler.func_slot, staged_handler.nargs, -1);
-                    // PUC luaG_errormsg → luaD_callnoyield(handler) →
-                    // luaD_precall → luaG_tracecall: the error handler's
-                    // activation gets its LUA_HOOKCALL here.
-                    try self.dispatchCalleeActivationHook(exec_frames, resolved.callee, resolved.args.len);
-                    return null;
-                } else {
-                    const handler_ret = self.runClosure(cl, resolved.args) catch {
-                        if (protection.on_error_stack) {
-                            return self.finishBytecodeProtectedFailure(
-                                exec_frames,
-                                boundary_depth,
-                                parent_index,
-                                .{ .String = try self.internStr("error in error handling") },
-                            );
-                        }
-                        protection.handler_depth += 1;
-                        emsg = self.errorHandlerInput();
-                        try handler_roots.add(emsg);
-                        if (protection.handler_depth >= 256) {
-                            protection.on_error_stack = true;
-                            emsg = .{ .String = try self.internStr("C stack overflow") };
-                            try handler_roots.add(emsg);
-                        }
-                        continue;
-                    };
-                    defer self.alloc.free(handler_ret);
-                    const value = try self.normalizeProtectedErrorResult(if (handler_ret.len == 0) .Nil else handler_ret[0]);
-                    return self.finishBytecodeProtectedFailure(
-                        exec_frames,
-                        boundary_depth,
-                        parent_index,
-                        value,
-                    );
-                },
-                .Builtin => |builtin_id| {
-                    var out = [_]Value{Value.Nil};
-                    self.callBuiltin(builtin_id, resolved.args, out[0..]) catch {
-                        if (protection.on_error_stack) {
-                            return self.finishBytecodeProtectedFailure(
-                                exec_frames,
-                                boundary_depth,
-                                parent_index,
-                                .{ .String = try self.internStr("error in error handling") },
-                            );
-                        }
-                        protection.handler_depth += 1;
-                        emsg = self.errorHandlerInput();
-                        try handler_roots.add(emsg);
-                        if (protection.handler_depth >= 256) {
-                            protection.on_error_stack = true;
-                            emsg = .{ .String = try self.internStr("C stack overflow") };
-                            try handler_roots.add(emsg);
-                        }
-                        continue;
-                    };
-                    const value = try self.normalizeProtectedErrorResult(out[0]);
-                    return self.finishBytecodeProtectedFailure(
-                        exec_frames,
-                        boundary_depth,
-                        parent_index,
-                        value,
-                    );
-                },
-                else => unreachable,
-            }
-        }
-    }
-
     fn finishBytecodeProtectedRecoveryAt(
         self: *Vm,
         exec_frames: *FrameStack,
         boundary_depth: usize,
         parent_index: usize,
     ) DispatchError!BytecodeDispatchRecovery {
-        const pending = self.getPendingCallPtr(exec_frames.getPtr(parent_index).pending_call_index).?;
-        const protection = pending.protection.?;
-        if (protection.kind == .pcall) {
-            const error_value = if (self.activeErrorHandlerDepth() != 0)
-                Value{ .String = try self.internStr("error in error handling") }
-            else
-                self.protectedErrorValue();
-            const final = try self.finishBytecodeProtectedFailure(
-                exec_frames,
-                boundary_depth,
-                parent_index,
-                error_value,
-            );
-            return if (final) |ret| .{ .completed = ret } else .resumed;
-        }
-
-        if (protection.phase == .target) {
-            protection.phase = .handler;
-            protection.thread.bytecode_error_handler_depth += 1;
-        } else if (protection.on_error_stack) {
-            const final = try self.finishBytecodeProtectedFailure(
-                exec_frames,
-                boundary_depth,
-                parent_index,
-                .{ .String = try self.internStr("error in error handling") },
-            );
-            return if (final) |ret| .{ .completed = ret } else .resumed;
-        } else {
-            protection.handler_depth += 1;
-        }
-
-        var error_value = self.errorHandlerInput();
-        if (protection.handler_depth >= 256 and !protection.on_error_stack) {
-            protection.on_error_stack = true;
-            error_value = .{ .String = try self.internStr("C stack overflow") };
-        }
-        const final = try self.startBytecodeXpcallHandler(
+        // PUC finishpcall (ldo.c): the message handler (xpcall) already ran
+        // AT THE THROW SITE — invokeErrfunc (PUC luaG_errormsg) transformed
+        // the error object BEFORE the unwind reached this protection, with
+        // the failed call's frames still intact. An errerr is likewise
+        // transported as the "error in error handling" OBJECT (set inside
+        // invokeErrfunc), so protectedErrorValue() is the complete,
+        // handler-transformed result for BOTH pcall and xpcall.
+        const error_value = self.protectedErrorValue();
+        const final = try self.finishBytecodeProtectedFailure(
             exec_frames,
             boundary_depth,
             parent_index,
@@ -12569,7 +12518,12 @@ pub const Vm = struct {
         // the overflow check.
         if (handling_overflow) {
             if (needed_top > self.bc_stack.len) {
-                return self.fail("stack overflow", .{});
+                // PUC luaD_growstack (ldo.c:355): a grow request while the
+                // stack is already at ERRORSTACKSIZE means the thread is
+                // handling a stack error and the handler itself exhausted
+                // the emergency headroom → luaD_errerr ("error in error
+                // handling", LUA_ERRERR) — NOT a fresh "stack overflow".
+                return self.raiseErrerr();
             }
         } else if (needed_top > lua_stack_overflow_limit) {
             // P16.10a T12: the realloc-to-PHYSICAL_LIMIT + fail body is
@@ -12760,6 +12714,30 @@ pub const Vm = struct {
         if (frame.isDebugHook()) {
             self.activeHookState().in_debug_hook = false;
         }
+        // P16.29 T5: C-frames reach this generic pop through the error-unwind
+        // paths (unwindBytecodeExecFrames' errdefer fallback and
+        // continueBytecodeErrorUnwind) when a coroutine suspends or errors
+        // inside C-frames — e.g. yielding inside xpcall's builtin target,
+        // then coroutine.close re-driving the parked pending call. Those
+        // paths discard the C-frames (the pending-call re-drive re-pushes
+        // fresh ones on resume, mirroring PUC's CallInfo chain rebuild), so
+        // the generic pop must give C-frames the same teardown
+        // popBuiltinCFrame does: free owned heap state, drop this frame's
+        // c_toclose_slots range (its c_stack indices are about to go stale),
+        // and maintain the c_frame_count invariant — the O(1) C-frame
+        // presence checks (canParkDirectBytecodeYield, bytecodeYieldable)
+        // read that counter, and a stale count changes yieldability
+        // decisions on the suspended thread.
+        if (frame.isC()) {
+            const th = self.activeBytecodeThread();
+            self.freeCFrameOwnedState(frame);
+            const tbc_base = frame.u.c.toclose_base;
+            if (self.c_toclose_slots.items.len > tbc_base) {
+                self.c_toclose_slots.shrinkRetainingCapacity(tbc_base);
+            }
+            if (std.debug.runtime_safety) std.debug.assert(th.c_frame_count > 0);
+            th.c_frame_count -= 1;
+        }
         // Phase D: Varargs are on bc_stack, no heap free needed.
         self.bc_tbc_regs.items.len = frame.tbc_mark;
         frame.callstatus = 0;
@@ -12909,29 +12887,20 @@ pub const Vm = struct {
         // OP_RETURN dispatches the callee's return hook while its frame is
         // still active. Ordinary Lua calls therefore need no second event.
         // A protected-call continuation is different: the Lua child returned,
-        // but the builtin pcall/xpcall activation is completing now.
-        if (pending.protection) |protection| {
-            const protected_ret = switch (protection.phase) {
-                .target => blk: {
-                    const wrapped = try self.alloc.alloc(Value, completed_ret.len + 1);
-                    wrapped[0] = .{ .Bool = true };
-                    @memcpy(wrapped[1..], completed_ret);
-                    if (!self.returnSliceIsOwned(completed_ret)) self.alloc.free(completed_ret);
-                    break :blk wrapped;
-                },
-                .handler => blk: {
-                    const wrapped = try self.alloc.alloc(Value, 2);
-                    wrapped[0] = .{ .Bool = false };
-                    wrapped[1] = try self.normalizeProtectedErrorResult(if (completed_ret.len == 0) .Nil else completed_ret[0]);
-                    if (!self.returnSliceIsOwned(completed_ret)) self.alloc.free(completed_ret);
-                    break :blk wrapped;
-                },
-            };
+        // but the builtin pcall/xpcall activation is completing now. The
+        // completing child is always the protected TARGET — the message
+        // handler (xpcall) runs inside invokeErrfunc at the throw site, not
+        // as a staged child of this protection.
+        if (pending.protection != null) {
+            const wrapped = try self.alloc.alloc(Value, completed_ret.len + 1);
+            wrapped[0] = .{ .Bool = true };
+            @memcpy(wrapped[1..], completed_ret);
+            if (!self.returnSliceIsOwned(completed_ret)) self.alloc.free(completed_ret);
             return try self.completeBytecodeProtectedResult(
                 exec_frames,
                 boundary_depth,
                 parent_index,
-                protected_ret,
+                wrapped,
             );
         }
         switch (pending.completion) {
@@ -16754,6 +16723,16 @@ pub const Vm = struct {
                 else => {
                     if (chain_depth >= 16) return self.fail("'__call' chain too long", .{});
                     const current_callee = ctx.regs[a];
+                    // As in bytecodeIndexValue: the "attempt to call"
+                    // annotation is an internal message re-composition —
+                    // keep the intermediate raise handler-silent so the
+                    // message handler sees only the final annotated message
+                    // (PUC luaG_typeerror composes varinfo at the single
+                    // raise site).
+                    const th_call = self.activeBytecodeThread();
+                    const saved_errfunc = th_call.errfunc;
+                    th_call.errfunc = ERRFUNC_NONE;
+                    defer th_call.errfunc = saved_errfunc;
                     self.tryCallMetamethodInPlace(
                         ctx.base,
                         a,
@@ -16762,6 +16741,7 @@ pub const Vm = struct {
                         &ctx.regs,
                         &chain_depth,
                     ) catch |err| {
+                        th_call.errfunc = saved_errfunc;
                         if (err == error.RuntimeError and self.err != null and
                             std.mem.startsWith(u8, self.err.?, "attempt to call a "))
                         {
@@ -16773,6 +16753,10 @@ pub const Vm = struct {
                                 );
                             }
                         }
+                        // No annotation applies — run the handler on the
+                        // original error now (the intermediate raise was
+                        // handler-silent).
+                        try self.invokeErrfunc();
                         return err;
                     };
                 },
@@ -17303,6 +17287,16 @@ pub const Vm = struct {
                 else => {
                     if (chain_depth >= 16) return self.fail("'__call' chain too long", .{});
                     const current_callee = ctx.regs[a];
+                    // As in bytecodeIndexValue: the "attempt to call"
+                    // annotation is an internal message re-composition —
+                    // keep the intermediate raise handler-silent so the
+                    // message handler sees only the final annotated message
+                    // (PUC luaG_typeerror composes varinfo at the single
+                    // raise site).
+                    const th_call = self.activeBytecodeThread();
+                    const saved_errfunc = th_call.errfunc;
+                    th_call.errfunc = ERRFUNC_NONE;
+                    defer th_call.errfunc = saved_errfunc;
                     self.tryCallMetamethodInPlace(
                         ctx.base,
                         a,
@@ -17311,6 +17305,7 @@ pub const Vm = struct {
                         &ctx.regs,
                         &chain_depth,
                     ) catch |err| {
+                        th_call.errfunc = saved_errfunc;
                         if (err == error.RuntimeError and self.err != null and
                             std.mem.startsWith(u8, self.err.?, "attempt to call a "))
                         {
@@ -17322,6 +17317,10 @@ pub const Vm = struct {
                                 );
                             }
                         }
+                        // No annotation applies — run the handler on the
+                        // original error now (the intermediate raise was
+                        // handler-silent).
+                        try self.invokeErrfunc();
                         return err;
                     };
                 },
@@ -18285,6 +18284,10 @@ pub const Vm = struct {
                     self.err_source = null;
                     self.err_line = -1;
                     self.clearErrorTraceback();
+                    // PUC luaB_error(nil) → luaG_errormsg: the message
+                    // handler runs at the throw site with the RAW nil object
+                    // (before any "<no error object>" normalization).
+                    try self.invokeErrfunc();
                     return error.RuntimeError;
                 }
                 const msg = switch (args[0]) {
@@ -19241,6 +19244,10 @@ pub const Vm = struct {
             self.err_source = null;
             self.err_line = -1;
             self.captureErrorTraceback();
+            // PUC luaB_assert → luaB_error → luaG_errormsg: the message
+            // handler (if armed) runs at the throw site, with assert's C
+            // frame still on the stack (un-hidden by invokeErrfunc).
+            try self.invokeErrfunc();
             return error.RuntimeError;
         }
         const n = @min(outs.len, args.len);
@@ -19686,11 +19693,13 @@ pub const Vm = struct {
             fn f(vm: *Vm, o: []Value) void {
                 o[0] = .{ .Bool = false };
                 if (o.len > 1) {
-                    const errv = if (vm.activeErrorHandlerDepth() != 0)
-                        Value{ .String = vm.internStrAssume("error in error handling") }
-                    else
-                        vm.protectedErrorValue();
-                    o[1] = errv;
+                    // PUC finishpcall: the error object is complete here —
+                    // an errerr is transported as the "error in error
+                    // handling" OBJECT (set at the throw site by
+                    // invokeErrfunc / PUC luaD_errerr), so a pcall running
+                    // INSIDE a message handler still returns the real error
+                    // it caught.
+                    o[1] = vm.protectedErrorValue();
                 }
                 vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
             }
@@ -19842,10 +19851,29 @@ pub const Vm = struct {
             .Closure, .Builtin => {},
             else => return self.failC("bad argument #2 to 'xpcall' (function expected, got {s})", .{self.valueTypeName(args[1])}),
         }
+        // PUC luaB_xpcall → lua_pcallk(L, 1, LUA_MULTRET, 2, finishpcall)
+        // (lapi.c lua_pcallk): arm the message handler as L->errfunc for
+        // the protected call's duration. Errors raised inside the target
+        // (including the C-stack-overflow raise below) run the handler AT
+        // THE THROW SITE (invokeErrfunc / PUC luaG_errormsg) with the call
+        // frames intact — before any unwinding. The handler slot lives on
+        // bc_stack just above xpcall's args and is popped when the
+        // protected call completes (lua_pcallk restores the old errfunc).
+        const th_xpcall_ef = self.activeBytecodeThread();
+        const saved_errfunc = th_xpcall_ef.errfunc;
+        const armed_errfunc = self.bc_stack_top;
+        self.setErrfuncValue(args[1]);
+        defer {
+            if (th_xpcall_ef.errfunc == armed_errfunc) {
+                if (self.bc_stack_top > armed_errfunc) self.bc_stack_top = armed_errfunc;
+                th_xpcall_ef.errfunc = ERRFUNC_NONE;
+            }
+            th_xpcall_ef.errfunc = saved_errfunc;
+        }
         if (self.activeProtectedCallDepth() >= 128) {
-            // PUC luaD_pcall: when C-stack depth is exceeded, luaG_runerror
-            // is called, which invokes the message handler (L->errfunc).
-            // We must call setFail to invoke the handler, not just return.
+            // PUC lua_pcallk → docallK → ccall: the C-stack depth check
+            // fails inside the protected extent, so the armed message
+            // handler sees this error too (luaG_runerror → luaG_errormsg).
             self.err = "stack overflow error";
             self.err_obj = .{ .String = try self.internStr("stack overflow error") };
             self.err_has_obj = true;
@@ -19880,55 +19908,17 @@ pub const Vm = struct {
                 // P15.51g: No per-frame slice refresh needed — regs/boxed
                 // are derived on demand from base + frame_cap.
             }
-            const setFail = struct {
-                fn run(vm: *Vm, handler: Value, o: []Value) DispatchError!void {
-                    o[0] = .{ .Bool = false };
-                    if (o.len <= 1) {
-                        vm.last_builtin_out_count = @min(@as(usize, 1), o.len);
-                        return;
-                    }
-                    // The error handler runs with the stack at ERRORSTACKSIZE,
-                    // grown above.  The handling_overflow check in
-                    // pushBytecodeExecFrame skips the overflow check when
-                    // bc_stack.len > MAXSTACK and in_error_handler > 0.
-                    const emsg: Value = vm.errorHandlerInput();
-                    vm.in_error_handler += 1;
-                    defer vm.in_error_handler -= 1;
-                    switch (handler) {
-                        .Builtin => |id| {
-                            var in = [_]Value{emsg};
-                            var out: [1]Value = .{.Nil};
-                            vm.callBuiltin(id, in[0..], out[0..]) catch {
-                                o[1] = .{ .String = try vm.internStr("error in error handling") };
-                                vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
-                                return;
-                            };
-                            o[1] = try vm.normalizeProtectedErrorResult(out[0]);
-                            vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
-                            return;
-                        },
-                        .Closure => |cl| {
-                            var in = [_]Value{emsg};
-                            const ret = vm.runClosure(cl, in[0..]) catch {
-                                o[1] = .{ .String = try vm.internStr("error in error handling") };
-                                vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
-                                return;
-                            };
-                            defer vm.alloc.free(ret);
-                            const result = if (ret.len > 0) ret[0] else .Nil;
-                            o[1] = try vm.normalizeProtectedErrorResult(result);
-                            vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
-                            return;
-                        },
-                        else => {
-                            o[1] = try vm.normalizeProtectedErrorResult(emsg);
-                            vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
-                            return;
-                        },
-                    }
-                }
-            }.run;
-            try setFail(self, args[1], outs);
+            // PUC lua_pcallk → docallK → luaD_call → ccall →
+            // luaE_incCstack fails → luaG_runerror("C stack overflow") →
+            // luaG_errormsg: the ARMED message handler runs at the throw
+            // site with the raw error object (retry loop inside
+            // invokeErrfunc mirrors luaG_errormsg recursion).
+            try self.invokeErrfunc();
+            if (outs.len > 0) {
+                outs[0] = .{ .Bool = false };
+                if (outs.len > 1) outs[1] = self.protectedErrorValue();
+                self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
+            }
             return;
         }
         self.protected_call_depth += 1;
@@ -19937,18 +19927,7 @@ pub const Vm = struct {
         defer self.leaveProtectedCFrame();
         defer self.shrinkBcStack();
 
-        // PUC luaD_pcall: clear errfunc — xpcall has its own handler
-        // mechanism (setFail) that runs after error propagation. We don't
-        // use the errfunc mechanism here to avoid double handler invocation.
-        // TODO: migrate xpcall to errfunc mechanism (runs handler BEFORE
-        // unwinding) — this is the same architectural gap as formatCliError.
-        const th_xpcall_ef = self.activeBytecodeThread();
-        const saved_errfunc = th_xpcall_ef.errfunc;
-        th_xpcall_ef.errfunc = ERRFUNC_NONE;
-        defer th_xpcall_ef.errfunc = saved_errfunc;
-
         const f = args[0];
-        const msgh = args[1];
         const call_args = args[2..];
 
         const prev_err = self.err;
@@ -19997,83 +19976,21 @@ pub const Vm = struct {
             return;
         }
 
-        const setFail = struct {
-            fn run(vm: *Vm, handler: Value, o: []Value) DispatchError!void {
+        // PUC lua_pcallk error completion (finishpcall): the message
+        // handler already ran at the throw site (invokeErrfunc /
+        // luaG_errormsg) and its result replaced the error object, so
+        // protectedErrorValue() IS the handler-transformed object (or the
+        // "error in error handling" object when the handler kept failing).
+        const writeFailure = struct {
+            fn run(vm: *Vm, o: []Value) void {
                 o[0] = .{ .Bool = false };
-                if (o.len <= 1) {
-                    vm.last_builtin_out_count = @min(@as(usize, 1), o.len);
-                    return;
-                }
-                // PUC Lua: the error handler runs with the stack at
-                // ERRORSTACKSIZE (MAXSTACK + 200), grown by the overflow
-                // path in pushBytecodeExecFrame.  luaD_shrinkstack is called
-                // AFTER the handler, by luaD_pcall — not here.  The
-                // handling_overflow check in pushBytecodeExecFrame skips the
-                // overflow check when bc_stack.len > MAXSTACK and
-                // in_error_handler > 0, giving the handler room to run.
-                var emsg: Value = vm.errorHandlerInput();
-                var depth: usize = 0;
-                var on_error_stack = false;
-                vm.in_error_handler += 1;
-                defer vm.in_error_handler -= 1;
-
-                while (true) {
-                    if (depth >= 256 and !on_error_stack) {
-                        // PUC Lua reserves a small emergency stack for error
-                        // handling.  Give the handler one final chance with the
-                        // C-stack-overflow object.  If that call also errors,
-                        // the protected call terminates with LUA_ERRERR.
-                        emsg = .{ .String = try vm.internStr("C stack overflow") };
-                        on_error_stack = true;
-                    }
-                    depth += 1;
-
-                    switch (handler) {
-                        .Builtin => |id| {
-                            var in = [_]Value{emsg};
-                            var out: [1]Value = .{.Nil};
-                            vm.callBuiltin(id, in[0..], out[0..]) catch {
-                                if (on_error_stack) {
-                                    o[1] = .{ .String = try vm.internStr("error in error handling") };
-                                    vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
-                                    return;
-                                }
-                                emsg = vm.errorHandlerInput();
-                                continue;
-                            };
-                            o[1] = try vm.normalizeProtectedErrorResult(out[0]);
-                            vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
-                            return;
-                        },
-                        .Closure => |cl| {
-                            var in = [_]Value{emsg};
-                            const ret = vm.runClosure(cl, in[0..]) catch {
-                                if (on_error_stack) {
-                                    o[1] = .{ .String = try vm.internStr("error in error handling") };
-                                    vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
-                                    return;
-                                }
-                                emsg = vm.errorHandlerInput();
-                                continue;
-                            };
-                            defer vm.alloc.free(ret);
-                            const result = if (ret.len > 0) ret[0] else .Nil;
-                            o[1] = try vm.normalizeProtectedErrorResult(result);
-                            vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
-                            return;
-                        },
-                        else => {
-                            o[1] = try vm.normalizeProtectedErrorResult(emsg);
-                            vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
-                            return;
-                        },
-                    }
-                }
+                if (o.len > 1) o[1] = vm.protectedErrorValue();
+                vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
             }
         }.run;
 
         const resolved = self.resolveCallable(f, call_args, null) catch {
-            try setFail(self, msgh, outs);
+            writeFailure(self, outs);
             return;
         };
         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
@@ -20095,7 +20012,7 @@ pub const Vm = struct {
                 self.callBuiltin(id, resolved.args, tmp) catch |e| switch (e) {
                     error.Yield => return e,
                     else => {
-                        try setFail(self, msgh, self.refreshBuiltinOuts() orelse outs);
+                        writeFailure(self, self.refreshBuiltinOuts() orelse outs);
                         return;
                     },
                 };
@@ -20117,10 +20034,9 @@ pub const Vm = struct {
             },
             .Closure => |cl| {
                 // PUC luaD_pcall: save old_top (L->top) and old_ci (L->ci)
-                // before calling f. On error, restore them so the message
-                // handler has room to run. Without unwinding call_frames,
-                // 999k+ frames from f()'s recursion stay on bc_stack and
-                // pushBytecodeExecFrame for the handler immediately overflows.
+                // before calling f. On error, restore them so the error
+                // value has room (the handler already ran at the throw
+                // site, before this unwind).
                 const saved_bc_stack_top = self.bc_stack_top;
                 const th_xpcall = self.activeBytecodeThread();
                 const saved_frame_count = th_xpcall.call_frames.len();
@@ -20128,11 +20044,10 @@ pub const Vm = struct {
                     error.Yield => return e,
                     else => {
                         // PUC luaD_pcall: L->ci = old_ci; restore stack
-                        // pointer and unwind call frames so the message
-                        // handler has room to run.
+                        // pointer and unwind call frames.
                         self.unwindBytecodeExecFrames(&th_xpcall.call_frames, saved_frame_count);
                         self.bc_stack_top = saved_bc_stack_top;
-                        try setFail(self, msgh, self.refreshBuiltinOuts() orelse outs);
+                        writeFailure(self, self.refreshBuiltinOuts() orelse outs);
                         return;
                     },
                 };
@@ -21453,6 +21368,10 @@ pub const Vm = struct {
         if (th == self.main_thread) return self.fail("cannot close the main thread", .{});
         if (th.close_has_err) {
             th.status = .dead;
+            // PUC lua_closethread → resetCI → luaE_resetthread: a dead
+            // thread's errfunc is cleared (a coroutine suspended inside a
+            // fast-path xpcall keeps its armed handler slot until here).
+            th.errfunc = ERRFUNC_NONE;
             // PUC resetCI sets L->status = LUA_OK even when __close errors.
             // lua_closethread returns the error status, but L->status (read
             // by lua_status) is LUA_OK. api_status mirrors L->status.
@@ -21475,6 +21394,7 @@ pub const Vm = struct {
             };
             if (!ok) {
                 th.status = .dead;
+                th.errfunc = ERRFUNC_NONE; // PUC luaE_resetthread
                 th.api_status = 0; // LUA_OK — PUC resetCI sets L->status=LUA_OK
                 if (outs.len > 0) outs[0] = .{ .Bool = false };
                 if (outs.len > 1) outs[1] = resume_out[1];
@@ -21487,6 +21407,7 @@ pub const Vm = struct {
             }
         }
         th.status = .dead;
+        th.errfunc = ERRFUNC_NONE; // PUC luaE_resetthread clears errfunc
         th.api_status = 0; // LUA_OK — close succeeded
         self.clearThreadContinuationScratch(th, .{ .clear_yielded = true });
         if (outs.len > 0) outs[0] = .{ .Bool = true };
@@ -22262,6 +22183,17 @@ pub const Vm = struct {
                         try self.gcQueueScanCell(cell);
                     }
                 }
+            }
+        }
+
+        // PUC traversethread (lgc.c) marks L->stack[0..L->top] wholesale,
+        // which includes the armed errfunc slot (L->errfunc points INTO the
+        // stack). The armed message handler (xpcall fast/slow path, CLI,
+        // C-API pcallk) sits BETWEEN frame register windows, so the
+        // per-frame walk above misses it — mark it explicitly.
+        if (active_th.errfunc != ERRFUNC_NONE) {
+            if (active_th.errfunc < self.bc_stack.len) {
+                try self.gcMarkValue(self.bc_stack[active_th.errfunc]);
             }
         }
 
@@ -24182,6 +24114,17 @@ pub const Vm = struct {
                         }
                     }
                 }
+                // Armed errfunc slot (PUC: L->errfunc points into L->stack,
+                // marked wholesale by traversethread). A coroutine suspended
+                // inside a fast-path xpcall keeps its handler slot parked
+                // BETWEEN frame register windows — the per-frame walks below
+                // miss it, so mark it explicitly via the thread's own stack.
+                if (th.errfunc != ERRFUNC_NONE) {
+                    const pstack = stackForThread(self, th);
+                    if (th.errfunc < pstack.len) {
+                        try self.gcMarkValue(pstack[th.errfunc]);
+                    }
+                }
                 // P15.83f: Mark the coroutine's C-API handle stack. Each
                 // Thread has an api_handle (lua_State) with its own c_stack.
                 // Values pushed via the C API on the coroutine's stack are
@@ -24412,10 +24355,9 @@ pub const Vm = struct {
                             else => {},
                         }
                         if (pending.protection) |protection| {
-                            const handler = protection.handler;
-                            if (GcObject.fromValue(handler) != null) {
-                                try self.gcMarkValue(handler);
-                            }
+                            // The armed message handler is GC-rooted via the
+                            // thread's errfunc bc_stack slot (marked in the
+                            // walks above), not via the protection struct.
                             const saved_error = protection.saved_error.err_obj;
                             if (GcObject.fromValue(saved_error) != null) {
                                 try self.gcMarkValue(saved_error);
@@ -27202,6 +27144,14 @@ pub const Vm = struct {
                 }
                 if (fr.proto() != null and self.bc_stack[fr.func_slot] == .Closure) {
                     // Bytecode source/debug metadata belongs to Proto.
+                    try self.debugFillInfoFromFunction(t, self.bc_stack[fr.func_slot], what);
+                } else if (self.bc_stack[fr.func_slot] == .Builtin) {
+                    // PUC funcinfo (ldebug.c): a C frame's what/source come
+                    // from the function object itself — what="C",
+                    // source="=[C]", linedefined=-1. C-frames are visible
+                    // to getinfo inside a message-handler window
+                    // (invokeErrfunc un-hides the raiser's C-frame, PUC
+                    // luaG_errormsg) and from C-API frames.
                     try self.debugFillInfoFromFunction(t, self.bc_stack[fr.func_slot], what);
                 }
             },
@@ -37364,7 +37314,22 @@ pub const Vm = struct {
         object: Value,
         key: Value,
     ) DispatchError!Value {
+        // PUC luaG_typeerror composes the operand annotation (varinfo) at
+        // the SINGLE raise site — the handler sees only the final annotated
+        // message. Here indexValue raises first and the annotation is added
+        // in the catch below: an internal message re-composition, not a
+        // second PUC error event. Disarm errfunc for the intermediate raise
+        // (the handler would otherwise run on the un-annotated message and
+        // its result would break the annotation check below), and re-arm it
+        // for the real raise: the enriched re-fail, or — when no annotation
+        // applies — invokeErrfunc on the original error, so the handler runs
+        // exactly once, like PUC.
+        const th_ix = self.activeBytecodeThread();
+        const saved_errfunc = th_ix.errfunc;
+        th_ix.errfunc = ERRFUNC_NONE;
+        defer th_ix.errfunc = saved_errfunc;
         return self.indexValue(object, key) catch |err| {
+            th_ix.errfunc = saved_errfunc;
             var expected_buf: [96]u8 = undefined;
             const expected = std.fmt.bufPrint(
                 expected_buf[0..],
@@ -37382,6 +37347,10 @@ pub const Vm = struct {
                     );
                 }
             }
+            // No annotation applies — the original error stands. The
+            // intermediate raise above was handler-silent, so run the
+            // handler on it now (exactly once, like PUC's single raise).
+            try self.invokeErrfunc();
             return err;
         };
     }
@@ -37395,7 +37364,16 @@ pub const Vm = struct {
         key: Value,
         value: Value,
     ) DispatchError!void {
+        // As in bytecodeIndexValue: the annotation is an internal message
+        // re-composition — keep the intermediate raise handler-silent so
+        // the message handler sees only the final annotated message (PUC
+        // luaG_typeerror composes varinfo at the single raise site).
+        const th_ix = self.activeBytecodeThread();
+        const saved_errfunc = th_ix.errfunc;
+        th_ix.errfunc = ERRFUNC_NONE;
+        defer th_ix.errfunc = saved_errfunc;
         self.setIndexValue(object, key, value) catch |err| {
+            th_ix.errfunc = saved_errfunc;
             var expected_buf: [96]u8 = undefined;
             const expected = std.fmt.bufPrint(
                 expected_buf[0..],
@@ -37413,6 +37391,9 @@ pub const Vm = struct {
                     );
                 }
             }
+            // No annotation applies — run the handler on the original
+            // error now (the intermediate raise was handler-silent).
+            try self.invokeErrfunc();
             return err;
         };
     }

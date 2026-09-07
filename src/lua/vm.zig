@@ -11598,6 +11598,12 @@ pub const Vm = struct {
                 else => break,
             };
             if (nested_id != .pcall and nested_id != .xpcall) break;
+            if (active_id == .xpcall) {
+                switch (active_args[1]) {
+                    .Closure, .Builtin => {},
+                    else => return false,
+                }
+            }
             try outer_specs.append(self.alloc, .{
                 .kind = if (active_id == .pcall) .pcall else .xpcall,
                 .handler = if (active_id == .xpcall) active_args[1] else .Nil,
@@ -11608,6 +11614,16 @@ pub const Vm = struct {
 
         const min_args: usize = if (active_id == .pcall) 1 else 2;
         if (active_args.len < min_args) return false;
+        // PUC lbaselib.c:503: the xpcall message handler must pass
+        // luaL_checktype(L, 2, LUA_TFUNCTION) - raw type tag, no __call
+        // resolution. On failure this fast path bails to builtinXpcall,
+        // which raises the arg error with the PUC message.
+        if (active_id == .xpcall) {
+            switch (active_args[1]) {
+                .Closure, .Builtin => {},
+                else => return false,
+            }
+        }
         const target = active_args[0];
         const target_args = if (active_id == .pcall) active_args[1..] else active_args[2..];
         const resolved = self.resolveCallable(target, target_args, null) catch return false;
@@ -19625,7 +19641,19 @@ pub const Vm = struct {
 
     fn builtinXpcall(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         self.last_builtin_out_count = 0;
-        if (args.len < 2) return self.fail("xpcall expects (f, msgh [, args...])", .{});
+        // PUC lbaselib.c:503 luaL_checktype(L, 2, LUA_TFUNCTION): the
+        // message handler MUST be a function (Lua or C closure). A callable
+        // table does NOT pass — the check is on the raw type tag, before
+        // any __call resolution. PUC error format: "bad argument #2 to
+        // 'xpcall' (function expected, got <type>)".
+        // PUC raises via luaL_checktype -> luaL_argerror from a C function:
+        // luaL_where(1) has no Lua level for a C frame, so the message
+        // carries NO "file:line:" prefix. failC is the C-function variant.
+        if (args.len < 2) return self.failC("bad argument #2 to 'xpcall' (function expected, got no value)", .{});
+        switch (args[1]) {
+            .Closure, .Builtin => {},
+            else => return self.failC("bad argument #2 to 'xpcall' (function expected, got {s})", .{self.valueTypeName(args[1])}),
+        }
         if (self.activeProtectedCallDepth() >= 128) {
             // PUC luaD_pcall: when C-stack depth is exceeded, luaG_runerror
             // is called, which invokes the message handler (L->errfunc).

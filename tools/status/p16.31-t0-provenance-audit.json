@@ -1,0 +1,92 @@
+{
+  "created_utc": "2026-09-08T20:21:33+00:00",
+  "task": "P16.31 T0 \u2014 provenance audit of all tools/perf/current-*.json and tools/status/current-*.json",
+  "head": "829a982",
+  "production_source_head": "4b6167b",
+  "verdict_rule": "current = git_head matches production source 4b6167b (or HEAD 829a982, which is 4b6167b + docs/artifacts only, no src/ changes); everything else = stale-retained",
+  "artifacts": [
+    {
+      "file": "tools/perf/current-activation-id-proof.json",
+      "git_head": "c79c9bf",
+      "git_dirty": "n/a (instrumentation-only worktree /tmp/opencode/wt21b, not committed; no git_head field \u2014 provenance from worktree note)",
+      "verdict": "stale-retained"
+    },
+    {
+      "file": "tools/perf/current-api580-ledger.json",
+      "git_head": "8f3bf6e",
+      "git_dirty": "clean",
+      "verdict": "stale-retained"
+    },
+    {
+      "file": "tools/perf/current-callframe-layout.json",
+      "git_head": "829a982",
+      "git_dirty": "clean",
+      "verdict": "current (regenerated this task; measured_source_head=4b6167b, values re-measured Debug+ReleaseFast)"
+    },
+    {
+      "file": "tools/perf/current-counters.json",
+      "git_head": "4b6167b",
+      "git_dirty": "dirty",
+      "verdict": "current (git_head matches production source; recorded dirty at measurement time \u2014 artifact writes during P16.30 final)"
+    },
+    {
+      "file": "tools/perf/current-differential-profile.json",
+      "git_head": "4b6167b8c13bf5ee93da320c0d90ef53a6b4a728",
+      "git_dirty": "0",
+      "verdict": "current"
+    },
+    {
+      "file": "tools/perf/current-fixed-load-footprint.json",
+      "git_head": "4bb378b",
+      "git_dirty": "clean",
+      "verdict": "stale-retained"
+    },
+    {
+      "file": "tools/perf/current-frame-activation-ledger.json",
+      "git_head": "c79c9bf",
+      "git_dirty": "clean",
+      "verdict": "stale-retained"
+    },
+    {
+      "file": "tools/perf/current-profile-index.json",
+      "git_head": "4b6167b",
+      "git_dirty": "dirty",
+      "verdict": "current (git_head matches production source; recorded dirty at measurement time)"
+    },
+    {
+      "file": "tools/perf/current-proto-ownership-audit.json",
+      "git_head": "7e6241c",
+      "git_dirty": "n/a (no git_dirty field; provenance field is 'head')",
+      "verdict": "stale-retained"
+    },
+    {
+      "file": "tools/status/current-matrix.json",
+      "git_head": "4b6167b",
+      "git_dirty": "dirty",
+      "verdict": "current (git_head matches production source; recorded dirty at measurement time)"
+    },
+    {
+      "file": "tools/status/current-smoke.json",
+      "git_head": "4b6167b",
+      "git_dirty": "dirty",
+      "verdict": "current (git_head matches production source; recorded dirty at measurement time)"
+    }
+  ],
+  "summary": {
+    "current": [
+      "tools/perf/current-callframe-layout.json (regenerated P16.31 T0)",
+      "tools/perf/current-counters.json",
+      "tools/perf/current-differential-profile.json",
+      "tools/perf/current-profile-index.json",
+      "tools/status/current-matrix.json",
+      "tools/status/current-smoke.json"
+    ],
+    "stale_retained": [
+      "tools/perf/current-activation-id-proof.json (c79c9bf, instrumentation-only worktree)",
+      "tools/perf/current-api580-ledger.json (8f3bf6e)",
+      "tools/perf/current-fixed-load-footprint.json (4bb378b)",
+      "tools/perf/current-frame-activation-ledger.json (c79c9bf)",
+      "tools/perf/current-proto-ownership-audit.json (7e6241c)"
+    ]
+  }
+}

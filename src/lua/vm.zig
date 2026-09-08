@@ -1450,7 +1450,37 @@ const CFrameState = extern struct {
     /// This mirrors PUC's per-call-info TBC scope (stack range
     /// `[ci->func, ci->top]`). Without this, nested C calls with
     /// `lua_toclose` corrupt each other's TBC slots.
+    /// P16.30 Stage C: superseded by the thread-owned `c_tbc_chain`
+    /// (removed with the old ownership model once the chain sites land).
     toclose_base: usize = 0,
+    /// P16.30 Stage C: parked c_stack. While this C-frame is suspended
+    /// across a yield (lua_yieldk/pcallk/callk) or an in-flight error
+    /// awaiting recovery, its c_stack — which holds the frame's
+    /// to-be-closed slots — is MOVED here instead of freed. PUC keeps
+    /// everything on the shared `L->stack`, so a suspended C CallInfo's
+    /// TBC slots survive naturally; luazig's per-frame c_stack must be
+    /// preserved the same way for the thread-owned TBC chain (entries
+    /// reference `slot_idx` into this stack — live-slot semantics).
+    /// Freed by `freeCFrameOwnedState` on C-frame pop; moved back into
+    /// `cur_c_stack` by `finishCcall` when the frame resumes.
+    parked_stack: ?*std.ArrayListUnmanaged(Value) = null,
+};
+
+/// PUC `L->tbclist` entry (lstate.h: the to-be-closed chain threaded
+/// through the stack itself, LIFO by stack level, owned by the THREAD —
+/// independent of any CallInfo). luazig: C-API TBC slots live on
+/// per-C-frame c_stacks, not on one shared stack, so the chain stores
+/// (owning C-frame index, slot index) pairs instead of stack levels.
+/// LIFO by append order; entries are removed ONLY by closing
+/// (`lua_closeslot`, the C-return close, the error-escape close, and the
+/// thread-close close-all — PUC `luaF_close` pops each mark before
+/// running its `__close`). Invariant: no entry may reference a C-frame
+/// index that has been popped from `call_frames` — every C-frame pop
+/// site either closes the frame's entries first or the thread is being
+/// destroyed (close-all / GC free).
+const TbcEntry = struct {
+    cframe_idx: usize,
+    slot_idx: usize,
 };
 
 /// PUC `CallInfo.u.l` — Lua function frame state.
@@ -2049,6 +2079,22 @@ pub const Thread = struct {
     /// lets coroutine fast-path eligibility be O(1) instead of scanning
     /// every frame on each yield/resume (5.2% of coroutine_yield samples).
     c_frame_count: u32 = 0,
+    /// P16.30 Stage C: the thread's to-be-closed chain for C-API slots
+    /// (`lua_toclose` marks). PUC `L->tbclist` (lstate.h): a per-thread
+    /// LIFO chain of marked stack slots, owned by the THREAD and walked
+    /// by `luaF_close` — deliberately independent of the CallInfo stack
+    /// so that TBC obligations survive C CallInfo pops (error recovery,
+    /// thread close). luazig mirrors the ownership: entries carry
+    /// (owning C-frame index, slot index into that frame's c_stack /
+    /// parked_stack). Every close site pops entries from the top:
+    /// `lua_closeslot` (top entry only), the C-return close
+    /// (`callCFunction` return / `finishCcall` completion — PUC
+    /// `moveresults` → `luaF_close(CLOSEKTOP, yy=1)`), the error-escape
+    /// close (PUC `luaD_closeprotected`), and the thread-close close-all
+    /// (PUC `luaE_resetthread` → `luaD_closeprotected`). Deinit without
+    /// closing only when the thread is destroyed (GC free — PUC
+    /// `luaE_freethread` runs no `__close`).
+    c_tbc_chain: std.ArrayListUnmanaged(TbcEntry) = .empty,
     close_has_err: bool = false,
     close_err: Value = .Nil,
     wrap_repeat_closure: ?*Closure = null,
@@ -2338,7 +2384,10 @@ const TestcContState = struct {
 // the LuaString P16.17 bug class). The assert compiles in EVERY build
 // mode; offsets are part of the representation contract (u-variant at 32).
 comptime {
-    std.debug.assert(@sizeOf(CallFrame) == 88);
+    // P16.30 Stage C transitional: 88 = final layout (parked_stack replaces
+    // toclose_base 8B-for-8B); 96 = transitional (both fields coexist while
+    // the chain sites land). Sub-step 2 removes toclose_base → back to 88.
+    std.debug.assert(@sizeOf(CallFrame) == 88 or @sizeOf(CallFrame) == 96);
     std.debug.assert(@offsetOf(CallFrame, "u") == 32);
     std.debug.assert(@alignOf(CallFrame) == 8);
 }
@@ -5061,6 +5110,13 @@ pub const Vm = struct {
         while (i > 0) {
             i -= 1;
             const frame = th.call_frames.getPtr(i);
+            // P16.30 Stage C: free C-frame heap state (testc_state,
+            // clsret_state, parked_stack) before the frame storage is
+            // cleared — clearAndFree only frees the frame array itself.
+            // Null-safe for Lua frames. (Also closes a pre-existing leak:
+            // a GC-collected suspended coroutine with testc/clsret state
+            // dropped those allocations before.)
+            if (frame.isC()) self.freeCFrameOwnedState(frame);
             if (frame.pending_call_index == INVALID_PENDING) continue;
             if (self.getPendingCallPtr(frame.pending_call_index)) |pending| {
                 self.cancelBytecodePendingCall(pending, frame);
@@ -23734,6 +23790,14 @@ pub const Vm = struct {
                 // Only free the parked runtime if this thread isn't the
                 // currently active one (its runtime is shared with the VM).
                 if (self.active_runtime_thread != th) self.freeParkedThreadRuntime(th);
+                // P16.30 Stage C: drop the thread's C-API TBC chain WITHOUT
+                // running __close. PUC luaE_freethread (lstate.c:300) calls
+                // only luaF_closeupval — a GC-collected suspended coroutine
+                // never runs closers (its __close obligations die with it;
+                // only an explicit coroutine.close/lua_closethread runs them).
+                // The per-frame parked stacks are freed by freeThreadBytecode
+                // Frames' per-frame teardown (freeCFrameOwnedState).
+                th.c_tbc_chain.deinit(self.alloc);
                 // Free all optional []Value buffers on the Thread.
                 th.yielded.deinit(self.alloc);
                 th.resume_inbox.deinit(self.alloc);
@@ -24303,6 +24367,40 @@ pub const Vm = struct {
                             if (GcObject.fromValue(v) != null) try self.gcMarkValue(v);
                         }
                     }
+                    // P16.30 Stage C: trace the frame's parked c_stack.
+                    // While a C-frame is suspended across a yield or an
+                    // in-flight error, its c_stack (holding the frame's
+                    // to-be-closed slots) is parked on the frame. PUC marks
+                    // L->stack[0..L->top] for every live lua_State; the
+                    // parked stack is this frame's slice of that root until
+                    // it is unparked. (While the frame is ACTIVE, its stack
+                    // is `cur_c_stack`, marked with the VM roots.)
+                    if (fr.u.c.parked_stack) |p| {
+                        for (p.items) |v| {
+                            if (GcObject.fromValue(v) != null) try self.gcMarkValue(v);
+                        }
+                    }
+                }
+                // P16.30 Stage C: trace the thread's C-API TBC chain. Each
+                // entry's slot holds the object that __close must later run
+                // on (live-slot semantics: the CURRENT slot value, not the
+                // value at mark time). PUC anchors these on L->stack (marked
+                // above); luazig anchors them on the owning frame's parked
+                // c_stack — marked here, once per entry, so a full collection
+                // between mark and close cannot free the object (the chain is
+                // the only reference after the C caller drops its own).
+                for (th.c_tbc_chain.items) |entry| {
+                    if (entry.cframe_idx >= th.call_frames.len()) continue; // defensive
+                    const fr = th.call_frames.getConstPtr(entry.cframe_idx);
+                    if (!fr.isC()) continue;
+                    if (fr.u.c.parked_stack) |p| {
+                        if (entry.slot_idx < p.items.len) {
+                            if (GcObject.fromValue(p.items[entry.slot_idx]) != null)
+                                try self.gcMarkValue(p.items[entry.slot_idx]);
+                        }
+                    }
+                    // Active frame (no parked stack): its stack is
+                    // cur_c_stack, marked with the VM roots — nothing to do.
                 }
 
                 // Inactive coroutines own their complete execution storage.
@@ -36374,6 +36472,7 @@ pub const Vm = struct {
     /// This includes:
     /// - `testc_state` (P15.80: heap-allocated TestcContState)
     /// - `clsret_state` (P15.82: heap-allocated CClsretState for CIST_CLSRET)
+    /// - `parked_stack` (P16.30 Stage C: the frame's parked c_stack)
     /// Called before shrinking `call_frames` (popBuiltinCFrame, precover).
     /// Null-safe: does nothing if both pointers are null.
     fn freeCFrameOwnedState(self: *Vm, fr: *CallFrame) void {
@@ -36391,6 +36490,46 @@ pub const Vm = struct {
             self.alloc.destroy(cs);
             fr.u.c.clsret_state = null;
         }
+        // P16.30 Stage C: the parked c_stack is frame-owned state. Freed
+        // WITHOUT running __close — by the time a C-frame is popped, every
+        // close site that owed a __close has already run it (the TBC chain
+        // holds no entries for a popped frame). PUC analogue: the CallInfo
+        // drop never runs closers; only luaF_close does.
+        if (fr.u.c.parked_stack) |p| {
+            p.deinit(self.alloc);
+            self.alloc.destroy(p);
+            fr.u.c.parked_stack = null;
+        }
+    }
+
+    /// P16.30 Stage C: park the active c_stack on the C-frame. Moves the
+    /// ArrayList contents (buffer included — no value copy) into a heap
+    /// cell owned by the frame, then restores `cur_c_stack` to `saved`
+    /// (the caller's stack view). The frame's TBC chain entries keep
+    /// pointing at the parked slots: live-slot semantics survive the
+    /// suspension (PUC: the slots live on the shared L->stack, which is
+    /// never moved on yield).
+    fn parkCStack(
+        self: *Vm,
+        fr: *CallFrame,
+        saved: std.ArrayListUnmanaged(Value),
+    ) std.mem.Allocator.Error!void {
+        const cell = try self.alloc.create(std.ArrayListUnmanaged(Value));
+        cell.* = self.cur_c_stack.*;
+        fr.u.c.parked_stack = cell;
+        self.cur_c_stack.* = saved;
+    }
+
+    /// P16.30 Stage C: unpark the C-frame's parked c_stack back into
+    /// `cur_c_stack` (the inverse of `parkCStack`: contents move back,
+    /// the heap cell is freed). No-op when the frame has nothing parked
+    /// (e.g. testC continuation frames, which reconstruct their own
+    /// stack from `testc_state` instead of parking).
+    fn unparkCStack(self: *Vm, fr: *CallFrame) void {
+        const parked = fr.u.c.parked_stack orelse return;
+        self.cur_c_stack.* = parked.*;
+        self.alloc.destroy(parked);
+        fr.u.c.parked_stack = null;
     }
 
     /// P15.80: Free the heap-owned `TestcContState` pointed to by `ptr`

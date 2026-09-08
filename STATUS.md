@@ -5363,6 +5363,53 @@ temp_table −6.2%, string_loop −3.0%. Layout-класс регрессии (�
 Гейт: matrix 31/32 (zig_fail=0; big.lua both_fail pre-existing),
 smoke **71/71**, c_api 21+diff, api580 376/376, unit D+RF.
 
+### P16.30 T3 Stage A: unwind-loop C-frame guard — D3 SIGSEGV закрыт (2026-09-08)
+
+Первый cut фазы TBC-ownership (Option B+, design truth:
+`tools/status/p16.30-tbc-ownership-truth.json`). Два фикса в
+`continueBytecodeErrorUnwind`/`pushBuiltinCFrame`:
+
+- **D3 (SIGSEGV, G1a)**: unwind pop-loop читал `frame.u.lua.hasOpenUpvalues()`
+  БЕЗ проверки `isC()` — для C-фрейма (pcallk-boundary короутины,
+  suspended по yield, затем `coroutine.close` → forced-close transport →
+  этот loop) union-arm неактивен → SIGSEGV. Фикс: `isC()`-ветка ПЕРЕД
+  Lua-специфичными чтениями — C-фреймы попаются generic-попом
+  (`popBytecodeExecFrame` уже роутит их через `freeCFrameOwnedState`),
+  без `beginBytecodeClose` (C-фреймы никогда не владеют `bc_tbc_regs`
+  — это Lua-фреймовые регистры, отмечаемые OP_TBC внутри Lua-фреймов;
+  их stale `tbc_mark` иначе misattributed бы внешние Lua-метки на
+  C-фрейм → `u.lua.frame_cap` read в `continueBytecodeClose`).
+  PUC-модель: Lua-frame close logic в unwind смотрит только Lua
+  CallInfo; C CallInfo анлинкуются и дропаются (их TBC-обязательства
+  живут на thread-owned tbclist — сходится на per-thread chain в
+  Stage C).
+- **pushBuiltinCFrame `tbc_mark` snapshot** (сопутствующий latent-баг
+  того же семейства): C-фреймы получали default `tbc_mark=0`, поэтому
+  generic-pop (строка `bc_tbc_regs.items.len = frame.tbc_mark`)
+  ТРАНКИРОВАЛ bc_tbc_regs до 0 при попе C-фрейма — молча ДРОПАЛ
+  to-be-closed метки внешних Lua-фреймов (freed-not-closed для Lua
+  TBC), а `closeAllTbcVariables` misattributed все нижние метки на
+  C-фрейм (u.lua read). Фикс: `tbc_mark = bc_tbc_regs.items.len` на
+  push — тот же snapshot, что делают Lua-frame push-сайты; инвариант
+  «при попе фрейма F len == F.tbc_mark» теперь держится и для C-фреймов
+  (каждый Lua-фрейм над C восстанавливает глубину при своём попе), так
+  что attributed-range C-фрейма в closeAllTbcVariables всегда пуст.
+
+Результат по 22_tbc_lifecycle (16 кейсов): SIGSEGV G1a устранён, тест
+доходит до конца; G1a/G1b/G2/G3a/G3b resume-часть PUC-идентична.
+Остальные diff'ы — ровно запланированные Stage C-работы (D1
+discardCFrame freed-not-closed: close_calls=0 у G*/D8/D10/D11; D2
+finishCcall success-drop: D4 n4a; D5 error-escape close: err=orig vs
+e-a; D7 latent: n7 err=boom7 vs none; D3-кейс n3b/closeslot).
+
+Гейт: zig build test D + build RF 0; smoke **71/71**; matrix --testc
+**31/32 zig_fail=0** (big.lua both_fail pre-existing); c_api make test
+ALL PASS; crash-repro t6r_zig **exit 0** (был SIGSEGV); GC-stress
+1000-итераций coroutine+TBC close loop: closes=1000 = PUC; api580
+GREEN; perf_compare 7-run median: атрибутируемых регрессий нет
+(temp_table_alloc +5.8-7% WARN — pre-existing drift, воспроизведён на
+stash без изменения; coroutine_yield/global_arith — шум 3-run median).
+
 ## История закрытых фаз
 
 P3–P15.12 — краткая сводка. P15.13+ — см. «История разработки» выше.

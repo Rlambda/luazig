@@ -1,71 +1,468 @@
 {
-  "created_utc": "2026-09-07T18:14:40Z",
+  "created_utc": "2026-09-08T17:19:36Z",
   "provenance": {
-    "git_head": "d2ef0092ecb6de1adbe8cc6a63ba6f2db9e2e667",
-    "git_dirty": "6",
+    "git_head": "4b6167b8c13bf5ee93da320c0d90ef53a6b4a728",
+    "git_dirty": "0",
     "zig_version": "0.16.0",
-    "note": "P16.29 T0.1 regeneration from P16.28-final source"
+    "note": "P16.30 final regeneration"
   },
   "workloads": {
     "lua_calls": {
       "top_symbols": [
         {
           "symbol": "vm.Vm.runBytecodeDispatch",
-          "percent": 95.89
+          "percent": 99.93
+        },
+        {
+          "symbol": "codegen_bc.Codegen.spanLastTokenLine",
+          "percent": 0.01
+        },
+        {
+          "symbol": "heap.ArenaAllocator.remap",
+          "percent": 0.01
+        },
+        {
+          "symbol": "compiler_rt.strlen",
+          "percent": 0.01
+        },
+        {
+          "symbol": "compiler_rt.memcpy.memcpyFast",
+          "percent": 0.01
+        },
+        {
+          "symbol": "heap.SmpAllocator.alloc",
+          "percent": 0.01
+        },
+        {
+          "symbol": "compiler_rt.memset",
+          "percent": 0.01
+        },
+        {
+          "symbol": "hash.wyhash.Wyhash.hash",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x0000000000028ca3",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x000000000000b264",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x0000000000010c57",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x00000000000085e3",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x000000000001661c",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x000000000001654c",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x00000000000228c3",
+          "percent": 0.0
         }
       ],
-      "source_head": "d2ef0092ecb6de1adbe8cc6a63ba6f2db9e2e667"
+      "source_head": "4b6167b8c13bf5ee93da320c0d90ef53a6b4a728"
     },
     "metamethod_call_noalloc": {
       "top_symbols": [
         {
           "symbol": "vm.Vm.runBytecodeDispatch",
-          "percent": 69.35
+          "percent": 50.69
+        },
+        {
+          "symbol": "vm.Vm.getTmByObj",
+          "percent": 32.13
+        },
+        {
+          "symbol": "vm.Vm.tryPushSimpleResultMetamethod",
+          "percent": 14.72
+        },
+        {
+          "symbol": "ltable.nodeInsert",
+          "percent": 0.96
+        },
+        {
+          "symbol": "vm.Vm.gcPropagateOne",
+          "percent": 0.57
+        },
+        {
+          "symbol": "vm.Vm.rawSet",
+          "percent": 0.3
+        },
+        {
+          "symbol": "process.Environ.createMap",
+          "percent": 0.12
+        },
+        {
+          "symbol": "codegen_bc.Codegen.popGlobalScope",
+          "percent": 0.12
+        },
+        {
+          "symbol": "codegen_bc.Codegen.genNameExpDesc",
+          "percent": 0.11
+        },
+        {
+          "symbol": "parser.Parser.parseExplistAst",
+          "percent": 0.09
+        },
+        {
+          "symbol": "hash.wyhash.Wyhash.final",
+          "percent": 0.09
+        },
+        {
+          "symbol": "0x000000000000b23c",
+          "percent": 0.04
+        },
+        {
+          "symbol": "0x000000000000b260",
+          "percent": 0.03
+        },
+        {
+          "symbol": "0x000000000000af80",
+          "percent": 0.02
+        },
+        {
+          "symbol": "0x0000000000013f05",
+          "percent": 0.01
         }
       ],
-      "source_head": "d2ef0092ecb6de1adbe8cc6a63ba6f2db9e2e667"
+      "source_head": "4b6167b8c13bf5ee93da320c0d90ef53a6b4a728"
     },
     "metamethod_add": {
       "top_symbols": [
         {
           "symbol": "vm.Vm.runBytecodeDispatch",
-          "percent": 22.64
+          "percent": 22.14
         },
         {
           "symbol": "heap.SmpAllocator.alloc",
-          "percent": 13.29
+          "percent": 13.53
+        },
+        {
+          "symbol": "heap.SmpAllocator.free",
+          "percent": 11.78
+        },
+        {
+          "symbol": "vm.Vm.getTmByObj",
+          "percent": 3.91
+        },
+        {
+          "symbol": "vm.Vm.tableGetValueDepth",
+          "percent": 3.74
+        },
+        {
+          "symbol": "vm.Vm.internStr",
+          "percent": 3.66
+        },
+        {
+          "symbol": "vm.Vm.callBuiltin",
+          "percent": 3.35
+        },
+        {
+          "symbol": "mem.eql__anon_3067",
+          "percent": 3.2
+        },
+        {
+          "symbol": "vm.Vm.rawGet",
+          "percent": 3.18
+        },
+        {
+          "symbol": "ltable.Node.keyMatches",
+          "percent": 2.84
+        },
+        {
+          "symbol": "hash.wyhash.Wyhash.final",
+          "percent": 2.65
+        },
+        {
+          "symbol": "vm.Vm.completeBytecodeExecFrame",
+          "percent": 2.18
+        },
+        {
+          "symbol": "vm.Vm.builtinSetmetatable",
+          "percent": 2.17
+        },
+        {
+          "symbol": "vm.Vm.rawSet",
+          "percent": 2.13
+        },
+        {
+          "symbol": "vm.Vm.setPendingCall",
+          "percent": 1.99
         }
       ],
-      "source_head": "d2ef0092ecb6de1adbe8cc6a63ba6f2db9e2e667"
+      "source_head": "4b6167b8c13bf5ee93da320c0d90ef53a6b4a728"
     },
     "coroutine_yield": {
       "top_symbols": [
         {
           "symbol": "vm.Vm.runBytecodeDispatch",
-          "percent": 46.95
+          "percent": 45.57
+        },
+        {
+          "symbol": "vm.Vm.builtinCoroutineResume",
+          "percent": 21.21
+        },
+        {
+          "symbol": "vm.Vm.switchRuntime",
+          "percent": 7.24
+        },
+        {
+          "symbol": "vm.Vm.tryRequestBytecodeCoroutineSwitch",
+          "percent": 4.98
+        },
+        {
+          "symbol": "vm.Vm.builtinCoroutineYield",
+          "percent": 3.78
+        },
+        {
+          "symbol": "vm.Vm.coroutineBuiltinFastPathEligible",
+          "percent": 3.38
+        },
+        {
+          "symbol": "vm.Vm.callCoroutineBuiltinDirect",
+          "percent": 2.3
+        },
+        {
+          "symbol": "compiler_rt.memcpy.memcpyFast",
+          "percent": 2.27
+        },
+        {
+          "symbol": "vm.Vm.hasActiveBytecodeNonYieldableBoundary",
+          "percent": 1.94
+        },
+        {
+          "symbol": "vm.Vm.runBytecodeInternal",
+          "percent": 1.83
+        },
+        {
+          "symbol": "vm.Vm.clearErrorTraceback",
+          "percent": 1.42
+        },
+        {
+          "symbol": "vm.Vm.tryPushBytecodeProtectedCall",
+          "percent": 1.14
+        },
+        {
+          "symbol": "vm.Vm.builtinOutLen",
+          "percent": 0.97
+        },
+        {
+          "symbol": "vm.Vm.condGcFromDispatch",
+          "percent": 0.84
+        },
+        {
+          "symbol": "vm.Vm.tryPushBytecodeDebugHook",
+          "percent": 0.66
         }
       ],
-      "source_head": "d2ef0092ecb6de1adbe8cc6a63ba6f2db9e2e667"
+      "source_head": "4b6167b8c13bf5ee93da320c0d90ef53a6b4a728"
     },
     "hash_access": {
       "top_symbols": [
         {
           "symbol": "vm.Vm.runBytecodeDispatch",
-          "percent": 99.71
+          "percent": 99.66
+        },
+        {
+          "symbol": "vm.Vm.rawSet",
+          "percent": 0.11
+        },
+        {
+          "symbol": "vm.Vm.gcClearDeadKeys",
+          "percent": 0.08
+        },
+        {
+          "symbol": "ltable.nodeInsert",
+          "percent": 0.04
+        },
+        {
+          "symbol": "vm.Vm.gcRegisterObject",
+          "percent": 0.03
+        },
+        {
+          "symbol": "bytecode.ConstPool.append",
+          "percent": 0.03
+        },
+        {
+          "symbol": "heap.ArenaAllocator.remap",
+          "percent": 0.02
+        },
+        {
+          "symbol": "0x000000000006bb73",
+          "percent": 0.01
+        },
+        {
+          "symbol": "0x000000000000b260",
+          "percent": 0.01
+        },
+        {
+          "symbol": "0x000000000000b20b",
+          "percent": 0.01
+        },
+        {
+          "symbol": "0x000000000000b219",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x000000000000ba80",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x000000000001660e",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x00000000000228c0",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x000000000002268a",
+          "percent": 0.0
         }
       ],
-      "source_head": "d2ef0092ecb6de1adbe8cc6a63ba6f2db9e2e667"
+      "source_head": "4b6167b8c13bf5ee93da320c0d90ef53a6b4a728"
     },
     "field_access": {
       "top_symbols": [
         {
           "symbol": "vm.Vm.runBytecodeDispatch",
-          "percent": 99.57
+          "percent": 99.58
+        },
+        {
+          "symbol": "vm.Vm.rawSet",
+          "percent": 0.14
+        },
+        {
+          "symbol": "vm.Vm.gcPropagateOne",
+          "percent": 0.09
+        },
+        {
+          "symbol": "ltable.nodeInsert",
+          "percent": 0.05
+        },
+        {
+          "symbol": "vm.Vm.tableResize",
+          "percent": 0.05
+        },
+        {
+          "symbol": "bytecode.ProtoBuilder.finish",
+          "percent": 0.02
+        },
+        {
+          "symbol": "fmt.parse_float.parseFloat__anon_40093",
+          "percent": 0.02
+        },
+        {
+          "symbol": "heap.SmpAllocator.alloc",
+          "percent": 0.01
+        },
+        {
+          "symbol": "vm.Vm.getGlobal",
+          "percent": 0.01
+        },
+        {
+          "symbol": "ltable.Node.keyMatches",
+          "percent": 0.01
+        },
+        {
+          "symbol": "compiler_rt.memcpy.memcpyFast",
+          "percent": 0.01
+        },
+        {
+          "symbol": "0x000000000002961e",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x00000000000114d3",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x000000000001041f",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x000000000000b20b",
+          "percent": 0.0
         }
       ],
-      "source_head": "d2ef0092ecb6de1adbe8cc6a63ba6f2db9e2e667"
+      "source_head": "4b6167b8c13bf5ee93da320c0d90ef53a6b4a728"
     },
     "branch_loop": {
+      "top_symbols": [
+        {
+          "symbol": "vm.Vm.runBytecodeDispatch",
+          "percent": 99.94
+        },
+        {
+          "symbol": "ltable.nodeInsert",
+          "percent": 0.02
+        },
+        {
+          "symbol": "vm.Vm.gcPropagateOne",
+          "percent": 0.02
+        },
+        {
+          "symbol": "array_list.Aligned(bytecode.Upvaldesc,null).append",
+          "percent": 0.01
+        },
+        {
+          "symbol": "heap.SmpAllocator.free",
+          "percent": 0.0
+        },
+        {
+          "symbol": "vm.Vm.rawSet",
+          "percent": 0.0
+        },
+        {
+          "symbol": "hash.wyhash.Wyhash.final",
+          "percent": 0.0
+        },
+        {
+          "symbol": "hash.wyhash.Wyhash.hash",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x000000000000af9a",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x000000000000ad62",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x000000000000badc",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x0000000000017024",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x0000000000016615",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x00000000000228b8",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x000000000002268a",
+          "percent": 0.0
+        }
+      ],
+      "source_head": "4b6167b8c13bf5ee93da320c0d90ef53a6b4a728"
+    },
+    "global_arith": {
       "top_symbols": [
         {
           "symbol": "vm.Vm.runBytecodeDispatch",
@@ -73,11 +470,7 @@
         },
         {
           "symbol": "vm.Vm.rawSet",
-          "percent": 0.02
-        },
-        {
-          "symbol": "hash_map.HashMapUnmanaged([]const",
-          "percent": 0.0
+          "percent": 0.03
         },
         {
           "symbol": "bytecode.ProtoBuilder.internString",
@@ -88,84 +481,43 @@
           "percent": 0.0
         },
         {
-          "symbol": "vm.Vm.tableResize",
-          "percent": 0.0
-        },
-        {
-          "symbol": "hash.wyhash.Wyhash.hash",
-          "percent": 0.0
-        },
-        {
-          "symbol": "vm.Vm.gcRegisterObject",
-          "percent": 0.0
-        },
-        {
-          "symbol": "0x000000000000b20f",
-          "percent": 0.0
-        },
-        {
-          "symbol": "0x00000000000a4dc5",
-          "percent": 0.0
-        },
-        {
-          "symbol": "0x000000000002961e",
-          "percent": 0.0
-        },
-        {
-          "symbol": "0x0000000000028ca7",
-          "percent": 0.0
-        },
-        {
-          "symbol": "0x000000000000af15",
-          "percent": 0.0
-        },
-        {
-          "symbol": "0x0000000000029691",
-          "percent": 0.0
-        },
-        {
-          "symbol": "0x0000000000019ca1",
-          "percent": 0.0
-        }
-      ],
-      "source_head": "d2ef0092ecb6de1adbe8cc6a63ba6f2db9e2e667"
-    },
-    "global_arith": {
-      "top_symbols": [
-        {
-          "symbol": "vm.Vm.runBytecodeDispatch",
-          "percent": 99.95
-        },
-        {
-          "symbol": "ltable.nodeInsert",
-          "percent": 0.03
-        },
-        {
           "symbol": "compiler_rt.memcpy.memcpyFast",
-          "percent": 0.0
-        },
-        {
-          "symbol": "heap.SmpAllocator.alloc",
-          "percent": 0.0
-        },
-        {
-          "symbol": "codegen_bc.Codegen.compileChildFunction",
-          "percent": 0.0
-        },
-        {
-          "symbol": "codegen_bc.Codegen.ensureUpvalue",
-          "percent": 0.0
-        },
-        {
-          "symbol": "vm.Vm.gcRegisterObject",
           "percent": 0.0
         },
         {
           "symbol": "compiler_rt.memset",
           "percent": 0.0
+        },
+        {
+          "symbol": "0x0000000000005139",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x0000000000029687",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x0000000000016630",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x00000000000228b0",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x000000000002268a",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x000000000002269d",
+          "percent": 0.0
+        },
+        {
+          "symbol": "0x00000000000226e8",
+          "percent": 0.0
         }
       ],
-      "source_head": "d2ef0092ecb6de1adbe8cc6a63ba6f2db9e2e667"
+      "source_head": "4b6167b8c13bf5ee93da320c0d90ef53a6b4a728"
     }
   }
 }

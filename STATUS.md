@@ -1,4 +1,4 @@
-> Last updated: 2026-09-08 (P16.29 COMPLETE — T1 PUC table hashing (hash_access 2.019→1.673x), T3 codegen parity (TESTSET/EQK/CLOSE/count-hook mask), T2 savedpc ownership (lua_calls 1.702→1.393x), T4 metamethod fixed-arity, T5 xpcall errfunc timing, T7 C-API tothread/extraspace; geomean 1.67273→1.61728 (−3.3%))
+> Last updated: 2026-09-08 (P16.30 COMPLETE — C-frame TBC ownership convergence: thread-owned c_tbc_chain + parked stacks + CIST_TBC bit18 + all close sites unified; 22_tbc_lifecycle 16/16 DIFF-EMPTY vs PUC; SIGSEGV closed; perf-neutral)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -35,7 +35,7 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Matrix non-pass | both_fail: big.lua |
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **71/71** pass |
-| C API suites (`tests/c_api`) | 21 suites |
+| C API suites (`tests/c_api`) | 22 suites |
 | Performance (geomean vs PUC) | **1.62x** |
 
 Geomean замедления vs PUC Lua: **1.62x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
@@ -5525,6 +5525,44 @@ c_stack[0] для testC-фреймов независимо от park-состо
 **22_tbc_lifecycle DIFF-EMPTY** (diff vs /tmp/opencode/t22_puc.txt
 пуст), api580 GREEN, matrix --testc 32/32 zig_fail=0 (big.lua both_fail
 pre-existing), crash repro t6r exit 0, GC-stress closes=1000.
+
+### P16.30 COMPLETE: C-frame TBC ownership convergence (2026-09-08)
+Correctness-first фаза. **22_tbc_lifecycle 16/16 DIFF-EMPTY vs PUC**;
+SIGSEGV закрыт; perf нейтрален (geomean 1.6247 vs B0 1.64; P16.29-final
+1.61728 → +0.5% в пределах шума/лэйаута; regression check без WARN).
+
+- **T0**: гейты зелёные; stale differential → свежий (input-era d2ef009 →
+  HEAD); B0 = 1.64; все 9 P16.29-репродюсеров сохранены.
+- **T1**: постоянный дифференциал tests/c_api/22_tbc_lifecycle.c (16 кейсов
+  в 4 группах; PUC-референс 64 строки снят; крэш детектируется сигналом).
+- **T2**: root cause зафиксирован (tools/status/p16.30-tbc-ownership-truth.json):
+  unwind-loop читает frame.u.lua через C-кадр (D3-SIGSEGV) + VM-глобальный
+  c_toclose_slots с индексами во временные стеки + дубликат-снапшот
+  remaining_tbc (D1/D2). Дизайн: **Option B+** (per-Thread chain + parked
+  stacks; Option A отвергнут — слишком широкий C-API рефакторинг).
+- **Stage A (`427f9bf`)**: D3 закрыт (isC-guard + tbc_mark латентный баг:
+  C-кадры обнуляли bc_tbc_marks внешних Lua-кадров).
+- **Stage B (`51c0716`)**: CIST_TBC bit 18 (PUC lstate.h порядок битов);
+  лгущий комментарий 'PUC L->ci->tbclist' заменён.
+- **Stage C.1 (`0cbc15e`)**: TbcEntry{cframe_idx, slot_idx} +
+  Thread.c_tbc_chain + CFrameState.parked_stack (move-helpers); GC-mark
+  parked/chain; закрыт leak collected-coroutine state.
+- **Stage C.2 (`4b6167b`)**: closeCFrameTbcEntries — единый workhorse:
+  pop entry ДО __close, live-slot значение, nil после, last-error-wins,
+  yieldable-close через CClsretState in-place; все close-сайты
+  (callCFunction/finishCcall/finishpcallk/precover/discard/reset/
+  closethread/unwind); T7-удаления: c_toclose_slots, toclose_base,
+  snapshotYieldedTbc, remaining_tbc — CallFrame **остался 88B**.
+  Найден+починен в шаге: coroutine.lua apico pcallk testc-дискриминатор.
+- **T8 GC**: D11 (mark→GC→close на живом объекте) в дифференциале;
+  GC-stress 1000 приостанавлив/закрытий = 1000 закрытий.
+- **Задокументированные остаточные расхождения** (в коде, не в тестах):
+  hook-yield abandon глотает финальную ошибку closer'а; close_has_err
+  гоняет closers в контексте закрывающего потока; unwind void-путь
+  глотает ошибки close.
+
+Гейт: matrix 31/32 (zig_fail=0), smoke 71/71, c_api 22+diff EMPTY,
+api580 376/376, unit D+RF, fmt clean, t6r rc=0 (был SIGSEGV).
 
 ## История закрытых фаз
 

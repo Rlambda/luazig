@@ -36292,10 +36292,7 @@ pub const Vm = struct {
         if (err_obj) |e| {
             var call_args = [_]Value{ obj, e };
             _ = self.callMetamethod(mm, "__close", call_args[0..]) catch |e2| switch (e2) {
-                error.RuntimeError => {
-                    self.annotateCloseRuntimeError();
-                    return error.RuntimeError;
-                },
+                error.RuntimeError => return error.RuntimeError,
                 error.Yield => {
                     if (mm == .Builtin and mm.Builtin == .coroutine_yield) {
                         if (self.current_thread) |th| {
@@ -36311,10 +36308,7 @@ pub const Vm = struct {
         } else {
             var call_args = [_]Value{obj};
             _ = self.callMetamethod(mm, "__close", call_args[0..]) catch |e2| switch (e2) {
-                error.RuntimeError => {
-                    self.annotateCloseRuntimeError();
-                    return error.RuntimeError;
-                },
+                error.RuntimeError => return error.RuntimeError,
                 error.Yield => {
                     if (mm == .Builtin and mm.Builtin == .coroutine_yield) {
                         if (self.current_thread) |th| {
@@ -36345,26 +36339,26 @@ pub const Vm = struct {
         }
     }
 
-    fn annotateCloseRuntimeError(self: *Vm) void {
-        // PUC luaF_close: when a __close metamethod errors, PUC prepends
-        // "error in __close metamethod" to the error MESSAGE (luaG_runerror
-        // → luaO_pushfstring). But the error OBJECT on the Lua stack is
-        // the ORIGINAL error value — the annotation is diagnostic only.
-        //
-        // In luazig, `self.err` is the rendered diagnostic message (used
-        // for traceback), and `self.err_obj` is the Lua error Value (what
-        // pcall returns as the second argument). We must annotate `self.err`
-        // WITHOUT mutating `self.err_obj` — the Lua error object must remain
-        // the exact value that `error()` produced.
-        const msg = self.err orelse return;
-        if (std.mem.indexOf(u8, msg, "not enough memory") != null) return;
-        if (std.mem.indexOf(u8, msg, "in metamethod 'close'") != null) return;
-        var tmp: [512]u8 = undefined;
-        const msg_copy = std.fmt.bufPrint(tmp[0..], "{s}", .{msg}) catch msg;
-        self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}\nin metamethod 'close'", .{msg_copy}) catch msg_copy;
-        // Do NOT mutate err_obj — the Lua error Value is the original
-        // object from error(), not the annotated diagnostic message.
-    }
+    // P16.31 Cut 2: annotateCloseRuntimeError is DELETED. The old function
+    // appended "\nin metamethod 'close'" to the DIAGNOSTIC message `self.err`
+    // after a __close metamethod errored, intending to mirror PUC's
+    // traceback-only annotation. But `self.err` is not traceback-only state:
+    // `currentRuntimeErrorValue` rebuilds string error objects from
+    // `protectedErrorString()` (= the annotated `self.err`) at every
+    // bytecode-unwind capture site, so the annotation leaked into the
+    // pcall-returned error VALUE ("\nin metamethod 'close'" appended to the
+    // Lua-visible error object whenever a __close error crossed a Lua frame).
+    //
+    // PUC truth (ldebug.c funcnamefromcode, lauxlib.c pushfuncname): the
+    // string "in metamethod 'close'" appears ONLY in traceback frame labels —
+    // the __close frame's caller instruction is OP_CLOSE/OP_RETURN, which
+    // funcnamefromcode maps to TM_CLOSE → kind "metamethod", name "close".
+    // The error OBJECT is finalized at throw time and carried as-is
+    // (upstream locals.lua asserts the xpcall message starts with the bare
+    // "@x123" and finds "in metamethod 'close'" only inside the traceback
+    // text). luazig's traceback machinery already produces the identical
+    // label (the metamethod frame push records debug_namewhat="metamethod" /
+    // debug_name="close"), so no replacement annotation is needed here.
 
     // ------------------------------------------------------------------
     // P16.30 Stage C: C-frame TBC chain (thread-owned, PUC L->tbclist).

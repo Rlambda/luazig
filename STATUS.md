@@ -1,4 +1,4 @@
-> Last updated: 2026-09-08 (P16.29 T5 xpcall throw-site errfunc — invokeErrfunc rewrite, errfunc_running_idx slot guard, raiseErrerr (luaD_errerr) + SO-margin errerr, popBytecodeExecFrame C-frame teardown (c_frame_count leak fix), GC errfunc marking, getinfo C-frame fill; smoke 71/71, geomean 1.63x, perf OK)
+> Last updated: 2026-09-08 (P16.29 COMPLETE — T1 PUC table hashing (hash_access 2.019→1.673x), T3 codegen parity (TESTSET/EQK/CLOSE/count-hook mask), T2 savedpc ownership (lua_calls 1.702→1.393x), T4 metamethod fixed-arity, T5 xpcall errfunc timing, T7 C-API tothread/extraspace; geomean 1.67273→1.61728 (−3.3%))
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -34,11 +34,11 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
 | Differential output (`--diff`) | **0 output_diff** |
-| Smoke tests (`tests/smoke/*.lua`) | **70/70** pass |
+| Smoke tests (`tests/smoke/*.lua`) | **71/71** pass |
 | C API suites (`tests/c_api`) | 21 suites |
-| Performance (geomean vs PUC) | **1.67x** |
+| Performance (geomean vs PUC) | **1.62x** |
 
-Geomean замедления vs PUC Lua: **1.67x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.62x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -5314,6 +5314,54 @@ PUC-identical (modulo addresses); perf_compare **OK** (geomean 1.63x,
    (zig `true yv` / `true resumed nil` vs PUC `true true resumed`).
 3. `math.max("x")`: PUC 5.5 возвращает "x", zig ошибается (math lib
    coercion — отдельная фаза).
+
+### P16.29 COMPLETE: core execution convergence (2026-09-08)
+**Geomean B0 1.67273 → 1.61728 (−3.3% same-session)**; сильные cuts:
+lua_calls 1.702→**1.393x** (−18.1%), hash_access 2.019→**1.673x** (−17.2%),
+metamethod_call_noalloc 2.165→**1.946x** (−10.1%), table_alloc −5.4%,
+temp_table −6.2%, string_loop −3.0%. Layout-класс регрессии (документирован
+в T2-коммите): int_arith +5.2%, array_access +5.5% времени при +1% instr.
+
+- **T0 (`группа артефактов`)**: stale current-* → historical-* (P16.24-era);
+  свежий current-differential-profile.json; interleaved B0 = 1.67273.
+- **T1 (`767067d`)**: PUC main-position: hashpow2/hashmod двухправильная
+  модель; hashint (32/64-bit mod, без seed), point2uint+hashmod,
+  l_hashfloat port; mainPosition = type switch; mainPositionOfNode для
+  Brent eviction; rawHash/keyHash/hashInt/hashNum/hashPointer УДАЛЕНЫ;
+  seed убран из всего ltable API; R1/R2/R3 тесты; семантический
+  дифференциал PUC-идентичен.
+- **T3 (`022192c`)**: codegen parity: PUC TESTSET machinery (patchTestReg/
+  patchListAux/needValue; 'a and b or 0' = точная PUC-форма, корпус −1207
+  MOVE); EQK nil/bool фолдинг; outermost-CLOSE skip + chunk RETURN rewrite;
+  SELF fresh-A; COUNT-HOOK MASK УДАЛЁН (каждая инструкция считается как
+  PUC; count-hook дифференциалы точно равны).
+- **T2 (`4b39fb3`)**: savedpc ownership: parkActiveFrame на 18 push-сайтов;
+  defer syncFrame + ВСЯ ActivationId-машина УДАЛЕНЫ; 4 RETURN fast-arm
+  in-place resume; P16.28-T6 hazard структурно невозможен; lua_calls
+  −19.5% cycles.
+- **T4 (`8a80e5d`)**: metamethod fixed-arity (PUC luaT_callTMres форма):
+  отдельные операнды вместо generic slice; ленивый opname;
+  stageFixedCall(comptime); pushStagedFast inline; mm_call −13% instr;
+  ПРЕД-СУЩЕСТВУЮЩИЙ БАГ: pushStagedFast headroom underflow (<200 слотов).
+- **T5 (`3ca493d`)**: xpcall НАСТОЯЩИЙ errfunc: handler на THROW SITE до
+  unwinding (live stack в handler; TBC порядок handler-до-close как PUC);
+  invokeErrfunc очищает err_source/err_line; errfunc_running_idx
+  (вложенные xpcall в handler); raiseErrerr (PUC luaD_errerr);
+  ПРЕД-СУЩЕСТВУЮЩИЙ БАГ: popBytecodeExecFrame C-frame teardown leak;
+  постоянный тест 71_xpcall_errfunc_timing.lua; smoke 71/71.
+- **T7 (`85f0a10`)**: lua_tothread NON-NULL (lazy stable handle);
+  lua_getextraspace (Lx-аллокация, PUC LX ABI + inherit-from-main);
+  allocStateHandle/freeStateHandle funnel; тест 21_thread_api.c.
+- **T6 (bounded investigation)**: deviation РЕАЛНА + 2 НОВЫХ дефекта
+  (normal-resume дропает TBC __close; SIGSEGV при close короутины
+  suspended в C-callk boundary — reproducer /tmp/opencode/t6_repro.c,
+  требует отдельного root-cause прохода); design sketch per-Thread TBC
+  chain зафиксирован. T7 luaL_traceback target-state — документированная
+  дивергенция (нужен handle-resolved getstack/getinfo).
+- Найдено pre-existing: gc.lua Debug hang (gc_count_kb→0 у collector-pace).
+
+Гейт: matrix 31/32 (zig_fail=0; big.lua both_fail pre-existing),
+smoke **71/71**, c_api 21+diff, api580 376/376, unit D+RF.
 
 ## История закрытых фаз
 

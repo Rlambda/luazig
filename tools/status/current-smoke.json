@@ -1,25 +1,25 @@
 {
   "meta": {
-    "created_utc": "2026-09-07T16:03:12.343213+00:00",
+    "created_utc": "2026-09-08T01:02:42.130236+00:00",
     "lane": "smoke_compare",
     "argv": [
       "/home/boss/codes/luazig/tools/smoke_compare.py",
       "--json-out",
-      "/home/boss/codes/luazig/tools/status/.tmp.smoke.405y3y33.json"
+      "/home/boss/codes/luazig/tools/status/.tmp.smoke.dcijvm79.json"
     ],
     "zig_version": "0.16.0"
   },
   "provenance": {
-    "git_head": "727a3d1",
-    "measured_source_head": "727a3d1",
+    "git_head": "85f0a10",
+    "measured_source_head": "85f0a10",
     "git_dirty": "dirty",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "db64cad1bd2d2806",
+    "zig_binary_sha16": "cb1743ba5967d10b",
     "puc_binary_sha16": "d54bc45e1757b216"
   },
-  "total": 70,
-  "ok": 70,
+  "total": 71,
+  "ok": 71,
   "mismatches": 0,
   "results": [
     {
@@ -300,6 +300,10 @@
     },
     {
       "file": "tests/smoke/70_coroutine_close_nonyieldable.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/71_xpcall_errfunc_timing.lua",
       "match": true
     }
   ]

@@ -1371,41 +1371,39 @@ const CFrameAux = extern union {
     nres: i32,
 };
 
-/// P15.82: Heap-allocated state for CIST_CLSRET (TBC close yielded mid-way
-/// during callCFunction's return-path close). Allocated on demand only when
-/// a `__close` metamethod yields during C function return. Freed when all
-/// closers complete (or on error/C-frame pop).
+/// P15.82/P16.30 Stage C: Heap-allocated state for CIST_CLSRET (a `__close`
+/// metamethod yielded mid-way through a TBC close). Allocated on demand only
+/// when a closer yields; freed when all closers complete (or on C-frame pop
+/// via freeCFrameOwnedState).
 ///
 /// Stored as a pointer (not inline) to keep CallFrame compact (~96-104B).
 /// Must be traced by GC while the C-frame is suspended (CIST_CLSRET).
 const CClsretState = struct {
-    /// Remaining TBC values to close (LIFO order). On resume, finishCcall
-    /// closes these one by one. If a closer yields again, this slice is
-    /// updated to skip the already-closed value.
-    remaining_tbc: []Value,
-    /// C function results saved before TBC close. Returned to the caller
-    /// after all closers complete (return_close mode).
-    results: []Value,
-    /// P15.83c FIX B: Discriminator for which close mode we're in.
-    /// - `.return_close`: TBC close during callCFunction's normal return
-    ///   path. After closers complete, the saved results are returned.
-    /// - `.pcall_error_close`: TBC close during finishpcallk's error path.
-    ///   After closers complete, the error object is placed at funcidx
-    ///   and the error status is returned to k.
+    /// Which close the suspension is in the middle of:
+    /// - `.return_close`: C function return close (PUC `moveresults` →
+    ///   `luaF_close(ci->func, CLOSEKTOP, yy=1)`). On completion the saved
+    ///   results are returned to the caller.
+    /// - `.error_escape`: error-recovery close of a C frame's entries
+    ///   (PUC `luaD_closeprotected` semantics reached through precover's
+    ///   frame-pop loop / callCFunction's error path). On completion the
+    ///   saved error state is re-raised (err_obj restored, RuntimeError
+    ///   returned — the caller re-drives the recovery).
     mode: CloseMode = .return_close,
-    /// P15.83c FIX B: For pcall_error_close — the error value passed to
-    /// __close as the 2nd argument. PUC luaF_close passes the current
-    /// error value to each closer. If a closer itself errors, the new
-    /// error replaces this value (LIFO, last-error-wins). Preserved
-    /// across yield so resumed closers receive the correct error.
+    /// C function results saved before the return-path close. Returned to
+    /// the caller after all closers complete (return_close mode).
+    results: []Value = &.{},
+    /// The error value passed to each remaining `__close` as the 2nd
+    /// argument (PUC `luaF_close(level, err)`). If a closer itself errors,
+    /// the new error replaces this value (LIFO, last-error-wins) — the
+    /// update is written back here so resumed closers receive it.
     error_value: ?Value = null,
-    /// P15.83c FIX B: For pcall_error_close — the error STATUS to return
-    /// to k after all closers complete. Preserved across yield (mirrors
-    /// PUC CIST_RECST).
+    /// The error STATUS to restore after all closers complete
+    /// (error_escape mode; mirrors PUC CIST_RECST: LUA_ERRRUN vs
+    /// LUA_ERRERR). return_close mode ignores this.
     error_status: i32 = 0,
 };
 
-const CloseMode = enum { return_close, pcall_error_close };
+const CloseMode = enum { return_close, error_escape };
 
 /// PUC `CallInfo.u.c` — C function frame state.
 /// Only valid when `callstatus & CIST_C != 0`.
@@ -1444,15 +1442,6 @@ const CFrameState = extern struct {
     /// interrupted TBC close. null when CIST_CLSRET is not set.
     /// Must be freed by freeCFrameOwnedState on C-frame pop.
     clsret_state: ?*CClsretState = null,
-    /// P15.82: Per-C-frame TBC base. When a C-frame is pushed, this saves
-    /// the current `c_toclose_slots.len`. On return, only slots in
-    /// `[toclose_base, c_toclose_slots.len)` belong to THIS C-frame.
-    /// This mirrors PUC's per-call-info TBC scope (stack range
-    /// `[ci->func, ci->top]`). Without this, nested C calls with
-    /// `lua_toclose` corrupt each other's TBC slots.
-    /// P16.30 Stage C: superseded by the thread-owned `c_tbc_chain`
-    /// (removed with the old ownership model once the chain sites land).
-    toclose_base: usize = 0,
     /// P16.30 Stage C: parked c_stack. While this C-frame is suspended
     /// across a yield (lua_yieldk/pcallk/callk) or an in-flight error
     /// awaiting recovery, its c_stack — which holds the frame's
@@ -2384,10 +2373,8 @@ const TestcContState = struct {
 // the LuaString P16.17 bug class). The assert compiles in EVERY build
 // mode; offsets are part of the representation contract (u-variant at 32).
 comptime {
-    // P16.30 Stage C transitional: 88 = final layout (parked_stack replaces
-    // toclose_base 8B-for-8B); 96 = transitional (both fields coexist while
-    // the chain sites land). Sub-step 2 removes toclose_base → back to 88.
-    std.debug.assert(@sizeOf(CallFrame) == 88 or @sizeOf(CallFrame) == 96);
+    // P16.30 Stage C final: 88 B (parked_stack replaced toclose_base 8B-for-8B).
+    std.debug.assert(@sizeOf(CallFrame) == 88);
     std.debug.assert(@offsetOf(CallFrame, "u") == 32);
     std.debug.assert(@alignOf(CallFrame) == 8);
 }
@@ -4151,22 +4138,6 @@ pub const Vm = struct {
     c_alloc_fn: ?*const fn (?*anyopaque, ?*anyopaque, usize, usize) callconv(.c) ?*anyopaque = null,
     c_alloc_ud: ?*anyopaque = null,
 
-    /// C-stack slots marked for auto-closing by `lua_toclose` (the C API
-    /// path). Stored as absolute indices into the handle's `c_stack`,
-    /// scoped per C frame via `CallFrame.u.c.toclose_base` (each C frame
-    /// closes slots in `[toclose_base, len)` on return).
-    ///
-    /// P16.30 Stage B — TRANSITIONAL STATE: this VM-global index list is
-    /// the OLD ownership model being replaced by the PUC-faithful
-    /// per-thread chain (`Thread.c_tbc_chain` + `CIST_TBC` +
-    /// frame-owned parked stacks, per
-    /// `tools/status/p16.30-tbc-ownership-truth.json`). The VM-global
-    /// indices are only meaningful relative to the currently-swapped
-    /// temp c_stack — stale across yields/thread switches (defects
-    /// D1/D2). It is REMOVED in Stage C (T7) once the chain owns all
-    /// marks. Do not add new readers.
-    c_toclose_slots: std.ArrayListUnmanaged(usize) = .empty,
-
     /// Monotonic counter backing `luaL_ref` (PUC lauxlib's `t->alref`).
     /// Each successful ref allocates the next integer key in the registry
     /// table, mirroring PUC's scheme where freed refs are recycled via a
@@ -5371,8 +5342,6 @@ pub const Vm = struct {
         // stacks). The main handle's c_stack is freed by lua_close /
         // api.State.deinit; coroutine handles' c_stacks are freed by
         // gcFreeObject(.thread). Nothing to deinit here.
-        // C API to-close slots: owns only the index list, not the Values.
-        self.c_toclose_slots.deinit(self.alloc);
         // C library cache (c_libs): free the dupe'd path keys and the HashMap
         // backing storage. The dlopen handles themselves are intentionally NOT
         // dlclose'd — see the comment on the `c_libs` field declaration.
@@ -6756,67 +6725,6 @@ pub const Vm = struct {
     /// Pop the topmost CallFrame (the synthetic C-frame pushed by
     /// `pushBuiltinCFrame`). Called via `defer` after the builtin call
     /// completes. Restores bc_stack_top to the C-frame's func_slot.
-    /// P15.83c FIX B: Snapshot TBC values from c_stack into the C-frame's
-    /// `clsret_state` field (pcall_error_close mode, CIST_CLSRET NOT set)
-    /// before c_stack is freed on yield.
-    ///
-    /// In PUC Lua, TBC vars live on the shared L->stack and survive across
-    /// yields naturally — `luaF_close(L, func, status, 1)` in `finishpcallk`
-    /// can access them on resume. In luazig, c_stack is per-C-frame and freed
-    /// by `callCFunction`'s errdefer when it returns `error.Yield`. This
-    /// function snapshots the TBC Values into `fr.u.c.clsret_state` (a
-    /// heap-allocated `CClsretState` in `pcall_error_close` mode, without
-    /// setting CIST_CLSRET) so `finishCcall`'s error path can close them
-    /// via CIST_CLSRET when the resumed callee errors.
-    ///
-    /// After snapshotting, `c_toclose_slots` is truncated to `toclose_base`
-    /// because the c_stack indices are about to become stale.
-    ///
-    /// Reuses `clsret_state` (already a `?*CClsretState` = 8 bytes) instead
-    /// of adding a new field to CFrameState, keeping CallFrame ≤ 104B.
-    /// CIST_CLSRET is NOT set here — it's set later by `finishCcall` when
-    /// the resumed callee errors and the TBC values need to be closed.
-    fn snapshotYieldedTbc(self: *Vm, cframe_idx: usize) void {
-        const fr = self.activeBytecodeThread().call_frames.getPtr(cframe_idx);
-        const tbc_base = fr.u.c.toclose_base;
-        if (self.c_toclose_slots.items.len <= tbc_base) return; // no TBC vars
-
-        // Collect TBC values in LIFO order (last-marked first), matching
-        // PUC's luaF_close which walks L->tbclist in stack order (most
-        // recent first via the linked list).
-        var tbc_vals: std.ArrayListUnmanaged(Value) = .empty;
-        defer tbc_vals.deinit(self.alloc);
-        while (self.c_toclose_slots.items.len > tbc_base) {
-            const tbc_idx = self.c_toclose_slots.pop().?;
-            if (tbc_idx < self.cur_c_stack.items.len) {
-                tbc_vals.append(self.alloc, self.cur_c_stack.items[tbc_idx]) catch return;
-            }
-        }
-
-        // Free any previous snapshot (can happen if k yields again after
-        // a previous yield cycle without an intervening error).
-        if (fr.u.c.clsret_state) |old| {
-            self.alloc.free(old.remaining_tbc);
-            self.alloc.free(old.results);
-            self.alloc.destroy(old);
-        }
-        const remaining_copy = self.alloc.dupe(Value, tbc_vals.items) catch return;
-        const cs = self.alloc.create(CClsretState) catch {
-            self.alloc.free(remaining_copy);
-            return;
-        };
-        cs.* = .{
-            .remaining_tbc = remaining_copy,
-            .results = &[_]Value{},
-            .mode = .pcall_error_close,
-            .error_value = null, // set by finishCcall on resume-error
-            .error_status = 0,
-        };
-        fr.u.c.clsret_state = cs;
-        // CIST_CLSRET is NOT set — finishCcall detects the snapshot via
-        // clsret_state != null && !isClsret() && isYpcall() && recst != 0.
-    }
-
     fn popBuiltinCFrame(self: *Vm) void {
         const th = self.activeBytecodeThread();
         const cur_len = th.call_frames.len();
@@ -6825,17 +6733,16 @@ pub const Vm = struct {
             // P15.80: Free heap-allocated state before shrinking.
             // Without this, the pointer is lost and the allocation leaks.
             if (frame.isC()) self.freeCFrameOwnedState(frame);
-            // P15.83c FIX A: Truncate c_toclose_slots to the popped frame's
-            // toclose_base. On normal return, callCFunction already closed
-            // and popped all TBC slots before calling popBuiltinCFrame. On
-            // error (non-YPCALL), the TBC slots are stale (their c_stack
-            // indices point into the freed c_stack) and must be truncated
-            // to prevent use-after-free. This mirrors PUC's per-CallInfo
-            // TBC scope: when a CallInfo is popped, its TBC vars are gone.
+            // P16.30 Stage C: the per-thread TBC chain replaced the
+            // per-C-frame c_toclose_slots truncation. Builtin frames are
+            // pushed directly (never via callCFunction), so user C code
+            // can never lua_toclose-mark them — a leftover chain entry
+            // owned by this frame would be a bug (marks only ever land on
+            // the topmost C activation, which is always a callCFunction
+            // frame while user C code runs).
             if (frame.isC()) {
-                const tbc_base = frame.u.c.toclose_base;
-                if (self.c_toclose_slots.items.len > tbc_base) {
-                    self.c_toclose_slots.shrinkRetainingCapacity(tbc_base);
+                if (std.debug.runtime_safety) {
+                    std.debug.assert(!threadHasCFrameTbcEntries(th, cur_len - 1));
                 }
             }
             self.bc_stack_top = frame.func_slot;
@@ -10688,12 +10595,12 @@ pub const Vm = struct {
     /// In both cases `CIST_YPCALL` is cleared and `L->errfunc` is restored
     /// from `ci->u.c.old_errfunc` (saved at pcallk entry).
     ///
-    /// P15.83c FIX B: C-frame TBC close (`luaF_close`) is handled by the
-    /// CIST_CLSRET path in `finishCcall` (TBC values pre-collected by
-    /// `callCFunction`'s error path before c_stack is restored). When
-    /// `finishpcallk` is called, CIST_CLSRET is NOT set — meaning either
-    /// there were no C-frame TBC variables, or they were already closed by
-    /// the CLSRET path. So `finishpcallk` does NOT need to close TBC vars.
+    /// P16.30 Stage C: the callee-region TBC close (PUC
+    /// `luaF_close(func, status, yy=1)` here) is handled by `precover`'s
+    /// frame-pop loop, which closes each popped C frame's chain entries
+    /// (yieldable, with the error) BEFORE the recovery frame's k runs —
+    /// same set, same order, same error argument. The frame's OWN entries
+    /// close later, at the k-return return_close in `finishCcall`.
     fn finishpcallk(self: *Vm, th: *Thread) i32 {
         const th_bc = &th.call_frames;
         const fr = th_bc.getPtr(th_bc.len() - 1);
@@ -10712,21 +10619,18 @@ pub const Vm = struct {
             const funcidx = fr.u.c.aux.funcidx;
             // PUC: L->allowhook = getoah(ci)
             th.allowhook = getoah(fr.callstatus);
-            // P15.83c FIX B: C-frame TBC close (luaF_close) is handled by
-            // the CIST_CLSRET path in finishCcall. When finishpcallk is
-            // called, CIST_CLSRET is NOT set (no TBC to close, or already
-            // closed). Lua-frame TBC variables are closed by the bytecode
-            // dispatch loop's error unwinding path (beginBytecodeClose)
-            // before precover is called.
-            // PUC: luaD_seterrorobj(L, status, func) — place error object at
-            // func on the stack. The error object is in self.err_obj.
-            // luazig: place the error object on bc_stack at funcidx so k can
-            // read it via lua_tovalue(L, 1) etc. (c_stack is set up by
-            // finishCcall before calling k).
+            // PUC: luaD_seterrorobj(L, status, func) — move the error
+            // object to the CALLEE's slot and truncate just above it, so k
+            // sees [own args..., error] (PUC: L->top = func + 1). The
+            // frame's c_stack (with its args) was installed as cur_c_stack
+            // by finishCcall's k path before calling finishpcallk; the
+            // callee-region TBC entries were already closed by precover's
+            // frame-pop loop (PUC closes them in finishpcallk's
+            // luaF_close(func, status, yy=1) — same set, same order).
             if (self.err_has_obj) {
-                if (funcidx < self.bc_stack.len) {
-                    self.bc_stack[funcidx] = self.err_obj;
-                    self.bc_stack_top = funcidx + 1;
+                if (funcidx <= self.cur_c_stack.items.len) {
+                    self.cur_c_stack.shrinkRetainingCapacity(funcidx);
+                    self.cur_c_stack.append(self.alloc, self.err_obj) catch {};
                 }
             }
             // PUC: luaD_shrinkstack(L)
@@ -10773,8 +10677,21 @@ pub const Vm = struct {
     /// drive loop. The drive loop will see the C-frame on top and call
     /// `finishCcall` → `finishpcallk` → k to complete error recovery.
     ///
+    /// P16.30 Stage C: each popped C frame's TBC chain entries close HERE,
+    /// with the in-flight error, yieldably (PUC closes the callee region's
+    /// entries in `finishpcallk`'s `luaF_close(func, status, yy=1)` — the
+    /// same set of entries, same order, same error argument; a yielding
+    /// closer suspends the recovery: the frame stays unpopped with
+    /// CIST_CLSRET (error_escape), the next resume completes the close via
+    /// `finishCcall`'s CLSRET path, re-raises the error, and the resume
+    /// machinery re-drives `precover` to finish the recovery). The popped
+    /// frames are parked (suspended across the yield/error), so their slot
+    /// values are read from their parked stacks.
+    ///
     /// Returns `true` if recovered (CIST_YPCALL frame found), `false` if not.
-    fn precover(self: *Vm, th: *Thread) bool {
+    /// Returns `error.Yield` when a closer yields mid-recovery (the caller
+    /// suspends; recovery resumes on the next resume).
+    fn precover(self: *Vm, th: *Thread) DispatchError!bool {
         const ci_idx = self.findpcall(th) orelse {
             return false;
         };
@@ -10782,10 +10699,11 @@ pub const Vm = struct {
         // Pop all frames above the CIST_YPCALL frame. This mirrors PUC's
         // `L->ci = ci` which effectively discards all CallInfo records above
         // the recovery point. In luazig, the frames above may include Lua
-        // frames from the errored callee — they are unwound here.
-        // P15.81: Free heap-allocated testc_state on any C-frames being
-        // popped, preventing leaks when precover discards a testcContShim
-        // C-frame (e.g., error from __close during TBC close).
+        // frames from the errored callee — they are unwound here (their TBC
+        // registers were already closed by the bytecode error unwind).
+        // P16.30 Stage C: close each popped C frame's TBC chain entries
+        // first (see the doc comment above). Top-down, so each frame's
+        // entries are the chain's top block when reached.
         {
             var fi: usize = th.call_frames.len();
             var removed_c: u32 = 0; // P16.27 T0.1: bulk accounting
@@ -10793,6 +10711,9 @@ pub const Vm = struct {
                 fi -= 1;
                 const f = th.call_frames.getPtr(fi);
                 if (f.isC()) {
+                    const err_arg: ?Value = if (self.err_has_obj) self.err_obj else null;
+                    const err_status: i32 = if (self.err_is_errerr) 5 else 2;
+                    _ = try self.closeCFrameTbcEntries(th, fi, err_arg, err_status, true, &.{});
                     self.freeCFrameOwnedState(f);
                     removed_c += 1;
                 }
@@ -10846,121 +10767,77 @@ pub const Vm = struct {
         const th_bc = &th.call_frames;
         const fr = th_bc.getPtr(th_bc.len() - 1);
         std.debug.assert(fr.isC());
+        const my_idx = th_bc.len() - 1;
 
-        // P15.83c FIX B: status variable visible across CLSRET and k paths.
-        // For pcall_error_close, the CLSRET completion sets status and falls
-        // through to the k invocation below.
-        var status: i32 = 1; // LUA_YIELD (default for plain yield)
-        var skip_finishpcallk = false;
-
-        // P15.83c FIX B: Resume-error with yield-snapshotted TBC values.
-        // When a yieldable pcall's C-frame has `clsret_state` (TBC Values
-        // snapshotted from c_stack at yield time, pcall_error_close mode,
-        // CIST_CLSRET NOT set) and the resumed callee errored (CIST_RECST
-        // has an error status), we must close those TBC Values before
-        // completing finishpcallk. This mirrors PUC's
-        // `luaF_close(L, func, status, 1)` in `finishpcallk`.
-        //
-        // Set CIST_CLSRET so the close loop below picks up the clsret_state,
-        // set the error value, then fall through to the CLSRET close loop.
-        if (!fr.isClsret() and fr.isYpcall() and fr.u.c.clsret_state != null) {
-            const recst = getcistrecst(fr.callstatus);
-            if (recst != 0) { // error status (not LUA_OK)
-                const cs = fr.u.c.clsret_state.?;
-                // Set the error value from the current error state.
-                cs.error_value = if (self.err_has_obj) self.err_obj else .Nil;
-                fr.setClsret();
-                // Fall through to the CLSRET close loop below.
-            } else {
-                // Normal yield resume (no error): the pcall succeeded.
-                // Free the yield-snapshotted TBC values — they don't need
-                // to be closed. This mirrors PUC where TBC vars survive
-                // naturally on L->stack and are closed later by lua_closeslot
-                // or normal return.
-                const cs = fr.u.c.clsret_state.?;
-                self.alloc.free(cs.remaining_tbc);
-                self.alloc.destroy(cs);
-                fr.u.c.clsret_state = null;
-            }
-        }
-
-        // CIST_CLSRET: TBC close yielded mid-way (return_close mode) OR
-        // C-frame TBC pre-collected for pcallk error recovery (pcall_error_close
-        // mode). Continue closing remaining TBC values from the saved
-        // CClsretState on the C-frame.
+        // (1) CIST_CLSRET: a TBC close suspended mid-way (return_close or
+        // error_escape — PUC: luaF_close with yy=1 hit a yielding closer).
+        // Install the frame's parked c_stack (the close operates on LIVE
+        // slots), continue closing the frame's remaining chain entries,
+        // then complete per mode.
         if (fr.isClsret()) {
             const cs = fr.u.c.clsret_state orelse {
                 // Should never happen: CIST_CLSRET without clsret_state.
                 return error.RuntimeError;
             };
-            // Run closers LIFO. The err_arg passed to __close depends on mode:
-            // - return_close: null (no error, normal return close)
-            // - pcall_error_close: cs.error_value (the current error object,
-            //   PUC luaF_close passes the error to __close as 2nd arg)
-            var ci: usize = 0;
-            while (ci < cs.remaining_tbc.len) {
-                const err_arg: ?Value = switch (cs.mode) {
-                    .return_close => null,
-                    .pcall_error_close => cs.error_value,
-                };
-                self.runCloseMetamethod(cs.remaining_tbc[ci], err_arg) catch |e| switch (e) {
-                    error.Yield => {
-                        // __close yielded again. Update remaining_tbc to
-                        // skip the closed value. C-frame stays with CIST_CLSRET.
-                        const remaining = cs.remaining_tbc[ci + 1 ..];
-                        if (remaining.len == 0) {
-                            self.alloc.free(cs.remaining_tbc);
-                            cs.remaining_tbc = &[_]Value{};
-                        } else {
-                            const new_remaining = self.alloc.dupe(Value, remaining) catch return error.OutOfMemory;
-                            self.alloc.free(cs.remaining_tbc);
-                            cs.remaining_tbc = new_remaining;
-                        }
-                        return error.Yield;
-                    },
-                    else => {
-                        if (cs.mode == .pcall_error_close) {
-                            // PUC luaF_close: __close errored during error
-                            // unwinding. The new error replaces the old error
-                            // value (LIFO, last-error-wins). Continue closing
-                            // remaining TBC vars. self.err_obj is already the
-                            // new error (set by fail() inside runCloseMetamethod).
-                            cs.error_value = self.err_obj;
-                            cs.error_status = 2; // LUA_ERRRUN
-                            // Continue closing remaining TBC vars.
-                        } else {
-                            // return_close: __close errored. Free clsret_state
-                            // and propagate the error.
-                            self.alloc.free(cs.remaining_tbc);
-                            self.alloc.free(cs.results);
-                            self.alloc.destroy(cs);
-                            fr.u.c.clsret_state = null;
-                            return e;
-                        }
-                    },
-                };
-                ci += 1;
+            // Save the outer (resumer's) c_stack view; install the frame's.
+            const saved_c_stack = self.cur_c_stack.*;
+            if (fr.u.c.parked_stack) |p| {
+                self.cur_c_stack.* = p.*;
+                self.alloc.destroy(p);
+                fr.u.c.parked_stack = null;
+            } else {
+                // No parked stack (testC continuation frames never park —
+                // defensive fresh empty).
+                self.cur_c_stack.* = .empty;
             }
-            // All closers done. Mode-specific completion.
+            var stack_installed = true;
+            errdefer if (stack_installed) {
+                self.cur_c_stack.deinit(self.alloc);
+                self.cur_c_stack.* = saved_c_stack;
+            };
+
+            // The err argument for the remaining closers depends on the
+            // mode: return_close → null (no error); error_escape → the
+            // preserved error object (PUC luaF_close passes the in-flight
+            // error to each closer as the 2nd argument).
+            const err_arg: ?Value = switch (cs.mode) {
+                .return_close => null,
+                .error_escape => cs.error_value,
+            };
+            const final_err = self.closeCFrameTbcEntries(th, my_idx, err_arg, cs.error_status, true, cs.results) catch |e| switch (e) {
+                error.Yield => {
+                    // A closer yielded again: the workhorse updated
+                    // clsret_state in place. Re-park the frame's stack and
+                    // suspend (the frame stays with CIST_CLSRET).
+                    self.parkCStack(fr, saved_c_stack) catch return error.OutOfMemory;
+                    stack_installed = false;
+                    return error.Yield;
+                },
+                else => return e,
+            };
+            // All closers done — mode-specific completion.
             switch (cs.mode) {
                 .return_close => {
-                    // Free remaining_tbc, extract results.
-                    self.alloc.free(cs.remaining_tbc);
+                    // Deliver the saved C-function results (they were
+                    // preserved across the suspension). The frame pops via
+                    // poscallCFrame in the caller.
                     const saved_results = cs.results;
                     self.alloc.destroy(cs);
                     fr.u.c.clsret_state = null;
                     fr.clearClsret();
-
-                    // DON'T pop C-frame here — poscallCFrame (called by the
-                    // trampoline after finishCcall returns) will pop it.
-                    // Put results in resume_inbox for the Lua frame to pick up.
+                    // The frame's stack dies here: its slots are all
+                    // closed/nil. Restore the outer view.
+                    self.cur_c_stack.deinit(self.alloc);
+                    self.cur_c_stack.* = saved_c_stack;
+                    stack_installed = false;
                     if (saved_results.len > 0) {
-                        if (th.resume_inbox.slice()) |old| self.alloc.free(old);
                         th.resume_inbox.setOwned(self.alloc, saved_results);
                     } else {
-                        self.alloc.free(saved_results);
+                        self.alloc.free(saved_results); // no-op for empty
+                        th.resume_inbox.deinit(self.alloc); // clear stale values
                     }
-                    // Set isHookYield on the Lua frame below so OP_CALL uses resume_inbox.
+                    // Set isHookYield on the Lua frame below so OP_CALL
+                    // consumes resume_inbox instead of re-calling.
                     {
                         var fi: usize = th_bc.len();
                         while (fi > 0) {
@@ -10975,76 +10852,78 @@ pub const Vm = struct {
                     }
                     return @intCast(saved_results.len);
                 },
-                .pcall_error_close => {
-                    // P15.83c FIX B: Complete finishpcallk's error path.
-                    // All C-frame TBC closers have run. Place the final error
-                    // object at funcidx, clear recovery flags, restore
-                    // allowhook/errfunc, then fall through to k invocation
-                    // with the error status.
-                    const funcidx = fr.u.c.aux.funcidx;
-                    // The final error value: if a closer errored, cs.error_value
-                    // was updated (last-error-wins). Otherwise, cs.error_value
-                    // is the original error (set by callCFunction).
-                    const final_err = cs.error_value orelse (if (self.err_has_obj) self.err_obj else .Nil);
-                    self.err_obj = final_err;
+                .error_escape => {
+                    // Re-raise the preserved error: restore the VM error
+                    // state and return error.RuntimeError. The caller
+                    // (resume/unroll error path) re-drives precover, which
+                    // pops this frame (its entries are all closed now) and
+                    // continues the recovery. PUC: the closeprotected error
+                    // propagates out of the recovery.
+                    const fe = final_err orelse cs.error_value orelse .Nil;
+                    self.err_obj = fe;
                     self.err_has_obj = true;
-                    // Determine the final error status:
-                    // - If a closer errored, cs.error_status is 2 (LUA_ERRRUN).
-                    // - Otherwise, use CIST_RECST (set by precover: 2 or 5).
-                    const final_status: i32 = if (cs.error_status != 0)
-                        cs.error_status
-                    else
-                        @intCast(getcistrecst(fr.callstatus));
-                    // PUC: luaD_seterrorobj(L, status, func) — place error at funcidx.
-                    if (funcidx < self.bc_stack.len) {
-                        self.bc_stack[funcidx] = final_err;
-                        self.bc_stack_top = funcidx + 1;
-                    }
-                    // PUC: luaD_shrinkstack(L)
-                    self.shrinkBcStack();
-                    // PUC: setcistrecst(ci, LUA_OK) — clear saved status.
-                    fr.callstatus = setcistrecst(fr.callstatus, 0);
-                    // PUC: L->allowhook = getoah(ci) — restore allowhook.
-                    th.allowhook = getoah(fr.callstatus);
-                    // PUC: ci->callstatus &= ~CIST_YPCALL
-                    fr.clearYpcall();
-                    // Clear CIST_CLSRET (close complete).
-                    fr.clearClsret();
-                    // PUC: L->errfunc = ci->u.c.old_errfunc
-                    th.errfunc = fr.u.c.old_errfunc;
-                    // Free clsret_state (remaining_tbc already freed above,
-                    // results is &.{} for pcall_error_close).
+                    self.err = if (fe == .String) fe.String.bytes() else null;
+                    self.err_source = null;
+                    self.err_line = -1;
+                    self.err_is_errerr = cs.error_status == 5;
                     self.alloc.destroy(cs);
                     fr.u.c.clsret_state = null;
-                    // Set status for k invocation and skip finishpcallk
-                    // (already completed above).
-                    status = final_status;
-                    skip_finishpcallk = true;
-                    // Fall through to k invocation below.
+                    fr.clearClsret();
+                    self.cur_c_stack.deinit(self.alloc);
+                    self.cur_c_stack.* = saved_c_stack;
+                    stack_installed = false;
+                    // Frame stays (unpopped): the error machinery pops it.
+                    return error.RuntimeError;
                 },
             }
         }
 
-        // PUC: status = LUA_YIELD (1). APIstatus(LUA_YIELD) = LUA_YIELD (1)
-        // — APIstatus is a no-op (llimits.h:50: cast_int(st)). k receives
-        // LUA_YIELD for a plain yield resume.
-        // If CIST_YPCALL and error occurred, finishpcallk returns the error
-        // status, and APIstatus passes it through (non-YIELD statuses are
-        // passed as-is).
-        // P15.83c FIX B: `status` and `skip_finishpcallk` are declared above
-        // the CLSRET block so pcall_error_close completion can set them and
-        // fall through to the k invocation here.
-        const kf = fr.u.c.k;
-
-        // PUC: if CIST_YPCALL, status = finishpcallk(L, ci).
-        // finishpcallk restores allowhook/errfunc, handles TBC close and
-        // error-object placement, clears CIST_YPCALL, and returns the status
-        // to pass to k (LUA_YIELD for plain yield, error status for errors).
-        // P15.83c FIX B: Skip finishpcallk if pcall_error_close already
-        // completed it in the CLSRET path above.
-        if (!skip_finishpcallk and fr.isYpcall()) {
-            status = self.finishpcallk(th);
+        // (2) Continuation path: install the frame's c_stack. A real
+        // C-frame suspended across a yield or an in-flight error has its
+        // c_stack PARKED on the frame (PUC: the stack lives on the shared
+        // L->stack and survives naturally); testC continuation frames
+        // never park — they get a fresh empty stack (testcContShim
+        // reconstructs its own stack from testc_state + resume_inbox).
+        const saved_c_stack = self.cur_c_stack.*;
+        if (fr.u.c.parked_stack) |p| {
+            self.cur_c_stack.* = p.*;
+            self.alloc.destroy(p);
+            fr.u.c.parked_stack = null;
+        } else {
+            self.cur_c_stack.* = .empty;
         }
+        var stack_installed = true;
+        errdefer if (stack_installed) {
+            self.cur_c_stack.deinit(self.alloc);
+            self.cur_c_stack.* = saved_c_stack;
+        };
+
+        // PUC: status = LUA_YIELD (1) for a plain yield resume. If
+        // CIST_YPCALL, finishpcallk restores allowhook/errfunc, places
+        // the error object on the frame's stack (at the callee's slot,
+        // truncating above it — k sees [own args..., error]), clears
+        // CIST_YPCALL, and returns the status to pass to k.
+        var status: i32 = 1; // LUA_YIELD
+        if (fr.isYpcall()) {
+            status = self.finishpcallk(th);
+            // testC continuation frames (testc_state != null) reconstruct
+            // their stack in testcContShim as [stack_prefix..., error] —
+            // the error object must sit at c_stack[0] (the shim's
+            // long-standing contract). finishpcallk's funcidx-relative
+            // placement cannot apply to them: testC pcallk saves a
+            // bc-stack-relative funcidx (frameBase), and the frame's
+            // original stack lives in testc_state.stack_prefix, not in
+            // cur_c_stack (testC frames never park a real c_stack — the
+            // park captured by the -1 error arm below is stale/empty).
+            // Real C frames (c_api lua_pcallk: c_stack-relative funcidx,
+            // parked stack) keep finishpcallk's PUC-faithful placement.
+            if (fr.u.c.testc_state != null and status != 1 and self.err_has_obj) {
+                self.cur_c_stack.clearRetainingCapacity();
+                self.cur_c_stack.append(self.alloc, self.err_obj) catch return error.OutOfMemory;
+            }
+        }
+
+        const kf = fr.u.c.k;
 
         // PUC: adjustresults(L, LUA_MULTRET) — no-op for MULTRET.
 
@@ -11067,11 +10946,13 @@ pub const Vm = struct {
         // In vendored Lua 5.5, LUA_YIELD == 1 and is passed as-is to k.
         if (kf) |k| {
             // Continuation invocation — k runs in the existing suspended C-frame.
-            // k pushes results onto c_stack and returns the count.
+            // k pushes results onto the frame's c_stack (installed above) and
+            // returns the count.
             //
             // P15.78: k is a C function that uses the C API (c_stack).
-            // We give it a clean c_stack (swapping out the current one)
-            // so its results don't corrupt the caller's c_stack. After k
+            // The frame's own c_stack (parked at suspension time) was
+            // installed above, so k sees its own args/slots (PUC: the stack
+            // lives on the shared L->stack and survives naturally). After k
             // returns, we put the results in th.resume_inbox for the Lua
             // frame's OP_CALL to pick up via takeBytecodeResumeValues.
             //
@@ -11087,26 +10968,9 @@ pub const Vm = struct {
             // PUC ldo.c:853: n = (*kf)(L, APIstatus(status), ci->u.c.ctx)
             // APIstatus(st) = cast_int(st) — no conversion. k receives the
             // raw status: LUA_YIELD (1) for plain yield, or the error status
-            // for pcallk errors.
+            // for pcallk errors (the error object sits on the frame's
+            // c_stack at the callee's slot — placed by finishpcallk).
             const api_status: c_int = @intCast(status);
-            const saved_c_stack = self.cur_c_stack.*;
-            self.cur_c_stack.* = .empty;
-
-            // PUC: if error status (not LUA_YIELD), luaD_seterrorobj has
-            // already placed the error object on the Lua stack at func.
-            // k reads it via lua_tostring(L, 1) etc. In luazig, k uses
-            // c_stack, so we place the error object on c_stack[0] for k
-            // to read via lua_to*(L, 1). This mirrors PUC's
-            // luaD_seterrorobj(L, status, func) which sets L->top = func + 1.
-            if (status != 1) { // not LUA_YIELD — error status
-                if (self.err_has_obj) {
-                    self.cur_c_stack.append(self.alloc, self.err_obj) catch {
-                        self.cur_c_stack.deinit(self.alloc);
-                        self.cur_c_stack.* = saved_c_stack;
-                        return error.OutOfMemory;
-                    };
-                }
-            }
 
             // Store continuation params for callContShim.
             self.c_cont_k = k;
@@ -11130,11 +10994,12 @@ pub const Vm = struct {
             if (nret_signed == -3) {
                 // ThreadSwitch: a __close metamethod inside the C
                 // continuation triggered a coroutine switch. The C-frame
-                // is preserved (testc_state stays). Clean up c_stack and
+                // is preserved (testc_state stays). Park the frame's
+                // c_stack (live TBC slots survive for the next resume) and
                 // propagate ThreadSwitch so the trampoline processes the
                 // switch request.
-                self.cur_c_stack.deinit(self.alloc);
-                self.cur_c_stack.* = saved_c_stack;
+                self.parkCStack(fr, saved_c_stack) catch return error.OutOfMemory;
+                stack_installed = false;
                 return error.ThreadSwitch;
             }
 
@@ -11142,14 +11007,12 @@ pub const Vm = struct {
                 // k yielded via lua_yieldk. The yielded values are already
                 // stored in th.yielded by builtinCoroutineYield (before the
                 // _longjmp). The C-frame's k/ctx have been updated by
-                // lua_yieldk for the next resume. Clean up c_stack and leave
-                // the C-frame in place (NOT popped) so finishCcall runs again
-                // on the next resume.
-                // P15.83c FIX B: Snapshot TBC values from k's c_stack before
-                // freeing it, so they can be closed on resume-error.
-                self.snapshotYieldedTbc(th_bc.len() - 1);
-                self.cur_c_stack.deinit(self.alloc);
-                self.cur_c_stack.* = saved_c_stack;
+                // lua_yieldk for the next resume. Park the frame's c_stack
+                // (live TBC slots survive — PUC: the stack lives on
+                // L->stack) and leave the C-frame in place (NOT popped) so
+                // finishCcall runs again on the next resume.
+                self.parkCStack(fr, saved_c_stack) catch return error.OutOfMemory;
+                stack_installed = false;
                 return error.Yield;
             }
 
@@ -11160,8 +11023,12 @@ pub const Vm = struct {
                 // err_obj directly without going through c_error_value).
                 // Don't overwrite err_obj if c_error_value is null — the
                 // error builtin may have already set it.
-                self.cur_c_stack.deinit(self.alloc);
-                self.cur_c_stack.* = saved_c_stack;
+                // Park the frame's c_stack: the frame stays for the error
+                // machinery — precover pops it, closing its TBC entries
+                // with this error (PUC: the entries close at the pcall
+                // boundary via luaF_close).
+                self.parkCStack(fr, saved_c_stack) catch return error.OutOfMemory;
+                stack_installed = false;
                 if (self.c_error_value) |cv| {
                     self.c_error_value = null;
                     self.err_obj = cv;
@@ -11181,28 +11048,63 @@ pub const Vm = struct {
                 return error.RuntimeError;
             }
 
-            // Normal return: collect results from c_stack into resume_inbox.
+            // Normal return: collect k's results from the frame's c_stack.
             const n: i32 = nret_signed;
             const n_usize: usize = @intCast(@max(n, 0));
+            var results: []Value = &.{};
+            var results_owned = false;
             if (n_usize > 0) {
                 const c_top = self.cur_c_stack.items.len;
                 const src_start = if (c_top >= n_usize) c_top - n_usize else 0;
                 const actual_n = if (c_top >= n_usize) n_usize else c_top;
-                const results = self.alloc.alloc(Value, actual_n) catch {
-                    self.cur_c_stack.deinit(self.alloc);
-                    self.cur_c_stack.* = saved_c_stack;
-                    return error.OutOfMemory;
-                };
+                results = self.alloc.alloc(Value, actual_n) catch return error.OutOfMemory;
+                results_owned = true;
                 for (0..actual_n) |i| {
                     results[i] = self.cur_c_stack.items[src_start + i];
                 }
+            }
+            errdefer if (results_owned) self.alloc.free(results);
+
+            // P16.30 Stage C: the frame's own TBC chain entries close at
+            // this return (PUC moveresults → luaF_close(ci->func,
+            // CLOSEKTOP, yy=1) — yieldable; the results are preserved in
+            // the CClsretState if a closer yields).
+            if (threadHasCFrameTbcEntries(th, my_idx)) {
+                const final_err = self.closeCFrameTbcEntries(th, my_idx, null, 0, true, results) catch |e| switch (e) {
+                    error.Yield => {
+                        // A closer yielded: clsret_state (with the saved
+                        // results) is installed on the frame. Park the
+                        // frame's c_stack and suspend (frame NOT popped).
+                        self.parkCStack(fr, saved_c_stack) catch return error.OutOfMemory;
+                        stack_installed = false;
+                        results_owned = false; // owned by clsret_state now
+                        return error.Yield;
+                    },
+                    else => return e,
+                };
+                if (final_err != null) {
+                    // A closer errored: the remaining entries were closed
+                    // with the new error (last-error-wins; err_obj was set
+                    // by fail()). PUC: the error escapes to the pcall
+                    // boundary. Park the frame (it stays for the error
+                    // machinery) and propagate.
+                    self.parkCStack(fr, saved_c_stack) catch return error.OutOfMemory;
+                    stack_installed = false;
+                    return error.RuntimeError;
+                }
+            }
+
+            // Deliver: results → resume_inbox; the frame's stack dies here
+            // (its TBC slots are all closed/nil). Restore the outer view.
+            if (results.len > 0) {
                 th.resume_inbox.setOwned(self.alloc, results);
+                results_owned = false;
             } else {
                 th.resume_inbox.deinit(self.alloc);
             }
-            // Restore c_stack
             self.cur_c_stack.deinit(self.alloc);
             self.cur_c_stack.* = saved_c_stack;
+            stack_installed = false;
             // Set isHookYield on the Lua frame below the C-frame so the
             // OP_CALL dispatch uses resume_inbox values instead of re-calling.
             // P15.78: Skip stale C-frames (testc_state=null, k=testcContShim)
@@ -11232,23 +11134,60 @@ pub const Vm = struct {
             // builtinCoroutineResume). Set isHookYield so the OP_CALL
             // dispatch uses them instead of re-calling the C function.
             //
+            // P16.30 Stage C: the frame's own TBC chain entries close at
+            // this return (PUC moveresults → luaF_close(ci->func,
+            // CLOSEKTOP, yy=1) — yieldable). The results (the resume
+            // values) are preserved in the CClsretState if a closer
+            // yields; the inbox is replaced with the same values on
+            // completion.
+            if (threadHasCFrameTbcEntries(th, my_idx)) {
+                const ri = th.resume_inbox.slice() orelse &[_]Value{};
+                const results = try self.alloc.dupe(Value, ri);
+                var results_owned = true;
+                errdefer if (results_owned) self.alloc.free(results);
+                const final_err = self.closeCFrameTbcEntries(th, my_idx, null, 0, true, results) catch |e| switch (e) {
+                    error.Yield => {
+                        // A closer yielded: clsret_state (with the saved
+                        // results) is installed on the frame. Park the
+                        // frame's c_stack and suspend (frame NOT popped).
+                        self.parkCStack(fr, saved_c_stack) catch return error.OutOfMemory;
+                        stack_installed = false;
+                        results_owned = false; // owned by clsret_state now
+                        return error.Yield;
+                    },
+                    else => return e,
+                };
+                if (final_err != null) {
+                    // A closer errored (remaining entries were closed with
+                    // the new error — last-error-wins; err_obj was set by
+                    // fail()). Park the frame (it stays for the error
+                    // machinery) and propagate.
+                    self.parkCStack(fr, saved_c_stack) catch return error.OutOfMemory;
+                    stack_installed = false;
+                    return error.RuntimeError;
+                }
+                // Close complete: deliver the same values (replace the
+                // inbox with our owned copy — same contents).
+                th.resume_inbox.setOwned(self.alloc, results);
+                results_owned = false;
+            }
             // P15.79: If CIST_YPCALL was set (pcall C-frame) and the
             // status is an error (not LUA_YIELD), format the results as
             // pcall failure: false, error_object. finishpcallk already
-            // placed the error object on bc_stack[funcidx] and restored
-            // errfunc. We put the formatted results in resume_inbox for
-            // the caller (builtinCoroutineResume) to pick up.
+            // placed the error object on the frame's c_stack (at the
+            // callee's slot) and restored errfunc. We put the formatted
+            // results in resume_inbox for the caller (builtinCoroutineResume)
+            // to pick up.
             if (status != 1) {
                 // Error status — pcall caught the error.
                 const funcidx = fr.u.c.aux.funcidx;
-                const errv = if (funcidx < self.bc_stack.len)
-                    self.bc_stack[funcidx]
+                const errv = if (funcidx < self.cur_c_stack.items.len)
+                    self.cur_c_stack.items[funcidx]
                 else
                     self.protectedErrorValue();
                 const results = try self.alloc.alloc(Value, 2);
                 results[0] = .{ .Bool = false };
                 results[1] = errv;
-                if (th.resume_inbox.slice()) |old| self.alloc.free(old);
                 th.resume_inbox.setOwned(self.alloc, results);
                 // Set isHookYield on the Lua frame below so the OP_CALL
                 // dispatch uses resume_inbox values instead of re-calling
@@ -11267,6 +11206,9 @@ pub const Vm = struct {
                         }
                     }
                 }
+                self.cur_c_stack.deinit(self.alloc);
+                self.cur_c_stack.* = saved_c_stack;
+                stack_installed = false;
                 return 2;
             }
             // P15.82: Search for the Lua frame below ALL C-frames, not just
@@ -11284,6 +11226,9 @@ pub const Vm = struct {
                     }
                 }
             }
+            self.cur_c_stack.deinit(self.alloc);
+            self.cur_c_stack.* = saved_c_stack;
+            stack_installed = false;
             const nargs = if (th.resume_inbox.slice()) |ri| @as(i32, @intCast(ri.len)) else 0;
             return nargs;
         }
@@ -11344,17 +11289,13 @@ pub const Vm = struct {
     ///
     /// In luazig, `lua_closethread` (close_mode) must mirror this: discard
     /// C-frames (free owned state + pop) WITHOUT calling `finishCcall`/k.
-    /// The Lua-frame TBC variables are closed by the existing forced-close
+    /// P16.30 Stage C: the C frame's TBC chain entries are closed by the
+    /// CALLER (`closeAndDiscardCFrame`) before this runs — the chain, not
+    /// the CallInfo, carries the close obligation (PUC tbclist). The
+    /// Lua-frame TBC variables are closed by the existing forced-close
     /// unwind (`appendBytecodeForcedCloseUnwind` in `runBytecodeInternal`'s
     /// `resume_in_place and close_mode` branch), which runs `__close` for
     /// each Lua frame's TBC variables.
-    ///
-    /// C-frame TBC (`clsret_state.remaining_tbc`): PUC closes these via
-    /// `luaF_close` which traverses the stack's `tbclist`. In luazig, these
-    /// TBC values are stored in `clsret_state`, not on the Lua stack. They
-    /// are freed (not closed) here — a deviation for the rare pcallk-error-
-    /// recovery-with-TBC case. The common case (Lua-level TBC in Lua frames)
-    /// is handled correctly by the forced-close unwind.
     fn discardCFrame(self: *Vm, th: *Thread) void {
         const th_bc = &th.call_frames;
         const cur_len = th_bc.len();
@@ -11538,7 +11479,7 @@ pub const Vm = struct {
                                     // loop — finishCcall will handle it via
                                     // finishpcallk → k. This mirrors the
                                     // runClosure RuntimeError path below.
-                                    if (self.precover(active)) {
+                                    if (try self.precover(active)) {
                                         continue :drive;
                                     }
                                     // Not recovered: unrecoverable error
@@ -11598,7 +11539,7 @@ pub const Vm = struct {
                                 // save the error status, pop frames above it, and
                                 // continue the drive loop — the C-frame on top will
                                 // be handled by finishCcall → finishpcallk → k.
-                                if (self.precover(active)) {
+                                if (try self.precover(active)) {
                                     // Recovered: continue the drive loop. The
                                     // C-frame with CIST_YPCALL is on top;
                                     // finishCcall will handle it.
@@ -11683,7 +11624,7 @@ pub const Vm = struct {
                                         error.RuntimeError => {
                                             // PUC precover: find the innermost
                                             // CIST_YPCALL frame for error recovery.
-                                            if (self.precover(active)) {
+                                            if (try self.precover(active)) {
                                                 continue :drive;
                                             }
                                             // Not recovered: unrecoverable error
@@ -12216,12 +12157,13 @@ pub const Vm = struct {
     fn appendBytecodeForcedCloseUnwind(
         self: *Vm,
         boundary_depth: usize,
+        error_value: Value,
     ) DispatchError!void {
         try self.activeBytecodeThread().bytecode_unwinds.append(self.alloc, .{
             .boundary_depth = boundary_depth,
             .target_depth = boundary_depth,
             .fault = .runtime,
-            .error_value = .Nil,
+            .error_value = error_value,
             .disposition = .propagate,
         });
     }
@@ -12265,6 +12207,26 @@ pub const Vm = struct {
                 // bc_tbc_regs to the push-time tbc_mark set by
                 // pushBuiltinCFrame.
                 if (frame.isC()) {
+                    // P16.30 Stage C (G1a): close this C frame's TBC chain
+                    // entries with the in-flight error before popping it
+                    // (PUC: the entries live on the thread-owned tbclist and
+                    // are closed by luaF_close during the unwind —
+                    // non-yieldable, last-error-wins). The frame reaches
+                    // this unwind either parked (a coroutine suspended
+                    // inside a C call, then coroutine.close driving the
+                    // forced-close transport) or active (its c_stack is
+                    // cur_c_stack) — cFrameTbcSlotValue covers both. A nil
+                    // error_value means a clean close (PUC luaE_resetthread
+                    // with LUA_OK → err=nil → __close gets 1 arg).
+                    const err_arg: ?Value = if (state.error_value == .Nil) null else state.error_value;
+                    const final_err = try self.closeCFrameTbcEntries(owner, frame_index, err_arg, 2, false, &.{});
+                    if (final_err) |fe| {
+                        // A closer errored: last-error-wins — the new error
+                        // replaces the unwind's error for the remaining
+                        // frames and the final failure reporting.
+                        state.error_value = fe;
+                        owner.bytecode_unwinds.items[state_index] = state;
+                    }
                     self.popBytecodeExecFrame(exec_frames);
                     continue;
                 }
@@ -12897,18 +12859,20 @@ pub const Vm = struct {
         // paths discard the C-frames (the pending-call re-drive re-pushes
         // fresh ones on resume, mirroring PUC's CallInfo chain rebuild), so
         // the generic pop must give C-frames the same teardown
-        // popBuiltinCFrame does: free owned heap state, drop this frame's
-        // c_toclose_slots range (its c_stack indices are about to go stale),
-        // and maintain the c_frame_count invariant — the O(1) C-frame
-        // presence checks (canParkDirectBytecodeYield, bytecodeYieldable)
-        // read that counter, and a stale count changes yieldability
-        // decisions on the suspended thread.
+        // popBuiltinCFrame does: free owned heap state and maintain the
+        // c_frame_count invariant — the O(1) C-frame presence checks
+        // (canParkDirectBytecodeYield, bytecodeYieldable) read that counter,
+        // and a stale count changes yieldability decisions on the suspended
+        // thread.
+        // P16.30 Stage C: the per-thread TBC chain replaced the per-C-frame
+        // c_toclose_slots truncation. A leftover chain entry owned by this
+        // frame would be a bug (the unwind sites close the entries before
+        // popping) — assert in debug builds.
         if (frame.isC()) {
             const th = self.activeBytecodeThread();
             self.freeCFrameOwnedState(frame);
-            const tbc_base = frame.u.c.toclose_base;
-            if (self.c_toclose_slots.items.len > tbc_base) {
-                self.c_toclose_slots.shrinkRetainingCapacity(tbc_base);
+            if (std.debug.runtime_safety) {
+                std.debug.assert(!threadHasCFrameTbcEntries(th, idx));
             }
             if (std.debug.runtime_safety) std.debug.assert(th.c_frame_count > 0);
             th.c_frame_count -= 1;
@@ -13139,6 +13103,20 @@ pub const Vm = struct {
             // precover → finishCcall → finishpcallk → k to find.
             if (frame.isC() and frame.isYpcall()) {
                 break;
+            }
+            // P16.30 Stage C: close a popped C frame's TBC chain entries
+            // (err=null, non-yieldable) before popping. This is an abort
+            // path (void errdefer — no error can propagate): closer
+            // errors/yields are swallowed (a yield attempt is an error in a
+            // non-yieldable close; the workhorse converts it). The frames
+            // here are parked or top-active — cFrameTbcSlotValue covers
+            // both.
+            if (frame.isC()) {
+                const th = self.activeBytecodeThread();
+                const cf_idx = exec_frames.len() - 1;
+                if (threadHasCFrameTbcEntries(th, cf_idx)) {
+                    _ = self.closeCFrameTbcEntries(th, cf_idx, null, 0, false, &.{}) catch {};
+                }
             }
             if (!frame.isC() and frame.u.lua.hasOpenUpvalues())
                 self.closeBytecodeUpvaluesFrom(frame, 0);
@@ -13380,8 +13358,15 @@ pub const Vm = struct {
         // bytecodeUnwindDisposition that stops at CIST_YPCALL).
         if (resume_in_place and exec_thread.close_mode) {
             self.clearErrorTraceback();
-            self.restoreRuntimeErrorValue(.Nil);
-            try self.appendBytecodeForcedCloseUnwind(boundary_depth);
+            // P16.30 Stage C: the forced close starts from the thread's
+            // latched close error (PUC luaE_resetthread:
+            // luaD_closeprotected(L, 1, L->status) — a suspended thread
+            // closes with LUA_OK → nil; a thread whose C-frame discard
+            // already hit a closer error closes with the running error —
+            // last-error-wins across ALL closers, C and Lua alike).
+            const initial_err: Value = if (exec_thread.close_has_err) exec_thread.close_err else .Nil;
+            self.restoreRuntimeErrorValue(initial_err);
+            try self.appendBytecodeForcedCloseUnwind(boundary_depth, initial_err);
             switch (try self.continueBytecodeErrorUnwind(exec_frames)) {
                 .resumed => {},
                 .completed => |ret| return ret,
@@ -20546,13 +20531,39 @@ pub const Vm = struct {
                 // Abandon frames above the hook frame (C builtin frames
                 // pushed by the hook's own calls). popBuiltinCFrame frees
                 // any heap state owned by a C-frame before shrinking.
-                while (frames.len() > hi + 1) {
-                    const tf = frames.getConstPtr(frames.len() - 1);
-                    if (tf.isC()) {
-                        self.popBuiltinCFrame();
-                    } else {
-                        self.popBytecodeExecFrame(frames);
+                // P16.30 Stage C: close each abandoned C frame's TBC chain
+                // entries first (err=null — the hook yield is not an error;
+                // non-yieldable, PUC luaD_callnoyield). The final closer
+                // error is DROPPED (documented divergence: PUC closes these
+                // entries later, at the parent poscall with the eventual
+                // error; the hook-yield abandon has no error to thread —
+                // the yield proceeds with the hook's values).
+                {
+                    // Snapshot the VM error state so a closer error (which
+                    // fail() writes into it) does not leak into the
+                    // suspended thread's resume state.
+                    const saved_err_obj = self.err_obj;
+                    const saved_err_has_obj = self.err_has_obj;
+                    const saved_err = self.err;
+                    const saved_err_source = self.err_source;
+                    const saved_err_line = self.err_line;
+                    while (frames.len() > hi + 1) {
+                        const tf = frames.getConstPtr(frames.len() - 1);
+                        if (tf.isC()) {
+                            const cf_idx = frames.len() - 1;
+                            if (threadHasCFrameTbcEntries(th_bc2, cf_idx)) {
+                                _ = self.closeCFrameTbcEntries(th_bc2, cf_idx, null, 0, false, &.{}) catch {};
+                            }
+                            self.popBuiltinCFrame();
+                        } else {
+                            self.popBytecodeExecFrame(frames);
+                        }
                     }
+                    self.err_obj = saved_err_obj;
+                    self.err_has_obj = saved_err_has_obj;
+                    self.err = saved_err;
+                    self.err_source = saved_err_source;
+                    self.err_line = saved_err_line;
                 }
                 if (frames.len() >= 2) {
                     const parent_idx = hi - 1;
@@ -20884,15 +20895,50 @@ pub const Vm = struct {
             // in runBytecodeInternal's close_mode branch). We just need to
             // discard the C-frames so finishCcall/k is never called.
             if (th.close_mode) {
+                // P16.30 Stage C (G2): close each discarded C frame's TBC
+                // chain entries with the thread's close error (PUC
+                // luaE_resetthread: resetCI drops the CallInfos, then ONE
+                // luaD_closeprotected(L, 1, status) pass closes ALL TBC —
+                // non-yieldable, last-error-wins across frames). A
+                // suspended thread closes with err=nil (LUA_YIELD→LUA_OK);
+                // an error-status thread closes with its error.
+                var close_err: ?Value = if (th.close_has_err) th.close_err else null;
                 while (th.call_frames.len() > 0) {
                     const top_fr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
                     if (!top_fr.isC()) break;
-                    self.discardCFrame(th);
+                    close_err = try self.closeAndDiscardCFrame(th, close_err);
                 }
-                // If no Lua frames remain, there are no TBC variables to
-                // close — the close succeeds immediately (PUC: luaD_closeprotected
-                // with no TBC vars returns the original status).
+                if (close_err) |ce| {
+                    // A closer errored: the VM error state was set by fail()
+                    // inside the close. Latch the running error onto the
+                    // thread so the Lua-frame forced close below starts
+                    // from it (PUC: the running error flows to the remaining
+                    // closers) and the failure is reported
+                    // (forced_close_had_error mirrors the Lua-side
+                    // closer-error latch).
+                    th.close_has_err = true;
+                    th.close_err = ce;
+                    self.forced_close_had_error = true;
+                }
+                // If no Lua frames remain, there are no more TBC variables
+                // to close — the close finishes here (PUC: closeprotected
+                // returns the running status; seterrorobj on error).
                 if (th.call_frames.len() == 0) {
+                    if (close_err != null) {
+                        // A closer errored and no Lua frames remain: report
+                        // the failure (mirrors the !ok tail below).
+                        th.status = .dead;
+                        th.api_status = 2; // LUA_ERRRUN
+                        th.started = true;
+                        th.finished = true;
+                        if (want_out) {
+                            outs[0] = .{ .Bool = false };
+                            if (outs.len > 1) outs[1] = th.close_err;
+                            self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
+                        }
+                        self.clearThreadContinuationScratch(th, .{ .clear_yielded = true });
+                        return;
+                    }
                     th.status = .dead;
                     th.api_status = 0; // LUA_OK
                     th.started = true;
@@ -20907,7 +20953,9 @@ pub const Vm = struct {
                     return;
                 }
                 // Lua frames remain — set up for resume so the close_mode
-                // branch in runBytecodeInternal runs __close for TBC vars.
+                // branch in runBytecodeInternal runs __close for TBC vars
+                // (starting from the running close error latched in
+                // th.close_err, if any).
                 th.bytecode_inplace_suspended = true;
                 th.bytecode_resume_boundary = 0;
             } else {
@@ -20967,17 +21015,36 @@ pub const Vm = struct {
                             // loop process Lua frames (which runs __close via
                             // the close_mode branch in runBytecodeInternal).
                             if (th.close_mode) {
+                                // P16.30 Stage C (G2): close the discarded
+                                // C frames' TBC chain entries with the
+                                // in-flight error (PUC: one closeprotected
+                                // pass, last-error-wins), then discard.
+                                var close_err: ?Value = if (self.err_has_obj) self.err_obj else null;
                                 while (th.call_frames.len() > 0 and
                                     th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
                                 {
-                                    self.discardCFrame(th);
+                                    close_err = try self.closeAndDiscardCFrame(th, close_err);
+                                }
+                                if (close_err) |ce| {
+                                    th.close_has_err = true;
+                                    th.close_err = ce;
+                                    self.forced_close_had_error = true;
                                 }
                                 if (th.call_frames.len() == 0) {
-                                    // No Lua frames — no TBC to close.
-                                    forced_close_ok = true;
+                                    // No Lua frames — no more TBC to close.
+                                    if (close_err != null) {
+                                        // A closer errored: report the
+                                        // failure via the !ok tail (the VM
+                                        // error state was set by fail()).
+                                        ok = false;
+                                    } else {
+                                        forced_close_ok = true;
+                                    }
                                 } else {
                                     // Lua frames remain — set up for close_mode
-                                    // resume so the unroll loop runs __close.
+                                    // resume so the unroll loop runs __close
+                                    // (starting from the running close error
+                                    // latched in th.close_err, if any).
                                     th.bytecode_inplace_suspended = true;
                                     th.bytecode_resume_boundary = 0;
                                 }
@@ -20990,7 +21057,7 @@ pub const Vm = struct {
                             // frames above it, and set up for finishCcall →
                             // finishpcallk → testcContShim with error status.
                             // This mirrors PUC Lua's luaD_throw → precover chain.
-                            if (self.precover(th)) {
+                            if (try self.precover(th)) {
                                 // precover found the CIST_YPCALL C-frame.
                                 // Continue the while loop — the CIST_YPCALL
                                 // C-frame is now on top, and finishCcall will
@@ -21094,6 +21161,14 @@ pub const Vm = struct {
                 // (A) All frames popped: the last poscall left the final
                 // results in resume_inbox.
                 if (th.call_frames.len() == 0) {
+                    // P16.30 Stage C: a C-frame discard closer errored
+                    // (latched in th.close_err) — the close failed; report
+                    // via the !ok tail (the VM error state was set by
+                    // fail() inside the close).
+                    if (th.close_mode and th.close_has_err) {
+                        ok = false;
+                        break :unroll_loop;
+                    }
                     const ri = th.resume_inbox.slice() orelse &[_]Value{};
                     if (ri.len > 0) {
                         payload = try self.alloc.alloc(Value, ri.len);
@@ -21112,8 +21187,20 @@ pub const Vm = struct {
                     // C-frames WITHOUT calling k (finishCcall). PUC's resetCI
                     // drops all CallInfos; the TBC variables are closed by
                     // luaF_close (the forced-close unwind in runBytecodeInternal).
+                    // P16.30 Stage C (G2): close the frame's TBC chain entries
+                    // with the running close error (PUC: one closeprotected
+                    // pass, last-error-wins; suspended → nil) before
+                    // discarding it. The running error lives in
+                    // th.close_err/close_has_err so it threads across loop
+                    // iterations into the Lua-frame close below.
                     if (th.close_mode) {
-                        self.discardCFrame(th);
+                        const err_arg: ?Value = if (th.close_has_err) th.close_err else null;
+                        const final_err = try self.closeAndDiscardCFrame(th, err_arg);
+                        if (final_err) |ce| {
+                            th.close_has_err = true;
+                            th.close_err = ce;
+                            self.forced_close_had_error = true;
+                        }
                         continue :unroll_loop;
                     }
                     // (B) C-frame on top: run its continuation (PUC
@@ -21137,18 +21224,37 @@ pub const Vm = struct {
                             // frames (which runs __close via the close_mode
                             // branch in runBytecodeInternal).
                             if (th.close_mode) {
+                                // P16.30 Stage C (G2): close the discarded
+                                // C frames' TBC chain entries with the
+                                // in-flight error (PUC: one closeprotected
+                                // pass, last-error-wins), then discard.
+                                var close_err: ?Value = if (self.err_has_obj) self.err_obj else null;
                                 while (th.call_frames.len() > 0 and
                                     th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
                                 {
-                                    self.discardCFrame(th);
+                                    close_err = try self.closeAndDiscardCFrame(th, close_err);
+                                }
+                                if (close_err) |ce| {
+                                    th.close_has_err = true;
+                                    th.close_err = ce;
+                                    self.forced_close_had_error = true;
                                 }
                                 if (th.call_frames.len() == 0) {
-                                    // No Lua frames — no TBC to close.
-                                    forced_close_ok = true;
+                                    // No Lua frames — no more TBC to close.
+                                    if (close_err != null) {
+                                        // A closer errored: report the
+                                        // failure via the !ok tail (the VM
+                                        // error state was set by fail()).
+                                        ok = false;
+                                    } else {
+                                        forced_close_ok = true;
+                                    }
                                     break :unroll_loop;
                                 }
                                 // Lua frames remain — set up for close_mode
-                                // resume so the unroll loop runs __close.
+                                // resume so the unroll loop runs __close
+                                // (starting from the running close error
+                                // latched in th.close_err, if any).
                                 th.bytecode_inplace_suspended = true;
                                 th.bytecode_resume_boundary = 0;
                                 continue :unroll_loop;
@@ -21156,7 +21262,7 @@ pub const Vm = struct {
                             // PUC precover: re-enter unroll from the
                             // innermost CIST_YPCALL frame (finishpcallk → k
                             // with the error status).
-                            if (self.precover(th)) continue :unroll_loop;
+                            if (try self.precover(th)) continue :unroll_loop;
                             ok = false;
                             break :unroll_loop;
                         },
@@ -21197,7 +21303,7 @@ pub const Vm = struct {
                             !self.isStackOverflowRuntimeError())
                         {
                             forced_close_ok = true;
-                        } else if (self.precover(th)) {
+                        } else if (try self.precover(th)) {
                             // Recovered: the CIST_YPCALL C-frame is on top —
                             // loop back to (B) for finishpcallk → k.
                             continue :unroll_loop;
@@ -21542,6 +21648,38 @@ pub const Vm = struct {
         }
         if (th == self.main_thread) return self.fail("cannot close the main thread", .{});
         if (th.close_has_err) {
+            // P16.30 Stage C (D8): a thread that died with an in-flight C
+            // call may still carry TBC chain entries on its parked C frames
+            // (the error escaped without popping them — e.g. a yieldable
+            // callk continuation errored with no CIST_YPCALL below). PUC
+            // luaE_resetthread: luaD_closeprotected(L, 1, status) closes ALL
+            // remaining TBC with the thread's error (non-yieldable,
+            // last-error-wins) before finishing the teardown. The closers
+            // run here in the CLOSING thread's context (luazig divergence:
+            // PUC drives them on the closed thread's stack; observable only
+            // via coroutine.running() inside __close during a dead thread's
+            // cleanup).
+            var close_err: ?Value = th.close_err;
+            while (th.c_tbc_chain.items.len > 0) {
+                const entry = th.c_tbc_chain.items[th.c_tbc_chain.items.len - 1];
+                const val = self.cFrameTbcSlotValue(th, entry.cframe_idx, entry.slot_idx) orelse .Nil;
+                _ = th.c_tbc_chain.pop();
+                self.setCFrameTbcSlotNil(th, entry.cframe_idx, entry.slot_idx);
+                self.runCloseMetamethod(val, close_err) catch |e| switch (e) {
+                    error.Yield => {
+                        // Non-yieldable close (PUC luaD_callnoyield): a
+                        // yield attempt is an error — treat it as a closer
+                        // error (last-error-wins).
+                        _ = self.fail("attempt to yield across a C-call boundary", .{}) catch {};
+                        close_err = if (self.err_has_obj) self.err_obj else .Nil;
+                    },
+                    else => {
+                        // Closer error: last-error-wins, continue closing.
+                        close_err = if (self.err_has_obj) self.err_obj else .Nil;
+                    },
+                };
+            }
+            if (close_err != null) th.close_err = close_err.?;
             th.status = .dead;
             // PUC lua_closethread → resetCI → luaE_resetthread: a dead
             // thread's errfunc is cleared (a coroutine suspended inside a
@@ -24350,16 +24488,12 @@ pub const Vm = struct {
                     }
                     // P15.82: Trace per-C-frame clsret_state for GC mark
                     // phase. When CIST_CLSRET is set (TBC close yielded
-                    // during C function return), remaining_tbc and results
-                    // are heap-allocated []Value slices that must survive GC
-                    // while the C-frame is suspended across yield.
-                    // P15.83c FIX B: Also trace error_value for
-                    // pcall_error_close mode (the preserved error object
-                    // passed to __close as 2nd arg).
+                    // during C function return or error escape), results
+                    // (the saved C-function return values) and error_value
+                    // (the preserved in-flight error) are heap-allocated
+                    // Values that must survive GC while the C-frame is
+                    // suspended across yield.
                     if (fr.u.c.clsret_state) |cs| {
-                        for (cs.remaining_tbc) |v| {
-                            if (GcObject.fromValue(v) != null) try self.gcMarkValue(v);
-                        }
                         for (cs.results) |v| {
                             if (GcObject.fromValue(v) != null) try self.gcMarkValue(v);
                         }
@@ -36232,6 +36366,182 @@ pub const Vm = struct {
         // object from error(), not the annotated diagnostic message.
     }
 
+    // ------------------------------------------------------------------
+    // P16.30 Stage C: C-frame TBC chain (thread-owned, PUC L->tbclist).
+    // The chain stores (owning C-frame index, slot index into that
+    // frame's c_stack/parked_stack) pairs. Live-slot semantics: the
+    // closer always runs on the CURRENT slot value (PUC tbclist stores
+    // stack LEVELS, not values).
+    // ------------------------------------------------------------------
+
+    /// Read the CURRENT value of a TBC chain entry's slot (live-slot
+    /// semantics). The owning frame's c_stack is its `parked_stack` while
+    /// suspended across a yield / in-flight error, or `cur_c_stack` while
+    /// it is the active top C-frame. Bounds-checked; null when the slot
+    /// is out of range (defensive — the invariant guarantees validity).
+    fn cFrameTbcSlotValue(self: *Vm, th: *Thread, cframe_idx: usize, slot_idx: usize) ?Value {
+        if (cframe_idx >= th.call_frames.len()) return null;
+        const fr = th.call_frames.getPtr(cframe_idx);
+        if (!fr.isC()) return null;
+        if (fr.u.c.parked_stack) |p| {
+            if (slot_idx < p.items.len) return p.items[slot_idx];
+            return null;
+        }
+        // Active frame: only the CURRENT thread's topmost C activation
+        // has its c_stack installed as cur_c_stack. (A nested active C
+        // frame's stack lives in its caller's Zig local — unreachable
+        // here; close sites only ever touch the top active frame or
+        // parked frames, so this fallback is only hit for the top frame.)
+        if (slot_idx < self.cur_c_stack.items.len) return self.cur_c_stack.items[slot_idx];
+        return null;
+    }
+
+    /// PUC `preclose(CLOSEKTOP)` (lfunc.c): the closed slot becomes nil
+    /// immediately, BEFORE the closer runs (live-slot semantics end at
+    /// close time; a closer reading the slot via the C API sees nil).
+    fn setCFrameTbcSlotNil(self: *Vm, th: *Thread, cframe_idx: usize, slot_idx: usize) void {
+        if (cframe_idx >= th.call_frames.len()) return;
+        const fr = th.call_frames.getPtr(cframe_idx);
+        if (!fr.isC()) return;
+        if (fr.u.c.parked_stack) |p| {
+            if (slot_idx < p.items.len) p.items[slot_idx] = .Nil;
+            return;
+        }
+        if (slot_idx < self.cur_c_stack.items.len) self.cur_c_stack.items[slot_idx] = .Nil;
+    }
+
+    /// Does C-frame `cframe_idx` currently own the TOP block of the
+    /// thread's TBC chain? (A frame's entries are always contiguous and
+    /// at the chain top when it is the topmost C frame with marks —
+    /// marks only ever land on the topmost C activation, LIFO.)
+    fn threadHasCFrameTbcEntries(th: *Thread, cframe_idx: usize) bool {
+        const chain = &th.c_tbc_chain;
+        return chain.items.len > 0 and chain.items[chain.items.len - 1].cframe_idx == cframe_idx;
+    }
+
+    /// P16.30 Stage C workhorse: close all TBC chain entries owned by
+    /// C-frame `cframe_idx` (PUC `luaF_close` over a level range — the
+    /// frame's entries are the chain's top block by the LIFO invariant).
+    ///
+    /// Per entry (top-down): pop the mark, nil the slot, run `__close` on
+    /// the LIVE slot value (PUC poptbclist → preclose → callclosemethod).
+    ///
+    /// `err` / `err_status`: the in-flight error (PUC `luaF_close`'s
+    /// `status` argument): null = closing with no error (`__close` gets
+    /// 1 arg); non-null = closing over an error (`__close` gets
+    /// (obj, err)).
+    ///
+    /// `yieldable_close`: whether a closer may yield (PUC `yy` flag: the
+    /// C-return close passes yy=1 — `moveresults`; the error-escape and
+    /// thread-close sites pass yy=0 — `luaD_closeprotected`).
+    ///
+    /// `results`: for a return-close suspension, the C function's saved
+    /// results — stored into the CClsretState on yield so `finishCcall`'s
+    /// CLSRET completion can deliver them. Caller-owned unless
+    /// `error.Yield` is returned (then owned by clsret_state).
+    ///
+    /// Closer errors: last-error-wins — the new error replaces `err` and
+    /// closing CONTINUES (PUC `luaD_closeprotected` loops; the C-return
+    /// close's error escapes to the pcall boundary whose closeprotected
+    /// finishes the remaining entries with the new error — same set, same
+    /// order, same arguments). A return-close that started with no error
+    /// becomes non-yieldable after the first closer error (the remaining
+    /// entries close through the closeprotected regime, yy=0).
+    ///
+    /// Returns the FINAL error value (null when everything closed
+    /// cleanly and no incoming error). Returns `error.Yield` when a
+    /// closer yields in a yieldable close: the CClsretState (mode,
+    /// results, error state) is installed on the frame with CIST_CLSRET
+    /// set — the CALLER must park the frame's c_stack and propagate the
+    /// yield; the next resume completes the close via `finishCcall`'s
+    /// CLSRET path.
+    fn closeCFrameTbcEntries(
+        self: *Vm,
+        th: *Thread,
+        cframe_idx: usize,
+        err: ?Value,
+        err_status: i32,
+        yieldable_close: bool,
+        results: []Value,
+    ) DispatchError!?Value {
+        const chain = &th.c_tbc_chain;
+        var cur_err = err;
+        var cur_status = err_status;
+        var yieldable = yieldable_close;
+        while (threadHasCFrameTbcEntries(th, cframe_idx)) {
+            const entry = chain.items[chain.items.len - 1];
+            // Live-slot read BEFORE nil-ing (the closer gets the object).
+            const val = self.cFrameTbcSlotValue(th, entry.cframe_idx, entry.slot_idx) orelse .Nil;
+            // Pop the mark BEFORE the closer runs (PUC poptbclist): a
+            // closer error/yield must not re-close this entry.
+            _ = chain.pop();
+            self.setCFrameTbcSlotNil(th, entry.cframe_idx, entry.slot_idx);
+            self.runCloseMetamethod(val, cur_err) catch |e| switch (e) {
+                error.Yield => {
+                    if (!yieldable) {
+                        // PUC yy=0 (luaD_callnoyield): a yield attempt
+                        // across a C-call boundary is an error — treat it
+                        // like a closer error (closeprotected continues
+                        // with the new error, last-error-wins).
+                        _ = self.fail("attempt to yield across a C-call boundary", .{}) catch {};
+                        cur_err = if (self.err_has_obj) self.err_obj else .Nil;
+                        cur_status = 2; // LUA_ERRRUN
+                        continue;
+                    }
+                    // PUC yy=1: the close suspends mid-way. Install (or
+                    // update) the CClsretState; the caller parks the
+                    // frame's c_stack and propagates the yield.
+                    const fr = th.call_frames.getPtr(cframe_idx);
+                    if (fr.u.c.clsret_state) |cs| {
+                        // Resumed close yielding again — update in place
+                        // (cs.results already carries the saved results).
+                        cs.mode = if (cur_err == null) .return_close else .error_escape;
+                        cs.error_value = cur_err;
+                        cs.error_status = cur_status;
+                    } else {
+                        const cs = self.alloc.create(CClsretState) catch return error.OutOfMemory;
+                        cs.* = .{
+                            .mode = if (cur_err == null) .return_close else .error_escape,
+                            .results = results,
+                            .error_value = cur_err,
+                            .error_status = cur_status,
+                        };
+                        fr.u.c.clsret_state = cs;
+                        fr.setClsret();
+                    }
+                    return error.Yield;
+                },
+                else => {
+                    // Closer error: last-error-wins, continue closing the
+                    // remaining entries with the NEW error (self.err_obj
+                    // was set by fail() inside the metamethod call).
+                    cur_err = if (self.err_has_obj) self.err_obj else .Nil;
+                    cur_status = 2; // LUA_ERRRUN
+                    // A return-close that started clean now closes through
+                    // the error-escape regime (PUC closeprotected, yy=0).
+                    if (err == null) yieldable = false;
+                    continue;
+                },
+            };
+        }
+        return cur_err;
+    }
+
+    /// P16.30 Stage C: close a C frame's TBC chain entries NON-yieldably
+    /// (PUC `luaD_closeprotected`, yy=0 — last-error-wins, a yield
+    /// attempt is an error) and discard the frame (PUC `resetCI` — no k,
+    /// no results). Used by the thread-close discard sites. Returns the
+    /// final error so the caller can thread it into subsequent closes
+    /// and the failure reporting.
+    fn closeAndDiscardCFrame(self: *Vm, th: *Thread, err: ?Value) DispatchError!?Value {
+        const cur_len = th.call_frames.len();
+        if (cur_len == 0) return err;
+        if (!th.call_frames.getConstPtr(cur_len - 1).isC()) return err;
+        const final = try self.closeCFrameTbcEntries(th, cur_len - 1, err, 2, false, &.{});
+        self.discardCFrame(th);
+        return final;
+    }
+
     fn callUnaryMetamethod(self: *Vm, v: Value, event: TmsEvent) DispatchError!?Value {
         const mm = self.findUnaryTm(v, event) orelse return null;
         // Lua passes the operand twice for unary metamethod dispatch.
@@ -36485,7 +36795,6 @@ pub const Vm = struct {
             fr.u.c.testc_state = null;
         }
         if (fr.u.c.clsret_state) |cs| {
-            self.alloc.free(cs.remaining_tbc);
             self.alloc.free(cs.results);
             self.alloc.destroy(cs);
             fr.u.c.clsret_state = null;
@@ -36885,20 +37194,19 @@ pub const Vm = struct {
         args: []const Value,
     ) DispatchError![]Value {
         if (self.stats.enabled) self.stats.calls_c += 1; // P16.0b
-        // Swap in a fresh C-API stack holding exactly the arguments.
+        // Swap in a fresh C-API stack holding exactly the arguments
+        // (PUC: the callee's argument slots on the shared L->stack).
         const saved_stack = self.cur_c_stack.*;
         self.cur_c_stack.* = .empty;
-        // P15.82: results_owned tracks whether saved_results is owned by
-        // the C-frame (CIST_CLSRET yield) and should NOT be freed by errdefer.
-        // This flag is checked by the errdefer to prevent dangling pointer.
-        var results_owned = false;
-        errdefer {
-            if (!results_owned) {
-                // saved_results will be freed by its own errdefer below
-            }
+        // stack_parked: once the frame's c_stack is PARKED on the C-frame
+        // (yield or in-flight error), the frame owns it — the errdefer must
+        // NOT free it (PUC: the stack lives on L->stack and survives
+        // naturally across suspensions).
+        var stack_parked = false;
+        errdefer if (!stack_parked) {
             self.cur_c_stack.deinit(self.alloc);
             self.cur_c_stack.* = saved_stack;
-        }
+        };
         // Place the arguments at c_stack[0..nargs] so that lua_to*(L, 1..n)
         // resolves them via the absolute positive-index convention.
         try self.cur_c_stack.appendSlice(self.alloc, args);
@@ -36914,17 +37222,9 @@ pub const Vm = struct {
         try self.pushBuiltinCFrame(callee_val);
         // P15.82c: Save the index of THIS C-frame. Later, during TBC close,
         // nested Lua/C frames may be pushed on top (e.g. __close metamethod,
-        // coroutine.yield builtin C-frame). We must set CIST_CLSRET on OUR
-        // C-frame, not whatever frame happens to be on top after a yield.
+        // coroutine.yield builtin C-frame). We must address OUR C-frame,
+        // not whatever frame happens to be on top after a yield.
         const my_cframe_idx = self.activeBytecodeThread().call_frames.len() - 1;
-        // P15.82: Save per-C-frame TBC base. Only slots in
-        // [toclose_base, c_toclose_slots.len) belong to THIS C-frame.
-        // This mirrors PUC's per-call-info TBC scope.
-        {
-            const cur_th = self.activeBytecodeThread();
-            const cur_fr = cur_th.call_frames.getPtr(my_cframe_idx);
-            cur_fr.u.c.toclose_base = self.c_toclose_slots.items.len;
-        }
         // P15.83r (PUC ldo.c:642-656 precallC): the C CallInfo exists FIRST,
         // then `luaD_hook(L, LUA_HOOKCALL, -1, 1, narg)` fires with ar.i_ci =
         // the C activation. This covers EVERY route into callCFunction: C
@@ -36947,107 +37247,30 @@ pub const Vm = struct {
 
         if (nret_signed == -2) {
             // P15.78: `lua_yieldk` yielded. The yield values are already
-            // stored in `th.yielded` by `builtinCoroutineYield`. The C-frame
-            // stays on `call_frames` (NOT popped) so `finishCcall` can invoke
-            // k on the next resume. Restore c_stack to the caller's stack
-            // (the errdefer above handles this when we return error.Yield).
-            // The C function's c_stack (with args) is freed by the errdefer.
-            //
-            // P15.83c FIX B: Snapshot TBC values from c_stack BEFORE the
-            // errdefer frees it. In PUC, TBC vars live on the shared L->stack
-            // and survive across yields. In luazig, c_stack is per-C-frame
-            // and freed on yield, so we must preserve the TBC Values in the
-            // C-frame's `yielded_tbc` field for `finishCcall`'s error path
-            // to close them via CIST_CLSRET (pcall_error_close mode).
-            self.snapshotYieldedTbc(my_cframe_idx);
+            // stored in `th.yielded` by `builtinCoroutineYield`. Park the
+            // frame's c_stack (args + live TBC slots survive — PUC: the
+            // stack lives on the shared L->stack) and return error.Yield;
+            // the C-frame stays on `call_frames` (NOT popped) so
+            // `finishCcall` can invoke k on the next resume.
+            {
+                const cur_th = self.activeBytecodeThread();
+                const cur_fr = cur_th.call_frames.getPtr(my_cframe_idx);
+                self.parkCStack(cur_fr, saved_stack) catch return error.OutOfMemory;
+            }
+            stack_parked = true;
             return error.Yield;
         }
 
         if (nret_signed < 0) {
-            // `lua_error` was called (or error longjmp'd from lua_pcallk's
-            // yieldable path). Check if the C-frame has CIST_YPCALL set.
-            // If so, DON'T pop the C-frame — leave it in place for `precover`
-            // to find. `precover` will save the error status, then
-            // `finishCcall` → `finishpcallk` → k will handle error recovery.
-            // This mirrors PUC Lua where `luaD_call` inside `lua_pcallk`
-            // longjmps on error, leaving the CallInfo (with CIST_YPCALL) on
-            // the stack for `precover` → `unroll` → `finishCcall`.
-            const cur_th = self.activeBytecodeThread();
-            const cur_fr = cur_th.call_frames.getConstPtr(cur_th.call_frames.len() - 1);
-            if (cur_fr.isYpcall()) {
-                // CIST_YPCALL: error inside yieldable pcall. Leave C-frame in
-                // place for precover → finishCcall → finishpcallk → k.
-                // The error object may come from two sources:
-                //   1. `lua_error()` (C API) → `c_error_value` is set
-                //   2. Lua `error()` → `self.err_obj`/`self.err_has_obj` are
-                //      set by `fail()`, `c_error_value` is null
-                // Only overwrite err_obj if c_error_value is set (lua_error
-                // path); otherwise keep the existing err_obj from fail().
-                if (self.c_error_value) |errval| {
-                    self.c_error_value = null;
-                    self.err_obj = errval;
-                    self.err_has_obj = true;
-                    self.err = if (errval == .String) errval.String.bytes() else null;
-                    self.err_source = null;
-                    self.err_line = -1;
-                    self.captureErrorTraceback();
-                }
-                // P15.83c FIX B: Pre-collect C-frame TBC values BEFORE the
-                // errdefer restores c_stack. The TBC slot indices are absolute
-                // indices into THIS C-frame's c_stack, which is about to be
-                // freed by the errdefer. We must snapshot the Values now and
-                // store them in clsret_state so finishCcall's CIST_CLSRET path
-                // can close them later (after precover → finishCcall).
-                //
-                // This mirrors PUC's luaF_close(L, func, status, 1) which
-                // closes TBC vars ≥ func. In PUC, TBC vars live on the shared
-                // L->stack, so they survive across CallInfo pops. In luazig,
-                // c_stack is per-C-frame, so we must snapshot the Values.
-                {
-                    const ypcall_fr = cur_th.call_frames.getPtr(cur_th.call_frames.len() - 1);
-                    const tbc_base = ypcall_fr.u.c.toclose_base;
-                    if (self.c_toclose_slots.items.len > tbc_base) {
-                        // Collect TBC values in LIFO order (last-marked first).
-                        var tbc_vals: std.ArrayListUnmanaged(Value) = .empty;
-                        defer tbc_vals.deinit(self.alloc);
-                        while (self.c_toclose_slots.items.len > tbc_base) {
-                            const tbc_idx = self.c_toclose_slots.pop().?;
-                            if (tbc_idx < self.cur_c_stack.items.len) {
-                                tbc_vals.append(self.alloc, self.cur_c_stack.items[tbc_idx]) catch return error.OutOfMemory;
-                            }
-                        }
-                        // Allocate CClsretState in pcall_error_close mode.
-                        // error_status = 0 means "use CIST_RECST on completion"
-                        // (precover sets CIST_RECST after we return).
-                        // If a closer errors, error_status is set to 2 (LUA_ERRRUN).
-                        const remaining_copy = self.alloc.dupe(Value, tbc_vals.items) catch return error.OutOfMemory;
-                        const cs = self.alloc.create(CClsretState) catch {
-                            self.alloc.free(remaining_copy);
-                            return error.OutOfMemory;
-                        };
-                        cs.* = .{
-                            .remaining_tbc = remaining_copy,
-                            .results = &.{},
-                            .mode = .pcall_error_close,
-                            .error_value = if (self.err_has_obj) self.err_obj else null,
-                            .error_status = 0,
-                        };
-                        ypcall_fr.u.c.clsret_state = cs;
-                        ypcall_fr.setClsret();
-                    }
-                }
-                // err_obj/err_has_obj are already set by fail() for Lua errors
-                return error.RuntimeError;
-            }
-            // Not CIST_YPCALL: pop the C-frame, then fold the thrown
-            // object into the VM's normal error state.
-            self.popBuiltinCFrame();
+            // `lua_error` was called (or an error longjmp'd from lua_pcallk's
+            // yieldable path). Fold the thrown object into the VM error state
+            // first — both the YPCALL and non-YPCALL paths below need it.
             // The error may come from two sources:
             //   1. `lua_error()` (C API) → `c_error_value` is set
-            //   2. `fail()` / `builtinCoroutineYield` → `err_obj`/`err_has_obj`
-            //      are already set, `c_error_value` is null
-            // Only overwrite err_obj if c_error_value is set (lua_error path);
-            // otherwise keep the existing err_obj from fail().
+            //   2. Lua `error()` → `self.err_obj`/`self.err_has_obj` are
+            //      set by `fail()`, `c_error_value` is null
+            // Only overwrite err_obj if c_error_value is set (lua_error
+            // path); otherwise keep the existing err_obj from fail().
             if (self.c_error_value) |errval| {
                 self.c_error_value = null;
                 self.err_obj = errval;
@@ -37057,108 +37280,89 @@ pub const Vm = struct {
                 self.err_line = -1;
                 self.captureErrorTraceback();
             }
+            const cur_th = self.activeBytecodeThread();
+            const cur_fr = cur_th.call_frames.getPtr(my_cframe_idx);
+            if (cur_fr.isYpcall()) {
+                // CIST_YPCALL: error inside a yieldable pcall. Leave the
+                // C-frame in place (NOT popped) for `precover` →
+                // `finishCcall` → `finishpcallk` → k error recovery. Park
+                // the frame's c_stack: its TBC chain entries close later,
+                // at the recovery (PUC: the callee region's entries close
+                // in finishpcallk's luaF_close(func, status, yy=1) —
+                // luazig: precover's frame-pop loop closes them from the
+                // parked stack; the frame's OWN entries close at the
+                // k-return return_close).
+                self.parkCStack(cur_fr, saved_stack) catch return error.OutOfMemory;
+                stack_parked = true;
+                // err_obj/err_has_obj are already set by fail() for Lua errors
+                return error.RuntimeError;
+            }
+            // Not CIST_YPCALL: close the frame's own TBC chain entries with
+            // the error (PUC: the error escapes to the pcall boundary, whose
+            // closeprotected closes the entries with the error —
+            // last-error-wins, non-yieldable), then pop the C-frame and
+            // propagate. err_obj is already the FINAL error by construction:
+            // a closer error replaces it inside the close (fail() sets the
+            // error state), so no re-fold is needed here.
+            const err_arg: ?Value = if (self.err_has_obj) self.err_obj else null;
+            _ = try self.closeCFrameTbcEntries(cur_th, my_cframe_idx, err_arg, 2, false, &.{});
+            self.popBuiltinCFrame();
             return error.RuntimeError;
         }
 
-        // Normal return: close TBC slots (PUC luaD_poscall → luaF_close),
-        // then pop the C-frame.
-        // PUC luaF_close: close in LIFO order (last-marked first).
-        // __close CAN yield (PUC CIST_CLSRET). If __close yields, set
-        // CIST_CLSRET on the C-frame and return error.Yield so the
-        // trampoline preserves the C-frame. On resume, finishCcall sees
-        // CIST_CLSRET and continues closing.
-        //
-        // P15.82: Save results BEFORE closing TBC, because c_stack is
-        // freed by errdefer on yield. Save remaining TBC values + results
-        // in a heap-allocated CClsretState on the C-frame so finishCcall
-        // can close them on resume without needing c_stack.
-        //
-        // P15.82: Only close TBC slots belonging to THIS C-frame (using
-        // toclose_base). This mirrors PUC's per-call-info TBC scope.
+        // Normal return: extract the C function's results, close the frame's
+        // own TBC chain entries (PUC moveresults → luaF_close(ci->func,
+        // CLOSEKTOP, yy=1) — yieldable; the results are preserved in the
+        // CClsretState if a closer yields), then pop the C-frame and deliver.
         const nret: usize = if (nret_signed > 0) @intCast(nret_signed) else 0;
         const total = self.cur_c_stack.items.len;
         const result_start: usize = if (total >= nret) total - nret else 0;
         const actual_nret: usize = if (total >= nret) nret else total;
         const saved_results = try self.alloc.dupe(Value, self.cur_c_stack.items[result_start .. result_start + actual_nret]);
-        // P15.82: errdefer checks results_owned to avoid freeing
-        // saved_results when it's owned by clsret_state (CIST_CLSRET yield).
+        // results_owned: once a yielding closer's CClsretState takes the
+        // results, the errdefer must not free them.
+        var results_owned = false;
         errdefer if (!results_owned) self.alloc.free(saved_results);
 
-        // Collect TBC values belonging to THIS C-frame, in LIFO order.
-        // P15.82: Use toclose_base to only pop slots from this frame.
-        const cur_th_0 = self.activeBytecodeThread();
-        const cur_fr_0 = cur_th_0.call_frames.getPtr(my_cframe_idx);
-        const tbc_base = cur_fr_0.u.c.toclose_base;
-        var tbc_values: std.ArrayListUnmanaged(Value) = .empty;
-        defer tbc_values.deinit(self.alloc);
-        while (self.c_toclose_slots.items.len > tbc_base) {
-            const tbc_idx = self.c_toclose_slots.pop().?;
-            if (tbc_idx < self.cur_c_stack.items.len) {
-                try tbc_values.append(self.alloc, self.cur_c_stack.items[tbc_idx]);
-            }
-        }
-
-        // Close TBC values. If a closer yields, allocate CClsretState
-        // on the C-frame for finishCcall to resume.
         {
-            var ci: usize = 0;
-            while (ci < tbc_values.items.len) {
-                self.runCloseMetamethod(tbc_values.items[ci], null) catch |e| switch (e) {
+            const cur_th = self.activeBytecodeThread();
+            const cur_fr = cur_th.call_frames.getPtr(my_cframe_idx);
+            if (threadHasCFrameTbcEntries(cur_th, my_cframe_idx)) {
+                const final_err = self.closeCFrameTbcEntries(cur_th, my_cframe_idx, null, 0, true, saved_results) catch |e| switch (e) {
                     error.Yield => {
-                        // __close yielded. Allocate CClsretState to save
-                        // remaining TBC values + results. C-frame stays.
-                        const cur_th = self.activeBytecodeThread();
-                        // P15.82c: Set CIST_CLSRET on OUR C-frame
-                        // (my_cframe_idx), NOT the top frame — the top
-                        // frame may be a callBuiltin C-frame from
-                        // coroutine.yield inside the __close metamethod.
-                        const cur_fr = cur_th.call_frames.getPtr(my_cframe_idx);
-                        // P15.82: Allocate clsret_state BEFORE setClsret()
-                        // so OOM doesn't leave a half-formed C-frame.
-                        // Use clsret_owned flag so errdefer doesn't free
-                        // on `return error.Yield`.
-                        var clsret_owned = false;
-                        const remaining = tbc_values.items[ci + 1 ..];
-                        const remaining_copy = try self.alloc.dupe(Value, remaining);
-                        errdefer if (!clsret_owned) self.alloc.free(remaining_copy);
-                        const cs = try self.alloc.create(CClsretState);
-                        errdefer if (!clsret_owned) self.alloc.destroy(cs);
-                        cs.* = .{
-                            .remaining_tbc = remaining_copy,
-                            .results = saved_results,
-                        };
-                        // All allocations succeeded — now set C-frame state.
-                        cur_fr.setClsret();
-                        cur_fr.u.c.aux.nres = @intCast(nret_signed);
-                        cur_fr.u.c.clsret_state = cs;
-                        clsret_owned = true;
-                        // saved_results is now owned by clsret_state.
-                        results_owned = true;
-                        // DON'T manually restore c_stack here — the outer
-                        // errdefer handles it on `return error.Yield`.
+                        // A closer yielded: the workhorse installed a
+                        // CClsretState (with the saved results) on the
+                        // frame. Park the frame's c_stack and suspend
+                        // (frame NOT popped; finishCcall's CLSRET path
+                        // completes the close and delivers the results on
+                        // the next resume).
+                        self.parkCStack(cur_fr, saved_stack) catch return error.OutOfMemory;
+                        stack_parked = true;
+                        results_owned = true; // owned by clsret_state now
                         return error.Yield;
                     },
-                    else => {
-                        // __close errored — pop C-frame, propagate error.
-                        // saved_results is freed by errdefer (results_owned
-                        // is still false).
-                        self.popBuiltinCFrame();
-                        return e;
-                    },
+                    else => return e,
                 };
-                ci += 1;
+                if (final_err != null) {
+                    // A closer errored: the remaining entries were closed
+                    // with the new error (last-error-wins; err_obj was set
+                    // by fail() inside the close). PUC: the error escapes
+                    // to the pcall boundary. Pop the C-frame and propagate.
+                    self.popBuiltinCFrame();
+                    return error.RuntimeError;
+                }
             }
         }
 
-        // All closers done. Pop the C-frame.
+        // All closers done. Pop the C-frame and restore the caller's C-API
+        // stack view (PUC leaves the caller's `L->top`/`L->base` intact
+        // after luaD_poscall).
         self.popBuiltinCFrame();
-
-        // Restore the caller's C-API stack view (PUC leaves the caller's
-        // `L->top`/`L->base` intact after luaD_poscall).
         self.cur_c_stack.deinit(self.alloc);
         self.cur_c_stack.* = saved_stack;
         // Results were already extracted from c_stack before TBC close.
-        // Mark as owned so errdefer doesn't free them.
+        // Mark as owned so errdefer doesn't free them (ownership transfers
+        // to the caller).
         results_owned = true;
         return saved_results;
     }

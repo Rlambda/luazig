@@ -946,87 +946,98 @@ pub export fn lua_numbertocstring(L: ?*lua_State, idx: c_int, buff: [*]u8) c_uin
 // To-be-closed slots (PUC lapi.c)
 // ===========================================================================
 
-/// PUC `lua_toclose` (lapi.c:1340): mark the stack slot at `idx` for
-/// automatic closing when it goes out of scope (PUC's to-be-closed mechanism).
-/// The slot is closed by `lua_closeslot` or when the C function returns
-/// (callCFunction closes TBC slots in LIFO order on normal return, matching
-/// PUC luaD_poscall → luaF_close). If __close yields during return-path close,
-/// CIST_CLSRET is set on the C-frame and finishCcall continues closing on
-/// resume.
+/// PUC `lua_toclose` (lapi.c:1283): mark the stack slot at `idx` as a
+/// to-be-closed variable. The mark goes on the THREAD-owned TBC chain
+/// (`Thread.c_tbc_chain` — PUC `L->tbclist`), LIFO by mark order; the slot
+/// is closed by `lua_closeslot`, when the owning C function returns
+/// (callCFunction/finishCcall — PUC `moveresults` → `luaF_close`), or over
+/// an in-flight error (PUC `luaD_closeprotected`).
 ///
-/// PUC chains to-be-closed slots as a linked list on the stack
-/// (`L->ci->tbclist`). We store absolute indices in `c_toclose_slots`;
-/// duplicate marks are ignored, matching PUC's idempotent behavior.
+/// PUC api_check: the new mark must be ABOVE the chain's current top
+/// (`L->tbclist.p < o`) — within one frame's stack the marks are LIFO by
+/// slot. luazig's chain stores (owning C-frame, slot) pairs; only slots
+/// of the SAME frame are comparable, so the LIFO check is enforced
+/// within-frame (cross-frame marks live on different c_stacks and always
+/// append, exactly like PUC marks on different stack levels). Violations
+/// are lenient (ignored) instead of api_check-aborting.
 pub export fn lua_toclose(L: ?*lua_State, idx: c_int) void {
     const h = L orelse return;
     const vm = h.vm;
     const abs = normalizeIndex(idx, h.c_stack.items.len) orelse return;
-    // P15.83c FIX A: Scope the dedup scan to the current C-frame's segment
-    // [toclose_base, len). Each C-frame gets a fresh c_stack (callCFunction
-    // swaps it), so outer arg 1 and inner arg 1 are different Lua slots that
-    // collide numerically as absolute indices. Scoping the dedup to the
-    // topmost C-frame's range allows both to coexist — mirroring PUC's
-    // per-CallInfo tbclist linked list.
-    const th = vm.current_thread orelse vm.main_thread orelse {
-        // No thread: no C-frame, scan whole list (legacy fallback).
-        for (vm.c_toclose_slots.items) |s| {
-            if (s == abs) return;
-        }
-        vm.c_toclose_slots.append(vm.alloc, abs) catch {};
-        return;
-    };
+    // The mark goes on the topmost C-frame of the thread that owns the
+    // current execution (PUC: L->ci — the running C activation). While C
+    // code runs, that is always its own callCFunction frame.
+    const th = vm.current_thread orelse vm.main_thread orelse return;
     const th_bc = th.call_frames;
-    // Find the topmost C-frame to get its toclose_base. This is the
-    // activation whose segment applies — the C-frame pushed by
-    // callCFunction/callBuiltin that is currently executing.
     var fi = th_bc.len();
     while (fi > 0) {
         fi -= 1;
         const f = th_bc.getConstPtr(fi);
-        if (f.isC()) {
-            const tbc_base = f.u.c.toclose_base;
-            // Dedup: only scan slots belonging to THIS C-frame.
-            var i = vm.c_toclose_slots.items.len;
-            while (i > tbc_base) {
-                i -= 1;
-                if (vm.c_toclose_slots.items[i] == abs) return;
-            }
-            break;
+        if (!f.isC()) continue;
+        // Within-frame LIFO: a mark at or below the frame's chain top is
+        // a PUC api_check violation — lenient ignore (idempotent re-mark).
+        const chain = &th.c_tbc_chain;
+        if (chain.items.len > 0) {
+            const top = chain.items[chain.items.len - 1];
+            if (top.cframe_idx == fi and top.slot_idx >= abs) return;
         }
+        chain.append(vm.alloc, .{ .cframe_idx = fi, .slot_idx = abs }) catch {};
+        // PUC sets CIST_TBC on L->ci (the frame "has marks" hint).
+        const fmut = th.call_frames.getPtr(fi);
+        if (!fmut.isTbc()) fmut.setTbc();
+        return;
     }
-    vm.c_toclose_slots.append(vm.alloc, abs) catch {};
+    // No C-frame on this thread: PUC would api_check-fail; lenient no-op.
 }
 
-/// PUC `lua_closeslot` (lapi.c:1350): close and remove a to-be-closed slot.
-/// Invokes the `__close` metamethod on the value at `idx`, then removes the
-/// slot from the to-close list. PUC calls `lua_callvalue` for the metamethod;
-/// we use `lua_pcallk` to protect against errors in the closer.
+/// PUC `lua_closeslot` (lapi.c:206): close the to-be-closed slot at `idx`.
+/// PUC api_check: the slot must be the TOP of the thread's tbclist AND
+/// belong to the current CallInfo. Lenient: only close when the chain top
+/// is exactly (topmost C-frame of the current thread, abs).
+///
+/// PUC semantics: `luaF_close(level, CLOSEKTOP, yy=0)` — the mark is popped
+/// BEFORE the closer runs, the slot is set to nil, and `__close(obj)` is
+/// called NON-yieldably (a yield attempt there is "attempt to yield across
+/// a C-call boundary"). Errors from `__close` propagate to the caller
+/// (PUC `luaD_callnoyield` → `luaD_throw`).
 pub export fn lua_closeslot(L: ?*lua_State, idx: c_int) void {
     const h = L orelse return;
     const vm = h.vm;
     const abs = normalizeIndex(idx, h.c_stack.items.len) orelse return;
+    const th = vm.current_thread orelse vm.main_thread orelse return;
+    const th_bc = th.call_frames;
+    // The current C activation: the topmost C-frame of this thread.
+    var fi = th_bc.len();
+    while (fi > 0) {
+        fi -= 1;
+        if (th_bc.getConstPtr(fi).isC()) break;
+    }
+    if (fi == 0 and (th_bc.len() == 0 or !th_bc.getConstPtr(0).isC())) return;
+    const chain = &th.c_tbc_chain;
+    if (chain.items.len == 0) return;
+    const top = chain.items[chain.items.len - 1];
+    if (top.cframe_idx != fi or top.slot_idx != abs) return; // not the chain top
 
-    // PUC lua_closeslot (lapi.c): calls __close via luaD_call (NOT luaD_pcall).
-    // Errors from __close propagate through lua_closeslot to the caller.
-    // The caller is responsible for protecting with pcall if needed.
-    const val = h.c_stack.items[abs];
+    // Pop the mark BEFORE the closer runs (PUC poptbclist-then-close: a
+    // closer error must not re-close this entry). Ordered pop — it IS the
+    // top entry.
+    _ = chain.pop();
+    const val = if (abs < h.c_stack.items.len) h.c_stack.items[abs] else .Nil;
+    // PUC preclose(CLOSEKTOP): the closed slot becomes nil immediately.
+    if (abs < h.c_stack.items.len) h.c_stack.items[abs] = .Nil;
+
     const mm = vm.getTmByObj(val, .close) orelse {
-        removeTocloseMark(vm, abs);
+        // No __close metamethod: PUC checkclosemth raises "non-closable";
+        // the c_api lane is lenient (mark popped, slot nil — close done).
         return;
     };
 
-    // Remove the to-close mark BEFORE calling __close (PUC pops the mark
-    // first, then calls). This ensures __close won't be called again if
-    // it errors and the stack unwinds.
-    removeTocloseMark(vm, abs);
-
-    // Call __close(val) with 0 results. Errors propagate (PUC luaD_call).
-    var call_args = [_]Value{ mm, val };
+    // Call __close(val) with 0 results, non-yieldably (PUC luaD_callnoyield).
+    // Errors propagate through apiCall to the caller's pcall/error handler
+    // (PUC luaD_call → luaD_throw): push the error object and re-raise via
+    // lua_error.
+    var call_args = [_]Value{val};
     _ = vm.apiCall(.nonyieldable, mm, call_args[0..]) catch {
-        // Error propagated through apiCall. The error object is in
-        // vm.err_obj (set by callCFunction's error path). Push it onto
-        // c_stack and re-raise via lua_error so the C caller's pcall/error
-        // handler catches it (PUC: luaD_call → luaD_throw).
         if (vm.err_has_obj) {
             h.c_stack.append(vm.alloc, vm.err_obj) catch {};
         } else {
@@ -1034,16 +1045,6 @@ pub export fn lua_closeslot(L: ?*lua_State, idx: c_int) void {
         }
         _ = lua_error(L);
     };
-}
-
-/// Remove `abs` from `c_toclose_slots` if present (swap-remove for O(1)).
-fn removeTocloseMark(vm: *Vm, abs: usize) void {
-    for (vm.c_toclose_slots.items, 0..) |s, i| {
-        if (s == abs) {
-            _ = vm.c_toclose_slots.swapRemove(i);
-            return;
-        }
-    }
 }
 
 /// PUC `luaL_loadbufferx` (lauxlib.c:867-872): load a chunk from a byte

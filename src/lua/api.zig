@@ -764,11 +764,26 @@ pub const State = struct {
         const fn_idx = self.stack.items.len - nargs - 1;
         const callee = self.stack.items[fn_idx];
         const args = self.stack.items[fn_idx + 1 ..];
-        // P16.23 T6: pcall-family = DEPTH-ONLY increment. luazig's pcall
-        // continuation machinery (P15.78/P15.82) handles its own yield
-        // semantics — an nny unit here would wrongly make yield-through-
-        // pcallk impossible (c_api 10_continuations t2 regression).
-        const ret = self.vm.apiCall(.yieldable, callee, args) catch {
+        // P16.31 Cut 1 (PUC lapi.c:1095-1097 + ldo.c f_call): every caller of
+        // this method is a CONVENTIONAL pcall — lua_pcallk's `k == NULL ||
+        // !yieldable(L)` branch (c_api lua_pcallk, the lua_pcall macro,
+        // luaL_dostring/luaL_dofile) and testC's "pcall" command (ltests.c
+        // uses lua_pcall). PUC runs those through `f_call`, which calls
+        // `luaD_callnoyield` — `ccall(..., nyci)`: +1 depth AND +1 nny. A
+        // yield attempt inside therefore fails with "attempt to yield across
+        // a C-call boundary" (lua_yieldk's `!yieldable(L)` check), and the
+        // pcall catches it as an ordinary error.
+        //
+        // The old `.yieldable` here (P16.23 T6) let the yield SUCCEED at the
+        // VM level: builtinCoroutineYield parked frames and set
+        // bytecode_inplace_suspended, then this catch block swallowed
+        // error.Yield as a Nil error object — leaving the thread with a stale
+        // in-place suspension that corrupted the next runBytecodeInternal
+        // (P16.31 S0 SIGSEGV: the __close frame resumed a stale frame whose
+        // func_slot no longer held a Closure). The yieldable pcallk path
+        // (k != NULL) does NOT come through here — it uses luaPcallKShared,
+        // which owns its own `.yieldable` unit (PUC luaD_call, ccall inc=1).
+        const ret = self.vm.apiCall(.nonyieldable, callee, args) catch {
             // PUC luaD_pcall: on error, restore the stack to the base,
             // set the error object (luaD_seterrorobj), then propagate status.
             self.stack.items.len = fn_idx;

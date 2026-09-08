@@ -1,12 +1,12 @@
 {
-  "created_utc": "2026-09-05T12:06:26.818336+00:00",
+  "created_utc": "2026-09-08T20:21:33+00:00",
   "provenance": {
-    "git_head": "e77ea03",
-    "measured_source_head": "e77ea03",
+    "git_head": "829a982",
+    "measured_source_head": "4b6167b",
     "git_dirty": "clean",
     "zig_version": "0.16.0",
     "optimize_mode": "Debug+ReleaseFast",
-    "zig_binary_sha16": "6ddaadc50d545b08"
+    "zig_binary_sha16": "79235b8f5273831d"
   },
   "luazig": {
     "Debug": {
@@ -22,6 +22,38 @@
       "union_floor": 56
     }
   },
+  "fields": {
+    "common": {
+      "func_slot": { "offset": 0, "size": 8 },
+      "tbc_mark": { "offset": 8, "size": 8 },
+      "callstatus": { "offset": 16, "size": 4 },
+      "reg_top": { "offset": 20, "size": 4 },
+      "pending_call_index": { "offset": 24, "size": 4 },
+      "u": { "offset": 32, "size": 56 }
+    },
+    "u.c": {
+      "k": { "offset": 0, "size": 8 },
+      "ctx": { "offset": 8, "size": 8 },
+      "old_errfunc": { "offset": 16, "size": 8 },
+      "aux": { "offset": 24, "size": 8 },
+      "testc_state": { "offset": 32, "size": 8 },
+      "clsret_state": { "offset": 40, "size": 8 },
+      "parked_stack": { "offset": 48, "size": 8 }
+    },
+    "u.lua": {
+      "proto": { "offset": 0, "size": 8 },
+      "pc": { "offset": 8, "size": 8 },
+      "frame_cap": { "offset": 16, "size": 4 },
+      "nextraargs": { "offset": 20, "size": 2 },
+      "lua_packed_flags": { "offset": 22, "size": 1 },
+      "simple_result_dst": { "offset": 23, "size": 1 },
+      "resume_pc": { "offset": 24, "size": 4 },
+      "last_line_pc": { "offset": 28, "size": 4 },
+      "skip_line_hook_pc": { "offset": 32, "size": 4 },
+      "skip_call_hook_pc": { "offset": 36, "size": 4 },
+      "resume_skip_count_pc": { "offset": 40, "size": 4 }
+    }
+  },
   "puc": {
     "size": 64,
     "align": 8,
@@ -32,6 +64,6 @@
     "offset_u": 32,
     "offset_callstatus": 60
   },
-  "notes": "PUC CallInfo is 64 B on this ABI. luazig CallFrame is 88 B in BOTH modes at d8cc5e7 \u2014 P16.20 T1 made the layout build-mode-stable (extern struct/union; was Debug 104 vs RF 96 before), and P16.20 T3 then removed the stored `base` field (invariant base == func_slot + 1, derived via frameBase()), shrinking 96 -> 88 B and shifting every field down by 8 (func_slot 8->0, tbc_mark 16->8, activation_id 16, callstatus 28->20, reg_top 32->24, pending_call_index 36->28, u 40->32). LuaFrameState 56 B and CFrameState 56 B (equal arms, extern union, no hidden tag). luazig frames carry architecture-specific state (iterative yieldable execution, inline hook-replay PCs, simple-result continuation, activation_id); 64 B is NOT a target \u2014 the model is.",
-  "luazig_state_note": "LuaFrameState 48 B (P16.21 T2+T5), CFrameState 56 B = union floor; CallFrame 88 B."
+  "notes": "PUC CallInfo is 64 B on this ABI (gcc-measured against lua-5.5.0/src/lstate.h). luazig CallFrame is 88 B in BOTH modes \u2014 P16.20 T1 made the layout build-mode-stable (extern struct/union; was Debug 104 vs RF 96 before), and P16.20 T3 then removed the stored `base` field (invariant base == func_slot + 1, derived via frameBase()), shrinking 96 -> 88 B. P16.30 Stage C replaced `toclose_base` with `parked_stack` 8B-for-8B (suspended C-frames keep their c_stack for the thread-owned TBC chain), CallFrame stayed 88 B (comptime assert vm.zig). luazig frames carry architecture-specific state (iterative yieldable execution, inline hook-replay PCs, simple-result continuation, activation_id); 64 B is NOT a target \u2014 the model is. P16.31 T0 regeneration on P16.30-final source: all values re-measured via standalone Zig probe (Debug + ReleaseFast, identical) and gcc probe for PUC; field offsets added.",
+  "luazig_state_note": "LuaFrameState 48 B, CFrameState 56 B = union floor; CallFrame 88 B."
 }

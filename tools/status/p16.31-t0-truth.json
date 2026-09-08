@@ -1,0 +1,84 @@
+{
+  "created_utc": "2026-09-08T20:21:33+00:00",
+  "task": "P16.31 T0 \u2014 entry truth (no production source changes; artifact regeneration + audit only)",
+  "entry_hashes": {
+    "git_head": "829a982",
+    "production_source_head": "4b6167b (829a982 = 4b6167b + docs/artifacts only; no src/ changes)",
+    "git_dirty": "clean (at entry)",
+    "zig_version": "0.16.0",
+    "zig_binary": "zig-out/bin/luazig (ReleaseFast, sha16=79235b8f5273831d)",
+    "lua_c_binary": "build/lua-c/lua"
+  },
+  "gate_results": {
+    "zig_fmt_check_src": "PASS",
+    "zig_build_test_Debug": "PASS",
+    "zig_build_test_ReleaseFast": "PASS",
+    "zig_build_ReleaseFast": "PASS",
+    "testes_matrix_testc": "PASS \u2014 31/32 pass parity, zig_fail=0, both_fail=1 (big.lua, pre-existing infra), both_fail_infra=0, zig_only_pass=0",
+    "smoke_compare_no_build": "PASS \u2014 71/71",
+    "c_api_make_clean_test_test_diff": "PASS \u2014 22 suites all pass + 10 differential suites diff EMPTY; lane dirties NOTHING tracked (built binaries are gitignored; no git checkout needed)",
+    "tbc_lifecycle_22_diff_vs_puc": "EMPTY (exit 0)",
+    "api580_gate": "GREEN \u2014 Debug delta=376 B (<400), ReleaseFast delta=376 B (<400), closure executed, X/Y verified; comptime size invariants hold both modes (LuaString=48, LSTRFIX=32, Closure=40, Cell=40, Upvaldesc=16, Proto=200, CallFrame<=104, Node=32)"
+  },
+  "callframe_layout_regeneration": {
+    "file": "tools/perf/current-callframe-layout.json",
+    "previous_provenance": "stale (git_head=e77ea03)",
+    "method": "no generator script exists (hand-maintained artifact, confirmed via git log --follow and tools/ grep); values re-measured via standalone Zig probe compiled against the lua module (Debug + ReleaseFast, identical output) + gcc probe against lua-5.5.0/src/lstate.h for the PUC side",
+    "measured": {
+      "CallFrame": { "size": 88, "align": 8, "offset_u": 32 },
+      "LuaFrameState": { "size": 48, "align": 8 },
+      "CFrameState": { "size": 56, "align": 8 },
+      "build_mode_stable": true,
+      "comptime_assert": "vm.zig: @sizeOf(CallFrame)==88, @offsetOf(CallFrame,\"u\")==32, @alignOf(CallFrame)==8 (compiles in every build mode; verified by Debug+RF builds)",
+      "u_c_fields": "k@0(8), ctx@8(8), old_errfunc@16(8), aux@24(8), testc_state@32(8), clsret_state@40(8), parked_stack@48(8)",
+      "u_lua_fields": "proto@0(8), pc@8(8), frame_cap@16(4), nextraargs@20(2), lua_packed_flags@22(1), simple_result_dst@23(1), resume_pc@24(4), last_line_pc@28(4), skip_line_hook_pc@32(4), skip_call_hook_pc@36(4), resume_skip_count_pc@40(4)",
+      "puc_CallInfo": { "size": 64, "align": 8, "func@0, top@8, previous@16, next@24, u@32, callstatus@60" }
+    },
+    "new_provenance": { "git_head": "829a982", "measured_source_head": "4b6167b", "git_dirty": "clean" }
+  },
+  "known_tbc_divergences": [
+    {
+      "id": "D1",
+      "name": "hook-yield abandon drops final closer error",
+      "location": "src/lua/vm.zig:20537 (hook-yield abandon path)",
+      "description": "When a debug-hook yield abandons C frames above the hook frame, their TBC chain entries are closed non-yieldable with err=null; the FINAL closer error is dropped (PUC closes these entries later at the parent poscall with the eventual error; the hook-yield abandon has no error to thread). VM error state is snapshotted around the closes so a closer error does not leak into the suspended thread's resume state."
+    },
+    {
+      "id": "D2",
+      "name": "close-context wrong thread (builtinCoroutineClose close_has_err)",
+      "location": "src/lua/vm.zig:21658 (builtinCoroutineClose, close_has_err branch)",
+      "description": "A thread that died with an in-flight C call may carry TBC chain entries on parked C frames; coroutine.close closes them with the thread's error (non-yieldable, last-error-wins, mirroring PUC luaE_resetthread/luaD_closeprotected), but the closers run in the CLOSING thread's context instead of the closed thread's stack. Observable only via coroutine.running() inside __close during a dead thread's cleanup."
+    },
+    {
+      "id": "D3",
+      "name": "unwindBytecodeExecFrames void path swallows close errors",
+      "location": "src/lua/vm.zig:13118 (unwindBytecodeExecFrames, void errdefer abort path)",
+      "description": "The void-returning abort fallback (frame construction/dispatch aborted before a semantic unwind could start) closes popped C frames' TBC entries non-yieldable with err=null and swallows closer errors/yields via catch {} \u2014 no error can propagate from a void errdefer path. Normal runtime/OOM propagation and yielding __close continuations go through continueBytecodeErrorUnwind instead."
+    }
+  ],
+  "provenance_audit_summary": {
+    "artifact": "tools/status/p16.31-t0-provenance-audit.json",
+    "current": 6,
+    "stale_retained": 5,
+    "current_files": [
+      "tools/perf/current-callframe-layout.json (regenerated this task)",
+      "tools/perf/current-counters.json (4b6167b)",
+      "tools/perf/current-differential-profile.json (4b6167b)",
+      "tools/perf/current-profile-index.json (4b6167b)",
+      "tools/status/current-matrix.json (4b6167b)",
+      "tools/status/current-smoke.json (4b6167b)"
+    ],
+    "stale_files": [
+      "tools/perf/current-activation-id-proof.json (c79c9bf, instrumentation-only worktree)",
+      "tools/perf/current-api580-ledger.json (8f3bf6e)",
+      "tools/perf/current-fixed-load-footprint.json (4bb378b)",
+      "tools/perf/current-frame-activation-ledger.json (c79c9bf)",
+      "tools/perf/current-proto-ownership-audit.json (7e6241c)"
+    ]
+  },
+  "files_changed_this_task": [
+    "tools/perf/current-callframe-layout.json (regenerated)",
+    "tools/status/p16.31-t0-provenance-audit.json (new)",
+    "tools/status/p16.31-t0-truth.json (new)"
+  ]
+}

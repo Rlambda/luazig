@@ -133,8 +133,7 @@ pub export fn lua_close(L: ?*lua_State) void {
     const alloc = vm.alloc;
     // Free the main handle (coroutine handles are freed by GC via
     // gcFreeObject(.thread) → Thread.api_handle).
-    h.c_stack.deinit(alloc);
-    alloc.destroy(h);
+    vm.freeStateHandle(h);
     alloc.destroy(vm);
 }
 
@@ -190,8 +189,10 @@ pub export fn lua_newthread(L: ?*lua_State) ?*lua_State {
     vm.gcRegisterThread(th) catch {};
     vm.gcNoteAlloc(@sizeOf(vm_mod.Thread));
     vm.c_api_thread = th;
-    // Create the coroutine handle with its own c_stack.
-    const handle = vm.alloc.create(lua_State) catch return null;
+    // Create the coroutine handle with its own c_stack (and its
+    // LUA_EXTRASPACE extra space in front, inheriting the main thread's
+    // extra-space contents — PUC lstate.c:291-293).
+    const handle = vm.allocStateHandle(false) catch return null;
     handle.* = .{ .vm = vm, .thread = th, .is_main = false };
     th.api_handle = handle;
     // Push the thread value on the parent's c_stack (PUC pushes it on L->top).
@@ -323,13 +324,19 @@ pub export fn lua_atpanic(
     return old;
 }
 
-/// PUC `lua_getextraspace` (lua.h:lua_getextraspace): return a pointer to the
-/// per-state "extra space" — a small area before `lua_State` for very fast
-/// access by C extensions. luazig does not allocate this area (no
-/// `LUA_EXTRASPACE`), so we return `NULL`. C code must check before use.
+/// PUC `lua_getextraspace` (lua.h:391): return a pointer to the per-state
+/// "extra space" — a small raw area IN FRONT of the `lua_State` for very
+/// fast access by C extensions (`((char *)L - LUA_EXTRASPACE)`). Every
+/// luazig handle is allocated as an `Lx` (PUC's "thread state + extra
+/// space" unit, lstate.h LX) with the extra space in front, so this is the
+/// same `&lx.extra` computation PUC's macro performs — same ABI. PUC
+/// leaves the main thread's extra space uninitialized and copies it into
+/// every new thread (lstate.c:291-293); luazig zeroes the main extra space
+/// (a safe superset) and keeps the inherit-from-main rule.
 pub export fn lua_getextraspace(L: ?*lua_State) ?*anyopaque {
-    _ = L;
-    return null; // luazig doesn't implement LUA_EXTRASPACE
+    const h = L orelse return null;
+    const lx: *vm_mod.Lx = @fieldParentPtr("l", h);
+    return @ptrCast(&lx.extra);
 }
 
 /// PUC `lua_xmove` (lapi.c:lua_xmove): move `n` values from the top of `from`'s
@@ -1505,12 +1512,24 @@ pub export fn lua_tocfunction(L: ?*lua_State, idx: c_int) ?*const fn (?*lua_Stat
 pub export fn lua_tothread(L: ?*lua_State, idx: c_int) ?*lua_State {
     var s = api.State.fromHandle(L orelse return null);
     if (s.tothread(idx)) |th| {
-        // Reverse-map the thread Value to its lua_State handle: coroutine
-        // handles are set by lua_newthread, the main thread's handle by
-        // setupMainHandle (P15.83k). For Lua-created coroutines (no C
-        // handle), return null — a deviation from PUC which returns the
-        // lua_State* for all threads.
-        return th.api_handle;
+        // Reverse-map the thread Value to its lua_State handle: handles are
+        // set by lua_newthread (coroutines) and setupMainHandle (main
+        // thread, P15.83k). For Lua-created coroutines (no handle yet) we
+        // lazily create+cache one here: in PUC a thread IS a lua_State, so
+        // lua_tothread returns a non-NULL lua_State* for EVERY thread
+        // value. The lazy handle gives Lua-created coroutines the same
+        // stable one-to-one Value↔lua_State mapping. The handle is cached
+        // on the Thread (created at most once per thread) and its lifetime
+        // is tied to the Thread's GC lifetime: gcFreeObject(.thread) frees
+        // it via Thread.api_handle. On allocation failure we return null —
+        // a deviation from PUC (which cannot fail here), acceptable because
+        // it only manifests under OOM.
+        if (th.api_handle) |h| return h;
+        const vm = s.vm;
+        const h = vm.allocStateHandle(false) catch return null;
+        h.* = .{ .vm = vm, .thread = th, .is_main = false };
+        th.api_handle = h;
+        return h;
     }
     return null;
 }

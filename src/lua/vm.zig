@@ -782,6 +782,22 @@ pub const lua_State = struct {
     resume_func_base: ?usize = null,
 };
 
+/// PUC `LUA_EXTRASPACE` (luaconf.h:224): `sizeof(void *)` — the size of the
+/// raw per-state "extra space" for very fast access by C extensions.
+pub const LUA_EXTRASPACE = @sizeOf(*anyopaque);
+
+/// PUC `LX` (lstate.h:317-320): "thread state + extra space" — the actual
+/// allocation unit behind every `lua_State *`. PUC's `lua_getextraspace(L)`
+/// is `((char *)L - LUA_EXTRASPACE)` (lua.h:391): the extra space sits IN
+/// FRONT of the `lua_State`, at a fixed negative offset. luazig mirrors
+/// this ABI exactly: every handle is allocated as an `Lx` and the
+/// `lua_State *` handed to C points at `.l`, so `lua_getextraspace` is the
+/// same `&lx.extra` computation PUC's macro performs.
+pub const Lx = struct {
+    extra: [LUA_EXTRASPACE]u8,
+    l: lua_State,
+};
+
 pub const Closure = struct {
     gc_age: GcAge = .new,
     /// Position in `Vm.gc_objects` (P16.16 C1: u32; see Cell.gc_index).
@@ -4486,6 +4502,44 @@ pub const Vm = struct {
         return vm;
     }
 
+    /// Allocate a `lua_State` handle with its `LUA_EXTRASPACE` extra space in
+    /// front (PUC allocates one `LX` per thread; lstate.c:lua_newthread /
+    /// f_luaopen's mainth). `main` selects the extra-space initialization
+    /// rule, matching PUC:
+    ///  - main handle (PUC `lua_newstate`): the main thread's extra space is
+    ///    left uninitialized by PUC; we zero it instead — a safe superset
+    ///    (deterministic, no uninitialized reads, still all-zero scratch).
+    ///  - coroutine handle (PUC `lua_newthread`, lstate.c:291-293
+    ///    "initialize L1 extra space"): memcpy from the MAIN thread's extra
+    ///    space, so every new thread inherits whatever the host stored there.
+    /// The returned pointer points at `lx.l`; the caller must fully
+    /// initialize the `lua_State` (its `vm` field has no default).
+    pub fn allocStateHandle(self: *Vm, main: bool) !*lua_State {
+        const lx = try self.alloc.create(Lx);
+        if (main) {
+            @memset(&lx.extra, 0);
+        } else if (self.main_handle) |mh| {
+            const from: *Lx = @fieldParentPtr("l", mh);
+            @memcpy(&lx.extra, &from.extra);
+        } else {
+            // No main handle yet (test VMs that skip setupMainHandle):
+            // zero, same as the main rule.
+            @memset(&lx.extra, 0);
+        }
+        return &lx.l;
+    }
+
+    /// Free a `lua_State` handle allocated by `allocStateHandle`: deinit its
+    /// C-API stack and destroy the whole `Lx` (extra space + state). This is
+    /// the single free path for ALL handles — `lua_close` / `api.State.deinit`
+    /// (main handle) and `gcFreeObject(.thread)` (coroutine handles, reached
+    /// via `Thread.api_handle`).
+    pub fn freeStateHandle(self: *Vm, h: *lua_State) void {
+        h.c_stack.deinit(self.alloc);
+        const lx: *Lx = @fieldParentPtr("l", h);
+        self.alloc.destroy(lx);
+    }
+
     /// Create the main `lua_State` handle for this VM and wire it as
     /// `cur_handle` / `main_handle`. Must be called AFTER `Vm.init` returns
     /// and the `*Vm` pointer is stable (the handle stores `self` as `vm`).
@@ -4494,7 +4548,7 @@ pub const Vm = struct {
     /// this after constructing the Vm. The handle is freed by `lua_close`
     /// (C API) or `api.State.deinit` (Zig API) alongside the Vm.
     pub fn setupMainHandle(self: *Vm) !*lua_State {
-        const h = try self.alloc.create(lua_State);
+        const h = try self.allocStateHandle(true);
         // P15.83k: the main handle references the main Thread (PUC: the main
         // lua_State IS the main thread). This makes every lua_State map to a
         // Lua thread Value: lua_pushthread pushes a real thread value for the
@@ -23588,16 +23642,14 @@ pub const Vm = struct {
                 self.alloc.destroy(c);
             },
             .thread => |th| {
-                // Free the coroutine's C API handle (created by lua_newthread).
-                // The main handle (main_thread.api_handle, P15.83k) is owned
-                // by lua_close / api.State.deinit — and Vm.deinit's
-                // drainGcRegistries destroys the main_thread too, so freeing
-                // its handle here as well would double-free.
+                // Free the coroutine's C API handle (created by
+                // lua_newthread, or lazily by lua_tothread for Lua-created
+                // coroutines). The main handle (main_thread.api_handle,
+                // P15.83k) is owned by lua_close / api.State.deinit — and
+                // Vm.deinit's drainGcRegistries destroys the main_thread
+                // too, so freeing its handle here as well would double-free.
                 if (th.api_handle) |h| {
-                    if (!h.is_main) {
-                        h.c_stack.deinit(self.alloc);
-                        self.alloc.destroy(h);
-                    }
+                    if (!h.is_main) self.freeStateHandle(h);
                 }
                 self.freeThreadWrapBuffers(th);
                 self.freeThreadBytecodeFrames(th);

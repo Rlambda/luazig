@@ -104,8 +104,7 @@ pub const State = struct {
         // handle is freed exactly once, here.
         self.vm.deinit();
         if (self.vm.main_handle) |h| {
-            h.c_stack.deinit(alloc);
-            alloc.destroy(h);
+            self.vm.freeStateHandle(h);
         }
         alloc.destroy(self.vm);
     }

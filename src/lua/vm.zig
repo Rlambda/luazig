@@ -1278,6 +1278,12 @@ const CIST_C: u32 = 1 << 15;
 const CIST_FRESH: u32 = 1 << 16;
 /// Bit 17: CIST_CLSRET — closing TBC variables on return.
 const CIST_CLSRET: u32 = 1 << 17;
+/// Bit 18: CIST_TBC — the C function marked a to-be-closed slot on its
+/// frame (PUC `lstate.h:230`: `#define CIST_TBC (CIST_CLSRET << 1)`).
+/// Set by `lua_toclose` on the FIRST mark of the owning C frame; read by
+/// the close sites to decide whether the frame owes any TBC closes.
+/// PUC `lua_settop`/`lua_closeslot` api_check it (`lapi.c:197,210`).
+const CIST_TBC: u32 = 1 << 18;
 /// Bit 19: CIST_OAH — saved allowhook.
 const CIST_OAH: u32 = 1 << 19;
 /// Bit 20: CIST_HOOKED — running debug hook.
@@ -1690,6 +1696,17 @@ pub const CallFrame = extern struct {
     }
     pub fn isClsret(fr: CallFrame) bool {
         return (fr.callstatus & CIST_CLSRET) != 0;
+    }
+    /// PUC `istbc` (`lstate.h:236`): the frame has at least one
+    /// to-be-closed slot marked through `lua_toclose`.
+    pub fn isTbc(fr: CallFrame) bool {
+        return (fr.callstatus & CIST_TBC) != 0;
+    }
+
+    /// PUC `settbc` (`lstate.h:237`): mark the frame as owning at least
+    /// one to-be-closed slot. Set once by `lua_toclose` on first mark.
+    pub fn setTbc(fr: *CallFrame) void {
+        fr.callstatus |= CIST_TBC;
     }
 
     pub fn setC(fr: *CallFrame) void {
@@ -4085,14 +4102,20 @@ pub const Vm = struct {
     c_alloc_fn: ?*const fn (?*anyopaque, ?*anyopaque, usize, usize) callconv(.c) ?*anyopaque = null,
     c_alloc_ud: ?*anyopaque = null,
 
-    /// PUC `L->ci->tbclist` (ldo.c): C-stack slots marked for auto-closing
-    /// by `lua_toclose`. Stored as absolute indices into the handle's
-    /// `c_stack`. When `lua_closeslot` is called, or when the owning C
-    /// function returns (each C frame snapshots `toclose_base` in
-    /// `callCFunction` and closes slots in `[toclose_base, len)` on unwind —
-    /// P15.83c), the VM invokes the `__close` metamethod on the value at
-    /// each marked slot. PUC chains these as a linked list on the stack;
-    /// we use a simple ArrayList since the C API typically marks few slots.
+    /// C-stack slots marked for auto-closing by `lua_toclose` (the C API
+    /// path). Stored as absolute indices into the handle's `c_stack`,
+    /// scoped per C frame via `CallFrame.u.c.toclose_base` (each C frame
+    /// closes slots in `[toclose_base, len)` on return).
+    ///
+    /// P16.30 Stage B — TRANSITIONAL STATE: this VM-global index list is
+    /// the OLD ownership model being replaced by the PUC-faithful
+    /// per-thread chain (`Thread.c_tbc_chain` + `CIST_TBC` +
+    /// frame-owned parked stacks, per
+    /// `tools/status/p16.30-tbc-ownership-truth.json`). The VM-global
+    /// indices are only meaningful relative to the currently-swapped
+    /// temp c_stack — stale across yields/thread switches (defects
+    /// D1/D2). It is REMOVED in Stage C (T7) once the chain owns all
+    /// marks. Do not add new readers.
     c_toclose_slots: std.ArrayListUnmanaged(usize) = .empty,
 
     /// Monotonic counter backing `luaL_ref` (PUC lauxlib's `t->alref`).

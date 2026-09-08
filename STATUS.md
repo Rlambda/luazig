@@ -5410,6 +5410,22 @@ GREEN; perf_compare 7-run median: атрибутируемых регресси�
 (temp_table_alloc +5.8-7% WARN — pre-existing drift, воспроизведён на
 stash без изменения; coroutine_yield/global_arith — шум 3-run median).
 
+### P16.30 T4 Stage B: CIST_TBC (bit 18) + istbc/settbc accessors (2026-09-08)
+
+PUC `lstate.h:230` `#define CIST_TBC (CIST_CLSRET << 1)` — бит 18, в
+luazig был пропущен (17 CLSRET → 19 OAH, дыра ровно на 18 = PUC-порядок).
+Добавлены `CIST_TBC = 1 << 18` + `CallFrame.isTbc()/setTbc()`
+(PUC `istbc`/`settbc`, `lstate.h:236-237`). Читатели появляются в
+Stage C (`lua_toclose` ставит на первый mark; close-сайты читают).
+Заодно: вводящий в заблуждение комментарий `c_toclose_slots`
+(«PUC L->ci->tbclist») заменён на честный TRANSITIONAL — VM-global
+индексы это OLD ownership-модель (stale через yield/thread-switch,
+дефекты D1/D2), удаляется в Stage C (T7).
+
+Поведенчески нейтральный cut (константа + аксессоры без читателей).
+Гейт: unit D+RF, smoke 71/71, c_api make test 50 PASS, 22-diff
+неизменен (те же Stage C-остатки).
+
 ## История закрытых фаз
 
 P3–P15.12 — краткая сводка. P15.13+ — см. «История разработки» выше.

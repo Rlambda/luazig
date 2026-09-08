@@ -6635,6 +6635,24 @@ pub const Vm = struct {
         };
         slot.* = .{
             .func_slot = func_slot, // base derived: func_slot + 1
+            // P16.30 Stage A: snapshot the Lua-TBC register depth at push,
+            // exactly like Lua-frame pushes do (pushStagedFast/pushStaged
+            // set tbc_mark = bc_tbc_regs.items.len). C frames never OWN
+            // bc_tbc_regs entries (those are Lua-frame registers marked by
+            // OP_TBC inside Lua frames), but the generic pop
+            // (popBytecodeExecFrame) restores bc_tbc_regs to the popped
+            // frame's tbc_mark. With the old default 0, popping a C frame
+            // truncated bc_tbc_regs to 0 — silently DROPPING the to-be-closed
+            // marks of outer Lua frames (freed-not-closed for Lua TBC) and
+            // misattributing all lower marks to the C frame in
+            // closeAllTbcVariables' per-frame range walk (which then reads
+            // u.lua.frame_cap through the inactive union arm). Snapshotting
+            // the depth keeps the invariant "when frame F is popped,
+            // bc_tbc_regs.items.len == F.tbc_mark" for C frames too: every
+            // Lua frame pushed above restores the depth to its own snapshot
+            // on pop, so a C frame's attributed range [tbc_mark, next_mark)
+            // is always empty.
+            .tbc_mark = self.bc_tbc_regs.items.len,
         };
         // P15.78: Mark this as a C function frame (PUC CIST_C). The frame
         // has no proto (no bytecode), so the CIST_C bit is the explicit
@@ -12147,6 +12165,30 @@ pub const Vm = struct {
                 }
 
                 const frame = exec_frames.getPtr(frame_index);
+                // P16.30 Stage A (D3): C frames on the unwind path must be
+                // popped WITHOUT touching frame.u.lua — that union arm is
+                // inactive for C frames (the G1a SIGSEGV: a coroutine
+                // suspended inside lua_pcallk, then coroutine.close drives
+                // the forced-close transport into this loop, which read
+                // u.lua.hasOpenUpvalues() through the pcallk C frame).
+                // C frames also never own bc_tbc_regs entries (those are
+                // Lua-frame registers marked by OP_TBC inside Lua frames),
+                // so the beginBytecodeClose branch below — which reads
+                // parent.u.lua.frame_cap in continueBytecodeClose — must be
+                // skipped for them; their stale tbc_mark would otherwise
+                // misattribute outer Lua frames' marks to the C frame.
+                // PUC model: the Lua-frame close logic in luaD_unwind only
+                // inspects Lua CallInfos; C CallInfos are unlinked and
+                // dropped (their TBC obligations live on the thread-owned
+                // tbclist, walked by luaF_close — converged onto the
+                // per-thread chain in Stage C). popBytecodeExecFrame routes
+                // C frames through freeCFrameOwnedState and restores
+                // bc_tbc_regs to the push-time tbc_mark set by
+                // pushBuiltinCFrame.
+                if (frame.isC()) {
+                    self.popBytecodeExecFrame(exec_frames);
+                    continue;
+                }
                 if (self.bc_tbc_regs.items.len > frame.tbc_mark) {
                     owner.bytecode_unwinds.items[state_index] = state;
                     switch (try self.beginBytecodeClose(

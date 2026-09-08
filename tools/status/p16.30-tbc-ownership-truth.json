@@ -1,0 +1,56 @@
+{
+  "created_utc": "2026-09-08T11:00:00Z",
+  "phase": "P16.30",
+  "task": "T2 — TBC ownership audit / root cause",
+  "input_head": "a214c58",
+  "crash_root_cause": {
+    "symptom": "SIGSEGV in closeBytecodeUpvaluesFrom (vm.zig:8014) during coroutine.close of a thread suspended inside lua_pcallk with a marked lua_toclose slot (repro: /tmp/opencode/t6_repro.c variant A; PUC: close_calls=1)",
+    "failing_transition": "builtinCoroutineClose -> forced close transport -> appendBytecodeUnwind(disposition=propagate-to-boundary) -> continueBytecodeErrorUnwind frame-popping loop (vm.zig:~12145)",
+    "invariant_violated": "The unwind loop reads frame.u.lua.hasOpenUpvalues() and closeBytecodeUpvaluesFrom(frame, 0) UNCONDITIONALLY on every popped frame. The suspended thread's call_frames contain a C frame (the pcallk CallInfo pushed by callCFunction). Reading u.lua through a frame whose active union arm is u.c yields garbage frame_cap -> bc_boxed[base .. base+garbage_cap] OOB slice -> SIGSEGV at the boxed[i] deref.",
+    "classification": "stale-owner: the unwind machinery assumes all frames are Lua frames; C frames on the same FrameStack are invisible to it"
+  },
+  "defect_family": {
+    "D1_freed_not_closed": {
+      "site": "discardCFrame (vm.zig:11261) -> freeCFrameOwnedState (vm.zig:36314)",
+      "behavior": "clsret_state.remaining_tbc Values are FREED (alloc.destroy) without running __close during forced-close/reset of a suspended C activation",
+      "puc": "luaE_resetthread: resetCI drops CallInfos; luaD_closeprotected -> luaF_close walks the THREAD-OWNED tbclist independently -> __close runs with (obj, nil)"
+    },
+    "D2_normal_resume_drop": {
+      "site": "finishCcall (vm.zig:~10729-10732) success path",
+      "behavior": "the yield-snapshot (remaining_tbc) is freed on successful resume WITHOUT closing; snapshotYieldedTbc already popped the c_toclose_slots marks -> the close obligation vanishes",
+      "puc": "moveresults sees CIST_TBC -> luaF_close(CLOSEKTOP) at poscall -> __close runs exactly once"
+    },
+    "D3_sigsegv": "the crash above"
+  },
+  "old_ownership": {
+    "owner_of_mark": "Vm.c_toclose_slots (VM-GLOBAL ArrayList of usize indices)",
+    "owner_of_value": "whichever temp c_stack is active in Vm.cur_c_stack (swapped per callCFunction; freed on yield by errdefer)",
+    "owner_after_yield": "CClsretState.remaining_tbc (heap copy per C frame) — DUPLICATE representation",
+    "problems": [
+      "VM-global indices are meaningful only relative to the currently-swapped temp stack (another thread / nested C call / post-yield = stale indices)",
+      "two semantic representations of the same obligation (live marks + yield snapshot)",
+      "C-frame discard destroys the obligation (D1) or normal resume drops it (D2)",
+      "unwind loop cannot see C frames (D3)"
+    ]
+  },
+  "new_ownership": {
+    "decision": "Option B+: per-THREAD TBC chain with slot-identity preserved through frame-owned parked stacks",
+    "owner_of_chain": "Thread.c_tbc_chain: ArrayListUnmanaged(TbcEntry) where TbcEntry = { cframe_idx: usize, slot_idx: usize }",
+    "owner_of_value": "the owning C frame's c_stack slice — LIVE while the C fn runs (mutable through the C API = PUC slot semantics), PARKED on the C frame (u.c.parked_stack) across yield/pcallk-error instead of freed",
+    "flags": "CIST_TBC (bit 18, currently MISSING in vm.zig — PUC lstate.h) set on the C frame at first lua_toclose; CIST_CLSRET means close-was-interrupted-by-yield (already exists)",
+    "close_sites": [
+      "normal C return / finishCcall success: close entries with cframe == this frame, top-down, live stack",
+      "finishpcallk error path: same entries with the error object",
+      "discardCFrame / reset / lua_closethread: walk the WHOLE thread chain LIFO; resolve values from parked stacks; close; then free",
+      "lua_closeslot: only the TOP entry, entry must belong to the current frame"
+    ],
+    "removed": [
+      "Vm.c_toclose_slots",
+      "snapshotYieldedTbc",
+      "CClsretState.remaining_tbc",
+      "freeCFrameOwnedState freed-not-closed branch"
+    ],
+    "unwind_loop_fix": "isC() guard: C frames are popped via the thread-chain close (no u.lua reads)"
+  },
+  "rejected_alternative": "Option A (persistent per-state C stack segments): closest to PUC but requires reworking every C-API indexing assumption across the c_api surface — too broad for this phase's correctness budget; Option B+ preserves the same OWNERSHIP semantics (one chain, slot identity, no snapshots) with a bounded refactor"
+}

@@ -5462,6 +5462,70 @@ C CallInfo (error recovery, thread close). luazig: C-API TBC-слоты живу
 Гейт: build D+RF, smoke 71/71, 22-diff неизменен (baseline-остатки
 Stage C), api580 GREEN, crash repro t6r exit 0, GC-stress closes=1000.
 
+### P16.30 T5 Stage C.2: цепочка + parked-стеки во всех close-сайтах — PUC-faithful закрытие C-frame TBC (2026-09-08)
+
+Полная проводка thread-owned TBC-цепочки через все close-сайты C-фреймов
+(22_tbc_lifecycle DIFF-EMPTY vs PUC). Workhorse:
+`closeCFrameTbcEntries(self, th, cframe_idx, err, err_status,
+yieldable_close, results)` — попает entry из цепочки ДО вызова closer
+(PUC `luaF_close`), читает live-slot (parked-стек, иначе cur_c_stack для
+верхнего активного фрейма), зануляет слот, гоняет `__close(err)`;
+ошибка closer → cur_err=self.err_obj + продолжение (last-error-wins,
+PUC `luaF_close` yy=0); yield (если yieldable) → CClsretState
+in-place (`return_close` если чисто, иначе `error_escape`) + suspend;
+non-yieldable yield → "attempt to yield across a C-call boundary" как
+ошибка closer. Хелперы: `cFrameTbcSlotValue`/`setCFrameTbcSlotNil`
+(parked-стек с fallback на cur_c_stack верхнего фрейма),
+`threadHasCFrameTbcEntries` (static), `closeAndDiscardCFrame`.
+
+Close-сайты (все PUC-faithful):
+
+- `finishpcallk`: ошибка на c_stack фрейма — truncate до funcidx +
+  append err (PUC `luaD_seterrorobj(func)`); k видит [args..., error].
+  testC-фреймы (testc_state != null): err на c_stack[0] — контракт
+  testcContShim (реконструкция [stack_prefix..., error]); testC pcallk
+  сохраняет bc-relative funcidx (frameBase), placement по funcidx к ним
+  неприменим.
+- `precover` → `DispatchError!bool`: поп-луп закрывает TBC-entries
+  попаемых C-фреймов yieldable с in-flight error (PUC закрывает их же в
+  `finishpcallk`'s `luaF_close(func, status, yy=1)` — тот же набор,
+  тот же порядок); все 6 call-сайтов `try`.
+- `finishCcall`: CLSRET-путь первым (install parked, докрытие цепочки,
+  mode-specific completion: return_close → результаты через
+  resume_inbox + isHookYield; error_escape → re-raise, фрейм попает
+  error-машиной); k-путь: install parked/fresh, park на -3/-2/-1,
+  return_close на нормальном возврате, ошибка в k==NULL-пути читается
+  с cur_c_stack[funcidx].
+- `callCFunction`: park на yield + YPCALL-error; non-YPCALL error →
+  close own entries non-yieldable + pop; нормальный возврат → close
+  yieldable с результатами (PUC `luaD_poscall` → `luaF_close(yy=1)`).
+- `unwind` C-ветка: close с state.error_value; все 4 close_mode
+  discard-сайта + (A)-guard + hook-yield abandon +
+  `unwindBytecodeExecFrames` + builtinCoroutineClose close_has_err
+  (закрывает остатки цепочки с th.close_err) — ошибки close
+  протекают через th.close_err/forced_close_had_error в
+  appendBytecodeForcedCloseUnwind (параметр error_value).
+- `snapshotYieldedTbc` УДАЛЁН (T7): toclose_base, c_toclose_slots
+  (поле+деinit), GC-walk remaining_tbc, freeCFrameOwnedState
+  remaining_tbc — всё удалено; CallFrame снова 88 B (assert == 88).
+
+Документированные divergences (в коде): hook-yield abandon дропает
+финальную ошибку closer (err-state snapshot/restore вокруг close);
+builtinCoroutineClose close_has_err гоняет closers в контексте
+CLOSING-треда (PUC — на стеке закрываемого); unwindBytecodeExecFrames
+void-путь глотает close-ошибки (`catch {}`).
+
+Регрессия, найденная и закрытая в ходе шага: coroutine.lua:1078/1244
+(apico pcallk) — testC-фреймы получают fresh-empty c_stack, а -1-arm
+(k called lua_error) паркует пустой стек → finishpcallk funcidx-placement
+(10 > 0) skip'ал ошибку; фикс — testc_state-дискриминатор: err на
+c_stack[0] для testC-фреймов независимо от park-состояния.
+
+Гейт: build D+RF, smoke 71/71, c_api make test ALL PASS +
+**22_tbc_lifecycle DIFF-EMPTY** (diff vs /tmp/opencode/t22_puc.txt
+пуст), api580 GREEN, matrix --testc 32/32 zig_fail=0 (big.lua both_fail
+pre-existing), crash repro t6r exit 0, GC-stress closes=1000.
+
 ## История закрытых фаз
 
 P3–P15.12 — краткая сводка. P15.13+ — см. «История разработки» выше.

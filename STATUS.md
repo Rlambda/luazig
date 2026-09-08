@@ -5426,6 +5426,42 @@ Stage C (`lua_toclose` ставит на первый mark; close-сайты ч�
 Гейт: unit D+RF, smoke 71/71, c_api make test 50 PASS, 22-diff
 неизменен (те же Stage C-остатки).
 
+### P16.30 T5 Stage C.1: TbcEntry + Thread.c_tbc_chain + parked_stack — каркас thread-owned TBC (2026-09-08)
+
+PUC `L->tbclist` (lstate.h) — per-thread LIFO-цепочка to-be-closed меток,
+принадлежащая THREAD'у, а не CallInfo: TBC-обязательства переживают попы
+C CallInfo (error recovery, thread close). luazig: C-API TBC-слоты живут
+на per-C-frame c_stack, поэтому цепочка хранит пары
+`TbcEntry{cframe_idx, slot_idx}` (LIFO append; entries удаляются ТОЛЬКО
+закрытием — PUC `luaF_close` попает метку до вызова `__close`).
+
+Добавлено (поведенчески нейтрально — цепочку пока никто не заполняет):
+
+- `Thread.c_tbc_chain: ArrayListUnmanaged(TbcEntry)` — зеркала PUC
+  ownership; деinit в `gcFreeObject(.thread)` БЕЗ `__close` (PUC
+  `luaE_freethread` → только `luaF_closeupval`: GC-collected coroutine
+  не гоняет closers; их гоняет только явный `coroutine.close`).
+- `CFrameState.parked_stack: ?*ArrayListUnmanaged(Value)` — паркинг
+  c_stack C-frame'а на время suspend'а (yield / in-flight error):
+  PUC держит слоты на общем `L->stack` (никогда не двигается), luazig
+  двигает per-frame c_stack в heap-cell фрейма — live-slot семантика
+  цепочки переживает suspend. Хелперы `parkCStack`/`unparkCStack`
+  (move, без копирования значений); `freeCFrameOwnedState` фрит
+  parked_stack БЕЗ `__close` (к моменту попа фрейма все close-сайты
+  уже отработали — инвариант цепочки).
+- GC: walk thread'ов маркирует parked-стеки + значения цепочки
+  (live-slot: текущее значение слота, не значение на момент mark);
+  активный фрейм маркируется через cur_c_stack в roots (уже было).
+- `freeThreadBytecodeFrames`: поп-пасс фреймов теперь вызывает
+  `freeCFrameOwnedState` — закрывает pre-existing leak (GC-collected
+  suspended coroutine с testc_state/clsret_state дропал аллокации).
+- CallFrame 88→96 B transitional (parked_stack + toclose_base
+  сосуществуют до T7-удаления toclose_base в C.2; assert допускает
+  оба, финал — 88).
+
+Гейт: build D+RF, smoke 71/71, 22-diff неизменен (baseline-остатки
+Stage C), api580 GREEN, crash repro t6r exit 0, GC-stress closes=1000.
+
 ## История закрытых фаз
 
 P3–P15.12 — краткая сводка. P15.13+ — см. «История разработки» выше.

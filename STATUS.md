@@ -99,6 +99,35 @@ allocation-countdown в C-global `l_memcontrol.countlimit` (ltests.c:191-198,
   (big.lua both_fail = pre-existing parity), c_api clean test + test-diff ALL
   PASS, api580 GREEN.
 
+**Cut B — opTailcall nothing-to-close fast path + results-dupe elimination
+(KEEP, коммит ниже).** T1 Q1: metamethod_add делал 4 allocs/iter vs PUC 2 —
+16B results-dupe (opTailcall .Builtin branch) + 80B безусловный
+BytecodeCloseContinuation на каждый tailcall. PUC OP_TAILCALL →
+luaD_pretailcall → precallC заменяет frame in-place; luaF_close только при
+реальных obligations (lvm.c asserts tbclist.p < base — компилятор не
+эммитит tailcall из функции с <close>). Фикс:
+
+- opTailcall: fast-path флаг `tail_fast_complete` = !hooks_active_cached &&
+  !fr.isTbc() && pending==INVALID (те же условия, что opReturn0/1 fast arms;
+  has_pending_tbc уже дивертирован выше в .retry_tailcall; chain-gate
+  .return_frame = isTbc() or return_k, return_k=false на этом site) →
+  прямое completeBytecodeExecFrame без continuation-аллокации.
+- .Builtin branch: при fast path результаты кладутся в bc_return_scratch
+  (borrowed, returnSliceIsOwned-детект, никогда не фриится) вместо heap-dupe
+  — PUC двигает C-results на общем стеке. used>1 → прежний dupe.
+- Семантика close НЕ изменена: все obligations (hook-lane chain region,
+  return hook, TBC regs, open upvalues — их закрывает сам
+  completeBytecodeExecFrame) идут через прежний медленный путь.
+- A/B: metamethod_add 3748.5→**3203.5** (−545 i/it, больше T1-оценки
+  100–200: уходит и continuation create/destroy, и pending-call dance);
+  allocs/iter metamethod_add 4.000→**2.002 = PARITY с PUC** (2.000);
+  temp_table_alloc 1089.0 flat; table_alloc_setmetatable ~2137→~2122 (flat);
+  lua_calls 593.3→595.3 (+2.0 = +0.34%, детерминированный code-layout
+  эффект роста inlined runBytecodeDispatch (.text +432B), порог 5% не
+  превышен); branch_loop/hash_access flat.
+- Гейты: build D+RF, unit D+RF, smoke 71/71, matrix --testc 31/32 zig_fail=0,
+  c_api clean test + test-diff ALL PASS (3× deterministic), api580 GREEN.
+
 ### P16.32 T1 — allocation decomposition truth (2026-09-09, research)
 
 Полный разбор alloc-family divergence (metamethod_add 2.22x, table_alloc_setmetatable

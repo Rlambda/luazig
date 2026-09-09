@@ -9237,3 +9237,48 @@ control` (src/lua/vm.zig, +104 строки) навсегда охраняет R
 zig fmt --check src OK; unit **D 200/200** + **RF 200/200** (было 199 —
 новый тест #200); smoke **71/71 PASS**; matrix sanity не нужен (нет src
 изменений кроме теста); negative-validation FAIL→revert→green.
+
+## P16.34 T0 — per-fetch dispatch head decomposition: luazig 18 vs PUC 8 i/fetch (2026-09-10)
+
+Truth-artifact `tools/status/p16.34-t0-fetch-decomposition.md`. Нет
+production-изменений; измерение на HEAD 3b1ce10 (= 5c16a69 + unit test only,
+dispatch 65,332 B побайтово идентичен). Заменяет оценку P16.33 T1 (16.2
+i/fetch pre-T2/T3) точным счётом.
+
+Метод: callgrind n-vs-2n slope (N=20000/40000, 5 shapes) + прямое измерение
+fetch-counts (строка `self.dispatch_pc = ctx.pc` vm.zig:14247 исполняется
+ровно раз на fetch — её callgrind-счётчик и есть число fetch) + perf record
+для выбора горячего клона головы PUC (215b0→213b0, не 21440). perf stat
+`-r 3` на гибридном CPU непригоден (partial counting); single-run совпадает
+со slope в 0.5–3%.
+
+Результат: **zig голова = 18 i/fetch, PUC = 8 i/fetch, gap = 10 i/fetch**.
+Компоненты gap: bounds-check+spill-reloads 4 (PUC 0 — pc-указатель без
+проверки), fetch 2 vs 1 (code.ptr перечитывается из Proto), публикация
+dispatch_pc 1 vs 0 (PUC пишет savedpc только на границах — 44 store в
+luaV_execute, все на call/error сайтах), gate 3 vs 2 (регистровый trap-local
+vs byte-load из Vm+0xf94), jump-table 4 vs 1 (LLVM 32-bit relative vs GCC
+64-bit absolute), pc-advance 1 vs folded (incq RMW на stack-слоте vs lea в
+регистре). Подтверждено per-line callgrind (4+2+1+3+6+1+1=18).
+
+Per-workload (dispatch-function): int_arith 54.54 vs 30.30 i/fetch (gap 24.2,
+голова 20 из 48.5 i/it gap = 41%); branch_loop 46.66 vs 31.31 (gap 15.4);
+comparisons 49.09 vs 30.91 (gap 18.2, голова 55%); lua_calls/mm —
+program-level (PUC call-machinery вне luaV_execute): голова объясняет 30%/21%
+gap. Чистые head-компараторы — pure-loop shapes: 41–55% dispatch-gap.
+
+Parity-находка: на взятом условном переходе zig диспатчит следующий JMP-опкод
+через полную голову (`.eqi` не скипает taken-путь), PUC `donextjump` читает
+JMP inline — branch_loop zig 5.0 vs PUC 4.5 fetch/iter (+9 i/iter чистой
+головы).
+
+Вердикт по removable (PUC-first): публикация dispatch_pc (−1, provably —
+читатели GC/fail получают pc на границах), gate→регистр (−1, trap-модель
+PUC), pc-as-pointer (−4..5, provably — codegen уже гарантирует terminating
+RETURN, bounds-check избыточен per-fetch), inline donextjump (−18 i на взятый
+condjump). Jump-table 4-vs-1 — структурная цена LLVM (не убирается из
+Zig-source без разрушения megafunction). Прогноз после cut 1–4: голова ≈10
+i/fetch; int_arith 109→89 i/it (−18% инструкций на shape).
+
+Гейт: src не менялся (артефакт + STATUS только); smoke 71/71, matrix --testc
+31/32 zig_fail=0 — прогнаны на неизменённом дереве для подтверждения.

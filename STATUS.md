@@ -9424,3 +9424,74 @@ Backlog: T0 «gate load» остаётся открытым — будущая �
 I-cache), либо принятия field-read как PUC-parity формы (load L1-resident
 и fused); measurement hygiene — gate-инструменты, пересобирающие zig-out
 (api580), могут тихо инвалидировать A/B-бинарники.
+
+## P16.34 Cut 3 — donextjump inline (T3.5) + dispatch-loop bounds removal (T3.1) (2026-09-10)
+
+Два коммита, закрывающие два T0-компонента головы dispatch:
+
+### dcbd16d — T3.5: taken condjump читает парный JMP inline (PUC docondjump parity)
+
+Все 11 условных опкодов (eq/lt/le/eqi/eqk/lti/lei/gti/gei/test_/testset) на
+taken-стороне применяют offset парного JMP в самом хендлере (target =
+pc + offset + 2, арифметика PUC `dojump(ci, ni, 1)`) + backward-jump SIGINT
+poll, затем `continue` — JMP-опкод больше не проходит через полную голову
+dispatch (T0: 18 i на каждый taken condjump; PUC `docondjump` никогда не
+исполняет парный JMP). Skip-сторона (`result != invert → pc += 1`) без
+изменений. Инвариант codegen доказан (CMP+JMP genCompare, testAndJump,
+goIfTrue/goIfFalse).
+
+SAFETY NET: `undump.verifyProtoCode` — one-time структурная валидация на
+undump, конвертирует PUC-UB (luai_verifycode пуст в production) в чистый
+`BadCode` «bad binary format (corrupted code)»: range опкодов (raw u7 vs 86
+ops — @enumFromInt OOR = ReleaseFast UB; найдено byte-corruption sweep:
+перевёрнутый опкод-байт прошёл валидацию и SIGILL'нулся об unreachable VM),
+терминирующий последний опк, jump-таргеты в диапазоне, condjump→JMP pairing
+(охраняет inline-чтение code[pc+1]), EXTRAARG-followers, arith→MMBIN-family
+pairing, lfalseskip, mmbin p≥1. Out of scope = PUC-parity UB (задокументено):
+register indices vs maxstacksize (sweep: a=253 → garbage loop; PUC читает
+соседние stack-слоты так же), k-индексы вне loadkx, closure proto indices.
+16 новых unit-тестов. Corruption sweep над реальным 204-байтным дампом:
+110 ok / 93 чистых ошибки / 1 задокументированный parity-UB hang (было 2
+крэша).
+
+A/B (median-of-3 instructions:u, taskset -c 0) + callgrind-атрибуция:
+branch_loop −3.19% (−7.6 i/it), field_access −3.84%, int_arith 0.00%,
+coroutine_yield −0.08%; collateral wall-neutral: comparisons +2 i/it = ОДИН
+исполняемый 14-байтный alignment-nop на LE/LT skip-fallthrough, lua_calls/
+mm_noalloc +6 i/it = LLVM re-lowering проверки frame-exit RETURN
+(sete/sete/or/jne vs fused test/je — 11 новых continue back-edge поменяли
+CFG) + один lea. Официальный perf-гейт WALL: branch_loop −14.0%,
+lua_calls −1.7%, comparisons +0.5%, field_access −5.6%, int_arith −5.6%;
+global_arith +9.5% WARN = host-noise (бимодальные instruction counts
+13.19B/14.61B воспроизведены на ОБОИХ бинарниках).
+
+### 6290951 — T3.1: per-fetch bounds check удалён из dispatch-loop
+
+`while (ctx.pc < ctx.cur_proto.code.len)` → `while (true)`: compare+branch
+на каждый fetch не имеет PUC-аналога (vmfetch читает savedpc без проверки).
+Безопасность теперь на том же инварианте, что и PUC — каждый Proto
+доказуемо заканчивается терминатором: (1) codegen-эпилог всегда эмитит
+trailing RETURN0, (2) verifyProtoCode rule 1 отклоняет нетерминирующие
+бинарные чанки (наш safety net; PUC — UB), (3) валидатор проверяет диапазон
+всех jump-таргетов. Fall-off fallback под циклом удалён (мёртв по тому же
+инварианту).
+
+A/B vs dcbd16d: равномерное улучшение на ВСЕХ 7 workloads — int_arith
+−3.80%, branch_loop −3.95%, comparisons −4.70%, lua_calls −4.62%,
+mm_noalloc −3.30%, field_access −5.77%, coroutine_yield −2.02% (T0-компонент
+«bounds+spill-reloads 4 i/fetch» — удаление условия позволило LLVM убрать и
+сопутствующий spill/reload). Официальный гейт WALL: branch_loop −15.2%,
+comparisons −8.8%, field_access −7.1%, mixed_arith −6.0%, int_arith −5.6%,
+float_arith −5.2%, lua_calls −3.5%; metamethod_call_noalloc +5.0% WARN =
+доказанный noise (15ms workload; median-of-15 re-run: −0.3%; instructions
+−3.30% — улучшение).
+
+Гейт (оба коммита): zig fmt; unit D+RF 216 pass; smoke 73/73; matrix --testc
+zig_fail=0 (big.lua both_fail pre-existing); c_api clean test + test-diff
+ALL PASS; api580 GREEN.
+
+Backlog фазы P16.34 после Cut 3: T0-компонент «gate load» остаётся открытым
+(Cut 2 REJECTED, см. выше); jump-table 4-vs-1 — структурная цена LLVM;
+следующий кандидат — frame-transition ctx re-derivation (PUC startfunc/
+returning parity). Side-finding: perf-гейты, пересобирающие zig-out
+(api580), инвалидируют A/B-бинарники — верифицировать md5.

@@ -1324,6 +1324,26 @@ const CIST_HOOKYIELD: u32 = 1 << 23;
 const CIST_FIN: u32 = 1 << 24;
 /// Bit 25: CIST_HIDE — luazig-specific: hide from debug.getinfo.
 const CIST_HIDE: u32 = 1 << 25;
+/// Bit 26: CIST_SR — a simple-result completion is pending on this Lua
+/// frame (P16.33 T2). VALIDITY FLAG for the aux fields `u.lua.simple_result_dst`
+/// + the event/invert/compare bits of `u.lua.lua_packed_flags` — PUC's
+/// `u2` valid-only-when-flagged pattern (PUC packs ALL per-frame flags into
+/// the ONE callstatus word and keeps mutually-exclusive aux state in a union
+/// whose arm is selected by a callstatus bit, e.g. CIST_CLSRET → u2.nres).
+/// Activation writes callstatus masked to CIST_NRESULTS (encodeNresults),
+/// so CIST_SR is provably CLEAR on every fresh activation — the aux fields
+/// may hold stale slot-reuse garbage while CIST_SR is clear (never read:
+/// every aux reader is gated by hasSimpleResult()). This is what lets
+/// pushStagedFast skip their initializing stores (PUC prepCallInfo writes
+/// only 5 fields; it never initializes aux state at activation).
+const CIST_SR: u32 = 1 << 26;
+/// Bit 27: CIST_OUV — this Lua frame may have open upvalues (cells in its
+/// boxed register window; set by OP_CLOSURE's instack capture). Same
+/// callstatus-packing rationale as CIST_SR: the flag is provably clear on
+/// every fresh activation (masked callstatus write), so it needs no
+/// separate initializing store. Readers: the return fast arms (child frame
+/// pop decision) and the close machinery — all Lua-frame contexts.
+const CIST_OUV: u32 = 1 << 27;
 /// P15.51n: Sentinel for Thread.hook_frame_index meaning "no hook frame active".
 const INVALID_HOOK_FRAME: usize = std.math.maxInt(usize);
 /// P15.51n: Sentinel for u32 pc fields meaning "no pc" (replaces ?usize null).
@@ -1544,14 +1564,26 @@ const LuaFrameState = extern struct {
     pc: usize = 0,
     /// Register window upper bound (PUC `ci->top - ci->func`).
     frame_cap: u32 = 0,
-    /// PUC `u.l.nextraargs`: extra vararg arguments.
+    /// PUC `u.l.nextraargs`: extra vararg arguments. WRITTEN ONLY ON
+    /// VARARG PATHS (PUC parity: PUC's precall writes u.l.nextraargs only
+    /// in the vararg branch — for non-vararg frames the field holds stale
+    /// slot-reuse garbage in PUC too). Every reader is therefore guarded by
+    /// the frame's proto being vararg (frameVarargs checks
+    /// proto.flags.is_vararg; OP_VARARG/OP_VARARGPREP/OP_GETVARG only exist
+    /// in vararg protos — the compiler never emits them elsewhere, the same
+    /// static proof PUC relies on).
     nextraargs: u16 = 0,
-    /// Packed Lua-frame flags: bit0 has_open_upvalues, bit1
-    /// simple_result_invert, bits 2-6 simple_result_event (TmsEvent u5),
-    /// bit7 simple_result_compare (see the invariant block below).
+    /// Simple-result AUX flags — valid ONLY while callstatus CIST_SR is set
+    /// (see the invariant block below): bit1 simple_result_invert, bits 2-6
+    /// simple_result_event (TmsEvent u5), bit7 simple_result_compare.
+    /// Bit0 is RESERVED (unused) — the has-open-upvalues flag moved to
+    /// callstatus CIST_OUV (P16.33 T2: PUC packs all frame flags into the
+    /// one callstatus word; a separate always-initialized flags byte forced
+    /// an eager store at every activation that PUC does not have).
     lua_packed_flags: u8 = 0,
-    /// Inline simple-result completion destination:
-    /// 0xFF (NO_REG) = no value destination (NONE or compare mode);
+    /// Inline simple-result completion destination (AUX — valid ONLY while
+    /// callstatus CIST_SR is set):
+    /// 0xFF (NO_REG) = compare mode (or no pending simple-result);
     /// 0x00-0xFE = value mode register (R254 VALID — MAX_FSTACK=255).
     simple_result_dst: u8 = 0xFF,
     /// Hook PC tracking (Lua-only, per-frame).
@@ -1561,92 +1593,49 @@ const LuaFrameState = extern struct {
     skip_call_hook_pc: u32 = INVALID_PC,
     resume_skip_count_pc: u32 = INVALID_PC,
 
-    /// P16.8 Task 1: INVARIANT — The simple-result state machine has
-    /// exactly three states, encoded by (compare_flag, simple_result_dst):
-    ///
-    ///   1. NONE  (compare=0, dst=NO_REG): no simple-result pending.
-    ///   2. VALUE (compare=0, dst=0..254): put 1 result into register
-    ///      `simple_result_dst`, advance pc by 1. Zero returns → nil
-    ///      (matches PUC `luaT_callTMres`).
-    ///   3. COMPARE (compare=1, dst=NO_REG): check truthiness of 1 result;
-    ///      advance pc by 1, then by 1 more if (truthy != invert).
-    ///      Zero returns → false.
-    ///
-    /// Representation invariant: compare=1 ⟹ dst=NO_REG.
-    /// R254 is fully valid in value mode — the old 0xFE sentinel is gone.
-    ///
-    /// This bypasses the pending_calls array entirely. The completion info
-    /// lives inline in LuaFrameState (packed into 2 bytes: lua_packed_flags +
-    /// simple_result_dst), using the 2 bytes of slack at the end of the
-    /// 48-byte struct since P16.21 T2 (func_slot_base removed; the outer
-    /// CallFrame stays 88 B because the C arm is the 56-B union floor).
-    ///
-    /// Resume equivalence: a frame with hasSimpleResult() that is suspended
-    /// (coroutine yield) resumes identically to the old `.value`/`.compare`
-    /// completion. The inline fields persist on the CallFrame (heap-resident
-    /// in thread.call_frames), and the return path checks `hasSimpleResult()`
-    /// before `pending_call_index`. The metamethod child frame is also
-    /// heap-resident and persists across yield/resume. The ONLY difference
-    /// from the old path is WHERE the completion info is stored (inline vs.
-    /// pending_calls array); the semantics are identical.
-    ///
-    /// `pending_call_index` remains `INVALID_PENDING` while a simple-result is
-    /// pending — the two completion mechanisms are mutually exclusive.
-    pub fn hasOpenUpvalues(self: *const LuaFrameState) bool {
-        return (self.lua_packed_flags & 0x01) != 0;
-    }
-    pub fn setOpenUpvalues(self: *LuaFrameState, v: bool) void {
-        self.lua_packed_flags = if (v) self.lua_packed_flags | 0x01 else self.lua_packed_flags & ~@as(u8, 0x01);
-    }
-
-    // ── P16.8 Task 1: Simple-result state machine helpers ──
-    // All simple_result access goes through these typed helpers. Callers
-    // cannot construct impossible states (compare+dst, stale flags, etc.).
-
-    /// True if a simple-result completion is pending (value OR compare mode).
-    pub fn hasSimpleResult(self: *const LuaFrameState) bool {
-        return (self.lua_packed_flags & SIMPLE_RESULT_COMPARE_FLAG) != 0 or
-            self.simple_result_dst != SIMPLE_RESULT_NONE;
-    }
-
-    /// True if the pending simple-result is in compare mode.
-    pub fn simpleResultIsCompare(self: *const LuaFrameState) bool {
-        return (self.lua_packed_flags & SIMPLE_RESULT_COMPARE_FLAG) != 0;
-    }
-
-    pub fn simpleResultEvent(self: *const LuaFrameState) TmsEvent {
-        return @enumFromInt((self.lua_packed_flags >> 2) & 0x1f);
-    }
-
-    pub fn simpleResultInvert(self: *const LuaFrameState) bool {
-        return (self.lua_packed_flags & 0x02) != 0;
-    }
-
-    /// Value mode: put 1 result into register `dst` (0..254), advance pc by 1.
-    /// Clears compare flag, sets dst and event.
-    pub fn setSimpleValueResult(self: *LuaFrameState, dst: u8, event: TmsEvent) void {
-        std.debug.assert(dst != SIMPLE_RESULT_NONE); // dst must be a real register
-        self.lua_packed_flags = (self.lua_packed_flags & 0x01) | // keep has_open_upvalues
-            (@as(u8, @intFromEnum(event)) << 2); // clear compare+invert, set event
-        self.simple_result_dst = dst;
-    }
-
-    /// Compare mode: check truthiness of 1 result, advance pc by 1, then by
-    /// 1 more if (truthy != invert). Sets compare flag, dst=NONE, event, invert.
-    pub fn setSimpleCompareResult(self: *LuaFrameState, event: TmsEvent, invert: bool) void {
-        self.lua_packed_flags = (self.lua_packed_flags & 0x01) | // keep has_open_upvalues
-            SIMPLE_RESULT_COMPARE_FLAG |
-            (if (invert) @as(u8, 0x02) else 0) |
-            (@as(u8, @intFromEnum(event)) << 2);
-        self.simple_result_dst = SIMPLE_RESULT_NONE; // invariant: compare ⟹ dst=NONE
-    }
-
-    /// Clear all simple-result state (back to NONE). Called on completion,
-    /// error-unwind, and frame initialization.
-    pub fn clearSimpleResult(self: *LuaFrameState) void {
-        self.lua_packed_flags &= 0x01; // keep only has_open_upvalues
-        self.simple_result_dst = SIMPLE_RESULT_NONE;
-    }
+    // P16.8 Task 1 + P16.33 T2: INVARIANT — The simple-result state machine
+    // has exactly three states, discriminated by callstatus CIST_SR plus
+    // the aux bytes (lua_packed_flags + simple_result_dst):
+    //
+    //   1. NONE  (CIST_SR=0): no simple-result pending. The aux bytes hold
+    //      STALE slot-reuse garbage — provably never read (every aux reader
+    //      is gated by hasSimpleResult(), i.e. by CIST_SR). This is PUC's
+    //      u2 valid-only-when-flagged pattern, and it is what lets
+    //      pushStagedFast skip the aux initializing stores (PUC's
+    //      prepCallInfo never initializes u2 either).
+    //   2. VALUE (CIST_SR=1, compare=0, dst=0..254): put 1 result into
+    //      register `simple_result_dst`, advance pc by 1. Zero returns →
+    //      nil (matches PUC `luaT_callTMres`).
+    //   3. COMPARE (CIST_SR=1, compare=1, dst=NO_REG): check truthiness of
+    //      1 result; advance pc by 1, then by 1 more if (truthy != invert).
+    //      Zero returns → false.
+    //
+    // Representation invariants: CIST_SR=1 ⟹ the aux bytes were written by
+    // setSimpleValueResult/setSimpleCompareResult (value-then-flag ordering:
+    // aux first, CIST_SR last — the same ordering discipline as resume_pc);
+    // compare=1 ⟹ dst=NO_REG. R254 is fully valid in value mode — the old
+    // 0xFE sentinel is gone.
+    //
+    // This bypasses the pending_calls array entirely. The completion info
+    // lives inline on the CallFrame (the CIST_SR bit in callstatus + the
+    // 2 aux bytes using the slack at the end of the 48-byte LuaFrameState
+    // since P16.21 T2), so the outer CallFrame stays 88 B (the C arm is the
+    // 56-B union floor).
+    //
+    // Resume equivalence: a frame with hasSimpleResult() that is suspended
+    // (coroutine yield) resumes identically to the old `.value`/`.compare`
+    // completion. The inline fields persist on the CallFrame (heap-resident
+    // in thread.call_frames), and the return path checks `hasSimpleResult()`
+    // before `pending_call_index`. The metamethod child frame is also
+    // heap-resident and persists across yield/resume. The ONLY difference
+    // from the old path is WHERE the completion info is stored (inline vs.
+    // pending_calls array); the semantics are identical.
+    //
+    // `pending_call_index` remains `INVALID_PENDING` while a simple-result is
+    // pending — the two completion mechanisms are mutually exclusive.
+    //
+    // P16.33 T2: the state-machine helpers moved from LuaFrameState to
+    // CallFrame (they need callstatus, which lives on the outer frame).
 };
 
 pub const CallFrame = extern struct {
@@ -1739,6 +1728,71 @@ pub const CallFrame = extern struct {
 
     // P15.51g: regs/boxed removed — derived on demand from base + frame_cap
     // via regsSlice()/boxedSlice(). Eliminates stale slices after bc_stack realloc.
+
+    // ── P16.33 T2: open-upvalues + simple-result state machine helpers ──
+    // Moved from LuaFrameState (they live on CallFrame because their
+    // discriminators are callstatus bits — PUC packs ALL per-frame flags
+    // into the one callstatus word). All simple_result/open-upvalues access
+    // goes through these typed helpers; callers cannot construct impossible
+    // states (compare+dst, stale flags, etc.).
+
+    /// True if this frame may have open upvalues (cells in its boxed
+    /// register window). C frames never set CIST_OUV → false for them.
+    pub inline fn hasOpenUpvalues(fr: *const CallFrame) bool {
+        return (fr.callstatus & CIST_OUV) != 0;
+    }
+
+    pub inline fn setOpenUpvalues(fr: *CallFrame, v: bool) void {
+        fr.callstatus = if (v) fr.callstatus | CIST_OUV else fr.callstatus & ~CIST_OUV;
+    }
+
+    /// True if a simple-result completion is pending (value OR compare mode).
+    /// Single callstatus-bit test — the validity flag for the aux bytes.
+    pub inline fn hasSimpleResult(fr: *const CallFrame) bool {
+        return (fr.callstatus & CIST_SR) != 0;
+    }
+
+    /// True if the pending simple-result is in compare mode (aux, valid
+    /// only while CIST_SR is set).
+    pub inline fn simpleResultIsCompare(fr: *const CallFrame) bool {
+        return (fr.u.lua.lua_packed_flags & SIMPLE_RESULT_COMPARE_FLAG) != 0;
+    }
+
+    pub inline fn simpleResultEvent(fr: *const CallFrame) TmsEvent {
+        return @enumFromInt((fr.u.lua.lua_packed_flags >> 2) & 0x1f);
+    }
+
+    pub inline fn simpleResultInvert(fr: *const CallFrame) bool {
+        return (fr.u.lua.lua_packed_flags & 0x02) != 0;
+    }
+
+    /// Value mode: put 1 result into register `dst` (0..254), advance pc by 1.
+    /// Value-then-flag ordering: aux bytes first, CIST_SR last — a failure
+    /// between the two cannot leave a half-set state visible to readers.
+    pub fn setSimpleValueResult(fr: *CallFrame, dst: u8, event: TmsEvent) void {
+        std.debug.assert(dst != SIMPLE_RESULT_NONE); // dst must be a real register
+        fr.u.lua.lua_packed_flags = @as(u8, @intFromEnum(event)) << 2; // clear compare+invert, set event
+        fr.u.lua.simple_result_dst = dst;
+        fr.callstatus |= CIST_SR;
+    }
+
+    /// Compare mode: check truthiness of 1 result, advance pc by 1, then by
+    /// 1 more if (truthy != invert). Value-then-flag ordering (see above).
+    pub fn setSimpleCompareResult(fr: *CallFrame, event: TmsEvent, invert: bool) void {
+        fr.u.lua.lua_packed_flags =
+            SIMPLE_RESULT_COMPARE_FLAG |
+            (if (invert) @as(u8, 0x02) else 0) |
+            (@as(u8, @intFromEnum(event)) << 2);
+        fr.u.lua.simple_result_dst = SIMPLE_RESULT_NONE; // invariant: compare ⟹ dst=NONE
+        fr.callstatus |= CIST_SR;
+    }
+
+    /// Clear the pending simple-result state (back to NONE). Called on
+    /// completion, error-unwind, and rollback (errdefer). The aux bytes are
+    /// left stale — valid-only-while-CIST_SR (PUC u2 pattern).
+    pub inline fn clearSimpleResult(fr: *CallFrame) void {
+        fr.callstatus &= ~CIST_SR;
+    }
 
     // ── Accessors (migrated from RuntimeFrame) ──
     // All closures carry a bytecode proto. These accessors delegate to the
@@ -4880,6 +4934,11 @@ pub const Vm = struct {
     /// P15.51g: Accept optional thread to resolve correct stack for parked coroutines.
     fn frameVarargs(self: *Vm, frame: *const CallFrame, th: ?*Thread) []Value {
         const proto = frame.proto() orelse return &.{};
+        // P16.33 T2 (PUC parity): nextraargs is written ONLY on vararg
+        // activation paths — for non-vararg frames it holds stale
+        // slot-reuse garbage (PUC's precall leaves u.l.nextraargs stale
+        // for non-vararg frames too). Guard the read by is_vararg.
+        if (!proto.flags.is_vararg) return &.{};
         const nextra: usize = frame.u.lua.nextraargs;
         if (nextra == 0) return &.{};
         const stack = stackForThread(self, th);
@@ -4933,8 +4992,8 @@ pub const Vm = struct {
         // P16.8 Task 1: Check inline simple-result completion first.
         // The debug name is derived from simple_result_event — no pending_calls
         // slot is involved.
-        if (parent.isLua() and parent.u.lua.hasSimpleResult()) {
-            const event: TmsEvent = parent.u.lua.simpleResultEvent();
+        if (parent.isLua() and parent.hasSimpleResult()) {
+            const event: TmsEvent = parent.simpleResultEvent();
             return .{
                 .namewhat = "metamethod",
                 .name = tag_method.opname(event),
@@ -8485,7 +8544,7 @@ pub const Vm = struct {
         if (had_close_error) {
             self.freeBytecodeClosePost(post);
             if (close_err) |err_value| self.restoreRuntimeErrorValue(err_value);
-            if (exec_frames.getPtr(parent_index).u.lua.hasOpenUpvalues())
+            if (exec_frames.getPtr(parent_index).hasOpenUpvalues())
                 self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), 0);
             self.popBytecodeExecFrame(exec_frames);
             return .propagate_error;
@@ -8493,7 +8552,7 @@ pub const Vm = struct {
 
         switch (post) {
             .advance_instruction => {
-                if (exec_frames.getPtr(parent_index).u.lua.hasOpenUpvalues())
+                if (exec_frames.getPtr(parent_index).hasOpenUpvalues())
                     self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), close_min_reg);
                 // PUC-faithful: the caller (OP_CLOSE handler) increments its
                 // local `ctx.pc` directly. We must NOT write to the frame's
@@ -8524,7 +8583,7 @@ pub const Vm = struct {
             },
             .unwind_frame => {
                 if (close_err) |err_value| self.restoreRuntimeErrorValue(err_value);
-                if (exec_frames.getPtr(parent_index).u.lua.hasOpenUpvalues())
+                if (exec_frames.getPtr(parent_index).hasOpenUpvalues())
                     self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), 0);
                 self.popBytecodeExecFrame(exec_frames);
                 return .propagate_error;
@@ -8676,7 +8735,7 @@ pub const Vm = struct {
         std.debug.assert(parent.pending_call_index == INVALID_PENDING);
         // P16.8 Task 1: simple_result and pending_calls are mutually exclusive.
         if (!parent.isC()) {
-            std.debug.assert(!parent.u.lua.hasSimpleResult());
+            std.debug.assert(!parent.hasSimpleResult());
         }
 
         if (mode == .pending) {
@@ -8720,11 +8779,11 @@ pub const Vm = struct {
             // hook dispatch). The errdefer below rolls it back if any
             // fails, mirroring the errdefer clearPendingCall pattern above.
             switch (sr.completion) {
-                .value => |dst| parent.u.lua.setSimpleValueResult(dst, sr.event),
-                .compare => |invert| parent.u.lua.setSimpleCompareResult(sr.event, invert),
+                .value => |dst| parent.setSimpleValueResult(dst, sr.event),
+                .compare => |invert| parent.setSimpleCompareResult(sr.event, invert),
             }
             // Re-fetch via getPtr: pushStagedBytecodeExecFrame may realloc.
-            errdefer exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
+            errdefer exec_frames.getPtr(parent_index).clearSimpleResult();
             // simple_result always consumes exactly 1 result (nresults=-1
             // means "the continuation handles result count" — the
             // simple_result completion reads exactly 1 value from the
@@ -8740,13 +8799,13 @@ pub const Vm = struct {
                 // generic arm below: every fallible step sits under the
                 // clearSimpleResult errdefer above.
                 const staged = try self.stageFixedCall(n, self.bc_stack_top, closure, args);
-                if (!try self.pushStagedFast(
+                if ((try self.pushStagedFast(
                     exec_frames,
                     proto,
                     staged.func_slot,
                     staged.nargs,
                     -1,
-                )) {
+                )) == null) {
                     try self.pushStagedBytecodeExecFrame(
                         exec_frames,
                         proto,
@@ -12690,7 +12749,7 @@ pub const Vm = struct {
                     }
                 }
 
-                if (frame.u.lua.hasOpenUpvalues())
+                if (frame.hasOpenUpvalues())
                     self.closeBytecodeUpvaluesFrom(frame, 0);
                 self.popBytecodeExecFrame(exec_frames);
             }
@@ -12897,10 +12956,31 @@ pub const Vm = struct {
     /// missing/excess), non-vararg, capacity already available (no stack
     /// growth), no hook gate active.
     ///
-    /// Returns true when the child frame was activated; false when the
-    /// caller must take the general slow path (varargs / VAHID / missing
-    /// args / growth / overflow / hooks). Heap-spill OOM propagates via
-    /// DispatchError exactly like FrameStack.addOne.
+    /// Returns the new frame's index when the child frame was activated;
+    /// null when the caller must take the general slow path (varargs /
+    /// VAHID / missing args / growth / overflow / hooks). The index lets
+    /// the dispatch OP_CALL fast path enter the child directly (PUC
+    /// `goto startfunc` parity — see the call site). Heap-spill OOM
+    /// propagates via DispatchError exactly like FrameStack.addOne.
+    ///
+    /// P16.33 T2 (PUC prepCallInfo parity): this path writes ONLY the
+    /// fields PUC's activation writes (func.p, callstatus, top, savedpc —
+    /// here: func_slot, callstatus, frame_cap, proto, pc) plus the fields
+    /// whose readers are UNGATED (reg_top: multret-CALL nargs derivation
+    /// and GC live-reg scan; tbc_mark/tbc_chain_base: pop-time snapshots
+    /// that are NOT re-derivable at pop; pending_call_index: frame_loop's
+    /// ungated entry check on slot reuse; bc_stack_top: the stack
+    /// watermark). Three eager stores PUC does NOT have are skipped:
+    ///   - nextraargs: non-vararg is proven by the gate; PUC writes
+    ///     u.l.nextraargs only on vararg paths, and every reader is
+    ///     vararg-guarded (see the field doc).
+    ///   - lua_packed_flags / simple_result_dst: simple-result AUX bytes,
+    ///     valid only while callstatus CIST_SR is set — and the masked
+    ///     callstatus store below provably clears it (PUC u2 pattern).
+    /// The slow path (pushStagedBytecodeExecFrame's general body) writes
+    /// nextraargs (always) and leaves the aux bytes stale-dead (CIST_SR
+    /// clear from its own masked callstatus write) — slots are always
+    /// fully initialized WHERE it matters.
     inline fn pushStagedFast(
         self: *Vm,
         exec_frames: *FrameStack,
@@ -12908,14 +12988,14 @@ pub const Vm = struct {
         func_slot_in: usize,
         nargs: usize,
         nresults: i32,
-    ) DispatchError!bool {
+    ) DispatchError!?usize {
         if (!proto.flags.is_vararg and nargs == proto.numparams) {
             const frame_cap32: u32 = @intCast(proto.maxstacksize + EXTRA_MARGIN);
             const base = func_slot_in + 1;
             const needed_top = base + frame_cap32;
             // PUC checkstackp: the child frame must fit the CURRENT stack
             // with ERRORSTACKSIZE headroom and no growth. Growth/overflow
-            // shapes return false — the slow path (and opCall) own
+            // shapes return null — the slow path (and opCall) own
             // ensureBcStackCap and the overflow machinery. This check also
             // guarantees no bc_stack realloc happens on the success path,
             // so the caller's ctx.regs slice stays valid without a refresh.
@@ -12944,11 +13024,21 @@ pub const Vm = struct {
                 // address compute in straight-line code instead of an
                 // out-of-line call. The heap-spill branch (>INLINE_FRAME_CAP
                 // frames deep) keeps addOne's error-propagating heap growth.
-                const ef_slot = if (exec_frames.inline_count < INLINE_FRAME_CAP) blk: {
+                // P16.33 T2: both branches also produce the new frame's
+                // INDEX (len()-1) so the dispatch CALL fast path can enter
+                // the child without re-deriving it at frame_loop's top.
+                const Ef = struct { idx: usize, ptr: *CallFrame };
+                const ef: Ef = if (exec_frames.inline_count < INLINE_FRAME_CAP) blk: {
                     const idx = exec_frames.inline_count;
                     exec_frames.inline_count = idx + 1;
-                    break :blk &exec_frames.inline_frames[idx];
-                } else try exec_frames.heap.addOne(self.alloc);
+                    break :blk .{ .idx = idx, .ptr = &exec_frames.inline_frames[idx] };
+                } else blk: {
+                    const hidx = exec_frames.heap.items.len;
+                    const ptr = try exec_frames.heap.addOne(self.alloc);
+                    break :blk .{ .idx = INLINE_FRAME_CAP + hidx, .ptr = ptr };
+                };
+                const ef_index = ef.idx;
+                const ef_slot = ef.ptr;
                 // P16.29 (corollary of P16.21 T4.3): hooks are OFF here
                 // (gated above), so the five hook-replay sentinels
                 // (resume_pc, last_line_pc, skip_line_hook_pc,
@@ -12959,15 +13049,15 @@ pub const Vm = struct {
                 // 8 bits, so CIST_HOOKYIELD is clear), and BOTH hook-install
                 // paths sanitize live frames via sanitizeHookReplayState.
                 // Skip their INVALID_PC stores; write only fields with
-                // ungated readers. simple_result_dst MUST stay 0xFF —
-                // hasSimpleResult() reads it unconditionally on return.
+                // ungated readers.
+                //
+                // P16.33 T2: nextraargs / lua_packed_flags /
+                // simple_result_dst stores are skipped too (see the
+                // function doc above) — PUC prepCallInfo parity.
                 ef_slot.u = .{ .lua = undefined };
                 ef_slot.u.lua.proto = proto;
                 ef_slot.u.lua.pc = 0;
                 ef_slot.u.lua.frame_cap = frame_cap32;
-                ef_slot.u.lua.nextraargs = 0;
-                ef_slot.u.lua.lua_packed_flags = 0;
-                ef_slot.u.lua.simple_result_dst = 0xFF;
                 ef_slot.func_slot = func_slot_in; // base = func_slot + 1
                 ef_slot.callstatus = encodeNresults(nresults);
                 ef_slot.reg_top = @intCast(proto.numparams);
@@ -12977,10 +13067,10 @@ pub const Vm = struct {
                 ef_slot.pending_call_index = INVALID_PENDING;
                 // Stack bookkeeping (PUC prepCallInfo + checkstack).
                 self.bc_stack_top = needed_top;
-                return true;
+                return ef_index;
             }
         }
-        return false;
+        return null;
     }
 
     /// ACTIVATE step (PUC luaD_precall LUA_VLCL branch, ldo.c:725-735).
@@ -13002,8 +13092,8 @@ pub const Vm = struct {
     ) DispatchError!void {
         // P16.29: shared inline fast path first (single source of truth
         // with the dispatch OP_CALL handler). On success the activation is
-        // complete; on false fall through to the general body below.
-        if (try self.pushStagedFast(exec_frames, proto, func_slot_in, nargs, nresults)) return;
+        // complete; on null fall through to the general body below.
+        if ((try self.pushStagedFast(exec_frames, proto, func_slot_in, nargs, nresults)) != null) return;
 
         if (self.stats.enabled) self.stats.calls_lua_frames += 1; // P16.0b: ALL Lua activations
         // Slow path: varargs / VAHID / missing args / growth / overflow /
@@ -13194,13 +13284,13 @@ pub const Vm = struct {
         ef_slot.tbc_chain_base = tbc_chain_base;
         // P15.51n: Initialize pending_call_index (addOne doesn't zero-init).
         ef_slot.pending_call_index = INVALID_PENDING;
-        // P16.8 Task 1: Initialize simple_result state (no simple-result pending).
-        ef_slot.u.lua.clearSimpleResult();
-
-        // P15.51g: regs/boxed are no longer cached in the frame — they are
-        // derived on demand from base + frame_cap. The local `regs`/`boxed`
-        // slices are used only for the nil-fill below.
-        ef_slot.u.lua.setOpenUpvalues(false);
+        // P16.33 T2: simple_result + open-upvalues state need NO
+        // initialization here — both discriminators are callstatus bits
+        // (CIST_SR / CIST_OUV) and the masked callstatus write above
+        // provably clears them (the old clearSimpleResult() /
+        // setOpenUpvalues(false) calls were dead). The aux bytes
+        // (lua_packed_flags / simple_result_dst) stay stale-dead —
+        // valid-only-while-CIST_SR (PUC u2 pattern).
 
         // P16.21 T4.3: hook-replay sentinels are initialized ONLY when hooks
         // are active for this thread (one predictable branch on the common
@@ -13286,7 +13376,7 @@ pub const Vm = struct {
         // Handles the error-unwind case where the parent frame is popped
         // without the normal return path clearing simple_result state.
         if (!frame.isC()) {
-            frame.u.lua.clearSimpleResult();
+            frame.clearSimpleResult();
         }
         // P15.38f: Clear in_debug_hook if this was a debug hook frame.
         // Since isInDebugHook() prevents nested hooks, at most one hook frame
@@ -13376,7 +13466,7 @@ pub const Vm = struct {
         const child_idx = exec_frames.len() - 1;
         const child_frame = exec_frames.getConstPtr(child_idx);
         const callee_nresults = decodeNresults(child_frame.callstatus);
-        if (exec_frames.getPtr(child_idx).u.lua.hasOpenUpvalues())
+        if (exec_frames.getPtr(child_idx).hasOpenUpvalues())
             self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(child_idx), 0);
         self.popBytecodeExecFrame(exec_frames);
 
@@ -13431,10 +13521,10 @@ pub const Vm = struct {
         // the completion is handled inline — no pending_calls slot involved.
         {
             const parent_ptr = exec_frames.getPtr(parent_index);
-            if (parent_ptr.isLua() and parent_ptr.u.lua.hasSimpleResult()) {
-                if (parent_ptr.u.lua.simpleResultIsCompare()) {
+            if (parent_ptr.isLua() and parent_ptr.hasSimpleResult()) {
+                if (parent_ptr.simpleResultIsCompare()) {
                     // Compare mode: check truthiness, adjust pc.
-                    const invert = parent_ptr.u.lua.simpleResultInvert();
+                    const invert = parent_ptr.simpleResultInvert();
                     const result = ret.len != 0 and isTruthy(ret[0]);
                     parent_ptr.u.lua.pc += 1;
                     if (result != invert) parent_ptr.u.lua.pc += 1;
@@ -13446,7 +13536,7 @@ pub const Vm = struct {
                     regs[sr_dst] = if (ret.len == 0) .Nil else ret[0];
                     parent_ptr.u.lua.pc += 1;
                 }
-                parent_ptr.u.lua.clearSimpleResult();
+                parent_ptr.clearSimpleResult();
                 if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
                 return null;
             }
@@ -13561,7 +13651,7 @@ pub const Vm = struct {
             if (frame.isC()) {
                 self.detachTbcRegion(self.activeBytecodeThread(), frame.tbc_chain_base);
             }
-            if (!frame.isC() and frame.u.lua.hasOpenUpvalues())
+            if (!frame.isC() and frame.hasOpenUpvalues())
                 self.closeBytecodeUpvaluesFrom(frame, 0);
             self.popBytecodeExecFrame(exec_frames);
         }
@@ -15958,12 +16048,12 @@ pub const Vm = struct {
                                     ctx.base + inst.a,
                                     nargs,
                                     nresults,
-                                )) {
+                                )) |child_index| {
                                     // P16.29 T2: park the caller's pc AT this
-                                    // CALL before the frame_loop starts
-                                    // executing the child. Every completion
-                                    // path of a plain Lua→Lua call (the
-                                    // opReturn0/1 fast arms' pc += 1,
+                                    // CALL before the child starts executing.
+                                    // Every completion path of a plain
+                                    // Lua→Lua call (the opReturn0/1 fast
+                                    // arms' pc += 1,
                                     // applyBytecodeResultsDirect's +1)
                                     // advances the parked pc by one — the
                                     // parked value must be the CALL opcode
@@ -15971,7 +16061,61 @@ pub const Vm = struct {
                                     // defer (PUC: luaD_precall's caller does
                                     // savestate/savedpc before the jump).
                                     self.parkActiveFrame(&ctx);
-                                    continue :frame_loop;
+                                    // P16.33 T2 (PUC startfunc parity):
+                                    // enter the child DIRECTLY from the
+                                    // activation's register-resident state
+                                    // instead of re-entering frame_loop,
+                                    // which would re-derive from the heap
+                                    // CallFrame everything this handler
+                                    // already holds in registers. PUC's
+                                    // OP_CALL does exactly this: precall
+                                    // returns ci, then `goto startfunc`
+                                    // derives only `base = ci->func.p + 1`
+                                    // (lvm.c) — no pending-call check, no
+                                    // frame re-fetch, no re-derivation of
+                                    // cl/k/pc. Skipped frame_loop entry
+                                    // work, all provably redundant for a
+                                    // frame THIS handler just activated:
+                                    //   - len() > boundary_depth: the push
+                                    //     grew the stack above the parent,
+                                    //     which was already >= boundary;
+                                    //   - pending_call_index check: the
+                                    //     activation just stored
+                                    //     INVALID_PENDING;
+                                    //   - hot-field loads (proto,
+                                    //     bc_stack[func_slot].Closure
+                                    //     .upvalues, frame_cap, pc): all
+                                    //     are the register-resident
+                                    //     proto/cl/frame_cap32/0 here;
+                                    //   - regs slice rebuild: same
+                                    //     arithmetic, same bc_stack
+                                    //     (pushStagedFast guarantees no
+                                    //     realloc on success).
+                                    // The SIGINT boundary check is KEPT
+                                    // (signal latency model: boundary +
+                                    // backward-jump checks — a signal that
+                                    // fired while the parent ran must be
+                                    // caught before the child's first
+                                    // backward jump, matching frame_loop's
+                                    // entry check; library embedders pay
+                                    // nothing, check_sigint is const false).
+                                    ctx.frame_index = child_index;
+                                    ctx.cur_proto = proto;
+                                    ctx.cur_upvalues = cl.upvalues;
+                                    const child_base = ctx.base + inst.a + 1;
+                                    ctx.base = child_base;
+                                    const child_cap: u32 = @intCast(proto.maxstacksize + EXTRA_MARGIN);
+                                    ctx.frame_cap = child_cap;
+                                    ctx.pc = 0;
+                                    ctx.regs = self.bc_stack[child_base .. child_base + child_cap];
+                                    if (check_sigint and signal_int_pending.load(.acquire)) {
+                                        signal_int_pending.store(false, .release);
+                                        return self.fail("interrupted!", .{});
+                                    }
+                                    // Plain `continue` (no pc advance): the
+                                    // child's pc is already 0 — same
+                                    // convention as .continue_no_advance.
+                                    continue;
                                 }
                             }
                         }
@@ -16442,7 +16586,7 @@ pub const Vm = struct {
             // See opReturn1 for the full safety proof and condition rationale.
             {
                 const child = ctx.exec_frames.topConstPtr();
-                if (!child.u.lua.hasOpenUpvalues() and
+                if (!child.hasOpenUpvalues() and
                     !child.isDebugHook() and
                     ctx.frame_index > 0 and
                     ctx.frame_index != ctx.boundary_depth)
@@ -16450,7 +16594,7 @@ pub const Vm = struct {
                     const parent_c = ctx.exec_frames.parentPtrOfTopConst();
                     if (parent_c.isLua() and
                         parent_c.pending_call_index == INVALID_PENDING and
-                        !parent_c.u.lua.hasSimpleResult())
+                        !parent_c.hasSimpleResult())
                     {
                         const nresults = decodeNresults(child.callstatus);
                         if (nresults == 0 or nresults < 0) {
@@ -16501,7 +16645,7 @@ pub const Vm = struct {
                     // 0 values returned: value mode → nil; compare mode → false.
                     if (parent_c.isLua() and
                         parent_c.pending_call_index == INVALID_PENDING and
-                        parent_c.u.lua.hasSimpleResult())
+                        parent_c.hasSimpleResult())
                     {
                         const nresults = decodeNresults(child.callstatus);
                         if (nresults < 0) {
@@ -16512,9 +16656,9 @@ pub const Vm = struct {
                             self.bc_stack_top = parent_c.frameBase() + parent_c.u.lua.frame_cap;
                             ctx.exec_frames.shrinkTo(ctx.frame_index);
                             const parent_m = @constCast(parent_c);
-                            if (parent_m.u.lua.simpleResultIsCompare()) {
+                            if (parent_m.simpleResultIsCompare()) {
                                 // Compare mode: 0 values → false.
-                                const invert = parent_m.u.lua.simpleResultInvert();
+                                const invert = parent_m.simpleResultInvert();
                                 parent_m.u.lua.pc += 1;
                                 if (false != invert) parent_m.u.lua.pc += 1;
                             } else {
@@ -16524,7 +16668,7 @@ pub const Vm = struct {
                                 parent_m.reg_top = @intCast(sr_dst + 1);
                                 parent_m.u.lua.pc += 1;
                             }
-                            parent_m.u.lua.clearSimpleResult();
+                            parent_m.clearSimpleResult();
                             // P16.29 T2: in-place parent resume (see the
                             // ordinary fast arm above for the full safety
                             // proof). The metamethod push parked the parent
@@ -16634,7 +16778,7 @@ pub const Vm = struct {
                 // Condition (f): no hooks — !hooks_active_cached (above) +
                 //   !child.isDebugHook() (popBytecodeExecFrame clears
                 //   in_debug_hook for debug-hook frames; skip that path).
-                if (!child.u.lua.hasOpenUpvalues() and
+                if (!child.hasOpenUpvalues() and
                     !child.isDebugHook() and
                     ctx.frame_index > 0 and // (c): parent exists
                     ctx.frame_index != ctx.boundary_depth) // (d): not boundary
@@ -16646,7 +16790,7 @@ pub const Vm = struct {
                     // P16.8 Task 1: also exclude simple_result (handled below).
                     if (parent_c.isLua() and
                         parent_c.pending_call_index == INVALID_PENDING and
-                        !parent_c.u.lua.hasSimpleResult())
+                        !parent_c.hasSimpleResult())
                     {
                         const nresults = decodeNresults(child.callstatus);
                         // Condition (g): fast arm handles nresults==1 (fixed
@@ -16711,7 +16855,7 @@ pub const Vm = struct {
                     // simple_result always uses MULTRET (nresults < 0).
                     if (parent_c.isLua() and
                         parent_c.pending_call_index == INVALID_PENDING and
-                        parent_c.u.lua.hasSimpleResult())
+                        parent_c.hasSimpleResult())
                     {
                         const nresults = decodeNresults(child.callstatus);
                         if (nresults < 0) {
@@ -16723,10 +16867,10 @@ pub const Vm = struct {
                             self.bc_stack_top = parent_c.frameBase() + parent_c.u.lua.frame_cap;
                             ctx.exec_frames.shrinkTo(ctx.frame_index);
                             const parent_m = @constCast(parent_c);
-                            if (parent_m.u.lua.simpleResultIsCompare()) {
+                            if (parent_m.simpleResultIsCompare()) {
                                 // Compare mode: check truthiness, adjust pc.
                                 const result = isTruthy(src_val);
-                                const invert = parent_m.u.lua.simpleResultInvert();
+                                const invert = parent_m.simpleResultInvert();
                                 parent_m.u.lua.pc += 1;
                                 if (result != invert) parent_m.u.lua.pc += 1;
                             } else {
@@ -16736,7 +16880,7 @@ pub const Vm = struct {
                                 parent_m.reg_top = @intCast(sr_dst + 1);
                                 parent_m.u.lua.pc += 1;
                             }
-                            parent_m.u.lua.clearSimpleResult();
+                            parent_m.clearSimpleResult();
                             // P16.29 T2: in-place parent resume (see the
                             // ordinary fast arm above for the safety proof).
                             ctx.frame_index -= 1;
@@ -16888,7 +17032,7 @@ pub const Vm = struct {
                     // closeBytecodeUpvaluesFrom knows to scan on return.
                     // The dispatch loop's fast path (OP_MOVE etc.) reads
                     // this flag directly from the CallFrame (P15.51l).
-                    ctx.exec_frames.getPtr(ctx.frame_index).u.lua.setOpenUpvalues(true);
+                    ctx.exec_frames.getPtr(ctx.frame_index).setOpenUpvalues(true);
                 }
             } else {
                 // Proxy from current frame's upvalues.
@@ -25374,7 +25518,13 @@ pub const Vm = struct {
                     // func_slot-nextra slice is wrong for vararg-TABLE frames
                     // (see frameVarargs) and underflowed in Debug when
                     // func_slot < nextraargs.
-                    if (exec_fr.proto() != null and exec_fr.u.lua.nextraargs != 0) {
+                    // P16.33 T2: is_vararg guard — nextraargs is stale
+                    // slot-reuse garbage for non-vararg frames (PUC parity;
+                    // frameVarargs re-checks it too, this guard just avoids
+                    // the call).
+                    if (exec_fr.proto() != null and exec_fr.isVararg() and
+                        exec_fr.u.lua.nextraargs != 0)
+                    {
                         // Use the same `stack` variable as the regs scan above:
                         // for the VM-active thread, bytecode_stack is empty
                         // (moved to self.bc_stack); for parked coroutines,
@@ -44058,44 +44208,46 @@ test "vm: generational GC enters and leaves incremental major mode" {
 test "vm: P16.8 R254 is valid simple_result value-mode destination" {
     const testing = std.testing;
 
-    var frame_state = LuaFrameState{};
+    // P16.33 T2: the simple-result state machine lives on CallFrame (its
+    // discriminators are callstatus bits CIST_SR/CIST_OUV). A fresh Lua
+    // frame: callstatus 0 → no simple result pending, CIST_SR clear.
+    var frame = CallFrame{ .u = .{ .lua = .{} } };
 
     // Initially: no simple result pending.
-    try testing.expect(!frame_state.hasSimpleResult());
-    try testing.expectEqual(@as(u8, 0xFF), frame_state.simple_result_dst);
+    try testing.expect(!frame.hasSimpleResult());
+    try testing.expectEqual(@as(u8, 0xFF), frame.u.lua.simple_result_dst);
 
     // Set value-mode result to R254 (0xFE) — the old sentinel.
-    frame_state.setSimpleValueResult(254, .add);
-    try testing.expect(frame_state.hasSimpleResult());
-    try testing.expect(!frame_state.simpleResultIsCompare());
-    try testing.expectEqual(@as(u8, 254), frame_state.simple_result_dst);
-    try testing.expectEqual(TmsEvent.add, frame_state.simpleResultEvent());
+    frame.setSimpleValueResult(254, .add);
+    try testing.expect(frame.hasSimpleResult());
+    try testing.expect(!frame.simpleResultIsCompare());
+    try testing.expectEqual(@as(u8, 254), frame.u.lua.simple_result_dst);
+    try testing.expectEqual(TmsEvent.add, frame.simpleResultEvent());
 
     // Set compare-mode result — dst must be NO_REG (invariant).
-    frame_state.clearSimpleResult();
-    frame_state.setSimpleCompareResult(.lt, true);
-    try testing.expect(frame_state.hasSimpleResult());
-    try testing.expect(frame_state.simpleResultIsCompare());
-    try testing.expectEqual(@as(u8, 0xFF), frame_state.simple_result_dst);
-    try testing.expectEqual(TmsEvent.lt, frame_state.simpleResultEvent());
-    try testing.expect(frame_state.simpleResultInvert());
+    frame.clearSimpleResult();
+    frame.setSimpleCompareResult(.lt, true);
+    try testing.expect(frame.hasSimpleResult());
+    try testing.expect(frame.simpleResultIsCompare());
+    try testing.expectEqual(@as(u8, 0xFF), frame.u.lua.simple_result_dst);
+    try testing.expectEqual(TmsEvent.lt, frame.simpleResultEvent());
+    try testing.expect(frame.simpleResultInvert());
 
-    // Clear back to NONE.
-    frame_state.clearSimpleResult();
-    try testing.expect(!frame_state.hasSimpleResult());
-    try testing.expectEqual(@as(u8, 0xFF), frame_state.simple_result_dst);
+    // Clear back to NONE (aux bytes go stale-dead — valid-only-while-CIST_SR).
+    frame.clearSimpleResult();
+    try testing.expect(!frame.hasSimpleResult());
 
     // Verify R0 and R254 are both valid value-mode destinations.
-    frame_state.setSimpleValueResult(0, .index);
-    try testing.expectEqual(@as(u8, 0), frame_state.simple_result_dst);
-    try testing.expect(!frame_state.simpleResultIsCompare());
-    frame_state.clearSimpleResult();
+    frame.setSimpleValueResult(0, .index);
+    try testing.expectEqual(@as(u8, 0), frame.u.lua.simple_result_dst);
+    try testing.expect(!frame.simpleResultIsCompare());
+    frame.clearSimpleResult();
 
-    frame_state.setSimpleValueResult(254, .len);
-    try testing.expectEqual(@as(u8, 254), frame_state.simple_result_dst);
-    try testing.expect(!frame_state.simpleResultIsCompare());
-    try testing.expectEqual(TmsEvent.len, frame_state.simpleResultEvent());
-    frame_state.clearSimpleResult();
+    frame.setSimpleValueResult(254, .len);
+    try testing.expectEqual(@as(u8, 254), frame.u.lua.simple_result_dst);
+    try testing.expect(!frame.simpleResultIsCompare());
+    try testing.expectEqual(TmsEvent.len, frame.simpleResultEvent());
+    frame.clearSimpleResult();
 }
 
 // =========================================================================
@@ -44188,7 +44340,7 @@ test "vm: P16.8a transactional simple_result setup — errdefer rollback on push
     var iter: usize = 0;
     while (iter < 5) : (iter += 1) {
         // Ensure clean slate for each iteration.
-        exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
+        exec_frames.getPtr(parent_index).clearSimpleResult();
         // bc_stack_top near the end forces growBcStackCapSlow in
         // pushBytecodeExecFrame (needed_for_args > bc_stack.len).
         vm.bc_stack_top = vm.bc_stack.len - 2;
@@ -44221,7 +44373,7 @@ test "vm: P16.8a transactional simple_result setup — errdefer rollback on push
         // Invariant: parent is EXACTLY as it was before the call.
         // 1. simple_result must be NONE (errdefer cleared it).
         try testing.expect(
-            !exec_frames.getPtr(parent_index).u.lua.hasSimpleResult(),
+            !exec_frames.getPtr(parent_index).hasSimpleResult(),
         );
         // 2. No child frame was left on the call stack.
         try testing.expectEqual(
@@ -44239,7 +44391,7 @@ test "vm: P16.8a transactional simple_result setup — errdefer rollback on push
     // Verifies the errdefer does NOT fire spuriously on success: the
     // parent keeps its simple_result and the child frame is on the stack.
     {
-        exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
+        exec_frames.getPtr(parent_index).clearSimpleResult();
         vm.bc_stack_top = vm.bc_stack.len - 2;
 
         var failing = std.testing.FailingAllocator.init(aalloc, .{
@@ -44266,7 +44418,7 @@ test "vm: P16.8a transactional simple_result setup — errdefer rollback on push
         try testing.expect(outcome == .pushed);
         // Parent must have simple_result set (errdefer did NOT fire).
         try testing.expect(
-            exec_frames.getPtr(parent_index).u.lua.hasSimpleResult(),
+            exec_frames.getPtr(parent_index).hasSimpleResult(),
         );
         // Child frame must be on the call stack.
         try testing.expectEqual(
@@ -44275,7 +44427,7 @@ test "vm: P16.8a transactional simple_result setup — errdefer rollback on push
         );
         // Clean up: pop the child frame and clear simple_result.
         vm.popBytecodeExecFrame(exec_frames);
-        exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
+        exec_frames.getPtr(parent_index).clearSimpleResult();
     }
 
     // Restore bc_stack_top for clean deinit.
@@ -44358,7 +44510,7 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
     // exceeds the 2 remaining slots → growBcStackCapSlow → FailingAllocator
     // makes the realloc fail → error.OutOfMemory.
     {
-        exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
+        exec_frames.getPtr(parent_index).clearSimpleResult();
         vm.bc_stack_top = vm.bc_stack.len - 3;
         const saved_top = vm.bc_stack_top;
 
@@ -44383,7 +44535,7 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
 
         try testing.expectError(error.OutOfMemory, result);
         // 1. simple_result rolled back.
-        try testing.expect(!exec_frames.getPtr(parent_index).u.lua.hasSimpleResult());
+        try testing.expect(!exec_frames.getPtr(parent_index).hasSimpleResult());
         // 2. no child frame.
         try testing.expectEqual(saved_frame_count, exec_frames.len());
         // 3. no pending-call slot leak.
@@ -44401,7 +44553,7 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
     // Pre-grow bc_stack so the activation needs no growth: the first
     // allocation on the path is addOne, which the FailingAllocator rejects.
     {
-        exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
+        exec_frames.getPtr(parent_index).clearSimpleResult();
         const child_frame_cap: usize = mm_proto.maxstacksize + EXTRA_MARGIN;
         try vm.ensureBcStackCap(vm.bc_stack_top + 1 + args.len + child_frame_cap);
         vm.bc_stack_top = vm.bc_stack.len - 1 - args.len - child_frame_cap;
@@ -44427,7 +44579,7 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
         vm.alloc = saved_alloc;
 
         try testing.expectError(error.OutOfMemory, result);
-        try testing.expect(!exec_frames.getPtr(parent_index).u.lua.hasSimpleResult());
+        try testing.expect(!exec_frames.getPtr(parent_index).hasSimpleResult());
         try testing.expectEqual(saved_frame_count, exec_frames.len());
         try testing.expectEqual(
             @as(u32, INVALID_PENDING),
@@ -44440,7 +44592,7 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
 
     // ── Success iteration: staging + activation both succeed. ──
     {
-        exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
+        exec_frames.getPtr(parent_index).clearSimpleResult();
         const child_frame_cap: usize = mm_proto.maxstacksize + EXTRA_MARGIN;
         try vm.ensureBcStackCap(vm.bc_stack_top + 1 + args.len + child_frame_cap);
 
@@ -44454,11 +44606,11 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
             .{ .value = 0 },
         );
         try testing.expect(outcome == .pushed);
-        try testing.expect(exec_frames.getPtr(parent_index).u.lua.hasSimpleResult());
+        try testing.expect(exec_frames.getPtr(parent_index).hasSimpleResult());
         try testing.expectEqual(saved_frame_count + 1, exec_frames.len());
         // Clean up: pop the child frame and clear simple_result.
         vm.popBytecodeExecFrame(exec_frames);
-        exec_frames.getPtr(parent_index).u.lua.clearSimpleResult();
+        exec_frames.getPtr(parent_index).clearSimpleResult();
     }
 
     // Restore bc_stack_top for clean deinit.

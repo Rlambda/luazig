@@ -9357,3 +9357,70 @@ LEN error без суффикса `(local 'x')`; locals.lua raw-diff = interleav
 артефакт tracegc "." (stderr/stdout merge в run_tests.py; оба движка
 печатают ровно 1 точку; на HEAD идентично); uncaught `error("boom")`
 double-traceback (на HEAD идентично, PUC печатает один раз).
+
+## P16.34 Cut 2 — dispatch-local gate word: реализован, измерён, REJECTED; switchRuntime exit-ordering parity fix (2026-09-10)
+
+Cut 2 пытался убрать per-fetch load `self.dispatch_gate` (T0 компонент
+«gate») зеркалированием PUC `trap`-модели: dispatch-local
+`var gate: u8 = self.dispatch_gate` + refresh на каждой границе, где
+nested-код мог поменять hooks (32 refresh-сайта: hooks-block end =
+`trap = luaG_traceexec` parity, index-arms после sync __index/__newindex,
+`.value`/`.compare` sync-метаметоды, unwrap opCall/opTailcall/opTforcall/
+opSetlist, GC-шаги allocTable/condGc — финалайзеры это Lua-код, PUC
+refresh'ит trap в checkGC именно поэтому). Мутационный инвентарь доказал
+полноту списка: все HOOKS-писатели (builtinDebugSethook, lua_sethook,
+switchRuntime) синхронны и вложены; асинхронного писателя нет (SIGINT =
+signal_int_pending, отдельная проверка на backward jumps, P16.10 T8);
+STATS пишет только CLI до старта.
+
+Реализация прошла все функциональные гейты, но A/B (median-of-3, taskset
+-c 0, instructions:u, бинарники верифицированы md5 + поведенческим
+маркером — ранняя A/B-сессия была инвалидирована: api580_gate.py
+переставил stale-бинарник в zig-out, «after»-копия сняла pre-fix артефакт)
+REJECTED её: LLVM re-materialизовал local обратно в per-fetch load
+(`movzbl 0xf8c(%r15),%r13d` в голове — на pure-путях `gate == field`
+доказуемо, reload дешевле byte-регистра через ~400 KB switch; local не
+стал register-resident, T0-премис «1 removable load/fetch» нереализуем
+этим путём), а 32 refresh-сайта создали loop-carried phi → LLVM
+jump-thread'нул цикл и дублировал back-edge в новый блок с EXTRA gate
+reload: comparisons/lua_calls +4 i/iter (+1.58%/+0.85% instr), а
+перекомпиляция сдвинула layout: hash_access +12% WALL при
+байт-идентичных instruction counts (callgrind-verified, 5/5
+воспроизводимо) — официальный perf-гейт FAIL. Полный разбор:
+`tools/status/p16.34-t2-gate-local-rejected.md`. Gate-local reverted
+(надгробный комментарий у головы dispatch).
+
+KEPT (содержимое коммита):
+
+- [x] switchRuntime exit-ordering fix (pre-existing parity bug, найден
+      probe 6): builtinCoroutineResume и coroutine-close path восстанавливали
+      `current_thread` ПОСЛЕ `switchRuntime` в exit-defer →
+      refreshHooksCached читал hook-состояние КОРУТИНЫ на выходе —
+      корутина, снявшая свой hook, глушала установленный hook MAIN после
+      возврата resume (line-события main не стреляли до конца фрейма).
+      Фикс: current_thread ДО switchRuntime (entry-путь и trampoline-bubble
+      были корректны);
+- [x] parity-тест `tests/smoke/74_hook_trap_state.lua`: 10 probe'ов
+      hook-видимости (install из nested call, clear из hook'а, line→count
+      mask switch mid-frame, count-hook семантика — COUNT включается 4-м
+      аргументом независимо от mask; абсолютные количества firing'ов
+      compiler-dependent (наши instruction streams компактнее PUC) — probe
+      ассертит семантику, не количества; call/return порядок, per-thread
+      hooks через yield/resume = probe-6 сценарий, sethook на suspended
+      coroutine + resume, install + sync string __add (MMBIN), install +
+      sync builtin __index (rawget), install из тела метаметода), выводы
+      сняты с PUC, байт-в-байт оба движка.
+
+Гейт: zig fmt; unit D+RF; smoke 73/73 (новый 74-й); matrix --testc
+zig_fail=0 (big.lua both_fail pre-existing); c_api clean test + test-diff
+ALL PASS; api580 GREEN; upstream db.lua GREEN (hook-heavy); perf_compare
+17/18 OK, global_arith +8.8% WARN = host-noise (тримодальность
+0.74/0.87/0.97 s воспроизведена на закоммиченном бинарнике; instruction
+counts идентичны Cut 1; dispatch-путь global_arith не тронут — 2 холодных
+defer + комментарий).
+
+Backlog: T0 «gate load» остаётся открытым — будущая попытка требует либо
+уменьшения dispatch-функции (вынос холодных arm'ов — также помогло бы
+I-cache), либо принятия field-read как PUC-parity формы (load L1-resident
+и fused); measurement hygiene — gate-инструменты, пересобирающие zig-out
+(api580), могут тихо инвалидировать A/B-бинарники.

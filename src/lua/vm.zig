@@ -14246,6 +14246,15 @@ pub const Vm = struct {
 
                 // P16.19 T5-A: single combined gate; common case = one
                 // not-taken branch for BOTH stats and hooks flags.
+                // (P16.34 Cut 2 experiment REJECTED: a dispatch-local gate
+                // word mirroring PUC's register-resident `trap` was measured
+                // and reverted — LLVM re-materializes the local as per-fetch
+                // memory loads (provably equal to the field on pure paths)
+                // and jump-threads duplicated back-edge blocks carrying an
+                // extra gate reload: comparisons/lua_calls +4 i/iter,
+                // hash_access +12% wall from code-layout shift with
+                // IDENTICAL instruction counts; official perf gate FAIL.
+                // See tools/status/p16.34-t2-gate-local-rejected.md.)
                 if (self.dispatch_gate != 0) {
                     if (self.dispatch_gate & DISPATCH_GATE_STATS != 0) {
                         self.stats.instructions_total += 1;
@@ -21652,8 +21661,14 @@ pub const Vm = struct {
         self.switchRuntime(th);
         th.caller = prev_thread;
         defer {
-            self.switchRuntime(prev_runtime_thread);
+            // P15.33/P16.34: restore current_thread BEFORE switchRuntime so
+            // refreshHooksCached (inside switchRuntime) reads the RETURNING
+            // thread's (main's) hook state, not the coroutine's. The old
+            // order (switchRuntime first) refreshed the gate from the
+            // coroutine's just-cleared hooks, silencing a still-installed
+            // main hook after resume returned (found by smoke 74 probe 6).
             self.current_thread = prev_thread;
+            self.switchRuntime(prev_runtime_thread);
             th.caller = null;
             if (prev_thread) |pt| {
                 if (prev_thread_status) |st| pt.status = st;
@@ -22529,8 +22544,10 @@ pub const Vm = struct {
         self.cur_c_stack = &th.api_handle.?.c_stack;
         defer {
             // ---- restore the caller, field for field ----
-            self.switchRuntime(prev_runtime_thread);
+            // P16.34: current_thread BEFORE switchRuntime (same
+            // refreshHooksCached ordering fix as builtinCoroutineResume).
             self.current_thread = prev_thread;
+            self.switchRuntime(prev_runtime_thread);
             th.caller = saved_caller;
             self.cur_handle = prev_handle;
             self.cur_c_stack = prev_c_stack;

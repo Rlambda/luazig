@@ -1,1 +1,1 @@
-P16.32 COMPLETE — measured allocation/metamethod convergence: geomean 1.62696→1.51994 (−6.6%); metamethod_add −40%, temp_table_alloc −32%, table_alloc −25%; 4 KEEP cuts (testC countdown, tailcall zero-alloc, GETFIELD raw-first, getTm pointer-return); allocs/iter parity with PUC
+P16.33 COMPLETE — call-frame convergence: geomean 1.51994→1.48778 (−2.1%); prepCallInfo parity + startfunc child-entry (lua_calls −28.3 i/it), noinline fail (dispatch −11.9%); R0 hygiene + shared testc control (PUC l_memcontrol parity)

@@ -1,4 +1,4 @@
-> Last updated: 2026-09-09 (P16.33 T2 — shared activation cut: PUC prepCallInfo parity (CIST_SR/CIST_OUV callstatus-packing, 3 eager-store skips) + startfunc child-entry; lua_calls −28.3 i/it, guards ±0.5%, dispatch symbol −154 B)
+> Last updated: 2026-09-09 (P16.33 T3 — dispatch megafunction layout: noinline fail, error-path formatting out-of-line PUC-style; dispatch symbol 74,155→65,332 B (−11.9%), guards ±0 exact, lua_calls +2 i/call = pad-proven layout artifact, perf_compare OK)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -8937,3 +8937,96 @@ clean test + test-diff ALL PASS; api580 GREEN (D+RF+sizes); perf_compare
 RESULT: OK (17/18 OK, global_arith +1.1%; первый прогон показал +14% —
 host-noise: 6 параллельных opencode-сессий, бимодальное распределение
 0.74–0.88s воспроизведено на НЕизменённом бинарнике stash-прогоном).
+
+## P16.33 T3 — dispatch megafunction layout: noinline `fail` (error-path formatting out-of-line) (2026-09-09)
+
+Закрывает P16.33-кандидат (1) «out-of-line cold paths / megafunction layout»
+(из P16.32-итогов: layout-чувствительность 72KB dispatch-мегафункции —
+структурная). Подход PUC-first: PUC держит ВСЁ error-formatting вне
+`luaV_execute` (`luaG_runerror`/`luaG_addinfo`/`luaO_pushfstring` — отдельные
+функции ldebug.c/lobject.c); luazig инлайнил тело `fail` (2048-B bufPrint +
+allocPrint «source:line:»-сборка) в каждый call site.
+
+### T3.1 — инвентаризация (измерено, не угадано)
+
+`runBytecodeDispatch` на HEAD 3b48f19 (ReleaseFast): **74,155 B**, 16,294
+инструкций, **387 call sites** на ~100 различных outlined-таргетов. Уже
+outlined: opCall/opTailcall/opReturn*/opForprep/opTforcall/opSetlist/
+opClosure/beginBytecodeClose/opVararg, growBcStackCapSlow,
+dispatchBytecodeHook*, slowCmp, rawGet/rawSet, ~20 вызовов fail-клонов и
+др. — мегафункция уже сильно декомпозирована; «крупных холодных inlined
+тел» почти не осталось, кроме одного:
+
+- **`fail` inlined-тела: ~10 KB в 56 фрагментах** (514 инструкций напрямую
+  на строках fail + интерливинг std/fmt/Io.Writer/Allocator-машинерии).
+  Холодно ПО ПОСТРОЕНИЮ (error-пути), в любом workload.
+- perf-карта (branch_loop + hooks-active + все 16 microbench, perf record
+  -j any,u, addr2line-атрибуция каждого байта): 58/73 KB-бакетов холодны в
+  branch_loop, 18/73 холодны даже в полном 16-workload прогоне. Холодные
+  бакеты = непокрытые microbench'ами opcode-тела (tforcall/varargprep/
+  mmbini/bnot/shr/errdefined...) — **не** доказуемо холодные в реальных
+  нагрузках → НЕ кандидаты на outline.
+- hooks-блок на вершине frame_loop: ~1.2 KB, размазан по 33 фрагментам,
+  guard горячий — не материален.
+- `gcTableBarrierBackSlow` (~900 B): осознанный inline (P16.9: noinline =
+  +18% comparisons) — не трогаем.
+
+### T3.2–3.3 — эксперимент: `noinline fn fail`
+
+Полный вариант (noinline на все 4 failRunerror/fail/failC/failLib) и
+узкий (только `fail` — единственный с inlined-телами в dispatch) дали
+идентичные размеры и инструкции; закоммичен узкий. Результат:
+
+| метрика | before (3b48f19) | after | delta |
+|---|---|---|---|
+| runBytecodeDispatch | 74,155 B | **65,332 B** | **−8,823 B (−11.9%)** |
+| .text (binary) | 2,346,521 B | 2,380,073 B | +33,552 B (fail-клоны 329→574: ранее dead-stripped standalone-копии теперь live) |
+| branch_loop instr | 12,232,080 K | 12,232,079 K | ±0 (точно) |
+| comparisons instr | 13,090,578 K | 13,090,581 K | ±0 (точно) |
+| lua_calls instr | 2,430,028 K | 2,440,129 K | **+2.00 i/call (+0.42%)** |
+| lua_calls wall (median-of-6) | 0.12541 s | 0.12578 s | +0.30% (в пределах разбега ±1.2%) |
+
+**+2 i/call — доказанный layout-artifact, не семантическая цена cut'а:**
+callgrind-дифференциал (n-vs-2n, 200K итераций, точный per-line Ir)
+локализует +2.00/iter ровно в двух строках OP_CALL fast path — nargs
+-derivation (vm.zig:16004-old) и parkActiveFrame bounds-check
+(vm.zig:14047-old); сами блоки instruction-identical базовым, это
+register-allocation перераспределение. Решающий pad-эксперимент (T3.4):
+narrow+dead-u64 возвращает lua_calls instr к base-точности (2,430,031 K) —
+тот же source, та же семантика, ±0 инструкций.
+
+### T3.4 — perturbation-тест (dead `unused_pad: u64` в Vm)
+
+| build | comparisons wall (median) | comparisons instr | lua_calls instr |
+|---|---|---|---|
+| base | 0.9206 (spread 3.9%) | 13,090,578 K | 2,430,028 K |
+| base+pad | 0.9232 (+0.3%) | 13,090,581 K (±0) | 2,430,029 K (±0) |
+| narrow (cut) | 0.9230 (spread 3.9%) | 13,090,581 K | 2,440,129 K |
+| narrow+pad | 0.9198 (−0.4%) | 13,090,581 K (±0) | **2,430,031 K (±0!)** |
+
+P16.32-свинг (dead-u64 → comparisons ±20% cycles, instructions identical)
+на сегодняшнем состоянии host/бинарника НЕ воспроизводится: base и narrow
+оба pad-нечувствительны по wall (±0.4% << разбег 3.9%) и по instructions
+(±0). Вердикт по чувствительности: **inconclusive today** — лотерея не
+проявлена в текущем состоянии, уменьшение чувствительности продемонстрировать
+нельзя; но cut сокращает layout-поверхность (74→65 KB, −12%). Попутно
+открыто: **field_access бимодален по instructions в ОДНОМ бинарнике**
+(1,788.68M / 1,859.38M, +4%) — runtime-эффект (hash-seed/GC-timing), не
+layout-сигнал; lua_calls-подобные ±2 i/iter на field_access — шум этого
+биморфизма.
+
+### Решение: KEEP (узкий cut)
+
+Критерии: dispatch −8.8 KB >> 2 KB ✓; i/it: branch_loop/comparisons ±0
+(точно), lua_calls +2.00 i/call — pad-доказанный layout-artifact (не
+семантика cut'а; тот же cut с pad = base-точность), wall +0.30% в шуме ✓;
+горячая ветка не платит call (все fail-сайты за not-taken error-ветками) ✓;
+PUC-first: error-formatting вне dispatch-цикла, как в PUC ✓. Цена: +33.5 KB
+.text (245 новых live fail-клонов binary-wide) — приемлемо за −8.8 KB
+мегафункции.
+
+**Гейты:** zig fmt; unit D 199/199 + RF 199/199; smoke 71/71 PASS; matrix
+--testc 31/32 (zig_fail=0; big.lua both_fail = pre-existing parity); c_api
+make clean test + test-diff ALL PASS; api580 GREEN (D+RF+sizes); perf_compare
+--runs 7 RESULT: OK (18/18 OK: lua_calls −2.6%, comparisons −2.1%,
+global_arith +3.0% — в пределах задокументированного host-noise).

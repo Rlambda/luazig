@@ -14540,28 +14540,53 @@ pub const Vm = struct {
                             }
                         }
                     },
-                    .getfield => {
-                        // R[A] = R[B][K[C]]  (string key)
-                        const obj = ctx.regs[inst.b];
-                        const key = ctx.cur_proto.resolved_values[inst.c];
-                        if (obj == .Table and obj.Table.metatable == null) {
-                            // Inline rawGet fast path: direct nodeLookup.
-                            // rawGet's switch on key type is unnecessary —
-                            // key is always String for GETFIELD. This
-                            // eliminates the function call to rawGet and
-                            // inlines nodeLookup into the dispatch loop.
-                            const tbl = obj.Table;
-                            if (self.stats.enabled) self.stats.tbl_get_fast_str += 1; // P16.0b
-                            // P16.26 C2: PUC luaH_getshortstr identity walk
-                            // (see GETTABUP); long keys keep content equality.
-                            const node = ltable.nodeLookupShortStrIdentity(tbl.hash, key.String);
-                            ctx.regs[inst.a] = if (node) |nd| nd.value else .Nil;
-                        } else {
-                            if (try self.bytecodeGetIndex(exec_frames, &ctx, obj, key, inst.a, inst.b, true)) {
-                                continue :frame_loop;
-                            }
-                        }
-                    },
+                     .getfield => {
+                         // R[A] = R[B][K[C]]  (string key)
+                         // PUC OP_GETFIELD → luaV_fastget (lvm.h): the raw
+                         // hash get runs FIRST regardless of the metatable;
+                         // only an EMPTY result consults __index
+                         // (luaV_finishfastget → luaV_finishget). The old
+                         // `metatable == null` precondition sent every
+                         // metatable'd table down the slow path even when
+                         // the key was present (a.v/b.v on boxed values).
+                         const obj = ctx.regs[inst.b];
+                         const key = ctx.cur_proto.resolved_values[inst.c];
+                         if (obj == .Table) {
+                             // Inline rawGet fast path: direct nodeLookup.
+                             // rawGet's switch on key type is unnecessary —
+                             // key is always String for GETFIELD. This
+                             // eliminates the function call to rawGet and
+                             // inlines nodeLookup into the dispatch loop.
+                             const tbl = obj.Table;
+                             if (self.stats.enabled) self.stats.tbl_get_fast_str += 1; // P16.0b
+                             // P16.26 C2: PUC luaH_getshortstr identity walk
+                             // (see GETTABUP); long keys keep content equality.
+                             const node = ltable.nodeLookupShortStrIdentity(tbl.hash, key.String);
+                             // PUC isempty(slot): a present key with a Nil
+                             // value (the .settable fast path nils in place)
+                             // counts as a MISS — the metamethod path must
+                             // still see it (tableGetRawValue's != .Nil
+                             // check, tryPushBytecodeIndexMetamethod).
+                             if (node != null and node.?.value != .Nil) {
+                                 // Raw hit (PUC !isempty) — done, no
+                                 // metamethod consult.
+                                 ctx.regs[inst.a] = node.?.value;
+                             } else if (tbl.metatable != null) {
+                                 // Miss on a metatable'd table → __index
+                                 // path (PUC luaV_finishget).
+                                 if (try self.bytecodeGetIndex(exec_frames, &ctx, obj, key, inst.a, inst.b, true)) {
+                                     continue :frame_loop;
+                                 }
+                             } else {
+                                 // Plain miss, no metatable — Nil.
+                                 ctx.regs[inst.a] = .Nil;
+                             }
+                         } else {
+                             if (try self.bytecodeGetIndex(exec_frames, &ctx, obj, key, inst.a, inst.b, true)) {
+                                 continue :frame_loop;
+                             }
+                         }
+                     },
                     .getvarg => {
                         // R[A] := vararg_param[R[C]] — virtual vararg access.
                         // PUC 5.5 OP_GETVARG / luaT_getvararg (ltm.c:292-311).

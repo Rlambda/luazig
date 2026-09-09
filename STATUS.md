@@ -128,6 +128,26 @@ luaD_pretailcall → precallC заменяет frame in-place; luaF_close тол
 - Гейты: build D+RF, unit D+RF, smoke 71/71, matrix --testc 31/32 zig_fail=0,
   c_api clean test + test-diff ALL PASS (3× deterministic), api580 GREEN.
 
+**Cut C — GETFIELD raw-get-first (KEEP, коммит ниже).** T1 Q4: `.getfield`
+fast path требовал `metatable == null`, поэтому таблицы С metatable всегда
+шли в slow path (bytecodeGetIndex → park + tryPushBytecodeIndexMetamethod →
+tableGetRawValue) даже при присутствующем ключе. PUC OP_GETFIELD (lvm.c:1338)
+делает `luaV_fastget` = raw `luaH_getshortstr` FIRST независимо от metatable;
+только tagisempty → luaV_finishget (__index). Фикс: raw nodeLookup
+(nodeLookupShortStrIdentity) первым; hit (node != null и value != Nil — PUC
+isempty(slot): present-key-with-Nil-value от .settable fast path считается
+miss, как и tableGetRawValue's != .Nil) →直接 запись; miss на metatable'd
+table → прежний __index path; miss без metatable → Nil. A/B:
+metamethod_add 3203.5→**2871.8** (−332, T1 измерял −343); остальные flat
+(temp_table_alloc 1089.0, table_alloc_setmetatable 2116.9, lua_calls 595.3,
+branch_loop 238.9, hash_access 224.2). Гейты: build D+RF, unit D+RF, smoke
+71/71, matrix --testc 31/32 zig_fail=0, c_api clean test + test-diff ALL
+PASS, api580 GREEN.
+
+Итог по cuts (instr/it, median 3×500k): metamethod_add 4563.2→2871.8 (−37%),
+temp_table_alloc 1850.6→1089.0 (−41%), table_alloc_setmetatable
+2902.6→2116.9 (−27%); guards flat (lua_calls +0.34% code-layout, прочие 0).
+
 ### P16.32 T1 — allocation decomposition truth (2026-09-09, research)
 
 Полный разбор alloc-family divergence (metamethod_add 2.22x, table_alloc_setmetatable

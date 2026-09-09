@@ -3705,6 +3705,16 @@ pub const VmStats = struct {
     resume_allocs: u64 = 0,
 };
 
+/// P16.33 R0.3: PUC `Memcontrol`/`l_memcontrol` (ltests.c:163-198) — the
+/// allocator-control state shared by every lua_State created with the same
+/// allocator userdata. Field semantics mirror the P16.32 VM fields they
+/// replace (alloc_count -1 = PUC `~0UL` unlimited sentinel).
+const TestcAllocControl = struct {
+    total_bytes: usize = 0,
+    mem_limit: ?usize = null,
+    alloc_count: i64 = -1,
+};
+
 pub const Vm = struct {
     const Frame = CallFrame;
 
@@ -4019,21 +4029,32 @@ pub const Vm = struct {
     testc_gc_manual_kb: f64 = 0.0,
     testc_gc_pending_finalize_kb: f64 = 0.0,
     testc_gc_pending_finalize_seen: bool = false,
-    testc_total_bytes: usize = 0,
-    testc_mem_limit: ?usize = null,
-    /// PUC ltests.c `l_memcontrol.countlimit` (ltests.c:191-198, checked in
-    /// `debug_realloc` at ltests.c:236-240): the allocation-countdown limit.
-    /// PUC's "unlimited" sentinel `~0UL` maps to -1 here. Kept as plain VM
-    /// state — exactly like PUC keeps it in a C global — so the
-    /// per-allocation check is one integer compare with NO Lua-side lookup.
-    /// (The previous implementation resolved the `T` global and interned
-    /// "_alloccount" on EVERY allocation — ~440 instructions per table even
-    /// with the testC module absent; PUC's ltests hooks are compile-time
-    /// guarded and cost nothing in release builds.)
-    /// `T._alloccount` is a luazig-specific Lua-visibility mirror PUC does
-    /// not have; `testcSetAllocCount` and the active-path decrement keep it
-    /// in sync so direct readers observe the same values as before.
-    testc_alloc_count: i64 = -1,
+    /// P16.33 R0.3: the testC allocator-control state (total bytes, memory
+    /// limit, allocation countdown) lives in ONE heap object shared by every
+    /// VM created from the same top-level state — PUC `l_memcontrol`
+    /// (ltests.c:191) is allocator USERDATA: `checkpanic`'s
+    /// `lua_newstate(f, ud)` passes the SAME control object, so countdown
+    /// consumption and limits propagate between parent and sub-state
+    /// (empirically verified: PUC checkpanic under an armed countdown fails
+    /// with the parent's budget and consumes from it). `borrowed` marks a
+    /// sub-VM sharing the parent's object — its deinit must not free it.
+    /// P16.33 R0.3: shared testC allocator control (PUC `l_memcontrol`,
+    /// ltests.c:191 — allocator USERDATA, so `checkpanic`'s
+    /// `lua_newstate(f, ud)` shares the SAME object: countdown consumption
+    /// and limits propagate between parent and sub-state; empirically
+    /// verified against a PUC ltests build). Heap-allocated once per
+    /// top-level VM; sub-VMs BORROW the parent's pointer (`borrowed=true`,
+    /// their deinit must not free it). The per-allocation hot check stays
+    /// one integer compare behind one pointer load.
+    testc_ctrl: ?*TestcAllocControl = null,
+    testc_ctrl_borrowed: bool = false,
+    /// True once testC allocator-control state has ever been touched (a
+    /// countdown armed / a limit set). Production VMs never set it, and the
+    /// per-allocation hot check is ONE byte-compare against this Vm-local
+    /// flag — the shared control object (a separate cache line) is only
+    /// dereferenced when testC is actually active. Mirrors how PUC's
+    /// debug_realloc checks C-global state that stays cache-hot.
+    testc_active: bool = false,
     /// PUC lauxlib.c:1074-1128 default warnf 3-state machine.
     /// State of the current warnf handler, mirroring PUC's function-pointer
     /// swap between `warnfon`/`warnfoff`/`warnfcont`. Initial state is `.on`
@@ -5368,6 +5389,14 @@ pub const Vm = struct {
     }
 
     pub fn deinit(self: *Vm) void {
+        // P16.33 R0.3: release the shared testC allocator control. A
+        // checkpanic sub-VM BORROWS the parent's object (borrowed=true) and
+        // must not free it — the parent, as the allocation owner, frees it
+        // exactly once here.
+        if (self.testc_ctrl) |c| {
+            if (!self.testc_ctrl_borrowed) self.alloc.destroy(c);
+            self.testc_ctrl = null;
+        }
         // Run closing finalizers first — they execute Lua __gc metamethods and
         // need most objects (global_env, frames, tables) still alive.
         self.gcFinalizeAtClose();
@@ -7247,34 +7276,37 @@ pub const Vm = struct {
     fn testcChargeMemory(self: *Vm, bytes: usize) DispatchError!void {
         if (bytes == 0) return;
         try self.testcConsumeAllocCount();
-        const next = self.testc_total_bytes +| bytes;
-        if (self.testc_mem_limit) |limit| {
+        if (!self.testc_active) return;
+        const ctrl = self.testc_ctrl orelse return;
+        const next = ctrl.total_bytes +| bytes;
+        if (ctrl.mem_limit) |limit| {
             if (next > limit) return self.failTestcRaw("not enough memory");
         }
-        self.testc_total_bytes = next;
+        ctrl.total_bytes = next;
     }
 
     fn testcConsumeAllocCount(self: *Vm) DispatchError!void {
         // PUC `debug_realloc` (ltests.c:236-240): a single integer compare
-        // against the C-global `countlimit`; the unlimited sentinel
-        // short-circuits before anything else. -1 is our "unlimited", so the
-        // production default (testC absent) costs one compare — no global
-        // lookup, no string interning, no hash get.
-        if (self.testc_alloc_count < 0) return;
+        // against the shared `l_memcontrol.countlimit`; the unlimited
+        // sentinel short-circuits before anything else. -1 is our
+        // "unlimited"; production default (testC absent) = null control =
+        // ONE null-check. The control is SHARED with checkpanic sub-VMs
+        // (P16.33 R0.3): consumption propagates between states like PUC's
+        // shared allocator userdata.
+        if (!self.testc_active) return;
+        const ctrl = self.testc_ctrl orelse return;
+        if (ctrl.alloc_count < 0) return;
         // countlimit == 0: every allocation fails (the error stays armed
         // until the limit is reset, exactly like PUC returning NULL without
         // decrementing).
-        if (self.testc_alloc_count == 0) return self.failTestcRaw("not enough memory");
-        self.testc_alloc_count -= 1;
+        if (ctrl.alloc_count == 0) return self.failTestcRaw("not enough memory");
+        ctrl.alloc_count -= 1;
         // Lua-visibility mirror: keep the luazig-specific `T._alloccount`
-        // field in sync for direct readers. PUC has no such field (the
-        // counter is pure C state); the mirror only preserves luazig's
-        // pre-existing observable surface. This runs solely on the
-        // active-countdown path, which exists only inside small testC
-        // windows (limits of a few allocations), so its cost is irrelevant.
+        // field in sync for direct readers (PUC has no such field). Runs
+        // solely on the active-countdown path — small testC windows only.
         const t_global = self.getGlobal("T");
         if (t_global == .Table)
-            try self.setField(t_global.Table, "_alloccount", .{ .Int = self.testc_alloc_count });
+            try self.setField(t_global.Table, "_alloccount", .{ .Int = ctrl.alloc_count });
     }
 
     /// Arm/reset the allocation countdown from a Lua-visible value.
@@ -7284,6 +7316,19 @@ pub const Vm = struct {
     /// (the `l_memcontrol` equivalent); the `T._alloccount` table field is
     /// the luazig-specific Lua-visibility mirror, written with the raw
     /// value so direct readers see exactly what was stored before.
+    /// Lazily create the shared testC allocator-control object on first
+    /// use (arming a countdown / setting a memory limit / totalmem query).
+    /// Production VMs that never touch testC keep `testc_ctrl == null` and
+    /// pay ONE null-check on the per-allocation hot path.
+    fn testcEnsureControl(self: *Vm) *TestcAllocControl {
+        self.testc_active = true;
+        if (self.testc_ctrl) |c| return c;
+        const c = self.alloc.create(TestcAllocControl) catch @panic("oom");
+        c.* = .{};
+        self.testc_ctrl = c;
+        return c;
+    }
+
     fn testcSetAllocCount(self: *Vm, v: Value) DispatchError!void {
         const t_global = self.getGlobal("T");
         if (t_global == .Table) try self.setField(t_global.Table, "_alloccount", v);
@@ -7291,7 +7336,7 @@ pub const Vm = struct {
         // anything else — nil, non-numbers, non-finite floats — means
         // "unlimited", matching the old consume path's coercion where a
         // non-numeric field simply never triggered.
-        self.testc_alloc_count = switch (v) {
+        self.testcEnsureControl().alloc_count = switch (v) {
             .Int => |i| i,
             .Num => |x| blk: {
                 if (!std.math.isFinite(x) or
@@ -7304,7 +7349,7 @@ pub const Vm = struct {
     }
 
     fn testcNoteMemory(self: *Vm, bytes: usize) void {
-        self.testc_total_bytes +|= bytes;
+        if (self.testc_ctrl) |c| c.total_bytes +|= bytes;
     }
 
     fn isTestcMemoryErrorValue(v: Value) bool {
@@ -7454,7 +7499,7 @@ pub const Vm = struct {
     inline fn gcNoteFree(self: *Vm, bytes: usize) void {
         const kb: f64 = @as(f64, @floatFromInt(bytes)) / 1024.0;
         self.gc_count_kb = @max(0, self.gc_count_kb - kb);
-        self.testc_total_bytes -|= bytes;
+        if (self.testc_ctrl) |c| c.total_bytes -|= bytes;
     }
 
     // --- Native tree memory accounting (Task 7) ---
@@ -20374,7 +20419,7 @@ pub const Vm = struct {
                 vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
             }
         }.f;
-        const mem_before_call = self.testc_total_bytes;
+        const mem_before_call = if (self.testc_ctrl) |c| c.total_bytes else 0;
         const obj_tables_before_call = self.testc_obj_tables;
         const obj_functions_before_call = self.testc_obj_functions;
         const obj_threads_before_call = self.testc_obj_threads;
@@ -20383,7 +20428,7 @@ pub const Vm = struct {
             fn f(vm: *Vm, mem: usize, tables: usize, functions: usize, threads: usize, strings: usize) void {
                 const errv = vm.protectedErrorValue();
                 if (isTestcMemoryErrorValue(errv)) {
-                    vm.testc_total_bytes = mem;
+                    if (vm.testc_ctrl) |c| c.total_bytes = mem;
                     vm.testc_obj_tables = tables;
                     vm.testc_obj_functions = functions;
                     vm.testc_obj_threads = threads;
@@ -39056,9 +39101,10 @@ pub const Vm = struct {
 
     fn builtinTestcTotalmem(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) {
-            if (outs.len > 0) outs[0] = .{ .Int = @intCast(self.testc_total_bytes) };
+            if (outs.len > 0) outs[0] = .{ .Int = @intCast(if (self.testc_ctrl) |c| c.total_bytes else 0) };
             if (outs.len > 1) outs[1] = .{ .Int = 0 };
-            if (outs.len > 2) outs[2] = .{ .Int = if (self.testc_mem_limit) |limit| @intCast(limit) else 0 };
+            const limit_now: usize = if (self.testc_ctrl) |c| (c.mem_limit orelse 0) else 0;
+            if (outs.len > 2) outs[2] = .{ .Int = @intCast(limit_now) };
             self.last_builtin_out_count = @min(outs.len, 3);
             return;
         }
@@ -39073,7 +39119,7 @@ pub const Vm = struct {
                     },
                     else => unreachable,
                 };
-                self.testc_mem_limit = if (limit_i <= 0) null else @as(usize, @intCast(limit_i));
+                self.testcEnsureControl().mem_limit = if (limit_i <= 0) null else @as(usize, @intCast(limit_i));
                 self.last_builtin_out_count = 0;
             },
             .String => |namev| {
@@ -39805,12 +39851,19 @@ pub const Vm = struct {
         var sub_vm = Vm.init(self.alloc, false);
         defer sub_vm.deinit();
 
-        // PUC's l_memcontrol is global/shared across states using the same
-        // allocator. Our per-VM counters must be copied so memory-limit tests
-        // (e.g. memerr.lua's totalmem gate) affect the sub-VM identically.
-        sub_vm.testc_mem_limit = self.testc_mem_limit;
-        sub_vm.testc_total_bytes = self.testc_total_bytes;
-        sub_vm.testc_alloc_count = self.testc_alloc_count;
+        // P16.33 R0.3: PUC's l_memcontrol is the allocator USERDATA —
+        // `lua_newstate(f, ud)` in checkpanic passes the SAME object, so
+        // countdown consumption, limits, and accounting propagate between
+        // parent and sub-state in BOTH directions (empirically verified
+        // against a PUC ltests build: checkpanic under an armed countdown
+        // fails with the parent's budget and consumes from it). Share the
+        // control object by pointer; the sub-VM borrows (never frees) it.
+        // Ensure the control exists on the PARENT before sharing: if the
+        // parent never armed testC state (ctrl == null), a lazily-created
+        // child control would be invisible to the parent (and leak — the
+        // borrowed flag suppresses its free). The parent is the single owner.
+        sub_vm.testc_ctrl = self.testcEnsureControl();
+        sub_vm.testc_ctrl_borrowed = true;
 
         // Share the bytecode compiler so the sub-VM can compile Lua source via
         // loadstring/load (PUC's lua_newstate shares the same lexer/parser code).
@@ -40712,7 +40765,7 @@ pub const Vm = struct {
                 // (a reallocation) fails, so lua_rawcheckstack reports
                 // false. The countdown now lives in the VM field (the
                 // l_memcontrol.countlimit equivalent).
-                const blocked = self.testc_alloc_count == 0;
+                const blocked = if (self.testc_ctrl) |c| c.alloc_count == 0 else false;
                 try st.append(self.alloc, .{ .Bool = !blocked and need < 500000 });
             },
             .alloccount => {
@@ -41873,7 +41926,7 @@ pub const Vm = struct {
                     break :blk try self.parseTestcIndex(cargs[2], st.items.len);
                 } else null;
                 const handler_val: ?Value = if (handler_idx) |hi| st.items[hi] else null;
-                const mem_before_call = self.testc_total_bytes;
+                const mem_before_call = if (self.testc_ctrl) |c| c.total_bytes else 0;
                 const obj_tables_before_call = self.testc_obj_tables;
                 const obj_functions_before_call = self.testc_obj_functions;
                 const obj_threads_before_call = self.testc_obj_threads;
@@ -41893,7 +41946,7 @@ pub const Vm = struct {
                         // calls must not leave partial allocations counted as
                         // live; after the script's collectgarbage() they would
                         // be unreachable in PUC.
-                        self.testc_total_bytes = mem_before_call;
+                        if (self.testc_ctrl) |c| c.total_bytes = mem_before_call;
                         self.testc_obj_tables = obj_tables_before_call;
                         self.testc_obj_functions = obj_functions_before_call;
                         self.testc_obj_threads = obj_threads_before_call;

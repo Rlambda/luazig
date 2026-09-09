@@ -1,4 +1,4 @@
-> Last updated: 2026-09-09 (P16.32 COMPLETE — measured allocation/metamethod convergence: geomean 1.62696→1.51994 (−6.6%); metamethod_add −40%, temp_table_alloc −32%, table_alloc −25%; 4 KEEP cuts (testC countdown, tailcall zero-alloc, GETFIELD raw-first, getTm pointer-return); allocs/iter parity with PUC)
+> Last updated: 2026-09-09 (P16.33 T2 — shared activation cut: PUC prepCallInfo parity (CIST_SR/CIST_OUV callstatus-packing, 3 eager-store skips) + startfunc child-entry; lua_calls −28.3 i/it, guards ±0.5%, dispatch symbol −154 B)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -8847,3 +8847,93 @@ test-diff ALL PASS; api580 GREEN; perf_compare RESULT: WARN —
 бинарника; hot-функция бенча не vararg, RETURN1 fast-path не затронут;
 остальные 15 workloads OK, geomean 1.62x) — шум, не атрибутируется
 Cut 5.
+
+## P16.33 T2 — shared activation cut: PUC prepCallInfo parity + startfunc child-entry (2026-09-09)
+
+Один измеренный общий cut call-пути по декомпозиции T1
+(`tools/status/p16.33-t1-callpath-decomposition.md`): Class B —
+сокращение eager field-writes при активации Lua-фрейма до PUC-паритета
+(`luaD_precall`/`prepCallInfo`), плюс (store-skips alone <10 i/it)
+расширение frame_loop-entry: dispatch OP_CALL fast path входит в child
+напрямую (PUC `startfunc` parity) вместо re-entry через frame_loop.
+
+**Часть 1 — callstatus-packing (PUC `lstate.h` parity).** PUC пакует ВСЕ
+per-frame флаги в одно слово callstatus и держит mutually-exclusive aux
+state в union-ветке, валидной только при статусном бите (CIST_CLSRET →
+u2.nres). luazig вместо этого держал отдельный always-initialized байт
+`lua_packed_flags` (bit0 = has_open_upvalues) + eager init-store на каждой
+активации. Фикс:
+
+- Новые биты: `CIST_SR` (1<<26) — pending simple-result, validity-флаг для
+  aux-полей `simple_result_dst` + event/invert/compare-биты
+  `lua_packed_flags`; `CIST_OUV` (1<<27) — may-have-open-upvalues.
+  Активация пишет callstatus маской (encodeNresults, low 8 bits) → оба бита
+  гарантированно чистые на fresh activation — это и делает skip aux-store
+  безопасным.
+- Helpers переехали с LuaFrameState на CallFrame (им нужен callstatus):
+  hasSimpleResult/hasOpenUpvalues/setOpenUpvalues/simpleResultIs/Event/
+  Invert/setSimpleValueResult/setSimpleCompareResult/clearSimpleResult.
+  setSimple* пишут aux ПЕРЕД установкой CIST_SR (value-then-flag — тот же
+  discipline, что resume_pc). bit0 `lua_packed_flags` теперь RESERVED.
+- `pushStagedFast` (PUC prepCallInfo parity) skip'ает 3 eager-store'а, которых
+  нет у PUC: `nextraargs=0` (non-vararg доказан gate'ом; PUC пишет
+  u.l.nextraargs только на vararg-путях), `lua_packed_flags=0`,
+  `simple_result_dst=0xFF` (aux, valid-only-while-CIST_SR). Все readers
+  aux — gated by hasSimpleResult(); readers nextraargs — vararg-guarded:
+  `frameVarargs` получил `if (!proto.flags.is_vararg) return &.{};`,
+  GC-site (parked-coroutine varargs scan) — is_vararg условие.
+  OP_VARARG/OP_VARARGPREP/OP_GETVARG — статически vararg-only (та же
+  proof-модель, что у PUC). Slow path (pushStagedBytecodeExecFrame) пишет
+  nextraargs всегда; его прежние `clearSimpleResult()` +
+  `setOpenUpvalues(false)` — мёртвые (masked callstatus write уже чистит
+  оба бита), удалены.
+- KEPT-поля активации (PUC-контрparts или ungated readers): proto, pc,
+  frame_cap, func_slot, callstatus, reg_top (ungated: multret-CALL nargs
+  derivation + GC live-reg scan), tbc_mark/tbc_chain_base (pop-time
+  snapshots, не re-derivable), pending_call_index (ungated frame_loop entry
+  check), bc_stack_top (watermark).
+
+**Часть 2 — startfunc child-entry (PUC `lvm.c` parity).** `pushStagedFast`
+теперь возвращает `?usize` — index нового фрейма. Dispatch OP_CALL fast
+path после успешной активации входит в child напрямую: parkActiveFrame
+(parent pc), затем ctx присваивается из register-resident state
+(frame_index/cur_proto/cur_upvalues/base/frame_cap/pc=0/regs slice) —
+вместо `continue :frame_loop`, который re-derived всё это из heap
+CallFrame. PUC OP_CALL делает ровно это (`goto startfunc`: только
+`base = ci->func.p + 1`). Пропущенные frame_loop-entry работы доказуемо
+избыточны для фрейма, активированного этим же handler'ом: boundary-depth
+check (push вырос стек над уже-легитимным parent), pending_call_index check
+(только что записан INVALID_PENDING), hot-field loads (register-resident),
+regs slice rebuild (pushStagedFast гарантирует no-realloc на success).
+SIGINT boundary check сохранён (signal latency model; check_sigint —
+const false для library embedders). mm-путь (tryPushSimpleResultMetamethod
+→ pushResolvedBytecodeClosure) сохраняет `continue :frame_loop` (PUC платит
+полный fresh-luaV_execute re-entry для mm тоже) — адаптирован только вызов
+pushStagedFast.
+
+**A/B-измерение** (instr/it, median-of-3, taskset -c 0, N как в T1;
+`/tmp/opencode/p33_t2_{before,after}.json`):
+
+| workload | before | after | delta |
+|---|---|---|---|
+| lua_calls (target) | 514.3 | 486.0 | **−28.3** |
+| metamethod_call_noalloc | 622.1 | 615.0 | −7.1 |
+| metamethod_add | 2902.1 | 2866.7 | −35.4 |
+| branch_loop (guard) | 244.6 | 244.6 | ±0.0 |
+| comparisons (guard) | 261.8 | 261.8 | ±0.0 |
+| field_access (guard) | 357.7 | 357.7 | ±0.0 |
+| hash_access (guard) | 340.6 | 340.6 | ±0.0 |
+| coroutine_yield (guard) | 2591.7 | 2594.7 | +3.0 (+0.12%) |
+
+Цель −20+ i/it на lua_calls достигнута (−28.3); guards в пределах ±0.5%.
+Dispatch symbol size: runBytecodeDispatch 73,925 → **73,771 B** (−154, не
+вырос); pushStagedBytecodeExecFrame 1399→1370, tryPushSimpleResultMetamethod
+2880→2752.
+
+**Гейты:** zig fmt; build+unit D (199/199) + RF; smoke 71/71; matrix
+--testc 30/32 (zig_fail=1 memerr.lua — pre-existing, верифицирован на clean
+HEAD stash-прогоном; big.lua both_fail = pre-existing parity); c_api make
+clean test + test-diff ALL PASS; api580 GREEN (D+RF+sizes); perf_compare
+RESULT: OK (17/18 OK, global_arith +1.1%; первый прогон показал +14% —
+host-noise: 6 параллельных opencode-сессий, бимодальное распределение
+0.74–0.88s воспроизведено на НЕизменённом бинарнике stash-прогоном).

@@ -1,0 +1,31 @@
+{
+  "created_utc": "2026-09-09T18:17:22.734716+00:00",
+  "provenance": {
+    "git_head": "fa75a87",
+    "measured_source_head": "fa75a87",
+    "zig_version": "0.16.0",
+    "optimize_mode": "ReleaseFast",
+    "zig_binary_sha16": "d6ade010ff343708",
+    "note": "P16.33 T0 B3 code-size truth; absent symbols = fully inlined into runBytecodeDispatch"
+  },
+  "text_total_bytes": 2346137,
+  "symbols_bytes": {
+    "vm.Vm.callBuiltin": 6336,
+    "vm.Vm.completeBytecodeExecFrame": 4357,
+    "vm.Vm.dispatchCalleeActivationHook": 526,
+    "vm.Vm.getTmByObj": 237,
+    "vm.Vm.pushResolvedBytecodeClosure__anon_34206": 1025,
+    "vm.Vm.pushStagedBytecodeExecFrame": 1399,
+    "vm.Vm.runBytecodeDispatch": 73925,
+    "vm.Vm.stageBytecodeCall": 482,
+    "vm.Vm.tryPushSimpleResultMetamethod": 2880
+  },
+  "absent_inlined_into_dispatch": [
+    "vm.Vm.findBinaryTm",
+    "vm.Vm.opCall",
+    "vm.Vm.opReturn0",
+    "vm.Vm.opReturn1",
+    "vm.Vm.pushStagedFast",
+    "vm.Vm.stageFixedCall"
+  ]
+}

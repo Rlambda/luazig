@@ -2379,7 +2379,16 @@ pub export fn luaL_where(L: ?*lua_State, lvl: c_int) void {
     if (lua_getstack(L, lvl, &ar) != 0) {
         _ = lua_getinfo(L, "Sl", &ar);
         if (ar.currentline > 0) {
-            const src: []const u8 = if (ar.source) |s| std.mem.span(s) else "?";
+            // PUC luaL_where uses ar.short_src — the chunkid form
+            // (luaO_chunkid: `[string "..."]` for string sources, the
+            // trimmed file path for file sources). Using the raw source
+            // leaks the full string chunk text into error prefixes
+            // (p31d S3/S4: `return function() ... end:1:` instead of
+            // `[string "return function() ... end"]:1:`).
+            const src: []const u8 = blk: {
+                const s = std.mem.sliceTo(&ar.short_src, 0);
+                break :blk if (s.len > 0) s else "?";
+            };
             var buf: [128]u8 = undefined;
             const formatted = std.fmt.bufPrint(&buf, "{s}:{d}: ", .{ src, ar.currentline }) catch {
                 h.c_stack.append(vm.alloc, .{ .String = vm.internStr("") catch return }) catch {};

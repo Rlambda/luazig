@@ -8184,13 +8184,15 @@ and committed.
       (derived isTestcScriptFrame) + pop-detach + error-unwind
       no-close-per-frame (границы pcall закрывают) + dead-normal
       close-all + forced-close chain phase ON CO.
-- [ ] Cut 4 (D2): coroutine.close closers на ЗАКРЫТОМ потоке (on=CO для
+- [x] Cut 4 (D2): coroutine.close closers на ЗАКРЫТОМ потоке (on=CO для
       dead-потоков: context-switch при close-all) + chunk-name quoting
       (`[string "..."]` префикс) + testc `loadstring` name/mode aliasing
       (PUC getstring_aux пишет в общий static buff → name и mode алиасятся
       на ПОСЛЕДНИЙ токен: `loadstring -1 name t` → chunkname "t", не
       "name"; обнаружено при p31_chk4: find("stack overflow") 20 vs 17;
-      bug-for-bug parity, api.lua проходит на обоих).
+      bug-for-bug parity, api.lua проходит на обоих; проанализировано все
+      8 loadstring-вызовов api.lua — алиасинг НИГДЕ не наблюдаем, принято
+      решение: документировать в комментарии, поведение НЕ менять).
 - [ ] Cut 5 (D1-E): верификация hook-lane edge-cases + постоянные
       дифференциальные тесты (tests/c_api).
 
@@ -8336,3 +8338,58 @@ api580 GREEN; perf_compare RESULT: OK.
   reference-сборке — артефакт отсутствующей ltests.h-конфигурации
   (LUAI_MAXSTACK/memlimit), НЕ zig-расхождение (matrix reference проходит
   api.lua; zig тоже).
+
+### Cut 4 результат (закрыт)
+
+D2 закрыт: closers coroutine.close для dead-потоков выполняются НА
+ЗАКРЫТОМ потоке — PUC lua_closethread → luaE_resetthread (lstate.c:310-320)
+→ resetCI + luaD_closeprotected(L, 1, status): ВСЁ закрытие идёт на
+закрытом потоке L (его стек, errfunc=0 для тела корутины, nny через
+callclosemethod incnny, identity lua_State).
+
+Реализация: новый helper `closeThreadRegionsOnClosedThread(th, err,
+err_status)` (vm.zig, перед builtinCoroutineClose) — полный field-for-field
+context-switch на закрытый поток на время closers (тот же набор полей, что
+пролог resumeCoroutine): lazy `th.api_handle` (паттерн lua_tothread),
+current_thread, prev-thread status (.running→.suspended на время),
+active_runtime_thread через switchRuntime, th.caller (= prev_thread —
+детект "normal"), cur_handle/cur_c_stack (C-API view закрытого потока),
+плюс VM-global error channel (err bytes/len, err_obj, err_has_obj,
+err_cframe_residue, err_is_errerr, err_source, err_line, err_traceback с
+transfer-ownership, err_cfunc_label) — save/restore; канал closers не
+оставляет dangling-состояния (ошибка возвращается через return-value
+close, PUC luaD_seterrorobj пишет на стек закрытого потока). Оба прямых
+close-all-ветки builtinCoroutineClose (close_has_err + lingering-marks)
+переведены на helper; suspended-transport ветка (trace_yields>0) без
+изменений (builtinCoroutineResume активирует штатно).
+
+Наблюдаемые эффекты (все PUC-identical): coroutine.running() внутри
+__close = закрытый поток (on=CO, p31a [D], p31b [A]/[B], p31d S3/S4, p31e);
+yielding closer → "attempt to yield across a C-call boundary" (incnny на
+закрытом потоке, p31b [D]); erroring closer НЕ пересекает errfunc
+вызывающего (p31b [C]: traceback больше НЕ дописывается в объект ошибки —
+invokeErrfunc читает errfunc активного потока = закрытый, errfunc=0);
+last-error-wins сохранён (p31b [C], p31d S4); close из ДРУГОЙ корутины
+(p31e, новый репродьюсер): closers on=CO, драйвер C2 жив, ошибки не
+протекают.
+
+Chunk-name quoting: luaL_where (c_api.zig) теперь использует
+`ar.short_src` (fillShortSrc = luaO_chunkid) вместо raw `ar.source` —
+`[string "..."]:1:` префикс в luaL_error/luaL_argerror из C-функций
+(p31d S3/S4: было `return function() ... end:1:`).
+
+loadstring aliasing: проанализированы все 8 вызовов loadstring в api.lua
+(429/452/462/528/542/573/593) — алиасинг name/mode (PUC getstring_aux
+shared buff) нигде не наблюдаем (либо нет опциональных аргументов, либо
+только один из name/mode; check3(":1:") проверяет только строку; dumped
+chunks несут собственный source; checkpanic ошибки до load). Решение:
+документировано комментарием в .loadstring (vm.zig), поведение НЕ
+изменено (bug-for-bug алиасинг не воспроизводится — нулевой observable
+parity gain).
+
+Гейты Cut 4: p31a/p31b/p31c/p31d/p31e DIFF-EMPTY vs PUC (3×
+deterministic; p31e — новый close-from-coroutine shape); 22_tbc_lifecycle
+DIFF-EMPTY; build D+RF; smoke 71/71; matrix --testc zig_fail=0 (big.lua
+both_fail = parity); c_api make clean test + test-diff ALL PASS; api580
+GREEN; perf_compare RESULT: OK (geomean 1.63x, все workloads OK,
+lua_calls -0.0%, branch_loop +0.0%).

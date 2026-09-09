@@ -1,4 +1,4 @@
-> Last updated: 2026-09-09 (P16.33 T3 — dispatch megafunction layout: noinline fail, error-path formatting out-of-line PUC-style; dispatch symbol 74,155→65,332 B (−11.9%), guards ±0 exact, lua_calls +2 i/call = pad-proven layout artifact, perf_compare OK)
+> Last updated: 2026-09-09 (P16.33 COMPLETE — call-frame convergence: geomean 1.51994→1.48778 (−2.1%); prepCallInfo parity + startfunc child-entry (lua_calls −28.3 i/it), noinline fail (dispatch −11.9%); R0 hygiene + shared testc control (PUC l_memcontrol parity))
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -36,9 +36,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **71/71** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.52x** |
+| Performance (geomean vs PUC) | **1.49x** |
 
-Geomean замедления vs PUC Lua: **1.52x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.49x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -5909,6 +5909,126 @@ family shared-stack артефактов.
 Гейт: matrix 31/32 zig_fail=0, smoke 71→72/72, c_api 23+diff, api580,
 22/23 TBC suites, unit D+RF 199/199, CallFrame 88B, fmt, perf OK
 (WARN/FAIL = 0 в финале; baseline=1.51994).
+
+### P16.33 COMPLETE: call-frame convergence — prepCallInfo parity + startfunc child-entry + outlined error formatting (2026-09-09)
+**Geomean 1.51994 → 1.48778 (−2.1% фазы)**; measured `5c16a69` (7 runs,
+core 0; snapshot `tools/perf/current*.json`, baseline-approved →
+P16.33-final).
+
+- **R0.1 (`b64f6c1`)**: zig fmt hygiene — блок `.getfield` (индентация
+  P16.32 T2-C); **.text byte-identical** до/после (2,344,921 B, objcopy
+  stash A/B; delta whole-binary sha = только embedded source metadata).
+  Семантических изменений нет.
+- **R0.2 (`c669fba`)**: perf provenance cleanup — provenance-convention
+  (measured_source_head vs source_dirty vs artifact_dirty: JSON/status
+  записи ПОСЛЕ измерения — не source dirt; git_dirty=dirty при чистом src/
+  = artifact-only dirt); current-p32-decomposition.json переименован в
+  historical-p16.32-input-decomposition.json (phase-INPUT декомпозиция не
+  должна зваться current-*); differential profile перегенерирован @b64f6c1.
+- **R0.3 (`9b3be2d` + артефакт `fa75a87`)**: testC allocator-control SHARED
+  между parent и checkpanic sub-VM (**PUC l_memcontrol userdata parity**):
+  TestcAllocControl heap-объект (total_bytes/mem_limit/alloc_count) вместо
+  трёх полей Vm; sub_vm BORROW'ит контроль родителя по указателю
+  (deinit не double-free; ensureControl на PARENT'е до шаринга); потребление
+  И настройки распространяются bidirectionally — проверено против
+  purpose-built PUC ltests-бинарника (реконструирован ltests.h Memcontrol,
+  LUA_DEBUG build: vendored tree поставлял ltests.c без его user header;
+  PUC truth: checkpanic под armed countdown fails с бюджетом родителя,
+  child потребляет из него (n: 24/50), child alloccount-setting
+  наследуется). Hot-path discipline: testc_active Vm-local byte-gate на оба
+  per-allocation чека (production = один compare; temp_table 1149 vs
+  P16.32-final 1158 i/it = neutral-or-better). Задокументированная разница:
+  zig sub-VM init не заряжает countdown за raw Zig-аллокации (PUC
+  debug_realloc инструментирует КАЖДЫЙ malloc) — accounting-coverage model
+  difference, не sharing semantics.
+- **R0.3 followup fix (`3b48f19`)**: memerr.lua regression (matrix
+  zig_fail=1) — root cause: shared control дал child'у лимит родителя, но
+  Vm-local флаг testc_active (hot-path byte-gate) остался false → charge
+  path short-circuited → memory limit invisible (checkpanic вернул nil
+  вместо MEMERRMSG на memerr.lua:28). Флаг должен путешествовать ВМЕСТЕ с
+  контролем. Честный рассказ: (1) регрессия была введена R0.3 и поймана
+  matrix-гейтом; (2) проверка «на clean HEAD через stash» оказалась
+  VACUOUS — stash чистого дерева не прячет ничего, всё уже было
+  закоммичено; re-verify через честный worktree A/B на fa75a87/9b3be2d.
+  Урок: stash-проверка валидна только если stash реально прячет изменения.
+- **T1 (research, `fa75a87`;
+  `tools/status/p16.33-t1-callpath-decomposition.md`)**: декомпозиция
+  общего ~+250 i/it gap на call-family workloads (lua_calls +257.2,
+  mm_noalloc +246.6 vs PUC) — **gap = CALL→RETURN цикл**: plain call
+  (+246.6) ≈ mm (+240.5) ≈ samebody (+271.8); **mm-механизм уже дешевле
+  PUC** (zig mm-delta +79.8 vs PUC +111.1 — TMS/staging не трогать).
+  Компоненты (callgrind): per-fetch dispatch **16.2 i/fetch** (10.1 head +
+  6.1 switch) — самый большой общий рычаг; activation 15 writes vs PUC 5
+  (7 без PUC-аналога); frame-transition re-derivation ~55 i/call vs PUC
+  ~12 (startfunc/returning). Ranked cuts: #1 per-fetch slimming (est.
+  −55..−66 lua_calls), #2 frame-transition ctx (est. −40..−50), #3
+  activation writes (est. −20..−30).
+- **T2 (`6d840da`)**: shared activation cut — **PUC prepCallInfo parity**:
+  callstatus-packing (CIST_SR bit26 / CIST_OUV bit27; simple-result +
+  open-upvalues дискриминаторы из always-init flags-байта в callstatus;
+  mutually-exclusive aux — status-gated, PUC CIST_CLSRET→u2.nres модель);
+  pushStagedFast skip'ает 3 eager-store'а, которых PUC не делает
+  (nextraargs=0 / lua_packed_flags=0 / simple_result_dst=0xFF — все readers
+  gated: hasSimpleResult(), vararg-guards); state-machine helpers
+  LuaFrameState→CallFrame. Плюс **startfunc child-entry**: OP_CALL fast
+  path входит в child напрямую из register-resident state (PUC `goto
+  startfunc` parity) вместо `continue :frame_loop` re-derivation из heap
+  CallFrame; пропущенные frame_loop-entry работы доказуемо избыточны для
+  фрейма, активированного этим же handler'ом. A/B (instr/it, median-of-3,
+  taskset -c 0): **lua_calls 514.3→486.0 (−28.3, цель −20+)**,
+  mm_noalloc −7.1, mm_add −35.4, guards (branch_loop/comparisons/
+  field_access/hash_access) ±0.0, coroutine_yield +0.12%; dispatch symbol
+  73,925→73,771 B (не вырос).
+- **T3 (`5c16a69`)**: dispatch megafunction layout — **noinline `fail`**
+  (error-path formatting out-of-line; PUC luaG_runerror/luaG_addinfo
+  parity: PUC держит ВСЁ error-formatting вне luaV_execute; ~10 KB в 56
+  фрагментах были inlined в каждый call site, холодные по построению):
+  **dispatch 74,155→65,332 B (−8,823, −11.9%)**; branch_loop/comparisons
+  instructions ±0 EXACT; lua_calls +2.00 i/call — callgrind n-vs-2n
+  локализует ровно в 2 RA-артефакта, dead-u64 pad-эксперимент возвращает
+  base-точные counts (layout-lottery re-roll, не семантика cut'а);
+  perturbation-тест: P16.32-свинг НЕ воспроизводится на сегодняшнем host
+  (base и narrow оба pad-нечувствительны — verdict inconclusive-today, но
+  layout-поверхность 74→65 KB); цена +33.5 KB .text (fail-клоны 329→574
+  live). Side-finding: field_access runtime-бимодален по instructions в
+  одном бинарнике (1,788.68M/1,859.38M, hash-seed/GC-timing) — не
+  layout-сигнал.
+
+Cut ledger (i/it, median-of-3, taskset -c 0):
+
+| cut | lua_calls | mm_noalloc | mm_add | guards |
+|---|---|---|---|---|
+| T2 activation (6d840da) | **−28.3** | −7.1 | −35.4 | ±0.0 |
+| T3 noinline fail (5c16a69) | +2.00 (pad-доказанный layout-artifact) | — | — | ±0 exact |
+
+Wall (final snapshot @ 5c16a69 vs P16.32-final): lua_calls 1.412→1.374x,
+metamethod_add 1.477→1.431x, mm_noalloc 1.867→1.739x, coroutine_yield
+1.811→1.777x; geomean 1.51994→1.48778.
+
+P16.34 queue:
+
+- **per-fetch dispatch slimming** до PUC `vmfetch` (pc-pointer cursor,
+  trap-модель dispatch_gate, dispatch_pc publish только на границах) —
+  est. −55..−66 i/it lua_calls, −45..−50 mm (T1 #1; также объясняет
+  не-call gap: int_arith +48.5 за 2 fetches);
+- **frame-transition ctx re-derivation** → PUC startfunc/returning parity
+  — est. −40..−50 i/it на каждый Lua→Lua вызов (T1 #2);
+- **coroutine_yield 2.59x i/it** (T1 counters);
+- semantic backlog: `lua_settop` tbc-close (c_api lane), resume-of-finished-co
+  leftover re-precall, `luaL_traceback` (handle-resolved getstack/getinfo),
+  `gc_count_kb` (gc.lua Debug hang у collector-pace); новый side-finding
+  этого wrap'а: uncaught top-level error печатает traceback ДВАЖДЫ
+  (`luazig -e 'error("boom")'` — message+traceback, затем traceback ещё
+  раз; PUC печатает один раз) — pre-existing divergence, smoke-набор не
+  покрывает uncaught-error вывод; в P16.34.
+
+Гейт: matrix --testc 31/32 zig_fail=0 (big.lua both_fail = pre-existing
+parity), smoke 71/71, c_api clean test + test-diff ALL PASS, api580 GREEN,
+unit D+RF 199/199, perf final: run1 global_arith +16.6% FAIL → host-noise
+доказан (бимодальность 0.77/0.87/0.98s воспроизведена на НЕизменённом
+бинарнике, 11 параллельных opencode-сессий, load ~2), re-run +5.5% WARN
+(host остаётся шумным; тот же source на T3-гейте мерил +3.0% OK), остальные
+17 workloads OK, geomean 1.48778.
 
 ## История закрытых фаз
 

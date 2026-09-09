@@ -21996,6 +21996,138 @@ pub const Vm = struct {
         outs[0] = .{ .Bool = (!is_main and t.status != .dead) };
     }
 
+    /// PUC `lua_closethread` → `luaE_resetthread` (lstate.c:310-320): the
+    /// ENTIRE reset runs ON the closed thread — `resetCI` drops its
+    /// CallInfos, then `luaD_closeprotected(L, 1, status)` drives every
+    /// remaining `__close` with L = the CLOSED thread. Observable
+    /// consequences (all shapes verified against PUC, p31a [D], p31b
+    /// [A]-[D], p31d S3/S4):
+    ///   - `coroutine.running()` inside `__close` returns the closed
+    ///     thread ("on=CO") — the metamethod executes on the closed
+    ///     thread's stack;
+    ///   - a yield attempt inside the non-yieldable close (yy=0:
+    ///     callclosemethod → luaD_callnoyield → incnny ON the closed
+    ///     thread) fails with "attempt to yield across a C-call
+    ///     boundary" — the closed thread is both the coroutine the yield
+    ///     would suspend and the thread whose nny counter is raised;
+    ///   - an erroring closer raises through the CLOSED thread's errfunc
+    ///     — a coroutine body runs unprotected (errfunc 0), so the error
+    ///     object stays bare and NEVER crosses the CALLER's armed
+    ///     message handler (p31b [C]: no traceback leaks into the error
+    ///     object returned by coroutine.close);
+    ///   - a C-function closer receives the closed thread's lua_State
+    ///     (PUC passes L = the closed thread to the metamethod).
+    ///
+    /// luazig keeps per-thread frame stacks but one VM-global dispatch
+    /// context. This helper swaps that context to the closed thread for
+    /// the duration of the closers — the same field-for-field swap the
+    /// resume path performs (builtinCoroutineResume's prologue:
+    /// current_thread, active_runtime_thread via switchRuntime, the
+    /// caller's status, the caller link) — plus the C-API handle view
+    /// (cur_handle/cur_c_stack) and the VM-global error channel. The
+    /// channel is saved and restored: closer errors are threaded through
+    /// closeTbcRegion's last-error-wins loop and reported via the close's
+    /// return values (PUC luaD_seterrorobj writes the final object onto
+    /// the CLOSED thread's stack; lua_closethread returns it as a
+    /// status), never left dangling on the caller's channel.
+    fn closeThreadRegionsOnClosedThread(
+        self: *Vm,
+        th: *Thread,
+        err: ?Value,
+        err_status: i32,
+    ) DispatchError!?Value {
+        // The closed thread's lua_State handle (PUC: the thread IS a
+        // lua_State — the closer's L). Lazy-allocate exactly like
+        // lua_tothread: cached on the Thread, freed with it
+        // (gcFreeObject(.thread) via Thread.api_handle).
+        if (th.api_handle == null) {
+            const h = self.allocStateHandle(false) catch return error.OutOfMemory;
+            h.* = .{ .vm = self, .thread = th, .is_main = false };
+            th.api_handle = h;
+        }
+        // ---- save the caller's dispatch context, field for field ----
+        const prev_thread = self.current_thread;
+        var prev_thread_status: ?@TypeOf(th.status) = null;
+        if (prev_thread) |pt| {
+            prev_thread_status = pt.status;
+            // Mirror the resume path: while another thread is the active
+            // runtime, a running caller reads as "normal" (PUC auxstatus:
+            // status LUA_OK + live frames ⇒ COS_NORM).
+            if (pt.status == .running) pt.status = .suspended;
+        }
+        const prev_runtime_thread = self.active_runtime_thread.?;
+        const prev_handle = self.cur_handle;
+        const prev_c_stack = self.cur_c_stack;
+        const saved_caller = th.caller;
+        // Save the caller's error channel. self.err always aliases
+        // self.err_buf[0..len] (fail/failRunerror), so the byte range is
+        // the exact save format. The traceback pointer moves to the save
+        // slot: the close owns whatever it captures (clearErrorTraceback
+        // inside would free a stale pointer otherwise).
+        var saved_err_bytes: [2048]u8 = undefined;
+        var saved_err_len: usize = 0;
+        const saved_err_present = self.err != null;
+        if (self.err) |msg| {
+            saved_err_len = @min(msg.len, saved_err_bytes.len);
+            @memcpy(saved_err_bytes[0..saved_err_len], msg[0..saved_err_len]);
+        }
+        const saved_err_obj = self.err_obj;
+        const saved_err_has_obj = self.err_has_obj;
+        const saved_err_cframe_residue = self.err_cframe_residue;
+        const saved_err_is_errerr = self.err_is_errerr;
+        const saved_err_source = self.err_source;
+        const saved_err_line = self.err_line;
+        const saved_err_traceback = self.err_traceback;
+        const saved_err_cfunc_label = self.err_cfunc_label;
+        self.err_traceback = null;
+
+        // ---- activate the closed thread as the coherent runtime ----
+        // current_thread BEFORE switchRuntime so refreshHooksCached
+        // (inside switchRuntime) reads the closed thread's hook state.
+        self.current_thread = th;
+        self.switchRuntime(th);
+        th.caller = prev_thread;
+        self.cur_handle = th.api_handle;
+        self.cur_c_stack = &th.api_handle.?.c_stack;
+        defer {
+            // ---- restore the caller, field for field ----
+            self.switchRuntime(prev_runtime_thread);
+            self.current_thread = prev_thread;
+            th.caller = saved_caller;
+            self.cur_handle = prev_handle;
+            self.cur_c_stack = prev_c_stack;
+            if (prev_thread) |pt| {
+                if (prev_thread_status) |st| pt.status = st;
+            }
+            // Drop any error state the closers left on the channel (their
+            // result traveled via the close's return values) and put the
+            // caller's channel back exactly as it was.
+            self.clearErrorTraceback();
+            if (saved_err_present) {
+                @memcpy(self.err_buf[0..saved_err_len], saved_err_bytes[0..saved_err_len]);
+                self.err = self.err_buf[0..saved_err_len];
+            } else {
+                self.err = null;
+            }
+            self.err_obj = saved_err_obj;
+            self.err_has_obj = saved_err_has_obj;
+            self.err_cframe_residue = saved_err_cframe_residue;
+            self.err_is_errerr = saved_err_is_errerr;
+            self.err_source = saved_err_source;
+            self.err_line = saved_err_line;
+            self.err_traceback = saved_err_traceback;
+            self.err_cfunc_label = saved_err_cfunc_label;
+        }
+        // Region close-all: base 0 = every surviving mark (live
+        // frame_slot entries on still-pushed frames + detached entries
+        // whose owning frames already popped). clsret_frame=null:
+        // close-all is non-yieldable (yy=0), so no CLSRET can be
+        // installed. incnny (inside closeTbcRegion) lands on th — the
+        // closed thread — so a yielding closer fails with the
+        // C-call-boundary error, exactly like PUC callclosemethod.
+        return self.closeTbcRegion(th, 0, null, err, err_status, false, &.{});
+    }
+
     fn builtinCoroutineClose(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         self.last_builtin_out_count = 0;
         // P16.27 T1: PUC lua_closethread -> luaD_closeprotected(yy=0) ->
@@ -22042,18 +22174,17 @@ pub const Vm = struct {
             // callk continuation errored with no CIST_YPCALL below). PUC
             // luaE_resetthread: luaD_closeprotected(L, 1, status) closes ALL
             // remaining TBC with the thread's error (non-yieldable,
-            // last-error-wins) before finishing the teardown. The closers
-            // run here in the CLOSING thread's context (luazig divergence:
-            // PUC drives them on the closed thread's stack; observable only
-            // via coroutine.running() inside __close during a dead thread's
-            // cleanup).
+            // last-error-wins) before finishing the teardown.
             // P16.31 Cut 3: region close-all — base 0 = every surviving
             // mark (live frame_slot entries on still-pushed frames +
             // detached entries whose owning frames already popped; p31a
             // [D]: the failing resume left them behind with err=orig).
             // clsret_frame=null: close-all is non-yieldable (yy=0), so no
             // CLSRET can ever be installed.
-            const close_err = try self.closeTbcRegion(th, 0, null, th.close_err, 2, false, &.{});
+            // P16.31 Cut 4: the closers run ON the closed thread
+            // (closeThreadRegionsOnClosedThread) — PUC drives them on the
+            // closed thread's stack (on=CO, p31a [D]).
+            const close_err = try self.closeThreadRegionsOnClosedThread(th, th.close_err, 2);
             if (close_err != null) th.close_err = close_err.?;
             th.status = .dead;
             // PUC lua_closethread → resetCI → luaE_resetthread: a dead
@@ -22104,7 +22235,9 @@ pub const Vm = struct {
         // closed everything ON the closed thread) and for re-close of an
         // already-dead thread (the first close emptied the chain).
         if (th.c_tbc_chain.items.len > 0) {
-            const final_err = try self.closeTbcRegion(th, 0, null, null, 0, false, &.{});
+            // P16.31 Cut 4: same closed-thread activation as the
+            // close_has_err branch above (p31b [A]/[B], p31d S3/S4).
+            const final_err = try self.closeThreadRegionsOnClosedThread(th, null, 0);
             if (final_err != null) {
                 th.status = .dead;
                 th.errfunc = ERRFUNC_NONE; // PUC luaE_resetthread
@@ -40671,6 +40804,20 @@ pub const Vm = struct {
                 // PUC's `luaL_loadbufferx` receives the mode string as-is and
                 // `f_parser` checks for uppercase 'B' to set `fixed=1`. Preserve
                 // the case so `builtinLoad` can detect fixed-buffer mode.
+                //
+                // PUC divergence (documented, intentionally not reproduced):
+                // ltests.c getstring_aux writes every token (chunk name AND
+                // mode) into ONE shared buff, so a loadstring call with both
+                // optional args aliases name and mode to the LAST token
+                // (e.g. `loadstring 1 "n" "t"` loads with name="t" AND
+                // mode="t"). luazig reads the tokens independently (name from
+                // cargs[1], mode from cargs[2]). The aliasing is NOT
+                // observable in any upstream test: every api.lua loadstring
+                // call passes either no optional args, only a name, or only a
+                // mode (never both), and check3(":1:") only checks the line
+                // number, not the chunk name; dumped chunks carry their own
+                // embedded source. Reproducing the shared-buff aliasing would
+                // add coupling with zero observable parity gain.
                 const mode_src: []const u8 = if (cargs.len >= 3) cargs[2] else "bt";
                 var load_args: [3]Value = .{
                     sv,

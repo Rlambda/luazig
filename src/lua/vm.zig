@@ -14266,7 +14266,21 @@ pub const Vm = struct {
             // refreshes were added at all realloc sites. P16.10 T6: explicit
             // refreshes now cover all sites — see table above.)
 
-            while (ctx.pc < ctx.cur_proto.code.len) {
+            // P16.34 Cut 3 (T3.1): NO per-fetch bounds check on pc — PUC
+            // luaV_execute parity. PUC's vmfetch macro reads
+            // ci->u.l.savedpc with no bounds check; the loop is guaranteed
+            // to exit via an opcode (RETURN family / TAILCALL) because every
+            // Proto's code array provably ends in a terminator:
+            //   1. codegen always emits a trailing RETURN0 in the epilogue
+            //      (codegen_bc.zig:5023 main proto, 7170 function protos);
+            //   2. undump.verifyProtoCode rejects any binary chunk whose
+            //      last opcode is not a terminator (undump.zig rule 1);
+            //   3. every jump target is validator-checked to stay in range,
+            //      so pc cannot be transported past the terminator.
+            // The old `ctx.pc < ctx.cur_proto.code.len` condition was one
+            // compare+branch per fetch that PUC does not have; the fall-off
+            // fallback below the loop is deleted with it.
+            while (true) {
                 const inst = ctx.cur_proto.code[ctx.pc];
                 const op: bc.Op = @enumFromInt(inst.op);
 
@@ -16619,11 +16633,6 @@ pub const Vm = struct {
 
                 ctx.pc += 1;
             }
-
-            // Should not happen (codegen ensures a terminating return), but
-            // preserve the old empty-return fallback for malformed Protos.
-            const ret = try self.alloc.alloc(Value, 0);
-            if (try self.completeBytecodeExecFrame(exec_frames, boundary_depth, ret)) |final| return final;
         }
 
         unreachable;

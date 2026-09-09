@@ -1,1 +1,1 @@
-P16.31 COMPLETE — TBC semantic closure (5 cuts): pcall non-yieldable S0-crash, error-object pollution, unified testC chain regions, closed-thread close context, hook-lane marks + VAHID return close; 23_tbc_semantics DIFF-EMPTY vs PUC; perf-neutral within noise
+P16.32 COMPLETE — measured allocation/metamethod convergence: geomean 1.62696→1.51994 (−6.6%); metamethod_add −40%, temp_table_alloc −32%, table_alloc −25%; 4 KEEP cuts (testC countdown, tailcall zero-alloc, GETFIELD raw-first, getTm pointer-return); allocs/iter parity with PUC

@@ -1,4 +1,4 @@
-> Last updated: 2026-09-09 (P16.31 COMPLETE — TBC semantic closure (5 cuts): pcall non-yieldable S0-crash, error-object pollution, unified testC chain regions, closed-thread close context, hook-lane marks + VAHID return close; 23_tbc_semantics DIFF-EMPTY vs PUC; perf-neutral within noise)
+> Last updated: 2026-09-09 (P16.32 COMPLETE — measured allocation/metamethod convergence: geomean 1.62696→1.51994 (−6.6%); metamethod_add −40%, temp_table_alloc −32%, table_alloc −25%; 4 KEEP cuts (testC countdown, tailcall zero-alloc, GETFIELD raw-first, getTm pointer-return); allocs/iter parity with PUC)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -36,9 +36,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **71/71** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.63x** |
+| Performance (geomean vs PUC) | **1.52x** |
 
-Geomean замедления vs PUC Lua: **1.63x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.52x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -5874,6 +5874,41 @@ PUC падает 'attempt to call a nil value', а error-exit считает nre
 уровней в error-путях — заведомо хуже per AGENTS.md). error()-builtin
 settop-close и resume-of-finished-co leftover re-precall — из той же
 family shared-stack артефактов.
+
+### P16.32 COMPLETE: measured allocation/metamethod convergence (2026-09-08)
+**Geomean 1.62696 → 1.51994 (−6.6% фазы)**; measured `7ee70d7`.
+
+- **T0**: fresh differential (stale P16.30-era → HEAD); counters decomposition;
+  provenance: src/ не менялся после 3dcaa1b. Ключевой инсайт: 87% alloc-сэмплов
+  в SmpAllocator — lock RMW (позже уточнено T1: ~12% total, cycles-only).
+- **T1 (`f458b0a`)**: allocation truth — counts EQUAL PUC для 5/6 shapes;
+  capacities exact; **root cause gdb-доказан: testcConsumeAllocCount делал
+  getGlobal("T") на КАЖДУЮ аллокацию таблицы (~440 instr)**; metamethod_add
+  4 vs 2 allocs (tailcall continuation + results-dupe); GETFIELD
+  metatable==null precondition (PUC luaV_fastget идёт raw-first).
+- **T2 Cut A (`e18041b`)**: testC countdown → VM-state (PUC l_memcontrol
+  parity): temp_table_alloc 1851→1089 i/it (**ниже PUC 1139**),
+  table_alloc 2903→2123, mm_add 4563→3749.
+- **T2 Cut B (`6303177`)**: opTailcall nothing-to-close fast path
+  (80B continuation только при реальных обязательствах) + results-dupe
+  elimination: **allocs/iter 4.000→2.002 = PUC parity**; mm_add→3204.
+- **T2 Cut C (`4fc1cca`)**: GETFIELD raw-get-first (PUC luaV_fastget
+  ordering): mm_add→2872 (−332).
+- **T2-инвестигация (`7c91592`)**: comparisons +11.5% FAIL — bisect +
+  микроарх-анализ (инструкции ИДЕНТИЧНЫ, cycles +6.7%, IPC 3.91→3.67) +
+  решающий dead-u64-эксперимент (+20% на PRE-cut коде) = **layout lottery
+  72KB megafunction**, не семантическая цена. Улеглось после T3 de-inline.
+- **T3 (`7ee70d7`)**: getTm-family pointer-return (PUC const TValue* +
+  notm() модель): getTmByObj 47→39 i/it; PEBS+callgrind коррекция декомпозиции
+  (не-PEBS skid 40.9%→реально ~8%); главный остаток mm_noalloc —
+  **frame-continuation machinery ~180 i/it** (P16.33 кандидат).
+- P16.33 кандидаты: (1) out-of-line cold paths / megafunction layout
+  (PUC держит luaD_precall вне luaV_execute); (2) frame-continuation
+  dispatch; (3) coroutine_yield 2.59x i/it.
+
+Гейт: matrix 31/32 zig_fail=0, smoke 71→72/72, c_api 23+diff, api580,
+22/23 TBC suites, unit D+RF 199/199, CallFrame 88B, fmt, perf OK
+(WARN/FAIL = 0 в финале; baseline=1.51994).
 
 ## История закрытых фаз
 

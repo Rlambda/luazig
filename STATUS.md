@@ -148,6 +148,26 @@ PASS, api580 GREEN.
 temp_table_alloc 1850.6→1089.0 (−41%), table_alloc_setmetatable
 2902.6→2116.9 (−27%); guards flat (lua_calls +0.34% code-layout, прочие 0).
 
+**Финальный perf_compare (--runs 7) и расследование comparisons.** Gate:
+metamethod_add −38.8%, temp_table_alloc −31.8%, table_alloc_setmetatable
+−25.9%, geomean 1.63→1.52; НО comparisons +11.5% FAIL. Бисект по коммитам
+(полные CLI-бинари, 5 прогонов каждый): регрессия пришла с Cut A
+(0.862→0.933 median, +5-8%); B/C не добавили. Микроарх-анализ: инструкции
+ИДЕНТИЧНЫ (12,989,641,743 vs 12,989,584,637), uops/DSB/icache/branch-miss/
+L1-dcache — flat; циклы 3.32B→3.54B (+6.7%), IPC 3.91→3.67. Это layout-
+эффект в 72KB inlined runBytecodeDispatch (71675→72224→72991 байт по cuts).
+Решающий эксперимент: одна СЕМАНТИЧЕСКИ МЁРТВАЯ u64-поле в конце Vm struct
+на PRE-Cut-A коде сдвинула comparisons 0.885→1.066 (+20%) — layout-lottery
+ПРЕДСУЩЕСТВУЕТ, любой edit vm.zig перебрасывает кости ±20%. Плюс: baseline
+comparisons 0.854 vs сегодняшняя замера ТОГО ЖЕ кода 0.862-0.885 (drift
++1-3%); global_arith БИМОДАЛЕН на обоих бинарях (0.76-0.78 ↔ 0.89-0.99) —
+machine noise, не регрессия. Вывод: +5-8% на comparisons — layout-dice-roll,
+не семантическая цена Cut A; revert бесполезен (переброс костей + потеря
+−26…−40% на трёх workload'ах). Все три cuts KEEP. Корневая причина —
+layout-чувствительность 72KB megafunction — структурная, кандидат в P16.33:
+вынести холодные пути (callBuiltinSwitch inline-копия и т.п.) out-of-line,
+как PUC держит luaD_precall вне luaV_execute.
+
 ### P16.32 T1 — allocation decomposition truth (2026-09-09, research)
 
 Полный разбор alloc-family divergence (metamethod_add 2.22x, table_alloc_setmetatable

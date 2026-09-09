@@ -1,4 +1,4 @@
-> Last updated: 2026-09-09 (P16.33 COMPLETE — call-frame convergence: geomean 1.51994→1.48778 (−2.1%); prepCallInfo parity + startfunc child-entry (lua_calls −28.3 i/it), noinline fail (dispatch −11.9%); R0 hygiene + shared testc control (PUC l_memcontrol parity))
+> Last updated: 2026-09-09 (P16.34 COMPLETE — geomean 1.48778→1.47176 (−1.1%); per-fetch dispatch head 18→~15 i/fetch (T0 projected ~10 — NOT reached: gate-local REJECTED with A/B evidence, pc-as-pointer not attempted; landed: boundary-published PC −1 i/fetch (PUC savedpc ownership), donextjump inline (PUC docondjump parity, −18 i/taken-condjump), vmfetch bounds-check removal (PUC while(true) parity, terminator invariant + undump.verifyProtoCode safety net)); int_arith 109.1→102.2 i/it (T0 projected 89: item 2 rejected + item 3 partial explain the full gap); hook-restore exit-order parity fix kept from Cut 2; branch_loop 1.879→1.622x, lua_calls 1.374→1.319x, comparisons 1.521→1.405x, field_access 1.817→1.678x, int_arith 1.402→1.313x; 18/18 OK vs baseline (global_arith +7.0% = host-noise: identical instructions 3/3, bimodal wall 0.76/0.85s); dispatch 65,332→67,840 B (+2,508: T3.5 inline outweighs head savings), .text 2,380,073→2,364,729 (−15,344))
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -34,11 +34,11 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
 | Differential output (`--diff`) | **0 output_diff** |
-| Smoke tests (`tests/smoke/*.lua`) | **71/71** pass |
+| Smoke tests (`tests/smoke/*.lua`) | **73/73** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.49x** |
+| Performance (geomean vs PUC) | **1.47x** |
 
-Geomean замедления vs PUC Lua: **1.49x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.47x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.

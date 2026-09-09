@@ -1,25 +1,27 @@
 {
   "meta": {
-    "created_utc": "2026-09-09T19:52:56.157421+00:00",
+    "created_utc": "2026-09-09T23:40:06.441134+00:00",
     "lane": "smoke_compare",
     "argv": [
       "/home/boss/codes/luazig/tools/smoke_compare.py",
       "--json-out",
-      "/home/boss/codes/luazig/tools/status/.tmp.smoke.4m378k63.json"
+      "/home/boss/codes/luazig/tools/status/.tmp.smoke.64wkmqq2.json"
     ],
     "zig_version": "0.16.0"
   },
   "provenance": {
-    "git_head": "5c16a69",
-    "measured_source_head": "5c16a69",
+    "git_head": "6e9cd69",
+    "measured_source_head": "6e9cd69",
     "git_dirty": "dirty",
+    "source_dirty": "clean",
+    "artifact_dirty": "dirty",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "2e3c30763282ae72",
+    "zig_binary_sha16": "b0fedf8a7d0280cf",
     "puc_binary_sha16": "d54bc45e1757b216"
   },
-  "total": 71,
-  "ok": 71,
+  "total": 73,
+  "ok": 73,
   "mismatches": 0,
   "results": [
     {
@@ -304,6 +306,14 @@
     },
     {
       "file": "tests/smoke/71_xpcall_errfunc_timing.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/73_error_location_pc.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/74_hook_trap_state.lua",
       "match": true
     }
   ]

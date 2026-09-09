@@ -40014,6 +40014,12 @@ pub const Vm = struct {
         // borrowed flag suppresses its free). The parent is the single owner.
         sub_vm.testc_ctrl = self.testcEnsureControl();
         sub_vm.testc_ctrl_borrowed = true;
+        // The active flag is Vm-local (hot-path byte-check) but the CONTROL
+        // is shared — a sub-VM borrowing a live control must charge against
+        // it immediately (memerr.lua:28: checkpanic("newuserdata 20000")
+        // under a low limit must fail with MEMERRMSG). Without this the
+        // child's charge path short-circuits and the limit is invisible.
+        sub_vm.testc_active = true;
 
         // Share the bytecode compiler so the sub-VM can compile Lua source via
         // loadstring/load (PUC's lua_newstate shares the same lexer/parser code).

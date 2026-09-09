@@ -127,6 +127,7 @@ fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: 
                 error.TruncatedChunk => "truncated precompiled chunk",
                 error.BadHeader => "bad binary format (corrupted header)",
                 error.BadConstant => "bad binary format (corrupted constant)",
+                error.BadCode => "bad binary format (corrupted code)",
                 error.OutOfMemory => return error.OutOfMemory,
             };
             lMessage(progname, msg);

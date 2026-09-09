@@ -30,6 +30,7 @@ pub const UndumpError = error{
     TruncatedChunk,
     BadHeader,
     BadConstant,
+    BadCode,
     OutOfMemory,
 };
 
@@ -490,6 +491,10 @@ pub const UndumpReader = struct {
         // undumpProto directly (unit tests) stay owner-less and must be
         // freed via `bc.destroyProtoTree`.
         const proto = try alloc.create(bc.Proto);
+        // verifyProtoCode below is the first fallible operation after the
+        // struct exists — on its failure the slice errdefers above free the
+        // arrays, and this one frees the Proto struct itself.
+        errdefer alloc.destroy(proto);
         proto.* = .{
             .code = code,
             .k = k,
@@ -515,7 +520,159 @@ pub const UndumpReader = struct {
         // Packed name fields (P16.16 C7): set via accessors.
         proto.setName(name);
         proto.setSourceName(source_name);
+        // One-time structural validation of the instruction stream (see
+        // verifyProtoCode). Deserialized chunks are the ONLY Proto source
+        // that is not proven by codegen construction, so this is the single
+        // gate between untrusted bytes and the bounds-check-free dispatch
+        // loop. Runs once per proto at load time — never on the hot path.
+        try verifyProtoCode(proto);
         return proto;
+    }
+
+    // --- Structural code validation ---
+
+    /// Validate that a deserialized Proto's instruction stream is
+    /// structurally sound for the dispatch loop's PUC-parity execution
+    /// model:
+    ///
+    ///   1. the LAST instruction is a frame-terminating opcode
+    ///      (RETURN/RETURN0/RETURN1/TAILCALL) — the dispatch loop has no
+    ///      per-fetch bounds condition (PUC `luaV_execute` is an infinite
+    ///      loop; valid Protos always terminate), so a missing terminator
+    ///      would run off the code array;
+    ///   2. every jump-carrying opcode (JMP, FORPREP, FORLOOP, TFORPREP,
+    ///      TFORLOOP) lands inside the code array;
+    ///   3. every conditional jump (EQ/LT/LE/EQI/LTI/LEI/GTI/GEI/EQK/
+    ///      TEST/TESTSET) is immediately followed by a JMP — the VM reads
+    ///      that JMP's offset INLINE on the taken side (PUC `donextjump`)
+    ///      and never dispatches it;
+    ///   4. every opcode that reads or skips the following instruction has
+    ///      it in range: LOADKX/SETLIST(C=255)/ERRDEFINED(B=0) need an
+    ///      EXTRAARG (LOADKX additionally needs the constant index in
+    ///      range — the VM reads it unguarded), the arith/bitwise family
+    ///      needs its MMBIN/MMBINI/MMBANK marker, LFALSESKIP needs any
+    ///      follower, and the MMBIN markers themselves need a predecessor
+    ///      (they read code[pc-1]).
+    ///
+    /// Deliberate, documented divergence from PUC Lua: PUC's production
+    /// `luaU_undump` performs NO code validation (`luai_verifycode` is the
+    /// empty macro outside ltests builds), so a hand-crafted malformed
+    /// chunk is undefined behavior in PUC — `luaV_execute` runs off the
+    /// code array. We keep PUC's hot-loop shape (no bounds check) and
+    /// instead convert malformed input into a clean load-time error:
+    /// zero cost on the dispatch path, defined behavior for bad input,
+    /// byte-identical behavior for every valid chunk. Codegen output
+    /// satisfies these rules by construction (the function/chunk epilogue
+    /// always emits a terminating RETURN; CMP+JMP and arith+MMBIN pairs
+    /// are emitted together), so this only ever rejects corrupt data.
+    ///
+    /// Out of scope (PUC-parity UB on malformed input, unchanged by this
+    /// check): constant-pool indices (K[B]/K[C] outside the arith path),
+    /// register indices vs maxstacksize, and proto indices in CLOSURE —
+    /// PUC does not validate these either, and covering them would turn
+    /// this into a full bytecode verifier.
+    pub fn verifyProtoCode(proto: *const bc.Proto) UndumpError!void {
+        const code = proto.code;
+        const n = code.len;
+        if (n == 0) return error.BadCode;
+
+        // 0. Opcode range. `Instruction.op` is a raw u7 — a corrupted chunk
+        //    can carry any 0..127 value, but `bc.Op` only defines
+        //    `op_count` members. `@enumFromInt` on an out-of-range value is
+        //    UB in ReleaseFast (in Debug it panics inside the validator
+        //    itself), so the range must be checked BEFORE any enum
+        //    conversion. Found by a single-byte corruption sweep over a
+        //    real dump: flipping an opcode byte to an out-of-range value
+        //    sailed through validation (garbage enum hits every switch's
+        //    `else`) and reached the VM's `unreachable` (SIGILL).
+        const op_count = @typeInfo(bc.Op).@"enum".fields.len;
+        for (code) |inst| {
+            if (inst.op >= op_count) return error.BadCode;
+        }
+
+        // 1. Terminating last instruction: the dispatch loop relies on the
+        //    final opcode exiting the frame (RETURN family) or replacing it
+        //    (TAILCALL) — anything else can fall through past the end.
+        const last_op: bc.Op = @enumFromInt(code[n - 1].op);
+        switch (last_op) {
+            .return_, .return0, .return1, .tailcall => {},
+            else => return error.BadCode,
+        }
+
+        var p: usize = 0;
+        while (p < n) : (p += 1) {
+            const inst = code[p];
+            const op: bc.Op = @enumFromInt(inst.op);
+            switch (op) {
+                // 2. Unconditional jumps: the target must be a valid
+                //    instruction index. JMP encodes a 24-bit signed offset
+                //    in a:b:c; FORPREP/FORLOOP/TFORPREP/TFORLOOP a 16-bit
+                //    signed offset in b:c. Target = index + offset + 1,
+                //    matching the VM's jump handlers.
+                .jmp => {
+                    const t = @as(i64, @intCast(p)) + inst.jumpOffset() + 1;
+                    if (t < 0 or t >= @as(i64, @intCast(n))) return error.BadCode;
+                },
+                .forprep, .forloop, .tforprep, .tforloop => {
+                    const off_bits: u16 = @as(u16, inst.b) | (@as(u16, inst.c) << 8);
+                    const off: i16 = @bitCast(off_bits);
+                    const t = @as(i64, @intCast(p)) + off + 1;
+                    if (t < 0 or t >= @as(i64, @intCast(n))) return error.BadCode;
+                },
+                // 3. Conditional jumps: the taken side reads the follower
+                //    inline as a JMP (its target is checked when the scan
+                //    reaches it).
+                .eq, .lt, .le, .eqi, .lti, .lei, .gti, .gei, .eqk, .test_, .testset => {
+                    if (p + 1 >= n) return error.BadCode;
+                    if (@as(bc.Op, @enumFromInt(code[p + 1].op)) != .jmp) return error.BadCode;
+                },
+                // 4a. EXTRAARG readers. LOADKX reads the constant index
+                //     unguarded at execution, so its range is checked here.
+                .loadkx => {
+                    if (p + 1 >= n) return error.BadCode;
+                    const follower = code[p + 1];
+                    if (@as(bc.Op, @enumFromInt(follower.op)) != .extraarg) return error.BadCode;
+                    if (follower.extraArg() >= proto.k.len) return error.BadCode;
+                },
+                .setlist => {
+                    if (inst.c == 255) {
+                        if (p + 1 >= n) return error.BadCode;
+                        if (@as(bc.Op, @enumFromInt(code[p + 1].op)) != .extraarg) return error.BadCode;
+                    }
+                },
+                .errdefined => {
+                    if (inst.b == 0) {
+                        if (p + 1 >= n) return error.BadCode;
+                        if (@as(bc.Op, @enumFromInt(code[p + 1].op)) != .extraarg) return error.BadCode;
+                    }
+                },
+                // 4b. Arith/bitwise ops skip their metamethod marker on the
+                //     fast path (pc += 1) and fall through into it on the
+                //     slow path — the marker must exist and be the right
+                //     variant (codegen emits the pairs together).
+                .add, .sub, .mul, .div, .mod, .pow, .idiv, .band, .bor, .bxor, .shl, .shr => {
+                    if (p + 1 >= n) return error.BadCode;
+                    if (@as(bc.Op, @enumFromInt(code[p + 1].op)) != .mmbin) return error.BadCode;
+                },
+                .addi, .shli, .shri => {
+                    if (p + 1 >= n) return error.BadCode;
+                    if (@as(bc.Op, @enumFromInt(code[p + 1].op)) != .mmbini) return error.BadCode;
+                },
+                .addk, .subk, .mulk, .modk, .powk, .divk, .idivk, .bandk, .bork, .bxork => {
+                    if (p + 1 >= n) return error.BadCode;
+                    if (@as(bc.Op, @enumFromInt(code[p + 1].op)) != .mmbink) return error.BadCode;
+                },
+                // 4c. LFALSESKIP skips the next instruction unconditionally.
+                .lfalseskip => {
+                    if (p + 1 >= n) return error.BadCode;
+                },
+                // 4d. MMBIN markers read the PREVIOUS instruction.
+                .mmbin, .mmbini, .mmbink => {
+                    if (p == 0) return error.BadCode;
+                },
+                else => {},
+            }
+        }
     }
 
     // --- Entry point ---
@@ -912,4 +1069,223 @@ test "UndumpReader: undumpProto round-trips nested protos" {
     try std.testing.expectEqual(@as(usize, 1), child.code.len);
     try std.testing.expectEqual(@as(usize, 1), child.k.len);
     try std.testing.expectEqual(@as(i64, 7), child.k[0].int);
+}
+
+// --- verifyProtoCode (P16.34 Cut 3: structural validation at undump) ---
+//
+// The validator is the safety net for the dispatch loop's inline reads
+// (condjump → code[pc+1] as JMP) and for T3.1's bounds-check removal: it
+// converts PUC's "malformed chunk = undefined behavior" into a clean
+// BadCode load error. These tests pin each rule directly on hand-built
+// Protos — no dump/undump round-trip needed, since verifyProtoCode takes
+// the finished Proto.
+
+/// Minimal Proto wrapper around a code array (validator only reads
+/// `code` and `k`).
+fn protoWithCode(code: []const bc.Instruction, k: []const bc.Constant) bc.Proto {
+    return .{
+        .code = @constCast(code),
+        .k = @constCast(k),
+        .p = &.{},
+        .upvalues = &.{},
+        .lineinfo = &.{},
+        .locvars = &.{},
+        .maxstacksize = 2,
+        .numparams = 0,
+        .line_defined = 0,
+        .last_line_defined = 0,
+    };
+}
+
+test "verifyProtoCode accepts a full loop shape" {
+    // FORPREP → body (condjump pair, arith pair) → FORLOOP back → RETURN.
+    // Layout mirrors codegen output for `for i=1,n do if i==n then s=s+1 end end`.
+    //   0: FORPREP  → 4    (16-bit sBx offset +3 in b:c)
+    //   4: EQ + JMP → 7    (JMP at 5, 24-bit offset +1)
+    //   6: ADDI + MMBINI
+    //   8: FORLOOP  → 1    (16-bit sBx offset -8 in b:c: 8 + (-8) + 1 = 1)
+    //   9: RETURN
+    // FORPREP/FORLOOP encode offsets as 16-bit sBx in b:c (make()), JMP as
+    // 24-bit in a:b:c (jump()).
+    const code = [_]bc.Instruction{
+        bc.Instruction.make(.forprep, 0, 3, 0), // 0 → 4
+        bc.Instruction.simple(.return0), // 1 (placeholder, fixed below)
+        bc.Instruction.simple(.return0), // 2 (placeholder, fixed below)
+        bc.Instruction.simple(.return0), // 3 (placeholder, fixed below)
+        bc.Instruction.make(.eq, 0, 0, 0), // 4: condjump
+        bc.Instruction.jump(.jmp, 1), // 5: its JMP → 7
+        bc.Instruction.make(.addi, 0, 0, 0), // 6
+        bc.Instruction.simple(.mmbini), // 7: ADDI's marker
+        bc.Instruction.make(.forloop, 0, 0xF8, 0xFF), // 8 → 1
+        bc.Instruction.simple(.return0), // 9: terminator
+    };
+    var proto = protoWithCode(&code, &.{});
+    try UndumpReader.verifyProtoCode(&proto);
+}
+
+test "verifyProtoCode rejects out-of-range opcode" {
+    // op is a raw u7 (0..127) but bc.Op defines fewer members. An
+    // out-of-range value must be rejected BEFORE any @enumFromInt — in
+    // ReleaseFast the conversion is UB and a garbage enum falls through
+    // every switch's else arm (found by byte-corruption sweep: SIGILL).
+    const code = [_]bc.Instruction{
+        .{ .op = @intCast(@typeInfo(bc.Op).@"enum".fields.len), .a = 0, .k = 0, .b = 0, .c = 0 },
+        bc.Instruction.simple(.return0),
+    };
+    var proto = protoWithCode(&code, &.{});
+    try std.testing.expectError(error.BadCode, UndumpReader.verifyProtoCode(&proto));
+}
+
+test "verifyProtoCode rejects empty code" {
+    var proto = protoWithCode(&.{}, &.{});
+    try std.testing.expectError(error.BadCode, UndumpReader.verifyProtoCode(&proto));
+}
+
+test "verifyProtoCode rejects non-terminating last opcode" {
+    // Last instruction is a MOVE — execution can fall past the end.
+    const code = [_]bc.Instruction{
+        bc.Instruction.simple(.move),
+    };
+    var proto = protoWithCode(&code, &.{});
+    try std.testing.expectError(error.BadCode, UndumpReader.verifyProtoCode(&proto));
+}
+
+test "verifyProtoCode rejects condjump without JMP follower" {
+    const code = [_]bc.Instruction{
+        bc.Instruction.make(.eq, 0, 0, 0),
+        bc.Instruction.simple(.return0), // not a JMP
+        bc.Instruction.simple(.return0),
+    };
+    var proto = protoWithCode(&code, &.{});
+    try std.testing.expectError(error.BadCode, UndumpReader.verifyProtoCode(&proto));
+}
+
+test "verifyProtoCode rejects condjump as last instruction" {
+    // No follower at all — the inline read of code[pc+1] would be OOB.
+    const code = [_]bc.Instruction{
+        bc.Instruction.simple(.return0),
+        bc.Instruction.make(.lti, 0, 0, 0),
+    };
+    var proto = protoWithCode(&code, &.{});
+    // The last-opcode check fires first (LTI is not a terminator), but the
+    // condjump rule would also reject it — either way BadCode.
+    try std.testing.expectError(error.BadCode, UndumpReader.verifyProtoCode(&proto));
+}
+
+test "verifyProtoCode rejects JMP target past the end" {
+    const code = [_]bc.Instruction{
+        bc.Instruction.jump(.jmp, 5), // 0 + 5 + 1 = 6 ≥ len 2
+        bc.Instruction.simple(.return0),
+    };
+    var proto = protoWithCode(&code, &.{});
+    try std.testing.expectError(error.BadCode, UndumpReader.verifyProtoCode(&proto));
+}
+
+test "verifyProtoCode rejects JMP target before start" {
+    const code = [_]bc.Instruction{
+        bc.Instruction.simple(.return0),
+        bc.Instruction.jump(.jmp, -3), // 1 + (-3) + 1 = -1 < 0
+    };
+    var proto = protoWithCode(&code, &.{});
+    // Last op is JMP (not a terminator) → BadCode from rule 1; the target
+    // check would also fire. Both are BadCode.
+    try std.testing.expectError(error.BadCode, UndumpReader.verifyProtoCode(&proto));
+}
+
+test "verifyProtoCode rejects FORLOOP target out of range" {
+    // FORLOOP encodes its offset as 16-bit sBx in b:c (not the 24-bit
+    // a:b:c form JMP uses), so build it with make() directly.
+    const code = [_]bc.Instruction{
+        bc.Instruction.make(.forloop, 0, 100, 0), // 0 + 100 + 1 = 101 ≥ len
+        bc.Instruction.simple(.return0),
+    };
+    var proto = protoWithCode(&code, &.{});
+    try std.testing.expectError(error.BadCode, UndumpReader.verifyProtoCode(&proto));
+}
+
+test "verifyProtoCode rejects arith without MMBIN follower" {
+    const code = [_]bc.Instruction{
+        bc.Instruction.make(.add, 0, 0, 0),
+        bc.Instruction.simple(.return0), // not MMBIN
+        bc.Instruction.simple(.return0),
+    };
+    var proto = protoWithCode(&code, &.{});
+    try std.testing.expectError(error.BadCode, UndumpReader.verifyProtoCode(&proto));
+}
+
+test "verifyProtoCode rejects ADDI without MMBINI follower" {
+    const code = [_]bc.Instruction{
+        bc.Instruction.make(.addi, 0, 0, 0),
+        bc.Instruction.simple(.mmbin), // wrong variant
+        bc.Instruction.simple(.return0),
+    };
+    var proto = protoWithCode(&code, &.{});
+    try std.testing.expectError(error.BadCode, UndumpReader.verifyProtoCode(&proto));
+}
+
+test "verifyProtoCode rejects ADDK without MMBINK follower" {
+    const code = [_]bc.Instruction{
+        bc.Instruction.make(.addk, 0, 0, 0),
+        bc.Instruction.simple(.mmbini), // wrong variant
+        bc.Instruction.simple(.return0),
+    };
+    var proto = protoWithCode(&code, &.{});
+    try std.testing.expectError(error.BadCode, UndumpReader.verifyProtoCode(&proto));
+}
+
+test "verifyProtoCode rejects LOADKX without EXTRAARG follower" {
+    const code = [_]bc.Instruction{
+        bc.Instruction.simple(.loadkx),
+        bc.Instruction.simple(.return0), // not EXTRAARG
+        bc.Instruction.simple(.return0),
+    };
+    var proto = protoWithCode(&code, &.{});
+    try std.testing.expectError(error.BadCode, UndumpReader.verifyProtoCode(&proto));
+}
+
+test "verifyProtoCode rejects LOADKX with constant index past pool" {
+    const code = [_]bc.Instruction{
+        bc.Instruction.simple(.loadkx),
+        bc.Instruction.extra(3), // pool has only 1 constant
+        bc.Instruction.simple(.return0),
+    };
+    const ks = [_]bc.Constant{.{ .int = 1 }};
+    var proto = protoWithCode(&code, &ks);
+    try std.testing.expectError(error.BadCode, UndumpReader.verifyProtoCode(&proto));
+}
+
+test "verifyProtoCode rejects MMBIN as first instruction" {
+    // MMBIN reads its PREVIOUS instruction — at index 0 there is none.
+    const code = [_]bc.Instruction{
+        bc.Instruction.simple(.mmbin),
+        bc.Instruction.simple(.return0),
+    };
+    var proto = protoWithCode(&code, &.{});
+    try std.testing.expectError(error.BadCode, UndumpReader.verifyProtoCode(&proto));
+}
+
+test "verifyProtoCode rejects LFALSESKIP as last instruction" {
+    // LFALSESKIP unconditionally skips a follower — none exists.
+    const code = [_]bc.Instruction{
+        bc.Instruction.simple(.return0),
+        bc.Instruction.simple(.lfalseskip),
+    };
+    var proto = protoWithCode(&code, &.{});
+    // Last-op rule fires (LFALSESKIP is not a terminator); the follower
+    // rule would also fire. Both are BadCode.
+    try std.testing.expectError(error.BadCode, UndumpReader.verifyProtoCode(&proto));
+}
+
+test "verifyProtoCode accepts TAILCALL terminator and valid condjump chain" {
+    // TAILCALL is a legal terminator (it replaces the frame); TEST + JMP
+    // with a backward in-range target is a valid pair.
+    const code = [_]bc.Instruction{
+        bc.Instruction.make(.test_, 0, 0, 0), // 0: condjump
+        bc.Instruction.jump(.jmp, 2), // 1: → 4
+        bc.Instruction.simple(.return0), // 2
+        bc.Instruction.simple(.return0), // 3
+        bc.Instruction.make(.tailcall, 0, 0, 0), // 4: terminator
+    };
+    var proto = protoWithCode(&code, &.{});
+    try UndumpReader.verifyProtoCode(&proto);
 }

@@ -14056,6 +14056,46 @@ pub const Vm = struct {
         ctx.exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
     }
 
+    /// PUC `donextjump` (lvm.c): the TAKEN side of a conditional jump reads
+    /// the FOLLOWING JMP's offset inline and applies it in one step — the
+    /// JMP opcode is never fetched or dispatched through the switch. PUC's
+    /// conditional opcodes (`docondjump`: `if (cond != condresult) pc++;
+    /// else donextjump(ci)`) never execute the paired JMP as an
+    /// instruction; before P16.34 Cut 3 our taken side fell through to a
+    /// real JMP dispatch, paying a full fetch+dispatch head per taken
+    /// branch (T0: −18 instructions per taken condjump on branch_loop).
+    ///
+    /// Precondition (both proven): codegen emits every condjump as a
+    /// CMP+JMP / TEST+JMP pair (genCompare codegen_bc.zig; testAndJump /
+    /// goIfTrue / goIfFalse), and undump validates the pairing for
+    /// deserialized chunks (`undump.verifyProtoCode`).
+    ///
+    /// The caller must `continue` the dispatch loop right after (skipping
+    /// the default `ctx.pc += 1` — the jump already landed on the target).
+    inline fn dispatchDoNextJump(
+        self: *Vm,
+        ctx: *BytecodeDispatchCtx,
+        check_sigint: bool,
+    ) DispatchError!void {
+        const ni = ctx.cur_proto.code[ctx.pc + 1];
+        // Target = (JMP index) + offset + 1 = (condjump index) + offset + 2
+        // — identical arithmetic to the JMP handler, folded with the skip
+        // of the condjump itself (PUC: pc += 2 + offset via dojump(ci, ni, 1)).
+        ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, ni.jumpOffset()) + 2);
+        // Backward-jump SIGINT poll — exactly the check the JMP handler
+        // performs after applying its offset (PUC refreshes the trap in
+        // dojump via `updatetrap`), moved inline with the jump it replaces.
+        // Same count as before the cut: the check was paid inside the JMP
+        // dispatch, now inside the condjump handler.
+        if (check_sigint and signal_int_pending.load(.acquire)) {
+            signal_int_pending.store(false, .release);
+            // Post-jump pc is the fetch point — publish before fail
+            // (PUC vmfetch trap; P16.34).
+            self.parkActiveFrame(ctx);
+            return self.fail("interrupted!", .{});
+        }
+    }
+
     /// Re-derive `ctx.regs` / `ctx.boxed` after a callee may have realloc'd
     /// `bc_stack`. Cheap (slice arithmetic only); call liberally after any
     /// function that may grow the shared stack.
@@ -15840,7 +15880,13 @@ pub const Vm = struct {
                             break :blk false;
                         };
                         const invert = (inst.c != 0);
-                        if (result != invert) ctx.pc += 1;
+                        if (result != invert) {
+                            ctx.pc += 1; // skip the following JMP
+                        } else {
+                            // Taken: PUC donextjump — read the JMP inline.
+                            try self.dispatchDoNextJump(&ctx, check_sigint);
+                            continue;
+                        }
                     },
                     .lt => {
                         const la = ctx.regs[inst.a];
@@ -15860,7 +15906,13 @@ pub const Vm = struct {
                             }
                         };
                         const invert = (inst.c != 0);
-                        if (result != invert) ctx.pc += 1;
+                        if (result != invert) {
+                            ctx.pc += 1; // skip the following JMP
+                        } else {
+                            // Taken: PUC donextjump — read the JMP inline.
+                            try self.dispatchDoNextJump(&ctx, check_sigint);
+                            continue;
+                        }
                     },
                     .le => {
                         const la = ctx.regs[inst.a];
@@ -15881,7 +15933,13 @@ pub const Vm = struct {
                             }
                         };
                         const invert = (inst.c != 0);
-                        if (result != invert) ctx.pc += 1;
+                        if (result != invert) {
+                            ctx.pc += 1; // skip the following JMP
+                        } else {
+                            // Taken: PUC donextjump — read the JMP inline.
+                            try self.dispatchDoNextJump(&ctx, check_sigint);
+                            continue;
+                        }
                     },
                     // P15.38d: Immediate comparison opcodes (PUC EQI/LTI/LEI/GTI/GEI/EQK).
                     // These compare R[A] against a signed immediate (sB) or constant
@@ -15899,7 +15957,13 @@ pub const Vm = struct {
                             else => false,
                         };
                         const invert = (inst.c & 1) != 0;
-                        if (result != invert) ctx.pc += 1;
+                        if (result != invert) {
+                            ctx.pc += 1; // skip the following JMP
+                        } else {
+                            // Taken: PUC donextjump — read the JMP inline.
+                            try self.dispatchDoNextJump(&ctx, check_sigint);
+                            continue;
+                        }
                     },
                     .eqk => {
                         // PUC OP_EQK: if ((R[A] == K[B]) ~= (C&1)) then ctx.pc++
@@ -15908,7 +15972,13 @@ pub const Vm = struct {
                         const rb = ctx.cur_proto.resolved_values[inst.b];
                         const result = valuesEqual(la, rb);
                         const invert = (inst.c & 1) != 0;
-                        if (result != invert) ctx.pc += 1;
+                        if (result != invert) {
+                            ctx.pc += 1; // skip the following JMP
+                        } else {
+                            // Taken: PUC donextjump — read the JMP inline.
+                            try self.dispatchDoNextJump(&ctx, check_sigint);
+                            continue;
+                        }
                     },
                     .lti => {
                         // PUC OP_LTI: if ((R[A] < sB) ~= (C&1)) then ctx.pc++
@@ -15932,7 +16002,13 @@ pub const Vm = struct {
                             }
                         };
                         const invert = (inst.c & 1) != 0;
-                        if (result != invert) ctx.pc += 1;
+                        if (result != invert) {
+                            ctx.pc += 1; // skip the following JMP
+                        } else {
+                            // Taken: PUC donextjump — read the JMP inline.
+                            try self.dispatchDoNextJump(&ctx, check_sigint);
+                            continue;
+                        }
                     },
                     .lei => {
                         // PUC OP_LEI: if ((R[A] <= sB) ~= (C&1)) then ctx.pc++
@@ -15954,7 +16030,13 @@ pub const Vm = struct {
                             }
                         };
                         const invert = (inst.c & 1) != 0;
-                        if (result != invert) ctx.pc += 1;
+                        if (result != invert) {
+                            ctx.pc += 1; // skip the following JMP
+                        } else {
+                            // Taken: PUC donextjump — read the JMP inline.
+                            try self.dispatchDoNextJump(&ctx, check_sigint);
+                            continue;
+                        }
                     },
                     .gti => {
                         // PUC OP_GTI: if ((R[A] > sB) ~= (C&1)) then ctx.pc++
@@ -15977,7 +16059,13 @@ pub const Vm = struct {
                             }
                         };
                         const invert = (inst.c & 1) != 0;
-                        if (result != invert) ctx.pc += 1;
+                        if (result != invert) {
+                            ctx.pc += 1; // skip the following JMP
+                        } else {
+                            // Taken: PUC donextjump — read the JMP inline.
+                            try self.dispatchDoNextJump(&ctx, check_sigint);
+                            continue;
+                        }
                     },
                     .gei => {
                         // PUC OP_GEI: if ((R[A] >= sB) ~= (C&1)) then ctx.pc++
@@ -16000,22 +16088,37 @@ pub const Vm = struct {
                             }
                         };
                         const invert = (inst.c & 1) != 0;
-                        if (result != invert) ctx.pc += 1;
+                        if (result != invert) {
+                            ctx.pc += 1; // skip the following JMP
+                        } else {
+                            // Taken: PUC donextjump — read the JMP inline.
+                            try self.dispatchDoNextJump(&ctx, check_sigint);
+                            continue;
+                        }
                     },
 
                     // --- Test / testset ---
                     .test_ => {
                         const is_truthy = isTruthy(ctx.regs[inst.a]);
                         const skip_if_falsy = (inst.c != 0);
-                        if (!is_truthy == skip_if_falsy) ctx.pc += 1;
+                        if (!is_truthy == skip_if_falsy) {
+                            ctx.pc += 1; // skip the following JMP
+                        } else {
+                            // Taken: PUC donextjump — read the JMP inline.
+                            try self.dispatchDoNextJump(&ctx, check_sigint);
+                            continue;
+                        }
                     },
                     .testset => {
                         const is_truthy = isTruthy(ctx.regs[inst.b]);
                         const skip_if_falsy = (inst.c != 0);
                         if (!is_truthy == skip_if_falsy) {
-                            ctx.pc += 1;
+                            ctx.pc += 1; // skip the following JMP
                         } else {
                             ctx.regs[inst.a] = ctx.regs[inst.b];
+                            // Taken: PUC donextjump — read the JMP inline.
+                            try self.dispatchDoNextJump(&ctx, check_sigint);
+                            continue;
                         }
                     },
 
@@ -26852,6 +26955,7 @@ pub const Vm = struct {
                 error.TruncatedChunk => "truncated precompiled chunk",
                 error.BadHeader => "bad binary format (corrupted header)",
                 error.BadConstant => "bad binary format (corrupted constant)",
+                error.BadCode => "bad binary format (corrupted code)",
                 error.OutOfMemory => return error.OutOfMemory,
             };
             const owned = try self.alloc.dupe(u8, msg);

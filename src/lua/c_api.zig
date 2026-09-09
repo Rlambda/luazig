@@ -1061,18 +1061,19 @@ pub export fn lua_closeslot(L: ?*lua_State, idx: c_int) void {
     // PUC preclose(CLOSEKTOP): the closed slot becomes nil immediately.
     if (abs < h.c_stack.items.len) h.c_stack.items[abs] = .Nil;
 
-    const mm = vm.getTmByObj(val, .close) orelse {
+    const mm = vm.getTmByObj(val, .close);
+    if (mm == null) {
         // No __close metamethod: PUC checkclosemth raises "non-closable";
         // the c_api lane is lenient (mark popped, slot nil — close done).
         return;
-    };
+    }
 
     // Call __close(val) with 0 results, non-yieldably (PUC luaD_callnoyield).
     // Errors propagate through apiCall to the caller's pcall/error handler
     // (PUC luaD_call → luaD_throw): push the error object and re-raise via
     // lua_error.
     var call_args = [_]Value{val};
-    _ = vm.apiCall(.nonyieldable, mm, call_args[0..]) catch {
+    _ = vm.apiCall(.nonyieldable, mm.?.*, call_args[0..]) catch {
         if (vm.err_has_obj) {
             h.c_stack.append(vm.alloc, vm.err_obj) catch {};
         } else {

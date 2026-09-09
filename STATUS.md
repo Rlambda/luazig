@@ -9282,3 +9282,78 @@ i/fetch; int_arith 109→89 i/it (−18% инструкций на shape).
 
 Гейт: src не менялся (артефакт + STATUS только); smoke 71/71, matrix --testc
 31/32 zig_fail=0 — прогнаны на неизменённом дереве для подтверждения.
+
+## P16.34 Cut 1 — dispatch_pc publication → PUC savestate ownership (2026-09-10)
+
+Убран per-fetch store `self.dispatch_pc = ctx.pc` из головы dispatch (T0:
+компонент «публикация 1 vs 0») и поле `dispatch_pc` из Vm целиком. Pc
+публикуется в heap CallFrame ТОЛЬКО на семантических границах — модель
+PUC `savestate`/`savepc` (lvm.c: 44 store'а, все на call/error/GC/hook
+сайтах, ни одного в голове): `parkActiveFrame(ctx)` пишет
+`u.lua.pc = ctx.pc` ДО reentrant-читателя (fail-сайты = PUC Protect,
+GC-шаги = PUC checkGC, hook/child-push, yield). Между парками heap pc
+deliberately stale — как savedpc между границами в PUC. Инвентарь всех
+читателей/сайтов: `tools/status/p16.34-t1-dispatch-pc-ownership.md`.
+
+- [x] T1.1 инвентарь читателей/publish-сайтов (артефакт-истина);
+- [x] T1.2 реализация: allocTable(ctx: ?*BytecodeDispatchCtx) (26 callers:
+      OP_NEWTABLE `&ctx`, остальные null — PUC checkGC conditional savepc),
+      syncTopFrameForGc удалён, per-fetch store и поле удалены, fail-сайты
+      публикуют (SETTABUP env, NEWTABLE malformed ×2, SETTABLE generic-key
+      rawSet, LEN slow-branch, MMBIN/MMBINI/MMBANK handler heads, UNM/BNOT,
+      sigint JMP/FORLOOP×2/TFORLOOP/TFORPREP, opSetlist, opForprep entry,
+      slowCmp entry, getBytecodeVarargTable), OP_CLOSE паркует ДО CLOSE
+      (PUC Protect(luaF_close), lvm.c:1637; resume_dispatch ветка сохраняет
+      `ctx.pc += 1` + park — completion `.advance_instruction` не трогает
+      pc фрейма), CALL fast-path sigint-fail без публикации (pushStagedFast
+      инициализирует child pc=0 — прежняя семантика dispatch_pc=0);
+- [x] T1.3 parity-тест `tests/smoke/73_error_location_pc.lua`: 15
+      error-location кейсов + 4 GC-live-pc кейса, выводы сняты с PUC,
+      байт-в-байт на обоих движках;
+- [x] T1.4 A/B (median-of-5, n-vs-2n steady-state, taskset -c 0, perf stat
+      single-run cpu_core): см. таблицу ниже.
+
+parkActiveFrame — unconditional store, паритет PUC savepc (`ci->u.l.savedpc
+= pc` без проверок): первая версия cut'а несла defensive bounds-check
+`if (frame_index < len)` — измерено +3.84 i/it на mm_noalloc (check+jcc на
+каждом горячем park-сайте MMBIN-push); check удалён как PUC-divergence
+(доказуемо всегда top-of-stack frame; safe-mode получает bounds-check от
+самого getPtr). После удаления mm_noalloc вернулся к −5.11 ≈ прогнозу −5.
+
+A/B base(9511ac8)→cut, i/iter (T0 fetch-counts: int/mixed/float 3,
+branch_loop 5, comparisons 5, lua_calls 7, mm 5):
+
+| workload | base | cut | Δ | прогноз −1×fetch | атрибуция |
+|---|---|---|---|---|---|
+| int_arith | 109.08 | 106.05 | −3.03 | −3 | exact |
+| mixed_arith | 121.20 | 118.17 | −3.03 | −3 | exact |
+| float_arith | 114.13 | 111.10 | −3.03 | −3 | exact |
+| branch_loop | 244.42 | 237.35 | −7.07 | −5 | −5 store + −2 RA re-roll |
+| comparisons | 261.59 | 255.53 | −6.06 | −5 | −5 store + −1 RA re-roll |
+| lua_calls | 485.81 | 472.68 | −13.13 | −7 | −7 store + −6 RA re-roll |
+| mm_noalloc | 593.98 | 588.87 | −5.11 | −5 | exact (после removal bounds-check) |
+| field_access | 353.51 | 337.34 | −16.2 | — | runtime-bimodal (P16.33 T3: 2 режима, hash-seed/GC) — не сигнал |
+| coroutine_yield | 2573.52 | 2570.56 | −2.96 | — | yield-путь вне головы |
+
+Доказательство −1/fetch на уровне disasm: голова cut = 15 инструкций до
+dispatch (10bcfd0: 2 spill-reload + len cmp/jae + 2 fetch + gate load/test/je
++ 6 jump-table) vs base 16 (T0) — store удалён, хвосты хендлеров идентичны
+(`incq pc; jmp head`). Доп. дельты (branch_loop −2, comparisons −1,
+lua_calls −6) — deterministic (median-of-5 стабилен), направление
+равномерно благоприятное, атрибутированы RA re-roll (снятие store'а убрало
+live-range `self`+pc через весь switch — роли регистров в голове
+перераспределены r12↔r15, inst теперь в r12d). callgrind-тотал lua_calls
+945,369/2000 iter = 472.68/iter — совпадает с perf byte-в-byte. Регрессий
+нет ни на одном workload.
+
+Гейт: zig fmt; unit D+RF (CallFrame==88 assert); smoke 72/72 (новый 73-й);
+matrix --testc zig_fail=0 (big.lua both_fail pre-existing); c_api clean
+test + test-diff ALL PASS; api580 GREEN (D+RF+sizes); upstream
+errors/coroutine/closure ok.
+
+Side-findings (pre-existing, не этого cut'а, в backlog): string.rep /
+string.byte / table.concat — расхождение текста arg-error сообщений с PUC;
+LEN error без суффикса `(local 'x')`; locals.lua raw-diff = interleaving
+артефакт tracegc "." (stderr/stdout merge в run_tests.py; оба движка
+печатают ровно 1 точку; на HEAD идентично); uncaught `error("boom")`
+double-traceback (на HEAD идентично, PUC печатает один раз).

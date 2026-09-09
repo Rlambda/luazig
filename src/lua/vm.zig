@@ -3674,16 +3674,15 @@ fn makeRandomSeed() u64 {
 /// ReleaseFast, see STATUS.md "P16.0b"): the struct lives INLINE on the
 /// (singleton) Vm. Every instrumented site — including the
 /// per-instruction histogram site — checks `self.stats.enabled` directly:
-/// one L1 byte-load + predictable never-taken branch (`enabled` is placed
-/// right after the per-instruction-written `dispatch_pc`, so it shares a
-/// cache line). Two alternatives were measured and REJECTED: (a) a cached
-/// `?*VmStats` loop-local pointer costs a register across the whole
-/// dispatch switch (+3% on branchy microbenchmarks); (b) converting every
-/// counter site to @branchHint(.unlikely) block form — reproducibly WORSE
-/// on some benches (+12% comparisons) because the extra block form shifts
-/// hot code layout; the codegen layout lottery dominates sub-cycle branch
-/// costs. `enabled` is flipped only by the CLI/tests BEFORE execution
-/// starts; execution semantics never read these counters.
+/// one L1 byte-load + predictable never-taken branch. Two alternatives
+/// were measured and REJECTED: (a) a cached `?*VmStats` loop-local
+/// pointer costs a register across the whole dispatch switch (+3% on
+/// branchy microbenchmarks); (b) converting every counter site to
+/// @branchHint(.unlikely) block form — reproducibly WORSE on some benches
+/// (+12% comparisons) because the extra block form shifts hot code
+/// layout; the codegen layout lottery dominates sub-cycle branch costs.
+/// `enabled` is flipped only by the CLI/tests BEFORE execution starts;
+/// execution semantics never read these counters.
 pub const VmStats = struct {
     enabled: bool = false,
 
@@ -4154,12 +4153,6 @@ pub const Vm = struct {
     /// write those flags. The hot loop pays ONE load + ONE branch for both
     /// (PUC vmfetch also pays one trap branch — this is shape parity).
     dispatch_gate: u8 = 0,
-
-    /// Current dispatch pc — mirrors PUC's `ci->u.l.savedpc` but kept
-    /// up-to-date per-instruction so that fail() and GC safepoints can read
-    /// the current pc without the dispatch loop syncing to the frame.
-    /// Written at the top of the inner dispatch loop.
-    dispatch_pc: usize = 0,
 
     /// P16.0b: default-off runtime counters (see VmStats). Inline on the
     /// singleton Vm: ~250 bytes of cold-when-disabled state is acceptable
@@ -5427,7 +5420,12 @@ pub const Vm = struct {
         len: usize,
     };
 
-    fn getBytecodeVarargTable(self: *Vm, proto: *const bc.Proto, regs: []Value) DispatchError!?BytecodeVarargTable {
+    fn getBytecodeVarargTable(
+        self: *Vm,
+        ctx: *BytecodeDispatchCtx,
+    ) DispatchError!?BytecodeVarargTable {
+        const proto = ctx.cur_proto;
+        const regs = ctx.regs;
         const reg = proto.vararg_table_reg;
         if (reg == bc.Proto.no_vararg_reg) return null;
         const idx: usize = @intCast(reg);
@@ -5436,6 +5434,9 @@ pub const Vm = struct {
         var n: usize = tbl.asize;
         const nv = self.getField(tbl, "n");
         if (nv != .Nil) {
+            // User code corrupted the vararg table's 'n': publish before
+            // failing (PUC Protect parity, P16.34).
+            self.parkActiveFrame(ctx);
             switch (nv) {
                 .Int => |iv| {
                     if (iv < 0 or iv > 100_000) return self.fail("no proper 'n'", .{});
@@ -5579,7 +5580,7 @@ pub const Vm = struct {
     }
 
     pub fn apiNewTable(self: *Vm) Error!*Table {
-        return exposeDispatchResult(*Table, self.allocTable());
+        return exposeDispatchResult(*Table, self.allocTable(null));
     }
 
     pub fn apiNewThread(self: *Vm, callee: Value) Error!*Thread {
@@ -6744,11 +6745,13 @@ pub const Vm = struct {
         // This prevents union field mismatch panic when callBuiltin pushes a
         // C-frame and a builtin calls fail().
         if (self.topLuaFrame()) |fr| {
-            // Sync pc from the dispatch loop's working copy. The heap pc is
-            // only parked at child-push transitions (P16.29 T2
-            // parkActiveFrame), so fr.u.lua.pc may be stale here.
-            // dispatch_pc is written every instruction in the inner loop.
-            fr.u.lua.pc = self.dispatch_pc;
+            // PUC luaG_runerror → luaG_addinfo reads ci->u.l.savedpc as-is:
+            // the pc published by the LAST savestate (Protect/checkGC/
+            // parkActiveFrame) at the failing boundary. Every dispatch-
+            // reachable fail site publishes before failing (P16.34 Cut 1
+            // inventory, tools/status/p16.34-t1-dispatch-pc-ownership.md);
+            // fail() from a C frame reads the parent Lua frame parked at
+            // the CALL that entered C. No per-instruction sync exists.
             // P15.51n: current_line derived from proto.lineinfo[pc].
             self.err_source = fr.sourceName();
             self.err_line = self.frameCurrentLine(fr);
@@ -7692,23 +7695,6 @@ pub const Vm = struct {
         self.testc_obj_tables += 1;
         return t;
     }
-
-    /// Sync the top frame's pc from the dispatch loop's
-    /// local state before GC runs. The fast dispatch path (P15.33) defers
-    /// per-instruction RuntimeFrame sync to safepoints. Any code path that
-    /// triggers GC from within the dispatch loop (allocTable, callBuiltin,
-    /// etc.) must call this so that gcMarkMutableRoots and
-    /// gcClearDeadFrameRegisters see the correct pc and live_reg_top.
-    fn syncTopFrameForGc(self: *Vm) void {
-        // Sync dispatch_pc to the frame so gcMarkMutableRoots reads the
-        // correct live_reg_top[pc]. dispatch_pc is written every instruction
-        // in the inner dispatch loop.
-        // Use topLuaFrame() to skip C-frames (which don't have u.lua.pc).
-        if (self.topLuaFrame()) |fr| {
-            fr.u.lua.pc = self.dispatch_pc;
-        }
-    }
-
     /// PUC `checkGC(L,c)` analogue: conditionally run a GC step after an
     /// allocation site. Called from OP_CONCAT, OP_CLOSURE, and string
     /// allocation paths — the same points where PUC invokes `luaC_condGC`.
@@ -7735,7 +7721,13 @@ pub const Vm = struct {
         ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
     }
 
-    fn allocTable(self: *Vm) DispatchError!*Table {
+    /// `ctx` is the ACTIVE dispatch context when the allocation happens
+    /// inside an opcode handler (only OP_NEWTABLE today); callers running
+    /// in C frames (builtins, stdlib init, C API) pass null — their parent
+    /// Lua frame is parked at the CALL that entered C, which is already
+    /// the pc the GC must see (PUC: builtins run with the caller's
+    /// savedpc already saved by the interpreter's savestate).
+    fn allocTable(self: *Vm, ctx: ?*BytecodeDispatchCtx) DispatchError!*Table {
         try self.testcConsumeAllocCount();
         const t = try self.allocTableNoGc();
         self.gc_alloc_tables += 1;
@@ -7754,10 +7746,12 @@ pub const Vm = struct {
             var roots = self.gcTempRoots();
             defer roots.end();
             try roots.add(.{ .Table = t });
-            // Sync frame.u.lua.pc from dispatch_pc so gcMarkMutableRoots reads the
-            // correct live_reg_top[pc]. dispatch_pc is updated every
-            // instruction in the dispatch loop (line: self.dispatch_pc = ctx.pc).
-            self.syncTopFrameForGc();
+            // PUC checkGC(L,c): `savepc(ci)` is the `p` argument of
+            // luaC_condGC — evaluated ONLY when a GC step will actually
+            // run (this branch). Publish the dispatch pc to the heap
+            // CallFrame (the savestate analogue) so gcMarkMutableRoots
+            // reads the correct live_reg_top[pc].
+            if (ctx) |c| self.parkActiveFrame(c);
             try self.gcAutomaticStep();
         }
         return t;
@@ -14045,17 +14039,21 @@ pub const Vm = struct {
     ///
     /// Between parks the heap pc is deliberately stale (the dispatch ctx
     /// owns it), exactly like PUC's savedpc between boundaries. Every
-    /// reentrant reader inside that window publishes first: fail() writes
-    /// dispatch_pc (per-instruction), condGcFromDispatch/syncTopFrameForGc
-    /// park before GC, the hooks block parks before pushing hook frames.
+    /// reentrant reader inside that window publishes first: fail sites
+    /// publish before failing (PUC Protect), condGcFromDispatch and
+    /// allocTable's GC branch park before GC steps (PUC checkGC), the
+    /// hooks block parks before pushing hook frames (P16.34 Cut 1
+    /// inventory: tools/status/p16.34-t1-dispatch-pc-ownership.md).
     ///
-    /// The bounds check is defensive only: every caller parks while the
-    /// frame is provably the live top-of-stack dispatch frame (before a
-    /// child push or around one) — it can never be out of range here.
+    /// No bounds check, matching PUC's unconditional `ci->u.l.savedpc = pc`
+    /// (savepc macro): every caller parks while the frame is provably the
+    /// live top-of-stack dispatch frame (before a child push or around one),
+    /// so `frame_index` can never be out of range here. Safe-mode builds
+    /// still get slice bounds checking from `getPtr` itself; in ReleaseFast
+    /// the park is a single store, exactly like PUC.
     inline fn parkActiveFrame(self: *Vm, ctx: *BytecodeDispatchCtx) void {
         _ = self;
-        if (ctx.frame_index < ctx.exec_frames.len())
-            ctx.exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+        ctx.exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
     }
 
     /// Re-derive `ctx.regs` / `ctx.boxed` after a callee may have realloc'd
@@ -14233,18 +14231,18 @@ pub const Vm = struct {
                 const op: bc.Op = @enumFromInt(inst.op);
 
                 // P16.0b: default-off instruction histogram. When disabled
-                // this is one L1 byte-load + predictable not-taken branch
-                // (the `enabled` field sits in the same cache line as the
-                // per-instruction-written `dispatch_pc`). Deliberately NOT
-                // a cached `?*VmStats` local: a loop-wide live pointer
-                // costs a register across the whole dispatch switch, which
-                // measured +3% on branchy microbenchmarks (see STATUS.md
-                // "P16.0b" for the A/B history). The hint keeps the
-                // increments out of the hot instruction stream.
-                // Publish the current pc so fail() and GC safepoints can read
-                // it without the dispatch loop syncing to the frame first.
-                // This mirrors PUC's `ci->u.l.savedpc` but is kept per-instruction.
-                self.dispatch_pc = ctx.pc;
+                // this is one L1 byte-load + predictable not-taken branch.
+                // Deliberately NOT a cached `?*VmStats` local: a loop-wide
+                // live pointer costs a register across the whole dispatch
+                // switch, which measured +3% on branchy microbenchmarks
+                // (see STATUS.md "P16.0b" for the A/B history). The hint
+                // keeps the increments out of the hot instruction stream.
+                //
+                // P16.34 Cut 1: NO per-instruction pc publication here.
+                // PUC's vmfetch never writes ci->u.l.savedpc; the pc is
+                // published only at semantic boundaries (fail sites, GC
+                // steps, hook/child pushes) via parkActiveFrame — see
+                // tools/status/p16.34-t1-dispatch-pc-ownership.md.
 
                 // P16.19 T5-A: single combined gate; common case = one
                 // not-taken branch for BOTH stats and hooks flags.
@@ -14570,6 +14568,9 @@ pub const Vm = struct {
                         // upvalue name in the error message (like GETUPVAL+
                         // SETFIELD does via debugBytecodeOperandName).
                         if (env != .Table) {
+                            // PUC Protect(luaV_finishset): publish the pc
+                            // before the error-capable slow path (P16.34).
+                            self.parkActiveFrame(&ctx);
                             const upv_name = if (inst.a < ctx.cur_proto.upvalues.len)
                                 ctx.cur_proto.upvalues[inst.a].name()
                             else
@@ -14878,6 +14879,12 @@ pub const Vm = struct {
                                     }
                                 }
                             } else {
+                                // Generic key: rawSet can fail on nil/NaN
+                                // keys ("table index is nil/NaN") — PUC
+                                // Protect(luaV_finishset): publish first
+                                // (P16.34). String/Int keys above cannot
+                                // fail, so only this branch pays the park.
+                                self.parkActiveFrame(&ctx);
                                 try self.rawSet(tbl, key, val);
                             }
                         } else {
@@ -14955,18 +14962,22 @@ pub const Vm = struct {
                         // C + EXTRAARG * 256. (PUC uses a k flag instead;
                         // our bytecode has no k bit, so we always emit
                         // EXTRAARG with 0 for the common case.)
-                        const t = try self.allocTable();
+                        const t = try self.allocTable(&ctx);
                         ctx.regs[inst.a] = .{ .Table = t };
                         const hsize_log2: u8 = inst.b;
                         // Read the EXTRAARG (always present after NEWTABLE).
                         if (ctx.pc + 1 >= ctx.cur_proto.code.len or
                             @as(bc.Op, @enumFromInt(ctx.cur_proto.code[ctx.pc + 1].op)) != .extraarg)
                         {
+                            // Defensive malformed-bytecode fail: publish
+                            // first (PUC Protect parity, P16.34).
+                            self.parkActiveFrame(&ctx);
                             return self.fail("NEWTABLE missing EXTRAARG", .{});
                         }
                         ctx.pc += 1;
                         const asize: u32 = @as(u32, inst.c) + @as(u32, ctx.cur_proto.code[ctx.pc].extraArg()) * 256;
                         if (hsize_log2 > 31) {
+                            self.parkActiveFrame(&ctx);
                             return self.fail("NEWTABLE hash size out of range", .{});
                         }
                         const hsize: u32 = if (hsize_log2 > 0)
@@ -15532,6 +15543,11 @@ pub const Vm = struct {
                         const event: TmsEvent = @enumFromInt(@as(u5, @truncate(inst.c)));
                         const lhs = ctx.regs[inst.a];
                         const rhs = ctx.regs[inst.b];
+                        // PUC Protect(luaT_trybinTM): publish before the
+                        // error-capable metamethod path — covers both the
+                        // no-metamethod type error and the __event push
+                        // (P16.34; one park instead of per-branch writes).
+                        self.parkActiveFrame(&ctx);
                         // PUC luaT_trybinTM (ltm.c:150-166): try metamethod
                         // on lhs, then rhs. No metamethod → type error.
                         // Metamethod not callable → call error.
@@ -15544,7 +15560,6 @@ pub const Vm = struct {
                         // callable semantics (handles __call chains), then
                         // invoke — bytecode Closure as continuation frame
                         // (yieldable), Builtin/C-closure synchronously.
-                        exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                         switch (try self.tryPushSimpleResultMetamethod(
                             exec_frames,
                             ctx.frame_index,
@@ -15572,13 +15587,14 @@ pub const Vm = struct {
                         const flip = inst.k != 0;
                         const lhs = if (flip) imm_val else ctx.regs[inst.a];
                         const rhs = if (flip) ctx.regs[inst.a] else imm_val;
+                        // PUC Protect(luaT_trybinTM) — see .mmbin (P16.34).
+                        self.parkActiveFrame(&ctx);
                         // Resolve ONCE — no re-lookup in the push/call path.
                         const tm = self.findBinaryTm(lhs, rhs, event);
                         if (tm == null) {
                             // Bad operand is always R[A] (immediate is always valid).
                             return self.failBinaryMmbin(lhs, rhs, event, ctx.cur_proto, ctx.pc - 1, inst.a, inst.a);
                         }
-                        exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                         switch (try self.tryPushSimpleResultMetamethod(
                             exec_frames,
                             ctx.frame_index,
@@ -15605,6 +15621,8 @@ pub const Vm = struct {
                         const flip = inst.k != 0;
                         const lhs = if (flip) kv else ctx.regs[inst.a];
                         const rhs = if (flip) ctx.regs[inst.a] else kv;
+                        // PUC Protect(luaT_trybinTM) — see .mmbin (P16.34).
+                        self.parkActiveFrame(&ctx);
                         // Resolve ONCE — no re-lookup in the push/call path.
                         const tm = self.findBinaryTm(lhs, rhs, event);
                         if (tm == null) {
@@ -15614,7 +15632,6 @@ pub const Vm = struct {
                             const p2_reg: u8 = if (flip) inst.a else 255;
                             return self.failBinaryMmbin(lhs, rhs, event, ctx.cur_proto, ctx.pc - 1, p1_reg, p2_reg);
                         }
-                        exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                         switch (try self.tryPushSimpleResultMetamethod(
                             exec_frames,
                             ctx.frame_index,
@@ -15645,13 +15662,14 @@ pub const Vm = struct {
                             // PUC OP_UNM: luaT_trybinTM(L, rb, rb, ra, TM_UNM).
                             // String operands handled by string mt __unm
                             // (PUC lstrlib.c arith_unm).
+                            // PUC Protect(luaT_trybinTM): one publish covers
+                            // the type error and the __unm push (P16.34).
+                            self.parkActiveFrame(&ctx);
                             // Resolve ONCE — no re-lookup in the push/call path.
                             const tm = self.findUnaryTm(val, .unm);
                             if (tm == null) {
-                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                                 return self.failBinaryMmbin(val, val, .unm, ctx.cur_proto, ctx.pc, inst.b, inst.b);
                             }
-                            exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                             switch (try self.tryPushSimpleResultMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -15685,13 +15703,15 @@ pub const Vm = struct {
                                 ctx.regs[inst.a] = .{ .Int = ~iv };
                             } else {
                                 // PUC OP_BNOT: luaT_trybinTM(L, rb, rb, ra, TM_BNOT).
+                                // PUC Protect(luaT_trybinTM): one publish
+                                // covers the type error and the __bnot push
+                                // (P16.34).
+                                self.parkActiveFrame(&ctx);
                                 // Resolve ONCE — no re-lookup in the push/call path.
                                 const tm = self.findUnaryTm(val, .bnot);
                                 if (tm == null) {
-                                    exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                                     return self.failBinaryMmbin(val, val, .bnot, ctx.cur_proto, ctx.pc, inst.b, inst.b);
                                 }
-                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                                 switch (try self.tryPushSimpleResultMetamethod(
                                     exec_frames,
                                     ctx.frame_index,
@@ -15721,10 +15741,14 @@ pub const Vm = struct {
                         if (val == .String) {
                             ctx.regs[inst.a] = .{ .Int = @intCast(val.String.len()) };
                         } else {
+                            // PUC Protect(luaT_trybinTM): publish before the
+                            // error-capable slow path — covers both the
+                            // __len push and the no-metamethod type error
+                            // (P16.34; replaces the per-push park below).
+                            self.parkActiveFrame(&ctx);
                             const tm = self.findUnaryTm(val, .len);
                             if (tm) |mm_ptr| {
                                 const mm = mm_ptr.*;
-                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                                 switch (try self.tryPushSimpleResultMetamethod(
                                     exec_frames,
                                     ctx.frame_index,
@@ -15991,6 +16015,10 @@ pub const Vm = struct {
                         ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + inst.jumpOffset() + 1);
                         if (check_sigint and signal_int_pending.load(.acquire)) {
                             signal_int_pending.store(false, .release);
+                            // PUC raises the signal error at the NEXT fetch
+                            // (vmfetch trap) — savedpc is the post-jump pc.
+                            // Publish it before fail (P16.34).
+                            self.parkActiveFrame(&ctx);
                             return self.fail("interrupted!", .{});
                         }
                         continue;
@@ -16150,6 +16178,10 @@ pub const Vm = struct {
                             .continue_no_advance => {
                                 if (check_sigint and signal_int_pending.load(.acquire)) {
                                     signal_int_pending.store(false, .release);
+                                    // PUC raises the signal error at the NEXT
+                                    // fetch (vmfetch trap) — savedpc is the
+                                    // post-jump pc. Publish before fail (P16.34).
+                                    self.parkActiveFrame(&ctx);
                                     return self.fail("interrupted!", .{});
                                 }
                                 continue;
@@ -16229,6 +16261,10 @@ pub const Vm = struct {
                                 ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
                                 if (check_sigint and signal_int_pending.load(.acquire)) {
                                     signal_int_pending.store(false, .release);
+                                    // PUC raises the signal error at the NEXT
+                                    // fetch (vmfetch trap) — savedpc is the
+                                    // post-jump pc. Publish before fail (P16.34).
+                                    self.parkActiveFrame(&ctx);
                                     return self.fail("interrupted!", .{});
                                 }
                                 continue;
@@ -16248,6 +16284,10 @@ pub const Vm = struct {
                                 ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
                                 if (check_sigint and signal_int_pending.load(.acquire)) {
                                     signal_int_pending.store(false, .release);
+                                    // PUC raises the signal error at the NEXT
+                                    // fetch (vmfetch trap) — savedpc is the
+                                    // post-jump pc. Publish before fail (P16.34).
+                                    self.parkActiveFrame(&ctx);
                                     return self.fail("interrupted!", .{});
                                 }
                                 continue;
@@ -16274,6 +16314,9 @@ pub const Vm = struct {
                             ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
                             if (check_sigint and signal_int_pending.load(.acquire)) {
                                 signal_int_pending.store(false, .release);
+                                // Post-jump pc is the fetch point — publish
+                                // before fail (PUC vmfetch trap, P16.34).
+                                self.parkActiveFrame(&ctx);
                                 return self.fail("interrupted!", .{});
                             }
                             continue;
@@ -16286,6 +16329,10 @@ pub const Vm = struct {
                         ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
                         if (check_sigint and signal_int_pending.load(.acquire)) {
                             signal_int_pending.store(false, .release);
+                            // PUC raises the signal error at the NEXT fetch
+                            // (vmfetch trap) — savedpc is the post-jump pc.
+                            // Publish it before fail (P16.34).
+                            self.parkActiveFrame(&ctx);
                             return self.fail("interrupted!", .{});
                         }
                         continue;
@@ -16324,6 +16371,21 @@ pub const Vm = struct {
                         // PUC Lua: luaF_close(L, level, status, yy) — closes
                         // all TBC upvalues and regular upvalues >= level.
                         // We process TBC in reverse declaration order (LIFO).
+                        //
+                        // PUC `Protect(luaF_close(...))` (lvm.c:1637):
+                        // savestate BEFORE the close. In PUC's next-
+                        // instruction savedpc convention that is CLOSE+1,
+                        // whose currentline (savedpc-1) is the CLOSE's line;
+                        // in our at-instruction convention the equivalent
+                        // publication is pc AT the CLOSE (frameCurrentLine
+                        // reads lineinfo[pc] directly). This park covers the
+                        // "metamethod 'close' is nil" fail inside
+                        // continueBytecodeClose AND every GC/debug read while
+                        // the closer children run (live_reg_top must include
+                        // the TBC registers — they are live at the CLOSE).
+                        // The .resume_dispatch branch below advances to
+                        // CLOSE+1 and re-parks for the continuation resume.
+                        self.parkActiveFrame(&ctx);
 
                         switch (try self.beginBytecodeClose(
                             exec_frames,
@@ -16336,13 +16398,9 @@ pub const Vm = struct {
                             .advance_instruction,
                         )) {
                             .resume_dispatch => {
-                                // continueBytecodeClose no longer writes
-                                // parent.u.lua.pc (PUC-faithful: dispatch loop
-                                // owns pc). Advance ctx.pc past the CLOSE and
-                                // P16.29 T2: park it here — the close
-                                // continuation resumes the frame at the
-                                // instruction AFTER the CLOSE (the parked pc
-                                // is what the frame_loop re-entry reads when
+                                // The close continuation resumes the frame at
+                                // the instruction AFTER the CLOSE (the parked
+                                // pc is what the frame_loop re-entry reads when
                                 // the last closer child completes).
                                 ctx.pc += 1;
                                 self.parkActiveFrame(&ctx);
@@ -16534,6 +16592,8 @@ pub const Vm = struct {
             if (ctx.pc + 1 >= ctx.cur_proto.code.len or
                 @as(bc.Op, @enumFromInt(ctx.cur_proto.code[ctx.pc + 1].op)) != .extraarg)
             {
+                // Defensive malformed-bytecode fail: publish first (P16.34).
+                self.parkActiveFrame(ctx);
                 return self.fail("SETLIST missing EXTRAARG", .{});
             }
             ctx.pc += 1;
@@ -16955,7 +17015,7 @@ pub const Vm = struct {
         const a: usize = inst.a;
         const c: u8 = inst.c;
 
-        const named_varargs = try self.getBytecodeVarargTable(ctx.cur_proto, ctx.regs);
+        const named_varargs = try self.getBytecodeVarargTable(ctx);
         // P16.10b: mode-aware varargs accessor (vahid: below func_slot;
         // table mode: base+numparams). The old unconditional
         // func_slot-nextra slice underflowed for table-mode frames whose
@@ -17285,6 +17345,10 @@ pub const Vm = struct {
     /// Returns `.continue_dispatch` (normal advance) for the loop body and
     /// skip paths.
     fn opForprep(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
+        // PUC OP_FORPREP: `savestate(L, ci); /* in case of errors */`
+        // (lvm.c) — publish before the error-capable limit/step checks
+        // (P16.34).
+        self.parkActiveFrame(ctx);
         const inst = ctx.cur_proto.code[ctx.pc];
         const a: u8 = inst.a;
         const b: u8 = inst.b;
@@ -17434,8 +17498,8 @@ pub const Vm = struct {
         // advanceBytecodeConcat can push a __concat metamethod child (its
         // .concat pending completion advances the parked pc by +1) or run a
         // synchronous metamethod via host recursion (the parked pc is the
-        // frame's only fresh pc record while dispatch_pc belongs to the
-        // inner dispatch loop — GC reads live_reg_top[parked pc]).
+        // frame's fresh pc record for reentrant readers — GC reads
+        // live_reg_top[parked pc]).
         self.parkActiveFrame(ctx);
 
         const concat_vals = try self.alloc.dupe(Value, ctx.regs[a .. a + b]);
@@ -18070,8 +18134,9 @@ pub const Vm = struct {
         // must be the CALL opcode itself. The synchronous branches
         // (.continue_dispatch) leave the parked pc stale-at-CALL until the
         // next park, exactly like PUC's savedpc between boundaries (every
-        // reentrant reader — GC via syncTopFrameForGc/condGcFromDispatch,
-        // fail() via dispatch_pc — publishes its own fresh copy first).
+        // reentrant reader — GC via condGcFromDispatch/allocTable's GC
+        // branch, fail sites via their pre-fail publishes — publishes its
+        // own fresh copy first; P16.34 Cut 1).
         self.parkActiveFrame(ctx);
 
         const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
@@ -19470,7 +19535,7 @@ pub const Vm = struct {
     }
 
     fn setArgTablePucInternal(self: *Vm, puc_argv: []const []const u8, script: i32) DispatchError!void {
-        const tbl = try self.allocTable();
+        const tbl = try self.allocTable(null);
         const argc: i32 = @intCast(puc_argv.len);
         // PUC: narg = argc - (script + 1)  (positive indices = script args)
         const narg: i32 = if (script >= 0) argc - (script + 1) else argc;
@@ -20031,7 +20096,7 @@ pub const Vm = struct {
     }
 
     fn createDebugTable(self: *Vm) DispatchError!*Table {
-        const mod = try self.allocTable();
+        const mod = try self.allocTable(null);
         try self.fillDebugTable(mod);
         return mod;
     }
@@ -28115,7 +28180,7 @@ pub const Vm = struct {
                     }
                     if (debugInfoHasOpt(what, 'L')) {
                         // Build activelines from Proto's line info.
-                        const act = try self.allocTable();
+                        const act = try self.allocTable(null);
                         for (p.lineinfo) |line| {
                             if (line > 0) {
                                 try self.rawSet(act, .{ .Int = @intCast(line) }, .{ .Bool = true });
@@ -28152,7 +28217,7 @@ pub const Vm = struct {
         var roots = self.gcTempRoots();
         defer roots.end();
 
-        const t = try self.allocTable();
+        const t = try self.allocTable(null);
         try roots.add(.{ .Table = t });
 
         try self.setField(t, "currentline", .{ .Int = 0 });
@@ -29279,13 +29344,13 @@ pub const Vm = struct {
         var roots = self.gcTempRoots();
         defer roots.end();
 
-        const reg = try self.allocTable();
+        const reg = try self.allocTable(null);
         try roots.add(.{ .Table = reg });
 
-        const hookkey = try self.allocTable();
+        const hookkey = try self.allocTable(null);
         try roots.add(.{ .Table = hookkey });
 
-        const mt = try self.allocTable();
+        const mt = try self.allocTable(null);
         try self.setField(mt, "__mode", .{ .String = try self.internStr("k") });
         try self.gcStoreMetatable(hookkey, mt);
         try self.setField(reg, "_HOOKKEY", .{ .Table = hookkey });
@@ -32575,7 +32640,7 @@ pub const Vm = struct {
         }
 
         if (std.mem.eql(u8, fmt, "*t")) {
-            const tbl = try self.allocTable();
+            const tbl = try self.allocTable(null);
             try self.setField(tbl, "sec", .{ .Int = p.sec });
             try self.setField(tbl, "min", .{ .Int = p.min });
             try self.setField(tbl, "hour", .{ .Int = p.hour });
@@ -35905,7 +35970,7 @@ pub const Vm = struct {
         if (narray > 1_000_000_000 or nhash > 1_000_000_000) return self.fail("table overflow", .{});
         if (narray > std.math.maxInt(usize) - nhash) return self.fail("table overflow", .{});
 
-        const t = try self.allocTable();
+        const t = try self.allocTable(null);
         if (narray != 0 or nhash != 0) {
             try self.tableResize(t, @intCast(narray), @intCast(nhash));
         }
@@ -36038,7 +36103,7 @@ pub const Vm = struct {
 
     fn builtinTablePack(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
-        const tbl = try self.allocTable();
+        const tbl = try self.allocTable(null);
         for (args, 0..) |v, i| {
             const k: i64 = @intCast(i + 1);
             try self.tableSetValue(tbl, .{ .Int = k }, v);
@@ -38681,9 +38746,12 @@ pub const Vm = struct {
         event: TmsEvent,
         invert: bool,
     ) DispatchError!CmpSlowResult {
+        // PUC Protect(op_order slow path): publish before the error-capable
+        // metamethod/type-error path — covers both the __lt/__le push and
+        // failCompare (P16.34; replaces the per-push write below).
+        exec_frames.getPtr(frame_index).u.lua.pc = pc;
         const tm = self.findBinaryTm(la, lb, event);
         if (tm) |mm| {
-            exec_frames.getPtr(frame_index).u.lua.pc = pc;
             switch (try self.tryPushSimpleResultMetamethod(
                 exec_frames,
                 frame_index,
@@ -39240,19 +39308,19 @@ pub const Vm = struct {
         var roots = self.gcTempRoots();
         defer roots.end();
 
-        const upvals = try self.allocTable();
+        const upvals = try self.allocTable(null);
         try roots.add(.{ .Table = upvals });
 
         for (args, 0..) |v, i| {
             try self.tableSetValue(upvals, .{ .Int = @intCast(i + 1) }, v);
         }
-        const ccl = try self.allocTable();
+        const ccl = try self.allocTable(null);
         try roots.add(.{ .Table = ccl });
 
         try self.setField(ccl, "__testc_upvalues", .{ .Table = upvals });
         try self.setField(ccl, "__testc_upenv", self.currentCallableEnvValue());
         try self.setField(ccl, "__testc_script_upvalue", .{ .Bool = true });
-        const mt = try self.allocTable();
+        const mt = try self.allocTable(null);
         try self.setField(mt, "__call", .{ .Builtin = .testc_testC });
         try self.gcStoreMetatable(ccl, mt);
         outs[0] = .{ .Table = ccl };
@@ -39352,16 +39420,16 @@ pub const Vm = struct {
             }
         }.f;
 
-        const root = try self.allocTable();
+        const root = try self.allocTable(null);
         try self.setField(root, "instructions", statVal(s.instructions_total));
 
-        const ops = try self.allocTable();
+        const ops = try self.allocTable(null);
         inline for (@typeInfo(bc.Op).@"enum".fields) |f| {
             try self.setField(ops, f.name, statVal(s.instructions_by_op[f.value]));
         }
         try self.setField(root, "op_histogram", .{ .Table = ops });
 
-        const calls = try self.allocTable();
+        const calls = try self.allocTable(null);
         try self.setField(calls, "fast", statVal(s.calls_fast));
         try self.setField(calls, "slow", statVal(s.calls_slow));
         try self.setField(calls, "lua_frames", statVal(s.calls_lua_frames));
@@ -39370,7 +39438,7 @@ pub const Vm = struct {
         try self.setField(calls, "c", statVal(s.calls_c));
         try self.setField(root, "calls", .{ .Table = calls });
 
-        const tables = try self.allocTable();
+        const tables = try self.allocTable(null);
         try self.setField(tables, "get_fast_int", statVal(s.tbl_get_fast_int));
         try self.setField(tables, "get_fast_str", statVal(s.tbl_get_fast_str));
         try self.setField(tables, "get_generic", statVal(s.tbl_get_generic));
@@ -39382,19 +39450,19 @@ pub const Vm = struct {
         try self.setField(tables, "rehash", statVal(s.tbl_rehash));
         try self.setField(root, "tables", .{ .Table = tables });
 
-        const allocs = try self.allocTable();
+        const allocs = try self.allocTable(null);
         inline for (@typeInfo(GcObject).@"union".fields, 0..) |f, i| {
             try self.setField(allocs, f.name, statVal(s.alloc_by_type[i]));
         }
         try self.setField(allocs, "bytes_total", statVal(s.alloc_bytes_total));
         try self.setField(root, "allocs", .{ .Table = allocs });
 
-        const gc = try self.allocTable();
+        const gc = try self.allocTable(null);
         try self.setField(gc, "steps_auto", statVal(s.gc_steps_auto));
         try self.setField(gc, "steps_manual", statVal(s.gc_steps_manual));
         try self.setField(root, "gc", .{ .Table = gc });
 
-        const yr = try self.allocTable();
+        const yr = try self.allocTable(null);
         try self.setField(yr, "yields", statVal(s.yields));
         try self.setField(yr, "resumes", statVal(s.resumes));
         try self.setField(yr, "yield_allocs", statVal(s.yield_allocs));
@@ -40619,7 +40687,7 @@ pub const Vm = struct {
                 var roots = self.gcTempRoots();
                 defer roots.end();
 
-                const upvals = try self.allocTable();
+                const upvals = try self.allocTable(null);
                 try roots.add(.{ .Table = upvals });
 
                 const base = st.items.len - n;
@@ -40627,7 +40695,7 @@ pub const Vm = struct {
                     try self.tableSetValue(upvals, .{ .Int = @intCast(i + 1) }, st.items[base + i]);
                 }
                 st.items.len = base;
-                const ccl = try self.allocTable();
+                const ccl = try self.allocTable(null);
                 try roots.add(.{ .Table = ccl });
 
                 try self.setField(ccl, "__testc_upvalues", .{ .Table = upvals });
@@ -40641,7 +40709,7 @@ pub const Vm = struct {
                 const envv = ctx.upenv orelse self.currentCallableEnvValue();
                 try self.setField(ccl, "__testc_upenv", envv);
                 try self.setField(ccl, "__testc_script_upvalue", .{ .Bool = false });
-                const mt = try self.allocTable();
+                const mt = try self.allocTable(null);
                 try self.setField(mt, "__call", .{ .Builtin = .testc_testC });
                 try self.gcStoreMetatable(ccl, mt);
                 try st.append(self.alloc, .{ .Table = ccl });
@@ -41916,7 +41984,7 @@ pub const Vm = struct {
                     try st.append(self.alloc, existing);
                     try st.append(self.alloc, .{ .Bool = false });
                 } else {
-                    const mt = try self.allocTable();
+                    const mt = try self.allocTable(null);
                     try self.setField(reg, k, .{ .Table = mt });
                     try st.append(self.alloc, .{ .Table = mt });
                     try st.append(self.alloc, .{ .Bool = true });

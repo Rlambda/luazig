@@ -8193,7 +8193,7 @@ and committed.
       bug-for-bug parity, api.lua проходит на обоих; проанализировано все
       8 loadstring-вызовов api.lua — алиасинг НИГДЕ не наблюдаем, принято
       решение: документировать в комментарии, поведение НЕ менять).
-- [ ] Cut 5 (D1-E): верификация hook-lane edge-cases + постоянные
+- [x] Cut 5 (D1-E): верификация hook-lane edge-cases + постоянные
       дифференциальные тесты (tests/c_api).
 
 ### Cut 3 дизайн (v5.2 — унифицированная region-модель)
@@ -8393,3 +8393,111 @@ DIFF-EMPTY; build D+RF; smoke 71/71; matrix --testc zig_fail=0 (big.lua
 both_fail = parity); c_api make clean test + test-diff ALL PASS; api580
 GREEN; perf_compare RESULT: OK (geomean 1.63x, все workloads OK,
 lua_calls -0.0%, branch_loop +0.0%).
+
+### Cut 5 результат (закрыт — P16.31 завершён)
+
+Hook-lane (D1-E) закрыт: `lua_toclose` из hook-скрипта (plain C API, без
+testC) теперь помечает прерванный Lua-фрейм F, метка переживает
+hook-yield/return/error и закрывается в семантически правильной точке НА
+корутине. Четыре фикса (все PUC-faithful, по исходникам lapi.c/lcode.c/
+lvm.c/ldo.c/lfunc.c 5.5.0):
+
+1. `lua_toclose` (c_api.zig) — переписан по правилу «верхний фрейм»
+   (эквивалент PUC L->ci): C-фрейм → существующий frame_slot-путь
+   (LIFO-проверка внутри фрейма); Lua-фрейм сверху (= hook-случай, т.к.
+   hook вызывается без собственного CallInfo) → `detached{value}`
+   (значение захвачено сейчас из c_stack) + setTbc(F) — PUC
+   luaF_newtbcval + CIST_TBC на ci=F. «Skip hidden frames» НЕ годится:
+   user C-фреймы тоже hidden (pushBuiltinCFrame setHidden для всех
+   callCFunction) — сломал бы c_api-lane.
+2. return_k-трединг (vm.zig): `BytecodeCloseContinuation.return_k` +
+   параметр `beginBytecodeClose` (12 call-ситов; opReturn передаёт
+   `inst.k != 0`, остальные false) + chain_gate `.return_frame =>
+   parent.isTbc() or state.return_k` — точный перевод PUC: OP_RETURN(k)
+   выполняет luaF_close(base, CLOSEKTOP, 1) БЕЗУСЛОВНО по k (закрывает
+   tbc-цепочку региона, включая hook-метки, даже без CIST_TBC бита);
+   poscall-закрытие moveresults — по биту; суммарный гейт на return
+   Lua-фрейма = k OR бит. opTailcall: k → luaF_closeupval ONLY (assert
+   tbclist < base) — оставлен false; tail-return completions —
+   bit-gated, корректны как есть.
+3. `rewriteReturnsForClose` (codegen_bc.zig) — luaK_finish parity:
+   RETURN0/1 → RETURN при `needclose or vahid` (vahid = is_vararg и
+   vararg_table_reg == null — PUC PF_VAHID без PF_VATAB: setvararg
+   ставит VAHID ВСЕМ vararg-функциям, luaK_finish снимает только при
+   материализации vararg-таблицы через needvatab/VVARGIND); k=1 на всех
+   .return_/.tailcall при needclose; C=numparams+1 при vahid. Главный
+   чанк — vararg → его RETURN0/1 всегда переписываются в RETURN →
+   poscall-путь закрывает CIST_TBC-метки hook'а на return чанка
+   (эмпирически: PUC [A]/[E] закрывают на return чанка именно через
+   VAHID→OP_RETURN→luaD_poscall→moveresults, НЕ через hookmask slow-path
+   — hook само-выключается, hookmask==0). Обновлён unit-тест
+   «codegen: simple arithmetic» (return1/return0 → return_/return_,
+   PUC luac -l подтверждает RETURN для обоих).
+4. builtinCoroutineClose suspended-transport (vm.zig): cur_handle/
+   cur_c_stack переключаются на handle закрытого потока (lazy
+   materialization как в closeThreadRegionsOnClosedThread) на время
+   builtinCoroutineResume-драйва closers — C-API view закрытого потока
+   (p31a [C]/[B2]: closer on=CO при suspended-close).
+
+Постоянный тест `tests/c_api/23_tbc_semantics.c` (в TESTS + DIFF_TESTS):
+Group H (hook-lane, plain C API): H-A abandoned→close-at-return (VAHID),
+H-C suspended-close transport, H-D runtime-error (error-path НЕ закрывает
+метку; st+message parity), H-E mark-only no-yield + dead-resume (st=2
+nres=0 — PUC resume_error ранний return не пишет *nresults), H-B2
+erroring closer (last-error-wins, closer видел err=none). Group C
+(c_api-lane close thread-context + chunk-name quoting): C-S1/S2
+suspended-close (closethread / Lua coroutine.close), C-S3/S4
+dead-with-error (err=cont-err с `[string "..."]:1:` префиксом) +
+last-error-wins, C-S0 pcallk(k=NULL) yield-boundary error → closer на
+return C-функции → co завершается OK. DIFF-EMPTY, 3× deterministic.
+
+Документированные divergences (justified, split-stack; см. header
+23_tbc_semantics.c):
+
+- **H-D close-after-runtime-error + nres на error-выходах**: PUC
+  hook-yield оставляет L->top на уровне метки (window end); построение
+  сообщения ошибки (luaO_pushvfstring в luaG_runerror) пишет ПОВЕРХ
+  слота метки → значение метки затирается мусором → coroutine.close
+  находит строку без __close → «attempt to call a nil value», closer
+  НЕ выполняется; nres=6 (сырой leftover stack с мусором построения
+  сообщения). luazig: detached-метка хранит исходное значение → closer
+  выполняется с err=объекта ошибки потока (PUC-семантика минус
+  shared-stack артефакт), nres=2. Эмуляция затирания слота потребовала
+  бы виртуальных C-stack уровней в error-путях — заведомо хуже
+  (AGENTS.md PUC-first exception); поведение luazig строже сохраняет
+  обязательство to-be-closed.
+- **error()-settop close**: PUC luaB_error делает lua_settop(L,1) →
+  luaF_close(newtop, CLOSEKTOP, 0) закрывает метки ниже уровня 1
+  (err=nil, non-yieldable) ВНУТРИ error() — shared-stack артефакт; наши
+  builtins — Zig (Value slices), C-API stack-события нет.
+- **resume-of-finished-co leftover re-precall**: PUC lua_resume при
+  status==OK и leftover (top != func+1+nargs) ПЕРЕВЫЗЫВАЕТ верхнее
+  leftover-значение как функцию («attempt to call a string value»,
+  nres=3); luazig — чистый dead-path. Pre-existing resume-semantics
+  divergence (не TBC); в тестах избегается lua_pop результата (как
+  xmove в coroutine.resume).
+
+Открытые пункты (вне P16.31, кандидаты на следующие фазы):
+
+- **lua_settop tbc-close (c_api-lane)**: PUC lapi.c lua_settop при
+  diff<0 и tbclist.p >= newtop вызывает luaF_close(newtop, CLOSEKTOP,
+  0) — любой C-API pop ниже уровня метки закрывает её (в т.ч.
+  frame_slot-метки собственного C-фрейма). Наш api.State.settop/pop
+  tbc-close НЕ выполняет вовсе. Реализуемо для frame_slot-меток
+  текущего C-фрейма (slot_idx сравним); detached-метки hook'а —
+  уровень-модель, частично неприменима (см. анализ в Cut 5 логах).
+- **resume-of-finished-co leftover re-precall** (выше) — семантика
+  lua_resume для finished-co с мусором на стеке.
+
+Гейты Cut 5: probe_hook_tbc [A]/[C]/[E]/[B2] parity, [D] — parity-часть
+(st=2, идентичное сообщение, log пуст) + документированная divergence;
+p31a/p31b/p31c/p31d_ctx/p31e DIFF-EMPTY; 23_tbc_semantics DIFF-EMPTY
+(3×); 22_tbc_lifecycle DIFF-EMPTY; build D+RF 199/199 (unit-тест
+codegen обновлён под VAHID-rewrite); smoke 71/71; matrix --testc 31/32
+(zig_fail=0, big.lua both_fail = parity); c_api make clean test +
+test-diff ALL PASS; api580 GREEN; perf_compare RESULT: WARN —
+единственный table_alloc_setmetatable +5.0-5.9% vs baseline при
+собственном разбросе ворклоада ±7% (0.087-0.093 по 5 прогонам того же
+бинарника; hot-функция бенча не vararg, RETURN1 fast-path не затронут;
+остальные 15 workloads OK, geomean 1.62x) — шум, не атрибутируется
+Cut 5.

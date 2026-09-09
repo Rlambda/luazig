@@ -5043,19 +5043,41 @@ pub const Codegen = struct {
         self.rewriteReturnsForClose();
     }
 
-    /// PUC `luaK_finish` (lcode.c:1929-1946): rewrite RETURN0/RETURN1 to
-    /// RETURN when the function has open upvalues (needclose). PUC uses the
-    /// k-bit on RETURN to signal upvalue closing; luazig's VM always closes
-    /// upvalues in completeBytecodeExecFrame, so the k-bit is not needed.
-    /// But T.listcode (code.lua) expects RETURN (not RETURN0) for functions
-    /// with upvalues — this rewrite produces PUC-faithful bytecode.
-    /// PUC needclose: set by markupval (upvalue capture) AND
-    /// marktobeclosed (<close> variable), see lparser.c:456,467.
-    /// Both cause luaK_finish to rewrite RETURN0/RETURN1 → RETURN.
+    /// PUC `luaK_finish` (lcode.c:1929-1962), applied to every finished
+    /// function (and the main chunk):
+    ///   1. RETURN0/RETURN1 are rewritten to RETURN when the function has
+    ///      open upvalues (needclose — set by markupval/marktobeclosed) OR
+    ///      hidden vararg arguments (PF_VAHID — every vararg function whose
+    ///      vararg stays virtual; a materialized vararg table clears it).
+    ///      The rewrite matters for the VM: OP_RETURN always goes through
+    ///      poscall (moveresults — the CIST_TBC-gated tbc-chain close),
+    ///      while OP_RETURN0/1 take the hookmask-gated fast path that skips
+    ///      poscall entirely. A vararg main chunk's `return 'x'` must close
+    ///      hook-lane tbc marks at its return even when the hook disabled
+    ///      itself — exactly like PUC.
+    ///   2. RETURN/TAILCALL get k=1 when needclose: PUC OP_RETURN(k) runs
+    ///      luaF_close(L, base) UNCONDITIONALLY (closing the tbc chain
+    ///      region — hook marks — even when the frame's CIST_TBC bit is
+    ///      clear). The VM's OP_RETURN chain-region gate reads this flag
+    ///      (beginBytecodeClose's return_k). PUC OP_TAILCALL(k) closes only
+    ///      upvalues (asserting no pending tbc) — the VM closes upvalues
+    ///      unconditionally there, so the tailcall k is bytecode-shape
+    ///      parity only.
+    ///   3. RETURN/TAILCALL get C=numparams+1 when PF_VAHID (PUC's
+    ///      hidden-args delta signal for the return; the VM derives the
+    ///      same from frame metadata — shape parity only).
+    /// T.listcode (code.lua) expects these PUC-faithful shapes.
     fn rewriteReturnsForClose(self: *Codegen) void {
         const needclose = self.captured_regs.count() > 0 or
             self.func_has_close;
-        if (!needclose) return;
+        // PF_VAHID equivalent: a vararg function whose vararg stays
+        // virtual. Plain `...` never materializes a table (reads are
+        // OP_VARARG); a named `...arg` materializes one on escape
+        // (needVarargTable sets vararg_table_reg — PUC needvatab, which
+        // luaK_finish honors by clearing PF_VAHID).
+        const vahid = self.is_vararg and self.builder.vararg_table_reg == null;
+        if (!needclose and !vahid) return;
+        const numparams1: u8 = @intCast(self.builder.numparams + 1);
         for (self.builder.code.items) |*inst| {
             const op: bc.Op = @enumFromInt(inst.op);
             if (op == .return0) {
@@ -5069,7 +5091,13 @@ pub const Codegen = struct {
                 // RETURN1 A=first B=1 → RETURN A=first B=2 (1 ret + 1)
                 inst.op = @intFromEnum(bc.Op.return_);
                 inst.b = 2;
+            } else if (op != .return_ and op != .tailcall) {
+                continue;
             }
+            // PUC luaK_finish: SETARG_k when needclose, SETARG_C when
+            // PF_VAHID — on every RETURN and TAILCALL of the function.
+            if (needclose) inst.k = 1;
+            if (vahid) inst.c = numparams1;
         }
     }
 
@@ -7187,13 +7215,14 @@ test "codegen: simple arithmetic" {
     // Verify bytecode (constant folding collapses "1 + 2" → 3):
     // 0: VARARGPREP
     // 1: LOADI R0 3       (constant-folded result)
-    // 2: RETURN1 R0       (return x)
-    // 3: RETURN0          (implicit return)
+    // 2: RETURN R0        (return x — RETURN1 rewritten to RETURN: the main
+    //                      chunk is vararg (PF_VAHID), matching PUC luaK_finish)
+    // 3: RETURN           (implicit return — RETURN0 rewritten likewise)
     try testing.expectEqual(@as(usize, 4), proto.code.len);
     try testing.expectEqual(bc.Op.varargprep, @as(bc.Op, @enumFromInt(proto.code[0].op)));
     try testing.expectEqual(bc.Op.loadi, @as(bc.Op, @enumFromInt(proto.code[1].op)));
-    try testing.expectEqual(bc.Op.return1, @as(bc.Op, @enumFromInt(proto.code[2].op)));
-    try testing.expectEqual(bc.Op.return0, @as(bc.Op, @enumFromInt(proto.code[3].op)));
+    try testing.expectEqual(bc.Op.return_, @as(bc.Op, @enumFromInt(proto.code[2].op)));
+    try testing.expectEqual(bc.Op.return_, @as(bc.Op, @enumFromInt(proto.code[3].op)));
 }
 
 test "codegen: if/else" {

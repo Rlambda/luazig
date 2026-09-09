@@ -304,6 +304,7 @@ pub const BuiltinId = enum(u8) {
     testc_makecfunc,
     testc_allowhookyield,
     testc_totalmem,
+    testc_alloccount,
     testc_gcage,
     testc_gccolor,
     testc_codeparam,
@@ -481,6 +482,7 @@ pub const BuiltinId = enum(u8) {
             .testc_makecfunc => "T._makecfunc",
             .testc_allowhookyield => "T._allowhookyield",
             .testc_totalmem => "T.totalmem",
+            .testc_alloccount => "T.alloccount",
             .testc_gcage => "T.gcage",
             .testc_gccolor => "T.gccolor",
             .testc_codeparam => "T.codeparam",
@@ -4019,6 +4021,19 @@ pub const Vm = struct {
     testc_gc_pending_finalize_seen: bool = false,
     testc_total_bytes: usize = 0,
     testc_mem_limit: ?usize = null,
+    /// PUC ltests.c `l_memcontrol.countlimit` (ltests.c:191-198, checked in
+    /// `debug_realloc` at ltests.c:236-240): the allocation-countdown limit.
+    /// PUC's "unlimited" sentinel `~0UL` maps to -1 here. Kept as plain VM
+    /// state — exactly like PUC keeps it in a C global — so the
+    /// per-allocation check is one integer compare with NO Lua-side lookup.
+    /// (The previous implementation resolved the `T` global and interned
+    /// "_alloccount" on EVERY allocation — ~440 instructions per table even
+    /// with the testC module absent; PUC's ltests hooks are compile-time
+    /// guarded and cost nothing in release builds.)
+    /// `T._alloccount` is a luazig-specific Lua-visibility mirror PUC does
+    /// not have; `testcSetAllocCount` and the active-path decrement keep it
+    /// in sync so direct readers observe the same values as before.
+    testc_alloc_count: i64 = -1,
     /// PUC lauxlib.c:1074-1128 default warnf 3-state machine.
     /// State of the current warnf handler, mirroring PUC's function-pointer
     /// swap between `warnfon`/`warnfoff`/`warnfcont`. Initial state is `.on`
@@ -7240,18 +7255,52 @@ pub const Vm = struct {
     }
 
     fn testcConsumeAllocCount(self: *Vm) DispatchError!void {
+        // PUC `debug_realloc` (ltests.c:236-240): a single integer compare
+        // against the C-global `countlimit`; the unlimited sentinel
+        // short-circuits before anything else. -1 is our "unlimited", so the
+        // production default (testC absent) costs one compare — no global
+        // lookup, no string interning, no hash get.
+        if (self.testc_alloc_count < 0) return;
+        // countlimit == 0: every allocation fails (the error stays armed
+        // until the limit is reset, exactly like PUC returning NULL without
+        // decrementing).
+        if (self.testc_alloc_count == 0) return self.failTestcRaw("not enough memory");
+        self.testc_alloc_count -= 1;
+        // Lua-visibility mirror: keep the luazig-specific `T._alloccount`
+        // field in sync for direct readers. PUC has no such field (the
+        // counter is pure C state); the mirror only preserves luazig's
+        // pre-existing observable surface. This runs solely on the
+        // active-countdown path, which exists only inside small testC
+        // windows (limits of a few allocations), so its cost is irrelevant.
         const t_global = self.getGlobal("T");
-        if (t_global != .Table) return;
-        const cur = self.getField(t_global.Table, "_alloccount");
-        if (cur == .Nil) return;
-        const n = switch (cur) {
+        if (t_global == .Table)
+            try self.setField(t_global.Table, "_alloccount", .{ .Int = self.testc_alloc_count });
+    }
+
+    /// Arm/reset the allocation countdown from a Lua-visible value.
+    /// PUC `alloc_count` (ltests.c:949-955) and the testC `alloccount`
+    /// command (ltests.c:1863) write `l_memcontrol.countlimit` directly —
+    /// a C global, not Lua state. The VM field is the authoritative counter
+    /// (the `l_memcontrol` equivalent); the `T._alloccount` table field is
+    /// the luazig-specific Lua-visibility mirror, written with the raw
+    /// value so direct readers see exactly what was stored before.
+    fn testcSetAllocCount(self: *Vm, v: Value) DispatchError!void {
+        const t_global = self.getGlobal("T");
+        if (t_global == .Table) try self.setField(t_global.Table, "_alloccount", v);
+        // Numeric values arm the countdown (PUC: cast to unsigned long);
+        // anything else — nil, non-numbers, non-finite floats — means
+        // "unlimited", matching the old consume path's coercion where a
+        // non-numeric field simply never triggered.
+        self.testc_alloc_count = switch (v) {
             .Int => |i| i,
-            .Num => |x| @as(i64, @intFromFloat(x)),
-            else => return,
+            .Num => |x| blk: {
+                if (!std.math.isFinite(x) or
+                    x < -9_223_372_036_854_775_808.0 or
+                    x >= 9_223_372_036_854_775_808.0) break :blk -1;
+                break :blk @as(i64, @intFromFloat(x));
+            },
+            else => -1,
         };
-        if (n < 0) return;
-        if (n == 0) return self.failTestcRaw("not enough memory");
-        try self.setField(t_global.Table, "_alloccount", .{ .Int = n - 1 });
     }
 
     fn testcNoteMemory(self: *Vm, bytes: usize) void {
@@ -19054,6 +19103,7 @@ pub const Vm = struct {
             .testc_makecfunc => try self.builtinTestcMakeCfunc(args, outs),
             .testc_allowhookyield => try self.builtinTestcAllowHookYield(args, outs),
             .testc_totalmem => try self.builtinTestcTotalmem(args, outs),
+            .testc_alloccount => try self.builtinTestcAlloccount(args, outs),
             .testc_stats => try self.builtinTestcStats(args, outs),
             .testc_gcage => try self.builtinTestcGcage(args, outs),
             .testc_gccolor => try self.builtinTestcGccolor(args, outs),
@@ -19173,6 +19223,11 @@ pub const Vm = struct {
         try self.setField(t, "_makecfunc", .{ .Builtin = .testc_makecfunc });
         try self.setField(t, "_allowhookyield", .{ .Builtin = .testc_allowhookyield });
         try self.setField(t, "totalmem", .{ .Builtin = .testc_totalmem });
+        // T.alloccount is a builtin writing the VM-level countdown (PUC
+        // alloc_count writes the C global l_memcontrol.countlimit). The old
+        // bootstrap defined it as a Lua closure writing T._alloccount, which
+        // forced every allocation to re-resolve the field by name.
+        try self.setField(t, "alloccount", .{ .Builtin = .testc_alloccount });
         try self.setField(t, "stats", .{ .Builtin = .testc_stats });
         try self.setField(t, "gcage", .{ .Builtin = .testc_gcage });
         try self.setField(t, "gccolor", .{ .Builtin = .testc_gccolor });
@@ -19238,10 +19293,6 @@ pub const Vm = struct {
             \\  return T._checkpanic(script)
             \\end
             \\T._alloccount = -1
-            \\function T.alloccount(v)
-            \\  if v ~= nil then T._alloccount = v else T._alloccount = -1 end
-            \\  return T._alloccount
-            \\end
             \\function T.externKstr(s) return tostring(s) end
             \\function T.externstr(s) return tostring(s) end
             \\function T.checkmemory() return true end
@@ -38938,6 +38989,18 @@ pub const Vm = struct {
         }
     }
 
+    /// PUC `alloc_count` (ltests.c:949-955): `T.alloccount()` resets the
+    /// allocation countdown to unlimited; `T.alloccount(n)` arms it to `n`
+    /// allocations. PUC's version returns no values; the luazig bootstrap
+    /// wrapper historically returned the new count, so we keep returning it
+    /// (a superset — no upstream caller uses the result).
+    fn builtinTestcAlloccount(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        const v: Value = if (args.len >= 1 and args[0] != .Nil) args[0] else .{ .Int = -1 };
+        try self.testcSetAllocCount(v);
+        if (outs.len > 0) outs[0] = v;
+        self.last_builtin_out_count = @min(outs.len, 1);
+    }
+
     /// P16.0b: T.stats() — read-only snapshot of the default-off runtime
     /// counters (see VmStats). No side effects on VM state beyond allocating
     /// the result table. Counters are 0 unless someone enabled them (the
@@ -39638,6 +39701,7 @@ pub const Vm = struct {
         // (e.g. memerr.lua's totalmem gate) affect the sub-VM identically.
         sub_vm.testc_mem_limit = self.testc_mem_limit;
         sub_vm.testc_total_bytes = self.testc_total_bytes;
+        sub_vm.testc_alloc_count = self.testc_alloc_count;
 
         // Share the bytecode compiler so the sub-VM can compile Lua source via
         // loadstring/load (PUC's lua_newstate shares the same lexer/parser code).
@@ -40535,29 +40599,20 @@ pub const Vm = struct {
                 if (cargs.len == 0) return self.fail("testC rawcheckstack expects at least 1 arg", .{});
                 const parsed = parseLeadingIntTail(cargs[0]) orelse return self.fail("testC invalid rawcheckstack", .{});
                 const need = parsed.n;
-                var blocked = false;
-                const t_global = self.getGlobal("T");
-                if (t_global == .Table) {
-                    if (self.getFieldOpt(t_global.Table, "_alloccount")) |v| {
-                        blocked = switch (v) {
-                            .Int => |iv| iv == 0,
-                            .Num => |nv| nv == 0,
-                            else => false,
-                        };
-                    }
-                }
+                // PUC: with the allocation countdown at 0, stack growth
+                // (a reallocation) fails, so lua_rawcheckstack reports
+                // false. The countdown now lives in the VM field (the
+                // l_memcontrol.countlimit equivalent).
+                const blocked = self.testc_alloc_count == 0;
                 try st.append(self.alloc, .{ .Bool = !blocked and need < 500000 });
             },
             .alloccount => {
                 if (cargs.len > 1) return self.fail("testC alloccount expects 0 or 1 args", .{});
-                const t_global = self.getGlobal("T");
-                if (t_global == .Table) {
-                    const v: Value = if (cargs.len == 1) blk: {
-                        const n = std.fmt.parseInt(i64, cargs[0], 10) catch return self.fail("testC invalid alloccount", .{});
-                        break :blk .{ .Int = n };
-                    } else .{ .Int = -1 };
-                    try self.setField(t_global.Table, "_alloccount", v);
-                }
+                const v: Value = if (cargs.len == 1) blk: {
+                    const n = std.fmt.parseInt(i64, cargs[0], 10) catch return self.fail("testC invalid alloccount", .{});
+                    break :blk .{ .Int = n };
+                } else .{ .Int = -1 };
+                try self.testcSetAllocCount(v);
             },
             .collectgarbage => {
                 if (cargs.len > 1) return self.fail("testC collectgarbage expects <=1 arg", .{});
@@ -42223,6 +42278,7 @@ pub const Vm = struct {
             .testc_makecfunc => 1,
             .testc_allowhookyield => 0,
             .testc_totalmem => 3,
+            .testc_alloccount => 1,
             .testc_stats => 1,
             .testc_querytab => 3,
             .testc_gcstate => 1,

@@ -68,6 +68,37 @@ IR VM полностью удалена из кодовой базы.
 
 Выполненные задачи по номерам (P15.xx). Полные детали — в `git log` и коде.
 
+### P16.32 T2 — measured allocation cuts (2026-09-09)
+
+Реализация ranked candidates из T1 (`tools/status/p16.32-t1-allocation-truth.md`),
+по одному коммиту на независимо-зелёный cut. A/B-харнесс: single-shape runner
+(`/tmp/opencode/ab_shape.zig`, production smp_allocator, warmup 1000, n=500k,
+`taskset -c 0 perf stat -r 3 -e instructions:u`, median of 3).
+
+**Cut A — testC alloc-count chain (KEEP, коммит ниже).** Корень: PUC держит
+allocation-countdown в C-global `l_memcontrol.countlimit` (ltests.c:191-198,
+проверка в debug_realloc ltests.c:236-240 — один integer compare); luazig
+хранит его в Lua-видимом поле `T._alloccount` и на КАЖДОЙ аллокации делал
+полный `getGlobal("T")` + `internStrAssume("_alloccount")` (~440 instr), даже
+когда testC-модуля нет. Фикс (PUC-faithful: счётчик — состояние VM, не Lua):
+
+- `Vm.testc_alloc_count: i64 = -1` — эквивалент `countlimit` (−1 ≡ ~0UL
+  "unlimited"); `testcConsumeAllocCount` = один compare в production-дефолте.
+- `T.alloccount` теперь builtin `testc_alloccount` (PUC alloc_count
+  ltests.c:949-955 пишет C-global напрямую); testC-команда `alloccount` и
+  `rawcheckstack` читают/пишут VM-поле; `T._alloccount` — Lua-visibility
+  зеркало (luazig-специфика, PUC его не имеет), синхронизируется на
+  transition-точках и на каждом decrement активного countdown (окна мелкие,
+  стоимость неактуальна). Счётчик не зависит от T-global (как PUC);
+  checkpanic sub-VM наследует его (PUC делит l_memcontrol между states).
+- A/B (instr/it, median 3×500k): temp_table_alloc 1850.6→**1089.0** (−762);
+  table_alloc_setmetatable 2902.6→**2123.0** (−780); metamethod_add
+  4563.2→**3748.5** (−815); guards lua_calls 593.4→593.3, branch_loop
+  239.0→238.9, hash_access 224.3→224.2 (flat).
+- Гейты: build D+RF, unit D+RF, smoke 71/71, matrix --testc 31/32 zig_fail=0
+  (big.lua both_fail = pre-existing parity), c_api clean test + test-diff ALL
+  PASS, api580 GREEN.
+
 ### P16.32 T1 — allocation decomposition truth (2026-09-09, research)
 
 Полный разбор alloc-family divergence (metamethod_add 2.22x, table_alloc_setmetatable

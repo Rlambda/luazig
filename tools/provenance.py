@@ -14,6 +14,24 @@ produced the numbers:
                     identify uncommitted changes that the measurement may
                     depend on. Untracked files are ignored: only tracked
                     sources are inputs to the measured binaries.
+                    P16.34 Cut 0A: kept for backward compat, but it is a
+                    whole-tree blur — artifact edits (tools/perf JSONs,
+                    STATUS.md) make it say "dirty" even when the measured
+                    source is pristine. The CANONICAL truth for "was the
+                    measured binary built from committed source?" is now
+                    source_dirty.
+  source_dirty    — "clean"/"dirty": same check scoped to the BUILD/RUNTIME
+                    INPUTS of every measured binary: src/, build.zig, and the
+                    vendored lua-5.5.0/src/ (PUC reference inputs). This is
+                    the field a reader should trust: source_dirty=clean means
+                    HEAD alone fully identifies the measured source, no
+                    matter how many artifacts were edited afterwards.
+  artifact_dirty  — "clean"/"dirty": same check scoped to the ARTIFACT and
+                    documentation surfaces (tools/perf, tools/status,
+                    README.md, STATUS.md). Expected "dirty" while an
+                    artifact regeneration is in flight (e.g. a historical
+                    rename staged before the new current-*.json is written);
+                    it never contaminates source_dirty.
   zig_version     — `zig version` of the toolchain that built the binaries
   zig_binary_sha16 / puc_binary_sha16 — first 16 hex chars of the sha256 of
                     each binary the lane actually executes ("only applicable
@@ -32,6 +50,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ZIG_LUA = ROOT / "zig-out" / "bin" / "luazig"
 PUC_LUA = ROOT / "build" / "lua-c" / "lua"
+
+# Pathspecs for the scoped dirty checks. Untracked files are ignored
+# (--untracked-files=no), same convention as git_dirty: an untracked file is
+# not a tracked input to any measured binary.
+# SOURCE_PATHS: every build/runtime input of the measured binaries — the
+# luazig source tree, the build script, and the vendored PUC tree the
+# reference binary is built from.
+SOURCE_PATHS = ("src/", "build.zig", "lua-5.5.0/src/")
+# ARTIFACT_PATHS: the versioned measurement artifacts and the status docs
+# that narrate them. Editing these NEVER changes a measured binary.
+ARTIFACT_PATHS = ("tools/perf", "tools/status", "README.md", "STATUS.md")
 
 
 def _capture(cmd: list[str]) -> str | None:
@@ -61,6 +90,39 @@ def git_dirty() -> str:
     if out is None:
         return "unknown"
     return "dirty" if out else "clean"
+
+
+def _scoped_dirty(pathspecs: tuple[str, ...]) -> str:
+    """"clean"/"dirty" for a pathspec-scoped slice of the tracked tree.
+
+    Shared implementation of source_dirty/artifact_dirty: `git status
+    --porcelain --untracked-files=no -- <paths...>`. Fails soft to
+    "unknown" like every other lookup.
+    """
+    cmd = ["git", "status", "--porcelain", "--untracked-files=no", *pathspecs]
+    out = _capture(cmd)
+    if out is None:
+        return "unknown"
+    return "dirty" if out else "clean"
+
+
+def source_dirty() -> str:
+    """Dirty check scoped to the BUILD/RUNTIME INPUTS of measured binaries.
+
+    src/, build.zig, and the vendored lua-5.5.0/src/ (the PUC reference
+    inputs). This is the canonical "was the measured binary built from
+    committed source?" field: artifact/doc edits do not affect it.
+    """
+    return _scoped_dirty(SOURCE_PATHS)
+
+
+def artifact_dirty() -> str:
+    """Dirty check scoped to the artifact/documentation surfaces.
+
+    tools/perf, tools/status, README.md, STATUS.md. Expected "dirty" while
+    regenerating artifacts; never contaminates source_dirty.
+    """
+    return _scoped_dirty(ARTIFACT_PATHS)
 
 
 def zig_version() -> str | None:
@@ -106,6 +168,12 @@ def block(*, zig_bin: Path | None = ZIG_LUA,
         # Explicit alias: this head is what the BINARY was built from.
         "measured_source_head": head,
         "git_dirty": git_dirty(),
+        # P16.34 Cut 0A: scoped dirty fields. git_dirty is whole-tree (kept
+        # for backward compat) and blurs artifact edits into "dirty";
+        # source_dirty is the CANONICAL "measured source is committed" truth,
+        # artifact_dirty explains any remaining tree dirt as artifact-side.
+        "source_dirty": source_dirty(),
+        "artifact_dirty": artifact_dirty(),
         "zig_version": zig_version(),
     }
     if optimize_mode is not None:

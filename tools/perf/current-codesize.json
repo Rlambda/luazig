@@ -1,0 +1,51 @@
+{
+  "created_utc": "2026-09-09T21:08:30+00:00",
+  "provenance": {
+    "git_head": "616c1b9",
+    "measured_source_head": "616c1b9",
+    "measured_source_note": "src/ at HEAD 616c1b9 is byte-identical to 5c16a69 (verified: git diff 5c16a69..HEAD --stat -- src/ is empty), so the P16.33-T3-final numbers (dispatch 65,332 B) reproduce exactly on this build",
+    "git_dirty": "dirty",
+    "source_dirty": "clean",
+    "artifact_dirty": "dirty (historical rename of the pre-T2/T3 artifact staged before this file was written; the measured binary's inputs are src/, reported by source_dirty=clean)",
+    "zig_version": "0.16.0",
+    "optimize_mode": "ReleaseFast",
+    "zig_binary_sha16": "bd42a2a8cd8f75e7",
+    "zig_binary_sha16_note": "final HEAD build (includes the appended vm.zig unit test — test blocks are excluded from non-test builds; all symbol sizes, .text total, and fail-clone count re-measured IDENTICAL on the pre-test binary 2e3c30763282ae72 and on this one)",
+    "note": "P16.34 Cut 0A canonical code-size truth (replaces current-p33-codesize.json, renamed to historical-p16.33-t0-codesize.json — that file measured fa75a87, pre-T2/T3). Absent symbols = fully inlined into runBytecodeDispatch."
+  },
+  "text_total_bytes": 2380073,
+  "symbols_bytes": {
+    "vm.Vm.runBytecodeDispatch": 65332,
+    "vm.Vm.pushStagedBytecodeExecFrame": 1370,
+    "vm.Vm.completeBytecodeExecFrame": 4425,
+    "vm.Vm.tryPushSimpleResultMetamethod": 2752,
+    "vm.Vm.dispatchCalleeActivationHook": 526,
+    "vm.Vm.callBuiltin": 6336,
+    "vm.Vm.getTmByObj": 237,
+    "vm.Vm.pushResolvedBytecodeClosure__anon_34210": 1025,
+    "vm.Vm.stageBytecodeCall": 482
+  },
+  "absent_inlined_into_dispatch": [
+    "vm.Vm.findBinaryTm",
+    "vm.Vm.opCall",
+    "vm.Vm.opReturn0",
+    "vm.Vm.opReturn1",
+    "vm.Vm.pushStagedFast",
+    "vm.Vm.stageFixedCall"
+  ],
+  "fail_instantiations": {
+    "vm.Vm.fail__anon": { "count": 574, "aggregate_bytes": 666394 },
+    "vm.Vm.failRunerror__anon": { "count": 2, "aggregate_bytes": 1130 },
+    "vm.Vm.failLib__anon": { "count": 3, "aggregate_bytes": 1717 },
+    "vm.Vm.failTestcRaw": { "count": 1, "aggregate_bytes": 206 },
+    "vm.Vm.failBinaryMmbin": { "count": 1, "aggregate_bytes": 599 },
+    "vm.Vm.failC": { "count": 0, "aggregate_bytes": 0 },
+    "note": "P16.33 T3 noinline-fail cost, binary-wide: 574 fail clones (was 329 pre-T3 with dead standalone copies dead-stripped); aggregate fail-family bytes 670,046. Counted via: nm -S | grep 'vm\\.Vm\\.fail' on the ReleaseFast binary."
+  },
+  "measurement": {
+    "binary": "zig-out/bin/luazig",
+    "symbols": "nm -S zig-out/bin/luazig (size column, hex->dec)",
+    "text_total": "objcopy --only-section=.text (cross-checked readelf -S .text size 0x245129 = 2,380,073)",
+    "text_delta_vs_p33_t0": "+33,552 B (2,346,521 -> 2,380,073; the P16.33 T3 noinline-fail cost, fail clones 329 -> 574 live)"
+  }
+}

@@ -1,4 +1,4 @@
-> Last updated: 2026-09-08 (P16.30 COMPLETE — C-frame TBC ownership convergence: thread-owned c_tbc_chain + parked stacks + CIST_TBC bit18 + all close sites unified; 22_tbc_lifecycle 16/16 DIFF-EMPTY vs PUC; SIGSEGV closed; perf-neutral)
+> Last updated: 2026-09-09 (P16.31 COMPLETE — TBC semantic closure (5 cuts): pcall non-yieldable S0-crash, error-object pollution, unified testC chain regions, closed-thread close context, hook-lane marks + VAHID return close; 23_tbc_semantics DIFF-EMPTY vs PUC; perf-neutral within noise)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -35,10 +35,10 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Matrix non-pass | both_fail: big.lua |
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **71/71** pass |
-| C API suites (`tests/c_api`) | 22 suites |
-| Performance (geomean vs PUC) | **1.62x** |
+| C API suites (`tests/c_api`) | 23 suites |
+| Performance (geomean vs PUC) | **1.63x** |
 
-Geomean замедления vs PUC Lua: **1.62x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.63x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -5563,6 +5563,113 @@ SIGSEGV закрыт; perf нейтрален (geomean 1.6247 vs B0 1.64; P16.29
 
 Гейт: matrix 31/32 (zig_fail=0), smoke 71/71, c_api 22+diff EMPTY,
 api580 376/376, unit D+RF, fmt clean, t6r rc=0 (был SIGSEGV).
+
+### P16.31 COMPLETE: TBC semantic closure — hook/testC to-be-closed marks (2026-09-09)
+
+Correctness-first фаза: закрытие эмпирически установленных расхождений
+TBC-семантики vs PUC Lua 5.5.0 (источник истины: p31-truth-report +
+p31a/p31b/p31c.lua, p31d_ctx.c, p31e.lua, probe_hook_tbc.c;
+tools/status/p16.31-t0-truth.json). 5 cuts, каждый PUC-faithful и
+закрыт отдельным коммитом:
+
+- **Cut 1 (`e1e79b1`, S0 SIGSEGV)**: conventional pcall non-yieldable —
+  `api.State.pcall` `.yieldable`→`.nonyieldable` (PUC lapi.c:1095-1097:
+  `lua_pcallk` k==NULL → `luaD_pcall` → `luaD_callnoyield`, +1 nny):
+  yield внутри conventional pcall = ошибка 'attempt to yield across a
+  C-call boundary', ловимая самим pcall'ом. Было: yield ПРОХОДИЛ на
+  уровне VM, `State.pcall` глотал его как Nil-ошибку → stale
+  in-place suspension → SIGSEGV (union-field panic) на следующем
+  `runBytecodeInternal`. Root cause — через gdb hardware watchpoint на
+  `Thread.bytecode_inplace_suspended`.
+- **Cut 2 (`9e06f26`, D3 error-object pollution)**:
+  `annotateCloseRuntimeError` УДАЛЕНА — аннотация "\nin metamethod
+  'close'" утекала в pcall-возвращаемый ОБЪЕКТ ошибки при пересечении
+  Lua-фрейма (currentRuntimeErrorValue перестраивает строку из
+  annotated self.err на каждом bytecode-unwind capture site). PUC:
+  "in metamethod 'close'" — ТОЛЬКО метка фрейма в traceback (ldebug.c
+  funcnamefromcode + lauxlib pushfuncname); объект ошибки финализируется
+  при throw и переносится as-is. Наша traceback-машина уже даёт
+  байт-идентичную метку — замена не нужна.
+- **Cut 3 (`d5a7d04`, D1-testC obligation loss)**: testC `toclose`-метки
+  → реальная per-thread TBC-цепочка (унифицированная region-модель v5.2):
+  `TbcEntry` tagged union (frame_slot / detached) + `CallFrame.tbc_chain_base`
+  (u32, CallFrame 88B сохранён) + pop-detach на каждом pop-пути; регионы
+  закрываются на RECOVERING-границах ровно где PUC (builtinPcall/xpcall
+  catch, api.State.pcall, finishpcallk на уровне callee, checkpanic);
+  resume-граница НИКОГДА не закрывает (метки доживают до
+  coroutine.close с сохранённой ошибкой); `.yield` COLLAPSE в
+  `luaYieldKShared(k=null)` (PUC runC yield = return lua_yield);
+  builtinCoroutineYield branch-3 переписан down-search'ом мимо ВСЕХ
+  C-фреймов. + perf-фиксы шага (u32 вместо usize; detachTbcRegion
+  noinline — LLVM инлайнил 281B в popBuiltinCFrame, убивая hot-site
+  inlining: table_alloc_setmetatable был +10.2% FAIL → +1.2%).
+- **Cut 4 (`ad212f1`, D2 wrong close context)**: coroutine.close closers
+  гоняют НА ЗАКРЫТОМ потоке — `closeThreadRegionsOnClosedThread`:
+  полный field-for-field dispatch-context swap (зеркало PUC
+  lua_closethread → luaE_resetthread, где ВЕСЬ reset идёт на L) +
+  VM-global error channel saved/restored по полям (ошибки closer'а
+  путешествуют через return values close, не виснут на вызывающем);
+  + `luaL_where` → ar.short_src (chunkid-форма `[string "..."]:1:` в
+  префиксах ошибок C-функций); testc loadstring name/mode aliasing
+  проанализирован (все 8 call-сайтов api.lua — не наблюдаем) и
+  документирован в коде, поведение не менялось.
+- **Cut 5 (`3dcaa1b`, D1-E hook-lane marks + VAHID return close)**:
+  `lua_toclose` переписан под topmost-frame rule (L->ci-эквивалент:
+  hook не имеет своего CallInfo → метка ставится на ПРЕРВАННЫЙ Lua-фрейм
+  F, detached{value} + setTbc(F)); `return_k` threading — точный перевод
+  PUC OP_RETURN(k): luaF_close на k выполняется БЕЗУСЛОВНО (закрывает
+  регион фрейма, включая hook-метки, без CIST_TBC-бита), poscall-close
+  остаётся bit-gated; `rewriteReturnsForClose` = luaK_finish parity:
+  RETURN0/1 → RETURN при needclose ИЛИ vahid (PUC PF_VAHID: setvararg
+  ставит его КАЖДОЙ vararg-функции, luaK_finish чистит только при
+  материализации vararg-таблицы; главный chunk — vararg, поэтому его
+  hook-метки закрываются на return через OP_RETURN → poscall
+  moveresults, НЕ hookmask slow path — верифицировано эмпирически +
+  luac -l); builtinCoroutineClose suspended-transport (C-API view
+  closers'ов = закрытый поток). + постоянный дифференциал
+  tests/c_api/23_tbc_semantics.c (Group H hook-lane + Group C
+  c_api-lane, TESTS + DIFF_TESTS).
+
+**Эмпирическая реклассификация.** Три residual-расхождения,
+задокументированные в P16.30 (hook-yield closer error swallow,
+close_has_err context, unwind void-path catch{}), оказались ЧАСТИЧНО
+НЕВЕРНЫ как классификация: реальные наблюдаемые расхождения —
+(1) S0-crash conventional pcall (Cut 1), (2) потеря testC-обязательств
+(Cut 3), (3) pollution объекта ошибки (Cut 2), (4) неправильный
+close-context (Cut 4), (5) hook-timing/edge-cases (Cut 5). D3
+(unwind void-path catch{}) при этом НЕ оказался наблюдаемым — parity:
+глотание ошибок close в void-пути unwind не наблюдается снаружи ни на
+одном репродюсере (закрытие регионом на recovering-границах
+семантически покрывает путь). Итог: 5 реальных расхождений закрыты,
+ложное — реклассифицировано в parity.
+
+Гейты: probe_hook_tbc [A]/[C]/[E]/[B2] полный parity + [D] parity-part;
+p31a/p31b/p31c/p31d_ctx/p31e DIFF-EMPTY vs PUC (3× deterministic);
+23_tbc_semantics DIFF-EMPTY (3×); 22_tbc_lifecycle DIFF-EMPTY; build
+D+RF 199/199; smoke 71/71; matrix --testc 31/32 zig_fail=0 (big.lua
+both_fail = parity); c_api make clean test + test-diff ALL PASS;
+api580 GREEN. Perf: geomean **1.62696** @ 3dcaa1b (P16.30-final
+1.62466 → +0.14%, в пределах шума; regression check vs
+baseline-approved: единственный WARN — table_alloc_setmetatable +6.3%,
+в пределах собственного ±7% run-to-run разброса workload'а, меренного
+на той же бинарности; comparisons на той же бинарности −8.9% — шум в
+обратную сторону; hot-функция workload'а non-vararg, RETURN1 fast path
+не затронут) — perf-neutral within noise.
+
+Открытые items (записаны, не костыли): `lua_settop` tbc-close в c_api
+lane отсутствует (PUC lapi.c закрывает метки при усечении стека ниже
+уровня метки); resume-of-finished-co leftover семантика. Обоснованные
+divergences (split-stack, см. заголовок suite 23_tbc_semantics):
+артефакты shared-stack clobbering PUC — построение сообщения ошибки
+(luaO_pushvfstring на L->top = уровень метки после hook-yield)
+ЗАТИРАЕТ помеченный слот, поэтому coroutine.close после runtime-ошибки
+PUC падает 'attempt to call a nil value', а error-exit считает nres по
+сырому остатку стека (6 vs наших 2); luazig хранит метку detached и
+гоняет closer с ошибкой потока (PUC-семантика минус shared-stack
+артефакт; эмуляция затирания потребовала бы виртуальных C-stack
+уровней в error-путях — заведомо хуже per AGENTS.md). error()-builtin
+settop-close и resume-of-finished-co leftover re-precall — из той же
+family shared-stack артефактов.
 
 ## История закрытых фаз
 

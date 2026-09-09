@@ -979,9 +979,15 @@ pub export fn lua_toclose(L: ?*lua_State, idx: c_int) void {
         const chain = &th.c_tbc_chain;
         if (chain.items.len > 0) {
             const top = chain.items[chain.items.len - 1];
-            if (top.cframe_idx == fi and top.slot_idx >= abs) return;
+            if (top == .frame_slot and top.frame_slot.cframe_idx == fi and
+                top.frame_slot.slot_idx >= abs) return;
         }
-        chain.append(vm.alloc, .{ .cframe_idx = fi, .slot_idx = abs }) catch {};
+        // P16.31 Cut 3: TbcEntry is a tagged union — live marks are
+        // frame_slot pairs (detached entries only arise from pop-detach).
+        chain.append(vm.alloc, .{ .frame_slot = .{
+            .cframe_idx = fi,
+            .slot_idx = abs,
+        } }) catch {};
         // PUC sets CIST_TBC on L->ci (the frame "has marks" hint).
         const fmut = th.call_frames.getPtr(fi);
         if (!fmut.isTbc()) fmut.setTbc();
@@ -1016,7 +1022,10 @@ pub export fn lua_closeslot(L: ?*lua_State, idx: c_int) void {
     const chain = &th.c_tbc_chain;
     if (chain.items.len == 0) return;
     const top = chain.items[chain.items.len - 1];
-    if (top.cframe_idx != fi or top.slot_idx != abs) return; // not the chain top
+    // P16.31 Cut 3: only a live frame_slot mark can be closed by slot
+    // identity (a detached entry has no slot — it was captured at pop).
+    if (top != .frame_slot) return;
+    if (top.frame_slot.cframe_idx != fi or top.frame_slot.slot_idx != abs) return; // not the chain top
 
     // Pop the mark BEFORE the closer runs (PUC poptbclist-then-close: a
     // closer error must not re-close this entry). Ordered pop — it IS the

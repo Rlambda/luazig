@@ -1,12 +1,19 @@
 {
-  "created_utc": "2026-09-08T20:21:33+00:00",
+  "created_utc": "2026-09-09T21:08:30+00:00",
   "provenance": {
-    "git_head": "829a982",
-    "measured_source_head": "4b6167b",
-    "git_dirty": "clean",
+    "git_head": "616c1b9",
+    "measured_source_head": "616c1b9",
+    "measured_source_note": "src/ at HEAD 616c1b9 is byte-identical to 5c16a69 (verified: git diff 5c16a69..HEAD --stat -- src/ is empty)",
+    "git_dirty": "dirty",
+    "source_dirty": "clean",
+    "artifact_dirty": "dirty (regeneration in flight; measured inputs are src/, reported by source_dirty=clean)",
     "zig_version": "0.16.0",
     "optimize_mode": "Debug+ReleaseFast",
-    "zig_binary_sha16": "79235b8f5273831d"
+    "probe_binary_sha16": {
+      "Debug": "2c3c840784775804",
+      "ReleaseFast": "e63cb3d7e7bab707"
+    },
+    "probe_note": "standalone Zig probe compiled OUTSIDE the repo against the same module graph (lua root src/lua/root.zig + util), -O Debug and -O ReleaseFast; prints @sizeOf/@alignOf/@offsetOf of vm.CallFrame and both u-variant arms. Probes rebuilt after the appended vm.zig unit test (test blocks are excluded from non-test builds): layout output byte-identical to the pre-test probes. Comptime asserts in vm.zig (CallFrame==88, u@32, align 8) compile in every mode and passed in both probe builds."
   },
   "luazig": {
     "Debug": {
@@ -26,9 +33,10 @@
     "common": {
       "func_slot": { "offset": 0, "size": 8 },
       "tbc_mark": { "offset": 8, "size": 8 },
-      "callstatus": { "offset": 16, "size": 4 },
-      "reg_top": { "offset": 20, "size": 4 },
-      "pending_call_index": { "offset": 24, "size": 4 },
+      "tbc_chain_base": { "offset": 16, "size": 4 },
+      "callstatus": { "offset": 20, "size": 4 },
+      "reg_top": { "offset": 24, "size": 4 },
+      "pending_call_index": { "offset": 28, "size": 4 },
       "u": { "offset": 32, "size": 56 }
     },
     "u.c": {
@@ -54,6 +62,31 @@
       "resume_skip_count_pc": { "offset": 40, "size": 4 }
     }
   },
+  "state_sizes": {
+    "LuaFrameState": 48,
+    "CFrameState": 56,
+    "CFrameAux": 8,
+    "union_floor_arm": "CFrameState (56 B) — the u-variant floor; LuaFrameState 48 B"
+  },
+  "callstatus_bits": {
+    "0-7": "CIST_NRESULTS (mask 0xff): nresults+1, written masked by encodeNresults on every activation",
+    "8-11": "CIST_CCMT (shift 8): __call metamethod count (MAX_CCMT 0xf<<8)",
+    "12-14": "CIST_RECST (shift 12): recover status (error during pcallk)",
+    "15": "CIST_C: C function frame — the u-variant discriminator",
+    "16": "CIST_FRESH: fresh luaV_execute frame",
+    "17": "CIST_CLSRET: closing TBC variables on return (gates u.c aux arm)",
+    "18": "CIST_TBC: C function marked a to-be-closed slot on its frame",
+    "19": "CIST_OAH: saved allowhook",
+    "20": "CIST_HOOKED: running debug hook",
+    "21": "CIST_YPCALL: yieldable protected call",
+    "22": "CIST_TAIL: tail call",
+    "23": "CIST_HOOKYIELD: last hook yielded",
+    "24": "CIST_FIN: finalizer",
+    "25": "CIST_HIDE: luazig-specific — hide from debug.getinfo",
+    "26": "CIST_SR (P16.33 T2): simple-result completion pending; validity flag for the u.lua aux bytes (lua_packed_flags + simple_result_dst); provably CLEAR on fresh activation (masked callstatus write)",
+    "27": "CIST_OUV (P16.33 T2): frame may have open upvalues; provably CLEAR on fresh activation; replaced the always-initialized flags byte (bit0 of lua_packed_flags now RESERVED)",
+    "28-31": "unused (4 bits free)"
+  },
   "puc": {
     "size": 64,
     "align": 8,
@@ -64,6 +97,6 @@
     "offset_u": 32,
     "offset_callstatus": 60
   },
-  "notes": "PUC CallInfo is 64 B on this ABI (gcc-measured against lua-5.5.0/src/lstate.h). luazig CallFrame is 88 B in BOTH modes \u2014 P16.20 T1 made the layout build-mode-stable (extern struct/union; was Debug 104 vs RF 96 before), and P16.20 T3 then removed the stored `base` field (invariant base == func_slot + 1, derived via frameBase()), shrinking 96 -> 88 B. P16.30 Stage C replaced `toclose_base` with `parked_stack` 8B-for-8B (suspended C-frames keep their c_stack for the thread-owned TBC chain), CallFrame stayed 88 B (comptime assert vm.zig). luazig frames carry architecture-specific state (iterative yieldable execution, inline hook-replay PCs, simple-result continuation, activation_id); 64 B is NOT a target \u2014 the model is. P16.31 T0 regeneration on P16.30-final source: all values re-measured via standalone Zig probe (Debug + ReleaseFast, identical) and gcc probe for PUC; field offsets added.",
+  "notes": "PUC CallInfo is 64 B on this ABI (gcc-measured against lua-5.5.0/src/lstate.h; unchanged — PUC source untouched). luazig CallFrame is 88 B in BOTH modes — P16.20 T1 made the layout build-mode-stable (extern struct/union), P16.20 T3 removed the stored `base` (96 -> 88 B), P16.30 Stage C replaced toclose_base with parked_stack 8B-for-8B, P16.31 Cut 3 packed tbc_chain_base (u32) into the 4-byte group keeping 88 B. P16.34 Cut 0A regeneration on P16.33-final source (src/ == 5c16a69): all values re-measured via standalone Zig probe (Debug + ReleaseFast, identical). CHANGED vs the stale 829a982-era artifact: the common 4-byte group — tbc_chain_base (P16.31 Cut 3) inserted at offset 16 shifted callstatus 16->20, reg_top 20->24, pending_call_index 24->28; the stale artifact predated that cut. luazig frames carry architecture-specific state (iterative yieldable execution, inline hook-replay PCs, simple-result continuation, region-model tbc_chain_base); 64 B is NOT a target — the model is.",
   "luazig_state_note": "LuaFrameState 48 B, CFrameState 56 B = union floor; CallFrame 88 B."
 }

@@ -9150,3 +9150,90 @@ PUC-first: error-formatting вне dispatch-цикла, как в PUC ✓. Це�
 make clean test + test-diff ALL PASS; api580 GREEN (D+RF+sizes); perf_compare
 --runs 7 RESULT: OK (18/18 OK: lua_calls −2.6%, comparisons −2.1%,
 global_arith +3.0% — в пределах задокументированного host-noise).
+
+## P16.34 Cut 0A+0B — truth hygiene + permanent checkpanic regression (2026-09-09)
+
+Нулевой cut фазы P16.34: нет runtime-изменений, только артефакты-истины и
+один постоянный тест. Измерённый source — 5c16a69 (P16.33-final;
+`git diff 5c16a69..HEAD --stat -- src/` пуст, HEAD 616c1b9).
+
+### Cut 0A — truth hygiene
+
+1. **Code-size artifact**: `tools/perf/current-p33-codesize.json` (fa75a87,
+   pre-T2/T3: dispatch 73,925 B) → `git mv` →
+   `tools/perf/historical-p16.33-t0-codesize.json`. Новый канонический
+   `tools/perf/current-codesize.json`, измерен на текущем ReleaseFast-билде
+   (src == 5c16a69): `runBytecodeDispatch` **65,332 B** (T3-final
+   воспроизводится точно), `pushStagedBytecodeExecFrame` 1,370,
+   `completeBytecodeExecFrame` 4,425, `tryPushSimpleResultMetamethod` 2,752,
+   `dispatchCalleeActivationHook` 526, `callBuiltin` 6,336; absent (полностью
+   inlined в dispatch): opReturn0/opReturn1/pushStagedFast/opCall/
+   findBinaryTm/stageFixedCall; fail-инстанцирования: **574** `fail__anon`
+   (666,394 B агрегат) + failRunerror 2 / failLib 3 / failTestcRaw 1 /
+   failBinaryMmbin 1 (семейный агрегат 670,046 B); .text total
+   **2,380,073 B** (objcopy, кросс-чек readelf 0x245129). После appends-теста
+   (Cut 0B) бинарь пересобран: все числа побайтово идентичны (test-блоки не
+   компилируются в non-test билдах), sha обновлён на финальный.
+
+2. **CallFrame layout artifact**: `current-callframe-layout.json` был
+   829a982-эпохи (STALE: предшествовал P16.31 Cut 3). Регенерирован
+   standalone Zig-пробой (вне репо, тот же module graph: lua root + util;
+   -O Debug и -O ReleaseFast, вывод идентичен): CallFrame **88 B**, align 8,
+   u@32, union floor 56 (CFrameState), LuaFrameState 48. ИЗМЕНЕНИЕ против
+   stale-артефакта: 4-байтовая группа common-полей — `tbc_chain_base`
+   (P16.31 Cut 3) встал на offset 16 и сдвинул callstatus 16→20, reg_top
+   20→24, pending_call_index 24→28. Добавлен полный callstatus bit inventory
+   (bits 0-27 + 4 свободных, включая новые CIST_SR bit26 / CIST_OUV bit27 из
+   P16.33 T2). Comptime-ассерты vm.zig (88/u@32/align8) проходят в обоих
+   режимах.
+
+3. **Provenance workflow**: `tools/provenance.py` — новые machine-readable
+   поля: `source_dirty` (git status по src/ + build.zig + lua-5.5.0/src/ —
+   build/runtime-инпуты измеряемых бинарей; CANONICAL truth «измерённый
+   source закоммичен») и `artifact_dirty` (tools/perf + tools/status +
+   README.md + STATUS.md). `git_dirty` сохранён whole-tree для backward
+   compat, но канон — `source_dirty`. Оба поля встроены в `block()`, так
+   что все lane-потребители (perf_compare/smoke/matrix/...) получают их
+   автоматически. Никто не фальсифицирован: у обоих новых артефактов
+   source_dirty=clean, artifact_dirty=dirty (rename/regeneration in flight)
+   задокументированы явно.
+
+### Cut 0B — permanent checkpanic shared-control regression
+
+Lane-инвестиция: smoke — строгий differential-раннер (zig vs PUC, exit+output
+match), T/testC в plain PUC не существует → smoke не может хостить
+zig-only-семантику; c_api-лейн тоже компилируется против PUC. Правильный
+lane — **zig unit test**.
+
+Новый тест `vm: P16.33 R0.3 — checkpanic sub-VM shares the testC allocator
+control` (src/lua/vm.zig, +104 строки) навсегда охраняет R0.3-архитектуру.
+Вызывает `builtinTestcCheckpanic`/`builtinTestcAlloccount`/
+`builtinTestcTotalmem` напрямую (private, same-file). Четыре инварианта:
+
+1. **Child consumption → parent budget**: arm 1,000,000, checkpanic
+   ("pushstring hi; error") == "hi" (api.lua:415 shape), после —
+   `ctrl.alloc_count < 1,000,000` (child потреблял из ОБЩЕГО countdown).
+2. **Child alloccount arm → parent control**: checkpanic("alloccount 7")
+   → nil (no-error sentinel), parent читает `alloc_count ∈ [0, 7]` — write
+   ребёнка виден родителю немедленно (private-control мир оставил бы
+   родителя ~1,000,000).
+3. **Memlimit propagation** (memerr.lua:26-28 семантика, 3b48f19 fix):
+   countdown сброшен в unlimited (иначе (2) оставил бы ≤7 и child падал бы
+   по WRONG reason), limit = total+10k, checkpanic("newuserdata 20000") ==
+   "not enough memory" (MEMERRMSG), limit restored.
+4. **100× cycles, no double-free**: та же parent-VM, 100 полных
+   checkpanic-циклов, каждый должен вернуть "hi". Аллокатор —
+   std.testing.allocator НАПРЯМУЮ (не arena): arena-destroy = no-op и
+   сломанный `testc_ctrl_borrowed` был бы невидим; DebugAllocator ловит
+   double-free контрола (sub-VM deinit + parent deinit).
+
+**Negative validation**: временно сломан borrow-флаг
+(`testc_ctrl_borrowed = false`) → `zig build test` FAIL (exit 1, 103
+"Double free detected") — тест действительно охраняет регрессию. Флаг
+восстановлен, все гейты на финальном source.
+
+### Гейты
+
+zig fmt --check src OK; unit **D 200/200** + **RF 200/200** (было 199 —
+новый тест #200); smoke **71/71 PASS**; matrix sanity не нужен (нет src
+изменений кроме теста); negative-validation FAIL→revert→green.

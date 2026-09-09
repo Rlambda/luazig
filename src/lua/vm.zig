@@ -45185,3 +45185,107 @@ test "vm: Task 7.4 — truncated fixed chunk at aligned blocks → clean error" 
         }
     }
 }
+
+// P16.34 Cut 0B — permanent regression for the P16.33 R0.3 architecture:
+// checkpanic's sub-VM SHARES the parent's TestcAllocControl (PUC l_memcontrol
+// parity: `lua_newstate(f, ud)` in checkpanic passes the SAME allocator
+// userdata, so countdown consumption, limits, and accounting propagate in
+// BOTH directions). This is zig-only semantics (T/testC does not exist in
+// plain PUC Lua), so the smoke lane (a strict zig-vs-PUC differential
+// runner) cannot host it; the unit lane is the durable home. All four
+// invariants the sharing architecture guarantees, in one test:
+//   (1) child consumption reduces the PARENT budget (shared countdown);
+//   (2) a child `alloccount` arm is visible in the parent's control;
+//   (3) a parent memlimit makes a child allocation fail MEMERRMSG
+//       (memerr.lua:28 semantics — the 3b48f19 testc_active fix);
+//   (4) repeated checkpanic cycles never double-free the borrowed control.
+//
+// Allocator choice: std.testing.allocator DIRECTLY (no arena). The 100×
+// cycle loop in (4) is exactly the scenario the `testc_ctrl_borrowed` flag
+// guards: each sub-VM deinits while the parent's control object stays
+// alive. Under an arena, destroy() is a no-op and a broken borrow flag
+// would be invisible; under the testing DebugAllocator a double free of
+// the control (sub-VM deinit + parent deinit) is detected and reported.
+test "vm: P16.33 R0.3 — checkpanic sub-VM shares the testC allocator control" {
+    const testing = std.testing;
+
+    var vm = Vm.init(std.testing.allocator, false);
+    defer vm.deinit();
+    // The testC bootstrap compiles Lua source (T.checkpanic wrapper etc.),
+    // so the sub-VM needs the dynamic compiler the CLI installs.
+    vm.setDynamicBytecodeCompiler(defaultBytecodeCompiler);
+    try vm.enableTestcModule();
+
+    var outs: [1]Value = undefined;
+
+    // ── (1) child consumption reduces the parent budget ──
+    // Arm a generous countdown on the PARENT, then run a checkpanic child.
+    // The child's sub-VM init + script allocations must consume from the
+    // SAME countdown: with a private (pre-R0.3) child control the parent's
+    // count would stay at the armed value. "pushstring hi; error" is the
+    // upstream api.lua:415 shape — the child must also return "hi", proving
+    // the budget was generous enough that no path failed for the wrong
+    // reason.
+    try vm.builtinTestcAlloccount(&.{.{ .Int = 1_000_000 }}, &outs);
+    try vm.builtinTestcCheckpanic(
+        &.{.{ .String = try vm.internStr("pushstring hi; error") }},
+        &outs,
+    );
+    try testing.expect(outs[0] == .String);
+    try testing.expectEqualStrings("hi", outs[0].String.bytes());
+    const ctrl = vm.testc_ctrl orelse return testing.expect(false);
+    try testing.expect(ctrl.alloc_count < 1_000_000); // child consumed from the shared budget
+
+    // ── (2) child alloccount arm visible in the parent ──
+    // The child script arms the countdown to 7 via the testC `alloccount`
+    // command. The write lands in the SHARED control, so the parent reads
+    // it back immediately (post-script teardown may consume a few more, but
+    // the count can never exceed 7 — with a private child control the
+    // parent would still sit near 1,000,000 minus child-init consumption).
+    // No error in the child script → checkpanic returns the nil sentinel.
+    try vm.builtinTestcCheckpanic(
+        &.{.{ .String = try vm.internStr("alloccount 7") }},
+        &outs,
+    );
+    try testing.expect(outs[0] == .Nil);
+    try testing.expect(ctrl.alloc_count >= 0 and ctrl.alloc_count <= 7);
+
+    // ── (3) memlimit propagation ──
+    // memerr.lua:26-28 semantics: set the memory limit to current+10k, then
+    // a child `newuserdata 20000` must fail with MEMERRMSG ("not enough
+    // memory"). This exercises the 3b48f19 fix: the borrowed control alone
+    // is not enough — the sub-VM's testc_active flag must travel WITH the
+    // control or the charge path short-circuits and the limit is invisible.
+    // Reset the countdown to unlimited first: (2) left it at ≤7, and an
+    // exhausted countdown would fail the child for the WRONG reason.
+    try vm.builtinTestcAlloccount(&.{.{ .Int = -1 }}, &outs);
+    var total_out: [3]Value = undefined;
+    try vm.builtinTestcTotalmem(&.{}, total_out[0..]);
+    const total_before: usize = @intCast(total_out[0].Int);
+    try vm.builtinTestcTotalmem(&.{.{ .Int = @intCast(total_before + 10_000) }}, &outs);
+    try vm.builtinTestcCheckpanic(
+        &.{.{ .String = try vm.internStr("newuserdata 20000") }},
+        &outs,
+    );
+    try testing.expect(outs[0] == .String);
+    try testing.expectEqualStrings("not enough memory", outs[0].String.bytes());
+    // Restore the unlimited limit (memerr.lua:29 `T.totalmem(0)`).
+    try vm.builtinTestcTotalmem(&.{.{ .Int = 0 }}, &outs);
+
+    // ── (4) repeated cycles never double-free the borrowed control ──
+    // 100 full checkpanic cycles on the SAME parent: each cycle's sub-VM
+    // borrows the control and deinits without freeing it. A broken
+    // `testc_ctrl_borrowed` flag double-frees (sub-VM deinit + parent
+    // deinit) — the testing DebugAllocator detects it; a stale dangling
+    // control would also make later cycles misbehave (the countdown/limit
+    // reads garbage). Every cycle must still produce the correct "hi".
+    var cycle: usize = 0;
+    while (cycle < 100) : (cycle += 1) {
+        try vm.builtinTestcCheckpanic(
+            &.{.{ .String = try vm.internStr("pushstring hi; error") }},
+            &outs,
+        );
+        try testing.expect(outs[0] == .String);
+        try testing.expectEqualStrings("hi", outs[0].String.bytes());
+    }
+}

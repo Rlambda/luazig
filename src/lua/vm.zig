@@ -1034,6 +1034,20 @@ const BytecodeCloseContinuation = struct {
     owner_thread: *Thread,
     child_active: bool = false,
     waiting_builtin_yield: bool = false,
+    /// PUC OP_RETURN's TESTARG_k (lvm.c:1763): the returning frame's
+    /// function has captured upvalues or <close> variables in scope
+    /// (parser `needclose` → luaK_finish SETARG_k). PUC's OP_RETURN(k)
+    /// runs `luaF_close(L, base, CLOSEKTOP, 1)` UNCONDITIONALLY before
+    /// poscall — closing the tbc-chain region (hook marks included) even
+    /// when the frame's CIST_TBC bit is clear (e.g. a hook marked a
+    /// DESCENDANT frame that returned via the OP_RETURN0/1 fast path,
+    /// leaving its entry in this frame's region with the bit gone).
+    /// poscall's moveresults close is bit-gated (CIST_TBC); both close the
+    /// same region, so the net gate is `k OR bit`. Only the OP_RETURN site
+    /// sets this: tail-return completions (OP_TAILCALL → C callee →
+    /// poscall → moveresults) and OP_RETURN0/1 (never emitted with k) stay
+    /// bit-gated, exactly like PUC moveresults.
+    return_k: bool = false,
     post: BytecodeClosePost,
 };
 
@@ -8132,6 +8146,7 @@ pub const Vm = struct {
         min_reg: u8,
         initial_err: ?Value,
         close_all: bool,
+        return_k: bool,
         post: BytecodeClosePost,
     ) DispatchError!BytecodeCloseProgress {
         std.debug.assert(!(exec_frames.getPtr(parent_index).pending_call_index != INVALID_PENDING));
@@ -8152,6 +8167,7 @@ pub const Vm = struct {
             .close_all = close_all,
             .err_depth = initial_err != null,
             .owner_thread = owner,
+            .return_k = return_k,
             .post = post,
         };
         try self.setPendingCall(exec_frames.getPtr(parent_index), .{
@@ -8192,12 +8208,19 @@ pub const Vm = struct {
             // the whole region. Gate per post:
             //   .advance_instruction (OP_CLOSE): unconditional — PUC lvm.c
             //     luaF_close(L, ra, LUA_OK, 1) closes everything >= ra.
-            //   .return_frame: CIST_TBC bit-gated — PUC poscall →
-            //     moveresults closes only when the returning frame's
-            //     callstatus has CIST_TBC. (The OP_RETURN(k) path's own
-            //     unconditional luaF_close is covered by the invariant: a
-            //     non-empty region at a Lua frame's return implies hook
-            //     marks, and hook-lane .toclose always set the bit.)
+            //   .return_frame: CIST_TBC bit OR the return instruction's k
+            //     flag (needclose). PUC closes this region at a frame's
+            //     return through TWO mechanisms that both cover it:
+            //     OP_RETURN(k) runs luaF_close(L, base) UNCONDITIONALLY
+            //     (lvm.c:1763 — k is set by luaK_finish for functions with
+            //     captured upvalues or <close> vars), and poscall's
+            //     moveresults closes bit-gated (the returning frame's
+            //     CIST_TBC). The bit alone misses one shape: a hook marked
+            //     a DESCENDANT frame G (bit on G), G returned via the
+            //     OP_RETURN0/1 fast path (entry survives in this frame's
+            //     region, bit gone with G) — PUC still closes it here when
+            //     k is set; the k flag (state.return_k, set only by the
+            //     OP_RETURN site) covers exactly that.
             //   .retry_tailcall: never — PUC OP_TAILCALL(k) asserts
             //     tbclist.p < base (the compiler never emits a tailcall
             //     from a function with TBC obligations).
@@ -8216,7 +8239,7 @@ pub const Vm = struct {
             // for that interleaving.
             const chain_gate = switch (state.post) {
                 .advance_instruction => true,
-                .return_frame => parent.isTbc(),
+                .return_frame => parent.isTbc() or state.return_k,
                 .retry_tailcall, .unwind_frame => false,
             };
             var obj: Value = undefined;
@@ -9458,6 +9481,7 @@ pub const Vm = struct {
                 0,
                 null,
                 true,
+                false,
                 .{ .return_frame = ret },
             )) {
                 .resume_dispatch => null,
@@ -10650,6 +10674,7 @@ pub const Vm = struct {
                 0,
                 null,
                 true,
+                false,
                 .{ .return_frame = ret },
             )) {
                 .resume_dispatch => null,
@@ -12221,6 +12246,7 @@ pub const Vm = struct {
                 0,
                 null,
                 true,
+                false,
                 .{ .return_frame = completed_ret },
             )) {
                 .resume_dispatch => null,
@@ -12549,6 +12575,7 @@ pub const Vm = struct {
                         0,
                         state.error_value,
                         true,
+                        false,
                         .unwind_frame,
                     )) {
                         .resume_dispatch => return .resumed,
@@ -13377,6 +13404,7 @@ pub const Vm = struct {
                         0,
                         null,
                         true,
+                        false,
                         .{ .return_frame = completed_ret },
                     )) {
                         .resume_dispatch => null,
@@ -16022,6 +16050,7 @@ pub const Vm = struct {
                             inst.a,
                             null,
                             false,
+                            false,
                             .advance_instruction,
                         )) {
                             .resume_dispatch => {
@@ -16197,6 +16226,7 @@ pub const Vm = struct {
             0,
             null,
             true,
+            inst.k != 0,
             .{ .return_frame = ret },
         );
         return switch (close_outcome) {
@@ -16267,6 +16297,15 @@ pub const Vm = struct {
         const has_pending_tbc = self.bc_tbc_regs.items.len >
             ctx.exec_frames.topConstPtr().tbc_mark; // P16.20 T6: current == top
         // P15.51l: hooks_active is read from self.hooks_active_cached.
+        // P16.31 Cut 5 (D1-E): the hooks gate translates PUC lvm.c
+        // OP_RETURN0/OP_RETURN1's fast-path condition `!L->hookmask` —
+        // with the hook disabled at the return, PUC skips luaD_poscall
+        // (no moveresults/testTBC/luaF_close), so a hook script's .toclose
+        // marks (bit on the interrupted Lua frame F, entries in F's
+        // c_tbc_chain region) are SILENTLY ABANDONED at F's normal return
+        // (p31a [A]/[B]/[E]); only coroutine.close could still close
+        // them. Hook still active → slow path → the .return_frame chain
+        // phase (bit-gated) closes them, mirroring PUC poscall.
         if (!has_pending_tbc and !self.hooks_active_cached) {
             // P16.2d: inline return fast arm (same conditions as opReturn1).
             // opReturn0 returns 0 values, so the fast arm handles nresults==0
@@ -16408,6 +16447,7 @@ pub const Vm = struct {
             0,
             null,
             true,
+            false,
             .{ .return_frame = ret },
         )) {
             .resume_dispatch => .continue_frame_loop,
@@ -16432,6 +16472,10 @@ pub const Vm = struct {
         const has_pending_tbc = self.bc_tbc_regs.items.len >
             ctx.exec_frames.topConstPtr().tbc_mark;
         // P15.51l: hooks_active is read from self.hooks_active_cached.
+        // P16.31 Cut 5 (D1-E): same hooks gate as opReturn0 — PUC lvm.c
+        // OP_RETURN1 (lvm.c:1802-1812) fast paths on `!L->hookmask`,
+        // skipping luaD_poscall/moveresults/testTBC/luaF_close. See
+        // opReturn0's comment for the full [A]/[B]/[E] abandonment story.
         if (!has_pending_tbc and !self.hooks_active_cached) {
             // P16.2d: inline return fast arm. When the return is a simple
             // Lua-to-Lua call completion (no open upvalues, no TBC closers,
@@ -16613,6 +16657,7 @@ pub const Vm = struct {
             0,
             null,
             true,
+            false,
             .{ .return_frame = ret },
         )) {
             .resume_dispatch => .continue_frame_loop,
@@ -17179,6 +17224,7 @@ pub const Vm = struct {
                 0,
                 null,
                 true,
+                false,
                 .{ .return_frame = vals },
             )) {
                 .resume_dispatch => .continue_frame_loop,
@@ -17327,6 +17373,7 @@ pub const Vm = struct {
                 0,
                 null,
                 true,
+                false,
                 .retry_tailcall,
             )) {
                 .resume_dispatch => .continue_frame_loop,
@@ -17661,6 +17708,7 @@ pub const Vm = struct {
             0,
             null,
             true,
+            false,
             .{ .return_frame = ret },
         )) {
             .resume_dispatch => .continue_frame_loop,
@@ -22204,6 +22252,34 @@ pub const Vm = struct {
         }
         if (th.status == .suspended and th.trace_yields > 0) {
             self.beginForcedClose(th);
+            // P16.31 Cut 5: switch cur_handle/cur_c_stack to the closed
+            // thread's handle for the transport drive — exactly like
+            // lua_resume (c_api) and closeThreadRegionsOnClosedThread do.
+            // The transport calls builtinCoroutineResume INTERNALLY (not
+            // through lua_resume), so without this switch the __close
+            // closers driven by the forced-close unwind would receive the
+            // CALLER's handle as their L (PUC runs them on the closed
+            // thread's lua_State — p31 [C]/[B2]: on=CO).
+            const saved_cur_handle = self.cur_handle;
+            const saved_cur_c_stack = self.cur_c_stack;
+            // Materialize the closed thread's handle if needed (the lazy
+            // api_handle pattern — closeThreadRegionsOnClosedThread does
+            // the same).
+            if (th.api_handle == null) {
+                const h = self.allocStateHandle(false) catch {
+                    self.cur_handle = saved_cur_handle;
+                    self.cur_c_stack = saved_cur_c_stack;
+                    return error.OutOfMemory;
+                };
+                h.* = .{ .vm = self, .thread = th, .is_main = false };
+                th.api_handle = h;
+            }
+            self.cur_handle = th.api_handle.?;
+            self.cur_c_stack = &th.api_handle.?.c_stack;
+            defer {
+                self.cur_handle = saved_cur_handle;
+                self.cur_c_stack = saved_cur_c_stack;
+            }
             var resume_args = [_]Value{.{ .Thread = th }};
             var resume_out = [_]Value{ .Nil, .Nil };
             self.builtinCoroutineResume(resume_args[0..], resume_out[0..]) catch {};
@@ -41021,6 +41097,21 @@ pub const Vm = struct {
                 // the marks; they ride F's region to F's return slow path
                 // or coroutine.close — p31a [A]/[B]/[E]).
                 //
+                // P16.31 Cut 5 (D1-E): when the hook script DISABLES the
+                // hook before F returns (p31a [A]/[B]/[E] shape), PUC's
+                // OP_RETURN0/OP_RETURN1 fast path (lvm.c:1785/1802,
+                // `!L->hookmask`) skips luaD_poscall entirely — no
+                // moveresults, no testTBC(F), no luaF_close — so the marks
+                // are SILENTLY ABANDONED at F's normal return: the
+                // coroutine dies normally and the closers NEVER run (only
+                // coroutine.close could still close them; at GC,
+                // luaE_freethread runs luaF_closeupval only). luazig
+                // mirrors this exactly: opReturn0/opReturn1's fast arms
+                // are gated on !hooks_active_cached (the hookmask
+                // translation), and the script-end close in
+                // runTestcScript is gated on the SCRIPT frame's TBC bit
+                // (clear for hook scripts — the bit went to F).
+                //
                 // Within-frame LIFO dedup (PUC newtbclist api_check
                 // L->tbclist.p < o — lenient, mirrors c_api lua_toclose).
                 toclose_blk: {
@@ -41331,7 +41422,9 @@ pub const Vm = struct {
                 // branch of builtinCoroutineYield abandons the hook's
                 // frames (the script frame among them — its pop DETACHES
                 // the marks; they ride F's region to F's return slow path
-                // / coroutine.close, p31a [A]/[B]/[E]).
+                // / coroutine.close, p31a [A]/[B]/[E]; with the hook
+                // self-disabled before F's return they are abandoned at
+                // F's fast-path return — see the .toclose comment).
                 try self.luaYieldKShared(
                     th,
                     st.items[base..],

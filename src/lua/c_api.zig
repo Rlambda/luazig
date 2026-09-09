@@ -949,51 +949,77 @@ pub export fn lua_numbertocstring(L: ?*lua_State, idx: c_int, buff: [*]u8) c_uin
 /// PUC `lua_toclose` (lapi.c:1283): mark the stack slot at `idx` as a
 /// to-be-closed variable. The mark goes on the THREAD-owned TBC chain
 /// (`Thread.c_tbc_chain` — PUC `L->tbclist`), LIFO by mark order; the slot
-/// is closed by `lua_closeslot`, when the owning C function returns
-/// (callCFunction/finishCcall — PUC `moveresults` → `luaF_close`), or over
-/// an in-flight error (PUC `luaD_closeprotected`).
+/// is closed by `lua_closeslot`, when the owning frame returns
+/// (callCFunction/finishCcall — PUC `moveresults` → `luaF_close`; a Lua
+/// frame's OP_RETURN — PUC `luaF_close(base)`/`moveresults`), or over an
+/// in-flight error (PUC `luaD_closeprotected`).
+///
+/// PUC marks `L->ci` — ALWAYS the topmost CallInfo of the state running the
+/// C code. Two lanes reach here:
+///   * a C function (called via lua_call/OP_CALL): its own C CallInfo is
+///     topmost — the frame_slot path (live slot on the frame's c_stack);
+///   * a debug hook (PUC `luaD_hook` runs hooks with NO CallInfo of their
+///     own, keeping `L->ci` = the interrupted frame): the topmost frame is
+///     the interrupted LUA frame — the hook path below.
 ///
 /// PUC api_check: the new mark must be ABOVE the chain's current top
 /// (`L->tbclist.p < o`) — within one frame's stack the marks are LIFO by
-/// slot. luazig's chain stores (owning C-frame, slot) pairs; only slots
-/// of the SAME frame are comparable, so the LIFO check is enforced
-/// within-frame (cross-frame marks live on different c_stacks and always
+/// slot. luazig's chain stores (owning frame, slot) pairs; only slots of
+/// the SAME frame are comparable, so the LIFO check is enforced
+/// within-frame (cross-frame marks live on different stacks and always
 /// append, exactly like PUC marks on different stack levels). Violations
 /// are lenient (ignored) instead of api_check-aborting.
 pub export fn lua_toclose(L: ?*lua_State, idx: c_int) void {
     const h = L orelse return;
     const vm = h.vm;
     const abs = normalizeIndex(idx, h.c_stack.items.len) orelse return;
-    // The mark goes on the topmost C-frame of the thread that owns the
-    // current execution (PUC: L->ci — the running C activation). While C
-    // code runs, that is always its own callCFunction frame.
+    // The mark goes on the topmost frame of the thread that owns the
+    // current execution (PUC: L->ci — the running activation). While a C
+    // function runs, that is always its own callCFunction frame; while a
+    // debug hook runs (hooks get no frame of their own — PUC luaD_hook
+    // keeps L->ci = the interrupted frame), it is the interrupted Lua
+    // frame.
     const th = vm.current_thread orelse vm.main_thread orelse return;
     const th_bc = th.call_frames;
-    var fi = th_bc.len();
-    while (fi > 0) {
-        fi -= 1;
-        const f = th_bc.getConstPtr(fi);
-        if (!f.isC()) continue;
-        // Within-frame LIFO: a mark at or below the frame's chain top is
-        // a PUC api_check violation — lenient ignore (idempotent re-mark).
-        const chain = &th.c_tbc_chain;
+    if (th_bc.len() == 0) return; // no activation: PUC api_check-fail; lenient no-op
+    const fi = th_bc.len() - 1;
+    const f = th_bc.getConstPtr(fi);
+    // P16.31 Cut 5: TbcEntry is a tagged union — live marks are frame_slot
+    // pairs (detached entries arise from pop-detach and the hook lane).
+    const chain = &th.c_tbc_chain;
+    if (f.isC()) {
+        // C-function lane: the slot lives on this frame's (parked) c_stack.
+        // Within-frame LIFO: a mark at or below the frame's chain top is a
+        // PUC api_check violation — lenient ignore (idempotent re-mark).
         if (chain.items.len > 0) {
             const top = chain.items[chain.items.len - 1];
             if (top == .frame_slot and top.frame_slot.cframe_idx == fi and
                 top.frame_slot.slot_idx >= abs) return;
         }
-        // P16.31 Cut 3: TbcEntry is a tagged union — live marks are
-        // frame_slot pairs (detached entries only arise from pop-detach).
         chain.append(vm.alloc, .{ .frame_slot = .{
             .cframe_idx = fi,
             .slot_idx = abs,
         } }) catch {};
-        // PUC sets CIST_TBC on L->ci (the frame "has marks" hint).
-        const fmut = th.call_frames.getPtr(fi);
-        if (!fmut.isTbc()) fmut.setTbc();
-        return;
+    } else {
+        // Hook lane (PUC luaD_hook: L->ci = the interrupted Lua frame).
+        // PUC marks the frame (CIST_TBC) + the slot's LEVEL in tbclist; the
+        // close later reads the LIVE slot at that level. luazig captures
+        // the value NOW as a detached entry: the hook's c_stack slot is
+        // unstable across later C-API operations, and Lua execution uses
+        // the bc_stack — so nothing between the hook and the close observes
+        // that c_stack slot. This is equivalent to PUC's live-level read
+        // for every shape where the mark's stack level is not reused
+        // before the close (a second hook event or a C call reusing the
+        // level is a PUC shared-stack quirk luazig's split stacks cannot
+        // — and need not — reproduce).
+        const value = if (abs < h.c_stack.items.len) h.c_stack.items[abs] else .Nil;
+        chain.append(vm.alloc, .{ .detached = value }) catch {};
     }
-    // No C-frame on this thread: PUC would api_check-fail; lenient no-op.
+    // PUC sets CIST_TBC on L->ci (the frame "has marks" hint) — gates the
+    // chain-region close at the frame's return (PUC moveresults) and the
+    // script-end close.
+    const fmut = th.call_frames.getPtr(fi);
+    if (!fmut.isTbc()) fmut.setTbc();
 }
 
 /// PUC `lua_closeslot` (lapi.c:206): close the to-be-closed slot at `idx`.

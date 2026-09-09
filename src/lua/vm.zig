@@ -17465,6 +17465,25 @@ pub const Vm = struct {
                 true,
             )) return error.ThreadSwitch;
 
+        // ── PUC luaD_poscall fast path (P16.32 T2 Cut B) ──
+        // PUC OP_TAILCALL → luaD_pretailcall → precallC: the callee's
+        // results are poscall'd in place; luaF_close runs ONLY when the
+        // frame actually carries close obligations. PUC lvm.c asserts
+        // tbclist.p < base for tailcalls (the compiler never emits one
+        // from a function with <close> vars), so bc_tbc_regs is empty
+        // here — the has_pending_tbc diversion above already handled the
+        // impossible case. The remaining obligations that need the close
+        // continuation machinery are the hook-lane chain region (the
+        // CIST_TBC bit: .return_frame's chain gate is `isTbc() or
+        // return_k`, and return_k is false at this site) and the "return"
+        // debug hook. With both absent, complete the frame directly —
+        // same conditions as the opReturn0/1 fast arms — eliminating the
+        // per-tailcall 80B BytecodeCloseContinuation allocation.
+        const fr_tail = ctx.exec_frames.getPtr(ctx.frame_index);
+        const tail_fast_complete = !self.hooks_active_cached and
+            !fr_tail.isTbc() and
+            fr_tail.pending_call_index == INVALID_PENDING;
+
         switch (callee_val) {
             .Closure => |cl| if (cl.proto) |new_proto| {
                 // ── Bytecode-to-bytecode tail call: frame reuse ──
@@ -17712,6 +17731,16 @@ pub const Vm = struct {
                     @min(self.last_builtin_out_count, outs.len)
                 else
                     outs.len;
+                // P16.32 T2 Cut B: on the nothing-to-close fast path, stash
+                // the results in bc_return_scratch (borrowed, detected by
+                // returnSliceIsOwned, never freed) instead of heap-duping —
+                // PUC moves the C results on the shared stack. The slow path
+                // keeps the owning dupe: beginBytecodeClose's .return_frame
+                // post takes ownership of the slice.
+                if (tail_fast_complete and used <= self.bc_return_scratch.len) {
+                    @memcpy(self.bc_return_scratch[0..used], outs[0..used]);
+                    break :blk self.bc_return_scratch[0..used];
+                }
                 break :blk try self.alloc.dupe(Value, outs[0..used]);
             },
             .Closure => |cl| blk: {
@@ -17750,6 +17779,18 @@ pub const Vm = struct {
         // if beginBytecodeClose accepted the slice — even on error.Yield,
         // the close continuation retains the slice for resume.
         ret_owned = false;
+        // P16.32 T2 Cut B: nothing to close and no return hook — complete
+        // the frame directly (the .return_frame post's non-close tail,
+        // minus the continuation allocation). completeBytecodeExecFrame
+        // closes the frame's open upvalues itself and handles both slice
+        // kinds: the borrowed scratch is duped at the C-frame/external
+        // boundaries, heap slices are freed on the internal paths
+        // (opReturn0/1 fast arms use the same contract).
+        if (tail_fast_complete) {
+            if (try self.completeBytecodeExecFrame(ctx.exec_frames, ctx.boundary_depth, ret)) |final|
+                return .{ .return_results = final };
+            return .continue_frame_loop;
+        }
         return switch (try self.beginBytecodeClose(
             ctx.exec_frames,
             ctx.boundary_depth,

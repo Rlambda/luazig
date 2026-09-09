@@ -8144,3 +8144,195 @@ flat. Documented, not hacked around.
 Batch P16.16 T2-T8 complete: api580 544 → 392 (PUC 304) via C1-C7 +
 bonus leak fix; every cut PUC-faithful, separately measured, gated,
 and committed.
+
+## P16.31 — TBC parity: hook/testC to-be-closed marks (D1/D2/D3, 5 cuts)
+
+Цель: закрыть эмпирически установленные расхождения TBC (to-be-closed)
+семантики vs PUC Lua 5.5.0. Источник истины: /tmp/opencode/p31-truth-report.md
+(+ p31a/p31b/p31c.lua, p31d_ctx.c, tools/status/p16.31-t0-truth.json).
+
+### PUC-семантика (эмпирически верифицирована, 3× deterministic)
+
+- `lua_toclose` из hook-скрипта помечает ПРЕРВАННЫЙ Lua-фрейм F (PUC Chook
+  вызывается БЕЗ собственного CallInfo — L->ci во время hook = F): метка
+  переживает hook-yield abandon (tbclist пер-thread, вне CallInfo).
+- Провалившийся resume тела корутины НЕ закрывает TBC (lua_resume error-path
+  только статус+объект ошибки): метки доживают до coroutine.close
+  (err=объект ошибки) — p31a [D].
+- Обязательство закрывается на coroutine.close (luaE_resetthread →
+  luaD_closeprotected, yy=0): closers на закрытом потоке (on=CO), err=nil
+  (suspended) или объект ошибки (dead-with-error); last-error-wins (B2).
+- [A]/[B]/[E]: hook само-выключился до return тела → OP_RETURN fast path
+  (hookmask==0) минует poscall → обязательство молча брошено (PUC сам
+  бросает: luaE_freethread → luaF_closeupval only). «Close at F's return»
+  path-dependent (hookmask ON → slow path → CIST_TBC → luaF_close) —
+  cleanly НЕ воспроизводится, задокументирован по исходникам.
+- PUC lua_yieldk (ldo.c:1027): `if ((ci->u.c.k = k) != NULL) ci->u.c.ctx = ctx;`
+  — k присваивается БЕЗУСЛОВНО (k=NULL затирает continuation!): plain yield
+  внутри continuation ТЕРМИНИРУЕТ скрипт.
+- PUC lparser.c:2029: tailcall НЕ эмитится при живом <close> в scope →
+  tailcall-reuse никогда не несёт живых bc_tbc_regs; tbclist-метки уровней
+  выше фрейма переживают reuse (закрываются на return НОВОЙ функции).
+
+### План (5 cuts)
+
+- [x] Cut 1 (S0 SIGSEGV): conventional pcall non-yieldable — e1e79b1.
+- [x] Cut 2 (D3): annotateCloseRuntimeError DELETED — 9e06f26.
+- [x] Cut 3 (D1-testC): testC `toclose` → реальная thread-цепочка
+      (унифицированная region-модель v5.2, ниже) + .yield collapse +
+      luaYieldKShared k-unconditional + suspension-owner detection
+      (derived isTestcScriptFrame) + pop-detach + error-unwind
+      no-close-per-frame (границы pcall закрывают) + dead-normal
+      close-all + forced-close chain phase ON CO.
+- [ ] Cut 4 (D2): coroutine.close closers на ЗАКРЫТОМ потоке (on=CO для
+      dead-потоков: context-switch при close-all) + chunk-name quoting
+      (`[string "..."]` префикс) + testc `loadstring` name/mode aliasing
+      (PUC getstring_aux пишет в общий static buff → name и mode алиасятся
+      на ПОСЛЕДНИЙ токен: `loadstring -1 name t` → chunkname "t", не
+      "name"; обнаружено при p31_chk4: find("stack overflow") 20 vs 17;
+      bug-for-bug parity, api.lua проходит на обоих).
+- [ ] Cut 5 (D1-E): верификация hook-lane edge-cases + постоянные
+      дифференциальные тесты (tests/c_api).
+
+### Cut 3 дизайн (v5.2 — унифицированная region-модель)
+
+PUC-перевод стек-уровней tbclist: у каждого CallFrame (общая часть, Lua+C)
+`tbc_chain_base: usize` = длина c_tbc_chain на момент push (CallFrame
+88→96B; tailcall-reuse НЕ сбрасывает — регион живёт столько же, сколько ci,
+как уровни в PUC). TbcEntry → tagged union `{ frame_slot: {cframe_idx,
+slot_idx}, detached: Value }`.
+
+1. toclose (vm.zig:40349): script-фрейм есть → frame_slot{script_frame_idx,
+   idx} + CIST_CHAIN_TBC bit (новый bit в callstatus, 0 байт) на
+   PUC-current фрейме (= script-фрейм для прямого testC; F = hfi-1 для
+   hook-скрипта — PUC помечает ПРЕРВАННЫЙ фрейм); нет фрейма (checkpanic) →
+   detached{value}. Инвокационно-локальный список (39019), testcIsMarked,
+   collectTestcClosers — DELETE.
+2. is_hook_script структурная проверка — ТОЛЬКО для skip script-end close
+   (hook-скрипт не имеет PUC ci → нет poscall-закрытия).
+3. Script-end close (runTestcScript): все кроме hook-скрипта: results =
+   copyTestcReturnValues; закрыть регион [script_frame.tbc_chain_base, len)
+   err=nil yy=1 results-payload; st = results. Checkpanic: frame-less
+   регион.
+4. closeCFrameTbcEntries → регион-семантика: цикл `while chain.len > base`;
+   frame_slot → live-read + nil; detached → захваченное значение; pop до
+   closer; CLSRET на yield (base читается из fr.tbc_chain_base при
+   re-entry — без нового поля в CClsretState); last-error-wins.
+5. POP-DETACH: каждый pop (popBuiltinCFrame, popBytecodeExecFrame обе
+   ветки, abandon) детачит frame_slot-entries своего региона (захват
+   значения) — метки переживают pop фрейма как detached (PUC: уровни
+   переживают ci-pop), закрываются регионом объемлющего фрейма /
+   coroutine.close / брошаются fast-path'ом. Assert в popBuiltinCFrame
+   (6743-6747) → заменён детачем. Abandon 20554-20555 (eager close) →
+   REMOVE.
+6. Lua return SLOW path (интеграция в beginBytecodeClose/continueBytecodeClose):
+   chain-фаза ПЕРЕД bc_tbc_regs-сканом (уровни C-стека выше регистров —
+   LIFO); гейт = CIST_CHAIN_TBC bit (точный перевод testTBC(ci) — не
+   «регион непустой»: child-hook метки не закрываются на return родителя);
+   OP_CLOSE (advance_instruction) — безусловно (PUC luaF_close(level));
+   unwind_frame (error unwind) — НИКОГДА (PUC longjmp не закрывает);
+   forced close (close_mode) — безусловно, ON CO; bit очищается по
+   опустошению региона; yield-closer → та же continuation-машина
+   (child_active/waiting_builtin_yield/re-scan).
+7. Error unwind: continueBytecodeErrorUnwind C-ветка (12209-12231) close →
+   REMOVE (только pop-detach); закрывают ВОССТАНАВЛИВАЮЩИЕ границы:
+   builtinPcall/xpcall catch, callCFunction error path (c_api pcallk),
+   checkpanic — регион [boundary_frame.tbc_chain_base, len) с ошибкой,
+   non-yieldable, last-error-wins. Resume-граница НИКОГДА (p31a [D]).
+8. coroutine.close (builtinCoroutineClose): dead-with-error — существующий
+   close-all (21663, MAIN-контекст; on=CO → Cut 4) обрабатывает оба вида
+   entries; dead-normal + непустая цепочка → НОВЫЙ close-all err=nil
+   (last-error-wins → false+ошибка closer'а, p31a [B2]); suspended →
+   transport (beginForcedClose+resume): forced chain-фаза (п.6) закрывает
+   Lua-регионы ON CO (p31a [C]).
+9. .yield (40616) COLLAPSE → luaYieldKShared(th, st.items[base..], nres,
+   null, 0) — обе ветки; без push фрейма/state/boundary=0 (ownership:
+   0==0 + derived scan; resume target = верхний Lua-фрейм). Non-hook:
+   builtinCoroutineYield паркует script-фрейм (k==null c_api-форма);
+   resume → finishCcall k==NULL → регион-close с resume-значениями как
+   результатами (скрипт ТЕРМИНИРУЕТСЯ на yield — PUC parity). Hook-ветка:
+   abandon попает script-фрейм (pop-detach → detached в регионе F).
+10. luaYieldKShared (5959): k присваивать БЕЗУСЛОВНО (когда !isDebugHook),
+    ctx только при k!=null — PUC ldo.c:1027; plain .yield внутри
+    continuation затирает shim-k → терминация (латентный re-run divergence).
+11. Suspension-owner detection: branch-2 scan (20615) +
+    has_testc_cframes_above (13332) расширяются derived-проверкой
+    isTestcScriptFrame(f) = f.isC() and bc_stack[f.func_slot] ==
+    .Builtin(testc_testC) (прямые/nested/hook script-фреймы — все
+    callBuiltin-pushed с этим callee; без нового поля в CFrameState).
+12. callBuiltin: Yield — существующий preserve (18386, cframe_preserved;
+    defer 18368 проверяет pushed&&!preserved — двойного pop нет); error
+    guard (18388): preserve если YPCALL или в регионе есть frame_slot.
+13. Owns-lane (builtinTestcTestC): захват script_frame_idx; errdefer паркует
+    st на frames[script_frame_idx] только если фрейм ещё валиден (idx<len,
+    isC — robust к abandon); иначе deinit cur_c_stack; restore saved.
+14. callk/pcallk/yieldk: closers-сериализация из TestcContState DELETE
+    (поля closers/close_return_values/close_current_index/close_err);
+    метки живут в регионе script-фрейма → закрываются на k==NULL
+    finishCcall после pop callk-фрейма.
+15. testcContShim: CLSRET closer-loop (36924-36973) + post-script
+    closer-loop (37060-37120) DELETE (закрытие — внутри runTestcScript
+    script-end close); остальное (реконструкция стека, статус-строки,
+    script_run, transfer) — без изменений.
+16. finishCcall: k==NULL путь (11129-11233) уже регион-закрывает (P16.30
+    Stage C) — сохранить, base из fr.tbc_chain_base; continuation-errdefer
+    (10894-10897): детач региона фрейма ДО deinit cur_c_stack (иначе метки
+    continuation-скрипта повиснут).
+17. GC trace (24490-24517) + teardown (23900-23960): оба вида entries;
+    teardown освобождает БЕЗ закрытия.
+18. closeslot (40877): chain-based — top-entry в регионе script-фрейма +
+    slot match → закрыть non-yieldably.
+19. threadHasCFrameTbcEntries → split-предикаты: guards — «регион содержит
+    frame_slot entries cframe_idx»; close-циклы — «регион непуст». p31d
+    (c_api lane) поведение неизменно.
+
+Гейты Cut 3: p31a ([A]/[B]/[E] parity-брошенные; [C] closer на
+coroutine.close err=nil on=CO; [D] err=orig (on=MAIN до Cut 4); [B2]
+false+closer-boom (on=MAIN до Cut 4)), p31b/p31c parity, p31d неизменно,
+22_tbc_lifecycle DIFF-EMPTY, build D+RF, smoke 71/71, matrix --testc
+zig_fail=0, c_api make test+test-diff, api580, perf guard (lua_calls +
+branch_loop).
+
+### Cut 3 результат (закрыт)
+
+Реализована унифицированная region-модель v5.2 (все 19 пунктов дизайна выше):
+per-thread `c_tbc_chain` с `TbcEntry` tagged union (`frame_slot{cframe_idx,
+slot_idx}` / `detached{Value}`), `CallFrame.tbc_chain_base` (u32, offset 16,
+CallFrame 88B сохранён), pop-detach на всех pop-путях, region-close на
+восстанавливающих границах (builtinPcall/xpcall, api.State.pcall через
+pub `Vm.apiCloseConventionalPcallBoundary`, checkpanic close-all +
+luaE_resetthread-семантика), forced-close chain phase ON CO (close_mode),
+`.yield` collapse → luaYieldKShared(k=null) на script-фрейме (без shim),
+branch-3 down-search в builtinCoroutineYield (мимо ВСЕХ C-фреймов до
+верхнего Lua-фрейма — фикс makeCfunc-yield: len-2 check баил на C-below-C),
+runTestcScript script-end close с заменой cell на results (PUC moveresults),
+closeTestcTruncationMarks с broke/run_start логикой (pop-усечение:
+run = [base, len) на исчерпании), CFrameAux.pcallk{funcidx, chain_base}.
+
+Perf-фиксы по ходу (perf_compare был FAIL +10.2% на table_alloc_setmetatable):
+1. `CallFrame.tbc_chain_base` usize→u32 (offset 16 = старое tail-padding;
+   CallFrame 96→88B, comptime-ассерты обновлены) — lua_calls +14.5%→+1.5%.
+2. `detachTbcRegion` → `noinline` + guard `chain.len > base` в
+   popBuiltinCFrame: LLVM инлайнил 281B detach-тело в popBuiltinCFrame
+   (192→487B), функция перестала инлайниться на hot-сайте (каждый builtin
+   call) → table_alloc_setmetatable +8-10% (FAIL). noinline вернул
+   popBuiltinCFrame к 225B → RESULT: OK (все workloads OK,
+   table_alloc +1.2%, lua_calls +1.6%, geomean 1.63x).
+
+Гейты Cut 3: p31c/p31_cs/p31_block/p31_coro DIFF-EMPTY; p31a/p31b/p31d —
+ожидаемое Cut-4-состояние (только on=MAIN vs on=CO; p31d S3/S4 также
+chunk-quoting); p31_chk1-5/checkpanic OK (chk3 mem-err: zig ПРАВИЛЬНО
+возвращает "XXnot enough memory" — puc-dbg reference-сборка была сломана:
+luaL_newstate использовал default luaL_alloc, alloccount не применялся;
+reference пересобран с debug_realloc на main state); p31_mk/mk2/ret/pop OK
+(mk2 traceback `[C]: in local 'co'` — Cut-4 scope); 22_tbc_lifecycle
+DIFF-EMPTY; build D+RF 199/199; smoke 71/71; matrix --testc zig_fail=0
+(big.lua both_fail = parity); c_api make clean test + test-diff ALL PASS;
+api580 GREEN; perf_compare RESULT: OK.
+
+Обнаруженные pre-existing пробелы (не Cut 3, внесены в Cut 4/5):
+- testc `loadstring` name/mode aliasing (см. Cut 4 выше).
+- puc-dbg reference: api.lua line 1304 (rawcheckstack 500000) падает на
+  reference-сборке — артефакт отсутствующей ltests.h-конфигурации
+  (LUAI_MAXSTACK/memlimit), НЕ zig-расхождение (matrix reference проходит
+  api.lua; zig тоже).

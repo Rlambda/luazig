@@ -783,11 +783,24 @@ pub const State = struct {
         // func_slot no longer held a Closure). The yieldable pcallk path
         // (k != NULL) does NOT come through here — it uses luaPcallKShared,
         // which owns its own `.yieldable` unit (PUC luaD_call, ccall inc=1).
+        // P16.31 Cut 3: the TBC-chain snapshot at pcall ENTRY — PUC
+        // luaD_pcall's old_top (the callee's func level, lapi.c f_call's
+        // savestack). The catch below closes every chain entry above it
+        // (luaD_closeprotected) before building the error object.
+        const th = self.vm.activeBytecodeThread();
+        const tbc_base = th.c_tbc_chain.items.len;
         const ret = self.vm.apiCall(.nonyieldable, callee, args) catch {
-            // PUC luaD_pcall: on error, restore the stack to the base,
-            // set the error object (luaD_seterrorobj), then propagate status.
+            // PUC luaD_pcall (ldo.c:1090-1095): on error, restore the
+            // stack to the base, run luaD_closeprotected(old_top, status)
+            // — every TBC mark above the pcall entry closes WITH the
+            // in-flight error, non-yieldable, last-error-wins (a closer
+            // error REPLACES the error object) — then set the error
+            // object (luaD_seterrorobj) and propagate status.
+            self.vm.apiCloseConventionalPcallBoundary(th, tbc_base);
             self.stack.items.len = fn_idx;
             // Push the error object onto the stack (PUC luaD_seterrorobj).
+            // apiCloseConventionalPcallBoundary already replaced err_obj
+            // with the final closer error when a closer errored.
             const errval: vm_mod.Value = if (self.vm.err_has_obj) self.vm.err_obj else .Nil;
             self.stack.append(self.vm.alloc, errval) catch return .memory_error;
             // PUC: status is LUA_ERRERR (5) if the message handler errored,

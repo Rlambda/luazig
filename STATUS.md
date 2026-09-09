@@ -168,6 +168,77 @@ layout-чувствительность 72KB megafunction — структурн
 вынести холодные пути (callBuiltinSwitch inline-копия и т.п.) out-of-line,
 как PUC держит luaD_precall вне luaV_execute.
 
+### P16.32 T3 — getTm-семейство: pointer-return (PUC `const TValue*` parity) (2026-09-09)
+
+Один cut на metamethod_call_noalloc-пути (`s = s + box`, `__add = function(a,b)
+return a end`; zig 630 vs puc 376 i/it по microbench). Исходная T0-декомпозиция
+(perf non-PEBS `instructions:u`) оказалась skid-артефактом: getTmByObj "40.9%"
+времени. PEBS (`instructions:upp`) + точный valgrind callgrind (20k iters,
+`/tmp/opencode/mm_small.lua`): runBytecodeDispatch 376 i/it,
+tryPushSimpleResultMetamethod 129, getTmByObj 47 (32 vm.zig + 15 ltable.zig),
+dispatchCalleeActivationHook 4; total 556 i/it. PUC (callgrind, тот же скрипт):
+luaV_execute 82+70, luaD_precall'2 48, luaT_callTMres 42, callbinTM 27,
+luaD_call 22, luaT_trybinTM 17, luaH_Hgetshortstr 14, luaT_gettmbyobj 13 ≈ 335
+i/it. Доминирующий gap — frame-continuation machinery (~180 i/it) —
+АРХИТЕКТУРНЫЙ, закрывать в P16.33, не в этой задаче.
+
+**Cut (KEEP, коммит ниже): getTm/getTmByObj/findBinaryTm/findUnaryTm возвращают
+`?*const Value`** — указатель на value-slot нода metatable (null = absent) —
+вместо `?Value` (24B optional: 16B Value + tag). Zig CC возвращает 16B tagged
+union через память (sret, ~20 instr marshalling/call), поэтому pointer-return —
+единственный способ получить register-return. Это ТОЧНО модель PUC
+(`luaT_gettm`/`luaT_gettmbyobj` возвращают `const TValue*`, absent = `notm()`,
+ltm.c:60-84). Nil-fold (нода отсутствует / поле явно nil / нет metatable →
+null) внутри getTm: `testb $0xf, tag; cmovne` — как PUC `notm()`-fold. Все ~24
+call-site'а переведены на null-check + `.*` deref; findBinaryTm de-inlined в
+2 out-of-line getTmByObj-вызова (dispatch-loop код сжал). Lifetime-safe: GC
+non-moving mark-sweep, metatable достижим из операнда в руках caller'а, ни
+один call-site не мутирует metatable между lookup и use — та же модель, что
+PUC. Отрицательного кэширования НЕТ (T5 PROHIBITION не тронута).
+
+Codegen (objdump, RF): `lea/mov → %rax; xor %eax,%eax; ret` — register-return,
+sret-marshalling исчез.
+
+A/B (interleaved, тот же binарий-пара, taskset -c 0):
+
+- callgrind mm_small: getTmByObj 47→**39 i/it** (−17%); total 556→548.
+- perf stat instr (median 3): metamethod_call_noalloc 315.09M→**311.06M**
+  (−1.28%); metamethod_add −0.24%; field_access −0.56%; hash_access −0.59%;
+  lua_calls flat.
+- Wall (median 5): metamethod_call_noalloc 0.019→0.019 flat; metamethod_add
+  0.099→0.099 flat; field_access flat.
+- **comparisons +0.78% instr (+2 i/it)** — единственная реальная цена: EQ-handler
+  fast path теперь материализует &la/&lb в callee-saved (r14/rbx) + 2 mov перед
+  valuesEqual-вызовом, т.к. указатели переживают вызов для getTmByObj-args.
+  Это PUC-faithful pointer-liveness: PUC luaV_equalobj держит p1/p2 (s2v(ra)/
+  s2v(rb)) живыми через сравнение и ПЕРЕИСПОЛЬСТВУЕТ их в callTMres (lvm.c) —
+  та же структура. Циклы +2.1%, wall +0.7%.
+- perf_compare vs baseline-approved.json (P16.31-final, ДО T2): comparisons
+  +11.2% FAIL — ПРЕДСУЩЕСТВУЕТ на HEAD (T2-отчёт 7c91592: +11.5% layout
+  lottery, bisect + dead-u64 эксперимент); инкремент этого cut'а — +0.7% wall.
+  Machine drift доказан: неизменённый PUC-бинарий +4-8% vs baseline-времён
+  (comparisons 0.598→0.622, float_arith 0.175→0.184, coroutine_yield
+  0.043→0.047). metamethod_add −39.7% / temp_table_alloc −31.7% /
+  table_alloc_setmetatable −24.9% в этом прогоне — в основном ЗАКОММИЧЕННЫЕ
+  T2-cuts против pre-T2 baseline, не этот cut.
+
+Семантика: dynamic metatable mutation видима (mt.__add = nil → error →
+mt.__add = f → работает; __index table/function/nil; __call; __concat/__len/
+__eq/__unm; явный nil ≡ absent для __tostring) — проверено на обоих движках,
+идентично. `/tmp/opencode/mm_semantics.lua`.
+
+Гейты: build D+RF; unit 199/199 D+RF; smoke 72/72; matrix --testc zig_fail=0
+(big.lua both_fail = pre-existing parity); c_api make clean test + test-diff
+ALL PASS; api580 GREEN; upstream events/attrib/db/closure OK (attrib — из
+testes-CWD); perf_compare: 15/16 OK или улучшение, comparisons FAIL
+предсуществующий (см. выше).
+
+Вердикт KEEP: закрывает реальный parity-блокер (модель возврата = PUC
+`const TValue*` + notm()), все metamethod-instruction-счетчики вниз,
+codegen-антипаттерн (sret optional) удалён; цена +2 i/it на EQ fast path —
+PUC-faithful pointer-liveness. Доминирующий gap (frame machinery ~180 i/it)
+— P16.33.
+
 ### P16.32 T1 — allocation decomposition truth (2026-09-09, research)
 
 Полный разбор alloc-family divergence (metamethod_add 2.22x, table_alloc_setmetatable

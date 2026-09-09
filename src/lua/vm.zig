@@ -8340,11 +8340,13 @@ pub const Vm = struct {
             // missing), so the chain path does NOT skip.
             if (!from_chain and (obj == .Nil or (obj == .Bool and !obj.Bool))) continue;
 
-            const mm = self.getTmByObj(obj, .close) orelse {
+            const mm = self.getTmByObj(obj, .close);
+            if (mm == null) {
                 _ = self.fail("metamethod 'close' is nil", .{}) catch {};
                 try self.recordBytecodeCloseError(state);
                 continue;
-            };
+            }
+            const mmv = mm.?.*;
             var argv: [2]Value = undefined;
             argv[0] = obj;
             var argc: usize = 1;
@@ -8353,7 +8355,7 @@ pub const Vm = struct {
                 argc = 2;
             }
 
-            const resolved = self.resolveCallable(mm, argv[0..argc], null) catch |resolve_err| switch (resolve_err) {
+            const resolved = self.resolveCallable(mmv, argv[0..argc], null) catch |resolve_err| switch (resolve_err) {
                 error.RuntimeError => {
                     try self.recordBytecodeCloseError(state);
                     continue;
@@ -9249,17 +9251,19 @@ pub const Vm = struct {
                 return .{ .resolved = .{ .mm = mm, .obj = object } };
             }
 
-            const mm = self.getTmByObj(object, .index) orelse return .not_found;
-            if (mm == .Table) {
-                object = .{ .Table = mm.Table };
+            const mm = self.getTmByObj(object, .index);
+            if (mm == null) return .not_found;
+            const mmv = mm.?.*;
+            if (mmv == .Table) {
+                object = .{ .Table = mmv.Table };
                 continue;
             }
-            if (mm == .Closure and mm.Closure.proto != null) {
+            if (mmv == .Closure and mmv.Closure.proto != null) {
                 const args = [_]Value{ object, key };
                 switch (try self.tryPushSimpleResultMetamethod(
                     exec_frames,
                     parent_index,
-                    mm,
+                    mmv,
                     args[0],
                     args[1],
                     .index,
@@ -9269,7 +9273,7 @@ pub const Vm = struct {
                     else => {},
                 }
             }
-            return .{ .resolved = .{ .mm = mm, .obj = object } };
+            return .{ .resolved = .{ .mm = mmv, .obj = object } };
         }
         return .not_found;
     }
@@ -9311,24 +9315,26 @@ pub const Vm = struct {
                 return .{ .resolved = .{ .mm = mm, .obj = object } };
             }
 
-            const mm = self.getTmByObj(object, .newindex) orelse return .not_found;
-            if (mm == .Table) {
-                object = .{ .Table = mm.Table };
+            const mm = self.getTmByObj(object, .newindex);
+            if (mm == null) return .not_found;
+            const mmv = mm.?.*;
+            if (mmv == .Table) {
+                object = .{ .Table = mmv.Table };
                 continue;
             }
-            if (mm == .Closure and mm.Closure.proto != null) {
+            if (mmv == .Closure and mmv.Closure.proto != null) {
                 const args = [_]Value{ object, key, value };
                 const pushed = try self.tryPushBytecodeMetamethod(
                     exec_frames,
                     parent_index,
-                    mm,
+                    mmv,
                     "newindex",
                     args[0..],
                     .{ .ignore = .{} },
                 );
                 if (pushed) return .pushed;
             }
-            return .{ .resolved = .{ .mm = mm, .obj = object } };
+            return .{ .resolved = .{ .mm = mmv, .obj = object } };
         }
         return .not_found;
     }
@@ -9659,13 +9665,14 @@ pub const Vm = struct {
                 const bad = if (!isDirectConcatOperand(lhs)) lhs else acc;
                 return self.fail("attempt to concatenate a {s} value", .{bad.typeName()});
             };
+            const mmv = mm.*;
             const args = [_]Value{ lhs, acc };
 
             // PUC two-stage: resolve ONCE through normal callable semantics
             // (handles __call chains), then invoke — bytecode Closure as
             // continuation frame (yieldable), Builtin/C-closure synchronously.
             // No double resolution (Task 5).
-            const resolved = try self.resolveCallable(mm, args[0..], .{
+            const resolved = try self.resolveCallable(mmv, args[0..], .{
                 .namewhat = "metamethod",
                 .name = "concat",
             });
@@ -15396,7 +15403,7 @@ pub const Vm = struct {
                         switch (try self.tryPushSimpleResultMetamethod(
                             exec_frames,
                             ctx.frame_index,
-                            tm.?,
+                            tm.?.*,
                             lhs,
                             rhs,
                             event,
@@ -15430,7 +15437,7 @@ pub const Vm = struct {
                         switch (try self.tryPushSimpleResultMetamethod(
                             exec_frames,
                             ctx.frame_index,
-                            tm.?,
+                            tm.?.*,
                             lhs,
                             rhs,
                             event,
@@ -15466,7 +15473,7 @@ pub const Vm = struct {
                         switch (try self.tryPushSimpleResultMetamethod(
                             exec_frames,
                             ctx.frame_index,
-                            tm.?,
+                            tm.?.*,
                             lhs,
                             rhs,
                             event,
@@ -15503,7 +15510,7 @@ pub const Vm = struct {
                             switch (try self.tryPushSimpleResultMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
-                                tm.?,
+                                tm.?.*,
                                 val,
                                 val,
                                 .unm,
@@ -15543,7 +15550,7 @@ pub const Vm = struct {
                                 switch (try self.tryPushSimpleResultMetamethod(
                                     exec_frames,
                                     ctx.frame_index,
-                                    tm.?,
+                                    tm.?.*,
                                     val,
                                     val,
                                     .bnot,
@@ -15570,7 +15577,8 @@ pub const Vm = struct {
                             ctx.regs[inst.a] = .{ .Int = @intCast(val.String.len()) };
                         } else {
                             const tm = self.findUnaryTm(val, .len);
-                            if (tm) |mm| {
+                            if (tm) |mm_ptr| {
+                                const mm = mm_ptr.*;
                                 exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                                 switch (try self.tryPushSimpleResultMetamethod(
                                     exec_frames,
@@ -15630,7 +15638,8 @@ pub const Vm = struct {
                             {
                                 // Resolve __eq ONCE — no re-lookup.
                                 const tm = self.findBinaryTm(la, lb, .eq);
-                                if (tm) |mm| {
+                                if (tm) |mm_ptr| {
+                                    const mm = mm_ptr.*;
                                     exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                                     switch (try self.tryPushSimpleResultMetamethod(
                                         exec_frames,
@@ -35240,9 +35249,10 @@ pub const Vm = struct {
         // PUC trymt (lstrlib.c:279-287): if rhs is a string or rhs has no
         // metamethod for this event → error. Otherwise call rhs's metamethod.
         if (rhs != .String) {
-            if (self.getTmByObj(rhs, event)) |mm| {
+            const mm = self.getTmByObj(rhs, event);
+            if (mm) |mmv| {
                 // Call rhs's metamethod with (lhs, rhs) in source order.
-                const result = try self.callMetamethod(mm, tag_method.opname(event), args);
+                const result = try self.callMetamethod(mmv.*, tag_method.opname(event), args);
                 const outs_fresh = self.refreshBuiltinOuts() orelse outs;
                 outs_fresh[0] = result;
                 return;
@@ -36659,9 +36669,11 @@ pub const Vm = struct {
             else => {},
         }
 
-        const mm = self.getTmByObj(object, .index) orelse {
+        const mm = self.getTmByObj(object, .index);
+        if (mm == null) {
             return self.fail("attempt to index a {s} value", .{object.typeName()});
-        };
+        }
+        const mmv = mm.?.*;
         const saved_nwo = self.debug_namewhat_override;
         const saved_no = self.debug_name_override;
         self.debug_namewhat_override = "metamethod";
@@ -36670,7 +36682,7 @@ pub const Vm = struct {
             self.debug_namewhat_override = saved_nwo;
             self.debug_name_override = saved_no;
         }
-        return switch (mm) {
+        return switch (mmv) {
             .Table => |t| try self.tableGetValueDepth(t, key, depth + 1),
             .Builtin => |id| blk: {
                 var call_args = [_]Value{ object, key };
@@ -36720,10 +36732,11 @@ pub const Vm = struct {
             }
         }
 
-        const mm = self.getTmByObj(object, .newindex) orelse {
+        const mm = self.getTmByObj(object, .newindex);
+        if (mm == null) {
             return self.fail("attempt to index a {s} value", .{object.typeName()});
-        };
-        switch (mm) {
+        }
+        switch (mm.?.*) {
             .Table => |t| return self.setIndexValueDepth(.{ .Table = t }, key, val, depth + 1),
             .Builtin => |id| {
                 var call_args = [_]Value{ object, key, val };
@@ -36797,17 +36810,36 @@ pub const Vm = struct {
     /// must be visible immediately. A negative-cache would hide the
     /// `nil → f` transition. Only events `<= .eq` (index, newindex, gc, mode,
     /// len, eq) participate in the flags cache, via `fastTm`/`gfasttm`.
-    fn getTm(self: *Vm, mt: *Table, event: TmsEvent) ?Value {
+    /// **Return convention (PUC `const TValue *` model):** `getTm` returns
+    /// `?*const Value` — a POINTER to the metatable node's value slot, null
+    /// = absent — exactly PUC's `luaT_gettmbyobj`/`luaH_Hgetshortstr`, which
+    /// return `&n->i_val` / `&G(L)->nilvalue` and whose callers test
+    /// `notm(tm)` == `ttisnil(tm)`. A metatable field explicitly set to nil
+    /// and a missing field are BOTH absent (the callee folds `node.value ==
+    /// .Nil` into null, PUC's `notm` fold). Pointer lifetime matches PUC's
+    /// model: the pointee lives in the metatable's node array, which is
+    /// reachable from the operand the caller holds; the GC is non-moving
+    /// (mark-sweep), and no call site mutates the metatable between lookup
+    /// and use. The old `?Value` return was a 24-byte optional (16B Value +
+    /// tag) returned via sret memory — every call paid a round-trip (caller
+    /// allocates result slot + passes pointer, callee stores 24B + tag,
+    /// caller reloads + unwraps): ~20 instructions of pure marshalling per
+    /// call vs PUC's pointer-in-%rax. A pointer returns in one register;
+    /// the caller's null check replaces both the optional unwrap and PUC's
+    /// `notm()`.
+    fn getTm(self: *Vm, mt: *Table, event: TmsEvent) ?*const Value {
         const name_str = self.tm_names[@intFromEnum(event)];
         const node = ltable.nodeLookupShortStrIdentity(mt.hash, name_str) orelse return null;
+        // PUC notm() fold: a nil-valued field is absent (see doc above).
         if (node.value == .Nil) return null;
-        return node.value;
+        return &node.value;
     }
 
     /// PUC `luaT_gettmbyobj` (ltm.c:71-84): look up a metamethod by event for
     /// a value `v`. Resolves the metatable for `v` (per-type metatable from
-    /// `G(L)->mt[]` for primitives, or the object's own `.metatable` for
-    /// tables/userdata), then calls `luaH_Hgetshortstr(mt, tmname[event])`.
+    /// the VM's per-type fields for primitives, or the object's own
+    /// `.metatable` for tables/userdata), then calls `luaH_Hgetshortstr(mt,
+    /// tmname[event])`.
     ///
     /// **NO flags cache for ANY event** — PUC's `luaT_gettmbyobj` does NOT
     /// call `gfasttm`/`luaT_gettm`; it calls `luaH_Hgetshortstr` directly.
@@ -36819,7 +36851,10 @@ pub const Vm = struct {
     /// Lookup parity: `getTm` uses `nodeLookupShortStrIdentity` — PUC
     /// `luaH_Hgetshortstr` short-string pointer-identity lookup keyed by the
     /// pre-interned `tm_names[event]` (P16.12/13 T2, landed).
-    pub fn getTmByObj(self: *Vm, v: Value, event: TmsEvent) ?Value {
+    ///
+    /// Return convention: `?*const Value`, null = absent — PUC's
+    /// `const TValue *` + `notm()` model (see `getTm`'s doc above).
+    pub fn getTmByObj(self: *Vm, v: Value, event: TmsEvent) ?*const Value {
         const mt = valueMetatable(self, v) orelse return null;
         return self.getTm(mt, event);
     }
@@ -36828,16 +36863,18 @@ pub const Vm = struct {
     /// rhs. This is the SINGLE resolution point for binary metamethods —
     /// callers receive the resolved value and pass it to
     /// `tryPushResolvedMetamethod` or `callMetamethod` without re-looking-up.
-    /// Returns null when neither operand has the metamethod.
-    fn findBinaryTm(self: *Vm, lhs: Value, rhs: Value, event: TmsEvent) ?Value {
+    /// Returns null when neither operand has the metamethod (PUC's
+    /// `notm(tm)` on both lookups).
+    fn findBinaryTm(self: *Vm, lhs: Value, rhs: Value, event: TmsEvent) ?*const Value {
         return self.getTmByObj(lhs, event) orelse
             self.getTmByObj(rhs, event);
     }
 
     /// Unary metamethod resolution: single `getTmByObj` on the operand.
     /// PUC passes the operand twice to the metamethod (luaT_trybinTM with
-    /// rb, rb), but the lookup itself is singular.
-    fn findUnaryTm(self: *Vm, operand: Value, event: TmsEvent) ?Value {
+    /// rb, rb), but the lookup itself is singular. Returns null when the
+    /// operand has no metamethod.
+    fn findUnaryTm(self: *Vm, operand: Value, event: TmsEvent) ?*const Value {
         return self.getTmByObj(operand, event);
     }
 
@@ -36980,9 +37017,10 @@ pub const Vm = struct {
     }
 
     fn callBinaryMetamethod(self: *Vm, lhs: Value, rhs: Value, event: TmsEvent) DispatchError!?Value {
-        const mm = self.findBinaryTm(lhs, rhs, event) orelse return null;
+        const mm = self.findBinaryTm(lhs, rhs, event);
+        if (mm == null) return null;
         var call_args = [_]Value{ lhs, rhs };
-        return try self.callMetamethod(mm, tag_method.opname(event), call_args[0..]);
+        return try self.callMetamethod(mm.?.*, tag_method.opname(event), call_args[0..]);
     }
 
     fn runCloseMetamethod(self: *Vm, obj: Value, err_obj: ?Value) DispatchError!void {
@@ -36996,9 +37034,11 @@ pub const Vm = struct {
                 return;
             }
         }
-        const mm = self.getTmByObj(obj, .close) orelse {
+        const mm = self.getTmByObj(obj, .close);
+        if (mm == null) {
             return self.fail("metamethod 'close' is nil", .{});
-        };
+        }
+        const mmv = mm.?.*;
         self.close_metamethod_depth += 1;
         defer self.close_metamethod_depth -= 1;
         if (err_obj != null) {
@@ -37007,10 +37047,10 @@ pub const Vm = struct {
         }
         if (err_obj) |e| {
             var call_args = [_]Value{ obj, e };
-            _ = self.callMetamethod(mm, "__close", call_args[0..]) catch |e2| switch (e2) {
+            _ = self.callMetamethod(mmv, "__close", call_args[0..]) catch |e2| switch (e2) {
                 error.RuntimeError => return error.RuntimeError,
                 error.Yield => {
-                    if (mm == .Builtin and mm.Builtin == .coroutine_yield) {
+                    if (mmv == .Builtin and mmv.Builtin == .coroutine_yield) {
                         if (self.current_thread) |th| {
                             th.pending_close_builtin = true;
                             th.pending_close_builtin_obj = obj;
@@ -37023,10 +37063,10 @@ pub const Vm = struct {
             self.clearPendingCloseBuiltinForObject(obj);
         } else {
             var call_args = [_]Value{obj};
-            _ = self.callMetamethod(mm, "__close", call_args[0..]) catch |e2| switch (e2) {
+            _ = self.callMetamethod(mmv, "__close", call_args[0..]) catch |e2| switch (e2) {
                 error.RuntimeError => return error.RuntimeError,
                 error.Yield => {
-                    if (mm == .Builtin and mm.Builtin == .coroutine_yield) {
+                    if (mmv == .Builtin and mmv.Builtin == .coroutine_yield) {
                         if (self.current_thread) |th| {
                             th.pending_close_builtin = true;
                             th.pending_close_builtin_obj = obj;
@@ -37498,10 +37538,11 @@ pub const Vm = struct {
     }
 
     fn callUnaryMetamethod(self: *Vm, v: Value, event: TmsEvent) DispatchError!?Value {
-        const mm = self.findUnaryTm(v, event) orelse return null;
+        const mm = self.findUnaryTm(v, event);
+        if (mm == null) return null;
         // Lua passes the operand twice for unary metamethod dispatch.
         var call_args = [_]Value{ v, v };
-        return try self.callMetamethod(mm, tag_method.opname(event), call_args[0..]);
+        return try self.callMetamethod(mm.?.*, tag_method.opname(event), call_args[0..]);
     }
 
     const ResolvedCall = struct {
@@ -37527,14 +37568,15 @@ pub const Vm = struct {
                 .Builtin, .Closure => return .{ .callee = callee, .args = args, .owned_args = owned },
                 else => {
                     if (depth >= 16) return self.fail("attempt to call a value (chain too long)", .{});
-                    const mm = self.getTmByObj(callee, .call) orelse {
+                    const mm = self.getTmByObj(callee, .call);
+                    if (mm == null) {
                         if (call_name) |cn| {
                             if (cn.name) |nm| {
                                 return self.fail("attempt to call a {s} value ({s} '{s}')", .{ callee.typeName(), cn.namewhat, nm });
                             }
                         }
                         return self.fail("attempt to call a {s} value", .{callee.typeName()});
-                    };
+                    }
 
                     const new_args = try self.alloc.alloc(Value, args.len + 1);
                     new_args[0] = callee;
@@ -37542,7 +37584,7 @@ pub const Vm = struct {
                     if (owned) |old| self.alloc.free(old);
                     owned = new_args;
                     args = new_args;
-                    callee = mm;
+                    callee = mm.?.*;
                     depth += 1;
                 },
             }
@@ -37596,9 +37638,10 @@ pub const Vm = struct {
         std.debug.assert(chain_depth.* < 16);
         const current_callee = regs.*[a];
         // Look up __call metamethod on the current (non-callable) value.
-        const mm = self.getTmByObj(current_callee, .call) orelse {
+        const mm = self.getTmByObj(current_callee, .call);
+        if (mm == null) {
             return self.fail("attempt to call a {s} value", .{current_callee.typeName()});
-        };
+        }
 
         // getTmByObj may have triggered GC (via allocTable inside table
         // lookup), which can realloc bc_stack and invalidate regs.*.
@@ -37624,7 +37667,7 @@ pub const Vm = struct {
                 regs.*[a + i] = regs.*[a + i - 1];
             }
         }
-        regs.*[a] = mm;
+        regs.*[a] = mm.?.*;
 
         nargs.* += 1;
         chain_depth.* += 1;
@@ -38439,7 +38482,7 @@ pub const Vm = struct {
             switch (try self.tryPushSimpleResultMetamethod(
                 exec_frames,
                 frame_index,
-                mm,
+                mm.*,
                 la,
                 lb,
                 event,

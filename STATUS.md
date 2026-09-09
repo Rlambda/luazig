@@ -68,6 +68,39 @@ IR VM полностью удалена из кодовой базы.
 
 Выполненные задачи по номерам (P15.xx). Полные детали — в `git log` и коде.
 
+### P16.32 T1 — allocation decomposition truth (2026-09-09, research)
+
+Полный разбор alloc-family divergence (metamethod_add 2.22x, table_alloc_setmetatable
+2.00x, temp_table_alloc 1.69x i/it). Артефакт: `tools/status/p16.32-t1-allocation-truth.md`.
+
+Ключевые результаты (измерено, A/B-патчи reverted, src/ чист, smoke 71/71):
+
+- **Счётчики аллокаций РАВНЫ PUC** для 5 из 6 shapes (2/2, 2/2, 1/1, 0/0, 2/2);
+  только metamethod_add = 4 vs 2: лишние 16B results-dupe (opTailcall .Builtin,
+  vm.zig:17666) + 80B BytecodeCloseContinuation (beginBytecodeClose, безусловный
+  на каждый tailcall; PUC OP_TAILCALL заменяет frame in-place без close-механизма).
+- **Ёмкости точные с обеих сторон** ({1,2,3} → ровно 3 array slots; {v=1} → ровно
+  1 hash node). Разница в байтах — модель структур: zig Table 72 vs PUC 48,
+  array slot 16B tagged vs 9B tagless, Node 32 vs 24.
+- **Корень mem.eql/internStr/rawGet в циклах (gdb-доказано)**:
+  `allocTable → testcConsumeAllocCount → getGlobal("T") → internStrAssume("T")`
+  — полный lookup по имени на КАЖДОЙ аллокации таблицы, даже когда модуль testC `T`
+  отсутствует. ~440 instr/аллокация.
+- **A/B-измерения фиксов** (instr/iter, n=500k): testC-кэш: temp_table_alloc
+  2022→1145 (PUC 1139 — **паритет, вся 1.69x = testC-цепочка**);
+  table_alloc_setmetatable 3004→2183 (PUC 1520); metamethod_add 4620→3829.
+  GETFIELD raw-get-first (PUC luaV_fastget, без предусловия metatable==null):
+  metamethod_add −343 дополнительно (→3486). SmpAllocator ≈ glibc по инструкциям
+  (lock-stall ~8 cycles/alloc+free pair — cycles, не instr).
+- **GC pacing divergence**: zig `gc_auto_threshold_kb` стартует 32MB → первый
+  автоматический цикл только после 32MB аллокаций (PUC: debt=0 → первый цикл
+  сразу, threshold = 2×marked). В 500k-итерационном окне zig первую половину
+  работает без GC (advantage), потом догоняет.
+- **Ranked candidates** (в артефакте, с измеренными savings): 1) testC-флаг
+  (−877/−821/−792 i/it), 2) GETFIELD raw-first (−343), 3) opTailcall
+  nothing-to-close fast path, 4) opTailcall results-dupe elimination,
+  5) pushBuiltinCFrame machinery, 6) GC initial threshold parity.
+
 ### P15.13–25 — итеративный bytecode dispatch loop
 Первоначальный host-recursive путь полностью устранён для активного bytecode backend. Как и `luaV_execute`/`CallInfo` в PUC Lua, один dispatch driver переключает heap-resident активации Lua, не сохраняя по Zig stack frame на каждый Lua-вызов.
 

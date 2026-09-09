@@ -6718,7 +6718,17 @@ pub const Vm = struct {
         return error.RuntimeError;
     }
 
-    fn fail(self: *Vm, comptime fmt: []const u8, args: anytype) Error {
+    /// noinline (P16.33 T3): error-path formatting is cold by construction —
+    /// the 2048-B bufPrint + allocPrint "source:line:" assembly runs only
+    /// when an error is being raised. PUC keeps this machinery OUT of
+    /// luaV_execute entirely (luaG_runerror / luaG_addinfo / luaO_pushfstring
+    /// live in ldebug.c/lobject.c as separate functions); inlining the fmt
+    /// body into every call site duplicated ~10 KB of it inside
+    /// runBytecodeDispatch alone (56 fragments), inflating the dispatch
+    /// megafunction and its code-layout sensitivity. A call on an error
+    /// path is free — no hot path reaches it (the fail sites all sit behind
+    /// not-taken error branches).
+    noinline fn fail(self: *Vm, comptime fmt: []const u8, args: anytype) Error {
         // Fresh error: reset LUA_ERRERR signal before invokeErrfunc.
         self.err_is_errerr = false;
         // PUC Lua error messages can be long — e.g. `require`'s "module not

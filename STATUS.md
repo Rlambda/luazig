@@ -9629,3 +9629,69 @@ ctx-кэшируемый `code_ptr` при index-pc (fetch 3 инструкци�
 **Гейты после revert**: unit PASS; smoke 74/74; matrix --testc
 zig_fail=0 (big.lua both_fail pre-existing); perf current.json
 не перегенерирован — src/ идентичен HEAD, артефакт P16.34 валиден.
+
+## P16.35 T5 — coroutine_yield gap decomposition: lookup vs transition (2026-09-10)
+
+Полный артефакт:
+[tools/status/p16.35-t5-coroutine-decomposition.md](tools/status/p16.35-t5-coroutine-decomposition.md).
+Research-only: src/ не менялся (HEAD a0491b3, src/ == be4fb0a).
+
+**T5.1 (A/B/C/D варианты, 500k итераций, оба движка, perf stat
+median-of-3, taskset -c 0)**: gap(A)=+1536.5 i/it (официальный референс
++1494.7 при 6e9cd69); lookup-часть гэпа = (A−D)_zig − (A−D)_puc =
+210.1 − 203.0 = **+7.1 i/it (0.5%)** — глобальный lookup в zig стоит
+как в PUC (~105 vs ~101.5 i на пару GETTABUP+GETFIELD);
+**transition-часть = gap(D) = +1529.4 i/it (99.5%)** — весь гэп это
+механизмы resume/yield. Гэп константен по A/B/C/D (1529-1537):
+аддитивен и ортогонален lookup-пути. B ≡ C с точностью до 20 инструкций
+на 505k итераций (одинаковый opcode-мультисет). Bytecode обоих движков
+IDENTICHEN per variant (единственные различия: +1 slot, формат операнда
+JMP). Wall: 85% гэпа тоже transition.
+
+**T5.2 (callgrind + perf record на варианте D, 20,200 циклов)**:
+builtinCoroutineResume self 395 i/cyc (+switchRuntime ×2 = 157,
+clearErrorTraceback 14, re-entry runBytecodeInternal'2 69);
+builtinCoroutineYield 154 (+memcpy 44: setFrom ×2); guard-chain на
+каждом builtin OP_CALL ×2 сайта: tryPushBytecodeProtectedCall 44
+(early-return на id-проверке, 10 i из них — defer-free-check),
+tryRequestBytecodeCoroutineSwitch 40 (early-return на trampoline),
+builtinOutLen 46, eligible 69, gcAutomaticStep 23 (после КАЖДОГО
+OP_CALL), hook-пробы 18. refreshHooksCached — 2×/цикл (внутри обоих
+switchRuntime). ~1000 i/cyc инлайн-стейджинга OP_CALL внутри dispatch
+self.
+
+**T5.3 (PUC callgrind на том же workload)**: PUC transition ≈ 517 i/cyc
+всего (dispatch 200 + precall 69 + resume-вход 135, из них 35 setjmp +
+poscall/rotate/xmove/checkstack ≈ 180 + yield 34 + longjmp-семейство
+92 — транспорт, которого zig не платит вовсе). Ключевые PUC-инварианты:
+yield = 3 стора + longjmp, ZERO копий значений, ZERO сканов фреймов
+(nny-счётчик = верхние биты nCcalls, O(1) AND+TEST), resume = 1 стор
+статуса + poscall + unroll на СУЩЕСТВУЮЩЕМ ci (никаких пушей/свопов),
+checkGC только на аллокационных опкодах (lvm.c:1425/1631/1933, НЕ
+OP_CALL), hookmask читается напрямую (2 i, без refresh).
+
+**Ранжированные механизмы** (доля от 1529 i/it):
+#1 resume-side state ceremony ~380 (25%) — 8-полей error save/restore +
+~10 defer-блоков на каждый resume (PUC: error-состояние = сам longjmp
+status, ldo.c:966-997);
+#2 builtin OP_CALL guard chain + per-call GC ~230 (15%) — чистые
+ask-then-decline прологи, PUC: lvm.c:1720 + ldo.c:642;
+#3 switchRuntime буферный своп 157 (10%) — PUC платит 0 (per-thread
+stack постоянен);
+#4 O(frames) yield-boundary derivation ~90 (6%) — 3 скана фреймов на
+yield vs один AND+TEST nCcalls (ldo.c:1016);
+#5 value copying на yield ~50 (3%) — setFrom ×2 дублирует одни значения
+(PUC: lua_yieldk копирует NOTHING).
+Остаток ~600-660 — инлайн-стейджинг OP_CALL (outs-window архитектура).
+
+**Cut-3 кандидат**: механизм #2 (guard-chain hoisting + GC-check
+relocation на аллокационные сайты) — самый механически доказуемый
+(out-of-line символы с точными счётчиками, нулевой семантический риск),
+самый generic (каждый builtin-вызов в каждом workload), PUC-citable
+построчно; ожидаемый эффект на coroutine_yield −170..−230 i/it
+(11-15% гэпа) + побочный выигрыш на всех builtin-тяжёлых workload'ах.
+#1 больше, но требует архитектурного решения по error-state (per-thread
+error state vs pointer-swapped window); #3 — чистейшее архитектурное
+расхождение (per-thread stack), но рефакторинг всех bc_stack-сайтов.
+
+**Гейты**: N/A (research-only, src/ == HEAD; артефакт закоммичен).

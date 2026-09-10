@@ -1,4 +1,4 @@
-> Last updated: 2026-09-10 (P16.36 Cut 3 — gsub yieldability O(frames) scan → O(1) nCcalls nny unit: gsub __index continuation push now owns the unit (the one scan-only gap), hasActiveBytecodeNonYieldableBoundary deleted, coroutine_yield −44.4 i/it (−2.0%); Cut 1 error-state ownership Vm → Thread complete)
+> Last updated: 2026-09-10 (P16.36 COMPLETE — error-state ownership (Cut 1: err_cfunc_label cross-thread leak fixed structurally f6c939a + thread-owned semantic error state b2b79c3, Thread 3632→3712/Vm 6584→6488, resume ceremony bundle deleted) + gsub yieldability O(1) nny unit (Cut 3 164ba0f, hasActiveBytecodeNonYieldableBoundary deleted, coroutine_yield −44.4 i/it); final: geomean 1.45349 @ 164ba0f (+0.53% vs P16.35-final baseline, 18/18 OK, single WARN field_access +7.6% = documented bimodal), T7 fresh A/B/C/D: gap 1204.2 i/it = lookup 0.4% + transition 99.6%)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -6196,6 +6196,91 @@ clean test ALL PASS + test-diff PASS (TBC 22+23); api580 GREEN. Final-wrap
 re-run (fresh, этот wrap): matrix 31/32 zig_fail=0, smoke 74/74, perf
 median-of-7 **18/18 OK vs baseline-p15.37, 0 WARN/FAIL** (max positive delta
 string_concat +0.6%, global_arith +0.5%); baseline-approved = 1.44578.
+
+### P16.36 COMPLETE: error-state ownership Vm → Thread + gsub yieldability O(1) nny-единица (2026-09-10)
+
+**Geomean 1.44578 → 1.45349 (+0.53%, под WARN-порогом +5%)**; measured
+`164ba0f` (7 runs, core 0; snapshot `tools/perf/current*.json` +
+`current-codesize.json` + `current-differential-profile.json` перегенерированы;
+baseline-approved → **P16.36-final = 1.45349**). Фаза закрыла механизм #1
+(resume error-state ceremony ~380 i/it) и механизм #4 (O(frames) yield-boundary
+~90 i/it) из P16.35-декомпозиции.
+
+- **Cut 0 (`0e6f996`)**: truth baseline + error-state ownership inventory +
+  T2-пробы — БЕЗ runtime-изменений (src/ == 162ae06). **T2.3 нашёл РЕАЛЬНЫЙ
+  cross-thread leak `err_cfunc_label`**: Vm-global C-frame label переживал
+  resume-границу и протекал в traceback чужого потока. Cut ledger фазы:
+  0e6f996 → f6c939a → b2b79c3 → 164ba0f.
+- **Cut 1a (`f6c939a`)**: leak закрыт **структурно** — поле `err_cfunc_label`
+  удалено (все 12 сайтов), raiser C-frame label выводится в момент capture
+  через `writeSyntheticTopCFrame` (PUC pushfuncname: funcnamefromcall name →
+  _G fallback → '?'); side-fixes с PUC-цитатами (CLI double-traceback,
+  xpcall argerror position = `luaL_where(1)` через новый `failWithPosFrame`);
+  постоянный differential smoke `76_error_cfunc_label.lua`.
+- **Cut 1b (`b2b79c3`)**: **thread-owned semantic error state** (PUC-модель:
+  error identity живёт на поднимающем lua_State, `luaD_seterrorobj` переносит
+  на resume-границах): err_obj/err_has_obj/err_cframe_residue/err_is_errerr/
+  err_source/err_line/err_traceback переехали Vm → Thread; **Thread
+  3632→3712 (+80B = точный перенос полей), Vm 6584→6488** (payload −80B +
+  −16B padding re-flow; число «−80B» в сообщении коммита = payload-учёт,
+  финальная probe-истина 6488, зафиксирована в p16.36-t0-layout.json
+  `p16_36_final`); **resume 7-field ceremony bundle удалён** (7-field
+  save/restore на каждом resume/close был leak-latency патчем);
+  ~263 сайтов `self.X` → `self.errThread().X`; locals/cstack 1b-регрессия
+  ОПРОВЕРГНУТА stash-baseline экспериментом (оба diff-класса pre-existing).
+- **Cut 3 (`164ba0f`)**: **gsub yieldability O(frames) → O(1) nCcalls nny
+  unit** (PUC ldo.c:1016: `yieldable` = один AND+TEST на верхних битах
+  nCcalls): `hasActiveBytecodeNonYieldableBoundary` удалён (10-строчный frame
+  walk, консультировался до 2× за resume/yield цикл); единственный реальный
+  gap скана — gsub `__index` continuation push — теперь **входит в nny-единицу
+  ДО push'а** на обоих сайтах (`gsubContCcallEnter`/`gsubContCcallRollback`,
+  флаг `repl_ccall_active` → `cont_ccall_active` на оба вида continuation);
+  coroutine_yield **−44.4 i/it (−2.0%)**; постоянный differential smoke
+  `77_gsub_yieldability.lua` (T1–T13 + T2b/T3b direct-call пробы);
+  негативная валидация ×2 (нейтрализованный enter → 4 probe-расхождения vs
+  PUC, восстановлено → byte-identical).
+- **T7 fresh A/B/C/D декомпозиция @ 164ba0f** (cy_{A,B,C,D}.lua, оба движка,
+  instructions:u, median-of-3): gap(A) **1204.2 i/it** (было 1536.5 на
+  P16.35) = **lookup 5.05 (0.4%) + transition 1199.2 (99.6%)**; gap константен
+  по вариантам (1197–1204) — вывод P16.35 не изменился и укрепился: весь
+  остаточный гэп — transition machinery. Fresh perf record (official
+  coroutine_yield): dispatch 71.64%, builtinCoroutineResume 12.17%,
+  callCoroutineBuiltinDirect 3.14%, switchRuntime 3.11%,
+  builtinCoroutineYield 2.44%, coroutineBuiltinFastPathEligible 1.65% (теперь
+  O(1)-терм), condGcFromDispatch 1.42%, memcpy 1.32%;
+  hasActiveBytecodeNonYieldableBoundary ОТСУТСТВУЕТ (удалён), resume-ceremony
+  символы ниже 0.2%.
+- **Code-size truth @ 164ba0f**: .text 2,365,145 → **2,595,289 (+230,144 B)**,
+  почти целиком — fail-clone family Cut 1a (fail→failWithPosFrame): 574
+  старых fail-клонов (~1,144 B) → 574 тонких (~122 B) + 576 новых
+  failWithPosFrame-клонов (~1,377 B) = +207,153 B; все клоны — cold error
+  paths, нулевая runtime-цена. runBytecodeDispatch 67,692 → 67,029 (−663).
+- **locals/cstack exoneration**: tracegc `__gc` dot-механизм root-caused
+  (g_write ← GCTM ← luaC_fullgc ← luaB_collectgarbage), 1b-гипотеза
+  опровергнута — оба diff-класса задокументированы как pre-existing
+  (locals-tracegc-divergence.json GC-pacing, p16.23-cstack-analysis.json
+  resume-chain/metatable-gsub).
+- **P16.37 queue**: switchRuntime per-thread stacks (bc_stack/bc_boxed/
+  bc_tbc_regs на Thread, ~157 i/it est — чистейшее архитектурное расхождение,
+  PUC платит 0); yield copying (~50 i/it: setFrom ×2 + resume-tail copy loop
+  vs PUC zero-copy); internStr GC cascade (checkGC на аллокационных опкодах,
+  PUC lvm.c:1425/1631/1933 — relocation = DispatchError каскад, отдельный
+  cut); scan inventory leftovers (suspension-owner topmost-Lua-frame search =
+  следующий кандидат); semantic backlog (table.sort comparator yield
+  PUC-blocks/luazig-allows, errored-coroutine TBC __close timing — оба
+  задокументированы как pre-existing divergences).
+
+Гейты фазы @ 164ba0f: fmt; unit D+RF; smoke **76/76** (включая
+76_error_cfunc_label.lua + 77_gsub_yieldability.lua); matrix --testc 31/32
+zig_fail=0 (big.lua both_fail pre-existing); c_api clean test ALL PASS +
+test-diff PASS (TBC 22+23); api580 GREEN. Final-wrap re-run (fresh, этот
+wrap): matrix 31/32 zig_fail=0, smoke 76/76, perf median-of-7 **18/18 OK vs
+P16.35-final baseline, единственный WARN field_access +7.6%** = задокументированный
+bimodal workload (свежие доказательства: 12-прогонов wall бимодален
+0.0993–0.1000 vs 0.1020–0.1038, instructions:u бимодален 1,727,947,033 vs
+1,798,648,270 = data-dependent path split; P16.36 менял только
+coroutine/error/gsub-пути); controls lua_calls +1.6%, branch_loop −1.0%,
+int_arith +0.4%; baseline-approved = **1.45349 (P16.36-final)**.
 
 ## История закрытых фаз
 

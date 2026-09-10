@@ -17859,7 +17859,12 @@ pub const Vm = struct {
         {
             return .continue_frame_loop;
         }
+        // P16.35 Cut 3: id-class guard hoisting (see the OP_CALL site above)
+        // — non-pcall/xpcall and non-trampoline tail calls skip the
+        // decline-chain calls entirely (PUC luaD_pretailcall → precallC has
+        // no layered guards).
         if (callee_val == .Builtin and
+            (callee_val.Builtin == .pcall or callee_val.Builtin == .xpcall) and
             try self.tryPushBytecodeProtectedCall(
                 ctx.exec_frames,
                 ctx.frame_index,
@@ -17873,6 +17878,7 @@ pub const Vm = struct {
             return .continue_frame_loop;
         }
         if (callee_val == .Builtin and
+            self.bytecode_coroutine_trampoline_active and
             try self.tryRequestBytecodeCoroutineSwitch(
                 ctx.exec_frames,
                 ctx.frame_index,
@@ -18464,27 +18470,41 @@ pub const Vm = struct {
                 )) {
                     return .continue_frame_loop;
                 }
-                if (try self.tryPushBytecodeProtectedCall(
-                    ctx.exec_frames,
-                    ctx.frame_index,
-                    a,
-                    nresults,
-                    id,
-                    rargs,
-                    false,
-                )) {
+                // P16.35 Cut 3: hoist the protected-family id check to the
+                // caller — PUC OP_CALL (lvm.c:1720) is savepc + luaD_precall
+                // with no layered guards; every non-pcall/xpcall builtin
+                // must skip the decline-chain (incl. the ArrayListUnmanaged
+                // init + defer deinit) entirely. The id-class gate is
+                // generic (protected family), not per-builtin.
+                if ((id == .pcall or id == .xpcall) and
+                    try self.tryPushBytecodeProtectedCall(
+                        ctx.exec_frames,
+                        ctx.frame_index,
+                        a,
+                        nresults,
+                        id,
+                        rargs,
+                        false,
+                    ))
+                {
                     return .continue_frame_loop;
                 }
-                if (try self.tryRequestBytecodeCoroutineSwitch(
-                    ctx.exec_frames,
-                    ctx.frame_index,
-                    a,
-                    nresults,
-                    id,
-                    rargs,
-                    false,
-                )) return error.ThreadSwitch;
-
+                // P16.35 Cut 3: same hoisting for the coroutine-switch
+                // request — its first check is the trampoline flag, which
+                // is false in the steady state (trampoline only active
+                // while a nested bytecode coroutine switch is pending).
+                // One load+test here replaces the out-of-line call for
+                // every non-trampoline builtin OP_CALL.
+                if (self.bytecode_coroutine_trampoline_active and
+                    try self.tryRequestBytecodeCoroutineSwitch(
+                        ctx.exec_frames,
+                        ctx.frame_index,
+                        a,
+                        nresults,
+                        id,
+                        rargs,
+                        false,
+                    )) return error.ThreadSwitch;
                 if (id == .string_gsub) {
                     switch (try self.tryStartBytecodeGsub(
                         ctx.exec_frames,
@@ -18637,36 +18657,44 @@ pub const Vm = struct {
                     @min(self.last_builtin_out_count, outs.len)
                 else
                     out_len;
-                if (try self.tryPushBytecodeDebugHook(
-                    ctx.exec_frames,
-                    ctx.frame_index,
-                    "return",
-                    null,
-                    callee_val,
-                    outs[0..produced],
-                    1,
-                    .{ .store_results = .{
-                        .continuation = .{ .dst = a, .nresults = nresults },
-                        .values = outs[0..produced],
-                    } },
-                )) {
-                    const pc2_idx = ctx.exec_frames.getPtr(ctx.frame_index).pending_call_index;
-                    if (self.getPendingCallPtr(pc2_idx)) |pending| {
-                        if (pending.completion == .hook and pending.completion.hook.post == .store_results) {
-                            const old_values = pending.completion.hook.post.store_results.values;
-                            if (self.returnSliceIsOwned(old_values)) {
-                                // Already scratch-owned, no free needed
-                            } else if (@intFromPtr(old_values.ptr) >= @intFromPtr(self.bc_stack.ptr) and
-                                @intFromPtr(old_values.ptr) < @intFromPtr(self.bc_stack.ptr) + self.bc_stack.len * @sizeOf(Value))
-                            {
-                                const owned = try self.alloc.dupe(Value, old_values);
-                                pending.completion.hook.post.store_results.values = owned;
+                // P16.35 Cut 3: gate the return-event hook probes by the
+                // cached hooks-active flag at the call site — both helpers'
+                // first check is exactly `!hooks_active_cached` (PUC
+                // precallC reads L->hookmask directly, ldo.c:650; no
+                // out-of-line probe when no hooks exist). Identical flag,
+                // no intervening mutation — semantics preserved.
+                if (self.hooks_active_cached) {
+                    if (try self.tryPushBytecodeDebugHook(
+                        ctx.exec_frames,
+                        ctx.frame_index,
+                        "return",
+                        null,
+                        callee_val,
+                        outs[0..produced],
+                        1,
+                        .{ .store_results = .{
+                            .continuation = .{ .dst = a, .nresults = nresults },
+                            .values = outs[0..produced],
+                        } },
+                    )) {
+                        const pc2_idx = ctx.exec_frames.getPtr(ctx.frame_index).pending_call_index;
+                        if (self.getPendingCallPtr(pc2_idx)) |pending| {
+                            if (pending.completion == .hook and pending.completion.hook.post == .store_results) {
+                                const old_values = pending.completion.hook.post.store_results.values;
+                                if (self.returnSliceIsOwned(old_values)) {
+                                    // Already scratch-owned, no free needed
+                                } else if (@intFromPtr(old_values.ptr) >= @intFromPtr(self.bc_stack.ptr) and
+                                    @intFromPtr(old_values.ptr) < @intFromPtr(self.bc_stack.ptr) + self.bc_stack.len * @sizeOf(Value))
+                                {
+                                    const owned = try self.alloc.dupe(Value, old_values);
+                                    pending.completion.hook.post.store_results.values = owned;
+                                }
                             }
                         }
+                        return .continue_frame_loop;
                     }
-                    return .continue_frame_loop;
+                    try self.dispatchBytecodeHookWithCallee("return", callee_val, outs[0..produced]);
                 }
-                try self.dispatchBytecodeHookWithCallee("return", callee_val, outs[0..produced]);
                 const nstore: usize = if (nresults >= 0) @intCast(nresults) else produced;
                 for (0..nstore) |i| {
                     ctx.regs[a + i] = if (i < produced) outs[i] else .Nil;
@@ -42736,22 +42764,141 @@ pub const Vm = struct {
         };
     }
 
-    fn builtinOutLen(self: *Vm, id: BuiltinId, call_args: []const Value) usize {
+    /// P16.35 Cut 3: comptime table of per-builtin fixed out-counts.
+    ///
+    /// PUC's C stack IS the outs window — a C function's results land above
+    /// L->top with no pre-sizing (ldo.c luaD_poscall just rotates them in
+    /// place). luazig's `outs` is a slice into bc_stack and must be sized
+    /// BEFORE the builtin runs, so every builtin OP_CALL pays this lookup;
+    /// the old out-of-line ~90-case switch cost ~23 i per call (call
+    /// overhead + jump-table dispatch) just to fetch a constant. Fixed
+    /// counts now resolve via one direct table load inlined at the call
+    /// site; argument-dependent counts are `null` here and fall through to
+    /// builtinOutLenDynamic. Unlisted builtins default to 1 (the old
+    /// switch's `else => 1`).
+    ///
+    /// Single source of truth: each builtin's window size lives EITHER here
+    /// (fixed) OR in builtinOutLenDynamic (dynamic; entry null). To add a
+    /// dynamic-out builtin: null its entry here AND add its case there. A
+    /// null entry without a case degrades to the default 1 — truncated
+    /// results, immediately visible in the upstream suite.
+    const builtin_const_out_len: [@typeInfo(BuiltinId).@"enum".fields.len]?u16 = blk: {
+        var t = [_]?u16{1} ** @typeInfo(BuiltinId).@"enum".fields.len;
+        // Argument-dependent (dynamic) out-counts — builtinOutLenDynamic.
+        for ([_]BuiltinId{
+            .io_lines,      .io_lines_iter, .assert,       .select,
+            .string_byte,   .string_find,   .string_match, .utf8_codepoint,
+            .string_unpack, .table_unpack,
+        }) |dyn_id| t[@intFromEnum(dyn_id)] = null;
+        // Fixed out-counts (moved verbatim from the old switch).
+        t[@intFromEnum(BuiltinId.print)] = 0;
+        t[@intFromEnum(BuiltinId.warn)] = 0;
+        t[@intFromEnum(BuiltinId.@"error")] = 0;
+        t[@intFromEnum(BuiltinId.os_exit)] = 0;
+        t[@intFromEnum(BuiltinId.io_write)] = 1;
+        t[@intFromEnum(BuiltinId.io_stderr_write)] = 1;
+        t[@intFromEnum(BuiltinId.io_close)] = 3;
+        t[@intFromEnum(BuiltinId.file_close)] = 3;
+        t[@intFromEnum(BuiltinId.io_open)] = 3;
+        t[@intFromEnum(BuiltinId.io_popen)] = 3;
+        t[@intFromEnum(BuiltinId.io_tmpfile)] = 3;
+        t[@intFromEnum(BuiltinId.os_execute)] = 3;
+        t[@intFromEnum(BuiltinId.io_read)] = 8;
+        t[@intFromEnum(BuiltinId.file_read)] = 8;
+        t[@intFromEnum(BuiltinId.file_lines)] = 3;
+        t[@intFromEnum(BuiltinId.io_flush)] = 1;
+        t[@intFromEnum(BuiltinId.file_flush)] = 1;
+        t[@intFromEnum(BuiltinId.file_setvbuf)] = 1;
+        t[@intFromEnum(BuiltinId.file_seek)] = 3;
+        t[@intFromEnum(BuiltinId.file_write)] = 4;
+        t[@intFromEnum(BuiltinId.os_remove)] = 3;
+        t[@intFromEnum(BuiltinId.os_rename)] = 3;
+        t[@intFromEnum(BuiltinId.math_random)] = 1;
+        t[@intFromEnum(BuiltinId.math_randomseed)] = 2;
+        t[@intFromEnum(BuiltinId.pairs)] = 4;
+        t[@intFromEnum(BuiltinId.ipairs)] = 3;
+        t[@intFromEnum(BuiltinId.pairs_iter)] = 2;
+        t[@intFromEnum(BuiltinId.ipairs_iter)] = 2;
+        t[@intFromEnum(BuiltinId.coroutine_running)] = 2;
+        t[@intFromEnum(BuiltinId.pcall)] = 256;
+        t[@intFromEnum(BuiltinId.xpcall)] = 256;
+        t[@intFromEnum(BuiltinId.coroutine_resume)] = 8;
+        t[@intFromEnum(BuiltinId.coroutine_yield)] = 8;
+        t[@intFromEnum(BuiltinId.coroutine_close)] = 2;
+        t[@intFromEnum(BuiltinId.coroutine_wrap_iter)] = 256;
+        t[@intFromEnum(BuiltinId.next)] = 2;
+        t[@intFromEnum(BuiltinId.dofile)] = 16;
+        t[@intFromEnum(BuiltinId.testc_testC)] = 256;
+        t[@intFromEnum(BuiltinId.testc_makecfunc)] = 1;
+        t[@intFromEnum(BuiltinId.testc_allowhookyield)] = 0;
+        t[@intFromEnum(BuiltinId.testc_totalmem)] = 3;
+        t[@intFromEnum(BuiltinId.testc_alloccount)] = 1;
+        t[@intFromEnum(BuiltinId.testc_stats)] = 1;
+        t[@intFromEnum(BuiltinId.testc_querytab)] = 3;
+        t[@intFromEnum(BuiltinId.testc_gcstate)] = 1;
+        t[@intFromEnum(BuiltinId.loadfile)] = 2;
+        t[@intFromEnum(BuiltinId.load)] = 2;
+        t[@intFromEnum(BuiltinId.require)] = 2;
+        t[@intFromEnum(BuiltinId.package_searchpath)] = 2;
+        t[@intFromEnum(BuiltinId.setmetatable)] = 1;
+        t[@intFromEnum(BuiltinId.getmetatable)] = 1;
+        t[@intFromEnum(BuiltinId.debug_getinfo)] = 1;
+        t[@intFromEnum(BuiltinId.debug_getlocal)] = 2;
+        t[@intFromEnum(BuiltinId.debug_setlocal)] = 1;
+        t[@intFromEnum(BuiltinId.debug_getupvalue)] = 2;
+        t[@intFromEnum(BuiltinId.debug_setupvalue)] = 1;
+        t[@intFromEnum(BuiltinId.debug_upvaluejoin)] = 0;
+        t[@intFromEnum(BuiltinId.debug_gethook)] = 3;
+        t[@intFromEnum(BuiltinId.debug_sethook)] = 0;
+        t[@intFromEnum(BuiltinId.debug_getuservalue)] = 2;
+        t[@intFromEnum(BuiltinId.debug_setuservalue)] = 1;
+        t[@intFromEnum(BuiltinId.debug_debug)] = 0;
+        t[@intFromEnum(BuiltinId.math_type)] = 1;
+        t[@intFromEnum(BuiltinId.math_modf)] = 2;
+        t[@intFromEnum(BuiltinId.math_frexp)] = 2;
+        t[@intFromEnum(BuiltinId.math_min)] = 1;
+        t[@intFromEnum(BuiltinId.math_max)] = 1;
+        t[@intFromEnum(BuiltinId.math_floor)] = 1;
+        t[@intFromEnum(BuiltinId.string_len)] = 1;
+        t[@intFromEnum(BuiltinId.string_char)] = 1;
+        t[@intFromEnum(BuiltinId.string_sub)] = 1;
+        t[@intFromEnum(BuiltinId.string_gsub)] = 2;
+        t[@intFromEnum(BuiltinId.string_gmatch)] = 1;
+        t[@intFromEnum(BuiltinId.string_gmatch_iter)] = 10;
+        t[@intFromEnum(BuiltinId.utf8_char)] = 1;
+        t[@intFromEnum(BuiltinId.utf8_len)] = 2;
+        t[@intFromEnum(BuiltinId.utf8_offset)] = 2;
+        t[@intFromEnum(BuiltinId.utf8_codes)] = 3;
+        t[@intFromEnum(BuiltinId.utf8_codes_iter)] = 2;
+        t[@intFromEnum(BuiltinId.utf8_codes_iter_ns)] = 2;
+        t[@intFromEnum(BuiltinId.string_dump)] = 1;
+        t[@intFromEnum(BuiltinId.string_rep)] = 1;
+        t[@intFromEnum(BuiltinId.table_insert)] = 0;
+        t[@intFromEnum(BuiltinId.table_sort)] = 0;
+        break :blk t;
+    };
+
+    /// Pre-size the outs window for a builtin call. Fixed counts come from
+    /// the comptime table above (one inlined load); dynamic counts fall
+    /// through to the out-of-line switch. Inline so the hot OP_CALL sites
+    /// pay only the table load for fixed-count builtins (PUC pays nothing
+    /// here — its C stack is the outs window; this is the minimal luazig
+    /// analogue of that invariant).
+    inline fn builtinOutLen(self: *Vm, id: BuiltinId, call_args: []const Value) usize {
+        const fixed = builtin_const_out_len[@intFromEnum(id)];
+        if (fixed) |n| return n;
+        return self.builtinOutLenDynamic(id, call_args);
+    }
+
+    /// Argument-dependent out-counts — the ONLY builtins whose outs window
+    /// must be sized from the call arguments. Every case here must be null
+    /// in builtin_const_out_len (see its doc comment for the contract).
+    fn builtinOutLenDynamic(self: *Vm, id: BuiltinId, call_args: []const Value) usize {
         return switch (id) {
-            .print => 0,
-            .warn => 0,
-            .@"error" => 0,
-            .io_write, .io_stderr_write => 1,
-            .io_close, .file_close => 3,
-            .io_open, .io_popen, .io_tmpfile => 3,
-            .os_execute => 3,
-            .os_exit => 0,
-            .io_read, .file_read => 8,
             .io_lines => blk: {
                 if (call_args.len > 0 and call_args[0] == .String) break :blk 4;
                 break :blk 3;
             },
-            .file_lines => 3,
             .io_lines_iter => blk: {
                 if (call_args.len == 0 or call_args[0] != .Table) break :blk 8;
                 const it = call_args[0].Table;
@@ -42761,18 +42908,6 @@ pub const Vm = struct {
                     0;
                 break :blk if (n == 0) 1 else n;
             },
-            .io_flush, .file_flush, .file_setvbuf => 1,
-            .file_seek => 3,
-            .file_write => 4,
-            .os_remove, .os_rename => 3,
-
-            .math_random => 1,
-            .math_randomseed => 2,
-            .pairs => 4,
-            .ipairs => 3,
-            .pairs_iter, .ipairs_iter => 2,
-            .coroutine_running => 2,
-
             .assert => call_args.len,
             .select => blk: {
                 if (call_args.len == 0) break :blk 0;
@@ -42793,44 +42928,6 @@ pub const Vm = struct {
                     else => break :blk 0,
                 }
             },
-            .pcall, .xpcall => 256,
-            .coroutine_resume => 8,
-            .coroutine_yield => 8,
-            .coroutine_close => 2,
-            .coroutine_wrap_iter => 256,
-            .next => 2,
-            .dofile => 16,
-            .testc_testC => 256,
-            .testc_makecfunc => 1,
-            .testc_allowhookyield => 0,
-            .testc_totalmem => 3,
-            .testc_alloccount => 1,
-            .testc_stats => 1,
-            .testc_querytab => 3,
-            .testc_gcstate => 1,
-            .loadfile, .load => 2,
-            .require => 2,
-            .package_searchpath => 2,
-            .setmetatable, .getmetatable => 1,
-            .debug_getinfo => 1,
-            .debug_getlocal => 2,
-            .debug_setlocal => 1,
-            .debug_getupvalue => 2,
-            .debug_setupvalue => 1,
-            .debug_upvaluejoin => 0,
-            .debug_gethook => 3,
-            .debug_sethook => 0,
-            .debug_getuservalue => 2,
-            .debug_setuservalue => 1,
-            .debug_debug => 0,
-            .math_type => 1,
-            .math_modf => 2,
-            .math_frexp => 2,
-            .math_min => 1,
-            .math_max => 1,
-            .math_floor => 1,
-            .string_len => 1,
-            .string_char => 1,
             .string_byte => blk: {
                 if (call_args.len == 0 or call_args[0] != .String) break :blk 1;
                 const s = call_args[0].String;
@@ -42844,21 +42941,16 @@ pub const Vm = struct {
                 if (start_idx > end_idx or start_idx > len) break :blk 0;
                 break :blk @intCast(end_idx - start_idx + 1);
             },
-            .string_sub => 1,
             .string_find => blk: {
                 if (call_args.len < 2 or call_args[1] != .String) break :blk 2;
                 const caps = estimatePatternCaptureCount(call_args[1].String.bytes());
                 break :blk 2 + caps;
             },
-            .string_gsub => 2,
-            .string_gmatch => 1,
-            .string_gmatch_iter => 10,
             .string_match => blk: {
                 if (call_args.len < 2 or call_args[1] != .String) break :blk 1;
                 const caps = estimatePatternCaptureCount(call_args[1].String.bytes());
                 break :blk if (caps == 0) 1 else caps;
             },
-            .utf8_char => 1,
             .utf8_codepoint => blk: {
                 if (call_args.len == 0 or call_args[0] != .String) break :blk 1;
                 const s = call_args[0].String;
@@ -42881,10 +42973,6 @@ pub const Vm = struct {
                 if (i < 1 or j < 1 or i > len or j > len or i > j) break :blk 0;
                 break :blk @intCast(j - i + 1);
             },
-            .utf8_len => 2,
-            .utf8_offset => 2,
-            .utf8_codes => 3,
-            .utf8_codes_iter, .utf8_codes_iter_ns => 2,
             .string_unpack => blk: {
                 if (call_args.len == 0 or call_args[0] != .String) break :blk 2;
                 const fmt = call_args[0].String.bytes();
@@ -42917,10 +43005,6 @@ pub const Vm = struct {
                 }
                 break :blk nvals + 1; // include next-position result
             },
-            .string_dump => 1,
-            .string_rep => 1,
-            .table_insert => 0,
-            .table_sort => 0,
             .table_unpack => blk: {
                 if (call_args.len == 0 or call_args[0] != .Table) break :blk 0;
                 const tbl = call_args[0].Table;
@@ -42956,7 +43040,9 @@ pub const Vm = struct {
                 break :blk @intCast(count_i128);
             },
 
-            // Most builtins return a single value.
+            // Unlisted builtins return a single value (the old switch's
+            // default; only reachable for a null table entry without a
+            // case above — see builtin_const_out_len's contract).
             else => 1,
         };
     }

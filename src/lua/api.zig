@@ -801,11 +801,14 @@ pub const State = struct {
             // Push the error object onto the stack (PUC luaD_seterrorobj).
             // apiCloseConventionalPcallBoundary already replaced err_obj
             // with the final closer error when a closer errored.
-            const errval: vm_mod.Value = if (self.vm.err_has_obj) self.vm.err_obj else .Nil;
+            // P16.36 Cut 1b: the pcall'd call raised on the active
+            // thread (same-thread protected call) — read its error state
+            // directly.
+            const errval: vm_mod.Value = if (th.err_has_obj) th.err_obj else .Nil;
             self.stack.append(self.vm.alloc, errval) catch return .memory_error;
             // PUC: status is LUA_ERRERR (5) if the message handler errored,
             // LUA_ERRRUN (2) otherwise.
-            return if (self.vm.err_is_errerr) .error_handler_error else .runtime_error;
+            return if (th.err_is_errerr) .error_handler_error else .runtime_error;
         };
         defer self.vm.alloc.free(ret);
 

@@ -2224,7 +2224,50 @@ pub const Thread = struct {
     /// error, before frames are cleared). Null for suspended threads —
     /// their traceback is built lazily from retained call_frames.
     /// Replaces the old eager [64]?[]const u8 per-yield snapshot.
-    err_traceback: ?[]const u8 = null,
+    /// (P16.36 Cut 1b: renamed from `err_traceback` — that name now
+    /// belongs to the in-flight error traceback below.)
+    err_dead_traceback: ?[]const u8 = null,
+
+    /// Per-thread in-flight error state (P16.36 Cut 1b, moved from Vm).
+    /// PUC keeps the error identity on the RAISING lua_State: the error
+    /// object sits on the raising L's stack (luaG_errormsg → luaD_throw
+    /// carries it up that L's protected boundaries), and at a resume
+    /// failure luaD_seterrorobj COPIES it onto the CALLER's stack
+    /// (ldo.c:983-988) — the ownership never silently hops threads.
+    /// luazig mirrors this: every raise lands on the raising thread
+    /// (Vm.errThread() == the active bytecode thread at raise time),
+    /// cross-thread boundaries read the raising thread's state directly
+    /// (builtinCoroutineResume's tails, c_api lua_resume), and a fresh
+    /// resume entry clears the target's stale state (a recovered error
+    /// leaves nothing in flight — PUC has no residual error state at a
+    /// resume entry). This removes the old Vm-global fields and their
+    /// save/restore ceremony at coroutine boundaries by construction.
+    /// Cold-path only (raise/recover/report); never read on dispatch
+    /// hot paths.
+    err_obj: Value = .Nil,
+    err_has_obj: bool = false,
+    /// P15.83q: C-frame residue of the raising builtin (PUC lbaselib
+    /// luaB_error, level >= 1 with a string argument): the ORIGINAL
+    /// argument string remains on the error() C-frame BELOW the built
+    /// message. At a lua_resume error boundary, PUC's visible window is
+    /// that whole C-frame area; this field transcribes the `orig` slot.
+    err_cframe_residue: ?Value = null,
+    /// PUC LUA_ERRERR signal (luaD_rawrunprotected, ldo.c): set by
+    /// invokeErrfunc when the message handler itself errors. Reset to
+    /// false at every error-throw site BEFORE invokeErrfunc.
+    err_is_errerr: bool = false,
+    /// Source chunk name / line of the fault point (for message
+    /// building at raise time; borrowed from the raising frame's proto).
+    err_source: ?[]const u8 = null,
+    err_line: i64 = -1,
+    /// Traceback captured at the FAULT point (captureErrorTraceback):
+    /// the frames die during unwind, so the text is latched here while
+    /// they are intact. Consumed by the message handler window
+    /// (builtinDebugTraceback reuse) and the CLI report; freed at every
+    /// recovery boundary (clearErrorTraceback) and at thread teardown
+    /// (freeThreadWrapBuffers). Distinct from err_dead_traceback above
+    /// (that one is the P16.28 dead-thread replay artifact).
+    err_traceback: ?[]u8 = null,
     pending_close_builtin: bool = false,
     pending_close_builtin_obj: Value = .Nil,
     pending_close_err_active: bool = false,
@@ -4318,35 +4361,23 @@ pub const Vm = struct {
     /// 32 values fall back to the heap-allocated slow path.
     bc_return_scratch: [1]Value = .{.Nil},
 
+    /// Raw in-flight error message view (P16.36 Cut 1b: the ONLY error
+    /// state that stays on the Vm — a scratch view into `err_buf`,
+    /// written at raise time alongside the raising thread's err_obj).
+    /// The semantic error identity (object, residue, status signal,
+    /// source, traceback) lives on the raising Thread (see
+    /// Thread.err_obj). This view is best-effort: a nested resume's
+    /// internal raises can overwrite it while an outer error is in
+    /// flight (the old resume bundle's slice-restore was already
+    /// unsound for the same reason — it restored a slice over mutated
+    /// err_buf bytes); consumers that need the exact object read
+    /// Thread.err_obj.
     err: ?[]const u8 = null,
-    err_obj: Value = .Nil,
-    err_has_obj: bool = false,
-    /// P15.83q: C-frame residue of the raising builtin (PUC lbaselib
-    /// luaB_error, level >= 1 with a string argument): luaB_error pushes
-    /// `luaL_where` + a copy of the argument and concatenates them, so the
-    /// ORIGINAL argument string remains on the error() C-frame BELOW the
-    /// built message. At a lua_resume error boundary, PUC's visible window
-    /// is that whole C-frame area: [orig, prefixed-msg, prefixed-msg-dup]
-    /// (luaD_seterrorobj duplicates top-1). This field transcribes the
-    /// `orig` slot: set by error()/assert() when they prefix a string
-    /// message, snapshotted onto the failing thread by
-    /// builtinCoroutineResume's error tail, exposed by c_api lua_resume as
-    /// the window's leading slot. Save/restored alongside the other err_*
-    /// fields at every protected boundary (pcall/xpcall/resume), so a
-    /// recovered error never leaks a stale residue into a later window.
-    err_cframe_residue: ?Value = null,
-    /// PUC LUA_ERRERR signal (PUC luaD_rawrunprotected in ldo.c): set by
-    /// invokeErrfunc when the message handler itself errors, signalling that
-    /// the error status should be LUA_ERRERR (5) instead of LUA_ERRRUN (2).
-    /// Reset to false at every error-throw site BEFORE invokeErrfunc so fresh
-    /// errors start as LUA_ERRRUN. Read by status-determination sites (pcall
-    /// catch, precover, lua_resume, lua_pcallk) to pick the correct status.
-    err_is_errerr: bool = false,
+    /// Raise-time scratch buffers (message building / rendering).
+    /// Vm-owned because they are pure scratch: no recovery or boundary
+    /// semantics depends on their contents surviving a thread switch.
     err_buf: [2048]u8 = undefined,
     err_render_buf: [512]u8 = undefined,
-    err_source: ?[]const u8 = null,
-    err_line: i64 = -1,
-    err_traceback: ?[]u8 = null,
     oom_context: ?[]const u8 = null,
     oom_table_array_len: usize = 0,
     oom_table_array_capacity: usize = 0,
@@ -4877,6 +4908,20 @@ pub const Vm = struct {
     /// active thread's TBC-chain snapshot at pcall entry).
     pub fn activeBytecodeThread(self: *Vm) *Thread {
         return self.current_thread orelse self.main_thread.?;
+    }
+
+    /// The thread that owns the in-flight error state: the active
+    /// bytecode thread, i.e. the RAISING thread at every raise/recovery
+    /// site (PUC: the error identity lives on the raising lua_State's
+    /// stack — see Thread.err_obj). Cold-path only (raise, recovery,
+    /// report, debug); never use on dispatch hot paths. Cross-thread
+    /// boundary readers (builtinCoroutineResume's tails, c_api
+    /// lua_resume) hold the raising thread directly and must NOT use
+    /// this accessor — after a runtime switch-back it would resolve to
+    /// the caller. pub for the C-API layer (c_api rethrow bridges read
+    /// the just-raised error of the current thread).
+    pub fn errThread(self: *Vm) *Thread {
+        return self.activeBytecodeThread();
     }
 
     /// P15.78: Set the error handler function (PUC `L->errfunc`).
@@ -5489,7 +5534,10 @@ pub const Vm = struct {
             };
         }
         self.open_processes.deinit(self.alloc);
-        if (self.err_traceback) |tb| self.alloc.free(tb);
+        // P16.36 Cut 1b: the old Vm-teardown free of the (then Vm-global)
+        // err_traceback is deleted — the traceback is thread-owned now and
+        // freeThreadWrapBuffers releases it for EVERY thread during
+        // drainGcRegistries below (main thread included).
         // Note: string_intern.deinit is deferred to AFTER drainGcRegistries,
         // because gcFreeObject for short strings calls string_intern.table.remove.
         self.long_literals.deinit(self.alloc);
@@ -6348,8 +6396,8 @@ pub const Vm = struct {
                     warn_buf.append(self.alloc, ')') catch return;
                     self.warnfHandler(warn_buf.items, false) catch {};
                     self.err = null;
-                    self.err_has_obj = false;
-                    self.err_obj = .Nil;
+                    self.errThread().err_has_obj = false;
+                    self.errThread().err_obj = .Nil;
                 },
                 else => return,
             };
@@ -6463,7 +6511,7 @@ pub const Vm = struct {
     /// bypasses the message handler; its object is the bare "error in error
     /// handling" string) — printed as-is, no traceback, like PUC.
     pub fn formatCliError(self: *Vm, alloc: std.mem.Allocator) Error![]u8 {
-        const err_obj: Value = if (self.err_has_obj) self.err_obj else blk: {
+        const err_obj: Value = if (self.errThread().err_has_obj) self.errThread().err_obj else blk: {
             const s = self.internStr(self.errorString()) catch return error.OutOfMemory;
             break :blk .{ .String = s };
         };
@@ -6482,7 +6530,7 @@ pub const Vm = struct {
     /// PUC's `luaL_traceback(L, L, msg, 1)` which prepends `msg\n` before
     /// the stack traceback.
     fn formatErrorWithTraceback(self: *Vm, alloc: std.mem.Allocator, msg: []const u8) std.mem.Allocator.Error![]u8 {
-        if (self.err_traceback) |tb| {
+        if (self.errThread().err_traceback) |tb| {
             return std.fmt.allocPrint(alloc, "{s}\n{s}", .{ msg, tb });
         }
         return alloc.dupe(u8, msg);
@@ -6502,8 +6550,8 @@ pub const Vm = struct {
         // not at pcall recovery time. If err_obj doesn't have a prefix, it's
         // because the error was created without one (e.g. error(msg, 0) or
         // a C function error with currentline=-1).
-        if (self.err_has_obj) {
-            return self.err_obj;
+        if (self.errThread().err_has_obj) {
+            return self.errThread().err_obj;
         }
         // Fallback: err_obj not set (e.g. C-level error before err_obj was
         // populated). Reconstruct from the diagnostic message.
@@ -6511,8 +6559,8 @@ pub const Vm = struct {
     }
 
     fn clearErrorTraceback(self: *Vm) void {
-        if (self.err_traceback) |tb| self.alloc.free(tb);
-        self.err_traceback = null;
+        if (self.errThread().err_traceback) |tb| self.alloc.free(tb);
+        self.errThread().err_traceback = null;
     }
 
     fn appendFmt(alloc: std.mem.Allocator, out: anytype, comptime fmt: []const u8, args: anytype) std.mem.Allocator.Error!void {
@@ -6676,7 +6724,7 @@ pub const Vm = struct {
         // PUC shows [C]: in ? as the final frame (from pushfuncname's
         // fallback for C functions without a name).
         w.writeAll("\t[C]: in ?") catch return;
-        self.err_traceback = aw.toOwnedSlice() catch null;
+        self.errThread().err_traceback = aw.toOwnedSlice() catch null;
     }
 
     /// P16.24 T6-adjacent: PUC luaG_runerror position semantics — bake
@@ -6694,14 +6742,14 @@ pub const Vm = struct {
             break :blk !th.call_frames.topConstPtr().isC();
         };
         if (top_is_lua) return self.fail(fmt, args);
-        self.err_is_errerr = false;
+        self.errThread().err_is_errerr = false;
         var tmp: [2048]u8 = undefined;
         const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
-        self.err_source = null;
-        self.err_line = -1;
-        self.err_obj = .{ .String = try self.internStr(self.err.?) };
-        self.err_has_obj = true;
+        self.errThread().err_source = null;
+        self.errThread().err_line = -1;
+        self.errThread().err_obj = .{ .String = try self.internStr(self.err.?) };
+        self.errThread().err_has_obj = true;
         self.captureErrorTraceback();
         try self.invokeErrfunc();
         return error.RuntimeError;
@@ -6753,7 +6801,7 @@ pub const Vm = struct {
 
     noinline fn failWithPosFrame(self: *Vm, pos_frame: ?*const Frame, comptime fmt: []const u8, args: anytype) Error {
         // Fresh error: reset LUA_ERRERR signal before invokeErrfunc.
-        self.err_is_errerr = false;
+        self.errThread().err_is_errerr = false;
         // PUC Lua error messages can be long — e.g. `require`'s "module not
         // found" message lists every searched path (path + cpath), which can
         // exceed 512 bytes with the full default LUA_PATH_DEFAULT. Use a
@@ -6776,8 +6824,8 @@ pub const Vm = struct {
             // fail() from a C frame reads the parent Lua frame parked at
             // the CALL that entered C. No per-instruction sync exists.
             // P15.51n: current_line derived from proto.lineinfo[pc].
-            self.err_source = fr.sourceName();
-            self.err_line = self.frameCurrentLine(fr);
+            self.errThread().err_source = fr.sourceName();
+            self.errThread().err_line = self.frameCurrentLine(fr);
             // PUC luaG_runerror → luaG_addinfo: bake "source:line: " prefix
             // into the error message at creation time. The error object
             // (err_obj) is the full "source:line: msg" string, matching
@@ -6786,26 +6834,26 @@ pub const Vm = struct {
             // A NULL source (empty source_name — a stripped proto, which
             // has no line info either) takes PUC's luaG_addinfo NULL branch:
             // "?:?: msg" (same condition as protectedErrorString below).
-            const src = self.err_source.?;
-            const null_source = (src.len == 0 or std.mem.eql(u8, src, "=?")) and self.err_line < 1;
+            const src = self.errThread().err_source.?;
+            const null_source = (src.len == 0 or std.mem.eql(u8, src, "=?")) and self.errThread().err_line < 1;
             const full = if (null_source)
                 std.fmt.allocPrint(self.alloc, "?:?: {s}", .{msg}) catch msg
             else blk: {
                 var id_buf: [59]u8 = undefined;
                 const chunk = diag.chunkId(id_buf[0..], src);
-                const line = self.err_line;
+                const line = self.errThread().err_line;
                 break :blk if (line >= 1)
                     std.fmt.allocPrint(self.alloc, "{s}:{d}: {s}", .{ chunk, line, msg }) catch msg
                 else
                     std.fmt.allocPrint(self.alloc, "{s}:?: {s}", .{ chunk, msg }) catch msg;
             };
-            self.err_obj = .{ .String = self.internStrAssume(full) };
-            self.err_has_obj = true;
+            self.errThread().err_obj = .{ .String = self.internStrAssume(full) };
+            self.errThread().err_has_obj = true;
         } else {
-            self.err_source = null;
-            self.err_line = -1;
-            self.err_obj = .{ .String = try self.internStr(self.err.?) };
-            self.err_has_obj = true;
+            self.errThread().err_source = null;
+            self.errThread().err_line = -1;
+            self.errThread().err_obj = .{ .String = try self.internStr(self.err.?) };
+            self.errThread().err_has_obj = true;
         }
         self.captureErrorTraceback();
         try self.invokeErrfunc();
@@ -6821,15 +6869,15 @@ pub const Vm = struct {
     /// before the handler runs, not after `fail` returns.
     fn failC(self: *Vm, comptime fmt: []const u8, args: anytype) Error {
         // Fresh error: reset LUA_ERRERR signal before invokeErrfunc.
-        self.err_is_errerr = false;
+        self.errThread().err_is_errerr = false;
         var tmp: [2048]u8 = undefined;
         const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
-        self.err_obj = .{ .String = try self.internStr(self.err.?) };
-        self.err_has_obj = true;
+        self.errThread().err_obj = .{ .String = try self.internStr(self.err.?) };
+        self.errThread().err_has_obj = true;
         // No source location for C-function errors (PUC skips luaG_addinfo).
-        self.err_source = null;
-        self.err_line = -1;
+        self.errThread().err_source = null;
+        self.errThread().err_line = -1;
         self.captureErrorTraceback();
         try self.invokeErrfunc();
         return error.RuntimeError;
@@ -6843,15 +6891,15 @@ pub const Vm = struct {
     /// add source location to the error object.
     fn failLib(self: *Vm, comptime fmt: []const u8, args: anytype) Error {
         // Fresh error: reset LUA_ERRERR signal before invokeErrfunc.
-        self.err_is_errerr = false;
+        self.errThread().err_is_errerr = false;
         var tmp: [2048]u8 = undefined;
         const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
-        self.err_obj = .{ .String = try self.internStr(self.err.?) };
-        self.err_has_obj = true;
+        self.errThread().err_obj = .{ .String = try self.internStr(self.err.?) };
+        self.errThread().err_has_obj = true;
         // PUC luaL_error: no source prefix (luaG_addinfo not called).
-        self.err_source = null;
-        self.err_line = -1;
+        self.errThread().err_source = null;
+        self.errThread().err_line = -1;
         self.captureErrorTraceback();
         try self.invokeErrfunc();
         return error.RuntimeError;
@@ -7040,7 +7088,7 @@ pub const Vm = struct {
         // The handler receives the RAW error object (PUC passes the object
         // before any nil normalization; `error(nil)` hands nil to the
         // handler, only the protected RESULT becomes "<no error object>").
-        var emsg: Value = if (self.err_has_obj) self.err_obj else .Nil;
+        var emsg: Value = if (self.errThread().err_has_obj) self.errThread().err_obj else .Nil;
         var handler_roots = self.gcTempRoots();
         defer handler_roots.end();
         try handler_roots.add(emsg);
@@ -7078,7 +7126,7 @@ pub const Vm = struct {
                 // PUC luaG_errormsg recursion: the handler's own error object
                 // goes through luaG_errormsg again — retry the handler with
                 // the new (raw) error object.
-                emsg = if (self.err_has_obj) self.err_obj else .Nil;
+                emsg = if (self.errThread().err_has_obj) self.errThread().err_obj else .Nil;
                 try handler_roots.add(emsg);
                 continue;
             };
@@ -7089,16 +7137,16 @@ pub const Vm = struct {
             if (value == .Nil) {
                 value = .{ .String = try self.internStr("<no error object>") };
             }
-            self.err_obj = value;
+            self.errThread().err_obj = value;
             self.err = if (value == .String) value.String.bytes() else null;
-            self.err_has_obj = true;
+            self.errThread().err_has_obj = true;
             // PUC bakes the position prefix into the error message only at
             // the ORIGINAL raise (luaG_addinfo in luaG_runerror/luaB_error).
             // The handler's result is the final object — the pending
             // position (err_source/err_line) must NOT be re-applied to it
             // when the error crosses a protected/coroutine boundary.
-            self.err_source = null;
-            self.err_line = -1;
+            self.errThread().err_source = null;
+            self.errThread().err_line = -1;
             return;
         }
     }
@@ -7114,22 +7162,22 @@ pub const Vm = struct {
     /// pcall/xpcall boundary returns "error in error handling" without
     /// re-running message handlers on it.
     fn raiseErrerr(self: *Vm) Error {
-        self.err_is_errerr = true;
+        self.errThread().err_is_errerr = true;
         self.err = "error in error handling";
-        self.err_obj = .{ .String = self.internStrAssume("error in error handling") };
-        self.err_has_obj = true;
-        self.err_source = null;
-        self.err_line = -1;
+        self.errThread().err_obj = .{ .String = self.internStrAssume("error in error handling") };
+        self.errThread().err_has_obj = true;
+        self.errThread().err_source = null;
+        self.errThread().err_line = -1;
         self.clearErrorTraceback();
         return error.RuntimeError;
     }
 
     fn setOutOfMemoryError(self: *Vm) void {
         // Fresh error: reset LUA_ERRERR signal.
-        self.err_is_errerr = false;
+        self.errThread().err_is_errerr = false;
         self.err = "not enough memory";
-        self.err_obj = .{ .String = self.internStrAssume("not enough memory") };
-        self.err_has_obj = true;
+        self.errThread().err_obj = .{ .String = self.internStrAssume("not enough memory") };
+        self.errThread().err_has_obj = true;
         if (stdio.activeEnviron().containsConstant("LUAZIG_TRACE_OOM")) {
             if (self.oom_context) |ctx| {
                 std.debug.print("luazig oom: {s} array_len={} array_capacity={}\n", .{
@@ -7142,11 +7190,11 @@ pub const Vm = struct {
         // Use topLuaFrame() to skip C-frames (which don't have u.lua fields).
         if (self.topLuaFrame()) |fr| {
             // P15.51n: current_line derived from proto.lineinfo[pc].
-            self.err_source = fr.sourceName();
-            self.err_line = self.frameCurrentLine(fr);
+            self.errThread().err_source = fr.sourceName();
+            self.errThread().err_line = self.frameCurrentLine(fr);
         } else {
-            self.err_source = null;
-            self.err_line = -1;
+            self.errThread().err_source = null;
+            self.errThread().err_line = -1;
         }
         self.captureErrorTraceback();
     }
@@ -7328,7 +7376,7 @@ pub const Vm = struct {
 
     fn protectedErrorString(self: *Vm) []const u8 {
         const base = self.errorString();
-        if (self.err_source) |src| {
+        if (self.errThread().err_source) |src| {
             if (std.mem.indexOf(u8, base, ":") != null) return base;
             var tmp: [256]u8 = undefined;
             const base_copy = std.fmt.bufPrint(tmp[0..], "{s}", .{base}) catch base;
@@ -7337,13 +7385,13 @@ pub const Vm = struct {
             // luazig is the empty source_name (dumped stripped chunks);
             // requiring err_line < 1 keeps a real empty chunk name
             // (load(s, ""), which has lines) on the normal path below.
-            if ((src.len == 0 or std.mem.eql(u8, src, "=?")) and self.err_line < 1) {
+            if ((src.len == 0 or std.mem.eql(u8, src, "=?")) and self.errThread().err_line < 1) {
                 return std.fmt.bufPrint(self.err_render_buf[0..], "?:?: {s}", .{base_copy}) catch base;
             }
             // PUC luaG_addinfo uses luaO_chunkid to format the source name.
             var id_buf: [59]u8 = undefined;
             const chunk = diag.chunkId(id_buf[0..], src);
-            const line = self.err_line;
+            const line = self.errThread().err_line;
             if (line >= 1) {
                 return std.fmt.bufPrint(self.err_render_buf[0..], "{s}:{d}: {s}", .{ chunk, line, base_copy }) catch base;
             }
@@ -8096,16 +8144,20 @@ pub const Vm = struct {
     }
 
     fn saveBytecodeProtectedError(self: *Vm) BytecodeSavedError {
+        // P16.36 Cut 1b: the saved state is the ACTIVE thread's (pcall/
+        // xpcall are same-thread protected calls — the LIFO-slot emulation
+        // of PUC's stack discipline, where each protected call's error
+        // lands above the outer one's object).
         const th = self.activeBytecodeThread();
         var saved: BytecodeSavedError = .{
             .err_present = self.err != null,
             .err_len = 0,
             .err_bytes = undefined,
-            .err_obj = self.err_obj,
-            .err_has_obj = self.err_has_obj,
-            .err_source = self.err_source,
-            .err_line = self.err_line,
-            .err_traceback = self.err_traceback,
+            .err_obj = th.err_obj,
+            .err_has_obj = th.err_has_obj,
+            .err_source = th.err_source,
+            .err_line = th.err_line,
+            .err_traceback = th.err_traceback,
             .errfunc = th.errfunc,
         };
         if (self.err) |msg| {
@@ -8115,7 +8167,7 @@ pub const Vm = struct {
         }
         // The protected child owns any traceback it creates.  The caller's
         // traceback pointer stays parked in the continuation until completion.
-        self.err_traceback = null;
+        th.err_traceback = null;
         // PUC luaD_pcall: clear errfunc for the protected child — pcall
         // has no message handler. xpcall sets its own handler separately.
         th.errfunc = ERRFUNC_NONE;
@@ -8132,11 +8184,11 @@ pub const Vm = struct {
         } else {
             self.err = null;
         }
-        self.err_obj = saved.err_obj;
-        self.err_has_obj = saved.err_has_obj;
-        self.err_source = saved.err_source;
-        self.err_line = saved.err_line;
-        self.err_traceback = saved.err_traceback;
+        th.err_obj = saved.err_obj;
+        th.err_has_obj = saved.err_has_obj;
+        th.err_source = saved.err_source;
+        th.err_line = saved.err_line;
+        th.err_traceback = saved.err_traceback;
         th.errfunc = saved.errfunc;
     }
 
@@ -8267,7 +8319,7 @@ pub const Vm = struct {
         // coroutine, or __close boundary, so materialize that normalized value
         // before the frame carrying the location is popped. Non-string error
         // objects keep their original identity.
-        if (self.err_has_obj and self.err_obj != .String) return self.err_obj;
+        if (self.errThread().err_has_obj and self.errThread().err_obj != .String) return self.errThread().err_obj;
         return .{ .String = try self.internStr(self.protectedErrorString()) };
     }
 
@@ -8277,11 +8329,11 @@ pub const Vm = struct {
         // protected handler, or coroutine continuation runs must not discard
         // that pre-unwind stack. A caller that intentionally injects a fresh
         // error (for example coroutine.close with nil) clears it explicitly.
-        self.err_obj = value;
-        self.err_has_obj = true;
+        self.errThread().err_obj = value;
+        self.errThread().err_has_obj = true;
         self.err = if (value == .String) value.String.bytes() else null;
-        self.err_source = null;
-        self.err_line = -1;
+        self.errThread().err_source = null;
+        self.errThread().err_line = -1;
     }
 
     fn closeBytecodeUpvaluesFrom(self: *Vm, frame: *CallFrame, min_reg: u8) void {
@@ -10985,10 +11037,10 @@ pub const Vm = struct {
             // callee-region TBC entries were already closed by precover's
             // frame-pop loop (PUC closes them in finishpcallk's
             // luaF_close(func, status, yy=1) — same set, same order).
-            if (self.err_has_obj) {
+            if (self.errThread().err_has_obj) {
                 if (funcidx <= self.cur_c_stack.items.len) {
                     self.cur_c_stack.shrinkRetainingCapacity(funcidx);
-                    self.cur_c_stack.append(self.alloc, self.err_obj) catch {};
+                    self.cur_c_stack.append(self.alloc, self.errThread().err_obj) catch {};
                 }
             }
             // PUC: luaD_shrinkstack(L)
@@ -11086,7 +11138,7 @@ pub const Vm = struct {
         // LUA_ERRRUN = 2 (most common error status).
         // LUA_ERRERR = 5 (error in message handler — set by invokeErrfunc).
         // Stack overflow uses LUA_ERRRUN with a "stack overflow" message.
-        const err_status: u32 = if (self.err_is_errerr) 5 else 2;
+        const err_status: u32 = if (self.errThread().err_is_errerr) 5 else 2;
         fr.callstatus = setcistrecst(fr.callstatus, err_status);
         // P16.31 Cut 3: ONE region close at the recovering boundary — the
         // pcallk-entry snapshot [aux.pcallk.chain_base, len) = every mark
@@ -11100,8 +11152,8 @@ pub const Vm = struct {
         // finishCcall finds it; its c_stack is irrelevant for detached
         // entries, the fresh-empty install on resume is correct).
         {
-            const err_arg: ?Value = if (self.err_has_obj) self.err_obj else null;
-            const err_status_i: i32 = if (self.err_is_errerr) 5 else 2;
+            const err_arg: ?Value = if (self.errThread().err_has_obj) self.errThread().err_obj else null;
+            const err_status_i: i32 = if (self.errThread().err_is_errerr) 5 else 2;
             _ = try self.closeTbcRegion(
                 th,
                 fr.u.c.aux.pcallk.chain_base,
@@ -11247,12 +11299,12 @@ pub const Vm = struct {
                     // continues the recovery. PUC: the closeprotected error
                     // propagates out of the recovery.
                     const fe = final_err orelse cs.error_value orelse .Nil;
-                    self.err_obj = fe;
-                    self.err_has_obj = true;
+                    self.errThread().err_obj = fe;
+                    self.errThread().err_has_obj = true;
                     self.err = if (fe == .String) fe.String.bytes() else null;
-                    self.err_source = null;
-                    self.err_line = -1;
-                    self.err_is_errerr = cs.error_status == 5;
+                    self.errThread().err_source = null;
+                    self.errThread().err_line = -1;
+                    self.errThread().err_is_errerr = cs.error_status == 5;
                     self.alloc.destroy(cs);
                     fr.u.c.clsret_state = null;
                     fr.clearClsret();
@@ -11312,9 +11364,9 @@ pub const Vm = struct {
             // park captured by the -1 error arm below is stale/empty).
             // Real C frames (c_api lua_pcallk: c_stack-relative funcidx,
             // parked stack) keep finishpcallk's PUC-faithful placement.
-            if (fr.u.c.testc_state != null and status != 1 and self.err_has_obj) {
+            if (fr.u.c.testc_state != null and status != 1 and self.errThread().err_has_obj) {
                 self.cur_c_stack.clearRetainingCapacity();
-                self.cur_c_stack.append(self.alloc, self.err_obj) catch return error.OutOfMemory;
+                self.cur_c_stack.append(self.alloc, self.errThread().err_obj) catch return error.OutOfMemory;
             }
         }
 
@@ -11458,19 +11510,19 @@ pub const Vm = struct {
                 stack_installed = false;
                 if (self.c_error_value) |cv| {
                     self.c_error_value = null;
-                    self.err_obj = cv;
-                    self.err_has_obj = true;
+                    self.errThread().err_obj = cv;
+                    self.errThread().err_has_obj = true;
                 }
                 // If c_error_value was null but err_has_obj is true,
                 // err_obj was already set by the error builtin.
-                if (!self.err_has_obj) {
-                    self.err_obj = .Nil;
-                    self.err_has_obj = true;
+                if (!self.errThread().err_has_obj) {
+                    self.errThread().err_obj = .Nil;
+                    self.errThread().err_has_obj = true;
                 }
-                const errval = self.err_obj;
+                const errval = self.errThread().err_obj;
                 self.err = if (errval == .String) errval.String.bytes() else null;
-                self.err_source = null;
-                self.err_line = -1;
+                self.errThread().err_source = null;
+                self.errThread().err_line = -1;
                 self.captureErrorTraceback();
                 return error.RuntimeError;
             }
@@ -12600,7 +12652,7 @@ pub const Vm = struct {
             recovery.target_depth == boundary_depth)
         {
             const th = self.activeBytecodeThread();
-            if (th.trace_yields > 0 and th.err_traceback == null) {
+            if (th.trace_yields > 0 and th.err_dead_traceback == null) {
                 var names: [64]?[]const u8 = undefined;
                 const cnt = self.buildSuspendedFrameNames(th, names[0..]);
                 if (cnt > 0) {
@@ -12612,7 +12664,7 @@ pub const Vm = struct {
                             aw.writer.writeAll("\tdb.lua: in function <db.lua>\n") catch break;
                         }
                     }
-                    th.err_traceback = aw.toOwnedSlice() catch null;
+                    th.err_dead_traceback = aw.toOwnedSlice() catch null;
                 }
             }
         }
@@ -19352,16 +19404,16 @@ pub const Vm = struct {
             .rawequal => try self.builtinRawequal(args, outs),
             .@"error" => {
                 // Fresh error: reset LUA_ERRERR signal before invokeErrfunc.
-                self.err_is_errerr = false;
+                self.errThread().err_is_errerr = false;
                 // P15.83q: fresh raise — no C-frame residue yet (only the
                 // string-prefix path below can set one).
-                self.err_cframe_residue = null;
+                self.errThread().err_cframe_residue = null;
                 if (args.len == 0 or args[0] == .Nil) {
                     self.err = null;
-                    self.err_obj = .Nil;
-                    self.err_has_obj = false;
-                    self.err_source = null;
-                    self.err_line = -1;
+                    self.errThread().err_obj = .Nil;
+                    self.errThread().err_has_obj = false;
+                    self.errThread().err_source = null;
+                    self.errThread().err_line = -1;
                     self.clearErrorTraceback();
                     // PUC luaB_error(nil) → luaG_errormsg: the message
                     // handler runs at the throw site with the RAW nil object
@@ -19406,7 +19458,7 @@ pub const Vm = struct {
                 // C-frame residue exposed at the lua_resume error boundary:
                 // [orig, msg, msg] (luaD_seterrorobj adds the dup).
                 if (args[0] == .String and level > 0)
-                    self.err_cframe_residue = args[0];
+                    self.errThread().err_cframe_residue = args[0];
                 if (location_frame) |fr_ptr| {
                     const fr = fr_ptr.*;
                     // P15.51n: current_line derived from proto.lineinfo[pc].
@@ -19431,20 +19483,20 @@ pub const Vm = struct {
                             @memcpy(self.err_buf[0..stable_len], msg_copy[0..stable_len]);
                             break :blk self.err_buf[0..stable_len];
                         };
-                        self.err_obj = .{ .String = try self.internStr(self.err.?) };
+                        self.errThread().err_obj = .{ .String = try self.internStr(self.err.?) };
                     } else {
                         // C function caller: no source prefix (PUC luaL_where
                         // pushes "" for currentline <= 0).
                         self.err = if (args[0] == .String) msg else null;
-                        self.err_obj = args[0];
+                        self.errThread().err_obj = args[0];
                     }
                 } else {
                     self.err = if (args[0] == .String) msg else null;
-                    self.err_obj = args[0];
+                    self.errThread().err_obj = args[0];
                 }
-                self.err_has_obj = true;
-                self.err_source = null;
-                self.err_line = -1;
+                self.errThread().err_has_obj = true;
+                self.errThread().err_source = null;
+                self.errThread().err_line = -1;
                 // fr.u.lua.pc is already current — no sync needed.
                 // Bytecode frames are in Thread.call_frames.
                 {
@@ -20272,7 +20324,7 @@ pub const Vm = struct {
     fn builtinAssert(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         self.last_builtin_out_count = 0;
         // P15.83q: fresh raise — no C-frame residue yet.
-        self.err_cframe_residue = null;
+        self.errThread().err_cframe_residue = null;
         if (args.len == 0) return self.fail("bad argument #1 to 'assert' (value expected)", .{});
         if (!isTruthy(args[0])) {
             // PUC luaB_assert (lbaselib.c): remove the condition, leave only
@@ -20296,32 +20348,32 @@ pub const Vm = struct {
                             @memcpy(self.err_buf[0..stable_len], msg_value.String.bytes()[0..stable_len]);
                             break :blk self.err_buf[0..stable_len];
                         };
-                        self.err_obj = .{ .String = try self.internStr(self.err.?) };
+                        self.errThread().err_obj = .{ .String = try self.internStr(self.err.?) };
                         // PUC leaves the unprefixed message below the built
                         // one on the C frame (luaB_error residue).
-                        self.err_cframe_residue = msg_value;
+                        self.errThread().err_cframe_residue = msg_value;
                     } else {
                         // C-function caller: luaL_where pushes "" — the built
                         // message equals the original, but the frame still
                         // holds the original below it.
                         self.err = msg_value.String.bytes();
-                        self.err_obj = msg_value;
-                        self.err_cframe_residue = msg_value;
+                        self.errThread().err_obj = msg_value;
+                        self.errThread().err_cframe_residue = msg_value;
                     }
                 } else {
                     self.err = msg_value.String.bytes();
-                    self.err_obj = msg_value;
-                    self.err_cframe_residue = msg_value;
+                    self.errThread().err_obj = msg_value;
+                    self.errThread().err_cframe_residue = msg_value;
                 }
             } else {
                 // Non-string message: luaB_error raises it as-is, no prefix,
                 // no residue.
                 self.err = null;
-                self.err_obj = msg_value;
+                self.errThread().err_obj = msg_value;
             }
-            self.err_has_obj = true;
-            self.err_source = null;
-            self.err_line = -1;
+            self.errThread().err_has_obj = true;
+            self.errThread().err_source = null;
+            self.errThread().err_line = -1;
             self.captureErrorTraceback();
             // PUC luaB_assert → luaB_error → luaG_errormsg: the message
             // handler (if armed) runs at the throw site, with assert's C
@@ -20647,10 +20699,10 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("pcall expects function", .{});
         if (self.activeProtectedCallDepth() >= 128) {
             self.err = "stack overflow error";
-            self.err_obj = .{ .String = try self.internStr("stack overflow error") };
-            self.err_has_obj = true;
-            self.err_source = null;
-            self.err_line = -1;
+            self.errThread().err_obj = .{ .String = try self.internStr("stack overflow error") };
+            self.errThread().err_has_obj = true;
+            self.errThread().err_source = null;
+            self.errThread().err_line = -1;
             self.captureErrorTraceback();
             if (outs.len > 0) {
                 outs[0] = .{ .Bool = false };
@@ -20734,29 +20786,29 @@ pub const Vm = struct {
 
         // Preserve error string; pcall should not permanently clobber it.
         const prev_err = self.err;
-        const prev_err_obj = self.err_obj;
-        const prev_err_has_obj = self.err_has_obj;
-        const prev_residue = self.err_cframe_residue;
-        const prev_err_source = self.err_source;
-        const prev_err_line = self.err_line;
-        const prev_err_traceback = self.err_traceback;
-        self.err_traceback = null;
+        const prev_err_obj = self.errThread().err_obj;
+        const prev_err_has_obj = self.errThread().err_has_obj;
+        const prev_residue = self.errThread().err_cframe_residue;
+        const prev_err_source = self.errThread().err_source;
+        const prev_err_line = self.errThread().err_line;
+        const prev_err_traceback = self.errThread().err_traceback;
+        self.errThread().err_traceback = null;
         defer {
             self.clearErrorTraceback();
             {
                 self.err = prev_err;
-                self.err_obj = prev_err_obj;
-                self.err_has_obj = prev_err_has_obj;
+                self.errThread().err_obj = prev_err_obj;
+                self.errThread().err_has_obj = prev_err_has_obj;
                 // P15.83q: PUC resets the stack at the pcall recovery point
                 // (luaD_throw lands with L->ci/L->top rolled back to the
                 // pcall frame) — the recovered error's C-frame residue dies
                 // with it. Restore ours the same way so a recovered error()
                 // never leaks a stale residue into a later error window.
-                self.err_cframe_residue = prev_residue;
-                self.err_source = prev_err_source;
-                self.err_line = prev_err_line;
+                self.errThread().err_cframe_residue = prev_residue;
+                self.errThread().err_source = prev_err_source;
+                self.errThread().err_line = prev_err_line;
             }
-            self.err_traceback = prev_err_traceback;
+            self.errThread().err_traceback = prev_err_traceback;
         }
 
         if (outs.len == 0) {
@@ -21000,10 +21052,10 @@ pub const Vm = struct {
             // fails inside the protected extent, so the armed message
             // handler sees this error too (luaG_runerror → luaG_errormsg).
             self.err = "stack overflow error";
-            self.err_obj = .{ .String = try self.internStr("stack overflow error") };
-            self.err_has_obj = true;
-            self.err_source = null;
-            self.err_line = -1;
+            self.errThread().err_obj = .{ .String = try self.internStr("stack overflow error") };
+            self.errThread().err_has_obj = true;
+            self.errThread().err_source = null;
+            self.errThread().err_line = -1;
             self.captureErrorTraceback();
             // PUC luaD_growstack: on overflow, grow stack to ERRORSTACKSIZE
             // (MAXSTACK + 200) so the error handler has room to run.
@@ -21070,26 +21122,26 @@ pub const Vm = struct {
         const call_args = args[2..];
 
         const prev_err = self.err;
-        const prev_err_obj = self.err_obj;
-        const prev_err_has_obj = self.err_has_obj;
-        const prev_residue = self.err_cframe_residue;
-        const prev_err_source = self.err_source;
-        const prev_err_line = self.err_line;
-        const prev_err_traceback = self.err_traceback;
-        self.err_traceback = null;
+        const prev_err_obj = self.errThread().err_obj;
+        const prev_err_has_obj = self.errThread().err_has_obj;
+        const prev_residue = self.errThread().err_cframe_residue;
+        const prev_err_source = self.errThread().err_source;
+        const prev_err_line = self.errThread().err_line;
+        const prev_err_traceback = self.errThread().err_traceback;
+        self.errThread().err_traceback = null;
         defer {
             self.clearErrorTraceback();
             {
                 self.err = prev_err;
-                self.err_obj = prev_err_obj;
-                self.err_has_obj = prev_err_has_obj;
+                self.errThread().err_obj = prev_err_obj;
+                self.errThread().err_has_obj = prev_err_has_obj;
                 // P15.83q: as in builtinPcall — a recovered error's C-frame
                 // residue dies at the recovery point (PUC stack reset).
-                self.err_cframe_residue = prev_residue;
-                self.err_source = prev_err_source;
-                self.err_line = prev_err_line;
+                self.errThread().err_cframe_residue = prev_residue;
+                self.errThread().err_source = prev_err_source;
+                self.errThread().err_line = prev_err_line;
             }
-            self.err_traceback = prev_err_traceback;
+            self.errThread().err_traceback = prev_err_traceback;
         }
 
         if (outs.len == 0) {
@@ -21305,10 +21357,10 @@ pub const Vm = struct {
             if (tmp.len > 1 and !(tmp[1] == .Nil)) {
                 if (tmp[1] == .String) return self.fail("{s}", .{tmp[1].String.bytes()});
                 self.err = null;
-                self.err_obj = tmp[1];
-                self.err_has_obj = true;
-                self.err_source = null;
-                self.err_line = -1;
+                self.errThread().err_obj = tmp[1];
+                self.errThread().err_has_obj = true;
+                self.errThread().err_source = null;
+                self.errThread().err_line = -1;
                 self.captureErrorTraceback();
                 return error.RuntimeError;
             }
@@ -21334,8 +21386,17 @@ pub const Vm = struct {
         // boundary is owned by the thread — release it at teardown.
         // (Every thread-reset path funnels through this fn via GC sweep
         // and Vm.deinit, so one free site covers all lifetimes.)
-        if (th.err_traceback) |tb| {
+        if (th.err_dead_traceback) |tb| {
             self.alloc.free(@constCast(tb));
+            th.err_dead_traceback = null;
+        }
+        // P16.36 Cut 1b: the in-flight fault traceback is thread-owned —
+        // release it at teardown too. Normal exits free it at the resume
+        // dead-defer / recovery boundaries; this is the safety net for
+        // threads that die while an error is still in flight (e.g. an
+        // uncaught error propagating out of a resume, a VM-wide abort).
+        if (th.err_traceback) |tb| {
+            self.alloc.free(tb);
             th.err_traceback = null;
         }
     }
@@ -21672,8 +21733,8 @@ pub const Vm = struct {
     }
 
     fn isStackOverflowRuntimeError(self: *Vm) bool {
-        if (self.err_has_obj and self.err_obj == .String) {
-            const s = self.err_obj.String;
+        if (self.errThread().err_has_obj and self.errThread().err_obj == .String) {
+            const s = self.errThread().err_obj.String;
             if (std.mem.indexOf(u8, s.bytes(), "C stack overflow") != null) return true;
             if (std.mem.indexOf(u8, s.bytes(), "stack overflow") != null) return true;
         }
@@ -21765,37 +21826,49 @@ pub const Vm = struct {
             th.capture_yield_id = 0;
         }
         defer {
+            // P16.36 Cut 1b: this defer runs AFTER the runtime switch-back
+            // defer below (LIFO), so current_thread is already the caller —
+            // read the dying thread's state DIRECTLY, never via errThread().
             if (th.status == .running) {
                 th.status = .dead;
-                th.api_status = if (self.err_is_errerr) 5 else 2; // LUA_ERRERR or LUA_ERRRUN
+                th.api_status = if (th.err_is_errerr) 5 else 2; // LUA_ERRERR or LUA_ERRRUN
+            }
+            // The target's fault traceback is only meaningful while its
+            // error is in flight (PUC: a traceback is consumed during the
+            // unwind/report; a dead thread's debug traceback is rebuilt
+            // live from its frozen stack — the P16.28 err_dead_traceback
+            // replay). Free it on every exit — success, yield, failure,
+            // and propagation alike (the old bundle defer's
+            // clearErrorTraceback did exactly this on the Vm-global).
+            if (th.err_traceback) |tb| {
+                self.alloc.free(tb);
+                th.err_traceback = null;
             }
         }
 
         th.yielded.deinit(self.alloc);
 
-        // Preserve error string; resume should not permanently clobber it.
-        const prev_err = self.err;
-        const prev_err_obj = self.err_obj;
-        const prev_err_has_obj = self.err_has_obj;
-        const prev_residue = self.err_cframe_residue;
-        const prev_err_source = self.err_source;
-        const prev_err_line = self.err_line;
-        const prev_err_traceback = self.err_traceback;
-        self.err_traceback = null;
-        // P15.83q: fresh resume — a residue from an earlier raise (e.g. an
-        // error() inside a pcall recovered in a previous resume) must not
-        // leak into this resume's error window.
-        self.err_cframe_residue = null;
-        defer {
-            self.clearErrorTraceback();
-            self.err = prev_err;
-            self.err_obj = prev_err_obj;
-            self.err_has_obj = prev_err_has_obj;
-            self.err_cframe_residue = prev_residue;
-            self.err_source = prev_err_source;
-            self.err_line = prev_err_line;
-            self.err_traceback = prev_err_traceback;
+        // P16.36 Cut 1b: fresh resume entry — clear the TARGET's stale
+        // error state. PUC has no residual error state at a resume entry:
+        // a recovered error inside the coroutine left its object as pcall
+        // return values (consumed), so nothing is in flight. The CALLER's
+        // error state lives on the caller thread and is untouched by
+        // construction — every raise inside this resume lands on `th`
+        // (current_thread == th for the whole body) — which deletes the
+        // old 7-field save/restore bundle and both of its leak vectors
+        // (stale label/state leaking into the caller's window, and the
+        // caller's in-flight state being clobbered by the target's
+        // raises).
+        if (th.err_traceback) |tb| {
+            self.alloc.free(tb);
+            th.err_traceback = null;
         }
+        th.err_obj = .Nil;
+        th.err_has_obj = false;
+        th.err_cframe_residue = null;
+        th.err_is_errerr = false;
+        th.err_source = null;
+        th.err_line = -1;
 
         const call_args = args[1..];
         // Builtin entrypoints (notably coroutine.create(pcall/xpcall)) need the
@@ -22021,7 +22094,7 @@ pub const Vm = struct {
                                 // C frames' TBC chain entries with the
                                 // in-flight error (PUC: one closeprotected
                                 // pass, last-error-wins), then discard.
-                                var close_err: ?Value = if (self.err_has_obj) self.err_obj else null;
+                                var close_err: ?Value = if (th.err_has_obj) th.err_obj else null;
                                 while (th.call_frames.len() > 0 and
                                     th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
                                 {
@@ -22230,7 +22303,7 @@ pub const Vm = struct {
                                 // C frames' TBC chain entries with the
                                 // in-flight error (PUC: one closeprotected
                                 // pass, last-error-wins), then discard.
-                                var close_err: ?Value = if (self.err_has_obj) self.err_obj else null;
+                                var close_err: ?Value = if (th.err_has_obj) th.err_obj else null;
                                 while (th.call_frames.len() > 0 and
                                     th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
                                 {
@@ -22486,11 +22559,15 @@ pub const Vm = struct {
         defer if (payload_heap) self.alloc.free(payload);
 
         if (forced_close_ok) {
+            // PUC luaE_resetthread on a successful forced close: the
+            // thread ends with LUA_OK — no error in flight. Clear the
+            // closed thread's state directly (still pre-defer, but th.
+            // is explicit per the boundary-reader rule).
             self.err = null;
-            self.err_obj = .Nil;
-            self.err_has_obj = false;
-            self.err_source = null;
-            self.err_line = -1;
+            th.err_obj = .Nil;
+            th.err_has_obj = false;
+            th.err_source = null;
+            th.err_line = -1;
         }
 
         if (!want_out) {
@@ -22512,19 +22589,20 @@ pub const Vm = struct {
 
         if (!ok) {
             outs[0] = .{ .Bool = false };
-            if (outs.len > 1) outs[1] = if (self.err_has_obj) self.err_obj else .{ .String = try self.internStr(self.errorString()) };
+            if (outs.len > 1) outs[1] = if (th.err_has_obj) th.err_obj else .{ .String = try self.internStr(self.errorString()) };
             self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
             th.yielded.deinit(self.alloc);
             th.trace_had_error = true;
             th.status = .dead;
-            th.api_status = if (self.err_is_errerr) 5 else 2; // LUA_ERRERR or LUA_ERRRUN
+            th.api_status = if (th.err_is_errerr) 5 else 2; // LUA_ERRERR or LUA_ERRRUN
             th.close_has_err = true;
-            th.close_err = if (self.err_has_obj) self.err_obj else .{ .String = try self.internStr(self.errorString()) };
+            th.close_err = if (th.err_has_obj) th.err_obj else .{ .String = try self.internStr(self.errorString()) };
             // P15.83q: snapshot the raising C-frame residue onto the thread
-            // (c_api lua_resume reads it AFTER this function restored the
-            // caller's vm error state). PUC's residue lives on the dead
-            // thread's frozen stack; ours lives here.
-            th.api_err_residue = self.err_cframe_residue;
+            // for c_api lua_resume (it reads the dead thread's state after
+            // this function returned and the runtime switched back to the
+            // caller). PUC's residue lives on the dead thread's frozen
+            // stack; ours lives here.
+            th.api_err_residue = th.err_cframe_residue;
             self.clearThreadContinuationScratch(th, .{});
             return;
         }
@@ -22673,26 +22751,17 @@ pub const Vm = struct {
         const prev_handle = self.cur_handle;
         const prev_c_stack = self.cur_c_stack;
         const saved_caller = th.caller;
-        // Save the caller's error channel. self.err always aliases
-        // self.err_buf[0..len] (fail/failRunerror), so the byte range is
-        // the exact save format. The traceback pointer moves to the save
-        // slot: the close owns whatever it captures (clearErrorTraceback
-        // inside would free a stale pointer otherwise).
-        var saved_err_bytes: [2048]u8 = undefined;
-        var saved_err_len: usize = 0;
-        const saved_err_present = self.err != null;
-        if (self.err) |msg| {
-            saved_err_len = @min(msg.len, saved_err_bytes.len);
-            @memcpy(saved_err_bytes[0..saved_err_len], msg[0..saved_err_len]);
-        }
-        const saved_err_obj = self.err_obj;
-        const saved_err_has_obj = self.err_has_obj;
-        const saved_err_cframe_residue = self.err_cframe_residue;
-        const saved_err_is_errerr = self.err_is_errerr;
-        const saved_err_source = self.err_source;
-        const saved_err_line = self.err_line;
-        const saved_err_traceback = self.err_traceback;
-        self.err_traceback = null;
+        // P16.36 Cut 1b: the old 7-field error-channel save/restore bundle
+        // (plus a 2048-byte Vm.err byte copy, both ways) is DELETED —
+        // per-thread error state protects the caller by construction:
+        // every closer raise lands on `th` (current_thread == th for the
+        // whole window below), and the caller's in-flight error lives on
+        // the caller thread, untouched. The closers' result travels via
+        // the close's return values (unchanged); their residual state on
+        // the closed `th` is dropped by the defer below. (Vm.err — the
+        // raw-message scratch view — is best-effort and may hold the last
+        // closer's message after the close; documented on the Vm.err
+        // field. No reader consumes it without a fresh raise in between.)
 
         // ---- activate the closed thread as the coherent runtime ----
         // current_thread BEFORE switchRuntime so refreshHooksCached
@@ -22714,23 +22783,21 @@ pub const Vm = struct {
             if (prev_thread) |pt| {
                 if (prev_thread_status) |st| pt.status = st;
             }
-            // Drop any error state the closers left on the channel (their
-            // result traveled via the close's return values) and put the
-            // caller's channel back exactly as it was.
-            self.clearErrorTraceback();
-            if (saved_err_present) {
-                @memcpy(self.err_buf[0..saved_err_len], saved_err_bytes[0..saved_err_len]);
-                self.err = self.err_buf[0..saved_err_len];
-            } else {
-                self.err = null;
+            // Drop any error state the closers left on the CLOSED thread
+            // (their result traveled via the close's return values). Must
+            // read `th` directly — the switch-back above already restored
+            // current_thread to the caller, so errThread() would resolve
+            // to the wrong thread here.
+            if (th.err_traceback) |tb| {
+                self.alloc.free(tb);
+                th.err_traceback = null;
             }
-            self.err_obj = saved_err_obj;
-            self.err_has_obj = saved_err_has_obj;
-            self.err_cframe_residue = saved_err_cframe_residue;
-            self.err_is_errerr = saved_err_is_errerr;
-            self.err_source = saved_err_source;
-            self.err_line = saved_err_line;
-            self.err_traceback = saved_err_traceback;
+            th.err_obj = .Nil;
+            th.err_has_obj = false;
+            th.err_cframe_residue = null;
+            th.err_is_errerr = false;
+            th.err_source = null;
+            th.err_line = -1;
         }
         // Region close-all: base 0 = every surviving mark (live
         // frame_slot entries on still-pushed frames + detached entries
@@ -22769,10 +22836,10 @@ pub const Vm = struct {
                 }
                 self.beginForcedClose(th);
                 self.err = null;
-                self.err_obj = .Nil;
-                self.err_has_obj = true;
-                self.err_source = null;
-                self.err_line = -1;
+                self.errThread().err_obj = .Nil;
+                self.errThread().err_has_obj = true;
+                self.errThread().err_source = null;
+                self.errThread().err_line = -1;
                 return error.RuntimeError;
             }
             if (th == self.main_thread and self.current_thread == null) {
@@ -23683,7 +23750,7 @@ pub const Vm = struct {
 
         for (self.gc_temp_roots.items) |value| try self.gcMarkValue(value);
         if (self.debug_transfer_values) |values| for (values) |value| try self.gcMarkValue(value);
-        if (self.err_has_obj) try self.gcMarkValue(self.err_obj);
+        if (self.errThread().err_has_obj) try self.gcMarkValue(self.errThread().err_obj);
         // c_error_value holds the object thrown by lua_error between the
         // _longjmp and callCFunction folding it into err_obj. It is a GC root
         // so a collection in that window cannot reclaim it.
@@ -25299,12 +25366,12 @@ pub const Vm = struct {
             }
         }
 
-        // Error object: self.err_obj may hold a GC-managed Value (String, Table)
+        // Error object: self.errThread().err_obj may hold a GC-managed Value (String, Table)
         // that is not reachable from any other root between error raise and pcall
         // catch. self.err (the bytes) borrows from the same LuaString, so marking
         // err_obj keeps the bytes valid too.
-        if (self.err_has_obj) {
-            try self.gcMarkValue(self.err_obj);
+        if (self.errThread().err_has_obj) {
+            try self.gcMarkValue(self.errThread().err_obj);
         }
 
         // c_error_value: object thrown by lua_error, held between _longjmp and
@@ -25589,6 +25656,30 @@ pub const Vm = struct {
                 if (th.api_err_residue) |rv| {
                     if (GcObject.fromValue(rv) != null) {
                         try self.gcMarkValue(rv);
+                    }
+                }
+                // P16.36 Cut 1b: the in-flight error state moved onto the
+                // thread — the error object and the raising builtin's
+                // C-frame residue are thread-held Values and must be
+                // marked here (PUC: the error object sits on the raising
+                // L's stack, marked wholesale by traversethread).
+                if (th.err_has_obj) {
+                    if (GcObject.fromValue(th.err_obj) != null) {
+                        try self.gcMarkValue(th.err_obj);
+                    }
+                }
+                if (th.err_cframe_residue) |rv| {
+                    if (GcObject.fromValue(rv) != null) {
+                        try self.gcMarkValue(rv);
+                    }
+                }
+                // The latched close error (dead-thread close replay) is a
+                // thread-held Value too — mark it defensively (pre-existing
+                // gap noticed during the Cut 1b move; interned strings in
+                // practice, same defensive class as api_err_residue).
+                if (th.close_has_err) {
+                    if (GcObject.fromValue(th.close_err) != null) {
+                        try self.gcMarkValue(th.close_err);
                     }
                 }
                 if (th.wrap_repeat_closure) |cl| {
@@ -26132,8 +26223,8 @@ pub const Vm = struct {
                     warn_buf.append(self.alloc, ')') catch return error.OutOfMemory;
                     self.warnfHandler(warn_buf.items, false) catch {};
                     self.err = null;
-                    self.err_has_obj = false;
-                    self.err_obj = .Nil;
+                    self.errThread().err_has_obj = false;
+                    self.errThread().err_obj = .Nil;
                     continue;
                 },
                 else => return e,
@@ -29413,7 +29504,7 @@ pub const Vm = struct {
                         return error.Yield;
                     } else {
                         // Hook errored via lua_error: the error object is in
-                        // self.err / self.err_obj. Propagate as RuntimeError.
+                        // self.err / self.errThread().err_obj. Propagate as RuntimeError.
                         return error.RuntimeError;
                     }
                     return;
@@ -29624,7 +29715,7 @@ pub const Vm = struct {
 
         const body = if (thread_arg) |th|
             try self.debugBuildThreadTraceback(th, level)
-        else if (self.err_traceback) |tb|
+        else if (self.errThread().err_traceback) |tb|
             // During xpcall message handling the original traceback was
             // captured at error point. Reuse it to avoid losing deep frames
             // after unwind.
@@ -29705,13 +29796,13 @@ pub const Vm = struct {
             // stack and printed via luaL_tolstring. We mirror this by catching
             // the error and printing the formatted error string to stderr.
             const prev_err = self.err;
-            const prev_err_obj = self.err_obj;
-            const prev_err_has_obj = self.err_has_obj;
-            const prev_residue = self.err_cframe_residue;
-            const prev_err_source = self.err_source;
-            const prev_err_line = self.err_line;
-            const prev_err_traceback = self.err_traceback;
-            self.err_traceback = null;
+            const prev_err_obj = self.errThread().err_obj;
+            const prev_err_has_obj = self.errThread().err_has_obj;
+            const prev_residue = self.errThread().err_cframe_residue;
+            const prev_err_source = self.errThread().err_source;
+            const prev_err_line = self.errThread().err_line;
+            const prev_err_traceback = self.errThread().err_traceback;
+            self.errThread().err_traceback = null;
 
             self.protected_call_depth += 1;
             defer self.protected_call_depth -= 1;
@@ -29730,12 +29821,12 @@ pub const Vm = struct {
                     // Restore preserved error state (pcall swallows the error).
                     self.clearErrorTraceback();
                     self.err = prev_err;
-                    self.err_obj = prev_err_obj;
-                    self.err_has_obj = prev_err_has_obj;
-                    self.err_cframe_residue = prev_residue;
-                    self.err_source = prev_err_source;
-                    self.err_line = prev_err_line;
-                    self.err_traceback = prev_err_traceback;
+                    self.errThread().err_obj = prev_err_obj;
+                    self.errThread().err_has_obj = prev_err_has_obj;
+                    self.errThread().err_cframe_residue = prev_residue;
+                    self.errThread().err_source = prev_err_source;
+                    self.errThread().err_line = prev_err_line;
+                    self.errThread().err_traceback = prev_err_traceback;
                     continue;
                 },
             };
@@ -29748,12 +29839,12 @@ pub const Vm = struct {
             // transient state set during execution).
             self.clearErrorTraceback();
             self.err = prev_err;
-            self.err_obj = prev_err_obj;
-            self.err_has_obj = prev_err_has_obj;
-            self.err_cframe_residue = prev_residue;
-            self.err_source = prev_err_source;
-            self.err_line = prev_err_line;
-            self.err_traceback = prev_err_traceback;
+            self.errThread().err_obj = prev_err_obj;
+            self.errThread().err_has_obj = prev_err_has_obj;
+            self.errThread().err_cframe_residue = prev_residue;
+            self.errThread().err_source = prev_err_source;
+            self.errThread().err_line = prev_err_line;
+            self.errThread().err_traceback = prev_err_traceback;
         }
     }
 
@@ -30018,7 +30109,7 @@ pub const Vm = struct {
                 w.writeAll("\t[C]: in function 'error'\n") catch return error.OutOfMemory;
                 // P16.28 T3: dead-error traceback was FORMATTED once at the
                 // terminal boundary; replay the captured text.
-                if (th.err_traceback) |tb| {
+                if (th.err_dead_traceback) |tb| {
                     w.writeAll(tb) catch return error.OutOfMemory;
                 } else {
                     w.writeAll("\tdb.lua: in function <db.lua>\n") catch return error.OutOfMemory;
@@ -32551,8 +32642,8 @@ pub const Vm = struct {
                         // catches the error; close_state then empties
                         // the stack. We clear the error state and proceed.
                         self.err = null;
-                        self.err_has_obj = false;
-                        self.err_obj = .Nil;
+                        self.errThread().err_has_obj = false;
+                        self.errThread().err_obj = .Nil;
                     },
                     else => return e,
                 };
@@ -37716,8 +37807,8 @@ pub const Vm = struct {
             // A closer errored (last-error-wins; err_obj was set by fail()
             // inside the close). PUC: the error escapes lua_settop to the
             // enclosing boundary.
-            self.err_has_obj = true;
-            self.err_obj = fe;
+            self.errThread().err_has_obj = true;
+            self.errThread().err_obj = fe;
             self.err = if (fe == .String) fe.String.bytes() else null;
             return error.RuntimeError;
         }
@@ -37839,7 +37930,7 @@ pub const Vm = struct {
                         // like a closer error (closeprotected continues
                         // with the new error, last-error-wins).
                         _ = self.fail("attempt to yield across a C-call boundary", .{}) catch {};
-                        cur_err = if (self.err_has_obj) self.err_obj else .Nil;
+                        cur_err = if (self.errThread().err_has_obj) self.errThread().err_obj else .Nil;
                         cur_status = 2; // LUA_ERRRUN
                         // A yield-as-error during a forced-close transport
                         // fails the close (same as a closer error above).
@@ -37873,9 +37964,9 @@ pub const Vm = struct {
                 },
                 else => {
                     // Closer error: last-error-wins, continue closing the
-                    // remaining entries with the NEW error (self.err_obj
+                    // remaining entries with the NEW error (self.errThread().err_obj
                     // was set by fail() inside the metamethod call).
-                    cur_err = if (self.err_has_obj) self.err_obj else .Nil;
+                    cur_err = if (self.errThread().err_has_obj) self.errThread().err_obj else .Nil;
                     cur_status = 2; // LUA_ERRRUN
                     // A return-close that started clean now closes through
                     // the error-escape regime (PUC closeprotected, yy=0).
@@ -37933,7 +38024,7 @@ pub const Vm = struct {
     /// Runs at the head of every catch in builtinPcall/builtinXpcall, while
     /// the pcall C-frame is still on the frame stack (callBuiltin pops it
     /// only after the builtin returns). The in-flight error object is
-    /// `self.err_obj` (for OOM arms `setOutOfMemoryError` ran first; for
+    /// `self.errThread().err_obj` (for OOM arms `setOutOfMemoryError` ran first; for
     /// xpcall the message handler already ran at the throw site, so this is
     /// the handler-transformed object).
     ///
@@ -37949,13 +38040,13 @@ pub const Vm = struct {
         const fr = th.call_frames.getConstPtr(pcall_frame_idx);
         const base = fr.tbc_chain_base;
         if (!threadTbcRegionNonEmpty(th, base)) return;
-        const err: ?Value = if (self.err_has_obj) self.err_obj else null;
+        const err: ?Value = if (self.errThread().err_has_obj) self.errThread().err_obj else null;
         const final = self.closeTbcRegion(th, base, null, err, 2, false, &.{}) catch return;
         if (final) |fe| {
             // The final closer error replaces the pcall failure's error
             // object (PUC: luaD_closeprotected's status → luaD_seterrorobj).
-            self.err_has_obj = true;
-            self.err_obj = fe;
+            self.errThread().err_has_obj = true;
+            self.errThread().err_obj = fe;
             self.err = if (fe == .String) fe.String.bytes() else null;
         }
     }
@@ -37974,14 +38065,14 @@ pub const Vm = struct {
     /// restores L->errfunc only after closeprotected).
     pub fn apiCloseConventionalPcallBoundary(self: *Vm, th: *Thread, base: usize) void {
         if (!threadTbcRegionNonEmpty(th, base)) return;
-        const err: ?Value = if (self.err_has_obj) self.err_obj else null;
-        const err_status: i32 = if (self.err_is_errerr) 5 else 2;
+        const err: ?Value = if (self.errThread().err_has_obj) self.errThread().err_obj else null;
+        const err_status: i32 = if (self.errThread().err_is_errerr) 5 else 2;
         const final = self.closeTbcRegion(th, base, null, err, err_status, false, &.{}) catch return;
         if (final) |fe| {
             // The final closer error replaces the pcall failure's error
             // object (PUC: luaD_closeprotected's status → luaD_seterrorobj).
-            self.err_has_obj = true;
-            self.err_obj = fe;
+            self.errThread().err_has_obj = true;
+            self.errThread().err_obj = fe;
             self.err = if (fe == .String) fe.String.bytes() else null;
         }
     }
@@ -38605,17 +38696,17 @@ pub const Vm = struct {
             // first — both the YPCALL and non-YPCALL paths below need it.
             // The error may come from two sources:
             //   1. `lua_error()` (C API) → `c_error_value` is set
-            //   2. Lua `error()` → `self.err_obj`/`self.err_has_obj` are
+            //   2. Lua `error()` → `self.errThread().err_obj`/`self.errThread().err_has_obj` are
             //      set by `fail()`, `c_error_value` is null
             // Only overwrite err_obj if c_error_value is set (lua_error
             // path); otherwise keep the existing err_obj from fail().
             if (self.c_error_value) |errval| {
                 self.c_error_value = null;
-                self.err_obj = errval;
-                self.err_has_obj = true;
+                self.errThread().err_obj = errval;
+                self.errThread().err_has_obj = true;
                 self.err = if (errval == .String) errval.String.bytes() else null;
-                self.err_source = null;
-                self.err_line = -1;
+                self.errThread().err_source = null;
+                self.errThread().err_line = -1;
                 self.captureErrorTraceback();
             }
             const cur_th = self.activeBytecodeThread();
@@ -40329,15 +40420,15 @@ pub const Vm = struct {
                 // concats the error with Y → "hiho").
                 {
                     const sth = sub_vm.activeBytecodeThread();
-                    const err_val: ?Value = if (sub_vm.err_has_obj) sub_vm.err_obj else null;
+                    const err_val: ?Value = if (sub_vm.errThread().err_has_obj) sub_vm.errThread().err_obj else null;
                     const final = sub_vm.closeTbcRegion(sth, 0, null, err_val, 2, false, &.{}) catch null;
                     if (final) |fe| {
-                        sub_vm.err_has_obj = true;
-                        sub_vm.err_obj = fe;
+                        sub_vm.errThread().err_has_obj = true;
+                        sub_vm.errThread().err_obj = fe;
                         sub_vm.err = if (fe == .String) fe.String.bytes() else null;
                     }
                     st.clearRetainingCapacity();
-                    const err_obj: Value = if (sub_vm.err_has_obj) sub_vm.err_obj else .Nil;
+                    const err_obj: Value = if (sub_vm.errThread().err_has_obj) sub_vm.errThread().err_obj else .Nil;
                     st.append(sub_vm.alloc, err_obj) catch return error.OutOfMemory;
                 }
 
@@ -40669,8 +40760,8 @@ pub const Vm = struct {
                     // to the boundary. Restore the error state and
                     // propagate (the errdefer pops the script frame — its
                     // remaining marks detach and close at the boundary).
-                    self.err_has_obj = true;
-                    self.err_obj = fe;
+                    self.errThread().err_has_obj = true;
+                    self.errThread().err_obj = fe;
                     self.err = if (fe == .String) fe.String.bytes() else null;
                     return @as(DispatchError!testc.RunResult, error.RuntimeError);
                 }
@@ -41481,13 +41572,13 @@ pub const Vm = struct {
             .@"error" => {
                 if (st.items.len == 0) return self.fail("testC error without message", .{});
                 // Fresh error: reset LUA_ERRERR signal (bypasses fail()).
-                self.err_is_errerr = false;
+                self.errThread().err_is_errerr = false;
                 const v = st.items[st.items.len - 1];
                 self.err = if (v == .String) v.String.bytes() else null;
-                self.err_obj = v;
-                self.err_has_obj = true;
-                self.err_source = null;
-                self.err_line = -1;
+                self.errThread().err_obj = v;
+                self.errThread().err_has_obj = true;
+                self.errThread().err_source = null;
+                self.errThread().err_line = -1;
                 self.captureErrorTraceback();
                 return error.RuntimeError;
             },
@@ -42252,8 +42343,8 @@ pub const Vm = struct {
                     // A closer errored (last-error-wins; err_obj was set by
                     // fail() inside the close). PUC: the error escapes
                     // lua_closeslot to the enclosing boundary.
-                    self.err_has_obj = true;
-                    self.err_obj = fe;
+                    self.errThread().err_has_obj = true;
+                    self.errThread().err_obj = fe;
                     self.err = if (fe == .String) fe.String.bytes() else null;
                     return @as(DispatchError!?testc.ReturnSpec, error.RuntimeError);
                 }
@@ -42690,10 +42781,10 @@ pub const Vm = struct {
     fn failTestcRaw(self: *Vm, msg: []const u8) Error {
         const ls = try self.internStr(msg);
         self.err = ls.bytes();
-        self.err_obj = .{ .String = ls };
-        self.err_has_obj = true;
-        self.err_source = null;
-        self.err_line = -1;
+        self.errThread().err_obj = .{ .String = ls };
+        self.errThread().err_has_obj = true;
+        self.errThread().err_source = null;
+        self.errThread().err_line = -1;
         self.captureErrorTraceback();
         return error.RuntimeError;
     }

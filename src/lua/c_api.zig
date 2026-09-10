@@ -285,8 +285,10 @@ pub export fn lua_closethread(L: ?*lua_State, from: ?*lua_State) c_int {
             if (vm.c_error_jmp) |jb| {
                 // Set a nil error object — the forced close machinery
                 // will set the real error object if __close errors.
-                vm.err_obj = .Nil;
-                vm.err_has_obj = true;
+                // P16.36 Cut 1b: the raise belongs to the closed thread
+                // (beginForcedClose raised on it; PUC throws on L).
+                th.err_obj = .Nil;
+                th.err_has_obj = true;
                 _longjmp(jb, 1);
             }
             // No c_error_jmp boundary (e.g., called from a non-C context
@@ -384,16 +386,20 @@ pub export fn lua_error(L: ?*lua_State) noreturn {
     // callCFunction performs) and run the handler; then longjmp. For a
     // yieldable lua_pcallk, the transformed object then flows through
     // precover → finishpcallk → seterrorobj → k, exactly like PUC.
+    // P16.36 Cut 1b: PUC lua_error throws on L — the error state lands
+    // on L's thread (the handle's thread; the main handle maps to the
+    // main thread), not on the Vm.
+    const eth = h.thread orelse vm.main_thread.?;
     if (vm.c_error_value) |ev| {
         vm.c_error_value = null;
-        vm.err_obj = ev;
-        vm.err_has_obj = true;
+        eth.err_obj = ev;
+        eth.err_has_obj = true;
         vm.err = if (ev == .String) ev.String.bytes() else null;
-        vm.err_source = null;
-        vm.err_line = -1;
+        eth.err_source = null;
+        eth.err_line = -1;
     }
     // Fresh error: reset LUA_ERRERR signal before invokeErrfunc.
-    vm.err_is_errerr = false;
+    eth.err_is_errerr = false;
     vm.invokeErrfunc() catch {};
     if (vm.c_error_jmp) |jb| {
         _longjmp(jb, 1);
@@ -429,7 +435,7 @@ pub export fn lua_callk(
     if (vm.current_thread orelse vm.main_thread) |th_check| {
         vm.apiCheckHookContinuationInvariant(th_check, k != null, false, 0) catch {
             if (vm.c_error_jmp) |jb| {
-                vm.c_error_value = vm.err_obj;
+                vm.c_error_value = vm.errThread().err_obj;
                 _longjmp(jb, 1);
             }
             @panic("lua_call hook api_check violation without an active C-function boundary");
@@ -469,7 +475,7 @@ pub export fn lua_callk(
         },
         error.RuntimeError => {
             if (vm.c_error_jmp) |jb| {
-                vm.c_error_value = vm.err_obj;
+                vm.c_error_value = vm.errThread().err_obj;
                 _longjmp(jb, 1);
             }
             @panic("lua_call without an active C-function boundary");
@@ -530,7 +536,7 @@ fn lua_callkImpl(L: ?*lua_State, nargs: c_int, nresults: c_int) void {
         error.RuntimeError => {
             // Error: propagate through boundary via longjmp
             if (vm.c_error_jmp) |jb| {
-                vm.c_error_value = vm.err_obj;
+                vm.c_error_value = vm.errThread().err_obj;
                 _longjmp(jb, 1);
             }
             @panic("lua_call without an active C-function boundary");
@@ -1074,8 +1080,8 @@ pub export fn lua_closeslot(L: ?*lua_State, idx: c_int) void {
     // lua_error.
     var call_args = [_]Value{val};
     _ = vm.apiCall(.nonyieldable, mm.?.*, call_args[0..]) catch {
-        if (vm.err_has_obj) {
-            h.c_stack.append(vm.alloc, vm.err_obj) catch {};
+        if (vm.errThread().err_has_obj) {
+            h.c_stack.append(vm.alloc, vm.errThread().err_obj) catch {};
         } else {
             h.c_stack.append(vm.alloc, .Nil) catch {};
         }
@@ -1846,7 +1852,12 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
         // luazig's message building does not use the Lua-visible stack,
         // so it exposes the [err, err] pair only.
         h.c_stack.items.len = lua_resume_base;
-        const ev: vm_mod.Value = if (vm.err_has_obj) vm.err_obj else .Nil;
+        // P16.36 Cut 1b: the error was raised inside the resumed thread
+        // and — with per-thread error state — STAYS there (the old
+        // Vm-global was restored to the caller's pre-resume state by
+        // builtinCoroutineResume's bundle defer, relying on latches;
+        // the raising thread is now the direct, by-construction owner).
+        const ev: vm_mod.Value = if (co.err_has_obj) co.err_obj else .Nil;
         h.c_stack.append(vm.alloc, ev) catch {};
         h.c_stack.append(vm.alloc, ev) catch {};
         if (nres) |p|
@@ -1855,7 +1866,7 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
             else
                 0);
         // PUC: LUA_ERRERR (5) if message handler errored, LUA_ERRRUN (2) otherwise.
-        return if (vm.err_is_errerr) 5 else 2;
+        return if (co.err_is_errerr) 5 else 2;
     };
     const failed = produced > 0 and !(out[0] == .Bool and out[0].Bool);
     if (failed) {
@@ -2068,10 +2079,10 @@ pub export fn lua_pcallk(
     if (vm.current_thread orelse vm.main_thread) |th_check| {
         vm.apiCheckHookContinuationInvariant(th_check, k != null, false, 0) catch {
             if (vm.c_error_jmp) |jb| {
-                vm.c_error_value = vm.err_obj;
+                vm.c_error_value = vm.errThread().err_obj;
                 _longjmp(jb, 1);
             }
-            return if (vm.err_is_errerr) 5 else 2;
+            return if (vm.errThread().err_is_errerr) 5 else 2;
         };
     }
 
@@ -2168,7 +2179,7 @@ pub export fn lua_pcallk(
                 vm.setErrfuncValue(null);
             }
             th.errfunc = fr2.u.c.old_errfunc;
-            return if (vm.err_is_errerr) 5 else 2;
+            return if (vm.errThread().err_is_errerr) 5 else 2;
         },
         error.OutOfMemory => {
             const fr2 = th.call_frames.getPtr(th.call_frames.len() - 1);
@@ -3525,8 +3536,8 @@ test "c api lua_error crosses the setjmp boundary into pcall" {
     const status = lua_pcallk(L, 0, 0, 0, 0, null);
     try std.testing.expectEqual(@as(c_int, 2), status);
 
-    try std.testing.expect(L.vm.err_has_obj);
-    try std.testing.expectEqualStrings("boom from C", L.vm.err_obj.String.bytes());
+    try std.testing.expect(L.vm.errThread().err_has_obj);
+    try std.testing.expectEqualStrings("boom from C", L.vm.errThread().err_obj.String.bytes());
     try std.testing.expect(L.vm.c_error_value == null);
     // PUC luaD_pcall → luaD_seterrorobj: on error, the error object is
     // pushed onto the stack. lua_gettop should be 1 (the error object).
@@ -3542,7 +3553,7 @@ test "c api boundary success path returns results normally" {
     try std.testing.expectEqual(@as(c_int, 0), status);
     try std.testing.expectEqual(@as(c_int, 1), lua_gettop(L));
     try std.testing.expectEqual(@as(i64, 42), intAt(L, -1));
-    try std.testing.expect(!L.vm.err_has_obj);
+    try std.testing.expect(!L.vm.errThread().err_has_obj);
 }
 
 test "c api lua_getallocf: alloc/realloc/free roundtrip" {

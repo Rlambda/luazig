@@ -1,4 +1,4 @@
-> Last updated: 2026-09-10 (P16.35 Cut 1 — dispatch PC as pointer cursor (PUC savedpc): implemented, measured, REJECTED — full Stage-1 conversion (~160 sites, ctx.pc_cur: [*]const bc.Instruction, heap pc stays usize), ALL functional gates GREEN, instruction win EXACTLY as decomposed (fetch 4→2 i, fetch+advance 5→3: int_arith −3.95%, branch_loop −4.57%, comparisons −4.11%, float_arith −3.80%, mixed_arith −3.57%, hash_access −3.79%, lua_calls −2.21%, field_access −2.3% real (bimodal modes both shifted −40.5M)), but WALL REGRESSED +25-30% on tight arith loops (int_arith +25.3%, float_arith +30.6%, mixed_arith +27.5%; official perf gate FAIL +29-33%; IPC 5.51→4.23, +2.3 c/dispatch; NOT layout lottery — probed both directions, robust) → REVERTED per pre-registered protocol (cursor stack-spilled, win did not survive to wall); honest negative preserved in p16.35-t3-cursor-ab-rejected.md incl. untested re-attempt candidate (code_ptr-cached ctx field); KEPT: tests/smoke/75_pc_cursor.lua (representation-independent parity gate, 9 probes, passes on both index and cursor builds); src/ unchanged vs HEAD be4fb0a — perf current.json remains valid; smoke 73→74/74. Prior: P16.34 COMPLETE — geomean 1.48778→1.47176 (−1.1%); per-fetch dispatch head 18→~15 i/fetch (landed: boundary-published PC −1 i/fetch (PUC savedpc ownership), donextjump inline (PUC docondjump parity, −18 i/taken-condjump), vmfetch bounds-check removal (PUC while(true) parity, terminator invariant + undump.verifyProtoCode safety net)); branch_loop 1.879→1.622x, lua_calls 1.374→1.319x, comparisons 1.521→1.405x, field_access 1.817→1.678x, int_arith 1.402→1.313x; dispatch 65,332→67,840 B, .text 2,380,073→2,364,729 (−15,344))
+> Last updated: 2026-09-10 (P16.35 Cut 3 — builtin OP_CALL guard-chain hoisting (T5 mechanism #2): protected-family id gate + coroutine-switch trampoline flag hoisted to both OP_CALL/OP_TAILCALL sites, return-event hook probes gated by hooks_active_cached, builtinOutLen → comptime ?u16 table (default 1, null=dynamic) + inline wrapper + out-of-line 10-case dynamic switch; GC placement KEPT (OP_CALL epilogue condGcFromDispatch is the only GC trigger for builtin-string loops — internStr has no check; PUC checks inside lapi.c push APIs l.426/549/592/603; relocation = internStr DispatchError cascade, dedicated cut); coroutine_yield −267.66 i/it A/B (gap 1494.7→1259.3 official, −235.4; target was −170..−230), wall −13.3% (1.90x→1.58x), metamethod_add −115, table_alloc_setmetatable −158, string_loop −173 i/it; controls int_arith/branch_loop/temp_table_alloc/lua_calls exactly 0.00; geomean 1.47176→1.4164 (−3.8%); dispatch 67,840→67,692 B, .text +424 B; gates: fmt, unit D+RF, smoke 74/74, matrix --testc zig_fail=0 (gc/gengc/tracegc/locals/coroutine/db/errors/events green), c_api ALL PASS + diff, api580 GREEN, perf 18/18 OK)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -36,9 +36,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **74/74** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.47x** |
+| Performance (geomean vs PUC) | **1.42x** |
 
-Geomean замедления vs PUC Lua: **1.47x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.42x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -67,6 +67,63 @@ IR VM полностью удалена из кодовой базы.
 ## История разработки
 
 Выполненные задачи по номерам (P15.xx). Полные детали — в `git log` и коде.
+
+### P16.35 Cut 3 — builtin OP_CALL guard-chain hoisting (2026-09-10)
+
+Реализация ranked mechanism #2 из T5-декомпозиции
+(`tools/status/p16.35-t5-coroutine-decomposition.md`; полный отчёт:
+`tools/status/p16.35-cut3-guard-hoisting.md`). Каждый builtin OP_CALL платил
+ask-then-decline prologue chain, которой нет в PUC (lvm.c:1720 = savepc +
+luaD_precall; precallC ldo.c:642 = checkstackp + prepCallInfo + 2-i hookmask
+read). Три hoist'а, все — generic id-class/flag gates, без benchmark
+special cases и новых флагов:
+
+1. **Protected-family id gate** поднят в caller (оба сайта OP_CALL/OP_TAILCALL):
+   `tryPushBytecodeProtectedCall` вызывается только при
+   `id == .pcall or id == .xpcall` (раньше каждый builtin платил out-of-line
+   call 22 i, incl. ArrayListUnmanaged init + defer-deinit на early return).
+2. **Coroutine-switch trampoline flag** поднят в caller (те же два сайта):
+   `tryRequestBytecodeCoroutineSwitch` вызывается только при
+   `bytecode_coroutine_trampoline_active` (его собственный first check,
+   steady state = false) — один load+test вместо 20-i call.
+3. **Return-event hook probes** (`tryPushBytecodeDebugHook` +
+   `dispatchBytecodeHookWithCallee` в builtin-эпилоге opCall) gated by
+   `hooks_active_cached` — идентичный first check хелперов (PUC precallC
+   читает L->hookmask напрямую, ldo.c:650).
+4. **builtinOutLen → comptime `?u16` таблица** (default 1 = старый
+   `else => 1`, null = dynamic) + inline wrapper (один table load на каждом
+   из 5 call sites) + out-of-line `builtinOutLenDynamic` (только 10
+   аргументо-зависимых случаев). Контракт single-source-of-truth
+   документирован на таблице.
+
+`coroutineBuiltinFastPathEligible` проверен (task item c): уже gated by
+`(id == .coroutine_resume or id == .coroutine_yield)` на обоих call sites —
+его 69 i/cycle платят только сами coroutine-билтины (механизм #4, вне скоупа).
+
+**GC placement KEPT (решение задокументировано):** эпилог-ный
+`condGcFromDispatch` (vm.zig:18703) — единственный GC-триггер для циклов с
+string-аллокацией в билтинах: `internStr` (chokepoint всего string creation)
+не имеет GC-проверки, в отличие от `allocTable`. PUC проверяет GC внутри
+object-creating C API (lapi.c lua_tolstring:426, lua_pushlstring:549,
+lua_pushfstring:603 и др.), НЕ на OP_CALL; перенос проверки на
+string-creation sites требует `internStr` → DispatchError каскада по всей
+поверхности string creation (parser, error paths, stdlib) — отдельный
+архитектурный cut. Контролы подтверждают нулевое изменение GC pacing:
+int_arith/branch_loop/temp_table_alloc/lua_calls — ровно 0.00 i/it.
+
+**Измерение** (A/B instructions:u, median of 3, taskset -c 0):
+coroutine_yield 2524.73 → 2257.07 = **−267.66 i/it** (цель −170..−230 —
+перевыполнена за счёт inlined re-checks + call-arg staging); официальные
+counters: gap 1494.7 → 1259.3 i/it (−235.4); wall −13.3% (1.90x → 1.58x);
+metamethod_add −115, table_alloc_setmetatable −158, string_loop −173 i/it;
+geomean 1.47176 → 1.4164 (−3.8%). Размеры: dispatch 67,840 → 67,692 B
+(−148), .text +424 B — не разросся.
+
+Гейты: fmt; unit D+RF; smoke 74/74; matrix --testc zig_fail=0
+(gc/gengc/tracegc/locals/coroutine/db/errors/events green; big.lua
+both_fail pre-existing); c_api make clean test ALL PASS + test-diff PASS
+(TBC 22+23); api580 GREEN; perf_compare 18/18 OK (корреляций нет,
+coroutine_yield −13.3% wall).
 
 ### P16.32 T2 — measured allocation cuts (2026-09-09)
 

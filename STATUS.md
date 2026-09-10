@@ -9931,3 +9931,88 @@ prefix-path 256-B message truncation, (6) CLI double-traceback (backlog).
 
 Гейты фазы: unit D+RF PASS; smoke 74/74; matrix --testc 31/32 zig_fail=0;
 api580 GREEN; src/ не менялся (git diff 162ae06..HEAD --stat -- src/ пуст).
+
+## P16.36 Cut 1a — T2.3 fix: err_cfunc_label → structural top-C-frame derivation (2026-09-10)
+
+Cut 1 фазы P16.36 (первый из двух коммитов cut'а; 1b — ownership move).
+Закрывает открытый пункт (1) из Cut 0: err_cfunc_label lifecycle.
+
+**T2.3 fix — поле удалено, лейбл деривируется структурно.** `Vm.err_cfunc_label`
+(персистентное состояние, протекавшее через восстановленные ошибки и
+coroutine-переключения) удалено вместе со всеми 12 сайтами (setters в
+error/assert/yield/failTestcRaw, clears в fail/failRunerror/failLib,
+preserve-комментарий в failC, save/restore в closeThreadProtected bundle,
+чтения в captureErrorTraceback + debugBuildCurrentTraceback). Вместо поля —
+`writeSyntheticTopCFrame` (vm.zig): при capture лейбл top hidden C-frame
+выводится структурно, ровно как PUC pushfuncname (lauxlib.c:96) лейблит
+видимый C-CallInfo: (1) имя из вызывающей инструкции caller'а
+(`getFuncNameForFrame` = funcnamefromcall/funcnamefromcode: "global
+'xpcall'", "field 'open'", "method 'm'", ...), (2) fallback — поиск в _G
+(`debugFindGlobalFuncName`, расширен с .Closure до .Closure+.Builtin —
+PUC ищет C-функции в _LOADED тем же способом: "[C]: in function
+'xpcall'"), (3) "?". Инвариант отсутствия двойной печати: во время окна
+handler'а invokeErrfunc уже unhide'ит raiser-C-frame → обычный walk его
+показывает; синтетическая строка только для hidden-кадров. Чтение в
+debugBuildCurrentTraceback удалено целиком: этот путь достигается только
+когда err_traceback == null (ошибка НЕ in flight — builtinDebugTraceback
+иначе переиспользует captured traceback) → чтение было чистым
+leak-вектором (t23c/t23e подтверждали).
+
+**Попутно закрыто (обнаруженные в ходе верификации T2.3 отступления от
+PUC, каждое с PUC-цитатой в коде):**
+
+1. **CLI double-traceback** (backlog-пункт 6 из Cut 0): uncaught top-level
+   error печатал traceback ДВАЖДЫ — builtinCliMsghandler форматировал
+   msg+traceback в err_obj, затем reportError→formatCliError добавлял
+   err_traceback ещё раз. PUC report (lua.c) печатает объект handler'а
+   as-is. formatCliError переписан под PUC report (print-as-is; единственный
+   no-handler путь — LUA_ERRERR, его bare "error in error handling" тоже
+   as-is, как PUC). Попутно dolibrary (-l) теперь вооружает cli_msghandler
+   вокруг apiCall (PUC dolibrary → docall → msghandler): раньше require-
+   фейл через -l печатался без position/traceback.
+2. **xpcall argerror position** (failC → failArgerror): комментарий сайта
+   неверно утверждал "luaL_where(1) has no Lua level for a C frame" —
+   luaL_where(L,1) резолвит level 1 = НЕПОСРЕДСТВЕННЫЙ caller xpcall
+   (Lua-кадр при прямом вызове → "file:line:" есть; C-кадр при
+   pcall(xpcall,...) → нет). Реализован точный PUC-мейппинг: fail()
+   рефакторнут в failWithPosFrame(pos_frame, ...); failArgerror() передаёт
+   immediateCallerOfTopCFrame() (кадр сразу под raiser-C-frame; C-caller →
+   no position). Прямой вызов: `F:N: bad argument #2 to 'xpcall'...`
+   (раньше префикс отсутствовал вовсе), pcall-wrapped: без префикса — оба
+   случая byte-parity с PUC.
+
+**Постоянный регрессионный тест**: tests/smoke/76_error_cfunc_label.lua —
+A (_G-fallback лейбл "function 'xpcall'"), B/C (no stale label после
+recovered error()/assert()), D (no cross-thread leak после смерти
+корутины), E (field 'open'), F (global 'error'), G1/G2 (argerror position:
+прямой вызов с префиксом / pcall-wrapped без). Дифференциальный,
+byte-identical оба движка. Все T2.3-пробы (t23*, probe1-6) byte-match PUC
+(нормализация progname/пути).
+
+**Обнаруженные pre-existing расхождения (НЕ фиксировались, вне scope,
+кандидаты в backlog):** (a) hidden C-frames НИЖЕ top в traceback
+отсутствуют (PUC показывает все CallInfo: внешний xpcall при
+xpcall(xpcall,...), table.sort у erroring-компаратора) — модель P15.79,
+лечение = общий лейблинг hidden-кадров в walk'е + калибровка level-
+counting, отдельный cut; (b) handler-window traceback не показывает
+собственный кадр handler'а (err_traceback-reuse дизайн в
+builtinDebugTraceback — captured-at-fault переиспользуется вместо live
+walk; PUC строит live с кадром handler'а); (c) plain debug.traceback()
+без ошибки не печатает финальный "[C]: in ?"; (d) системное расхождение
+семейства argerror-сообщений fail() (topLuaFrame = всегда позиция) vs PUC
+luaL_where(1) (позиция только при Lua immediate-caller) + тексты
+("string.format: %d expects integer" vs "bad argument #2 to
+'string.format' (number expected, got string)", "'open'" vs "'io.open'"
+при C-caller через _LOADED-имя) — failArgerror готов как образец для
+миграции семейства; (e) flaky SIGSEGV в gc.lua (секция self-referenced
+threads, ~10-25% прогонов, воспроизведён И на baseline 162ae06 (4/24),
+И на билде с изменениями (2/8) — pre-existing, требует отдельного
+расследования GC/thread-teardown).
+
+**Гейты**: fmt; unit D+RF PASS; smoke **75/75** (74 + новый 76); matrix
+--testc 31/32 zig_fail=0 (big.lua both_fail pre-existing); c_api make
+clean test ALL PASS + test-diff PASS (TBC 22+23); api580 GREEN (Debug+RF+
+sizes); targeted suites outputs match: coroutine/db/errors/locals/cstack/
+calls + events/attrib/closure/nextvar/gc. Все изменения — cold-path
+(error/capture/CLI-report); perf-гейты (perf_compare + A/B) — в конце
+cut'а после 1b.

@@ -466,6 +466,13 @@ fn dolibrary(vm: *lua.internal.vm.Vm, spec: []const u8) bool {
     const require_fn = vm.apiGetGlobal("require");
     const modname_str = vm.internStr(modname) catch return false;
     var call_args = [_]lua.internal.vm.Value{.{ .String = modname_str }};
+    // PUC dolibrary → docall (lua.c): the msghandler is armed as errfunc
+    // around the protected call, so a require failure is formatted (position
+    // + traceback) BEFORE report prints it. Without this, reportError would
+    // print the raw object.
+    const saved_errfunc = vm.getErrfuncValue();
+    vm.setErrfuncValue(.{ .Builtin = .cli_msghandler });
+    defer vm.setErrfuncValue(saved_errfunc);
     const ret = vm.apiCall(.nonyieldable, require_fn, call_args[0..]) catch return false;
     defer vm.alloc.free(ret);
     if (ret.len == 0) return false;

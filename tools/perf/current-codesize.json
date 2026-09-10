@@ -1,69 +1,72 @@
 {
- "created_utc": "2026-09-09T23:39:06.026027+00:00",
- "provenance": {
-  "git_head": "6e9cd69",
-  "measured_source_head": "6290951",
-  "measured_source_note": "src/ at HEAD 6e9cd69 is byte-identical to 6290951 (verified: git diff 6290951..HEAD --stat -- src/ is empty); binary zig-out/bin/luazig sha16 b0fedf8a7d0280cf = the perf_compare P16.34-final measured binary",
-  "git_dirty": "dirty (this artifact + sibling perf/status artifacts staged after measurement)",
-  "source_dirty": "clean",
-  "artifact_dirty": "dirty (post-measurement JSON writes; the measured binary's inputs are src/, reported by source_dirty=clean)",
-  "zig_version": "0.16.0",
-  "optimize_mode": "ReleaseFast",
-  "zig_binary_sha16": "b0fedf8a7d0280cf",
-  "note": "P16.34 final canonical code-size truth at HEAD (supersedes the P16.34 Cut 0A artifact measured at 616c1b9: dispatch 65,332 B pre-Cut-1/2/3.5/3.1). Absent symbols = fully inlined into runBytecodeDispatch. undump.verifyProtoCode (Cut 3.5 safety net) has no standalone symbol \u2014 fully inlined into undump.UndumpReader.undumpProto (7,545 B)."
- },
- "text_total_bytes": 2364729,
- "symbols_bytes": {
-  "vm.Vm.runBytecodeDispatch": 67840,
-  "vm.Vm.pushStagedBytecodeExecFrame": 1348,
-  "vm.Vm.completeBytecodeExecFrame": 4370,
-  "vm.Vm.tryPushSimpleResultMetamethod": 2705,
-  "vm.Vm.dispatchCalleeActivationHook": 526,
-  "vm.Vm.callBuiltin": 6336,
-  "vm.Vm.getTmByObj": 237,
-  "vm.Vm.pushResolvedBytecodeClosure__anon_42101": 1025,
-  "vm.Vm.stageBytecodeCall": 482
- },
- "absent_inlined_into_dispatch": [
-  "vm.Vm.findBinaryTm",
-  "vm.Vm.opCall",
-  "vm.Vm.opReturn0",
-  "vm.Vm.opReturn1",
-  "vm.Vm.pushStagedFast",
-  "vm.Vm.stageFixedCall"
- ],
- "fail_instantiations": {
-  "vm.Vm.fail__anon": {
-   "count": 574,
-   "aggregate_bytes": 656636
+  "created_utc": "2026-09-10T16:18:30.599675+00:00",
+  "provenance": {
+    "git_head": "162ae06",
+    "measured_source_head": "162ae06",
+    "measured_source_note": "P16.35 final wrap: HEAD IS the production commit 162ae06 (git diff 162ae06..HEAD --stat -- src/ empty); binary zig-out/bin/luazig sha16 23c67305670ee4b6 = the perf_compare P16.35-final measured binary (byte-identical to the Cut 3 working-tree measurement: same sha16 in the pre-commit artifact)",
+    "git_dirty": "clean at measurement time (post-measurement artifact writes only)",
+    "source_dirty": "clean",
+    "artifact_dirty": "dirty (post-measurement JSON/status writes; the measured binary's inputs are src/, reported by source_dirty=clean)",
+    "zig_version": "0.16.0",
+    "optimize_mode": "ReleaseFast",
+    "zig_binary_sha16": "23c67305670ee4b6",
+    "note": "P16.35 final canonical code-size truth at HEAD 162ae06 (P16.35 Cut 3 guard-chain hoisting landed). Supersedes the P16.34-final artifact (6e9cd69/src=6290951, binary b0fedf8a7d0280cf). Absent symbols = fully inlined into runBytecodeDispatch. undump.verifyProtoCode still has no standalone symbol (inlined into undump.UndumpReader.undumpProto)."
   },
-  "vm.Vm.failRunerror__anon": {
-   "count": 2,
-   "aggregate_bytes": 1130
+  "text_total_bytes": 2365145,
+  "symbols_bytes": {
+    "vm.Vm.runBytecodeDispatch": 67692,
+    "vm.Vm.builtinOutLenDynamic": 2025,
+    "vm.Vm.pushStagedBytecodeExecFrame": 1348,
+    "vm.Vm.completeBytecodeExecFrame": 4370,
+    "vm.Vm.tryPushSimpleResultMetamethod": 2705,
+    "vm.Vm.dispatchCalleeActivationHook": 526,
+    "vm.Vm.callBuiltin": 6336,
+    "vm.Vm.getTmByObj": 237,
+    "vm.Vm.pushResolvedBytecodeClosure__anon_42893": 1025,
+    "vm.Vm.stageBytecodeCall": 482
   },
-  "vm.Vm.failLib__anon": {
-   "count": 3,
-   "aggregate_bytes": 1717
+  "absent_inlined_into_dispatch": [
+    "vm.Vm.findBinaryTm",
+    "vm.Vm.opCall",
+    "vm.Vm.opReturn0",
+    "vm.Vm.opReturn1",
+    "vm.Vm.pushStagedFast",
+    "vm.Vm.stageFixedCall",
+    "vm.Vm.builtinOutLen (inline wrapper: one comptime-table load at 5 call sites)"
+  ],
+  "fail_instantiations": {
+    "vm.Vm.fail__anon": {
+      "count": 574,
+      "aggregate_bytes": 656636
+    },
+    "vm.Vm.failRunerror__anon": {
+      "count": 2,
+      "aggregate_bytes": 1130
+    },
+    "vm.Vm.failLib__anon": {
+      "count": 3,
+      "aggregate_bytes": 1717
+    },
+    "vm.Vm.failTestcRaw": {
+      "count": 1,
+      "aggregate_bytes": 206
+    },
+    "vm.Vm.failBinaryMmbin": {
+      "count": 1,
+      "aggregate_bytes": 599
+    },
+    "vm.Vm.failC": {
+      "count": 0,
+      "aggregate_bytes": 0
+    },
+    "note": "P16.33 T3 noinline-fail cost, binary-wide: 574 fail clones (count unchanged vs P16.34-final 6e9cd69); aggregate fail-family bytes 660,288 (unchanged vs P16.34-final \u2014 Cut 3 touched call plumbing, not fail formatting). Counted via: nm -S | grep 'vm\\.Vm\\.fail' on the ReleaseFast binary."
   },
-  "vm.Vm.failTestcRaw": {
-   "count": 1,
-   "aggregate_bytes": 206
-  },
-  "vm.Vm.failBinaryMmbin": {
-   "count": 1,
-   "aggregate_bytes": 599
-  },
-  "vm.Vm.failC": {
-   "count": 0,
-   "aggregate_bytes": 0
-  },
-  "note": "P16.33 T3 noinline-fail cost, binary-wide: 574 fail clones (unchanged count vs 616c1b9); aggregate fail-family bytes 660,288 (was 670,046 at 616c1b9, -9,758: Cut 3.1 deleted the fall-off fallback below the dispatch loop + smaller fail bodies after the bounds-check removal). Counted via: nm -S | grep 'vm\\.Vm\\.fail' on the ReleaseFast binary."
- },
- "measurement": {
-  "binary": "zig-out/bin/luazig",
-  "symbols": "nm -S zig-out/bin/luazig (size column, hex->dec)",
-  "text_total": "readelf -S .text size 0x241539 = 2,364,729",
-  "dispatch_delta_vs_p16_34_cut0a": "+2,508 B (65,332 -> 67,840, +3.8%): Cut 3.5 donextjump inline ADDS 11 in-handler taken-jump blocks (~+3 KB of duplicated jump-apply code) which outweighs the head savings from Cut 1 (dispatch_pc store removal, ~-60 B) and Cut 3.1 (per-fetch bounds compare+branch removal, ~-100 B); the pre-cut expectation 'dispatch shrinks after Cut 1+3' held only for the head, not for the whole switch \u2014 the inline is a deliberate code-size-for-speed trade (branch_loop -14..-15% WALL)",
-  "text_delta_vs_p16_34_cut0a": "-15,344 B (2,380,073 -> 2,364,729): fail-family -9,758 + completeBytecodeExecFrame -55 (fall-off fallback deleted) + tryPushSimpleResultMetamethod -47 + pushStagedBytecodeExecFrame -22 + rest = re-roll of the whole binary after the cuts"
- }
+  "measurement": {
+    "binary": "zig-out/bin/luazig",
+    "symbols": "nm -S zig-out/bin/luazig (size column, hex->dec)",
+    "text_total": "readelf -S -W .text size 0x2416d9 = 2,365,145",
+    "dispatch_delta_vs_p16_34_final": "-148 B (67,840 -> 67,692): Cut 3 guard-chain hoisting removes the decline-chain calls (incl. ArrayListUnmanaged init+defer-deinit on early return) from non-protected/non-trampoline builtin OP_CALL/OP_TAILCALL paths; builtinOutLen comptime-table split keeps the default-1 case at a single table load",
+    "builtinOutLenDynamic_note": "new out-of-line symbol 2,025 B (10 arg-dependent builtin cases only; default cases resolved via the comptime ?u16 table inline)",
+    "text_delta_vs_p16_34_final": "+416 B (2,364,729 -> 2,365,145): dispatch -148 + builtinOutLenDynamic +2,025 out-of-line - inlined wrapper/table loads at 5 call sites + re-roll of the whole binary (commit message recorded +424 vs the pre-commit working base; fresh readelf at the committed binary gives +416 vs the P16.34-final artifact)"
+  }
 }

@@ -1,178 +1,178 @@
 {
- "created_utc": "2026-09-09T23:35:53.639918+00:00",
- "zig_version": "0.16.0",
- "provenance": {
-  "git_head": "6e9cd69",
-  "measured_source_head": "6e9cd69",
-  "git_dirty": "clean",
-  "source_dirty": "clean",
-  "artifact_dirty": "clean",
+  "created_utc": "2026-09-10T16:11:14.490151+00:00",
   "zig_version": "0.16.0",
-  "optimize_mode": "ReleaseFast",
-  "zig_binary_sha16": "b0fedf8a7d0280cf",
-  "puc_binary_sha16": "d54bc45e1757b216"
- },
- "host": {
-  "platform": "Linux-7.1.5-arch1-2-x86_64-with-glibc2.44",
-  "python": "3.11.15"
- },
- "runs": 7,
- "core": "0",
- "geomean": 1.4717639538129235,
- "workloads": {
-  "dynamic_load": {
-   "zig_s": 0.199239,
-   "puc_s": 0.126717,
-   "ratio": 1.5723146854802434
+  "provenance": {
+    "git_head": "162ae06",
+    "measured_source_head": "162ae06",
+    "git_dirty": "clean",
+    "source_dirty": "clean",
+    "artifact_dirty": "clean",
+    "zig_version": "0.16.0",
+    "optimize_mode": "ReleaseFast",
+    "zig_binary_sha16": "23c67305670ee4b6",
+    "puc_binary_sha16": "d54bc45e1757b216"
   },
-  "branch_loop": {
-   "zig_s": 0.859628,
-   "puc_s": 0.529892,
-   "ratio": 1.622270198455534
+  "host": {
+    "platform": "Linux-7.1.5-arch1-2-x86_64-with-glibc2.44",
+    "python": "3.11.15"
   },
-  "global_arith": {
-   "zig_s": 0.836084,
-   "puc_s": 0.553888,
-   "ratio": 1.5094820613553641
+  "runs": 7,
+  "core": "0",
+  "geomean": 1.4457790047721266,
+  "workloads": {
+    "metamethod_call_noalloc": {
+      "zig_s": 0.015798,
+      "puc_s": 0.008519,
+      "ratio": 1.8544430097429274
+    },
+    "comparisons": {
+      "zig_s": 0.840283,
+      "puc_s": 0.597747,
+      "ratio": 1.405750258888794
+    },
+    "lua_calls": {
+      "zig_s": 0.121878,
+      "puc_s": 0.09046,
+      "ratio": 1.3473137298253373
+    },
+    "hash_access": {
+      "zig_s": 0.115659,
+      "puc_s": 0.068439,
+      "ratio": 1.6899574803839916
+    },
+    "field_access": {
+      "zig_s": 0.094985,
+      "puc_s": 0.056551,
+      "ratio": 1.6796343123905855
+    },
+    "branch_loop": {
+      "zig_s": 0.863039,
+      "puc_s": 0.529094,
+      "ratio": 1.631163838561768
+    },
+    "float_arith": {
+      "zig_s": 0.230749,
+      "puc_s": 0.176365,
+      "ratio": 1.3083605023672498
+    },
+    "global_arith": {
+      "zig_s": 0.85481,
+      "puc_s": 0.551002,
+      "ratio": 1.5513736792243948
+    },
+    "temp_table_alloc": {
+      "zig_s": 0.034422,
+      "puc_s": 0.030797,
+      "ratio": 1.1177062700912426
+    },
+    "coroutine_yield": {
+      "zig_s": 0.070672,
+      "puc_s": 0.043703,
+      "ratio": 1.6170972244468342
+    },
+    "table_alloc_setmetatable": {
+      "zig_s": 0.057677,
+      "puc_s": 0.04325,
+      "ratio": 1.3335722543352602
+    },
+    "array_access": {
+      "zig_s": 0.083483,
+      "puc_s": 0.046251,
+      "ratio": 1.8049988108365225
+    },
+    "int_arith": {
+      "zig_s": 0.230004,
+      "puc_s": 0.173305,
+      "ratio": 1.3271630939672832
+    },
+    "mixed_arith": {
+      "zig_s": 0.248966,
+      "puc_s": 0.174696,
+      "ratio": 1.4251385263543528
+    },
+    "metamethod_add": {
+      "zig_s": 0.084415,
+      "puc_s": 0.061753,
+      "ratio": 1.3669781225203634
+    },
+    "string_loop": {
+      "zig_s": 0.120542,
+      "puc_s": 0.097603,
+      "ratio": 1.2350235136215075
+    },
+    "string_concat": {
+      "zig_s": 0.085015,
+      "puc_s": 0.078269,
+      "ratio": 1.086189934712338
+    },
+    "dynamic_load": {
+      "zig_s": 0.194203,
+      "puc_s": 0.126977,
+      "ratio": 1.5294344645093203
+    }
   },
-  "lua_calls": {
-   "zig_s": 0.119961,
-   "puc_s": 0.090914,
-   "ratio": 1.3194997470136614
+  "zig": {
+    "metamethod_call_noalloc": 0.015798,
+    "comparisons": 0.840283,
+    "lua_calls": 0.121878,
+    "hash_access": 0.115659,
+    "field_access": 0.094985,
+    "branch_loop": 0.863039,
+    "float_arith": 0.230749,
+    "global_arith": 0.85481,
+    "temp_table_alloc": 0.034422,
+    "coroutine_yield": 0.070672,
+    "table_alloc_setmetatable": 0.057677,
+    "array_access": 0.083483,
+    "int_arith": 0.230004,
+    "mixed_arith": 0.248966,
+    "metamethod_add": 0.084415,
+    "string_loop": 0.120542,
+    "string_concat": 0.085015,
+    "dynamic_load": 0.194203
   },
-  "coroutine_yield": {
-   "zig_s": 0.080572,
-   "puc_s": 0.04358,
-   "ratio": 1.8488297384121157
+  "puc": {
+    "metamethod_call_noalloc": 0.008519,
+    "comparisons": 0.597747,
+    "lua_calls": 0.09046,
+    "hash_access": 0.068439,
+    "field_access": 0.056551,
+    "branch_loop": 0.529094,
+    "float_arith": 0.176365,
+    "global_arith": 0.551002,
+    "temp_table_alloc": 0.030797,
+    "coroutine_yield": 0.043703,
+    "table_alloc_setmetatable": 0.04325,
+    "array_access": 0.046251,
+    "int_arith": 0.173305,
+    "mixed_arith": 0.174696,
+    "metamethod_add": 0.061753,
+    "string_loop": 0.097603,
+    "string_concat": 0.078269,
+    "dynamic_load": 0.126977
   },
-  "mixed_arith": {
-   "zig_s": 0.246387,
-   "puc_s": 0.174678,
-   "ratio": 1.410521073060145
+  "ratios": {
+    "metamethod_call_noalloc": 1.8544430097429274,
+    "comparisons": 1.405750258888794,
+    "lua_calls": 1.3473137298253373,
+    "hash_access": 1.6899574803839916,
+    "field_access": 1.6796343123905855,
+    "branch_loop": 1.631163838561768,
+    "float_arith": 1.3083605023672498,
+    "global_arith": 1.5513736792243948,
+    "temp_table_alloc": 1.1177062700912426,
+    "coroutine_yield": 1.6170972244468342,
+    "table_alloc_setmetatable": 1.3335722543352602,
+    "array_access": 1.8049988108365225,
+    "int_arith": 1.3271630939672832,
+    "mixed_arith": 1.4251385263543528,
+    "metamethod_add": 1.3669781225203634,
+    "string_loop": 1.2350235136215075,
+    "string_concat": 1.086189934712338,
+    "dynamic_load": 1.5294344645093203
   },
-  "float_arith": {
-   "zig_s": 0.231052,
-   "puc_s": 0.175391,
-   "ratio": 1.3173537980854206
-  },
-  "metamethod_add": {
-   "zig_s": 0.090264,
-   "puc_s": 0.061713,
-   "ratio": 1.462641582810753
-  },
-  "comparisons": {
-   "zig_s": 0.845214,
-   "puc_s": 0.601712,
-   "ratio": 1.4046819741005663
-  },
-  "table_alloc_setmetatable": {
-   "zig_s": 0.06387,
-   "puc_s": 0.043837,
-   "ratio": 1.4569883888039783
-  },
-  "array_access": {
-   "zig_s": 0.082073,
-   "puc_s": 0.046089,
-   "ratio": 1.780750287487253
-  },
-  "metamethod_call_noalloc": {
-   "zig_s": 0.015842,
-   "puc_s": 0.008624,
-   "ratio": 1.8369666048237476
-  },
-  "int_arith": {
-   "zig_s": 0.23046,
-   "puc_s": 0.175472,
-   "ratio": 1.3133719339837695
-  },
-  "field_access": {
-   "zig_s": 0.095375,
-   "puc_s": 0.056838,
-   "ratio": 1.6780147084696857
-  },
-  "temp_table_alloc": {
-   "zig_s": 0.035613,
-   "puc_s": 0.030484,
-   "ratio": 1.1682521978742946
-  },
-  "hash_access": {
-   "zig_s": 0.118371,
-   "puc_s": 0.068657,
-   "ratio": 1.724092226575586
-  },
-  "string_loop": {
-   "zig_s": 0.122595,
-   "puc_s": 0.097033,
-   "ratio": 1.2634361505879443
-  },
-  "string_concat": {
-   "zig_s": 0.08526,
-   "puc_s": 0.077848,
-   "ratio": 1.0952111807625116
+  "baseline_identity": {
+    "baseline_phase": "P16.35-final",
+    "note": "1.44578 @ 162ae06 (production HEAD, clean src, binary sha16 23c67305670ee4b6). Phase P16.35: Cut 0 truth hygiene (be4fb0a): cursor-audit u.lua.pc type fix (usize 8B, not u32) + heap-PC inventory + PC-lifetime proof artifact + fresh dispatch-head decomposition \u2014 honest provable cursor win corrected to -2..-3 i/fetch (T0's -4..-5 double-counted the scaled-index addressing mode and the advance-fold). Cut 1 dispatch-PC-as-pointer-cursor HONESTLY REJECTED (a0491b3, pre-registered protocol): the instruction win materialized exactly per decomposition (fetch 4->2 i, int_arith -3.95%, branch_loop -4.57%) but WALL REGRESSED +25-30% on tight arith loops (int_arith +25.3%, float_arith +30.6%, mixed_arith +27.5%; IPC 5.51->4.23; cold never-taken probe inside dispatcher robust 0.233-0.243 -> 0.296-0.302 = structural, not layout lottery) -> REVERTED; permanent representation-independent test tests/smoke/75_pc_cursor.lua KEPT (9 PC-invariant probes, passes on both index and cursor builds); evidence tools/status/p16.35-t3-cursor-ab-rejected.md incl. untested re-attempt candidate (ctx-cached code_ptr + index pc: fetch 3 i, chain depth like cursor). T5 coroutine_yield gap decomposition (d518ce1): gap +1536.5 i/it = lookup +7.1 (0.5%) + transition +1529.4 (99.5%); ranked 5 mechanisms with PUC citations (resume error-state ceremony ~395+69+14 i vs PUC 135 incl setjmp ldo.c; builtin guard chain ~230; switchRuntime 157; 3 frame scans per yield vs PUC nCcalls AND+TEST; setFrom memcpy x2 vs zero-copy yield). Cut 3 builtin OP_CALL guard-chain hoisting KEEP (162ae06, T5 mechanism #2, PUC lvm.c:1720/ldo.c:642 parity): coroutine_yield -267.66 i/it A/B (2524.73->2257.07, official counters -235.4), wall -13.3% (1.90x->1.58x), geomean 1.47176->1.4164 (-3.8%) at the Cut-3 measurement; controls int_arith/branch_loop/temp_table_alloc/lua_calls EXACTLY 0.00 (GC pacing unchanged); GC placement KEPT by documented decision (OP_CALL epilogue condGcFromDispatch is the ONLY GC trigger for builtin-string loops; relocation = internStr DispatchError cascade = dedicated cut). FINAL RE-MEASURE NOISE TRUTH: this baseline is the fresh final wrap measurement of the BYTE-IDENTICAL binary (sha16 23c67305670ee4b6 = the Cut-3 measured binary): geomean 1.4164 (Cut-3 session) -> 1.44578 (this session) = +2.1% host noise; per-workload drift on identical instructions: global_arith 1.384->1.551 (+12.1%, the known bimodal CPU-frequency host-noise mode), coroutine_yield 1.526->1.617 (+6.0%), array_access 1.719->1.805 (+5.0%), hash_access +4.5%, string_loop +4.6%; 18/18 OK vs baseline-p15.37, 0 WARN/FAIL (max positive delta string_concat +0.6%, global_arith +0.5%). P16.36 regression checks run against THIS noise-inclusive measurement (conservative: fewer false FAILs)."
   }
- },
- "zig": {
-  "dynamic_load": 0.199239,
-  "branch_loop": 0.859628,
-  "global_arith": 0.836084,
-  "lua_calls": 0.119961,
-  "coroutine_yield": 0.080572,
-  "mixed_arith": 0.246387,
-  "float_arith": 0.231052,
-  "metamethod_add": 0.090264,
-  "comparisons": 0.845214,
-  "table_alloc_setmetatable": 0.06387,
-  "array_access": 0.082073,
-  "metamethod_call_noalloc": 0.015842,
-  "int_arith": 0.23046,
-  "field_access": 0.095375,
-  "temp_table_alloc": 0.035613,
-  "hash_access": 0.118371,
-  "string_loop": 0.122595,
-  "string_concat": 0.08526
- },
- "puc": {
-  "dynamic_load": 0.126717,
-  "branch_loop": 0.529892,
-  "global_arith": 0.553888,
-  "lua_calls": 0.090914,
-  "coroutine_yield": 0.04358,
-  "mixed_arith": 0.174678,
-  "float_arith": 0.175391,
-  "metamethod_add": 0.061713,
-  "comparisons": 0.601712,
-  "table_alloc_setmetatable": 0.043837,
-  "array_access": 0.046089,
-  "metamethod_call_noalloc": 0.008624,
-  "int_arith": 0.175472,
-  "field_access": 0.056838,
-  "temp_table_alloc": 0.030484,
-  "hash_access": 0.068657,
-  "string_loop": 0.097033,
-  "string_concat": 0.077848
- },
- "ratios": {
-  "dynamic_load": 1.5723146854802434,
-  "branch_loop": 1.622270198455534,
-  "global_arith": 1.5094820613553641,
-  "lua_calls": 1.3194997470136614,
-  "coroutine_yield": 1.8488297384121157,
-  "mixed_arith": 1.410521073060145,
-  "float_arith": 1.3173537980854206,
-  "metamethod_add": 1.462641582810753,
-  "comparisons": 1.4046819741005663,
-  "table_alloc_setmetatable": 1.4569883888039783,
-  "array_access": 1.780750287487253,
-  "metamethod_call_noalloc": 1.8369666048237476,
-  "int_arith": 1.3133719339837695,
-  "field_access": 1.6780147084696857,
-  "temp_table_alloc": 1.1682521978742946,
-  "hash_access": 1.724092226575586,
-  "string_loop": 1.2634361505879443,
-  "string_concat": 1.0952111807625116
- },
- "baseline_identity": {
-  "baseline_phase": "P16.34-final",
-  "note": "1.47176 @ 6e9cd69 (src = 6290951); per-fetch dispatch head slimmed 18 -> ~15 i/fetch (T0 projected ~10, NOT reached: gate-local REJECTED, pc-as-pointer not attempted): Cut 1 boundary-published dispatch_pc (PUC savedpc ownership parity, -1 i/fetch, 0a4009d), Cut 3.5 donextjump inline (PUC docondjump parity, -18 i/taken-condjump, dcbd16d), Cut 3.1 vmfetch bounds-check removal (PUC luaV_execute while(true) parity, terminator-invariant safety via undump.verifyProtoCode, 6290951); Cut 2 dispatch-local gate word REJECTED with A/B evidence (LLVM re-materializes the local as a per-fetch reload; tools/status/p16.34-t2-gate-local-rejected.md) \u2014 kept the hook-restore exit-ordering parity bug fix + tests/smoke/74_hook_trap_state.lua; branch_loop 1.879->1.622x, lua_calls 1.374->1.319x, comparisons 1.521->1.405x, field_access 1.817->1.678x, hash_access 1.687->1.724x (bimodal host-noise documented in prior phases), int_arith 1.402->1.313x; cut ledger: tools/perf/p16.23-cut-ledger.json convention, per-cut A/B in commit messages 0a4009d/03c9dd1/dcbd16d/6290951; 18/18 OK vs baseline-p15.37 (0 WARN/FAIL). global_arith 1.410->1.509x (+7.0% vs P16.33-final) = host-noise, evidence: same binary b0fedf8a, instructions:u identical 3/3 (12,837,940,568/945/679, spread < 700 instr) while wall is bimodal 0.76/0.85s (CPU frequency modes, zig IPC 4.38 vs puc 5.02 at stable 12.84B instr = post-Cut-3.1 count BELOW the 13.19B mode documented at dcbd16d); PUC stable 0.55s 3/3."
- }
 }

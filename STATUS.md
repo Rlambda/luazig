@@ -1,4 +1,4 @@
-> Last updated: 2026-09-10 (P16.35 Cut 3 — builtin OP_CALL guard-chain hoisting (T5 mechanism #2): protected-family id gate + coroutine-switch trampoline flag hoisted to both OP_CALL/OP_TAILCALL sites, return-event hook probes gated by hooks_active_cached, builtinOutLen → comptime ?u16 table (default 1, null=dynamic) + inline wrapper + out-of-line 10-case dynamic switch; GC placement KEPT (OP_CALL epilogue condGcFromDispatch is the only GC trigger for builtin-string loops — internStr has no check; PUC checks inside lapi.c push APIs l.426/549/592/603; relocation = internStr DispatchError cascade, dedicated cut); coroutine_yield −267.66 i/it A/B (gap 1494.7→1259.3 official, −235.4; target was −170..−230), wall −13.3% (1.90x→1.58x), metamethod_add −115, table_alloc_setmetatable −158, string_loop −173 i/it; controls int_arith/branch_loop/temp_table_alloc/lua_calls exactly 0.00; geomean 1.47176→1.4164 (−3.8%); dispatch 67,840→67,692 B, .text +424 B; gates: fmt, unit D+RF, smoke 74/74, matrix --testc zig_fail=0 (gc/gengc/tracegc/locals/coroutine/db/errors/events green), c_api ALL PASS + diff, api580 GREEN, perf 18/18 OK)
+> Last updated: 2026-09-10 (P16.35 COMPLETE — pointer-cursor honestly REJECTED (instr −4% but wall +25-30% structural; permanent test 75 kept; re-attempt candidate documented), builtin guard-chain hoisting KEEP (coroutine_yield 1.90→1.58x wall, geomean 1.4718→1.4458 final-wrap noise-inclusive; Cut-3 session 1.4164 on byte-identical binary), coroutine gap fully decomposed (lookup 0.5% / transition 99.5%))
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -36,9 +36,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **74/74** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.42x** |
+| Performance (geomean vs PUC) | **1.45x** |
 
-Geomean замедления vs PUC Lua: **1.42x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.45x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -6086,6 +6086,108 @@ unit D+RF 199/199, perf final: run1 global_arith +16.6% FAIL → host-noise
 бинарнике, 11 параллельных opencode-сессий, load ~2), re-run +5.5% WARN
 (host остаётся шумным; тот же source на T3-гейте мерил +3.0% OK), остальные
 17 workloads OK, geomean 1.48778.
+
+### P16.35 COMPLETE: dispatch PC cursor — честный REJECT; builtin guard-chain hoisting — KEEP; coroutine gap полностью декомпозирован (2026-09-10)
+
+**Geomean 1.47176 → 1.4458 (final-wrap, noise-inclusive; Cut-3 сессия мерила
+1.4164, −3.8%, на байт-идентичном бинарнике)**; measured `162ae06` (7 runs,
+core 0; snapshot `tools/perf/current*.json` + `current-codesize.json` +
+`current-differential-profile.json` перегенерированы; baseline-approved →
+P16.35-final = 1.44578).
+
+- **Cut 0 truth hygiene (`be4fb0a`)**: cursor-audit fix — `u.lua.pc` на самом
+  деле **usize 8B** (не u32, аудит врал); heap-PC inventory (105 сайтов:
+  ~40 readers / ~45 writers / конверсии, полный список в артефакте); NEW
+  PC-lifetime proof (`tools/status/p16.35-pc-lifetime-and-consumers.md`) —
+  cursor в proto.code стабилен всё время жизни фрейма, включая parked-корутины
+  (GC-pin через closure-дерево, оба undump-режима); fresh dispatch-head
+  decomposition: **honest provable cursor win = −2..−3 i/fetch, не −4..−5** —
+  старая T0-оценка double-count'ила scaled index (адресация, 0 инструкций) и
+  advance-fold; оставшийся гэп 6-7 i = gate load 1 (unfixable, P16.34 Cut 2) +
+  jump-table 4-vs-1 (structural).
+- **Cut 1 dispatch PC as pointer cursor (PUC savedpc) — реализован, измерён,
+  REJECTED (`a0491b3`, pre-registered protocol)**: полная Stage-1 конверсия
+  (~160 сайтов, `ctx.pc_cur: [*]const bc.Instruction`, хелперы pcIndex/
+  jumpCursor, heap u.lua.pc остаётся usize) прошла ВСЕ функциональные гейты;
+  instruction-выигрыш материализовался ровно по декомпозиции (fetch 4→2 i;
+  int_arith −3.95%, branch_loop −4.57%); НО **wall регрессировал +25-30% на
+  tight arith loops** (int_arith +25.3%, float_arith +30.6%, mixed_arith
+  +27.5%; IPC 5.51→4.23; cold never-taken probe внутри dispatcher 0.233→0.296
+  = структурный штраф, НЕ layout lottery — проверено в обе стороны) →
+  **REVERTED** по pre-registered протоколу. KEPT:
+  `tests/smoke/75_pc_cursor.lua` — representation-independent parity-гейт
+  (9 PC-invariant проб, проходит и на index-, и на cursor-билде). Кандидат на
+  re-attempt записан (не тестировался): ctx-cached `code_ptr` + index pc
+  (fetch 3 i, глубина цепочки как у курсора). Полный артефакт:
+  `tools/status/p16.35-t3-cursor-ab-rejected.md`.
+- **T5 coroutine_yield gap decomposition (research, `d518ce1`)**: A/B/C/D
+  варианты, оба движка: gap +1536.5 i/it = **lookup +7.1 (0.5%) + transition
+  +1529.4 (99.5%)** — весь гэп это resume/yield-механизмы, lookup-путь уже
+  parity. 5 ранжированных механизмов с PUC-цитатами (callgrind per-cycle):
+  #1 resume error-state ceremony ~380 (25%); #2 builtin OP_CALL guard chain +
+  per-call GC ~230 (15%); #3 switchRuntime буферный своп 157 (10%); #4
+  O(frames) yield-boundary derivation ~90 (6%); #5 value copying на yield ~50
+  (3%). Артефакт: `tools/status/p16.35-t5-coroutine-decomposition.md`.
+- **Cut 3 builtin OP_CALL guard-chain hoisting — KEEP (`162ae06`, T5 механизм
+  #2, PUC lvm.c:1720/ldo.c:642 parity)**: 4 guard-гейта, все generic
+  id-class/flag, без benchmark special cases: (1) protected-family id gate
+  (pcall/xpcall) поднят в caller на обоих OP_CALL/OP_TAILCALL сайтах;
+  (2) coroutine-switch trampoline flag поднят в caller; (3) return-event hook
+  probes gated by `hooks_active_cached` (PUC precallC читает hookmask
+  напрямую, ldo.c:650); (4) builtinOutLen → comptime `?u16` таблица + inline
+  wrapper (один table load на 5 сайтах) + out-of-line `builtinOutLenDynamic`
+  2,025 B (10 аргументо-зависимых случаев). A/B: coroutine_yield
+  **−267.66 i/it** (2524.73→2257.07; официальные counters gap −235.4), wall
+  −13.3% (1.90x→1.58x); metamethod_add −115, table_alloc_setmetatable −158,
+  string_loop −173 i/it; контролы int_arith/branch_loop/temp_table_alloc/
+  lua_calls — ровно **0.00** (GC pacing не тронут). **GC placement KEPT
+  задокументированным решением**: OP_CALL-эпилог condGcFromDispatch —
+  единственный GC-триггер для builtin-string-циклов (internStr не имеет
+  проверки, в отличие от allocTable); перенос на string-creation sites =
+  internStr → DispatchError каскад по parser/error/stdlib = отдельный
+  dedicated cut. Полный отчёт: `tools/status/p16.35-cut3-guard-hoisting.md`.
+
+Cut ledger (i/it, median-of-3, taskset -c 0):
+
+| cut | coroutine_yield | mm_add | table_alloc_sm | string_loop | controls |
+|---|---|---|---|---|---|
+| Cut 1 cursor (`a0491b3`) | +0.51% | ~0 | — | — | instr −4%, wall +25-30% → REJECTED |
+| Cut 3 guard hoist (`162ae06`) | **−267.66** | −115 | −158 | −173 | 0.00 exact |
+
+Wall (final snapshot @ 162ae06 vs P16.34-final): geomean 1.47176→1.4458;
+coroutine_yield 1.849→1.617x (Cut-3 сессия 1.526). Host-noise truth:
+бинарник байт-идентичен в обеих сессиях (sha16 23c67305670ee4b6) — дрейф
+geomean +2.1% (global_arith +12.1% — известный бимодальный CPU-frequency
+режим; coroutine_yield +6.0%; array_access +5.0%) = чистый host noise,
+инструкции не менялись.
+
+P16.36 queue:
+
+- **механизм #1: resume error-state ceremony ~380 i/it (25% гэпа)** —
+  8-полей error save/restore + ~10 defer-блоков на каждый resume (PUC:
+  error-состояние = сам longjmp status, ldo.c:966-997); требует
+  архитектурного решения per-thread error state vs pointer-swapped window;
+- **механизм #3: per-thread stacks 157 i/it (10%)** — switchRuntime буферный
+  своп (PUC платит 0: per-thread stack постоянен); рефакторинг всех
+  bc_stack-сайтов;
+- **механизм #4: yield-boundary O(frames) derivation ~90 i/it (6%)** — 3
+  скана фреймов на yield vs один AND+TEST nCcalls (ldo.c:1016);
+- **механизм #5: value copying на yield ~50 i/it (3%)** — setFrom ×2
+  дублирует одни значения (PUC lua_yieldk копирует NOTHING);
+- **internStr GC cascade** — перенос GC-проверки на string-creation sites
+  (PUC lapi.c:426/549/603 модель), internStr → DispatchError каскад;
+- **cursor re-attempt candidate** (не тестировался): ctx-cached code_ptr +
+  index pc;
+- semantic backlog: `lua_settop` tbc-close, resume-of-finished-co leftover,
+  `luaL_traceback`, `gc_count_kb`, double-traceback на uncaught top-level
+  error (P16.33 side-finding).
+
+Гейты фазы @ 162ae06: fmt; unit D+RF; smoke 74/74 (включая 75_pc_cursor.lua);
+matrix --testc 31/32 zig_fail=0 (big.lua both_fail pre-existing); c_api make
+clean test ALL PASS + test-diff PASS (TBC 22+23); api580 GREEN. Final-wrap
+re-run (fresh, этот wrap): matrix 31/32 zig_fail=0, smoke 74/74, perf
+median-of-7 **18/18 OK vs baseline-p15.37, 0 WARN/FAIL** (max positive delta
+string_concat +0.6%, global_arith +0.5%); baseline-approved = 1.44578.
 
 ## История закрытых фаз
 

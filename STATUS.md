@@ -1,4 +1,4 @@
-> Last updated: 2026-09-09 (P16.34 COMPLETE — geomean 1.48778→1.47176 (−1.1%); per-fetch dispatch head 18→~15 i/fetch (T0 projected ~10 — NOT reached: gate-local REJECTED with A/B evidence, pc-as-pointer not attempted; landed: boundary-published PC −1 i/fetch (PUC savedpc ownership), donextjump inline (PUC docondjump parity, −18 i/taken-condjump), vmfetch bounds-check removal (PUC while(true) parity, terminator invariant + undump.verifyProtoCode safety net)); int_arith 109.1→102.2 i/it (T0 projected 89: item 2 rejected + item 3 partial explain the full gap); hook-restore exit-order parity fix kept from Cut 2; branch_loop 1.879→1.622x, lua_calls 1.374→1.319x, comparisons 1.521→1.405x, field_access 1.817→1.678x, int_arith 1.402→1.313x; 18/18 OK vs baseline (global_arith +7.0% = host-noise: identical instructions 3/3, bimodal wall 0.76/0.85s); dispatch 65,332→67,840 B (+2,508: T3.5 inline outweighs head savings), .text 2,380,073→2,364,729 (−15,344))
+> Last updated: 2026-09-10 (P16.35 Cut 1 — dispatch PC as pointer cursor (PUC savedpc): implemented, measured, REJECTED — full Stage-1 conversion (~160 sites, ctx.pc_cur: [*]const bc.Instruction, heap pc stays usize), ALL functional gates GREEN, instruction win EXACTLY as decomposed (fetch 4→2 i, fetch+advance 5→3: int_arith −3.95%, branch_loop −4.57%, comparisons −4.11%, float_arith −3.80%, mixed_arith −3.57%, hash_access −3.79%, lua_calls −2.21%, field_access −2.3% real (bimodal modes both shifted −40.5M)), but WALL REGRESSED +25-30% on tight arith loops (int_arith +25.3%, float_arith +30.6%, mixed_arith +27.5%; official perf gate FAIL +29-33%; IPC 5.51→4.23, +2.3 c/dispatch; NOT layout lottery — probed both directions, robust) → REVERTED per pre-registered protocol (cursor stack-spilled, win did not survive to wall); honest negative preserved in p16.35-t3-cursor-ab-rejected.md incl. untested re-attempt candidate (code_ptr-cached ctx field); KEPT: tests/smoke/75_pc_cursor.lua (representation-independent parity gate, 9 probes, passes on both index and cursor builds); src/ unchanged vs HEAD be4fb0a — perf current.json remains valid; smoke 73→74/74. Prior: P16.34 COMPLETE — geomean 1.48778→1.47176 (−1.1%); per-fetch dispatch head 18→~15 i/fetch (landed: boundary-published PC −1 i/fetch (PUC savedpc ownership), donextjump inline (PUC docondjump parity, −18 i/taken-condjump), vmfetch bounds-check removal (PUC while(true) parity, terminator invariant + undump.verifyProtoCode safety net)); branch_loop 1.879→1.622x, lua_calls 1.374→1.319x, comparisons 1.521→1.405x, field_access 1.817→1.678x, int_arith 1.402→1.313x; dispatch 65,332→67,840 B, .text 2,380,073→2,364,729 (−15,344))
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -34,7 +34,7 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
 | Differential output (`--diff`) | **0 output_diff** |
-| Smoke tests (`tests/smoke/*.lua`) | **73/73** pass |
+| Smoke tests (`tests/smoke/*.lua`) | **74/74** pass |
 | C API suites (`tests/c_api`) | 23 suites |
 | Performance (geomean vs PUC) | **1.47x** |
 
@@ -9562,3 +9562,70 @@ back-jmp) = **15 i/fetch**. PUC luaV_execute: доминирующий head 0x21
 Гейт: zig fmt (без изменений — только .md артефакты); unit D+RF; smoke
 73/73; matrix --testc zig_fail=0; api580 GREEN. Runtime-поведение не
 изменено (src/ нетронут).
+
+## P16.35 Cut 1 — dispatch PC as pointer cursor (PUC savedpc): реализован, измерён, REJECTED (2026-09-10)
+
+Полный честный негатив сохранён в
+[tools/status/p16.35-t3-cursor-ab-rejected.md](tools/status/p16.35-t3-cursor-ab-rejected.md).
+Краткая выжимка:
+
+**Реализация (Stage 1, полная)**: `ctx.pc: usize` → `ctx.pc_cur:
+[*]const bc.Instruction` во всех ~160 code-сайтах vm.zig; хелперы
+`pcIndex` (derived index для heap/debug потребителей) и `jumpCursor`
+(знаковая jump-арифметика, Debug-ловушки сохранены); heap
+`u.lua.pc` остаётся usize (Stage 2 не начинался — гейтед на успехе
+Stage 1). MMBIN prev-reads: `(ctx.pc_cur - 1)[0]` (Zig many-pointer не
+даёт литеральный `[-1]`). Defensive-проверки EXTRAARG-followers
+(NEWTABLE/SETLIST/ERRDEFINED) сохранены с index-derived bounds.
+Инвариант: `cur_proto` и `pc_cur` всегда обновляются вместе.
+
+**Гейты — все GREEN на cursor-билде**: fmt; unit D+RF 217/217;
+smoke 74/74 (включая новый 75_pc_cursor.lua); matrix --testc
+zig_fail=0; c_api make test ALL PASS; TBC 22+23 DIFF-EMPTY (RF);
+api580 GREEN; CallFrame==88 comptime (heap layout не тронут);
+code size: runBytecodeDispatch +205 B, .text +1,200 B.
+
+**Instruction A/B (taskset -c 0, медиана 3)**: выигрыш МАТЕРИАЛИЗОВАЛСЯ
+ровно по декомпозиции T0.3 — fetch 4→2 инструкции (cur_proto reload +
+pc reload + code.ptr load + scaled load → cursor reload + direct load),
+fetch+advance 5→3. int_arith −3.95%, branch_loop −4.57%,
+comparisons −4.11%, float_arith −3.80%, mixed_arith −3.57%,
+hash_access −3.79%, lua_calls −2.21%, field_access −2.3% (bimodal,
+обе моды сдвинулись на −40.5M — медиана врёт), metamethod_add ~0
+(park-derivation +2/park компенсирует), coroutine_yield +0.51%
+(park-heavy).
+
+**Wall A/B — REJECTION**: int_arith +25.3%, float_arith +30.6%,
+mixed_arith +27.5% (официальный perf_compare FAIL: +29.0/+32.6/+29.8%);
+branch_loop/comparisons/lua_calls ~нейтрально; field_access −7.1%,
+hash_access −7.2%, metamethod_add −3.0%, coroutine_yield −2.9%.
+Микроанализ int_arith: cycles +25% (+2.3 c/dispatch), IPC 5.51→4.23,
+uops_issued −6%, branch counts/misses идентичны, store_forward
+идентичен. Циклы концентрируются на хвосте dispatch-switch
+(add+jmp* ~10%→~23%) при байт-идентичном стриме инструкций свитча.
+
+**НЕ layout lottery (проверено в обе стороны)**: base + cold
+never-taken probe внутри dispatcher — без регрессии (0.233-0.243);
+new + тот же probe — регрессия не изменилась (0.296-0.302). В отличие
+от P16.34 Cut 2 (hash_access +12% качнулся от perturbation), здесь
+штраф структурный. Точный frontend-механизм изолировать не удалось
+(DSB/MITE счётчики на этом hybrid CPU нестабильны: 191M vs 1,016M
+на один бинарь).
+
+**Решение по pre-registered протоколу**: курсор stack-spilled
+(регистровое давление 68KB-свитча), instruction-выигрыш не конвертировался
+в wall, официальный гейт FAIL → **REVERTED**. src/ восстановлен к HEAD
+be4fb0a (6290951), wall проверено восстановлен (int_arith 0.234).
+Stage 2 не пытался — он не трогает hot-fetch-path.
+
+**Оставлено**: `tests/smoke/75_pc_cursor.lua` — parity-гейт
+представления PC (9 проб: MMBIN skip/fallback, condjump, EXTRAARG
+followers, backward FOR, точные error-строки, hook lines,
+yield/resume replay, parked-frame GC); проходит и на index-, и на
+cursor-представлении. Кандидат на re-attempt записан в артефакте:
+ctx-кэшируемый `code_ptr` при index-pc (fetch 3 инструкции, глубина
+цепочки как у курсора, форма блоков ближе к base) — не тестировался.
+
+**Гейты после revert**: unit PASS; smoke 74/74; matrix --testc
+zig_fail=0 (big.lua both_fail pre-existing); perf current.json
+не перегенерирован — src/ идентичен HEAD, артефакт P16.34 валиден.

@@ -1,27 +1,28 @@
 {
   "meta": {
-    "created_utc": "2026-09-09T23:40:06.441134+00:00",
+    "created_utc": "2026-09-10T15:25:02.542576+00:00",
     "lane": "smoke_compare",
     "argv": [
-      "/home/boss/codes/luazig/tools/smoke_compare.py",
+      "tools/smoke_compare.py",
+      "--no-build",
       "--json-out",
-      "/home/boss/codes/luazig/tools/status/.tmp.smoke.64wkmqq2.json"
+      "tools/status/current-smoke.json"
     ],
     "zig_version": "0.16.0"
   },
   "provenance": {
-    "git_head": "6e9cd69",
-    "measured_source_head": "6e9cd69",
-    "git_dirty": "dirty",
+    "git_head": "be4fb0a",
+    "measured_source_head": "be4fb0a",
+    "git_dirty": "clean",
     "source_dirty": "clean",
-    "artifact_dirty": "dirty",
+    "artifact_dirty": "clean",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "b0fedf8a7d0280cf",
+    "zig_binary_sha16": "0bfb5ae3c95909b3",
     "puc_binary_sha16": "d54bc45e1757b216"
   },
-  "total": 73,
-  "ok": 73,
+  "total": 74,
+  "ok": 74,
   "mismatches": 0,
   "results": [
     {
@@ -314,6 +315,10 @@
     },
     {
       "file": "tests/smoke/74_hook_trap_state.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/75_pc_cursor.lua",
       "match": true
     }
   ]

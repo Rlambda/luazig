@@ -1,4 +1,4 @@
-> Last updated: 2026-09-10 (P16.35 COMPLETE — pointer-cursor honestly REJECTED (instr −4% but wall +25-30% structural; permanent test 75 kept; re-attempt candidate documented), builtin guard-chain hoisting KEEP (coroutine_yield 1.90→1.58x wall, geomean 1.4718→1.4458 final-wrap noise-inclusive; Cut-3 session 1.4164 on byte-identical binary), coroutine gap fully decomposed (lookup 0.5% / transition 99.5%))
+> Last updated: 2026-09-10 (P16.36 Cut 3 — gsub yieldability O(frames) scan → O(1) nCcalls nny unit: gsub __index continuation push now owns the unit (the one scan-only gap), hasActiveBytecodeNonYieldableBoundary deleted, coroutine_yield −44.4 i/it (−2.0%); Cut 1 error-state ownership Vm → Thread complete)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -34,7 +34,7 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
 | Differential output (`--diff`) | **0 output_diff** |
-| Smoke tests (`tests/smoke/*.lua`) | **74/74** pass |
+| Smoke tests (`tests/smoke/*.lua`) | **76/76** pass |
 | C API suites (`tests/c_api`) | 23 suites |
 | Performance (geomean vs PUC) | **1.45x** |
 
@@ -6170,8 +6170,16 @@ P16.36 queue:
 - **механизм #3: per-thread stacks 157 i/it (10%)** — switchRuntime буферный
   своп (PUC платит 0: per-thread stack постоянен); рефакторинг всех
   bc_stack-сайтов;
-- **механизм #4: yield-boundary O(frames) derivation ~90 i/it (6%)** — 3
-  скана фреймов на yield vs один AND+TEST nCcalls (ldo.c:1016);
+- **механизм #4: yield-boundary O(frames) derivation ~90 i/it (6%)** —
+  ✅ ЗАКРЫТ Cut 3 (2026-09-10): `hasActiveBytecodeNonYieldableBoundary`
+  удалён; gsub repl + gsub `__index` continuation-push'и владеют nny-единицей
+  nCcalls (PUC ccall(nyci) / luaT_callTMres→callnoyield); yieldability =
+  O(1) `Thread.yieldable()`. Измерено −44.4 i/it (−1.99%) на
+  coroutine_yield (финальная enter-before-push сборка; промежуточная
+  enter-after-push −58.6 i/it — ранний enter накрывает CALL-hook окно
+  ребёнка, как PUC ccall(nyci)). Оставшиеся сканы — инвентарь
+  p16.36-coroutine-scan-inventory.md (suspension-owner search 1-2 шага —
+  следующий кандидат);
 - **механизм #5: value copying на yield ~50 i/it (3%)** — setFrom ×2
   дублирует одни значения (PUC lua_yieldk копирует NOTHING);
 - **internStr GC cascade** — перенос GC-проверки на string-creation sites
@@ -10107,3 +10115,117 @@ P16.35-final) — **RESULT: OK, no regressions** (coroutine_yield +0.4%,
 lua_calls −1.8%, metamethod_call_noalloc −0.3%, branch_loop −2.1%,
 int_arith +0.0%, temp_table_alloc −1.3%, array_access −2.5%; geomean
 Zig/PUC 1.45x). Cut 1 закрыт полностью.
+
+## P16.36 Cut 3 — gsub yieldability: O(frames) скан → O(1) nCcalls nny-единица (2026-09-10)
+
+Cut 3 фазы P16.36 (закрывает механизм #4 из P16.35-декомпозиции:
+yield-boundary O(frames) derivation). T5.1 аудит владения → T5.2 кат.
+Артефакты: `tools/status/p16.36-cut3-gsub-nny-audit.md` (аудит-таблица всех
+non-yieldable-границ, negative-validation, A/B) +
+`tools/status/p16.36-coroutine-scan-inventory.md` (T6: инвентарь
+ОСТАВШИХСЯ сканов yield/resume-пути — «все сканы удалены» НЕ заявляется).
+
+**T5.1 аудит (владение non-yieldable-границами).** Ключевой вопрос: gsub
+входит ли сегодня в nny-единицу nCcalls (PUC `yieldable(L)` = upper 16
+bits == 0)? Ответ: repl-функция — ДА (P16.23 T6: ccallEnter(.nonyieldable)
+на continuation-push, exit в applyBytecodePendingGsub + cancel, unwind
+восстанавливает BytecodeProtectedCall-снапшот nCcalls); gsub table
+`__index`-метаметод — НЕТ: push без nny, скан был ЕДИНСТВЕННЫМ владельцем
+(ЕДИНСТВЕННЫЙ реальный gap); sync-пути (runGsubReplacementFunction,
+tableGetFromNonYieldableC) держат nny синхронно. Окна, где pending `.gsub`
+существует и исполняется Lua: ровно 3 (repl-continuation, __index-
+continuation, sync-вызовы) — между push'ами sync-цикл Lua не исполняет.
+Остальные границы аудита: pcall/xpcall = .yieldable (PUC lua_pcallk с
+finishpcall-continuation — yield-through-pcall легален); __close =
+CloseCallPolicy nny-единица; coroutine.close = incnny на закрываемом
+thread + close_mode; debug hooks = in_debug_hook + allow_yield (модель
+PUC allowhook); testC callk/yieldk = ccallEnter(.nonyieldable)/incnny;
+C API lua_callk k==NULL = .nonyieldable; `__pairs` = PUC 5.5
+lua_callk С continuation pairscont (lbaselib.c:295) — YIELDABLE, наш push
+без nny корректен (эмпирически сверино); __concat/arith-мм из Lua-опкодов
+= isLuacode → luaD_call — yieldable, паритет. Скан не покрывал НИЧЕГО
+кроме gsub → после фикса __index он чистое дублирование.
+
+**T5.2 кат.** (a) `tryPushBytecodeGsubTableIndex`: успешный __index-push
+теперь входит в `ccallEnter(.nonyieldable)` под тем же идемпотентным
+флагом (переименован `repl_ccall_active` → `cont_ccall_active` — покрывает
+оба вида continuation); exit-пути уже генерические (completion + cancel +
+снапшот unwind). (a') **enter-before-push уточнение (pre-commit review
+catch)**: единица входит ДО push'а на ОБОИХ сайтах (repl + __index), не
+после — pushResolvedBytecodeClosure диспатчит CALL-hook ребёнка
+(dispatchCalleeActivationHook, шаг 5) как часть push'а, а в PUC этот hook
+стреляет ВНУТРИ окна ccall(nyci) (nny поднят до precall; C-callee:
+ldo.c:652 luaD_hook внутри precallC; Lua-callee: hook на старте функции
+внутри luaV_execute — тоже внутри окна). До кат'а скан это окно покрывал
+(pending .gsub ставился на шаге 2 push'а, до hook-диспатча); enter только
+после успешного push'а оставил бы окно непокрытым — регрессия для
+C-hook'а с allow_yield, yield'ящегося в CALL-hook ребёнка gsub (PUC
+блокирует через nny). Реструктуризация восстанавливает точное покрытие:
+общие хелперы gsubContCcallEnter/gsubContCcallRollback; rollback при
+отказе push'а (sync-fallback входит в свою единицу) и через errdefer при
+ошибке push'а. RETURN-hook ребёнка отдельной обработки не требует — он
+стреляет в OP_RETURN, пока фрейм ребёнка ещё активен, до exit'а в
+applyBytecodePendingGsub. (b) `hasActiveBytecodeNonYieldableBoundary`
+УДАЛЁН. (c) 3 caller'а заменены O(1)-членом, который уже проверялся
+параллельно: coroutineBuiltinFastPathEligible (.coroutine_yield),
+builtinCoroutineYield, builtinCoroutineIsyieldable — везде остаётся
+`!th.yieldable()` (PUC yieldable(L)). Новых флагов/счётчиков нет —
+единица nCcalls upper (P16.24-модель: снапшоты восстанавливаются на
+unwind).
+
+**Паритет-пробы (10/10 байт-идентичны PUC, оба двигателя).** yield в
+gsub-repl → "attempt to yield across a C-call boundary"; yield в gsub
+__index → тот же; __pairs yield → РАЗРЕШЁН; __concat yield → разрешён;
+coroutine.isyieldable() = false внутри repl и __index; yield после
+завершения gsub и после error+recovery → OK.
+
+**Negative-validation.** Временно сняты ОБА ccallEnter на gsub-push'ах
+(скан уже удалён): прямой gsub-repl yield — корутина SUSPEND'ится внутри
+gsub (`true must-not-suspend` vs PUC `false ...C-call boundary`);
+прямой __index yield — та же дивергенция; isyieldable внутри repl/__index
+= true (PUC false). 4 пробы 77_gsub_yieldability.lua падают (T2b, T3b,
+T4×2). Примечание: pcall(string.gsub,...) в negative-сборке блокируется
+синхронным gsub-путём (его собственная nny-единица — корректна, не
+трогалась); прямой вызов (OP_CALL divert → continuation) — именно то,
+чем владели снятые enter'ы. Восстановлено, smoke 77 снова байт-идентичен.
+Negative-validation повторён ПОСЛЕ enter-before-push реструктуризации
+(нейтрализован gsubContCcallEnter): те же 4 расхождения (T2b/T3b
+suspend'ятся, T4 isyieldable=true) — единица по-прежнему единственный
+владелец поведения; восстановлено, smoke 77 байт-идентичен.
+
+**Измерение (A/B instructions:u, median-of-3, taskset -c 0).**
+coroutine_yield 1,114,416,378 → 1,092,196,565 = **−1.99% (−44.4 i/it**,
+2228.8 → 2184.4 i/it; финальная enter-before-push сборка — enter ДО push'а,
+чтобы CALL-hook ребёнка (внутри push'а) шёл под единицей, как в PUC
+ccall(nyci); промежуточная enter-after-push мерила −2.63% (−58.6 i/it);
+P16.35-оценка ~90 i/it gross — скан звался до 2 раз
+за цикл resume+yield); контроли: lua_calls −0.000%, mm_noalloc +0.004%
+(noise), branch_loop +0.000%, field_access бимодален (1.728B/1.799B режимы на ОБОИХ
+бинарях — host noise, wall-медиана after ≤ before). perf_compare
+median-of-7: 18/18, geomean 1.46x, coroutine_yield −2.7% wall; единственный
+WARN field_access +9.2% = задокументированный бимодальный workload (прямой
+A/B wall на тех же бинарях: before 0.1046s vs after 0.0994s — after БЫСТРЕЕ
+на 5%; оба бинаря сэмплируют оба режима instruction-count).
+
+**Обнаруженные pre-existing дивергенции (задокументированы, НЕ чинились
+здесь — вне механизма скана).** (1) table.sort comparator yield: PUC
+блокирует (callnoyield из C-контекста sort), luazig разрешает suspend;
+tableSortLess даже специализирует прямой .coroutine_yield-Builtin —
+name-based аппроксимация отсутствующей nny-единицы; нужен отдельный кат
+(sort comparator boundary, тот же класс, что __index-gap этого ката).
+(2) Время закрытия TBC умершей от ошибки корутины: PUC lua_resume
+error-путь НЕ закрывает to-be-closed (ldo.c:989-993, без closeprotected) —
+закрытие в luaE_resetthread (coroutine.close); luazig закрывает при
+unwind resume. Наблюдаемо как порядок print'ов вокруг resume/close
+(минимальный gsub-free probe). Обе — открытые parity-пункты.
+
+**Гейты.** fmt; builds Debug+RF; unit D+RF PASS; smoke **76/76** (новый
+перманентный tests/smoke/77_gsub_yieldability.lua — пробы: нормальный
+yield, отказ в repl (pcall + прямой), отказ в __index (pcall + прямой),
+isyieldable в обоих окнах, yield после завершения/ошибы gsub, nested
+pcall/xpcall в repl, __close в repl, yield-ящий __close в repl,
+coroutine.close умершей внутри gsub корутины, рекурсивный gsub, yield из
+корутины, resumed внутри repl); matrix --testc 31/32 zig_fail=0 (big.lua
+both_fail pre-existing; strings/sort/gsub-heavy зелёные); c_api make test
+ALL PASS + test-diff PASS (TBC 22+23); api580 GREEN; testc_lane 9/9.
+README/STATUS generated-блоки перегенерированы (smoke 76/76).

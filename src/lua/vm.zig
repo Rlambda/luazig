@@ -940,11 +940,16 @@ const BytecodeConcatContinuation = struct {
 /// bytecode backend the same property without recursively entering
 /// runBytecode from the builtin.
 const BytecodeGsubContinuation = struct {
-    /// P16.23 T6: one C-depth unit is held while a replacement-function
-    /// continuation frame is in flight (PUC: lua_call → ccall(nyci) around
-    /// each repl invocation). The flag makes the accounting IDEMPOTENT
-    /// against boundary replay after a coroutine yield/resume.
-    repl_ccall_active: bool = false,
+    /// P16.23 T6 / P16.36 Cut 3: one C-depth unit is held while ANY gsub
+    /// child continuation is in flight — the replacement function (PUC:
+    /// lua_call → ccall(nyci) around each repl invocation) OR the table
+    /// __index metamethod (PUC: lua_gettable from the gsub C context →
+    /// luaT_callTMres → luaD_callnoyield). The flag makes the accounting
+    /// IDEMPOTENT against boundary replay after a coroutine yield/resume.
+    /// P16.36 Cut 3: this unit is the SINGLE owner of gsub non-yieldability
+    /// — the old O(frames) `hasActiveBytecodeNonYieldableBoundary` scan was
+    /// deleted in its favor (PUC `yieldable(L)` = nCcalls upper bits == 0).
+    cont_ccall_active: bool = false,
     result: BytecodeResultContinuation,
     subject: Value,
     pattern: Value,
@@ -5190,17 +5195,6 @@ pub const Vm = struct {
         return self.in_error_handler;
     }
 
-    fn hasActiveBytecodeNonYieldableBoundary(self: *Vm) bool {
-        const thread = self.activeBytecodeThread();
-        var i = thread.call_frames.len();
-        while (i != 0) {
-            i -= 1;
-            const pending = self.getPendingCallConst(thread.call_frames.getConstPtr(i).pending_call_index) orelse continue;
-            if (pending.completion == .gsub) return true;
-        }
-        return false;
-    }
-
     fn activeCloseMetamethodDepth(self: *Vm) usize {
         return self.close_metamethod_depth + self.activeBytecodeThread().bytecode_close_metamethod_depth;
     }
@@ -8691,12 +8685,13 @@ pub const Vm = struct {
             .concat => |cont| self.alloc.free(cont.values),
             .gsub => |cont| {
                 const state = cont;
-                // P16.23 T6: release the in-flight repl unit (the unwind
-                // pops the frame without a completion pass). The owning
-                // protection's snapshot restore makes this belt-and-braces.
-                if (state.repl_ccall_active) {
+                // P16.23 T6: release the in-flight continuation unit (the
+                // unwind pops the frame without a completion pass). The
+                // owning protection's snapshot restore makes this
+                // belt-and-braces.
+                if (state.cont_ccall_active) {
                     self.activeBytecodeThread().ccallExit(.nonyieldable);
-                    state.repl_ccall_active = false;
+                    state.cont_ccall_active = false;
                 }
                 self.deinitBytecodeGsub(state);
                 self.alloc.destroy(state);
@@ -10093,6 +10088,33 @@ pub const Vm = struct {
         return storage[0..count];
     }
 
+    /// P16.36 Cut 3: enter the gsub continuation's nny unit BEFORE the child
+    /// push. The push machinery dispatches the child's CALL hook
+    /// (`dispatchCalleeActivationHook`, step 5 of `pushResolvedBytecodeClosure`)
+    /// — in PUC that hook fires INSIDE the ccall(nyci) window (lua_call /
+    /// lua_gettable raise nny before precall dispatches hooks, ldo.c:652),
+    /// so the unit must already be held when the hook runs. Idempotent via
+    /// `cont_ccall_active` (at most one unit per gsub state; pushes are
+    /// strictly sequential — each continuation completes before the next).
+    fn gsubContCcallEnter(self: *Vm, state: *BytecodeGsubContinuation) DispatchError!void {
+        if (!state.cont_ccall_active) {
+            try self.ccallEnter(self.activeBytecodeThread(), .nonyieldable);
+            state.cont_ccall_active = true;
+        }
+    }
+
+    /// P16.36 Cut 3: paired rollback when the push did NOT leave a
+    /// continuation in flight (push declined → the synchronous fallback
+    /// enters its own unit; push errored → errdefer here). The completion
+    /// (`applyBytecodePendingGsub`) and unwind (`cancelBytecodePendingCall`)
+    /// exits are the same flag check — one mechanism.
+    fn gsubContCcallRollback(self: *Vm, state: *BytecodeGsubContinuation) void {
+        if (state.cont_ccall_active) {
+            self.activeBytecodeThread().ccallExit(.nonyieldable);
+            state.cont_ccall_active = false;
+        }
+    }
+
     fn tryPushBytecodeGsubTableIndex(
         self: *Vm,
         exec_frames: *FrameStack,
@@ -10115,7 +10137,17 @@ pub const Vm = struct {
             }
             if (mm == .Closure and mm.Closure.proto != null) {
                 const call_args = [_]Value{ object, key };
-                return self.tryPushBytecodeContinuationCall(
+                // P16.36 Cut 3: PUC runs gsub's table lookup from a C
+                // context — lua_gettable → luaV_finishget → luaT_callTMres
+                // sees a non-Lua current ci and calls luaD_callnoyield
+                // (incnny). The __index metamethod frame is therefore
+                // non-yieldable exactly like the repl function. The unit is
+                // entered BEFORE the push so the child's CALL-hook dispatch
+                // (inside the push) runs under it, exactly like PUC; rolled
+                // back when no continuation is left in flight.
+                try self.gsubContCcallEnter(state);
+                errdefer self.gsubContCcallRollback(state);
+                const pushed = try self.tryPushBytecodeContinuationCall(
                     exec_frames,
                     parent_index,
                     mm,
@@ -10124,6 +10156,8 @@ pub const Vm = struct {
                     "metamethod",
                     "index",
                 );
+                if (!pushed) self.gsubContCcallRollback(state);
+                return pushed;
             }
             return false;
         }
@@ -10284,6 +10318,19 @@ pub const Vm = struct {
                             &caps,
                             &call_storage,
                         );
+                        // P16.23 T6 / P16.36 Cut 3: PUC invokes each gsub
+                        // replacement through lua_call → ccall(nyci): one
+                        // C-depth unit per repl invocation, raised BEFORE
+                        // the call so the child's CALL-hook dispatch (inside
+                        // the push) runs under it — PUC fires that hook
+                        // inside the ccall window. The iterative
+                        // continuation has no C frame, so the unit is
+                        // accounted here, before the push, and released at
+                        // the continuation's completion (in
+                        // applyBytecodePendingGsub). Errors unwind to a
+                        // protection whose finish restores the snapshot.
+                        try self.gsubContCcallEnter(state);
+                        errdefer self.gsubContCcallRollback(state);
                         if (try self.tryPushBytecodeContinuationCall(
                             exec_frames,
                             parent_index,
@@ -10294,21 +10341,11 @@ pub const Vm = struct {
                             null,
                         )) {
                             owns_state = false;
-                            // P16.23 T6: PUC invokes each gsub replacement
-                            // through lua_call → ccall(nyci): one C-depth
-                            // unit per repl invocation. The iterative
-                            // continuation has no C frame, so the unit is
-                            // accounted HERE, at the push, and released at
-                            // the continuation's completion (in
-                            // applyBytecodePendingGsub). Errors unwind to a
-                            // protection whose finish restores the snapshot.
-                            if (!state.repl_ccall_active) {
-                                const th_g = self.activeBytecodeThread();
-                                try self.ccallEnter(th_g, .nonyieldable);
-                                state.repl_ccall_active = true;
-                            }
                             return .pushed;
                         }
+                        // Push declined — no continuation in flight; the
+                        // synchronous fallback below enters its own unit.
+                        self.gsubContCcallRollback(state);
                     }
                     const value = try self.runGsubReplacementFunction(
                         state.replacement,
@@ -10363,11 +10400,12 @@ pub const Vm = struct {
         ret: []Value,
         state: *BytecodeGsubContinuation,
     ) DispatchError!?[]Value {
-        // P16.23 T6: the in-flight repl's C-depth unit is complete
-        // (paired exit for the guarded enter at the push site).
-        if (state.repl_ccall_active) {
+        // P16.23 T6: the in-flight continuation's C-depth unit is complete
+        // (paired exit for the guarded enter at the push site — repl
+        // function or __index metamethod alike).
+        if (state.cont_ccall_active) {
             self.activeBytecodeThread().ccallExit(.nonyieldable);
-            state.repl_ccall_active = false;
+            state.cont_ccall_active = false;
         }
         self.clearPendingCall(exec_frames.getPtr(parent_index));
         switch (try self.advanceBytecodeGsub(exec_frames, parent_index, state, ret)) {
@@ -10613,11 +10651,13 @@ pub const Vm = struct {
                 // builtinCoroutineResume (resetCI drops all C-frames).
                 if (th.close_mode) return false;
                 // Thread must be yieldable (PUC lua_yield: L->ci must be
-                // yieldable — nCcalls < LUAI_MAXCCALLS).
+                // yieldable — nCcalls < LUAI_MAXCCALLS). P16.36 Cut 3: this
+                // single O(1) check also covers the gsub boundary — the
+                // repl-function and __index-metamethod continuation pushes
+                // own the nny upper unit (PUC ccall(nyci)), so the old
+                // O(frames) `hasActiveBytecodeNonYieldableBoundary` scan
+                // was pure duplication and is deleted.
                 if (!th.yieldable()) return false;
-                // No non-yieldable boundary (gsub pending call — PUC's
-                // CIST_YPCALL makes lua_yield fail with "C-call boundary").
-                if (self.hasActiveBytecodeNonYieldableBoundary()) return false;
                 // No C-frames on the stack at all. When yielding from within
                 // a builtin C-frame (e.g. pcall(foo) where foo yields),
                 // builtinCoroutineYield's P15.79 path expects the yield's
@@ -21514,7 +21554,12 @@ pub const Vm = struct {
         // is active the thread is inside a yy=0 close context where any
         // yield attempt must fail — this is how a suspended-inside-xpcall
         // thread gets correctly unwound when force-closed.
-        if (!th.yieldable() or self.hasActiveBytecodeNonYieldableBoundary() or
+        // P16.36 Cut 3: gsub non-yieldability is owned by the nny upper
+        // unit (entered at the repl/__index continuation pushes) — the old
+        // O(frames) `hasActiveBytecodeNonYieldableBoundary` scan is deleted;
+        // `th.yieldable()` (PUC yieldable(L) = nCcalls upper bits) is the
+        // single O(1) answer.
+        if (!th.yieldable() or
             (in_debug_hook and !self.activeDebugHookAllowsYield()))
             return self.failRunerror("attempt to yield across a C-call boundary", .{});
         if (th.close_mode) return self.failRunerror("attempt to yield across a C-call boundary", .{});
@@ -22672,7 +22717,10 @@ pub const Vm = struct {
                 return;
             };
             const in_debug_hook = self.isInDebugHook();
-            if (!t.yieldable() or self.hasActiveBytecodeNonYieldableBoundary() or
+            // P16.36 Cut 3: gsub non-yieldability is owned by the nny upper
+            // unit (repl/__index continuation pushes) — `t.yieldable()` is
+            // the single O(1) PUC-faithful answer (lua_isyieldable).
+            if (!t.yieldable() or
                 (in_debug_hook and !self.activeDebugHookAllowsYield()))
             {
                 outs[0] = .{ .Bool = false };

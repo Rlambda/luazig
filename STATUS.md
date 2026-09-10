@@ -9495,3 +9495,70 @@ Backlog фазы P16.34 после Cut 3: T0-компонент «gate load» о
 следующий кандидат — frame-transition ctx re-derivation (PUC startfunc/
 returning parity). Side-finding: perf-гейты, пересобирающие zig-out
 (api580), инвалидируют A/B-бинарники — верифицировать md5.
+
+## P16.35 Cut 0 — truth hygiene: cursor-audit fix + heap-PC inventory + PC-lifetime proof + head re-measure (2026-09-10)
+
+Нулевой cut фазы P16.35: нет runtime-изменений, только исправления
+артефактов-истины и замеры на чистом src (6290951 == HEAD 016532d,
+`git diff 6290951..HEAD --stat -- src/` пуст).
+
+**R0.1 — исправление фактической ошибки в p16.35-cursor-audit.md**: аудит
+утверждал `u.lua.pc: u32 today` — НЕВЕРНО: LuaFrameState.pc — `usize`
+(8 B, offset 8 в u.lua; vm.zig:1564 + current-callframe-layout.json).
+Исправлено. Добавлена секция heap-PC inventory (отдельно от ctx.pc):
+ctx.pc — 207 raw / 182 code uses (перепроверено, совпадает); heap
+`.u.lua.pc` — 105 raw (103 vm.zig + 2 c_api.zig), все code uses:
+~40 читателей (frame-resume restore 8, hook line tracking 3, hook replay
+comparisons 9, hooks lineinfo 2, debug currentline/getinfo 5, error name
+attribution 2, GC live_reg_top 3, C API 2, узлы питающие compact-поля/park
+15), ~45 писателей (activation init 6, tailcall reset 3, parkActiveFrame 1,
+hooks publish 2, in-loop metamethod publish 9, fail-site/Protect 5,
+cold-path 4, completion `pc+=1` heap-RMW 15), конвертации ctx↔heap
+(publish ~22 холодных, restore 8, narrowing @intCast ~18), полный список
+compact u32 полей resume_pc/last_line_pc/skip_line_hook_pc/
+skip_call_hook_pc/resume_skip_count_pc с писателями/читателями — все
+index-typed by contract (сравниваются с INVALID_PC, индексируют
+lineinfo/live_reg_top), рекомендация: оставить u32-индексами (PUC oldpc
+семантика).
+
+**R0.3 — новый артефакт p16.35-pc-lifetime-and-consumers.md**: вердикт —
+курсор `[*]const bc.Instruction` в proto.code стабилен всё время жизни
+фрейма, включая parked-корутины. Доказательство: (1) text-compiled —
+ProtoBuilder.finish toOwnedSlice → code иммутабелен с момента создания,
+нет production-мутаций; (2) undump — полный backing-ownership chain для
+fixed (borrowed=caller contract / owned=tree source_backing.owned /
+pinned=GC-pin) и non-fixed (всё копируется, cloneUndumpedStrings);
+(3) release-модель — closure retain/releaseTree, gcFreeObject; фрейм
+никогда не переживает свой proto: closure на bc_stack[func_slot] —
+безусловный GC-root для активного треда (gcMarkMutableRoots:23604) и для
+каждой parked-корутины (gcPropagateOne thread arm:25722), tailcall-reuse
+переписывает proto и func_slot атомарно вместе, pending.callee тоже
+маркируется; (4) Proto не двигаются (не GC-объекты, refcount-деревья).
+
+**T0.1 — воспроизведение baseline**: ReleaseFast rebuild, гейты: unit
+D+RF pass, smoke 73/73, matrix --testc zig_fail=0 (big.lua both_fail
+pre-existing), api580 GREEN. Instruction spot-check (taskset -c 0,
+3 прогона): int_arith 102.2/102.2/102.2, branch_loop 220.9×3,
+lua_calls 458.7×3 i/it — точное совпадение с current-counters.json.
+
+**T0.3 — точный re-measure dispatch-head на ЭТОМ source**: objdump
+runBytecodeDispatch (0x10bce30, 0x10900 B), доминирующий backward-edge
+target 0x10bd125 (73 края), tail incq на 0x10bd11e (61 край).
+Верифицированная последовательность: fetch 4 (cur_proto spill reload,
+pc spill reload, code.ptr load, scaled load) + gate 3 (VM-field
+movzbl 0xf8c(%r13) + test + je — Cut 2 evidence всё ещё в бинарнике) +
+dispatch 6 (movzbl+and+lea+movslq+add+jmp*) + tail 2 (incq spill RMW +
+back-jmp) = **15 i/fetch**. PUC luaV_execute: доминирующий head 0x21440
+(35 краёв) = 8 + back-jmp = 9; вариант 0x215b0→0x213b0 (26 краёв) = 7+1
+= 8. Свежая компонентная таблица ЗАМЕНИЛА устаревший прогноз T0
+«−4..5 i/fetch»: он double-counted — scaled index стоит 0 инструкций
+(addressing mode), advance-fold не аддитивен к fetch-side выигрышу.
+Честный provable-выигрыш курсора: **−2..−3 i/fetch** (fetch+advance
+блок 5 → 2–3 PUC-shaped); остальной гэп 6–7 = gate load (1, доказанно
+нефиксируем, Cut 2) + jump-table 4-vs-1 (3, структурная цена) — курсор
+их не трогает. Re-measure A/B + callgrind обязателен перед принятием
+(Cut 2 lesson).
+
+Гейт: zig fmt (без изменений — только .md артефакты); unit D+RF; smoke
+73/73; matrix --testc zig_fail=0; api580 GREEN. Runtime-поведение не
+изменено (src/ нетронут).

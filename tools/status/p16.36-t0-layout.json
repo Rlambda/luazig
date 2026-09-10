@@ -52,11 +52,51 @@
   ],
   "note": "fresh percentages at HEAD 1abf81c (src==162ae06): transition machinery (resume+switchRuntime+yield+fastpath-eligible+memcpy) = ~22.2% of cycles; dispatch itself 72.4% — consistent with the p16.35-t5 decomposition (gap = 99.5% transition machinery)"
  },
- "gates": {
-  "unit_debug": "PASS (zig build test, 0.16.0)",
-  "unit_releasefast": "PASS (zig build test --release=fast)",
-  "smoke": "74/74 PASS",
-  "matrix_testc": "31 pass + big.lua both_fail (pre-existing) — zig_fail=0",
-  "api580": "GREEN (Debug + ReleaseFast + sizes)"
- }
+  "p16_36_final": {
+   "phase": "P16.36 final wrap (HEAD 164ba0f, all cuts landed)",
+   "probe": "throwaway standalone Zig probe (/tmp/opencode/p36_final/p36_size_final.zig, same module graph, -OReleaseFast + -ODebug, -lc); probe kept in /tmp only, no repo source touched",
+   "layout_final": {
+    "Thread": {"size": 3712, "align": 8, "modes": "identical Debug+ReleaseFast", "delta_vs_cut0": "+80 B (3632 -> 3712): Cut 1b semantic error fields moved Vm -> Thread (err_obj+err_has_obj, err_cframe_residue, err_is_errerr, err_source+err_line, err_traceback) — exact field move, PUC model (error identity lives on the raising lua_State)"},
+    "Vm": {"size_releasefast": 6488, "size_debug": 6592, "align": 8, "delta_vs_cut0": "-96 B RF (6584 -> 6488) / -96 B Debug (6688 -> 6592): the moved payload is 80 B (Cut 1b commit message 'Vm -80B' = payload accounting); the extra -16 B is alignment/padding re-flow when the interleaved err_* fields left the struct. Cut 3 (164ba0f) changed no Vm fields (verified: git diff b2b79c3..164ba0f src/lua/vm.zig = function bodies only, bool rename repl_ccall_active -> cont_ccall_active; Vm probed IDENTICAL 6488 at b2b79c3 and 164ba0f). The phase-prompt expectation '6504?' was the 6584-80 payload prediction; measured truth is 6488."},
+    "CallFrame": {"size": 88, "align": 8, "modes": "identical Debug+ReleaseFast, unchanged all phase"}
+   },
+   "t7_fresh_abcd": {
+    "method": "cy_{A,B,C,D}.lua variants (P16.35 T5.1, verbatim), both engines, taskset -c 0 perf stat instructions:u, 3 runs, median; i/it = median / 500,000 (official whole-process methodology)",
+    "table": {
+     "A": {"zig_i_per_it": 2196.58, "puc_i_per_it": 992.36, "gap": 1204.2},
+     "B": {"zig_i_per_it": 2092.56, "puc_i_per_it": 895.41, "gap": 1197.1},
+     "C": {"zig_i_per_it": 2092.56, "puc_i_per_it": 895.40, "gap": 1197.2},
+     "D": {"zig_i_per_it": 1988.53, "puc_i_per_it": 789.36, "gap": 1199.2}
+    },
+    "lookup_vs_transition": {
+     "zig_lookup_pair": 104.0, "puc_lookup_pair": 96.95, "zig_both_A_minus_D": 208.05, "puc_both_A_minus_D": 203.00,
+     "lookup_attributable_gap": 5.05, "lookup_pct": 0.4,
+     "transition_attributable_gap": 1199.2, "transition_pct": 99.6,
+     "gap_constancy": "1204.2/1197.1/1197.2/1199.2 across A/B/C/D — additive and orthogonal, same structure as P16.35",
+     "vs_p16_35": "gap(A) 1536.5 -> 1204.2 (-332.3 i/it = P16.35 Cut 3 guard hoisting -267 + P16.36 Cut 1b resume ceremony + Cut 3 nny O(1) + noise); decomposition conclusion UNCHANGED and now stronger: lookup 0.4%, transition 99.6%"
+    }
+   },
+   "t7_fresh_perf_record_official": {
+    "method": "taskset -c 0 perf record -e cpu_core/cycles/u --call-graph dwarf, official microbench.lua coroutine_yield, 309 samples; perf report --no-children",
+    "top_symbols": [
+     { "symbol": "vm.Vm.runBytecodeDispatch", "pct": 71.64 },
+     { "symbol": "vm.Vm.builtinCoroutineResume", "pct": 12.17 },
+     { "symbol": "vm.Vm.callCoroutineBuiltinDirect", "pct": 3.14 },
+     { "symbol": "vm.Vm.switchRuntime", "pct": 3.11 },
+     { "symbol": "vm.Vm.builtinCoroutineYield", "pct": 2.44 },
+     { "symbol": "vm.Vm.runBytecodeInternal", "pct": 1.73 },
+     { "symbol": "vm.Vm.coroutineBuiltinFastPathEligible", "pct": 1.65 },
+     { "symbol": "vm.Vm.condGcFromDispatch", "pct": 1.42 },
+     { "symbol": "compiler_rt.memcpy.memcpyFast", "pct": 1.32 }
+    ],
+    "note": "vs Cut 0 (src==162ae06): builtinCoroutineResume 10.73->12.17, switchRuntime 4.42->3.11, builtinCoroutineYield 3.45->2.44, coroutineBuiltinFastPathEligible 1.83->1.65 (now the O(1) !th.yieldable() term only); hasActiveBytecodeNonYieldableBoundary ABSENT (deleted in Cut 3); clearErrorTraceback/tryPushBytecodeProtectedCall below 0.2% (ceremony deleted Cut 1b, guards hoisted P16.35 Cut 3). Percentages are of a SMALLER total wall (workload got faster), so absolute shares of resume/switchRuntime/yield all shrank in absolute terms."
+   }
+  },
+  "gates": {
+   "unit_debug": "PASS (zig build test, 0.16.0)",
+   "unit_releasefast": "PASS (zig build test --release=fast)",
+   "smoke": "74/74 PASS",
+   "matrix_testc": "31 pass + big.lua both_fail (pre-existing) — zig_fail=0",
+   "api580": "GREEN (Debug + ReleaseFast + sizes)"
+  }
 }

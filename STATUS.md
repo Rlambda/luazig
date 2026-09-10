@@ -10016,3 +10016,94 @@ sizes); targeted suites outputs match: coroutine/db/errors/locals/cstack/
 calls + events/attrib/closure/nextvar/gc. Все изменения — cold-path
 (error/capture/CLI-report); perf-гейты (perf_compare + A/B) — в конце
 cut'а после 1b.
+
+## P16.36 Cut 1b — error-state ownership: семантические поля ошибок перенесены Vm → Thread (2026-09-10)
+
+Cut 1 фазы P16.36, второй коммит (1a = f6c939a — err_cfunc_label). Закрывает
+пункт (2) из Cut 0: владение semantic error-state. PUC-модель: идентичность
+ошибки живёт на поднимающем lua_State (L->errorobj/errfunc/стек), а НЕ на
+global_State; luaD_seterrorobj переносит объект на границах resume. До 1b
+luazig держал семантические поля на Vm (одна «текущая ошибка» на всю VM) с
+церемонией save/restore из 7 полей на каждом resume/close — протечки через
+границы корутин латались bundle'ами.
+
+**Перенос полей (vm.zig).** Thread теперь владеет семантическим состоянием
+ошибки (поля ~2232-2270, с doc-комментариями): `err_obj` + `err_has_obj`
+(объект ошибки; PUC L->errorobj), `err_cframe_residue` (residue-значение
+C-кадра при ошибке в C-функции), `err_is_errerr` (LUA_ERRERR), `err_source`
++ `err_line` (позиция подъёма, latch на raise; PUC деривирует luaL_where
+из ci, но у нас кадры к моменту чтения уже развёрнуты — latch сохраняет
+identity), `err_traceback` (fault-point traceback; PUC строит live, наш
+captured-at-fault — задокументированное отступление). P16.28-поле
+`Thread.err_traceback` (replay мёртвой корутины для db.lua) переименовано
+в `err_dead_traceback` (5 сайтов). Vm оставлены только scratch-поля:
+`err` (raw-message view в err_buf; best-effort — вложенный resume может
+переписать; задокументировано), `err_buf`, `err_render_buf`.
+`protected_call_depth`/`in_error_handler` остаются на Vm (hot-path
+constraint; PUC nCcalls в 5.4+ тоже на global_State).
+
+**Удалённая церемония.** (a) 7-полевой bundle в `builtinCoroutineResume`
+УДАЛЁН: на входе resume чистит ВСЕ 7 полей на `th` (err_traceback
+освобождается первым), dead-status defer читает `th.err_is_errerr`
+напрямую + безусловно освобождает `th.err_traceback`, хвосты !ok и
+forced_close_ok читают `th.` напрямую. (b) bundle + 2048-байтная копия
+Vm.err в `closeThreadRegionsOnClosedThread` УДАЛЕНЫ: defer сбрасывает
+error-state закрываемого th. (c) `saveBytecodeProtectedError`/
+`restoreBytecodeSavedError` (pcall/xpcall LIFO-слоты, эмуляция стековой
+дисциплины PUC) остаются, переписаны на свой `th`. (d) Новый accessor
+`pub fn errThread()` (= activeBytecodeThread) для cold-path чтений;
+boundary-читатели (хвосты resume после switch-back, c_api lua_resume)
+обязаны читать thread напрямую — errThread() после switch-back резолвится
+в CALLER'а. ~263 сайта переписаны self.X → self.errThread().X.
+
+**Границы C-API (c_api.zig/api.zig).** lua_resetthread поднимает на `th`;
+lua_error fold — `h.thread orelse vm.main_thread.?` (L-семантика: ошибка
+идёт на текущий thread хоста); lua_resume catch читает `co.err_*`
+(резюмленный thread — фикс старой хрупкости, где bundle-defer
+восстанавливал состояние caller'а); rethrow-мосты и unit-тесты —
+errThread()/th.
+
+**GC-разметка.** Thread mark-walk размечает `th.err_obj` (при
+err_has_obj), `th.err_cframe_residue` и попутно закрытый pre-existing gap
+`th.close_err` (при close_has_err) — раньше эти значения не размечались
+(потенциальный use-after-free при GC между подъёмом и обработкой).
+
+**Teardown-фикс (найден unit-тестом).** Старый free `err_traceback` в
+Vm.deinit не занулял поле → double-free с новым safety-net в
+`freeThreadWrapBuffers` (который теперь освобождает err_traceback всех
+drain-потоков). Удалён (safety-net покрывает полнее).
+
+**Расследование locals.lua/cstack.lua (первоначально принятых за
+регрессии 1b).** Оба суита показали DIFF (locals: лишняя точка tracegc
+перед заголовком "to-be-closed variables in coroutines"; cstack: сдвиг
+final-count'ов + точки). Root cause точек: testes/tracegc.lua — его `__gc`
+пишет "." в stderr и перемаркирует объект (точка = GC-цикл с финализацией;
+gdb-подтверждено: g_write ← precall ← luaV_execute ← GCTM ← luaC_fullgc ←
+luaB_collectgarbage). ГИПОТЕЗА «1b сдвинул GC-pacing (Thread +80B)»
+ОПРОВЕРГНУТА stash-экспериментом: базлайн 1a (f6c939a, чистый rebuild)
+даёт БАЙТ-ИДЕНТИЧНЫЕ diff'ы обоих суитов (cstack 1a==1b полностью;
+locals 1a==1b полностью). Оба расхождения — задокументированные
+pre-existing классы: locals = GC-pacing window alignment
+(locals-tracegc-divergence.json, backlog), cstack = resume-chain
+accounting + metatable-gsub unit (p16.23-cstack-analysis.json, backlog).
+Поправка к записи Cut 1a: пункт «targeted suites: locals/cstack match» в
+gate-протоколе 1a был ошибочен (проверка batch-грепом; фактические
+расхождения присутствовали уже в 1a). 1b не внесла НИ ОДНОГО нового
+расхождения: 9 суитов match (coroutine/db/errors/calls/events/attrib/
+closure/nextvar/gc), locals/cstack байт-идентичны базлайну.
+
+**Размеры (probe, тот же модуль-граф, RF и Debug идентичны).** Thread
+3632 → 3712 (+80 B; бюджет ≤128 B соблюдён), Vm 6672 → 6592 (−80 B —
+ровно перенос полей), CallFrame 88 без изменений. (Абсолютные значения
+отличаются от p16.36-t0-layout.json из-за probe-методологии; дельта
+замерена одним probe'ом stash↔tree.)
+
+**Гейты (все на финальном дереве, RF).** fmt; builds Debug+RF; unit D+RF
+PASS; smoke 75/75; matrix --testc 31/32 zig_fail=0 (big.lua both_fail
+pre-existing); c_api make clean test ALL PASS + test-diff PASS; api580
+GREEN; суиты — см. выше. **Perf-гейты (отложенные из 1a на конец cut'а)**:
+perf_compare.py (16 микро-бенчмарков, median-of-7, vs baseline-approved
+P16.35-final) — **RESULT: OK, no regressions** (coroutine_yield +0.4%,
+lua_calls −1.8%, metamethod_call_noalloc −0.3%, branch_loop −2.1%,
+int_arith +0.0%, temp_table_alloc −1.3%, array_access −2.5%; geomean
+Zig/PUC 1.45x). Cut 1 закрыт полностью.

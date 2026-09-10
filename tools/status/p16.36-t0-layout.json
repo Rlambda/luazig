@@ -1,0 +1,62 @@
+{
+ "created_utc": "2026-09-10T20:30:00+00:00",
+ "phase": "P16.36 Cut 0 (T0 truth baseline)",
+ "provenance": {
+  "git_head": "1abf81c",
+  "measured_source_head": "162ae06",
+  "measured_source_note": "git diff 162ae06..HEAD --stat -- src/ is empty; src/ byte-identical to the P16.35 Cut-3 measured source",
+  "git_dirty": "clean (before this artifact)",
+  "zig_version": "0.16.0",
+  "zig_binary_path": "/usr/bin/zig",
+  "zig_binary_sha16": "9640c29ae441820b",
+  "zig_toolchain_note": "tools/zig-bin/zig is STALE Zig 0.15.2 (sha16 2858dc89dbbfdd08, gitignored) and CANNOT build HEAD (std.process.Init/std.Io.File are 0.16 APIs) — all builds in this phase used system /usr/bin/zig 0.16.0; AGENTS.md toolchain target ('actual installed zig') = 0.16.0",
+  "puc_binary": "build/lua-c/lua",
+  "puc_binary_sha16": "d54bc45e1757b216",
+  "luazig_releasefast_sha16": "23c67305670ee4b6",
+  "optimize_mode": "ReleaseFast (production) + Debug (layout cross-check)",
+  "probe_note": "throwaway standalone Zig probes compiled OUTSIDE the repo (/tmp/opencode/p36_layout3.zig) against the same module graph (--dep lua -Mlua=src/lua/root.zig --dep util -Mutil=src/util/root.zig), -OReleaseFast and -ODebug; probes DELETED after capture; no repo source touched"
+ },
+ "layout": {
+  "Thread":  { "size": 3632, "align": 8, "modes": "identical Debug+ReleaseFast" },
+  "Vm": {
+   "size_releasefast": 6584, "size_debug": 6688, "align": 8,
+   "mode_delta_note": "104 B = 12 x HashMapUnmanaged (16 B RF vs 24 B Debug safety field: long_string_cache, finalizables, gc_marked_tables/closures/threads, gc_fin_tables/closures/threads, c_libs, open_files, file_buffers, open_processes) + StringIntern long_literals (16 vs 24) — std containers carry a Debug-only safety field; PRODUCTION (ReleaseFast) Vm = 6584 B. The phase prompt's ~6688 expectation is the DEBUG number."
+  },
+  "CallFrame":       { "size": 88, "align": 8, "offset_u": 32, "union_floor": 56, "modes": "identical Debug+ReleaseFast", "comptime_assert": "vm.zig:2494-2499 (size==88, offsetOf(u)==32, align==8) compiles in every mode" },
+  "LuaFrameState":   { "size": 48, "align": 8, "note": "private type; measured via CallFrame.u.lua union arm in the probe; no dedicated comptime assert exists (only the 48-B figure in the vm.zig:1621 comment) — CallFrame==88 assert transitively pins the arm sizes" },
+  "CFrameState":     { "size": 56, "align": 8 }
+ },
+ "t0_counters": {
+  "method": "taskset -c 0 perf stat -j -e instructions:u,cycles:u, median of 3 whole-process runs per workload per engine; i/it = median instructions / bench n (warmup included in instructions, same convention as p16.35-cut3 artifact)",
+  "workloads": {
+   "int_arith":               { "n": 50000000, "zig_i_per_it": 102.23, "puc_i_per_it": 60.76, "ratio": 1.682 },
+   "branch_loop":             { "n": 50000000, "zig_i_per_it": 220.90, "puc_i_per_it": 141.06, "ratio": 1.566 },
+   "lua_calls":               { "n": 5000000,  "zig_i_per_it": 458.71, "puc_i_per_it": 257.13, "ratio": 1.784 },
+   "temp_table_alloc":        { "n": 500000,   "zig_i_per_it": 1121.99, "puc_i_per_it": 1138.67, "ratio": 0.985 },
+   "coroutine_yield":         { "n": 500000,   "zig_i_per_it": 2242.93, "puc_i_per_it": 1015.91, "ratio": 2.208 },
+   "metamethod_add":          { "n": 500000,   "zig_i_per_it": 2719.21, "puc_i_per_it": 2104.94, "ratio": 1.292 },
+   "metamethod_call_noalloc": { "n": 500000,   "zig_i_per_it": 596.55, "puc_i_per_it": 375.56, "ratio": 1.588 }
+  },
+  "notes": "coroutine_yield zig 2242.93 i/it matches the canonical post-guard-chain 2257.07 within host noise (−0.6%); puc 1015.91 vs canonical 997.73 (+1.8% run-to-run puc noise); phase-prompt estimate ~2.248x instr → measured 2.208x fresh. Controls int_arith/branch_loop/lua_calls/temp_table_alloc exactly reproduce canonical values (102.23/220.90/458.71/1121.99)."
+ },
+ "t0_perf_record_coroutine_yield": {
+  "method": "taskset -c 0 perf record -F 20000 -e cycles:u, official microbench workload, 1546 samples",
+  "top_symbols": [
+   { "symbol": "vm.Vm.runBytecodeDispatch", "pct": 72.41 },
+   { "symbol": "vm.Vm.builtinCoroutineResume", "pct": 10.73 },
+   { "symbol": "vm.Vm.switchRuntime", "pct": 4.42 },
+   { "symbol": "vm.Vm.builtinCoroutineYield", "pct": 3.45 },
+   { "symbol": "vm.Vm.runBytecodeInternal", "pct": 2.17 },
+   { "symbol": "vm.Vm.coroutineBuiltinFastPathEligible", "pct": 1.83 },
+   { "symbol": "compiler_rt.memcpy.memcpyFast", "pct": 1.72 }
+  ],
+  "note": "fresh percentages at HEAD 1abf81c (src==162ae06): transition machinery (resume+switchRuntime+yield+fastpath-eligible+memcpy) = ~22.2% of cycles; dispatch itself 72.4% — consistent with the p16.35-t5 decomposition (gap = 99.5% transition machinery)"
+ },
+ "gates": {
+  "unit_debug": "PASS (zig build test, 0.16.0)",
+  "unit_releasefast": "PASS (zig build test --release=fast)",
+  "smoke": "74/74 PASS",
+  "matrix_testc": "31 pass + big.lua both_fail (pre-existing) — zig_fail=0",
+  "api580": "GREEN (Debug + ReleaseFast + sizes)"
+ }
+}

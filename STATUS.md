@@ -9854,3 +9854,80 @@ error state vs pointer-swapped window); #3 — чистейшее архитек
 расхождение (per-thread stack), но рефакторинг всех bc_stack-сайтов.
 
 **Гейты**: N/A (research-only, src/ == HEAD; артефакт закоммичен).
+
+## P16.36 Cut 0 — truth baseline + error-state ownership inventory + differential probes (2026-09-10)
+
+Нулевой cut фазы P16.36: НЕТ runtime-изменений (src/ == 162ae06, verified),
+только truth-артефакты + дифференциальные пробы. HEAD 1abf81c.
+
+**T0 baseline** (tools/status/p16.36-t0-layout.json): provenance — Zig
+0.16.0 /usr/bin/zig (sha16 9640c29ae441820b; tools/zig-bin STALE 0.15.2,
+не билдит HEAD — все сборки фазы системным zig), PUC d54bc45e1757b216,
+luazig RF 23c67305670ee4b6 (детерминированный cache-hit). Гейты: unit D+RF
+PASS, smoke 74/74, matrix --testc 31/32 zig_fail=0 (big.lua both_fail
+pre-existing), api580 GREEN. Свежие counters (median-of-3, taskset -c 0):
+coroutine_yield zig 2242.93 / puc 1015.91 i/it = **2.208x** (канон
+2257.07/997.73 = 2.26x в пределах host-noise; оценка фазы ~2.248x
+подтверждена), int_arith 102.23/60.76, branch_loop 220.90/141.06,
+lua_calls 458.71/257.13, temp_table_alloc 1121.99/1138.67 (0.985x —
+быстрее PUC), mm_add 2719.21/2104.94, mm_call_noalloc 596.55/375.56.
+Layout truth (throwaway probe, удалён): **Thread 3632/8** (оба режима),
+**Vm 6584 RF / 6688 Debug** (модовая дельта 104 B = 12×HashMapUnmanaged
+16→24 Debug-safety + StringIntern — ПРОДАКШН 6584; ожидание ~6688 фазы =
+Debug-число), CallFrame 88/8 offset_u 32 (comptime assert vm.zig:2494),
+LuaFrameState 48/8, CFrameState 56/8. perf record coroutine_yield (1546
+samples): dispatch 72.41%, resume 10.73%, switchRuntime 4.42%, yield 3.45%,
+runBytecodeInternal 2.17%, fastPathEligible 1.83%, memcpy 1.72% —
+transition machinery ~22.2% (консистентно с p16.35-t5 декомпозицией).
+
+**T1 inventory** (tools/status/p16.36-error-state-ownership.md): полная
+карта владения error-состоянием. Ключевое архитектурное расхождение: PUC
+держит ВСЮ error-identity на стеке поднимающего потока (объект на L->top-1,
+статус per-thread через errorJmp->status, errfunc/status на lua_State,
+никаких глобальных буферов/traceback/label), luazig — Vm-global поля +
+save/restore-церемония на каждой границе (= perf-механизм #1, ~380 i/it).
+Классификация: SEMANTIC (err_obj, err_has_obj, err_cframe_residue,
+err_is_errerr, err_source, err_line, err_traceback, err_cfunc_label —
+все Vm-global, предложенный владелец Thread), SCRATCH (err-алиас, err_buf,
+err_render_buf), COUNTERS (in_error_handler, protected_call_depth —
+корректно не сохраняются), per-thread УЖЕ корректно (api_status, errfunc,
+errfunc_running_idx, err_traceback, bytecode_protected_depth). Механика:
+BytecodeSavedError копирует байты именно из-за алиаса err→err_buf (256-B
+truncation — латентная дивергенция для сообщений >256 B); resume-bundle
+сохраняет 7 полей SLICE-only (без копии байтов) и МИССИТ err_is_errerr +
+err_cfunc_label (+ err_buf alias); closeThreadProtected — ЕДИНСТВЕННЫЙ
+полный saver (10 полей + 2048-B копия) — доказательство, что полный набор
+уже был известен, но не бэкпортирован в resume/pcall.
+
+**T2 пробы** (обе машины, verbatim): T2.1 nested resume в handler — PARITY;
+T2.2 ERRERR isolation — PARITY на Lua-уровне (латентный err_is_errerr leak
+статически доказан, наблюдаем только через C-API статус-коды); T2.4
+shared-buffer alias (err→err_buf через resume) — PARITY: hazard замаскирован
+интернированием err_obj при raise + unwind-снапшотами
+(restoreRuntimeErrorValue переприцеливает err на интернированный снапшот);
+T2.5 чередование A/B — PARITY; T2.6 успешный inner resume в handler —
+PARITY; **T2.3 C-function label — DIVERGENCE (outcome A, реальный
+cross-thread leak)**: err_cfunc_label не сохраняется НИ одной границей кроме
+close, failC (vm.zig:6799) сохраняет существующий label, а его сайты
+(xpcall bad-arg 20953/20956, io.open, string.format) не пресетят свой —
+итог: (a) traceback failC-ошибок без пресета ЛИШАЁТСЯ [C]-кадра (PUC:
+"[C]: in global 'xpcall'" / "[C]: in field 'open'"), (b) stale label
+последнего error()/assert() (ЛЮБОГО уже восстановленного, в т.ч.
+cross-thread через coroutine.resume) МИС-атрибутируется ("[C]: in global
+'error'" для чужого xpcall-аргеррора). Минимальный репродьюсер (5 строк):
+`pcall(function() error("plain", 0) end); xpcall(print, "not-a-function")`.
+PUC-first фикс-направление: структурная деривация синтетического C-кадра из
+top hidden builtin C-frame при capture (state-free), интерим — пресет на
+каждом failC/failLib сайте + поле во все bundle. Попутно reconfirmed
+pre-existing: CLI double-traceback на uncaught top-level error (backlog,
+P16.33 side-finding).
+
+Открытые пункты для следующих cut'ов (ранжировано): (1) err_cfunc_label
+lifecycle (структурная деривация), (2) per-thread error channel (убирает
+всю bundle-церемонию + закрывает оба leak-вектора by construction + часть
+380 i/it resume ceremony), (3) err_is_errerr per-thread (подмножество 2),
+(4) BytecodeSavedError 256-B truncation + missing residue, (5) error()
+prefix-path 256-B message truncation, (6) CLI double-traceback (backlog).
+
+Гейты фазы: unit D+RF PASS; smoke 74/74; matrix --testc 31/32 zig_fail=0;
+api580 GREEN; src/ не менялся (git diff 162ae06..HEAD --stat -- src/ пуст).

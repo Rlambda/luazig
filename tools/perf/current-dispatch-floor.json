@@ -1,0 +1,613 @@
+{
+  "created_utc": "2026-09-11T20:19:54.657251+00:00",
+  "task": "P16.10 dispatch floor measurement + lowering analysis + historical component deltas",
+  "head": "862bec7",
+  "zig_version": "0.16.0",
+  "binary_identity": {
+    "zig": {
+      "path": "/home/boss/codes/luazig/zig-out/bin/luazig",
+      "sha256": "c134caa825828c375e0c65d5a9dda663eb53248326d121bea9d6551f00b57c3c",
+      "size_bytes": 15263464,
+      "mtime_unix": 1789157657.923628
+    },
+    "puc": {
+      "path": "/home/boss/codes/luazig/build/lua-c/lua",
+      "sha256": "d54bc45e1757b216eaa8a273511fc9fcd2670e97ca85dfe9781daf71437a91f2",
+      "size_bytes": 341000,
+      "mtime_unix": 1789157124.6804812
+    }
+  },
+  "cpu_info": {
+    "model": "13th Gen Intel(R) Core(TM) i7-13700H",
+    "flags": "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities"
+  },
+  "measurement": {
+    "method": "n-vs-2n delta (steady-state subtraction); pinned core 0; user-mode counters",
+    "n": 500000000,
+    "runs_per_point": 5,
+    "core": "0",
+    "events": "instructions:u,cycles:u,branches:u,branch-misses:u,cache-misses:u,cache-references:u",
+    "steady_state_note": "per_iter = (counter[2N] - counter[N]) / N. This cancels setup (VARARGPREP, tonumber, os.clock) and epilogue (io.write, string.format, return) which are constant regardless of N. The result is pure FORLOOP dispatch+handler cost per iteration."
+  },
+  "part1_steady_state": {
+    "workload": "for i = 1, n do end (empty body)",
+    "zig": {
+      "instructions_per_iter": 61.018619336,
+      "instructions_2n": 61010653983,
+      "instructions_n": 30501344315,
+      "cycles_per_iter": 12.151496454,
+      "cycles_2n": 12104909207,
+      "cycles_n": 6029160980,
+      "branches_per_iter": 7.002101434,
+      "branches_2n": 7001292095,
+      "branches_n": 3500241378,
+      "branch-misses_per_iter": -5.926e-06,
+      "branch-misses_2n": 10261,
+      "branch-misses_n": 13224,
+      "cache-misses_per_iter": 1.0602e-05,
+      "cache-misses_2n": 22352,
+      "cache-misses_n": 17051,
+      "cache-references_per_iter": 2.4562e-05,
+      "cache-references_2n": 44465,
+      "cache-references_n": 32184,
+      "ipc": 5.0214901158049585,
+      "cpi": 0.19914407415689941,
+      "branch_miss_ratio": -8.463173599892754e-07,
+      "cache_miss_ratio": 0.43164237439947883,
+      "wall_per_iter_ns": 3.206984
+    },
+    "puc": {
+      "instructions_per_iter": 28.00029707,
+      "instructions_2n": 28005538860,
+      "instructions_n": 14005390325,
+      "cycles_per_iter": 10.3466212,
+      "cycles_2n": 10362720242,
+      "cycles_n": 5189409642,
+      "branches_per_iter": 5.000055534,
+      "branches_2n": 5001005839,
+      "branches_n": 2500978072,
+      "branch-misses_per_iter": 1.66e-07,
+      "branch-misses_2n": 7542,
+      "branch-misses_n": 7459,
+      "cache-misses_per_iter": 1.014e-06,
+      "cache-misses_2n": 12168,
+      "cache-misses_n": 11661,
+      "cache-references_per_iter": -1.458e-06,
+      "cache-references_2n": 20063,
+      "cache-references_n": 20792,
+      "ipc": 2.7062261707232502,
+      "cpi": 0.3695182652574621,
+      "branch_miss_ratio": 3.319963125833554e-08,
+      "wall_per_iter_ns": 2.7387899999999994
+    },
+    "ratio_instr": 2.18,
+    "ratio_cycles": 1.17,
+    "zig_raw_n": {
+      "counters_median": {
+        "instructions": 30501344315,
+        "cycles": 6029160980,
+        "branches": 3500241378,
+        "branch-misses": 13224,
+        "cache-misses": 17051,
+        "cache-references": 32184
+      },
+      "wall_median_s": 1.588516,
+      "all_runs": [
+        {
+          "instructions": 30501344010,
+          "cycles": 6019410347,
+          "branches": 3500241378,
+          "branch-misses": 13471,
+          "cache-misses": 17051,
+          "cache-references": 33048
+        },
+        {
+          "instructions": 30501344315,
+          "cycles": 6029160980,
+          "branches": 3500241344,
+          "branch-misses": 13224,
+          "cache-misses": 15397,
+          "cache-references": 31132
+        },
+        {
+          "instructions": 30510553974,
+          "cycles": 6052902367,
+          "branches": 3501279349,
+          "branch-misses": 10088,
+          "cache-misses": 17334,
+          "cache-references": 32184
+        },
+        {
+          "instructions": 30501343144,
+          "cycles": 6051629885,
+          "branches": 3500241114,
+          "branch-misses": 13242,
+          "cache-misses": 18768,
+          "cache-references": 37395
+        },
+        {
+          "instructions": 30509455766,
+          "cycles": 6009601618,
+          "branches": 3501152934,
+          "branch-misses": 9840,
+          "cache-misses": 14594,
+          "cache-references": 23658
+        }
+      ]
+    },
+    "zig_raw_2n": {
+      "counters_median": {
+        "instructions": 61010653983,
+        "cycles": 12104909207,
+        "branches": 7001292095,
+        "branch-misses": 10261,
+        "cache-misses": 22352,
+        "cache-references": 44465
+      },
+      "wall_median_s": 3.192008,
+      "all_runs": [
+        {
+          "instructions": 61017426203,
+          "cycles": 12040124769,
+          "branches": 7002069002,
+          "branch-misses": 10107,
+          "cache-misses": 22352,
+          "cache-references": 38331
+        },
+        {
+          "instructions": 61011005942,
+          "cycles": 12083995408,
+          "branches": 7001332722,
+          "branch-misses": 10206,
+          "cache-misses": 21063,
+          "cache-references": 35619
+        },
+        {
+          "instructions": 61001344212,
+          "cycles": 12104909207,
+          "branches": 7000242763,
+          "branch-misses": 13217,
+          "cache-misses": 22343,
+          "cache-references": 44465
+        },
+        {
+          "instructions": 61001345203,
+          "cycles": 12181975026,
+          "branches": 7000242891,
+          "branch-misses": 13224,
+          "cache-misses": 26855,
+          "cache-references": 51202
+        },
+        {
+          "instructions": 61010653983,
+          "cycles": 12298255828,
+          "branches": 7001292095,
+          "branch-misses": 10261,
+          "cache-misses": 28426,
+          "cache-references": 54618
+        }
+      ]
+    },
+    "puc_raw_n": {
+      "counters_median": {
+        "instructions": 14005390325,
+        "cycles": 5189409642,
+        "branches": 2500978072,
+        "branch-misses": 7459,
+        "cache-misses": 11661,
+        "cache-references": 20792
+      },
+      "wall_median_s": 1.366977,
+      "all_runs": [
+        {
+          "instructions": 14006742933,
+          "cycles": 5191890511,
+          "branches": 2501219697,
+          "branch-misses": 7459,
+          "cache-misses": 14657,
+          "cache-references": 22366
+        },
+        {
+          "instructions": 14005390325,
+          "cycles": 5189400477,
+          "branches": 2500978072,
+          "branch-misses": 7356,
+          "cache-misses": 11661,
+          "cache-references": 20428
+        },
+        {
+          "instructions": 14005470574,
+          "cycles": 5186700331,
+          "branches": 2500992482,
+          "branch-misses": 7478,
+          "cache-misses": 10827,
+          "cache-references": 19975
+        },
+        {
+          "instructions": 14005096667,
+          "cycles": 5189409642,
+          "branches": 2500925699,
+          "branch-misses": 7678,
+          "cache-misses": 12481,
+          "cache-references": 20897
+        },
+        {
+          "instructions": 14004800390,
+          "cycles": 5190017030,
+          "branches": 2500872729,
+          "branch-misses": 7358,
+          "cache-misses": 9172,
+          "cache-references": 20792
+        }
+      ]
+    },
+    "puc_raw_2n": {
+      "counters_median": {
+        "instructions": 28005538860,
+        "cycles": 10362720242,
+        "branches": 5001005839,
+        "branch-misses": 7542,
+        "cache-misses": 12168,
+        "cache-references": 20063
+      },
+      "wall_median_s": 2.736372,
+      "all_runs": [
+        {
+          "instructions": 28005846202,
+          "cycles": 10362720242,
+          "branches": 5001060793,
+          "branch-misses": 7512,
+          "cache-misses": 12111,
+          "cache-references": 20063
+        },
+        {
+          "instructions": 28005854840,
+          "cycles": 10374712784,
+          "branches": 5001062159,
+          "branch-misses": 7330,
+          "cache-misses": 15027,
+          "cache-references": 28980
+        },
+        {
+          "instructions": 28005538860,
+          "cycles": 10363653626,
+          "branches": 5001005839,
+          "branch-misses": 7611,
+          "cache-misses": 12168,
+          "cache-references": 21600
+        },
+        {
+          "instructions": 28005490081,
+          "cycles": 10358975866,
+          "branches": 5000997071,
+          "branch-misses": 7542,
+          "cache-misses": 11789,
+          "cache-references": 19841
+        },
+        {
+          "instructions": 28005055925,
+          "cycles": 10361325919,
+          "branches": 5000919522,
+          "branch-misses": 7581,
+          "cache-misses": 14969,
+          "cache-references": 19722
+        }
+      ]
+    }
+  },
+  "bytecode": {
+    "puc_luac_l": "main </tmp/dispatch_floor/forloop_only.lua:0,0> (31 instructions at 0x558b795a4a80)\n0+ params, 7 slots, 1 upvalue, 5 locals, 10 constants, 0 functions\n\t1\t[1]\tVARARGPREP\t0\n\t2\t[1]\tGETTABUP \t0 0 0\t; _ENV \"tonumber\"\n\t3\t[1]\tGETTABUP \t1 0 1\t; _ENV \"arg\"\n\t4\t[1]\tGETI     \t1 1 1\n\t5\t[1]\tCALL     \t0 2 2\t; 1 in 1 out\n\t6\t[1]\tTEST     \t0 1\n\t7\t[1]\tJMP      \t1\t; to 9\n\t8\t[1]\tLOADK    \t0 2\t; 1000000000.0\n\t9\t[1]\tGETTABUP \t1 0 3\t; _ENV \"os\"\n\t10\t[1]\tGETFIELD \t1 1 4\t; \"clock\"\n\t11\t[1]\tCALL     \t1 1 2\t; 0 in 1 out\n\t12\t[1]\tLOADI    \t2 1\n\t13\t[1]\tMOVE     \t3 0\n\t14\t[1]\tLOADI    \t4 1\n\t15\t[1]\tFORPREP  \t2 0\t; exit to 17\n\t16\t[1]\tFORLOOP  \t2 1\t; to 16\n\t17\t[1]\tGETTABUP \t2 0 5\t; _ENV \"io\"\n\t18\t[1]\tGETFIELD \t2 2 6\t; \"write\"\n\t19\t[1]\tGETTABUP \t3 0 7\t; _ENV \"string\"\n\t20\t[1]\tGETFIELD \t3 3 8\t; \"format\"\n\t21\t[1]\tLOADK    \t4 9\t; \"forloop_only\\t%.6f\\t%d\\n\"\n\t22\t[1]\tGETTABUP \t5 0 3\t; _ENV \"os\"\n\t23\t[1]\tGETFIELD \t5 5 4\t; \"clock\"\n\t24\t[1]\tCALL     \t5 1 2\t; 0 in 1 out\n\t25\t[1]\tSUB      \t5 5 1\n\t26\t[1]\tMMBIN    \t5 1 7\t; __sub\n\t27\t[1]\tMOVE     \t6 0\n\t28\t[1]\tCALL     \t3 4 0\t; 3 in all out\n\t29\t[1]\tCALL     \t2 0 1\t; all in 0 out\n\t30\t[1]\tRETURN   \t0 2 1\t; 1 out\n\t31\t[1]\tRETURN   \t2 1 1\t; 0 out",
+    "zig_dump_bytecode": "main <@/tmp/dispatch_floor/forloop_only.lua:0,0> (31 instructions)\n        0+ params, 7 slots, 1 upvalue, 5 locals, 10 constants, 0 functions\n        \t1\t[0]\tVARARGPREP\t0\n        \t2\t[1]\tGETTABUP\t0\t0\t0\t; \"tonumber\"\n        \t3\t[1]\tGETTABUP\t1\t0\t1\t; \"arg\"\n        \t4\t[1]\tGETI\t1\t1\t1\n        \t5\t[1]\tCALL\t0\t2\t2\t; 1 out\n        \t6\t[1]\tTEST\t0\t0\t1\n        \t7\t[1]\tJMP\t; to 8\n        \t8\t[1]\tLOADK\t0\t2\t; 1000000000\n        \t9\t[1]\tGETTABUP\t1\t0\t3\t; \"os\"\n        \t10\t[1]\tGETFIELD\t1\t1\t4\t; \"clock\"\n        \t11\t[1]\tCALL\t1\t1\t2\t; 1 out\n        \t12\t[1]\tLOADI\t2\t1\n        \t13\t[1]\tMOVE\t3\n        \t14\t[1]\tLOADI\t4\t1\n        \t15\t[1]\tFORPREP\t2\t; to 16\n        \t16\t[1]\tFORLOOP\t2\t; to 15\n        \t17\t[1]\tGETTABUP\t2\t0\t5\t; \"io\"\n        \t18\t[1]\tGETFIELD\t2\t2\t6\t; \"write\"\n        \t19\t[1]\tGETTABUP\t3\t0\t7\t; \"string\"\n        \t20\t[1]\tGETFIELD\t3\t3\t8\t; \"format\"\n        \t21\t[1]\tLOADK\t4\t9\t; \"forloop_only\t%.6f\t%d\n\"\n        \t22\t[1]\tGETTABUP\t5\t0\t3\t; \"os\"\n        \t23\t[1]\tGETFIELD\t5\t5\t4\t; \"clock\"\n        \t24\t[1]\tCALL\t5\t1\t2\t; 1 out\n        \t25\t[1]\tSUB\t5\t5\t1\n        \t26\t[1]\tMMBIN\t5\t1\t7\n        \t27\t[1]\tMOVE\t6\n        \t28\t[1]\tCALL\t3\t4\t0\t; multret\n        \t29\t[1]\tCALL\t2\t0\t1\t; 0 out\n        \t30\t[1]\tRETURN\t0\t2\t1\t; 1 out\n        \t31\t[1]\tRETURN\t0\t1\t1\t; 0 out\nconstants (10) for @/tmp/dispatch_floor/forloop_only.lua:\n        \t0\t\"tonumber\"\n        \t1\t\"arg\"\n        \t2\t1000000000\n        \t3\t\"os\"\n        \t4\t\"clock\"\n        \t5\t\"io\"\n        \t6\t\"write\"\n        \t7\t\"string\"\n        \t8\t\"format\"\n        \t9\t\"forloop_only\t%.6f\t%d\n\"\nlocals (5) for @/tmp/dispatch_floor/forloop_only.lua:\n        \t0\tn\t8\t30\n        \t1\ts\t11\t30\n        \t2\t(for state)\t14\t16\n        \t3\t(for state)\t14\t16\n        \t5\ti\t15\t15\nupvalues (1) for @/tmp/dispatch_floor/forloop_only.lua:\n        \t0\t_ENV\tupvalue\t0",
+    "puc_steady_state_ops": [
+      "15\t[1]\tFORPREP  \t2 0\t; exit to 17",
+      "16\t[1]\tFORLOOP  \t2 1\t; to 16"
+    ],
+    "zig_steady_state_ops": [
+      "15\t[1]\tFORPREP\t2\t; to 16",
+      "16\t[1]\tFORLOOP\t2\t; to 15"
+    ],
+    "note": "Both runtimes list FORPREP (executed once) + FORLOOP (executed N times) as the steady-state loop body. The empty body means FORLOOP is the ONLY opcode executed per iteration in steady state. FORPREP runs once before the loop. The n-vs-2n delta subtracts all setup/epilogue cost, isolating pure FORLOOP dispatch+handler."
+  },
+  "part2_lowering_analysis": {
+    "binary_identity": {
+      "path": "/home/boss/codes/luazig/zig-out/bin/luazig",
+      "sha256": "c134caa825828c375e0c65d5a9dda663eb53248326d121bea9d6551f00b57c3c",
+      "size_bytes": 15263464,
+      "mtime_unix": 1789157657.923628
+    },
+    "binary": "/home/boss/codes/luazig/zig-out/bin/luazig",
+    "symbol": {
+      "symbol": "vm.Vm.runBytecodeDispatch",
+      "addr": 17579152,
+      "addr_hex": "00000000010c3c90"
+    },
+    "cpu_target": {
+      "model": "13th Gen Intel(R) Core(TM) i7-13700H",
+      "flags": "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities"
+    },
+    "classification": {
+      "classification": "jump table (indirect jump via 32-bit offset table)",
+      "indirect_jump_count": 68,
+      "jump_table_ref_count": 45,
+      "distinct_jump_tables": 13,
+      "main_table_addr": "100c4a0",
+      "main_table_ref_count": 0,
+      "main_table_dispatch_sites": 4,
+      "distinct_dispatch_sites": 68,
+      "dispatch_site_excerpts": [
+        {
+          "table_ref_line": "10c4096:\tlea    -0xb7bfd(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>",
+          "context": " 10c4090:\tmovzbl %bl,%eax\n 10c4093:\tand    $0x7f,%eax\n 10c4096:\tlea    -0xb7bfd(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>\n 10c409d:\tmovslq (%rcx,%rax,4),%rax\n 10c40a1:\tadd    %rcx,%rax\n 10c40a4:\tjmp    *%rax\n 10c40a6:\tmov    -0x90(%rbp),%rax\n 10c40ad:\tmov    %ebx,%ecx\n 10c40af:\tshr    $0x3,%ecx\n 10c40b2:\tand    $0xff0,%ecx"
+        },
+        {
+          "table_ref_line": "10c41b8:\tlea    -0xb7d1f(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>",
+          "context": " 10c41b2:\tmovzbl %bl,%eax\n 10c41b5:\tand    $0x7f,%eax\n 10c41b8:\tlea    -0xb7d1f(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>\n 10c41bf:\tmovslq (%rcx,%rax,4),%rax\n 10c41c3:\tadd    %rcx,%rax\n 10c41c6:\tjmp    *%rax\n 10c41c8:\tmov    0x38(%r14),%rax\n 10c41cc:\tlea    -0x1(%rax),%rdx\n 10c41d0:\tmov    %rdx,0x38(%r14)\n 10c41d4:\tcmp    $0x1,%rax"
+        },
+        {
+          "table_ref_line": "10c42cc:\tlea    -0xb7e33(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>",
+          "context": " 10c42c6:\tmovzbl %bl,%eax\n 10c42c9:\tand    $0x7f,%eax\n 10c42cc:\tlea    -0xb7e33(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>\n 10c42d3:\tmovslq (%rcx,%rax,4),%rax\n 10c42d7:\tadd    %rcx,%rax\n 10c42da:\tjmp    *%rax\n 10c42dc:\tmov    0x38(%r15),%esi\n 10c42e0:\tcmp    %rsi,%rdx\n 10c42e3:\tsete   %sil\n 10c42e7:\tcmp    $0x1f,%rcx"
+        },
+        {
+          "table_ref_line": "10c4350:\tlea    -0xb7eb7(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>",
+          "context": " 10c434a:\tmovzbl %bl,%eax\n 10c434d:\tand    $0x7f,%eax\n 10c4350:\tlea    -0xb7eb7(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>\n 10c4357:\tmovslq (%rcx,%rax,4),%rax\n 10c435b:\tadd    %rcx,%rax\n 10c435e:\tjmp    *%rax\n 10c4360:\tmov    -0xb0(%rbp),%rax\n 10c4367:\tmov    -0x90(%rbp),%rcx\n 10c436e:\tmov    %ebx,%edx\n 10c4370:\tshr    $0x3,%edx"
+        }
+      ],
+      "has_jump_table": true,
+      "has_indirect_jump": true,
+      "all_table_addrs": [
+        "100c4a0",
+        "100c60c",
+        "100c620",
+        "100c64c",
+        "100c880",
+        "100c894",
+        "100c8a8",
+        "100c8bc",
+        "100c8d0",
+        "100c9f0",
+        "100cb10",
+        "100cd44",
+        "100cd8c"
+      ]
+    },
+    "handler_shape": {
+      "shape": "few main-table dispatch sites (4)",
+      "main_table_dispatch_sites": 4,
+      "note": "4 dispatch sites use the main jump table. These are likely: (1) the initial dispatch after preamble checks, (2-4) alternate entry points after hooks/special handlers. The FORLOOP steady-state path uses only ONE of these (the first, after the preamble). The computed-goto advantage of a single shared site is partially present \u2014 the hot path already uses one site, but cold paths have separate sites."
+    },
+    "forloop_handler_path": {
+      "forloop_opcode": 73,
+      "jump_table_entry_addr": "0x100c5c4",
+      "handler_addr": "0x10c495d",
+      "handler_excerpt": " 10c495d:\tmov    %ebx,%eax\n 10c495f:\tshr    $0x7,%eax\n 10c4962:\tlea    0x1(%rax),%ecx\n 10c4965:\tmovzbl %cl,%esi\n 10c4968:\tmov    -0x90(%rbp),%rcx\n 10c496f:\tmov    %esi,%edx\n 10c4971:\tshl    $0x4,%edx\n 10c4974:\tmovzbl 0x8(%rcx,%rdx,1),%edi\n 10c4979:\tand    $0xf,%dil\n 10c497d:\tmov    %ebx,%edx\n 10c497f:\tshr    $0x3,%edx\n 10c4982:\tand    $0xff0,%edx\n 10c4988:\tadd    %rcx,%rdx\n 10c498b:\tcmp    $0x2,%dil\n 10c498f:\tjne    10c6f57 <vm.Vm.runBytecodeDispatch+0x32c7>\n 10c4995:\tmov    (%rdx),%rdi\n 10c4998:\ttest   %rdi,%rdi\n 10c499b:\tje     10c3f65 <vm.Vm.runBytecodeDispatch+0x2d5>\n 10c49a1:\tshl    $0x4,%esi\n 10c49a4:\tlea    0x2(%rax),%r8d",
+      "exit_jumps": [
+        "10c49eb:\tjmp    10c6fbd <vm.Vm.runBytecodeDispatch+0x332d>"
+      ],
+      "shared_tail": null,
+      "path_summary": "FORLOOP handler at 0x10c495d computes new pc (pc + offset), then jumps to the shared tail which does inc pc (the +1), cmp pc < code.len, jb back to dispatch top. The dispatch top (0x10bdbf0) does the stack_ptr check, loads the instruction, checks stats/dispatch_pc/sigint/hooks, then jumps via the main jump table. In steady state, only ONE dispatch site (the first, at the jump table jmp *%rax) is reached per iteration."
+    },
+    "computed_goto_framing": {
+      "single_dispatch_site": false,
+      "main_table_dispatch_sites": 4,
+      "total_indirect_jumps": 68,
+      "note": "The dispatch switch is lowered to a jump table (32-bit signed offsets, 128 entries for the 7-bit opcode space). There are 4 dispatch sites using the MAIN jump table, but the FORLOOP steady-state path uses only ONE (the first, after the preamble checks). The other main-table site is a cold path (after hooks processing). The remaining 64 indirect jumps are nested switches within specific opcode handlers (e.g., type-dispatch in arithmetic). COMPUTED-GOTO FRAMING: since the hot path already uses a single shared indirect-branch site with a jump table, 'replace switch with computed goto' is NOT a valid diagnosis \u2014 the only potential computed-goto advantage (consolidating multiple per-handler dispatch sites into one shared site for BTB prediction) is already realized for the hot path. The 2nd main-table dispatch site is a cold path (hooks active), so it does not affect steady-state BTB prediction."
+    }
+  },
+  "diagnostic_component_experiments": {
+    "source_head": "03422b1",
+    "source_head_description": "P16.10 T1+T2+T3: dispatch floor measurement (pre-T6+T8 cleanups, baseline 75 instr/iter)",
+    "baseline_instr_per_iter": 75.02,
+    "experiments": {
+      "A_stack_ptr_check": {
+        "description": "bc_stack.ptr != stack_ptr refresh in inner loop",
+        "baseline_instr_per_iter": 75.02,
+        "removed_instr_per_iter": 72.03,
+        "delta_instr_per_iter": 3.0,
+        "baseline_cycles_per_iter": 13.52,
+        "removed_cycles_per_iter": 13.45,
+        "delta_cycles_per_iter": 0.06,
+        "baseline_branch_misses_per_iter": 0.001,
+        "removed_branch_misses_per_iter": 0.001,
+        "delta_branch_misses_per_iter": 0.0,
+        "measured": {
+          "instr_per_iter": 72.025802312,
+          "cycles_per_iter": 13.452304998,
+          "branch_misses_per_iter": 0.000996722,
+          "all_runs": [
+            {
+              "instructions": 36018043559,
+              "cycles": 6734744999,
+              "branch-misses": 498361
+            },
+            {
+              "instructions": 36011418413,
+              "cycles": 6720816172,
+              "branch-misses": 498396
+            },
+            {
+              "instructions": 36012901156,
+              "cycles": 6726152499,
+              "branch-misses": 498291
+            }
+          ]
+        }
+      },
+      "B_vmstats_gate": {
+        "description": "if (self.stats.enabled) histogram check when disabled",
+        "baseline_instr_per_iter": 75.02,
+        "removed_instr_per_iter": 73.03,
+        "delta_instr_per_iter": 2.0,
+        "baseline_cycles_per_iter": 13.52,
+        "removed_cycles_per_iter": 13.98,
+        "delta_cycles_per_iter": -0.46,
+        "baseline_branch_misses_per_iter": 0.001,
+        "removed_branch_misses_per_iter": 0.001,
+        "delta_branch_misses_per_iter": -0.0,
+        "measured": {
+          "instr_per_iter": 73.025534576,
+          "cycles_per_iter": 13.977912662,
+          "branch_misses_per_iter": 0.000997772,
+          "all_runs": [
+            {
+              "instructions": 36519088992,
+              "cycles": 7641646742,
+              "branch-misses": 498886
+            },
+            {
+              "instructions": 36512767288,
+              "cycles": 6988956331,
+              "branch-misses": 498860
+            },
+            {
+              "instructions": 36503297296,
+              "cycles": 6982235169,
+              "branch-misses": 501384
+            }
+          ]
+        }
+      },
+      "C_dispatch_pc": {
+        "description": "self.dispatch_pc = ctx.pc publication",
+        "baseline_instr_per_iter": 75.02,
+        "removed_instr_per_iter": 74.02,
+        "delta_instr_per_iter": 1.0,
+        "baseline_cycles_per_iter": 13.52,
+        "removed_cycles_per_iter": 14.33,
+        "delta_cycles_per_iter": -0.81,
+        "baseline_branch_misses_per_iter": 0.001,
+        "removed_branch_misses_per_iter": 0.001,
+        "delta_branch_misses_per_iter": -0.0,
+        "measured": {
+          "instr_per_iter": 74.021857252,
+          "cycles_per_iter": 14.3315535,
+          "branch_misses_per_iter": 0.000997582,
+          "all_runs": [
+            {
+              "instructions": 37003292323,
+              "cycles": 7165776750,
+              "branch-misses": 501791
+            },
+            {
+              "instructions": 37010928626,
+              "cycles": 7104886302,
+              "branch-misses": 498786
+            },
+            {
+              "instructions": 37016827314,
+              "cycles": 7216784691,
+              "branch-misses": 498791
+            }
+          ]
+        }
+      },
+      "D_sigint": {
+        "description": "SIGINT countdown/check amortization",
+        "baseline_instr_per_iter": 75.02,
+        "removed_instr_per_iter": 68.02,
+        "delta_instr_per_iter": 7.01,
+        "baseline_cycles_per_iter": 13.52,
+        "removed_cycles_per_iter": 13.81,
+        "delta_cycles_per_iter": -0.3,
+        "baseline_branch_misses_per_iter": 0.001,
+        "removed_branch_misses_per_iter": 0.0,
+        "delta_branch_misses_per_iter": 0.001,
+        "measured": {
+          "instr_per_iter": 68.019383354,
+          "cycles_per_iter": 13.813553048,
+          "branch_misses_per_iter": 2.0396e-05,
+          "all_runs": [
+            {
+              "instructions": 34015470368,
+              "cycles": 6906776524,
+              "branch-misses": 10062
+            },
+            {
+              "instructions": 34009691677,
+              "cycles": 6950164551,
+              "branch-misses": 10198
+            },
+            {
+              "instructions": 34001340955,
+              "cycles": 6767323410,
+              "branch-misses": 13112
+            }
+          ]
+        }
+      },
+      "E_hooks_gate": {
+        "description": "hooks_active_cached gate (when no hooks active)",
+        "baseline_instr_per_iter": 75.02,
+        "removed_instr_per_iter": 73.03,
+        "delta_instr_per_iter": 2.0,
+        "baseline_cycles_per_iter": 13.52,
+        "removed_cycles_per_iter": 13.89,
+        "delta_cycles_per_iter": -0.38,
+        "baseline_branch_misses_per_iter": 0.001,
+        "removed_branch_misses_per_iter": 0.001,
+        "delta_branch_misses_per_iter": 0.0,
+        "measured": {
+          "instr_per_iter": 73.02594572,
+          "cycles_per_iter": 13.893410218,
+          "branch_misses_per_iter": 0.000997078,
+          "all_runs": [
+            {
+              "instructions": 36517916719,
+              "cycles": 7066558538,
+              "branch-misses": 498539
+            },
+            {
+              "instructions": 36512972860,
+              "cycles": 6934123544,
+              "branch-misses": 498556
+            },
+            {
+              "instructions": 36511455406,
+              "cycles": 6946705109,
+              "branch-misses": 498429
+            }
+          ]
+        }
+      },
+      "F_all_removed": {
+        "description": "ALL housekeeping removed (A+B+C+D+E) \u2014 lower bound",
+        "baseline_instr_per_iter": 75.02,
+        "removed_instr_per_iter": 61.02,
+        "delta_instr_per_iter": 14.0,
+        "baseline_cycles_per_iter": 13.52,
+        "removed_cycles_per_iter": 14.45,
+        "delta_cycles_per_iter": -0.93,
+        "baseline_branch_misses_per_iter": 0.001,
+        "removed_branch_misses_per_iter": 0.0,
+        "delta_branch_misses_per_iter": 0.001,
+        "measured": {
+          "instr_per_iter": 61.019894134,
+          "cycles_per_iter": 14.44677149,
+          "branch_misses_per_iter": 1.9376e-05,
+          "all_runs": [
+            {
+              "instructions": 30514290055,
+              "cycles": 7223385745,
+              "branch-misses": 9723
+            },
+            {
+              "instructions": 30509947067,
+              "cycles": 7201555010,
+              "branch-misses": 9581
+            },
+            {
+              "instructions": 30508121133,
+              "cycles": 7233769056,
+              "branch-misses": 9688
+            }
+          ]
+        }
+      },
+      "_additivity_check": {
+        "sum_of_individual_deltas_instr": 15.01,
+        "measured_all_removed_delta_instr": 14.0,
+        "non_additivity_residual": -1.01,
+        "note": "Sum of individual component deltas vs measured all-removed delta. Non-zero residual = non-additive effects (branch layout, register allocation, instruction scheduling changes when multiple components are removed simultaneously). A negative residual means the all-removed measurement is LESS than the sum of parts (synergy \u2014 removing together saves more than the sum). A positive residual means all-removed saves LESS than the sum (interference \u2014 removing together is less beneficial)."
+      }
+    }
+  }
+}

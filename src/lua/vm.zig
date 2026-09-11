@@ -674,9 +674,10 @@ pub const Cell = struct {
     /// references the owning thread's bytecode stack at this index
     /// (P16.16 C5: u32 + sentinel instead of ?usize — 8B → 4B; slot 0 is
     /// unambiguous because the sentinel is maxInt, not 0).
-    /// The thread is needed because a suspended coroutine's stack lives
-    /// in `th.bytecode_stack`, not in `vm.bc_stack` (which belongs to
-    /// whichever thread is currently executing).
+    /// The thread is needed because each Thread permanently owns its
+    /// bytecode stack (PUC model: L->stack lives on the lua_State); a
+    /// suspended coroutine's stack stays valid on its own Thread while
+    /// another thread executes.
     /// When closed, `value` is the actual value (closed upvalue).
     /// This mirrors PUC Lua's UpVal model: open upvalues point to stack,
     /// closed upvalues have their own copy.
@@ -5614,8 +5615,9 @@ pub const Vm = struct {
         self.testc_obj_threads += 1;
         // P15.40a: Pre-allocate frame capacity for the new coroutine. This
         // avoids the capacity-check branch on the first 64 bytecode calls.
-        // activateRuntime also does this (for threads parked and re-activated),
-        // but pre-allocating here means the first activation is already ready.
+        // A Thread permanently owns its frame stack, so the capacity
+        // survives suspension and re-entry; pre-allocating here means the
+        // first activation is already ready.
         th.call_frames.ensureTotalCapacity(self.alloc, 64) catch {};
         return th;
     }
@@ -11864,7 +11866,8 @@ pub const Vm = struct {
 
     /// Drive a chain of bytecode coroutine.resume/wrap calls without nesting
     /// `builtinCoroutineResume` or `runBytecode` on the Zig stack. Each switch
-    /// parks the active Thread runtime and activates the target's owned buffers.
+    /// just selects the executing Thread (switchThread: current_thread store
+    /// + hook refresh); every Thread permanently owns its runtime buffers.
     fn driveBytecodeCoroutineTrampoline(
         self: *Vm,
         initial: *Thread,
@@ -22827,8 +22830,8 @@ pub const Vm = struct {
     /// context. This helper swaps that context to the closed thread for
     /// the duration of the closers — the same field-for-field swap the
     /// resume path performs (builtinCoroutineResume's prologue:
-    /// current_thread, active_runtime_thread via switchRuntime, the
-    /// caller's status, the caller link) — plus the C-API handle view
+    /// current_thread via switchThread, the caller's status, the caller
+    /// link) — plus the C-API handle view
     /// (cur_handle/cur_c_stack) and the VM-global error channel. The
     /// channel is saved and restored: closer errors are threaded through
     /// closeTbcRegion's last-error-wins loop and reported via the close's
@@ -25263,12 +25266,12 @@ pub const Vm = struct {
                 self.freeThreadBytecodeFrames(th);
                 // PUC luaE_freethread (lstate.c:301): luaF_closeupval(L1,
                 // L1->stack.p) — close ALL open upvalues before freeing the
-                // stack. Open upvalue cells (in th.bytecode_boxed for a parked
-                // thread) still point into th.bytecode_stack via bc_stack_idx.
+                // stack. Open upvalue cells (in th.bytecode_boxed) still
+                // point into th.bytecode_stack via bc_stack_idx.
                 // If a live closure references such a cell (e.g. a closure
                 // capturing a local from a now-unreachable suspended coroutine),
                 // the cell survives GC but its stack reference would dangle
-                // after freeParkedThreadRuntime frees th.bytecode_stack.
+                // after freeThreadRuntime frees th.bytecode_stack.
                 // Closing the cell copies the stack value into cell.value and
                 // clears bc_stack_idx, making the cell self-contained.
                 // PUC uses luaF_closeupval (not luaF_close): no __close
@@ -25911,9 +25914,9 @@ pub const Vm = struct {
                 }
 
                 // Inactive coroutines own their complete execution storage.
-                // Mark it exactly like the VM-active runtime above. Active
-                // threads have these parked fields empty and are covered by
-                // the regular Thread.call_frames root walk.
+                // Mark it exactly like the executing thread's roots above.
+                // Executing threads have these parked fields empty and are
+                // covered by the regular Thread.call_frames root walk.
                 //
                 // P15.34b: Walk per-frame live registers using live_reg_top[pc]
                 // (our equivalent of PUC's L->top boundary), NOT the entire

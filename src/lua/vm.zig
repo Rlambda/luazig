@@ -21848,25 +21848,21 @@ pub const Vm = struct {
         }
         if (self.active_builtin) |id| {
             th.suspended_builtin = id;
-            // P16.38 Cut 3B: suspended_builtin_args is read ONLY by
-            // debug.getlocal when the suspended thread has NO parked Lua
-            // frame (pure-C suspension: testC base yield/yieldk). On every
-            // path with a Lua frame the getlocal walk answers from that
-            // frame and returns before reaching the args read — the
-            // per-cycle copy was pure waste (the second memcpy in the
-            // callgrind profile). Write it only when it can be read.
-            // (At this point bytecode_inplace_suspended is not set yet —
-            // the park branches below own it — so test the frames
-            // directly, mirroring threadCurrentParkedRuntimeFrame's
-            // non-C-frame search.)
-            var has_lua_frame = false;
-            for (0..th.call_frames.len()) |fi| {
-                if (!th.call_frames.getConstPtr(fi).isC()) {
-                    has_lua_frame = true;
-                    break;
-                }
-            }
-            if (!has_lua_frame) {
+            // P16.38 Cut 3B (fixed): suspended_builtin_args is read by
+            // debug.getlocal's C-temporary path whenever the TOP frame of
+            // the suspended thread is the yielding C/builtin frame — the
+            // walk's level 0 targets the top frame regardless of what
+            // lives BELOW it (coroutine.lua:722 shape: [Lua body, testC
+            // C-frame] — level 0 is the C frame and reads these args).
+            // The copy is skippable only when the top frame is a LUA
+            // frame (the direct bytecode yield — the hot path): then the
+            // level-0 walk answers from Lua-frame locals and never
+            // reaches the args read. (At this point
+            // bytecode_inplace_suspended is not set yet — the park
+            // branches below own it — so test the top frame directly.)
+            const top_frame_is_c = th.call_frames.len() > 0 and
+                th.call_frames.getConstPtr(th.call_frames.len() - 1).isC();
+            if (top_frame_is_c) {
                 th.suspended_builtin_args.deinit(self.alloc);
                 if (self.active_builtin_args) |builtin_args| {
                     // P16.3: inline for <= INLINE_VALUES_CAP (the dominant yield
@@ -29503,20 +29499,48 @@ pub const Vm = struct {
             .Int => |level| {
                 if (target_thread) |th| {
                     if (level < 0 or level > 1 or local_index < 1) return;
-                    if (threadCurrentParkedRuntimeFrame(th)) |fr| {
-                        // P16.38 T4.1 (PUC differential): level 0 of a
-                        // coroutine suspended at a non-hook builtin/C yield
-                        // is the yield C frame in PUC — its window is EMPTY
-                        // by the time Lua can observe it (auxresume's
-                        // lua_xmove moved the yielded values to the resumer
-                        // when resume returned), so getlocal(co, 0, n) is
-                        // nil for every n. Level 1 is the parked Lua frame.
-                        // Hook yields keep level 0 = the interrupted Lua
-                        // frame (PUC: the hook runs on the current CallInfo).
-                        if (level == 0 and !th.yielded_from_debug_hook) return;
-                        const proto = fr.proto() orelse return;
-                        try self.debugGetLocalFromBytecodeFrame(fr, proto, local_index, outs, th, false);
-                        return;
+                    // P16.38 fix (coroutine.lua:722 regression): a C frame
+                    // ON TOP of the parked Lua frame (testC yield/yieldk
+                    // above a Lua body) means level 0 IS that C frame — its
+                    // C-temporary window is observable in PUC (the yield
+                    // moved only the TOP n values to the resumer; the
+                    // remaining testC stack survives as C temporaries:
+                    // T.testC("yield 1", 10, 20) → getlocal(co,0,2) == 10).
+                    // Consult the suspended_builtin path FIRST for that
+                    // shape; the parked-Lua path below then handles the
+                    // hook-yield and pure coroutine.yield shapes.
+                    // Hook suspensions keep level 0 = the interrupted
+                    // Lua frame even when a hook-related C frame sits on
+                    // top (PUC: the hook runs on the current CallInfo) —
+                    // only non-hook C-top suspensions (testC yield above
+                    // a Lua body) divert to the C-temporary path.
+                    // Only LEVEL 0 diverts to the C-temporary window
+                    // (the yielding C frame itself); level 1 always walks
+                    // to the parked Lua frame below it (db.lua:792-795:
+                    // plain body-yield — PUC keeps luaB_yield's C ci at
+                    // level 0 with an EMPTY window, level 1 = the body's
+                    // locals x/a).
+                    const divert_to_c_window = level == 0 and
+                        th.call_frames.len() > 0 and
+                        th.call_frames.getConstPtr(th.call_frames.len() - 1).isC() and
+                        !th.yielded_from_debug_hook;
+                    if (!divert_to_c_window) inner: {
+                        if (threadCurrentParkedRuntimeFrame(th)) |fr| {
+                            // P16.38 T4.1 (PUC differential): level 0 of a
+                            // coroutine suspended at a non-hook builtin/C yield
+                            // is the yield C frame in PUC — its window is EMPTY
+                            // by the time Lua can observe it (auxresume's
+                            // lua_xmove moved the yielded values to the resumer
+                            // when resume returned), so getlocal(co, 0, n) is
+                            // nil for every n. Level 1 is the parked Lua frame.
+                            // Hook yields keep level 0 = the interrupted Lua
+                            // frame (PUC: the hook runs on the current CallInfo).
+                            if (level == 0 and !th.yielded_from_debug_hook) return;
+                            const proto = fr.proto() orelse return;
+                            try self.debugGetLocalFromBytecodeFrame(fr, proto, local_index, outs, th, false);
+                            return;
+                        }
+                        break :inner;
                     }
                     if (th.suspended_builtin != null) {
                         if (local_index == 1) {

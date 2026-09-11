@@ -683,15 +683,13 @@ pub const Cell = struct {
     bc_stack_idx: u32 = bc_stack_closed,
     bc_stack_thread: ?*Thread = null,
 
-    /// Resolve the correct bytecode stack slice for this cell.
-    /// For open upvalues: if the owning thread is currently active,
-    /// use `vm.bc_stack`; otherwise use `th.bytecode_stack`.
+    /// Resolve the owning thread's bytecode stack for this cell.
+    /// P16.37 Cut 2: the Thread owns its stack permanently — there is no
+    /// active-vs-parked branch anymore; an open cell's owning thread is the
+    /// one and only place its stack can be.
     fn resolveStack(self: *const Cell, vm: *const Vm) []Value {
-        if (self.bc_stack_thread) |th| {
-            if (vm.active_runtime_thread == th) return vm.bc_stack;
-            return th.bytecode_stack;
-        }
-        return vm.bc_stack;
+        const th = self.bc_stack_thread orelse vm.activeBytecodeThread();
+        return th.bytecode_stack;
     }
 
     /// Read the current value of this cell.
@@ -1927,8 +1925,7 @@ pub const CallFrame = extern struct {
 
     /// P15.51g: Derive register slice from base + frame_cap (PUC: `ci->func + 1
     /// .. ci->top`). NOT stored in the frame — eliminates stale slices after
-    /// bc_stack realloc. Callers must pass the correct stack for the thread
-    /// (self.bc_stack for the VM-active thread, th.bytecode_stack for parked).
+    /// bytecode_stack realloc. Callers must pass the owning thread's stack.
     pub fn regsSlice(fr: CallFrame, stack: []Value) []Value {
         return stack[fr.frameBase() .. fr.frameBase() + fr.u.lua.frame_cap];
     }
@@ -1939,15 +1936,11 @@ pub const CallFrame = extern struct {
     }
 };
 
-/// P15.51g: Resolve the correct bytecode stack for a thread.
-/// Active thread → self.bc_stack; parked coroutine → th.bytecode_stack.
-/// Mirrors PUC Lua where each lua_State has its own stack.
+/// P15.51g / P16.37 Cut 2: resolve a thread's bytecode stack. `th == null`
+/// means the running thread. Every thread owns its stack permanently
+/// (PUC: each lua_State has its own stack) — one indirection, no branches.
 fn stackForThread(self: *Vm, th: ?*Thread) []Value {
-    if (th) |t| {
-        if (t == self.active_runtime_thread) return self.bc_stack;
-        return t.bytecode_stack;
-    }
-    return self.bc_stack;
+    return (th orelse self.activeBytecodeThread()).bytecode_stack;
 }
 
 /// PUC `base_ci` equivalent: inline call-frame storage with heap overflow.
@@ -2301,13 +2294,25 @@ pub const Thread = struct {
     /// P15.51n: Moved from CallFrame — single-valued (only active frame's
     /// line hook matters), matching PUC's oldpc on lua_State.
     last_hook_line: i64 = -1,
-    /// Parked runtime storage for this Lua thread. While the thread is active,
-    /// ownership is temporarily moved into the VM's hot dispatch fields so the
-    /// existing helpers can keep using contiguous arrays without per-access
-    /// indirection. Context switches move the buffers, never copy them.
+    /// This thread's bytecode runtime (PUC `L->stack` and friends, lstate.c).
+    /// P16.37 Cut 2 (Variant A): the Thread owns these PERMANENTLY — the old
+    /// model parked them into Vm hot fields while the thread was active and
+    /// moved them back on every coroutine switch (4-field SIMD moves, 2× per
+    /// resume/yield cycle). Now the buffers never move: the dispatch loop
+    /// reaches them through the running thread (ctx.th, cached at frame_loop
+    /// entry like PUC caches `L` in luaV_execute), and a thread switch is a
+    /// `current_thread` store + hook refresh (switchThread).
+    /// A never-activated coroutine has an empty stack (lazy first-use
+    /// allocation in growBcStackCapSlow) — `bytecode_stack.len == 0` means
+    /// "never activated", never "currently active".
     bytecode_stack: []Value = &.{},
+    /// Open upvalue cells per stack slot, parallel to bytecode_stack.
     bytecode_boxed: []?*Cell = &.{},
+    /// High-water mark (next available stack slot) — PUC `L->top.p` analog
+    /// for the register file extent.
     bytecode_stack_top: usize = 0,
+    /// Per-frame TBC register indices (registers marked to-be-closed by the
+    /// TBC opcode; CLOSE calls __close on these).
     bytecode_tbc_regs: std.ArrayListUnmanaged(u8) = .empty,
     /// Any bytecode `coroutine.yield` parks the thread-owned execution stacks
     /// in place. Resume continues the same descriptors without snapshot/replay.
@@ -4208,18 +4213,26 @@ pub const Vm = struct {
     /// site with one predictable branch.
     stats: VmStats = .{},
 
-    // ── Shared bytecode stack (PUC Lua model) ──
-    // A single contiguous array that serves as the register file for ALL
-    // bytecode frames. Each frame occupies bc_stack[base .. base+maxstack].
-    // No per-frame heap allocation. Stack grows via realloc when needed.
-    // After realloc, all `base` offsets in frames are still valid.
-    bc_stack: []Value = &.{},
-    bc_boxed: []?*Cell = &.{}, // parallel to bc_stack — open upvalue cells per slot
-    bc_stack_top: usize = 0, // high-water mark (next available slot)
+    // ── Bytecode stack ownership (P16.37 Cut 2, Variant A — PUC model) ──
+    // A single contiguous array per Lua thread that serves as the register
+    // file for ALL bytecode frames of that thread. Each frame occupies
+    // bytecode_stack[base .. base+maxstack]. No per-frame heap allocation.
+    // The stack grows via realloc when needed; after realloc, all `base`
+    // offsets in frames are still valid (they're indices).
+    //
+    // PUC Lua model (lstate.c): the stack lives on the lua_State (`L->stack`)
+    // and the VM holds NO stack state — luaV_execute receives `L` and reaches
+    // the stack through it. luazig mirrors this exactly: `Thread.bytecode_stack`
+    // is `L->stack`; the dispatch loop caches the running thread (ctx.th, set
+    // at frame_loop entry like ctx.regs) the way PUC caches `L`/`ci`; cold
+    // helpers resolve the running thread via activeBytecodeThread().
+    //
+    // There is NO move-in/move-out on coroutine switches: switching threads is
+    // a `current_thread` store + refreshHooksCached (see switchThread). A
+    // never-activated coroutine simply has an empty stack (lazy first-use
+    // allocation in growBcStackCapSlow) — `bytecode_stack.len == 0` means
+    // "never activated", never "currently active".
     bc_stack_initial: usize = 2048,
-    /// Per-frame TBC register indices. Tracks registers marked as
-    /// to-be-closed by the TBC opcode. CLOSE calls __close on these.
-    bc_tbc_regs: std.ArrayListUnmanaged(u8) = .empty,
 
     /// C API stack for lua_State-compatible push/pop operations.
     /// Used by C extension functions loaded via package.loadlib (and by the
@@ -4403,10 +4416,14 @@ pub const Vm = struct {
     /// without LUA_COMPAT_GLOBAL). In normal mode, `global` is a regular name
     /// (PUC Lua compatibility mode with LUA_COMPAT_GLOBAL).
     testc_module_enabled: bool = false,
+    /// The semantic running thread (PUC `L`): the thread all bytecode/C-frame
+    /// execution currently runs on. `null` means the main thread. This is the
+    /// SINGLE source of truth for "which thread is executing" — P16.37 Cut 2
+    /// deleted the parallel `active_runtime_thread` (the runtime buffers
+    /// never move; each Thread owns its stack permanently, see the bytecode
+    /// stack ownership block above). Switching threads = `switchThread`
+    /// (store + hook refresh), nothing else.
     current_thread: ?*Thread = null,
-    /// Thread whose runtime buffers are currently borrowed by `frames`,
-    /// `bc_stack`, `bc_boxed`, and `bc_tbc_regs` below.
-    active_runtime_thread: ?*Thread = null,
     debug_hook_main: DebugHookState = .{},
     /// Yield capability captured for the synchronous/frozen-IR hook path.
     /// Bytecode hooks carry the same bit on RuntimeFrame instead.
@@ -4623,18 +4640,19 @@ pub const Vm = struct {
             .status = .running,
         };
         vm.main_thread = main_th;
-        vm.active_runtime_thread = main_th;
         // P15.40a: Pre-allocate frame capacity for the main thread (same as
-        // activateRuntime does for coroutines). The main thread is activated
-        // directly here, not via activateRuntime, so we pre-allocate inline.
+        // first activation does for coroutines). The main thread is always
+        // activated, so this is unconditional.
         main_th.call_frames.ensureTotalCapacity(alloc, 64) catch @panic("oom");
         vm.gcRegisterThread(main_th) catch @panic("oom");
         vm.gcNoteAlloc(@sizeOf(Thread));
-        // Allocate shared bytecode stack.
-        vm.bc_stack = alloc.alloc(Value, vm.bc_stack_initial) catch @panic("oom");
-        @memset(vm.bc_stack, .Nil);
-        vm.bc_boxed = alloc.alloc(?*Cell, vm.bc_stack_initial) catch @panic("oom");
-        @memset(vm.bc_boxed, null);
+        // Allocate the main thread's bytecode stack (P16.37 Cut 2: the Thread
+        // owns its runtime from creation — Vm.init allocates INTO the owner;
+        // the running-thread pointer is just current_thread = null = main).
+        main_th.bytecode_stack = alloc.alloc(Value, vm.bc_stack_initial) catch @panic("oom");
+        @memset(main_th.bytecode_stack, .Nil);
+        main_th.bytecode_boxed = alloc.alloc(?*Cell, vm.bc_stack_initial) catch @panic("oom");
+        @memset(main_th.bytecode_boxed, null);
         // PUC lstate.c:354: g->seed = seed. The hash seed is initialized ONCE
         // from the caller-provided value (entropy via makeRandomSeed for
         // Vm.init, explicit seed for lua_newstate/tests). It is never mutated
@@ -4787,89 +4805,40 @@ pub const Vm = struct {
         self.dynamic_bytecode_compiler = compiler;
     }
 
-    /// Park the currently active runtime buffers into their owning Lua thread.
-    /// This is a move-only operation: register/TBC/frame storage is never
-    /// duplicated during a coroutine switch.
-    fn parkActiveRuntime(self: *Vm) void {
-        const owner = self.active_runtime_thread orelse return;
-        std.debug.assert(owner.bytecode_stack.len == 0);
-        std.debug.assert(owner.bytecode_boxed.len == 0);
-        std.debug.assert(owner.bytecode_tbc_regs.items.len == 0);
-
-        // fr.u.lua.pc is already current — the dispatch loop writes ctx.pc
-        // directly (fr.u.lua.pc IS the sole program counter). No sync needed
-        // on park.
-
-        owner.bytecode_stack = self.bc_stack;
-        owner.bytecode_boxed = self.bc_boxed;
-        owner.bytecode_stack_top = self.bc_stack_top;
-        owner.bytecode_tbc_regs = self.bc_tbc_regs;
-
-        self.bc_stack = &.{};
-        self.bc_boxed = &.{};
-        self.bc_stack_top = 0;
-        self.bc_tbc_regs = .empty;
-        self.active_runtime_thread = null;
-    }
-
-    /// Activate a parked Lua thread's runtime buffers in the VM hot path.
-    fn activateRuntime(self: *Vm, owner: *Thread) void {
-        std.debug.assert(self.active_runtime_thread == null);
-        std.debug.assert(self.bc_stack.len == 0);
-        std.debug.assert(self.bc_boxed.len == 0);
-        std.debug.assert(self.bc_tbc_regs.items.len == 0);
-
-        self.bc_stack = owner.bytecode_stack;
-        self.bc_boxed = owner.bytecode_boxed;
-        self.bc_stack_top = owner.bytecode_stack_top;
-        self.bc_tbc_regs = owner.bytecode_tbc_regs;
-
-        owner.bytecode_stack = &.{};
-        owner.bytecode_boxed = &.{};
-        owner.bytecode_stack_top = 0;
-        owner.bytecode_tbc_regs = .empty;
-        self.active_runtime_thread = owner;
-
-        // P15.40a: Pre-allocate frame capacity to avoid capacity-check branch
-        // on the hot path. 64 frames covers typical Lua call depth; deeper
-        // chains fall back to geometric growth (rare). PUC has no limit
-        // (linked list) but amortizes via never freeing on return.
-        // Memory cost: 64 * (BytecodeExecFrame + RuntimeFrame) = ~30KB per
-        // active thread (acceptable; threads are not lightweight).
-        //
-        // `ensureTotalCapacity` is infallible in practice (only fails on OOM).
-        // We use `catch {}` because `activateRuntime` is invoked from
-        // `switchRuntime` in the coroutine hot path and cannot return an error.
-        // If pre-allocation fails, `addOne` retries on the next push — correct
-        // behavior, just slower.
-        owner.call_frames.ensureTotalCapacity(self.alloc, 64) catch {};
-
-        // fr.u.lua.pc is already current in the activated thread's frames.
-        // No bc_dispatch_pc sync needed — the field no longer exists.
-    }
-
-    fn switchRuntime(self: *Vm, next: *Thread) void {
-        if (self.active_runtime_thread == next) return;
-        self.parkActiveRuntime();
-        self.activateRuntime(next);
-        // P15.33: Different threads may have different hook states. Refresh
-        // the cached flag so the dispatch loop picks up the new thread's hooks.
+    /// Switch the VM to `next` as the running thread (PUC: resuming a
+    /// coroutine just changes which lua_State executes — `ldo.c` resume/unroll;
+    /// there is no buffer migration).
+    ///
+    /// P16.37 Cut 2 (Variant A): the old parkActiveRuntime/activateRuntime
+    /// pair moved FOUR runtime buffers (stack, boxed, stack_top, tbc_regs)
+    /// between the Vm hot fields and the owning Thread on every coroutine
+    /// switch — 151 instructions/cycle of pure transition cost in the
+    /// coroutine_yield profile (T0.2 decomposition), with a dual-pointer
+    /// invariant (current_thread ≡ active_runtime_thread) to maintain.
+    /// The Thread now owns its runtime permanently; a switch is exactly:
+    ///   1. store the semantic thread pointer (PUC's L),
+    ///   2. refresh the cached hook flags — different threads may have
+    ///      different hook states (P15.33), and the dispatch loop reads the
+    ///      cache, not the thread.
+    /// Nothing else: no guard, no moves, no capacity ceremony. The store is
+    /// idempotent-safe; switch-to-self would only redundantly refresh hooks.
+    fn switchThread(self: *Vm, next: ?*Thread) void {
+        self.current_thread = next;
         self.refreshHooksCached();
     }
 
     /// PUC luaE_freethread → luaF_closeupval: close all open upvalues of a
     /// thread before its stack is freed. Called from gcFreeObject(.thread).
     ///
-    /// Open upvalue cells live in th.bytecode_boxed (for a parked/suspended
-    /// coroutine) — each non-null entry is a *Cell with bc_stack_idx pointing
-    /// into th.bytecode_stack. Closing copies the stack value into cell.value
-    /// and clears bc_stack_idx/bc_stack_thread, so the cell becomes
-    /// self-contained and survives the thread's stack deallocation.
+    /// Open upvalue cells live in th.bytecode_boxed — each non-null entry is
+    /// a *Cell with bc_stack_idx pointing into th.bytecode_stack. Closing
+    /// copies the stack value into cell.value and clears
+    /// bc_stack_idx/bc_stack_thread, so the cell becomes self-contained and
+    /// survives the thread's stack deallocation.
     ///
-    /// For the active_runtime_thread (main thread at Vm.deinit), th.bytecode_boxed
-    /// is empty — its open upvalues (if any) live in vm.bc_boxed, which is freed
-    /// separately in Vm.deinit before drainGcRegistries. The main thread should
-    /// have no open upvalues at teardown (the main chunk returns and closes them).
+    /// P16.37 Cut 2: uniform for ALL threads — the buffers never move, so
+    /// there is no active-thread special case (the main thread at Vm.deinit
+    /// used to keep its open upvalues in vm.bc_boxed, freed separately).
     ///
     /// PUC uses luaF_closeupval (not luaF_close): no __close metamethods are
     /// invoked — the thread is being freed and cannot run Lua code. This mirrors
@@ -4897,8 +4866,14 @@ pub const Vm = struct {
         }
     }
 
-    fn freeParkedThreadRuntime(self: *Vm, th: *Thread) void {
-        std.debug.assert(self.active_runtime_thread != th);
+    /// Free a thread's runtime buffers (PUC luaE_freethread frees L1->stack
+    /// via luaE_freethread → freestack). P16.37 Cut 2: generic owner-free —
+    /// every thread owns its stack permanently (no active/parked split), so
+    /// this runs for ALL threads at teardown, the running main thread
+    /// included (via Vm.deinit → drainGcRegistries → gcFreeObject(.thread),
+    /// the documented root path). Exactly-once by construction: the fields
+    /// are nulled here and gcFreeObject destroys the Thread right after.
+    fn freeThreadRuntime(self: *Vm, th: *Thread) void {
         if (th.bytecode_stack.len != 0) self.alloc.free(th.bytecode_stack);
         if (th.bytecode_boxed.len != 0) self.alloc.free(th.bytecode_boxed);
         th.bytecode_tbc_regs.deinit(self.alloc);
@@ -4911,7 +4886,7 @@ pub const Vm = struct {
     /// `L` — luazig keeps one frame stack per thread). pub for the API
     /// layer (api.State.pcall's P16.31 Cut 3 recovery close needs the
     /// active thread's TBC-chain snapshot at pcall entry).
-    pub fn activeBytecodeThread(self: *Vm) *Thread {
+    pub fn activeBytecodeThread(self: *const Vm) *Thread {
         return self.current_thread orelse self.main_thread.?;
     }
 
@@ -4936,19 +4911,19 @@ pub const Vm = struct {
     pub fn setErrfuncValue(self: *Vm, v: ?Value) void {
         const th = self.activeBytecodeThread();
         if (v) |val| {
-            const idx = self.bc_stack_top;
-            if (idx >= self.bc_stack.len) {
-                self.ensureBcStackCap(idx + 1) catch {
+            const idx = th.bytecode_stack_top;
+            if (idx >= th.bytecode_stack.len) {
+                self.ensureBcStackCap(th, idx + 1) catch {
                     th.errfunc = ERRFUNC_NONE;
                     return;
                 };
             }
-            self.bc_stack[idx] = val;
-            self.bc_stack_top = idx + 1;
+            th.bytecode_stack[idx] = val;
+            th.bytecode_stack_top = idx + 1;
             th.errfunc = idx;
         } else {
             if (th.errfunc != ERRFUNC_NONE) {
-                self.bc_stack_top = th.errfunc;
+                th.bytecode_stack_top = th.errfunc;
                 th.errfunc = ERRFUNC_NONE;
             }
         }
@@ -4959,7 +4934,7 @@ pub const Vm = struct {
     pub fn getErrfuncValue(self: *Vm) ?Value {
         const th = self.activeBytecodeThread();
         if (th.errfunc != ERRFUNC_NONE) {
-            return self.bc_stack[th.errfunc];
+            return th.bytecode_stack[th.errfunc];
         }
         return null;
     }
@@ -5290,23 +5265,26 @@ pub const Vm = struct {
         th.bytecode_resume_boundary = 0;
     }
 
-    /// Ensure the shared bytecode stack can hold at least `needed` slots.
-    /// Grows by doubling + `needed`, reallocating both bc_stack and bc_boxed.
-    /// After realloc, all frame `base` offsets remain valid (they're indices).
-    // P16.2d: Fast path is a single comparison (needed <= bc_stack.len).
+    /// Ensure the owning thread's bytecode stack can hold at least `needed`
+    /// slots. Grows by doubling + `needed`, reallocating both bytecode_stack
+    /// and bytecode_boxed. After realloc, all frame `base` offsets remain
+    /// valid (they're indices).
+    // P16.2d: Fast path is a single comparison (needed <= bytecode_stack.len).
     // Inlining avoids call overhead (~40% of this symbol's 3.2% in perf
     // annotate). The rare growth path is outlined into growBcStackCapSlow
     // to keep the inlined fast path minimal and avoid code bloat at every
     // call site.
-    inline fn ensureBcStackCap(self: *Vm, needed: usize) DispatchError!void {
-        if (needed > self.bc_stack.len) {
+    // P16.37 Cut 2: takes the owning Thread explicitly — the stack lives on
+    // the Thread (PUC L->stack), and dispatch callers pass ctx.th.
+    inline fn ensureBcStackCap(self: *Vm, th: *Thread, needed: usize) DispatchError!void {
+        if (needed > th.bytecode_stack.len) {
             @branchHint(.cold);
-            try self.growBcStackCapSlow(needed);
+            try self.growBcStackCapSlow(th, needed);
         }
     }
 
-    fn growBcStackCapSlow(self: *Vm, needed: usize) DispatchError!void {
-        const old_len = self.bc_stack.len;
+    fn growBcStackCapSlow(self: *Vm, th: *Thread, needed: usize) DispatchError!void {
+        const old_len = th.bytecode_stack.len;
         // PUC luaD_growstack: newsize = size + size/2 (1.5x growth),
         // capped at MAXSTACK. If needed > MAXSTACK, the overflow check
         // in pushBytecodeExecFrame catches it and grows to ERRORSTACKSIZE
@@ -5321,19 +5299,20 @@ pub const Vm = struct {
         // handles the overflow by growing to ERRORSTACKSIZE. Growing beyond
         // MAXSTACK here would break the stack-overflow detection invariant.
         if (new_cap <= old_len) return;
-        self.bc_stack = try self.alloc.realloc(self.bc_stack, new_cap);
-        self.bc_boxed = try self.alloc.realloc(self.bc_boxed, new_cap);
+        th.bytecode_stack = try self.alloc.realloc(th.bytecode_stack, new_cap);
+        th.bytecode_boxed = try self.alloc.realloc(th.bytecode_boxed, new_cap);
         // Initialize new slots.
-        @memset(self.bc_stack[old_len..], .Nil);
-        @memset(self.bc_boxed[old_len..], null);
+        @memset(th.bytecode_stack[old_len..], .Nil);
+        @memset(th.bytecode_boxed[old_len..], null);
         // After realloc, bytecode frames no longer cache slices — their
         // register windows are derived on demand from base + frame_cap.
         // Nothing to update here (PUC Lua's luaD_reallocstack also needs
         // no per-frame fixup because ci->func points into the stack).
     }
 
-    /// PUC ldo.c `luaD_shrinkstack`: shrink bc_stack back to a reasonable
-    /// size after a stack overflow has been handled.
+    /// PUC ldo.c `luaD_shrinkstack`: shrink the owning thread's bytecode
+    /// stack back to a reasonable size after a stack overflow has been
+    /// handled.
     ///
     /// PUC algorithm:
     ///   inuse = stackinuse(L)   // max(L->top, all ci->top), min LUA_MINSTACK
@@ -5342,24 +5321,24 @@ pub const Vm = struct {
     ///     nsize = (inuse > MAXSTACK/2) ? MAXSTACK : inuse*2
     ///     luaD_reallocstack(L, nsize)
     ///
-    /// In our architecture, bc_stack_top is the equivalent of L->top.p.
-    /// After an overflow, bc_stack was grown to lua_max_stack_slots (32K).
+    /// In our architecture, bytecode_stack_top is the equivalent of L->top.p.
+    /// After an overflow, bytecode_stack was grown to lua_max_stack_slots (32K).
     /// Once the error handler returns and the protected frame unwinds,
-    /// bc_stack_top drops back to normal, but bc_stack.len stays at 32K.
-    /// This function shrinks it back to ~2x current usage.
+    /// bytecode_stack_top drops back to normal, but bytecode_stack.len stays
+    /// at 32K. This function shrinks it back to ~2x current usage.
     ///
     /// Called after pcall/xpcall completes (success or error), matching
     /// PUC's luaD_pcall which calls luaD_shrinkstack on the error path.
     fn shrinkBcStack(self: *Vm) void {
         const MAXSTACK: usize = 1_000_000; // lua_max_stack_slots
         const LUA_MINSTACK: usize = 20;
+        const th = self.activeBytecodeThread();
 
         // PUC's `stackinuse` computes the max extent across all CallInfo
-        // frames. In the overlapping model, bc_stack_top only reflects the
-        // TOP frame's extent — a lower frame may extend further. Walk all
+        // frames. In the overlapping model, bytecode_stack_top only reflects
+        // the TOP frame's extent — a lower frame may extend further. Walk all
         // active bytecode frames to find the true high-water mark.
-        var inuse = self.bc_stack_top;
-        const th = self.activeBytecodeThread();
+        var inuse = th.bytecode_stack_top;
         for (0..th.call_frames.len()) |i| {
             const fr = th.call_frames.getConstPtr(i);
             if (fr.proto() != null) {
@@ -5374,14 +5353,14 @@ pub const Vm = struct {
 
         // PUC: max = (inuse > MAXSTACK/3) ? MAXSTACK : inuse*3
         const max = if (inuse > MAXSTACK / 3) MAXSTACK else inuse * 3;
-        if (self.bc_stack.len <= max) return;
+        if (th.bytecode_stack.len <= max) return;
 
         // PUC: nsize = (inuse > MAXSTACK/2) ? MAXSTACK : inuse*2
         const nsize = if (inuse > MAXSTACK / 2) MAXSTACK else inuse * 2;
-        // Shrink both bc_stack and bc_boxed. realloc with smaller size
-        // is valid and will shrink the allocation.
-        self.bc_stack = self.alloc.realloc(self.bc_stack, nsize) catch return;
-        self.bc_boxed = self.alloc.realloc(self.bc_boxed, nsize) catch return;
+        // Shrink both bytecode_stack and bytecode_boxed. realloc with smaller
+        // size is valid and will shrink the allocation.
+        th.bytecode_stack = self.alloc.realloc(th.bytecode_stack, nsize) catch return;
+        th.bytecode_boxed = self.alloc.realloc(th.bytecode_boxed, nsize) catch return;
 
         // After realloc, bytecode frame slices are derived on demand
         // from base + frame_cap — no per-frame slice update needed.
@@ -5407,12 +5386,13 @@ pub const Vm = struct {
         ctx: *BytecodeDispatchCtx,
         needed_local: usize,
     ) DispatchError!void {
-        try self.bcGrowFrame(ctx.base, needed_local, &ctx.frame_cap, &ctx.regs);
+        try self.bcGrowFrame(ctx.th, ctx.base, needed_local, &ctx.frame_cap, &ctx.regs);
         ctx.exec_frames.getPtr(ctx.frame_index).u.lua.frame_cap = ctx.frame_cap;
     }
 
     fn bcGrowFrame(
         self: *Vm,
+        th: *Thread,
         base: usize,
         needed_local: usize,
         frame_cap: *u32,
@@ -5421,8 +5401,8 @@ pub const Vm = struct {
         const old_cap = frame_cap.*;
         if (needed_local > frame_cap.*) {
             frame_cap.* = @intCast(needed_local);
-            try self.ensureBcStackCap(base + frame_cap.*);
-            self.bc_stack_top = @max(self.bc_stack_top, base + frame_cap.*);
+            try self.ensureBcStackCap(th, base + frame_cap.*);
+            th.bytecode_stack_top = @max(th.bytecode_stack_top, base + frame_cap.*);
         }
 
         // A nested call can grow and reallocate the shared bytecode stack even
@@ -5431,7 +5411,7 @@ pub const Vm = struct {
         // it can write through pointers into the old allocation and leave the
         // live registers unchanged.
         const cap: usize = frame_cap.*;
-        regs.* = self.bc_stack[base .. base + cap];
+        regs.* = th.bytecode_stack[base .. base + cap];
 
         if (frame_cap.* > old_cap) {
             // Nil-fill new register slots and clear the corresponding boxed
@@ -5441,7 +5421,7 @@ pub const Vm = struct {
             // smoke 61/67). P16.19 T3: boxed slots are derived here, not
             // carried in the hot dispatch context.
             for (regs.*[old_cap..]) |*r| r.* = .Nil;
-            for (self.bc_boxed[base + old_cap .. base + cap]) |*b| b.* = null;
+            for (th.bytecode_boxed[base + old_cap .. base + cap]) |*b| b.* = null;
         }
 
         // P15.51g: No frame slice update needed — regs/boxed are derived
@@ -5537,8 +5517,14 @@ pub const Vm = struct {
         self.long_literals.deinit(self.alloc);
         self.finalizables.deinit(self.alloc);
         self.dynamic_ast_arena.deinit();
-        self.alloc.free(self.bc_stack);
-        self.alloc.free(self.bc_boxed);
+        // P16.37 Cut 2: the main thread's bytecode stack/boxed arrays are NO
+        // LONGER freed here — the Thread owns them permanently, and
+        // drainGcRegistries below destroys the main_thread via
+        // gcFreeObject(.thread) → freeThreadRuntime (the documented root
+        // path; closeThreadOpenUpvalues runs first in that sequence, so any
+        // main-thread open upvalues are closed before the stack frees —
+        // stricter than the old model, which relied on "the main chunk
+        // returns and closes them").
         // PUC-faithful teardown: free non-GC managed buffers before destroying
         // GC objects. `long_string_cache` keys point into GC-owned LuaString
         // bytes, but deinit only frees the hashmap backing storage (never
@@ -6609,7 +6595,7 @@ pub const Vm = struct {
         // function value ("function 'name'"). Builtins live in _G as
         // .Builtin values, so match those too (PUC finds C functions in
         // _LOADED the same way).
-        if (self.debugFindGlobalFuncName(self.bc_stack[top.func_slot])) |gname| {
+        if (self.debugFindGlobalFuncName(th.bytecode_stack[top.func_slot])) |gname| {
             try w.print("\t[C]: in function '{s}'\n", .{gname});
             return;
         }
@@ -6916,29 +6902,31 @@ pub const Vm = struct {
     /// field needed.
     fn pushBuiltinCFrame(self: *Vm, callee: Value) std.mem.Allocator.Error!void {
         const th = self.activeBytecodeThread();
-        // Place callee on bc_stack (PUC: ci->func points into L->stack).
-        const func_slot = self.bc_stack_top;
-        // Grow bc_stack + bc_boxed transactionally: realloc bc_boxed first
-        // (into a temp), then bc_stack. If bc_stack realloc fails, restore
-        // bc_boxed. This avoids divergent sizes between the two arrays.
-        if (func_slot + 1 > self.bc_stack.len) {
-            const new_cap = @max(func_slot + 1, self.bc_stack.len + (self.bc_stack.len >> 1));
-            const new_boxed = try self.alloc.realloc(self.bc_boxed, new_cap);
-            const old_boxed = self.bc_boxed;
+        // Place callee on the thread's bytecode stack (PUC: ci->func points
+        // into L->stack).
+        const func_slot = th.bytecode_stack_top;
+        // Grow bytecode_stack + bytecode_boxed transactionally: realloc
+        // bytecode_boxed first (into a temp), then bytecode_stack. If the
+        // bytecode_stack realloc fails, restore bytecode_boxed. This avoids
+        // divergent sizes between the two arrays.
+        if (func_slot + 1 > th.bytecode_stack.len) {
+            const new_cap = @max(func_slot + 1, th.bytecode_stack.len + (th.bytecode_stack.len >> 1));
+            const new_boxed = try self.alloc.realloc(th.bytecode_boxed, new_cap);
+            const old_boxed = th.bytecode_boxed;
             errdefer {
-                self.bc_boxed = old_boxed;
+                th.bytecode_boxed = old_boxed;
                 _ = self.alloc.realloc(new_boxed, old_boxed.len) catch {};
             }
-            self.bc_boxed = new_boxed;
-            self.bc_stack = try self.alloc.realloc(self.bc_stack, new_cap);
-            @memset(self.bc_stack[func_slot..], .Nil);
-            @memset(self.bc_boxed[func_slot..], null);
+            th.bytecode_boxed = new_boxed;
+            th.bytecode_stack = try self.alloc.realloc(th.bytecode_stack, new_cap);
+            @memset(th.bytecode_stack[func_slot..], .Nil);
+            @memset(th.bytecode_boxed[func_slot..], null);
         }
-        self.bc_stack[func_slot] = callee;
-        self.bc_stack_top = func_slot + 1;
-        // addOne may fail with OOM — rollback bc_stack_top on failure.
+        th.bytecode_stack[func_slot] = callee;
+        th.bytecode_stack_top = func_slot + 1;
+        // addOne may fail with OOM — rollback bytecode_stack_top on failure.
         const slot = th.call_frames.addOne(self.alloc) catch |err| {
-            self.bc_stack_top = func_slot;
+            th.bytecode_stack_top = func_slot;
             return err;
         };
         slot.* = .{
@@ -6960,7 +6948,7 @@ pub const Vm = struct {
             // Lua frame pushed above restores the depth to its own snapshot
             // on pop, so a C frame's attributed range [tbc_mark, next_mark)
             // is always empty.
-            .tbc_mark = self.bc_tbc_regs.items.len,
+            .tbc_mark = th.bytecode_tbc_regs.items.len,
             // P16.31 Cut 3: snapshot the TBC-chain depth at push — the
             // frame's REGION base (see the CallFrame field doc). Same
             // rationale as tbc_mark above: the depth is restored on pop
@@ -7015,7 +7003,7 @@ pub const Vm = struct {
             // P15.80: Free heap-allocated state before shrinking.
             // Without this, the pointer is lost and the allocation leaks.
             if (frame.isC()) self.freeCFrameOwnedState(frame);
-            self.bc_stack_top = frame.func_slot;
+            th.bytecode_stack_top = frame.func_slot;
             th.call_frames.shrinkTo(cur_len - 1);
             if (frame.isC()) {
                 if (std.debug.runtime_safety) std.debug.assert(th.c_frame_count > 0);
@@ -7040,7 +7028,7 @@ pub const Vm = struct {
     pub fn invokeErrfunc(self: *Vm) !void {
         const th = self.activeBytecodeThread();
         if (th.errfunc == ERRFUNC_NONE) return;
-        const ef = self.bc_stack[th.errfunc];
+        const ef = th.bytecode_stack[th.errfunc];
         // Re-entrancy guard (see Thread.errfunc_running_idx): a raise while
         // the SAME handler window is running is handled by the retry loop
         // below — do not invoke it again at the raise site. A DIFFERENT
@@ -7780,7 +7768,7 @@ pub const Vm = struct {
         // reg_top is read directly from the CallFrame (P15.51l).
         try self.gcAutomaticStep();
         // bc_stack may have been realloc'd by GC finalizers.
-        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+        ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
     }
 
     /// `ctx` is the ACTIVE dispatch context when the allocation happens
@@ -8088,7 +8076,7 @@ pub const Vm = struct {
         // non-VAHID frames (buildhiddenargs copies them there).
         const nparams: usize = if (fr.proto()) |p| p.numparams else 0;
         const n_transfer = @min(nargs, nparams);
-        const transfer = self.bc_stack[fr.frameBase() .. fr.frameBase() + n_transfer];
+        const transfer = self.activeBytecodeThread().bytecode_stack[fr.frameBase() .. fr.frameBase() + n_transfer];
         try self.debugDispatchHookWithCalleeTransfer(
             "call",
             null,
@@ -8211,7 +8199,7 @@ pub const Vm = struct {
             const th_ef = protection.thread;
             if (th_ef.errfunc == protection.armed_errfunc) {
                 th_ef.errfunc = ERRFUNC_NONE;
-                if (self.bc_stack_top > protection.armed_errfunc) self.bc_stack_top = protection.armed_errfunc;
+                if (self.activeBytecodeThread().bytecode_stack_top > protection.armed_errfunc) self.activeBytecodeThread().bytecode_stack_top = protection.armed_errfunc;
             }
         }
         // P16.23 T6: restore the C-call depth to the protection's entry
@@ -8331,7 +8319,7 @@ pub const Vm = struct {
     }
 
     fn closeBytecodeUpvaluesFrom(self: *Vm, frame: *CallFrame, min_reg: u8) void {
-        const boxed = self.bc_boxed[frame.frameBase() .. frame.frameBase() + frame.u.lua.frame_cap];
+        const boxed = self.activeBytecodeThread().bytecode_boxed[frame.frameBase() .. frame.frameBase() + frame.u.lua.frame_cap];
         var i: usize = min_reg;
         while (i < boxed.len) : (i += 1) {
             if (boxed[i]) |cell| {
@@ -8384,7 +8372,7 @@ pub const Vm = struct {
             // closes are yieldable (yy=1).
             .policy = if (owner.close_mode) .nonyieldable else .yieldable,
             .min_reg = min_reg,
-            .scan_index = self.bc_tbc_regs.items.len,
+            .scan_index = owner.bytecode_tbc_regs.items.len,
             .current_err = initial_err,
             .had_close_error = false,
             .close_all = close_all,
@@ -8486,12 +8474,12 @@ pub const Vm = struct {
                 _ = chain.pop();
                 from_chain = true;
             } else {
-                state.scan_index = @min(state.scan_index, self.bc_tbc_regs.items.len);
+                state.scan_index = @min(state.scan_index, state.owner_thread.bytecode_tbc_regs.items.len);
                 var found_index: ?usize = null;
                 var i = state.scan_index;
                 while (i > parent.tbc_mark) {
                     i -= 1;
-                    const reg = self.bc_tbc_regs.items[i];
+                    const reg = state.owner_thread.bytecode_tbc_regs.items[i];
                     if (reg >= parent.u.lua.frame_cap) continue;
                     if (!state.close_all and reg < state.min_reg) continue;
                     found_index = i;
@@ -8499,11 +8487,11 @@ pub const Vm = struct {
                 }
 
                 const close_index = found_index orelse break;
-                const tbc_reg = self.bc_tbc_regs.items[close_index];
-                _ = self.bc_tbc_regs.orderedRemove(close_index);
+                const tbc_reg = state.owner_thread.bytecode_tbc_regs.items[close_index];
+                _ = state.owner_thread.bytecode_tbc_regs.orderedRemove(close_index);
                 state.scan_index = close_index;
 
-                const regs = self.bc_stack[parent.frameBase() .. parent.frameBase() + parent.u.lua.frame_cap];
+                const regs = state.owner_thread.bytecode_stack[parent.frameBase() .. parent.frameBase() + parent.u.lua.frame_cap];
                 obj = regs[tbc_reg];
             }
 
@@ -8556,7 +8544,8 @@ pub const Vm = struct {
                 // between continuation install and activation, roll the
                 // __close continuation back to its exact prior state.
                 const staged = self.stageBytecodeCall(
-                    self.bc_stack_top,
+                    state.owner_thread,
+                    state.owner_thread.bytecode_stack_top,
                     resolved.callee.Closure,
                     resolved.args,
                 ) catch |push_err| {
@@ -8564,6 +8553,7 @@ pub const Vm = struct {
                     return push_err;
                 };
                 self.pushStagedBytecodeExecFrame(
+                    state.owner_thread,
                     exec_frames,
                     resolved.callee.Closure.proto.?,
                     staged.func_slot,
@@ -8616,7 +8606,7 @@ pub const Vm = struct {
             if (close_err) |err_value| self.restoreRuntimeErrorValue(err_value);
             if (exec_frames.getPtr(parent_index).hasOpenUpvalues())
                 self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), 0);
-            self.popBytecodeExecFrame(exec_frames);
+            self.popBytecodeExecFrame(state.owner_thread, exec_frames);
             return .propagate_error;
         }
 
@@ -8655,7 +8645,7 @@ pub const Vm = struct {
                 if (close_err) |err_value| self.restoreRuntimeErrorValue(err_value);
                 if (exec_frames.getPtr(parent_index).hasOpenUpvalues())
                     self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), 0);
-                self.popBytecodeExecFrame(exec_frames);
+                self.popBytecodeExecFrame(state.owner_thread, exec_frames);
                 return .propagate_error;
             },
         }
@@ -8704,7 +8694,7 @@ pub const Vm = struct {
             },
             .hook => |cont| {
                 if (owner_runtime) |runtime| {
-                    self.bc_stack[runtime.func_slot] = cont.saved_parent_callee;
+                    self.activeBytecodeThread().bytecode_stack[runtime.func_slot] = cont.saved_parent_callee;
                     runtime.setTailCallBool(cont.saved_parent_tailcall);
                 }
                 self.alloc.free(cont.transfer);
@@ -8801,6 +8791,10 @@ pub const Vm = struct {
             .simple_result => SimpleResultPayload,
         },
     ) DispatchError!void {
+        // P16.37: the value stack is Thread-owned; metamethod/continuation
+        // activations run on the active thread's frames (a coroutine switch
+        // makes the target active before re-driving continuations).
+        const th = self.activeBytecodeThread();
         const proto = closure.proto orelse unreachable; // caller proves proto != null
         const parent = exec_frames.getPtr(parent_index);
         std.debug.assert(parent.pending_call_index == INVALID_PENDING);
@@ -8827,11 +8821,13 @@ pub const Vm = struct {
             // PUC luaT_callTMres two-step: stage [func, args...] at
             // L->top (bc_stack_top), then activate (luaD_precall).
             const staged = try self.stageBytecodeCall(
-                self.bc_stack_top,
+                th,
+                th.bytecode_stack_top,
                 closure,
                 args,
             );
             try self.pushStagedBytecodeExecFrame(
+                th,
                 exec_frames,
                 proto,
                 staged.func_slot,
@@ -8869,8 +8865,9 @@ pub const Vm = struct {
                 // fallback for non-fast shapes. Same transactionality as the
                 // generic arm below: every fallible step sits under the
                 // clearSimpleResult errdefer above.
-                const staged = try self.stageFixedCall(n, self.bc_stack_top, closure, args);
+                const staged = try self.stageFixedCall(th, n, th.bytecode_stack_top, closure, args);
                 if ((try self.pushStagedFast(
+                    th,
                     exec_frames,
                     proto,
                     staged.func_slot,
@@ -8878,6 +8875,7 @@ pub const Vm = struct {
                     -1,
                 )) == null) {
                     try self.pushStagedBytecodeExecFrame(
+                        th,
                         exec_frames,
                         proto,
                         staged.func_slot,
@@ -8887,11 +8885,13 @@ pub const Vm = struct {
                 }
             } else {
                 const staged = try self.stageBytecodeCall(
-                    self.bc_stack_top,
+                    th,
+                    th.bytecode_stack_top,
                     closure,
                     args,
                 );
                 try self.pushStagedBytecodeExecFrame(
+                    th,
                     exec_frames,
                     proto,
                     staged.func_slot,
@@ -9276,6 +9276,10 @@ pub const Vm = struct {
         transfer_start: i64,
         post: BytecodeHookPost,
     ) DispatchError!bool {
+        // P16.37: the value stack is Thread-owned; this helper runs on
+        // the active thread's frames (a coroutine switch makes the
+        // target active before re-driving continuations). Hook frames are always pushed on the active thread.
+        const th = self.activeBytecodeThread();
         if (!self.hooks_active_cached) return false;
         if (self.debug_hooks_suppressed != 0 or self.isInDebugHook()) return false;
         const hook_state = self.activeHookState();
@@ -9311,9 +9315,9 @@ pub const Vm = struct {
         // bc_stack[func_slot] so debug.getinfo(2).func = event_callee, then
         // restores it when the hook returns.
         const parent_frame = exec_frames.getPtr(parent_index);
-        const saved_callee = self.bc_stack[parent_frame.func_slot];
+        const saved_callee = th.bytecode_stack[parent_frame.func_slot];
         const saved_tailcall = parent_frame.isTailCall();
-        if (event_callee) |callee| self.bc_stack[parent_frame.func_slot] = callee;
+        if (event_callee) |callee| th.bytecode_stack[parent_frame.func_slot] = callee;
         if (std.mem.eql(u8, event, "tail call")) parent_frame.setTailCall() else if (std.mem.eql(u8, event, "call")) parent_frame.clearTailCall();
 
         const hook_state_ptr = try self.alloc.create(BytecodeHookContinuation);
@@ -9332,24 +9336,23 @@ pub const Vm = struct {
         });
         // PUC luaD_hook: the hook function + event/line args are staged on
         // the stack, then called via luaD_call.
-        const staged_hook = self.stageBytecodeCall(self.bc_stack_top, cl, argv[0..argc]) catch |err| {
+        const staged_hook = self.stageBytecodeCall(th, th.bytecode_stack_top, cl, argv[0..argc]) catch |err| {
             self.clearPendingCall(exec_frames.getPtr(parent_index));
             self.alloc.destroy(hook_state_ptr);
-            self.bc_stack[parent_frame.func_slot] = saved_callee;
+            th.bytecode_stack[parent_frame.func_slot] = saved_callee;
             exec_frames.getPtr(parent_index).setTailCallBool(saved_tailcall);
             return err;
         };
-        self.pushStagedBytecodeExecFrame(exec_frames, proto, staged_hook.func_slot, staged_hook.nargs, -1) catch |err| {
+        self.pushStagedBytecodeExecFrame(th, exec_frames, proto, staged_hook.func_slot, staged_hook.nargs, -1) catch |err| {
             self.clearPendingCall(exec_frames.getPtr(parent_index));
             self.alloc.destroy(hook_state_ptr);
-            self.bc_stack[parent_frame.func_slot] = saved_callee;
+            th.bytecode_stack[parent_frame.func_slot] = saved_callee;
             exec_frames.getPtr(parent_index).setTailCallBool(saved_tailcall);
             return err;
         };
         const hook_runtime = exec_frames.getPtr(exec_frames.len() - 1);
         hook_runtime.setDebugHook();
         // P15.51n: Track hook frame index on Thread for O(1) access.
-        const th = self.activeBytecodeThread();
         th.hook_frame_index = exec_frames.len() - 1;
         // P15.38f: Set per-thread in_debug_hook so isInDebugHook() is O(1).
         // This mirrors PUC Lua's `L->allowhook = 0` in luaD_hook.
@@ -9541,7 +9544,7 @@ pub const Vm = struct {
             .not_found => {
                 if (use_bytecode_fallback) {
                     const result = try self.bytecodeIndexValue(ctx.cur_proto, ctx.pc, b, obj, key);
-                    ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                    ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
                     ctx.regs[a] = result;
                 } else {
                     ctx.regs[a] = try self.indexValue(obj, key);
@@ -9550,7 +9553,7 @@ pub const Vm = struct {
             .resolved => |r| {
                 exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                 ctx.regs[a] = try self.callResolvedIndexMetamethod(r.mm, r.obj, key);
-                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
             },
         }
         return false;
@@ -9587,7 +9590,7 @@ pub const Vm = struct {
             .resolved => |r| {
                 exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                 try self.callResolvedNewIndexMetamethod(r.mm, r.obj, key, val);
-                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
             },
         }
         return false;
@@ -9610,9 +9613,13 @@ pub const Vm = struct {
         dst: usize,
         nresults: i32,
     ) DispatchError!void {
+        // P16.37: the value stack is Thread-owned; this helper runs on
+        // the active thread's frames (a coroutine switch makes the
+        // target active before re-driving continuations). Result completions run on the active thread.
+        const th = self.activeBytecodeThread();
         errdefer if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         const parent = exec_frames.getPtr(parent_index);
-        var regs = self.bc_stack[parent.frameBase() .. parent.frameBase() + parent.u.lua.frame_cap];
+        var regs = th.bytecode_stack[parent.frameBase() .. parent.frameBase() + parent.u.lua.frame_cap];
         const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
         // P16.2e (CHANGE 5): Guard bcGrowFrame — only call when growth is
         // actually needed. bcGrowFrame unconditionally re-derives regs/boxed
@@ -9621,7 +9628,7 @@ pub const Vm = struct {
         // semantically identical to bcGrowFrame's internal check.
         //
         // Safety: the slices derived above are always valid because they are
-        // computed from the current self.bc_stack pointer. No code between the
+        // computed from the current th.bytecode_stack pointer. No code between the
         // derivation and the write below can reallocate bc_stack (it is a
         // simple loop copy). If a previous operation in this caller did
         // reallocate bc_stack, the slices were derived AFTER that realloc, so
@@ -9629,7 +9636,7 @@ pub const Vm = struct {
         // frame_cap field is always up-to-date (frames are not moved by stack
         // realloc — only the bc_stack/bc_boxed arrays grow).
         if (dst + nstore > parent.u.lua.frame_cap) {
-            try self.bcGrowFrame(parent.frameBase(), dst + nstore, &parent.u.lua.frame_cap, &regs);
+            try self.bcGrowFrame(th, parent.frameBase(), dst + nstore, &parent.u.lua.frame_cap, &regs);
         }
         for (0..nstore) |i| regs[dst + i] = if (i < ret.len) ret[i] else .Nil;
         if (nresults < 0) parent.reg_top = @intCast(@as(usize, dst) + ret.len);
@@ -9645,6 +9652,10 @@ pub const Vm = struct {
         dst: usize,
         nresults: i32,
     ) DispatchError!void {
+        // P16.37: the value stack is Thread-owned; this helper runs on
+        // the active thread's frames (a coroutine switch makes the
+        // target active before re-driving continuations). Result completions run on the active thread.
+        const th = self.activeBytecodeThread();
         errdefer if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         const parent = exec_frames.getPtr(parent_index);
         const pending = self.getPendingCallConst(parent.pending_call_index) orelse unreachable;
@@ -9652,9 +9663,9 @@ pub const Vm = struct {
             .results => |cont| cont.min_reg_top,
             else => unreachable,
         };
-        var regs = self.bc_stack[parent.frameBase() .. parent.frameBase() + parent.u.lua.frame_cap];
+        var regs = th.bytecode_stack[parent.frameBase() .. parent.frameBase() + parent.u.lua.frame_cap];
         const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
-        try self.bcGrowFrame(parent.frameBase(), dst + nstore, &parent.u.lua.frame_cap, &regs);
+        try self.bcGrowFrame(th, parent.frameBase(), dst + nstore, &parent.u.lua.frame_cap, &regs);
         for (0..nstore) |i| regs[dst + i] = if (i < ret.len) ret[i] else .Nil;
         if (nresults < 0) parent.reg_top = @intCast(dst + ret.len);
         if (min_reg_top) |minimum| parent.reg_top = @max(parent.reg_top, minimum);
@@ -9756,10 +9767,14 @@ pub const Vm = struct {
         ret: []Value,
         cont: BytecodeValueContinuation,
     ) DispatchError!void {
+        // P16.37: the value stack is Thread-owned; this helper runs on
+        // the active thread's frames (a coroutine switch makes the
+        // target active before re-driving continuations). Result completions run on the active thread.
+        const th = self.activeBytecodeThread();
         defer if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         const parent = exec_frames.getPtr(parent_index);
-        var regs = self.bc_stack[parent.frameBase() .. parent.frameBase() + parent.u.lua.frame_cap];
-        try self.bcGrowFrame(parent.frameBase(), @as(usize, cont.dst) + 1, &parent.u.lua.frame_cap, &regs);
+        var regs = th.bytecode_stack[parent.frameBase() .. parent.frameBase() + parent.u.lua.frame_cap];
+        try self.bcGrowFrame(th, parent.frameBase(), @as(usize, cont.dst) + 1, &parent.u.lua.frame_cap, &regs);
         regs[cont.dst] = if (ret.len == 0) .Nil else ret[0];
         parent.u.lua.pc += 1;
         self.clearPendingCall(parent);
@@ -9909,6 +9924,10 @@ pub const Vm = struct {
         ret: []Value,
         cont: *BytecodeConcatContinuation,
     ) DispatchError!void {
+        // P16.37: the value stack is Thread-owned; this helper runs on
+        // the active thread's frames (a coroutine switch makes the
+        // target active before re-driving continuations). Result completions run on the active thread.
+        const th = self.activeBytecodeThread();
         const acc = if (ret.len == 0) Value.Nil else ret[0];
 
         // Root the continuation while detaching it from the parent.  The next
@@ -9933,8 +9952,8 @@ pub const Vm = struct {
             .pushed => {},
             .value => |value| {
                 const parent = exec_frames.getPtr(parent_index);
-                var regs = self.bc_stack[parent.frameBase() .. parent.frameBase() + parent.u.lua.frame_cap];
-                try self.bcGrowFrame(parent.frameBase(), @as(usize, cont.dst) + 1, &parent.u.lua.frame_cap, &regs);
+                var regs = th.bytecode_stack[parent.frameBase() .. parent.frameBase() + parent.u.lua.frame_cap];
+                try self.bcGrowFrame(th, parent.frameBase(), @as(usize, cont.dst) + 1, &parent.u.lua.frame_cap, &regs);
                 regs[cont.dst] = value;
                 parent.u.lua.pc += 1;
             },
@@ -10436,7 +10455,7 @@ pub const Vm = struct {
         if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         // P15.51k: Restore callee at bc_stack[func_slot] (PUC's ci->func).
         const runtime = exec_frames.getPtr(parent_index);
-        self.bc_stack[runtime.func_slot] = cont.saved_parent_callee;
+        self.activeBytecodeThread().bytecode_stack[runtime.func_slot] = cont.saved_parent_callee;
         runtime.setTailCallBool(cont.saved_parent_tailcall);
         self.clearPendingCall(exec_frames.getPtr(parent_index));
         self.alloc.free(cont.transfer);
@@ -10853,7 +10872,6 @@ pub const Vm = struct {
         defer self.alloc.free(request.args);
         const target = request.target;
         std.debug.assert(self.current_thread == request.caller);
-        std.debug.assert(self.active_runtime_thread == request.caller);
         std.debug.assert(canTrampolineBytecodeThread(target));
 
         // P16.24 T4 / P16.25.1 R3: resume-entry depth accounting — the
@@ -10866,7 +10884,13 @@ pub const Vm = struct {
         if (entry == .rejected)
             return self.raiseResumeEntryRejected(entry.rejected);
         const first_start = !target.started and target.entry_args == null;
-        if (first_start) target.entry_args = try self.alloc.dupe(Value, request.args);
+        if (first_start) {
+            target.entry_args = try self.alloc.dupe(Value, request.args);
+            // T7.2 (P16.37 Cut 2): frame-capacity pre-allocation at FIRST
+            // activation — same rationale as builtinCoroutineResume's
+            // first-start site (was: every activateRuntime switch).
+            target.call_frames.ensureTotalCapacity(self.alloc, 64) catch {};
+        }
         try self.setThreadResumeInbox(target, request.args);
         target.yielded.deinit(self.alloc);
 
@@ -10876,11 +10900,10 @@ pub const Vm = struct {
         target.capture_yield_id = 0;
         target.caller = request.caller;
 
-        // P15.33: Set current_thread before switchRuntime so that
-        // refreshHooksCached (called inside switchRuntime) reads the
-        // target thread's hook state.
-        self.current_thread = target;
-        self.switchRuntime(target);
+        // P15.33: switchThread sets current_thread BEFORE refreshing the
+        // cached hook flags so refreshHooksCached reads the target thread's
+        // hook state.
+        self.switchThread(target);
         return first_start;
     }
 
@@ -11796,15 +11819,15 @@ pub const Vm = struct {
         if (th_bc.len() > 0) {
             const caller = th_bc.getConstPtr(th_bc.len() - 1);
             if (!caller.isC()) {
-                self.bc_stack_top = caller.frameBase() + caller.u.lua.frame_cap;
+                th.bytecode_stack_top = caller.frameBase() + caller.u.lua.frame_cap;
             } else {
-                // C-frame caller: restore bc_stack_top to the C-frame's base
-                // (= func_slot + 1), matching popBytecodeExecFrame's C-frame
-                // caller path.
-                self.bc_stack_top = caller.frameBase();
+                // C-frame caller: restore bytecode_stack_top to the C-frame's
+                // base (= func_slot + 1), matching popBytecodeExecFrame's
+                // C-frame caller path.
+                th.bytecode_stack_top = caller.frameBase();
             }
         } else {
-            self.bc_stack_top = 0;
+            th.bytecode_stack_top = 0;
         }
     }
 
@@ -11833,7 +11856,7 @@ pub const Vm = struct {
         if (!fr.isC()) return;
         const saved_func_slot = fr.func_slot;
         self.freeCFrameOwnedState(fr);
-        self.bc_stack_top = saved_func_slot + 1;
+        th.bytecode_stack_top = saved_func_slot + 1;
         th_bc.shrinkTo(cur_len - 1);
         if (std.debug.runtime_safety) std.debug.assert(th.c_frame_count > 0);
         th.c_frame_count -= 1; // P16.26 D
@@ -12197,8 +12220,7 @@ pub const Vm = struct {
                 const parent = child.caller orelse unreachable;
                 const child_step = step;
                 self.finishNestedBytecodeCoroutine(child, child_step);
-                self.current_thread = parent;
-                self.switchRuntime(parent);
+                self.switchThread(parent);
                 child.caller = null;
                 parent.status = .running;
                 active = parent;
@@ -12280,6 +12302,10 @@ pub const Vm = struct {
         args: []const Value,
         tail_return: bool,
     ) DispatchError!bool {
+        // P16.37: the value stack is Thread-owned; this helper runs on
+        // the active thread's frames (a coroutine switch makes the
+        // target active before re-driving continuations). The pcall fast path stages on the active thread.
+        const th = self.activeBytecodeThread();
         if (id != .pcall and id != .xpcall) return false;
         const owner = self.activeBytecodeThread();
         const protected_depth_before = self.protected_call_depth + owner.bytecode_protected_depth;
@@ -12449,7 +12475,7 @@ pub const Vm = struct {
         // Call pops the slot; restoreBytecodeSavedError restores the outer
         // errfunc.
         if (active_id == .xpcall) {
-            protection_ptr.armed_errfunc = self.bc_stack_top;
+            protection_ptr.armed_errfunc = th.bytecode_stack_top;
             self.setErrfuncValue(active_args[1]);
         }
         if (protected_depth_before + outer_specs.items.len >= 200)
@@ -12463,8 +12489,8 @@ pub const Vm = struct {
         // 'pcall'/'xpcall' lines by checking pending_call.protection.
         // PUC luaB_pcall: the target + args are staged on the stack, then
         // activated (luaD_pcall → luaD_precall).
-        const staged_target = try self.stageBytecodeCall(self.bc_stack_top, cl, child_args);
-        try self.pushStagedBytecodeExecFrame(exec_frames, proto, staged_target.func_slot, staged_target.nargs, -1);
+        const staged_target = try self.stageBytecodeCall(th, th.bytecode_stack_top, cl, child_args);
+        try self.pushStagedBytecodeExecFrame(th, exec_frames, proto, staged_target.func_slot, staged_target.nargs, -1);
         // The pcall/xpcall target gets its CALL event here (PUC: pcall runs
         // the target via luaD_call → luaD_precall → luaG_tracecall).
         if (child_debug_pairs) {
@@ -12816,7 +12842,7 @@ pub const Vm = struct {
                     } else {
                         self.detachTbcRegion(owner, frame.tbc_chain_base);
                     }
-                    self.popBytecodeExecFrame(exec_frames);
+                    self.popBytecodeExecFrame(owner, exec_frames);
                     continue;
                 }
                 // P16.31 Cut 3: forced-close transport (owner.close_mode —
@@ -12842,7 +12868,7 @@ pub const Vm = struct {
                         owner.bytecode_unwinds.items[state_index] = state;
                     }
                 }
-                if (self.bc_tbc_regs.items.len > frame.tbc_mark) {
+                if (owner.bytecode_tbc_regs.items.len > frame.tbc_mark) {
                     owner.bytecode_unwinds.items[state_index] = state;
                     switch (try self.beginBytecodeClose(
                         exec_frames,
@@ -12867,7 +12893,7 @@ pub const Vm = struct {
 
                 if (frame.hasOpenUpvalues())
                     self.closeBytecodeUpvaluesFrom(frame, 0);
-                self.popBytecodeExecFrame(exec_frames);
+                self.popBytecodeExecFrame(owner, exec_frames);
             }
 
             _ = owner.bytecode_unwinds.pop();
@@ -13005,6 +13031,7 @@ pub const Vm = struct {
     /// caller-specific fast-path copies.
     fn stageBytecodeCall(
         self: *Vm,
+        th: *Thread,
         func_slot: usize,
         callee_cl: ?*Closure,
         args: []const Value,
@@ -13013,15 +13040,15 @@ pub const Vm = struct {
         // EXTRA_STACK for the staged values; the frame's own space is
         // reserved by the activation's checkstackp equivalent).
         const needed = func_slot + 1 + args.len;
-        if (needed > self.bc_stack.len) {
-            try self.ensureBcStackCap(needed);
+        if (needed > th.bytecode_stack.len) {
+            try self.ensureBcStackCap(th, needed);
         }
-        self.bc_stack[func_slot] = if (callee_cl) |cl|
+        th.bytecode_stack[func_slot] = if (callee_cl) |cl|
             .{ .Closure = cl }
         else
             .Nil;
         for (args, 0..) |v, i| {
-            self.bc_stack[func_slot + 1 + i] = v;
+            th.bytecode_stack[func_slot + 1 + i] = v;
         }
         return .{ .func_slot = func_slot, .nargs = args.len };
     }
@@ -13041,6 +13068,7 @@ pub const Vm = struct {
     /// vs `luaD_call` (arbitrary top-based window) at the call site.
     fn stageFixedCall(
         self: *Vm,
+        th: *Thread,
         comptime n: usize,
         func_slot: usize,
         callee_cl: *Closure,
@@ -13051,12 +13079,12 @@ pub const Vm = struct {
         // luaT_callTMres assumes EXTRA_STACK for the staged values,
         // luaD_precall's checkstack covers the frame).
         const needed = func_slot + 1 + n;
-        if (needed > self.bc_stack.len) {
-            try self.ensureBcStackCap(needed);
+        if (needed > th.bytecode_stack.len) {
+            try self.ensureBcStackCap(th, needed);
         }
-        self.bc_stack[func_slot] = .{ .Closure = callee_cl };
+        th.bytecode_stack[func_slot] = .{ .Closure = callee_cl };
         inline for (0..n) |i| {
-            self.bc_stack[func_slot + 1 + i] = args[i];
+            th.bytecode_stack[func_slot + 1 + i] = args[i];
         }
         return .{ .func_slot = func_slot, .nargs = n };
     }
@@ -13099,6 +13127,7 @@ pub const Vm = struct {
     /// fully initialized WHERE it matters.
     inline fn pushStagedFast(
         self: *Vm,
+        th: *Thread,
         exec_frames: *FrameStack,
         proto: *const bc.Proto,
         func_slot_in: usize,
@@ -13130,8 +13159,8 @@ pub const Vm = struct {
             // wrapped and accepted — identical to this form's small-stack
             // arm, so established ReleaseFast acceptance is preserved
             // exactly for every stack size.
-            if (needed_top <= self.bc_stack.len and
-                (self.bc_stack.len < 200 or needed_top + 200 <= self.bc_stack.len) and
+            if (needed_top <= th.bytecode_stack.len and
+                (th.bytecode_stack.len < 200 or needed_top + 200 <= th.bytecode_stack.len) and
                 (self.dispatch_gate & DISPATCH_GATE_HOOKS) == 0)
             {
                 if (self.stats.enabled) self.stats.calls_lua_frames += 1; // P16.0b: ALL Lua activations
@@ -13177,12 +13206,12 @@ pub const Vm = struct {
                 ef_slot.func_slot = func_slot_in; // base = func_slot + 1
                 ef_slot.callstatus = encodeNresults(nresults);
                 ef_slot.reg_top = @intCast(proto.numparams);
-                ef_slot.tbc_mark = self.bc_tbc_regs.items.len;
+                ef_slot.tbc_mark = th.bytecode_tbc_regs.items.len;
                 // P16.31 Cut 3: region base snapshot (see CallFrame field doc).
-                ef_slot.tbc_chain_base = @intCast(self.activeBytecodeThread().c_tbc_chain.items.len);
+                ef_slot.tbc_chain_base = @intCast(th.c_tbc_chain.items.len);
                 ef_slot.pending_call_index = INVALID_PENDING;
                 // Stack bookkeeping (PUC prepCallInfo + checkstack).
-                self.bc_stack_top = needed_top;
+                th.bytecode_stack_top = needed_top;
                 return ef_index;
             }
         }
@@ -13200,6 +13229,7 @@ pub const Vm = struct {
     /// `narg = L->top.p - func - 1`.
     fn pushStagedBytecodeExecFrame(
         self: *Vm,
+        th: *Thread,
         exec_frames: *FrameStack,
         proto: *const bc.Proto,
         func_slot_in: usize,
@@ -13209,7 +13239,7 @@ pub const Vm = struct {
         // P16.29: shared inline fast path first (single source of truth
         // with the dispatch OP_CALL handler). On success the activation is
         // complete; on null fall through to the general body below.
-        if ((try self.pushStagedFast(exec_frames, proto, func_slot_in, nargs, nresults)) != null) return;
+        if ((try self.pushStagedFast(th, exec_frames, proto, func_slot_in, nargs, nresults)) != null) return;
 
         if (self.stats.enabled) self.stats.calls_lua_frames += 1; // P16.0b: ALL Lua activations
         // Slow path: varargs / VAHID / missing args / growth / overflow /
@@ -13278,7 +13308,7 @@ pub const Vm = struct {
         const base = func_slot + 1;
 
         if (is_vahid) {
-            try self.prepareVahidShift(func_slot_in, func_slot, base, nparams, frame_cap);
+            try self.prepareVahidShift(th, func_slot_in, func_slot, base, nparams, frame_cap);
         }
 
         // PUC checkstackp overflow check: base + frame_cap must fit.
@@ -13291,7 +13321,7 @@ pub const Vm = struct {
         // However, if the handler itself needs more than the available
         // ERRORSTACKSIZE headroom (needed_top > bc_stack.len), raise
         // another error — the handler overflowed its emergency stack.
-        const handling_overflow = self.bc_stack.len > lua_max_stack_slots and
+        const handling_overflow = th.bytecode_stack.len > lua_max_stack_slots and
             self.activeErrorHandlerDepth() > 0;
         // When handling overflow, the error handler runs with ERRORSTACKSIZE
         // headroom (200 slots).  Skip the frame-count and stack-overflow
@@ -13300,7 +13330,7 @@ pub const Vm = struct {
         // error" path, which allows the handler to run without re-triggering
         // the overflow check.
         if (handling_overflow) {
-            if (needed_top > self.bc_stack.len) {
+            if (needed_top > th.bytecode_stack.len) {
                 // PUC luaD_growstack (ldo.c:355): a grow request while the
                 // stack is already at ERRORSTACKSIZE means the thread is
                 // handling a stack error and the handler itself exhausted
@@ -13313,16 +13343,16 @@ pub const Vm = struct {
             // cold (only reached on actual overflow). Outlined to a
             // noinline helper to keep the allocator vtable calls and
             // bc_boxed reload out of the hot path's register pressure.
-            return self.raiseFrameOverflow();
+            return self.raiseFrameOverflow(th);
         }
 
-        try self.ensureBcStackCap(needed_top);
+        try self.ensureBcStackCap(th, needed_top);
 
-        const old_stack_top = self.bc_stack_top;
-        self.bc_stack_top = needed_top;
-        errdefer self.bc_stack_top = old_stack_top;
+        const old_stack_top = th.bytecode_stack_top;
+        th.bytecode_stack_top = needed_top;
+        errdefer th.bytecode_stack_top = old_stack_top;
 
-        const regs = self.bc_stack[base .. base + frame_cap];
+        const regs = th.bytecode_stack[base .. base + frame_cap];
         // P15.51g: boxed no longer cached in frame — derive locally for nil-fill.
         // Nil-fill missing parameters (PUC luaD_precall behavior).
         // For VAHID, params were already copied during buildhiddenargs.
@@ -13334,10 +13364,10 @@ pub const Vm = struct {
             for (ncopy..nparams) |i| regs[i] = .Nil;
         }
 
-        const tbc_mark = self.bc_tbc_regs.items.len;
-        errdefer self.bc_tbc_regs.items.len = tbc_mark;
+        const tbc_mark = th.bytecode_tbc_regs.items.len;
+        errdefer th.bytecode_tbc_regs.items.len = tbc_mark;
         // P16.31 Cut 3: region base snapshot (see CallFrame field doc).
-        const tbc_chain_base: u32 = @intCast(self.activeBytecodeThread().c_tbc_chain.items.len);
+        const tbc_chain_base: u32 = @intCast(th.c_tbc_chain.items.len);
 
         // P15.51k: callee lives at bc_stack[func_slot] (PUC's ci->func).
         // No duplicated callee field in CallFrame.
@@ -13430,6 +13460,7 @@ pub const Vm = struct {
     /// Cold: only vararg functions WITHOUT a vararg table AND with extra args.
     noinline fn prepareVahidShift(
         self: *Vm,
+        th: *Thread,
         func_slot_in: usize,
         func_slot: usize,
         base: usize,
@@ -13438,14 +13469,14 @@ pub const Vm = struct {
     ) DispatchError!void {
         // Ensure space for the shifted func+params + frame_cap.
         const needed_shift = base + frame_cap;
-        try self.ensureBcStackCap(needed_shift);
+        try self.ensureBcStackCap(th, needed_shift);
         // Copy func to new position (PUC: setobjs2s(L, L->top++, ci->func)).
-        self.bc_stack[func_slot] = self.bc_stack[func_slot_in];
+        th.bytecode_stack[func_slot] = th.bytecode_stack[func_slot_in];
         // Copy fixed params above the new func position.
         for (0..nparams) |i| {
-            self.bc_stack[base + i] = self.bc_stack[func_slot_in + 1 + i];
+            th.bytecode_stack[base + i] = th.bytecode_stack[func_slot_in + 1 + i];
             // Nil original param position (PUC: for GC safety).
-            self.bc_stack[func_slot_in + 1 + i] = .Nil;
+            th.bytecode_stack[func_slot_in + 1 + i] = .Nil;
         }
         // VAHID requires nextra > 0 (args.len > nparams), so there are never
         // missing params to nil-fill here — the old dead nil-fill loop was
@@ -13457,19 +13488,19 @@ pub const Vm = struct {
     /// Cold: only reached on actual stack/frame overflow.
     /// PUC luaD_growstack: this bypasses ensureBcStackCap's MAXSTACK cap
     /// because ERRORSTACKSIZE > MAXSTACK by design.
-    noinline fn raiseFrameOverflow(self: *Vm) DispatchError!void {
+    noinline fn raiseFrameOverflow(self: *Vm, th: *Thread) DispatchError!void {
         const PHYSICAL_LIMIT: usize = 1_000_000 + 200;
-        if (self.bc_stack.len < PHYSICAL_LIMIT) {
-            const old_len = self.bc_stack.len;
-            self.bc_stack = self.alloc.realloc(self.bc_stack, PHYSICAL_LIMIT) catch {
+        if (th.bytecode_stack.len < PHYSICAL_LIMIT) {
+            const old_len = th.bytecode_stack.len;
+            th.bytecode_stack = self.alloc.realloc(th.bytecode_stack, PHYSICAL_LIMIT) catch {
                 return self.fail("stack overflow", .{});
             };
-            self.bc_boxed = self.alloc.realloc(self.bc_boxed, PHYSICAL_LIMIT) catch {
+            th.bytecode_boxed = self.alloc.realloc(th.bytecode_boxed, PHYSICAL_LIMIT) catch {
                 return self.fail("stack overflow", .{});
             };
             // Initialize new slots.
-            @memset(self.bc_stack[old_len..], .Nil);
-            @memset(self.bc_boxed[old_len..], null);
+            @memset(th.bytecode_stack[old_len..], .Nil);
+            @memset(th.bytecode_boxed[old_len..], null);
             // P15.51g: No per-frame slice refresh needed — regs/boxed
             // are derived on demand from base + frame_cap.
         }
@@ -13478,6 +13509,7 @@ pub const Vm = struct {
 
     inline fn popBytecodeExecFrame(
         self: *Vm,
+        th: *Thread,
         exec_frames: *FrameStack,
     ) void {
         std.debug.assert(exec_frames.len() != 0);
@@ -13522,20 +13554,19 @@ pub const Vm = struct {
         // Replaces the P16.30 assert: testC script frames (builtin frames)
         // can now legitimately carry `toclose` marks.
         if (frame.isC()) {
-            const th = self.activeBytecodeThread();
             self.detachTbcRegion(th, frame.tbc_chain_base);
             self.freeCFrameOwnedState(frame);
             if (std.debug.runtime_safety) std.debug.assert(th.c_frame_count > 0);
             th.c_frame_count -= 1;
         }
-        // Phase D: Varargs are on bc_stack, no heap free needed.
-        self.bc_tbc_regs.items.len = frame.tbc_mark;
+        // Phase D: Varargs are on the stack, no heap free needed.
+        th.bytecode_tbc_regs.items.len = frame.tbc_mark;
         frame.callstatus = 0;
         // PUC model: restore bc_stack_top to the caller's frame capacity.
         if (idx > 0) {
             const caller = exec_frames.getConstPtr(idx - 1);
             if (!caller.isC()) {
-                self.bc_stack_top = caller.frameBase() + caller.u.lua.frame_cap;
+                th.bytecode_stack_top = caller.frameBase() + caller.u.lua.frame_cap;
             } else {
                 // C-frame caller: restore bc_stack_top to the C-frame's base
                 // (= func_slot + 1). Without this, each runBytecodeInternal
@@ -13544,10 +13575,10 @@ pub const Vm = struct {
                 // bc_stack_top at the Lua frame's base + frame_cap, causing
                 // bc_stack_top to grow without bound across repeated calls
                 // and eventually triggering "stack overflow error".
-                self.bc_stack_top = caller.frameBase();
+                th.bytecode_stack_top = caller.frameBase();
             }
         } else {
-            self.bc_stack_top = 0;
+            th.bytecode_stack_top = 0;
         }
         exec_frames.shrinkTo(idx);
     }
@@ -13558,6 +13589,10 @@ pub const Vm = struct {
         boundary_depth: usize,
         ret: []Value,
     ) DispatchError!?[]Value {
+        // P16.37: the value stack is Thread-owned; this helper runs on
+        // the active thread's frames (a coroutine switch makes the
+        // target active before re-driving continuations). Return completions run on the active thread.
+        const th = self.activeBytecodeThread();
         // P15.51j: gcTempRoots is NOT needed on the common path. After
         // popBytecodeExecFrame the child's register window is dead, but:
         //  - closeBytecodeUpvaluesFrom fires write barriers only (gcMarkValue
@@ -13584,7 +13619,7 @@ pub const Vm = struct {
         const callee_nresults = decodeNresults(child_frame.callstatus);
         if (exec_frames.getPtr(child_idx).hasOpenUpvalues())
             self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(child_idx), 0);
-        self.popBytecodeExecFrame(exec_frames);
+        self.popBytecodeExecFrame(th, exec_frames);
 
         // P15.78: If the parent frame is a C-frame (pushed by runTestcScript's
         // closer loop or by callk/pcallk/yieldk), return the results to the
@@ -13647,8 +13682,8 @@ pub const Vm = struct {
                 } else {
                     // Value mode: put 1 result into register, advance pc.
                     const sr_dst = parent_ptr.u.lua.simple_result_dst;
-                    var regs = self.bc_stack[parent_ptr.frameBase() .. parent_ptr.frameBase() + parent_ptr.u.lua.frame_cap];
-                    try self.bcGrowFrame(parent_ptr.frameBase(), @as(usize, sr_dst) + 1, &parent_ptr.u.lua.frame_cap, &regs);
+                    var regs = th.bytecode_stack[parent_ptr.frameBase() .. parent_ptr.frameBase() + parent_ptr.u.lua.frame_cap];
+                    try self.bcGrowFrame(th, parent_ptr.frameBase(), @as(usize, sr_dst) + 1, &parent_ptr.u.lua.frame_cap, &regs);
                     regs[sr_dst] = if (ret.len == 0) .Nil else ret[0];
                     parent_ptr.u.lua.pc += 1;
                 }
@@ -13769,7 +13804,7 @@ pub const Vm = struct {
             }
             if (!frame.isC() and frame.hasOpenUpvalues())
                 self.closeBytecodeUpvaluesFrom(frame, 0);
-            self.popBytecodeExecFrame(exec_frames);
+            self.popBytecodeExecFrame(self.activeBytecodeThread(), exec_frames);
         }
     }
 
@@ -13911,8 +13946,8 @@ pub const Vm = struct {
             // PUC lua_pcallk/lua_resume: the C API stages func+args on the
             // value stack before docall — mirror it: stage at bc_stack_top
             // (L->top), then activate.
-            const staged_entry = try self.stageBytecodeCall(self.bc_stack_top, effective_callee, args);
-            try self.pushStagedBytecodeExecFrame(exec_frames, proto_in, staged_entry.func_slot, staged_entry.nargs, -1);
+            const staged_entry = try self.stageBytecodeCall(exec_thread, exec_thread.bytecode_stack_top, effective_callee, args);
+            try self.pushStagedBytecodeExecFrame(exec_thread, exec_frames, proto_in, staged_entry.func_slot, staged_entry.nargs, -1);
             // PUC luaG_tracecall (ldebug.c:903-921): when a fresh activation
             // starts executing, the CALL hook fires with the NEW ci — the
             // main chunk of a lua_pcall/dostring, a C-API-called function,
@@ -14087,6 +14122,16 @@ pub const Vm = struct {
         boundary_depth: usize,
         yielded_in_place: *bool,
 
+        // P16.37 Cut 2 (Variant A): the RUNNING thread (PUC `L` in
+        // luaV_execute). Set at frame_loop entry next to ctx.regs — the
+        // thread cannot change while a dispatch loop is executing its own
+        // opcodes (a coroutine switch always unwinds the dispatch loop via
+        // Yield/ThreadSwitch; it never continues on a foreign runtime), so
+        // this is a cache, not a live view. All bytecode_stack/boxed/top/
+        // tbc_regs access inside the dispatch loop goes through it — one
+        // pointer, no per-opcode thread lookup.
+        th: *Thread,
+
         // Hot frame state — cached from the heap CallFrame for register
         // performance. Only state touched EVERY iteration lives here;
         // rare frame metadata stays on the CallFrame and is loaded at use
@@ -14212,7 +14257,8 @@ pub const Vm = struct {
     /// `bc_stack`. Cheap (slice arithmetic only); call liberally after any
     /// function that may grow the shared stack.
     fn refreshCtxSlices(self: *Vm, ctx: *BytecodeDispatchCtx) void {
-        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+        _ = self; // P16.37: the stack lives on the Thread; ctx.th carries it.
+        ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
     }
 
     fn runBytecodeDispatch(
@@ -14231,6 +14277,7 @@ pub const Vm = struct {
             .boundary_depth = boundary_depth,
             .yielded_in_place = yielded_in_place,
             // hot fields — initialized from CallFrame at top of frame_loop
+            .th = undefined,
             .cur_proto = undefined,
             .cur_upvalues = &.{},
             .base = 0,
@@ -14310,14 +14357,18 @@ pub const Vm = struct {
                 // register slice (was: frameBase() twice).
                 const fr = entry_fr;
                 const fb = fr.frameBase();
+                // P16.37 Cut 2: cache the running thread (PUC `L`) for the
+                // whole iteration — all bytecode_stack access below goes
+                // through it (see BytecodeDispatchCtx.th).
+                ctx.th = self.activeBytecodeThread();
                 ctx.cur_proto = fr.u.lua.proto;
-                // P15.51n: upvalues derived from bc_stack[func_slot].Closure.
-                ctx.cur_upvalues = self.bc_stack[fr.func_slot].Closure.upvalues;
+                // P15.51n: upvalues derived from the stack's func slot.
+                ctx.cur_upvalues = ctx.th.bytecode_stack[fr.func_slot].Closure.upvalues;
                 ctx.base = fb;
                 const cap = fr.u.lua.frame_cap;
                 ctx.frame_cap = cap;
                 ctx.pc = fr.u.lua.pc;
-                ctx.regs = self.bc_stack[fb .. fb + cap];
+                ctx.regs = ctx.th.bytecode_stack[fb .. fb + cap];
             }
 
             // P16.29 T2: the generic frame-exit `defer syncFrame` is DELETED.
@@ -14339,7 +14390,7 @@ pub const Vm = struct {
 
             // P16.10 T6: Stack-pointer poll — REMOVED.
             //
-            // The per-instruction `if (self.bc_stack.ptr != stack_ptr)` check
+            // The per-instruction `if (ctx.th.bytecode_stack.ptr != stack_ptr)` check
             // was +3 instr/iter. It is unnecessary because every bc_stack
             // realloc path reachable from the inner loop either (a) explicitly
             // refreshes ctx.regs afterward, or (b) exits to
@@ -14521,7 +14572,7 @@ pub const Vm = struct {
                                     };
                                     // The hook can execute Lua and grow both the shared
                                     // value stack and runtime-frame array.
-                                    ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                    ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
                                     fr = exec_frames.getPtr(ctx.frame_index);
                                     ctx.pc = fr.u.lua.pc;
                                 }
@@ -14550,7 +14601,7 @@ pub const Vm = struct {
                                         }
                                         return hook_err;
                                     };
-                                    ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                    ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
                                     fr = exec_frames.getPtr(ctx.frame_index);
                                     ctx.pc = fr.u.lua.pc;
                                 }
@@ -14603,7 +14654,7 @@ pub const Vm = struct {
                                     };
                                     // A hook can recursively run Lua and reallocate
                                     // both arrays used by the explicit dispatch loop.
-                                    ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                    ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
                                     fr = exec_frames.getPtr(ctx.frame_index);
                                     ctx.pc = fr.u.lua.pc;
                                 }
@@ -14947,7 +14998,7 @@ pub const Vm = struct {
                             if (key == .Int) {
                                 const n: i64 = key.Int;
                                 if (n >= 1 and @as(usize, @intCast(n)) <= nextra) {
-                                    ctx.regs[inst.a] = self.bc_stack[va_base_idx + @as(usize, @intCast(n - 1))];
+                                    ctx.regs[inst.a] = ctx.th.bytecode_stack[va_base_idx + @as(usize, @intCast(n - 1))];
                                 } else {
                                     ctx.regs[inst.a] = .Nil;
                                 }
@@ -14968,7 +15019,7 @@ pub const Vm = struct {
                                         if (f >= 1 and f <= @as(f64, @floatFromInt(std.math.maxInt(i32)))) {
                                             const n: i64 = @intFromFloat(f);
                                             if (@as(usize, @intCast(n)) <= nextra) {
-                                                ctx.regs[inst.a] = self.bc_stack[va_base_idx + @as(usize, @intCast(n - 1))];
+                                                ctx.regs[inst.a] = ctx.th.bytecode_stack[va_base_idx + @as(usize, @intCast(n - 1))];
                                             } else {
                                                 ctx.regs[inst.a] = .Nil;
                                             }
@@ -15746,7 +15797,7 @@ pub const Vm = struct {
                         )) {
                             .pushed => continue :frame_loop,
                             .value => |result| {
-                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
                                 ctx.regs[pi.a] = result;
                             },
                             .compare => unreachable, // MMBIN never uses .compare
@@ -15781,7 +15832,7 @@ pub const Vm = struct {
                         )) {
                             .pushed => continue :frame_loop,
                             .value => |result| {
-                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
                                 ctx.regs[pi.a] = result;
                             },
                             .compare => unreachable, // MMBINI never uses .compare
@@ -15818,7 +15869,7 @@ pub const Vm = struct {
                         )) {
                             .pushed => continue :frame_loop,
                             .value => |result| {
-                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
                                 ctx.regs[pi.a] = result;
                             },
                             .compare => unreachable, // MMBANK never uses .compare
@@ -15856,7 +15907,7 @@ pub const Vm = struct {
                             )) {
                                 .pushed => continue :frame_loop,
                                 .value => |result| {
-                                    ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                    ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
                                     ctx.regs[inst.a] = result;
                                 },
                                 .compare => unreachable,
@@ -15898,7 +15949,7 @@ pub const Vm = struct {
                                 )) {
                                     .pushed => continue :frame_loop,
                                     .value => |result| {
-                                        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                        ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
                                         ctx.regs[inst.a] = result;
                                     },
                                     .compare => unreachable,
@@ -15935,7 +15986,7 @@ pub const Vm = struct {
                                 )) {
                                     .pushed => continue :frame_loop,
                                     .value => |result| {
-                                        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                        ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
                                         ctx.regs[inst.a] = result;
                                     },
                                     .compare => unreachable,
@@ -15996,7 +16047,7 @@ pub const Vm = struct {
                                     )) {
                                         .pushed => continue :frame_loop,
                                         .value => |ret| {
-                                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                            ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
                                             break :blk isTruthy(ret);
                                         },
                                         .compare => |cmp| break :blk cmp,
@@ -16319,6 +16370,7 @@ pub const Vm = struct {
                                 // both calls_fast and calls_slow — the
                                 // counters keep their entry-path meaning.
                                 if (try self.pushStagedFast(
+                                    ctx.th,
                                     ctx.exec_frames,
                                     proto,
                                     ctx.base + inst.a,
@@ -16383,7 +16435,7 @@ pub const Vm = struct {
                                     const child_cap: u32 = @intCast(proto.maxstacksize + EXTRA_MARGIN);
                                     ctx.frame_cap = child_cap;
                                     ctx.pc = 0;
-                                    ctx.regs = self.bc_stack[child_base .. child_base + child_cap];
+                                    ctx.regs = ctx.th.bytecode_stack[child_base .. child_base + child_cap];
                                     if (check_sigint and signal_int_pending.load(.acquire)) {
                                         signal_int_pending.store(false, .release);
                                         return self.fail("interrupted!", .{});
@@ -16660,7 +16712,7 @@ pub const Vm = struct {
                                 exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                                 return self.fail("variable '{s}' got a non-closable value", .{local_name});
                             }
-                            self.bc_tbc_regs.append(self.alloc, inst.a) catch return error.OutOfMemory;
+                            ctx.th.bytecode_tbc_regs.append(self.alloc, inst.a) catch return error.OutOfMemory;
                         }
                     },
 
@@ -16689,7 +16741,7 @@ pub const Vm = struct {
                             const va_slice: []Value = if (nextra_vp != 0) blk: {
                                 const np = ctx.cur_proto.numparams;
                                 const va_start = ctx.base + np;
-                                break :blk self.bc_stack[va_start .. va_start + nextra_vp];
+                                break :blk ctx.th.bytecode_stack[va_start .. va_start + nextra_vp];
                             } else &.{};
                             try self.tableResizeArray(t, @intCast(va_slice.len));
                             for (va_slice, 0..) |v, i| {
@@ -16700,7 +16752,7 @@ pub const Vm = struct {
                             // setIndexValue, internStr) may trigger GC which
                             // reallocates bc_stack. Refresh ctx.regs before writing
                             // the table to the register.
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[va_reg] = .{ .Table = t };
                             // P15.51l: reg_top is a rare field, write to CallFrame.
                             fr_vp.reg_top = @max(fr_vp.reg_top, va_reg + 1);
@@ -16869,7 +16921,7 @@ pub const Vm = struct {
     /// (pointer-identity detected, never freed). This eliminates the
     /// alloc(Value, 0)/free pair on every no-value return.
     fn opReturn0(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
-        const has_pending_tbc = self.bc_tbc_regs.items.len >
+        const has_pending_tbc = ctx.th.bytecode_tbc_regs.items.len >
             ctx.exec_frames.topConstPtr().tbc_mark; // P16.20 T6: current == top
         // P15.51l: hooks_active is read from self.hooks_active_cached.
         // P16.31 Cut 5 (D1-E): the hooks gate translates PUC lvm.c
@@ -16907,7 +16959,7 @@ pub const Vm = struct {
                             // parent reused across the shrink.
                             const child_m = @constCast(child);
                             child_m.callstatus = 0;
-                            self.bc_stack_top = parent_c.frameBase() + parent_c.u.lua.frame_cap;
+                            ctx.th.bytecode_stack_top = parent_c.frameBase() + parent_c.u.lua.frame_cap;
                             ctx.exec_frames.shrinkTo(ctx.frame_index);
                             // No value to store (opReturn0 returns 0 values).
                             const parent_m = @constCast(parent_c);
@@ -16935,12 +16987,12 @@ pub const Vm = struct {
                             const fb = parent_m.frameBase();
                             ctx.cur_proto = parent_m.u.lua.proto;
                             // P15.51n: upvalues from bc_stack[func_slot].
-                            ctx.cur_upvalues = self.bc_stack[parent_m.func_slot].Closure.upvalues;
+                            ctx.cur_upvalues = ctx.th.bytecode_stack[parent_m.func_slot].Closure.upvalues;
                             ctx.base = fb;
                             const pcap = parent_m.u.lua.frame_cap;
                             ctx.frame_cap = pcap;
                             ctx.pc = parent_m.u.lua.pc;
-                            ctx.regs = self.bc_stack[fb .. fb + pcap];
+                            ctx.regs = ctx.th.bytecode_stack[fb .. fb + pcap];
                             return .continue_no_advance;
                         }
                     }
@@ -16956,7 +17008,7 @@ pub const Vm = struct {
                             // (T7: stable parent reused across the shrink).
                             const child_m = @constCast(child);
                             child_m.callstatus = 0;
-                            self.bc_stack_top = parent_c.frameBase() + parent_c.u.lua.frame_cap;
+                            ctx.th.bytecode_stack_top = parent_c.frameBase() + parent_c.u.lua.frame_cap;
                             ctx.exec_frames.shrinkTo(ctx.frame_index);
                             const parent_m = @constCast(parent_c);
                             if (parent_m.simpleResultIsCompare()) {
@@ -16967,7 +17019,7 @@ pub const Vm = struct {
                             } else {
                                 // Value mode: 0 values → nil.
                                 const sr_dst = parent_m.u.lua.simple_result_dst;
-                                self.bc_stack[parent_c.frameBase() + sr_dst] = .Nil;
+                                ctx.th.bytecode_stack[parent_c.frameBase() + sr_dst] = .Nil;
                                 parent_m.reg_top = @intCast(sr_dst + 1);
                                 parent_m.u.lua.pc += 1;
                             }
@@ -16980,12 +17032,12 @@ pub const Vm = struct {
                             ctx.frame_index -= 1;
                             const fb = parent_m.frameBase();
                             ctx.cur_proto = parent_m.u.lua.proto;
-                            ctx.cur_upvalues = self.bc_stack[parent_m.func_slot].Closure.upvalues;
+                            ctx.cur_upvalues = ctx.th.bytecode_stack[parent_m.func_slot].Closure.upvalues;
                             ctx.base = fb;
                             const pcap = parent_m.u.lua.frame_cap;
                             ctx.frame_cap = pcap;
                             ctx.pc = parent_m.u.lua.pc;
-                            ctx.regs = self.bc_stack[fb .. fb + pcap];
+                            ctx.regs = ctx.th.bytecode_stack[fb .. fb + pcap];
                             return .continue_no_advance;
                         }
                     }
@@ -17044,7 +17096,7 @@ pub const Vm = struct {
         // exec_frames (calls push on top; the dispatch loop sets
         // frame_index = len()-1 at entry). topPtr() = one conditional,
         // no len()+index arithmetic.
-        const has_pending_tbc = self.bc_tbc_regs.items.len >
+        const has_pending_tbc = ctx.th.bytecode_tbc_regs.items.len >
             ctx.exec_frames.topConstPtr().tbc_mark;
         // P15.51l: hooks_active is read from self.hooks_active_cached.
         // P16.31 Cut 5 (D1-E): same hooks gate as opReturn0 — PUC lvm.c
@@ -17067,7 +17119,7 @@ pub const Vm = struct {
             //
             // Safety proof (single-copy cannot clobber source): the RHS
             // (ctx.regs[a]) is read into a local BEFORE the write. The write
-            // target (self.bc_stack[parent.frameBase() + dst]) is in the parent's
+            // target (ctx.th.bytecode_stack[parent.frameBase() + dst]) is in the parent's
             // register window, which may overlap the child's window (shared
             // stack). But since we read the source value first and perform a
             // single Value assignment, there is no aliasing hazard.
@@ -17118,13 +17170,13 @@ pub const Vm = struct {
                             // getPtr(ctx.frame_index) returned.
                             const child_m = @constCast(child);
                             child_m.callstatus = 0;
-                            self.bc_stack_top = parent_c.frameBase() + parent_c.u.lua.frame_cap;
+                            ctx.th.bytecode_stack_top = parent_c.frameBase() + parent_c.u.lua.frame_cap;
                             ctx.exec_frames.shrinkTo(ctx.frame_index);
                             // Single-copy: write return value directly into
                             // parent's register window. dst < frame_cap is
                             // guaranteed because the original func slot is within the
                             // parent's window (it's where the function was).
-                            self.bc_stack[parent_c.frameBase() + dst] = src_val;
+                            ctx.th.bytecode_stack[parent_c.frameBase() + dst] = src_val;
                             if (nresults < 0) {
                                 parent_m.reg_top = @intCast(dst + 1);
                             }
@@ -17139,12 +17191,12 @@ pub const Vm = struct {
                             ctx.frame_index -= 1;
                             const fb = parent_m.frameBase();
                             ctx.cur_proto = parent_m.u.lua.proto;
-                            ctx.cur_upvalues = self.bc_stack[parent_m.func_slot].Closure.upvalues;
+                            ctx.cur_upvalues = ctx.th.bytecode_stack[parent_m.func_slot].Closure.upvalues;
                             ctx.base = fb;
                             const pcap = parent_m.u.lua.frame_cap;
                             ctx.frame_cap = pcap;
                             ctx.pc = parent_m.u.lua.pc;
-                            ctx.regs = self.bc_stack[fb .. fb + pcap];
+                            ctx.regs = ctx.th.bytecode_stack[fb .. fb + pcap];
                             return .continue_no_advance;
                         }
                     }
@@ -17167,7 +17219,7 @@ pub const Vm = struct {
                             // (T7: stable parent reused across the shrink).
                             const child_m = @constCast(child);
                             child_m.callstatus = 0;
-                            self.bc_stack_top = parent_c.frameBase() + parent_c.u.lua.frame_cap;
+                            ctx.th.bytecode_stack_top = parent_c.frameBase() + parent_c.u.lua.frame_cap;
                             ctx.exec_frames.shrinkTo(ctx.frame_index);
                             const parent_m = @constCast(parent_c);
                             if (parent_m.simpleResultIsCompare()) {
@@ -17179,7 +17231,7 @@ pub const Vm = struct {
                             } else {
                                 // Value mode: single-copy into parent register.
                                 const sr_dst = parent_m.u.lua.simple_result_dst;
-                                self.bc_stack[parent_c.frameBase() + sr_dst] = src_val;
+                                ctx.th.bytecode_stack[parent_c.frameBase() + sr_dst] = src_val;
                                 parent_m.reg_top = @intCast(sr_dst + 1);
                                 parent_m.u.lua.pc += 1;
                             }
@@ -17189,12 +17241,12 @@ pub const Vm = struct {
                             ctx.frame_index -= 1;
                             const fb = parent_m.frameBase();
                             ctx.cur_proto = parent_m.u.lua.proto;
-                            ctx.cur_upvalues = self.bc_stack[parent_m.func_slot].Closure.upvalues;
+                            ctx.cur_upvalues = ctx.th.bytecode_stack[parent_m.func_slot].Closure.upvalues;
                             ctx.base = fb;
                             const pcap = parent_m.u.lua.frame_cap;
                             ctx.frame_cap = pcap;
                             ctx.pc = parent_m.u.lua.pc;
-                            ctx.regs = self.bc_stack[fb .. fb + pcap];
+                            ctx.regs = ctx.th.bytecode_stack[fb .. fb + pcap];
                             return .continue_no_advance;
                         }
                     }
@@ -17301,7 +17353,7 @@ pub const Vm = struct {
         // P16.19 T3: boxed slots are not hot dispatch state; derive the
         // frame's boxed slice locally at the (comparatively cold) closure-
         // creation point. Open-upvalue semantics unchanged (smoke 67).
-        const boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
+        const boxed = ctx.th.bytecode_boxed[ctx.base .. ctx.base + ctx.frame_cap];
         for (child_proto.upvalues, 0..) |uv, i| {
             if (uv.instack) {
                 // Capture from current frame's register.
@@ -17448,8 +17500,8 @@ pub const Vm = struct {
             .Closure => |cl| if (cl.proto) |p| (if (p.flags.is_vararg and effective_nargs > p.numparams) effective_nargs - p.numparams else 0) else 0,
             else => 0,
         };
-        try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap + child_nextra);
-        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+        try self.ensureBcStackCap(ctx.th, ctx.th.bytecode_stack_top + child_frame_cap + child_nextra);
+        ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
         // rargs are at R[A+5..] (after the copy at A+4 which may have been
         // replaced by __call resolution).
         const rargs_builtin = ctx.regs[a + 5 .. a + 5 + effective_nargs];
@@ -17469,7 +17521,7 @@ pub const Vm = struct {
                 // Call from R[A+4] — above the close value at R[A+3].
                 // Staged-ABI activation: iterator at R[A+4], args at
                 // R[A+5..] already in place (zero-copy).
-                try self.pushStagedBytecodeExecFrame(ctx.exec_frames, child_proto, ctx.base + a + 4, effective_nargs, @intCast(nresults));
+                try self.pushStagedBytecodeExecFrame(ctx.th, ctx.exec_frames, child_proto, ctx.base + a + 4, effective_nargs, @intCast(nresults));
                 // PUC OP_TFORCALL (lvm.c): the iterator is invoked via
                 // luaD_call → luaG_tracecall → LUA_HOOKCALL with
                 // name="for iterator" (ldebug.c funcnamefromcode).
@@ -17500,7 +17552,7 @@ pub const Vm = struct {
                     try self.pushBuiltinCFrame(callee_val);
                     iter_cframe_pushed = true;
                     const cf_idx = self.activeBytecodeThread().call_frames.len() - 1;
-                    const iter_hook_args = self.bc_stack[ctx.base + a + 5 .. ctx.base + a + 5 + effective_nargs];
+                    const iter_hook_args = ctx.th.bytecode_stack[ctx.base + a + 5 .. ctx.base + a + 5 + effective_nargs];
                     self.dispatchCCalleeActivationHook(cf_idx, callee_val, iter_hook_args) catch |hook_err| {
                         self.popBuiltinCFrame();
                         return hook_err;
@@ -17511,7 +17563,7 @@ pub const Vm = struct {
                 // pushBuiltinCFrame may have reallocated bc_stack — re-derive
                 // the args slice for callBuiltin.
                 const rargs_builtin_fresh = if (iter_cframe_pushed)
-                    self.bc_stack[ctx.base + a + 5 .. ctx.base + a + 5 + effective_nargs]
+                    ctx.th.bytecode_stack[ctx.base + a + 5 .. ctx.base + a + 5 + effective_nargs]
                 else
                     rargs_builtin;
                 try self.callBuiltin(id, rargs_builtin_fresh, outs);
@@ -17553,7 +17605,7 @@ pub const Vm = struct {
         defer self.alloc.free(ret);
 
         // Refresh ctx.regs after potential realloc, then write results.
-        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+        ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
         const fr_tfc = ctx.exec_frames.getPtr(ctx.frame_index);
         if (nresults < 0) {
             // LUA_MULTRET: copy all results, adjust reg_top.
@@ -17750,7 +17802,7 @@ pub const Vm = struct {
         return switch (outcome) {
             .pushed => .continue_frame_loop,
             .value => |result| blk: {
-                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
                 ctx.regs[a] = result;
                 break :blk .continue_dispatch;
             },
@@ -17943,7 +17995,7 @@ pub const Vm = struct {
         }
 
         // P15.51l: tbc_mark is a rare field, read from CallFrame.
-        const has_pending_tbc = self.bc_tbc_regs.items.len > ctx.exec_frames.getPtr(ctx.frame_index).tbc_mark;
+        const has_pending_tbc = ctx.th.bytecode_tbc_regs.items.len > ctx.exec_frames.getPtr(ctx.frame_index).tbc_mark;
         if (has_pending_tbc) {
             return switch (try self.beginBytecodeClose(
                 ctx.exec_frames,
@@ -18031,7 +18083,7 @@ pub const Vm = struct {
                 }
 
                 // 1. Close all boxed upvalues (derived locally, P16.19 T3).
-                for (self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap]) |*bc_slot| {
+                for (ctx.th.bytecode_boxed[ctx.base .. ctx.base + ctx.frame_cap]) |*bc_slot| {
                     if (bc_slot.*) |cell| {
                         cell.close(self);
                         // PUC luaF_closeupval (lfunc.c:205-208): if !iswhite:
@@ -18067,20 +18119,20 @@ pub const Vm = struct {
                 // Reset to the original (unshifted) func_slot.
                 const reset_slot = ctx.exec_frames.getPtr(ctx.frame_index).originalFuncSlot();
                 const reset_base = reset_slot + 1;
-                try self.ensureBcStackCap(reset_base + @max(new_cap, effective_nargs + 1));
+                try self.ensureBcStackCap(ctx.th, reset_base + @max(new_cap, effective_nargs + 1));
 
                 // Copy func + args from regs[a..a+1+effective_nargs] down to
                 // [reset_slot..reset_slot+1+effective_nargs].
                 const total_move = effective_nargs + 1;
                 std.mem.copyForwards(
                     Value,
-                    self.bc_stack[reset_slot .. reset_slot + total_move],
-                    self.bc_stack[ctx.base + a .. ctx.base + a + total_move],
+                    ctx.th.bytecode_stack[reset_slot .. reset_slot + total_move],
+                    ctx.th.bytecode_stack[ctx.base + a .. ctx.base + a + total_move],
                 );
                 // Nil-fill missing params at the copied position.
                 const nc = @min(np, effective_nargs);
                 for (nc..np) |i| {
-                    self.bc_stack[reset_slot + 1 + i] = .Nil;
+                    ctx.th.bytecode_stack[reset_slot + 1 + i] = .Nil;
                 }
 
                 // VAHID buildhiddenargs: shift func+params up past extra args.
@@ -18089,22 +18141,22 @@ pub const Vm = struct {
                 if (new_is_vahid) {
                     new_func_slot = reset_slot + effective_nargs + 1;
                     new_base = new_func_slot + 1;
-                    try self.ensureBcStackCap(new_base + new_cap);
-                    self.bc_stack[new_func_slot] = self.bc_stack[reset_slot];
+                    try self.ensureBcStackCap(ctx.th, new_base + new_cap);
+                    ctx.th.bytecode_stack[new_func_slot] = ctx.th.bytecode_stack[reset_slot];
                     for (0..np) |i| {
-                        self.bc_stack[new_base + i] = self.bc_stack[reset_slot + 1 + i];
-                        self.bc_stack[reset_slot + 1 + i] = .Nil;
+                        ctx.th.bytecode_stack[new_base + i] = ctx.th.bytecode_stack[reset_slot + 1 + i];
+                        ctx.th.bytecode_stack[reset_slot + 1 + i] = .Nil;
                     }
                 }
 
                 // Grow frame to new proto's register needs.
-                try self.bcGrowFrame(new_base, new_cap, &ctx.frame_cap, &ctx.regs); // published below after base switch
+                try self.bcGrowFrame(ctx.th, new_base, new_cap, &ctx.frame_cap, &ctx.regs); // published below after base switch
                 ctx.base = new_base;
                 // P15.51l: func_slot is a rare field, written to CallFrame below.
-                self.bc_stack_top = new_base + ctx.frame_cap;
+                ctx.th.bytecode_stack_top = new_base + ctx.frame_cap;
 
                 // Re-derive register slices after potential base change.
-                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
 
                 // P15.51l: nextraargs is a rare field, write to CallFrame.
                 const new_nextra_u16: u16 = @intCast(new_nextra);
@@ -18113,7 +18165,7 @@ pub const Vm = struct {
 
                 // Nil-fill remaining registers.
                 for (ctx.regs[np..new_max]) |*r| r.* = .Nil;
-                for (self.bc_boxed[new_base .. new_base + new_max]) |*bc_slot| bc_slot.* = null;
+                for (ctx.th.bytecode_boxed[new_base .. new_base + new_max]) |*bc_slot| bc_slot.* = null;
 
                 // 6. Update frame state.
                 ctx.cur_proto = new_proto;
@@ -18159,7 +18211,7 @@ pub const Vm = struct {
                         "tail call",
                         null,
                         callee_val,
-                        self.bc_stack[fr2.frameBase() .. fr2.frameBase() + n_transfer],
+                        ctx.th.bytecode_stack[fr2.frameBase() .. fr2.frameBase() + n_transfer],
                         1,
                         ctx.frame_index,
                     );
@@ -18203,13 +18255,13 @@ pub const Vm = struct {
                     const cf_idx = self.activeBytecodeThread().call_frames.len() - 1;
                     // call_args may be stale after pushBuiltinCFrame grew
                     // bc_stack — re-derive from the caller's registers.
-                    const tc_hook_args = self.bc_stack[ctx.base + a + 1 .. ctx.base + a + 1 + effective_nargs];
+                    const tc_hook_args = ctx.th.bytecode_stack[ctx.base + a + 1 .. ctx.base + a + 1 + effective_nargs];
                     self.dispatchCCalleeActivationHook(cf_idx, callee_val, tc_hook_args) catch |hook_err| {
                         self.popBuiltinCFrame();
                         return hook_err;
                     };
                     self.builtin_cframe_pre_pushed = true;
-                    call_args = self.bc_stack[ctx.base + a + 1 .. ctx.base + a + 1 + effective_nargs];
+                    call_args = ctx.th.bytecode_stack[ctx.base + a + 1 .. ctx.base + a + 1 + effective_nargs];
                 }
                 // P15.51l: reg_top lives directly on the CallFrame.
                 // P16.5b: Use direct call for coroutine fast path.
@@ -18404,7 +18456,7 @@ pub const Vm = struct {
                 return .continue_frame_loop;
             }
             try self.dispatchBytecodeHookWithCallee("return", ctx.regs[a], vals);
-            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+            ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
             const nstore: usize = if (nresults >= 0) @intCast(nresults) else vals.len;
             try self.growCtxFrame(ctx, a + nstore);
             for (0..nstore) |i| ctx.regs[a + i] = if (i < vals.len) vals[i] else .Nil;
@@ -18487,8 +18539,8 @@ pub const Vm = struct {
             .Closure => |cl| if (cl.proto) |p| (if (p.flags.is_vararg and nargs > p.numparams) nargs - p.numparams else 0) else 0,
             else => 0,
         };
-        try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap + child_nextra);
-        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+        try self.ensureBcStackCap(ctx.th, ctx.th.bytecode_stack_top + child_frame_cap + child_nextra);
+        ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
 
         const rargs = ctx.regs[a + 1 .. a + 1 + effective_nargs];
 
@@ -18646,7 +18698,7 @@ pub const Vm = struct {
                                 return .continue_frame_loop;
                             }
                             try self.dispatchBytecodeHookWithCallee("return", callee_val, values);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             const nstore: usize = if (nresults >= 0) @intCast(nresults) else values.len;
                             try self.growCtxFrame(ctx, a + nstore);
                             for (0..nstore) |i| ctx.regs[a + i] = if (i < values.len) values[i] else .Nil;
@@ -18701,7 +18753,7 @@ pub const Vm = struct {
                     // pushBuiltinCFrame may have reallocated bc_stack —
                     // re-derive the caller-window slices (the C-frame's
                     // func_slot sits above the window, which is unchanged).
-                    ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                    ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
                     rargs_fresh = ctx.regs[a + 1 .. a + 1 + effective_nargs];
                     outs = ctx.regs[outs_start .. outs_start + out_len];
                     const hook_args = rargs_fresh;
@@ -18763,7 +18815,7 @@ pub const Vm = struct {
                         error.ThreadSwitch => return error.ThreadSwitch,
                     };
                 }
-                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
                 outs = ctx.regs[outs_start .. outs_start + out_len];
                 const produced: usize = if (builtinHasDynamicOutCount(id))
                     @min(self.last_builtin_out_count, outs.len)
@@ -18795,8 +18847,8 @@ pub const Vm = struct {
                                 const old_values = pending.completion.hook.post.store_results.values;
                                 if (self.returnSliceIsOwned(old_values)) {
                                     // Already scratch-owned, no free needed
-                                } else if (@intFromPtr(old_values.ptr) >= @intFromPtr(self.bc_stack.ptr) and
-                                    @intFromPtr(old_values.ptr) < @intFromPtr(self.bc_stack.ptr) + self.bc_stack.len * @sizeOf(Value))
+                                } else if (@intFromPtr(old_values.ptr) >= @intFromPtr(ctx.th.bytecode_stack.ptr) and
+                                    @intFromPtr(old_values.ptr) < @intFromPtr(ctx.th.bytecode_stack.ptr) + ctx.th.bytecode_stack.len * @sizeOf(Value))
                                 {
                                     const owned = try self.alloc.dupe(Value, old_values);
                                     pending.completion.hook.post.store_results.values = owned;
@@ -18821,7 +18873,7 @@ pub const Vm = struct {
                     // pending_call needed for ordinary Lua CALL.
                     // Staged-ABI activation: callee at R[A] (possibly the
                     // __call-resolved value), args at R[A+1..] in place.
-                    try self.pushStagedBytecodeExecFrame(ctx.exec_frames, proto2, ctx.base + a, effective_nargs, nresults);
+                    try self.pushStagedBytecodeExecFrame(ctx.th, ctx.exec_frames, proto2, ctx.base + a, effective_nargs, nresults);
                     // CALL hook on the callee activation (PUC luaD_hookcall:
                     // the new ci exists, then the hook fires). rargs may be
                     // stale after the push (bc_stack realloc) — the helper
@@ -19218,9 +19270,9 @@ pub const Vm = struct {
         const isTestcCFrame = struct {
             fn check(vm: *const Vm, fr: *const CallFrame) bool {
                 if (!fr.isC()) return false;
-                if (fr.func_slot >= vm.bc_stack.len) return false;
-                return vm.bc_stack[fr.func_slot] == .Builtin and
-                    vm.bc_stack[fr.func_slot].Builtin == .testc_testC;
+                if (fr.func_slot >= vm.activeBytecodeThread().bytecode_stack.len) return false;
+                return vm.activeBytecodeThread().bytecode_stack[fr.func_slot] == .Builtin and
+                    vm.activeBytecodeThread().bytecode_stack[fr.func_slot].Builtin == .testc_testC;
             }
         }.check;
         if (level == 0) return null;
@@ -19316,7 +19368,8 @@ pub const Vm = struct {
     /// callers that pass local buffers). Mirrors PUC Lua's restorestack macro.
     fn refreshBuiltinOuts(self: *Vm) ?[]Value {
         if (!self.builtin_outs_on_bc_stack) return null;
-        return self.bc_stack[self.builtin_outs_base .. self.builtin_outs_base + self.builtin_outs_len];
+        const th = self.activeBytecodeThread();
+        return th.bytecode_stack[self.builtin_outs_base .. self.builtin_outs_base + self.builtin_outs_len];
     }
 
     fn callBuiltin(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value) DispatchError!void {
@@ -19327,8 +19380,9 @@ pub const Vm = struct {
         // calls that may realloc bc_stack. This mirrors PUC Lua's
         // savestack/restorestack mechanism (ldo.c:277-282).
         const outs_ptr = @intFromPtr(outs.ptr);
-        const bc_start = @intFromPtr(self.bc_stack.ptr);
-        const bc_end = bc_start + self.bc_stack.len * @sizeOf(Value);
+        const bc_stack = self.activeBytecodeThread().bytecode_stack;
+        const bc_start = @intFromPtr(bc_stack.ptr);
+        const bc_end = bc_start + bc_stack.len * @sizeOf(Value);
         const prev_on_bc = self.builtin_outs_on_bc_stack;
         const prev_base = self.builtin_outs_base;
         const prev_len = self.builtin_outs_len;
@@ -19367,12 +19421,12 @@ pub const Vm = struct {
         if (!cframe_pre_pushed and cframe_pushed) try self.pushBuiltinCFrame(callee_val);
         // Re-derive args from the (possibly reallocated) bc_stack.
         const args_fresh: []const Value = if (args_on_bc)
-            self.bc_stack[args_base .. args_base + args.len]
+            self.activeBytecodeThread().bytecode_stack[args_base .. args_base + args.len]
         else
             args;
         // Re-derive outs from the (possibly reallocated) bc_stack.
         const outs_fresh: []Value = if (self.builtin_outs_on_bc_stack)
-            self.bc_stack[self.builtin_outs_base .. self.builtin_outs_base + self.builtin_outs_len]
+            self.activeBytecodeThread().bytecode_stack[self.builtin_outs_base .. self.builtin_outs_base + self.builtin_outs_len]
         else
             outs;
         var cframe_preserved = false;
@@ -21013,8 +21067,8 @@ pub const Vm = struct {
                 // PUC luaD_pcall: save old_top (L->top) and old_ci (L->ci)
                 // before calling f. On error, restore them so error value
                 // has room.
-                const saved_bc_stack_top = self.bc_stack_top;
                 const th_pcall = self.activeBytecodeThread();
+                const saved_bc_stack_top = th_pcall.bytecode_stack_top;
                 const saved_frame_count = th_pcall.call_frames.len();
                 const ret = self.runClosure(cl, resolved.args) catch |e| switch (e) {
                     error.Yield => return e,
@@ -21027,7 +21081,7 @@ pub const Vm = struct {
                         // boundary (empty-region no-op here).
                         if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_pcall_ef, idx);
                         self.unwindBytecodeExecFrames(&th_pcall.call_frames, saved_frame_count);
-                        self.bc_stack_top = saved_bc_stack_top;
+                        th_pcall.bytecode_stack_top = saved_bc_stack_top;
                         rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
                         setFail(self, self.refreshBuiltinOuts() orelse outs);
                         return;
@@ -21037,7 +21091,7 @@ pub const Vm = struct {
                         // the OOM arm above.
                         if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_pcall_ef, idx);
                         self.unwindBytecodeExecFrames(&th_pcall.call_frames, saved_frame_count);
-                        self.bc_stack_top = saved_bc_stack_top;
+                        th_pcall.bytecode_stack_top = saved_bc_stack_top;
                         rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
                         setFail(self, self.refreshBuiltinOuts() orelse outs);
                         return;
@@ -21085,11 +21139,11 @@ pub const Vm = struct {
         // protected call completes (lua_pcallk restores the old errfunc).
         const th_xpcall_ef = self.activeBytecodeThread();
         const saved_errfunc = th_xpcall_ef.errfunc;
-        const armed_errfunc = self.bc_stack_top;
+        const armed_errfunc = th_xpcall_ef.bytecode_stack_top;
         self.setErrfuncValue(args[1]);
         defer {
             if (th_xpcall_ef.errfunc == armed_errfunc) {
-                if (self.bc_stack_top > armed_errfunc) self.bc_stack_top = armed_errfunc;
+                if (th_xpcall_ef.bytecode_stack_top > armed_errfunc) th_xpcall_ef.bytecode_stack_top = armed_errfunc;
                 th_xpcall_ef.errfunc = ERRFUNC_NONE;
             }
             th_xpcall_ef.errfunc = saved_errfunc;
@@ -21109,9 +21163,9 @@ pub const Vm = struct {
             const MAXSTACK: usize = 1_000_000;
             const ERRORSTACKSIZE: usize = 200;
             const PHYSICAL_LIMIT: usize = MAXSTACK + ERRORSTACKSIZE;
-            if (self.bc_stack.len < PHYSICAL_LIMIT) {
-                const old_len = self.bc_stack.len;
-                self.bc_stack = self.alloc.realloc(self.bc_stack, PHYSICAL_LIMIT) catch {
+            if (th_xpcall_ef.bytecode_stack.len < PHYSICAL_LIMIT) {
+                const old_len = th_xpcall_ef.bytecode_stack.len;
+                th_xpcall_ef.bytecode_stack = self.alloc.realloc(th_xpcall_ef.bytecode_stack, PHYSICAL_LIMIT) catch {
                     if (outs.len > 0) {
                         outs[0] = .{ .Bool = false };
                         if (outs.len > 1) outs[1] = self.protectedErrorValue();
@@ -21119,7 +21173,7 @@ pub const Vm = struct {
                     }
                     return;
                 };
-                self.bc_boxed = self.alloc.realloc(self.bc_boxed, PHYSICAL_LIMIT) catch {
+                th_xpcall_ef.bytecode_boxed = self.alloc.realloc(th_xpcall_ef.bytecode_boxed, PHYSICAL_LIMIT) catch {
                     if (outs.len > 0) {
                         outs[0] = .{ .Bool = false };
                         if (outs.len > 1) outs[1] = self.protectedErrorValue();
@@ -21127,8 +21181,8 @@ pub const Vm = struct {
                     }
                     return;
                 };
-                @memset(self.bc_stack[old_len..], .Nil);
-                @memset(self.bc_boxed[old_len..], null);
+                @memset(th_xpcall_ef.bytecode_stack[old_len..], .Nil);
+                @memset(th_xpcall_ef.bytecode_boxed[old_len..], null);
                 // P15.51g: No per-frame slice refresh needed — regs/boxed
                 // are derived on demand from base + frame_cap.
             }
@@ -21288,8 +21342,8 @@ pub const Vm = struct {
                 // before calling f. On error, restore them so the error
                 // value has room (the handler already ran at the throw
                 // site, before this unwind).
-                const saved_bc_stack_top = self.bc_stack_top;
                 const th_xpcall = self.activeBytecodeThread();
+                const saved_bc_stack_top = th_xpcall.bytecode_stack_top;
                 const saved_frame_count = th_xpcall.call_frames.len();
                 const ret = self.runClosure(cl, resolved.args) catch |e| switch (e) {
                     error.Yield => return e,
@@ -21303,7 +21357,7 @@ pub const Vm = struct {
                         // PUC luaD_pcall: L->ci = old_ci; restore stack
                         // pointer and unwind call frames.
                         self.unwindBytecodeExecFrames(&th_xpcall.call_frames, saved_frame_count);
-                        self.bc_stack_top = saved_bc_stack_top;
+                        th_xpcall.bytecode_stack_top = saved_bc_stack_top;
                         writeFailure(self, self.refreshBuiltinOuts() orelse outs);
                         return;
                     },
@@ -21654,7 +21708,7 @@ pub const Vm = struct {
                     if (tf.isC()) {
                         self.popBuiltinCFrame();
                     } else {
-                        self.popBytecodeExecFrame(frames);
+                        self.popBytecodeExecFrame(th, frames);
                     }
                 }
                 if (frames.len() >= 2) {
@@ -21667,7 +21721,7 @@ pub const Vm = struct {
                         if (self.getPendingCallPtr(parent.pending_call_index)) |pending| {
                             if (pending.completion == .hook) {
                                 const cont = pending.completion.hook;
-                                self.bc_stack[parent.func_slot] = cont.saved_parent_callee;
+                                th.bytecode_stack[parent.func_slot] = cont.saved_parent_callee;
                                 parent.setTailCallBool(cont.saved_parent_tailcall);
                                 // For count hooks, set resume_skip_count_pc so the
                                 // count hook doesn't immediately re-fire on resume.
@@ -21691,7 +21745,7 @@ pub const Vm = struct {
                         // Clear in_debug_hook (mirrors popBytecodeExecFrame).
                         self.activeHookState().in_debug_hook = false;
                         // Pop the hook frame.
-                        self.popBytecodeExecFrame(frames);
+                        self.popBytecodeExecFrame(th, frames);
                         // Mark as suspended so errdefer in runBytecodeInternal
                         // does not unwind the parent frame.
                         th.bytecode_inplace_suspended = true;
@@ -21931,6 +21985,14 @@ pub const Vm = struct {
             if (self.stats.enabled) self.stats.resume_allocs += 1; // P16.0b
             for (call_args, 0..) |v, i| saved[i] = v;
             th.entry_args = saved;
+            // P15.40a/T7.2 (P16.37 Cut 2): pre-allocate frame capacity at the
+            // coroutine's FIRST activation (was: every activateRuntime switch,
+            // 2x per resume/yield cycle). 64 frames covers typical Lua call
+            // depth; deeper chains fall back to geometric growth (rare). PUC
+            // has no limit (linked list) but amortizes via never freeing on
+            // return. Never-started coroutines pay nothing (lazy, T4.2).
+            // Infallible in practice; on OOM addOne retries on the next push.
+            th.call_frames.ensureTotalCapacity(self.alloc, 64) catch {};
         }
         try self.setThreadResumeInbox(th, call_args);
         const nouts = if (outs.len > 1) outs.len - 1 else 0;
@@ -21940,21 +22002,17 @@ pub const Vm = struct {
             prev_thread_status = pt.status;
             if (pt.status == .running) pt.status = .suspended;
         }
-        const prev_runtime_thread = self.active_runtime_thread.?;
-        // P15.33: Set current_thread before switchRuntime so refreshHooksCached
-        // reads the target thread's hook state.
-        self.current_thread = th;
-        self.switchRuntime(th);
+        // P15.33: switchThread sets current_thread BEFORE refreshing the
+        // cached hook flags so they read the target thread's hook state.
+        self.switchThread(th);
         th.caller = prev_thread;
         defer {
-            // P15.33/P16.34: restore current_thread BEFORE switchRuntime so
-            // refreshHooksCached (inside switchRuntime) reads the RETURNING
-            // thread's (main's) hook state, not the coroutine's. The old
-            // order (switchRuntime first) refreshed the gate from the
-            // coroutine's just-cleared hooks, silencing a still-installed
-            // main hook after resume returned (found by smoke 74 probe 6).
-            self.current_thread = prev_thread;
-            self.switchRuntime(prev_runtime_thread);
+            // P15.33/P16.34: switchThread restores current_thread and then
+            // refreshes the hook cache from the RETURNING thread's (main's)
+            // hook state — never from the coroutine's just-cleared hooks
+            // (the old switchRuntime-first order silenced a still-installed
+            // main hook after resume returned; found by smoke 74 probe 6).
+            self.switchThread(prev_thread);
             th.caller = null;
             if (prev_thread) |pt| {
                 if (prev_thread_status) |st| pt.status = st;
@@ -22405,7 +22463,7 @@ pub const Vm = struct {
                 // errors.
                 th.bytecode_inplace_suspended = true;
                 th.bytecode_resume_boundary = 0;
-                const top_cl = self.bc_stack[top_fr.func_slot].Closure;
+                const top_cl = th.bytecode_stack[top_fr.func_slot].Closure;
                 const ret = self.runClosure(top_cl, &.{}) catch |e| switch (e) {
                     error.Yield => {
                         // Values are in th.yielded — the common tail
@@ -22802,7 +22860,6 @@ pub const Vm = struct {
             // status LUA_OK + live frames ⇒ COS_NORM).
             if (pt.status == .running) pt.status = .suspended;
         }
-        const prev_runtime_thread = self.active_runtime_thread.?;
         const prev_handle = self.cur_handle;
         const prev_c_stack = self.cur_c_stack;
         const saved_caller = th.caller;
@@ -22819,19 +22876,18 @@ pub const Vm = struct {
         // field. No reader consumes it without a fresh raise in between.)
 
         // ---- activate the closed thread as the coherent runtime ----
-        // current_thread BEFORE switchRuntime so refreshHooksCached
-        // (inside switchRuntime) reads the closed thread's hook state.
-        self.current_thread = th;
-        self.switchRuntime(th);
+        // switchThread sets current_thread BEFORE refreshing the hook cache
+        // so it reads the closed thread's hook state.
+        self.switchThread(th);
         th.caller = prev_thread;
         self.cur_handle = th.api_handle;
         self.cur_c_stack = &th.api_handle.?.c_stack;
         defer {
             // ---- restore the caller, field for field ----
-            // P16.34: current_thread BEFORE switchRuntime (same
-            // refreshHooksCached ordering fix as builtinCoroutineResume).
-            self.current_thread = prev_thread;
-            self.switchRuntime(prev_runtime_thread);
+            // P16.34: switchThread restores current_thread and refreshes the
+            // hook cache from the caller's state (same ordering fix as
+            // builtinCoroutineResume).
+            self.switchThread(prev_thread);
             th.caller = saved_caller;
             self.cur_handle = prev_handle;
             self.cur_c_stack = prev_c_stack;
@@ -23742,9 +23798,9 @@ pub const Vm = struct {
             if (frame.proto()) |proto| {
                 try self.gcMarkBytecodeProto(proto);
                 // P15.51g: Derive regs from base + frame_cap (no cached slice).
-                // Use self.bc_stack directly because GC finalizers may execute
-                // Lua code that reallocs bc_stack.
-                const regs = self.bc_stack[frame.frameBase() .. frame.frameBase() + frame.u.lua.frame_cap];
+                // Read through the owning thread because GC finalizers may
+                // execute Lua code that reallocs bytecode_stack.
+                const regs = active_th.bytecode_stack[frame.frameBase() .. frame.frameBase() + frame.u.lua.frame_cap];
                 // Scan bound: proto.live_reg_top[pc] is the compile-time
                 // liveness bound — it includes exactly the registers that are
                 // live at the current PC. Using @max(pc_live, frame.reg_top)
@@ -23765,12 +23821,12 @@ pub const Vm = struct {
                 // pending __close finalization. Without this, GC would collect
                 // them before __close runs.
                 if (i == active_th.call_frames.len() - 1) {
-                    for (self.bc_tbc_regs.items) |tbc_reg| {
+                    for (active_th.bytecode_tbc_regs.items) |tbc_reg| {
                         if (tbc_reg < regs.len) try self.gcMarkValue(regs[tbc_reg]);
                     }
                 }
             }
-            try self.gcMarkValue(self.bc_stack[frame.func_slot]);
+            try self.gcMarkValue(active_th.bytecode_stack[frame.func_slot]);
             // PUC model: hidden varargs at [func_slot-nextraargs..func_slot].
             // Varargs/boxed are Lua-frame-only fields — C-frames don't have
             // u.lua.nextraargs or u.lua.frame_cap. Guard prevents union field
@@ -23784,7 +23840,7 @@ pub const Vm = struct {
                 for (self.frameUpvalues(frame, null)) |cell| {
                     try self.gcQueueScanCell(cell);
                 }
-                for (self.bc_boxed[frame.frameBase() .. frame.frameBase() + frame.u.lua.frame_cap]) |maybe_cell| {
+                for (active_th.bytecode_boxed[frame.frameBase() .. frame.frameBase() + frame.u.lua.frame_cap]) |maybe_cell| {
                     if (maybe_cell) |cell| {
                         try self.gcQueueScanCell(cell);
                     }
@@ -23798,8 +23854,8 @@ pub const Vm = struct {
         // C-API pcallk) sits BETWEEN frame register windows, so the
         // per-frame walk above misses it — mark it explicitly.
         if (active_th.errfunc != ERRFUNC_NONE) {
-            if (active_th.errfunc < self.bc_stack.len) {
-                try self.gcMarkValue(self.bc_stack[active_th.errfunc]);
+            if (active_th.errfunc < active_th.bytecode_stack.len) {
+                try self.gcMarkValue(active_th.bytecode_stack[active_th.errfunc]);
             }
         }
 
@@ -24585,7 +24641,7 @@ pub const Vm = struct {
             const frame = th.call_frames.getPtr(i);
             if (frame.proto()) |proto| {
                 const regs_len = frame.u.lua.frame_cap;
-                const regs = self.bc_stack[frame.frameBase() .. frame.frameBase() + regs_len];
+                const regs = th.bytecode_stack[frame.frameBase() .. frame.frameBase() + regs_len];
                 const live_top: usize = if (frame.u.lua.pc < proto.live_reg_top.len)
                     @min(proto.live_reg_top[frame.u.lua.pc], regs.len)
                 else
@@ -24594,7 +24650,7 @@ pub const Vm = struct {
                 // live_reg_top[pc] but are still pending __close finalization.
                 var clear_from: usize = live_top;
                 if (i == th.call_frames.len() - 1) {
-                    for (self.bc_tbc_regs.items) |tbc_reg| {
+                    for (th.bytecode_tbc_regs.items) |tbc_reg| {
                         if (tbc_reg < regs.len and tbc_reg >= clear_from) clear_from = tbc_reg + 1;
                     }
                 }
@@ -25218,9 +25274,15 @@ pub const Vm = struct {
                 // PUC uses luaF_closeupval (not luaF_close): no __close
                 // metamethods are run — the thread is dead, no Lua code.
                 self.closeThreadOpenUpvalues(th);
-                // Only free the parked runtime if this thread isn't the
-                // currently active one (its runtime is shared with the VM).
-                if (self.active_runtime_thread != th) self.freeParkedThreadRuntime(th);
+                // P16.37 Cut 2: generic owner-free — every thread owns its
+                // runtime buffers permanently (no active/parked split), so
+                // this runs unconditionally, the main thread included (at
+                // Vm.deinit the main thread is destroyed by this same
+                // drainGcRegistries root path). A RUNNING thread can never
+                // reach gcFreeObject — it is reachable (current_thread root /
+                // resume chain), so the old active-runtime guard was
+                // protecting a state that cannot occur.
+                self.freeThreadRuntime(th);
                 // P16.30 Stage C: drop the thread's C-API TBC chain WITHOUT
                 // running __close. PUC luaE_freethread (lstate.c:300) calls
                 // only luaF_closeupval — a GC-collected suspended coroutine
@@ -25864,11 +25926,9 @@ pub const Vm = struct {
                     // Skip C-frames: they don't have proto/regs/boxed/upvalues.
                     // C-frame state (testc_state) is traced separately above.
                     if (exec_fr.isC()) continue;
-                    // For the VM-active thread, th.bytecode_stack is empty
-                    // (stack is in self.bc_stack); for inactive coroutines,
-                    // th.bytecode_stack holds their stack. Compute the correct
-                    // stack once for both regs and varargs scans below.
-                    const frame_stack = if (th.bytecode_stack.len > 0) th.bytecode_stack else self.bc_stack;
+                    // P16.37 Cut 2: every thread owns its stack — one
+                    // indirection, no active-vs-parked branch.
+                    const frame_stack = th.bytecode_stack;
                     // Bytecode frames live ONLY in th.call_frames. Scan
                     // regs/boxed/callee/env_override.
                     if (exec_fr.proto()) |proto| {
@@ -25936,9 +25996,7 @@ pub const Vm = struct {
                         try self.gcQueueScanCell(cell);
                     }
                     // P15.51g: Derive boxed slice from base + frame_cap.
-                    // Use the thread's own bytecode_boxed for parked coroutines,
-                    // self.bc_boxed for the VM-active thread.
-                    const boxed_stack = if (th.bytecode_boxed.len > 0) th.bytecode_boxed else self.bc_boxed;
+                    const boxed_stack = th.bytecode_boxed;
                     for (boxed_stack[exec_fr.frameBase() .. exec_fr.frameBase() + exec_fr.u.lua.frame_cap]) |maybe_cell| {
                         if (maybe_cell) |cell| {
                             try self.gcQueueScanCell(cell);
@@ -28090,7 +28148,7 @@ pub const Vm = struct {
     };
 
     fn debugFrameCalleeMatches(self: *Vm, candidate: Value, target: Frame) bool {
-        const target_callee = self.bc_stack[target.func_slot];
+        const target_callee = self.activeBytecodeThread().bytecode_stack[target.func_slot];
         return switch (target_callee) {
             .Builtin => |target_id| candidate == .Builtin and candidate.Builtin == target_id,
             .Closure => |target_cl| candidate == .Closure and candidate.Closure == target_cl,
@@ -28329,7 +28387,7 @@ pub const Vm = struct {
 
         if (caller.proto()) |proto| {
             // P15.51g: Derive regs from base + frame_cap (no cached slice).
-            const caller_regs = caller.regsSlice(self.bc_stack);
+            const caller_regs = caller.regsSlice(self.activeBytecodeThread().bytecode_stack);
             // Prefer the register named by the active CALL instruction.
             // Comparing closure values across all locals is ambiguous when the
             // same function has aliases (for example `g(f)`, followed by a
@@ -28697,12 +28755,12 @@ pub const Vm = struct {
                 if (self.isInDebugHook() and lv == 1) {
                     try self.setField(t, "name", .Nil);
                     try self.setField(t, "namewhat", .{ .String = try self.internStr("hook") });
-                } else if (self.isInDebugHook() and lv == 2 and self.debugNameFromCallee(self.bc_stack[fr.func_slot]) != null) {
+                } else if (self.isInDebugHook() and lv == 2 and self.debugNameFromCallee(self.activeBytecodeThread().bytecode_stack[fr.func_slot]) != null) {
                     // Synthetic call/return events for a builtin temporarily
                     // replace the paused Lua frame's callee. That event name
                     // is more specific than the frame's continuation label
                     // (for example `return sethook` while inside __close).
-                    try self.setField(t, "name", .{ .String = try self.internStr(self.debugNameFromCallee(self.bc_stack[fr.func_slot]).?) });
+                    try self.setField(t, "name", .{ .String = try self.internStr(self.debugNameFromCallee(self.activeBytecodeThread().bytecode_stack[fr.func_slot]).?) });
                     try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
                 } else if (self.getDebugName(parent_frame)) |dn| {
                     // Continuation-entered frames carry their call-site name
@@ -28759,8 +28817,8 @@ pub const Vm = struct {
                             try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
                         } else {
                             const inferred = self.debugInferNameFromCaller(self.debugResolveFrameIndex(lv + 1), fr.*);
-                            if (self.isInDebugHook() and lv == 2 and self.debugNameFromCallee(self.bc_stack[fr.func_slot]) != null) {
-                                try self.setField(t, "name", .{ .String = try self.internStr(self.debugNameFromCallee(self.bc_stack[fr.func_slot]).?) });
+                            if (self.isInDebugHook() and lv == 2 and self.debugNameFromCallee(self.activeBytecodeThread().bytecode_stack[fr.func_slot]) != null) {
+                                try self.setField(t, "name", .{ .String = try self.internStr(self.debugNameFromCallee(self.activeBytecodeThread().bytecode_stack[fr.func_slot]).?) });
                             } else if (self.isInDebugHook() and lv == 2 and self.debug_name_override != null) {
                                 const raw = self.debug_name_override.?;
                                 if (std.mem.eql(u8, raw, "__close") and self.testc_close_metamethod_depth != 0) {
@@ -28807,19 +28865,19 @@ pub const Vm = struct {
                     }
                 }
                 if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
-                    try self.setField(t, "func", self.bc_stack[fr.func_slot]);
+                    try self.setField(t, "func", self.activeBytecodeThread().bytecode_stack[fr.func_slot]);
                 }
-                if (fr.proto() != null and self.bc_stack[fr.func_slot] == .Closure) {
+                if (fr.proto() != null and self.activeBytecodeThread().bytecode_stack[fr.func_slot] == .Closure) {
                     // Bytecode source/debug metadata belongs to Proto.
-                    try self.debugFillInfoFromFunction(t, self.bc_stack[fr.func_slot], what);
-                } else if (self.bc_stack[fr.func_slot] == .Builtin) {
+                    try self.debugFillInfoFromFunction(t, self.activeBytecodeThread().bytecode_stack[fr.func_slot], what);
+                } else if (self.activeBytecodeThread().bytecode_stack[fr.func_slot] == .Builtin) {
                     // PUC funcinfo (ldebug.c): a C frame's what/source come
                     // from the function object itself — what="C",
                     // source="=[C]", linedefined=-1. C-frames are visible
                     // to getinfo inside a message-handler window
                     // (invokeErrfunc un-hides the raiser's C-frame, PUC
                     // luaG_errormsg) and from C-API frames.
-                    try self.debugFillInfoFromFunction(t, self.bc_stack[fr.func_slot], what);
+                    try self.debugFillInfoFromFunction(t, self.activeBytecodeThread().bytecode_stack[fr.func_slot], what);
                 }
             },
             .Builtin, .Closure => {
@@ -29971,7 +30029,7 @@ pub const Vm = struct {
         }
 
         // Builtin (C) frames: format as [C]: in {namewhat} '{name}' or [C]: in ?
-        if (self.bc_stack[fr.func_slot] == .Builtin) {
+        if (self.activeBytecodeThread().bytecode_stack[fr.func_slot] == .Builtin) {
             if (namewhat) |nw| {
                 if (name) |nm| {
                     return try std.fmt.allocPrint(self.alloc, "\t[C]: in {s} '{s}'", .{ nw, nm });
@@ -29997,7 +30055,7 @@ pub const Vm = struct {
 
         // PUC pushglobalfuncname: try to find the function in _G (loaded table).
         // If found, show "function 'name'". Otherwise, show "function <src:linedefined>".
-        if (self.debugFindGlobalFuncName(self.bc_stack[fr.func_slot])) |gname| {
+        if (self.debugFindGlobalFuncName(self.activeBytecodeThread().bytecode_stack[fr.func_slot])) |gname| {
             return try std.fmt.allocPrint(self.alloc, "{s}function '{s}'", .{ loc, gname });
         }
 
@@ -30071,7 +30129,7 @@ pub const Vm = struct {
         var has_pcall = false;
         for (shown) |fr_ptr| {
             const fr = fr_ptr.*;
-            if (self.bc_stack[fr.func_slot] == .Builtin and self.bc_stack[fr.func_slot].Builtin == .pcall) {
+            if (th_bc.bytecode_stack[fr.func_slot] == .Builtin and th_bc.bytecode_stack[fr.func_slot].Builtin == .pcall) {
                 has_pcall = true;
                 break;
             }
@@ -32671,17 +32729,17 @@ pub const Vm = struct {
             const next_mark: usize = if (frame_idx + 1 < exec_frames.len())
                 exec_frames.getConstPtr(frame_idx + 1).tbc_mark
             else
-                self.bc_tbc_regs.items.len;
+                th.bytecode_tbc_regs.items.len;
 
             // Close TBC regs in reverse order (LIFO within this frame).
             var i: usize = next_mark;
             while (i > frame.tbc_mark) {
                 i -= 1;
-                if (i >= self.bc_tbc_regs.items.len) continue;
-                const reg = self.bc_tbc_regs.items[i];
+                if (i >= th.bytecode_tbc_regs.items.len) continue;
+                const reg = th.bytecode_tbc_regs.items[i];
                 if (reg >= frame.u.lua.frame_cap) continue;
 
-                const obj = self.bc_stack[frame.frameBase() + reg];
+                const obj = th.bytecode_stack[frame.frameBase() + reg];
                 // PUC: nil/false are inert close sentinels — skip them.
                 if (obj == .Nil or (obj == .Bool and !obj.Bool)) continue;
 
@@ -32705,7 +32763,7 @@ pub const Vm = struct {
             }
         }
         // Clear all TBC regs — they've all been closed.
-        self.bc_tbc_regs.clearRetainingCapacity();
+        th.bytecode_tbc_regs.clearRetainingCapacity();
     }
 
     fn builtinOsClock(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -38282,13 +38340,13 @@ pub const Vm = struct {
         // getTmByObj may have triggered GC (via allocTable inside table
         // lookup), which can realloc bc_stack and invalidate regs.*.
         // Always refresh regs.* here, even if bcGrowFrame is not needed.
-        regs.* = self.bc_stack[base .. base + frame_cap.*];
+        regs.* = self.activeBytecodeThread().bytecode_stack[base .. base + frame_cap.*];
 
         // Ensure the frame has space for one extra slot (the shift target).
         // PUC does this via checkstackp(L, 1, func) before the shift.
         const needed = a + 1 + nargs.* + 1;
         if (needed > frame_cap.*) {
-            try self.bcGrowFrame(base, needed, frame_cap, regs);
+            try self.bcGrowFrame(self.activeBytecodeThread(), base, needed, frame_cap, regs);
         }
 
         // Shift args up by 1 slot (high-to-low for overlap safety).
@@ -40358,11 +40416,11 @@ pub const Vm = struct {
     fn builtinTestcStacklevel(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = args;
         const th = self.activeBytecodeThread();
-        const top: i64 = @intCast(self.bc_stack_top);
+        const top: i64 = @intCast(self.activeBytecodeThread().bytecode_stack_top);
         // PUC: L->stacksize grows dynamically. At overflow, it's grown to
         // LUAI_MAXSTACK + ERRORSTACKSIZE. We report bc_stack.len which grows
         // the same way (ensureBcStackCap grows on overflow at pushBytecodeExecFrame).
-        const size: i64 = @intCast(self.bc_stack.len);
+        const size: i64 = @intCast(self.activeBytecodeThread().bytecode_stack.len);
         // P16.24 T6: report the REAL C-call depth (PUC ltests.c stacklevel
         // exposes L->nCcalls via getCcalls) — NOT protected-call nesting, which
         // models recovery ownership, not C-stack depth.
@@ -44916,14 +44974,15 @@ test "vm: P16.8a transactional simple_result setup — errdefer rollback on push
     try vm.resolveProtoConstants(mm_proto);
 
     // Push a parent Lua frame onto the active thread's call_frames.
-    const exec_frames = &vm.activeBytecodeThread().call_frames;
+    const th = vm.activeBytecodeThread();
+    const exec_frames = &th.call_frames;
     // Stage the parent frame at slot 0 (PUC: lua_pcallk pushes func+args
     // onto the stack before docall) and activate.
-    const staged_parent = try vm.stageBytecodeCall(0, parent_cl, &.{});
-    try vm.pushStagedBytecodeExecFrame(exec_frames, parent_proto, staged_parent.func_slot, staged_parent.nargs, -1);
+    const staged_parent = try vm.stageBytecodeCall(th, 0, parent_cl, &.{});
+    try vm.pushStagedBytecodeExecFrame(th, exec_frames, parent_proto, staged_parent.func_slot, staged_parent.nargs, -1);
     const parent_index: usize = 0;
     const saved_frame_count = exec_frames.len();
-    const saved_bc_stack_top = vm.bc_stack_top;
+    const saved_bc_stack_top = th.bytecode_stack_top;
 
     // ── Failure iterations: force pushBytecodeExecFrame to fail ──
     // Each iteration: set bc_stack_top near the end so the child frame
@@ -44935,7 +44994,7 @@ test "vm: P16.8a transactional simple_result setup — errdefer rollback on push
         exec_frames.getPtr(parent_index).clearSimpleResult();
         // bc_stack_top near the end forces growBcStackCapSlow in
         // pushBytecodeExecFrame (needed_for_args > bc_stack.len).
-        vm.bc_stack_top = vm.bc_stack.len - 2;
+        th.bytecode_stack_top = th.bytecode_stack.len - 2;
 
         var failing = std.testing.FailingAllocator.init(aalloc, .{
             .fail_index = 0,
@@ -44984,7 +45043,7 @@ test "vm: P16.8a transactional simple_result setup — errdefer rollback on push
     // parent keeps its simple_result and the child frame is on the stack.
     {
         exec_frames.getPtr(parent_index).clearSimpleResult();
-        vm.bc_stack_top = vm.bc_stack.len - 2;
+        th.bytecode_stack_top = th.bytecode_stack.len - 2;
 
         var failing = std.testing.FailingAllocator.init(aalloc, .{
             .fail_index = 100,
@@ -45018,12 +45077,12 @@ test "vm: P16.8a transactional simple_result setup — errdefer rollback on push
             exec_frames.len(),
         );
         // Clean up: pop the child frame and clear simple_result.
-        vm.popBytecodeExecFrame(exec_frames);
+        vm.popBytecodeExecFrame(th, exec_frames);
         exec_frames.getPtr(parent_index).clearSimpleResult();
     }
 
     // Restore bc_stack_top for clean deinit.
-    vm.bc_stack_top = saved_bc_stack_top;
+    th.bytecode_stack_top = saved_bc_stack_top;
 }
 
 // =========================================================================
@@ -45087,9 +45146,10 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
     try vm.resolveProtoConstants(mm_proto);
 
     // Push the parent frame (staged ABI: stage at slot 0, activate).
-    const exec_frames = &vm.activeBytecodeThread().call_frames;
-    const staged_parent = try vm.stageBytecodeCall(0, parent_cl, &.{});
-    try vm.pushStagedBytecodeExecFrame(exec_frames, parent_proto, staged_parent.func_slot, staged_parent.nargs, -1);
+    const th = vm.activeBytecodeThread();
+    const exec_frames = &th.call_frames;
+    const staged_parent = try vm.stageBytecodeCall(th, 0, parent_cl, &.{});
+    try vm.pushStagedBytecodeExecFrame(th, exec_frames, parent_proto, staged_parent.func_slot, staged_parent.nargs, -1);
     const parent_index: usize = 0;
     const saved_frame_count = exec_frames.len();
 
@@ -45103,8 +45163,8 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
     // makes the realloc fail → error.OutOfMemory.
     {
         exec_frames.getPtr(parent_index).clearSimpleResult();
-        vm.bc_stack_top = vm.bc_stack.len - 3;
-        const saved_top = vm.bc_stack_top;
+        th.bytecode_stack_top = th.bytecode_stack.len - 3;
+        const saved_top = th.bytecode_stack_top;
 
         var failing = std.testing.FailingAllocator.init(aalloc, .{
             .fail_index = 0,
@@ -45137,7 +45197,7 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
         );
         // 4. bc_stack_top restored (staging never bumps it; the activation
         //    failed before its own top update).
-        try testing.expectEqual(saved_top, vm.bc_stack_top);
+        try testing.expectEqual(saved_top, th.bytecode_stack_top);
     }
 
     // ── Failure point 2: FrameStack.addOne fails AFTER staging AND after
@@ -45147,9 +45207,9 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
     {
         exec_frames.getPtr(parent_index).clearSimpleResult();
         const child_frame_cap: usize = mm_proto.maxstacksize + EXTRA_MARGIN;
-        try vm.ensureBcStackCap(vm.bc_stack_top + 1 + args.len + child_frame_cap);
-        vm.bc_stack_top = vm.bc_stack.len - 1 - args.len - child_frame_cap;
-        const saved_top = vm.bc_stack_top;
+        try vm.ensureBcStackCap(th, th.bytecode_stack_top + 1 + args.len + child_frame_cap);
+        th.bytecode_stack_top = th.bytecode_stack.len - 1 - args.len - child_frame_cap;
+        const saved_top = th.bytecode_stack_top;
 
         var failing = std.testing.FailingAllocator.init(aalloc, .{
             .fail_index = 0,
@@ -45179,14 +45239,14 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
         );
         // bc_stack_top was set to needed_top before addOne failed — the
         // errdefer must have restored it.
-        try testing.expectEqual(saved_top, vm.bc_stack_top);
+        try testing.expectEqual(saved_top, th.bytecode_stack_top);
     }
 
     // ── Success iteration: staging + activation both succeed. ──
     {
         exec_frames.getPtr(parent_index).clearSimpleResult();
         const child_frame_cap: usize = mm_proto.maxstacksize + EXTRA_MARGIN;
-        try vm.ensureBcStackCap(vm.bc_stack_top + 1 + args.len + child_frame_cap);
+        try vm.ensureBcStackCap(th, th.bytecode_stack_top + 1 + args.len + child_frame_cap);
 
         const outcome = try vm.tryPushSimpleResultMetamethod(
             exec_frames,
@@ -45201,12 +45261,12 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
         try testing.expect(exec_frames.getPtr(parent_index).hasSimpleResult());
         try testing.expectEqual(saved_frame_count + 1, exec_frames.len());
         // Clean up: pop the child frame and clear simple_result.
-        vm.popBytecodeExecFrame(exec_frames);
+        vm.popBytecodeExecFrame(th, exec_frames);
         exec_frames.getPtr(parent_index).clearSimpleResult();
     }
 
     // Restore bc_stack_top for clean deinit.
-    vm.bc_stack_top = exec_frames.getPtr(parent_index).frameBase() +
+    th.bytecode_stack_top = exec_frames.getPtr(parent_index).frameBase() +
         exec_frames.getPtr(parent_index).u.lua.frame_cap;
 }
 

@@ -10921,3 +10921,45 @@ pre-existing); smoke **79/79** PASS (ok=79 mismatches=0, включая
 79_trampoline_ownership + 80_yield_value_span); README/STATUS status-блоки
 регенерированы (status_snapshot + status_summary --use-current
 --write-readme --write-status).
+
+## P16.39 Cut 0 — truth/hygiene: HEAD-воспроизведение + layout provenance (Thread-типы) + R0.3 stale comments (2026-09-11)
+
+Нулевой cut фазы P16.39: НЕТ runtime-изменений (src/ == 5a22e7a до
+R0.3, verified `git diff 5a22e7a..fe0688f --stat -- src/` пуст; единственные
+src/-правки — R0.3 комментарии, behavior-neutral).
+
+- **T0.1 P16.38-final воспроизведён**: HEAD `fe0688f`, RF rebuild sha16
+  `df5c95b88f4fb31b` = measured binary из current-counters.json
+  (byte-identical). Гейты: unit D+RF, smoke **79/79**, matrix --testc
+  zig_fail=0 (big.lua both_fail pre-existing), api580 GREEN (Debug+RF,
+  delta=376 B, sizes: LuaString=48, Closure=40, CallFrame<=104).
+  Spot-counters (median-of-3 `taskset -c 0 perf stat -r 3 -e
+  instructions:u`, official single-workload mode): int_arith
+  5,111,292,773/50M = **102.23**, branch_loop 11,045,044,106/50M =
+  **220.90**, lua_calls 2,252,993,019/5M = **450.60** i/it — все три ТОЧНО
+  воспроизводят canonical значения.
+- **R0.2 layout truth регенерирован** (`tools/perf/current-callframe-layout.json`):
+  свежий out-of-repo probe (`/tmp/opencode/cfprobe39.zig`, тот же module
+  graph lua+util, -O Debug + -O ReleaseFast). CallFrame 88 B / offset_u=32
+  / union_floor 56 (CFrameState), LuaFrameState 48 — byte-identical
+  P16.38-артефакту (assertions в regen-скрипте). Схема ЧЕСТНО расширена
+  секцией `thread_state_types` (per-mode @sizeOf): **Vm 6528 D / 6424 RF**
+  (легитимное различие — Debug safety metadata), **Thread 3720** (оба
+  режима), **YieldedValues 96**, **InlineValues 88** (оба режима).
+  Private-типы получены через `@FieldType` (Thread.yielded →
+  YieldedValues; .owned → InlineValues) — никаких fake fields.
+- **R0.3 stale comments** (4 сайта в src/lua/vm.zig, behavior-neutral):
+  (1) GC vararg scan: "for the VM-active thread, bytecode_stack is empty
+  (moved to self.bc_stack)" → durable wording "every thread owns its
+  bytecode_stack permanently (P16.37 Cut 2); no active-vs-parked move";
+  (2)+(3) debugGetLocalFromFrame/SetLocalInFrame: "stackForThread returns
+  self.bc_stack" → "resolves to that thread's own bytecode_stack; there is
+  no Vm-side stack"; (4) debug getinfo: "No parked runtime frame" → "No
+  in-place suspended Lua frame (not bytecode_inplace_suspended)". Все
+  оставшиеся activateRuntime/switchRuntime-упоминания — clearly-historical
+  ("was:", "the old"), оставлены.
+- **Гейты после R0.3**: fmt clean; unit D+RF; smoke 79/79; matrix --testc
+  zig_fail=0; int_arith control 102.23 i/it (комментарии не меняют codegen).
+- **P16.39 queue status**: закрыт подготовительный пункт truth/hygiene
+  (воспроизведение + layout + комментарии); очередь 1-7 из P16.38 final
+  wrap остаётся открытой, Cut 1+2 закрывают пункт 1 (dispatch floor).

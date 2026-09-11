@@ -26205,10 +26205,12 @@ pub const Vm = struct {
                     if (exec_fr.proto() != null and exec_fr.isVararg() and
                         exec_fr.u.lua.nextraargs != 0)
                     {
-                        // Use the same `stack` variable as the regs scan above:
-                        // for the VM-active thread, bytecode_stack is empty
-                        // (moved to self.bc_stack); for parked coroutines,
-                        // bytecode_stack holds their stack.
+                        // frameVarargs resolves the owning thread's stack
+                        // internally (th == null → the running thread) — the
+                        // same permanent per-thread bytecode_stack the regs
+                        // scan above used. Every thread owns its stack for
+                        // its whole lifetime (P16.37 Cut 2); there is no
+                        // active-vs-parked move of stack storage.
                         for (self.frameVarargs(exec_fr, th)) |yv| {
                             if (GcObject.fromValue(yv) != null) {
                                 try self.gcMarkValue(yv);
@@ -28912,8 +28914,9 @@ pub const Vm = struct {
                         if (outs.len > 0) outs[0] = .{ .Table = t };
                         return;
                     }
-                    // No parked runtime frame. If the coroutine suspended in a
-                    // C builtin (e.g. testC `yield`), report that builtin.
+                    // No in-place suspended Lua frame (the thread is not
+                    // bytecode_inplace_suspended). If the coroutine suspended
+                    // in a C builtin (e.g. testC `yield`), report that builtin.
                     if (th.suspended_builtin) |id| {
                         try self.setField(t, "name", .Nil);
                         try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
@@ -29431,7 +29434,9 @@ pub const Vm = struct {
     /// debugTempCalleeBound. Computed by the level-walk callers.
     fn debugGetLocalFromFrame(self: *Vm, fr: *const Frame, idx: i64, outs: []Value, frames_above: bool) DispatchError!void {
         // All frames are bytecode frames; delegate to the bytecode path.
-        // Active thread → th=null → stackForThread returns self.bc_stack.
+        // th == null means the running thread: stackForThread resolves to
+        // that thread's own bytecode_stack (every thread owns its stack
+        // permanently — P16.37 Cut 2; there is no Vm-side stack).
         const proto = fr.proto() orelse return;
         return self.debugGetLocalFromBytecodeFrame(fr, proto, idx, outs, null, frames_above);
     }
@@ -29473,7 +29478,9 @@ pub const Vm = struct {
     /// P16.38 T4.1: `frames_above` — see debugGetLocalFromFrame.
     fn debugSetLocalInFrame(self: *Vm, fr: *Frame, idx: i64, val: Value, outs: []Value, frames_above: bool) DispatchError!void {
         // All frames are bytecode frames; delegate to the bytecode path.
-        // Active thread → th=null → stackForThread returns self.bc_stack.
+        // th == null means the running thread: stackForThread resolves to
+        // that thread's own bytecode_stack (every thread owns its stack
+        // permanently — P16.37 Cut 2; there is no Vm-side stack).
         const proto = fr.proto() orelse return;
         return self.debugSetLocalInBytecodeFrame(fr, proto, idx, val, outs, null, frames_above);
     }

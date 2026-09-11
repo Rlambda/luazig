@@ -1,27 +1,27 @@
 {
   "meta": {
-    "created_utc": "2026-09-11T16:53:28.760588+00:00",
+    "created_utc": "2026-09-11T18:46:42.973307+00:00",
     "lane": "smoke_compare",
     "argv": [
       "/home/boss/codes/luazig/tools/smoke_compare.py",
       "--json-out",
-      "/home/boss/codes/luazig/tools/status/.tmp.smoke.mjaopm5w.json"
+      "/home/boss/codes/luazig/tools/status/.tmp.smoke.hv903hon.json"
     ],
     "zig_version": "0.16.0"
   },
   "provenance": {
-    "git_head": "bc0f820",
-    "measured_source_head": "bc0f820",
+    "git_head": "5a22e7a",
+    "measured_source_head": "5a22e7a",
     "git_dirty": "dirty",
-    "source_dirty": "dirty",
+    "source_dirty": "clean",
     "artifact_dirty": "dirty",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "38ae1885a4864c82",
+    "zig_binary_sha16": "df5c95b88f4fb31b",
     "puc_binary_sha16": "d54bc45e1757b216"
   },
-  "total": 78,
-  "ok": 78,
+  "total": 79,
+  "ok": 79,
   "mismatches": 0,
   "results": [
     {
@@ -334,6 +334,10 @@
     },
     {
       "file": "tests/smoke/79_trampoline_ownership.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/80_yield_value_span.lua",
       "match": true
     }
   ]

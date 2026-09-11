@@ -1,85 +1,85 @@
 {
- "created_utc": "2026-09-11T13:53:36.608593+00:00",
- "provenance": {
-  "git_head": "dabfad6",
-  "measured_source_head": "dabfad6",
-  "measured_source_note": "P16.37 final wrap: HEAD IS the production commit dabfad6 (git diff dabfad6..HEAD --stat -- src/ empty); binary zig-out/bin/luazig sha16 a892306a2856f0b4 = the perf_compare P16.37-final measured binary",
-  "git_dirty": "clean at measurement time (post-measurement artifact writes only)",
-  "source_dirty": "clean",
-  "artifact_dirty": "dirty (post-measurement JSON/status writes; the measured binary's inputs are src/, reported by source_dirty=clean)",
-  "zig_version": "0.16.0",
-  "optimize_mode": "ReleaseFast",
-  "zig_binary_sha16": "a892306a2856f0b4",
-  "note": "P16.37 final canonical code-size truth at HEAD dabfad6 (Cuts 0 60681b9 + 1 1fab11d + 2 dabfad6 landed). Supersedes the P16.36-final artifact (164ba0f, text 2,595,289, binary sha16 a43c3f73608b65d4). Absent symbols = fully inlined into runBytecodeDispatch."
- },
- "text_total_bytes": 2598777,
- "symbols_bytes": {
-  "vm.Vm.runBytecodeDispatch": 67717,
-  "vm.Vm.builtinOutLenDynamic": 2025,
-  "vm.Vm.pushStagedBytecodeExecFrame": 1196,
-  "vm.Vm.completeBytecodeExecFrame": 4462,
-  "vm.Vm.tryPushSimpleResultMetamethod": 2885,
-  "vm.Vm.dispatchCalleeActivationHook": 536,
-  "vm.Vm.callBuiltin": 6756,
-  "vm.Vm.getTmByObj": 237,
-  "vm.Vm.stageBytecodeCall": 497,
-  "vm.Vm.builtinCoroutineResume": 16977,
-  "vm.Vm.builtinCoroutineYield": 4144,
-  "vm.Vm.switchThread": 106,
-  "vm.Vm.coroutineBuiltinFastPathEligible": 301,
-  "vm.Vm.gsubContCcallRollback": 57,
-  "vm.Vm.pushResolvedBytecodeClosure__anon_42994": 1111
- },
- "absent_inlined_into_dispatch": [
-  "vm.Vm.findBinaryTm",
-  "vm.Vm.opCall",
-  "vm.Vm.opReturn0",
-  "vm.Vm.opReturn1",
-  "vm.Vm.pushStagedFast",
-  "vm.Vm.stageFixedCall",
-  "vm.Vm.builtinOutLen (inline wrapper: one comptime-table load at 5 call sites)",
-  "vm.Vm.errThread (pub accessor, cold paths; fully inlined)",
-  "vm.Vm.gsubContCcallEnter (inlined at both push sites; only gsubContCcallRollback 57 B stands alone)",
-  "vm.Vm.switchRuntime (DELETED in Cut 2 \u2014 replaced by switchThread = current_thread store + refreshHooksCached)",
-  "vm.Vm.parkActiveRuntime / vm.Vm.activateRuntime (DELETED in Cut 2 \u2014 Thread owns the runtime fields permanently; no move ceremony)",
-  "vm.Vm.activeBytecodeThread (inlined at cold/debug sites; dispatch caches ctx.th at frame_loop entry)"
- ],
- "fail_instantiations": {
-  "vm.Vm.fail": {
-   "count": 571,
-   "aggregate_bytes": 69372
+  "created_utc": "2026-09-11T18:45:35.895919+00:00",
+  "provenance": {
+    "git_head": "5a22e7a",
+    "measured_source_head": "5a22e7a",
+    "measured_source_note": "P16.38 final wrap: HEAD IS the production commit 5a22e7a (git diff 5a22e7a..HEAD --stat -- src/ empty); binary zig-out/bin/luazig sha16 df5c95b88f4fb31b = the perf_compare P16.38-final measured binary",
+    "git_dirty": "clean at measurement time (post-measurement artifact writes only)",
+    "source_dirty": "clean",
+    "artifact_dirty": "dirty (post-measurement JSON/status writes; the measured binary's inputs are src/, reported by source_dirty=clean)",
+    "zig_version": "0.16.0",
+    "optimize_mode": "ReleaseFast",
+    "zig_binary_sha16": "df5c95b88f4fb31b",
+    "note": "P16.38 final canonical code-size truth at HEAD 5a22e7a (Cut 0 bc0f820 + Cut 1 T12 ce03120 + Cut 2+3 b57f328 + regression fix 5a22e7a landed). Supersedes the P16.37-final artifact (dabfad6, text 2,598,777, binary sha16 a892306a2856f0b4). Absent symbols = fully inlined into runBytecodeDispatch."
   },
-  "vm.Vm.failArgerror": {
-   "count": 4,
-   "aggregate_bytes": 754
+  "text_total_bytes": 2591401,
+  "symbols_bytes": {
+    "vm.Vm.runBytecodeDispatch": 67519,
+    "vm.Vm.builtinOutLenDynamic": 2025,
+    "vm.Vm.pushStagedBytecodeExecFrame": 1190,
+    "vm.Vm.completeBytecodeExecFrame": 4423,
+    "vm.Vm.tryPushSimpleResultMetamethod": 2839,
+    "vm.Vm.dispatchCalleeActivationHook": 536,
+    "vm.Vm.callBuiltin": 6756,
+    "vm.Vm.getTmByObj": 237,
+    "vm.Vm.stageBytecodeCall": 497,
+    "vm.Vm.builtinCoroutineResume": 16556,
+    "vm.Vm.builtinCoroutineYield": 4248,
+    "vm.Vm.switchThread": 106,
+    "vm.Vm.coroutineBuiltinFastPathEligible": 301,
+    "vm.Vm.gsubContCcallRollback": 57,
+    "vm.Vm.pushResolvedBytecodeClosure__anon_42999": 1111
   },
-  "vm.Vm.failBinaryMmbin": {
-   "count": 1,
-   "aggregate_bytes": 599
+  "absent_inlined_into_dispatch": [
+    "vm.Vm.findBinaryTm",
+    "vm.Vm.opCall",
+    "vm.Vm.opReturn0",
+    "vm.Vm.opReturn1",
+    "vm.Vm.pushStagedFast",
+    "vm.Vm.stageFixedCall",
+    "vm.Vm.builtinOutLen (inline wrapper: one comptime-table load at 5 call sites)",
+    "vm.Vm.errThread (pub accessor, cold paths; fully inlined)",
+    "vm.Vm.gsubContCcallEnter (inlined at both push sites; only gsubContCcallRollback 57 B stands alone)",
+    "vm.Vm.switchRuntime (DELETED in P16.37 Cut 2 \u2014 replaced by switchThread = current_thread store + refreshHooksCached)",
+    "vm.Vm.parkActiveRuntime / vm.Vm.activateRuntime (DELETED in P16.37 Cut 2 \u2014 Thread owns the runtime fields permanently; no move ceremony)",
+    "vm.Vm.activeBytecodeThread (inlined at cold/debug sites; dispatch caches ctx.th at frame_loop entry)"
+  ],
+  "fail_instantiations": {
+    "vm.Vm.fail": {
+      "count": 571,
+      "aggregate_bytes": 69372
+    },
+    "vm.Vm.failArgerror": {
+      "count": 4,
+      "aggregate_bytes": 754
+    },
+    "vm.Vm.failBinaryMmbin": {
+      "count": 1,
+      "aggregate_bytes": 599
+    },
+    "vm.Vm.failLib": {
+      "count": 3,
+      "aggregate_bytes": 2096
+    },
+    "vm.Vm.failRunerror": {
+      "count": 2,
+      "aggregate_bytes": 1408
+    },
+    "vm.Vm.failTestcRaw": {
+      "count": 1,
+      "aggregate_bytes": 278
+    },
+    "vm.Vm.failWithPosFrame": {
+      "count": 576,
+      "aggregate_bytes": 790167
+    }
   },
-  "vm.Vm.failLib": {
-   "count": 3,
-   "aggregate_bytes": 2096
-  },
-  "vm.Vm.failRunerror": {
-   "count": 2,
-   "aggregate_bytes": 1408
-  },
-  "vm.Vm.failTestcRaw": {
-   "count": 1,
-   "aggregate_bytes": 278
-  },
-  "vm.Vm.failWithPosFrame": {
-   "count": 576,
-   "aggregate_bytes": 793640
+  "measurement": {
+    "binary": "zig-out/bin/luazig",
+    "symbols": "nm -S zig-out/bin/luazig (size column, hex->dec)",
+    "text_total": "readelf -S -W .text size = 2,591,401",
+    "text_delta_vs_p16_37_final": "-7,376 B (2,598,777 -> 2,591,401): Cut 2+3 YieldedValues union(none/span/owned) replaced the InlineValues heap-copy path (yieldArgSpan O(1) classification, owned only on cold paths) and Cut 3B eliminated the suspended_builtin_args copy for the hot path; the 5a22e7a regression fix added back the suspended-C-window getlocal reader (level-0 top-frame divert + debugTempCalleeBound/frames_above) \u2014 net shrink vs P16.37",
+    "dispatch_delta_vs_p16_37_final": "-198 B (67,717 -> 67,519): Cut 2+3 removed the per-yield InlineValues staging from the dispatch-adjacent paths; the direct-bytecode-yield hot skip is preserved",
+    "coroutine_symbols_note": "switchThread 106 B standalone (hot copies inlined at the 4 switch sites); builtinCoroutineResume 16,556 (-421 vs P16.37 16,977) / builtinCoroutineYield 4,248 (+104 vs P16.37 4,144) \u2014 Cut 2+3 replaced the resume-side InlineValues consume with the span copy-out (auxresume lua_xmove model) and the yield-side heap copy with span recording; coroutineBuiltinFastPathEligible 301 B unchanged (O(1) nny term since P16.36 Cut 3); pushResolvedBytecodeClosure anon suffix renumbered 42994 -> 42999 (same 1,111 B body, comptime counter shift from Cut 2+3 signature changes)"
   }
- },
- "measurement": {
-  "binary": "zig-out/bin/luazig",
-  "symbols": "nm -S zig-out/bin/luazig (size column, hex->dec)",
-  "text_total": "readelf -S -W .text size = 2,598,777",
-  "text_delta_vs_p16_36_final": "+3,488 B (2,595,289 -> 2,598,777): Cut 1 arg-error naming parity family (pushGlobalFuncName + failTabArgerror + checkTabArg arg_no; failArgerror 2->4 instantiations 377->754 B, +377 B) + Cut 1 tableSortLess nny-unit rewrite + Cut 2 re-homing churn (~290 sites: ctx.th caching in dispatch, th-param signatures); all cold/structural, no benchmark-hot path growth",
-  "dispatch_delta_vs_p16_36_final": "+688 B (67,029 -> 67,717): Cut 2 ctx.th slot setup at frame_loop entry + owner-Thread re-homing of dispatch/frame paths; switchRuntime 750 B symbol DELETED, replaced by switchThread 106 B (current_thread store + refreshHooksCached)",
-  "coroutine_symbols_note": "switchThread 106 B standalone (hot copies inlined at the 4 switch sites); switchRuntime/parkActiveRuntime/activateRuntime ABSENT from the symbol table (move ceremony deleted as a class in Cut 2); builtinCoroutineResume 16,977 (+137 vs P16.36) / builtinCoroutineYield 4,144 (+28) \u2014 Cut 2 deleted the 7-field resume save/restore bundle and the park/activate calls; coroutineBuiltinFastPathEligible 301 B unchanged (O(1) nny term since P16.36 Cut 3)"
- }
 }

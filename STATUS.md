@@ -1,4 +1,4 @@
-> Last updated: 2026-09-11 (P16.38 Cut 2+3)
+> Last updated: 2026-09-11 (P16.38 COMPLETE)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -34,11 +34,11 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
 | Differential output (`--diff`) | **0 output_diff** |
-| Smoke tests (`tests/smoke/*.lua`) | **78/78** pass |
+| Smoke tests (`tests/smoke/*.lua`) | **79/79** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.43x** |
+| Performance (geomean vs PUC) | **1.44x** |
 
-Geomean замедления vs PUC Lua: **1.43x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -10822,3 +10822,102 @@ tracegc dot-count расхождение в byte-diff лейнах — обяз�
    coroutine.close/setmetatable arg messages, order-error position-prefix;
    D5 frame-chain level walk (артефакт §6); tostring(function) формат;
    dofile outs-окно.
+
+## P16.38 COMPLETE — final wrap: baseline P16.38-final 1.44094, T12 закрыт, yield span = PUC lua_yieldk модель, ноль аллокаций на yield (2026-09-11)
+
+Production HEAD `5a22e7a` (git diff 5a22e7a..HEAD --stat -- src/ пуст;
+binary sha16 df5c95b88f4fb31b = measured binary). Cut ledger фазы:
+
+- **Cut 0 `bc0f820`** — truth + cleanup (behavior-neutral): callframe-layout
+  provenance регенерирован @ 3c68d37/src==dabfad6 (standalone probe D+RF вне
+  репо: ВСЕ layout-значения байт-идентичны, comptime asserts vm.zig:2549-2552
+  проходят в обоих режимах); stale active/parked-model комментарии исправлены
+  на durable wording (Thread постоянно владеет bytecode runtime; switchThread
+  выбирает исполняющий поток).
+- **Cut 1 T12 `ce03120`** — trampoline ownership FIX: switch eligibility =
+  drive-iteration ownership (trampoline_active AND requesting thread ==
+  bytecode_trampoline_drive_thread AND boundary_depth == 0); вложенные
+  host-recursive resumes (table.sort comparator, __lt под sort,
+  coroutine.wrap iterator из comparator, require/load, testC close
+  continuation) исполняются синхронно через существующий runClosure fallback
+  builtinCoroutineResume = PUC nested luaB_coresume → lua_resume ('coroutine
+  trampoline lost continuation' crash ЗАКРЫТ); drive_thread = ownership
+  recording (тот же класс, что current_thread, НЕ mode flag); stale
+  drive_thread может только conservative-reject, никогда false-accept;
+  permanent test 79_trampoline_ownership.lua 12 кейсов A–L байт-идентичны
+  PUC↔zig; perf guard coroutine_yield −0.69% flat (2 сравнения на
+  уже загруженных полях).
+- **Cut 2+3 `b57f328`** — yield-value lifetime: `Thread.yielded:
+  InlineValues` (heap-копия на каждый yield) заменён на
+  `YieldedValues = union(enum){none, span, owned}` = PUC lua_yieldk модель
+  (значения остаются в стековом окне yielding-потока, записывается только
+  base+len = `ci->u2.nyield`; resume-tail копирует наружу = auxresume
+  lua_xmove, очищает); O(1) pointer-range классификация yieldArgSpan; owned
+  только для холодных путей (C API lua_yieldk c_stack args, debug-hook yields,
+  __close transport); GC thread-mark помечает span-цели явно; Cut 3B
+  suspended_builtin_args copy устранена для hot path; T4.1
+  debug.getlocal/setlocal PUC parity (level 0 C-window, temp bounds);
+  OUTS-WINDOW FIX (pre-existing truncation bug): outs 8 → 256 convention
+  window, `yield(unpack(t100))` теперь 101 значение как PUC (было 8);
+  vd20k 5-val **−326 i/cycle (−12.2%)**, 1-val −5.15 i/cycle, **ноль
+  per-yield аллокаций на hot path** (PUC не аллоцирует); permanent smoke
+  80_yield_value_span.lua 12 секций A–L байт-идентичны.
+- **Regression fix `5a22e7a`** — suspended-C-window getlocal semantics:
+  Cut 3B + T4.1 регрессии (coroutine.lua:722 + db.lua:793), пойманные
+  **обязательным matrix-гейтом**, который сессия Cut 2+3
+  **misreported как green**: (1) условие записи Cut 3B 'нет Lua frame
+  где-либо' — НЕВЕРНО: C-temporary reader debug.getlocal целится в LEVEL 0 =
+  TOP frame независимо от того, что под ним (coroutine.lua:722 shape
+  [Lua body, testC C-frame]: level 0 = C и читает args); исправлено на
+  top-frame-is-C (hot direct-bytecode-yield skip сохранён — там top frame
+  Lua); (2) 'empty window' level-0-nil return T4.1 тоже overbroad для того
+  же shape — testC yields оставляют OBSERVABLE C temporaries (PUC runC
+  пушит args на стек L; lua_yield переносит только TOP n к resumer;
+  остаток выживает: `T.testC("yield 1",10,20)` → `getlocal(co,0,2)==10`);
+  getlocal теперь дивертирует level 0 в suspended_builtin C-window когда
+  top frame = C и не debug-hook suspension, level 1 ВСЕГДА идёт к parked
+  Lua frame ниже (db.lua:792-795); hook suspensions никогда не дивертируют.
+  **Gate-integrity lesson**: никогда не доверять self-reported гейту сессии
+  — обязательный matrix есть истина.
+
+**Final measurement (baseline-approved → P16.38-final, median-of-7, core 0)**:
+geomean **1.44094** (vs P16.37-final 1.42994 = **+0.77%**, noise-band; цена
+span copy-out + C-window reader на coroutine_yield 1.498 vs 1.419 = +5.6%
+wall, компенсирована elsewhere), 18/18 OK, **0 WARN/FAIL**. Ratios:
+metamethod_call_noalloc 1.856x, array_access 1.776x, field_access 1.715x,
+hash_access 1.600x, branch_loop 1.584x, dynamic_load 1.581x, global_arith
+1.569x, coroutine_yield 1.498x, metamethod_add 1.463x, comparisons 1.425x,
+mixed_arith 1.398x, table_alloc_setmetatable 1.366x, int_arith 1.328x,
+lua_calls 1.326x, float_arith 1.317x, string_loop 1.200x,
+temp_table_alloc 1.123x, string_concat 1.081x.
+
+**Code-size @ 5a22e7a**: .text **2,591,401** (−7,376 B vs P16.37-final
+2,598,777): Cut 2+3 удалил InlineValues staging-пути; fix 5a22e7a вернул
+suspended-C-window reader — нетто shrink; runBytecodeDispatch 67,519 (−198);
+builtinCoroutineResume 16,556 (−421) / builtinCoroutineYield 4,248 (+104);
+switchThread 106 B unchanged. Артефакты: tools/perf/ current.json +
+current-counters.json + current-profile-index.json (snapshot
+/tmp/opencode/p38_final) + current-codesize.json + current-differential-profile.json
+(workload set realigned к PROFILE_WORKLOADS = canonical 10, как в committed
+profile-index; P16.37 differential артефакт имел stale list) регенерированы
+@ 5a22e7a.
+
+**P16.39 queue**:
+1. **dispatch floor ~843 i/it** (p16.10 track) — callgrind D: dispatch 1075
+   i/it доминирует (vs PUC luaV_execute 232); отдельный длинный трек.
+2. **resume decomposition fresh** — builtinCoroutineResume 16.6 KB / 10.3%
+   профиля coroutine_yield после span-модели; свежая декомпозиция.
+3. **internStr GC cascade** — checkGC на allocation-опкодах (PUC lvm.c:1425).
+4. **D5 frame-chain walk** — level ≥ 2 + out-of-range error parity
+   (артефакт p16.38-yield-value-lifetime.md §6).
+5. **tostring(function)** = `function: <name>` vs PUC addr.
+6. **dofile outs-окно 16** — тот же класс обрезания, что resume/yield 8.
+7. **errored-TBC `__close` timing** (PUC defers-to-close / zig
+   closes-during-unwind) + semantic backlog (comparator call-counts,
+   coroutine.close/setmetatable arg messages, order-error position-prefix).
+
+Гейты final wrap: matrix --testc 31/32 zig_fail=0 (big.lua both_fail
+pre-existing); smoke **79/79** PASS (ok=79 mismatches=0, включая
+79_trampoline_ownership + 80_yield_value_span); README/STATUS status-блоки
+регенерированы (status_snapshot + status_summary --use-current
+--write-readme --write-status).

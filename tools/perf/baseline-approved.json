@@ -1,178 +1,178 @@
 {
- "created_utc": "2026-09-11T13:56:44.158624+00:00",
- "zig_version": "0.16.0",
- "provenance": {
-  "git_head": "dabfad6",
-  "measured_source_head": "dabfad6",
-  "git_dirty": "clean",
-  "source_dirty": "clean",
-  "artifact_dirty": "clean",
+  "created_utc": "2026-09-11T18:46:28.631024+00:00",
   "zig_version": "0.16.0",
-  "optimize_mode": "ReleaseFast",
-  "zig_binary_sha16": "a892306a2856f0b4",
-  "puc_binary_sha16": "d54bc45e1757b216"
- },
- "host": {
-  "platform": "Linux-7.1.5-arch1-2-x86_64-with-glibc2.44",
-  "python": "3.11.15"
- },
- "runs": 7,
- "core": "0",
- "geomean": 1.4299375778709313,
- "workloads": {
-  "table_alloc_setmetatable": {
-   "zig_s": 0.058198,
-   "puc_s": 0.043002,
-   "ratio": 1.353378912608716
+  "provenance": {
+    "git_head": "5a22e7a",
+    "measured_source_head": "5a22e7a",
+    "git_dirty": "clean",
+    "source_dirty": "clean",
+    "artifact_dirty": "clean",
+    "zig_version": "0.16.0",
+    "optimize_mode": "ReleaseFast",
+    "zig_binary_sha16": "df5c95b88f4fb31b",
+    "puc_binary_sha16": "d54bc45e1757b216"
   },
-  "metamethod_call_noalloc": {
-   "zig_s": 0.015622,
-   "puc_s": 0.008422,
-   "ratio": 1.8549038233198765
+  "host": {
+    "platform": "Linux-7.1.5-arch1-2-x86_64-with-glibc2.44",
+    "python": "3.14.6"
   },
-  "comparisons": {
-   "zig_s": 0.822212,
-   "puc_s": 0.596781,
-   "ratio": 1.3777449349091209
+  "runs": 7,
+  "core": "0",
+  "geomean": 1.440942004456083,
+  "workloads": {
+    "temp_table_alloc": {
+      "zig_s": 0.03443,
+      "puc_s": 0.030661,
+      "ratio": 1.1229248882945762
+    },
+    "lua_calls": {
+      "zig_s": 0.120681,
+      "puc_s": 0.090978,
+      "ratio": 1.3264855239728286
+    },
+    "metamethod_add": {
+      "zig_s": 0.090835,
+      "puc_s": 0.062072,
+      "ratio": 1.4633812346951927
+    },
+    "comparisons": {
+      "zig_s": 0.860853,
+      "puc_s": 0.603958,
+      "ratio": 1.4253524251686376
+    },
+    "hash_access": {
+      "zig_s": 0.110583,
+      "puc_s": 0.069099,
+      "ratio": 1.6003560109408241
+    },
+    "string_loop": {
+      "zig_s": 0.117545,
+      "puc_s": 0.097951,
+      "ratio": 1.2000387949076579
+    },
+    "dynamic_load": {
+      "zig_s": 0.204972,
+      "puc_s": 0.129676,
+      "ratio": 1.5806471513618554
+    },
+    "coroutine_yield": {
+      "zig_s": 0.06532,
+      "puc_s": 0.043613,
+      "ratio": 1.4977185701511018
+    },
+    "branch_loop": {
+      "zig_s": 0.848253,
+      "puc_s": 0.535346,
+      "ratio": 1.5844948874186042
+    },
+    "array_access": {
+      "zig_s": 0.081869,
+      "puc_s": 0.046093,
+      "ratio": 1.7761699173410277
+    },
+    "float_arith": {
+      "zig_s": 0.232621,
+      "puc_s": 0.176607,
+      "ratio": 1.3171674961921103
+    },
+    "metamethod_call_noalloc": {
+      "zig_s": 0.015609,
+      "puc_s": 0.008411,
+      "ratio": 1.8557840922601354
+    },
+    "string_concat": {
+      "zig_s": 0.08529,
+      "puc_s": 0.078909,
+      "ratio": 1.0808653005360604
+    },
+    "table_alloc_setmetatable": {
+      "zig_s": 0.059239,
+      "puc_s": 0.043359,
+      "ratio": 1.3662446089623839
+    },
+    "field_access": {
+      "zig_s": 0.096159,
+      "puc_s": 0.05607,
+      "ratio": 1.7149812734082395
+    },
+    "global_arith": {
+      "zig_s": 0.878517,
+      "puc_s": 0.559746,
+      "ratio": 1.569492233977554
+    },
+    "mixed_arith": {
+      "zig_s": 0.248103,
+      "puc_s": 0.17748,
+      "ratio": 1.397920892494929
+    },
+    "int_arith": {
+      "zig_s": 0.229811,
+      "puc_s": 0.173017,
+      "ratio": 1.328256760896328
+    }
   },
-  "int_arith": {
-   "zig_s": 0.228816,
-   "puc_s": 0.172417,
-   "ratio": 1.3271081157890463
+  "zig": {
+    "temp_table_alloc": 0.03443,
+    "lua_calls": 0.120681,
+    "metamethod_add": 0.090835,
+    "comparisons": 0.860853,
+    "hash_access": 0.110583,
+    "string_loop": 0.117545,
+    "dynamic_load": 0.204972,
+    "coroutine_yield": 0.06532,
+    "branch_loop": 0.848253,
+    "array_access": 0.081869,
+    "float_arith": 0.232621,
+    "metamethod_call_noalloc": 0.015609,
+    "string_concat": 0.08529,
+    "table_alloc_setmetatable": 0.059239,
+    "field_access": 0.096159,
+    "global_arith": 0.878517,
+    "mixed_arith": 0.248103,
+    "int_arith": 0.229811
   },
-  "temp_table_alloc": {
-   "zig_s": 0.034657,
-   "puc_s": 0.030372,
-   "ratio": 1.1410838930593967
+  "puc": {
+    "temp_table_alloc": 0.030661,
+    "lua_calls": 0.090978,
+    "metamethod_add": 0.062072,
+    "comparisons": 0.603958,
+    "hash_access": 0.069099,
+    "string_loop": 0.097951,
+    "dynamic_load": 0.129676,
+    "coroutine_yield": 0.043613,
+    "branch_loop": 0.535346,
+    "array_access": 0.046093,
+    "float_arith": 0.176607,
+    "metamethod_call_noalloc": 0.008411,
+    "string_concat": 0.078909,
+    "table_alloc_setmetatable": 0.043359,
+    "field_access": 0.05607,
+    "global_arith": 0.559746,
+    "mixed_arith": 0.17748,
+    "int_arith": 0.173017
   },
-  "dynamic_load": {
-   "zig_s": 0.193536,
-   "puc_s": 0.126632,
-   "ratio": 1.528334070377156
+  "ratios": {
+    "temp_table_alloc": 1.1229248882945762,
+    "lua_calls": 1.3264855239728286,
+    "metamethod_add": 1.4633812346951927,
+    "comparisons": 1.4253524251686376,
+    "hash_access": 1.6003560109408241,
+    "string_loop": 1.2000387949076579,
+    "dynamic_load": 1.5806471513618554,
+    "coroutine_yield": 1.4977185701511018,
+    "branch_loop": 1.5844948874186042,
+    "array_access": 1.7761699173410277,
+    "float_arith": 1.3171674961921103,
+    "metamethod_call_noalloc": 1.8557840922601354,
+    "string_concat": 1.0808653005360604,
+    "table_alloc_setmetatable": 1.3662446089623839,
+    "field_access": 1.7149812734082395,
+    "global_arith": 1.569492233977554,
+    "mixed_arith": 1.397920892494929,
+    "int_arith": 1.328256760896328
   },
-  "field_access": {
-   "zig_s": 0.095955,
-   "puc_s": 0.056634,
-   "ratio": 1.6943002436698804
-  },
-  "hash_access": {
-   "zig_s": 0.110786,
-   "puc_s": 0.068439,
-   "ratio": 1.6187553880097605
-  },
-  "mixed_arith": {
-   "zig_s": 0.24568,
-   "puc_s": 0.174588,
-   "ratio": 1.407198661992806
-  },
-  "string_loop": {
-   "zig_s": 0.117311,
-   "puc_s": 0.097,
-   "ratio": 1.2093917525773195
-  },
-  "global_arith": {
-   "zig_s": 0.840052,
-   "puc_s": 0.550451,
-   "ratio": 1.526115857723939
-  },
-  "metamethod_add": {
-   "zig_s": 0.090415,
-   "puc_s": 0.062399,
-   "ratio": 1.4489815541915734
-  },
-  "branch_loop": {
-   "zig_s": 0.841639,
-   "puc_s": 0.529563,
-   "ratio": 1.5893085430817486
-  },
-  "coroutine_yield": {
-   "zig_s": 0.062874,
-   "puc_s": 0.044314,
-   "ratio": 1.4188292638895157
-  },
-  "string_concat": {
-   "zig_s": 0.084665,
-   "puc_s": 0.077771,
-   "ratio": 1.0886448676241787
-  },
-  "lua_calls": {
-   "zig_s": 0.121252,
-   "puc_s": 0.090945,
-   "ratio": 1.3332453680796086
-  },
-  "float_arith": {
-   "zig_s": 0.229994,
-   "puc_s": 0.175651,
-   "ratio": 1.3093805329887105
-  },
-  "array_access": {
-   "zig_s": 0.080408,
-   "puc_s": 0.045571,
-   "ratio": 1.7644554650984177
+  "baseline_identity": {
+    "baseline_phase": "P16.38-final",
+    "note": "1.44094 @ 5a22e7a (production HEAD, clean src, binary sha16 df5c95b88f4fb31b). Phase P16.38 (coroutine yield-value lifetime + trampoline ownership + debug parity): Cut 0 (bc0f820): truth + cleanup (behavior-neutral) \u2014 callframe-layout provenance regenerated @ 3c68d37 (standalone probe D+RF outside repo: ALL layout values byte-identical, comptime asserts vm.zig:2549-2552 pass in both modes), stale active/parked-model comments fixed to durable wording (Thread permanently owns its bytecode runtime; switchThread selects the executing thread). Cut 1 T12 (ce03120): trampoline ownership CLOSED \u2014 switch eligibility = drive-iteration ownership (trampoline_active AND requesting thread == bytecode_trampoline_drive_thread AND boundary_depth == 0); nested host-recursive resumes (table.sort comparator, __lt under sort, coroutine.wrap iterator from comparator, require/load, testC close continuation) run synchronously via builtinCoroutineResume's existing runClosure fallback = PUC nested luaB_coresume -> lua_resume ('coroutine trampoline lost continuation' crash CLOSED); bytecode_trampoline_drive_thread = ownership recording (same class as current_thread, NOT a mode flag); stale drive_thread can only conservative-reject, never false-accept; permanent test 79_trampoline_ownership.lua 12 cases A-L byte-identical PUC<->zig; perf guard coroutine_yield -0.69% flat. Cut 2+3 (b57f328): yield-value lifetime \u2014 Thread.yielded InlineValues heap-copy replaced by YieldedValues union(none/span/owned) = PUC lua_yieldk model (values stay in the yielding thread's stack window, only base+len recorded = ci->u2.nyield; resume tail copies out = auxresume lua_xmove, clears); O(1) yieldArgSpan classification, owned only for cold paths (C API lua_yieldk c_stack args, debug-hook yields, __close transport); vd20k 5-val -326 i/cycle (-12.2%), 1-val -5.15 i/cycle, ZERO per-yield allocation on the hot path (PUC allocates nothing); Cut 3B suspended_builtin_args copy eliminated for hot path; T4.1 debug.getlocal/setlocal PUC parity (level 0 C-window, temp bounds via debugTempCalleeBound + frames_above); OUTS-WINDOW FIX (pre-existing truncation bug): coroutine_resume/yield fixed outs 8 silently truncated every resume/yield to 7 values -> 256 convention window; yield(unpack(t100)) now 101 values like PUC (was 8); permanent smoke 80_yield_value_span.lua 12 sections A-L byte-identical. HONEST REGRESSION STORY: the Cut 2+3 session MISREPORTED its matrix gate as green; the MANDATORY matrix caught two regressions \u2014 coroutine.lua:722 + db.lua:793 \u2014 root-caused as level-0/top-frame semantics: (1) Cut 3B write condition 'no Lua frame anywhere' was WRONG (debug.getlocal's C-temporary reader targets LEVEL 0 = the TOP frame regardless of what lives below); (2) the T4.1 'empty window' level-0-nil return was overbroad for the same shape (testC yields leave OBSERVABLE C temporaries: PUC runC pushes args on L's stack, lua_yield moves only the TOP n to the resumer, the remainder survives). Fixed in 5a22e7a: getlocal diverts level 0 to the suspended_builtin C-window when the top frame is C and not a debug-hook suspension, level 1 ALWAYS walks to the parked Lua frame below; hook suspensions never divert. Gate-integrity lesson: never trust a session's self-reported gate run \u2014 the mandatory matrix is the truth. FINAL MEASUREMENT (this baseline): geomean 1.44094 vs P16.37-final 1.42994 = +0.77% (noise-band; coroutine_yield 1.498 vs 1.419 = +5.6% wall = the span copy-out + C-window reader price, offset elsewhere); 18/18 OK, 0 WARN/FAIL vs P15.37 historical baseline. P16.39 queue: dispatch floor ~843 i/it p16.10 track (callgrind D: dispatch 1075 dominant vs PUC luaV_execute 232); resume decomposition fresh; internStr GC cascade (checkGC at allocation opcodes, PUC lvm.c:1425); D5 frame-chain walk (level >= 2 + out-of-range error) open; tostring(function)='function: <name>' vs PUC addr; dofile outs window 16 (same truncation class); errored-TBC __close timing (PUC defers-to-close / zig closes-during-unwind) + semantic backlog. P16.39 regression checks run against THIS measurement (conservative)."
   }
- },
- "zig": {
-  "table_alloc_setmetatable": 0.058198,
-  "metamethod_call_noalloc": 0.015622,
-  "comparisons": 0.822212,
-  "int_arith": 0.228816,
-  "temp_table_alloc": 0.034657,
-  "dynamic_load": 0.193536,
-  "field_access": 0.095955,
-  "hash_access": 0.110786,
-  "mixed_arith": 0.24568,
-  "string_loop": 0.117311,
-  "global_arith": 0.840052,
-  "metamethod_add": 0.090415,
-  "branch_loop": 0.841639,
-  "coroutine_yield": 0.062874,
-  "string_concat": 0.084665,
-  "lua_calls": 0.121252,
-  "float_arith": 0.229994,
-  "array_access": 0.080408
- },
- "puc": {
-  "table_alloc_setmetatable": 0.043002,
-  "metamethod_call_noalloc": 0.008422,
-  "comparisons": 0.596781,
-  "int_arith": 0.172417,
-  "temp_table_alloc": 0.030372,
-  "dynamic_load": 0.126632,
-  "field_access": 0.056634,
-  "hash_access": 0.068439,
-  "mixed_arith": 0.174588,
-  "string_loop": 0.097,
-  "global_arith": 0.550451,
-  "metamethod_add": 0.062399,
-  "branch_loop": 0.529563,
-  "coroutine_yield": 0.044314,
-  "string_concat": 0.077771,
-  "lua_calls": 0.090945,
-  "float_arith": 0.175651,
-  "array_access": 0.045571
- },
- "ratios": {
-  "table_alloc_setmetatable": 1.353378912608716,
-  "metamethod_call_noalloc": 1.8549038233198765,
-  "comparisons": 1.3777449349091209,
-  "int_arith": 1.3271081157890463,
-  "temp_table_alloc": 1.1410838930593967,
-  "dynamic_load": 1.528334070377156,
-  "field_access": 1.6943002436698804,
-  "hash_access": 1.6187553880097605,
-  "mixed_arith": 1.407198661992806,
-  "string_loop": 1.2093917525773195,
-  "global_arith": 1.526115857723939,
-  "metamethod_add": 1.4489815541915734,
-  "branch_loop": 1.5893085430817486,
-  "coroutine_yield": 1.4188292638895157,
-  "string_concat": 1.0886448676241787,
-  "lua_calls": 1.3332453680796086,
-  "float_arith": 1.3093805329887105,
-  "array_access": 1.7644554650984177
- },
- "baseline_identity": {
-  "baseline_phase": "P16.37-final",
-  "note": "1.42994 @ dabfad6 (production HEAD, clean src, binary sha16 a892306a2856f0b4). Phase P16.37 (table.sort yieldability parity + thread runtime ownership): Cut 0 (60681b9): truth \u2014 P16.36-final reproduced (RF sha16 byte-identical, spot-counters exact), fresh switchRuntime decomposition (variant D: 2 switches/cycle exact, switchRuntime 151.0 i/cycle self = park 21 + activate 17 + refreshHooksCached 12 + guard/prologue ~14.5 per switch), R0.3 callframe-layout provenance regenerated, R0.2 errored-coroutine TBC __close timing divergence CONFIRMED (PUC defers-to-close / zig closes-during-unwind \u2014 backlog). Cut 1 (1fab11d): table.sort comparator non-yieldable via nny unit \u2014 tableSortLess enters ccallEnter(.nonyieldable) BEFORE resolveCallable (PUC ldo.c:652), all 6 coroutine_yield special cases + 'invalid order function' error-wrapping DELETED (comparator errors propagate unwrapped, PUC sort_comp lua_call); bare-message mechanism = callBuiltin pushes builtin C-frame first; builtinTableSort checktype raw-tag parity (ltablib.c:399); follow-on arg-message naming parity family: _G in _LOADED (luaopen_base), pushGlobalFuncName (loaded-search, findfield L2, strip _G.), failTabArgerror, checkTabArg arg_no \u2014 table.sort messages byte-match PUC; side-fix undump fixed-borrow alignment (latent UB exposed by arena offset shift; fixed_borrow = base % 4 check with copy fallback, PUC plain-casts = UB on misaligned base); smoke 78_table_sort_yieldability.lua T0-T10 byte-identical (T12 dropped: pre-existing trampoline lost-continuation crash, reproduces on pre-P16.37 binary \u2014 backlog); negative validation: neutralized nny-enter -> P1 suspends (old divergence reproduced), restored -> byte-identical. Cut 2 (dabfad6): PERMANENT Thread runtime ownership Variant A \u2014 PUC lstate.c model (L->stack on lua_State, global_State without stack): Thread.bytecode_stack = L->stack, activeBytecodeThread() = L, dispatch caches the thread like PUC caches L/ci; Vm fields bc_stack/bc_boxed/bc_stack_top/bc_tbc_regs DELETED (Vm 6592->6520 B = -72 exactly 5 fields, Thread 3712 unchanged); move ceremony DELETED as a class: parkActiveRuntime (21 i/switch) + activateRuntime (17 i/switch) + switchRuntime (151 i/cycle x2/cycle 4-field SIMD) + active_runtime_thread + branchy active-vs-parked resolves; switch = thread-select (current_thread store, null=main, single switch-state) + refreshHooksCached; ~290 sites re-homed (ctx.th in dispatch, th-pairs in close/unwind, th-params in signatures); T7 A/B: coroutine_yield -6.3% instructions (1,092,199,178 -> 1,023,529,434), cy_d -6.2%, field_access -9.0%, controls int_arith/branch_loop/table_alloc ~0 = noise -> no new per-opcode chain; perf_compare @ Cut 2: coroutine_yield -9.7% wall; T8 memory: GC-count full reclamation no leak, native_mem LINEAR identical at Cut 1 HEAD = pre-existing. Cut ledger: Cut 0 60681b9, Cut 1 1fab11d, Cut 2 dabfad6. FINAL MEASUREMENT (this baseline): geomean 1.42994 vs P16.36-final 1.45349 = -1.62% (improvement); 18/18 OK, 0 WARN/FAIL; coroutine_yield -8.45% wall vs P16.36-final (Cut 2 recorded -9.7%), field_access -5.94%, comparisons -4.15%; controls int_arith -2.39%, branch_loop -1.78%. Fresh A/B/C/D @ HEAD: gap(D) 1076.0 i/it (was 1529.4 at P16.35, 1199.2 at P16.36) = lookup +5.0 (0.5%) + transition 1076.0 (99.5%); fresh perf record: switchRuntime/park/activate ABSENT (0 matches), switchThread 0.72%, builtinCoroutineResume 12.31% (was 28.8% at P16.35). P16.38 queue: yield copying ~50 i/it (setFrom x2 + resume-tail copy vs PUC zero-copy, with lifetime proof), internStr GC cascade (checkGC at allocation opcodes, PUC lvm.c:1425), errored-coroutine TBC __close timing (PUC defers-to-close / zig closes-during-unwind), remaining semantic backlog (T12 trampoline lost-continuation crash, comparator call-counts, coroutine.close/setmetatable arg messages). P16.38 regression checks run against THIS measurement (conservative)."
- }
 }

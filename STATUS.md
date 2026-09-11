@@ -1,4 +1,4 @@
-> Last updated: 2026-09-11 (P16.38 Cut 1)
+> Last updated: 2026-09-11 (P16.38 Cut 2+3)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -10742,10 +10742,83 @@ boundary 0 — остаётся eligible, добавлены 2 сравнени�
 исправлено в самом тесте до дифа).
 
 **P16.38 queue (обновлён)**:
-1. **yield copying ~50 i/it** — без изменений.
+1. ~~yield copying ~50 i/it~~ (ЗАКРЫТ Cut 2+3, см. ниже).
 2. **internStr GC cascade** — без изменений.
 3. **errored-coroutine TBC `__close` timing** — без изменений.
-4. Semantic backlog: ~~T12 trampoline lost-continuation crash~~ (ЗАКРЫТ
-   этим Cut'ом); остались comparator call-counts (алгоритмическое),
+4. Semantic backlog: ~~T12 trampoline lost-continuation crash~~ (ЗАКРЫТ Cut 1);
+   остались comparator call-counts (алгоритмическое),
    coroutine.close/setmetatable arg messages, order-error position-prefix
    (новое, см. выше).
+
+## P16.38 Cut 2+3 — yield-value lifetime: span representation + debug parity + outs-window fix (2026-09-11)
+
+**Cut 2 (decomposition)**: свежие A/B/C/D = 2127.4/2024.4/2052.4/1935.4 i/it
+(PUC 1063.1/958.1/950.1/854.1); callgrind D: dispatch 1075 i/it — доминирующий
+чанк (vs PUC luaV_execute 232 → ~+843, отдельный трек p16.10); transition-функции
+≈ parity; memcpy 46 i/it = 2 setFrom/cycle (`th.yielded` +
+`suspended_builtin_args` в builtinCoroutineYield). Полные таблицы в
+`tools/status/p16.38-yield-value-lifetime.md` §1.
+
+**Cut 3 (span)**: `Thread.yielded: InlineValues` (heap-копия на каждый yield)
+заменён на `YieldedValues = union(enum){none, span, owned}` — span = PUC-модель
+(значения остаются в стеке yielding-потока, записывается только позиция+длина;
+resume-tail копирует их наружу = PUC auxresume lua_xmove). Классификация O(1)
+pointer-range (`yieldArgSpan`); owned — только холодные пути (C API lua_yieldk,
+debug-hook yields, __close transport). Lifetime proof — артефакт §3.
+GC thread-mark помечает span-цели явно (error.ThreadSwitch путь).
+`Thread.yielded` 24 → 32 байта (один на корутину — ничтожно).
+
+**Cut 3B**: `suspended_builtin_args` пишется только при отсутствии Lua-frame
+в call_frames (читается только debug.getlocal pure-C веткой); `suspended_builtin`
+(ID) пишется всегда. Убрана вторая копия на цикл.
+
+**T4.1 (debug parity, PUC differential D1–D8)**: getlocal(co,0,n) → nil при
+suspended-at-non-hook-yield (пустое C-окно: auxresume уже xmove'нул значения);
+setlocal(co,0,1) → "(C temporary)" без записи (PUC пишет в мёртвый слот,
+перезаписываемый следующим poscall — unobservable); temp-окно parked/active
+frame ограничено callee-регистром yield/call (luaG_findlocal limit =
+ci->next->func); debug-hook frame сверху = полное окно (hook на текущем
+CallInfo). D5 (полный frame-chain walk уровней ≥2 + out-of-range error parity)
+— открытый пункт (артефакт §6).
+
+**Outs-window fix (найден span-GC пробой, pre-existing)**:
+`coroutine_resume`/`coroutine_yield` outs-окно было фиксировано 8 → каждый
+resume/yield молча обрезался до 7 значений (PUC возвращает все: его C-стек =
+outs-окно). Число результатов принципиально неизвестно в момент вызова →
+использовано окно 256 по конвенции архитектуры (pcall/xpcall/wrap_iter/testC).
+`yield(unpack(t100))` теперь возвращает 101 значение как PUC (было 8).
+
+**Измерения** (median-of-3 instructions:u, taskset -c 0, ReleaseFast):
+vd20k 1-value: 39,873,369 → 39,770,286 (−5.15 i/cycle; setFrom(1) был дёшев,
+классификация span стоит несколько инструкций обратно);
+vd20k 5-value: 53,352,197 → 46,830,390 (**−326 i/cycle, −12.2%** — обе
+per-yield heap-копии устранены). `perf_compare.py`: OK, регрессий нет
+(coroutine_yield +0.7% = шум).
+
+**Гейты**: unit D PASS; matrix --testc 31/32 zig_fail=0 (big.lua both_fail
+pre-existing); smoke **80/80** PASS (новый 80_yield_value_span.lua — 12 секций
+A–L, byte-identical PUC↔zig: счётчики значений 0/1/4/5/100, объекты живы
+через GC пока suspended, repeated yields, resume args, wrap, getlocal/setlocal
+parity, span corruption-resistance через setlocal, active-thread bound,
+close-suspended, nested); official testC lane PASS; api580 GREEN; run_tests
+per-suite coroutine/db/errors/strings/sort PASS (locals/cstack — pre-existing
+byte-diff, подписи байт-в-байт как на HEAD, артефакт §6).
+
+**PUC-faithfulness**: span = точная PUC-модель (значения в стеке потока,
+счётчик+позиция = `ci->u2.nyield`); ноль аллокаций на yield в hot path (PUC
+не аллоцирует). Побочный эффект: сдвиг GC-timing (меньше аллокаций) виден как
+tracegc dot-count расхождение в byte-diff лейнах — обязательный matrix-гейт
+сравнивает только stdout и не затронут.
+
+**Наблюдено pre-existing (backlog, артефакт §6)**: tostring(function) =
+`function: <name>` vs PUC `function: <addr>`; dofile outs-окно = 16 (тот же
+класс обрезания, что resume/yield 8); locals/cstack tracegc-dot byte-diff.
+
+**P16.38 queue (обновлён)**:
+1. ~~yield copying~~ ЗАКРЫТ (Cut 2+3).
+2. **internStr GC cascade** — без изменений.
+3. **errored-coroutine TBC `__close` timing** — без изменений.
+4. Semantic backlog: comparator call-counts (алгоритмическое),
+   coroutine.close/setmetatable arg messages, order-error position-prefix;
+   D5 frame-chain level walk (артефакт §6); tostring(function) формат;
+   dofile outs-окно.

@@ -2135,6 +2135,62 @@ const InlineValues = struct {
     }
 };
 
+/// P16.38 Cut 3: storage for a suspended thread's yielded values.
+///
+/// PUC model (ldo.c lua_yieldk): the yielded values are the top `nresults`
+/// slots of the yielding thread's stack, physically inside the yield
+/// C-function's CallInfo window (`ci->func+1 .. L->top`). Only the COUNT is
+/// saved (`ci->u2.nyield`); when resume returns, the resumer (auxresume)
+/// `lua_xmove`s the values OFF the suspended thread's stack, so from Lua the
+/// values are never observable on the suspended coroutine.
+///
+/// - `.span`: the values are still in the yielding thread's `bytecode_stack`
+///   at `[base, base+len)` — the PUC-faithful representation for the hot
+///   paths (coroutine.yield called directly from bytecode: the args ARE the
+///   caller frame's call window). No copy at yield; the resume tail copies
+///   them out (mirroring PUC's xmove) and clears the span. Lifetime proof in
+///   tools/status/p16.38-yield-value-lifetime.md §3: no Lua code, no GC step,
+///   and no child-stack mutation can occur between the park and the
+///   resume-tail consume (the only exception, error.ThreadSwitch leaving the
+///   span live across dispatch iterations, keeps the child suspended and its
+///   stack untouched; the GC thread-mark marks span targets explicitly).
+/// - `.owned`: copied storage for cold paths whose args are not stably
+///   stack-resident (C API lua_yieldk — args live on c_stack; debug-hook
+///   yields — the hook frame is popped right after capture; __close
+///   transport yields).
+/// - `.none`: no values; also the state after consume/clear (mirrors PUC's
+///   post-xmove empty C window).
+///
+/// Invariant: `.span`/`.owned` always carry len >= 1 — a zero-value yield is
+/// `.none`. This keeps the historical `yielded.slice() != null` "did this
+/// thread yield values" predicates exact.
+const YieldSpan = struct { base: u32, len: u32 };
+
+const YieldedValues = union(enum) {
+    none,
+    span: YieldSpan,
+    owned: InlineValues,
+
+    /// Free owned heap storage (span/none have none) and reset to `.none`.
+    fn deinit(self: *YieldedValues, alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .none, .span => {},
+            .owned => |*iv| iv.deinit(alloc),
+        }
+        self.* = .none;
+    }
+
+    /// Store an owned copy of `vals` (zero values ⇒ `.none`, preserving the
+    /// "slice() != null ⇔ has values" predicate). Errors only on heap spill.
+    fn setOwnedCopy(self: *YieldedValues, alloc: std.mem.Allocator, vals: []const Value) error{OutOfMemory}!void {
+        self.deinit(alloc);
+        if (vals.len == 0) return;
+        var iv: InlineValues = .{};
+        try iv.setFrom(alloc, vals);
+        self.* = .{ .owned = iv };
+    }
+};
+
 pub const Thread = struct {
     gc_age: GcAge = .new,
     /// Position in `Vm.gc_objects` (P16.16 C1: u32; see Cell.gc_index).
@@ -2186,9 +2242,11 @@ pub const Thread = struct {
     /// normally, hence the slot identity instead of a boolean.
     errfunc_running_idx: StackOffset = ERRFUNC_NONE,
     callee: Value, // .Closure or .Builtin
-    /// P16.3: inline small-vector (0-4 values stay off the heap; the
-    /// yield/resume hot loop must be allocation-free).
-    yielded: InlineValues = .{},
+    /// P16.38 Cut 3: yielded values as none/span/owned (see YieldedValues).
+    /// The span form is the PUC-faithful "values live on the yielding
+    /// thread's stack" representation; owned copies remain only for cold
+    /// non-stack-resident paths (C API / debug-hook / __close yields).
+    yielded: YieldedValues = .none,
     close_mode: bool = false,
     /// P16.26 D: count of C-frames currently on this thread's frame stack.
     /// Mirrors what PUC knows structurally (a C CallInfo is on L->ci stack):
@@ -2374,6 +2432,52 @@ pub const Thread = struct {
     pub fn yieldable(th: *const Thread) bool {
         return th.nCcalls & 0xffff0000 == 0;
     }
+
+    /// P16.38 Cut 3: resolve this (suspended) thread's yielded values.
+    /// Null when none — the exact meaning of the historical
+    /// `yielded.slice() != null` "yielded something" predicate (zero-value
+    /// yields are `.none`). PUC equivalent: the values between the yield
+    /// C frame's `func+1` and `L->top` — empty once the resumer consumed
+    /// them (auxresume's lua_xmove).
+    pub fn yieldedValues(th: *const Thread) ?[]const Value {
+        return switch (th.yielded) {
+            .none => null,
+            // The span targets are the parked frame's call-arg registers.
+            // The lifetime proof (p16.38-yield-value-lifetime.md §3) guarantees
+            // the child's stack window is intact while the span is live; the
+            // assert catches proof violations under checked builds.
+            .span => |sp| blk: {
+                const stack = th.bytecode_stack;
+                std.debug.assert(sp.base +| sp.len <= stack.len);
+                break :blk stack[sp.base..][0..sp.len];
+            },
+            .owned => |*iv| iv.slice(),
+        };
+    }
+
+    /// P16.38 Cut 3: O(1) classification — are `args` a window of this
+    /// thread's `bytecode_stack`? That is exactly the PUC condition for
+    /// yield values (lua_yieldk takes them from the yielding thread's
+    /// stack top): the direct fast path stages call args at
+    /// `ctx.regs[a+1..a+1+nargs]` and the generic builtin path re-derives
+    /// them from the same window, so both classify as stack-resident and
+    /// can park a span. C API yields pass `c_stack` slices (a different
+    /// buffer) and classify as not stack-resident.
+    pub fn yieldArgSpan(th: *const Thread, args: []const Value) ?YieldSpan {
+        if (args.len == 0 or args.len > std.math.maxInt(u32)) return null;
+        const stack = th.bytecode_stack;
+        if (stack.len == 0) return null;
+        const first = @intFromPtr(args.ptr);
+        const buf = @intFromPtr(stack.ptr);
+        const buf_end = buf + stack.len * @sizeOf(Value);
+        if (first < buf or first >= buf_end) return null;
+        const byte_off = first - buf;
+        if (byte_off % @sizeOf(Value) != 0) return null;
+        const base = byte_off / @sizeOf(Value);
+        if (base + args.len > stack.len) return null;
+        return .{ .base = @intCast(base), .len = @intCast(args.len) };
+    }
+
     /// PUC `getCcalls` (lstate.h macro): lower 16 bits of `nCcalls`,
     /// the C-call nesting depth used by the LUAI_MAXCCALLS overflow guard.
     pub fn getCcalls(th: *const Thread) u16 {
@@ -11091,7 +11195,7 @@ pub const Vm = struct {
         }
         // Nested coroutine: bubble path needs owned values because
         // finishNestedBytecodeCoroutine frees thread.yielded.
-        const values = thread.yielded.slice() orelse &[_]Value{};
+        const values = thread.yieldedValues() orelse &[_]Value{};
         return .{ .yielded = try self.alloc.dupe(Value, values) };
     }
 
@@ -12178,7 +12282,7 @@ pub const Vm = struct {
                                     continue :drive;
                                 }
                                 // Not recovered: unrecoverable error
-                                if (active.yielded.slice() != null and active.capture_yield_id != 0) {
+                                if (active.yieldedValues() != null and active.capture_yield_id != 0) {
                                     step = try self.bytecodeCoroutineYieldStep(active, active == initial);
                                 } else if (active.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
                                     step = .forced_close;
@@ -21716,23 +21820,64 @@ pub const Vm = struct {
         // frames; the dead-error path captures once at the terminal
         // boundary. The old per-yield 64-name walk was hot-path work for
         // debug output that is almost never requested.
-        // P16.3: setFrom stores inline for <= INLINE_VALUES_CAP values — the
-        // dominant `coroutine.yield(v)` (0-4 values) does not touch the heap.
+        // P16.38 Cut 3: PUC stores the yielded values on the yielding
+        // thread's stack (lua_yieldk saves only the count; the resumer's
+        // auxresume xmove copies them out). When our args are already the
+        // caller frame's call window in th.bytecode_stack, park a SPAN
+        // instead of copying — the resume tail copies them out (PUC's
+        // xmove) and clears. Cold paths whose args are not stably
+        // stack-resident keep an owned copy: C API lua_yieldk (args on
+        // c_stack), debug-hook yields (the hook frame is popped right
+        // after capture — PUC also forbids hook yields carrying values),
+        // and __close-transport yields (testc_close_metamethod_depth).
         th.yielded.deinit(self.alloc);
-        if (args.len > INLINE_VALUES_CAP) {
-            if (self.stats.enabled) self.stats.yield_allocs += 1; // P16.0b (heap spill only)
+        const arg_span: ?YieldSpan = if (!in_debug_hook and self.testc_close_metamethod_depth == 0)
+            th.yieldArgSpan(args)
+        else
+            null;
+        if (arg_span) |sp| {
+            th.yielded = .{ .span = sp };
+        } else {
+            // P16.3: setFrom stores inline for <= INLINE_VALUES_CAP values —
+            // the dominant `coroutine.yield(v)` (0-4 values) does not touch
+            // the heap.
+            if (args.len > INLINE_VALUES_CAP) {
+                if (self.stats.enabled) self.stats.yield_allocs += 1; // P16.0b (heap spill only)
+            }
+            try th.yielded.setOwnedCopy(self.alloc, args);
         }
-        try th.yielded.setFrom(self.alloc, args);
         if (self.active_builtin) |id| {
             th.suspended_builtin = id;
-            th.suspended_builtin_args.deinit(self.alloc);
-            if (self.active_builtin_args) |builtin_args| {
-                // P16.3: inline for <= INLINE_VALUES_CAP (the dominant yield
-                // from a builtin carries 0-2 args).
-                if (builtin_args.len > INLINE_VALUES_CAP) {
-                    if (self.stats.enabled) self.stats.yield_allocs += 1; // P16.0b (heap spill only)
+            // P16.38 Cut 3B: suspended_builtin_args is read ONLY by
+            // debug.getlocal when the suspended thread has NO parked Lua
+            // frame (pure-C suspension: testC base yield/yieldk). On every
+            // path with a Lua frame the getlocal walk answers from that
+            // frame and returns before reaching the args read — the
+            // per-cycle copy was pure waste (the second memcpy in the
+            // callgrind profile). Write it only when it can be read.
+            // (At this point bytecode_inplace_suspended is not set yet —
+            // the park branches below own it — so test the frames
+            // directly, mirroring threadCurrentParkedRuntimeFrame's
+            // non-C-frame search.)
+            var has_lua_frame = false;
+            for (0..th.call_frames.len()) |fi| {
+                if (!th.call_frames.getConstPtr(fi).isC()) {
+                    has_lua_frame = true;
+                    break;
                 }
-                try th.suspended_builtin_args.setFrom(self.alloc, builtin_args);
+            }
+            if (!has_lua_frame) {
+                th.suspended_builtin_args.deinit(self.alloc);
+                if (self.active_builtin_args) |builtin_args| {
+                    // P16.3: inline for <= INLINE_VALUES_CAP (the dominant yield
+                    // from a builtin carries 0-2 args).
+                    if (builtin_args.len > INLINE_VALUES_CAP) {
+                        if (self.stats.enabled) self.stats.yield_allocs += 1; // P16.0b (heap spill only)
+                    }
+                    try th.suspended_builtin_args.setFrom(self.alloc, builtin_args);
+                }
+            } else {
+                th.suspended_builtin_args.deinit(self.alloc);
             }
         } else {
             th.suspended_builtin = null;
@@ -22264,7 +22409,7 @@ pub const Vm = struct {
                             // do NOT restore the old value.
                             // Return yield results.
                             yielded = true;
-                            const ys = th.yielded.slice() orelse &[_]Value{};
+                            const ys = th.yieldedValues() orelse &[_]Value{};
                             if (ys.len > 0) {
                                 payload = try self.alloc.alloc(Value, ys.len);
                                 payload_heap = true;
@@ -22722,7 +22867,7 @@ pub const Vm = struct {
                                     break :retblk null;
                                 },
                                 error.RuntimeError => {
-                                    if (th.yielded.slice() != null and th.capture_yield_id != 0) {
+                                    if (th.yieldedValues() != null and th.capture_yield_id != 0) {
                                         yielded = true;
                                         break :retblk null;
                                     }
@@ -22764,7 +22909,7 @@ pub const Vm = struct {
 
         if (!want_out) {
             // Caller ignores results. Still follow resume semantics and do not throw.
-            if (yielded or th.yielded.slice() != null) {
+            if (yielded or th.yieldedValues() != null) {
                 th.yielded.deinit(self.alloc);
                 th.status = .suspended;
                 th.api_status = 1; // LUA_YIELD
@@ -22800,8 +22945,8 @@ pub const Vm = struct {
         }
 
         // Yield path: return yielded values (set by coroutine.yield).
-        if (yielded or th.yielded.slice() != null) {
-            const ys = th.yielded.slice() orelse &[_]Value{};
+        if (yielded or th.yieldedValues() != null) {
+            const ys = th.yieldedValues() orelse &[_]Value{};
             outs[0] = .{ .Bool = true };
             const n = @min(ys.len, outs.len - 1);
             for (0..n) |i| outs[1 + i] = ys[i];
@@ -25842,7 +25987,7 @@ pub const Vm = struct {
                         try self.gcMarkValue(hv);
                     }
                 }
-                if (th.yielded.slice()) |ys| {
+                if (th.yieldedValues()) |ys| {
                     for (ys) |yv| {
                         if (GcObject.fromValue(yv) != null) {
                             try self.gcMarkValue(yv);
@@ -28210,6 +28355,16 @@ pub const Vm = struct {
         return if (self.debugResolveFrameWithIndex(level)) |r| r.frame else null;
     }
 
+    /// P16.38 T4.1: does the call_frames entry at `index` have a real callee
+    /// directly above it? A debug-hook frame above means the frame is
+    /// "current" in PUC's sense (the hook runs on the same CallInfo), so it
+    /// gets PUC's full L->top window, not the callee-bounded one.
+    fn debugFrameHasRealCalleeAbove(self: *Vm, index: usize) bool {
+        const th = self.activeBytecodeThread();
+        if (index + 1 >= th.call_frames.len()) return false;
+        return !th.call_frames.getConstPtr(index + 1).isDebugHook();
+    }
+
     fn debugResolveFrameWithIndex(self: *Vm, level: usize) ?struct { frame: *CallFrame, index: usize } {
         // Walk Thread.call_frames (bytecode, most recent first).
         var visible: usize = 0;
@@ -29039,7 +29194,41 @@ pub const Vm = struct {
         };
     }
 
-    fn debugGetLocalFromBytecodeFrame(self: *Vm, fr: *const Frame, proto: *const bc.Proto, idx: i64, outs: []Value, th: ?*Thread) DispatchError!void {
+    /// P16.38 T4.1: PUC luaG_findlocal's window limit (ldebug.c:196): a
+    /// frame's accessible temporary window ends at its innermost callee's
+    /// func slot (`limit = ci->next->func.p`) whenever a callee is running;
+    /// the CURRENT frame (PUC `L->ci`) uses the full window (`L->top`).
+    /// Returns the callee's register A when `fr` sits at an
+    /// OP_CALL/OP_TAILCALL with a live callee:
+    ///  - suspended thread (th != null): every non-hook suspension parks at
+    ///    the call that yielded (builtin or C function) — that callee is
+    ///    conceptually above the frame, exactly PUC's yield C frame whose
+    ///    func slot bounds the parked Lua frame's window;
+    ///  - active thread: a frame directly above exists in call_frames and
+    ///    is not a debug-hook frame (a hook frame above means the frame is
+    ///    "current" in PUC's sense — the hook runs on the same CallInfo, so
+    ///    PUC would give it the full L->top window).
+    /// Null otherwise (current frame / hook-yield parking): the full
+    /// live_reg_top window applies, matching PUC's L->top.
+    fn debugTempCalleeBound(
+        fr: *const Frame,
+        proto: *const bc.Proto,
+        th: ?*Thread,
+        frames_above: bool,
+    ) ?u8 {
+        const pc = fr.u.lua.pc;
+        if (pc >= proto.code.len) return null;
+        const inst = proto.code[pc];
+        const op: bc.Op = @enumFromInt(inst.op);
+        if (op != .call and op != .tailcall) return null;
+        if (th) |t| {
+            if (t.bytecode_inplace_suspended and !t.yielded_from_debug_hook) return inst.a;
+            return null;
+        }
+        return if (frames_above) inst.a else null;
+    }
+
+    fn debugGetLocalFromBytecodeFrame(self: *Vm, fr: *const Frame, proto: *const bc.Proto, idx: i64, outs: []Value, th: ?*Thread, frames_above: bool) DispatchError!void {
         // P15.51g: Derive regs from base + frame_cap (no cached slice).
         // Pass th so parked coroutines resolve to th.bytecode_stack.
         const stack = stackForThread(self, th);
@@ -29116,14 +29305,21 @@ pub const Vm = struct {
         // bound, stale values from a previous frame's window would be exposed
         // as phantom temporaries. Fall back to full window for legacy/external
         // protos that lack live_reg_top.
+        // P16.38 T4.1: PUC's limit is the innermost callee's func slot when a
+        // callee is running (ci->next->func.p) — without this, the parked
+        // frame's call-argument registers (which hold the yielded values on
+        // the span path) would be exposed as "(temporary)" slots that PUC
+        // keeps unreachable, and debug.setlocal could mutate them.
+        const callee_bound = debugTempCalleeBound(fr, proto, th, frames_above);
         const live_top: usize = if (fr.u.lua.pc < proto.live_reg_top.len)
             @min(proto.live_reg_top[fr.u.lua.pc], fr_regs.len)
         else if (proto.live_reg_top.len > 0)
             @min(fr.reg_top, fr_regs.len) // P16.21 T5: legacy-proto fallback
         else
             fr_regs.len;
+        const temp_top: usize = if (callee_bound) |b| @min(live_top, b) else live_top;
         var reg: usize = 0;
-        while (reg < live_top) : (reg += 1) {
+        while (reg < temp_top) : (reg += 1) {
             if (instruction_temp != null and instruction_temp.? == reg) continue;
             if ((reg < 256 and active_regs.isSet(reg)) or fr_regs[reg] == .Nil) continue;
             switch (fr_regs[reg]) {
@@ -29140,7 +29336,7 @@ pub const Vm = struct {
         }
     }
 
-    fn debugSetLocalInBytecodeFrame(self: *Vm, fr: *Frame, proto: *const bc.Proto, idx: i64, value: Value, outs: []Value, th: ?*Thread) DispatchError!void {
+    fn debugSetLocalInBytecodeFrame(self: *Vm, fr: *Frame, proto: *const bc.Proto, idx: i64, value: Value, outs: []Value, th: ?*Thread, frames_above: bool) DispatchError!void {
         // P15.51g: Derive regs from base + frame_cap (no cached slice).
         // Pass th so parked coroutines resolve to th.bytecode_stack.
         const stack = stackForThread(self, th);
@@ -29205,14 +29401,19 @@ pub const Vm = struct {
 
         // Bound the temp-scan by live_reg_top[pc] — same as getlocal.
         // Fall back to full window for legacy/external protos without it.
+        // P16.38 T4.1: same callee bound as getlocal — PUC's limit
+        // (ci->next->func.p) keeps the parked call's argument registers
+        // (the span-held yielded values) unreachable by setlocal too.
+        const callee_bound = debugTempCalleeBound(fr, proto, th, frames_above);
         const live_top: usize = if (fr.u.lua.pc < proto.live_reg_top.len)
             @min(proto.live_reg_top[fr.u.lua.pc], fr_regs.len)
         else if (proto.live_reg_top.len > 0)
             @min(fr.reg_top, fr_regs.len) // P16.21 T5: legacy-proto fallback
         else
             fr_regs.len;
+        const temp_top: usize = if (callee_bound) |b| @min(live_top, b) else live_top;
         var reg: usize = 0;
-        while (reg < live_top) : (reg += 1) {
+        while (reg < temp_top) : (reg += 1) {
             if (instruction_temp != null and instruction_temp.? == reg) continue;
             if ((reg < 256 and active_regs.isSet(reg)) or fr_regs[reg] == .Nil) continue;
             switch (fr_regs[reg]) {
@@ -29229,11 +29430,14 @@ pub const Vm = struct {
         }
     }
 
-    fn debugGetLocalFromFrame(self: *Vm, fr: *const Frame, idx: i64, outs: []Value) DispatchError!void {
+    /// P16.38 T4.1: `frames_above` = a non-hook frame directly above `fr` in
+    /// the active thread's call_frames (a real callee) — see
+    /// debugTempCalleeBound. Computed by the level-walk callers.
+    fn debugGetLocalFromFrame(self: *Vm, fr: *const Frame, idx: i64, outs: []Value, frames_above: bool) DispatchError!void {
         // All frames are bytecode frames; delegate to the bytecode path.
         // Active thread → th=null → stackForThread returns self.bc_stack.
         const proto = fr.proto() orelse return;
-        return self.debugGetLocalFromBytecodeFrame(fr, proto, idx, outs, null);
+        return self.debugGetLocalFromBytecodeFrame(fr, proto, idx, outs, null, frames_above);
     }
 
     fn threadCurrentParkedRuntimeFrame(th: *Thread) ?*CallFrame {
@@ -29270,11 +29474,12 @@ pub const Vm = struct {
         }
     }
 
-    fn debugSetLocalInFrame(self: *Vm, fr: *Frame, idx: i64, val: Value, outs: []Value) DispatchError!void {
+    /// P16.38 T4.1: `frames_above` — see debugGetLocalFromFrame.
+    fn debugSetLocalInFrame(self: *Vm, fr: *Frame, idx: i64, val: Value, outs: []Value, frames_above: bool) DispatchError!void {
         // All frames are bytecode frames; delegate to the bytecode path.
         // Active thread → th=null → stackForThread returns self.bc_stack.
         const proto = fr.proto() orelse return;
-        return self.debugSetLocalInBytecodeFrame(fr, proto, idx, val, outs, null);
+        return self.debugSetLocalInBytecodeFrame(fr, proto, idx, val, outs, null, frames_above);
     }
 
     fn builtinDebugGetlocal(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -29299,8 +29504,18 @@ pub const Vm = struct {
                 if (target_thread) |th| {
                     if (level < 0 or level > 1 or local_index < 1) return;
                     if (threadCurrentParkedRuntimeFrame(th)) |fr| {
+                        // P16.38 T4.1 (PUC differential): level 0 of a
+                        // coroutine suspended at a non-hook builtin/C yield
+                        // is the yield C frame in PUC — its window is EMPTY
+                        // by the time Lua can observe it (auxresume's
+                        // lua_xmove moved the yielded values to the resumer
+                        // when resume returned), so getlocal(co, 0, n) is
+                        // nil for every n. Level 1 is the parked Lua frame.
+                        // Hook yields keep level 0 = the interrupted Lua
+                        // frame (PUC: the hook runs on the current CallInfo).
+                        if (level == 0 and !th.yielded_from_debug_hook) return;
                         const proto = fr.proto() orelse return;
-                        try self.debugGetLocalFromBytecodeFrame(fr, proto, local_index, outs, th);
+                        try self.debugGetLocalFromBytecodeFrame(fr, proto, local_index, outs, th, false);
                         return;
                     }
                     if (th.suspended_builtin != null) {
@@ -29334,7 +29549,8 @@ pub const Vm = struct {
                     return;
                 }
                 const lv: usize = @intCast(level);
-                const fr = self.debugResolveFrameIndex(lv) orelse return self.fail("bad level", .{});
+                const resolved = self.debugResolveFrameWithIndex(lv) orelse return self.fail("bad level", .{});
+                const fr = resolved.frame;
                 if (self.isInDebugHook() and lv == 2) {
                     if (self.activeDebugTransferValues()) |vals| {
                         const start = self.activeDebugTransferStart();
@@ -29348,7 +29564,10 @@ pub const Vm = struct {
                         }
                     }
                 }
-                try self.debugGetLocalFromFrame(fr, local_index, outs);
+                // P16.38 T4.1: a non-hook frame directly above = a real
+                // callee running on this frame's current call — PUC bounds
+                // its temp window at the callee's func slot.
+                try self.debugGetLocalFromFrame(fr, local_index, outs, self.debugFrameHasRealCalleeAbove(resolved.index));
             },
             .Closure => |cl| {
                 if (cl.proto) |proto| {
@@ -29382,16 +29601,32 @@ pub const Vm = struct {
                 if (target_thread) |th| {
                     if (level < 0 or level > 1 or local_index < 1) return;
                     if (threadCurrentParkedRuntimeFrame(th)) |fr| {
+                        // P16.38 T4.1 (PUC differential): PUC's db_setlocal
+                        // pushes the value onto the coroutine's stack BEFORE
+                        // lua_setlocal, so the yield C frame's empty window
+                        // momentarily holds one slot and setlocal(co, 0, 1)
+                        // reports "(C temporary)". The write lands in the
+                        // stale first-yield-value slot, which the next
+                        // resume's poscall overwrites and getlocal can never
+                        // read back — unobservable. Mirror the name, skip
+                        // the dead write (our span-held values must not be
+                        // mutated through this artifact). n >= 2: nil.
+                        if (level == 0 and !th.yielded_from_debug_hook) {
+                            if (local_index == 1) {
+                                if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(C temporary)") };
+                            }
+                            return;
+                        }
                         const proto = fr.proto() orelse return;
-                        try self.debugSetLocalInBytecodeFrame(fr, proto, local_index, new_value, outs, th);
+                        try self.debugSetLocalInBytecodeFrame(fr, proto, local_index, new_value, outs, th, false);
                         return;
                     }
                     return;
                 }
                 if (level < 1) return self.fail("bad level", .{});
                 const lv: usize = @intCast(level);
-                const fr = self.debugResolveFrameIndex(lv) orelse return self.fail("bad level", .{});
-                try self.debugSetLocalInFrame(fr, local_index, new_value, outs);
+                const resolved = self.debugResolveFrameWithIndex(lv) orelse return self.fail("bad level", .{});
+                try self.debugSetLocalInFrame(resolved.frame, local_index, new_value, outs, self.debugFrameHasRealCalleeAbove(resolved.index));
             },
             .Closure, .Builtin => {},
             else => return self.fail("bad argument #1 to 'setlocal' (function or level expected)", .{}),
@@ -43254,8 +43489,17 @@ pub const Vm = struct {
         t[@intFromEnum(BuiltinId.coroutine_running)] = 2;
         t[@intFromEnum(BuiltinId.pcall)] = 256;
         t[@intFromEnum(BuiltinId.xpcall)] = 256;
-        t[@intFromEnum(BuiltinId.coroutine_resume)] = 8;
-        t[@intFromEnum(BuiltinId.coroutine_yield)] = 8;
+        // P16.38 Cut 3: resume/yield results are fundamentally unknowable at
+        // call time (resume returns the NEXT yield's values or the body's
+        // returns; yield returns the NEXT resume's args), so they use the
+        // architecture's unbounded-result convention window (256, like
+        // pcall/xpcall/wrap_iter/testC above). The old 8-slot window
+        // silently truncated every resume/yield to 7 values (PUC returns
+        // all: its C stack IS the outs window, ldo.c luaD_poscall). Both
+        // report the true count via last_builtin_out_count (dynamic set),
+        // so `produced` stays exact up to the window bound.
+        t[@intFromEnum(BuiltinId.coroutine_resume)] = 256;
+        t[@intFromEnum(BuiltinId.coroutine_yield)] = 256;
         t[@intFromEnum(BuiltinId.coroutine_close)] = 2;
         t[@intFromEnum(BuiltinId.coroutine_wrap_iter)] = 256;
         t[@intFromEnum(BuiltinId.next)] = 2;

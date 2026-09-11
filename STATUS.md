@@ -1,4 +1,4 @@
-> Last updated: 2026-09-11 (P16.38 COMPLETE)
+> Last updated: 2026-09-11 (P16.39 COMPLETE — dispatch truth: floor 61/28 i/it (1.17x cycles), kernel matrix, builtin-call Cut 3 (K5 −121); geomean 1.42076)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -36,9 +36,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **79/79** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.44x** |
+| Performance (geomean vs PUC) | **1.42x** |
 
-Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.42x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -6282,6 +6282,31 @@ bimodal workload (свежие доказательства: 12-прогонов
 1,798,648,270 = data-dependent path split; P16.36 менял только
 coroutine/error/gsub-пути); controls lua_calls +1.6%, branch_loop −1.0%,
 int_arith +0.4%; baseline-approved = **1.45349 (P16.36-final)**.
+
+### P16.39 COMPLETE: fresh dispatch truth + builtin-call cut (2026-09-09)
+**Geomean 1.44094 → 1.42076** (measured `280f6bd` clean; 18/18 OK,
+0 WARN/FAIL). Truth-first фаза: "+843 dispatch floor" разложен причинно.
+
+- **Cut 0 (`862bec7`)**: финальная layout-истина (Vm/Thread/CallFrame/
+  LuaFrameState/YieldedValues D+RF); stale-комментарии active/parked.
+- **Cut 1 (`7a3bea3`)**: свежий floor: **K1 61 vs 28 i/it (2.18x instr,
+  1.17x cycles!)** = head 13 (i/fetch=15 vs PUC 7) + FORLOOP 37 (вкл.
+  5 sigint/back-edge vs 0) + continuation 11. p16.10 70-vs-28 устарел.
+- **Cut 2 (`4b6792c`)**: kernel-матрица K1-K6 с D-бакетами:
+  K1 61/28, K2 101/60, K3 218.5/139.5, K4 395/224, **K5 builtin 830/251
+  (3.31x — ХУДШИЙ)**, K6 2056/980. K6 = W321+D1 143+D2 256+D3 96+D6 449+
+  D7 68+D8 55+D9 658. Parity-победы: PUC платит 101 (global lookups) +
+  89 (setjmp/longjmp), zig ~0. **Допущение floor-доминированности
+  ОПРОВЕРГНУТО** — builtin/call-пути доминируют во всех не-floor workloads.
+- **Cut 3 (`280f6bd`)**: builtin OP_CALL residue: **K5 830→709 i/it (−121)**
+  (savestack-дисциплина = PUC ldo.c:277; pushBuiltinCFrame→grew; outs-window
+  gated к reentrant; GC-guard → allocation-adjacent). Официальный suite flat
+  (нет builtin-dominated ворклоада); честная история: код начал
+  rate-limited сабагент, полностью переверифицирован напрямую.
+- Финальные K: K4 395/224, K5 709/251 (2.82x), K6 ~2028/983.
+
+Гейт: matrix 31/32 zig_fail=0, smoke 79/79, c_api 50+diff, api580,
+TBC 22+23, unit D+RF; geomean 1.42076.
 
 ## История закрытых фаз
 

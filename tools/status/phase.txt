@@ -1,1 +1,1 @@
-P16.38 Cut 1
+P16.39 COMPLETE — dispatch truth: floor 61/28 i/it (1.17x cycles), kernel matrix, builtin-call Cut 3 (K5 −121); geomean 1.42076

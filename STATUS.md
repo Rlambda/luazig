@@ -10963,3 +10963,48 @@ src/-правки — R0.3 комментарии, behavior-neutral).
 - **P16.39 queue status**: закрыт подготовительный пункт truth/hygiene
   (воспроизведение + layout + комментарии); очередь 1-7 из P16.38 final
   wrap остаётся открытой, Cut 1+2 закрывают пункт 1 (dispatch floor).
+
+## P16.39 Cut 1 — свежий чистый dispatch floor + точная декомпозиция executed-path (2026-09-11)
+
+Cut 1 фазы P16.39: НЕТ runtime-изменений (только измерения и артефакт).
+Закрывает пункт 1 очереди (dispatch floor) в части floor + декомпозиции;
+Cut 2 (kernel matrix) — следующая часть.
+
+- **C1.1 floor регенерирован** (`tools/perf_dispatch_floor.py --no-build`,
+  head `862bec7`, zig sha16 `c134caa825828c37`, puc `d54bc45e1757b216`;
+  артефакт `tools/perf/current-dispatch-floor.json`, workload
+  `/tmp/dispatch_floor/forloop_only.lua` = FORPREP+FORLOOP only,
+  verified via --dump-bytecode): **zig 61.02 i/it, 12.15 cycles/it,
+  7.00 branches/it, IPC 5.02, 3.21 ns/it; puc 28.00 i/it, 10.35 cycles/it,
+  5.00 branches/it, IPC 2.71, 2.74 ns/it** (ratio 2.18x instr / 1.17x
+  cycles / 1.17x wall). Историческая эра P16.10: zig ~70 / puc 28.
+- **C1.2 точная декомпозиция executed-path** (callgrind `--dump-instr`,
+  n-vs-2n slope 20k/40k, все адреса сверены с objdump instruction-starts;
+  каждая инструкция пути исполняется ровно 1 раз за итерацию):
+  - **zig = 61.000 i/it ТОЧНО** (= perf 61.02): head **13** + FORLOOP
+    handler **37** + jump-continuation **11**.
+    - head 13 = fetch 4 (spill-reload cur_proto, spill-reload pc,
+      load code.ptr, load inst) + gate 3 (dispatch_gate movzbl+test+je)
+      + dispatch 6 (op movzbl+and, table lea+movslq+add, jmp*).
+    - continuation 11 = pc-apply 6 (shr offset, spill-reload pc, movswq,
+      add, inc, spill-store pc) + **sigint 5** (local testb+je not-taken,
+      pending movzbl+test+je taken).
+  - **puc = 28.000 i/it ТОЧНО** (= perf 28.00): head **5** (lea pc+1,
+    fetch, mov, and, jmp* scaled-index — БЕЗ spill-reload'ов: pc в
+    регистре %r14, БЕЗ gate, scaled-index jmp не требует lea/movslq/add)
+    + FORLOOP 23 (tag-check 7, count-check 3, body+pc-adjust+back-jmp 13).
+- **C1.3 i/fetch verdict**: простой опкод = **15 i/fetch** (head 13 +
+  incq pc + jmp back-edge) — НЕ ИЗМЕНИЛСЯ от P16.34 post-cuts (15),
+  верх ожидаемого диапазона 13-15. Ранее не сходившийся статический
+  подсчёт 58 vs 61.02 ЗАКРЫТ: continuation = 11, а не 8 — 3 инструкции
+  sigint-pending-чека исполняются каждую итерацию (CLI ставит sigint
+  handler → check_sigint=true; PUC в этом пути не имеет НИ ОДНОЙ
+  hook/sigint-инструкции — 5 i/it наш sigint-чек на back-edge против 0
+  у PUC; дизайн задокументирован в P16.10 T8, latency-parity сохранена).
+- **C1.4 разрыв zig−puc = 33 i/it**: head +8 (2 spill-reload + 3 gate +
+  3 адресация таблицы), handler+continuation +25 (regs-base spill-reload
+  ×3, 3 tag-store на итерацию, pc через spill-store против регистрового
+  pc у PUC, sigint +5). Это вход для Cut 2 D-бакетов.
+- Гейты не применимы (src/ не менялся); контроль: perf 61.02/28.00 ==
+  callgrind slope 61.000/28.000 (двойная сверка двумя независимыми
+  инструментами).

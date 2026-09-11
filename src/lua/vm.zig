@@ -20126,6 +20126,13 @@ pub const Vm = struct {
         const reg = try self.ensureDebugRegistry();
         try self.setField(reg, "_LOADED", .{ .Table = loaded_tbl });
         try self.setField(reg, "_PRELOAD", .{ .Table = preload_tbl });
+        // PUC registers the globals table in package.loaded under "_G"
+        // (lbaselib.c luaopen_base: `lua_pushvalue(L, LUA_GLOBALSINDEX);
+        // lua_setfield(L, -2, "_G")` on the loaded table). This is what
+        // `require("_G")` reads and — importantly for error messages —
+        // what pushglobalfuncname's loaded-table search walks to resolve
+        // global functions (setmetatable, error, ...) to their names.
+        try self.setField(loaded_tbl, "_G", .{ .Table = self.global_env });
         try self.setGlobal("package", .{ .Table = package_tbl });
 
         // os = core process/filesystem helpers
@@ -36191,7 +36198,7 @@ pub const Vm = struct {
 
     fn builtinTableUnpack(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) return self.fail("table.unpack expects table", .{});
-        try self.checkTabArg(args[0], .{ .read = true, .len = true }, "unpack");
+        try self.checkTabArg(args[0], .{ .read = true, .len = true }, 1, "unpack");
         const tobj = args[0];
         const start_idx0: i64 = if (args.len >= 2) switch (args[1]) {
             .Nil => 1,
@@ -36301,13 +36308,13 @@ pub const Vm = struct {
     fn builtinTableMove(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len > 0) outs[0] = .Nil;
         if (args.len < 4) return self.fail("bad argument #1 to 'move' (table expected)", .{});
-        try self.checkTabArg(args[0], .{ .read = true }, "move");
+        try self.checkTabArg(args[0], .{ .read = true }, 1, "move");
         const src = args[0];
         const f = try self.tableMoveArgToInt(args[1], 2);
         const e = try self.tableMoveArgToInt(args[2], 3);
         const t = try self.tableMoveArgToInt(args[3], 4);
         const dst = if (args.len >= 5) blk: {
-            try self.checkTabArg(args[4], .{ .write = true }, "move");
+            try self.checkTabArg(args[4], .{ .write = true }, 4, "move");
             break :blk args[4];
         } else src;
 
@@ -36348,7 +36355,7 @@ pub const Vm = struct {
     fn builtinTableConcat(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("table expected", .{});
-        try self.checkTabArg(args[0], .{ .read = true, .len = true }, "concat");
+        try self.checkTabArg(args[0], .{ .read = true, .len = true }, 1, "concat");
         const tobj = args[0];
         const sep = if (args.len >= 2) switch (args[1]) {
             .String => |s| s.bytes(),
@@ -36433,7 +36440,7 @@ pub const Vm = struct {
     fn builtinTableInsert(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = outs;
         if (args.len < 2 or args.len > 3) return self.fail("wrong number of arguments to 'insert'", .{});
-        try self.checkTabArg(args[0], .{ .read = true, .write = true, .len = true }, "insert");
+        try self.checkTabArg(args[0], .{ .read = true, .write = true, .len = true }, 1, "insert");
         const tobj = args[0];
         const len_v = try self.evalUnOp(.Hash, tobj);
         const len: i64 = switch (len_v) {
@@ -36464,7 +36471,7 @@ pub const Vm = struct {
 
     fn builtinTableRemove(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) return self.fail("table.remove expects table", .{});
-        try self.checkTabArg(args[0], .{ .read = true, .write = true, .len = true }, "remove");
+        try self.checkTabArg(args[0], .{ .read = true, .write = true, .len = true }, 1, "remove");
         const tobj = args[0];
         const len_v = try self.evalUnOp(.Hash, tobj);
         const len: i64 = switch (len_v) {
@@ -36506,22 +36513,50 @@ pub const Vm = struct {
         if (outs.len > 0) outs[0] = removed;
     }
 
+    /// PUC `ltablib.c` `sort_comp` (line 271): the comparator is invoked via
+    /// `lua_call(L, 2, 1)` — i.e. `lua_callk` with `k == NULL` (`lapi.c:1037`)
+    /// → `luaD_callnoyield` (`ldo.c:783`) → `ccall(nyci = 0x10000|1)`. The
+    /// whole comparator invocation therefore runs under ONE non-yieldable
+    /// C-call boundary:
+    ///   - `L->nCcalls += inc` happens BEFORE `luaD_precall` (`ldo.c:652`
+    ///     precallC), so the comparator's CALL hook fires INSIDE the window;
+    ///   - any yield attempt inside the comparator — a closure calling
+    ///     `coroutine.yield`, a builtin `coroutine.yield` passed directly as
+    ///     the comparator, a yield nested behind pcall — fails AT THE YIELD
+    ///     SITE with "attempt to yield across a C-call boundary"
+    ///     (`builtinCoroutineYield`'s `th.yieldable()` check; the message is
+    ///     bare because `callBuiltin` pushes the yield's own C-frame first,
+    ///     exactly like PUC's `luaB_yield` C-frame on top of the stack);
+    ///   - comparator errors propagate to the sort caller UNWRAPPED — PUC's
+    ///     "invalid order function for sorting" comes only from the
+    ///     partition invariant violation (`ltablib.c` `partition`), never
+    ///     from `sort_comp`;
+    ///   - `nCcalls -= inc` on return; nested sorts accumulate nny units
+    ///     (`yieldable` tests the upper bits for == 0, so nesting is safe).
+    ///
+    /// P16.37 Cut 1: the unit is entered BEFORE the callable is activated
+    /// (`resolveCallable` may run `__call` metamethods — PUC `tryfuncTM`
+    /// runs inside the ccall window) and the Zig `defer` covers BOTH the
+    /// normal return and the error unwind. If this frame is unwound past
+    /// (pcall recovery), the existing nCcalls snapshot model
+    /// (`BytecodeProtectedCall.saved_ncalls`, vm.zig:864, restored at the
+    /// recovery boundary vm.zig:8224) reclaims the unit — the same model
+    /// P16.36 Cut 3 proven for gsub repl/`__index` continuations.
+    /// The old `id == .coroutine_yield` comparator special cases (fail
+    /// BEFORE the call, wrapping the message with a position prefix) are
+    /// deleted: the natural `callBuiltin` path produces the exact PUC
+    /// behavior and message.
     fn tableSortLess(self: *Vm, cmp_fn: ?Value, a: Value, b: Value) DispatchError!bool {
         if (cmp_fn) |cf| {
+            const th = self.activeBytecodeThread();
+            try self.ccallEnter(th, .nonyieldable);
+            defer th.ccallExit(.nonyieldable);
             var outv: Value = .Nil;
             switch (cf) {
                 .Builtin => |id| {
-                    if (id == .coroutine_yield) {
-                        return self.fail("attempt to yield across a C-call boundary", .{});
-                    }
                     var outs1 = [_]Value{.Nil};
                     const call_args = [_]Value{ a, b };
-                    self.callBuiltin(id, call_args[0..], outs1[0..]) catch {
-                        if (id == .coroutine_yield) {
-                            return self.fail("attempt to yield across a C-call boundary", .{});
-                        }
-                        return self.fail("invalid order function for sorting ('{s}')", .{id.name()});
-                    };
+                    try self.callBuiltin(id, call_args[0..], outs1[0..]);
                     outv = outs1[0];
                 },
                 .Closure => |cl| {
@@ -36536,16 +36571,8 @@ pub const Vm = struct {
                     defer if (resolved.owned_args) |owned| self.alloc.free(owned);
                     switch (resolved.callee) {
                         .Builtin => |id| {
-                            if (id == .coroutine_yield) {
-                                return self.fail("attempt to yield across a C-call boundary", .{});
-                            }
                             var outs1 = [_]Value{.Nil};
-                            self.callBuiltin(id, resolved.args, outs1[0..]) catch {
-                                if (id == .coroutine_yield) {
-                                    return self.fail("attempt to yield across a C-call boundary", .{});
-                                }
-                                return self.fail("invalid order function for sorting ('{s}')", .{id.name()});
-                            };
+                            try self.callBuiltin(id, resolved.args, outs1[0..]);
                             outv = outs1[0];
                         },
                         .Closure => |cl| {
@@ -36564,7 +36591,14 @@ pub const Vm = struct {
 
     fn tableSortRange(self: *Vm, arr: []Value, cmp_fn: ?Value, lo: usize, hi: usize, depth: usize) DispatchError!void {
         if (hi <= lo) return;
-        if (depth > 128) return self.fail("invalid order function for sorting", .{});
+        // PUC raises "invalid order function for sorting" via luaL_error
+        // (partition invariant violation / recursion malformation), i.e.
+        // luaL_where(L, 1): position comes from the immediate caller of
+        // sort's C-frame — present when sort is called from Lua, ABSENT
+        // when the caller is a C function (pcall(table.sort, ...)).
+        // failArgerror implements exactly that rule; plain fail() would
+        // unconditionally take the top Lua frame's position.
+        if (depth > 128) return self.failArgerror("invalid order function for sorting", .{});
 
         var i = lo;
         var j = hi;
@@ -36592,7 +36626,7 @@ pub const Vm = struct {
     fn builtinTableSort(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = outs;
         if (args.len == 0) return self.fail("table.sort expects table", .{});
-        try self.checkTabArg(args[0], .{ .read = true, .write = true, .len = true }, "sort");
+        try self.checkTabArg(args[0], .{ .read = true, .write = true, .len = true }, 1, "sort");
         const tobj = args[0];
         const cmp: ?Value = if (args.len >= 2 and args[1] != .Nil) args[1] else null;
         const len_v = try self.evalUnOp(.Hash, tobj);
@@ -36602,6 +36636,18 @@ pub const Vm = struct {
         };
         if (len_i64 < 2) return;
         if (len_i64 > 1_000_000) return self.fail("array is too big", .{});
+        // PUC sort (ltablib.c:397-399): `luaL_checktype(L, 2, LUA_TFUNCTION)`
+        // — the comparator must be a function (Lua or C closure). A callable
+        // table does NOT pass: the check is on the raw type tag, before any
+        // __call resolution (same rule as builtinXpcall's handler check).
+        // PUC error format: "bad argument #2 to 'sort' (function expected,
+        // got <type>)", raised via luaL_checktype -> luaL_argerror.
+        if (args.len >= 2 and args[1] != .Nil) {
+            switch (args[1]) {
+                .Closure, .Builtin => {},
+                else => return self.failArgerror("bad argument #2 to 'sort' (function expected, got {s})", .{self.valueTypeName(args[1])}),
+            }
+        }
         const n: usize = @intCast(len_i64);
         var arr = try self.alloc.alloc(Value, n);
         defer self.alloc.free(arr);
@@ -36619,7 +36665,9 @@ pub const Vm = struct {
             var k: usize = 1;
             while (k < n) : (k += 1) {
                 if (try self.tableSortLess(cmp, arr[k], arr[k - 1])) {
-                    return self.fail("invalid order function for sorting", .{});
+                    // Same luaL_error/luaL_where(1) rule as the depth check
+                    // in tableSortRange — see the comment there.
+                    return self.failArgerror("invalid order function for sorting", .{});
                 }
             }
         }
@@ -42849,7 +42897,92 @@ pub const Vm = struct {
     /// and must have the metamethods.
     const TabCheck = struct { read: bool = false, write: bool = false, len: bool = false };
 
-    fn checkTabArg(self: *Vm, v: Value, what: TabCheck, fname: []const u8) DispatchError!void {
+    /// PUC `pushglobalfuncname` (lauxlib.c:74-92): search the registry
+    /// `_LOADED` table for the function value — `findfield` with level 2
+    /// walks each loaded module table's fields — and return the dotted
+    /// name ("table.sort"). A name found inside the "_G" module (the
+    /// globals table, registered in loaded like PUC's luaopen_base) has
+    /// its "_G." prefix stripped, so global functions print unqualified
+    /// ("setmetatable"), exactly like PUC. Returns null when not found.
+    /// The result is written into `buf` (no allocation — error paths must
+    /// not be able to fail with OOM while building a message).
+    fn pushGlobalFuncName(self: *Vm, buf: []u8, func: Value) ?[]const u8 {
+        const reg = self.debug_registry orelse return null;
+        const loaded = switch (self.getFieldOpt(reg, "_LOADED") orelse return null) {
+            .Table => |t| t,
+            else => return null,
+        };
+        // findfield level 2: walk each loaded module table (level 1) and
+        // its fields (level 0 — direct value match). Non-string keys are
+        // ignored, exactly like PUC's findfield.
+        for (loaded.hash) |*mod_node| {
+            if (!ltable.Node.isStringTag(mod_node.key_tt)) continue;
+            if (mod_node.value == .Nil) continue;
+            const mod_table = switch (mod_node.value) {
+                .Table => |t| t,
+                else => continue,
+            };
+            const mod_name = mod_node.key_val.string.bytes();
+            for (mod_table.hash) |*field_node| {
+                if (!ltable.Node.isStringTag(field_node.key_tt)) continue;
+                if (field_node.value == .Nil) continue;
+                // Tag-guarded comparison (reading the wrong union payload
+                // is UB in ReleaseFast — see debugFindGlobalFuncName).
+                const matches = switch (field_node.value) {
+                    .Closure => |cl| func == .Closure and cl == func.Closure,
+                    .Builtin => |b| func == .Builtin and b == func.Builtin,
+                    else => false,
+                };
+                if (!matches) continue;
+                const field_name = field_node.key_val.string.bytes();
+                // "_G." prefix stripped (PUC pushglobalfuncname).
+                if (std.mem.eql(u8, mod_name, "_G")) {
+                    if (field_name.len > buf.len) return null;
+                    @memcpy(buf[0..field_name.len], field_name);
+                    return buf[0..field_name.len];
+                }
+                const total = mod_name.len + 1 + field_name.len;
+                if (total > buf.len) return null;
+                @memcpy(buf[0..mod_name.len], mod_name);
+                buf[mod_name.len] = '.';
+                @memcpy(buf[mod_name.len + 1 .. total], field_name);
+                return buf[0..total];
+            }
+        }
+        return null;
+    }
+
+    /// PUC `luaL_typeerror` for the table-arg check (checktab →
+    /// luaL_typeerror → luaL_argerror):
+    /// "bad argument #<n> to '<name>' (table expected, got <type>)".
+    ///
+    /// `<name>` follows PUC's luaL_argerror name resolution: when the
+    /// raising builtin was called from Lua bytecode, getinfo("n") finds
+    /// the call-site name ('sort' for `table.sort(t)`); when the caller
+    /// is a C function — pcall(table.sort, ...), or sort_comp's lua_call
+    /// on a builtin comparator — there is no call-site name and
+    /// pushglobalfuncname's _LOADED search produces the qualified name
+    /// ("table.sort"). The position follows luaL_where(1): the immediate
+    /// caller of the raising builtin's C-frame; a C caller gives no
+    /// position (failWithPosFrame(null)).
+    fn failTabArgerror(self: *Vm, arg_no: usize, fname: []const u8, v: Value) Error {
+        const pos_frame = self.immediateCallerOfTopCFrame();
+        var name_buf: [128]u8 = undefined;
+        const name = if (pos_frame == null) blk: {
+            // C-context call: PUC ar.name == NULL → pushglobalfuncname.
+            if (self.active_builtin) |id| {
+                if (self.pushGlobalFuncName(&name_buf, .{ .Builtin = id })) |q| break :blk q;
+            }
+            break :blk fname; // not found in loaded: keep the short name
+        } else fname;
+        return self.failWithPosFrame(
+            pos_frame,
+            "bad argument #{d} to '{s}' (table expected, got {s})",
+            .{ arg_no, name, self.valueTypeName(v) },
+        );
+    }
+
+    fn checkTabArg(self: *Vm, v: Value, what: TabCheck, arg_no: usize, fname: []const u8) DispatchError!void {
         if (v == .Table and asFileTable(self, v) == null) return;
         // Not a real table: must have a metatable with the required metamethods.
         const mt: ?*Table = switch (v) {
@@ -42865,7 +42998,7 @@ pub const Vm = struct {
                 return; // all required metamethods present
             }
         }
-        return self.fail("bad argument #1 to '{s}' (table expected)", .{fname});
+        return self.failTabArgerror(arg_no, fname, v);
     }
 
     fn isTestcLightUserdata(self: *Vm, v: Value) bool {

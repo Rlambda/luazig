@@ -1,178 +1,178 @@
 {
-  "created_utc": "2026-09-10T21:00:04.323353+00:00",
+ "created_utc": "2026-09-11T13:56:44.158624+00:00",
+ "zig_version": "0.16.0",
+ "provenance": {
+  "git_head": "dabfad6",
+  "measured_source_head": "dabfad6",
+  "git_dirty": "clean",
+  "source_dirty": "clean",
+  "artifact_dirty": "clean",
   "zig_version": "0.16.0",
-  "provenance": {
-    "git_head": "164ba0f",
-    "measured_source_head": "164ba0f",
-    "git_dirty": "clean",
-    "source_dirty": "clean",
-    "artifact_dirty": "clean",
-    "zig_version": "0.16.0",
-    "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "a43c3f73608b65d4",
-    "puc_binary_sha16": "d54bc45e1757b216"
+  "optimize_mode": "ReleaseFast",
+  "zig_binary_sha16": "a892306a2856f0b4",
+  "puc_binary_sha16": "d54bc45e1757b216"
+ },
+ "host": {
+  "platform": "Linux-7.1.5-arch1-2-x86_64-with-glibc2.44",
+  "python": "3.11.15"
+ },
+ "runs": 7,
+ "core": "0",
+ "geomean": 1.4299375778709313,
+ "workloads": {
+  "table_alloc_setmetatable": {
+   "zig_s": 0.058198,
+   "puc_s": 0.043002,
+   "ratio": 1.353378912608716
   },
-  "host": {
-    "platform": "Linux-7.1.5-arch1-2-x86_64-with-glibc2.44",
-    "python": "3.11.15"
+  "metamethod_call_noalloc": {
+   "zig_s": 0.015622,
+   "puc_s": 0.008422,
+   "ratio": 1.8549038233198765
   },
-  "runs": 7,
-  "core": "0",
-  "geomean": 1.453487993082536,
-  "workloads": {
-    "string_loop": {
-      "zig_s": 0.119381,
-      "puc_s": 0.096881,
-      "ratio": 1.232243680391408
-    },
-    "metamethod_call_noalloc": {
-      "zig_s": 0.015898,
-      "puc_s": 0.008449,
-      "ratio": 1.881642797964256
-    },
-    "hash_access": {
-      "zig_s": 0.113364,
-      "puc_s": 0.068146,
-      "ratio": 1.6635459161212691
-    },
-    "int_arith": {
-      "zig_s": 0.234424,
-      "puc_s": 0.175931,
-      "ratio": 1.3324769369809755
-    },
-    "metamethod_add": {
-      "zig_s": 0.086682,
-      "puc_s": 0.062135,
-      "ratio": 1.3950591454091896
-    },
-    "temp_table_alloc": {
-      "zig_s": 0.035466,
-      "puc_s": 0.030785,
-      "ratio": 1.1520545720318336
-    },
-    "global_arith": {
-      "zig_s": 0.829533,
-      "puc_s": 0.552382,
-      "ratio": 1.5017379277384126
-    },
-    "string_concat": {
-      "zig_s": 0.084818,
-      "puc_s": 0.078765,
-      "ratio": 1.0768488541865042
-    },
-    "field_access": {
-      "zig_s": 0.102019,
-      "puc_s": 0.056469,
-      "ratio": 1.8066372700065523
-    },
-    "branch_loop": {
-      "zig_s": 0.856898,
-      "puc_s": 0.53087,
-      "ratio": 1.6141390547591692
-    },
-    "table_alloc_setmetatable": {
-      "zig_s": 0.058967,
-      "puc_s": 0.043396,
-      "ratio": 1.3588118720619413
-    },
-    "dynamic_load": {
-      "zig_s": 0.198674,
-      "puc_s": 0.128483,
-      "ratio": 1.5463057369457436
-    },
-    "mixed_arith": {
-      "zig_s": 0.248741,
-      "puc_s": 0.175614,
-      "ratio": 1.4164075757058094
-    },
-    "coroutine_yield": {
-      "zig_s": 0.06868,
-      "puc_s": 0.043391,
-      "ratio": 1.5828167131432787
-    },
-    "lua_calls": {
-      "zig_s": 0.124128,
-      "puc_s": 0.090669,
-      "ratio": 1.3690235913046356
-    },
-    "float_arith": {
-      "zig_s": 0.230041,
-      "puc_s": 0.176443,
-      "ratio": 1.3037694892968268
-    },
-    "array_access": {
-      "zig_s": 0.083112,
-      "puc_s": 0.046524,
-      "ratio": 1.7864328088728398
-    },
-    "comparisons": {
-      "zig_s": 0.857805,
-      "puc_s": 0.5987,
-      "ratio": 1.4327793552697512
-    }
+  "comparisons": {
+   "zig_s": 0.822212,
+   "puc_s": 0.596781,
+   "ratio": 1.3777449349091209
   },
-  "zig": {
-    "string_loop": 0.119381,
-    "metamethod_call_noalloc": 0.015898,
-    "hash_access": 0.113364,
-    "int_arith": 0.234424,
-    "metamethod_add": 0.086682,
-    "temp_table_alloc": 0.035466,
-    "global_arith": 0.829533,
-    "string_concat": 0.084818,
-    "field_access": 0.102019,
-    "branch_loop": 0.856898,
-    "table_alloc_setmetatable": 0.058967,
-    "dynamic_load": 0.198674,
-    "mixed_arith": 0.248741,
-    "coroutine_yield": 0.06868,
-    "lua_calls": 0.124128,
-    "float_arith": 0.230041,
-    "array_access": 0.083112,
-    "comparisons": 0.857805
+  "int_arith": {
+   "zig_s": 0.228816,
+   "puc_s": 0.172417,
+   "ratio": 1.3271081157890463
   },
-  "puc": {
-    "string_loop": 0.096881,
-    "metamethod_call_noalloc": 0.008449,
-    "hash_access": 0.068146,
-    "int_arith": 0.175931,
-    "metamethod_add": 0.062135,
-    "temp_table_alloc": 0.030785,
-    "global_arith": 0.552382,
-    "string_concat": 0.078765,
-    "field_access": 0.056469,
-    "branch_loop": 0.53087,
-    "table_alloc_setmetatable": 0.043396,
-    "dynamic_load": 0.128483,
-    "mixed_arith": 0.175614,
-    "coroutine_yield": 0.043391,
-    "lua_calls": 0.090669,
-    "float_arith": 0.176443,
-    "array_access": 0.046524,
-    "comparisons": 0.5987
+  "temp_table_alloc": {
+   "zig_s": 0.034657,
+   "puc_s": 0.030372,
+   "ratio": 1.1410838930593967
   },
-  "ratios": {
-    "string_loop": 1.232243680391408,
-    "metamethod_call_noalloc": 1.881642797964256,
-    "hash_access": 1.6635459161212691,
-    "int_arith": 1.3324769369809755,
-    "metamethod_add": 1.3950591454091896,
-    "temp_table_alloc": 1.1520545720318336,
-    "global_arith": 1.5017379277384126,
-    "string_concat": 1.0768488541865042,
-    "field_access": 1.8066372700065523,
-    "branch_loop": 1.6141390547591692,
-    "table_alloc_setmetatable": 1.3588118720619413,
-    "dynamic_load": 1.5463057369457436,
-    "mixed_arith": 1.4164075757058094,
-    "coroutine_yield": 1.5828167131432787,
-    "lua_calls": 1.3690235913046356,
-    "float_arith": 1.3037694892968268,
-    "array_access": 1.7864328088728398,
-    "comparisons": 1.4327793552697512
+  "dynamic_load": {
+   "zig_s": 0.193536,
+   "puc_s": 0.126632,
+   "ratio": 1.528334070377156
   },
-  "baseline_identity": {
-    "baseline_phase": "P16.36-final",
-    "note": "1.45349 @ 164ba0f (production HEAD, clean src, binary sha16 a43c3f73608b65d4). Phase P16.36 (error-state ownership + gsub yieldability): Cut 0 truth baseline (0e6f996: no src changes; T2.3 REAL cross-thread err_cfunc_label leak found + error-state ownership inventory + T2 probes). Cut 1a (f6c939a): err_cfunc_label leak FIXED structurally \u2014 raiser C-frame label derived at capture time via writeSyntheticTopCFrame (PUC pushfuncname: funcnamefromcall name -> _G fallback -> '?'), all 12 field sites deleted; side-fixes with PUC citations (CLI double-traceback, xpcall argerror position failWithPosFrame = luaL_where(1)); permanent differential smoke 76_error_cfunc_label.lua. Cut 1b (b2b79c3): thread-owned semantic error state \u2014 err_obj/err_has_obj/err_cframe_residue/err_is_errerr/err_source/err_line/err_traceback moved Vm -> Thread (PUC model: error identity lives on the raising lua_State, luaD_seterrorobj transfers at resume boundaries); Thread 3632->3712 (+80B = exact field move), Vm 6584->6488 (payload -80B + -16B padding re-flow; commit message recorded the payload number); resume 7-field error save/restore ceremony bundle DELETED (single current-error-on-Vm was a leak-latency patch); ~263 sites self.X -> self.errThread().X; locals/cstack 1b-regression hypothesis REFUTED (both diff classes pre-existing, stash-baseline experiment). Cut 3 (164ba0f): gsub yieldability O(frames) scan -> O(1) nCcalls nny unit (PUC ldo.c:1016 yieldable = one AND+TEST on nCcalls upper bits) \u2014 hasActiveBytecodeNonYieldableBoundary deleted (10-line frame walk consulted up to 2x per resume/yield cycle); gsub __index continuation push enters the unit BEFORE the push at both sites (gsubContCcallEnter/gsubContCcallRollback, flag repl_ccall_active -> cont_ccall_active covering both continuation kinds); coroutine_yield -44.4 i/it (-2.0%); permanent differential smoke 77_gsub_yieldability.lua; negative validation x2 (neutralized enter -> 4 probe failures vs PUC, restored -> byte-identical). Cut ledger: Cut 0 0e6f996 (baseline+inventory+probes), Cut 1a f6c939a, Cut 1b b2b79c3, Cut 3 164ba0f. FINAL MEASUREMENT: geomean 1.45349 vs P16.35-final baseline 1.44578 = +0.53% (under WARN +5%); 18/18 OK; single WARN field_access +7.6% = documented bimodal workload (fresh evidence: 12-run wall bimodal 0.0993-0.1000 vs 0.1020-0.1038 modes AND instructions:u bimodal 1,727,947,033 vs 1,798,648,270 = data-dependent path split, untouched by P16.36 which changed only coroutine/error/gsub paths); controls lua_calls +1.6%, branch_loop -1.0%, int_arith +0.4%. T7 fresh A/B/C/D decomposition @ HEAD: gap(A) 1204.2 i/it (was 1536.5 at P16.35) = lookup 5.05 (0.4%) + transition 1199.2 (99.6%) \u2014 conclusion unchanged, transition machinery still the whole gap. P16.37 queue: switchRuntime per-thread stacks (~157 i/it est), yield copying (~50), internStr GC cascade (checkGC at allocation opcodes, PUC lvm.c:1425), scan inventory leftovers (suspension-owner topmost-Lua-frame search = next candidate), semantic backlog. P16.37 regression checks run against THIS measurement (conservative)."
+  "field_access": {
+   "zig_s": 0.095955,
+   "puc_s": 0.056634,
+   "ratio": 1.6943002436698804
+  },
+  "hash_access": {
+   "zig_s": 0.110786,
+   "puc_s": 0.068439,
+   "ratio": 1.6187553880097605
+  },
+  "mixed_arith": {
+   "zig_s": 0.24568,
+   "puc_s": 0.174588,
+   "ratio": 1.407198661992806
+  },
+  "string_loop": {
+   "zig_s": 0.117311,
+   "puc_s": 0.097,
+   "ratio": 1.2093917525773195
+  },
+  "global_arith": {
+   "zig_s": 0.840052,
+   "puc_s": 0.550451,
+   "ratio": 1.526115857723939
+  },
+  "metamethod_add": {
+   "zig_s": 0.090415,
+   "puc_s": 0.062399,
+   "ratio": 1.4489815541915734
+  },
+  "branch_loop": {
+   "zig_s": 0.841639,
+   "puc_s": 0.529563,
+   "ratio": 1.5893085430817486
+  },
+  "coroutine_yield": {
+   "zig_s": 0.062874,
+   "puc_s": 0.044314,
+   "ratio": 1.4188292638895157
+  },
+  "string_concat": {
+   "zig_s": 0.084665,
+   "puc_s": 0.077771,
+   "ratio": 1.0886448676241787
+  },
+  "lua_calls": {
+   "zig_s": 0.121252,
+   "puc_s": 0.090945,
+   "ratio": 1.3332453680796086
+  },
+  "float_arith": {
+   "zig_s": 0.229994,
+   "puc_s": 0.175651,
+   "ratio": 1.3093805329887105
+  },
+  "array_access": {
+   "zig_s": 0.080408,
+   "puc_s": 0.045571,
+   "ratio": 1.7644554650984177
   }
+ },
+ "zig": {
+  "table_alloc_setmetatable": 0.058198,
+  "metamethod_call_noalloc": 0.015622,
+  "comparisons": 0.822212,
+  "int_arith": 0.228816,
+  "temp_table_alloc": 0.034657,
+  "dynamic_load": 0.193536,
+  "field_access": 0.095955,
+  "hash_access": 0.110786,
+  "mixed_arith": 0.24568,
+  "string_loop": 0.117311,
+  "global_arith": 0.840052,
+  "metamethod_add": 0.090415,
+  "branch_loop": 0.841639,
+  "coroutine_yield": 0.062874,
+  "string_concat": 0.084665,
+  "lua_calls": 0.121252,
+  "float_arith": 0.229994,
+  "array_access": 0.080408
+ },
+ "puc": {
+  "table_alloc_setmetatable": 0.043002,
+  "metamethod_call_noalloc": 0.008422,
+  "comparisons": 0.596781,
+  "int_arith": 0.172417,
+  "temp_table_alloc": 0.030372,
+  "dynamic_load": 0.126632,
+  "field_access": 0.056634,
+  "hash_access": 0.068439,
+  "mixed_arith": 0.174588,
+  "string_loop": 0.097,
+  "global_arith": 0.550451,
+  "metamethod_add": 0.062399,
+  "branch_loop": 0.529563,
+  "coroutine_yield": 0.044314,
+  "string_concat": 0.077771,
+  "lua_calls": 0.090945,
+  "float_arith": 0.175651,
+  "array_access": 0.045571
+ },
+ "ratios": {
+  "table_alloc_setmetatable": 1.353378912608716,
+  "metamethod_call_noalloc": 1.8549038233198765,
+  "comparisons": 1.3777449349091209,
+  "int_arith": 1.3271081157890463,
+  "temp_table_alloc": 1.1410838930593967,
+  "dynamic_load": 1.528334070377156,
+  "field_access": 1.6943002436698804,
+  "hash_access": 1.6187553880097605,
+  "mixed_arith": 1.407198661992806,
+  "string_loop": 1.2093917525773195,
+  "global_arith": 1.526115857723939,
+  "metamethod_add": 1.4489815541915734,
+  "branch_loop": 1.5893085430817486,
+  "coroutine_yield": 1.4188292638895157,
+  "string_concat": 1.0886448676241787,
+  "lua_calls": 1.3332453680796086,
+  "float_arith": 1.3093805329887105,
+  "array_access": 1.7644554650984177
+ },
+ "baseline_identity": {
+  "baseline_phase": "P16.37-final",
+  "note": "1.42994 @ dabfad6 (production HEAD, clean src, binary sha16 a892306a2856f0b4). Phase P16.37 (table.sort yieldability parity + thread runtime ownership): Cut 0 (60681b9): truth \u2014 P16.36-final reproduced (RF sha16 byte-identical, spot-counters exact), fresh switchRuntime decomposition (variant D: 2 switches/cycle exact, switchRuntime 151.0 i/cycle self = park 21 + activate 17 + refreshHooksCached 12 + guard/prologue ~14.5 per switch), R0.3 callframe-layout provenance regenerated, R0.2 errored-coroutine TBC __close timing divergence CONFIRMED (PUC defers-to-close / zig closes-during-unwind \u2014 backlog). Cut 1 (1fab11d): table.sort comparator non-yieldable via nny unit \u2014 tableSortLess enters ccallEnter(.nonyieldable) BEFORE resolveCallable (PUC ldo.c:652), all 6 coroutine_yield special cases + 'invalid order function' error-wrapping DELETED (comparator errors propagate unwrapped, PUC sort_comp lua_call); bare-message mechanism = callBuiltin pushes builtin C-frame first; builtinTableSort checktype raw-tag parity (ltablib.c:399); follow-on arg-message naming parity family: _G in _LOADED (luaopen_base), pushGlobalFuncName (loaded-search, findfield L2, strip _G.), failTabArgerror, checkTabArg arg_no \u2014 table.sort messages byte-match PUC; side-fix undump fixed-borrow alignment (latent UB exposed by arena offset shift; fixed_borrow = base % 4 check with copy fallback, PUC plain-casts = UB on misaligned base); smoke 78_table_sort_yieldability.lua T0-T10 byte-identical (T12 dropped: pre-existing trampoline lost-continuation crash, reproduces on pre-P16.37 binary \u2014 backlog); negative validation: neutralized nny-enter -> P1 suspends (old divergence reproduced), restored -> byte-identical. Cut 2 (dabfad6): PERMANENT Thread runtime ownership Variant A \u2014 PUC lstate.c model (L->stack on lua_State, global_State without stack): Thread.bytecode_stack = L->stack, activeBytecodeThread() = L, dispatch caches the thread like PUC caches L/ci; Vm fields bc_stack/bc_boxed/bc_stack_top/bc_tbc_regs DELETED (Vm 6592->6520 B = -72 exactly 5 fields, Thread 3712 unchanged); move ceremony DELETED as a class: parkActiveRuntime (21 i/switch) + activateRuntime (17 i/switch) + switchRuntime (151 i/cycle x2/cycle 4-field SIMD) + active_runtime_thread + branchy active-vs-parked resolves; switch = thread-select (current_thread store, null=main, single switch-state) + refreshHooksCached; ~290 sites re-homed (ctx.th in dispatch, th-pairs in close/unwind, th-params in signatures); T7 A/B: coroutine_yield -6.3% instructions (1,092,199,178 -> 1,023,529,434), cy_d -6.2%, field_access -9.0%, controls int_arith/branch_loop/table_alloc ~0 = noise -> no new per-opcode chain; perf_compare @ Cut 2: coroutine_yield -9.7% wall; T8 memory: GC-count full reclamation no leak, native_mem LINEAR identical at Cut 1 HEAD = pre-existing. Cut ledger: Cut 0 60681b9, Cut 1 1fab11d, Cut 2 dabfad6. FINAL MEASUREMENT (this baseline): geomean 1.42994 vs P16.36-final 1.45349 = -1.62% (improvement); 18/18 OK, 0 WARN/FAIL; coroutine_yield -8.45% wall vs P16.36-final (Cut 2 recorded -9.7%), field_access -5.94%, comparisons -4.15%; controls int_arith -2.39%, branch_loop -1.78%. Fresh A/B/C/D @ HEAD: gap(D) 1076.0 i/it (was 1529.4 at P16.35, 1199.2 at P16.36) = lookup +5.0 (0.5%) + transition 1076.0 (99.5%); fresh perf record: switchRuntime/park/activate ABSENT (0 matches), switchThread 0.72%, builtinCoroutineResume 12.31% (was 28.8% at P16.35). P16.38 queue: yield copying ~50 i/it (setFrom x2 + resume-tail copy vs PUC zero-copy, with lifetime proof), internStr GC cascade (checkGC at allocation opcodes, PUC lvm.c:1425), errored-coroutine TBC __close timing (PUC defers-to-close / zig closes-during-unwind), remaining semantic backlog (T12 trampoline lost-continuation crash, comparator call-counts, coroutine.close/setmetatable arg messages). P16.38 regression checks run against THIS measurement (conservative)."
+ }
 }

@@ -1,19 +1,19 @@
 {
-  "created_utc": "2026-09-11T14:05:00+00:00",
+  "created_utc": "2026-09-11T16:32:07.934262+00:00",
   "provenance": {
-    "git_head": "5221906",
-    "measured_source_head": "164ba0f",
-    "measured_source_note": "git diff 164ba0f..HEAD --stat -- src/ is empty; src/ byte-identical to the P16.36 final source (P16.37 Cut 0 R0.3 regeneration)",
+    "git_head": "3c68d37",
+    "measured_source_head": "dabfad6",
+    "measured_source_note": "git diff dabfad6..HEAD --stat -- src/ is empty; src/ byte-identical to the P16.37 Cut 2 source (P16.38 Cut 0 R0.6 regeneration)",
     "git_dirty": "clean (before this artifact)",
     "source_dirty": "clean",
     "artifact_dirty": "clean (regeneration in flight; measured inputs are src/, reported by source_dirty=clean)",
     "zig_version": "0.16.0",
     "optimize_mode": "Debug+ReleaseFast",
     "probe_binary_sha16": {
-      "Debug": "0e1fb4dacba82138",
-      "ReleaseFast": "dee32eebc0fb6a59"
+      "Debug": "8bacebd3920d0f6a",
+      "ReleaseFast": "7a117a6f5f282667"
     },
-    "probe_note": "standalone Zig probe compiled OUTSIDE the repo against the same module graph (lua root src/lua/root.zig + util), -O Debug and -O ReleaseFast; prints @sizeOf/@alignOf/@offsetOf of vm.CallFrame and both u-variant arms. P16.37 R0.3 regeneration at HEAD 5221906: ALL layout values byte-identical to the previous artifact (P16.34 Cut 0A content) — only provenance refreshed. Comptime asserts now at vm.zig:2545-2546 (CallFrame==88, u@32) compile in every mode and passed in both probe builds + unit D/RF."
+    "probe_note": "standalone Zig probe compiled OUTSIDE the repo against the same module graph (lua root src/lua/root.zig + util), -O Debug and -O ReleaseFast; prints @sizeOf/@alignOf/@offsetOf of vm.CallFrame and both u-variant arms. P16.38 Cut 0 R0.6 regeneration at HEAD 3c68d37 (src/ == dabfad6): ALL layout values byte-identical to the P16.37 R0.3 artifact content — only provenance refreshed. Comptime asserts now at vm.zig:2549-2552 (CallFrame==88, u@32, align 8) compile in every mode and passed in both probe builds + unit D/RF."
   },
   "luazig": {
     "Debug": {

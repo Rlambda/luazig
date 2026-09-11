@@ -11008,3 +11008,51 @@ Cut 2 (kernel matrix) — следующая часть.
 - Гейты не применимы (src/ не менялся); контроль: perf 61.02/28.00 ==
   callgrind slope 61.000/28.000 (двойная сверка двумя независимыми
   инструментами).
+
+## P16.39 Cut 2 — dispatch/opcode kernel matrix K1-K6 + D-bucket атрибуция (2026-09-12)
+
+Cut 2 фазы P16.39: НЕТ runtime-изменений (только измерения + артефакт).
+Закрывает пункт 1 очереди (dispatch floor track) полностью: floor (Cut 1)
++ kernel matrix + D-бакеты (Cut 2). Артефакт:
+`tools/status/p16.39-dispatch-opcode-matrix.md`.
+
+- **C2.1 kernels K1-K6** (`/tmp/opencode/p39k/`, формы сверены с
+  `--dump-bytecode`; PUC `luac -l -l` — формы ИДЕНТИЧНЫ, ops/it
+  engine-независимы): K1 forloop-only, K2 arith (ADD+skipped MMBIN),
+  K3 branch (MODK/EQI/ADDI/JMP-0.5), K4 lua call (`f(x) return x`),
+  K5 no-alloc builtin (`math.abs`, allocs FLAT — verified via --stats),
+  K6 coroutine resume+yield 1 (canonical coroutine_yield shape, allocs
+  FLAT — span-модель P16.38 работает).
+- **C2.2 matrix** (perf n-vs-2n median-of-3 taskset -c 0): zig/puc i/it =
+  **61/28 (2.18x), 101/60 (1.68x), 218.5/139.5 (1.57x), 395/224 (1.76x),
+  830/251 (3.31x — ХУДШИЙ), 2056/980 (2.10x)**. K1 воспроизводит floor
+  точно (61.00/12.07 vs 61.02/12.15).
+- **C2.3 D-бакеты** (callgrind --dump-instr addr-exact slope, addr2line;
+  callgrind_annotate line-вывод ОТКЛОНЁН — double-counts inlined frames,
+  суммы 1.7-4x program totals): K4 395 = W 71 + D1 78 + D2 44 + D3 65 +
+  D4 44 + D5 92; K5 830 = W 95 + D1 65 + D2 87 + D3 35 + **D6 493** +
+  D8 55; K6 2084 = W 321 + D1 143 + D2 256 + D3 96 + D6 449 + D7 68 +
+  D8 55 + **D9 658** (+38 unassigned). D1 = 13 i/fetch × ops/it —
+  сходится во всех трёх (78/65/143).
+- **C2.4 главные находки**: (1) builtin-путь — худший разрыв (K5 3.31x):
+  D6 493 + D8 55 = 548 vs PUC весь C-путь ~132; крупнейшие элементы:
+  callBuiltin-механика 175, pushBuiltinCFrame 58, popBuiltinCFrame 45,
+  CallFrame-init memset 38, freeCFrameOwnedState 23, GC-guard
+  (condGcFromDispatch+gcAutomaticStep) 55 — GC-чек исполняется на КАЖДЫЙ
+  builtin-call (gc_steps_auto slope ровно 1/call; PUC проверяет GC только
+  на allocation-сайтах); (2) K6: coroutine-механика D9 658 + D6 449 +
+  двойной frame_loop D2 256; parity-ВЫИГРЫШИ в PUC-числе: PUC платит
+  luaH_getshortstr 101 (глобальные `coroutine`/`resume`/`yield` lookup —
+  реальные вызовы) и setjmp/longjmp 89 на resume+yield-пару — zig
+  GETFIELD fast-path и error-return-модель платят ~0; (3) K4:
+  call+return механика D3+D4+D5+D2 = 245 vs PUC precall 48 + доля
+  poscall; (4) K3: JMP 0.5/it подтверждает donextjump parity.
+- **C2.5 рекомендация** (data-driven, ранжировано по абсолютному разрыву):
+  **C (OP_CALL/builtin residue) → B (parent-return/re-entry convergence)
+  → A (code_ptr+index-pc cache, head 13→~10, −3 i/fetch равномерно;
+  pre-registered reject rule P16.35 сохранена)**. Трек p16.10 предполагал,
+  что dispatch floor (A) — доминирующий разрыв; матрица показывает, что
+  builtin- и call-пути доминируют во всех не-floor workloads.
+- **Гейты** (src/ не менялся с 862bec7; бинарник sha16 c134caa825828c37):
+  unit D + RF PASS, smoke **79/79**, matrix --testc 31/32 zig_fail=0
+  (big.lua both_fail pre-existing).

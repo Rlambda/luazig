@@ -4216,10 +4216,27 @@ pub const Vm = struct {
     // previous cycle.
     gc_alloc_threshold: usize = 20000,
     gc_auto_threshold_kb: f64 = 32768.0,
-    gc_finalizer_tick_pending: bool = false,
     /// PUC GCdebt analogue — kept on Vm (not tracker) for exact behavioral
     /// match with the pre-tracking-allocator code.
-    gc_step_debt_kb: f64 = 0.0,
+    ///
+    /// P16.39 Cut 3: initialized to the default gc_auto_threshold_kb
+    /// (gc_count_kb starts at 0, so debt = threshold - count, the same
+    /// value gcScheduleNextAutomaticCycle would set). The old 0.0 init made
+    /// every dispatch safe point fall through the `debt > 0` skip into the
+    /// pc-sync + gcAutomaticStep call, which then provably no-opped in the
+    /// pause state (~40 wasted instructions per builtin call; measured
+    /// P16.39 K5 D8). With a positive init, PUC's luaC_condGC shape holds
+    /// exactly: `debt > 0` ⟺ no automatic GC work is due.
+    ///
+    /// Invariant (PUC luaE_setdebt discipline): every gc_auto_threshold_kb
+    /// reschedule pairs the debt write (`threshold - count`) — see
+    /// gcScheduleNextAutomaticCycle's callers. The deliberate exceptions
+    /// are force-due sites: LUA_GCRESTART and LUA_GCSTEP(n<=0) set debt = 0
+    /// (PUC luaE_setdebt(g, 0)). gcNoteFree decrements only gc_count_kb
+    /// (not debt), so debt is conservative: it can hit 0 before the
+    /// threshold does, never after — a step entered early no-ops in
+    /// gcAutomaticStep, exactly like the pre-cut behavior.
+    gc_step_debt_kb: f64 = 32768.0,
     gc_finalizer_epoch: usize = 0,
     gc_cycle_finalizer_epoch: usize = 0,
     /// Number of finalizers called in the most recent atomic phase.
@@ -7019,11 +7036,17 @@ pub const Vm = struct {
     /// at `func_slot` (PUC `ci->func`), so `debug.getinfo().func` and GC
     /// marking can derive it from the shared stack — no separate `callee`
     /// field needed.
-    fn pushBuiltinCFrame(self: *Vm, callee: Value) std.mem.Allocator.Error!void {
+    /// Push a synthetic C-frame for a builtin callee. Returns whether the
+    /// push reallocated bc_stack (P16.39 Cut 3) — the ONLY staleness source
+    /// for caller-held bc_stack slices on the synchronous callBuiltin path
+    /// (callers re-derive their slices only when true; PUC's C stack never
+    /// moves, so PUC re-derives nothing).
+    fn pushBuiltinCFrame(self: *Vm, callee: Value) std.mem.Allocator.Error!bool {
         const th = self.activeBytecodeThread();
         // Place callee on the thread's bytecode stack (PUC: ci->func points
         // into L->stack).
         const func_slot = th.bytecode_stack_top;
+        var grew = false;
         // Grow bytecode_stack + bytecode_boxed transactionally: realloc
         // bytecode_boxed first (into a temp), then bytecode_stack. If the
         // bytecode_stack realloc fails, restore bytecode_boxed. This avoids
@@ -7040,6 +7063,7 @@ pub const Vm = struct {
             th.bytecode_stack = try self.alloc.realloc(th.bytecode_stack, new_cap);
             @memset(th.bytecode_stack[func_slot..], .Nil);
             @memset(th.bytecode_boxed[func_slot..], null);
+            grew = true;
         }
         th.bytecode_stack[func_slot] = callee;
         th.bytecode_stack_top = func_slot + 1;
@@ -7094,6 +7118,7 @@ pub const Vm = struct {
         // the stack growth and addOne above can fail, and a pre-increment
         // would leak the count on rollback.
         th.c_frame_count += 1;
+        return grew;
     }
 
     /// Pop the topmost CallFrame (the synthetic C-frame pushed by
@@ -7212,7 +7237,7 @@ pub const Vm = struct {
             // pushes a CallInfo (CIST_C) so debug.getinfo counts it as a
             // stack level. Without this frame, level numbers inside the
             // handler wouldn't match PUC.
-            try self.pushBuiltinCFrame(ef);
+            _ = try self.pushBuiltinCFrame(ef);
             defer {
                 self.popBuiltinCFrame();
                 if (std.debug.runtime_safety) self.cFrameCountAssert(self.activeBytecodeThread());
@@ -7676,11 +7701,11 @@ pub const Vm = struct {
         // PUC luaC_checkfinalizer (lgc.c:1088): l_setbit(o->marked, FINALIZEDBIT)
         gcPtr(obj).marked.* |= FINALIZEDBIT;
         self.gc_finalizer_epoch +%= 1;
-        // Do NOT set gc_finalizer_tick_pending here. In PUC Lua, registering
-        // a finalizer does not force the next GC step to run; the finalizer
-        // will run when the object is collected. Setting the tick flag here
-        // causes spurious automatic minor collections that promote young
-        // objects' ages prematurely, breaking gengc.lua age assertions.
+        // In PUC Lua, registering a finalizer does not force the next GC
+        // step to run; the finalizer will run when the object is collected.
+        // Forcing a step at registration causes spurious automatic minor
+        // collections that promote young objects' ages prematurely,
+        // breaking gengc.lua age assertions.
     }
 
     /// PUC `udata2finalize` (lgc.c:947-960): atomic semantic transition that
@@ -7876,10 +7901,20 @@ pub const Vm = struct {
     /// in `luaC_checkGC` inside string/table allocators.
     fn condGcFromDispatch(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!void {
         if (!self.gc_running or self.gc_busy) return;
-        // PUC luaC_condGC: if GCdebt <= 0, run a step. gc_step_debt_kb is
-        // decremented by gcNoteAlloc on every allocation (PUC: GCdebt
-        // decreases as bytes are allocated via luaM_*).
-        if (self.gc_step_debt_kb > 0 and !self.gc_finalizer_tick_pending and !self.gcAutoCycleDue()) return;
+        // PUC luaC_condGC (lgc.h): a single GCdebt check gates the step.
+        // gc_step_debt_kb > 0 means no automatic work is due — mid-cycle
+        // the step is throttled by the stepsize debt, and in pause/minor
+        // the next cycle fires when the debt is exhausted (which, by the
+        // debt = threshold - count rescheduling invariant, coincides with
+        // gcAutoCycleDue). The explicit gcAutoCycleDue() re-check covers
+        // the one unpaired threshold write (the minor2inc generational
+        // transition sets threshold = count without rescheduling debt).
+        // P16.39 Cut 3: this also dropped a gc_finalizer_tick_pending read
+        // — provably always false (the flag was never set true; see
+        // gcFinishCycle for the rationale) — and fixed the debt init (see
+        // the field doc), which together made every builtin call pay the
+        // safepoint sync + a no-op gcAutomaticStep entry.
+        if (self.gc_step_debt_kb > 0 and !self.gcAutoCycleDue()) return;
         // Safepoint: sync dispatch state to the heap CallFrame so
         // gcMarkMutableRoots sees correct pc/reg_top for live_reg_top.
         const fr = ctx.exec_frames.getPtr(ctx.frame_index);
@@ -7903,9 +7938,12 @@ pub const Vm = struct {
         self.gc_last_table_inst = self.gc_inst;
 
         // PUC luaC_condGC: if GCdebt <= 0, run a step. gc_step_debt_kb is
-        // decremented by gcNoteAlloc on every allocation.
+        // decremented by gcNoteAlloc on every allocation. The gcAutoCycleDue
+        // re-check covers the minor2inc unpaired threshold write (see
+        // condGcFromDispatch). P16.39 Cut 3: dropped the always-false
+        // gc_finalizer_tick_pending read.
         if (self.gc_running and !self.gc_busy and
-            (self.gc_step_debt_kb <= 0 or self.gc_finalizer_tick_pending or self.gcAutoCycleDue()))
+            (self.gc_step_debt_kb <= 0 or self.gcAutoCycleDue()))
         {
             self.gc_alloc_tables = 0;
             // Protect the just-allocated table: it is registered but has
@@ -17731,10 +17769,12 @@ pub const Vm = struct {
                 // the C CallInfo exists before LUA_HOOKCALL fires, and the
                 // name resolves to "for iterator" (getFuncNameForFrame's
                 // .tforcall branch reads this caller's instruction).
-                var iter_cframe_pushed = false;
-                if (id != .collectgarbage and id != .string_sub) {
-                    try self.pushBuiltinCFrame(callee_val);
-                    iter_cframe_pushed = true;
+                if (builtinNeedsCFrame(id)) {
+                    // P16.39 Cut 3: re-derive the args slice only when the
+                    // stack base moved — the compare covers both the push
+                    // growth and the sync hook body's nested execution.
+                    const iter_stack_base = ctx.th.bytecode_stack.ptr;
+                    _ = try self.pushBuiltinCFrame(callee_val);
                     const cf_idx = self.activeBytecodeThread().call_frames.len() - 1;
                     const iter_hook_args = ctx.th.bytecode_stack[ctx.base + a + 5 .. ctx.base + a + 5 + effective_nargs];
                     self.dispatchCCalleeActivationHook(cf_idx, callee_val, iter_hook_args) catch |hook_err| {
@@ -17742,15 +17782,15 @@ pub const Vm = struct {
                         return hook_err;
                     };
                     self.builtin_cframe_pre_pushed = true;
+                    // P15.51l: reg_top lives directly on the CallFrame.
+                    // pushBuiltinCFrame may have reallocated bc_stack — re-derive
+                    // the args slice for callBuiltin.
+                    const rargs_builtin_fresh = if (ctx.th.bytecode_stack.ptr != iter_stack_base)
+                        ctx.th.bytecode_stack[ctx.base + a + 5 .. ctx.base + a + 5 + effective_nargs]
+                    else
+                        rargs_builtin;
+                    try self.callBuiltin(id, rargs_builtin_fresh, outs);
                 }
-                // P15.51l: reg_top lives directly on the CallFrame.
-                // pushBuiltinCFrame may have reallocated bc_stack — re-derive
-                // the args slice for callBuiltin.
-                const rargs_builtin_fresh = if (iter_cframe_pushed)
-                    ctx.th.bytecode_stack[ctx.base + a + 5 .. ctx.base + a + 5 + effective_nargs]
-                else
-                    rargs_builtin;
-                try self.callBuiltin(id, rargs_builtin_fresh, outs);
                 const produced: usize = if (builtinHasDynamicOutCount(id))
                     @min(self.last_builtin_out_count, outs.len)
                 else
@@ -18436,17 +18476,21 @@ pub const Vm = struct {
                 // "call" — see the tc_event selection above.)
                 // P16.5b: Skip the C-frame push on the coroutine fast path.
                 if (!co_fast_path and deferred_builtin_call_hook) {
-                    try self.pushBuiltinCFrame(callee_val);
+                    // P16.39 Cut 3: re-derive call_args only when the stack
+                    // base moved — covers the push growth AND the sync hook
+                    // body's nested execution.
+                    const tc_stack_base = ctx.th.bytecode_stack.ptr;
+                    _ = try self.pushBuiltinCFrame(callee_val);
                     const cf_idx = self.activeBytecodeThread().call_frames.len() - 1;
-                    // call_args may be stale after pushBuiltinCFrame grew
-                    // bc_stack — re-derive from the caller's registers.
                     const tc_hook_args = ctx.th.bytecode_stack[ctx.base + a + 1 .. ctx.base + a + 1 + effective_nargs];
                     self.dispatchCCalleeActivationHook(cf_idx, callee_val, tc_hook_args) catch |hook_err| {
                         self.popBuiltinCFrame();
                         return hook_err;
                     };
                     self.builtin_cframe_pre_pushed = true;
-                    call_args = ctx.th.bytecode_stack[ctx.base + a + 1 .. ctx.base + a + 1 + effective_nargs];
+                    if (ctx.th.bytecode_stack.ptr != tc_stack_base) {
+                        call_args = ctx.th.bytecode_stack[ctx.base + a + 1 .. ctx.base + a + 1 + effective_nargs];
+                    }
                 }
                 // P15.51l: reg_top lives directly on the CallFrame.
                 // P16.5b: Use direct call for coroutine fast path.
@@ -18917,15 +18961,21 @@ pub const Vm = struct {
                 // bc_stack, invalidating the old rargs slice (use-after-free).
                 var rargs_fresh = ctx.regs[a + 1 .. a + 1 + effective_nargs];
                 var outs = ctx.regs[outs_start .. outs_start + out_len];
-                // Sync pc and frame_cap to frame before callBuiltin — the
+                // Sync frame_cap to the frame before callBuiltin — the
                 // builtin may trigger GC (reads live_reg_top[pc]) or shrink
                 // bc_stack (reads frame_cap to compute inuse). Without
                 // syncing frame_cap, shrinkBcStack sees the OLD (smaller)
                 // frame_cap, computes a too-small inuse, and shrinks bc_stack
                 // below ctx.base + ctx.frame_cap → OOB panic on return.
+                // (tryCallMetamethodInPlace grows ctx.frame_cap via
+                // bcGrowFrame WITHOUT publishing to the frame — only
+                // growCtxFrame publishes — so this sync is load-bearing.)
+                // P16.39 Cut 3: the pc sync that used to live here is
+                // provably redundant — parkActiveFrame at the top of opCall
+                // already parked u.lua.pc = ctx.pc (the CALL), and nothing
+                // between mutates ctx.pc or the parked copy.
                 // P15.51l: reg_top lives directly on the CallFrame.
                 const fr_pre_call = ctx.exec_frames.getPtr(ctx.frame_index);
-                fr_pre_call.u.lua.pc = ctx.pc;
                 if (!fr_pre_call.isC()) fr_pre_call.u.lua.frame_cap = ctx.frame_cap;
                 // P15.83r (PUC ldo.c:642-656 precallC ordering): the C
                 // CallInfo exists BEFORE the CALL hook fires. Push the
@@ -18934,23 +18984,39 @@ pub const Vm = struct {
                 // P16.5b: Skip the C-frame push entirely on the coroutine
                 // fast path — guards guarantee no hooks need it.
                 if (!co_fast_path and deferred_builtin_call_hook) {
-                    try self.pushBuiltinCFrame(callee_val);
+                    // P16.39 Cut 3: re-derive the caller-window slices only
+                    // when the stack base moved. The compare covers BOTH
+                    // staleness sources here — the C-frame push growth AND
+                    // the sync hook body's nested execution (which can grow
+                    // bc_stack too); a same-base realloc keeps every slice
+                    // valid, so the pointer compare is the exact
+                    // invalidation test.
+                    const stack_base_at_push = ctx.th.bytecode_stack.ptr;
+                    _ = try self.pushBuiltinCFrame(callee_val);
                     const cf_idx = self.activeBytecodeThread().call_frames.len() - 1;
-                    // pushBuiltinCFrame may have reallocated bc_stack —
-                    // re-derive the caller-window slices (the C-frame's
-                    // func_slot sits above the window, which is unchanged).
-                    ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                    rargs_fresh = ctx.regs[a + 1 .. a + 1 + effective_nargs];
-                    outs = ctx.regs[outs_start .. outs_start + out_len];
-                    const hook_args = rargs_fresh;
+                    const hook_args = ctx.th.bytecode_stack[ctx.base + a + 1 .. ctx.base + a + 1 + effective_nargs];
                     self.dispatchCCalleeActivationHook(cf_idx, callee_val, hook_args) catch |hook_err| {
                         self.popBuiltinCFrame();
                         return hook_err;
                     };
                     self.builtin_cframe_pre_pushed = true;
+                    if (ctx.th.bytecode_stack.ptr != stack_base_at_push) {
+                        // The C-frame's func_slot sits above the window,
+                        // which is unchanged.
+                        ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                        rargs_fresh = ctx.regs[a + 1 .. a + 1 + effective_nargs];
+                        outs = ctx.regs[outs_start .. outs_start + out_len];
+                    }
                 }
-                // P16.5b: Use the direct call (no C-frame) for the coroutine
-                // fast path; generic callBuiltin for everything else.
+                // P16.39 Cut 3: capture the stack base before the call —
+                // callBuiltin (or callCoroutineBuiltinDirect) may have
+                // reallocated bc_stack (C-frame push growth, or a nested
+                // call inside the builtin). Re-derive the caller-window
+                // slices only when the base moved: a same-base realloc
+                // keeps every slice valid, so the pointer compare is the
+                // exact invalidation test (PUC's stack never moves; this is
+                // the minimal luazig analogue).
+                const stack_base_before = ctx.th.bytecode_stack.ptr;
                 if (co_fast_path) {
                     self.callCoroutineBuiltinDirect(id, rargs_fresh, outs) catch |call_err| switch (call_err) {
                         error.Yield => {
@@ -19001,8 +19067,10 @@ pub const Vm = struct {
                         error.ThreadSwitch => return error.ThreadSwitch,
                     };
                 }
-                ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                outs = ctx.regs[outs_start .. outs_start + out_len];
+                if (ctx.th.bytecode_stack.ptr != stack_base_before) {
+                    ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                    outs = ctx.regs[outs_start .. outs_start + out_len];
+                }
                 const produced: usize = if (builtinHasDynamicOutCount(id))
                     @min(self.last_builtin_out_count, outs.len)
                 else
@@ -19046,8 +19114,17 @@ pub const Vm = struct {
                     try self.dispatchBytecodeHookWithCallee("return", callee_val, outs[0..produced]);
                 }
                 const nstore: usize = if (nresults >= 0) @intCast(nresults) else produced;
-                for (0..nstore) |i| {
-                    ctx.regs[a + i] = if (i < produced) outs[i] else .Nil;
+                // P16.39 Cut 3: PUC luaD_poscall moveresults (ldo.c:436-440)
+                // — the single-result contract (the overwhelmingly common
+                // call shape: every `f(x)` assignment) is one unguarded
+                // move; the nil-padded loop only serves multi-result and
+                // variable-result contracts.
+                if (nstore == 1) {
+                    ctx.regs[a] = if (produced >= 1) outs[0] else .Nil;
+                } else {
+                    for (0..nstore) |i| {
+                        ctx.regs[a + i] = if (i < produced) outs[i] else .Nil;
+                    }
                 }
                 if (nresults < 0) ctx.exec_frames.getPtr(ctx.frame_index).reg_top = @intCast(@as(usize, a) + produced);
                 try self.condGcFromDispatch(ctx);
@@ -19553,6 +19630,14 @@ pub const Vm = struct {
     /// into bc_stack). Returns null when outs is not on bc_stack (internal
     /// callers that pass local buffers). Mirrors PUC Lua's restorestack macro.
     fn refreshBuiltinOuts(self: *Vm) ?[]Value {
+        // P16.39 Cut 3: the outs-window registration this re-derivation
+        // depends on is gated by builtin_may_refresh_outs — a refresh from
+        // an unlisted builtin would read a stale outer window
+        // (use-after-free). Catch missing entries loudly in safe builds
+        // (all test suites run Debug).
+        if (std.debug.runtime_safety and !(if (self.active_builtin) |ab| builtinMayRefreshOuts(ab) else false)) {
+            @panic("refreshBuiltinOuts: builtin missing from builtin_may_refresh_outs");
+        }
         if (!self.builtin_outs_on_bc_stack) return null;
         const th = self.activeBytecodeThread();
         return th.bytecode_stack[self.builtin_outs_base .. self.builtin_outs_base + self.builtin_outs_len];
@@ -19560,40 +19645,15 @@ pub const Vm = struct {
 
     fn callBuiltin(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value) DispatchError!void {
         if (self.stats.enabled) self.stats.calls_builtin += 1; // P16.0b
-        // P15.38i: Track whether outs points into bc_stack. When true, builtins
-        // with re-entry (pcall, xpcall, tostring with __tostring, etc.) can
-        // re-derive their outs slice via refreshBuiltinOuts() after nested Lua
-        // calls that may realloc bc_stack. This mirrors PUC Lua's
-        // savestack/restorestack mechanism (ldo.c:277-282).
-        const outs_ptr = @intFromPtr(outs.ptr);
-        const bc_stack = self.activeBytecodeThread().bytecode_stack;
-        const bc_start = @intFromPtr(bc_stack.ptr);
-        const bc_end = bc_start + bc_stack.len * @sizeOf(Value);
-        const prev_on_bc = self.builtin_outs_on_bc_stack;
-        const prev_base = self.builtin_outs_base;
-        const prev_len = self.builtin_outs_len;
-        if (outs_ptr >= bc_start and outs_ptr < bc_end) {
-            self.builtin_outs_on_bc_stack = true;
-            self.builtin_outs_base = (outs_ptr - bc_start) / @sizeOf(Value);
-            self.builtin_outs_len = outs.len;
-        } else {
-            self.builtin_outs_on_bc_stack = false;
-        }
-        defer {
-            self.builtin_outs_on_bc_stack = prev_on_bc;
-            self.builtin_outs_base = prev_base;
-            self.builtin_outs_len = prev_len;
-        }
-
-        // P15.79: Track whether args points into bc_stack. pushBuiltinCFrame
-        // may reallocate bc_stack (growing it to fit the C-frame's func_slot),
-        // which invalidates any []const Value slice that points into the old
-        // allocation. Save the offset now; after pushBuiltinCFrame, re-derive
-        // args from the new bc_stack if it was on bc_stack. If args is from a
-        // different allocation (e.g. resolveCallable's owned_args), it's safe.
-        const args_ptr = @intFromPtr(args.ptr);
-        const args_on_bc = args_ptr >= bc_start and args_ptr < bc_end;
-        const args_base = if (args_on_bc) (args_ptr - bc_start) / @sizeOf(Value) else 0;
+        // P16.39 Cut 3: snapshot the bc_stack slice BEFORE the C-frame
+        // push. The push may realloc it; the snapshot is the base for
+        // re-deriving args/outs slices that pointed into the OLD
+        // allocation (PUC savestack/restorestack, ldo.c:277-282 — PUC
+        // snapshots the stack pointer, we snapshot the slice). Callers
+        // pass slices derived after their own last stack mutation, so the
+        // push is the only staleness source on this path.
+        const th = self.activeBytecodeThread();
+        const old_stack = th.bytecode_stack;
 
         const callee_val: Value = .{ .Builtin = id };
         // P15.83r: the OP_CALL/OP_TAILCALL/OP_TFORCALL dispatch sites may
@@ -19603,18 +19663,86 @@ pub const Vm = struct {
         // exactly one C-frame per builtin invocation, whoever pushed it.
         const cframe_pre_pushed = self.builtin_cframe_pre_pushed;
         self.builtin_cframe_pre_pushed = false;
-        const cframe_pushed = cframe_pre_pushed or (id != .collectgarbage and id != .string_sub);
-        if (!cframe_pre_pushed and cframe_pushed) try self.pushBuiltinCFrame(callee_val);
-        // Re-derive args from the (possibly reallocated) bc_stack.
-        const args_fresh: []const Value = if (args_on_bc)
-            self.activeBytecodeThread().bytecode_stack[args_base .. args_base + args.len]
-        else
-            args;
-        // Re-derive outs from the (possibly reallocated) bc_stack.
-        const outs_fresh: []Value = if (self.builtin_outs_on_bc_stack)
-            self.activeBytecodeThread().bytecode_stack[self.builtin_outs_base .. self.builtin_outs_base + self.builtin_outs_len]
-        else
-            outs;
+        const cframe_pushed = cframe_pre_pushed or builtinNeedsCFrame(id);
+        // P16.39 Cut 3: pushBuiltinCFrame reports whether it reallocated
+        // bc_stack. Only then can args/outs slices into the old allocation
+        // be stale — the common no-grow case keeps them as-is.
+        var grew = false;
+        if (!cframe_pre_pushed and cframe_pushed) grew = try self.pushBuiltinCFrame(callee_val);
+
+        // P15.79: re-derive args only when the push reallocated bc_stack
+        // AND args pointed into the old allocation (heap args from
+        // resolveCallable's owned_args are safe).
+        const args_fresh: []const Value = if (grew) blk: {
+            const args_ptr = @intFromPtr(args.ptr);
+            const bc_start = @intFromPtr(old_stack.ptr);
+            const bc_end = bc_start + old_stack.len * @sizeOf(Value);
+            if (args_ptr >= bc_start and args_ptr < bc_end) {
+                const base = (args_ptr - bc_start) / @sizeOf(Value);
+                break :blk th.bytecode_stack[base .. base + args.len];
+            }
+            break :blk args;
+        } else args;
+
+        // P15.38i: register the outs window for refreshBuiltinOuts ONLY for
+        // builtins that re-enter the VM and re-derive their outs slice
+        // (pcall, tostring, load, ... — see builtin_may_refresh_outs).
+        // Non-reentrant builtins (the overwhelming majority — math.*,
+        // string predicates, ...) never call refreshBuiltinOuts, so for
+        // them the window classification + field save/set/restore was dead
+        // weight (~25 instructions per call, measured P16.39 K5). This
+        // mirrors PUC Lua's savestack/restorestack mechanism (ldo.c:277-282)
+        // for exactly the builtins that need it.
+        var outs_fresh: []Value = outs;
+        // P16.39 Cut 3 (correctness): the outs registration MUST outlive the
+        // if-block below — the original code had the save/restore defer
+        // INSIDE the block, so it restored the previous registration before
+        // the builtin body ever ran: refreshBuiltinOuts always returned null
+        // and every re-entrant builtin (dofile, require, pcall, ...) wrote
+        // results through a stale slice after nested execution grew
+        // bc_stack (reproduced: dofile of a ~1024-frame chunk returned nils
+        // and corrupted freed memory). The defer now lives at function
+        // scope; the saved state is an optional so the non-reentrant
+        // majority pays only a null check at exit.
+        var saved_outs_reg: ?struct { on_bc: bool, base: usize, len: usize } = null;
+        defer if (saved_outs_reg) |s| {
+            self.builtin_outs_on_bc_stack = s.on_bc;
+            self.builtin_outs_base = s.base;
+            self.builtin_outs_len = s.len;
+        };
+        if (builtinMayRefreshOuts(id)) {
+            // Save the PREVIOUS registration (an outer re-entrant builtin's
+            // window) — restored by the function-scope defer above on exit,
+            // giving correct nesting.
+            saved_outs_reg = .{
+                .on_bc = self.builtin_outs_on_bc_stack,
+                .base = self.builtin_outs_base,
+                .len = self.builtin_outs_len,
+            };
+            const outs_ptr = @intFromPtr(outs.ptr);
+            const bc_start = @intFromPtr(old_stack.ptr);
+            const bc_end = bc_start + old_stack.len * @sizeOf(Value);
+            if (outs_ptr >= bc_start and outs_ptr < bc_end) {
+                self.builtin_outs_on_bc_stack = true;
+                self.builtin_outs_base = (outs_ptr - bc_start) / @sizeOf(Value);
+                self.builtin_outs_len = outs.len;
+                if (grew) {
+                    outs_fresh = th.bytecode_stack[self.builtin_outs_base .. self.builtin_outs_base + self.builtin_outs_len];
+                }
+            } else {
+                self.builtin_outs_on_bc_stack = false;
+            }
+        } else if (grew) {
+            // Non-reentrant but the push reallocated: re-derive the window
+            // if it pointed into the old allocation.
+            const outs_ptr = @intFromPtr(outs.ptr);
+            const bc_start = @intFromPtr(old_stack.ptr);
+            const bc_end = bc_start + old_stack.len * @sizeOf(Value);
+            if (outs_ptr >= bc_start and outs_ptr < bc_end) {
+                const base = (outs_ptr - bc_start) / @sizeOf(Value);
+                outs_fresh = th.bytecode_stack[base .. base + outs.len];
+            }
+        }
         var cframe_preserved = false;
         defer if (cframe_pushed and !cframe_preserved) self.popBuiltinCFrame();
 
@@ -19622,8 +19750,18 @@ pub const Vm = struct {
         // that may realloc bc_stack, call this to get a fresh outs slice.
         // Usage: const outs = self.refreshBuiltinOuts();
 
-        // Initialize outputs to nil.
-        for (outs_fresh) |*o| o.* = .Nil;
+        // Initialize outputs to nil. P16.39 Cut 3: small windows (the
+        // overwhelmingly common fixed-result shapes — 1-2 values) are filled
+        // with inline stores; Zig lowers the generic loop to an out-of-line
+        // compiler_rt memset call costing ~36 instructions even for a
+        // single 16-byte Value (measured P16.39 K5). Larger windows keep
+        // the memset call.
+        switch (outs_fresh.len) {
+            inline 0...8 => |n| {
+                inline for (0..n) |i| outs_fresh[i] = .Nil;
+            },
+            else => @memset(outs_fresh, .Nil),
+        }
         self.last_builtin_out_count = outs_fresh.len;
         const prev_active_builtin = self.active_builtin;
         const prev_active_builtin_args = self.active_builtin_args;
@@ -20875,11 +21013,15 @@ pub const Vm = struct {
         if (args.len == 0) {
             // PUC: lua_gc(L, LUA_GCCOLLECT) → default case: checkvalres + push int.
             const res = self.gcControl(2, 0, -1); // LUA_GCCOLLECT
+            // P16.39 Cut 3 (correctness): the full collection may have run
+            // __gc finalizers (nested Lua on bc_stack, which can grow and
+            // reallocate it) — re-derive the outs window before writing.
+            const outw = self.refreshBuiltinOuts() orelse outs;
             if (res < 0) {
                 // checkvalres: GCSTPGC/GCSTPCLS → push false (not reentrant).
-                if (want_out) outs[0] = .{ .Bool = false };
+                if (want_out) outw[0] = .{ .Bool = false };
             } else {
-                if (want_out) outs[0] = .{ .Int = 0 };
+                if (want_out) outw[0] = .{ .Int = 0 };
             }
             return;
         }
@@ -20895,8 +21037,12 @@ pub const Vm = struct {
             const b = self.gcControl(4, 0, -1); // LUA_GCCOUNTB
             if (want_out) {
                 const live_ud_kb = self.testcLiveUserdataKb();
+                // P16.39 Cut 3 (correctness): testcLiveUserdataKb runs a
+                // nested callBuiltin (C-frame push may grow bc_stack) —
+                // re-derive the outs window before writing.
+                const outw = self.refreshBuiltinOuts() orelse outs;
                 const total_kb: f64 = @as(f64, @floatFromInt(k)) + @as(f64, @floatFromInt(b)) / 1024.0;
-                outs[0] = .{ .Num = total_kb + live_ud_kb + self.testc_gc_manual_kb + self.testc_gc_count_bonus_once_kb };
+                outw[0] = .{ .Num = total_kb + live_ud_kb + self.testc_gc_manual_kb + self.testc_gc_count_bonus_once_kb };
             }
             self.testc_gc_count_bonus_once_kb = 0.0;
             return;
@@ -20908,12 +21054,16 @@ pub const Vm = struct {
                 else => return self.fail("collectgarbage('step', size) expects integer size", .{}),
             } else 0;
             const res = self.gcControl(5, @intCast(n), -1); // LUA_GCSTEP
+            // P16.39 Cut 3 (correctness): a step can run a full cycle
+            // (stepsize=0) or advance through atomic — running __gc
+            // finalizers (nested Lua) — re-derive the outs window first.
+            const outw = self.refreshBuiltinOuts() orelse outs;
             if (res < 0) {
                 // GCSTPCLS guard: collector stopped → push false (PUC checkvalres).
-                if (want_out) outs[0] = .{ .Bool = false };
+                if (want_out) outw[0] = .{ .Bool = false };
                 return;
             }
-            if (want_out) outs[0] = .{ .Bool = res != 0 };
+            if (want_out) outw[0] = .{ .Bool = res != 0 };
             return;
         }
         if (std.mem.eql(u8, what, "isrunning")) {
@@ -20923,13 +21073,19 @@ pub const Vm = struct {
         }
         if (std.mem.eql(u8, what, "generational")) {
             const res = self.gcControl(7, 0, -1); // LUA_GCGEN
+            // P16.39 Cut 3 (correctness): the mode switch runs full
+            // collections (finalizers) — re-derive the outs window first.
+            const outw = self.refreshBuiltinOuts() orelse outs;
             // PUC pushmode: 8→"incremental", 7→"generational"
-            if (want_out) outs[0] = .{ .String = try self.internStr(if (res == 8) "incremental" else "generational") };
+            if (want_out) outw[0] = .{ .String = try self.internStr(if (res == 8) "incremental" else "generational") };
             return;
         }
         if (std.mem.eql(u8, what, "incremental")) {
             const res = self.gcControl(8, 0, -1); // LUA_GCINC
-            if (want_out) outs[0] = .{ .String = try self.internStr(if (res == 7) "generational" else "incremental") };
+            // P16.39 Cut 3 (correctness): the mode switch runs full
+            // collections (finalizers) — re-derive the outs window first.
+            const outw = self.refreshBuiltinOuts() orelse outs;
+            if (want_out) outw[0] = .{ .String = try self.internStr(if (res == 7) "generational" else "incremental") };
             return;
         }
         if (std.mem.eql(u8, what, "param")) {
@@ -20970,10 +21126,13 @@ pub const Vm = struct {
         }
         if (std.mem.eql(u8, what, "collect")) {
             const res = self.gcControl(2, 0, -1); // LUA_GCCOLLECT
+            // P16.39 Cut 3 (correctness): the full collection may have run
+            // __gc finalizers (nested Lua) — re-derive the outs window first.
+            const outw = self.refreshBuiltinOuts() orelse outs;
             if (res < 0) {
-                if (want_out) outs[0] = .{ .Bool = false };
+                if (want_out) outw[0] = .{ .Bool = false };
             } else {
-                if (want_out) outs[0] = .{ .Int = res };
+                if (want_out) outw[0] = .{ .Int = res };
             }
             return;
         }
@@ -23786,8 +23945,6 @@ pub const Vm = struct {
         self.gc_mode = .generational;
         try self.gcMakeAllOld();
         // After a full collection, all pending finalizers have run.
-        // Clear the tick flag so automatic GC doesn't fire spuriously.
-        self.gc_finalizer_tick_pending = false;
         // Set debt so the next automatic cycle starts when threshold is reached.
         self.gc_step_debt_kb = self.gc_auto_threshold_kb - self.gc_count_kb;
     }
@@ -23803,12 +23960,12 @@ pub const Vm = struct {
         if (self.gc_busy) return;
         if (self.stats.enabled) self.stats.gc_steps_auto += 1; // P16.0b
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
-            if (!self.gc_finalizer_tick_pending and !self.gcAutoCycleDue()) return;
+            if (!self.gcAutoCycleDue()) return;
             try self.gcMinorCollection();
             return;
         }
         if (self.gc_state == .pause) {
-            if (!self.gc_finalizer_tick_pending and !self.gcAutoCycleDue()) return;
+            if (!self.gcAutoCycleDue()) return;
             try self.gcStartCycle(true);
         }
         // PUC incstep: do bounded work, then set debt to stepsize so the
@@ -25596,15 +25753,15 @@ pub const Vm = struct {
         self.gc_gray.clearRetainingCapacity();
         // PUC does not force a follow-up collection when finalizers ran
         // during a cycle; the next cycle is paced solely by GCdebt (PUC
-        // setpause). Setting `gc_finalizer_tick_pending` here made every
-        // allocation-site check bypass `gc_step_debt_kb` and start a fresh
-        // cycle, producing many more cycles than PUC for the same workload
-        // (e.g. tracegc in locals.lua prints 1 dot per cycle in PUC, but
-        // luazig produced one extra cycle per collect because the next
-        // allocation after a cycle immediately re-entered `gcAutomaticStep`).
-        // The flag remains defined for legacy callers; never set it from
-        // cycle completion.
-        self.gc_finalizer_tick_pending = false;
+        // setpause). An earlier design had a `gc_finalizer_tick_pending`
+        // flag set here that made every allocation-site check bypass
+        // `gc_step_debt_kb` and start a fresh cycle, producing many more
+        // cycles than PUC for the same workload (e.g. tracegc in locals.lua
+        // prints 1 dot per cycle in PUC, but luazig produced one extra
+        // cycle per collect because the next allocation after a cycle
+        // immediately re-entered `gcAutomaticStep`). The flag was removed
+        // entirely in P16.39 Cut 3 (it was never set true anywhere); the
+        // next cycle is paced only by gc_step_debt_kb, exactly like PUC.
 
         if (self.gc_mode == .generational and self.gc_gen_phase == .major) {
             const added = @max(0.0, self.gc_gen_major_start_kb - self.gc_gen_major_base_kb);
@@ -26887,8 +27044,16 @@ pub const Vm = struct {
             else => return error.RuntimeError,
         };
         defer self.alloc.free(ret);
-        const n = @min(outs.len, ret.len);
-        for (0..n) |i| outs[i] = ret[i];
+        // P16.39 Cut 3 (correctness): runClosure may have reallocated
+        // bc_stack (the chunk's frames grow it) — re-derive the outs window
+        // before writing results (refreshBuiltinOuts; .dofile is listed in
+        // builtin_may_refresh_outs). Before this fix the write went through
+        // the stale pre-call slice: a dofile'd chunk deep enough to grow
+        // the stack silently lost its return values (reproduced: results
+        // read back as nil) and wrote into freed memory.
+        const outw = self.refreshBuiltinOuts() orelse outs;
+        const n = @min(outw.len, ret.len);
+        for (0..n) |i| outw[i] = ret[i];
         self.last_builtin_out_count = ret.len;
     }
 
@@ -27860,9 +28025,13 @@ pub const Vm = struct {
                     try self.callBuiltin(id, loader_args[0..], loader_out[0..]);
                     const v: Value = if (loader_out[0] != .Nil) loader_out[0] else .{ .Bool = true };
                     try self.setField(loaded_tbl, name, v);
-                    outs[0] = v;
-                    if (outs.len > 1) outs[1] = .{ .String = preload_str };
-                    self.last_builtin_out_count = @min(outs.len, 2);
+                    // P16.39 Cut 3 (correctness): the nested callBuiltin's
+                    // C-frame push may have reallocated bc_stack — re-derive
+                    // the outs window before writing results.
+                    const outw = self.refreshBuiltinOuts() orelse outs;
+                    outw[0] = v;
+                    if (outw.len > 1) outw[1] = .{ .String = preload_str };
+                    self.last_builtin_out_count = @min(outw.len, 2);
                     return;
                 },
                 .Closure => |cl| {
@@ -27878,9 +28047,12 @@ pub const Vm = struct {
                         try self.setField(loaded_tbl, name, .{ .Bool = true });
                         break :v .{ .Bool = true };
                     };
-                    outs[0] = final_val;
-                    if (outs.len > 1) outs[1] = .{ .String = preload_str };
-                    self.last_builtin_out_count = @min(outs.len, 2);
+                    // P16.39 Cut 3 (correctness): runClosure may have
+                    // reallocated bc_stack — re-derive before writing.
+                    const outw = self.refreshBuiltinOuts() orelse outs;
+                    outw[0] = final_val;
+                    if (outw.len > 1) outw[1] = .{ .String = preload_str };
+                    self.last_builtin_out_count = @min(outw.len, 2);
                     return;
                 },
                 else => {},
@@ -27955,8 +28127,11 @@ pub const Vm = struct {
                 try self.setField(loaded_tbl, name, .{ .Bool = true });
                 break :v .{ .Bool = true };
             };
-            outs[0] = final_val;
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(file_path) };
+            // P16.39 Cut 3 (correctness): runClosure may have reallocated
+            // bc_stack — re-derive before writing.
+            const outw = self.refreshBuiltinOuts() orelse outs;
+            outw[0] = final_val;
+            if (outw.len > 1) outw[1] = .{ .String = try self.internStr(file_path) };
             return;
         }
 
@@ -28101,8 +28276,11 @@ pub const Vm = struct {
             try self.setField(loaded_tbl, modname, .{ .Bool = true });
             break :v .{ .Bool = true };
         };
-        outs[0] = final_val;
-        if (outs.len > 1) outs[1] = .{ .String = try self.internStr(file_path) };
+        // P16.39 Cut 3 (correctness): the C loader's runClosure may have
+        // reallocated bc_stack — re-derive before writing.
+        const outw = self.refreshBuiltinOuts() orelse outs;
+        outw[0] = final_val;
+        if (outw.len > 1) outw[1] = .{ .String = try self.internStr(file_path) };
         return true;
     }
 
@@ -30804,16 +30982,23 @@ pub const Vm = struct {
             switch (resolved.callee) {
                 .Builtin => |id| {
                     try self.callBuiltin(id, resolved.args, outs);
+                    // P16.39 Cut 3 (correctness): the nested callBuiltin's
+                    // C-frame push may have reallocated bc_stack — re-derive
+                    // the outs window before the nil-fill.
+                    const outw = self.refreshBuiltinOuts() orelse outs;
                     if (builtinHasDynamicOutCount(id)) {
                         var i = self.last_builtin_out_count;
-                        while (i < outs.len) : (i += 1) outs[i] = .Nil;
+                        while (i < outw.len) : (i += 1) outw[i] = .Nil;
                     }
                 },
                 .Closure => |cl| {
                     const ret = try self.runClosure(cl, resolved.args);
                     defer self.alloc.free(ret);
-                    const n = @min(outs.len, ret.len);
-                    for (0..n) |i| outs[i] = ret[i];
+                    // P16.39 Cut 3 (correctness): runClosure may have
+                    // reallocated bc_stack — re-derive before writing.
+                    const outw = self.refreshBuiltinOuts() orelse outs;
+                    const n = @min(outw.len, ret.len);
+                    for (0..n) |i| outw[i] = ret[i];
                 },
                 else => unreachable,
             }
@@ -39150,7 +39335,7 @@ pub const Vm = struct {
             .{ .Closure = cl }
         else
             .Nil;
-        try self.pushBuiltinCFrame(callee_val);
+        _ = try self.pushBuiltinCFrame(callee_val);
         // P15.82c: Save the index of THIS C-frame. Later, during TBC close,
         // nested Lua/C frames may be pushed on top (e.g. __close metamethod,
         // coroutine.yield builtin C-frame). We must address OUR C-frame,
@@ -41072,7 +41257,7 @@ pub const Vm = struct {
                 th.call_frames.getPtr(script_frame_idx).u.c.parked_stack = null;
             }
         } else {
-            try self.pushBuiltinCFrame(.{ .Thread = th });
+            _ = try self.pushBuiltinCFrame(.{ .Thread = th });
             script_frame_idx = th.call_frames.len() - 1;
             frame_pushed_here = true;
         }
@@ -41632,7 +41817,7 @@ pub const Vm = struct {
                 };
 
                 if (!reuse_cframe) {
-                    try self.pushBuiltinCFrame(callee);
+                    _ = try self.pushBuiltinCFrame(callee);
                 }
                 const cframe = th.call_frames.getPtr(th.call_frames.len() - 1);
                 // P15.82e: remember the previous state (owned by an outer
@@ -42685,7 +42870,7 @@ pub const Vm = struct {
                 };
                 if (!reuse_cframe) {
                     // No C-frame at all (yieldk from a raw C context).
-                    try self.pushBuiltinCFrame(.{ .Thread = th });
+                    _ = try self.pushBuiltinCFrame(.{ .Thread = th });
                 }
                 const cframe = th.call_frames.getPtr(th.call_frames.len() - 1);
                 // P15.82e: an old state (if any) is owned by the running
@@ -43041,7 +43226,7 @@ pub const Vm = struct {
                 // Reuse the existing C-frame (or push one only as a
                 // fallback when there is none at all).
                 if (!reuse_cframe) {
-                    try self.pushBuiltinCFrame(callee);
+                    _ = try self.pushBuiltinCFrame(callee);
                 }
                 const cframe = th.call_frames.getPtr(th.call_frames.len() - 1);
 
@@ -43460,6 +43645,62 @@ pub const Vm = struct {
             .coroutine_resume, .coroutine_wrap_iter, .coroutine_yield, .coroutine_close, .pcall, .xpcall, .utf8_codepoint, .io_lines_iter, .io_read, .file_read, .file_close, .io_close, .io_popen, .os_execute, .dofile, .io_lines, .file_lines, .testc_testC => true,
             else => false,
         };
+    }
+
+    /// P16.39 Cut 3: comptime table — builtins whose synchronous
+    /// callBuiltin path requires a C-frame (pushBuiltinCFrame). False only
+    /// for the frameless pair: collectgarbage and string_sub never re-enter
+    /// the VM in ways that need a C activation (hooks, continuations,
+    /// traceback, yield parking). Replaces the two-enum-compare idiom
+    /// (`id != .collectgarbage and id != .string_sub`) with one table load.
+    const builtin_needs_cframe: [@typeInfo(BuiltinId).@"enum".fields.len]bool = blk: {
+        var t = [_]bool{true} ** @typeInfo(BuiltinId).@"enum".fields.len;
+        t[@intFromEnum(BuiltinId.collectgarbage)] = false;
+        t[@intFromEnum(BuiltinId.string_sub)] = false;
+        break :blk t;
+    };
+
+    inline fn builtinNeedsCFrame(id: BuiltinId) bool {
+        return builtin_needs_cframe[@intFromEnum(id)];
+    }
+
+    /// P16.39 Cut 3: comptime table — builtins that re-enter the VM and
+    /// re-derive their outs slice via refreshBuiltinOuts(), directly or
+    /// transitively through the helpers they call. callBuiltin registers
+    /// the outs window (builtin_outs_* fields) ONLY for these builtins;
+    /// for every other builtin the window classification + field
+    /// save/set/restore is dead weight (~25 instructions per call,
+    /// measured P16.39 K5).
+    ///
+    /// Single source of truth: adding a refreshBuiltinOuts call — directly
+    /// or via a new helper reachable from a builtin arm — REQUIRES adding
+    /// that builtin here. A missing entry is caught loudly: safe builds
+    /// assert in refreshBuiltinOuts that active_builtin is listed (all
+    /// test suites run Debug), and the failure mode without the assert is
+    /// a stale-window use-after-free, not silent misbehavior.
+    ///
+    /// Transitive members: .loadfile and .require route through
+    /// builtinLoad → builtinLoadEx; .require also calls builtinLoadfile and
+    /// tryCLoad directly; .str_arith_* route through strArithMetamethod;
+    /// .testc_testC's loadstring arm calls builtinLoadEx directly.
+    /// .dofile/.require/.pairs/.collectgarbage re-derive after nested
+    /// execution (runClosure / nested callBuiltin / GC finalizers) before
+    /// writing their results (P16.39 Cut 3 correctness fix).
+    const builtin_may_refresh_outs: [@typeInfo(BuiltinId).@"enum".fields.len]bool = blk: {
+        var t = [_]bool{false} ** @typeInfo(BuiltinId).@"enum".fields.len;
+        for ([_]BuiltinId{
+            .tostring, .pcall,          .xpcall,
+            .load,    .loadfile,        .dofile,
+            .require, .pairs,           .collectgarbage,
+            .str_arith_add, .str_arith_sub, .str_arith_mul, .str_arith_mod,
+            .str_arith_pow, .str_arith_div, .str_arith_idiv, .str_arith_unm,
+            .testc_testC,
+        }) |rid| t[@intFromEnum(rid)] = true;
+        break :blk t;
+    };
+
+    inline fn builtinMayRefreshOuts(id: BuiltinId) bool {
+        return builtin_may_refresh_outs[@intFromEnum(id)];
     }
 
     /// P16.35 Cut 3: comptime table of per-builtin fixed out-counts.

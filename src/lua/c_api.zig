@@ -2806,8 +2806,8 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
                     // nups = nupvalues of the called function (0 for light C
                     // functions / builtins), nparams = 0, isvararg = 1 — C
                     // functions accept any number of arguments.
-                    const func = if (frame.func_slot < vm.bc_stack.len)
-                        vm.bc_stack[frame.func_slot]
+                    const func = if (frame.func_slot < th.bytecode_stack.len)
+                        th.bytecode_stack[frame.func_slot]
                     else
                         .Nil;
                     ar.nups = if (func == .Closure)
@@ -2878,8 +2878,8 @@ pub export fn lua_getlocal(L: ?*lua_State, ar: *lua_Debug, n: c_int) ?[*:0]const
             if (count == n) {
                 // Push the local's value from the bytecode register file.
                 const reg_idx = frame.frameBase() + lv.reg;
-                if (reg_idx >= vm.bc_stack.len) return null;
-                const val = vm.bc_stack[reg_idx];
+                if (reg_idx >= th.bytecode_stack.len) return null;
+                const val = th.bytecode_stack[reg_idx];
                 h.c_stack.append(vm.alloc, val) catch return null;
                 return @ptrCast(@constCast(lv.name.ptr));
             }
@@ -2920,8 +2920,8 @@ pub export fn lua_setlocal(L: ?*lua_State, ar: *lua_Debug, n: c_int) ?[*:0]const
                 const val = h.c_stack.items[h.c_stack.items.len - 1];
                 h.c_stack.items.len -= 1;
                 const reg_idx = frame.frameBase() + lv.reg;
-                if (reg_idx >= vm.bc_stack.len) return null;
-                vm.bc_stack[reg_idx] = val;
+                if (reg_idx >= th.bytecode_stack.len) return null;
+                th.bytecode_stack[reg_idx] = val;
                 return @ptrCast(@constCast(lv.name.ptr));
             }
         }

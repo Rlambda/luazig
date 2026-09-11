@@ -1,4 +1,4 @@
-> Last updated: 2026-09-11 (P16.37 in progress — Cut 0 truth: P16.36-final воспроизведён (RF sha16 a43c3f73608b65d4 byte-identical, spot-counters int_arith/lua_calls exact, coroutine_yield −1.2% noise), T0.2 fresh switchRuntime-декомпозиция (variant D lookup-free: 2 switches/cycle ровно, switchRuntime 151.0 i/cycle self = park 42 + activate 34 + refreshHooksCached 24 + guard/prologue ~51, ensureTotalCapacity ~0 — 4-field SIMD moves видимы в objdump, символ 752 B; артефакт p16.37-t0-switch-decomposition.md), R0.3 callframe-layout provenance regenerated @ 5221906 (контент неизменен — все значения byte-identical), R0.2 errored-coroutine TBC __close timing diverгенция ПОДТВЕРЖДЕНА (PUC defers-to-close / luazig closes-during-unwind, оба вывода captured verbatim — backlog, не чинилась); Cut 1 table.sort non-yieldable comparator ЗАВЕРШЁН: tableSortLess переписан на nny-единицу (6 спец-кейсов coroutine_yield удалено, error-wrapping удалено, enter ДО resolveCallable — CALL hook внутри окна), comparator checktype + "invalid order function" failArgerror-сайты, follow-on arg-error naming parity (_G в _LOADED, pushGlobalFuncName, checkTabArg arg_no — 7 сайтов; errors.lua регрессия закрыта), side-fix undump fixed-borrow alignment (copy-fallback на misaligned base — латентный UB, вскрыт сдвигом arena-офсетов), smoke 78 (T12 dropped — pre-existing trampoline bug, backlog), negative validation ×1; гейты: unit D+RF 217/217, smoke 77/77, matrix zig_fail=0, c_api test+diff, api580 GREEN; backlog: trampoline lost-continuation crash, coroutine.close/setmetatable arg-сообщения; следующий cut — из P16.37 queue)
+> Last updated: 2026-09-11 (P16.37 Cut 2 ЗАВЕРШЁН: thread runtime ownership Variant A — Thread навсегда владеет bytecode_stack/boxed/stack_top/tbc_regs, Vm-поля и move ceremony УДАЛЕНЫ как класс (parkActiveRuntime/activateRuntime/switchRuntime 151 i/cycle ×2, active_runtime_thread, branchy резолвы), switchThread = current_thread store + refreshHooksCached, ~290 сайтов переехали (ctx.th/th-пары/inline activeBytecodeThread), Vm 6592→6520 B (−72 = ровно 5 полей), Thread 3712 без изменений; T7 A/B: coroutine_yield −6.3% instructions (1,092.2M→1,023.5M), field_access −9.0%, cy_d −6.2%, lua_calls −1.8%, контроли int_arith/branch_loop/table_alloc ~0 = шума → новой per-opcode цепочки нет; perf_compare 18/18 OK geomean 1.43x, coroutine_yield −9.7% wall; T8: GC-count полная реклеймация (no leak), native_mem LINEAR = pre-existing (идентично на HEAD); locals.lua targeted-parity diff = pre-existing GC-pacing класс (байт-идентично на HEAD, stash-эксперимент); гейты: unit D+RF 217/217, smoke 77/77, matrix zig_fail=0, c_api 50 PASS (TBC 22+23), api580 GREEN; артефакт p16.37-thread-runtime-ownership.md дополнен completion record; следующий cut — из P16.37 queue: yield copying ~50 i/it (setFrom ×2 + resume-tail copy vs PUC zero-copy))
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -10479,3 +10479,67 @@ sort_comp's lua_call.
 both_fail pre-existing; errors.lua снова PASS — остался только
 pre-existing stack-depth count diff 999756 vs 999961); c_api test +
 test-diff PASS (TBC 22+23); api580 GREEN.
+
+## P16.37 Cut 2 — thread runtime ownership: Variant A, стек навсегда на Thread (2026-09-11)
+
+Архитектурный cut из P16.37 queue: switchRuntime per-thread stacks. Выбран
+**Variant A** (Thread fields canonical) — PUC-first модель: в PUC стек живёт
+на `lua_State` (`L->stack`, lstate.c), `global_State` не держит стека;
+`Thread.bytecode_stack` = `L->stack`, `activeBytecodeThread()` = `L`,
+dispatch кэширует тред как PUC кэширует `L`/`ci`. Variant B (Vm держит
+заимствованный `active_runtime: *BytecodeRuntime`) отвергнут: двойной
+source-of-truth (current_thread ↔ active_runtime — тот самый класс
+инварианта, который сейчас страдает от active_runtime_thread), нет PUC
+аналога, switch дороже.
+
+**Удалено как класс** (артефакт p16.37-thread-runtime-ownership.md,
+10-механизмный инвентарь): `active_runtime_thread` (Vm-поле), Vm-поля
+`bc_stack`/`bc_boxed`/`bc_stack_top`/`bc_tbc_regs`, `parkActiveRuntime`
+(21 i/switch), `activateRuntime` (17 i/switch), `switchRuntime`
+(151 i/cycle ×2/cycle — 4-field SIMD move ceremony), branchy
+active-vs-parked резолвы в `stackForThread`/`Cell.resolveStack`/
+gcPropagateOne, guard `active_runtime_thread != th` в gcFreeObject.
+`switchThread` = store `current_thread` (null=main — единственный
+switch-state указатель) + `refreshHooksCached`. `bytecode_stack.len == 0`
+означает только "никогда не активировался" (lazy first-use), НЕ
+active-сентинел. ~290 consumer-сайтов переехали (ctx.th в dispatch, th-пары
+в per-thread путях, inline `activeBytecodeThread()` в cold/debug);
+сигнатуры с th-параметром: stageBytecodeCall, stageFixedCall,
+pushStagedFast, pushStagedBytecodeExecFrame, prepareVahidShift,
+raiseFrameOverflow, popBytecodeExecFrame, bcGrowFrame;
+ensureBcStackCap(th, needed) двухаргументная везде.
+
+**Размеры**: Thread 3712 B (без изменений — поля и так жили там), Vm
+6592→**6520 B (−72 B = ровно 5 удалённых полей)**, CallFrame 88 B.
+
+**T7 A/B instructions:u** (median-of-3, taskset -c 0, immutable binaries
+cut1/cut2): coroutine_yield 1,092,199,178 → 1,023,529,434 = **−6.3%**
+(цель cut — move ceremony удалена); cy_d (hoisted) −6.2%; field_access
+**−9.0%**; lua_calls −1.8%; hash_access −1.6%; контролы int_arith
++0.0002% / branch_loop ~0 / table_alloc_setmetatable +0.25% = шум →
+новой per-opcode dependent-load цепочки в dispatch head нет (T7.4:
+ctx.th ставится один раз на frame_loop entry, слот того же класса, что
+ctx.regs). perf_compare median-of-7 vs baseline-approved (P16.36-final):
+**18/18 OK**, geomean 1.43x, coroutine_yield −9.7% wall, field_access
+−5.6%, 0 WARN/FAIL.
+
+**T8 memory probes**: GC-count (1000 корутин на состояние):
+luazig 3776 B/coroutine константно (never/yielded/full), после drop
+20.7 KB live = полная реклеймация, утечки нет (PUC ~985–1113 B/co;
+3776 = сам Thread 3712 + header, pre-existing размер). native_mem_check
+co-lifecycle probe: LINEAR 9.86 MB/decade — **идентично на Cut 1 HEAD
+(10.08)** = pre-existing allocator high-water (~7 B/co slope при полной
+GC-реклеймации), НЕ регрессия Cut 2.
+
+**Pre-existing дивергенции, проверенные stash-бaseline экспериментами**
+(байт-идентичные падения на HEAD 1fab11d и с Cut 2):
+`run_tests.py --suite locals.lua` (targeted parity из api_regression_lane)
+— известный locals-tracegc GC-pacing dot-count класс (zig 3 vs ref 2
+stderr-точки, задокументирован с P16.36,
+locals-tracegc-divergence.json); native_mem LINEAR (выше).
+
+Гейты Cut 2: fmt; unit D+RF **217/217**; smoke **77/77**; matrix --testc
+31/32 zig_fail=0 (big.lua both_fail pre-existing); c_api make test
+**50 PASS** (TBC 22+23) + test-diff; api580 GREEN; api_integration_lane
+ok; api_regression_lane: unit ok + testC lane ok, targeted parity
+locals.lua = pre-existing (байт-идентично на HEAD).

@@ -1,27 +1,27 @@
 {
   "meta": {
-    "created_utc": "2026-09-11T13:57:05.463753+00:00",
+    "created_utc": "2026-09-11T16:53:28.760588+00:00",
     "lane": "smoke_compare",
     "argv": [
       "/home/boss/codes/luazig/tools/smoke_compare.py",
       "--json-out",
-      "/home/boss/codes/luazig/tools/status/.tmp.smoke.cb5rf255.json"
+      "/home/boss/codes/luazig/tools/status/.tmp.smoke.mjaopm5w.json"
     ],
     "zig_version": "0.16.0"
   },
   "provenance": {
-    "git_head": "dabfad6",
-    "measured_source_head": "dabfad6",
+    "git_head": "bc0f820",
+    "measured_source_head": "bc0f820",
     "git_dirty": "dirty",
-    "source_dirty": "clean",
+    "source_dirty": "dirty",
     "artifact_dirty": "dirty",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "a892306a2856f0b4",
+    "zig_binary_sha16": "38ae1885a4864c82",
     "puc_binary_sha16": "d54bc45e1757b216"
   },
-  "total": 77,
-  "ok": 77,
+  "total": 78,
+  "ok": 78,
   "mismatches": 0,
   "results": [
     {
@@ -330,6 +330,10 @@
     },
     {
       "file": "tests/smoke/78_table_sort_yieldability.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/79_trampoline_ownership.lua",
       "match": true
     }
   ]

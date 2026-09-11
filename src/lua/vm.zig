@@ -4514,6 +4514,19 @@ pub const Vm = struct {
     forced_close_thread: ?*Thread = null,
     forced_close_had_error: bool = false,
     bytecode_coroutine_trampoline_active: bool = false,
+    /// P16.38 Cut 1 (T12): the thread whose body the active trampoline's
+    /// CURRENT drive iteration is executing. This is ownership recording
+    /// (same class as `current_thread`), not a behavioral mode flag: it
+    /// records WHICH `runClosure` entry in `driveBytecodeCoroutineTrampoline`
+    /// is live, so `tryRequestBytecodeCoroutineSwitch` can distinguish the
+    /// trampoline's own drive iteration (safe to unwind to the trampoline's
+    /// catch — only trampoline machinery frames lie below) from a NESTED
+    /// host-recursive `runBytecodeInternal` (e.g. a table.sort comparator,
+    /// whose native Zig-stack state would be destroyed by the unwind).
+    /// Set at the drive loop's single `runClosure` site (every iteration
+    /// converges there: fresh entry, post-switch, post-bubble,
+    /// post-finishCcall); cleared in the trampoline's exit defer.
+    bytecode_trampoline_drive_thread: ?*Thread = null,
     bytecode_coroutine_switch_request: ?BytecodeCoroutineSwitchRequest = null,
     pattern_match_budget: usize = 0,
     pattern_budget_active: bool = false,
@@ -10571,6 +10584,38 @@ pub const Vm = struct {
     /// to the one active trampoline. The caller's activation stays in its
     /// Thread-owned frame stack; no Zig frame has to remain alive while the
     /// child coroutine runs.
+    ///
+    /// P16.38 Cut 1 (T12) — eligibility. A `ThreadSwitch` unwinds every Zig
+    /// frame between the requesting dispatch loop and the trampoline's catch
+    /// in `driveBytecodeCoroutineTrampoline`. That unwind is lossless ONLY
+    /// when those frames are exactly the trampoline's own machinery
+    /// (`runClosure → runBytecodeInternal → runBytecodeDispatch`) — i.e. the
+    /// requesting loop IS the trampoline's current drive iteration. Any other
+    /// requester has native state on the Zig stack below (sort comparator
+    /// state, metamethod/repl/close continuation frames, C builtin state)
+    /// that the unwind would destroy — the T12 "coroutine trampoline lost
+    /// continuation" crash. The drive iteration is identified exactly by:
+    ///
+    ///   1. `bytecode_coroutine_trampoline_active` — a trampoline exists;
+    ///   2. the requesting thread == `bytecode_trampoline_drive_thread` —
+    ///      the loop runs on the drive thread. A sync-fallback child (or a
+    ///      c_api-resumed thread) enters `runBytecodeInternal` with a FRESH
+    ///      boundary 0 on its OWN thread, so the boundary check alone is
+    ///      insufficient (nested graph A→comparator→B→resume(C));
+    ///   3. `boundary_depth == 0` — on the drive thread this means the
+    ///      requesting loop is the outermost `runBytecodeInternal` (any
+    ///      nested host-recursive entry has ≥ 1 resident frame below, hence
+    ///      boundary ≥ 1). The only nonzero-boundary drive iteration is the
+    ///      cold testC-callk `finishCcall` re-entry, which conservatively
+    ///      falls back below.
+    ///
+    /// Rejected requests fall through to the ordinary builtin dispatch, whose
+    /// `builtinCoroutineResume` runs the child body SYNCHRONOUSLY
+    /// (`runClosure`) — exactly PUC's nested `luaB_coresume → lua_resume`
+    /// under any native state. All eligibility checks run BEFORE any state
+    /// commit (args copy, saved-error, continuation alloc, pending-call,
+    /// switch request, inplace-suspended): a rejected request leaves zero
+    /// residue. See tools/status/p16.38-trampoline-ownership.md.
     fn tryRequestBytecodeCoroutineSwitch(
         self: *Vm,
         exec_frames: *FrameStack,
@@ -10580,10 +10625,23 @@ pub const Vm = struct {
         id: BuiltinId,
         args: []const Value,
         tail_return: bool,
+        boundary_depth: usize,
     ) DispatchError!bool {
         if (!self.bytecode_coroutine_trampoline_active) return false;
+        // T12: a nested host-recursive runBytecodeInternal (sort comparator,
+        // metamethod/require under a C builtin, testC close continuation)
+        // has native state on the Zig stack below — unwinding to the
+        // trampoline would destroy it. Only the drive iteration (boundary 0
+        // on the drive thread) may switch.
+        if (boundary_depth != 0) return false;
         const target = self.bytecodeCoroutineTarget(id, args) orelse return false;
         const caller = self.activeBytecodeThread();
+        // T12: the requesting loop must be the trampoline's own drive
+        // iteration. A sync-fallback child or c_api-resumed thread enters
+        // with boundary 0 on its OWN thread — the thread identity check
+        // rejects those (they must run nested/synchronously, like PUC's
+        // nested lua_resume).
+        if (self.bytecode_trampoline_drive_thread != caller) return false;
         // A coroutine that is waiting for this caller is "normal", not
         // resumable. Let the ordinary builtin produce `(false, message)`;
         // switching the trampoline back into an ancestor would create a cycle
@@ -11879,6 +11937,7 @@ pub const Vm = struct {
         self.bytecode_coroutine_trampoline_active = true;
         defer {
             self.bytecode_coroutine_trampoline_active = false;
+            self.bytecode_trampoline_drive_thread = null;
             if (self.bytecode_coroutine_switch_request) |request| {
                 self.alloc.free(request.args);
                 self.bytecode_coroutine_switch_request = null;
@@ -12055,6 +12114,24 @@ pub const Vm = struct {
                     };
                     const args = if (first_run) initial_args else active.entry_args orelse &[_]Value{};
                     first_run = false;
+
+                    // P16.38 Cut 1 (T12): record the drive iteration's owner
+                    // BEFORE entering the body. Every drive iteration (fresh
+                    // entry, post-switch, post-bubble, post-finishCcall)
+                    // converges on this single runClosure site, so the field
+                    // always names the thread whose dispatch loop is the
+                    // outermost runBytecodeInternal. tryRequestBytecodeCoroutine
+                    // Switch uses this to reject switch requests from nested
+                    // host-recursive loops (sort comparators, metamethods
+                    // under C builtins) and from sync-fallback children on
+                    // other threads — those run synchronously, like PUC's
+                    // nested lua_resume. A stale value (between a switch and
+                    // the next iteration reaching this site) can only cause
+                    // a conservative reject, never a false accept: the old
+                    // drive thread is suspended (no dispatch loop running on
+                    // it), and everything else is on another thread or nested
+                    // (boundary >= 1).
+                    self.bytecode_trampoline_drive_thread = active;
 
                     const ret_opt: ?[]Value = retblk: {
                         const values = self.runClosure(closure, args) catch |run_err| switch (run_err) {
@@ -18054,6 +18131,7 @@ pub const Vm = struct {
                 callee_val.Builtin,
                 call_args,
                 true,
+                ctx.boundary_depth,
             )) return error.ThreadSwitch;
 
         // ── PUC luaD_poscall fast path (P16.32 T2 Cut B) ──
@@ -18671,6 +18749,7 @@ pub const Vm = struct {
                         id,
                         rargs,
                         false,
+                        ctx.boundary_depth,
                     )) return error.ThreadSwitch;
                 if (id == .string_gsub) {
                     switch (try self.tryStartBytecodeGsub(

@@ -1,4 +1,4 @@
-> Last updated: 2026-09-11 (P16.37 COMPLETE — thread runtime ownership Variant A (Cut 0 60681b9 + Cut 1 1fab11d + Cut 2 dabfad6): table.sort nny parity + arg-message naming parity + undump alignment fix; permanent Thread runtime ownership (move ceremony deleted, switch = thread-select + hook refresh); coroutine_yield -6.3% instr / -9.7% wall @ Cut 2 (final fresh -8.45%); geomean 1.42994, 18/18 OK 0 WARN/FAIL; gap(D) 1529.4 -> 1076.0 i/it (-29.6% over P16.36+P16.37); switchRuntime/park/activate ABSENT from profile; Vm 6520 / Thread 3712 / CallFrame 88 RF exact; P16.38 queue: yield copying ~50 i/it, internStr GC cascade, errored-coroutine TBC timing, semantic backlog)
+> Last updated: 2026-09-11 (P16.38 Cut 1)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -34,7 +34,7 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
 | Differential output (`--diff`) | **0 output_diff** |
-| Smoke tests (`tests/smoke/*.lua`) | **77/77** pass |
+| Smoke tests (`tests/smoke/*.lua`) | **78/78** pass |
 | C API suites (`tests/c_api`) | 23 suites |
 | Performance (geomean vs PUC) | **1.43x** |
 
@@ -10632,3 +10632,120 @@ current-counters.json + current-profile-index.json (snapshot
 pre-existing); smoke **77/77** PASS (ok=77 mismatches=0, включая
 78_table_sort_yieldability); README/STATUS status-блоки регенерированы (status_snapshot --phase
 "P16.37 COMPLETE" + status_summary --use-current --perf-current).
+
+## P16.38 Cut 0 — truth/cleanup: T12 root cause + stale-comment fix + layout provenance regen (2026-09-11)
+
+Baseline @ 3c68d37 (src == dabfad6): все гейты зелёные (unit D/RF, smoke
+77/77, matrix zig_fail=0, api580, coroutine_yield A-official
+median-of-3 = 1,030,433,195 instr).
+
+**T12 root cause (полностью прослежен)**: `tryRequestBytecodeCoroutineSwitch`
+гейтился ТОЛЬКО глобальным `bytecode_coroutine_trampoline_active` и не
+отличал собственную drive-итерацию трамплина от NESTED host-recursive
+`runBytecodeInternal` (компаратор table.sort под
+`builtinTableSort → tableSortLess → runClosure`). Switch-запрос из
+компаратора: errdefer не suspension-owner → unwind уничтожает frame
+компаратора + pending-call + нативное sort-состояние на Zig-стеке →
+bubble-back не находит pending на верхнем frame родителя →
+`fail("coroutine trampoline lost continuation")`. PUC: nested
+`luaB_coreseme → lua_resume` из любой глубины — синхронный C-stack resume.
+
+**T1.7 (nCcalls @ resume entry, сверено с PUC 5.5.0 ldo.c:978-981)**:
+`resumeEnterC` уже точен — `nCcalls = getCcalls(from)` (только нижние 16
+бит, nny НЕ наследуется: upper-биты), reject при `>= LUAI_MAXCCALLS=200`,
+затем +1. Дочерняя корутина, resumed из non-yieldable родителя, yieldable —
+как в PUC (t12: `inner-resume true inner-y`).
+
+**R0.5**: 6 устаревших комментариев active/parked-модели в vm.zig
+переписаны на durable-формулировку "Thread permanently owns its bytecode
+runtime; switchThread selects the executing thread" (upvalue-cell ~678,
+apiNewThread ~5617, trampoline doc ~11867, closeThreadRegions ~22830,
+GC thread-free ~25271, GC inactive-coroutines ~25914). Исторические
+"was:"/"old" заметки сохранены намеренно.
+
+**R0.6**: tools/perf/current-callframe-layout.json provenance
+регенерирован @ 3c68d37/src==dabfad6 — standalone-пробник вне репо,
+Debug+ReleaseFast, ВСЕ layout-значения байт-идентичны (CallFrame 88,
+align 8, u@32, U 56, LuaFrameState 48, CFrameState 56, CFrameAux 8;
+comptime-ассерты vm.zig:2549-2552). Хирургическая правка 7 строк
+(provenance-only).
+
+**Коммит**: bc0f820 (vm.zig комментарии + layout provenance).
+
+## P16.38 Cut 1 — T12 FIX: trampoline switch eligibility = drive-iteration ownership (2026-09-11)
+
+**Критерий (T1.4/T1.5, полный аудит call-site'ов и контекстов —
+tools/status/p16.38-trampoline-ownership.md)**:
+
+```
+eligible ⟺ trampoline_active
+        ∧ requesting thread == bytecode_trampoline_drive_thread
+        ∧ boundary_depth == 0
+```
+
+- `bytecode_trampoline_drive_thread: ?*Thread` — запись владельца (тот же
+  класс, что `current_thread`), НЕ поведенческий флаг: ставится на
+  единственном `runClosure`-сайте drive-цикла (все итерации сходятся там:
+  fresh/post-switch/post-bubble/post-finishCcall), чистится в exit-defer.
+- `boundary_depth == 0` на drive-потоке ⟺ запрашивающий loop — внешний
+  `runBytecodeInternal` = drive-итерация (любой nested host-recursive вход
+  имеет ≥1 резидентный frame → boundary ≥ 1). Единственная drive-итерация
+  с ненулевым boundary — холодный testC-callk finishCcall re-entry
+  (bytecode_resume_boundary = len-1) — консервативно уходит в fallback.
+- Проверка thread-identity ОБЯЗАТЕЛЬНА дополнительно к boundary:
+  sync-fallback child (или c_api-resumed thread) входит с boundary 0 на
+  СВОЁМ потоке (nested graph A→компаратор→B→resume(C)).
+- Stale drive_thread (между switch и следующим runClosure-сайтом) даёт
+  только консервативный reject, никогда false accept: старый drive-поток
+  suspended, остальное либо на другом потоке, либо nested (boundary ≥ 1).
+- Отклонённые запросы падают в СУЩЕСТВУЮЩИЙ sync-fallback
+  `builtinCoroutineResume` (`cl.proto != null and !trampoline_active →
+  driveTrampoline else runClosure`) = PUC nested lua_resume. Все
+  eligibility-проверки ДО любого state-commit (args copy, saved-error,
+  continuation alloc, pending-call, switch request, inplace-suspended) —
+  нулевой residue при reject.
+
+**T1.9 negative validation**: критерий нейтрализован (`and false` на обеих
+проверках) → T12 репродуцируется ровно (`coroutine trampoline lost
+continuation`); восстановлен → t12 byte-identical с PUC. Фикс каузален.
+
+**Постоянный тест**: tests/smoke/79_trampoline_ownership.lua — 12 кейсов
+(A–L): A=t12-форма; B=child-returns; C=child-error+pcall-recovery+sort
+completes; D=inner resumed ×3; E=nested pcall вокруг inner resume; F=
+компаратор по-прежнему не может yield после child resume (C-boundary
+error); G=post-sort outer yield; H=gsub repl resume (iterative —
+chain через трамплин сохранён, P16.36 Cut 3 модель); I=__lt metamethod
+comparator resume (host-recursive → sync); J=nested graph
+компаратор→B→resume(C)→C yields; K=coroutine.wrap iterator из
+компаратора; L=pcall-wrapped resume в drive body (boundary 0 → chain).
+ВСЕ byte-identical PUC 5.5.0 ↔ zig. Note в 78_table_sort_yieldability
+про "known pre-existing trampoline bug" переписан на fixed-указатель.
+
+**Гейты Cut 1**: unit Debug PASS + unit ReleaseFast PASS; smoke **78/78**
+PASS (ok=78 mismatches=0, включая новый 79); matrix --testc zig_fail=0
+(big.lua both_fail pre-existing); targeted coroutine/db/errors/locals/
+cstack/strings/sort — все pass; c_api make test PASS + test-diff PASS
+(включая TBC 22+23); api580 GREEN (D+RF+sizes).
+
+**Perf guard (coroutine_yield A-official, median-of-3 instructions:u,
+taskset -c 0, ReleaseFast)**: 1,023,361,433 / 1,030,431,919 / 1,023,360,318
+→ median **1,023,361,433** vs baseline 1,030,433,195 = **-0.69%** (flat,
+в пределах шума; hot path — pure-Lua nested resume на drive-потоке с
+boundary 0 — остаётся eligible, добавлены 2 сравнения на уже загруженных
+полях).
+
+**Наблюдение (не блокер, вне скоупа)**: pre-existing расхождение
+формата ошибки order-error под coroutine.resume — zig добавляет
+`file:line:` префикс к "attempt to compare two table values", PUC 5.5.0
+нет (luaG_ordererror → luaG_runerror из C-контекста sort). Обнаружено при
+написании кейса I (тест-баг: __lt на метатаблице mt, а не на mt —
+исправлено в самом тесте до дифа).
+
+**P16.38 queue (обновлён)**:
+1. **yield copying ~50 i/it** — без изменений.
+2. **internStr GC cascade** — без изменений.
+3. **errored-coroutine TBC `__close` timing** — без изменений.
+4. Semantic backlog: ~~T12 trampoline lost-continuation crash~~ (ЗАКРЫТ
+   этим Cut'ом); остались comparator call-counts (алгоритмическое),
+   coroutine.close/setmetatable arg messages, order-error position-prefix
+   (новое, см. выше).

@@ -177,13 +177,13 @@ end)
 print("T10-r1", coroutine.resume(co10))
 print("T10-r2", coroutine.resume(co10))
 
--- NOT covered here (known pre-existing trampoline bug, backlog — see
--- STATUS.md "P16.37 backlog"): a comparator that RESUMES another
+-- Formerly NOT covered here (fixed in P16.38 Cut 1 — see
+-- 79_trampoline_ownership.lua): a comparator that RESUMES another
 -- coroutine while the coroutine trampoline is active (coroutine →
 -- table.sort comparator → coroutine.resume(inner)). The trampoline
--- switch request unwinds through builtinTableSort's Zig-stack sort
--- state and fails with "coroutine trampoline lost continuation".
--- Reproducer: /tmp/opencode/p37_t12_min.lua; crashes identically on
--- the pre-P16.37 binary (systemic: any Lua nested under a builtin via
--- runClosure, not sort-specific). The nny unit itself is per-thread
--- and does not affect the resumed coroutine's own yieldability.
+-- switch request used to unwind through builtinTableSort's Zig-stack
+-- sort state and fail with "coroutine trampoline lost continuation";
+-- it was systemic (any Lua nested under a builtin via runClosure, not
+-- sort-specific). P16.38 restricted switch eligibility to the
+-- trampoline's own drive iteration (drive thread + boundary 0), so
+-- nested resumes run synchronously like PUC's nested lua_resume.

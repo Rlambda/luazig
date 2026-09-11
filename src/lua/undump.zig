@@ -363,22 +363,42 @@ pub const UndumpReader = struct {
         // cursor to sizeof(Instruction) so fixed-buffer undump can BORROW
         // the code block directly from the input buffer (PUC PF_FIXED
         // parity: lundump.c:187-193 loadCode + getaddr).
+        //
+        // Borrow feasibility: the writer's padding aligns each block
+        // RELATIVE to the buffer start, so the borrowed pointers are
+        // naturally aligned iff the buffer BASE is Instruction-aligned.
+        // PUC's fixed mode plain-casts regardless (lundump.c:191) — a
+        // misaligned base is UB in PUC too; it implicitly assumes
+        // malloc-aligned input. Zig's @alignCast UB is not safely
+        // ignorable, so on a misaligned base we fall back to COPYING the
+        // block into a fresh aligned allocation: identical observable
+        // semantics, defined behavior for every input. Both 4-aligned
+        // borrow blocks (code, lineinfo) are relative to the same base,
+        // so borrow-ability is all-or-nothing — one check covers both.
+        const fixed_borrow = self.fixed and
+            (@intFromPtr(self.data.ptr) % @alignOf(bc.Instruction) == 0);
         const code_len = try self.readU32();
         try self.skipAlign(@sizeOf(bc.Instruction));
-        // In fixed-buffer mode, point directly into the input buffer (PUC's
-        // `f->code = getaddr(...)`). The writer's alignment padding guarantees
-        // the borrowed pointer is naturally aligned for Instruction. In
-        // non-fixed mode, allocate and copy instruction-by-instruction.
-        const code_borrowed = self.fixed;
-        const code: []const bc.Instruction = if (self.fixed) blk: {
+        // In fixed mode, point directly into the input buffer (PUC's
+        // `f->code = getaddr(...)`). In non-fixed mode — or fixed mode
+        // with a misaligned buffer base — allocate and copy.
+        const code_borrowed = fixed_borrow;
+        const code: []const bc.Instruction = if (fixed_borrow) blk: {
             const byte_len = code_len * @sizeOf(bc.Instruction);
             const raw = try self.getaddr(byte_len);
-            // Debug assert: the borrowed pointer must be Instruction-aligned.
-            // The writer's writeAlign guarantees this; the assert catches
-            // corrupted chunks or misaligned input buffers.
-            std.debug.assert(@intFromPtr(raw.ptr) % @alignOf(bc.Instruction) == 0);
+            // Alignment is guaranteed by `fixed_borrow` (base check above
+            // + the writer's writeAlign padding).
             const ptr: [*]const bc.Instruction = @ptrCast(@alignCast(raw.ptr));
             break :blk ptr[0..code_len];
+        } else if (self.fixed) blk: {
+            // Fixed mode, misaligned base: consume the block through
+            // getaddr (the stream layout is identical) but copy into an
+            // aligned, tree-owned allocation.
+            const byte_len = code_len * @sizeOf(bc.Instruction);
+            const raw = try self.getaddr(byte_len);
+            const c = try alloc.alloc(bc.Instruction, @intCast(code_len));
+            @memcpy(std.mem.sliceAsBytes(c), raw);
+            break :blk c;
         } else blk: {
             const c = try alloc.alloc(bc.Instruction, @intCast(code_len));
             for (0..code_len) |i| {
@@ -443,15 +463,25 @@ pub const UndumpReader = struct {
         // relative offsets); luazig stores absolute u32 as raw LE words —
         // both are raw (not varint) so fixed-buffer undump can borrow them.
         const li_len = try self.readU32();
-        const li_borrowed = self.fixed;
-        const lineinfo: []const u32 = if (self.fixed) blk: {
+        const li_borrowed = fixed_borrow;
+        const lineinfo: []const u32 = if (fixed_borrow) blk: {
             if (li_len == 0) break :blk &.{};
             try self.skipAlign(@sizeOf(u32));
             const byte_len = li_len * @sizeOf(u32);
             const raw = try self.getaddr(byte_len);
-            std.debug.assert(@intFromPtr(raw.ptr) % @alignOf(u32) == 0);
+            // Alignment guaranteed by `fixed_borrow` (see the code block
+            // above for the base-alignment analysis).
             const ptr: [*]const u32 = @ptrCast(@alignCast(raw.ptr));
             break :blk ptr[0..li_len];
+        } else if (self.fixed) blk: {
+            // Fixed mode, misaligned base: copy (see code block above).
+            if (li_len == 0) break :blk &.{};
+            try self.skipAlign(@sizeOf(u32));
+            const byte_len = li_len * @sizeOf(u32);
+            const raw = try self.getaddr(byte_len);
+            const li = try alloc.alloc(u32, @intCast(li_len));
+            @memcpy(std.mem.sliceAsBytes(li), raw);
+            break :blk li;
         } else blk: {
             if (li_len == 0) break :blk &.{};
             try self.skipAlign(@sizeOf(u32));
@@ -514,8 +544,12 @@ pub const UndumpReader = struct {
             // lineinfo from the input buffer, flag the Proto so the tree
             // deinit (destroyProtoTree) skips freeing them and the GC
             // footprint (protoTreeFootprint) excludes them. PUC sets this
-            // via `f->flag |= PF_FIXED` in lundump.c:332-333.
-            .flags = .{ .is_vararg = is_vararg, .fixed_arrays = self.fixed },
+            // via `f->flag |= PF_FIXED` in lundump.c:332-333. On a
+            // misaligned buffer base the arrays were COPIED (see the code
+            // block above), so they are tree-owned and the flag stays
+            // false — the all-or-nothing base check makes this exact for
+            // both arrays.
+            .flags = .{ .is_vararg = is_vararg, .fixed_arrays = fixed_borrow },
         };
         // Packed name fields (P16.16 C7): set via accessors.
         proto.setName(name);

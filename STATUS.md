@@ -1,4 +1,4 @@
-> Last updated: 2026-09-11 (P16.37 in progress — Cut 0 truth: P16.36-final воспроизведён (RF sha16 a43c3f73608b65d4 byte-identical, spot-counters int_arith/lua_calls exact, coroutine_yield −1.2% noise), T0.2 fresh switchRuntime-декомпозиция (variant D lookup-free: 2 switches/cycle ровно, switchRuntime 151.0 i/cycle self = park 42 + activate 34 + refreshHooksCached 24 + guard/prologue ~51, ensureTotalCapacity ~0 — 4-field SIMD moves видимы в objdump, символ 752 B; артефакт p16.37-t0-switch-decomposition.md), R0.3 callframe-layout provenance regenerated @ 5221906 (контент неизменен — все значения byte-identical), R0.2 errored-coroutine TBC __close timing diverгенция ПОДТВЕРЖДЕНА (PUC defers-to-close / luazig closes-during-unwind, оба вывода captured verbatim — backlog, не чинилась); Cut 1 BLOCKING table.sort non-yieldable comparator — следующий)
+> Last updated: 2026-09-11 (P16.37 in progress — Cut 0 truth: P16.36-final воспроизведён (RF sha16 a43c3f73608b65d4 byte-identical, spot-counters int_arith/lua_calls exact, coroutine_yield −1.2% noise), T0.2 fresh switchRuntime-декомпозиция (variant D lookup-free: 2 switches/cycle ровно, switchRuntime 151.0 i/cycle self = park 42 + activate 34 + refreshHooksCached 24 + guard/prologue ~51, ensureTotalCapacity ~0 — 4-field SIMD moves видимы в objdump, символ 752 B; артефакт p16.37-t0-switch-decomposition.md), R0.3 callframe-layout provenance regenerated @ 5221906 (контент неизменен — все значения byte-identical), R0.2 errored-coroutine TBC __close timing diverгенция ПОДТВЕРЖДЕНА (PUC defers-to-close / luazig closes-during-unwind, оба вывода captured verbatim — backlog, не чинилась); Cut 1 table.sort non-yieldable comparator ЗАВЕРШЁН: tableSortLess переписан на nny-единицу (6 спец-кейсов coroutine_yield удалено, error-wrapping удалено, enter ДО resolveCallable — CALL hook внутри окна), comparator checktype + "invalid order function" failArgerror-сайты, follow-on arg-error naming parity (_G в _LOADED, pushGlobalFuncName, checkTabArg arg_no — 7 сайтов; errors.lua регрессия закрыта), side-fix undump fixed-borrow alignment (copy-fallback на misaligned base — латентный UB, вскрыт сдвигом arena-офсетов), smoke 78 (T12 dropped — pre-existing trampoline bug, backlog), negative validation ×1; гейты: unit D+RF 217/217, smoke 77/77, matrix zig_fail=0, c_api test+diff, api580 GREEN; backlog: trampoline lost-continuation crash, coroutine.close/setmetatable arg-сообщения; следующий cut — из P16.37 queue)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -6266,9 +6266,10 @@ baseline-approved → **P16.36-final = 1.45349**). Фаза закрыла ме�
   vs PUC zero-copy); internStr GC cascade (checkGC на аллокационных опкодах,
   PUC lvm.c:1425/1631/1933 — relocation = DispatchError каскад, отдельный
   cut); scan inventory leftovers (suspension-owner topmost-Lua-frame search =
-  следующий кандидат); semantic backlog (table.sort comparator yield
-  PUC-blocks/luazig-allows, errored-coroutine TBC __close timing — оба
-  задокументированы как pre-existing divergences).
+  следующий кандидат); semantic backlog (table.sort comparator yield —
+  ЗАКРЫТ в P16.37 Cut 1; errored-coroutine TBC __close timing + trampoline
+  lost-continuation crash + coroutine.close/setmetatable arg-сообщения —
+  задокументированы как pre-existing divergences, см. Cut 1 backlog).
 
 Гейты фазы @ 164ba0f: fmt; unit D+RF; smoke **76/76** (включая
 76_error_cfunc_label.lua + 77_gsub_yieldability.lua); matrix --testc 31/32
@@ -10368,3 +10369,113 @@ README/STATUS generated-блоки перегенерированы (smoke 76/76
 Гейты Cut 0 (src/ не тронут): fmt; unit D+RF; smoke 76/76; matrix --testc
 31/32 zig_fail=0; api580 GREEN. perf_compare не гонялся (src/ byte-identical
 P16.36-final measured source; current.json валиден).
+
+## P16.37 Cut 1 — table.sort comparator non-yieldable (nny-единица) + arg-error naming parity + undump borrow-alignment fix (2026-09-11)
+
+BLOCKING-фикс фазы: `table.sort` comparator обязан быть non-yieldable
+(PUC: `sort_comp` → `lua_call` → `luaD_callnoyield` → `ccall(nyci)` —
+попытка yield внутри comparator'а = "attempt to yield across a C-call
+boundary" + смерть coroutine; luazig до фикса SUSPENDED'а). Модель —
+P16.36 gsub nny-единица (nCcalls upper unit), распространённая на
+sort_comp's lua_call.
+
+- **tableSortLess переписан**: `ccallEnter(.nonyieldable)` ДО активации
+  comparator'а (resolveCallable может исполнить `__call` — PUC tryfuncTM
+  работает ВНУТРИ ccall-окна; CALL hook ребёнка стреляет внутри окна,
+  ldo.c:652), `defer ccallExit(.nonyieldable)`. Все шесть спец-кейсов
+  `id == .coroutine_yield` УДАЛЕНЫ + обёртка ошибки
+  `invalid order function for sorting ('{s}')` удалена (в PUC это
+  сообщение приходит ТОЛЬКО из partition invariant, никогда из sort_comp;
+  ошибки comparator'а распространяются unwrapped).
+- **Ключевой механизм bare-message**: `callBuiltin` ВСЕГДА пушит C-frame
+  билтина первым → `builtinCoroutineYield`'s `failRunerror` видит C-frame
+  на вершине → bare "attempt to yield across a C-call boundary" без
+  position-префикса, ровно как PUC luaB_yield frame. Старый workaround
+  расходился потому, что фейлил ДО callBuiltin (добавлялся префикс
+  позиции).
+- **builtinTableSort comparator checktype** (PUC ltablib.c:397-399
+  `luaL_checktype(L, 2, LUA_TFUNCTION)` — raw type tag, БЕЗ __call
+  resolution): "bad argument #2 to 'sort' (function expected, got X)".
+  `else`-ветка resolveCallable в tableSortLess сохранена (generality
+  lua_call/tryfuncTM: `__call`-table comparator работает через
+  resolveCallable, но checktype в builtin — raw tag, как PUC).
+- **"invalid order function for sorting" сайты** (depth-check в
+  tableSortRange + verification-loop в builtinTableSort): `fail` →
+  `failArgerror` (PUC luaL_error → luaL_where(1)): позиция ЕСТЬ при
+  вызове sort из Lua, ОТСУТСТВУЕТ когда caller — C (pcall). D1/D2 пробы
+  byte-match PUC.
+- **Follow-on arg-error naming parity** (регрессия errors.lua:381
+  `checkmessage("table.sort({1,2,3}, table.sort)", "'table.sort'")`
+  вскрыла, что старый код проходил её СЛУЧАЙНО — wrapping-сообщение
+  содержало 'table.sort' через `id.name()`): реализована PUC-семантика
+  именования arg-error'ов — from-Lua call → имя call-site ('sort');
+  C-context call (pcall(table.sort,5), sort_comp's lua_call) →
+  `pushglobalfuncname` loaded-table search → квалифицированное
+  'table.sort'; позиция через luaL_where(1) (нет, когда immediate caller
+  — C frame; `immediateCallerOfTopCFrame` уже реализовал правило).
+  Конкретно: `_G` зарегистрирован в `_LOADED` (PUC luaopen_base);
+  `pushGlobalFuncName` (поиск по registry `_LOADED`, findfield level 2,
+  strip "_G.", без аллокации — пишет в caller buf; tag-guarded
+  сравнение Value по payload — прямое `!=` на union запрещено Zig);
+  `failTabArgerror`; `checkTabArg` получил `arg_no` (заодно чинит
+  pre-existing захардкоженный "#1" для table.move arg-4). 7 call-sites
+  (unpack:1, move:1, move:4, concat:1, insert:1, remove:1, sort:1).
+  Пробы byte-match PUC для всех table.sort-кейсов.
+- **undump fixed-borrow alignment fix** (латентный баг, вскрытый сдвигом
+  arena-офсетов от `_G`-регистрации — unit-тест Task 7.3 упал на
+  alignment assert): fixed-mode borrow (code/lineinfo) требует
+  4-выровненный BASE буфера (skipAlign выравнивает блоки ОТНОСИТЕЛЬНО
+  начала буфера). PUC plain-cast'ит (lundump.c:191 — misaligned base =
+  UB в PUC тоже, неявно предполагается malloc-aligned input); Zig
+  `@alignCast` UB игнорировать нельзя → alignment-checked borrow с copy
+  fallback (`fixed_borrow` — all-or-nothing: оба 4-выровненных блока
+  относительны одного base); `flags.fixed_arrays = fixed_borrow` держит
+  destroyProtoTree/protoTreeFootprint точными. Lua-уровень
+  `load(s, "B")` безопасен и раньше (LuaString content 8-выровнен);
+  уязвимы только .owned/.borrowed C-API буферы (1-aligned).
+- **Negative validation**: nny-enter нейтрализован (`if (false)`) → P1
+  снова suspended (старая дивергенция воспроизведена) → восстановлено →
+  byte-identical.
+- **Дифференциальный smoke 78_table_sort_yieldability.lua** (T0–T10:
+  plain sort, direct yield, pcall-wrapped, nested helper,
+  inner-pcall-catches, builtin comparator, __call-table rejection,
+  isyieldable latch, unit release на normal/error/invalid-order return,
+  luaL_where position semantics, nested sorts) — byte-identical vs PUC.
+  T12 (resume-from-comparator) DROPNUT с комментарием-указателем на
+  backlog-баг (ниже): per-comparator prints latched (call counts
+  implementation-defined — PUC auxsort 1 call vs luazig quicksort+
+  verification 3 при n=2, алгоритмическое, не контрактное).
+
+### Pre-existing дивергенции, обнаруженные в Cut 1 (backlog, НЕ чинились)
+
+1. **Coroutine trampoline lost-continuation crash** (системный, НЕ
+   sort-специфичный; воспроизводится на pre-P16.37 бинарри
+   идентично): coroutine → table.sort comparator (или любой Lua,
+   вложенный под builtin через runClosure) → `coroutine.resume(другой
+   coroutine)` при активном trampoline → "coroutine trampoline lost
+   continuation" crash. Root cause: tryRequestBytecodeCoroutineSwitch
+   engage'ит фреймы, не управляемые trampoline drive-loop;
+   ThreadSwitch unwinds через Zig-stack состояние builtinTableSort
+   (arr освобождён defer'ом); pending call отменён при unwind.
+   Корректный fallback существует (builtinCoroutineResume nested
+   runClosure branch, PUC C-stack semantics), но wiring decline'а —
+   surgery trampoline-core, отдельный cut. Репродьюсеры:
+   `/tmp/opencode/p37_t12_min.lua`, `/tmp/opencode/p37_sysprobe.lua`
+   (S3).
+2. **coroutine.close arg message**: "type error: expected thread, got
+   number" vs PUC "bad argument #1 to 'coroutine.close' (thread
+   expected, got number)".
+3. **setmetatable arg errors**: неверный номер аргумента (#2 vs PUC #1)
+   + текст сообщения ("nil or table expected" vs "table expected, got
+   X").
+4. **Comparator call counts**: PUC auxsort vs luazig quicksort+
+   verification (алгоритмическое расхождение, не контрактное; smoke
+   должен использовать latched prints).
+5. **TBC __close timing** (from Cut 0 R0.2): PUC defers-to-close /
+   luazig closes-during-unwind.
+
+Гейты Cut 1: fmt; unit D+RF **217/217**; smoke **77/77** (включая
+78_table_sort_yieldability.lua); matrix --testc zig_fail=0 (big.lua
+both_fail pre-existing; errors.lua снова PASS — остался только
+pre-existing stack-depth count diff 999756 vs 999961); c_api test +
+test-diff PASS (TBC 22+23); api580 GREEN.

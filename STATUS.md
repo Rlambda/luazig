@@ -1,4 +1,4 @@
-> Last updated: 2026-09-11 (P16.37 Cut 2 ЗАВЕРШЁН: thread runtime ownership Variant A — Thread навсегда владеет bytecode_stack/boxed/stack_top/tbc_regs, Vm-поля и move ceremony УДАЛЕНЫ как класс (parkActiveRuntime/activateRuntime/switchRuntime 151 i/cycle ×2, active_runtime_thread, branchy резолвы), switchThread = current_thread store + refreshHooksCached, ~290 сайтов переехали (ctx.th/th-пары/inline activeBytecodeThread), Vm 6592→6520 B (−72 = ровно 5 полей), Thread 3712 без изменений; T7 A/B: coroutine_yield −6.3% instructions (1,092.2M→1,023.5M), field_access −9.0%, cy_d −6.2%, lua_calls −1.8%, контроли int_arith/branch_loop/table_alloc ~0 = шума → новой per-opcode цепочки нет; perf_compare 18/18 OK geomean 1.43x, coroutine_yield −9.7% wall; T8: GC-count полная реклеймация (no leak), native_mem LINEAR = pre-existing (идентично на HEAD); locals.lua targeted-parity diff = pre-existing GC-pacing класс (байт-идентично на HEAD, stash-эксперимент); гейты: unit D+RF 217/217, smoke 77/77, matrix zig_fail=0, c_api 50 PASS (TBC 22+23), api580 GREEN; артефакт p16.37-thread-runtime-ownership.md дополнен completion record; следующий cut — из P16.37 queue: yield copying ~50 i/it (setFrom ×2 + resume-tail copy vs PUC zero-copy))
+> Last updated: 2026-09-11 (P16.37 COMPLETE — thread runtime ownership Variant A (Cut 0 60681b9 + Cut 1 1fab11d + Cut 2 dabfad6): table.sort nny parity + arg-message naming parity + undump alignment fix; permanent Thread runtime ownership (move ceremony deleted, switch = thread-select + hook refresh); coroutine_yield -6.3% instr / -9.7% wall @ Cut 2 (final fresh -8.45%); geomean 1.42994, 18/18 OK 0 WARN/FAIL; gap(D) 1529.4 -> 1076.0 i/it (-29.6% over P16.36+P16.37); switchRuntime/park/activate ABSENT from profile; Vm 6520 / Thread 3712 / CallFrame 88 RF exact; P16.38 queue: yield copying ~50 i/it, internStr GC cascade, errored-coroutine TBC timing, semantic backlog)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -34,11 +34,11 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
 | Differential output (`--diff`) | **0 output_diff** |
-| Smoke tests (`tests/smoke/*.lua`) | **76/76** pass |
+| Smoke tests (`tests/smoke/*.lua`) | **77/77** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.45x** |
+| Performance (geomean vs PUC) | **1.43x** |
 
-Geomean замедления vs PUC Lua: **1.45x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.43x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -10543,3 +10543,92 @@ locals-tracegc-divergence.json); native_mem LINEAR (выше).
 **50 PASS** (TBC 22+23) + test-diff; api580 GREEN; api_integration_lane
 ok; api_regression_lane: unit ok + testC lane ok, targeted parity
 locals.lua = pre-existing (байт-идентично на HEAD).
+
+## P16.37 COMPLETE — final wrap: baseline P16.37-final 1.42994, gap(D) 1076.0 i/it, move ceremony отсутствует в профиле (2026-09-11)
+
+Production HEAD `dabfad6` (git diff dabfad6..HEAD --stat -- src/ пуст;
+binary sha16 a892306a2856f0b4 = measured binary). Cut ledger фазы:
+
+- **Cut 0 `60681b9`** — truth: P16.36-final воспроизведён (RF sha16
+  байт-идентичен, spot-counters точны); свежая switchRuntime-декомпозиция
+  (variant D: ровно 2 switches/cycle, switchRuntime 151.0 i/cycle self =
+  park 21 + activate 17 + refreshHooksCached 12 + guard/prologue ~14.5 на
+  switch); R0.3 callframe-layout provenance регенерирован; R0.2
+  errored-coroutine TBC `__close` timing дивергенция ПОДТВЕРЖДЕНА (PUC
+  defers-to-close / zig closes-during-unwind, verbatim outputs — backlog,
+  не фиксировалась).
+- **Cut 1 `1fab11d`** — table.sort comparator non-yieldable через nny-единицу
+  (ccallEnter(.nonyieldable) ДО resolveCallable, PUC ldo.c:652); все 6
+  coroutine_yield спец-кейсов + 'invalid order function' error-wrapping
+  УДАЛЕНЫ (ошибки компаратора распространяются unwrapped, PUC sort_comp);
+  arg-message naming parity family (_G в _LOADED, pushGlobalFuncName,
+  failTabArgerror, checkTabArg arg_no) — table.sort сообщения байт-совпадают
+  с PUC; side-fix undump fixed-borrow alignment (латентный UB, вскрытый
+  сдвигом arena offset). Честные оговорки: **T12 trampoline
+  lost-continuation crash** (coroutine → comparator → resume other → crash;
+  воспроизводится на pre-P16.37 бинарнике = pre-existing, backlog с
+  репродьюсерами, T0-T10 байт-идентичны); **comparator call-counts**
+  расходятся (алгоритмическое, PUC sort делает меньше вызовов в некоторых
+  паттернах — backlog); **coroutine.close/setmetatable arg messages**
+  расходятся с PUC (backlog); negative validation ×2 (нейтрализованный
+  nny-enter → P1 suspends = старая дивергенция воспроизведена; restored →
+  байт-идентично).
+- **Cut 2 `dabfad6`** — permanent Thread runtime ownership **Variant A**
+  (PUC lstate.c модель): move ceremony УДАЛЕНА как класс
+  (parkActiveRuntime/activateRuntime/switchRuntime 151 i/cycle ×2,
+  active_runtime_thread, branchy резолвы), switch = thread-select
+  (current_thread store, null=main) + refreshHooksCached; Vm 6592→6520 B
+  (−72 = ровно 5 полей), Thread 3712 без изменений; coroutine_yield −6.3%
+  instructions (1,092.2M→1,023.5M), −9.7% wall @ Cut 2 measurement;
+  **locals.lua targeted-parity и native_mem co-lifecycle LINEAR проверены
+  stash-экспериментами = pre-existing** (байт-идентичные падения на Cut 1
+  HEAD 1fab11d; GC-pacing класс и allocator high-water, задокументированы
+  с P16.36), НЕ регрессии фазы.
+
+**Final measurement (baseline-approved → P16.37-final, median-of-7, core 0)**:
+geomean **1.42994** (vs P16.36-final 1.45349 = **−1.62%**), 18/18 OK,
+**0 WARN/FAIL**; coroutine_yield −8.45% wall vs P16.36-final, field_access
+−5.94%, comparisons −4.15%; контроли int_arith −2.39% / branch_loop −1.78%.
+Ratios: metamethod_call_noalloc 1.855x, array_access 1.764x, field_access
+1.694x, hash_access 1.619x, branch_loop 1.589x, dynamic_load 1.528x,
+global_arith 1.526x, metamethod_add 1.449x, coroutine_yield 1.419x,
+mixed_arith 1.407x, comparisons 1.378x, table_alloc_setmetatable 1.353x,
+lua_calls 1.333x, int_arith 1.327x, float_arith 1.309x, string_loop
+1.209x, temp_table_alloc 1.141x, string_concat 1.089x.
+
+**Fresh A/B/C/D gap table** (median-of-3 instructions:u, N=500k,
+whole-process): A gap 1081.0 / B 1083.1 / C 1064.9 / D **1076.0 i/it**;
+split: lookup **+5.0 (0.5%)** + transition **1076.0 (99.5%)**; gap(D)
+1529.4 (P16.35) → 1199.2 (P16.36) → **1076.0 = −29.6% за две фазы**.
+**Fresh perf record** (official coroutine_yield, cycles:u):
+switchRuntime/parkActiveRuntime/activateRuntime — **0 matches в профиле,
+ABSENT**; новые top transition symbols: builtinCoroutineResume 12.31%
+(было 28.8% на P16.35), callCoroutineBuiltinDirect 2.81%,
+builtinCoroutineYield 2.73% (было 8.7%), memcpy 2.04%, runBytecodeInternal
+1.89%, switchThread 0.72% (выживший switch), gcFreeObject 0.38%.
+
+**Final layout probe (RF)**: Vm **6520** / Thread **3712** / CallFrame
+**88** — точно ожидаемые. Артефакты: p16.37-thread-runtime-ownership.md
+дополнен final-wrap секцией; tools/perf/ current.json +
+current-counters.json + current-profile-index.json (snapshot
+/tmp/opencode/p37_final) + current-codesize.json (.text 2,598,777 =
++3,488 B vs P16.36 final — arg-message parity family + re-homing churn,
+холодные/структурные) + current-differential-profile.json регенерированы
+@ dabfad6.
+
+**P16.38 queue**:
+1. **yield copying ~50 i/it** — `th.yielded.setFrom` ×2 + resume-tail copy
+   vs PUC zero-copy (PUC переносит значения через стек без memcpy);
+   требуется lifetime proof перед реализацией.
+2. **internStr GC cascade** — checkGC на allocation-опкодах (PUC
+   lvm.c:1425 luaC_checkGC inline после аллокаций).
+3. **errored-coroutine TBC `__close` timing** — PUC defers-to-close / zig
+   closes-during-unwind (R0.2 verbatim outputs captured).
+4. Оставшийся semantic backlog: T12 trampoline lost-continuation crash,
+   comparator call-counts (алгоритмическое), coroutine.close/setmetatable
+   arg messages.
+
+Гейты final wrap: matrix --testc 31/32 zig_fail=0 (big.lua both_fail
+pre-existing); smoke **77/77** PASS (ok=77 mismatches=0, включая
+78_table_sort_yieldability); README/STATUS status-блоки регенерированы (status_snapshot --phase
+"P16.37 COMPLETE" + status_summary --use-current --perf-current).

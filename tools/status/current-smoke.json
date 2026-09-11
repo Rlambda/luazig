@@ -1,27 +1,27 @@
 {
   "meta": {
-    "created_utc": "2026-09-10T21:08:25.512161+00:00",
+    "created_utc": "2026-09-11T13:57:05.463753+00:00",
     "lane": "smoke_compare",
     "argv": [
       "/home/boss/codes/luazig/tools/smoke_compare.py",
       "--json-out",
-      "/home/boss/codes/luazig/tools/status/.tmp.smoke.ad6nzmgy.json"
+      "/home/boss/codes/luazig/tools/status/.tmp.smoke.cb5rf255.json"
     ],
     "zig_version": "0.16.0"
   },
   "provenance": {
-    "git_head": "164ba0f",
-    "measured_source_head": "164ba0f",
+    "git_head": "dabfad6",
+    "measured_source_head": "dabfad6",
     "git_dirty": "dirty",
     "source_dirty": "clean",
     "artifact_dirty": "dirty",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "a43c3f73608b65d4",
+    "zig_binary_sha16": "a892306a2856f0b4",
     "puc_binary_sha16": "d54bc45e1757b216"
   },
-  "total": 76,
-  "ok": 76,
+  "total": 77,
+  "ok": 77,
   "mismatches": 0,
   "results": [
     {
@@ -326,6 +326,10 @@
     },
     {
       "file": "tests/smoke/77_gsub_yieldability.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/78_table_sort_yieldability.lua",
       "match": true
     }
   ]

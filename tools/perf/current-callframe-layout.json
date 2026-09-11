@@ -1,19 +1,19 @@
 {
-  "created_utc": "2026-09-09T21:08:30+00:00",
+  "created_utc": "2026-09-11T14:05:00+00:00",
   "provenance": {
-    "git_head": "616c1b9",
-    "measured_source_head": "616c1b9",
-    "measured_source_note": "src/ at HEAD 616c1b9 is byte-identical to 5c16a69 (verified: git diff 5c16a69..HEAD --stat -- src/ is empty)",
-    "git_dirty": "dirty",
+    "git_head": "5221906",
+    "measured_source_head": "164ba0f",
+    "measured_source_note": "git diff 164ba0f..HEAD --stat -- src/ is empty; src/ byte-identical to the P16.36 final source (P16.37 Cut 0 R0.3 regeneration)",
+    "git_dirty": "clean (before this artifact)",
     "source_dirty": "clean",
-    "artifact_dirty": "dirty (regeneration in flight; measured inputs are src/, reported by source_dirty=clean)",
+    "artifact_dirty": "clean (regeneration in flight; measured inputs are src/, reported by source_dirty=clean)",
     "zig_version": "0.16.0",
     "optimize_mode": "Debug+ReleaseFast",
     "probe_binary_sha16": {
-      "Debug": "2c3c840784775804",
-      "ReleaseFast": "e63cb3d7e7bab707"
+      "Debug": "0e1fb4dacba82138",
+      "ReleaseFast": "dee32eebc0fb6a59"
     },
-    "probe_note": "standalone Zig probe compiled OUTSIDE the repo against the same module graph (lua root src/lua/root.zig + util), -O Debug and -O ReleaseFast; prints @sizeOf/@alignOf/@offsetOf of vm.CallFrame and both u-variant arms. Probes rebuilt after the appended vm.zig unit test (test blocks are excluded from non-test builds): layout output byte-identical to the pre-test probes. Comptime asserts in vm.zig (CallFrame==88, u@32, align 8) compile in every mode and passed in both probe builds."
+    "probe_note": "standalone Zig probe compiled OUTSIDE the repo against the same module graph (lua root src/lua/root.zig + util), -O Debug and -O ReleaseFast; prints @sizeOf/@alignOf/@offsetOf of vm.CallFrame and both u-variant arms. P16.37 R0.3 regeneration at HEAD 5221906: ALL layout values byte-identical to the previous artifact (P16.34 Cut 0A content) — only provenance refreshed. Comptime asserts now at vm.zig:2545-2546 (CallFrame==88, u@32) compile in every mode and passed in both probe builds + unit D/RF."
   },
   "luazig": {
     "Debug": {

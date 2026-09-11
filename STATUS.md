@@ -1,4 +1,4 @@
-> Last updated: 2026-09-10 (P16.36 COMPLETE — error-state ownership (Cut 1: err_cfunc_label cross-thread leak fixed structurally f6c939a + thread-owned semantic error state b2b79c3, Thread 3632→3712/Vm 6584→6488, resume ceremony bundle deleted) + gsub yieldability O(1) nny unit (Cut 3 164ba0f, hasActiveBytecodeNonYieldableBoundary deleted, coroutine_yield −44.4 i/it); final: geomean 1.45349 @ 164ba0f (+0.53% vs P16.35-final baseline, 18/18 OK, single WARN field_access +7.6% = documented bimodal), T7 fresh A/B/C/D: gap 1204.2 i/it = lookup 0.4% + transition 99.6%)
+> Last updated: 2026-09-11 (P16.37 in progress — Cut 0 truth: P16.36-final воспроизведён (RF sha16 a43c3f73608b65d4 byte-identical, spot-counters int_arith/lua_calls exact, coroutine_yield −1.2% noise), T0.2 fresh switchRuntime-декомпозиция (variant D lookup-free: 2 switches/cycle ровно, switchRuntime 151.0 i/cycle self = park 42 + activate 34 + refreshHooksCached 24 + guard/prologue ~51, ensureTotalCapacity ~0 — 4-field SIMD moves видимы в objdump, символ 752 B; артефакт p16.37-t0-switch-decomposition.md), R0.3 callframe-layout provenance regenerated @ 5221906 (контент неизменен — все значения byte-identical), R0.2 errored-coroutine TBC __close timing diverгенция ПОДТВЕРЖДЕНА (PUC defers-to-close / luazig closes-during-unwind, оба вывода captured verbatim — backlog, не чинилась); Cut 1 BLOCKING table.sort non-yieldable comparator — следующий)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -10314,3 +10314,57 @@ coroutine.close умершей внутри gsub корутины, рекурс�
 both_fail pre-existing; strings/sort/gsub-heavy зелёные); c_api make test
 ALL PASS + test-diff PASS (TBC 22+23); api580 GREEN; testc_lane 9/9.
 README/STATUS generated-блоки перегенерированы (smoke 76/76).
+
+## P16.37 Cut 0 — truth: P16.36-final воспроизведение + switchRuntime-декомпозиция + layout provenance + TBC-timing репродьюсер (2026-09-11)
+
+Нулевой cut фазы P16.37: НЕТ runtime-изменений (src/ == 164ba0f, verified
+`git diff 164ba0f..HEAD --stat -- src/` пуст). Полный артефакт:
+`tools/status/p16.37-t0-switch-decomposition.md`.
+
+- **T0.1 P16.36 final воспроизведён**: RF rebuild sha16 `a43c3f73608b65d4`
+  byte-identical provenance current-counters.json; гейты: unit D+RF, smoke
+  76/76, matrix --testc 31/32 zig_fail=0 (big.lua both_fail pre-existing),
+  api580 GREEN; spot-counters (median-of-3 instructions:u, official
+  single-workload mode): int_arith 102.23 / lua_calls 458.71 — ТОЧНО
+  current-counters, coroutine_yield 2170.25 vs 2196.58 (−1.2% host noise,
+  семейство 2242.9/2257.1/2196.6).
+- **T0.2 fresh switchRuntime-декомпозиция** (variant D `/tmp/opencode/cy_d.lua`
+  lookup-free, N=500k; callgrind N=20k+200 warmup): **switches/cycle = 2.00
+  ровно** (40,400/20,200 — resume-in main→co + yield-out co→main, скрытого
+  третьего свича нет); switchRuntime self **151.0 i/cycle (75.5 i/switch × 2)**;
+  line-декомпозиция per switch: guard 11.0 (вкл. ensureTotalCapacity hot-check
+  `mov cap; cmp $0x1f; ja` + prologue share), parkActiveRuntime 21.0
+  (4-field moves 10 + zeroing 9 + null-test 2), activateRuntime 17.0
+  (reverse moves 10 + zeroing 6 + owner store 1), ensureTotalCapacity(64)
+  **~0** (2 Ir TOTAL за прогон — FrameStack inline-32 + heap pre-reserve,
+  growth path cold), refreshHooksCached 12.0 (activeHookState deref + 4-flag
+  or-chain + dispatch_gate RMW); line-sum 61 vs symbol 75.5 — дельта ~14.5 =
+  call prologue/epilogue (6 push+sub / add+5 pop+pop rbp+vzeroupper+ret).
+  Прочие per-cycle: dispatch (2 клона) 998.3, builtinCoroutineResume 351.0,
+  builtinCoroutineYield 134.0, runBytecodeInternal 67.0,
+  coroutineBuiltinFastPathEligible 57.0, memcpy 46.1 (2 вызова/cycle из
+  yield @ 22 i), condGcFromDispatch 37.0. objdump: символ 752 B
+  (0x1172fc0–0x11732ae), 4-field moves ВИДИМЫ как SIMD пары
+  (vmovups bc_stack/bc_boxed/bc_tbc_regs + mov bc_stack_top, park и
+  activate — зеркальные). Весь 151 i/cycle — архитектурная
+  transition-стоимость (PUC платит 0: zero-copy yield, per-thread stack
+  постоянен) — согласуется с T7 (transition 99.6% гэпа); механизм #3
+  (per-thread stacks) из P16.37 queue — следующий кандидат.
+- **R0.3 current-callframe-layout.json provenance regenerated @ 5221906**
+  (measured_source_head 164ba0f): контент НЕ ИЗМЕНИЛСЯ — все значения
+  byte-identical (CallFrame 88/align 8/u@32/union 56, LuaFrameState 48,
+  CFrameState 56, CFrameAux 8, все field offsets, оба режима идентичны);
+  comptime-ассерты теперь vm.zig:2545-2546; обновлены только
+  git_head/measured_source_head/dirty-поля/probe sha16.
+- **R0.2 errored-coroutine TBC __close timing diverгенция ПОДТВЕРЖДЕНА @
+  5221906** (репродьюсер `/tmp/opencode/p37_tbc_timing.lua`, оба вывода
+  captured verbatim в артефакте): PUC НЕ закрывает TBC при error-unwind
+  resume (ldo.c:989-993 без closeprotected) — `__close` печатается ПОСЛЕ
+  "calling coroutine.close" (закрытие в luaE_resetthread); luazig закрывает
+  ВО ВРЕМЯ unwind (print ДО строки resume-результата). Контроль
+  normal-return — идентичен. ЗАПИСАНО в backlog (error-unwind
+  architecture cut), НЕ чинилась — Cut 1 фазы = table.sort.
+
+Гейты Cut 0 (src/ не тронут): fmt; unit D+RF; smoke 76/76; matrix --testc
+31/32 zig_fail=0; api580 GREEN. perf_compare не гонялся (src/ byte-identical
+P16.36-final measured source; current.json валиден).

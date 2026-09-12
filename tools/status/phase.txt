@@ -1,1 +1,1 @@
-P16.40 Cut 0
+P16.40 COMPLETE — GC-debt discipline (PUC two-sided GCdebt parity): K5 663, gcAutomaticStep 1.0→0.0/call, temp_table 1.076x; geomean 1.40315

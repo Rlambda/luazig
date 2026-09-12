@@ -1356,6 +1356,23 @@ const CIST_SR: u32 = 1 << 26;
 /// separate initializing store. Readers: the return fast arms (child frame
 /// pop decision) and the close machinery — all Lua-frame contexts.
 const CIST_OUV: u32 = 1 << 27;
+/// Bit 28: CIST_VIEW — luazig-specific: this C frame is a VIEW over the
+/// caller's bytecode CALL window (PUC precallC: `ci->func` points at the
+/// EXISTING callee slot R[A] in the caller's window; the C CallInfo owns no
+/// stack slots of its own). PUC has no such bit because ALL its C frames are
+/// views; luazig additionally has staged C frames (host-internal origins
+/// whose args are heap slices — the synthetic callee slot at
+/// bytecode_stack_top), and this bit discriminates the two restore
+/// arithmetic shapes:
+///   - staged: the frame's stack extent is [func_slot, func_slot+1) —
+///     bytecode_stack_top restores to func_slot(+1);
+///   - view:   the frame owns NO slots; its stack top is the below Lua
+///     frame's window top (frameBase + frame_cap of the frame directly
+///     below — view frames are pushed ONLY from bytecode dispatch, so the
+///     below frame is always a Lua frame).
+/// Set by pushBuiltinCFrameAt; read by the bytecode_stack_top restore sites
+/// (popBuiltinCFrame, poscallCFrame, popBytecodeExecFrame, discardCFrame).
+const CIST_VIEW: u32 = 1 << 28;
 /// P15.51n: Sentinel for Thread.hook_frame_index meaning "no hook frame active".
 const INVALID_HOOK_FRAME: usize = std.math.maxInt(usize);
 /// P15.51n: Sentinel for u32 pc fields meaning "no pc" (replaces ?usize null).
@@ -1906,6 +1923,12 @@ pub const CallFrame = extern struct {
     pub fn isFin(fr: CallFrame) bool {
         return (fr.callstatus & CIST_FIN) != 0;
     }
+    /// P16.41 Cut 3: view C-frame — func_slot points INTO the caller's
+    /// bytecode window (PUC precallC ci->func = the existing R[A] slot);
+    /// the frame owns no stack slots. See CIST_VIEW.
+    pub fn isView(fr: CallFrame) bool {
+        return (fr.callstatus & CIST_VIEW) != 0;
+    }
     pub fn setTailCall(fr: *CallFrame) void {
         fr.callstatus |= CIST_TAIL;
     }
@@ -1920,6 +1943,9 @@ pub const CallFrame = extern struct {
     }
     pub fn setFin(fr: *CallFrame) void {
         fr.callstatus |= CIST_FIN;
+    }
+    pub fn setView(fr: *CallFrame) void {
+        fr.callstatus |= CIST_VIEW;
     }
     pub fn clearFin(fr: *CallFrame) void {
         fr.callstatus &= ~CIST_FIN;
@@ -4598,19 +4624,6 @@ pub const Vm = struct {
     builtin_outs_base: usize = 0,
     builtin_outs_len: usize = 0,
     builtin_outs_on_bc_stack: bool = false,
-    /// P15.83r: set by the OP_CALL/OP_TAILCALL/OP_TFORCALL dispatch sites when
-    /// they pre-pushed the builtin's C-frame so the CALL hook could fire on
-    /// the C activation (PUC precallC ordering). callBuiltin consumes (clears)
-    /// it at entry and REUSES that frame instead of pushing its own — exactly
-    /// one frame per builtin invocation, whoever pushed it. The diverting
-    /// fast-path branches (pairs/pcall/coroutine-switch/gsub) pop the
-    /// pre-pushed frame themselves before installing their continuations,
-    /// because the iterative completion machinery requires the callee body
-    /// frame to sit directly above its pending-call owner (see the
-    /// `parent.isC()` return routing in runBytecodeInternal's frame-return
-    /// path — a plain builtin C-frame there has no continuation k and would
-    /// be misrouted to finishCcall).
-    builtin_cframe_pre_pushed: bool = false,
     debug_transfer_values: ?[]const Value = null,
     debug_transfer_start: i64 = 1,
     debug_hook_event_calllike: bool = false,
@@ -6043,7 +6056,7 @@ pub const Vm = struct {
                 const out_len = self.builtinOutLen(id, resolved.args);
                 const outs = try self.alloc.alloc(Value, out_len);
                 errdefer self.alloc.free(outs);
-                try exposeDispatchResult(void, self.callBuiltin(id, resolved.args, outs));
+                try exposeDispatchResult(void, self.callBuiltin(id, resolved.args, outs, .host));
                 const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
                 if (used == outs.len) return outs;
                 const ret = try self.alloc.alloc(Value, used);
@@ -7279,6 +7292,29 @@ pub const Vm = struct {
             th.bytecode_stack_top = func_slot;
             return err;
         };
+        self.initBuiltinCFrame(th, slot, func_slot);
+        // P16.41 Cut 1: builtin C-frames are REAL and VISIBLE, exactly like
+        // PUC CallInfos for C functions. Every builtin call site in PUC Lua
+        // pushes a CallInfo (luaD_precall C branch); debug.getinfo levels,
+        // traceback lines, and luaL_where walks count them. The only frames
+        // that stay hidden (CIST_HIDE) are genuinely-internal duplicates
+        // with no PUC counterpart (the testC script frame — see
+        // runTestcScript).
+        // P16.27 T0.1: increment ONLY after the frame actually exists —
+        // the stack growth and addOne above can fail, and a pre-increment
+        // would leak the count on rollback.
+        th.c_frame_count += 1;
+        return grew;
+    }
+
+    /// Common C-frame initialization shared by the staged push
+    /// (`pushBuiltinCFrame`) and the view push (`pushBuiltinCFrameAt`):
+    /// the CallFrame fields every C activation gets, regardless of where
+    /// its func_slot points. The staged push additionally writes the
+    /// callee at a fresh top slot; the view push points func_slot at the
+    /// caller's existing callee slot and sets CIST_VIEW.
+    fn initBuiltinCFrame(self: *Vm, th: *Thread, slot: *CallFrame, func_slot: usize) void {
+        _ = self;
         slot.* = .{
             .func_slot = func_slot, // base derived: func_slot + 1
             // P16.30 Stage A: snapshot the Lua-TBC register depth at push,
@@ -7311,18 +7347,44 @@ pub const Vm = struct {
         // has no proto (no bytecode), so the CIST_C bit is the explicit
         // discriminator — mirroring PUC `prepCallInfo` for C functions.
         slot.setC();
-        // P16.41 Cut 1: builtin C-frames are REAL and VISIBLE, exactly like
-        // PUC CallInfos for C functions. Every builtin call site in PUC Lua
-        // pushes a CallInfo (luaD_precall C branch); debug.getinfo levels,
-        // traceback lines, and luaL_where walks count them. The only frames
-        // that stay hidden (CIST_HIDE) are genuinely-internal duplicates
-        // with no PUC counterpart (the testC script frame — see
-        // runTestcScript).
-        // P16.27 T0.1: increment ONLY after the frame actually exists —
-        // the stack growth and addOne above can fail, and a pre-increment
-        // would leak the count on rollback.
+    }
+
+    /// P16.41 Cut 3 Variant A — push a VIEW C-frame over the caller's
+    /// EXISTING bytecode CALL window (PUC `luaD_precall` C branch,
+    /// ldo.c:642-656: `ci->func = func` points at the callee slot R[A]
+    /// already in the caller's window; the C CallInfo owns no stack slots).
+    /// Contrast with the staged push (`pushBuiltinCFrame`), which allocates
+    /// a DUPLICATE callee slot above the caller's window at
+    /// bytecode_stack_top (host-internal origins whose args are heap
+    /// slices — see tools/status/p16.41-builtin-call-origins.md).
+    ///
+    /// Because the window already exists (the caller's frame_cap backs
+    /// [base, base+frame_cap), and func_slot is a register inside it):
+    ///   - NO bytecode_stack write (the callee is already at func_slot);
+    ///   - NO bytecode_stack_top advance (the caller's window top IS the
+    ///     C activation's stack top — PUC's L->top stays above the args);
+    ///   - NO growth check/realloc (the caller's activation already
+    ///     ensured the window is backed — pushStagedFast/bcGrowFrame);
+    ///   - the only failure mode is call_frames.addOne OOM (heap-spill
+    ///     branch), which mutates nothing to roll back.
+    /// The tbc snapshots and setC() are exactly the staged push's
+    /// (initBuiltinCFrame); CIST_VIEW marks the different restore
+    /// arithmetic (see the bit's doc).
+    ///
+    /// Precondition: the frame directly below the new one is the Lua frame
+    /// whose dispatch is making this call (OP_CALL/OP_TAILCALL/OP_TFORCALL)
+    /// — view frames are pushed ONLY from bytecode dispatch, never above
+    /// another C frame. The restore sites rely on this to derive the view
+    /// frame's stack top as below.frameBase() + below.u.lua.frame_cap.
+    fn pushBuiltinCFrameAt(self: *Vm, func_slot: usize) std.mem.Allocator.Error!void {
+        const th = self.activeBytecodeThread();
+        const slot = try th.call_frames.addOne(self.alloc);
+        self.initBuiltinCFrame(th, slot, func_slot);
+        slot.setView();
+        // P16.41 Cut 1: view frames are REAL and VISIBLE like every builtin
+        // C-frame (see pushBuiltinCFrame). P16.27 T0.1: increment only after
+        // the frame exists (addOne above is the only failure point).
         th.c_frame_count += 1;
-        return grew;
     }
 
     /// Push the host entry C-frame (PUC `pmain`'s CallInfo) below a chunk
@@ -7370,7 +7432,21 @@ pub const Vm = struct {
             // P15.80: Free heap-allocated state before shrinking.
             // Without this, the pointer is lost and the allocation leaks.
             if (frame.isC()) self.freeCFrameOwnedState(frame);
-            th.bytecode_stack_top = frame.func_slot;
+            // P16.41 Cut 3: restore bytecode_stack_top by frame class.
+            // Staged frame: func_slot was the pre-push top (the push
+            // captured it), so top = func_slot rolls the synthetic callee
+            // slot off. View frame: the push NEVER moved top — the frame
+            // owns no slots; its stack top is the below Lua frame's window
+            // top (view frames always sit directly on the Lua frame whose
+            // dispatch pushed them — see pushBuiltinCFrameAt). Restoring
+            // func_slot here would clobber the caller's window (top would
+            // land BELOW the args/outs that are still live).
+            if (frame.isC() and frame.isView()) {
+                const below = th.call_frames.getConstPtr(cur_len - 2);
+                th.bytecode_stack_top = below.frameBase() + below.u.lua.frame_cap;
+            } else {
+                th.bytecode_stack_top = frame.func_slot;
+            }
             th.call_frames.shrinkTo(cur_len - 1);
             if (frame.isC()) {
                 if (std.debug.runtime_safety) std.debug.assert(th.c_frame_count > 0);
@@ -9603,7 +9679,7 @@ pub const Vm = struct {
         return switch (resolved.callee) {
             .Builtin => |id| blk: {
                 var out: [1]Value = .{.Nil};
-                try self.callBuiltin(id, resolved.args, out[0..]);
+                try self.callBuiltin(id, resolved.args, out[0..], .host);
                 break :blk out[0];
             },
             .Closure => |cl| blk: {
@@ -10289,7 +10365,7 @@ pub const Vm = struct {
             acc = switch (resolved.callee) {
                 .Builtin => |id| blk: {
                     var out: [1]Value = .{.Nil};
-                    try self.callBuiltin(id, resolved.args, out[0..]);
+                    try self.callBuiltin(id, resolved.args, out[0..], .host);
                     break :blk out[0];
                 },
                 .Closure => |cl| blk: {
@@ -12212,6 +12288,27 @@ pub const Vm = struct {
         }
     }
 
+    /// P16.41 Cut 3: the bytecode_stack_top to restore when the frame at
+    /// `caller_idx` becomes the top of the frame stack again (the frame
+    /// above it was just popped/finished). One arithmetic per frame class:
+    ///   - Lua frame:    its window top (frameBase + frame_cap);
+    ///   - staged C frame: func_slot + 1 (the synthetic callee slot the
+    ///     staged push wrote stays on the stack — it IS the frame's top);
+    ///   - view C frame: the below Lua frame's window top — the view frame
+    ///     owns no slots; the window it views (the caller's CALL window)
+    ///     is its stack extent. View frames always sit directly on the
+    ///     Lua frame whose dispatch pushed them (pushBuiltinCFrameAt), so
+    ///     the below frame is provably Lua.
+    fn restoreTopAtFrame(frames: *FrameStack, caller_idx: usize) usize {
+        const caller = frames.getConstPtr(caller_idx);
+        if (!caller.isC()) return caller.frameBase() + caller.u.lua.frame_cap;
+        if (caller.isView()) {
+            const below = frames.getConstPtr(caller_idx - 1);
+            return below.frameBase() + below.u.lua.frame_cap;
+        }
+        return caller.frameBase();
+    }
+
     /// PUC `luaD_poscall` for C-frames: move n results and pop the C-frame.
     ///
     /// In PUC, `luaD_poscall` calls `move2result` to shift results from the
@@ -12251,15 +12348,9 @@ pub const Vm = struct {
         // grows by 2 per yield/resume cycle (pushBuiltinCFrame +1,
         // poscallCFrame +1), causing unbounded bc_stack/bc_boxed growth.
         if (th_bc.len() > 0) {
-            const caller = th_bc.getConstPtr(th_bc.len() - 1);
-            if (!caller.isC()) {
-                th.bytecode_stack_top = caller.frameBase() + caller.u.lua.frame_cap;
-            } else {
-                // C-frame caller: restore bytecode_stack_top to the C-frame's
-                // base (= func_slot + 1), matching popBytecodeExecFrame's
-                // C-frame caller path.
-                th.bytecode_stack_top = caller.frameBase();
-            }
+            // P16.41 Cut 3: one restore helper for all three frame classes
+            // (Lua / staged C / view C — see restoreTopAtFrame).
+            th.bytecode_stack_top = restoreTopAtFrame(th_bc, th_bc.len() - 1);
         } else {
             th.bytecode_stack_top = 0;
         }
@@ -12288,9 +12379,17 @@ pub const Vm = struct {
         if (cur_len == 0) return;
         const fr = th_bc.getPtr(cur_len - 1);
         if (!fr.isC()) return;
+        const is_view = fr.isView();
         const saved_func_slot = fr.func_slot;
         self.freeCFrameOwnedState(fr);
-        th.bytecode_stack_top = saved_func_slot + 1;
+        // P16.41 Cut 3: staged frames keep the synthetic-slot restore
+        // (func_slot + 1); view frames own no slots — restore the below
+        // Lua frame's window top (see restoreTopAtFrame).
+        if (is_view) {
+            th.bytecode_stack_top = restoreTopAtFrame(th_bc, cur_len - 2);
+        } else {
+            th.bytecode_stack_top = saved_func_slot + 1;
+        }
         th_bc.shrinkTo(cur_len - 1);
         if (std.debug.runtime_safety) std.debug.assert(th.c_frame_count > 0);
         th.c_frame_count -= 1; // P16.26 D
@@ -14022,20 +14121,14 @@ pub const Vm = struct {
         th.bytecode_tbc_regs.items.len = frame.tbc_mark;
         frame.callstatus = 0;
         // PUC model: restore bc_stack_top to the caller's frame capacity.
+        // P16.41 Cut 3: one restore helper for all three frame classes
+        // (Lua / staged C / view C — see restoreTopAtFrame). The staged-C
+        // arm matters for repeated runClosure calls from a C-frame context
+        // (e.g. table.sort's comparator via tableSortLess): without the
+        // restore, bc_stack_top grew without bound across calls and
+        // eventually triggered "stack overflow error".
         if (idx > 0) {
-            const caller = exec_frames.getConstPtr(idx - 1);
-            if (!caller.isC()) {
-                th.bytecode_stack_top = caller.frameBase() + caller.u.lua.frame_cap;
-            } else {
-                // C-frame caller: restore bc_stack_top to the C-frame's base
-                // (= func_slot + 1). Without this, each runBytecodeInternal
-                // call from a C-frame context (e.g. table.sort's comparison
-                // function via tableSortLess → runClosure) would leave
-                // bc_stack_top at the Lua frame's base + frame_cap, causing
-                // bc_stack_top to grow without bound across repeated calls
-                // and eventually triggering "stack overflow error".
-                th.bytecode_stack_top = caller.frameBase();
-            }
+            th.bytecode_stack_top = restoreTopAtFrame(exec_frames, idx - 1);
         } else {
             th.bytecode_stack_top = 0;
         }
@@ -18006,27 +18099,26 @@ pub const Vm = struct {
                 // the C CallInfo exists before LUA_HOOKCALL fires, and the
                 // name resolves to "for iterator" (getFuncNameForFrame's
                 // .tforcall branch reads this caller's instruction).
+                // P16.41 Cut 3 Variant A: the C-frame is a VIEW at the
+                // EXISTING iterator slot R[A+4] (pushBuiltinCFrameAt — PUC
+                // precallC views the func slot in the caller's window).
                 if (builtinNeedsCFrame(id)) {
-                    // P16.39 Cut 3: re-derive the args slice only when the
-                    // stack base moved — the compare covers both the push
-                    // growth and the sync hook body's nested execution.
-                    const iter_stack_base = ctx.th.bytecode_stack.ptr;
-                    _ = try self.pushBuiltinCFrame(callee_val);
+                    try self.pushBuiltinCFrameAt(ctx.base + a + 4);
                     const cf_idx = self.activeBytecodeThread().call_frames.len() - 1;
+                    // P16.39 Cut 3: re-derive the args slice only when the
+                    // stack base moved — the view push cannot move it; only
+                    // the sync hook body's nested execution can.
+                    const iter_stack_base = ctx.th.bytecode_stack.ptr;
                     const iter_hook_args = ctx.th.bytecode_stack[ctx.base + a + 5 .. ctx.base + a + 5 + effective_nargs];
                     self.dispatchCCalleeActivationHook(cf_idx, callee_val, iter_hook_args) catch |hook_err| {
                         self.popBuiltinCFrame();
                         return hook_err;
                     };
-                    self.builtin_cframe_pre_pushed = true;
-                    // P15.51l: reg_top lives directly on the CallFrame.
-                    // pushBuiltinCFrame may have reallocated bc_stack — re-derive
-                    // the args slice for callBuiltin.
                     const rargs_builtin_fresh = if (ctx.th.bytecode_stack.ptr != iter_stack_base)
                         ctx.th.bytecode_stack[ctx.base + a + 5 .. ctx.base + a + 5 + effective_nargs]
                     else
                         rargs_builtin;
-                    try self.callBuiltin(id, rargs_builtin_fresh, outs);
+                    try self.callBuiltin(id, rargs_builtin_fresh, outs, .bytecode_window);
                 }
                 const produced: usize = if (builtinHasDynamicOutCount(id))
                     @min(self.last_builtin_out_count, outs.len)
@@ -18711,22 +18803,28 @@ pub const Vm = struct {
                 // callBuiltin. (This is the tail-call-to-C path: PUC pushes
                 // a FRESH ci without CIST_TAIL, so the event is a plain
                 // "call" — see the tc_event selection above.)
+                // P16.41 Cut 3 Variant A: the C-frame is a VIEW at the
+                // EXISTING callee slot R[A] (pushBuiltinCFrameAt — PUC
+                // pretailcall's C branch moves func to the caller's func
+                // slot and precallC views it). Pushed for every C-frame
+                // builtin, not just the hook path.
                 // P16.5b: Skip the C-frame push on the coroutine fast path.
-                if (!co_fast_path and deferred_builtin_call_hook) {
-                    // P16.39 Cut 3: re-derive call_args only when the stack
-                    // base moved — covers the push growth AND the sync hook
-                    // body's nested execution.
-                    const tc_stack_base = ctx.th.bytecode_stack.ptr;
-                    _ = try self.pushBuiltinCFrame(callee_val);
+                if (!co_fast_path and builtinNeedsCFrame(id)) {
+                    try self.pushBuiltinCFrameAt(ctx.base + a);
                     const cf_idx = self.activeBytecodeThread().call_frames.len() - 1;
-                    const tc_hook_args = ctx.th.bytecode_stack[ctx.base + a + 1 .. ctx.base + a + 1 + effective_nargs];
-                    self.dispatchCCalleeActivationHook(cf_idx, callee_val, tc_hook_args) catch |hook_err| {
-                        self.popBuiltinCFrame();
-                        return hook_err;
-                    };
-                    self.builtin_cframe_pre_pushed = true;
-                    if (ctx.th.bytecode_stack.ptr != tc_stack_base) {
-                        call_args = ctx.th.bytecode_stack[ctx.base + a + 1 .. ctx.base + a + 1 + effective_nargs];
+                    if (deferred_builtin_call_hook) {
+                        // P16.39 Cut 3: re-derive call_args only when the
+                        // stack base moved — the view push cannot move it;
+                        // only the sync hook body's nested execution can.
+                        const tc_stack_base = ctx.th.bytecode_stack.ptr;
+                        const tc_hook_args = ctx.th.bytecode_stack[ctx.base + a + 1 .. ctx.base + a + 1 + effective_nargs];
+                        self.dispatchCCalleeActivationHook(cf_idx, callee_val, tc_hook_args) catch |hook_err| {
+                            self.popBuiltinCFrame();
+                            return hook_err;
+                        };
+                        if (ctx.th.bytecode_stack.ptr != tc_stack_base) {
+                            call_args = ctx.th.bytecode_stack[ctx.base + a + 1 .. ctx.base + a + 1 + effective_nargs];
+                        }
                     }
                 }
                 // P15.51l: reg_top lives directly on the CallFrame.
@@ -18755,7 +18853,13 @@ pub const Vm = struct {
                         error.ThreadSwitch => return error.ThreadSwitch,
                     };
                 } else {
-                    self.callBuiltin(id, call_args, outs) catch |call_err| switch (call_err) {
+                    // P16.41 Cut 3: view frame pushed above for every
+                    // C-frame builtin; frameless builtins pass .host (the
+                    // staged-push arm is needsCFrame-gated — no frame
+                    // either way, see the opCall site for the rationale).
+                    const tc_cframe_origin: BuiltinCallOrigin =
+                        if (builtinNeedsCFrame(id)) .bytecode_window else .host;
+                    self.callBuiltin(id, call_args, outs, tc_cframe_origin) catch |call_err| switch (call_err) {
                         error.Yield => {
                             if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
                                 const th = self.current_thread.?;
@@ -19218,41 +19322,49 @@ pub const Vm = struct {
                 // CallInfo exists BEFORE the CALL hook fires. Push the
                 // builtin's C-frame, fire the event on it (ar.i_ci = the C
                 // activation), then run the builtin reusing this frame.
+                // P16.41 Cut 3 Variant A: the C-frame is a VIEW over this
+                // CALL window — func_slot = the EXISTING callee slot R[A]
+                // (pushBuiltinCFrameAt), exactly PUC's `ci->func = func`.
+                // No synthetic slot above the window, no stack write, no
+                // growth check, no top advance — pushed for EVERY
+                // C-frame builtin (not just the hook path), so callBuiltin
+                // (.bytecode_window) never pushes a staged frame here.
                 // P16.5b: Skip the C-frame push entirely on the coroutine
                 // fast path — guards guarantee no hooks need it.
-                if (!co_fast_path and deferred_builtin_call_hook) {
-                    // P16.39 Cut 3: re-derive the caller-window slices only
-                    // when the stack base moved. The compare covers BOTH
-                    // staleness sources here — the C-frame push growth AND
-                    // the sync hook body's nested execution (which can grow
-                    // bc_stack too); a same-base realloc keeps every slice
-                    // valid, so the pointer compare is the exact
-                    // invalidation test.
-                    const stack_base_at_push = ctx.th.bytecode_stack.ptr;
-                    _ = try self.pushBuiltinCFrame(callee_val);
+                if (!co_fast_path and builtinNeedsCFrame(id)) {
+                    try self.pushBuiltinCFrameAt(ctx.base + a);
                     const cf_idx = self.activeBytecodeThread().call_frames.len() - 1;
-                    const hook_args = ctx.th.bytecode_stack[ctx.base + a + 1 .. ctx.base + a + 1 + effective_nargs];
-                    self.dispatchCCalleeActivationHook(cf_idx, callee_val, hook_args) catch |hook_err| {
-                        self.popBuiltinCFrame();
-                        return hook_err;
-                    };
-                    self.builtin_cframe_pre_pushed = true;
-                    if (ctx.th.bytecode_stack.ptr != stack_base_at_push) {
-                        // The C-frame's func_slot sits above the window,
-                        // which is unchanged.
-                        ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                        rargs_fresh = ctx.regs[a + 1 .. a + 1 + effective_nargs];
-                        outs = ctx.regs[outs_start .. outs_start + out_len];
+                    if (deferred_builtin_call_hook) {
+                        // P16.39 Cut 3: re-derive the caller-window slices
+                        // only when the stack base moved. The view push
+                        // CANNOT move it (no stack mutation); the only
+                        // staleness source inside this block is the sync
+                        // hook body's nested execution — and func_slot is
+                        // an index, so the frame itself is stable either
+                        // way (T3.3: no push-induced realloc exists at all).
+                        const stack_base_at_hook = ctx.th.bytecode_stack.ptr;
+                        const hook_args = ctx.th.bytecode_stack[ctx.base + a + 1 .. ctx.base + a + 1 + effective_nargs];
+                        self.dispatchCCalleeActivationHook(cf_idx, callee_val, hook_args) catch |hook_err| {
+                            self.popBuiltinCFrame();
+                            return hook_err;
+                        };
+                        if (ctx.th.bytecode_stack.ptr != stack_base_at_hook) {
+                            ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            rargs_fresh = ctx.regs[a + 1 .. a + 1 + effective_nargs];
+                            outs = ctx.regs[outs_start .. outs_start + out_len];
+                        }
                     }
                 }
                 // P16.39 Cut 3: capture the stack base before the call —
                 // callBuiltin (or callCoroutineBuiltinDirect) may have
-                // reallocated bc_stack (C-frame push growth, or a nested
-                // call inside the builtin). Re-derive the caller-window
-                // slices only when the base moved: a same-base realloc
-                // keeps every slice valid, so the pointer compare is the
-                // exact invalidation test (PUC's stack never moves; this is
-                // the minimal luazig analogue).
+                // reallocated bc_stack through a NESTED call inside the
+                // builtin body (P16.41 Cut 3: the view-frame push itself
+                // no longer grows the stack — growth-from-below only).
+                // Re-derive the caller-window slices only when the base
+                // moved: a same-base realloc keeps every slice valid, so
+                // the pointer compare is the exact invalidation test
+                // (PUC's stack never moves; this is the minimal luazig
+                // analogue).
                 const stack_base_before = ctx.th.bytecode_stack.ptr;
                 if (co_fast_path) {
                     self.callCoroutineBuiltinDirect(id, rargs_fresh, outs) catch |call_err| switch (call_err) {
@@ -19278,7 +19390,15 @@ pub const Vm = struct {
                         error.ThreadSwitch => return error.ThreadSwitch,
                     };
                 } else {
-                    self.callBuiltin(id, rargs_fresh, outs) catch |call_err| switch (call_err) {
+                    // P16.41 Cut 3: the view frame was pushed above for every
+                    // C-frame builtin; frameless builtins (collectgarbage/
+                    // string_sub) have no frame at all (Cut 1 documented
+                    // deviation) and pass .host — callBuiltin's staged-push
+                    // arm is gated by builtinNeedsCFrame, so nothing is
+                    // pushed or popped for them either way.
+                    const cframe_origin: BuiltinCallOrigin =
+                        if (builtinNeedsCFrame(id)) .bytecode_window else .host;
+                    self.callBuiltin(id, rargs_fresh, outs, cframe_origin) catch |call_err| switch (call_err) {
                         error.Yield => {
                             if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
                                 const th = self.current_thread.?;
@@ -19849,7 +19969,30 @@ pub const Vm = struct {
         return th.bytecode_stack[self.builtin_outs_base .. self.builtin_outs_base + self.builtin_outs_len];
     }
 
-    fn callBuiltin(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value) DispatchError!void {
+    /// P16.41 Cut 3 — the ORIGIN of a callBuiltin invocation, deciding the
+    /// C-frame model (see tools/status/p16.41-builtin-call-origins.md for
+    /// the full site inventory):
+    ///
+    ///   - `bytecode_window` (Variant A): the callee and its contiguous
+    ///     args are the caller's bytecode CALL window (OP_CALL /
+    ///     OP_TAILCALL→C / OP_TFORCALL dispatch). The dispatch site already
+    ///     pushed a VIEW C-frame at the existing callee slot
+    ///     (pushBuiltinCFrameAt — PUC precallC: `ci->func` points at R[A])
+    ///     before firing the CALL hook. callBuiltin REUSES that frame: no
+    ///     push, and provably NO bc_stack growth from the frame push — the
+    ///     args/outs window slices stay valid as passed (the only staleness
+    ///     source is growth from BELOW: nested execution inside the builtin
+    ///     body, handled by the outs registration).
+    ///
+    ///   - `host` (Variant B): host-internal caller (C API, metamethods,
+    ///     loaders, debug hooks, sort comparators, finalizers, coroutine
+    ///     bodies) whose args are heap/Zig-stack slices with no bytecode
+    ///     window. callBuiltin stages the C-frame itself: a synthetic
+    ///     callee slot at bytecode_stack_top (PUC stages C calls at
+    ///     L->top), with the growth check + savestack re-derive ceremony.
+    const BuiltinCallOrigin = enum { bytecode_window, host };
+
+    fn callBuiltin(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value, origin: BuiltinCallOrigin) DispatchError!void {
         if (self.stats.enabled) self.stats.calls_builtin += 1; // P16.0b
         // P16.39 Cut 3: snapshot the bc_stack slice BEFORE the C-frame
         // push. The push may realloc it; the snapshot is the base for
@@ -19858,23 +20001,29 @@ pub const Vm = struct {
         // snapshots the stack pointer, we snapshot the slice). Callers
         // pass slices derived after their own last stack mutation, so the
         // push is the only staleness source on this path.
+        // P16.41 Cut 3: for `bytecode_window` origins the push already
+        // happened at the dispatch site and CANNOT grow bc_stack (the view
+        // push writes no stack slot) — the snapshot equals the live stack
+        // and every `grew` branch below is dead.
         const th = self.activeBytecodeThread();
         const old_stack = th.bytecode_stack;
 
         const callee_val: Value = .{ .Builtin = id };
-        // P15.83r: the OP_CALL/OP_TAILCALL/OP_TFORCALL dispatch sites may
-        // have already pushed this builtin's C-frame so the CALL hook could
-        // fire on the C activation (PUC precallC ordering). Consume the flag
-        // (exactly one callBuiltin entry per push) and REUSE that frame —
-        // exactly one C-frame per builtin invocation, whoever pushed it.
-        const cframe_pre_pushed = self.builtin_cframe_pre_pushed;
-        self.builtin_cframe_pre_pushed = false;
-        const cframe_pushed = cframe_pre_pushed or builtinNeedsCFrame(id);
+        // P16.41 Cut 3: the origin replaces the builtin_cframe_pre_pushed
+        // global handoff. `bytecode_window`: the dispatch site pushed the
+        // view frame (before the CALL hook — PUC precallC ordering) and
+        // callBuiltin reuses it — exactly one C-frame per builtin
+        // invocation, whoever pushed it. `host`: callBuiltin owns the
+        // staged push, gated by builtinNeedsCFrame as before.
+        const cframe_pushed = switch (origin) {
+            .bytecode_window => true,
+            .host => builtinNeedsCFrame(id),
+        };
         // P16.39 Cut 3: pushBuiltinCFrame reports whether it reallocated
         // bc_stack. Only then can args/outs slices into the old allocation
         // be stale — the common no-grow case keeps them as-is.
         var grew = false;
-        if (!cframe_pre_pushed and cframe_pushed) grew = try self.pushBuiltinCFrame(callee_val);
+        if (origin == .host and cframe_pushed) grew = try self.pushBuiltinCFrame(callee_val);
 
         // P15.79: re-derive args only when the push reallocated bc_stack
         // AND args pointed into the old allocation (heap args from
@@ -21474,7 +21623,7 @@ pub const Vm = struct {
             const resolved = self.resolveCallable(callee, call_args, null) catch return;
             defer if (resolved.owned_args) |owned| self.alloc.free(owned);
             switch (resolved.callee) {
-                .Builtin => |id| self.callBuiltin(id, resolved.args, &[_]Value{}) catch |e| {
+                .Builtin => |id| self.callBuiltin(id, resolved.args, &[_]Value{}, .host) catch |e| {
                     // P16.31 Cut 3: pcall recovery-boundary close (PUC
                     // luaD_closeprotected) — never on a yield (the yield
                     // propagates through the pre-existing swallow here).
@@ -21571,7 +21720,7 @@ pub const Vm = struct {
                 }
                 defer if (tmp_heap) self.alloc.free(tmp);
 
-                self.callBuiltin(id, resolved.args, tmp) catch |e| switch (e) {
+                self.callBuiltin(id, resolved.args, tmp, .host) catch |e| switch (e) {
                     error.Yield => return e,
                     error.OutOfMemory => {
                         self.setOutOfMemoryError();
@@ -21807,7 +21956,7 @@ pub const Vm = struct {
             const resolved = self.resolveCallable(f, call_args, null) catch return;
             defer if (resolved.owned_args) |owned| self.alloc.free(owned);
             switch (resolved.callee) {
-                .Builtin => |id| self.callBuiltin(id, resolved.args, &[_]Value{}) catch |e| switch (e) {
+                .Builtin => |id| self.callBuiltin(id, resolved.args, &[_]Value{}, .host) catch |e| switch (e) {
                     error.Yield => return e,
                     else => {
                         // P16.31 Cut 3: xpcall recovery-boundary close (PUC
@@ -21866,7 +22015,7 @@ pub const Vm = struct {
                 }
                 defer if (tmp_heap) self.alloc.free(tmp);
 
-                self.callBuiltin(id, resolved.args, tmp) catch |e| switch (e) {
+                self.callBuiltin(id, resolved.args, tmp, .host) catch |e| switch (e) {
                     error.Yield => return e,
                     else => {
                         // P16.31 Cut 3: xpcall recovery-boundary close (PUC
@@ -23213,7 +23362,7 @@ pub const Vm = struct {
                         payload = try self.alloc.alloc(Value, nouts);
                         payload_heap = true;
                     }
-                    self.callBuiltin(id, resolved.args, payload) catch |e| switch (e) {
+                    self.callBuiltin(id, resolved.args, payload, .host) catch |e| switch (e) {
                         error.Yield => {
                             yielded = true;
                         },
@@ -28104,7 +28253,7 @@ pub const Vm = struct {
                     switch (resolved.callee) {
                         .Builtin => |id| {
                             var out1 = [_]Value{.Nil};
-                            self.callBuiltin(id, resolved.args, out1[0..]) catch {
+                            self.callBuiltin(id, resolved.args, out1[0..], .host) catch {
                                 outs[0] = .Nil;
                                 if (outs.len > 1) outs[1] = .{ .String = try self.internStr(self.errorString()) };
                                 return;
@@ -28286,7 +28435,7 @@ pub const Vm = struct {
                 .Builtin => |id| {
                     var loader_args = [_]Value{ .{ .String = try self.internStr(name) }, .{ .String = preload_str } };
                     var loader_out: [2]Value = .{ .Nil, .Nil };
-                    try self.callBuiltin(id, loader_args[0..], loader_out[0..]);
+                    try self.callBuiltin(id, loader_args[0..], loader_out[0..], .host);
                     const v: Value = if (loader_out[0] != .Nil) loader_out[0] else .{ .Bool = true };
                     try self.setField(loaded_tbl, name, v);
                     // P16.39 Cut 3 (correctness): the nested callBuiltin's
@@ -30510,7 +30659,7 @@ pub const Vm = struct {
         switch (hook) {
             .Builtin => |id| {
                 var outs: [0]Value = .{};
-                try self.callBuiltin(id, argv_buf[0..argc], outs[0..]);
+                try self.callBuiltin(id, argv_buf[0..argc], outs[0..], .host);
             },
             .Closure => |cl| {
                 const ret = try self.runClosure(cl, argv_buf[0..argc]);
@@ -31100,7 +31249,7 @@ pub const Vm = struct {
             defer if (resolved.owned_args) |owned| self.alloc.free(owned);
             switch (resolved.callee) {
                 .Builtin => |id| {
-                    try self.callBuiltin(id, resolved.args, outs);
+                    try self.callBuiltin(id, resolved.args, outs, .host);
                     // P16.39 Cut 3 (correctness): the nested callBuiltin's
                     // C-frame push may have reallocated bc_stack — re-derive
                     // the outs window before the nil-fill.
@@ -36194,7 +36343,7 @@ pub const Vm = struct {
                 const outs = try self.alloc.alloc(Value, out_len);
                 defer self.alloc.free(outs);
                 for (outs) |*o| o.* = .Nil;
-                try self.callBuiltin(id, resolved.args, outs);
+                try self.callBuiltin(id, resolved.args, outs, .host);
                 const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
                 if (used == 0) break :blk .Nil;
                 break :blk outs[0];
@@ -37266,7 +37415,7 @@ pub const Vm = struct {
                 .Builtin => |id| {
                     var outs1 = [_]Value{.Nil};
                     const call_args = [_]Value{ a, b };
-                    try self.callBuiltin(id, call_args[0..], outs1[0..]);
+                    try self.callBuiltin(id, call_args[0..], outs1[0..], .host);
                     outv = outs1[0];
                 },
                 .Closure => |cl| {
@@ -37282,7 +37431,7 @@ pub const Vm = struct {
                     switch (resolved.callee) {
                         .Builtin => |id| {
                             var outs1 = [_]Value{.Nil};
-                            try self.callBuiltin(id, resolved.args, outs1[0..]);
+                            try self.callBuiltin(id, resolved.args, outs1[0..], .host);
                             outv = outs1[0];
                         },
                         .Closure => |cl| {
@@ -37968,7 +38117,7 @@ pub const Vm = struct {
             .Builtin => |id| blk: {
                 var call_args = [_]Value{ .{ .Table = tbl }, key };
                 var out: [1]Value = .{.Nil};
-                try self.callBuiltin(id, call_args[0..], out[0..]);
+                try self.callBuiltin(id, call_args[0..], out[0..], .host);
                 break :blk out[0];
             },
             .Closure => |cl| blk: {
@@ -38033,7 +38182,7 @@ pub const Vm = struct {
             .Builtin => |id| blk: {
                 var call_args = [_]Value{ object, key };
                 var out: [1]Value = .{.Nil};
-                try self.callBuiltin(id, call_args[0..], out[0..]);
+                try self.callBuiltin(id, call_args[0..], out[0..], .host);
                 break :blk out[0];
             },
             .Closure => |cl| blk: {
@@ -38066,7 +38215,7 @@ pub const Vm = struct {
                 .Builtin => |id| {
                     var call_args = [_]Value{ object, key, val };
                     var out: [1]Value = .{.Nil};
-                    return self.callBuiltin(id, call_args[0..], out[0..]);
+                    return self.callBuiltin(id, call_args[0..], out[0..], .host);
                 },
                 .Closure => |cl| {
                     var call_args = [_]Value{ object, key, val };
@@ -38087,7 +38236,7 @@ pub const Vm = struct {
             .Builtin => |id| {
                 var call_args = [_]Value{ object, key, val };
                 var out: [1]Value = .{.Nil};
-                return self.callBuiltin(id, call_args[0..], out[0..]);
+                return self.callBuiltin(id, call_args[0..], out[0..], .host);
             },
             .Closure => |cl| {
                 var call_args = [_]Value{ object, key, val };
@@ -38350,7 +38499,7 @@ pub const Vm = struct {
         return switch (resolved.callee) {
             .Builtin => |id| blk: {
                 var out: [1]Value = .{.Nil};
-                try self.callBuiltin(id, resolved.args, out[0..]);
+                try self.callBuiltin(id, resolved.args, out[0..], .host);
                 break :blk out[0];
             },
             .Closure => |cl| blk: {
@@ -43748,7 +43897,7 @@ pub const Vm = struct {
         const retv: Value = switch (fnv) {
             .Builtin => |id| blk: {
                 var out: [1]Value = .{.Nil};
-                self.callBuiltin(id, &[_]Value{}, out[0..]) catch return 0.0;
+                self.callBuiltin(id, &[_]Value{}, out[0..], .host) catch return 0.0;
                 break :blk out[0];
             },
             .Closure => |cl| blk: {

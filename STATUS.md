@@ -1,4 +1,4 @@
-> Last updated: 2026-09-12 (P16.40 Cut 0)
+> Last updated: 2026-09-12 (P16.40 Cut 2)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -11165,3 +11165,60 @@ HEAD 144ab80.
   gc-suites, callgrind gate early-out ≥30). (2) C-frame lifecycle
   (135 vs 71) — после GC-debt. (3) upvalues cache в CallFrame (−7).
   (4) R0 gate cascade (K4, smallest gap 171).
+
+## P16.40 Cut 2 — GC-debt discipline (двусторонний GCdebt-учёт) (2026-09-12)
+
+Реализован выбранный в Cut 1 §7 cut №1 (GC-debt discipline). HEAD `58b5627`
+→ этот коммит; A/B на immutable-бинарниках: A `6f94c09e62750970` (= Cut 0/1
+canonical), B `4abf8cfbbdc00cae`, puc `d54bc45e1757b216` не менялся.
+
+**PUC-механизм (цитаты, проверено по lua-5.5.0/src)**:
+- `luaM_free_` (lmem.c:154): `g->GCdebt += osize` — free двигает debt
+  ОТ due; `luaM_realloc_` (lmem.c:187): `g->GCdebt -= (nsize - osize)` —
+  двусторонний учёт. `luaC_condGC` (lgc.h:233) фаерит на `GCdebt <= 0`.
+- `luaC_step` (lgc.c:1752-1754): `KGC_GENMINOR: youngcollection + setminordebt`
+  — debt перепаривается ПОСЛЕ каждой minor-коллекции.
+- `entergen` (lgc.c:1428-1433): atomic2gen + setminordebt; `minor2inc`
+  (lgc.c:1313): заканчивается luaE_setdebt.
+
+**Правки (все с PUC-цитатами в комментариях)**:
+1. `gcNoteFree`: `gc_step_debt_kb += kb` (root cause — раньше только
+   count; debt дрейфовал к due в no-alloc/free-heavy циклах навсегда).
+2. `gcCreditTreeMemory`: симметричный кредит debt (tree-аналог).
+3. `gcAutomaticStep` gen-minor ветка: setminordebt-пейринг
+   `debt = threshold - count` после каждой автоматической minor — второй
+   односторонний writer (threshold переписывался без debt).
+4. `gcEnterGenerational`/`gcLeaveGenerational`: пейринг debt на выходе
+   из mode-transition (entergen/minor2inc формы).
+5. Доки: поле `gc_step_debt_kb` (инвариант переписан под двусторонний
+   учёт), мёртвое поле `gc_debt_kb` в tracking_alloc.zig помечено unused.
+
+**Slope proof (главный артефакт cut)**: `--stats gc_steps_auto` на K5@40k:
+A **40005** → B **0** (slope 1.0 → 0.0 на builtin-вызов); K6@40k:
+A 40007 → B 0. Callgrind (identical invocation, 20k): condGcFromDispatch
+58.0 → **13.0 i/call** (−45; gcAutomaticStep 420,105 Ir → 0 вызовов),
+ранний выход из gate работает на каждом вызове.
+
+**A/B (3 runs, perf slope i/it, taskset -c 0)**: K1 floor 60-61 → 60-61
+(flat, guard держится); K4 395 → 394 (flat, builtin-путь не затронут);
+K5 709 → **663** (−46; callgrind 709.0 → 664.0; ожидалось ~−41 → ~668);
+K6 2014 → **1982** (−32; NB: у K6 обнаружен ±1.4% hash-order noise в
+total Ir от GETTABUP global-lookups — run-to-run variance table-lookup
+цепочек, не связана с cut; детерминистичный per-function proof выше).
+Microbench-контролы (ins median): lua_calls +0.001% / branch_loop
++0.0001% / int_arith +0.035% (guards flat); GC-adjacent **улучшились**:
+temp_table_alloc **−6.75%**, table_alloc_setmetatable **−6.29%** ins
+(меньше spurious GC-step входов при net-учёте).
+
+**Гейты (все зелёные)**: fmt; unit Debug+RF; smoke **79/79**; matrix
+--testc 31/32 zig_fail=0 (big.lua both_fail pre-existing); c_api 50 PASS
++ test-diff PASS (TBC 22+23); api580 GREEN (D+RF+sizes);
+gc/gengc/tracegc/locals --testc — вывод **побайтно идентичен** pre-cut
+baseline (pre-existing pacing-классы не изменились); api.lua/db.lua pass.
+perf_compare --runs 7: geomean **1.41196** (baseline 1.42076 = **−0.62%**,
+0 WARN/FAIL; vs pre-cut current 1.42749 = −1.08%) — rejection rule (b)
+geomean >+1% пройдена с улучшением. Rejection rules (a)-(d) все пройдены.
+
+**P16.40 queue**: следующий шаг по ранжированию Cut 1 §7 — C-frame
+lifecycle для нереентерабельных builtin (K5 F3+P0+P1 ≈ 135 vs PUC
+precallC+poscall 71), затем upvalues cache в CallFrame.u.lua (−7 i/return).

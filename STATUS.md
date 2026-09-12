@@ -1,4 +1,4 @@
-> Last updated: 2026-09-12 (P16.41 Cut 1 COMPLETE — builtin C-frames real/visible: CIST_FIN, 'n' gating, sync C-hook yield, C-temporary window, luaL_where(L,1); matrix --testc 31/32 zig_fail=0; geomean 1.39x)
+> Last updated: 2026-09-12 (P16.41 Cut 3 COMPLETE — builtin C-frames VIEW over the bytecode CALL window: CIST_VIEW + pushBuiltinCFrameAt (opCall/opTailcall @ R[A], opTforcall @ R[A+4]) + origin-typed callBuiltin (bytecode_window|host), builtin_cframe_pre_pushed deleted; matrix --testc 33 zig_fail=0; smoke 81/81; geomean 1.42x, global_arith drift pre-existing)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -67,6 +67,54 @@ IR VM полностью удалена из кодовой базы.
 ## История разработки
 
 Выполненные задачи по номерам (P15.xx). Полные детали — в `git log` и коде.
+
+### P16.41 Cut 3 — builtin C-frames: VIEW over the bytecode CALL window (2026-09-12)
+
+PUC-модель (ldo.c precallC: `ci->func = func` — слот callee ВНУТРИ окна
+caller'а, никогда не staged-дубликат над окном) реализована для всех
+bytecode-origin builtin-вызовов:
+
+- **CIST_VIEW** (`1 << 28`) + `isView()`/`setView()`; `pushBuiltinCFrameAt(func_slot)`
+  — view-push: без записи в стек, без top-advance, без growth-check;
+  staged-путь (`pushBuiltinCFrame`) разделяет `initBuiltinCFrame`.
+- **3 Variant-A dispatch-сайта**: opCall/opTailcall — view на `ctx.base + a`
+  (PUC pretailcall C-ветка: func на func-слоте caller'а); opTforcall — на
+  `ctx.base + a + 4` (iterator R[A+4]). Push теперь для КАЖДОГО C-frame
+  builtin (не только hook-deferred); C-activation hook стреляет на view-frame.
+- **`callBuiltin(id, args, outs, origin)`**: `BuiltinCallOrigin { bytecode_window,
+  host }`; глобал `builtin_cframe_pre_pushed` удалён (поле Vm + все set/read).
+  21 host-сайт (apiCall/metamethod/sort/gsub/…) — staged, неизменны.
+- **View-aware top-restore**: `popBuiltinCFrame` (view → top нижнего Lua-frame
+  окна), новый `restoreTopAtFrame` в `poscallCFrame`/`discardCFrame`/
+  `popBytecodeExecFrame` — hot-path sort-comparator/metamethod возвратов.
+- Frameless builtins (collectgarbage/string_sub) — без frame (Cut 1 deviation),
+  origin `.host` без эффекта (staged-arm needsCFrame-gated).
+
+Gates: unit D+RF rc=0; smoke differential **81/81** (новый
+`tests/smoke/82_cframe_view_model.lua` — 20 тестов: окна args/results,
+multret, nested reentrancy, hook на view-frame + reentrant hook body,
+arg/RuntimeError + location, pcall recovery, GC finalizer reentry, TBC,
+tailcall-to-C, TFORCALL-to-C, testC; PUC-first + negative-validated:
+мутация view-restore → 81+82 FAIL); matrix --testc **33 pass, zig_fail=0**
+(big.lua both_fail pre-existing); c_api test + test-diff PASS; api580 GREEN;
+nextvar/coroutine/calls/locals/db/gc/errors/sort/strings ok (cstack count-diff
+pre-existing); fmt clean.
+
+Perf A/B (callgrind, immutable binaries): K5 builtin 664→663 (−1), K4 call
+395→395 (0, pure-Lua путь не тронут by design), K1 61→61, K6 coroutine
+1971→1980 (+9 i/it = +0.46% < 0.5% guard-порога; inlining/layout shift вокруг
+изменённого opCall, без новой семантической работы на co_fast_path).
+perf_compare: все 5 guard'ов OK; global_arith +14.2% — pre-existing drift
+(HEAD stash: +11.8%). Оценка P16.40 "135→71 i/it" оказалась оптимистичной:
+большая часть bucket'а — церемония, общая для обеих моделей; ценность cut'а —
+архитектурная parity (нет дубликата callee-слота), не сокращение инструкций.
+
+Найденные pre-existing расхождения (verified at HEAD via stash, NOT cut
+regressions; детали в p16.41-builtin-call-origins.md §7): pcall-caller
+arg-error naming ('abs' vs PUC 'math.abs' — pcall divert без реального
+C-frame); TFORCALL-callee hook naming ("next" vs PUC "for iterator");
+string.rep arg-error текст. Pre-existing holes: cstack Debug segfault,
+pcall-in-__gc corruption, gc.lua pace2 (Cut 1 список).
 
 ### P16.41 Cut 1 — BLOCKING correctness: ordinary builtin C-frames REAL and VISIBLE (2026-09-12)
 

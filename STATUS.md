@@ -1,4 +1,4 @@
-> Last updated: 2026-09-12 (P16.41 Cut 3 COMPLETE — builtin C-frames VIEW over the bytecode CALL window: CIST_VIEW + pushBuiltinCFrameAt (opCall/opTailcall @ R[A], opTforcall @ R[A+4]) + origin-typed callBuiltin (bytecode_window|host), builtin_cframe_pre_pushed deleted; matrix --testc 33 zig_fail=0; smoke 81/81; geomean 1.42x, global_arith drift pre-existing)
+> Last updated: 2026-09-12 (P16.41 COMPLETE — C-frame visibility parity (CIST_HIDE deleted) + CALL-window view model; getinfo(0)/sort-frames/traceback PUC-identical; geomean 1.41237 (correctness phase))
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -34,11 +34,11 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
 | Differential output (`--diff`) | **0 output_diff** |
-| Smoke tests (`tests/smoke/*.lua`) | **79/79** pass |
+| Smoke tests (`tests/smoke/*.lua`) | **81/81** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.40x** |
+| Performance (geomean vs PUC) | **1.41x** |
 
-Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -6410,6 +6410,36 @@ TBC 22+23, unit D+RF; geomean 1.42076.
 
 Гейт: matrix 31/32 zig_fail=0, smoke 79/79, c_api 50+diff, api580,
 TBC 22+23, unit D+RF; geomean 1.40315; baseline=1.40315.
+
+### P16.41 COMPLETE: C-frame parity + CALL-window view model (2026-09-09)
+**Geomean 1.40315 → 1.41237** (measured `8b1e00f` clean; correctness/
+architecture фаза; global_arith +14% = pre-existing drift, HEAD-верифицирован).
+
+- **Cut 0 (`0fd3682`)**: stale-артефакты → единая provenance @ a6c470a;
+  финальная K-матрица: K1 61/28, K4 395/224, K5 664/251, K6 ~1980/980.
+- **Cut 1 (`2d9cc8c`) — BLOCKING закрыт**: ordinary builtin C-frames
+  РЕАЛЬНЫ и ВИДИМЫ: **CIST_HIDE удалён**; `debug.getinfo(0)` = C field
+  getinfo; sort-comparator видит `C field sort` на level 2; traceback
+  содержит реальные C-кадры. Бонус-фиксы: CIST_FIN (PUC GCTM),
+  sync/async C-hook yield (stale suspended_builtin — реальный баг),
+  C-temporary window (PUC luaG_findlocal), luaL_where восстановлен
+  (регрессия поймана c_api-diff). Тест 81 + негативная валидация.
+  matrix **zig_fail=0 впервые** (db.lua finalizer-hang тоже закрыт
+  'n'-gating + isFin-порядком).
+- **Cut 3 (`8b1e00f`) — view-модель**: C-кадр = VIEW над СУЩЕСТВУЮЩИМ
+  CALL-window (PUC `ci->func = func`): CIST_VIEW bit;
+  pushBuiltinCFrameAt — без stack-write/top-advance/growth-check;
+  `builtin_cframe_pre_pushed` глобал УДАЛЁН (origin-дескриптор);
+  21 host-сайт staged; view-aware top-restore. Тест 82 (20 кейсов) +
+  негативная валидация. Perf честно нейтрален (K5 −1, K6 +0.46%<
+  гварда): оценка 135→71 была оптимистична — ценность = архитектурная
+  parity.
+- **Найдено pre-existing** (документировано, НЕ регрессии): cstack Debug
+  segfault; pcall-in-__gc corruption; gc pace2 hang; pcall-caller
+  arg-error naming; TFORCALL hook naming; string.rep text.
+
+Гейт: matrix 31/32 zig_fail=0, smoke **81/81** (+81, +82), c_api 50+diff,
+api580, TBC 22+23, unit D+RF; geomean 1.41237; baseline=1.41237.
 
 ## История закрытых фаз
 

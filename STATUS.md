@@ -1,4 +1,4 @@
-> Last updated: 2026-09-12 (P16.41 COMPLETE — C-frame visibility parity (CIST_HIDE deleted) + CALL-window view model; getinfo(0)/sort-frames/traceback PUC-identical; geomean 1.41237 (correctness phase))
+> Last updated: 2026-09-12 (P16.42 T2+T3 — gc.lua pace2 hang FIXED (closure charge −8B/load), cstack Debug segfault classified DEFERRED; geomean 1.41x unchanged)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -67,6 +67,61 @@ IR VM полностью удалена из кодовой базы.
 ## История разработки
 
 Выполненные задачи по номерам (P15.xx). Полные детали — в `git log` и коде.
+
+### P16.42 T2+T3 — pre-existing correctness bugs: gc.lua pace2 FIXED, cstack Debug segfault classified/DEFERRED (2026-09-12)
+
+**T3 — gc.lua "pace of the collector" hang (без --testc): CLOSED.**
+Root cause (измерен event-trace'ом каждого gcNoteAlloc/gcNoteFree для
+одного изолированного load): `createBytecodeChunkClosure` (text-load путь)
+заряжал `gcNoteAlloc(@sizeOf(Closure))` = 40 B, а `gcFreeObject(.closure)`
+кредитует `40 + upvalues.len*8` = 48 B — main-chunk closure имеет ровно
+1 upvalue (`_ENV`) → **−8 B на каждый `load()`**. После ~150 load'ов
+перекошенный `gc_count_kb` схлопывался до 0 на полном GC → LOOP-2 pace-секции
+(`until gcinfo() <= x*2`, x≈0) не могла выйти никогда. Тот же missing term
+в `closureFromProto` (undump-путь). PUC parity: `luaF_newLclosure` выделяет
+LClosure+upvalue-array одним блоком через `luaC_newobj`. Fix: оба сайта
+заряжают полный размер; errdefer'ы симметричны + освобождают upvalue-array
+(прежде leak на OOM-пути). Tree-учёт (chargeTreeFootprint/releaseTree)
+проверен инструментально — симметричен (663==663 B), не причина.
+Верификация: single-load delta 0.0 B; n=5000 count 21.30 KB stable (было
+0.0000); drift flat как PUC; **gc.lua без --testc проходит, вывод
+побайтно идентичен PUC**; с --testc вывод не изменился; gengc/tracegc/locals
+вывод не изменился (их vs-PUC diff'ы pre-existing at HEAD, stash-verified).
+Бонус-симптом закрыт тем же фиксом: `T.stats()` после ≥150 load'ов + full GC
+крашился (`switch on corrupt value` в ltable keyMatches — collapsed count
+занижал GC-threshold, step стрелял внутри builtinTestcStats и выметал
+не-yet-rooted Zig-local таблицы; latent rooting-hole в builtinTestcStats
+остаётся — flagged для C-frame/GC-rooting convergence). Детали:
+`tools/status/p16.42-gc-pace2.md`.
+
+**T2 — cstack.lua Debug segfault (chain of coroutine.close): DEFERRED,
+честная классификация.** Genuine host-stack exhaustion: Debug-фреймы
+~84.2 KB/уровень (runBytecodeDispatch ~44.9K dynamic sub, resume ~16.9K,
+opCall ~8.6K, …) × 200 семантический лимит ≈ 16.8 MB > фиксированный ~16 MB
+stack ceiling этого окружения (ulimit -s НЕ enforced в контейнере —
+проверено отдельным рекурсивным Zig-пробом) → смерть на глубине 198.
+PUC тоже рекурсирует в C в этом пути (lua_closethread→…→precallC, ~1 KB
+фреймы), bounded nCcalls=200 — итеративного PUC-пути НЕ СУЩЕСТВУЕТ, посему
+условие фикса "сделать итеративно как PUC" неприменимо. Семантика корректна
+(RF: error at 200 = documented count-diff vs PUC 197). Класс: Debug-codegen
+frame-size artifact, не memory-safety. N-таблица + размеры фреймов:
+`tools/status/p16.42-cstack-debug-crash.md`.
+
+**Обнаружено попутно (pre-existing, НЕ фикс этого этапа)**:
+`tests/smoke/82_cframe_view_model.lua` падает под `--testc` (Debug и RF,
+строка 227: `for k in next, {10}` с call-hook — `type error: expected
+table, got nil`, hook/TFORCALL arg-window под testC-модулем); БЕЗ --testc
+проходит (официальный smoke-lane). Stash-verified pre-existing и на HEAD
+(0728e37), и на 8b1e00f (коммит, добавивший тест зелёным). Требует
+отдельного расследования.
+
+Gates (T3 fix): fmt; unit D+RF; smoke differential **83/83 PASS**; matrix
+--testc **33 pass, zig_fail=0** (big.lua both_fail pre-existing); c_api
+test + test-diff PASS; api580 GREEN (384<400); gc/gengc/tracegc/locals/
+db/coroutine/errors оба режима; TBC known-divergence probe unchanged;
+perf_compare **OK no regressions** (geomean 1.41x ≈ baseline 1.41237;
+dynamic_load −3.4%, temp_table_alloc −2.7% — улучшения P16.40 Cut 2
+сохранены; preregistered guard <1% выдержан).
 
 ### P16.41 Cut 3 — builtin C-frames: VIEW over the bytecode CALL window (2026-09-12)
 

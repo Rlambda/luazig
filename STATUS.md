@@ -1,4 +1,4 @@
-> Last updated: 2026-09-12 (P16.40 COMPLETE — GC-debt discipline (PUC two-sided GCdebt parity): K5 663, gcAutomaticStep 1.0→0.0/call, temp_table 1.076x; geomean 1.40315)
+> Last updated: 2026-09-12 (P16.41 Cut 1 COMPLETE — builtin C-frames real/visible: CIST_FIN, 'n' gating, sync C-hook yield, C-temporary window, luaL_where(L,1); matrix --testc 31/32 zig_fail=0; geomean 1.39x)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -67,6 +67,39 @@ IR VM полностью удалена из кодовой базы.
 ## История разработки
 
 Выполненные задачи по номерам (P15.xx). Полные детали — в `git log` и коде.
+
+### P16.41 Cut 1 — BLOCKING correctness: ordinary builtin C-frames REAL and VISIBLE (2026-09-12)
+
+CIST_HIDE удалён полностью; все builtin C-frames теперь реальные и видимые
+debug-стеку, как PUC CallInfo для C-функций (getinfo levels, traceback,
+luaL_where walks). Дополнительно в рамках cut'а закрыто:
+
+- **CIST_FIN** (PUC GCTM): флаг на top-frame вокруг finalizer-вызова;
+  getinfo/getFuncNameForFrame отдают "__gc"/"metamethod" в PUC-порядке
+  (чинит hang db.lua:913-930 — finalizer test).
+- **'n' gating** в getinfo (PUC auxgetinfo): name/namewhat только при 'n'
+  в what (или пустом what).
+- **Sync C-hook yield** (PUC lua_yieldk hook branch + luaG_traceexec):
+  yield из frameless C-hook усекает стек до прерванного frame — level 0 =
+  прерванный Lua-frame, level 1 = nil (чинит coroutine.lua:699 под
+  --testc; матрица впервые 31/32, zig_fail=0).
+- **C-temporary window** (PUC luaG_findlocal): `suspendedCWindow` — окно
+  припаркованного C-frame = parked_stack минус moved-out `aux.nyield`
+  значений (coroutine.lua:722: getlocal(co,0,2) == 10).
+- **luaL_where(L, 1)** (PUC lauxlib.c): восстановлен PUC-уровень в
+  luaL_error/luaL_argerror — регрессия cut'а, поймана c_api
+  23_tbc_semantics diff (k_cont_error терял "[string ...]:1:" prefix).
+
+Gates: matrix --testc 31/32 (zig_fail=0; big.lua both_fail pre-existing),
+smoke differential 80/80 (новый tests/smoke/81_cframe_visibility.lua),
+unit D+RF rc=0, c_api test + test-diff PASS, api580 GREEN. Perf: hot paths
+flat (lua_calls +1.9%, string_loop +1.0%, coroutine_yield +0.4%); global_arith
++14% — pre-existing drift от baseline P16.40 (падает и на HEAD).
+
+Найденные pre-existing проблемы (задокументированы, не регрессии cut'а):
+cstack.lua segfault в Debug-сборке; pcall внутри __gc finalizer портит
+память; gc.lua pace2 (GC pacing divergence). Детали:
+tools/status/p16.41-cframe-parity.md.
 
 ### P16.35 Cut 3 — builtin OP_CALL guard-chain hoisting (2026-09-10)
 

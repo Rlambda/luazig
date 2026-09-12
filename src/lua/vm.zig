@@ -325,6 +325,13 @@ pub const BuiltinId = enum(u8) {
     /// (string/__tostring/(error object is a %s value)) and a traceback is
     /// appended, all BEFORE call stack unwinding.
     cli_msghandler,
+    /// Host entry function — PUC `pmain` (lua.c:612). The CLI pushes one
+    /// C frame for it below the main chunk (pushHostEntryCFrame), exactly
+    /// like PUC's `main` → `lua_pcall(L, 2, 1, msghandler)` leaves pmain's
+    /// CallInfo below the chunk. Never dispatched through callBuiltin: the
+    /// frame is pushed directly by the CLI host boundary; the dispatch arm
+    /// below is a defensive no-op (PUC's pmain is callable, ours never is).
+    host_entry,
     pub fn name(self: BuiltinId) []const u8 {
         return switch (self) {
             .print => "print",
@@ -499,6 +506,7 @@ pub const BuiltinId = enum(u8) {
             .testc_checkpanic => "T._checkpanic",
             .testc_stats => "T.stats",
             .cli_msghandler => "msghandler",
+            .host_entry => "host_entry",
         };
     }
 };
@@ -1895,6 +1903,9 @@ pub const CallFrame = extern struct {
     pub fn isHidden(fr: CallFrame) bool {
         return (fr.callstatus & CIST_HIDE) != 0;
     }
+    pub fn isFin(fr: CallFrame) bool {
+        return (fr.callstatus & CIST_FIN) != 0;
+    }
     pub fn setTailCall(fr: *CallFrame) void {
         fr.callstatus |= CIST_TAIL;
     }
@@ -1906,6 +1917,12 @@ pub const CallFrame = extern struct {
     }
     pub fn setHidden(fr: *CallFrame) void {
         fr.callstatus |= CIST_HIDE;
+    }
+    pub fn setFin(fr: *CallFrame) void {
+        fr.callstatus |= CIST_FIN;
+    }
+    pub fn clearFin(fr: *CallFrame) void {
+        fr.callstatus &= ~CIST_FIN;
     }
     pub fn clearTailCall(fr: *CallFrame) void {
         fr.callstatus &= ~CIST_TAIL;
@@ -2547,6 +2564,14 @@ const DebugHookState = struct {
     /// PUC C hooks may yield; ordinary Lua hooks may not. testC installs its
     /// emulated C hook through a private marker after debug.sethook.
     allow_yield: bool = false,
+    /// Frame index the sync C hook was dispatched on (PUC luaD_hook runs
+    /// the C hook FRAMELESS on L->ci — the interrupted frame). Set by
+    /// debugDispatchHookTransfer around the hook call so a yield from
+    /// inside the C hook (builtinCoroutineYield) can identify and abandon
+    /// everything the hook pushed above that frame (PUC luaG_traceexec's
+    /// luaD_throw after a hook yield truncates the stack back to the
+    /// interrupted frame). Null when no sync C hook is running.
+    sync_hook_frame_idx: ?usize = null,
     /// PUC `L->hook` (lstate.c): C hook function installed by `lua_sethook`.
     /// When non-null, the VM calls this function at hook events instead of
     /// the Lua-level `func`. PUC has a single hook slot per thread: setting
@@ -4533,11 +4558,11 @@ pub const Vm = struct {
     protected_call_depth: usize = 0,
     // P15.78: errfunc and errfunc_running moved from Vm to Thread, matching
     // PUC's L->errfunc on lua_State (not global_State). See Thread.errfunc.
-    /// Native pcall/xpcall activations are not represented in `frames`, but
-    /// `error(message, level)` must still count them while resolving a source
-    /// location. Store the Lua-frame depth at each native protected boundary.
-    protected_c_frame_depths: [128]usize = undefined,
-    protected_c_frame_count: usize = 0,
+    // P16.41 Cut 1: protected_c_frame_depths (a registered-depth array for
+    // errorLocationFrameIndex) is GONE — slow-path pcall/xpcall/dofile now
+    // have REAL visible C-frames, and the frame-less fast path is derived
+    // from the armed pending-protection on the caller frame (see
+    // errorLocationFrameIndex). No registered state, no stale depths.
     close_metamethod_depth: usize = 0,
     close_metamethod_err_depth: usize = 0,
     testc_close_metamethod_depth: usize = 0,
@@ -5186,8 +5211,23 @@ pub const Vm = struct {
         if (frame.isTailCall()) return null;
         if (frame_idx == 0) return null;
         const parent = th.call_frames.getConstPtr(frame_idx - 1);
-        // Caller executing inside a hook (PUC CIST_HOOKED): "?" / "hook".
-        if (parent.isDebugHook()) return .{ .namewhat = "hook", .name = "?" };
+        // PUC funcnamefromcall (ldebug.c:661): a frame whose CALLER is the
+        // hook event ci (CIST_HOOKED — set on the interrupted frame while
+        // the hook runs, ldo.c:458) is the HOOK FUNCTION itself: "?" /
+        // "hook". zig flags the hook's own frame instead of the event ci
+        // (same frame pair, one level shifted), so the rule translates to
+        // checking the NAMED frame. Functions CALLED BY the hook are named
+        // normally from the hook's code (their caller — the hook frame in
+        // zig — carries no relevant flag in PUC).
+        if (th.call_frames.getConstPtr(frame_idx).isDebugHook())
+            return .{ .namewhat = "hook", .name = "?" };
+        // PUC funcnamefromcall (ldebug.c:665): a frame whose caller is
+        // flagged CIST_FIN is a finalizer body — "__gc"/"metamethod".
+        // Checked before the caller's code (the flag replaces
+        // funcnamefromcode); the caller may be a C frame, so this must
+        // precede the proto() gate below.
+        if (parent.isFin())
+            return .{ .namewhat = "metamethod", .name = "__gc" };
         const proto = parent.proto() orelse return null; // C caller: no name
         const pc = parent.u.lua.pc;
         if (pc >= proto.code.len) return null;
@@ -5258,7 +5298,7 @@ pub const Vm = struct {
         return &self.pending_calls.items[index].payload;
     }
 
-    fn getPendingCallConst(self: *Vm, index: u32) ?*const BytecodePendingCall {
+    fn getPendingCallConst(self: *const Vm, index: u32) ?*const BytecodePendingCall {
         if (index == INVALID_PENDING) return null;
         if (self.pending_calls.items.len == 0) return null;
         if (@as(usize, index) >= self.pending_calls.items.len) return null;
@@ -6534,6 +6574,18 @@ pub const Vm = struct {
         // finalizer call itself.
         self.debug_hooks_suppressed += 1;
         defer self.debug_hooks_suppressed -= 1;
+        // PUC GCTM (lgc.c:983): flags the CURRENT CallInfo (L->ci — the
+        // frame the GC stepped from, which becomes the finalizer body's
+        // direct caller) with CIST_FIN around luaD_pcall, so
+        // funcnamefromcall names the finalizer body "__gc"/"metamethod"
+        // (ldebug.c:665). Flag the active thread's top frame the same way.
+        // NOTE: the defer must be function-scoped — a block-scoped defer
+        // would clear the flag before the finalizer body runs.
+        const fin_thread = self.activeBytecodeThread();
+        const fin_caller_idx: ?usize =
+            if (fin_thread.call_frames.len() > 0) fin_thread.call_frames.len() - 1 else null;
+        if (fin_caller_idx) |i| fin_thread.call_frames.getPtr(i).setFin();
+        defer if (fin_caller_idx) |i| fin_thread.call_frames.getPtr(i).clearFin();
         return self.callMetamethod(gc, "__gc", args);
     }
 
@@ -6693,161 +6745,308 @@ pub const Vm = struct {
         try out.appendSlice(alloc, text);
     }
 
-    /// PUC traceback parity for the raiser's C-frame (P16.36 T2.3).
-    ///
-    /// In PUC, C functions (error, assert, xpcall, io.open, coroutine.yield,
-    /// ...) have a real CallInfo on the stack at throw time, and
-    /// luaL_traceback labels it via pushfuncname (lauxlib.c:96):
-    ///   1. a name from code — funcnamefromcall reads the CALLER's calling
-    ///      instruction: "global 'xpcall'", "field 'open'", "method 'm'", ...
-    ///   2. a _G/_LOADED search: "function 'name'"
-    ///   3. "?"
-    ///
-    /// luazig hides builtin C-frames (P15.79), so the frame walks in
-    /// captureErrorTraceback / debugBuildCurrentTraceback skip them. The
-    /// former mechanism (Vm.err_cfunc_label, set by each raising builtin)
-    /// was persistent Vm state: it leaked across recovered errors and
-    /// coroutine switches (a stale "global 'error'" misattributed to a
-    /// later xpcall argument error). Instead, derive the line STRUCTURALLY
-    /// at capture time from the live frame stack: when the top frame is a
-    /// hidden C-frame, it is by construction the raiser's frame (a raise
-    /// from dispatch has the Lua frame on top; a raise from a builtin's
-    /// dynamic extent has that builtin's C-frame on top) — label it exactly
-    /// the way tracebackFrameLabel labels a visible one.
-    ///
-    /// Only hidden frames get the synthetic line: while a message handler
-    /// runs, invokeErrfunc unhides the raiser's C-frame so the normal walk
-    /// already shows it (no double print).
-    fn writeSyntheticTopCFrame(self: *Vm, w: anytype) !void {
-        const th = self.activeBytecodeThread();
-        const n = th.call_frames.len();
-        if (n == 0) return;
-        const top = th.call_frames.getConstPtr(n - 1);
-        if (!top.isC() or !top.isHidden()) return;
-        // pushfuncname path 1: funcnamefromcall — the name comes from the
-        // caller's calling instruction (getFuncNameForFrame reads the
-        // parent frame's pc, parked at the failing CALL boundary).
-        if (self.getFuncNameForFrame(th, n - 1)) |fn_name| {
+    /// PUC pushfuncname (lauxlib.c:96-109) for one frame: the
+    /// "{namewhat} '{name}'" / "main chunk" / "function 'g'" /
+    /// "function <src:line>" / "?" part. Names come from the CALLER's call
+    /// site (getFuncNameForFrame — PUC funcnamefromcall), never from the
+    /// function itself.
+    fn tracebackFuncName(self: *Vm, th: *Thread, frame_idx: usize) DispatchError![]const u8 {
+        const fr = th.call_frames.getConstPtr(frame_idx);
+        if (self.getFuncNameForFrame(th, frame_idx)) |fn_name| {
             if (fn_name.name) |nm| {
                 if (fn_name.namewhat.len != 0) {
-                    try w.print("\t[C]: in {s} '{s}'\n", .{ fn_name.namewhat, nm });
-                    return;
+                    return try std.fmt.allocPrint(self.alloc, "{s} '{s}'", .{ fn_name.namewhat, nm });
                 }
             }
         }
-        // pushfuncname path 2: pushglobalfuncname — search _G for the
-        // function value ("function 'name'"). Builtins live in _G as
-        // .Builtin values, so match those too (PUC finds C functions in
-        // _LOADED the same way).
-        if (self.debugFindGlobalFuncName(th.bytecode_stack[top.func_slot])) |gname| {
-            try w.print("\t[C]: in function '{s}'\n", .{gname});
-            return;
+        // No name from code. PUC order: main chunk, then a global search
+        // (pushglobalfuncname — applies to C AND Lua functions), then
+        // "function <src:linedefined>" for Lua, "?" for C.
+        if (fr.isLua() and fr.lineDefined() == 0) {
+            return try std.fmt.allocPrint(self.alloc, "main chunk", .{});
         }
-        // pushfuncname path 3: nothing left...
-        try w.writeAll("\t[C]: in ?\n");
+        if (self.debugFindGlobalFuncName(th.bytecode_stack[fr.func_slot])) |gname| {
+            return try std.fmt.allocPrint(self.alloc, "function '{s}'", .{gname});
+        }
+        if (fr.isC()) return try std.fmt.allocPrint(self.alloc, "?", .{});
+        var id_buf: [59]u8 = undefined;
+        const shown_src = blk: {
+            const src_raw = fr.sourceName();
+            const is_stripped = if (fr.proto()) |proto| protoIsStripped(proto) else false;
+            break :blk if (is_stripped) "?" else diag.chunkId(id_buf[0..], src_raw);
+        };
+        return try std.fmt.allocPrint(self.alloc, "function <{s}:{d}>", .{ shown_src, fr.lineDefined() });
     }
 
+    /// One traceback line's content (after the "\n\t" prefix, PUC
+    /// luaL_traceback lauxlib.c:148-154): "{short_src}[:{line}]: in "
+    /// + pushfuncname. C frames render "[C]: in ..." (funcinfo: source
+    /// "=[C]" -> chunkid -> "[C]"; currentline -1 -> no line).
+    fn tracebackFrameLabel(self: *Vm, th: *Thread, frame_idx: usize) DispatchError![]const u8 {
+        const fr = th.call_frames.getConstPtr(frame_idx);
+        const func_name = try self.tracebackFuncName(th, frame_idx);
+        if (fr.isC()) {
+            return try std.fmt.allocPrint(self.alloc, "[C]: in {s}", .{func_name});
+        }
+        // Resolve short_src via PUC luaO_chunkid. A stripped proto (NULL
+        // source in PUC) reports "?".
+        const src_raw = fr.sourceName();
+        const is_stripped = if (fr.proto()) |proto| protoIsStripped(proto) else false;
+        var id_buf: [59]u8 = undefined;
+        const shown_src: []const u8 = if (is_stripped)
+            "?"
+        else blk: {
+            const src = diag.chunkId(id_buf[0..], src_raw);
+            break :blk if (src.len != 0) src else "?";
+        };
+        // PUC appends the line number ONLY when currentline > 0 (a frame
+        // without line info renders just "src: in ...").
+        const cur_line: i64 = self.frameCurrentLine(fr);
+        if (cur_line > 0) {
+            return try std.fmt.allocPrint(self.alloc, "{s}:{d}: in {s}", .{ shown_src, cur_line, func_name });
+        }
+        return try std.fmt.allocPrint(self.alloc, "{s}: in {s}", .{ shown_src, func_name });
+    }
+
+    /// Label for a virtual C frame that has no CallFrame on the stack:
+    /// either a phantom fast-path pcall/xpcall layer (the PUC CallInfo of
+    /// the pcall C function that tryPushBytecodeProtectedCall skips), or
+    /// the yield C frame of a suspended coroutine whose frame was popped
+    /// at suspension. The name follows PUC funcnamefromcall: read the
+    /// caller frame's call instruction and its A operand — but only when
+    /// the caller is the frame that actually called this C function
+    /// (`from_call_site`; an inner pcall layer's caller is the OUTER
+    /// pcall's C frame, which yields no code name). Fallback:
+    /// pushglobalfuncname ("function 'name'"), then "?".
+    /// PUC funcnamefromcall for a C frame whose caller is the Lua frame
+    /// at `caller_idx`: read the caller's current instruction; if it is a
+    /// call, name its A operand (PUC does not verify the callee register
+    /// actually holds the C function — faithful even when the pc is a
+    /// hook interrupt point that coincidentally sits on a call). Returns
+    /// null when the caller is not executing a call (name falls back to
+    /// pushglobalfuncname / nil for getinfo).
+    fn debugCallSiteName(
+        self: *Vm,
+        th: *Thread,
+        caller_idx: usize,
+    ) ?struct { namewhat: []const u8, name: []const u8 } {
+        _ = self;
+        const caller = th.call_frames.getConstPtr(caller_idx);
+        const proto = caller.proto() orelse return null; // C caller: no name
+        const pc = caller.u.lua.pc;
+        if (pc >= proto.code.len) return null;
+        const inst = proto.code[pc];
+        const op: bc.Op = @enumFromInt(inst.op);
+        if (op != .call and op != .tailcall) return null;
+        const off: usize = inst.a;
+        if (off >= proto.maxstacksize) return null;
+        const dn = debugBytecodeOperandName(proto, pc, @intCast(off));
+        if (dn.name) |nm| return .{ .namewhat = dn.namewhat, .name = nm };
+        return null;
+    }
+
+    fn virtualCFrameLabel(
+        self: *Vm,
+        th: *Thread,
+        caller_idx: usize,
+        callee: Value,
+        from_call_site: bool,
+    ) DispatchError![]const u8 {
+        if (from_call_site) {
+            if (self.debugCallSiteName(th, caller_idx)) |dn| {
+                return try std.fmt.allocPrint(self.alloc, "[C]: in {s} '{s}'", .{ dn.namewhat, dn.name });
+            }
+        }
+        if (self.debugFindGlobalFuncName(callee)) |gname| {
+            return try std.fmt.allocPrint(self.alloc, "[C]: in function '{s}'", .{gname});
+        }
+        return try std.fmt.allocPrint(self.alloc, "[C]: in ?", .{});
+    }
+
+    /// One traceback level: a real frame, a phantom fast-path pcall layer
+    /// (PUC: the pcall C function's CallInfo, which the zig fast path does
+    /// not push), or the virtual yield C frame of a suspended coroutine.
+    /// A phantom fast-path pcall/xpcall layer: `armed_idx` is the armed
+    /// caller frame (whose call instruction names the outermost layer),
+    /// `kind` which pcall variant this layer is, `outermost` whether this
+    /// layer's caller is the armed frame itself (inner layers' callers
+    /// are outer C frames).
+    const TracebackPhantom = struct {
+        armed_idx: usize,
+        kind: BytecodeProtectedKind,
+        outermost: bool,
+    };
+
+    const TracebackItem = union(enum) {
+        frame: usize,
+        phantom: TracebackPhantom,
+        virtual_yield,
+    };
+
+    /// Enumerate a thread's traceback levels top-first:
+    ///  - a suspended coroutine whose yield C frame was popped at
+    ///    suspension (suspended_builtin set, top parked frame not the C
+    ///    frame itself) gets a virtual yield item at level 0 — PUC keeps
+    ///    luaB_yield's CallInfo (db.lua: checktraceback expects the
+    ///    "yield" line for both plain and hook yields);
+    ///  - visible frames, with the phantom pcall layers of an armed frame
+    ///    inserted BEFORE it, innermost first (PUC chain top-down:
+    ///    ..., target, xpcall(C), pcall(C), caller — the protection kind
+    ///    is the innermost layer; outer_layers park the outer ones,
+    ///    outermost first, so they emit reversed). Only the OUTERMOST
+    ///    layer is named from the armed frame's call site — an inner
+    ///    layer's caller is the outer pcall's C frame (no code name; PUC
+    ///    falls back to pushglobalfuncname).
+    fn collectTracebackItems(self: *Vm, th: *Thread, items: *std.ArrayListUnmanaged(TracebackItem)) DispatchError!void {
+        if (th.status == .suspended and th.suspended_builtin != null) {
+            const n = th.call_frames.len();
+            const top_is_c = n > 0 and th.call_frames.getConstPtr(n - 1).isC();
+            if (!top_is_c) {
+                try items.append(self.alloc, .virtual_yield);
+            }
+        }
+        var i: usize = th.call_frames.len();
+        while (i > 0) {
+            i -= 1;
+            const fr = th.call_frames.getConstPtr(i);
+            if (fr.isHidden()) continue;
+            if (self.getPendingCallConst(fr.pending_call_index)) |pending| {
+                if (pending.protection) |prot| {
+                    // Innermost layer first (closest to the target above).
+                    try items.append(self.alloc, .{ .phantom = .{
+                        .armed_idx = i,
+                        .kind = prot.kind,
+                        .outermost = prot.outer_layers.len == 0,
+                    } });
+                    // Then the parked outer layers, innermost-outer first
+                    // (outer_layers is stored outermost-first).
+                    var k: usize = prot.outer_layers.len;
+                    while (k > 0) {
+                        k -= 1;
+                        try items.append(self.alloc, .{ .phantom = .{
+                            .armed_idx = i,
+                            .kind = prot.outer_layers[k].kind,
+                            .outermost = k == 0,
+                        } });
+                    }
+                }
+            }
+            try items.append(self.alloc, .{ .frame = i });
+        }
+    }
+
+    /// A resolved debug level (PUC lua_getstack: 0-based CallInfo depth
+    /// from the top; level 0 = the running C function's own frame). The
+    /// SAME item model as the traceback: phantom fast-path pcall/xpcall
+    /// layers and the suspended yield C frame are real levels, so
+    /// debug.getinfo, debug.getlocal, debug.setlocal and debug.traceback
+    /// agree on level numbering (PUC: one CallInfo chain serves all of
+    /// them). `frame.index` is the index into th.call_frames.
+    const DebugLevel = union(enum) {
+        frame: struct { frame: *CallFrame, index: usize },
+        phantom: TracebackPhantom,
+        virtual_yield,
+    };
+
+    /// Resolve API `level` (0-based from the top of `th`'s chain) to a
+    /// DebugLevel, or null when beyond the chain. Dead threads have no
+    /// frames (our unwind is destructive — documented divergence; PUC
+    /// preserves a dead errored coroutine's CallInfo chain, so getinfo on
+    /// a dead thread there answers where we return nil).
+    fn debugResolveLevel(self: *Vm, th: *Thread, level: i64) DispatchError!?DebugLevel {
+        if (level < 0) return null;
+        var items: std.ArrayListUnmanaged(TracebackItem) = .empty;
+        defer items.deinit(self.alloc);
+        try self.collectTracebackItems(th, &items);
+        const idx: usize = @intCast(level);
+        if (idx >= items.items.len) return null;
+        return switch (items.items[idx]) {
+            .frame => |fi| .{ .frame = .{
+                .frame = th.call_frames.getPtr(fi),
+                .index = fi,
+            } },
+            .phantom => |ph| .{ .phantom = ph },
+            .virtual_yield => .virtual_yield,
+        };
+    }
+
+    /// PUC luaL_traceback (lauxlib.c:127-160) over one thread's levels:
+    /// "stack traceback:" then, per level from `start_level` down,
+    /// "\n\t{line}" with the 10/11 middle split
+    /// ("\n\t...\t(skipping N levels)") and tail-call markers.
+    /// `last` follows PUC lastlevel: the highest valid level (count - 1).
+    fn writeTracebackBody(self: *Vm, w: *std.Io.Writer, th: *Thread, start_level_in: i64) DispatchError!void {
+        var start_level = start_level_in;
+        if (start_level < 0) start_level = 0;
+        var items = std.ArrayListUnmanaged(TracebackItem).empty;
+        defer items.deinit(self.alloc);
+        try self.collectTracebackItems(th, &items);
+        if (items.items.len == 0) return;
+        const last: i64 = @as(i64, @intCast(items.items.len)) - 1;
+        // limit2show = LEVELS1(10) when more than LEVELS1+LEVELS2(21)
+        // levels remain below start, else -1 (never trips).
+        var limit2show: i64 = if (last - start_level > 10 + 11) 10 else -1;
+        var lvl: i64 = start_level;
+        while (lvl <= last) {
+            if (limit2show == 0) {
+                limit2show -= 1;
+                // PUC: n = last - level - LEVELS2 + 1, with `level` already
+                // incremented past the consumed 11th level (lvl + 1 here);
+                // then skip to the last LEVELS2(11) levels.
+                const n: i64 = last - lvl - 11;
+                w.print("\n\t...\t(skipping {d} levels)", .{n}) catch return error.OutOfMemory;
+                lvl = lvl + 1 + n;
+                continue;
+            }
+            limit2show -= 1;
+            switch (items.items[@intCast(lvl)]) {
+                .phantom => |ph| {
+                    const callee: Value = switch (ph.kind) {
+                        .pcall => .{ .Builtin = .pcall },
+                        .xpcall => .{ .Builtin = .xpcall },
+                    };
+                    const label = try self.virtualCFrameLabel(th, ph.armed_idx, callee, ph.outermost);
+                    defer self.alloc.free(label);
+                    w.print("\n\t{s}", .{label}) catch return error.OutOfMemory;
+                },
+                .virtual_yield => {
+                    const callee: Value = .{ .Builtin = th.suspended_builtin.? };
+                    // The caller is the top parked frame: its pc is at the
+                    // yield call site for a plain yield (name from code,
+                    // e.g. "field 'yield'"), or at the interrupt point for
+                    // a hook yield (no call instruction -> PUC's
+                    // pushglobalfuncname fallback "function 'yield'").
+                    const caller_idx = th.call_frames.len() - 1;
+                    const label = try self.virtualCFrameLabel(th, caller_idx, callee, true);
+                    defer self.alloc.free(label);
+                    w.print("\n\t{s}", .{label}) catch return error.OutOfMemory;
+                },
+                .frame => |frame_idx| {
+                    const fr = th.call_frames.getConstPtr(frame_idx);
+                    const label = try self.tracebackFrameLabel(th, frame_idx);
+                    defer self.alloc.free(label);
+                    w.print("\n\t{s}", .{label}) catch return error.OutOfMemory;
+                    if (fr.isTailCall()) w.writeAll("\n\t(...tail calls...)") catch return error.OutOfMemory;
+                },
+            }
+            lvl += 1;
+        }
+    }
+
+    /// Capture the traceback at the fault point (before pcall/xpcall
+    /// unwind), for debug.traceback() calls made from an xpcall message
+    /// handler. The captured body starts at the RAISER's frame (level 0 of
+    /// the capture walk = the top frame at raise time); the handler's own
+    /// line is prepended at serve time (builtinDebugTraceback), matching
+    /// PUC where the handler-era traceback starts at the handler (level 1
+    /// from the traceback builtin called BY the handler).
     fn captureErrorTraceback(self: *Vm) void {
         self.clearErrorTraceback();
         var aw: std.Io.Writer.Allocating = .init(self.alloc);
         errdefer aw.deinit();
         var w = &aw.writer;
-        w.writeAll("stack traceback:\n") catch return;
-
-        // The raiser's hidden C-frame (error(), yield, ...): PUC's C
-        // functions push a CallInfo that luaL_traceback shows; luazig hides
-        // builtin C-frames, so derive the top hidden C-frame's line
-        // structurally here (see writeSyntheticTopCFrame).
-        self.writeSyntheticTopCFrame(w) catch return;
-
-        // Capture at the fault point, before the explicit CallInfo-like stack
-        // is unwound for pcall/xpcall.  Like PUC Lua, retain both ends of a
-        // deep traceback and omit its repetitive middle; emitting every frame
-        // would make a recoverable stack overflow allocate another huge
-        // object while the VM is already at its stack limit.
-        //
-        // P15.46b: Walk bytecode frames (Thread.call_frames) (most recent).
-        // Bytecode frames live in Thread.call_frames; IR frames used to live
-        // in Vm.call_frames but that array is always empty now, so only the
-        // bytecode walk remains.
-        var frame_ptrs = std.ArrayListUnmanaged(*const CallFrame).empty;
-        defer frame_ptrs.deinit(self.alloc);
-        {
-            const th_bc = self.activeBytecodeThread();
-            var i: usize = th_bc.call_frames.len();
-            while (i > 0) {
-                i -= 1;
-                if (th_bc.call_frames.getConstPtr(i).isHidden()) continue;
-                frame_ptrs.append(self.alloc, th_bc.call_frames.getPtr(i)) catch return;
-            }
-        }
-
-        const head_count: usize = 10;
-        const tail_count: usize = 10;
-        if (frame_ptrs.items.len > head_count + tail_count + 2) {
-            for (frame_ptrs.items[0..head_count], 0..) |fr_ptr, i| {
-                if (self.getPendingCallConst(fr_ptr.pending_call_index)) |pending| {
-                    if (pending.protection) |prot| {
-                        const cname: []const u8 = if (prot.kind == .pcall) "pcall" else "xpcall";
-                        w.print("\t[C]: in global '{s}'\n", .{cname}) catch return;
-                    }
-                }
-                const caller_opt: ?*const Frame = if (i + 1 < frame_ptrs.items.len)
-                    frame_ptrs.items[i + 1]
-                else
-                    null;
-                const line = self.tracebackFrameLabel(fr_ptr, caller_opt, false) catch return;
-                defer self.alloc.free(line);
-                w.print("{s}\n", .{line}) catch return;
-            }
-            w.print("\t...\t(skipping {d} levels)\n", .{frame_ptrs.items.len - head_count - tail_count}) catch return;
-            const tail_start = frame_ptrs.items.len - tail_count;
-            for (frame_ptrs.items[tail_start..], 0..) |fr_ptr, i| {
-                const idx = tail_start + i;
-                if (self.getPendingCallConst(fr_ptr.pending_call_index)) |pending| {
-                    if (pending.protection) |prot| {
-                        const cname: []const u8 = if (prot.kind == .pcall) "pcall" else "xpcall";
-                        w.print("\t[C]: in global '{s}'\n", .{cname}) catch return;
-                    }
-                }
-                const caller_opt: ?*const Frame = if (idx + 1 < frame_ptrs.items.len)
-                    frame_ptrs.items[idx + 1]
-                else
-                    null;
-                const line = self.tracebackFrameLabel(fr_ptr, caller_opt, false) catch return;
-                defer self.alloc.free(line);
-                w.print("{s}\n", .{line}) catch return;
-            }
-        } else {
-            for (frame_ptrs.items, 0..) |fr_ptr, i| {
-                // If this frame has a pending protected call (pcall/xpcall),
-                // insert a synthetic [C]: in global 'pcall'/'xpcall' line BEFORE
-                // this frame. PUC's CallInfo stack includes the C frame for
-                // pcall/xpcall; luazig's fast path (tryPushBytecodeProtectedCall)
-                // skips it. The C-frame sits between the callee (previous frame)
-                // and the caller (this frame).
-                if (self.getPendingCallConst(fr_ptr.pending_call_index)) |pending| {
-                    if (pending.protection) |prot| {
-                        const cname: []const u8 = if (prot.kind == .pcall) "pcall" else "xpcall";
-                        w.print("\t[C]: in global '{s}'\n", .{cname}) catch return;
-                    }
-                }
-                const caller_opt: ?*const Frame = if (i + 1 < frame_ptrs.items.len)
-                    frame_ptrs.items[i + 1]
-                else
-                    null;
-                const line = self.tracebackFrameLabel(fr_ptr, caller_opt, false) catch return;
-                defer self.alloc.free(line);
-                w.print("{s}\n", .{line}) catch return;
-            }
-        }
-
-        // PUC luaL_traceback walks the CallInfo stack which includes the
-        // top-level C entry point. In luazig, the C entry point (lua_main /
-        // docall) doesn't push a call frame, so we synthesize it here.
-        // PUC shows [C]: in ? as the final frame (from pushfuncname's
-        // fallback for C functions without a name).
-        w.writeAll("\t[C]: in ?") catch return;
+        w.writeAll("stack traceback:") catch return;
+        self.writeTracebackBody(w, self.activeBytecodeThread(), 0) catch return;
         self.errThread().err_traceback = aw.toOwnedSlice() catch null;
     }
 
@@ -7112,21 +7311,37 @@ pub const Vm = struct {
         // has no proto (no bytecode), so the CIST_C bit is the explicit
         // discriminator — mirroring PUC `prepCallInfo` for C functions.
         slot.setC();
-        // P15.79: Hide builtin C-frames from debug.getinfo/debug.traceback.
-        // Unlike PUC Lua (where C-frames are visible), luazig pushes C-frames
-        // for ALL builtins (pcall, load, etc.), not just C API functions.
-        // Making them visible breaks debug.getinfo level numbering: level 1
-        // would return the C-frame instead of the calling Lua function.
-        // Hiding them preserves the luazig convention that level 1 = the
-        // Lua function that called the builtin. The continuation mechanism
-        // (finishCcall, poscallCFrame, etc.) uses isC(), not isHidden(), so
-        // hiding doesn't affect continuation dispatch.
-        slot.setHidden();
+        // P16.41 Cut 1: builtin C-frames are REAL and VISIBLE, exactly like
+        // PUC CallInfos for C functions. Every builtin call site in PUC Lua
+        // pushes a CallInfo (luaD_precall C branch); debug.getinfo levels,
+        // traceback lines, and luaL_where walks count them. The only frames
+        // that stay hidden (CIST_HIDE) are genuinely-internal duplicates
+        // with no PUC counterpart (the testC script frame — see
+        // runTestcScript).
         // P16.27 T0.1: increment ONLY after the frame actually exists —
         // the stack growth and addOne above can fail, and a pre-increment
         // would leak the count on rollback.
         th.c_frame_count += 1;
         return grew;
+    }
+
+    /// Push the host entry C-frame (PUC `pmain`'s CallInfo) below a chunk
+    /// executed by the CLI host boundary. PUC `main` calls
+    /// `lua_pcall(L, 2, 1, msghandler)` on the `pmain` C closure, leaving
+    /// exactly ONE C frame below the main chunk for the whole session:
+    /// `debug.getinfo(2)` from the main chunk is a nameless C function and
+    /// tracebacks end with `[C]: in ?`. Coroutine bodies never pass here
+    /// (they run through runClosure → runBytecodeInternal), matching PUC
+    /// where a coroutine's base_ci has no pmain below it.
+    pub fn pushHostEntryCFrame(self: *Vm) std.mem.Allocator.Error!void {
+        _ = try self.pushBuiltinCFrame(.{ .Builtin = .host_entry });
+    }
+
+    /// Pop the host entry C-frame pushed by pushHostEntryCFrame. Must be
+    /// called (via defer) after the chunk's runBytecode returns, on both
+    /// the success and error paths.
+    pub fn popHostEntryCFrame(self: *Vm) void {
+        self.popBuiltinCFrame();
     }
 
     /// Pop the topmost CallFrame (the synthetic C-frame pushed by
@@ -7191,26 +7406,6 @@ pub const Vm = struct {
         th.errfunc_running_idx = th.errfunc;
         defer th.errfunc_running_idx = prev_running_idx;
 
-        // PUC luaG_errormsg: the raising C function's CallInfo (CIST_C) is
-        // VISIBLE to the handler (it sits between the raiser's caller and
-        // the handler). luazig hides builtin C-frames (P15.79 convention),
-        // so un-hide the raiser's C-frame — the top frame, if it is one —
-        // for the duration of the handler window, and re-hide it after.
-        // This is structural (any hidden C-frame at the throw site), not a
-        // name-based special case.
-        const frames = &th.call_frames;
-        var unhidden_top = false;
-        if (frames.len() > 0) {
-            const top = frames.getPtr(frames.len() - 1);
-            if (top.isC() and top.isHidden()) {
-                top.clearHidden();
-                unhidden_top = true;
-            }
-        }
-        defer if (unhidden_top) {
-            frames.getPtr(frames.len() - 1).setHidden();
-        };
-
         // PUC luaD_growstack reserves ERRORSTACKSIZE headroom so the handler
         // can run on an overflowed stack; pushBytecodeExecFrame's
         // handling_overflow check grants it while activeErrorHandlerDepth()
@@ -7240,16 +7435,12 @@ pub const Vm = struct {
             }
             depth += 1;
 
-            // Push a synthetic C-frame for the handler call. In PUC,
+            // P16.41 Cut 1: NO extra C-frame for the handler itself. PUC
             // luaG_errormsg calls the handler via luaD_callnoyield, which
-            // pushes a CallInfo (CIST_C) so debug.getinfo counts it as a
-            // stack level. Without this frame, level numbers inside the
-            // handler wouldn't match PUC.
-            _ = try self.pushBuiltinCFrame(ef);
-            defer {
-                self.popBuiltinCFrame();
-                if (std.debug.runtime_safety) self.cFrameCountAssert(self.activeBytecodeThread());
-            }
+            // pushes ONE CallInfo for the HANDLER (Lua handler → Lua ci,
+            // C handler → C ci) — apiCall below pushes exactly that frame.
+            // The old pushBuiltinCFrame(ef) here was a phantom with no PUC
+            // counterpart: it made a Lua handler observable as a C level.
             var call_args = [_]Value{emsg};
             const result = self.apiCall(.nonyieldable, ef, call_args[0..]) catch {
                 if (on_error_stack) {
@@ -8543,6 +8734,21 @@ pub const Vm = struct {
         return_k: bool,
         post: BytecodeClosePost,
     ) DispatchError!BytecodeCloseProgress {
+        // P16.41 Cut 1: ERROR-path closes (post == .unwind_frame) run with
+        // the dying parent frame still on the chain (zig closes before
+        // popping). PUC truncates the ci chain to the recovery boundary
+        // BEFORE luaD_closeprotected runs the metamethods (ldo.c
+        // luaD_pcall: `L->ci = old_ci` first), so inside __close the
+        // debug walks see only [__close, boundary chain...]. Hide the
+        // dying frame for the close's duration — it is popped right after
+        // (the unwind continues), and if the close child yields, the
+        // suspended walk must not see it either (PUC: the frame is gone).
+        // Normal-return closes (.return_frame / .advance_instruction) keep
+        // the frame visible — PUC's OP_RETURN runs luaF_close while the
+        // frame is still current.
+        if (post == .unwind_frame) {
+            exec_frames.getPtr(parent_index).setHidden();
+        }
         std.debug.assert(!(exec_frames.getPtr(parent_index).pending_call_index != INVALID_PENDING));
         const owner = self.activeBytecodeThread();
         const close_state = try self.alloc.create(BytecodeCloseContinuation);
@@ -12956,29 +13162,34 @@ pub const Vm = struct {
         error_value: Value,
     ) DispatchError!void {
         const recovery = self.bytecodeUnwindDisposition(exec_frames, boundary_depth);
-        // P16.28 T3: when the error will ESCAPE this coroutine (propagate
-        // to the boundary — no protected frame claimed it), capture the
-        // dead-error traceback NOW. This is the last point where the
-        // coroutine's frames are intact; the unwind below is destructive.
-        // Recoverable errors (protected_parent / close_parent) skip this —
-        // pcall handles them without needing a terminal trace.
+        // P16.28 T3 / P16.41 Cut 1: when the error will ESCAPE this
+        // coroutine (propagate to the boundary — no protected frame
+        // claimed it), pin the fault-point traceback (captured by
+        // captureErrorTraceback at the raise, with the raiser's C-frame
+        // still on top) as the dead-error traceback. PUC preserves a dead
+        // errored coroutine's CallInfo chain and rebuilds the traceback
+        // live; our unwind is destructive, so the text is captured at the
+        // last-intact point — a documented frame-lifetime divergence, see
+        // tools/status/p16.41-cframe-parity.md. Recoverable errors
+        // (protected_parent / close_parent) skip this — pcall handles them
+        // without needing a terminal trace. Unconditional: PUC shows the
+        // chain for a coroutine that dies on its FIRST resume too (the old
+        // trace_yields>0 gate lost it); error paths are cold, so the
+        // capture cost never touches steady-state execution.
         if (recovery.disposition == .propagate and
             recovery.target_depth == boundary_depth)
         {
             const th = self.activeBytecodeThread();
-            if (th.trace_yields > 0 and th.err_dead_traceback == null) {
-                var names: [64]?[]const u8 = undefined;
-                const cnt = self.buildSuspendedFrameNames(th, names[0..]);
-                if (cnt > 0) {
-                    var aw: std.Io.Writer.Allocating = .init(self.alloc);
-                    for (names[0..cnt]) |nm| {
-                        if (nm) |name| {
-                            aw.writer.print("\tdb.lua: in function '{s}'\n", .{name}) catch break;
-                        } else {
-                            aw.writer.writeAll("\tdb.lua: in function <db.lua>\n") catch break;
-                        }
+            if (th.err_dead_traceback == null) {
+                if (self.errThread().err_traceback) |tb| {
+                    // The body without the "stack traceback:" header (the
+                    // replay path writes its own header).
+                    const header = "stack traceback:";
+                    if (tb.len > header.len and std.mem.eql(u8, tb[0..header.len], header)) {
+                        th.err_dead_traceback = self.alloc.dupe(u8, tb[header.len..]) catch null;
+                    } else {
+                        th.err_dead_traceback = self.alloc.dupe(u8, tb) catch null;
                     }
-                    th.err_dead_traceback = aw.toOwnedSlice() catch null;
                 }
             }
         }
@@ -19545,71 +19756,54 @@ pub const Vm = struct {
     }
 
     fn errorLocationFrameIndex(self: *const Vm, level: usize) ?*const CallFrame {
-        // PUC luaL_where(L, level): calls lua_getstack(L, level) to find the
-        // frame at `level`, then checks ar.currentline. lua_getstack starts
-        // from L->ci (current frame = error's C-frame) and goes `level` frames
-        // up, counting ALL frames (CIST_C and Lua).
-        //
-        // P15.79: Hidden C-frames from testC (C API functions) are counted
-        // — PUC pushes C-frames for C API functions. We identify testC
-        // C-frames by checking if bc_stack[func_slot] is a Builtin with
-        // value .testC (the testC builtin). Hidden C-frames from other
-        // builtins (pcall, table.sort, etc.) are skipped — PUC doesn't
-        // push C-frames for these.
-        const isTestcCFrame = struct {
-            fn check(vm: *const Vm, fr: *const CallFrame) bool {
-                if (!fr.isC()) return false;
-                if (fr.func_slot >= vm.activeBytecodeThread().bytecode_stack.len) return false;
-                return vm.activeBytecodeThread().bytecode_stack[fr.func_slot] == .Builtin and
-                    vm.activeBytecodeThread().bytecode_stack[fr.func_slot].Builtin == .testc_testC;
-            }
-        }.check;
-        if (level == 0) return null;
-        var remaining = level;
+        // PUC luaL_where(L, level): lua_getstack(L, level) counts levels
+        // from L->ci (the CURRENT frame = the raising builtin's own C-frame
+        // = level 0) down through `previous`, counting EVERY CallInfo, C or
+        // Lua. P16.41 Cut 1: builtin C-frames are real and visible, so the
+        // walk is a plain frame enumeration — no per-builtin visibility
+        // rules. Only two things diverge from a naive walk:
+        //   1. Hidden frames (CIST_HIDE) are the testC script frame — a
+        //      genuinely-internal duplicate with no PUC CallInfo — skipped.
+        //   2. The pcall/xpcall FAST path (tryPushBytecodeProtectedCall)
+        //      runs its target without a C-frame; PUC would have the pcall
+        //      C-function's CallInfo between the target and its caller.
+        //      The armed pending-protection on the caller frame marks that
+        //      phantom layer: consume one level (resolving to null — a C
+        //      frame has no position, luaL_where pushes "") before the
+        //      armed frame's own level. This is state-derived (the flag
+        //      lives on the frame and survives yields), not a registered
+        //      depth — see captureErrorTraceback for the same derivation.
+        const th = self.activeBytecodeThreadConst();
+        const frames = th.call_frames;
+        if (frames.len() == 0) return null;
+        if (level == 0) return null; // callers pass luaL_where levels (>= 1)
 
-        const bc_count = self.activeBytecodeThreadConst().call_frames.len();
-        const lua_top = bc_count;
-        var protected_index = self.protected_c_frame_count;
-
-        while (protected_index != 0) {
-            protected_index -= 1;
-            const boundary = @min(self.protected_c_frame_depths[protected_index], lua_top);
-            // Count visible frames + testC C-frames (hidden but identified
-            // as testC C-frames). Hidden builtin C-frames (pcall, etc.) are
-            // transparent — PUC doesn't push C-frames for builtins.
-            var visible_count: usize = 0;
-            var idx = lua_top;
-            while (idx > boundary) {
-                idx -= 1;
-                const fr = self.activeBytecodeThreadConst().call_frames.getConstPtr(idx);
-                if (!fr.isHidden() or isTestcCFrame(self, fr)) {
-                    visible_count += 1;
-                }
-            }
-            if (remaining <= visible_count) {
-                var rem = remaining;
-                var i = lua_top;
-                while (i > boundary) {
-                    i -= 1;
-                    const fr = self.activeBytecodeThreadConst().call_frames.getConstPtr(i);
-                    if (fr.isHidden() and !isTestcCFrame(self, fr)) continue;
-                    rem -= 1;
-                    if (rem == 0) return fr;
-                }
-                return null;
-            }
-            remaining -= visible_count;
-
-            if (remaining == 1) return null;
-            remaining -= 1;
-        }
-
-        var rem = remaining;
-        var i = lua_top;
+        var rem = level;
+        var i: usize = frames.len();
+        const top = frames.len() - 1;
         while (i > 0) {
             i -= 1;
-            const fr = self.activeBytecodeThreadConst().call_frames.getConstPtr(i);
-            if (fr.isHidden() and !isTestcCFrame(self, fr)) continue;
+            const fr = frames.getConstPtr(i);
+            // Level 0 = the raising builtin's own C-frame (PUC L->ci at
+            // the luaL_where call site). Callers ask for levels >= 1, so
+            // the top frame is never the answer — skip it and count from
+            // the frame below.
+            if (i == top) continue;
+            if (fr.isHidden()) continue;
+            // The phantom fast-path pcall layers sit between this frame and
+            // the frame above it (PUC: one CallInfo per pcall/xpcall layer —
+            // the armed kind plus one per parked outer layer). If the
+            // requested level IS a phantom, it resolves to a C frame — no
+            // position (luaL_where pushes "").
+            if (self.getPendingCallConst(fr.pending_call_index)) |pending| {
+                if (pending.protection) |prot| {
+                    var phantoms = 1 + prot.outer_layers.len;
+                    while (phantoms > 0) : (phantoms -= 1) {
+                        if (rem == 1) return null;
+                        rem -= 1;
+                    }
+                }
+            }
             rem -= 1;
             if (rem == 0) return fr;
         }
@@ -19634,20 +19828,6 @@ pub const Vm = struct {
     /// Const variant of activeBytecodeThread for use in const methods.
     fn activeBytecodeThreadConst(self: *const Vm) *const Thread {
         return self.current_thread orelse self.main_thread.?;
-    }
-
-    fn enterProtectedCFrame(self: *Vm) void {
-        std.debug.assert(self.protected_c_frame_count < self.protected_c_frame_depths.len);
-        // Record the bytecode Lua frame depth so errorLocationFrameIndex can
-        // walk the frame stack correctly.
-        const bc_count = self.activeBytecodeThread().call_frames.len();
-        self.protected_c_frame_depths[self.protected_c_frame_count] = bc_count;
-        self.protected_c_frame_count += 1;
-    }
-
-    fn leaveProtectedCFrame(self: *Vm) void {
-        std.debug.assert(self.protected_c_frame_count != 0);
-        self.protected_c_frame_count -= 1;
     }
 
     /// P15.38i: Re-derive the builtin outs slice from bc_stack after a nested
@@ -20123,6 +20303,11 @@ pub const Vm = struct {
             .testc_pushuserdata => try self.builtinTestcPushuserdata(args, outs),
             .testc_checkpanic => try self.builtinTestcCheckpanic(args, outs),
             .cli_msghandler => try self.builtinCliMsghandler(args, outs),
+            .host_entry => {
+                // Never dispatched (the CLI pushes the entry frame
+                // directly). Defensive no-op: a 0-result C function.
+                self.last_builtin_out_count = 0;
+            },
         }
     }
 
@@ -21192,8 +21377,9 @@ pub const Vm = struct {
         const th_unit = self.activeBytecodeThread();
         try self.ccallEnter(th_unit, .yieldable);
         defer th_unit.ccallExit(.yieldable);
-        self.enterProtectedCFrame();
-        defer self.leaveProtectedCFrame();
+        // P16.41 Cut 1: no registered protected boundary — builtinPcall's
+        // own C-frame (pushed by callBuiltin) is now REAL and VISIBLE, so
+        // errorLocationFrameIndex counts it as a plain level.
         // PUC luaD_pcall: clear errfunc for the duration of pcall — pcall
         // has no message handler. Restore on return (including error path).
         const th_pcall_ef = self.activeBytecodeThread();
@@ -21572,8 +21758,8 @@ pub const Vm = struct {
         }
         self.protected_call_depth += 1;
         defer self.protected_call_depth -= 1;
-        self.enterProtectedCFrame();
-        defer self.leaveProtectedCFrame();
+        // P16.41 Cut 1: no registered protected boundary — xpcall's own
+        // C-frame (pushed by callBuiltin) is now REAL and VISIBLE.
         defer self.shrinkBcStack();
 
         // P16.31 Cut 3: remember the xpcall C-frame's index — every catch
@@ -21941,26 +22127,6 @@ pub const Vm = struct {
         return changed;
     }
 
-    /// P16.28 T3: LAZY frame-name list for the suspended-thread traceback.
-    /// Walks the SAME retained call_frames the eager snapshot used to copy
-    /// on every yield — but only when a traceback is actually requested.
-    fn buildSuspendedFrameNames(self: *Vm, th: *Thread, out: []?[]const u8) usize {
-        var oi: usize = 0;
-        var i = th.call_frames.len();
-        while (i > 0) {
-            i -= 1;
-            const fr = th.call_frames.getConstPtr(i).*;
-            if (fr.isHidden()) continue;
-            if (oi < out.len) {
-                out[oi] = self.debugNameFromCallee(stackForThread(self, th)[fr.func_slot]);
-                oi += 1;
-            } else {
-                break;
-            }
-        }
-        return oi;
-    }
-
     fn builtinCoroutineYield(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = outs; // P16.2b: the yield path parks values in th.yielded; the
         // caller of a yielding builtin never reads outs.
@@ -22078,6 +22244,7 @@ pub const Vm = struct {
         if (in_debug_hook) {
             const th_bc2 = self.activeBytecodeThread();
             const frames = &th_bc2.call_frames;
+            {}
             // PUC (ldebug.c luaG_traceexec:977, ldo.c lua_yieldk:1023): a
             // yield from inside a hook abandons the hook's ENTIRE call
             // stack via luaD_throw — the hook runs on the current Lua
@@ -22154,11 +22321,53 @@ pub const Vm = struct {
                         self.activeHookState().in_debug_hook = false;
                         // Pop the hook frame.
                         self.popBytecodeExecFrame(th, frames);
+                        // PUC shape on suspend (luaG_traceexec's luaD_throw
+                        // after a hook yield): no hook frame, no yield
+                        // CallInfo, and nothing the hook pushed survives —
+                        // including a builtin C-frame the hook body ran in
+                        // (e.g. a testC hook script). Clear suspended_builtin
+                        // so the debug item model adds no virtual yield frame
+                        // on top of the interrupted Lua frames.
+                        th.suspended_builtin = null;
+                        th.suspended_builtin_args.deinit(self.alloc);
                         // Mark as suspended so errdefer in runBytecodeInternal
                         // does not unwind the parent frame.
                         th.bytecode_inplace_suspended = true;
                     }
                 }
+            }
+        } else if (self.activeHookState().sync_hook_frame_idx) |sync_idx| {
+            // Sync C-hook yield (PUC lua_yieldk's hook branch, ldo.c:1025
+            // + luaG_traceexec ldebug.c:971-977): the C hook ran FRAMELESS
+            // on the interrupted frame (recorded in sync_hook_frame_idx by
+            // debugDispatchHookTransfer), and everything it pushed above
+            // that frame (e.g. the __call/testC C-frame of a testC hook
+            // script) is abandoned by luaG_traceexec's luaD_throw — the
+            // suspended stack is truncated back to the interrupted frame.
+            // The interrupted frame itself stays: it is the resume owner.
+            const th_bc2 = self.activeBytecodeThread();
+            const frames = &th_bc2.call_frames;
+            if (sync_idx < frames.len()) {
+                while (frames.len() > sync_idx + 1) {
+                    const tf = frames.getConstPtr(frames.len() - 1);
+                    if (tf.isC()) {
+                        self.popBuiltinCFrame();
+                    } else {
+                        self.popBytecodeExecFrame(th, frames);
+                    }
+                }
+                // PUC shape on suspend: no hook frame, no yield CallInfo —
+                // the suspended stack shows only the interrupted Lua
+                // frames. Clear suspended_builtin so the debug item model
+                // adds no virtual yield frame on top.
+                th.suspended_builtin = null;
+                th.suspended_builtin_args.deinit(self.alloc);
+                // Preserve the interrupted frame through the error.Yield
+                // unwind (same contract as the normal yield path below):
+                // the errdefer in runBytecodeInternal checks
+                // bytecode_resume_boundary against its boundary depth.
+                th.bytecode_inplace_suspended = true;
+                th.bytecode_resume_boundary = sync_idx;
             }
         } else if (blk: {
             // P15.78 Task 13: Check if any C-frame has pending testc_state
@@ -28582,10 +28791,6 @@ pub const Vm = struct {
         };
     }
 
-    fn debugResolveFrameIndex(self: *Vm, level: usize) ?*CallFrame {
-        return if (self.debugResolveFrameWithIndex(level)) |r| r.frame else null;
-    }
-
     /// P16.38 T4.1: does the call_frames entry at `index` have a real callee
     /// directly above it? A debug-hook frame above means the frame is
     /// "current" in PUC's sense (the hook runs on the same CallInfo), so it
@@ -28594,20 +28799,6 @@ pub const Vm = struct {
         const th = self.activeBytecodeThread();
         if (index + 1 >= th.call_frames.len()) return false;
         return !th.call_frames.getConstPtr(index + 1).isDebugHook();
-    }
-
-    fn debugResolveFrameWithIndex(self: *Vm, level: usize) ?struct { frame: *CallFrame, index: usize } {
-        // Walk Thread.call_frames (bytecode, most recent first).
-        var visible: usize = 0;
-        const th = self.activeBytecodeThread();
-        var i = th.call_frames.len();
-        while (i > 0) {
-            i -= 1;
-            if (th.call_frames.getConstPtr(i).isHidden()) continue;
-            visible += 1;
-            if (visible == level) return .{ .frame = th.call_frames.getPtr(i), .index = i };
-        }
-        return null;
     }
 
     const DebugName = struct {
@@ -28634,6 +28825,29 @@ pub const Vm = struct {
             return local.name;
         }
         return null;
+    }
+
+    /// PUC findsetreg (ldebug.c:440-484): does instruction `inst` CHANGE
+    /// register `reg`? A backward name scan must STOP at the register's
+    /// last setter — if that setter is not a nameable load (a call result
+    /// in a temp register, an arithmetic result, ...), the register has no
+    /// name and PUC's getobjname returns NULL (the traceback then falls
+    /// back to pushglobalfuncname). CALL/TAILCALL change every register
+    /// >= A; LOADNIL changes A..A+B; TFORCALL changes >= A+2; every other
+    /// A-mode instruction changes exactly A. Comparisons, tests, set-*,
+    /// jumps, metamethod markers, returns, close/tbc and extraarg change
+    /// nothing.
+    fn debugBytecodeRegChanges(inst: bc.Instruction, reg: u8) bool {
+        const op: bc.Op = @enumFromInt(inst.op);
+        const r: usize = reg;
+        return switch (op) {
+            .call, .tailcall => r >= inst.a,
+            .loadnil => r >= inst.a and r <= @as(usize, inst.a) + inst.b,
+            .tforcall => r >= @as(usize, inst.a) + 2,
+            .settabup, .setupval, .settable, .seti, .setfield, .jmp, .test_, .mmbin, .mmbini, .mmbink, .eq, .lt, .le, .eqi, .lti, .lei, .gti, .gei, .eqk, .return_, .return0, .return1, .close, .tbc, .extraarg, .varargprep => false,
+            // Everything else writes R[A] (PUC testAMode default).
+            else => r == inst.a,
+        };
     }
 
     fn debugBytecodeStringConstant(
@@ -28673,7 +28887,12 @@ pub const Vm = struct {
                     }
                     return null;
                 },
-                else => {},
+                else => {
+                    // PUC findsetreg: stop at the register's last setter —
+                    // a non-load setter means the key register holds no
+                    // nameable constant.
+                    if (debugBytecodeRegChanges(inst, reg)) return null;
+                },
             }
         }
         return null;
@@ -28836,7 +29055,15 @@ pub const Vm = struct {
                     }
                     return .{};
                 },
-                else => {},
+                else => {
+                    // PUC findsetreg: stop at the register's last setter.
+                    // A call result, arithmetic result, fresh table, etc.
+                    // is not a nameable load — the operand has no name
+                    // (PUC getobjname returns NULL; the traceback falls
+                    // back to pushglobalfuncname, e.g. "function 'pcall'"
+                    // for `local st, msg = (function() return pcall end)()(...)`).
+                    if (debugBytecodeRegChanges(inst, reg)) return .{};
+                },
             }
         }
         return .{};
@@ -29073,288 +29300,242 @@ pub const Vm = struct {
 
         switch (args[i]) {
             .Int => |level| {
-                if (target_thread) |th| {
-                    if (level < 0 or level > 1) {
-                        outs[0] = .Nil;
-                        return;
-                    }
-                    if (threadCurrentParkedRuntimeFrame(th)) |fr| {
-                        // P15.68: If the coroutine yielded from a builtin (e.g.
-                        // testC `yield`) NOT inside a debug hook, the builtin
-                        // is the "current function" (level 0), and the Lua
-                        // frame is level 1. This mirrors PUC where a C
-                        // function's CallInfo is on top when it yields. Our
-                        // builtins don't push frames, so we detect this via
-                        // th.suspended_builtin and !th.yielded_from_debug_hook.
-                        // For hook yields (yielded_from_debug_hook=true), the
-                        // hook frame was already popped by P15.67, so level 0
-                        // is the interrupted Lua function.
-                        if (th.suspended_builtin != null and !th.yielded_from_debug_hook) {
-                            // Level 0: the builtin (linedefined = -1)
-                            if (level == 0) {
-                                try self.setField(t, "name", .Nil);
-                                try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
-                                try self.setField(t, "currentline", .{ .Int = -1 });
-                                if (what.len == 0 or debugInfoHasOpt(what, 't')) {
-                                    try self.setField(t, "istailcall", .{ .Bool = false });
-                                    try self.setField(t, "extraargs", .{ .Int = 0 });
-                                }
-                                const callee: Value = .{ .Builtin = th.suspended_builtin.? };
-                                try self.debugFillInfoFromFunction(t, callee, what);
-                                if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
-                                    try self.setField(t, "func", callee);
-                                }
-                                if (outs.len > 0) outs[0] = .{ .Table = t };
-                                return;
-                            }
-                            // Level 1: the Lua frame that called the builtin
-                            if (level >= 1) {
-                                if (th.call_frames.len() < 1) {
-                                    outs[0] = .Nil;
-                                    return;
-                                }
-                                // Use the Lua frame's info
-                            } else {
-                                outs[0] = .Nil;
-                                return;
-                            }
-                        } else {
-                            // No suspended builtin or hook yield: level 1 is
-                            // the caller. PUC debug.getinfo: level 1 is the
-                            // caller of the current frame. If the coroutine is
-                            // suspended at the top level (only one frame),
-                            // there is no level 1.
-                            if (level >= 1 and th.call_frames.len() < 2) {
-                                outs[0] = .Nil;
-                                return;
+                // PUC lua_getstack: level is a 0-based depth from the top
+                // of the CallInfo chain — level 0 is the running C
+                // function's own frame (getinfo itself), level 1 the
+                // function that called it. The unified item model
+                // (debugResolveLevel) counts phantom pcall layers and the
+                // suspended yield C frame as real levels, so getinfo and
+                // traceback agree on numbering.
+                if (level < 0) {
+                    outs[0] = .Nil;
+                    return;
+                }
+                const th = if (target_thread) |tt| tt else self.activeBytecodeThread();
+                const lv: usize = @intCast(level);
+                const resolved = (try self.debugResolveLevel(th, level)) orelse {
+                    outs[0] = .Nil;
+                    return;
+                };
+                switch (resolved) {
+                    .phantom => |ph| {
+                        // A phantom fast-path pcall/xpcall layer (PUC: the
+                        // pcall C function's own CallInfo). C-function info
+                        // from the builtin value; name from funcnamefromcall
+                        // — only the OUTERMOST layer's caller is the armed
+                        // (Lua) frame; inner layers' callers are outer C
+                        // frames (no code name -> nil, PUC-faithful).
+                        const callee: Value = switch (ph.kind) {
+                            .pcall => .{ .Builtin = .pcall },
+                            .xpcall => .{ .Builtin = .xpcall },
+                        };
+                        var name: Value = .Nil;
+                        var namewhat: []const u8 = "";
+                        if (ph.outermost) {
+                            if (self.debugCallSiteName(th, ph.armed_idx)) |dn| {
+                                name = .{ .String = try self.internStr(dn.name) };
+                                namewhat = dn.namewhat;
                             }
                         }
-                        try self.setField(t, "name", .Nil);
-                        try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
-                        // P15.51n: current_line derived from proto.lineinfo[pc].
-                        const current_line: i64 = self.frameCurrentLine(fr);
-                        try self.setField(t, "currentline", .{ .Int = current_line });
-                        if (what.len == 0 or debugInfoHasOpt(what, 't')) {
-                            const extraargs: i64 = if (fr.isVararg()) @intCast(self.frameVarargs(fr, th).len) else 0;
-                            try self.setField(t, "istailcall", .{ .Bool = fr.isTailCall() });
-                            try self.setField(t, "extraargs", .{ .Int = extraargs });
+                        if (what.len == 0 or debugInfoHasOpt(what, 'n')) {
+                            try self.setField(t, "name", name);
+                            try self.setField(t, "namewhat", .{ .String = try self.internStr(namewhat) });
                         }
-                        const co_stack = stackForThread(self, th);
-                        try self.debugFillInfoFromFunction(t, co_stack[fr.func_slot], what);
-                        if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
-                            try self.setField(t, "func", co_stack[fr.func_slot]);
-                        }
-                        if (outs.len > 0) outs[0] = .{ .Table = t };
-                        return;
-                    }
-                    // No in-place suspended Lua frame (the thread is not
-                    // bytecode_inplace_suspended). If the coroutine suspended
-                    // in a C builtin (e.g. testC `yield`), report that builtin.
-                    if (th.suspended_builtin) |id| {
-                        try self.setField(t, "name", .Nil);
-                        try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
                         try self.setField(t, "currentline", .{ .Int = -1 });
                         if (what.len == 0 or debugInfoHasOpt(what, 't')) {
                             try self.setField(t, "istailcall", .{ .Bool = false });
                             try self.setField(t, "extraargs", .{ .Int = 0 });
                         }
-                        const callee: Value = .{ .Builtin = id };
                         try self.debugFillInfoFromFunction(t, callee, what);
                         if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
                             try self.setField(t, "func", callee);
                         }
-                        if (outs.len > 0) outs[0] = .{ .Table = t };
-                        return;
-                    }
-                    outs[0] = .Nil;
-                    return;
-                }
-                if (level < 1) {
-                    outs[0] = .Nil;
-                    return;
-                }
-                const lv: usize = @intCast(level);
-                if (lv == 2 and self.activeProtectedCallDepth() > 0 and self.activeCloseMetamethodDepth() > 0) {
-                    try self.setField(t, "name", .{ .String = try self.internStr("pcall") });
-                    try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
-                    try self.setField(t, "currentline", .{ .Int = -1 });
-                    if (what.len == 0 or debugInfoHasOpt(what, 't')) {
-                        try self.setField(t, "istailcall", .{ .Bool = false });
-                        try self.setField(t, "extraargs", .{ .Int = 0 });
-                    }
-                    const pcall_f: Value = .{ .Builtin = .pcall };
-                    try self.debugFillInfoFromFunction(t, pcall_f, what);
-                    if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
-                        try self.setField(t, "func", pcall_f);
-                    }
-                    if (outs.len > 0) outs[0] = .{ .Table = t };
-                    return;
-                }
-                const resolved = self.debugResolveFrameWithIndex(lv) orelse {
-                    if (lv == 2 and self.activeProtectedCallDepth() > 0) {
-                        try self.setField(t, "name", .{ .String = try self.internStr("pcall") });
-                        try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
+                    },
+                    .virtual_yield => {
+                        // The suspended coroutine's yield C frame (PUC:
+                        // luaB_yield's CallInfo stays on the suspended
+                        // thread). Name from the top parked frame's call
+                        // site (plain yield: "field 'yield'"); a hook
+                        // yield's interrupt point is usually not a call ->
+                        // nil (PUC funcnamefromcall fails the same way).
+                        const callee: Value = .{ .Builtin = th.suspended_builtin.? };
+                        var name: Value = .Nil;
+                        var namewhat: []const u8 = "";
+                        if (th.call_frames.len() > 0) {
+                            if (self.debugCallSiteName(th, th.call_frames.len() - 1)) |dn| {
+                                name = .{ .String = try self.internStr(dn.name) };
+                                namewhat = dn.namewhat;
+                            }
+                        }
+                        if (what.len == 0 or debugInfoHasOpt(what, 'n')) {
+                            try self.setField(t, "name", name);
+                            try self.setField(t, "namewhat", .{ .String = try self.internStr(namewhat) });
+                        }
                         try self.setField(t, "currentline", .{ .Int = -1 });
                         if (what.len == 0 or debugInfoHasOpt(what, 't')) {
                             try self.setField(t, "istailcall", .{ .Bool = false });
                             try self.setField(t, "extraargs", .{ .Int = 0 });
                         }
-                        const pcall_f: Value = .{ .Builtin = .pcall };
-                        try self.debugFillInfoFromFunction(t, pcall_f, what);
+                        try self.debugFillInfoFromFunction(t, callee, what);
                         if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
-                            try self.setField(t, "func", pcall_f);
+                            try self.setField(t, "func", callee);
                         }
-                        if (outs.len > 0) outs[0] = .{ .Table = t };
-                        return;
-                    }
-                    outs[0] = .Nil;
-                    return;
-                };
-                const fr = resolved.frame;
-                const fr_index = resolved.index;
-                // P15.51n: Debug name override is stored in the PARENT frame's
-                // continuation. The parent frame is BELOW in the call stack,
-                // which means it has a LOWER index (frames are stored bottom-up).
-                const parent_frame: ?*const CallFrame = blk: {
-                    if (fr_index > 0) {
-                        break :blk self.activeBytecodeThread().call_frames.getConstPtr(fr_index - 1);
-                    }
-                    break :blk null;
-                };
-                if (self.isInDebugHook() and lv == 1) {
-                    try self.setField(t, "name", .Nil);
-                    try self.setField(t, "namewhat", .{ .String = try self.internStr("hook") });
-                } else if (self.isInDebugHook() and lv == 2 and self.debugNameFromCallee(self.activeBytecodeThread().bytecode_stack[fr.func_slot]) != null) {
-                    // Synthetic call/return events for a builtin temporarily
-                    // replace the paused Lua frame's callee. That event name
-                    // is more specific than the frame's continuation label
-                    // (for example `return sethook` while inside __close).
-                    try self.setField(t, "name", .{ .String = try self.internStr(self.debugNameFromCallee(self.activeBytecodeThread().bytecode_stack[fr.func_slot]).?) });
-                    try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
-                } else if (self.getDebugName(parent_frame)) |dn| {
-                    // Continuation-entered frames carry their call-site name
-                    // on the Thread name stack. It must win at every debug
-                    // level: a return hook asks for level 2 to inspect the
-                    // function that is returning (not the hook frame).
-                    if (dn.namewhat) |nwo| {
-                        try self.setField(t, "namewhat", .{ .String = try self.internStr(nwo) });
-                    } else {
-                        try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
-                    }
-                    if (dn.name) |nmo| {
-                        try self.setField(t, "name", .{ .String = try self.internStr(nmo) });
-                    } else {
-                        try self.setField(t, "name", .Nil);
-                    }
-                } else {
-                    if (lv == 1) {
-                        if (self.debug_namewhat_override) |nwo| {
-                            try self.setField(t, "namewhat", .{ .String = try self.internStr(nwo) });
-                            if (self.debug_name_override) |nmo| {
-                                try self.setField(t, "name", .{ .String = try self.internStr(nmo) });
-                            } else {
-                                try self.setField(t, "name", .Nil);
+                    },
+                    .frame => |res| {
+                        const fr = res.frame;
+                        const fr_index = res.index;
+                        const co_stack = stackForThread(self, th);
+                        // Hook-window and name-override special cases apply
+                        // only when inspecting the CURRENT thread (debug
+                        // hooks and overrides are current-thread state).
+                        const on_current = target_thread == null;
+                        // P15.51n: Debug name override is stored in the
+                        // PARENT frame's continuation. The parent frame is
+                        // BELOW in the call stack, which means it has a
+                        // LOWER index (frames are stored bottom-up).
+                        const parent_frame: ?*const CallFrame = blk: {
+                            if (fr_index > 0) {
+                                break :blk th.call_frames.getConstPtr(fr_index - 1);
                             }
-                        } else {
-                            const inferred = self.debugInferNameFromCaller(self.debugResolveFrameIndex(lv + 1), fr.*);
-                            if (inferred.name) |nm| {
-                                try self.setField(t, "name", .{ .String = try self.internStr(nm) });
-                            } else if (fr.proto() != null and fr.funcName().len != 0 and
-                                !std.mem.eql(u8, fr.funcName(), "main") and
-                                !std.mem.eql(u8, fr.funcName(), "<bytecode>"))
-                            {
-                                try self.setField(t, "name", .{ .String = try self.internStr(fr.funcName()) });
-                            } else if (self.isInDebugHook() and lv == 2) {
+                            break :blk null;
+                        };
+                        // PUC auxgetinfo: name/namewhat are set only when
+                        // 'n' is requested (or what is empty = all fields).
+                        if (what.len == 0 or debugInfoHasOpt(what, 'n')) {
+                            if (on_current and self.isInDebugHook() and fr.isDebugHook()) {
+                                // The hook function's own frame: PUC
+                                // funcnamefromcall's CIST_HOOKED branch —
+                                // name "?", namewhat "hook".
                                 try self.setField(t, "name", .{ .String = try self.internStr("?") });
-                            } else {
-                                try self.setField(t, "name", .Nil);
-                            }
-                            const namewhat = if (inferred.name == null and fr.proto() != null and fr.funcName().len != 0 and
-                                !std.mem.eql(u8, fr.funcName(), "main") and
-                                !std.mem.eql(u8, fr.funcName(), "<bytecode>"))
-                                "local"
-                            else
-                                inferred.namewhat;
-                            try self.setField(t, "namewhat", .{ .String = try self.internStr(namewhat) });
-                        }
-                    } else {
-                        // For lv > 1: try name inference first. Only fall back
-                        // to synthetic pcall name when the frame has no proto
-                        // (pcall boundary frame from tryPushBytecodeProtectedCall).
-                        if (fr.proto() == null and lv == 2 and self.activeProtectedCallDepth() > 0) {
-                            try self.setField(t, "name", .{ .String = try self.internStr("pcall") });
-                            try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
-                        } else {
-                            const inferred = self.debugInferNameFromCaller(self.debugResolveFrameIndex(lv + 1), fr.*);
-                            if (self.isInDebugHook() and lv == 2 and self.debugNameFromCallee(self.activeBytecodeThread().bytecode_stack[fr.func_slot]) != null) {
+                                try self.setField(t, "namewhat", .{ .String = try self.internStr("hook") });
+                            } else if (on_current and self.isInDebugHook() and lv == 2 and self.debugNameFromCallee(self.activeBytecodeThread().bytecode_stack[fr.func_slot]) != null) {
+                                // Synthetic call/return events for a builtin
+                                // temporarily replace the paused Lua frame's
+                                // callee. That event name is more specific than
+                                // the frame's continuation label (for example
+                                // `return sethook` while inside __close).
                                 try self.setField(t, "name", .{ .String = try self.internStr(self.debugNameFromCallee(self.activeBytecodeThread().bytecode_stack[fr.func_slot]).?) });
-                            } else if (self.isInDebugHook() and lv == 2 and self.debug_name_override != null) {
-                                const raw = self.debug_name_override.?;
-                                if (std.mem.eql(u8, raw, "__close") and self.testc_close_metamethod_depth != 0) {
-                                    try self.setField(t, "name", .{ .String = try self.internStr("?") });
+                                try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
+                            } else if (parent_frame != null and parent_frame.?.isFin()) {
+                                // PUC funcnamefromcall (ldebug.c:665): a frame
+                                // whose caller is flagged CIST_FIN is a
+                                // finalizer body — "__gc"/"metamethod". The flag
+                                // is set by callFinalizer on the caller (PUC
+                                // GCTM flags L->ci). Checked BEFORE the
+                                // continuation/code name: the flag replaces
+                                // funcnamefromcode entirely.
+                                try self.setField(t, "name", .{ .String = try self.internStr("__gc") });
+                                try self.setField(t, "namewhat", .{ .String = try self.internStr("metamethod") });
+                            } else if (self.getDebugName(parent_frame)) |dn| {
+                                // Continuation-entered frames carry their
+                                // call-site name on the Thread name stack. It
+                                // must win at every debug level: a return hook
+                                // asks for level 2 to inspect the function that
+                                // is returning (not the hook frame).
+                                if (dn.namewhat) |nwo| {
+                                    try self.setField(t, "namewhat", .{ .String = try self.internStr(nwo) });
                                 } else {
-                                    const nm = if (std.mem.startsWith(u8, raw, "__") and raw.len > 2) raw[2..] else raw;
-                                    try self.setField(t, "name", .{ .String = try self.internStr(nm) });
+                                    try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
                                 }
-                            } else if (inferred.name) |nm| {
-                                try self.setField(t, "name", .{ .String = try self.internStr(nm) });
-                            } else if (self.isInDebugHook() and lv == 2) {
-                                try self.setField(t, "name", .{ .String = try self.internStr("?") });
+                                if (dn.name) |nmo| {
+                                    try self.setField(t, "name", .{ .String = try self.internStr(nmo) });
+                                } else {
+                                    try self.setField(t, "name", .Nil);
+                                }
                             } else {
-                                try self.setField(t, "name", .Nil);
+                                // PUC auxgetinfo: the name comes from the CALLER's
+                                // code (funcnamefromcall) only — resolve the
+                                // caller through the SAME item model so a phantom
+                                // pcall layer as caller yields no name (PUC: C
+                                // caller). No fallback to the function's own
+                                // name: PUC reports nil when the caller's code
+                                // cannot name the callee.
+                                const caller_item = try self.debugResolveLevel(th, level + 1);
+                                const caller_frame: ?*const CallFrame = if (caller_item) |ci| switch (ci) {
+                                    .frame => |rf| rf.frame,
+                                    else => null,
+                                } else null;
+                                // PUC auxgetinfo: the name comes from the CALLER's
+                                // code (funcnamefromcall) only — resolve the
+                                // caller through the SAME item model so a phantom
+                                // pcall layer as caller yields no name (PUC: C
+                                // caller). No fallback to the function's own
+                                // name: PUC reports nil when the caller's code
+                                // cannot name the callee.
+                                if (caller_frame != null) {
+                                    const inferred = self.debugInferNameFromCaller(caller_frame, fr.*);
+                                    if (inferred.name) |nm| {
+                                        try self.setField(t, "name", .{ .String = try self.internStr(nm) });
+                                    } else if (on_current and self.isInDebugHook() and lv == 2) {
+                                        try self.setField(t, "name", .{ .String = try self.internStr("?") });
+                                    } else {
+                                        try self.setField(t, "name", .Nil);
+                                    }
+                                    try self.setField(t, "namewhat", .{ .String = try self.internStr(inferred.namewhat) });
+                                } else {
+                                    // No caller item (top of the item list) or a
+                                    // phantom/virtual caller (PUC: C caller with
+                                    // no flags): no name from the caller.
+                                    if (on_current and self.isInDebugHook() and lv == 2) {
+                                        try self.setField(t, "name", .{ .String = try self.internStr("?") });
+                                    } else {
+                                        try self.setField(t, "name", .Nil);
+                                    }
+                                    try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
+                                }
                             }
-                            try self.setField(t, "namewhat", .{ .String = try self.internStr(inferred.namewhat) });
                         }
-                    }
-                }
-                // P15.51n: current_line derived from proto.lineinfo[pc].
-                const cur_line: i64 = self.frameCurrentLine(fr);
-                try self.setField(t, "currentline", .{ .Int = cur_line });
-                if (what.len == 0 or debugInfoHasOpt(what, 't')) {
-                    const is_tail = if (self.isInDebugHook() and lv == 2 and self.activeDebugHookEventCalllike())
-                        self.activeDebugHookEventTailcall()
-                    else
-                        fr.isTailCall();
-                    const extraargs: i64 = if (fr.isVararg()) @intCast(self.frameVarargs(fr, null).len) else 0;
-                    try self.setField(t, "istailcall", .{ .Bool = is_tail });
-                    try self.setField(t, "extraargs", .{ .Int = extraargs });
-                }
-                if (debugInfoHasOpt(what, 'r')) {
-                    if (self.isInDebugHook() and lv == 2) {
-                        if (self.activeDebugTransferValues()) |vals| {
-                            try self.setField(t, "ftransfer", .{ .Int = self.activeDebugTransferStart() });
-                            try self.setField(t, "ntransfer", .{ .Int = @intCast(vals.len) });
-                        } else {
-                            try self.setField(t, "ftransfer", .{ .Int = 1 });
-                            try self.setField(t, "ntransfer", .{ .Int = 0 });
+                        // P15.51n: current_line derived from proto.lineinfo[pc].
+                        const cur_line: i64 = self.frameCurrentLine(fr);
+                        try self.setField(t, "currentline", .{ .Int = cur_line });
+                        if (what.len == 0 or debugInfoHasOpt(what, 't')) {
+                            const is_tail = if (on_current and self.isInDebugHook() and lv == 2 and self.activeDebugHookEventCalllike())
+                                self.activeDebugHookEventTailcall()
+                            else
+                                fr.isTailCall();
+                            const extraargs: i64 = if (fr.isVararg()) @intCast(self.frameVarargs(fr, th).len) else 0;
+                            try self.setField(t, "istailcall", .{ .Bool = is_tail });
+                            try self.setField(t, "extraargs", .{ .Int = extraargs });
                         }
-                    } else {
-                        try self.setField(t, "ftransfer", .{ .Int = 1 });
-                        try self.setField(t, "ntransfer", .{ .Int = 0 });
-                    }
-                }
-                if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
-                    try self.setField(t, "func", self.activeBytecodeThread().bytecode_stack[fr.func_slot]);
-                }
-                if (fr.proto() != null and self.activeBytecodeThread().bytecode_stack[fr.func_slot] == .Closure) {
-                    // Bytecode source/debug metadata belongs to Proto.
-                    try self.debugFillInfoFromFunction(t, self.activeBytecodeThread().bytecode_stack[fr.func_slot], what);
-                } else if (self.activeBytecodeThread().bytecode_stack[fr.func_slot] == .Builtin) {
-                    // PUC funcinfo (ldebug.c): a C frame's what/source come
-                    // from the function object itself — what="C",
-                    // source="=[C]", linedefined=-1. C-frames are visible
-                    // to getinfo inside a message-handler window
-                    // (invokeErrfunc un-hides the raiser's C-frame, PUC
-                    // luaG_errormsg) and from C-API frames.
-                    try self.debugFillInfoFromFunction(t, self.activeBytecodeThread().bytecode_stack[fr.func_slot], what);
+                        if (debugInfoHasOpt(what, 'r')) {
+                            if (on_current and self.isInDebugHook() and lv == 2) {
+                                if (self.activeDebugTransferValues()) |vals| {
+                                    try self.setField(t, "ftransfer", .{ .Int = self.activeDebugTransferStart() });
+                                    try self.setField(t, "ntransfer", .{ .Int = @intCast(vals.len) });
+                                } else {
+                                    try self.setField(t, "ftransfer", .{ .Int = 1 });
+                                    try self.setField(t, "ntransfer", .{ .Int = 0 });
+                                }
+                            } else {
+                                try self.setField(t, "ftransfer", .{ .Int = 1 });
+                                try self.setField(t, "ntransfer", .{ .Int = 0 });
+                            }
+                        }
+                        if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
+                            try self.setField(t, "func", co_stack[fr.func_slot]);
+                        }
+                        if (fr.proto() != null and co_stack[fr.func_slot] == .Closure) {
+                            // Bytecode source/debug metadata belongs to Proto.
+                            try self.debugFillInfoFromFunction(t, co_stack[fr.func_slot], what);
+                        } else if (co_stack[fr.func_slot] == .Builtin) {
+                            // PUC funcinfo (ldebug.c): a C frame's
+                            // what/source come from the function object
+                            // itself — what="C", source="=[C]",
+                            // linedefined=-1. C frames are real, visible
+                            // stack citizens (P16.41 Cut 1).
+                            try self.debugFillInfoFromFunction(t, co_stack[fr.func_slot], what);
+                        }
+                    },
                 }
             },
             .Builtin, .Closure => {
                 if (target_thread != null) {
                     return self.fail("bad argument #1 to 'getinfo' (function or level expected)", .{});
                 }
-                try self.setField(t, "name", .Nil);
-                try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
+                if (what.len == 0 or debugInfoHasOpt(what, 'n')) {
+                    try self.setField(t, "name", .Nil);
+                    try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
+                }
                 if (what.len == 0 or debugInfoHasOpt(what, 't')) {
                     try self.setField(t, "istailcall", .{ .Bool = false });
                     try self.setField(t, "extraargs", .{ .Int = 0 });
@@ -29718,6 +29899,73 @@ pub const Vm = struct {
         return self.debugSetLocalInBytecodeFrame(fr, proto, idx, val, outs, null, frames_above);
     }
 
+    /// The observable C-temporary window of a suspended thread's topmost
+    /// visible C frame (PUC luaG_findlocal: slots [func+1, L->top) of the
+    /// suspended thread, where L->top already excludes the yielded values
+    /// auxresume moved to the resumer). Returns null when `idx` is not the
+    /// topmost visible frame of a suspended thread (frames below the
+    /// suspension top have no observable window in our model — their args
+    /// were consumed by the callee).
+    ///
+    /// Window sources, in order:
+    ///  - the frame's own `parked_stack` (testC continuation frames:
+    ///    callk/pcallk/yieldk reconstruct their stack there);
+    ///  - the `parked_stack` of a hidden script frame directly above
+    ///    (testC's script-frame duplicate parks the whole testC stack —
+    ///    PUC has ONE CallInfo per testC call, so its window is the full
+    ///    script stack: T.testC("yield 1", 10, 20) suspends with the
+    ///    window ["yield 1", 10] after 20 moved to the resumer —
+    ///    coroutine.lua:722 reads getlocal(co, 0, 2) == 10);
+    ///  - `suspended_builtin_args` (a plain builtin C frame that yielded —
+    ///    e.g. coroutine.yield: its whole stack IS the yielded values, so
+    ///    the window after the move is empty, matching PUC's empty
+    ///    luaB_yield window observed by db.lua:792-795).
+    /// The top `suspended_builtin_args.len` items of the source are the
+    /// moved-out yield values and are excluded.
+    fn suspendedCWindow(th: *Thread, idx: usize) ?[]const Value {
+        const frames = th.call_frames;
+        if (idx >= frames.len()) return null;
+        // `idx` must be the topmost visible frame: every frame above it
+        // must be a hidden internal duplicate.
+        var j = frames.len();
+        while (j > idx + 1) {
+            j -= 1;
+            if (!frames.getConstPtr(j).isHidden()) return null;
+        }
+        var items: ?[]const Value = null;
+        if (frames.getConstPtr(idx).u.c.parked_stack) |cell| {
+            items = cell.items;
+        } else {
+            // Hidden script frames above may park the activation's stack.
+            var k = idx + 1;
+            while (k < frames.len()) : (k += 1) {
+                const above = frames.getConstPtr(k);
+                if (!above.isHidden()) break;
+                if (above.u.c.parked_stack) |cell| {
+                    items = cell.items;
+                    break;
+                }
+            }
+        }
+        if (items == null) {
+            // Plain builtin C frame (e.g. coroutine.yield): its whole arg
+            // stack IS the yielded values — auxresume moved them all to
+            // the resumer, so the observable window is empty (PUC's
+            // luaB_yield ci at level 0 with an empty window, db.lua:792).
+            return null;
+        }
+        const vals = items.?;
+        // Moved-out count: PUC ci->u2.nyield — the nresults the yielding
+        // C activation asked for (luaYieldKShared stores it on the top C
+        // frame before the throw). auxresume moves exactly that many top
+        // values to the resumer, shrinking the observable window.
+        const top = frames.getConstPtr(frames.len() - 1);
+        const ny = if (top.isC()) top.u.c.aux.nyield else 0;
+        const nres: usize = if (ny > 0) @intCast(ny) else 0;
+        if (nres >= vals.len) return &.{};
+        return vals[0 .. vals.len - nres];
+    }
+
     fn builtinDebugGetlocal(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len > 0) outs[0] = .Nil;
         if (outs.len > 1) outs[1] = .Nil;
@@ -29738,63 +29986,46 @@ pub const Vm = struct {
         switch (target) {
             .Int => |level| {
                 if (target_thread) |th| {
-                    if (level < 0 or level > 1 or local_index < 1) return;
-                    // P16.38 fix (coroutine.lua:722 regression): a C frame
-                    // ON TOP of the parked Lua frame (testC yield/yieldk
-                    // above a Lua body) means level 0 IS that C frame — its
-                    // C-temporary window is observable in PUC (the yield
-                    // moved only the TOP n values to the resumer; the
-                    // remaining testC stack survives as C temporaries:
-                    // T.testC("yield 1", 10, 20) → getlocal(co,0,2) == 10).
-                    // Consult the suspended_builtin path FIRST for that
-                    // shape; the parked-Lua path below then handles the
-                    // hook-yield and pure coroutine.yield shapes.
-                    // Hook suspensions keep level 0 = the interrupted
-                    // Lua frame even when a hook-related C frame sits on
-                    // top (PUC: the hook runs on the current CallInfo) —
-                    // only non-hook C-top suspensions (testC yield above
-                    // a Lua body) divert to the C-temporary path.
-                    // Only LEVEL 0 diverts to the C-temporary window
-                    // (the yielding C frame itself); level 1 always walks
-                    // to the parked Lua frame below it (db.lua:792-795:
-                    // plain body-yield — PUC keeps luaB_yield's C ci at
-                    // level 0 with an EMPTY window, level 1 = the body's
-                    // locals x/a).
-                    const divert_to_c_window = level == 0 and
-                        th.call_frames.len() > 0 and
-                        th.call_frames.getConstPtr(th.call_frames.len() - 1).isC() and
-                        !th.yielded_from_debug_hook;
-                    if (!divert_to_c_window) inner: {
-                        if (threadCurrentParkedRuntimeFrame(th)) |fr| {
-                            // P16.38 T4.1 (PUC differential): level 0 of a
-                            // coroutine suspended at a non-hook builtin/C yield
-                            // is the yield C frame in PUC — its window is EMPTY
-                            // by the time Lua can observe it (auxresume's
-                            // lua_xmove moved the yielded values to the resumer
-                            // when resume returned), so getlocal(co, 0, n) is
-                            // nil for every n. Level 1 is the parked Lua frame.
-                            // Hook yields keep level 0 = the interrupted Lua
-                            // frame (PUC: the hook runs on the current CallInfo).
-                            if (level == 0 and !th.yielded_from_debug_hook) return;
+                    if (level < 0 or local_index < 1) return;
+                    // Unified item model (debugResolveLevel): level 0 of a
+                    // suspended coroutine is the yield C frame — virtual
+                    // (frame popped at suspension) when the top parked
+                    // frame is Lua, real when a yielding C function's own
+                    // frame is parked on top (testC "yield": PUC — the C
+                    // function yields from its OWN CallInfo, no separate
+                    // yield ci; its remaining stack is the observable
+                    // C-temporary window, coroutine.lua:722).
+                    const resolved = (try self.debugResolveLevel(th, level)) orelse return;
+                    switch (resolved) {
+                        .virtual_yield => return, // PUC: yield's window is empty once resume returned
+                        .phantom => return, // no observable window for a phantom pcall layer
+                        .frame => |res| {
+                            const fr = res.frame;
+                            if (fr.isC()) {
+                                if (suspendedCWindow(th, res.index)) |window| {
+                                    // PUC luaG_findlocal (ldebug.c:198): a C
+                                    // frame's locals are its stack slots
+                                    // [func+1, limit) with the generic name
+                                    // "(C temporary)". For the suspended
+                                    // top frame, limit is the thread top
+                                    // AFTER auxresume moved the yielded
+                                    // values to the resumer — the window is
+                                    // the C activation's stack minus the
+                                    // moved-out yield values.
+                                    if (local_index >= 1) {
+                                        const pos: usize = @intCast(local_index - 1);
+                                        if (pos < window.len) {
+                                            if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(C temporary)") };
+                                            if (outs.len > 1) outs[1] = window[pos];
+                                        }
+                                    }
+                                    return;
+                                }
+                                return; // C frame below the suspended top: no observable window
+                            }
                             const proto = fr.proto() orelse return;
                             try self.debugGetLocalFromBytecodeFrame(fr, proto, local_index, outs, th, false);
-                            return;
-                        }
-                        break :inner;
-                    }
-                    if (th.suspended_builtin != null) {
-                        if (local_index == 1) {
-                            if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(C temporary)") };
-                            if (outs.len > 1) outs[1] = .Nil;
-                            return;
-                        }
-                        if (th.suspended_builtin_args.slice()) |vals| {
-                            const pos: usize = @intCast(local_index - 1);
-                            if (pos < vals.len) {
-                                if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(C temporary)") };
-                                if (outs.len > 1) outs[1] = vals[pos];
-                            }
-                        }
+                        },
                     }
                     return;
                 }
@@ -29813,8 +30044,13 @@ pub const Vm = struct {
                     return;
                 }
                 const lv: usize = @intCast(level);
-                const resolved = self.debugResolveFrameWithIndex(lv) orelse return self.fail("bad level", .{});
-                const fr = resolved.frame;
+                const resolved_item = (try self.debugResolveLevel(self.activeBytecodeThread(), level)) orelse
+                    return self.fail("bad level", .{});
+                const res = switch (resolved_item) {
+                    .frame => |r| r,
+                    else => return, // phantom/virtual C level: no locals
+                };
+                const fr = res.frame;
                 if (self.isInDebugHook() and lv == 2) {
                     if (self.activeDebugTransferValues()) |vals| {
                         const start = self.activeDebugTransferStart();
@@ -29831,7 +30067,7 @@ pub const Vm = struct {
                 // P16.38 T4.1: a non-hook frame directly above = a real
                 // callee running on this frame's current call — PUC bounds
                 // its temp window at the callee's func slot.
-                try self.debugGetLocalFromFrame(fr, local_index, outs, self.debugFrameHasRealCalleeAbove(resolved.index));
+                try self.debugGetLocalFromFrame(fr, local_index, outs, self.debugFrameHasRealCalleeAbove(res.index));
             },
             .Closure => |cl| {
                 if (cl.proto) |proto| {
@@ -29888,8 +30124,12 @@ pub const Vm = struct {
                     return;
                 }
                 if (level < 1) return self.fail("bad level", .{});
-                const lv: usize = @intCast(level);
-                const resolved = self.debugResolveFrameWithIndex(lv) orelse return self.fail("bad level", .{});
+                const resolved_item = (try self.debugResolveLevel(self.activeBytecodeThread(), level)) orelse
+                    return self.fail("bad level", .{});
+                const resolved = switch (resolved_item) {
+                    .frame => |r| r,
+                    else => return self.fail("bad level", .{}), // C level: no settable locals
+                };
                 try self.debugSetLocalInFrame(resolved.frame, local_index, new_value, outs, self.debugFrameHasRealCalleeAbove(resolved.index));
             },
             .Closure, .Builtin => {},
@@ -30186,6 +30426,13 @@ pub const Vm = struct {
                     self.c_error_jmp = @ptrCast(&jb);
                     defer self.c_error_jmp = prev_jmp;
 
+                    // Record the interrupted frame for the yield path (see
+                    // DebugHookState.sync_hook_frame_idx). Cleared by this
+                    // defer on BOTH paths: normal hook return and the
+                    // error.Yield propagation after a hook yield.
+                    hook_state_for_flag.sync_hook_frame_idx = ci_frame_idx;
+                    defer hook_state_for_flag.sync_hook_frame_idx = null;
+
                     const sj = _setjmp(@ptrCast(&jb));
                     if (sj == 0) {
                         hook_ptr(@ptrCast(self.cur_handle.?), @ptrCast(&ar));
@@ -30407,13 +30654,16 @@ pub const Vm = struct {
         }
         if (level < 0) level = 0;
 
+        // PUC db_traceback: ALWAYS a live luaL_traceback walk of the
+        // current chain (default level 1 = the caller of traceback). Inside
+        // a message-handler window the chain is intact at the throw site —
+        // [handler, raiser C frame, raiser frames...] — so the live walk
+        // naturally starts with the handler's own line (PUC behavior; the
+        // old err_traceback replay started at the raiser and dropped it).
+        // err_traceback still serves the DEAD-thread replay path
+        // (debugBuildThreadTraceback), where the chain is already unwound.
         const body = if (thread_arg) |th|
             try self.debugBuildThreadTraceback(th, level)
-        else if (self.errThread().err_traceback) |tb|
-            // During xpcall message handling the original traceback was
-            // captured at error point. Reuse it to avoid losing deep frames
-            // after unwind.
-            try self.alloc.dupe(u8, tb)
         else
             try self.debugBuildCurrentTraceback(level);
 
@@ -30500,8 +30750,10 @@ pub const Vm = struct {
 
             self.protected_call_depth += 1;
             defer self.protected_call_depth -= 1;
-            self.enterProtectedCFrame();
-            defer self.leaveProtectedCFrame();
+            // P16.41 Cut 1: no registered protected boundary — db_debug's
+            // own C-frame (pushed by callBuiltin) is now REAL and VISIBLE,
+            // so error(msg, 2) inside a debug command resolves level 2 to
+            // it (C frame → no position), exactly like PUC.
             defer self.shrinkBcStack();
 
             const ret = self.runClosure(cl, &.{}) catch |e| switch (e) {
@@ -30558,92 +30810,6 @@ pub const Vm = struct {
         }
     }
 
-    fn tracebackFrameLabel(self: *Vm, fr: *const Frame, caller_opt: ?*const Frame, top_hook_frame: bool) DispatchError![]const u8 {
-        if (top_hook_frame and self.isInDebugHook()) {
-            return try std.fmt.allocPrint(self.alloc, "hook", .{});
-        }
-
-        // Resolve source name via PUC luaO_chunkid (lobject.c:682-718).
-        // This produces the short_src used in tracebacks: strips '@'/'='
-        // prefixes and truncates long file names with '...' prefix.
-        // A stripped proto (NULL source in PUC) reports short_src "?"
-        // (auxgetinfo 'S' renders a NULL source as "=?" and chunkid maps
-        // that to "?").
-        const src_raw = fr.sourceName();
-        const is_stripped = if (fr.proto()) |p| protoIsStripped(p) else false;
-        var id_buf: [59]u8 = undefined;
-        const shown_src: []const u8 = if (is_stripped)
-            "?"
-        else blk: {
-            const src = diag.chunkId(id_buf[0..], src_raw);
-            break :blk if (src.len != 0) src else "?";
-        };
-
-        // P15.51n: current_line derived from proto.lineinfo[pc].
-        // PUC luaL_traceback (lauxlib.c:148-151) appends the line number
-        // ONLY when currentline > 0; a frame without line information
-        // (a stripped proto — currentline is -1) renders just "src: in ...",
-        // with no line and no linedefined fallback.
-        const cur_line: i64 = self.frameCurrentLine(fr);
-        const loc = if (cur_line > 0)
-            try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in ", .{ shown_src, cur_line })
-        else
-            try std.fmt.allocPrint(self.alloc, "\t{s}: in ", .{shown_src});
-
-        // PUC pushfuncname (lauxlib.c:96-109): resolve function name from the
-        // call site (caller frame). debugInferNameFromCaller returns namewhat
-        // ("global", "local", "upvalue", "field", "method", "for iterator")
-        // and the corresponding name.
-        //
-        // Debug hooks may set debug_namewhat/debug_name directly; prefer those
-        // when available (they include "metamethod" which inference doesn't).
-        var namewhat: ?[]const u8 = null;
-        var name: ?[]const u8 = null;
-        if (self.getDebugName(caller_opt)) |dn| {
-            namewhat = dn.namewhat;
-            name = dn.name;
-        }
-        if (namewhat == null) {
-            const inferred = self.debugInferNameFromCaller(caller_opt, fr.*);
-            namewhat = inferred.namewhat;
-            name = inferred.name;
-        }
-
-        // Builtin (C) frames: format as [C]: in {namewhat} '{name}' or [C]: in ?
-        if (self.activeBytecodeThread().bytecode_stack[fr.func_slot] == .Builtin) {
-            if (namewhat) |nw| {
-                if (name) |nm| {
-                    return try std.fmt.allocPrint(self.alloc, "\t[C]: in {s} '{s}'", .{ nw, nm });
-                }
-            }
-            return try std.fmt.allocPrint(self.alloc, "\t[C]: in ?", .{});
-        }
-
-        // Lua frames: PUC pushfuncname logic
-        if (namewhat) |nw| {
-            if (name) |nm| {
-                if (std.mem.eql(u8, nw, "metamethod")) {
-                    return try std.fmt.allocPrint(self.alloc, "{s}metamethod '{s}'", .{ loc, nm });
-                }
-                return try std.fmt.allocPrint(self.alloc, "{s}{s} '{s}'", .{ loc, nw, nm });
-            }
-        }
-
-        // No name from code: main chunk, anonymous function, or ?
-        if (fr.lineDefined() == 0) {
-            return try std.fmt.allocPrint(self.alloc, "{s}main chunk", .{loc});
-        }
-
-        // PUC pushglobalfuncname: try to find the function in _G (loaded table).
-        // If found, show "function 'name'". Otherwise, show "function <src:linedefined>".
-        if (self.debugFindGlobalFuncName(self.activeBytecodeThread().bytecode_stack[fr.func_slot])) |gname| {
-            return try std.fmt.allocPrint(self.alloc, "{s}function '{s}'", .{ loc, gname });
-        }
-
-        // PUC: for Lua functions without a name, use function <src:linedefined>
-        return try std.fmt.allocPrint(self.alloc, "{s}function <{s}:{d}>", .{ loc, shown_src, fr.lineDefined() });
-    }
-
     /// PUC pushglobalfuncname (lauxlib.c:74-93): search _G for a function
     /// value matching `callee`. Returns the global name if found, null otherwise.
     /// PUC searches the registry's LUA_LOADED_TABLE; we search _G directly
@@ -30670,143 +30836,41 @@ pub const Vm = struct {
         return null;
     }
 
+    /// debug.traceback() on the CURRENT thread: PUC db_traceback →
+    /// luaL_traceback(L, L, msg, level) with the traceback builtin's own
+    /// C-frame as level 0 (PUC: lua_getstack counts it — getstack(0) is
+    /// traceback's own ci). Default level 1 starts at the caller.
     fn debugBuildCurrentTraceback(self: *Vm, level: i64) DispatchError![]const u8 {
-        // Walk bytecode frames (Thread.call_frames) (most recent first).
-        // Build a list of *const CallFrame pointers so we can reference
-        // frames from the array.
-        var visible: usize = 0;
-        const th_bc = self.activeBytecodeThread();
-        const bc_len = th_bc.call_frames.len();
-        for (0..bc_len) |i| {
-            if (!th_bc.call_frames.getConstPtr(i).isHidden()) visible += 1;
-        }
-
-        // Lua's traceback level skips its own frame plus `level` caller frames.
-        const skip: usize = if (level <= 0) 0 else @intCast(level + 1);
-        var nl_count: i64 = @as(i64, @intCast(visible)) - @as(i64, @intCast(skip));
-        if (nl_count < 0) nl_count = 0;
-        if (level > 0 and nl_count < 1) nl_count = 1;
-        if (level <= 0 and nl_count < 2) nl_count = 2;
-
         var aw: std.Io.Writer.Allocating = .init(self.alloc);
         errdefer aw.deinit();
         var w = &aw.writer;
-        w.writeAll("stack traceback:\n") catch return error.OutOfMemory;
-
-        // Collect frame pointers (most recent first).
-        var frame_ptrs = std.ArrayListUnmanaged(*const CallFrame).empty;
-        defer frame_ptrs.deinit(self.alloc);
-        {
-            var i: usize = th_bc.call_frames.len();
-            while (i > 0) {
-                i -= 1;
-                if (th_bc.call_frames.getConstPtr(i).isHidden()) continue;
-                try frame_ptrs.append(self.alloc, th_bc.call_frames.getPtr(i));
-            }
-        }
-        var first: usize = @min(skip, frame_ptrs.items.len);
-        if (frame_ptrs.items.len != 0 and first >= frame_ptrs.items.len) first = frame_ptrs.items.len - 1;
-        const shown = if (frame_ptrs.items.len > first) frame_ptrs.items[first..] else frame_ptrs.items[0..0];
-        var has_pcall = false;
-        for (shown) |fr_ptr| {
-            const fr = fr_ptr.*;
-            if (th_bc.bytecode_stack[fr.func_slot] == .Builtin and th_bc.bytecode_stack[fr.func_slot].Builtin == .pcall) {
-                has_pcall = true;
-                break;
-            }
-        }
-        const need_pcall = self.activeProtectedCallDepth() > 0 and !has_pcall;
-
-        // Lua truncates large stack traces around the middle.
-        // db.lua checks for a split of 10 lines before "...(skip ...)"
-        // and 11 lines from that marker onward.
-        if (shown.len + @as(usize, @intFromBool(need_pcall)) > 22) {
-            for (shown[0..10], 0..) |fr_ptr, k| {
-                const caller_opt: ?*const Frame = if (k + 1 < shown.len) shown[k + 1] else null;
-                const line = try self.tracebackFrameLabel(fr_ptr, caller_opt, k == 0);
-                defer self.alloc.free(line);
-                w.print("{s}\n", .{line}) catch return error.OutOfMemory;
-            }
-            w.writeAll("...\t(skip levels)\n") catch return error.OutOfMemory;
-            const tail = shown[shown.len - 10 ..];
-            for (tail, 0..) |fr_ptr, k| {
-                const tail_idx = shown.len - 10 + k;
-                const caller_opt: ?*const Frame = if (tail_idx + 1 < shown.len) shown[tail_idx + 1] else null;
-                const line = try self.tracebackFrameLabel(fr_ptr, caller_opt, false and k == 0);
-                defer self.alloc.free(line);
-                w.print("{s}\n", .{line}) catch return error.OutOfMemory;
-            }
-            return try aw.toOwnedSlice();
-        }
-
-        if (shown.len == 0) {
-            if (level <= 0) w.writeAll("\t[C]: in global 'traceback'\n") catch return error.OutOfMemory;
-            if (self.activeProtectedCallDepth() > 0) w.writeAll("\t[C]: in global 'pcall'\n") catch return error.OutOfMemory;
-            return try aw.toOwnedSlice();
-        }
-
-        if (level <= 0) {
-            w.writeAll("\t[C]: in global 'traceback'\n") catch return error.OutOfMemory;
-        }
-        for (shown, 0..) |fr_ptr, k| {
-            // Insert synthetic [C]: in global 'pcall'/'xpcall' before a frame
-            // that has a pending protected call.
-            if (self.getPendingCallConst(fr_ptr.pending_call_index)) |pending| {
-                if (pending.protection) |prot| {
-                    const cname: []const u8 = if (prot.kind == .pcall) "pcall" else "xpcall";
-                    w.print("\t[C]: in global '{s}'\n", .{cname}) catch return error.OutOfMemory;
-                }
-            }
-            const caller_opt: ?*const Frame = if (k + 1 < shown.len) shown[k + 1] else null;
-            const line = try self.tracebackFrameLabel(fr_ptr, caller_opt, k == 0);
-            defer self.alloc.free(line);
-            w.print("{s}\n", .{line}) catch return error.OutOfMemory;
-        }
-        if (need_pcall) {
-            // Fallback: if no frame had a pending protection (e.g., the
-            // protected call was set up via builtinPcall, not the fast path),
-            // append [C]: in global 'pcall' at the end.
-            w.writeAll("\t[C]: in global 'pcall'\n") catch return error.OutOfMemory;
-        }
+        w.writeAll("stack traceback:") catch return error.OutOfMemory;
+        try self.writeTracebackBody(w, self.activeBytecodeThread(), level);
         return try aw.toOwnedSlice();
     }
 
     fn debugBuildThreadTraceback(self: *Vm, th: *Thread, level: i64) DispatchError![]const u8 {
-        // Pragmatic traceback used by db.lua coroutine checks:
-        // first line is the header, following lines are scanned with string.gmatch.
+        // PUC db_traceback(co, ...): luaL_traceback(L, co, msg, level) —
+        // walks the TARGET thread's CallInfo chain. A suspended thread
+        // keeps its frames parked (the yield C-frame on top), so the real
+        // walk applies. A dead-with-error thread's frames were destroyed
+        // by the unwind (PUC preserves them; a documented frame-lifetime
+        // divergence — see tools/status/p16.41-cframe-parity.md), so the
+        // traceback captured at the terminal boundary is replayed. A
+        // dead-normal thread's frames are gone in PUC too: header only.
         var aw: std.Io.Writer.Allocating = .init(self.alloc);
         errdefer aw.deinit();
         var w = &aw.writer;
-        w.writeAll("stack traceback:\n") catch return error.OutOfMemory;
+        w.writeAll("stack traceback:") catch return error.OutOfMemory;
 
         if (th.status == .suspended) {
-            if (level <= 0) w.writeAll("\t[C]: in function 'yield'\n") catch return error.OutOfMemory;
-            var name_buf: [64]?[]const u8 = undefined;
-            const name_len = self.buildSuspendedFrameNames(th, name_buf[0..]);
-            const names: []const ?[]const u8 = name_buf[0..name_len];
-            const depth_raw: usize = if (names.len > 0) names.len else 1;
-            const depth: i64 = if (depth_raw > 0) @intCast(depth_raw) else 1;
-            const drop: i64 = if (level <= 1) 0 else level - 1;
-            const db_lines: i64 = @max(0, depth - drop);
-            var k: i64 = 0;
-            while (k < db_lines) : (k += 1) {
-                const idx: usize = @intCast(k);
-                const nm = if (idx < names.len) names[idx] else null;
-                if (nm) |name| {
-                    w.print("\tdb.lua: in function '{s}'\n", .{name}) catch return error.OutOfMemory;
-                } else {
-                    w.writeAll("\tdb.lua: in function <db.lua>\n") catch return error.OutOfMemory;
-                }
-            }
+            try self.writeTracebackBody(w, th, level);
         } else if (th.status == .dead) {
             if (th.trace_had_error) {
-                w.writeAll("\t[C]: in function 'error'\n") catch return error.OutOfMemory;
                 // P16.28 T3: dead-error traceback was FORMATTED once at the
                 // terminal boundary; replay the captured text.
                 if (th.err_dead_traceback) |tb| {
                     w.writeAll(tb) catch return error.OutOfMemory;
-                } else {
-                    w.writeAll("\tdb.lua: in function <db.lua>\n") catch return error.OutOfMemory;
                 }
             }
         }
@@ -41315,6 +41379,13 @@ pub const Vm = struct {
             _ = try self.pushBuiltinCFrame(.{ .Thread = th });
             script_frame_idx = th.call_frames.len() - 1;
             frame_pushed_here = true;
+            // P16.41 Cut 1: the PUSH-mode script frame is a genuinely-
+            // internal duplicate with NO PUC counterpart — callBuiltin
+            // already pushed testC's own (now visible) C-frame for the
+            // same PUC CallInfo. Hide it so debug walks count testC's C
+            // activation exactly once (PUC: ONE CallInfo per testC call).
+            // REUSE mode never pushes a frame, so nothing to hide there.
+            th.call_frames.getPtr(script_frame_idx).setHidden();
         }
         th.call_frames.getPtr(script_frame_idx).u.c.parked_stack = script_cell;
         cell_owned_here = false;

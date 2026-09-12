@@ -1,85 +1,16 @@
 {
-  "created_utc": "2026-09-12T09:23:53.601076+00:00",
-  "provenance": {
-    "git_head": "144ab80",
-    "measured_source_head": "144ab80",
-    "measured_source_note": "P16.40 Cut 0 remainder: HEAD IS the production commit 144ab80 (fmt-only vs 280f6bd, .text byte-identical to the P16.39 Cut 3 measured binary per objcopy A/B); binary zig-out/bin/luazig sha16 6f94c09e62750970 = the perf_compare P16.40 snapshot measured binary (one binary for all P16.40 Cut 0 artifacts)",
-    "git_dirty": "clean at measurement time (post-measurement artifact writes only)",
-    "source_dirty": "clean",
-    "artifact_dirty": "dirty (post-measurement JSON/status writes; the measured binary's inputs are src/, reported by source_dirty=clean)",
-    "zig_version": "0.16.0",
-    "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "6f94c09e62750970",
-    "note": "P16.40 Cut 0 canonical code-size truth at HEAD 144ab80 (P16.39 Cut 3 landed: builtin OP_CALL path residue reductions). Supersedes the P16.38-final artifact (5a22e7a, text 2,591,401, binary sha16 df5c95b88f4fb31b). Absent symbols = fully inlined into runBytecodeDispatch."
-  },
-  "text_total_bytes": 2604265,
-  "absent_inlined_into_dispatch": [
-    "vm.Vm.findBinaryTm",
-    "vm.Vm.opCall",
-    "vm.Vm.opReturn0",
-    "vm.Vm.opReturn1",
-    "vm.Vm.pushStagedFast",
-    "vm.Vm.stageFixedCall",
-    "vm.Vm.builtinOutLen (inline wrapper: one comptime-table load at 5 call sites)",
-    "vm.Vm.errThread (pub accessor, cold paths; fully inlined)",
-    "vm.Vm.gsubContCcallEnter (inlined at both push sites; only gsubContCcallRollback 57 B stands alone)",
-    "vm.Vm.switchRuntime (DELETED in P16.37 Cut 2 \u2014 replaced by switchThread = current_thread store + refreshHooksCached)",
-    "vm.Vm.parkActiveRuntime / vm.Vm.activateRuntime (DELETED in P16.37 Cut 2 \u2014 Thread owns the runtime fields permanently; no move ceremony)",
-    "vm.Vm.activeBytecodeThread (inlined at cold/debug sites; dispatch caches ctx.th at frame_loop entry)"
-  ],
-  "fail_instantiations": {
-    "vm.Vm.fail": {
-      "count": 571,
-      "aggregate_bytes": 69372
-    },
-    "vm.Vm.failArgerror": {
-      "count": 4,
-      "aggregate_bytes": 754
-    },
-    "vm.Vm.failBinaryMmbin": {
-      "count": 1,
-      "aggregate_bytes": 599
-    },
-    "vm.Vm.failLib": {
-      "count": 3,
-      "aggregate_bytes": 2096
-    },
-    "vm.Vm.failRunerror": {
-      "count": 2,
-      "aggregate_bytes": 1408
-    },
-    "vm.Vm.failTestcRaw": {
-      "count": 1,
-      "aggregate_bytes": 278
-    },
-    "vm.Vm.failWithPosFrame": {
-      "count": 576,
-      "aggregate_bytes": 793640
-    }
-  },
-  "symbols_bytes": {
-    "vm.Vm.runBytecodeDispatch": 68221,
-    "vm.Vm.builtinOutLenDynamic": 2025,
-    "vm.Vm.pushStagedBytecodeExecFrame": 1196,
-    "vm.Vm.completeBytecodeExecFrame": 4462,
-    "vm.Vm.tryPushSimpleResultMetamethod": 2885,
-    "vm.Vm.dispatchCalleeActivationHook": 536,
-    "vm.Vm.callBuiltin": 8503,
-    "vm.Vm.getTmByObj": 253,
-    "vm.Vm.stageBytecodeCall": 497,
-    "vm.Vm.builtinCoroutineResume": 16882,
-    "vm.Vm.builtinCoroutineYield": 4295,
-    "vm.Vm.switchThread": 106,
-    "vm.Vm.coroutineBuiltinFastPathEligible": 301,
-    "vm.Vm.gsubContCcallRollback": 57,
-    "vm.Vm.pushResolvedBytecodeClosure__anon_43014": 1111
-  },
-  "measurement": {
-    "binary": "zig-out/bin/luazig",
-    "symbols": "nm -S zig-out/bin/luazig (size column, hex->dec)",
-    "text_total": "readelf -S -W .text size = 2,604,265",
-    "text_delta_vs_p16_38_final": "+12864 B (2,591,401 -> 2,604,265): P16.39 Cut 3 (280f6bd) landed the builtin OP_CALL path residue reductions \u2014 callBuiltin snapshot discipline (bc_stack slice snapshotted before the C-frame push, args/outs re-derived only on realloc), pushBuiltinCFrame grew-return, gated outs-window registration (builtin_may_refresh_outs comptime table, reentrant builtins only), single-Value stores for small windows, allocation-adjacent GC guard (gc_auto_threshold machinery) \u2014 net code growth concentrated in callBuiltin +1,747 and runBytecodeDispatch +702 (inlined guards); 144ab80 (fmt-only) left .text byte-identical",
-    "dispatch_delta_vs_p16_38_final": "+702 B (67,519 -> 702): Cut 3 inlined the gated outs-window classification + allocation-adjacent GC threshold check into the dispatch-adjacent builtin path",
-    "coroutine_symbols_note": "switchThread 106 B standalone (hot copies inlined at the 4 switch sites); builtinCoroutineResume 16,882 (+326 vs P16.38-final 16,556) / builtinCoroutineYield 4,295 (+47 vs 4,248) \u2014 Cut 3's gated outs-window + snapshot discipline touch the coroutine builtins (pcall-class reentrant); coroutineBuiltinFastPathEligible 301 B unchanged (O(1) nny term since P16.36 Cut 3); pushResolvedBytecodeClosure anon suffix renumbered 42999 -> 43014 (same 1,111 B body, comptime counter shift from Cut 3 signature changes)"
-  }
+ "created_utc": "2026-09-12T13:26:59.548873+00:00",
+ "provenance": {
+  "git_head": "ac47362",
+  "measured_source_head": "a6c470a",
+  "source_dirty": "clean"
+ },
+ "text_bytes": 2604825,
+ "symbols": {
+  "runBytecodeDispatch": 68221,
+  "callBuiltin": 8503,
+  "pushBuiltinCFrame": 745,
+  "popBuiltinCFrame": 219,
+  "builtinCoroutineResume": 16882
+ }
 }

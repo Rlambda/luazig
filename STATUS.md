@@ -1,4 +1,4 @@
-> Last updated: 2026-09-12 (P16.42 T2+T3 — gc.lua pace2 hang FIXED (closure charge −8B/load), cstack Debug segfault classified DEFERRED; geomean 1.41x unchanged)
+> Last updated: 2026-09-12 (P16.42 COMPLETE — correctness phase: pcall-in-__gc corruption CLOSED (savestack), gc.lua pace2 CLOSED (8B/load closure accounting); gc.lua plain PUC-identical first time; cstack Debug classified (host-stack, deferred); geomean 1.40892)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -34,7 +34,7 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
 | Differential output (`--diff`) | **0 output_diff** |
-| Smoke tests (`tests/smoke/*.lua`) | **81/81** pass |
+| Smoke tests (`tests/smoke/*.lua`) | **82/82** pass |
 | C API suites (`tests/c_api`) | 23 suites |
 | Performance (geomean vs PUC) | **1.41x** |
 
@@ -6495,6 +6495,30 @@ architecture фаза; global_arith +14% = pre-existing drift, HEAD-верифи
 
 Гейт: matrix 31/32 zig_fail=0, smoke **81/81** (+81, +82), c_api 50+diff,
 api580, TBC 22+23, unit D+RF; geomean 1.41237; baseline=1.41237.
+
+### P16.42 COMPLETE: finalizer re-entry + GC accounting correctness (2026-09-09)
+**Geomean 1.41237 → 1.40892** (measured `3b11f8e` clean; correctness-фаза).
+
+- **Cut 1 (`0728e37`) — BLOCKING pcall-in-__gc corruption CLOSED**: allocTable's
+  inline GC-шаг跑л финалайзеры (realloc bytecode_stack) БЕЗ ре-деривации
+  ctx.regs → чтение freed-памяти ("switch on corrupt value" / RF infinite
+  loop). Фикс = PUC savestack/restorestack: ре-деривация regs из base+cap
+  ИНДЕКСОВ (как condGcFromDispatch — единственный пропущенный сайт).
+  Тест 83 (3 варианта, PUC-идентичны в D+RF).
+- **T3 (`3b11f8e`) — gc.lua pace2 CLOSED**: createBytecodeChunkClosure
+  charging 40B, freeing 48B (closure+upvalue) → **−8B на каждый load()** →
+  count коллапсировал → pace-цикл невыходен. PUC luaF_newLclosure = один
+  блок. **gc.lua plain byte-identical PUC ВПЕРВЫЕ**; collateral T.stats()
+  crash тоже ушёл; errdefer-симметрия + leak on OOM-пути закрыты.
+- **T2 — честно DEFERRED**: cstack Debug = host-stack exhaustion (~84KB
+  Zig-фреймов × 200 уровней > контейнерный стек); PUC тоже рекурсивен —
+  итеративного пути нет; RF корректен.
+- Найдено pre-existing: smoke 82 под --testc (hook+TFORCALL окно);
+  builtinTestcStats rooting-hole (латентный).
+- P16.40 GC-debt гейны сохранены (dynamic_load −3.4%, temp_table 1.070x).
+
+Гейт: matrix 31/32 zig_fail=0, smoke 83/83, c_api 50+diff, api580,
+TBC 22+23, unit D+RF; geomean 1.40892; baseline=1.40892.
 
 ## История закрытых фаз
 

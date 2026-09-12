@@ -1,8 +1,8 @@
 {
  "created_utc": "2026-09-12T09:28:18.471294+00:00",
  "provenance": {
-  "git_head": "ac47362",
-  "measured_source_head": "a6c470a",
+  "git_head": "3b11f8e",
+  "measured_source_head": "3b11f8e",
   "measured_source_note": "P16.40 Cut 0 remainder regeneration at HEAD 144ab80 (production commit; fmt-only vs 280f6bd \u2014 builtin_may_refresh_outs comptime table alignment, .text byte-identical). Probe binaries rebuilt from current source (cfprobe40-debug/rf, -O flag before module flags). CallFrame/LuaFrameState/CFrameState asserted identical to the P16.39 Cut 0 artifact.",
   "git_dirty": "clean (before this artifact)",
   "source_dirty": "clean",
@@ -16,7 +16,7 @@
    "ReleaseFast": "ca844bc53f4dcca9"
   },
   "probe_note": "standalone Zig probe compiled OUTSIDE the repo (/tmp/opencode/cfprobe39.zig) against the same module graph (lua root src/lua/root.zig + util), -O Debug and -O ReleaseFast; prints @sizeOf/@alignOf of vm.Vm, vm.Thread, vm.CallFrame (+ u-variant arms via @FieldType) and the Thread-side state types (YieldedValues via @FieldType(Thread,'yielded'), InlineValues via @FieldType(YieldedValues,'owned')). P16.40 Cut 0 regeneration at HEAD 144ab80: CallFrame/LuaFrameState/CFrameState values byte-identical to the P16.39 Cut 0 artifact (fmt-only source delta); thread_state_types schema kept (Vm legitimately differs Debug vs RF: Debug-only safety metadata).",
-  "note": "P16.41 Cut 0 provenance refresh; layout values unchanged (CallFrame 88 asserted)"
+  "note": "P16.42 final provenance refresh"
  },
  "luazig": {
   "Debug": {

@@ -1,1 +1,1 @@
-P16.41 COMPLETE — C-frame visibility parity (CIST_HIDE deleted) + CALL-window view model; getinfo(0)/sort-frames/traceback PUC-identical; geomean 1.41237 (correctness phase)
+P16.42 COMPLETE — correctness phase: pcall-in-__gc corruption CLOSED (savestack), gc.lua pace2 CLOSED (8B/load closure accounting); gc.lua plain PUC-identical first time; cstack Debug classified (host-stack, deferred); geomean 1.40892

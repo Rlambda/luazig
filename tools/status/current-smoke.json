@@ -1,27 +1,27 @@
 {
   "meta": {
-    "created_utc": "2026-09-12T16:35:39.153196+00:00",
+    "created_utc": "2026-09-12T20:04:08.942381+00:00",
     "lane": "smoke_compare",
     "argv": [
       "/home/boss/codes/luazig/tools/smoke_compare.py",
       "--json-out",
-      "/home/boss/codes/luazig/tools/status/.tmp.smoke.22g2dzmy.json"
+      "/home/boss/codes/luazig/tools/status/.tmp.smoke.o_6ren4h.json"
     ],
     "zig_version": "0.16.0"
   },
   "provenance": {
-    "git_head": "8b1e00f",
-    "measured_source_head": "8b1e00f",
+    "git_head": "3b11f8e",
+    "measured_source_head": "3b11f8e",
     "git_dirty": "dirty",
     "source_dirty": "clean",
     "artifact_dirty": "dirty",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "2cef80cab41c3e32",
+    "zig_binary_sha16": "bb0f47501b8a71bb",
     "puc_binary_sha16": "d54bc45e1757b216"
   },
-  "total": 81,
-  "ok": 81,
+  "total": 82,
+  "ok": 82,
   "mismatches": 0,
   "results": [
     {
@@ -346,6 +346,10 @@
     },
     {
       "file": "tests/smoke/82_cframe_view_model.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/83_finalizer_pcall_reentry.lua",
       "match": true
     }
   ]

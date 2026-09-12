@@ -1,16 +1,16 @@
 {
- "created_utc": "2026-09-12T13:26:59.548873+00:00",
+ "created_utc": "2026-09-12T20:03:37.236551+00:00",
  "provenance": {
-  "git_head": "ac47362",
-  "measured_source_head": "a6c470a",
+  "git_head": "3b11f8e",
+  "measured_source_head": "3b11f8e",
   "source_dirty": "clean"
  },
- "text_bytes": 2604825,
+ "text_bytes": 2589289,
  "symbols": {
-  "runBytecodeDispatch": 68221,
-  "callBuiltin": 8503,
-  "pushBuiltinCFrame": 745,
-  "popBuiltinCFrame": 219,
-  "builtinCoroutineResume": 16882
+  "runBytecodeDispatch": 68678,
+  "callBuiltin": 8537,
+  "pushBuiltinCFrame": 742,
+  "popBuiltinCFrame": 305,
+  "builtinCoroutineResume": 16656
  }
 }

@@ -4230,12 +4230,20 @@ pub const Vm = struct {
     ///
     /// Invariant (PUC luaE_setdebt discipline): every gc_auto_threshold_kb
     /// reschedule pairs the debt write (`threshold - count`) — see
-    /// gcScheduleNextAutomaticCycle's callers. The deliberate exceptions
-    /// are force-due sites: LUA_GCRESTART and LUA_GCSTEP(n<=0) set debt = 0
-    /// (PUC luaE_setdebt(g, 0)). gcNoteFree decrements only gc_count_kb
-    /// (not debt), so debt is conservative: it can hit 0 before the
-    /// threshold does, never after — a step entered early no-ops in
-    /// gcAutomaticStep, exactly like the pre-cut behavior.
+    /// gcScheduleNextAutomaticCycle's callers, gcAutomaticStep's gen-minor
+    /// branch (PUC luaC_step: youngcollection + setminordebt),
+    /// gcEnterGenerational (entergen) and gcLeaveGenerational (minor2inc).
+    /// The deliberate exceptions are force-due sites: LUA_GCRESTART and
+    /// LUA_GCSTEP(n<=0) set debt = 0 (PUC luaE_setdebt(g, 0)).
+    ///
+    /// P16.40 Cut 2: the accounting is two-sided like PUC's GCdebt —
+    /// `luaM_realloc_` updates it for allocs AND `luaM_free_` for frees
+    /// (lmem.c:154,187); ours: gcNoteAlloc/gcNoteFree and
+    /// gcChargeTreeMemory/gcCreditTreeMemory. In a steady state
+    /// `debt <= 0` coincides with gcAutoCycleDue; the explicit
+    /// gcAutoCycleDue re-check in the gates covers the residual unpaired
+    /// cases (the minor2inc threshold write mid-sweep; the count clamped
+    /// at 0 drifting the debt upward — the safe, later-firing direction).
     gc_step_debt_kb: f64 = 32768.0,
     gc_finalizer_epoch: usize = 0,
     gc_cycle_finalizer_epoch: usize = 0,
@@ -7757,14 +7765,27 @@ pub const Vm = struct {
         self.gc_step_debt_kb -= kb;
         if (self.stats.enabled) self.stats.alloc_bytes_total += bytes; // P16.0b
     }
-    /// an object. The tracker's total_bytes is updated automatically by
-    /// the allocator's free callback.
-    /// Decrement testc_total_bytes and approximate gc_count_kb when GC frees
-    /// an object. The tracker's total_bytes is updated automatically by
-    /// the allocator's free callback.
+    /// Decrement testc_total_bytes and the approximate gc_count_kb when an
+    /// object is freed, and credit the GC debt symmetrically. The tracker's
+    /// total_bytes is updated automatically by the allocator's free callback.
+    ///
+    /// PUC `luaM_free_` (lmem.c:154): `g->GCdebt += osize` — every free moves
+    /// the debt AWAY from due exactly as the count moves down, keeping the
+    /// invariant `debt <= 0 ⟺ cycle due` that `luaC_condGC`'s single debt
+    /// check relies on. P16.40 Cut 2: the old one-sided version (count only,
+    /// documented as "conservative") let the debt drift to "due" in
+    /// free-heavy/no-alloc loops while the count said "not due" — the
+    /// condGcFromDispatch gate then fell through on EVERY dispatch safe
+    /// point and paid the safepoint sync + a no-op gcAutomaticStep entry
+    /// (measured: gc_steps_auto slope exactly 1.0 per builtin call in K5,
+    /// P16.40 Cut 1 §3a). The debt credit is NOT clamped, mirroring PUC's
+    /// unclamped GCdebt; a count clamped at 0 while the debt keeps growing
+    /// only makes debt-based firing LATER, and the explicit gcAutoCycleDue
+    /// re-check in the gates still fires the cycle at the threshold.
     inline fn gcNoteFree(self: *Vm, bytes: usize) void {
         const kb: f64 = @as(f64, @floatFromInt(bytes)) / 1024.0;
         self.gc_count_kb = @max(0, self.gc_count_kb - kb);
+        self.gc_step_debt_kb += kb;
         if (self.testc_ctrl) |c| c.total_bytes -|= bytes;
     }
 
@@ -7787,9 +7808,14 @@ pub const Vm = struct {
         self.gc_step_debt_kb -= kb;
     }
 
+    /// Credit the tree footprint at last release. The debt credit mirrors
+    /// gcNoteFree's (PUC luaM_free_ two-sided GCdebt accounting) so tree
+    /// releases move the debt away from due like any other free — see the
+    /// gcNoteFree doc for the invariant argument.
     pub fn gcCreditTreeMemory(self: *Vm, bytes: usize) void {
         const kb: f64 = @as(f64, @floatFromInt(bytes)) / 1024.0;
         self.gc_count_kb = @max(0, self.gc_count_kb - kb);
+        self.gc_step_debt_kb += kb;
     }
 
     /// Register a Table in the unified GC list. Thin wrapper for call-site
@@ -23862,6 +23888,11 @@ pub const Vm = struct {
         try self.gcCycleFull();
         self.gc_mode = .generational;
         try self.gcMakeAllOld();
+        // PUC entergen (lgc.c:1428-1433): atomic2gen + setminordebt — the
+        // mode transition ends with a debt write paired to the threshold
+        // gcMakeAllOld just rescheduled, so luaC_condGC's debt check paces
+        // the next minor collection exactly like PUC's.
+        self.gc_step_debt_kb = self.gc_auto_threshold_kb - self.gc_count_kb;
     }
 
     fn gcLeaveGenerational(self: *Vm) void {
@@ -23891,6 +23922,15 @@ pub const Vm = struct {
         self.gcClearGenerationalLists();
         self.gcMakeAllWhite();
         self.gcScheduleNextAutomaticCycle();
+        // PUC minor2inc ends with luaE_setdebt (lgc.c:1313). We land in
+        // .pause (not mid-sweep — gcMinorCollection is monolithic, see
+        // above), so the pause-state pairing applies: debt = threshold -
+        // count (the setpause shape). Without a fresh pairing the debt
+        // keeps its generational-era value, which a manual
+        // collectgarbage("step", n) could have driven to <= 0 — every
+        // dispatch safe point would then pay a no-op gcAutomaticStep entry
+        // until the count alone reaches the threshold.
+        self.gc_step_debt_kb = self.gc_auto_threshold_kb - self.gc_count_kb;
     }
 
     fn gcFullCollectionForUser(self: *Vm) DispatchError!void {
@@ -23962,6 +24002,21 @@ pub const Vm = struct {
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             if (!self.gcAutoCycleDue()) return;
             try self.gcMinorCollection();
+            // PUC luaC_step (lgc.c:1752-1754): KGC_GENMINOR → youngcollection
+            // + setminordebt — the debt is re-paired after EVERY minor
+            // collection, so the next minor fires after MINORMUL% of NET
+            // growth (allocs push the debt down via gcNoteAlloc, frees push
+            // it up via gcNoteFree — luaM_realloc_/luaM_free_ two-sided
+            // accounting). gcMinorCollection already rescheduled
+            // gc_auto_threshold_kb via gcScheduleNextAutomaticCycle (the
+            // minor2inc branch set its own stepsize debt); pair the debt
+            // with that threshold. Without this pairing the debt keeps its
+            // pre-collection (<= 0) value and every dispatch safe point pays
+            // the safepoint sync + a no-op gcAutomaticStep entry until
+            // allocations alone drive the count to the threshold.
+            if (self.gc_gen_phase == .minor) {
+                self.gc_step_debt_kb = self.gc_auto_threshold_kb - self.gc_count_kb;
+            }
             return;
         }
         if (self.gc_state == .pause) {

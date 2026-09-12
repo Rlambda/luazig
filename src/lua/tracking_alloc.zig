@@ -8,8 +8,10 @@
 //! `collectgarbage("count")` reads `total_bytes / 1024` — no approximation,
 //! no hand-placed `gcNoteAlloc`/`gcNoteFree` call sites.
 //!
-//! GC pacing also hooks here: the `gc_debt_kb` field is decremented on every
-//! alloc, replacing the old `gcNoteAlloc` → `gc_step_debt_kb` mechanism.
+//! GC pacing does NOT hook here: the `gc_debt_kb` field below is unused
+//! (kept for potential future use). Debt pacing lives on the Vm
+//! (`vm.gc_step_debt_kb`), updated two-sided by `gcNoteAlloc`/`gcNoteFree`
+//! (PUC luaM_realloc_/luaM_free_ GCdebt accounting — P16.40 Cut 2).
 //!
 //! ## Leak-map mode (LUAZIG_TRACK_ALLOC=1)
 //!
@@ -46,7 +48,8 @@ pub const TrackingAllocator = struct {
     /// Net bytes currently allocated through this allocator.
     /// Equivalent to PUC's `l_G->totalbytes`.
     total_bytes: usize = 0,
-    /// GC debt in KB, decremented on every alloc.
+    /// GC debt in KB. UNUSED (see module doc): pacing lives on the Vm's
+    /// `gc_step_debt_kb`, updated by gcNoteAlloc/gcNoteFree.
     gc_debt_kb: f64 = 0.0,
     /// Debug: count of alloc/free calls (set LUAZIG_TRACE_ALLOC=1 to print).
     alloc_count: usize = 0,

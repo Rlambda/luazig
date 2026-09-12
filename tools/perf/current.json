@@ -1,15 +1,15 @@
 {
-  "created_utc": "2026-09-12T09:21:36.604753+00:00",
+  "created_utc": "2026-09-12T10:07:05.522459+00:00",
   "zig_version": "0.16.0",
   "provenance": {
-    "git_head": "144ab80",
-    "measured_source_head": "144ab80",
+    "git_head": "58b5627",
+    "measured_source_head": "58b5627",
     "git_dirty": "dirty",
-    "source_dirty": "clean",
-    "artifact_dirty": "dirty",
+    "source_dirty": "dirty",
+    "artifact_dirty": "clean",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "6f94c09e62750970",
+    "zig_binary_sha16": "4abf8cfbbdc00cae",
     "puc_binary_sha16": "d54bc45e1757b216"
   },
   "host": {
@@ -18,157 +18,157 @@
   },
   "runs": 7,
   "core": "0",
-  "geomean": 1.4274932476281847,
+  "geomean": 1.4119613096812313,
   "workloads": {
-    "int_arith": {
-      "zig_s": 0.228873,
-      "puc_s": 0.172876,
-      "ratio": 1.3239142506767856
-    },
-    "string_loop": {
-      "zig_s": 0.118998,
-      "puc_s": 0.096592,
-      "ratio": 1.2319653801557067
-    },
-    "float_arith": {
-      "zig_s": 0.237053,
-      "puc_s": 0.176105,
-      "ratio": 1.34608898100565
-    },
-    "metamethod_add": {
-      "zig_s": 0.085566,
-      "puc_s": 0.062519,
-      "ratio": 1.368639933460228
-    },
-    "dynamic_load": {
-      "zig_s": 0.199565,
-      "puc_s": 0.127533,
-      "ratio": 1.564810676452369
-    },
-    "array_access": {
-      "zig_s": 0.081777,
-      "puc_s": 0.045978,
-      "ratio": 1.7786115098525384
-    },
     "string_concat": {
-      "zig_s": 0.0849,
-      "puc_s": 0.078126,
-      "ratio": 1.086706090162046
-    },
-    "lua_calls": {
-      "zig_s": 0.120325,
-      "puc_s": 0.090969,
-      "ratio": 1.3227033384999287
-    },
-    "table_alloc_setmetatable": {
-      "zig_s": 0.056596,
-      "puc_s": 0.04346,
-      "ratio": 1.3022549470777727
+      "zig_s": 0.083737,
+      "puc_s": 0.078546,
+      "ratio": 1.0660886614213327
     },
     "hash_access": {
-      "zig_s": 0.111176,
-      "puc_s": 0.068407,
-      "ratio": 1.62521379390998
+      "zig_s": 0.110784,
+      "puc_s": 0.06831,
+      "ratio": 1.6217830478700044
     },
-    "coroutine_yield": {
-      "zig_s": 0.064962,
-      "puc_s": 0.044207,
-      "ratio": 1.4694957812111205
+    "lua_calls": {
+      "zig_s": 0.119287,
+      "puc_s": 0.09139,
+      "ratio": 1.3052522157785316
     },
-    "global_arith": {
-      "zig_s": 0.745304,
-      "puc_s": 0.547411,
-      "ratio": 1.3615071673751533
-    },
-    "mixed_arith": {
-      "zig_s": 0.253666,
-      "puc_s": 0.175676,
-      "ratio": 1.443942257337371
-    },
-    "field_access": {
-      "zig_s": 0.09559,
-      "puc_s": 0.056641,
-      "ratio": 1.6876467576490528
-    },
-    "metamethod_call_noalloc": {
-      "zig_s": 0.015567,
-      "puc_s": 0.008474,
-      "ratio": 1.8370309181024307
-    },
-    "branch_loop": {
-      "zig_s": 0.857606,
-      "puc_s": 0.530925,
-      "ratio": 1.615305363281066
-    },
-    "temp_table_alloc": {
-      "zig_s": 0.036144,
-      "puc_s": 0.030206,
-      "ratio": 1.1965834602396876
+    "metamethod_add": {
+      "zig_s": 0.083732,
+      "puc_s": 0.061771,
+      "ratio": 1.3555228181509122
     },
     "comparisons": {
-      "zig_s": 0.82245,
-      "puc_s": 0.597937,
-      "ratio": 1.3754793565208374
+      "zig_s": 0.826634,
+      "puc_s": 0.601804,
+      "ratio": 1.3735933958564581
+    },
+    "field_access": {
+      "zig_s": 0.092789,
+      "puc_s": 0.057067,
+      "ratio": 1.6259659698249425
+    },
+    "table_alloc_setmetatable": {
+      "zig_s": 0.051913,
+      "puc_s": 0.044344,
+      "ratio": 1.1706882554573335
+    },
+    "dynamic_load": {
+      "zig_s": 0.204048,
+      "puc_s": 0.126875,
+      "ratio": 1.6082600985221678
+    },
+    "coroutine_yield": {
+      "zig_s": 0.064699,
+      "puc_s": 0.043758,
+      "ratio": 1.4785639197403906
+    },
+    "mixed_arith": {
+      "zig_s": 0.251781,
+      "puc_s": 0.174465,
+      "ratio": 1.4431605193018655
+    },
+    "string_loop": {
+      "zig_s": 0.116966,
+      "puc_s": 0.098362,
+      "ratio": 1.189138081779549
+    },
+    "array_access": {
+      "zig_s": 0.082262,
+      "puc_s": 0.045963,
+      "ratio": 1.7897439244609796
+    },
+    "float_arith": {
+      "zig_s": 0.234317,
+      "puc_s": 0.176257,
+      "ratio": 1.3294053569503623
+    },
+    "global_arith": {
+      "zig_s": 0.858321,
+      "puc_s": 0.556487,
+      "ratio": 1.5423918258647553
+    },
+    "int_arith": {
+      "zig_s": 0.229299,
+      "puc_s": 0.175717,
+      "ratio": 1.3049335010272198
+    },
+    "metamethod_call_noalloc": {
+      "zig_s": 0.015611,
+      "puc_s": 0.008459,
+      "ratio": 1.8454900106395555
+    },
+    "temp_table_alloc": {
+      "zig_s": 0.033231,
+      "puc_s": 0.031053,
+      "ratio": 1.0701381509032943
+    },
+    "branch_loop": {
+      "zig_s": 0.857932,
+      "puc_s": 0.532313,
+      "ratio": 1.6117058948400658
     }
   },
   "zig": {
-    "int_arith": 0.228873,
-    "string_loop": 0.118998,
-    "float_arith": 0.237053,
-    "metamethod_add": 0.085566,
-    "dynamic_load": 0.199565,
-    "array_access": 0.081777,
-    "string_concat": 0.0849,
-    "lua_calls": 0.120325,
-    "table_alloc_setmetatable": 0.056596,
-    "hash_access": 0.111176,
-    "coroutine_yield": 0.064962,
-    "global_arith": 0.745304,
-    "mixed_arith": 0.253666,
-    "field_access": 0.09559,
-    "metamethod_call_noalloc": 0.015567,
-    "branch_loop": 0.857606,
-    "temp_table_alloc": 0.036144,
-    "comparisons": 0.82245
+    "string_concat": 0.083737,
+    "hash_access": 0.110784,
+    "lua_calls": 0.119287,
+    "metamethod_add": 0.083732,
+    "comparisons": 0.826634,
+    "field_access": 0.092789,
+    "table_alloc_setmetatable": 0.051913,
+    "dynamic_load": 0.204048,
+    "coroutine_yield": 0.064699,
+    "mixed_arith": 0.251781,
+    "string_loop": 0.116966,
+    "array_access": 0.082262,
+    "float_arith": 0.234317,
+    "global_arith": 0.858321,
+    "int_arith": 0.229299,
+    "metamethod_call_noalloc": 0.015611,
+    "temp_table_alloc": 0.033231,
+    "branch_loop": 0.857932
   },
   "puc": {
-    "int_arith": 0.172876,
-    "string_loop": 0.096592,
-    "float_arith": 0.176105,
-    "metamethod_add": 0.062519,
-    "dynamic_load": 0.127533,
-    "array_access": 0.045978,
-    "string_concat": 0.078126,
-    "lua_calls": 0.090969,
-    "table_alloc_setmetatable": 0.04346,
-    "hash_access": 0.068407,
-    "coroutine_yield": 0.044207,
-    "global_arith": 0.547411,
-    "mixed_arith": 0.175676,
-    "field_access": 0.056641,
-    "metamethod_call_noalloc": 0.008474,
-    "branch_loop": 0.530925,
-    "temp_table_alloc": 0.030206,
-    "comparisons": 0.597937
+    "string_concat": 0.078546,
+    "hash_access": 0.06831,
+    "lua_calls": 0.09139,
+    "metamethod_add": 0.061771,
+    "comparisons": 0.601804,
+    "field_access": 0.057067,
+    "table_alloc_setmetatable": 0.044344,
+    "dynamic_load": 0.126875,
+    "coroutine_yield": 0.043758,
+    "mixed_arith": 0.174465,
+    "string_loop": 0.098362,
+    "array_access": 0.045963,
+    "float_arith": 0.176257,
+    "global_arith": 0.556487,
+    "int_arith": 0.175717,
+    "metamethod_call_noalloc": 0.008459,
+    "temp_table_alloc": 0.031053,
+    "branch_loop": 0.532313
   },
   "ratios": {
-    "int_arith": 1.3239142506767856,
-    "string_loop": 1.2319653801557067,
-    "float_arith": 1.34608898100565,
-    "metamethod_add": 1.368639933460228,
-    "dynamic_load": 1.564810676452369,
-    "array_access": 1.7786115098525384,
-    "string_concat": 1.086706090162046,
-    "lua_calls": 1.3227033384999287,
-    "table_alloc_setmetatable": 1.3022549470777727,
-    "hash_access": 1.62521379390998,
-    "coroutine_yield": 1.4694957812111205,
-    "global_arith": 1.3615071673751533,
-    "mixed_arith": 1.443942257337371,
-    "field_access": 1.6876467576490528,
-    "metamethod_call_noalloc": 1.8370309181024307,
-    "branch_loop": 1.615305363281066,
-    "temp_table_alloc": 1.1965834602396876,
-    "comparisons": 1.3754793565208374
+    "string_concat": 1.0660886614213327,
+    "hash_access": 1.6217830478700044,
+    "lua_calls": 1.3052522157785316,
+    "metamethod_add": 1.3555228181509122,
+    "comparisons": 1.3735933958564581,
+    "field_access": 1.6259659698249425,
+    "table_alloc_setmetatable": 1.1706882554573335,
+    "dynamic_load": 1.6082600985221678,
+    "coroutine_yield": 1.4785639197403906,
+    "mixed_arith": 1.4431605193018655,
+    "string_loop": 1.189138081779549,
+    "array_access": 1.7897439244609796,
+    "float_arith": 1.3294053569503623,
+    "global_arith": 1.5423918258647553,
+    "int_arith": 1.3049335010272198,
+    "metamethod_call_noalloc": 1.8454900106395555,
+    "temp_table_alloc": 1.0701381509032943,
+    "branch_loop": 1.6117058948400658
   }
 }

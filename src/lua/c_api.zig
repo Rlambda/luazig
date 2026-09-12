@@ -2406,10 +2406,9 @@ pub export fn luaL_checkoption(L: ?*lua_State, arg: c_int, def: ?[*:0]const u8, 
 /// `luaL_error` to annotate error messages with the caller's location.
 ///
 /// In PUC, level 0 = the C function itself (which has a CallInfo), and
-/// level 1 = the Lua caller. luazig does not push CallFrames for C
-/// functions (see vm.zig TODO at callCFunction), so level 0 = the Lua
-/// frame that called the C function. Internal callers (`luaL_argerror`,
-/// `luaL_error`) therefore use `luaL_where(L, 0)` instead of PUC's `(L, 1)`.
+/// level 1 = the Lua caller. P16.41 Cut 1 made builtin/C CallFrames real
+/// and visible, so luazig levels now match PUC exactly and internal
+/// callers (`luaL_argerror`, `luaL_error`) use PUC's `luaL_where(L, 1)`.
 pub export fn luaL_where(L: ?*lua_State, lvl: c_int) void {
     const h = L orelse return;
     const vm = h.vm;
@@ -2449,9 +2448,9 @@ pub export fn luaL_typeerror(L: ?*lua_State, arg: c_int, tname: [*:0]const u8) c
 }
 
 pub export fn luaL_argerror(L: ?*lua_State, arg: c_int, extramsg: ?[*:0]const u8) c_int {
-    // Level 0 (not 1 as in PUC): luazig doesn't push C-function CallFrames,
-    // so level 0 = the Lua frame that called this C function.
-    luaL_where(L, 0);
+    // PUC lauxlib.c:174-196: the where-prefix comes from level 1 (the
+    // Lua caller of this C function); level 0 is this C frame itself.
+    luaL_where(L, 1);
     if (extramsg) |msg| {
         _ = lua_pushfstring(L, "bad argument #%d (%s)", arg, msg);
     } else {
@@ -2462,9 +2461,9 @@ pub export fn luaL_argerror(L: ?*lua_State, arg: c_int, extramsg: ?[*:0]const u8
 }
 
 pub export fn luaL_error(L: ?*lua_State, fmt: [*:0]const u8, ...) c_int {
-    // Level 0 (not 1 as in PUC): luazig doesn't push C-function CallFrames,
-    // so level 0 = the Lua frame that called this C function.
-    luaL_where(L, 0);
+    // PUC lauxlib.c:238-245: luaL_where(L, 1) — level 1 is the Lua caller
+    // of this C function (level 0 is the C frame itself, no position).
+    luaL_where(L, 1);
     var ap = @cVaStart();
     defer @cVaEnd(&ap);
     _ = lua_pushvfstring(L, fmt, @ptrCast(&ap));

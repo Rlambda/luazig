@@ -153,6 +153,12 @@ fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: 
         // SIGINT handler so pcall can catch interrupts.
         lua.internal.vm.installSigintHandler();
         defer lua.internal.vm.restoreSigintHandler();
+        // PUC main → lua_pcall(pmain) leaves pmain's C CallInfo below the
+        // chunk for the whole session: getinfo(2) from main is a nameless C
+        // function, tracebacks end with "[C]: in ?". Push the host entry
+        // C-frame for the chunk's duration (P16.41 Cut 1).
+        try vm.pushHostEntryCFrame();
+        defer vm.popHostEntryCFrame();
         const ret = vm.runBytecode(loaded_proto, &upvals, script_args, null) catch {
             reportError(aalloc, vm, progname);
             return error.RuntimeError;
@@ -217,6 +223,9 @@ fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: 
             // PUC docall (lua.c:161): setsignal(SIGINT, laction).
             lua.internal.vm.installSigintHandler();
             defer lua.internal.vm.restoreSigintHandler();
+            // PUC pmain C CallInfo below the chunk (P16.41 Cut 1).
+            try vm.pushHostEntryCFrame();
+            defer vm.popHostEntryCFrame();
             const ret = vm.runBytecode(proto, &upvals, script_args, null) catch {
                 reportError(aalloc, vm, progname);
                 return error.RuntimeError;
@@ -824,6 +833,12 @@ fn doREPL(
             const saved_errfunc = vm.getErrfuncValue();
             vm.setErrfuncValue(.{ .Builtin = .cli_msghandler });
             defer vm.setErrfuncValue(saved_errfunc);
+            // PUC pmain C CallInfo below each REPL line's chunk (P16.41
+            // Cut 1) — one entry frame per docall, like PUC's single
+            // pmain ci that stays below every doREPL docall. OOM ends the
+            // REPL, matching the runBytecode OOM handling below.
+            vm.pushHostEntryCFrame() catch break;
+            defer vm.popHostEntryCFrame();
             const rets = vm.runBytecode(p, &upvals, &.{}, null) catch |err| switch (err) {
                 error.OutOfMemory => break,
                 else => {

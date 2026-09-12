@@ -8253,6 +8253,16 @@ pub const Vm = struct {
             // reads the correct live_reg_top[pc].
             if (ctx) |c| self.parkActiveFrame(c);
             try self.gcAutomaticStep();
+            // P16.42 T1 (PUC savestack/restorestack discipline): the GC
+            // step may execute __gc finalizers — arbitrary nested Lua
+            // that can grow and REALLOC the owning Thread's
+            // bytecode_stack. The dispatch ctx's regs slice points into
+            // the OLD allocation; without re-derivation from base+cap
+            // INDICES, the next opcode reads freed memory (the
+            // pcall-in-__gc corruption: "switch on corrupt value" in
+            // isTruthy(regs[inst.a]) / ReleaseFast infinite loop reading
+            // a stale slot that never observes the finalizer's write).
+            if (ctx) |c| c.regs = c.th.bytecode_stack[c.base .. c.base + c.frame_cap];
         }
         return t;
     }

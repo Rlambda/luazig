@@ -1,21 +1,21 @@
 {
- "created_utc": "2026-09-11T20:16:54.207735+00:00",
+ "created_utc": "2026-09-12T09:28:18.471294+00:00",
  "provenance": {
-  "git_head": "fe0688f",
-  "measured_source_head": "5a22e7a",
-  "measured_source_note": "git diff 5a22e7a..HEAD --stat -- src/ is empty; src/ byte-identical to the P16.38 measured source (P16.39 Cut 0 R0.2 regeneration). Probe binaries rebuilt after the R0.3 comment-only fixes (behavior-neutral; layout asserted identical to the pre-fix probe run).",
+  "git_head": "144ab80",
+  "measured_source_head": "144ab80",
+  "measured_source_note": "P16.40 Cut 0 remainder regeneration at HEAD 144ab80 (production commit; fmt-only vs 280f6bd \u2014 builtin_may_refresh_outs comptime table alignment, .text byte-identical). Probe binaries rebuilt from current source (cfprobe40-debug/rf, -O flag before module flags). CallFrame/LuaFrameState/CFrameState asserted identical to the P16.39 Cut 0 artifact.",
   "git_dirty": "clean (before this artifact)",
   "source_dirty": "clean",
   "artifact_dirty": "clean (regeneration in flight; measured inputs are src/, reported by source_dirty=clean)",
   "zig_version": "0.16.0",
   "optimize_mode": "Debug+ReleaseFast",
-  "zig_binary_sha16": "c134caa825828c37",
+  "zig_binary_sha16": "6f94c09e62750970",
   "puc_binary_sha16": "d54bc45e1757b216",
   "probe_binary_sha16": {
-   "Debug": "94d4a4fc0b484dbb",
-   "ReleaseFast": "b20c879823221f8a"
+   "Debug": "5a999a9de6a21d7f",
+   "ReleaseFast": "ca844bc53f4dcca9"
   },
-  "probe_note": "standalone Zig probe compiled OUTSIDE the repo (/tmp/opencode/cfprobe39.zig) against the same module graph (lua root src/lua/root.zig + util), -O Debug and -O ReleaseFast; prints @sizeOf/@alignOf of vm.Vm, vm.Thread, vm.CallFrame (+ u-variant arms via @FieldType) and the Thread-side state types (YieldedValues via @FieldType(Thread,'yielded'), InlineValues via @FieldType(YieldedValues,'owned')). P16.39 Cut 0 R0.2 regeneration at HEAD fe0688f (src/ == 5a22e7a): CallFrame/LuaFrameState/CFrameState values byte-identical to the P16.38 R0.6 artifact; schema EXTENDED with thread_state_types (Vm/Thread/YieldedValues/InlineValues per mode \u2014 Vm legitimately differs Debug vs RF: Debug-only safety metadata)."
+  "probe_note": "standalone Zig probe compiled OUTSIDE the repo (/tmp/opencode/cfprobe39.zig) against the same module graph (lua root src/lua/root.zig + util), -O Debug and -O ReleaseFast; prints @sizeOf/@alignOf of vm.Vm, vm.Thread, vm.CallFrame (+ u-variant arms via @FieldType) and the Thread-side state types (YieldedValues via @FieldType(Thread,'yielded'), InlineValues via @FieldType(YieldedValues,'owned')). P16.40 Cut 0 regeneration at HEAD 144ab80: CallFrame/LuaFrameState/CFrameState values byte-identical to the P16.39 Cut 0 artifact (fmt-only source delta); thread_state_types schema kept (Vm legitimately differs Debug vs RF: Debug-only safety metadata)."
  },
  "luazig": {
   "Debug": {

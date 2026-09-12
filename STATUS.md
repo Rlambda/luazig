@@ -1,4 +1,4 @@
-> Last updated: 2026-09-11 (P16.39 COMPLETE — dispatch truth: floor 61/28 i/it (1.17x cycles), kernel matrix, builtin-call Cut 3 (K5 −121); geomean 1.42076)
+> Last updated: 2026-09-12 (P16.40 Cut 0)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -36,9 +36,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **79/79** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.42x** |
+| Performance (geomean vs PUC) | **1.43x** |
 
-Geomean замедления vs PUC Lua: **1.42x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.43x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -11081,3 +11081,41 @@ Cut 2 фазы P16.39: НЕТ runtime-изменений (только изме�
 - **Гейты** (src/ не менялся с 862bec7; бинарник sha16 c134caa825828c37):
   unit D + RF PASS, smoke **79/79**, matrix --testc 31/32 zig_fail=0
   (big.lua both_fail pre-existing).
+
+## P16.40 Cut 0 remainder — каноническая регенерация артефактов (2026-09-12)
+
+Cut 0 remainder фазы P16.40: НЕТ runtime-изменений (HEAD `144ab80` =
+fmt-only над измерённым `280f6bd`, .text побайтно идентичен по objcopy
+A/B). Все артефакты перегенерированы на ОДНОМ бинарнике
+`zig-out/bin/luazig` sha16 `6f94c09e62750970` (puc `d54bc45e1757b216`
+не менялся), provenance = head `144ab80`, source_dirty=clean везде.
+
+- **Быстрые гейты**: unit D+RF PASS; smoke **79/79**; matrix --testc
+  31/32 zig_fail=0 (big.lua both_fail pre-existing); api580 GREEN
+  (Debug+RF+sizes).
+- **current-dispatch-floor.json** (perf_dispatch_floor.py Parts 1-2,
+  fresh): zig **61.00 i/it / 12.35 c/it / 7.00 br/it / IPC 4.94 /
+  3.11 ns**; puc **28.00 / 10.39 / 5.00 / 2.70 / 2.74 ns** —
+  воспроизводит P16.39 Cut 1 floor (2.18x instr / 1.19x cycles).
+- **current.json / current-counters / current-profile-index**
+  (perf_compare --runs 7 --snapshot-out): geomean **1.42749**
+  (vs baseline 1.42076 = +0.47%, 0 WARN/FAIL; max workload delta
+  +1.1% dynamic_load, улучшения до −11.8% int_arith).
+- **current-matrix / current-smoke** (status_snapshot, атомарно):
+  31/32 zig_fail=0, 79/79; README/STATUS блоки перегенерированы.
+- **current-codesize.json**: .text **2,604,265** (+12,864 vs
+  P16.38-final 2,591,401 — рост от P16.39 Cut 3: callBuiltin +1,747,
+  runBytecodeDispatch +702 — inlined gated outs-window + GC-threshold
+  machinery); fail-инстанциации: failWithPosFrame 576×793,640 B;
+  absent-inlined список неизменен (opCall/opReturn0/1/pushStagedFast/
+  stageFixedCall/findBinaryTm и др.).
+- **current-differential-profile.json**: perf record top-15 на 10
+  hotspot workloads; coroutine_yield top = runBytecodeDispatch 57.3%
+  (vs 77.2% в P16.38-final — Cut 3 перераспределил builtin-часть).
+- **current-callframe-layout.json**: probe пересобран из текущего
+  source (cfprobe40-debug/rf; NB: `-O` обязан стоять ДО module-флагов
+  zig build-exe, иначе молча собирается Debug); CallFrame 88 B /
+  LuaFrameState 48 / CFrameState 56 / Thread 3720 / YieldedValues 96 —
+  все asserted идентичны P16.39 Cut 0 (fmt-only delta не меняет layout).
+- **P16.40 queue**: Cut 1 (K4/K5/K6 fine-grained decomposition) —
+  следующий шаг.

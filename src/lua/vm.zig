@@ -27275,11 +27275,14 @@ pub const Vm = struct {
             if (cl_registered) {
                 self.gcUnregisterObject(.{ .closure = cl });
                 self.testc_obj_functions -= 1;
-                self.gcNoteFree(@sizeOf(Closure));
+                self.gcNoteFree(@sizeOf(Closure) + cells.len * @sizeOf(*Cell));
             }
             if (cl.proto) |p| {
                 if (p.tree) |t| t.releaseTree(self.alloc);
             }
+            // The upvalue array is owned by the closure (gcFreeObject frees
+            // it via c.upvalues); destroy(cl) alone would leak it.
+            self.alloc.free(cells);
             self.alloc.destroy(cl);
         }
         cl.* = .{
@@ -27292,7 +27295,14 @@ pub const Vm = struct {
         try self.gcRegisterClosure(cl);
         cl_registered = true;
         self.testc_obj_functions += 1;
-        self.gcNoteAlloc(@sizeOf(Closure));
+        // Charge the FULL closure allocation: struct + upvalue pointer
+        // array (PUC luaF_newLclosure allocates LClosure + nupvals*Upval*
+        // as one block charged via luaC_newobj). gcFreeObject(.closure)
+        // credits exactly this total; charging only @sizeOf(Closure)
+        // under-reported 8B per upvalue — after ~150 dynamic loads the
+        // skewed gc_count_kb collapsed collectgarbage("count") to 0 and
+        // broke gen-GC pacing (gc.lua pace2 hang, P16.42 T3).
+        self.gcNoteAlloc(@sizeOf(Closure) + proto.upvalues.len * @sizeOf(*Cell));
         // P16.10b Task 7+15 (adoption): resolve the tree's constants HERE,
         // at the closure-creation boundary, so every executable Proto is
         // runtime-ready BEFORE any frame push (PUC invariant: bytecode
@@ -27711,11 +27721,14 @@ pub const Vm = struct {
         errdefer {
             if (cl_registered) {
                 self.gcUnregisterObject(.{ .closure = cl });
-                self.gcNoteFree(@sizeOf(Closure));
+                self.gcNoteFree(@sizeOf(Closure) + cells.len * @sizeOf(*Cell));
             }
             if (cl.proto) |p| {
                 if (p.tree) |t| t.releaseTree(self.alloc);
             }
+            // The upvalue array is owned by the closure; free it here —
+            // destroy(cl) alone would leak it (same as the text path).
+            self.alloc.free(cells);
             self.alloc.destroy(cl);
         }
         cl.* = .{
@@ -27726,7 +27739,10 @@ pub const Vm = struct {
         _ = self.retainTreeForClosure(proto);
         try self.gcRegisterClosure(cl);
         cl_registered = true;
-        self.gcNoteAlloc(@sizeOf(Closure));
+        // Full closure allocation: struct + upvalue array (PUC
+        // luaF_newLclosure; must match gcFreeObject's credit — see the
+        // text-path fix in createBytecodeChunkClosure, P16.42 T3).
+        self.gcNoteAlloc(@sizeOf(Closure) + nups * @sizeOf(*Cell));
         // Charge the tree's native footprint at adoption (Task 7). For
         // undumped trees, constants were pre-resolved by
         // preResolveUndumpedConstants before this call, so resolved_values

@@ -1,4 +1,4 @@
-> Last updated: 2026-09-12 (P16.40 Cut 2)
+> Last updated: 2026-09-12 (P16.40 COMPLETE — GC-debt discipline (PUC two-sided GCdebt parity): K5 663, gcAutomaticStep 1.0→0.0/call, temp_table 1.076x; geomean 1.40315)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -36,9 +36,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **79/79** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.43x** |
+| Performance (geomean vs PUC) | **1.40x** |
 
-Geomean замедления vs PUC Lua: **1.43x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -6307,6 +6307,28 @@ int_arith +0.4%; baseline-approved = **1.45349 (P16.36-final)**.
 
 Гейт: matrix 31/32 zig_fail=0, smoke 79/79, c_api 50+diff, api580,
 TBC 22+23, unit D+RF; geomean 1.42076.
+
+### P16.40 COMPLETE: post-Cut3 call-path truth + GC-debt discipline (2026-09-09)
+**Geomean 1.42076 → 1.40315** (measured `a6c470a` clean; 0 WARN/FAIL).
+
+- **R0.1 (`144ab80`)**: fmt-фикс (comptime-таблица); .text побайтово
+  идентичен.
+- **Cut 0 (`c4bc0a5`)**: ВСЕ current-* артефакты перегенерированы на одном
+  бинаре; floor свежий 61.00/28.00.
+- **Cut 1 (`58b5627`)**: тонкая K4/K5/K6 декомпозиция: K4 call 124 vs
+  precall 48 / return 121 vs ~30 (R0 gate-cascade 66 из 13 условий); K5
+  C-frame ≈135 vs 71; marshalling zig ВЫИГРЫВАЕТ 2:1; active_builtin 16.
+  **Root cause: gcNoteFree односторонний** → guard стрелял на КАЖДОМ
+  builtin-вызове (PUC luaM_realloc_ двусторонний).
+- **Cut 2 (`a6c470a`)**: GC-debt discipline: gcNoteFree/gcCreditTreeMemory
+  += kb; setminordebt после каждого auto-minor (lgc.c:1752) и на переходах
+  generational. **gcAutomaticStep 1.0→0.0/call** (детерминированное
+  callgrind-доказательство); **K5 709→663**, K6 −32; GC-adjacent
+  workloads УЛУЧШИЛИСЬ (temp_table −6.75% ins → **1.076x**, table_alloc
+  **1.225x**); gc/gengc/tracegc/locals byte-identical (пейсинг не сдвинулся).
+
+Гейт: matrix 31/32 zig_fail=0, smoke 79/79, c_api 50+diff, api580,
+TBC 22+23, unit D+RF; geomean 1.40315; baseline=1.40315.
 
 ## История закрытых фаз
 

@@ -43689,12 +43689,12 @@ pub const Vm = struct {
     const builtin_may_refresh_outs: [@typeInfo(BuiltinId).@"enum".fields.len]bool = blk: {
         var t = [_]bool{false} ** @typeInfo(BuiltinId).@"enum".fields.len;
         for ([_]BuiltinId{
-            .tostring, .pcall,          .xpcall,
-            .load,    .loadfile,        .dofile,
-            .require, .pairs,           .collectgarbage,
-            .str_arith_add, .str_arith_sub, .str_arith_mul, .str_arith_mod,
-            .str_arith_pow, .str_arith_div, .str_arith_idiv, .str_arith_unm,
-            .testc_testC,
+            .tostring,       .pcall,         .xpcall,
+            .load,           .loadfile,      .dofile,
+            .require,        .pairs,         .collectgarbage,
+            .str_arith_add,  .str_arith_sub, .str_arith_mul,
+            .str_arith_mod,  .str_arith_pow, .str_arith_div,
+            .str_arith_idiv, .str_arith_unm, .testc_testC,
         }) |rid| t[@intFromEnum(rid)] = true;
         break :blk t;
     };

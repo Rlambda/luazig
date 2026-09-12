@@ -11119,3 +11119,49 @@ A/B). Все артефакты перегенерированы на ОДНОМ
   все asserted идентичны P16.39 Cut 0 (fmt-only delta не меняет layout).
 - **P16.40 queue**: Cut 1 (K4/K5/K6 fine-grained decomposition) —
   следующий шаг.
+
+## P16.40 Cut 1 — fine-grained callpath decomposition (K4/K5/K6)
+
+Artifact: `tools/status/p16.40-callpath-decomposition.md`. Методология
+P16.39 (callgrind --dump-instr 20k/40k slope + addr2line nearest-lower
+fallback; callgrind_annotate запрещён — double-counting). Тот же
+canonical binary pair (zig 6f94c09e62750970 / puc d54bc45e1757b216),
+HEAD 144ab80.
+
+- **Kernel matrix (callgrind, deterministic)**: K4 **395** (0 vs P16.39),
+  K5 **709** (−121, Cut 3), K6 **2028** (−56). Perf: K4 394.98/223.95
+  (1.76x), K5 709.01/250.97 (**2.82x** — worst gap), K6 2013.92/962.02
+  (2.09x). PUC: 224 / 251 / 969.
+- **K4 buckets** (395): H 77, W 73, C0 49, C1 10, C2 23, C3 8, C4 14,
+  C5 20 (call path 124 vs PUC precall 48), R0 66 (gate cascade — 13
+  условий), R1 11, R2 3, R3 21, R6 20 (return path 121 vs poscall ~30).
+- **K5 buckets** (709): H 73, W 67, CALL 29, F0 96, F1 56, F2 7, F3 89,
+  F4 29, S0 14, S1 5, S2 21, S3 10 (nil-fill 38→10 — Cut 3 win),
+  B0 16 (active_builtin ceremony, нет PUC-аналога), B1 38 (marshalling
+  20 vs PUC 61 — zig WIN 2:1), P0 54, P1 7, G 60, SHARED 38.
+  C-frame lifecycle ≈135 vs PUC precallC+poscall 71.
+- **K6 buckets** (2028): W 332, D1 113, D2 71, D6 741, D7 70, D8 63,
+  D9 545, SHARED 93. K5 −121 vs K6 −56 объяснено: все 4 сокращения
+  Cut 3 живут в generic builtin path; K6 resume/yield идёт через
+  co fast path (callCoroutineBuiltinDirect), который обходит callBuiltin
+  целиком — снапшоты/outs-window/nil-fill/C-frame там отсутствуют.
+- **GC guard root cause (§3a)**: gdb-проба на первом K5-вызове:
+  debt=−0.075, count=20.38 < threshold=24.36 → gate проходит КАЖДЫЙ
+  вызов, safepoint sync + no-op gcAutomaticStep entry (48 i) — и ничего
+  не пересчитывает debt. Причина: gcNoteFree декрементирует count, но
+  НЕ debt (наше односторонее отклонение); PUC luaM_realloc_ обновляет
+  GCdebt в обе стороны. Cut 3 "allocation-adjacent GC guard" НЕ достиг
+  цели для no-alloc циклов (D8 55 → G 60, без реального выигрыша).
+- **R-вердикты**: R4.1 shrinkTo 7–8 i/pop confirmed; R4.2 callstatus=0
+  1 i; R4.3 cur_upvalues load chain 7 i/return confirmed (objdump
+  0x10d319e–0x10d31bc, addr2line misattr на 17416); R4.4 guard cascade
+  25 i vs PUC fast path; R5 active_builtin 16 i confirmed; R6 memset
+  RESOLVED (38→10).
+- **Cut 2 decision (ranked)**: (1) **GC-debt discipline** — ВЫБРАН:
+  gcNoteFree/gcCreditTreeMemory обновляют gc_step_debt_kb (+kb),
+  восстанавливая PUC luaM_realloc_ GCdebt accounting и инвариант
+  debt≤0 ⟺ due; ожидание K5 −41 (→~668, 2.66x), K6 −41 (→~1987);
+  rejection rules preregistered (matrix/smoke/api580, geomean >+1%,
+  gc-suites, callgrind gate early-out ≥30). (2) C-frame lifecycle
+  (135 vs 71) — после GC-debt. (3) upvalues cache в CallFrame (−7).
+  (4) R0 gate cascade (K4, smallest gap 171).

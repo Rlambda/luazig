@@ -1,20 +1,20 @@
 {
-  "created_utc": "2026-09-11T20:19:54.657251+00:00",
+  "created_utc": "2026-09-12T09:20:35.375501+00:00",
   "task": "P16.10 dispatch floor measurement + lowering analysis + historical component deltas",
-  "head": "862bec7",
+  "head": "144ab80",
   "zig_version": "0.16.0",
   "binary_identity": {
     "zig": {
       "path": "/home/boss/codes/luazig/zig-out/bin/luazig",
-      "sha256": "c134caa825828c375e0c65d5a9dda663eb53248326d121bea9d6551f00b57c3c",
-      "size_bytes": 15263464,
-      "mtime_unix": 1789157657.923628
+      "sha256": "6f94c09e627509708c776c89945ef3ec656d978a006ea57665a884981a58f6db",
+      "size_bytes": 15284048,
+      "mtime_unix": 1789204401.1729314
     },
     "puc": {
       "path": "/home/boss/codes/luazig/build/lua-c/lua",
       "sha256": "d54bc45e1757b216eaa8a273511fc9fcd2670e97ca85dfe9781daf71437a91f2",
       "size_bytes": 341000,
-      "mtime_unix": 1789157124.6804812
+      "mtime_unix": 1789204701.3801734
     }
   },
   "cpu_info": {
@@ -32,271 +32,272 @@
   "part1_steady_state": {
     "workload": "for i = 1, n do end (empty body)",
     "zig": {
-      "instructions_per_iter": 61.018619336,
-      "instructions_2n": 61010653983,
-      "instructions_n": 30501344315,
-      "cycles_per_iter": 12.151496454,
-      "cycles_2n": 12104909207,
-      "cycles_n": 6029160980,
-      "branches_per_iter": 7.002101434,
-      "branches_2n": 7001292095,
-      "branches_n": 3500241378,
-      "branch-misses_per_iter": -5.926e-06,
-      "branch-misses_2n": 10261,
-      "branch-misses_n": 13224,
-      "cache-misses_per_iter": 1.0602e-05,
-      "cache-misses_2n": 22352,
-      "cache-misses_n": 17051,
-      "cache-references_per_iter": 2.4562e-05,
-      "cache-references_2n": 44465,
-      "cache-references_n": 32184,
-      "ipc": 5.0214901158049585,
-      "cpi": 0.19914407415689941,
-      "branch_miss_ratio": -8.463173599892754e-07,
-      "cache_miss_ratio": 0.43164237439947883,
-      "wall_per_iter_ns": 3.206984
+      "instructions_per_iter": 60.998767096,
+      "instructions_2n": 61010705365,
+      "instructions_n": 30511321817,
+      "cycles_per_iter": 12.351441004,
+      "cycles_2n": 12153447814,
+      "cycles_n": 5977727312,
+      "branches_per_iter": 6.999861626,
+      "branches_2n": 7001298078,
+      "branches_n": 3501367265,
+      "branch-misses_per_iter": 4.28e-07,
+      "branch-misses_2n": 10191,
+      "branch-misses_n": 9977,
+      "cache-misses_per_iter": 2.1418e-05,
+      "cache-misses_2n": 28092,
+      "cache-misses_n": 17383,
+      "cache-references_per_iter": 4.2724e-05,
+      "cache-references_2n": 50550,
+      "cache-references_n": 29188,
+      "ipc": 4.938595187091581,
+      "cpi": 0.20248673197871808,
+      "branch_miss_ratio": 6.114406582128057e-08,
+      "cache_miss_ratio": 0.5013107386948787,
+      "wall_per_iter_ns": 3.1132760000000004
     },
     "puc": {
-      "instructions_per_iter": 28.00029707,
-      "instructions_2n": 28005538860,
-      "instructions_n": 14005390325,
-      "cycles_per_iter": 10.3466212,
-      "cycles_2n": 10362720242,
-      "cycles_n": 5189409642,
-      "branches_per_iter": 5.000055534,
-      "branches_2n": 5001005839,
-      "branches_n": 2500978072,
-      "branch-misses_per_iter": 1.66e-07,
-      "branch-misses_2n": 7542,
-      "branch-misses_n": 7459,
-      "cache-misses_per_iter": 1.014e-06,
-      "cache-misses_2n": 12168,
-      "cache-misses_n": 11661,
-      "cache-references_per_iter": -1.458e-06,
-      "cache-references_2n": 20063,
-      "cache-references_n": 20792,
-      "ipc": 2.7062261707232502,
-      "cpi": 0.3695182652574621,
-      "branch_miss_ratio": 3.319963125833554e-08,
-      "wall_per_iter_ns": 2.7387899999999994
+      "instructions_per_iter": 28.001287652,
+      "instructions_2n": 28005967905,
+      "instructions_n": 14005324079,
+      "cycles_per_iter": 10.389683098,
+      "cycles_2n": 10376231317,
+      "cycles_n": 5181389768,
+      "branches_per_iter": 5.000227166,
+      "branches_2n": 5001082468,
+      "branches_n": 2500968885,
+      "branch-misses_per_iter": -1.8e-07,
+      "branch-misses_2n": 7448,
+      "branch-misses_n": 7538,
+      "cache-misses_per_iter": 7.73e-06,
+      "cache-misses_2n": 15337,
+      "cache-misses_n": 11472,
+      "cache-references_per_iter": 1.0858e-05,
+      "cache-references_2n": 25162,
+      "cache-references_n": 19733,
+      "ipc": 2.6951050756678234,
+      "cpi": 0.3710430472742176,
+      "branch_miss_ratio": -3.599836447910695e-08,
+      "cache_miss_ratio": 0.7119174801989318,
+      "wall_per_iter_ns": 2.7384579999999996
     },
     "ratio_instr": 2.18,
-    "ratio_cycles": 1.17,
+    "ratio_cycles": 1.19,
     "zig_raw_n": {
       "counters_median": {
-        "instructions": 30501344315,
-        "cycles": 6029160980,
-        "branches": 3500241378,
-        "branch-misses": 13224,
-        "cache-misses": 17051,
-        "cache-references": 32184
+        "instructions": 30511321817,
+        "cycles": 5977727312,
+        "branches": 3501367265,
+        "branch-misses": 9977,
+        "cache-misses": 17383,
+        "cache-references": 29188
       },
-      "wall_median_s": 1.588516,
+      "wall_median_s": 1.591454,
       "all_runs": [
         {
-          "instructions": 30501344010,
-          "cycles": 6019410347,
-          "branches": 3500241378,
-          "branch-misses": 13471,
-          "cache-misses": 17051,
-          "cache-references": 33048
+          "instructions": 30501339491,
+          "cycles": 6133795262,
+          "branches": 3500240623,
+          "branch-misses": 13631,
+          "cache-misses": 25809,
+          "cache-references": 46222
         },
         {
-          "instructions": 30501344315,
-          "cycles": 6029160980,
-          "branches": 3500241344,
-          "branch-misses": 13224,
-          "cache-misses": 15397,
-          "cache-references": 31132
+          "instructions": 30512542891,
+          "cycles": 5903168836,
+          "branches": 3501507294,
+          "branch-misses": 9977,
+          "cache-misses": 15979,
+          "cache-references": 27788
         },
         {
-          "instructions": 30510553974,
-          "cycles": 6052902367,
-          "branches": 3501279349,
-          "branch-misses": 10088,
-          "cache-misses": 17334,
-          "cache-references": 32184
+          "instructions": 30511321817,
+          "cycles": 5977727312,
+          "branches": 3501367265,
+          "branch-misses": 9938,
+          "cache-misses": 17383,
+          "cache-references": 29188
         },
         {
-          "instructions": 30501343144,
-          "cycles": 6051629885,
-          "branches": 3500241114,
-          "branch-misses": 13242,
-          "cache-misses": 18768,
-          "cache-references": 37395
+          "instructions": 30509618624,
+          "cycles": 6025235040,
+          "branches": 3501171968,
+          "branch-misses": 10134,
+          "cache-misses": 20667,
+          "cache-references": 35814
         },
         {
-          "instructions": 30509455766,
-          "cycles": 6009601618,
-          "branches": 3501152934,
-          "branch-misses": 9840,
-          "cache-misses": 14594,
-          "cache-references": 23658
+          "instructions": 30511496829,
+          "cycles": 5943963109,
+          "branches": 3501387384,
+          "branch-misses": 9877,
+          "cache-misses": 15921,
+          "cache-references": 28556
         }
       ]
     },
     "zig_raw_2n": {
       "counters_median": {
-        "instructions": 61010653983,
-        "cycles": 12104909207,
-        "branches": 7001292095,
-        "branch-misses": 10261,
-        "cache-misses": 22352,
-        "cache-references": 44465
+        "instructions": 61010705365,
+        "cycles": 12153447814,
+        "branches": 7001298078,
+        "branch-misses": 10191,
+        "cache-misses": 28092,
+        "cache-references": 50550
       },
-      "wall_median_s": 3.192008,
+      "wall_median_s": 3.148092,
       "all_runs": [
         {
-          "instructions": 61017426203,
-          "cycles": 12040124769,
-          "branches": 7002069002,
-          "branch-misses": 10107,
-          "cache-misses": 22352,
-          "cache-references": 38331
+          "instructions": 61012781562,
+          "cycles": 12397947778,
+          "branches": 7001536333,
+          "branch-misses": 10191,
+          "cache-misses": 32428,
+          "cache-references": 57383
         },
         {
-          "instructions": 61011005942,
-          "cycles": 12083995408,
-          "branches": 7001332722,
-          "branch-misses": 10206,
-          "cache-misses": 21063,
-          "cache-references": 35619
+          "instructions": 61001341724,
+          "cycles": 12179512198,
+          "branches": 7000242345,
+          "branch-misses": 12994,
+          "cache-misses": 30169,
+          "cache-references": 55720
         },
         {
-          "instructions": 61001344212,
-          "cycles": 12104909207,
-          "branches": 7000242763,
-          "branch-misses": 13217,
-          "cache-misses": 22343,
-          "cache-references": 44465
+          "instructions": 61010705365,
+          "cycles": 11978090016,
+          "branches": 7001298078,
+          "branch-misses": 10169,
+          "cache-misses": 25414,
+          "cache-references": 45622
         },
         {
-          "instructions": 61001345203,
-          "cycles": 12181975026,
-          "branches": 7000242891,
-          "branch-misses": 13224,
-          "cache-misses": 26855,
-          "cache-references": 51202
+          "instructions": 61009473009,
+          "cycles": 11868104460,
+          "branches": 7001161655,
+          "branch-misses": 10879,
+          "cache-misses": 23560,
+          "cache-references": 42608
         },
         {
-          "instructions": 61010653983,
-          "cycles": 12298255828,
-          "branches": 7001292095,
-          "branch-misses": 10261,
-          "cache-misses": 28426,
-          "cache-references": 54618
+          "instructions": 61010953411,
+          "cycles": 12153447814,
+          "branches": 7001326359,
+          "branch-misses": 9943,
+          "cache-misses": 28092,
+          "cache-references": 50550
         }
       ]
     },
     "puc_raw_n": {
       "counters_median": {
-        "instructions": 14005390325,
-        "cycles": 5189409642,
-        "branches": 2500978072,
-        "branch-misses": 7459,
-        "cache-misses": 11661,
-        "cache-references": 20792
+        "instructions": 14005324079,
+        "cycles": 5181389768,
+        "branches": 2500968885,
+        "branch-misses": 7538,
+        "cache-misses": 11472,
+        "cache-references": 19733
       },
-      "wall_median_s": 1.366977,
+      "wall_median_s": 1.36721,
       "all_runs": [
         {
-          "instructions": 14006742933,
-          "cycles": 5191890511,
-          "branches": 2501219697,
-          "branch-misses": 7459,
-          "cache-misses": 14657,
-          "cache-references": 22366
+          "instructions": 14007539907,
+          "cycles": 5208651545,
+          "branches": 2501362057,
+          "branch-misses": 7626,
+          "cache-misses": 18140,
+          "cache-references": 32867
         },
         {
-          "instructions": 14005390325,
-          "cycles": 5189400477,
-          "branches": 2500978072,
-          "branch-misses": 7356,
-          "cache-misses": 11661,
-          "cache-references": 20428
+          "instructions": 14006024606,
+          "cycles": 5181447754,
+          "branches": 2501091386,
+          "branch-misses": 7436,
+          "cache-misses": 10113,
+          "cache-references": 17400
         },
         {
-          "instructions": 14005470574,
-          "cycles": 5186700331,
-          "branches": 2500992482,
-          "branch-misses": 7478,
-          "cache-misses": 10827,
-          "cache-references": 19975
+          "instructions": 14005108257,
+          "cycles": 5179881626,
+          "branches": 2500927732,
+          "branch-misses": 7394,
+          "cache-misses": 10956,
+          "cache-references": 19733
         },
         {
-          "instructions": 14005096667,
-          "cycles": 5189409642,
-          "branches": 2500925699,
-          "branch-misses": 7678,
-          "cache-misses": 12481,
-          "cache-references": 20897
+          "instructions": 14005207793,
+          "cycles": 5179778815,
+          "branches": 2500945486,
+          "branch-misses": 7538,
+          "cache-misses": 11472,
+          "cache-references": 18241
         },
         {
-          "instructions": 14004800390,
-          "cycles": 5190017030,
-          "branches": 2500872729,
-          "branch-misses": 7358,
-          "cache-misses": 9172,
-          "cache-references": 20792
+          "instructions": 14005324079,
+          "cycles": 5181389768,
+          "branches": 2500968885,
+          "branch-misses": 7769,
+          "cache-misses": 14204,
+          "cache-references": 20410
         }
       ]
     },
     "puc_raw_2n": {
       "counters_median": {
-        "instructions": 28005538860,
-        "cycles": 10362720242,
-        "branches": 5001005839,
-        "branch-misses": 7542,
-        "cache-misses": 12168,
-        "cache-references": 20063
+        "instructions": 28005967905,
+        "cycles": 10376231317,
+        "branches": 5001082468,
+        "branch-misses": 7448,
+        "cache-misses": 15337,
+        "cache-references": 25162
       },
-      "wall_median_s": 2.736372,
+      "wall_median_s": 2.736439,
       "all_runs": [
         {
-          "instructions": 28005846202,
-          "cycles": 10362720242,
-          "branches": 5001060793,
-          "branch-misses": 7512,
-          "cache-misses": 12111,
-          "cache-references": 20063
+          "instructions": 28008918208,
+          "cycles": 10362868677,
+          "branches": 5001609208,
+          "branch-misses": 7358,
+          "cache-misses": 13085,
+          "cache-references": 19822
         },
         {
-          "instructions": 28005854840,
-          "cycles": 10374712784,
-          "branches": 5001062159,
-          "branch-misses": 7330,
-          "cache-misses": 15027,
-          "cache-references": 28980
+          "instructions": 28000743076,
+          "cycles": 10363729482,
+          "branches": 5000155693,
+          "branch-misses": 10295,
+          "cache-misses": 14376,
+          "cache-references": 28554
         },
         {
-          "instructions": 28005538860,
-          "cycles": 10363653626,
-          "branches": 5001005839,
-          "branch-misses": 7611,
-          "cache-misses": 12168,
-          "cache-references": 21600
+          "instructions": 28005554694,
+          "cycles": 10376231317,
+          "branches": 5001008593,
+          "branch-misses": 7554,
+          "cache-misses": 18031,
+          "cache-references": 29952
         },
         {
-          "instructions": 28005490081,
-          "cycles": 10358975866,
-          "branches": 5000997071,
-          "branch-misses": 7542,
-          "cache-misses": 11789,
-          "cache-references": 19841
+          "instructions": 28005967905,
+          "cycles": 10385388977,
+          "branches": 5001082468,
+          "branch-misses": 7448,
+          "cache-misses": 15337,
+          "cache-references": 22917
         },
         {
-          "instructions": 28005055925,
-          "cycles": 10361325919,
-          "branches": 5000919522,
-          "branch-misses": 7581,
-          "cache-misses": 14969,
-          "cache-references": 19722
+          "instructions": 28005973162,
+          "cycles": 10376794277,
+          "branches": 5001083296,
+          "branch-misses": 7380,
+          "cache-misses": 17972,
+          "cache-references": 25162
         }
       ]
     }
   },
   "bytecode": {
-    "puc_luac_l": "main </tmp/dispatch_floor/forloop_only.lua:0,0> (31 instructions at 0x558b795a4a80)\n0+ params, 7 slots, 1 upvalue, 5 locals, 10 constants, 0 functions\n\t1\t[1]\tVARARGPREP\t0\n\t2\t[1]\tGETTABUP \t0 0 0\t; _ENV \"tonumber\"\n\t3\t[1]\tGETTABUP \t1 0 1\t; _ENV \"arg\"\n\t4\t[1]\tGETI     \t1 1 1\n\t5\t[1]\tCALL     \t0 2 2\t; 1 in 1 out\n\t6\t[1]\tTEST     \t0 1\n\t7\t[1]\tJMP      \t1\t; to 9\n\t8\t[1]\tLOADK    \t0 2\t; 1000000000.0\n\t9\t[1]\tGETTABUP \t1 0 3\t; _ENV \"os\"\n\t10\t[1]\tGETFIELD \t1 1 4\t; \"clock\"\n\t11\t[1]\tCALL     \t1 1 2\t; 0 in 1 out\n\t12\t[1]\tLOADI    \t2 1\n\t13\t[1]\tMOVE     \t3 0\n\t14\t[1]\tLOADI    \t4 1\n\t15\t[1]\tFORPREP  \t2 0\t; exit to 17\n\t16\t[1]\tFORLOOP  \t2 1\t; to 16\n\t17\t[1]\tGETTABUP \t2 0 5\t; _ENV \"io\"\n\t18\t[1]\tGETFIELD \t2 2 6\t; \"write\"\n\t19\t[1]\tGETTABUP \t3 0 7\t; _ENV \"string\"\n\t20\t[1]\tGETFIELD \t3 3 8\t; \"format\"\n\t21\t[1]\tLOADK    \t4 9\t; \"forloop_only\\t%.6f\\t%d\\n\"\n\t22\t[1]\tGETTABUP \t5 0 3\t; _ENV \"os\"\n\t23\t[1]\tGETFIELD \t5 5 4\t; \"clock\"\n\t24\t[1]\tCALL     \t5 1 2\t; 0 in 1 out\n\t25\t[1]\tSUB      \t5 5 1\n\t26\t[1]\tMMBIN    \t5 1 7\t; __sub\n\t27\t[1]\tMOVE     \t6 0\n\t28\t[1]\tCALL     \t3 4 0\t; 3 in all out\n\t29\t[1]\tCALL     \t2 0 1\t; all in 0 out\n\t30\t[1]\tRETURN   \t0 2 1\t; 1 out\n\t31\t[1]\tRETURN   \t2 1 1\t; 0 out",
+    "puc_luac_l": "main </tmp/dispatch_floor/forloop_only.lua:0,0> (31 instructions at 0x56231a806a80)\n0+ params, 7 slots, 1 upvalue, 5 locals, 10 constants, 0 functions\n\t1\t[1]\tVARARGPREP\t0\n\t2\t[1]\tGETTABUP \t0 0 0\t; _ENV \"tonumber\"\n\t3\t[1]\tGETTABUP \t1 0 1\t; _ENV \"arg\"\n\t4\t[1]\tGETI     \t1 1 1\n\t5\t[1]\tCALL     \t0 2 2\t; 1 in 1 out\n\t6\t[1]\tTEST     \t0 1\n\t7\t[1]\tJMP      \t1\t; to 9\n\t8\t[1]\tLOADK    \t0 2\t; 1000000000.0\n\t9\t[1]\tGETTABUP \t1 0 3\t; _ENV \"os\"\n\t10\t[1]\tGETFIELD \t1 1 4\t; \"clock\"\n\t11\t[1]\tCALL     \t1 1 2\t; 0 in 1 out\n\t12\t[1]\tLOADI    \t2 1\n\t13\t[1]\tMOVE     \t3 0\n\t14\t[1]\tLOADI    \t4 1\n\t15\t[1]\tFORPREP  \t2 0\t; exit to 17\n\t16\t[1]\tFORLOOP  \t2 1\t; to 16\n\t17\t[1]\tGETTABUP \t2 0 5\t; _ENV \"io\"\n\t18\t[1]\tGETFIELD \t2 2 6\t; \"write\"\n\t19\t[1]\tGETTABUP \t3 0 7\t; _ENV \"string\"\n\t20\t[1]\tGETFIELD \t3 3 8\t; \"format\"\n\t21\t[1]\tLOADK    \t4 9\t; \"forloop_only\\t%.6f\\t%d\\n\"\n\t22\t[1]\tGETTABUP \t5 0 3\t; _ENV \"os\"\n\t23\t[1]\tGETFIELD \t5 5 4\t; \"clock\"\n\t24\t[1]\tCALL     \t5 1 2\t; 0 in 1 out\n\t25\t[1]\tSUB      \t5 5 1\n\t26\t[1]\tMMBIN    \t5 1 7\t; __sub\n\t27\t[1]\tMOVE     \t6 0\n\t28\t[1]\tCALL     \t3 4 0\t; 3 in all out\n\t29\t[1]\tCALL     \t2 0 1\t; all in 0 out\n\t30\t[1]\tRETURN   \t0 2 1\t; 1 out\n\t31\t[1]\tRETURN   \t2 1 1\t; 0 out",
     "zig_dump_bytecode": "main <@/tmp/dispatch_floor/forloop_only.lua:0,0> (31 instructions)\n        0+ params, 7 slots, 1 upvalue, 5 locals, 10 constants, 0 functions\n        \t1\t[0]\tVARARGPREP\t0\n        \t2\t[1]\tGETTABUP\t0\t0\t0\t; \"tonumber\"\n        \t3\t[1]\tGETTABUP\t1\t0\t1\t; \"arg\"\n        \t4\t[1]\tGETI\t1\t1\t1\n        \t5\t[1]\tCALL\t0\t2\t2\t; 1 out\n        \t6\t[1]\tTEST\t0\t0\t1\n        \t7\t[1]\tJMP\t; to 8\n        \t8\t[1]\tLOADK\t0\t2\t; 1000000000\n        \t9\t[1]\tGETTABUP\t1\t0\t3\t; \"os\"\n        \t10\t[1]\tGETFIELD\t1\t1\t4\t; \"clock\"\n        \t11\t[1]\tCALL\t1\t1\t2\t; 1 out\n        \t12\t[1]\tLOADI\t2\t1\n        \t13\t[1]\tMOVE\t3\n        \t14\t[1]\tLOADI\t4\t1\n        \t15\t[1]\tFORPREP\t2\t; to 16\n        \t16\t[1]\tFORLOOP\t2\t; to 15\n        \t17\t[1]\tGETTABUP\t2\t0\t5\t; \"io\"\n        \t18\t[1]\tGETFIELD\t2\t2\t6\t; \"write\"\n        \t19\t[1]\tGETTABUP\t3\t0\t7\t; \"string\"\n        \t20\t[1]\tGETFIELD\t3\t3\t8\t; \"format\"\n        \t21\t[1]\tLOADK\t4\t9\t; \"forloop_only\t%.6f\t%d\n\"\n        \t22\t[1]\tGETTABUP\t5\t0\t3\t; \"os\"\n        \t23\t[1]\tGETFIELD\t5\t5\t4\t; \"clock\"\n        \t24\t[1]\tCALL\t5\t1\t2\t; 1 out\n        \t25\t[1]\tSUB\t5\t5\t1\n        \t26\t[1]\tMMBIN\t5\t1\t7\n        \t27\t[1]\tMOVE\t6\n        \t28\t[1]\tCALL\t3\t4\t0\t; multret\n        \t29\t[1]\tCALL\t2\t0\t1\t; 0 out\n        \t30\t[1]\tRETURN\t0\t2\t1\t; 1 out\n        \t31\t[1]\tRETURN\t0\t1\t1\t; 0 out\nconstants (10) for @/tmp/dispatch_floor/forloop_only.lua:\n        \t0\t\"tonumber\"\n        \t1\t\"arg\"\n        \t2\t1000000000\n        \t3\t\"os\"\n        \t4\t\"clock\"\n        \t5\t\"io\"\n        \t6\t\"write\"\n        \t7\t\"string\"\n        \t8\t\"format\"\n        \t9\t\"forloop_only\t%.6f\t%d\n\"\nlocals (5) for @/tmp/dispatch_floor/forloop_only.lua:\n        \t0\tn\t8\t30\n        \t1\ts\t11\t30\n        \t2\t(for state)\t14\t16\n        \t3\t(for state)\t14\t16\n        \t5\ti\t15\t15\nupvalues (1) for @/tmp/dispatch_floor/forloop_only.lua:\n        \t0\t_ENV\tupvalue\t0",
     "puc_steady_state_ops": [
       "15\t[1]\tFORPREP  \t2 0\t; exit to 17",
@@ -311,15 +312,15 @@
   "part2_lowering_analysis": {
     "binary_identity": {
       "path": "/home/boss/codes/luazig/zig-out/bin/luazig",
-      "sha256": "c134caa825828c375e0c65d5a9dda663eb53248326d121bea9d6551f00b57c3c",
-      "size_bytes": 15263464,
-      "mtime_unix": 1789157657.923628
+      "sha256": "6f94c09e627509708c776c89945ef3ec656d978a006ea57665a884981a58f6db",
+      "size_bytes": 15284048,
+      "mtime_unix": 1789204401.1729314
     },
     "binary": "/home/boss/codes/luazig/zig-out/bin/luazig",
     "symbol": {
       "symbol": "vm.Vm.runBytecodeDispatch",
-      "addr": 17579152,
-      "addr_hex": "00000000010c3c90"
+      "addr": 17580016,
+      "addr_hex": "00000000010c3ff0"
     },
     "cpu_target": {
       "model": "13th Gen Intel(R) Core(TM) i7-13700H",
@@ -336,20 +337,20 @@
       "distinct_dispatch_sites": 68,
       "dispatch_site_excerpts": [
         {
-          "table_ref_line": "10c4096:\tlea    -0xb7bfd(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>",
-          "context": " 10c4090:\tmovzbl %bl,%eax\n 10c4093:\tand    $0x7f,%eax\n 10c4096:\tlea    -0xb7bfd(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>\n 10c409d:\tmovslq (%rcx,%rax,4),%rax\n 10c40a1:\tadd    %rcx,%rax\n 10c40a4:\tjmp    *%rax\n 10c40a6:\tmov    -0x90(%rbp),%rax\n 10c40ad:\tmov    %ebx,%ecx\n 10c40af:\tshr    $0x3,%ecx\n 10c40b2:\tand    $0xff0,%ecx"
+          "table_ref_line": "10c4406:\tlea    -0xb7f6d(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>",
+          "context": " 10c4400:\tmovzbl %bl,%eax\n 10c4403:\tand    $0x7f,%eax\n 10c4406:\tlea    -0xb7f6d(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>\n 10c440d:\tmovslq (%rcx,%rax,4),%rax\n 10c4411:\tadd    %rcx,%rax\n 10c4414:\tjmp    *%rax\n 10c4416:\tmov    -0x98(%rbp),%rax\n 10c441d:\tmov    %ebx,%ecx\n 10c441f:\tshr    $0x3,%ecx\n 10c4422:\tand    $0xff0,%ecx"
         },
         {
-          "table_ref_line": "10c41b8:\tlea    -0xb7d1f(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>",
-          "context": " 10c41b2:\tmovzbl %bl,%eax\n 10c41b5:\tand    $0x7f,%eax\n 10c41b8:\tlea    -0xb7d1f(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>\n 10c41bf:\tmovslq (%rcx,%rax,4),%rax\n 10c41c3:\tadd    %rcx,%rax\n 10c41c6:\tjmp    *%rax\n 10c41c8:\tmov    0x38(%r14),%rax\n 10c41cc:\tlea    -0x1(%rax),%rdx\n 10c41d0:\tmov    %rdx,0x38(%r14)\n 10c41d4:\tcmp    $0x1,%rax"
+          "table_ref_line": "10c452b:\tlea    -0xb8092(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>",
+          "context": " 10c4525:\tmovzbl %bl,%eax\n 10c4528:\tand    $0x7f,%eax\n 10c452b:\tlea    -0xb8092(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>\n 10c4532:\tmovslq (%rcx,%rax,4),%rax\n 10c4536:\tadd    %rcx,%rax\n 10c4539:\tjmp    *%rax\n 10c453b:\tmov    0x38(%r14),%rax\n 10c453f:\tlea    -0x1(%rax),%rdx\n 10c4543:\tmov    %rdx,0x38(%r14)\n 10c4547:\tcmp    $0x1,%rax"
         },
         {
-          "table_ref_line": "10c42cc:\tlea    -0xb7e33(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>",
-          "context": " 10c42c6:\tmovzbl %bl,%eax\n 10c42c9:\tand    $0x7f,%eax\n 10c42cc:\tlea    -0xb7e33(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>\n 10c42d3:\tmovslq (%rcx,%rax,4),%rax\n 10c42d7:\tadd    %rcx,%rax\n 10c42da:\tjmp    *%rax\n 10c42dc:\tmov    0x38(%r15),%esi\n 10c42e0:\tcmp    %rsi,%rdx\n 10c42e3:\tsete   %sil\n 10c42e7:\tcmp    $0x1f,%rcx"
+          "table_ref_line": "10c4642:\tlea    -0xb81a9(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>",
+          "context": " 10c463c:\tmovzbl %bl,%eax\n 10c463f:\tand    $0x7f,%eax\n 10c4642:\tlea    -0xb81a9(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>\n 10c4649:\tmovslq (%rcx,%rax,4),%rax\n 10c464d:\tadd    %rcx,%rax\n 10c4650:\tjmp    *%rax\n 10c4652:\tmov    0x38(%r15),%esi\n 10c4656:\tcmp    %rsi,%rdx\n 10c4659:\tsete   %sil\n 10c465d:\tcmp    $0x1f,%rcx"
         },
         {
-          "table_ref_line": "10c4350:\tlea    -0xb7eb7(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>",
-          "context": " 10c434a:\tmovzbl %bl,%eax\n 10c434d:\tand    $0x7f,%eax\n 10c4350:\tlea    -0xb7eb7(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>\n 10c4357:\tmovslq (%rcx,%rax,4),%rax\n 10c435b:\tadd    %rcx,%rax\n 10c435e:\tjmp    *%rax\n 10c4360:\tmov    -0xb0(%rbp),%rax\n 10c4367:\tmov    -0x90(%rbp),%rcx\n 10c436e:\tmov    %ebx,%edx\n 10c4370:\tshr    $0x3,%edx"
+          "table_ref_line": "10c46c9:\tlea    -0xb8230(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>",
+          "context": " 10c46c3:\tmovzbl %bl,%eax\n 10c46c6:\tand    $0x7f,%eax\n 10c46c9:\tlea    -0xb8230(%rip),%rcx        # 100c4a0 <__anon_24517+0x80e8>\n 10c46d0:\tmovslq (%rcx,%rax,4),%rax\n 10c46d4:\tadd    %rcx,%rax\n 10c46d7:\tjmp    *%rax\n 10c46d9:\tmov    -0xb8(%rbp),%rax\n 10c46e0:\tmov    -0x98(%rbp),%rcx\n 10c46e7:\tmov    %ebx,%edx\n 10c46e9:\tshr    $0x3,%edx"
         }
       ],
       "has_jump_table": true,
@@ -378,13 +379,13 @@
     "forloop_handler_path": {
       "forloop_opcode": 73,
       "jump_table_entry_addr": "0x100c5c4",
-      "handler_addr": "0x10c495d",
-      "handler_excerpt": " 10c495d:\tmov    %ebx,%eax\n 10c495f:\tshr    $0x7,%eax\n 10c4962:\tlea    0x1(%rax),%ecx\n 10c4965:\tmovzbl %cl,%esi\n 10c4968:\tmov    -0x90(%rbp),%rcx\n 10c496f:\tmov    %esi,%edx\n 10c4971:\tshl    $0x4,%edx\n 10c4974:\tmovzbl 0x8(%rcx,%rdx,1),%edi\n 10c4979:\tand    $0xf,%dil\n 10c497d:\tmov    %ebx,%edx\n 10c497f:\tshr    $0x3,%edx\n 10c4982:\tand    $0xff0,%edx\n 10c4988:\tadd    %rcx,%rdx\n 10c498b:\tcmp    $0x2,%dil\n 10c498f:\tjne    10c6f57 <vm.Vm.runBytecodeDispatch+0x32c7>\n 10c4995:\tmov    (%rdx),%rdi\n 10c4998:\ttest   %rdi,%rdi\n 10c499b:\tje     10c3f65 <vm.Vm.runBytecodeDispatch+0x2d5>\n 10c49a1:\tshl    $0x4,%esi\n 10c49a4:\tlea    0x2(%rax),%r8d",
+      "handler_addr": "0x10c4ceb",
+      "handler_excerpt": " 10c4ceb:\tmov    %ebx,%eax\n 10c4ced:\tshr    $0x7,%eax\n 10c4cf0:\tlea    0x1(%rax),%ecx\n 10c4cf3:\tmovzbl %cl,%esi\n 10c4cf6:\tmov    -0x98(%rbp),%rcx\n 10c4cfd:\tmov    %esi,%edx\n 10c4cff:\tshl    $0x4,%edx\n 10c4d02:\tmovzbl 0x8(%rcx,%rdx,1),%edi\n 10c4d07:\tand    $0xf,%dil\n 10c4d0b:\tmov    %ebx,%edx\n 10c4d0d:\tshr    $0x3,%edx\n 10c4d10:\tand    $0xff0,%edx\n 10c4d16:\tadd    %rcx,%rdx\n 10c4d19:\tcmp    $0x2,%dil\n 10c4d1d:\tjne    10c7334 <vm.Vm.runBytecodeDispatch+0x3344>\n 10c4d23:\tmov    (%rdx),%rdi\n 10c4d26:\ttest   %rdi,%rdi\n 10c4d29:\tje     10c42c8 <vm.Vm.runBytecodeDispatch+0x2d8>\n 10c4d2f:\tshl    $0x4,%esi\n 10c4d32:\tlea    0x2(%rax),%r8d",
       "exit_jumps": [
-        "10c49eb:\tjmp    10c6fbd <vm.Vm.runBytecodeDispatch+0x332d>"
+        "10c4d79:\tjmp    10c739a <vm.Vm.runBytecodeDispatch+0x33aa>"
       ],
       "shared_tail": null,
-      "path_summary": "FORLOOP handler at 0x10c495d computes new pc (pc + offset), then jumps to the shared tail which does inc pc (the +1), cmp pc < code.len, jb back to dispatch top. The dispatch top (0x10bdbf0) does the stack_ptr check, loads the instruction, checks stats/dispatch_pc/sigint/hooks, then jumps via the main jump table. In steady state, only ONE dispatch site (the first, at the jump table jmp *%rax) is reached per iteration."
+      "path_summary": "FORLOOP handler at 0x10c4ceb computes new pc (pc + offset), then jumps to the shared tail which does inc pc (the +1), cmp pc < code.len, jb back to dispatch top. The dispatch top (0x10bdbf0) does the stack_ptr check, loads the instruction, checks stats/dispatch_pc/sigint/hooks, then jumps via the main jump table. In steady state, only ONE dispatch site (the first, at the jump table jmp *%rax) is reached per iteration."
     },
     "computed_goto_framing": {
       "single_dispatch_site": false,

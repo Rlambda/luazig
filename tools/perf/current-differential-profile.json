@@ -1,10 +1,11 @@
 {
- "created_utc": "2026-09-13T11:38:26.222768+00:00",
+ "created_utc": "2026-09-13T16:24:56.791705+00:00",
  "provenance": {
-  "git_head": "b59cb74",
-  "measured_source_head": "b59cb74",
-  "source_dirty": "clean",
-  "note": "P16.43 final regeneration"
+  "git_head": "8641a34",
+  "measured_source_head": "8641a34",
+  "source_dirty": "artifact_dirty only (this regeneration); src/ clean pre-commit",
+  "zig_binary_sha256": "071ffa77f160646ef345902121cfb36849749098bf800636c389ca8c1270d9ae",
+  "note": "P16.45 FINAL regeneration (pub-markers build)"
  },
  "mode": "perf record -g instructions:u core0 top-15",
  "workloads": {
@@ -12,72 +13,68 @@
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 99.92
+     "percent": 99.72
     }
    ],
-   "source_head": "b59cb74"
+   "source_head": "8641a34"
   },
   "metamethod_call_noalloc": {
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 64.46
+     "percent": 60.88
     }
    ],
-   "source_head": "b59cb74"
+   "source_head": "8641a34"
   },
   "metamethod_add": {
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 41.8
+     "percent": 45.49
     }
    ],
-   "source_head": "b59cb74"
+   "source_head": "8641a34"
   },
   "coroutine_yield": {
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 60.05
+     "percent": 58.49
     }
    ],
-   "source_head": "b59cb74"
+   "source_head": "8641a34"
   },
   "hash_access": {
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 99.51
+     "percent": 99.53
     }
    ],
-   "source_head": "b59cb74"
+   "source_head": "8641a34"
   },
   "field_access": {
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 99.59
+     "percent": 99.66
     }
    ],
-   "source_head": "b59cb74"
+   "source_head": "8641a34"
   },
   "branch_loop": {
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 99.92
+     "percent": 99.96
     },
     {
-     "symbol": "ltable.nodeInsert",
-     "percent": 0.07
+     "symbol": "vm.Vm.gcPropagateOne",
+     "percent": 0.03
     },
     {
-     "symbol": "bytecode.ProtoBuilder.internString",
-     "percent": 0.0
-    },
-    {
-     "symbol": "codegen_bc.Codegen.compileChildFunction",
+     "symbol": "heap.SmpAllocator.free",
      "percent": 0.0
     },
     {
@@ -85,35 +82,39 @@
      "percent": 0.0
     },
     {
-     "symbol": "compiler_rt.memset",
+     "symbol": "vm.Vm.internStr",
      "percent": 0.0
     },
     {
-     "symbol": "hash.wyhash.Wyhash.hash",
+     "symbol": "ltable.nodeInsert",
      "percent": 0.0
     },
     {
-     "symbol": "0x0000000000029640",
+     "symbol": "0x00000000000a6e5d",
      "percent": 0.0
     },
     {
-     "symbol": "0x000000000000bad4",
+     "symbol": "0x0000000000010410",
      "percent": 0.0
     },
     {
-     "symbol": "0x000000000000baee",
+     "symbol": "0x000000000002aa28",
      "percent": 0.0
     },
     {
-     "symbol": "0x0000000000029622",
+     "symbol": "0x000000000000afa3",
      "percent": 0.0
     },
     {
-     "symbol": "0x000000000001660a",
+     "symbol": "0x000000000002961e",
      "percent": 0.0
     },
     {
-     "symbol": "0x00000000000228b8",
+     "symbol": "0x000000000001658b",
+     "percent": 0.0
+    },
+    {
+     "symbol": "0x00000000000228c0",
      "percent": 0.0
     },
     {
@@ -125,7 +126,7 @@
      "percent": 0.0
     }
    ],
-   "source_head": "b59cb74"
+   "source_head": "8641a34"
   },
   "global_arith": {
    "top_symbols": [
@@ -134,25 +135,25 @@
      "percent": 99.92
     }
    ],
-   "source_head": "b59cb74"
+   "source_head": "8641a34"
   },
   "temp_table_alloc": {
    "top_symbols": [
     {
      "symbol": "heap.SmpAllocator.alloc",
-     "percent": 35.9
+     "percent": 29.85
     }
    ],
-   "source_head": "b59cb74"
+   "source_head": "8641a34"
   },
   "table_alloc_setmetatable": {
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 35.18
+     "percent": 37.21
     }
    ],
-   "source_head": "b59cb74"
+   "source_head": "8641a34"
   }
  }
 }

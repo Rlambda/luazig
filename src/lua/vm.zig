@@ -1503,7 +1503,7 @@ const CloseMode = enum { return_close, error_escape };
 
 /// PUC `CallInfo.u.c` — C function frame state.
 /// Only valid when `callstatus & CIST_C != 0`.
-const CFrameState = extern struct {
+pub const CFrameState = extern struct {
     /// PUC `u.c.k`: continuation function, called on resume after yield.
     /// null = no continuation (plain yield or non-yieldable call).
     k: ?*const fn (?*lua_State, c_int, isize) callconv(.c) c_int = null,
@@ -1579,7 +1579,7 @@ const TbcEntry = union(enum) {
 
 /// PUC `CallInfo.u.l` — Lua function frame state.
 /// Only valid when `callstatus & CIST_C == 0`.
-const LuaFrameState = extern struct {
+pub const LuaFrameState = extern struct {
     /// PUC `Proto*` — the bytecode prototype. Non-optional for Lua frames.
     /// Invariant: isLua(fr) → fr.u.lua.proto is a valid pointer.
     /// The `undefined` default is safe because LuaFrameState is only valid
@@ -2118,7 +2118,7 @@ const FrameStack = struct {
 ///   - `deinit()` frees the heap spill if any
 const INLINE_VALUES_CAP: usize = 4;
 
-const InlineValues = struct {
+pub const InlineValues = struct {
     inline_buf: [INLINE_VALUES_CAP]Value = undefined,
     heap: ?[]Value = null,
     len: usize = 0,
@@ -2209,7 +2209,7 @@ const InlineValues = struct {
 /// thread yield values" predicates exact.
 const YieldSpan = struct { base: u32, len: u32 };
 
-const YieldedValues = union(enum) {
+pub const YieldedValues = union(enum) {
     none,
     span: YieldSpan,
     owned: InlineValues,

@@ -1,201 +1,39 @@
 {
- "created_utc": "2026-09-12T09:28:18.471294+00:00",
+ "created_utc": "2026-09-13T16:17:54.175826+00:00",
  "provenance": {
-  "git_head": "b59cb74",
-  "measured_source_head": "b59cb74",
-  "measured_source_note": "P16.40 Cut 0 remainder regeneration at HEAD 144ab80 (production commit; fmt-only vs 280f6bd \u2014 builtin_may_refresh_outs comptime table alignment, .text byte-identical). Probe binaries rebuilt from current source (cfprobe40-debug/rf, -O flag before module flags). CallFrame/LuaFrameState/CFrameState asserted identical to the P16.39 Cut 0 artifact.",
-  "git_dirty": "clean (before this artifact)",
-  "source_dirty": "clean",
-  "artifact_dirty": "clean (regeneration in flight; measured inputs are src/, reported by source_dirty=clean)",
+  "git_head": "8641a34",
+  "measured_source_head": "8641a34",
+  "source_dirty": "clean at measurement (pre-commit)",
   "zig_version": "0.16.0",
-  "optimize_mode": "Debug+ReleaseFast",
-  "zig_binary_sha16": "6f94c09e62750970",
-  "puc_binary_sha16": "d54bc45e1757b216",
-  "probe_binary_sha16": {
-   "Debug": "5a999a9de6a21d7f",
-   "ReleaseFast": "ca844bc53f4dcca9"
-  },
-  "probe_note": "standalone Zig probe compiled OUTSIDE the repo (/tmp/opencode/cfprobe39.zig) against the same module graph (lua root src/lua/root.zig + util), -O Debug and -O ReleaseFast; prints @sizeOf/@alignOf of vm.Vm, vm.Thread, vm.CallFrame (+ u-variant arms via @FieldType) and the Thread-side state types (YieldedValues via @FieldType(Thread,'yielded'), InlineValues via @FieldType(YieldedValues,'owned')). P16.40 Cut 0 regeneration at HEAD 144ab80: CallFrame/LuaFrameState/CFrameState values byte-identical to the P16.39 Cut 0 artifact (fmt-only source delta); thread_state_types schema kept (Vm legitimately differs Debug vs RF: Debug-only safety metadata).",
-  "note": "P16.43 final provenance refresh; CallFrame 88/LuaFrameState 48 asserts unchanged"
+  "probe_rf_sha256_16": "e7b0beebe7cc8cc4",
+  "probe_debug_sha256_16": "fdef829687c353a4",
+  "note": "P16.45 final: REBUILT from current source (P16.40-era probe data superseded; no relabeling)",
+  "zig_binary_sha256": "071ffa77f160646ef345902121cfb36849749098bf800636c389ca8c1270d9ae"
  },
- "luazig": {
-  "Debug": {
-   "size": 88,
-   "align": 8,
-   "offset_u": 32,
-   "union_floor": 56
-  },
+ "layout": {
   "ReleaseFast": {
-   "size": 88,
-   "align": 8,
-   "offset_u": 32,
-   "union_floor": 56
-  }
- },
- "fields": {
-  "common": {
-   "func_slot": {
-    "offset": 0,
-    "size": 8
-   },
-   "tbc_mark": {
-    "offset": 8,
-    "size": 8
-   },
-   "tbc_chain_base": {
-    "offset": 16,
-    "size": 4
-   },
-   "callstatus": {
-    "offset": 20,
-    "size": 4
-   },
-   "reg_top": {
-    "offset": 24,
-    "size": 4
-   },
-   "pending_call_index": {
-    "offset": 28,
-    "size": 4
-   },
-   "u": {
-    "offset": 32,
-    "size": 56
-   }
-  },
-  "u.c": {
-   "k": {
-    "offset": 0,
-    "size": 8
-   },
-   "ctx": {
-    "offset": 8,
-    "size": 8
-   },
-   "old_errfunc": {
-    "offset": 16,
-    "size": 8
-   },
-   "aux": {
-    "offset": 24,
-    "size": 8
-   },
-   "testc_state": {
-    "offset": 32,
-    "size": 8
-   },
-   "clsret_state": {
-    "offset": 40,
-    "size": 8
-   },
-   "parked_stack": {
-    "offset": 48,
-    "size": 8
-   }
-  },
-  "u.lua": {
-   "proto": {
-    "offset": 0,
-    "size": 8
-   },
-   "pc": {
-    "offset": 8,
-    "size": 8
-   },
-   "frame_cap": {
-    "offset": 16,
-    "size": 4
-   },
-   "nextraargs": {
-    "offset": 20,
-    "size": 2
-   },
-   "lua_packed_flags": {
-    "offset": 22,
-    "size": 1
-   },
-   "simple_result_dst": {
-    "offset": 23,
-    "size": 1
-   },
-   "resume_pc": {
-    "offset": 24,
-    "size": 4
-   },
-   "last_line_pc": {
-    "offset": 28,
-    "size": 4
-   },
-   "skip_line_hook_pc": {
-    "offset": 32,
-    "size": 4
-   },
-   "skip_call_hook_pc": {
-    "offset": 36,
-    "size": 4
-   },
-   "resume_skip_count_pc": {
-    "offset": 40,
-    "size": 4
-   }
-  }
- },
- "state_sizes": {
-  "LuaFrameState": 48,
-  "CFrameState": 56,
-  "CFrameAux": 8,
-  "union_floor_arm": "CFrameState (56 B) \u2014 the u-variant floor; LuaFrameState 48 B"
- },
- "callstatus_bits": {
-  "0-7": "CIST_NRESULTS (mask 0xff): nresults+1, written masked by encodeNresults on every activation",
-  "8-11": "CIST_CCMT (shift 8): __call metamethod count (MAX_CCMT 0xf<<8)",
-  "12-14": "CIST_RECST (shift 12): recover status (error during pcallk)",
-  "15": "CIST_C: C function frame \u2014 the u-variant discriminator",
-  "16": "CIST_FRESH: fresh luaV_execute frame",
-  "17": "CIST_CLSRET: closing TBC variables on return (gates u.c aux arm)",
-  "18": "CIST_TBC: C function marked a to-be-closed slot on its frame",
-  "19": "CIST_OAH: saved allowhook",
-  "20": "CIST_HOOKED: running debug hook",
-  "21": "CIST_YPCALL: yieldable protected call",
-  "22": "CIST_TAIL: tail call",
-  "23": "CIST_HOOKYIELD: last hook yielded",
-  "24": "CIST_FIN: finalizer",
-  "25": "CIST_HIDE: luazig-specific \u2014 hide from debug.getinfo",
-  "26": "CIST_SR (P16.33 T2): simple-result completion pending; validity flag for the u.lua aux bytes (lua_packed_flags + simple_result_dst); provably CLEAR on fresh activation (masked callstatus write)",
-  "27": "CIST_OUV (P16.33 T2): frame may have open upvalues; provably CLEAR on fresh activation; replaced the always-initialized flags byte (bit0 of lua_packed_flags now RESERVED)",
-  "28-31": "unused (4 bits free)"
- },
- "puc": {
-  "size": 64,
-  "align": 8,
-  "offset_func": 0,
-  "offset_top": 8,
-  "offset_previous": 16,
-  "offset_next": 24,
-  "offset_u": 32,
-  "offset_callstatus": 60
- },
- "notes": "PUC CallInfo is 64 B on this ABI (gcc-measured against lua-5.5.0/src/lstate.h; unchanged \u2014 PUC source untouched). luazig CallFrame is 88 B in BOTH modes \u2014 P16.20 T1 made the layout build-mode-stable (extern struct/union), P16.20 T3 removed the stored `base` (96 -> 88 B), P16.30 Stage C replaced toclose_base with parked_stack 8B-for-8B, P16.31 Cut 3 packed tbc_chain_base (u32) into the 4-byte group keeping 88 B. P16.34 Cut 0A regeneration on P16.33-final source (src/ == 5c16a69): all values re-measured via standalone Zig probe (Debug + ReleaseFast, identical). CHANGED vs the stale 829a982-era artifact: the common 4-byte group \u2014 tbc_chain_base (P16.31 Cut 3) inserted at offset 16 shifted callstatus 16->20, reg_top 20->24, pending_call_index 24->28; the stale artifact predated that cut. luazig frames carry architecture-specific state (iterative yieldable execution, inline hook-replay PCs, simple-result continuation, region-model tbc_chain_base); 64 B is NOT a target \u2014 the model is.",
- "luazig_state_note": "LuaFrameState 48 B, CFrameState 56 B = union floor; CallFrame 88 B.",
- "thread_state_types": {
-  "note": "P16.39 Cut 0 R0.2 schema extension: @sizeOf of the Thread-side state types, per build mode, from the same probe run. Vm differs between modes (Debug carries extra safety metadata); Thread/CallFrame/YieldedValues/InlineValues are mode-stable.",
-  "Debug": {
-   "Vm": 6528,
-   "Thread": 3720,
+   "Vm": 5408,
+   "Thread": 3736,
    "CallFrame": 88,
    "LuaFrameState": 48,
    "CFrameState": 56,
    "YieldedValues": 96,
-   "InlineValues": 88
+   "InlineValues": 88,
+   "CallFrame_align": 8,
+   "CallFrame_u_offset": 32
   },
-  "ReleaseFast": {
-   "Vm": 6424,
-   "Thread": 3720,
+  "Debug": {
+   "Vm": 5512,
+   "Thread": 3736,
    "CallFrame": 88,
    "LuaFrameState": 48,
    "CFrameState": 56,
    "YieldedValues": 96,
-   "InlineValues": 88
+   "InlineValues": 88,
+   "CallFrame_align": 8,
+   "CallFrame_u_offset": 32
   }
- }
+ },
+ "invariants": "CallFrame == 88 B / align 8 / u@32 asserted in both modes; identical Debug/RF (extern structs)",
+ "note_vm_debug": "Vm Debug=5512 vs RF=5408: Debug-only safety padding in Vm struct (internals), not a layout divergence of the tracked frame types."
 }

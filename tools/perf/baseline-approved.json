@@ -1,73 +1,177 @@
 {
-  "created_utc": "2026-09-13T16:23:13.665918+00:00",
+  "created_utc": "2026-09-13T20:14:13.889055+00:00",
+  "provenance": {
+    "git_head": "7971e59",
+    "measured_source_head": "7971e59",
+    "git_dirty": "dirty",
+    "source_dirty": "clean",
+    "artifact_dirty": "dirty",
+    "zig_version": "0.16.0",
+    "optimize_mode": "ReleaseFast",
+    "zig_binary_sha16": "071ffa77f160646e",
+    "puc_binary_sha16": "d54bc45e1757b216"
+  },
   "host": {
     "platform": "Linux-7.1.5-arch1-2-x86_64-with-glibc2.44",
-    "python": "3.11.15"
+    "python": "3.14.6"
   },
-  "runs": 7,
+  "runs": 21,
   "core": "0",
   "zig": {
-    "field_access": 0.09302,
-    "coroutine_yield": 0.062569,
-    "metamethod_add": 0.08763,
-    "temp_table_alloc": 0.033319,
-    "comparisons": 0.831548,
-    "table_alloc_setmetatable": 0.052304,
-    "string_concat": 0.083621,
-    "mixed_arith": 0.244848,
-    "array_access": 0.080205,
-    "float_arith": 0.229901,
-    "branch_loop": 0.835773,
-    "lua_calls": 0.121505,
-    "metamethod_call_noalloc": 0.015784,
-    "hash_access": 0.111178,
-    "global_arith": 0.856685,
-    "dynamic_load": 0.190786,
-    "string_loop": 0.113138,
-    "int_arith": 0.230681
+    "hash_access": 0.111414,
+    "global_arith": 0.832144,
+    "array_access": 0.080077,
+    "string_loop": 0.112544,
+    "dynamic_load": 0.19075,
+    "comparisons": 0.829281,
+    "metamethod_call_noalloc": 0.015635,
+    "branch_loop": 0.837283,
+    "float_arith": 0.230676,
+    "mixed_arith": 0.245603,
+    "temp_table_alloc": 0.033152,
+    "coroutine_yield": 0.062465,
+    "field_access": 0.095433,
+    "int_arith": 0.228524,
+    "string_concat": 0.083937,
+    "metamethod_add": 0.08754,
+    "table_alloc_setmetatable": 0.052202,
+    "lua_calls": 0.121204
   },
   "puc": {
-    "field_access": 0.056735,
-    "coroutine_yield": 0.043784,
-    "metamethod_add": 0.062082,
-    "temp_table_alloc": 0.030315,
-    "comparisons": 0.601569,
-    "table_alloc_setmetatable": 0.043115,
-    "string_concat": 0.078246,
-    "mixed_arith": 0.175525,
-    "array_access": 0.046344,
-    "float_arith": 0.17631,
-    "branch_loop": 0.530594,
-    "lua_calls": 0.090518,
-    "metamethod_call_noalloc": 0.00837,
-    "hash_access": 0.068101,
-    "global_arith": 0.548856,
-    "dynamic_load": 0.127169,
-    "string_loop": 0.097008,
-    "int_arith": 0.172716
+    "hash_access": 0.068607,
+    "global_arith": 0.550313,
+    "array_access": 0.046144,
+    "string_loop": 0.097513,
+    "dynamic_load": 0.126943,
+    "comparisons": 0.597795,
+    "metamethod_call_noalloc": 0.00841,
+    "branch_loop": 0.530949,
+    "float_arith": 0.175447,
+    "mixed_arith": 0.174277,
+    "temp_table_alloc": 0.030504,
+    "coroutine_yield": 0.04345,
+    "field_access": 0.056382,
+    "int_arith": 0.172829,
+    "string_concat": 0.078322,
+    "metamethod_add": 0.061684,
+    "table_alloc_setmetatable": 0.042957,
+    "lua_calls": 0.090565
   },
   "ratios": {
-    "field_access": 1.6395523045738962,
-    "coroutine_yield": 1.429038004750594,
-    "metamethod_add": 1.4115202474147097,
-    "temp_table_alloc": 1.0990928583209632,
-    "comparisons": 1.382298622435664,
-    "table_alloc_setmetatable": 1.2131276817812826,
-    "string_concat": 1.0686936073409503,
-    "mixed_arith": 1.3949465888050137,
-    "array_access": 1.7306447436561365,
-    "float_arith": 1.3039589359650616,
-    "branch_loop": 1.5751648152824946,
-    "lua_calls": 1.3423297023796372,
-    "metamethod_call_noalloc": 1.8857825567502984,
-    "hash_access": 1.6325457775950427,
-    "global_arith": 1.5608556707041557,
-    "dynamic_load": 1.5002555654286815,
-    "string_loop": 1.1662749463961735,
-    "int_arith": 1.3356087449917784
+    "hash_access": 1.623945078490533,
+    "global_arith": 1.512128552296602,
+    "array_access": 1.735371879334258,
+    "string_loop": 1.154143550090757,
+    "dynamic_load": 1.5026429184752212,
+    "comparisons": 1.3872330815747875,
+    "metamethod_call_noalloc": 1.8590963139120094,
+    "branch_loop": 1.5769556021388118,
+    "float_arith": 1.3147902215483878,
+    "mixed_arith": 1.4092680043838257,
+    "temp_table_alloc": 1.0868082874377132,
+    "coroutine_yield": 1.4376294591484464,
+    "field_access": 1.6926146642545494,
+    "int_arith": 1.32225494563991,
+    "string_concat": 1.0716912234110467,
+    "metamethod_add": 1.4191686661046625,
+    "table_alloc_setmetatable": 1.2152152152152151,
+    "lua_calls": 1.3383095014630375
+  },
+  "geomean": 1.4094286520500439,
+  "zig_spread": {
+    "hash_access": {
+      "min": 0.110622,
+      "max": 0.113942,
+      "median": 0.111414
+    },
+    "global_arith": {
+      "min": 0.743499,
+      "max": 0.862444,
+      "median": 0.832144
+    },
+    "array_access": {
+      "min": 0.078353,
+      "max": 0.085326,
+      "median": 0.080077
+    },
+    "string_loop": {
+      "min": 0.111549,
+      "max": 0.114548,
+      "median": 0.112544
+    },
+    "dynamic_load": {
+      "min": 0.187607,
+      "max": 0.196111,
+      "median": 0.19075
+    },
+    "comparisons": {
+      "min": 0.818146,
+      "max": 0.845688,
+      "median": 0.829281
+    },
+    "metamethod_call_noalloc": {
+      "min": 0.015479,
+      "max": 0.016592,
+      "median": 0.015635
+    },
+    "branch_loop": {
+      "min": 0.827741,
+      "max": 0.844724,
+      "median": 0.837283
+    },
+    "float_arith": {
+      "min": 0.229522,
+      "max": 0.234864,
+      "median": 0.230676
+    },
+    "mixed_arith": {
+      "min": 0.243994,
+      "max": 0.250335,
+      "median": 0.245603
+    },
+    "temp_table_alloc": {
+      "min": 0.032763,
+      "max": 0.034217,
+      "median": 0.033152
+    },
+    "coroutine_yield": {
+      "min": 0.061166,
+      "max": 0.069684,
+      "median": 0.062465
+    },
+    "field_access": {
+      "min": 0.092477,
+      "max": 0.211302,
+      "median": 0.095433
+    },
+    "int_arith": {
+      "min": 0.22737,
+      "max": 0.233403,
+      "median": 0.228524
+    },
+    "string_concat": {
+      "min": 0.083129,
+      "max": 0.089026,
+      "median": 0.083937
+    },
+    "metamethod_add": {
+      "min": 0.085877,
+      "max": 0.091298,
+      "median": 0.08754
+    },
+    "table_alloc_setmetatable": {
+      "min": 0.05074,
+      "max": 0.055171,
+      "median": 0.052202
+    },
+    "lua_calls": {
+      "min": 0.120053,
+      "max": 0.137733,
+      "median": 0.121204
+    }
   },
   "baseline_identity": {
-    "baseline_phase": "P16.45-final",
-    "note": "P16.45 fail-safe rework: per-workload verdict aggregation (order-independent, NOISE? diagnostic-only \u2014 P16.44 false-green downgrade reverted); global_arith seed-causal bimodality documented (tools/perf/noise-lanes.json: 12.451G/13.851G instr modes, per-seed deterministic; PUC control itself bimodal 9.50/10.40G). Median blends seed modes; seed-selected single-mode sampling FORBIDDEN for baselines."
+    "baseline_phase": "P16.45-correction-final",
+    "note": "P16.45-correction: 21-run session (large-N mode blend for the bimodal global_arith; the 7-run predecessors could land either mode: 0.75/0.83 medians observed). Uniform-mode harness + canonical-workload seed evidence in tools/perf/noise-lanes.json (env-node placement EXACTLY separates the 12.58G/14.00G instruction modes; intern-chain disproven). NOISE? diagnostic-only. Sessions sampling the other mode will FAIL the wall gate with a visible NOISE? note \u2014 that is the fail-safe design; the causal check for such FAILs is the per-seed deterministic instruction count, not wall."
   }
 }

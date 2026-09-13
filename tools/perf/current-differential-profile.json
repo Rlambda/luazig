@@ -1,11 +1,11 @@
 {
- "created_utc": "2026-09-13T16:24:56.791705+00:00",
+ "created_utc": "2026-09-13T20:03:30.464922+00:00",
  "provenance": {
-  "git_head": "8641a34",
-  "measured_source_head": "8641a34",
-  "source_dirty": "artifact_dirty only (this regeneration); src/ clean pre-commit",
+  "git_head": "3683116",
+  "measured_source_head": "3683116",
+  "source_dirty": "clean",
   "zig_binary_sha256": "071ffa77f160646ef345902121cfb36849749098bf800636c389ca8c1270d9ae",
-  "note": "P16.45 FINAL regeneration (pub-markers build)"
+  "note": "P16.45-correction FINAL regeneration from clean measured-source commit A (3683116); artifact wrapper commit B follows"
  },
  "mode": "perf record -g instructions:u core0 top-15",
  "workloads": {
@@ -13,55 +13,55 @@
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 99.72
+     "percent": 99.53
     }
    ],
-   "source_head": "8641a34"
+   "source_head": "3683116"
   },
   "metamethod_call_noalloc": {
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 60.88
+     "percent": 62.02
     }
    ],
-   "source_head": "8641a34"
+   "source_head": "3683116"
   },
   "metamethod_add": {
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 45.49
+     "percent": 41.53
     }
    ],
-   "source_head": "8641a34"
+   "source_head": "3683116"
   },
   "coroutine_yield": {
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 58.49
+     "percent": 63.54
     }
    ],
-   "source_head": "8641a34"
+   "source_head": "3683116"
   },
   "hash_access": {
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 99.53
+     "percent": 99.54
     }
    ],
-   "source_head": "8641a34"
+   "source_head": "3683116"
   },
   "field_access": {
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 99.66
+     "percent": 99.68
     }
    ],
-   "source_head": "8641a34"
+   "source_head": "3683116"
   },
   "branch_loop": {
    "top_symbols": [
@@ -78,35 +78,39 @@
      "percent": 0.0
     },
     {
-     "symbol": "heap.ArenaAllocator.alloc",
+     "symbol": "heap.SmpAllocator.alloc",
      "percent": 0.0
     },
     {
-     "symbol": "vm.Vm.internStr",
+     "symbol": "lexer.Lexer.next",
      "percent": 0.0
     },
     {
-     "symbol": "ltable.nodeInsert",
+     "symbol": "Io.Threaded.dirOpenFilePosix",
      "percent": 0.0
     },
     {
-     "symbol": "0x00000000000a6e5d",
+     "symbol": "compiler_rt.memset",
      "percent": 0.0
     },
     {
-     "symbol": "0x0000000000010410",
+     "symbol": "process.Environ.createMap",
      "percent": 0.0
     },
     {
-     "symbol": "0x000000000002aa28",
+     "symbol": "0x0000000000028ca3",
      "percent": 0.0
     },
     {
-     "symbol": "0x000000000000afa3",
+     "symbol": "0x0000000000028ca7",
      "percent": 0.0
     },
     {
-     "symbol": "0x000000000002961e",
+     "symbol": "0x000000000000bae3",
+     "percent": 0.0
+    },
+    {
+     "symbol": "0x0000000000029622",
      "percent": 0.0
     },
     {
@@ -114,46 +118,42 @@
      "percent": 0.0
     },
     {
-     "symbol": "0x00000000000228c0",
+     "symbol": "0x00000000000228b8",
      "percent": 0.0
     },
     {
      "symbol": "0x000000000002268a",
      "percent": 0.0
-    },
-    {
-     "symbol": "0x000000000002269d",
-     "percent": 0.0
     }
    ],
-   "source_head": "8641a34"
+   "source_head": "3683116"
   },
   "global_arith": {
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 99.92
+     "percent": 99.96
     }
    ],
-   "source_head": "8641a34"
+   "source_head": "3683116"
   },
   "temp_table_alloc": {
    "top_symbols": [
     {
      "symbol": "heap.SmpAllocator.alloc",
-     "percent": 29.85
+     "percent": 35.41
     }
    ],
-   "source_head": "8641a34"
+   "source_head": "3683116"
   },
   "table_alloc_setmetatable": {
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 37.21
+     "percent": 38.46
     }
    ],
-   "source_head": "8641a34"
+   "source_head": "3683116"
   }
  }
 }

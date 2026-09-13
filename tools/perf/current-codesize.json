@@ -1,11 +1,11 @@
 {
- "created_utc": "2026-09-13T16:24:56.791705+00:00",
+ "created_utc": "2026-09-13T20:03:30.464922+00:00",
  "provenance": {
-  "git_head": "8641a34",
-  "measured_source_head": "8641a34",
-  "source_dirty": "artifact_dirty only (this regeneration); src/ clean pre-commit",
+  "git_head": "3683116",
+  "measured_source_head": "3683116",
+  "source_dirty": "clean",
   "zig_binary_sha256": "071ffa77f160646ef345902121cfb36849749098bf800636c389ca8c1270d9ae",
-  "note": "P16.45 FINAL regeneration (pub-markers build)"
+  "note": "P16.45-correction FINAL regeneration from clean measured-source commit A (3683116); artifact wrapper commit B follows"
  },
  "text_bytes": 2590057,
  "symbols": {

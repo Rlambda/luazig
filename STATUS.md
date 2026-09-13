@@ -1,4 +1,4 @@
-> Last updated: 2026-09-13 (P16.42 Iteration 2 — smoke-82 --testc/TFORCALL sync-hook corruption CLOSED: gcClearDeadFrameRegisters child-guard расширен на C view-frames (PUC stackinuse/traversethread parity); smoke 82 --testc впервые зелёный, оба режима 82/82; geomean 1.41x)
+> Last updated: 2026-09-13 (P16.42 Iteration 2+2b — smoke-82 --testc/TFORCALL sync-hook corruption CLOSED (gcClearDeadFrameRegisters child-guard → C view-frames, PUC stackinuse/traversethread parity) + builtinTestcStats rooting hole CLOSED (gcTempRoots на 7 таблиц, PUC C-stack rooting parity); smoke 82 --testc впервые зелёный, оба режима 83/83; geomean 1.41x)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -68,6 +68,31 @@ IR VM полностью удалена из кодовой базы.
 
 Выполненные задачи по номерам (P15.xx). Полные детали — в `git log` и коде.
 
+### P16.42 Iteration 2b — builtinTestcStats rooting hole CLOSED (2026-09-13)
+
+**Root cause** (флагнут P16.42 T3, закрыто здесь): семь таблиц
+`builtinTestcStats` жили в plain Zig-locals между `allocTable` и линковкой
+в `root` (сам `root` — до outs[0]), при том что каждый allocTable несёт
+inline GC step → шаг mid-stats выметал not-yet-linked таблицы (крэш-шейп
+T3: `switch on corrupt value` в ltable keyMatches). PUC ltests.c строит
+stats через C API — таблицы под конструированием живут на L-stack ниже
+L->top, маркируемом traversethread'ом. **Fix:** gcTempRoots (non-moving
+аналог C-stack rooting, паттерн builtinDebugGetinfo) на все семь таблиц +
+defensive root для `mt` в builtinTestcMakeCfunc (та же латентная форма,
+без step-сайта сегодня). outs-окно после return защищено существующей
+моделью (direct path — R[A] store без Lua между; hook path —
+debug_transfer_values маркирует transfer slice). Постоянный тест:
+`tests/smoke/84_gc_builtin_rooting.lua` (секции: 60 попыток
+gcstate+debt-burn+T.stats — детерминированно ловит atomic+sweep внутри
+stats; оригинальный T3-шейп 200 load'ов + full GC + T.stats; plain-режим
+корректно SKIP'ается без testc-модуля). Негативная валидация: revert →
+panic `switch on corrupt value` (Debug, ltable.zig:250 keyMatches — тот
+самый задокументированный шейп), RF — молчаливый крэш; restore → зелёный
+оба билда. Gates: fmt, unit D+RF, smoke **83/83 plain + --testc**, matrix
+--testc zig_fail=0, c_api 24/24 + test-diff PASS, api580 GREEN,
+perf_compare OK (3 прогона после одного noise-WARN на global_arith —
+документированный noisy workload, медианы стабильны).
+
 ### P16.42 Iteration 2 — smoke-82 --testc / TFORCALL sync-hook corruption CLOSED (2026-09-13)
 
 **Root cause (найден пошаговой канареечной трассировкой + негативной
@@ -116,8 +141,9 @@ getinfo/error-путях — getFuncNameForFrame из error-message,
 debugInferNameFromCaller из builtinDebugGetinfo; фреймы не несут name-state,
 P15.51n перенёс в pending calls; setDebugName пишет только константы).
 
-Открытым остаётся: builtinTestcStats latent rooting hole (таблицы в
-fallible Zig-locals должны быть gcTempRoots — P16.42 T3 shape).
+Открытым остаётся: builtinTestcStats latent rooting hole — ЗАКРЫТО в
+Iteration 2b выше (отдельный коммит: другой root cause — Zig-local таблицы
+across allocating calls vs child-guard clearing).
 
 ### P16.42 T2+T3 — pre-existing correctness bugs: gc.lua pace2 FIXED, cstack Debug segfault classified/DEFERRED (2026-09-12)
 

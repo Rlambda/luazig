@@ -40657,6 +40657,7 @@ pub const Vm = struct {
         try self.setField(ccl, "__testc_upenv", self.currentCallableEnvValue());
         try self.setField(ccl, "__testc_script_upvalue", .{ .Bool = true });
         const mt = try self.allocTable(null);
+        try roots.add(.{ .Table = mt });
         try self.setField(mt, "__call", .{ .Builtin = .testc_testC });
         try self.gcStoreMetatable(ccl, mt);
         outs[0] = .{ .Table = ccl };
@@ -40756,16 +40757,37 @@ pub const Vm = struct {
             }
         }.f;
 
+        // PUC ltests.c's stats builds its result tables through the C API —
+        // lua_createtable/lua_settable — so every table under construction
+        // lives on L's stack below L->top, a region traversethread marks as
+        // a root: an allocation-triggered GC step mid-construction can never
+        // sweep them. Here the seven tables sit in plain Zig locals until
+        // each is linked into `root` (and `root` itself until it lands in
+        // outs[0]), while every allocTable below carries an inline GC step —
+        // the P16.42-T3 crash shape (a step fired mid-stats and swept the
+        // not-yet-linked tables). gcTempRoots is the non-moving analogue of
+        // the C-stack rooting (same pattern as builtinDebugGetinfo's info
+        // table): each table is rooted from the moment it exists until
+        // `root` is stored into the caller's outs window (the defer runs
+        // after outs[0] is set; the outs window is then itself protected —
+        // direct path: no Lua runs before the caller's R[A] store; hook
+        // path: debug_transfer_values marks the transfer slice).
+        var roots = self.gcTempRoots();
+        defer roots.end();
+
         const root = try self.allocTable(null);
+        try roots.add(.{ .Table = root });
         try self.setField(root, "instructions", statVal(s.instructions_total));
 
         const ops = try self.allocTable(null);
+        try roots.add(.{ .Table = ops });
         inline for (@typeInfo(bc.Op).@"enum".fields) |f| {
             try self.setField(ops, f.name, statVal(s.instructions_by_op[f.value]));
         }
         try self.setField(root, "op_histogram", .{ .Table = ops });
 
         const calls = try self.allocTable(null);
+        try roots.add(.{ .Table = calls });
         try self.setField(calls, "fast", statVal(s.calls_fast));
         try self.setField(calls, "slow", statVal(s.calls_slow));
         try self.setField(calls, "lua_frames", statVal(s.calls_lua_frames));
@@ -40775,6 +40797,7 @@ pub const Vm = struct {
         try self.setField(root, "calls", .{ .Table = calls });
 
         const tables = try self.allocTable(null);
+        try roots.add(.{ .Table = tables });
         try self.setField(tables, "get_fast_int", statVal(s.tbl_get_fast_int));
         try self.setField(tables, "get_fast_str", statVal(s.tbl_get_fast_str));
         try self.setField(tables, "get_generic", statVal(s.tbl_get_generic));
@@ -40787,6 +40810,7 @@ pub const Vm = struct {
         try self.setField(root, "tables", .{ .Table = tables });
 
         const allocs = try self.allocTable(null);
+        try roots.add(.{ .Table = allocs });
         inline for (@typeInfo(GcObject).@"union".fields, 0..) |f, i| {
             try self.setField(allocs, f.name, statVal(s.alloc_by_type[i]));
         }
@@ -40794,11 +40818,13 @@ pub const Vm = struct {
         try self.setField(root, "allocs", .{ .Table = allocs });
 
         const gc = try self.allocTable(null);
+        try roots.add(.{ .Table = gc });
         try self.setField(gc, "steps_auto", statVal(s.gc_steps_auto));
         try self.setField(gc, "steps_manual", statVal(s.gc_steps_manual));
         try self.setField(root, "gc", .{ .Table = gc });
 
         const yr = try self.allocTable(null);
+        try roots.add(.{ .Table = yr });
         try self.setField(yr, "yields", statVal(s.yields));
         try self.setField(yr, "resumes", statVal(s.resumes));
         try self.setField(yr, "yield_allocs", statVal(s.yield_allocs));

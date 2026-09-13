@@ -89,7 +89,7 @@ stats; оригинальный T3-шейп 200 load'ов + full GC + T.stats; p
 panic `switch on corrupt value` (Debug, ltable.zig:250 keyMatches — тот
 самый задокументированный шейп), RF — молчаливый крэш; restore → зелёный
 оба билда. Gates: fmt, unit D+RF, smoke **83/83 plain + --testc**, matrix
---testc zig_fail=0, c_api 24/24 + test-diff PASS, api580 GREEN,
+--testc zig_fail=0, c_api 23 suites + test-diff PASS, api580 GREEN,
 perf_compare OK (3 прогона после одного noise-WARN на global_arith —
 документированный noisy workload, медианы стабильны).
 
@@ -132,12 +132,12 @@ root во время хука).
 `collectgarbage("collect")` — atomic неизбежно стреляет в теле хука).
 
 Gates: fmt; unit D+RF; smoke **82/82 plain И 82/82 --testc**; matrix --testc
-zig_fail=0 (31/32, big.lua both_fail pre-existing); c_api 24/24 + test-diff
+zig_fail=0 (31/32, big.lua both_fail pre-existing); c_api 23 suites + test-diff
 PASS; api580 GREEN (384<400); TBC 22+23 (в c_api); db/coroutine byte-identical,
 errors/locals diffs pre-existing (stash-verified at HEAD); perf_compare OK
 no regressions (geomean 1.41x). Закрыт stale-чекбокс "Debug name
 reconstruction выполняется лениво" (аудит: реконструкция только в
-getinfo/error-путях — getFuncNameForFrame из error-message, 
+getinfo/error-путях — getFuncNameForFrame из error-message,
 debugInferNameFromCaller из builtinDebugGetinfo; фреймы не несут name-state,
 P15.51n перенёс в pending calls; setDebugName пишет только константы).
 
@@ -604,7 +604,7 @@ Part 1: Codegen infrastructure for "before" semantics
 ### P15.37 — воспроизводимый performance gate + hotspot-driven perf-фазы
 Добавить `tools/perf_compare.py` и versioned baseline + закрыть 3 hotspot'а, выявленных через `perf record --call-graph lbr`:
 - [x] wall time, process CPU, max RSS и opcode count — закрыто P16.0b/c (VmStats opcode histogram; perf stat counters; getrusage max-RSS/process-CPU).
-- [ ] отдельная маркировка noisy/long suites вроде direct `constructs.lua`.
+- [x] отдельная маркировка noisy/long suites — ЗАКРЫТО P16.44: perf_compare regression_check принимает per-workload session spread (median_runs возвращает min/max/median прогонов ТОГО ЖЕ бинаря); WARN/FAIL дельта внутри собственного разброса бинаря понижается до явного NOISE-тега с напечатанным spread (механизм общий, downgrade только при overlap >= 80%); global_arith бимодальность классифицирована как hash-seed-зависимая раскладка таблиц (instructions 12.74/14.15G на одном бинаре, tools/perf/noise-lanes.json).
 
 ### P15.38 — codegen-level opcode reduction (PUC 5.5 fast paths)
 Цель: уменьшить число bytecode-инструкций на Lua-итерацию через PUC 5.5 codegen fast paths. Каждая подзадача устраняет 1–3 инструкции в common-case паттернах (`s = s + 1`, `if a < b then`, `x = x + 1.0`).
@@ -686,43 +686,43 @@ Eliminate `alloc.dupe(Value, varargs_src)` on every vararg function call by stor
 
 ### P15.56 — Virtual vararg access (PF_VAHID + OP_GETVARG)
 **Problem:** PUC Lua 5.5 has two modes for named varargs (`...arg`): - **PF_VAHID** (default, hidden args, no table): `arg[n]`/`arg.n` compile to `OP_GETVARG` reading extra args directly from stack. 0 allocations. - **PF_VATAB** (table exists): created lazily only when the vararg escapes (assigne...
-Результат: 
+Результат:
 
 ### P15.57 — GC free tracking + function-sugar upvalue assignment
 **Two bugs fixed:**
-Результат: 
+Результат:
 
 ### P15.58 — Per-object GC mark bits + T.gccolor/T.gcstate + warn + querytab
 **Problem:** PUC Lua's GC uses per-object tri-color mark bits stored in `CommonHeader.marked` (lgc.h:79-86). luazig had no per-object mark bits — GC marking was done via a HashSet of visited pointers, which cannot support `T.gccolor()` (testC command to inspect an object's GC color: white/gray/bl...
-Результат: 
+Результат:
 
 ### P15.59 — Fix generational GC age tracking + barrier gray marking
 **Three bugs fixed:**
-Результат: 
+Результат:
 
 ### P15.60 — PUC-faithful forward/backward barrier split
 **Problem:** PUC Lua has TWO distinct write barriers: - **Forward barrier** (`luaC_barrier_`/`luaC_objbarrier`): marks the VALUE. Used for `setmetatable`, `lua_setupvalue`, `OP_SETUPVAL`, `OP_CLOSURE`. - **Backward barrier** (`luaC_barrierback_`/`luaC_objbarrierback`): turns the OWNER gray and ad...
-Результат: 
+Результат:
 
 ### P15.61 — PUC-faithful upvalue cell marking + finalization order
 **Two fixes:**
-Результат: 
+Результат:
 
 ### P15.62 — PUC-faithful forward barrier sweep-phase makewhite
 **Problem:** PUC's `luaC_barrier_` (forward barrier) has two branches: - `keepinvariant(g)` (propagate/atomic): mark the value (`reallymarkobject`) - sweep phase: make the owner white (`luaC_makewhite`)
-Результат: 
+Результат:
 
 ### P15.63 — PUC-faithful open upvalues + OP_CLOSURE function counting
 **Problem:** PUC Lua's `UpVal` is a GC object that can be OPEN (pointing to a stack slot via `uv->v.p`) or CLOSED (holding its own copy in `uv->u.value`). Open upvalues are kept GRAY during GC marking (not BLACK), which prevents the forward barrier from firing when the stack slot is written. This...
-Результат: 
+Результат:
 
 ### P15.64 — Two-phase finalization + generational fullgc fix + loadlib _G
 **Problem:** Three issues blocked api.lua and gengc.lua: 1. `gcFullCollectionForUser` checked `finalizables.count() > 0` for the second cycle, but `gcFinalizeList` removes from `finalizables`, so the second cycle never ran. Finalized objects survived but were never freed. 2. In generational mode,...
-Результат: 
+Результат:
 
 ### P15.65 — testC close continuation in coroutines (locals.lua:1130)
 **Problem:** When a `__close` metamethod (running as a bytecode closure via `resumeTestcCloseReturnContinuation`) called `coroutine.yield`, the bytecode frame was lost. Two root causes:
-Результат: 
+Результат:
 
 ### P15.66 — PUC-faithful table rehash
 Цель: закрыть главный parity-блокер — `nextvar.lua:41` (table rehash). Реализуется PUC-faithful rehash algorithm (`computesizes`/`numusearray`/ `numusehash`/`luaH_resize`), заменяя eager array extension на PUC's rehash-on-overflow model.
@@ -744,7 +744,7 @@ Eliminate `alloc.dupe(Value, varargs_src)` on every vararg function call by stor
 
 ### P15.71b — testC LightUserdata migration (Phase A: A1–A6)
 **Problem:** `T.pushuserdata(n)` created a Lua **table** with fields `{__testud, __ptr, __val, __light, __isnull, __size}` masquerading as light userdata. An entire detection apparatus — `isTestcUserdata`, `isTestcLightUserdata`, `isTestcNullPointer`, `makeTestcPointerValue`, `debugLightUserdataF...
-Результат: 
+Результат:
 
 ### P15.72 — cstack.lua stack overflow recovery + T.listcode
 Цель: починить cstack.lua (3 части: stack overflow detection, message handling, stack recovery) и реализовать T.listcode для code.lua.

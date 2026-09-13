@@ -1,0 +1,19 @@
+{
+  "created_utc": "2026-09-09",
+  "phase": "P16.44 Task 5",
+  "subject": "global_arith wall bimodality classification",
+  "binary_sha256_prefix": "81f8071c34f0d4aa (same binary for ALL 12 runs)",
+  "method": "taskset -c 0, perf stat instructions:u,cycles:u + wall, 12 interleaved runs",
+  "results": {
+    "instruction_modes": [
+      {"mode": "low", "instructions": 12736986000, "runs": 6},
+      {"mode": "high", "instructions": 14150987000, "runs": 6, "delta_pct": 11.1}
+    ],
+    "cycles": "2.86G..3.70G continuous across BOTH modes (no cycle bimodality aligned with instruction modes)",
+    "wall_s": "0.742..0.858 continuous across both modes — wall does NOT correlate with the instruction mode",
+    "puc_side": "stable ~0.55s (3/3 runs, prior sessions)"
+  },
+  "conclusion": "The instruction bimodality is DATA-DEPENDENT, not code-layout: Vm.init draws a per-process random hash seed (makeRandomSeed); global_arith's dominant GETTABUP-on-_ENV lookups walk interned-string hash chains whose length depends on the seed's table layout. Two dominant layouts (~10% instruction delta) emerge across processes. The SAME binary in the same session visits both modes, so the reviewer's 0.849s vs 0.750s runs (gate FAIL vs OK) sampled different processes/seeds — not a source regression and not reproducible wall truth.",
+  "action": "P15.37 noisy-lane marking CLOSED this phase: tools/perf_compare.py regression_check now takes per-workload session spread (median_runs returns min/max/median of the SAME binary's runs); a WARN/FAIL delta inside the binary's own observed spread is downgraded to an explicit NOISE tag with the spread printed — reported, never silenced. General mechanism, no workload special-casing; the downgrade is evidence-driven (same-binary spread overlap >= 80%).",
+  "rule_for_baseline": "Do not select a lucky mode when updating baselines; the median-of-7 snapshot already blends modes, and the recorded baseline carries the median."
+}

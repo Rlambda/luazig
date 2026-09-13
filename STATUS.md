@@ -1,4 +1,4 @@
-> Last updated: 2026-09-13 (P16.45 COMPLETE — fail-safe perf gate (order-independent aggregation + NOISE? diagnostic-only; P16.44 false-green closed with 14 selftests) + seed-causal noise-lanes evidence (seed_harness via Vm.initWithSeed) + canonical artifacts regenerated)
+> Last updated: 2026-09-13 (P16.45-correction COMPLETE — reproducible seed evidence (canonical workload + env-node structural separation), uniform-mode harness, provenance-preserving baseline mechanism, clean-source two-commit artifacts)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -36,9 +36,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **83/83** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.41x** |
+| Performance (geomean vs PUC) | **1.42x** |
 
-Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.42x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.

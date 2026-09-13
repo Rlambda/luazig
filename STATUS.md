@@ -1,4 +1,4 @@
-> Last updated: 2026-09-12 (P16.42 COMPLETE — correctness phase: pcall-in-__gc corruption CLOSED (savestack), gc.lua pace2 CLOSED (8B/load closure accounting); gc.lua plain PUC-identical first time; cstack Debug classified (host-stack, deferred); geomean 1.40892)
+> Last updated: 2026-09-13 (P16.42 Iteration 2 — smoke-82 --testc/TFORCALL sync-hook corruption CLOSED: gcClearDeadFrameRegisters child-guard расширен на C view-frames (PUC stackinuse/traversethread parity); smoke 82 --testc впервые зелёный, оба режима 82/82; geomean 1.41x)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -68,6 +68,57 @@ IR VM полностью удалена из кодовой базы.
 
 Выполненные задачи по номерам (P15.xx). Полные детали — в `git log` и коде.
 
+### P16.42 Iteration 2 — smoke-82 --testc / TFORCALL sync-hook corruption CLOSED (2026-09-13)
+
+**Root cause (найден пошаговой канареечной трассировкой + негативной
+валидацией):** `gcClearDeadFrameRegisters` (vm.zig, GC atomic phase) чистит
+"мёртвые" регистры каждого припаркованного Lua-фрейма в диапазоне
+`[live_reg_top[parked_pc], frame_cap)`. Guard "не трогать окно child-фрейма"
+учитывал ТОЛЬКО Lua-детей (`child.proto() != null`), но окно вызова припарко-
+ванного родителя может принадлежать и **C view-frame** (PUC precallC:
+`ci->func = func` ВНУТРИ окна вызывающего — ровно наша view-модель).
+OP_TFORCALL стаджит func/state/control в R[A+4..A+6] — регистры, которые
+compile-time liveness на parked-pc считает dead-at-entry (live_top=10 <
+стейдж-слота стейта при nvars≤1). Пока тело sync-хука исполняет вложенный
+Lua (`debug.getinfo(2)` default mode), его allocTable/condGcFromDispatch
+ловит GC atomic step → clear `[10..15)` → **слот стейта таблицы → Nil** →
+`next` получает nil как state (`type error: expected table, got nil`).
+Прайминг (секции A/B репродьюсера) — это ТОЛЬКО GC-pacing: какие аллокации
+доводят цикл до atomic именно внутри тела хука; поэтому симптом был
+недетерминированно-зависим от преамбулы и от --testc. Тот же класс бага
+латентно грозил outs-окну `[A+1+nargs..]` любого builtin, чей atomic step
+стрелял mid-call ПОСЛЕ записи результатов.
+
+**Fix (PUC-паритет, без спец-кейсов):** guard в `gcClearDeadFrameRegisters`
+распространён на ЛЮБОЙ child-фрейм: `clear_end = min(regs.len,
+child.func_slot - base)` без проверки прото. Это GC-выражение PUC-модели
+владения стеком: traversethread маркирует `[1..L->top)` целиком и collector
+НИКОГДА не чистит слоты; `luaD_shrinkstack`/`stackinuse` учитывает ci->top
+ВСЕХ CallInfo, C-фреймы включены. Маркировка окна изменения не требовала:
+func маркируется через `bc_stack[frame.func_slot]` view-фрейма, аргументы —
+через канонические регистры R[A..A+2], покрытые liveness parked-pc (+transfer
+root во время хука).
+
+**Верификация:** все 4 репродьюсера (combo AB — падал PLAIN, ABC/x2 — оба
+режима) зелёные оба режима; **smoke 82 --testc ВПЕРВЫЕ зелёный**; негативная
+валидация дважды: revert → 82 падает (line 227 + round 1 новой секции) в
+ОБОИХ режимах, restore → зелёный. Постоянный тест: секция 19b в 82
+(детерминированный хаммер: 50 раундов hook+getinfo+TFORCALL после
+`collectgarbage("collect")` — atomic неизбежно стреляет в теле хука).
+
+Gates: fmt; unit D+RF; smoke **82/82 plain И 82/82 --testc**; matrix --testc
+zig_fail=0 (31/32, big.lua both_fail pre-existing); c_api 24/24 + test-diff
+PASS; api580 GREEN (384<400); TBC 22+23 (в c_api); db/coroutine byte-identical,
+errors/locals diffs pre-existing (stash-verified at HEAD); perf_compare OK
+no regressions (geomean 1.41x). Закрыт stale-чекбокс "Debug name
+reconstruction выполняется лениво" (аудит: реконструкция только в
+getinfo/error-путях — getFuncNameForFrame из error-message, 
+debugInferNameFromCaller из builtinDebugGetinfo; фреймы не несут name-state,
+P15.51n перенёс в pending calls; setDebugName пишет только константы).
+
+Открытым остаётся: builtinTestcStats latent rooting hole (таблицы в
+fallible Zig-locals должны быть gcTempRoots — P16.42 T3 shape).
+
 ### P16.42 T2+T3 — pre-existing correctness bugs: gc.lua pace2 FIXED, cstack Debug segfault classified/DEFERRED (2026-09-12)
 
 **T3 — gc.lua "pace of the collector" hang (без --testc): CLOSED.**
@@ -107,13 +158,11 @@ PUC тоже рекурсирует в C в этом пути (lua_closethread�
 frame-size artifact, не memory-safety. N-таблица + размеры фреймов:
 `tools/status/p16.42-cstack-debug-crash.md`.
 
-**Обнаружено попутно (pre-existing, НЕ фикс этого этапа)**:
-`tests/smoke/82_cframe_view_model.lua` падает под `--testc` (Debug и RF,
-строка 227: `for k in next, {10}` с call-hook — `type error: expected
-table, got nil`, hook/TFORCALL arg-window под testC-модулем); БЕЗ --testc
-проходит (официальный smoke-lane). Stash-verified pre-existing и на HEAD
-(0728e37), и на 8b1e00f (коммит, добавивший тест зелёным). Требует
-отдельного расследования.
+**Обнаружено попутно (pre-existing, зафиксировано этим этапом; ЗАКРЫТО в
+P16.42 Iteration 2 выше)**: `tests/smoke/82_cframe_view_model.lua` падает под
+`--testc` (Debug и RF, строка 227: `for k in next, {10}` с call-hook —
+`type error: expected table, got nil`); root cause =
+gcClearDeadFrameRegisters child-guard без C-view arm (см. Iteration 2).
 
 Gates (T3 fix): fmt; unit D+RF; smoke differential **83/83 PASS**; matrix
 --testc **33 pass, zig_fail=0** (big.lua both_fail pre-existing); c_api
@@ -510,7 +559,7 @@ Generational mode больше не является compatibility-веткой,
 ### P15.35 — CallInfo stack и обычный call fast path
 Предвыделенный массив frame/CallInfo records
 Результат: lua_calls -27% (7.27→5.32s, Debug build). Parity: 28/31
-- [ ] Debug name reconstruction выполняется лениво.
+- [x] Debug name reconstruction выполняется лениво. (закрыто задним числом — P16.42 Iteration 2 audit: реконструкция только on-demand в debug-путях — getFuncNameForFrame вызывается только из error-message (vm.zig:6768), debugInferNameFromCaller только из builtinDebugGetinfo (vm.zig:29726); фреймы не несут name-state (P15.51n перенёс debug-имена в BytecodePendingCall), setDebugName пишет только константные строки)
 - [ ] Уплотнить `Thread` header и parked-frame storage после измерения lifetime
 
 ### P15.36 — compiler/`load()` pipeline

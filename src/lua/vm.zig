@@ -27241,19 +27241,36 @@ pub const Vm = struct {
     }
 
     pub fn createBytecodeChunkClosure(self: *Vm, proto: *const bc.Proto) DispatchError!*Closure {
+        // P16.43 Iteration 1: SINGLE-OWNER transactional cleanup. The old
+        // shape had two overlapping errdefers that BOTH freed `cells` on
+        // any failure after the second became active — the second freed
+        // the array, then the first iterated the freed slice
+        // (use-after-free) and freed it AGAIN (double free). Arena-based
+        // tests masked it (arena free is a no-op diagnostic). The fix is
+        // an explicit ownership flag: the cell-phase errdefer owns `cells`
+        // ONLY until the closure-phase errdefer takes over (exactly when
+        // `cl` exists); after the handoff the closure-phase cleanup is
+        // the single owner of the array, the cells' registry entries, the
+        // tree ref, and the closure object itself.
         const cells = try self.alloc.alloc(*Cell, proto.upvalues.len);
         var n_cells: usize = 0;
+        // Ownership handoff: set to true immediately before creating the
+        // closure object — from that point the closure-phase errdefer
+        // below owns `cells` and every created Cell.
+        var cells_owned_by_closure_phase = false;
         errdefer {
-            // Partial cell-creation failure (P16.10b Task 13 hygiene):
-            // fully undo every cell created so far — unregister from the
-            // GC list, credit the accounting, free the object — then the
-            // array. No leak, no dangling registry entry.
-            for (cells[0..n_cells]) |c| {
-                self.gcUnregisterObject(.{ .cell = c });
-                self.gcNoteFree(@sizeOf(Cell));
-                self.alloc.destroy(c);
+            if (!cells_owned_by_closure_phase) {
+                // Partial cell-creation failure (P16.10b Task 13 hygiene):
+                // fully undo every cell created so far — unregister from
+                // the GC list, credit the accounting, free the object —
+                // then the array. No leak, no dangling registry entry.
+                for (cells[0..n_cells]) |c| {
+                    self.gcUnregisterObject(.{ .cell = c });
+                    self.gcNoteFree(@sizeOf(Cell));
+                    self.alloc.destroy(c);
+                }
+                self.alloc.free(cells);
             }
-            self.alloc.free(cells);
         }
         for (cells) |*slot| {
             const cell = try self.alloc.create(Cell);
@@ -27263,6 +27280,10 @@ pub const Vm = struct {
             slot.* = cell;
             n_cells += 1;
         }
+        // NOTE: the handoff flag flips only AFTER the closure-phase
+        // errdefer below is DECLARED — between the cell loop and that
+        // point (testcChargeMemory / create(Closure) failures) the
+        // cell-phase errdefer still owns the cleanup.
         try self.testcChargeMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
         // P16.10b Task 8: errdefer after tree retain. If gcRegisterClosure
@@ -27270,12 +27291,26 @@ pub const Vm = struct {
         // incremented the tree ref_count, we must release that reference
         // and free/unregister the closure object. Without this, an OOM
         // after retain leaks the tree ref (ref_count never returns to 0).
+        // P16.43 Iteration 1: this is the ONLY owner of `cells` and the
+        // Cells once the handoff flag flips (immediately below).
         var cl_registered = false;
         errdefer {
+            // Handoff: from this point the closure-phase cleanup owns
+            // cells + all Cells; the cell-phase errdefer above is inert.
+            cells_owned_by_closure_phase = true;
             if (cl_registered) {
                 self.gcUnregisterObject(.{ .closure = cl });
                 self.testc_obj_functions -= 1;
                 self.gcNoteFree(@sizeOf(Closure) + cells.len * @sizeOf(*Cell));
+            } else {
+                // Closure never registered: the Cells are still on the GC
+                // registry under their own object identity — undo them
+                // here (their ownership moved with the handoff flag).
+                for (cells) |c| {
+                    self.gcUnregisterObject(.{ .cell = c });
+                    self.gcNoteFree(@sizeOf(Cell));
+                    self.alloc.destroy(c);
+                }
             }
             if (cl.proto) |p| {
                 if (p.tree) |t| t.releaseTree(self.alloc);
@@ -27692,19 +27727,37 @@ pub const Vm = struct {
     /// counterpart of `builtinStringDump`: dump serializes a Proto tree, undump
     /// reconstructs it, and this function wraps it in an executable Closure.
     fn closureFromProto(self: *Vm, proto: *bc.Proto) DispatchError!*Closure {
+        // P16.43 Iteration 1: single-owner transactional cleanup (the old
+        // shape double-freed `cells` on failure after the second errdefer
+        // became active; additionally, a failure of the `cells` allocation
+        // itself leaked `cl` and left testc_obj_functions incremented).
+        // Structure: phase-A errdefer owns `cl`; phase-B errdefer owns
+        // `cells` + created Cells; phase-D errdefer (declared after both)
+        // takes ownership of EVERYTHING via two handoff flags — so on any
+        // failure exactly ONE cleanup owner runs per resource.
         try self.testcChargeMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
         self.testc_obj_functions += 1;
+        var cl_owned_by_phase_d = false;
+        errdefer {
+            if (!cl_owned_by_phase_d) {
+                self.testc_obj_functions -= 1;
+                self.alloc.destroy(cl);
+            }
+        }
         const nups: usize = proto.upvalues.len;
         const cells = try self.alloc.alloc(*Cell, nups);
         var n_cells: usize = 0;
+        var cells_owned_by_phase_d = false;
         errdefer {
-            for (cells[0..n_cells]) |c| {
-                self.gcUnregisterObject(.{ .cell = c });
-                self.gcNoteFree(@sizeOf(Cell));
-                self.alloc.destroy(c);
+            if (!cells_owned_by_phase_d) {
+                for (cells[0..n_cells]) |c| {
+                    self.gcUnregisterObject(.{ .cell = c });
+                    self.gcNoteFree(@sizeOf(Cell));
+                    self.alloc.destroy(c);
+                }
+                self.alloc.free(cells);
             }
-            self.alloc.free(cells);
         }
         for (0..nups) |i| {
             const c = try self.alloc.create(Cell);
@@ -27714,14 +27767,22 @@ pub const Vm = struct {
             cells[i] = c;
             n_cells += 1;
         }
-        // P16.10b Task 8: errdefer after tree retain — same pattern as
-        // createBytecodeChunkClosure. If gcRegisterClosure fails after
-        // retainTreeForClosure, release the tree ref and clean up cl.
+        // Phase D: declared LAST so it runs FIRST on error and flips both
+        // handoff flags — phases A/B become inert for every resource D
+        // now owns (cl, cells, all Cells, the tree ref).
         var cl_registered = false;
         errdefer {
+            cl_owned_by_phase_d = true;
+            cells_owned_by_phase_d = true;
             if (cl_registered) {
                 self.gcUnregisterObject(.{ .closure = cl });
                 self.gcNoteFree(@sizeOf(Closure) + cells.len * @sizeOf(*Cell));
+            } else {
+                for (cells) |c| {
+                    self.gcUnregisterObject(.{ .cell = c });
+                    self.gcNoteFree(@sizeOf(Cell));
+                    self.alloc.destroy(c);
+                }
             }
             if (cl.proto) |p| {
                 if (p.tree) |t| t.releaseTree(self.alloc);
@@ -46824,3 +46885,127 @@ test "vm: P16.33 R0.3 — checkpanic sub-VM shares the testC allocator control" 
         try testing.expectEqualStrings("hi", outs[0].String.bytes());
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// P16.43 Iteration 1: closure-construction OOM single-owner tests.
+//
+// The P16.42 shape double-freed `cells` on any failure after the
+// closure-phase errdefer became active (both errdefers ran: the second
+// freed the array, then the first iterated the freed slice and freed it
+// AGAIN). Arena-based tests (Task 7.2/8.1) masked this — an arena's free
+// is a no-op. These tests run the VM on std.testing.allocator (which
+// DIAGNOSES invalid/double frees and reports leaks) and route a
+// FailingAllocator into the constructors at every fail index, so each
+// failure edge (cells array, cell alloc N, testc charge, Closure object,
+// registry growth) exercises the single-owner cleanup. Modeled on the
+// Task 7.2 differential structure.
+
+// Build a minimal valid one-upvalue Proto on the given allocator
+// (ProtoBuilder style, mirroring Task 8.1).
+fn p43BuildOneUpvalueProto(falloc: std.mem.Allocator) !*bc.Proto {
+    var builder = bc.ProtoBuilder.init(falloc);
+    errdefer builder.deinit();
+    _ = try builder.emitSimple(.return0, 1);
+    _ = try builder.internConst(.{ .int = 42 });
+    const proto = try builder.finish();
+    builder.deinit();
+    return proto;
+}
+
+test "P16.43: createBytecodeChunkClosure OOM single-owner (every fail index)" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    const functions_before = vm.testc_obj_functions;
+
+    var fail_idx: usize = 0;
+    var tested_failures: usize = 0;
+    while (fail_idx <= 16) : (fail_idx += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        const saved_alloc = vm.alloc;
+        vm.alloc = failing.allocator();
+        defer vm.alloc = saved_alloc;
+        const proto = try p43BuildOneUpvalueProto(saved_alloc);
+        // The tree starts at ref_count 1 (ProtoBuilder.finish); this
+        // defer releases that initial reference (the constructor's own
+        // retain/release balances inside the probe).
+        defer proto.tree.?.releaseTree(saved_alloc);
+        if (vm.createBytecodeChunkClosure(proto)) |cl| {
+            // Success edge: undo the registration so the loop's per-index
+            // accounting assertions keep meaning; the break ends probing.
+            _ = vm.gcUnregisterObject(.{ .closure = cl });
+            vm.testc_obj_functions -= 1;
+            vm.gcNoteFree(@sizeOf(Closure) + cl.upvalues.len * @sizeOf(*Cell));
+            // The closure held a tree retain (retainTreeForClosure);
+            // manual teardown bypasses gcFreeObject, so release it here.
+            if (cl.proto) |p| {
+                if (p.tree) |t| t.releaseTree(saved_alloc);
+            }
+            const ua = vm.alloc;
+            vm.alloc = saved_alloc;
+            ua.free(cl.upvalues);
+            ua.destroy(cl);
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            tested_failures += 1;
+        }
+        // Per-failure invariants: object counter rolled back (cells
+        // unregistered, closure unregistered or never counted).
+        try testing.expectEqual(functions_before, vm.testc_obj_functions);
+    }
+    try testing.expect(tested_failures > 0);
+}
+
+test "P16.43: closureFromProto OOM single-owner (every fail index)" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    const functions_before = vm.testc_obj_functions;
+
+    var fail_idx: usize = 0;
+    var tested_failures: usize = 0;
+    while (fail_idx <= 16) : (fail_idx += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        const saved_alloc = vm.alloc;
+        vm.alloc = failing.allocator();
+        defer vm.alloc = saved_alloc;
+        const proto = try p43BuildOneUpvalueProto(saved_alloc);
+        // The tree starts at ref_count 1 (ProtoBuilder.finish); this
+        // defer releases that initial reference (the constructor's own
+        // retain/release balances inside the probe).
+        defer proto.tree.?.releaseTree(saved_alloc);
+        if (vm.closureFromProto(proto)) |cl| {
+            _ = vm.gcUnregisterObject(.{ .closure = cl });
+            vm.gcNoteFree(@sizeOf(Closure) + cl.upvalues.len * @sizeOf(*Cell));
+            if (cl.proto) |p| {
+                if (p.tree) |t| t.releaseTree(saved_alloc);
+            }
+            const ua = vm.alloc;
+            vm.alloc = saved_alloc;
+            ua.free(cl.upvalues);
+            ua.destroy(cl);
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            tested_failures += 1;
+        }
+        try testing.expectEqual(functions_before, vm.testc_obj_functions);
+    }
+    try testing.expect(tested_failures > 0);
+}
+
+// Negative-validation note: std.testing.allocator (DebugAllocator)
+// catches double/invalid frees via a hard panic rather than an error
+// value, so an executable oracle test is not expressible. The diagnostic
+// power of the two tests above is proven historically: the intermediate
+// broken refactor of this iteration was caught immediately (Task 7.2
+// integer-overflow panic + leak reports), and the P16.42 double-free
+// shape would similarly abort inside these tests' failure loops (they
+// run on the testing allocator, unlike the Arena-based Task 7.2).

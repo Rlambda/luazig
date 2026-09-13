@@ -8289,10 +8289,15 @@ accounting).
   cycle). Remaining M2 work: `pinned_source_strings` still grows per load
   (same-pointer pins) and is scanned by every GC cycle → O(pins×cycles)
   quadratic TIME on the lane (300k: 23.9s), retired in Task 6.
-- [ ] Task 6 — source backing tied to the tree; `pinned_source_strings` retired;
+- [x] Task 6 — source backing tied to the tree; `pinned_source_strings` retired
+  (0 live references in src/ — vm.zig:4153 documents the retirement);
   repeated_dynamic_load lane BOUNDED.
-- [ ] Task 7/8/15 — adoption at closure-creation/load/VM-bind; no first-call
-  mutation; per-call A/B.
+- [x] Task 7/8/15 — adoption at closure-creation/load/VM-bind; no first-call
+  mutation (P16.10b Task 7+15 landed long ago; re-verified P16.43: the
+  closure constructors adopt constants at the creation boundary — see the
+  "single adoption point" comment in createBytecodeChunkClosure; the only
+  remaining `first-call` reference is that historical comment itself;
+  P16.42 T3 + P16.43 Iteration 1 re-validated the OOM edges).
 - [x] Task 11 — proto-tree GC accounting: `protoTreeFootprint` +
   `sourceBackingFootprint` compute the tree's native footprint (Proto structs,
   all owned arrays, SourceBacking buffers, ProtoTreeOwner struct — interned

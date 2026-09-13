@@ -1,57 +1,281 @@
 {
-  "created_utc": "2026-09-10T12:00:00Z",
-  "phase": "P16.45-correction (supersedes both earlier noise-lanes.json versions)",
-  "subject": "global_arith instruction bimodality — canonical-workload seed experiment with measured structural observables",
-  "provenance": {
-    "measured_source_commit": "commit A of the P16.45 correction (see git log; the source tree that builds the binaries below)",
-    "zig_version": "0.16.0 (/usr/bin/zig)",
-    "puc_binary_sha256": "d54bc45e1757b216eaa8a273511fc9fcd2670e97ca85dfe9781daf71437a91f2",
-    "seed_harness_sha256": "1e986868e9b4ab4c82574cb2267dd75068e64c36a926b4bdfecf09be0efd7a31",
-    "seed_harness_build": "zig build seed-harness -Doptimize=ReleaseFast (uniform mode: harness root AND lua/util dependencies share the build's -Doptimize; the P16.45 mixed-mode bug is fixed in build.zig)",
-    "host_core": "core 0 pinned (taskset -c 0)",
-    "workload": "tools/microbench.lua executed VERBATIM by the harness (file read + script arg 'global_arith') — same file, same bench() warmup, same stdlib/intern population history as the perf-gate lane; Vm.initWithSeed fixes the per-process seed",
-    "measurement_command": "taskset -c 0 perf stat -e instructions:u,cycles:u,branches:u,branch-misses:u /tmp/opencode/seed_harness_imm <seed> tools/microbench.lua global_arith",
-    "observable_command": "/tmp/opencode/seed_harness_imm <seed> tools/microbench.lua global_arith (prints wall ns + intern-chain facts + _ENV-node facts)",
-    "hash_recheck_after_run": "1e986868e9b4ab4c (verified unchanged after all measurements)"
+ "created_utc": "2026-09-10T12:00:00Z",
+ "phase": "P16.45-correction (supersedes both earlier noise-lanes.json versions)",
+ "subject": "global_arith instruction bimodality \u2014 canonical-workload seed experiment with measured structural observables",
+ "provenance": {
+  "measured_source_commit": "commit A of the P16.45 correction (see git log; the source tree that builds the binaries below)",
+  "zig_version": "0.16.0 (/usr/bin/zig)",
+  "puc_binary_sha256": "d54bc45e1757b216eaa8a273511fc9fcd2670e97ca85dfe9781daf71437a91f2",
+  "seed_harness_sha256": "1e986868e9b4ab4c82574cb2267dd75068e64c36a926b4bdfecf09be0efd7a31",
+  "seed_harness_build": "zig build seed-harness -Doptimize=ReleaseFast (uniform mode: harness root AND lua/util dependencies share the build's -Doptimize; the P16.45 mixed-mode bug is fixed in build.zig)",
+  "host_core": "core 0 pinned (taskset -c 0)",
+  "workload": "tools/microbench.lua executed VERBATIM by the harness (file read + script arg 'global_arith') \u2014 same file, same bench() warmup, same stdlib/intern population history as the perf-gate lane; Vm.initWithSeed fixes the per-process seed",
+  "measurement_command": "taskset -c 0 perf stat -e instructions:u,cycles:u,branches:u,branch-misses:u /tmp/opencode/seed_harness_imm <seed> tools/microbench.lua global_arith",
+  "observable_command": "/tmp/opencode/seed_harness_imm <seed> tools/microbench.lua global_arith (prints wall ns + intern-chain facts + _ENV-node facts)",
+  "hash_recheck_after_run": "1e986868e9b4ab4c (verified unchanged after all measurements)"
+ },
+ "raw_runs": [
+  {
+   "seed": 1,
+   "instructions": 13997944602,
+   "cycles": 3980366252,
+   "branches": 2526563274,
+   "branch_misses": 23917,
+   "wall_ns": 1192382119,
+   "g_count_intern_chain_depth": 0,
+   "g_count_intern_bucket_len": 1,
+   "env_node_depth": 1,
+   "env_node_chain_len": 2,
+   "mode": "high"
   },
-  "raw_runs": [
-    {"seed": 1, "instructions": 13997944602, "cycles": 3980366252, "branches": 2526563274, "branch_misses": 23917, "wall_ns": 1192382119, "g_count_intern_chain_depth": 0, "g_count_intern_bucket_len": 1, "env_node_depth": 1, "env_node_chain_len": 2, "mode": "high"},
-    {"seed": 2, "instructions": 13997945159, "cycles": 4398730188, "branches": 2526563543, "branch_misses": 23611, "wall_ns": 1189285235, "g_count_intern_chain_depth": 0, "g_count_intern_bucket_len": 2, "env_node_depth": 1, "env_node_chain_len": 3, "mode": "high"},
-    {"seed": 3, "instructions": 13997943338, "cycles": 3991895698, "branches": 2526563041, "branch_misses": 24130, "wall_ns": 1212930053, "g_count_intern_chain_depth": 0, "g_count_intern_bucket_len": 1, "env_node_depth": 1, "env_node_chain_len": 3, "mode": "high"},
-    {"seed": 5, "instructions": 13997946612, "cycles": 3505146526, "branches": 2526563571, "branch_misses": 22559, "wall_ns": 1207316580, "g_count_intern_chain_depth": 0, "g_count_intern_bucket_len": 1, "env_node_depth": 1, "env_node_chain_len": 3, "mode": "high"},
-    {"seed": 8, "instructions": 12583944342, "cycles": 3053526967, "branches": 1920563018, "branch_misses": 22737, "wall_ns": 1078668698, "g_count_intern_chain_depth": 0, "g_count_intern_bucket_len": 1, "env_node_depth": 0, "env_node_chain_len": 1, "mode": "low"},
-    {"seed": 13, "instructions": 12583944229, "cycles": 3008938673, "branches": 1920563119, "branch_misses": 21112, "wall_ns": 1040028767, "g_count_intern_chain_depth": 0, "g_count_intern_bucket_len": 1, "env_node_depth": 0, "env_node_chain_len": 1, "mode": "low"},
-    {"seed": 21, "instructions": 12583943907, "cycles": 3044070563, "branches": 1920562900, "branch_misses": 22944, "wall_ns": 1098260699, "g_count_intern_chain_depth": 0, "g_count_intern_bucket_len": 1, "env_node_depth": 0, "env_node_chain_len": 1, "mode": "low"},
-    {"seed": 34, "instructions": 12583942566, "cycles": 3028199658, "branches": 1920562713, "branch_misses": 22504, "wall_ns": 1060717292, "g_count_intern_chain_depth": 0, "g_count_intern_bucket_len": 1, "env_node_depth": 0, "env_node_chain_len": 1, "mode": "low"},
-    {"seed": 42, "instructions": 12583947216, "cycles": 3041835903, "branches": 1920563732, "branch_misses": 22638, "wall_ns": 1077784228, "g_count_intern_chain_depth": 0, "g_count_intern_bucket_len": 1, "env_node_depth": 0, "env_node_chain_len": 1, "mode": "low"},
-    {"seed": 55, "instructions": 12583944617, "cycles": 3018954946, "branches": 1920563166, "branch_misses": 22234, "wall_ns": 2036574553, "g_count_intern_chain_depth": 0, "g_count_intern_bucket_len": 3, "env_node_depth": 0, "env_node_chain_len": 1, "mode": "low", "wall_note": "one-off scheduling outlier (1.04s expected; a co-running process inflated this wall sample — instructions/cycles/branches confirm low mode)"},
-    {"seed": 1000, "instructions": 13997943923, "cycles": 3960402763, "branches": 2526563157, "branch_misses": 25980, "wall_ns": 1202432149, "g_count_intern_chain_depth": 0, "g_count_intern_bucket_len": 3, "env_node_depth": 1, "env_node_chain_len": 3, "mode": "high"},
-    {"seed": 12345, "instructions": 12583944824, "cycles": 3047463984, "branches": 1920563137, "branch_misses": 22938, "wall_ns": 1051312221, "g_count_intern_chain_depth": 0, "g_count_intern_bucket_len": 1, "env_node_depth": 0, "env_node_chain_len": 1, "mode": "low"},
-    {"seed": 99999, "instructions": 13997943998, "cycles": 3544016789, "branches": 2526563145, "branch_misses": 24209, "wall_ns": 1185505774, "g_count_intern_chain_depth": 0, "g_count_intern_bucket_len": 1, "env_node_depth": 1, "env_node_chain_len": 2, "mode": "high"},
-    {"seed": 271828, "instructions": 13997944017, "cycles": 3929576087, "branches": 2526563113, "branch_misses": 22848, "wall_ns": 1202216980, "g_count_intern_chain_depth": 0, "g_count_intern_bucket_len": 2, "env_node_depth": 1, "env_node_chain_len": 2, "mode": "high"},
-    {"seed": 31415926, "instructions": 12583943881, "cycles": 3009799152, "branches": 1920562990, "branch_misses": 21188, "wall_ns": 1061435245, "g_count_intern_chain_depth": 0, "g_count_intern_bucket_len": 2, "env_node_depth": 0, "env_node_chain_len": 1, "mode": "low"}
+  {
+   "seed": 2,
+   "instructions": 13997945159,
+   "cycles": 4398730188,
+   "branches": 2526563543,
+   "branch_misses": 23611,
+   "wall_ns": 1189285235,
+   "g_count_intern_chain_depth": 0,
+   "g_count_intern_bucket_len": 2,
+   "env_node_depth": 1,
+   "env_node_chain_len": 3,
+   "mode": "high"
+  },
+  {
+   "seed": 3,
+   "instructions": 13997943338,
+   "cycles": 3991895698,
+   "branches": 2526563041,
+   "branch_misses": 24130,
+   "wall_ns": 1212930053,
+   "g_count_intern_chain_depth": 0,
+   "g_count_intern_bucket_len": 1,
+   "env_node_depth": 1,
+   "env_node_chain_len": 3,
+   "mode": "high"
+  },
+  {
+   "seed": 5,
+   "instructions": 13997946612,
+   "cycles": 3505146526,
+   "branches": 2526563571,
+   "branch_misses": 22559,
+   "wall_ns": 1207316580,
+   "g_count_intern_chain_depth": 0,
+   "g_count_intern_bucket_len": 1,
+   "env_node_depth": 1,
+   "env_node_chain_len": 3,
+   "mode": "high"
+  },
+  {
+   "seed": 8,
+   "instructions": 12583944342,
+   "cycles": 3053526967,
+   "branches": 1920563018,
+   "branch_misses": 22737,
+   "wall_ns": 1078668698,
+   "g_count_intern_chain_depth": 0,
+   "g_count_intern_bucket_len": 1,
+   "env_node_depth": 0,
+   "env_node_chain_len": 1,
+   "mode": "low"
+  },
+  {
+   "seed": 13,
+   "instructions": 12583944229,
+   "cycles": 3008938673,
+   "branches": 1920563119,
+   "branch_misses": 21112,
+   "wall_ns": 1040028767,
+   "g_count_intern_chain_depth": 0,
+   "g_count_intern_bucket_len": 1,
+   "env_node_depth": 0,
+   "env_node_chain_len": 1,
+   "mode": "low"
+  },
+  {
+   "seed": 21,
+   "instructions": 12583943907,
+   "cycles": 3044070563,
+   "branches": 1920562900,
+   "branch_misses": 22944,
+   "wall_ns": 1098260699,
+   "g_count_intern_chain_depth": 0,
+   "g_count_intern_bucket_len": 1,
+   "env_node_depth": 0,
+   "env_node_chain_len": 1,
+   "mode": "low"
+  },
+  {
+   "seed": 34,
+   "instructions": 12583942566,
+   "cycles": 3028199658,
+   "branches": 1920562713,
+   "branch_misses": 22504,
+   "wall_ns": 1060717292,
+   "g_count_intern_chain_depth": 0,
+   "g_count_intern_bucket_len": 1,
+   "env_node_depth": 0,
+   "env_node_chain_len": 1,
+   "mode": "low"
+  },
+  {
+   "seed": 42,
+   "instructions": 12583947216,
+   "cycles": 3041835903,
+   "branches": 1920563732,
+   "branch_misses": 22638,
+   "wall_ns": 1077784228,
+   "g_count_intern_chain_depth": 0,
+   "g_count_intern_bucket_len": 1,
+   "env_node_depth": 0,
+   "env_node_chain_len": 1,
+   "mode": "low"
+  },
+  {
+   "seed": 55,
+   "instructions": 12583944617,
+   "cycles": 3018954946,
+   "branches": 1920563166,
+   "branch_misses": 22234,
+   "wall_ns": 2036574553,
+   "g_count_intern_chain_depth": 0,
+   "g_count_intern_bucket_len": 3,
+   "env_node_depth": 0,
+   "env_node_chain_len": 1,
+   "mode": "low",
+   "wall_note": "one-off scheduling outlier (1.04s expected; a co-running process inflated this wall sample \u2014 instructions/cycles/branches confirm low mode)"
+  },
+  {
+   "seed": 1000,
+   "instructions": 13997943923,
+   "cycles": 3960402763,
+   "branches": 2526563157,
+   "branch_misses": 25980,
+   "wall_ns": 1202432149,
+   "g_count_intern_chain_depth": 0,
+   "g_count_intern_bucket_len": 3,
+   "env_node_depth": 1,
+   "env_node_chain_len": 3,
+   "mode": "high"
+  },
+  {
+   "seed": 12345,
+   "instructions": 12583944824,
+   "cycles": 3047463984,
+   "branches": 1920563137,
+   "branch_misses": 22938,
+   "wall_ns": 1051312221,
+   "g_count_intern_chain_depth": 0,
+   "g_count_intern_bucket_len": 1,
+   "env_node_depth": 0,
+   "env_node_chain_len": 1,
+   "mode": "low"
+  },
+  {
+   "seed": 99999,
+   "instructions": 13997943998,
+   "cycles": 3544016789,
+   "branches": 2526563145,
+   "branch_misses": 24209,
+   "wall_ns": 1185505774,
+   "g_count_intern_chain_depth": 0,
+   "g_count_intern_bucket_len": 1,
+   "env_node_depth": 1,
+   "env_node_chain_len": 2,
+   "mode": "high"
+  },
+  {
+   "seed": 271828,
+   "instructions": 13997944017,
+   "cycles": 3929576087,
+   "branches": 2526563113,
+   "branch_misses": 22848,
+   "wall_ns": 1202216980,
+   "g_count_intern_chain_depth": 0,
+   "g_count_intern_bucket_len": 2,
+   "env_node_depth": 1,
+   "env_node_chain_len": 2,
+   "mode": "high"
+  },
+  {
+   "seed": 31415926,
+   "instructions": 12583943881,
+   "cycles": 3009799152,
+   "branches": 1920562990,
+   "branch_misses": 21188,
+   "wall_ns": 1061435245,
+   "g_count_intern_chain_depth": 0,
+   "g_count_intern_bucket_len": 2,
+   "env_node_depth": 0,
+   "env_node_chain_len": 1,
+   "mode": "low"
+  }
+ ],
+ "determinism_recheck": [
+  {
+   "seed": 1,
+   "rep1_instructions": 13997944963,
+   "rep2_instructions": 13997944391,
+   "env_node": "depth=1 len=2 both reps"
+  },
+  {
+   "seed": 42,
+   "rep1_instructions": 12583947165,
+   "rep2_instructions": 12583947253,
+   "env_node": "depth=0 len=1 both reps"
+  },
+  {
+   "seed": 3,
+   "rep1_instructions": 13997943159,
+   "rep2_instructions": 13997943347,
+   "env_node": "depth=1 len=3 both reps"
+  },
+  {
+   "seed": 12345,
+   "rep1_instructions": 12583944766,
+   "rep2_instructions": 12583944877,
+   "env_node": "depth=0 len=1 both reps"
+  }
+ ],
+ "puc_control_same_session": {
+  "command": "taskset -c 0 perf stat -e instructions:u ./build/lua-c/lua tools/microbench.lua global_arith",
+  "runs_instructions": [
+   10512001761,
+   9602998502,
+   9603002419,
+   10511998997
   ],
-  "determinism_recheck": [
-    {"seed": 1, "rep1_instructions": 13997944963, "rep2_instructions": 13997944391, "env_node": "depth=1 len=2 both reps"},
-    {"seed": 42, "rep1_instructions": 12583947165, "rep2_instructions": 12583947253, "env_node": "depth=0 len=1 both reps"},
-    {"seed": 3, "rep1_instructions": 13997943159, "rep2_instructions": 13997943347, "env_node": "depth=1 len=3 both reps"},
-    {"seed": 12345, "rep1_instructions": 12583944766, "rep2_instructions": 12583944877, "env_node": "depth=0 len=1 both reps"}
-  ],
-  "puc_control_same_session": {
-    "command": "taskset -c 0 perf stat -e instructions:u ./build/lua-c/lua tools/microbench.lua global_arith",
-    "runs_instructions": [10512001761, 9602998502, 9603002419, 10511998997],
-    "note": "PUC itself is bimodal across processes (9.60G / 10.51G, +9.5%) on the identical workload file in the identical session — the reference implementation has the same class of per-process data-dependent variation (its own string-hash seed randomization)."
-  },
-  "measured_structural_separation": {
-    "observable": "the _ENV table's Node chain AT THE MAIN POSITION of the hot global's name key ('g_count'): env_node_depth (0 = alone at main position; 1 = displaced behind a colliding key) and env_node_chain_len (nodes reachable from that main position)",
-    "result": "ALL 8 low-mode seeds have env_node_depth=0/chain_len=1; ALL 7 high-mode seeds have env_node_depth=1/chain_len>=2. Exact separation, zero exceptions, reproducible across repeated runs of the same seed.",
-    "intern_chain_negative_result": "The intern-table chain depth of 'g_count' itself is 0 in BOTH modes (measured) — the intern-chain hypothesis from the earlier artifact version is DISPROVEN as the separating mechanism and is not claimed.",
-    "branch_corroboration": "low mode executes 1,920,563,xxx branches; high mode 2,565,563,xxx — a delta of 645,000,000 = 50M x 12.9 branches/iteration, consistent with extra per-iteration comparison branches in the table-get path."
-  },
-  "conclusion_bounded": {
-    "proven": "On the CANONICAL microbench workload (byte-identical file + args + setup), the VM hash seed deterministically selects one of two instruction modes (12,583,94x vs 13,997,94x, delta = 1,414,000,000 = 50M x 28.28 instr/iter), and the modes are EXACTLY separated by the measured _ENV-node placement of the hot global's key (main-position occupancy).",
-    "inferred_not_disassembled": "The instruction-level attribution of the exact 28-instr/iter delta to the extra chain-node visit in the GETTABUP/SETTABUP table-get path is CONSISTENT with the measured branch delta (+12.9 branches/iter) and the node facts, but was not verified instruction-by-instruction by disassembly.",
-    "not_claimed": "No claim about workloads other than global_arith; no claim that the intern-string table chain is the mechanism (disproven above); no wall-time causality (wall is dominated by scheduling; see seed 55 wall outlier)."
-  },
-  "gate_implication": "Any cross-process wall/instruction comparison of global_arith samples one of two seed-controlled modes. The fail-safe gate prints the NOISE? diagnostic but preserves threshold verdicts. Baselines record multi-run medians (mode blends); single-mode sampling is FORBIDDEN (documented in baseline-approved.json baseline_identity)."
+  "note": "PUC itself is bimodal across processes (9.60G / 10.51G, +9.5%) on the identical workload file in the identical session \u2014 the reference implementation has the same class of per-process data-dependent variation (its own string-hash seed randomization)."
+ },
+ "measured_structural_separation": {
+  "observable": "the _ENV table's Node chain AT THE MAIN POSITION of the hot global's name key ('g_count'): env_node_depth (0 = alone at main position; 1 = displaced behind a colliding key) and env_node_chain_len (nodes reachable from that main position)",
+  "result": "ALL 8 low-mode seeds have env_node_depth=0/chain_len=1; ALL 7 high-mode seeds have env_node_depth=1/chain_len>=2. Exact separation, zero exceptions, reproducible across repeated runs of the same seed.",
+  "intern_chain_negative_result": "The intern-table chain depth of 'g_count' itself is 0 in BOTH modes (measured) \u2014 the intern-chain hypothesis from the earlier artifact version is DISPROVEN as the separating mechanism and is not claimed.",
+  "branch_corroboration": "low mode executes 1920563068 branches (median); high mode 2526563157 \u2014 a delta of 606000088.5 = 50M x 12.120 branches/iteration (median-derived; the earlier 645M/12.9 prose was arithmetically WRONG and is corrected by tools/validate_noise_lanes.py)."
+ },
+ "conclusion_bounded": {
+  "proven": "On the CANONICAL microbench workload (byte-identical file + args + setup), the VM hash seed deterministically selects one of two instruction modes (12,583,94x vs 13,997,94x, instruction-median delta = 1413999731.5 = 50M x 28.2800 instr/iter), and the modes are EXACTLY separated by the measured _ENV-node placement of the hot global's key (main-position occupancy).",
+  "inferred_not_disassembled": "The instruction-level attribution of the exact 28-instr/iter delta to the extra chain-node visit in the GETTABUP/SETTABUP table-get path is CONSISTENT with the measured branch delta (+12.9 branches/iter) and the node facts, but was not verified instruction-by-instruction by disassembly.",
+  "not_claimed": "No claim about workloads other than global_arith; no claim that the intern-string table chain is the mechanism (disproven above); no wall-time causality (wall is dominated by scheduling; see seed 55 wall outlier)."
+ },
+ "gate_implication": "Any cross-process wall/instruction comparison of global_arith samples one of two seed-controlled modes. The fail-safe gate prints the NOISE? diagnostic but preserves threshold verdicts. Baselines record multi-run medians (mode blends); single-mode sampling is FORBIDDEN (documented in baseline-approved.json baseline_identity).",
+ "mechanical_summary": {
+  "low_count": 8,
+  "high_count": 7,
+  "low_median_instructions": 12583944285.5,
+  "high_median_instructions": 13997944017,
+  "delta_instructions": 1413999731.5,
+  "low_median_branches": 1920563068.5,
+  "high_median_branches": 2526563157,
+  "delta_branches": 606000088.5,
+  "low_median_cycles": 3035017780.5,
+  "high_median_cycles": 3960402763,
+  "delta_cycles": 925384982.5,
+  "low_median_wall_ns": 1069609736.5,
+  "high_median_wall_ns": 1202216980,
+  "delta_wall_ns": 132607243.5,
+  "delta_instructions_per_iteration": 28.27999463,
+  "delta_branches_per_iteration": 12.12000177
+ }
 }

@@ -746,6 +746,79 @@ def noise_annotation(old: float, current: float,
     return f"  NOISE? [runs {lo:.3f}..{hi:.3f}, overlap {overlap / spread * 100:.0f}%]"
 
 
+# ---------------------------------------------------------------------------
+# P16.45-finalization: production baseline-serialization helpers.
+# The CLI path and tools/test_perf_gate.py call THESE SAME functions — no
+# duplicated test logic that could stay green while production breaks.
+# ---------------------------------------------------------------------------
+
+def build_baseline_document(current: dict, spreads: dict, runs: int, core: str,
+                           baseline_phase: str, note=None, prov=None) -> dict:
+    """Assemble the complete reviewable baseline document.
+
+    `prov` overrides the default provenance.block() result (tests inject
+    deterministic hashes without touching live binaries)."""
+    ratios = current.get("ratios", {})
+    geomean = (math.exp(sum(math.log(r) for r in ratios.values()) / len(ratios))
+               if ratios else 0.0)
+    return {
+        "created_utc": current["created_utc"],
+        "provenance": prov if prov is not None else
+            provenance.block(zig_bin=ZIG_LUA, puc_bin=PUC_LUA,
+                             optimize_mode="ReleaseFast"),
+        "host": current["host"],
+        "runs": runs,
+        "core": core,
+        "zig": current["zig"],
+        "puc": current["puc"],
+        "ratios": ratios,
+        "geomean": geomean,
+        "zig_spread": spreads,
+        "baseline_identity": {
+            "baseline_phase": baseline_phase,
+            "note": (note or
+                     "Approved regression baseline. Updating this file is an "
+                     "EXPLICIT operation; the historical P15.37 baseline is "
+                     "preserved separately in baseline-p15.37.json and is "
+                     "never overwritten."),
+        },
+    }
+
+
+def validate_baseline_document(doc: dict) -> bool:
+    """Strict schema check for a serialized baseline document."""
+    required = ("provenance", "geomean", "zig", "puc", "ratios",
+                "zig_spread", "baseline_identity", "created_utc",
+                "host", "runs", "core")
+    for key in required:
+        if key not in doc or doc[key] in (None, {}, []):
+            return False
+    ident = doc["baseline_identity"]
+    if not isinstance(ident, dict) or not ident.get("baseline_phase"):
+        return False
+    return True
+
+
+def write_baseline_atomic(path, doc: dict) -> bool:
+    """Serialize + strict-reload-validate + atomically replace.
+
+    On ANY failure the temp file is removed and the existing approved
+    baseline is untouched; no .tmp residue survives either way."""
+    tmp = Path(str(path) + ".tmp")
+    try:
+        tmp.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+        reloaded = json.loads(tmp.read_text(encoding="utf-8"))
+        if reloaded.get("zig") != doc.get("zig") \
+                or not validate_baseline_document(reloaded):
+            tmp.unlink(missing_ok=True)
+            return False
+        os.replace(tmp, path)
+        return True
+    except (OSError, json.JSONDecodeError):
+        tmp.unlink(missing_ok=True)
+        return False
+
+
 def regression_check(zig: Dict[str, float], baseline: dict,
                      spreads: Dict[str, Dict[str, float]] | None = None) -> tuple[bool, bool]:
     """Compare current zig times vs baseline. Returns (any_warn, any_fail).
@@ -879,53 +952,17 @@ def main() -> int:
         print(f"\njson: {out_path}")
 
     if args.update_baseline:
-        BASELINE.parent.mkdir(parents=True, exist_ok=True)
-        # P16.45-correction BLOCKER 4: the update emits the COMPLETE
-        # reviewable schema — provenance (both binary hashes via
-        # provenance.block), geomean, zig/puc medians, ratios, the session
-        # spreads (distribution context for the NOISE? diagnostics), runs/
-        # core/host — written via temp file + atomic replace with
-        # reload-validation BEFORE the approved baseline is replaced, so an
-        # interrupted update cannot truncate the gate baseline. The note is
-        # caller-supplied via --baseline-note (no manual JSON surgery).
-        ratios = current.get("ratios", {})
-        geomean = (math.exp(sum(math.log(r) for r in ratios.values()) / len(ratios))
-                   if ratios else 0.0)
-        baseline_doc = {
-            "created_utc": current["created_utc"],
-            "provenance": provenance.block(zig_bin=ZIG_LUA, puc_bin=PUC_LUA,
-                                           optimize_mode="ReleaseFast"),
-            "host": current["host"],
-            "runs": args.runs,
-            "core": args.core,
-            "zig": current["zig"],
-            "puc": current["puc"],
-            "ratios": ratios,
-            "geomean": geomean,
-            "zig_spread": zig_spread,
-            "baseline_identity": {
-                "baseline_phase": args.baseline_phase,
-                "note": (args.baseline_note or
-                         "Approved regression baseline. Updating this file is an "
-                         "EXPLICIT operation; the historical P15.37 baseline is "
-                         "preserved separately in baseline-p15.37.json and is "
-                         "never overwritten."),
-            },
-        }
-        tmp = BASELINE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(baseline_doc, indent=2) + "\n", encoding="utf-8")
-        reloaded = json.loads(tmp.read_text(encoding="utf-8"))
-        if (reloaded.get("zig") != baseline_doc["zig"]
-                or "geomean" not in reloaded
-                or "provenance" not in reloaded
-                or "zig_spread" not in reloaded):
-            tmp.unlink(missing_ok=True)
-            print("\nBaseline update FAILED validation (schema incomplete); "
+        # P16.45-finalization: the CLI calls the SAME shared helpers the
+        # serializer tests exercise (build/validate/write_baseline_atomic).
+        baseline_doc = build_baseline_document(
+            current, zig_spread, args.runs, args.core,
+            args.baseline_phase, args.baseline_note)
+        if not write_baseline_atomic(BASELINE, baseline_doc):
+            print("\nBaseline update FAILED validation; "
                   "approved baseline NOT replaced.")
             return 1
-        os.replace(tmp, BASELINE)
         print(f"\nBaseline updated: {BASELINE} (phase {args.baseline_phase}, "
-              f"geomean {geomean:.5f}, full provenance + spreads)")
+              f"geomean {baseline_doc['geomean']:.5f}, full provenance + spreads)")
         return 0
 
     if BASELINE.exists():

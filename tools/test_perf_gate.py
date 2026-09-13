@@ -14,6 +14,8 @@ from __future__ import annotations
 import importlib.util
 import io
 import sys
+import tempfile
+import json as _json
 import contextlib
 from pathlib import Path
 
@@ -164,54 +166,73 @@ check("negative: P16.44 shape false-greens", f_old is False,
       "old aggregation returned fail=False with a real FAIL lane")
 
 # ---------------------------------------------------------------------------
-# P16.45-correction: baseline document schema test (BLOCKER 4).
-# The --update-baseline mechanism must emit a COMPLETE reviewable schema
-# (provenance + geomean + workloads + spreads), write atomically, and
-# reload-validate before replacing. Test the serialization helper shape by
-# monkeypatching the IO around the update path.
+# P16.45-finalization BLOCKER 4: test the REAL production serializer
+# (build_baseline_document / validate_baseline_document /
+# write_baseline_atomic — the same helpers the CLI --update-baseline path
+# calls). The previous hand-rolled version stayed green when production
+# broke; this one cannot.
 # ---------------------------------------------------------------------------
-import tempfile, os, json as _json
+import copy
 
 
-def test_baseline_schema():
-    """Simulate --update-baseline end-to-end with a fake BASELINE path."""
+def _mk_current():
+    return {"created_utc": "2026-09-14T00:00:00Z",
+            "host": {"platform": "test"},
+            "zig": {"w1": 1.0, "w2": 2.0},
+            "puc": {"w1": 0.5, "w2": 1.0},
+            "ratios": {"w1": 2.0, "w2": 2.0}}
+
+
+SPREADS = {"w1": {"min": 0.9, "max": 1.1, "median": 1.0},
+           "w2": {"min": 1.9, "max": 2.1, "median": 2.0}}
+INJ_PROV = {"git_head": "cccc" * 10, "zig_binary_sha256": "dddd" * 8,
+            "puc_binary_sha256": "eeee" * 8}
+
+
+def test_real_serializer():
+    doc = pc.build_baseline_document(_mk_current(), SPREADS, 7, "0",
+                                    "test-phase", "caller note", prov=INJ_PROV)
+    check("serializer: caller note recorded", doc["baseline_identity"]["note"] == "caller note")
+    check("serializer: geomean preserved", doc["geomean"] == 2.0)
+    check("serializer: spreads preserved", doc["zig_spread"] == SPREADS)
+    check("serializer: injected provenance", doc["provenance"]["git_head"] == INJ_PROV["git_head"])
+    check("serializer: validate accepts", pc.validate_baseline_document(doc))
+
+    # Strict reload + atomic write + no residue + old-baseline survival.
     with tempfile.TemporaryDirectory() as td:
-        fake = Path(td) / "baseline-approved.json"
-        orig_baseline = pc.BASELINE
-        pc.BASELINE = fake
-        try:
-            fake.write_text(_json.dumps({"zig": {"old": 1.0}, "legacy": True}) + "\n")
-            baseline_doc = {
-                "created_utc": "2026-09-10T00:00:00Z",
-                "provenance": {"git_head": "aaaa", "puc_binary_sha256": "bbbb"},
-                "host": {"platform": "test"},
-                "runs": 7,
-                "core": "0",
-                "zig": {"w1": 1.0, "w2": 2.0},
-                "puc": {"w1": 0.5, "w2": 1.0},
-                "ratios": {"w1": 2.0, "w2": 2.0},
-                "geomean": 2.0,
-                "zig_spread": {"w1": {"min": 0.9, "max": 1.1, "median": 1.0}},
-                "baseline_identity": {"baseline_phase": "test", "note": "n"},
-            }
-            # Write via the same tmp+rename discipline the tool uses.
-            tmp = fake.with_suffix(".json.tmp")
-            tmp.write_text(_json.dumps(baseline_doc, indent=2) + "\n")
-            reloaded = _json.loads(tmp.read_text())
-            assert reloaded.get("zig") == baseline_doc["zig"] and "geomean" in reloaded \
-                and "provenance" in reloaded and "zig_spread" in reloaded
-            os.replace(tmp, fake)
-            # Survived crash-safety: no .tmp residue, strict JSON parse.
-            assert not tmp.exists()
-            final = _json.loads(fake.read_text())
-            assert set(("provenance", "geomean", "zig", "puc", "ratios",
-                        "zig_spread", "baseline_identity")) <= set(final)
-            check("baseline schema complete + atomic + strict-parse", True)
-        finally:
-            pc.BASELINE = orig_baseline
+        fake = Path(td) / "baseline.json"
+        fake.write_text('{"zig": {"old": 1.0}}\n')
+        assert pc.write_baseline_atomic(fake, doc)
+        reloaded = _json.loads(fake.read_text())
+        check("serializer: atomic write + strict reload", reloaded["geomean"] == 2.0)
+        check("serializer: no tmp residue", not (Path(str(fake) + ".tmp").exists()))
+
+        # Validation failure must NOT replace the old approved baseline.
+        bad = copy.deepcopy(doc)
+        del bad["zig_spread"]
+        ok = pc.write_baseline_atomic(fake, bad)
+        after = _json.loads(fake.read_text())
+        check("serializer: invalid doc leaves old baseline",
+              ok is False and after.get("geomean") == 2.0)
+
+        # validate_baseline_document rejects each missing section.
+        for missing in ("provenance", "geomean", "zig", "ratios",
+                        "zig_spread", "baseline_identity"):
+            bad2 = copy.deepcopy(doc)
+            del bad2[missing]
+            if not pc.validate_baseline_document(bad2):
+                continue
+            check(f"serializer: validate rejects missing {missing}", False)
+        check("serializer: validate rejects every missing section", True)
+        empty_ident = copy.deepcopy(doc)
+        empty_ident["baseline_identity"] = {"baseline_phase": ""}
+        check("serializer: validate rejects empty phase",
+              not pc.validate_baseline_document(empty_ident))
 
 
-test_baseline_schema()
+test_real_serializer()
+
+
 
 # ---------------------------------------------------------------------------
 # P16.45-correction: every canonical JSON artifact must parse strictly
@@ -228,6 +249,11 @@ CANONICAL = [
     "tools/perf/baseline-approved.json",
     "tools/perf/noise-lanes.json",
     "tools/perf/baseline-p15.37.json",
+    # P16.45-finalization: the list must actually cover EVERY canonical
+    # artifact (matrix/smoke were previously omitted while the docstring
+    # claimed full coverage).
+    "tools/status/current-matrix.json",
+    "tools/status/current-smoke.json",
 ]
 for rel in CANONICAL:
     p = REPO / rel

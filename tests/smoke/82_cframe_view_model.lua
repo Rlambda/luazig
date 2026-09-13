@@ -229,6 +229,34 @@ do
   assert(saw_next, "call hook observed the next C frame via TFORCALL")
 end
 
+-- 19b. GC atomic step DURING the sync hook body over the TFORCALL window
+--      (P16.42): gcClearDeadFrameRegisters nils "dead" registers of the
+--      parked caller (>= live_reg_top[pc]) once per cycle; the TFORCALL
+--      window R[A+4..A+6] sits above the parked pc's compile-time
+--      liveness, so a child-frame guard that ignores C view frames let
+--      the clear wipe the staged state mid-call (next received nil).
+--      Deterministic regression: hammer the cycle so an atomic step
+--      inevitably fires inside a hook body's getinfo allocation while
+--      the iterator window is live.
+do
+  collectgarbage("collect")  -- fresh cycle; subsequent allocations re-arm it
+  for round = 1, 50 do
+    local t = {}
+    for j = 1, 3 do t[j] = j end
+    local sum = 0
+    debug.sethook(function()
+      local i = debug.getinfo(2)  -- allocates the info table (GC step site)
+      if i and i.what == "C" and (i.name == "for iterator" or i.name == "next") then
+        sum = sum + 1
+      end
+    end, "c")
+    for k in next, t do sum = sum + k * 1000 end
+    debug.sethook()
+    -- t = {1,2,3}: keys 1..3 -> 6000; 4 iterator calls (last returns nil)
+    assert(sum == 6004, "round " .. round .. ": iterator state survived")
+  end
+end
+
 -- 20. testC called from bytecode (its C-frame machinery above the view
 --     model) and from inside a sort comparator.
 do

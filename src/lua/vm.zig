@@ -25457,17 +25457,41 @@ pub const Vm = struct {
                         if (tbc_reg < regs.len and tbc_reg >= clear_from) clear_from = tbc_reg + 1;
                     }
                 }
-                // PUC-faithful overlapping frames: a child frame's func_slot
-                // may be within this frame's register window. Don't clear
-                // registers that belong to a child frame — they are live
-                // roots of the child, not dead registers of this frame.
+                // PUC-faithful overlapping frames: a child activation's
+                // func_slot may be within this frame's register window —
+                // for Lua children (luaD_precall's LUA_VLCL branch, the
+                // callee at R[A]) and C-frame children alike (precallC:
+                // `ci->func = func` points INTO the caller's window, the
+                // exact shape of our view C-frames). Everything at or above
+                // the child's func_slot is the child activation's own
+                // region (func + args for a C call, func + frame for a Lua
+                // call) — live territory of the callee, never dead
+                // registers of this frame. This is the GC-side expression
+                // of PUC's stack-ownership model: traversethread marks
+                // [1..L->top) wholesale and the collector NEVER clears
+                // stack slots, so any region below the live activations'
+                // top is untouchable; luaD_shrinkstack's `stackinuse`
+                // likewise accounts for every ci->top, C frames included.
+                //
+                // The C-frame arm is load-bearing for parked parents whose
+                // runtime staged a call window ABOVE their compile-time
+                // liveness: OP_TFORCALL copies iterator/state/control to
+                // R[A+4..A+6], registers that live_reg_top[TFORCALL-pc]
+                // (live-on-entry analysis) does not cover because the
+                // instruction itself writes them. While the C activation
+                // over that window is in flight (sync hook body, or the
+                // builtin itself), a GC atomic step must not nil the window
+                // — without this guard the staged state was cleared to nil
+                // and the iterator received nil as its state argument (the
+                // P16.42 smoke-82 "c"-hook/TFORCALL corruption). The same
+                // guard protects a builtin's outs window [A+1+nargs..]
+                // against an atomic step that fires mid-builtin after
+                // results were staged.
                 var clear_end: usize = regs.len;
                 if (i + 1 < th.call_frames.len()) {
                     const child = th.call_frames.getConstPtr(i + 1);
-                    if (child.proto() != null) {
-                        const child_start = child.func_slot - frame.frameBase();
-                        if (child_start < clear_end) clear_end = child_start;
-                    }
+                    const child_start = child.func_slot -| frame.frameBase();
+                    if (child_start < clear_end) clear_end = child_start;
                 }
                 if (clear_from < clear_end) {
                     for (regs[clear_from..clear_end]) |*slot| {

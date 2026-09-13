@@ -27323,18 +27323,28 @@ pub const Vm = struct {
             // cells + all Cells; the cell-phase errdefer above is inert.
             cells_owned_by_closure_phase = true;
             if (cl_registered) {
+                // P16.44 Task 1: unregister the closure FIRST so no
+                // registered GC object references the Cells while they
+                // are being rolled back (PUC freeobj order — the closure
+                // and each UpVal are SEPARATE GC objects; a partially
+                // constructed set must be rolled back without dangling
+                // registry state). The P16.43 shape stopped here and left
+                // every Cell as an unreachable registry entry until a
+                // later collection or Vm.deinit — not transactional.
                 self.gcUnregisterObject(.{ .closure = cl });
                 self.testc_obj_functions -= 1;
                 self.gcNoteFree(@sizeOf(Closure) + cells.len * @sizeOf(*Cell));
-            } else {
-                // Closure never registered: the Cells are still on the GC
-                // registry under their own object identity — undo them
-                // here (their ownership moved with the handoff flag).
-                for (cells) |c| {
-                    self.gcUnregisterObject(.{ .cell = c });
-                    self.gcNoteFree(@sizeOf(Cell));
-                    self.alloc.destroy(c);
-                }
+            }
+            // Every Cell is a SEPARATE GC object (PUC luaF_initupvals:
+            // one GCObject per UpVal, freed by its own freeobj arm):
+            // roll back its registry entry, accounting, and storage on
+            // BOTH arms — pre-registration (they were never absorbed by
+            // the closure) and post-registration (the closure that would
+            // have owned them is already unregistered above).
+            for (cells) |c| {
+                self.gcUnregisterObject(.{ .cell = c });
+                self.gcNoteFree(@sizeOf(Cell));
+                self.alloc.destroy(c);
             }
             if (cl.proto) |p| {
                 if (p.tree) |t| t.releaseTree(self.alloc);
@@ -27798,15 +27808,24 @@ pub const Vm = struct {
         errdefer {
             cl_owned_by_phase_d = true;
             cells_owned_by_phase_d = true;
+            // P16.44 Task 1: identical rollback shape as
+            // createBytecodeChunkClosure — closure unregistered FIRST,
+            // then every Cell (separate GC objects, PUC luaF_initupvals)
+            // unregistered/accounted/destroyed on BOTH arms. The arm is
+            // dormant today (no fallible op follows registration here:
+            // constants are pre-resolved by preResolveUndumpedConstants
+            // and chargeTreeFootprint does not allocate), but leaving the
+            // old asymmetric branch would silently become the P16.43 leak
+            // again the moment a fallible adoption step is added after
+            // gcRegisterClosure.
             if (cl_registered) {
                 self.gcUnregisterObject(.{ .closure = cl });
                 self.gcNoteFree(@sizeOf(Closure) + cells.len * @sizeOf(*Cell));
-            } else {
-                for (cells) |c| {
-                    self.gcUnregisterObject(.{ .cell = c });
-                    self.gcNoteFree(@sizeOf(Cell));
-                    self.alloc.destroy(c);
-                }
+            }
+            for (cells) |c| {
+                self.gcUnregisterObject(.{ .cell = c });
+                self.gcNoteFree(@sizeOf(Cell));
+                self.alloc.destroy(c);
             }
             if (cl.proto) |p| {
                 if (p.tree) |t| t.releaseTree(self.alloc);
@@ -46937,60 +46956,191 @@ test "vm: P16.33 R0.3 — checkpanic sub-VM shares the testC allocator control" 
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// P16.43 Iteration 1: closure-construction OOM single-owner tests.
+// P16.44 Task 2: closure-construction transactional tests.
 //
-// The P16.42 shape double-freed `cells` on any failure after the
-// closure-phase errdefer became active (both errdefers ran: the second
-// freed the array, then the first iterated the freed slice and freed it
-// AGAIN). Arena-based tests (Task 7.2/8.1) masked this — an arena's free
-// is a no-op. These tests run the VM on std.testing.allocator (which
-// DIAGNOSES invalid/double frees and reports leaks) and route a
-// FailingAllocator into the constructors at every fail index, so each
-// failure edge (cells array, cell alloc N, testc charge, Closure object,
-// registry growth) exercises the single-owner cleanup. Modeled on the
-// Task 7.2 differential structure.
+// The P16.43 claim "one cleanup owner on every edge" was FALSE on the
+// post-registration edge: the cl_registered arm unregistered the closure
+// but left every Cell as an unreachable GC-registry entry (each Cell is a
+// separate GC object — PUC luaF_initupvals/freeobj) with its accounting
+// charged, until a later collection or Vm.deinit swept it. These tests
+// snapshot the FULL observable state (registry length, gc_count_kb,
+// testc_obj_functions, tree ref state) before each injected failure and
+// assert exact restoration AFTER — no reliance on vm.deinit to hide drift.
+//
+// The fail-index sweep includes indices PROVEN to land inside
+// resolveTreeConstants after cl_registered=true (see the S-1 logic below):
+// the constructor's LAST fallible operation is the constant resolution of
+// an unresolved compiled tree (chargeTreeFootprint allocates nothing), so
+// the final pre-success failing allocation is necessarily inside the
+// post-registration resolution phase.
 
-// Build a minimal valid one-upvalue Proto on the given allocator
-// (ProtoBuilder style, mirroring Task 8.1).
-fn p43BuildOneUpvalueProto(falloc: std.mem.Allocator) !*bc.Proto {
+// Build an unresolved compiled Proto with `nups` upvalue descriptors and
+// `nconsts` integer constants. resolveTreeConstants allocates for EVERY
+// compiled proto regardless of constant kind (stageResolveTree stages a
+// resolved_values array per proto + the staging list grows), so the
+// post-registration adoption phase is allocation-exercised without
+// VM-interning string constants — builder constants must stay tree-owned;
+// VM-interned ones would be destroyed by the tree while still linked in
+// the VM intern table (a test bug caught by the Debug nextShort assert).
+fn p44BuildProto(falloc: std.mem.Allocator, vm: *Vm, nups: usize, nconsts: usize) !*bc.Proto {
+    _ = vm;
     var builder = bc.ProtoBuilder.init(falloc);
     errdefer builder.deinit();
     _ = try builder.emitSimple(.return0, 1);
-    _ = try builder.internConst(.{ .int = 42 });
+    var s: usize = 0;
+    while (s < nconsts) : (s += 1) {
+        _ = try builder.internConst(.{ .int = @intCast(1000 + s) });
+    }
+    var u: usize = 0;
+    while (u < nups) : (u += 1) {
+        _ = try builder.addUpvalue(.{ .instack = false, .idx = 0, .is_const = false });
+    }
     const proto = try builder.finish();
     builder.deinit();
+    // The builder's finish leaves constants_resolved=false for compiled
+    // trees (bytecode.zig:916 default); assert the precondition.
+    try std.testing.expect(!proto.tree.?.flags.constants_resolved);
     return proto;
 }
 
-test "P16.43: createBytecodeChunkClosure OOM single-owner (every fail index)" {
+test "P16.44: createBytecodeChunkClosure fully transactional (every fail index)" {
     const testing = std.testing;
     var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
-    const functions_before = vm.testc_obj_functions;
+    const functions0 = vm.testc_obj_functions;
 
     var fail_idx: usize = 0;
     var tested_failures: usize = 0;
-    while (fail_idx <= 16) : (fail_idx += 1) {
+    var first_success_idx: ?usize = null;
+    while (fail_idx <= 64) : (fail_idx += 1) {
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
             .fail_index = fail_idx,
             .resize_fail_index = fail_idx,
         });
+        const proto = try p44BuildProto(vm.alloc, &vm, 3, 8);
         const saved_alloc = vm.alloc;
         vm.alloc = failing.allocator();
         defer vm.alloc = saved_alloc;
-        const proto = try p43BuildOneUpvalueProto(saved_alloc);
-        // The tree starts at ref_count 1 (ProtoBuilder.finish); this
-        // defer releases that initial reference (the constructor's own
-        // retain/release balances inside the probe).
-        defer proto.tree.?.releaseTree(saved_alloc);
+        proto.tree.?.retainTree();
+        const tree_ref0 = proto.tree.?.ref_count;
+        defer {
+            proto.tree.?.releaseTree(saved_alloc);
+            proto.tree.?.releaseTree(saved_alloc);
+        }
+
+        // Full observable state BEFORE the constructor probe.
+        const gc_len0 = vm.gc_objects.items.len;
+        const count0 = vm.gc_count_kb;
+        const funcs0 = vm.testc_obj_functions;
+
         if (vm.createBytecodeChunkClosure(proto)) |cl| {
-            // Success edge: undo the registration so the loop's per-index
-            // accounting assertions keep meaning; the break ends probing.
+            // Success: the adoption resolved the constants (post-
+            // registration phase completed) — this index is the first
+            // non-failing one; everything below it failed somewhere.
+            try testing.expect(proto.tree.?.flags.constants_resolved);
+            // Undo registration (single manual teardown mirrors the
+            // constructor's success-side ownership).
             _ = vm.gcUnregisterObject(.{ .closure = cl });
             vm.testc_obj_functions -= 1;
             vm.gcNoteFree(@sizeOf(Closure) + cl.upvalues.len * @sizeOf(*Cell));
-            // The closure held a tree retain (retainTreeForClosure);
-            // manual teardown bypasses gcFreeObject, so release it here.
+            for (cl.upvalues) |c| {
+                _ = vm.gcUnregisterObject(.{ .cell = c });
+                vm.gcNoteFree(@sizeOf(Cell));
+                saved_alloc.destroy(c);
+            }
+            if (cl.proto) |p| {
+                if (p.tree) |t| t.releaseTree(saved_alloc);
+            }
+            const ua = vm.alloc;
+            vm.alloc = saved_alloc;
+            ua.free(cl.upvalues);
+            ua.destroy(cl);
+            first_success_idx = fail_idx;
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            tested_failures += 1;
+            // EXACT restoration of every observable — the registry must
+            // not grow (the P16.43 bug left 3 Cell entries per failing
+            // post-registration index), the accounting must return to the
+            // byte-exact pre-call value, and the tree ref must balance.
+            try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
+            try testing.expectEqual(count0, vm.gc_count_kb);
+            try testing.expectEqual(funcs0, vm.testc_obj_functions);
+            try testing.expectEqual(tree_ref0, proto.tree.?.ref_count);
+        }
+    }
+    try testing.expect(tested_failures > 0);
+    try testing.expect(first_success_idx != null);
+    // PROOF that the sweep covered the post-registration phase: the last
+    // failing index (S-1) is the constructor's final fallible allocation,
+    // which for an unresolved compiled tree is inside resolveTreeConstants
+    // (stageResolveTree stages the per-proto resolved_values arrays) —
+    // i.e. cl_registered was already true there. Re-run S-1 explicitly
+    // and assert the same full restoration on it.
+    const s = first_success_idx.?;
+    if (s > 0) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = s - 1,
+            .resize_fail_index = s - 1,
+        });
+        const proto = try p44BuildProto(vm.alloc, &vm, 3, 8);
+        const saved_alloc = vm.alloc;
+        vm.alloc = failing.allocator();
+        defer vm.alloc = saved_alloc;
+        proto.tree.?.retainTree();
+        // Release the probe-retain AND the finish-time initial reference
+        // (the constructor's own retain/release balances internally).
+        defer {
+            proto.tree.?.releaseTree(saved_alloc);
+            proto.tree.?.releaseTree(saved_alloc);
+        }
+        const gc_len0 = vm.gc_objects.items.len;
+        const count0 = vm.gc_count_kb;
+        const funcs0 = vm.testc_obj_functions;
+        try testing.expectError(error.OutOfMemory, vm.createBytecodeChunkClosure(proto));
+        try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
+        try testing.expectEqual(count0, vm.gc_count_kb);
+        try testing.expectEqual(funcs0, vm.testc_obj_functions);
+        // Resolution did not complete (the failure was inside it).
+        try testing.expect(!proto.tree.?.flags.constants_resolved);
+    }
+    try testing.expectEqual(functions0, vm.testc_obj_functions);
+}
+
+test "P16.44: closureFromProto fully transactional (every fail index)" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    var fail_idx: usize = 0;
+    var tested_failures: usize = 0;
+    while (fail_idx <= 32) : (fail_idx += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        const proto = try p44BuildProto(vm.alloc, &vm, 2, 4);
+        const saved_alloc = vm.alloc;
+        vm.alloc = failing.allocator();
+        defer vm.alloc = saved_alloc;
+        proto.tree.?.retainTree();
+        // Release the probe-retain AND the finish-time initial reference
+        // (the constructor's own retain/release balances internally).
+        defer {
+            proto.tree.?.releaseTree(saved_alloc);
+            proto.tree.?.releaseTree(saved_alloc);
+        }
+        const gc_len0 = vm.gc_objects.items.len;
+        const count0 = vm.gc_count_kb;
+        const funcs0 = vm.testc_obj_functions;
+        if (vm.closureFromProto(proto)) |cl| {
+            _ = vm.gcUnregisterObject(.{ .closure = cl });
+            vm.gcNoteFree(@sizeOf(Closure) + cl.upvalues.len * @sizeOf(*Cell));
+            for (cl.upvalues) |c| {
+                _ = vm.gcUnregisterObject(.{ .cell = c });
+                vm.gcNoteFree(@sizeOf(Cell));
+                saved_alloc.destroy(c);
+            }
             if (cl.proto) |p| {
                 if (p.tree) |t| t.releaseTree(saved_alloc);
             }
@@ -47002,38 +47152,52 @@ test "P16.43: createBytecodeChunkClosure OOM single-owner (every fail index)" {
         } else |err| {
             try testing.expectEqual(error.OutOfMemory, err);
             tested_failures += 1;
+            try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
+            try testing.expectEqual(count0, vm.gc_count_kb);
+            try testing.expectEqual(funcs0, vm.testc_obj_functions);
         }
-        // Per-failure invariants: object counter rolled back (cells
-        // unregistered, closure unregistered or never counted).
-        try testing.expectEqual(functions_before, vm.testc_obj_functions);
     }
     try testing.expect(tested_failures > 0);
 }
 
-test "P16.43: closureFromProto OOM single-owner (every fail index)" {
+test "P16.44: repeated constructor failures leave zero registry/accounting growth" {
+    // The stress lane from the phase prompt: multiple-upvalue dynamic-load
+    // shape with repeated injected failures — no cumulative drift.
     const testing = std.testing;
     var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
-    const functions_before = vm.testc_obj_functions;
-
-    var fail_idx: usize = 0;
-    var tested_failures: usize = 0;
-    while (fail_idx <= 16) : (fail_idx += 1) {
+    const gc_len0 = vm.gc_objects.items.len;
+    const count0 = vm.gc_count_kb;
+    const funcs0 = vm.testc_obj_functions;
+    var round: usize = 0;
+    while (round < 40) : (round += 1) {
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
-            .fail_index = fail_idx,
-            .resize_fail_index = fail_idx,
+            .fail_index = 3 + (round % 6),
+            .resize_fail_index = 3 + (round % 6),
         });
+        const proto = try p44BuildProto(vm.alloc, &vm, 4, 2);
         const saved_alloc = vm.alloc;
         vm.alloc = failing.allocator();
         defer vm.alloc = saved_alloc;
-        const proto = try p43BuildOneUpvalueProto(saved_alloc);
-        // The tree starts at ref_count 1 (ProtoBuilder.finish); this
-        // defer releases that initial reference (the constructor's own
-        // retain/release balances inside the probe).
-        defer proto.tree.?.releaseTree(saved_alloc);
-        if (vm.closureFromProto(proto)) |cl| {
+        proto.tree.?.retainTree();
+        // Release the probe-retain AND the finish-time initial reference
+        // (the constructor's own retain/release balances internally).
+        defer {
+            proto.tree.?.releaseTree(saved_alloc);
+            proto.tree.?.releaseTree(saved_alloc);
+        }
+        if (vm.createBytecodeChunkClosure(proto)) |cl| {
+            // Success edge (the constructor can complete within the
+            // allowed allocations): tear it down so the snapshot delta
+            // measures only FAILURE-path drift.
             _ = vm.gcUnregisterObject(.{ .closure = cl });
+            vm.testc_obj_functions -= 1;
             vm.gcNoteFree(@sizeOf(Closure) + cl.upvalues.len * @sizeOf(*Cell));
+            for (cl.upvalues) |c| {
+                _ = vm.gcUnregisterObject(.{ .cell = c });
+                vm.gcNoteFree(@sizeOf(Cell));
+                saved_alloc.destroy(c);
+            }
             if (cl.proto) |p| {
                 if (p.tree) |t| t.releaseTree(saved_alloc);
             }
@@ -47041,14 +47205,18 @@ test "P16.43: closureFromProto OOM single-owner (every fail index)" {
             vm.alloc = saved_alloc;
             ua.free(cl.upvalues);
             ua.destroy(cl);
-            break;
         } else |err| {
             try testing.expectEqual(error.OutOfMemory, err);
-            tested_failures += 1;
         }
-        try testing.expectEqual(functions_before, vm.testc_obj_functions);
+        // Fail fast with full context on the first drifting round.
+        if (vm.gc_objects.items.len != gc_len0) {
+            std.debug.print("DRIFT round={d} idx={d} gc={d}->{d} funcs={d}->{d}\n", .{ round, 3 + (round % 6), gc_len0, vm.gc_objects.items.len, funcs0, vm.testc_obj_functions });
+            return error.TestUnexpectedResult;
+        }
     }
-    try testing.expect(tested_failures > 0);
+    try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
+    try testing.expectEqual(count0, vm.gc_count_kb);
+    try testing.expectEqual(funcs0, vm.testc_obj_functions);
 }
 
 // Negative-validation note: std.testing.allocator (DebugAllocator)

@@ -1189,4 +1189,3 @@ A strong phase improves at least one of:
 - provenance quality;
 
 without silently degrading the others.
-

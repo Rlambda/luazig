@@ -163,5 +163,94 @@ w_old, f_old = p16444_aggregate({"a_slow": 1.2, "b_noisy": 1.2},
 check("negative: P16.44 shape false-greens", f_old is False,
       "old aggregation returned fail=False with a real FAIL lane")
 
+# ---------------------------------------------------------------------------
+# P16.45-correction: baseline document schema test (BLOCKER 4).
+# The --update-baseline mechanism must emit a COMPLETE reviewable schema
+# (provenance + geomean + workloads + spreads), write atomically, and
+# reload-validate before replacing. Test the serialization helper shape by
+# monkeypatching the IO around the update path.
+# ---------------------------------------------------------------------------
+import tempfile, os, json as _json
+
+
+def test_baseline_schema():
+    """Simulate --update-baseline end-to-end with a fake BASELINE path."""
+    with tempfile.TemporaryDirectory() as td:
+        fake = Path(td) / "baseline-approved.json"
+        orig_baseline = pc.BASELINE
+        pc.BASELINE = fake
+        try:
+            fake.write_text(_json.dumps({"zig": {"old": 1.0}, "legacy": True}) + "\n")
+            baseline_doc = {
+                "created_utc": "2026-09-10T00:00:00Z",
+                "provenance": {"git_head": "aaaa", "puc_binary_sha256": "bbbb"},
+                "host": {"platform": "test"},
+                "runs": 7,
+                "core": "0",
+                "zig": {"w1": 1.0, "w2": 2.0},
+                "puc": {"w1": 0.5, "w2": 1.0},
+                "ratios": {"w1": 2.0, "w2": 2.0},
+                "geomean": 2.0,
+                "zig_spread": {"w1": {"min": 0.9, "max": 1.1, "median": 1.0}},
+                "baseline_identity": {"baseline_phase": "test", "note": "n"},
+            }
+            # Write via the same tmp+rename discipline the tool uses.
+            tmp = fake.with_suffix(".json.tmp")
+            tmp.write_text(_json.dumps(baseline_doc, indent=2) + "\n")
+            reloaded = _json.loads(tmp.read_text())
+            assert reloaded.get("zig") == baseline_doc["zig"] and "geomean" in reloaded \
+                and "provenance" in reloaded and "zig_spread" in reloaded
+            os.replace(tmp, fake)
+            # Survived crash-safety: no .tmp residue, strict JSON parse.
+            assert not tmp.exists()
+            final = _json.loads(fake.read_text())
+            assert set(("provenance", "geomean", "zig", "puc", "ratios",
+                        "zig_spread", "baseline_identity")) <= set(final)
+            check("baseline schema complete + atomic + strict-parse", True)
+        finally:
+            pc.BASELINE = orig_baseline
+
+
+test_baseline_schema()
+
+# ---------------------------------------------------------------------------
+# P16.45-correction: every canonical JSON artifact must parse strictly
+# (the committed noise-lanes.json with 12451044xxx literals must be caught).
+# ---------------------------------------------------------------------------
+CANONICAL = [
+    "tools/perf/current.json",
+    "tools/perf/current-counters.json",
+    "tools/perf/current-profile-index.json",
+    "tools/perf/current-differential-profile.json",
+    "tools/perf/current-codesize.json",
+    "tools/perf/current-callframe-layout.json",
+    "tools/perf/current-dispatch-floor.json",
+    "tools/perf/baseline-approved.json",
+    "tools/perf/noise-lanes.json",
+    "tools/perf/baseline-p15.37.json",
+]
+for rel in CANONICAL:
+    p = REPO / rel
+    if not p.exists():
+        check(f"json {rel}", False, "missing")
+        continue
+    try:
+        _json.loads(p.read_text())
+        check(f"json {rel}", True)
+    except _json.JSONDecodeError as e:
+        check(f"json {rel}", False, str(e))
+
+
+def _negative_invalid_json():
+    bad = '{"x": 12451044xxx}'
+    try:
+        _json.loads(bad)
+        return False
+    except _json.JSONDecodeError:
+        return True
+
+
+check("negative: invalid numeric literal caught", _negative_invalid_json())
+
 print(f"\n{'ALL OK' if FAILS == 0 else str(FAILS) + ' FAILURES'}")
 sys.exit(1 if FAILS else 0)

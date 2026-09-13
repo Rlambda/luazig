@@ -30,7 +30,13 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/perf/seed_harness.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            // P16.45-correction: use the build's OWN optimize option so the
+            // harness and its lua/util dependencies always share one mode
+            // (the P16.45 shape hard-coded ReleaseFast here while the
+            // imported modules defaulted to Debug — a mixed-mode
+            // executable). Canonical invocation:
+            //   zig build seed-harness -Doptimize=ReleaseFast
+            .optimize = optimize,
             .imports = &.{
                 .{ .name = "lua", .module = lua_mod },
                 .{ .name = "util", .module = util_mod },

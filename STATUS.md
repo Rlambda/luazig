@@ -1,4 +1,4 @@
-> Last updated: 2026-09-13 (P16.42 Iteration 2+2b — smoke-82 --testc/TFORCALL sync-hook corruption CLOSED (gcClearDeadFrameRegisters child-guard → C view-frames, PUC stackinuse/traversethread parity) + builtinTestcStats rooting hole CLOSED (gcTempRoots на 7 таблиц, PUC C-stack rooting parity); smoke 82 --testc впервые зелёный, оба режима 83/83; geomean 1.41x)
+> Last updated: 2026-09-13 (P16.43 COMPLETE — closure-OOM single-owner + TFORCALL GC-clear window + testcStats rooting; smoke --testc 83/83 first time; geomean 1.40095)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -34,11 +34,11 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
 | Differential output (`--diff`) | **0 output_diff** |
-| Smoke tests (`tests/smoke/*.lua`) | **82/82** pass |
+| Smoke tests (`tests/smoke/*.lua`) | **83/83** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.41x** |
+| Performance (geomean vs PUC) | **1.40x** |
 
-Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -6594,6 +6594,39 @@ api580, TBC 22+23, unit D+RF; geomean 1.41237; baseline=1.41237.
 
 Гейт: matrix 31/32 zig_fail=0, smoke 83/83, c_api 50+diff, api580,
 TBC 22+23, unit D+RF; geomean 1.40892; baseline=1.40892.
+
+### P16.43 COMPLETE: closure-OOM + TFORCALL window + testcStats rooting (2026-09-09)
+**Geomean 1.40892 → 1.40095** (measured `b59cb74` clean; 0 WARN/FAIL;
+correctness-фаза). Smoke **--testc 83/83 — впервые**.
+
+- **Iteration 1 (`d1e353b`) — BLOCKING OOM double-free**: P16.42-форма
+  errdefer'ов double-freed `cells` на каждой ошибке после активации
+  closure-фазы (второй освобождал массив, первый итерировал FREED-слот и
+  освобождал СНОВА); Arena-тесты (Task 7.2/8.1) маскировали (arena free =
+  no-op) — claim «OOM leak closed» был неподтверждён. Реструктуризация:
+  phase-A/B/D с handoff-флагами, ровно ОДИН cleanup-владелец на ресурс на
+  каждом failure edge; closureFromProto дополнительно закрыл leak `cl` при
+  cells-alloc OOM. Failure-injection тести (оба пути, fail index 0..16,
+  std.testing.allocator — double-free ДИАГНОСТИРУЕТСЯ). Чекбоксы: 26→24.
+- **Iteration 2 (`d241a4c`) — TFORCALL --testc corruption**: root cause =
+  `gcClearDeadFrameRegisters` child-guard признавал только Lua-детей, но
+  окно вызова может принадлежать C VIEW-кадру (PUC precallC: ci->func
+  ВНУТРИ окна вызывающего). OP_TFORCALL стейжит func/state/control на
+  R[A+4..A+6] — вне liveness-анализа; sync-hook body (getinfo-аллокации)
+  запускал GC atomic step → clear затирал state → next получал nil.
+  Фикс = PUC stack-ownership parity: clear_end = min(regs.len,
+  child.func_slot -| base) для ЛЮБОГО типа ребёнка. «Priming»-пребамбулы и
+  testc/plain асимметрия были GC-пейсингом. Smoke 82 §19b (50-раундовый
+  hammer). Чекбоксы: 24→23.
+- **Iteration 2b (`b59cb74`) — builtinTestcStats rooting**: семь таблиц в
+  Zig-локалах между allocTable и линковкой в root — inline GC step мог
+  смести их (задокументированный T3 crash-shape, латентный с P16.42).
+  PUC ltests строит статистику через C API = стек = root-регион. Фикс =
+  gcTempRoots (non-moving аналог); тест 84. Отдельный коммит (другой
+  root cause).
+
+Гейт: matrix 31/32 zig_fail=0, smoke 83/83 plain + --testc, c_api 24+diff,
+api580, TBC 22+23, unit D+RF; geomean 1.40095; baseline=1.40095.
 
 ## История закрытых фаз
 

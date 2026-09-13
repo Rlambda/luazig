@@ -1,10 +1,10 @@
 {
- "created_utc": "2026-09-12T20:03:22.576498+00:00",
+ "created_utc": "2026-09-13T11:38:26.222768+00:00",
  "provenance": {
-  "git_head": "3b11f8e",
-  "measured_source_head": "3b11f8e",
+  "git_head": "b59cb74",
+  "measured_source_head": "b59cb74",
   "source_dirty": "clean",
-  "note": "P16.42 final regeneration"
+  "note": "P16.43 final regeneration"
  },
  "mode": "perf record -g instructions:u core0 top-15",
  "workloads": {
@@ -12,72 +12,68 @@
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 99.52
+     "percent": 99.92
     }
    ],
-   "source_head": "3b11f8e"
+   "source_head": "b59cb74"
   },
   "metamethod_call_noalloc": {
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 65.0
+     "percent": 64.46
     }
    ],
-   "source_head": "3b11f8e"
+   "source_head": "b59cb74"
   },
   "metamethod_add": {
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 43.69
+     "percent": 41.8
     }
    ],
-   "source_head": "3b11f8e"
+   "source_head": "b59cb74"
   },
   "coroutine_yield": {
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 62.19
+     "percent": 60.05
     }
    ],
-   "source_head": "3b11f8e"
+   "source_head": "b59cb74"
   },
   "hash_access": {
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 99.61
+     "percent": 99.51
     }
    ],
-   "source_head": "3b11f8e"
+   "source_head": "b59cb74"
   },
   "field_access": {
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 99.6
+     "percent": 99.59
     }
    ],
-   "source_head": "3b11f8e"
+   "source_head": "b59cb74"
   },
   "branch_loop": {
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 99.93
+     "percent": 99.92
     },
     {
-     "symbol": "vm.GcObject.fromValue",
-     "percent": 0.03
+     "symbol": "ltable.nodeInsert",
+     "percent": 0.07
     },
     {
-     "symbol": "vm.Vm.tableResize",
-     "percent": 0.03
-    },
-    {
-     "symbol": "codegen_bc.Codegen.genStat",
+     "symbol": "bytecode.ProtoBuilder.internString",
      "percent": 0.0
     },
     {
@@ -85,7 +81,7 @@
      "percent": 0.0
     },
     {
-     "symbol": "compiler_rt.strlen",
+     "symbol": "heap.ArenaAllocator.alloc",
      "percent": 0.0
     },
     {
@@ -93,19 +89,31 @@
      "percent": 0.0
     },
     {
-     "symbol": "0x0000000000028ca3",
+     "symbol": "hash.wyhash.Wyhash.hash",
      "percent": 0.0
     },
     {
-     "symbol": "0x000000000000af84",
+     "symbol": "0x0000000000029640",
      "percent": 0.0
     },
     {
-     "symbol": "0x0000000000016587",
+     "symbol": "0x000000000000bad4",
      "percent": 0.0
     },
     {
-     "symbol": "0x00000000000228b3",
+     "symbol": "0x000000000000baee",
+     "percent": 0.0
+    },
+    {
+     "symbol": "0x0000000000029622",
+     "percent": 0.0
+    },
+    {
+     "symbol": "0x000000000001660a",
+     "percent": 0.0
+    },
+    {
+     "symbol": "0x00000000000228b8",
      "percent": 0.0
     },
     {
@@ -113,42 +121,38 @@
      "percent": 0.0
     },
     {
-     "symbol": "0x0000000000022697",
-     "percent": 0.0
-    },
-    {
      "symbol": "0x000000000002269d",
      "percent": 0.0
     }
    ],
-   "source_head": "3b11f8e"
+   "source_head": "b59cb74"
   },
   "global_arith": {
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 99.99
+     "percent": 99.92
     }
    ],
-   "source_head": "3b11f8e"
+   "source_head": "b59cb74"
   },
   "temp_table_alloc": {
    "top_symbols": [
     {
      "symbol": "heap.SmpAllocator.alloc",
-     "percent": 34.04
+     "percent": 35.9
     }
    ],
-   "source_head": "3b11f8e"
+   "source_head": "b59cb74"
   },
   "table_alloc_setmetatable": {
    "top_symbols": [
     {
      "symbol": "vm.Vm.runBytecodeDispatch",
-     "percent": 34.38
+     "percent": 35.18
     }
    ],
-   "source_head": "3b11f8e"
+   "source_head": "b59cb74"
   }
  }
 }

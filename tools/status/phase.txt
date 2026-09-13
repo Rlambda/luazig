@@ -1,1 +1,1 @@
-P16.42 COMPLETE — correctness phase: pcall-in-__gc corruption CLOSED (savestack), gc.lua pace2 CLOSED (8B/load closure accounting); gc.lua plain PUC-identical first time; cstack Debug classified (host-stack, deferred); geomean 1.40892
+P16.43 COMPLETE — closure-OOM single-owner + TFORCALL GC-clear window + testcStats rooting; smoke --testc 83/83 first time; geomean 1.40095

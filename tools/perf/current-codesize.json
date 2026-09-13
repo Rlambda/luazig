@@ -1,11 +1,11 @@
 {
- "created_utc": "2026-09-12T20:03:37.236551+00:00",
+ "created_utc": "2026-09-13T11:38:26.222768+00:00",
  "provenance": {
-  "git_head": "3b11f8e",
-  "measured_source_head": "3b11f8e",
+  "git_head": "b59cb74",
+  "measured_source_head": "b59cb74",
   "source_dirty": "clean"
  },
- "text_bytes": 2589289,
+ "text_bytes": 2589929,
  "symbols": {
   "runBytecodeDispatch": 68678,
   "callBuiltin": 8537,

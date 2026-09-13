@@ -1,1 +1,1 @@
-P16.43 COMPLETE — closure-OOM single-owner + TFORCALL GC-clear window + testcStats rooting; smoke --testc 83/83 first time; geomean 1.40095
+P16.45 COMPLETE — fail-safe perf gate (order-independent aggregation + NOISE? diagnostic-only; P16.44 false-green closed with 14 selftests) + seed-causal noise-lanes evidence (seed_harness via Vm.initWithSeed) + canonical artifacts regenerated

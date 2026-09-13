@@ -62,16 +62,18 @@ BENCH_TIMEOUT_S = 600  # microbench must finish in under 10 min per run
 REGRESSION_WARN = 0.05
 REGRESSION_FAIL = 0.10
 
-# Noisy-lane policy (P15.37, closed P16.44): workloads whose wall time is
-# known to be bimodal/noisy (host frequency modes, hash-seed layout) get
-# their regression verdict computed against the spread of THIS session's
-# own runs: a delta within the observed min..max spread is downgraded to
-# NOISE (reported explicitly with the spread — never silenced), because it
-# is indistinguishable from run-to-run variance of the same binary. The
-# list is per-workload measured behavior, not a benchmark-name special
-# case in the VM. New candidates may be added only with a documented
-# same-binary spread measurement (see tools/perf/noise-lanes.json).
-NOISE_LANE_OVERLAP = 0.80  # spread-overlap fraction required to downgrade
+# Noisy-lane policy (P15.37; fail-safe rework P16.45 after review
+# rejected the P16.44 downgrade): the current session's per-workload run
+# spread of the SAME binary is printed as a NOISE DIAGNOSTIC when the
+# baseline value falls inside it, but it NEVER changes the exit verdict.
+# Reason: the candidate's own range cannot prove absence of regression —
+# a genuinely slower, high-variance candidate can reach the old baseline
+# with one lucky run. Downgrading requires comparable baseline AND
+# candidate distributions, which the tool does not have (the baseline
+# stores a single median). The aggregate WARN/FAIL verdicts below are
+# computed per-workload first and folded afterwards — order-independent
+# and never cleared while iterating (the P16.44 bug: one NOISE lane
+# erased another lane's FAIL).
 
 # Representative workload for `--perf`: a tight integer loop that exercises
 # the VM core (arith + branch + loop) without allocating.
@@ -713,15 +715,46 @@ def print_table(zig: Dict[str, float], puc: Dict[str, float]) -> None:
         print(f"{'geomean':<22} {'':>10} {'':>10} {geomean:>9.2f}x")
 
 
+def classify(delta: float) -> str:
+    """Threshold verdict for one workload — independent of all others."""
+    if delta > REGRESSION_FAIL:
+        return "FAIL"
+    if delta > REGRESSION_WARN:
+        return "WARN"
+    return "OK"
+
+
+def noise_annotation(old: float, current: float,
+                     sp: Dict[str, float] | None) -> str:
+    """Diagnostic-only noise marker (P16.45 fail-safe policy).
+
+    Prints when the baseline value lies inside the CURRENT session's own
+    min..max range of the SAME binary: the delta is then within that
+    binary's observed run-to-run variance for this workload. This is
+    EVIDENCE, never permission — the threshold verdict is unchanged,
+    because the candidate's own range cannot prove absence of regression
+    (a genuinely slower, high-variance candidate reaches the old baseline
+    with one lucky run)."""
+    if sp is None or old <= 0:
+        return ""
+    lo, hi = sp["min"], sp["max"]
+    spread = hi - lo
+    if spread <= 0 or not (lo <= old <= hi):
+        return ""
+    overlap = min(hi, max(old, current)) - max(lo, min(old, current))
+    return f"  NOISE? [runs {lo:.3f}..{hi:.3f}, overlap {overlap / spread * 100:.0f}%]"
+
+
 def regression_check(zig: Dict[str, float], baseline: dict,
                      spreads: Dict[str, Dict[str, float]] | None = None) -> tuple[bool, bool]:
     """Compare current zig times vs baseline. Returns (any_warn, any_fail).
 
-    `spreads` maps workload -> {"min", "max", "median"} of the CURRENT
-    session's runs. When a regression verdict falls inside a noisy lane's
-    own observed spread (delta smaller than the spread overlap), the tag is
-    downgraded to NOISE and both the delta and spread are printed — the
-    gate stays honest about what it cannot distinguish."""
+    Fail-safe aggregation (P16.45): every workload's threshold verdict is
+    computed independently first; the aggregate flags are folded from the
+    per-workload verdict list AFTER the loop. A NOISE diagnostic never
+    changes a verdict, and no later workload can erase an earlier one's
+    (the P16.44 shape returned (False, False) while the printed table
+    contained a real FAIL)."""
     spreads = spreads or {}
     prev_zig = baseline.get("zig", {})
     prev_ident = baseline.get("baseline_identity", {})
@@ -729,39 +762,19 @@ def regression_check(zig: Dict[str, float], baseline: dict,
           f"(phase: {prev_ident.get('baseline_phase', 'unknown')}):")
     print(f"  {'Workload':<22} {'base (s)':>10} {'cur (s)':>10} {'delta':>10}  status")
     print("  " + "-" * 52)
-    any_warn = False
-    any_fail = False
+    verdicts: list[str] = []
     for name in sorted(zig):
         old = prev_zig.get(name)
         if old is None:
             print(f"  {name:<22} {'--':>10} {zig[name]:>10.3f} {'--':>10}  NEW")
             continue
         delta = (zig[name] - old) / old if old else 0.0
-        tag = "OK"
-        if delta > REGRESSION_FAIL:
-            tag = "FAIL"
-            any_fail = True
-        elif delta > REGRESSION_WARN:
-            tag = "WARN"
-            any_warn = True
-        # Noisy-lane downgrade: if BOTH the baseline value and the current
-        # value lie inside the range this session's own runs of the SAME
-        # binary produced, the delta is within the machine/seed variance
-        # of this workload — the gate cannot distinguish it from noise.
-        # Mark NOISE with the spread visible; do not fail the gate on it.
-        sp = spreads.get(name)
-        if sp and tag in ("WARN", "FAIL") and old > 0:
-            spread = sp["max"] - sp["min"]
-            baseline_in_spread = sp["min"] - spread * 0.05 <= old <= sp["max"] + spread * 0.05
-            current_in_spread = sp["min"] <= zig[name] <= sp["max"]
-            if baseline_in_spread and current_in_spread and spread > 0:
-                tag = f"NOISE(spread {spread:.3f}s)"
-                if any_fail and delta > REGRESSION_FAIL:
-                    any_fail = False  # re-evaluated: only this lane failed
-                elif any_warn and delta > REGRESSION_WARN:
-                    any_warn = False
-        print(f"  {name:<22} {old:>10.3f} {zig[name]:>10.3f} {delta * 100:>+9.1f}%  {tag}"
-              + (f" [runs {sp['min']:.3f}..{sp['max']:.3f}]" if sp and tag.startswith("NOISE") else ""))
+        verdict = classify(delta)
+        verdicts.append(verdict)
+        note = noise_annotation(old, zig[name], spreads.get(name))
+        print(f"  {name:<22} {old:>10.3f} {zig[name]:>10.3f} {delta * 100:>+9.1f}%  {verdict}{note}")
+    any_warn = "WARN" in verdicts
+    any_fail = "FAIL" in verdicts
     return any_warn, any_fail
 
 

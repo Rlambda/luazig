@@ -1,4 +1,4 @@
-> Last updated: 2026-09-13 (P16.43 COMPLETE — closure-OOM single-owner + TFORCALL GC-clear window + testcStats rooting; smoke --testc 83/83 first time; geomean 1.40095)
+> Last updated: 2026-09-13 (P16.45 COMPLETE — fail-safe perf gate (order-independent aggregation + NOISE? diagnostic-only; P16.44 false-green closed with 14 selftests) + seed-causal noise-lanes evidence (seed_harness via Vm.initWithSeed) + canonical artifacts regenerated)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -36,9 +36,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **83/83** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.40x** |
+| Performance (geomean vs PUC) | **1.41x** |
 
-Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -604,7 +604,7 @@ Part 1: Codegen infrastructure for "before" semantics
 ### P15.37 — воспроизводимый performance gate + hotspot-driven perf-фазы
 Добавить `tools/perf_compare.py` и versioned baseline + закрыть 3 hotspot'а, выявленных через `perf record --call-graph lbr`:
 - [x] wall time, process CPU, max RSS и opcode count — закрыто P16.0b/c (VmStats opcode histogram; perf stat counters; getrusage max-RSS/process-CPU).
-- [x] отдельная маркировка noisy/long suites — ЗАКРЫТО P16.44: perf_compare regression_check принимает per-workload session spread (median_runs возвращает min/max/median прогонов ТОГО ЖЕ бинаря); WARN/FAIL дельта внутри собственного разброса бинаря понижается до явного NOISE-тега с напечатанным spread (механизм общий, downgrade только при overlap >= 80%); global_arith бимодальность классифицирована как hash-seed-зависимая раскладка таблиц (instructions 12.74/14.15G на одном бинаре, tools/perf/noise-lanes.json).
+- [x] отдельная маркировка noisy/long suites — ЗАКРЫТО P16.45 (fail-safe rework после отклонения P16.44-формы ревью): perf_compare median_runs возвращает per-workload session spread (min/max/median прогонов ТОГО ЖЕ бинаря); regression_check печатает NOISE? ДИАГНОСТИКУ (spread + overlap %) когда baseline попадает в диапазон сессии, но НИКОГДА не меняет пороговый вердикт — агрегаты WARN/FAIL вычисляются per-workload ДО фолда, порядок-независимы, ни один workload не может стереть чужой вердикт (P16.44-баг: NOISE-ветка делала any_fail=False → false-green при смешанном FAIL+NOISE; tests/tools/test_perf_gate.py: 14 кейсов вкл. негативную валидацию старой агрегации); global_arith бимодальность ДОКАЗАНА seed-каузально (tools/perf/noise-lanes.json: seed→12.451G/13.851G моды, Δ=1.4G=50M×28 инстр/итер, детерминизм per-seed; PUC-контроль сам бимодален 9.50/10.40G).
 
 ### P15.38 — codegen-level opcode reduction (PUC 5.5 fast paths)
 Цель: уменьшить число bytecode-инструкций на Lua-итерацию через PUC 5.5 codegen fast paths. Каждая подзадача устраняет 1–3 инструкции в common-case паттернах (`s = s + 1`, `if a < b then`, `x = x + 1.0`).
@@ -3528,7 +3528,7 @@ both_fail, 13 pre-existing output_diff), zig build test exit 0.
 
 ### Perf gate (P15.37)
 - [x] ~~Добавить process CPU, max RSS, opcode count~~ — закрыто P16.0b/c.
-- [ ] Маркировка noisy/long suites.
+- [x] Маркировка noisy/long suites — закрыто P16.45 (тот же механизм; дубль пункта выше учтён: раньше дублировался в двух секциях).
 
 ### Thread compaction (P15.35)
 - [ ] Уплотнить `Thread` header (~110 полей; inline FrameStack уже сделан).
@@ -6627,6 +6627,45 @@ correctness-фаза). Smoke **--testc 83/83 — впервые**.
 
 Гейт: matrix 31/32 zig_fail=0, smoke 83/83 plain + --testc, c_api 24+diff,
 api580, TBC 22+23, unit D+RF; geomean 1.40095; baseline=1.40095.
+
+### P16.44 + P16.45: transactional closure + fail-safe perf gate (2026-09-10)
+**P16.44 (`8641a34`)**: closure-construction OOM single-owner — P16.43
+post-registration ветка оставляла КАЖДУЮ Cell утечкой в GC-реестре (отдельный
+GC-объект, PUC luaF_initupvals/freeobj) до следующей сборки; фикс: closure
+unreg ПЕРВЫМ → Cells unreg/noteFree/destroy на обеих ветках обоих
+конструкторов; failure-injection тесты (снапшоты gc_len/count/funcs/tree-ref
+per fail index; S-1 index с proof попадания в post-registration фазу;
+негативная валидация DRIFT gc=206→210). НО фаза ОТКЛОНЕНА ревью в perf-части:
+
+**P16.45 (текущая)** — два BLOCKER'а perf-гейта закрыты:
+1. **False-green агрегация**: P16.44 regression_check мутировал глобальные
+   any_warn/any_fail в цикле — NOISE-ветка ПОЗЖЕГО workload стирала FAIL
+   РАННЕГО (ревью: `a FAIL + b NOISE → (False, False)` = exit 0 при видимом
+   FAIL). Фикс: per-workload verdict (classify) → фолд агрегатов ПОСЛЕ цикла
+   (`"FAIL" in verdicts`) — порядок-независимо, диагностика не меняет вердикт.
+   14 автотестов (tools/test_perf_gate.py): FAIL+NOISE, 2×FAIL один NOISE,
+   WARN+NOISE, all-NOISE, перестановка, NEW-workload, zero/degenerate spread
+   + негативная валидация старой агрегации (false-green пойман).
+2. **Несостоятельный downgrade**: NOISE-тег не давал права на проход —
+   candidate-range-only доказательство бессмысленно (сильно замедленный
+   high-variance кандидат одной удачной пробегом накрывает baseline).
+   Теперь NOISE? — чистая ДИАГНОСТИКА (spread + overlap %), вердикты всегда
+   по порогам. NOISE_LANE_OVERLAP удалён (неиспользуемый).
+3. **Seed-каузальность** (Task 3): tools/perf/seed_harness.zig (build step
+   `zig build seed-harness`; Vm.initWithSeed, ОДИН процесс = ОДИН детерми-
+   нированный seed; diagnostic-only, не CLI-режим) — ДИЙСТВИТЕЛЬНО доказано:
+   seed управляет модой (12.451G / 13.851G, Δ=1.4G = 50M×28 инстр/итер),
+   per-seed детерминизм (±120 инстр на 12-14G), PUC-контроль сам бимодален
+   (9.50/10.40G). Артефакт tools/perf/noise-lanes.json (raw runs, hashes).
+4. **STATUS truth**: P16.44 ложный текст (overlap>=80% не был реализован)
+   исправлен; дубль noisy-lane пункта закрыт честно (обе копии, 22→**21**);
+   настоящая фазовая запись добавлена (эта).
+5. Артефакты current-* перегенерированы на финальном бинаре (Task 5, см.
+   commit).
+
+Гейт: fmt, unit D+RF, smoke 83/83 plain + real --testc, matrix zig_fail=0,
+c_api 23+diff, api580, gc.lua, perf-gate selftests 14/14; perf_compare —
+honest verdicts (global_arith: FAIL+NOISE? видим при mode-mismatch сессий).
 
 ## История закрытых фаз
 

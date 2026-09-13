@@ -1,19 +1,55 @@
 {
-  "created_utc": "2026-09-09",
-  "phase": "P16.44 Task 5",
-  "subject": "global_arith wall bimodality classification",
-  "binary_sha256_prefix": "81f8071c34f0d4aa (same binary for ALL 12 runs)",
-  "method": "taskset -c 0, perf stat instructions:u,cycles:u + wall, 12 interleaved runs",
-  "results": {
-    "instruction_modes": [
-      {"mode": "low", "instructions": 12736986000, "runs": 6},
-      {"mode": "high", "instructions": 14150987000, "runs": 6, "delta_pct": 11.1}
-    ],
-    "cycles": "2.86G..3.70G continuous across BOTH modes (no cycle bimodality aligned with instruction modes)",
-    "wall_s": "0.742..0.858 continuous across both modes — wall does NOT correlate with the instruction mode",
-    "puc_side": "stable ~0.55s (3/3 runs, prior sessions)"
+  "created_utc": "2026-09-10T00:00:00Z",
+  "phase": "P16.45 Task 3 (supersedes the P16.44 summary-only noise-lanes.json)",
+  "subject": "global_arith instruction bimodality — seed-causal evidence",
+  "provenance": {
+    "source_head": "8641a34 + P16.45 working tree (harness + gate fix; no VM runtime changes)",
+    "luazig_binary_sha256_16": "81f8071c34f0d4aa",
+    "puc_binary_sha256_16": "d54bc45e1757b216",
+    "seed_harness_sha256_16": "rebuilt per-run; build cmd: zig build seed-harness (ReleaseFast, tools/perf/seed_harness.zig via Vm.initWithSeed — a DIAGNOSTIC harness, NOT a production CLI mode)",
+    "toolchain": "/usr/bin/zig 0.16.0",
+    "host_method": "taskset -c 0, perf stat -e instructions:u,cycles:u, one process per seed (one process == one deterministic seed)"
   },
-  "conclusion": "The instruction bimodality is DATA-DEPENDENT, not code-layout: Vm.init draws a per-process random hash seed (makeRandomSeed); global_arith's dominant GETTABUP-on-_ENV lookups walk interned-string hash chains whose length depends on the seed's table layout. Two dominant layouts (~10% instruction delta) emerge across processes. The SAME binary in the same session visits both modes, so the reviewer's 0.849s vs 0.750s runs (gate FAIL vs OK) sampled different processes/seeds — not a source regression and not reproducible wall truth.",
-  "action": "P15.37 noisy-lane marking CLOSED this phase: tools/perf_compare.py regression_check now takes per-workload session spread (median_runs returns min/max/median of the SAME binary's runs); a WARN/FAIL delta inside the binary's own observed spread is downgraded to an explicit NOISE tag with the spread printed — reported, never silenced. General mechanism, no workload special-casing; the downgrade is evidence-driven (same-binary spread overlap >= 80%).",
-  "rule_for_baseline": "Do not select a lucky mode when updating baselines; the median-of-7 snapshot already blends modes, and the recorded baseline carries the median."
+  "workload": "g_acc = 0; for i=1,50000000 do g_acc = g_acc + i end (the exact microbench global_arith shape: GETTABUP+SETTABUP on _ENV per iteration)",
+  "raw_runs": {
+    "seed_sweep": [
+      {"seed": 1, "instructions": 12451044972, "cycles": 2998472793, "mode": "low"},
+      {"seed": 2, "instructions": 12451045426, "cycles": 2999402897, "mode": "low"},
+      {"seed": 3, "instructions": 13851043915, "cycles": 3539871466, "mode": "high"},
+      {"seed": 5, "instructions": 12451047085, "cycles": 3058617021, "mode": "low"},
+      {"seed": 8, "instructions": 13851045497, "cycles": 3480313289, "mode": "high"},
+      {"seed": 13, "instructions": 12451044985, "cycles": 3264847554, "mode": "low"},
+      {"seed": 21, "instructions": 12451044478, "cycles": 3002357035, "mode": "low"},
+      {"seed": 34, "instructions": 12451043781, "cycles": 3002124620, "mode": "low"},
+      {"seed": 42, "instructions": 13851048140, "cycles": 3549038916, "mode": "high"},
+      {"seed": 55, "instructions": 13851045617, "cycles": 3491933602, "mode": "high"},
+      {"seed": 1000, "instructions": 12451044230, "cycles": 2988793572, "mode": "low"},
+      {"seed": 12345, "instructions": 13851046163, "cycles": 3494089741, "mode": "high"},
+      {"seed": 99999, "instructions": 12451044304, "cycles": 3050050632, "mode": "low"},
+      {"seed": 271828, "instructions": 13851044449, "cycles": 3516642187, "mode": "high"},
+      {"seed": 31415926, "instructions": 12451044467, "cycles": 3041695878, "mode": "low"}
+    ],
+    "determinism_recheck": [
+      {"seed": 3, "rep1": 13851043839, "rep2": 13851043872},
+      {"seed": 42, "rep1": 13851048181, "rep2": 13851048089},
+      {"seed": 1, "rep1": 12451045329, "rep2": 12451045208},
+      {"seed": 34, "rep1": 12451043679, "rep2": 12451043813}
+    ],
+    "puc_control_same_session": [
+      {"run": 1, "instructions": 10400676674},
+      {"run": 2, "instructions": 9500675875},
+      {"run": 3, "instructions": 9500675582}
+    ],
+    "note_puc": "PUC itself is ALSO bimodal (10.40G vs 9.50G, +9.5%) across processes — the same class of per-process data-dependent variation exists in the reference implementation."
+  },
+  "conclusion": {
+    "causal_chain_proven": "seed -> interned-string hash placement in the string intern table -> 'g_acc' lookup chain work per GETTABUP/SETTABUP -> per-iteration instruction count",
+    "modes": {
+      "low": {"instructions": 12451044xxx, "seeds": 9},
+      "high": {"instructions": 13851044xxx, "seeds": 6, "delta": 1400000000, "delta_per_iteration": 28, "iterations": 50000000}
+    },
+    "determinism": "Same seed reproduces the same mode to within ~120 instructions on 12-14G (perf-stat noise); the mode is a pure function of the seed.",
+    "what_this_does_NOT_prove": "The exact 28-instruction mechanism (which specific chain-length branch) is not attributed instruction-by-instruction; the correlation is at the mode level.",
+    "implication_for_the_gate": "Per-process random seeding means ANY wall/instruction comparison of global_arith across processes samples one of two modes. The fail-safe gate (P16.45) therefore reports the NOISE? diagnostic but preserves threshold verdicts; baseline refreshes must record medians of multi-run sessions (mode blend), never a single-mode sample."
+  }
 }

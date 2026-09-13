@@ -21,6 +21,27 @@ pub fn build(b: *std.Build) void {
     });
     lua_mod.addImport("util", util_mod);
 
+    // P16.45 Task 3: seed-variation diagnostic harness (tools/perf/).
+    // One process == one deterministic Vm.initWithSeed; wrap with perf stat
+    // to correlate seed -> table layout -> instruction modes. NOT installed
+    // with the default prefix; build explicitly via -Dseed-harness.
+    const seed_harness = b.addExecutable(.{
+        .name = "seed_harness",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/perf/seed_harness.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lua", .module = lua_mod },
+                .{ .name = "util", .module = util_mod },
+            },
+        }),
+    });
+    const seed_harness_step = b.step("seed-harness", "Build the seed-variation diagnostic harness");
+    seed_harness_step.dependOn(&b.addInstallArtifact(seed_harness, .{
+        .dest_sub_path = "seed_harness",
+    }).step);
+
     const luazig_exe = b.addExecutable(.{
         .name = "luazig",
         .root_module = b.createModule(.{

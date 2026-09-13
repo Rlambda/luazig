@@ -1,4 +1,4 @@
-> Last updated: 2026-09-13 (P16.45-correction COMPLETE — reproducible seed evidence (canonical workload + env-node structural separation), uniform-mode harness, provenance-preserving baseline mechanism, clean-source two-commit artifacts)
+> Last updated: 2026-09-14 (P16.45-finalization COMPLETE — двухкоммитная дисциплина C/D: один immutable measured-source коммит C (7d97e5a) + artifact-wrapper D; все канонические артефакты перегенерированы с provenance = точный C; арифметика noise-сводок механически валидируется; layout-проба реально перестроена)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -36,9 +36,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **83/83** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.42x** |
+| Performance (geomean vs PUC) | **1.40x** |
 
-Geomean замедления vs PUC Lua: **1.42x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -6685,7 +6685,10 @@ honest verdicts (global_arith: FAIL+NOISE? видим при mode-mismatch се�
   интерн-гипотеза DISPROVEN) и **_ENV-node placement** (главная позиция
   ключа): low-моды env_node_depth=0/len=1, high-моды depth=1/len≥2 —
   ТОЧНОЕ разделение 15/15 seeds, per-seed детерминизм; branch-delta
-  +645M = 50M×12.9 подтверждает table-get путь. PUC-контроль той же сессии
+  (медианы) +606,000,088.5 = 50M×12.12000177 подтверждает table-get путь
+  (первоначальная проза +645M=50M×12.9 была арифметически ОШИБОЧНОЙ —
+  исправлено в P16.45-finalization механической сводкой
+  tools/validate_noise_lanes.py). PUC-контроль той же сессии
   на том же файле сам бимодален (9.60/10.51G). Выводы ограничены
   честно (28-инстр атрибуция — consistent-not-disassembled).
 - **BLOCKER 3 (двухкоммитная форма)**: коммит A = все правки (этот);
@@ -6703,6 +6706,66 @@ honest verdicts (global_arith: FAIL+NOISE? видим при mode-mismatch се�
 Гейт: fmt, unit D+RF, selftests, smoke 83/83 plain + real --testc,
 matrix zig_fail=0, c_api 23+diff, api580, gc.lua, diff --check 0,
 perf_compare RESULT: OK.
+
+### P16.45-finalization: двухкоммитная дисциплина C/D + механическая валидация сводок (2026-09-14)
+
+Финализация по замечаниям ревью P16.45-correction (4 блокера; чекбоксы не
+трогаем — геч 22→21 остаётся truthful):
+
+- **Коммит C = `7d97e5aacf9b696e69cdce66872f357ca92f3ad3`** (measured source;
+  ЗАМЕРЫ после него — никаких amend):
+  - **BLOCKER 3**: проза noise-сводок была арифметически неверна (branch-delta
+    «+645M = 50M×12.9»); правда: **+606,000,088.5 = 50M×12.12000177
+    branches/iter**, instruction-delta 1,413,999,731.5 = 28.27999463/iter.
+    В noise-lanes.json установлен `mechanical_summary` (скрипт считает из
+    raw_runs: counts, медианы/delta для instructions/branches/cycles/wall,
+    per-iteration) + `tools/validate_noise_lanes.py` пересчитывает КАЖДОЕ
+    поле сводки из сырых строк (counts, медианы, дельты, per-iteration,
+    15/15 env-placement разделение, intern-negative, determinism bounds,
+    bounded-conclusion) c `--negative`-режимом (возмущённая сводка → FAIL).
+  - **BLOCKER 4**: production-сериализация baseline отрефакторена в общие
+    module-level helpers `build_baseline_document` /
+    `validate_baseline_document` / `write_baseline_atomic` — CLI
+    `--update-baseline` И тесты зовут ОДНИ И ТЕ ЖЕ функции (прошлый
+    hand-rolled тест оставался зелёным при сломанной production-логике).
+    Тесты: caller-note, geomean/spread preservation, injected provenance,
+    atomic write + strict reload, no-tmp-residue, invalid-doc НЕ трогает
+    старый baseline, per-section rejection, empty-phase rejection.
+  - Канонический strict-JSON список дополнен tools/status/current-matrix.json
+    + current-smoke.json (список прежде заявлял полное покрытие, опуская их).
+- **Wrapper D** (этот коммит): ВСЕ канонические артефакты перегенерированы на
+  чистом C с provenance = точный C, source_dirty=clean, реальными
+  timestamp'ами и хэшами immutable-бинарей:
+  - luazig RF `071ffa77…` (= /tmp/opencode/C_luazig_imm), PUC `d54bc45e…`,
+    seed-harness `8a739386…` (= /tmp/opencode/C_harness_imm);
+  - **BLOCKER 2**: layout-пробы РЕАЛЬНО перестроены из C (`/tmp/opencode/
+    C_layout_rf` `f1aa1a6d…` / `C_layout_dbg` `d1297307…`): CallFrame 88 /
+    u@32 / align 8, Thread 3736, Vm 5408RF/5512D — один однозначный
+    timestamp-блок, без relabeling;
+  - **BLOCKER 1**: noise-lanes.json provenance несёт точный C +
+    `verification_at_C` (свежие прогоны: seed 1 → 13,997,783,862 instr /
+    env depth=1,len=2; seed 8 → 12,583,783,630 / depth=0,len=1; harness
+    8a739386…) — модовые observables воспроизводятся точно;
+  - baseline-approved: P16.45-finalization, 21 runs, geomean 1.39996, через
+    общий helper-путь (atomic + reload-validation), note с ИСПРАВЛЕННОЙ
+    формулировкой (медиана 21 бимодальных сэмплов СЕЛЕКТИРУЕТ моду,
+    содержащую средний порядковый статисктик — она не «смешивает» моды;
+    формулировка «mode blend» из P16.45-correction была некорректна).
+    Никакого cherry-picking моды: baseline = первая же 21-прогонная сессия.
+  - СЛЕДСТВИЕ ПО ДИЗАЙНУ: контрольный gate-прогон после обновления baseline
+    сэмплировал ДРУГУЮ моду global_arith → `RESULT: FAIL (global_arith
+    +11.4%, NOISE? видим)` при 17 OK по остальным — это ЗАДОКУМЕНТИРОВАННОЕ
+    поведение fail-safe гейта (диагностический NOISE? никогда не меняет
+    вердикт; causal-инструмент — детерминированные per-seed счётчики
+    инструкций, не wall).
+- STATUS: ошибочная проза «+645M=50M×12.9» в записи P16.45-correction
+  исправлена на механически валидируемые числа.
+
+Гейт (на C/D): fmt --check, unit D+RF, selftests (perf-gate + serializer +
+strict-JSON incl. matrix/smoke), validate_noise_lanes ALL OK + negative
+FAIL-detected, smoke 83/83 plain + real --testc, matrix 31/32 (zig_fail=0,
+both_fail=1 big.lua), c_api 23+diff, api580, gc.lua, diff --check 0,
+perf_compare: 17 OK / 1 задокументированный bimodal-FAIL.
 
 ## История закрытых фаз
 

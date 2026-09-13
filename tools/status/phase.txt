@@ -1,1 +1,1 @@
-P16.45-correction COMPLETE — reproducible seed evidence (canonical workload + env-node structural separation), uniform-mode harness, provenance-preserving baseline mechanism, clean-source two-commit artifacts
+P16.45-finalization

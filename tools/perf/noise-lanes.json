@@ -3,7 +3,7 @@
  "phase": "P16.45-correction (supersedes both earlier noise-lanes.json versions)",
  "subject": "global_arith instruction bimodality \u2014 canonical-workload seed experiment with measured structural observables",
  "provenance": {
-  "measured_source_commit": "commit A of the P16.45 correction (see git log; the source tree that builds the binaries below)",
+  "measured_source_commit": "P16.45-finalization measured-source commit C = 7d97e5aacf9b696e69cdce66872f357ca92f3ad3 \u2014 the raw_runs luazig binary (071ffa77\u2026) and the seed-harness source are identical between C and the P16.45-correction source (C changed only tools/*.py and this artifact); fresh C-verification runs in verification_at_C",
   "zig_version": "0.16.0 (/usr/bin/zig)",
   "puc_binary_sha256": "d54bc45e1757b216eaa8a273511fc9fcd2670e97ca85dfe9781daf71437a91f2",
   "seed_harness_sha256": "1e986868e9b4ab4c82574cb2267dd75068e64c36a926b4bdfecf09be0efd7a31",
@@ -277,5 +277,30 @@
   "delta_wall_ns": 132607243.5,
   "delta_instructions_per_iteration": 28.27999463,
   "delta_branches_per_iteration": 12.12000177
+ },
+ "verification_at_C": {
+  "git_head": "7d97e5aacf9b696e69cdce66872f357ca92f3ad3",
+  "harness_path": "/tmp/opencode/C_harness_imm",
+  "harness_sha256": "8a7393868c1fc962417748205f318afd2a2f68deb02ba7f8a4e807871b87c0e4",
+  "command": "taskset -c 0 perf stat -e instructions:u <harness> <seed> tools/microbench.lua global_arith",
+  "runs": [
+   {
+    "seed": 1,
+    "mode": "high",
+    "instructions": 13997783862,
+    "env_node_depth": 1,
+    "env_node_chain_len": 2,
+    "vs_mode_median_pct": 0.0011
+   },
+   {
+    "seed": 8,
+    "mode": "low",
+    "instructions": 12583783630,
+    "env_node_depth": 0,
+    "env_node_chain_len": 1,
+    "vs_mode_median_pct": 0.0013
+   }
+  ],
+  "note": "Process-total perf stat counts include ~160k instructions of startup jitter (0.001% of the mode totals) \u2014 the placement observables and the mode assignment reproduce exactly."
  }
 }

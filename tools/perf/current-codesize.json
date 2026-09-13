@@ -1,18 +1,18 @@
 {
- "created_utc": "2026-09-13T20:03:30.464922+00:00",
- "provenance": {
-  "git_head": "3683116",
-  "measured_source_head": "3683116",
-  "source_dirty": "clean",
-  "zig_binary_sha256": "071ffa77f160646ef345902121cfb36849749098bf800636c389ca8c1270d9ae",
-  "note": "P16.45-correction FINAL regeneration from clean measured-source commit A (3683116); artifact wrapper commit B follows"
- },
- "text_bytes": 2590057,
- "symbols": {
-  "runBytecodeDispatch": 68678,
-  "callBuiltin": 8537,
-  "pushBuiltinCFrame": 742,
-  "popBuiltinCFrame": 305,
-  "builtinCoroutineResume": 16656
- }
+  "created_utc": "2026-09-13T21:34:29.697490+00:00",
+  "provenance": {
+    "git_head": "7d97e5a",
+    "measured_source_head": "7d97e5a",
+    "source_dirty": "clean",
+    "zig_binary_sha256": "071ffa77f160646ef345902121cfb36849749098bf800636c389ca8c1270d9ae",
+    "note": "P16.45-finalization regeneration from clean measured-source commit C (7d97e5a); artifact wrapper commit D follows. Binary verified identical to /tmp/opencode/C_luazig_imm."
+  },
+  "text_bytes": 2590057,
+  "symbols": {
+    "runBytecodeDispatch": 68678,
+    "callBuiltin": 8537,
+    "pushBuiltinCFrame": 742,
+    "popBuiltinCFrame": 305,
+    "builtinCoroutineResume": 16656
+  }
 }

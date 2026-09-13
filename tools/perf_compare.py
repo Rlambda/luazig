@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import platform
 import statistics
 import subprocess
@@ -802,6 +803,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--update-baseline", action="store_true",
                     help="rewrite baseline JSON with current results")
+    ap.add_argument("--baseline-note",
+                    help="Caller-supplied provenance note recorded verbatim in "
+                         "the baseline's baseline_identity when --update-baseline "
+                         "runs (the reviewable justification for the refresh).",
+                    default=None)
     ap.add_argument("--baseline-phase", default="unlabeled",
                     help="Phase label stamped into baseline-approved.json "
                          "by --update-baseline (e.g. P16.18)")
@@ -874,15 +880,52 @@ def main() -> int:
 
     if args.update_baseline:
         BASELINE.parent.mkdir(parents=True, exist_ok=True)
-        current["baseline_identity"] = {
-            "baseline_phase": args.baseline_phase,
-            "note": ("Approved regression baseline. Updating this file is an "
-                     "EXPLICIT operation; the historical P15.37 baseline is "
-                     "preserved separately in baseline-p15.37.json and is "
-                     "never overwritten."),
+        # P16.45-correction BLOCKER 4: the update emits the COMPLETE
+        # reviewable schema — provenance (both binary hashes via
+        # provenance.block), geomean, zig/puc medians, ratios, the session
+        # spreads (distribution context for the NOISE? diagnostics), runs/
+        # core/host — written via temp file + atomic replace with
+        # reload-validation BEFORE the approved baseline is replaced, so an
+        # interrupted update cannot truncate the gate baseline. The note is
+        # caller-supplied via --baseline-note (no manual JSON surgery).
+        ratios = current.get("ratios", {})
+        geomean = (math.exp(sum(math.log(r) for r in ratios.values()) / len(ratios))
+                   if ratios else 0.0)
+        baseline_doc = {
+            "created_utc": current["created_utc"],
+            "provenance": provenance.block(zig_bin=ZIG_LUA, puc_bin=PUC_LUA,
+                                           optimize_mode="ReleaseFast"),
+            "host": current["host"],
+            "runs": args.runs,
+            "core": args.core,
+            "zig": current["zig"],
+            "puc": current["puc"],
+            "ratios": ratios,
+            "geomean": geomean,
+            "zig_spread": zig_spread,
+            "baseline_identity": {
+                "baseline_phase": args.baseline_phase,
+                "note": (args.baseline_note or
+                         "Approved regression baseline. Updating this file is an "
+                         "EXPLICIT operation; the historical P15.37 baseline is "
+                         "preserved separately in baseline-p15.37.json and is "
+                         "never overwritten."),
+            },
         }
-        BASELINE.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
-        print(f"\nBaseline updated: {BASELINE} (phase {args.baseline_phase})")
+        tmp = BASELINE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(baseline_doc, indent=2) + "\n", encoding="utf-8")
+        reloaded = json.loads(tmp.read_text(encoding="utf-8"))
+        if (reloaded.get("zig") != baseline_doc["zig"]
+                or "geomean" not in reloaded
+                or "provenance" not in reloaded
+                or "zig_spread" not in reloaded):
+            tmp.unlink(missing_ok=True)
+            print("\nBaseline update FAILED validation (schema incomplete); "
+                  "approved baseline NOT replaced.")
+            return 1
+        os.replace(tmp, BASELINE)
+        print(f"\nBaseline updated: {BASELINE} (phase {args.baseline_phase}, "
+              f"geomean {geomean:.5f}, full provenance + spreads)")
         return 0
 
     if BASELINE.exists():

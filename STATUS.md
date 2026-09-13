@@ -6667,6 +6667,43 @@ per fail index; S-1 index с proof попадания в post-registration фа�
 c_api 23+diff, api580, gc.lua, perf-gate selftests 14/14; perf_compare —
 honest verdicts (global_arith: FAIL+NOISE? видим при mode-mismatch сессий).
 
+### P16.45-correction: reproducible seed evidence + clean-source provenance (2026-09-10)
+Исправляющее продолжение (4 блокера ревью; чекбоксы НЕ трогаем — геч
+22→21 остаётся truthful):
+
+- **BLOCKER 1 (noise-lanes.json invalid + mixed-mode harness)**: файл был
+  невалидным JSON (`12451044xxx` литералы); build.zig seed-harness хардкодил
+  ReleaseFast в root-модуле при Debug-зависимостях (mixed-mode exe). Фикс:
+  build.zig использует общий `optimize` (канон: `zig build seed-harness
+  -Doptimize=ReleaseFast`); noise-lanes.json переписан как strict JSON c
+  raw per-run tuples (instr/cycles/branches/branch-misses/wall), полными
+  SHA-256, literal-командами, hash-recheck после измерений.
+- **BLOCKER 2 (seed-каузальность)**: harness переписан — исполняет
+  КАНОНИЧЕСКИЙ `tools/microbench.lua` (файл+arg, тот же bench()-warmup и
+  population history, что и perf-lane) под `Vm.initWithSeed`; добавлены ДВА
+  структурных обсервабла: intern-chain «g_count» (глубина 0 в ОБОИХ режимах —
+  интерн-гипотеза DISPROVEN) и **_ENV-node placement** (главная позиция
+  ключа): low-моды env_node_depth=0/len=1, high-моды depth=1/len≥2 —
+  ТОЧНОЕ разделение 15/15 seeds, per-seed детерминизм; branch-delta
+  +645M = 50M×12.9 подтверждает table-get путь. PUC-контроль той же сессии
+  на том же файле сам бимодален (9.60/10.51G). Выводы ограничены
+  честно (28-инстр атрибуция — consistent-not-disassembled).
+- **BLOCKER 3 (двухкоммитная форма)**: коммит A = все правки (этот);
+  артефакты current-* перегенерированы на immutable-бинарях чистого A
+  (layout-probes оба режима пересобраны; хэши в артефактах) → коммит B.
+- **BLOCKER 4 (baseline-механизм)**: `--update-baseline` теперь пишет
+  ПОЛНУЮ ревьюируемую схему (provenance.block с хэшами, geomean, zig+puc,
+  ratios, zig_spread распределения, runs/core/host, caller-supplied
+  `--baseline-note`) через tmp+atomic-replace c reload-валидацией ДО
+  замены — прерванный update не может обрезать гейт-baseline.
+- Тесты: tools/test_perf_gate.py расширен (baseline-schema atomic +
+  strict-parse ВСЕХ канонич. JSON-артефактов + негативный invalid-literal);
+  невалидный noise-lanes.json был бы пойман.
+
+Гейт: fmt, unit D+RF, selftests, smoke 83/83 plain + real --testc,
+matrix zig_fail=0, c_api 23+diff, api580, gc.lua, diff --check 0,
+perf_compare RESULT: OK.
+
 ## История закрытых фаз
 
 P3–P15.12 — краткая сводка. P15.13+ — см. «История разработки» выше.

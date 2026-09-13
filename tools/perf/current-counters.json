@@ -1,11 +1,11 @@
 {
-  "created_utc": "2026-09-13T16:22:02.811070+00:00",
+  "created_utc": "2026-09-13T20:02:42.201841+00:00",
   "zig_version": "0.16.0",
   "provenance": {
-    "git_head": "8641a34",
-    "measured_source_head": "8641a34",
+    "git_head": "3683116",
+    "measured_source_head": "3683116",
     "git_dirty": "dirty",
-    "source_dirty": "dirty",
+    "source_dirty": "clean",
     "artifact_dirty": "dirty",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
@@ -17,657 +17,657 @@
   "core": "0",
   "host": {
     "platform": "Linux-7.1.5-arch1-2-x86_64-with-glibc2.44",
-    "python": "3.11.15"
+    "python": "3.14.6"
   },
   "events": "cycles:u,instructions:u,branches:u,branch-misses:u,cache-misses:u,cache-references:u",
   "workloads": {
     "int_arith": {
       "zig": {
         "counters": {
-          "cycles": 876656280.0,
-          "instructions": 5111477127.0,
-          "branches": 658428161.0,
-          "branch-misses": 21032.0,
-          "cache-misses": 19713.0,
-          "cache-references": 40003.0
+          "cycles": 882131744.0,
+          "instructions": 5111308193.0,
+          "branches": 658396280.0,
+          "branch-misses": 19921.0,
+          "cache-misses": 19732.0,
+          "cache-references": 35866.0
         },
-        "ipc": 5.830651355169668,
-        "cpi": 0.17150742500035843,
-        "branch_miss_ratio": 3.19427406750909e-05,
-        "cache_miss_ratio": 0.49278804089693273,
-        "maxrss_kb": 16432,
-        "cpu_s": 0.23688499999999998
+        "ipc": 5.794268518014016,
+        "cpi": 0.17258433862549913,
+        "branch_miss_ratio": 3.0256853820620007e-05,
+        "cache_miss_ratio": 0.5501589248870797,
+        "maxrss_kb": 11956,
+        "cpu_s": 0.23563699999999999
       },
       "puc": {
         "counters": {
-          "cycles": 662683670.0,
-          "instructions": 3038000989.0,
-          "branches": 506631256.0,
-          "branch-misses": 19553.0,
-          "cache-misses": 9925.0,
-          "cache-references": 21160.0
+          "cycles": 663134549.0,
+          "instructions": 3037845024.0,
+          "branches": 506601863.0,
+          "branch-misses": 18458.0,
+          "cache-misses": 10186.0,
+          "cache-references": 20673.0
         },
-        "ipc": 4.584390904034198,
-        "cpi": 0.21813148593415418,
-        "branch_miss_ratio": 3.859414469288093e-05,
-        "cache_miss_ratio": 0.4690453686200378,
-        "maxrss_kb": 16060,
-        "cpu_s": 0.176759
+        "ipc": 4.581038687519809,
+        "cpi": 0.21829110562290488,
+        "branch_miss_ratio": 3.643492325649027e-05,
+        "cache_miss_ratio": 0.49271997291152714,
+        "maxrss_kb": 12060,
+        "cpu_s": 0.17704899999999998
       },
       "zig_vm_instructions": 101050266,
-      "instr_ratio": 0.03326209121257136
+      "instr_ratio": 0.033263798910631984
     },
     "global_arith": {
       "zig": {
         "counters": {
-          "cycles": 3220249158.0,
-          "instructions": 12736987301.0,
-          "branches": 2021930787.0,
-          "branch-misses": 24302.0,
-          "cache-misses": 24754.0,
-          "cache-references": 51270.0
+          "cycles": 2868118920.0,
+          "instructions": 12736820089.0,
+          "branches": 2021899323.0,
+          "branch-misses": 22727.0,
+          "cache-misses": 26514.0,
+          "cache-references": 50193.0
         },
-        "ipc": 3.9552800656302507,
-        "cpi": 0.252826597208523,
-        "branch_miss_ratio": 1.2019204691006073e-05,
-        "cache_miss_ratio": 0.4828164618685391,
-        "maxrss_kb": 15908,
-        "cpu_s": 0.762848
+        "ipc": 4.440827052247889,
+        "cpi": 0.22518327965368815,
+        "branch_miss_ratio": 1.1240421192821181e-05,
+        "cache_miss_ratio": 0.5282409897794513,
+        "maxrss_kb": 11888,
+        "cpu_s": 0.8642259999999999
       },
       "puc": {
         "counters": {
-          "cycles": 2105738835.0,
-          "instructions": 9603003617.0,
-          "branches": 1718632228.0,
-          "branch-misses": 20192.0,
-          "cache-misses": 12319.0,
-          "cache-references": 23167.0
+          "cycles": 2106101764.0,
+          "instructions": 10511844785.0,
+          "branches": 2021602093.0,
+          "branch-misses": 20497.0,
+          "cache-misses": 13638.0,
+          "cache-references": 25420.0
         },
-        "ipc": 4.560396311919659,
-        "cpi": 0.2192791879482638,
-        "branch_miss_ratio": 1.174887778259445e-05,
-        "cache_miss_ratio": 0.5317477446367678,
-        "maxrss_kb": 16220,
-        "cpu_s": 0.562409
+        "ipc": 4.991138113400298,
+        "cpi": 0.20035510484375935,
+        "branch_miss_ratio": 1.0138988315738749e-05,
+        "cache_miss_ratio": 0.5365066876475216,
+        "maxrss_kb": 12020,
+        "cpu_s": 0.563581
       },
       "zig_vm_instructions": 202050270,
-      "instr_ratio": 0.021040320097590565
+      "instr_ratio": 0.019221199906634658
     },
     "branch_loop": {
       "zig": {
         "counters": {
-          "cycles": 3209736617.0,
-          "instructions": 11045227206.0,
-          "branches": 1441178693.0,
-          "branch-misses": 26314.0,
-          "cache-misses": 22993.0,
-          "cache-references": 46026.0
+          "cycles": 3188729469.0,
+          "instructions": 11045056993.0,
+          "branches": 1441146609.0,
+          "branch-misses": 25761.0,
+          "cache-misses": 27369.0,
+          "cache-references": 52264.0
         },
-        "ipc": 3.44116309964507,
-        "cpi": 0.2905994197436159,
-        "branch_miss_ratio": 1.8258665721197976e-05,
-        "cache_miss_ratio": 0.49956546299917437,
-        "maxrss_kb": 16200,
-        "cpu_s": 0.84265
+        "ipc": 3.4637798848654855,
+        "cpi": 0.28870194794113907,
+        "branch_miss_ratio": 1.7875349974195444e-05,
+        "cache_miss_ratio": 0.5236682994030307,
+        "maxrss_kb": 11844,
+        "cpu_s": 0.8463689999999999
       },
       "puc": {
         "counters": {
-          "cycles": 2045295051.0,
-          "instructions": 7052751095.0,
-          "branches": 1188381450.0,
-          "branch-misses": 21195.0,
-          "cache-misses": 12540.0,
-          "cache-references": 26484.0
+          "cycles": 2019444133.0,
+          "instructions": 7052596793.0,
+          "branches": 1188352532.0,
+          "branch-misses": 20812.0,
+          "cache-misses": 12948.0,
+          "cache-references": 25174.0
         },
-        "ipc": 3.448280526348372,
-        "cpi": 0.2899996077346325,
-        "branch_miss_ratio": 1.783518246603395e-05,
-        "cache_miss_ratio": 0.47349342999546895,
-        "maxrss_kb": 16152,
-        "cpu_s": 0.5420079999999999
+        "ipc": 3.4923455805251535,
+        "cpi": 0.2863405058126084,
+        "branch_miss_ratio": 1.7513321543543442e-05,
+        "cache_miss_ratio": 0.5143401922618575,
+        "maxrss_kb": 12148,
+        "cpu_s": 0.540453
       },
       "zig_vm_instructions": 227300266,
-      "instr_ratio": 0.032228596038380394
+      "instr_ratio": 0.032229301159766445
     },
     "lua_calls": {
       "zig": {
         "counters": {
-          "cycles": 471022212.0,
-          "instructions": 2253175567.0,
-          "branches": 325127665.0,
-          "branch-misses": 20883.0,
-          "cache-misses": 20051.0,
-          "cache-references": 41589.0
+          "cycles": 468468621.0,
+          "instructions": 2253008677.0,
+          "branches": 325096493.0,
+          "branch-misses": 19991.0,
+          "cache-misses": 18832.0,
+          "cache-references": 36600.0
         },
-        "ipc": 4.783586653871007,
-        "cpi": 0.2090481624683799,
-        "branch_miss_ratio": 6.423015402272827e-05,
-        "cache_miss_ratio": 0.4821226766693116,
-        "maxrss_kb": 15740,
-        "cpu_s": 0.126622
+        "ipc": 4.809305417704807,
+        "cpi": 0.20793023381684916,
+        "branch_miss_ratio": 6.14925120093498e-05,
+        "cache_miss_ratio": 0.5145355191256831,
+        "maxrss_kb": 12076,
+        "cpu_s": 0.12670499999999998
       },
       "puc": {
         "counters": {
-          "cycles": 352724409.0,
-          "instructions": 1285648440.0,
-          "branches": 183430589.0,
-          "branch-misses": 19843.0,
-          "cache-misses": 9833.0,
-          "cache-references": 23503.0
+          "cycles": 349569226.0,
+          "instructions": 1285494621.0,
+          "branches": 183401714.0,
+          "branch-misses": 18079.0,
+          "cache-misses": 9446.0,
+          "cache-references": 21291.0
         },
-        "ipc": 3.6449091902794852,
-        "cpi": 0.27435525764726165,
-        "branch_miss_ratio": 0.00010817715904515795,
-        "cache_miss_ratio": 0.41837212270773944,
-        "maxrss_kb": 16304,
-        "cpu_s": 0.094381
+        "ipc": 3.6773678155525054,
+        "cpi": 0.27193363573008683,
+        "branch_miss_ratio": 9.85759598735266e-05,
+        "cache_miss_ratio": 0.4436616410689963,
+        "maxrss_kb": 12052,
+        "cpu_s": 0.094138
       },
       "zig_vm_instructions": 35400266,
-      "instr_ratio": 0.027534950378814288
+      "instr_ratio": 0.027538245140583905
     },
     "array_access": {
       "zig": {
         "counters": {
-          "cycles": 310014696.0,
-          "instructions": 1233076939.0,
-          "branches": 173627936.0,
-          "branch-misses": 20843.0,
-          "cache-misses": 24232.0,
-          "cache-references": 43495.0
+          "cycles": 311417824.0,
+          "instructions": 1232907826.0,
+          "branches": 173596131.0,
+          "branch-misses": 19273.0,
+          "cache-misses": 26406.0,
+          "cache-references": 46072.0
         },
-        "ipc": 3.977478986996152,
-        "cpi": 0.2514155331227065,
-        "branch_miss_ratio": 0.00012004404636820655,
-        "cache_miss_ratio": 0.5571215082193356,
-        "maxrss_kb": 16184,
-        "cpu_s": 0.08406999999999999
+        "ipc": 3.959014966336673,
+        "cpi": 0.25258808276880873,
+        "branch_miss_ratio": 0.00011102205958726119,
+        "cache_miss_ratio": 0.5731463795797882,
+        "maxrss_kb": 11992,
+        "cpu_s": 0.085488
       },
       "puc": {
         "counters": {
-          "cycles": 179786707.0,
-          "instructions": 846462119.0,
-          "branches": 127939073.0,
-          "branch-misses": 19725.0,
-          "cache-misses": 11026.0,
-          "cache-references": 24424.0
+          "cycles": 180259305.0,
+          "instructions": 846308449.0,
+          "branches": 127910328.0,
+          "branch-misses": 19138.0,
+          "cache-misses": 12636.0,
+          "cache-references": 24980.0
         },
-        "ipc": 4.708146298046384,
-        "cpi": 0.2123978178874653,
-        "branch_miss_ratio": 0.00015417494857102802,
-        "cache_miss_ratio": 0.45144120537176546,
-        "maxrss_kb": 15996,
-        "cpu_s": 0.052478
+        "ipc": 4.694950138635007,
+        "cpi": 0.21299480728686426,
+        "branch_miss_ratio": 0.0001496204434719298,
+        "cache_miss_ratio": 0.5058446757405924,
+        "maxrss_kb": 12256,
+        "cpu_s": 0.048875999999999996
       },
       "zig_vm_instructions": 25300266,
-      "instr_ratio": 0.029889424974964534
+      "instr_ratio": 0.029894852201812296
     },
     "hash_access": {
       "zig": {
         "counters": {
-          "cycles": 434294559.0,
-          "instructions": 1576476946.0,
-          "branches": 229177988.0,
-          "branch-misses": 21290.0,
-          "cache-misses": 33087.0,
-          "cache-references": 201679.0
+          "cycles": 430403134.0,
+          "instructions": 1576308542.0,
+          "branches": 229146374.0,
+          "branch-misses": 19543.0,
+          "cache-misses": 33554.0,
+          "cache-references": 122930.0
         },
-        "ipc": 3.6299716709091903,
-        "cpi": 0.2754842435862681,
-        "branch_miss_ratio": 9.289722885602783e-05,
-        "cache_miss_ratio": 0.1640577353120553,
-        "maxrss_kb": 16116,
-        "cpu_s": 0.1167
+        "ipc": 3.662400241723147,
+        "cpi": 0.27304497979431747,
+        "branch_miss_ratio": 8.528609752297456e-05,
+        "cache_miss_ratio": 0.27295208655332304,
+        "maxrss_kb": 11828,
+        "cpu_s": 0.11548199999999999
       },
       "puc": {
         "counters": {
-          "cycles": 268315945.0,
-          "instructions": 1189700435.0,
-          "branches": 208681340.0,
-          "branch-misses": 20046.0,
-          "cache-misses": 16296.0,
-          "cache-references": 76859.0
+          "cycles": 265640373.0,
+          "instructions": 1189543755.0,
+          "branches": 208651849.0,
+          "branch-misses": 18880.0,
+          "cache-misses": 19234.0,
+          "cache-references": 70857.0
         },
-        "ipc": 4.433953543088913,
-        "cpi": 0.22553235848821052,
-        "branch_miss_ratio": 9.606033773791179e-05,
-        "cache_miss_ratio": 0.21202461650554913,
-        "maxrss_kb": 16320,
-        "cpu_s": 0.07203999999999999
+        "ipc": 4.478023206961843,
+        "cpi": 0.22331282215003517,
+        "branch_miss_ratio": 9.048565872042667e-05,
+        "cache_miss_ratio": 0.27144812791961276,
+        "maxrss_kb": 12052,
+        "cpu_s": 0.071826
       },
       "zig_vm_instructions": 30350266,
-      "instr_ratio": 0.025510847190704775
+      "instr_ratio": 0.025514207335736044
     },
     "temp_table_alloc": {
       "zig": {
         "counters": {
-          "cycles": 132963304.0,
-          "instructions": 524602834.0,
-          "branches": 69194185.0,
-          "branch-misses": 27011.0,
-          "cache-misses": 26867.0,
-          "cache-references": 112120.0
+          "cycles": 132252910.0,
+          "instructions": 524435149.0,
+          "branches": 69162740.0,
+          "branch-misses": 25498.0,
+          "cache-misses": 24844.0,
+          "cache-references": 110478.0
         },
-        "ipc": 3.9454708044860256,
-        "cpi": 0.2534551767213671,
-        "branch_miss_ratio": 0.0003903651730271843,
-        "cache_miss_ratio": 0.23962718515875847,
-        "maxrss_kb": 16196,
-        "cpu_s": 0.037523999999999995
+        "ipc": 3.9653959145398012,
+        "cpi": 0.2521816286573881,
+        "branch_miss_ratio": 0.00036866671274157157,
+        "cache_miss_ratio": 0.22487735114683466,
+        "maxrss_kb": 11876,
+        "cpu_s": 0.03727899999999999
       },
       "puc": {
         "counters": {
-          "cycles": 121568102.0,
-          "instructions": 569337900.0,
-          "branches": 118995191.0,
-          "branch-misses": 51827.0,
-          "cache-misses": 6831.0,
-          "cache-references": 27281.0
+          "cycles": 120498568.0,
+          "instructions": 569183460.0,
+          "branches": 118966140.0,
+          "branch-misses": 52018.0,
+          "cache-misses": 8875.0,
+          "cache-references": 25786.0
         },
-        "ipc": 4.683283613328108,
-        "cpi": 0.21352539853749417,
-        "branch_miss_ratio": 0.0004355386092871602,
-        "cache_miss_ratio": 0.2503940471390345,
-        "maxrss_kb": 16144,
-        "cpu_s": 0.033543
+        "ipc": 4.723570324918716,
+        "cpi": 0.2117042684269146,
+        "branch_miss_ratio": 0.0004372504647120601,
+        "cache_miss_ratio": 0.3441790118669045,
+        "maxrss_kb": 11820,
+        "cpu_s": 0.033264999999999996
       },
       "zig_vm_instructions": 3080264,
-      "instr_ratio": 0.005410256369723498
+      "instr_ratio": 0.0054117243673946535
     },
     "string_loop": {
       "zig": {
         "counters": {
-          "cycles": 422745498.0,
-          "instructions": 1531650652.0,
-          "branches": 212644739.0,
-          "branch-misses": 535532.0,
-          "cache-misses": 42498.0,
-          "cache-references": 350887.0
+          "cycles": 423968629.0,
+          "instructions": 1531505470.0,
+          "branches": 212617030.0,
+          "branch-misses": 538111.0,
+          "cache-misses": 47485.0,
+          "cache-references": 400784.0
         },
-        "ipc": 3.623103402037885,
-        "cpi": 0.2760064753982816,
-        "branch_miss_ratio": 0.002518435219786933,
-        "cache_miss_ratio": 0.12111591481018105,
-        "maxrss_kb": 16124,
-        "cpu_s": 0.116074
+        "ipc": 3.6123084710590696,
+        "cpi": 0.2768312861461735,
+        "branch_miss_ratio": 0.00253089322148842,
+        "cache_miss_ratio": 0.11848027865383848,
+        "maxrss_kb": 12076,
+        "cpu_s": 0.11659
       },
       "puc": {
         "counters": {
-          "cycles": 389285830.0,
-          "instructions": 1300649829.0,
-          "branches": 262202552.0,
-          "branch-misses": 2510015.0,
-          "cache-misses": 10592.0,
-          "cache-references": 34158.0
+          "cycles": 392405521.0,
+          "instructions": 1301309406.0,
+          "branches": 262397372.0,
+          "branch-misses": 2602479.0,
+          "cache-misses": 12184.0,
+          "cache-references": 40518.0
         },
-        "ipc": 3.341117833649378,
-        "cpi": 0.2993010273174764,
-        "branch_miss_ratio": 0.009572809192185132,
-        "cache_miss_ratio": 0.31008841267053106,
-        "maxrss_kb": 16088,
-        "cpu_s": 0.106368
+        "ipc": 3.316236231039165,
+        "cpi": 0.30154667229078647,
+        "branch_miss_ratio": 0.009918083325925992,
+        "cache_miss_ratio": 0.3007058591243398,
+        "maxrss_kb": 12016,
+        "cpu_s": 0.10663
       },
       "zig_vm_instructions": 3585266,
-      "instr_ratio": 0.002756519026152119
+      "instr_ratio": 0.0027551218668437107
     },
     "coroutine_yield": {
       "zig": {
         "counters": {
-          "cycles": 238989699.0,
-          "instructions": 1018014891.0,
-          "branches": 179193271.0,
-          "branch-misses": 20819.0,
-          "cache-misses": 15891.0,
-          "cache-references": 35411.0
+          "cycles": 242306495.0,
+          "instructions": 1017845474.0,
+          "branches": 179161446.0,
+          "branch-misses": 19096.0,
+          "cache-misses": 19142.0,
+          "cache-references": 37205.0
         },
-        "ipc": 4.259660124514404,
-        "cpi": 0.23476051393043915,
-        "branch_miss_ratio": 0.00011618181801034259,
-        "cache_miss_ratio": 0.448758860241168,
-        "maxrss_kb": 16120,
-        "cpu_s": 0.067546
+        "ipc": 4.200652871479982,
+        "cpi": 0.23805823299264384,
+        "branch_miss_ratio": 0.0001065854313321405,
+        "cache_miss_ratio": 0.514500739147964,
+        "maxrss_kb": 12020,
+        "cpu_s": 0.07189799999999999
       },
       "puc": {
         "counters": {
-          "cycles": 179992741.0,
-          "instructions": 521588641.0,
-          "branches": 99096768.0,
-          "branch-misses": 1534292.0,
-          "cache-misses": 8672.0,
-          "cache-references": 21813.0
+          "cycles": 169331184.0,
+          "instructions": 503253771.0,
+          "branches": 93007698.0,
+          "branch-misses": 1533527.0,
+          "cache-misses": 7823.0,
+          "cache-references": 19494.0
         },
-        "ipc": 2.8978315353284163,
-        "cpi": 0.3450856227522792,
-        "branch_miss_ratio": 0.015482765290589498,
-        "cache_miss_ratio": 0.39756108742493007,
-        "maxrss_kb": 16140,
-        "cpu_s": 0.044871999999999995
+        "ipc": 2.9720088120331103,
+        "cpi": 0.33647275739936783,
+        "branch_miss_ratio": 0.01648817283919875,
+        "cache_miss_ratio": 0.4013029650148764,
+        "maxrss_kb": 12152,
+        "cpu_s": 0.048326
       },
       "zig_vm_instructions": 5605262,
-      "instr_ratio": 0.010746518538543097
+      "instr_ratio": 0.011138042719206966
     },
     "dynamic_load": {
       "zig": {
         "counters": {
-          "cycles": 738464648.0,
-          "instructions": 2297769128.0,
-          "branches": 330819097.0,
-          "branch-misses": 136391.0,
-          "cache-misses": 50780.0,
-          "cache-references": 269429.0
+          "cycles": 739063802.0,
+          "instructions": 2297601281.0,
+          "branches": 330787314.0,
+          "branch-misses": 140440.0,
+          "cache-misses": 63601.0,
+          "cache-references": 337364.0
         },
-        "ipc": 3.111549258617997,
-        "cpi": 0.3213833100119883,
-        "branch_miss_ratio": 0.0004122827286479172,
-        "cache_miss_ratio": 0.1884726588451874,
-        "maxrss_kb": 16020,
-        "cpu_s": 0.198962
+        "ipc": 3.1087996391954262,
+        "cpi": 0.3216675617791841,
+        "branch_miss_ratio": 0.00042456283556267213,
+        "cache_miss_ratio": 0.18852337534532435,
+        "maxrss_kb": 12024,
+        "cpu_s": 0.196161
       },
       "puc": {
         "counters": {
-          "cycles": 512434291.0,
-          "instructions": 1739482518.0,
-          "branches": 342225920.0,
-          "branch-misses": 1609204.0,
-          "cache-misses": 14766.0,
-          "cache-references": 40019.0
+          "cycles": 510857550.0,
+          "instructions": 1738626470.0,
+          "branches": 342142607.0,
+          "branch-misses": 1598648.0,
+          "cache-misses": 17220.0,
+          "cache-references": 49740.0
         },
-        "ipc": 3.394547454280338,
-        "cpi": 0.2945900781970377,
-        "branch_miss_ratio": 0.004702168672670965,
-        "cache_miss_ratio": 0.36897473699992506,
-        "maxrss_kb": 16400,
-        "cpu_s": 0.136647
+        "ipc": 3.4033488787627784,
+        "cpi": 0.29382823672298053,
+        "branch_miss_ratio": 0.004672461036108256,
+        "cache_miss_ratio": 0.34620024125452353,
+        "maxrss_kb": 11876,
+        "cpu_s": 0.138231
       },
       "zig_vm_instructions": 11160264,
-      "instr_ratio": 0.006415852924369545
+      "instr_ratio": 0.006419011899663532
     },
     "mixed_arith": {
       "zig": {
         "counters": {
-          "cycles": 947714714.0,
-          "instructions": 5666977745.0,
-          "branches": 809928203.0,
-          "branch-misses": 21260.0,
-          "cache-misses": 16549.0,
-          "cache-references": 36822.0
+          "cycles": 944958886.0,
+          "instructions": 5666807785.0,
+          "branches": 809896359.0,
+          "branch-misses": 20079.0,
+          "cache-misses": 18917.0,
+          "cache-references": 36440.0
         },
-        "ipc": 5.979624101309458,
-        "cpi": 0.16723459251912062,
-        "branch_miss_ratio": 2.6249240267535172e-05,
-        "cache_miss_ratio": 0.44943240454076366,
-        "maxrss_kb": 16356,
-        "cpu_s": 0.254585
+        "ipc": 5.996882900363562,
+        "cpi": 0.1667532977739777,
+        "branch_miss_ratio": 2.4792061079015173e-05,
+        "cache_miss_ratio": 0.5191273326015368,
+        "maxrss_kb": 12088,
+        "cpu_s": 0.253438
       },
       "puc": {
         "counters": {
-          "cycles": 677222124.0,
-          "instructions": 3290502005.0,
-          "branches": 607631636.0,
-          "branch-misses": 19329.0,
-          "cache-misses": 10615.0,
-          "cache-references": 21155.0
+          "cycles": 670776815.0,
+          "instructions": 3290345618.0,
+          "branches": 607602115.0,
+          "branch-misses": 18073.0,
+          "cache-misses": 9400.0,
+          "cache-references": 20140.0
         },
-        "ipc": 4.858822369187691,
-        "cpi": 0.20581118715957142,
-        "branch_miss_ratio": 3.1810391123216634e-05,
-        "cache_miss_ratio": 0.5017726305837863,
-        "maxrss_kb": 16268,
-        "cpu_s": 0.178551
+        "ipc": 4.905276307142488,
+        "cpi": 0.20386211446313784,
+        "branch_miss_ratio": 2.974479442027617e-05,
+        "cache_miss_ratio": 0.4667328699106256,
+        "maxrss_kb": 12000,
+        "cpu_s": 0.179421
       },
       "zig_vm_instructions": 101050266,
-      "instr_ratio": 0.030709680725449065
+      "instr_ratio": 0.030711140327386727
     },
     "float_arith": {
       "zig": {
         "counters": {
-          "cycles": 886763015.0,
-          "instructions": 5313476958.0,
-          "branches": 708927985.0,
-          "branch-misses": 20962.0,
-          "cache-misses": 16754.0,
-          "cache-references": 35964.0
+          "cycles": 892772570.0,
+          "instructions": 5313308882.0,
+          "branches": 708896558.0,
+          "branch-misses": 19901.0,
+          "cache-misses": 17403.0,
+          "cache-references": 33755.0
         },
-        "ipc": 5.991992074680742,
-        "cpi": 0.1668894063170604,
-        "branch_miss_ratio": 2.9568588690993768e-05,
-        "cache_miss_ratio": 0.4658547436325214,
-        "maxrss_kb": 16416,
-        "cpu_s": 0.240122
+        "ipc": 5.951469680570495,
+        "cpi": 0.1680257236737098,
+        "branch_miss_ratio": 2.8073207261926077e-05,
+        "cache_miss_ratio": 0.5155680639905199,
+        "maxrss_kb": 11700,
+        "cpu_s": 0.236572
       },
       "puc": {
         "counters": {
-          "cycles": 677506662.0,
-          "instructions": 3189501586.0,
-          "branches": 607631396.0,
-          "branch-misses": 19542.0,
-          "cache-misses": 9535.0,
-          "cache-references": 19922.0
+          "cycles": 679953942.0,
+          "instructions": 3189348160.0,
+          "branches": 607602560.0,
+          "branch-misses": 18551.0,
+          "cache-misses": 9125.0,
+          "cache-references": 19541.0
         },
-        "ipc": 4.707705126595493,
-        "cpi": 0.21241772224658803,
-        "branch_miss_ratio": 3.216094515300523e-05,
-        "cache_miss_ratio": 0.4786166047585584,
-        "maxrss_kb": 15928,
-        "cpu_s": 0.18009499999999998
+        "ipc": 4.690535583364556,
+        "cpi": 0.21319526997014965,
+        "branch_miss_ratio": 3.0531471098475954e-05,
+        "cache_miss_ratio": 0.4669668901284479,
+        "maxrss_kb": 12004,
+        "cpu_s": 0.18110199999999999
       },
       "zig_vm_instructions": 101050268,
-      "instr_ratio": 0.03168215010255838
+      "instr_ratio": 0.03168367419629722
     },
     "string_concat": {
       "zig": {
         "counters": {
-          "cycles": 325798898.0,
-          "instructions": 1048922389.0,
-          "branches": 132932940.0,
-          "branch-misses": 286554.0,
-          "cache-misses": 31984.0,
-          "cache-references": 294818.0
+          "cycles": 325789827.0,
+          "instructions": 1048746515.0,
+          "branches": 132898774.0,
+          "branch-misses": 283951.0,
+          "cache-misses": 37155.0,
+          "cache-references": 310917.0
         },
-        "ipc": 3.219539401265869,
-        "cpi": 0.31060343588490225,
-        "branch_miss_ratio": 0.0021556282438348236,
-        "cache_miss_ratio": 0.10848727011240833,
-        "maxrss_kb": 15960,
-        "cpu_s": 0.088341
+        "ipc": 3.2190892044029353,
+        "cpi": 0.31064687447376166,
+        "branch_miss_ratio": 0.0021365960832716185,
+        "cache_miss_ratio": 0.11950134601839076,
+        "maxrss_kb": 12060,
+        "cpu_s": 0.088585
       },
       "puc": {
         "counters": {
-          "cycles": 318031424.0,
-          "instructions": 1071691805.0,
-          "branches": 211683086.0,
-          "branch-misses": 2430874.0,
-          "cache-misses": 11385.0,
-          "cache-references": 30668.0
+          "cycles": 317324502.0,
+          "instructions": 1071557063.0,
+          "branches": 211660343.0,
+          "branch-misses": 2452070.0,
+          "cache-misses": 12954.0,
+          "cache-references": 31831.0
         },
-        "ipc": 3.3697670233995494,
-        "cpi": 0.2967564205643991,
-        "branch_miss_ratio": 0.011483553296270444,
-        "cache_miss_ratio": 0.3712338593974175,
-        "maxrss_kb": 15844,
-        "cpu_s": 0.08603799999999999
+        "ipc": 3.3768494277822896,
+        "cpi": 0.296134021189313,
+        "branch_miss_ratio": 0.011584928783754262,
+        "cache_miss_ratio": 0.4069617668310766,
+        "maxrss_kb": 12220,
+        "cpu_s": 0.08552299999999999
       },
       "zig_vm_instructions": 2575266,
-      "instr_ratio": 0.002402991221902644
+      "instr_ratio": 0.0024032933839193966
     },
     "metamethod_add": {
       "zig": {
         "counters": {
-          "cycles": 343986146.0,
-          "instructions": 1305149359.0,
-          "branches": 205574944.0,
-          "branch-misses": 27100.0,
-          "cache-misses": 33684.0,
-          "cache-references": 139900.0
+          "cycles": 349268328.0,
+          "instructions": 1312051434.0,
+          "branches": 208573696.0,
+          "branch-misses": 26218.0,
+          "cache-misses": 36215.0,
+          "cache-references": 162286.0
         },
-        "ipc": 3.7941916387528,
-        "cpi": 0.26356075159364195,
-        "branch_miss_ratio": 0.00013182540378072535,
-        "cache_miss_ratio": 0.24077197998570407,
-        "maxrss_kb": 16088,
-        "cpu_s": 0.09477
+        "ipc": 3.7565714633019915,
+        "cpi": 0.26620018007617224,
+        "branch_miss_ratio": 0.00012570137319712645,
+        "cache_miss_ratio": 0.22315541697989968,
+        "maxrss_kb": 11880,
+        "cpu_s": 0.09361399999999999
       },
       "puc": {
         "counters": {
-          "cycles": 234481500.0,
-          "instructions": 1051461366.0,
-          "branches": 213229325.0,
-          "branch-misses": 48906.0,
-          "cache-misses": 7893.0,
-          "cache-references": 26296.0
+          "cycles": 237498613.0,
+          "instructions": 1052317721.0,
+          "branches": 213705444.0,
+          "branch-misses": 48204.0,
+          "cache-misses": 10008.0,
+          "cache-references": 24144.0
         },
-        "ipc": 4.484197542236807,
-        "cpi": 0.2230053405500017,
-        "branch_miss_ratio": 0.00022935869632378193,
-        "cache_miss_ratio": 0.30015972010952235,
-        "maxrss_kb": 16244,
-        "cpu_s": 0.063445
+        "ipc": 4.430837332932129,
+        "cpi": 0.2256909755109978,
+        "branch_miss_ratio": 0.000225562807843117,
+        "cache_miss_ratio": 0.41451292246520877,
+        "maxrss_kb": 12180,
+        "cpu_s": 0.063315
       },
       "zig_vm_instructions": 6110266,
-      "instr_ratio": 0.005811213038901137
+      "instr_ratio": 0.005806483990589378
     },
     "field_access": {
       "zig": {
         "counters": {
-          "cycles": 359895656.0,
-          "instructions": 1626977076.0,
-          "branches": 279677936.0,
-          "branch-misses": 20357.0,
-          "cache-misses": 15267.0,
-          "cache-references": 33150.0
+          "cycles": 373684768.0,
+          "instructions": 1697508685.0,
+          "branches": 309946346.0,
+          "branch-misses": 19412.0,
+          "cache-misses": 19094.0,
+          "cache-references": 34920.0
         },
-        "ipc": 4.520691063856575,
-        "cpi": 0.22120511795090592,
-        "branch_miss_ratio": 7.278729345313818e-05,
-        "cache_miss_ratio": 0.46054298642533936,
-        "maxrss_kb": 16080,
-        "cpu_s": 0.099537
+        "ipc": 4.542622098527708,
+        "cpi": 0.22013717591082604,
+        "branch_miss_ratio": 6.263019471118399e-05,
+        "cache_miss_ratio": 0.5467926689576174,
+        "maxrss_kb": 12188,
+        "cpu_s": 0.09822199999999999
       },
       "puc": {
         "counters": {
-          "cycles": 218289682.0,
-          "instructions": 1164454260.0,
-          "branches": 213731918.0,
-          "branch-misses": 19699.0,
-          "cache-misses": 8710.0,
-          "cache-references": 19032.0
+          "cycles": 219990752.0,
+          "instructions": 1164297695.0,
+          "branches": 213702475.0,
+          "branch-misses": 18482.0,
+          "cache-misses": 8675.0,
+          "cache-references": 18251.0
         },
-        "ipc": 5.334444804404452,
-        "cpi": 0.18746093298675381,
-        "branch_miss_ratio": 9.216686110494737e-05,
-        "cache_miss_ratio": 0.4576502732240437,
-        "maxrss_kb": 16296,
-        "cpu_s": 0.059815
+        "ipc": 5.292484726812516,
+        "cpi": 0.18894716784610657,
+        "branch_miss_ratio": 8.648472601920029e-05,
+        "cache_miss_ratio": 0.4753164210180264,
+        "maxrss_kb": 12160,
+        "cpu_s": 0.061314
       },
       "zig_vm_instructions": 20250264,
-      "instr_ratio": 0.017390347303122066
+      "instr_ratio": 0.017392685811337967
     },
     "comparisons": {
       "zig": {
         "counters": {
-          "cycles": 3158522996.0,
-          "instructions": 12332976291.0,
-          "branches": 1718928488.0,
-          "branch-misses": 23357.0,
-          "cache-misses": 21587.0,
-          "cache-references": 45922.0
+          "cycles": 3246365204.0,
+          "instructions": 12332807827.0,
+          "branches": 1718896821.0,
+          "branch-misses": 24324.0,
+          "cache-misses": 28941.0,
+          "cache-references": 57102.0
         },
-        "ipc": 3.9046656638620845,
-        "cpi": 0.2561038731830641,
-        "branch_miss_ratio": 1.3588116179967576e-05,
-        "cache_miss_ratio": 0.4700797003614825,
-        "maxrss_kb": 16416,
-        "cpu_s": 0.8447039999999999
+        "ipc": 3.798958851519282,
+        "cpi": 0.2632300161924837,
+        "branch_miss_ratio": 1.415093663728406e-05,
+        "cache_miss_ratio": 0.5068298833666072,
+        "maxrss_kb": 11984,
+        "cpu_s": 0.857509
       },
       "puc": {
         "counters": {
-          "cycles": 2291289302.0,
-          "instructions": 9047502735.0,
-          "branches": 1668132198.0,
-          "branch-misses": 20193.0,
-          "cache-misses": 10153.0,
-          "cache-references": 21387.0
+          "cycles": 2294156421.0,
+          "instructions": 9047347186.0,
+          "branches": 1668102824.0,
+          "branch-misses": 20025.0,
+          "cache-misses": 12252.0,
+          "cache-references": 22929.0
         },
-        "ipc": 3.948651410846591,
-        "cpi": 0.2532510206530487,
-        "branch_miss_ratio": 1.2105155709008142e-05,
-        "cache_miss_ratio": 0.47472763828493947,
-        "maxrss_kb": 16208,
-        "cpu_s": 0.6052420000000001
+        "ipc": 3.943648786622994,
+        "cpi": 0.25357227636295554,
+        "branch_miss_ratio": 1.2004655655447773e-05,
+        "cache_miss_ratio": 0.5343451524270575,
+        "maxrss_kb": 12220,
+        "cpu_s": 0.6077969999999999
       },
       "zig_vm_instructions": 252550262,
-      "instr_ratio": 0.027913808859434404
+      "instr_ratio": 0.027914288775255584
     },
     "metamethod_call_noalloc": {
       "zig": {
         "counters": {
-          "cycles": 64173117.0,
-          "instructions": 298826771.0,
-          "branches": 44852817.0,
-          "branch-misses": 20339.0,
-          "cache-misses": 13561.0,
-          "cache-references": 34701.0
+          "cycles": 65447721.0,
+          "instructions": 298657283.0,
+          "branches": 44821022.0,
+          "branch-misses": 18740.0,
+          "cache-misses": 12629.0,
+          "cache-references": 33022.0
         },
-        "ipc": 4.656572486575648,
-        "cpi": 0.21475022731480775,
-        "branch_miss_ratio": 0.0004534609275488761,
-        "cache_miss_ratio": 0.39079565430391056,
-        "maxrss_kb": 16200,
-        "cpu_s": 0.018607
+        "ipc": 4.563295381973652,
+        "cpi": 0.21913987947181587,
+        "branch_miss_ratio": 0.00041810737827441773,
+        "cache_miss_ratio": 0.3824420083580643,
+        "maxrss_kb": 12180,
+        "cpu_s": 0.018907999999999998
       },
       "puc": {
         "counters": {
-          "cycles": 35236474.0,
-          "instructions": 187781283.0,
-          "branches": 28901096.0,
-          "branch-misses": 19068.0,
-          "cache-misses": 6132.0,
-          "cache-references": 18854.0
+          "cycles": 36113338.0,
+          "instructions": 187625684.0,
+          "branches": 28871893.0,
+          "branch-misses": 18137.0,
+          "cache-misses": 5470.0,
+          "cache-references": 17951.0
         },
-        "ipc": 5.329173486541247,
-        "cpi": 0.18764635876942007,
-        "branch_miss_ratio": 0.0006597673666078269,
-        "cache_miss_ratio": 0.3252360241858492,
-        "maxrss_kb": 16132,
-        "cpu_s": 0.011044
+        "ipc": 5.1954677797992534,
+        "cpi": 0.19247545021608023,
+        "branch_miss_ratio": 0.0006281888063245454,
+        "cache_miss_ratio": 0.30471840008913154,
+        "maxrss_kb": 11956,
+        "cpu_s": 0.012399
       },
       "zig_vm_instructions": 2575266,
-      "instr_ratio": 0.013714178318826376
+      "instr_ratio": 0.01372555156148025
     },
     "table_alloc_setmetatable": {
       "zig": {
         "counters": {
-          "cycles": 209626220.0,
-          "instructions": 877749263.0,
-          "branches": 131791457.0,
-          "branch-misses": 26789.0,
-          "cache-misses": 23755.0,
-          "cache-references": 110931.0
+          "cycles": 210450695.0,
+          "instructions": 884649179.0,
+          "branches": 134789485.0,
+          "branch-misses": 25497.0,
+          "cache-misses": 33842.0,
+          "cache-references": 123912.0
         },
-        "ipc": 4.187211232449834,
-        "cpi": 0.23882243920494184,
-        "branch_miss_ratio": 0.00020326810712776322,
-        "cache_miss_ratio": 0.21414212438362587,
-        "maxrss_kb": 16140,
-        "cpu_s": 0.057963
+        "ipc": 4.203593525789972,
+        "cpi": 0.2378916976307961,
+        "branch_miss_ratio": 0.00018916163972286116,
+        "cache_miss_ratio": 0.27311317709342114,
+        "maxrss_kb": 11948,
+        "cpu_s": 0.060648
       },
       "puc": {
         "counters": {
-          "cycles": 165007104.0,
-          "instructions": 756946025.0,
-          "branches": 167262868.0,
-          "branch-misses": 44377.0,
-          "cache-misses": 8013.0,
-          "cache-references": 21541.0
+          "cycles": 165551763.0,
+          "instructions": 756789646.0,
+          "branches": 167233233.0,
+          "branch-misses": 43541.0,
+          "cache-misses": 8108.0,
+          "cache-references": 24981.0
         },
-        "ipc": 4.587354160218459,
-        "cpi": 0.21799058129673116,
-        "branch_miss_ratio": 0.00026531292049829014,
-        "cache_miss_ratio": 0.3719883013787661,
-        "maxrss_kb": 16080,
-        "cpu_s": 0.04481399999999999
+        "ipc": 4.571317346828859,
+        "cpi": 0.21875532240038073,
+        "branch_miss_ratio": 0.0002603609295767188,
+        "cache_miss_ratio": 0.32456667066970896,
+        "maxrss_kb": 12116,
+        "cpu_s": 0.044867
       },
       "zig_vm_instructions": 3080264,
-      "instr_ratio": 0.004069331099268273
+      "instr_ratio": 0.004070171964271297
     }
   }
 }

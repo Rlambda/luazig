@@ -1,1 +1,1 @@
-P16.45 COMPLETE — fail-safe perf gate (order-independent aggregation + NOISE? diagnostic-only; P16.44 false-green closed with 14 selftests) + seed-causal noise-lanes evidence (seed_harness via Vm.initWithSeed) + canonical artifacts regenerated
+P16.45-correction COMPLETE — reproducible seed evidence (canonical workload + env-node structural separation), uniform-mode harness, provenance-preserving baseline mechanism, clean-source two-commit artifacts

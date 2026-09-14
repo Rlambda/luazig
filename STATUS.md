@@ -1,4 +1,4 @@
-> Last updated: 2026-09-14 (P16.45-finalization COMPLETE — двухкоммитная дисциплина C/D: один immutable measured-source коммит C (7d97e5a) + artifact-wrapper D; все канонические артефакты перегенерированы с provenance = точный C; арифметика noise-сводок механически валидируется; layout-проба реально перестроена)
+> Last updated: 2026-09-14 (P16.46 OPEN: perf-gate contract + provenance truth — owner-instructed ledger item добавлен; см. «Открытые пункты текущей фазы»; P16.45-finalization COMPLETE — двухкоммитная дисциплина C/D: один immutable measured-source коммит C (7d97e5a) + artifact-wrapper D; все канонические артефакты перегенерированы с provenance = точный C; арифметика noise-сводок механически валидируется; layout-проба реально перестроена)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -40,6 +40,26 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 
 Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
+
+## Открытые пункты текущей фазы (владелец, 2026-09-14)
+
+- [ ] **P16.46 (owner-instructed)**: perf-gate contract + provenance truth —
+  (a) AGENTS.md perf-раздел согласован с реализацией по явному решению
+  владельца: gate baseline = `tools/perf/baseline-approved.json` (файл
+  легализован), workload count = 18 (устаревшее «16» исправлено);
+  (b) `determinism_recheck` в noise-lanes.json переведён на структурную
+  схему (numeric instructions / explicit mode / env_node_depth /
+  env_node_chain_len / intern depth на каждый repeat) с независимой
+  валидацией в `tools/validate_noise_lanes.py` (expected mode выводится из
+  raw seed rows; проверка mode/placement/intern/drift каждого repeat;
+  отказ на missing seed / missing field / пустой recheck) + негативные
+  тесты wrong-mode / wrong-placement / excessive-drift с ожидаемыми exit
+  codes; (c) оставшаяся ложная prose в noise-lanes.json исправлена
+  (`+12.9` → ссылка на mechanical_summary без второго ручного числа;
+  «mode blends» → median-selects-mode; timestamps разделены: raw evidence
+  сохраняет своё реальное время, `verification_at_C` — своё);
+  (d) serializer test aggregate boolean честен.
+
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
 IR VM полностью удалена из кодовой базы.

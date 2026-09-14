@@ -57,14 +57,16 @@ HISTORICAL_BASELINE = ROOT / "tools" / "perf" / "baseline-p15.37.json"
 # Pin to a single CPU core to reduce scheduler noise. Core 0 is a safe default
 # on most setups; if it is busy the user can override via --core.
 DEFAULT_CORE = "0"
-# P16.47: 13 samples per workload per session. Coverage math: a seed mode
-# observed at probability p is missed by N independent samples with
-# probability (1-p)^N. The recorded bimodal workloads have minor-mode
-# probabilities ~0.29 (metamethod_call_noalloc), ~0.43 (global_arith) and
-# ~0.43 (field_access); at N=13 the per-session miss chance is ~1.1%/0.36%/
-# 0.36% (total ~2%), and a miss is a fail-safe INCONCLUSIVE (nonzero,
-# rerun) — never a silent OK. N=7 missed ~9% of sessions on the 29% mode.
-DEFAULT_RUNS = 13
+# P16.47: 21 samples per workload per session — SYMMETRIC with the baseline
+# recording breadth. Coverage math: a seed mode observed at probability p
+# is missed by N independent samples with probability (1-p)^N. The recorded
+# minor modes: metamethod_call_noalloc ~0.29 (6/21; the binomial CI allows
+# lower), global_arith ~0.43, field_access ~0.43. At N=21 the per-session
+# miss is <=~0.5% for p>=0.29 (<=~3% even if the true p is 0.15); a miss is
+# a fail-safe INCONCLUSIVE (nonzero, rerun) — never a silent OK. Measured
+# earlier: N=7 missed ~9% of sessions on the 29% mode; N=13 still ~1-12%
+# depending on the mode's true probability.
+DEFAULT_RUNS = 21
 BENCH_TIMEOUT_S = 600  # microbench must finish in under 10 min per run
 
 # P16.47 owner-approved matched-mode policy (AGENTS.md «Инструменты

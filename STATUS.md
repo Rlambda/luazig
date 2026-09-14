@@ -1,4 +1,4 @@
-> Last updated: 2026-09-14 (P16.46 OPEN: perf-gate contract + provenance truth — owner-instructed ledger item добавлен; см. «Открытые пункты текущей фазы»; P16.45-finalization COMPLETE — двухкоммитная дисциплина C/D: один immutable measured-source коммит C (7d97e5a) + artifact-wrapper D; все канонические артефакты перегенерированы с provenance = точный C; арифметика noise-сводок механически валидируется; layout-проба реально перестроена)
+> Last updated: 2026-09-14 (P16.46 COMPLETE (correctness-green; обязательный perf gate = FAIL по global_arith — задокументированный bimodal mode flip, см. запись фазы): perf-контракт AGENTS↔код согласован по решению владельца; determinism_recheck структурный с независимым валидатором + негативная матрица; prose truth исправлена) — двухкоммитная дисциплина C/D: один immutable measured-source коммит C (7d97e5a) + artifact-wrapper D; все канонические артефакты перегенерированы с provenance = точный C; арифметика noise-сводок механически валидируется; layout-проба реально перестроена)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -43,7 +43,7 @@ Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-14)
 
-- [ ] **P16.46 (owner-instructed)**: perf-gate contract + provenance truth —
+- [x] **P16.46 (owner-instructed)**: perf-gate contract + provenance truth —
   (a) AGENTS.md perf-раздел согласован с реализацией по явному решению
   владельца: gate baseline = `tools/perf/baseline-approved.json` (файл
   легализован), workload count = 18 (устаревшее «16» исправлено);
@@ -6786,6 +6786,59 @@ strict-JSON incl. matrix/smoke), validate_noise_lanes ALL OK + negative
 FAIL-detected, smoke 83/83 plain + real --testc, matrix 31/32 (zig_fail=0,
 both_fail=1 big.lua), c_api 23+diff, api580, gc.lua, diff --check 0,
 perf_compare: 17 OK / 1 задокументированный bimodal-FAIL.
+
+### P16.46: perf-gate contract + provenance truth (2026-09-14)
+
+Corrective-фаза по решению владельца (ledger item добавлен ДО реализации
+отдельным коммитом a4cd1d5; открытых пунктов было 21 → 22 → закрыт этим
+этапом → 21):
+
+- **Коммит C'** = `2682bbd00f30110665df016410de39aea7644664` (measured
+  source; runtime не менялся — luazig RF остался `071ffa77…`).
+- **BLOCKER 1 (policy/code расхождение)**: владелец решил — gate baseline
+  легитимен как `tools/perf/baseline-approved.json`, AGENTS.md perf-раздел
+  правлен владельческим решением (16→18 workloads; gate baseline назван;
+  baseline-p15.37.json зафиксирован как исторический, гейтом не читается);
+  tools/perf/README.md и docstring'и согласованы; test_perf_gate получил
+  policy-contract asserts (BASELINE.name == baseline-approved.json,
+  len(WORKLOADS) == 18) — молчаливый дрейф теперь роняет suite.
+- **BLOCKER 2 (vacuous validator)**: determinism_recheck переведён на
+  структурную схему (per repeat: numeric instructions / mode /
+  env_node_depth / env_node_chain_len / intern_depth); expected mode
+  выводится независимо из raw seed row (label ⟷ placement-observables);
+  проверяются mode/placement/intern/drift (bound 5M instr; модовый разрыв
+  ~1.4G, jitter ~1.6e5); отвергаются unknown seed / missing field / пустой
+  recheck; негативная матрица 7×FAIL-detected (arithmetic, wrong-mode,
+  wrong-placement, drift, missing-seed, missing-field, empty-recheck);
+  legacy rows сохранены verbatim (legacy_determinism_note), не
+  фабрикуются недозаписанные поля. Свежие прогоны на чистом C'
+  (immutable harness 8a739386…): seed 1 ×2 (13,997,783,559 / …764, high,
+  depth=1/len=2/intern=0), seed 8 ×2 (12,583,783,578 / …482, low,
+  depth=0/len=1/intern=0) — drift ~161k, всё в bound.
+- **MEDIUM (prose truth)**: топ-level created_utc (hand-set 2026-09-10)
+  удалён; timestamps разделены (raw_evidence = commit-anchor 56ef121
+  2026-09-13T16:29:13Z с honest note — старая сессия НЕ relabelена;
+  determinism_verification = реальные 2026-09-14T08:45Z на C');
+  «mode blends» → median SELECTS the mode containing the middle order
+  statistic; +12.9/дублирующие числа → ссылки на mechanical_summary
+  (валидатор охраняет литералы 12.9/645 и отсутствие top-level
+  created_utc); serializer test aggregate boolean честен (all_rejected).
+- **Гейты (на D')**: fmt 0; unit D/RF 0; selftests ALL OK; noise
+  positive ALL OK + 7 негативных FAIL-detected (rc=0 каждый); smoke 83/83
+  plain + все 83 через реальный --testc rc=0; matrix zig_fail=0,
+  both_fail=1 (big.lua); c_api test rc=0 + test-diff DIFF: PASS; api580
+  GREEN; gc.lua outputs match; git diff --check 0.
+- **Обязательный perf gate (perf_compare vs baseline-approved.json,
+  phase P16.45-finalization): RESULT: FAIL — global_arith +13.1%
+  (base 0.751, cur 0.849, NOISE? [runs 0.747..0.972, overlap 44%]),
+  остальные 17 OK. Классификация: задокументированный межпроцессный
+  bimodal mode flip (сессия сэмплировала high-моду; baseline-median —
+  low-мода); binary побайтно идентичен принятому P16.45-finalization
+  состоянию (071ffa77…), независимая сессия ревью ранее дала OK с
+  global_arith 0.744. Фаза НЕ объявляется green по perf-gate; regression
+  фазой не внесена; mode-aware gating — отдельное reviewable решение
+  владельца (candidate-only range доказательством отсутствия регрессии
+  не является — KEEP).
 
 ## История закрытых фаз
 

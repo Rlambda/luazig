@@ -221,7 +221,11 @@
     классифицирует mode-популяции (largest-gap split по instruction-популяции,
     без имён workload'ов). Сравниваются сопоставимые populations
     baseline↔candidate (low↔low, high↔high); вердикт workload'а — худший из
-    покрытых mode (WARN при +5%, FAIL при +10% ВНУТРИ mode).
+    покрытых mode (WARN при +5%, FAIL при +10% ВНУТРИ mode) по
+    **instruction-медиане моды** (causal observable). Wall-медианы внутри
+    моды печатаются как диагностика: wall мультимодален ВНУТРИ одной
+    instruction-моды (address-layout lottery, уровни ~±12%) и не может быть
+    вердикт-метрикой.
   - INCONCLUSIVE (nonzero exit, не green): baseline-мода без покрытия в
     candidate-сессии, либо повреждённое/неклассифицируемое mode-evidence.
   - Скалярная wall-таблица (медианы по всем сэмплам) — ДИАГНОСТИКА; вердиктом

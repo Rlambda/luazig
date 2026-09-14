@@ -76,19 +76,21 @@ BENCH_TIMEOUT_S = 600  # microbench must finish in under 10 min per run
 # orders of magnitude above jitter); wall = the workload's self-reported
 # os.clock time (immune to wrapper startup overhead).
 MODE_SPLIT_REL_GAP = 0.01   # adjacent-sample instruction gap > 1% → mode split
-# Assignment tolerance is DERIVED FROM THE BASELINE POPULATION STRUCTURE
-# (recorded per workload in mode_evidence.assign_tolerance):
-# - mono population: a generous floor (5%) — seed-driven instruction drift
-#   can extend a unimodal population beyond its observed span (measured
-#   +2.4% on table_alloc_setmetatable); the check exists to catch grossly
-#   corrupt counts, not population extension;
-# - multi-mode: 0.8 x the relative half-separation of the closest centers,
-#   floored at 0.5% — members sit within ~span/2 of their center (measured
-#   worst 0.7% vs tolerance 1.0% for metamethod_call_noalloc), so true
-#   members stay assignable while cross-mode garbage does not.
-MONO_TOLERANCE = 0.05
-MULTI_TOL_FRACTION = 0.8
-MULTI_TOL_FLOOR = 0.005
+# Uniform assignment tolerance, deliberately ABOVE the FAIL threshold:
+# a genuine instruction regression of +10..15% inside a mode must stay
+# ASSIGNED to its nearest mode so the delta comparison produces a real
+# FAIL — a tolerance below the threshold would misclassify regressions as
+# "corrupt evidence" (INCONCLUSIVE). Seed-driven population extension is
+# measured at ~2.4% (table_alloc_setmetatable), far inside 15%. Only
+# grossly unclassifiable counts (>15% from EVERY center — parse garbage,
+# a different workload shape) trip it. Within-mode member distances are
+# measured 0.03–1.35%, so no true member is ever rejected.
+# NOTE on degenerate geometry: for modes ~11% apart (global_arith), a
+# +11% shift of the low population lands ON the high center — nearest-
+# center assignment then labels those samples high and the low mode comes
+# back uncovered → INCONCLUSIVE (nonzero, fail-safe), which is the honest
+# verdict for geometrically indistinguishable evidence.
+ASSIGN_TOLERANCE = 0.15
 
 # Regression thresholds (fraction). WARN at +5%, FAIL at +10%.
 REGRESSION_WARN = 0.05
@@ -818,24 +820,18 @@ def classify_modes(samples: list[dict]) -> dict:
         labels = []
         for s in samples:
             labels.append("low" if s["instructions"] <= instrs[best_i] else "high")
-        # half-separation of the closest centers: a sample further than
-        # this from BOTH centers is in no-man's-land (ambiguous) — members
-        # themselves sit within ~span/2, well inside.
-        seps = [abs(b - a) / a for a, b in
-                zip(sorted(centers.values()), sorted(centers.values())[1:])]
-        tolerance = max(MULTI_TOL_FLOOR,
-                        MULTI_TOL_FRACTION * min(seps) / 2)
+        tolerance = ASSIGN_TOLERANCE
     else:
         centers = {"mono": statistics.median(instrs)}
         labels = ["mono"] * n
-        tolerance = MONO_TOLERANCE
+        tolerance = ASSIGN_TOLERANCE
     return {"labels": labels, "centers": centers,
             "assign_tolerance": tolerance,
             "split_rel_gap": best_gap, "n": n}
 
 
 def assign_modes(instrs: list[int], centers: dict[str, float],
-                 tolerance: float = MONO_TOLERANCE) -> list[str]:
+                 tolerance: float = ASSIGN_TOLERANCE) -> list[str]:
     """Assign candidate samples to recorded baseline centers.
 
     A sample farther than `tolerance` (relative, derived from the baseline
@@ -857,6 +853,16 @@ def mode_aware_regression(zig_samples: dict[str, list[dict]],
                           baseline_doc: dict) -> dict:
     """Matched-mode regression: low↔low, high↔high, mono↔mono.
 
+    Verdict METRIC = the causal observable (instructions:u median of the
+    mode population), NOT wall: raw evidence (P16.47 sessions at N=21)
+    shows wall is multimodal WITHIN one instruction mode (global_arith
+    levels ~0.745/0.83/0.95/1.14s interleaved randomly per process — the
+    per-process address-layout lottery), so any wall-median verdict is
+    session-dependent even after mode matching. instructions:u is
+    deterministic per seed (reproducibility evidence in
+    tools/perf/noise-lanes.json) and its within-mode spread is measured
+    0.03–1.35%. Wall medians per mode are PRINTED as diagnostics only.
+
     Fail-safe aggregation: per-(workload, mode) verdicts are computed
     independently; the aggregates are folded from the verdict list AFTER
     the loop. A baseline mode the candidate session failed to sample is
@@ -869,9 +875,9 @@ def mode_aware_regression(zig_samples: dict[str, list[dict]],
     prev_ident = baseline_doc.get("baseline_identity", {})
     print(f"\nMatched-mode regression check vs {BASELINE} "
           f"(phase: {prev_ident.get('baseline_phase', 'unknown')}):")
-    print(f"  {'Workload[mode]':<28} {'base (s)':>10} {'cur (s)':>10} "
-          f"{'delta':>10}  status")
-    print("  " + "-" * 66)
+    print(f"  {'Workload[mode]':<28} {'base instr':>13} {'cur instr':>13} "
+          f"{'delta':>9}  status")
+    print("  " + "-" * 78)
     verdicts: list[str] = []
     inconclusive = False
     for wl in sorted(base_samples_all):
@@ -886,7 +892,8 @@ def mode_aware_regression(zig_samples: dict[str, list[dict]],
             print(f"  {wl:<28}  baseline evidence incomplete -> INCONCLUSIVE")
             inconclusive = True
             continue
-        tol = base_evidence.get(wl, {}).get("assign_tolerance", MONO_TOLERANCE)
+        tol = base_evidence.get(wl, {}).get("assign_tolerance",
+                                           ASSIGN_TOLERANCE)
         try:
             cand_labels = assign_modes([s["instructions"] for s in cand_rows],
                                        centers, tol)
@@ -899,22 +906,28 @@ def mode_aware_regression(zig_samples: dict[str, list[dict]],
             cand_idx = [i for i, lab in enumerate(cand_labels) if lab == mode]
             if not base_walls or not cand_idx:
                 print(f"  {wl + '[' + mode + ']':<28} "
-                      f"{(statistics.median(base_walls) if base_walls else 0):>10.3f} "
-                      f"{'--':>10} {'--':>10}  INCONCLUSIVE "
+                      f"{'--':>13} {'--':>13} {'--':>9}  INCONCLUSIVE "
                       f"({'baseline' if not base_walls else 'candidate'} "
                       f"mode not covered)")
                 inconclusive = True
                 continue
-            base_med = statistics.median(base_walls)
-            cand_walls = [cand_rows[i]["wall"] for i in cand_idx]
-            cand_med = statistics.median(cand_walls)
-            delta = (cand_med - base_med) / base_med if base_med else 0.0
+            # Verdict: causal instruction medians inside the matched mode.
+            base_instr = [s["instructions"] for s in base_rows
+                          if s.get("mode") == mode]
+            cand_instr = [cand_rows[i]["instructions"] for i in cand_idx]
+            base_imed = statistics.median(base_instr)
+            cand_imed = statistics.median(cand_instr)
+            delta = ((cand_imed - base_imed) / base_imed
+                     if base_imed else 0.0)
             verdict = classify(delta)
             verdicts.append(verdict)
-            sp = {"min": min(cand_walls), "max": max(cand_walls)}
-            note = noise_annotation(base_med, cand_med, sp)
-            print(f"  {wl + '[' + mode + ']':<28} {base_med:>10.3f} "
-                  f"{cand_med:>10.3f} {delta * 100:>+9.1f}%  {verdict}{note}")
+            # Wall: diagnostic only (multimodal within a mode — see above).
+            cand_walls = [cand_rows[i]["wall"] for i in cand_idx]
+            w_med = statistics.median(cand_walls)
+            w_spread = (f"[wall {min(cand_walls):.3f}..{max(cand_walls):.3f}"
+                        f", med {w_med:.3f}]")
+            print(f"  {wl + '[' + mode + ']':<28} {base_imed:>13} "
+                  f"{cand_imed:>13} {delta * 100:>+8.2f}%  {verdict}  {w_spread}")
         extra = set(cand_labels) - set(centers)
         if extra:
             print(f"  {wl:<28}  candidate-only modes {sorted(extra)}: "

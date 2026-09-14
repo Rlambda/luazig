@@ -76,7 +76,7 @@ def bimodal_doc(low_w=0.750, high_w=0.850):
         },
         "mode_evidence": {"wl": {"centers": {"low": 12_583_900_500,
                                              "high": 13_997_900_500},
-                                 "assign_tolerance": 0.088,
+                                 "assign_tolerance": 0.15,
                                  "split_rel_gap": 0.11, "n": 7}},
     }
 
@@ -97,17 +97,66 @@ res, table = run_mode(cand, bimodal_doc())
 check("1 cross-mode same-binary not a regression",
       res["fail"] is False and res["inconclusive"] is False and res["warn"] is False)
 
-# 2. Real +11% slowdown INSIDE low mode -> FAIL.
-cand = {"wl": mk_rows([0.833] * 4, [12_583_940_000] * 4, "low")
-             + mk_rows([0.851] * 3, [13_997_940_000] * 3, "high")}
-res, table = run_mode(cand, bimodal_doc())
+# 1b. WALL LOTTERY IMMUNITY (measured P16.47: global_arith wall levels
+#     ~0.745/0.83/0.95/1.14s interleaved per process within one
+#     instruction mode): identical instruction populations with a
+#     completely different wall mix must NOT flip the verdict — the
+#     causal observable decides, wall is a printed diagnostic.
+lottery = {"wl": mk_rows([0.949] * 4, [12_583_940_000] * 4, "low")
+                 + mk_rows([0.745] * 3, [13_997_940_000] * 3, "high")}
+res, table = run_mode(lottery, bimodal_doc())
+check("1b wall-lottery flip not a regression", res["fail"] is False
+      and res["warn"] is False and res["inconclusive"] is False)
+
+# 2. Real +11% instruction regression inside a mode — geometrically
+#    decidable shape: centers 30% apart, so +11% off the low center stays
+#    NEARER low than high and remains assignable (tolerance 15% > FAIL
+#    10%): the delta comparison must produce a real FAIL.
+wide_doc = {
+    "baseline_identity": {"baseline_phase": "fixture"},
+    "zig_samples": {"w": mk_rows([0.6] * 4,
+                                 [10_000_000_000 + k * 1000 for k in range(4)], "low")
+                          + mk_rows([0.8] * 3,
+                                    [13_000_000_000 + k * 1000 for k in range(3)], "high")},
+    "mode_evidence": {"w": {"centers": {"low": 10_000_001_500,
+                                        "high": 13_000_001_000},
+                            "assign_tolerance": 0.15,
+                            "split_rel_gap": 0.30, "n": 7}},
+}
+cand = {"w": mk_rows([0.6] * 4, [11_100_001_500] * 4, "low")
+             + mk_rows([0.8] * 3, [13_000_001_000] * 3, "high")}
+res, table = run_mode(cand, wide_doc)
 check("2 +11% inside low FAILs", res["fail"] is True)
 
-# 3. Real +11% slowdown INSIDE high mode -> FAIL.
-cand = {"wl": mk_rows([0.751] * 4, [12_583_940_000] * 4, "low")
-             + mk_rows([0.944] * 3, [13_997_940_000] * 3, "high")}
+# 2b. Degenerate geometry (measured global_arith shape: centers 11% apart):
+#     a +11% shift of the low population lands ON the high center —
+#     nearest-center assignment labels them high, low comes back uncovered
+#     → INCONCLUSIVE (nonzero, fail-safe — NEVER a green).
+cand = {"wl": mk_rows([0.751] * 4, [13_967_973_400] * 4, "low")
+             + mk_rows([0.849] * 3, [13_997_940_000] * 3, "high")}
 res, table = run_mode(cand, bimodal_doc())
+check("2b degenerate +11% low is nonzero INCONCLUSIVE",
+      res["inconclusive"] is True and res["fail"] is False)
+
+# 3. Real +11% slowdown INSIDE high mode (wide-shape fixture: the shift
+#    stays nearer the high center — decidable FAIL).
+cand = {"w": mk_rows([0.6] * 4, [10_000_001_500] * 4, "low")
+             + mk_rows([0.8] * 3, [14_430_001_100] * 3, "high")}
+res, table = run_mode(cand, wide_doc)
 check("3 +11% inside high FAILs", res["fail"] is True)
+
+# 3b. Mono workload +11% instructions (tolerance 15% keeps it assigned).
+mono_doc = {
+    "baseline_identity": {"baseline_phase": "fixture"},
+    "zig_samples": {"mw": mk_rows([0.9] * 5,
+                                  [880_000_000 + k * 1000 for k in range(5)], "mono")},
+    "mode_evidence": {"mw": {"centers": {"mono": 880_002_000},
+                             "assign_tolerance": 0.15,
+                             "split_rel_gap": 0.0, "n": 5}},
+}
+cand = {"mw": mk_rows([0.9] * 5, [976_802_200] * 5, "mono")}
+res, table = run_mode(cand, mono_doc)
+check("3b mono +11% FAILs", res["fail"] is True)
 
 # 4. One mode missing from the candidate session -> INCONCLUSIVE.
 cand = {"wl": mk_rows([0.751] * 7, [12_583_940_000] * 7, "low")}
@@ -127,36 +176,29 @@ rb, _ = run_mode(b, bimodal_doc())
 check("5 reorder invariant", (ra["fail"], ra["warn"], ra["inconclusive"])
       == (rb["fail"], rb["warn"], rb["inconclusive"]))
 
-# 6. NOISE diagnostics never change aggregates: wide overlapping candidate
-#    spread produces the same flags as a tight one.
+# 6. Wall spread NEVER changes aggregates: identical instruction
+#    populations with wildly different wall spreads verdict identically
+#    (the verdict metric is causal; wall is printed diagnostics only).
 tight = {"wl": mk_rows([0.751] * 4, [12_583_940_000] * 4, "low")
                + mk_rows([0.849] * 3, [13_997_940_000] * 3, "high")}
 wide = {"wl": mk_rows([0.70, 0.751, 0.80, 0.751], [12_583_940_000] * 4, "low")
               + mk_rows([0.80, 0.849, 0.90], [13_997_940_000] * 3, "high")}
 rt, tt = run_mode(tight, bimodal_doc())
 rw, tw = run_mode(wide, bimodal_doc())
-check("6 NOISE diagnostic-only", (rt["fail"], rt["warn"], rt["inconclusive"])
-      == (rw["fail"], rw["warn"], rw["inconclusive"]) and "NOISE?" in tw)
+check("6 wall spread diagnostic-only", (rt["fail"], rt["warn"], rt["inconclusive"])
+      == (rw["fail"], rw["warn"], rw["inconclusive"]))
 
 # 7. Corrupt/mislabeled mode evidence (sample 20% away from every center)
 #    -> ModeEvidenceError inside the check -> INCONCLUSIVE verdict path.
 cand = {"wl": mk_rows([0.751] * 4, [12_583_940_000] * 4, "low")
              + mk_rows([0.849] * 2, [13_997_940_000] * 2, "high")
-             + [{"wall": 0.9, "instructions": 16_000_000_000, "mode": "?"}]}
+             + [{"wall": 0.9, "instructions": 20_000_000_000, "mode": "?"}]}
 res, table = run_mode(cand, bimodal_doc())
 check("7 corrupt evidence INCONCLUSIVE", res["inconclusive"] is True)
 
-# 7b. mono population EXTENSION within the mono tolerance is assignable
+# 7b. mono population EXTENSION within the tolerance is assignable
 #     (measured: +2.4% seed drift on table_alloc_setmetatable must not be
 #     called corrupt; only gross corruption is).
-mono_doc = {
-    "baseline_identity": {"baseline_phase": "fixture"},
-    "zig_samples": {"mw": mk_rows([0.9] * 5, [880_000_000 + k * 1000
-                                              for k in range(5)], "mono")},
-    "mode_evidence": {"mw": {"centers": {"mono": 880_002_000},
-                             "assign_tolerance": 0.05,
-                             "split_rel_gap": 0.0, "n": 5}},
-}
 cand = {"mw": mk_rows([0.902] * 5, [901_000_000] * 5, "mono")}
 res, table = run_mode(cand, mono_doc)
 check("7b mono extension (+2.4%) assignable", res["inconclusive"] is False)
@@ -166,15 +208,18 @@ cand = {"mw": mk_rows([0.9] * 5, [1_200_000_000] * 5, "mono")}
 res, table = run_mode(cand, mono_doc)
 check("7c gross mono corruption INCONCLUSIVE", res["inconclusive"] is True)
 
-# 11. classify_modes records a structure-derived tolerance: bimodal
-#     centers 11% apart → 0.8x half-sep ~4.4%; mono → 5%.
+# 11. classify_modes records the uniform tolerance (above the FAIL
+#     threshold so real regressions stay assignable — see perf_compare).
 rows = [{"wall": 0.75, "instructions": 1000 + k} for k in range(4)]
 rows += [{"wall": 0.85, "instructions": 1115 + k} for k in range(3)]
 ev = pc.classify_modes(rows)
-check("11 tolerance derived for bimodal", 0.03 < ev["assign_tolerance"] < 0.05)
+check("11 tolerance uniform above FAIL threshold",
+      ev["assign_tolerance"] == pc.ASSIGN_TOLERANCE
+      and pc.ASSIGN_TOLERANCE > pc.REGRESSION_FAIL)
 ev2 = pc.classify_modes([{"wall": 0.5, "instructions": 1000 + k}
                          for k in range(6)])
-check("11 tolerance floor for mono", ev2["assign_tolerance"] == 0.05)
+check("11 tolerance uniform for mono",
+      ev2["assign_tolerance"] == pc.ASSIGN_TOLERANCE)
 
 # 8. Fail-safe fold: a real FAIL cannot be erased by later OK/INCONCLUSIVE
 #    rows (verdicts folded after the loop from the list).
@@ -182,7 +227,7 @@ doc2 = bimodal_doc()
 doc2["zig_samples"]["a_fail"] = mk_rows([1.0], [100], "mono")
 doc2["mode_evidence"]["a_fail"] = {"centers": {"mono": 100}, "split_rel_gap": 0.0, "n": 1}
 cand = {"wl": mk_rows([0.751] * 7, [12_583_940_000] * 7, "low"),
-        "a_fail": mk_rows([1.11], [100], "mono")}
+        "a_fail": mk_rows([1.0], [111], "mono")}
 res, table = run_mode(cand, doc2)
 check("8 FAIL preserved alongside INCONCLUSIVE",
       res["fail"] is True and res["inconclusive"] is True)

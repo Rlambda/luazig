@@ -8127,10 +8127,16 @@ pub const Vm = struct {
         // P16.0b: per-type allocation counts. GcObject is a tagged union,
         // so @intFromEnum yields the active tag (declaration order: table,
         // closure, thread, string, cell, userdata — matches alloc_by_type).
-        if (self.stats.enabled) self.stats.alloc_by_type[@intFromEnum(obj)] += 1;
+        // P16.49-review-2: count the registration only AFTER the fallible
+        // capacity reservations succeed — the old placement (before them)
+        // left alloc_by_type incremented when registration failed, so a
+        // rolled-back object permanently drifted the per-type counters.
+        // (PUC luaC_newobj has no such counter; ours must at least be
+        // consistent with actual registrations.)
         try self.gc_objects.ensureUnusedCapacity(self.alloc, 1);
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
             try self.gc_young_objects.ensureUnusedCapacity(self.alloc, 1);
+        if (self.stats.enabled) self.stats.alloc_by_type[@intFromEnum(obj)] += 1;
         const p = gcPtr(obj);
         p.marked.* = self.gc_current_white & WHITEBITS;
         // P16.16 C1: gc_index is u32 — the list can never exceed 4G entries
@@ -24170,6 +24176,12 @@ pub const Vm = struct {
 
     fn gcForwardBarrierValue(self: *Vm, owner: Value, child: Value) DispatchError!void {
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
+            // PUC luaC_barrier_ (lgc.c:257-260): in the sweep phase of a
+            // generational MINOR collection the barrier is a deliberate
+            // no-op (only non-GENMINOR sweeps makewhite the owner). This
+            // also guarantees the young sweep stays allocation-free when
+            // thread teardown runs this barrier.
+            if (self.gc_state == .sweep) return;
             const owner_age = gcValueAge(owner) orelse return;
             const child_age = gcValueAge(child) orelse return;
             if (owner_age.isOld() and child_age.isYoung()) {
@@ -24185,6 +24197,8 @@ pub const Vm = struct {
 
     fn gcForwardBarrierCell(self: *Vm, owner: *Closure, child: *Cell) DispatchError!void {
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
+            // PUC luaC_barrier_ sweep arm: GENMINOR sweep → no-op.
+            if (self.gc_state == .sweep) return;
             if (owner.gc_age.isOld() and child.gc_age.isYoung()) {
                 child.gc_age = .old0;
                 try self.gc_old1.append(self.alloc, .{ .cell = child });
@@ -24883,6 +24897,13 @@ pub const Vm = struct {
         // writes (luaF_close, lua_setupvalue). Without it, a young value
         // stored in an old closed upvalue would be swept — use-after-free.
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
+            // PUC luaC_barrier_ (lgc.c:257-260): in the GENMINOR sweep
+            // phase the barrier is a no-op — the closed cell's value was
+            // already marked in atomic through the live closure's
+            // traversal; marking/promoting here would allocate inside
+            // the young sweep (whose allocation-freedom the pre-reserve
+            // guarantees cover only for the promote paths).
+            if (self.gc_state == .sweep) return;
             if (cell.gc_age.isOld()) {
                 if (gcValueAge(value)) |age| {
                     if (age.isYoung()) {
@@ -25594,14 +25615,21 @@ pub const Vm = struct {
                 return false;
             },
             .old0 => {
-                // PUC nextage: G_OLD0 → G_OLD1, then add to grayagain.
-                // P16.49-review: the forward barrier that set .old0
-                // (gcForwardBarrierValue/Cell) ALREADY appended the object
-                // to gc_old1 and charged gc_gen_added_old_kb — repeating
-                // both here created duplicate gc_old1 entries and
-                // double-charged the minor→major pacing decision.
-                // grayagain/gen_threads linking matches the .survival arm.
+                // PUC nextage (lgc.c:1175-1205): G_OLD0 → G_OLD1.
+                // P16.49-review-2: the forward barrier that set .old0
+                // already LINKED the object into gc_old1
+                // (gcForwardBarrierValue/Cell, gcWriteBarrierCell) — do
+                // not append again (duplicate entries). It did NOT,
+                // however, charge the accounting: PUC sweepgen increments
+                // `addedold` for EVERY object becoming G_OLD1 — both
+                // G_SURVIVAL→G_OLD1 and G_OLD0→G_OLD1 (lgc.c:1172-1212) —
+                // while luaC_barrier_ (lgc.c:246-260) only sets the age.
+                // The charge therefore belongs HERE, exactly once, at the
+                // actual age transition (the P16.49-review removal of it
+                // undercounted OLD0 promotions and wrongly deferred the
+                // minor→major transition).
                 p.age.* = .old1;
+                self.gc_gen_added_old_kb += @as(f64, @floatFromInt(gcObjectBytes(obj))) / 1024.0;
                 if (obj != .cell) {
                     try self.gc_grayagain.append(self.alloc, obj);
                 }
@@ -25868,6 +25896,18 @@ pub const Vm = struct {
     }
 
     fn gcSweepYoungGeneration(self: *Vm) DispatchError!void {
+        // PUC youngcollection (lgc.c:1351): `g->gcstate = GCSswpallgc`
+        // BEFORE running sweepgen, so issweepphase() is true for any
+        // barrier reachable from thread teardown inside the sweep — and
+        // luaC_barrier_ (lgc.c:257-260) is a deliberate NO-OP in the
+        // KGC_GENMINOR sweep phase (the value of a surviving cell was
+        // already marked in atomic through the live closure's traversal).
+        // This is what makes the young sweep genuinely allocation-free:
+        // the barrier family takes its sweep arm instead of the marking /
+        // promoting / gc_old1-append path.
+        const saved_state = self.gc_state;
+        self.gc_state = .sweep;
+        defer self.gc_state = saved_state;
         self.gcClearDeadFrameRegisters();
         try self.gcSweepYoungObjects();
         self.gcCorrectOld1();
@@ -47394,6 +47434,167 @@ test "P16.49-review: generational rollback keeps every GC registry exact" {
             // restored state. With the old defect the dangling entries
             // were dereferenced here (gcPtr on freed memory → garbage
             // liveness → double free caught by the testing allocator).
+            try vm.gcMinorCollection();
+            try testing.expectEqual(young0.len, vm.gc_young_objects.items.len);
+        }
+    }
+    try testing.expect(tested_failures > 0);
+    try testing.expect(first_success_idx != null);
+}
+
+test "P16.49-review-2: OLD0 promotion charges added-old exactly once (PUC sweepgen)" {
+    // PUC sweepgen (lgc.c:1172-1212) increments `addedold` for EVERY
+    // object becoming G_OLD1 — both G_SURVIVAL→G_OLD1 and G_OLD0→G_OLD1 —
+    // while luaC_barrier_ (lgc.c:246-260) only sets G_OLD0 (no charge
+    // there). The P16.49-review regression removed the OLD0 charge,
+    // undercounting and wrongly deferring the minor→major transition.
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    // Old owner: created BEFORE entering generational mode, then made old
+    // by the mode-transition full collection (temp-rooted so it survives).
+    const owner = try vm.allocTable(null);
+    {
+        var roots = vm.gcTempRoots();
+        try roots.add(.{ .Table = owner });
+        try vm.gcEnterGenerational();
+        try testing.expect(owner.gc_age.isOld());
+        roots.end();
+    }
+    // Young child (registered in gen-minor → age .new, in young list).
+    const child = try vm.allocTable(null);
+    try testing.expect(child.gc_age == .new);
+
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(.{ .Table = owner });
+    try roots.add(.{ .Table = child });
+
+    // Real forward barrier: old owner stores young child.
+    const added_old_before_barrier = vm.gc_gen_added_old_kb;
+    try vm.gcForwardBarrierValue(.{ .Table = owner }, .{ .Table = child });
+    try testing.expect(child.gc_age == .old0);
+    // Barrier LINKS into gc_old1 (exactly once) but does NOT charge:
+    var in_old1: usize = 0;
+    for (vm.gc_old1.items) |o| {
+        if (o == .table and o.table == child) in_old1 += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), in_old1);
+    try testing.expectEqual(added_old_before_barrier, vm.gc_gen_added_old_kb);
+
+    // Minor sweep: OLD0 → OLD1 with EXACTLY-ONE charge of the child's
+    // byte size; still exactly one gc_old1 entry.
+    const expected_charge = @as(f64, @floatFromInt(gcObjectBytes(.{ .table = child }))) / 1024.0;
+    const before = vm.gc_gen_added_old_kb;
+    try vm.gcMinorCollection();
+    try testing.expect(child.gc_age == .old1);
+    try testing.expectApproxEqAbs(expected_charge, vm.gc_gen_added_old_kb - before, 1e-9);
+    in_old1 = 0;
+    for (vm.gc_old1.items) |o| {
+        if (o == .table and o.table == child) in_old1 += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), in_old1);
+
+    // Next cycle (PUC markold, lgc.c:1276): the OLD1 object advances to
+    // OLD and leaves the old1 registry — no second charge, no duplicate.
+    const before2 = vm.gc_gen_added_old_kb;
+    try vm.gcMinorCollection();
+    try testing.expectEqual(before2, vm.gc_gen_added_old_kb);
+    try testing.expect(child.gc_age == .old);
+    in_old1 = 0;
+    for (vm.gc_old1.items) |o| {
+        if (o == .table and o.table == child) in_old1 += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), in_old1);
+
+    // Threshold edge: with the OLD0 contribution the minor→major
+    // decision must trip exactly at the PUC checkminormajor boundary
+    // (gc_gen_added_old_kb >= base * minormajor%). A build without the
+    // OLD0 charge stays minor here — the negative validation. Uses a
+    // FRESH young child: the first one is already OLD by now (markold).
+    const child2 = try vm.allocTable(null);
+    try roots.add(.{ .Table = child2 });
+    try vm.gcForwardBarrierValue(.{ .Table = owner }, .{ .Table = child2 });
+    try testing.expect(child2.gc_age == .old0);
+    vm.gc_gen_major_base_kb = 10.0;
+    // Mirror the checkminormajor limit: limit = base * pct(gcparams[2]);
+    // query the same helper the runtime uses (Vm method scope).
+    const pct = @as(f64, @floatFromInt(@max(Vm.gcApplyParam(vm.gcparams[2], 100), 0))) / 100.0;
+    const expected_charge2 = @as(f64, @floatFromInt(gcObjectBytes(.{ .table = child2 }))) / 1024.0;
+    // Make added-old sit exactly one child2-charge below the limit.
+    vm.gc_gen_added_old_kb = 10.0 * pct - expected_charge2;
+    try vm.gcMinorCollection();
+    try testing.expect(child2.gc_age == .old1);
+    try testing.expect(vm.gc_gen_phase == .major);
+}
+
+test "P16.49-review-2: generational closureFromProto rollback keeps every registry exact" {
+    // Task 3 coverage gap: the P16.49-review generational test exercised
+    // only createBytecodeChunkClosure. closureFromProto's rollback must
+    // restore the young registry byte-exactly too — including the
+    // register-failure edge where gcRegisterCell's young-list growth is
+    // the failing allocation.
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    try vm.gcEnterGenerational();
+    try testing.expect(vm.gc_mode == .generational);
+    try testing.expect(vm.gc_gen_phase == .minor);
+
+    var fail_idx: usize = 0;
+    var tested_failures: usize = 0;
+    var first_success_idx: ?usize = null;
+    while (fail_idx <= 64) : (fail_idx += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        const proto = try p44BuildProto(vm.alloc, &vm, 3, 8);
+        const saved_alloc = vm.alloc;
+        vm.alloc = failing.allocator();
+        defer vm.alloc = saved_alloc;
+        proto.tree.?.retainTree();
+        defer {
+            proto.tree.?.releaseTree(saved_alloc);
+            proto.tree.?.releaseTree(saved_alloc);
+        }
+
+        const young0 = try testing.allocator.dupe(GcObject, vm.gc_young_objects.items);
+        defer testing.allocator.free(young0);
+        const gc_len0 = vm.gc_objects.items.len;
+        const count0 = vm.gc_count_kb;
+        const funcs0 = vm.testc_obj_functions;
+
+        if (vm.closureFromProto(proto)) |cl| {
+            _ = vm.gcUnregisterObjectRollback(.{ .closure = cl });
+            vm.gcNoteFree(@sizeOf(Closure) + cl.upvalues.len * @sizeOf(*Cell));
+            for (cl.upvalues) |c| {
+                _ = vm.gcUnregisterObjectRollback(.{ .cell = c });
+                vm.gcNoteFree(@sizeOf(Cell));
+                saved_alloc.destroy(c);
+            }
+            if (cl.proto) |pp| {
+                if (pp.tree) |t| t.releaseTree(saved_alloc);
+            }
+            const ua = vm.alloc;
+            vm.alloc = saved_alloc;
+            ua.free(cl.upvalues);
+            ua.destroy(cl);
+            first_success_idx = fail_idx;
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            tested_failures += 1;
+            try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
+            try testing.expectEqual(count0, vm.gc_count_kb);
+            try testing.expectEqual(funcs0, vm.testc_obj_functions);
+            try testing.expectEqual(young0.len, vm.gc_young_objects.items.len);
+            for (young0, vm.gc_young_objects.items) |a, b| {
+                try testing.expect(std.meta.eql(a, b));
+            }
+            // Real young collection over the restored state (DebugAllocator
+            // catches any dangling/double-free).
             try vm.gcMinorCollection();
             try testing.expectEqual(young0.len, vm.gc_young_objects.items.len);
         }

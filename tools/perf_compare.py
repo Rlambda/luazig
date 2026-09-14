@@ -57,7 +57,14 @@ HISTORICAL_BASELINE = ROOT / "tools" / "perf" / "baseline-p15.37.json"
 # Pin to a single CPU core to reduce scheduler noise. Core 0 is a safe default
 # on most setups; if it is busy the user can override via --core.
 DEFAULT_CORE = "0"
-DEFAULT_RUNS = 7
+# P16.47: 13 samples per workload per session. Coverage math: a seed mode
+# observed at probability p is missed by N independent samples with
+# probability (1-p)^N. The recorded bimodal workloads have minor-mode
+# probabilities ~0.29 (metamethod_call_noalloc), ~0.43 (global_arith) and
+# ~0.43 (field_access); at N=13 the per-session miss chance is ~1.1%/0.36%/
+# 0.36% (total ~2%), and a miss is a fail-safe INCONCLUSIVE (nonzero,
+# rerun) — never a silent OK. N=7 missed ~9% of sessions on the 29% mode.
+DEFAULT_RUNS = 13
 BENCH_TIMEOUT_S = 600  # microbench must finish in under 10 min per run
 
 # P16.47 owner-approved matched-mode policy (AGENTS.md «Инструменты

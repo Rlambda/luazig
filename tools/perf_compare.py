@@ -75,26 +75,38 @@ BENCH_TIMEOUT_S = 600  # microbench must finish in under 10 min per run
 # per-process instructions:u (deterministic per seed; the bimodal gap is
 # orders of magnitude above jitter); wall = the workload's self-reported
 # os.clock time (immune to wrapper startup overhead).
-MODE_SPLIT_REL_GAP = 0.01   # adjacent-sample instruction gap > 1% → mode split
-# Uniform assignment tolerance, deliberately ABOVE the FAIL threshold:
-# a genuine instruction regression of +10..15% inside a mode must stay
-# ASSIGNED to its nearest mode so the delta comparison produces a real
-# FAIL — a tolerance below the threshold would misclassify regressions as
-# "corrupt evidence" (INCONCLUSIVE). Seed-driven population extension is
-# measured at ~2.4% (table_alloc_setmetatable), far inside 15%. Only
-# grossly unclassifiable counts (>15% from EVERY center — parse garbage,
-# a different workload shape) trip it. Within-mode member distances are
-# measured 0.03–1.35%, so no true member is ever rejected.
-# NOTE on degenerate geometry: for modes ~11% apart (global_arith), a
-# +11% shift of the low population lands ON the high center — nearest-
-# center assignment then labels those samples high and the low mode comes
-# back uncovered → INCONCLUSIVE (nonzero, fail-safe), which is the honest
-# verdict for geometrically indistinguishable evidence.
-ASSIGN_TOLERANCE = 0.15
-
 # Regression thresholds (fraction). WARN at +5%, FAIL at +10%.
 REGRESSION_WARN = 0.05
 REGRESSION_FAIL = 0.10
+
+# P16.48: the split threshold is TIED TO THE VERDICT THRESHOLD — a gap
+# smaller than REGRESSION_WARN cannot by itself create a WARN/FAIL verdict
+# (mode-mix can shift a median at most by the gap size), so gaps below it
+# are safely treated as within-population spread; gaps at/above it are
+# modes whose mixing WOULD corrupt a verdict. Verified on the stored raw
+# sessions: at the WARN-tied threshold the 18 workloads show 0/18 cluster-
+# form flips between sessions (vs 3/18 at the old 1%: coroutine_yield,
+# temp_table_alloc, metamethod_call_noalloc flipped forms — the gate had
+# ignored candidate classification entirely, which is the false-green).
+MODE_SPLIT_REL_GAP = REGRESSION_WARN
+# Population-weight compatibility: a candidate whose mode mixture is
+# statistically incompatible with the baseline mixture (exact two-sided
+# binomial p-value < 1e-3) signals mass migration between modes — NOT a
+# benign seed-mix change — and must not yield a green verdict.
+WEIGHT_ALPHA = 1e-3
+# Secondary wall rule (owner-approved P16.48): per matched instruction
+# mode, compare the wall P25 (lower envelope). The per-process address
+# layout lottery inflates/mixes the UPPER part of the wall distribution
+# but leaves the fast envelope stable (measured ±1.6% across sessions
+# while medians flipped >25%); a real slowdown shifts the whole
+# distribution including the envelope. Envelope shift > 10% with an
+# instruction-OK verdict → INCONCLUSIVE + run causal counters.
+WALL_P25_LIMIT = 0.10
+# (P16.48) The nearest-baseline-center assignment verdict is RETIRED: it
+# had three proven false-greens (ignored candidate cluster form; absorbed
+# a migrated population into the destination mode; absorbed a new minority
+# mode into a mono median). The gate now clusters both sides INDEPENDENTLY
+# and compares order-matched centers — see mode_aware_regression.
 
 # Noisy-lane policy (P15.37; fail-safe rework P16.45 after review
 # rejected the P16.44 downgrade): the current session's per-workload run
@@ -800,8 +812,11 @@ def classify_modes(samples: list[dict]) -> dict:
 
     Deterministic and reorder-invariant: sort the instruction counts,
     split at the largest adjacent gap when that gap exceeds
-    MODE_SPLIT_REL_GAP (the global_arith mode gap is ~10% of the total
-    while same-mode jitter is ~0.001%). No workload names involved."""
+    MODE_SPLIT_REL_GAP (WARN-tied — see the constant's comment; the
+    global_arith mode gap is ~11% while same-mode jitter is ~0.001%).
+    A split needs BOTH sides >= 2 samples and >= 10% of the population —
+    a one-sample "cluster" is an outlier, not a mode. No workload names
+    involved."""
     instrs = sorted(s["instructions"] for s in samples)
     n = len(instrs)
     if n < 2:
@@ -814,64 +829,84 @@ def classify_modes(samples: list[dict]) -> dict:
         g = (b - a) / a if a else 0.0
         if g > best_gap:
             best_gap, best_i = g, i
-    if best_gap > MODE_SPLIT_REL_GAP:
+    # A single-sample "cluster" is an outlier, not a mode: a split is only
+    # accepted when BOTH sides have at least 2 samples (and at least 10% of
+    # the population), otherwise the form is mono-with-outlier and the
+    # comparison geometry below reports it honestly.
+    splittable = (best_i + 1 >= 2 and n - best_i - 1 >= 2
+                  and best_i + 1 >= max(2, n // 10)
+                  and n - best_i - 1 >= max(2, n // 10))
+    # A gap above the threshold whose split was rejected by the minimum
+    # cluster size is ANOMALOUS evidence (an outlier that would otherwise
+    # be its own mode): carried out so the regression can fail safe.
+    rejected_split_gap = best_gap if (best_gap > MODE_SPLIT_REL_GAP
+                                      and not splittable) else 0.0
+    if best_gap > MODE_SPLIT_REL_GAP and splittable:
         low, high = instrs[:best_i + 1], instrs[best_i + 1:]
         centers = {"low": statistics.median(low), "high": statistics.median(high)}
         labels = []
         for s in samples:
             labels.append("low" if s["instructions"] <= instrs[best_i] else "high")
-        tolerance = ASSIGN_TOLERANCE
     else:
         centers = {"mono": statistics.median(instrs)}
         labels = ["mono"] * n
-        tolerance = ASSIGN_TOLERANCE
     return {"labels": labels, "centers": centers,
-            "assign_tolerance": tolerance,
-            "split_rel_gap": best_gap, "n": n}
+            "split_rel_gap": best_gap, "n": n,
+            "rejected_split_gap": rejected_split_gap}
 
 
-def assign_modes(instrs: list[int], centers: dict[str, float],
-                 tolerance: float = ASSIGN_TOLERANCE) -> list[str]:
-    """Assign candidate samples to recorded baseline centers.
+def _binom_two_sided_p(k: int, n: int, p: float) -> float:
+    """Exact two-sided binomial p-value (no scipy dependency)."""
+    def pmf(i: int) -> float:
+        return math.comb(n, i) * p ** i * (1.0 - p) ** (n - i)
+    pk = pmf(k)
+    return min(1.0, sum(pmf(i) for i in range(n + 1)
+                        if pmf(i) <= pk * (1 + 1e-9)))
 
-    A sample farther than `tolerance` (relative, derived from the baseline
-    population structure — see the constants above) from EVERY center is
-    mislabeled/corrupt evidence → ModeEvidenceError → INCONCLUSIVE."""
-    labels = []
-    for v in instrs:
-        dists = {lab: abs(v - c) / c for lab, c in centers.items()}
-        lab = min(dists, key=dists.get)
-        if dists[lab] > tolerance:
-            raise ModeEvidenceError(
-                f"instruction sample {v} unassignable: nearest center "
-                f"{lab} at {dists[lab]*100:.1f}% > {tolerance*100:.1f}%")
-        labels.append(lab)
-    return labels
+
+def _p25(walls: list[float]) -> float:
+    """Lower-envelope quantile of a wall population (deterministic).
+
+    The address-layout lottery inflates the upper part of the wall
+    distribution; the P25 envelope is its stable fast edge."""
+    xs = sorted(walls)
+    return xs[min(len(xs) - 1, int(0.25 * len(xs)))]
 
 
 def mode_aware_regression(zig_samples: dict[str, list[dict]],
                           baseline_doc: dict) -> dict:
-    """Matched-mode regression: low↔low, high↔high, mono↔mono.
+    """Matched-mode regression with INDEPENDENT cluster forms.
 
-    Verdict METRIC = the causal observable (instructions:u median of the
-    mode population), NOT wall: raw evidence (P16.47 sessions at N=21)
-    shows wall is multimodal WITHIN one instruction mode (global_arith
-    levels ~0.745/0.83/0.95/1.14s interleaved randomly per process — the
-    per-process address-layout lottery), so any wall-median verdict is
-    session-dependent even after mode matching. instructions:u is
-    deterministic per seed (reproducibility evidence in
-    tools/perf/noise-lanes.json) and its within-mode spread is measured
-    0.03–1.35%. Wall medians per mode are PRINTED as diagnostics only.
+    P16.48 correction of three proven false-greens:
+      1. a baseline workload missing from the candidate → INCONCLUSIVE
+         (the old code printed "NEW" and returned a green aggregate);
+      2. mode migration hid regressions: samples were only assigned to
+         nearest BASELINE centers, so a population that migrated +11% into
+         the other mode kept a green verdict (independently reproduced
+         fixture: baseline low=10x100/high=10x111 vs candidate 1x100 +
+         20x111 → old verdict OK);
+      3. a new minority mode was absorbed by a mono median (baseline
+         21x100 vs candidate 11x100 + 10x111 → old verdict OK).
 
-    Fail-safe aggregation: per-(workload, mode) verdicts are computed
-    independently; the aggregates are folded from the verdict list AFTER
-    the loop. A baseline mode the candidate session failed to sample is
-    INCONCLUSIVE (never OK); NOISE? stays a pure diagnostic.
+    Both sides are now clustered INDEPENDENTLY by the same reorder-
+    invariant largest-gap algorithm (threshold = WARN-tied, see
+    MODE_SPLIT_REL_GAP). Verdicts compare cluster centers matched BY ORDER
+    (low↔low, high↔high) only when the mode counts agree; any form change
+    (mono↔split) is INCONCLUSIVE. For split↔split, the population weights
+    must additionally be binomially compatible (WEIGHT_ALPHA): mass
+    migration between modes is not a benign seed-mix change.
 
-    Returns {"warn": bool, "fail": bool, "inconclusive": bool,
-             "verdicts": [str, ...]}."""
+    Verdict metric: instruction center medians per matched mode (causal,
+    deterministic per seed). Secondary owner-approved rule: a wall P25
+    envelope shift > WALL_P25_LIMIT inside a matched mode with an
+    instruction-OK verdict → INCONCLUSIVE (possible memory-hierarchy
+    regression invisible to instruction counts) with guidance to run the
+    causal counters lane.
+
+    Fail-safe aggregation: per-verdict list folded after the loop; nothing
+    can erase a FAIL; INCONCLUSIVE yields rc=2; NOISE/wall prints are
+    diagnostics only."""
     base_samples_all = baseline_doc.get("zig_samples", {})
-    base_evidence = baseline_doc.get("mode_evidence", {})
     prev_ident = baseline_doc.get("baseline_identity", {})
     print(f"\nMatched-mode regression check vs {BASELINE} "
           f"(phase: {prev_ident.get('baseline_phase', 'unknown')}):")
@@ -880,66 +915,95 @@ def mode_aware_regression(zig_samples: dict[str, list[dict]],
     print("  " + "-" * 78)
     verdicts: list[str] = []
     inconclusive = False
+    matching: dict[str, dict] = {}
     for wl in sorted(base_samples_all):
         base_rows = base_samples_all[wl]
-        centers = base_evidence.get(wl, {}).get("centers")
         cand_rows = zig_samples.get(wl)
         if cand_rows is None:
-            print(f"  {wl:<28} {'--':>10} {'--':>10} {'--':>10}  NEW "
-                  "(not in candidate; no verdict)")
-            continue
-        if not centers:
-            print(f"  {wl:<28}  baseline evidence incomplete -> INCONCLUSIVE")
+            print(f"  {wl:<28}  MISSING from candidate session "
+                  f"-> INCONCLUSIVE")
             inconclusive = True
             continue
-        tol = base_evidence.get(wl, {}).get("assign_tolerance",
-                                           ASSIGN_TOLERANCE)
-        try:
-            cand_labels = assign_modes([s["instructions"] for s in cand_rows],
-                                       centers, tol)
-        except ModeEvidenceError as e:
-            print(f"  {wl:<28}  corrupt mode evidence ({e}) -> INCONCLUSIVE")
+        # Independent clustering of BOTH sides from raw samples — recorded
+        # labels are provenance, never verdict input.
+        base_ev = classify_modes(base_rows)
+        cand_ev = classify_modes(cand_rows)
+        base_form = "split" if len(base_ev["centers"]) == 2 else "mono"
+        cand_form = "split" if len(cand_ev["centers"]) == 2 else "mono"
+        matching[wl] = {"baseline_form": base_form,
+                        "candidate_form": cand_form,
+                        "baseline_centers": base_ev["centers"],
+                        "candidate_centers": cand_ev["centers"]}
+        outlier_gap = max(base_ev.get("rejected_split_gap", 0.0),
+                          cand_ev.get("rejected_split_gap", 0.0))
+        if outlier_gap > MODE_SPLIT_REL_GAP:
+            print(f"  {wl:<28}  outlier above split threshold "
+                  f"(gap {outlier_gap * 100:.1f}%, cluster too small) — "
+                  f"corrupt evidence? -> INCONCLUSIVE")
             inconclusive = True
             continue
-        for mode in sorted(centers):
-            base_walls = [s["wall"] for s in base_rows if s.get("mode") == mode]
-            cand_idx = [i for i, lab in enumerate(cand_labels) if lab == mode]
-            if not base_walls or not cand_idx:
-                print(f"  {wl + '[' + mode + ']':<28} "
-                      f"{'--':>13} {'--':>13} {'--':>9}  INCONCLUSIVE "
-                      f"({'baseline' if not base_walls else 'candidate'} "
-                      f"mode not covered)")
+        if base_form != cand_form:
+            print(f"  {wl:<28}  cluster form changed "
+                  f"({base_form} -> {cand_form}) -> INCONCLUSIVE")
+            inconclusive = True
+            continue
+        # Population-weight compatibility for split↔split (order-matched).
+        if base_form == "split":
+            base_low_n = sum(1 for s in base_rows
+                             if s["instructions"] <= base_ev["centers"]["low"])
+            cand_low_n = sum(1 for s in cand_rows
+                             if s["instructions"] <= cand_ev["centers"]["low"])
+            p = base_low_n / len(base_rows)
+            pv = _binom_two_sided_p(cand_low_n, len(cand_rows), p)
+            matching[wl]["weights"] = {"baseline_low_frac": p,
+                                       "candidate_low_frac":
+                                           cand_low_n / len(cand_rows),
+                                       "binom_p": pv}
+            if pv < WEIGHT_ALPHA:
+                print(f"  {wl:<28}  population weights incompatible "
+                      f"(low {p:.2f} -> {cand_low_n / len(cand_rows):.2f}, "
+                      f"p={pv:.1e}) — mass migration? -> INCONCLUSIVE")
                 inconclusive = True
                 continue
-            # Verdict: causal instruction medians inside the matched mode.
-            base_instr = [s["instructions"] for s in base_rows
-                          if s.get("mode") == mode]
-            cand_instr = [cand_rows[i]["instructions"] for i in cand_idx]
-            base_imed = statistics.median(base_instr)
-            cand_imed = statistics.median(cand_instr)
-            delta = ((cand_imed - base_imed) / base_imed
-                     if base_imed else 0.0)
+        for mode in sorted(base_ev["centers"]):
+            base_c = base_ev["centers"][mode]
+            cand_c = cand_ev["centers"][mode]
+            delta = (cand_c - base_c) / base_c if base_c else 0.0
             verdict = classify(delta)
             verdicts.append(verdict)
-            # Wall: diagnostic only (multimodal within a mode — see above).
-            cand_walls = [cand_rows[i]["wall"] for i in cand_idx]
-            w_med = statistics.median(cand_walls)
-            w_spread = (f"[wall {min(cand_walls):.3f}..{max(cand_walls):.3f}"
-                        f", med {w_med:.3f}]")
-            print(f"  {wl + '[' + mode + ']':<28} {base_imed:>13} "
-                  f"{cand_imed:>13} {delta * 100:>+8.2f}%  {verdict}  {w_spread}")
-        extra = set(cand_labels) - set(centers)
-        if extra:
-            print(f"  {wl:<28}  candidate-only modes {sorted(extra)}: "
-                  f"no baseline population to compare (diagnostic)")
+            # Secondary wall-envelope rule (owner-approved P16.48).
+            b_walls = [s["wall"] for s, lab in zip(base_rows, base_ev["labels"])
+                       if lab == mode]
+            c_walls = [s["wall"] for s, lab in zip(cand_rows, cand_ev["labels"])
+                       if lab == mode]
+            env_note = ""
+            if b_walls and c_walls:
+                env_shift = (_p25(c_walls) - _p25(b_walls)) / _p25(b_walls)
+                matching[wl].setdefault("wall_p25", {})[mode] = {
+                    "baseline": _p25(b_walls), "candidate": _p25(c_walls),
+                    "shift": env_shift}
+                if verdict == "OK" and env_shift > WALL_P25_LIMIT:
+                    verdict = "INCONCLUSIVE"
+                    inconclusive = True
+                    env_note = (f"  wall-P25 {env_shift * 100:+.0f}% -> "
+                                f"INCONCLUSIVE (run causal counters: "
+                                f"--perf)")
+            w_med = statistics.median(c_walls) if c_walls else float("nan")
+            w_spread = (f"[wall {min(c_walls):.3f}..{max(c_walls):.3f}"
+                        f", med {w_med:.3f}]" if c_walls else "")
+            print(f"  {wl + '[' + mode + ']':<28} {base_c:>13} "
+                  f"{cand_c:>13} {delta * 100:>+8.2f}%  {verdict}  "
+                  f"{w_spread}{env_note}")
     for wl in sorted(set(zig_samples) - set(base_samples_all)):
-        print(f"  {wl:<28} {'--':>10} "
-              f"{statistics.median(s['wall'] for s in zig_samples[wl]):>10.3f} "
-              f"{'--':>10}  NEW (no baseline; informational)")
+        med = statistics.median(s["wall"] for s in zig_samples[wl])
+        print(f"  {wl:<28} {'--':>13} "
+              f"{statistics.median(s['instructions'] for s in zig_samples[wl]):>13} "
+              f"{'--':>9}  NEW (no baseline; informational)")
     any_warn = "WARN" in verdicts
     any_fail = "FAIL" in verdicts
     return {"warn": any_warn, "fail": any_fail,
-            "inconclusive": inconclusive, "verdicts": verdicts}
+            "inconclusive": inconclusive, "verdicts": verdicts,
+            "matching": matching}
 
 
 # ---------------------------------------------------------------------------
@@ -1134,6 +1198,10 @@ def main() -> int:
                     help=f"median runs per workload in --counters mode (default {DEFAULT_COUNTERS_RUNS})")
     ap.add_argument("--json-out", default="",
                     help="write the current run result dict to PATH (baseline untouched)")
+    ap.add_argument("--gate-out", default="",
+                    help="explicit path for this gate session's evidence JSON "
+                         "(atomic temp->replace); when omitted the canonical "
+                         "tools/perf/current-gate.json is atomically updated")
     ap.add_argument("--snapshot-out", default="",
                     help="produce versioned snapshot (current.json + current-counters.json + "
                          "current-profile-index.json) in DIR; supersedes --counters/--json-out")
@@ -1169,7 +1237,6 @@ def main() -> int:
     for wl, rows in zig_mode_samples.items():
         ev = classify_modes(rows)
         mode_evidence[wl] = {"centers": ev["centers"],
-                             "assign_tolerance": ev["assign_tolerance"],
                              "split_rel_gap": ev["split_rel_gap"], "n": ev["n"]}
         zig_samples_labeled[wl] = [
             {"wall": s["wall"], "instructions": s["instructions"], "mode": lab}
@@ -1231,22 +1298,6 @@ def main() -> int:
               f"geomean {baseline_doc['geomean']:.5f}, full provenance + spreads)")
         return 0
 
-    # Always persist this gate session's raw evidence (owner-approved
-    # P16.47 policy: current artifact carries samples, labels, provenance).
-    gate_session = {
-        "created_utc": current["created_utc"],
-        "provenance": provenance.block(zig_bin=ZIG_LUA, puc_bin=PUC_LUA,
-                                       optimize_mode="ReleaseFast"),
-        "runs": args.runs,
-        "core": args.core,
-        "zig_samples": zig_samples_labeled,
-        "mode_evidence": mode_evidence,
-    }
-    gate_path = ROOT / "tools/perf/current-gate.json"
-    gate_path.write_text(json.dumps(gate_session, indent=2) + "\n",
-                         encoding="utf-8")
-    print(f"\ngate session evidence: {gate_path}")
-
     if BASELINE.exists():
         prev = json.loads(BASELINE.read_text(encoding="utf-8"))
         if "zig_samples" not in prev or "mode_evidence" not in prev:
@@ -1257,20 +1308,88 @@ def main() -> int:
             return 2
         res = mode_aware_regression(zig_samples_labeled, prev)
         if res["fail"]:
-            print("\nRESULT: FAIL (regression > 10% inside a matched mode "
-                  "on one or more workloads)")
-            return 1
-        if res["inconclusive"]:
-            print("\nRESULT: INCONCLUSIVE (a baseline mode is not covered "
-                  "or mode evidence is corrupt — NOT green; rerun or "
-                  "re-record the baseline)")
-            return 2
-        if res["warn"]:
-            print("\nRESULT: WARN (regression > 5% inside a matched mode "
-                  "on one or more workloads)")
+            result_line = ("RESULT: FAIL (regression > 10% inside a "
+                           "matched mode on one or more workloads)")
+            rc = 1
+        elif res["inconclusive"]:
+            result_line = ("RESULT: INCONCLUSIVE (cluster-form change, "
+                           "incompatible weights, missing workload, wall-P25 "
+                           "envelope shift or corrupt evidence — NOT green; "
+                           "rerun or re-record the baseline)")
+            rc = 2
+        elif res["warn"]:
+            result_line = ("RESULT: WARN (regression > 5% inside a matched "
+                           "mode on one or more workloads)")
+            rc = 0
         else:
-            print("\nRESULT: OK (no regressions in any matched mode)")
-        return 0
+            result_line = "RESULT: OK (no regressions in any matched mode)"
+            rc = 0
+        print(f"\n{result_line}")
+
+        # Persist this gate session (owner-approved evidence policy):
+        # samples, BOTH independent cluster-evidence blocks, the explicit
+        # matching decisions, provenance and the verdict. Written via
+        # temp+atomic-replace so a tracked artifact is never left torn or
+        # half-written; the canonical tools/perf/current-gate.json is the
+        # record of the LATEST completed gate run unless --gate-out points
+        # elsewhere.
+        gate_session = {
+            "created_utc": current["created_utc"],
+            "provenance": provenance.block(zig_bin=ZIG_LUA, puc_bin=PUC_LUA,
+                                           optimize_mode="ReleaseFast"),
+            "runs": args.runs,
+            "core": args.core,
+            "result": {"verdict": ("FAIL" if rc == 1 else
+                                   "INCONCLUSIVE" if rc == 2 else
+                                   "WARN" if res["warn"] else "OK"),
+                       "line": result_line},
+            "zig_samples": zig_samples_labeled,
+            "mode_evidence": mode_evidence,
+            "baseline_evidence": prev.get("mode_evidence", {}),
+            "matching": res.get("matching", {}),
+        }
+        gate_path = (Path(args.gate_out) if args.gate_out
+                     else ROOT / "tools/perf/current-gate.json")
+        tmp = Path(str(gate_path) + ".tmp")
+        tmp.write_text(json.dumps(gate_session, indent=2) + "\n",
+                       encoding="utf-8")
+        import hashlib
+        artifact_sha = hashlib.sha256(
+            tmp.read_bytes()).hexdigest()
+        os.replace(tmp, gate_path)
+        print(f"gate session evidence: {gate_path}")
+
+        # Multi-session manifest (P16.48 MEDIUM): consecutive-session
+        # claims are backed by compact per-session records — timestamp,
+        # source SHA, binary hash, artifact hash, result, per-mode centers.
+        manifest_path = ROOT / "tools/perf/current-gate-manifest.json"
+        manifest = []
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(
+                    manifest_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                manifest = []
+        centers_digest = {wl: {m: c for m, c in ev["centers"].items()}
+                          for wl, ev in mode_evidence.items()}
+        manifest.append({
+            "created_utc": current["created_utc"],
+            "source_head": gate_session["provenance"].get("git_head"),
+            "zig_binary_sha256": gate_session["provenance"].get(
+                "zig_binary_sha256"),
+            "runs": args.runs,
+            "result": gate_session["result"]["verdict"],
+            "artifact_sha256": artifact_sha,
+            "mode_centers": centers_digest,
+        })
+        mtmp = Path(str(manifest_path) + ".tmp")
+        mtmp.write_text(json.dumps(manifest, indent=2) + "\n",
+                        encoding="utf-8")
+        os.replace(mtmp, manifest_path)
+        return rc
+    print(f"\nNo baseline at {BASELINE}; run with --update-baseline to "
+          "create one.")
+    return 0
 
     print(f"\nNo baseline at {BASELINE}; run with --update-baseline to create one.")
     return 0

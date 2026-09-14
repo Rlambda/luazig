@@ -226,8 +226,24 @@
     моды печатаются как диагностика: wall мультимодален ВНУТРИ одной
     instruction-моды (address-layout lottery, уровни ~±12%) и не может быть
     вердикт-метрикой.
-  - INCONCLUSIVE (nonzero exit, не green): baseline-мода без покрытия в
-    candidate-сессии, либо повреждённое/неклассифицируемое mode-evidence.
+  - P16.48 (owner-approved): обе стороны классифицируются НЕЗАВИСИМО одним
+    reorder-invariant алгоритмом; порог кластеризации привязан к WARN-порогу
+    (gap < WARN не может сам создать WARN-вердикт и считается spread);
+    сопоставление центров только по порядку при равном числе mode; изменение
+    формы (mono↔split) → INCONCLUSIVE; статистически несовместимый перенос
+    population weights (точный двусторонний binomial p < 1e-3) → INCONCLUSIVE;
+    outlier выше порога сплита без минимального размера кластера → INCONCLUSIVE;
+    отсутствующий в candidate baseline-workload → INCONCLUSIVE.
+  - Secondary wall rule (owner-approved P16.48): внутри matched instruction-
+    mode сдвиг wall-P25 нижней огибающей > 10% при instruction-OK →
+    INCONCLUSIVE + подсказка запустить causal counters (`--perf`: cycles/
+    IPC/cache-misses). Огибающая устойчива к address-layout lottery
+    (измерено ±1.6% при флипающих медианах); медианы wall остаются
+    диагностикой. Инструкции — causal-метрика вердикта, но не полная мера
+    performance: layout-изменения могут замедлять реальный код без роста
+    instruction count.
+  - INCONCLUSIVE (nonzero exit, не green): любые формы несовместимого
+    mode-evidence из пунктов выше.
   - Скалярная wall-таблица (медианы по всем сэмплам) — ДИАГНОСТИКА; вердиктом
     не является (mode-blind медианы сравнивают независимо сэмплированные
     seed-моды и делают verdict session-dependent).
@@ -235,7 +251,13 @@
     candidate-only range/overlap не является доказательством отсутствия
     регрессии.
   - baseline/current артефакты хранят raw сэмплы (wall+instructions),
-    mode-метки, cluster evidence и provenance.
+    mode-метки, ОБА независимых cluster-evidence блока, явное решение
+    сопоставления и provenance. Гейт-сессии пишутся atomically
+    (temp→replace): canonical `current-gate.json` обновляется каждым полным
+    гейт-прогоном (или явно через `--gate-out PATH`); multi-session claims
+    подтверждаются компактным manifest `current-gate-manifest.json`
+    (timestamp, source SHA, binary hash, artifact hash, result, per-mode
+    centers).
 
 - **`python3 tools/perf_core_snapshot.py`** — end-to-end замер upstream suites
   (nextvar, coroutine, gc). Используется `tools/release_gate.sh`.

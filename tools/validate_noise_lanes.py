@@ -1,125 +1,224 @@
 #!/usr/bin/env python3
-"""P16.45-finalization BLOCKER 3: mechanical noise-summary validator.
+"""P16.46: mechanical noise-evidence validator (BLOCKER 2 rewrite).
 
-Recomputes every summary field in tools/perf/noise-lanes.json from its
-raw_runs — no hand-calculated prose arithmetic survives unverified:
+tools/perf/noise-lanes.json is EVIDENCE: every summary field, every prose
+claim that can be checked mechanically, and every determinism recheck row
+are recomputed here from the raw data — nothing stays green just because a
+hand-written number sits in the file.
 
-- low/high counts and mode assignment consistency;
-- medians and deltas for instructions/branches/cycles/wall;
-- per-iteration deltas (50M iterations);
-- the 15/15 _ENV node-placement separation claim;
-- the intern-depth negative result (depth 0 in BOTH modes);
-- determinism recheck bounds (same mode for repeated seeds).
+Validated:
+- mechanical_summary: low/high counts, medians and deltas
+  (instructions/branches/cycles/wall), per-iteration deltas — recomputed
+  from raw_runs with exact equality;
+- placement separation: ALL low runs have env_node_depth=0/len=1, ALL high
+  runs depth>=1/len>=2 (raw runs);
+- intern negative result: intern chain depth 0 in EVERY raw run;
+- prose hygiene: no stale arithmetic literals (12.9, 645M), no
+  "mode blends" phrasing (a median SELECTS the mode containing the middle
+  order statistic), no single top-level created_utc spanning both the raw
+  session and the C verification — timestamps are per-section;
+- determinism_recheck (structured schema): for every row the seed must
+  exist in raw_runs; the EXPECTED mode is derived INDEPENDENTLY from the
+  raw seed row (mode label AND its placement observables must agree);
+  every repeat carries numeric instructions/mode/env_node_depth/
+  env_node_chain_len/intern_depth; repeat mode must equal the expected
+  mode; placement must match the mode; intern depth must be 0 (the
+  documented negative result); instructions must sit within
+  DRIFT_BOUND_INSTR of the raw seed's instruction count (the mode gap is
+  ~1.4 G instructions, observed cross-session startup jitter <=~1 M);
+  an empty recheck set is rejected.
 
-Negative test: perturbing any summary value must FAIL (run with --negative).
-
-Run: python3 tools/validate_noise_lanes.py [--negative]
+Negative validation: --negative [case] perturbs an in-memory copy and the
+validator MUST fail. Cases: arithmetic (default), wrong-mode,
+wrong-placement, drift, missing-seed, missing-field, empty-recheck.
+Exit codes: positive run 0 (ALL OK); negative case 0 when the defect is
+DETECTED (correct behavior), 1 when it is NOT detected (validator bug).
 """
 from __future__ import annotations
 
+import copy
 import json
 import statistics
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-ART = REPO / "tools/perf/noise-lanes.json"
+DEFAULT_ART = REPO / "tools/perf/noise-lanes.json"
 ITERATIONS = 50_000_000
+# Wrong-mode repeats are ~1.4e9 instructions away from the raw seed count;
+# honest cross-session perf-stat jitter observed at ~1.6e5. 5e6 separates
+# both by two orders of magnitude.
+DRIFT_BOUND_INSTR = 5_000_000
+
+NEGATIVE_CASES = ("arithmetic", "wrong-mode", "wrong-placement", "drift",
+                  "missing-seed", "missing-field", "empty-recheck")
 
 FAILS: list[str] = []
 
 
-def check(name: str, cond: bool, detail: str = "") -> None:
+def check(name: str, cond: bool, detail: str = "") -> bool:
     if not cond:
         FAILS.append(f"{name}{(' — ' + detail) if detail else ''}")
-    print(f"  {name}: {'ok' if cond else 'FAIL'}{(' — ' + detail) if detail and not cond else ''}")
+    print(f"  {name}: {'ok' if cond else 'FAIL'}"
+          f"{(' — ' + detail) if detail and not cond else ''}")
+    return cond
 
 
-def median(xs: list[float]) -> float:
-    return statistics.median(xs)
+def expected_mode_for_seed(raw_runs: list[dict], seed: int) -> str | None:
+    """Derive the expected mode for a seed INDEPENDENTLY of any recheck row.
+
+    The raw row carries both the recorded mode label and the placement
+    observables; they must agree, otherwise the raw evidence itself is
+    inconsistent and validation fails."""
+    rows = [r for r in raw_runs if r["seed"] == seed]
+    if len(rows) != 1:
+        return None
+    r = rows[0]
+    by_label = r["mode"]
+    by_placement = "low" if (r["env_node_depth"] == 0
+                             and r["env_node_chain_len"] == 1) else "high"
+    return by_label if by_label == by_placement else None
 
 
-def main() -> int:
-    d = json.loads(ART.read_text())
-    raw = d["raw_runs"]
-    det = d["determinism_recheck"]
-    summary = d["mechanical_summary"]
+def validate(doc: dict) -> bool:
+    """Run every check against a parsed noise-lanes document."""
+    raw = doc["raw_runs"]
+    det = doc["determinism_recheck"]
+    summary = doc["mechanical_summary"]
 
     low = [r for r in raw if r["mode"] == "low"]
     high = [r for r in raw if r["mode"] == "high"]
-    check("summary: low count", summary["low_count"] == len(low),
-          f"json={summary['low_count']} raw={len(low)}")
-    check("summary: high count", summary["high_count"] == len(high),
-          f"json={summary['high_count']} raw={len(high)}")
+    check("summary: low count", summary["low_count"] == len(low))
+    check("summary: high count", summary["high_count"] == len(high))
+
+    def med(rows, field):
+        return statistics.median([r[field] for r in rows])
 
     for field in ("instructions", "branches", "cycles", "wall_ns"):
-        lm = median([r[field] for r in low])
-        hm = median([r[field] for r in high])
-        check(f"summary: low median {field}", summary[f"low_median_{field}"] == lm,
-              f"json={summary[f'low_median_{field}']} raw={lm}")
-        check(f"summary: high median {field}", summary[f"high_median_{field}"] == hm,
-              f"json={summary[f'high_median_{field}']} raw={hm}")
-        check(f"summary: delta {field}", summary[f"delta_{field}"] == hm - lm,
-              f"json={summary[f'delta_{field}']} raw={hm - lm}")
+        lm, hm = med(low, field), med(high, field)
+        check(f"summary: low median {field}", summary[f"low_median_{field}"] == lm)
+        check(f"summary: high median {field}", summary[f"high_median_{field}"] == hm)
+        check(f"summary: delta {field}", summary[f"delta_{field}"] == hm - lm)
 
     for field in ("instructions", "branches"):
-        per = (summary[f"delta_{field}"]) / ITERATIONS
+        per = summary[f"delta_{field}"] / ITERATIONS
         check(f"summary: per-iteration {field}",
-              abs(summary[f"delta_{field}_per_iteration"] - per) < 1e-6,
-              f"json={summary[f'delta_{field}_per_iteration']} raw={per}")
+              abs(summary[f"delta_{field}_per_iteration"] - per) < 1e-6)
 
-    # The _ENV placement separation: ALL low depth=0/len=1, ALL high
-    # depth>=1/len>=2, exactly.
-    sep_low = all(r["env_node_depth"] == 0 and r["env_node_chain_len"] == 1 for r in low)
-    sep_high = all(r["env_node_depth"] >= 1 and r["env_node_chain_len"] >= 2 for r in high)
-    check("summary: env placement separates ALL runs", sep_low and sep_high)
-
-    # Intern-chain negative result: depth 0 in BOTH modes.
-    check("summary: intern depth 0 both modes",
+    sep_low = all(r["env_node_depth"] == 0 and r["env_node_chain_len"] == 1
+                  for r in low)
+    sep_high = all(r["env_node_depth"] >= 1 and r["env_node_chain_len"] >= 2
+                   for r in high)
+    check("summary: env placement separates ALL raw runs", sep_low and sep_high)
+    check("summary: intern depth 0 in every raw run",
           all(r["g_count_intern_chain_depth"] == 0 for r in raw))
 
-    # Determinism: repeated seeds keep the same mode AND same observables.
-    mode_of = {r["seed"]: r["mode"] for r in raw}
-    det_ok = True
-    for row in det:
-        seed = row["seed"]
-        inst = row["rep1_instructions"] if mode_of[seed] == "low" else row["rep1_instructions"]
-        base = median([r["instructions"] for r in raw if r["seed"] == seed])
-        drift = max(abs(row["rep1_instructions"] - base), abs(row["rep2_instructions"] - base)
-                    if "rep2_instructions" in row else 0)
-        if row.get("rep1_instructions") != row.get("rep2_instructions") and drift > 20_000:
-            det_ok = False
-        if not all(s in (row.get("env_node") or "") or True for s in []):
-            det_ok = False
-    check("summary: determinism recheck within bounds", det_ok)
-    check("summary: determinism recheck rows present", len(det) >= 4)
+    # --- prose hygiene: stale literals and relabeled timestamps ------
+    prose = json.dumps(doc)
+    check("prose: no stale literal 12.9", "12.9" not in prose)
+    check("prose: no stale literal 645", "645" not in prose)
+    check("prose: no 'mode blends' claim", "mode blends" not in prose
+          and "blends" not in prose)
+    check("prose: no top-level created_utc spanning sections",
+          "created_utc" not in doc)
+    raw_ev = doc.get("raw_evidence", {})
+    check("prose: raw_evidence carries its own recorded timestamp",
+          isinstance(raw_ev.get("recorded_utc"), str)
+          and raw_ev["recorded_utc"].startswith("2026-09-13"))
+    check("prose: conclusion references mechanical fields, not hand numbers",
+          "delta_instructions_per_iteration" in json.dumps(
+              doc.get("conclusion_bounded", {})))
 
-    # Bounded conclusion must be stated, not overclaimed.
-    concl = d["conclusion_bounded"]
-    check("summary: conclusion bounded (not-disassembled stated)",
-          "not_disassembled" in json.dumps(concl))
+    # --- determinism recheck (structured schema) ----------------------
+    check("det: recheck set non-empty", isinstance(det, list) and len(det) > 0)
+    raw_instr = {r["seed"]: r["instructions"] for r in raw}
+    for row in det:
+        seed = row.get("seed")
+        exp = expected_mode_for_seed(raw, seed)
+        if not check(f"det seed {seed}: known raw seed with consistent mode",
+                     exp is not None):
+            continue
+        reps = row.get("repeats")
+        if not check(f"det seed {seed}: non-empty repeats",
+                     isinstance(reps, list) and len(reps) > 0):
+            continue
+        for i, rep in enumerate(reps):
+            required = ("instructions", "mode", "env_node_depth",
+                        "env_node_chain_len", "intern_depth")
+            if not check(f"det seed {seed} rep{i}: all fields present",
+                         all(k in rep for k in required)):
+                continue
+            check(f"det seed {seed} rep{i}: mode == expected ({exp})",
+                  rep["mode"] == exp)
+            if exp == "low":
+                ok_place = (rep["env_node_depth"] == 0
+                            and rep["env_node_chain_len"] == 1)
+            else:
+                ok_place = (rep["env_node_depth"] >= 1
+                            and rep["env_node_chain_len"] >= 2)
+            check(f"det seed {seed} rep{i}: placement matches mode", ok_place)
+            check(f"det seed {seed} rep{i}: intern depth 0",
+                  rep["intern_depth"] == 0)
+            drift = abs(rep["instructions"] - raw_instr[seed])
+            check(f"det seed {seed} rep{i}: instruction drift {drift} "
+                  f"<= {DRIFT_BOUND_INSTR}", drift <= DRIFT_BOUND_INSTR)
 
     print()
     if FAILS:
         print(f"{len(FAILS)} FAILURES")
-        return 1
+        return False
     print("ALL OK")
-    return 0
+    return True
 
 
-def negative() -> int:
-    """Perturb one summary value in a scratch copy; the validator must fail."""
-    global ART
-    d = json.loads(ART.read_text())
-    d["mechanical_summary"]["delta_branches"] += 39_000_000  # the old 645M error class
-    scratch = Path("/tmp/opencode/noise_lanes_negative.json")
-    scratch.write_text(json.dumps(d))
-    ART = scratch
-    rc = main()
-    print("\nnegative-validation:", "FAIL-detected (correct)" if rc == 1 else "NOT detected (BAD)")
-    scratch.unlink()
-    return 0 if rc == 1 else 1
+def load(path: Path) -> dict:
+    return json.loads(path.read_text())
+
+
+def perturb(doc: dict, case: str) -> dict:
+    """Return an in-memory copy with exactly one injected defect."""
+    d = copy.deepcopy(doc)
+    if case == "arithmetic":
+        d["mechanical_summary"]["delta_branches"] += 39_000_000
+    elif case == "wrong-mode":
+        d["determinism_recheck"][0]["repeats"][0]["mode"] = (
+            "low" if d["determinism_recheck"][0]["repeats"][0]["mode"] == "high"
+            else "high")
+    elif case == "wrong-placement":
+        rep = d["determinism_recheck"][0]["repeats"][0]
+        rep["env_node_depth"] = 0 if rep["env_node_depth"] >= 1 else 3
+        rep["env_node_chain_len"] = 1 if rep["env_node_chain_len"] >= 2 else 4
+    elif case == "drift":
+        d["determinism_recheck"][0]["repeats"][0]["instructions"] += 1_400_000_000
+    elif case == "missing-seed":
+        d["determinism_recheck"].append(
+            {"seed": 999999, "repeats": [{"instructions": 1, "mode": "low",
+                                          "env_node_depth": 0,
+                                          "env_node_chain_len": 1,
+                                          "intern_depth": 0}]})
+    elif case == "missing-field":
+        del d["determinism_recheck"][0]["repeats"][0]["intern_depth"]
+    elif case == "empty-recheck":
+        d["determinism_recheck"] = []
+    else:
+        raise SystemExit(f"unknown negative case: {case} "
+                         f"(valid: {', '.join(NEGATIVE_CASES)})")
+    return d
+
+
+def main(argv: list[str]) -> int:
+    if "--negative" in argv:
+        i = argv.index("--negative")
+        case = argv[i + 1] if len(argv) > i + 1 and argv[i + 1] in NEGATIVE_CASES \
+            else "arithmetic"
+        FAILS.clear()
+        ok = validate(perturb(load(DEFAULT_ART), case))
+        detected = not ok
+        print(f"negative[{case}]:",
+              "FAIL-detected (correct)" if detected else "NOT detected (BAD)")
+        return 0 if detected else 1
+    return 0 if validate(load(DEFAULT_ART)) else 1
 
 
 if __name__ == "__main__":
-    sys.exit(negative() if "--negative" in sys.argv else main())
+    sys.exit(main(sys.argv[1:]))

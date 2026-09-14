@@ -544,7 +544,7 @@ def run_snapshot_mode(args) -> int:
       current-profile-index.json — top-N symbols for 8 hotspot workloads
 
     This is the reproducible artifact that roadmap decisions cite. It is
-    SEPARATE from the regression baseline (baseline-p15.37.json): the baseline
+    SEPARATE from the regression baseline (baseline-approved.json): the baseline
     is for regression checking, current.json is the versioned snapshot.
     """
     out_dir = Path(args.snapshot_out)

@@ -312,8 +312,8 @@
   "note": "Pre-P16.46 determinism rows: per-repeat env observables recorded only as a string, intern depth not recorded. Preserved verbatim; superseded by the structured determinism_recheck schema."
  },
  "determinism_verification": {
-  "latest_session": "p16.46-C-prime",
-  "measured_source_commit": "2682bbd00f30110665df016410de39aea7644664",
+  "latest_session": "p16.47-C-triple-prime",
+  "measured_source_commit": "4e5dcec3e4eb3fd88942c969fb9e74499cd15423",
   "harness_sha256": "8a7393868c1fc962417748205f318afd2a2f68deb02ba7f8a4e807871b87c0e4",
   "row_count": 2,
   "seeds": [
@@ -397,6 +397,54 @@
       },
       {
        "instructions": 12583783482,
+       "mode": "low",
+       "env_node_depth": 0,
+       "env_node_chain_len": 1,
+       "intern_depth": 0
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "session_id": "p16.47-C-triple-prime",
+   "measured_source_commit": "4e5dcec3e4eb3fd88942c969fb9e74499cd15423",
+   "measured_utc": "2026-09-14T09:44:53Z",
+   "harness_path": "/tmp/opencode/C_harness_imm",
+   "harness_sha256": "8a7393868c1fc962417748205f318afd2a2f68deb02ba7f8a4e807871b87c0e4",
+   "command": "taskset -c 0 perf stat -e instructions:u /tmp/opencode/C_harness_imm <seed> tools/microbench.lua global_arith",
+   "rows": [
+    {
+     "seed": 1,
+     "repeats": [
+      {
+       "instructions": 13997783996,
+       "mode": "high",
+       "env_node_depth": 1,
+       "env_node_chain_len": 2,
+       "intern_depth": 0
+      },
+      {
+       "instructions": 13997783718,
+       "mode": "high",
+       "env_node_depth": 1,
+       "env_node_chain_len": 2,
+       "intern_depth": 0
+      }
+     ]
+    },
+    {
+     "seed": 8,
+     "repeats": [
+      {
+       "instructions": 12583783609,
+       "mode": "low",
+       "env_node_depth": 0,
+       "env_node_chain_len": 1,
+       "intern_depth": 0
+      },
+      {
+       "instructions": 12583783532,
        "mode": "low",
        "env_node_depth": 0,
        "env_node_chain_len": 1,

@@ -1,4 +1,4 @@
-> Last updated: 2026-09-14 (P16.47 OPEN: mode-aware perf gate + удаление запрещённого policy guard; P16.46 COMPLETE (correctness-green; обязательный perf gate = FAIL по global_arith — задокументированный bimodal mode flip, см. запись фазы): perf-контракт AGENTS↔код согласован по решению владельца; determinism_recheck структурный с независимым валидатором + негативная матрица; prose truth исправлена) — двухкоммитная дисциплина C/D: один immutable measured-source коммит C (7d97e5a) + artifact-wrapper D; все канонические артефакты перегенерированы с provenance = точный C; арифметика noise-сводок механически валидируется; layout-проба реально перестроена)
+> Last updated: 2026-09-14 (P16.47 COMPLETE: обязательный perf gate воспроизводимо зелёный 5/5 (matched-mode по causal instructions:u, wall=диагностика); запрещённый policy guard удалён; P16.46 COMPLETE (correctness-green; обязательный perf gate = FAIL по global_arith — задокументированный bimodal mode flip, см. запись фазы): perf-контракт AGENTS↔код согласован по решению владельца; determinism_recheck структурный с независимым валидатором + негативная матрица; prose truth исправлена) — двухкоммитная дисциплина C/D: один immutable measured-source коммит C (7d97e5a) + artifact-wrapper D; все канонические артефакты перегенерированы с provenance = точный C; арифметика noise-сводок механически валидируется; layout-проба реально перестроена)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -43,7 +43,7 @@ Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-14)
 
-- [ ] **P16.47 (owner-instructed)**: убрать запрещённый policy guard + воспроизводимый mode-aware perf gate — (a) удалить test_policy_contract() из tools/test_perf_gate.py (CI/test guard, принуждающий AGENTS-политику, запрещён AGENTS.md «Обязательное правило фиксации») и STATUS-утверждение о закреплении политики падающим тестом; функциональные тесты на fixtures остаются; (b) обязательный gate переводится на matched-mode регрессию по causal-observables (дизайн A владельца: production RF binary, per-sample `perf stat -e instructions:u` + self-reported wall; классификация mode по instruction-популяции largest-gap split без имён workload'ов; сравнение low↔low/high↔high; INCONCLUSIVE/nonzero при непокрытой baseline-моде или повреждённом evidence; скалярная wall-таблица — диагностика; baseline перезаписывается на measured-source commit с raw samples+labels+cluster evidence, owner-approved); (c) negative matrix: same-binary cross-mode не регрессия; +11% внутри low → FAIL; +11% внутри high → FAIL; mode отсутствует → INCONCLUSIVE/nonzero; reorder invariant; NOISE не меняет aggregate; corrupt evidence → nonzero; (d) determinism_recheck в noise-lanes.json разделён по measurement-сессиям с per-session provenance (SHA/UTC/harness/command/список прогонов), validator связывает verification block с ровно заявленными fresh rows.
+- [x] **P16.47 (owner-instructed)**: убрать запрещённый policy guard + воспроизводимый mode-aware perf gate — (a) удалить test_policy_contract() из tools/test_perf_gate.py (CI/test guard, принуждающий AGENTS-политику, запрещён AGENTS.md «Обязательное правило фиксации») и STATUS-утверждение о закреплении политики падающим тестом; функциональные тесты на fixtures остаются; (b) обязательный gate переводится на matched-mode регрессию по causal-observables (дизайн A владельца: production RF binary, per-sample `perf stat -e instructions:u` + self-reported wall; классификация mode по instruction-популяции largest-gap split без имён workload'ов; сравнение low↔low/high↔high; INCONCLUSIVE/nonzero при непокрытой baseline-моде или повреждённом evidence; скалярная wall-таблица — диагностика; baseline перезаписывается на measured-source commit с raw samples+labels+cluster evidence, owner-approved); (c) negative matrix: same-binary cross-mode не регрессия; +11% внутри low → FAIL; +11% внутри high → FAIL; mode отсутствует → INCONCLUSIVE/nonzero; reorder invariant; NOISE не меняет aggregate; corrupt evidence → nonzero; (d) determinism_recheck в noise-lanes.json разделён по measurement-сессиям с per-session provenance (SHA/UTC/harness/command/список прогонов), validator связывает verification block с ровно заявленными fresh rows.
 
 - [x] **P16.46 (owner-instructed)**: perf-gate contract + provenance truth —
   (a) AGENTS.md perf-раздел согласован с реализацией по явному решению
@@ -6842,6 +6842,59 @@ Corrective-фаза по решению владельца (ledger item доба
   фазой не внесена; mode-aware gating — отдельное reviewable решение
   владельца (candidate-only range доказательством отсутствия регрессии
   не является — KEEP).
+
+### P16.47: воспроизводимый matched-mode perf gate + удаление запрещённого policy guard (2026-09-14)
+
+Фаза по owner-ledger item (открыт отдельным коммитом 92a31de; open-count
+21→22→закрыт этим этапом→21). Owner-решения: дизайн A (matched-mode на
+production binary), baseline re-record при measured-source commit,
+AGENTS-формулировка применена как owner-approved.
+
+- **Измеренные source-коммиты (linear, без amend после первого замера)**:
+  C″ 1be15cc → C″₂ e9999f0 (DEFAULT_RUNS 7→13: coverage) → C″₃ 4e5dcec
+  (assign-tolerance из структуры популяции) → C″₄ e504538 (DEFAULT_RUNS
+  13→21: симметрия с baseline) → C″₅ 1935685 (вердикт-метрика = causal
+  instructions:u). Wrapper D″ — только артефакты/доки.
+- **BLOCKER 1**: test_policy_contract() и его вызов удалены; STATUS-похвала
+  policy-asserts заменена честной пометкой; заменяющих guard'ов нет;
+  функциональные тесты на fixtures сохранены.
+- **BLOCKER 2**: скалярный mode-blind regression_check удалён (OK
+  0.744s/FAIL 0.847s на одном binary — session-dependent вердикт). Новый
+  механизм: per-sample процессы (18 workload × N сэмплов), wall =
+  self-reported os.clock, causal observable = instructions:u;
+  классификация largest-gap split (без имён workload'ов — механизм сам
+  нашёл бимодальность у global_arith 12/9, field_access 12/9 и
+  metamethod_call_noalloc 6/15, о которых скалярный gate не знал);
+  сравнение low↔low/high↔high; INCONCLUSIVE (rc=2) на непокрытой
+  baseline-моде или corrupt evidence; fail-safe fold; NOISE? только
+  диагностика.
+- **Два измеренных фальсификации в ходе фазы** (обе задокументированы в
+  коде/тестах): (1) tolerance ниже порога FAIL превращает реальные
+  регрессии в INCONCLUSIVE 'corrupt' → единый ASSIGN_TOLERANCE=0.15 над
+  порогом; degenerate geometry (моды ~11% apart: +11% сдвиг low
+  приземляется НА high-центр → INCONCLUSIVE/nonzero — честно);
+  (2) WALL ВНУТРИ одной instruction-моды мультимодален (global_arith
+  уровни ~0.745/0.83/0.95/1.14s случайно per-process — address-layout
+  lottery; ложный FAIL global_arith[high] +11.7% при [low] +0.0% на
+  идентичном binary) → вердикт-метрика = instructions:u медиана моды,
+  wall-медианы per-mode печатаются как диагностика.
+- **Итоговый обязательный gate (после C″₅ + re-record baseline
+  P16.47-final geomean 1.39747)**: **5/5 последовательных сессий
+  RESULT: OK (rc=0)** — вердикт воспроизводим; ложных FAIL/INCONCLUSIVE
+  нет.
+- **MEDIUM**: determinism_recheck разделён на det_sessions с per-session
+  provenance (source SHA, measured_utc, immutable harness hash, literal
+  command, exact rows); determinism_verification index валидатором
+  связывается с ровно заявленными fresh rows (count/seeds/repeats/SHA);
+  негативные 7 случаев адаптированы; свежая сессия p16.47 (C″₃ 4e5dcec,
+  2026-09-14T09:44:53Z, seeds 1/8 ×2, full numeric observables).
+- **Выявлено попутно (не фазой; runtime не менялся)**: единичный SIGSEGV
+  luazig на gc.lua (run_tests, exit −11, после 'self-referenced
+  threads' до OK) — 0/120 воспроизведений (90 plain + 30 --testc);
+  binary побайтно идентичен принятому состоянию; требует отдельного
+  расследования в будущей semantic-фазе.
+
+Гейты: см. report.md (полная матрица). Обязательный perf gate: OK ×5.
 
 ## История закрытых фаз
 

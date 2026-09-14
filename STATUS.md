@@ -1,4 +1,4 @@
-> Last updated: 2026-09-14 (P16.49 OPEN: deterministic gc.lua SIGSEGV root-cause fix + Task 0 paired-schema hardening; P16.48-review correction COMPLETE: paired-seed идентифицируемость gate; manifest schema; mandatory verdict OK; gc.lua SIGSEGV получил детерминированный reproducer + backtrace — следующий semantic blocker: paired-seed идентифицируемость + manifest/schema; P16.48 COMPLETE: три false-green формы gate закрыты независимой кластеризацией + weight/outlier-проверками + wall-P25 secondary rule; manifest multi-session; 3/3+official OK; SIGSEGV-план подготовлен; P16.47 COMPLETE: обязательный perf gate воспроизводимо зелёный 5/5 (matched-mode по causal instructions:u, wall=диагностика); запрещённый policy guard удалён; P16.46 COMPLETE (correctness-green; обязательный perf gate = FAIL по global_arith — задокументированный bimodal mode flip, см. запись фазы): perf-контракт AGENTS↔код согласован по решению владельца; determinism_recheck структурный с независимым валидатором + негативная матрица; prose truth исправлена) — двухкоммитная дисциплина C/D: один immutable measured-source коммит C (7d97e5a) + artifact-wrapper D; все канонические артефакты перегенерированы с provenance = точный C; арифметика noise-сводок механически валидируется; layout-проба реально перестроена)
+> Last updated: 2026-09-14 (P16.49 COMPLETE: gc.lua SIGSEGV устранён PUC-faithful unlink (root cause доказан first-illegal-op дискриминатором); 415/415 валидационных прогонов; полная батарея зелёная; Task 0 paired-schema hardening; P16.48-review correction COMPLETE: deterministic gc.lua SIGSEGV root-cause fix + Task 0 paired-schema hardening; P16.48-review correction COMPLETE: paired-seed идентифицируемость gate; manifest schema; mandatory verdict OK; gc.lua SIGSEGV получил детерминированный reproducer + backtrace — следующий semantic blocker: paired-seed идентифицируемость + manifest/schema; P16.48 COMPLETE: три false-green формы gate закрыты независимой кластеризацией + weight/outlier-проверками + wall-P25 secondary rule; manifest multi-session; 3/3+official OK; SIGSEGV-план подготовлен; P16.47 COMPLETE: обязательный perf gate воспроизводимо зелёный 5/5 (matched-mode по causal instructions:u, wall=диагностика); запрещённый policy guard удалён; P16.46 COMPLETE (correctness-green; обязательный perf gate = FAIL по global_arith — задокументированный bimodal mode flip, см. запись фазы): perf-контракт AGENTS↔код согласован по решению владельца; determinism_recheck структурный с независимым валидатором + негативная матрица; prose truth исправлена) — двухкоммитная дисциплина C/D: один immutable measured-source коммит C (7d97e5a) + artifact-wrapper D; все канонические артефакты перегенерированы с provenance = точный C; арифметика noise-сводок механически валидируется; layout-проба реально перестроена)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -43,7 +43,7 @@ Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-14)
 
-- [ ] **P16.49 (owner-instructed)**: устранить deterministic gc.lua SIGSEGV (self-referenced-thread allocator corruption) + Task 0 paired-seed schema hardening — (a) Task 0 (tools-only, до runtime): ровно один row на каждый seed из опубликованного списка для каждого workload (без пропусков/дубликатов/extras/null — dict-comprehension больше не скрывает duplicate evidence), validate_baseline_document проверяет protocol/seed_list/runs==len(seed_list)/per-workload seed identities/типы/wall>0/instructions>0/mode-evidence согласованность, --runs N для verdict/baseline — только exact published N=21 (metadata обязана совпадать с исполнением); (b) BLOCKER: сохранить immutable crashing binary ДО любых rebuild; точный reproducer contract (cwd testes, относительный argv[0], env только PADVAR=256×'x', --vm=bc gc.lua); свежий symbolized backtrace + registers + fault address + size class; Debug/ReleaseSafe/sanitizer; LUAZIG_TRACK_ALLOC/C_ALLOC только как A/B; временный allocation ledger/guard size-class'а (default-off); инвентаризация всех объектов size class (Cell=40 И Closure=40 — один class!); сузить upstream window бинарным поиском; сравнить с PUC luaE_freethread/luaF_close/lgc sweep order (особенно текущий teardown порядок freeThreadBytecodeFrames ДО closeThreadOpenUpvalues); критерий — первая доказанная незаконная операция + PUC-faithful ownership invariant, не просто 100 зелёных запусков; negative validation старой ветки; permanent focused reproducer после root cause; без special-case по gc.lua/строке/self-reference/PADVAR/seed/имени функции.
+- [x] **P16.49 (owner-instructed)**: устранить deterministic gc.lua SIGSEGV (self-referenced-thread allocator corruption) + Task 0 paired-seed schema hardening — (a) Task 0 (tools-only, до runtime): ровно один row на каждый seed из опубликованного списка для каждого workload (без пропусков/дубликатов/extras/null — dict-comprehension больше не скрывает duplicate evidence), validate_baseline_document проверяет protocol/seed_list/runs==len(seed_list)/per-workload seed identities/типы/wall>0/instructions>0/mode-evidence согласованность, --runs N для verdict/baseline — только exact published N=21 (metadata обязана совпадать с исполнением); (b) BLOCKER: сохранить immutable crashing binary ДО любых rebuild; точный reproducer contract (cwd testes, относительный argv[0], env только PADVAR=256×'x', --vm=bc gc.lua); свежий symbolized backtrace + registers + fault address + size class; Debug/ReleaseSafe/sanitizer; LUAZIG_TRACK_ALLOC/C_ALLOC только как A/B; временный allocation ledger/guard size-class'а (default-off); инвентаризация всех объектов size class (Cell=40 И Closure=40 — один class!); сузить upstream window бинарным поиском; сравнить с PUC luaE_freethread/luaF_close/lgc sweep order (особенно текущий teardown порядок freeThreadBytecodeFrames ДО closeThreadOpenUpvalues); критерий — первая доказанная незаконная операция + PUC-faithful ownership invariant, не просто 100 зелёных запусков; negative validation старой ветки; permanent focused reproducer после root cause; без special-case по gc.lua/строке/self-reference/PADVAR/seed/имени функции.
 
 
 - [x] **P16.48-review correction (owner-instructed)**: paired-seed идентифицируемость gate + manifest/schema исправления — (a) BLOCKER 1: умеренная миграция modes (10/10 → 3/18, p=0.0015>α) даёт false-green; решение владельца — paired-seed протокол: LUAZIG_HASH_SEED (u64) в production binary по прецеденту LUAZIG_TRACK_ALLOC/LUAZIG_C_ALLOC (не задан → entropy без изменений), гейт измеряет ОПУБЛИКОВАННЫЙ фиксированный список seed'ов, вердикт = per-seed paired instruction deltas (нулевая выборочная неопределённость), moderate/extreme migration → FAIL по построению; baseline перезаписывается на measured-source commit (owner-approved schema evolution); (b) BLOCKER 2: population weights считать из cluster labels (не из instructions<=median(low) — давало 0.25 вместо 0.5), fixture с неодинаковыми within-mode значениями + пересчёт из raw rows; (c) MEDIUM manifest: полный sha256 binary (не null/не sha16-подделка), --gate-out не мутирует canonical manifest (--manifest-out), atomic replace + no-residue тесты; (d) README: median-of-7/16-workloads → актуальные N=21/18, status-блок перегенерировать проектным механизмом.
@@ -7031,6 +7031,66 @@ Correction-фаза по owner-ledger item (открыт a058cbf; open-count 21�
   reproducer'ом, инспекция ownership вокруг opClosure/coroutine teardown
   против PUC lstate/lgc, минимальный reproducer после root cause; никакого
   special-casing.
+
+### P16.49: deterministic gc.lua SIGSEGV — root cause + PUC-faithful fix + Task 0 (2026-09-14)
+
+Фаза по owner-ledger item (открыт f7bd3e7; open-count 21→22→закрыт→21).
+
+- **Доказательство root cause (first illegal operation, не только victim)**:
+  Debug-дискриминатор (@panic в gcFreeObject(.cell), worktree): sweep
+  полного цикла collectgarbage() после секции self-referenced threads
+  освобождает OPEN Cell, ещё связанную с мёртвым (white, не снятым)
+  owning Thread — in_boxed=true, live_refs=0 (genuinely unreachable,
+  liveness-багов НЕТ), THREAD-FREED: 0 до первой незаконной операции.
+  Каскад: cell freed while linked → teardown Thread'а
+  (closeThreadOpenUpvalues) пишет cell.value по смещению 0 освобождённой
+  памяти → затёрт next-указатель SmpAllocator 64B freelist (значение
+  0x3c874=247924 — Lua-integer регистра) → следующий alloc Cell/Closure
+  (opClosure vm.zig:17925) детонирует. Сигнатуры: RF SIGSEGV 10/10
+  (exact contract: cwd testes, rel argv0, env только PADVAR=256×'x',
+  --vm=bc gc.lua); Debug/ReleaseSafe — panic 'incorrect alignment' на том
+  же месте; C_ALLOC — glibc 'unaligned tcache chunk'; TRACK_ALLOC
+  маскирует таймингом (allocator-independent corruption). Свежий
+  symbolized backtrace + registers + fault address сохранены
+  (/tmp/opencode/p49_backtrace.txt); oracle /tmp/opencode/p49_crash_oracle
+  (fe4af086…) сохранён ДО rebuild.
+- **Фикс = PUC freeupval (lgc.c:829-833)**: gcFreeObject(.cell) при
+  открытом cell очищает owner.bytecode_boxed[bc_stack_idx]=null ДО
+  destroy — оба порядка sweep безопасны (cell-first → слот занулён;
+  thread-first → teardown сначала закрывает связанные cells).
+  Intra-thread teardown порядок был PUC-correct (close до free stack) —
+  расхождение было именно в отсутствии unlink при независимой смерти Cell.
+- **Валидация**: negative control oracle 10/10 crash; fixed — 100/100
+  exact-contract + 20/20 × 10 конфигураций (PADVAR 0..1024, abs/rel
+  argv0, full env, C_ALLOC, TRACK_ALLOC) + Debug 30/30 + ReleaseSafe
+  30/30 без паник + gc.lua plain/--testc/run_tests 5/5×3 + focused тест
+  10/10 plain/testc/C_ALLOC = 415 runs, 0 failures. Полная батарея
+  зелёная: fmt, unit D/RF, selftests (79 проверок), noise + 7 негативных,
+  smoke 85 файлов (добавлен 85_selfref_upvalue_gc.lua — generic,
+  без special-case) plain + --testc 0 fails, matrix zig_fail=0/both_fail=1
+  (big.lua pre-existing), c_api + DIFF: PASS, api580 GREEN, gc.lua 5/5,
+  diff --check 0.
+- **Mandatory perf**: одна объявленная сессия на fixed binary
+  (3542a661…) → RESULT: OK (rc=0), per-seed дельты ±0.6% (unlink не
+  меняет instruction counts значимо); baseline НЕ обновлялся.
+- **Task 0 (paired-seed schema hardening, tools-only)**: ровно один row
+  на каждый seed опубликованного списка для каждого workload обеих
+  сторон (anonymous/null/duplicate/missing/extra → INCONCLUSIVE с
+  причиной); validate_baseline_document: protocol=='paired-seed-v1',
+  seed_list уникальные положительные int, runs==len(seed_list),
+  полнота seed-идентичностей каждого workload, wall>0, instructions>0,
+  типы, mode_evidence; --runs для verdict/baseline — только exact
+  published N=21 (rc=2 иначе); тесты M18-M22 + test_paired_seed_schema
+  (16 проверок); M1-M17/serializer/manifest зелёные.
+- **Коммиты**: C = b52d10e (src unlink + Task 0 tools + focused тест) →
+  D = wrapper (артефакты гейт-сессий + STATUS). Immutable binary
+  3542a661… зафиксирован до измерений.
+
+Остающиеся ограничения: latent OOM-rollback дефект (rollback не удаляет
+freed objects из gc_young_objects — double-free класс, OOM-only;
+задокументирован, вне этого crash'а); big.lua both_fail (pre-existing,
+оба движка); historical self-referenced-threads падения (4/24, 2/8)
+объяснены env-layout зависимостью воспроизводимости.
 
 ## История закрытых фаз
 

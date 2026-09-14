@@ -271,6 +271,9 @@ CANONICAL = [
     # claimed full coverage).
     "tools/status/current-matrix.json",
     "tools/status/current-smoke.json",
+    # P16.47: every gate run persists its raw session evidence here
+    # (samples + mode labels + cluster evidence + provenance).
+    "tools/perf/current-gate.json",
 ]
 for rel in CANONICAL:
     p = REPO / rel

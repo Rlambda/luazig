@@ -157,7 +157,12 @@ def perf_section(perf: dict | None, versioned: bool = False) -> list[str]:
     lines.append(
         f"Geomean slowdown vs PUC Lua: **{geomean:.2f}x** (lower is better; 1.0x = parity)."
     )
-    lines.append(f"Method: median-of-{runs} per workload, pinned CPU core (`tools/perf_compare.py`).")
+    lines.append(
+        "Method: paired-seed protocol — {runs} published seeds per workload "
+        "per session (`LUAZIG_HASH_SEED` env on the production ReleaseFast "
+        "binary, pinned CPU core); verdict = per-seed paired instruction "
+        "deltas; wall time is diagnostic only (`tools/perf_compare.py`)."
+        .format(runs=runs))
     lines.append("")
     lines.append("| Workload | Zig/PUC |")
     lines.append("|----------|--------:|")

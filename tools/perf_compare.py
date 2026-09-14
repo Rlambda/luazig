@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -89,11 +90,21 @@ REGRESSION_FAIL = 0.10
 # temp_table_alloc, metamethod_call_noalloc flipped forms — the gate had
 # ignored candidate classification entirely, which is the false-green).
 MODE_SPLIT_REL_GAP = REGRESSION_WARN
-# Population-weight compatibility: a candidate whose mode mixture is
-# statistically incompatible with the baseline mixture (exact two-sided
-# binomial p-value < 1e-3) signals mass migration between modes — NOT a
-# benign seed-mix change — and must not yield a green verdict.
-WEIGHT_ALPHA = 1e-3
+# P16.48-review: PAIRED-SEED protocol (owner-approved). Both baseline and
+# candidate sessions run the production binary under LUAZIG_HASH_SEED over
+# this PUBLISHED fixed seed list, so every sample has a deterministic seed
+# identity and the verdict is a per-seed paired instruction delta — there
+# is NO sampling ambiguity by construction. A mode migration is simply a
+# changed count on the migrated seeds -> FAIL (the earlier anonymous-
+# population weight test could not distinguish migration from sampling
+# variation: 10/10 -> 3/18 stayed green at any practical alpha).
+SEED_LIST = list(range(1, 22))
+SEED_ENV = "LUAZIG_HASH_SEED"
+# Per-seed instruction drift bound for the PAIRED comparison: identical
+# seed + identical code reproduces within ~5e2 instructions (measured
+# 237/417 = 1.7e-8..3.3e-8 relative); 1e-5 relative separates that from
+# any verdict-relevant delta by three orders of magnitude.
+PAIRED_DRIFT_REL = 1e-5
 # Secondary wall rule (owner-approved P16.48): per matched instruction
 # mode, compare the wall P25 (lower envelope). The per-process address
 # layout lottery inflates/mixes the UPPER part of the wall distribution
@@ -750,17 +761,26 @@ class ModeEvidenceError(RuntimeError):
 
 
 def run_bench_one(lua_bin: Path, core: str, workload: str,
-                  with_perf: bool = True) -> dict:
-    """One workload in one fresh process (one hash seed = one mode sample).
+                  with_perf: bool = True, seed: int | None = None) -> dict:
+    """One workload in one fresh process.
 
-    Returns {"wall": self-reported seconds, "instructions": process total}.
-    Wall comes from the workload's own os.clock print, so wrapping the
-    process in perf/taskset does not distort the measured section."""
+    With `seed`, the production binary runs under LUAZIG_HASH_SEED (paired
+    protocol — deterministic per-seed instruction counts); without it the
+    process uses the default entropy seed (legacy anonymous sampling).
+
+    Returns {"wall": self-reported seconds, "instructions": process total,
+    "seed": seed|None}. Wall comes from the workload's own os.clock print,
+    so wrapping the process in perf/taskset does not distort the measured
+    section."""
     cmd = ["taskset", "-c", core, str(lua_bin), str(BENCH), workload]
     if with_perf:
         cmd = ["perf", "stat", "-e", "instructions:u"] + cmd
+    run_env = None
+    if seed is not None:
+        run_env = dict(os.environ)
+        run_env[SEED_ENV] = str(seed)
     proc = subprocess.run(cmd, capture_output=True, text=True,
-                          timeout=BENCH_TIMEOUT_S)
+                          timeout=BENCH_TIMEOUT_S, env=run_env)
     if proc.returncode != 0:
         raise ModeEvidenceError(
             f"workload {workload} exited {proc.returncode}: "
@@ -776,7 +796,7 @@ def run_bench_one(lua_bin: Path, core: str, workload: str,
     if wall is None or wall <= 0:
         raise ModeEvidenceError(f"no self-reported wall for {workload}")
     if not with_perf:
-        return {"wall": wall, "instructions": None}
+        return {"wall": wall, "instructions": None, "seed": seed}
     instr = None
     for line in proc.stderr.splitlines():
         m = re.match(r"\s*([\d,]+)\s+cpu_core/instructions/u", line)
@@ -784,26 +804,31 @@ def run_bench_one(lua_bin: Path, core: str, workload: str,
             instr = int(m.group(1).replace(",", ""))
     if instr is None or instr <= 0:
         raise ModeEvidenceError(f"no instructions:u for {workload}")
-    return {"wall": wall, "instructions": instr}
+    return {"wall": wall, "instructions": instr, "seed": seed}
 
 
 def collect_mode_samples(lua_bin: Path, n: int, core: str, label: str,
-                         workloads=None, with_perf: bool = True
+                         workloads=None, with_perf: bool = True,
+                         seeds: list[int] | None = None
                          ) -> dict[str, list[dict]]:
-    """Per-workload sample populations: n fresh processes per workload.
+    """Per-workload sample populations over the given seed identities.
 
-    Each process draws an independent hash seed, so the samples of a
-    bimodal workload populate both mode clusters; a unimodal workload
-    stays in one cluster. Raw samples are kept verbatim (artifact evidence)."""
+    Paired protocol (default): `seeds` is the published SEED_LIST — every
+    sample carries its seed, both baseline and candidate run the SAME
+    list, and the verdict compares per-seed pairs. `n` is accepted for
+    CLI compatibility; with an explicit seed list the list length wins.
+    Raw samples are kept verbatim (artifact evidence)."""
+    if seeds is None:
+        seeds = SEED_LIST[:n] if n < len(SEED_LIST) else SEED_LIST
     samples: dict[str, list[dict]] = {}
     for wl in (workloads or WORKLOADS):
         rows = []
         t0 = time.perf_counter()
-        for i in range(n):
-            rows.append(run_bench_one(lua_bin, core, wl, with_perf))
+        for s in seeds:
+            rows.append(run_bench_one(lua_bin, core, wl, with_perf, seed=s))
         samples[wl] = rows
-        print(f"  {label} {wl}: {n} samples in {time.perf_counter() - t0:.1f}s",
-              flush=True)
+        print(f"  {label} {wl}: {len(seeds)} seed samples in "
+              f"{time.perf_counter() - t0:.1f}s", flush=True)
     return samples
 
 
@@ -855,15 +880,6 @@ def classify_modes(samples: list[dict]) -> dict:
             "rejected_split_gap": rejected_split_gap}
 
 
-def _binom_two_sided_p(k: int, n: int, p: float) -> float:
-    """Exact two-sided binomial p-value (no scipy dependency)."""
-    def pmf(i: int) -> float:
-        return math.comb(n, i) * p ** i * (1.0 - p) ** (n - i)
-    pk = pmf(k)
-    return min(1.0, sum(pmf(i) for i in range(n + 1)
-                        if pmf(i) <= pk * (1 + 1e-9)))
-
-
 def _p25(walls: list[float]) -> float:
     """Lower-envelope quantile of a wall population (deterministic).
 
@@ -875,42 +891,35 @@ def _p25(walls: list[float]) -> float:
 
 def mode_aware_regression(zig_samples: dict[str, list[dict]],
                           baseline_doc: dict) -> dict:
-    """Matched-mode regression with INDEPENDENT cluster forms.
+    """PAIRED-SEED matched regression (owner-approved P16.48-review).
 
-    P16.48 correction of three proven false-greens:
-      1. a baseline workload missing from the candidate → INCONCLUSIVE
-         (the old code printed "NEW" and returned a green aggregate);
-      2. mode migration hid regressions: samples were only assigned to
-         nearest BASELINE centers, so a population that migrated +11% into
-         the other mode kept a green verdict (independently reproduced
-         fixture: baseline low=10x100/high=10x111 vs candidate 1x100 +
-         20x111 → old verdict OK);
-      3. a new minority mode was absorbed by a mono median (baseline
-         21x100 vs candidate 11x100 + 10x111 → old verdict OK).
+    Every sample carries its LUAZIG_HASH_SEED identity; both sessions ran
+    the SAME published SEED_LIST on the SAME production binary. The
+    verdict is therefore a PER-SEED paired instruction delta — a
+    deterministic comparison with no sampling ambiguity:
 
-    Both sides are now clustered INDEPENDENTLY by the same reorder-
-    invariant largest-gap algorithm (threshold = WARN-tied, see
-    MODE_SPLIT_REL_GAP). Verdicts compare cluster centers matched BY ORDER
-    (low↔low, high↔high) only when the mode counts agree; any form change
-    (mono↔split) is INCONCLUSIVE. For split↔split, the population weights
-    must additionally be binomially compatible (WEIGHT_ALPHA): mass
-    migration between modes is not a benign seed-mix change.
+      - a mode migration is simply a changed count on the migrated seeds
+        (moderate 10/10 -> 3/18-class shifts FAIL by construction — the
+        migrated seeds each show their real +11%);
+      - sampling variation does not exist (identical seed + identical
+        code reproduces within ~5e2 instructions, PAIRED_DRIFT_REL).
 
-    Verdict metric: instruction center medians per matched mode (causal,
-    deterministic per seed). Secondary owner-approved rule: a wall P25
-    envelope shift > WALL_P25_LIMIT inside a matched mode with an
-    instruction-OK verdict → INCONCLUSIVE (possible memory-hierarchy
-    regression invisible to instruction counts) with guidance to run the
-    causal counters lane.
+    Fail-safety kept from the P16.48 correction: a baseline workload
+    missing from the candidate -> INCONCLUSIVE; a seed present on one
+    side only -> INCONCLUSIVE (identity mismatch = corrupt evidence);
+    independent cluster FORM change (mono<->split) -> INCONCLUSIVE;
+    an above-threshold outlier gap without a minimum cluster size ->
+    INCONCLUSIVE; FAIL is never erased (verdicts folded after the loop).
 
-    Fail-safe aggregation: per-verdict list folded after the loop; nothing
-    can erase a FAIL; INCONCLUSIVE yields rc=2; NOISE/wall prints are
-    diagnostics only."""
+    Cluster forms, centers and weights (computed FROM LABELS) are
+    recorded as artifact evidence; the wall-P25 envelope secondary rule
+    (owner-approved) stays: envelope shift > WALL_P25_LIMIT with an
+    instruction-OK verdict -> INCONCLUSIVE + causal-counters guidance."""
     base_samples_all = baseline_doc.get("zig_samples", {})
     prev_ident = baseline_doc.get("baseline_identity", {})
-    print(f"\nMatched-mode regression check vs {BASELINE} "
+    print(f"\nPaired-seed regression check vs {BASELINE} "
           f"(phase: {prev_ident.get('baseline_phase', 'unknown')}):")
-    print(f"  {'Workload[mode]':<28} {'base instr':>13} {'cur instr':>13} "
+    print(f"  {'Workload[seed]':<28} {'base instr':>13} {'cur instr':>13} "
           f"{'delta':>9}  status")
     print("  " + "-" * 78)
     verdicts: list[str] = []
@@ -924,78 +933,89 @@ def mode_aware_regression(zig_samples: dict[str, list[dict]],
                   f"-> INCONCLUSIVE")
             inconclusive = True
             continue
-        # Independent clustering of BOTH sides from raw samples — recorded
-        # labels are provenance, never verdict input.
+        base_by_seed = {s["seed"]: s for s in base_rows
+                        if s.get("seed") is not None}
+        cand_by_seed = {s["seed"]: s for s in cand_rows
+                        if s.get("seed") is not None}
+        if not base_by_seed or not cand_by_seed:
+            print(f"  {wl:<28}  anonymous samples (pre-paired schema) "
+                  f"-> INCONCLUSIVE (re-record baseline)")
+            inconclusive = True
+            continue
+        only_base = set(base_by_seed) - set(cand_by_seed)
+        only_cand = set(cand_by_seed) - set(base_by_seed)
+        if only_base or only_cand:
+            print(f"  {wl:<28}  seed-identity mismatch "
+                  f"(base-only {sorted(only_base)[:3]}, cand-only "
+                  f"{sorted(only_cand)[:3]}) -> INCONCLUSIVE")
+            inconclusive = True
+            continue
+        # Independent cluster evidence (recorded; also a fail-safe guard).
         base_ev = classify_modes(base_rows)
         cand_ev = classify_modes(cand_rows)
         base_form = "split" if len(base_ev["centers"]) == 2 else "mono"
         cand_form = "split" if len(cand_ev["centers"]) == 2 else "mono"
-        matching[wl] = {"baseline_form": base_form,
-                        "candidate_form": cand_form,
-                        "baseline_centers": base_ev["centers"],
-                        "candidate_centers": cand_ev["centers"]}
-        outlier_gap = max(base_ev.get("rejected_split_gap", 0.0),
-                          cand_ev.get("rejected_split_gap", 0.0))
-        if outlier_gap > MODE_SPLIT_REL_GAP:
-            print(f"  {wl:<28}  outlier above split threshold "
-                  f"(gap {outlier_gap * 100:.1f}%, cluster too small) — "
-                  f"corrupt evidence? -> INCONCLUSIVE")
-            inconclusive = True
-            continue
-        if base_form != cand_form:
-            print(f"  {wl:<28}  cluster form changed "
-                  f"({base_form} -> {cand_form}) -> INCONCLUSIVE")
-            inconclusive = True
-            continue
-        # Population-weight compatibility for split↔split (order-matched).
-        if base_form == "split":
-            base_low_n = sum(1 for s in base_rows
-                             if s["instructions"] <= base_ev["centers"]["low"])
-            cand_low_n = sum(1 for s in cand_rows
-                             if s["instructions"] <= cand_ev["centers"]["low"])
-            p = base_low_n / len(base_rows)
-            pv = _binom_two_sided_p(cand_low_n, len(cand_rows), p)
-            matching[wl]["weights"] = {"baseline_low_frac": p,
-                                       "candidate_low_frac":
-                                           cand_low_n / len(cand_rows),
-                                       "binom_p": pv}
-            if pv < WEIGHT_ALPHA:
-                print(f"  {wl:<28}  population weights incompatible "
-                      f"(low {p:.2f} -> {cand_low_n / len(cand_rows):.2f}, "
-                      f"p={pv:.1e}) — mass migration? -> INCONCLUSIVE")
-                inconclusive = True
-                continue
-        for mode in sorted(base_ev["centers"]):
-            base_c = base_ev["centers"][mode]
-            cand_c = cand_ev["centers"][mode]
-            delta = (cand_c - base_c) / base_c if base_c else 0.0
+        base_low_n = sum(1 for lab in base_ev["labels"] if lab == "low")
+        cand_low_n = sum(1 for lab in cand_ev["labels"] if lab == "low")
+        matching[wl] = {
+            "baseline_form": base_form, "candidate_form": cand_form,
+            "baseline_centers": base_ev["centers"],
+            "candidate_centers": cand_ev["centers"],
+            "weights": {"baseline_low_frac":
+                            base_low_n / len(base_rows) if base_rows else 0.0,
+                        "candidate_low_frac":
+                            cand_low_n / len(cand_rows) if cand_rows else 0.0},
+        }
+        # Per-seed paired deltas FIRST — the primary causal evidence.
+        # A real regression (migrated seeds, mode shifts) must surface as
+        # FAIL/WARN per seed; the form/outlier guards below then apply
+        # only when no verdict-relevant delta exists, so they can never
+        # mask a regression into a generic INCONCLUSIVE.
+        wl_verdicts: list[str] = []
+        b_walls, c_walls = [], []
+        for seed in sorted(base_by_seed):
+            b, c = base_by_seed[seed], cand_by_seed[seed]
+            delta = ((c["instructions"] - b["instructions"])
+                     / b["instructions"] if b["instructions"] else 0.0)
             verdict = classify(delta)
             verdicts.append(verdict)
-            # Secondary wall-envelope rule (owner-approved P16.48).
-            b_walls = [s["wall"] for s, lab in zip(base_rows, base_ev["labels"])
-                       if lab == mode]
-            c_walls = [s["wall"] for s, lab in zip(cand_rows, cand_ev["labels"])
-                       if lab == mode]
+            wl_verdicts.append(verdict)
+            b_walls.append(b["wall"])
+            c_walls.append(c["wall"])
+            if abs(delta) >= PAIRED_DRIFT_REL:
+                print(f"  {wl + '[' + str(seed) + ']':<28} "
+                      f"{b['instructions']:>13} {c['instructions']:>13} "
+                      f"{delta * 100:>+8.3f}%  {verdict}")
+        if not any(v != "OK" for v in wl_verdicts):
+            # No verdict-relevant per-seed delta: apply the evidence-shape
+            # fail-safes (form change / outlier) and the wall envelope rule.
+            if base_form != cand_form:
+                print(f"  {wl:<28}  cluster form changed "
+                      f"({base_form} -> {cand_form}) -> INCONCLUSIVE")
+                inconclusive = True
+                continue
+            outlier_gap = max(base_ev.get("rejected_split_gap", 0.0),
+                              cand_ev.get("rejected_split_gap", 0.0))
+            if outlier_gap > MODE_SPLIT_REL_GAP:
+                print(f"  {wl:<28}  outlier above split threshold "
+                      f"(gap {outlier_gap * 100:.1f}%) -> INCONCLUSIVE")
+                inconclusive = True
+                continue
             env_note = ""
             if b_walls and c_walls:
-                env_shift = (_p25(c_walls) - _p25(b_walls)) / _p25(b_walls)
-                matching[wl].setdefault("wall_p25", {})[mode] = {
-                    "baseline": _p25(b_walls), "candidate": _p25(c_walls),
-                    "shift": env_shift}
-                if verdict == "OK" and env_shift > WALL_P25_LIMIT:
-                    verdict = "INCONCLUSIVE"
+                bp, cp = _p25(b_walls), _p25(c_walls)
+                env_shift = (cp - bp) / bp if bp else 0.0
+                matching[wl]["wall_p25"] = {"baseline": bp, "candidate": cp,
+                                            "shift": env_shift}
+                if env_shift > WALL_P25_LIMIT:
                     inconclusive = True
                     env_note = (f"  wall-P25 {env_shift * 100:+.0f}% -> "
-                                f"INCONCLUSIVE (run causal counters: "
-                                f"--perf)")
-            w_med = statistics.median(c_walls) if c_walls else float("nan")
-            w_spread = (f"[wall {min(c_walls):.3f}..{max(c_walls):.3f}"
-                        f", med {w_med:.3f}]" if c_walls else "")
-            print(f"  {wl + '[' + mode + ']':<28} {base_c:>13} "
-                  f"{cand_c:>13} {delta * 100:>+8.2f}%  {verdict}  "
-                  f"{w_spread}{env_note}")
+                                f"INCONCLUSIVE (run causal counters: --perf)")
+                print(f"  {wl + '[all-seeds]':<28} "
+                      f"{'--':>13} {'--':>13} "
+                      f"{'~0':>9}  OK  [wall med {statistics.median(c_walls):.3f}]"
+                      f"{env_note}")
     for wl in sorted(set(zig_samples) - set(base_samples_all)):
-        med = statistics.median(s["wall"] for s in zig_samples[wl])
         print(f"  {wl:<28} {'--':>13} "
               f"{statistics.median(s['instructions'] for s in zig_samples[wl]):>13} "
               f"{'--':>9}  NEW (no baseline; informational)")
@@ -1095,6 +1115,8 @@ def build_baseline_document(current: dict, spreads: dict, runs: int, core: str,
         # never against mode-blind scalar medians.
         "zig_samples": current.get("zig_samples", {}),
         "mode_evidence": current.get("mode_evidence", {}),
+        "seed_list": current.get("seed_list", SEED_LIST),
+        "protocol": current.get("protocol", "paired-seed-v1"),
         "baseline_identity": {
             "baseline_phase": baseline_phase,
             "note": (note or
@@ -1168,6 +1190,41 @@ def run_perf_stat(zig_bin: Path, core: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-session manifest (P16.48-review)
+# ---------------------------------------------------------------------------
+
+def should_write_manifest(gate_out: str, manifest_out: str) -> bool:
+    """Decide whether this gate session appends to the per-session manifest.
+
+    A session redirected via --gate-out produces review/temporary evidence
+    and must NOT silently mutate the canonical manifest; only an explicit
+    --manifest-out re-enables the append for such a run. Canonical runs
+    (no --gate-out) always append. Returns False ONLY in the redirected
+    case: gate_out set AND manifest_out empty.
+    """
+    return not (bool(gate_out) and not manifest_out)
+
+
+def manifest_append(path: Path, entry: dict) -> None:
+    """Atomically append `entry` to the JSON-array manifest at `path`.
+
+    Write-then-replace (temp file -> os.replace) so a crash mid-append can
+    never leave a truncated manifest behind, and no `.tmp` residue survives
+    a successful append. Existing history is preserved verbatim; a corrupt
+    existing manifest raises rather than being silently discarded.
+    """
+    rows: list = []
+    if path.exists():
+        rows = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(rows, list):
+            raise ValueError(f"manifest at {path} is not a JSON array")
+    rows.append(entry)
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1198,6 +1255,14 @@ def main() -> int:
                     help=f"median runs per workload in --counters mode (default {DEFAULT_COUNTERS_RUNS})")
     ap.add_argument("--json-out", default="",
                     help="write the current run result dict to PATH (baseline untouched)")
+    ap.add_argument("--manifest-out", default="",
+                    help="explicit path for the per-session manifest append "
+                         "(atomic temp->replace). Default: the canonical "
+                         "tools/perf/current-gate-manifest.json — BUT a "
+                         "run redirected via --gate-out does NOT touch the "
+                         "canonical manifest unless --manifest-out is given "
+                         "(review/temporary outputs never mutate tracked "
+                         "artifacts silently).")
     ap.add_argument("--gate-out", default="",
                     help="explicit path for this gate session's evidence JSON "
                          "(atomic temp->replace); when omitted the canonical "
@@ -1275,6 +1340,8 @@ def main() -> int:
         "ratios": {n: zig[n] / puc[n] for n in zig if n in puc and puc[n]},
         "zig_samples": zig_samples_labeled,
         "mode_evidence": mode_evidence,
+        "seed_list": SEED_LIST,
+        "protocol": "paired-seed-v1",
     }
 
     if args.json_out:
@@ -1353,39 +1420,33 @@ def main() -> int:
         tmp = Path(str(gate_path) + ".tmp")
         tmp.write_text(json.dumps(gate_session, indent=2) + "\n",
                        encoding="utf-8")
-        import hashlib
         artifact_sha = hashlib.sha256(
             tmp.read_bytes()).hexdigest()
         os.replace(tmp, gate_path)
         print(f"gate session evidence: {gate_path}")
 
-        # Multi-session manifest (P16.48 MEDIUM): consecutive-session
+        # Multi-session manifest (P16.48-review): consecutive-session
         # claims are backed by compact per-session records — timestamp,
-        # source SHA, binary hash, artifact hash, result, per-mode centers.
-        manifest_path = ROOT / "tools/perf/current-gate-manifest.json"
-        manifest = []
-        if manifest_path.exists():
-            try:
-                manifest = json.loads(
-                    manifest_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                manifest = []
-        centers_digest = {wl: {m: c for m, c in ev["centers"].items()}
-                          for wl, ev in mode_evidence.items()}
-        manifest.append({
-            "created_utc": current["created_utc"],
-            "source_head": gate_session["provenance"].get("git_head"),
-            "zig_binary_sha256": gate_session["provenance"].get(
-                "zig_binary_sha256"),
-            "runs": args.runs,
-            "result": gate_session["result"]["verdict"],
-            "artifact_sha256": artifact_sha,
-            "mode_centers": centers_digest,
-        })
-        mtmp = Path(str(manifest_path) + ".tmp")
-        mtmp.write_text(json.dumps(manifest, indent=2) + "\n",
-                        encoding="utf-8")
-        os.replace(mtmp, manifest_path)
+        # source SHA, FULL binary sha256 (computed directly from the
+        # measured binary — never a null or a 16-char prefix posing as a
+        # full digest), artifact hash, result, seed list, per-mode centers.
+        if should_write_manifest(args.gate_out, args.manifest_out):
+            manifest_path = (Path(args.manifest_out) if args.manifest_out
+                             else ROOT / "tools/perf/current-gate-manifest.json")
+            zig_sha256 = hashlib.sha256(
+                ZIG_LUA.read_bytes()).hexdigest()
+            centers_digest = {wl: {m: c for m, c in ev["centers"].items()}
+                              for wl, ev in mode_evidence.items()}
+            manifest_append(manifest_path, {
+                "created_utc": current["created_utc"],
+                "source_head": gate_session["provenance"].get("git_head"),
+                "zig_binary_sha256": zig_sha256,
+                "seed_list": SEED_LIST,
+                "runs": args.runs,
+                "result": gate_session["result"]["verdict"],
+                "artifact_sha256": artifact_sha,
+                "mode_centers": centers_digest,
+            })
         return rc
     print(f"\nNo baseline at {BASELINE}; run with --update-baseline to "
           "create one.")

@@ -32,7 +32,7 @@ Regression lane: `python3 tools/testes_matrix.py --testc` (no `_port`/`_soft` pr
 ### Performance
 
 Geomean slowdown vs PUC Lua: **1.40x** (lower is better; 1.0x = parity).
-Method: median-of-7 per workload, pinned CPU core (`tools/perf_compare.py`).
+Method: paired-seed protocol — 7 published seeds per workload per session (`LUAZIG_HASH_SEED` env on the production ReleaseFast binary, pinned CPU core); verdict = per-seed paired instruction deltas; wall time is diagnostic only (`tools/perf_compare.py`).
 
 | Workload | Zig/PUC |
 |----------|--------:|
@@ -155,7 +155,7 @@ The test strategy is based on **differential testing**: the same upstream Lua te
 | `tools/testes_matrix.py --diff` | Adds normalized stdout comparison (detects behavioral differences even when exit codes match) |
 | `tools/smoke_compare.py` | Runs `tests/smoke/*.lua` with both engines, compares stdout+stderr+exit byte-for-byte |
 | `tools/api_regression_lane.py` | Zig unit/integration tests + testC lane |
-| `tools/perf_compare.py` | Main perf gate: 16 micro-benchmarks, geomean Zig/PUC ratio, regression check |
+| `tools/perf_compare.py` | Main perf gate: 18 micro-benchmarks, paired-seed instruction-delta regression check, geomean Zig/PUC ratio (diagnostic) |
 | `tools/release_gate.sh` | Unified command for checking release readiness |
 
 ### Common commands

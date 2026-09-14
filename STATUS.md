@@ -1,4 +1,4 @@
-> Last updated: 2026-09-14 (P16.48-review correction OPEN: paired-seed идентифицируемость + manifest/schema; P16.48 COMPLETE: три false-green формы gate закрыты независимой кластеризацией + weight/outlier-проверками + wall-P25 secondary rule; manifest multi-session; 3/3+official OK; SIGSEGV-план подготовлен; P16.47 COMPLETE: обязательный perf gate воспроизводимо зелёный 5/5 (matched-mode по causal instructions:u, wall=диагностика); запрещённый policy guard удалён; P16.46 COMPLETE (correctness-green; обязательный perf gate = FAIL по global_arith — задокументированный bimodal mode flip, см. запись фазы): perf-контракт AGENTS↔код согласован по решению владельца; determinism_recheck структурный с независимым валидатором + негативная матрица; prose truth исправлена) — двухкоммитная дисциплина C/D: один immutable measured-source коммит C (7d97e5a) + artifact-wrapper D; все канонические артефакты перегенерированы с provenance = точный C; арифметика noise-сводок механически валидируется; layout-проба реально перестроена)
+> Last updated: 2026-09-14 (P16.48-review correction COMPLETE: paired-seed идентифицируемость gate; manifest schema; mandatory verdict OK; gc.lua SIGSEGV получил детерминированный reproducer + backtrace — следующий semantic blocker: paired-seed идентифицируемость + manifest/schema; P16.48 COMPLETE: три false-green формы gate закрыты независимой кластеризацией + weight/outlier-проверками + wall-P25 secondary rule; manifest multi-session; 3/3+official OK; SIGSEGV-план подготовлен; P16.47 COMPLETE: обязательный perf gate воспроизводимо зелёный 5/5 (matched-mode по causal instructions:u, wall=диагностика); запрещённый policy guard удалён; P16.46 COMPLETE (correctness-green; обязательный perf gate = FAIL по global_arith — задокументированный bimodal mode flip, см. запись фазы): perf-контракт AGENTS↔код согласован по решению владельца; determinism_recheck структурный с независимым валидатором + негативная матрица; prose truth исправлена) — двухкоммитная дисциплина C/D: один immutable measured-source коммит C (7d97e5a) + artifact-wrapper D; все канонические артефакты перегенерированы с provenance = точный C; арифметика noise-сводок механически валидируется; layout-проба реально перестроена)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -43,7 +43,7 @@ Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-14)
 
-- [ ] **P16.48-review correction (owner-instructed)**: paired-seed идентифицируемость gate + manifest/schema исправления — (a) BLOCKER 1: умеренная миграция modes (10/10 → 3/18, p=0.0015>α) даёт false-green; решение владельца — paired-seed протокол: LUAZIG_HASH_SEED (u64) в production binary по прецеденту LUAZIG_TRACK_ALLOC/LUAZIG_C_ALLOC (не задан → entropy без изменений), гейт измеряет ОПУБЛИКОВАННЫЙ фиксированный список seed'ов, вердикт = per-seed paired instruction deltas (нулевая выборочная неопределённость), moderate/extreme migration → FAIL по построению; baseline перезаписывается на measured-source commit (owner-approved schema evolution); (b) BLOCKER 2: population weights считать из cluster labels (не из instructions<=median(low) — давало 0.25 вместо 0.5), fixture с неодинаковыми within-mode значениями + пересчёт из raw rows; (c) MEDIUM manifest: полный sha256 binary (не null/не sha16-подделка), --gate-out не мутирует canonical manifest (--manifest-out), atomic replace + no-residue тесты; (d) README: median-of-7/16-workloads → актуальные N=21/18, status-блок перегенерировать проектным механизмом.
+- [x] **P16.48-review correction (owner-instructed)**: paired-seed идентифицируемость gate + manifest/schema исправления — (a) BLOCKER 1: умеренная миграция modes (10/10 → 3/18, p=0.0015>α) даёт false-green; решение владельца — paired-seed протокол: LUAZIG_HASH_SEED (u64) в production binary по прецеденту LUAZIG_TRACK_ALLOC/LUAZIG_C_ALLOC (не задан → entropy без изменений), гейт измеряет ОПУБЛИКОВАННЫЙ фиксированный список seed'ов, вердикт = per-seed paired instruction deltas (нулевая выборочная неопределённость), moderate/extreme migration → FAIL по построению; baseline перезаписывается на measured-source commit (owner-approved schema evolution); (b) BLOCKER 2: population weights считать из cluster labels (не из instructions<=median(low) — давало 0.25 вместо 0.5), fixture с неодинаковыми within-mode значениями + пересчёт из raw rows; (c) MEDIUM manifest: полный sha256 binary (не null/не sha16-подделка), --gate-out не мутирует canonical manifest (--manifest-out), atomic replace + no-residue тесты; (d) README: median-of-7/16-workloads → актуальные N=21/18, status-блок перегенерировать проектным механизмом.
 
 - [x] **P16.48 (owner-instructed)**: закрыть false-green формы matched-mode gate — (a) BLOCKER 1: baseline workload, отсутствующий в candidate → INCONCLUSIVE/nonzero (сейчас NEW без вердикта); (b) BLOCKER 2: mode migration скрывает регрессию — candidate обязан классифицироваться НЕЗАВИСИМО тем же reorder-invariant алгоритмом, сопоставление центров по порядку только при совместимой геометрии, изменение числа mode → INCONCLUSIVE, статистически несовместимый перенос population weights → INCONCLUSIVE/nonzero; (c) BLOCKER 3: mono→minority (+11% у половины процессов) и зеркальный bimodal→mono → nonzero; (d) порог кластеризации привязан к WARN-порогу (gap < WARN не может создать WARN-вердикт — проверено на реальных raw samples: 0/18 form flips при 5% против 3 при 1%); (e) HIGH (owner-approved): secondary wall-P25-envelope rule — сдвиг P25 нижней огибающей >10% внутри matched mode при instruction-OK → INCONCLUSIVE + подсказка causal counters; (f) MEDIUM: multi-session manifest для consecutive-claims (timestamp/source/binary/artifact-hash/result/per-mode centers); atomic temp→canonical для current-gate.json + документация когда canonical обновляется; (g) подготовить план и evidence для gc.lua SIGSEGV (историческое свидетельство self-referenced threads 4/24, 2/8 — crash-класс не закрыт).
 
@@ -6970,6 +6970,64 @@ policy (>10% огибающая → INCONCLUSIVE + counters) — approved.
 реальным --testc rc=0; matrix zig_fail=0/both_fail=1 (big.lua); c_api
 test + test-diff PASS; api580 GREEN; gc.lua outputs match; noise negative
 ×7 rc=0; обязательный perf gate: OK ×4; git diff --check 0.
+
+### P16.48-review correction: paired-seed идентифицируемость + manifest schema (2026-09-14)
+
+Correction-фаза по owner-ledger item (открыт a058cbf; open-count 21→22→
+закрыт этим этапом→21). Owner-решения: paired-seed протокол
+(LUAZIG_HASH_SEED по прецеденту LUAZIG_*), baseline re-record approved.
+
+- **Коммиты (linear, без amend после измерений)**: C = b6b8646 (seed-hook
+  в src/bin/luazig.zig + paired вердикт + weights-from-labels + manifest
+  schema + README/AGENTS) → C2 = 244d032 (фикс: zig_samples_labeled терял
+  поле seed — обнаружено ИЗМЕРЕНИЕМ: первая объявленная mandatory-сессия
+  честно вернула INCONCLUSIVE 'anonymous samples' и ОСТАЛАСЬ в manifest
+  как история) → D = wrapper (только артефакты/доки).
+- **BLOCKER 1 решён архитектурно**: paired-seed протокол — production RF
+  binary (fe4af086…) исполняет опубликованный SEED_LIST (seeds 1..21) через
+  LUAZIG_HASH_SEED для ОБЕИХ сессий; вердикт = per-seed paired instruction
+  deltas (воспроизводимость identical-seed 1.7e-8..3.3e-8 отн.) —
+  сэмплинг-неоднозначность устранена по построению; moderate migration
+  10/10→3/18 (старый binomial p=0.0015>α — зелёный) теперь FAIL: 7 seed'ов
+  показывают реальное +11%; guard-порядок: per-seed вердикты первыми,
+  форма/outlier-гарды только при нулевых дельтах (реальная регрессия
+  никогда не маскируется в generic INCONCLUSIVE). Матрица M1–M17 +
+  manifest contract — ALL OK; noise validator + 7 негативных rc=0.
+- **BLOCKER 2**: weights из classify_modes labels (fixture M14: distinct
+  within-mode значения → 0.5, не 0.25), counts/fractions в matching-artifact
+  пересчитываются из raw rows.
+- **MEDIUM manifest**: полный 64-hex sha256 binary (hashlib по файлу);
+  --gate-out НЕ мутирует canonical manifest (should_write_manifest +
+  --manifest-out); manifest_append atomic + no-residue тесты; legacy
+  null-строки superseded (артефакты не сохранены — manifest перегенерирован
+  из реально сохранённых новых сессий: 3 строки — INCONCLUSIVE-история,
+  mandatory OK, battery OK; последняя строка hash == current-gate.json).
+- **Baseline**: P16.48-review-paired-v2 (measured C2, fe4af086…, geomean
+  1.41135, seed-идентичности в zig_samples, protocol=paired-seed-v1).
+- **Mandatory verdict**: ОДНА заранее объявленная сессия → RESULT: OK
+  (rc=0), per-seed дельты ~0 (детерминированное воспроизведение того же
+  binary); reroll не выполнялся (INCONCLUSIVE-сессия №1 — история бага
+  записи, задокументирована).
+- **Полный battery (субагент, финальное состояние)**: zig 0.16.0; fmt 0;
+  unit D/RF 0; builds 0; selftests ALL OK; noise + 7×rc0; smoke 83/83
+  plain + 0 fails из 83 реальным --testc; matrix zig_fail=0/both_fail=1
+  (big.lua); c_api test + DIFF: PASS; api580 GREEN; git diff --check 0;
+  perf gate OK. **gc.lua: flaky RED 3/7** — см. ниже.
+- **gc.lua SIGSEGV — прорыв в evidence (субагент, следующая semantic-фаза)**:
+  (1) ДЕТЕРМИНИРОВАННЫЙ reproducer: `env -i PADVAR=<256 байт> zig-out/bin
+  luazig --vm=bc gc.lua` → **20/20 SIGSEGV** и на pre-hook binary
+  (fe723ea, e1edabe8…), и на HEAD (fe4af086) — hook исключён (Hypothesis
+  B: частота определяется размером окружения → startup stack layout;
+  full/empty env → 0 crashes, minimal env + padding → ~100%);
+  seed-корреляции нет (same-length dummy var тоже подавляет); (2)
+  **backtrace (coredumpctl)**: #0 heap.SmpAllocator.alloc — t.frees[class]
+  = node.* (SIGSEGV) ← opClosure (vm.zig:17925, 40-байт closure alloc)
+  ← runBytecodeDispatch — повреждённый/dangling thread-local free-list
+  (класс UAF/double-free в использовании аллокатора VM); (3) окно — секция
+  self-referenced threads gc.lua:503. План следующей фазы: ASan/Debug под
+  reproducer'ом, инспекция ownership вокруг opClosure/coroutine teardown
+  против PUC lstate/lgc, минимальный reproducer после root cause; никакого
+  special-casing.
 
 ## История закрытых фаз
 

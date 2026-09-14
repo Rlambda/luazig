@@ -1,4 +1,4 @@
-> Last updated: 2026-09-14 (P16.48 OPEN: false-green matched-mode gate correction + SIGSEGV prep; P16.47 COMPLETE: обязательный perf gate воспроизводимо зелёный 5/5 (matched-mode по causal instructions:u, wall=диагностика); запрещённый policy guard удалён; P16.46 COMPLETE (correctness-green; обязательный perf gate = FAIL по global_arith — задокументированный bimodal mode flip, см. запись фазы): perf-контракт AGENTS↔код согласован по решению владельца; determinism_recheck структурный с независимым валидатором + негативная матрица; prose truth исправлена) — двухкоммитная дисциплина C/D: один immutable measured-source коммит C (7d97e5a) + artifact-wrapper D; все канонические артефакты перегенерированы с provenance = точный C; арифметика noise-сводок механически валидируется; layout-проба реально перестроена)
+> Last updated: 2026-09-14 (P16.48 COMPLETE: три false-green формы gate закрыты независимой кластеризацией + weight/outlier-проверками + wall-P25 secondary rule; manifest multi-session; 3/3+official OK; SIGSEGV-план подготовлен; P16.47 COMPLETE: обязательный perf gate воспроизводимо зелёный 5/5 (matched-mode по causal instructions:u, wall=диагностика); запрещённый policy guard удалён; P16.46 COMPLETE (correctness-green; обязательный perf gate = FAIL по global_arith — задокументированный bimodal mode flip, см. запись фазы): perf-контракт AGENTS↔код согласован по решению владельца; determinism_recheck структурный с независимым валидатором + негативная матрица; prose truth исправлена) — двухкоммитная дисциплина C/D: один immutable measured-source коммит C (7d97e5a) + artifact-wrapper D; все канонические артефакты перегенерированы с provenance = точный C; арифметика noise-сводок механически валидируется; layout-проба реально перестроена)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -43,7 +43,7 @@ Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-14)
 
-- [ ] **P16.48 (owner-instructed)**: закрыть false-green формы matched-mode gate — (a) BLOCKER 1: baseline workload, отсутствующий в candidate → INCONCLUSIVE/nonzero (сейчас NEW без вердикта); (b) BLOCKER 2: mode migration скрывает регрессию — candidate обязан классифицироваться НЕЗАВИСИМО тем же reorder-invariant алгоритмом, сопоставление центров по порядку только при совместимой геометрии, изменение числа mode → INCONCLUSIVE, статистически несовместимый перенос population weights → INCONCLUSIVE/nonzero; (c) BLOCKER 3: mono→minority (+11% у половины процессов) и зеркальный bimodal→mono → nonzero; (d) порог кластеризации привязан к WARN-порогу (gap < WARN не может создать WARN-вердикт — проверено на реальных raw samples: 0/18 form flips при 5% против 3 при 1%); (e) HIGH (owner-approved): secondary wall-P25-envelope rule — сдвиг P25 нижней огибающей >10% внутри matched mode при instruction-OK → INCONCLUSIVE + подсказка causal counters; (f) MEDIUM: multi-session manifest для consecutive-claims (timestamp/source/binary/artifact-hash/result/per-mode centers); atomic temp→canonical для current-gate.json + документация когда canonical обновляется; (g) подготовить план и evidence для gc.lua SIGSEGV (историческое свидетельство self-referenced threads 4/24, 2/8 — crash-класс не закрыт).
+- [x] **P16.48 (owner-instructed)**: закрыть false-green формы matched-mode gate — (a) BLOCKER 1: baseline workload, отсутствующий в candidate → INCONCLUSIVE/nonzero (сейчас NEW без вердикта); (b) BLOCKER 2: mode migration скрывает регрессию — candidate обязан классифицироваться НЕЗАВИСИМО тем же reorder-invariant алгоритмом, сопоставление центров по порядку только при совместимой геометрии, изменение числа mode → INCONCLUSIVE, статистически несовместимый перенос population weights → INCONCLUSIVE/nonzero; (c) BLOCKER 3: mono→minority (+11% у половины процессов) и зеркальный bimodal→mono → nonzero; (d) порог кластеризации привязан к WARN-порогу (gap < WARN не может создать WARN-вердикт — проверено на реальных raw samples: 0/18 form flips при 5% против 3 при 1%); (e) HIGH (owner-approved): secondary wall-P25-envelope rule — сдвиг P25 нижней огибающей >10% внутри matched mode при instruction-OK → INCONCLUSIVE + подсказка causal counters; (f) MEDIUM: multi-session manifest для consecutive-claims (timestamp/source/binary/artifact-hash/result/per-mode centers); atomic temp→canonical для current-gate.json + документация когда canonical обновляется; (g) подготовить план и evidence для gc.lua SIGSEGV (историческое свидетельство self-referenced threads 4/24, 2/8 — crash-класс не закрыт).
 
 - [x] **P16.47 (owner-instructed)**: убрать запрещённый policy guard + воспроизводимый mode-aware perf gate — (a) удалить test_policy_contract() из tools/test_perf_gate.py (CI/test guard, принуждающий AGENTS-политику, запрещён AGENTS.md «Обязательное правило фиксации») и STATUS-утверждение о закреплении политики падающим тестом; функциональные тесты на fixtures остаются; (b) обязательный gate переводится на matched-mode регрессию по causal-observables (дизайн A владельца: production RF binary, per-sample `perf stat -e instructions:u` + self-reported wall; классификация mode по instruction-популяции largest-gap split без имён workload'ов; сравнение low↔low/high↔high; INCONCLUSIVE/nonzero при непокрытой baseline-моде или повреждённом evidence; скалярная wall-таблица — диагностика; baseline перезаписывается на measured-source commit с raw samples+labels+cluster evidence, owner-approved); (c) negative matrix: same-binary cross-mode не регрессия; +11% внутри low → FAIL; +11% внутри high → FAIL; mode отсутствует → INCONCLUSIVE/nonzero; reorder invariant; NOISE не меняет aggregate; corrupt evidence → nonzero; (d) determinism_recheck в noise-lanes.json разделён по measurement-сессиям с per-session provenance (SHA/UTC/harness/command/список прогонов), validator связывает verification block с ровно заявленными fresh rows.
 
@@ -6897,6 +6897,77 @@ AGENTS-формулировка применена как owner-approved.
   расследования в будущей semantic-фазе.
 
 Гейты: см. report.md (полная матрица). Обязательный perf gate: OK ×5.
+
+### P16.48: закрытие false-green matched-mode gate + SIGSEGV prep (2026-09-14)
+
+Фаза по owner-ledger item (открыт 5f3f62d; оценка 21 открытого пункта —
+все allocator/parser backlog, честного снятия нет; open-count 21→22→
+закрыт этим этапом→21). Owner-решения: открыть пункт; secondary wall-P25
+policy (>10% огибающая → INCONCLUSIVE + counters) — approved.
+
+- **C‴ = fe723ea** (measured source; runtime не менялся — RF binary
+  побайтно 071ffa77…). Wrapper D‴ — только артефакты/доки.
+- **BLOCKER 1**: baseline workload без candidate → INCONCLUSIVE/nonzero
+  (было NEW-без-вердикта → пустой candidate давал зелёный aggregate).
+- **BLOCKER 2**: nearest-baseline-center-only verdict RETIRED — обе
+  стороны кластеризуются НЕЗАВИСИМО одним reorder-invariant алгоритмом;
+  сопоставление по порядку при равном числе mode; изменение формы →
+  INCONCLUSIVE; перенос population weights вне точного двустороннего
+  binomial p<1e-3 → INCONCLUSIVE. Reviewer-fixture (low=10×100/high=10×111
+  vs 1×100+20×111) → nonzero.
+- **BLOCKER 3**: mono→minority +11% (21×100 vs 11×100+10×111) → форма
+  candidate сплитится → INCONCLUSIVE; зеркальный bimodal→mono → INCONCLUSIVE.
+- **Порог кластеризации привязан к WARN** (gap < WARN не может сам создать
+  WARN-вердикт): на сохранённых raw-сессиях 0/18 form flips при 5% против
+  3/18 при 1% (coroutine_yield/temp_table_alloc/metamethod_call_noalloc
+  флипались, а gate это игнорировал). Outlier выше порога сплита без
+  минимального кластера (≥2, ≥10%) → отклонён как mode + доведён до
+  regression как corrupt → INCONCLUSIVE.
+- **HIGH (owner-approved)**: secondary wall-P25 envelope rule — сдвиг
+  нижней огибающей >10% внутри matched mode при instruction-OK →
+  INCONCLUSIVE + подсказка causal counters (инструкции — causal-метрика,
+  но не полная мера performance: layout-изменения могут замедлять код без
+  роста instruction count). Огибающая устойчива к lottery (±1.6% при
+  флипающих медианах).
+- **MEDIUM**: multi-session manifest `current-gate-manifest.json`
+  (timestamp/source SHA/binary hash/artifact sha256/result/per-mode
+  centers; append temp→atomic replace); current-gate.json пишется
+  atomically, canonical обновляется каждым полным гейт-прогоном (--gate-out
+  redirect); в artifact — ОБА независимых evidence-блока + matching-решения
+  + verdict.
+- **Тесты**: матрица N1–N16 (все обязательные формы, включая три
+  false-green fixtures; P25-rule с counters-подсказкой; threshold/
+  outlier-классификация). Selftests ALL OK; noise validator ALL OK + 7
+  негативных rc=0.
+- **Гейт-сессии на чистом C‴ (runs=21)**: 3/3 + официальный прогон
+  полного battery → RESULT: OK ×4; формы стабильны (global_arith
+  split↔split low +0.00%/high −0.01%; field_access mono↔mono +0.35% —
+  3.8% gap корректно считается spread). Manifest подтверждает все 4
+  сессии.
+- **gc.lua SIGSEGV — evidence + план (следующая semantic-фаза, приоритет
+  над pcall naming)**: (1) упавший run: `tools/run_tests.py --suite gc.lua
+  --prelude '' --no-build` → движок `zig-out/bin/luazig --vm=bc gc.lua`
+  (cwd testes), exit −11, вывод оборван ПОСЛЕ "self-referenced threads"
+  (gc.lua:503; 1000 корутин с self-refs + open upvalues) ДО "OK";
+  0/120 немедленных воспроизведений; (2) историческое свидетельство STATUS
+  (~строка 10721): тот же класс flaky SIGSEGV в этой же секции ~10–25%
+  прогонов, воспроизведён и на baseline 162ae06 (4/24), и на изменённом
+  билде (2/8) — класс НЕ закрыт; (3) вероятный механизм: seed-зависимый
+  GC-pacing (hash seed → table layout → шаги GC) в окне массового
+  создания корутин + GC stop/restart self-ref collection теста;
+  подозреваемые invariant-области: освобождение Thread при GC (аналог
+  luaE_freethread), закрытие upvalue-Cell при сборке потока, parked-frame
+  C VIEW окна; (4) план: ASan/Debug + цикл gc.lua с вариацией entropy
+  (разные процессы = разные seed-моды — использовать seed-моды как
+  усилитель воспроизведения), deterministic GC pacing (пошаговый
+  collectgarbage), core/backtrace, сравнение с PUC lstate/lgc инвариантами
+  ownership; reproducer только после установления механизма; никакого
+  special-casing self-referenced threads.
+
+Гейты: fmt 0; unit D/RF 0; harness build 0; smoke 83/83 plain + все 83
+реальным --testc rc=0; matrix zig_fail=0/both_fail=1 (big.lua); c_api
+test + test-diff PASS; api580 GREEN; gc.lua outputs match; noise negative
+×7 rc=0; обязательный perf gate: OK ×4; git diff --check 0.
 
 ## История закрытых фаз
 

@@ -72,6 +72,7 @@ def mk_rows(walls, instrs, mode="", seeds=None):
 
 SEEDS = list(range(1, 22))  # arbitrary fixture seed identities
 S10 = SEEDS[:10]
+S20 = SEEDS[:20]  # 20-of-21 partial list (Task 0 negative-fixture basis)
 S21 = SEEDS
 
 
@@ -82,9 +83,15 @@ def run_mode(zig_samples, baseline):
     return res, buf.getvalue()
 
 
-def blank_doc(samples):
-    return {"baseline_identity": {"baseline_phase": "fixture"},
-            "zig_samples": samples}
+def blank_doc(samples, seed_list=None):
+    """Fixture baseline doc. `seed_list` declares the protocol list the
+    doc was recorded under (Task 0: mode_aware_regression prefers the
+    doc's declared list and falls back to pc.SEED_LIST when absent)."""
+    doc = {"baseline_identity": {"baseline_phase": "fixture"},
+           "zig_samples": samples}
+    if seed_list is not None:
+        doc["seed_list"] = list(seed_list)
+    return doc
 
 
 def bimodal(seeds, low_n=10, base=100, high=111, wall=1.0):
@@ -98,8 +105,9 @@ def bimodal(seeds, low_n=10, base=100, high=111, wall=1.0):
 
 # M1. EXTREME migration (P16.48 reviewer fixture) 10/10 -> 1/20:
 #     paired terms — seeds 2..10 (9 low seeds) moved to 111 -> FAIL.
+#     (20-seed fixture: the doc declares its own seed_list — Task 0.)
 bl = blank_doc({"wl": bimodal(S10 + S10[0:0] + list(range(11, 21)),
-                              low_n=10)})
+                              low_n=10)}, seed_list=S20)
 cand_rows = [{"wall": 1.0, "instructions": (100 if s == 1 else 111),
               "seed": s}
              for s in list(range(1, 21))]
@@ -132,8 +140,8 @@ check("M3 all intermediate mass shifts FAIL", True)
 rows_a = bimodal(list(range(1, 21)), low_n=10)
 a = {"wl": [dict(r) for r in rows_a]}
 b = {"wl": list(reversed([dict(r) for r in rows_a]))}
-ra, _ = run_mode(a, blank_doc({"wl": rows_a}))
-rb, _ = run_mode(b, blank_doc({"wl": rows_a}))
+ra, _ = run_mode(a, blank_doc({"wl": rows_a}, seed_list=S20))
+rb, _ = run_mode(b, blank_doc({"wl": rows_a}, seed_list=S20))
 check("M4 reorder invariant", (ra["fail"], ra["warn"], ra["inconclusive"])
       == (rb["fail"], rb["warn"], rb["inconclusive"]))
 
@@ -141,7 +149,7 @@ check("M4 reorder invariant", (ra["fail"], ra["warn"], ra["inconclusive"])
 #     modes 100/130; all low seeds +11% -> 111 (still nearer low; the
 #     per-seed delta is exactly the regression).
 bl = blank_doc({"wl": bimodal(list(range(1, 21)), low_n=10,
-                              base=100, high=130)})
+                              base=100, high=130)}, seed_list=S20)
 cand_rows = [{"wall": 1.0, "instructions": (111 if s <= 10 else 130),
               "seed": s} for s in list(range(1, 21))]
 res, table = run_mode({"wl": cand_rows}, bl)
@@ -151,7 +159,8 @@ check("M5 +11% within mode is FAIL", res["fail"] is True
 # M6. Same binary / same seeds: everything reproduces -> all OK.
 base_rows = bimodal(list(range(1, 21)), low_n=10, base=1000, high=1111)
 cand_rows = [dict(r) for r in base_rows]
-res, table = run_mode({"wl": cand_rows}, blank_doc({"wl": base_rows}))
+res, table = run_mode({"wl": cand_rows},
+                      blank_doc({"wl": base_rows}, seed_list=S20))
 check("M6 identical paired populations OK", res["fail"] is False
       and res["inconclusive"] is False and res["warn"] is False)
 
@@ -162,7 +171,8 @@ check("M7 missing workload INCONCLUSIVE", res["inconclusive"] is True)
 # M8. Seed-identity mismatch -> INCONCLUSIVE (corrupt evidence).
 cand_rows = [dict(r) for r in base_rows]
 cand_rows[0]["seed"] = 999
-res, table = run_mode({"wl": cand_rows}, blank_doc({"wl": base_rows}))
+res, table = run_mode({"wl": cand_rows},
+                      blank_doc({"wl": base_rows}, seed_list=S20))
 check("M8 seed mismatch INCONCLUSIVE", res["inconclusive"] is True)
 
 # M9. Anonymous (pre-paired) samples -> INCONCLUSIVE, not a verdict.
@@ -183,10 +193,12 @@ base_rows = ([{"wall": 1.0, "instructions": 1000 + s, "seed": s}
 cand_rows = ([dict(r) for r in base_rows[:10]]
              + [{"wall": 1.0, "instructions": int((1049 + s) * 1.01),
                  "seed": s} for s in SEEDS[10:20]])
-res, table = run_mode({"wl": cand_rows}, blank_doc({"wl": base_rows}))
+res, table = run_mode({"wl": cand_rows},
+                      blank_doc({"wl": base_rows}, seed_list=S20))
 check("M10 sub-threshold mono->split INCONCLUSIVE",
       res["inconclusive"] is True and res["fail"] is False)
-res, table = run_mode({"wl": base_rows}, blank_doc({"wl": cand_rows}))
+res, table = run_mode({"wl": base_rows},
+                      blank_doc({"wl": cand_rows}, seed_list=S20))
 check("M10 sub-threshold split->mono INCONCLUSIVE",
       res["inconclusive"] is True and res["fail"] is False)
 
@@ -226,7 +238,8 @@ rows = ([{"wall": 1.0, "instructions": 1000 + 3 * s, "seed": s}
         + [{"wall": 1.0, "instructions": 1300 + 3 * s, "seed": s}
            for s in SEEDS[10:20]])
 cand_rows = [dict(r) for r in rows]
-res, table = run_mode({"wl": cand_rows}, blank_doc({"wl": rows}))
+res, table = run_mode({"wl": cand_rows}, blank_doc({"wl": rows},
+                                                   seed_list=S20))
 w = res["matching"]["wl"]["weights"]
 check("M14 weights from labels (0.5 not 0.25)",
       w["baseline_low_frac"] == 0.5 and w["candidate_low_frac"] == 0.5)
@@ -258,6 +271,53 @@ bim_e = pc.classify_modes(
     + [{"wall": 0.5, "instructions": 1120 + k} for k in range(10)])
 check("M17 gap above threshold splits", set(bim_e["centers"]) == {"low", "high"})
 
+# M18-M22 (Task 0): bounded paired-seed schema hardening. The old dict/set
+# comparison collapsed duplicates and only checked set equality, so
+# symmetrically corrupt sessions returned OK. These docs declare NO
+# seed_list -> the expected list falls back to the published pc.SEED_LIST.
+full_rows = [{"wall": 1.0, "instructions": 1000 + s, "mode": "mono",
+              "seed": s} for s in S21]
+
+# M18. Both sides ONLY seed 1 -> INCONCLUSIVE (missing 2..21), never OK.
+one = [{"wall": 1.0, "instructions": 1000, "mode": "mono", "seed": 1}]
+res, table = run_mode({"wl": [dict(r) for r in one]},
+                      blank_doc({"wl": one}))
+check("M18 both sides only seed 1 INCONCLUSIVE",
+      res["inconclusive"] is True and res["fail"] is False
+      and "missing seed" in table)
+
+# M19. Both sides the SAME 20 of 21 seeds (symmetric truncation) ->
+#      INCONCLUSIVE: incomplete populations are not comparable evidence.
+rows20 = [{"wall": 1.0, "instructions": 1000 + s, "mode": "mono",
+           "seed": s} for s in S20]
+res, table = run_mode({"wl": [dict(r) for r in rows20]},
+                      blank_doc({"wl": rows20}))
+check("M19 both sides same 20-of-21 seeds INCONCLUSIVE",
+      res["inconclusive"] is True and "missing seed" in table)
+
+# M20. Both sides 21 COPIES of seed 1 (duplicates the old dict
+#      comprehension silently collapsed) -> INCONCLUSIVE.
+dupes = [{"wall": 1.0, "instructions": 1000, "mode": "mono", "seed": 1}
+         for _ in S21]
+res, table = run_mode({"wl": [dict(r) for r in dupes]},
+                      blank_doc({"wl": dupes}))
+check("M20 both sides 21 copies of seed 1 INCONCLUSIVE",
+      res["inconclusive"] is True and "duplicate seed" in table)
+
+# M21. Candidate carries an EXTRA seed 99 -> INCONCLUSIVE.
+cand = [dict(r) for r in full_rows] + [{"wall": 1.0, "instructions": 1000,
+                                        "mode": "mono", "seed": 99}]
+res, table = run_mode({"wl": cand}, blank_doc({"wl": full_rows}))
+check("M21 extra seed 99 INCONCLUSIVE",
+      res["inconclusive"] is True and "extra seed" in table)
+
+# M22. A row with a NULL seed -> INCONCLUSIVE.
+nullseed = [dict(r) for r in full_rows]
+nullseed[5]["seed"] = None
+res, table = run_mode({"wl": nullseed}, blank_doc({"wl": full_rows}))
+check("M22 null seed INCONCLUSIVE",
+      res["inconclusive"] is True and "null seed" in table)
+
 
 # ---------------------------------------------------------------------------
 # P16.45-finalization BLOCKER 4: test the REAL production serializer
@@ -270,15 +330,28 @@ import copy
 
 
 def _mk_current():
+    # Task 0: a schema-valid paired-seed current session — every workload
+    # carries exactly one row per published seed with positive
+    # wall/instructions and a mode label, plus the protocol declaration.
+    zig_samples = {
+        wl: [{"wall": 1.0, "instructions": 1000 + s, "mode": "mono",
+              "seed": s} for s in pc.SEED_LIST]
+        for wl in pc.WORKLOADS
+    }
+    mode_evidence = {
+        wl: {"centers": {"mono": 1000 + pc.SEED_LIST[len(pc.SEED_LIST) // 2]},
+             "split_rel_gap": 0.0, "n": len(pc.SEED_LIST)}
+        for wl in pc.WORKLOADS
+    }
     return {"created_utc": "2026-09-14T00:00:00Z",
             "host": {"platform": "test"},
             "zig": {"w1": 1.0, "w2": 2.0},
             "puc": {"w1": 0.5, "w2": 1.0},
             "ratios": {"w1": 2.0, "w2": 2.0},
-            "zig_samples": {"w1": [{"wall": 1.0, "instructions": 10,
-                                    "mode": "mono"}]},
-            "mode_evidence": {"w1": {"centers": {"mono": 10},
-                                     "split_rel_gap": 0.0, "n": 1}}}
+            "zig_samples": zig_samples,
+            "mode_evidence": mode_evidence,
+            "seed_list": pc.SEED_LIST,
+            "protocol": "paired-seed-v1"}
 
 
 SPREADS = {"w1": {"min": 0.9, "max": 1.1, "median": 1.0},
@@ -337,8 +410,8 @@ test_manifest_contract()
 
 
 def test_real_serializer():
-    doc = pc.build_baseline_document(_mk_current(), SPREADS, 7, "0",
-                                    "test-phase", "caller note", prov=INJ_PROV)
+    doc = pc.build_baseline_document(_mk_current(), SPREADS, len(pc.SEED_LIST),
+                                     "0", "test-phase", "caller note", prov=INJ_PROV)
     check("serializer: caller note recorded", doc["baseline_identity"]["note"] == "caller note")
     check("serializer: geomean preserved", doc["geomean"] == 2.0)
     check("serializer: spreads preserved", doc["zig_spread"] == SPREADS)
@@ -383,6 +456,71 @@ def test_real_serializer():
 
 
 test_real_serializer()
+
+
+# ---------------------------------------------------------------------------
+# Task 0: bounded paired-seed schema hardening — the production validator
+# (validate_baseline_document) must reject every incomplete / corrupt
+# protocol declaration and seed population, so such a doc can never
+# replace a valid approved baseline via write_baseline_atomic.
+# ---------------------------------------------------------------------------
+def test_paired_seed_schema():
+    doc = pc.build_baseline_document(_mk_current(), SPREADS,
+                                     len(pc.SEED_LIST), "0", "test-phase",
+                                     "caller note", prov=INJ_PROV)
+    check("schema: valid paired-seed doc accepted",
+          pc.validate_baseline_document(doc))
+
+    def rejects(name, mutate):
+        bad = copy.deepcopy(doc)
+        mutate(bad)
+        check(f"schema: rejects {name}",
+              not pc.validate_baseline_document(bad))
+
+    wl0 = pc.WORKLOADS[0]
+    rejects("missing protocol", lambda d: d.pop("protocol"))
+    rejects("wrong protocol string",
+            lambda d: d.update(protocol="anonymous-v0"))
+    rejects("missing seed_list", lambda d: d.pop("seed_list"))
+    rejects("duplicate seed_list entries",
+            lambda d: d.update(seed_list=[1, 1] + pc.SEED_LIST[2:]))
+    rejects("runs != len(seed_list)",
+            lambda d: d.update(runs=len(pc.SEED_LIST) - 1))
+
+    def _dup_seed(d):
+        d["zig_samples"][wl0][1]["seed"] = d["zig_samples"][wl0][0]["seed"]
+    rejects("zig_samples workload with duplicate seed", _dup_seed)
+    rejects("zig_samples workload missing a seed",
+            lambda d: d["zig_samples"][wl0].pop(0))
+    rejects("row with wall=0",
+            lambda d: d["zig_samples"][wl0][0].update(wall=0))
+    rejects("row with instructions=0",
+            lambda d: d["zig_samples"][wl0][0].update(instructions=0))
+    rejects("row with empty mode",
+            lambda d: d["zig_samples"][wl0][0].update(mode=""))
+    rejects("row with null seed",
+            lambda d: d["zig_samples"][wl0][0].update(seed=None))
+    rejects("mode_evidence missing a workload",
+            lambda d: d["mode_evidence"].pop(wl0))
+    rejects("mode_evidence empty centers",
+            lambda d: d["mode_evidence"][wl0].update(centers={}))
+    rejects("zig_samples missing a workload",
+            lambda d: d["zig_samples"].pop(wl0))
+
+    # build_baseline_document refuses to RECORD inconsistent metadata:
+    # runs != len(seed_list) raises instead of serializing.
+    try:
+        pc.build_baseline_document(_mk_current(), SPREADS,
+                                   len(pc.SEED_LIST) - 1, "0",
+                                   "test-phase", prov=INJ_PROV)
+        raised = False
+    except ValueError:
+        raised = True
+    check("schema: build_baseline_document rejects runs != len(seed_list)",
+          raised)
+
+
+test_paired_seed_schema()
 
 
 

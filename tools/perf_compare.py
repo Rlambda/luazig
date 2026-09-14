@@ -889,6 +889,47 @@ def _p25(walls: list[float]) -> float:
     return xs[min(len(xs) - 1, int(0.25 * len(xs)))]
 
 
+def _paired_seed_schema_reason(rows: list, expected_seeds: list) -> str | None:
+    """Exact paired-seed schema check for one workload's sample rows.
+
+    Returns None when `rows` is a valid paired-seed population — exactly
+    ONE row per seed in `expected_seeds` — or a human-readable reason
+    string otherwise (anonymous rows, null seeds, duplicate / missing /
+    extra seeds).
+
+    Why an exact multiset comparison and not a dict/set comparison: a dict
+    comprehension `{s["seed"]: s for s in rows}` SILENTLY COLLAPSES
+    duplicates, so corrupt sessions like "21 copies of seed 1" or "the
+    same 20 of 21 seeds on both sides" used to look like complete,
+    matching populations and returned a green verdict on incomplete
+    evidence. The paired protocol is bounded by construction — one row per
+    published seed — so anything else is corrupt evidence, not a verdict."""
+    # Anonymous rows (pre-paired schema, no seed key at all) cannot back a
+    # paired verdict — there is no identity to pair on.
+    for s in rows:
+        if "seed" not in s:
+            return "anonymous samples (pre-paired schema; re-record baseline)"
+    seeds = [s["seed"] for s in rows]
+    if any(s is None for s in seeds):
+        return "null seed"
+    counts: dict = {}
+    dupes = []
+    for s in seeds:
+        counts[s] = counts.get(s, 0) + 1
+        if counts[s] == 2:
+            dupes.append(s)
+    if dupes:
+        return f"duplicate seed(s) {sorted(map(str, dupes))[:3]}"
+    exp_set, got_set = set(expected_seeds), set(seeds)
+    missing = exp_set - got_set
+    if missing:
+        return f"missing seed(s) {sorted(map(str, missing))[:3]}"
+    extra = got_set - exp_set
+    if extra:
+        return f"extra seed(s) {sorted(map(str, extra))[:3]}"
+    return None
+
+
 def mode_aware_regression(zig_samples: dict[str, list[dict]],
                           baseline_doc: dict) -> dict:
     """PAIRED-SEED matched regression (owner-approved P16.48-review).
@@ -911,12 +952,27 @@ def mode_aware_regression(zig_samples: dict[str, list[dict]],
     an above-threshold outlier gap without a minimum cluster size ->
     INCONCLUSIVE; FAIL is never erased (verdicts folded after the loop).
 
+    Task 0 (bounded paired-seed schema hardening): for every workload on
+    BOTH sides the seed multiset must be EXACTLY the protocol seed list —
+    one row per seed, no missing, no duplicates, no extras, no null
+    seeds. The expected list is the baseline document's declared
+    seed_list when present, else the published SEED_LIST. Any deviation
+    is corrupt evidence -> INCONCLUSIVE with the reason printed (the old
+    dict/set comparison collapsed duplicates and accepted symmetrically
+    truncated sessions).
+
     Cluster forms, centers and weights (computed FROM LABELS) are
     recorded as artifact evidence; the wall-P25 envelope secondary rule
     (owner-approved) stays: envelope shift > WALL_P25_LIMIT with an
     instruction-OK verdict -> INCONCLUSIVE + causal-counters guidance."""
     base_samples_all = baseline_doc.get("zig_samples", {})
     prev_ident = baseline_doc.get("baseline_identity", {})
+    # Expected protocol seed list: prefer the baseline document's own
+    # declaration (it was recorded under that list); a doc without one
+    # predates the declaration and falls back to the published SEED_LIST.
+    doc_seeds = baseline_doc.get("seed_list")
+    expected_seeds = (doc_seeds if isinstance(doc_seeds, list) and doc_seeds
+                      else SEED_LIST)
     print(f"\nPaired-seed regression check vs {BASELINE} "
           f"(phase: {prev_ident.get('baseline_phase', 'unknown')}):")
     print(f"  {'Workload[seed]':<28} {'base instr':>13} {'cur instr':>13} "
@@ -933,23 +989,19 @@ def mode_aware_regression(zig_samples: dict[str, list[dict]],
                   f"-> INCONCLUSIVE")
             inconclusive = True
             continue
-        base_by_seed = {s["seed"]: s for s in base_rows
-                        if s.get("seed") is not None}
-        cand_by_seed = {s["seed"]: s for s in cand_rows
-                        if s.get("seed") is not None}
-        if not base_by_seed or not cand_by_seed:
-            print(f"  {wl:<28}  anonymous samples (pre-paired schema) "
-                  f"-> INCONCLUSIVE (re-record baseline)")
+        # Exact paired-seed schema on BOTH sides (Task 0): a workload whose
+        # seed population is not exactly one row per expected protocol seed
+        # cannot back a paired verdict — INCONCLUSIVE with the reason.
+        base_reason = _paired_seed_schema_reason(base_rows, expected_seeds)
+        cand_reason = _paired_seed_schema_reason(cand_rows, expected_seeds)
+        if base_reason or cand_reason:
+            side = "baseline" if base_reason else "candidate"
+            print(f"  {wl:<28}  {side}: "
+                  f"{base_reason or cand_reason} -> INCONCLUSIVE")
             inconclusive = True
             continue
-        only_base = set(base_by_seed) - set(cand_by_seed)
-        only_cand = set(cand_by_seed) - set(base_by_seed)
-        if only_base or only_cand:
-            print(f"  {wl:<28}  seed-identity mismatch "
-                  f"(base-only {sorted(only_base)[:3]}, cand-only "
-                  f"{sorted(only_cand)[:3]}) -> INCONCLUSIVE")
-            inconclusive = True
-            continue
+        base_by_seed = {s["seed"]: s for s in base_rows}
+        cand_by_seed = {s["seed"]: s for s in cand_rows}
         # Independent cluster evidence (recorded; also a fail-safe guard).
         base_ev = classify_modes(base_rows)
         cand_ev = classify_modes(cand_rows)
@@ -1088,11 +1140,24 @@ def noise_annotation(old: float, current: float,
 # ---------------------------------------------------------------------------
 
 def build_baseline_document(current: dict, spreads: dict, runs: int, core: str,
-                           baseline_phase: str, note=None, prov=None) -> dict:
+                            baseline_phase: str, note=None, prov=None) -> dict:
     """Assemble the complete reviewable baseline document.
 
     `prov` overrides the default provenance.block() result (tests inject
-    deterministic hashes without touching live binaries)."""
+    deterministic hashes without touching live binaries).
+
+    Task 0: the recorded seed_list/runs metadata must MATCH EXECUTION —
+    the paired-seed protocol records exactly one sample per published
+    seed, so `runs` must equal len(seed_list). A disagreement is a
+    recording bug (a partial or padded session posing as complete) and
+    raises instead of serializing an inconsistent baseline."""
+    seed_list = list(current.get("seed_list") or SEED_LIST)
+    if runs != len(seed_list):
+        raise ValueError(
+            f"build_baseline_document: runs ({runs}) != len(seed_list) "
+            f"({len(seed_list)}); the paired-seed protocol records exactly "
+            f"one sample per published seed — record with the default "
+            f"--runs {len(SEED_LIST)}")
     ratios = current.get("ratios", {})
     geomean = (math.exp(sum(math.log(r) for r in ratios.values()) / len(ratios))
                if ratios else 0.0)
@@ -1115,7 +1180,7 @@ def build_baseline_document(current: dict, spreads: dict, runs: int, core: str,
         # never against mode-blind scalar medians.
         "zig_samples": current.get("zig_samples", {}),
         "mode_evidence": current.get("mode_evidence", {}),
-        "seed_list": current.get("seed_list", SEED_LIST),
+        "seed_list": seed_list,
         "protocol": current.get("protocol", "paired-seed-v1"),
         "baseline_identity": {
             "baseline_phase": baseline_phase,
@@ -1129,7 +1194,21 @@ def build_baseline_document(current: dict, spreads: dict, runs: int, core: str,
 
 
 def validate_baseline_document(doc: dict) -> bool:
-    """Strict schema check for a serialized baseline document."""
+    """Strict schema check for a serialized baseline document.
+
+    Task 0 (bounded paired-seed schema hardening): beyond the required
+    sections, a baseline must declare the paired-seed protocol it was
+    recorded under, and its zig_samples must be COMPLETE, exact
+    paired-seed populations — for EVERY workload one row per declared
+    seed (no dupes/missing/extras), every row carrying a positive numeric
+    wall, a positive int instructions count and a non-empty mode label,
+    with mode_evidence covering every sampled workload. A partial,
+    duplicated or anonymous seed population cannot back a paired verdict
+    and must never replace a valid approved baseline.
+
+    The seed_list values are NOT hardcoded to 1..21 (the published list
+    may legitimately evolve) — but it must be a list of UNIQUE positive
+    ints with at least 2 entries, and runs must equal its length."""
     required = ("provenance", "geomean", "zig", "puc", "ratios",
                 "zig_spread", "baseline_identity", "created_utc",
                 "host", "runs", "core",
@@ -1142,6 +1221,59 @@ def validate_baseline_document(doc: dict) -> bool:
     ident = doc["baseline_identity"]
     if not isinstance(ident, dict) or not ident.get("baseline_phase"):
         return False
+    # Paired-seed protocol declaration.
+    if doc.get("protocol") != "paired-seed-v1":
+        return False
+    seed_list = doc.get("seed_list")
+    if (not isinstance(seed_list, list) or len(seed_list) < 2
+            or not all(isinstance(s, int) and not isinstance(s, bool)
+                       and s > 0 for s in seed_list)
+            or len(set(seed_list)) != len(seed_list)):
+        return False
+    if doc["runs"] != len(seed_list):
+        return False
+    # Complete, exact paired-seed populations for every workload.
+    zig_samples = doc["zig_samples"]
+    if not isinstance(zig_samples, dict) or not zig_samples:
+        return False
+    if not set(WORKLOADS) <= set(zig_samples):
+        return False
+    expected = sorted(seed_list)
+    mode_evidence = doc["mode_evidence"]
+    if not isinstance(mode_evidence, dict):
+        return False
+    for wl, rows in zig_samples.items():
+        if not isinstance(rows, list) or not rows:
+            return False
+        seeds = []
+        for r in rows:
+            if not isinstance(r, dict):
+                return False
+            wall = r.get("wall")
+            if (not isinstance(wall, (int, float))
+                    or isinstance(wall, bool) or wall <= 0):
+                return False
+            instr = r.get("instructions")
+            if (not isinstance(instr, int) or isinstance(instr, bool)
+                    or instr <= 0):
+                return False
+            mode = r.get("mode")
+            if not isinstance(mode, str) or not mode:
+                return False
+            if "seed" not in r:
+                return False
+            seeds.append(r["seed"])
+        # Exact multiset equality: one row per declared seed — sorted()
+        # comparison catches duplicates, missing and extra seeds alike.
+        if not all(isinstance(s, int) and not isinstance(s, bool)
+                   and s > 0 for s in seeds):
+            return False
+        if sorted(seeds) != expected:
+            return False
+        ev = mode_evidence.get(wl)
+        if not isinstance(ev, dict) or not isinstance(ev.get("centers"), dict) \
+                or not ev["centers"]:
+            return False
     return True
 
 
@@ -1276,6 +1408,21 @@ def main() -> int:
         ap.error("--runs must be >= 1")
     if args.counters_runs < 1:
         ap.error("--counters-runs must be >= 1")
+
+    # Task 0: the paired-seed gate verdict AND --update-baseline must run
+    # EXACTLY one sample per published protocol seed — a custom --runs
+    # would record or compare a partial seed population (silently
+    # uncomparable paired evidence). The snapshot/counters lanes are
+    # unaffected: they never reach the paired-seed verdict and use their
+    # own run counts.
+    if (not args.snapshot_out and not args.counters
+            and args.runs != len(SEED_LIST)):
+        print(f"error: --runs must be {len(SEED_LIST)} (= len(SEED_LIST)) "
+              f"for the paired-seed gate and --update-baseline; the "
+              f"protocol runs exactly one sample per published seed. "
+              f"Use the default (--runs {DEFAULT_RUNS}).",
+              file=sys.stderr)
+        return 2
 
     if not args.no_build:
         build_all()

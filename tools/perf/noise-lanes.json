@@ -1,5 +1,4 @@
 {
- "created_utc": "2026-09-10T12:00:00Z",
  "phase": "P16.45-correction (supersedes both earlier noise-lanes.json versions)",
  "subject": "global_arith instruction bimodality \u2014 canonical-workload seed experiment with measured structural observables",
  "provenance": {
@@ -212,32 +211,6 @@
    "mode": "low"
   }
  ],
- "determinism_recheck": [
-  {
-   "seed": 1,
-   "rep1_instructions": 13997944963,
-   "rep2_instructions": 13997944391,
-   "env_node": "depth=1 len=2 both reps"
-  },
-  {
-   "seed": 42,
-   "rep1_instructions": 12583947165,
-   "rep2_instructions": 12583947253,
-   "env_node": "depth=0 len=1 both reps"
-  },
-  {
-   "seed": 3,
-   "rep1_instructions": 13997943159,
-   "rep2_instructions": 13997943347,
-   "env_node": "depth=1 len=3 both reps"
-  },
-  {
-   "seed": 12345,
-   "rep1_instructions": 12583944766,
-   "rep2_instructions": 12583944877,
-   "env_node": "depth=0 len=1 both reps"
-  }
- ],
  "puc_control_same_session": {
   "command": "taskset -c 0 perf stat -e instructions:u ./build/lua-c/lua tools/microbench.lua global_arith",
   "runs_instructions": [
@@ -252,14 +225,14 @@
   "observable": "the _ENV table's Node chain AT THE MAIN POSITION of the hot global's name key ('g_count'): env_node_depth (0 = alone at main position; 1 = displaced behind a colliding key) and env_node_chain_len (nodes reachable from that main position)",
   "result": "ALL 8 low-mode seeds have env_node_depth=0/chain_len=1; ALL 7 high-mode seeds have env_node_depth=1/chain_len>=2. Exact separation, zero exceptions, reproducible across repeated runs of the same seed.",
   "intern_chain_negative_result": "The intern-table chain depth of 'g_count' itself is 0 in BOTH modes (measured) \u2014 the intern-chain hypothesis from the earlier artifact version is DISPROVEN as the separating mechanism and is not claimed.",
-  "branch_corroboration": "low mode executes 1920563068 branches (median); high mode 2526563157 \u2014 a delta of 606000088.5 = 50M x 12.120 branches/iteration (median-derived; the earlier 645M/12.9 prose was arithmetically WRONG and is corrected by tools/validate_noise_lanes.py)."
+  "branch_corroboration": "Low/high branch medians differ; the delta and per-iteration values are exactly mechanical_summary.delta_branches and mechanical_summary.delta_branches_per_iteration (recomputed by tools/validate_noise_lanes.py; the earlier hand-written branch-delta prose was arithmetically wrong and is corrected mechanically)."
  },
  "conclusion_bounded": {
-  "proven": "On the CANONICAL microbench workload (byte-identical file + args + setup), the VM hash seed deterministically selects one of two instruction modes (12,583,94x vs 13,997,94x, instruction-median delta = 1413999731.5 = 50M x 28.2800 instr/iter), and the modes are EXACTLY separated by the measured _ENV-node placement of the hot global's key (main-position occupancy).",
-  "inferred_not_disassembled": "The instruction-level attribution of the exact 28-instr/iter delta to the extra chain-node visit in the GETTABUP/SETTABUP table-get path is CONSISTENT with the measured branch delta (+12.9 branches/iter) and the node facts, but was not verified instruction-by-instruction by disassembly.",
+  "proven": "On the CANONICAL microbench workload (byte-identical file + args + setup), the VM hash seed deterministically selects one of two instruction modes (per-seed placement observables separate them 15/15; the mode medians and their instruction/branch deltas are exactly the fields of mechanical_summary, recomputed by tools/validate_noise_lanes.py).",
+  "inferred_not_disassembled": "The instruction-level attribution of the per-iteration instruction delta (mechanical_summary.delta_instructions_per_iteration) to the extra chain-node visit in the GETTABUP/SETTABUP table-get path is CONSISTENT with the measured per-iteration branch delta (mechanical_summary.delta_branches_per_iteration) \u2014 see mechanical_summary for the exact numbers; they are recomputed by tools/validate_noise_lanes.py, not restated by hand here.",
   "not_claimed": "No claim about workloads other than global_arith; no claim that the intern-string table chain is the mechanism (disproven above); no wall-time causality (wall is dominated by scheduling; see seed 55 wall outlier)."
  },
- "gate_implication": "Any cross-process wall/instruction comparison of global_arith samples one of two seed-controlled modes. The fail-safe gate prints the NOISE? diagnostic but preserves threshold verdicts. Baselines record multi-run medians (mode blends); single-mode sampling is FORBIDDEN (documented in baseline-approved.json baseline_identity).",
+ "gate_implication": "Any cross-process wall/instruction comparison of global_arith samples one of two seed-controlled modes. The fail-safe gate prints the NOISE? diagnostic but preserves threshold verdicts. Baselines record multi-run medians: a median of N bimodal samples SELECTS the mode containing the middle order statistic \u2014 it does not merge modes; sessions sampling the other mode FAIL with a visible NOISE? (documented in baseline-approved.json baseline_identity).",
  "mechanical_summary": {
   "low_count": 8,
   "high_count": 7,
@@ -302,5 +275,72 @@
    }
   ],
   "note": "Process-total perf stat counts include ~160k instructions of startup jitter (0.001% of the mode totals) \u2014 the placement observables and the mode assignment reproduce exactly."
- }
+ },
+ "raw_evidence": {
+  "recorded_utc": "2026-09-13T16:29:13Z",
+  "recorded_by_commit": "56ef121bfddcdfa25ee47e9a45546048f3f06311",
+  "note": "Raw runs and the original mechanical measurements were recorded during the P16.45 session that landed in commit 56ef121 (2026-09-13T19:29:13+03:00). The previous top-level created_utc (hand-set to 2026-09-10T12:00:00Z) was not a credible clock value and is replaced by this commit-anchored timestamp; the raw session is NOT relabeled with a newer date."
+ },
+ "legacy_determinism_note": {
+  "status": "quoted history \u2014 not validated by tools/validate_noise_lanes.py",
+  "original_rows": [
+   {
+    "seed": 1,
+    "rep1_instructions": 13997944963,
+    "rep2_instructions": 13997944391,
+    "env_node": "depth=1 len=2 both reps"
+   },
+   {
+    "seed": 42,
+    "rep1_instructions": 12583947165,
+    "rep2_instructions": 12583947253,
+    "env_node": "depth=0 len=1 both reps"
+   },
+   {
+    "seed": 3,
+    "rep1_instructions": 13997943159,
+    "rep2_instructions": 13997943347,
+    "env_node": "depth=1 len=3 both reps"
+   },
+   {
+    "seed": 12345,
+    "rep1_instructions": 12583944766,
+    "rep2_instructions": 12583944877,
+    "env_node": "depth=0 len=1 both reps"
+   }
+  ],
+  "note": "Pre-P16.46 determinism rows: per-repeat env observables recorded only as a string, intern depth not recorded. Preserved verbatim; superseded by the structured determinism_recheck schema."
+ },
+ "determinism_recheck": [
+  {
+   "seed": 1,
+   "source": "P16.45-finalization C-verification (commit C=7d97e5a)",
+   "harness_sha256": "8a7393868c1fc962417748205f318afd2a2f68deb02ba7f8a4e807871b87c0e4",
+   "measured_via": "taskset -c 0 perf stat -e instructions:u (process total)",
+   "repeats": [
+    {
+     "instructions": 13997783862,
+     "mode": "high",
+     "env_node_depth": 1,
+     "env_node_chain_len": 2,
+     "intern_depth": 0
+    }
+   ]
+  },
+  {
+   "seed": 8,
+   "source": "P16.45-finalization C-verification (commit C=7d97e5a)",
+   "harness_sha256": "8a7393868c1fc962417748205f318afd2a2f68deb02ba7f8a4e807871b87c0e4",
+   "measured_via": "taskset -c 0 perf stat -e instructions:u (process total)",
+   "repeats": [
+    {
+     "instructions": 12583783630,
+     "mode": "low",
+     "env_node_depth": 0,
+     "env_node_chain_len": 1,
+     "intern_depth": 0
+    }
+   ]
+  }
+ ]
 }

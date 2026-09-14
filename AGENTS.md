@@ -196,9 +196,12 @@
 
 В репозитории поддерживаются два perf-инструмента (остальные удалены как дублирующие):
 
-- **`python3 tools/perf_compare.py`** — основной gate: 16 микро-бенчмарков
+- **`python3 tools/perf_compare.py`** — основной gate: 18 микро-бенчмарков
   (`tools/microbench.lua`), median-of-7, pinned CPU core, geomean Zig/PUC ratio,
-  regression check vs `tools/perf/baseline-p15.37.json`.
+  regression check vs `tools/perf/baseline-approved.json`
+  (approved regression baseline; обновляется ТОЛЬКО явной операцией
+  `--update-baseline`; историческое измерение P15.37 сохранено неизменным в
+  `baseline-p15.37.json` и гейтом не читается).
   - Флаги: `--update-baseline`, `--perf` (perf stat), `--runs N`, `--no-build`.
   - WARN при +5%, FAIL при +10% от baseline.
 
@@ -207,14 +210,17 @@
   - Guard: `python3 tools/perf_guard_core.py --baseline ... --current ...`.
 
 Все perf-скрипты сами собирают ReleaseFast + `make lua-c`, если не передан `--no-build`.
-Baselines живут в `tools/perf/` (только `baseline-p15.37.json` и `core_baseline.json`).
+Baselines живут в `tools/perf/`: gate-baseline — `baseline-approved.json`
+(обновление — только через `--update-baseline`), исторический снапшот
+P15.37 — `baseline-p15.37.json` (не изменяется), end-to-end baseline —
+`core_baseline.json`. Другие baseline-файлы не добавляются.
 
 ### Интерпретация результатов perf_compare.py
 
 - Колонка **Zig/PUC** — это **мультипликатор времени**: `zig_time / puc_time`.
   Например, `2.78x` означает, что luazig в 2.78 раза **медленнее** PUC Lua.
 - **Меньше — лучше.** Цель: приблизиться к `1.0x`.
-- Geomean по 16 workload'ам — основная метрика. Актуальный geomean см. в
+- Geomean по 18 workload'ам — основная метрика. Актуальный geomean см. в
   status-блоке README (генерируется tools/status_summary.py).
 - Regression check сравнивает с baseline: отрицательный delta (например `-9.2%`)
   — **улучшение** (стало быстрее), положительный delta (например `+5.1%`) —

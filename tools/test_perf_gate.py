@@ -166,6 +166,21 @@ check("negative: P16.44 shape false-greens", f_old is False,
       "old aggregation returned fail=False with a real FAIL lane")
 
 # ---------------------------------------------------------------------------
+# P16.46: policy contract — the gate must open the baseline the (owner-
+# amended) AGENTS.md perf section names, and the workload count must be the
+# owner-decided 18. These asserts tie code to policy so a silent path/count
+# change fails the suite.
+# ---------------------------------------------------------------------------
+def test_policy_contract():
+    check("policy: gate baseline is baseline-approved.json",
+          pc.BASELINE.name == "baseline-approved.json")
+    check("policy: workload count is 18", len(pc.WORKLOADS) == 18)
+
+
+test_policy_contract()
+
+
+# ---------------------------------------------------------------------------
 # P16.45-finalization BLOCKER 4: test the REAL production serializer
 # (build_baseline_document / validate_baseline_document /
 # write_baseline_atomic — the same helpers the CLI --update-baseline path
@@ -216,14 +231,15 @@ def test_real_serializer():
               ok is False and after.get("geomean") == 2.0)
 
         # validate_baseline_document rejects each missing section.
+        all_rejected = True
         for missing in ("provenance", "geomean", "zig", "ratios",
                         "zig_spread", "baseline_identity"):
             bad2 = copy.deepcopy(doc)
             del bad2[missing]
-            if not pc.validate_baseline_document(bad2):
-                continue
-            check(f"serializer: validate rejects missing {missing}", False)
-        check("serializer: validate rejects every missing section", True)
+            if pc.validate_baseline_document(bad2):
+                all_rejected = False
+                check(f"serializer: validate rejects missing {missing}", False)
+        check("serializer: validate rejects every missing section", all_rejected)
         empty_ident = copy.deepcopy(doc)
         empty_ident["baseline_identity"] = {"baseline_phase": ""}
         check("serializer: validate rejects empty phase",

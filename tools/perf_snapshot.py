@@ -11,7 +11,7 @@ in tools/perf/:
   current-profile-index.json — top-N symbols (by cycles%) for 8 hotspot workloads
 
 These are the reproducible artifacts that roadmap decisions cite. They are
-SEPARATE from the regression baseline (baseline-p15.37.json).
+SEPARATE from the regression baseline (baseline-approved.json).
 
 Usage:
   perf_snapshot.py                    # timing 5, counters 2 (recommended)

@@ -23,7 +23,8 @@ python3 tools/perf_snapshot.py --regenerate-docs  # also update README + STATUS
 
 | File | Purpose |
 |------|---------|
-| `baseline-p15.37.json` | Regression gate baseline — `perf_compare.py` compares current zig times vs this and WARNs/FAILs at +5%/+10%. NOT a snapshot; updated only via `--update-baseline`. |
+| `baseline-approved.json` | Regression gate baseline — `perf_compare.py` compares current zig times vs this and WARNs/FAILs at +5%/+10%. NOT a snapshot; updated only via the explicit `--update-baseline` operation (atomic, reload-validated). |
+| `baseline-p15.37.json` | Historical P15.37 measurement, preserved immutably; NOT read by the gate. |
 | `core_baseline.json` | End-to-end upstream-suite timing baseline for `perf_core_snapshot.py` / `perf_guard_core.py`. |
 
 The snapshot and the baseline serve **different purposes** and must not be

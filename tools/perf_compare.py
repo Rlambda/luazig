@@ -1304,7 +1304,8 @@ def main() -> int:
         mode_evidence[wl] = {"centers": ev["centers"],
                              "split_rel_gap": ev["split_rel_gap"], "n": ev["n"]}
         zig_samples_labeled[wl] = [
-            {"wall": s["wall"], "instructions": s["instructions"], "mode": lab}
+            {"wall": s["wall"], "instructions": s["instructions"],
+             "mode": lab, "seed": s.get("seed")}
             for s, lab in zip(rows, ev["labels"])]
 
     # PUC: wall-only populations for the scalar ratio diagnostic.

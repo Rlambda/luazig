@@ -1,27 +1,27 @@
 {
   "meta": {
-    "created_utc": "2026-09-13T21:36:14.357030+00:00",
+    "created_utc": "2026-09-14T19:16:36.135490+00:00",
     "lane": "smoke_compare",
     "argv": [
       "/home/boss/codes/luazig/tools/smoke_compare.py",
       "--json-out",
-      "/home/boss/codes/luazig/tools/status/.tmp.smoke.xihv7gmp.json"
+      "/home/boss/codes/luazig/tools/status/.tmp.smoke.sv87ctz7.json"
     ],
     "zig_version": "0.16.0"
   },
   "provenance": {
-    "git_head": "7d97e5a",
-    "measured_source_head": "7d97e5a",
+    "git_head": "7af60be",
+    "measured_source_head": "7af60be",
     "git_dirty": "dirty",
     "source_dirty": "clean",
     "artifact_dirty": "dirty",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "071ffa77f160646e",
+    "zig_binary_sha16": "da3d6316dfd6d320",
     "puc_binary_sha16": "d54bc45e1757b216"
   },
-  "total": 83,
-  "ok": 83,
+  "total": 84,
+  "ok": 84,
   "mismatches": 0,
   "results": [
     {
@@ -354,6 +354,10 @@
     },
     {
       "file": "tests/smoke/84_gc_builtin_rooting.lua",
+      "match": true
+    },
+    {
+      "file": "tests/smoke/85_selfref_upvalue_gc.lua",
       "match": true
     }
   ]

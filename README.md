@@ -24,7 +24,7 @@ The project is in a **pre-release / parity-focused** state.
 |--------|--------|
 | Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
-| Smoke tests (`tests/smoke/*.lua`) | **83/83** match (byte-identical stdout+stderr+exit) |
+| Smoke tests (`tests/smoke/*.lua`) | **84/84** match (byte-identical stdout+stderr+exit) |
 | C API suites (`tests/c_api`) | 23 suites (gate: `make -C tests/c_api test`) |
 
 Regression lane: `python3 tools/testes_matrix.py --testc` (no `_port`/`_soft` prelude overrides).
@@ -36,23 +36,23 @@ Method: paired-seed protocol — 21 published seeds per workload per session (`L
 
 | Workload | Zig/PUC |
 |----------|--------:|
-| metamethod_call_noalloc | 1.86x |
-| array_access | 1.77x |
-| global_arith | 1.72x |
+| metamethod_call_noalloc | 1.87x |
+| array_access | 1.76x |
 | field_access | 1.70x |
-| hash_access | 1.65x |
+| global_arith | 1.65x |
 | branch_loop | 1.62x |
-| dynamic_load | 1.53x |
-| coroutine_yield | 1.48x |
-| comparisons | 1.43x |
+| hash_access | 1.61x |
+| dynamic_load | 1.55x |
+| coroutine_yield | 1.49x |
+| metamethod_add | 1.46x |
 | mixed_arith | 1.42x |
-| metamethod_add | 1.41x |
-| lua_calls | 1.38x |
-| int_arith | 1.35x |
-| float_arith | 1.33x |
-| table_alloc_setmetatable | 1.23x |
-| string_loop | 1.17x |
-| temp_table_alloc | 1.11x |
+| comparisons | 1.41x |
+| lua_calls | 1.37x |
+| int_arith | 1.34x |
+| float_arith | 1.30x |
+| table_alloc_setmetatable | 1.27x |
+| string_loop | 1.16x |
+| temp_table_alloc | 1.13x |
 | string_concat | 1.07x |
 <!-- END GENERATED STATUS -->
 

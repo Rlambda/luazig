@@ -1,4 +1,4 @@
-> Last updated: 2026-09-14 (P16.49-review correction OPEN: transactional GC rollback + Task 0; P16.49 COMPLETE: gc.lua SIGSEGV устранён PUC-faithful unlink (root cause доказан first-illegal-op дискриминатором); 415/415 валидационных прогонов; полная батарея зелёная; Task 0 paired-schema hardening; P16.48-review correction COMPLETE: deterministic gc.lua SIGSEGV root-cause fix + Task 0 paired-schema hardening; P16.48-review correction COMPLETE: paired-seed идентифицируемость gate; manifest schema; mandatory verdict OK; gc.lua SIGSEGV получил детерминированный reproducer + backtrace — следующий semantic blocker: paired-seed идентифицируемость + manifest/schema; P16.48 COMPLETE: три false-green формы gate закрыты независимой кластеризацией + weight/outlier-проверками + wall-P25 secondary rule; manifest multi-session; 3/3+official OK; SIGSEGV-план подготовлен; P16.47 COMPLETE: обязательный perf gate воспроизводимо зелёный 5/5 (matched-mode по causal instructions:u, wall=диагностика); запрещённый policy guard удалён; P16.46 COMPLETE (correctness-green; обязательный perf gate = FAIL по global_arith — задокументированный bimodal mode flip, см. запись фазы): perf-контракт AGENTS↔код согласован по решению владельца; determinism_recheck структурный с независимым валидатором + негативная матрица; prose truth исправлена) — двухкоммитная дисциплина C/D: один immutable measured-source коммит C (7d97e5a) + artifact-wrapper D; все канонические артефакты перегенерированы с provenance = точный C; арифметика noise-сводок механически валидируется; layout-проба реально перестроена)
+> Last updated: 2026-09-14 (P16.49-review)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -34,16 +34,16 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Upstream matrix (`testes/*.lua`, `--testc`) | **31/32** pass (exit code parity) |
 | Matrix non-pass | both_fail: big.lua |
 | Differential output (`--diff`) | **0 output_diff** |
-| Smoke tests (`tests/smoke/*.lua`) | **83/83** pass |
+| Smoke tests (`tests/smoke/*.lua`) | **84/84** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.40x** |
+| Performance (geomean vs PUC) | **1.44x** |
 
-Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-14)
 
-- [ ] **P16.49-review correction (owner-instructed)**: transactional GC rollback + Task 0 review fixes — (a) BLOCKER: rollback-пути (createBytecodeChunkClosure/closureFromProto) зовут gcUnregisterObject, который удаляет ТОЛЬКО из gc_objects, тогда как gcRegisterObject в generational minor phase регистрирует и в gc_young_objects → freed объекты остаются dangling в young list → следующий young sweep разыменовывает/double-free; нужен общий PUC-explainable ownership контракт для ВСЕХ secondary registries (young/old1/gen_threads/gray/grayagain/weak/finalizer/accounting), инвентаризация всех gcRegisterObject→fallible→rollback цепочек (Table/Closure/Thread/String/Cell/Userdata), failing FailingAllocator-регрессия в generational minor phase со снапшотами содержимого secondary registries + young collection после каждого fail index (DebugAllocator ловит dangling/double-free), invariant-хелпер (каждый entry каждого registry — живой объект верного типа; rollback восстанавливает byte-exact pre-call state), сравнение с PUC luaC_newobj/allgc unlink ownership; (b) Task 0: hardened validate_baseline_document (точный опубликованный SEED_LIST для paired-seed-v1, finite wall, пересчёт classify_modes + согласованность labels/mode_evidence, строгий validator в gate path → INCONCLUSIVE с причиной, harden _paired_seed_schema_reason против non-dict/unhashable/wrong-type rows) + negative fixtures; (c) provenance drift: перегенерация ВСЕХ canonical current-* на одном final measured-source/binary (smoke=85 файлов), STATUS methodology строки (~83) — актуальный paired-seed gate, P16.49 perf prose — per-seed extrema −2.685%..+2.956% (не ±0.6%); (d) focused тест 85: assert успешный resume + suspended status в обеих ветках.
+- [x] **P16.49-review correction (owner-instructed)**: transactional GC rollback + Task 0 review fixes — (a) BLOCKER: rollback-пути (createBytecodeChunkClosure/closureFromProto) зовут gcUnregisterObject, который удаляет ТОЛЬКО из gc_objects, тогда как gcRegisterObject в generational minor phase регистрирует и в gc_young_objects → freed объекты остаются dangling в young list → следующий young sweep разыменовывает/double-free; нужен общий PUC-explainable ownership контракт для ВСЕХ secondary registries (young/old1/gen_threads/gray/grayagain/weak/finalizer/accounting), инвентаризация всех gcRegisterObject→fallible→rollback цепочек (Table/Closure/Thread/String/Cell/Userdata), failing FailingAllocator-регрессия в generational minor phase со снапшотами содержимого secondary registries + young collection после каждого fail index (DebugAllocator ловит dangling/double-free), invariant-хелпер (каждый entry каждого registry — живой объект верного типа; rollback восстанавливает byte-exact pre-call state), сравнение с PUC luaC_newobj/allgc unlink ownership; (b) Task 0: hardened validate_baseline_document (точный опубликованный SEED_LIST для paired-seed-v1, finite wall, пересчёт classify_modes + согласованность labels/mode_evidence, строгий validator в gate path → INCONCLUSIVE с причиной, harden _paired_seed_schema_reason против non-dict/unhashable/wrong-type rows) + negative fixtures; (c) provenance drift: перегенерация ВСЕХ canonical current-* на одном final measured-source/binary (smoke=85 файлов), STATUS methodology строки (~83) — актуальный paired-seed gate, P16.49 perf prose — per-seed extrema −2.685%..+2.956% (не ±0.6%); (d) focused тест 85: assert успешный resume + suspended status в обеих ветках.
 
 
 - [x] **P16.49 (owner-instructed)**: устранить deterministic gc.lua SIGSEGV (self-referenced-thread allocator corruption) + Task 0 paired-seed schema hardening — (a) Task 0 (tools-only, до runtime): ровно один row на каждый seed из опубликованного списка для каждого workload (без пропусков/дубликатов/extras/null — dict-comprehension больше не скрывает duplicate evidence), validate_baseline_document проверяет protocol/seed_list/runs==len(seed_list)/per-workload seed identities/типы/wall>0/instructions>0/mode-evidence согласованность, --runs N для verdict/baseline — только exact published N=21 (metadata обязана совпадать с исполнением); (b) BLOCKER: сохранить immutable crashing binary ДО любых rebuild; точный reproducer contract (cwd testes, относительный argv[0], env только PADVAR=256×'x', --vm=bc gc.lua); свежий symbolized backtrace + registers + fault address + size class; Debug/ReleaseSafe/sanitizer; LUAZIG_TRACK_ALLOC/C_ALLOC только как A/B; временный allocation ledger/guard size-class'а (default-off); инвентаризация всех объектов size class (Cell=40 И Closure=40 — один class!); сузить upstream window бинарным поиском; сравнить с PUC luaE_freethread/luaF_close/lgc sweep order (особенно текущий teardown порядок freeThreadBytecodeFrames ДО closeThreadOpenUpvalues); критерий — первая доказанная незаконная операция + PUC-faithful ownership invariant, не просто 100 зелёных запусков; negative validation старой ветки; permanent focused reproducer после root cause; без special-case по gc.lua/строке/self-reference/PADVAR/seed/имени функции.
@@ -7101,6 +7101,75 @@ freed objects из gc_young_objects — double-free класс, OOM-only;
 задокументирован, вне этого crash'а); big.lua both_fail (pre-existing,
 оба движка); historical self-referenced-threads падения (4/24, 2/8)
 объяснены env-layout зависимостью воспроизводимости.
+
+### P16.49-review correction: transactional GC rollback + Task 0 (2026-09-14)
+
+Correction-фаза по owner-ledger item (открыт ca06215; open-count 21→22→
+закрыт→21). Коммиты: C = 7af60bed → D = wrapper (только артефакты/доки;
+scope-проверка: git diff C..D по src/build.zig/tests/tools-*.py пуст).
+
+- **BLOCKER — dangling в gc_young_objects закрыт общим контрактом**:
+  split API (gcUnregisterObjectSweep — только gc_objects, вызывающий
+  sweep владеет компакцией; gcUnregisterObjectRollback — дополнительно
+  ORDER-PRESERVING удаление из young list: post-snapshot хвост обязан
+  оставаться после snapshot-региона, swapRemove запрещён); восстановлен
+  PUC-инвариант «объект никогда не освобождён пока linked в registry,
+  членом которого является» (PUC достигает его структурно: один
+  intrusive allgc, unlink=free, lgc.c:1172-1213). Sibling-хазард закрыт:
+  gcSweepYoungObjects теперь allocation-free (pre-reserve по snapshot
+  ДО первого free; провал reserve — до любых освобождений) — раньше OOM
+  в promote mid-sweep оставлял freed-объекты в нескомпактированном
+  списке (тот же класс). .old0-arm gcPromoteYoungObject больше не
+  дублирует gc_old1-append и double-charge gc_gen_added_old_kb
+  (forward-barrier уже сделал оба — дубли искажали minor→major pacing).
+- **Смежный production-дефект (leak-класс) найден тестом и закрыт**:
+  register-failure ownership — gcRegisterCell сам fallible (рост young
+  list в generational-minor аллоцирует), cell ещё не в n_cells →
+  phase-errdefer пропускал его; оба конструктора уничтожают cell на
+  месте при провале регистрации. Триггер существует только в
+  generational-режиме — P16.44-тесты (incremental) не могли его поймать.
+- **Регрессии**: 'generational rollback keeps every GC registry exact'
+  (FailingAllocator: byte-exact young-восстановление включая порядок +
+  gcMinorCollection-проба после каждого fail index + success edge);
+  'secondary registry invariants' (каждый entry young/old1/gen_threads
+  резолвится в живой зарегистрированный объект, 8 раундов minor cycles);
+  helper gcCheckSecondaryRegistryInvariants. **Negative validation**
+  (throwaway-копия со старым поведением): новый тест ЛОВИТ дефект —
+  'expected 0, found 1' на byte-exact young-assertion. Unit D/RF
+  222/222, 0 leaks.
+- **Инвентаризация registration→rollback**: production rollback-sites —
+  только оба transactional-конструктора (+ тестовые teardown, переведён
+  на Rollback-вариант); leak-only OOM-класс задокументирован вне
+  минимального scope (opClosure errdefer-отсутствие, lua_newthread/
+  registerfuncs catch{}-проглатывание, internStr pre-register intern,
+  allocTable/allocUserdata register-failure) — кандидаты отдельной фазы.
+  Secondary registries проверены: young — единственный с dangling-риском
+  из rollback; old1/grayagain/gen_threads для rollback-объектов
+  недостижимы (age .new, барьеры требуют old-owner); latent minor2inc
+  stale-entries (inert, очищаются при re-entry) задокументированы.
+- **Task 0**: hardened validate_baseline_document (точный опубликованный
+  SEED_LIST для paired-seed-v1; finite wall/instructions; пересчёт
+  classify_modes со сверкой labels/centers/n/split_rel_gap) + строгий
+  validator в gate path (повреждённый baseline → INCONCLUSIVE rc=2 с
+  причиной, не traceback) + hardened _paired_seed_schema_reason
+  (non-dict/unhashable/wrong-type → INCONCLUSIVE); +16 schema-фикстур,
+  M23-M26; тест 85 hardened (assert resume/suspended в обеих ветках).
+- **Provenance drift устранён**: ВСЕ canonical current-* перегенерированы
+  на одном final source 7af60bed / binary da3d6316… (counters, codesize
+  .text 2590425, layout CallFrame 88/u@32, differential-profile,
+  dispatch-floor, matrix, smoke — фактически 84 файла; счёт «85» в
+  ревью был неточен, зафиксировано честно); STATUS methodology-строки
+  актуализированы (paired-seed gate, baseline-approved.json); P16.49
+  prose исправлен (per-seed extrema −2.685%..+2.956%).
+- **Perf**: correctness-фикс causally сдвинул instruction counts →
+  baseline перезаписан owner-approved классом (P16.49-review, geomean
+  1.43133, note объясняет причинность); объявленная сессия (ровно одна):
+  RESULT: OK (rc=0), все 18 workloads × 21 seeds.
+- **Батарея**: fmt 0; unit D/RF 0; selftests ALL OK (86); noise + 7
+  негативных rc=0; smoke 84/84 plain + 84/84 реальным --testc; matrix
+  zig_fail=0/both_fail=1 (big.lua); c_api + DIFF: PASS; api580 GREEN;
+  gc.lua outputs match; exact-contract crash loop 20/20 rc=0;
+  diff --check 0.
 
 ## История закрытых фаз
 

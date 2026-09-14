@@ -1,13 +1,13 @@
 {
-  "created_utc": "2026-09-13T21:34:29.697490+00:00",
+  "created_utc": "2026-09-14T19:15:16.269810+00:00",
   "provenance": {
-    "git_head": "7d97e5a",
-    "measured_source_head": "7d97e5a",
+    "git_head": "7af60bed0450c57895bc6663a99a6a6d5bae262e",
+    "measured_source_head": "7af60bed0450c57895bc6663a99a6a6d5bae262e",
     "source_dirty": "clean",
-    "zig_binary_sha256": "071ffa77f160646ef345902121cfb36849749098bf800636c389ca8c1270d9ae",
-    "note": "P16.45-finalization regeneration from clean measured-source commit C (7d97e5a); artifact wrapper commit D follows. Binary verified identical to /tmp/opencode/C_luazig_imm."
+    "zig_binary_sha256": "da3d6316dfd6d3205dc90dee8039afd7de8fb0259992bfae43379481f4a3ce0a",
+    "note": "P16.49-review regeneration from clean measured-source commit 7af60bed; artifact wrapper D follows."
   },
-  "text_bytes": 2590057,
+  "text_bytes": 2590425,
   "symbols": {
     "runBytecodeDispatch": 68678,
     "callBuiltin": 8537,

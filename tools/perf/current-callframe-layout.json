@@ -1,20 +1,20 @@
 {
-  "created_utc": "2026-09-13T21:35:19.320457+00:00",
+  "created_utc": "2026-09-14T19:16:24.295761+00:00",
   "provenance": {
-    "git_head": "7d97e5a",
-    "measured_source_head": "7d97e5a",
+    "git_head": "7af60bed0450c57895bc6663a99a6a6d5bae262e",
+    "measured_source_head": "7af60bed0450c57895bc6663a99a6a6d5bae262e",
     "source_dirty": "clean",
     "zig_version": "0.16.0",
-    "probe_rf_path": "/tmp/opencode/C_layout_rf",
-    "probe_debug_path": "/tmp/opencode/C_layout_dbg",
-    "probe_rf_sha256_16": "f1aa1a6d36147060",
-    "probe_debug_sha256_16": "d129730780ff9757",
+    "probe_rf_path": "/tmp/opencode/p49r_layout_rf",
+    "probe_debug_path": "/tmp/opencode/p49r_layout_dbg",
+    "probe_rf_sha256_16": "fb66df68aed23d21",
+    "probe_debug_sha256_16": "92e82c7556046c34",
     "probe_build_commands": [
-      "zig build-exe -O ReleaseFast --dep lua -Mroot=/tmp/opencode/layout_probe.zig --dep util -Mlua=src/lua/root.zig -Mutil=src/util/root.zig -lc -femit-bin=/tmp/opencode/C_layout_rf",
-      "zig build-exe -O Debug --dep lua -Mroot=/tmp/opencode/layout_probe.zig --dep util -Mlua=src/lua/root.zig -Mutil=src/util/root.zig -lc -femit-bin=/tmp/opencode/C_layout_dbg"
+      "zig build-exe -O ReleaseFast --dep lua -Mroot=/tmp/opencode/layout_probe.zig --dep util -Mlua=src/lua/root.zig -Mutil=src/util/root.zig -lc -femit-bin=/tmp/opencode/p49r_layout_rf",
+      "zig build-exe -O Debug --dep lua -Mroot=/tmp/opencode/layout_probe.zig --dep util -Mlua=src/lua/root.zig -Mutil=src/util/root.zig -lc -femit-bin=/tmp/opencode/p49r_layout_dbg"
     ],
-    "zig_binary_sha256": "071ffa77f160646ef345902121cfb36849749098bf800636c389ca8c1270d9ae",
-    "note": "P16.45-finalization: probe binaries REBUILT from clean measured-source commit C (7d97e5a) \u2014 fresh immutable copies, hashes above, single regeneration timestamp; no relabeling, no nested timestamps."
+    "zig_binary_sha256": "da3d6316dfd6d3205dc90dee8039afd7de8fb0259992bfae43379481f4a3ce0a",
+    "note": "P16.49-review: probe binaries REBUILT from clean measured-source commit 7af60bed \u2014 fresh copies, hashes above, single regeneration timestamp; no relabeling, no nested timestamps."
   },
   "layout": {
     "ReleaseFast": {

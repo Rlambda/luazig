@@ -23,6 +23,7 @@ import json
 import math
 import os
 import platform
+import re
 import statistics
 import subprocess
 import sys
@@ -58,6 +59,15 @@ HISTORICAL_BASELINE = ROOT / "tools" / "perf" / "baseline-p15.37.json"
 DEFAULT_CORE = "0"
 DEFAULT_RUNS = 7
 BENCH_TIMEOUT_S = 600  # microbench must finish in under 10 min per run
+
+# P16.47 owner-approved matched-mode policy (AGENTS.md «Инструменты
+# производительности»): the mandatory gate compares COMPARABLE seed-mode
+# populations of the production ReleaseFast binary. Causal observable =
+# per-process instructions:u (deterministic per seed; the bimodal gap is
+# orders of magnitude above jitter); wall = the workload's self-reported
+# os.clock time (immune to wrapper startup overhead).
+MODE_SPLIT_REL_GAP = 0.01   # adjacent-sample instruction gap > 1% → mode split
+CENTER_TOLERANCE = 0.02     # candidate sample must sit within 2% of a center
 
 # Regression thresholds (fraction). WARN at +5%, FAIL at +10%.
 REGRESSION_WARN = 0.05
@@ -669,9 +679,9 @@ def median_runs(lua_bin: Path, n: int, core: str, label: str
     """Run microbench n times; return (median, spread) per workload.
 
     The spread (min/max/median of this session's own runs of the SAME
-    binary) feeds the noisy-lane downgrade in regression_check: a wall
-    delta inside the binary's own variance is reported as NOISE rather
-    than failed, with the spread printed (P15.37, closed P16.44)."""
+    binary) feeds the diagnostic NOISE annotation in the gate tables.
+    Used by the snapshot/counters lanes; the P16.47 mandatory gate lane
+    collects per-workload mode samples instead (collect_mode_samples)."""
     runs: list[Dict[str, float]] = []
     for i in range(n):
         t0 = time.perf_counter()
@@ -689,6 +699,201 @@ def median_runs(lua_bin: Path, n: int, core: str, label: str
         for name in names
     }
     return med, spread
+
+
+# ---------------------------------------------------------------------------
+# P16.47 matched-mode measurement core
+# ---------------------------------------------------------------------------
+
+class ModeEvidenceError(RuntimeError):
+    """Unclassifiable or mislabeled mode evidence — the gate must NOT guess.
+
+    Raised when a candidate instruction sample cannot be assigned to any
+    recorded baseline center within CENTER_TOLERANCE: the populations are
+    then not comparable and the mandatory verdict is INCONCLUSIVE (nonzero),
+    never a silent OK."""
+
+
+def run_bench_one(lua_bin: Path, core: str, workload: str,
+                  with_perf: bool = True) -> dict:
+    """One workload in one fresh process (one hash seed = one mode sample).
+
+    Returns {"wall": self-reported seconds, "instructions": process total}.
+    Wall comes from the workload's own os.clock print, so wrapping the
+    process in perf/taskset does not distort the measured section."""
+    cmd = ["taskset", "-c", core, str(lua_bin), str(BENCH), workload]
+    if with_perf:
+        cmd = ["perf", "stat", "-e", "instructions:u"] + cmd
+    proc = subprocess.run(cmd, capture_output=True, text=True,
+                          timeout=BENCH_TIMEOUT_S)
+    if proc.returncode != 0:
+        raise ModeEvidenceError(
+            f"workload {workload} exited {proc.returncode}: "
+            f"{proc.stderr[-300:]}")
+    wall = None
+    for line in proc.stdout.splitlines():
+        name, _, sec = line.partition("\t")
+        if name.strip() == workload:
+            try:
+                wall = float(sec)
+            except ValueError:
+                pass
+    if wall is None or wall <= 0:
+        raise ModeEvidenceError(f"no self-reported wall for {workload}")
+    if not with_perf:
+        return {"wall": wall, "instructions": None}
+    instr = None
+    for line in proc.stderr.splitlines():
+        m = re.match(r"\s*([\d,]+)\s+cpu_core/instructions/u", line)
+        if m:
+            instr = int(m.group(1).replace(",", ""))
+    if instr is None or instr <= 0:
+        raise ModeEvidenceError(f"no instructions:u for {workload}")
+    return {"wall": wall, "instructions": instr}
+
+
+def collect_mode_samples(lua_bin: Path, n: int, core: str, label: str,
+                         workloads=None, with_perf: bool = True
+                         ) -> dict[str, list[dict]]:
+    """Per-workload sample populations: n fresh processes per workload.
+
+    Each process draws an independent hash seed, so the samples of a
+    bimodal workload populate both mode clusters; a unimodal workload
+    stays in one cluster. Raw samples are kept verbatim (artifact evidence)."""
+    samples: dict[str, list[dict]] = {}
+    for wl in (workloads or WORKLOADS):
+        rows = []
+        t0 = time.perf_counter()
+        for i in range(n):
+            rows.append(run_bench_one(lua_bin, core, wl, with_perf))
+        samples[wl] = rows
+        print(f"  {label} {wl}: {n} samples in {time.perf_counter() - t0:.1f}s",
+              flush=True)
+    return samples
+
+
+def classify_modes(samples: list[dict]) -> dict:
+    """Cluster a workload's instruction population into seed modes.
+
+    Deterministic and reorder-invariant: sort the instruction counts,
+    split at the largest adjacent gap when that gap exceeds
+    MODE_SPLIT_REL_GAP (the global_arith mode gap is ~10% of the total
+    while same-mode jitter is ~0.001%). No workload names involved."""
+    instrs = sorted(s["instructions"] for s in samples)
+    n = len(instrs)
+    if n < 2:
+        labels = ["mono"] * n
+        centers = {"mono": instrs[0] if n else 0}
+        return {"labels": labels, "centers": centers, "split_rel_gap": 0.0, "n": n}
+    best_gap, best_i = 0.0, 0
+    for i in range(n - 1):
+        a, b = instrs[i], instrs[i + 1]
+        g = (b - a) / a if a else 0.0
+        if g > best_gap:
+            best_gap, best_i = g, i
+    if best_gap > MODE_SPLIT_REL_GAP:
+        low, high = instrs[:best_i + 1], instrs[best_i + 1:]
+        centers = {"low": statistics.median(low), "high": statistics.median(high)}
+        labels = []
+        for s in samples:
+            labels.append("low" if s["instructions"] <= instrs[best_i] else "high")
+    else:
+        centers = {"mono": statistics.median(instrs)}
+        labels = ["mono"] * n
+    return {"labels": labels, "centers": centers,
+            "split_rel_gap": best_gap, "n": n}
+
+
+def assign_modes(instrs: list[int], centers: dict[str, float]) -> list[str]:
+    """Assign candidate samples to recorded baseline centers.
+
+    A sample farther than CENTER_TOLERANCE (relative) from EVERY center is
+    mislabeled/corrupt evidence → ModeEvidenceError → INCONCLUSIVE."""
+    labels = []
+    for v in instrs:
+        dists = {lab: abs(v - c) / c for lab, c in centers.items()}
+        lab = min(dists, key=dists.get)
+        if dists[lab] > CENTER_TOLERANCE:
+            raise ModeEvidenceError(
+                f"instruction sample {v} unassignable: nearest center "
+                f"{lab} at {dists[lab]*100:.1f}% > {CENTER_TOLERANCE*100:.0f}%")
+        labels.append(lab)
+    return labels
+
+
+def mode_aware_regression(zig_samples: dict[str, list[dict]],
+                          baseline_doc: dict) -> dict:
+    """Matched-mode regression: low↔low, high↔high, mono↔mono.
+
+    Fail-safe aggregation: per-(workload, mode) verdicts are computed
+    independently; the aggregates are folded from the verdict list AFTER
+    the loop. A baseline mode the candidate session failed to sample is
+    INCONCLUSIVE (never OK); NOISE? stays a pure diagnostic.
+
+    Returns {"warn": bool, "fail": bool, "inconclusive": bool,
+             "verdicts": [str, ...]}."""
+    base_samples_all = baseline_doc.get("zig_samples", {})
+    base_evidence = baseline_doc.get("mode_evidence", {})
+    prev_ident = baseline_doc.get("baseline_identity", {})
+    print(f"\nMatched-mode regression check vs {BASELINE} "
+          f"(phase: {prev_ident.get('baseline_phase', 'unknown')}):")
+    print(f"  {'Workload[mode]':<28} {'base (s)':>10} {'cur (s)':>10} "
+          f"{'delta':>10}  status")
+    print("  " + "-" * 66)
+    verdicts: list[str] = []
+    inconclusive = False
+    for wl in sorted(base_samples_all):
+        base_rows = base_samples_all[wl]
+        centers = base_evidence.get(wl, {}).get("centers")
+        cand_rows = zig_samples.get(wl)
+        if cand_rows is None:
+            print(f"  {wl:<28} {'--':>10} {'--':>10} {'--':>10}  NEW "
+                  "(not in candidate; no verdict)")
+            continue
+        if not centers:
+            print(f"  {wl:<28}  baseline evidence incomplete -> INCONCLUSIVE")
+            inconclusive = True
+            continue
+        try:
+            cand_labels = assign_modes([s["instructions"] for s in cand_rows],
+                                       centers)
+        except ModeEvidenceError as e:
+            print(f"  {wl:<28}  corrupt mode evidence ({e}) -> INCONCLUSIVE")
+            inconclusive = True
+            continue
+        for mode in sorted(centers):
+            base_walls = [s["wall"] for s in base_rows if s.get("mode") == mode]
+            cand_idx = [i for i, lab in enumerate(cand_labels) if lab == mode]
+            if not base_walls or not cand_idx:
+                print(f"  {wl + '[' + mode + ']':<28} "
+                      f"{(statistics.median(base_walls) if base_walls else 0):>10.3f} "
+                      f"{'--':>10} {'--':>10}  INCONCLUSIVE "
+                      f"({'baseline' if not base_walls else 'candidate'} "
+                      f"mode not covered)")
+                inconclusive = True
+                continue
+            base_med = statistics.median(base_walls)
+            cand_walls = [cand_rows[i]["wall"] for i in cand_idx]
+            cand_med = statistics.median(cand_walls)
+            delta = (cand_med - base_med) / base_med if base_med else 0.0
+            verdict = classify(delta)
+            verdicts.append(verdict)
+            sp = {"min": min(cand_walls), "max": max(cand_walls)}
+            note = noise_annotation(base_med, cand_med, sp)
+            print(f"  {wl + '[' + mode + ']':<28} {base_med:>10.3f} "
+                  f"{cand_med:>10.3f} {delta * 100:>+9.1f}%  {verdict}{note}")
+        extra = set(cand_labels) - set(centers)
+        if extra:
+            print(f"  {wl:<28}  candidate-only modes {sorted(extra)}: "
+                  f"no baseline population to compare (diagnostic)")
+    for wl in sorted(set(zig_samples) - set(base_samples_all)):
+        print(f"  {wl:<28} {'--':>10} "
+              f"{statistics.median(s['wall'] for s in zig_samples[wl]):>10.3f} "
+              f"{'--':>10}  NEW (no baseline; informational)")
+    any_warn = "WARN" in verdicts
+    any_fail = "FAIL" in verdicts
+    return {"warn": any_warn, "fail": any_fail,
+            "inconclusive": inconclusive, "verdicts": verdicts}
 
 
 # ---------------------------------------------------------------------------
@@ -774,6 +979,12 @@ def build_baseline_document(current: dict, spreads: dict, runs: int, core: str,
         "ratios": ratios,
         "geomean": geomean,
         "zig_spread": spreads,
+        # P16.47 matched-mode evidence: raw per-sample populations (wall +
+        # instructions + mode label) and the cluster centers they were
+        # classified into. The mandatory gate compares modes against THESE,
+        # never against mode-blind scalar medians.
+        "zig_samples": current.get("zig_samples", {}),
+        "mode_evidence": current.get("mode_evidence", {}),
         "baseline_identity": {
             "baseline_phase": baseline_phase,
             "note": (note or
@@ -789,7 +1000,10 @@ def validate_baseline_document(doc: dict) -> bool:
     """Strict schema check for a serialized baseline document."""
     required = ("provenance", "geomean", "zig", "puc", "ratios",
                 "zig_spread", "baseline_identity", "created_utc",
-                "host", "runs", "core")
+                "host", "runs", "core",
+                # P16.47: a baseline without mode populations cannot back a
+                # matched-mode verdict and must not replace a valid one.
+                "zig_samples", "mode_evidence")
     for key in required:
         if key not in doc or doc[key] in (None, {}, []):
             return False
@@ -819,37 +1033,12 @@ def write_baseline_atomic(path, doc: dict) -> bool:
         return False
 
 
-def regression_check(zig: Dict[str, float], baseline: dict,
-                     spreads: Dict[str, Dict[str, float]] | None = None) -> tuple[bool, bool]:
-    """Compare current zig times vs baseline. Returns (any_warn, any_fail).
-
-    Fail-safe aggregation (P16.45): every workload's threshold verdict is
-    computed independently first; the aggregate flags are folded from the
-    per-workload verdict list AFTER the loop. A NOISE diagnostic never
-    changes a verdict, and no later workload can erase an earlier one's
-    (the P16.44 shape returned (False, False) while the printed table
-    contained a real FAIL)."""
-    spreads = spreads or {}
-    prev_zig = baseline.get("zig", {})
-    prev_ident = baseline.get("baseline_identity", {})
-    print(f"\nRegression check vs {BASELINE} "
-          f"(phase: {prev_ident.get('baseline_phase', 'unknown')}):")
-    print(f"  {'Workload':<22} {'base (s)':>10} {'cur (s)':>10} {'delta':>10}  status")
-    print("  " + "-" * 52)
-    verdicts: list[str] = []
-    for name in sorted(zig):
-        old = prev_zig.get(name)
-        if old is None:
-            print(f"  {name:<22} {'--':>10} {zig[name]:>10.3f} {'--':>10}  NEW")
-            continue
-        delta = (zig[name] - old) / old if old else 0.0
-        verdict = classify(delta)
-        verdicts.append(verdict)
-        note = noise_annotation(old, zig[name], spreads.get(name))
-        print(f"  {name:<22} {old:>10.3f} {zig[name]:>10.3f} {delta * 100:>+9.1f}%  {verdict}{note}")
-    any_warn = "WARN" in verdicts
-    any_fail = "FAIL" in verdicts
-    return any_warn, any_fail
+# (P16.47) the scalar mode-blind regression_check was REMOVED: comparing
+# independently sampled seed-mode medians made the mandatory verdict
+# session-dependent (OK ~0.744s / FAIL ~0.847s for one identical binary).
+# Its fail-safe aggregation semantics live on in mode_aware_regression
+# (per-verdict computation, fold after the loop, NOISE diagnostic-only);
+# the scalar wall table remains as a printed diagnostic only.
 
 
 # ---------------------------------------------------------------------------
@@ -920,12 +1109,40 @@ def main() -> int:
     if args.counters:
         return run_counters_mode(args)
 
-    print(f"\n>> {args.runs} median runs each, pinned to core {args.core}")
-    print(f">> zig: {ZIG_LUA}")
-    print(f">> puc: {PUC_LUA}")
-    zig, zig_spread = median_runs(ZIG_LUA, args.runs, args.core, "zig")
-    puc, _ = median_runs(PUC_LUA, args.runs, args.core, "puc")
+    print(f"\n>> matched-mode gate: {args.runs} samples per workload per "
+          f"binary, pinned to core {args.core}")
+    print(f">> zig: {ZIG_LUA} (wall = self-reported; mode observable = "
+          f"instructions:u)")
+    print(f">> puc: {PUC_LUA} (wall only — ratio diagnostic)")
 
+    # Zig: per-workload populations WITH the causal observable.
+    zig_mode_samples = collect_mode_samples(ZIG_LUA, args.runs, args.core,
+                                            "zig", with_perf=True)
+    mode_evidence: dict[str, dict] = {}
+    zig_samples_labeled: dict[str, list[dict]] = {}
+    for wl, rows in zig_mode_samples.items():
+        ev = classify_modes(rows)
+        mode_evidence[wl] = {"centers": ev["centers"],
+                             "split_rel_gap": ev["split_rel_gap"], "n": ev["n"]}
+        zig_samples_labeled[wl] = [
+            {"wall": s["wall"], "instructions": s["instructions"], "mode": lab}
+            for s, lab in zip(rows, ev["labels"])]
+
+    # PUC: wall-only populations for the scalar ratio diagnostic.
+    puc_mode_samples = collect_mode_samples(PUC_LUA, args.runs, args.core,
+                                            "puc", with_perf=False)
+
+    zig = {wl: statistics.median(s["wall"] for s in rows)
+           for wl, rows in zig_samples_labeled.items()}
+    puc = {wl: statistics.median(s["wall"] for s in rows)
+           for wl, rows in puc_mode_samples.items()}
+    zig_spread = {wl: {"min": min(s["wall"] for s in rows),
+                       "max": max(s["wall"] for s in rows),
+                       "median": zig[wl]}
+                  for wl, rows in zig_samples_labeled.items()}
+
+    print("\nScalar diagnostic table (mode-blind medians — NOT the gate "
+          "verdict; see the matched-mode check below):")
     print_table(zig, puc)
 
     if args.perf:
@@ -942,6 +1159,8 @@ def main() -> int:
         "zig": zig,
         "puc": puc,
         "ratios": {n: zig[n] / puc[n] for n in zig if n in puc and puc[n]},
+        "zig_samples": zig_samples_labeled,
+        "mode_evidence": mode_evidence,
     }
 
     if args.json_out:
@@ -965,16 +1184,45 @@ def main() -> int:
               f"geomean {baseline_doc['geomean']:.5f}, full provenance + spreads)")
         return 0
 
+    # Always persist this gate session's raw evidence (owner-approved
+    # P16.47 policy: current artifact carries samples, labels, provenance).
+    gate_session = {
+        "created_utc": current["created_utc"],
+        "provenance": provenance.block(zig_bin=ZIG_LUA, puc_bin=PUC_LUA,
+                                       optimize_mode="ReleaseFast"),
+        "runs": args.runs,
+        "core": args.core,
+        "zig_samples": zig_samples_labeled,
+        "mode_evidence": mode_evidence,
+    }
+    gate_path = ROOT / "tools/perf/current-gate.json"
+    gate_path.write_text(json.dumps(gate_session, indent=2) + "\n",
+                         encoding="utf-8")
+    print(f"\ngate session evidence: {gate_path}")
+
     if BASELINE.exists():
         prev = json.loads(BASELINE.read_text(encoding="utf-8"))
-        any_warn, any_fail = regression_check(zig, prev, zig_spread)
-        if any_fail:
-            print("\nRESULT: FAIL (regression > 10% on one or more workloads)")
+        if "zig_samples" not in prev or "mode_evidence" not in prev:
+            print("\nBaseline carries no mode evidence (pre-P16.47 schema).")
+            print("Re-record via --update-baseline under the owner-approved "
+                  "matched-mode policy; a mode-blind comparison is NOT a "
+                  "valid gate verdict.")
+            return 2
+        res = mode_aware_regression(zig_samples_labeled, prev)
+        if res["fail"]:
+            print("\nRESULT: FAIL (regression > 10% inside a matched mode "
+                  "on one or more workloads)")
             return 1
-        if any_warn:
-            print("\nRESULT: WARN (regression > 5% on one or more workloads)")
+        if res["inconclusive"]:
+            print("\nRESULT: INCONCLUSIVE (a baseline mode is not covered "
+                  "or mode evidence is corrupt — NOT green; rerun or "
+                  "re-record the baseline)")
+            return 2
+        if res["warn"]:
+            print("\nRESULT: WARN (regression > 5% inside a matched mode "
+                  "on one or more workloads)")
         else:
-            print("\nRESULT: OK (no regressions)")
+            print("\nRESULT: OK (no regressions in any matched mode)")
         return 0
 
     print(f"\nNo baseline at {BASELINE}; run with --update-baseline to create one.")

@@ -197,13 +197,30 @@
 В репозитории поддерживаются два perf-инструмента (остальные удалены как дублирующие):
 
 - **`python3 tools/perf_compare.py`** — основной gate: 18 микро-бенчмарков
-  (`tools/microbench.lua`), median-of-7, pinned CPU core, geomean Zig/PUC ratio,
-  regression check vs `tools/perf/baseline-approved.json`
+  (`tools/microbench.lua`), по одному workload-процессу на сэмпл, pinned CPU
+  core, matched-mode regression check vs `tools/perf/baseline-approved.json`
   (approved regression baseline; обновляется ТОЛЬКО явной операцией
   `--update-baseline`; историческое измерение P15.37 сохранено неизменным в
   `baseline-p15.37.json` и гейтом не читается).
   - Флаги: `--update-baseline`, `--perf` (perf stat), `--runs N`, `--no-build`.
-  - WARN при +5%, FAIL при +10% от baseline.
+  - **Matched-mode политика (P16.47)**: каждый сэмпл каждого workload'а
+    исполняется в отдельном процессе production ReleaseFast binary; wall =
+    self-reported `os.clock` workload'а (не искажён обёрткой); causal
+    observable = process `instructions:u` (`perf stat`), по которому сессия
+    классифицирует mode-популяции (largest-gap split по instruction-популяции,
+    без имён workload'ов). Сравниваются сопоставимые populations
+    baseline↔candidate (low↔low, high↔high); вердикт workload'а — худший из
+    покрытых mode (WARN при +5%, FAIL при +10% ВНУТРИ mode).
+  - INCONCLUSIVE (nonzero exit, не green): baseline-мода без покрытия в
+    candidate-сессии, либо повреждённое/неклассифицируемое mode-evidence.
+  - Скалярная wall-таблица (медианы по всем сэмплам) — ДИАГНОСТИКА; вердиктом
+    не является (mode-blind медианы сравнивают независимо сэмплированные
+    seed-моды и делают verdict session-dependent).
+  - NOISE? — только диагностика, никогда не понижает вердикт;
+    candidate-only range/overlap не является доказательством отсутствия
+    регрессии.
+  - baseline/current артефакты хранят raw сэмплы (wall+instructions),
+    mode-метки, cluster evidence и provenance.
 
 - **`python3 tools/perf_core_snapshot.py`** — end-to-end замер upstream suites
   (nextvar, coroutine, gc). Используется `tools/release_gate.sh`.
@@ -220,11 +237,12 @@ P15.37 — `baseline-p15.37.json` (не изменяется), end-to-end baseli
 - Колонка **Zig/PUC** — это **мультипликатор времени**: `zig_time / puc_time`.
   Например, `2.78x` означает, что luazig в 2.78 раза **медленнее** PUC Lua.
 - **Меньше — лучше.** Цель: приблизиться к `1.0x`.
-- Geomean по 18 workload'ам — основная метрика. Актуальный geomean см. в
+- Geomean по 18 workload'ам — основная ДИАГНОСТИЧЕСКАЯ метрика (mode-blind);
+  вердикт гейта — matched-mode (см. выше). Актуальный geomean см. в
   status-блоке README (генерируется tools/status_summary.py).
-- Regression check сравнивает с baseline: отрицательный delta (например `-9.2%`)
-  — **улучшение** (стало быстрее), положительный delta (например `+5.1%`) —
-  **ухудшение** (стало медленнее).
-- WARN при +5% к baseline, FAIL при +10%.
+- Внутри matched-mode: отрицательный delta (например `-9.2%`) — **улучшение**
+  (стало быстрее), положительный delta (например `+5.1%`) — **ухудшение**
+  (стало медленнее).
+- WARN при +5% внутри mode, FAIL при +10% внутри mode; INCONCLUSIVE — не green.
 
 

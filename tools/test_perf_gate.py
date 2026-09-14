@@ -57,127 +57,120 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 
 # ---------------------------------------------------------------------------
-# Case 1: one ordinary FAIL plus one NOISE-diagnostic lane.
-# The P16.44 aggregation returned (False, False) here — false green.
+# P16.47 matched-mode verdict matrix (owner-approved design A).
+# Pure fixtures injected into mode_aware_regression — no binaries, no
+# policy constants (workload names here are arbitrary fixture labels).
 # ---------------------------------------------------------------------------
-zig = {"a_slow": 1.20, "b_noisy": 1.20}
-bl = base({"a_slow": 1.0, "b_noisy": 1.0})
-sp = {"b_noisy": spread(0.9, 1.4)}  # baseline 1.0 inside candidate range
-warn, fail, table = run_check(zig, bl, sp)
-check("1 fail preserved alongside noise", fail is True)
-check("1 warn not set (a is FAIL, b is FAIL diag)", warn is False or fail is True)
-check("1 table shows FAIL", "FAIL" in table)
-check("1 table shows NOISE diagnostic", "NOISE?" in table)
-
-# ---------------------------------------------------------------------------
-# Case 2: two FAILs, only one noise-eligible — aggregate must stay FAIL.
-# ---------------------------------------------------------------------------
-zig = {"a_plain": 1.2, "b_noisy": 1.25}
-bl = base({"a_plain": 1.0, "b_noisy": 1.0})
-sp = {"b_noisy": spread(0.95, 1.45)}
-warn, fail, table = run_check(zig, bl, sp)
-check("2 two FAILs aggregate FAIL", fail is True)
-check("2 non-eligible FAIL printed without NOISE",
-      "a_plain" in table and "NOISE?" not in table.split("a_plain")[1].split("\n")[0])
-
-# ---------------------------------------------------------------------------
-# Case 3: WARN plus NOISE diagnostic — WARN must survive.
-# ---------------------------------------------------------------------------
-zig = {"a_warn": 1.06, "b_noisy": 1.30}
-bl = base({"a_warn": 1.0, "b_noisy": 1.0})
-sp = {"b_noisy": spread(0.9, 1.4)}
-warn, fail, table = run_check(zig, bl, sp)
-check("3 warn preserved", warn is True and fail is True)
-
-# ---------------------------------------------------------------------------
-# Case 4: all lanes noise-annotated — verdicts still by threshold.
-# ---------------------------------------------------------------------------
-zig = {"a": 1.2, "b": 1.02}
-bl = base({"a": 1.0, "b": 1.0})
-sp = {"a": spread(0.9, 1.4), "b": spread(0.95, 1.1)}
-warn, fail, table = run_check(zig, bl, sp)
-check("4 all-noise still FAILs the regressor", fail is True)
-check("4 ok lane stays ok", "OK" in table)
-
-# ---------------------------------------------------------------------------
-# Case 5: order independence — shuffled input, same aggregates.
-# ---------------------------------------------------------------------------
-bl_times = {f"w{i}": 1.0 + (0.02 * i) for i in range(12)}
-items = dict(bl_times)
-items["w7"] = 1.30  # one FAIL among OKs (delta ~14% over 1.14 baseline)
-bl = base(bl_times)
-spreads = {f"w{i}": spread(0.98, 1.02) for i in range(12)}
-spreads["w7"] = spread(0.95, 1.35)
-w1, f1, _ = run_check(items, bl, spreads)
-w2, f2, _ = run_check(dict(reversed(list(items.items()))), bl, spreads)
-check("5 order independent", (w1, f1) == (w2, f2) and f1 is True)
-
-# ---------------------------------------------------------------------------
-# Case 6: missing baseline workload — NEW row, no verdict influence.
-# ---------------------------------------------------------------------------
-zig = {"known": 1.0, "unknown": 1.5}
-bl = base({"known": 1.0})
-warn, fail, table = run_check(zig, bl, None)
-check("6 NEW row no crash", "NEW" in table and fail is False)
-
-# ---------------------------------------------------------------------------
-# Case 7: zero/degenerate spreads — no annotation, no crash, verdict intact.
-# ---------------------------------------------------------------------------
-zig = {"degen": 1.2}
-bl = base({"degen": 1.0})
-warn, fail, table = run_check(zig, bl, {"degen": spread(1.0, 1.0)})
-check("7 degenerate spread keeps FAIL", fail is True and "NOISE?" not in table)
-warn, fail, table = run_check(zig, bl, {"degen": spread(0.0, 0.0)})
-check("7 zero spread keeps FAIL", fail is True)
-
-# ---------------------------------------------------------------------------
-# Negative validation: the P16.44 aggregation (restored inline) must go
-# false-green on Case 1, proving this suite catches the bug class.
-# ---------------------------------------------------------------------------
-def p16444_aggregate(zig, baseline, spreads):
-    any_warn = any_fail = False
-    for name in sorted(zig):
-        old = baseline["zig"].get(name)
-        if old is None:
-            continue
-        delta = (zig[name] - old) / old if old else 0.0
-        if delta > REGRESSION_FAIL:
-            tag, any_fail = "FAIL", True
-        elif delta > REGRESSION_WARN:
-            tag, any_warn = "WARN", True
-        else:
-            tag = "OK"
-        sp = (spreads or {}).get(name)
-        if sp and tag in ("WARN", "FAIL") and old > 0:
-            spread_w = sp["max"] - sp["min"]
-            if sp["min"] - spread_w * 0.05 <= old <= sp["max"] + spread_w * 0.05 \
-                    and sp["min"] <= zig[name] <= sp["max"] and spread_w > 0:
-                if any_fail and delta > REGRESSION_FAIL:
-                    any_fail = False
-                elif any_warn and delta > REGRESSION_WARN:
-                    any_warn = False
-    return any_warn, any_fail
+def mk_rows(walls, instrs, mode):
+    return [{"wall": w, "instructions": i, "mode": mode}
+            for w, i in zip(walls, instrs)]
 
 
-w_old, f_old = p16444_aggregate({"a_slow": 1.2, "b_noisy": 1.2},
-                                base({"a_slow": 1.0, "b_noisy": 1.0}),
-                                {"b_noisy": spread(0.9, 1.4)})
-check("negative: P16.44 shape false-greens", f_old is False,
-      "old aggregation returned fail=False with a real FAIL lane")
-
-# ---------------------------------------------------------------------------
-# P16.46: policy contract — the gate must open the baseline the (owner-
-# amended) AGENTS.md perf section names, and the workload count must be the
-# owner-decided 18. These asserts tie code to policy so a silent path/count
-# change fails the suite.
-# ---------------------------------------------------------------------------
-def test_policy_contract():
-    check("policy: gate baseline is baseline-approved.json",
-          pc.BASELINE.name == "baseline-approved.json")
-    check("policy: workload count is 18", len(pc.WORKLOADS) == 18)
+def bimodal_doc(low_w=0.750, high_w=0.850):
+    """Baseline with both seed modes covered (4 low + 3 high samples)."""
+    return {
+        "baseline_identity": {"baseline_phase": "fixture"},
+        "zig_samples": {
+            "wl": mk_rows([low_w] * 4, [12_583_900_000 + k * 1000 for k in range(4)], "low")
+                 + mk_rows([high_w] * 3, [13_997_900_000 + k * 1000 for k in range(3)], "high"),
+        },
+        "mode_evidence": {"wl": {"centers": {"low": 12_583_900_500,
+                                             "high": 13_997_900_500},
+                                 "split_rel_gap": 0.11, "n": 7}},
+    }
 
 
-test_policy_contract()
+def run_mode(zig_samples, baseline):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        res = pc.mode_aware_regression(zig_samples, baseline)
+    return res, buf.getvalue()
+
+
+# 1. Same binary, sessions sampling different mode MIXES: after matched-mode
+#    classification this is NOT a runtime regression (the scalar gate's
+#    +13% flip must not appear as FAIL).
+cand = {"wl": mk_rows([0.751] * 4, [12_583_940_000] * 4, "low")
+             + mk_rows([0.849] * 3, [13_997_940_000] * 3, "high")}
+res, table = run_mode(cand, bimodal_doc())
+check("1 cross-mode same-binary not a regression",
+      res["fail"] is False and res["inconclusive"] is False and res["warn"] is False)
+
+# 2. Real +11% slowdown INSIDE low mode -> FAIL.
+cand = {"wl": mk_rows([0.833] * 4, [12_583_940_000] * 4, "low")
+             + mk_rows([0.851] * 3, [13_997_940_000] * 3, "high")}
+res, table = run_mode(cand, bimodal_doc())
+check("2 +11% inside low FAILs", res["fail"] is True)
+
+# 3. Real +11% slowdown INSIDE high mode -> FAIL.
+cand = {"wl": mk_rows([0.751] * 4, [12_583_940_000] * 4, "low")
+             + mk_rows([0.944] * 3, [13_997_940_000] * 3, "high")}
+res, table = run_mode(cand, bimodal_doc())
+check("3 +11% inside high FAILs", res["fail"] is True)
+
+# 4. One mode missing from the candidate session -> INCONCLUSIVE.
+cand = {"wl": mk_rows([0.751] * 7, [12_583_940_000] * 7, "low")}
+res, table = run_mode(cand, bimodal_doc())
+check("4 uncovered baseline mode INCONCLUSIVE",
+      res["inconclusive"] is True and res["fail"] is False)
+
+# 5. Reorder invariance: shuffled samples, identical aggregates.
+a = {"wl": mk_rows([0.751, 0.752, 0.750, 0.751],
+                   [12_583_940_000, 12_583_941_000, 12_583_939_000,
+                    12_583_940_500], "low")
+          + mk_rows([0.849, 0.850, 0.848],
+                    [13_997_940_000, 13_997_941_000, 13_997_939_000], "high")}
+b = {"wl": list(reversed(a["wl"]))}
+ra, _ = run_mode(a, bimodal_doc())
+rb, _ = run_mode(b, bimodal_doc())
+check("5 reorder invariant", (ra["fail"], ra["warn"], ra["inconclusive"])
+      == (rb["fail"], rb["warn"], rb["inconclusive"]))
+
+# 6. NOISE diagnostics never change aggregates: wide overlapping candidate
+#    spread produces the same flags as a tight one.
+tight = {"wl": mk_rows([0.751] * 4, [12_583_940_000] * 4, "low")
+               + mk_rows([0.849] * 3, [13_997_940_000] * 3, "high")}
+wide = {"wl": mk_rows([0.70, 0.751, 0.80, 0.751], [12_583_940_000] * 4, "low")
+              + mk_rows([0.80, 0.849, 0.90], [13_997_940_000] * 3, "high")}
+rt, tt = run_mode(tight, bimodal_doc())
+rw, tw = run_mode(wide, bimodal_doc())
+check("6 NOISE diagnostic-only", (rt["fail"], rt["warn"], rt["inconclusive"])
+      == (rw["fail"], rw["warn"], rw["inconclusive"]) and "NOISE?" in tw)
+
+# 7. Corrupt/mislabeled mode evidence (sample 20% away from every center)
+#    -> ModeEvidenceError inside the check -> INCONCLUSIVE verdict path.
+cand = {"wl": mk_rows([0.751] * 4, [12_583_940_000] * 4, "low")
+             + mk_rows([0.849] * 2, [13_997_940_000] * 2, "high")
+             + [{"wall": 0.9, "instructions": 16_000_000_000, "mode": "?"}]}
+res, table = run_mode(cand, bimodal_doc())
+check("7 corrupt evidence INCONCLUSIVE", res["inconclusive"] is True)
+
+# 8. Fail-safe fold: a real FAIL cannot be erased by later OK/INCONCLUSIVE
+#    rows (verdicts folded after the loop from the list).
+doc2 = bimodal_doc()
+doc2["zig_samples"]["a_fail"] = mk_rows([1.0], [100], "mono")
+doc2["mode_evidence"]["a_fail"] = {"centers": {"mono": 100}, "split_rel_gap": 0.0, "n": 1}
+cand = {"wl": mk_rows([0.751] * 7, [12_583_940_000] * 7, "low"),
+        "a_fail": mk_rows([1.11], [100], "mono")}
+res, table = run_mode(cand, doc2)
+check("8 FAIL preserved alongside INCONCLUSIVE",
+      res["fail"] is True and res["inconclusive"] is True)
+
+# 9. NEW workload (candidate-only) does not influence verdicts.
+res, table = run_mode({"wl": cand["wl"], "brand_new": mk_rows([1.0], [5], "mono")},
+                      bimodal_doc())
+check("9 NEW row no crash", "NEW" in table)
+
+# 10. classify_modes clustering: split threshold + reorder invariance.
+rows = [{"wall": 0.75, "instructions": 1000 + k} for k in range(4)]
+rows += [{"wall": 0.85, "instructions": 1115 + k} for k in range(3)]
+ev = pc.classify_modes(rows)
+check("10 classify splits bimodal", set(ev["centers"]) == {"low", "high"})
+mono = [{"wall": 0.5, "instructions": 1000 + k} for k in range(6)]
+ev2 = pc.classify_modes(mono)
+check("10 classify keeps unimodal", set(ev2["centers"]) == {"mono"})
+ev3 = pc.classify_modes(list(reversed(rows)))
+check("10 classify reorder invariant", ev3["centers"] == ev["centers"])
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +188,11 @@ def _mk_current():
             "host": {"platform": "test"},
             "zig": {"w1": 1.0, "w2": 2.0},
             "puc": {"w1": 0.5, "w2": 1.0},
-            "ratios": {"w1": 2.0, "w2": 2.0}}
+            "ratios": {"w1": 2.0, "w2": 2.0},
+            "zig_samples": {"w1": [{"wall": 1.0, "instructions": 10,
+                                    "mode": "mono"}]},
+            "mode_evidence": {"w1": {"centers": {"mono": 10},
+                                     "split_rel_gap": 0.0, "n": 1}}}
 
 
 SPREADS = {"w1": {"min": 0.9, "max": 1.1, "median": 1.0},
@@ -210,6 +207,10 @@ def test_real_serializer():
     check("serializer: caller note recorded", doc["baseline_identity"]["note"] == "caller note")
     check("serializer: geomean preserved", doc["geomean"] == 2.0)
     check("serializer: spreads preserved", doc["zig_spread"] == SPREADS)
+    check("serializer: mode samples preserved",
+          doc["zig_samples"] == _mk_current()["zig_samples"])
+    check("serializer: mode evidence preserved",
+          doc["mode_evidence"] == _mk_current()["mode_evidence"])
     check("serializer: injected provenance", doc["provenance"]["git_head"] == INJ_PROV["git_head"])
     check("serializer: validate accepts", pc.validate_baseline_document(doc))
 

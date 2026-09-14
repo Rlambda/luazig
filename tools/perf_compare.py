@@ -74,7 +74,19 @@ BENCH_TIMEOUT_S = 600  # microbench must finish in under 10 min per run
 # orders of magnitude above jitter); wall = the workload's self-reported
 # os.clock time (immune to wrapper startup overhead).
 MODE_SPLIT_REL_GAP = 0.01   # adjacent-sample instruction gap > 1% → mode split
-CENTER_TOLERANCE = 0.02     # candidate sample must sit within 2% of a center
+# Assignment tolerance is DERIVED FROM THE BASELINE POPULATION STRUCTURE
+# (recorded per workload in mode_evidence.assign_tolerance):
+# - mono population: a generous floor (5%) — seed-driven instruction drift
+#   can extend a unimodal population beyond its observed span (measured
+#   +2.4% on table_alloc_setmetatable); the check exists to catch grossly
+#   corrupt counts, not population extension;
+# - multi-mode: 0.8 x the relative half-separation of the closest centers,
+#   floored at 0.5% — members sit within ~span/2 of their center (measured
+#   worst 0.7% vs tolerance 1.0% for metamethod_call_noalloc), so true
+#   members stay assignable while cross-mode garbage does not.
+MONO_TOLERANCE = 0.05
+MULTI_TOL_FRACTION = 0.8
+MULTI_TOL_FLOOR = 0.005
 
 # Regression thresholds (fraction). WARN at +5%, FAIL at +10%.
 REGRESSION_WARN = 0.05
@@ -804,26 +816,37 @@ def classify_modes(samples: list[dict]) -> dict:
         labels = []
         for s in samples:
             labels.append("low" if s["instructions"] <= instrs[best_i] else "high")
+        # half-separation of the closest centers: a sample further than
+        # this from BOTH centers is in no-man's-land (ambiguous) — members
+        # themselves sit within ~span/2, well inside.
+        seps = [abs(b - a) / a for a, b in
+                zip(sorted(centers.values()), sorted(centers.values())[1:])]
+        tolerance = max(MULTI_TOL_FLOOR,
+                        MULTI_TOL_FRACTION * min(seps) / 2)
     else:
         centers = {"mono": statistics.median(instrs)}
         labels = ["mono"] * n
+        tolerance = MONO_TOLERANCE
     return {"labels": labels, "centers": centers,
+            "assign_tolerance": tolerance,
             "split_rel_gap": best_gap, "n": n}
 
 
-def assign_modes(instrs: list[int], centers: dict[str, float]) -> list[str]:
+def assign_modes(instrs: list[int], centers: dict[str, float],
+                 tolerance: float = MONO_TOLERANCE) -> list[str]:
     """Assign candidate samples to recorded baseline centers.
 
-    A sample farther than CENTER_TOLERANCE (relative) from EVERY center is
+    A sample farther than `tolerance` (relative, derived from the baseline
+    population structure — see the constants above) from EVERY center is
     mislabeled/corrupt evidence → ModeEvidenceError → INCONCLUSIVE."""
     labels = []
     for v in instrs:
         dists = {lab: abs(v - c) / c for lab, c in centers.items()}
         lab = min(dists, key=dists.get)
-        if dists[lab] > CENTER_TOLERANCE:
+        if dists[lab] > tolerance:
             raise ModeEvidenceError(
                 f"instruction sample {v} unassignable: nearest center "
-                f"{lab} at {dists[lab]*100:.1f}% > {CENTER_TOLERANCE*100:.0f}%")
+                f"{lab} at {dists[lab]*100:.1f}% > {tolerance*100:.1f}%")
         labels.append(lab)
     return labels
 
@@ -861,9 +884,10 @@ def mode_aware_regression(zig_samples: dict[str, list[dict]],
             print(f"  {wl:<28}  baseline evidence incomplete -> INCONCLUSIVE")
             inconclusive = True
             continue
+        tol = base_evidence.get(wl, {}).get("assign_tolerance", MONO_TOLERANCE)
         try:
             cand_labels = assign_modes([s["instructions"] for s in cand_rows],
-                                       centers)
+                                       centers, tol)
         except ModeEvidenceError as e:
             print(f"  {wl:<28}  corrupt mode evidence ({e}) -> INCONCLUSIVE")
             inconclusive = True
@@ -1130,6 +1154,7 @@ def main() -> int:
     for wl, rows in zig_mode_samples.items():
         ev = classify_modes(rows)
         mode_evidence[wl] = {"centers": ev["centers"],
+                             "assign_tolerance": ev["assign_tolerance"],
                              "split_rel_gap": ev["split_rel_gap"], "n": ev["n"]}
         zig_samples_labeled[wl] = [
             {"wall": s["wall"], "instructions": s["instructions"], "mode": lab}

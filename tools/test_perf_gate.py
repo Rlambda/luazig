@@ -76,6 +76,7 @@ def bimodal_doc(low_w=0.750, high_w=0.850):
         },
         "mode_evidence": {"wl": {"centers": {"low": 12_583_900_500,
                                              "high": 13_997_900_500},
+                                 "assign_tolerance": 0.088,
                                  "split_rel_gap": 0.11, "n": 7}},
     }
 
@@ -144,6 +145,36 @@ cand = {"wl": mk_rows([0.751] * 4, [12_583_940_000] * 4, "low")
              + [{"wall": 0.9, "instructions": 16_000_000_000, "mode": "?"}]}
 res, table = run_mode(cand, bimodal_doc())
 check("7 corrupt evidence INCONCLUSIVE", res["inconclusive"] is True)
+
+# 7b. mono population EXTENSION within the mono tolerance is assignable
+#     (measured: +2.4% seed drift on table_alloc_setmetatable must not be
+#     called corrupt; only gross corruption is).
+mono_doc = {
+    "baseline_identity": {"baseline_phase": "fixture"},
+    "zig_samples": {"mw": mk_rows([0.9] * 5, [880_000_000 + k * 1000
+                                              for k in range(5)], "mono")},
+    "mode_evidence": {"mw": {"centers": {"mono": 880_002_000},
+                             "assign_tolerance": 0.05,
+                             "split_rel_gap": 0.0, "n": 5}},
+}
+cand = {"mw": mk_rows([0.902] * 5, [901_000_000] * 5, "mono")}
+res, table = run_mode(cand, mono_doc)
+check("7b mono extension (+2.4%) assignable", res["inconclusive"] is False)
+
+# 7c. gross mono corruption (instructions 30% off) still INCONCLUSIVE.
+cand = {"mw": mk_rows([0.9] * 5, [1_200_000_000] * 5, "mono")}
+res, table = run_mode(cand, mono_doc)
+check("7c gross mono corruption INCONCLUSIVE", res["inconclusive"] is True)
+
+# 11. classify_modes records a structure-derived tolerance: bimodal
+#     centers 11% apart → 0.8x half-sep ~4.4%; mono → 5%.
+rows = [{"wall": 0.75, "instructions": 1000 + k} for k in range(4)]
+rows += [{"wall": 0.85, "instructions": 1115 + k} for k in range(3)]
+ev = pc.classify_modes(rows)
+check("11 tolerance derived for bimodal", 0.03 < ev["assign_tolerance"] < 0.05)
+ev2 = pc.classify_modes([{"wall": 0.5, "instructions": 1000 + k}
+                         for k in range(6)])
+check("11 tolerance floor for mono", ev2["assign_tolerance"] == 0.05)
 
 # 8. Fail-safe fold: a real FAIL cannot be erased by later OK/INCONCLUSIVE
 #    rows (verdicts folded after the loop from the list).

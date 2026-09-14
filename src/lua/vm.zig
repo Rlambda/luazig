@@ -26143,6 +26143,34 @@ pub const Vm = struct {
                 destroyLuaString(self.alloc, s);
             },
             .cell => |c| {
+                // PUC freeupval (lgc.c:829-833): an upvalue being freed must
+                // first be UNLINKED from its owning thread's open-upvalue
+                // registry — PUC's `if (upisopen(uv)) luaF_unlinkupval(uv);`
+                // before `luaM_free`. Our registry is the owning thread's
+                // `bytecode_boxed` array and `bc_stack_idx` is the slot
+                // (opClosure stores the cell exactly at
+                // bytecode_boxed[bc_stack_idx]).
+                //
+                // P16.49: without this unlink, a sweep that reaches an open
+                // Cell BEFORE its (equally dead) owning Thread leaves a
+                // dangling pointer in `bytecode_boxed`; the thread's later
+                // teardown (closeThreadOpenUpvalues) would then WRITE
+                // `cell.value` at offset 0 of freed memory — overwriting the
+                // allocator's freelist link and crashing the next
+                // Cell/Closure allocation (the deterministic gc.lua SIGSEGV;
+                // first illegal op proven by the Debug discriminator: open
+                // cell freed while still linked, owner white and not yet
+                // swept, zero live closure references — no liveness bug).
+                // With the unlink BOTH sweep orders are safe, exactly like
+                // PUC: cell-first → slot nulled here, the thread's teardown
+                // skips it; thread-first → its teardown closes every
+                // still-linked cell first (cells become closed,
+                // bc_stack_thread = null, so this unlink is a no-op).
+                if (c.bc_stack_thread) |owner| {
+                    if (c.bc_stack_idx != Cell.bc_stack_closed) {
+                        owner.bytecode_boxed[c.bc_stack_idx] = null;
+                    }
+                }
                 // P16.10c verifier Task 6: Debug-only, env-gated sweep
                 // diagnostic. Captures WHY the cell died — open/closed state,
                 // tri-color, age, gc_index — so a reachable Cell dying at

@@ -324,6 +324,20 @@
      "env_node_depth": 1,
      "env_node_chain_len": 2,
      "intern_depth": 0
+    },
+    {
+     "instructions": 13997783559,
+     "mode": "high",
+     "env_node_depth": 1,
+     "env_node_chain_len": 2,
+     "intern_depth": 0
+    },
+    {
+     "instructions": 13997783764,
+     "mode": "high",
+     "env_node_depth": 1,
+     "env_node_chain_len": 2,
+     "intern_depth": 0
     }
    ]
   },
@@ -339,8 +353,30 @@
      "env_node_depth": 0,
      "env_node_chain_len": 1,
      "intern_depth": 0
+    },
+    {
+     "instructions": 12583783578,
+     "mode": "low",
+     "env_node_depth": 0,
+     "env_node_chain_len": 1,
+     "intern_depth": 0
+    },
+    {
+     "instructions": 12583783482,
+     "mode": "low",
+     "env_node_depth": 0,
+     "env_node_chain_len": 1,
+     "intern_depth": 0
     }
    ]
   }
- ]
+ ],
+ "determinism_verification": {
+  "measured_utc": "2026-09-14T08:45:33.898494+00:00",
+  "measured_source_commit": "2682bbd00f30110665df016410de39aea7644664",
+  "harness_path": "/tmp/opencode/C_harness_imm",
+  "harness_sha256": "8a7393868c1fc962417748205f318afd2a2f68deb02ba7f8a4e807871b87c0e4",
+  "command": "taskset -c 0 perf stat -e instructions:u /tmp/opencode/C_harness_imm <seed> tools/microbench.lua global_arith",
+  "note": "P16.46 fresh structured repeats at clean C': seeds 1 (high) and 8 (low), 2 repeats each, full numeric observables per repeat (instructions / mode / env_node_depth / env_node_chain_len / intern_depth). All repeats validated by tools/validate_noise_lanes.py against raw evidence."
+ }
 }

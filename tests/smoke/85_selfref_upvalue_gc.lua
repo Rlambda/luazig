@@ -24,7 +24,13 @@ local function make_group(n)
     end
     for i = 1, n do
         local co = coroutine.create(fn)
-        coroutine.resume(co, co)
+        -- The invariant under test needs the thread SUSPENDED at the yield
+        -- with live open upvalues: a failed setup resume must fail the
+        -- test, not silently produce an empty group.
+        local ok, err = coroutine.resume(co, co)
+        assert(ok, err)
+        assert(coroutine.status(co) == "suspended",
+               "setup: thread must be suspended at the yield")
     end
     return threads
 end
@@ -56,7 +62,10 @@ do
     end
     for i = 1, 32 do
         local co = coroutine.create(fn)
-        coroutine.resume(co, co)
+        local ok, err = coroutine.resume(co, co)
+        assert(ok, err)
+        assert(coroutine.status(co) == "suspended",
+               "setup: thread must be suspended at the yield")
         assert(coroutine.close(co))
     end
     saved = nil

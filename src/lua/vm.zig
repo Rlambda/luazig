@@ -3511,7 +3511,7 @@ test "string allocated-size rule: per-kind table (PUC parity)" {
     // GC list first (the test destroys manually; vm.deinit must not see it
     // again) and credit the accounting symmetrically.
     try testing.expect(!freed);
-    vm.gcUnregisterObject(.{ .string = fm });
+    vm.gcUnregisterObjectRollback(.{ .string = fm });
     vm.gcNoteFree(fm.allocatedSize());
     destroyLuaString(vm.alloc, fm);
     try testing.expect(freed);
@@ -8154,14 +8154,18 @@ pub const Vm = struct {
         }
     }
 
-    /// Generic GC unregistration. swapRemoves from gc_objects using the
+    /// Sweep-time unregistration. swapRemoves from gc_objects using the
     /// object's `gc_index` field for O(1) lookup. Does NOT remove from
     /// gc_young_objects (filtered during sweep via snapshot/write-pointer).
     ///
     /// PUC lgc.c `sweepstep` unlinks from `allgc`; our `swapRemove` is the
     /// equivalent, with the swapped object's `gc_index` updated to maintain
     /// the position invariant.
-    fn gcUnregisterObject(self: *Vm, obj: GcObject) void {
+    ///
+    /// P16.49-review CONTRACT: this variant may ONLY be called by the
+    /// sweeps themselves (gcSweepYoungObjects / gcSweepOne) — the caller
+    /// owns the secondary-registry compaction that drops the entry.
+    fn gcUnregisterObjectSweep(self: *Vm, obj: GcObject) void {
         const p = gcPtr(obj);
         const index = p.index.*;
         std.debug.assert(index < self.gc_objects.items.len and
@@ -8170,6 +8174,36 @@ pub const Vm = struct {
         if (index < self.gc_objects.items.len) {
             const swapped = self.gc_objects.items[index];
             gcPtr(swapped).index.* = index;
+        }
+    }
+
+    /// Rollback-time unregistration (P16.49-review). Constructor rollbacks
+    /// and manual test teardown destroy objects OUTSIDE any sweep, so the
+    /// sweep-owned compaction will never clean their registry entries:
+    /// this variant additionally removes the object from
+    /// `gc_young_objects` with an ORDER-PRESERVING removal. Order matters:
+    /// the young list's post-snapshot tail must stay after the snapshot
+    /// region (mid-cycle allocations are unconditionally kept by the
+    /// sweep), so swapRemove — which would scramble that boundary — is
+    /// forbidden here.
+    ///
+    /// PUC parity: PUC frees an object only by unlinking it from the one
+    /// intrusive `allgc` list (lgc.c:1172-1213, sweepgen: `*p = curr->next;
+    /// freeobj(...)`), so "freed while linked" cannot exist there. Our
+    /// young list is a Zig-native secondary registry with no PUC
+    /// counterpart; this removal restores the PUC invariant "an object is
+    /// never freed while linked in a registry it belongs to". The linear
+    /// scan is acceptable: this path runs at most once per failed
+    /// constructor (OOM), never on a hot loop.
+    fn gcUnregisterObjectRollback(self: *Vm, obj: GcObject) void {
+        self.gcUnregisterObjectSweep(obj);
+        const items = self.gc_young_objects.items;
+        var i: usize = 0;
+        while (i < items.len) : (i += 1) {
+            if (std.meta.eql(items[i], obj)) {
+                _ = self.gc_young_objects.orderedRemove(i);
+                break;
+            }
         }
     }
 
@@ -25561,12 +25595,16 @@ pub const Vm = struct {
             },
             .old0 => {
                 // PUC nextage: G_OLD0 → G_OLD1, then add to grayagain.
+                // P16.49-review: the forward barrier that set .old0
+                // (gcForwardBarrierValue/Cell) ALREADY appended the object
+                // to gc_old1 and charged gc_gen_added_old_kb — repeating
+                // both here created duplicate gc_old1 entries and
+                // double-charged the minor→major pacing decision.
+                // grayagain/gen_threads linking matches the .survival arm.
                 p.age.* = .old1;
-                try self.gc_old1.append(self.alloc, obj);
                 if (obj != .cell) {
                     try self.gc_grayagain.append(self.alloc, obj);
                 }
-                self.gc_gen_added_old_kb += @as(f64, @floatFromInt(gcObjectBytes(obj))) / 1024.0;
                 if (obj == .thread) {
                     try self.gc_gen_threads.append(self.alloc, obj.thread);
                 }
@@ -25607,6 +25645,18 @@ pub const Vm = struct {
         // after sweep so the next cycle's markold can distinguish them from
         // dead objects.
         const snapshot = @min(self.gc_young_objects_snapshot_len, self.gc_young_objects.items.len);
+        // P16.49-review: make the sweep loop allocation-free (PUC sweepgen
+        // is infallible pointer surgery, lgc.c:1172-1213). Every promote-time
+        // append (gc_old1 / gc_grayagain / gc_gen_threads) is bounded by the
+        // snapshot length, so reserving that much capacity BEFORE any object
+        // is freed guarantees the loop cannot fail mid-way — a mid-loop
+        // failure would leave already-freed objects in the uncompacted young
+        // list, the same dangling-entry poisoning as the constructor
+        // rollback (a reserve failure here happens before any free, leaving
+        // every registry untouched).
+        try self.gc_old1.ensureUnusedCapacity(self.alloc, snapshot);
+        try self.gc_grayagain.ensureUnusedCapacity(self.alloc, snapshot);
+        try self.gc_gen_threads.ensureUnusedCapacity(self.alloc, snapshot);
         var write: usize = 0;
         for (self.gc_young_objects.items[0..snapshot]) |obj| {
             const p = gcPtr(obj);
@@ -25616,7 +25666,7 @@ pub const Vm = struct {
                 (gcCanFinalize(obj) and self.gcHasFinalizer(obj));
             if (!alive) {
                 // Remove from gc_objects first (swapRemove), then free memory.
-                self.gcUnregisterObject(obj);
+                self.gcUnregisterObjectSweep(obj);
                 self.gcFreeObject(obj);
                 continue;
             }
@@ -26005,7 +26055,7 @@ pub const Vm = struct {
                 // (swapRemove moves the last element into this slot), then
                 // free its memory. We must NOT advance the cursor so the
                 // swapped-in element gets examined next iteration.
-                self.gcUnregisterObject(obj);
+                self.gcUnregisterObjectSweep(obj);
                 self.gcFreeObject(obj);
             } else {
                 // Object is alive (or has a finalizer to run) — reset its
@@ -27317,7 +27367,7 @@ pub const Vm = struct {
                 // the GC list, credit the accounting, free the object —
                 // then the array. No leak, no dangling registry entry.
                 for (cells[0..n_cells]) |c| {
-                    self.gcUnregisterObject(.{ .cell = c });
+                    self.gcUnregisterObjectRollback(.{ .cell = c });
                     self.gcNoteFree(@sizeOf(Cell));
                     self.alloc.destroy(c);
                 }
@@ -27327,7 +27377,17 @@ pub const Vm = struct {
         for (cells) |*slot| {
             const cell = try self.alloc.create(Cell);
             cell.* = .{ .value = .Nil };
-            try self.gcRegisterCell(cell);
+            // P16.49-review: registration itself can fail (registry growth
+            // allocates — in generational-minor it grows gc_young_objects).
+            // The cell is not yet counted in n_cells at this point, so the
+            // phase errdefer would miss it: destroy it HERE, exactly once.
+            // (PUC luaC_newobj links into the intrusive allgc list —
+            // allocation-free and infallible; our fallible registration
+            // must own its failure cleanup.)
+            self.gcRegisterCell(cell) catch |reg_err| {
+                self.alloc.destroy(cell);
+                return reg_err;
+            };
             self.gcNoteAlloc(@sizeOf(Cell));
             slot.* = cell;
             n_cells += 1;
@@ -27359,7 +27419,7 @@ pub const Vm = struct {
                 // registry state). The P16.43 shape stopped here and left
                 // every Cell as an unreachable registry entry until a
                 // later collection or Vm.deinit — not transactional.
-                self.gcUnregisterObject(.{ .closure = cl });
+                self.gcUnregisterObjectRollback(.{ .closure = cl });
                 self.testc_obj_functions -= 1;
                 self.gcNoteFree(@sizeOf(Closure) + cells.len * @sizeOf(*Cell));
             }
@@ -27370,7 +27430,7 @@ pub const Vm = struct {
             // the closure) and post-registration (the closure that would
             // have owned them is already unregistered above).
             for (cells) |c| {
-                self.gcUnregisterObject(.{ .cell = c });
+                self.gcUnregisterObjectRollback(.{ .cell = c });
                 self.gcNoteFree(@sizeOf(Cell));
                 self.alloc.destroy(c);
             }
@@ -27814,7 +27874,7 @@ pub const Vm = struct {
         errdefer {
             if (!cells_owned_by_phase_d) {
                 for (cells[0..n_cells]) |c| {
-                    self.gcUnregisterObject(.{ .cell = c });
+                    self.gcUnregisterObjectRollback(.{ .cell = c });
                     self.gcNoteFree(@sizeOf(Cell));
                     self.alloc.destroy(c);
                 }
@@ -27824,7 +27884,12 @@ pub const Vm = struct {
         for (0..nups) |i| {
             const c = try self.alloc.create(Cell);
             c.* = .{ .value = .Nil };
-            try self.gcRegisterCell(c);
+            // P16.49-review: same register-failure ownership as the chunk
+            // constructor — the not-yet-counted cell is destroyed here.
+            self.gcRegisterCell(c) catch |reg_err| {
+                self.alloc.destroy(c);
+                return reg_err;
+            };
             self.gcNoteAlloc(@sizeOf(Cell));
             cells[i] = c;
             n_cells += 1;
@@ -27847,11 +27912,11 @@ pub const Vm = struct {
             // again the moment a fallible adoption step is added after
             // gcRegisterClosure.
             if (cl_registered) {
-                self.gcUnregisterObject(.{ .closure = cl });
+                self.gcUnregisterObjectRollback(.{ .closure = cl });
                 self.gcNoteFree(@sizeOf(Closure) + cells.len * @sizeOf(*Cell));
             }
             for (cells) |c| {
-                self.gcUnregisterObject(.{ .cell = c });
+                self.gcUnregisterObjectRollback(.{ .cell = c });
                 self.gcNoteFree(@sizeOf(Cell));
                 self.alloc.destroy(c);
             }
@@ -47068,11 +47133,11 @@ test "P16.44: createBytecodeChunkClosure fully transactional (every fail index)"
             try testing.expect(proto.tree.?.flags.constants_resolved);
             // Undo registration (single manual teardown mirrors the
             // constructor's success-side ownership).
-            _ = vm.gcUnregisterObject(.{ .closure = cl });
+            _ = vm.gcUnregisterObjectRollback(.{ .closure = cl });
             vm.testc_obj_functions -= 1;
             vm.gcNoteFree(@sizeOf(Closure) + cl.upvalues.len * @sizeOf(*Cell));
             for (cl.upvalues) |c| {
-                _ = vm.gcUnregisterObject(.{ .cell = c });
+                _ = vm.gcUnregisterObjectRollback(.{ .cell = c });
                 vm.gcNoteFree(@sizeOf(Cell));
                 saved_alloc.destroy(c);
             }
@@ -47162,10 +47227,10 @@ test "P16.44: closureFromProto fully transactional (every fail index)" {
         const count0 = vm.gc_count_kb;
         const funcs0 = vm.testc_obj_functions;
         if (vm.closureFromProto(proto)) |cl| {
-            _ = vm.gcUnregisterObject(.{ .closure = cl });
+            _ = vm.gcUnregisterObjectRollback(.{ .closure = cl });
             vm.gcNoteFree(@sizeOf(Closure) + cl.upvalues.len * @sizeOf(*Cell));
             for (cl.upvalues) |c| {
-                _ = vm.gcUnregisterObject(.{ .cell = c });
+                _ = vm.gcUnregisterObjectRollback(.{ .cell = c });
                 vm.gcNoteFree(@sizeOf(Cell));
                 saved_alloc.destroy(c);
             }
@@ -47218,11 +47283,11 @@ test "P16.44: repeated constructor failures leave zero registry/accounting growt
             // Success edge (the constructor can complete within the
             // allowed allocations): tear it down so the snapshot delta
             // measures only FAILURE-path drift.
-            _ = vm.gcUnregisterObject(.{ .closure = cl });
+            _ = vm.gcUnregisterObjectRollback(.{ .closure = cl });
             vm.testc_obj_functions -= 1;
             vm.gcNoteFree(@sizeOf(Closure) + cl.upvalues.len * @sizeOf(*Cell));
             for (cl.upvalues) |c| {
-                _ = vm.gcUnregisterObject(.{ .cell = c });
+                _ = vm.gcUnregisterObjectRollback(.{ .cell = c });
                 vm.gcNoteFree(@sizeOf(Cell));
                 saved_alloc.destroy(c);
             }
@@ -47245,6 +47310,151 @@ test "P16.44: repeated constructor failures leave zero registry/accounting growt
     try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
     try testing.expectEqual(count0, vm.gc_count_kb);
     try testing.expectEqual(funcs0, vm.testc_obj_functions);
+}
+
+test "P16.49-review: generational rollback keeps every GC registry exact" {
+    // The latent OOM defect: gcRegisterObject in generational-minor links
+    // a new object into BOTH gc_objects and gc_young_objects, but the
+    // constructor rollbacks removed it only from gc_objects — a freed
+    // Cell/Closure stayed as a dangling young-list entry, and the next
+    // gcMinorCollection dereferenced/double-freed it. This test proves the
+    // rollback restores BYTE-EXACT pre-call contents of the young registry
+    // (order included — the removal must be order-preserving so the
+    // snapshot/tail boundary semantics survive) and that a full young
+    // collection afterwards runs clean over the restored state.
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    // Enter generational mode: gcEnterGenerational runs a full cycle and
+    // makes everything old; new registrations then land in the young list.
+    try vm.gcEnterGenerational();
+    try testing.expect(vm.gc_mode == .generational);
+    try testing.expect(vm.gc_gen_phase == .minor);
+
+    var fail_idx: usize = 0;
+    var tested_failures: usize = 0;
+    var first_success_idx: ?usize = null;
+    while (fail_idx <= 64) : (fail_idx += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        const proto = try p44BuildProto(vm.alloc, &vm, 3, 8);
+        const saved_alloc = vm.alloc;
+        vm.alloc = failing.allocator();
+        defer vm.alloc = saved_alloc;
+        proto.tree.?.retainTree();
+        defer {
+            proto.tree.?.releaseTree(saved_alloc);
+            proto.tree.?.releaseTree(saved_alloc);
+        }
+
+        // EXACT pre-call state of every affected registry.
+        const young0 = try testing.allocator.dupe(GcObject, vm.gc_young_objects.items);
+        defer testing.allocator.free(young0);
+        const gc_len0 = vm.gc_objects.items.len;
+        const count0 = vm.gc_count_kb;
+        const funcs0 = vm.testc_obj_functions;
+
+        if (vm.createBytecodeChunkClosure(proto)) |cl| {
+            // Success edge: single manual teardown (success-side
+            // ownership), exercising the rollback unregister on a live
+            // generational registration too.
+            _ = vm.gcUnregisterObjectRollback(.{ .closure = cl });
+            vm.testc_obj_functions -= 1;
+            vm.gcNoteFree(@sizeOf(Closure) + cl.upvalues.len * @sizeOf(*Cell));
+            for (cl.upvalues) |c| {
+                _ = vm.gcUnregisterObjectRollback(.{ .cell = c });
+                vm.gcNoteFree(@sizeOf(Cell));
+                saved_alloc.destroy(c);
+            }
+            if (cl.proto) |pp| {
+                if (pp.tree) |t| t.releaseTree(saved_alloc);
+            }
+            const ua = vm.alloc;
+            vm.alloc = saved_alloc;
+            ua.free(cl.upvalues);
+            ua.destroy(cl);
+            first_success_idx = fail_idx;
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            tested_failures += 1;
+            // Restoration of the unified registry...
+            try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
+            try testing.expectEqual(count0, vm.gc_count_kb);
+            try testing.expectEqual(funcs0, vm.testc_obj_functions);
+            // ...AND of the young registry: same length, same order,
+            // same objects (a dangling or reordered entry fails here).
+            try testing.expectEqual(young0.len, vm.gc_young_objects.items.len);
+            for (young0, vm.gc_young_objects.items) |a, b| {
+                try testing.expect(std.meta.eql(a, b));
+            }
+            // The decisive probe: run a real young collection over the
+            // restored state. With the old defect the dangling entries
+            // were dereferenced here (gcPtr on freed memory → garbage
+            // liveness → double free caught by the testing allocator).
+            try vm.gcMinorCollection();
+            try testing.expectEqual(young0.len, vm.gc_young_objects.items.len);
+        }
+    }
+    try testing.expect(tested_failures > 0);
+    try testing.expect(first_success_idx != null);
+}
+
+// Registry invariant helper used by the generational tests: every entry
+// of every live secondary registry must point at an object that is still
+// registered in gc_objects (i.e. its gc_index resolves back to itself).
+fn gcCheckSecondaryRegistryInvariants(vm: *Vm) bool {
+    for (vm.gc_young_objects.items) |obj| {
+        const p = gcPtr(obj);
+        const i = p.index.*;
+        if (i >= vm.gc_objects.items.len) return false;
+        if (!std.meta.eql(vm.gc_objects.items[i], obj)) return false;
+    }
+    for (vm.gc_old1.items) |obj| {
+        const p = gcPtr(obj);
+        const i = p.index.*;
+        if (i >= vm.gc_objects.items.len) return false;
+        if (!std.meta.eql(vm.gc_objects.items[i], obj)) return false;
+    }
+    for (vm.gc_gen_threads.items) |th| {
+        const p = gcPtr(.{ .thread = th });
+        const i = p.index.*;
+        if (i >= vm.gc_objects.items.len) return false;
+        if (!std.meta.eql(vm.gc_objects.items[i], .{ .thread = th })) return false;
+    }
+    return true;
+}
+
+test "P16.49-review: secondary registry invariants hold across minor cycles" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    try vm.gcEnterGenerational();
+    // A handful of young collections over fresh registrations must keep
+    // every registry entry pointing at a live registered object.
+    var round: usize = 0;
+    while (round < 8) : (round += 1) {
+        const proto = try p44BuildProto(vm.alloc, &vm, 2, 4);
+        proto.tree.?.retainTree();
+        // Release the probe-retain AND the finish-time initial reference
+        // (the P16.44 double-release pattern: the constructor's own
+        // retain/release balances internally). The closure's own tree
+        // reference is then the only one left — released by the minor
+        // collection if the closure dies, or by drainGcRegistries ->
+        // gcFreeObject(.closure) at Vm.deinit — dropping ref_count to 0
+        // and freeing the tree with every Proto-owned allocation.
+        defer {
+            proto.tree.?.releaseTree(vm.alloc);
+            proto.tree.?.releaseTree(vm.alloc);
+        }
+        const cl = try vm.closureFromProto(proto);
+        _ = cl; // stays registered: young-list member by construction
+        try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+        try vm.gcMinorCollection();
+        try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+    }
 }
 
 // Negative-validation note: std.testing.allocator (DebugAllocator)

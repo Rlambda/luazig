@@ -318,6 +318,45 @@ res, table = run_mode({"wl": nullseed}, blank_doc({"wl": full_rows}))
 check("M22 null seed INCONCLUSIVE",
       res["inconclusive"] is True and "null seed" in table)
 
+# M23-M26 (P16.49-review): malformed rows / unusable seed identities are
+# corrupt evidence — an INCONCLUSIVE reason string, never an exception.
+# M23. A non-dict row (bare int) on the CANDIDATE side -> INCONCLUSIVE.
+bad_int = [dict(r) for r in full_rows]
+bad_int[3] = 42
+res, table = run_mode({"wl": bad_int}, blank_doc({"wl": full_rows}))
+check("M23 non-dict row (candidate) INCONCLUSIVE",
+      res["inconclusive"] is True and "malformed row" in table)
+
+# M23b. The same malformed row on the BASELINE side -> INCONCLUSIVE too
+# (the schema check runs on BOTH sides).
+res, table = run_mode({"wl": [dict(r) for r in full_rows]},
+                      blank_doc({"wl": bad_int}))
+check("M23b non-dict row (baseline) INCONCLUSIVE",
+      res["inconclusive"] is True and "malformed row" in table)
+
+# M24. An unhashable seed ([1, 2]) -> INCONCLUSIVE, no TypeError.
+bad_unhash = [dict(r) for r in full_rows]
+bad_unhash[3]["seed"] = [1, 2]
+res, table = run_mode({"wl": bad_unhash}, blank_doc({"wl": full_rows}))
+check("M24 unhashable seed INCONCLUSIVE",
+      res["inconclusive"] is True and "unusable seed type" in table)
+
+# M25. A string seed "7" -> INCONCLUSIVE (it must not pair with int 7; a
+# float seed would even compare hash-equal to its int and silently pass).
+bad_str = [dict(r) for r in full_rows]
+bad_str[3]["seed"] = "7"
+res, table = run_mode({"wl": bad_str}, blank_doc({"wl": full_rows}))
+check("M25 string seed INCONCLUSIVE",
+      res["inconclusive"] is True and "unusable seed type" in table)
+
+# M26. A malformed row in a CANDIDATE-ONLY workload (informational NEW
+# path) -> INCONCLUSIVE, never an exception on the median.
+res, table = run_mode({"wl": [dict(r) for r in full_rows],
+                       "brand_new": [42]},
+                      blank_doc({"wl": full_rows}))
+check("M26 malformed candidate-only row INCONCLUSIVE",
+      res["inconclusive"] is True and "malformed row" in table)
+
 
 # ---------------------------------------------------------------------------
 # P16.45-finalization BLOCKER 4: test the REAL production serializer
@@ -506,6 +545,53 @@ def test_paired_seed_schema():
             lambda d: d["mode_evidence"][wl0].update(centers={}))
     rejects("zig_samples missing a workload",
             lambda d: d["zig_samples"].pop(wl0))
+
+    # P16.49-review: exact published seed list. A FULLY self-consistent doc
+    # recorded under a shifted list (2..22 — unique positive ints, runs
+    # matches, every workload carries exactly one row per declared seed,
+    # mode evidence faithful to the rows) passes every generic check and
+    # must STILL be rejected: only the exact-SEED_LIST rule catches it.
+    shifted = list(range(2, 2 + len(pc.SEED_LIST)))
+    cur = _mk_current()
+    cur["zig_samples"] = {
+        wl: [{"wall": 1.0, "instructions": 1000 + s, "mode": "mono",
+              "seed": s} for s in shifted]
+        for wl in pc.WORKLOADS}
+    cur["mode_evidence"] = {
+        wl: {"centers": {"mono": 1000 + shifted[len(shifted) // 2]},
+             "split_rel_gap": 0.0, "n": len(shifted)}
+        for wl in pc.WORKLOADS}
+    cur["seed_list"] = shifted
+    shifted_doc = pc.build_baseline_document(cur, SPREADS, len(shifted),
+                                             "0", "test-phase", prov=INJ_PROV)
+    check("schema: rejects self-consistent non-published seed_list",
+          not pc.validate_baseline_document(shifted_doc))
+
+    # P16.49-review: non-finite samples. float('inf') > 0 is True, so the
+    # old positivity check accepted infinite walls; NaN already failed but
+    # is pinned here too, and a string instructions count is not an int.
+    rejects("row with wall=inf",
+            lambda d: d["zig_samples"][wl0][0].update(wall=float("inf")))
+    rejects("row with wall=nan",
+            lambda d: d["zig_samples"][wl0][0].update(wall=float("nan")))
+    rejects("row with instructions='many' (string)",
+            lambda d: d["zig_samples"][wl0][0].update(instructions="many"))
+
+    # P16.49-review: mode-evidence consistency recompute. The stored
+    # evidence must match the clustering RECOMPUTED from the raw rows —
+    # fabricated blocks (n=999, centers={'bogus':'x'}, row mode='bogus')
+    # or a missing split_rel_gap must not pass validation.
+    rejects("mode_evidence n=999",
+            lambda d: d["mode_evidence"][wl0].update(n=999))
+    rejects("mode_evidence centers={'bogus': 'x'}",
+            lambda d: d["mode_evidence"][wl0].update(centers={"bogus": "x"}))
+    rejects("row mode='bogus' (label mismatch)",
+            lambda d: d["zig_samples"][wl0][0].update(mode="bogus"))
+    rejects("mode_evidence missing split_rel_gap",
+            lambda d: d["mode_evidence"][wl0].pop("split_rel_gap"))
+    rejects("mode_evidence split_rel_gap=nan",
+            lambda d: d["mode_evidence"][wl0].update(
+                split_rel_gap=float("nan")))
 
     # build_baseline_document refuses to RECORD inconsistent metadata:
     # runs != len(seed_list) raises instead of serializing.

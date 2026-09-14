@@ -903,15 +903,30 @@ def _paired_seed_schema_reason(rows: list, expected_seeds: list) -> str | None:
     same 20 of 21 seeds on both sides" used to look like complete,
     matching populations and returned a green verdict on incomplete
     evidence. The paired protocol is bounded by construction — one row per
-    published seed — so anything else is corrupt evidence, not a verdict."""
-    # Anonymous rows (pre-paired schema, no seed key at all) cannot back a
-    # paired verdict — there is no identity to pair on.
+    published seed — so anything else is corrupt evidence, not a verdict.
+
+    P16.49-review hardening: malformed rows and unusable seed identities
+    are corrupt evidence too, never an exception and never a silent pass:
+    - a row that is not a dict cannot carry a seed identity at all;
+    - a seed must be a hashable int — an unhashable seed (list/dict) used
+      to raise TypeError on the counts dict, and a float seed silently
+      compared EQUAL to its int (hash(7.0) == hash(7)), so both are
+      rejected as "unusable seed type" (str/bool included: bool is an int
+      subtype that would pose as 0/1)."""
+    if not isinstance(rows, list):
+        return "malformed rows (not a list)"
+    # Malformed rows (not dicts) cannot carry a seed identity at all.
     for s in rows:
+        if not isinstance(s, dict):
+            return "malformed row (not an object)"
         if "seed" not in s:
             return "anonymous samples (pre-paired schema; re-record baseline)"
     seeds = [s["seed"] for s in rows]
-    if any(s is None for s in seeds):
-        return "null seed"
+    for s in seeds:
+        if s is None:
+            return "null seed"
+        if isinstance(s, bool) or not isinstance(s, int):
+            return f"unusable seed type ({type(s).__name__})"
     counts: dict = {}
     dupes = []
     for s in seeds:
@@ -1068,8 +1083,19 @@ def mode_aware_regression(zig_samples: dict[str, list[dict]],
                       f"{'~0':>9}  OK  [wall med {statistics.median(c_walls):.3f}]"
                       f"{env_note}")
     for wl in sorted(set(zig_samples) - set(base_samples_all)):
+        new_rows = zig_samples[wl]
+        # P16.49-review: malformed candidate-only rows are corrupt evidence
+        # too — the informational median below must never raise on them.
+        if not isinstance(new_rows, list) or not new_rows or not all(
+                isinstance(s, dict)
+                and isinstance(s.get("instructions"), (int, float))
+                and not isinstance(s.get("instructions"), bool)
+                for s in new_rows):
+            print(f"  {wl:<28}  candidate: malformed row -> INCONCLUSIVE")
+            inconclusive = True
+            continue
         print(f"  {wl:<28} {'--':>13} "
-              f"{statistics.median(s['instructions'] for s in zig_samples[wl]):>13} "
+              f"{statistics.median(s['instructions'] for s in new_rows):>13} "
               f"{'--':>9}  NEW (no baseline; informational)")
     any_warn = "WARN" in verdicts
     any_fail = "FAIL" in verdicts
@@ -1206,9 +1232,24 @@ def validate_baseline_document(doc: dict) -> bool:
     duplicated or anonymous seed population cannot back a paired verdict
     and must never replace a valid approved baseline.
 
-    The seed_list values are NOT hardcoded to 1..21 (the published list
-    may legitimately evolve) — but it must be a list of UNIQUE positive
-    ints with at least 2 entries, and runs must equal its length."""
+    The seed_list values are NOT hardcoded to 1..21 for arbitrary protocols
+    (a non-paired declaration keeps the generic uniqueness check) — but a
+    list must be UNIQUE positive ints with at least 2 entries, and runs must
+    equal its length.
+
+    P16.49-review hardening:
+    - under protocol 'paired-seed-v1' the seed_list must be EXACTLY the
+      published SEED_LIST (element-wise) — the protocol is bounded by
+      construction to that list, so any other list is a doc recorded under
+      a different protocol posing as this one;
+    - wall/instructions must be FINITE (float('inf') > 0 is True, so a bare
+      positivity check used to accept infinite samples);
+    - the stored mode_evidence must be a faithful record of the raw rows:
+      the clustering is RECOMPUTED from zig_samples and the stored row mode
+      labels, centers and n must match it exactly (split_rel_gap only needs
+      to be present and finite). Without this a hand-written
+      mode='bogus'/n=999/centers={'bogus':'x'} block passed validation.
+    """
     required = ("provenance", "geomean", "zig", "puc", "ratios",
                 "zig_spread", "baseline_identity", "created_utc",
                 "host", "runs", "core",
@@ -1230,6 +1271,11 @@ def validate_baseline_document(doc: dict) -> bool:
                        and s > 0 for s in seed_list)
             or len(set(seed_list)) != len(seed_list)):
         return False
+    # Exact published list (element-wise) for the declared paired-seed
+    # protocol; non-paired protocol declarations keep the generic check
+    # above only (and are rejected earlier by the protocol check anyway).
+    if seed_list != SEED_LIST:
+        return False
     if doc["runs"] != len(seed_list):
         return False
     # Complete, exact paired-seed populations for every workload.
@@ -1250,12 +1296,17 @@ def validate_baseline_document(doc: dict) -> bool:
             if not isinstance(r, dict):
                 return False
             wall = r.get("wall")
+            # Finite: float('inf') > 0 is True, so a bare positivity check
+            # used to accept infinite walls as valid samples.
             if (not isinstance(wall, (int, float))
-                    or isinstance(wall, bool) or wall <= 0):
+                    or isinstance(wall, bool) or wall <= 0
+                    or not math.isfinite(wall)):
                 return False
             instr = r.get("instructions")
+            # int-typed by schema, so non-finite floats are already rejected
+            # by the type check; isfinite kept for explicitness/robustness.
             if (not isinstance(instr, int) or isinstance(instr, bool)
-                    or instr <= 0):
+                    or instr <= 0 or not math.isfinite(instr)):
                 return False
             mode = r.get("mode")
             if not isinstance(mode, str) or not mode:
@@ -1273,6 +1324,24 @@ def validate_baseline_document(doc: dict) -> bool:
         ev = mode_evidence.get(wl)
         if not isinstance(ev, dict) or not isinstance(ev.get("centers"), dict) \
                 or not ev["centers"]:
+            return False
+        # Consistency recompute: the stored evidence must be a faithful
+        # record of the raw rows. classify_modes is deterministic, so a
+        # doc serialized by the gate matches by construction; a hand-edited
+        # block (mode='bogus', n=999, centers={'bogus':'x'}) does not.
+        recomputed = classify_modes(rows)
+        for r, lab in zip(rows, recomputed["labels"]):
+            if r.get("mode") != lab:
+                return False
+        if ev["centers"] != recomputed["centers"]:
+            return False
+        if ev.get("n") != len(rows):
+            return False
+        gap = ev.get("split_rel_gap")
+        # split_rel_gap is diagnostic (its value may legitimately differ
+        # across recorder versions) but must exist and be a finite number.
+        if (not isinstance(gap, (int, float)) or isinstance(gap, bool)
+                or not math.isfinite(gap)):
             return False
     return True
 
@@ -1514,7 +1583,25 @@ def main() -> int:
         return 0
 
     if BASELINE.exists():
-        prev = json.loads(BASELINE.read_text(encoding="utf-8"))
+        try:
+            prev = json.loads(BASELINE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            print(f"\nBaseline {BASELINE} is not valid JSON ({e}).")
+            print("Re-record via --update-baseline; a corrupt baseline is "
+                  "NOT a valid gate verdict.")
+            return 2
+        # P16.49-review: the loaded baseline must pass the SAME strict
+        # validator the serializer uses — a corrupt doc (non-published seed
+        # list, non-finite samples, fabricated mode evidence) is
+        # INCONCLUSIVE evidence, never a traceback and never a verdict.
+        # This subsumes the older "no mode evidence" pre-P16.47 check below.
+        if not isinstance(prev, dict) or not validate_baseline_document(prev):
+            print("\nBaseline failed strict validation "
+                  "(schema/protocol/seed-list/mode-evidence checks).")
+            print("Re-record via --update-baseline under the owner-approved "
+                  "paired-seed policy; a corrupt baseline is NOT a valid "
+                  "gate verdict.")
+            return 2
         if "zig_samples" not in prev or "mode_evidence" not in prev:
             print("\nBaseline carries no mode evidence (pre-P16.47 schema).")
             print("Re-record via --update-baseline under the owner-approved "

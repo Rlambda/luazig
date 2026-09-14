@@ -83,8 +83,13 @@ IR VM полностью удалена из кодовой базы.
 
 ### Методика
 
-- PUC Lua 5.5 (vendored) vs luazig (ReleaseFast), `taskset -c 0`, медиана 7 прогонов.
-- `python3 tools/perf_compare.py` — WARN +5%, FAIL +10% к baseline (`tools/perf/baseline-p15.37.json`).
+- PUC Lua 5.5 (vendored) vs luazig (ReleaseFast, production binary,
+  per-workload процессы), `taskset -c 0`, published paired seeds 1..21
+  (`LUAZIG_HASH_SEED`); вердикт = per-seed paired instruction deltas.
+- `python3 tools/perf_compare.py` — WARN +5%, FAIL +10% ВНУТРИ matched
+  mode к baseline (`tools/perf/baseline-approved.json`,
+  protocol=paired-seed-v1; `baseline-p15.37.json` — исторический, гейтом
+  не читается); INCONCLUSIVE — nonzero.
 
 ### Текущие bottleneck'ы (по приоритету)
 
@@ -7074,7 +7079,9 @@ Correction-фаза по owner-ledger item (открыт a058cbf; open-count 21�
   (big.lua pre-existing), c_api + DIFF: PASS, api580 GREEN, gc.lua 5/5,
   diff --check 0.
 - **Mandatory perf**: одна объявленная сессия на fixed binary
-  (3542a661…) → RESULT: OK (rc=0), per-seed дельты ±0.6% (unlink не
+  (3542a661…) → RESULT: OK (rc=0): ни один seed не достиг WARN +5%;
+  per-seed extrema −2.685%..+2.956% (оба у metamethod_call_noalloc) —
+  unlink не
   меняет instruction counts значимо); baseline НЕ обновлялся.
 - **Task 0 (paired-seed schema hardening, tools-only)**: ровно один row
   на каждый seed опубликованного списка для каждого workload обеих

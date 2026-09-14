@@ -6802,8 +6802,9 @@ Corrective-фаза по решению владельца (ledger item доба
   правлен владельческим решением (16→18 workloads; gate baseline назван;
   baseline-p15.37.json зафиксирован как исторический, гейтом не читается);
   tools/perf/README.md и docstring'и согласованы; test_perf_gate получил
-  policy-contract asserts (BASELINE.name == baseline-approved.json,
-  len(WORKLOADS) == 18) — молчаливый дрейф теперь роняет suite.
+  (Policy-contract asserts, добавленные здесь, оказались ЗАПРЕЩЁННЫМ
+  test-guard'ом и удалены в P16.47: правила проекта живут только в AGENTS,
+  без CI/test-принуждения.)
 - **BLOCKER 2 (vacuous validator)**: determinism_recheck переведён на
   структурную схему (per repeat: numeric instructions / mode /
   env_node_depth / env_node_chain_len / intern_depth); expected mode

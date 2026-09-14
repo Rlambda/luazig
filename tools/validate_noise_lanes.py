@@ -83,7 +83,6 @@ def expected_mode_for_seed(raw_runs: list[dict], seed: int) -> str | None:
 def validate(doc: dict) -> bool:
     """Run every check against a parsed noise-lanes document."""
     raw = doc["raw_runs"]
-    det = doc["determinism_recheck"]
     summary = doc["mechanical_summary"]
 
     low = [r for r in raw if r["mode"] == "low"]
@@ -129,39 +128,70 @@ def validate(doc: dict) -> bool:
           "delta_instructions_per_iteration" in json.dumps(
               doc.get("conclusion_bounded", {})))
 
-    # --- determinism recheck (structured schema) ----------------------
-    check("det: recheck set non-empty", isinstance(det, list) and len(det) > 0)
+    # --- determinism recheck (per-measurement-session schema) ----------
+    sessions = doc.get("det_sessions")
+    check("det: session list non-empty",
+          isinstance(sessions, list) and len(sessions) > 0)
+    idx = doc.get("determinism_verification", {})
+    latest = idx.get("latest_session")
+    latest_sess = next((s for s in (sessions or [])
+                        if s.get("session_id") == latest), None)
+    check("det: verification index points at an existing session",
+          latest_sess is not None)
+    if latest_sess is not None:
+        check("det: latest session has a real measured_utc",
+              isinstance(latest_sess.get("measured_utc"), str))
+        check("det: index SHA == latest session SHA",
+              idx.get("measured_source_commit")
+              == latest_sess.get("measured_source_commit"))
+        check("det: index harness == latest session harness",
+              idx.get("harness_sha256") == latest_sess.get("harness_sha256"))
+        check("det: index row_count == session rows",
+              idx.get("row_count") == len(latest_sess.get("rows", [])))
+        check("det: index seeds == session seeds",
+              idx.get("seeds")
+              == sorted(r["seed"] for r in latest_sess.get("rows", [])))
+        check("det: index repeat_count == session repeats",
+              idx.get("repeat_count")
+              == sum(len(r["repeats"]) for r in latest_sess.get("rows", [])))
     raw_instr = {r["seed"]: r["instructions"] for r in raw}
-    for row in det:
-        seed = row.get("seed")
-        exp = expected_mode_for_seed(raw, seed)
-        if not check(f"det seed {seed}: known raw seed with consistent mode",
-                     exp is not None):
-            continue
-        reps = row.get("repeats")
-        if not check(f"det seed {seed}: non-empty repeats",
-                     isinstance(reps, list) and len(reps) > 0):
-            continue
-        for i, rep in enumerate(reps):
-            required = ("instructions", "mode", "env_node_depth",
-                        "env_node_chain_len", "intern_depth")
-            if not check(f"det seed {seed} rep{i}: all fields present",
-                         all(k in rep for k in required)):
+    for sess in (sessions or []):
+        check(f"det {sess.get('session_id')}: source SHA is a full git SHA",
+              isinstance(sess.get("measured_source_commit"), str)
+              and len(sess["measured_source_commit"]) == 40)
+        check(f"det {sess.get('session_id')}: harness hash recorded",
+              isinstance(sess.get("harness_sha256"), str)
+              and len(sess["harness_sha256"]) == 64)
+        for row in sess.get("rows", []):
+            seed = row.get("seed")
+            exp = expected_mode_for_seed(raw, seed)
+            if not check(f"det seed {seed}: known raw seed with consistent mode",
+                         exp is not None):
                 continue
-            check(f"det seed {seed} rep{i}: mode == expected ({exp})",
-                  rep["mode"] == exp)
-            if exp == "low":
-                ok_place = (rep["env_node_depth"] == 0
-                            and rep["env_node_chain_len"] == 1)
-            else:
-                ok_place = (rep["env_node_depth"] >= 1
-                            and rep["env_node_chain_len"] >= 2)
-            check(f"det seed {seed} rep{i}: placement matches mode", ok_place)
-            check(f"det seed {seed} rep{i}: intern depth 0",
-                  rep["intern_depth"] == 0)
-            drift = abs(rep["instructions"] - raw_instr[seed])
-            check(f"det seed {seed} rep{i}: instruction drift {drift} "
-                  f"<= {DRIFT_BOUND_INSTR}", drift <= DRIFT_BOUND_INSTR)
+            reps = row.get("repeats")
+            if not check(f"det seed {seed}: non-empty repeats",
+                         isinstance(reps, list) and len(reps) > 0):
+                continue
+            for i, rep in enumerate(reps):
+                required = ("instructions", "mode", "env_node_depth",
+                            "env_node_chain_len", "intern_depth")
+                if not check(f"det seed {seed} rep{i}: all fields present",
+                             all(k in rep for k in required)):
+                    continue
+                check(f"det seed {seed} rep{i}: mode == expected ({exp})",
+                      rep["mode"] == exp)
+                if exp == "low":
+                    ok_place = (rep["env_node_depth"] == 0
+                                and rep["env_node_chain_len"] == 1)
+                else:
+                    ok_place = (rep["env_node_depth"] >= 1
+                                and rep["env_node_chain_len"] >= 2)
+                check(f"det seed {seed} rep{i}: placement matches mode", ok_place)
+                check(f"det seed {seed} rep{i}: intern depth 0",
+                      rep["intern_depth"] == 0)
+                drift = abs(rep["instructions"] - raw_instr[seed])
+                check(f"det seed {seed} rep{i}: instruction drift {drift} "
+                      f"<= {DRIFT_BOUND_INSTR}", drift <= DRIFT_BOUND_INSTR)
 
     print()
     if FAILS:
@@ -175,31 +205,41 @@ def load(path: Path) -> dict:
     return json.loads(path.read_text())
 
 
+def _latest_session(doc: dict) -> dict:
+    latest = doc.get("determinism_verification", {}).get("latest_session")
+    return next(s for s in doc["det_sessions"]
+                if s["session_id"] == latest)
+
+
+def _latest_rep(doc: dict) -> dict:
+    return _latest_session(doc)["rows"][0]["repeats"][0]
+
+
 def perturb(doc: dict, case: str) -> dict:
     """Return an in-memory copy with exactly one injected defect."""
     d = copy.deepcopy(doc)
     if case == "arithmetic":
         d["mechanical_summary"]["delta_branches"] += 39_000_000
     elif case == "wrong-mode":
-        d["determinism_recheck"][0]["repeats"][0]["mode"] = (
-            "low" if d["determinism_recheck"][0]["repeats"][0]["mode"] == "high"
-            else "high")
+        rep = _latest_rep(d)
+        rep["mode"] = "low" if rep["mode"] == "high" else "high"
     elif case == "wrong-placement":
-        rep = d["determinism_recheck"][0]["repeats"][0]
+        rep = _latest_rep(d)
         rep["env_node_depth"] = 0 if rep["env_node_depth"] >= 1 else 3
         rep["env_node_chain_len"] = 1 if rep["env_node_chain_len"] >= 2 else 4
     elif case == "drift":
-        d["determinism_recheck"][0]["repeats"][0]["instructions"] += 1_400_000_000
+        _latest_rep(d)["instructions"] += 1_400_000_000
     elif case == "missing-seed":
-        d["determinism_recheck"].append(
+        _latest_session(d)["rows"].append(
             {"seed": 999999, "repeats": [{"instructions": 1, "mode": "low",
                                           "env_node_depth": 0,
                                           "env_node_chain_len": 1,
                                           "intern_depth": 0}]})
     elif case == "missing-field":
-        del d["determinism_recheck"][0]["repeats"][0]["intern_depth"]
+        del _latest_rep(d)["intern_depth"]
     elif case == "empty-recheck":
-        d["determinism_recheck"] = []
+        for s in d["det_sessions"]:
+            s["rows"] = []
     else:
         raise SystemExit(f"unknown negative case: {case} "
                          f"(valid: {', '.join(NEGATIVE_CASES)})")

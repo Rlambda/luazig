@@ -311,72 +311,100 @@
   ],
   "note": "Pre-P16.46 determinism rows: per-repeat env observables recorded only as a string, intern depth not recorded. Preserved verbatim; superseded by the structured determinism_recheck schema."
  },
- "determinism_recheck": [
+ "determinism_verification": {
+  "latest_session": "p16.46-C-prime",
+  "measured_source_commit": "2682bbd00f30110665df016410de39aea7644664",
+  "harness_sha256": "8a7393868c1fc962417748205f318afd2a2f68deb02ba7f8a4e807871b87c0e4",
+  "row_count": 2,
+  "seeds": [
+   1,
+   8
+  ],
+  "repeat_count": 4
+ },
+ "det_sessions": [
   {
-   "seed": 1,
-   "source": "P16.45-finalization C-verification (commit C=7d97e5a)",
+   "session_id": "p16.45-finalization-C",
+   "measured_source_commit": "7d97e5aacf9b696e69cdce66872f357ca92f3ad3",
+   "recorded_by_commit": "fdf813d76350bbc3bfd70ca28d47eda4209a96dc",
+   "recorded_note": "Exact run wall clock was not captured during the finalization session; anchored to the wrapper commit as the recording bound. The session is NOT relabeled with a later date.",
+   "harness_path": "/tmp/opencode/C_harness_imm",
    "harness_sha256": "8a7393868c1fc962417748205f318afd2a2f68deb02ba7f8a4e807871b87c0e4",
-   "measured_via": "taskset -c 0 perf stat -e instructions:u (process total)",
-   "repeats": [
+   "command": "taskset -c 0 perf stat -e instructions:u /tmp/opencode/C_harness_imm <seed> tools/microbench.lua global_arith",
+   "rows": [
     {
-     "instructions": 13997783862,
-     "mode": "high",
-     "env_node_depth": 1,
-     "env_node_chain_len": 2,
-     "intern_depth": 0
+     "seed": 1,
+     "repeats": [
+      {
+       "instructions": 13997783862,
+       "mode": "high",
+       "env_node_depth": 1,
+       "env_node_chain_len": 2,
+       "intern_depth": 0
+      }
+     ]
     },
     {
-     "instructions": 13997783559,
-     "mode": "high",
-     "env_node_depth": 1,
-     "env_node_chain_len": 2,
-     "intern_depth": 0
-    },
-    {
-     "instructions": 13997783764,
-     "mode": "high",
-     "env_node_depth": 1,
-     "env_node_chain_len": 2,
-     "intern_depth": 0
+     "seed": 8,
+     "repeats": [
+      {
+       "instructions": 12583783630,
+       "mode": "low",
+       "env_node_depth": 0,
+       "env_node_chain_len": 1,
+       "intern_depth": 0
+      }
+     ]
     }
    ]
   },
   {
-   "seed": 8,
-   "source": "P16.45-finalization C-verification (commit C=7d97e5a)",
+   "session_id": "p16.46-C-prime",
+   "measured_source_commit": "2682bbd00f30110665df016410de39aea7644664",
+   "measured_utc": "2026-09-14T08:45:33.898494+00:00",
+   "harness_path": "/tmp/opencode/C_harness_imm",
    "harness_sha256": "8a7393868c1fc962417748205f318afd2a2f68deb02ba7f8a4e807871b87c0e4",
-   "measured_via": "taskset -c 0 perf stat -e instructions:u (process total)",
-   "repeats": [
+   "command": "taskset -c 0 perf stat -e instructions:u /tmp/opencode/C_harness_imm <seed> tools/microbench.lua global_arith",
+   "rows": [
     {
-     "instructions": 12583783630,
-     "mode": "low",
-     "env_node_depth": 0,
-     "env_node_chain_len": 1,
-     "intern_depth": 0
+     "seed": 1,
+     "repeats": [
+      {
+       "instructions": 13997783559,
+       "mode": "high",
+       "env_node_depth": 1,
+       "env_node_chain_len": 2,
+       "intern_depth": 0
+      },
+      {
+       "instructions": 13997783764,
+       "mode": "high",
+       "env_node_depth": 1,
+       "env_node_chain_len": 2,
+       "intern_depth": 0
+      }
+     ]
     },
     {
-     "instructions": 12583783578,
-     "mode": "low",
-     "env_node_depth": 0,
-     "env_node_chain_len": 1,
-     "intern_depth": 0
-    },
-    {
-     "instructions": 12583783482,
-     "mode": "low",
-     "env_node_depth": 0,
-     "env_node_chain_len": 1,
-     "intern_depth": 0
+     "seed": 8,
+     "repeats": [
+      {
+       "instructions": 12583783578,
+       "mode": "low",
+       "env_node_depth": 0,
+       "env_node_chain_len": 1,
+       "intern_depth": 0
+      },
+      {
+       "instructions": 12583783482,
+       "mode": "low",
+       "env_node_depth": 0,
+       "env_node_chain_len": 1,
+       "intern_depth": 0
+      }
+     ]
     }
    ]
   }
- ],
- "determinism_verification": {
-  "measured_utc": "2026-09-14T08:45:33.898494+00:00",
-  "measured_source_commit": "2682bbd00f30110665df016410de39aea7644664",
-  "harness_path": "/tmp/opencode/C_harness_imm",
-  "harness_sha256": "8a7393868c1fc962417748205f318afd2a2f68deb02ba7f8a4e807871b87c0e4",
-  "command": "taskset -c 0 perf stat -e instructions:u /tmp/opencode/C_harness_imm <seed> tools/microbench.lua global_arith",
-  "note": "P16.46 fresh structured repeats at clean C': seeds 1 (high) and 8 (low), 2 repeats each, full numeric observables per repeat (instructions / mode / env_node_depth / env_node_chain_len / intern_depth). All repeats validated by tools/validate_noise_lanes.py against raw evidence."
- }
+ ]
 }

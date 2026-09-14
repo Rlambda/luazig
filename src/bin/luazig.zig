@@ -1106,6 +1106,9 @@ fn interpreterMain(init: std.process.Init) !void {
     const env = stdio.activeEnviron();
     const track_env_val = env.getAlloc(alloc, "LUAZIG_TRACK_ALLOC") catch null;
     defer if (track_env_val) |v| alloc.free(v);
+    // P16.48-review: optional pinned hash seed (see the Vm init below).
+    const hash_seed_env = env.getAlloc(alloc, "LUAZIG_HASH_SEED") catch null;
+    defer if (hash_seed_env) |v| alloc.free(v);
     const track_alloc = track_env_val != null and
         (std.mem.eql(u8, track_env_val.?, "1") or std.mem.eql(u8, track_env_val.?, "true"));
     // LUAZIG_C_ALLOC=1 selects the libc allocator for diagnostic A/B runs
@@ -1161,8 +1164,25 @@ fn interpreterMain(init: std.process.Init) !void {
     // PUC pmain: if has_E, set LUA_NOENV (handled via Vm.init noenv flag).
     const disable_env = (cr.args & has_E) != 0;
 
-    // --- Create VM and open libraries ---
-    var vm = lua.internal.vm.Vm.init(runtime_alloc, disable_env);
+    // P16.48-review: LUAZIG_HASH_SEED=<u64> pins the VM hash seed for
+    // PAIRED perf measurement (tools/perf_compare.py runs the same
+    // published seed list for baseline and candidate, making per-seed
+    // instruction deltas deterministic). Measurement affordance only,
+    // following the LUAZIG_TRACK_ALLOC / LUAZIG_C_ALLOC precedent: unset
+    // (the default) keeps the entropy-derived seed — production behavior
+    // is byte-for-byte unchanged. The seed is already per-process
+    // arbitrary; pinning it changes no Lua semantics.
+    var vm = seed_env_value: {
+        if (hash_seed_env) |txt| {
+            const seed = std.fmt.parseInt(u64, txt, 10) catch {
+                var errw = stdio.stderr();
+                errw.writeAll("luazig: LUAZIG_HASH_SEED must be a u64 decimal\n") catch {};
+                std.process.exit(1);
+            };
+            break :seed_env_value lua.internal.vm.Vm.initWithSeed(runtime_alloc, disable_env, seed);
+        }
+        break :seed_env_value lua.internal.vm.Vm.init(runtime_alloc, disable_env);
+    };
     // Create the main lua_State handle so C API functions (callCFunction,
     // hooks, continuations) receive a valid ?*lua_State. The handle stores
     // a pointer to `vm`, so it must be created AFTER `vm` is at its final

@@ -258,6 +258,16 @@
     подтверждаются компактным manifest `current-gate-manifest.json`
     (timestamp, source SHA, binary hash, artifact hash, result, per-mode
     centers).
+  - Paired-seed протокол (P16.48-review): production binary принимает env
+    `LUAZIG_HASH_SEED=<u64>` (measurement affordance по прецеденту
+    LUAZIG_TRACK_ALLOC / LUAZIG_C_ALLOC; unset = entropy, поведение по
+    умолчанию не меняется); гейт исполняет опубликованный фиксированный
+    SEED_LIST (seeds 1..21, DEFAULT_RUNS=21) для ОБЕИХ сессий baseline и
+    candidate; вердикт — per-seed paired instruction-deltas
+    (детерминированные, без сэмплинг-неоднозначности); миграции seed-мод —
+    FAIL by construction; seed-identity mismatch / анонимные сэмплы →
+    INCONCLUSIVE; manifest хранит полные sha256; `--gate-out`-редиректы
+    canonical manifest не мутируют.
 
 - **`python3 tools/perf_core_snapshot.py`** — end-to-end замер upstream suites
   (nextvar, coroutine, gc). Используется `tools/release_gate.sh`.

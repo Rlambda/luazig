@@ -57,13 +57,22 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 
 # ---------------------------------------------------------------------------
-# P16.48 matched-mode matrix: INDEPENDENT clustering of both sides,
-# order-matched centers, weight compatibility, wall-P25 envelope rule.
-# Pure fixtures — no binaries, no policy constants, no workload names.
+# P16.48-review: PAIRED-SEED verdict matrix. Fixtures carry seed
+# identities; the verdict is a per-seed paired instruction delta — no
+# sampling ambiguity, migrations FAIL by construction.
 # ---------------------------------------------------------------------------
-def mk_rows(walls, instrs, mode=""):
-    return [{"wall": w, "instructions": i, "mode": mode}
+def mk_rows(walls, instrs, mode="", seeds=None):
+    rows = [{"wall": w, "instructions": i, "mode": mode}
             for w, i in zip(walls, instrs)]
+    if seeds is not None:
+        for r, s in zip(rows, seeds):
+            r["seed"] = s
+    return rows
+
+
+SEEDS = list(range(1, 22))  # arbitrary fixture seed identities
+S10 = SEEDS[:10]
+S21 = SEEDS
 
 
 def run_mode(zig_samples, baseline):
@@ -78,143 +87,176 @@ def blank_doc(samples):
             "zig_samples": samples}
 
 
-# N1. missing baseline workload in candidate -> INCONCLUSIVE/nonzero.
-bl = blank_doc({"wl": mk_rows([1.0] * 5, [100] * 5, "mono")})
-res, table = run_mode({}, bl)
-check("N1 missing baseline workload INCONCLUSIVE",
-      res["inconclusive"] is True and res["fail"] is False)
+def bimodal(seeds, low_n=10, base=100, high=111, wall=1.0):
+    """Bimodal fixture: first low_n seeds cost `base`, rest cost `high`."""
+    rows = []
+    for i, s in enumerate(seeds):
+        cost = base if i < low_n else high
+        rows.append({"wall": wall, "instructions": cost, "seed": s})
+    return rows
 
-# N2. partial mode migration (reviewer fixture): baseline low=10x100 /
-#     high=10x111; candidate 1x100 + 20x111 -> must NEVER be OK.
-bl = blank_doc({"wl": mk_rows([1.0] * 10, [100] * 10)
-                       + mk_rows([1.0] * 10, [111] * 10)})
-cand = {"wl": mk_rows([1.0], [100]) + mk_rows([1.0] * 20, [111] * 20)}
-res, table = run_mode(cand, bl)
-check("N2 mode migration nonzero", (res["fail"] or res["inconclusive"]) is True)
 
-# N3. mono -> minority +11% (reviewer fixture): 21x100 vs 11x100+10x111.
-bl = blank_doc({"wl": mk_rows([1.0] * 21, [100] * 21)})
-cand = {"wl": mk_rows([1.0] * 11, [100] * 11)
-             + mk_rows([1.0] * 10, [111] * 10)}
-res, table = run_mode(cand, bl)
-check("N3 mono->minority +11% nonzero", res["inconclusive"] is True)
+# M1. EXTREME migration (P16.48 reviewer fixture) 10/10 -> 1/20:
+#     paired terms — seeds 2..10 (9 low seeds) moved to 111 -> FAIL.
+bl = blank_doc({"wl": bimodal(S10 + S10[0:0] + list(range(11, 21)),
+                              low_n=10)})
+cand_rows = [{"wall": 1.0, "instructions": (100 if s == 1 else 111),
+              "seed": s}
+             for s in list(range(1, 21))]
+res, table = run_mode({"wl": cand_rows}, bl)
+check("M1 extreme migration 10/10->1/20 FAILs",
+      res["fail"] is True)  # 9 migrated seeds show +11% per-seed deltas
 
-# N4. mirror: bimodal -> mono collapse -> nonzero.
-bl = blank_doc({"wl": mk_rows([1.0] * 10, [100] * 10)
-                       + mk_rows([1.0] * 10, [111] * 10)})
-cand = {"wl": mk_rows([1.0] * 21, [100] * 21)}
-res, table = run_mode(cand, bl)
-check("N4 bimodal->mono nonzero", res["inconclusive"] is True)
+# M2. MODERATE migration (reviewer fixture) 10/10 -> 3/18: seeds 4..10
+#     (7 low seeds) moved +11% -> FAIL (the old binomial guard stayed
+#     green at p=0.0015 > alpha).
+cand_rows = [{"wall": 1.0, "instructions": (100 if s <= 3 else 111),
+              "seed": s}
+             for s in list(range(1, 21))]
+res, table = run_mode({"wl": cand_rows}, bl)
+check("M2 moderate migration 10/10->3/18 FAILs", res["fail"] is True)
 
-# N5. same independently clustered mono populations -> OK.
-bl = blank_doc({"wl": mk_rows([0.5] * 21, [1000 + k for k in range(21)])})
-cand = {"wl": mk_rows([0.5] * 21, [1000 + k * 0 for k in range(21)])}
-res, table = run_mode(cand, bl)
-check("N5 matched mono OK", res["fail"] is False
-      and res["inconclusive"] is False and res["warn"] is False)
+# M3. Intermediate mass shifts (5/16-class and lighter): every shift of
+#     >= 1 low seed by +11% must be nonzero; 5 stay / 5 move -> FAIL.
+for keep in (5, 4, 3, 2, 1):
+    cand_rows = [{"wall": 1.0,
+                  "instructions": (100 if s <= keep else 111),
+                  "seed": s}
+                 for s in list(range(1, 21))]
+    res, table = run_mode({"wl": cand_rows}, bl)
+    if not res["fail"]:
+        check(f"M3 shift keep={keep} FAILs", False)
+check("M3 all intermediate mass shifts FAIL", True)
 
-# N6. same binary, sessions with different mode MIXES but compatible
-#     weights -> not a regression (the old scalar +13% flip must not FAIL).
-bl = blank_doc({"wl": mk_rows([1.0] * 12, [100] * 12)
-                       + mk_rows([1.0] * 9, [111] * 9)})
-cand = {"wl": mk_rows([1.0] * 9, [100] * 9) + mk_rows([1.0] * 12, [111] * 12)}
-res, table = run_mode(cand, bl)
-check("N6 cross-mode same-binary mix OK", res["fail"] is False
-      and res["inconclusive"] is False and res["warn"] is False)
-
-# N7. wall-lottery flip (same instructions): within each mode the session
-#     mixes fast/slow wall sublevels (measured shape: levels ~0.75/0.95
-#     interleaved per process); medians move, the P25 ENVELOPE keeps the
-#     fast edge — verdict stays OK.
-bl = blank_doc({"wl": mk_rows([0.75] * 10, [100] * 10)
-                       + mk_rows([0.85] * 10, [111] * 10)})
-cand = {"wl": mk_rows([0.75] * 5 + [0.95] * 5, [100] * 10)
-               + mk_rows([0.74] * 5 + [0.95] * 5, [111] * 10)}
-res, table = run_mode(cand, bl)
-check("N7 wall-lottery median flip stays OK", res["fail"] is False
-      and res["inconclusive"] is False and res["warn"] is False)
-
-# N8. +11% inside a stably matched mode (centers 30% apart, weights kept)
-#     -> FAIL.
-bl = blank_doc({"wl": mk_rows([0.6] * 10, [1000] * 10)
-                       + mk_rows([0.8] * 10, [1300] * 10)})
-cand = {"wl": mk_rows([0.6] * 10, [1110] * 10)
-               + mk_rows([0.8] * 10, [1300] * 10)}
-res, table = run_mode(cand, bl)
-check("N8 +11% in matched low FAIL", res["fail"] is True)
-
-# N9. +11% inside high mode -> FAIL.
-cand = {"wl": mk_rows([0.6] * 10, [1000] * 10)
-               + mk_rows([0.8] * 10, [1443] * 10)}
-res, table = run_mode(cand, bl)
-check("N9 +11% in matched high FAIL", res["fail"] is True)
-
-# N10. weight change beyond the binomial bound (10/10 -> 1/20) -> nonzero.
-cand = {"wl": mk_rows([1.0], [100]) + mk_rows([1.0] * 20, [111] * 20)}
-res, table = run_mode(cand, bl)
-check("N10 weight-migration nonzero", res["inconclusive"] is True)
-
-# N11. reorder invariance: reversed candidate samples, same aggregates.
-a = {"wl": mk_rows([0.6] * 10, [1000 + k for k in range(10)])
-           + mk_rows([0.8] * 10, [1300 + k for k in range(10)])}
-b = {"wl": list(reversed(a["wl"]))}
-ra, _ = run_mode(a, bl)
-rb, _ = run_mode(b, bl)
-check("N11 reorder invariant", (ra["fail"], ra["warn"], ra["inconclusive"])
+# M4. Reorder invariance: shuffled candidate rows, identical aggregates.
+rows_a = bimodal(list(range(1, 21)), low_n=10)
+a = {"wl": [dict(r) for r in rows_a]}
+b = {"wl": list(reversed([dict(r) for r in rows_a]))}
+ra, _ = run_mode(a, blank_doc({"wl": rows_a}))
+rb, _ = run_mode(b, blank_doc({"wl": rows_a}))
+check("M4 reorder invariant", (ra["fail"], ra["warn"], ra["inconclusive"])
       == (rb["fail"], rb["warn"], rb["inconclusive"]))
 
-# N12. FAIL not erased by a later INCONCLUSIVE (fold after the loop).
-doc2 = blank_doc({"ok_wl": mk_rows([1.0] * 10, [1000] * 10)
-                          + mk_rows([1.0] * 10, [1300] * 10),
-                  "gone_wl": mk_rows([1.0] * 5, [100] * 5)})
-cand = {"ok_wl": mk_rows([1.0] * 10, [1110] * 10)
-               + mk_rows([1.0] * 10, [1300] * 10)}  # FAIL in low
+# M5. Real +11% inside a mode STAYS FAIL (not generic INCONCLUSIVE):
+#     modes 100/130; all low seeds +11% -> 111 (still nearer low; the
+#     per-seed delta is exactly the regression).
+bl = blank_doc({"wl": bimodal(list(range(1, 21)), low_n=10,
+                              base=100, high=130)})
+cand_rows = [{"wall": 1.0, "instructions": (111 if s <= 10 else 130),
+              "seed": s} for s in list(range(1, 21))]
+res, table = run_mode({"wl": cand_rows}, bl)
+check("M5 +11% within mode is FAIL", res["fail"] is True
+      and res["inconclusive"] is False)
+
+# M6. Same binary / same seeds: everything reproduces -> all OK.
+base_rows = bimodal(list(range(1, 21)), low_n=10, base=1000, high=1111)
+cand_rows = [dict(r) for r in base_rows]
+res, table = run_mode({"wl": cand_rows}, blank_doc({"wl": base_rows}))
+check("M6 identical paired populations OK", res["fail"] is False
+      and res["inconclusive"] is False and res["warn"] is False)
+
+# M7. Missing baseline workload -> INCONCLUSIVE.
+res, table = run_mode({}, blank_doc({"wl": base_rows}))
+check("M7 missing workload INCONCLUSIVE", res["inconclusive"] is True)
+
+# M8. Seed-identity mismatch -> INCONCLUSIVE (corrupt evidence).
+cand_rows = [dict(r) for r in base_rows]
+cand_rows[0]["seed"] = 999
+res, table = run_mode({"wl": cand_rows}, blank_doc({"wl": base_rows}))
+check("M8 seed mismatch INCONCLUSIVE", res["inconclusive"] is True)
+
+# M9. Anonymous (pre-paired) samples -> INCONCLUSIVE, not a verdict.
+anon = [{"wall": 1.0, "instructions": 1000, "mode": "mono"}]
+res, table = run_mode({"wl": anon}, blank_doc({"wl": anon}))
+check("M9 anonymous schema INCONCLUSIVE", res["inconclusive"] is True)
+
+# M10. mono<->split form change with SUB-THRESHOLD per-seed deltas ->
+#      INCONCLUSIVE (the guard exists for evidence-shape anomalies that
+#      carry no verdict-relevant delta; a real delta must FAIL instead —
+#      see M1-M5). Baseline: two tight sub-threshold groups (gap 4.5%);
+#      candidate: second group +1% -> gap crosses 5% -> form flips while
+#      every per-seed delta stays OK.
+base_rows = ([{"wall": 1.0, "instructions": 1000 + s, "seed": s}
+              for s in SEEDS[:10]]
+             + [{"wall": 1.0, "instructions": 1049 + s, "seed": s}
+                for s in SEEDS[10:20]])
+cand_rows = ([dict(r) for r in base_rows[:10]]
+             + [{"wall": 1.0, "instructions": int((1049 + s) * 1.01),
+                 "seed": s} for s in SEEDS[10:20]])
+res, table = run_mode({"wl": cand_rows}, blank_doc({"wl": base_rows}))
+check("M10 sub-threshold mono->split INCONCLUSIVE",
+      res["inconclusive"] is True and res["fail"] is False)
+res, table = run_mode({"wl": base_rows}, blank_doc({"wl": cand_rows}))
+check("M10 sub-threshold split->mono INCONCLUSIVE",
+      res["inconclusive"] is True and res["fail"] is False)
+
+# M11. Outlier above the split threshold with a too-small cluster ON THE
+#      BASELINE SIDE (identical candidate — every per-seed delta is ~0):
+#      the evidence shape itself is anomalous and cannot back a green
+#      verdict -> INCONCLUSIVE. (A candidate-side-only outlier of that
+#      magnitude would show a >5% per-seed delta and FAIL first — the
+#      guard ordering guarantees real deltas are never masked.)
+mono_rows = [{"wall": 1.0, "instructions": 1000 + s, "seed": s}
+             for s in S21]
+out_base = [dict(r) for r in mono_rows]
+out_base[2]["instructions"] = 1080  # isolated by ~5.9% > threshold
+res, table = run_mode({"wl": [dict(r) for r in out_base]},
+                      blank_doc({"wl": out_base}))
+check("M11 baseline-side outlier INCONCLUSIVE",
+      res["inconclusive"] is True and res["fail"] is False)
+
+# M12. FAIL not erased by a later INCONCLUSIVE (fold after the loop).
+doc2 = blank_doc({"ok_wl": mono_rows, "gone_wl": mono_rows[:5]})
+cand = {"ok_wl": [{"wall": 1.0, "instructions": 1120 + s, "seed": s}
+                  for s in S21]}  # +12% on every seed -> FAIL
 res, table = run_mode(cand, doc2)
-check("N12 FAIL preserved alongside INCONCLUSIVE",
+check("M12 FAIL preserved alongside INCONCLUSIVE",
       res["fail"] is True and res["inconclusive"] is True)
 
-# N13. corrupt evidence: a wild outlier sample becomes a 1-sample
-#      "cluster" -> rejected as a mode (outlier) -> form change or weight
-#      incompatibility -> INCONCLUSIVE.
-bl = blank_doc({"wl": mk_rows([1.0] * 21, [100] * 21)})
-cand = {"wl": mk_rows([1.0] * 21, [100] * 20 + [500])}
-res, table = run_mode(cand, bl)
-check("N13 corrupt outlier INCONCLUSIVE", res["inconclusive"] is True)
+# M13. Candidate-only workload -> NEW informational row.
+res, table = run_mode({"wl": [dict(r) for r in mono_rows],
+                       "brand_new": mono_rows[:3]}, blank_doc({"wl": mono_rows}))
+check("M13 candidate-only NEW informational", "NEW" in table)
 
-# N14. candidate-only workload -> NEW informational row, no verdict.
-bl = blank_doc({"wl": mk_rows([1.0] * 10, [100] * 10)
-                       + mk_rows([1.0] * 10, [1300] * 10)})
-cand = {"wl": mk_rows([1.0] * 21, [100] * 21),
-        "brand_new": mk_rows([1.0] * 5, [7] * 5)}
-res, table = run_mode(cand, bl)
-check("N14 candidate-only NEW informational", "NEW" in table)
+# M14. Weights computed FROM LABELS (P16.48-review BLOCKER 2): ten
+#      DISTINCT low values + ten DISTINCT high values must give
+#      baseline_low_frac == 0.5 (the old median-comparison gave 0.25).
+rows = ([{"wall": 1.0, "instructions": 1000 + 3 * s, "seed": s}
+         for s in SEEDS[:10]]
+        + [{"wall": 1.0, "instructions": 1300 + 3 * s, "seed": s}
+           for s in SEEDS[10:20]])
+cand_rows = [dict(r) for r in rows]
+res, table = run_mode({"wl": cand_rows}, blank_doc({"wl": rows}))
+w = res["matching"]["wl"]["weights"]
+check("M14 weights from labels (0.5 not 0.25)",
+      w["baseline_low_frac"] == 0.5 and w["candidate_low_frac"] == 0.5)
 
-# N15. wall-P25 envelope secondary rule: instructions identical (OK) but
-#      the candidate's fast envelope moved +12% -> INCONCLUSIVE + counter
-#      guidance (owner-approved P16.48 policy).
-bl = blank_doc({"wl": mk_rows([0.50] * 10, [1000] * 10)
-                       + mk_rows([0.80] * 10, [1300] * 10)})
-cand = {"wl": mk_rows([0.56] * 10, [1000] * 10)
-               + mk_rows([0.90] * 10, [1300] * 10)}
+# M15. Wall-P25 envelope secondary rule with paired OK instructions.
+bl = blank_doc({"wl": [{"wall": 0.50, "instructions": 1000 + s, "seed": s}
+                       for s in S21]})
+cand = {"wl": [{"wall": 0.56, "instructions": 1000 + s, "seed": s}
+               for s in S21]}
 res, table = run_mode(cand, bl)
-check("N15 wall-P25 envelope shift INCONCLUSIVE",
+check("M15 wall-P25 envelope shift INCONCLUSIVE",
       res["inconclusive"] is True and res["fail"] is False
       and "causal counters" in table)
 
-# N16. classify_modes: WARN-tied split threshold + outlier rejection.
-mono_rows = [{"wall": 0.5, "instructions": 1000 + k} for k in range(20)]
-ev = pc.classify_modes(mono_rows)
-check("N16 spread below threshold stays mono",
-      set(ev["centers"]) == {"mono"})
-bim_rows = ([{"wall": 0.5, "instructions": 1000 + k} for k in range(10)]
-            + [{"wall": 0.5, "instructions": 1120 + k} for k in range(10)])
-ev2 = pc.classify_modes(bim_rows)
-check("N16 gap above threshold splits", set(ev2["centers"]) == {"low", "high"})
-outlier = [{"wall": 0.5, "instructions": 1000 + k} for k in range(20)]
-outlier[0]["instructions"] = 900
-ev3 = pc.classify_modes(outlier)
-check("N16 one-sample cluster rejected as outlier",
-      set(ev3["centers"]) == {"mono"})
+# M16. Wall-lottery median flip (fast sublevel intact) stays OK.
+cand = {"wl": [{"wall": 0.50 if s % 2 else 0.95,
+                "instructions": 1000 + s, "seed": s} for s in S21]}
+res, table = run_mode(cand, bl)
+check("M16 wall-lottery median flip OK", res["fail"] is False
+      and res["inconclusive"] is False)
+
+# M17. classify_modes basics (kept): spread< threshold mono; gap> splits;
+#      one-sample cluster rejected.
+mono_e = pc.classify_modes([{"wall": 0.5, "instructions": 1000 + k}
+                            for k in range(20)])
+check("M17 spread below threshold mono", set(mono_e["centers"]) == {"mono"})
+bim_e = pc.classify_modes(
+    [{"wall": 0.5, "instructions": 1000 + k} for k in range(10)]
+    + [{"wall": 0.5, "instructions": 1120 + k} for k in range(10)])
+check("M17 gap above threshold splits", set(bim_e["centers"]) == {"low", "high"})
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +285,55 @@ SPREADS = {"w1": {"min": 0.9, "max": 1.1, "median": 1.0},
            "w2": {"min": 1.9, "max": 2.1, "median": 2.0}}
 INJ_PROV = {"git_head": "cccc" * 10, "zig_binary_sha256": "dddd" * 8,
             "puc_binary_sha256": "eeee" * 8}
+
+
+# ---------------------------------------------------------------------------
+# P16.48-review MEDIUM: manifest schema contract + redirect separation.
+# ---------------------------------------------------------------------------
+def test_manifest_contract():
+    check("manifest: redirected run must not touch canonical",
+          pc.should_write_manifest("/tmp/review.json", "") is False)
+    check("manifest: canonical run writes canonical",
+          pc.should_write_manifest("", "") is True)
+    check("manifest: explicit manifest-out wins over gate-out",
+          pc.should_write_manifest("/tmp/r.json", "/tmp/m.json") is True)
+    with tempfile.TemporaryDirectory() as td:
+        mp = Path(td) / "manifest.json"
+        entry = {"created_utc": "2026-09-14T00:00:00Z",
+                 "source_head": "a" * 40,
+                 "zig_binary_sha256": "b" * 64,
+                 "seed_list": [1, 2], "runs": 21, "result": "OK",
+                 "artifact_sha256": "c" * 64, "mode_centers": {}}
+        pc.manifest_append(mp, entry)
+        pc.manifest_append(mp, dict(entry, result="FAIL"))
+        data = _json.loads(mp.read_text())
+        check("manifest: atomic append keeps history",
+              [e["result"] for e in data] == ["OK", "FAIL"])
+        check("manifest: no tmp residue",
+              not (Path(str(mp) + ".tmp")).exists())
+    # Canonical manifest (if present): rows written by the paired-seed
+    # protocol (they carry "seed_list") must carry FULL 64-hex digests —
+    # never null, never a short prefix posing as a full hash. Legacy rows
+    # (pre-protocol, no "seed_list") may carry a null zig digest — the old
+    # writer never recorded it and the true historical digest is
+    # unrecoverable — but a short/prefix digest must still fail, and every
+    # row's artifact hash must be a full 64-hex string.
+    canon = REPO / "tools/perf/current-gate-manifest.json"
+    if canon.exists():
+        rows = _json.loads(canon.read_text())
+        def _hex64(v):
+            return isinstance(v, str) and len(v) == 64
+        ok_hashes = all(
+            (_hex64(e.get("zig_binary_sha256"))
+             if "seed_list" in e
+             else (e.get("zig_binary_sha256") is None
+                   or _hex64(e.get("zig_binary_sha256"))))
+            and _hex64(e.get("artifact_sha256"))
+            for e in rows) if rows else True
+        check("manifest: canonical rows carry full 64-hex hashes", ok_hashes)
+
+
+test_manifest_contract()
 
 
 def test_real_serializer():

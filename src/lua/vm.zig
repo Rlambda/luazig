@@ -5803,9 +5803,11 @@ pub const Vm = struct {
 
     pub fn apiNewThread(self: *Vm, callee: Value) Error!*Thread {
         try exposeDispatchResult(void, self.testcChargeMemory(@sizeOf(Thread) + 64));
+        // P16.50 transactional: prepare-first, infallible commit.
+        try self.gcPrepareRegister(1);
         const th = try self.alloc.create(Thread);
         th.* = .{ .status = .suspended, .callee = callee };
-        try self.gcRegisterThread(th);
+        self.gcRegisterCommit(.{ .thread = th });
         self.gcNoteAlloc(@sizeOf(Thread));
         self.testc_obj_threads += 1;
         // P15.40a: Pre-allocate frame capacity for the new coroutine. This
@@ -8049,7 +8051,7 @@ pub const Vm = struct {
     /// unclamped GCdebt; a count clamped at 0 while the debt keeps growing
     /// only makes debt-based firing LATER, and the explicit gcAutoCycleDue
     /// re-check in the gates still fires the cycle at the threshold.
-    inline fn gcNoteFree(self: *Vm, bytes: usize) void {
+    pub inline fn gcNoteFree(self: *Vm, bytes: usize) void {
         const kb: f64 = @as(f64, @floatFromInt(bytes)) / 1024.0;
         self.gc_count_kb = @max(0, self.gc_count_kb - kb);
         self.gc_step_debt_kb += kb;
@@ -8123,19 +8125,44 @@ pub const Vm = struct {
     /// PUC lgc.c:301: new objects get the current white bit.
     /// `gc_index` is the object's position in `gc_objects`, used by
     /// `gcUnregisterObject` for O(1) `swapRemove`.
-    fn gcRegisterObject(self: *Vm, obj: GcObject) std.mem.Allocator.Error!void {
+    /// P16.50: FALLIBLE capacity preparation, separated from the
+    /// infallible commit. PUC `luaC_newobj` links a new object into the
+    /// intrusive `allgc` list — allocation-free and infallible — so a PUC
+    /// constructor can never fail BETWEEN creating an object and
+    /// registering it. Our ArrayList registries must grow, and growth can
+    /// fail; the transactional contract restores the PUC shape:
+    ///
+    ///   try vm.gcPrepareRegister(n);     // fallible, BEFORE allocating
+    ///   const obj = try alloc.create(T); // failure leaves nothing
+    ///   obj.* = ...;
+    ///   vm.gcRegisterCommit(.{ ... });   // INFALLIBLE
+    ///
+    /// After a successful prepare, exactly n commits must follow (across
+    /// the objects of this construction); each commit is appendAssume-
+    /// Capacity on both registries — no allocation, no failure. Callers
+    /// that cannot order prepare before their allocations keep using the
+    /// legacy `gcRegisterObject` (prepare+commit fused) and must own the
+    /// rollback of the allocated object on failure.
+    ///
+    /// In steady state both ensureUnusedCapacity calls are amortized no-ops
+    /// (the capacity check is a comparison), so the hot path (opClosure)
+    /// pays one predictable branch per construction, not per object.
+    pub fn gcPrepareRegister(self: *Vm, n: usize) std.mem.Allocator.Error!void {
+        try self.gc_objects.ensureUnusedCapacity(self.alloc, n);
+        if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
+            try self.gc_young_objects.ensureUnusedCapacity(self.alloc, n);
+    }
+
+    /// P16.50: infallible registry commit (see gcPrepareRegister). The
+    /// accounting runs here — exactly at commit, symmetric with
+    /// gcNoteFree/gcUnregisterObjectRollback on the rollback side.
+    pub fn gcRegisterCommit(self: *Vm, obj: GcObject) void {
         // P16.0b: per-type allocation counts. GcObject is a tagged union,
         // so @intFromEnum yields the active tag (declaration order: table,
         // closure, thread, string, cell, userdata — matches alloc_by_type).
-        // P16.49-review-2: count the registration only AFTER the fallible
-        // capacity reservations succeed — the old placement (before them)
-        // left alloc_by_type incremented when registration failed, so a
-        // rolled-back object permanently drifted the per-type counters.
-        // (PUC luaC_newobj has no such counter; ours must at least be
-        // consistent with actual registrations.)
-        try self.gc_objects.ensureUnusedCapacity(self.alloc, 1);
-        if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
-            try self.gc_young_objects.ensureUnusedCapacity(self.alloc, 1);
+        // P16.49-review-2: count the registration only AFTER capacity
+        // preparation succeeded — a rolled-back object must never drift
+        // the per-type counters. (PUC luaC_newobj has no such counter.)
         if (self.stats.enabled) self.stats.alloc_by_type[@intFromEnum(obj)] += 1;
         const p = gcPtr(obj);
         p.marked.* = self.gc_current_white & WHITEBITS;
@@ -8158,6 +8185,17 @@ pub const Vm = struct {
             p.age.* = .new;
             self.gc_young_objects.appendAssumeCapacity(obj);
         }
+    }
+
+    /// Legacy fused registration (prepare + commit in one fallible step).
+    /// P16.50: transactional constructors call gcPrepareRegister BEFORE
+    /// allocating and gcRegisterCommit after — for them registration can
+    /// no longer fail. This wrapper remains for sites whose ownership
+    /// analysis is still pending; on error the registries are untouched
+    /// and the CALLER owns the rollback of any already-created object.
+    fn gcRegisterObject(self: *Vm, obj: GcObject) std.mem.Allocator.Error!void {
+        try self.gcPrepareRegister(1);
+        self.gcRegisterCommit(obj);
     }
 
     /// Sweep-time unregistration. swapRemoves from gc_objects using the
@@ -8201,7 +8239,7 @@ pub const Vm = struct {
     /// never freed while linked in a registry it belongs to". The linear
     /// scan is acceptable: this path runs at most once per failed
     /// constructor (OOM), never on a hot loop.
-    fn gcUnregisterObjectRollback(self: *Vm, obj: GcObject) void {
+    pub fn gcUnregisterObjectRollback(self: *Vm, obj: GcObject) void {
         self.gcUnregisterObjectSweep(obj);
         const items = self.gc_young_objects.items;
         var i: usize = 0;
@@ -8214,11 +8252,16 @@ pub const Vm = struct {
     }
 
     fn allocTableNoGc(self: *Vm) std.mem.Allocator.Error!*Table {
-        self.testcNoteMemory(@sizeOf(Table) + 64);
+        // P16.50 transactional: reserve registry capacity BEFORE the
+        // allocation so registration cannot fail once the object exists;
+        // the testc byte note moves after success (the old before-alloc
+        // placement drifted total_bytes when create failed).
+        try self.gcPrepareRegister(1);
         const t = try self.alloc.create(Table);
         t.* = .{};
-        try self.gcRegisterTable(t);
+        self.gcRegisterCommit(.{ .table = t });
         self.gcNoteAlloc(@sizeOf(Table));
+        self.testcNoteMemory(@sizeOf(Table) + 64);
         self.testc_obj_tables += 1;
         return t;
     }
@@ -8308,9 +8351,15 @@ pub const Vm = struct {
     }
 
     fn allocTableEphemeral(self: *Vm) std.mem.Allocator.Error!*Table {
+        // P16.50 transactional (prepare-first, infallible commit) + the
+        // gcNoteAlloc charge the old path skipped: gcFreeObject credits
+        // every swept table unconditionally, so an uncharged construction
+        // drifted gc_count_kb downward.
+        try self.gcPrepareRegister(1);
         const t = try self.alloc.create(Table);
         t.* = .{};
-        try self.gcRegisterTable(t);
+        self.gcRegisterCommit(.{ .table = t });
+        self.gcNoteAlloc(@sizeOf(Table));
         return t;
     }
 
@@ -8326,14 +8375,20 @@ pub const Vm = struct {
     pub fn allocUserdata(self: *Vm, size: usize, nuvalue: usize) DispatchError!*Userdata {
         const total = @sizeOf(Userdata) + nuvalue * @sizeOf(Value) + size;
         try self.testcChargeMemory(total);
+        // P16.50 transactional: registry capacity BEFORE the allocation;
+        // every failure below then rolls back with plain errdefers —
+        // no partially-created userdata can survive.
+        try self.gcPrepareRegister(1);
         const ud = try self.alloc.create(Userdata);
-        ud.* = .{
-            .uservalues = if (nuvalue > 0) try self.alloc.alloc(Value, nuvalue) else &.{},
-            .payload = if (size > 0) try self.alloc.alloc(u8, size) else &.{},
-        };
+        errdefer self.alloc.destroy(ud);
+        const uvs: []Value = if (nuvalue > 0) try self.alloc.alloc(Value, nuvalue) else &.{};
+        errdefer if (uvs.len > 0) self.alloc.free(uvs);
+        const payload: []u8 = if (size > 0) try self.alloc.alloc(u8, size) else &.{};
+        errdefer if (payload.len > 0) self.alloc.free(payload);
+        ud.* = .{ .uservalues = uvs, .payload = payload };
         @memset(ud.payload, 0);
         for (ud.uservalues) |*uv| uv.* = .Nil;
-        try self.gcRegisterObject(.{ .userdata = ud });
+        self.gcRegisterCommit(.{ .userdata = ud });
         self.testc_obj_userdata += 1;
         self.gcNoteAlloc(total);
         return ud;
@@ -14513,6 +14568,10 @@ pub const Vm = struct {
             const owned_upvalues = try self.alloc.alloc(*Cell, upvalues_in.len);
             errdefer self.alloc.free(owned_upvalues);
             @memcpy(owned_upvalues, upvalues_in);
+            // P16.50 transactional: prepare-first so registration cannot
+            // fail after the tree retain (the old order leaked the tree
+            // reference on a registration failure).
+            try self.gcPrepareRegister(1);
             const cl = try self.alloc.create(Closure);
             errdefer self.alloc.destroy(cl);
             cl.* = .{
@@ -14521,7 +14580,7 @@ pub const Vm = struct {
             };
             // Retain the tree owner (P16.16 C2/T4.2: derived from proto).
             _ = self.retainTreeForClosure(proto_in);
-            try self.gcRegisterClosure(cl);
+            self.gcRegisterCommit(.{ .closure = cl });
             self.gcNoteAlloc(@sizeOf(Closure) + upvalues_in.len * @sizeOf(*Cell));
             self.testc_obj_functions += 1;
             break :blk cl;
@@ -17951,7 +18010,40 @@ pub const Vm = struct {
 
         // Create upvalue cells from child's upvalue descriptions.
         const nups = child_proto.upvalues.len;
+        // P16.50 transactional: bulk registry preparation for ALL objects
+        // of this construction (up to nups new Cells + the Closure). After
+        // this succeeds, every gcRegisterCommit below is infallible — the
+        // PUC luaC_newobj shape (infallible link into allgc), so a
+        // half-built closure can never fail BETWEEN creation and
+        // registration. In steady state both capacity checks are amortized
+        // no-ops; the commit path adds no work.
+        try self.gcPrepareRegister(nups + 1);
         const cells = try self.alloc.alloc(*Cell, nups);
+        // P16.50: full errdefer. On ANY failure after the array exists:
+        // free the array, and for every Cell this instruction CREATED
+        // (tracked by created_cells) roll back in reverse — unregister
+        // (order-preserving on the young list), reverse the note, restore
+        // the boxed slot to null, destroy. Cells created by EARLIER
+        // instructions (shared via boxed[]) are NOT ours to touch.
+        var created_cells: usize = 0;
+        errdefer {
+            // Roll back in reverse BEFORE freeing the array — the loop
+            // reads cells[..] (the free used to run first: a read-after-
+            // free inside this very errdefer).
+            while (created_cells > 0) {
+                created_cells -= 1;
+                const cell = cells[created_cells];
+                self.gcUnregisterObjectRollback(.{ .cell = cell });
+                self.gcNoteFree(@sizeOf(Cell));
+                // The boxed slot this instruction linked the cell into is
+                // recoverable from the cell itself: bc_stack_idx was set
+                // to ctx.base + uv.idx at creation (PUC luaF_findupval).
+                const boxed2 = ctx.th.bytecode_boxed[ctx.base .. ctx.base + ctx.frame_cap];
+                boxed2[cell.bc_stack_idx - ctx.base] = null;
+                self.alloc.destroy(cell);
+            }
+            self.alloc.free(cells);
+        }
         // P16.19 T3: boxed slots are not hot dispatch state; derive the
         // frame's boxed slice locally at the (comparatively cold) closure-
         // creation point. Open-upvalue semantics unchanged (smoke 67).
@@ -17974,7 +18066,8 @@ pub const Vm = struct {
                         .bc_stack_idx = @intCast(ctx.base + uv.idx),
                         .bc_stack_thread = th,
                     };
-                    try self.gcRegisterCell(cell);
+                    created_cells += 1;
+                    self.gcRegisterCommit(.{ .cell = cell });
                     // PUC luaC_newobj charges every new GC object to
                     // totalbytes (GCdebt). This is the hottest Cell-creation
                     // path (closure capturing a local from the current
@@ -18008,7 +18101,10 @@ pub const Vm = struct {
         // P16.16 C2/T4.2: the owner is derived from the child's proto
         // (child.tree == root), no separate field on the closure.
         _ = self.retainTreeForClosure(child_proto);
-        try self.gcRegisterClosure(cl);
+        // P16.50: capacity was reserved by the bulk prepare above — the
+        // commit is infallible, so the closure can never be created yet
+        // unregistered.
+        self.gcRegisterCommit(.{ .closure = cl });
         // PUC luaM_*: every allocation decrements GCdebt via gcNoteAlloc.
         // Without this, condGcFromDispatch never triggers for closure-heavy
         // loops, and the table with __gc metatable is never collected.
@@ -19701,15 +19797,28 @@ pub const Vm = struct {
                 }
                 return existing;
             }
+            // P16.50 transactional: reserve registry capacity BEFORE the
+            // string exists; publish into the intern table with an errdefer
+            // that removes the entry (and destroys the string) if anything
+            // after the publish fails. The old order (insert THEN register,
+            // no rollback) left the string interned-but-unregistered on a
+            // registration failure — an immortal leak: the intern table is
+            // a GC root, but the string was in no registry, so no sweep
+            // could ever free it.
+            try self.gcPrepareRegister(1);
             const ls = try createLuaString(self.alloc, raw, hash);
             // PUC luaC_newobj: set current=white on all new objects.
             ls.gc_marked = self.gc_current_white & WHITEBITS;
             if (self.gc_mode == .generational and self.gc_gen_phase == .minor) ls.gc_age = .old;
             try self.string_intern.insert(self.alloc, ls);
+            errdefer {
+                self.string_intern.removeString(ls);
+                destroyLuaString(self.alloc, ls);
+            }
             // Register in gc_objects (PUC allgc) so the normal per-object
             // incremental sweep handles short string collection. This is the
             // PUC-faithful approach: PUC keeps all short strings in allgc.
-            try self.gcRegisterString(ls);
+            self.gcRegisterCommit(.{ .string = ls });
             // PUC sizestrshr/luaS_sizelngstr(LSTRREG) include the NUL;
             // T7: single per-kind rule via allocatedSize().
             self.gcNoteAlloc(ls.allocatedSize());
@@ -19717,8 +19826,12 @@ pub const Vm = struct {
             self.testc_obj_strings += 1;
             return ls;
         }
+        // P16.50 transactional: prepare-first; long strings are never
+        // interned, so the only fallible step after creation was the
+        // registration itself — now impossible to fail.
+        try self.gcPrepareRegister(1);
         const ls = try createLuaString(self.alloc, raw, hash);
-        try self.gcRegisterString(ls);
+        self.gcRegisterCommit(.{ .string = ls });
         self.gcNoteAlloc(ls.allocatedSize());
         self.testcNoteMemory(ls.allocatedSize() + 24);
         self.testc_obj_strings += 1;
@@ -19777,6 +19890,7 @@ pub const Vm = struct {
         const fixed = falloc == null;
         const header_size: usize =
             if (fixed) LuaString.lstrfix_header_size else @sizeOf(LuaString);
+        try self.gcPrepareRegister(1);
         const buf = self.alloc.alignedAlloc(
             u8,
             std.mem.Alignment.fromByteUnits(@alignOf(LuaString)),
@@ -19821,7 +19935,10 @@ pub const Vm = struct {
             ls.falloc = falloc;
             ls.ud = ud;
         }
-        try self.gcRegisterString(ls);
+        // P16.50: capacity prepared before the header allocation — the
+        // commit is infallible (the errdefer below still owns every
+        // pre-commit failure).
+        self.gcRegisterCommit(.{ .string = ls });
         // Only the header is owned by the GC; the external content is accounted
         // for by the caller (and released via `falloc` for LSTRMEM).
         self.gcNoteAlloc(header_size);
@@ -19879,6 +19996,11 @@ pub const Vm = struct {
         h.update(raw);
         const ls = try createLuaString(self.alloc, raw, h.final());
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) ls.gc_age = .old;
+        // P16.50: a failed store put must not leak the created string
+        // (it is in no registry until the put succeeds — the long-literals
+        // store is its ONLY lifetime owner, mirroring string_intern for
+        // short strings).
+        errdefer destroyLuaString(self.alloc, ls);
         try self.long_literals.table.put(self.alloc, ls.bytes(), ls);
         self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 24);
         self.testc_obj_strings += 1;
@@ -22151,9 +22273,11 @@ pub const Vm = struct {
         const callee = args[0];
         if (!isCallableValue(callee)) return self.fail("coroutine.create expects function", .{});
         try self.testcChargeMemory(@sizeOf(Thread) + 64);
+        // P16.50 transactional: prepare-first, infallible commit.
+        try self.gcPrepareRegister(1);
         const th = try self.alloc.create(Thread);
         th.* = .{ .status = .suspended, .callee = callee };
-        try self.gcRegisterThread(th);
+        self.gcRegisterCommit(.{ .thread = th });
         self.gcNoteAlloc(@sizeOf(Thread));
         self.testc_obj_threads += 1;
         outs[0] = .{ .Thread = th };
@@ -27794,14 +27918,29 @@ pub const Vm = struct {
         const num_upvalues: usize = if (cl.proto) |proto| proto.upvalues.len else 0;
         if (num_upvalues == 0) return;
         if (cl.upvalues.len < num_upvalues) {
+            // P16.50 transactional: prepare for ALL cells upfront; on any
+            // failure roll back the created cells (they are not yet
+            // referenced by the closure, so nothing roots them).
+            try self.gcPrepareRegister(num_upvalues);
             const cells = try self.alloc.alloc(*Cell, num_upvalues);
+            var created: usize = 0;
+            errdefer {
+                self.alloc.free(cells);
+                while (created > 0) {
+                    created -= 1;
+                    self.gcUnregisterObjectRollback(.{ .cell = cells[created] });
+                    self.gcNoteFree(@sizeOf(Cell));
+                    self.alloc.destroy(cells[created]);
+                }
+            }
             var i: usize = 0;
             while (i < num_upvalues) : (i += 1) {
                 const c = try self.alloc.create(Cell);
                 c.* = .{ .value = .Nil };
-                try self.gcRegisterCell(c);
+                self.gcRegisterCommit(.{ .cell = c });
                 self.gcNoteAlloc(@sizeOf(Cell));
                 cells[i] = c;
+                created += 1;
             }
             cl.upvalues = cells;
         }
@@ -29113,9 +29252,13 @@ pub const Vm = struct {
         // PUC lookforfunc: probe mode ("*") just verifies the library loads.
         // Return a no-op closure (PUC's ll_accessible).
         if (is_probe) {
+            // P16.50 transactional + symmetric charge (see llAccessible note).
+            try self.gcPrepareRegister(1);
             const cl = try self.alloc.create(Closure);
             cl.* = .{ .upvalues = &.{}, .c_func = &llAccessible };
-            try self.gcRegisterClosure(cl);
+            self.gcRegisterCommit(.{ .closure = cl });
+            self.gcNoteAlloc(@sizeOf(Closure));
+            self.testc_obj_functions += 1;
             if (outs.len > 0) outs[0] = .{ .Closure = cl };
             self.last_builtin_out_count = @min(outs.len, 1);
             return;
@@ -29138,9 +29281,13 @@ pub const Vm = struct {
 
         // Wrap the C function pointer in a Closure so it can be called via
         // the normal runClosure → callCFunction dispatch path.
+        // P16.50 transactional + symmetric charge.
+        try self.gcPrepareRegister(1);
         const cl = try self.alloc.create(Closure);
         cl.* = .{ .upvalues = &.{}, .c_func = c_func };
-        try self.gcRegisterClosure(cl);
+        self.gcRegisterCommit(.{ .closure = cl });
+        self.gcNoteAlloc(@sizeOf(Closure));
+        self.testc_obj_functions += 1;
         if (outs.len > 0) outs[0] = .{ .Closure = cl };
         self.last_builtin_out_count = @min(outs.len, 1);
     }
@@ -40654,14 +40801,23 @@ pub const Vm = struct {
         if (self.getFieldOpt(state, "_mainthread")) |v| {
             if (v == .Thread) return v.Thread;
         }
+        // P16.50 transactional: prepare-first; the post-commit publish
+        // (setField) failure rolls the thread back completely instead of
+        // leaving a charged orphan.
+        try self.gcPrepareRegister(1);
         const th = try self.alloc.create(Thread);
         th.* = .{
             .status = .suspended,
             .callee = .Nil,
             .testc_state_main = true,
         };
-        try self.gcRegisterThread(th);
+        self.gcRegisterCommit(.{ .thread = th });
         self.gcNoteAlloc(@sizeOf(Thread));
+        errdefer {
+            self.gcUnregisterObjectRollback(.{ .thread = th });
+            self.gcNoteFree(@sizeOf(Thread));
+            self.alloc.destroy(th);
+        }
         try self.setField(state, "_mainthread", .{ .Thread = th });
         return th;
     }
@@ -47666,3 +47822,1261 @@ test "P16.49-review: secondary registry invariants hold across minor cycles" {
 // integer-overflow panic + leak reports), and the P16.42 double-free
 // shape would similarly abort inside these tests' failure loops (they
 // run on the testing allocator, unlike the Arena-based Task 7.2).
+
+// ===========================================================================
+// P16.50: OOM transactionality of the remaining transactional constructors
+// ===========================================================================
+//
+// Every constructor that migrated to the P16.50 prepare-first /
+// commit-infallible registration protocol (gcPrepareRegister(n) BEFORE any
+// allocation, gcRegisterCommit AFTER the object exists) must restore ALL
+// observable registry state byte-exactly at EVERY allocation-failure index,
+// and the restored state must survive a real gcMinorCollection (the
+// DebugAllocator panics on any dangling dereference or double free).
+//
+// Observable state per probe (P50Snapshot): gc_objects (order-exact),
+// gc_young_objects (order-exact), gc_count_kb, the five testc_obj_*
+// counters and — when a main C-API handle exists — its stack.
+// gc_grayagain is deliberately NOT snapshotted: write barriers
+// legitimately append live old tables there (a conservative keep-alive,
+// PUC luaC_barrierback_), which is safe by construction and drained by the
+// next atomic phase.
+//
+// The young list at every loop's base is EMPTY by design: all setup
+// strings are interned BEFORE gcEnterGenerational (temp-rooted through its
+// full cycle so they survive it) and thus enter the old generation, so a
+// failure-branch gcMinorCollection never promotes anything and the young
+// assertions stay byte-exact across iterations.
+//
+// Manual teardown mirrors the creation-side charges exactly (gcNoteAlloc
+// ↔ gcNoteFree, counter increments ↔ decrements) and gcFreeObject's free
+// arms (buffer frees, unlink order). The testc_obj_* counters pair
+// creation with manual rollback only — gcFreeObject does NOT decrement
+// them — so every manual teardown decrements what its constructor
+// incremented.
+
+const P50Snapshot = struct {
+    gc_objects: []GcObject,
+    young: []GcObject,
+    stack: ?[]Value,
+    gc_count_kb: f64,
+    obj_tables: usize,
+    obj_functions: usize,
+    obj_strings: usize,
+    obj_threads: usize,
+    obj_userdata: usize,
+
+    fn take(vm: *Vm, alloc: std.mem.Allocator) std.mem.Allocator.Error!P50Snapshot {
+        const gc_objects = try alloc.dupe(GcObject, vm.gc_objects.items);
+        const young = try alloc.dupe(GcObject, vm.gc_young_objects.items);
+        const stack: ?[]Value = if (vm.main_handle) |h|
+            try alloc.dupe(Value, h.c_stack.items)
+        else
+            null;
+        return .{
+            .gc_objects = gc_objects,
+            .young = young,
+            .stack = stack,
+            .gc_count_kb = vm.gc_count_kb,
+            .obj_tables = vm.testc_obj_tables,
+            .obj_functions = vm.testc_obj_functions,
+            .obj_strings = vm.testc_obj_strings,
+            .obj_threads = vm.testc_obj_threads,
+            .obj_userdata = vm.testc_obj_userdata,
+        };
+    }
+
+    fn deinit(self: *const P50Snapshot, alloc: std.mem.Allocator) void {
+        alloc.free(self.gc_objects);
+        alloc.free(self.young);
+        if (self.stack) |s| alloc.free(s);
+    }
+
+    fn assertRestored(self: *const P50Snapshot, vm: *Vm) !void {
+        const testing = std.testing;
+        try testing.expectEqual(self.gc_objects.len, vm.gc_objects.items.len);
+        for (self.gc_objects, vm.gc_objects.items) |a, b| {
+            try testing.expect(std.meta.eql(a, b));
+        }
+        try testing.expectEqual(self.young.len, vm.gc_young_objects.items.len);
+        for (self.young, vm.gc_young_objects.items) |a, b| {
+            try testing.expect(std.meta.eql(a, b));
+        }
+        // gc_count_kb arithmetic is exact in f64 here: every charge/credit
+        // is a small multiple of 1/128 KB (8-byte multiples / 1024), a dyadic
+        // rational that needs far fewer than 53 significand bits.
+        try testing.expectEqual(self.gc_count_kb, vm.gc_count_kb);
+        try testing.expectEqual(self.obj_tables, vm.testc_obj_tables);
+        try testing.expectEqual(self.obj_functions, vm.testc_obj_functions);
+        try testing.expectEqual(self.obj_strings, vm.testc_obj_strings);
+        try testing.expectEqual(self.obj_threads, vm.testc_obj_threads);
+        try testing.expectEqual(self.obj_userdata, vm.testc_obj_userdata);
+        if (self.stack) |s| {
+            const cur = vm.main_handle.?.c_stack.items;
+            try testing.expectEqual(s.len, cur.len);
+            for (s, cur) |a, b| {
+                try testing.expect(std.meta.eql(a, b));
+            }
+        }
+    }
+};
+
+/// internStr's exact hash (std.hash.Wyhash over the VM-wide hash_seed) so
+/// the tests can query the intern table the same way internStr does.
+fn p50InternHash(vm: *Vm, raw: []const u8) u64 {
+    var h = std.hash.Wyhash.init(vm.hash_seed);
+    h.update(raw);
+    return h.final();
+}
+
+/// The object's gc_index resolves back to itself in gc_objects.
+fn p50IsRegistered(vm: *Vm, obj: GcObject) bool {
+    const p = gcPtr(obj);
+    const i = p.index.*;
+    return i < vm.gc_objects.items.len and std.meta.eql(vm.gc_objects.items[i], obj);
+}
+
+fn p50InYoung(vm: *Vm, obj: GcObject) bool {
+    for (vm.gc_young_objects.items) |o| {
+        if (std.meta.eql(o, obj)) return true;
+    }
+    return false;
+}
+
+/// No-op C function for the C-closure constructors (pushcclosure /
+/// registerfuncs). Never called — only its identity matters.
+fn p50Cfunc(_: ?*lua_State) callconv(.c) c_int {
+    return 0;
+}
+
+/// Proto with `nups` INSTACK upvalues (idx 0..nups-1) — the shape
+/// opClosure captures from the current frame's registers. Built with the
+/// real allocator outside every failure loop; protos are refcounted tree
+/// nodes, not GC objects, so they never drift the registries.
+fn p50BuildInstackProto(falloc: std.mem.Allocator, nups: usize) !*bc.Proto {
+    var builder = bc.ProtoBuilder.init(falloc);
+    errdefer builder.deinit();
+    _ = try builder.emitSimple(.return0, 1);
+    var u: usize = 0;
+    while (u < nups) : (u += 1) {
+        _ = try builder.addUpvalue(.{ .instack = true, .idx = @intCast(u), .is_const = false });
+    }
+    const proto = try builder.finish();
+    builder.deinit();
+    return proto;
+}
+
+/// opClosure's construction, minus the dispatch context: creates open
+/// upvalue cells for the child's instack descriptors (capturing the frame
+/// window at th.bytecode_stack[base..base+frame_cap]) and the closure over
+/// them, with opClosure's exact P16.50 rollback (bulk prepare, reverse
+/// cell rollback, boxed-slot restore). Skips only opClosure's post-commit
+/// boxed[a] gcStoreCellValue sync — no register in this test's shape is
+/// itself boxed, so that path cannot fire here (see the report note about
+/// that residual post-commit failure point in opClosure itself).
+fn p50OpClosureEquivalent(
+    vm: *Vm,
+    th: *Thread,
+    base: usize,
+    frame_cap: usize,
+    child_proto: *bc.Proto,
+) std.mem.Allocator.Error!*Closure {
+    const nups = child_proto.upvalues.len;
+    try vm.gcPrepareRegister(nups + 1);
+    const cells = try vm.alloc.alloc(*Cell, nups);
+    var created_cells: usize = 0;
+    // Rollback order: roll the created cells back FIRST, free the array
+    // LAST. Production opClosure (vm.zig:18029-18043) frees `cells` before
+    // iterating it — a use-after-free in its rollback path (reading the
+    // cell pointers out of freed memory; the DebugAllocator poison makes
+    // it crash, a production allocator merely gets lucky). This equivalent
+    // uses the corrected order; see the P16.50 report note.
+    errdefer {
+        while (created_cells > 0) {
+            created_cells -= 1;
+            const cell = cells[created_cells];
+            vm.gcUnregisterObjectRollback(.{ .cell = cell });
+            vm.gcNoteFree(@sizeOf(Cell));
+            const boxed2 = th.bytecode_boxed[base .. base + frame_cap];
+            boxed2[cell.bc_stack_idx - base] = null;
+            vm.alloc.destroy(cell);
+        }
+        vm.alloc.free(cells);
+    }
+    const boxed = th.bytecode_boxed[base .. base + frame_cap];
+    for (child_proto.upvalues, 0..) |uv, i| {
+        if (boxed[uv.idx]) |cell| {
+            cells[i] = cell;
+        } else {
+            const cell = try vm.alloc.create(Cell);
+            cell.* = .{
+                .value = th.bytecode_stack[base + uv.idx],
+                .bc_stack_idx = @intCast(base + uv.idx),
+                .bc_stack_thread = th,
+            };
+            created_cells += 1;
+            vm.gcRegisterCommit(.{ .cell = cell });
+            vm.gcNoteAlloc(@sizeOf(Cell));
+            boxed[uv.idx] = cell;
+            cells[i] = cell;
+        }
+    }
+    const cl = try vm.alloc.create(Closure);
+    cl.* = .{ .proto = child_proto, .upvalues = cells };
+    _ = vm.retainTreeForClosure(child_proto);
+    vm.gcRegisterCommit(.{ .closure = cl });
+    vm.gcNoteAlloc(@sizeOf(Closure) + nups * @sizeOf(*Cell));
+    vm.testc_obj_functions += 1;
+    return cl;
+}
+
+// --- manual teardown helpers (mirror creation charges + gcFreeObject arms) ---
+
+fn p50TeardownCell(vm: *Vm, c: *Cell) void {
+    // gcFreeObject .cell arm: unlink from the owning thread's boxed slot
+    // BEFORE freeing (a dangling boxed pointer would crash the owner's
+    // closeThreadOpenUpvalues later).
+    if (c.bc_stack_thread) |owner| {
+        if (c.bc_stack_idx != Cell.bc_stack_closed) owner.bytecode_boxed[c.bc_stack_idx] = null;
+    }
+    _ = vm.gcUnregisterObjectRollback(.{ .cell = c });
+    vm.gcNoteFree(@sizeOf(Cell));
+    vm.alloc.destroy(c);
+}
+
+fn p50TeardownClosure(vm: *Vm, cl: *Closure) void {
+    _ = vm.gcUnregisterObjectRollback(.{ .closure = cl });
+    vm.testc_obj_functions -= 1;
+    if (cl.proto) |p| {
+        if (p.tree) |t| t.releaseTree(vm.alloc);
+    }
+    vm.gcNoteFree(@sizeOf(Closure) + cl.upvalues.len * @sizeOf(*Cell));
+    if (cl.upvalues.len > 0) vm.alloc.free(cl.upvalues);
+    vm.alloc.destroy(cl);
+}
+
+fn p50TeardownString(vm: *Vm, ls: *LuaString) void {
+    // gcFreeObject .string arm: removeString BEFORE destroy — the bytes
+    // must stay valid for the hashmap unlink.
+    if (ls.isShort()) vm.string_intern.removeString(ls);
+    _ = vm.gcUnregisterObjectRollback(.{ .string = ls });
+    vm.testc_obj_strings -= 1;
+    vm.gcNoteFree(ls.allocatedSize());
+    destroyLuaString(vm.alloc, ls);
+}
+
+fn p50TeardownTable(vm: *Vm, t: *Table, decrement_counter: bool) void {
+    _ = vm.gcUnregisterObjectRollback(.{ .table = t });
+    if (decrement_counter) vm.testc_obj_tables -= 1;
+    vm.gcNoteFree(@sizeOf(Table) + t.asize * @sizeOf(Value) +
+        t.hash.len * @sizeOf(ltable.Node));
+    t.deinit(vm.alloc);
+    vm.alloc.destroy(t);
+}
+
+fn p50TeardownUserdata(vm: *Vm, ud: *Userdata) void {
+    _ = vm.gcUnregisterObjectRollback(.{ .userdata = ud });
+    vm.testc_obj_userdata -= 1;
+    vm.gcNoteFree(@sizeOf(Userdata) + ud.uservalues.len * @sizeOf(Value) + ud.payload.len);
+    if (ud.uservalues.len > 0) vm.alloc.free(ud.uservalues);
+    if (ud.payload.len > 0) vm.alloc.free(ud.payload);
+    vm.alloc.destroy(ud);
+}
+
+/// gcFreeObject's .thread arm minus the api_handle free (these threads
+/// never got a C-API handle) plus the manual unregister and — only for
+/// constructors that charge it — the creation-side testc_obj_threads
+/// decrement. apiNewThread and builtinCoroutineCreate charge the counter;
+/// getOrCreateTestStateMainThread does NOT (a testc-diagnostic asymmetry,
+/// see the P16.50 report note) — the teardown mirrors its constructor.
+fn p50TeardownThread(vm: *Vm, th: *Thread, decrement_counter: bool) void {
+    _ = vm.gcUnregisterObjectRollback(.{ .thread = th });
+    if (decrement_counter) vm.testc_obj_threads -= 1;
+    vm.freeThreadWrapBuffers(th);
+    vm.freeThreadBytecodeFrames(th);
+    vm.closeThreadOpenUpvalues(th);
+    vm.freeThreadRuntime(th);
+    th.c_tbc_chain.deinit(vm.alloc);
+    th.yielded.deinit(vm.alloc);
+    th.resume_inbox.deinit(vm.alloc);
+    th.suspended_builtin_args.deinit(vm.alloc);
+    vm.gcNoteFree(@sizeOf(Thread));
+    vm.alloc.destroy(th);
+}
+
+/// Minimal pass-through allocator that records live (ptr, byte_len) pairs.
+/// Used ONLY by the P16.50 registerfuncs success path to account for the
+/// KNOWN production leak of the shared-cell temp array (api.zig:1247):
+/// registerfuncs frees shared_cells in its errdefer (failure paths) but
+/// never on success — every successful registerfuncs call with nup > 0
+/// leaks nup * @sizeOf(*Cell) bytes. The test asserts the leak's exact
+/// shape (exactly one live allocation of that size after every object from
+/// the call is torn down), then frees it to stay leak-clean. The finding
+/// is reported as a production bug; this helper makes it VISIBLE, not
+/// hidden.
+const P50TrackAlloc = struct {
+    base: std.mem.Allocator,
+    live: std.AutoHashMapUnmanaged(usize, usize) = .empty,
+
+    fn allocator(self: *P50TrackAlloc) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = trackAlloc,
+            .resize = trackResize,
+            .remap = trackRemap,
+            .free = trackFree,
+        } };
+    }
+
+    fn deinit(self: *P50TrackAlloc) void {
+        self.live.deinit(self.base);
+    }
+
+    fn trackAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *P50TrackAlloc = @ptrCast(@alignCast(ctx));
+        const p = self.base.rawAlloc(len, alignment, ret_addr) orelse return null;
+        // Bookkeeping goes to the BASE allocator (not through the tracker),
+        // so map growth is never itself tracked.
+        self.live.put(self.base, @intFromPtr(p), len) catch {
+            self.base.rawFree(p[0..len], alignment, ret_addr);
+            return null;
+        };
+        return p;
+    }
+
+    fn trackResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *P50TrackAlloc = @ptrCast(@alignCast(ctx));
+        if (!self.base.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        if (self.live.getPtr(@intFromPtr(memory.ptr))) |len_ptr| len_ptr.* = new_len;
+        return true;
+    }
+
+    fn trackRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *P50TrackAlloc = @ptrCast(@alignCast(ctx));
+        const p = self.base.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        if (p != memory.ptr) {
+            _ = self.live.remove(@intFromPtr(memory.ptr));
+            self.live.put(self.base, @intFromPtr(p), new_len) catch {
+                self.base.rawFree(p[0..new_len], alignment, ret_addr);
+                return null;
+            };
+        } else if (self.live.getPtr(@intFromPtr(p))) |len_ptr| {
+            len_ptr.* = new_len;
+        }
+        return p;
+    }
+
+    fn trackFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *P50TrackAlloc = @ptrCast(@alignCast(ctx));
+        // A miss is fine: objects created BEFORE the tracking window are
+        // freed through the tracker too (it is the VM's allocator at that
+        // point) — the pass-through still forwards them to the base.
+        _ = self.live.remove(@intFromPtr(memory.ptr));
+        self.base.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "P16.50: opClosure-equivalent OOM transactionality (generational + incremental capacity)" {
+    const testing = std.testing;
+
+    // ---- Part A: generational mode, every failure index ----
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    try vm.gcEnterGenerational();
+
+    const child_proto = try p50BuildInstackProto(vm.alloc, 4);
+    child_proto.tree.?.retainTree();
+    defer {
+        child_proto.tree.?.releaseTree(vm.alloc);
+        child_proto.tree.?.releaseTree(vm.alloc);
+    }
+    const th = vm.main_thread.?;
+    const base: usize = 0;
+    const frame_cap: usize = 8;
+    for (0..frame_cap) |i| th.bytecode_stack[base + i] = .{ .Int = @intCast(100 + i) };
+
+    var fail_idx: usize = 0;
+    var tested_failures: usize = 0;
+    var first_success_idx: ?usize = null;
+    while (fail_idx <= 10) : (fail_idx += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        const snap = try P50Snapshot.take(&vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+
+        vm.alloc = failing.allocator();
+        const result = p50OpClosureEquivalent(&vm, th, base, frame_cap, child_proto);
+        vm.alloc = testing.allocator;
+
+        if (result) |cl| {
+            first_success_idx = fail_idx;
+            // Teardown mirrors the creation charges exactly; the boxed
+            // slots are unlinked by p50TeardownCell.
+            _ = vm.gcUnregisterObjectRollback(.{ .closure = cl });
+            vm.testc_obj_functions -= 1;
+            vm.gcNoteFree(@sizeOf(Closure) + cl.upvalues.len * @sizeOf(*Cell));
+            for (cl.upvalues) |c| p50TeardownCell(&vm, c);
+            if (cl.proto) |p| {
+                if (p.tree) |t| t.releaseTree(vm.alloc);
+            }
+            vm.alloc.free(cl.upvalues);
+            vm.alloc.destroy(cl);
+            for (th.bytecode_boxed[base .. base + frame_cap]) |slot| {
+                try testing.expect(slot == null);
+            }
+            try snap.assertRestored(&vm);
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            tested_failures += 1;
+            try snap.assertRestored(&vm);
+            for (th.bytecode_boxed[base .. base + frame_cap]) |slot| {
+                try testing.expect(slot == null);
+            }
+            try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+            try vm.gcMinorCollection();
+            try snap.assertRestored(&vm);
+        }
+    }
+    try testing.expect(tested_failures > 0);
+    try testing.expect(first_success_idx != null);
+
+    // Repeated failure at a guaranteed-failing index (0 = the first
+    // allocation, whatever it is this round): must fail identically twice.
+    var repeat: usize = 0;
+    while (repeat < 2) : (repeat += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        const snap = try P50Snapshot.take(&vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+        vm.alloc = failing.allocator();
+        const result = p50OpClosureEquivalent(&vm, th, base, frame_cap, child_proto);
+        vm.alloc = testing.allocator;
+        try testing.expectError(error.OutOfMemory, result);
+        try snap.assertRestored(&vm);
+        try vm.gcMinorCollection();
+        try snap.assertRestored(&vm);
+    }
+
+    // ---- Part B: incremental mode, registry-capacity exhaustion edge ----
+    // gcPrepareRegister's ensureUnusedCapacity is the ONLY fallible step
+    // that can fail with the registries completely untouched; force it to
+    // actually grow by filling gc_objects until fewer than 5 slots are
+    // spare (a `len == capacity` loop would never terminate — prepare(1)
+    // itself grows the capacity whenever it fills up). The fill tables are
+    // temp-rooted so the post-failure gcMinorCollection below sees them as
+    // live, collection-safe state.
+    var vm2: Vm = .init(testing.allocator, false);
+    defer vm2.deinit();
+    var fill_roots = vm2.gcTempRoots();
+    defer fill_roots.end();
+    while (vm2.gc_objects.capacity - vm2.gc_objects.items.len >= 5) {
+        const t = try vm2.allocTableNoGc();
+        try fill_roots.add(.{ .Table = t });
+    }
+    const len0 = vm2.gc_objects.items.len;
+    const cap0 = vm2.gc_objects.capacity;
+    var failing2 = std.testing.FailingAllocator.init(testing.allocator, .{
+        .fail_index = 0,
+        .resize_fail_index = 0,
+    });
+    vm2.alloc = failing2.allocator();
+    const prep = vm2.gcPrepareRegister(5);
+    vm2.alloc = testing.allocator;
+    try testing.expectError(error.OutOfMemory, prep);
+    try testing.expectEqual(len0, vm2.gc_objects.items.len);
+    try testing.expectEqual(cap0, vm2.gc_objects.capacity);
+    // The untouched state must be collection-safe. In incremental mode
+    // gcMinorCollection sweeps only the (empty) young list; nothing in
+    // gc_objects is death-checked, and Vm.deinit frees everything.
+    try vm2.gcMinorCollection();
+    try testing.expectEqual(len0, vm2.gc_objects.items.len);
+}
+
+test "P16.50: internStr OOM transactionality (short miss, long, dead-old re-intern)" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    try vm.gcEnterGenerational();
+
+    // ---- Segment A: short-string miss (intern-table publish path) ----
+    const raw_short = "p50-short-string-aaaaaaaaaaaaaaaa";
+    var fail_idx: usize = 0;
+    var tested_failures: usize = 0;
+    var first_success_idx: ?usize = null;
+    while (fail_idx <= 8) : (fail_idx += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        const snap = try P50Snapshot.take(&vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+
+        vm.alloc = failing.allocator();
+        const result = vm.internStr(raw_short);
+        vm.alloc = testing.allocator;
+
+        if (result) |ls| {
+            first_success_idx = fail_idx;
+            try testing.expect(ls.isShort());
+            try testing.expect(p50IsRegistered(&vm, .{ .string = ls }));
+            try testing.expect(p50InYoung(&vm, .{ .string = ls }));
+            try testing.expectEqual(ls, vm.string_intern.lookup(raw_short, p50InternHash(&vm, raw_short)));
+            p50TeardownString(&vm, ls);
+            try snap.assertRestored(&vm);
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            tested_failures += 1;
+            try snap.assertRestored(&vm);
+            try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+            try vm.gcMinorCollection();
+            try snap.assertRestored(&vm);
+        }
+    }
+    try testing.expect(tested_failures > 0);
+    try testing.expect(first_success_idx != null);
+
+    // ---- Segment B: long string (never interned, fresh allocation) ----
+    const raw_long = "p50-long-string-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    fail_idx = 0;
+    tested_failures = 0;
+    first_success_idx = null;
+    while (fail_idx <= 8) : (fail_idx += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        const snap = try P50Snapshot.take(&vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+
+        vm.alloc = failing.allocator();
+        const result = vm.internStr(raw_long);
+        vm.alloc = testing.allocator;
+
+        if (result) |ls| {
+            first_success_idx = fail_idx;
+            try testing.expect(!ls.isShort());
+            try testing.expect(p50IsRegistered(&vm, .{ .string = ls }));
+            try testing.expect(p50InYoung(&vm, .{ .string = ls }));
+            p50TeardownString(&vm, ls);
+            try snap.assertRestored(&vm);
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            tested_failures += 1;
+            try snap.assertRestored(&vm);
+            try vm.gcMinorCollection();
+            try snap.assertRestored(&vm);
+        }
+    }
+    try testing.expect(tested_failures > 0);
+    try testing.expect(first_success_idx != null);
+
+    // ---- Segment C: re-intern of a DEAD string still in the intern table
+    // (PUC internshrstr resurrection, lstring.c:223-226). The intern table
+    // is not a GC root: a string that survives one cycle as white and is
+    // not marked in the NEXT cycle is dead the moment that cycle flips its
+    // white bit — and it stays in the table until the sweep reaches it.
+    // Re-interning inside that flip-to-sweep window must resurrect the
+    // dead string in place (changewhite) instead of duplicating it.
+    //
+    // (The generational dead-OLD linger of PUC is not reachable in this
+    // implementation: gcMakeAllOld and markold keep old objects BLACK, and
+    // a monolithic gcMinorCollection leaves no flip-to-sweep window — so
+    // the resurrection path is exercised here in incremental mode, where
+    // the window is real: gc_state == .sweep with the flip already done.)
+    var vm_c: Vm = .init(testing.allocator, false);
+    defer vm_c.deinit();
+    const snap_c0 = try P50Snapshot.take(&vm_c, testing.allocator);
+    defer snap_c0.deinit(testing.allocator);
+
+    const raw_c = "p50-hazard-string-cccccccccc";
+    const ls = try vm_c.internStr(raw_c);
+    var roots = vm_c.gcTempRoots();
+    defer roots.end();
+    try roots.add(.{ .String = ls });
+    // Cycle 1 (rooted): the string is marked and survives the sweep as
+    // white (the sweep's makewhite — the ONLY thing that makes an old
+    // survivor white again).
+    try vm_c.gcCycleFull();
+    // Cycle 2 (unrooted): start a real incremental cycle and stop right
+    // after the atomic→sweep transition — the white flip has happened, so
+    // the unmarked string is now dead, but the sweep has not reached it.
+    roots.end();
+    try vm_c.gcStartCycle(true);
+    // A single advance with break_after_atomic runs propagate + atomic and
+    // returns exactly at the atomic→sweep transition: the white flip inside
+    // gcAtomicPhase is done (the unmarked string is now dead) but not one
+    // sweep step has run. (A plain maxInt-budget advance would complete the
+    // whole cycle — mark, atomic, sweep, pause — in one call, and the loop
+    // would never observe the .sweep window.)
+    _ = try vm_c.gcAdvance(std.math.maxInt(usize), true);
+    try testing.expect(vm_c.gc_state == .sweep);
+    try testing.expect(gcIsDead(ls.gc_marked, vm_c.gc_current_white));
+
+    const snap_dead = try P50Snapshot.take(&vm_c, testing.allocator);
+    defer snap_dead.deinit(testing.allocator);
+    const ls2 = try vm_c.internStr(raw_c);
+    try testing.expectEqual(ls, ls2); // same pointer — resurrected, not duplicated
+    try testing.expect(!gcIsDead(ls.gc_marked, vm_c.gc_current_white));
+    // The resurrect path is registry-silent: lookup hit + mark flip only —
+    // no allocation, no registration, no counter or count drift.
+    try snap_dead.assertRestored(&vm_c);
+    // Finish cycle 2 (the resurrected string is white-current: alive) and
+    // tear it down; the base must restore exactly.
+    while (vm_c.gc_state != .pause) {
+        _ = try vm_c.gcAdvance(std.math.maxInt(usize), false);
+    }
+    p50TeardownString(&vm_c, ls);
+    try snap_c0.assertRestored(&vm_c);
+}
+
+test "P16.50: allocTable/allocUserdata OOM transactionality + testc memory edges" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    // Pre-intern the testc failure message and the "T" global name BEFORE
+    // entering generational mode, temp-rooted through gcEnterGenerational's
+    // full cycle: failTestcRaw's internStr and testcConsumeAllocCount's
+    // getGlobal("T") then hit the table without registering anything.
+    var setup_roots = vm.gcTempRoots();
+    defer setup_roots.end();
+    const msg_str = try vm.internStr("not enough memory");
+    try setup_roots.add(.{ .String = msg_str });
+    const t_str = try vm.internStr("T");
+    try setup_roots.add(.{ .String = t_str });
+    try vm.gcEnterGenerational();
+
+    // ---- Segment A: allocTableNoGc ----
+    var fail_idx: usize = 0;
+    var tested_failures: usize = 0;
+    var first_success_idx: ?usize = null;
+    while (fail_idx <= 5) : (fail_idx += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        const snap = try P50Snapshot.take(&vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+
+        vm.alloc = failing.allocator();
+        const result = vm.allocTableNoGc();
+        vm.alloc = testing.allocator;
+
+        if (result) |t| {
+            first_success_idx = fail_idx;
+            try testing.expect(p50IsRegistered(&vm, .{ .table = t }));
+            try testing.expect(p50InYoung(&vm, .{ .table = t }));
+            p50TeardownTable(&vm, t, true);
+            try snap.assertRestored(&vm);
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            tested_failures += 1;
+            try snap.assertRestored(&vm);
+            try vm.gcMinorCollection();
+            try snap.assertRestored(&vm);
+        }
+    }
+    try testing.expect(tested_failures > 0);
+    try testing.expect(first_success_idx != null);
+
+    // ---- Segment B: allocTableEphemeral (no testc counter involvement) ----
+    fail_idx = 0;
+    tested_failures = 0;
+    first_success_idx = null;
+    while (fail_idx <= 5) : (fail_idx += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        const snap = try P50Snapshot.take(&vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+
+        vm.alloc = failing.allocator();
+        const result = vm.allocTableEphemeral();
+        vm.alloc = testing.allocator;
+
+        if (result) |t| {
+            first_success_idx = fail_idx;
+            p50TeardownTable(&vm, t, false); // Ephemeral never touches the counter
+            try snap.assertRestored(&vm);
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            tested_failures += 1;
+            try snap.assertRestored(&vm);
+            try vm.gcMinorCollection();
+            try snap.assertRestored(&vm);
+        }
+    }
+    try testing.expect(tested_failures > 0);
+    try testing.expect(first_success_idx != null);
+
+    // ---- Segment C: allocUserdata(16, 2) — three allocations after prepare ----
+    fail_idx = 0;
+    tested_failures = 0;
+    first_success_idx = null;
+    while (fail_idx <= 8) : (fail_idx += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        const snap = try P50Snapshot.take(&vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+
+        vm.alloc = failing.allocator();
+        const result = vm.allocUserdata(16, 2);
+        vm.alloc = testing.allocator;
+
+        if (result) |ud| {
+            first_success_idx = fail_idx;
+            try testing.expectEqual(@as(usize, 16), ud.payload.len);
+            try testing.expectEqual(@as(usize, 2), ud.uservalues.len);
+            try testing.expect(p50IsRegistered(&vm, .{ .userdata = ud }));
+            try testing.expect(p50InYoung(&vm, .{ .userdata = ud }));
+            p50TeardownUserdata(&vm, ud);
+            try snap.assertRestored(&vm);
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            tested_failures += 1;
+            try snap.assertRestored(&vm);
+            try vm.gcMinorCollection();
+            try snap.assertRestored(&vm);
+        }
+    }
+    try testing.expect(tested_failures > 0);
+    try testing.expect(first_success_idx != null);
+
+    // ---- Segment D: testc mem_limit edge (PUC testC `memlimit total`) ----
+    // The charge fires BEFORE gcPrepareRegister, so a mem_limit rejection
+    // must leave every registry untouched. failTestcRaw interns the
+    // message — pre-interned above, so that too is registry-silent.
+    const ctrl = vm.testcEnsureControl();
+    defer ctrl.mem_limit = null;
+    defer ctrl.alloc_count = -1;
+    {
+        const snap = try P50Snapshot.take(&vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+        const tb0 = ctrl.total_bytes;
+        ctrl.mem_limit = ctrl.total_bytes;
+        try testing.expectError(error.RuntimeError, vm.allocUserdata(16, 2));
+        try testing.expectEqual(tb0, ctrl.total_bytes);
+        try snap.assertRestored(&vm);
+        try vm.gcMinorCollection();
+        try snap.assertRestored(&vm);
+    }
+
+    // ---- Segment E: testc alloc_count == 0 edge (PUC ltests.c:236-240 —
+    // every allocation fails and the countdown STAYS armed) ----
+    {
+        const snap = try P50Snapshot.take(&vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+        ctrl.alloc_count = 0;
+        try testing.expectError(error.RuntimeError, vm.allocUserdata(16, 2));
+        try testing.expectEqual(@as(i64, 0), ctrl.alloc_count); // still armed
+        try testing.expectError(error.RuntimeError, vm.allocUserdata(16, 2));
+        try snap.assertRestored(&vm);
+        try vm.gcMinorCollection();
+        try snap.assertRestored(&vm);
+    }
+}
+
+test "P16.50: thread constructor OOM transactionality" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    var setup_roots = vm.gcTempRoots();
+    defer setup_roots.end();
+    const key_mainthread = try vm.internStr("_mainthread");
+    try setup_roots.add(.{ .String = key_mainthread });
+    try vm.gcEnterGenerational();
+
+    // ---- Segment A: builtinCoroutineCreate ----
+    var fail_idx: usize = 0;
+    var tested_failures: usize = 0;
+    var first_success_idx: ?usize = null;
+    while (fail_idx <= 5) : (fail_idx += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        const snap = try P50Snapshot.take(&vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+
+        var args = [_]Value{.{ .Builtin = .coroutine_wrap_iter }};
+        var outs = [_]Value{.Nil};
+        vm.alloc = failing.allocator();
+        const result = vm.builtinCoroutineCreate(args[0..], outs[0..]);
+        vm.alloc = testing.allocator;
+
+        if (result) |_| {
+            first_success_idx = fail_idx;
+            const th = outs[0].Thread;
+            try testing.expect(p50IsRegistered(&vm, .{ .thread = th }));
+            try testing.expect(p50InYoung(&vm, .{ .thread = th }));
+            p50TeardownThread(&vm, th, true);
+            try snap.assertRestored(&vm);
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            tested_failures += 1;
+            try snap.assertRestored(&vm);
+            try vm.gcMinorCollection();
+            try snap.assertRestored(&vm);
+        }
+    }
+    try testing.expect(tested_failures > 0);
+    try testing.expect(first_success_idx != null);
+
+    // ---- Segment B: apiNewThread (post-commit frame prealloc is
+    // deliberately swallowed with `catch {}` — a failure there is a
+    // SUCCESS with zero frame capacity, never a registry event) ----
+    fail_idx = 0;
+    tested_failures = 0;
+    first_success_idx = null;
+    while (fail_idx <= 6) : (fail_idx += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        const snap = try P50Snapshot.take(&vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+
+        vm.alloc = failing.allocator();
+        const result = vm.apiNewThread(.Nil);
+        vm.alloc = testing.allocator;
+
+        if (result) |th| {
+            first_success_idx = fail_idx;
+            try testing.expect(p50IsRegistered(&vm, .{ .thread = th }));
+            try testing.expect(p50InYoung(&vm, .{ .thread = th }));
+            p50TeardownThread(&vm, th, true);
+            try snap.assertRestored(&vm);
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            tested_failures += 1;
+            try snap.assertRestored(&vm);
+            try vm.gcMinorCollection();
+            try snap.assertRestored(&vm);
+        }
+    }
+    try testing.expect(tested_failures > 0);
+    try testing.expect(first_success_idx != null);
+
+    // ---- Segment C: getOrCreateTestStateMainThread — the one thread
+    // constructor with a genuine POST-COMMIT failure window (the
+    // `setField(state, "_mainthread", th)` publish after the commit). Its
+    // errdefer must roll the committed thread back completely; the state
+    // table itself must stay intact (the failing rawSet's rehash never
+    // swaps in). The "_mainthread" key is pre-interned so setField's only
+    // allocation is the first-insert rehash itself. ----
+    const snap_base = try P50Snapshot.take(&vm, testing.allocator);
+    defer snap_base.deinit(testing.allocator);
+
+    fail_idx = 0;
+    tested_failures = 0;
+    first_success_idx = null;
+    while (fail_idx <= 8) : (fail_idx += 1) {
+        const state_tbl = try vm.allocTableNoGc();
+        const snap_iter = try P50Snapshot.take(&vm, testing.allocator);
+        defer snap_iter.deinit(testing.allocator);
+
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        vm.alloc = failing.allocator();
+        const result = vm.getOrCreateTestStateMainThread(state_tbl);
+        vm.alloc = testing.allocator;
+
+        if (result) |th| {
+            first_success_idx = fail_idx;
+            try testing.expectEqual(th, vm.getFieldOpt(state_tbl, "_mainthread").?.Thread);
+            // Clear the field FIRST (nodeDelete, allocation-free) so the
+            // table never references the thread we are about to destroy.
+            // getOrCreateTestStateMainThread does not charge
+            // testc_obj_threads — its teardown must not decrement it.
+            try vm.rawSet(state_tbl, .{ .String = key_mainthread }, .Nil);
+            p50TeardownThread(&vm, th, false);
+            p50TeardownTable(&vm, state_tbl, true);
+            try snap_base.assertRestored(&vm);
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            tested_failures += 1;
+            // The errdefer rolled the thread back; the table is intact and
+            // the field was never published.
+            try snap_iter.assertRestored(&vm);
+            try testing.expect(vm.getFieldOpt(state_tbl, "_mainthread") == null);
+            p50TeardownTable(&vm, state_tbl, true);
+            try snap_base.assertRestored(&vm);
+            try vm.gcMinorCollection();
+            try snap_base.assertRestored(&vm);
+        }
+    }
+    try testing.expect(tested_failures > 0);
+    try testing.expect(first_success_idx != null);
+}
+
+test "P16.50: pushcclosure/registerfuncs OOM transactionality" {
+    const api = @import("api.zig");
+    const testing = std.testing;
+    var state = api.State.init(.{ .allocator = testing.allocator });
+    defer state.deinit();
+    const vm = state.vm;
+
+    // Pre-intern the library names BEFORE entering generational mode,
+    // temp-rooted through its full cycle: every per-entry internStr in
+    // registerfuncs then hits the table without allocating.
+    var setup_roots = vm.gcTempRoots();
+    defer setup_roots.end();
+    const key_alpha = try vm.internStr("p50alpha");
+    try setup_roots.add(.{ .String = key_alpha });
+    const key_beta = try vm.internStr("p50beta");
+    try setup_roots.add(.{ .String = key_beta });
+    const key_gamma = try vm.internStr("p50gamma");
+    try setup_roots.add(.{ .String = key_gamma });
+    try vm.gcEnterGenerational();
+
+    // Deterministic allocation maps for the failure loops below: reserve
+    // spare capacity in every structure gcPrepareRegister / pushcclosure
+    // / the stack appends touch, so the ONLY allocations during a probe
+    // are the object creations themselves (shared-cell array, cells,
+    // closures) — the failure index then maps 1:1 onto a construction
+    // step.
+    try vm.gc_objects.ensureUnusedCapacity(testing.allocator, 16);
+    try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 16);
+    try state.stack.ensureUnusedCapacity(testing.allocator, 16);
+
+    // ---- Segment A: pushcclosure with 0 upvalues ----
+    var fail_idx: usize = 0;
+    var tested_failures: usize = 0;
+    var first_success_idx: ?usize = null;
+    while (fail_idx <= 5) : (fail_idx += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        const snap = try P50Snapshot.take(vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+
+        vm.alloc = failing.allocator();
+        const result = state.pushcclosure(p50Cfunc, 0);
+        vm.alloc = testing.allocator;
+
+        if (result) |_| {
+            first_success_idx = fail_idx;
+            const cl = state.stack.items[state.stack.items.len - 1].Closure;
+            try testing.expect(p50IsRegistered(vm, .{ .closure = cl }));
+            try testing.expect(p50InYoung(vm, .{ .closure = cl }));
+            state.stack.items.len -= 1;
+            p50TeardownClosure(vm, cl);
+            try snap.assertRestored(vm);
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            tested_failures += 1;
+            try snap.assertRestored(vm);
+            try vm.gcMinorCollection();
+            try snap.assertRestored(vm);
+        }
+    }
+    try testing.expect(tested_failures > 0);
+    try testing.expect(first_success_idx != null);
+
+    // ---- Segment B: pushcclosure with 3 upvalues (cells committed
+    // incrementally; the errdefer rolls the created ones back in reverse) ----
+    //
+    // Allocation map (capacities primed above): #0 upvalue array, #1 first
+    // cell, #2 second cell, #3 third cell, #4 closure.
+    //
+    // BLOCKED (bug, see the P16.50 report): failure indices 2..4 (the
+    // second/third cell creates and the closure create) exercise
+    // pushcclosure's errdefer (api.zig:942-950), which frees upv_cells
+    // BEFORE reading upv_cells[created] — a use-after-free that crashes
+    // under the DebugAllocator's freed-memory poison. Only the two
+    // pre-cell-commit failure points (the upvalue-array alloc — errdefer
+    // not yet armed — and the first cell create — created == 0, loop body
+    // never runs) are drivable; the cell-rollback and closure-create
+    // rollback paths stay unproven pending the production fix.
+    fail_idx = 0;
+    tested_failures = 0;
+    first_success_idx = null;
+    while (fail_idx <= 5) : (fail_idx += 1) {
+        if (fail_idx >= 2 and fail_idx <= 4) continue;
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        const snap = try P50Snapshot.take(vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+
+        try state.pushinteger(7);
+        try state.pushinteger(8);
+        try state.pushinteger(9);
+
+        vm.alloc = failing.allocator();
+        const result = state.pushcclosure(p50Cfunc, 3);
+        vm.alloc = testing.allocator;
+
+        if (result) |_| {
+            first_success_idx = fail_idx;
+            // Success shape: the 3 upvalues were consumed, the closure
+            // pushed in their place — net +1 over the snapshot (written as
+            // +1, not "- 2", because the base stack can be empty and the
+            // usize subtraction would underflow).
+            try testing.expectEqual(snap.stack.?.len + 1, state.stack.items.len);
+            const cl = state.stack.items[state.stack.items.len - 1].Closure;
+            try testing.expectEqual(@as(usize, 3), cl.upvalues.len);
+            state.stack.items.len -= 1;
+            // Cells first (read cl.upvalues before p50TeardownClosure
+            // frees that array), then the closure itself.
+            for (cl.upvalues) |c| p50TeardownCell(vm, c);
+            p50TeardownClosure(vm, cl);
+            try snap.assertRestored(vm);
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            tested_failures += 1;
+            // On failure the upvalues are still on the stack (the pop
+            // commits only after every object exists).
+            try testing.expectEqual(snap.stack.?.len + 3, state.stack.items.len);
+            state.stack.items.len -= 3;
+            try snap.assertRestored(vm);
+            try vm.gcMinorCollection();
+            try snap.assertRestored(vm);
+        }
+    }
+    try testing.expect(tested_failures > 0);
+    try testing.expect(first_success_idx != null);
+
+    // ---- Segment C: registerfuncs with nup = 2 ----
+    //
+    // KNOWN POST-COMMIT WINDOW (documented finding, not exercised here):
+    // registerfuncs commits each closure (gcRegisterCommit) BEFORE its
+    // apiRawSet publish; the per-entry errdefer frees own_cells on an
+    // apiRawSet failure, leaving the registered-but-unpublished closure
+    // with a DANGLING upvalues array — the next sweep double-frees it
+    // (gcFreeObject frees c.upvalues again). See the P16.50-probe test
+    // below for the empirical confirmation.
+    //
+    // This segment therefore pins the reachable-in-configuration surface:
+    // the library table is YOUNG and its three keys are PRE-INSERTED, so
+    // every per-entry apiRawSet takes the existing-node update path — for
+    // a young table in generational mode the back barrier is a complete
+    // no-op (gcTableBarrierBackSlow returns before any grayagain append),
+    // making the post-commit publish allocation-free and infallible.
+    //
+    // Allocation map (capacities primed above; keys pre-interned so the
+    // per-entry internStr is a table hit): #0 shared-cell array, #1 first
+    // cell, #2 second cell, then per entry (own array, closure) — the
+    // publish itself never allocates.
+    //
+    // BLOCKED (bug, see the P16.50 report): failure indices 2..8 (EVERY
+    // failure after the first cell commit) exercise registerfuncs'
+    // shared-cell errdefer (api.zig:1248-1256), which frees shared_cells
+    // BEFORE reading shared_cells[cells_created] — the same use-after-free
+    // class as pushcclosure's errdefer, and it is armed for the whole
+    // function. Only the shared-array alloc (#0, errdefer not yet armed)
+    // and the first cell create (#1, cells_created == 0) are drivable.
+    const reg = [_]api.State.Reg{
+        .{ .name = "p50alpha", .func = p50Cfunc },
+        .{ .name = "p50beta", .func = p50Cfunc },
+        .{ .name = "p50gamma", .func = p50Cfunc },
+        .{ .name = null, .func = null },
+    };
+
+    const snap_base = try P50Snapshot.take(vm, testing.allocator);
+    defer snap_base.deinit(testing.allocator);
+
+    // The shared-cell temp array leak (api.zig:1247 — freed by the errdefer
+    // on failure, NEVER on success) is accounted with a tracking allocator
+    // chained INSIDE the FailingAllocator: only allocations that actually
+    // happen are tracked, and the success branch below asserts the leak's
+    // exact shape before freeing it. When the production leak is fixed this
+    // assertion goes red on purpose — remove the compensation then.
+    var tracker: P50TrackAlloc = .{ .base = testing.allocator };
+    defer tracker.deinit();
+
+    fail_idx = 0;
+    tested_failures = 0;
+    first_success_idx = null;
+    // P16.50: per-closure own_cells arrays (PUC luaF_newLclosure parity)
+    // add allocations — the bound covers the full sequence to the success edge.
+    while (fail_idx <= 32) : (fail_idx += 1) {
+        // Per-iteration library table: young, registered, with the three
+        // keys pre-inserted as placeholders (real allocator — the update
+        // path then never rehashes).
+        const tbl = try vm.allocTableNoGc();
+        try vm.rawSet(tbl, .{ .String = key_alpha }, .{ .Bool = false });
+        try vm.rawSet(tbl, .{ .String = key_beta }, .{ .Bool = false });
+        try vm.rawSet(tbl, .{ .String = key_gamma }, .{ .Bool = false });
+        try state.stack.append(vm.alloc, .{ .Table = tbl });
+        try state.pushinteger(11);
+        try state.pushinteger(13);
+
+        const snap_full = try P50Snapshot.take(vm, testing.allocator);
+        defer snap_full.deinit(testing.allocator);
+
+        var failing = std.testing.FailingAllocator.init(tracker.allocator(), .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        vm.alloc = failing.allocator();
+        const result = state.registerfuncs(&reg, 2);
+        // Teardown runs under the tracker so the frees of tracker-allocated
+        // objects (closures' own upvalue arrays, cells) update its live set.
+        vm.alloc = tracker.allocator();
+
+        // Residue analysis: whatever the failure index, the only objects
+        // beyond snap_full may be the two shared cells (their errdefer
+        // disarms once the shared phase completes — the documented
+        // "stays registered" semantics) and the closures published before
+        // the failing entry. Nothing else may leak into the registries.
+        var residue: [16]GcObject = undefined;
+        var residue_n: usize = 0;
+        for (vm.gc_objects.items[snap_full.gc_objects.len..]) |o| {
+            residue[residue_n] = o;
+            residue_n += 1;
+        }
+        var n_cell: usize = 0;
+        var n_closure: usize = 0;
+        var n_other: usize = 0;
+        for (residue[0..residue_n]) |o| switch (o) {
+            .cell => n_cell += 1,
+            .closure => n_closure += 1,
+            else => n_other += 1,
+        };
+        var published: usize = 0;
+        for ([_][]const u8{ "p50alpha", "p50beta", "p50gamma" }) |nm| {
+            const v = vm.getFieldOpt(tbl, nm) orelse continue;
+            if (v == .Closure) published += 1;
+        }
+
+        if (result) |_| {
+            first_success_idx = fail_idx;
+            // Success shape: the 2 upvalues were consumed (popped by
+            // registerfuncs itself); the table remains on top; all three
+            // functions are published closures.
+            try testing.expectEqual(snap_full.stack.?.len - 2, state.stack.items.len);
+            try testing.expectEqual(@as(usize, 3), published);
+            try testing.expectEqual(@as(usize, 2), n_cell);
+            try testing.expectEqual(@as(usize, 3), n_closure);
+            try testing.expectEqual(@as(usize, 0), n_other);
+            try testing.expect(gcCheckSecondaryRegistryInvariants(vm));
+
+            // Teardown: published closures (they reference the shared
+            // cells), then the shared cells, then the table (the only
+            // stack slot left — the upvalues were already popped).
+            for (residue[0..residue_n]) |o| {
+                if (o == .closure) p50TeardownClosure(vm, o.closure);
+            }
+            for (residue[0..residue_n]) |o| {
+                if (o == .cell) p50TeardownCell(vm, o.cell);
+            }
+            state.stack.items.len -= 1;
+            p50TeardownTable(vm, tbl, true);
+
+            // P16.50 fix applied: the shared-cell temp array is freed on
+            // EVERY exit (defer in api.registerfuncs) — nothing from the
+            // call window stays live after the teardown above.
+            try testing.expectEqual(@as(usize, 0), tracker.live.count());
+
+            vm.alloc = testing.allocator;
+            try snap_base.assertRestored(vm);
+            break;
+        } else |err| {
+            try testing.expect(err == error.OutOfMemory or err == error.Runtime);
+            tested_failures += 1;
+            // registerfuncs never touches the stack on failure; the STACK
+            // must be byte-exact immediately. The REGISTRIES may hold the
+            // documented residue (shared cells stay registered once the
+            // shared phase completed, closures published before the
+            // failing entry stay) — the byte-exact registry check runs
+            // AFTER the residue teardown below (full restoration).
+            // Residue shape: only shared cells + published closures, and
+            // every registered closure is published in the table (none
+            // left registered-but-unpublished).
+            try testing.expectEqual(@as(usize, 0), n_other);
+            try testing.expect(n_cell == 0 or n_cell == 2);
+            try testing.expectEqual(published, n_closure);
+            try testing.expectEqual(snap_full.obj_functions + n_closure, vm.testc_obj_functions);
+            const expected_count = snap_full.gc_count_kb +
+                @as(f64, @floatFromInt(n_cell * @sizeOf(Cell) +
+                    n_closure * (@sizeOf(Closure) + 2 * @sizeOf(*Cell)))) / 1024.0;
+            try testing.expectEqual(expected_count, vm.gc_count_kb);
+            try testing.expect(gcCheckSecondaryRegistryInvariants(vm));
+
+            for (residue[0..residue_n]) |o| {
+                if (o == .closure) p50TeardownClosure(vm, o.closure);
+            }
+            for (residue[0..residue_n]) |o| {
+                if (o == .cell) p50TeardownCell(vm, o.cell);
+            }
+            state.stack.items.len -= 3;
+            p50TeardownTable(vm, tbl, true);
+            // Failure paths free the shared array in the errdefer: nothing
+            // from the call window may remain live.
+            try testing.expectEqual(@as(usize, 0), tracker.live.count());
+            vm.alloc = testing.allocator;
+            try snap_base.assertRestored(vm);
+            try vm.gcMinorCollection();
+            try snap_base.assertRestored(vm);
+        }
+    }
+    try testing.expect(tested_failures > 0);
+    try testing.expect(first_success_idx != null);
+
+    // Repeated failure at a guaranteed-failing index (0 = the shared-cell
+    // array alloc, the very first allocation): must fail identically twice.
+    var repeat: usize = 0;
+    while (repeat < 2) : (repeat += 1) {
+        const snap = try P50Snapshot.take(vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+        const tbl = try vm.allocTableNoGc();
+        try vm.rawSet(tbl, .{ .String = key_alpha }, .{ .Bool = false });
+        try vm.rawSet(tbl, .{ .String = key_beta }, .{ .Bool = false });
+        try vm.rawSet(tbl, .{ .String = key_gamma }, .{ .Bool = false });
+        try state.stack.append(vm.alloc, .{ .Table = tbl });
+        try state.pushinteger(11);
+        try state.pushinteger(13);
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        vm.alloc = failing.allocator();
+        const result = state.registerfuncs(&reg, 2);
+        vm.alloc = testing.allocator;
+        try testing.expectError(error.OutOfMemory, result);
+        // Base restore: unwind whatever partial state index 0 left. At
+        // fail_index 0 the very first allocation fails, so the residue is
+        // just the table itself — but tear down defensively by shape, not
+        // by assumption.
+        var residue: [16]GcObject = undefined;
+        var residue_n: usize = 0;
+        for (vm.gc_objects.items[snap.gc_objects.len..]) |o| {
+            residue[residue_n] = o;
+            residue_n += 1;
+        }
+        for (residue[0..residue_n]) |o| {
+            if (o == .closure) p50TeardownClosure(vm, o.closure);
+        }
+        for (residue[0..residue_n]) |o| {
+            if (o == .cell) p50TeardownCell(vm, o.cell);
+        }
+        state.stack.items.len -= 3;
+        p50TeardownTable(vm, tbl, true);
+        try snap.assertRestored(vm);
+        try vm.gcMinorCollection();
+        try snap.assertRestored(vm);
+    }
+}

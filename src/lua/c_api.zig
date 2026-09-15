@@ -184,19 +184,39 @@ pub export fn lua_newstate(
 pub export fn lua_newthread(L: ?*lua_State) ?*lua_State {
     const parent = L orelse return null;
     const vm = parent.vm;
+    // P16.50 transactional: the old chain swallowed a registration
+    // failure (`catch {}`) and STILL charged gcNoteAlloc — an
+    // unregistered-but-published thread that no sweep could free, plus a
+    // count drift. Prepare-first makes the registration infallible; the
+    // post-commit publishes (handle, c_stack) roll the thread back
+    // completely on failure instead of leaking published state.
+    vm.gcPrepareRegister(1) catch return null;
     const th = vm.alloc.create(vm_mod.Thread) catch return null;
     th.* = .{ .status = .suspended, .callee = .Nil };
-    vm.gcRegisterThread(th) catch {};
+    vm.gcRegisterCommit(.{ .thread = th });
     vm.gcNoteAlloc(@sizeOf(vm_mod.Thread));
+    errdefer {
+        vm.gcUnregisterObjectRollback(.{ .thread = th });
+        vm.gcNoteFree(@sizeOf(vm_mod.Thread));
+        vm.alloc.destroy(th);
+    }
     vm.c_api_thread = th;
     // Create the coroutine handle with its own c_stack (and its
     // LUA_EXTRASPACE extra space in front, inheriting the main thread's
     // extra-space contents — PUC lstate.c:291-293).
-    const handle = vm.allocStateHandle(false) catch return null;
+    const handle = vm.allocStateHandle(false) catch {
+        vm.c_api_thread = null;
+        return null;
+    };
     handle.* = .{ .vm = vm, .thread = th, .is_main = false };
     th.api_handle = handle;
     // Push the thread value on the parent's c_stack (PUC pushes it on L->top).
-    parent.c_stack.append(vm.alloc, .{ .Thread = th }) catch {};
+    parent.c_stack.append(vm.alloc, .{ .Thread = th }) catch {
+        vm.freeStateHandle(handle);
+        th.api_handle = null;
+        vm.c_api_thread = null;
+        return null;
+    };
     return handle;
 }
 

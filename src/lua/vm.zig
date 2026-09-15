@@ -18054,7 +18054,18 @@ pub const Vm = struct {
         // rollback walks it in reverse. (An instack descriptor whose
         // boxed slot is already populated shares the existing Cell —
         // also not ours.)
-        var created: [16]*Cell = undefined;
+        // Upvalue counts can exceed 16 (PUC maxupvals is 255): the inline
+        // worklist covers the common case; deeper closures fall back to a
+        // heap array freed on every exit path. (The T1 matrix covers the
+        // inline path; the fallback only changes storage, not semantics.)
+        var created_buf: [16]*Cell = undefined;
+        var created_heap: ?[]*Cell = null;
+        defer if (created_heap) |h| self.alloc.free(h);
+        const created: []*Cell = if (nups > created_buf.len) blk: {
+            const h = self.alloc.alloc(*Cell, nups) catch return error.OutOfMemory;
+            created_heap = h;
+            break :blk h;
+        } else created_buf[0..nups];
         var created_n: usize = 0;
         // P16.50-review BLOCKER 1 post-commit window: after the Closure
         // commits, gcStoreCellValue (the recursive-closure barrier) can
@@ -18125,7 +18136,6 @@ pub const Vm = struct {
                         .bc_stack_idx = @intCast(ctx.base + uv.idx),
                         .bc_stack_thread = th,
                     };
-                    std.debug.assert(created_n < created.len);
                     created[created_n] = cell;
                     created_n += 1;
                     self.gcRegisterCommit(.{ .cell = cell });

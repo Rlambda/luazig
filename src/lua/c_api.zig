@@ -184,38 +184,51 @@ pub export fn lua_newstate(
 pub export fn lua_newthread(L: ?*lua_State) ?*lua_State {
     const parent = L orelse return null;
     const vm = parent.vm;
-    // P16.50 transactional: the old chain swallowed a registration
-    // failure (`catch {}`) and STILL charged gcNoteAlloc — an
-    // unregistered-but-published thread that no sweep could free, plus a
-    // count drift. Prepare-first makes the registration infallible; the
-    // post-commit publishes (handle, c_stack) roll the thread back
-    // completely on failure instead of leaking published state.
-    vm.gcPrepareRegister(1) catch return null;
-    const th = vm.alloc.create(vm_mod.Thread) catch return null;
+    // P16.50-review BLOCKER 2: the previous version used `errdefer` in a
+    // function returning ?*lua_State — errdefer only runs on ERROR
+    // returns, and every failure arm was an ordinary `return null`, so
+    // the cleanup NEVER executed (committed Thread leaked registered and
+    // accounted; the append-failure arm freed the handle but not the
+    // Thread). The transaction now lives in an inner error-union
+    // function; the ABI wrapper maps failure to null strictly AFTER the
+    // cleanup ran. The previous `vm.c_api_thread` value is preserved and
+    // restored on failure (it is caller-owned state, not ours to null).
+    const saved_c_api_thread = vm.c_api_thread;
+    const result = luaNewThreadTx(parent, vm) catch {
+        vm.c_api_thread = saved_c_api_thread;
+        return null;
+    };
+    return result;
+}
+
+/// Inner transaction for lua_newthread (P16.50-review): every failure
+/// returns an ERROR so the errdefer actually fires.
+fn luaNewThreadTx(parent: *vm_mod.lua_State, vmp: *Vm) error{OutOfMemory}!*vm_mod.lua_State {
+    // Prepare-first: after this, registration cannot fail.
+    try vmp.gcPrepareRegister(1);
+    const th = try vmp.alloc.create(vm_mod.Thread);
+    errdefer vmp.alloc.destroy(th);
     th.* = .{ .status = .suspended, .callee = .Nil };
-    vm.gcRegisterCommit(.{ .thread = th });
-    vm.gcNoteAlloc(@sizeOf(vm_mod.Thread));
-    errdefer {
-        vm.gcUnregisterObjectRollback(.{ .thread = th });
-        vm.gcNoteFree(@sizeOf(vm_mod.Thread));
-        vm.alloc.destroy(th);
-    }
-    vm.c_api_thread = th;
+    vmp.gcRegisterCommit(.{ .thread = th });
+    vmp.gcNoteAlloc(@sizeOf(vm_mod.Thread));
+    var committed = false;
+    errdefer if (committed) {
+        vmp.gcUnregisterObjectRollback(.{ .thread = th });
+        vmp.gcNoteFree(@sizeOf(vm_mod.Thread));
+    };
+    committed = true;
+    vmp.c_api_thread = th;
     // Create the coroutine handle with its own c_stack (and its
     // LUA_EXTRASPACE extra space in front, inheriting the main thread's
     // extra-space contents — PUC lstate.c:291-293).
-    const handle = vm.allocStateHandle(false) catch {
-        vm.c_api_thread = null;
-        return null;
-    };
-    handle.* = .{ .vm = vm, .thread = th, .is_main = false };
+    const handle = try vmp.allocStateHandle(false);
+    handle.* = .{ .vm = vmp, .thread = th, .is_main = false };
     th.api_handle = handle;
     // Push the thread value on the parent's c_stack (PUC pushes it on L->top).
-    parent.c_stack.append(vm.alloc, .{ .Thread = th }) catch {
-        vm.freeStateHandle(handle);
+    parent.c_stack.append(vmp.alloc, .{ .Thread = th }) catch {
+        vmp.freeStateHandle(handle);
         th.api_handle = null;
-        vm.c_api_thread = null;
-        return null;
+        return error.OutOfMemory;
     };
     return handle;
 }
@@ -1392,14 +1405,44 @@ pub export fn lua_pushlightuserdata(L: ?*lua_State, p: ?*anyopaque) void {
     s.pushlightuserdata(p) catch {};
 }
 
+/// P16.50-review: the shared `luaD_throw` equivalent for void C-ABI
+/// functions whose transactional internals return ApiError. PUC
+/// (`lmem.c` luaM_error → `ldo.c:125-146` luaD_throw) never lets an OOM
+/// surface as silent success: it longjmps to the nearest pcall anchor
+/// (`c_error_jmp` here — installed by callCFunctionWithBoundary, the
+/// luaD_rawrunprotected analogue) and, with no anchor, calls the
+/// `atpanic` hook then aborts. Matches the existing lua_callkImpl OOM
+/// arm (which sets c_error_value = .Nil and _longjmps).
+fn cThrow(vm: *Vm, err: api.ApiError) noreturn {
+    switch (err) {
+        error.OutOfMemory => {
+            if (vm.c_error_jmp) |jb| {
+                vm.c_error_value = .Nil;
+                _longjmp(jb, 1);
+            }
+            // No protected boundary: PUC would run g->panic(L) and abort.
+            // c_panicf is currently stored but never wired (see
+            // lua_atpanic); documented residual.
+            @panic("lua OOM without an active C-function boundary");
+        },
+        else => {
+            if (vm.c_error_jmp) |jb| {
+                vm.c_error_value = vm.errThread().err_obj;
+                _longjmp(jb, 1);
+            }
+            @panic("lua error without an active C-function boundary");
+        },
+    }
+}
+
 pub export fn lua_pushcclosure(L: ?*lua_State, f: ?*const fn (?*lua_State) callconv(.c) c_int, n: c_int) void {
     var s = api.State.fromHandle(L orelse return);
-    s.pushcclosure(f, @intCast(@max(n, 0))) catch {};
+    s.pushcclosure(f, @intCast(@max(n, 0))) catch |e| cThrow(s.vm, e);
 }
 
 pub export fn lua_pushcfunction(L: ?*lua_State, f: ?*const fn (?*lua_State) callconv(.c) c_int) void {
     var s = api.State.fromHandle(L orelse return);
-    s.pushcfunction(f) catch {};
+    s.pushcfunction(f) catch |e| cThrow(s.vm, e);
 }
 
 pub export fn lua_pushexternalstring(
@@ -2272,12 +2315,12 @@ pub export fn luaL_checklstring(L: ?*lua_State, arg: c_int, l: ?*usize) [*:0]con
 
 pub export fn luaL_setfuncs(L: ?*lua_State, reg: [*]const luaL_Reg, nup: c_int) void {
     var s = api.State.fromHandle(L orelse return);
-    s.registerfuncs(reg, @intCast(@max(nup, 0))) catch {};
+    s.registerfuncs(reg, @intCast(@max(nup, 0))) catch |e| cThrow(s.vm, e);
 }
 
 pub export fn luaL_newlib(L: ?*lua_State, reg: [*]const luaL_Reg) void {
     var s = api.State.fromHandle(L orelse return);
-    s.newlib(reg) catch {};
+    s.newlib(reg) catch |e| cThrow(s.vm, e);
 }
 
 pub export fn luaL_ref(L: ?*lua_State, t: c_int) c_int {
@@ -2977,7 +3020,14 @@ pub export fn lua_setupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]c
             const idx: usize = @intCast(@max(n - 1, 0));
             if (idx >= cl.upvalues.len) return null;
             if (s.stack.items.len < 1) return null;
-            cl.upvalues[idx].value = s.stack.items[s.stack.items.len - 1];
+            const v = s.stack.items[s.stack.items.len - 1];
+            // P16.50-review (test finding 4): a write into a CLOSED cell
+            // must run the generational barrier (PUC lua_setupvalue →
+            // luaC_barrier for upvalue stores, lapi.c). The old direct
+            // field write skipped it — an old cell storing a young value
+            // missed promotion and the value could be swept.
+            cl.upvalues[idx].value = v;
+            s.vm.gcWriteBarrierCell(cl.upvalues[idx], v) catch {};
             s.stack.items.len -= 1;
             return null;
         }

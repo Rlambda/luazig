@@ -917,26 +917,29 @@ pub const State = struct {
 
     /// Push a C closure wrapping `fn_` with `n` upvalues from the stack.
     /// Currently only n=0 is supported (upvalues need Phase 9).
-    pub fn pushcclosure(self: *State, fn_: ?*const fn (?*vm_mod.lua_State) callconv(.c) c_int, n: usize) ApiError!void {
-        // P16.50 transactional: reserve registry AND stack capacity before
-        // creating anything, then commit infallibly. The old order popped
-        // the upvalue values BEFORE the closure existed — a later failure
-        // lost them permanently; and any registration failure leaked the
-        // half-built objects.
+    /// Canonical C-closure constructor (P16.50-review BLOCKER 3).
+    /// PUC semantics: `lua_pushcclosure` (lapi.c:609+) allocates a FRESH
+    /// CClosure per call and COPIES the given values into that closure's
+    /// OWN upvalue slots — closures never share upvalue objects. The old
+    /// registerfuncs shared one set of Cell objects across every closure:
+    /// lua_setupvalue(f1, 1) mutated the same Cell observed by f2. PUC
+    /// luaL_setfuncs (lauxlib.c:965-978) copies the shared VALUES onto
+    /// the stack for each function and lets lua_pushcclosure take fresh
+    /// copies — this constructor is that mechanism: values in, fresh
+    /// per-closure Cells + Closure out, prepared-then-committed.
+    /// Returns the closure WITHOUT touching the stack (callers own the
+    /// push/pop ordering).
+    fn makeCclosure(self: *State, fn_: ?*const fn (?*vm_mod.lua_State) callconv(.c) c_int, values: []const vm_mod.Value) ApiError!*vm_mod.Closure {
+        const n = values.len;
         try self.vm.gcPrepareRegister(n + 1);
-        try self.stack.ensureUnusedCapacity(self.vm.alloc, 1);
         if (n == 0) {
             const cl = try self.vm.alloc.create(vm_mod.Closure);
             cl.* = .{ .upvalues = &.{}, .c_func = fn_ };
             self.vm.gcRegisterCommit(.{ .closure = cl });
             self.vm.gcNoteAlloc(@sizeOf(vm_mod.Closure));
             self.vm.testc_obj_functions += 1;
-            self.stack.appendAssumeCapacity(.{ .Closure = cl });
-            return;
+            return cl;
         }
-        // Read the n upvalue values from the stack top (WITHOUT popping:
-        // the pop commits only after every object exists).
-        if (self.stack.items.len < n) return error.InvalidState;
         const upv_cells = try self.vm.alloc.alloc(*vm_mod.Cell, n);
         var created: usize = 0;
         errdefer {
@@ -950,10 +953,9 @@ pub const State = struct {
             }
             self.vm.alloc.free(upv_cells);
         }
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
+        for (values, 0..) |v, i| {
             const cell = try self.vm.alloc.create(vm_mod.Cell);
-            cell.* = .{ .value = self.stack.items[self.stack.items.len - (n - i)] };
+            cell.* = .{ .value = v };
             self.vm.gcRegisterCommit(.{ .cell = cell });
             self.vm.gcNoteAlloc(@sizeOf(vm_mod.Cell));
             upv_cells[i] = cell;
@@ -964,6 +966,24 @@ pub const State = struct {
         self.vm.gcRegisterCommit(.{ .closure = cl });
         self.vm.gcNoteAlloc(@sizeOf(vm_mod.Closure) + n * @sizeOf(*vm_mod.Cell));
         self.vm.testc_obj_functions += 1;
+        return cl;
+    }
+
+    pub fn pushcclosure(self: *State, fn_: ?*const fn (?*vm_mod.lua_State) callconv(.c) c_int, n: usize) ApiError!void {
+        // P16.50 transactional: the stack mutation (pop the consumed
+        // upvalues, push the closure) commits only AFTER every object
+        // exists — a failure never loses values.
+        try self.stack.ensureUnusedCapacity(self.vm.alloc, 1);
+        if (n == 0) {
+            const cl = try self.makeCclosure(fn_, &.{});
+            self.stack.appendAssumeCapacity(.{ .Closure = cl });
+            return;
+        }
+        // Read the n upvalue values from the stack top (WITHOUT popping:
+        // the pop commits only after every object exists).
+        if (self.stack.items.len < n) return error.InvalidState;
+        const vals = self.stack.items[self.stack.items.len - n ..];
+        const cl = try self.makeCclosure(fn_, vals);
         // Commit the stack mutation only now: pop the consumed upvalues
         // and push the closure (capacity reserved above — infallible).
         self.stack.items.len -= n;
@@ -1229,48 +1249,26 @@ pub const State = struct {
             .Table => |t| t,
             else => return error.Type,
         };
-        // Snapshot the shared upvalues (they're at [tbl_idx+1 .. tbl_idx+1+nup])
+        // P16.50-review BLOCKER 3: PUC luaL_setfuncs (lauxlib.c:965-978)
+        // copies the nup SHARED VALUES (not upvalue objects) and, for
+        // each registered function, calls lua_pushcclosure — which
+        // allocates a FRESH CClosure with its OWN upvalue slots and
+        // copies the values in (lapi.c:609+, lfunc.c luaF_newCclosure).
+        // The old implementation created one set of shared Cell OBJECTS
+        // referenced by every closure: lua_setupvalue(f1, 1) mutated the
+        // same Cell observed by f2 — not PUC behavior. The shared-cell
+        // phase is REMOVED; each function gets fresh per-closure Cells
+        // holding copies of the values (makeCclosure — the canonical
+        // constructor shared with pushcclosure).
+        //
+        // Errors propagate with the original value (no catch {} swallows,
+        // no silent partial library): functions registered before a
+        // failure stay published — valid, fully-registered objects; the
+        // caller sees the error (PUC luaL_setfuncs aborts via luaD_throw
+        // on the first failure; our error return is the Zig-native form).
         const upv_start = tbl_idx + 1;
-        // P16.50 transactional: no swallowed registrations (the old
-        // `catch {}` left cells/closures UNREGISTERED but referenced —
-        // permanent leaks) and no silent per-function `catch continue`
-        // (a partial library was invisible to the caller). Errors now
-        // propagate with the original error value; the shared cells are
-        // prepared (registry capacity reserved) before allocation, so a
-        // failure rolls back cleanly. Functions registered before a
-        // failure stay published — they are valid, fully-registered
-        // objects; the caller sees the error and knows the registration
-        // is incomplete (PUC luaL_setfuncs aborts via luaD_throw on the
-        // first failure — our error return is the Zig-native equivalent).
-        var shared_cells: []*vm_mod.Cell = &.{};
-        var cells_created: usize = 0;
-        var cells_ok = false;
-        if (nup > 0) {
-            try self.vm.gcPrepareRegister(nup);
-            shared_cells = try self.vm.alloc.alloc(*vm_mod.Cell, nup);
-            // The temp array is freed on EVERY exit (success included —
-            // freeing only on failure leaked nup*8 bytes per call); the
-            // rollback errdefer below runs FIRST (reverse declaration
-            // order) and still reads the array.
-            defer self.vm.alloc.free(shared_cells);
-            errdefer if (!cells_ok) {
-                while (cells_created > 0) {
-                    cells_created -= 1;
-                    self.vm.gcUnregisterObjectRollback(.{ .cell = shared_cells[cells_created] });
-                    self.vm.gcNoteFree(@sizeOf(vm_mod.Cell));
-                    self.vm.alloc.destroy(shared_cells[cells_created]);
-                }
-            };
-            for (0..nup) |i| {
-                const cell = try self.vm.alloc.create(vm_mod.Cell);
-                cell.* = .{ .value = self.stack.items[upv_start + i] };
-                self.vm.gcRegisterCommit(.{ .cell = cell });
-                self.vm.gcNoteAlloc(@sizeOf(vm_mod.Cell));
-                shared_cells[i] = cell;
-                cells_created += 1;
-            }
-            cells_ok = true;
-        }
+        const shared_values: []const vm_mod.Value =
+            self.stack.items[upv_start .. upv_start + nup];
         var i: usize = 0;
         while (reg[i].name != null) : (i += 1) {
             const name = std.mem.span(reg[i].name.?);
@@ -1279,38 +1277,23 @@ pub const State = struct {
                 self.vm.apiRawSet(tbl, .{ .String = key_str }, .{ .Bool = false }) catch return mapVmError();
                 continue;
             }
-            // PUC luaL_setfuncs: each closure gets its OWN upvalue array
-            // (luaF_newLclosure(nup)) holding pointers to the SHARED UpVal
-            // objects. Sharing one array across closures would double-free
-            // it at sweep (gcFreeObject frees c.upvalues per closure).
-            try self.vm.gcPrepareRegister(1);
-            const own_cells: []*vm_mod.Cell = if (nup > 0)
-                try self.vm.alloc.alloc(*vm_mod.Cell, nup)
-            else
-                &.{};
-            var cl_committed = false;
-            errdefer if (!cl_committed) {
-                if (own_cells.len > 0) self.vm.alloc.free(own_cells);
-            };
-            if (nup > 0) @memcpy(own_cells, shared_cells);
-            const cl = try self.vm.alloc.create(vm_mod.Closure);
-            cl.* = .{ .upvalues = own_cells, .c_func = reg[i].func };
-            self.vm.gcRegisterCommit(.{ .closure = cl });
-            // Symmetric with gcFreeObject's per-closure credit.
-            self.vm.gcNoteAlloc(@sizeOf(vm_mod.Closure) + nup * @sizeOf(*vm_mod.Cell));
-            self.vm.testc_obj_functions += 1;
+            const cl = try self.makeCclosure(reg[i].func, shared_values);
             self.vm.apiRawSet(tbl, .{ .String = key_str }, .{ .Closure = cl }) catch {
-                // Publish failed: roll the committed closure back fully —
-                // a registered-but-unpublished closure would sweep-free
-                // own_cells while this errdefer also frees it (double free).
+                // Publish failed: roll the fully-committed closure back
+                // (its Cells are reachable only through the array we
+                // still own — unregister the closure, then every Cell).
                 self.vm.gcUnregisterObjectRollback(.{ .closure = cl });
                 self.vm.gcNoteFree(@sizeOf(vm_mod.Closure) + nup * @sizeOf(*vm_mod.Cell));
                 self.vm.testc_obj_functions -= 1;
-                if (own_cells.len > 0) self.vm.alloc.free(own_cells);
-                cl_committed = true; // errdefer disarmed; cleanup done here
+                for (cl.upvalues) |c| {
+                    self.vm.gcUnregisterObjectRollback(.{ .cell = c });
+                    self.vm.gcNoteFree(@sizeOf(vm_mod.Cell));
+                    self.vm.alloc.destroy(c);
+                }
+                self.vm.alloc.free(cl.upvalues);
+                self.vm.alloc.destroy(cl);
                 return mapVmError();
             };
-            cl_committed = true;
         }
         self.stack.items.len -= nup;
     }

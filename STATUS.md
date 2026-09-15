@@ -43,7 +43,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-14)
 
-- [ ] **P16.49-review-2 (owner-instructed)**: OLD0 accounting regression + OOM coverage — (a) Task 1: вернуть EXACTLY-ONCE gc_gen_added_old_kb charge при .old0→.old1 в sweep (PUC sweepgen addedold: lgc.c:1172-1212 инкрементит для КАЖДОГО becoming-G_OLD1 — и survival→old1, и old0→old1; барьеры charge НЕ делают — мой P16.49-review removal был ошибочен), сохранив устранение duplicate gc_old1.append (барьер уже linked), исправить ложный комментарий/prose, проверить все .old0-setting пути на zero/double charge; focused unit test (old owner + young child → настоящий forward barrier → .old0 + ровно одно вхождение в gc_old1 → minor sweep → .old1 + charge ровно gcObjectBytes(child) → threshold edge против PUC-модели → следующий цикл без второго charge) + negative validation throwaway без OLD0 charge; (b) Task 3: generational-minor FailingAllocator sweep для closureFromProto (каждый fail index вкл. gcRegisterCell young-list growth; byte-exact gc_objects/young contents/order/accounting/funcs/tree-ref; реальный gcMinorCollection после каждого failure; success edge + repeated; negative copy со старым register-failure ownership ловится); stats accounting при register failure (alloc_by_type инкрементится ДО fallible ensureUnusedCapacity — перенести после успешной регистрации + тест); (c) sweep/OOM audit: фраза 'allocation-free' неточна — closeThreadOpenUpvalues→gcWriteBarrierCell catch {} в gen-minor делает аллоцирующие appends (gcQueueScanObject→gc_gray, gc_old1.append): доказать недостижимость во время young sweep ЛИБО PUC-faithful sweep-arm (lgc.c:246-260: во время sweep barrier делает makewhite(owner), без marking и без аллокаций) ЛИБО честно зафиксировать pre-existing blocker и не называть sweep allocation-free; (d) baseline: после фикса перезаписать на исправленном measured source (owner-approved), history ошибочной сессии в manifest не трогать.
+- [x] **P16.49-review-2 (owner-instructed)**: OLD0 accounting regression + OOM coverage — (a) Task 1: вернуть EXACTLY-ONCE gc_gen_added_old_kb charge при .old0→.old1 в sweep (PUC sweepgen addedold: lgc.c:1172-1212 инкрементит для КАЖДОГО becoming-G_OLD1 — и survival→old1, и old0→old1; барьеры charge НЕ делают — мой P16.49-review removal был ошибочен), сохранив устранение duplicate gc_old1.append (барьер уже linked), исправить ложный комментарий/prose, проверить все .old0-setting пути на zero/double charge; focused unit test (old owner + young child → настоящий forward barrier → .old0 + ровно одно вхождение в gc_old1 → minor sweep → .old1 + charge ровно gcObjectBytes(child) → threshold edge против PUC-модели → следующий цикл без второго charge) + negative validation throwaway без OLD0 charge; (b) Task 3: generational-minor FailingAllocator sweep для closureFromProto (каждый fail index вкл. gcRegisterCell young-list growth; byte-exact gc_objects/young contents/order/accounting/funcs/tree-ref; реальный gcMinorCollection после каждого failure; success edge + repeated; negative copy со старым register-failure ownership ловится); stats accounting при register failure (alloc_by_type инкрементится ДО fallible ensureUnusedCapacity — перенести после успешной регистрации + тест); (c) sweep/OOM audit: фраза 'allocation-free' неточна — closeThreadOpenUpvalues→gcWriteBarrierCell catch {} в gen-minor делает аллоцирующие appends (gcQueueScanObject→gc_gray, gc_old1.append): доказать недостижимость во время young sweep ЛИБО PUC-faithful sweep-arm (lgc.c:246-260: во время sweep barrier делает makewhite(owner), без marking и без аллокаций) ЛИБО честно зафиксировать pre-existing blocker и не называть sweep allocation-free; (d) baseline: после фикса перезаписать на исправленном measured source (owner-approved), history ошибочной сессии в manifest не трогать.
 
 
 - [x] **P16.49-review correction (owner-instructed)**: transactional GC rollback + Task 0 review fixes — (a) BLOCKER: rollback-пути (createBytecodeChunkClosure/closureFromProto) зовут gcUnregisterObject, который удаляет ТОЛЬКО из gc_objects, тогда как gcRegisterObject в generational minor phase регистрирует и в gc_young_objects → freed объекты остаются dangling в young list → следующий young sweep разыменовывает/double-free; нужен общий PUC-explainable ownership контракт для ВСЕХ secondary registries (young/old1/gen_threads/gray/grayagain/weak/finalizer/accounting), инвентаризация всех gcRegisterObject→fallible→rollback цепочек (Table/Closure/Thread/String/Cell/Userdata), failing FailingAllocator-регрессия в generational minor phase со снапшотами содержимого secondary registries + young collection после каждого fail index (DebugAllocator ловит dangling/double-free), invariant-хелпер (каждый entry каждого registry — живой объект верного типа; rollback восстанавливает byte-exact pre-call state), сравнение с PUC luaC_newobj/allgc unlink ownership; (b) Task 0: hardened validate_baseline_document (точный опубликованный SEED_LIST для paired-seed-v1, finite wall, пересчёт classify_modes + согласованность labels/mode_evidence, строгий validator в gate path → INCONCLUSIVE с причиной, harden _paired_seed_schema_reason против non-dict/unhashable/wrong-type rows) + negative fixtures; (c) provenance drift: перегенерация ВСЕХ canonical current-* на одном final measured-source/binary (smoke=85 файлов), STATUS methodology строки (~83) — актуальный paired-seed gate, P16.49 perf prose — per-seed extrema −2.685%..+2.956% (не ±0.6%); (d) focused тест 85: assert успешный resume + suspended status в обеих ветках.
@@ -7173,6 +7173,55 @@ scope-проверка: git diff C..D по src/build.zig/tests/tools-*.py пус
   zig_fail=0/both_fail=1 (big.lua); c_api + DIFF: PASS; api580 GREEN;
   gc.lua outputs match; exact-contract crash loop 20/20 rc=0;
   diff --check 0.
+
+### P16.49-review-2: OLD0 accounting regression fix + OOM coverage (2026-09-15)
+
+Correction-фаза по owner-ledger item (открыт 76328a2; open-count 21→22→
+закрыт→21). Коммиты: C = 66cd438 → D = wrapper (scope пуст).
+
+- **Task 1 — REGRESSION FIX**: gcPromoteYoungObject(.old0) снова charge'ит
+  gc_gen_added_old_kb при .old0→.old1 — РОВНО по PUC sweepgen (lgc.c:1172-
+  1212: addedold инкрементит для КАЖДОГО becoming-G_OLD1, оба перехода;
+  luaC_barrier_ lgc.c:246-260 charge НЕ делает). Мой P16.49-review removal
+  был ошибочен (недосчёт OLD0 promotions → ошибочно отложенный minor→major).
+  Duplicate gc_old1.append НЕ возвращён (барьер уже linked — верная часть).
+  Ложный комментарий/prose исправлены; все .old0-setting пути проверены —
+  ни один не charge'ит → exactly-once в sweep. Тест 'OLD0 promotion
+  charges added-old exactly once': old owner → настоящий forward barrier →
+  .old0 + ровно одно вхождение в gc_old1 + нулевой charge барьера → minor
+  sweep → .old1 + charge ровно gcObjectBytes → второй цикл (markold
+  .old1→.old, выход из old1, ноль второго charge) → threshold edge со
+  свежим child2 → .major. NEGATIVE VALIDATION (throwaway-worktree без
+  charge): тест ловит — 'actual 0, not within tolerance of expected
+  0.0703125'.
+- **Sweep/OOM audit закрыт PUC-faithful**: gcSweepYoungGeneration ставит
+  gc_state=.sweep ДО sweep (точная модель PUC youngcollection lgc.c:1351
+  gcstate=GCSswpallgc) + все три generational-ветки барьеров получают
+  sweep-arm NO-OP (PUC lgc.c:257-260: в KGC_GENMINOR sweep фазе барьер —
+  deliberate no-op; значение surviving cell уже помечено в atomic через
+  traversal живого closure). Young sweep теперь ДЕЙСТВИТЕЛЬНО
+  allocation-free — catch {} больше не маскирует недостижимый путь.
+  Validation C (sweep-arm убран): все тесты зелёные — behavioral-neutral
+  сегодня, ценность = PUC-parity + гарантия allocation-freedom.
+- **Task 3 — coverage gap закрыт**: generational-minor FailingAllocator
+  sweep для closureFromProto (каждый fail index вкл. gcRegisterCell
+  young-list growth; byte-exact gc_objects/young contents+order/
+  accounting/funcs; реальный gcMinorCollection после каждого failure;
+  success edge). NEGATIVE VALIDATION (register-failure ownership убран):
+  ОБЕ генерационные регрессии ловят утечку ровно одного Cell. Stats
+  accounting: alloc_by_type перенесён ПОСЛЕ успешной регистрации (rollback
+  больше не оставляет drift per-type counters).
+- **Baseline (owner-approved)**: перезаписан на fixed source 66cd438
+  (P16.49-review-2, geomean 1.42097, note с полным causal rationale:
+  OLD0-accounting + sweep-arm + stats — instruction counts сдвигаются
+  причинно); history ошибочной сессии в manifest нетронута.
+- **Perf**: объявленная сессия (ровно одна) на immutable binary
+  d9669fac…: RESULT: OK (rc=0), seeds 1..21 × 18 workloads.
+- **Батарея**: 16/16 rc=0 (fmt, unit D/RF 224/224 0 leaks, selftests,
+  noise + 7 негативных, smoke, matrix zig_fail=0/both_fail=1, c_api +
+  DIFF: PASS, api580, gc.lua, diff --check); smoke 84/84 реальным --testc;
+  exact-contract crash loop 20/20 rc=0; binary hash неизменен после
+  rebuild.
 
 ## История закрытых фаз
 

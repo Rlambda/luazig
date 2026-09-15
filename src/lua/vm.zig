@@ -5820,7 +5820,10 @@ pub const Vm = struct {
         th.* = .{ .status = .suspended, .callee = callee };
         self.gcRegisterCommit(.{ .thread = th });
         self.gcNoteAlloc(@sizeOf(Thread));
-        self.testcCommitMemory(@sizeOf(Thread) + 64);
+        // P16.50-review-2 defect 5: the thread's free path credits exactly
+        // sizeof(Thread) (gcFreeObject) — the commit must match; the old
+        // +64 headroom left a permanent +64 residue per thread lifecycle.
+        self.testcCommitMemory(@sizeOf(Thread));
         self.testc_obj_threads += 1;
         // P15.40a: Pre-allocate frame capacity for the new coroutine. This
         // avoids the capacity-check branch on the first 64 bytecode calls.
@@ -7687,14 +7690,12 @@ pub const Vm = struct {
         // to the table exactly at the step-5 swap (flag disarm).
         var hash_installed = false;
         errdefer if (!hash_installed and new_hash.len > 0) {
+            // Reverse the hash charges exactly once: gcNoteFree already
+            // reverses BOTH ledgers (gc_count_kb AND ctrl.total_bytes) —
+            // the earlier explicit ctrl reversal here double-counted and
+            // drove the ledger below baseline (found by the B4 test).
             self.alloc.free(new_hash);
-            // Reverse the hash charges exactly once (saturating).
             self.gcNoteFree(new_hash.len * @sizeOf(ltable.Node));
-            if (self.testc_active) {
-                if (self.testc_ctrl) |ctrl| {
-                    ctrl.total_bytes -|= new_hash.len * @sizeOf(ltable.Node);
-                }
-            }
         };
         // 3. Allocate new array, copy common elements, nil-fill new slots.
         //    PUC `resizearray` + `clearNewSlice`. When the array size doesn't
@@ -22390,8 +22391,8 @@ pub const Vm = struct {
         th.* = .{ .status = .suspended, .callee = callee };
         self.gcRegisterCommit(.{ .thread = th });
         self.gcNoteAlloc(@sizeOf(Thread));
-        // P16.50-review-2 BLOCKER 4: the matching commit (was check-only).
-        self.testcCommitMemory(@sizeOf(Thread) + 64);
+        // P16.50-review-2 defect 5: symmetric with the free credit.
+        self.testcCommitMemory(@sizeOf(Thread));
         self.testc_obj_threads += 1;
         outs[0] = .{ .Thread = th };
     }
@@ -37810,11 +37811,33 @@ pub const Vm = struct {
             if (k == end_idx) break;
             k += 1;
         }
-        const final_str = try self.internStr(try out.toOwnedSlice(self.alloc));
-        // P16.50-review-2 BLOCKER 4: commit AFTER the last native
-        // allocation (toOwnedSlice + internStr) succeeded; was check-only.
-        // toOwnedSlice moved the buffer, so out.deinit is now a no-op.
+        const scratch = try out.toOwnedSlice(self.alloc);
+        // P16.50-review-2 defects 4+6: (4) internStr COPIES the bytes —
+        // the scratch buffer was leaked on every path that reached here
+        // (found by the B4 test's live-set proof); freed now. (6) PUC's
+        // concat scratch is a TRANSIENT luaM_realloc_'d buffer whose
+        // luaM_free_ nets it to zero — the permanent delta is only the
+        // interned string's own accounting (charged inside internStr).
+        // Charge the scratch, then reverse it symmetrically on BOTH paths
+        // (a failing internStr leaves the table byte-exact too).
         self.testcCommitMemory(total_len);
+        var scratch_settled = false;
+        errdefer if (!scratch_settled) {
+            self.alloc.free(scratch);
+            // Reverse ONLY the testc ledger: the scratch never charged
+            // gc_count_kb (the out-buffer growth was check'd, not
+            // gcNoteAlloc'd) — a gcNoteFree here would under-drift the GC
+            // ledger by total_len (found by the B4 snapshot: −3 bytes).
+            if (self.testc_active) {
+                if (self.testc_ctrl) |ctrl2| ctrl2.total_bytes -|= total_len;
+            }
+        };
+        const final_str = try self.internStr(scratch);
+        self.alloc.free(scratch);
+        if (self.testc_active) {
+            if (self.testc_ctrl) |ctrl2| ctrl2.total_bytes -|= total_len;
+        }
+        scratch_settled = true;
         outs[0] = .{ .String = final_str };
     }
 
@@ -50150,4 +50173,865 @@ test "P16.50-review T4: testcCheckMemory/testcCommitMemory split under native fa
         try vm.gcMinorCollection();
         try snap.assertRestored(&vm);
     }
+}
+
+// ---------------------------------------------------------------------------
+// P16.50-review-2: the three test groups the review asked for on top of the
+// committed production fixes (B1 heap-worklist opClosure, B3 C-API callCFunction
+// ERRMEM/ERRRUN transport, B4 testc total_bytes charge/credit parity per
+// constructor site). Tests only — every production defect they expose is
+// asserted-as-is with a FINDING comment, per the T1 precedent.
+// ---------------------------------------------------------------------------
+
+/// B3 Part 1 C function: pushinteger + pushcclosure(n=1) + return 1.
+/// Measured allocation map through the failing allocator:
+///   #0 pushinteger's c_stack append growth (9 slots = 144 bytes),
+///   #1 pushcclosure's upv_cells array (8),
+///   #2 the captured upvalue Cell (40),
+///   #3 the Closure (40),
+///   #4 the normal-path results dupe (16).
+fn p50r2PushcclosureFn(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    c_api.lua_pushinteger(L, 42); // the future upvalue (captured by n=1)
+    c_api.lua_pushcclosure(L, p50Cfunc, 1);
+    return 1;
+}
+
+/// B3 Part 3 C function: pushcfunction (pushcclosure with n=0) + return 1.
+/// Measured map: #0 the c_stack ensureUnusedCapacity growth (144),
+/// #1 the Closure (40), #2 the results dupe (16).
+fn p50r2PushcfunctionFn(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    c_api.lua_pushcfunction(L, p50Cfunc);
+    return 1;
+}
+
+/// B3 Part 2 C function: pushes the error object (allocation-free Int) and
+/// throws via lua_error — the ERRRUN path (boundary decodes -1-0 = -1).
+fn p50r2ErrorFn(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    c_api.lua_pushinteger(L, 777); // the error object
+    c_api.lua_error(L);
+}
+
+test "P16.50-review-2 B1: opClosure heap worklist (nups=20) mixed OOM matrix" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    const th = vm.main_thread.?;
+
+    // ---- Base state: everything created before gcEnterGenerational is OLD,
+    // so the failure branches' gcMinorCollection never touches it. ----
+    var setup_roots = vm.gcTempRoots();
+    defer setup_roots.end();
+
+    // Fill tables: keep gc_objects non-empty so the rollback's
+    // gcUnregisterObjectRollback swapRemoves exercise the swap-with-last path.
+    var fill_tables: [4]*Table = undefined;
+    for (&fill_tables) |*slot| {
+        const t = try vm.allocTableNoGc();
+        try setup_roots.add(.{ .Table = t });
+        slot.* = t;
+    }
+
+    // 10 borrowed OPEN cells at absolute stack slots 0..9 (OUTSIDE the frame
+    // window [16..28)) — the foreign live cells the child's 10 proxy
+    // descriptors resolve to through cur_upvalues. The exact-ownership
+    // worklist rollback must never touch them.
+    var borrowed: [10]*Cell = undefined;
+    for (0..10) |i| {
+        th.bytecode_stack[i] = .{ .Int = @intCast(100 + i) };
+        const cell = try vm.alloc.create(Cell);
+        cell.* = .{ .value = .{ .Int = @intCast(100 + i) }, .bc_stack_idx = @intCast(i), .bc_stack_thread = th };
+        th.bytecode_boxed[i] = cell;
+        try vm.gcPrepareRegister(1);
+        vm.gcRegisterCommit(.{ .cell = cell });
+        vm.gcNoteAlloc(@sizeOf(Cell));
+        borrowed[i] = cell;
+    }
+
+    // Keeper C-closure: the only temp-root mechanism for Cells — roots all
+    // 10 borrowed cells through gcEnterGenerational's full cycle, then is
+    // torn down (the cells stay registered + old).
+    const keeper_upvs = try vm.alloc.alloc(*Cell, 10);
+    for (0..10) |i| keeper_upvs[i] = borrowed[i];
+    try vm.gcPrepareRegister(1);
+    const keeper = try vm.alloc.create(Closure);
+    keeper.* = .{ .upvalues = keeper_upvs, .c_func = p50Cfunc };
+    vm.gcRegisterCommit(.{ .closure = keeper });
+    vm.gcNoteAlloc(@sizeOf(Closure) + 10 * @sizeOf(*Cell));
+    vm.testc_obj_functions += 1; // balances p50TeardownClosure's decrement
+    try setup_roots.add(.{ .Closure = keeper });
+
+    try vm.gcEnterGenerational();
+    p50TeardownClosure(&vm, keeper); // cells stay registered + old
+    setup_roots.end(); // fill tables stay registered (old) until vm.deinit
+
+    // Prime both registries so opClosure's gcPrepareRegister(21) is a
+    // capacity no-op — the failure index then maps 1:1 onto the construction
+    // steps.
+    try vm.gc_objects.ensureUnusedCapacity(testing.allocator, 32);
+    try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 32);
+
+    // Hand-built protos (real allocator, outside every failure loop):
+    //   child:  20 upvalues — even i: proxy(idx = i/2) → cur_upvalues[i/2]
+    //                   (a borrowed cell), odd i: instack(idx = (i-1)/2) →
+    //                   a FRESH cell capturing frame register (i-1)/2.
+    //   parent: OP_CLOSURE R11 := closure(P[0]); RETURN0;
+    //           10 proxy upvalues (idx 0..9) = cur_upvalues.
+    // nups=20 > 16 forces opClosure's HEAP worklist branch (the P16.50-review-2
+    // BLOCKER 1 fallback allocation) — the point of this test.
+    var child_builder = bc.ProtoBuilder.init(vm.alloc);
+    errdefer child_builder.deinit();
+    _ = try child_builder.emitSimple(.return0, 1);
+    for (0..20) |i| {
+        if (i % 2 == 0) {
+            _ = try child_builder.addUpvalue(.{ .instack = false, .idx = @intCast(i / 2), .is_const = false });
+        } else {
+            _ = try child_builder.addUpvalue(.{ .instack = true, .idx = @intCast((i - 1) / 2), .is_const = false });
+        }
+    }
+    const child_proto = try child_builder.finish();
+    child_builder.deinit();
+    child_builder = bc.ProtoBuilder.init(vm.alloc); // disarm the errdefer: consumed
+
+    var parent_builder = bc.ProtoBuilder.init(vm.alloc);
+    errdefer parent_builder.deinit();
+    _ = try parent_builder.emitABC(.closure, 11, 0, 0, 1); // R11 := closure(P[0])
+    _ = try parent_builder.emitSimple(.return0, 1);
+    for (0..10) |i| {
+        _ = try parent_builder.addUpvalue(.{ .instack = false, .idx = @intCast(i), .is_const = false });
+    }
+    _ = try parent_builder.addProto(child_proto); // takes over the producing ref
+    const parent_proto = try parent_builder.finish();
+    parent_builder.deinit();
+    parent_builder = bc.ProtoBuilder.init(vm.alloc); // disarm the errdefer: consumed
+    defer parent_proto.tree.?.releaseTree(vm.alloc); // the producing reference
+
+    // The production dispatch context: a Lua CallFrame at slot 15 (base 16,
+    // frame_cap 12 — the register window stack[16..28]) over the parent proto,
+    // with cur_upvalues = the 10 borrowed cells.
+    var frames: FrameStack = .{};
+    frames.inline_frames[0] = .{
+        .func_slot = 15,
+        .u = .{ .lua = .{ .proto = parent_proto, .pc = 0, .frame_cap = 12 } },
+    };
+    frames.inline_count = 1;
+    var yielded = false;
+    var ctx: Vm.BytecodeDispatchCtx = .{
+        .exec_frames = &frames,
+        .frame_index = 0,
+        .boundary_depth = 0,
+        .yielded_in_place = &yielded,
+        .th = th,
+        .cur_proto = parent_proto,
+        .cur_upvalues = borrowed[0..],
+        .base = 16,
+        .frame_cap = 12,
+        .regs = th.bytecode_stack[16..28],
+        .pc = 0,
+    };
+
+    // Frame registers: stack[16..26] = the instack capture targets,
+    // stack[27] = R11, the publish target (boxed[27] null — no barrier).
+    for (0..10) |i| th.bytecode_stack[16 + i] = .{ .Int = @intCast(200 + i) };
+    th.bytecode_stack[27] = .{ .Int = 7 };
+
+    // Allocation map (registries primed): #0 the heap worklist (20*8=160),
+    // #1 the cells array (160), #2..#11 the ten fresh Cells (40 each),
+    // #12 the Closure (40) — first success at fail_index 13.
+    // fail_index 0 and 1 are the BLOCKER 1 regression indices: the OLD
+    // ordering allocated `cells` first and the heap fallback second, so a
+    // fallback-allocation failure (then index 1) returned OOM while leaking
+    // the cells array. Every index must now restore byte-exact state.
+    var fail_idx: usize = 0;
+    var tested_failures: usize = 0;
+    var first_success_idx: ?usize = null;
+    while (fail_idx <= 14) : (fail_idx += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        const snap = try P50Snapshot.take(&vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+
+        ctx.pc = 0;
+        vm.alloc = failing.allocator();
+        const result = vm.opClosure(&ctx);
+        vm.alloc = testing.allocator;
+
+        if (result) |_| {
+            first_success_idx = fail_idx;
+            const cl = th.bytecode_stack[27].Closure; // published at R11
+            try testing.expectEqual(@as(usize, 20), cl.upvalues.len);
+            // Capture the fresh cells before the teardown frees the array.
+            var fresh: [10]*Cell = undefined;
+            for (0..10) |j| {
+                // even slot 2j: the borrowed proxy cell, in order
+                try testing.expect(cl.upvalues[2 * j] == borrowed[j]);
+                // odd slot 2j+1: a FRESH open cell capturing register j
+                const cell = cl.upvalues[2 * j + 1];
+                try testing.expect(cell != borrowed[j]);
+                try testing.expect(cell.isOpen());
+                try testing.expectEqual(@as(u32, 16 + @as(u32, @intCast(j))), cell.bc_stack_idx);
+                try testing.expect(cell.bc_stack_thread == th);
+                try testing.expect(std.meta.eql(cell.value, .{ .Int = @intCast(200 + j) }));
+                try testing.expect(th.bytecode_boxed[16 + j] == cell);
+                try testing.expect(p50IsRegistered(&vm, .{ .cell = cell }));
+                try testing.expect(p50InYoung(&vm, .{ .cell = cell }));
+                fresh[j] = cell;
+            }
+            try testing.expect(p50IsRegistered(&vm, .{ .closure = cl }));
+            try testing.expect(p50InYoung(&vm, .{ .closure = cl }));
+            try testing.expectEqual(snap.obj_functions + 1, vm.testc_obj_functions);
+            p50TeardownClosure(&vm, cl);
+            for (0..10) |j| p50TeardownCell(&vm, fresh[j]);
+            th.bytecode_stack[27] = .{ .Int = 7 }; // un-publish the freed closure
+            try snap.assertRestored(&vm);
+            try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+            try vm.gcMinorCollection();
+            try snap.assertRestored(&vm);
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            tested_failures += 1;
+            // NEGATIVE (what the exact-ownership worklist proves): none of
+            // the ten BORROWED cells may be unregistered, unlinked or
+            // destroyed by any rollback index — the old count-prefix
+            // rollback read foreign cells out of `cells`.
+            for (0..10) |i| {
+                try testing.expect(p50IsRegistered(&vm, .{ .cell = borrowed[i] }));
+                try testing.expect(th.bytecode_boxed[i] == borrowed[i]);
+            }
+            // No partial cell publish survives: every frame-window boxed
+            // slot is null again and the registers are untouched.
+            for (0..10) |i| try testing.expect(th.bytecode_boxed[16 + i] == null);
+            for (0..10) |i| try testing.expect(std.meta.eql(th.bytecode_stack[16 + i], .{ .Int = @intCast(200 + i) }));
+            try testing.expect(std.meta.eql(th.bytecode_stack[27], .{ .Int = 7 }));
+            try snap.assertRestored(&vm);
+            try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+            try vm.gcMinorCollection();
+            try snap.assertRestored(&vm);
+        }
+    }
+    try testing.expect(tested_failures > 0);
+    try testing.expect(first_success_idx != null);
+    // The measured map: the heap worklist is request #0, the Closure #12 —
+    // the first non-failing index is 13.
+    try testing.expectEqual(@as(usize, 13), first_success_idx.?);
+
+    // ---- Final teardown: the borrowed cells (open — each unlinks its own
+    // boxed slot). The fill tables stay registered (old) until vm.deinit. ----
+    for (0..10) |i| p50TeardownCell(&vm, borrowed[i]);
+}
+
+test "P16.50-review-2 B3: callCFunction ERRMEM/ERRRUN status transport" {
+    const testing = std.testing;
+    const api = @import("api.zig");
+
+    // api.State owns a HEAP Vm with a main handle (callCFunction swaps
+    // cur_c_stack, which points at the active handle's stack — the exact
+    // production shape every C-ABI call runs in). No separate vm.deinit.
+    var state = api.State.init(.{ .allocator = testing.allocator });
+    defer state.deinit();
+    const vm = state.vm;
+    const th = vm.main_thread.?;
+
+    var setup_roots = vm.gcTempRoots();
+    defer setup_roots.end();
+
+    // The three C-closure callees, hand-built (the keeper pattern — c-fn
+    // closures have no proto/tree) BEFORE gcEnterGenerational so they are
+    // OLD and every gcMinorCollection below leaves them alone.
+    var callees: [3]*Closure = undefined;
+    const c_fns = [3]*const fn (?*lua_State) callconv(.c) c_int{
+        p50r2PushcclosureFn,
+        p50r2PushcfunctionFn,
+        p50r2ErrorFn,
+    };
+    for (c_fns, 0..) |f, i| {
+        try vm.gcPrepareRegister(1);
+        const cl = try vm.alloc.create(Closure);
+        cl.* = .{ .upvalues = &.{}, .c_func = f };
+        vm.gcRegisterCommit(.{ .closure = cl });
+        vm.gcNoteAlloc(@sizeOf(Closure));
+        vm.testc_obj_functions += 1;
+        try setup_roots.add(.{ .Closure = cl });
+        callees[i] = cl;
+    }
+
+    try vm.gcEnterGenerational();
+    try vm.gc_objects.ensureUnusedCapacity(testing.allocator, 16);
+    try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 16);
+
+    // ---- Part 1: ERRMEM — fail_index 2 is pushcclosure's Cell alloc (#2
+    // in the measured map); cThrow carries LUA_ERRMEM=4 through the boundary
+    // (decoded -5), callCFunction's -5 arm propagates error.OutOfMemory. ----
+    {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 2,
+            .resize_fail_index = 2,
+        });
+        const snap = try P50Snapshot.take(vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+
+        const frames0 = th.call_frames.len();
+        vm.alloc = failing.allocator();
+        const result = vm.apiCall(.nonyieldable, .{ .Closure = callees[0] }, &.{});
+        vm.alloc = testing.allocator;
+
+        try testing.expectError(error.OutOfMemory, result);
+        // BLOCKER 3 transport: LUA_ERRMEM=4 reached the error thread's
+        // api_status (PUC lua_pcallk returns LUA_ERRMEM, not ERRRUN).
+        try testing.expectEqual(@as(c_int, 4), vm.errThread().api_status);
+        // The OOM throw carries no error object (PUC seterrorobj would set
+        // the "not enough memory" string; cThrow carries .Nil).
+        try testing.expect(vm.errThread().err_obj == .Nil);
+        try testing.expect(vm.errThread().err_has_obj);
+        // FINDING (documented, not fixed here): the -5 arm does NOT pop the
+        // C-frame — every OOM-failing C call leaks one frame on call_frames
+        // (PUC pops the C CallInfo on every error unwind path). Compensated
+        // here to keep the machine state clean for the parts below.
+        try testing.expectEqual(frames0 + 1, th.call_frames.len());
+        vm.popBuiltinCFrame();
+        try testing.expectEqual(frames0, th.call_frames.len());
+        // The swapped-in C stack (with the pushed 42) was deinit'd and the
+        // saved stack restored by the errdefer; the registries are exact.
+        try snap.assertRestored(vm);
+        try vm.gcMinorCollection();
+        try snap.assertRestored(vm);
+    }
+
+    // ---- Part 1b: the state is fully usable after the ERRMEM failure —
+    // the same call succeeds with the real allocator and delivers the
+    // pushed closure. ----
+    {
+        const snap = try P50Snapshot.take(vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+
+        const frames0 = th.call_frames.len();
+        const result = try vm.apiCall(.nonyieldable, .{ .Closure = callees[0] }, &.{});
+        defer vm.alloc.free(result);
+        try testing.expectEqual(@as(usize, 1), result.len);
+        const cl = result[0].Closure;
+        try testing.expectEqual(@as(usize, 1), cl.upvalues.len);
+        const cell42 = cl.upvalues[0]; // capture before the teardown frees the array
+        try testing.expect(std.meta.eql(cell42.value, .{ .Int = 42 }));
+        try testing.expect(p50IsRegistered(vm, .{ .closure = cl }));
+        try testing.expect(p50IsRegistered(vm, .{ .cell = cell42 }));
+        // The normal path pops the C-frame.
+        try testing.expectEqual(frames0, th.call_frames.len());
+        p50TeardownClosure(vm, cl);
+        p50TeardownCell(vm, cell42);
+        try snap.assertRestored(vm);
+        // FINDING (documented, not fixed here): api_status is never reset
+        // on success — it still carries the 4 from Part 1 (PUC sets
+        // L->status = LUA_OK on every successful return).
+        try testing.expectEqual(@as(c_int, 4), vm.errThread().api_status);
+    }
+
+    // ---- Part 2: ERRRUN — lua_error inside the C function. The boundary
+    // decodes -1 (c_error_status 0 was reset after the -5 read), the RUN arm
+    // pops the C-frame and propagates error.RuntimeError with the thrown
+    // object folded into err_obj. ----
+    {
+        const snap = try P50Snapshot.take(vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+
+        const frames0 = th.call_frames.len();
+        const result = vm.apiCall(.nonyieldable, .{ .Closure = callees[2] }, &.{});
+        try testing.expectError(error.RuntimeError, result);
+        // The C-frame IS popped on this path.
+        try testing.expectEqual(frames0, th.call_frames.len());
+        // The thrown object (the pushed 777) is transported intact.
+        try testing.expect(std.meta.eql(vm.errThread().err_obj, .{ .Int = 777 }));
+        try testing.expect(vm.errThread().err_has_obj);
+        // FINDING (documented, not fixed here): api_status is NOT set to 2
+        // (LUA_ERRRUN) on the lua_error path — it still carries the stale 4
+        // from Part 1 (PUC lua_pcallk returns LUA_ERRRUN=2 for this unwind).
+        try testing.expectEqual(@as(c_int, 4), vm.errThread().api_status);
+        try snap.assertRestored(vm);
+        try vm.gcMinorCollection();
+        try snap.assertRestored(vm);
+    }
+
+    // ---- Part 3: pushcfunction (pushcclosure with n=0) — fail_index 1 is
+    // the Closure alloc (#1 in the measured map: #0 is the c_stack growth,
+    // which succeeded). Same ERRMEM shape as Part 1. ----
+    {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 1,
+            .resize_fail_index = 1,
+        });
+        const snap = try P50Snapshot.take(vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+
+        const frames0 = th.call_frames.len();
+        vm.alloc = failing.allocator();
+        const result = vm.apiCall(.nonyieldable, .{ .Closure = callees[1] }, &.{});
+        vm.alloc = testing.allocator;
+
+        try testing.expectError(error.OutOfMemory, result);
+        try testing.expectEqual(@as(c_int, 4), vm.errThread().api_status);
+        try testing.expect(vm.errThread().err_obj == .Nil);
+        // FINDING (same documented C-frame leak as Part 1).
+        try testing.expectEqual(frames0 + 1, th.call_frames.len());
+        vm.popBuiltinCFrame();
+        try testing.expectEqual(frames0, th.call_frames.len());
+        try snap.assertRestored(vm);
+        try vm.gcMinorCollection();
+        try snap.assertRestored(vm);
+    }
+}
+
+test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
+    const testing = std.testing;
+
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    var setup_roots = vm.gcTempRoots();
+    defer setup_roots.end();
+
+    // ---- Fixtures for (e)/(f), created BEFORE gcEnterGenerational and
+    // BEFORE the testc control exists: OLD, temp-rooted, and their testc
+    // charges (if any) never land in the per-iteration baseline. ----
+    const e_tbl = try vm.allocTableNoGc();
+    try setup_roots.add(.{ .Table = e_tbl });
+    const s_a = try vm.internStr("a");
+    try setup_roots.add(.{ .String = s_a });
+    const s_b = try vm.internStr("b");
+    try setup_roots.add(.{ .String = s_b });
+    const s_sep = try vm.internStr(",");
+    try setup_roots.add(.{ .String = s_sep });
+    try vm.tableSetValue(e_tbl, .{ .Int = 1 }, .{ .String = s_a });
+    try vm.tableSetValue(e_tbl, .{ .Int = 2 }, .{ .String = s_b });
+
+    const f_tbl = try vm.allocTableNoGc();
+    try setup_roots.add(.{ .Table = f_tbl });
+    try vm.tableResize(f_tbl, 4, 4);
+    const s_k = try vm.internStr("k1");
+    try setup_roots.add(.{ .String = s_k });
+    try vm.tableSetValue(f_tbl, .{ .String = s_k }, .{ .Int = 11 });
+    try vm.tableSetValue(f_tbl, .{ .Int = 1 }, .{ .Int = 100 });
+    try vm.tableSetValue(f_tbl, .{ .Int = 2 }, .{ .Int = 200 });
+
+    try vm.gcEnterGenerational();
+    try vm.gc_objects.ensureUnusedCapacity(testing.allocator, 16);
+    try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 16);
+
+    const ctrl = vm.testcEnsureControl();
+    defer ctrl.alloc_count = -1;
+    defer ctrl.mem_limit = null;
+
+    // Every probe iteration resets total_bytes to this baseline so the
+    // per-index deltas are exact and independent (the FailingAllocator
+    // fails from index N ONWARD — a failed request does not consume it).
+    const tb0: usize = 1000;
+
+    // ---- (a) apiNewThread: #0 the Thread struct; the commit
+    // (sizeof(Thread)+64) lands only on success. The post-commit
+    // FrameStack.ensureTotalCapacity(64) is deliberately swallowed
+    // (`catch {}`) — its failure is a SUCCESS with zero heap frames. ----
+    {
+        var fail_idx: usize = 0;
+        var tested_failures: usize = 0;
+        while (fail_idx <= 1) : (fail_idx += 1) {
+            ctrl.total_bytes = tb0;
+            var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+                .fail_index = fail_idx,
+                .resize_fail_index = fail_idx,
+            });
+            const snap = try P50Snapshot.take(&vm, testing.allocator);
+            defer snap.deinit(testing.allocator);
+
+            vm.alloc = failing.allocator();
+            const result = vm.apiNewThread(.Nil);
+            vm.alloc = testing.allocator;
+
+            if (result) |nth| {
+                try testing.expectEqual(tb0 + @sizeOf(Thread), ctrl.total_bytes);
+                try testing.expect(p50IsRegistered(&vm, .{ .thread = nth }));
+                p50TeardownThread(&vm, nth, true);
+                // P16.50-review-2 defect-5 fix applied: the commit is
+                // sizeof(Thread) — symmetric with the free credit; the
+                // lifecycle nets exactly zero now.
+                try testing.expectEqual(tb0, ctrl.total_bytes);
+                try snap.assertRestored(&vm);
+            } else |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                tested_failures += 1;
+                try testing.expectEqual(tb0, ctrl.total_bytes); // no charge
+                try snap.assertRestored(&vm);
+                try vm.gcMinorCollection();
+                try snap.assertRestored(&vm);
+            }
+        }
+        try testing.expect(tested_failures > 0);
+    }
+
+    // ---- (b) builtinCoroutineCreate: the same Thread-commit shape through
+    // the builtin (fail: no thread published, no charge). ----
+    {
+        var fail_idx: usize = 0;
+        var tested_failures: usize = 0;
+        while (fail_idx <= 1) : (fail_idx += 1) {
+            ctrl.total_bytes = tb0;
+            var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+                .fail_index = fail_idx,
+                .resize_fail_index = fail_idx,
+            });
+            const snap = try P50Snapshot.take(&vm, testing.allocator);
+            defer snap.deinit(testing.allocator);
+
+            var args = [_]Value{.{ .Builtin = .coroutine_wrap_iter }};
+            var outs = [_]Value{.Nil};
+            vm.alloc = failing.allocator();
+            const result = vm.builtinCoroutineCreate(args[0..], outs[0..]);
+            vm.alloc = testing.allocator;
+
+            if (result) |_| {
+                try testing.expectEqual(tb0 + @sizeOf(Thread), ctrl.total_bytes);
+                const cth = outs[0].Thread;
+                try testing.expect(p50IsRegistered(&vm, .{ .thread = cth }));
+                p50TeardownThread(&vm, cth, true);
+                // P16.50-review-2 defect-5 fix: symmetric sizeof(Thread).
+                try testing.expectEqual(tb0, ctrl.total_bytes);
+                try snap.assertRestored(&vm);
+            } else |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                tested_failures += 1;
+                try testing.expect(outs[0] == .Nil); // nothing published
+                try testing.expectEqual(tb0, ctrl.total_bytes);
+                try snap.assertRestored(&vm);
+                try vm.gcMinorCollection();
+                try snap.assertRestored(&vm);
+            }
+        }
+        try testing.expect(tested_failures > 0);
+    }
+
+    // ---- (c) createBytecodeChunkClosure (p44BuildProto(3, 8)): the
+    // measured request map is #0 the cells array, #1..#3 the three Cells,
+    // #4 the Closure, #5.. the resolveTreeConstants staging — first success
+    // at 7. ----
+    {
+        var fail_idx: usize = 0;
+        var tested_failures: usize = 0;
+        var first_success_idx: ?usize = null;
+        while (fail_idx <= 8) : (fail_idx += 1) {
+            ctrl.total_bytes = tb0;
+            var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+                .fail_index = fail_idx,
+                .resize_fail_index = fail_idx,
+            });
+            const proto = try p44BuildProto(vm.alloc, &vm, 3, 8);
+            const saved_alloc = vm.alloc;
+            vm.alloc = failing.allocator();
+            defer vm.alloc = saved_alloc;
+            proto.tree.?.retainTree();
+            defer {
+                proto.tree.?.releaseTree(saved_alloc);
+                proto.tree.?.releaseTree(saved_alloc);
+            }
+
+            const gc_len0 = vm.gc_objects.items.len;
+            const count0 = vm.gc_count_kb;
+            const funcs0 = vm.testc_obj_functions;
+
+            if (vm.createBytecodeChunkClosure(proto)) |cl| {
+                first_success_idx = fail_idx;
+                // Success commits exactly sizeof(Closure) + 64 = 104 (the
+                // fixed c-closure upvalue-array allowance, vm.zig:27741).
+                try testing.expectEqual(tb0 + @sizeOf(Closure) + 64, ctrl.total_bytes);
+                // p44's manual teardown mirror:
+                _ = vm.gcUnregisterObjectRollback(.{ .closure = cl });
+                vm.testc_obj_functions -= 1;
+                vm.gcNoteFree(@sizeOf(Closure) + cl.upvalues.len * @sizeOf(*Cell));
+                for (cl.upvalues) |c| {
+                    _ = vm.gcUnregisterObjectRollback(.{ .cell = c });
+                    vm.gcNoteFree(@sizeOf(Cell));
+                    saved_alloc.destroy(c);
+                }
+                if (cl.proto) |p| {
+                    if (p.tree) |t| t.releaseTree(saved_alloc);
+                }
+                const ua = vm.alloc;
+                vm.alloc = saved_alloc;
+                ua.free(cl.upvalues);
+                ua.destroy(cl);
+                // FINDING (documented, not fixed here): the full lifecycle
+                // ends 80 BELOW the baseline — the teardown credits 64 for
+                // the closure plus 120 for the three Cells, but the Cells
+                // were never testc-CHARGED (they are gcNoteAlloc'd only;
+                // there is no testcCommitMemory for Cells anywhere), so
+                // every rolled-back or freed Cell drifts total_bytes down
+                // by 40.
+                try testing.expectEqual(tb0 - 80, ctrl.total_bytes);
+                try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
+                try testing.expectEqual(funcs0, vm.testc_obj_functions);
+                break;
+            } else |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                tested_failures += 1;
+                // Measured per-index deltas (see the FINDINGs inline):
+                //   idx 0 (cells array), 1 (Cell#1): unchanged — nothing
+                //     committed, nothing credited.
+                //   idx 2..4 (Cell#2, Cell#3, Closure): -40*(idx-1) — the
+                //     rolled-back Cells' gcNoteFree credits bytes no commit
+                //     ever charged (FINDING: the uncharged-Cell ledger drift
+                //     above).
+                //   idx 5, 6 (resolveTreeConstants staging, post-commit):
+                //     +104 commit - 64 closure credit - 120 cell credits =
+                //     -80 (FINDING: the post-commit errdefer reverses the
+                //     gcNoteAlloc side but NOT the testcCommitMemory side).
+                const expected: usize = switch (fail_idx) {
+                    0, 1 => tb0,
+                    2, 3, 4 => tb0 - 40 * (fail_idx - 1),
+                    else => tb0 - 80,
+                };
+                try testing.expectEqual(expected, ctrl.total_bytes);
+                // The registry and gc_count_kb restorations are exact (the
+                // p44 guarantees — only the testc ledger drifts).
+                try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
+                try testing.expectEqual(count0, vm.gc_count_kb);
+                try testing.expectEqual(funcs0, vm.testc_obj_functions);
+            }
+        }
+        try testing.expect(tested_failures > 0);
+        try testing.expect(first_success_idx != null);
+        try testing.expectEqual(@as(usize, 7), first_success_idx.?);
+    }
+
+    // ---- (d) closureFromProto (same proto shape): the measured map is #0
+    // the Closure, #1 the cells array, #2..#4 the three Cells — first
+    // success at 5. ----
+    {
+        var fail_idx: usize = 0;
+        var tested_failures: usize = 0;
+        var first_success_idx: ?usize = null;
+        while (fail_idx <= 6) : (fail_idx += 1) {
+            ctrl.total_bytes = tb0;
+            var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+                .fail_index = fail_idx,
+                .resize_fail_index = fail_idx,
+            });
+            const proto = try p44BuildProto(vm.alloc, &vm, 3, 8);
+            const saved_alloc = vm.alloc;
+            vm.alloc = failing.allocator();
+            defer vm.alloc = saved_alloc;
+            proto.tree.?.retainTree();
+            defer {
+                proto.tree.?.releaseTree(saved_alloc);
+                proto.tree.?.releaseTree(saved_alloc);
+            }
+
+            const gc_len0 = vm.gc_objects.items.len;
+            const count0 = vm.gc_count_kb;
+            const funcs0 = vm.testc_obj_functions;
+
+            if (vm.closureFromProto(proto)) |cl| {
+                first_success_idx = fail_idx;
+                // The same fixed sizeof(Closure) + 64 = 104 commit.
+                try testing.expectEqual(tb0 + @sizeOf(Closure) + 64, ctrl.total_bytes);
+                _ = vm.gcUnregisterObjectRollback(.{ .closure = cl });
+                vm.testc_obj_functions -= 1;
+                vm.gcNoteFree(@sizeOf(Closure) + cl.upvalues.len * @sizeOf(*Cell));
+                for (cl.upvalues) |c| {
+                    _ = vm.gcUnregisterObjectRollback(.{ .cell = c });
+                    vm.gcNoteFree(@sizeOf(Cell));
+                    saved_alloc.destroy(c);
+                }
+                if (cl.proto) |p| {
+                    if (p.tree) |t| t.releaseTree(saved_alloc);
+                }
+                const ua = vm.alloc;
+                vm.alloc = saved_alloc;
+                ua.free(cl.upvalues);
+                ua.destroy(cl);
+                // FINDING: the same -80 lifecycle drift as (c).
+                try testing.expectEqual(tb0 - 80, ctrl.total_bytes);
+                try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
+                try testing.expectEqual(funcs0, vm.testc_obj_functions);
+                break;
+            } else |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                tested_failures += 1;
+                // Measured: idx 0..2 unchanged (nothing created yet at the
+                // Closure/cells/Cell#1 failure points), idx 3 -40 (one
+                // Cell rolled back), idx 4 -80 (two) — the same uncharged-
+                // Cell drift as (c).
+                const expected: usize = switch (fail_idx) {
+                    0, 1, 2 => tb0,
+                    3, 4 => tb0 - 40 * (fail_idx - 2),
+                    else => tb0 - 80,
+                };
+                try testing.expectEqual(expected, ctrl.total_bytes);
+                try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
+                try testing.expectEqual(count0, vm.gc_count_kb);
+                try testing.expectEqual(funcs0, vm.testc_obj_functions);
+            }
+        }
+        try testing.expect(tested_failures > 0);
+        try testing.expect(first_success_idx != null);
+        try testing.expectEqual(@as(usize, 5), first_success_idx.?);
+    }
+
+    // ---- (e) table.concat({[1]="a", [2]="b"}, ",", 1, 2): the builder
+    // appends are check'd (not charged); the commit (total_len = 3) lands at
+    // the very end, after the interned result string's own note — so every
+    // failure index leaves total_bytes unchanged. Measured request map:
+    // #0 the out-buffer growth, #1 toOwnedSlice, #2 internStr's LuaString;
+    // first success at 3. ----
+    {
+        // P16.50-review-2 defect-4 fix applied: the scratch buffer is
+        // freed by the builtin — the tracker now proves NOTHING stays
+        // live (the old compensation asserted-and-freed the leak).
+        var tracker: P50TrackAlloc = .{ .base = testing.allocator };
+        defer tracker.deinit();
+
+        var fail_idx: usize = 0;
+        var tested_failures: usize = 0;
+        var first_success_idx: ?usize = null;
+        while (fail_idx <= 3) : (fail_idx += 1) {
+            ctrl.total_bytes = tb0;
+            var failing = std.testing.FailingAllocator.init(tracker.allocator(), .{
+                .fail_index = fail_idx,
+                .resize_fail_index = fail_idx,
+            });
+            const snap = try P50Snapshot.take(&vm, testing.allocator);
+            defer snap.deinit(testing.allocator);
+
+            var outs = [_]Value{.Nil};
+            const args = [_]Value{ .{ .Table = e_tbl }, .{ .String = s_sep }, .{ .Int = 1 }, .{ .Int = 2 } };
+            vm.alloc = failing.allocator();
+            const result = vm.builtinTableConcat(args[0..], outs[0..]);
+            // Teardown runs under the tracker so the frees of tracker-
+            // allocated objects (the result string) update its live set.
+            vm.alloc = tracker.allocator();
+
+            if (result) |_| {
+                first_success_idx = fail_idx;
+                try testing.expectEqualStrings("a,b", outs[0].String.bytes());
+                // P16.50-review-2 defects 4+6 fix applied: the scratch is
+                // committed then freed symmetrically (nets zero — PUC's
+                // transient buffer semantics); the permanent delta is the
+                // interned string's own note only.
+                const note = outs[0].String.allocatedSize() + 24;
+                try testing.expectEqual(tb0 + note, ctrl.total_bytes);
+                p50TeardownString(&vm, outs[0].String);
+                // The remaining +24 is the pre-existing internStr
+                // note-vs-free shape (notes allocatedSize+24, frees
+                // allocatedSize).
+                try testing.expectEqual(tb0 + 24, ctrl.total_bytes);
+            } else |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                tested_failures += 1;
+                try testing.expect(outs[0] == .Nil); // nothing published
+                try testing.expectEqual(tb0, ctrl.total_bytes); // no charge
+            }
+            // P16.50-review-2 defect-4 fix applied: the scratch is freed
+            // by the builtin on every path — nothing stays live.
+            try testing.expectEqual(@as(usize, 0), tracker.live.count());
+            vm.alloc = testing.allocator;
+            try snap.assertRestored(&vm);
+            try vm.gcMinorCollection();
+            try snap.assertRestored(&vm);
+        }
+        try testing.expect(tested_failures > 0);
+        try testing.expect(first_success_idx != null);
+        try testing.expectEqual(@as(usize, 3), first_success_idx.?);
+    }
+
+    // ---- (f) tableResize(tbl, 16, 8) on a 4/4 table: #0 the new hash
+    // (8 Nodes), #1 the new array (16 Values). ----
+    {
+        const old_hash_ptr = f_tbl.hash.ptr;
+        const old_array_ptr = f_tbl.array.ptr;
+        var fail_idx: usize = 0;
+        var tested_failures: usize = 0;
+        var first_success_idx: ?usize = null;
+        while (fail_idx <= 2) : (fail_idx += 1) {
+            ctrl.total_bytes = tb0;
+            var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+                .fail_index = fail_idx,
+                .resize_fail_index = fail_idx,
+            });
+            const snap = try P50Snapshot.take(&vm, testing.allocator);
+            defer snap.deinit(testing.allocator);
+
+            vm.alloc = failing.allocator();
+            const result = vm.tableResize(f_tbl, 16, 8);
+            vm.alloc = testing.allocator;
+
+            if (result) |_| {
+                first_success_idx = fail_idx;
+                // +new hash (8*Node) + new array (16*Value) - old array
+                // (4*Value) - old hash (4*Node) — the exact byte delta.
+                const delta = 8 * @sizeOf(ltable.Node) + 16 * @sizeOf(Value) - 4 * @sizeOf(Value) - 4 * @sizeOf(ltable.Node);
+                try testing.expectEqual(tb0 + delta, ctrl.total_bytes);
+                try testing.expectEqual(@as(usize, 16), f_tbl.asize);
+                try testing.expectEqual(@as(usize, 8), f_tbl.hash.len);
+                try testing.expect(f_tbl.hash.ptr != old_hash_ptr);
+                try testing.expect(f_tbl.array.ptr != old_array_ptr);
+                // Every entry survived the rehash:
+                try testing.expectEqual(@as(i64, 11), (try vm.tableGetRawValue(f_tbl, .{ .String = s_k })).Int);
+                try testing.expectEqual(@as(i64, 100), (try vm.tableGetRawValue(f_tbl, .{ .Int = 1 })).Int);
+                try testing.expectEqual(@as(i64, 200), (try vm.tableGetRawValue(f_tbl, .{ .Int = 2 })).Int);
+                // The table legitimately grew — gc_count_kb tracks the same
+                // +new/−old byte delta as the testc ledger (dyadic-exact in
+                // f64); every registry field is unchanged, so instead of
+                // snap.assertRestored (which pins gc_count_kb) assert the
+                // exact growth plus the untouched registries.
+                try testing.expectEqual(snap.gc_count_kb + @as(f64, @floatFromInt(delta)) / 1024.0, vm.gc_count_kb);
+                try testing.expectEqual(snap.gc_objects.len, vm.gc_objects.items.len);
+                try testing.expectEqual(snap.young.len, vm.gc_young_objects.items.len);
+                try testing.expectEqual(snap.obj_tables, vm.testc_obj_tables);
+                try testing.expectEqual(snap.obj_functions, vm.testc_obj_functions);
+                try testing.expectEqual(snap.obj_strings, vm.testc_obj_strings);
+                try testing.expectEqual(snap.obj_threads, vm.testc_obj_threads);
+                try testing.expectEqual(snap.obj_userdata, vm.testc_obj_userdata);
+                break;
+            } else |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                tested_failures += 1;
+                if (fail_idx == 0) {
+                    // The new-hash alloc failed before any commit.
+                    try testing.expectEqual(tb0, ctrl.total_bytes);
+                } else {
+                    // P16.50-review-2 defect-3 fix applied: the errdefer
+                    // reverses the hash commit exactly ONCE (gcNoteFree
+                    // covers both ledgers) — the ledger returns to the
+                    // baseline.
+                    try testing.expectEqual(tb0, ctrl.total_bytes);
+                }
+                // The table itself is byte-identical (the failure is
+                // invisible to every reader):
+                try testing.expectEqual(@as(usize, 4), f_tbl.asize);
+                try testing.expectEqual(@as(usize, 4), f_tbl.hash.len);
+                try testing.expect(f_tbl.hash.ptr == old_hash_ptr);
+                try testing.expect(f_tbl.array.ptr == old_array_ptr);
+                try testing.expectEqual(@as(i64, 11), (try vm.tableGetRawValue(f_tbl, .{ .String = s_k })).Int);
+                try testing.expectEqual(@as(i64, 100), (try vm.tableGetRawValue(f_tbl, .{ .Int = 1 })).Int);
+                try testing.expectEqual(@as(i64, 200), (try vm.tableGetRawValue(f_tbl, .{ .Int = 2 })).Int);
+                // gc_count_kb is symmetric here (only ONE gcNoteFree ran).
+                try snap.assertRestored(&vm);
+                try vm.gcMinorCollection();
+                try snap.assertRestored(&vm);
+            }
+        }
+        try testing.expect(tested_failures > 0);
+        try testing.expect(first_success_idx != null);
+        try testing.expectEqual(@as(usize, 2), first_success_idx.?);
+    }
+
+    // Fixture teardown (after every total_bytes assertion — the per-iteration
+    // resets make cross-site ledger arithmetic meaningless, only the
+    // zero-leak freeing matters here).
+    p50TeardownTable(&vm, f_tbl, true);
+    p50TeardownTable(&vm, e_tbl, true);
+    p50TeardownString(&vm, s_k);
+    p50TeardownString(&vm, s_sep);
+    p50TeardownString(&vm, s_b);
+    p50TeardownString(&vm, s_a);
 }

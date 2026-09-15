@@ -1,15 +1,15 @@
 {
- "created_utc": "2026-09-15T16:26:29.863675+00:00",
+ "created_utc": "2026-09-15T20:23:05.277783+00:00",
  "provenance": {
-  "git_head": "bab3341a5dfc67bce480f6144035dfd76398dbb5",
-  "measured_source_head": "bab3341a5dfc67bce480f6144035dfd76398dbb5",
+  "git_head": "200cae7d8ab72e8b83c7a48f04534b602e252cae",
+  "measured_source_head": "200cae7d8ab72e8b83c7a48f04534b602e252cae",
   "source_dirty": "clean",
-  "zig_binary_sha256": "259e43d5b7d0e430e5ca3c3db81560dcc7c6bf611c15108a988f1c5eb3807c1e",
-  "note": "P16.50 regeneration from clean measured-source commit bab3341 (transactional GC registration); wrapper D follows."
+  "zig_binary_sha256": "97ee5179e631110ec84c1f832dcdd300b596ff9bdfcadf7d479c0d414ad8c193",
+  "note": "P16.50-review-C2 regeneration from clean measured-source commit 200cae7."
  },
- "text_bytes": 2599609,
+ "text_bytes": 2600441,
  "symbols": {
-  "runBytecodeDispatch": 70924,
+  "runBytecodeDispatch": 71241,
   "callBuiltin": 8537,
   "pushBuiltinCFrame": 742,
   "popBuiltinCFrame": 305,

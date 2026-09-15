@@ -1,4 +1,4 @@
-> Last updated: 2026-09-15 (P16.50)
+> Last updated: 2026-09-15 (P16.50-review)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -36,14 +36,14 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **84/84** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.39x** |
+| Performance (geomean vs PUC) | **1.41x** |
 
-Geomean замедления vs PUC Lua: **1.39x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [ ] **P16.50-review correction (owner-instructed)**: rollback ownership + C-closure upvalue semantics — (a) BLOCKER 1: opClosure count-prefix rollback неверен при смешанных дескрипторах (proxy/new instack/уже-boxed) — exact ownership worklist/bitmap, rollback только созданных этим вызовом Cells в reverse-порядке; закрыть post-commit окно (gcStoreCellValue после commit) — либо provably-infallible через preparation/order, либо полный rollback owner для Closure/tree/register/accounting/register-slot; dispatch-driven mixed-upvalue тест ([proxy, new instack] из реального bytecode; existing-boxed; провал на следующем Cell и на Closure alloc; post-commit barrier failure; byte-exact всё + minor collection + repeated + success); negative copy count-prefix rollback детерминированно ловится; (b) BLOCKER 2: lua_newthread errdefer НЕ работает (?*lua_State ≠ error union) — inner error-union transaction / явный cleanup helper, ABI-wrapper маппит в null ПОСЛЕ cleanup; preserve/restore прежний vm.c_api_thread; тест против реального экспортированного lua_newthread (fail на registry prepare / Thread alloc / handle alloc / parent stack growth; registries/stack/handle/counters/live-set + GC после); (c) BLOCKER 3: registerfuncs алиасит C-closure upvalues (общие Cell-объекты: setupvalue(f1) виден f2) — PUC luaL_setfuncs (lauxlib.c:965-978) копирует VALUES на стек + lua_pushcclosure (lapi.c:609+) свежий CClosure с inline slots; один канонический C-closure конструктор для pushcclosure+registerfuncs с per-closure Cells; убрать неверный LClosure rationale; differential-тест (upvalueid differs; setupvalue A не меняет B; сбор в обоих порядках без leaks; OOM на non-preinterned names + table-growth setfield); (d) error propagation: lua_pushcclosure/lua_pushcfunction/luaL_setfuncs/luaL_newlib catch {} — обследовать защищённый механизм (protected call/throw) и маршрутизировать ЛИБО зафиксировать архитектурный blocker (owner решает); (e) HIGH: testcChargeMemory коммитит total_bytes ДО нативных аллокаций — split check/reserve от accounting commit / точный rollback; тест с активным testc_ctrl + провалы registry reserve/Userdata/uservalues/payload; аудит всех testcChargeMemory-сайтов; (f) cleanup: устаревшие BLOCKED/KNOWN-leak комментарии в тестах, skip fail-индексов 2..4 в pushcclosure matrix, smoke provenance prose (84 файла, 85-й номер — один из 84).
+- [x] **P16.50-review correction (owner-instructed)**: rollback ownership + C-closure upvalue semantics — (a) BLOCKER 1: opClosure count-prefix rollback неверен при смешанных дескрипторах (proxy/new instack/уже-boxed) — exact ownership worklist/bitmap, rollback только созданных этим вызовом Cells в reverse-порядке; закрыть post-commit окно (gcStoreCellValue после commit) — либо provably-infallible через preparation/order, либо полный rollback owner для Closure/tree/register/accounting/register-slot; dispatch-driven mixed-upvalue тест ([proxy, new instack] из реального bytecode; existing-boxed; провал на следующем Cell и на Closure alloc; post-commit barrier failure; byte-exact всё + minor collection + repeated + success); negative copy count-prefix rollback детерминированно ловится; (b) BLOCKER 2: lua_newthread errdefer НЕ работает (?*lua_State ≠ error union) — inner error-union transaction / явный cleanup helper, ABI-wrapper маппит в null ПОСЛЕ cleanup; preserve/restore прежний vm.c_api_thread; тест против реального экспортированного lua_newthread (fail на registry prepare / Thread alloc / handle alloc / parent stack growth; registries/stack/handle/counters/live-set + GC после); (c) BLOCKER 3: registerfuncs алиасит C-closure upvalues (общие Cell-объекты: setupvalue(f1) виден f2) — PUC luaL_setfuncs (lauxlib.c:965-978) копирует VALUES на стек + lua_pushcclosure (lapi.c:609+) свежий CClosure с inline slots; один канонический C-closure конструктор для pushcclosure+registerfuncs с per-closure Cells; убрать неверный LClosure rationale; differential-тест (upvalueid differs; setupvalue A не меняет B; сбор в обоих порядках без leaks; OOM на non-preinterned names + table-growth setfield); (d) error propagation: lua_pushcclosure/lua_pushcfunction/luaL_setfuncs/luaL_newlib catch {} — обследовать защищённый механизм (protected call/throw) и маршрутизировать ЛИБО зафиксировать архитектурный blocker (owner решает); (e) HIGH: testcChargeMemory коммитит total_bytes ДО нативных аллокаций — split check/reserve от accounting commit / точный rollback; тест с активным testc_ctrl + провалы registry reserve/Userdata/uservalues/payload; аудит всех testcChargeMemory-сайтов; (f) cleanup: устаревшие BLOCKED/KNOWN-leak комментарии в тестах, skip fail-индексов 2..4 в pushcclosure matrix, smoke provenance prose (84 файла, 85-й номер — один из 84).
 
 
 - [x] **P16.50 (owner-instructed)**: транзакционная регистрация GC-объектов + единый current-* provenance — (a) полный inventory всех allocate→init→publish→register→account→expose цепочек с fallible edges; единый ownership-контракт: fallible capacity preparation отделена от infallible registry commit (PUC luaC_newobj — infallible link в intrusive allgc), bulk reserve для multi-object constructors; opClosure полный errdefer (cells, open Cells, Closure, tree retain, восстановление bytecode_boxed); allocTable/allocTableNoGc/allocUserdata/thread constructors/internStr (insert ДО register — рассинхрон canonical table и GC registry)/registerfuncs catch{}-проглатывание — все gcRegister* callers; инварианты: никакой публикации до гарантированной регистрации/rollback, никакого destroy пока в registry, accounting симметрично ровно на commit, никаких catch{}→продолжения (обновить все сигнатуры call sites, исходная ошибка сохраняется), young-list порядок сохраняется, hot opClosure без заметного steady-state regression; (b) FailingAllocator/DebugAllocator матрицы для каждой constructor family и каждого fail index вкл. оба registry-growth edges: byte-exact восстановление gc_objects/young/string_intern/bytecode_boxed/stack/table state, counters/debt/tree refs, реальный gcMinorCollection после каждого failure, repeated failures + success edge; throwaway negative validation для каждого исправленного класса; (c) Task 0: после ВСЕХ source-изменений пересобрать RF и перегенерировать КАЖДЫЙ canonical current-* на одном чистом final measured-source + immutable binary (сейчас набор расщеплён: gate/baseline на 66cd438, остальные на 7af60be); (d) perf A/B immutable binaries, closure-heavy/dynamic-load/allocation-heavy workloads, ровно одна объявленная финальная сессия; baseline — только явное owner-approved.
@@ -7274,6 +7274,59 @@ Correction-фаза по owner-ledger item (открыт 76328a2; open-count 21�
   noise + 7 негативных rc=0; smoke 84/84 plain + 84/84 реальным --testc;
   matrix zig_fail=0/both_fail=1 (big.lua); c_api + DIFF: PASS; api580
   GREEN; gc.lua outputs match; crash-loop 20/20; diff --check 0.
+
+### P16.50-review correction: rollback ownership + C-closure semantics (2026-09-15)
+
+Correction-фаза по owner-ledger item (открыт b61728f; open-count 21→22→
+закрыт→21). Коммиты: C = ab83016 → C2 = 200cae7 (fix, найден финальной
+батареей) → D = wrapper.
+
+- **BLOCKER 1 — opClosure exact ownership worklist**: count-prefix
+  rollback заменён worklist'ом только созданных этим вызовом Cells
+  (reverse-порядок; borrowed proxy/boxed Cells не тронуты — реальный
+  mixed-shape [proxy, instack] из 'local x / local y / x+y'). Post-commit
+  окно закрыто (closure_committed: полный rollback включая destroy
+  Closure struct — leak найден T1-тестом). C2: fixed-size [16] заменён
+  inline16 + heap-fallback (реальные прото до 255 upvalue'ов — calls.lua
+  '__call'-chain создал >16 → OOB write → SIGSEGV; пойман финальной
+  батареей субагента, gdb-backtrace opClosure vm.zig:18146).
+- **BLOCKER 2 — lua_newthread**: errdefer в ?*-функции никогда не
+  выполнялся; теперь inner error-union transaction luaNewThreadTx,
+  ABI-wrapper маппит в null строго после cleanup; c_api_thread
+  сохраняется/восстанавливается.
+- **BLOCKER 3 — registerfuncs CClosure-семантика**: PUC luaL_setfuncs
+  (lauxlib.c:965-978) копирует VALUES; lua_pushcclosure (lapi.c:609+)
+  свежий CClosure с OWN slots; общий shared-cell фазa удалён;
+  канонический makeCclosure (per-closure Cells) для pushcclosure И
+  registerfuncs; дифференциальный тест: upvalueid различны,
+  setupvalue(f1) невидим в f2, сбор без утечек; неверный LClosure
+  rationale исправлен.
+- **Error propagation**: cThrow — PUC luaM_error→luaD_throw эквивалент
+  (c_error_value + _longjmp на ближайший c_error_jmp; no-boundary →
+  panic; c_panicf-невводка задокументирована как residual);
+  lua_pushcclosure/lua_pushcfunction/luaL_setfuncs/luaL_newlib больше не
+  проглатывают.
+- **HIGH — testcCheckMemory/testcCommitMemory split** (PUC ltests.c:
+  check ДО аллокации, подсчёт ПОСЛЕ успеха): allocUserdata + table
+  rehash + thread/Closure конструкторы + table.concat.
+- **FINDING 4**: lua_setupvalue C-closure path — пропущенный
+  generational барьер добавлен (PUC luaC_barrier).
+- **Negative validation** (worktree-ревёрсы): count-prefix → T1 ловит
+  (integer overflow); lua_newthread no-cleanup → T2 ловит; registerfuncs
+  shared-cells aliasing → T3 ловит (double-free).
+- **Тесты T1-T4** (dispatch-driven production opClosure; реальный
+  экспортированный lua_newthread; C-ABI differential; testc split) —
+  233/233 D/RF, 0 leaks.
+- **Cleanup**: устаревшие BLOCKED/KNOWN-leak комментарии переписаны;
+  skip 2..4 удалён; smoke provenance = 84 файла.
+- **Perf**: объявленные сессии — #1 на binary 92d115c3 (после C) OK, #2
+  на 97ee5179 (после C2) OK; A/B closures −0.36..−2.99% (улучшения);
+  baseline 66cd438 не тронут. Единый provenance: все canonical на
+  200cae7/97ee5179 (C2); .text 2600441.
+- **Батарея**: 13/13 зелёные (fmt, unit D/RF 233/233, selftests 87,
+  noise + 7 neg, smoke 84/84 plain + 84/84 --testc, matrix zig_fail=0/
+  both_fail=1, c_api + DIFF: PASS, api580 GREEN, gc.lua, diff --check);
+  crash-loop 20/20.
 
 ## История закрытых фаз
 

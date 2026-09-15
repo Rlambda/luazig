@@ -702,5 +702,181 @@
         "mono": 880383312
       }
     }
+  },
+  {
+    "created_utc": "2026-09-15T19:43:57.460488+00:00",
+    "source_head": "ab83016",
+    "zig_binary_sha256": "92d115c35b4a6b7eac171becacf6fefabbee6a0a0cddae282cb05ffdda02d7d6",
+    "seed_list": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21
+    ],
+    "runs": 21,
+    "result": "OK",
+    "artifact_sha256": "eef97f1f489112023cbc8d9f3bc06a607b3a983f8158307a3ec39923a6b2fdd8",
+    "mode_centers": {
+      "int_arith": {
+        "mono": 5124100780
+      },
+      "global_arith": {
+        "low": 12796378971.0,
+        "high": 14210477822
+      },
+      "branch_loop": {
+        "mono": 11052681529
+      },
+      "lua_calls": {
+        "mono": 2262864738
+      },
+      "array_access": {
+        "mono": 1251782252
+      },
+      "hash_access": {
+        "mono": 1589235673
+      },
+      "temp_table_alloc": {
+        "mono": 530191221
+      },
+      "string_loop": {
+        "mono": 1505903270
+      },
+      "coroutine_yield": {
+        "mono": 1026041353
+      },
+      "dynamic_load": {
+        "mono": 2302165087
+      },
+      "mixed_arith": {
+        "mono": 5680129446
+      },
+      "float_arith": {
+        "mono": 5326697885
+      },
+      "string_concat": {
+        "mono": 1041435327
+      },
+      "metamethod_add": {
+        "mono": 1316813943
+      },
+      "field_access": {
+        "mono": 1647021030
+      },
+      "comparisons": {
+        "mono": 12341608157
+      },
+      "metamethod_call_noalloc": {
+        "mono": 308351185
+      },
+      "table_alloc_setmetatable": {
+        "mono": 881332561
+      }
+    }
+  },
+  {
+    "created_utc": "2026-09-15T20:10:56.154683+00:00",
+    "source_head": "200cae7",
+    "zig_binary_sha256": "97ee5179e631110ec84c1f832dcdd300b596ff9bdfcadf7d479c0d414ad8c193",
+    "seed_list": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21
+    ],
+    "runs": 21,
+    "result": "OK",
+    "artifact_sha256": "441c4851379dce90a83db03c6385d7106f4853c46f70020ec71a6ad3d430b1f7",
+    "mode_centers": {
+      "int_arith": {
+        "mono": 5123839604
+      },
+      "global_arith": {
+        "low": 12797808131.5,
+        "high": 14203439042
+      },
+      "branch_loop": {
+        "mono": 11052718403
+      },
+      "lua_calls": {
+        "mono": 2263705339
+      },
+      "array_access": {
+        "mono": 1240520735
+      },
+      "hash_access": {
+        "mono": 1579521920
+      },
+      "temp_table_alloc": {
+        "mono": 530485181
+      },
+      "string_loop": {
+        "mono": 1504573907
+      },
+      "coroutine_yield": {
+        "mono": 1022286252
+      },
+      "dynamic_load": {
+        "mono": 2302911630
+      },
+      "mixed_arith": {
+        "mono": 5680186381
+      },
+      "float_arith": {
+        "mono": 5326201260
+      },
+      "string_concat": {
+        "mono": 1041394328
+      },
+      "metamethod_add": {
+        "mono": 1318414818
+      },
+      "field_access": {
+        "mono": 1648326860
+      },
+      "comparisons": {
+        "mono": 12341651694
+      },
+      "metamethod_call_noalloc": {
+        "mono": 308105519
+      },
+      "table_alloc_setmetatable": {
+        "mono": 879255126
+      }
+    }
   }
 ]

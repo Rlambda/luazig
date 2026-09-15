@@ -4450,6 +4450,13 @@ pub const Vm = struct {
     /// this into `err_obj` so the rest of the VM's error machinery (pcall,
     /// tracebacks, coroutine resume) sees a uniform error object.
     c_error_value: ?Value = null,
+    /// P16.50-review-2 BLOCKER 3: the STATUS transported with a protected
+    /// throw (LUA_ERRRUN=2 / LUA_ERRMEM=4) — PUC `luaD_throw(L, status)`
+    /// carries the status alongside the error object (ldo.c:125-146);
+    /// our `_longjmp(jb, 1)` channel carried only the object, so an OOM
+    /// from the unswallowed push/setfuncs wrappers surfaced to lua_pcall
+    /// as LUA_ERRRUN. The boundary folds this into the landing-pad result.
+    c_error_status: c_int = 0,
 
     /// PUC `L->warnf` (lstate.c): warning handler installed by `lua_setwarnf`.
     /// When non-null, `lua_warning` forwards the message to this callback.
@@ -5802,6 +5809,10 @@ pub const Vm = struct {
     }
 
     pub fn apiNewThread(self: *Vm, callee: Value) Error!*Thread {
+        // P16.50-review-2 BLOCKER 4: check-only was missing the COMMIT —
+        // the thread's eventual gcNoteFree subtracted bytes that were
+        // never charged (testc undercount). Commit exactly once the
+        // construction succeeds, same size as the free.
         try exposeDispatchResult(void, self.testcCheckMemory(@sizeOf(Thread) + 64));
         // P16.50 transactional: prepare-first, infallible commit.
         try self.gcPrepareRegister(1);
@@ -5809,6 +5820,7 @@ pub const Vm = struct {
         th.* = .{ .status = .suspended, .callee = callee };
         self.gcRegisterCommit(.{ .thread = th });
         self.gcNoteAlloc(@sizeOf(Thread));
+        self.testcCommitMemory(@sizeOf(Thread) + 64);
         self.testc_obj_threads += 1;
         // P15.40a: Pre-allocate frame capacity for the new coroutine. This
         // avoids the capacity-check branch on the first 64 bytecode calls.
@@ -7667,6 +7679,23 @@ pub const Vm = struct {
             tbl.hash_lastfree = saved_lastfree;
         }
 
+        // P16.50-review-2 BLOCKER 4: the new_hash temporary is OWNED until
+        // installation. A failure at the new-array allocation previously
+        // leaked the new hash block AND kept its testc/GC charge with the
+        // table byte-identical — the charge never balanced. The errdefer
+        // frees the block and reverses both charges; ownership transfers
+        // to the table exactly at the step-5 swap (flag disarm).
+        var hash_installed = false;
+        errdefer if (!hash_installed and new_hash.len > 0) {
+            self.alloc.free(new_hash);
+            // Reverse the hash charges exactly once (saturating).
+            self.gcNoteFree(new_hash.len * @sizeOf(ltable.Node));
+            if (self.testc_active) {
+                if (self.testc_ctrl) |ctrl| {
+                    ctrl.total_bytes -|= new_hash.len * @sizeOf(ltable.Node);
+                }
+            }
+        };
         // 3. Allocate new array, copy common elements, nil-fill new slots.
         //    PUC `resizearray` + `clearNewSlice`. When the array size doesn't
         //    change, PUC reuses the existing array (no allocation). This is
@@ -7714,6 +7743,7 @@ pub const Vm = struct {
         const old_hash = tbl.hash;
         tbl.hash = new_hash;
         tbl.hash_lastfree = new_hash_lastfree;
+        hash_installed = true; // ownership transferred to the table
         for (old_hash) |*n| {
             if (n.key_tt == .empty or n.key_tt == .dead) continue;
             if (n.value == .Nil) continue; // skip deleted entries
@@ -18041,6 +18071,23 @@ pub const Vm = struct {
         // registration. In steady state both capacity checks are amortized
         // no-ops; the commit path adds no work.
         try self.gcPrepareRegister(nups + 1);
+        // P16.50-review-2 BLOCKER 1: ownership order fixed. The old order
+        // allocated `cells` FIRST and the heap fallback SECOND, with the
+        // cells-freeing errdefer declared after both — a fallback-allocation
+        // failure returned OOM while leaking `cells`. Every allocation is
+        // now owned immediately: the heap fallback (when nups > 16, PUC
+        // MAXUPVAL=255) is allocated FIRST under its own defer, then
+        // `cells` gets its owner errdefer before anything else can fail.
+        // (The comment claiming the fallback "only changes storage" was
+        // incomplete — its allocation is itself a failure point.)
+        var created_buf: [16]*Cell = undefined;
+        var created_heap: ?[]*Cell = null;
+        defer if (created_heap) |h| self.alloc.free(h);
+        const created: []*Cell = if (nups > created_buf.len) blk: {
+            const h = try self.alloc.alloc(*Cell, nups);
+            created_heap = h;
+            break :blk h;
+        } else created_buf[0..nups];
         const cells = try self.alloc.alloc(*Cell, nups);
         // P16.50-review BLOCKER 1: EXACT ownership worklist. The old
         // count-prefix rollback (cells[0..created_cells]) was wrong for
@@ -18054,18 +18101,6 @@ pub const Vm = struct {
         // rollback walks it in reverse. (An instack descriptor whose
         // boxed slot is already populated shares the existing Cell —
         // also not ours.)
-        // Upvalue counts can exceed 16 (PUC maxupvals is 255): the inline
-        // worklist covers the common case; deeper closures fall back to a
-        // heap array freed on every exit path. (The T1 matrix covers the
-        // inline path; the fallback only changes storage, not semantics.)
-        var created_buf: [16]*Cell = undefined;
-        var created_heap: ?[]*Cell = null;
-        defer if (created_heap) |h| self.alloc.free(h);
-        const created: []*Cell = if (nups > created_buf.len) blk: {
-            const h = self.alloc.alloc(*Cell, nups) catch return error.OutOfMemory;
-            created_heap = h;
-            break :blk h;
-        } else created_buf[0..nups];
         var created_n: usize = 0;
         // P16.50-review BLOCKER 1 post-commit window: after the Closure
         // commits, gcStoreCellValue (the recursive-closure barrier) can
@@ -22355,6 +22390,8 @@ pub const Vm = struct {
         th.* = .{ .status = .suspended, .callee = callee };
         self.gcRegisterCommit(.{ .thread = th });
         self.gcNoteAlloc(@sizeOf(Thread));
+        // P16.50-review-2 BLOCKER 4: the matching commit (was check-only).
+        self.testcCommitMemory(@sizeOf(Thread) + 64);
         self.testc_obj_threads += 1;
         outs[0] = .{ .Thread = th };
     }
@@ -27700,6 +27737,8 @@ pub const Vm = struct {
         // skewed gc_count_kb collapsed collectgarbage("count") to 0 and
         // broke gen-GC pacing (gc.lua pace2 hang, P16.42 T3).
         self.gcNoteAlloc(@sizeOf(Closure) + proto.upvalues.len * @sizeOf(*Cell));
+        // P16.50-review-2 BLOCKER 4: the matching testc commit (was check-only).
+        self.testcCommitMemory(@sizeOf(Closure) + 64);
         // P16.10b Task 7+15 (adoption): resolve the tree's constants HERE,
         // at the closure-creation boundary, so every executable Proto is
         // runtime-ready BEFORE any frame push (PUC invariant: bytecode
@@ -28195,6 +28234,9 @@ pub const Vm = struct {
         // luaF_newLclosure; must match gcFreeObject's credit — see the
         // text-path fix in createBytecodeChunkClosure, P16.42 T3).
         self.gcNoteAlloc(@sizeOf(Closure) + nups * @sizeOf(*Cell));
+        // P16.50-review-2 BLOCKER 4: the matching testc commit (was
+        // check-only — the eventual free undercounted live memory).
+        self.testcCommitMemory(@sizeOf(Closure) + 64);
         // Charge the tree's native footprint at adoption (Task 7). For
         // undumped trees, constants were pre-resolved by
         // preResolveUndumpedConstants before this call, so resolved_values
@@ -37768,7 +37810,12 @@ pub const Vm = struct {
             if (k == end_idx) break;
             k += 1;
         }
-        outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
+        const final_str = try self.internStr(try out.toOwnedSlice(self.alloc));
+        // P16.50-review-2 BLOCKER 4: commit AFTER the last native
+        // allocation (toOwnedSlice + internStr) succeeded; was check-only.
+        // toOwnedSlice moved the buffer, so out.deinit is now a no-op.
+        self.testcCommitMemory(total_len);
+        outs[0] = .{ .String = final_str };
     }
 
     fn builtinTablePack(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -40050,12 +40097,16 @@ pub const Vm = struct {
             // error (-1) and normal return (>= 0).
             return -2;
         }
-        // `lua_error` `_longjmp`'d back: `_setjmp` "returned" nonzero (1), we
-        // take the else branch, and `return -1` runs like any normal return —
-        // so the `defer` above restores `c_error_jmp` correctly. No Zig frame
-        // above this one was unwound (the longjmp landed HERE), so every frame
-        // with its own defers (`callCFunction`, its callers) resumes intact.
-        return -1;
+        // `lua_error`/`cThrow` `_longjmp`'d back. P16.50-review-2 BLOCKER 3:
+        // the thrower recorded the PUC status in `c_error_status`
+        // (LUA_ERRRUN=2 default; LUA_ERRMEM=4 for OOM). Return it as a
+        // negative value (-2 would collide with yield, so: -1 - status,
+        // i.e. -3 = LUA_ERRRUN, -5 = LUA_ERRMEM); `callCFunction` decodes.
+        {
+            const st = self.c_error_status;
+            self.c_error_status = 0;
+            return -1 - st;
+        }
     }
 
     fn callCFunction(
@@ -40139,6 +40190,24 @@ pub const Vm = struct {
             //   1. `lua_error()` (C API) → `c_error_value` is set
             //   2. Lua `error()` → `self.errThread().err_obj`/`self.errThread().err_has_obj` are
             //      set by `fail()`, `c_error_value` is null
+            // P16.50-review-2 BLOCKER 3: an OOM throw carries
+            // LUA_ERRMEM=4 in the encoded return (-5). Propagate the OOM
+            // AS OOM — do not fold it into a RuntimeError (PUC
+            // luaD_throw(L, LUA_ERRMEM) reaches lua_pcallk as ERRMEM;
+            // masking it as ERRRUN loses the status).
+            if (nret_signed == -5) {
+                if (stack_parked) {
+                    // (unreachable today: no parked stack on this path, kept
+                    // symmetric with the yield arm for future-proofing)
+                }
+                if (self.c_error_value) |errval| {
+                    self.c_error_value = null;
+                    self.errThread().err_obj = errval;
+                    self.errThread().err_has_obj = true;
+                }
+                self.errThread().api_status = 4; // LUA_ERRMEM
+                return error.OutOfMemory;
+            }
             // Only overwrite err_obj if c_error_value is set (lua_error
             // path); otherwise keep the existing err_obj from fail().
             if (self.c_error_value) |errval| {
@@ -49523,10 +49592,21 @@ test "P16.50-review T1: opClosure mixed-upvalue OOM matrix (production dispatch)
     // above).
 }
 
+/// Test seam for T2: the inner transaction carries the same cleanup the
+/// ABI wrapper performs; the wrapper adds only the (non-local) throw.
+fn luaNewThreadTxWrap(parent: anytype) ?*@typeInfo(@TypeOf(parent)).pointer.child {
+    const c_api = @import("c_api.zig");
+    const vmp = parent.vm;
+    const saved = vmp.c_api_thread;
+    return c_api.luaNewThreadTx(parent, vmp) catch {
+        vmp.c_api_thread = saved;
+        return null;
+    };
+}
+
 test "P16.50-review T2: lua_newthread C-ABI OOM transaction" {
     const testing = std.testing;
     const api = @import("api.zig");
-    const c_api = @import("c_api.zig");
 
     // api.State owns a HEAP Vm (State.deinit runs vm.deinit, frees the main
     // handle, destroys the Vm) — the exact production shape the C-ABI
@@ -49571,7 +49651,11 @@ test "P16.50-review T2: lua_newthread C-ABI OOM transaction" {
         defer snap.deinit(testing.allocator);
 
         vm.alloc = failing.allocator();
-        const handle_opt = c_api.lua_newthread(parent);
+        // P16.50-review-2 B2: the ABI wrapper now THROWS LUA_ERRMEM after
+        // cleanup (PUC lua_newthread has no null-failure) — the inner
+        // transaction is the testable seam: it performs the identical
+        // cleanup and returns the error instead of jumping.
+        const handle_opt = luaNewThreadTxWrap(parent);
         vm.alloc = testing.allocator;
 
         if (handle_opt) |handle| {
@@ -49646,7 +49730,11 @@ test "P16.50-review T2: lua_newthread C-ABI OOM transaction" {
         defer snap.deinit(testing.allocator);
 
         vm.alloc = failing.allocator();
-        const handle_opt = c_api.lua_newthread(parent);
+        // P16.50-review-2 B2: the ABI wrapper now THROWS LUA_ERRMEM after
+        // cleanup (PUC lua_newthread has no null-failure) — the inner
+        // transaction is the testable seam: it performs the identical
+        // cleanup and returns the error instead of jumping.
+        const handle_opt = luaNewThreadTxWrap(parent);
         vm.alloc = testing.allocator;
 
         try testing.expect(handle_opt == null);

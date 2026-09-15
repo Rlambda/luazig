@@ -182,28 +182,27 @@ pub export fn lua_newstate(
 /// `Thread.api_handle`. Each handle has its own `c_stack`, and
 /// `Vm.cur_c_stack` points to the active handle's stack.
 pub export fn lua_newthread(L: ?*lua_State) ?*lua_State {
+    // P16.50-review-2 BLOCKER 2: PUC lua_newthread (lua.h:165,
+    // lstate.c:273-291) has NO nullable failure result — an allocation
+    // failure throws LUA_ERRMEM through the protected boundary
+    // (luaC_newobjdt / stack growth → luaM_error → luaD_throw). The
+    // earlier null-sentinel silently converted OOM into apparent API
+    // failure-by-sentinel. The inner transaction still completes ALL
+    // cleanup first; its OOM then travels through the canonical
+    // protected transport (cThrow, LUA_ERRMEM) — never a NULL return.
     const parent = L orelse return null;
     const vm = parent.vm;
-    // P16.50-review BLOCKER 2: the previous version used `errdefer` in a
-    // function returning ?*lua_State — errdefer only runs on ERROR
-    // returns, and every failure arm was an ordinary `return null`, so
-    // the cleanup NEVER executed (committed Thread leaked registered and
-    // accounted; the append-failure arm freed the handle but not the
-    // Thread). The transaction now lives in an inner error-union
-    // function; the ABI wrapper maps failure to null strictly AFTER the
-    // cleanup ran. The previous `vm.c_api_thread` value is preserved and
-    // restored on failure (it is caller-owned state, not ours to null).
     const saved_c_api_thread = vm.c_api_thread;
-    const result = luaNewThreadTx(parent, vm) catch {
+    const result = luaNewThreadTx(parent, vm) catch |err| {
         vm.c_api_thread = saved_c_api_thread;
-        return null;
+        cThrow(vm, err);
     };
     return result;
 }
 
 /// Inner transaction for lua_newthread (P16.50-review): every failure
 /// returns an ERROR so the errdefer actually fires.
-fn luaNewThreadTx(parent: *vm_mod.lua_State, vmp: *Vm) error{OutOfMemory}!*vm_mod.lua_State {
+pub fn luaNewThreadTx(parent: *vm_mod.lua_State, vmp: *Vm) error{OutOfMemory}!*vm_mod.lua_State {
     // Prepare-first: after this, registration cannot fail.
     try vmp.gcPrepareRegister(1);
     const th = try vmp.alloc.create(vm_mod.Thread);
@@ -1414,25 +1413,42 @@ pub export fn lua_pushlightuserdata(L: ?*lua_State, p: ?*anyopaque) void {
 /// `atpanic` hook then aborts. Matches the existing lua_callkImpl OOM
 /// arm (which sets c_error_value = .Nil and _longjmps).
 fn cThrow(vm: *Vm, err: api.ApiError) noreturn {
+    // P16.50-review-2 BLOCKER 3: the ONE canonical protected-throw
+    // transport — carries the error object AND the PUC status
+    // (LUA_ERRMEM=4 / LUA_ERRRUN=2) through c_error_value +
+    // c_error_status, then _longjmps to the nearest boundary
+    // (callCFunctionWithBoundary decodes -1-status). With no boundary,
+    // PUC luaD_throw (ldo.c:125-146) calls g->panic(L) and aborts —
+    // we invoke the stored c_panicf exactly once, then panic.
     switch (err) {
         error.OutOfMemory => {
             if (vm.c_error_jmp) |jb| {
                 vm.c_error_value = .Nil;
+                vm.c_error_status = 4; // LUA_ERRMEM
                 _longjmp(jb, 1);
             }
-            // No protected boundary: PUC would run g->panic(L) and abort.
-            // c_panicf is currently stored but never wired (see
-            // lua_atpanic); documented residual.
-            @panic("lua OOM without an active C-function boundary");
+            cPanic(vm);
         },
         else => {
             if (vm.c_error_jmp) |jb| {
                 vm.c_error_value = vm.errThread().err_obj;
+                vm.c_error_status = 2; // LUA_ERRRUN
                 _longjmp(jb, 1);
             }
-            @panic("lua error without an active C-function boundary");
+            cPanic(vm);
         },
     }
+}
+
+/// PUC `g->panic(L)` + abort (ldo.c:141-146): the unprotected-throw
+/// fallback. The hook runs EXACTLY once; a return falls through to the
+/// terminal panic (PUC aborts — a Zig @panic carries the same
+/// no-return contract with a diagnostic).
+fn cPanic(vm: *Vm) noreturn {
+    if (vm.c_panicf) |pf| {
+        _ = pf(vm.cur_handle orelse @panic("lua panic without a state handle"));
+    }
+    @panic("lua error without an active C-function boundary (panic hook returned)");
 }
 
 pub export fn lua_pushcclosure(L: ?*lua_State, f: ?*const fn (?*lua_State) callconv(.c) c_int, n: c_int) void {

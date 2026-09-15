@@ -219,7 +219,7 @@ pub const State = struct {
         var acc = self.stack.items[start];
         var i = start + 1;
         while (i < self.stack.items.len) : (i += 1) {
-            acc = self.vm.apiConcat(acc, self.stack.items[i]) catch return mapVmError();
+            acc = self.vm.apiConcat(acc, self.stack.items[i]) catch |e| return mapVmError(e);
         }
         self.stack.items.len = start;
         try self.stack.append(self.vm.alloc, acc);
@@ -240,11 +240,11 @@ pub const State = struct {
             // PUC lua_arith: for unary ops, duplicate the top value as both
             // operands. The result is computed from the single operand.
             const v = self.stack.items[top - 1];
-            break :blk self.vm.apiArith(@intFromEnum(op), v, v) catch return mapVmError();
+            break :blk self.vm.apiArith(@intFromEnum(op), v, v) catch |e| return mapVmError(e);
         } else blk: {
             const b = self.stack.items[top - 1];
             const a = self.stack.items[top - 2];
-            break :blk self.vm.apiArith(@intFromEnum(op), a, b) catch return mapVmError();
+            break :blk self.vm.apiArith(@intFromEnum(op), a, b) catch |e| return mapVmError(e);
         };
 
         // Pop operands: 1 for unary, 2 for binary.
@@ -271,7 +271,7 @@ pub const State = struct {
         const abs2 = normalizeIndex(idx2, self.stack.items.len) orelse return false;
         const a = self.stack.items[abs1];
         const b = self.stack.items[abs2];
-        return self.vm.apiCompare(@intFromEnum(op), a, b) catch return mapVmError();
+        return self.vm.apiCompare(@intFromEnum(op), a, b) catch |e| return mapVmError(e);
     }
 
     /// PUC `lua_len` (lapi.c:lua_len): push the length of the value at idx.
@@ -280,7 +280,7 @@ pub const State = struct {
     pub fn len(self: *State, idx: i32) ApiError!void {
         const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
         const v = self.stack.items[abs];
-        const result = self.vm.apiLen(v) catch return mapVmError();
+        const result = self.vm.apiLen(v) catch |e| return mapVmError(e);
         try self.stack.append(self.vm.alloc, result);
     }
 
@@ -505,16 +505,16 @@ pub const State = struct {
         if (self.stack.items.len == 0) return error.InvalidState;
         const v = self.stack.items[self.stack.items.len - 1];
         self.stack.items.len -= 1;
-        self.vm.apiSetGlobal(name, v) catch return mapVmError();
+        self.vm.apiSetGlobal(name, v) catch |e| return mapVmError(e);
     }
 
     pub fn newtable(self: *State) ApiError!void {
-        const t = self.vm.apiNewTable() catch return mapVmError();
+        const t = self.vm.apiNewTable() catch |e| return mapVmError(e);
         try self.stack.append(self.vm.alloc, .{ .Table = t });
     }
 
     pub fn newthread(self: *State) ApiError!void {
-        const th = self.vm.apiNewThread(.Nil) catch return mapVmError();
+        const th = self.vm.apiNewThread(.Nil) catch |e| return mapVmError(e);
         try self.thread_stacks.put(self.vm.alloc, th, .empty);
         try self.stack.append(self.vm.alloc, .{ .Thread = th });
     }
@@ -576,7 +576,7 @@ pub const State = struct {
 
     pub fn isyieldable(self: *State, thread_idx: ?i32) ApiError!bool {
         const th = if (thread_idx) |idx| self.threadAt(idx) orelse return error.Type else null;
-        return self.vm.apiIsYieldable(th) catch return mapVmError();
+        return self.vm.apiIsYieldable(th) catch |e| return mapVmError(e);
     }
 
     pub fn gettable(self: *State, idx: i32) ApiError!Type {
@@ -584,7 +584,7 @@ pub const State = struct {
         const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
         const key = self.stack.items[self.stack.items.len - 1];
         const object = self.stack.items[abs];
-        const out = self.vm.apiGetTable(object, key) catch return mapVmError();
+        const out = self.vm.apiGetTable(object, key) catch |e| return mapVmError(e);
         self.stack.items.len -= 1;
         try self.stack.append(self.vm.alloc, out);
         return valueType(out);
@@ -596,20 +596,20 @@ pub const State = struct {
         const value = self.stack.items[self.stack.items.len - 1];
         const key = self.stack.items[self.stack.items.len - 2];
         const object = self.stack.items[abs];
-        self.vm.apiSetTable(object, key, value) catch return mapVmError();
+        self.vm.apiSetTable(object, key, value) catch |e| return mapVmError(e);
         self.stack.items.len -= 2;
     }
 
     pub fn getfield(self: *State, idx: i32, key: []const u8) ApiError!Type {
         const registry_idx: c_int = -1001000;
         const object: vm_mod.Value = if (idx == registry_idx) blk: {
-            const reg = self.vm.apiEnsureRegistry() catch return mapVmError();
+            const reg = self.vm.apiEnsureRegistry() catch |e| return mapVmError(e);
             break :blk .{ .Table = reg };
         } else blk: {
             const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
             break :blk self.stack.items[abs];
         };
-        const out = self.vm.apiGetTable(object, .{ .String = try self.vm.internStr(key) }) catch return mapVmError();
+        const out = self.vm.apiGetTable(object, .{ .String = try self.vm.internStr(key) }) catch |e| return mapVmError(e);
         try self.stack.append(self.vm.alloc, out);
         return valueType(out);
     }
@@ -618,21 +618,21 @@ pub const State = struct {
         if (self.stack.items.len == 0) return error.InvalidState;
         const registry_idx: c_int = -1001000;
         const object: vm_mod.Value = if (idx == registry_idx) blk: {
-            const reg = self.vm.apiEnsureRegistry() catch return mapVmError();
+            const reg = self.vm.apiEnsureRegistry() catch |e| return mapVmError(e);
             break :blk .{ .Table = reg };
         } else blk: {
             const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
             break :blk self.stack.items[abs];
         };
         const value = self.stack.items[self.stack.items.len - 1];
-        self.vm.apiSetTable(object, .{ .String = try self.vm.internStr(key) }, value) catch return mapVmError();
+        self.vm.apiSetTable(object, .{ .String = try self.vm.internStr(key) }, value) catch |e| return mapVmError(e);
         self.stack.items.len -= 1;
     }
 
     pub fn geti(self: *State, idx: i32, n: i64) ApiError!Type {
         const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
         const object = self.stack.items[abs];
-        const out = self.vm.apiGetTable(object, .{ .Int = n }) catch return mapVmError();
+        const out = self.vm.apiGetTable(object, .{ .Int = n }) catch |e| return mapVmError(e);
         try self.stack.append(self.vm.alloc, out);
         return valueType(out);
     }
@@ -642,7 +642,7 @@ pub const State = struct {
         const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
         const object = self.stack.items[abs];
         const value = self.stack.items[self.stack.items.len - 1];
-        self.vm.apiSetTable(object, .{ .Int = n }, value) catch return mapVmError();
+        self.vm.apiSetTable(object, .{ .Int = n }, value) catch |e| return mapVmError(e);
         self.stack.items.len -= 1;
     }
 
@@ -654,7 +654,7 @@ pub const State = struct {
             else => return error.Type,
         };
         const key = self.stack.items[self.stack.items.len - 1];
-        const out = self.vm.apiRawGet(tbl, key) catch return mapVmError();
+        const out = self.vm.apiRawGet(tbl, key) catch |e| return mapVmError(e);
         self.stack.items.len -= 1;
         try self.stack.append(self.vm.alloc, out);
         return valueType(out);
@@ -669,7 +669,7 @@ pub const State = struct {
         };
         const value = self.stack.items[self.stack.items.len - 1];
         const key = self.stack.items[self.stack.items.len - 2];
-        self.vm.apiRawSet(tbl, key, value) catch return mapVmError();
+        self.vm.apiRawSet(tbl, key, value) catch |e| return mapVmError(e);
         self.stack.items.len -= 2;
     }
 
@@ -679,7 +679,7 @@ pub const State = struct {
             .Table => |t| t,
             else => return error.Type,
         };
-        const out = self.vm.apiRawGet(tbl, .{ .Int = n }) catch return mapVmError();
+        const out = self.vm.apiRawGet(tbl, .{ .Int = n }) catch |e| return mapVmError(e);
         try self.stack.append(self.vm.alloc, out);
         return valueType(out);
     }
@@ -692,7 +692,7 @@ pub const State = struct {
             else => return error.Type,
         };
         const value = self.stack.items[self.stack.items.len - 1];
-        self.vm.apiRawSet(tbl, .{ .Int = n }, value) catch return mapVmError();
+        self.vm.apiRawSet(tbl, .{ .Int = n }, value) catch |e| return mapVmError(e);
         self.stack.items.len -= 1;
     }
 
@@ -709,7 +709,7 @@ pub const State = struct {
             else => return error.Type,
         };
         const key: *anyopaque = p orelse return error.InvalidIndex;
-        const out = self.vm.apiRawGet(tbl, .{ .LightUserdata = key }) catch return mapVmError();
+        const out = self.vm.apiRawGet(tbl, .{ .LightUserdata = key }) catch |e| return mapVmError(e);
         try self.stack.append(self.vm.alloc, out);
         return valueType(out);
     }
@@ -726,7 +726,7 @@ pub const State = struct {
         };
         const key: *anyopaque = p orelse return error.InvalidIndex;
         const value = self.stack.items[self.stack.items.len - 1];
-        self.vm.apiRawSet(tbl, .{ .LightUserdata = key }, value) catch return mapVmError();
+        self.vm.apiRawSet(tbl, .{ .LightUserdata = key }, value) catch |e| return mapVmError(e);
         self.stack.items.len -= 1;
     }
 
@@ -739,7 +739,7 @@ pub const State = struct {
         };
         const key = self.stack.items[self.stack.items.len - 1];
         var out: [2]vm_mod.Value = .{ .Nil, .Nil };
-        const produced = self.vm.apiNext(tbl, key, out[0..]) catch return mapVmError();
+        const produced = self.vm.apiNext(tbl, key, out[0..]) catch |e| return mapVmError(e);
         self.stack.items.len -= 1;
         if (produced == 0) return false;
         try self.stack.appendSlice(self.vm.alloc, out[0..2]);
@@ -1274,11 +1274,11 @@ pub const State = struct {
             const name = std.mem.span(reg[i].name.?);
             const key_str = try self.vm.internStr(name);
             if (reg[i].func == null) {
-                self.vm.apiRawSet(tbl, .{ .String = key_str }, .{ .Bool = false }) catch return mapVmError();
+                self.vm.apiRawSet(tbl, .{ .String = key_str }, .{ .Bool = false }) catch |e| return mapVmError(e);
                 continue;
             }
             const cl = try self.makeCclosure(reg[i].func, shared_values);
-            self.vm.apiRawSet(tbl, .{ .String = key_str }, .{ .Closure = cl }) catch {
+            self.vm.apiRawSet(tbl, .{ .String = key_str }, .{ .Closure = cl }) catch |e| {
                 // Publish failed: roll the fully-committed closure back
                 // (its Cells are reachable only through the array we
                 // still own — unregister the closure, then every Cell).
@@ -1292,7 +1292,7 @@ pub const State = struct {
                 }
                 self.vm.alloc.free(cl.upvalues);
                 self.vm.alloc.destroy(cl);
-                return mapVmError();
+                return mapVmErr(e);
             };
         }
         self.stack.items.len -= nup;
@@ -1397,8 +1397,23 @@ fn isFileUserdata(tbl: *vm_mod.Table) bool {
     return false;
 }
 
-fn mapVmError() ApiError {
-    return error.Runtime;
+/// P16.50-review-3 BLOCKER 3: kind-preserving Vm→API error mapping. The
+/// old parameterless `mapVmError()` cast EVERYTHING (including OOM) to
+/// error.Runtime — an OOM from apiNewTable/apiRawSet surfaced as ERRRUN
+/// through cThrow, losing LUA_ERRMEM. The mapping is exact: OOM stays OOM,
+/// RuntimeError becomes error.Runtime (the API's name for it), and Yield
+/// (unreachable at these non-yieldable sites) stays explicit.
+fn mapVmErr(err: vm_mod.Vm.Error) ApiError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.RuntimeError => error.Runtime,
+        error.Yield => error.Runtime, // unreachable at these call sites
+    };
+}
+
+/// Legacy shim retained for not-yet-audited sites; kind-preserving now.
+fn mapVmError(err: vm_mod.Vm.Error) ApiError {
+    return mapVmErr(err);
 }
 
 pub fn mapCompileError(err_val: anyerror) Status {

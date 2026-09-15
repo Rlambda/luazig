@@ -1412,22 +1412,28 @@ pub export fn lua_pushlightuserdata(L: ?*lua_State, p: ?*anyopaque) void {
 /// luaD_rawrunprotected analogue) and, with no anchor, calls the
 /// `atpanic` hook then aborts. Matches the existing lua_callkImpl OOM
 /// arm (which sets c_error_value = .Nil and _longjmps).
-fn cThrow(vm: *Vm, err: api.ApiError) noreturn {
-    // P16.50-review-2 BLOCKER 3: the ONE canonical protected-throw
-    // transport — carries the error object AND the PUC status
-    // (LUA_ERRMEM=4 / LUA_ERRRUN=2) through c_error_value +
-    // c_error_status, then _longjmps to the nearest boundary
-    // (callCFunctionWithBoundary decodes -1-status). With no boundary,
-    // PUC luaD_throw (ldo.c:125-146) calls g->panic(L) and aborts —
-    // we invoke the stored c_panicf exactly once, then panic.
+fn cThrowOn(vm: *Vm, throwing: *vm_mod.lua_State, err: api.ApiError) noreturn {
+    // P16.50-review-3 HIGH: the throwing STATE is explicit — cPanic used
+    // vm.cur_handle which may differ from the L an exported API received
+    // (a non-current coroutine handle); the panic hook must see the
+    // throwing L and its error object.
+    // BLOCKER 2 PUC requirement: OOM installs the FIXED MEMERRMSG object
+    // (luaD_seterrorobj parity — "not enough memory", not a nil).
     switch (err) {
         error.OutOfMemory => {
             if (vm.c_error_jmp) |jb| {
-                vm.c_error_value = .Nil;
+                // PUC luaD_seterrorobj(ERRMEM): installs the FIXED
+                // statMsg literal — never allocates. The VM's
+                // outOfMemoryError installs the same interned literal;
+                // reuse its machinery so the object identity matches what
+                // the Lua-facing error paths observe (and no new interning
+                // can fail under the failing allocator).
+                vm.setOutOfMemoryError();
+                vm.c_error_value = vm.errThread().err_obj;
                 vm.c_error_status = 4; // LUA_ERRMEM
                 _longjmp(jb, 1);
             }
-            cPanic(vm);
+            cPanicOn(vm, throwing, "not enough memory");
         },
         else => {
             if (vm.c_error_jmp) |jb| {
@@ -1435,20 +1441,35 @@ fn cThrow(vm: *Vm, err: api.ApiError) noreturn {
                 vm.c_error_status = 2; // LUA_ERRRUN
                 _longjmp(jb, 1);
             }
-            cPanic(vm);
+            cPanicOn(vm, throwing, null);
         },
     }
+}
+
+fn cThrow(vm: *Vm, err: api.ApiError) noreturn {
+    cThrowOn(vm, vm.cur_handle.?, err);
 }
 
 /// PUC `g->panic(L)` + abort (ldo.c:141-146): the unprotected-throw
 /// fallback. The hook runs EXACTLY once; a return falls through to the
 /// terminal panic (PUC aborts — a Zig @panic carries the same
 /// no-return contract with a diagnostic).
-fn cPanic(vm: *Vm) noreturn {
+fn cPanicOn(vm: *Vm, throwing: *vm_mod.lua_State, msg: ?[]const u8) noreturn {
+    // PUC g->panic(L) receives the state and reads the error object from
+    // its stack top (ldo.c:141-146 sets it via luaD_seterrorobj first).
+    // Install the message (fixed MEMERRMSG for OOM) so the hook observes
+    // the exact object, run the hook EXACTLY once, then terminate.
+    if (msg) |m| {
+        throwing.c_stack.append(vm.alloc, .{ .String = vm.internStrAssume(m) }) catch {};
+    }
     if (vm.c_panicf) |pf| {
-        _ = pf(vm.cur_handle orelse @panic("lua panic without a state handle"));
+        _ = pf(throwing);
     }
     @panic("lua error without an active C-function boundary (panic hook returned)");
+}
+
+fn cPanic(vm: *Vm) noreturn {
+    cPanicOn(vm, vm.cur_handle.?, null);
 }
 
 pub export fn lua_pushcclosure(L: ?*lua_State, f: ?*const fn (?*lua_State) callconv(.c) c_int, n: c_int) void {

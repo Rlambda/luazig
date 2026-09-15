@@ -4457,6 +4457,10 @@ pub const Vm = struct {
     /// from the unswallowed push/setfuncs wrappers surfaced to lua_pcall
     /// as LUA_ERRRUN. The boundary folds this into the landing-pad result.
     c_error_status: c_int = 0,
+    /// P16.50-review-3: the interned "not enough memory" literal (PUC
+    /// statMsg[ERRMEM]), interned once at Vm init so the OOM error path
+    /// never allocates.
+    oom_msg_str: ?*LuaString = null,
 
     /// PUC `L->warnf` (lstate.c): warning handler installed by `lua_setwarnf`.
     /// When non-null, `lua_warning` forwards the message to this callback.
@@ -4820,6 +4824,7 @@ pub const Vm = struct {
             .string_metatable = str_mt,
             .noenv = noenv,
         };
+        vm.oom_msg_str = vm.internStr("not enough memory") catch @panic("oom");
         vm.gcRegisterTable(env) catch @panic("oom");
         vm.gcRegisterTable(str_mt) catch @panic("oom");
         const main_th = alloc.create(Thread) catch @panic("oom");
@@ -5823,7 +5828,6 @@ pub const Vm = struct {
         // P16.50-review-2 defect 5: the thread's free path credits exactly
         // sizeof(Thread) (gcFreeObject) — the commit must match; the old
         // +64 headroom left a permanent +64 residue per thread lifecycle.
-        self.testcCommitMemory(@sizeOf(Thread));
         self.testc_obj_threads += 1;
         // P15.40a: Pre-allocate frame capacity for the new coroutine. This
         // avoids the capacity-check branch on the first 64 bytecode calls.
@@ -7590,11 +7594,17 @@ pub const Vm = struct {
         return error.RuntimeError;
     }
 
-    fn setOutOfMemoryError(self: *Vm) void {
+    pub fn setOutOfMemoryError(self: *Vm) void {
         // Fresh error: reset LUA_ERRERR signal.
         self.errThread().err_is_errerr = false;
         self.err = "not enough memory";
-        self.errThread().err_obj = .{ .String = self.internStrAssume("not enough memory") };
+        // P16.50-review-3: PUC luaD_seterrorobj(ERRMEM) uses the FIXED
+        // statMsg literal — allocation-free by construction. Our
+        // internStrAssume can itself OOM under a failing allocator (found
+        // by the B3 test: the OOM path panicked while installing the
+        // message). The literal is interned ONCE at Vm init (before any
+        // caller-controlled allocator state) and reused here.
+        self.errThread().err_obj = .{ .String = self.oom_msg_str orelse self.internStrAssume("not enough memory") };
         self.errThread().err_has_obj = true;
         if (stdio.activeEnviron().containsConstant("LUAZIG_TRACE_OOM")) {
             if (self.oom_context) |ctx| {
@@ -7644,7 +7654,6 @@ pub const Vm = struct {
             // succeeds (P16.50-review check/commit split).
             try self.testcCheckMemory(hsize * @sizeOf(ltable.Node));
             new_hash = try self.alloc.alloc(ltable.Node, hsize);
-            self.testcCommitMemory(hsize * @sizeOf(ltable.Node));
             // PUC luaM_realloc_ adds the new block's bytes to totalbytes.
             // gc_count_kb mirrors totalbytes: charge the new hash part here
             // so gcFreeObject's full-size credit (header + array + hash)
@@ -7712,7 +7721,6 @@ pub const Vm = struct {
         } else if (new_asize > 0) blk: {
             try self.testcCheckMemory(new_asize * @sizeOf(Value));
             const arr = try self.alloc.alloc(Value, new_asize);
-            self.testcCommitMemory(new_asize * @sizeOf(Value));
             // Charge the new array part (PUC luaM_realloc_ → totalbytes).
             // See the hash-part charge above for the symmetry argument.
             self.gcNoteAlloc(new_asize * @sizeOf(Value));
@@ -8078,10 +8086,27 @@ pub const Vm = struct {
     /// `collectgarbage("count")`; this function controls WHEN the GC
     /// check triggers and maintains the approximate counter used for
     /// threshold calculations.
+    /// P16.50-review-3 BLOCKER 5: THE single accounting boundary (PUC
+    /// `luaM_realloc_`/`luaM_free_` parity). Every successful native
+    /// allocation for a GC object is counted here — once, in BOTH ledgers
+    /// (gc_count_kb/debt AND the testc ctrl.total_bytes); every free
+    /// reverses exactly the same size through gcNoteFree. The old split
+    /// (manual testcCommitMemory at scattered sites) left asymmetries the
+    /// audit matrix proved: Cells were gcNoteAlloc'd but never
+    /// testc-committed while their gcNoteFree subtracted testc bytes
+    /// (−40/cell drift); interned strings noted allocatedSize+24 but
+    /// freed allocatedSize (+24 residue); thread constructors committed
+    /// +64 headroom their frees never credited. With the boundary HERE,
+    /// every committed native byte pairs with its reversal — the manual
+    /// testcCommitMemory calls at construction sites become redundant and
+    /// are removed; testcCheckMemory stays as the pre-allocation LIMIT
+    /// check (PUC debug_realloc checks before allocating), and the exact
+    /// byte accounting happens at the same place the GC ledger does.
     pub inline fn gcNoteAlloc(self: *Vm, bytes: usize) void {
         const kb: f64 = @as(f64, @floatFromInt(bytes)) / 1024.0;
         self.gc_count_kb += kb;
         self.gc_step_debt_kb -= kb;
+        if (self.testc_ctrl) |c| c.total_bytes +|= bytes;
         if (self.stats.enabled) self.stats.alloc_bytes_total += bytes; // P16.0b
     }
     /// Decrement testc_total_bytes and the approximate gc_count_kb when an
@@ -8443,7 +8468,6 @@ pub const Vm = struct {
         for (ud.uservalues) |*uv| uv.* = .Nil;
         self.gcRegisterCommit(.{ .userdata = ud });
         self.testc_obj_userdata += 1;
-        self.testcCommitMemory(total);
         self.gcNoteAlloc(total);
         return ud;
     }
@@ -12170,7 +12194,9 @@ pub const Vm = struct {
             // Clear the continuation params.
             self.c_cont_k = null;
 
-            if (nret_signed == -3) {
+            // P16.50-review-3: the union switch — ThreadSwitch is now its
+            // own tag (the old -3 collided with the error encoding).
+            if (nret_signed == .thread_switch) {
                 // ThreadSwitch: a __close metamethod inside the C
                 // continuation triggered a coroutine switch. The C-frame
                 // is preserved (testc_state stays). Park the frame's
@@ -12196,7 +12222,7 @@ pub const Vm = struct {
                 return error.ThreadSwitch;
             }
 
-            if (nret_signed == -2) {
+            if (nret_signed == .yield) {
                 // k yielded via lua_yieldk. The yielded values are already
                 // stored in th.yielded by builtinCoroutineYield (before the
                 // _longjmp). The C-frame's k/ctx have been updated by
@@ -12218,8 +12244,8 @@ pub const Vm = struct {
                 return error.Yield;
             }
 
-            if (nret_signed < 0) {
-                // k called lua_error. The error object is in c_error_value
+            if (nret_signed == .lua_err) {
+                // k called lua_error (or cThrow). The error object is in c_error_value
                 // (if k used the C API lua_error) or already in err_obj
                 // (if k's script used the Lua error() builtin, which sets
                 // err_obj directly without going through c_error_value).
@@ -12260,7 +12286,10 @@ pub const Vm = struct {
             }
 
             // Normal return: collect k's results from the frame's c_stack.
-            const n: i32 = nret_signed;
+            const n: i32 = switch (nret_signed) {
+                .ok => |cnt| @intCast(cnt),
+                else => unreachable, // handled above
+            };
             const n_usize: usize = @intCast(@max(n, 0));
             var results: []Value = &.{};
             var results_owned = false;
@@ -19934,7 +19963,10 @@ pub const Vm = struct {
             // PUC sizestrshr/luaS_sizelngstr(LSTRREG) include the NUL;
             // T7: single per-kind rule via allocatedSize().
             self.gcNoteAlloc(ls.allocatedSize());
-            self.testcNoteMemory(ls.allocatedSize() + 24);
+            // P16.50-review-3 single boundary: gcNoteAlloc already
+            // counts allocatedSize in BOTH ledgers; the extra +24 note
+            // (a hash/allowance surcharge nothing ever reversed) is
+            // removed — the ledger pair is now exactly symmetric.
             self.testc_obj_strings += 1;
             return ls;
         }
@@ -19945,7 +19977,6 @@ pub const Vm = struct {
         const ls = try createLuaString(self.alloc, raw, hash);
         self.gcRegisterCommit(.{ .string = ls });
         self.gcNoteAlloc(ls.allocatedSize());
-        self.testcNoteMemory(ls.allocatedSize() + 24);
         self.testc_obj_strings += 1;
         return ls;
     }
@@ -20054,7 +20085,7 @@ pub const Vm = struct {
         // Only the header is owned by the GC; the external content is accounted
         // for by the caller (and released via `falloc` for LSTRMEM).
         self.gcNoteAlloc(header_size);
-        self.testcNoteMemory(header_size);
+        // P16.50-review-3 single boundary (see internStr note).
         self.testc_obj_strings += 1;
         return ls;
     }
@@ -20126,7 +20157,7 @@ pub const Vm = struct {
     // abort — exactly what `Vm.init` does for its own allocations. This keeps
     // the call sites free of `try` without introducing a parallel interning
     // path: it routes through `internStr`, so dedup/pointer-identity still hold.
-    fn internStrAssume(self: *Vm, raw: []const u8) *LuaString {
+    pub fn internStrAssume(self: *Vm, raw: []const u8) *LuaString {
         return self.internStr(raw) catch @panic("luazig: oom interning constant string");
     }
 
@@ -22392,7 +22423,6 @@ pub const Vm = struct {
         self.gcRegisterCommit(.{ .thread = th });
         self.gcNoteAlloc(@sizeOf(Thread));
         // P16.50-review-2 defect 5: symmetric with the free credit.
-        self.testcCommitMemory(@sizeOf(Thread));
         self.testc_obj_threads += 1;
         outs[0] = .{ .Thread = th };
     }
@@ -26586,6 +26616,9 @@ pub const Vm = struct {
         // Type metatables: every string/number/boolean/etc. value's metamethod
         // lookup routes through these.
         try self.gcMarkValue(.{ .Table = self.string_metatable });
+        // P16.50-review-3: the fixed OOM message literal is a VM-lifetime
+        // root (the OOM path must never allocate — see setOutOfMemoryError).
+        if (self.oom_msg_str) |s| try self.gcMarkValue(.{ .String = s });
         const optional_mts = [_]?*Table{
             self.number_metatable,
             self.boolean_metatable,
@@ -27738,8 +27771,6 @@ pub const Vm = struct {
         // skewed gc_count_kb collapsed collectgarbage("count") to 0 and
         // broke gen-GC pacing (gc.lua pace2 hang, P16.42 T3).
         self.gcNoteAlloc(@sizeOf(Closure) + proto.upvalues.len * @sizeOf(*Cell));
-        // P16.50-review-2 BLOCKER 4: the matching testc commit (was check-only).
-        self.testcCommitMemory(@sizeOf(Closure) + 64);
         // P16.10b Task 7+15 (adoption): resolve the tree's constants HERE,
         // at the closure-creation boundary, so every executable Proto is
         // runtime-ready BEFORE any frame push (PUC invariant: bytecode
@@ -28235,9 +28266,6 @@ pub const Vm = struct {
         // luaF_newLclosure; must match gcFreeObject's credit — see the
         // text-path fix in createBytecodeChunkClosure, P16.42 T3).
         self.gcNoteAlloc(@sizeOf(Closure) + nups * @sizeOf(*Cell));
-        // P16.50-review-2 BLOCKER 4: the matching testc commit (was
-        // check-only — the eventual free undercounted live memory).
-        self.testcCommitMemory(@sizeOf(Closure) + 64);
         // Charge the tree's native footprint at adoption (Task 7). For
         // undumped trees, constants were pre-resolved by
         // preResolveUndumpedConstants before this call, so resolved_values
@@ -37812,32 +37840,17 @@ pub const Vm = struct {
             k += 1;
         }
         const scratch = try out.toOwnedSlice(self.alloc);
-        // P16.50-review-2 defects 4+6: (4) internStr COPIES the bytes —
-        // the scratch buffer was leaked on every path that reached here
-        // (found by the B4 test's live-set proof); freed now. (6) PUC's
-        // concat scratch is a TRANSIENT luaM_realloc_'d buffer whose
-        // luaM_free_ nets it to zero — the permanent delta is only the
-        // interned string's own accounting (charged inside internStr).
-        // Charge the scratch, then reverse it symmetrically on BOTH paths
-        // (a failing internStr leaves the table byte-exact too).
-        self.testcCommitMemory(total_len);
-        var scratch_settled = false;
-        errdefer if (!scratch_settled) {
-            self.alloc.free(scratch);
-            // Reverse ONLY the testc ledger: the scratch never charged
-            // gc_count_kb (the out-buffer growth was check'd, not
-            // gcNoteAlloc'd) — a gcNoteFree here would under-drift the GC
-            // ledger by total_len (found by the B4 snapshot: −3 bytes).
-            if (self.testc_active) {
-                if (self.testc_ctrl) |ctrl2| ctrl2.total_bytes -|= total_len;
-            }
-        };
+        // P16.50-review-3: the scratch is a TRANSIENT buffer — PUC's
+        // luaM_realloc_'d scratch nets to zero against totalbytes; under
+        // the single accounting boundary it never enters any ledger at
+        // all (pure allocator alloc/free). internStr COPIES the bytes
+        // (the P16.50-review-2 leak is fixed by the frees below); the
+        // permanent delta is only the interned string's own accounting
+        // (inside internStr's gcNoteAlloc). The old commit+manual-reversal
+        // is deleted along with the rest of the distributed scheme.
+        errdefer self.alloc.free(scratch);
         const final_str = try self.internStr(scratch);
         self.alloc.free(scratch);
-        if (self.testc_active) {
-            if (self.testc_ctrl) |ctrl2| ctrl2.total_bytes -|= total_len;
-        }
-        scratch_settled = true;
         outs[0] = .{ .String = final_str };
     }
 
@@ -40087,10 +40100,35 @@ pub const Vm = struct {
         }
     }
 
+    /// P16.50-review-3 BLOCKER 2: the internal result of a protected C
+    /// call. The old magic negative integers collided: the boundary
+    /// encoded lua errors as `-1 - status` (-3 = ERRRUN), but `finishCcall`
+    /// already reserved -3 for ThreadSwitch — a Runtime cThrow from a
+    /// continuation was misclassified as a thread switch, and ERRMEM (-5)
+    /// fell into the generic negative arm and became RuntimeError. One
+    /// explicit tagged union carries every outcome; the C ABI callback's
+    /// ordinary integer return stays separate from these VM control
+    /// signals.
+    const BoundaryResult = union(enum) {
+        /// Normal C return; the payload is the result count.
+        ok: u32,
+        /// lua_yieldk (or a yieldable boundary return): values are in
+        /// th.yielded, the C-frame stays parked for the continuation.
+        yield,
+        /// A __close metamethod triggered a coroutine switch; the frame is
+        /// preserved like yield but the trampoline processes the switch.
+        thread_switch,
+        /// A protected Lua error (PUC luaD_throw). The payload is the PUC
+        /// status (LUA_ERRRUN=2 / LUA_ERRMEM=4 / LUA_ERRERR=5); the thrown
+        /// object is in `c_error_value` (or the thread err state when the
+        /// throw came from the VM, not the C API).
+        lua_err: c_int,
+    };
+
     fn callCFunctionWithBoundary(
         self: *Vm,
         f: *const fn (?*lua_State) callconv(.c) c_int,
-    ) i32 {
+    ) BoundaryResult {
         // The `jmp_buf` lives in THIS stack frame; its address is stored in
         // `c_error_jmp` so `lua_error` can `_longjmp` to it.
         var jb: JmpBuf = undefined;
@@ -40106,29 +40144,26 @@ pub const Vm = struct {
 
         const sj = _setjmp(@ptrCast(&jb));
         if (sj == 0) {
-            return @intCast(f(self.cur_handle.?));
+            return .{ .ok = @intCast(f(self.cur_handle.?)) };
         }
-        // `_longjmp` with value 1 = `lua_error` (existing behavior).
-        // `_longjmp` with value 2 = `lua_yieldk` yield (P15.78).
-        //   The yield values are already stored in `th.yielded` by
-        //   `builtinCoroutineYield` before the `_longjmp`; no error object
-        //   is carried. The `defer` above restores `c_error_jmp` correctly
-        //   because the longjmp landed HERE — no Zig frame above this one
-        //   was unwound.
+        // `_longjmp` with value 2 = `lua_yieldk` yield (P15.78). The yield
+        // values are already stored in `th.yielded` by `builtinCoroutineYield`
+        // before the `_longjmp`; no error object is carried.
         if (sj == 2) {
-            // Yield: return -2 so `callCFunction` can distinguish yield from
-            // error (-1) and normal return (>= 0).
-            return -2;
+            return .yield;
         }
-        // `lua_error`/`cThrow` `_longjmp`'d back. P16.50-review-2 BLOCKER 3:
-        // the thrower recorded the PUC status in `c_error_status`
-        // (LUA_ERRRUN=2 default; LUA_ERRMEM=4 for OOM). Return it as a
-        // negative value (-2 would collide with yield, so: -1 - status,
-        // i.e. -3 = LUA_ERRRUN, -5 = LUA_ERRMEM); `callCFunction` decodes.
+        // `lua_error`/`cThrow` `_longjmp`'d back with value 1 (or 3 = the
+        // ThreadSwitch signal raised by a __close-driven coroutine switch —
+        // see builtinCoroutineResumeClosePath). The thrower recorded the
+        // PUC status in `c_error_status`; PUC luaD_throw carries the status
+        // alongside the object (ldo.c:125-146).
+        if (sj == 3) {
+            return .thread_switch;
+        }
         {
-            const st = self.c_error_status;
+            const st: c_int = if (self.c_error_status != 0) self.c_error_status else 2;
             self.c_error_status = 0;
-            return -1 - st;
+            return .{ .lua_err = st };
         }
     }
 
@@ -40183,13 +40218,12 @@ pub const Vm = struct {
         // so that `finishCcall` can invoke k on the next resume. We pop
         // manually on the normal-return and error paths below.
 
-        // Invoke the C function through the setjmp/longjmp error boundary.
-        // On a normal return the value is the result count (PUC `n = (*f)(L)`
-        // in luaD_precall); -1 means `lua_error` fired and `_longjmp`'d back;
-        // -2 means `lua_yieldk` yielded and `_longjmp`'d back (P15.78).
+        // Invoke the C function through the setjmp/longjmp error boundary
+        // (PUC `n = (*f)(L)` in luaD_precall). P16.50-review-3: the result
+        // is the BoundaryResult union — no magic negatives.
         const nret_signed = self.callCFunctionWithBoundary(cf);
 
-        if (nret_signed == -2) {
+        if (nret_signed == .yield) {
             // P15.78: `lua_yieldk` yielded. The yield values are already
             // stored in `th.yielded` by `builtinCoroutineYield`. Park the
             // frame's c_stack (args + live TBC slots survive — PUC: the
@@ -40205,34 +40239,26 @@ pub const Vm = struct {
             return error.Yield;
         }
 
-        if (nret_signed < 0) {
-            // `lua_error` was called (or an error longjmp'd from lua_pcallk's
-            // yieldable path). Fold the thrown object into the VM error state
-            // first — both the YPCALL and non-YPCALL paths below need it.
-            // The error may come from two sources:
-            //   1. `lua_error()` (C API) → `c_error_value` is set
-            //   2. Lua `error()` → `self.errThread().err_obj`/`self.errThread().err_has_obj` are
-            //      set by `fail()`, `c_error_value` is null
-            // P16.50-review-2 BLOCKER 3: an OOM throw carries
-            // LUA_ERRMEM=4 in the encoded return (-5). Propagate the OOM
-            // AS OOM — do not fold it into a RuntimeError (PUC
-            // luaD_throw(L, LUA_ERRMEM) reaches lua_pcallk as ERRMEM;
-            // masking it as ERRRUN loses the status).
-            if (nret_signed == -5) {
-                if (stack_parked) {
-                    // (unreachable today: no parked stack on this path, kept
-                    // symmetric with the yield arm for future-proofing)
-                }
-                if (self.c_error_value) |errval| {
-                    self.c_error_value = null;
-                    self.errThread().err_obj = errval;
-                    self.errThread().err_has_obj = true;
-                }
-                self.errThread().api_status = 4; // LUA_ERRMEM
-                return error.OutOfMemory;
-            }
-            // Only overwrite err_obj if c_error_value is set (lua_error
-            // path); otherwise keep the existing err_obj from fail().
+        if (nret_signed == .lua_err) {
+            // A protected Lua error (lua_error or cThrow). Fold the thrown
+            // object into the VM error state first — both the YPCALL and
+            // non-YPCALL paths below need it.
+            //   1. `lua_error()`/`cThrow` (C API) → `c_error_value` is set
+            //   2. Lua `error()` → `self.errThread().err_obj`/`err_has_obj`
+            //      are set by `fail()`, `c_error_value` is null
+            // P16.50-review-3 BLOCKER 1: EVERY error arm (incl. ERRMEM)
+            // now takes the SAME structural unwind — the old -5 arm
+            // returned OOM without popping the C-frame, leaking one frame
+            // per failing call (the B3 test manually hid this with
+            // popBuiltinCFrame; that compensation is gone).
+            // P16.50-review-3 BLOCKER 3/4: the exact kind propagates —
+            // ERRMEM (payload 4) → error.OutOfMemory with the object
+            // already folded; anything else → error.RuntimeError. The
+            // status is NOT written into Thread.api_status here: PUC
+            // stores the status on the errorJmp/catching boundary
+            // (luaD_throw → status; lua_pcallk returns it), while the
+            // RUNNING state returns to LUA_OK — the old permanent
+            // api_status=4 write is removed.
             if (self.c_error_value) |errval| {
                 self.c_error_value = null;
                 self.errThread().err_obj = errval;
@@ -40257,7 +40283,7 @@ pub const Vm = struct {
                 self.parkCStack(cur_fr, saved_stack) catch return error.OutOfMemory;
                 stack_parked = true;
                 // err_obj/err_has_obj are already set by fail() for Lua errors
-                return error.RuntimeError;
+                return if (nret_signed.lua_err == 4) error.OutOfMemory else error.RuntimeError;
             }
             // Not CIST_YPCALL: pop the C-frame (pop-detach — the frame's
             // live marks detach with their values captured) and propagate.
@@ -40266,16 +40292,21 @@ pub const Vm = struct {
             // catches the error (a YPCALL C-frame → precover's region
             // close with the error; builtin pcall → the catch's region
             // close; no boundary → the resume boundary leaves them for
-            // coroutine.close, p31a [D]).
+            // coroutine.close, p31a [D]). P16.50-review-3 BLOCKER 1: the
+            // OOM path pops exactly like RuntimeError (the old -5 arm
+            // skipped this pop and leaked the frame).
             self.popBuiltinCFrame();
-            return error.RuntimeError;
+            return if (nret_signed.lua_err == 4) error.OutOfMemory else error.RuntimeError;
         }
 
         // Normal return: extract the C function's results, close the frame's
         // own TBC chain entries (PUC moveresults → luaF_close(ci->func,
         // CLOSEKTOP, yy=1) — yieldable; the results are preserved in the
         // CClsretState if a closer yields), then pop the C-frame and deliver.
-        const nret: usize = if (nret_signed > 0) @intCast(nret_signed) else 0;
+        const nret: usize = switch (nret_signed) {
+            .ok => |cnt| cnt,
+            else => unreachable, // handled above
+        };
         const total = self.cur_c_stack.items.len;
         const result_start: usize = if (total >= nret) total - nret else 0;
         const actual_nret: usize = if (total >= nret) nret else total;
@@ -49793,7 +49824,8 @@ test "P16.50-review T3: registerfuncs per-closure Cells + fresh-table publish ro
     try setup_roots.add(.{ .String = key_f1b });
     try vm.gcEnterGenerational();
 
-    const reg = [_]c_api.luaL_Reg{
+    const c_api0 = @import("c_api.zig");
+    const reg = [_]c_api0.luaL_Reg{
         .{ .name = "p50r3_f1a", .func = p50Cfunc },
         .{ .name = "p50r3_f1b", .func = p50Cfunc },
         .{ .name = null, .func = null },
@@ -50426,162 +50458,91 @@ test "P16.50-review-2 B1: opClosure heap worklist (nups=20) mixed OOM matrix" {
 }
 
 test "P16.50-review-2 B3: callCFunction ERRMEM/ERRRUN status transport" {
+    // P16.50-review-3 rewrite: the expected-bug assertions are GONE (the
+    // manual popBuiltinCFrame compensation, the stale api_status==4 after
+    // success/lua_error). New contract:
+    //   - EVERY error arm (incl. ERRMEM) structurally unwinds the C-frame
+    //     (BLOCKER 1): frames return to baseline with NO test repair;
+    //   - the exact error kind propagates (BLOCKER 3): OOM →
+    //     error.OutOfMemory, lua_error → error.RuntimeError;
+    //   - Thread.api_status is boundary-owned (BLOCKER 4): the running
+    //     state does NOT permanently carry the error status.
     const testing = std.testing;
     const api = @import("api.zig");
 
-    // api.State owns a HEAP Vm with a main handle (callCFunction swaps
-    // cur_c_stack, which points at the active handle's stack — the exact
-    // production shape every C-ABI call runs in). No separate vm.deinit.
     var state = api.State.init(.{ .allocator = testing.allocator });
     defer state.deinit();
     const vm = state.vm;
+    var roots = vm.gcTempRoots();
+    defer roots.end();
     const th = vm.main_thread.?;
+    const frames0 = th.call_frames.len();
 
-    var setup_roots = vm.gcTempRoots();
-    defer setup_roots.end();
-
-    // The three C-closure callees, hand-built (the keeper pattern — c-fn
-    // closures have no proto/tree) BEFORE gcEnterGenerational so they are
-    // OLD and every gcMinorCollection below leaves them alone.
-    var callees: [3]*Closure = undefined;
-    const c_fns = [3]*const fn (?*lua_State) callconv(.c) c_int{
-        p50r2PushcclosureFn,
-        p50r2PushcfunctionFn,
-        p50r2ErrorFn,
-    };
-    for (c_fns, 0..) |f, i| {
-        try vm.gcPrepareRegister(1);
-        const cl = try vm.alloc.create(Closure);
-        cl.* = .{ .upvalues = &.{}, .c_func = f };
-        vm.gcRegisterCommit(.{ .closure = cl });
-        vm.gcNoteAlloc(@sizeOf(Closure));
-        vm.testc_obj_functions += 1;
-        try setup_roots.add(.{ .Closure = cl });
-        callees[i] = cl;
-    }
-
-    try vm.gcEnterGenerational();
-    try vm.gc_objects.ensureUnusedCapacity(testing.allocator, 16);
-    try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 16);
-
-    // ---- Part 1: ERRMEM — fail_index 2 is pushcclosure's Cell alloc (#2
-    // in the measured map); cThrow carries LUA_ERRMEM=4 through the boundary
-    // (decoded -5), callCFunction's -5 arm propagates error.OutOfMemory. ----
+    // ---- Part 1: ERRMEM via lua_pushcclosure(n=1) Cell-alloc failure ----
     {
-        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
-            .fail_index = 2,
-            .resize_fail_index = 2,
-        });
-        const snap = try P50Snapshot.take(vm, testing.allocator);
-        defer snap.deinit(testing.allocator);
-
-        const frames0 = th.call_frames.len();
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1, .resize_fail_index = 1 });
+        const saved = vm.alloc;
         vm.alloc = failing.allocator();
-        const result = vm.apiCall(.nonyieldable, .{ .Closure = callees[0] }, &.{});
-        vm.alloc = testing.allocator;
-
-        try testing.expectError(error.OutOfMemory, result);
-        // BLOCKER 3 transport: LUA_ERRMEM=4 reached the error thread's
-        // api_status (PUC lua_pcallk returns LUA_ERRMEM, not ERRRUN).
-        try testing.expectEqual(@as(c_int, 4), vm.errThread().api_status);
-        // The OOM throw carries no error object (PUC seterrorobj would set
-        // the "not enough memory" string; cThrow carries .Nil).
-        try testing.expect(vm.errThread().err_obj == .Nil);
-        try testing.expect(vm.errThread().err_has_obj);
-        // FINDING (documented, not fixed here): the -5 arm does NOT pop the
-        // C-frame — every OOM-failing C call leaks one frame on call_frames
-        // (PUC pops the C CallInfo on every error unwind path). Compensated
-        // here to keep the machine state clean for the parts below.
-        try testing.expectEqual(frames0 + 1, th.call_frames.len());
-        vm.popBuiltinCFrame();
-        try testing.expectEqual(frames0, th.call_frames.len());
-        // The swapped-in C stack (with the pushed 42) was deinit'd and the
-        // saved stack restored by the errdefer; the registries are exact.
-        try snap.assertRestored(vm);
-        try vm.gcMinorCollection();
-        try snap.assertRestored(vm);
+        defer vm.alloc = saved;
+        const r = vm.callCFunction(p50PushClosureCf, &.{});
+        try testing.expectEqual(error.OutOfMemory, r);
     }
+    // BLOCKER 1: the C-frame is popped — NO manual repair.
+    try testing.expectEqual(frames0, th.call_frames.len());
+    // BLOCKER 4: the running state carries no stale error status.
+    try testing.expectEqual(@as(c_int, 0), th.api_status);
 
-    // ---- Part 1b: the state is fully usable after the ERRMEM failure —
-    // the same call succeeds with the real allocator and delivers the
-    // pushed closure. ----
+    // ---- Part 1b: state genuinely usable afterward (same call succeeds) ----
     {
-        const snap = try P50Snapshot.take(vm, testing.allocator);
-        defer snap.deinit(testing.allocator);
-
-        const frames0 = th.call_frames.len();
-        const result = try vm.apiCall(.nonyieldable, .{ .Closure = callees[0] }, &.{});
+        const result = try vm.callCFunction(p50PushClosureCf, &.{});
         defer vm.alloc.free(result);
         try testing.expectEqual(@as(usize, 1), result.len);
         const cl = result[0].Closure;
         try testing.expectEqual(@as(usize, 1), cl.upvalues.len);
-        const cell42 = cl.upvalues[0]; // capture before the teardown frees the array
-        try testing.expect(std.meta.eql(cell42.value, .{ .Int = 42 }));
-        try testing.expect(p50IsRegistered(vm, .{ .closure = cl }));
-        try testing.expect(p50IsRegistered(vm, .{ .cell = cell42 }));
-        // The normal path pops the C-frame.
-        try testing.expectEqual(frames0, th.call_frames.len());
-        p50TeardownClosure(vm, cl);
-        p50TeardownCell(vm, cell42);
-        try snap.assertRestored(vm);
-        // FINDING (documented, not fixed here): api_status is never reset
-        // on success — it still carries the 4 from Part 1 (PUC sets
-        // L->status = LUA_OK on every successful return).
-        try testing.expectEqual(@as(c_int, 4), vm.errThread().api_status);
     }
+    try testing.expectEqual(frames0, th.call_frames.len());
+    try testing.expectEqual(@as(c_int, 0), th.api_status);
 
-    // ---- Part 2: ERRRUN — lua_error inside the C function. The boundary
-    // decodes -1 (c_error_status 0 was reset after the -5 read), the RUN arm
-    // pops the C-frame and propagates error.RuntimeError with the thrown
-    // object folded into err_obj. ----
+    // ---- Part 2: ERRRUN via lua_error keeps the original object ----
     {
-        const snap = try P50Snapshot.take(vm, testing.allocator);
-        defer snap.deinit(testing.allocator);
-
-        const frames0 = th.call_frames.len();
-        const result = vm.apiCall(.nonyieldable, .{ .Closure = callees[2] }, &.{});
-        try testing.expectError(error.RuntimeError, result);
-        // The C-frame IS popped on this path.
-        try testing.expectEqual(frames0, th.call_frames.len());
-        // The thrown object (the pushed 777) is transported intact.
-        try testing.expect(std.meta.eql(vm.errThread().err_obj, .{ .Int = 777 }));
-        try testing.expect(vm.errThread().err_has_obj);
-        // FINDING (documented, not fixed here): api_status is NOT set to 2
-        // (LUA_ERRRUN) on the lua_error path — it still carries the stale 4
-        // from Part 1 (PUC lua_pcallk returns LUA_ERRRUN=2 for this unwind).
-        try testing.expectEqual(@as(c_int, 4), vm.errThread().api_status);
-        try snap.assertRestored(vm);
-        try vm.gcMinorCollection();
-        try snap.assertRestored(vm);
+        const r = vm.callCFunction(p50LuaErrorCf, &.{});
+        try testing.expectEqual(error.RuntimeError, r);
+        const msg = vm.errThread().err_obj;
+        try testing.expect(msg == .String);
+        try testing.expectEqualStrings("p50 runtime!", msg.String.bytes());
     }
+    try testing.expectEqual(frames0, th.call_frames.len());
 
-    // ---- Part 3: pushcfunction (pushcclosure with n=0) — fail_index 1 is
-    // the Closure alloc (#1 in the measured map: #0 is the c_stack growth,
-    // which succeeded). Same ERRMEM shape as Part 1. ----
+    // ---- Part 3: repeated ERRMEM failures do not grow call_frames ----
     {
-        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
-            .fail_index = 1,
-            .resize_fail_index = 1,
-        });
-        const snap = try P50Snapshot.take(vm, testing.allocator);
-        defer snap.deinit(testing.allocator);
-
-        const frames0 = th.call_frames.len();
-        vm.alloc = failing.allocator();
-        const result = vm.apiCall(.nonyieldable, .{ .Closure = callees[1] }, &.{});
-        vm.alloc = testing.allocator;
-
-        try testing.expectError(error.OutOfMemory, result);
-        try testing.expectEqual(@as(c_int, 4), vm.errThread().api_status);
-        try testing.expect(vm.errThread().err_obj == .Nil);
-        // FINDING (same documented C-frame leak as Part 1).
-        try testing.expectEqual(frames0 + 1, th.call_frames.len());
-        vm.popBuiltinCFrame();
-        try testing.expectEqual(frames0, th.call_frames.len());
-        try snap.assertRestored(vm);
-        try vm.gcMinorCollection();
-        try snap.assertRestored(vm);
+        var round: usize = 0;
+        while (round < 3) : (round += 1) {
+            var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1, .resize_fail_index = 1 });
+            const saved = vm.alloc;
+            vm.alloc = failing.allocator();
+            const r = vm.callCFunction(p50PushClosureCf, &.{});
+            vm.alloc = saved;
+            try testing.expectEqual(error.OutOfMemory, r);
+            try testing.expectEqual(frames0, th.call_frames.len());
+        }
     }
+}
+
+/// C callback: pushcclosure(fn, 1) with one integer upvalue already on the
+/// state's stack (pushed by the callback itself — PUC C functions push
+/// their own arguments).
+fn p50PushClosureCf(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    _ = c_api.lua_pushinteger(L, 42);
+    c_api.lua_pushcclosure(L, p50Cfunc, 1);
+    return 1;
+}
+
+/// C callback: lua_error with a distinctive string object.
+fn p50LuaErrorCf(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    _ = c_api.lua_pushstring(L, "p50 runtime!");
+    return c_api.lua_error(L);
 }
 
 test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
@@ -50741,9 +50702,12 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
 
             if (vm.createBytecodeChunkClosure(proto)) |cl| {
                 first_success_idx = fail_idx;
-                // Success commits exactly sizeof(Closure) + 64 = 104 (the
-                // fixed c-closure upvalue-array allowance, vm.zig:27741).
-                try testing.expectEqual(tb0 + @sizeOf(Closure) + 64, ctrl.total_bytes);
+                // P16.50-review-3 single boundary: the success charge is
+                // the SAME bytes gcNoteAlloc charged (Cells + closure incl.
+                // its upvalue-array allowance) — and the teardown below
+                // credits exactly these back (found delta = 184 = 3*40 +
+                // 40 + 3*8, matching gcNoteFree's credits).
+                try testing.expectEqual(tb0 + @as(usize, 3 * @sizeOf(Cell) + @sizeOf(Closure) + 3 * @sizeOf(*Cell)), ctrl.total_bytes);
                 // p44's manual teardown mirror:
                 _ = vm.gcUnregisterObjectRollback(.{ .closure = cl });
                 vm.testc_obj_functions -= 1;
@@ -50760,14 +50724,11 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
                 vm.alloc = saved_alloc;
                 ua.free(cl.upvalues);
                 ua.destroy(cl);
-                // FINDING (documented, not fixed here): the full lifecycle
-                // ends 80 BELOW the baseline — the teardown credits 64 for
-                // the closure plus 120 for the three Cells, but the Cells
-                // were never testc-CHARGED (they are gcNoteAlloc'd only;
-                // there is no testcCommitMemory for Cells anywhere), so
-                // every rolled-back or freed Cell drifts total_bytes down
-                // by 40.
-                try testing.expectEqual(tb0 - 80, ctrl.total_bytes);
+                // P16.50-review-3 single boundary: the lifecycle nets
+                // exactly ZERO (gcNoteAlloc/gcNoteFree pair symmetric in
+                // both ledgers — the old tb0-80 Cell-drift FINDING is
+                // resolved, not asserted).
+                try testing.expectEqual(tb0, ctrl.total_bytes);
                 try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
                 try testing.expectEqual(funcs0, vm.testc_obj_functions);
                 break;
@@ -50785,12 +50746,11 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
                 //     +104 commit - 64 closure credit - 120 cell credits =
                 //     -80 (FINDING: the post-commit errdefer reverses the
                 //     gcNoteAlloc side but NOT the testcCommitMemory side).
-                const expected: usize = switch (fail_idx) {
-                    0, 1 => tb0,
-                    2, 3, 4 => tb0 - 40 * (fail_idx - 1),
-                    else => tb0 - 80,
-                };
-                try testing.expectEqual(expected, ctrl.total_bytes);
+                // P16.50-review-3 single accounting boundary: the gcNoteAlloc/
+                // gcNoteFree pair covers BOTH ledgers — every failure
+                // index restores exactly (the old per-site
+                // testcCommitMemory asymmetry -40/-80 is gone).
+                try testing.expectEqual(tb0, ctrl.total_bytes);
                 // The registry and gc_count_kb restorations are exact (the
                 // p44 guarantees — only the testc ledger drifts).
                 try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
@@ -50832,8 +50792,8 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
 
             if (vm.closureFromProto(proto)) |cl| {
                 first_success_idx = fail_idx;
-                // The same fixed sizeof(Closure) + 64 = 104 commit.
-                try testing.expectEqual(tb0 + @sizeOf(Closure) + 64, ctrl.total_bytes);
+                // P16.50-review-3 single boundary (same exact shape as (c)).
+                try testing.expectEqual(tb0 + @as(usize, 3 * @sizeOf(Cell) + @sizeOf(Closure) + 3 * @sizeOf(*Cell)), ctrl.total_bytes);
                 _ = vm.gcUnregisterObjectRollback(.{ .closure = cl });
                 vm.testc_obj_functions -= 1;
                 vm.gcNoteFree(@sizeOf(Closure) + cl.upvalues.len * @sizeOf(*Cell));
@@ -50850,23 +50810,16 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
                 ua.free(cl.upvalues);
                 ua.destroy(cl);
                 // FINDING: the same -80 lifecycle drift as (c).
-                try testing.expectEqual(tb0 - 80, ctrl.total_bytes);
+                try testing.expectEqual(tb0, ctrl.total_bytes);
                 try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
                 try testing.expectEqual(funcs0, vm.testc_obj_functions);
                 break;
             } else |err| {
                 try testing.expectEqual(error.OutOfMemory, err);
                 tested_failures += 1;
-                // Measured: idx 0..2 unchanged (nothing created yet at the
-                // Closure/cells/Cell#1 failure points), idx 3 -40 (one
-                // Cell rolled back), idx 4 -80 (two) — the same uncharged-
-                // Cell drift as (c).
-                const expected: usize = switch (fail_idx) {
-                    0, 1, 2 => tb0,
-                    3, 4 => tb0 - 40 * (fail_idx - 2),
-                    else => tb0 - 80,
-                };
-                try testing.expectEqual(expected, ctrl.total_bytes);
+                // P16.50-review-3 single boundary: every failure index
+                // restores exactly (the Cell-drift is resolved).
+                try testing.expectEqual(tb0, ctrl.total_bytes);
                 try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
                 try testing.expectEqual(count0, vm.gc_count_kb);
                 try testing.expectEqual(funcs0, vm.testc_obj_functions);
@@ -50917,13 +50870,12 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
                 // committed then freed symmetrically (nets zero — PUC's
                 // transient buffer semantics); the permanent delta is the
                 // interned string's own note only.
-                const note = outs[0].String.allocatedSize() + 24;
-                try testing.expectEqual(tb0 + note, ctrl.total_bytes);
+                // P16.50-review-3 single boundary: the success delta is
+                // exactly the string's allocatedSize (gcNoteAlloc); the
+                // +24 note is removed; teardown nets exactly zero.
+                try testing.expectEqual(tb0 + outs[0].String.allocatedSize(), ctrl.total_bytes);
                 p50TeardownString(&vm, outs[0].String);
-                // The remaining +24 is the pre-existing internStr
-                // note-vs-free shape (notes allocatedSize+24, frees
-                // allocatedSize).
-                try testing.expectEqual(tb0 + 24, ctrl.total_bytes);
+                try testing.expectEqual(tb0, ctrl.total_bytes);
             } else |err| {
                 try testing.expectEqual(error.OutOfMemory, err);
                 tested_failures += 1;

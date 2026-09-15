@@ -1,45 +1,43 @@
 {
-  "created_utc": "2026-09-14T19:16:24.295761+00:00",
-  "provenance": {
-    "git_head": "7af60bed0450c57895bc6663a99a6a6d5bae262e",
-    "measured_source_head": "7af60bed0450c57895bc6663a99a6a6d5bae262e",
-    "source_dirty": "clean",
-    "zig_version": "0.16.0",
-    "probe_rf_path": "/tmp/opencode/p49r_layout_rf",
-    "probe_debug_path": "/tmp/opencode/p49r_layout_dbg",
-    "probe_rf_sha256_16": "fb66df68aed23d21",
-    "probe_debug_sha256_16": "92e82c7556046c34",
-    "probe_build_commands": [
-      "zig build-exe -O ReleaseFast --dep lua -Mroot=/tmp/opencode/layout_probe.zig --dep util -Mlua=src/lua/root.zig -Mutil=src/util/root.zig -lc -femit-bin=/tmp/opencode/p49r_layout_rf",
-      "zig build-exe -O Debug --dep lua -Mroot=/tmp/opencode/layout_probe.zig --dep util -Mlua=src/lua/root.zig -Mutil=src/util/root.zig -lc -femit-bin=/tmp/opencode/p49r_layout_dbg"
-    ],
-    "zig_binary_sha256": "da3d6316dfd6d3205dc90dee8039afd7de8fb0259992bfae43379481f4a3ce0a",
-    "note": "P16.49-review: probe binaries REBUILT from clean measured-source commit 7af60bed \u2014 fresh copies, hashes above, single regeneration timestamp; no relabeling, no nested timestamps."
+ "created_utc": "2026-09-15T16:26:29.868758+00:00",
+ "provenance": {
+  "git_head": "bab3341a5dfc67bce480f6144035dfd76398dbb5",
+  "measured_source_head": "bab3341a5dfc67bce480f6144035dfd76398dbb5",
+  "source_dirty": "clean",
+  "zig_version": "0.16.0",
+  "probe_rf_path": "/tmp/opencode/p50_layout_rf",
+  "probe_debug_path": "/tmp/opencode/p50_layout_dbg",
+  "probe_rf_sha256_16": "4009e6633b1078b3",
+  "probe_debug_sha256_16": "67723dc5231c1383",
+  "probe_build_commands": [
+   "zig build-exe -O ReleaseFast --dep lua -Mroot=/tmp/opencode/layout_probe.zig --dep util -Mlua=src/lua/root.zig -Mutil=src/util/root.zig -lc -femit-bin=/tmp/opencode/p50_layout_rf",
+   "zig build-exe -O Debug --dep lua -Mroot=/tmp/opencode/layout_probe.zig --dep util -Mlua=src/lua/root.zig -Mutil=src/util/root.zig -lc -femit-bin=/tmp/opencode/p50_layout_dbg"
+  ],
+  "zig_binary_sha256": "259e43d5b7d0e430e5ca3c3db81560dcc7c6bf611c15108a988f1c5eb3807c1e",
+  "note": "P16.50: probe binaries REBUILT from clean measured-source commit bab3341 (transactional GC registration) \u2014 fresh copies, hashes above, single regeneration timestamp; no relabeling, no nested timestamps."
+ },
+ "layout": {
+  "ReleaseFast": {
+   "Vm": 5408,
+   "Thread": 3736,
+   "CallFrame": 88,
+   "LuaFrameState": 48,
+   "CFrameState": 56,
+   "YieldedValues": 96,
+   "InlineValues": 88,
+   "CallFrame_align": 8,
+   "CallFrame_u_offset": 32
   },
-  "layout": {
-    "ReleaseFast": {
-      "Vm": 5408,
-      "Thread": 3736,
-      "CallFrame": 88,
-      "LuaFrameState": 48,
-      "CFrameState": 56,
-      "YieldedValues": 96,
-      "InlineValues": 88,
-      "CallFrame_align": 8,
-      "CallFrame_u_offset": 32
-    },
-    "Debug": {
-      "Vm": 5512,
-      "Thread": 3736,
-      "CallFrame": 88,
-      "LuaFrameState": 48,
-      "CFrameState": 56,
-      "YieldedValues": 96,
-      "InlineValues": 88,
-      "CallFrame_align": 8,
-      "CallFrame_u_offset": 32
-    }
-  },
-  "invariants": "CallFrame == 88 B / align 8 / u@32 asserted in both modes; identical Debug/RF (extern structs)",
-  "note_vm_debug": "Vm Debug=5512 vs RF=5408: Debug-only safety padding in Vm struct (internals), not a layout divergence of the tracked frame types."
+  "Debug": {
+   "Vm": 5512,
+   "Thread": 3736,
+   "CallFrame": 88,
+   "LuaFrameState": 48,
+   "CFrameState": 56,
+   "YieldedValues": 96,
+   "InlineValues": 88,
+   "CallFrame_align": 8,
+   "CallFrame_u_offset": 32
+  }
+ }
 }

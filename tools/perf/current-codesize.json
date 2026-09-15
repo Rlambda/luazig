@@ -1,18 +1,18 @@
 {
-  "created_utc": "2026-09-14T19:15:16.269810+00:00",
-  "provenance": {
-    "git_head": "7af60bed0450c57895bc6663a99a6a6d5bae262e",
-    "measured_source_head": "7af60bed0450c57895bc6663a99a6a6d5bae262e",
-    "source_dirty": "clean",
-    "zig_binary_sha256": "da3d6316dfd6d3205dc90dee8039afd7de8fb0259992bfae43379481f4a3ce0a",
-    "note": "P16.49-review regeneration from clean measured-source commit 7af60bed; artifact wrapper D follows."
-  },
-  "text_bytes": 2590425,
-  "symbols": {
-    "runBytecodeDispatch": 68678,
-    "callBuiltin": 8537,
-    "pushBuiltinCFrame": 742,
-    "popBuiltinCFrame": 305,
-    "builtinCoroutineResume": 16656
-  }
+ "created_utc": "2026-09-15T16:26:29.863675+00:00",
+ "provenance": {
+  "git_head": "bab3341a5dfc67bce480f6144035dfd76398dbb5",
+  "measured_source_head": "bab3341a5dfc67bce480f6144035dfd76398dbb5",
+  "source_dirty": "clean",
+  "zig_binary_sha256": "259e43d5b7d0e430e5ca3c3db81560dcc7c6bf611c15108a988f1c5eb3807c1e",
+  "note": "P16.50 regeneration from clean measured-source commit bab3341 (transactional GC registration); wrapper D follows."
+ },
+ "text_bytes": 2599609,
+ "symbols": {
+  "runBytecodeDispatch": 70924,
+  "callBuiltin": 8537,
+  "pushBuiltinCFrame": 742,
+  "popBuiltinCFrame": 305,
+  "builtinCoroutineResume": 16656
+ }
 }

@@ -1,4 +1,4 @@
-> Last updated: 2026-09-14 (P16.49-review)
+> Last updated: 2026-09-15 (P16.50)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -36,14 +36,14 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **84/84** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.44x** |
+| Performance (geomean vs PUC) | **1.39x** |
 
-Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.39x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [ ] **P16.50 (owner-instructed)**: транзакционная регистрация GC-объектов + единый current-* provenance — (a) полный inventory всех allocate→init→publish→register→account→expose цепочек с fallible edges; единый ownership-контракт: fallible capacity preparation отделена от infallible registry commit (PUC luaC_newobj — infallible link в intrusive allgc), bulk reserve для multi-object constructors; opClosure полный errdefer (cells, open Cells, Closure, tree retain, восстановление bytecode_boxed); allocTable/allocTableNoGc/allocUserdata/thread constructors/internStr (insert ДО register — рассинхрон canonical table и GC registry)/registerfuncs catch{}-проглатывание — все gcRegister* callers; инварианты: никакой публикации до гарантированной регистрации/rollback, никакого destroy пока в registry, accounting симметрично ровно на commit, никаких catch{}→продолжения (обновить все сигнатуры call sites, исходная ошибка сохраняется), young-list порядок сохраняется, hot opClosure без заметного steady-state regression; (b) FailingAllocator/DebugAllocator матрицы для каждой constructor family и каждого fail index вкл. оба registry-growth edges: byte-exact восстановление gc_objects/young/string_intern/bytecode_boxed/stack/table state, counters/debt/tree refs, реальный gcMinorCollection после каждого failure, repeated failures + success edge; throwaway negative validation для каждого исправленного класса; (c) Task 0: после ВСЕХ source-изменений пересобрать RF и перегенерировать КАЖДЫЙ canonical current-* на одном чистом final measured-source + immutable binary (сейчас набор расщеплён: gate/baseline на 66cd438, остальные на 7af60be); (d) perf A/B immutable binaries, closure-heavy/dynamic-load/allocation-heavy workloads, ровно одна объявленная финальная сессия; baseline — только явное owner-approved.
+- [x] **P16.50 (owner-instructed)**: транзакционная регистрация GC-объектов + единый current-* provenance — (a) полный inventory всех allocate→init→publish→register→account→expose цепочек с fallible edges; единый ownership-контракт: fallible capacity preparation отделена от infallible registry commit (PUC luaC_newobj — infallible link в intrusive allgc), bulk reserve для multi-object constructors; opClosure полный errdefer (cells, open Cells, Closure, tree retain, восстановление bytecode_boxed); allocTable/allocTableNoGc/allocUserdata/thread constructors/internStr (insert ДО register — рассинхрон canonical table и GC registry)/registerfuncs catch{}-проглатывание — все gcRegister* callers; инварианты: никакой публикации до гарантированной регистрации/rollback, никакого destroy пока в registry, accounting симметрично ровно на commit, никаких catch{}→продолжения (обновить все сигнатуры call sites, исходная ошибка сохраняется), young-list порядок сохраняется, hot opClosure без заметного steady-state regression; (b) FailingAllocator/DebugAllocator матрицы для каждой constructor family и каждого fail index вкл. оба registry-growth edges: byte-exact восстановление gc_objects/young/string_intern/bytecode_boxed/stack/table state, counters/debt/tree refs, реальный gcMinorCollection после каждого failure, repeated failures + success edge; throwaway negative validation для каждого исправленного класса; (c) Task 0: после ВСЕХ source-изменений пересобрать RF и перегенерировать КАЖДЫЙ canonical current-* на одном чистом final measured-source + immutable binary (сейчас набор расщеплён: gate/baseline на 66cd438, остальные на 7af60be); (d) perf A/B immutable binaries, closure-heavy/dynamic-load/allocation-heavy workloads, ровно одна объявленная финальная сессия; baseline — только явное owner-approved.
 
 
 - [x] **P16.49-review-2 (owner-instructed)**: OLD0 accounting regression + OOM coverage — (a) Task 1: вернуть EXACTLY-ONCE gc_gen_added_old_kb charge при .old0→.old1 в sweep (PUC sweepgen addedold: lgc.c:1172-1212 инкрементит для КАЖДОГО becoming-G_OLD1 — и survival→old1, и old0→old1; барьеры charge НЕ делают — мой P16.49-review removal был ошибочен), сохранив устранение duplicate gc_old1.append (барьер уже linked), исправить ложный комментарий/prose, проверить все .old0-setting пути на zero/double charge; focused unit test (old owner + young child → настоящий forward barrier → .old0 + ровно одно вхождение в gc_old1 → minor sweep → .old1 + charge ровно gcObjectBytes(child) → threshold edge против PUC-модели → следующий цикл без второго charge) + negative validation throwaway без OLD0 charge; (b) Task 3: generational-minor FailingAllocator sweep для closureFromProto (каждый fail index вкл. gcRegisterCell young-list growth; byte-exact gc_objects/young contents/order/accounting/funcs/tree-ref; реальный gcMinorCollection после каждого failure; success edge + repeated; negative copy со старым register-failure ownership ловится); stats accounting при register failure (alloc_by_type инкрементится ДО fallible ensureUnusedCapacity — перенести после успешной регистрации + тест); (c) sweep/OOM audit: фраза 'allocation-free' неточна — closeThreadOpenUpvalues→gcWriteBarrierCell catch {} в gen-minor делает аллоцирующие appends (gcQueueScanObject→gc_gray, gc_old1.append): доказать недостижимость во время young sweep ЛИБО PUC-faithful sweep-arm (lgc.c:246-260: во время sweep barrier делает makewhite(owner), без marking и без аллокаций) ЛИБО честно зафиксировать pre-existing blocker и не называть sweep allocation-free; (d) baseline: после фикса перезаписать на исправленном measured source (owner-approved), history ошибочной сессии в manifest не трогать.
@@ -7225,6 +7225,52 @@ Correction-фаза по owner-ledger item (открыт 76328a2; open-count 21�
   DIFF: PASS, api580, gc.lua, diff --check); smoke 84/84 реальным --testc;
   exact-contract crash loop 20/20 rc=0; binary hash неизменен после
   rebuild.
+
+### P16.50: транзакционная регистрация GC-объектов + единый provenance (2026-09-15)
+
+Фаза по owner-ledger item (открыт 4f0ce59; open-count 21→22→закрыт→21).
+Коммиты: C = bab3341 → D = wrapper (только артефакты).
+
+- **Контракт PUC luaC_newobj**: gcPrepareRegister(n) (fallible reserve
+  для gc_objects И gc_young_objects) + gcRegisterCommit(obj)
+  (infallible append + accounting) — после успешного prepare регистрация
+  не может провалиться; объект не может существовать незарегистрированным.
+  Steady-state: две capacity-сравнения (амортизированный no-op).
+- **Мигрированы все production-цепочки** (inventory: 24 caller-site):
+  таблицы (note-after-success), userdata (errdefer-chain), threads,
+  internStr short/long (устранён publish-before-register immortal leak),
+  external strings, opClosure (bulk prepare + полный errdefer с
+  восстановлением bytecode_boxed), chunk-closures, loadlib, applyLoadEnv,
+  pushcclosure (stack-мутация только после создания всех объектов),
+  registerfuncs (каскадная пропагация ошибок, per-closure массиви по PUC
+  luaF_newLclosure — закрыт pre-existing latent double-free общего
+  массива), lua_newthread (никаких проглатываний), internLiteral.
+- **Тесты**: 5 новых OOM-матриц (234/234, 0 leaks): opClosure-equivalent,
+  internStr (вкл. dead-old re-intern через incremental sweep window),
+  table/userdata (+ young-capacity-exhaustion), threads,
+  pushcclosure/registerfuncs (полный fail-индексный размах после фиксов).
+- **Найдено и исправлено 5 дефектов первой реализации** (errdefer
+  free-before-read UAF ×3, armed-after-commit dangling, success-path
+  leak) — все субагентскими тестами до коммита.
+- **Negative validation** (worktree-ревёрсы): allocTableNoGc → leak
+  CAUGHT; internStr → segfault в vm.deinit CAUGHT; pushcclosure pop-early
+  → panic CAUGHT; registerfuncs полный pre-P16.50 ревёрс → CAUGHT.
+  Документированные гэпы: swallow-ветки registerfuncs недостижимы в
+  конфигурации теста; opClosure-реплика вместо dispatch-драйва.
+- **Perf A/B**: per-seed instruction deltas vs P16.49-review-2 baseline —
+  все в пределах ±2.4% (string_loop −2.33% улучшение; runBytecodeDispatch
+  +2246B .text от транзакционного кода). Объявленная сессия (ровно одна,
+  binary 259e43d5…): RESULT: OK (rc=0). Baseline НЕ обновлён (owner
+  policy: только явное решение; гейт зелёный против 66cd438-baseline).
+- **Единый provenance**: ВСЕ canonical current-* перегенерированы на
+  bab3341 / 259e43d5… (differential-profile, codesize .text 2599609,
+  callframe-layout CallFrame 88/u@32 свежими пробами, dispatch-floor,
+  counters, profile-index, current, gate, matrix, smoke 85/85 — файл 85
+  появился в снапшоте как tests/smoke/85_selfref_upvalue_gc.lua).
+- **Батарея**: fmt 0; unit D/RF 0 (234/234, 0 leaks); selftests ALL OK;
+  noise + 7 негативных rc=0; smoke 84/84 plain + 84/84 реальным --testc;
+  matrix zig_fail=0/both_fail=1 (big.lua); c_api + DIFF: PASS; api580
+  GREEN; gc.lua outputs match; crash-loop 20/20; diff --check 0.
 
 ## История закрытых фаз
 

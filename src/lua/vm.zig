@@ -40144,7 +40144,20 @@ pub const Vm = struct {
 
         const sj = _setjmp(@ptrCast(&jb));
         if (sj == 0) {
-            return .{ .ok = @intCast(f(self.cur_handle.?)) };
+            // No longjmp: decode the raw C return. PUC C functions return
+            // a non-negative result count; NEGATIVE returns are the
+            // established shim protocol (testC continuations signal
+            // error/yield via plain returns because their inner machinery
+            // propagates Zig errors instead of longjmping): -1 = a Lua
+            // error occurred (the object is already in the VM error
+            // state, c_error_value is null), -2 = yield (values in
+            // th.yielded). The old i32 passthrough encoded these as
+            // plain negatives; the union maps them to the same outcomes
+            // without colliding with ThreadSwitch.
+            const raw = f(self.cur_handle.?);
+            if (raw >= 0) return .{ .ok = @intCast(raw) };
+            if (raw == -2) return .yield;
+            return .{ .lua_err = 2 }; // LUA_ERRRUN (testC error sentinel)
         }
         // `_longjmp` with value 2 = `lua_yieldk` yield (P15.78). The yield
         // values are already stored in `th.yielded` by `builtinCoroutineYield`
@@ -50986,4 +50999,1450 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
     p50TeardownString(&vm, s_sep);
     p50TeardownString(&vm, s_b);
     p50TeardownString(&vm, s_a);
+}
+
+// ===========================================================================
+// P16.50-review-3 (R1-R5): continuation error transport through finishCcall,
+// C-ABI throwing APIs under callCFunction OOM sweeps, the api_status
+// lifecycle, a ledger audit under an ACTIVE testc control with NO per-probe
+// counter resets, and the atpanic-hook subprocess probe.
+//
+// TESTS ONLY — no production changes. Two production defects are asserted
+// AS-IS with FINDING comments (repo precedent: the test stays green, the
+// defect is documented for a follow-up fix):
+//
+//   FINDING #1 (R1 Segment B, R3c): an OOM raised inside a yieldk
+//     continuation is masked to LUA_ERRRUN on every observable surface.
+//     Chain: finishCcall's .lua_err arm (vm.zig:12285) returns
+//     error.RuntimeError unconditionally — it never maps c_error_status 4
+//     (LUA_ERRMEM) to error.OutOfMemory — builtinCoroutineResume's
+//     error-tail defer (vm.zig:23024) then pins th.api_status to
+//     `if (err_is_errerr) 5 else 2` (never 4), and c_api.lua_resume's
+//     catch (c_api.zig:1969) returns 2. PUC returns LUA_ERRMEM (4) here.
+//     The error OBJECT is correct (the fixed MEMERRMSG string, PUC
+//     luaD_seterrorobj) — only the kind/status is masked.
+//
+//   FINDING #2 (R5 scenario B): cThrow (c_api.zig:1450) passes
+//     vm.cur_handle.? (the main L) to cThrowOn instead of the handle that
+//     threw, so the atpanic hook receives the WRONG lua_State when a
+//     non-current coroutine's API call throws without an active boundary.
+//     Call sites: lua_pushcclosure, lua_pushcfunction, luaL_setfuncs,
+//     luaL_newlib, lua_newthread. PUC luaD_throw always passes the
+//     throwing lua_State.
+//
+//   FINDING #3 (R2 probe): lua_createtable (c_api.zig:1691) swallows
+//     allocation errors (`s.newtable() catch {}`). PUC lua_createtable
+//     lets luaH_new's failure longjmp out as LUA_ERRMEM — the caller
+//     never observes a silently missing table. The probe asserts the
+//     swallow AS-IS: under a total-failure allocator the call SUCCEEDS
+//     with zero results and no table.
+//
+//   FINDING #4 (R1, absorbed by the test's tracker): tracebackFrameLabel
+//     (vm.zig:6821) allocates the intermediate C-frame name ("?" —
+//     tracebackFuncName's allocPrint, vm.zig:6805) and never frees it.
+//     Every erroring continuation resume that renders parked C frames
+//     leaks one byte per rendered frame (captureErrorTraceback inside
+//     finishCcall's .lua_err arm). R1 observes exactly three one-byte
+//     leaks across its two erroring continuations; the absorbing tracker
+//     asserts the shape AFTER state.deinit, then frees them so the test
+//     itself leaks nothing.
+//
+//   FINDING #5 (R3, absorbed by the test's tracker): builtinCoroutineResume's
+//     coroutine-completion early return (vm.zig:23373) fires BEFORE the
+//     payload-free defer (vm.zig:23753) is armed — the 1-Value completion
+//     payload (vm.zig:23356) leaks on every completing resume. R3 observes
+//     exactly one @sizeOf(Value) leak; the tracker absorbs it.
+//
+//   FINDING #6 (R2 sweeps, compensated in-test): callCFunction's
+//     normal-return path has an unprotected allocation window — the
+//     results dupe (vm.zig:40313) sits BETWEEN the C function's return
+//     and the manual C-frame pop (vm.zig:40357). Its `try` exits without
+//     popping the C-frame (the errdefer at vm.zig:40317 restores only the
+//     c_stack) and without installing any error object (the OOM never
+//     reaches cThrow — PUC's moveresults cannot fail, and every PUC OOM
+//     path sets the MEMERRMSG object via luaD_throw). Exactly one index
+//     per sweep (the results-dupe failure, the last failing index) shows
+//     the shape: frames0+1 with the error state untouched. The sweep
+//     pops the stale frame as documented-defect compensation so later
+//     cells stay deterministic; for lua_newthread the dupe index
+//     additionally gets the success-arm Thread/handle teardown (the
+//     call already succeeded inside when the dupe failed).
+// ===========================================================================
+
+/// One-shot failing allocator for R1 Segment B: the FIRST allocation after
+/// `armed` is set fails exactly once; everything before and after passes
+/// through. std.testing.FailingAllocator cannot express this shape: its
+/// failure window starts at a fixed request index, but the resume preamble
+/// (apiResumeThread's resume_args) allocates BEFORE the continuation k runs
+/// — arming must happen INSIDE k, at an unpredictable request index.
+const P50r3OneShot = struct {
+    inner: std.mem.Allocator,
+    armed: bool = false,
+    failed: bool = false,
+
+    fn allocator(self: *P50r3OneShot) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = allocFn,
+                .resize = resizeFn,
+                .remap = remapFn,
+                .free = freeFn,
+            },
+        };
+    }
+
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *P50r3OneShot = @ptrCast(@alignCast(ctx));
+        if (self.armed and !self.failed) {
+            self.failed = true;
+            return null;
+        }
+        return self.inner.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *P50r3OneShot = @ptrCast(@alignCast(ctx));
+        return self.inner.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *P50r3OneShot = @ptrCast(@alignCast(ctx));
+        return self.inner.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *P50r3OneShot = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+/// Absorbing tracker for R1/R3 (FINDING #4/#5): like P50TrackAlloc, but it
+/// records each live allocation's (len, alignment) and its deinit FREES the
+/// still-live entries. Used as the State's allocator: after state.deinit
+/// everything legitimately owned is freed through the tracker, so the
+/// remaining live set is EXACTLY the documented production leak — asserted
+/// as a precise shape, then absorbed (freed) so the test itself leaks
+/// nothing through std.testing.allocator.
+const P50r3AbsorbAlloc = struct {
+    base: std.mem.Allocator,
+    live: std.AutoHashMapUnmanaged(usize, LiveEntry) = .empty,
+
+    const LiveEntry = struct { len: usize, alignment: std.mem.Alignment };
+
+    fn allocator(self: *P50r3AbsorbAlloc) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = absorbAlloc,
+                .resize = absorbResize,
+                .remap = absorbRemap,
+                .free = absorbFree,
+            },
+        };
+    }
+
+    /// Absorb: free every still-live entry (the documented production
+    /// leaks), then the bookkeeping map itself.
+    fn deinit(self: *P50r3AbsorbAlloc) void {
+        var it = self.live.iterator();
+        while (it.next()) |e| {
+            const p: [*]u8 = @ptrFromInt(e.key_ptr.*);
+            self.base.rawFree(p[0..e.value_ptr.len], e.value_ptr.alignment, @returnAddress());
+        }
+        self.live.deinit(self.base);
+    }
+
+    fn absorbAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *P50r3AbsorbAlloc = @ptrCast(@alignCast(ctx));
+        const p = self.base.rawAlloc(len, alignment, ret_addr) orelse return null;
+        // Bookkeeping goes to the BASE allocator (not through the tracker),
+        // so map growth is never itself tracked.
+        self.live.put(self.base, @intFromPtr(p), .{ .len = len, .alignment = alignment }) catch {
+            self.base.rawFree(p[0..len], alignment, ret_addr);
+            return null;
+        };
+        return p;
+    }
+
+    fn absorbResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *P50r3AbsorbAlloc = @ptrCast(@alignCast(ctx));
+        if (!self.base.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        if (self.live.getPtr(@intFromPtr(memory.ptr))) |e| e.len = new_len;
+        return true;
+    }
+
+    fn absorbRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *P50r3AbsorbAlloc = @ptrCast(@alignCast(ctx));
+        const p = self.base.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        if (p != memory.ptr) {
+            _ = self.live.remove(@intFromPtr(memory.ptr));
+            self.live.put(self.base, @intFromPtr(p), .{ .len = new_len, .alignment = alignment }) catch {
+                self.base.rawFree(p[0..new_len], alignment, ret_addr);
+                return null;
+            };
+        } else if (self.live.getPtr(@intFromPtr(p))) |e| {
+            e.len = new_len;
+        }
+        return p;
+    }
+
+    fn absorbFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *P50r3AbsorbAlloc = @ptrCast(@alignCast(ctx));
+        _ = self.live.remove(@intFromPtr(memory.ptr));
+        self.base.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+// R1/R3 continuation-communication globals. k runs inside the VM's boundary
+// machinery (callContShim through callCFunctionWithBoundary) and cannot
+// capture test locals — the file scope is the only shared channel.
+var p50r3_k_choice: u8 = 0; // 0 = error k, 1 = OOM k, 2 = complete k
+var p50r3_k_status: c_int = -1; // the status argument k received
+var p50r3_k_ctx: isize = -1; // the ctx argument k received
+var p50r3_k_entered: bool = false; // k actually ran
+var p50r3_oneshot: ?*P50r3OneShot = null; // armed from inside the OOM k
+
+/// Coroutine body: yields immediately with 0 results, handing the chosen k
+/// (by p50r3_k_choice) and ctx 42 to the resume machinery — PUC's canonical
+/// yieldk continuation setup.
+fn p50r3BodyYieldk(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    const k: ?*const anyopaque = switch (p50r3_k_choice) {
+        0 => @ptrCast(&p50r3KError),
+        1 => @ptrCast(&p50r3KOom),
+        else => @ptrCast(&p50r3KComplete),
+    };
+    return c_api.lua_yieldk(L, 0, 42, k);
+}
+
+/// k #0: records its arguments, then raises a plain runtime error via
+/// lua_error with an Int object (allocation-free — Segment A must fail ONLY
+/// through the error transport, never through an incidental OOM).
+fn p50r3KError(L: ?*lua_State, status: c_int, ctx: isize) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    p50r3_k_entered = true;
+    p50r3_k_status = status;
+    p50r3_k_ctx = ctx;
+    _ = c_api.lua_pushinteger(L, 777);
+    return c_api.lua_error(L);
+}
+
+/// k #1: records its arguments, arms the one-shot allocator, then performs
+/// an API call whose first allocation fails — an OOM raised INSIDE the
+/// continuation, exactly on k's own first request.
+fn p50r3KOom(L: ?*lua_State, status: c_int, ctx: isize) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    p50r3_k_entered = true;
+    p50r3_k_status = status;
+    p50r3_k_ctx = ctx;
+    // Arm INSIDE k: the resume preamble allocated before k, so the single
+    // failure shot lands deterministically on k's own first allocation.
+    p50r3_oneshot.?.armed = true;
+    c_api.lua_pushcfunction(L, p50Cfunc); // throws LUA_ERRMEM through the boundary
+    return 0; // unreachable: the push never returns on the armed shot
+}
+
+/// k #2: records its arguments and completes the coroutine normally with
+/// one result (R3b/R3d: the success leg of the lifecycle).
+fn p50r3KComplete(L: ?*lua_State, status: c_int, ctx: isize) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    p50r3_k_entered = true;
+    p50r3_k_status = status;
+    p50r3_k_ctx = ctx;
+    _ = c_api.lua_pushinteger(L, 77);
+    return 1;
+}
+
+/// Coroutine body for R3c: raises a plain runtime error on the FIRST resume
+/// (no yield, no continuation — the direct C-body error leg).
+fn p50r3BodyError(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    _ = c_api.lua_pushinteger(L, 999);
+    return c_api.lua_error(L);
+}
+
+// ---- R2 callbacks: each drives ONE exported throwing API through the
+// callCFunction boundary (the fresh swapped c_stack is the callback's
+// working stack; its final contents come back as the call's results). ----
+
+fn p50r3CfPushcclosure(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    _ = c_api.lua_pushinteger(L, 42); // the upvalue
+    c_api.lua_pushcclosure(L, p50Cfunc, 1);
+    return 1;
+}
+
+fn p50r3CfPushcfunction(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    c_api.lua_pushcfunction(L, p50Cfunc);
+    return 1;
+}
+
+// R2's per-iteration entry names: a UNIQUE pair per call (a file-scope
+// sequence), formatted into static buffers — the intern copies the bytes,
+// so the buffer lifetime is sufficient. The names are deliberately NOT
+// pre-interned (unlike T3): the key intern itself is one of the spec's
+// swept failure points, and the residue teardown removes each iteration's
+// names from the intern table so every cell starts intern-clean.
+var p50r3_name_seq: usize = 0;
+var p50r3_name_buf_a: [32]u8 = undefined;
+var p50r3_name_buf_b: [32]u8 = undefined;
+
+fn p50r3NextName(buf: []u8, prefix: []const u8) [*:0]const u8 {
+    const s = std.fmt.bufPrint(buf, "{s}_{d}", .{ prefix, p50r3_name_seq }) catch unreachable;
+    buf[s.len] = 0;
+    return @ptrCast(buf);
+}
+
+fn p50r3CfSetfuncs(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    p50r3_name_seq += 1;
+    const reg = [_]c_api.luaL_Reg{
+        .{ .name = p50r3NextName(&p50r3_name_buf_a, "p50r3_g1"), .func = p50Cfunc },
+        .{ .name = p50r3NextName(&p50r3_name_buf_b, "p50r3_g2"), .func = p50Cfunc },
+        .{ .name = null, .func = null },
+    };
+    // The lib table is the call's single ARGUMENT (a fresh table per
+    // iteration, created by the sweep with the real allocator): the swept
+    // failure points are then exactly luaL_setfuncs' own — the per-entry
+    // object allocs, the non-preinterned key intern, and the publish
+    // rehash on the fresh table. (Creating the table inside the callback
+    // via lua_createtable would put the sweep on the FINDING #3 swallow
+    // path instead — see the dedicated probe at the end of R2.)
+    _ = c_api.lua_pushinteger(L, 42); // the shared upvalue value (nup=1)
+    c_api.luaL_setfuncs(L, &reg, 1);
+    return 1; // the lib table (setfuncs consumed the upvalue)
+}
+
+fn p50r3CfNewlib(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    p50r3_name_seq += 1;
+    const reg = [_]c_api.luaL_Reg{
+        .{ .name = p50r3NextName(&p50r3_name_buf_a, "p50r3_g1"), .func = p50Cfunc },
+        .{ .name = p50r3NextName(&p50r3_name_buf_b, "p50r3_g2"), .func = p50Cfunc },
+        .{ .name = null, .func = null },
+    };
+    c_api.luaL_newlib(L, &reg); // newtable + registerfuncs — table created INSIDE
+    return 1;
+}
+
+fn p50r3CfNewthread(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    // lua_newthread appends the thread value to the parent's c_stack —
+    // inside callCFunction that IS the swapped fresh stack, so the value
+    // returns as this call's single result. On OOM it throws LUA_ERRMEM
+    // through the boundary (PUC lua_newthread has no null-failure).
+    if (c_api.lua_newthread(L)) |_| {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+/// FINDING #3 probe body: lua_createtable under a total-failure allocator.
+/// PUC lua_createtable propagates luaH_new's failure as LUA_ERRMEM (the
+/// throw longjmps past the caller — the table never silently goes
+/// missing); luazig's export swallows it (`s.newtable() catch {}`,
+/// c_api.zig:1691). Returns 0 results so the empty results dupe (a no-op
+/// allocation) cannot mask the shape.
+fn p50r3CfCreatetable(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    c_api.lua_createtable(L, 0, 0); // OOM swallowed — no throw, no table
+    return 0;
+}
+
+// R4's external-string dealloc callback: counts calls (the LSTRMEM
+// ownership handoff must run EXACTLY once per lifetime event).
+var p50r3_falloc_calls: usize = 0;
+
+fn p50r3Falloc(ud: ?*anyopaque, ptr: ?*anyopaque, osize: usize, nsize: usize) callconv(.c) ?*anyopaque {
+    _ = ud;
+    _ = ptr;
+    _ = osize;
+    _ = nsize;
+    p50r3_falloc_calls += 1;
+    return null;
+}
+
+const P50r3SweepResult = struct { first_success: usize, census: P50r3ResidueCensus };
+
+/// Residue census by GC type: everything registered ABOVE a snapshot's
+/// gc_objects prefix (the call window's registrations). `n_other` must be
+/// zero in every R2 sweep — only closures, cells, interned strings, and
+/// (for setfuncs/newlib) the lib table are created there.
+const P50r3ResidueCensus = struct {
+    n_closure: usize = 0,
+    n_cell: usize = 0,
+    n_string: usize = 0,
+    n_table: usize = 0,
+    n_other: usize = 0,
+};
+
+fn p50r3CensusResidue(vm: *Vm, above: usize) P50r3ResidueCensus {
+    var c: P50r3ResidueCensus = .{};
+    for (vm.gc_objects.items[above..]) |o| switch (o) {
+        .closure => c.n_closure += 1,
+        .cell => c.n_cell += 1,
+        .string => c.n_string += 1,
+        .table => c.n_table += 1,
+        else => c.n_other += 1,
+    };
+    return c;
+}
+
+/// Tear down everything registered above the snapshot prefix (the whole
+/// tail region), tail-first: every removal is a TAIL swapRemove, so the
+/// prefix order — what assertRestored pins — is untouched. registerfuncs
+/// documents published-entries-survive-failure as by-design residue; the
+/// SUCCESS run's graph is torn down the same way so nothing stays young —
+/// later segments' gcMinorCollection calls must stay no-ops for the
+/// young-list pin to hold.
+fn p50r3TeardownResidue(vm: *Vm, above: usize) void {
+    while (vm.gc_objects.items.len > above) {
+        const obj = vm.gc_objects.items[vm.gc_objects.items.len - 1];
+        switch (obj) {
+            .closure => p50TeardownClosure(vm, obj.closure),
+            .cell => p50TeardownCell(vm, obj.cell),
+            .string => p50TeardownString(vm, obj.string),
+            .table => p50TeardownTable(vm, obj.table, true),
+            else => unreachable, // guarded by the census n_other == 0 assert
+        }
+    }
+}
+
+/// One R2 sweep segment: runs `cf` under FailingAllocator(fail_index) for
+/// every index in 0..bound. Every failing index must satisfy the full B3
+/// failure contract — error.OutOfMemory with the exact MEMERRMSG object,
+/// the C-frame structurally unwound, no stale api_status — and after the
+/// residue teardown the state is byte-exact before AND after a minor
+/// collection. The first SUCCESS index is returned together with its
+/// residue census (the published graph's shape, recorded before the
+/// identical teardown). `fresh_table_arg` creates a fresh lib table per
+/// cell (real allocator, registered above the snapshot prefix — the
+/// residue teardown owns it) and passes it as the call's single argument.
+fn p50r3Sweep(
+    vm: *Vm,
+    th: *Thread,
+    frames0: usize,
+    cf: *const fn (?*lua_State) callconv(.c) c_int,
+    bound: usize,
+    fresh_table_arg: bool,
+) !P50r3SweepResult {
+    const testing = std.testing;
+    var fail_idx: usize = 0;
+    var tested_failures: usize = 0;
+    var first_success: ?usize = null;
+    var success_census: P50r3ResidueCensus = .{};
+    while (fail_idx <= bound) : (fail_idx += 1) {
+        const snap = try P50Snapshot.take(vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+
+        // Per-cell fixture: a fresh lib table for the setfuncs sweep,
+        // created above the snapshot prefix (the residue teardown owns it).
+        var table_arg: [1]Value = .{.Nil};
+        if (fresh_table_arg) table_arg[0] = .{ .Table = try vm.allocTableNoGc() };
+        const args: []const Value = if (fresh_table_arg) table_arg[0..1] else &.{};
+
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        // The pre-call error-object state: the FINDING #6 dupe failure
+        // below must leave it UNTOUCHED (no cThrow runs on that path).
+        const err_has_obj0 = vm.errThread().err_has_obj;
+        const saved = vm.alloc;
+        vm.alloc = failing.allocator();
+        const r = vm.callCFunction(cf, args);
+        vm.alloc = saved;
+
+        const census = p50r3CensusResidue(vm, snap.gc_objects.len);
+        try testing.expectEqual(@as(usize, 0), census.n_other);
+
+        if (r) |result| {
+            first_success = fail_idx;
+            success_census = census;
+            try testing.expectEqual(@as(usize, 1), result.len);
+            vm.alloc.free(result);
+            // The C-frame is unwound and the running state carries no
+            // stale error status (the B3 BLOCKER 1/4 contract on success).
+            try testing.expectEqual(frames0, th.call_frames.len());
+            try testing.expectEqual(@as(c_int, 0), th.api_status);
+            p50r3TeardownResidue(vm, snap.gc_objects.len);
+            try snap.assertRestored(vm);
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            tested_failures += 1;
+            if (th.call_frames.len() == frames0 + 1) {
+                // FINDING #6 (asserted AS-IS, then compensated): this is
+                // the sweep's LAST failing index — the C function already
+                // returned normally, and the failing allocation is the
+                // results dupe (vm.zig:40313), which sits BETWEEN the
+                // return and the manual C-frame pop (vm.zig:40357). Its
+                // `try` exits WITHOUT popping the C-frame and WITHOUT
+                // installing any error object (the OOM never reaches
+                // cThrow; PUC's moveresults cannot fail, and every PUC
+                // OOM path sets the MEMERRMSG object via luaD_throw).
+                // Assert the untouched error state, then compensate the
+                // documented defect: pop the stale frame so the residue
+                // teardown and later cells stay deterministic.
+                try testing.expectEqual(err_has_obj0, vm.errThread().err_has_obj);
+                try testing.expectEqual(@as(c_int, 0), th.api_status);
+                vm.popBuiltinCFrame();
+            } else {
+                // BLOCKER 1: the C-frame is popped — no manual repair.
+                try testing.expectEqual(frames0, th.call_frames.len());
+                // BLOCKER 4: no stale error status on the running thread.
+                try testing.expectEqual(@as(c_int, 0), th.api_status);
+                // The error object is the fixed MEMERRMSG (PUC
+                // luaD_seterrorobj for LUA_ERRMEM) — pointer identity.
+                const eter = vm.errThread();
+                try testing.expect(eter.err_has_obj);
+                try testing.expectEqual(vm.oom_msg_str.?, eter.err_obj.String);
+            }
+            try testing.expectEqual(frames0, th.call_frames.len());
+            // The by-design residue (registerfuncs: published entries
+            // survive a failure) is torn down by registry diff; the state
+            // is then byte-exact, before and after a minor collection.
+            p50r3TeardownResidue(vm, snap.gc_objects.len);
+            try snap.assertRestored(vm);
+            try testing.expect(gcCheckSecondaryRegistryInvariants(vm));
+            try vm.gcMinorCollection();
+            try snap.assertRestored(vm);
+        }
+    }
+    try testing.expect(tested_failures > 0);
+    try testing.expect(first_success != null);
+    return .{ .first_success = first_success.?, .census = success_census };
+}
+
+/// Parse a lowercase-hex address from s[start..] up to the first non-hex
+/// byte (R5's subprocess prints pointers with std.debug.print("{x}", ...)).
+fn p50r3ParseHex(s: []const u8, start: usize) ?usize {
+    var end = start;
+    while (end < s.len) : (end += 1) {
+        const c = s[end];
+        const is_hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
+        if (!is_hex) break;
+    }
+    if (end == start) return null;
+    return std.fmt.parseInt(usize, s[start..end], 16) catch null;
+}
+
+test "P16.50-review-3 R1: k continuation error transport through finishCcall" {
+    const testing = std.testing;
+    const api = @import("api.zig");
+    const c_api = @import("c_api.zig");
+
+    // FINDING #4 (asserted AS-IS, then absorbed): the erroring continuation
+    // resumes below render parked C frames through captureErrorTraceback
+    // (finishCcall's .lua_err arm), and tracebackFrameLabel (vm.zig:6821)
+    // never frees the intermediate C-frame name ("?" — one byte). The
+    // absorbing tracker is the State's allocator: after the ordered
+    // teardown everything legitimately owned is freed THROUGH it, so its
+    // live set is exactly the leak — asserted as a precise shape, then
+    // freed so this test leaks nothing itself.
+    var absorb = P50r3AbsorbAlloc{ .base = testing.allocator };
+    var state = api.State.init(.{ .allocator = absorb.allocator() });
+    const vm = state.vm;
+    const L = vm.main_handle.?;
+    const main_th = vm.main_thread.?;
+    const frames0 = main_th.call_frames.len();
+
+    var roots = vm.gcTempRoots();
+
+    // ---- Segment A: k raises a plain runtime error via lua_error. The
+    // ERRRUN kind must survive the whole transport: lua_resume returns 2,
+    // the window is PUC's duplicated pair [err, err] (luaD_seterrorobj),
+    // the coroutine dies, its status latches LUA_ERRRUN, and the main
+    // thread's frames are untouched. ----
+    {
+        p50r3_k_choice = 0;
+        p50r3_k_status = -1;
+        p50r3_k_ctx = -1;
+        p50r3_k_entered = false;
+
+        const main_len0 = L.c_stack.items.len;
+        const L2 = c_api.lua_newthread(L).?;
+        const th2 = L2.thread.?;
+        c_api.lua_pushcfunction(L2, p50r3BodyYieldk);
+
+        var nres: c_int = -1;
+        const st1 = c_api.lua_resume(L2, L, 0, &nres);
+        try testing.expectEqual(@as(c_int, 1), st1); // LUA_YIELD
+        try testing.expectEqual(@as(c_int, 0), nres);
+        try testing.expectEqual(@as(c_int, 1), c_api.lua_status(L2)); // LUA_YIELD
+        try testing.expect(th2.status == .suspended);
+
+        const st2 = c_api.lua_resume(L2, L, 0, &nres);
+        try testing.expect(p50r3_k_entered);
+        // PUC ldo.c:853: k receives APIstatus(LUA_YIELD) == 1 and the ctx.
+        try testing.expectEqual(@as(c_int, 1), p50r3_k_status);
+        try testing.expectEqual(@as(isize, 42), p50r3_k_ctx);
+        // LUA_ERRRUN (2), PUC parity. Negative check on the OLD bug this
+        // transport replaced: the pre-BoundaryResult encoding signaled a
+        // continuation's status with -1 and could not distinguish a plain
+        // runtime error from a thread-switch request — a Runtime cThrow
+        // from inside k was misclassified as ThreadSwitch (the coroutine
+        // machinery then tried to switch instead of propagating the
+        // error). The .lua_err BoundaryResult arm carries k's lua_error
+        // out as error.RuntimeError — NOT error.ThreadSwitch — which is
+        // what makes the LUA_ERRRUN below observable at all.
+        try testing.expectEqual(@as(c_int, 2), st2); // LUA_ERRRUN (PUC parity)
+        try testing.expectEqual(@as(c_int, 2), nres);
+        // PUC error window: the duplicated error object [err, err].
+        try testing.expectEqual(@as(usize, 2), L2.c_stack.items.len);
+        try testing.expect(std.meta.eql(L2.c_stack.items[0], .{ .Int = 777 }));
+        try testing.expect(std.meta.eql(L2.c_stack.items[1], .{ .Int = 777 }));
+        try testing.expectEqual(@as(c_int, 2), c_api.lua_status(L2)); // LUA_ERRRUN
+        try testing.expect(th2.status == .dead);
+        try testing.expectEqual(frames0, main_th.call_frames.len());
+
+        // Re-resume of the dead coroutine: PUC resume_error — the pushed
+        // args are popped, the message is APPENDED to the window, *nres is
+        // left UNTOUCHED (resume_error returns before the assignment).
+        const st3 = c_api.lua_resume(L2, L, 0, &nres);
+        try testing.expectEqual(@as(c_int, 2), st3);
+        try testing.expectEqual(@as(c_int, 2), nres); // untouched by st3
+        try testing.expectEqual(@as(usize, 3), L2.c_stack.items.len);
+        try testing.expectEqualStrings(
+            "cannot resume dead coroutine",
+            L2.c_stack.items[2].String.bytes(),
+        );
+
+        // Teardown (T2 idiom): the dead coroutine keeps its C-frame (k's
+        // error left it in place — PUC-faithful); freeThreadBytecodeFrames
+        // frees its parked stack. luaNewThreadTx does not charge
+        // testc_obj_threads — hence `false`.
+        L.c_stack.shrinkRetainingCapacity(main_len0);
+        vm.c_api_thread = null;
+        p50TeardownThread(vm, th2, false);
+        vm.freeStateHandle(L2);
+        try testing.expectEqual(frames0, main_th.call_frames.len());
+    }
+
+    // ---- Segment B: k raises LUA_ERRMEM (an OOM inside the continuation).
+    // The error OBJECT must be the fixed MEMERRMSG string — asserted with
+    // pointer identity. FINDING #1 (asserted AS-IS): the ERRMEM KIND is
+    // masked to LUA_ERRRUN on every observable surface (see the header
+    // comment); PUC returns LUA_ERRMEM (4) here. ----
+    {
+        p50r3_k_choice = 1;
+        p50r3_k_status = -1;
+        p50r3_k_ctx = -1;
+        p50r3_k_entered = false;
+        var one_shot = P50r3OneShot{ .inner = absorb.allocator() };
+        p50r3_oneshot = &one_shot;
+        defer p50r3_oneshot = null;
+
+        const main_len0 = L.c_stack.items.len;
+        const L2 = c_api.lua_newthread(L).?;
+        const th2 = L2.thread.?;
+        c_api.lua_pushcfunction(L2, p50r3BodyYieldk);
+
+        var nres: c_int = -1;
+        _ = c_api.lua_resume(L2, L, 0, &nres); // yields — real allocator
+        try testing.expectEqual(@as(c_int, 1), c_api.lua_status(L2));
+
+        // The one-shot allocator covers ONLY the second resume (the one
+        // that runs k); arming happens inside k, after the preamble.
+        const saved_alloc = vm.alloc;
+        vm.alloc = one_shot.allocator();
+        const st2 = c_api.lua_resume(L2, L, 0, &nres);
+        vm.alloc = saved_alloc;
+
+        try testing.expect(p50r3_k_entered);
+        try testing.expect(one_shot.failed); // the armed shot fired inside k
+        try testing.expectEqual(@as(c_int, 1), p50r3_k_status);
+        try testing.expectEqual(@as(isize, 42), p50r3_k_ctx);
+        // FINDING #1 (AS-IS): PUC returns 4 (LUA_ERRMEM); luazig masks the
+        // kind to 2 (LUA_ERRRUN) through finishCcall's unconditional
+        // error.RuntimeError (vm.zig:12285).
+        try testing.expectEqual(@as(c_int, 2), st2);
+        try testing.expectEqual(@as(c_int, 2), c_api.lua_status(L2));
+        try testing.expectEqual(@as(c_int, 2), nres);
+        // The error object IS the fixed MEMERRMSG (PUC luaD_seterrorobj
+        // for LUA_ERRMEM) — duplicated into PUC's [err, err] window.
+        try testing.expectEqual(@as(usize, 2), L2.c_stack.items.len);
+        try testing.expectEqual(vm.oom_msg_str.?, L2.c_stack.items[0].String);
+        try testing.expectEqual(vm.oom_msg_str.?, L2.c_stack.items[1].String);
+        try testing.expect(th2.status == .dead);
+        try testing.expectEqual(frames0, main_th.call_frames.len());
+
+        // The OOM left no stale boundary: the state is genuinely usable
+        // (a conventional round-trip on the main thread succeeds).
+        try testing.expect(state.loadbuffer("return 7", "=p50r3b") == .ok);
+        try testing.expect(state.pcall(0, 1) == .ok);
+        try testing.expect(std.meta.eql(
+            state.stack.items[state.stack.items.len - 1],
+            .{ .Int = 7 },
+        ));
+        try testing.expectEqual(@as(c_int, 0), c_api.lua_status(L));
+
+        // Teardown (T2 idiom).
+        L.c_stack.shrinkRetainingCapacity(main_len0);
+        vm.c_api_thread = null;
+        p50TeardownThread(vm, th2, false);
+        vm.freeStateHandle(L2);
+        try testing.expectEqual(frames0, main_th.call_frames.len());
+    }
+
+    // Ordered teardown (explicit, no defers — the leak assertions must run
+    // AFTER state.deinit): temp roots first (they reference vm-owned
+    // objects), then the state. Everything legitimately owned is freed
+    // through the tracker; what remains in `live` is exactly FINDING #4.
+    roots.end();
+    state.deinit();
+
+    // FINDING #4 (asserted AS-IS): exactly three one-byte leaks —
+    // tracebackFrameLabel's unfreed "?" intermediates, one per rendered
+    // parked C frame across this test's two erroring continuations.
+    try testing.expectEqual(@as(usize, 3), absorb.live.count());
+    var leak_it = absorb.live.iterator();
+    while (leak_it.next()) |e| {
+        try testing.expectEqual(@as(usize, 1), e.value_ptr.len);
+    }
+    // Absorb: free the leaked bytes so the test itself leaks nothing.
+    absorb.deinit();
+}
+
+test "P16.50-review-3 R2: exported throwing APIs under callCFunction OOM sweeps" {
+    const testing = std.testing;
+    const api = @import("api.zig");
+
+    var state = api.State.init(.{ .allocator = testing.allocator });
+    defer state.deinit();
+    const vm = state.vm;
+    const th = vm.main_thread.?;
+    const frames0 = th.call_frames.len();
+
+    // Prime both registries (T2 idiom) so gcPrepareRegister is a capacity
+    // no-op and every failure index maps 1:1 onto a construction step. The
+    // fresh swapped c_stack starts empty with zero capacity on every
+    // callCFunction invocation, so the per-API request maps are
+    // deterministic and the first-success indices are pinnable.
+    try vm.gcEnterGenerational();
+    try vm.gc_objects.ensureUnusedCapacity(testing.allocator, 32);
+    try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 32);
+
+    // The setfuncs/newlib entry names are NOT pre-interned (unlike T3):
+    // every iteration interns a UNIQUE pair, so the key intern itself is a
+    // swept failure point, and the residue teardown returns the state to
+    // the snapshot after every cell.
+
+    // ---- lua_pushcclosure(n=1): #0 the fresh-stack growth (pushinteger),
+    // #1 the upvalue array, #2 the Cell, #3 the Closure, #4 the results
+    // dupe — first success at 5. ----
+    {
+        const sr = try p50r3Sweep(vm, th, frames0, p50r3CfPushcclosure, 8, false);
+        try testing.expectEqual(@as(usize, 5), sr.first_success);
+        try testing.expectEqual(@as(usize, 1), sr.census.n_closure);
+        try testing.expectEqual(@as(usize, 1), sr.census.n_cell);
+        try testing.expectEqual(@as(usize, 0), sr.census.n_string);
+        try testing.expectEqual(@as(usize, 0), sr.census.n_table);
+    }
+
+    // ---- lua_pushcfunction: #0 the fresh-stack growth, #1 the Closure,
+    // #2 the results dupe — first success at 3. ----
+    {
+        const sr = try p50r3Sweep(vm, th, frames0, p50r3CfPushcfunction, 6, false);
+        try testing.expectEqual(@as(usize, 3), sr.first_success);
+        try testing.expectEqual(@as(usize, 1), sr.census.n_closure);
+        try testing.expectEqual(@as(usize, 0), sr.census.n_cell);
+        try testing.expectEqual(@as(usize, 0), sr.census.n_string);
+        try testing.expectEqual(@as(usize, 0), sr.census.n_table);
+    }
+
+    // ---- luaL_setfuncs(nup=1, 2 entries, lib table via the call arg):
+    // #0 the arg append growth, #1 the upvalue push growth, then per entry
+    // — the non-preinterned key intern, the upvalue array, the Cell, the
+    // Closure — plus ONE publish growth for the fresh table (the first
+    // entry's hash-part growth; the second entry fits inside it), then
+    // the results dupe — 12 allocations, first success at 12. ----
+    {
+        const sr = try p50r3Sweep(vm, th, frames0, p50r3CfSetfuncs, 16, true);
+        try testing.expectEqual(@as(usize, 12), sr.first_success);
+        try testing.expectEqual(@as(usize, 2), sr.census.n_closure);
+        try testing.expectEqual(@as(usize, 2), sr.census.n_cell);
+        try testing.expectEqual(@as(usize, 2), sr.census.n_string);
+        try testing.expectEqual(@as(usize, 1), sr.census.n_table); // the arg fixture
+    }
+
+    // ---- luaL_newlib (nup=0, 2 entries): #0 the lib Table, #1 the stack
+    // growth, then per entry — the key intern, the Closure, the publish
+    // rehash — then the results dupe. ----
+    {
+        const sr = try p50r3Sweep(vm, th, frames0, p50r3CfNewlib, 12, false);
+        try testing.expectEqual(@as(usize, 9), sr.first_success);
+        try testing.expectEqual(@as(usize, 2), sr.census.n_closure);
+        try testing.expectEqual(@as(usize, 0), sr.census.n_cell);
+        try testing.expectEqual(@as(usize, 2), sr.census.n_string);
+        try testing.expectEqual(@as(usize, 1), sr.census.n_table); // created inside newlib
+    }
+
+    // ---- lua_newthread: full T2-style teardown on the success arm — the
+    // thread is published VM-globally (c_api_thread + api_handle), not just
+    // registered. Measured map: #0 the Thread, #1 the Lx handle, #2 the
+    // fresh-stack append growth, #3 the results dupe — first success at 4. ----
+    {
+        var fail_idx: usize = 0;
+        var tested_failures: usize = 0;
+        var first_success: ?usize = null;
+        while (fail_idx <= 6) : (fail_idx += 1) {
+            var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+                .fail_index = fail_idx,
+                .resize_fail_index = fail_idx,
+            });
+            const snap = try P50Snapshot.take(vm, testing.allocator);
+            defer snap.deinit(testing.allocator);
+
+            // The pre-call error-object state (the FINDING #6 dupe
+            // failure below must leave it untouched).
+            const err_has_obj0 = vm.errThread().err_has_obj;
+            const saved = vm.alloc;
+            vm.alloc = failing.allocator();
+            const r = vm.callCFunction(p50r3CfNewthread, &.{});
+            vm.alloc = saved;
+
+            if (r) |result| {
+                first_success = fail_idx;
+                try testing.expectEqual(@as(usize, 1), result.len);
+                try testing.expect(result[0] == .Thread);
+                const th2 = result[0].Thread;
+                try testing.expect(th2 != vm.main_thread.?);
+                try testing.expect(p50IsRegistered(vm, .{ .thread = th2 }));
+                try testing.expect(vm.c_api_thread.? == th2);
+                vm.alloc.free(result);
+                // Teardown (T2 idiom): the fresh stack was auto-restored by
+                // callCFunction's normal return, so only the c_api slot, the
+                // Thread, and its handle remain to undo.
+                vm.c_api_thread = null;
+                p50TeardownThread(vm, th2, false);
+                vm.freeStateHandle(th2.api_handle.?);
+                try testing.expectEqual(frames0, th.call_frames.len());
+                try testing.expectEqual(@as(c_int, 0), th.api_status);
+                try snap.assertRestored(vm);
+                try vm.gcMinorCollection();
+                try snap.assertRestored(vm);
+                break;
+            } else |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                tested_failures += 1;
+                if (th.call_frames.len() == frames0 + 1) {
+                    // FINDING #6 (asserted AS-IS, then compensated): the
+                    // LAST failing index — the results dupe (vm.zig:40313)
+                    // failed AFTER lua_newthread itself succeeded: the
+                    // Thread and its handle are registered and c_api_thread
+                    // is published, but the C-frame is not popped and no
+                    // error object is installed (the OOM never reaches
+                    // cThrow). Compensate the documented defect with the
+                    // success-arm teardown plus the stale-frame pop.
+                    const th2 = vm.c_api_thread.?;
+                    try testing.expectEqual(err_has_obj0, vm.errThread().err_has_obj);
+                    vm.c_api_thread = null;
+                    p50TeardownThread(vm, th2, false);
+                    vm.freeStateHandle(th2.api_handle.?);
+                    vm.popBuiltinCFrame();
+                } else {
+                    try testing.expectEqual(frames0, th.call_frames.len());
+                    try testing.expectEqual(@as(c_int, 0), th.api_status);
+                    try testing.expect(vm.c_api_thread == null); // restored by the wrapper's catch
+                    const eter = vm.errThread();
+                    try testing.expect(eter.err_has_obj);
+                    try testing.expectEqual(vm.oom_msg_str.?, eter.err_obj.String);
+                }
+                try testing.expectEqual(frames0, th.call_frames.len());
+                try testing.expectEqual(@as(c_int, 0), th.api_status);
+                try snap.assertRestored(vm);
+                try testing.expect(gcCheckSecondaryRegistryInvariants(vm));
+                try vm.gcMinorCollection();
+                try snap.assertRestored(vm);
+            }
+        }
+        try testing.expect(tested_failures > 0);
+        try testing.expect(first_success != null);
+        try testing.expectEqual(@as(usize, 4), first_success.?);
+    }
+
+    // ---- FINDING #3 probe: lua_createtable swallows OOM (c_api.zig:1691
+    // `s.newtable() catch {}`). PUC throws LUA_ERRMEM from luaH_new's
+    // failure; here the call SUCCEEDS with zero results and no table —
+    // asserted AS-IS. ----
+    {
+        const snap = try P50Snapshot.take(vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        const saved = vm.alloc;
+        vm.alloc = failing.allocator();
+        const r = vm.callCFunction(p50r3CfCreatetable, &.{});
+        vm.alloc = saved;
+
+        const result = try r; // succeeds — the swallow (PUC: LUA_ERRMEM)
+        try testing.expectEqual(@as(usize, 0), result.len);
+        try testing.expectEqual(frames0, th.call_frames.len());
+        try testing.expectEqual(@as(c_int, 0), th.api_status);
+        // Nothing registered, nothing charged, no error state change.
+        try snap.assertRestored(vm);
+    }
+}
+
+test "P16.50-review-3 R3: api_status lifecycle through lua_status" {
+    const testing = std.testing;
+    const api = @import("api.zig");
+    const c_api = @import("c_api.zig");
+
+    // FINDING #5 (asserted AS-IS, then absorbed): the (b) completion leg
+    // below ends through builtinCoroutineResume's completion early return
+    // (vm.zig:23373), which fires BEFORE the payload-free defer
+    // (vm.zig:23753) is armed — the 1-Value completion payload leaks. The
+    // absorbing tracker is the State's allocator; after the ordered
+    // teardown its live set is exactly that leak.
+    var absorb = P50r3AbsorbAlloc{ .base = testing.allocator };
+    var state = api.State.init(.{ .allocator = absorb.allocator() });
+    const vm = state.vm;
+    const L = vm.main_handle.?;
+    const main_th = vm.main_thread.?;
+    const frames0 = main_th.call_frames.len();
+
+    var roots = vm.gcTempRoots();
+
+    // (a) A fresh coroutine: PUC lua_newthread leaves L->status == LUA_OK
+    // (the thread is suspended internally, but no error/yield status is
+    // latched yet).
+    {
+        const main_len0 = L.c_stack.items.len;
+        const L2 = c_api.lua_newthread(L).?;
+        const th2 = L2.thread.?;
+        try testing.expectEqual(@as(c_int, 0), c_api.lua_status(L2));
+        try testing.expect(th2.status == .suspended);
+        L.c_stack.shrinkRetainingCapacity(main_len0);
+        vm.c_api_thread = null;
+        p50TeardownThread(vm, th2, false);
+        vm.freeStateHandle(L2);
+    }
+
+    // (b)+(d) yield → complete: LUA_YIELD after the yield, LUA_OK after the
+    // completion (PUC resets the status on a successful resume).
+    {
+        p50r3_k_choice = 2;
+        p50r3_k_status = -1;
+        p50r3_k_ctx = -1;
+        p50r3_k_entered = false;
+        const main_len0 = L.c_stack.items.len;
+        const L2 = c_api.lua_newthread(L).?;
+        const th2 = L2.thread.?;
+        c_api.lua_pushcfunction(L2, p50r3BodyYieldk);
+
+        var nres: c_int = -1;
+        try testing.expectEqual(@as(c_int, 1), c_api.lua_resume(L2, L, 0, &nres));
+        try testing.expectEqual(@as(c_int, 1), c_api.lua_status(L2)); // LUA_YIELD
+
+        try testing.expectEqual(@as(c_int, 0), c_api.lua_resume(L2, L, 0, &nres));
+        try testing.expect(p50r3_k_entered);
+        try testing.expectEqual(@as(c_int, 1), p50r3_k_status); // LUA_YIELD handed to k
+        try testing.expectEqual(@as(isize, 42), p50r3_k_ctx);
+        try testing.expectEqual(@as(c_int, 0), c_api.lua_status(L2)); // LUA_OK
+        try testing.expectEqual(@as(c_int, 1), nres);
+        try testing.expectEqual(@as(usize, 1), L2.c_stack.items.len);
+        try testing.expect(std.meta.eql(L2.c_stack.items[0], .{ .Int = 77 }));
+        try testing.expect(th2.status == .dead);
+
+        L.c_stack.shrinkRetainingCapacity(main_len0);
+        vm.c_api_thread = null;
+        p50TeardownThread(vm, th2, false);
+        vm.freeStateHandle(L2);
+    }
+
+    // (c) error: the error status stays latched on the dead coroutine (PUC:
+    // L->status = LUA_ERRRUN survives until a reset/close).
+    {
+        const main_len0 = L.c_stack.items.len;
+        const L2 = c_api.lua_newthread(L).?;
+        const th2 = L2.thread.?;
+        c_api.lua_pushcfunction(L2, p50r3BodyError);
+        var nres: c_int = -1;
+        try testing.expectEqual(@as(c_int, 2), c_api.lua_resume(L2, L, 0, &nres));
+        try testing.expectEqual(@as(c_int, 2), c_api.lua_status(L2)); // LUA_ERRRUN
+        try testing.expectEqual(@as(c_int, 2), nres);
+        // PUC error window: the duplicated error object [err, err].
+        try testing.expectEqual(@as(usize, 2), L2.c_stack.items.len);
+        try testing.expect(std.meta.eql(L2.c_stack.items[0], .{ .Int = 999 }));
+        try testing.expect(std.meta.eql(L2.c_stack.items[1], .{ .Int = 999 }));
+        try testing.expect(th2.status == .dead);
+        // Still latched on a later query.
+        try testing.expectEqual(@as(c_int, 2), c_api.lua_status(L2));
+
+        L.c_stack.shrinkRetainingCapacity(main_len0);
+        vm.c_api_thread = null;
+        p50TeardownThread(vm, th2, false);
+        vm.freeStateHandle(L2);
+    }
+
+    // (d2) The main state's status stays LUA_OK across a conventional
+    // round-trip (PUC: lua_pcall leaves L->status == LUA_OK on success;
+    // luazig's lua_status pins LUA_OK for the main handle).
+    try testing.expect(state.loadbuffer("return 7", "=p50r3d") == .ok);
+    try testing.expect(state.pcall(0, 1) == .ok);
+    try testing.expect(std.meta.eql(
+        state.stack.items[state.stack.items.len - 1],
+        .{ .Int = 7 },
+    ));
+    try testing.expectEqual(@as(c_int, 0), c_api.lua_status(L));
+    try testing.expectEqual(frames0, main_th.call_frames.len());
+
+    // Ordered teardown (explicit, no defers — the leak assertion must run
+    // AFTER state.deinit): temp roots first, then the state.
+    roots.end();
+    state.deinit();
+
+    // FINDING #5 (asserted AS-IS): exactly one leaked allocation — the
+    // 1-Value completion payload from the (b) leg's early return
+    // (vm.zig:23373) before the payload-free defer (vm.zig:23753) is armed.
+    try testing.expectEqual(@as(usize, 1), absorb.live.count());
+    var leak_it = absorb.live.iterator();
+    while (leak_it.next()) |e| {
+        try testing.expectEqual(@sizeOf(Value), e.value_ptr.len);
+    }
+    // Absorb: free the leaked payload so the test itself leaks nothing.
+    absorb.deinit();
+}
+
+test "P16.50-review-3 R4: ledger audit under an ACTIVE testc control (no per-probe resets)" {
+    const testing = std.testing;
+    const api = @import("api.zig");
+
+    var state = api.State.init(.{ .allocator = testing.allocator });
+    defer state.deinit();
+    const vm = state.vm;
+
+    try vm.gcEnterGenerational();
+    try vm.gc_objects.ensureUnusedCapacity(testing.allocator, 32);
+    try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 32);
+
+    const ctrl = vm.testcEnsureControl();
+    defer ctrl.alloc_count = -1;
+    defer ctrl.mem_limit = null;
+
+    // The running-ledger baseline, captured ONCE. Every probe asserts exact
+    // deltas against the CURRENT value and nets back to it — unlike B4,
+    // whose per-iteration total_bytes resets make cross-site ledger
+    // arithmetic meaningless. This is the lifecycle view: charge on create,
+    // credit on teardown, net exactly zero, with the ledger never reset.
+    const tb0: usize = ctrl.total_bytes;
+
+    // ---- (1) Ledger-active proof: a KEPT C closure (pushcclosure, n=1)
+    // charges Cell + Closure + upvalue-slot (makeCclosure's two gcNoteAlloc
+    // notes) and credits all of it back on teardown. ----
+    {
+        try state.pushinteger(42);
+        try state.pushcclosure(p50Cfunc, 1);
+        try testing.expect(state.stack.items[state.stack.items.len - 1] == .Closure);
+        const cl = state.stack.items[state.stack.items.len - 1].Closure;
+        const charge = @sizeOf(Cell) + @sizeOf(Closure) + @sizeOf(*Cell);
+        try testing.expectEqual(tb0 + charge, ctrl.total_bytes);
+        // Teardown mirrors the creation charges exactly (the stack growth
+        // itself is not a GC-object charge — only the objects are).
+        state.stack.items.len -= 1; // pop the closure value
+        p50TeardownCell(vm, cl.upvalues[0]);
+        p50TeardownClosure(vm, cl);
+        try testing.expectEqual(tb0, ctrl.total_bytes);
+    }
+
+    // ---- (2) internStr: short miss / short hit / long ×2 / short-miss
+    // OOM (with a post-failure retry proving no stale intern entry). ----
+    {
+        // Short miss: the charge is exactly allocatedSize (24 + len + 1).
+        const s_short = try vm.internStr("p50r3_short");
+        try testing.expectEqual(tb0 + s_short.allocatedSize(), ctrl.total_bytes);
+        // Short hit: the SAME pointer, zero charge.
+        const s_hit = try vm.internStr("p50r3_short");
+        try testing.expect(s_hit == s_short);
+        try testing.expectEqual(tb0 + s_short.allocatedSize(), ctrl.total_bytes);
+        // Long (never interned): a FRESH allocation per call — distinct
+        // pointers, each charged its own allocatedSize (32 + len + 1).
+        const long_content = "p50r3_long_string_content_longer_than_forty_characters_pad";
+        try testing.expect(long_content.len > lua_string_max_short_len);
+        const s_l1 = try vm.internStr(long_content);
+        const s_l2 = try vm.internStr(long_content);
+        try testing.expect(s_l1 != s_l2);
+        try testing.expectEqual(
+            tb0 + s_short.allocatedSize() + s_l1.allocatedSize() + s_l2.allocatedSize(),
+            ctrl.total_bytes,
+        );
+        // Teardown credits every charge back (hit-teardown skipped: the
+        // interned original stays, as before the probe).
+        p50TeardownString(vm, s_l2);
+        p50TeardownString(vm, s_l1);
+        p50TeardownString(vm, s_short);
+        try testing.expectEqual(tb0, ctrl.total_bytes);
+
+        // Short-miss OOM: no charge, nothing registered.
+        const reg_len0 = vm.gc_objects.items.len;
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        const saved = vm.alloc;
+        vm.alloc = failing.allocator();
+        const r = vm.internStr("p50r3_oom");
+        vm.alloc = saved;
+        try testing.expectEqual(error.OutOfMemory, r);
+        try testing.expectEqual(tb0, ctrl.total_bytes);
+        try testing.expectEqual(reg_len0, vm.gc_objects.items.len);
+        // The failed intern left no stale entry: the retry succeeds and
+        // nets back to the baseline on teardown.
+        const s_retry = try vm.internStr("p50r3_oom");
+        try testing.expectEqual(tb0 + s_retry.allocatedSize(), ctrl.total_bytes);
+        p50TeardownString(vm, s_retry);
+        try testing.expectEqual(tb0, ctrl.total_bytes);
+    }
+
+    // ---- (3) createExternalLuaString: LSTRFIX / LSTRMEM / header-alloc
+    // OOM with and without the ownership-return callback. ----
+    {
+        var ext_buf: [64]u8 = undefined;
+        const ext_content = "p50r3_external_string_content_0123456789_abcdef";
+        @memcpy(ext_buf[0..ext_content.len], ext_content);
+        const content_ptr: [*]const u8 = &ext_buf;
+
+        // LSTRFIX (falloc == null): only the 32-byte truncated header is
+        // GC-owned; the charge is exactly that header.
+        const fix = try vm.createExternalLuaString(content_ptr, ext_content.len, null, null);
+        try testing.expectEqual(@as(usize, 32), fix.allocatedSize());
+        try testing.expectEqual(tb0 + fix.allocatedSize(), ctrl.total_bytes);
+        p50TeardownString(vm, fix);
+        try testing.expectEqual(tb0, ctrl.total_bytes);
+
+        // LSTRMEM (falloc != null): the full 48-byte header; the dealloc
+        // callback runs EXACTLY once at teardown (the ownership handoff).
+        const calls0 = p50r3_falloc_calls;
+        const mem = try vm.createExternalLuaString(content_ptr, ext_content.len, p50r3Falloc, null);
+        try testing.expectEqual(@as(usize, 48), mem.allocatedSize());
+        try testing.expectEqual(tb0 + mem.allocatedSize(), ctrl.total_bytes);
+        p50TeardownString(vm, mem);
+        try testing.expectEqual(tb0, ctrl.total_bytes);
+        try testing.expectEqual(calls0 + 1, p50r3_falloc_calls);
+
+        // Header-alloc OOM WITH falloc (PUC lstring.c:327-330): Lua already
+        // owns the external content, so it must give it back — falloc runs
+        // EXACTLY once — and nothing is charged or registered.
+        const reg_len0 = vm.gc_objects.items.len;
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        const saved = vm.alloc;
+        vm.alloc = failing.allocator();
+        const calls1 = p50r3_falloc_calls;
+        const r = vm.createExternalLuaString(content_ptr, ext_content.len, p50r3Falloc, null);
+        vm.alloc = saved;
+        try testing.expectEqual(error.OutOfMemory, r);
+        try testing.expectEqual(calls1 + 1, p50r3_falloc_calls);
+        try testing.expectEqual(tb0, ctrl.total_bytes);
+        try testing.expectEqual(reg_len0, vm.gc_objects.items.len);
+
+        // Header-alloc OOM WITHOUT falloc: no callback, same no-charge
+        // shape (the caller keeps the content — nothing to hand back).
+        var failing2 = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        vm.alloc = failing2.allocator();
+        const r2 = vm.createExternalLuaString(content_ptr, ext_content.len, null, null);
+        vm.alloc = saved;
+        try testing.expectEqual(error.OutOfMemory, r2);
+        try testing.expectEqual(tb0, ctrl.total_bytes);
+        try testing.expectEqual(reg_len0, vm.gc_objects.items.len);
+    }
+
+    // ---- (4) Bytecode-closure constructors at nups=0/1/3/20 (no resets;
+    // B4(c)/(d) additionally swept nups=3 with per-iteration resets): the
+    // charge formula is nups-independent (the constructors have no
+    // heap-worklist branch — unlike opClosure's nups>16 codegen path),
+    // failure charges nothing, success charges the exact object bytes,
+    // teardown nets exactly zero. ----
+    inline for (.{ 0, 1, 3, 20 }) |nups| {
+        const charge = nups * @sizeOf(Cell) + @sizeOf(Closure) + nups * @sizeOf(*Cell);
+
+        // closureFromProto (B4(d) map order: the Closure comes FIRST).
+        {
+            const proto = try p44BuildProto(vm.alloc, vm, nups, 4);
+            defer proto.tree.?.releaseTree(vm.alloc); // the finish-time reference
+            var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+                .fail_index = 0,
+                .resize_fail_index = 0,
+            });
+            const saved = vm.alloc;
+            vm.alloc = failing.allocator();
+            const r = vm.closureFromProto(proto);
+            vm.alloc = saved;
+            try testing.expectEqual(error.OutOfMemory, r);
+            try testing.expectEqual(tb0, ctrl.total_bytes);
+
+            const cl = try vm.closureFromProto(proto);
+            try testing.expectEqual(tb0 + charge, ctrl.total_bytes);
+            // The p44/B4 teardown mirror.
+            _ = vm.gcUnregisterObjectRollback(.{ .closure = cl });
+            vm.testc_obj_functions -= 1;
+            vm.gcNoteFree(@sizeOf(Closure) + cl.upvalues.len * @sizeOf(*Cell));
+            for (cl.upvalues) |c| {
+                _ = vm.gcUnregisterObjectRollback(.{ .cell = c });
+                vm.gcNoteFree(@sizeOf(Cell));
+                vm.alloc.destroy(c);
+            }
+            proto.tree.?.releaseTree(vm.alloc); // the constructor's reference
+            vm.alloc.free(cl.upvalues);
+            vm.alloc.destroy(cl);
+            try testing.expectEqual(tb0, ctrl.total_bytes);
+        }
+
+        // createBytecodeChunkClosure (B4(c) map order: the cells array
+        // comes first; for nups=0 the zero-length array alloc is a no-op).
+        {
+            const proto = try p44BuildProto(vm.alloc, vm, nups, 4);
+            defer proto.tree.?.releaseTree(vm.alloc);
+            var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+                .fail_index = 0,
+                .resize_fail_index = 0,
+            });
+            const saved = vm.alloc;
+            vm.alloc = failing.allocator();
+            const r = vm.createBytecodeChunkClosure(proto);
+            vm.alloc = saved;
+            try testing.expectEqual(error.OutOfMemory, r);
+            try testing.expectEqual(tb0, ctrl.total_bytes);
+
+            const cl = try vm.createBytecodeChunkClosure(proto);
+            try testing.expect(proto.tree.?.flags.constants_resolved); // adopted
+            try testing.expectEqual(tb0 + charge, ctrl.total_bytes);
+            _ = vm.gcUnregisterObjectRollback(.{ .closure = cl });
+            vm.testc_obj_functions -= 1;
+            vm.gcNoteFree(@sizeOf(Closure) + cl.upvalues.len * @sizeOf(*Cell));
+            for (cl.upvalues) |c| {
+                _ = vm.gcUnregisterObjectRollback(.{ .cell = c });
+                vm.gcNoteFree(@sizeOf(Cell));
+                vm.alloc.destroy(c);
+            }
+            proto.tree.?.releaseTree(vm.alloc); // the constructor's reference
+            vm.alloc.free(cl.upvalues);
+            vm.alloc.destroy(cl);
+            try testing.expectEqual(tb0, ctrl.total_bytes);
+        }
+    }
+
+    // The whole lifecycle nets exactly back to the baseline — the ledger
+    // was never reset, so this is a true cross-site zero.
+    try testing.expectEqual(tb0, ctrl.total_bytes);
+}
+
+/// The R5 subprocess program, embedded as source. Built with the SAME
+/// module graph as `zig build test` (util + lua) and executed for scenarios
+/// A (throw from the main L) and B (throw from a non-current coroutine L2).
+/// Validated against the live tree before embedding: the identical program
+/// was built and run manually (both scenarios, SIGABRT, stderr output).
+const p50r3_panic_main_src =
+    \\// P16.50-review-3 R5 subprocess: atpanic hook on an unprotected OOM throw.
+    \\// Scenario comes from argv[1] ("A" or "B"); all diagnostics go to stderr.
+    \\const std = @import("std");
+    \\const lua = @import("lua");
+    \\
+    \\/// One-shot failing allocator: the FIRST allocation after `armed` is set
+    \\/// fails exactly once, everything else (before and after) passes through.
+    \\const OneShot = struct {
+    \\    inner: std.mem.Allocator,
+    \\    armed: bool = false,
+    \\    failed: bool = false,
+    \\
+    \\    fn allocator(self: *OneShot) std.mem.Allocator {
+    \\        return .{
+    \\            .ptr = self,
+    \\            .vtable = &.{
+    \\                .alloc = allocFn,
+    \\                .resize = resizeFn,
+    \\                .remap = remapFn,
+    \\                .free = freeFn,
+    \\            },
+    \\        };
+    \\    }
+    \\
+    \\    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+    \\        const self: *OneShot = @ptrCast(@alignCast(ctx));
+    \\        if (self.armed and !self.failed) {
+    \\            self.failed = true;
+    \\            return null;
+    \\        }
+    \\        return self.inner.rawAlloc(len, alignment, ret_addr);
+    \\    }
+    \\
+    \\    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+    \\        const self: *OneShot = @ptrCast(@alignCast(ctx));
+    \\        return self.inner.rawResize(memory, alignment, new_len, ret_addr);
+    \\    }
+    \\
+    \\    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+    \\        const self: *OneShot = @ptrCast(@alignCast(ctx));
+    \\        return self.inner.rawRemap(memory, alignment, new_len, ret_addr);
+    \\    }
+    \\
+    \\    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+    \\        const self: *OneShot = @ptrCast(@alignCast(ctx));
+    \\        self.inner.rawFree(memory, alignment, ret_addr);
+    \\    }
+    \\};
+    \\
+    \\fn dummyCfunc(L: ?*lua.c_api.lua_State) callconv(.c) c_int {
+    \\    _ = L;
+    \\    return 0;
+    \\}
+    \\
+    \\fn panicHook(L: ?*lua.c_api.lua_State) callconv(.c) c_int {
+    \\    var len: usize = 0;
+    \\    const msg = lua.c_api.lua_tolstring(L, -1, &len);
+    \\    std.debug.print("PANIC-SEEN L={x} msg={s}\n", .{ @intFromPtr(L), if (msg) |m| m[0..len] else "(null)" });
+    \\    return 0;
+    \\}
+    \\
+    \\pub fn main(init: std.process.Init) u8 {
+    \\    // argv[0] = program name, argv[1] = scenario ("A" default).
+    \\    const argv = init.minimal.args.vector;
+    \\    const scenario: []const u8 = if (argv.len > 1) std.mem.span(argv[1]) else "A";
+    \\
+    \\    var one_shot = OneShot{ .inner = std.heap.c_allocator };
+    \\    var state = lua.api.State.init(.{ .allocator = one_shot.allocator() });
+    \\    defer state.deinit();
+    \\    const vm = state.vm;
+    \\    const L = vm.main_handle.?;
+    \\    const c = lua.c_api;
+    \\
+    \\    _ = c.lua_atpanic(L, panicHook);
+    \\
+    \\    if (std.mem.eql(u8, scenario, "B")) {
+    \\        // Non-current coroutine handle: L2 exists, cur_handle stays main L.
+    \\        const L2 = c.lua_newthread(L);
+    \\        std.debug.print("EXPECT-L2 {x}\n", .{@intFromPtr(L2)});
+    \\        _ = c.lua_pushinteger(L2, 7);
+    \\        one_shot.armed = true;
+    \\        c.lua_pushcclosure(L2, dummyCfunc, 1);
+    \\    } else {
+    \\        std.debug.print("MAIN-L {x}\n", .{@intFromPtr(L)});
+    \\        _ = c.lua_pushinteger(L, 7);
+    \\        one_shot.armed = true;
+    \\        c.lua_pushcclosure(L, dummyCfunc, 1);
+    \\    }
+    \\    // Unreachable on both paths: the OOM either longjmps to a boundary
+    \\    // (none is active) or runs the panic hook and aborts.
+    \\    std.debug.print("NO-PANIC (unexpected)\n", .{});
+    \\    return 0;
+    \\}
+    \\
+;
+
+test "P16.50-review-3 R5: atpanic hook on an unprotected OOM (subprocess)" {
+    const testing = std.testing;
+
+    // std.testing exposes no shared Io in 0.16 — build our own threaded one
+    // (the cwd-probe-verified pattern for io-using tests). The child zig
+    // NEEDS a real environment (HOME / XDG_CACHE_HOME / PATH) to resolve
+    // its cache directories: Io.Threaded.init defaults `environ` to .empty
+    // and processSpawnPosix builds the child env from exactly that — an
+    // empty env makes `zig build-exe` fail with AppDataDirUnavailable.
+    // Pass the parent's libc environ (the start.zig pattern).
+    const c_environ = std.c.environ;
+    var env_count: usize = 0;
+    while (c_environ[env_count] != null) : (env_count += 1) {}
+    var io_threaded = std.Io.Threaded.init(testing.allocator, .{
+        .environ = .{ .block = .{ .slice = c_environ[0..env_count :null] } },
+    });
+    defer io_threaded.deinit();
+    const io = io_threaded.io();
+
+    const src_path = "/tmp/opencode/p50r3_panic_main.zig";
+    const bin_path = "/tmp/opencode/p50r3_panic_bin";
+
+    // Write the subprocess source (the test binary's CWD is the build root,
+    // so the absolute /tmp path and the relative module paths both resolve).
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = src_path, .data = p50r3_panic_main_src });
+
+    // Build against the SAME module graph as `zig build test` (util + lua,
+    // libc linked). The optimize flag matches the current test mode so the
+    // lua module compile is shared with this test binary's cache entry.
+    const opt_flag = if (@import("builtin").mode == .ReleaseFast) "-OReleaseFast" else "-ODebug";
+    const build_result = try std.process.run(testing.allocator, io, .{
+        .argv = &.{
+            "/usr/bin/zig",             "build-exe",
+            "--dep",                    "lua",
+            "-Mroot=" ++ src_path,      "--dep",
+            "util",                     "-Mlua=src/lua/root.zig",
+            "-Mutil=src/util/root.zig", "-lc",
+            opt_flag,                   "-femit-bin=" ++ bin_path,
+        },
+    });
+    defer testing.allocator.free(build_result.stdout);
+    defer testing.allocator.free(build_result.stderr);
+    if (build_result.term != .exited or build_result.term.exited != 0) {
+        std.debug.print("p50r3 R5 build failed:\n{s}\n{s}\n", .{
+            build_result.stdout,
+            build_result.stderr,
+        });
+        return error.TestUnexpectedResult;
+    }
+
+    // Both scenarios share the binary; each must abort with SIGABRT (the
+    // panic path after the hook returns — PUC LUAI_THROW with no boundary).
+    for ([_][]const u8{ "A", "B" }) |scenario| {
+        const run = try std.process.run(testing.allocator, io, .{
+            .argv = &.{ bin_path, scenario },
+        });
+        defer testing.allocator.free(run.stdout);
+        defer testing.allocator.free(run.stderr);
+
+        if (run.term != .signal or run.term.signal != .ABRT) {
+            std.debug.print("p50r3 R5 scenario {s}: expected SIGABRT, got {any}\n{s}\n", .{
+                scenario, run.term, run.stderr,
+            });
+            return error.TestUnexpectedResult;
+        }
+        // All diagnostics go to stderr (std.debug.print). The hook ran
+        // (never the unexpected NO-PANIC fallthrough), it received the OOM
+        // message object, and the abort came from the unprotected-boundary
+        // panic, not some other crash.
+        try testing.expect(std.mem.indexOf(u8, run.stderr, "NO-PANIC") == null);
+        const panic_at = std.mem.indexOf(u8, run.stderr, "PANIC-SEEN L=") orelse {
+            std.debug.print("p50r3 R5 scenario {s}: no PANIC-SEEN in stderr:\n{s}\n", .{
+                scenario, run.stderr,
+            });
+            return error.TestUnexpectedResult;
+        };
+        try testing.expect(std.mem.indexOf(u8, run.stderr, "msg=not enough memory") != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            run.stderr,
+            "without an active C-function boundary",
+        ) != null);
+
+        // Parse the hook's L and the expectation line, then compare.
+        const hook_l = p50r3ParseHex(run.stderr, panic_at + "PANIC-SEEN L=".len) orelse
+            return error.TestUnexpectedResult;
+        const expect_marker: []const u8 = if (std.mem.eql(u8, scenario, "A")) "MAIN-L " else "EXPECT-L2 ";
+        const expect_at = std.mem.indexOf(u8, run.stderr, expect_marker) orelse
+            return error.TestUnexpectedResult;
+        const expect_l = p50r3ParseHex(run.stderr, expect_at + expect_marker.len) orelse
+            return error.TestUnexpectedResult;
+
+        if (std.mem.eql(u8, scenario, "A")) {
+            // CORRECT (PUC parity): the throw came from the main L, and the
+            // hook receives exactly that state.
+            try testing.expectEqual(expect_l, hook_l);
+        } else {
+            // FINDING #2 (asserted AS-IS): the hook receives the MAIN L,
+            // not the throwing coroutine L2 — cThrow (c_api.zig:1450) passes
+            // vm.cur_handle.? (main) instead of the throwing handle. PUC
+            // luaD_throw always passes the throwing lua_State.
+            try testing.expect(expect_l != hook_l);
+        }
+    }
 }

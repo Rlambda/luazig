@@ -195,7 +195,7 @@ pub export fn lua_newthread(L: ?*lua_State) ?*lua_State {
     const saved_c_api_thread = vm.c_api_thread;
     const result = luaNewThreadTx(parent, vm) catch |err| {
         vm.c_api_thread = saved_c_api_thread;
-        cThrow(vm, err);
+        cThrowOn(vm, parent, err);
     };
     return result;
 }
@@ -1446,9 +1446,10 @@ fn cThrowOn(vm: *Vm, throwing: *vm_mod.lua_State, err: api.ApiError) noreturn {
     }
 }
 
-fn cThrow(vm: *Vm, err: api.ApiError) noreturn {
-    cThrowOn(vm, vm.cur_handle.?, err);
-}
+// P16.50-review-4 BLOCKER 2: the implicit-current helper is DELETED — it
+// substituted vm.cur_handle for the throwing export's L, so an
+// unprotected OOM on a non-current coroutine ran atpanic with the main
+// state. Every throwing export passes its OWN L to cThrowOn.
 
 /// PUC `g->panic(L)` + abort (ldo.c:141-146): the unprotected-throw
 /// fallback. The hook runs EXACTLY once; a return falls through to the
@@ -1474,12 +1475,12 @@ fn cPanic(vm: *Vm) noreturn {
 
 pub export fn lua_pushcclosure(L: ?*lua_State, f: ?*const fn (?*lua_State) callconv(.c) c_int, n: c_int) void {
     var s = api.State.fromHandle(L orelse return);
-    s.pushcclosure(f, @intCast(@max(n, 0))) catch |e| cThrow(s.vm, e);
+    s.pushcclosure(f, @intCast(@max(n, 0))) catch |e| cThrowOn(s.vm, L.?, e);
 }
 
 pub export fn lua_pushcfunction(L: ?*lua_State, f: ?*const fn (?*lua_State) callconv(.c) c_int) void {
     var s = api.State.fromHandle(L orelse return);
-    s.pushcfunction(f) catch |e| cThrow(s.vm, e);
+    s.pushcfunction(f) catch |e| cThrowOn(s.vm, L.?, e);
 }
 
 pub export fn lua_pushexternalstring(
@@ -1687,10 +1688,13 @@ pub export fn lua_version(L: ?*lua_State) f64 {
 // --- Table / globals ---
 
 pub export fn lua_createtable(L: ?*lua_State, narr: c_int, nrec: c_int) void {
+    // P16.50-review-4 BLOCKER 3: PUC lua_createtable THROWS LUA_ERRMEM on
+    // allocation failure (lapi.c — luaC_newobj → luaM_error); the old
+    // `catch {}` silently succeeded with no table on the stack.
     _ = narr;
     _ = nrec;
     var s = api.State.fromHandle(L orelse return);
-    s.newtable() catch {};
+    s.newtable() catch |e| cThrowOn(s.vm, L.?, e);
 }
 
 pub export fn lua_setglobal(L: ?*lua_State, name: [*:0]const u8) void {
@@ -2352,12 +2356,12 @@ pub export fn luaL_checklstring(L: ?*lua_State, arg: c_int, l: ?*usize) [*:0]con
 
 pub export fn luaL_setfuncs(L: ?*lua_State, reg: [*]const luaL_Reg, nup: c_int) void {
     var s = api.State.fromHandle(L orelse return);
-    s.registerfuncs(reg, @intCast(@max(nup, 0))) catch |e| cThrow(s.vm, e);
+    s.registerfuncs(reg, @intCast(@max(nup, 0))) catch |e| cThrowOn(s.vm, L.?, e);
 }
 
 pub export fn luaL_newlib(L: ?*lua_State, reg: [*]const luaL_Reg) void {
     var s = api.State.fromHandle(L orelse return);
-    s.newlib(reg) catch |e| cThrow(s.vm, e);
+    s.newlib(reg) catch |e| cThrowOn(s.vm, L.?, e);
 }
 
 pub export fn luaL_ref(L: ?*lua_State, t: c_int) c_int {

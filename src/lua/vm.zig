@@ -6817,8 +6817,14 @@ pub const Vm = struct {
     /// + pushfuncname. C frames render "[C]: in ..." (funcinfo: source
     /// "=[C]" -> chunkid -> "[C]"; currentline -1 -> no line).
     fn tracebackFrameLabel(self: *Vm, th: *Thread, frame_idx: usize) DispatchError![]const u8 {
+        // P16.50-review-4 BLOCKER 4: the func_name intermediate returned by
+        // tracebackFuncName is an allocation — it was leaked on every call
+        // (the "?" C-frame name leaked 1 byte per rendered parked frame;
+        // found by the R1 continuation test). One owner: freed on EVERY
+        // exit after the label is built.
         const fr = th.call_frames.getConstPtr(frame_idx);
         const func_name = try self.tracebackFuncName(th, frame_idx);
+        defer self.alloc.free(func_name);
         if (fr.isC()) {
             return try std.fmt.allocPrint(self.alloc, "[C]: in {s}", .{func_name});
         }
@@ -12282,7 +12288,12 @@ pub const Vm = struct {
                 self.errThread().err_source = null;
                 self.errThread().err_line = -1;
                 self.captureErrorTraceback();
-                return error.RuntimeError;
+                // P16.50-review-4 BLOCKER 1: carry the EXACT PUC status.
+                // The old unconditional error.RuntimeError masked ERRMEM
+                // from a resumed continuation into LUA_ERRRUN at the
+                // resume boundary (PUC finishCcall → docall → status).
+                if (nret_signed.lua_err == 4) return error.OutOfMemory;
+                return error.RuntimeError; // LUA_ERRRUN (2) / LUA_ERRERR (5)
             }
 
             // Normal return: collect k's results from the frame's c_stack.
@@ -23108,6 +23119,12 @@ pub const Vm = struct {
         var yielded: bool = false;
         var payload: []Value = &[_]Value{};
         var payload_heap: bool = false;
+        // P16.50-review-4 BLOCKER 4: the free defer was declared at the
+        // function's tail — the coroutine-completion early return (and
+        // the yielded return) fired BEFORE it was armed, leaking the
+        // 1-Value completion payload on every completing resume. Armed
+        // immediately after the declarations: EVERY exit frees it.
+        defer if (payload_heap) self.alloc.free(payload);
 
         // Coroutine-body CALL hook. For a bytecode-Closure body, PUC fires
         // LUA_HOOKCALL when the body's CallInfo starts executing (luaD_call →
@@ -23749,8 +23766,6 @@ pub const Vm = struct {
                 else => return self.fail("coroutine.resume: bad thread", .{}),
             }
         }
-
-        defer if (payload_heap) self.alloc.free(payload);
 
         if (forced_close_ok) {
             // PUC luaE_resetthread on a successful forced close: the
@@ -40201,7 +40216,22 @@ pub const Vm = struct {
         };
         // Place the arguments at c_stack[0..nargs] so that lua_to*(L, 1..n)
         // resolves them via the absolute positive-index convention.
-        try self.cur_c_stack.appendSlice(self.alloc, args);
+        // P16.50-review-4 HIGH 1: PUC guarantees every called C function
+        // at least LUA_MINSTACK free stack slots without lua_checkstack
+        // (luaD_precallC → luaD_checkstack; lstate/lapi assume it). The
+        // reserve happens at the ACTIVATION boundary — before the callback
+        // runs — so the 20 guaranteed pushes cannot silently fail or
+        // allocate mid-callback. A prologue failure is PUC's
+        // luaD_checkstack OOM → luaD_throw(LUA_ERRMEM): the fixed MEMERRMSG
+        // is installed exactly like every other OOM on this path.
+        self.cur_c_stack.appendSlice(self.alloc, args) catch {
+            self.setOutOfMemoryError();
+            return error.OutOfMemory;
+        };
+        self.cur_c_stack.ensureUnusedCapacity(self.alloc, 20) catch {
+            self.setOutOfMemoryError();
+            return error.OutOfMemory;
+        };
 
         // P15.78: Push a C-frame so `lua_yieldk` can save k/ctx and
         // `finishCcall` can invoke k on resume. This mirrors PUC Lua's
@@ -40323,7 +40353,17 @@ pub const Vm = struct {
         const total = self.cur_c_stack.items.len;
         const result_start: usize = if (total >= nret) total - nret else 0;
         const actual_nret: usize = if (total >= nret) nret else total;
-        const saved_results = try self.alloc.dupe(Value, self.cur_c_stack.items[result_start .. result_start + actual_nret]);
+        // P16.50-review-4 BLOCKER 5: the result-copy OOM previously exited
+        // with the C-frame still linked and no error object installed. The
+        // transfer is transactional now: on OOM the frame unwinds exactly
+        // like the structural error path (pop; no close — the TBC marks
+        // close at whichever boundary catches the error) and the fixed
+        // MEMERRMSG is installed before returning the OOM kind.
+        const saved_results = self.alloc.dupe(Value, self.cur_c_stack.items[result_start .. result_start + actual_nret]) catch {
+            self.popBuiltinCFrame();
+            self.setOutOfMemoryError();
+            return error.OutOfMemory;
+        };
         // results_owned: once a yielding closer's CClsretState takes the
         // results, the errdefer must not free them.
         var results_owned = false;
@@ -51448,9 +51488,6 @@ fn p50r3Sweep(
             .fail_index = fail_idx,
             .resize_fail_index = fail_idx,
         });
-        // The pre-call error-object state: the FINDING #6 dupe failure
-        // below must leave it UNTOUCHED (no cThrow runs on that path).
-        const err_has_obj0 = vm.errThread().err_has_obj;
         const saved = vm.alloc;
         vm.alloc = failing.allocator();
         const r = vm.callCFunction(cf, args);
@@ -51474,33 +51511,19 @@ fn p50r3Sweep(
         } else |err| {
             try testing.expectEqual(error.OutOfMemory, err);
             tested_failures += 1;
-            if (th.call_frames.len() == frames0 + 1) {
-                // FINDING #6 (asserted AS-IS, then compensated): this is
-                // the sweep's LAST failing index — the C function already
-                // returned normally, and the failing allocation is the
-                // results dupe (vm.zig:40313), which sits BETWEEN the
-                // return and the manual C-frame pop (vm.zig:40357). Its
-                // `try` exits WITHOUT popping the C-frame and WITHOUT
-                // installing any error object (the OOM never reaches
-                // cThrow; PUC's moveresults cannot fail, and every PUC
-                // OOM path sets the MEMERRMSG object via luaD_throw).
-                // Assert the untouched error state, then compensate the
-                // documented defect: pop the stale frame so the residue
-                // teardown and later cells stay deterministic.
-                try testing.expectEqual(err_has_obj0, vm.errThread().err_has_obj);
-                try testing.expectEqual(@as(c_int, 0), th.api_status);
-                vm.popBuiltinCFrame();
-            } else {
-                // BLOCKER 1: the C-frame is popped — no manual repair.
-                try testing.expectEqual(frames0, th.call_frames.len());
-                // BLOCKER 4: no stale error status on the running thread.
-                try testing.expectEqual(@as(c_int, 0), th.api_status);
-                // The error object is the fixed MEMERRMSG (PUC
-                // luaD_seterrorobj for LUA_ERRMEM) — pointer identity.
-                const eter = vm.errThread();
-                try testing.expect(eter.err_has_obj);
-                try testing.expectEqual(vm.oom_msg_str.?, eter.err_obj.String);
-            }
+            // P16.50-review-4 BLOCKER 5 fix: EVERY failing index — including
+            // the results-copy failure — unwinds the C-frame structurally
+            // and installs MEMERRMSG (no compensation branch, no manual
+            // frame pops, no untouched-error-state exceptions).
+            try testing.expectEqual(frames0, th.call_frames.len());
+            try testing.expectEqual(@as(c_int, 0), th.api_status);
+            const eter = vm.errThread();
+            try testing.expect(eter.err_has_obj);
+            try testing.expectEqual(vm.oom_msg_str.?, eter.err_obj.String);
+            // Residue on the results-copy failure index is PUC-correct:
+            // the C callback SUCCEEDED (its objects are registered GC
+            // objects; PUC leaves them in allgc for collection) — the
+            // teardown below owns them, no zero-census assertion here.
             try testing.expectEqual(frames0, th.call_frames.len());
             // The by-design residue (registerfuncs: published entries
             // survive a failure) is torn down by registry diff; the state
@@ -51695,15 +51718,10 @@ test "P16.50-review-3 R1: k continuation error transport through finishCcall" {
     roots.end();
     state.deinit();
 
-    // FINDING #4 (asserted AS-IS): exactly three one-byte leaks —
-    // tracebackFrameLabel's unfreed "?" intermediates, one per rendered
-    // parked C frame across this test's two erroring continuations.
-    try testing.expectEqual(@as(usize, 3), absorb.live.count());
-    var leak_it = absorb.live.iterator();
-    while (leak_it.next()) |e| {
-        try testing.expectEqual(@as(usize, 1), e.value_ptr.len);
-    }
-    // Absorb: free the leaked bytes so the test itself leaks nothing.
+    // P16.50-review-4 BLOCKER 4 fix applied: the tracebackFrameLabel
+    // intermediate is owned and freed on every exit — the absorbing
+    // tracker sees NOTHING after full teardown.
+    try testing.expectEqual(@as(usize, 0), absorb.live.count());
     absorb.deinit();
 }
 
@@ -51735,7 +51753,7 @@ test "P16.50-review-3 R2: exported throwing APIs under callCFunction OOM sweeps"
     // #1 the upvalue array, #2 the Cell, #3 the Closure, #4 the results
     // dupe — first success at 5. ----
     {
-        const sr = try p50r3Sweep(vm, th, frames0, p50r3CfPushcclosure, 8, false);
+        const sr = try p50r3Sweep(vm, th, frames0, p50r3CfPushcclosure, 9, false);
         try testing.expectEqual(@as(usize, 5), sr.first_success);
         try testing.expectEqual(@as(usize, 1), sr.census.n_closure);
         try testing.expectEqual(@as(usize, 1), sr.census.n_cell);
@@ -51746,7 +51764,7 @@ test "P16.50-review-3 R2: exported throwing APIs under callCFunction OOM sweeps"
     // ---- lua_pushcfunction: #0 the fresh-stack growth, #1 the Closure,
     // #2 the results dupe — first success at 3. ----
     {
-        const sr = try p50r3Sweep(vm, th, frames0, p50r3CfPushcfunction, 6, false);
+        const sr = try p50r3Sweep(vm, th, frames0, p50r3CfPushcfunction, 7, false);
         try testing.expectEqual(@as(usize, 3), sr.first_success);
         try testing.expectEqual(@as(usize, 1), sr.census.n_closure);
         try testing.expectEqual(@as(usize, 0), sr.census.n_cell);
@@ -51762,7 +51780,7 @@ test "P16.50-review-3 R2: exported throwing APIs under callCFunction OOM sweeps"
     // the results dupe — 12 allocations, first success at 12. ----
     {
         const sr = try p50r3Sweep(vm, th, frames0, p50r3CfSetfuncs, 16, true);
-        try testing.expectEqual(@as(usize, 12), sr.first_success);
+        try testing.expectEqual(@as(usize, 13), sr.first_success);
         try testing.expectEqual(@as(usize, 2), sr.census.n_closure);
         try testing.expectEqual(@as(usize, 2), sr.census.n_cell);
         try testing.expectEqual(@as(usize, 2), sr.census.n_string);
@@ -51799,7 +51817,7 @@ test "P16.50-review-3 R2: exported throwing APIs under callCFunction OOM sweeps"
 
             // The pre-call error-object state (the FINDING #6 dupe
             // failure below must leave it untouched).
-            const err_has_obj0 = vm.errThread().err_has_obj;
+
             const saved = vm.alloc;
             vm.alloc = failing.allocator();
             const r = vm.callCFunction(p50r3CfNewthread, &.{});
@@ -51829,28 +51847,27 @@ test "P16.50-review-3 R2: exported throwing APIs under callCFunction OOM sweeps"
             } else |err| {
                 try testing.expectEqual(error.OutOfMemory, err);
                 tested_failures += 1;
-                if (th.call_frames.len() == frames0 + 1) {
-                    // FINDING #6 (asserted AS-IS, then compensated): the
-                    // LAST failing index — the results dupe (vm.zig:40313)
-                    // failed AFTER lua_newthread itself succeeded: the
-                    // Thread and its handle are registered and c_api_thread
-                    // is published, but the C-frame is not popped and no
-                    // error object is installed (the OOM never reaches
-                    // cThrow). Compensate the documented defect with the
-                    // success-arm teardown plus the stale-frame pop.
-                    const th2 = vm.c_api_thread.?;
-                    try testing.expectEqual(err_has_obj0, vm.errThread().err_has_obj);
+                // P16.50-review-4 BLOCKER 5 fix: the C-frame unwinds
+                // structurally on EVERY index (the old stale-frame
+                // compensation is gone). One distinction remains honest:
+                // when the failing allocation is the RESULT COPY (after
+                // the C callback returned), lua_newthread itself already
+                // SUCCEEDED — its side effects stand exactly as PUC leaves
+                // them (the thread is a registered GC object with its
+                // handle); tear it down via the normal teardown arm.
+                try testing.expectEqual(frames0, th.call_frames.len());
+                try testing.expectEqual(@as(c_int, 0), th.api_status);
+                const eter = vm.errThread();
+                try testing.expect(eter.err_has_obj);
+                try testing.expectEqual(vm.oom_msg_str.?, eter.err_obj.String);
+                if (vm.c_api_thread) |th2| {
+                    // The success-side teardown (identical to the success
+                    // arm — NOT a stale-frame compensation: B5 popped it).
                     vm.c_api_thread = null;
                     p50TeardownThread(vm, th2, false);
                     vm.freeStateHandle(th2.api_handle.?);
-                    vm.popBuiltinCFrame();
                 } else {
-                    try testing.expectEqual(frames0, th.call_frames.len());
-                    try testing.expectEqual(@as(c_int, 0), th.api_status);
                     try testing.expect(vm.c_api_thread == null); // restored by the wrapper's catch
-                    const eter = vm.errThread();
-                    try testing.expect(eter.err_has_obj);
-                    try testing.expectEqual(vm.oom_msg_str.?, eter.err_obj.String);
                 }
                 try testing.expectEqual(frames0, th.call_frames.len());
                 try testing.expectEqual(@as(c_int, 0), th.api_status);
@@ -51881,11 +51898,15 @@ test "P16.50-review-3 R2: exported throwing APIs under callCFunction OOM sweeps"
         const r = vm.callCFunction(p50r3CfCreatetable, &.{});
         vm.alloc = saved;
 
-        const result = try r; // succeeds — the swallow (PUC: LUA_ERRMEM)
-        try testing.expectEqual(@as(usize, 0), result.len);
+        // P16.50-review-4 BLOCKER 3 fix: lua_createtable THROWS — the
+        // C callback OOMs through the protected transport (ERRMEM +
+        // MEMERRMSG), never silent success.
+        try testing.expectEqual(error.OutOfMemory, r);
         try testing.expectEqual(frames0, th.call_frames.len());
         try testing.expectEqual(@as(c_int, 0), th.api_status);
-        // Nothing registered, nothing charged, no error state change.
+        const etr = vm.errThread();
+        try testing.expect(etr.err_has_obj);
+        try testing.expectEqual(vm.oom_msg_str.?, etr.err_obj.String);
         try snap.assertRestored(vm);
     }
 }
@@ -51999,15 +52020,9 @@ test "P16.50-review-3 R3: api_status lifecycle through lua_status" {
     roots.end();
     state.deinit();
 
-    // FINDING #5 (asserted AS-IS): exactly one leaked allocation — the
-    // 1-Value completion payload from the (b) leg's early return
-    // (vm.zig:23373) before the payload-free defer (vm.zig:23753) is armed.
-    try testing.expectEqual(@as(usize, 1), absorb.live.count());
-    var leak_it = absorb.live.iterator();
-    while (leak_it.next()) |e| {
-        try testing.expectEqual(@sizeOf(Value), e.value_ptr.len);
-    }
-    // Absorb: free the leaked payload so the test itself leaks nothing.
+    // P16.50-review-4 BLOCKER 4 fix: the completion payload's free defer
+    // is armed at declaration — NOTHING leaks after full teardown.
+    try testing.expectEqual(@as(usize, 0), absorb.live.count());
     absorb.deinit();
 }
 
@@ -52433,16 +52448,10 @@ test "P16.50-review-3 R5: atpanic hook on an unprotected OOM (subprocess)" {
         const expect_l = p50r3ParseHex(run.stderr, expect_at + expect_marker.len) orelse
             return error.TestUnexpectedResult;
 
-        if (std.mem.eql(u8, scenario, "A")) {
-            // CORRECT (PUC parity): the throw came from the main L, and the
-            // hook receives exactly that state.
-            try testing.expectEqual(expect_l, hook_l);
-        } else {
-            // FINDING #2 (asserted AS-IS): the hook receives the MAIN L,
-            // not the throwing coroutine L2 — cThrow (c_api.zig:1450) passes
-            // vm.cur_handle.? (main) instead of the throwing handle. PUC
-            // luaD_throw always passes the throwing lua_State.
-            try testing.expect(expect_l != hook_l);
-        }
+        // P16.50-review-4 BLOCKER 2 fix: EVERY scenario asserts the hook
+        // received EXACTLY the throwing state (PUC luaD_throw passes the
+        // throwing lua_State — the old expected-defect inequality is
+        // deleted).
+        try testing.expectEqual(expect_l, hook_l);
     }
 }

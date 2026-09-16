@@ -1,14 +1,14 @@
 {
-  "created_utc": "2026-09-15T22:20:49.774835+00:00",
+  "created_utc": "2026-09-16T03:04:21.628259+00:00",
   "provenance": {
-    "git_head": "e11a587",
-    "measured_source_head": "e11a587",
+    "git_head": "14a1c70",
+    "measured_source_head": "14a1c70",
     "git_dirty": "dirty",
     "source_dirty": "clean",
     "artifact_dirty": "dirty",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast+Debug",
-    "zig_binary_sha16": "914caffad7124ec6"
+    "zig_binary_sha16": "6da8f0009031564f"
   },
   "gate_threshold": 400,
   "verdict": "GREEN",
@@ -130,18 +130,18 @@
   },
   "evidence": {
     "harness_anchored": {
-      "m1": 68568,
-      "m2": 68952,
+      "m1": 68610,
+      "m2": 68994,
       "delta": 384,
-      "m2_global_crosscheck": 68952,
+      "m2_global_crosscheck": 68994,
       "x_interned_m1": true,
       "y_interned_m1": true,
       "name_interned_m1": false,
       "b_interned_m1": false,
       "x_interned_m2": true,
       "y_interned_m2": true,
-      "l1_outstanding": 643,
-      "l2_outstanding": 650,
+      "l1_outstanding": 644,
+      "l2_outstanding": 651,
       "freed_in_interval_count": 0,
       "freed_in_interval_bytes": 0,
       "sizes": {
@@ -156,11 +156,11 @@
         "Constant": 16
       },
       "code_closure": {
-        "ptr": 140050613142528,
+        "ptr": 140068477534912,
         "tree_is_root": true,
         "upvalues_len": 1,
         "proto": {
-          "ptr": 140050617150208,
+          "ptr": 140068481223168,
           "gc_charged": true,
           "gc_footprint": 264,
           "fixed_arrays": true,
@@ -196,70 +196,70 @@
       },
       "new_outstanding": [
         {
-          "ptr": 140050613142464,
-          "len": 48,
-          "ret_addr": 18301873,
-          "label": "resolved_values",
-          "symbol": "vm.Vm.loadChunkImpl"
-        },
-        {
-          "ptr": 140050613142528,
-          "len": 40,
-          "ret_addr": 18295260,
-          "label": "Closure",
-          "symbol": "vm.Vm.builtinLoadEx"
-        },
-        {
-          "ptr": 140050613142592,
-          "len": 40,
-          "ret_addr": 18295260,
-          "label": "Cell",
-          "symbol": "vm.Vm.builtinLoadEx"
-        },
-        {
-          "ptr": 140050609275008,
-          "len": 16,
-          "ret_addr": 18301873,
-          "label": "upvalues_desc",
-          "symbol": "vm.Vm.loadChunkImpl"
-        },
-        {
-          "ptr": 140050609995800,
-          "len": 8,
-          "ret_addr": 18295260,
-          "label": "Closure.upvalues slice",
-          "symbol": "vm.Vm.builtinLoadEx"
-        },
-        {
-          "ptr": 140050614321856,
+          "ptr": 140068477601056,
           "len": 32,
-          "ret_addr": 18323385,
+          "ret_addr": 18323529,
           "label": "external_LuaString_header",
           "symbol": "vm.Vm.undumpFixedInternCallback"
         },
         {
-          "ptr": 140050617150208,
+          "ptr": 140068472291368,
+          "len": 8,
+          "ret_addr": 18295356,
+          "label": "Closure.upvalues slice",
+          "symbol": "vm.Vm.builtinLoadEx"
+        },
+        {
+          "ptr": 140068473536592,
+          "len": 16,
+          "ret_addr": 18301969,
+          "label": "upvalues_desc",
+          "symbol": "vm.Vm.loadChunkImpl"
+        },
+        {
+          "ptr": 140068476814208,
+          "len": 40,
+          "ret_addr": 18295356,
+          "label": "Cell",
+          "symbol": "vm.Vm.builtinLoadEx"
+        },
+        {
+          "ptr": 140068481223168,
           "len": 200,
-          "ret_addr": 18301873,
+          "ret_addr": 18301969,
           "label": "Proto",
           "symbol": "vm.Vm.loadChunkImpl"
+        },
+        {
+          "ptr": 140068477207296,
+          "len": 48,
+          "ret_addr": 18301969,
+          "label": "resolved_values",
+          "symbol": "vm.Vm.loadChunkImpl"
+        },
+        {
+          "ptr": 140068477534912,
+          "len": 40,
+          "ret_addr": 18295356,
+          "label": "Closure",
+          "symbol": "vm.Vm.builtinLoadEx"
         }
       ],
       "freed_in_interval": []
     },
     "harness_variance": {
-      "m1": 68412,
-      "m2": 68848,
+      "m1": 68454,
+      "m2": 68890,
       "delta": 436,
-      "m2_global_crosscheck": 68848,
+      "m2_global_crosscheck": 68890,
       "x_interned_m1": false,
       "y_interned_m1": false,
       "name_interned_m1": false,
       "b_interned_m1": false,
       "x_interned_m2": true,
       "y_interned_m2": true,
-      "l1_outstanding": 641,
-      "l2_outstanding": 650,
+      "l1_outstanding": 642,
+      "l2_outstanding": 651,
       "freed_in_interval_count": 0,
       "freed_in_interval_bytes": 0,
       "sizes": {
@@ -274,11 +274,11 @@
         "Constant": 16
       },
       "code_closure": {
-        "ptr": 140067602172352,
+        "ptr": 139712976322816,
         "tree_is_root": true,
         "upvalues_len": 1,
         "proto": {
-          "ptr": 140067603742976,
+          "ptr": 139712969703424,
           "gc_charged": true,
           "gc_footprint": 264,
           "fixed_arrays": true,
@@ -314,81 +314,81 @@
       },
       "new_outstanding": [
         {
-          "ptr": 140067600728176,
-          "len": 16,
-          "ret_addr": 18301905,
-          "label": "upvalues_desc",
-          "symbol": "vm.Vm.loadChunkImpl"
+          "ptr": 139712977110272,
+          "len": 32,
+          "ret_addr": 18323561,
+          "label": "external_LuaString_header",
+          "symbol": "vm.Vm.undumpFixedInternCallback"
         },
         {
-          "ptr": 140067605119584,
+          "ptr": 139712977110304,
           "len": 26,
-          "ret_addr": 18093221,
-          "label": "short_string_X",
-          "symbol": "vm.Vm.internStrAll"
-        },
-        {
-          "ptr": 140067605119648,
-          "len": 26,
-          "ret_addr": 18093221,
+          "ret_addr": 18093317,
           "label": "short_string_Y",
           "symbol": "vm.Vm.internStrAll"
         },
         {
-          "ptr": 140067602172416,
+          "ptr": 139712977043648,
           "len": 40,
-          "ret_addr": 18295292,
+          "ret_addr": 18295388,
           "label": "Cell",
           "symbol": "vm.Vm.builtinLoadEx"
         },
         {
-          "ptr": 140067602172288,
+          "ptr": 139712977110240,
+          "len": 26,
+          "ret_addr": 18093317,
+          "label": "short_string_X",
+          "symbol": "vm.Vm.internStrAll"
+        },
+        {
+          "ptr": 139712976322880,
           "len": 48,
-          "ret_addr": 18301905,
+          "ret_addr": 18302001,
           "label": "resolved_values",
           "symbol": "vm.Vm.loadChunkImpl"
         },
         {
-          "ptr": 140067600203800,
-          "len": 8,
-          "ret_addr": 18295292,
-          "label": "Closure.upvalues slice",
-          "symbol": "vm.Vm.builtinLoadEx"
-        },
-        {
-          "ptr": 140067602172352,
+          "ptr": 139712976322816,
           "len": 40,
-          "ret_addr": 18295292,
+          "ret_addr": 18295388,
           "label": "Closure",
           "symbol": "vm.Vm.builtinLoadEx"
         },
         {
-          "ptr": 140067603742976,
-          "len": 200,
-          "ret_addr": 18301905,
-          "label": "Proto",
+          "ptr": 139712972980240,
+          "len": 8,
+          "ret_addr": 18295388,
+          "label": "Closure.upvalues slice",
+          "symbol": "vm.Vm.builtinLoadEx"
+        },
+        {
+          "ptr": 139712973045840,
+          "len": 16,
+          "ret_addr": 18302001,
+          "label": "upvalues_desc",
           "symbol": "vm.Vm.loadChunkImpl"
         },
         {
-          "ptr": 140067605119616,
-          "len": 32,
-          "ret_addr": 18323417,
-          "label": "external_LuaString_header",
-          "symbol": "vm.Vm.undumpFixedInternCallback"
+          "ptr": 139712969703424,
+          "len": 200,
+          "ret_addr": 18302001,
+          "label": "Proto",
+          "symbol": "vm.Vm.loadChunkImpl"
         }
       ],
       "freed_in_interval": []
     },
     "driver_anchored": {
       "delta": 384,
-      "m1": 66454,
-      "m2": 66838,
+      "m1": 66496,
+      "m2": 66880,
       "under400": "true"
     },
     "driver_no_xy_root": {
       "delta": 436,
-      "m1": 66334,
-      "m2": 66770,
+      "m1": 66376,
+      "m2": 66812,
       "under400": "false"
     },
     "xy_root_probe_puc": {
@@ -406,49 +406,49 @@
     "ReleaseFast": {
       "driver_anchored": {
         "delta": 384,
-        "m1": 66454,
-        "m2": 66838,
+        "m1": 66496,
+        "m2": 66880,
         "under400": "true"
       },
       "driver_no_xy_root": {
         "delta": 436,
-        "m1": 66334,
-        "m2": 66770,
+        "m1": 66376,
+        "m2": 66812,
         "under400": "false"
       },
       "provenance": {
-        "git_head": "e11a587",
-        "measured_source_head": "e11a587",
+        "git_head": "14a1c70",
+        "measured_source_head": "14a1c70",
         "git_dirty": "dirty",
         "source_dirty": "clean",
         "artifact_dirty": "dirty",
         "zig_version": "0.16.0",
         "optimize_mode": "ReleaseFast",
-        "zig_binary_sha16": "914caffad7124ec6"
+        "zig_binary_sha16": "6da8f0009031564f"
       }
     },
     "Debug": {
       "driver_anchored": {
         "delta": 384,
-        "m1": 66454,
-        "m2": 66838,
+        "m1": 66496,
+        "m2": 66880,
         "under400": "true"
       },
       "driver_no_xy_root": {
         "delta": 436,
-        "m1": 66334,
-        "m2": 66770,
+        "m1": 66376,
+        "m2": 66812,
         "under400": "false"
       },
       "provenance": {
-        "git_head": "e11a587",
-        "measured_source_head": "e11a587",
+        "git_head": "14a1c70",
+        "measured_source_head": "14a1c70",
         "git_dirty": "dirty",
         "source_dirty": "clean",
         "artifact_dirty": "dirty",
         "zig_version": "0.16.0",
         "optimize_mode": "Debug",
-        "zig_binary_sha16": "914caffad7124ec6"
+        "zig_binary_sha16": "6da8f0009031564f"
       }
     }
   }

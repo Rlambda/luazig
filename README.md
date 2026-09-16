@@ -38,22 +38,22 @@ Method: paired-seed protocol — 21 published seeds per workload per session (`L
 |----------|--------:|
 | metamethod_call_noalloc | 1.86x |
 | array_access | 1.74x |
-| field_access | 1.70x |
+| field_access | 1.69x |
+| branch_loop | 1.63x |
 | hash_access | 1.62x |
-| branch_loop | 1.60x |
 | dynamic_load | 1.54x |
-| mixed_arith | 1.44x |
-| comparisons | 1.43x |
-| coroutine_yield | 1.41x |
+| coroutine_yield | 1.44x |
+| mixed_arith | 1.41x |
+| comparisons | 1.40x |
 | global_arith | 1.39x |
-| metamethod_add | 1.37x |
-| lua_calls | 1.34x |
-| float_arith | 1.34x |
-| int_arith | 1.32x |
+| lua_calls | 1.36x |
+| metamethod_add | 1.34x |
+| int_arith | 1.33x |
+| float_arith | 1.32x |
 | table_alloc_setmetatable | 1.19x |
-| string_loop | 1.12x |
-| temp_table_alloc | 1.07x |
-| string_concat | 1.06x |
+| string_loop | 1.14x |
+| temp_table_alloc | 1.06x |
+| string_concat | 1.05x |
 <!-- END GENERATED STATUS -->
 
 See [STATUS.md](STATUS.md) for detailed profiling methodology, hotspot analysis, and optimization history.

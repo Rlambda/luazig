@@ -1,4 +1,5 @@
 {
+  "artifact_role": "historical",
   "created_utc": "2026-08-30T00:38:18.595371+00:00",
   "head": "7e6241c",
   "task": "P16.10a T16 \u2014 Proto constant-resolution ownership audit (ANALYSIS ONLY)",

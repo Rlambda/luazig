@@ -1,11 +1,11 @@
 {
-  "created_utc": "2026-09-16T02:57:48.847453+00:00",
+  "created_utc": "2026-09-16T06:08:43.375266+00:00",
   "provenance": {
-    "git_head": "14a1c704fc3643e04dbdad43ebc8b21ab5b32113",
-    "measured_source_head": "14a1c704fc3643e04dbdad43ebc8b21ab5b32113",
+    "git_head": "fbaf638ef723260802291bc239b4288a4baa03f9",
+    "measured_source_head": "fbaf638ef723260802291bc239b4288a4baa03f9",
     "source_dirty": "clean",
-    "zig_binary_sha256": "6da8f0009031564fd47ea6f0eda1e6ac0c2bdf63b091775f6499fad2bcc8e5f0",
-    "note": "P16.50-review-3 regeneration from clean measured-source commit 14a1c70."
+    "zig_binary_sha256": "7e4ce0455965b44c91c762c4eab638db7836bf2147f861dd52adefe795440e7f",
+    "note": "P16.50-review-4 regeneration from clean measured-source commit fbaf638."
   },
   "mode": "perf record -g instructions:u core0 top-15",
   "workloads": {
@@ -16,16 +16,16 @@
           "percent": 100.0
         }
       ],
-      "source_head": "14a1c704fc3643e04dbdad43ebc8b21ab5b32113"
+      "source_head": "fbaf638ef723260802291bc239b4288a4baa03f9"
     },
     "hash_access": {
       "top_symbols": [
         {
           "symbol": "vm.Vm.runBytecodeDispatch",
-          "percent": 99.97
+          "percent": 99.98
         }
       ],
-      "source_head": "14a1c704fc3643e04dbdad43ebc8b21ab5b32113"
+      "source_head": "fbaf638ef723260802291bc239b4288a4baa03f9"
     },
     "field_access": {
       "top_symbols": [
@@ -34,90 +34,90 @@
           "percent": 100.0
         }
       ],
-      "source_head": "14a1c704fc3643e04dbdad43ebc8b21ab5b32113"
+      "source_head": "fbaf638ef723260802291bc239b4288a4baa03f9"
     },
     "coroutine_yield": {
       "top_symbols": [
         {
           "symbol": "vm.Vm.runBytecodeDispatch",
-          "percent": 60.98
+          "percent": 60.8
         },
         {
           "symbol": "vm.Vm.builtinCoroutineResume",
-          "percent": 17.94
+          "percent": 17.16
         },
         {
           "symbol": "vm.Vm.builtinCoroutineYield",
-          "percent": 7.45
-        },
-        {
-          "symbol": "vm.Vm.runBytecodeInternal",
-          "percent": 4.23
+          "percent": 6.68
         },
         {
           "symbol": "vm.Vm.callCoroutineBuiltinDirect",
-          "percent": 3.05
+          "percent": 3.77
+        },
+        {
+          "symbol": "vm.Vm.runBytecodeInternal",
+          "percent": 3.4
         },
         {
           "symbol": "vm.Vm.coroutineBuiltinFastPathEligible",
-          "percent": 2.77
+          "percent": 3.23
         },
         {
           "symbol": "vm.Vm.switchThread",
-          "percent": 1.5
+          "percent": 1.74
         },
         {
           "symbol": "vm.Thread.yieldedValues",
-          "percent": 0.92
+          "percent": 1.74
         },
         {
           "symbol": "vm.YieldedValues.deinit",
-          "percent": 0.66
+          "percent": 0.85
         },
         {
           "symbol": "vm.Vm.tryPushBytecodeDebugHook",
-          "percent": 0.47
+          "percent": 0.54
         }
       ],
-      "source_head": "14a1c704fc3643e04dbdad43ebc8b21ab5b32113"
+      "source_head": "fbaf638ef723260802291bc239b4288a4baa03f9"
     },
     "string_concat": {
       "top_symbols": [
         {
           "symbol": "heap.SmpAllocator.free",
-          "percent": 29.74
+          "percent": 29.4
         },
         {
           "symbol": "heap.SmpAllocator.alloc",
-          "percent": 27.34
+          "percent": 27.29
         },
         {
           "symbol": "compiler_rt.memcpy.memcpyFast",
-          "percent": 12.4
+          "percent": 12.45
         },
         {
           "symbol": "vm.Vm.runBytecodeDispatch",
-          "percent": 8.59
+          "percent": 8.84
         },
         {
           "symbol": "vm.Vm.advanceBytecodeConcat",
-          "percent": 6.99
-        },
-        {
-          "symbol": "vm.Vm.internStr",
-          "percent": 3.19
+          "percent": 7.37
         },
         {
           "symbol": "hash.wyhash.Wyhash.final",
-          "percent": 2.91
+          "percent": 3.34
+        },
+        {
+          "symbol": "vm.Vm.internStr",
+          "percent": 2.99
         },
         {
           "symbol": "array_list.Aligned(vm.GcObject,null).ensureTotalCapacity",
-          "percent": 1.89
+          "percent": 1.78
         },
         {
           "symbol": "Io.Writer.alignBuffer",
-          "percent": 1.4
+          "percent": 1.47
         },
         {
           "symbol": "vm.Vm.gcAtomicCommon",
@@ -125,194 +125,194 @@
         },
         {
           "symbol": "vm.Vm.gcFreeObject",
-          "percent": 0.8
-        },
-        {
-          "symbol": "hash.wyhash.Wyhash.update",
-          "percent": 0.73
+          "percent": 0.77
         },
         {
           "symbol": "vm.Vm.gcMarkMutableRoots",
-          "percent": 0.7
+          "percent": 0.69
+        },
+        {
+          "symbol": "hash.wyhash.Wyhash.update",
+          "percent": 0.6
         },
         {
           "symbol": "vm.Vm.gcMinorCollection",
-          "percent": 0.59
+          "percent": 0.56
         },
         {
           "symbol": "vm.Vm.gcQueueScanObject",
-          "percent": 0.34
+          "percent": 0.29
         }
       ],
-      "source_head": "14a1c704fc3643e04dbdad43ebc8b21ab5b32113"
+      "source_head": "fbaf638ef723260802291bc239b4288a4baa03f9"
     },
     "string_loop": {
       "top_symbols": [
         {
           "symbol": "heap.SmpAllocator.free",
-          "percent": 21.62
+          "percent": 21.03
         },
         {
           "symbol": "heap.SmpAllocator.alloc",
-          "percent": 19.05
+          "percent": 20.01
         },
         {
           "symbol": "vm.Vm.runBytecodeDispatch",
-          "percent": 15.12
+          "percent": 15.06
         },
         {
           "symbol": "vm.Vm.valueToInternedStr",
-          "percent": 8.49
-        },
-        {
-          "symbol": "vm.Vm.internStr",
-          "percent": 5.33
+          "percent": 7.95
         },
         {
           "symbol": "compiler_rt.memcpy.memcpyFast",
-          "percent": 5.31
+          "percent": 6.22
         },
         {
           "symbol": "hash.wyhash.Wyhash.final",
           "percent": 5.06
         },
         {
+          "symbol": "vm.Vm.internStr",
+          "percent": 4.75
+        },
+        {
           "symbol": "vm.Vm.advanceBytecodeConcat",
-          "percent": 3.54
+          "percent": 3.84
         },
         {
           "symbol": "vm.Vm.callBuiltin",
-          "percent": 3.52
-        },
-        {
-          "symbol": "array_list.Aligned(vm.GcObject,null).ensureTotalCapacity",
-          "percent": 1.75
+          "percent": 3.31
         },
         {
           "symbol": "vm.Vm.pushBuiltinCFrameAt",
-          "percent": 1.65
+          "percent": 2.65
+        },
+        {
+          "symbol": "array_list.Aligned(vm.GcObject,null).ensureTotalCapacity",
+          "percent": 1.52
         },
         {
           "symbol": "vm.Vm.gcAtomicCommon",
-          "percent": 1.49
+          "percent": 1.41
         },
         {
           "symbol": "Io.Writer.alignBuffer",
-          "percent": 1.4
+          "percent": 1.35
         },
         {
           "symbol": "vm.Vm.gcFreeObject",
-          "percent": 1.17
+          "percent": 0.96
         },
         {
-          "symbol": "hash.wyhash.Wyhash.update",
-          "percent": 1.06
+          "symbol": "vm.Vm.gcMarkMutableRoots",
+          "percent": 0.96
         }
       ],
-      "source_head": "14a1c704fc3643e04dbdad43ebc8b21ab5b32113"
+      "source_head": "fbaf638ef723260802291bc239b4288a4baa03f9"
     },
     "metamethod_add": {
       "top_symbols": [
         {
           "symbol": "vm.Vm.runBytecodeDispatch",
-          "percent": 38.18
+          "percent": 39.0
         },
         {
           "symbol": "heap.SmpAllocator.alloc",
-          "percent": 13.8
+          "percent": 13.55
         },
         {
           "symbol": "heap.SmpAllocator.free",
-          "percent": 8.25
+          "percent": 8.17
         },
         {
           "symbol": "vm.Vm.completeBytecodeExecFrame",
-          "percent": 5.89
+          "percent": 5.95
         },
         {
           "symbol": "vm.Vm.rawSet",
-          "percent": 4.23
+          "percent": 4.11
         },
         {
           "symbol": "vm.Vm.getTmByObj",
-          "percent": 3.57
+          "percent": 3.87
         },
         {
           "symbol": "vm.Vm.callBuiltin",
-          "percent": 3.04
+          "percent": 3.33
         },
         {
           "symbol": "vm.Vm.gcMarkMutableRoots",
-          "percent": 2.32
+          "percent": 2.58
         },
         {
           "symbol": "vm.Vm.gcAtomicCommon",
-          "percent": 2.04
+          "percent": 2.16
         },
         {
           "symbol": "vm.Vm.popBuiltinCFrame",
-          "percent": 1.92
+          "percent": 2.06
         },
         {
           "symbol": "vm.Vm.tryPushSimpleResultMetamethod",
-          "percent": 1.85
+          "percent": 1.8
         },
         {
           "symbol": "vm.Vm.pushBuiltinCFrameAt",
-          "percent": 1.45
+          "percent": 1.61
         },
         {
-          "symbol": "vm.Vm.gcQueueScanObject",
-          "percent": 1.35
+          "symbol": "compiler_rt.memcpy.memcpyFast",
+          "percent": 1.37
+        },
+        {
+          "symbol": "vm.Vm.freeCFrameOwnedState",
+          "percent": 1.15
         },
         {
           "symbol": "vm.Vm.builtinSetmetatable",
-          "percent": 1.33
-        },
-        {
-          "symbol": "vm.Vm.gcPropagateOne",
-          "percent": 1.13
+          "percent": 1.02
         }
       ],
-      "source_head": "14a1c704fc3643e04dbdad43ebc8b21ab5b32113"
+      "source_head": "fbaf638ef723260802291bc239b4288a4baa03f9"
     },
     "temp_table_alloc": {
       "top_symbols": [
         {
           "symbol": "heap.SmpAllocator.alloc",
-          "percent": 31.09
+          "percent": 31.54
         },
         {
           "symbol": "vm.Vm.runBytecodeDispatch",
-          "percent": 20.84
+          "percent": 21.28
         },
         {
           "symbol": "heap.SmpAllocator.free",
-          "percent": 18.22
+          "percent": 17.45
         },
         {
           "symbol": "vm.Vm.gcAtomicCommon",
-          "percent": 4.58
+          "percent": 5.33
         },
         {
           "symbol": "vm.Vm.gcMarkMutableRoots",
-          "percent": 4.06
+          "percent": 4.57
         },
         {
           "symbol": "array_list.Aligned(vm.GcObject,null).ensureTotalCapacity",
-          "percent": 3.52
-        },
-        {
-          "symbol": "vm.Vm.allocTableNoGc",
-          "percent": 2.98
-        },
-        {
-          "symbol": "vm.Vm.gcPropagateOne",
-          "percent": 2.68
+          "percent": 3.44
         },
         {
           "symbol": "vm.Vm.tableResize",
-          "percent": 2.63
+          "percent": 2.79
+        },
+        {
+          "symbol": "vm.Vm.allocTableNoGc",
+          "percent": 2.57
+        },
+        {
+          "symbol": "vm.Vm.gcPropagateOne",
+          "percent": 2.39
         },
         {
           "symbol": "vm.Vm.gcQueueScanObject",
@@ -323,109 +323,109 @@
           "percent": 1.12
         },
         {
-          "symbol": "vm.Vm.gcFreeObject",
-          "percent": 1.1
-        },
-        {
-          "symbol": "vm.Vm.gcClearDeadFrameRegisters",
-          "percent": 0.98
-        },
-        {
           "symbol": "vm.Vm.gcMinorCollection",
-          "percent": 0.97
+          "percent": 1.05
+        },
+        {
+          "symbol": "vm.Vm.gcFreeObject",
+          "percent": 0.99
         },
         {
           "symbol": "vm.Vm.gcMarkCurrentRoots",
-          "percent": 0.92
+          "percent": 0.93
+        },
+        {
+          "symbol": "vm.Vm.gcClearDeadFrameRegisters",
+          "percent": 0.88
         }
       ],
-      "source_head": "14a1c704fc3643e04dbdad43ebc8b21ab5b32113"
+      "source_head": "fbaf638ef723260802291bc239b4288a4baa03f9"
     },
     "metamethod_call_noalloc": {
       "top_symbols": [
         {
           "symbol": "vm.Vm.runBytecodeDispatch",
-          "percent": 63.41
+          "percent": 42.04
         },
         {
           "symbol": "vm.Vm.getTmByObj",
-          "percent": 24.78
+          "percent": 28.58
         },
         {
           "symbol": "vm.Vm.tryPushSimpleResultMetamethod",
-          "percent": 10.88
+          "percent": 28.49
         },
         {
           "symbol": "vm.Vm.dispatchCalleeActivationHook",
-          "percent": 0.92
+          "percent": 0.88
         }
       ],
-      "source_head": "14a1c704fc3643e04dbdad43ebc8b21ab5b32113"
+      "source_head": "fbaf638ef723260802291bc239b4288a4baa03f9"
     },
     "table_alloc_setmetatable": {
       "top_symbols": [
         {
           "symbol": "vm.Vm.runBytecodeDispatch",
-          "percent": 28.71
+          "percent": 29.77
         },
         {
           "symbol": "heap.SmpAllocator.alloc",
-          "percent": 18.66
+          "percent": 18.91
         },
         {
           "symbol": "heap.SmpAllocator.free",
-          "percent": 12.03
+          "percent": 11.91
         },
         {
           "symbol": "vm.Vm.rawSet",
-          "percent": 10.06
+          "percent": 9.36
         },
         {
           "symbol": "vm.Vm.callBuiltin",
-          "percent": 4.65
+          "percent": 4.69
         },
         {
           "symbol": "vm.Vm.popBuiltinCFrame",
-          "percent": 3.6
-        },
-        {
-          "symbol": "vm.Vm.pushBuiltinCFrameAt",
-          "percent": 2.93
+          "percent": 3.17
         },
         {
           "symbol": "vm.Vm.gcAtomicCommon",
-          "percent": 2.86
+          "percent": 3.08
         },
         {
           "symbol": "vm.Vm.builtinSetmetatable",
-          "percent": 2.81
+          "percent": 2.79
+        },
+        {
+          "symbol": "vm.Vm.pushBuiltinCFrameAt",
+          "percent": 2.74
         },
         {
           "symbol": "vm.Vm.gcMarkMutableRoots",
-          "percent": 2.1
+          "percent": 2.56
         },
         {
           "symbol": "vm.Vm.gcPropagateOne",
-          "percent": 1.45
-        },
-        {
-          "symbol": "vm.Vm.freeCFrameOwnedState",
-          "percent": 1.4
+          "percent": 1.34
         },
         {
           "symbol": "vm.Vm.gcQueueScanObject",
-          "percent": 1.36
+          "percent": 1.33
+        },
+        {
+          "symbol": "vm.Vm.freeCFrameOwnedState",
+          "percent": 1.2
+        },
+        {
+          "symbol": "vm.Vm.gcMarkBytecodeProto",
+          "percent": 0.76
         },
         {
           "symbol": "vm.Vm.tableResize",
-          "percent": 0.93
-        },
-        {
-          "symbol": "array_list.Aligned(vm.GcObject,null).ensureTotalCapacity",
-          "percent": 0.87
+          "percent": 0.73
         }
       ],
-      "source_head": "14a1c704fc3643e04dbdad43ebc8b21ab5b32113"
+      "source_head": "fbaf638ef723260802291bc239b4288a4baa03f9"
     }
   }
 }

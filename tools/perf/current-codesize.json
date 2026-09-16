@@ -1,18 +1,18 @@
 {
- "created_utc": "2026-09-16T02:58:05.015706+00:00",
+ "created_utc": "2026-09-16T06:09:12.122074+00:00",
  "provenance": {
-  "git_head": "14a1c704fc3643e04dbdad43ebc8b21ab5b32113",
-  "measured_source_head": "14a1c704fc3643e04dbdad43ebc8b21ab5b32113",
+  "git_head": "fbaf638ef723260802291bc239b4288a4baa03f9",
+  "measured_source_head": "fbaf638ef723260802291bc239b4288a4baa03f9",
   "source_dirty": "clean",
-  "zig_binary_sha256": "6da8f0009031564fd47ea6f0eda1e6ac0c2bdf63b091775f6499fad2bcc8e5f0",
-  "note": "P16.50-review-3 regeneration from clean measured-source commit 14a1c70."
+  "zig_binary_sha256": "7e4ce0455965b44c91c762c4eab638db7836bf2147f861dd52adefe795440e7f",
+  "note": "P16.50-review-4 regeneration from clean measured-source commit fbaf638."
  },
- "text_bytes": 2611705,
+ "text_bytes": 2611897,
  "symbols": {
   "runBytecodeDispatch": 71685,
   "callBuiltin": 8537,
   "pushBuiltinCFrame": 745,
   "popBuiltinCFrame": 305,
-  "builtinCoroutineResume": 16898
+  "builtinCoroutineResume": 16988
  }
 }

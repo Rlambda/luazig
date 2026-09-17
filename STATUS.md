@@ -82,8 +82,10 @@ Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependen
   (locals/vararg/api/memerr/coroutine/cstack/gc/gengc/tracegc/calls/db/errors);
   matrix --testc 31/32 (zig_fail=0, big.lua both_fail pre-existing); smoke
   84/84; fmt + git-diff-check clean. Perf: ОДНА объявленная paired-seed
-  clean-C сессия (seeds 1..21, RUNS=21) — verdict и полное canonical current-*
-  перегенерирование на clean C фиксируются артефактным commit'ом D
+  clean-C сессия (seeds 1..21, RUNS=21) — verdict GREEN (RESULT OK, 18/18
+  workloads OK, worst per-seed +3.24% < WARN 5%, wall-P25 envelope max
+  +6.17% < 10%, geomean diagnostic 1.42x); полное canonical current-*
+  перегенерирование на clean C фиксируется артефактным commit'ом D
   (current-gate.json/manifest; STATUS — artifact-class per
   tools/provenance.py ARTIFACT_PATHS); baselines byte-identical без
   owner-approved обновлений.
@@ -7570,12 +7572,17 @@ provenance-расщепления review-5).
 - **Попутно закрыты 3 pre-existing утечки**: traceback body buffer,
   BytecodeProtectedCall struct ×2, BytecodeHookContinuation.
 - **Perf**: ОДНА объявленная paired-seed clean-C сессия (seeds 1..21,
-  RUNS=21) на commit C (source_head = C, source_dirty = clean) — verdict в
-  tools/perf/current-gate.json + current-gate-manifest.json (commit D);
-  geomean diagnostic перегенерируется в README status-блоке; baselines
-  byte-identical (baseline-approved/baseline-p15.37/core_baseline не
-  тронуты). Две dirty-сессии 2026-09-17 (HEAD 5c03e0f, верификация BLOCKER
-  1+2) остаются в manifest как исторические строки (append-only).
+  RUNS=21) на commit C (source_head = C, source_dirty = clean) — verdict:
+  GREEN — RESULT OK, 18/18 workloads OK, worst per-seed +3.24%
+  (coroutine_yield[1]) < WARN 5%, wall-P25 envelope max +6.17% (float_arith)
+  < 10%; geomean diagnostic 1.42x; сессия 2026-09-17T20:44:20Z, binary
+  sha256 0ba8593b5dbfbb3698f4195cf1d5a73be83d5064ab0a061a32a1475613c1a500
+  (полный sha в manifest row; determinism-rebuild после C дал идентичный
+  sha); артефакты tools/perf/current-gate.json + current-gate-manifest.json
+  (commit D); manifest append-only, 17 строк (две dirty-сессии 2026-09-17
+  на HEAD 5c03e0f из верификации BLOCKER 1+2 сохранены как исторические);
+  baselines byte-identical (baseline-approved/baseline-p15.37/core_baseline
+  не тронуты).
 - **Батарея**: 248/248 unit (Debug+ReleaseFast, 0 leaks), 12 upstream
   testc-лейнов rc=0, matrix --testc 31/32 (zig_fail=0, big.lua both_fail
   pre-existing), smoke 84/84, fmt + git-diff-check clean.

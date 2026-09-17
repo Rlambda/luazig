@@ -1,14 +1,14 @@
 {
-  "created_utc": "2026-09-16T06:12:32.050801+00:00",
+  "created_utc": "2026-09-17T20:35:53.844961+00:00",
   "provenance": {
-    "git_head": "fbaf638",
-    "measured_source_head": "fbaf638",
+    "git_head": "4375f53",
+    "measured_source_head": "4375f53",
     "git_dirty": "dirty",
     "source_dirty": "clean",
     "artifact_dirty": "dirty",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "7e4ce0455965b44c"
+    "zig_binary_sha16": "0ba8593b5dbfbb36"
   },
   "zig_sizes": {
     "Proto": 200,
@@ -62,8 +62,8 @@
   },
   "actual_delta": {
     "delta": 384,
-    "m1": 66445,
-    "m2": 66829
+    "m1": 66403,
+    "m2": 66787
   },
   "verdict": "GREEN",
   "gate_threshold": 400,

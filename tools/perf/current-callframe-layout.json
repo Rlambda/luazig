@@ -1,24 +1,24 @@
 {
- "created_utc": "2026-09-16T06:10:04.550602+00:00",
+ "created_utc": "2026-09-17T20:38:35.616753+00:00",
  "provenance": {
-  "git_head": "fbaf638ef723260802291bc239b4288a4baa03f9",
-  "measured_source_head": "fbaf638ef723260802291bc239b4288a4baa03f9",
+  "git_head": "4375f53f014ab78767d6b64ee502e8e6f0c82a3b",
+  "measured_source_head": "4375f53f014ab78767d6b64ee502e8e6f0c82a3b",
   "source_dirty": "clean",
   "zig_version": "0.16.0",
-  "probe_rf_path": "/tmp/opencode/p4_layout_rf",
-  "probe_debug_path": "/tmp/opencode/p4_layout_dbg",
-  "probe_rf_sha256_16": "11916199fcb87eeb",
-  "probe_debug_sha256_16": "b65cc12643891793",
+  "probe_rf_path": "/tmp/opencode/r6_layout_rf",
+  "probe_debug_path": "/tmp/opencode/r6_layout_dbg",
+  "probe_rf_sha256_16": "f972792ddb67d019",
+  "probe_debug_sha256_16": "9a0777ada2b12a50",
   "probe_build_commands": [
-   "zig build-exe -O ReleaseFast --dep lua -Mroot=/tmp/opencode/layout_probe.zig --dep util -Mlua=src/lua/root.zig -Mutil=src/util/root.zig -lc -femit-bin=/tmp/opencode/p4_layout_rf",
-   "zig build-exe -O Debug --dep lua -Mroot=/tmp/opencode/layout_probe.zig --dep util -Mlua=src/lua/root.zig -Mutil=src/util/root.zig -lc -femit-bin=/tmp/opencode/p4_layout_dbg"
+   "zig build-exe -O ReleaseFast --dep lua -Mroot=/tmp/opencode/r6_layout_probe.zig --dep util -Mlua=src/lua/root.zig -Mutil=src/util/root.zig -lc -femit-bin=/tmp/opencode/r6_layout_rf",
+   "zig build-exe -O Debug --dep lua -Mroot=/tmp/opencode/r6_layout_probe.zig --dep util -Mlua=src/lua/root.zig -Mutil=src/util/root.zig -lc -femit-bin=/tmp/opencode/r6_layout_dbg"
   ],
-  "zig_binary_sha256": "7e4ce0455965b44c91c762c4eab638db7836bf2147f861dd52adefe795440e7f",
-  "note": "P16.50-review-4: probe binaries REBUILT from clean measured-source commit fbaf638 \u2014 fresh copies, hashes above, single regeneration timestamp; no relabeling, no nested timestamps."
+  "zig_binary_sha256": "0ba8593b5dbfbb3698f4195cf1d5a73be83d5064ab0a061a32a1475613c1a500",
+  "note": "P16.50-review-6: probe binaries REBUILT from clean measured-source commit 4375f53 \u2014 fresh copies, hashes above, single regeneration timestamp; no relabeling, no nested timestamps."
  },
  "layout": {
   "ReleaseFast": {
-   "Vm": 5416,
+   "Vm": 5472,
    "Thread": 3736,
    "CallFrame": 88,
    "LuaFrameState": 48,
@@ -29,7 +29,7 @@
    "CallFrame_u_offset": 32
   },
   "Debug": {
-   "Vm": 5520,
+   "Vm": 5576,
    "Thread": 3736,
    "CallFrame": 88,
    "LuaFrameState": 48,

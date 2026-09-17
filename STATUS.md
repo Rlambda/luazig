@@ -43,7 +43,7 @@ Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [ ] **P16.50-review correction (REOPENED by review-6)**: rollback ownership + C-closure upvalue semantics — (a) BLOCKER 1: opClosure count-prefix rollback неверен при смешанных дескрипторах (proxy/new instack/уже-boxed) — exact ownership worklist/bitmap, rollback только созданных этим вызовом Cells в reverse-порядке; закрыть post-commit окно (gcStoreCellValue после commit) — либо provably-infallible через preparation/order, либо полный rollback owner для Closure/tree/register/accounting/register-slot; dispatch-driven mixed-upvalue тест ([proxy, new instack] из реального bytecode; existing-boxed; провал на следующем Cell и на Closure alloc; post-commit barrier failure; byte-exact всё + minor collection + repeated + success); negative copy count-prefix rollback детерминированно ловится; (b) BLOCKER 2: lua_newthread errdefer НЕ работает (?*lua_State ≠ error union) — inner error-union transaction / явный cleanup helper, ABI-wrapper маппит в null ПОСЛЕ cleanup; preserve/restore прежний vm.c_api_thread; тест против реального экспортированного lua_newthread (fail на registry prepare / Thread alloc / handle alloc / parent stack growth; registries/stack/handle/counters/live-set + GC после); (c) BLOCKER 3: registerfuncs алиасит C-closure upvalues (общие Cell-объекты: setupvalue(f1) виден f2) — PUC luaL_setfuncs (lauxlib.c:965-978) копирует VALUES на стек + lua_pushcclosure (lapi.c:609+) свежий CClosure с inline slots; один канонический C-closure конструктор для pushcclosure+registerfuncs с per-closure Cells; убрать неверный LClosure rationale; differential-тест (upvalueid differs; setupvalue A не меняет B; сбор в обоих порядках без leaks; OOM на non-preinterned names + table-growth setfield); (d) error propagation: lua_pushcclosure/lua_pushcfunction/luaL_setfuncs/luaL_newlib catch {} — обследовать защищённый механизм (protected call/throw) и маршрутизировать ЛИБО зафиксировать архитектурный blocker (owner решает); (e) HIGH: testcChargeMemory коммитит total_bytes ДО нативных аллокаций — split check/reserve от accounting commit / точный rollback; тест с активным testc_ctrl + провалы registry reserve/Userdata/uservalues/payload; аудит всех testcChargeMemory-сайтов; (f) cleanup: устаревшие BLOCKED/KNOWN-leak комментарии в тестах, skip fail-индексов 2..4 в pushcclosure matrix, smoke provenance prose (84 файла, 85-й номер — один из 84).
+- [x] **P16.50-review correction (REOPENED→CLOSED by review-6)**: rollback ownership + C-closure upvalue semantics — (a) BLOCKER 1: opClosure count-prefix rollback неверен при смешанных дескрипторах (proxy/new instack/уже-boxed) — exact ownership worklist/bitmap, rollback только созданных этим вызовом Cells в reverse-порядке; закрыть post-commit окно (gcStoreCellValue после commit) — либо provably-infallible через preparation/order, либо полный rollback owner для Closure/tree/register/accounting/register-slot; dispatch-driven mixed-upvalue тест ([proxy, new instack] из реального bytecode; existing-boxed; провал на следующем Cell и на Closure alloc; post-commit barrier failure; byte-exact всё + minor collection + repeated + success); negative copy count-prefix rollback детерминированно ловится; (b) BLOCKER 2: lua_newthread errdefer НЕ работает (?*lua_State ≠ error union) — inner error-union transaction / явный cleanup helper, ABI-wrapper маппит в null ПОСЛЕ cleanup; preserve/restore прежний vm.c_api_thread; тест против реального экспортированного lua_newthread (fail на registry prepare / Thread alloc / handle alloc / parent stack growth; registries/stack/handle/counters/live-set + GC после); (c) BLOCKER 3: registerfuncs алиасит C-closure upvalues (общие Cell-объекты: setupvalue(f1) виден f2) — PUC luaL_setfuncs (lauxlib.c:965-978) копирует VALUES на стек + lua_pushcclosure (lapi.c:609+) свежий CClosure с inline slots; один канонический C-closure конструктор для pushcclosure+registerfuncs с per-closure Cells; убрать неверный LClosure rationale; differential-тест (upvalueid differs; setupvalue A не меняет B; сбор в обоих порядках без leaks; OOM на non-preinterned names + table-growth setfield); (d) error propagation: lua_pushcclosure/lua_pushcfunction/luaL_setfuncs/luaL_newlib catch {} — обследовать защищённый механизм (protected call/throw) и маршрутизировать ЛИБО зафиксировать архитектурный blocker (owner решает); (e) HIGH: testcChargeMemory коммитит total_bytes ДО нативных аллокаций — split check/reserve от accounting commit / точный rollback; тест с активным testc_ctrl + провалы registry reserve/Userdata/uservalues/payload; аудит всех testcChargeMemory-сайтов; (f) cleanup: устаревшие BLOCKED/KNOWN-leak комментарии в тестах, skip fail-индексов 2..4 в pushcclosure matrix, smoke provenance prose (84 файла, 85-й номер — один из 84).
 
   ПЕРЕОТКРЫТ фазой P16.50-review-6 (owner-instructed): review-5 не принята —
   BLOCKER 1: testcScriptOutBound не является заявленной conservative upper bound
@@ -58,6 +58,35 @@ Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependen
   записаны как dirty 40099c6, а не measured source 6a27253, остальные current-*
   остались на fbaf638, README geomean 1.41x vs заявленный 1.44x; BLOCKER 4:
   report.md устарёл. Полезные ownership/OOM-фиксы review-5 сохраняются; open-count 21→22.
+
+  ЗАКРЫТО фазой P16.50-review-6 (2026-09-17; open-count 22→21). BLOCKER 1:
+  статический сканер `testcScriptOutBound` полностью удалён (остались только
+  комментарии-ориентиры vm.zig:46626, vm.zig:55080, документирующие отвергнутый
+  подход); builtin-call contract переведён на runtime-dynamic `BuiltinResult`
+  (vm.zig:21242: `window | owned`) — `callBuiltin` (vm.zig:21247) возвращает
+  фактическое количество результатов C-функции, `consumeBuiltinResult`
+  (vm.zig:21432) применяет обычный nresults/grow/copy contract на
+  OP_CALL/OP_TAILCALL/TFORCALL/host-API границах (PUC ldo.c precallC →
+  luaD_poscall/moveresults двухфазная модель); fixed/from-arguments builtins
+  сохраняют быстрый window path; single-owner инвариант на
+  success/OOM/yield/TBC/hook путях; `last_builtin_out_count` не транспортирует
+  owned-результаты. BLOCKER 2: один общий семантический примитив
+  `newMetatableShared` (vm.zig:32708) с PUC-порядком lauxlib.c:317-327
+  (registry lookup → existing+false | create → root → `__name = tname` →
+  publish → table+true); `api.State.newmetatable` (api.zig:1187) и testC-команда
+  `newmetatable` (vm.zig:45710) — тонкие обёртки над примитивом; non-nil
+  registry value считается name-in-use; per-edge FailingAllocator OOM-тест
+  (intern/table/root/__name/publish, registry pre-filled to max load) доказывает
+  отсутствие partial publish / dangling registry entry / ledger drift. Гейты
+  фазы: unit 248/248 Debug+ReleaseFast 0 leaks; 12 upstream testc-лейнов rc=0
+  (locals/vararg/api/memerr/coroutine/cstack/gc/gengc/tracegc/calls/db/errors);
+  matrix --testc 31/32 (zig_fail=0, big.lua both_fail pre-existing); smoke
+  84/84; fmt + git-diff-check clean. Perf: ОДНА объявленная paired-seed
+  clean-C сессия (seeds 1..21, RUNS=21) — verdict и полное canonical current-*
+  перегенерирование на clean C фиксируются артефактным commit'ом D
+  (current-gate.json/manifest; STATUS — artifact-class per
+  tools/provenance.py ARTIFACT_PATHS); baselines byte-identical без
+  owner-approved обновлений.
 
 
 
@@ -7505,6 +7534,55 @@ C = fbaf638 → D = wrapper.
 - **Батарея**: 15/15 (unit D/RF 241/241 0 leaks, selftests, noise + 7
   neg, smoke 84/84 + 84/84 --testc, matrix zig_fail=0, c_api 23 +
   DIFF: PASS, api580, gc.lua, diff --check); crash-loop 20/20.
+
+### P16.50-review-6: dynamic builtin results + newmetatable __name parity (2026-09-17)
+
+Фаза по owner-ledger item (переоткрыт 5e4363f; open-count 21→22→закрыт→21).
+Коммиты: C = measured source (настоящий коммит; RF binary sha256
+0ba8593b5dbfbb3698f4195cf1d5a73be83d5064ab0a061a32a1475613c1a500,
+верифицирован determinism-rebuild после C) → D = wrapper (полное canonical
+current-* перегенерирование на clean C + объявленная clean-C perf-сессия;
+source_head сессии = C, source_dirty = clean — закрытие BLOCKER 3
+provenance-расщепления review-5).
+
+- **BLOCKER 1 — testcScriptOutBound усекал корректные результаты**: сканер
+  удалён; runtime-dynamic `BuiltinResult` contract (vm.zig:21242:
+  `window: usize | owned: []Value`) — двухфазная модель PUC precallC/
+  luaD_poscall: `callBuiltin` (vm.zig:21247) возвращает фактический результат
+  C-функции, `consumeBuiltinResult` (vm.zig:21432) применяет обычный nresults
+  contract + grow/copy на OP_CALL/OP_TAILCALL/TFORCALL/host-API границах.
+  Fixed/from-arguments builtins сохраняют быстрый window path; single-owner
+  на success/OOM/yield/TBC/hook путях; `last_builtin_out_count` не является
+  VM-global transport'ом для owned-результатов. Тесты: оба owner-repro
+  (compare → r.n==4; newmetatable → r.n==3), `return *` после
+  compare/topointer/traceback/newmetatable, отрицательный settop + `return *`,
+  nested/re-entrant T.testC, fixed `return N`, callable/table form, OOM до и
+  после dynamic results, return hook, tail call, TBC close; negative-before
+  на чистом 6a27253 подтверждён (оба repro падали rc=1).
+- **BLOCKER 2 — luaL_newmetatable не ставил __name**: один общий примитив
+  `newMetatableShared` (vm.zig:32708) с PUC-порядком lauxlib.c:317-327
+  (lookup → existing+false | create → root → `__name = tname` → publish →
+  table+true); `api.State.newmetatable` (api.zig:1187) и testC-команда
+  (vm.zig:45710) — тонкие обёртки; non-nil registry value = name-in-use;
+  per-edge FailingAllocator OOM-тест (intern/table/root/__name/publish,
+  registry pre-filled to max load) — нет partial publish, нет dangling entry,
+  нет ledger drift. Repro печатает `table true review_name_probe`.
+- **Попутно закрыты 3 pre-existing утечки**: traceback body buffer,
+  BytecodeProtectedCall struct ×2, BytecodeHookContinuation.
+- **Perf**: ОДНА объявленная paired-seed clean-C сессия (seeds 1..21,
+  RUNS=21) на commit C (source_head = C, source_dirty = clean) — verdict в
+  tools/perf/current-gate.json + current-gate-manifest.json (commit D);
+  geomean diagnostic перегенерируется в README status-блоке; baselines
+  byte-identical (baseline-approved/baseline-p15.37/core_baseline не
+  тронуты). Две dirty-сессии 2026-09-17 (HEAD 5c03e0f, верификация BLOCKER
+  1+2) остаются в manifest как исторические строки (append-only).
+- **Батарея**: 248/248 unit (Debug+ReleaseFast, 0 leaks), 12 upstream
+  testc-лейнов rc=0, matrix --testc 31/32 (zig_fail=0, big.lua both_fail
+  pre-existing), smoke 84/84, fmt + git-diff-check clean.
+- **Известные pre-existing (не внесены фазой, задокументированы для
+  владельца)**: locals.lua stderr GC-pacing dot diff (3 vs 2, HEAD-level);
+  Debug-build cstack.lua native-stack exhaustion edge (<1% RF flake,
+  HEAD-level); big.lua both_fail (pre-existing, matrix).
 
 ### P16.50-review-5: rescue + completion (2026-09-17)
 

@@ -1177,42 +1177,15 @@ pub const State = struct {
     }
 
     /// Create a table, store it in the registry under key `tname`, push it.
-    /// PUC luaL_newmetatable (lauxlib.c:317-327). P16.50-review-5 3.2:
-    /// - the table comes from the NORMAL table constructor (`apiNewTable`
-    ///   → allocTable → gcPrepareRegister/gcRegisterCommit + gcNoteAlloc) —
-    ///   the same register/accounting contract as every other table. Being
-    ///   a metatable does NOT make a table finalizable: the old manual
-    ///   `alloc.create(Table)` + `registerFinalizable` invented a
-    ///   __gc-eligible object PUC never creates (luaL_newmetatable calls
-    ///   plain lua_createtable) and skipped the table accounting.
-    /// - PUC rooting order: the fresh table sits on the Lua stack (a GC
-    ///   root) BEFORE the registry publish (lauxlib.c keeps it on L's
-    ///   stack across lua_setfield), so the publish's OOM path can run an
-    ///   emergency GC without sweeping the table, and a failed publish
-    ///   leaves no dangling registry entry.
-    /// Every OOM edge has exactly one owner:
-    ///   - constructor OOM → nothing exists, nothing published (the normal
-    ///     apiNewTable contract rolls back internally);
-    ///   - stack-root OOM → the table is registered-but-unrooted; the next
-    ///     GC collects it through the normal sweep — no leak, no dangling
-    ///     registry entry (the identical window plain `newtable()` has);
-    ///   - registry-publish OOM → the table stays rooted on the API stack
-    ///     (PUC leaves it on L's stack across the luaD_throw too) and the
-    ///     registry is untouched.
+    /// PUC luaL_newmetatable (lauxlib.c:317-327). P16.50-review-6 B2: this
+    /// is a THIN wrapper over the one shared semantic path
+    /// (`Vm.newMetatableShared`) used by both the C API here and the testC
+    /// `newmetatable` command — same registry, same PUC order (lookup →
+    /// existing-value-on-top + false | create normal GC table → root on
+    /// the API stack → `__name = tname` → publish to registry → true).
+    /// Per-edge OOM ownership is documented and proven at the primitive.
     pub fn newmetatable(self: *State, tname: []const u8) ApiError!bool {
-        const reg = self.vm.apiEnsureRegistry() catch |e| return mapVmError(e);
-        const key = try self.vm.internStr(tname);
-        const existing = self.vm.apiRawGet(reg, .{ .String = key });
-        if (existing == .Table) {
-            try self.stack.append(self.vm.alloc, existing);
-            return false;
-        }
-        const mt = self.vm.apiNewTable() catch |e| return mapVmError(e);
-        // PUC lauxlib.c:321-325: root the fresh table on the API stack
-        // BEFORE publishing it into the registry.
-        try self.stack.append(self.vm.alloc, .{ .Table = mt });
-        self.vm.apiRawSet(reg, .{ .String = key }, .{ .Table = mt }) catch |e| return mapVmError(e);
-        return true;
+        return self.vm.apiNewMetatable(tname, self.stack, self.vm.alloc) catch |e| mapVmError(e);
     }
 
     /// Push the metatable registered under `tname`, or nil.

@@ -6463,13 +6463,24 @@ pub const Vm = struct {
                 const out_len = self.builtinOutLen(id, resolved.args);
                 const outs = try self.alloc.alloc(Value, out_len);
                 errdefer self.alloc.free(outs);
-                try exposeDispatchResult(void, self.callBuiltin(id, resolved.args, outs, .host));
-                const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
-                if (used == outs.len) return outs;
-                const ret = try self.alloc.alloc(Value, used);
-                for (0..used) |i| ret[i] = outs[i];
-                self.alloc.free(outs);
-                return ret;
+                // P16.50-review-6 BLOCKER 1: apiCall returns ALL results to
+                // its caller — an owned slice (T.testC) is returned directly
+                // (freeing the unused window); a window result is trimmed to
+                // the produced count as before.
+                const bres = try exposeDispatchResult(BuiltinResult, self.callBuiltin(id, resolved.args, outs, .host));
+                switch (bres) {
+                    .owned => |vals| {
+                        self.alloc.free(outs);
+                        return vals;
+                    },
+                    .window => |produced| {
+                        if (produced == outs.len) return outs;
+                        const ret = try self.alloc.alloc(Value, produced);
+                        for (0..produced) |i| ret[i] = outs[i];
+                        self.alloc.free(outs);
+                        return ret;
+                    },
+                }
             },
             .Closure => |cl| return exposeDispatchResult([]Value, self.runClosure(cl, resolved.args)),
             else => unreachable,
@@ -9388,8 +9399,7 @@ pub const Vm = struct {
     /// Drop a protected continuation because its caller itself is being
     /// unwound or collected.  Unlike normal completion, the current error is
     /// authoritative and must not be overwritten with the parked caller error.
-    fn discardBytecodeProtectedCall(self: *Vm, protection: *BytecodeProtectedCall) void {
-        // The armed handler slot dies with this unwind; clear a matching
+    fn discardBytecodeProtectedCall(self: *Vm, protection: *BytecodeProtectedCall) void { // The armed handler slot dies with this unwind; clear a matching
         // errfunc so no later error on this thread invokes a stale handler
         // (PUC: unwinding past a pcallk frame restores the old errfunc).
         if (protection.armed_errfunc != ERRFUNC_NONE) {
@@ -9951,6 +9961,9 @@ pub const Vm = struct {
         }
         if (pending.protection) |protection| {
             self.discardBytecodeProtectedCall(protection);
+            // P16.50-review-6: destroy the heap protection struct (see the
+            // matching destroy in completeBytecodeProtectedResult).
+            self.alloc.destroy(protection);
             pending.protection = null;
         }
     }
@@ -10459,7 +10472,8 @@ pub const Vm = struct {
         return switch (resolved.callee) {
             .Builtin => |id| blk: {
                 var out: [1]Value = .{.Nil};
-                try self.callBuiltin(id, resolved.args, out[0..], .host);
+                const bres = try self.callBuiltin(id, resolved.args, out[0..], .host);
+                _ = self.consumeBuiltinResult(bres, out[0..]);
                 break :blk out[0];
             },
             .Closure => |cl| blk: {
@@ -11151,7 +11165,8 @@ pub const Vm = struct {
             acc = switch (resolved.callee) {
                 .Builtin => |id| blk: {
                     var out: [1]Value = .{.Nil};
-                    try self.callBuiltin(id, resolved.args, out[0..], .host);
+                    const bres = try self.callBuiltin(id, resolved.args, out[0..], .host);
+                    _ = self.consumeBuiltinResult(bres, out[0..]);
                     break :blk out[0];
                 },
                 .Closure => |cl| blk: {
@@ -11710,6 +11725,16 @@ pub const Vm = struct {
         runtime.setTailCallBool(cont.saved_parent_tailcall);
         self.clearPendingCall(exec_frames.getPtr(parent_index));
         self.alloc.free(cont.transfer);
+        // P16.50-review-6: the hook continuation struct is heap-allocated in
+        // tryPushBytecodeDebugHook (alloc.create) and owned by the pending
+        // call's .hook completion. This consume path clears that pending and
+        // handles every post variant below — destroy the struct on every
+        // exit (normal, error, value-returning). The OTHER owner path —
+        // pending-call discard during an unwind — destroys it in
+        // freePendingCall's hook branch. Pre-existing leak on every hook
+        // completion (exposed by the testC contract unit tests via
+        // debug.sethook 'r' around builtin calls).
+        defer self.alloc.destroy(cont);
 
         switch (cont.post) {
             .resume_instruction => |state| {
@@ -13876,6 +13901,15 @@ pub const Vm = struct {
             for (completed_ret) |value| try result_roots.add(value);
         }
         self.finishBytecodeProtectedCall(protection);
+        // P16.50-review-6: the protection struct is heap-allocated in
+        // tryPushBytecodeProtectedCall (alloc.create) — finish consumes it
+        // fully, so the completion path destroys it here. (The errdefer
+        // fallback in tryPushBytecodeProtectedCall uses a STACK struct and
+        // must not destroy — hence the destroy lives at the owning call
+        // sites, not inside finish.) Pre-existing leak on every
+        // pcall/xpcall completion, exposed by the testC contract unit
+        // tests (leak-checked allocator).
+        self.alloc.destroy(protection);
         self.getPendingCallPtr(exec_frames.getPtr(parent_index).pending_call_index).?.protection = null;
 
         const result_cont = switch (pending.completion) {
@@ -19120,6 +19154,11 @@ pub const Vm = struct {
                 // P16.41 Cut 3 Variant A: the C-frame is a VIEW at the
                 // EXISTING iterator slot R[A+4] (pushBuiltinCFrameAt — PUC
                 // precallC views the func slot in the caller's window).
+                // P16.50-review-6 BLOCKER 1: default to the full window (the
+                // frameless path — collectgarbage/string_sub — never calls
+                // callBuiltin here; pre-existing shape), overwrite with the
+                // real contract when the C-frame path runs.
+                var tfc_bres: BuiltinResult = .{ .window = out_len };
                 if (builtinNeedsCFrame(id)) {
                     try self.pushBuiltinCFrameAt(ctx.base + a + 4);
                     const cf_idx = self.activeBytecodeThread().call_frames.len() - 1;
@@ -19136,12 +19175,15 @@ pub const Vm = struct {
                         ctx.th.bytecode_stack[ctx.base + a + 5 .. ctx.base + a + 5 + effective_nargs]
                     else
                         rargs_builtin;
-                    try self.callBuiltin(id, rargs_builtin_fresh, outs, .bytecode_window);
+                    tfc_bres = try self.callBuiltin(id, rargs_builtin_fresh, outs, .bytecode_window);
                 }
-                const produced: usize = if (builtinHasDynamicOutCount(id))
-                    @min(self.last_builtin_out_count, outs.len)
-                else
-                    out_len;
+                // Owned results (T.testC as a for-iterator): the exact-count
+                // slice IS the transport — the `defer self.alloc.free(ret)`
+                // below frees it (foreign blocks pass through the charged
+                // registry), replacing the infraAlloc dupe. PUC poscall
+                // moves the C results in place; no intermediate copy.
+                if (tfc_bres == .owned) break :blk tfc_bres.owned;
+                const produced: usize = tfc_bres.window;
                 // PUC luaD_poscall moves the C results into the caller's
                 // pre-reserved stack slots — pure transport, never a
                 // COUNTED allocation. Under an armed countdown (locals.lua
@@ -19853,6 +19895,10 @@ pub const Vm = struct {
                 }
                 // P15.51l: reg_top lives directly on the CallFrame.
                 // P16.5b: Use direct call for coroutine fast path.
+                // P16.50-review-6 BLOCKER 1: both paths classify into the
+                // BuiltinResult contract; the direct path (which bypasses
+                // callBuiltin) mirrors callBuiltin's tail formula.
+                var tc_bres: BuiltinResult = undefined;
                 if (co_fast_path) {
                     self.callCoroutineBuiltinDirect(id, call_args, outs) catch |call_err| switch (call_err) {
                         error.Yield => {
@@ -19876,6 +19922,10 @@ pub const Vm = struct {
                         error.RuntimeError => return error.RuntimeError,
                         error.ThreadSwitch => return error.ThreadSwitch,
                     };
+                    tc_bres = .{ .window = if (builtinHasDynamicOutCount(id))
+                        @min(self.last_builtin_out_count, outs.len)
+                    else
+                        outs.len };
                 } else {
                     // P16.41 Cut 3: view frame pushed above for every
                     // C-frame builtin; frameless builtins pass .host (the
@@ -19883,7 +19933,7 @@ pub const Vm = struct {
                     // either way, see the opCall site for the rationale).
                     const tc_cframe_origin: BuiltinCallOrigin =
                         if (builtinNeedsCFrame(id)) .bytecode_window else .host;
-                    self.callBuiltin(id, call_args, outs, tc_cframe_origin) catch |call_err| switch (call_err) {
+                    tc_bres = self.callBuiltin(id, call_args, outs, tc_cframe_origin) catch |call_err| switch (call_err) {
                         error.Yield => {
                             if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
                                 const th = self.current_thread.?;
@@ -19909,10 +19959,16 @@ pub const Vm = struct {
                         error.ThreadSwitch => return error.ThreadSwitch,
                     };
                 }
-                const used = if (builtinHasDynamicOutCount(id))
-                    @min(self.last_builtin_out_count, outs.len)
-                else
-                    outs.len;
+                // P16.50-review-6 BLOCKER 1: owned results (T.testC) are the
+                // tail-call transport DIRECTLY — the exact-count slice flows
+                // into the same ownership contract as the duped window
+                // results below (completeBytecodeExecFrame /
+                // beginBytecodeClose's .return_frame post free heap slices;
+                // self.alloc.free passes infraAlloc'd blocks through). No
+                // dupe, no bc_return_scratch staging: PUC's poscall moves
+                // the C results on the shared stack in place.
+                if (tc_bres == .owned) break :blk tc_bres.owned;
+                const used = tc_bres.window;
                 // P16.32 T2 Cut B: on the nothing-to-close fast path, stash
                 // the results in bc_return_scratch (borrowed, detected by
                 // returnSliceIsOwned, never freed) instead of heap-duping —
@@ -20343,6 +20399,12 @@ pub const Vm = struct {
                 // P15.51l: reg_top lives directly on the CallFrame.
                 const fr_pre_call = ctx.exec_frames.getPtr(ctx.frame_index);
                 if (!fr_pre_call.isC()) fr_pre_call.u.lua.frame_cap = ctx.frame_cap;
+                // P16.50-review-6 BLOCKER 1: the builtin's result contract.
+                // Initialized to the 0-window for the coroutine fast path
+                // (callCoroutineBuiltinDirect writes `outs` itself and is
+                // never an owned-result builtin); the generic path assigns
+                // callBuiltin's BuiltinResult below.
+                var bres: BuiltinResult = .{ .window = 0 };
                 // P15.83r (PUC ldo.c:642-656 precallC ordering): the C
                 // CallInfo exists BEFORE the CALL hook fires. Push the
                 // builtin's C-frame, fire the event on it (ar.i_ci = the C
@@ -20414,6 +20476,14 @@ pub const Vm = struct {
                         error.RuntimeError => return error.RuntimeError,
                         error.ThreadSwitch => return error.ThreadSwitch,
                     };
+                    // callCoroutineBuiltinDirect writes `outs` and reports
+                    // its true count via last_builtin_out_count (resume/
+                    // yield are dynamic-count builtins) — capture it here at
+                    // the call boundary, exactly like callBuiltin does.
+                    bres = .{ .window = if (builtinHasDynamicOutCount(id))
+                        @min(self.last_builtin_out_count, outs.len)
+                    else
+                        out_len };
                 } else {
                     // P16.41 Cut 3: the view frame was pushed above for every
                     // C-frame builtin; frameless builtins (collectgarbage/
@@ -20423,7 +20493,7 @@ pub const Vm = struct {
                     // pushed or popped for them either way.
                     const cframe_origin: BuiltinCallOrigin =
                         if (builtinNeedsCFrame(id)) .bytecode_window else .host;
-                    self.callBuiltin(id, rargs_fresh, outs, cframe_origin) catch |call_err| switch (call_err) {
+                    bres = self.callBuiltin(id, rargs_fresh, outs, cframe_origin) catch |call_err| switch (call_err) {
                         error.Yield => {
                             if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
                                 const th = self.current_thread.?;
@@ -20453,63 +20523,137 @@ pub const Vm = struct {
                     ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
                     outs = ctx.regs[outs_start .. outs_start + out_len];
                 }
-                const produced: usize = if (builtinHasDynamicOutCount(id))
-                    @min(self.last_builtin_out_count, outs.len)
-                else
-                    out_len;
-                // P16.35 Cut 3: gate the return-event hook probes by the
-                // cached hooks-active flag at the call site — both helpers'
-                // first check is exactly `!hooks_active_cached` (PUC
-                // precallC reads L->hookmask directly, ldo.c:650; no
-                // out-of-line probe when no hooks exist). Identical flag,
-                // no intervening mutation — semantics preserved.
-                if (self.hooks_active_cached) {
-                    if (try self.tryPushBytecodeDebugHook(
-                        ctx.exec_frames,
-                        ctx.frame_index,
-                        "return",
-                        null,
-                        callee_val,
-                        outs[0..produced],
-                        1,
-                        .{ .store_results = .{
-                            .continuation = .{ .dst = a, .nresults = nresults },
-                            .values = outs[0..produced],
-                        } },
-                    )) {
-                        const pc2_idx = ctx.exec_frames.getPtr(ctx.frame_index).pending_call_index;
-                        if (self.getPendingCallPtr(pc2_idx)) |pending| {
-                            if (pending.completion == .hook and pending.completion.hook.post == .store_results) {
-                                const old_values = pending.completion.hook.post.store_results.values;
-                                if (self.returnSliceIsOwned(old_values)) {
-                                    // Already scratch-owned, no free needed
-                                } else if (@intFromPtr(old_values.ptr) >= @intFromPtr(ctx.th.bytecode_stack.ptr) and
-                                    @intFromPtr(old_values.ptr) < @intFromPtr(ctx.th.bytecode_stack.ptr) + ctx.th.bytecode_stack.len * @sizeOf(Value))
-                                {
-                                    const owned = try self.alloc.dupe(Value, old_values);
-                                    pending.completion.hook.post.store_results.values = owned;
-                                }
+                // P16.50-review-6 BLOCKER 1: consume the BuiltinResult under
+                // the ordinary nresults contract. The window path is the
+                // pre-existing flow (results in the pre-sized outs window).
+                // The owned path (T.testC) receives the EXACT result count
+                // first, then applies the contract — PUC luaD_poscall:
+                // moveresults adjusts the C function's actual count to the
+                // caller's nresults (truncate / nil-pad / keep all for
+                // multret), growing the caller's frame only when the results
+                // exceed it.
+                switch (bres) {
+                    .owned => |vals| {
+                        // Single owner: this scope. Freed on every exit — the
+                        // errdefer on error unwind, the explicit free on the
+                        // normal store, ownership transfer to the hook
+                        // continuation on the async path (freeBytecodeHookPost
+                        // frees it; self.alloc.free passes infraAlloc'd blocks
+                        // through the charged-block registry unaccounted).
+                        var vals_owned = true;
+                        errdefer if (vals_owned) self.infraAlloc().free(vals);
+                        // Root the values across the sync return-hook portion:
+                        // the hook is Lua code that can allocate and GC; the
+                        // heap slice is invisible to the collector without this
+                        // (TempRoots uses infraAlloc — countdown-safe, so an
+                        // armed countdown cannot kill the hook arm itself).
+                        var roots = self.gcTempRoots();
+                        defer roots.end();
+                        for (vals) |v| try roots.add(v);
+                        // P16.35 Cut 3: gate the return-event hook probes by the
+                        // cached hooks-active flag (see the window path below).
+                        if (self.hooks_active_cached) {
+                            if (try self.tryPushBytecodeDebugHook(
+                                ctx.exec_frames,
+                                ctx.frame_index,
+                                "return",
+                                null,
+                                callee_val,
+                                vals,
+                                1,
+                                .{ .store_results = .{
+                                    .continuation = .{ .dst = a, .nresults = nresults },
+                                    .values = vals,
+                                } },
+                            )) {
+                                // Ownership transferred to the pending hook
+                                // continuation (rooted by gcMarkMutableRoots;
+                                // freed by freeBytecodeHookPost).
+                                vals_owned = false;
+                                return .continue_frame_loop;
+                            }
+                            try self.dispatchBytecodeHookWithCallee("return", callee_val, vals);
+                        }
+                        ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                        const nstore: usize = if (nresults >= 0) @intCast(nresults) else vals.len;
+                        // PUC luaD_growstack parity: the frame grows only when
+                        // the actual results exceed it — a COUNTED bc_stack grow
+                        // (the pre-sized window path paid this up front for
+                        // every call; the owned path pays it only in overflow).
+                        try self.growCtxFrame(ctx, a + nstore);
+                        // P16.39 Cut 3: PUC luaD_poscall moveresults — the
+                        // single-result contract is one unguarded move; the
+                        // nil-padded loop serves multi-result and variable
+                        // contracts.
+                        if (nstore == 1) {
+                            ctx.regs[a] = if (vals.len >= 1) vals[0] else .Nil;
+                        } else {
+                            for (0..nstore) |i| {
+                                ctx.regs[a + i] = if (i < vals.len) vals[i] else .Nil;
                             }
                         }
-                        return .continue_frame_loop;
-                    }
-                    try self.dispatchBytecodeHookWithCallee("return", callee_val, outs[0..produced]);
+                        if (nresults < 0) ctx.exec_frames.getPtr(ctx.frame_index).reg_top = @intCast(@as(usize, a) + vals.len);
+                        self.infraAlloc().free(vals);
+                        vals_owned = false;
+                        try self.condGcFromDispatch(ctx);
+                        return .continue_dispatch;
+                    },
+                    .window => |produced| {
+                        // P16.35 Cut 3: gate the return-event hook probes by the
+                        // cached hooks-active flag at the call site — both helpers'
+                        // first check is exactly `!hooks_active_cached` (PUC
+                        // precallC reads L->hookmask directly, ldo.c:650; no
+                        // out-of-line probe when no hooks exist). Identical flag,
+                        // no intervening mutation — semantics preserved.
+                        if (self.hooks_active_cached) {
+                            if (try self.tryPushBytecodeDebugHook(
+                                ctx.exec_frames,
+                                ctx.frame_index,
+                                "return",
+                                null,
+                                callee_val,
+                                outs[0..produced],
+                                1,
+                                .{ .store_results = .{
+                                    .continuation = .{ .dst = a, .nresults = nresults },
+                                    .values = outs[0..produced],
+                                } },
+                            )) {
+                                const pc2_idx = ctx.exec_frames.getPtr(ctx.frame_index).pending_call_index;
+                                if (self.getPendingCallPtr(pc2_idx)) |pending| {
+                                    if (pending.completion == .hook and pending.completion.hook.post == .store_results) {
+                                        const old_values = pending.completion.hook.post.store_results.values;
+                                        if (self.returnSliceIsOwned(old_values)) {
+                                            // Already scratch-owned, no free needed
+                                        } else if (@intFromPtr(old_values.ptr) >= @intFromPtr(ctx.th.bytecode_stack.ptr) and
+                                            @intFromPtr(old_values.ptr) < @intFromPtr(ctx.th.bytecode_stack.ptr) + ctx.th.bytecode_stack.len * @sizeOf(Value))
+                                        {
+                                            const owned = try self.alloc.dupe(Value, old_values);
+                                            pending.completion.hook.post.store_results.values = owned;
+                                        }
+                                    }
+                                }
+                                return .continue_frame_loop;
+                            }
+                            try self.dispatchBytecodeHookWithCallee("return", callee_val, outs[0..produced]);
+                        }
+                        const nstore: usize = if (nresults >= 0) @intCast(nresults) else produced;
+                        // P16.39 Cut 3: PUC luaD_poscall moveresults (ldo.c:436-440)
+                        // — the single-result contract (the overwhelmingly common
+                        // call shape: every `f(x)` assignment) is one unguarded
+                        // move; the nil-padded loop only serves multi-result and
+                        // variable-result contracts.
+                        if (nstore == 1) {
+                            ctx.regs[a] = if (produced >= 1) outs[0] else .Nil;
+                        } else {
+                            for (0..nstore) |i| {
+                                ctx.regs[a + i] = if (i < produced) outs[i] else .Nil;
+                            }
+                        }
+                        if (nresults < 0) ctx.exec_frames.getPtr(ctx.frame_index).reg_top = @intCast(@as(usize, a) + produced);
+                        try self.condGcFromDispatch(ctx);
+                    },
                 }
-                const nstore: usize = if (nresults >= 0) @intCast(nresults) else produced;
-                // P16.39 Cut 3: PUC luaD_poscall moveresults (ldo.c:436-440)
-                // — the single-result contract (the overwhelmingly common
-                // call shape: every `f(x)` assignment) is one unguarded
-                // move; the nil-padded loop only serves multi-result and
-                // variable-result contracts.
-                if (nstore == 1) {
-                    ctx.regs[a] = if (produced >= 1) outs[0] else .Nil;
-                } else {
-                    for (0..nstore) |i| {
-                        ctx.regs[a + i] = if (i < produced) outs[i] else .Nil;
-                    }
-                }
-                if (nresults < 0) ctx.exec_frames.getPtr(ctx.frame_index).reg_top = @intCast(@as(usize, a) + produced);
-                try self.condGcFromDispatch(ctx);
             },
             .Closure => |cl| {
                 if (cl.proto) |proto2| {
@@ -21068,7 +21212,39 @@ pub const Vm = struct {
     ///     L->top), with the growth check + savestack re-derive ceremony.
     const BuiltinCallOrigin = enum { bytecode_window, host };
 
-    fn callBuiltin(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value, origin: BuiltinCallOrigin) DispatchError!void {
+    /// P16.50-review-6 BLOCKER 1: the result contract of a synchronous
+    /// `callBuiltin` invocation — the runtime-dynamic analogue of PUC's
+    /// precallC/luaD_poscall model (ldo.c): a C function's results land on
+    /// the caller's stack ABOVE L->top with no pre-sized window, and the
+    /// ACTUAL count (the C function's return value) is only known after it
+    /// runs.
+    ///
+    ///   - `window`: the overwhelming majority — the builtin wrote its
+    ///     results into the caller-provided `outs` window (a slice into
+    ///     bc_stack or a local buffer). `produced` is the number of valid
+    ///     results (the window length, or `last_builtin_out_count` for
+    ///     builtins whose true count is smaller than the window — pcall,
+    ///     resume, select, ...; the count is read HERE, at the call
+    ///     boundary, before any further VM execution can clobber it).
+    ///
+    ///   - `owned`: the builtin could not know its result count before
+    ///     running (today only T.testC: `return *`/`return N` depend on the
+    ///     script's runtime stack). It returns a heap slice with the EXACT
+    ///     results (allocated via infraAlloc — result transport, uncounted,
+    ///     PUC luaD_poscall parity). The caller consumes it under the
+    ///     ordinary nresults contract and frees it (self.alloc.free is safe:
+    ///     the charged-block registry passes foreign blocks through).
+    ///
+    /// Single-owner invariant: on success, ownership of an `owned` slice
+    /// passes to the CALLER of callBuiltin; on error/Yield/ThreadSwitch the
+    /// builtin keeps it (nothing is returned). `last_builtin_out_count`
+    /// never transports owned results — the count is structural here.
+    const BuiltinResult = union(enum) {
+        window: usize,
+        owned: []Value,
+    };
+
+    fn callBuiltin(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value, origin: BuiltinCallOrigin) DispatchError!BuiltinResult {
         if (self.stats.enabled) self.stats.calls_builtin += 1; // P16.0b
         // P16.39 Cut 3: snapshot the bc_stack slice BEFORE the C-frame
         // push. The push may realloc it; the snapshot is the base for
@@ -21202,7 +21378,7 @@ pub const Vm = struct {
             self.active_builtin = prev_active_builtin;
             self.active_builtin_args = prev_active_builtin_args;
         }
-        self.callBuiltinSwitch(id, args_fresh, outs_fresh) catch |err| {
+        const owned = self.callBuiltinSwitch(id, args_fresh, outs_fresh) catch |err| {
             if (err == error.Yield or err == error.ThreadSwitch) {
                 cframe_preserved = true;
             } else if (err == error.RuntimeError) {
@@ -21226,14 +21402,56 @@ pub const Vm = struct {
             }
             return err;
         };
+        // P16.50-review-6 BLOCKER 1: wrap the arm's outcome in the
+        // BuiltinResult contract. An owned slice (T.testC) passes through
+        // as-is — exact results, no window. Otherwise the builtin wrote its
+        // window: the count is the window length, or — for builtins whose
+        // true count is smaller than their window (pcall, resume, select,
+        // ...) — `last_builtin_out_count` as set by the arm. The count is
+        // captured HERE, at the call boundary, before any further VM
+        // execution can clobber the field (re-entrant safety: an outer
+        // dynamic builtin's count is read only after its nested execution
+        // completed, exactly like PUC reads the C function's return value
+        // after it returns).
+        if (owned) |vals| return .{ .owned = vals };
+        const produced: usize = if (builtinHasDynamicOutCount(id))
+            @min(self.last_builtin_out_count, outs_fresh.len)
+        else
+            outs_fresh.len;
+        return .{ .window = produced };
     }
 
-    fn callBuiltinSwitch(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value) DispatchError!void {
+    /// P16.50-review-6 BLOCKER 1: consume a BuiltinResult at a host call
+    /// site that wants the results in a fixed local/window buffer.
+    /// `.window`: the builtin already wrote its results into `out`;
+    /// `produced` passes through. `.owned`: copy up to `out.len` results
+    /// into `out` (min-clamped — the caller's window is the contract) and
+    /// free the slice. Returns the number of results now available in
+    /// `out`. Sites that need ALL results (apiCall) branch on the union
+    /// themselves instead of using this helper.
+    fn consumeBuiltinResult(self: *Vm, bres: BuiltinResult, out: []Value) usize {
+        switch (bres) {
+            .window => |produced| return produced,
+            .owned => |vals| {
+                const n = @min(vals.len, out.len);
+                if (n > 0) @memcpy(out[0..n], vals[0..n]);
+                self.infraAlloc().free(vals);
+                return n;
+            },
+        }
+    }
+
+    /// P16.50-review-6 BLOCKER 1: the arm dispatch returns the builtin's
+    /// outcome — `null` for the window contract (results written into
+    /// `outs`, count derived by callBuiltin), or an owned heap slice with
+    /// the EXACT results for builtins that cannot know their count before
+    /// running (T.testC: `return *` / `return N`).
+    fn callBuiltinSwitch(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value) DispatchError!?[]Value {
         switch (id) {
             .print => try self.builtinPrint(args),
             .warn => try self.builtinWarn(args, outs),
             .tostring => {
-                if (outs.len == 0) return;
+                if (outs.len == 0) return null;
                 if (args.len == 0) return self.fail("bad argument #1 to 'tostring' (value expected)", .{});
                 if (self.getMetaFieldByObj(args[0], .tostring)) |mm| {
                     var call_args = [_]Value{args[0]};
@@ -21509,7 +21727,7 @@ pub const Vm = struct {
             .coroutine_running => try self.builtinCoroutineRunning(args, outs),
             .coroutine_isyieldable => try self.builtinCoroutineIsyieldable(args, outs),
             .coroutine_close => try self.builtinCoroutineClose(args, outs),
-            .testc_testC => try self.builtinTestcTestC(args, outs),
+            .testc_testC => return try self.builtinTestcTestC(args, outs),
             .testc_makecfunc => try self.builtinTestcMakeCfunc(args, outs),
             .testc_allowhookyield => try self.builtinTestcAllowHookYield(args, outs),
             .testc_totalmem => try self.builtinTestcTotalmem(args, outs),
@@ -21536,6 +21754,10 @@ pub const Vm = struct {
                 self.last_builtin_out_count = 0;
             },
         }
+        // Window contract: the arm wrote its results into `outs` (or none);
+        // callBuiltin derives the count. Only the owned arms above return
+        // early with a slice.
+        return null;
     }
 
     /// PUC `setpath` (loadlib.c:274): resolve `package.path`/`cpath` from
@@ -22731,13 +22953,20 @@ pub const Vm = struct {
             const resolved = self.resolveCallable(callee, call_args, null) catch return;
             defer if (resolved.owned_args) |owned| self.alloc.free(owned);
             switch (resolved.callee) {
-                .Builtin => |id| self.callBuiltin(id, resolved.args, &[_]Value{}, .host) catch |e| {
-                    // P16.31 Cut 3: pcall recovery-boundary close (PUC
-                    // luaD_closeprotected) — never on a yield (the yield
-                    // propagates through the pre-existing swallow here).
-                    if (e != error.Yield) {
-                        if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_pcall_ef, idx);
-                    }
+                .Builtin => |id| {
+                    const bres = self.callBuiltin(id, resolved.args, &[_]Value{}, .host) catch |e| {
+                        // P16.31 Cut 3: pcall recovery-boundary close (PUC
+                        // luaD_closeprotected) — never on a yield (the yield
+                        // propagates through the pre-existing swallow here).
+                        if (e != error.Yield) {
+                            if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_pcall_ef, idx);
+                        }
+                        return;
+                    };
+                    // P16.50-review-6: 0-window swallow — free any owned
+                    // results (T.testC called for side effects).
+                    _ = self.consumeBuiltinResult(bres, &[_]Value{});
+                    return;
                 },
                 .Closure => |cl| {
                     const ret = self.runClosure(cl, resolved.args) catch |e| {
@@ -22836,7 +23065,7 @@ pub const Vm = struct {
                 }
                 defer if (tmp_heap) self.alloc.free(tmp);
 
-                self.callBuiltin(id, resolved.args, tmp, .host) catch |e| switch (e) {
+                const pcall_bres = self.callBuiltin(id, resolved.args, tmp, .host) catch |e| switch (e) {
                     error.Yield => return e,
                     error.OutOfMemory => {
                         self.setOutOfMemoryError();
@@ -22874,10 +23103,10 @@ pub const Vm = struct {
                 // bc_stack realloc via nested re-entry.
                 const outs_fresh = self.refreshBuiltinOuts() orelse outs;
                 outs_fresh[0] = .{ .Bool = true };
-                const used_tmp = if (builtinHasDynamicOutCount(id))
-                    @min(self.last_builtin_out_count, tmp.len)
-                else
-                    tmp.len;
+                // P16.50-review-6 BLOCKER 1: obtain the ACTUAL count first
+                // (owned results land in the local tmp buffer, window count
+                // passes through), then apply the pcall result contract.
+                const used_tmp = self.consumeBuiltinResult(pcall_bres, tmp);
                 for (0..used_tmp) |i| {
                     const v = tmp[i];
                     if (1 + i >= outs_fresh.len) break;
@@ -23104,13 +23333,19 @@ pub const Vm = struct {
             const resolved = self.resolveCallable(f, call_args, null) catch return;
             defer if (resolved.owned_args) |owned| self.alloc.free(owned);
             switch (resolved.callee) {
-                .Builtin => |id| self.callBuiltin(id, resolved.args, &[_]Value{}, .host) catch |e| switch (e) {
-                    error.Yield => return e,
-                    else => {
-                        // P16.31 Cut 3: xpcall recovery-boundary close (PUC
-                        // luaD_closeprotected).
-                        if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_xpcall_cf, idx);
-                    },
+                .Builtin => |id| {
+                    const bres = self.callBuiltin(id, resolved.args, &[_]Value{}, .host) catch |e| switch (e) {
+                        error.Yield => return e,
+                        else => {
+                            // P16.31 Cut 3: xpcall recovery-boundary close (PUC
+                            // luaD_closeprotected).
+                            if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_xpcall_cf, idx);
+                            return;
+                        },
+                    };
+                    // P16.50-review-6: 0-window swallow — free owned results.
+                    _ = self.consumeBuiltinResult(bres, &[_]Value{});
+                    return;
                 },
                 .Closure => |cl| {
                     const ret = self.runClosure(cl, resolved.args) catch |e| switch (e) {
@@ -23163,7 +23398,7 @@ pub const Vm = struct {
                 }
                 defer if (tmp_heap) self.alloc.free(tmp);
 
-                self.callBuiltin(id, resolved.args, tmp, .host) catch |e| switch (e) {
+                const xpcall_bres = self.callBuiltin(id, resolved.args, tmp, .host) catch |e| switch (e) {
                     error.Yield => return e,
                     else => {
                         // P16.31 Cut 3: xpcall recovery-boundary close (PUC
@@ -23180,10 +23415,9 @@ pub const Vm = struct {
                 // bc_stack realloc via nested re-entry.
                 const outs_fresh = self.refreshBuiltinOuts() orelse outs;
                 outs_fresh[0] = .{ .Bool = true };
-                const used_tmp = if (builtinHasDynamicOutCount(id))
-                    @min(self.last_builtin_out_count, tmp.len)
-                else
-                    tmp.len;
+                // P16.50-review-6 BLOCKER 1: actual count first, then the
+                // xpcall result contract (see builtinPcall).
+                const used_tmp = self.consumeBuiltinResult(xpcall_bres, tmp);
                 for (0..used_tmp) |i| {
                     const v = tmp[i];
                     if (1 + i >= outs_fresh.len) break;
@@ -24534,7 +24768,26 @@ pub const Vm = struct {
                         payload = try self.alloc.alloc(Value, nouts);
                         payload_heap = true;
                     }
-                    self.callBuiltin(id, resolved.args, payload, .host) catch |e| switch (e) {
+                    // P16.50-review-6 BLOCKER 1: capture the result contract.
+                    // The catch arms set flags and fall through to the common
+                    // tails, which never read the payload on those paths.
+                    if (self.callBuiltin(id, resolved.args, payload, .host)) |co_bres| {
+                        // Owned results (a T.testC coroutine body) carry the
+                        // EXACT count — replace the nil-padded nouts payload
+                        // with the owned slice (the tail defer frees it via
+                        // self.alloc.free; foreign blocks pass through). The
+                        // resume tail then reports exactly vals.len results
+                        // instead of the padded window (PUC lua_resume: the
+                        // body's actual returns).
+                        switch (co_bres) {
+                            .owned => |vals| {
+                                if (payload_heap) self.alloc.free(payload);
+                                payload = vals;
+                                payload_heap = true;
+                            },
+                            .window => {},
+                        }
+                    } else |e| switch (e) {
                         error.Yield => {
                             yielded = true;
                         },
@@ -24546,7 +24799,7 @@ pub const Vm = struct {
                             }
                         },
                         else => return e,
-                    };
+                    }
                 },
                 .Closure => |cl| {
                     if (cl.proto != null and !self.bytecode_coroutine_trampoline_active) {
@@ -29818,7 +30071,7 @@ pub const Vm = struct {
                     switch (resolved.callee) {
                         .Builtin => |id| {
                             var out1 = [_]Value{.Nil};
-                            self.callBuiltin(id, resolved.args, out1[0..], .host) catch {
+                            const bres = self.callBuiltin(id, resolved.args, out1[0..], .host) catch {
                                 outs[0] = .Nil;
                                 if (outs.len > 1) {
                                     const istr2 = try self.internStr(self.errorString());
@@ -29826,6 +30079,7 @@ pub const Vm = struct {
                                 }
                                 return;
                             };
+                            _ = self.consumeBuiltinResult(bres, out1[0..]);
                             piece = out1[0];
                         },
                         .Closure => |cl| {
@@ -30033,7 +30287,8 @@ pub const Vm = struct {
                 .Builtin => |id| {
                     var loader_args = [_]Value{ .{ .String = name_str }, .{ .String = preload_str } };
                     var loader_out: [2]Value = .{ .Nil, .Nil };
-                    try self.callBuiltin(id, loader_args[0..], loader_out[0..], .host);
+                    const loader_bres = try self.callBuiltin(id, loader_args[0..], loader_out[0..], .host);
+                    _ = self.consumeBuiltinResult(loader_bres, loader_out[0..]);
                     const v: Value = if (loader_out[0] != .Nil) loader_out[0] else .{ .Bool = true };
                     try self.setField(loaded_tbl, name, v);
                     // P16.39 Cut 3 (correctness): the nested callBuiltin's
@@ -32351,8 +32606,11 @@ pub const Vm = struct {
 
         switch (hook) {
             .Builtin => |id| {
+                // P16.50-review-6: 0-window — hook results are discarded;
+                // free any owned results (T.testC as a hook).
                 var outs: [0]Value = .{};
-                try self.callBuiltin(id, argv_buf[0..argc], outs[0..], .host);
+                const bres = try self.callBuiltin(id, argv_buf[0..argc], outs[0..], .host);
+                _ = self.consumeBuiltinResult(bres, outs[0..]);
             },
             .Closure => |cl| {
                 const ret = try self.runClosure(cl, argv_buf[0..argc]);
@@ -32410,6 +32668,86 @@ pub const Vm = struct {
         try self.setField(reg, "_HOOKKEY", .{ .Table = hookkey });
         self.debug_registry = reg;
         return reg;
+    }
+
+    /// PUC luaL_newmetatable (lauxlib.c:317-327) as ONE shared semantic
+    /// path for both thin wrappers: the C-API `api.State.newmetatable` /
+    /// c_api `luaL_newmetatable`, and the testC `newmetatable` command
+    /// (ltests.c:1730 `lua_pushboolean(L1, luaL_newmetatable(L1,
+    /// getstring))`). PUC-faithful order:
+    ///   1. lookup registry[tname] (luaL_getmetatable — interns tname as
+    ///      part of the field access);
+    ///   2. non-nil existing value → leave it on top of the caller's
+    ///      stack, report "not created" (PUC returns 0 — ANY non-nil
+    ///      registry value counts as "name already in use", not just a
+    ///      table);
+    ///   3. create a NORMAL GC-registered/accounted table (lua_createtable
+    ///      — a metatable is not finalizable);
+    ///   4. ROOT the fresh table on the caller's stack (PUC keeps it on
+    ///      L's stack across every later fallible step), plus a
+    ///      gcTempRoots safety net: the testC shadow stack is NOT
+    ///      GC-marked, so the temp root is what actually protects the
+    ///      created-but-unpublished table from an emergency GC inside the
+    ///      __name/registry insertions;
+    ///   5. metatable.__name = tname;
+    ///   6. publish registry[tname] = metatable (the registry is itself a
+    ///      GC root, so post-publish the table stays reachable even
+    ///      before the caller observes it);
+    ///   7. report "created" (PUC returns 1); the table is on top of
+    ///      `root_stack`.
+    /// Every OOM edge has exactly one unambiguous owner:
+    ///   - tname-intern / table-constructor OOM → nothing committed,
+    ///     nothing published, stack shape untouched;
+    ///   - stack-root OOM → table committed but unpublished: collectable
+    ///     through the normal sweep (no leak, no dangling registry entry);
+    ///   - __name-insertion OOM → table committed and stack-rooted,
+    ///     registry untouched (no partially-published entry);
+    ///   - publish OOM → table committed, rooted AND __name-set, registry
+    ///     untouched; the caller's stack root keeps it alive (PUC leaves
+    ///     it on L's stack across the luaD_throw).
+    fn newMetatableShared(
+        self: *Vm,
+        tname: []const u8,
+        root_stack: *std.ArrayListUnmanaged(Value),
+        root_alloc: std.mem.Allocator,
+    ) DispatchError!bool {
+        const reg = try self.ensureDebugRegistry();
+        // Edge 1: tname intern (part of the registry lookup).
+        const key = try self.internStr(tname);
+        const existing = self.apiRawGet(reg, .{ .String = key });
+        if (existing != .Nil) {
+            // PUC: "name already in use" — leave the previous value on top.
+            try root_stack.append(root_alloc, existing);
+            return false;
+        }
+        var roots = self.gcTempRoots();
+        defer roots.end();
+        // Edge 2: normal table constructor (register + account).
+        const mt = try self.allocTable(null);
+        // Edge 3: root — the caller's stack (PUC's L-stack root) plus the
+        // temp-root net for shadow stacks (see the doc comment above).
+        try roots.add(.{ .Table = mt });
+        try root_stack.append(root_alloc, .{ .Table = mt });
+        // Edge 4: metatable.__name = tname (PUC lua_setfield on a fresh
+        // plain table — no metamethods possible).
+        try self.setField(mt, "__name", .{ .String = key });
+        // Edge 5: publish registry[tname] = metatable.
+        try self.setField(reg, tname, .{ .Table = mt });
+        return true;
+    }
+
+    /// Error-exposed variant of `newMetatableShared` for
+    /// `api.State.newmetatable` (c_api `luaL_newmetatable`). `root_alloc`
+    /// is passed by the caller (not captured here) so the API stack append
+    /// goes through the CURRENT `vm.alloc` — countdown/memlimit tests swap
+    /// that allocator and the stack-root edge must be exercised by it.
+    pub fn apiNewMetatable(
+        self: *Vm,
+        tname: []const u8,
+        root_stack: *std.ArrayListUnmanaged(Value),
+        root_alloc: std.mem.Allocator,
+    ) Error!bool {
+        return exposeDispatchResult(bool, self.newMetatableShared(tname, root_stack, root_alloc));
     }
 
     fn builtinDebugGetregistry(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -32511,6 +32849,12 @@ pub const Vm = struct {
             try self.debugBuildThreadTraceback(th, level)
         else
             try self.debugBuildCurrentTraceback(level);
+        // P16.50-review-6: debugBuild*Traceback returns an OWNED raw buffer
+        // (Allocating.toOwnedSlice); internStr/internFmt copy the bytes into
+        // the (GC-registered) LuaString. The raw buffer itself must be freed
+        // on every path — a pre-existing leak on every debug.traceback call,
+        // exposed by the testC traceback unit test (leak-checked allocator).
+        defer self.alloc.free(body);
 
         if (msg.len != 0) {
             const istr = try self.internFmt("{s}\n{s}", .{ msg, body });
@@ -32947,15 +33291,17 @@ pub const Vm = struct {
             defer if (resolved.owned_args) |owned| self.alloc.free(owned);
             switch (resolved.callee) {
                 .Builtin => |id| {
-                    try self.callBuiltin(id, resolved.args, outs, .host);
+                    const pairs_bres = try self.callBuiltin(id, resolved.args, outs, .host);
                     // P16.39 Cut 3 (correctness): the nested callBuiltin's
                     // C-frame push may have reallocated bc_stack — re-derive
-                    // the outs window before the nil-fill.
+                    // the outs window before consuming/nil-filling.
                     const outw = self.refreshBuiltinOuts() orelse outs;
-                    if (builtinHasDynamicOutCount(id)) {
-                        var i = self.last_builtin_out_count;
-                        while (i < outw.len) : (i += 1) outw[i] = .Nil;
-                    }
+                    // P16.50-review-6 BLOCKER 1: actual count first (owned
+                    // results copy into the window), then nil-pad the rest
+                    // of the pairs contract (next, t, nil).
+                    const produced = self.consumeBuiltinResult(pairs_bres, outw);
+                    var i = produced;
+                    while (i < outw.len) : (i += 1) outw[i] = .Nil;
                 },
                 .Closure => |cl| {
                     const ret = try self.runClosure(cl, resolved.args);
@@ -38181,8 +38527,10 @@ pub const Vm = struct {
                 const outs = try self.alloc.alloc(Value, out_len);
                 defer self.alloc.free(outs);
                 for (outs) |*o| o.* = .Nil;
-                try self.callBuiltin(id, resolved.args, outs, .host);
-                const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
+                const gsub_bres = try self.callBuiltin(id, resolved.args, outs, .host);
+                // P16.50-review-6 BLOCKER 1: actual count first (owned results
+                // copy into the window), then take the first value.
+                const used = self.consumeBuiltinResult(gsub_bres, outs);
                 if (used == 0) break :blk .Nil;
                 break :blk outs[0];
             },
@@ -39335,7 +39683,8 @@ pub const Vm = struct {
                 .Builtin => |id| {
                     var outs1 = [_]Value{.Nil};
                     const call_args = [_]Value{ a, b };
-                    try self.callBuiltin(id, call_args[0..], outs1[0..], .host);
+                    const bres = try self.callBuiltin(id, call_args[0..], outs1[0..], .host);
+                    _ = self.consumeBuiltinResult(bres, outs1[0..]);
                     outv = outs1[0];
                 },
                 .Closure => |cl| {
@@ -39351,7 +39700,8 @@ pub const Vm = struct {
                     switch (resolved.callee) {
                         .Builtin => |id| {
                             var outs1 = [_]Value{.Nil};
-                            try self.callBuiltin(id, resolved.args, outs1[0..], .host);
+                            const bres = try self.callBuiltin(id, resolved.args, outs1[0..], .host);
+                            _ = self.consumeBuiltinResult(bres, outs1[0..]);
                             outv = outs1[0];
                         },
                         .Closure => |cl| {
@@ -40042,7 +40392,8 @@ pub const Vm = struct {
             .Builtin => |id| blk: {
                 var call_args = [_]Value{ .{ .Table = tbl }, key };
                 var out: [1]Value = .{.Nil};
-                try self.callBuiltin(id, call_args[0..], out[0..], .host);
+                const bres = try self.callBuiltin(id, call_args[0..], out[0..], .host);
+                _ = self.consumeBuiltinResult(bres, out[0..]);
                 break :blk out[0];
             },
             .Closure => |cl| blk: {
@@ -40107,7 +40458,8 @@ pub const Vm = struct {
             .Builtin => |id| blk: {
                 var call_args = [_]Value{ object, key };
                 var out: [1]Value = .{.Nil};
-                try self.callBuiltin(id, call_args[0..], out[0..], .host);
+                const bres = try self.callBuiltin(id, call_args[0..], out[0..], .host);
+                _ = self.consumeBuiltinResult(bres, out[0..]);
                 break :blk out[0];
             },
             .Closure => |cl| blk: {
@@ -40140,7 +40492,11 @@ pub const Vm = struct {
                 .Builtin => |id| {
                     var call_args = [_]Value{ object, key, val };
                     var out: [1]Value = .{.Nil};
-                    return self.callBuiltin(id, call_args[0..], out[0..], .host);
+                    // P16.50-review-6: __newindex discards results — consume
+                    // (copies owned into the window, frees the owned slice).
+                    const bres = try self.callBuiltin(id, call_args[0..], out[0..], .host);
+                    _ = self.consumeBuiltinResult(bres, out[0..]);
+                    return;
                 },
                 .Closure => |cl| {
                     var call_args = [_]Value{ object, key, val };
@@ -40161,7 +40517,11 @@ pub const Vm = struct {
             .Builtin => |id| {
                 var call_args = [_]Value{ object, key, val };
                 var out: [1]Value = .{.Nil};
-                return self.callBuiltin(id, call_args[0..], out[0..], .host);
+                // P16.50-review-6: __newindex discards results — consume
+                // (copies owned into the window, frees the owned slice).
+                const bres = try self.callBuiltin(id, call_args[0..], out[0..], .host);
+                _ = self.consumeBuiltinResult(bres, out[0..]);
+                return;
             },
             .Closure => |cl| {
                 var call_args = [_]Value{ object, key, val };
@@ -40424,7 +40784,8 @@ pub const Vm = struct {
         return switch (resolved.callee) {
             .Builtin => |id| blk: {
                 var out: [1]Value = .{.Nil};
-                try self.callBuiltin(id, resolved.args, out[0..], .host);
+                const bres = try self.callBuiltin(id, resolved.args, out[0..], .host);
+                _ = self.consumeBuiltinResult(bres, out[0..]);
                 break :blk out[0];
             },
             .Closure => |cl| blk: {
@@ -42445,11 +42806,28 @@ pub const Vm = struct {
         return .{ .Table = self.global_env };
     }
 
-    fn builtinTestcTestC(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+    /// P16.50-review-6 BLOCKER 1: T.testC returns its ACTUAL results via the
+    /// owned-slice contract — the runtime-dynamic analogue of PUC's
+    /// precallC/luaD_poscall. PUC's testC C function returns `n` (from
+    /// `return N` or `gettop` for `return *`) and luaD_poscall moves EXACTLY
+    /// those values to the caller under the caller's nresults contract; the
+    /// count is unknowable before the script runs (the script's stack is
+    /// runtime state: settop/pcall/xmove/... all change it). The old static
+    /// scanner (testcScriptOutBound) pre-sized a window from the script TEXT
+    /// and truncated every shape it mis-modeled (verified: `compare` +
+    /// `return *` lost the boolean; `settop -1` + `return *` lost
+    /// everything). Now the script runs to completion first, then
+    /// copyTestcReturnValues snapshots the final stack per the return spec
+    /// (`.all` = the whole stack INCLUDING the script string at index 1 —
+    /// PUC `return *` = lua_gettop; `.fixed` = the LAST n values, PUC
+    /// `return n` negative-index semantics) and returns it as an owned
+    /// slice; the CALLER applies the ordinary nresults contract.
+    fn builtinTestcTestC(self: *Vm, args: []const Value, outs: []Value) DispatchError!?[]Value {
         // P15.78 Task 14: testC continuations (yield/yieldk/callk/pcallk) now
         // use the production C-frame mechanism (finishCcall → testcContShim).
         // No LIFO loop is needed here — the trampoline handles continuation
         // chains via C-frames on call_frames.
+        _ = outs; // owned contract: results return as a slice, never via the window
 
         if (args.len == 0) {
             return self.fail("bad argument #1 to 'testC' (string expected)", .{});
@@ -42518,34 +42896,17 @@ pub const Vm = struct {
         const rr = try self.runTestcScript(script_source.?, &st, ctx, null);
         const spec = rr.return_spec orelse testc.ReturnSpec{ .fixed = 0 };
 
-        // runTestcScript may invoke nested Lua calls (via apiCall in testC
-        // commands like "call"), which can trigger bc_stack realloc. After
-        // realloc, the outs slice (which points into bc_stack) is stale.
-        // Re-derive it from bc_stack, mirroring PUC Lua's restorestack.
-        // This is the same mechanism used by pcall/xpcall/tostring (see
-        // refreshBuiltinOuts at vm.zig:9806).
-        const outs_fresh = self.refreshBuiltinOuts() orelse outs;
-
-        var produced: usize = 0;
-        switch (spec) {
-            .all => {
-                produced = @min(outs_fresh.len, st.items.len);
-                for (0..produced) |i| outs_fresh[i] = st.items[i];
-            },
-            .fixed => |n| {
-                produced = @min(outs_fresh.len, n);
-                const available = st.items.len;
-                for (0..produced) |i| {
-                    const src_from_top = produced - i;
-                    if (available >= src_from_top) {
-                        outs_fresh[i] = st.items[available - src_from_top];
-                    } else {
-                        outs_fresh[i] = .Nil;
-                    }
-                }
-            },
-        }
-        self.last_builtin_out_count = produced;
+        // P16.50-review-6 BLOCKER 1: return the exact results as an owned
+        // slice (infraAlloc — result transport, uncounted: PUC's poscall
+        // moves values on the stack, allocating nothing; a counted copy
+        // would fail under an armed countdown and kill the script's own
+        // return, memerr.lua testalloc parity). runTestcScript already
+        // performed the TBC-region close on the script frame (results were
+        // snapshotted BEFORE the close and restored into `st` — see its
+        // tail), so `st.items` holds the final stack in every completion
+        // shape. No outs window is written and last_builtin_out_count is
+        // NOT set: the count travels structurally in the slice length.
+        return try self.copyTestcReturnValues(st.items, spec);
     }
 
     /// Copy return values from the testC stack based on the return spec.
@@ -45348,17 +45709,14 @@ pub const Vm = struct {
             },
             .newmetatable => {
                 if (cargs.len != 1) return self.fail("testC newmetatable expects 1 arg", .{});
-                const reg = try self.ensureDebugRegistry();
-                const k = trimTestcQuoted(cargs[0]);
-                if (self.getFieldOpt(reg, k)) |existing| {
-                    try st.append(self.infraAlloc(), existing);
-                    try st.append(self.infraAlloc(), .{ .Bool = false });
-                } else {
-                    const mt = try self.allocTable(null);
-                    try self.setField(reg, k, .{ .Table = mt });
-                    try st.append(self.infraAlloc(), .{ .Table = mt });
-                    try st.append(self.infraAlloc(), .{ .Bool = true });
-                }
+                // PUC ltests.c:1730: lua_pushboolean(L1, luaL_newmetatable(
+                // L1, getstring)) — the shared luaL_newmetatable path (see
+                // newMetatableShared) pushes the metatable (or the existing
+                // registry value) onto the testC stack; we only add the
+                // created-boolean. Same registry, same __name semantics as
+                // the C-API luaL_newmetatable.
+                const created = try self.newMetatableShared(trimTestcQuoted(cargs[0]), st, self.infraAlloc());
+                try st.append(self.infraAlloc(), .{ .Bool = created });
             },
             .testudata => {
                 if (cargs.len != 2) return self.fail("testC testudata expects 2 args", .{});
@@ -46050,7 +46408,8 @@ pub const Vm = struct {
         const retv: Value = switch (fnv) {
             .Builtin => |id| blk: {
                 var out: [1]Value = .{.Nil};
-                self.callBuiltin(id, &[_]Value{}, out[0..], .host) catch return 0.0;
+                const bres = self.callBuiltin(id, &[_]Value{}, out[0..], .host) catch return 0.0;
+                _ = self.consumeBuiltinResult(bres, out[0..]);
                 break :blk out[0];
             },
             .Closure => |cl| blk: {
@@ -46070,7 +46429,7 @@ pub const Vm = struct {
 
     fn builtinHasDynamicOutCount(id: BuiltinId) bool {
         return switch (id) {
-            .coroutine_resume, .coroutine_wrap_iter, .coroutine_yield, .coroutine_close, .pcall, .xpcall, .utf8_codepoint, .io_lines_iter, .io_read, .file_read, .file_close, .io_close, .io_popen, .os_execute, .dofile, .io_lines, .file_lines, .testc_testC => true,
+            .coroutine_resume, .coroutine_wrap_iter, .coroutine_yield, .coroutine_close, .pcall, .xpcall, .utf8_codepoint, .io_lines_iter, .io_read, .file_read, .file_close, .io_close, .io_popen, .os_execute, .dofile, .io_lines, .file_lines => true,
             else => false,
         };
     }
@@ -46164,16 +46523,7 @@ pub const Vm = struct {
         for ([_]BuiltinId{
             .io_lines,      .io_lines_iter, .assert,       .select,
             .string_byte,   .string_find,   .string_match, .utf8_codepoint,
-            .string_unpack, .table_unpack,  .testc_testC,
-            // P16.50-review-5: the T.testC window is sized per-call from
-            // the script (builtinOutLenDynamic). A fixed 256-slot window
-            // forced growCtxFrame to widen the CALLER's frame by 256
-            // slots — a COUNTED bc_stack grow where PUC pushes results
-            // dynamically via luaD_poscall (no growth when they fit);
-            // under an armed countdown (memerr.lua testalloc) that
-            // spurious grow fails and kills the unprotected chunk.
-            // Without this null the default falls to fixed-1 and every
-            // multret T.testC call returns a single value (api.lua:44).
+            .string_unpack, .table_unpack,
         }) |dyn_id| t[@intFromEnum(dyn_id)] = null;
         // Fixed out-counts (moved verbatim from the old switch).
         t[@intFromEnum(BuiltinId.print)] = 0;
@@ -46268,181 +46618,17 @@ pub const Vm = struct {
         t[@intFromEnum(BuiltinId.string_rep)] = 1;
         t[@intFromEnum(BuiltinId.table_insert)] = 0;
         t[@intFromEnum(BuiltinId.table_sort)] = 0;
+        // P16.50-review-6 BLOCKER 1: T.testC never writes a window — it
+        // returns its ACTUAL results as an owned slice (BuiltinResult
+        // contract, PUC ldo.c precallC/luaD_poscall model: the C function's
+        // results land above L->top with no pre-sized window). The 0 here
+        // only sizes the (unused) registered window; the owned slice is the
+        // transport. The rejected static script scanner (testcScriptOutBound,
+        // P16.50-review-5) is deleted.
+        t[@intFromEnum(BuiltinId.testc_testC)] = 0;
         break :blk t;
     };
 
-    /// Conservative static upper bound on the number of results a testC
-    /// script can produce (see builtinOutLenDynamic .testc_testC). Scans
-    /// the script tokens: every push-like command adds one stack slot,
-    /// `xmove N` adds N, call-like commands add their literal result count,
-    /// and `return N` sets the literal floor. Mis-scanned string arguments
-    /// can only OVER-count (the bound grows), never under-count the real
-    /// `return N` pair, so the window is always a safe upper bound.
-    fn testcScriptOutBound(script: []const u8, nargs: usize) usize {
-        // Conservative upper bound on the number of results a testC script
-        // can produce (see builtinOutLenDynamic .testc_testC). Simulates the
-        // script's stack depth statement by statement, mirroring PUC's
-        // getnum forms ('*', '.', '!') and each command's net stack delta
-        // (ltests.c checkC). The bound may OVER-count (the window is
-        // scratch; produced is min-clamped) but must never UNDER-count, or
-        // results are truncated. Anything static analysis cannot bound
-        // (resume, nres<0 calls, xmove 0, value-derived settop/return)
-        // falls back to the 256 cap — the old fixed window, still correct.
-        const CAP: usize = 256;
-        var depth: usize = nargs;
-        var max_ret: usize = 0;
-        var unbounded = false;
-
-        // Statement splitter: ';' / '\n' separate statements, whitespace
-        // separates words — all outside quotes, the same shape
-        // parseTestcWords consumes.
-        var stmt_start: usize = 0;
-        var in_quote = false;
-        var quote_char: u8 = 0;
-        var k: usize = 0;
-        while (k <= script.len) : (k += 1) {
-            const at_end = k == script.len;
-            if (!at_end) {
-                const ch = script[k];
-                if (!in_quote and (ch == '\'' or ch == '"')) {
-                    in_quote = true;
-                    quote_char = ch;
-                    continue;
-                } else if (in_quote and ch == quote_char) {
-                    in_quote = false;
-                    quote_char = 0;
-                    continue;
-                }
-            }
-            const is_sep = at_end or (!in_quote and (script[k] == ';' or script[k] == '\n'));
-            if (!is_sep) continue;
-            defer stmt_start = k + 1;
-
-            // Words of this statement (outside quotes).
-            var words_buf: [16][]const u8 = undefined;
-            var wc: usize = 0;
-            var w_start: usize = stmt_start;
-            var w_in_quote = false;
-            var w_quote: u8 = 0;
-            var m = stmt_start;
-            while (m <= k) : (m += 1) {
-                const w_end = m == k;
-                if (!w_end) {
-                    const ch = script[m];
-                    if (!w_in_quote and (ch == '\'' or ch == '"')) {
-                        w_in_quote = true;
-                        w_quote = ch;
-                        continue;
-                    }
-                    if (w_in_quote and ch == w_quote) {
-                        w_in_quote = false;
-                        w_quote = 0;
-                        continue;
-                    }
-                }
-                const w_sep = w_end or (!w_in_quote and (script[m] == ' ' or script[m] == '\t' or script[m] == '\r'));
-                if (!w_sep) continue;
-                if (m > w_start and wc < words_buf.len) {
-                    words_buf[wc] = script[w_start..m];
-                    wc += 1;
-                }
-                w_start = m + 1;
-            }
-            if (wc == 0) continue;
-            const op = words_buf[0];
-
-            // Parse word[idx] as a PUC getnum argument: plain (possibly
-            // negative) numeric literal, '*' (= lua_gettop), or anything
-            // else ('.', '!', symbolic) which static analysis cannot bound.
-            const NumArg = union(enum) { int: i64, star, other };
-            const arg = struct {
-                fn get(words: []const []const u8, idx: usize) NumArg {
-                    if (idx >= words.len) return .other;
-                    const t = words[idx];
-                    if (t.len == 1 and t[0] == '*') return .star;
-                    if (std.fmt.parseInt(i64, t, 10)) |n| return .{ .int = n } else |_| {}
-                    return .other;
-                }
-            }.get;
-
-            if (std.mem.eql(u8, op, "settop")) {
-                switch (arg(words_buf[0..wc], 1)) {
-                    .int => |n| depth = if (n <= 0) 0 else @intCast(@min(@as(i64, @intCast(CAP * 4)), n)),
-                    .star => {}, // settop to gettop: no change
-                    .other => unbounded = true, // value-derived ('.', '!'): unbounded
-                }
-            } else if (std.mem.eql(u8, op, "return")) {
-                switch (arg(words_buf[0..wc], 1)) {
-                    .int => |n| max_ret = @max(max_ret, @as(usize, @intCast(@max(@as(i64, 0), n)))),
-                    .star => max_ret = @max(max_ret, depth),
-                    .other => unbounded = true, // value-derived
-                }
-            } else if (std.mem.eql(u8, op, "call") or std.mem.eql(u8, op, "callk")) {
-                switch (arg(words_buf[0..wc], 2)) { // nres is 2nd arg
-                    .int => |nres| {
-                        if (nres < 0) unbounded = true // LUA_MULTRET: all results
-                        else depth += @intCast(nres);
-                    },
-                    .star => unbounded = true, // '*' nres = gettop value
-                    .other => unbounded = true,
-                }
-            } else if (std.mem.eql(u8, op, "pcall") or std.mem.eql(u8, op, "pcallk")) {
-                switch (arg(words_buf[0..wc], 2)) { // nres is 2nd arg
-                    .int => |nres| {
-                        if (nres < 0) unbounded = true else depth += @as(usize, @intCast(@max(nres, 1))); // error path pushes 1 even when nres == 0
-                    },
-                    .star => unbounded = true,
-                    .other => unbounded = true,
-                }
-            } else if (std.mem.eql(u8, op, "resume")) {
-                unbounded = true; // lua_resume pushes all results
-            } else if (std.mem.eql(u8, op, "xmove")) {
-                switch (arg(words_buf[0..wc], 3)) { // n is 3rd arg
-                    .int => |n| depth += @intCast(@max(@as(i64, 0), n)),
-                    .star => unbounded = true,
-                    .other => unbounded = true, // n == 0 means "all": unbounded
-                }
-            } else if (std.mem.eql(u8, op, "next") or std.mem.eql(u8, op, "loadstring") or
-                std.mem.eql(u8, op, "loadfile"))
-            {
-                depth += 2; // lua_next pushes key+value; load errors push nil+msg
-            } else if (std.mem.startsWith(u8, op, "push") or
-                std.mem.eql(u8, op, "newtable") or std.mem.eql(u8, op, "newuserdata") or
-                std.mem.eql(u8, op, "newthread") or std.mem.eql(u8, op, "getglobal") or
-                std.mem.eql(u8, op, "getfield") or std.mem.eql(u8, op, "gettable") or
-                std.mem.eql(u8, op, "getmetatable") or std.mem.eql(u8, op, "gettop") or
-                std.mem.eql(u8, op, "rawget") or std.mem.eql(u8, op, "rawgeti") or
-                std.mem.eql(u8, op, "rawgetp") or std.mem.eql(u8, op, "gsub") or
-                std.mem.eql(u8, op, "objsize") or std.mem.eql(u8, op, "threadstatus") or
-                std.mem.eql(u8, op, "type") or std.mem.eql(u8, op, "tobool") or
-                std.mem.eql(u8, op, "tostring") or std.mem.eql(u8, op, "tonumber") or
-                std.mem.eql(u8, op, "tointeger") or std.mem.eql(u8, op, "Ltolstring") or
-                std.mem.eql(u8, op, "testudata") or std.mem.eql(u8, op, "isyieldable") or
-                std.mem.eql(u8, op, "absindex") or std.mem.eql(u8, op, "len") or
-                std.mem.eql(u8, op, "Llen") or std.mem.eql(u8, op, "func2num") or
-                std.mem.eql(u8, op, "newmetatable") or std.mem.eql(u8, op, "rawcheckstack") or
-                std.mem.eql(u8, op, "d2s") or std.mem.eql(u8, op, "tocfunction"))
-            {
-                depth += 1;
-            } else if (std.mem.eql(u8, op, "isfunction") or std.mem.eql(u8, op, "iscfunction") or
-                std.mem.eql(u8, op, "isuserdata") or std.mem.eql(u8, op, "isudataval") or
-                std.mem.eql(u8, op, "isnil") or std.mem.eql(u8, op, "isnull") or
-                std.mem.eql(u8, op, "isnumber") or std.mem.eql(u8, op, "isstring") or
-                std.mem.eql(u8, op, "istable"))
-            {
-                depth += 1;
-            }
-            // Everything else (pop/replace/remove/set*/rawset*/concat/
-            // insert/rotate/copy/arith/compare/checkstack/print/...) never
-            // pushes: not adding is safe because the bound only needs an
-            // over-approximation. 'error'/'argerror'/'yield'/'yieldk'/
-            // 'abort'/'throw' end or suspend the script — the return bound
-            // is already fixed by then.
-            if (unbounded) break;
-        }
-        if (unbounded) return CAP;
-        return @min(@max(depth, max_ret), CAP);
-    }
     /// Pre-size the outs window for a builtin call. Fixed counts come from
     /// the comptime table above (one inlined load); dynamic counts fall
     /// through to the out-of-line switch. Inline so the hot OP_CALL sites
@@ -46460,36 +46646,6 @@ pub const Vm = struct {
     /// in builtin_const_out_len (see its doc comment for the contract).
     fn builtinOutLenDynamic(self: *Vm, id: BuiltinId, call_args: []const Value) usize {
         return switch (id) {
-            // PUC parity (memerr.lua testalloc): PUC's T.testC pushes its
-            // results onto L's stack dynamically (ldo.c luaD_poscall) —
-            // only the ACTUAL result slots ever touch the stack. A fixed
-            // 256-slot outs window instead forces a bc_stack regrow on
-            // every T.testC call after a shrink, and that growth is a
-            // COUNTED allocation (PUC luaD_growstack parity) — under an
-            // armed countdown it fails and kills the whole chunk
-            // (memerr.lua: `T.alloccount(M); a,b = T.testC(...)`).
-            // Size the window from the script itself: a conservative
-            // upper bound on the stack depth the script can build plus
-            // the largest literal `return N`. Over-estimates are harmless
-            // (the builtin min-clamps writes to the window); the 256 cap
-            // keeps the old truncation ceiling for pathological scripts
-            // (e.g. `return *` after xmove of a huge stack).
-            .testc_testC => blk: {
-                const script: ?[]const u8 = switch (if (call_args.len > 0) call_args[0] else .Nil) {
-                    .String => |s| s.bytes(),
-                    // Callable/state forms: the script is the first
-                    // String argument after the table (args[1]).
-                    .Table => if (call_args.len > 1 and call_args[1] == .String)
-                        call_args[1].String.bytes()
-                    else
-                        null,
-                    else => null,
-                };
-                break :blk if (script) |sc|
-                    testcScriptOutBound(sc, call_args.len)
-                else
-                    256; // ccl/callable form: script lives in the table, unknown here
-            },
             .io_lines => blk: {
                 if (call_args.len > 0 and call_args[0] == .String) break :blk 4;
                 break :blk 3;
@@ -54560,15 +54716,17 @@ test "varargprep: named-vararg (...t) table slot-1 integrity + OOM transactional
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// P16.50-review-5 3.2: `State.newmetatable` must use the NORMAL GC table
-// constructor (apiNewTable's register/accounting contract — a metatable is
-// NOT finalizable), root the fresh table on the API stack BEFORE the
-// registry publish (PUC lauxlib.c:317-327), and give every OOM edge an
-// unambiguous owner: constructor OOM → nothing exists; root OOM → the
-// unrooted table is collectable (no leak, no dangling entry); publish OOM
-// → the rooted table survives emergency GC and the registry is untouched.
+// P16.50-review-6 B2: luaL_newmetatable is ONE shared semantic path
+// (`Vm.newMetatableShared`) for the C-API wrapper (`api.State.newmetatable`
+// / c_api `luaL_newmetatable`) and the testC `newmetatable` command, with
+// PUC-faithful order (lookup → existing-on-top + false | create normal GC
+// table → root → `__name = tname` → publish → true). The sweep below
+// exercises EVERY allocation edge (tname intern, table constructor, stack
+// root, __name insertion, registry publish) with the FailingAllocator and
+// proves per edge, by OBSERVED state: no partially published table, no
+// dangling registry entry, no ledger drift.
 // ─────────────────────────────────────────────────────────────────────
-test "P16.50-review-5 3.2: newmetatable normal constructor + per-edge OOM ownership" {
+test "P16.50-review-6 B2: newmetatable shared path + per-edge OOM ownership" {
     const testing = std.testing;
     const api = @import("api.zig");
 
@@ -54576,20 +54734,43 @@ test "P16.50-review-5 3.2: newmetatable normal constructor + per-edge OOM owners
     defer state.deinit();
     const vm = state.vm;
 
-    // Pre-create the Lua registry and pre-intern every sweep key (temp-
-    // rooted): the sweep's failing indices then land ONLY on newmetatable's
-    // own edges (table constructor / stack rooting / registry publish).
+    // Pre-create the Lua registry and pre-intern the FIXED "__name" key
+    // (temp-rooted). The per-iteration names are deliberately NOT
+    // pre-interned: the tname-intern edge must be inside the swept window.
     const reg = try vm.apiEnsureRegistry();
     var setup_roots = vm.gcTempRoots();
     defer setup_roots.end();
-    const names = [_][]const u8{
-        "p50r5mt0", "p50r5mt1", "p50r5mt2", "p50r5mt3",
-        "p50r5mt4", "p50r5mt5", "p50r5mt6",
-    };
-    var keys: [names.len]*LuaString = undefined;
-    for (names, 0..) |n, i| {
-        keys[i] = try vm.internStr(n);
-        try setup_roots.add(.{ .String = keys[i] });
+    const name_key = try vm.internStr("__name");
+    try setup_roots.add(.{ .String = name_key });
+
+    // Fill the registry's hash part to EXACTLY full (no empty node slots):
+    // the publish edge (registry insertion) must ALLOCATE (rehash) during
+    // the sweep — a spare-capacity insert never fails and would leave the
+    // publish OOM path unproven (edge vacuously never fires).
+    var dummy_i: usize = 0;
+    while (dummy_i < 1024) : (dummy_i += 1) {
+        var full = true;
+        for (reg.hash) |*node| {
+            if (node.isEmpty()) {
+                full = false;
+                break;
+            }
+        }
+        if (full) break;
+        var buf: [32]u8 = undefined;
+        const dn = std.fmt.bufPrint(&buf, "p50r6dummy{d}", .{dummy_i}) catch unreachable;
+        try vm.setField(reg, dn, .{ .Bool = true });
+    }
+    // The fill must have reached "no empty slot" (bounded loop above).
+    {
+        var full = true;
+        for (reg.hash) |*node| {
+            if (node.isEmpty()) {
+                full = false;
+                break;
+            }
+        }
+        try testing.expect(full);
     }
 
     try vm.gcEnterGenerational();
@@ -54597,19 +54778,26 @@ test "P16.50-review-5 3.2: newmetatable normal constructor + per-edge OOM owners
     try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 32);
 
     // Edge coverage is classified by OBSERVED state (registry entry, stack
-    // shape, gc_objects membership), never by fail index — automatic GC
-    // steps inside allocTable may shift allocation indices, the observable
-    // edge shapes cannot.
-    var saw_constructor_oom = false; // failure, no table exists
-    var saw_root_oom = false; // failure, table exists, NOT rooted
-    var saw_publish_oom = false; // failure, table exists AND rooted
+    // shape, __name presence, gc_objects membership), never by fail index —
+    // automatic GC steps inside the constructors may shift allocation
+    // indices, the observable edge shapes cannot.
+    var saw_pretable_oom = false; // intern/constructor: nothing committed
+    var saw_root_oom = false; // table committed, NOT stack-rooted
+    var saw_name_oom = false; // committed + rooted, __name unset, unpublished
+    var saw_publish_oom = false; // committed + rooted + __name, unpublished
     var saw_success = false;
+
+    const names = [_][]const u8{
+        "p50r6mt0",  "p50r6mt1",  "p50r6mt2",  "p50r6mt3",
+        "p50r6mt4",  "p50r6mt5",  "p50r6mt6",  "p50r6mt7",
+        "p50r6mt8",  "p50r6mt9",  "p50r6mt10", "p50r6mt11",
+        "p50r6mt12", "p50r6mt13", "p50r6mt14", "p50r6mt15",
+    };
 
     const base_stack_len = state.stack.items.len;
     var fail_idx: usize = 0;
     while (fail_idx < names.len) : (fail_idx += 1) {
         const name = names[fail_idx];
-        const key = keys[fail_idx];
         const before = try testing.allocator.dupe(GcObject, vm.gc_objects.items);
         defer testing.allocator.free(before);
 
@@ -54619,16 +54807,23 @@ test "P16.50-review-5 3.2: newmetatable normal constructor + per-edge OOM owners
         vm.alloc = failing.allocator();
         const result = state.newmetatable(name);
         vm.alloc = testing.allocator;
+        // Post-restore canonical key for the registry lookups below (a
+        // no-op intern when the call itself already interned the name).
+        const key = try vm.internStr(name);
 
         if (result) |_| {
             saw_success = true;
             // Contract: fresh table from the NORMAL constructor, rooted on
-            // the API stack, published to the registry, NOT finalizable.
+            // the API stack, __name set, published to the registry, NOT
+            // finalizable.
             try testing.expectEqual(base_stack_len + 1, state.stack.items.len);
             const mt = state.stack.items[state.stack.items.len - 1].Table;
             try testing.expect(p50IsRegistered(vm, .{ .table = mt }));
             try testing.expect(!vm.finalizables.contains(.{ .table = mt }));
             try testing.expectEqual(mt, vm.apiRawGet(reg, .{ .String = key }).Table);
+            // B2: metatable.__name == tname (PUC lauxlib.c:323) — the
+            // interned name string, not a fresh copy.
+            try testing.expectEqual(key, vm.apiRawGet(mt, .{ .String = name_key }).String);
             const tables_before = vm.testc_obj_tables;
             // A forced FULL GC while the table is stack-rooted AND
             // registry-published must NOT collect it — the rooting-order
@@ -54666,25 +54861,16 @@ test "P16.50-review-5 3.2: newmetatable normal constructor + per-edge OOM owners
             }
             const rooted = state.stack.items.len > base_stack_len;
             if (!table_created) {
-                // Constructor edge: nothing exists, nothing published.
-                saw_constructor_oom = true;
+                // Pre-table edge (tname intern or table constructor — both
+                // allocations are swept; both leave nothing committed):
+                // nothing exists, nothing published, stack shape untouched.
+                saw_pretable_oom = true;
                 try testing.expectEqual(base_stack_len, state.stack.items.len);
-            } else if (rooted) {
-                // Publish edge: the table is committed AND stack-rooted;
-                // a full GC must NOT collect it (the root works), and
-                // after unrooting the next full GC collects it (no leak).
-                saw_publish_oom = true;
-                const mt = state.stack.items[state.stack.items.len - 1].Table;
-                try vm.gcFullCollectionForUser();
-                try testing.expect(p50StillRegistered(vm, .{ .table = mt }));
-                state.stack.items.len = base_stack_len;
-                try vm.gcFullCollectionForUser();
-                try testing.expect(!p50StillRegistered(vm, .{ .table = mt }));
-            } else {
-                // Root edge: the table is committed but the stack append
-                // failed — registered-but-unrooted; the next full GC must
-                // collect it through the normal sweep (no leak, and the
-                // registry publish never happened → no dangling entry).
+            } else if (!rooted) {
+                // Stack-root edge: the table is committed but the stack
+                // append failed — registered-but-unrooted; the next full GC
+                // must collect it through the normal sweep (no leak, and
+                // the publish never happened → no dangling entry).
                 saw_root_oom = true;
                 try vm.gcFullCollectionForUser();
                 for (vm.gc_objects.items) |obj| {
@@ -54697,15 +54883,90 @@ test "P16.50-review-5 3.2: newmetatable normal constructor + per-edge OOM owners
                     }
                     try testing.expect(known); // everything pre-iteration survived
                 }
+            } else {
+                // The table is committed AND stack-rooted; the registry is
+                // untouched (no partially-published entry). __name presence
+                // splits the __name-insertion edge from the publish edge.
+                const mt = state.stack.items[state.stack.items.len - 1].Table;
+                if (vm.apiRawGet(mt, .{ .String = name_key }) == .String) {
+                    saw_publish_oom = true;
+                } else {
+                    saw_name_oom = true;
+                }
+                // A full GC while stack-rooted must NOT collect it (the
+                // root works); after unrooting, the next full GC collects
+                // it (no leak — the publish never happened).
+                try vm.gcFullCollectionForUser();
+                try testing.expect(p50StillRegistered(vm, .{ .table = mt }));
+                state.stack.items.len = base_stack_len;
+                try vm.gcFullCollectionForUser();
+                try testing.expect(!p50StillRegistered(vm, .{ .table = mt }));
             }
         }
     }
 
-    // Both owner-named edges must have fired, plus a clean success.
-    try testing.expect(saw_constructor_oom);
-    try testing.expect(saw_publish_oom);
+    // Every owner-named edge must have fired, plus a clean success.
+    try testing.expect(saw_pretable_oom);
     try testing.expect(saw_root_oom);
+    try testing.expect(saw_name_oom);
+    try testing.expect(saw_publish_oom);
     try testing.expect(saw_success);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// P16.50-review-6 B2: the testC `newmetatable` command runs the SAME
+// shared path as the C API (one `newMetatableShared`): same registry (a
+// testC-created metatable is visible through the registry to the C-API
+// side), same `__name = tname` contract, same "existing value + false"
+// behavior on the second call (PUC "name already in use").
+// ─────────────────────────────────────────────────────────────────────
+test "P16.50-review-6 B2: testC newmetatable shares the luaL_newmetatable path" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    vm.setDynamicBytecodeCompiler(defaultBytecodeCompiler);
+    try vm.enableTestcModule();
+
+    const src =
+        \\local pack = table.pack
+        \\
+        \\-- Created: table + true, and the PUC __name contract
+        \\-- (lauxlib.c:323) is observable from Lua.
+        \\local r = pack(T.testC('newmetatable p50r6b2mt; return 2'))
+        \\assert(r.n == 2 and type(r[1]) == 'table' and r[2] == true)
+        \\local mt = r[1]
+        \\assert(mt.__name == 'p50r6b2mt', '__name contract')
+        \\
+        \\-- Existing: the SAME table + false (PUC "name already in use").
+        \\r = pack(T.testC('newmetatable p50r6b2mt; return 2'))
+        \\assert(r.n == 2 and r[1] == mt and r[2] == false)
+        \\
+        \\-- return * shape: script + table + boolean.
+        \\r = pack(T.testC('newmetatable p50r6b2mt2; return *'))
+        \\assert(r.n == 3 and type(r[2]) == 'table' and r[3] == true)
+        \\assert(r[2].__name == 'p50r6b2mt2')
+        \\
+        \\return true
+    ;
+    const chunk_v = try vm.compileChunkValue(src, "=p50r6b2-testc-newmetatable");
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(chunk_v);
+    const cl = chunk_v.Closure;
+    const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+    defer vm.alloc.free(results);
+    try testing.expect(results[0] == .Bool and results[0].Bool == true);
+
+    // Shared-registry proof (Zig side): both testC-created metatables are
+    // published in the ONE registry the C API uses, each with __name set.
+    const reg = try vm.apiEnsureRegistry();
+    const name_key = try vm.internStr("__name");
+    for ([_][]const u8{ "p50r6b2mt", "p50r6b2mt2" }) |n| {
+        const key = try vm.internStr(n);
+        const got = vm.apiRawGet(reg, .{ .String = key });
+        try testing.expect(got == .Table);
+        try testing.expectEqual(key, vm.apiRawGet(got.Table, .{ .String = name_key }).String);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -54810,4 +55071,190 @@ test "P16.50-review-5 3.3: remapFn reserve-first registry update (no best-effort
         alloc.free(grown);
         try testing.expectEqual(@as(i64, 0), ctrl.total_bytes);
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// P16.50-review-6 BLOCKER 1: T.testC returns its ACTUAL results via the
+// runtime-dynamic BuiltinResult contract (PUC ldo.c precallC/luaD_poscall:
+// the C function returns the real count; moveresults moves exactly those
+// values). The rejected static script scanner (testcScriptOutBound,
+// P16.50-review-5) is deleted. These tests run REAL bytecode dispatch —
+// every consumption shape (table.pack multret, fixed nresults, table
+// constructor, select('#', ...), tail call, TBC close, return hook,
+// nested pcall, ccl callable form) must observe the exact result set.
+// Ground truth verified against a purpose-built PUC 5.5 reference binary
+// with ltests (see report.md).
+// ─────────────────────────────────────────────────────────────────────
+test "P16.50-review-6 B1: T.testC runtime-dynamic result contract (real dispatch)" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    // The testC bootstrap compiles Lua source; it needs the dynamic
+    // compiler the CLI installs.
+    vm.setDynamicBytecodeCompiler(defaultBytecodeCompiler);
+    try vm.enableTestcModule();
+
+    const src =
+        \\local pack = table.pack
+        \\local debug = require('debug')
+        \\
+        \\-- Owner repro 1: compare + return * (the scanner ate the boolean).
+        \\local r = pack(T.testC('pushint 1; pushint 2; compare LT -2 -1; return *'))
+        \\assert(r.n == 4 and r[2] == 1 and r[3] == 2 and r[4] == true)
+        \\
+        \\-- Owner repro 2: newmetatable + return * (table + boolean).
+        \\r = pack(T.testC('newmetatable p50r6mt; return *'))
+        \\assert(r.n == 3 and type(r[2]) == 'table' and r[3] == true)
+        \\
+        \\-- return * after topointer (userdata push, scanner counted 0).
+        \\r = pack(T.testC('newtable; topointer -1; return *'))
+        \\assert(r.n == 3 and type(r[3]) == 'userdata')
+        \\
+        \\-- return * after traceback (well-formed; PUC reference: n=2).
+        \\r = pack(T.testC('traceback "msg" 1; return *'))
+        \\assert(r.n == 2 and type(r[2]) == 'string')
+        \\
+        \\-- Negative settop is a RELATIVE index (PUC lua_settop):
+        \\-- settop -1 keeps the top element, settop -2 pops one.
+        \\r = pack(T.testC('pushint 1; pushint 2; pushint 3; settop -1; return *'))
+        \\assert(r.n == 4 and r[2] == 1 and r[3] == 2 and r[4] == 3)
+        \\r = pack(T.testC('pushint 1; pushint 2; pushint 3; settop -2; return *'))
+        \\assert(r.n == 3 and r[2] == 1 and r[3] == 2)
+        \\
+        \\-- Fixed return N: the LAST n stack values (PUC return n).
+        \\r = pack(T.testC('pushint 1; pushint 2; return 2'))
+        \\assert(r.n == 2 and r[1] == 1 and r[2] == 2)
+        \\
+        \\-- Nested / re-entrant: pcall -> Lua -> T.testC with return *.
+        \\local function inner()
+        \\  return pack(T.testC('pushint 7; pushint 8; return *'))
+        \\end
+        \\local ok, ir = pcall(inner)
+        \\assert(ok and ir.n == 3 and ir[2] == 7 and ir[3] == 8)
+        \\
+        \\-- Callable/table (ccl) form: script in the upvalue; the testC
+        \\-- stack starts empty (include_script_on_stack = false), so
+        \\-- return * yields exactly the pushed values.
+        \\local ccl = T._makecfunc('pushint 5; pushint 6; return *')
+        \\r = pack(ccl())
+        \\assert(r.n == 2 and r[1] == 5 and r[2] == 6)
+        \\
+        \\-- Consumption shapes around the dynamic count. PUC `return *`
+        \\-- includes the script string as result 1, so a fixed-nresults
+        \\-- assignment sees (script, 1) — verified against the PUC
+        \\-- reference binary.
+        \\local a, b = T.testC('pushint 1; pushint 2; pushint 3; return *')
+        \\assert(type(a) == 'string' and b == 1)
+        \\local c, d = T.testC('pushint 1; pushint 2; return 2')
+        \\assert(c == 1 and d == 2)
+        \\local t = {T.testC('pushint 1; pushint 2; return *')}
+        \\assert(#t == 3 and type(t[1]) == 'string' and t[2] == 1 and t[3] == 2)
+        \\assert(select('#', T.testC('pushint 1; pushint 2; return *')) == 3)
+        \\
+        \\-- Tail call: OP_TAILCALL owned transport (no dupe, no scratch).
+        \\local function tailf()
+        \\  return T.testC('pushint 9; pushint 10; return *')
+        \\end
+        \\r = pack(tailf())
+        \\assert(r.n == 3 and r[2] == 9 and r[3] == 10)
+        \\
+        \\-- TBC close around a dynamic T.testC return: the close runs on
+        \\-- the normal return path AND the results stay exact.
+        \\local closed = false
+        \\local function withclose()
+        \\  local x <close> = setmetatable({}, {__close = function() closed = true end})
+        \\  return T.testC('pushint 11; return *')
+        \\end
+        \\r = pack(withclose())
+        \\assert(closed and r.n == 2 and r[2] == 11)
+        \\
+        \\-- Return hook around a dynamic T.testC return: the hook fires on
+        \\-- the builtin's return event; the store_results continuation must
+        \\-- carry the OWNED values (single owner, exact count).
+        \\local hookfires = 0
+        \\debug.sethook(function() hookfires = hookfires + 1 end, 'r')
+        \\r = pack(T.testC('pushint 12; return *'))
+        \\debug.sethook()
+        \\assert(r.n == 2 and r[2] == 12 and hookfires > 0)
+        \\
+        \\return true
+    ;
+    const chunk_v = try vm.compileChunkValue(src, "=p50r6-contract");
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(chunk_v);
+    const cl = chunk_v.Closure;
+    const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+    defer vm.alloc.free(results);
+    try testing.expectEqual(@as(usize, 1), results.len);
+    try testing.expect(results[0] == .Bool and results[0].Bool == true);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// P16.50-review-6 BLOCKER 1: OOM countdown sweep across the dynamic
+// result path. Failures must land BOTH before the results are obtained
+// (runTestcScript stack growth) AND after (OP_CALL's growCtxFrame /
+// moveresults store under the caller's nresults contract). Every failure
+// must surface as a memory error (never a wrong-value success), and the
+// first success must produce the EXACT contract. The owned slice itself
+// is infraAlloc'd (uncounted transport, PUC luaD_poscall parity), so a
+// countdown can never kill the result transport itself — only the
+// counted bc_stack growth and script machinery. testing.allocator catches
+// any ownership leak at deinit.
+// ─────────────────────────────────────────────────────────────────────
+test "P16.50-review-6 B1: owned-result OOM countdown sweep (before/after results)" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    vm.setDynamicBytecodeCompiler(defaultBytecodeCompiler);
+    try vm.enableTestcModule();
+
+    // Precompile BEFORE arming any countdown: the sweep must fail inside
+    // the RUN, not the compile.
+    const src =
+        \\local r = table.pack(T.testC('pushint 1; pushint 2; compare LT -2 -1; return *'))
+        \\return r.n, r[2], r[3], r[4]
+    ;
+    const chunk_v = try vm.compileChunkValue(src, "=p50r6-oom");
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(chunk_v);
+    const cl = chunk_v.Closure;
+
+    var outs: [1]Value = undefined;
+    var saw_fail = false;
+    var saw_success = false;
+    var cd: i64 = 0;
+    while (cd <= 96) : (cd += 1) {
+        try vm.builtinTestcAlloccount(&.{.{ .Int = cd }}, &outs);
+        const failed = blk: {
+            if (vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl)) |results| {
+                defer vm.alloc.free(results);
+                // ANY success must already carry the exact contract — a
+                // truncated success (the old scanner bug) fails here.
+                try testing.expectEqual(@as(usize, 4), results.len);
+                try testing.expect(results[0] == .Int and results[0].Int == 4);
+                try testing.expect(results[1] == .Int and results[1].Int == 1);
+                try testing.expect(results[2] == .Int and results[2].Int == 2);
+                try testing.expect(results[3] == .Bool and results[3].Bool == true);
+                break :blk false;
+            } else |e| {
+                // Memory errors surface as OutOfMemory or a RuntimeError
+                // carrying "not enough memory" — never anything else.
+                try testing.expect(e == error.OutOfMemory or e == error.RuntimeError);
+                break :blk true;
+            }
+        };
+        try vm.builtinTestcAlloccount(&.{.{ .Int = -1 }}, &outs); // disarm
+        if (failed) saw_fail = true else saw_success = true;
+    }
+    // The sweep must have crossed at least one failure point and reached
+    // the success plateau.
+    try testing.expect(saw_fail and saw_success);
+
+    // Disarmed, one final clean run: exact contract, no countdown.
+    const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+    defer vm.alloc.free(results);
+    try testing.expectEqual(@as(usize, 4), results.len);
+    try testing.expect(results[3] == .Bool and results[3].Bool == true);
 }

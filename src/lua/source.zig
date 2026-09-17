@@ -7,6 +7,10 @@ pub const Source = struct {
     pub fn loadFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !Source {
         const max_bytes: usize = 64 * 1024 * 1024;
         const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_bytes));
+        // If the name formatting fails, the already-read bytes must not
+        // leak (observed as a per-attempt retained leak under testc
+        // memory limits in memerr.lua's dofile test).
+        errdefer alloc.free(bytes);
         const name = try std.fmt.allocPrint(alloc, "@{s}", .{path});
         return .{ .name = name, .bytes = bytes };
     }

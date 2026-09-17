@@ -113,6 +113,8 @@ pub const luaL_Buffer = extern struct {
 
 pub export fn luaL_newstate() ?*lua_State {
     const alloc = std.heap.c_allocator;
+    // (b) status contract: lua_newstate returns NULL on failure (PUC
+    // lstate.c) — no state exists yet, so there is nothing to throw on.
     const vm = alloc.create(Vm) catch return null;
     vm.* = Vm.init(alloc, false);
     // Install the default bytecode compiler so that text loading via
@@ -160,6 +162,8 @@ pub export fn lua_newstate(
     // string hashing (luaS_hash). We pass it through as the hash_seed_override
     // so Vm.init uses it directly instead of generating its own entropy.
     const alloc = std.heap.c_allocator;
+    // (b) status contract: lua_newstate returns NULL on failure (PUC
+    // lstate.c) — no state exists yet, so there is nothing to throw on.
     const vm = alloc.create(Vm) catch return null;
     vm.* = Vm.initWithSeed(alloc, false, @as(u64, seed));
     vm.c_alloc_fn = f;
@@ -277,8 +281,19 @@ pub export fn lua_closethread(L: ?*lua_State, from: ?*lua_State) c_int {
     }
 
     // PUC lstate.c:328: status = luaE_resetthread(L, L->status)
+    // PUC lstate.c:328: status = luaE_resetthread(L, L->status) — an OOM
+    // during the protected close yields LUA_ERRMEM, and lua_closethread
+    // returns APIstatus(status) VERBATIM (no kind conversion; PUC's
+    // resetthread also installs the error object via luaD_seterrorobj at
+    // stack.p+1 — mirrored below with the fixed MEMERRMSG object,
+    // best-effort: the c_stack append can itself OOM).
     const result = vm.apiCloseThread(th) catch |err| switch (err) {
-        error.OutOfMemory => return 2,
+        error.OutOfMemory => {
+            vm.setOutOfMemoryError();
+            h.c_stack.clearRetainingCapacity();
+            h.c_stack.append(vm.alloc, vm.errThread().err_obj) catch {};
+            return 4; // LUA_ERRMEM (PUC APIstatus, P16.50-review-5 B2)
+        },
         error.RuntimeError => {
             // PUC lua_closethread (lstate.c:329-330): if L == from (closing
             // itself), luaD_throwbaselevel(L, status) never returns — it
@@ -340,6 +355,11 @@ pub export fn lua_closethread(L: ?*lua_State, from: ?*lua_State) c_int {
 
     // Error: push the error object on c_stack (PUC luaD_seterrorobj).
     h.c_stack.clearRetainingCapacity();
+    // (b) status-returning API: lua_closethread returns the close status;
+    // PUC's seterrorobj moves the object WITHIN one stack (infallible), our
+    // c_stack append can OOM — the status (2) is still returned, only the
+    // object push is lost (P16.50-review-5 B2 inventory; architectural fix
+    // = reserved c_stack slots, same family as the LUA_MINSTACK reserve).
     h.c_stack.append(vm.alloc, result.err) catch {};
     return 2; // LUA_ERRRUN
 }
@@ -393,7 +413,11 @@ pub export fn lua_xmove(from: ?*lua_State, to: ?*lua_State, n: c_int) void {
     if (count > src_h.c_stack.items.len) return;
     const start = src_h.c_stack.items.len - count;
     // Copy top `count` items from src to dst, then truncate src.
-    dst_h.c_stack.appendSlice(vm.alloc, src_h.c_stack.items[start..]) catch return;
+    // PUC lua_xmove → luaD_growstack on dst: OOM is LUA_ERRMEM thrown on
+    // the DESTINATION state (P16.50-review-5 B2 — the old `catch return`
+    // silently dropped the move).
+    dst_h.c_stack.appendSlice(vm.alloc, src_h.c_stack.items[start..]) catch |e|
+        cThrowOn(vm, dst_h, e);
     src_h.c_stack.items.len = start;
 }
 
@@ -432,6 +456,12 @@ pub export fn lua_error(L: ?*lua_State) noreturn {
     }
     // Fresh error: reset LUA_ERRERR signal before invokeErrfunc.
     eth.err_is_errerr = false;
+    // (d) internal cleanup, unobservable: the thrown object is ALREADY
+    // installed on eth (the fold above); invokeErrfunc's error return can
+    // only be an OOM from its gcTempRoots bookkeeping — PUC's equivalent
+    // root-push is a stack-slot store (infallible). A failure here skips
+    // only the message handler and the SAME object still longjmps below,
+    // which is exactly what PUC throws when its (infallible) setup exists.
     vm.invokeErrfunc() catch {};
     if (vm.c_error_jmp) |jb| {
         _longjmp(jb, 1);
@@ -604,6 +634,15 @@ pub export fn lua_pushfstring(L: ?*lua_State, fmt: [*:0]const u8, ...) [*:0]cons
     return lua_pushvfstring(L, fmt, &ap);
 }
 
+/// PUC luaM_error via the C boundary for pushvfstring's locally-held
+/// buffer: `_longjmp` bypasses Zig `defer`, so the buffer is deinit'd
+/// manually BEFORE the throw (P16.50-review-5 B2 — every append failure
+/// previously returned "" and leaked the buffer).
+fn cThrowOomBuf(vm: *Vm, h: *vm_mod.lua_State, buf: *std.ArrayList(u8)) noreturn {
+    buf.deinit(vm.alloc);
+    cThrowOn(vm, h, error.OutOfMemory);
+}
+
 /// PUC `lua_pushvfstring` (lapi.c) / `luaO_pushvfstring` (lobject.c): the
 /// core formatting engine. Walks `fmt`, copying literal text to a buffer and
 /// substituting `%`-specifiers from the C vararg list `argp`. PUC supports:
@@ -624,15 +663,20 @@ pub export fn lua_pushvfstring(
     const h = L orelse return "".ptr;
     const vm = h.vm;
 
+    // NO defer: _longjmp bypasses it. Every failure path deinits the
+    // buffer manually via cThrowOomBuf before throwing LUA_ERRMEM.
     var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(vm.alloc);
+    // Scratch for numeric/pointer specs: formatted into this fixed buffer
+    // (no heap temp — the old allocPrint+defer-free dance is gone; the
+    // longest possible output, an f64 shortest-round-trip, is < 32 bytes).
+    var tmp: [64]u8 = undefined;
 
     var i: usize = 0;
     while (true) {
         const c = fmt[i];
         if (c == 0) break;
         if (c != '%') {
-            buf.append(vm.alloc, c) catch return "".ptr;
+            buf.append(vm.alloc, c) catch cThrowOomBuf(vm, h, &buf);
             i += 1;
             continue;
         }
@@ -640,64 +684,64 @@ pub export fn lua_pushvfstring(
         const spec = fmt[i];
         switch (spec) {
             0 => {
-                buf.append(vm.alloc, '%') catch return "".ptr;
+                buf.append(vm.alloc, '%') catch cThrowOomBuf(vm, h, &buf);
                 break;
             },
             'd' => {
                 const v = @cVaArg(argp, c_int);
-                const s = std.fmt.allocPrint(vm.alloc, "{d}", .{v}) catch return "".ptr;
-                defer vm.alloc.free(s);
-                buf.appendSlice(vm.alloc, s) catch return "".ptr;
+                const s = std.fmt.bufPrint(&tmp, "{d}", .{v}) catch unreachable;
+                buf.appendSlice(vm.alloc, s) catch cThrowOomBuf(vm, h, &buf);
             },
             'I' => {
                 const v = @cVaArg(argp, i64);
-                const s = std.fmt.allocPrint(vm.alloc, "{d}", .{v}) catch return "".ptr;
-                defer vm.alloc.free(s);
-                buf.appendSlice(vm.alloc, s) catch return "".ptr;
+                const s = std.fmt.bufPrint(&tmp, "{d}", .{v}) catch unreachable;
+                buf.appendSlice(vm.alloc, s) catch cThrowOomBuf(vm, h, &buf);
             },
             'f' => {
                 const v = @cVaArg(argp, f64);
-                const s = std.fmt.allocPrint(vm.alloc, "{d}", .{v}) catch return "".ptr;
-                defer vm.alloc.free(s);
-                buf.appendSlice(vm.alloc, s) catch return "".ptr;
+                const s = std.fmt.bufPrint(&tmp, "{d}", .{v}) catch unreachable;
+                buf.appendSlice(vm.alloc, s) catch cThrowOomBuf(vm, h, &buf);
             },
             's' => {
                 const v = @cVaArg(argp, ?[*:0]const u8);
                 if (v) |str| {
-                    buf.appendSlice(vm.alloc, std.mem.span(str)) catch return "".ptr;
+                    buf.appendSlice(vm.alloc, std.mem.span(str)) catch cThrowOomBuf(vm, h, &buf);
                 } else {
-                    buf.appendSlice(vm.alloc, "(null)") catch return "".ptr;
+                    buf.appendSlice(vm.alloc, "(null)") catch cThrowOomBuf(vm, h, &buf);
                 }
             },
             'c' => {
                 const v = @cVaArg(argp, c_int);
-                buf.append(vm.alloc, @intCast(@as(u32, @bitCast(v)) & 0xFF)) catch return "".ptr;
+                buf.append(vm.alloc, @intCast(@as(u32, @bitCast(v)) & 0xFF)) catch cThrowOomBuf(vm, h, &buf);
             },
             'p' => {
                 const v = @cVaArg(argp, ?*anyopaque);
-                const s = std.fmt.allocPrint(vm.alloc, "{x}", .{@intFromPtr(v)}) catch return "".ptr;
-                defer vm.alloc.free(s);
-                buf.appendSlice(vm.alloc, s) catch return "".ptr;
+                const s = std.fmt.bufPrint(&tmp, "{x}", .{@intFromPtr(v)}) catch unreachable;
+                buf.appendSlice(vm.alloc, s) catch cThrowOomBuf(vm, h, &buf);
             },
             'U' => {
                 const cp = @cVaArg(argp, c_int);
                 var utf8: [4]u8 = undefined;
                 const codepoint: u21 = @intCast(@as(u32, @bitCast(cp)) & 0x7FFFFFFF);
+                // (c) PUC parity: an invalid codepoint encodes to 0 bytes
+                // (luaO_utf8esc's failure mode) — nothing is appended.
                 const n = std.unicode.utf8Encode(codepoint, &utf8) catch 0;
-                buf.appendSlice(vm.alloc, utf8[0..n]) catch return "".ptr;
+                buf.appendSlice(vm.alloc, utf8[0..n]) catch cThrowOomBuf(vm, h, &buf);
             },
-            '%' => buf.append(vm.alloc, '%') catch return "".ptr,
+            '%' => buf.append(vm.alloc, '%') catch cThrowOomBuf(vm, h, &buf),
             else => {
                 // PUC default: keep unknown specifier verbatim (e.g. "%x" stays "%x")
-                buf.append(vm.alloc, '%') catch return "".ptr;
-                buf.append(vm.alloc, spec) catch return "".ptr;
+                buf.append(vm.alloc, '%') catch cThrowOomBuf(vm, h, &buf);
+                buf.append(vm.alloc, spec) catch cThrowOomBuf(vm, h, &buf);
             },
         }
         i += 1;
     }
 
-    const ls = vm.internStr(buf.items) catch return "".ptr;
-    h.c_stack.append(vm.alloc, .{ .String = ls }) catch {};
+    // PUC luaO_pushvfstring → luaS_new: OOM is LUA_ERRMEM (never "").
+    const ls = vm.internStr(buf.items) catch cThrowOomBuf(vm, h, &buf);
+    h.c_stack.append(vm.alloc, .{ .String = ls }) catch cThrowOomBuf(vm, h, &buf);
+    buf.deinit(vm.alloc);
     return @ptrCast(@constCast(ls.bytes().ptr));
 }
 
@@ -720,10 +764,13 @@ fn cApiAllocWrapper(
     }
     if (ptr) |p| {
         const old_buf: [*]u8 = @ptrCast(p);
+        // (b) lua_Alloc C contract: the allocator callback returns NULL on
+        // failure — PUC's l_alloc does the same (the caller decides the
+        // error status; the fixed MEMERRMSG path never re-enters here).
         const new_buf = vm.alloc.realloc(old_buf[0..osize], nsize) catch return null;
         return @ptrCast(new_buf.ptr);
     }
-    const new_buf = vm.alloc.alloc(u8, nsize) catch return null;
+    const new_buf = vm.alloc.alloc(u8, nsize) catch return null; // (b) same contract
     return @ptrCast(new_buf.ptr);
 }
 
@@ -924,13 +971,16 @@ pub export fn lua_stringtonumber(L: ?*lua_State, s: [*:0]const u8) usize {
 
     // Try integer first (PUC's `l_str2int`): handles decimal and hex (0x).
     if (std.fmt.parseInt(i64, trimmed, 0)) |i| {
-        h.c_stack.append(vm.alloc, .{ .Int = i }) catch return 0;
+        // PUC lua_stringtonumber → lua_pushinteger → api_incr_top: OOM is
+        // LUA_ERRMEM (P16.50-review-5 B2 — the old `catch return 0` masked
+        // the push failure as "not a number").
+        h.c_stack.append(vm.alloc, .{ .Int = i }) catch |e| cThrowOn(vm, h, e);
         return str.len + 1; // PUC returns strlen(s) + 1 (including NUL)
     } else |_| {}
 
     // Try float (PUC's `l_str2d`): handles decimal, hex floats, inf, nan.
     if (std.fmt.parseFloat(f64, trimmed)) |n| {
-        h.c_stack.append(vm.alloc, .{ .Num = n }) catch return 0;
+        h.c_stack.append(vm.alloc, .{ .Num = n }) catch |e| cThrowOn(vm, h, e);
         return str.len + 1;
     } else |_| {}
 
@@ -952,12 +1002,16 @@ pub export fn lua_numbertocstring(L: ?*lua_State, idx: c_int, buff: [*]u8) c_uin
 
     switch (val) {
         .Int => |i| {
-            const s = std.fmt.bufPrint(buff[0..64], "{d}", .{i}) catch return 0;
+            // (c) infallible: LUA_N2SBUFFSZ is 64 bytes; the longest {d}
+            // output for an i64 is 20 chars — NoSpaceLeft is impossible.
+            const s = std.fmt.bufPrint(buff[0..64], "{d}", .{i}) catch unreachable;
             buff[s.len] = 0; // NUL-terminate
             return @intCast(s.len + 1);
         },
         .Num => |n| {
-            const s = std.fmt.bufPrint(buff[0..64], "{d}", .{n}) catch return 0;
+            // (c) infallible: the longest {d} output for an f64 shortest
+            // round-trip ("-1.7976931348623157e308") is 24 chars < 64.
+            const s = std.fmt.bufPrint(buff[0..64], "{d}", .{n}) catch unreachable;
             // PUC's `tostringbuffFloat` appends ".0" if the result looks like
             // an integer (no decimal point or exponent). Zig's `{d}` for f64
             // may produce "42" for 42.0, so we mirror PUC's behavior.
@@ -1034,10 +1088,13 @@ pub export fn lua_toclose(L: ?*lua_State, idx: c_int) void {
             if (top == .frame_slot and top.frame_slot.cframe_idx == fi and
                 top.frame_slot.slot_idx >= abs) return;
         }
+        // PUC lua_toclose → luaF_newtbcmark → luaM_error: OOM is
+        // LUA_ERRMEM (P16.50-review-5 B2 — the old `catch {}` silently
+        // dropped the __close mark).
         chain.append(vm.alloc, .{ .frame_slot = .{
             .cframe_idx = fi,
             .slot_idx = abs,
-        } }) catch {};
+        } }) catch |e| cThrowOn(vm, h, e);
     } else {
         // Hook lane (PUC luaD_hook: L->ci = the interrupted Lua frame).
         // PUC marks the frame (CIST_TBC) + the slot's LEVEL in tbclist; the
@@ -1051,7 +1108,8 @@ pub export fn lua_toclose(L: ?*lua_State, idx: c_int) void {
         // level is a PUC shared-stack quirk luazig's split stacks cannot
         // — and need not — reproduce).
         const value = if (abs < h.c_stack.items.len) h.c_stack.items[abs] else .Nil;
-        chain.append(vm.alloc, .{ .detached = value }) catch {};
+        // Same luaF_newtbcmark OOM contract as the frame_slot lane above.
+        chain.append(vm.alloc, .{ .detached = value }) catch |e| cThrowOn(vm, h, e);
     }
     // PUC sets CIST_TBC on L->ci (the frame "has marks" hint) — gates the
     // chain-region close at the frame's return (PUC moveresults) and the
@@ -1107,17 +1165,17 @@ pub export fn lua_closeslot(L: ?*lua_State, idx: c_int) void {
     }
 
     // Call __close(val) with 0 results, non-yieldably (PUC luaD_callnoyield).
-    // Errors propagate through apiCall to the caller's pcall/error handler
-    // (PUC luaD_call → luaD_throw): push the error object and re-raise via
-    // lua_error.
+    // Errors propagate to the caller's pcall/error handler (PUC luaD_call →
+    // luaD_throw): re-raise through the C-function boundary directly with
+    // the error object the VM already installed — no intermediate stack
+    // push (which itself could OOM; P16.50-review-5 B2 removed the old
+    // append-swallow-then-lua_error detour).
     var call_args = [_]Value{val};
-    _ = vm.apiCall(.nonyieldable, mm.?.*, call_args[0..]) catch {
-        if (vm.errThread().err_has_obj) {
-            h.c_stack.append(vm.alloc, vm.errThread().err_obj) catch {};
-        } else {
-            h.c_stack.append(vm.alloc, .Nil) catch {};
-        }
-        _ = lua_error(L);
+    _ = vm.apiCall(.nonyieldable, mm.?.*, call_args[0..]) catch |e| switch (e) {
+        // .nonyieldable contract: apiCall never reports error.Yield here.
+        error.Yield => unreachable,
+        error.OutOfMemory => cThrowOn(vm, h, error.OutOfMemory),
+        error.RuntimeError => cThrowOn(vm, h, error.Runtime),
     };
 }
 
@@ -1181,6 +1239,11 @@ pub export fn luaL_loadbufferx(L: ?*lua_State, buff: [*]const u8, sz: usize, nam
 pub export fn luaL_loadfilex(L: ?*lua_State, filename: [*:0]const u8, mode: ?[*:0]const u8) c_int {
     const h = L orelse return 2; // LUA_ERRRUN
     const vm = h.vm;
+    // (b) status-returning: luaL_loadfilex reports failures as a status.
+    // Residual divergence (B2 inventory, not a swallow): PUC maps a missing
+    // file to LUA_ERRFILE; loadFile's error set is undifferentiated here, so
+    // every failure reports LUA_ERRMEM (candidate follow-up: split the
+    // error kinds once statusCode grows an ERRFILE arm).
     const source = source_mod.Source.loadFile(vm.alloc, stdio.activeIo(), std.mem.span(filename)) catch
         return statusCode(.memory_error);
     // PUC lauxlib.c:820-836: skip BOM and optional `#` first-line comment
@@ -1286,6 +1349,11 @@ pub export fn luaL_checkversion_(L: ?*lua_State, ver: f64, sz: usize) void {
 // ===========================================================================
 
 // --- Stack manipulation ---
+// B2 inventory note for this block: pop/rotate/copy/insert/remove/absindex
+// operate on EXISTING stack slots only — their error sets are
+// InvalidIndex-only (no allocation). PUC treats a bad index as an api_check
+// precondition (abort in apicheck builds); these shims are lenient no-ops
+// instead (class (c) — infallible w.r.t. allocation, precondition-lenient).
 
 pub export fn lua_gettop(L: ?*lua_State) c_int {
     var s = api.State.fromHandle(L orelse return 0);
@@ -1294,18 +1362,23 @@ pub export fn lua_gettop(L: ?*lua_State) c_int {
 
 pub export fn lua_settop(L: ?*lua_State, idx: c_int) void {
     var s = api.State.fromHandle(L orelse return);
-    s.settop(idx) catch {};
+    s.settop(idx) catch |e| switch (e) {
+        // Growing the stack (idx above top) → PUC luaD_growstack →
+        // LUA_ERRMEM. InvalidIndex is PUC api_check — lenient.
+        error.OutOfMemory => cThrowOn(s.vm, L.?, e),
+        else => {},
+    };
 }
 
 pub export fn lua_pop(L: ?*lua_State, n: c_int) void {
     var s = api.State.fromHandle(L orelse return);
     if (n <= 0) return;
-    s.pop(@intCast(n)) catch {};
+    s.pop(@intCast(n)) catch {}; // (c): InvalidIndex-only (see block note)
 }
 
 pub export fn lua_rotate(L: ?*lua_State, idx: c_int, n: c_int) void {
     var s = api.State.fromHandle(L orelse return);
-    s.rotate(idx, n) catch {};
+    s.rotate(idx, n) catch {}; // (c): in-stack rotate, InvalidIndex-only
 }
 
 pub export fn lua_copy(L: ?*lua_State, fromidx: c_int, toidx: c_int) void {
@@ -1333,27 +1406,31 @@ pub export fn lua_copy(L: ?*lua_State, fromidx: c_int, toidx: c_int) void {
         return;
     }
     var s = api.State.fromHandle(h);
-    s.copy(fromidx, toidx) catch {};
+    s.copy(fromidx, toidx) catch {}; // (c): in-stack write, InvalidIndex-only
 }
 
 pub export fn lua_insert(L: ?*lua_State, idx: c_int) void {
     var s = api.State.fromHandle(L orelse return);
-    s.insert(idx) catch {};
+    s.insert(idx) catch {}; // (c): in-stack move (rotate), InvalidIndex-only
 }
 
 pub export fn lua_remove(L: ?*lua_State, idx: c_int) void {
     var s = api.State.fromHandle(L orelse return);
-    s.remove(idx) catch {};
+    s.remove(idx) catch {}; // (c): in-stack move (rotate+pop), InvalidIndex-only
 }
 
 pub export fn lua_absindex(L: ?*lua_State, idx: c_int) c_int {
     var s = api.State.fromHandle(L orelse return 0);
+    // (c): pure index arithmetic, InvalidIndex-only → lenient 0.
     return @intCast(s.absindex(idx) catch 0);
 }
 
 pub export fn lua_checkstack(L: ?*lua_State, n: c_int) c_int {
     var s = api.State.fromHandle(L orelse return 0);
     if (n < 0) return 0;
+    // (b) PUC contract: lua_checkstack grows with raiseerror=0
+    // (luaD_growstack's non-throwing mode) and RETURNS 0 on failure —
+    // never a throw.
     s.checkstack(@intCast(n)) catch return 0;
     return 1;
 }
@@ -1362,27 +1439,31 @@ pub export fn lua_checkstack(L: ?*lua_State, n: c_int) c_int {
 
 pub export fn lua_pushnil(L: ?*lua_State) void {
     var s = api.State.fromHandle(L orelse return);
-    s.pushnil() catch {};
+    // PUC api_incr_top → luaD_checkstack: an OOM here is LUA_ERRMEM
+    // (P16.50-review-5 B2 — the old `catch {}` silently dropped the push).
+    s.pushnil() catch |e| cThrowOn(s.vm, L.?, e);
 }
 
 pub export fn lua_pushboolean(L: ?*lua_State, b: c_int) void {
     var s = api.State.fromHandle(L orelse return);
-    s.pushboolean(b != 0) catch {};
+    s.pushboolean(b != 0) catch |e| cThrowOn(s.vm, L.?, e);
 }
 
 pub export fn lua_pushinteger(L: ?*lua_State, v: i64) void {
     var s = api.State.fromHandle(L orelse return);
-    s.pushinteger(v) catch {};
+    s.pushinteger(v) catch |e| cThrowOn(s.vm, L.?, e);
 }
 
 pub export fn lua_pushnumber(L: ?*lua_State, v: f64) void {
     var s = api.State.fromHandle(L orelse return);
-    s.pushnumber(v) catch {};
+    s.pushnumber(v) catch |e| cThrowOn(s.vm, L.?, e);
 }
 
 pub export fn lua_pushstring(L: ?*lua_State, s: [*:0]const u8) void {
     var st = api.State.fromHandle(L orelse return);
-    st.pushstring(std.mem.span(s)) catch {};
+    // PUC lua_pushstring → luaS_new → luaC_newobj: OOM is LUA_ERRMEM
+    // (P16.50-review-5 B2 — the old `catch {}` silently dropped the push).
+    st.pushstring(std.mem.span(s)) catch |e| cThrowOn(st.vm, L.?, e);
 }
 
 pub export fn lua_pushliteral(L: ?*lua_State, s: [*:0]const u8) void {
@@ -1391,17 +1472,22 @@ pub export fn lua_pushliteral(L: ?*lua_State, s: [*:0]const u8) void {
 
 pub export fn lua_pushlstring(L: ?*lua_State, s: [*]const u8, len: usize) void {
     var st = api.State.fromHandle(L orelse return);
-    st.pushlstring(s[0..len]) catch {};
+    st.pushlstring(s[0..len]) catch |e| cThrowOn(st.vm, L.?, e);
 }
 
 pub export fn lua_pushvalue(L: ?*lua_State, idx: c_int) void {
     var s = api.State.fromHandle(L orelse return);
-    s.pushvalue(idx) catch {};
+    s.pushvalue(idx) catch |e| switch (e) {
+        // OOM: PUC api_incr_top → luaD_checkstack → LUA_ERRMEM.
+        error.OutOfMemory => cThrowOn(s.vm, L.?, e),
+        // InvalidIndex: PUC api_check precondition — lenient no-op.
+        else => {},
+    };
 }
 
 pub export fn lua_pushlightuserdata(L: ?*lua_State, p: ?*anyopaque) void {
     var s = api.State.fromHandle(L orelse return);
-    s.pushlightuserdata(p) catch {};
+    s.pushlightuserdata(p) catch |e| cThrowOn(s.vm, L.?, e);
 }
 
 /// P16.50-review: the shared `luaD_throw` equivalent for void C-ABI
@@ -1435,7 +1521,22 @@ fn cThrowOn(vm: *Vm, throwing: *vm_mod.lua_State, err: api.ApiError) noreturn {
             }
             cPanicOn(vm, throwing, "not enough memory");
         },
-        else => {
+        // P16.50-review-5 3.1: the remaining ApiError members are
+        // ENUMERATED — no catch-all `else` prong. A future ApiError kind
+        // must become a compile error here, never a silent ERRRUN. All of
+        // these surface as LUA_ERRRUN: Runtime is the Lua-facing runtime
+        // error; Type/InvalidIndex/InvalidState are PUC api_check-class
+        // failures reported as errors rather than UB; Syntax never reaches
+        // the throw path (load maps it to LUA_ERRSYNTAX before throwing);
+        // Memory is currently an unused ApiError member kept for source
+        // compatibility.
+        error.Type,
+        error.Runtime,
+        error.Syntax,
+        error.Memory,
+        error.InvalidIndex,
+        error.InvalidState,
+        => {
             if (vm.c_error_jmp) |jb| {
                 vm.c_error_value = vm.errThread().err_obj;
                 vm.c_error_status = 2; // LUA_ERRRUN
@@ -1461,6 +1562,13 @@ fn cPanicOn(vm: *Vm, throwing: *vm_mod.lua_State, msg: ?[]const u8) noreturn {
     // Install the message (fixed MEMERRMSG for OOM) so the hook observes
     // the exact object, run the hook EXACTLY once, then terminate.
     if (msg) |m| {
+        // (d) terminal path, best-effort: the only msg is the fixed
+        // MEMERRMSG, pre-interned ONCE at Vm init (oom_msg_str — see
+        // setOutOfMemoryError), so internStrAssume is a no-alloc lookup.
+        // The append installs the object for the panic hook exactly like
+        // PUC's in-stack luaD_seterrorobj (infallible there); if the append
+        // itself OOMs, the hook sees a stale top — observable only by the
+        // hook, which runs once immediately before the terminal abort.
         throwing.c_stack.append(vm.alloc, .{ .String = vm.internStrAssume(m) }) catch {};
     }
     if (vm.c_panicf) |pf| {
@@ -1491,7 +1599,9 @@ pub export fn lua_pushexternalstring(
     ud: ?*anyopaque,
 ) void {
     var st = api.State.fromHandle(L orelse return);
-    st.pushexternalString(s, len, falloc, ud) catch {};
+    // PUC lua_pushfstring-family: any string-construction OOM is LUA_ERRMEM
+    // (P16.50-review-5 B2 — the old `catch {}` silently dropped the push).
+    st.pushexternalString(s, len, falloc, ud) catch |e| cThrowOn(st.vm, L.?, e);
 }
 
 // --- Type / conversion ---
@@ -1597,6 +1707,8 @@ pub export fn lua_isuserdata(L: ?*lua_State, idx: c_int) c_int {
 
 pub export fn lua_isyieldable(L: ?*lua_State) c_int {
     var s = api.State.fromHandle(L orelse return 0);
+    // (c) infallible: apiIsYieldable is a pure nCcalls/status check (no
+    // allocation); the catch only guards the typed error union — false.
     return if (s.isyieldable(null) catch false) 1 else 0;
 }
 
@@ -1611,7 +1723,9 @@ pub export fn lua_tolstring(L: ?*lua_State, idx: c_int, len: ?*usize) ?[*:0]cons
         if (len) |p| p.* = 0;
         return null;
     });
-    if (s.tolstring(idx)) |bytes| {
+    // PUC lua_tolstring on a number allocates (luaS_new) — OOM is
+    // LUA_ERRMEM, not a silent NULL (P16.50-review-5 B2).
+    if (s.tolstring(idx) catch |e| cThrowOn(s.vm, L.?, e)) |bytes| {
         // luazig's LuaString storage is NUL-terminated (createLuaString writes
         // body[raw.len] = 0), so the byte slice can be safely cast to [*:0].
         if (len) |p| p.* = bytes.len;
@@ -1665,12 +1779,13 @@ pub export fn lua_tothread(L: ?*lua_State, idx: c_int) ?*lua_State {
         // stable one-to-one Value↔lua_State mapping. The handle is cached
         // on the Thread (created at most once per thread) and its lifetime
         // is tied to the Thread's GC lifetime: gcFreeObject(.thread) frees
-        // it via Thread.api_handle. On allocation failure we return null —
-        // a deviation from PUC (which cannot fail here), acceptable because
-        // it only manifests under OOM.
+        // it via Thread.api_handle. P16.50-review-5 B2: PUC cannot fail
+        // here (a thread IS a lua_State); our handle allocation OOM is
+        // LUA_ERRMEM (the old `catch return null` silently reported "not
+        // a thread" for a real thread value).
         if (th.api_handle) |h| return h;
         const vm = s.vm;
-        const h = vm.allocStateHandle(false) catch return null;
+        const h = vm.allocStateHandle(false) catch |e| cThrowOn(vm, L.?, e);
         h.* = .{ .vm = vm, .thread = th, .is_main = false };
         th.api_handle = h;
         return h;
@@ -1699,92 +1814,150 @@ pub export fn lua_createtable(L: ?*lua_State, narr: c_int, nrec: c_int) void {
 
 pub export fn lua_setglobal(L: ?*lua_State, name: [*:0]const u8) void {
     var s = api.State.fromHandle(L orelse return);
-    s.setglobal(std.mem.span(name)) catch {};
+    s.setglobal(std.mem.span(name)) catch |e| switch (e) {
+        // PUC lua_setglobal → luaH_set on the globals table: OOM (fresh
+        // key intern / table growth) is LUA_ERRMEM. Type/InvalidState are
+        // PUC api_check preconditions — lenient.
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => {},
+    };
 }
 
 pub export fn lua_getglobal(L: ?*lua_State, name: [*:0]const u8) c_int {
     var s = api.State.fromHandle(L orelse return -1);
-    return typeCode(s.getglobal(std.mem.span(name)) catch return 0);
+    // Only the result push can fail (OOM → LUA_ERRMEM; PUC api_incr_top).
+    return typeCode(s.getglobal(std.mem.span(name)) catch |e| cThrowOn(s.vm, L.?, e));
 }
 
 pub export fn lua_setfield(L: ?*lua_State, idx: c_int, k: [*:0]const u8) void {
     var s = api.State.fromHandle(L orelse return);
-    s.setfield(idx, std.mem.span(k)) catch {};
+    s.setfield(idx, std.mem.span(k)) catch |e| switch (e) {
+        // OOM (key intern / table growth) and Runtime (non-table target →
+        // luaG_typeerror) are real PUC throws; Type/InvalidIndex/
+        // InvalidState are PUC api_check preconditions — lenient.
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => {},
+    };
 }
 
 pub export fn lua_getfield(L: ?*lua_State, idx: c_int, k: [*:0]const u8) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    return typeCode(s.getfield(idx, std.mem.span(k)) catch return 0);
+    const t = s.getfield(idx, std.mem.span(k)) catch |e| switch (e) {
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => return 0,
+    };
+    return typeCode(t);
 }
 
 pub export fn lua_rawset(L: ?*lua_State, idx: c_int) void {
     var s = api.State.fromHandle(L orelse return);
-    s.rawset(idx) catch {};
+    s.rawset(idx) catch |e| switch (e) {
+        // PUC lua_rawset → luaH_rawset: OOM (table growth) throws ERRMEM;
+        // non-table target is a PUC api_check (lenient here).
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => {},
+    };
 }
 
 pub export fn lua_rawget(L: ?*lua_State, idx: c_int) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    return typeCode(s.rawget(idx) catch return 0);
+    const t = s.rawget(idx) catch |e| switch (e) {
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => return 0,
+    };
+    return typeCode(t);
 }
 
 /// PUC `lua_gettable` (lapi.c): `t[k]` with metamethods. Pops the key,
 /// pushes the value. Returns the value's type code.
 pub export fn lua_gettable(L: ?*lua_State, idx: c_int) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    return typeCode(s.gettable(idx) catch return 0);
+    const t = s.gettable(idx) catch |e| switch (e) {
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => return 0,
+    };
+    return typeCode(t);
 }
 
 /// PUC `lua_settable` (lapi.c): `t[k] = v` with metamethods. Pops both
 /// key and value.
 pub export fn lua_settable(L: ?*lua_State, idx: c_int) void {
     var s = api.State.fromHandle(L orelse return);
-    s.settable(idx) catch {};
+    s.settable(idx) catch |e| switch (e) {
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => {},
+    };
 }
 
 /// PUC `lua_geti` (lapi.c): `t[n]` with metamethods. Pushes the value.
 /// Returns the value's type code.
 pub export fn lua_geti(L: ?*lua_State, idx: c_int, n: i64) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    return typeCode(s.geti(idx, n) catch return 0);
+    const t = s.geti(idx, n) catch |e| switch (e) {
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => return 0,
+    };
+    return typeCode(t);
 }
 
 /// PUC `lua_seti` (lapi.c): `t[n] = v` with metamethods. Pops the value.
 pub export fn lua_seti(L: ?*lua_State, idx: c_int, n: i64) void {
     var s = api.State.fromHandle(L orelse return);
-    s.seti(idx, n) catch {};
+    s.seti(idx, n) catch |e| switch (e) {
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => {},
+    };
 }
 
 /// PUC `lua_rawgeti` (lapi.c): `t[n]` without metamethods. Pushes the
 /// value. Returns the value's type code.
 pub export fn lua_rawgeti(L: ?*lua_State, idx: c_int, n: i64) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    return typeCode(s.rawgeti(idx, n) catch return 0);
+    const t = s.rawgeti(idx, n) catch |e| switch (e) {
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => return 0,
+    };
+    return typeCode(t);
 }
 
 /// PUC `lua_rawseti` (lapi.c): `t[n] = v` without metamethods. Pops the
 /// value.
 pub export fn lua_rawseti(L: ?*lua_State, idx: c_int, n: i64) void {
     var s = api.State.fromHandle(L orelse return);
-    s.rawseti(idx, n) catch {};
+    s.rawseti(idx, n) catch |e| switch (e) {
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => {},
+    };
 }
 
 /// PUC `lua_rawgetp` (lapi.c): `t[p]` without metamethods, where `p` is a
 /// light userdata key. Pushes the value. Returns the value's type code.
 pub export fn lua_rawgetp(L: ?*lua_State, idx: c_int, p: ?*anyopaque) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    return typeCode(s.rawgetp(idx, p) catch return 0);
+    const t = s.rawgetp(idx, p) catch |e| switch (e) {
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => return 0,
+    };
+    return typeCode(t);
 }
 
 /// PUC `lua_rawsetp` (lapi.c): `t[p] = v` without metamethods, where `p`
 /// is a light userdata key. Pops the value.
 pub export fn lua_rawsetp(L: ?*lua_State, idx: c_int, p: ?*anyopaque) void {
     var s = api.State.fromHandle(L orelse return);
-    s.rawsetp(idx, p) catch {};
+    s.rawsetp(idx, p) catch |e| switch (e) {
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => {},
+    };
 }
 
 pub export fn lua_next(L: ?*lua_State, idx: c_int) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    return if (s.next(idx) catch false) 1 else 0;
+    const t = s.next(idx) catch |e| switch (e) {
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => return 0,
+    };
+    return if (t) 1 else 0;
 }
 
 // --- Arithmetic / comparison / length (PUC lapi.c) ---
@@ -1811,7 +1984,12 @@ pub export fn lua_arith(L: ?*lua_State, op: c_int) void {
         13 => .bnot,
         else => return,
     };
-    s.arith(arith_op) catch {};
+    s.arith(arith_op) catch |e| switch (e) {
+        // PUC lua_arith → luaT_trybinTM: OOM and Runtime (luaG_opint /
+        // __add error) throw; Type/InvalidState are api_check — lenient.
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => {},
+    };
 }
 
 /// PUC `lua_rawequal` (lapi.c:lua_rawequal): raw equality (no __eq
@@ -1832,7 +2010,13 @@ pub export fn lua_compare(L: ?*lua_State, idx1: c_int, idx2: c_int, op: c_int) c
         2 => .le,
         else => return 0,
     };
-    return if (s.compare(idx1, idx2, cmp_op) catch false) 1 else 0;
+    return if (s.compare(idx1, idx2, cmp_op) catch |e| switch (e) {
+        // PUC lua_compare: OOM and Runtime (luaG_ordererror / __lt
+        // metamethod error) throw; Type/InvalidIndex are api_check —
+        // lenient false.
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => false,
+    }) 1 else 0;
 }
 
 /// PUC `lua_concat` (lapi.c:lua_concat): concatenate n values from the
@@ -1840,7 +2024,13 @@ pub export fn lua_compare(L: ?*lua_State, idx1: c_int, idx2: c_int, op: c_int) c
 pub export fn lua_concat(L: ?*lua_State, n: c_int) void {
     var s = api.State.fromHandle(L orelse return);
     if (n <= 0) return;
-    s.concat(@intCast(n)) catch {};
+    s.concat(@intCast(n)) catch |e| switch (e) {
+        // PUC lua_concat → luaV_concat: OOM (string build) and Runtime
+        // (luaG_concaterror / __concat error) throw; Type/InvalidIndex
+        // are api_check — lenient.
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => {},
+    };
 }
 
 /// PUC `lua_len` (lapi.c:lua_len): push the length of the value at idx.
@@ -1848,7 +2038,12 @@ pub export fn lua_concat(L: ?*lua_State, n: c_int) void {
 /// nothing, pushes the length value.
 pub export fn lua_len(L: ?*lua_State, idx: c_int) void {
     var s = api.State.fromHandle(L orelse return);
-    s.len(idx) catch {};
+    s.len(idx) catch |e| switch (e) {
+        // PUC lua_len → luaV_objlen: OOM and Runtime (luaG_typeerror /
+        // __len error) throw; Type/InvalidIndex are api_check — lenient.
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => {},
+    };
 }
 
 // --- Coroutines (PUC lapi.c / ldo.c) ---
@@ -1962,6 +2157,10 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
         // builtinCoroutineResume's bundle defer, relying on latches;
         // the raising thread is now the direct, by-construction owner).
         const ev: vm_mod.Value = if (co.err_has_obj) co.err_obj else .Nil;
+        // (b) status-returning API: the status below (co.api_status — 4 for
+        // OOM since B1) is returned regardless; PUC's seterrorobj builds
+        // the [err, err] window within one stack (infallible), our appends
+        // can OOM — the window is lost, the status is not.
         h.c_stack.append(vm.alloc, ev) catch {};
         h.c_stack.append(vm.alloc, ev) catch {};
         if (nres) |p|
@@ -1969,8 +2168,12 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
                 h.c_stack.items.len - lua_resume_base
             else
                 0);
-        // PUC: LUA_ERRERR (5) if message handler errored, LUA_ERRRUN (2) otherwise.
-        return if (co.err_is_errerr) 5 else 2;
+        // PUC: the status flows from the resumed thread's own status
+        // (set by the catching boundary — L->status = status in
+        // ldo.c:983-988): LUA_ERRMEM (4) for OOM (P16.50-review-5 B1 —
+        // the old unconditional 2/5 mapping discarded the OutOfMemory
+        // kind finishCcall carried), ERRERR (5), ERRRUN (2).
+        return if (co.api_status != 0) co.api_status else if (co.err_is_errerr) 5 else 2;
     };
     const failed = produced > 0 and !(out[0] == .Bool and out[0].Bool);
     if (failed) {
@@ -1980,6 +2183,7 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
             // untouched. The engine's only failure for an already-dead
             // thread is "cannot resume dead coroutine".
             h.c_stack.items.len -= @min(nargs_usize, h.c_stack.items.len);
+            // (b): same window-append contract as the error path above.
             h.c_stack.append(vm.alloc, out[1]) catch {};
             return 2;
         }
@@ -1992,6 +2196,8 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
         // concatenates). builtinCoroutineResume snapshots it onto the thread
         // as api_err_residue. nres = window size.
         h.c_stack.items.len = lua_resume_base;
+        // (b): the [residue?, err, err] window appends — status (below)
+        // survives an append OOM; only the observable window is lost.
         if (co.api_err_residue) |r| h.c_stack.append(vm.alloc, r) catch {};
         h.c_stack.append(vm.alloc, out[1]) catch {};
         h.c_stack.append(vm.alloc, out[1]) catch {};
@@ -2000,15 +2206,23 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
                 h.c_stack.items.len - lua_resume_base
             else
                 0);
-        // PUC APIstatus: LUA_ERRERR (5) if the message handler itself
-        // errored, LUA_ERRRUN (2) otherwise (mirrored in th.api_status
-        // by builtinCoroutineResume's error tail).
-        return if (co.api_status == 5) 5 else 2;
+        // PUC APIstatus: the thread's own status (mirrored by
+        // builtinCoroutineResume's error tail — ERRMEM=4 included since
+        // P16.50-review-5 B1), ERRERR (5), else ERRRUN (2).
+        return if (co.api_status != 0) co.api_status else 2;
     }
     // Success or yield: replace function+args with results on c_stack.
     h.c_stack.items.len = lua_resume_base;
     const nres_usize: usize = if (produced > 0) produced - 1 else 0;
-    h.c_stack.appendSlice(vm.alloc, out[1 .. 1 + nres_usize]) catch {};
+    h.c_stack.appendSlice(vm.alloc, out[1 .. 1 + nres_usize]) catch {
+        // PUC luaD_poscall moves results within ONE stack (infallible);
+        // our append can OOM — report LUA_ERRMEM with the fixed MEMERRMSG
+        // object installed instead of silently reporting LUA_OK with
+        // missing results (P16.50-review-5 B2).
+        vm.setOutOfMemoryError();
+        if (nres) |p| p.* = 0;
+        return 4;
+    };
     if (nres) |p| p.* = @intCast(nres_usize);
     // Return LUA_YIELD (1) if suspended, LUA_OK (0) if done.
     const st_result: c_int = if (co.status == .suspended) 1 else 0;
@@ -2026,6 +2240,8 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
         // into a later resume's results or be mistaken for its arguments
         // (args are read from the top; the window sits below them).
         if (vm.apiHookYieldWindow(co)) |window|
+            // (b): diagnostic-only visibility window (the yield itself is
+            // already reported); an append OOM loses just the window.
             h.c_stack.appendSlice(vm.alloc, window) catch {};
     }
     return st_result;
@@ -2083,7 +2299,15 @@ pub export fn lua_yieldk(L: ?*lua_State, nresults: c_int, ctx: isize, k: ?*const
             }
             return 2;
         },
-        error.OutOfMemory => return 4,
+        // (b) status-returning: LUA_ERRMEM is lua_yieldk's specified OOM
+        // status. Install the FIXED MEMERRMSG object first so the error
+        // state is observable (allocation-free — oom_msg_str is interned
+        // once at Vm init), exactly like the results-append arms in
+        // lua_resume/lua_pcallk (P16.50-review-5 B2).
+        error.OutOfMemory => {
+            vm.setOutOfMemoryError();
+            return 4;
+        },
     };
     return 1; // LUA_YIELD — shouldn't happen
 }
@@ -2117,7 +2341,10 @@ pub export fn lua_status(L: ?*lua_State) c_int {
 pub export fn lua_pushthread(L: ?*lua_State) c_int {
     const h = L orelse return 0;
     const th = h.thread orelse return 0;
-    h.c_stack.append(h.vm.alloc, .{ .Thread = th }) catch return 0;
+    // PUC api_incr_top: OOM is LUA_ERRMEM (P16.50-review-5 B2 — the old
+    // `catch return 0` misreported "not the main thread" and pushed
+    // nothing).
+    h.c_stack.append(h.vm.alloc, .{ .Thread = th }) catch |e| cThrowOn(h.vm, h, e);
     return if (h.is_main) 1 else 0;
 }
 
@@ -2292,6 +2519,11 @@ pub export fn lua_pcallk(
                 vm.setErrfuncValue(null);
             }
             th.errfunc = fr2.u.c.old_errfunc;
+            // (b) status-returning: LUA_ERRMEM is the specified OOM status.
+            // Install the FIXED MEMERRMSG object (allocation-free) so the
+            // error state is observable — the raw `try` OOMs inside apiCall
+            // do not install it themselves (P16.50-review-5 B2).
+            vm.setOutOfMemoryError();
             return 4; // LUA_ERRMEM
         },
     };
@@ -2300,7 +2532,14 @@ pub export fn lua_pcallk(
     // Put results on c_stack
     h.c_stack.items.len = fn_idx;
     const want: usize = if (nresults < 0) ret.len else @min(ret.len, @as(usize, @intCast(nresults)));
-    h.c_stack.appendSlice(vm.alloc, ret[0..want]) catch return 4;
+    h.c_stack.appendSlice(vm.alloc, ret[0..want]) catch {
+        // PUC moves results within one stack (infallible); our append can
+        // OOM — install the fixed MEMERRMSG object so the error state is
+        // observable, then return LUA_ERRMEM (P16.50-review-5 B2 — the old
+        // bare `return 4` left no error object installed).
+        vm.setOutOfMemoryError();
+        return 4;
+    };
     return 0; // LUA_OK
 }
 
@@ -2308,7 +2547,9 @@ pub export fn lua_pcallk(
 
 pub export fn lua_newuserdatauv(L: ?*lua_State, sz: usize, nuvalue: c_int) ?*anyopaque {
     var s = api.State.fromHandle(L orelse return null);
-    return s.newuserdatauv(sz, @intCast(@max(nuvalue, 0))) catch null;
+    // PUC lua_newuserdatauv → luaC_newobj → luaM_error: OOM is LUA_ERRMEM,
+    // never a silent null (P16.50-review-5 B2).
+    return s.newuserdatauv(sz, @intCast(@max(nuvalue, 0))) catch |e| cThrowOn(s.vm, L.?, e);
 }
 
 pub export fn lua_touserdata(L: ?*lua_State, idx: c_int) ?*anyopaque {
@@ -2323,23 +2564,43 @@ pub export fn lua_topointer(L: ?*lua_State, idx: c_int) ?*anyopaque {
 
 pub export fn lua_setmetatable(L: ?*lua_State, objindex: c_int) c_int {
     var s = api.State.fromHandle(L orelse return 0);
+    // PUC lua_setmetatable is allocation-free and cannot fail. Our
+    // barrier/finalizer bookkeeping can OOM AFTER the observable
+    // metatable write commits — throwing would not restore the missed
+    // barrier, so the swallow is class (d) documented (P16.50-review-5
+    // B2; the architectural fix is pre-reserved barrier lists). The
+    // remaining Type/InvalidIndex/InvalidState errors are PUC api_check
+    // preconditions — lenient 0.
     s.setmetatable(objindex) catch return 0;
     return 1;
 }
 
 pub export fn lua_getmetatable(L: ?*lua_State, objindex: c_int) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    return if (s.getmetatable(objindex) catch false) 1 else 0;
+    return if (s.getmetatable(objindex) catch |e| switch (e) {
+        // OOM (metatable-list growth) → LUA_ERRMEM; Type/InvalidIndex are
+        // PUC api_check — lenient false (P16.50-review-5 B2).
+        error.OutOfMemory => cThrowOn(s.vm, L.?, e),
+        else => false,
+    }) 1 else 0;
 }
 
 pub export fn lua_setiuservalue(L: ?*lua_State, idx: c_int, n: c_int) c_int {
     var s = api.State.fromHandle(L orelse return 0);
+    // (c) infallible w.r.t. allocation: setiuservalue's error set is
+    // InvalidState/InvalidIndex only (an in-place uservalue write) — the
+    // catch is the lenient api_check answer for a bad index.
     return if (s.setiuservalue(idx, @intCast(@max(n, 0))) catch false) 1 else 0;
 }
 
 pub export fn lua_getiuservalue(L: ?*lua_State, idx: c_int, n: c_int) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    return typeCode(s.getiuservalue(idx, @intCast(@max(n, 0))) catch return 0);
+    return typeCode(s.getiuservalue(idx, @intCast(@max(n, 0))) catch |e| switch (e) {
+        // OOM (result push) → LUA_ERRMEM; Type/InvalidIndex are PUC
+        // api_check — lenient LUA_TNONE-ish 0 (P16.50-review-5 B2).
+        error.OutOfMemory => cThrowOn(s.vm, L.?, e),
+        else => return 0,
+    });
 }
 
 // --- lauxlib ---
@@ -2376,17 +2637,28 @@ pub export fn luaL_unref(L: ?*lua_State, t: c_int, ref: c_int) void {
 
 pub export fn luaL_newmetatable(L: ?*lua_State, tname: [*:0]const u8) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    return if (s.newmetatable(std.mem.span(tname)) catch false) 1 else 0;
+    // PUC luaL_newmetatable: lua_createtable + lua_setfield — OOM is
+    // LUA_ERRMEM, never a silent false (P16.50-review-5 B2).
+    return if (s.newmetatable(std.mem.span(tname)) catch |e| cThrowOn(s.vm, L.?, e)) 1 else 0;
 }
 
 pub export fn luaL_getmetatable(L: ?*lua_State, tname: [*:0]const u8) void {
     var s = api.State.fromHandle(L orelse return);
-    s.getRegisteredMetatable(std.mem.span(tname)) catch {};
+    // PUC luaL_getmetatable: lua_getfield on the registry — OOM is
+    // LUA_ERRMEM (the old swallow pushed NOTHING, corrupting the stack
+    // shape; P16.50-review-5 B2).
+    s.getRegisteredMetatable(std.mem.span(tname)) catch |e| cThrowOn(s.vm, L.?, e);
 }
 
 pub export fn luaL_setmetatable(L: ?*lua_State, tname: [*:0]const u8) void {
     var s = api.State.fromHandle(L orelse return);
-    s.setRegisteredMetatable(std.mem.span(tname)) catch {};
+    s.setRegisteredMetatable(std.mem.span(tname)) catch |e| switch (e) {
+        // getRegisteredMetatable OOM → LUA_ERRMEM; the trailing
+        // setmetatable's post-commit bookkeeping failures are class (d)
+        // documented (see lua_setmetatable).
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => {},
+    };
 }
 
 pub export fn luaL_testudata(L: ?*lua_State, ud: c_int, tname: [*:0]const u8) ?*anyopaque {
@@ -2410,6 +2682,8 @@ pub export fn luaL_checkinteger(L: ?*lua_State, arg: c_int) i64 {
 
 pub export fn luaL_optinteger(L: ?*lua_State, arg: c_int, def: i64) i64 {
     var s = api.State.fromHandle(L orelse return def);
+    // (c) infallible: optinteger's every path returns a value (absent or
+    // nil → def; the catch only guards the typed error union).
     return s.optinteger(arg, def) catch def;
 }
 
@@ -2531,17 +2805,20 @@ pub export fn luaL_where(L: ?*lua_State, lvl: c_int) void {
                 break :blk if (s.len > 0) s else "?";
             };
             var buf: [128]u8 = undefined;
-            const formatted = std.fmt.bufPrint(&buf, "{s}:{d}: ", .{ src, ar.currentline }) catch {
-                h.c_stack.append(vm.alloc, .{ .String = vm.internStr("") catch return }) catch {};
-                return;
-            };
-            const ls = vm.internStr(formatted) catch return;
-            h.c_stack.append(vm.alloc, .{ .String = ls }) catch {};
+            // Bounded inputs (short_src ≤ 60 bytes, currentline ≤ 11
+            // digits) — bufPrint cannot fail; PUC has no failure mode
+            // here either (lua_pushfstring on a fixed-size chunkid).
+            const formatted = std.fmt.bufPrint(&buf, "{s}:{d}: ", .{ src, ar.currentline }) catch unreachable;
+            // PUC lua_pushfstring: OOM is LUA_ERRMEM (P16.50-review-5 B2
+            // — the old `catch return` silently pushed nothing).
+            const ls = vm.internStr(formatted) catch |e| cThrowOn(vm, h, e);
+            h.c_stack.append(vm.alloc, .{ .String = ls }) catch |e| cThrowOn(vm, h, e);
             return;
         }
     }
     // Fallback: empty string (PUC pushes "" when no info is available)
-    h.c_stack.append(vm.alloc, .{ .String = vm.internStr("") catch return }) catch {};
+    const ls = vm.internStr("") catch |e| cThrowOn(vm, h, e);
+    h.c_stack.append(vm.alloc, .{ .String = ls }) catch |e| cThrowOn(vm, h, e);
 }
 
 pub export fn luaL_typeerror(L: ?*lua_State, arg: c_int, tname: [*:0]const u8) c_int {
@@ -2575,6 +2852,12 @@ pub export fn luaL_error(L: ?*lua_State, fmt: [*:0]const u8, ...) c_int {
     lua_error(L);
 }
 
+/// cThrowOomBuf's ArrayListUnmanaged twin (traceback/gsub buffers).
+fn cThrowOomBufU(vm: *Vm, h: *vm_mod.lua_State, buf: *std.ArrayListUnmanaged(u8)) noreturn {
+    buf.deinit(vm.alloc);
+    cThrowOn(vm, h, error.OutOfMemory);
+}
+
 /// PUC `luaL_traceback` (lauxlib.c:luaL_traceback): build a stack traceback
 /// string and push it onto the stack. `msg` (if non-null) is prepended.
 /// `lvl` is the starting level (0 = the frame that called the C function).
@@ -2588,14 +2871,17 @@ pub export fn luaL_traceback(L: ?*lua_State, L1: ?*lua_State, msg: ?[*:0]const u
     const h = L orelse return;
     const vm = h.vm;
 
+    // NO defer: _longjmp bypasses it — every failure path deinits the
+    // buffer manually via cThrowOomBufU before throwing LUA_ERRMEM
+    // (P16.50-review-5 B2 — the old `catch return`/`catch {}` sites
+    // leaked the buffer and/or silently dropped the traceback push).
     var buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer buf.deinit(vm.alloc);
 
     if (msg) |m| {
-        buf.appendSlice(vm.alloc, std.mem.span(m)) catch return;
-        buf.append(vm.alloc, '\n') catch return;
+        buf.appendSlice(vm.alloc, std.mem.span(m)) catch cThrowOomBufU(vm, h, &buf);
+        buf.append(vm.alloc, '\n') catch cThrowOomBufU(vm, h, &buf);
     }
-    buf.appendSlice(vm.alloc, "stack traceback:\n") catch return;
+    buf.appendSlice(vm.alloc, "stack traceback:\n") catch cThrowOomBufU(vm, h, &buf);
 
     // Walk frames from level `lvl` upward, building the traceback.
     var ar: lua_Debug = .{};
@@ -2605,16 +2891,23 @@ pub export fn luaL_traceback(L: ?*lua_State, L1: ?*lua_State, msg: ?[*:0]const u
         const src: []const u8 = if (ar.source) |s| std.mem.span(s) else "?";
         const line = ar.currentline;
         if (line > 0) {
-            const entry = std.fmt.allocPrint(vm.alloc, "\t{s}:{d}: in ?\n", .{ src, line }) catch continue;
-            defer vm.alloc.free(entry);
-            buf.appendSlice(vm.alloc, entry) catch {};
+            // PUC builds each entry with lua_pushfstring into a
+            // luaL_Buffer — OOM throws. The entry temp is freed manually
+            // (no defer: a later throw would bypass it).
+            const entry = std.fmt.allocPrint(vm.alloc, "\t{s}:{d}: in ?\n", .{ src, line }) catch cThrowOomBufU(vm, h, &buf);
+            buf.appendSlice(vm.alloc, entry) catch {
+                vm.alloc.free(entry);
+                cThrowOomBufU(vm, h, &buf);
+            };
+            vm.alloc.free(entry);
         } else {
-            buf.appendSlice(vm.alloc, "\t[C]: in ?\n") catch {};
+            buf.appendSlice(vm.alloc, "\t[C]: in ?\n") catch cThrowOomBufU(vm, h, &buf);
         }
     }
 
-    const ls = vm.internStr(buf.items) catch return;
-    h.c_stack.append(vm.alloc, .{ .String = ls }) catch {};
+    const ls = vm.internStr(buf.items) catch cThrowOomBufU(vm, h, &buf);
+    h.c_stack.append(vm.alloc, .{ .String = ls }) catch cThrowOomBufU(vm, h, &buf);
+    buf.deinit(vm.alloc);
 }
 
 pub export fn luaL_tolstring(L: ?*lua_State, idx: c_int, l: ?*usize) [*:0]const u8 {
@@ -2622,7 +2915,10 @@ pub export fn luaL_tolstring(L: ?*lua_State, idx: c_int, l: ?*usize) [*:0]const 
         if (l) |p| p.* = 0;
         return "";
     });
-    if (s.tolstring(idx)) |bytes| {
+    // PUC luaL_tolstring: lua_tolstring (number → luaS_new: OOM throws)
+    // then lua_pushfstring for type names (OOM throws) — never a silent
+    // "" (P16.50-review-5 B2).
+    if (s.tolstring(idx) catch |e| cThrowOn(s.vm, L.?, e)) |bytes| {
         if (l) |p| p.* = bytes.len;
         return @ptrCast(@constCast(bytes.ptr));
     }
@@ -2637,11 +2933,8 @@ pub export fn luaL_tolstring(L: ?*lua_State, idx: c_int, l: ?*usize) [*:0]const 
             .lightuserdata => "lightuserdata: 0x0",
             .number, .string => "value",
         };
-        const ls = s.vm.internStr(name) catch {
-            if (l) |p| p.* = 0;
-            return "";
-        };
-        s.stack.append(s.vm.alloc, .{ .String = ls }) catch {};
+        const ls = s.vm.internStr(name) catch |e| cThrowOn(s.vm, L.?, e);
+        s.stack.append(s.vm.alloc, .{ .String = ls }) catch |e| cThrowOn(s.vm, L.?, e);
         if (l) |p| p.* = name.len;
         return @ptrCast(@constCast(ls.bytes().ptr));
     }
@@ -2651,7 +2944,12 @@ pub export fn luaL_tolstring(L: ?*lua_State, idx: c_int, l: ?*usize) [*:0]const 
 
 pub export fn luaL_len(L: ?*lua_State, idx: c_int) i64 {
     var s = api.State.fromHandle(L orelse return 0);
-    s.len(idx) catch return 0;
+    // PUC luaL_len: lua_len errors propagate (OOM/Runtime throw);
+    // Type/InvalidIndex are api_check — lenient 0 (P16.50-review-5 B2).
+    s.len(idx) catch |e| switch (e) {
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => return 0,
+    };
     const result = s.tointeger(-1) orelse 0;
     s.stack.items.len -= 1;
     return result;
@@ -2663,20 +2961,24 @@ pub export fn luaL_gsub(L: ?*lua_State, s_str: [*:0]const u8, p: [*:0]const u8, 
     const src = std.mem.span(s_str);
     const pat = std.mem.span(p);
     const rep = std.mem.span(r);
+    // NO defer: _longjmp bypasses it — every failure path deinits the
+    // buffer via cThrowOomBufU before throwing LUA_ERRMEM
+    // (P16.50-review-5 B2 — the old `catch return s_str` leaked the
+    // buffer and silently returned the UNSUBSTITUTED input).
     var result: std.ArrayListUnmanaged(u8) = .empty;
-    defer result.deinit(vm.alloc);
     var i: usize = 0;
     while (i < src.len) {
         if (pat.len > 0 and i + pat.len <= src.len and std.mem.eql(u8, src[i .. i + pat.len], pat)) {
-            result.appendSlice(vm.alloc, rep) catch return s_str;
+            result.appendSlice(vm.alloc, rep) catch cThrowOomBufU(vm, h, &result);
             i += pat.len;
         } else {
-            result.append(vm.alloc, src[i]) catch return s_str;
+            result.append(vm.alloc, src[i]) catch cThrowOomBufU(vm, h, &result);
             i += 1;
         }
     }
-    const ls = vm.internStr(result.items) catch return s_str;
-    h.c_stack.append(vm.alloc, .{ .String = ls }) catch {};
+    const ls = vm.internStr(result.items) catch cThrowOomBufU(vm, h, &result);
+    h.c_stack.append(vm.alloc, .{ .String = ls }) catch cThrowOomBufU(vm, h, &result);
+    result.deinit(vm.alloc);
     return @ptrCast(@constCast(ls.bytes().ptr));
 }
 
@@ -2689,10 +2991,13 @@ pub export fn luaL_getmetafield(L: ?*lua_State, obj: c_int, event: [*:0]const u8
         else => null,
     };
     if (mt) |m| {
-        const key = s.vm.internStr(std.mem.span(event)) catch return 0;
-        const val = s.vm.apiRawGet(m, .{ .String = key }) catch return 0;
+        // PUC luaL_getmetafield: lua_getfield on the metatable — OOM is
+        // LUA_ERRMEM (P16.50-review-5 B2 — the old `catch return 0`
+        // misreported "no metamethod").
+        const key = s.vm.internStr(std.mem.span(event)) catch |e| cThrowOn(s.vm, L.?, e);
+        const val = s.vm.apiRawGet(m, .{ .String = key });
         if (val == .Nil) return 0;
-        s.stack.append(s.vm.alloc, val) catch {};
+        s.stack.append(s.vm.alloc, val) catch |e| cThrowOn(s.vm, L.?, e);
         return 1;
     }
     return 0;
@@ -2701,29 +3006,55 @@ pub export fn luaL_getmetafield(L: ?*lua_State, obj: c_int, event: [*:0]const u8
 pub export fn luaL_callmeta(L: ?*lua_State, obj: c_int, event: [*:0]const u8) c_int {
     if (luaL_getmetafield(L, obj, event) == 0) return 0;
     var s = api.State.fromHandle(L orelse return 0);
-    s.pushvalue(obj) catch return 0;
+    // PUC luaL_callmeta: lua_pushvalue → api_incr_top: OOM throws;
+    // InvalidIndex is api_check — lenient 0 (P16.50-review-5 B2).
+    s.pushvalue(obj) catch |e| switch (e) {
+        error.OutOfMemory => cThrowOn(s.vm, L.?, e),
+        else => return 0,
+    };
     return lua_pcallk(L, 1, 1, 0, 0, null);
 }
 
 pub export fn luaL_requiref(L: ?*lua_State, modname: [*:0]const u8, openf: ?*const fn (?*lua_State) callconv(.c) c_int, glb: c_int) void {
     var s = api.State.fromHandle(L orelse return);
-    s.pushcfunction(openf) catch return;
-    s.pushstring(std.mem.span(modname)) catch return;
-    s.call(1, 1) catch return;
+    // PUC luaL_requiref: every step (pushcfunction / pushstring / call /
+    // setfield / setglobal) throws on failure — no silent early return
+    // leaving a half-pushed stack (P16.50-review-5 B2).
+    s.pushcfunction(openf) catch |e| cThrowOn(s.vm, L.?, e);
+    s.pushstring(std.mem.span(modname)) catch |e| cThrowOn(s.vm, L.?, e);
+    s.call(1, 1) catch |e| switch (e) {
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => {},
+    };
     // Store in package.loaded[modname]
-    _ = s.getglobal("package") catch return;
+    _ = s.getglobal("package") catch |e| cThrowOn(s.vm, L.?, e);
     if (s.typeOf(-1)) |t| if (t == .table) {
-        _ = s.getfield(-1, "loaded") catch return;
+        _ = s.getfield(-1, "loaded") catch |e| switch (e) {
+            error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+            else => {},
+        };
         if (s.typeOf(-1)) |t2| if (t2 == .table) {
-            _ = s.pushvalue(-3) catch {};
-            s.setfield(-2, std.mem.span(modname)) catch {};
+            _ = s.pushvalue(-3) catch |e| switch (e) {
+                error.OutOfMemory => cThrowOn(s.vm, L.?, e),
+                else => {},
+            };
+            s.setfield(-2, std.mem.span(modname)) catch |e| switch (e) {
+                error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+                else => {},
+            };
         };
         s.stack.items.len -= 1;
     };
     s.stack.items.len -= 1;
     if (glb != 0) {
-        _ = s.pushvalue(-1) catch {};
-        s.setglobal(std.mem.span(modname)) catch {};
+        _ = s.pushvalue(-1) catch |e| switch (e) {
+            error.OutOfMemory => cThrowOn(s.vm, L.?, e),
+            else => {},
+        };
+        s.setglobal(std.mem.span(modname)) catch |e| switch (e) {
+            error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+            else => {},
+        };
     }
 }
 
@@ -2734,15 +3065,21 @@ pub export fn luaL_loadstring(L: ?*lua_State, s_str: [*:0]const u8) c_int {
 
 pub export fn luaL_fileresult(L: ?*lua_State, stat: c_int, fname: ?[*:0]const u8) c_int {
     var s = api.State.fromHandle(L orelse return 0);
+    // PUC luaL_fileresult: pushboolean/pushnil/pushstring/lua_concat all
+    // throw ERRMEM on OOM (P16.50-review-5 B2 — the old `catch {}` sites
+    // silently skipped pushes, corrupting the 3-value result shape).
     if (stat >= 0) {
-        s.pushboolean(true) catch {};
+        s.pushboolean(true) catch |e| cThrowOn(s.vm, L.?, e);
         return 1;
     }
-    s.pushnil() catch {};
-    s.pushstring("file error") catch {};
+    s.pushnil() catch |e| cThrowOn(s.vm, L.?, e);
+    s.pushstring("file error") catch |e| cThrowOn(s.vm, L.?, e);
     if (fname) |f| {
-        s.pushstring(std.mem.span(f)) catch {};
-        s.concat(2) catch {};
+        s.pushstring(std.mem.span(f)) catch |e| cThrowOn(s.vm, L.?, e);
+        s.concat(2) catch |e| switch (e) {
+            error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+            else => {},
+        };
     }
     return 3;
 }
@@ -2879,7 +3216,9 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
                     // Intern source_name to get a NUL-terminated LuaString.
                     // Proto.source_name is []const u8 (not NUL-terminated);
                     // LuaString storage IS NUL-terminated (createLuaString).
-                    const src_ls = vm.internStr(p.sourceName()) catch return 0;
+                    // PUC pushes the source via lua_pushstring — OOM is
+                    // LUA_ERRMEM (P16.50-review-5 B2).
+                    const src_ls = vm.internStr(p.sourceName()) catch |e| cThrowOn(vm, h, e);
                     const src_bytes = src_ls.bytes();
                     ar.source = @ptrCast(@constCast(src_bytes.ptr));
                     ar.srclen = src_bytes.len;
@@ -2936,10 +3275,10 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
                     resolved_namewhat = dn.namewhat;
                     resolved_name = dn.name;
                 }
-                const nw_ls = vm.internStr(resolved_namewhat) catch return 0;
+                const nw_ls = vm.internStr(resolved_namewhat) catch |e| cThrowOn(vm, h, e);
                 ar.namewhat = @ptrCast(@constCast(nw_ls.bytes().ptr));
                 if (resolved_name) |nm| {
-                    const ls = vm.internStr(nm) catch return 0;
+                    const ls = vm.internStr(nm) catch |e| cThrowOn(vm, h, e);
                     ar.name = @ptrCast(@constCast(ls.bytes().ptr));
                 } else {
                     ar.name = null;
@@ -2983,7 +3322,10 @@ pub export fn lua_getlocal(L: ?*lua_State, ar: *lua_Debug, n: c_int) ?[*:0]const
                 const reg_idx = frame.frameBase() + lv.reg;
                 if (reg_idx >= th.bytecode_stack.len) return null;
                 const val = th.bytecode_stack[reg_idx];
-                h.c_stack.append(vm.alloc, val) catch return null;
+                // PUC lua_getlocal pushes via api_incr_top: OOM is
+                // LUA_ERRMEM (P16.50-review-5 B2 — the old `catch return
+                // null` misreported "no such local").
+                h.c_stack.append(vm.alloc, val) catch |e| cThrowOn(vm, h, e);
                 return @ptrCast(@constCast(lv.name.ptr));
             }
         }
@@ -3041,12 +3383,18 @@ pub export fn lua_getupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]c
         if (cl.c_func != null) {
             const idx: usize = @intCast(@max(n - 1, 0));
             if (idx >= cl.upvalues.len) return null;
-            s.stack.append(s.vm.alloc, cl.upvalues[idx].value) catch return null;
+            // PUC lua_getupvalue → api_incr_top: OOM is LUA_ERRMEM
+            // (P16.50-review-5 B2 — the old `catch return null`
+            // misreported "no such upvalue").
+            s.stack.append(s.vm.alloc, cl.upvalues[idx].value) catch |e| cThrowOn(s.vm, L.?, e);
             return null; // C closures have unnamed upvalues
         }
     }
     // Lua closures: use debug module
-    const name = s.getupvalue(funcindex, @intCast(@max(n, 0))) catch return null;
+    const name = s.getupvalue(funcindex, @intCast(@max(n, 0))) catch |e| switch (e) {
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => return null,
+    };
     if (name) |nm| return @ptrCast(@constCast(nm.ptr));
     return null;
 }
@@ -3068,13 +3416,20 @@ pub export fn lua_setupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]c
             // field write skipped it — an old cell storing a young value
             // missed promotion and the value could be swept.
             cl.upvalues[idx].value = v;
+            // PUC luaC_barrier is infallible; our barrier-list append can
+            // OOM AFTER the observable cell write commits — throwing
+            // would not restore the missed barrier (class (d) documented,
+            // P16.50-review-5 B2; architectural fix = pre-reserved lists).
             s.vm.gcWriteBarrierCell(cl.upvalues[idx], v) catch {};
             s.stack.items.len -= 1;
             return null;
         }
     }
     // Lua closures: use debug module
-    const name = s.setupvalue(funcindex, @intCast(@max(n, 0))) catch return null;
+    const name = s.setupvalue(funcindex, @intCast(@max(n, 0))) catch |e| switch (e) {
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => return null,
+    };
     if (name) |nm| return @ptrCast(@constCast(nm.ptr));
     return null;
 }
@@ -3203,7 +3558,9 @@ const LUA_UTF8LIBK: c_int = LUA_TABLIBK << 1;
 pub export fn luaopen_base(L: ?*lua_State) c_int {
     const h = L orelse return 0;
     const vm = h.vm;
-    h.c_stack.append(vm.alloc, .{ .Table = vm.global_env }) catch return 0;
+    // PUC lua_pushglobaltable → api_incr_top: OOM is LUA_ERRMEM
+    // (P16.50-review-5 B2 — the old `catch return 0` pushed nothing).
+    h.c_stack.append(vm.alloc, .{ .Table = vm.global_env }) catch |e| cThrowOn(vm, h, e);
     return 1;
 }
 
@@ -3211,63 +3568,81 @@ pub export fn luaopen_base(L: ?*lua_State) c_int {
 /// The `package` table is already in `_G.package`; push it.
 pub export fn luaopen_package(L: ?*lua_State) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    _ = s.getglobal("package") catch return 0;
+    // PUC pushes the module table — OOM is LUA_ERRMEM
+    // (P16.50-review-5 B2 — the old `catch return 0` pushed nothing).
+    _ = s.getglobal("package") catch |e| cThrowOn(s.vm, L.?, e);
     return 1;
 }
 
 /// PUC `luaopen_coroutine` (lcorolib.c): opens the coroutine library.
 pub export fn luaopen_coroutine(L: ?*lua_State) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    _ = s.getglobal("coroutine") catch return 0;
+    // PUC pushes the module table — OOM is LUA_ERRMEM
+    // (P16.50-review-5 B2 — the old `catch return 0` pushed nothing).
+    _ = s.getglobal("coroutine") catch |e| cThrowOn(s.vm, L.?, e);
     return 1;
 }
 
 /// PUC `luaopen_debug` (ldblib.c): opens the debug library.
 pub export fn luaopen_debug(L: ?*lua_State) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    _ = s.getglobal("debug") catch return 0;
+    // PUC pushes the module table — OOM is LUA_ERRMEM
+    // (P16.50-review-5 B2 — the old `catch return 0` pushed nothing).
+    _ = s.getglobal("debug") catch |e| cThrowOn(s.vm, L.?, e);
     return 1;
 }
 
 /// PUC `luaopen_io` (liolib.c): opens the I/O library.
 pub export fn luaopen_io(L: ?*lua_State) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    _ = s.getglobal("io") catch return 0;
+    // PUC pushes the module table — OOM is LUA_ERRMEM
+    // (P16.50-review-5 B2 — the old `catch return 0` pushed nothing).
+    _ = s.getglobal("io") catch |e| cThrowOn(s.vm, L.?, e);
     return 1;
 }
 
 /// PUC `luaopen_math` (lmathlib.c): opens the math library.
 pub export fn luaopen_math(L: ?*lua_State) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    _ = s.getglobal("math") catch return 0;
+    // PUC pushes the module table — OOM is LUA_ERRMEM
+    // (P16.50-review-5 B2 — the old `catch return 0` pushed nothing).
+    _ = s.getglobal("math") catch |e| cThrowOn(s.vm, L.?, e);
     return 1;
 }
 
 /// PUC `luaopen_os` (loslib.c): opens the os library.
 pub export fn luaopen_os(L: ?*lua_State) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    _ = s.getglobal("os") catch return 0;
+    // PUC pushes the module table — OOM is LUA_ERRMEM
+    // (P16.50-review-5 B2 — the old `catch return 0` pushed nothing).
+    _ = s.getglobal("os") catch |e| cThrowOn(s.vm, L.?, e);
     return 1;
 }
 
 /// PUC `luaopen_string` (lstrlib.c): opens the string library.
 pub export fn luaopen_string(L: ?*lua_State) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    _ = s.getglobal("string") catch return 0;
+    // PUC pushes the module table — OOM is LUA_ERRMEM
+    // (P16.50-review-5 B2 — the old `catch return 0` pushed nothing).
+    _ = s.getglobal("string") catch |e| cThrowOn(s.vm, L.?, e);
     return 1;
 }
 
 /// PUC `luaopen_table` (ltablib.c): opens the table library.
 pub export fn luaopen_table(L: ?*lua_State) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    _ = s.getglobal("table") catch return 0;
+    // PUC pushes the module table — OOM is LUA_ERRMEM
+    // (P16.50-review-5 B2 — the old `catch return 0` pushed nothing).
+    _ = s.getglobal("table") catch |e| cThrowOn(s.vm, L.?, e);
     return 1;
 }
 
 /// PUC `luaopen_utf8` (lutf8lib.c): opens the utf8 library.
 pub export fn luaopen_utf8(L: ?*lua_State) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    _ = s.getglobal("utf8") catch return 0;
+    // PUC pushes the module table — OOM is LUA_ERRMEM
+    // (P16.50-review-5 B2 — the old `catch return 0` pushed nothing).
+    _ = s.getglobal("utf8") catch |e| cThrowOn(s.vm, L.?, e);
     return 1;
 }
 
@@ -3282,10 +3657,12 @@ pub export fn luaL_openselectedlibs(L: ?*lua_State, load: c_int, preload: c_int)
     // PUC: luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_PRELOAD_TABLE)
     // Get the PRELOAD table from the registry. The VM stores it under
     // "_PRELOAD" in the debug registry (see Vm.init package setup).
-    s.getregistry() catch return;
-    _ = s.getfield(-1, "_PRELOAD") catch {
-        s.stack.items.len -= 1; // pop registry
-        return;
+    // PUC luaL_getsubtable throws on OOM (P16.50-review-5 B2 — the old
+    // early returns left the library set half-open with no error).
+    s.getregistry() catch |e| cThrowOn(s.vm, L.?, e);
+    _ = s.getfield(-1, "_PRELOAD") catch |e| switch (e) {
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => {},
     };
     // Stack: [registry, preload_table]
 
@@ -3317,8 +3694,12 @@ pub export fn luaL_openselectedlibs(L: ?*lua_State, load: c_int, preload: c_int)
         } else if (preload & lib.mask != 0) {
             // PUC: lua_pushcfunction(L, lib->func);
             //      lua_setfield(L, -2, lib->name);
-            s.pushcfunction(lib.openf) catch {};
-            s.setfield(-2, std.mem.span(lib.name)) catch {};
+            // Both throw on OOM in PUC (P16.50-review-5 B2).
+            s.pushcfunction(lib.openf) catch |e| cThrowOn(s.vm, L.?, e);
+            s.setfield(-2, std.mem.span(lib.name)) catch |e| switch (e) {
+                error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+                else => {},
+            };
         }
     }
 
@@ -3355,14 +3736,19 @@ pub export fn luaL_prepbuffsize(B: *luaL_Buffer, sz: usize) [*c]u8 {
 
     if (B.b == &B.init[0]) {
         // Spilling from inline to heap: allocate and copy inline content.
-        const new_buf = vm.alloc.alloc(u8, new_size) catch return &B.init[0];
+        // PUC luaL_prepbuffsize → luaM_error: OOM is LUA_ERRMEM
+        // (P16.50-review-5 B2 — the old `catch return &B.init[0]` handed
+        // the caller the INLINE buffer with no free space, an overflow
+        // trap). B is untouched on failure — nothing to clean up.
+        const new_buf = vm.alloc.alloc(u8, new_size) catch |e| cThrowOn(vm, h, e);
         @memcpy(new_buf[0..B.n], B.init[0..B.n]);
         B.b = new_buf.ptr;
         B.size = new_size;
     } else {
-        // Already on heap: realloc.
+        // Already on heap: realloc. The old buffer stays valid on
+        // failure — nothing to clean up before the throw.
         const old_buf = B.b[0..B.size];
-        const new_buf = vm.alloc.realloc(old_buf, new_size) catch return B.b;
+        const new_buf = vm.alloc.realloc(old_buf, new_size) catch |e| cThrowOn(vm, h, e);
         B.b = new_buf.ptr;
         B.size = new_size;
     }
@@ -3405,12 +3791,18 @@ pub export fn luaL_pushresultsize(B: *luaL_Buffer, sz: usize) void {
     const h = B.L orelse return;
     const vm = h.vm;
     B.n = sz;
+    // PUC luaL_pushresultsize → lua_pushlstring: OOM is LUA_ERRMEM, with
+    // the spilled heap buffer freed BEFORE the throw (P16.50-review-5
+    // B2 — the old `catch return`/`catch {}` leaked the heap spill
+    // and/or silently skipped the push).
     const ls = vm.internStr(B.b[0..sz]) catch {
-        // Free heap if spilled
         if (B.b != &B.init[0]) vm.alloc.free(B.b[0..B.size]);
-        return;
+        cThrowOn(vm, h, error.OutOfMemory);
     };
-    h.c_stack.append(vm.alloc, .{ .String = ls }) catch {};
+    h.c_stack.append(vm.alloc, .{ .String = ls }) catch {
+        if (B.b != &B.init[0]) vm.alloc.free(B.b[0..B.size]);
+        cThrowOn(vm, h, error.OutOfMemory);
+    };
     // Free heap if spilled
     if (B.b != &B.init[0]) vm.alloc.free(B.b[0..B.size]);
 }

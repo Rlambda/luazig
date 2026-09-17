@@ -94,15 +94,20 @@ pub const State = struct {
         var it = self.thread_stacks.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit(self.vm.alloc);
         self.thread_stacks.deinit(self.vm.alloc);
-        // Save the allocator before deinit'ing the Vm — after deinit the Vm's
-        // fields are invalid, but the allocator (a value type) is safe to copy.
-        const alloc = self.vm.alloc;
         // Tear the Vm down FIRST (matching lua_close in c_api.zig): finalizers
         // running inside vm.deinit may touch main_thread.api_handle (whose
         // c_stack is a GC root), so the main handle must stay alive until
         // then. gcFreeObject(.thread) skips main handles (P15.83k), so the
         // handle is freed exactly once, here.
         self.vm.deinit();
+        // P16.50-review-5: capture the allocator AFTER deinit. Before the
+        // teardown the field may hold the testC adapter, whose control is
+        // released inside vm.deinit — freeing the vm struct through it
+        // would use a destroyed control. vm.deinit's tail restores the
+        // original base allocator, which is also what allocated the vm
+        // struct at State.init. The field read is memory-safe: the struct
+        // is not freed until the destroy below.
+        const alloc = self.vm.alloc;
         if (self.vm.main_handle) |h| {
             self.vm.freeStateHandle(h);
         }
@@ -450,7 +455,11 @@ pub const State = struct {
     /// The returned bytes are NUL-terminated in luazig's string storage
     /// (see `createLuaString`: `body[raw.len] = 0`), so the C shim can safely
     /// cast to `[*:0]const u8`.
-    pub fn tolstring(self: *State, idx: i32) ?[]const u8 {
+    ///
+    /// P16.50-review-5 B2: PUC lua_tolstring on a number goes through
+    /// luaS_new (an allocation) — an OOM there is LUA_ERRMEM, not a silent
+    /// null. The signature is now fallible: `ApiError!?[]const u8`.
+    pub fn tolstring(self: *State, idx: i32) ApiError!?[]const u8 {
         const abs = normalizeIndex(idx, self.stack.items.len) orelse return null;
         switch (self.stack.items[abs]) {
             .String => |s| return s.bytes(),
@@ -458,7 +467,7 @@ pub const State = struct {
                 // PUC lua_tolstring: convert number to string in place on stack.
                 // valueToInternedStr uses the same formatting as PUC's
                 // luaO_tostringbuff (%.14g equivalent + ".0" for integer floats).
-                const ls = self.vm.valueToInternedStr(self.stack.items[abs]) catch return null;
+                const ls = self.vm.valueToInternedStr(self.stack.items[abs]) catch |e| return mapDispatchError(e);
                 self.stack.items[abs] = .{ .String = ls };
                 return self.stack.items[abs].String.bytes();
             },
@@ -654,7 +663,7 @@ pub const State = struct {
             else => return error.Type,
         };
         const key = self.stack.items[self.stack.items.len - 1];
-        const out = self.vm.apiRawGet(tbl, key) catch |e| return mapVmError(e);
+        const out = self.vm.apiRawGet(tbl, key);
         self.stack.items.len -= 1;
         try self.stack.append(self.vm.alloc, out);
         return valueType(out);
@@ -679,7 +688,7 @@ pub const State = struct {
             .Table => |t| t,
             else => return error.Type,
         };
-        const out = self.vm.apiRawGet(tbl, .{ .Int = n }) catch |e| return mapVmError(e);
+        const out = self.vm.apiRawGet(tbl, .{ .Int = n });
         try self.stack.append(self.vm.alloc, out);
         return valueType(out);
     }
@@ -709,7 +718,7 @@ pub const State = struct {
             else => return error.Type,
         };
         const key: *anyopaque = p orelse return error.InvalidIndex;
-        const out = self.vm.apiRawGet(tbl, .{ .LightUserdata = key }) catch |e| return mapVmError(e);
+        const out = self.vm.apiRawGet(tbl, .{ .LightUserdata = key });
         try self.stack.append(self.vm.alloc, out);
         return valueType(out);
     }
@@ -864,16 +873,19 @@ pub const State = struct {
     }
 
     pub fn getregistry(self: *State) ApiError!void {
-        const reg = self.vm.apiEnsureRegistry() catch return error.Runtime;
+        // Kind-preserving: an OOM creating the registry stays OOM
+        // (P16.50-review-5 B2 — the old `catch return error.Runtime`
+        // surfaced ERRRUN for an allocation failure).
+        const reg = self.vm.apiEnsureRegistry() catch |e| return mapVmError(e);
         try self.stack.append(self.vm.alloc, .{ .Table = reg });
     }
 
     pub fn getupvalue(self: *State, func_idx: i32, n: usize) ApiError!?[]const u8 {
         const fv = self.valueAtConst(func_idx) orelse return error.InvalidIndex;
         const dbg = try self.requireDebugModule();
-        const f = self.vm.apiGetTable(dbg, .{ .String = try self.vm.internStr("getupvalue") }) catch return error.Runtime;
+        const f = self.vm.apiGetTable(dbg, .{ .String = try self.vm.internStr("getupvalue") }) catch |e| return mapVmError(e);
         var args = [_]vm_mod.Value{ fv.*, .{ .Int = @intCast(n) } };
-        const ret = self.vm.apiCall(.nonyieldable, f, args[0..]) catch return error.Runtime;
+        const ret = self.vm.apiCall(.nonyieldable, f, args[0..]) catch |e| return mapVmError(e);
         defer self.vm.alloc.free(ret);
         if (ret.len == 0 or ret[0] == .Nil) return null;
         if (ret[0] != .String) return error.Type;
@@ -886,9 +898,9 @@ pub const State = struct {
         const fv = self.valueAtConst(func_idx) orelse return error.InvalidIndex;
         const set_val = self.stack.items[self.stack.items.len - 1];
         const dbg = try self.requireDebugModule();
-        const f = self.vm.apiGetTable(dbg, .{ .String = try self.vm.internStr("setupvalue") }) catch return error.Runtime;
+        const f = self.vm.apiGetTable(dbg, .{ .String = try self.vm.internStr("setupvalue") }) catch |e| return mapVmError(e);
         var args = [_]vm_mod.Value{ fv.*, .{ .Int = @intCast(n) }, set_val };
-        const ret = self.vm.apiCall(.nonyieldable, f, args[0..]) catch return error.Runtime;
+        const ret = self.vm.apiCall(.nonyieldable, f, args[0..]) catch |e| return mapVmError(e);
         defer self.vm.alloc.free(ret);
         self.stack.items.len -= 1;
         if (ret.len == 0 or ret[0] == .Nil) return null;
@@ -1014,7 +1026,10 @@ pub const State = struct {
     /// Allocate a full userdata with `sz` bytes of payload and `nuvalue`
     /// uservalues, push it, return payload pointer.
     pub fn newuserdatauv(self: *State, sz: usize, nuvalue: usize) ApiError!?*anyopaque {
-        const ud = self.vm.allocUserdata(sz, nuvalue) catch return error.Runtime;
+        // Kind-preserving: allocUserdata OOM stays OOM (LUA_ERRMEM via
+        // cThrowOn — P16.50-review-5 B2; the old `catch return
+        // error.Runtime` misreported it as ERRRUN).
+        const ud = self.vm.allocUserdata(sz, nuvalue) catch |e| return mapDispatchError(e);
         try self.stack.append(self.vm.alloc, .{ .Userdata = ud });
         return if (ud.payload.len > 0) @ptrCast(ud.payload.ptr) else @ptrCast(ud);
     }
@@ -1084,14 +1099,15 @@ pub const State = struct {
     // Unprotected call (Zig equivalent of lua_call)
     // -----------------------------------------------------------------------
 
-    /// Unprotected call: on failure, returns error.Runtime. The actual longjmp
-    /// boundary logic stays in c_api.zig for C callers.
+    /// Unprotected call: on failure, returns the mapped error (OOM stays
+    /// OOM — LUA_ERRMEM via cThrowOn; P16.50-review-5 B2). The actual
+    /// longjmp boundary logic stays in c_api.zig for C callers.
     pub fn call(self: *State, nargs: usize, nresults: i32) ApiError!void {
         if (self.stack.items.len < nargs + 1) return error.InvalidState;
         const fn_idx = self.stack.items.len - nargs - 1;
         const callee = self.stack.items[fn_idx];
         const args = self.stack.items[fn_idx + 1 ..];
-        const ret = self.vm.apiCall(.nonyieldable, callee, args) catch return error.Runtime;
+        const ret = self.vm.apiCall(.nonyieldable, callee, args) catch |e| return mapVmError(e);
         defer self.vm.alloc.free(ret);
         self.stack.items.len = fn_idx;
         const want: usize = if (nresults < 0) ret.len else @min(ret.len, @as(usize, @intCast(nresults)));
@@ -1155,36 +1171,58 @@ pub const State = struct {
                 else => return,
             };
         };
-        const freelist = self.vm.apiRawGet(tbl, .{ .Int = 0 }) catch .Nil;
+        const freelist = self.vm.apiRawGet(tbl, .{ .Int = 0 });
         self.vm.apiRawSet(tbl, .{ .Int = @intCast(ref_id) }, freelist) catch {};
         self.vm.apiRawSet(tbl, .{ .Int = 0 }, .{ .Int = @intCast(ref_id) }) catch {};
     }
 
     /// Create a table, store it in the registry under key `tname`, push it.
+    /// PUC luaL_newmetatable (lauxlib.c:317-327). P16.50-review-5 3.2:
+    /// - the table comes from the NORMAL table constructor (`apiNewTable`
+    ///   → allocTable → gcPrepareRegister/gcRegisterCommit + gcNoteAlloc) —
+    ///   the same register/accounting contract as every other table. Being
+    ///   a metatable does NOT make a table finalizable: the old manual
+    ///   `alloc.create(Table)` + `registerFinalizable` invented a
+    ///   __gc-eligible object PUC never creates (luaL_newmetatable calls
+    ///   plain lua_createtable) and skipped the table accounting.
+    /// - PUC rooting order: the fresh table sits on the Lua stack (a GC
+    ///   root) BEFORE the registry publish (lauxlib.c keeps it on L's
+    ///   stack across lua_setfield), so the publish's OOM path can run an
+    ///   emergency GC without sweeping the table, and a failed publish
+    ///   leaves no dangling registry entry.
+    /// Every OOM edge has exactly one owner:
+    ///   - constructor OOM → nothing exists, nothing published (the normal
+    ///     apiNewTable contract rolls back internally);
+    ///   - stack-root OOM → the table is registered-but-unrooted; the next
+    ///     GC collects it through the normal sweep — no leak, no dangling
+    ///     registry entry (the identical window plain `newtable()` has);
+    ///   - registry-publish OOM → the table stays rooted on the API stack
+    ///     (PUC leaves it on L's stack across the luaD_throw too) and the
+    ///     registry is untouched.
     pub fn newmetatable(self: *State, tname: []const u8) ApiError!bool {
-        const reg = self.vm.apiEnsureRegistry() catch return error.Runtime;
+        const reg = self.vm.apiEnsureRegistry() catch |e| return mapVmError(e);
         const key = try self.vm.internStr(tname);
-        const existing = self.vm.apiRawGet(reg, .{ .String = key }) catch .Nil;
+        const existing = self.vm.apiRawGet(reg, .{ .String = key });
         if (existing == .Table) {
             try self.stack.append(self.vm.alloc, existing);
             return false;
         }
-        const mt = try self.vm.alloc.create(vm_mod.Table);
-        mt.* = .{};
-        self.vm.registerFinalizable(.{ .table = mt }) catch {};
-        self.vm.apiRawSet(reg, .{ .String = key }, .{ .Table = mt }) catch {};
+        const mt = self.vm.apiNewTable() catch |e| return mapVmError(e);
+        // PUC lauxlib.c:321-325: root the fresh table on the API stack
+        // BEFORE publishing it into the registry.
         try self.stack.append(self.vm.alloc, .{ .Table = mt });
+        self.vm.apiRawSet(reg, .{ .String = key }, .{ .Table = mt }) catch |e| return mapVmError(e);
         return true;
     }
 
     /// Push the metatable registered under `tname`, or nil.
+    /// PUC luaL_getmetatable: lua_getfield on the registry — OOM throws
+    /// (the old swallow pushed nothing at all, corrupting the stack shape;
+    /// P16.50-review-5 B2).
     pub fn getRegisteredMetatable(self: *State, tname: []const u8) ApiError!void {
-        const reg = self.vm.apiEnsureRegistry() catch {
-            try self.stack.append(self.vm.alloc, .Nil);
-            return;
-        };
+        const reg = self.vm.apiEnsureRegistry() catch |e| return mapVmError(e);
         const key = try self.vm.internStr(tname);
-        const val = self.vm.apiRawGet(reg, .{ .String = key }) catch .Nil;
+        const val = self.vm.apiRawGet(reg, .{ .String = key });
         try self.stack.append(self.vm.alloc, val);
     }
 
@@ -1200,7 +1238,7 @@ pub const State = struct {
         if (self.stack.items[abs] != .Userdata) return null;
         const reg = self.vm.apiEnsureRegistry() catch return null;
         const key = self.vm.internStr(tname) catch return null;
-        const expected = self.vm.apiRawGet(reg, .{ .String = key }) catch return null;
+        const expected = self.vm.apiRawGet(reg, .{ .String = key });
         if (expected != .Table) return null;
         const ud_val = self.stack.items[abs].Userdata;
         if (ud_val.metatable != expected.Table) return null;
@@ -1292,7 +1330,7 @@ pub const State = struct {
                 }
                 self.vm.alloc.free(cl.upvalues);
                 self.vm.alloc.destroy(cl);
-                return mapVmErr(e);
+                return mapVmError(e);
             };
         }
         self.stack.items.len -= nup;
@@ -1346,7 +1384,8 @@ pub const State = struct {
 
     fn requireDebugModule(self: *State) ApiError!vm_mod.Value {
         var args = [_]vm_mod.Value{.{ .String = try self.vm.internStr("debug") }};
-        const ret = self.callGlobal("require", args[0..]) catch return error.Runtime;
+        // Kind-preserving: require() OOM stays OOM (P16.50-review-5 B2).
+        const ret = self.callGlobal("require", args[0..]) catch |e| return mapVmError(e);
         defer self.vm.alloc.free(ret);
         if (ret.len == 0 or ret[0] != .Table) return error.Runtime;
         return ret[0];
@@ -1397,30 +1436,62 @@ fn isFileUserdata(tbl: *vm_mod.Table) bool {
     return false;
 }
 
-/// P16.50-review-3 BLOCKER 3: kind-preserving Vm→API error mapping. The
-/// old parameterless `mapVmError()` cast EVERYTHING (including OOM) to
-/// error.Runtime — an OOM from apiNewTable/apiRawSet surfaced as ERRRUN
-/// through cThrow, losing LUA_ERRMEM. The mapping is exact: OOM stays OOM,
-/// RuntimeError becomes error.Runtime (the API's name for it), and Yield
-/// (unreachable at these non-yieldable sites) stays explicit.
-fn mapVmErr(err: vm_mod.Vm.Error) ApiError {
+/// P16.50-review-5 3.1: EXACT typed Vm→API error mapping. The parameter is
+/// the precise public Vm error union (`Vm.Error` = {OutOfMemory,
+/// RuntimeError, Yield}) — never `anyerror`, never an `else` arm: an error
+/// kind added to `Vm.Error` in the future becomes a COMPILE error at this
+/// switch instead of silently surfacing as ERRRUN (the forbidden
+/// `else => error.Runtime` kind-erasure the review flagged). PUC statuses
+/// pass through as data: OOM → LUA_ERRMEM (error.OutOfMemory), runtime
+/// error → LUA_ERRRUN (error.Runtime).
+pub fn mapVmError(err: vm_mod.Vm.Error) ApiError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.RuntimeError => error.Runtime,
-        error.Yield => error.Runtime, // unreachable at these call sites
+        // Yield is control flow, not an error. Every api.zig call site
+        // runs inside a non-yieldable context (apiCall(.nonyieldable) or
+        // host-driven metamethod dispatch): PUC converts a yield attempt
+        // there into "attempt to yield across a C-call boundary"
+        // (RuntimeError) at the yield site itself, so error.Yield never
+        // legitimately crosses this boundary. Reaching this arm means the
+        // non-yieldable invariant broke — fail loudly instead of silently
+        // re-labeling coroutine control flow as ERRRUN.
+        error.Yield => @panic("api: yield crossed a non-yieldable API boundary"),
     };
 }
 
-/// Legacy shim retained for not-yet-audited sites; kind-preserving now.
-fn mapVmError(err: vm_mod.Vm.Error) ApiError {
-    return mapVmErr(err);
+/// Same exact-arm contract for the api.zig sites whose VM function returns
+/// the wider `Vm.DispatchError` union (valueToInternedStr, allocUserdata).
+/// `ThreadSwitch` is private dispatch control flow raised only inside the
+/// bytecode coroutine trampoline and consumed by
+/// `driveBytecodeCoroutineTrampoline`; it cannot cross a host API boundary.
+fn mapDispatchError(err: vm_mod.Vm.DispatchError) ApiError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.RuntimeError => error.Runtime,
+        error.Yield => @panic("api: yield crossed a non-yieldable API boundary"),
+        error.ThreadSwitch => @panic("api: thread-switch crossed a host API boundary"),
+    };
 }
 
-pub fn mapCompileError(err_val: anyerror) Status {
+/// The exact error union of `Vm.compileChunkValue` (loading a chunk):
+/// `Vm.Error` plus `Syntax`. Yield/ThreadSwitch are declared by the
+/// underlying constructors (createBytecodeChunkClosure/applyLoadEnv) but
+/// unreachable while merely LOADING — loading never runs the chunk and
+/// never enters the coroutine trampoline.
+pub const CompileError = vm_mod.Vm.Error || error{ Syntax, ThreadSwitch };
+
+/// PUC load-status mapping (LUA_ERRSYNTAX/LUA_ERRMEM/LUA_ERRRUN). Exact
+/// arms over `CompileError` — no `anyerror`, no `else` (P16.50-review-5
+/// 3.1): a new error kind becomes a compile error here, not a silent
+/// ERRRUN.
+pub fn mapCompileError(err_val: CompileError) Status {
     return switch (err_val) {
         error.Syntax => .syntax_error,
         error.OutOfMemory => .memory_error,
-        else => .runtime_error,
+        error.RuntimeError => .runtime_error,
+        error.Yield => @panic("api: yield crossed a non-yieldable load boundary"),
+        error.ThreadSwitch => @panic("api: thread-switch crossed a host load boundary"),
     };
 }
 

@@ -1,4 +1,4 @@
-> Last updated: 2026-09-16 (P16.50-review-4)
+> Last updated: 2026-09-17 (P16.50-review-5)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -43,7 +43,7 @@ Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [ ] **P16.50-review correction (REOPENED by review-5)**: rollback ownership + C-closure upvalue semantics — (a) BLOCKER 1: opClosure count-prefix rollback неверен при смешанных дескрипторах (proxy/new instack/уже-boxed) — exact ownership worklist/bitmap, rollback только созданных этим вызовом Cells в reverse-порядке; закрыть post-commit окно (gcStoreCellValue после commit) — либо provably-infallible через preparation/order, либо полный rollback owner для Closure/tree/register/accounting/register-slot; dispatch-driven mixed-upvalue тест ([proxy, new instack] из реального bytecode; existing-boxed; провал на следующем Cell и на Closure alloc; post-commit barrier failure; byte-exact всё + minor collection + repeated + success); negative copy count-prefix rollback детерминированно ловится; (b) BLOCKER 2: lua_newthread errdefer НЕ работает (?*lua_State ≠ error union) — inner error-union transaction / явный cleanup helper, ABI-wrapper маппит в null ПОСЛЕ cleanup; preserve/restore прежний vm.c_api_thread; тест против реального экспортированного lua_newthread (fail на registry prepare / Thread alloc / handle alloc / parent stack growth; registries/stack/handle/counters/live-set + GC после); (c) BLOCKER 3: registerfuncs алиасит C-closure upvalues (общие Cell-объекты: setupvalue(f1) виден f2) — PUC luaL_setfuncs (lauxlib.c:965-978) копирует VALUES на стек + lua_pushcclosure (lapi.c:609+) свежий CClosure с inline slots; один канонический C-closure конструктор для pushcclosure+registerfuncs с per-closure Cells; убрать неверный LClosure rationale; differential-тест (upvalueid differs; setupvalue A не меняет B; сбор в обоих порядках без leaks; OOM на non-preinterned names + table-growth setfield); (d) error propagation: lua_pushcclosure/lua_pushcfunction/luaL_setfuncs/luaL_newlib catch {} — обследовать защищённый механизм (protected call/throw) и маршрутизировать ЛИБО зафиксировать архитектурный blocker (owner решает); (e) HIGH: testcChargeMemory коммитит total_bytes ДО нативных аллокаций — split check/reserve от accounting commit / точный rollback; тест с активным testc_ctrl + провалы registry reserve/Userdata/uservalues/payload; аудит всех testcChargeMemory-сайтов; (f) cleanup: устаревшие BLOCKED/KNOWN-leak комментарии в тестах, skip fail-индексов 2..4 в pushcclosure matrix, smoke provenance prose (84 файла, 85-й номер — один из 84).
+- [x] **P16.50-review correction (REOPENED→CLOSED by review-5)**: rollback ownership + C-closure upvalue semantics — (a) BLOCKER 1: opClosure count-prefix rollback неверен при смешанных дескрипторах (proxy/new instack/уже-boxed) — exact ownership worklist/bitmap, rollback только созданных этим вызовом Cells в reverse-порядке; закрыть post-commit окно (gcStoreCellValue после commit) — либо provably-infallible через preparation/order, либо полный rollback owner для Closure/tree/register/accounting/register-slot; dispatch-driven mixed-upvalue тест ([proxy, new instack] из реального bytecode; existing-boxed; провал на следующем Cell и на Closure alloc; post-commit barrier failure; byte-exact всё + minor collection + repeated + success); negative copy count-prefix rollback детерминированно ловится; (b) BLOCKER 2: lua_newthread errdefer НЕ работает (?*lua_State ≠ error union) — inner error-union transaction / явный cleanup helper, ABI-wrapper маппит в null ПОСЛЕ cleanup; preserve/restore прежний vm.c_api_thread; тест против реального экспортированного lua_newthread (fail на registry prepare / Thread alloc / handle alloc / parent stack growth; registries/stack/handle/counters/live-set + GC после); (c) BLOCKER 3: registerfuncs алиасит C-closure upvalues (общие Cell-объекты: setupvalue(f1) виден f2) — PUC luaL_setfuncs (lauxlib.c:965-978) копирует VALUES на стек + lua_pushcclosure (lapi.c:609+) свежий CClosure с inline slots; один канонический C-closure конструктор для pushcclosure+registerfuncs с per-closure Cells; убрать неверный LClosure rationale; differential-тест (upvalueid differs; setupvalue A не меняет B; сбор в обоих порядках без leaks; OOM на non-preinterned names + table-growth setfield); (d) error propagation: lua_pushcclosure/lua_pushcfunction/luaL_setfuncs/luaL_newlib catch {} — обследовать защищённый механизм (protected call/throw) и маршрутизировать ЛИБО зафиксировать архитектурный blocker (owner решает); (e) HIGH: testcChargeMemory коммитит total_bytes ДО нативных аллокаций — split check/reserve от accounting commit / точный rollback; тест с активным testc_ctrl + провалы registry reserve/Userdata/uservalues/payload; аудит всех testcChargeMemory-сайтов; (f) cleanup: устаревшие BLOCKED/KNOWN-leak комментарии в тестах, skip fail-индексов 2..4 в pushcclosure matrix, smoke provenance prose (84 файла, 85-й номер — один из 84). ЗАКРЫТО фазой P16.50-review-5 (rescue + completion, measured-source коммит C фазы): rescue-блокеры и остатки review-4 закрыты PUC-faithful архитектурно — named-vararg (...t) slot-1 corruption (.varargprep vm.zig:18152: gcTempRoots temp root + publish после копирования extras, PUC createvarargtab ltm.c:231-247; + testcLiveUserdataKb early-return), T.testC outs window per-call (testcScriptOutBound vm.zig:46281), testcSetAllocCount mirror-write удалён (vm.zig:8391), error-recovery/transport аллокации → infraAlloc (vm.zig:8307), hash_seed до первого intern (initWithSeed vm.zig:5091 — oom_msg_str duplicate latent-баг), cloneUndumpedStrings ownership + table.concat single-buffer/external handoff (vm.zig:29300, tconcatExternalFree vm.zig:39198), TestcAllocAdapter.remapFn charge-class preserve (vm.zig:52736), typed error mappers (mapVmError api.zig:1447/mapDispatchError api.zig:1468/cThrowOn c_api.zig:1501), newmetatable через apiNewTable (api.zig:1202), 3 stack-slice-aliasing memory-safety блокера (stageBytecodeCall vm.zig:14401/builtinXpcall vm.zig:22936/builtinLoadfile vm.zig:28987, savestack/restorestack per PUC luaT_callTMres), research-диагностики удалены; доказательства: unit 245/245 D/RF 0 leaks, matrix --testc zig_fail=0 (big.lua both_fail pre-existing), smoke 84/84, api580, c_api lanes, gc.lua --vm=bc differential 20x, paired-seed perf сессия GREEN (tools/perf/current-gate.json + current-gate-manifest.json, binary sha256 9b4bcd29…); фазовая запись — «История разработки», P16.50-review-5.
 
 
 - [x] **P16.50 (owner-instructed)**: транзакционная регистрация GC-объектов + единый current-* provenance — (a) полный inventory всех allocate→init→publish→register→account→expose цепочек с fallible edges; единый ownership-контракт: fallible capacity preparation отделена от infallible registry commit (PUC luaC_newobj — infallible link в intrusive allgc), bulk reserve для multi-object constructors; opClosure полный errdefer (cells, open Cells, Closure, tree retain, восстановление bytecode_boxed); allocTable/allocTableNoGc/allocUserdata/thread constructors/internStr (insert ДО register — рассинхрон canonical table и GC registry)/registerfuncs catch{}-проглатывание — все gcRegister* callers; инварианты: никакой публикации до гарантированной регистрации/rollback, никакого destroy пока в registry, accounting симметрично ровно на commit, никаких catch{}→продолжения (обновить все сигнатуры call sites, исходная ошибка сохраняется), young-list порядок сохраняется, hot opClosure без заметного steady-state regression; (b) FailingAllocator/DebugAllocator матрицы для каждой constructor family и каждого fail index вкл. оба registry-growth edges: byte-exact восстановление gc_objects/young/string_intern/bytecode_boxed/stack/table state, counters/debt/tree refs, реальный gcMinorCollection после каждого failure, repeated failures + success edge; throwaway negative validation для каждого исправленного класса; (c) Task 0: после ВСЕХ source-изменений пересобрать RF и перегенерировать КАЖДЫЙ canonical current-* на одном чистом final measured-source + immutable binary (сейчас набор расщеплён: gate/baseline на 66cd438, остальные на 7af60be); (d) perf A/B immutable binaries, closure-heavy/dynamic-load/allocation-heavy workloads, ровно одна объявленная финальная сессия; baseline — только явное owner-approved.
@@ -7490,6 +7490,79 @@ C = fbaf638 → D = wrapper.
 - **Батарея**: 15/15 (unit D/RF 241/241 0 leaks, selftests, noise + 7
   neg, smoke 84/84 + 84/84 --testc, matrix zig_fail=0, c_api 23 +
   DIFF: PASS, api580, gc.lua, diff --check); crash-loop 20/20.
+
+### P16.50-review-5: rescue + completion (2026-09-17)
+
+Фаза по owner-ledger item (открыт 40099c6; open-count 21→22→закрыт→21).
+Коммиты: C = measured source (настоящий коммит; RF binary sha256
+9b4bcd29c6a6548950037ada3e7fb3e5d42df99aeeed301ac474ea3fdde54802) →
+D = wrapper (артефакты current-gate/current-gate-manifest).
+
+- **named-vararg (...t) slot-1 corruption**: .varargprep (vm.zig:18152) —
+  temp root через gcTempRoots, publish после копирования extras (PUC
+  createvarargtab, ltm.c:231-247); collectgarbage("count") spurious
+  per-cycle alloc — testcLiveUserdataKb (vm.zig:46031) early-return при
+  отключённом testc; узкий regression-тест добавлен.
+- **T.testC outs window**: sized per-call из скрипта
+  (testcScriptOutBound vm.zig:46281: settop/return */call-nres/xmove-0/
+  resume unbounded → 256 cap) — убран spurious 256-slot counted
+  caller-frame grow под armed countdowns (memerr.lua testalloc parity).
+- **testcSetAllocCount** (vm.zig:8391): mirror-write удалён (PUC
+  ltests.c пишет l_memcontrol.countlimit без Lua-state доступа).
+- **Error-recovery/transport аллокации → infraAlloc** (vm.zig:8307):
+  bytecode_unwinds, bytecode_tbc_regs, OP_CALL/OP_TAILCALL poscall
+  result dupe, pcall failure tuple — PUC recovery C-stack-resident и
+  никогда не аллоцирует.
+- **hash_seed до первого intern**: initWithSeed (vm.zig:5091) —
+  oom_msg_str интернировался под seed 0 → duplicate "not enough memory"
+  short string и `msg == "not enough memory"` false после OOM-ошибок
+  (latent-at-HEAD баг).
+- **Утечки scratch/ownership**: string.upper/lower/reverse scratch
+  buffers freed; cloneUndumpedStrings (vm.zig:29300) 3-array ownership
+  orphans — root cause memerr.lua matrix timeout (+7B/iter leak делал
+  M+=7 limit loop никогда не сходящимся); builtinTableConcat small-path
+  buffer freed (B4 test).
+- **table.concat**: один exact total_len+1 буфер; ≤8192 → internStr
+  copy; >8192 → createExternalLuaString handoff (PUC luaL_pushresult
+  box path), tconcatExternalFree (vm.zig:39198) dealloc через vm.alloc.
+- **TestcAllocAdapter.remapFn** (vm.zig:52736): manual alloc+copy+free
+  fallback с сохранением charge class (foreign остаётся foreign — убран
+  +8576 phantom charge на pcall-shrunk bc stacks); reserve-first
+  (ensureUnusedCapacity на base) до remap — registry updates
+  infallible, без best-effort catch {}.
+- **Typed error mappers**: mapVmError (api.zig:1447) / mapDispatchError
+  (api.zig:1468) / CompileError заменяют anyerror/else=>error.Runtime
+  catch-alls; cThrowOn (c_api.zig:1501) enumerated.
+- **newmetatable** (api.zig:1202): через apiNewTable (нормальный
+  constructor contract), stack-rooted до registry publish,
+  registerFinalizable удалён; apiRawGet/tableGetRawValue честно
+  infallible.
+- **Stack-slice-aliasing memory-safety**: 3 блокера (stageBytecodeCall
+  vm.zig:14401, builtinXpcall vm.zig:22936, builtinLoadfile vm.zig:28987
+  — gcTempRoots + 4 preventive сайта) — savestack/restorestack
+  re-basing per PUC luaT_callTMres.
+- **Cleanup**: временные research-диагностики удалены
+  (LUAZIG_TRACE_BIG/OOM2/OOM3, debugPoisonScanLow/Trap, FREE THREAD/
+  RETRY prints, reportError stack dump); CLI 256MiB dedicated-thread
+  reverted point-wise.
+- **Perf**: ОДНА объявленная paired-seed сессия (seeds 1..21, RUNS=21)
+  на final tree — verdict GREEN (18/18 workloads OK, worst per-seed
+  +3.38% < WARN 5%; wall-P25 envelope max +5.69% < 10%; geomean
+  diagnostic 1.44x); артефакты tools/perf/current-gate.json +
+  current-gate-manifest.json (сессия 2026-09-17T17:33:39Z, binary
+  sha256 9b4bcd29…, source_head 40099c6 dirty); baselines
+  byte-identical (не тронуты).
+- **Батарея**: 245/245 unit (Debug+ReleaseFast, 0 leaks), matrix --testc
+  full pass кроме pre-existing big.lua both_fail, smoke 84/84, api580,
+  c_api lanes ok, gc.lua --vm=bc differential 20x clean, fmt +
+  git-diff-check clean.
+- **Известные pre-existing (не внесены фазой, задокументированы для
+  владельца)**: locals.lua stderr GC-pacing dot diff (3 vs 2,
+  HEAD-level); Debug-build cstack.lua native-stack exhaustion edge
+  (<1% RF flake, HEAD-level); out-of-scope same-class findings (api.zig
+  unref/testudata catch swallows, compileChunkValue OOM→Syntax erasure,
+  unused error.Memory, newmetatable missing `__name = tname` parity
+  item).
 
 ## История закрытых фаз
 

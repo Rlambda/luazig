@@ -386,6 +386,10 @@ pub const ConstPool = struct {
         const ls = try vm.createLuaString(alloc, s, h.final());
         errdefer vm.destroyLuaString(alloc, ls);
         const id = try self.append(alloc, .{ .str = ls });
+        // Undo the append if the index put fails below: otherwise the
+        // errdefer would destroy `ls` while `self.items` still holds the
+        // (now dangling) pointer — a later deinit would double-free it.
+        errdefer _ = self.items.pop();
         try self.str_index.put(alloc, ls.bytes(), id);
         return id;
     }

@@ -53,7 +53,13 @@ fn compileDynamicBytecode(
 ) std.mem.Allocator.Error!lua.internal.vm.DynamicBytecodeCompileResult {
     var codegen = lua.internal.codegen_bc.Codegen.init(alloc, source.name, source.bytes);
     defer codegen.deinit();
-    const proto = codegen.compileChunk(chunk) catch {
+    const proto = codegen.compileChunk(chunk) catch |e| {
+        // PUC luaD_seterrorobj (ldo.c): a codegen OOM surfaces at the
+        // protected-load boundary as LUA_ERRMEM with the FIXED
+        // "not enough memory" object — not as a diagnostic (formatting a
+        // diagnostic would itself allocate and fail again under the armed
+        // limit). Propagate; the load boundary installs the fixed message.
+        if (e == error.OutOfMemory) return error.OutOfMemory;
         if (codegen.diag) |diag| {
             return .{ .diagnostic = try std.fmt.allocPrint(alloc, ":{d}: {s}", .{ diag.line, diag.msg }) };
         }
@@ -1082,7 +1088,7 @@ fn pushArgsFromTable(alloc: std.mem.Allocator, vm: *lua.internal.vm.Vm) ![]lua.i
     errdefer list.deinit(alloc);
     var i: i64 = 1;
     while (true) : (i += 1) {
-        const v = vm.apiRawGet(arg_tbl, .{ .Int = i }) catch return error.RuntimeError;
+        const v = vm.apiRawGet(arg_tbl, .{ .Int = i });
         if (v == .Nil) break;
         try list.append(alloc, v);
     }

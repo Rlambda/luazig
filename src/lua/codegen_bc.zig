@@ -990,7 +990,7 @@ pub const Codegen = struct {
         return result;
     }
 
-    fn popGlobalScope(self: *Codegen) void {
+    fn popGlobalScope(self: *Codegen) Error!void {
         const n = self.global_scope_marks.items.len;
         std.debug.assert(n > 0);
         const mark = self.global_scope_marks.items[n - 1];
@@ -1013,7 +1013,7 @@ pub const Codegen = struct {
             attr_index -= 1;
             const entry = self.global_attr_log.items[attr_index];
             if (entry.had_prev) {
-                self.global_attrs.put(self.alloc, entry.name, entry.prev) catch @panic("oom");
+                try self.global_attrs.put(self.alloc, entry.name, entry.prev);
             } else {
                 _ = self.global_attrs.remove(entry.name);
             }
@@ -1094,7 +1094,7 @@ pub const Codegen = struct {
         });
     }
 
-    fn popScope(self: *Codegen) void {
+    fn popScope(self: *Codegen) Error!void {
         const scope_count = self.scope_marks.items.len;
         std.debug.assert(scope_count > 0);
         const mark = self.scope_marks.items[scope_count - 1];
@@ -1155,7 +1155,7 @@ pub const Codegen = struct {
                 i -= 1;
                 const b = self.bindings.items[i];
                 if (self.isCloseLocal(b.reg) or self.captured_regs.contains(b.reg)) {
-                    _ = self.builder.emitSimple(.close, self.line_hint) catch @panic("oom");
+                    _ = try self.builder.emitSimple(.close, self.line_hint);
                     // CLOSE takes the register to close from A.
                     self.builder.code.items[self.builder.code.items.len - 1].a = b.reg;
                 }
@@ -1185,10 +1185,10 @@ pub const Codegen = struct {
         self.peak_freereg = self.nvarstack;
         self.syncLiveTop();
         self.bindings.items.len = mark;
-        self.popGlobalScope();
+        try self.popGlobalScope();
     }
 
-    fn popScopeNoClear(self: *Codegen) void {
+    fn popScopeNoClear(self: *Codegen) Error!void {
         const scope_count = self.scope_marks.items.len;
         std.debug.assert(scope_count > 0);
         const mark = self.scope_marks.items[scope_count - 1];
@@ -1228,7 +1228,7 @@ pub const Codegen = struct {
         self.peak_freereg = self.nvarstack;
         self.syncLiveTop();
         self.bindings.items.len = mark;
-        self.popGlobalScope();
+        try self.popGlobalScope();
     }
 
     fn appendBinding(self: *Codegen, name: []const u8, reg: u8) Error!void {
@@ -1292,9 +1292,9 @@ pub const Codegen = struct {
         return false;
     }
 
-    fn markConstLocal(self: *Codegen, reg: u8) void {
-        self.const_locals.put(self.alloc, reg, {}) catch @panic("oom");
-        self.markReadonlyLocal(reg);
+    fn markConstLocal(self: *Codegen, reg: u8) Error!void {
+        try self.const_locals.put(self.alloc, reg, {});
+        try self.markReadonlyLocal(reg);
     }
 
     /// Capture the compile-time constant value of a `<const>` local's
@@ -1303,23 +1303,23 @@ pub const Codegen = struct {
     /// initializer is a compile-time constant (`luaK_exp2const`). We evaluate
     /// the initializer purely (no code) and, if it is constant, store its
     /// value so that name references fold instead of loading the register.
-    fn captureConstLocalValue(self: *Codegen, reg: u8, init_exp: ?*const ast.Exp) void {
+    fn captureConstLocalValue(self: *Codegen, reg: u8, init_exp: ?*const ast.Exp) Error!void {
         const e = init_exp orelse return;
         if (self.genConstExpDesc(e)) |c| {
-            self.const_local_values.put(self.alloc, reg, c.val) catch @panic("oom");
+            try self.const_local_values.put(self.alloc, reg, c.val);
         }
     }
 
-    fn markReadonlyLocal(self: *Codegen, reg: u8) void {
-        self.readonly_locals.put(self.alloc, reg, {}) catch @panic("oom");
+    fn markReadonlyLocal(self: *Codegen, reg: u8) Error!void {
+        try self.readonly_locals.put(self.alloc, reg, {});
     }
 
-    fn markCloseLocal(self: *Codegen, reg: u8) void {
-        self.close_locals.put(self.alloc, reg, {}) catch @panic("oom");
+    fn markCloseLocal(self: *Codegen, reg: u8) Error!void {
+        try self.close_locals.put(self.alloc, reg, {});
         self.func_has_close = true;
         // A <close> variable is read-only after its initialization, exactly
         // like PUC Lua's VDKTOCLOSE kind.
-        self.markReadonlyLocal(reg);
+        try self.markReadonlyLocal(reg);
     }
 
     /// Mark that this function needs a real vararg table (PF_VATAB).
@@ -1414,7 +1414,7 @@ pub const Codegen = struct {
                         outer.needVarargTable();
                     }
                 }
-                outer.captured_regs.put(outer.alloc, reg, {}) catch @panic("oom");
+                try outer.captured_regs.put(outer.alloc, reg, {});
                 const is_const = outer.isReadonlyLocal(reg);
                 const idx = try self.nextUpvalueIndex();
                 try self.upvalue_descs.append(self.alloc, bc.Upvaldesc.make(
@@ -1424,12 +1424,12 @@ pub const Codegen = struct {
                     name,
                 ));
                 try self.upvalues.put(self.alloc, name, idx);
-                if (is_const) self.const_upvalues.put(self.alloc, idx, {}) catch @panic("oom");
+                if (is_const) try self.const_upvalues.put(self.alloc, idx, {});
                 // Propagate the compile-time constant value (PUC VCONST):
                 // if the captured local is a compile-time const, nested
                 // functions see its value directly rather than GETUPVAL.
                 if (outer.const_local_values.get(reg)) |v| {
-                    self.const_upvalue_values.put(self.alloc, idx, v) catch @panic("oom");
+                    try self.const_upvalue_values.put(self.alloc, idx, v);
                 }
                 return idx;
             }
@@ -1444,9 +1444,9 @@ pub const Codegen = struct {
                     name,
                 ));
                 try self.upvalues.put(self.alloc, name, idx);
-                if (is_const) self.const_upvalues.put(self.alloc, idx, {}) catch @panic("oom");
+                if (is_const) try self.const_upvalues.put(self.alloc, idx, {});
                 if (outer.const_upvalue_values.get(outer_idx)) |v| {
-                    self.const_upvalue_values.put(self.alloc, idx, v) catch @panic("oom");
+                    try self.const_upvalue_values.put(self.alloc, idx, v);
                 }
                 return idx;
             }
@@ -1464,9 +1464,9 @@ pub const Codegen = struct {
                 name,
             ));
             try self.upvalues.put(self.alloc, name, idx);
-            if (is_const) self.const_upvalues.put(self.alloc, idx, {}) catch @panic("oom");
+            if (is_const) try self.const_upvalues.put(self.alloc, idx, {});
             if (outer.const_upvalue_values.get(outer_idx)) |v| {
-                self.const_upvalue_values.put(self.alloc, idx, v) catch @panic("oom");
+                try self.const_upvalue_values.put(self.alloc, idx, v);
             }
             return idx;
         }
@@ -4997,7 +4997,7 @@ pub const Codegen = struct {
                 // info and is resolvable by name. The register is nil at
                 // runtime while virtual (no table created).
                 const va_reg = try self.declareLocal(va_name.slice(self.source));
-                self.markReadonlyLocal(va_reg);
+                try self.markReadonlyLocal(va_reg);
                 self.vararg_param_reg = va_reg;
                 // Special case: if the vararg parameter is named "_ENV",
                 // it serves as the function's environment table. It must
@@ -5632,13 +5632,13 @@ pub const Codegen = struct {
                 try self.appendBinding(dn.name.slice(self.source), reg);
                 if (dn.prefix_attr orelse dn.suffix_attr) |attr| {
                     if (attr.kind == .Const) {
-                        self.markConstLocal(reg);
+                        try self.markConstLocal(reg);
                         // PUC RDKCTC: store the compile-time value when the
                         // initializer is a constant expression.
-                        self.captureConstLocalValue(reg, if (i < values.len) values[i] else null);
+                        try self.captureConstLocalValue(reg, if (i < values.len) values[i] else null);
                     }
                     if (attr.kind == .Close) {
-                        self.markCloseLocal(reg);
+                        try self.markCloseLocal(reg);
                         _ = try self.builder.emitABC(.tbc, reg, 0, 0, line);
                     }
                 }
@@ -5660,11 +5660,11 @@ pub const Codegen = struct {
                     try self.appendBinding(dn.name.slice(self.source), reg);
                     if (dn.prefix_attr orelse dn.suffix_attr) |attr| {
                         if (attr.kind == .Const) {
-                            self.markConstLocal(reg);
-                            self.captureConstLocalValue(reg, null);
+                            try self.markConstLocal(reg);
+                            try self.captureConstLocalValue(reg, null);
                         }
                         if (attr.kind == .Close) {
-                            self.markCloseLocal(reg);
+                            try self.markCloseLocal(reg);
                             _ = try self.builder.emitABC(.tbc, reg, 0, 0, line);
                         }
                     }
@@ -5689,8 +5689,8 @@ pub const Codegen = struct {
                     // PUC: nvars(1) != nexps(0), so a `<const>` here stays a
                     // regular const (gets a register with nil), not a
                     // compile-time constant. No value is captured.
-                    if (attr.kind == .Const) self.markConstLocal(reg);
-                    if (attr.kind == .Close) self.markCloseLocal(reg);
+                    if (attr.kind == .Const) try self.markConstLocal(reg);
+                    if (attr.kind == .Close) try self.markCloseLocal(reg);
                 }
             }
         }
@@ -6609,7 +6609,7 @@ pub const Codegen = struct {
             else
                 cond_line;
             const ej = try self.emitJump(then_line);
-            end_jumps.append(self.alloc, ej) catch @panic("oom");
+            try end_jumps.append(self.alloc, ej);
         }
 
         // Else target: false-list jumps here.
@@ -6633,7 +6633,7 @@ pub const Codegen = struct {
             else
                 eif_cond_line;
             const ej = try self.emitJump(branch_line);
-            end_jumps.append(self.alloc, ej) catch @panic("oom");
+            try end_jumps.append(self.alloc, ej);
             self.patchListToHere(eif_ed.f_list);
             eif_ed.f_list = 0;
         }
@@ -6723,7 +6723,7 @@ pub const Codegen = struct {
         if (break_jump_pc != 0) {
             self.patchJumpTo(break_jump_pc, break_cleanup);
         }
-        self.popScopeNoClear();
+        try self.popScopeNoClear();
 
         // End target: false-list jumps here (condition is false → exit loop).
         self.patchListToHere(cond_ed.f_list);
@@ -6824,7 +6824,7 @@ pub const Codegen = struct {
         }
 
         self.loop_ends.items.len -= 1;
-        self.popScopeNoClear();
+        try self.popScopeNoClear();
         return false;
     }
 
@@ -6867,7 +6867,12 @@ pub const Codegen = struct {
         // PUC layout: R[base]=init, R[base+1]=limit, R[base+2]=step,
         // R[base+3]=loop variable.
         try self.pushScope();
-        defer self.popScope();
+        // PUC luaD_throw abandons the FuncState on error (leaveblock never
+        // runs on the unwind path; the whole codegen state is discarded by
+        // the caller's deinit), so the unwind-path pop is best-effort
+        // bookkeeping only. The success-path pop below propagates: a
+        // swallowed OOM there would return broken bytecode.
+        errdefer self.popScope() catch {};
 
         // Compile init, limit, step into consecutive registers.
         const base = self.freereg;
@@ -6896,7 +6901,7 @@ pub const Codegen = struct {
         self.syncLiveTop();
         const loop_binding_mark = self.bindings.items.len;
         const loop_var = try self.declareLocal(n.name.slice(self.source));
-        self.markReadonlyLocal(loop_var);
+        try self.markReadonlyLocal(loop_var);
 
         // FORPREP A offset: A=base, offset in B:C (16-bit signed).
         const forprep_pc = try self.builder.emitABC(.forprep, base, 0, 0, line);
@@ -6914,7 +6919,7 @@ pub const Codegen = struct {
         // Save break jump PC for patching AFTER CLOSE+FORLOOP.
         const break_jump_pc = self.loop_ends.items[break_slot].pc;
         self.popLoopEnd();
-        self.popScope();
+        try self.popScope();
 
         // Close upvalues for locals declared in the loop body (if any were
         // captured by nested closures).  PUC leaveblock (lparser.c) emits
@@ -6949,6 +6954,7 @@ pub const Codegen = struct {
         self.builder.closeLocVar(state_locvar_1, end_pc);
         self.builder.closeLocVar(state_locvar_2, end_pc);
 
+        try self.popScope();
         return false;
     }
 
@@ -6956,7 +6962,9 @@ pub const Codegen = struct {
         // PUC layout: R[base]=iterator, R[base+1]=state, R[base+2]=control,
         // R[base+3]=close value (to-be-closed), R[base+4..]=loop variables.
         try self.pushScope();
-        defer self.popScope();
+        // See genForNumeric: unwind-path pop is best-effort (PUC abandons
+        // the FuncState on throw); the success-path pop propagates.
+        errdefer self.popScope() catch {};
 
         // Compile explist into 4 values (iterator, state, control, close).
         // If fewer than 4 expressions, nil-fill. If more, discard extras.
@@ -6994,7 +7002,7 @@ pub const Codegen = struct {
         }
         // First loop variable is const (control variable).
         if (n.names.len > 0) {
-            self.markReadonlyLocal(base + 4);
+            try self.markReadonlyLocal(base + 4);
         }
 
         // TFORPREP A offset: A=base, offset in B:C.
@@ -7014,7 +7022,7 @@ pub const Codegen = struct {
         try self.genBlock(n.block);
         const break_jump_pc = self.loop_ends.items[break_slot].pc;
         self.popLoopEnd();
-        self.popScope();
+        try self.popScope();
 
         // Close upvalues for locals declared in the loop body (if any were
         // captured by nested closures).  Same as the numeric-for: the body
@@ -7063,6 +7071,7 @@ pub const Codegen = struct {
         self.builder.closeLocVar(state_locvar, end_pc);
         self.builder.closeLocVar(close_locvar, end_pc);
 
+        try self.popScope();
         return false;
     }
 
@@ -7102,7 +7111,7 @@ pub const Codegen = struct {
                 terminated = try self.genStat(st);
             }
         }
-        self.popScope();
+        try self.popScope();
     }
 
     fn genBlockNoScope(self: *Codegen, block: *const ast.Block, has_postlude: bool) Error!void {

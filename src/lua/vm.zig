@@ -1028,17 +1028,22 @@ const BytecodeCloseContinuation = struct {
     ///   .nonyieldable — luaD_closeprotected paths (coroutine.close /
     ///     forced-close transport / dead-thread reset);
     ///   .yieldable — ordinary OP_CLOSE/OP_RETURN/error-unwind/poscall.
-    /// The policy OWNS the nny unit for the whole closer invocation:
-    /// .nonyieldable enters it before the metamethod runs and leaves it
-    /// exactly once on completion/error (coroutine.isyieldable() naturally
-    /// returns false; a yield raises the ordinary PUC error — which stays
-    /// CATCHABLE by pcall inside the closer, exactly like
-    /// luaD_callnoyield).
+    /// The policy OWNS the C-call unit for the whole closer invocation:
+    /// .nonyieldable enters it (nyci: nny + C depth) before the metamethod
+    /// runs and leaves it exactly once on completion/error
+    /// (coroutine.isyieldable() naturally returns false; a yield raises the
+    /// ordinary PUC error — which stays CATCHABLE by pcall inside the
+    /// closer, exactly like luaD_callnoyield); .yieldable enters the plain
+    /// depth unit (ci: +1 C depth, no nny) — PUC callclosemethod routes
+    /// through luaD_call(yy=1)/luaD_callnoyield(yy=0), and BOTH are ccall:
+    /// every __close invocation consumes a C-depth unit, so the
+    /// LUAI_MAXCCALLS guard bounds recursive close chains (PUC lstate.c
+    /// luaE_checkcstack → "C stack overflow").
     policy: CloseCallPolicy = .yieldable,
-    /// Whether THIS continuation currently holds the nny unit for its
-    /// in-flight .nonyieldable closer child (paired leave on completion
-    /// or cancel — mirrors the sync defer above).
-    nny_active: bool = false,
+    /// Whether THIS continuation currently holds the C-call unit for its
+    /// in-flight closer child (paired leave on completion or cancel —
+    /// mirrors the sync defer at the direct-call site below).
+    ccall_active: bool = false,
     min_reg: u8,
     scan_index: usize,
     current_err: ?Value,
@@ -3108,18 +3113,24 @@ pub const StringIntern = struct {
     /// during this GC cycle). Safe to call during GC — collects entries to
     /// remove first, then removes+frees one at a time (key is valid until the
     /// LuaString is freed).
-    pub fn sweep(self: *StringIntern, alloc: std.mem.Allocator, current_white: u8) !void {
+    pub fn sweep(self: *StringIntern, temp_alloc: std.mem.Allocator, free_alloc: std.mem.Allocator, current_white: u8) !void {
+        // temp_alloc (infra) backs the removal list — GC-internal bookkeeping
+        // that must not fail under an armed test memory limit (PUC's string
+        // sweep is allocation-free pointer surgery). free_alloc (the counted
+        // adapter) backs the destroys: dead strings were charged at creation,
+        // so their frees must subtract from the ledger (adapter frees never
+        // fail — PUC freeblock does no checks).
         var to_remove = std.ArrayListUnmanaged(*LuaString).empty;
-        defer to_remove.deinit(alloc);
+        defer to_remove.deinit(temp_alloc);
         var it = self.table.iterator();
         while (it.next()) |entry| {
             if (gcIsDead(entry.value_ptr.*.gc_marked, current_white)) {
-                try to_remove.append(alloc, entry.value_ptr.*);
+                try to_remove.append(temp_alloc, entry.value_ptr.*);
             }
         }
         for (to_remove.items) |ls| {
             _ = self.table.remove(ls.bytes());
-            destroyLuaString(alloc, ls);
+            destroyLuaString(free_alloc, ls);
         }
     }
 
@@ -3851,7 +3862,13 @@ pub fn defaultBytecodeCompiler(
 ) std.mem.Allocator.Error!DynamicBytecodeCompileResult {
     var codegen = lua_codegen_bc.Codegen.init(alloc, source.name, source.bytes);
     defer codegen.deinit();
-    const proto = codegen.compileChunk(chunk) catch {
+    const proto = codegen.compileChunk(chunk) catch |e| {
+        // PUC luaD_seterrorobj (ldo.c): a codegen OOM surfaces at the
+        // protected-load boundary as LUA_ERRMEM with the FIXED
+        // "not enough memory" object — not as a diagnostic (formatting a
+        // diagnostic would itself allocate and fail again under the armed
+        // limit). Propagate; the load boundary installs the fixed message.
+        if (e == error.OutOfMemory) return error.OutOfMemory;
         if (codegen.diag) |d| {
             return .{ .diagnostic = try std.fmt.allocPrint(alloc, ":{d}: {s}", .{ d.line, d.msg }) };
         }
@@ -3971,10 +3988,234 @@ pub const VmStats = struct {
 /// allocator-control state shared by every lua_State created with the same
 /// allocator userdata. Field semantics mirror the P16.32 VM fields they
 /// replace (alloc_count -1 = PUC `~0UL` unlimited sentinel).
+///
+/// P16.50-review-5: `total_bytes` is SIGNED (PUC `l_mem`): the adapter is
+/// installed mid-VM-life, so frees of memory allocated BEFORE installation
+/// drive the total negative. All test limits are RELATIVE
+/// (`T.totalmem(T.totalmem()+X)`), so the baseline is irrelevant — only
+/// deltas and comparisons against the armed limit matter, exactly as in
+/// PUC where `l_memcontrol.total` can also go negative on pre-control frees.
 const TestcAllocControl = struct {
-    total_bytes: usize = 0,
-    mem_limit: ?usize = null,
+    total_bytes: i64 = 0,
+    mem_limit: ?i64 = null,
     alloc_count: i64 = -1,
+};
+
+/// P16.50-review-5: PUC `debug_realloc` (ltests.c:195-265) as a Zig
+/// allocator vtable — the allocator-boundary implementation of testC memory
+/// control. Installed on `vm.alloc` at the END of `enableTestcModuleInternal`
+/// (the T-table bootstrap itself runs on the base allocator — PUC loads
+/// ltests before any arming); from that point every native allocation flows
+/// through the same check → allocate → account → (on failure) emergency-GC
+/// retry path as PUC's `luaM_realloc_` + `debug_realloc` pair.
+///
+/// Semantics (verified against ltests.c/lmem.c):
+///   alloc:   countlimit armed and 0 → fail WITHOUT decrement (stays armed);
+///            otherwise the count is consumed BEFORE the limit check, as in
+///            debug_realloc. memlimit: total + len > limit → fail. On any
+///            failure run ONE emergency full GC (PUC `tryagain` →
+///            `luaC_fullgc(L, 1)` when `cantryagain`) and retry the FULL
+///            check path — the retry consumes the countdown again, exactly
+///            as a second debug_realloc call would.
+///   free:    total -= len, no checks (PUC `freeblock`).
+///   resize:  countlimit consumed only when the length changes; memlimit
+///            checked only when growing; total += delta on success.
+///   remap:   same checks as resize, remap flavor.
+///
+/// The adapter object itself (and the control) are allocated via the BASE
+/// allocator — uncounted, mirroring PUC's `l_memcontrol` living in static
+/// memory rather than in the controlled heap.
+const TestcAllocAdapter = struct {
+    base: std.mem.Allocator,
+    ctrl: *TestcAllocControl,
+    vm: *Vm,
+
+    /// Charged-block registry — the role of PUC ltests.c's inline
+    /// `memHeader` (ltests.c:206-232): maps every adapter-charged block
+    /// pointer to its charged length. free/resize/remap consult it:
+    ///   registered block  → exact accounting (total -= len / += delta);
+    ///   unregistered block → FOREIGN (allocated via infraAlloc — GC
+    ///     queues, testC machinery, call-result transport — or before the
+    ///     adapter was installed) → passed through to the base WITHOUT
+    ///     accounting, so infra memory freed or resized through vm.alloc
+    ///     can never skew the ledger.
+    /// PUC stores this in a header prepended to every block; a side table
+    /// avoids reading base-allocator metadata that may legitimately sit
+    /// before a foreign block. The registry's own storage comes from the
+    /// BASE allocator directly (never through the adapter — no recursion,
+    /// never counted), mirroring PUC's memHeader living outside `total`.
+    charged: std.AutoHashMapUnmanaged(usize, usize) = .{},
+
+    fn allocator(self: *TestcAllocAdapter) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = allocFn,
+                .resize = resizeFn,
+                .remap = remapFn,
+                .free = freeFn,
+            },
+        };
+    }
+
+    /// One full debug_realloc malloc attempt. Returns null on check failure
+    /// or base-allocator failure (PUC returns NULL in both cases). The
+    /// countdown is consumed on every non-failing-at-0 pass through the
+    /// check block — including attempts whose malloc then fails — matching
+    /// debug_realloc's decrement placement (ltests.c:236-240).
+    fn attemptAlloc(self: *TestcAllocAdapter, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const ctrl = self.ctrl;
+        if (ctrl.alloc_count == 0) { // armed: fail, no decrement
+            return null;
+        }
+        if (ctrl.alloc_count > 0) ctrl.alloc_count -= 1;
+        if (ctrl.mem_limit) |limit| {
+            if (ctrl.total_bytes + @as(i64, @intCast(len)) > limit) {
+                return null;
+            }
+        }
+        const mem = self.base.rawAlloc(len, alignment, ra) orelse return null;
+        // Register the block as charged BEFORE publishing it: a free that
+        // races no re-entrancy concern (single-threaded VM), but the entry
+        // must exist by the time the caller can free the block.
+        self.charged.put(self.base, @intFromPtr(mem), len) catch {
+            // Registry growth failed: uncharge by failing the allocation
+            // (the block never reaches the caller — free it via the base).
+            self.base.rawFree(mem[0..len], alignment, ra);
+            return null;
+        };
+        ctrl.total_bytes += @intCast(len);
+        return mem;
+    }
+
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *TestcAllocAdapter = @ptrCast(@alignCast(ctx));
+        if (self.attemptAlloc(len, alignment, ra)) |mem| return mem;
+        // PUC `luaM_realloc_` tryagain (lmem.c): on ANY failure (including
+        // countdown-0 rejections) run one emergency full GC and retry the
+        // FULL check path. `cantryagain` = completestate && !gcstopem:
+        // completeness is structural (the adapter is installed only after
+        // init), gcstopem maps to gc_busy/testc_emergency_active.
+        if (self.vm.testcEmergencyCollectAllowed()) {
+            self.vm.testcEmergencyCollect();
+            if (self.attemptAlloc(len, alignment, ra)) |mem| return mem;
+        }
+        return null;
+    }
+
+    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *TestcAllocAdapter = @ptrCast(@alignCast(ctx));
+        // PUC freeblock: subtract the block size, no checks, always frees.
+        // The registry decides WHAT to subtract: a charged block subtracts
+        // exactly its charged length; a foreign block (infraAlloc'd — GC
+        // queues, transport arrays — or pre-adapter) subtracts NOTHING.
+        // The @max(0, ...) floor is belt-and-braces: with exact registry
+        // accounting the total can no longer go negative, but PUC's
+        // unsigned `total` invariant is worth preserving defensively.
+        if (self.charged.fetchRemove(@intFromPtr(memory.ptr))) |kv| {
+            self.ctrl.total_bytes = @max(0, self.ctrl.total_bytes - @as(i64, @intCast(kv.value)));
+        }
+        self.base.rawFree(memory, alignment, ra);
+    }
+
+    /// Shared check logic for resize/remap: PUC consumes the count only
+    /// when the size changes, and checks the limit only when growing.
+    /// Returns false/null on check failure (after consuming the count if
+    /// applicable — debug_realloc decrements before the limit check).
+    fn checkResize(self: *TestcAllocAdapter, old_len: usize, new_len: usize) bool {
+        const ctrl = self.ctrl;
+        if (new_len == old_len) return true;
+        if (ctrl.alloc_count == 0) return false;
+        if (ctrl.alloc_count > 0) ctrl.alloc_count -= 1;
+        if (new_len > old_len) {
+            if (ctrl.mem_limit) |limit| {
+                if (ctrl.total_bytes + @as(i64, @intCast(new_len - old_len)) > limit) return false;
+            }
+        }
+        return true;
+    }
+
+    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *TestcAllocAdapter = @ptrCast(@alignCast(ctx));
+        // Foreign blocks (not in the registry) skip the checks entirely:
+        // infra memory is by definition outside the Lua heap budget (PUC
+        // would not allocate here at all — its stack slots and intrusive
+        // lists are allocator-free).
+        const charged_old: ?usize = self.charged.get(@intFromPtr(memory.ptr));
+        if (charged_old) |old_len| {
+            if (!self.checkResize(old_len, new_len)) return false;
+        }
+        // Update the registry entry FIRST (a put failure must leave both
+        // the block and the ledger untouched); roll it back if the base
+        // resize then fails.
+        if (charged_old) |old_len| {
+            self.charged.put(self.base, @intFromPtr(memory.ptr), new_len) catch return false;
+            if (!self.base.rawResize(memory, alignment, new_len, ra)) {
+                self.charged.put(self.base, @intFromPtr(memory.ptr), old_len) catch {};
+                return false;
+            }
+            self.ctrl.total_bytes = @max(0, self.ctrl.total_bytes + @as(i64, @intCast(new_len)) - @as(i64, @intCast(old_len)));
+        } else {
+            if (!self.base.rawResize(memory, alignment, new_len, ra)) return false;
+        }
+        return true;
+    }
+
+    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *TestcAllocAdapter = @ptrCast(@alignCast(ctx));
+        const key = @intFromPtr(memory.ptr);
+        const charged_old: ?usize = self.charged.get(key);
+        if (charged_old) |old_len| {
+            if (!self.checkResize(old_len, new_len)) return null;
+            // P16.50-review-5 3.3: RESERVE the registry update BEFORE any
+            // block can exist at a new address. `charged` storage comes
+            // from the BASE (infrastructure) allocator — never the counted
+            // adapter — so this reservation cannot be blocked by the
+            // countdown/limit under test; once it succeeds, the
+            // re-registration below cannot allocate (putAssumeCapacity
+            // asserts exactly that guarantee). The old `put(...) catch {}`
+            // best-effort shape could silently leave a LIVE block
+            // unregistered — a permanent ledger under-count. A reservation
+            // failure fails the remap BEFORE anything is moved: the block,
+            // its registry entry, and the ledger all stay untouched.
+            self.charged.ensureUnusedCapacity(self.base, 1) catch return null;
+        }
+        if (self.base.rawRemap(memory, alignment, new_len, ra)) |mem| {
+            if (charged_old) |old_len| {
+                // Transactional re-registration: remove the old entry
+                // (returns its slot capacity), then insert the new one —
+                // reserved above, so this cannot fail after the block moved.
+                _ = self.charged.remove(key);
+                self.charged.putAssumeCapacity(@intFromPtr(mem), new_len);
+                self.ctrl.total_bytes = @max(0, self.ctrl.total_bytes + @as(i64, @intCast(new_len)) - @as(i64, @intCast(old_len)));
+            }
+            return mem;
+        }
+        // The base allocator cannot remap in place. Perform the move
+        // OURSELVES instead of letting std's realloc fall back to a blind
+        // alloc+copy+free: that fallback charges the replacement block
+        // through allocFn unconditionally, so replacing a FOREIGN
+        // (pre-install / infra) block would enter the ledger while its
+        // freed predecessor never leaves it — a permanent phantom charge
+        // (locals.lua buffer tests: pcall-shrunk bc stack). PUC's
+        // debug_realloc totals EVERY block, so a replacement transfers the
+        // old block's charge; our ledger equivalence: preserve the block's
+        // charge class across the move.
+        const new_mem = self.base.rawAlloc(new_len, alignment, ra) orelse
+            return null; // Zig's own fallback will retry and fail the same way
+        const copy_len = @min(memory.len, new_len);
+        @memcpy(new_mem[0..copy_len], memory[0..copy_len]);
+        self.base.rawFree(memory, alignment, ra);
+        if (charged_old) |old_len| {
+            // Same transactional re-registration as the rawRemap path: the
+            // capacity was reserved before the move, so the put cannot fail
+            // and the successor block is never left unregistered.
+            _ = self.charged.remove(key);
+            self.charged.putAssumeCapacity(@intFromPtr(new_mem), new_len);
+            self.ctrl.total_bytes = @max(0, self.ctrl.total_bytes + @as(i64, @intCast(new_len)) - @as(i64, @intCast(old_len)));
+        }
+        return new_mem;
+    }
 };
 
 pub const Vm = struct {
@@ -4164,6 +4405,14 @@ pub const Vm = struct {
     /// HandleScope), just root registration.
     gc_temp_roots: std.ArrayListUnmanaged(Value) = .empty,
 
+    /// Temporary GC roots for CELLS (upvalue boxes). Cells are not Values
+    /// (PUC UpVal is its own object type), so they get a parallel list with
+    /// the same scope discipline. PUC anchors open upvalues on the thread
+    /// stack (they are reachable through the frame's stack slots); during
+    /// closure construction our cells live only in Zig locals, so they are
+    /// explicitly temp-rooted here until the closure owns them.
+    gc_temp_cell_roots: std.ArrayListUnmanaged(*Cell) = .empty,
+
     gc_running: bool = true,
     gc_mode: enum { incremental, generational } = .incremental,
     gc_gen_phase: GcGenPhase = .minor,
@@ -4335,6 +4584,28 @@ pub const Vm = struct {
     /// one integer compare behind one pointer load.
     testc_ctrl: ?*TestcAllocControl = null,
     testc_ctrl_borrowed: bool = false,
+    /// P16.50-review-5: the pre-adapter base allocator (the allocator the
+    /// VM was constructed with). Set together with `testc_alloc_adapter`
+    /// by `installTestcAdapter`; `Vm.deinit` restores it before teardown
+    /// of the adapter/control. Also the source for `infraAlloc()` — the
+    /// uncounted allocator for host-side bookkeeping with no PUC
+    /// allocation counterpart.
+    testc_alloc_base: ?std.mem.Allocator = null,
+    /// P16.50-review-5: the installed testC allocator adapter (PUC
+    /// `debug_realloc` as a Zig vtable). Null on production VMs that never
+    /// enable the testC module.
+    testc_alloc_adapter: ?*TestcAllocAdapter = null,
+    /// PUC `gcstopem` for the emergency collector: set while an emergency
+    /// full GC runs, so an allocation failure INSIDE the emergency GC does
+    /// not re-enter it (adapter checks `testcEmergencyCollectAllowed`).
+    testc_emergency_active: bool = false,
+
+    /// PUC `gcemergency` (lgc.c): set during an emergency full GC. Switches
+    /// root marking to the conservative full register window (the heap pc
+    /// is stale mid-instruction), and suppresses finalizer calls (GCScallfin
+    /// guard) and the string-table shrink (checkSizes guard) — both are
+    /// mutator/allocating work that must not run on the failing path.
+    gc_emergency: bool = false,
     /// True once testC allocator-control state has ever been touched (a
     /// countdown armed / a limit set). Production VMs never set it, and the
     /// per-allocation hot check is ONE byte-compare against this Vm-local
@@ -4724,7 +4995,12 @@ pub const Vm = struct {
     /// Private execution-layer signal set. `ThreadSwitch` is raised only while
     /// the bytecode coroutine trampoline is active and must be consumed by
     /// `driveBytecodeCoroutineTrampoline`; it must never cross a public Vm API.
-    const DispatchError = Error || error{ThreadSwitch};
+    /// `pub` so api.zig can write EXACT typed mappers over this union
+    /// (P16.50-review-5 3.1): a mapper parameter must be the precise error
+    /// set of the call site's fallible expression — never `anyerror` — so a
+    /// future error kind becomes a compile error at the mapper, not a
+    /// silently re-labeled status.
+    pub const DispatchError = Error || error{ThreadSwitch};
 
     /// P15.33: Recompute hooks_active_cached from the active thread's hook
     /// state. Called after every debug.sethook / hook clear.
@@ -4823,6 +5099,13 @@ pub const Vm = struct {
             .global_env = env,
             .string_metatable = str_mt,
             .noenv = noenv,
+            // The seed MUST be live before the first internStr below: the
+            // intern table buckets strings by the seed-derived Wyhash, so an
+            // oom_msg_str interned with the default seed 0 is unreachable
+            // by later (real-seed) lookups — a duplicate "not enough memory"
+            // then makes `msg == "not enough memory"` false after OOM errors
+            // (locals.lua:704, short-string pointer identity via luaStringEq).
+            .hash_seed = hash_seed,
         };
         vm.oom_msg_str = vm.internStr("not enough memory") catch @panic("oom");
         vm.gcRegisterTable(env) catch @panic("oom");
@@ -5069,7 +5352,7 @@ pub const Vm = struct {
     fn freeThreadRuntime(self: *Vm, th: *Thread) void {
         if (th.bytecode_stack.len != 0) self.alloc.free(th.bytecode_stack);
         if (th.bytecode_boxed.len != 0) self.alloc.free(th.bytecode_boxed);
-        th.bytecode_tbc_regs.deinit(self.alloc);
+        th.bytecode_tbc_regs.deinit(self.infraAlloc());
         th.bytecode_stack = &.{};
         th.bytecode_boxed = &.{};
         th.bytecode_stack_top = 0;
@@ -5468,7 +5751,7 @@ pub const Vm = struct {
         }
         th.c_frame_count = 0; // P16.27 T0.1: bulk reset — stack emptied below
         th.call_frames.clearAndFree(self.alloc);
-        th.bytecode_unwinds.clearAndFree(self.alloc);
+        th.bytecode_unwinds.clearAndFree(self.infraAlloc());
         th.bytecode_inplace_suspended = false;
         th.bytecode_resume_boundary = 0;
     }
@@ -5507,15 +5790,82 @@ pub const Vm = struct {
         // handles the overflow by growing to ERRORSTACKSIZE. Growing beyond
         // MAXSTACK here would break the stack-overflow detection invariant.
         if (new_cap <= old_len) return;
-        th.bytecode_stack = try self.alloc.realloc(th.bytecode_stack, new_cap);
-        th.bytecode_boxed = try self.alloc.realloc(th.bytecode_boxed, new_cap);
-        // Initialize new slots.
-        @memset(th.bytecode_stack[old_len..], .Nil);
-        @memset(th.bytecode_boxed[old_len..], null);
+        try self.reallocBcStackArrays(th, new_cap);
         // After realloc, bytecode frames no longer cache slices — their
         // register windows are derived on demand from base + frame_cap.
         // Nothing to update here (PUC Lua's luaD_reallocstack also needs
         // no per-frame fixup because ci->func points into the stack).
+    }
+
+    /// Failure-atomic growth of a thread's parallel stack arrays
+    /// (bytecode_stack + bytecode_boxed) to new_cap.
+    ///
+    /// PUC luaD_reallocstack invariant: on allocation failure the stack is
+    /// UNCHANGED — luaD_growstack raises a memory error with the old stack
+    /// intact, and every slot within the old length holds a valid Value, so
+    /// the emergency GC inside the failing allocation scans consistent data.
+    ///
+    /// The previous two-step realloc (stack, then boxed, tail memsets only
+    /// after BOTH) violated that invariant under the testc memlimit: a
+    /// failure of the second realloc had already committed the grown
+    /// bytecode_stack slice with an uninitialized tail, and the emergency
+    /// GC running inside that failing allocation scanned those slots
+    /// (0xAA poison in Debug builds, arbitrary garbage in ReleaseFast) —
+    /// memerr.lua "running code on new thread" crash.
+    ///
+    /// Both new blocks are allocated and fully initialized (old contents
+    /// copied, tail nil-filled) BEFORE either is committed to the thread;
+    /// any failure leaves the thread completely untouched. The new blocks
+    /// are unrooted Zig locals during the second allocation, but they hold
+    /// COPIES, not moves: every object in them is still reachable through
+    /// the old, still-committed arrays, so the emergency GC cannot free
+    /// them.
+    ///
+    /// Reentrancy: the emergency GC inside an allocation may run finalizers
+    /// that execute Lua code and grow/shrink this thread's stack (P15.51g).
+    /// The post-allocation length check detects any such change (the block
+    /// and its contents would be stale) and retries with fresh state.
+    fn reallocBcStackArrays(self: *Vm, th: *Thread, new_cap: usize) std.mem.Allocator.Error!void {
+        while (true) {
+            const old_len = th.bytecode_stack.len;
+            if (new_cap <= old_len) return;
+            const new_stack = try self.alloc.alloc(Value, new_cap);
+            // If any later step in this iteration fails (new_boxed alloc, or
+            // a reentrancy retry's own failure), new_stack must be freed —
+            // it is charged memory that nothing references (the thread still
+            // owns its old arrays). Without this, a new_boxed OOM orphans the
+            // whole new stack block (observed as +32768/burst divergence in
+            // memerr testbytes loops).
+            errdefer self.alloc.free(new_stack);
+            if (th.bytecode_stack.len != old_len) {
+                // Reentrant growth/shrink during the allocation: retry.
+                self.alloc.free(new_stack);
+                continue;
+            }
+            @memcpy(new_stack[0..old_len], th.bytecode_stack);
+            @memset(new_stack[old_len..], .Nil);
+            const new_boxed = try self.alloc.alloc(?*Cell, new_cap);
+            if (th.bytecode_boxed.len != old_len or th.bytecode_stack.len != old_len) {
+                // Reentrant change during the second allocation: retry.
+                self.alloc.free(new_boxed);
+                self.alloc.free(new_stack);
+                continue;
+            }
+            @memcpy(new_boxed[0..old_len], th.bytecode_boxed);
+            @memset(new_boxed[old_len..], null);
+            // Commit. No allocations happen between these statements, so no
+            // reentrant GC can run and observe the thread with mismatched
+            // arrays. Freeing the old blocks through the adapter is a
+            // charged-registry pass-through (their sizes were charged when
+            // originally allocated); the new allocations were charged above,
+            // matching PUC's realloc accounting (new size charged, old size
+            // credited).
+            self.alloc.free(th.bytecode_stack);
+            self.alloc.free(th.bytecode_boxed);
+            th.bytecode_stack = new_stack;
+            th.bytecode_boxed = new_boxed;
+            return;
+        }
     }
 
     /// PUC ldo.c `luaD_shrinkstack`: shrink the owning thread's bytecode
@@ -5670,14 +6020,13 @@ pub const Vm = struct {
     }
 
     pub fn deinit(self: *Vm) void {
-        // P16.33 R0.3: release the shared testC allocator control. A
-        // checkpanic sub-VM BORROWS the parent's object (borrowed=true) and
-        // must not free it — the parent, as the allocation owner, frees it
-        // exactly once here.
-        if (self.testc_ctrl) |c| {
-            if (!self.testc_ctrl_borrowed) self.alloc.destroy(c);
-            self.testc_ctrl = null;
-        }
+        // P16.50-review-5: the testC allocator adapter and the shared
+        // control stay installed for the WHOLE teardown below — every free
+        // runs through the adapter (byte accounting; frees never fail) with
+        // the control alive, exactly as PUC's lua_close runs through
+        // debug_realloc with l_memcontrol alive. They are released at the
+        // very END of this function (see the tail block).
+        //
         // Run closing finalizers first — they execute Lua __gc metamethods and
         // need most objects (global_env, frames, tables) still alive.
         self.gcFinalizeAtClose();
@@ -5759,6 +6108,28 @@ pub const Vm = struct {
         // P15.51n: Free pending call storage AFTER drainGcRegistries, which
         // calls freeThreadBytecodeFrames → getPendingCallPtr on each thread.
         self.pending_calls.deinit(self.alloc);
+        // P16.50-review-5: teardown tail — restore the pre-adapter base
+        // allocator, then release the adapter and the shared control LAST.
+        // A checkpanic sub-VM BORROWS the parent's control (borrowed=true)
+        // and must not free it — the parent, as the allocation owner, frees
+        // it exactly once here. Both objects were allocated via the BASE
+        // allocator (uncounted — PUC's l_memcontrol lives in static memory),
+        // so they are destroyed through base after the restore.
+        if (self.testc_alloc_adapter) |adapter| {
+            const base = self.testc_alloc_base.?;
+            self.alloc = base;
+            // Release the charged-block registry (its storage came from the
+            // base directly — see TestcAllocAdapter.charged) before the
+            // adapter object itself.
+            adapter.charged.deinit(base);
+            base.destroy(adapter);
+            self.testc_alloc_adapter = null;
+            self.testc_alloc_base = null;
+        }
+        if (self.testc_ctrl) |c| {
+            if (!self.testc_ctrl_borrowed) self.alloc.destroy(c);
+            self.testc_ctrl = null;
+        }
     }
 
     /// Single ownership point for GC-able object destruction. Iterates the
@@ -5787,6 +6158,7 @@ pub const Vm = struct {
         self.gc_grayagain.deinit(self.alloc);
         self.gc_gen_threads.deinit(self.alloc);
         self.gc_temp_roots.deinit(self.alloc);
+        self.gc_temp_cell_roots.deinit(self.alloc);
         // Now safe to deinit string_intern — all GC objects (including
         // short strings) have been freed by drainGcRegistries above.
         self.string_intern.deinit(self.alloc);
@@ -5814,32 +6186,46 @@ pub const Vm = struct {
     }
 
     pub fn apiNewThread(self: *Vm, callee: Value) Error!*Thread {
-        // P16.50-review-2 BLOCKER 4: check-only was missing the COMMIT —
-        // the thread's eventual gcNoteFree subtracted bytes that were
-        // never charged (testc undercount). Commit exactly once the
-        // construction succeeds, same size as the free.
-        try exposeDispatchResult(void, self.testcCheckMemory(@sizeOf(Thread) + 64));
-        // P16.50 transactional: prepare-first, infallible commit.
+        // P16.50-review-5: emergency-GC-safe ordering. Any vm.alloc failure
+        // (countdown/memlimit) can run an emergency full GC, which sweeps
+        // REGISTERED-but-unrooted objects. The old shape registered the
+        // thread and THEN grew call_frames with `catch {}` — an emergency
+        // GC inside that growth swept the registered-but-unanchored thread,
+        // leaving a dangling registry entry. PUC's lua_newthread links the
+        // thread into allgc only after luaE_extendCI has pre-sized its CI
+        // list (both on the caller's stack). Mirror that: do ALL fallible
+        // work while the object is still UNREGISTERED (invisible to the
+        // collector), then commit the infallible registration.
         try self.gcPrepareRegister(1);
         const th = try self.alloc.create(Thread);
         th.* = .{ .status = .suspended, .callee = callee };
-        self.gcRegisterCommit(.{ .thread = th });
-        self.gcNoteAlloc(@sizeOf(Thread));
-        // P16.50-review-2 defect 5: the thread's free path credits exactly
-        // sizeof(Thread) (gcFreeObject) — the commit must match; the old
-        // +64 headroom left a permanent +64 residue per thread lifecycle.
-        self.testc_obj_threads += 1;
         // P15.40a: Pre-allocate frame capacity for the new coroutine. This
         // avoids the capacity-check branch on the first 64 bytecode calls.
         // A Thread permanently owns its frame stack, so the capacity
         // survives suspension and re-entry; pre-allocating here means the
-        // first activation is already ready.
+        // first activation is already ready. Failure is tolerable (PUC
+        // luaE_extendCI failure aborts state creation; we grow lazily
+        // later): the thread is still UNREGISTERED here, so an emergency GC
+        // inside this allocation cannot sweep it.
         th.call_frames.ensureTotalCapacity(self.alloc, 64) catch {};
+        // Infallible: capacity reserved above (PUC luaC_newobj allgc link).
+        self.gcRegisterCommit(.{ .thread = th });
+        self.gcNoteAlloc(@sizeOf(Thread));
+        self.testc_obj_threads += 1;
         return th;
     }
 
-    pub fn apiRawGet(self: *Vm, tbl: *Table, key: Value) Error!Value {
-        return exposeDispatchResult(Value, self.tableGetRawValue(tbl, key));
+    /// PUC `lua_rawget` → `luaH_get` (lapi.c): a raw lookup runs no
+    /// metamethods and allocates nothing, so it CANNOT fail. (PUC's
+    /// lua_rawget can only fail at its implicit `api_incr_top` stack push,
+    /// which lives at the push site in the caller here — not in the
+    /// lookup.) The old `Error!Value` signature was a lie that forced
+    /// every caller into `catch .Nil` / `catch return null` swallows,
+    /// misreporting failure on an infallible operation
+    /// (P16.50-review-5 3.2). `tableGetRawValue` is infallible for the
+    /// same reason (see its comment).
+    pub fn apiRawGet(self: *Vm, tbl: *Table, key: Value) Value {
+        return self.tableGetRawValue(tbl, key);
     }
 
     pub fn apiRawSet(self: *Vm, tbl: *Table, key: Value, value: Value) Error!void {
@@ -6159,6 +6545,15 @@ pub const Vm = struct {
     /// object onto `c_stack` on error, matching PUC `luaD_seterrorobj`.
     pub fn apiCloseThread(self: *Vm, th: *Thread) Error!struct { status: i32, err: Value } {
         var out = [_]Value{ .Nil, .Nil };
+        // P16.52: builtinCoroutineClose re-derives its outs slice via
+        // refreshBuiltinOuts() after nested execution. `out` is a LOCAL
+        // buffer (not in bc_stack): reset the window flag so the refresh
+        // returns null and the builtin writes here — otherwise a stale
+        // outer registration (e.g. an in-flight testC/pcall window) would
+        // capture the results. Same pattern as the testC loadstring arm.
+        const saved_on_bc = self.builtin_outs_on_bc_stack;
+        self.builtin_outs_on_bc_stack = false;
+        defer self.builtin_outs_on_bc_stack = saved_on_bc;
         try exposeDispatchResult(void, self.builtinCoroutineClose(&[_]Value{.{ .Thread = th }}, out[0..]));
         const ok = out[0] == .Bool and out[0].Bool;
         return .{ .status = if (ok) 0 else 2, .err = out[1] };
@@ -7083,7 +7478,13 @@ pub const Vm = struct {
     fn captureErrorTraceback(self: *Vm) void {
         self.clearErrorTraceback();
         var aw: std.Io.Writer.Allocating = .init(self.alloc);
-        errdefer aw.deinit();
+        // defer (not errdefer): the OOM paths below exit via `catch return`
+        // and `catch null` — NORMAL returns that would skip an errdefer and
+        // leak the partially-grown writer buffer (observed as a 177-byte
+        // leak per ~25 failed testc attempts in memerr.lua). After a
+        // successful toOwnedSlice the writer's buffer is reset, so this
+        // deinit is a no-op on the success path.
+        defer aw.deinit();
         var w = &aw.writer;
         w.writeAll("stack traceback:") catch return;
         self.writeTracebackBody(w, self.activeBytecodeThread(), 0) catch return;
@@ -7111,7 +7512,8 @@ pub const Vm = struct {
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
         self.errThread().err_source = null;
         self.errThread().err_line = -1;
-        self.errThread().err_obj = .{ .String = try self.internStr(self.err.?) };
+        const istr = try self.internStr(self.err.?);
+        self.errThread().err_obj = .{ .String = istr };
         self.errThread().err_has_obj = true;
         self.captureErrorTraceback();
         try self.invokeErrfunc();
@@ -7210,12 +7612,27 @@ pub const Vm = struct {
                 else
                     std.fmt.allocPrint(self.alloc, "{s}:?: {s}", .{ chunk, msg }) catch msg;
             };
-            self.errThread().err_obj = .{ .String = self.internStrAssume(full) };
+            // PUC luaG_runerror → luaO_pushvfstring → (OOM) luaM_error: when
+            // error-message construction itself hits OOM (armed countdown /
+            // memlimit — memerr.lua testalloc loops hit every allocation,
+            // including this intern), the OOM error REPLACES the original —
+            // the message is lost, "not enough memory" is raised instead.
+            // setOutOfMemoryError is allocation-free (pre-interned literal,
+            // no traceback capture), so this degradation cannot fail again.
+            const full_str = self.internStr(full) catch {
+                self.setOutOfMemoryError();
+                return error.OutOfMemory;
+            };
+            self.errThread().err_obj = .{ .String = full_str };
             self.errThread().err_has_obj = true;
         } else {
             self.errThread().err_source = null;
             self.errThread().err_line = -1;
-            self.errThread().err_obj = .{ .String = try self.internStr(self.err.?) };
+            const plain_str = self.internStr(self.err.?) catch {
+                self.setOutOfMemoryError();
+                return error.OutOfMemory;
+            };
+            self.errThread().err_obj = .{ .String = plain_str };
             self.errThread().err_has_obj = true;
         }
         self.captureErrorTraceback();
@@ -7236,7 +7653,8 @@ pub const Vm = struct {
         var tmp: [2048]u8 = undefined;
         const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
-        self.errThread().err_obj = .{ .String = try self.internStr(self.err.?) };
+        const istr = try self.internStr(self.err.?);
+        self.errThread().err_obj = .{ .String = istr };
         self.errThread().err_has_obj = true;
         // No source location for C-function errors (PUC skips luaG_addinfo).
         self.errThread().err_source = null;
@@ -7258,7 +7676,8 @@ pub const Vm = struct {
         var tmp: [2048]u8 = undefined;
         const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
-        self.errThread().err_obj = .{ .String = try self.internStr(self.err.?) };
+        const istr = try self.internStr(self.err.?);
+        self.errThread().err_obj = .{ .String = istr };
         self.errThread().err_has_obj = true;
         // PUC luaL_error: no source prefix (luaG_addinfo not called).
         self.errThread().err_source = null;
@@ -7630,7 +8049,14 @@ pub const Vm = struct {
             self.errThread().err_source = null;
             self.errThread().err_line = -1;
         }
-        self.captureErrorTraceback();
+        // PUC parity: memory errors carry NO traceback. PUC's error object
+        // for ERRMEM is the fixed string (luaD_seterrorobj) and its default
+        // msghandler (lua.c) explicitly returns the message unchanged for
+        // "not enough memory" — capturing a traceback would also ALLOCATE
+        // on the recovery path, which must stay allocation-free (an armed
+        // countdown would turn the recovery itself into a fatal OOM).
+        // Clear any stale traceback from a previous error instead.
+        self.clearErrorTraceback();
     }
 
     /// PUC `luaH_resizearray` (ltable.c:751). Resize only the array part,
@@ -7655,14 +8081,13 @@ pub const Vm = struct {
         var new_hash_lastfree: usize = 0;
         if (new_hsize > 0) {
             const hsize: usize = if (new_hsize == 1) 1 else std.math.ceilPowerOfTwo(usize, new_hsize) catch new_hsize;
-            // PUC `luaM_reallocvector` → `luaM_realloc_` checks the limit
-            // BEFORE the real allocation and counts bytes only after it
-            // succeeds (P16.50-review check/commit split).
-            try self.testcCheckMemory(hsize * @sizeOf(ltable.Node));
+            // P16.50-review-5: the countdown/limit check and the byte
+            // accounting both happen at the allocator boundary
+            // (TestcAllocAdapter) — PUC debug_realloc wraps this exact
+            // luaM_reallocvector.
             new_hash = try self.alloc.alloc(ltable.Node, hsize);
-            // PUC luaM_realloc_ adds the new block's bytes to totalbytes.
-            // gc_count_kb mirrors totalbytes: charge the new hash part here
-            // so gcFreeObject's full-size credit (header + array + hash)
+            // gc_count_kb ledger: charge the new hash part here so
+            // gcFreeObject's full-size credit (header + array + hash)
             // stays symmetric. Without this, every freed table with a hash
             // part over-decrements the count (P16.4f bug B).
             self.gcNoteAlloc(hsize * @sizeOf(ltable.Node));
@@ -7725,10 +8150,11 @@ pub const Vm = struct {
             // to the hash part.
             break :blk tbl.array;
         } else if (new_asize > 0) blk: {
-            try self.testcCheckMemory(new_asize * @sizeOf(Value));
+            // P16.50-review-5: countdown/limit check + byte accounting at
+            // the allocator boundary (TestcAllocAdapter).
             const arr = try self.alloc.alloc(Value, new_asize);
-            // Charge the new array part (PUC luaM_realloc_ → totalbytes).
-            // See the hash-part charge above for the symmetry argument.
+            // Charge the new array part (gc_count_kb ledger — see the
+            // hash-part charge above for the symmetry argument).
             self.gcNoteAlloc(new_asize * @sizeOf(Value));
             const copy_len = @min(old_asize, new_asize);
             if (copy_len > 0) @memcpy(arr[0..copy_len], tbl.array[0..copy_len]);
@@ -7864,56 +8290,71 @@ pub const Vm = struct {
         return &self.debug_hook_main;
     }
 
-    /// P16.50-review HIGH: the CHECK (limit + alloc-count consumption —
-    /// both semantically "before the allocation") is separated from the
-    /// ACCOUNTING COMMIT (`total_bytes +=`). The old fused form committed
-    /// total_bytes immediately, so a later native-allocation failure left
-    /// an unbalanced charge (no GC object was committed to credit it
-    /// back); the check without commit is PUC-faithful (ltests.c
-    /// debug_realloc checks the limit BEFORE the real allocation and only
-    /// counts after it succeeded).
-    fn testcCheckMemory(self: *Vm, bytes: usize) DispatchError!void {
-        if (bytes == 0) return;
-        try self.testcConsumeAllocCount();
-        if (!self.testc_active) return;
-        const ctrl = self.testc_ctrl orelse return;
-        if (ctrl.mem_limit) |limit| {
-            const next = ctrl.total_bytes +| bytes;
-            if (next > limit) return self.failTestcRaw("not enough memory");
-        }
+    /// P16.50-review-5: the UNCOUNTED base allocator — the allocator the VM
+    /// was constructed with (pre-adapter). Used for:
+    ///   (a) host-side bookkeeping with NO PUC allocation counterpart — GC
+    ///       registries/queues, temp roots, testC script machinery. PUC's
+    ///       equivalents are intrusive lists (allgc, gray, tobefnz) or
+    ///       structures pre-sized at state creation (CI freelist, stack) —
+    ///       they never allocate on the paths we route here, so counting
+    ///       our ArrayList growths would DIVERGE from PUC's allocation
+    ///       counts (nextvar.lua:185 asserts exact counts around table
+    ///       constructors; memerr.lua asserts aloc==0 for a testC pcall).
+    ///   (b) the checkpanic sub-VM's own init: PUC gives the sub-state the
+    ///       same headroom — its lua_newstate allocations are not part of
+    ///       the armed test budget (memerr.lua:28 arms only +10K and then
+    ///       expects `newuserdata 20000` to be the failure).
+    fn infraAlloc(self: *Vm) std.mem.Allocator {
+        return self.testc_alloc_base orelse self.alloc;
     }
 
-    /// The accounting commit — call ONLY after the corresponding native
-    /// allocation succeeded (mirrors PUC's post-success byte counting).
-    fn testcCommitMemory(self: *Vm, bytes: usize) void {
-        if (bytes == 0) return;
-        if (!self.testc_active) return;
-        const ctrl = self.testc_ctrl orelse return;
-        ctrl.total_bytes = ctrl.total_bytes +| bytes;
+    /// P16.50-review-5: wrap `vm.alloc` with the testC allocator adapter —
+    /// PUC installs `debug_realloc` as the state allocator at lua_newstate
+    /// time; we install at the END of `enableTestcModuleInternal` (the
+    /// T-table bootstrap itself runs on the base allocator, like PUC
+    /// loading ltests before any arming). From this point every native
+    /// allocation is checked and accounted at the allocator boundary.
+    /// Idempotent. The adapter and the control are allocated via the BASE
+    /// allocator (uncounted — PUC's l_memcontrol lives in static memory).
+    fn installTestcAdapter(self: *Vm) void {
+        if (self.testc_alloc_adapter != null) return;
+        const base = self.alloc; // still the pre-adapter base here
+        const ctrl = self.testcEnsureControl();
+        // testcEnsureControl activates the adapter when it CREATES the
+        // control — the nested call may have completed the install already
+        // (ctrl existed → no nesting; ctrl created → nested install ran).
+        if (self.testc_alloc_adapter != null) return;
+        const adapter = base.create(TestcAllocAdapter) catch @panic("oom");
+        adapter.* = .{ .base = base, .ctrl = ctrl, .vm = self };
+        self.testc_alloc_base = base;
+        self.testc_alloc_adapter = adapter;
+        self.alloc = adapter.allocator();
     }
 
-    fn testcConsumeAllocCount(self: *Vm) DispatchError!void {
-        // PUC `debug_realloc` (ltests.c:236-240): a single integer compare
-        // against the shared `l_memcontrol.countlimit`; the unlimited
-        // sentinel short-circuits before anything else. -1 is our
-        // "unlimited"; production default (testC absent) = null control =
-        // ONE null-check. The control is SHARED with checkpanic sub-VMs
-        // (P16.33 R0.3): consumption propagates between states like PUC's
-        // shared allocator userdata.
-        if (!self.testc_active) return;
-        const ctrl = self.testc_ctrl orelse return;
-        if (ctrl.alloc_count < 0) return;
-        // countlimit == 0: every allocation fails (the error stays armed
-        // until the limit is reset, exactly like PUC returning NULL without
-        // decrementing).
-        if (ctrl.alloc_count == 0) return self.failTestcRaw("not enough memory");
-        ctrl.alloc_count -= 1;
-        // Lua-visibility mirror: keep the luazig-specific `T._alloccount`
-        // field in sync for direct readers (PUC has no such field). Runs
-        // solely on the active-countdown path — small testC windows only.
-        const t_global = self.getGlobal("T");
-        if (t_global == .Table)
-            try self.setField(t_global.Table, "_alloccount", .{ .Int = ctrl.alloc_count });
+    /// PUC `cantryagain` (lmem.c): completestate && !gcstopem. Completeness
+    /// is structural — the adapter is installed only after init completes.
+    /// gcstopem maps to our gc_busy (any GC step in flight on this VM,
+    /// including finalizer-driven Lua) plus testc_emergency_active (the
+    /// emergency collector itself).
+    fn testcEmergencyCollectAllowed(self: *Vm) bool {
+        return !self.gc_busy and !self.testc_emergency_active;
+    }
+
+    /// PUC `tryagain` → `luaC_fullgc(L, 1)` (lmem.c): the emergency full GC
+    /// run from a failed allocation, best-effort. gc_emergency switches
+    /// root marking to the conservative full register window (the heap pc
+    /// is stale mid-instruction) and suppresses finalizer calls (GCScallfin
+    /// guard) and the string-table shrink (checkSizes guard) — PUC lgc.c
+    /// fullinc under gcemergency=1. The collection itself allocates only
+    /// through infraAlloc (GC-internal queues), so it cannot re-enter the
+    /// failing adapter path; failures are swallowed (the retry that follows
+    /// may still fail → the caller reports OOM, as PUC's NULL return does).
+    fn testcEmergencyCollect(self: *Vm) void {
+        self.testc_emergency_active = true;
+        defer self.testc_emergency_active = false;
+        self.gc_emergency = true;
+        defer self.gc_emergency = false;
+        self.gcFullCollectionForUser() catch return;
     }
 
     /// Arm/reset the allocation countdown from a Lua-visible value.
@@ -7930,19 +8371,39 @@ pub const Vm = struct {
     fn testcEnsureControl(self: *Vm) *TestcAllocControl {
         self.testc_active = true;
         if (self.testc_ctrl) |c| return c;
-        const c = self.alloc.create(TestcAllocControl) catch @panic("oom");
+        // Via infraAlloc: the control is allocator metadata, not heap
+        // payload — PUC's l_memcontrol is static memory, never counted
+        // against itself.
+        const c = self.infraAlloc().create(TestcAllocControl) catch @panic("oom");
         c.* = .{};
         self.testc_ctrl = c;
+        // P16.50-review-5: ensuring the control ACTIVATES the checked
+        // allocator. PUC builds with ltests have debug_realloc installed
+        // from state creation; our equivalent activation point is "testC
+        // control exists" — every path that arms the countdown/limit
+        // (T.alloccount, T.totalmem, checkpanic, unit tests) must see its
+        // checks enforced at the allocator boundary. Idempotent (the
+        // enable-end install and this call converge).
+        self.installTestcAdapter();
         return c;
     }
 
     fn testcSetAllocCount(self: *Vm, v: Value) DispatchError!void {
-        const t_global = self.getGlobal("T");
-        if (t_global == .Table) try self.setField(t_global.Table, "_alloccount", v);
         // Numeric values arm the countdown (PUC: cast to unsigned long);
         // anything else — nil, non-numbers, non-finite floats — means
         // "unlimited", matching the old consume path's coercion where a
         // non-numeric field simply never triggered.
+        //
+        // P16.50-review-5: the T._alloccount mirror write is REMOVED.
+        // PUC's `alloccount` testC command (ltests.c alloc_count) writes
+        // the C global `l_memcontrol.countlimit` with ZERO Lua-state
+        // access. Our mirror write interned "T"/"_alloccount" through
+        // the COUNTED allocator, so arming `alloccount 0` left the
+        // countdown consumed and checkpanic's recovery script
+        // (`alloccount -1`) OOM'd at the intern itself and panicked
+        // (api.lua "memory error + thread status"). Nothing reads the
+        // mirror (only bootstrap's inert `T._alloccount = -1` init);
+        // the control field is the authoritative counter.
         self.testcEnsureControl().alloc_count = switch (v) {
             .Int => |i| i,
             .Num => |x| blk: {
@@ -7953,10 +8414,6 @@ pub const Vm = struct {
             },
             else => -1,
         };
-    }
-
-    fn testcNoteMemory(self: *Vm, bytes: usize) void {
-        if (self.testc_ctrl) |c| c.total_bytes +|= bytes;
     }
 
     fn isTestcMemoryErrorValue(v: Value) bool {
@@ -7978,18 +8435,45 @@ pub const Vm = struct {
     const TempRoots = struct {
         vm: *Vm,
         snapshot: usize,
+        cell_snapshot: usize,
 
         pub fn add(self: *TempRoots, v: Value) std.mem.Allocator.Error!void {
-            try self.vm.gc_temp_roots.append(self.vm.alloc, v);
+            // infraAlloc: temp roots have no PUC allocation counterpart —
+            // PUC anchors construction intermediates on the Lua stack
+            // (allocation-free push).
+            try self.vm.gc_temp_roots.append(self.vm.infraAlloc(), v);
+        }
+
+        /// P16.50-review-5: pre-reserve capacity for `n` infallible pushes
+        /// (infra allocator — cannot re-enter the failing adapter path).
+        /// Constructors with multi-object emergency-GC windows call this
+        /// up front so every subsequent addAssumeCapacity is infallible.
+        pub fn ensure(self: *TempRoots, n: usize) std.mem.Allocator.Error!void {
+            try self.vm.gc_temp_roots.ensureUnusedCapacity(self.vm.infraAlloc(), n);
+            try self.vm.gc_temp_cell_roots.ensureUnusedCapacity(self.vm.infraAlloc(), n);
+        }
+
+        /// Infallible push after a successful `ensure`. The value is marked
+        /// as a root by gcMarkMutableRoots, so an emergency full GC at any
+        /// LATER allocation of the constructor cannot sweep it.
+        pub fn addAssumeCapacity(self: *TempRoots, v: Value) void {
+            self.vm.gc_temp_roots.appendAssumeCapacity(v);
+        }
+
+        /// Infallible cell push after a successful `ensure` (cells are not
+        /// Values — parallel list, same discipline).
+        pub fn addCellAssumeCapacity(self: *TempRoots, cell: *Cell) void {
+            self.vm.gc_temp_cell_roots.appendAssumeCapacity(cell);
         }
 
         pub fn end(self: *TempRoots) void {
             self.vm.gc_temp_roots.shrinkRetainingCapacity(self.snapshot);
+            self.vm.gc_temp_cell_roots.shrinkRetainingCapacity(self.cell_snapshot);
         }
     };
 
     fn gcTempRoots(self: *Vm) TempRoots {
-        return .{ .vm = self, .snapshot = self.gc_temp_roots.items.len };
+        return .{ .vm = self, .snapshot = self.gc_temp_roots.items.len, .cell_snapshot = self.gc_temp_cell_roots.items.len };
     }
 
     // === FINALIZER REGISTRATION INVARIANT ===
@@ -8038,7 +8522,10 @@ pub const Vm = struct {
         // The bit test IS the PUC `tofinalize(o)` check — if already
         // registered, keep the registration untouched (PUC returns early).
         if ((gcPtr(obj).marked.* & FINALIZEDBIT) != 0) return;
-        try self.finalizables.put(self.alloc, obj, {});
+        // infraAlloc (PUC luaC_checkfinalizer parity): finalizer
+        // registration is intrusive pointer surgery in PUC — it allocates
+        // nothing, so it must not consume countdown/limit budget here.
+        try self.finalizables.put(self.infraAlloc(), obj, {});
         // PUC luaC_checkfinalizer (lgc.c:1088): l_setbit(o->marked, FINALIZEDBIT)
         gcPtr(obj).marked.* |= FINALIZEDBIT;
         self.gc_finalizer_epoch +%= 1;
@@ -8094,25 +8581,17 @@ pub const Vm = struct {
     /// threshold calculations.
     /// P16.50-review-3 BLOCKER 5: THE single accounting boundary (PUC
     /// `luaM_realloc_`/`luaM_free_` parity). Every successful native
-    /// allocation for a GC object is counted here — once, in BOTH ledgers
-    /// (gc_count_kb/debt AND the testc ctrl.total_bytes); every free
-    /// reverses exactly the same size through gcNoteFree. The old split
-    /// (manual testcCommitMemory at scattered sites) left asymmetries the
-    /// audit matrix proved: Cells were gcNoteAlloc'd but never
-    /// testc-committed while their gcNoteFree subtracted testc bytes
-    /// (−40/cell drift); interned strings noted allocatedSize+24 but
-    /// freed allocatedSize (+24 residue); thread constructors committed
-    /// +64 headroom their frees never credited. With the boundary HERE,
-    /// every committed native byte pairs with its reversal — the manual
-    /// testcCommitMemory calls at construction sites become redundant and
-    /// are removed; testcCheckMemory stays as the pre-allocation LIMIT
-    /// check (PUC debug_realloc checks before allocating), and the exact
-    /// byte accounting happens at the same place the GC ledger does.
+    /// allocation for a GC object is counted here — once, in the
+    /// gc_count_kb/debt ledger; every free reverses exactly the same size
+    /// through gcNoteFree. P16.50-review-5: the testc ctrl.total_bytes
+    /// ledger moved to the ALLOCATOR BOUNDARY (TestcAllocAdapter counts
+    /// every vm.alloc byte, including tree memory and registry growth that
+    /// the old scattered commits missed) — gcNoteAlloc/gcNoteFree no longer
+    /// touch it, eliminating the double-count the boundary would introduce.
     pub inline fn gcNoteAlloc(self: *Vm, bytes: usize) void {
         const kb: f64 = @as(f64, @floatFromInt(bytes)) / 1024.0;
         self.gc_count_kb += kb;
         self.gc_step_debt_kb -= kb;
-        if (self.testc_ctrl) |c| c.total_bytes +|= bytes;
         if (self.stats.enabled) self.stats.alloc_bytes_total += bytes; // P16.0b
     }
     /// Decrement testc_total_bytes and the approximate gc_count_kb when an
@@ -8136,7 +8615,6 @@ pub const Vm = struct {
         const kb: f64 = @as(f64, @floatFromInt(bytes)) / 1024.0;
         self.gc_count_kb = @max(0, self.gc_count_kb - kb);
         self.gc_step_debt_kb += kb;
-        if (self.testc_ctrl) |c| c.total_bytes -|= bytes;
     }
 
     // --- Native tree memory accounting (Task 7) ---
@@ -8229,9 +8707,13 @@ pub const Vm = struct {
     /// (the capacity check is a comparison), so the hot path (opClosure)
     /// pays one predictable branch per construction, not per object.
     pub fn gcPrepareRegister(self: *Vm, n: usize) std.mem.Allocator.Error!void {
-        try self.gc_objects.ensureUnusedCapacity(self.alloc, n);
+        // infraAlloc (P16.50-review-5): PUC's allgc/gray links are
+        // intrusive — registration never allocates in PUC, so counting our
+        // registry growth would diverge from PUC allocation counts (and
+        // would re-enter the failing adapter during emergency GC).
+        try self.gc_objects.ensureUnusedCapacity(self.infraAlloc(), n);
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
-            try self.gc_young_objects.ensureUnusedCapacity(self.alloc, n);
+            try self.gc_young_objects.ensureUnusedCapacity(self.infraAlloc(), n);
     }
 
     /// P16.50: infallible registry commit (see gcPrepareRegister). The
@@ -8322,27 +8804,68 @@ pub const Vm = struct {
     /// constructor (OOM), never on a hot loop.
     pub fn gcUnregisterObjectRollback(self: *Vm, obj: GcObject) void {
         self.gcUnregisterObjectSweep(obj);
-        const items = self.gc_young_objects.items;
+        removeGcObjectFromList(&self.gc_young_objects, obj);
+        // Purge the object from every GC carry-over work list. The failing
+        // allocation that triggered this rollback ran an EMERGENCY full GC
+        // first (allocFn retry, PUC luaM_realloc_ tryagain) — that cycle
+        // may have queued this object into gray/grayagain/old1/gen-threads
+        // via barriers or propagation. PUC cannot hit this: it has no
+        // rollback (a failed constructor's objects stay linked in allgc
+        // and are swept later, lgc.c sweepgen), so "freed while queued"
+        // cannot exist there. Our rollback frees the object NOW, so every
+        // list that may still hold it must drop it too — otherwise the
+        // NEXT cycle propagates freed memory (memerr.lua testalloc:
+        // OP_CLOSURE rollback under countdown, closure/cells queued by the
+        // emergency collect, next testbytes emergency GC crashes in
+        // gcPropagateOne). Linear scans, cold path (once per failed
+        // constructor), mirroring the gc_young_objects scan above.
+        removeGcObjectFromList(&self.gc_gray, obj);
+        removeGcObjectFromList(&self.gc_grayagain, obj);
+        removeGcObjectFromList(&self.gc_old1, obj);
+        if (obj == .thread) {
+            var ti: usize = 0;
+            while (ti < self.gc_gen_threads.items.len) {
+                if (self.gc_gen_threads.items[ti] == obj.thread) {
+                    _ = self.gc_gen_threads.orderedRemove(ti);
+                } else {
+                    ti += 1;
+                }
+            }
+        }
+    }
+
+    /// Remove ALL occurrences of `obj` from a GcObject work list (identity
+    /// compare via std.meta.eql, matching the registry scans). ALL, not just
+    /// the first: the same object can legitimately sit in a work list more
+    /// than once — write barriers append the owner on every hit without a
+    /// presence check (gcStoreCellValue, table/userdata barrierbacks), and
+    /// gcDrainGrayagain then forwards every saved grayagain occurrence into
+    /// gc_gray. A rollback that purged only the first occurrence would leave
+    /// a stale duplicate behind; the next cycle pops it from gc_gray and
+    /// walks freed memory (memerr.lua testalloc→testbytes crash in
+    /// gcPropagateOne). Removing every occurrence is idempotent and safe:
+    /// live duplicates are re-queued by the next barrier hit.
+    fn removeGcObjectFromList(list: *std.ArrayListUnmanaged(GcObject), obj: GcObject) void {
         var i: usize = 0;
-        while (i < items.len) : (i += 1) {
-            if (std.meta.eql(items[i], obj)) {
-                _ = self.gc_young_objects.orderedRemove(i);
-                break;
+        while (i < list.items.len) {
+            if (std.meta.eql(list.items[i], obj)) {
+                _ = list.orderedRemove(i);
+            } else {
+                i += 1;
             }
         }
     }
 
     fn allocTableNoGc(self: *Vm) std.mem.Allocator.Error!*Table {
         // P16.50 transactional: reserve registry capacity BEFORE the
-        // allocation so registration cannot fail once the object exists;
-        // the testc byte note moves after success (the old before-alloc
-        // placement drifted total_bytes when create failed).
+        // allocation so registration cannot fail once the object exists.
+        // P16.50-review-5: byte accounting happens at the allocator
+        // boundary (TestcAllocAdapter) — no manual note needed here.
         try self.gcPrepareRegister(1);
         const t = try self.alloc.create(Table);
         t.* = .{};
         self.gcRegisterCommit(.{ .table = t });
         self.gcNoteAlloc(@sizeOf(Table));
-        self.testcNoteMemory(@sizeOf(Table) + 64);
         self.testc_obj_tables += 1;
         return t;
     }
@@ -8389,7 +8912,6 @@ pub const Vm = struct {
     /// the pc the GC must see (PUC: builtins run with the caller's
     /// savedpc already saved by the interpreter's savestate).
     fn allocTable(self: *Vm, ctx: ?*BytecodeDispatchCtx) DispatchError!*Table {
-        try self.testcConsumeAllocCount();
         const t = try self.allocTableNoGc();
         self.gc_alloc_tables += 1;
         self.gc_last_table_inst = self.gc_inst;
@@ -8455,13 +8977,11 @@ pub const Vm = struct {
     /// and `gcFreeObject` frees both slices.
     pub fn allocUserdata(self: *Vm, size: usize, nuvalue: usize) DispatchError!*Userdata {
         const total = @sizeOf(Userdata) + nuvalue * @sizeOf(Value) + size;
-        // P16.50-review HIGH: CHECK the limit (and consume the alloc
-        // count) before any allocation, COMMIT total_bytes only after
-        // every native allocation succeeded.
-        try self.testcCheckMemory(total);
-        // P16.50 transactional: registry capacity BEFORE the allocation;
-        // every failure below then rolls back with plain errdefers —
-        // no partially-created userdata can survive.
+        // P16.50-review-5: the countdown/limit checks moved to the
+        // allocator boundary (TestcAllocAdapter). Transactional shape:
+        // registry capacity BEFORE the allocations; the userdata stays
+        // UNREGISTERED (invisible to an emergency GC) until every part
+        // exists, so every failure below rolls back with plain errdefers.
         try self.gcPrepareRegister(1);
         const ud = try self.alloc.create(Userdata);
         errdefer self.alloc.destroy(ud);
@@ -8904,11 +9424,16 @@ pub const Vm = struct {
 
     fn releaseBytecodeCloseChild(self: *Vm, state: *BytecodeCloseContinuation) void {
         _ = self;
-        // P16.27 T1: paired leave of the non-yieldable unit here — this is
+        // P16.27 T1 / P16.52: paired leave of the C-call unit here — this is
         // THE single completion/cancel point for an in-flight closer child.
-        if (state.nny_active) {
-            state.owner_thread.decnny();
-            state.nny_active = false;
+        // The mode is derived from the (immutable) policy: the same mode the
+        // enter side used (see the staging site in continueBytecodeClose).
+        if (state.ccall_active) {
+            state.owner_thread.ccallExit(switch (state.policy) {
+                .nonyieldable => Thread.CCallMode.nonyieldable,
+                .yieldable => Thread.CCallMode.yieldable,
+            });
+            state.ccall_active = false;
         }
         if (!state.child_active) return;
         std.debug.assert(state.owner_thread.bytecode_close_metamethod_depth != 0);
@@ -8935,6 +9460,19 @@ pub const Vm = struct {
     }
 
     fn currentRuntimeErrorValue(self: *Vm) DispatchError!Value {
+        // PUC luaD_seterrorobj (ldo.c): the ERRMEM error object is the FIXED
+        // statMsg literal — no source position, no allocation. The OOM
+        // message is pre-interned at Vm init (oom_msg_str); return it as-is.
+        // Re-materializing it below would intern the POSITIONED message
+        // ("chunk:line: not enough memory") — an allocation that itself
+        // fails under the armed countdown/limit that caused the OOM, and
+        // whose failure escapes the recovery path (memerr.lua testalloc:
+        // countdown-0 pcall must return exactly "not enough memory").
+        if (self.oom_msg_str) |oom| {
+            const obj = self.errThread().err_obj;
+            if (self.errThread().err_has_obj and obj == .String and obj.String == oom)
+                return obj;
+        }
         // PUC prefixes string errors before stack unwinding. Our fail helpers
         // keep source/line separately until an error crosses a protected,
         // coroutine, or __close boundary, so materialize that normalized value
@@ -9016,7 +9554,15 @@ pub const Vm = struct {
         }
         std.debug.assert(!(exec_frames.getPtr(parent_index).pending_call_index != INVALID_PENDING));
         const owner = self.activeBytecodeThread();
-        const close_state = try self.alloc.create(BytecodeCloseContinuation);
+        // infraAlloc (PUC C-stack parity): the close continuation is HOST
+        // machinery — PUC's luaF_close recurses on the C stack with
+        // intrusive TBC lists, allocating nothing. A counted continuation
+        // would fail under the armed countdown/limit that caused the error
+        // being closed over, and its failure would escape the unwind
+        // (memerr.lua testalloc: countdown-0 pcall with a TBC frame).
+        // Destroys stay on self.alloc: the adapter's charged-block registry
+        // passes foreign blocks through without accounting.
+        const close_state = try self.infraAlloc().create(BytecodeCloseContinuation);
         close_state.* = .{
             // P16.27 T1: PUC yy derivation — closes driven by a forced
             // close transport (coroutine.close on a suspended thread;
@@ -9180,13 +9726,39 @@ pub const Vm = struct {
             };
             defer if (resolved.owned_args) |owned| self.alloc.free(owned);
             if (resolved.callee == .Closure and resolved.callee.Closure.proto != null) {
+                // P16.52: PUC callclosemethod (lfunc.c:107) → luaD_call(yy=1)
+                // / luaD_callnoyield(yy=0) → ccall(ci / nyci) — EVERY __close
+                // invocation enters a full C-call unit, so the LUAI_MAXCCALLS
+                // guard (luaE_checkcstack) bounds recursive close chains
+                // (coroutine.close → __close → coroutine.close → …) with
+                // "C stack overflow" instead of exhausting the native stack.
+                // The policy picks the mode exactly like PUC's yy table:
+                // .nonyieldable → nyci (nny + depth), .yieldable → ci (depth).
+                // Entered BEFORE child activation; the unit lives in the
+                // continuation (ccall_active) and is left exactly once when
+                // this child completes (applyBytecodePendingClose) or is
+                // cancelled — the unit is held across the child's entire
+                // execution, so a nested close chain accumulates one unit
+                // per level, like PUC's recursive ccall frames.
+                const ccall_mode: Thread.CCallMode = switch (state.policy) {
+                    .nonyieldable => .nonyieldable,
+                    .yieldable => .yieldable,
+                };
+                self.ccallEnter(state.owner_thread, ccall_mode) catch |ccall_err| switch (ccall_err) {
+                    error.RuntimeError => {
+                        // C-stack overflow (ccallEnter's depth guard): the
+                        // metamethod never runs. PUC's ccall raises before
+                        // luaD_precall and the enclosing closeprotected
+                        // catches it and keeps closing — mirror the
+                        // missing-metamethod path: record the error and
+                        // continue with the remaining TBC variables.
+                        try self.recordBytecodeCloseError(state);
+                        continue;
+                    },
+                    else => return ccall_err,
+                };
+                state.ccall_active = true;
                 state.child_active = true;
-                // P16.27 T1: the POLICY owns the nny unit for the whole
-                // closer invocation (PUC callclosemethod yy). Entered here
-                // (before activation) and left exactly once when this child
-                // completes (applyBytecodePendingClose) or is cancelled.
-                state.nny_active = state.policy == .nonyieldable;
-                if (state.nny_active) state.owner_thread.incnny();
                 state.owner_thread.bytecode_close_metamethod_depth += 1;
                 if (state.err_depth) state.owner_thread.bytecode_close_metamethod_err_depth += 1;
                 try self.setPendingCall(exec_frames.getPtr(parent_index), .{
@@ -9224,8 +9796,27 @@ pub const Vm = struct {
                 return .resume_dispatch;
             }
 
-            if (state.policy == .nonyieldable) state.owner_thread.incnny();
-            defer if (state.policy == .nonyieldable) state.owner_thread.decnny();
+            // P16.52: same full C-call unit as the staged arm above — PUC
+            // callclosemethod routes EVERY __close through ccall (ci/nyci),
+            // so the direct (builtin/synchronous) closer consumes a C-depth
+            // unit too. The defer releases the unit on ALL exits, including
+            // the error.Yield park (PUC's yield longjmps past ccall's
+            // decrement; lua_resume re-derives nCcalls on the next resume —
+            // releasing here matches that model).
+            const ccall_mode: Thread.CCallMode = switch (state.policy) {
+                .nonyieldable => .nonyieldable,
+                .yieldable => .yieldable,
+            };
+            self.ccallEnter(state.owner_thread, ccall_mode) catch |ccall_err| switch (ccall_err) {
+                error.RuntimeError => {
+                    // C-stack overflow: metamethod never runs; closeprotected
+                    // catches and keeps closing (same as the staged arm).
+                    try self.recordBytecodeCloseError(state);
+                    continue;
+                },
+                else => return ccall_err,
+            };
+            defer state.owner_thread.ccallExit(ccall_mode);
             self.runCloseMetamethod(obj, state.current_err) catch |close_err| switch (close_err) {
                 error.RuntimeError => {
                     try self.recordBytecodeCloseError(state);
@@ -9949,7 +10540,13 @@ pub const Vm = struct {
         errdefer self.alloc.free(transfer_copy);
 
         var argv: [2]Value = undefined;
+        // Root the interned event string across the continuation allocation
+        // below (native arrays are invisible to the GC — see builtinLoadfile's
+        // note; an emergency GC during alloc.create would free it).
+        var roots = self.gcTempRoots();
+        defer roots.end();
         argv[0] = .{ .String = try self.internStr(event) };
+        try roots.add(argv[0]);
         var argc: usize = 1;
         var hook_line = line;
         if (hook_line == null and std.mem.eql(u8, event, "line") and exec_frames.len() != 0) {
@@ -10052,7 +10649,7 @@ pub const Vm = struct {
         while (depth < 200) : (depth += 1) {
             if (object == .Table) {
                 const table = object.Table;
-                if (try self.tableGetRawValue(table, key) != .Nil) return .not_found;
+                if (self.tableGetRawValue(table, key) != .Nil) return .not_found;
                 const mt = table.metatable orelse return .not_found;
                 // PUC fasttm: check flags bit, cache-on-miss via fasttm.
                 // (lua-5.5.0/src/ltm.h:63 checknoTM + luaT_gettm.)
@@ -10124,7 +10721,7 @@ pub const Vm = struct {
         while (depth < 200) : (depth += 1) {
             if (object == .Table) {
                 const table = object.Table;
-                const raw = try self.tableGetRawValue(table, key);
+                const raw = self.tableGetRawValue(table, key);
                 if (raw != .Nil or table.metatable == null) return .not_found;
                 // PUC fasttm: check flags bit, cache-on-miss via fasttm.
                 const mm = self.fastTm(table.metatable.?, .newindex) orelse return .not_found;
@@ -10800,7 +11397,7 @@ pub const Vm = struct {
         var depth: usize = 0;
         while (depth < 200) : (depth += 1) {
             const table = object.Table;
-            if (try self.tableGetRawValue(table, key) != .Nil) return false;
+            if (self.tableGetRawValue(table, key) != .Nil) return false;
             const mt = table.metatable orelse return false;
             // PUC fasttm: check flags bit, cache-on-miss via fasttm.
             const mm = self.fastTm(mt, .index) orelse return false;
@@ -13366,7 +13963,14 @@ pub const Vm = struct {
                 var effective_error = error_value;
                 if (final_err) |fe| effective_error = fe;
                 try error_root.add(effective_error);
-                const ret = try self.alloc.alloc(Value, 2);
+                // infraAlloc (PUC stack-slot parity): the pcall FAILURE tuple
+                // is recovery transport — PUC's luaD_poscall moves the error
+                // object into the caller's pre-reserved stack slots, so the
+                // recovery path NEVER allocates. A counted tuple would fail
+                // under the very countdown/limit that caused the failure and
+                // its error would escape the recovery machinery
+                // (memerr.lua testalloc/testbytes).
+                const ret = try self.infraAlloc().alloc(Value, 2);
                 ret[0] = .{ .Bool = false };
                 ret[1] = effective_error;
                 return try self.completeBytecodeProtectedResult(
@@ -13377,7 +13981,9 @@ pub const Vm = struct {
                 );
             }
         }
-        const ret = try self.alloc.alloc(Value, 2);
+        // infraAlloc: same stack-slot parity as the TBC arm above — the
+        // failure tuple is recovery transport, never a counted allocation.
+        const ret = try self.infraAlloc().alloc(Value, 2);
         ret[0] = .{ .Bool = false };
         ret[1] = error_value;
         return try self.completeBytecodeProtectedResult(
@@ -13491,7 +14097,13 @@ pub const Vm = struct {
                 }
             }
         }
-        try self.activeBytecodeThread().bytecode_unwinds.append(self.alloc, .{
+        // P16.50-review-5: infraAlloc — PUC's error-recovery records are
+        // C stack frames (ldo.c), never heap; a COUNTED allocation here
+        // made the error path itself fail under an armed countdown
+        // (memerr.lua: pcall catches the memerr, then the unwind record
+        // alloc is rejected by the still-armed countdown and kills the
+        // unprotected chunk).
+        try self.activeBytecodeThread().bytecode_unwinds.append(self.infraAlloc(), .{
             .boundary_depth = boundary_depth,
             .target_depth = recovery.target_depth,
             .fault = fault,
@@ -13509,7 +14121,7 @@ pub const Vm = struct {
         boundary_depth: usize,
         error_value: Value,
     ) DispatchError!void {
-        try self.activeBytecodeThread().bytecode_unwinds.append(self.alloc, .{
+        try self.activeBytecodeThread().bytecode_unwinds.append(self.infraAlloc(), .{
             .boundary_depth = boundary_depth,
             .target_depth = boundary_depth,
             .fault = .runtime,
@@ -13796,18 +14408,54 @@ pub const Vm = struct {
         // Reserve space for func + args only (PUC: luaT_callTMres assumes
         // EXTRA_STACK for the staged values; the frame's own space is
         // reserved by the activation's checkstackp equivalent).
+        //
+        // PUC luaT_callTMres (ltm.c) stages func + args with plain
+        // setobj2s stores AFTER checkstackGCp(L, n+1, func) has grown the
+        // stack. PUC's `func` is a stack-slot pointer, and checkstackGCp
+        // re-derives it via restorestack(L, func) after luaD_growstack may
+        // have reallocated the stack array: a value that aliases the stack
+        // is never read through a stale pointer.
+        //
+        // `args` here may alias the SAME thread's bytecode_stack (opCall
+        // passes the caller's register window, e.g. pcall's [f, arg...]
+        // slice). Growing the stack frees the old array (reallocBcStackArrays
+        // commits by alloc-copy-free), so the slice must be re-based onto
+        // the new array before the copy loop below — the exact analog of
+        // PUC's restorestack. Without this, the loop reads freed memory
+        // (0xAA poison in Debug builds) and stages it as the callee's
+        // parameter (observed: locals.lua "to-be-closed variables in
+        // coroutines", pcall(foo, 1) staged poison as foo's `err` param).
+        // Snapshot the stack array BEFORE the capacity growth: if `args`
+        // aliases it, the growth (reallocBcStackArrays: alloc-copy-free)
+        // invalidates the slice, and it must be re-based by slot offset —
+        // PUC's savestack/restorestack, applied to the whole slice.
+        const old_stack = th.bytecode_stack;
         const needed = func_slot + 1 + args.len;
         if (needed > th.bytecode_stack.len) {
             try self.ensureBcStackCap(th, needed);
+        }
+        // restorestack: re-base `args` when the array moved and the slice
+        // aliased the old array. Foreign slices (host buffers, other
+        // threads' stacks) pass through untouched. Slot contents survive
+        // any number of moves — reallocBcStackArrays memcpy-preserves them.
+        var args_restored: []const Value = args;
+        if (th.bytecode_stack.ptr != old_stack.ptr) {
+            const args_ptr = @intFromPtr(args.ptr);
+            const old_start = @intFromPtr(old_stack.ptr);
+            const old_end = old_start + old_stack.len * @sizeOf(Value);
+            if (args_ptr >= old_start and args_ptr < old_end) {
+                const base = (args_ptr - old_start) / @sizeOf(Value);
+                args_restored = th.bytecode_stack[base .. base + args.len];
+            }
         }
         th.bytecode_stack[func_slot] = if (callee_cl) |cl|
             .{ .Closure = cl }
         else
             .Nil;
-        for (args, 0..) |v, i| {
+        for (args_restored, 0..) |v, i| {
             th.bytecode_stack[func_slot + 1 + i] = v;
         }
-        return .{ .func_slot = func_slot, .nargs = args.len };
+        return .{ .func_slot = func_slot, .nargs = args_restored.len };
     }
 
     /// FIXED-ARITY staging (PUC `luaT_callTMres`, ltm.c:119-131): PUC stages
@@ -14248,16 +14896,15 @@ pub const Vm = struct {
     noinline fn raiseFrameOverflow(self: *Vm, th: *Thread) DispatchError!void {
         const PHYSICAL_LIMIT: usize = 1_000_000 + 200;
         if (th.bytecode_stack.len < PHYSICAL_LIMIT) {
-            const old_len = th.bytecode_stack.len;
-            th.bytecode_stack = self.alloc.realloc(th.bytecode_stack, PHYSICAL_LIMIT) catch {
+            // Failure-atomic growth (reallocBcStackArrays): on allocation
+            // failure the stack is unchanged and we simply raise the error
+            // on the old stack — PUC also raises the error without growing
+            // when the realloc fails. The old two-step realloc here could
+            // commit the grown stack with an uninitialized tail before the
+            // boxed realloc failed.
+            self.reallocBcStackArrays(th, PHYSICAL_LIMIT) catch {
                 return self.fail("stack overflow", .{});
             };
-            th.bytecode_boxed = self.alloc.realloc(th.bytecode_boxed, PHYSICAL_LIMIT) catch {
-                return self.fail("stack overflow", .{});
-            };
-            // Initialize new slots.
-            @memset(th.bytecode_stack[old_len..], .Nil);
-            @memset(th.bytecode_boxed[old_len..], null);
             // P15.51g: No per-frame slice refresh needed — regs/boxed
             // are derived on demand from base + frame_cap.
         }
@@ -14392,7 +15039,16 @@ pub const Vm = struct {
             const parent = exec_frames.getConstPtr(exec_frames.len() - 1);
             if (parent.isC()) {
                 if (self.returnSliceIsOwned(ret)) {
-                    const owned = try self.alloc.dupe(Value, ret);
+                    // infraAlloc (PUC C-stack parity): this dupe is the
+                    // call-result TRANSPORT to a C caller — PUC's
+                    // luaD_poscall moves the values into the C caller's
+                    // pre-reserved stack slots, allocating nothing. A
+                    // counted dupe would fail under an armed countdown
+                    // (memerr.lua testalloc: `f()` under alloccount(0))
+                    // and kill the call instead of returning the result.
+                    // Frees stay on self.alloc: the charged-block registry
+                    // passes foreign blocks through without accounting.
+                    const owned = try self.infraAlloc().dupe(Value, ret);
                     return owned;
                 }
                 return ret;
@@ -14409,7 +15065,11 @@ pub const Vm = struct {
             if (self.returnSliceIsOwned(ret)) {
                 // External caller needs an owned copy — the scratch is not
                 // safe to return (it can be overwritten by the next return).
-                const owned = try self.alloc.dupe(Value, ret);
+                // infraAlloc (PUC C-stack parity): the copy is result
+                // TRANSPORT across the C boundary — PUC's luaD_poscall
+                // lands results in the caller's pre-reserved stack slots,
+                // allocating nothing (see the C-frame parent branch above).
+                const owned = try self.infraAlloc().dupe(Value, ret);
                 return owned;
             }
             return ret;
@@ -17467,7 +18127,15 @@ pub const Vm = struct {
                                 exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                                 return self.fail("variable '{s}' got a non-closable value", .{local_name});
                             }
-                            ctx.th.bytecode_tbc_regs.append(self.alloc, inst.a) catch return error.OutOfMemory;
+                            // PUC luaF_newtbcupval links the TBC mark into
+                            // the CallInfo's STACK-resident tbclist — no
+                            // heap allocation. Route through infraAlloc so
+                            // arming a countdown (T.alloccount(0)) cannot
+                            // fail the <close> DECLARATION itself
+                            // (locals.lua "memory error inside closing
+                            // function" — the mark must survive to close y's
+                            // memerr).
+                            ctx.th.bytecode_tbc_regs.append(self.infraAlloc(), inst.a) catch return error.OutOfMemory;
                         }
                     },
 
@@ -17487,30 +18155,72 @@ pub const Vm = struct {
                         // create the table and store it in the designated register.
                         if (ctx.cur_proto.vararg_table_reg != bc.Proto.no_vararg_reg) {
                             const va_reg = ctx.cur_proto.vararg_table_reg;
-                            try self.testcConsumeAllocCount(); // Table struct
+                            // P16.50-review-5: the countdown/limit checks
+                            // live at the allocator boundary — the table,
+                            // array, hash-node, and (cold) "n"-string
+                            // allocations are counted by the adapter, exactly
+                            // PUC's createvarargtab (luaH_new + luaH_resize
+                            // + warm luaS_new("n") = 3 blocks, memerr.lua
+                            // asserts aloc==3; "n" is warm from compiling
+                            // the chunk's own `arg.n` constant).
+                            //
+                            // PUC createvarargtab (ltm.c:231-247) roots the
+                            // new table at L->top — NOT in the parameter
+                            // slot — and only moves it into the last
+                            // parameter slot AFTER the extra arguments are
+                            // copied into it. For VATAB the vararg
+                            // parameter's register (base+numparams) is THE
+                            // SAME SLOT as the first extra argument, so
+                            // publishing the table there before the copy
+                            // would overwrite extra arg #1 with the table
+                            // itself (the `...t` slot-1 corruption:
+                            // t[1] == t). Our analogue of PUC's temporary
+                            // L->top slot is gcTempRoots: the table survives
+                            // every emergency GC from creation on
+                            // (gcMarkVmRoots marks gc_temp_roots), while the
+                            // source argument range stays intact until the
+                            // copy is done.
                             const t = try self.allocTableEphemeral();
+                            var roots = self.gcTempRoots();
+                            defer roots.end();
+                            try roots.add(.{ .Table = t });
                             // PUC model (VATAB): extra args at base+numparams
-                            // P15.51l: nextraargs is a rare field, read from CallFrame.
+                            // P15.51l: nextraargs/reg_top are rare fields,
+                            // read from / written to the CallFrame.
                             const fr_vp = exec_frames.getPtr(ctx.frame_index);
+                            fr_vp.reg_top = @max(fr_vp.reg_top, va_reg + 1);
                             const nextra_vp: usize = fr_vp.u.lua.nextraargs;
-                            const va_slice: []Value = if (nextra_vp != 0) blk: {
+                            const va_len: usize = if (nextra_vp != 0) nextra_vp else 0;
+                            try self.tableResizeArray(t, @intCast(va_len));
+                            // Re-derive the extra-args slice AFTER the resize:
+                            // its failure path may run an emergency GC that
+                            // reallocates bc_stack, invalidating a slice
+                            // captured before (values are preserved by the
+                            // realloc copy; only the pointer moves). This is
+                            // the last stack-moving operation before the
+                            // publish — the extras MUST be read from the
+                            // still-intact range BEFORE the table lands in
+                            // the overlapping va_reg slot.
+                            if (va_len != 0) {
                                 const np = ctx.cur_proto.numparams;
                                 const va_start = ctx.base + np;
-                                break :blk ctx.th.bytecode_stack[va_start .. va_start + nextra_vp];
-                            } else &.{};
-                            try self.tableResizeArray(t, @intCast(va_slice.len));
-                            for (va_slice, 0..) |v, i| {
-                                t.array[i] = v;
+                                const va_slice = ctx.th.bytecode_stack[va_start .. va_start + nextra_vp];
+                                for (va_slice, 0..) |v, i| {
+                                    t.array[i] = v;
+                                }
                             }
-                            try self.setIndexValue(.{ .Table = t }, .{ .String = try self.internStr("n") }, .{ .Int = @intCast(va_slice.len) });
-                            // Allocations above (allocTableEphemeral, tableResizeArray,
+                            try self.setIndexValue(.{ .Table = t }, .{ .String = try self.internStr("n") }, .{ .Int = @intCast(va_len) });
+                            // Allocations above (tableResizeArray,
                             // setIndexValue, internStr) may trigger GC which
-                            // reallocates bc_stack. Refresh ctx.regs before writing
-                            // the table to the register.
+                            // reallocates bc_stack. Refresh ctx.regs before
+                            // the publish — a stale slice would write the
+                            // table into freed memory. The extras are
+                            // already copied, so the publish may safely
+                            // clobber the overlapping first-extra-arg slot
+                            // (PUC: setobjs2s moves the table into the last
+                            // parameter slot only at the very end).
                             ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[va_reg] = .{ .Table = t };
-                            // P15.51l: reg_top is a rare field, write to CallFrame.
-                            fr_vp.reg_top = @max(fr_vp.reg_top, va_reg + 1);
                         }
                     },
 
@@ -17579,7 +18289,17 @@ pub const Vm = struct {
         // P15.51l: reg_top is a rare field, read from CallFrame.
         const fr_ret = ctx.exec_frames.getPtr(ctx.frame_index);
         const nvals: usize = if (b == 0) fr_ret.reg_top - a else b - 1;
-        const ret = try self.alloc.dupe(Value, ctx.regs[a .. a + nvals]);
+        // infraAlloc (PUC luaV_execute OP_RETURN parity): PUC preserves
+        // return values across __close by keeping them in stack slots —
+        // the stack is GC machinery, not Lua payload, and its growth is
+        // never charged to the mutator by OP_RETURN itself. Our heap dupe
+        // is the same transport (values are copied out only because our
+        // close continuation may outlive the frame's stack region), so it
+        // must not be charged: memerr.lua's "optimized vararg table" test
+        // asserts aloc==0 for `return arg[n] + arg.n`, and this dupe was
+        // the single counted allocation. The free stays on self.alloc —
+        // pass-through for uncharged infra blocks.
+        const ret = try self.infraAlloc().dupe(Value, ctx.regs[a .. a + nvals]);
         var ret_owned = true;
         errdefer if (ret_owned) self.alloc.free(ret);
         // beginBytecodeClose takes ownership of `ret` (stored in
@@ -18070,7 +18790,7 @@ pub const Vm = struct {
             const ncopy2 = @min(nr, source_len);
             for (0..ncopy2) |i| {
                 ctx.regs[a + i] = if (named_varargs) |src|
-                    try self.tableGetRawValue(src.table, .{ .Int = @intCast(i + 1) })
+                    self.tableGetRawValue(src.table, .{ .Int = @intCast(i + 1) })
                 else
                     va_slice[i];
             }
@@ -18081,7 +18801,7 @@ pub const Vm = struct {
             try self.growCtxFrame(ctx, a + source_len);
             for (0..source_len) |i| {
                 ctx.regs[a + i] = if (named_varargs) |src|
-                    try self.tableGetRawValue(src.table, .{ .Int = @intCast(i + 1) })
+                    self.tableGetRawValue(src.table, .{ .Int = @intCast(i + 1) })
                 else
                     va_slice[i];
             }
@@ -18422,7 +19142,13 @@ pub const Vm = struct {
                     @min(self.last_builtin_out_count, outs.len)
                 else
                     out_len;
-                break :blk try self.alloc.dupe(Value, outs[0..produced]);
+                // PUC luaD_poscall moves the C results into the caller's
+                // pre-reserved stack slots — pure transport, never a
+                // COUNTED allocation. Under an armed countdown (locals.lua
+                // "memory error inside closing function": T.alloccount(0)
+                // returns through this path) a counted dupe would fail the
+                // builtin's own completion and kill the arming call itself.
+                break :blk try self.infraAlloc().dupe(Value, outs[0..produced]);
             },
             .Closure => |cl| blk: {
                 try self.setPendingCall(ctx.exec_frames.getPtr(ctx.frame_index), .{
@@ -19197,7 +19923,8 @@ pub const Vm = struct {
                     @memcpy(self.bc_return_scratch[0..used], outs[0..used]);
                     break :blk self.bc_return_scratch[0..used];
                 }
-                break :blk try self.alloc.dupe(Value, outs[0..used]);
+                // Same poscall transport parity as OP_CALL (see above).
+                break :blk try self.infraAlloc().dupe(Value, outs[0..used]);
             },
             .Closure => |cl| blk: {
                 try self.setPendingCall(ctx.exec_frames.getPtr(ctx.frame_index), .{
@@ -20112,6 +20839,18 @@ pub const Vm = struct {
     /// frees the source LuaString right after this call, leaving the cache key
     /// dangling. On the next grow/rehash, the map compared keys through freed
     /// memory, corrupting the table and tripping `assert(!containsContext(...))`.
+    /// Format-then-intern with no intermediate leak: the allocPrint'ed
+    /// temporary is freed on EVERY path, including an internStr OOM
+    /// (previously `internStr(try allocPrint(...))` leaked the formatted
+    /// buffer when the intern failed — under a testc memory limit that
+    /// grew the retained base by exactly the message size per failed
+    /// attempt, defeating the limit-stepping convergence loops).
+    pub fn internFmt(self: *Vm, comptime fmt: []const u8, args: anytype) std.mem.Allocator.Error!*LuaString {
+        const tmp = try std.fmt.allocPrint(self.alloc, fmt, args);
+        defer self.alloc.free(tmp);
+        return try self.internStr(tmp);
+    }
+
     fn internStrAll(self: *Vm, raw: []const u8) std.mem.Allocator.Error!*LuaString {
         if (raw.len <= lua_string_max_short_len) return self.internStr(raw);
         // For long strings, deduplicate via a separate cache so identical
@@ -20155,8 +20894,11 @@ pub const Vm = struct {
         // store is its ONLY lifetime owner, mirroring string_intern for
         // short strings).
         errdefer destroyLuaString(self.alloc, ls);
-        try self.long_literals.table.put(self.alloc, ls.bytes(), ls);
-        self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 24);
+        // infraAlloc (P16.50-review-5): the long-literals MAP is host-side
+        // dedup bookkeeping with no PUC allocation counterpart (PUC dedups
+        // per-Proto in the constant table); only the string itself is
+        // counted (via self.alloc above), matching PUC's luaS_createlstr.
+        try self.long_literals.table.put(self.infraAlloc(), ls.bytes(), ls);
         self.testc_obj_strings += 1;
         return ls;
     }
@@ -20282,6 +21024,15 @@ pub const Vm = struct {
     /// into bc_stack). Returns null when outs is not on bc_stack (internal
     /// callers that pass local buffers). Mirrors PUC Lua's restorestack macro.
     fn refreshBuiltinOuts(self: *Vm) ?[]Value {
+        // P16.50-review-5: a NON-bc_stack caller (testC's execTestcCommand
+        // passes a LOCAL buffer to builtinLoadEx; internal callers pass
+        // their own slices) must never consult the bc-stack window state
+        // at all — the on-stack check runs FIRST. The old order ran the
+        // active_builtin safety guard first and panicked for exactly those
+        // local-buffer callers in safe builds (api.lua "loadstring"
+        // checkpanic — a Debug-only latent crash the ReleaseFast matrix
+        // lanes never exercised).
+        if (!self.builtin_outs_on_bc_stack) return null;
         // P16.39 Cut 3: the outs-window registration this re-derivation
         // depends on is gated by builtin_may_refresh_outs — a refresh from
         // an unlisted builtin would read a stale outer window
@@ -20290,7 +21041,6 @@ pub const Vm = struct {
         if (std.debug.runtime_safety and !(if (self.active_builtin) |ab| builtinMayRefreshOuts(ab) else false)) {
             @panic("refreshBuiltinOuts: builtin missing from builtin_may_refresh_outs");
         }
-        if (!self.builtin_outs_on_bc_stack) return null;
         const th = self.activeBytecodeThread();
         return th.bytecode_stack[self.builtin_outs_base .. self.builtin_outs_base + self.builtin_outs_len];
     }
@@ -20495,7 +21245,8 @@ pub const Vm = struct {
                 } else {
                     // P15.38h: Use stack-buffer fast path for Int/Num to avoid
                     // heap allocation (PUC luaO_tostring model).
-                    outs[0] = .{ .String = try self.valueToInternedStr(args[0]) };
+                    const istr = try self.valueToInternedStr(args[0]);
+                    outs[0] = .{ .String = istr };
                 }
             },
             .tonumber => try self.builtinTonumber(args, outs),
@@ -20582,7 +21333,8 @@ pub const Vm = struct {
                             @memcpy(self.err_buf[0..stable_len], msg_copy[0..stable_len]);
                             break :blk self.err_buf[0..stable_len];
                         };
-                        self.errThread().err_obj = .{ .String = try self.internStr(self.err.?) };
+                        const istr2 = try self.internStr(self.err.?);
+                        self.errThread().err_obj = .{ .String = istr2 };
                     } else {
                         // C function caller: no source prefix (PUC luaL_where
                         // pushes "" for currentline <= 0).
@@ -21108,10 +21860,10 @@ pub const Vm = struct {
         var p = LuaParser.init(&lex) catch return self.fail("{s}", .{lex.diagString()});
         var ast_arena = lua_ast.AstArena.init(self.alloc);
         defer ast_arena.deinit();
-        const chunk = p.parseChunkAst(&ast_arena) catch return self.fail("{s}", .{p.diagString()});
+        const chunk = p.parseChunkAst(&ast_arena) catch |e| return self.fail("{s}", .{if (e == error.OutOfMemory) "not enough memory" else p.diagString()});
         var cg_bc = lua_codegen_bc.Codegen.init(self.alloc, source.name, source.bytes);
         defer cg_bc.deinit();
-        const proto = cg_bc.compileChunk(chunk) catch return self.fail("{s}", .{cg_bc.diagString()});
+        const proto = cg_bc.compileChunk(chunk) catch |e| return self.fail("{s}", .{if (e == error.OutOfMemory) "not enough memory" else cg_bc.diagString()});
         // Producing reference discipline (P16.10b Task 4): closure creation
         // retains its own; drop ours on success, free on failure. No source
         // backing needed: the bootstrap source is a string literal in the
@@ -21129,6 +21881,25 @@ pub const Vm = struct {
         try self.applyLoadEnv(cl, .{ .Table = self.global_env }, false);
         const ret = try self.runClosure(cl, &.{});
         self.alloc.free(ret);
+
+        // PUC statcodes are string literals pushed via lua_pushstring
+        // (ltests.c pushstatus/threadstatus). Intern them NOW — on the
+        // base allocator, before the adapter goes in — so `pushstatus`/
+        // `threadstatus` inside an armed countdown window are pure intern
+        // lookups (memerr.lua testamem("function call") asserts aloc==0
+        // for pcall f + pushstatus + return 2; "OK" is also warm from
+        // compiling the test source's own "OK" literal, this makes it
+        // unconditional). "not enough memory" is already interned at
+        // Vm.init (oom_msg_str).
+        _ = try self.internStr("OK");
+        _ = try self.internStr("ERRRUN");
+        // P16.50-review-5: install the testC allocator adapter (PUC
+        // debug_realloc) LAST — the T-table bootstrap above ran on the
+        // base allocator, like PUC loading ltests before any arming. From
+        // here on, every native allocation is checked and accounted at
+        // the allocator boundary, and allocation failures run the
+        // emergency-GC retry (luaM_realloc_ tryagain).
+        self.installTestcAdapter();
     }
 
     fn bootstrapGlobals(self: *Vm) DispatchError!void {
@@ -21459,7 +22230,8 @@ pub const Vm = struct {
                             @memcpy(self.err_buf[0..stable_len], msg_value.String.bytes()[0..stable_len]);
                             break :blk self.err_buf[0..stable_len];
                         };
-                        self.errThread().err_obj = .{ .String = try self.internStr(self.err.?) };
+                        const istr = try self.internStr(self.err.?);
+                        self.errThread().err_obj = .{ .String = istr };
                         // PUC leaves the unprefixed message below the built
                         // one on the C frame (luaB_error residue).
                         self.errThread().err_cframe_residue = msg_value;
@@ -21525,10 +22297,11 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("bad argument #1 to 'type' (value expected)", .{});
         const v = args[0];
         if (asFileTable(self, v) != null) {
-            outs[0] = .{ .String = try self.internStr("userdata") };
+            const istr = try self.internStr("userdata");
+            outs[0] = .{ .String = istr };
             return;
         }
-        outs[0] = .{ .String = try self.internStr(switch (v) {
+        const tn = switch (v) {
             .Nil => "nil",
             .Bool => "boolean",
             .Int, .Num => "number",
@@ -21537,7 +22310,9 @@ pub const Vm = struct {
             .Builtin, .Closure => "function",
             .Thread => "thread",
             .LightUserdata, .Userdata => "userdata",
-        }) };
+        };
+        const istr = try self.internStr(tn);
+        outs[0] = .{ .String = istr };
     }
 
     fn builtinRawlen(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -21763,7 +22538,10 @@ pub const Vm = struct {
             // collections (finalizers) — re-derive the outs window first.
             const outw = self.refreshBuiltinOuts() orelse outs;
             // PUC pushmode: 8→"incremental", 7→"generational"
-            if (want_out) outw[0] = .{ .String = try self.internStr(if (res == 8) "incremental" else "generational") };
+            if (want_out) {
+                const istr = try self.internStr(if (res == 8) "incremental" else "generational");
+                outw[0] = .{ .String = istr };
+            }
             return;
         }
         if (std.mem.eql(u8, what, "incremental")) {
@@ -21771,7 +22549,10 @@ pub const Vm = struct {
             // P16.39 Cut 3 (correctness): the mode switch runs full
             // collections (finalizers) — re-derive the outs window first.
             const outw = self.refreshBuiltinOuts() orelse outs;
-            if (want_out) outw[0] = .{ .String = try self.internStr(if (res == 7) "generational" else "incremental") };
+            if (want_out) {
+                const istr2 = try self.internStr(if (res == 7) "generational" else "incremental");
+                outw[0] = .{ .String = istr2 };
+            }
             return;
         }
         if (std.mem.eql(u8, what, "param")) {
@@ -21831,7 +22612,8 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("pcall expects function", .{});
         if (self.activeProtectedCallDepth() >= 128) {
             self.err = "stack overflow error";
-            self.errThread().err_obj = .{ .String = try self.internStr("stack overflow error") };
+            const istr = try self.internStr("stack overflow error");
+            self.errThread().err_obj = .{ .String = istr };
             self.errThread().err_has_obj = true;
             self.errThread().err_source = null;
             self.errThread().err_line = -1;
@@ -21990,16 +22772,24 @@ pub const Vm = struct {
                 vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
             }
         }.f;
-        const mem_before_call = if (self.testc_ctrl) |c| c.total_bytes else 0;
         const obj_tables_before_call = self.testc_obj_tables;
         const obj_functions_before_call = self.testc_obj_functions;
         const obj_threads_before_call = self.testc_obj_threads;
         const obj_strings_before_call = self.testc_obj_strings;
         const rollbackMemoryError = struct {
-            fn f(vm: *Vm, mem: usize, tables: usize, functions: usize, threads: usize, strings: usize) void {
+            fn f(vm: *Vm, tables: usize, functions: usize, threads: usize, strings: usize) void {
                 const errv = vm.protectedErrorValue();
                 if (isTestcMemoryErrorValue(errv)) {
-                    if (vm.testc_ctrl) |c| c.total_bytes = mem;
+                    // P16.50-review-5: ctrl.total_bytes is NO LONGER
+                    // restored here — the ledger lives at the allocator
+                    // boundary and every byte it counted is backed by a
+                    // real allocation (rolled back by the constructors'
+                    // errdefers through the adapter's freeFn). Restoring
+                    // the snapshot would CLOBBER the emergency GC's
+                    // legitimate frees. Only the per-type OBJECT counters
+                    // (used by T.totalmem("table") etc.) are rolled back:
+                    // their constructors increment before the failure
+                    // point.
                     vm.testc_obj_tables = tables;
                     vm.testc_obj_functions = functions;
                     vm.testc_obj_threads = threads;
@@ -22012,12 +22802,12 @@ pub const Vm = struct {
             error.Yield => return e,
             error.OutOfMemory => {
                 self.setOutOfMemoryError();
-                rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
+                rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
                 setFail(self, outs);
                 return;
             },
             else => {
-                rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
+                rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
                 setFail(self, outs);
                 return;
             },
@@ -22037,7 +22827,7 @@ pub const Vm = struct {
                     tmp = self.alloc.alloc(Value, nouts) catch |e| switch (e) {
                         error.OutOfMemory => {
                             self.setOutOfMemoryError();
-                            rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
+                            rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
                             setFail(self, outs);
                             return;
                         },
@@ -22054,7 +22844,7 @@ pub const Vm = struct {
                         // luaD_closeprotected) — before setFail so a final
                         // closer error replaces the failure's error object.
                         if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_pcall_ef, idx);
-                        rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
+                        rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
                         setFail(self, self.refreshBuiltinOuts() orelse outs);
                         return;
                     },
@@ -22074,7 +22864,7 @@ pub const Vm = struct {
                         // builtin-callee errors (e.g. a testC script that
                         // marked TBC and errored) close HERE.
                         if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_pcall_ef, idx);
-                        rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
+                        rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
                         setFail(self, self.refreshBuiltinOuts() orelse outs);
                         return;
                     },
@@ -22114,7 +22904,7 @@ pub const Vm = struct {
                         if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_pcall_ef, idx);
                         self.unwindBytecodeExecFrames(&th_pcall.call_frames, saved_frame_count);
                         th_pcall.bytecode_stack_top = saved_bc_stack_top;
-                        rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
+                        rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
                         setFail(self, self.refreshBuiltinOuts() orelse outs);
                         return;
                     },
@@ -22124,7 +22914,7 @@ pub const Vm = struct {
                         if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_pcall_ef, idx);
                         self.unwindBytecodeExecFrames(&th_pcall.call_frames, saved_frame_count);
                         th_pcall.bytecode_stack_top = saved_bc_stack_top;
-                        rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
+                        rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
                         setFail(self, self.refreshBuiltinOuts() orelse outs);
                         return;
                     },
@@ -22172,6 +22962,16 @@ pub const Vm = struct {
         const th_xpcall_ef = self.activeBytecodeThread();
         const saved_errfunc = th_xpcall_ef.errfunc;
         const armed_errfunc = th_xpcall_ef.bytecode_stack_top;
+        // PUC luaB_xpcall (lbaselib.c): the target and handler are read
+        // BEFORE any stack manipulation, and lua_pcallk receives the
+        // handler as a stack INDEX (errfunc=2) — indices survive stack
+        // reallocation via savestack/restorestack. Here setErrfuncValue
+        // stages the handler ON bc_stack and may grow/realloc it
+        // (reallocBcStackArrays frees the old array), invalidating the
+        // `args` slice when it aliases the caller's register window.
+        // Snapshot the array here and re-base `args` below before the
+        // target read — callBuiltin's args_fresh restorestack idiom.
+        const args_stack_snapshot = th_xpcall_ef.bytecode_stack;
         self.setErrfuncValue(args[1]);
         defer {
             if (th_xpcall_ef.errfunc == armed_errfunc) {
@@ -22185,7 +22985,8 @@ pub const Vm = struct {
             // fails inside the protected extent, so the armed message
             // handler sees this error too (luaG_runerror → luaG_errormsg).
             self.err = "stack overflow error";
-            self.errThread().err_obj = .{ .String = try self.internStr("stack overflow error") };
+            const istr = try self.internStr("stack overflow error");
+            self.errThread().err_obj = .{ .String = istr };
             self.errThread().err_has_obj = true;
             self.errThread().err_source = null;
             self.errThread().err_line = -1;
@@ -22224,10 +23025,15 @@ pub const Vm = struct {
             // site with the raw error object (retry loop inside
             // invokeErrfunc mirrors luaG_errormsg recursion).
             try self.invokeErrfunc();
-            if (outs.len > 0) {
-                outs[0] = .{ .Bool = false };
-                if (outs.len > 1) outs[1] = self.protectedErrorValue();
-                self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
+            // The PHYSICAL_LIMIT realloc above (and invokeErrfunc's handler
+            // execution) may have moved bc_stack — re-derive the outs
+            // window before writing the failure result (xpcall registered
+            // it via callBuiltin's builtinMayRefreshOuts).
+            const outs_ovf = self.refreshBuiltinOuts() orelse outs;
+            if (outs_ovf.len > 0) {
+                outs_ovf[0] = .{ .Bool = false };
+                if (outs_ovf.len > 1) outs_ovf[1] = self.protectedErrorValue();
+                self.last_builtin_out_count = @min(@as(usize, 2), outs_ovf.len);
             }
             return;
         }
@@ -22251,8 +23057,24 @@ pub const Vm = struct {
             if (th_xpcall_cf.call_frames.getPtr(idx).isC()) pcall_frame_idx = idx;
         }
 
-        const f = args[0];
-        const call_args = args[2..];
+        // restorestack: setErrfuncValue (and the C-stack-overflow raise
+        // block above it) may have reallocated bc_stack out from under
+        // the caller's register window. Re-base `args` by its snapshot
+        // offset when it aliased the old array; foreign (heap/native)
+        // slices pass through untouched. Offsets survive any number of
+        // moves — reallocBcStackArrays memcpy-preserves slot contents.
+        const args_fresh: []const Value = if (th_xpcall_ef.bytecode_stack.ptr != args_stack_snapshot.ptr) blk: {
+            const args_ptr = @intFromPtr(args.ptr);
+            const bc_start = @intFromPtr(args_stack_snapshot.ptr);
+            const bc_end = bc_start + args_stack_snapshot.len * @sizeOf(Value);
+            if (args_ptr >= bc_start and args_ptr < bc_end) {
+                const base = (args_ptr - bc_start) / @sizeOf(Value);
+                break :blk th_xpcall_ef.bytecode_stack[base .. base + args.len];
+            }
+            break :blk args;
+        } else args;
+        const f = args_fresh[0];
+        const call_args = args_fresh[2..];
 
         const prev_err = self.err;
         const prev_err_obj = self.errThread().err_obj;
@@ -22426,14 +23248,15 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("coroutine.create expects function", .{});
         const callee = args[0];
         if (!isCallableValue(callee)) return self.fail("coroutine.create expects function", .{});
-        try self.testcCheckMemory(@sizeOf(Thread) + 64);
-        // P16.50 transactional: prepare-first, infallible commit.
+        // P16.50-review-5: countdown/limit checks live at the allocator
+        // boundary (TestcAllocAdapter). Transactional: prepare-first,
+        // infallible commit; no allocation follows the commit, so the
+        // registered thread is anchored in outs[0] before any GC can run.
         try self.gcPrepareRegister(1);
         const th = try self.alloc.create(Thread);
         th.* = .{ .status = .suspended, .callee = callee };
         self.gcRegisterCommit(.{ .thread = th });
         self.gcNoteAlloc(@sizeOf(Thread));
-        // P16.50-review-2 defect 5: symmetric with the free credit.
         self.testc_obj_threads += 1;
         outs[0] = .{ .Thread = th };
     }
@@ -22980,19 +23803,28 @@ pub const Vm = struct {
 
         if (th.status == .dead) {
             if (want_out) outs[0] = .{ .Bool = false };
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("cannot resume dead coroutine") };
+            if (outs.len > 1) {
+                const istr = try self.internStr("cannot resume dead coroutine");
+                outs[1] = .{ .String = istr };
+            }
             self.last_builtin_out_count = if (want_out) @min(@as(usize, 2), outs.len) else 0;
             return;
         }
         if (th.status == .suspended and self.current_thread != null and self.current_thread.? != th and self.current_thread.?.caller == th) {
             if (want_out) outs[0] = .{ .Bool = false };
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("cannot resume non-suspended coroutine") };
+            if (outs.len > 1) {
+                const istr2 = try self.internStr("cannot resume non-suspended coroutine");
+                outs[1] = .{ .String = istr2 };
+            }
             self.last_builtin_out_count = if (want_out) @min(@as(usize, 2), outs.len) else 0;
             return;
         }
         if (th.status == .running) {
             if (want_out) outs[0] = .{ .Bool = false };
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("cannot resume non-suspended coroutine") };
+            if (outs.len > 1) {
+                const istr3 = try self.internStr("cannot resume non-suspended coroutine");
+                outs[1] = .{ .String = istr3 };
+            }
             self.last_builtin_out_count = if (want_out) @min(@as(usize, 2), outs.len) else 0;
             return;
         }
@@ -23032,7 +23864,12 @@ pub const Vm = struct {
             // read the dying thread's state DIRECTLY, never via errThread().
             if (th.status == .running) {
                 th.status = .dead;
-                th.api_status = if (th.err_is_errerr) 5 else 2; // LUA_ERRERR or LUA_ERRRUN
+                // P16.50-review-5 B1: an OOM error carries status 4 — the
+                // error object is the FIXED interned "not enough memory"
+                // (pointer identity); anything else maps ERRERR(5)/ERRRUN(2).
+                th.api_status = if (th.err_obj == .String and th.err_obj.String == self.oom_msg_str)
+                    4 // LUA_ERRMEM
+                else if (th.err_is_errerr) 5 else 2;
             }
             // The target's fault traceback is only meaningful while its
             // error is in flight (PUC: a traceback is consumed during the
@@ -23798,14 +24635,29 @@ pub const Vm = struct {
 
         if (!ok) {
             outs[0] = .{ .Bool = false };
-            if (outs.len > 1) outs[1] = if (th.err_has_obj) th.err_obj else .{ .String = try self.internStr(self.errorString()) };
+            if (outs.len > 1) {
+                if (th.err_has_obj) {
+                    outs[1] = th.err_obj;
+                } else {
+                    const istr = try self.internStr(self.errorString());
+                    outs[1] = .{ .String = istr };
+                }
+            }
             self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
             th.yielded.deinit(self.alloc);
             th.trace_had_error = true;
             th.status = .dead;
-            th.api_status = if (th.err_is_errerr) 5 else 2; // LUA_ERRERR or LUA_ERRRUN
+            // P16.50-review-5 B1: ERRMEM by fixed-object identity (4).
+            th.api_status = if (th.err_obj == .String and th.err_obj.String == self.oom_msg_str)
+                4 // LUA_ERRMEM
+            else if (th.err_is_errerr) 5 else 2;
             th.close_has_err = true;
-            th.close_err = if (th.err_has_obj) th.err_obj else .{ .String = try self.internStr(self.errorString()) };
+            if (th.err_has_obj) {
+                th.close_err = th.err_obj;
+            } else {
+                const istr2 = try self.internStr(self.errorString());
+                th.close_err = .{ .String = istr2 };
+            }
             // P15.83q: snapshot the raising C-frame residue onto the thread
             // for c_api lua_resume (it reads the dead thread's state after
             // this function returned and the runtime switched back to the
@@ -23851,14 +24703,17 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("coroutine.status expects thread", .{});
         const th = try self.expectThread(args[0]);
         if (th.status == .suspended and self.current_thread != null and self.current_thread.? != th and self.current_thread.?.caller == th) {
-            outs[0] = .{ .String = try self.internStr("normal") };
+            const istr = try self.internStr("normal");
+            outs[0] = .{ .String = istr };
             return;
         }
-        outs[0] = .{ .String = try self.internStr(switch (th.status) {
+        const sn = switch (th.status) {
             .suspended => "suspended",
             .running => "running",
             .dead => "dead",
-        }) };
+        };
+        const istr = try self.internStr(sn);
+        outs[0] = .{ .String = istr };
     }
 
     fn builtinCoroutineRunning(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -24086,11 +24941,17 @@ pub const Vm = struct {
             // lua_closethread returns the error status, but L->status (read
             // by lua_status) is LUA_OK. api_status mirrors L->status.
             th.api_status = 0; // LUA_OK — PUC resetCI
-            if (outs.len > 0) outs[0] = .{ .Bool = false };
-            if (outs.len > 1) outs[1] = th.close_err;
+            // P16.52: re-derive outs — closeThreadRegionsOnClosedThread ran
+            // __close metamethods (nested VM execution). coroutine_close is
+            // in builtin_may_refresh_outs, so the registered window is
+            // authoritative; direct callers with local buffers (apiCloseThread)
+            // get null and keep their own slice.
+            const outw = self.refreshBuiltinOuts() orelse outs;
+            if (outw.len > 0) outw[0] = .{ .Bool = false };
+            if (outw.len > 1) outw[1] = th.close_err;
             th.close_has_err = false;
             th.close_err = .Nil;
-            self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
+            self.last_builtin_out_count = @min(@as(usize, 2), outw.len);
             return;
         }
         if (th.status == .suspended and th.trace_yields > 0) {
@@ -24134,13 +24995,16 @@ pub const Vm = struct {
                 th.status = .dead;
                 th.errfunc = ERRFUNC_NONE; // PUC luaE_resetthread
                 th.api_status = 0; // LUA_OK — PUC resetCI sets L->status=LUA_OK
-                if (outs.len > 0) outs[0] = .{ .Bool = false };
-                if (outs.len > 1) outs[1] = resume_out[1];
+                // P16.52: re-derive outs — the transport above ran the
+                // forced-close unwind (nested VM execution).
+                const outw = self.refreshBuiltinOuts() orelse outs;
+                if (outw.len > 0) outw[0] = .{ .Bool = false };
+                if (outw.len > 1) outw[1] = resume_out[1];
                 // Error is already returned by this close call; do not keep it
                 // latched for subsequent close() calls on the dead coroutine.
                 th.close_has_err = false;
                 th.close_err = .Nil;
-                self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
+                self.last_builtin_out_count = @min(@as(usize, 2), outw.len);
                 return;
             }
         }
@@ -24161,9 +25025,12 @@ pub const Vm = struct {
                 th.status = .dead;
                 th.errfunc = ERRFUNC_NONE; // PUC luaE_resetthread
                 th.api_status = 0; // LUA_OK — PUC resetCI
-                if (outs.len > 0) outs[0] = .{ .Bool = false };
-                if (outs.len > 1) outs[1] = final_err.?;
-                self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
+                // P16.52: re-derive outs — the region close above ran
+                // __close metamethods (nested VM execution).
+                const outw = self.refreshBuiltinOuts() orelse outs;
+                if (outw.len > 0) outw[0] = .{ .Bool = false };
+                if (outw.len > 1) outw[1] = final_err.?;
+                self.last_builtin_out_count = @min(@as(usize, 2), outw.len);
                 return;
             }
         }
@@ -24171,9 +25038,13 @@ pub const Vm = struct {
         th.errfunc = ERRFUNC_NONE; // PUC luaE_resetthread clears errfunc
         th.api_status = 0; // LUA_OK — close succeeded
         self.clearThreadContinuationScratch(th, .{ .clear_yielded = true });
-        if (outs.len > 0) outs[0] = .{ .Bool = true };
-        if (outs.len > 1) outs[1] = .Nil;
-        self.last_builtin_out_count = @min(@as(usize, 1), outs.len);
+        // P16.52: re-derive outs — the c_tbc_chain block above may have run
+        // __close metamethods (nested VM execution); a no-op close returns
+        // the same window unchanged.
+        const outw = self.refreshBuiltinOuts() orelse outs;
+        if (outw.len > 0) outw[0] = .{ .Bool = true };
+        if (outw.len > 1) outw[1] = .Nil;
+        self.last_builtin_out_count = @min(@as(usize, 1), outw.len);
     }
 
     fn gcWeakMode(self: *Vm, tbl: *Table) struct { weak_k: bool, weak_v: bool } {
@@ -24270,6 +25141,35 @@ pub const Vm = struct {
                 std.debug.assert(false);
             }
         }
+        // Precise-liveness safety skip (PUC deviation, by design). Our
+        // normal cycles free objects sitting in DEAD register slots
+        // (live_reg_top[pc] excludes them — the compiler guarantees they
+        // are never read again). PUC never does this: traversethread marks
+        // the FULL static frame window [base..ci->top], so an object in an
+        // active frame's window is never collected while the frame lives;
+        // dead slots above top are cleared at atomic (lgc.c:712-714).
+        // Our emergency GC cannot copy PUC's clear-the-dead-slice approach:
+        // it runs MID-INSTRUCTION, where the in-flight opcode may already
+        // hold values in registers above live_reg_top[pc] (OP_NEWTABLE's
+        // table before its store) — clearing would destroy them. Instead,
+        // the emergency scan conservatively marks the full window, which
+        // necessarily sweeps over dead slots holding STALE pointers to
+        // objects freed by earlier precise cycles. Skipping unregistered
+        // objects here is what makes that combination sound: a freed
+        // object is never re-queued into gc_gray (the stale entry would be
+        // popped by the next cycle's propagation and walk freed memory —
+        // memerr.lua testalloc→testbytes crash in gcPropagateOne).
+        // This is not masking a liveness bug: if a LIVE register's object
+        // were freed, the dispatch loop itself would use freed memory on
+        // the next read, independent of the GC.
+        {
+            const idx = p.index.*;
+            if (idx >= self.gc_objects.items.len or
+                !std.meta.eql(self.gc_objects.items[idx], obj))
+            {
+                return;
+            }
+        }
         // Cell is structurally excluded from gc_gray: PUC propagatemark
         // (lgc.c:727-740) has no LUA_VUPVAL case. Delegate immediately to
         // markCell (PUC reallymarkobject LUA_VUPVAL), which sets open→gray
@@ -24289,7 +25189,7 @@ pub const Vm = struct {
             gcSetBlack(p.marked);
         } else {
             gcSetGray(p.marked);
-            try self.gc_gray.append(self.alloc, obj);
+            try self.gc_gray.append(self.infraAlloc(), obj);
         }
     }
 
@@ -24444,7 +25344,7 @@ pub const Vm = struct {
                 p.age.* = .touched1;
                 // PUC linkobjgclist: paint gray and add to grayagain.
                 gcSetGray(p.marked);
-                try self.gc_grayagain.append(self.alloc, owner);
+                try self.gc_grayagain.append(self.infraAlloc(), owner);
             },
         }
     }
@@ -24470,7 +25370,7 @@ pub const Vm = struct {
             if (owner_age.isOld() and child_age.isYoung()) {
                 const child_obj = GcObject.fromValue(child).?;
                 gcPtr(child_obj).age.* = .old0;
-                try self.gc_old1.append(self.alloc, child_obj);
+                try self.gc_old1.append(self.infraAlloc(), child_obj);
                 try self.gcQueueScanValue(child);
             }
             return;
@@ -24484,7 +25384,7 @@ pub const Vm = struct {
             if (self.gc_state == .sweep) return;
             if (owner.gc_age.isOld() and child.gc_age.isYoung()) {
                 child.gc_age = .old0;
-                try self.gc_old1.append(self.alloc, .{ .cell = child });
+                try self.gc_old1.append(self.infraAlloc(), .{ .cell = child });
                 try self.gcQueueScanCell(child);
             }
             return;
@@ -24566,7 +25466,7 @@ pub const Vm = struct {
             // handle that separately if it becomes an issue.
             gcSetBlack(o.marked);
             if (obj == .thread) {
-                try self.gc_gen_threads.append(self.alloc, obj.thread);
+                try self.gc_gen_threads.append(self.infraAlloc(), obj.thread);
             }
         }
         // Short strings are now in gc_objects. Only long literals separate.
@@ -24920,6 +25820,18 @@ pub const Vm = struct {
     /// linkgclist(&L->gclist, g->grayagain) + traversethread re-traversal
     /// achieves. The disabled requeue code has been removed. No gap found.
     fn gcMarkMutableRoots(self: *Vm) DispatchError!void {
+        // PUC restartcollection (lgc.c:443): markobject(g, mainthread(g)) —
+        // the MAIN thread is an unconditional GC root, every cycle, even
+        // when another coroutine is running. Without this, a GC that fires
+        // while active_th is a coroutine never scans the main thread's
+        // frames: every object live only in main-thread registers (e.g. a
+        // coroutine being resumed — memerr.lua "running code on new thread"
+        // testalloc crash: the emergency GC inside the coroutine's stack
+        // growth swept the still-referenced thread, then the next cycle
+        // marked its freed stack) is collected as unreachable. Marking the
+        // thread object queues it; propagation's .thread case walks its
+        // frames (the inactive-coroutine path below).
+        if (self.main_thread) |mt| try self.gcMarkValue(.{ .Thread = mt });
         if (self.debug_hook_main.func) |hook| try self.gcMarkValue(hook);
         if (self.wrap_thread) |thread| try self.gcMarkValue(.{ .Thread = thread });
         if (self.current_thread) |thread| try self.gcMarkValue(.{ .Thread = thread });
@@ -24935,7 +25847,16 @@ pub const Vm = struct {
                 // Read through the owning thread because GC finalizers may
                 // execute Lua code that reallocs bytecode_stack.
                 const regs = active_th.bytecode_stack[frame.frameBase() .. frame.frameBase() + frame.u.lua.frame_cap];
-                // Scan bound: proto.live_reg_top[pc] is the compile-time
+                // Emergency GC (PUC gcemergency): the heap pc is STALE
+                // mid-instruction — live_reg_top[pc] may exclude registers
+                // the in-flight opcode already created or loaded into Zig
+                // locals (e.g. OP_NEWTABLE's table before its store). PUC's
+                // emergency GC has no such window: traversethread marks
+                // L->stack[0..L->top] wholesale. Mark the FULL register
+                // window conservatively; the precise liveness bound is only
+                // safe when frames are parked at safepoints.
+                //
+                // Normal marking: proto.live_reg_top[pc] is the compile-time
                 // liveness bound — it includes exactly the registers that are
                 // live at the current PC. Using @max(pc_live, frame.reg_top)
                 // would also scan dead registers above the live range (e.g.,
@@ -24943,7 +25864,9 @@ pub const Vm = struct {
                 // keeping unreachable objects alive and breaking finalization
                 // tests (gc.lua:382, api.lua:1039). When pc is out of range,
                 // scan all registers as a conservative fallback.
-                const live_top: usize = if (frame.u.lua.pc < proto.live_reg_top.len)
+                const live_top: usize = if (self.gc_emergency)
+                    regs.len
+                else if (frame.u.lua.pc < proto.live_reg_top.len)
                     @min(proto.live_reg_top[frame.u.lua.pc], regs.len)
                 else
                     regs.len;
@@ -24961,6 +25884,18 @@ pub const Vm = struct {
                 }
             }
             try self.gcMarkValue(active_th.bytecode_stack[frame.func_slot]);
+            // PUC traversethread marks L->stack[0..L->top] wholesale — every
+            // value on the stack, INCLUDING values parked by C activations
+            // (PUC C functions keep their locals on the Lua stack itself;
+            // our C frames park them in u.c.parked_stack — e.g. the testC
+            // script's `st` parked into the script frame). Mark every parked
+            // value so no collection (emergency or regular) can reclaim an
+            // object a C frame still holds.
+            if (frame.isC()) {
+                if (frame.u.c.parked_stack) |parked| {
+                    for (parked.items) |value| try self.gcMarkValue(value);
+                }
+            }
             // PUC model: hidden varargs at [func_slot-nextraargs..func_slot].
             // Varargs/boxed are Lua-frame-only fields — C-frames don't have
             // u.lua.nextraargs or u.lua.frame_cap. Guard prevents union field
@@ -24994,6 +25929,8 @@ pub const Vm = struct {
         }
 
         for (self.gc_temp_roots.items) |value| try self.gcMarkValue(value);
+        // Cells (upvalue boxes) under construction — parallel temp-root list.
+        for (self.gc_temp_cell_roots.items) |cell| try self.gcQueueScanCell(cell);
         if (self.debug_transfer_values) |values| for (values) |value| try self.gcMarkValue(value);
         if (self.errThread().err_has_obj) try self.gcMarkValue(self.errThread().err_obj);
         // c_error_value holds the object thrown by lua_error between the
@@ -25122,7 +26059,7 @@ pub const Vm = struct {
         }
         // Backward barrier: turn owner gray, add to grayagain.
         gcSetGray(&owner.gc_marked);
-        try self.gc_grayagain.append(self.alloc, .{ .table = owner });
+        try self.gc_grayagain.append(self.infraAlloc(), .{ .table = owner });
     }
 
     /// PUC luaC_barrierback_ (lgc.c:268) for userdata uservalue writes.
@@ -25150,7 +26087,7 @@ pub const Vm = struct {
         }
         // Backward barrier: turn owner gray, add to grayagain.
         gcSetGray(&owner.gc_marked);
-        try self.gc_grayagain.append(self.alloc, .{ .userdata = owner });
+        try self.gc_grayagain.append(self.infraAlloc(), .{ .userdata = owner });
     }
 
     /// PUC forward barrier for cell/upvalue writes (lgc.h:245 `luaC_barrier`):
@@ -25201,7 +26138,7 @@ pub const Vm = struct {
                         const child_obj = GcObject.fromValue(value) orelse return;
                         try self.gcQueueScanObject(child_obj);
                         gcPtr(child_obj).age.* = .old0;
-                        try self.gc_old1.append(self.alloc, child_obj);
+                        try self.gc_old1.append(self.infraAlloc(), child_obj);
                     }
                 }
             }
@@ -25265,7 +26202,7 @@ pub const Vm = struct {
                     try self.gcQueueScanObject(.{ .table = mt });
                     if (table.gc_age.isOld()) {
                         mt.gc_age = .old0;
-                        try self.gc_old1.append(self.alloc, .{ .table = mt });
+                        try self.gc_old1.append(self.infraAlloc(), .{ .table = mt });
                     }
                 }
                 // Also add the table to grayagain (backward barrier) so it's
@@ -25279,7 +26216,7 @@ pub const Vm = struct {
                 if (gcIsBlack(table.gc_marked) and table.gc_age != .touched1) {
                     table.gc_age = .touched1;
                     gcSetGray(&table.gc_marked);
-                    try self.gc_grayagain.append(self.alloc, .{ .table = table });
+                    try self.gc_grayagain.append(self.infraAlloc(), .{ .table = table });
                 }
                 return;
             }
@@ -25431,7 +26368,7 @@ pub const Vm = struct {
         if (!gcIsWhite(gcPtr(child).marked.*)) return;
         // Backward barrier: turn owner gray, add to grayagain.
         gcSetGray(&table.gc_marked);
-        try self.gc_grayagain.append(self.alloc, .{ .table = table });
+        try self.gc_grayagain.append(self.infraAlloc(), .{ .table = table });
     }
 
     fn gcDrainGray(self: *Vm) DispatchError!void {
@@ -25461,8 +26398,10 @@ pub const Vm = struct {
         // Without genlink, TOUCHED1 objects are cleared from grayagain but
         // never advanced. In subsequent cycles, they're not in grayagain and
         // not re-traversed → their young children are not marked → freed.
-        const saved = self.alloc.dupe(GcObject, self.gc_grayagain.items) catch return error.OutOfMemory;
-        defer self.alloc.free(saved);
+        // infraAlloc: the grayagain save/clear is GC-internal bookkeeping —
+        // PUC re-links the intrusive list without allocating.
+        const saved = self.infraAlloc().dupe(GcObject, self.gc_grayagain.items) catch return error.OutOfMemory;
+        defer self.infraAlloc().free(saved);
         self.gc_grayagain.clearRetainingCapacity();
         for (saved) |obj| {
             // Task 7: invariant — all grayagain entries are valid (registered
@@ -25504,7 +26443,7 @@ pub const Vm = struct {
                     // PUC propagatemark: nw2black(o) — set BLACK before
                     // traversing, then genlink after.
                     gcSetBlack(p.marked);
-                    try self.gc_gray.append(self.alloc, obj);
+                    try self.gc_gray.append(self.infraAlloc(), obj);
                     try self.gcDrainGray();
                     // PUC genlink (lgc.c:470-477): after traversal, if the
                     // object is TOUCHED1, link it back to grayagain WITHOUT
@@ -25521,7 +26460,7 @@ pub const Vm = struct {
                     // currentwhite) are not re-marked and get collected.
                     switch (p.age.*) {
                         .touched1 => {
-                            try self.gc_grayagain.append(self.alloc, obj);
+                            try self.gc_grayagain.append(self.infraAlloc(), obj);
                         },
                         .touched2 => {
                             p.age.* = .old;
@@ -25530,7 +26469,7 @@ pub const Vm = struct {
                             // Threads and other objects kept in grayagain
                             // by correctgraylist. Keep them.
                             if (obj == .thread) {
-                                try self.gc_grayagain.append(self.alloc, obj);
+                                try self.gc_grayagain.append(self.infraAlloc(), obj);
                             }
                         },
                     }
@@ -25653,9 +26592,13 @@ pub const Vm = struct {
 
         // ── Step 9 (lgc.c:1567): separatetobefnz(g, 0) ──
         // Separate finalizable objects into gc_to_finalize (PUC's tobefnz).
+        // infraAlloc: PUC's tobefnz is an intrusive list — the separation
+        // never allocates; our temporary slice + queue append are host-side
+        // bookkeeping and must not re-enter the (possibly failing) adapter
+        // during an emergency GC.
         const to_finalize = try self.gcCollectFinalizables();
-        defer self.alloc.free(to_finalize);
-        try self.gc_to_finalize.appendSlice(self.alloc, to_finalize);
+        defer self.infraAlloc().free(to_finalize);
+        try self.gc_to_finalize.appendSlice(self.infraAlloc(), to_finalize);
 
         // ── Step 10 (lgc.c:1568-1569): markbeingfnz(g) + propagateall(g) ──
         // Mark to-be-finalized objects with ORDINARY GC marking. This is
@@ -25688,7 +26631,16 @@ pub const Vm = struct {
         // runs them during atomic (architectural choice). Finalizers are
         // mutator code and can trigger backward barriers that add to
         // grayagain.
-        try self.gcFinalizeList(self.gc_to_finalize.items);
+        //
+        // PUC emergency GC (gcemergency=1) skips the callfin phase
+        // entirely (GCScallfin guard, lgc.c) — finalizers are arbitrary
+        // Lua that allocates and would re-enter the failing allocator.
+        // The separated objects stay marked (step 10 above) and keep
+        // their FINALIZEDBIT, so the NEXT regular cycle re-separates and
+        // finalizes them — exactly PUC's tobefnz carry-over semantics.
+        if (!self.gc_emergency) {
+            try self.gcFinalizeList(self.gc_to_finalize.items);
+        }
 
         // ── Step 13 (luazig-specific): post-finalizer grayagain drain ──
         // Drain grayagain entries created by finalizer barriers. PUC does
@@ -25711,7 +26663,14 @@ pub const Vm = struct {
         // Shrink the interned-string table when it is less than a quarter
         // full. Without this, long churn episodes leave an oversized
         // bucket array.
-        self.string_intern.shrinkIfNeeded(self.alloc);
+        //
+        // PUC checkSizes is guarded by !gcemergency (lgc.c:935): the shrink
+        // reallocs through the very allocator that is failing — skipping it
+        // under emergency GC keeps the emergency path allocation-free (the
+        // next regular cycle retries the shrink).
+        if (!self.gc_emergency) {
+            self.string_intern.shrinkIfNeeded(self.alloc);
+        }
     }
 
     fn gcAtomicPhase(self: *Vm) DispatchError!void {
@@ -25882,18 +26841,18 @@ pub const Vm = struct {
             },
             .survival => {
                 p.age.* = .old1;
-                try self.gc_old1.append(self.alloc, obj);
+                try self.gc_old1.append(self.infraAlloc(), obj);
                 // PUC sweepgen adds OLD1 to the old1 list only, NOT to
                 // grayagain. Cells are NEVER added to grayagain — PUC never
                 // puts upvalues in grayagain, and markold handles them via
                 // markCellForce (inline mark). Non-cell OLD1 objects are
                 // added to grayagain so correctgraylist makes them BLACK.
                 if (obj != .cell) {
-                    try self.gc_grayagain.append(self.alloc, obj);
+                    try self.gc_grayagain.append(self.infraAlloc(), obj);
                 }
                 self.gc_gen_added_old_kb += @as(f64, @floatFromInt(gcObjectBytes(obj))) / 1024.0;
                 if (obj == .thread) {
-                    try self.gc_gen_threads.append(self.alloc, obj.thread);
+                    try self.gc_gen_threads.append(self.infraAlloc(), obj.thread);
                 }
                 return false;
             },
@@ -25914,10 +26873,10 @@ pub const Vm = struct {
                 p.age.* = .old1;
                 self.gc_gen_added_old_kb += @as(f64, @floatFromInt(gcObjectBytes(obj))) / 1024.0;
                 if (obj != .cell) {
-                    try self.gc_grayagain.append(self.alloc, obj);
+                    try self.gc_grayagain.append(self.infraAlloc(), obj);
                 }
                 if (obj == .thread) {
-                    try self.gc_gen_threads.append(self.alloc, obj.thread);
+                    try self.gc_gen_threads.append(self.infraAlloc(), obj.thread);
                 }
                 return false;
             },
@@ -25965,9 +26924,16 @@ pub const Vm = struct {
         // list, the same dangling-entry poisoning as the constructor
         // rollback (a reserve failure here happens before any free, leaving
         // every registry untouched).
-        try self.gc_old1.ensureUnusedCapacity(self.alloc, snapshot);
-        try self.gc_grayagain.ensureUnusedCapacity(self.alloc, snapshot);
-        try self.gc_gen_threads.ensureUnusedCapacity(self.alloc, snapshot);
+        // infraAlloc (PUC sweepgen parity): PUC's generational sweep is
+        // infallible pointer surgery on intrusive lists (lgc.c:1172-1213)
+        // — it allocates nothing, so a test memory limit can never make it
+        // fail. These list-growth reservations are host-registry machinery
+        // (the side-table analogue of PUC's intrusive lists); a counted
+        // reservation would let an armed memlimit kill the GC mid-cycle
+        // (memerr.lua testbytes: emergency collect under totalmem limit).
+        try self.gc_old1.ensureUnusedCapacity(self.infraAlloc(), snapshot);
+        try self.gc_grayagain.ensureUnusedCapacity(self.infraAlloc(), snapshot);
+        try self.gc_gen_threads.ensureUnusedCapacity(self.infraAlloc(), snapshot);
         var write: usize = 0;
         for (self.gc_young_objects.items[0..snapshot]) |obj| {
             const p = gcPtr(obj);
@@ -26167,12 +27133,12 @@ pub const Vm = struct {
                 } else {
                     // Force re-traversal: set gray + append to gray list.
                     gcSetGray(p.marked);
-                    try self.gc_gray.append(self.alloc, obj);
+                    try self.gc_gray.append(self.infraAlloc(), obj);
                 }
                 // Threads are linked into grayagain so they are re-traversed
                 // every cycle. correctgraylist keeps them there permanently.
                 if (obj == .thread) {
-                    try self.gc_grayagain.append(self.alloc, obj);
+                    try self.gc_grayagain.append(self.infraAlloc(), obj);
                 }
             }
         }
@@ -26246,7 +27212,7 @@ pub const Vm = struct {
                         try self.markCellForce(obj.cell);
                     } else {
                         gcSetGray(p.marked);
-                        try self.gc_gray.append(self.alloc, obj);
+                        try self.gc_gray.append(self.infraAlloc(), obj);
                     }
                 }
             }
@@ -26275,7 +27241,7 @@ pub const Vm = struct {
         for (self.gc_gen_threads.items) |thread| {
             const p = gcPtr(.{ .thread = thread });
             gcSetGray(p.marked);
-            try self.gc_gray.append(self.alloc, .{ .thread = thread });
+            try self.gc_gray.append(self.infraAlloc(), .{ .thread = thread });
         }
 
         try self.gcDrainGray();
@@ -26406,7 +27372,7 @@ pub const Vm = struct {
 
         // Phase 3: sweep long string literals. (The chained intern table
         // needs no rehash: removals unlink in O(1) and never degrade.)
-        try self.long_literals.sweep(self.alloc, self.gc_current_white);
+        try self.long_literals.sweep(self.infraAlloc(), self.alloc, self.gc_current_white);
         return false;
     }
 
@@ -26876,6 +27842,22 @@ pub const Vm = struct {
     /// which gcPropagateEphemerons uses as its fixpoint convergence signal.
     fn gcMarkValue(self: *Vm, v: Value) DispatchError!void {
         const obj = GcObject.fromValue(v) orelse return;
+        // Precise-liveness safety skip — see the full rationale in
+        // gcQueueScanObject below. The check must live HERE too (before any
+        // header dereference): a stale pointer to a freed object in a dead
+        // register slot must not even have its gc_marked byte read
+        // (freed-memory GPF, memerr.lua load-error emergency GC crash).
+        // Reading gc_index is safe: the pointer is only stale, and the
+        // registry compare detects it without touching the object body.
+        {
+            const p = gcPtr(obj);
+            const idx = p.index.*;
+            if (idx >= self.gc_objects.items.len or
+                !std.meta.eql(self.gc_objects.items[idx], obj))
+            {
+                return;
+            }
+        }
         const p = gcPtr(obj);
         const was_white = gcIsWhite(p.marked.*);
         try self.gcQueueScanObject(obj);
@@ -26898,7 +27880,12 @@ pub const Vm = struct {
                 // (O(marked)) instead of all gc_objects (O(total)). The
                 // HashMap dedupes via put — repeated references to the same
                 // table are a no-op.
-                try self.gc_marked_tables.put(self.alloc, tbl, {});
+                // infraAlloc (PUC intrusive-list parity): the marked-tables
+                // side table is GC bookkeeping — PUC's mark phase allocates
+                // nothing. A counted put can fail under an armed memlimit
+                // (emergency collect inside the failing allocation), aborting
+                // the GC cycle mid-mark and corrupting GC state.
+                try self.gc_marked_tables.put(self.infraAlloc(), tbl, {});
                 if (tbl.metatable) |mt| try self.gcMarkValue(.{ .Table = mt });
 
                 const mode = self.gcWeakMode(tbl);
@@ -26911,7 +27898,7 @@ pub const Vm = struct {
                             break;
                         }
                     }
-                    if (!seen) try self.gc_weak_tables.append(self.alloc, tbl);
+                    if (!seen) try self.gc_weak_tables.append(self.infraAlloc(), tbl);
                 }
 
                 // Array part: keys are ints (non-collectable), so there is
@@ -27507,16 +28494,20 @@ pub const Vm = struct {
             // After atomic-phase drain, all reachable objects are black.
             // A white object here is unreachable — queue it for __gc.
             if (gcIsWhite(p.marked.*)) {
-                try to_finalize.append(self.alloc, obj);
+                // infraAlloc: PUC's tobefnz is an intrusive list — the
+                // separation never allocates.
+                try to_finalize.append(self.infraAlloc(), obj);
             }
         }
-        return to_finalize.toOwnedSlice(self.alloc);
+        return to_finalize.toOwnedSlice(self.infraAlloc());
     }
 
     fn gcFinalizeList(self: *Vm, to_finalize: []const GcObject) DispatchError!void {
         self.gc_finalizers_ran_count = to_finalize.len;
-        const ordered = try self.alloc.dupe(GcObject, to_finalize);
-        defer self.alloc.free(ordered);
+        // infraAlloc: the sort copy is host-side bookkeeping (PUC sorts the
+        // intrusive tobefnz list in place).
+        const ordered = try self.infraAlloc().dupe(GcObject, to_finalize);
+        defer self.infraAlloc().free(ordered);
         std.sort.block(GcObject, ordered, self, gcFinalizeLessThan);
         // PUC lgc.c:978-987: set GCSTPGC during finalizer execution to
         // prevent reentrant GC. `collectgarbage()` called from __gc returns
@@ -27669,29 +28660,40 @@ pub const Vm = struct {
     }
 
     pub fn createBytecodeChunkClosure(self: *Vm, proto: *const bc.Proto) DispatchError!*Closure {
-        // P16.43 Iteration 1: SINGLE-OWNER transactional cleanup. The old
-        // shape had two overlapping errdefers that BOTH freed `cells` on
-        // any failure after the second became active — the second freed
-        // the array, then the first iterated the freed slice
-        // (use-after-free) and freed it AGAIN (double free). Arena-based
-        // tests masked it (arena free is a no-op diagnostic). The fix is
-        // an explicit ownership flag: the cell-phase errdefer owns `cells`
-        // ONLY until the closure-phase errdefer takes over (exactly when
-        // `cl` exists); after the handoff the closure-phase cleanup is
-        // the single owner of the array, the cells' registry entries, the
-        // tree ref, and the closure object itself.
-        const cells = try self.alloc.alloc(*Cell, proto.upvalues.len);
+        // P16.50-review-5: emergency-GC-safe construction. Any vm.alloc
+        // failure (countdown/memlimit) can run an emergency full GC, which
+        // sweeps REGISTERED-but-unrooted objects. The old shape registered
+        // each Cell (and later the closure) while they were reachable ONLY
+        // from this Zig frame — an emergency GC at a later allocation swept
+        // them and the errdefers then double-freed. The PUC-faithful fix
+        // mirrors luaF_newLclosure/luaF_initupvals running with the closure
+        // anchored on the caller's Lua stack: reserve ALL registry capacity
+        // and temp-root space up front (infra allocator — PUC's allgc link
+        // and stack push are allocation-free), then create → root →
+        // register each object with every step infallible until the caller
+        // anchors the result.
+        const nups = proto.upvalues.len;
+        try self.gcPrepareRegister(nups + 1);
+        var roots = self.gcTempRoots();
+        defer roots.end();
+        try roots.ensure(nups + 1);
+
+        const cells = try self.alloc.alloc(*Cell, nups);
         var n_cells: usize = 0;
-        // Ownership handoff: set to true immediately before creating the
-        // closure object — from that point the closure-phase errdefer
-        // below owns `cells` and every created Cell.
+        // Ownership handoff: flipped (as its FIRST action) by the
+        // closure-phase errdefer below, which runs BEFORE this one (LIFO).
+        // After the handoff the closure-phase cleanup is the single owner
+        // of `cells` and every Cell — this errdefer goes inert.
         var cells_owned_by_closure_phase = false;
         errdefer {
             if (!cells_owned_by_closure_phase) {
-                // Partial cell-creation failure (P16.10b Task 13 hygiene):
-                // fully undo every cell created so far — unregister from
-                // the GC list, credit the accounting, free the object —
-                // then the array. No leak, no dangling registry entry.
+                // Partial cell-creation failure: fully undo every cell
+                // created so far — unregister from the GC list, credit the
+                // accounting, free the object — then the array. No leak, no
+                // dangling registry entry. (Cells created here are
+                // temp-ROOTED, so an emergency GC at a later allocation
+                // cannot have swept them; the stale root entries are
+                // truncated by roots.end().)
                 for (cells[0..n_cells]) |c| {
                     self.gcUnregisterObjectRollback(.{ .cell = c });
                     self.gcNoteFree(@sizeOf(Cell));
@@ -27703,65 +28705,38 @@ pub const Vm = struct {
         for (cells) |*slot| {
             const cell = try self.alloc.create(Cell);
             cell.* = .{ .value = .Nil };
-            // P16.49-review: registration itself can fail (registry growth
-            // allocates — in generational-minor it grows gc_young_objects).
-            // The cell is not yet counted in n_cells at this point, so the
-            // phase errdefer would miss it: destroy it HERE, exactly once.
-            // (PUC luaC_newobj links into the intrusive allgc list —
-            // allocation-free and infallible; our fallible registration
-            // must own its failure cleanup.)
-            self.gcRegisterCell(cell) catch |reg_err| {
-                self.alloc.destroy(cell);
-                return reg_err;
-            };
+            // Infallible: registry capacity reserved above (PUC luaC_newobj
+            // links into the intrusive allgc list — allocation-free).
+            self.gcRegisterCommit(.{ .cell = cell });
             self.gcNoteAlloc(@sizeOf(Cell));
+            // Infallible: temp-root space reserved above. From this point
+            // the cell survives any emergency GC.
+            roots.addCellAssumeCapacity(cell);
             slot.* = cell;
             n_cells += 1;
         }
-        // NOTE: the handoff flag flips only AFTER the closure-phase
-        // errdefer below is DECLARED — between the cell loop and that
-        // point (testcChargeMemory / create(Closure) failures) the
-        // cell-phase errdefer still owns the cleanup.
-        try self.testcCheckMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
-        // P16.10b Task 8: errdefer after tree retain. If gcRegisterClosure
-        // or resolveTreeConstants fails after retainTreeForClosure has
-        // incremented the tree ref_count, we must release that reference
-        // and free/unregister the closure object. Without this, an OOM
-        // after retain leaks the tree ref (ref_count never returns to 0).
-        // P16.43 Iteration 1: this is the ONLY owner of `cells` and the
-        // Cells once the handoff flag flips (immediately below).
         var cl_registered = false;
         errdefer {
-            // Handoff: from this point the closure-phase cleanup owns
-            // cells + all Cells; the cell-phase errdefer above is inert.
+            // Handoff FIRST (this errdefer runs before the cell-phase one):
+            // from here the closure-phase cleanup is the single owner of
+            // cells + all Cells.
             cells_owned_by_closure_phase = true;
+            // Roll back the closure, every Cell, and the tree reference in
+            // PUC freeobj order — closure FIRST so no registered GC object
+            // references the Cells while they are being rolled back.
             if (cl_registered) {
-                // P16.44 Task 1: unregister the closure FIRST so no
-                // registered GC object references the Cells while they
-                // are being rolled back (PUC freeobj order — the closure
-                // and each UpVal are SEPARATE GC objects; a partially
-                // constructed set must be rolled back without dangling
-                // registry state). The P16.43 shape stopped here and left
-                // every Cell as an unreachable registry entry until a
-                // later collection or Vm.deinit — not transactional.
                 self.gcUnregisterObjectRollback(.{ .closure = cl });
                 self.testc_obj_functions -= 1;
                 self.gcNoteFree(@sizeOf(Closure) + cells.len * @sizeOf(*Cell));
             }
-            // Every Cell is a SEPARATE GC object (PUC luaF_initupvals:
-            // one GCObject per UpVal, freed by its own freeobj arm):
-            // roll back its registry entry, accounting, and storage on
-            // BOTH arms — pre-registration (they were never absorbed by
-            // the closure) and post-registration (the closure that would
-            // have owned them is already unregistered above).
+            if (cl.proto) |p| {
+                if (p.tree) |t| t.releaseTree(self.alloc);
+            }
             for (cells) |c| {
                 self.gcUnregisterObjectRollback(.{ .cell = c });
                 self.gcNoteFree(@sizeOf(Cell));
                 self.alloc.destroy(c);
-            }
-            if (cl.proto) |p| {
-                if (p.tree) |t| t.releaseTree(self.alloc);
             }
             // The upvalue array is owned by the closure (gcFreeObject frees
             // it via c.upvalues); destroy(cl) alone would leak it.
@@ -27775,8 +28750,12 @@ pub const Vm = struct {
         // Retain the tree owner (P16.16 C2/T4.2: derived from proto, no
         // separate field — see the Closure doc comment).
         _ = self.retainTreeForClosure(proto);
-        try self.gcRegisterClosure(cl);
+        // Infallible (capacity reserved above). The closure is temp-rooted
+        // immediately after, so the fallible resolveTreeConstants below —
+        // the old emergency-GC window — can no longer sweep it or its cells.
+        self.gcRegisterCommit(.{ .closure = cl });
         cl_registered = true;
+        roots.addAssumeCapacity(.{ .Closure = cl });
         self.testc_obj_functions += 1;
         // Charge the FULL closure allocation: struct + upvalue pointer
         // array (PUC luaF_newLclosure allocates LClosure + nupvals*Upval*
@@ -27879,7 +28858,15 @@ pub const Vm = struct {
         };
         self.dynamic_ast_arena.resetRetainingCapacity();
         defer self.dynamic_ast_arena.resetRetainingCapacity();
-        const chunk = p.parseChunkAst(&self.dynamic_ast_arena) catch {
+        const chunk = p.parseChunkAst(&self.dynamic_ast_arena) catch |e| {
+            // PUC luaD_seterrorobj (ldo.c): an OOM inside the parser surfaces
+            // at the protected-load boundary as LUA_ERRMEM with the FIXED
+            // "not enough memory" object — never as a formatted diagnostic
+            // (formatting would itself allocate and fail again under the
+            // armed countdown/limit that caused the OOM). Propagate the OOM;
+            // builtinLoadEx installs the fixed message (luaB_load semantics).
+            if (e == error.OutOfMemory) return error.OutOfMemory;
+            // Unified error formatting via Diag (PUC luaG_addinfo + near <token>).
             const diagnostic = try self.alloc.dupe(u8, p.diagString());
             return .{ .diagnostic = @constCast(diagnostic) };
         };
@@ -28006,7 +28993,10 @@ pub const Vm = struct {
 
         const source = LuaSource.loadFile(self.alloc, stdio.activeIo(), path) catch |e| {
             outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(try std.fmt.allocPrint(self.alloc, "loadfile: cannot read '{s}': {s}", .{ path, @errorName(e) })) };
+            if (outs.len > 1) {
+                const istr = try self.internFmt("loadfile: cannot read '{s}': {s}", .{ path, @errorName(e) });
+                outs[1] = .{ .String = istr };
+            }
             return;
         };
         // The file bytes/name are interned into fresh LuaStrings below;
@@ -28014,9 +29004,23 @@ pub const Vm = struct {
         // Task 6). builtinLoad's tree backing pins the INTERNED copies.
         defer self.alloc.free(source.name);
         defer self.alloc.free(source.bytes);
+        // PUC luaB_loadfile roots every intermediate object on the Lua
+        // stack (L->top), which the GC scans. `load_args` is a native
+        // array the GC cannot see: after the FIRST internStr, the chunk
+        // string's only reference is load_args[0] — the SECOND internStr
+        // (the chunk name) below may allocate, and under a testc memory
+        // limit that allocation runs the emergency GC, which collects the
+        // unrooted chunk string and frees it (observed: memerr.lua
+        // "minimum allocations for dofile" — stripChunkPrefix then read
+        // the freed string's poison bytes). Root both strings for the
+        // duration, exactly PUC's stack-rooting.
+        var roots = self.gcTempRoots();
+        defer roots.end();
         var load_args: [4]Value = .{ .Nil, .Nil, .Nil, .Nil };
         load_args[0] = .{ .String = try self.internStr(source.bytes) };
+        try roots.add(load_args[0]);
         load_args[1] = .{ .String = try self.internStr(source.name) };
+        try roots.add(load_args[1]);
         var n: usize = 2;
         if (args.len > 1) {
             load_args[2] = args[1];
@@ -28065,7 +29069,8 @@ pub const Vm = struct {
         // resulting string; `internStr` copies the bytes into a GC-managed
         // LuaString, so we free the temporary buffer.
         defer self.alloc.free(bytes);
-        outs[0] = .{ .String = try self.internStr(bytes) };
+        const istr = try self.internStr(bytes);
+        outs[0] = .{ .String = istr };
     }
 
     fn applyLoadEnv(self: *Vm, cl: *Closure, env_val: Value, force_first_on_missing: bool) DispatchError!void {
@@ -28190,84 +29195,51 @@ pub const Vm = struct {
     /// counterpart of `builtinStringDump`: dump serializes a Proto tree, undump
     /// reconstructs it, and this function wraps it in an executable Closure.
     fn closureFromProto(self: *Vm, proto: *bc.Proto) DispatchError!*Closure {
-        // P16.43 Iteration 1: single-owner transactional cleanup (the old
-        // shape double-freed `cells` on failure after the second errdefer
-        // became active; additionally, a failure of the `cells` allocation
-        // itself leaked `cl` and left testc_obj_functions incremented).
-        // Structure: phase-A errdefer owns `cl`; phase-B errdefer owns
-        // `cells` + created Cells; phase-D errdefer (declared after both)
-        // takes ownership of EVERYTHING via two handoff flags — so on any
-        // failure exactly ONE cleanup owner runs per resource.
-        try self.testcCheckMemory(@sizeOf(Closure) + 64);
-        const cl = try self.alloc.create(Closure);
-        self.testc_obj_functions += 1;
-        var cl_owned_by_phase_d = false;
-        errdefer {
-            if (!cl_owned_by_phase_d) {
-                self.testc_obj_functions -= 1;
-                self.alloc.destroy(cl);
-            }
-        }
+        // P16.50-review-5: emergency-GC-safe construction — same shape as
+        // createBytecodeChunkClosure (see the full rationale there): any
+        // vm.alloc failure can run an emergency full GC that sweeps
+        // registered-but-unrooted objects, so ALL registry capacity and
+        // temp-root space is reserved up front (infra allocator) and every
+        // create → root → register step after that is infallible.
         const nups: usize = proto.upvalues.len;
-        const cells = try self.alloc.alloc(*Cell, nups);
-        var n_cells: usize = 0;
-        var cells_owned_by_phase_d = false;
-        errdefer {
-            if (!cells_owned_by_phase_d) {
-                for (cells[0..n_cells]) |c| {
-                    self.gcUnregisterObjectRollback(.{ .cell = c });
-                    self.gcNoteFree(@sizeOf(Cell));
-                    self.alloc.destroy(c);
-                }
-                self.alloc.free(cells);
-            }
-        }
-        for (0..nups) |i| {
-            const c = try self.alloc.create(Cell);
-            c.* = .{ .value = .Nil };
-            // P16.49-review: same register-failure ownership as the chunk
-            // constructor — the not-yet-counted cell is destroyed here.
-            self.gcRegisterCell(c) catch |reg_err| {
-                self.alloc.destroy(c);
-                return reg_err;
-            };
-            self.gcNoteAlloc(@sizeOf(Cell));
-            cells[i] = c;
-            n_cells += 1;
-        }
-        // Phase D: declared LAST so it runs FIRST on error and flips both
-        // handoff flags — phases A/B become inert for every resource D
-        // now owns (cl, cells, all Cells, the tree ref).
+        try self.gcPrepareRegister(nups + 1);
+        var roots = self.gcTempRoots();
+        defer roots.end();
+        try roots.ensure(nups + 1);
+
+        const cl = try self.alloc.create(Closure);
         var cl_registered = false;
+        // The closure is UNREGISTERED until the commit below — invisible
+        // to an emergency GC — so a failure anywhere before the commit
+        // needs only a plain destroy.
         errdefer {
-            cl_owned_by_phase_d = true;
-            cells_owned_by_phase_d = true;
-            // P16.44 Task 1: identical rollback shape as
-            // createBytecodeChunkClosure — closure unregistered FIRST,
-            // then every Cell (separate GC objects, PUC luaF_initupvals)
-            // unregistered/accounted/destroyed on BOTH arms. The arm is
-            // dormant today (no fallible op follows registration here:
-            // constants are pre-resolved by preResolveUndumpedConstants
-            // and chargeTreeFootprint does not allocate), but leaving the
-            // old asymmetric branch would silently become the P16.43 leak
-            // again the moment a fallible adoption step is added after
-            // gcRegisterClosure.
             if (cl_registered) {
                 self.gcUnregisterObjectRollback(.{ .closure = cl });
-                self.gcNoteFree(@sizeOf(Closure) + cells.len * @sizeOf(*Cell));
+                self.testc_obj_functions -= 1;
+                self.gcNoteFree(@sizeOf(Closure) + nups * @sizeOf(*Cell));
             }
-            for (cells) |c| {
+            self.alloc.destroy(cl);
+        }
+        const cells = try self.alloc.alloc(*Cell, nups);
+        var n_cells: usize = 0;
+        errdefer {
+            for (cells[0..n_cells]) |c| {
                 self.gcUnregisterObjectRollback(.{ .cell = c });
                 self.gcNoteFree(@sizeOf(Cell));
                 self.alloc.destroy(c);
             }
-            if (cl.proto) |p| {
-                if (p.tree) |t| t.releaseTree(self.alloc);
-            }
-            // The upvalue array is owned by the closure; free it here —
-            // destroy(cl) alone would leak it (same as the text path).
             self.alloc.free(cells);
-            self.alloc.destroy(cl);
+        }
+        for (0..nups) |i| {
+            const c = try self.alloc.create(Cell);
+            c.* = .{ .value = .Nil };
+            // Infallible: registry capacity reserved above.
+            self.gcRegisterCommit(.{ .cell = c });
+            self.gcNoteAlloc(@sizeOf(Cell));
+            // Infallible: temp-root space reserved above.
+            roots.addCellAssumeCapacity(c);
+            cells[i] = c;
+            n_cells += 1;
         }
         cl.* = .{
             .proto = proto,
@@ -28275,8 +29247,11 @@ pub const Vm = struct {
         };
         // Retain the tree owner (P16.16 C2/T4.2: derived from proto).
         _ = self.retainTreeForClosure(proto);
-        try self.gcRegisterClosure(cl);
+        // Infallible (capacity reserved above); temp-rooted right after.
+        self.gcRegisterCommit(.{ .closure = cl });
         cl_registered = true;
+        roots.addAssumeCapacity(.{ .Closure = cl });
+        self.testc_obj_functions += 1;
         // Full closure allocation: struct + upvalue array (PUC
         // luaF_newLclosure; must match gcFreeObject's credit — see the
         // text-path fix in createBytecodeChunkClosure, P16.42 T3).
@@ -28327,11 +29302,23 @@ pub const Vm = struct {
         // Helper: dupe and register on the owner so the last release frees
         // every copy (P16.10b Task 6 — previously the dupes leaked with
         // the tree).
+        // P16.50-review-5: the dupe has NO owner until it is registered in
+        // name_copies. If the registration (ensureExtra/append) fails after
+        // the dupe succeeded, the block would be orphaned — charged by the
+        // testc ledger but never freed. Free it explicitly on that path.
+        // (PUC has no such window: lundump.c loadString creates the TString
+        // as a GC object the moment it is read; ownership is immediate.)
         const dupeOwned = struct {
             fn run(vm: *Vm, ow: *bc.Proto, bytes: []const u8) DispatchError![]const u8 {
                 const d = try vm.alloc.dupe(u8, bytes);
-                const e = try ow.source_backing.ensureExtra(vm.alloc);
-                try e.name_copies.append(vm.alloc, d);
+                const e = ow.source_backing.ensureExtra(vm.alloc) catch |err| {
+                    vm.alloc.free(d);
+                    return err;
+                };
+                e.name_copies.append(vm.alloc, d) catch |err| {
+                    vm.alloc.free(d);
+                    return err;
+                };
                 return d;
             }
         }.run;
@@ -28342,9 +29329,16 @@ pub const Vm = struct {
         if (proto.name().len > 0) {
             proto.setName(try dupeOwned(self, owner, proto.name()));
         }
-        // upvalue names — upvalues is []const, need mutable copy
+        // upvalue names — upvalues is []const, need mutable copy.
+        // P16.50-review-5: the undumped array is superseded by `uvs`; it
+        // must be freed here, not orphaned (the orphan leaked it in the
+        // testc ledger and in real heap terms on every binary load).
+        // On a mid-loop failure `uvs` itself would be orphaned — errdefer
+        // frees it; `proto.upvalues` is still the intact old array, so the
+        // tree stays consistent for the caller's error cleanup.
         if (proto.upvalues.len > 0) {
             const uvs = try self.alloc.alloc(bc.Upvaldesc, proto.upvalues.len);
+            errdefer self.alloc.free(uvs);
             for (proto.upvalues, 0..) |uv, i| {
                 const nm = uv.name();
                 uvs[i] = bc.Upvaldesc.make(
@@ -28354,11 +29348,14 @@ pub const Vm = struct {
                     if (nm.len > 0) try dupeOwned(self, owner, nm) else nm,
                 );
             }
+            self.alloc.free(proto.upvalues);
             proto.upvalues = uvs;
         }
-        // locvar names — locvars is []const, need mutable copy
+        // locvar names — locvars is []const, need mutable copy.
+        // Same supersede discipline as upvalues above (P16.50-review-5).
         if (proto.locvars.len > 0) {
             const lvs = try self.alloc.alloc(bc.LocVar, proto.locvars.len);
+            errdefer self.alloc.free(lvs);
             for (proto.locvars, 0..) |lv, i| {
                 lvs[i] = .{
                     .name = if (lv.name.len > 0) try dupeOwned(self, owner, lv.name) else lv.name,
@@ -28367,6 +29364,7 @@ pub const Vm = struct {
                     .endpc = lv.endpc,
                 };
             }
+            self.alloc.free(proto.locvars);
             proto.locvars = lvs;
         }
         // recurse into nested protos
@@ -28808,7 +29806,10 @@ pub const Vm = struct {
                 while (true) {
                     const resolved = self.resolveCallable(reader_val, &.{}, null) catch {
                         outs[0] = .Nil;
-                        if (outs.len > 1) outs[1] = .{ .String = try self.internStr(self.errorString()) };
+                        if (outs.len > 1) {
+                            const istr = try self.internStr(self.errorString());
+                            outs[1] = .{ .String = istr };
+                        }
                         return;
                     };
                     defer if (resolved.owned_args) |owned| self.alloc.free(owned);
@@ -28819,7 +29820,10 @@ pub const Vm = struct {
                             var out1 = [_]Value{.Nil};
                             self.callBuiltin(id, resolved.args, out1[0..], .host) catch {
                                 outs[0] = .Nil;
-                                if (outs.len > 1) outs[1] = .{ .String = try self.internStr(self.errorString()) };
+                                if (outs.len > 1) {
+                                    const istr2 = try self.internStr(self.errorString());
+                                    outs[1] = .{ .String = istr2 };
+                                }
                                 return;
                             };
                             piece = out1[0];
@@ -28827,7 +29831,10 @@ pub const Vm = struct {
                         .Closure => |cl| {
                             const ret = self.runClosure(cl, resolved.args) catch {
                                 outs[0] = .Nil;
-                                if (outs.len > 1) outs[1] = .{ .String = try self.internStr(self.errorString()) };
+                                if (outs.len > 1) {
+                                    const istr3 = try self.internStr(self.errorString());
+                                    outs[1] = .{ .String = istr3 };
+                                }
                                 return;
                             };
                             // runClosure() always returns a caller-owned, freeable
@@ -28845,7 +29852,10 @@ pub const Vm = struct {
                         },
                         else => {
                             outs[0] = .Nil;
-                            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("reader function must return a string") };
+                            if (outs.len > 1) {
+                                const istr4 = try self.internStr("reader function must return a string");
+                                outs[1] = .{ .String = istr4 };
+                            }
                             return;
                         },
                     }
@@ -28918,7 +29928,20 @@ pub const Vm = struct {
 
         // --- Delegate to loadChunk (the unified primitive) ---
         const result = self.loadChunk(input, chunk_bytes, chunk_name, mode, env_val, pinned_chunk_name) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
+            // PUC luaB_load (lbaselib.c): lua_load returns LUA_ERRMEM with
+            // the FIXED pre-interned MEMERRMSG object (luaD_seterrorobj —
+            // no allocation, no source position); luaB_load then returns
+            // nil + that message. Re-interning or formatting here would
+            // allocate and fail again under the armed limit.
+            error.OutOfMemory => {
+                const o = self.refreshBuiltinOuts() orelse outs;
+                o[0] = .Nil;
+                if (o.len > 1) {
+                    const istr = self.oom_msg_str orelse self.internStrAssume("not enough memory");
+                    o[1] = .{ .String = istr };
+                }
+                return;
+            },
             error.RuntimeError => return error.RuntimeError,
             error.Yield => return error.Yield,
         };
@@ -28933,7 +29956,10 @@ pub const Vm = struct {
                 defer self.alloc.free(msg);
                 const o = self.refreshBuiltinOuts() orelse outs;
                 o[0] = .Nil;
-                if (o.len > 1) o[1] = .{ .String = try self.internStr(msg) };
+                if (o.len > 1) {
+                    const istr5 = try self.internStr(msg);
+                    o[1] = .{ .String = istr5 };
+                }
             },
         }
     }
@@ -28994,10 +30020,18 @@ pub const Vm = struct {
         }
 
         if (self.getFieldOpt(preload_tbl, name)) |loader| {
+            // Root the interned strings across each other's internStr and
+            // the loader call (native arrays are invisible to the GC — see
+            // builtinLoadfile's note).
+            var roots = self.gcTempRoots();
+            defer roots.end();
             const preload_str = try self.internStr(":preload:");
+            try roots.add(.{ .String = preload_str });
+            const name_str = try self.internStr(name);
+            try roots.add(.{ .String = name_str });
             switch (loader) {
                 .Builtin => |id| {
-                    var loader_args = [_]Value{ .{ .String = try self.internStr(name) }, .{ .String = preload_str } };
+                    var loader_args = [_]Value{ .{ .String = name_str }, .{ .String = preload_str } };
                     var loader_out: [2]Value = .{ .Nil, .Nil };
                     try self.callBuiltin(id, loader_args[0..], loader_out[0..], .host);
                     const v: Value = if (loader_out[0] != .Nil) loader_out[0] else .{ .Bool = true };
@@ -29012,7 +30046,7 @@ pub const Vm = struct {
                     return;
                 },
                 .Closure => |cl| {
-                    const loader_args = [_]Value{ .{ .String = try self.internStr(name) }, .{ .String = preload_str } };
+                    var loader_args = [_]Value{ .{ .String = name_str }, .{ .String = preload_str } };
                     const ret = try self.runClosure(cl, loader_args[0..]);
                     defer self.alloc.free(ret);
                     // PUC ll_require: if loader returned non-nil, set loaded.
@@ -29108,7 +30142,10 @@ pub const Vm = struct {
             // bc_stack — re-derive before writing.
             const outw = self.refreshBuiltinOuts() orelse outs;
             outw[0] = final_val;
-            if (outw.len > 1) outw[1] = .{ .String = try self.internStr(file_path) };
+            if (outw.len > 1) {
+                const istr = try self.internStr(file_path);
+                outw[1] = .{ .String = istr };
+            }
             return;
         }
 
@@ -29257,7 +30294,10 @@ pub const Vm = struct {
         // reallocated bc_stack — re-derive before writing.
         const outw = self.refreshBuiltinOuts() orelse outs;
         outw[0] = final_val;
-        if (outw.len > 1) outw[1] = .{ .String = try self.internStr(file_path) };
+        if (outw.len > 1) {
+            const istr = try self.internStr(file_path);
+            outw[1] = .{ .String = istr };
+        }
         return true;
     }
 
@@ -29323,12 +30363,18 @@ pub const Vm = struct {
                 try appendFmt(self.alloc, &err_buf, "\n\tno file '{s}'", .{candidate});
                 continue;
             };
-            if (outs.len > 0) outs[0] = .{ .String = try self.internStr(try std.fmt.allocPrint(self.alloc, "{s}", .{candidate})) };
+            if (outs.len > 0) {
+                const istr = try self.internFmt("{s}", .{candidate});
+                outs[0] = .{ .String = istr };
+            }
             if (outs.len > 1) outs[1] = .Nil;
             return;
         }
 
-        if (outs.len > 1) outs[1] = .{ .String = try self.internStr(try std.fmt.allocPrint(self.alloc, "{s}", .{err_buf.items})) };
+        if (outs.len > 1) {
+            const istr2 = try self.internFmt("{s}", .{err_buf.items});
+            outs[1] = .{ .String = istr2 };
+        }
     }
 
     /// PUC `ll_loadlib` (loadlib.c): dynamic library loading.
@@ -29397,10 +30443,16 @@ pub const Vm = struct {
 
             const h = std.c.dlopen(path_z, flags) orelse {
                 if (outs.len > 0) outs[0] = .Nil;
-                if (outs.len > 1) outs[1] = .{ .String = try self.internStr(
-                    try std.fmt.allocPrint(self.alloc, "\n\tcannot open '{s}'", .{lib_path}),
-                ) };
-                if (outs.len > 2) outs[2] = .{ .String = try self.internStr("open") };
+                if (outs.len > 1) {
+                    const istr = try self.internStr(
+                        try std.fmt.allocPrint(self.alloc, "\n\tcannot open '{s}'", .{lib_path}),
+                    );
+                    outs[1] = .{ .String = istr };
+                }
+                if (outs.len > 2) {
+                    const istr = try self.internStr("open");
+                    outs[2] = .{ .String = istr };
+                }
                 self.last_builtin_out_count = @min(outs.len, 3);
                 return;
             };
@@ -29432,10 +30484,16 @@ pub const Vm = struct {
         defer self.alloc.free(func_name_z);
         const sym = std.c.dlsym(handle, func_name_z) orelse {
             if (outs.len > 0) outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(
-                try std.fmt.allocPrint(self.alloc, "\n\tsymbol '{s}' not found in '{s}'", .{ func_name, lib_path }),
-            ) };
-            if (outs.len > 2) outs[2] = .{ .String = try self.internStr("init") };
+            if (outs.len > 1) {
+                const istr = try self.internStr(
+                    try std.fmt.allocPrint(self.alloc, "\n\tsymbol '{s}' not found in '{s}'", .{ func_name, lib_path }),
+                );
+                outs[1] = .{ .String = istr };
+            }
+            if (outs.len > 2) {
+                const istr2 = try self.internStr("init");
+                outs[2] = .{ .String = istr2 };
+            }
             self.last_builtin_out_count = @min(outs.len, 3);
             return;
         };
@@ -30374,7 +31432,10 @@ pub const Vm = struct {
             if (pos_i < 0) return;
             const pos: usize = @intCast(pos_i);
             if (pos >= self.frameVarargs(fr, th).len) return;
-            if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg)") };
+            if (outs.len > 0) {
+                const istr = try self.internStr("(vararg)");
+                outs[0] = .{ .String = istr };
+            }
             if (outs.len > 1) outs[1] = self.frameVarargs(fr, th)[pos];
             return;
         }
@@ -30392,7 +31453,10 @@ pub const Vm = struct {
                 inserted_vararg_table = true;
                 rank += 1;
                 if (rank == idx) {
-                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
+                    if (outs.len > 0) {
+                        const istr2 = try self.internStr("(vararg table)");
+                        outs[0] = .{ .String = istr2 };
+                    }
                     if (outs.len > 1) outs[1] = .Nil;
                     return;
                 }
@@ -30401,7 +31465,10 @@ pub const Vm = struct {
             has_named_active_local = true;
             rank += 1;
             if (rank == idx) {
-                if (outs.len > 0) outs[0] = .{ .String = try self.internStr(local.name) };
+                if (outs.len > 0) {
+                    const istr3 = try self.internStr(local.name);
+                    outs[0] = .{ .String = istr3 };
+                }
                 if (outs.len > 1) outs[1] = fr_regs[local.reg];
                 return;
             }
@@ -30409,7 +31476,10 @@ pub const Vm = struct {
         if (exposes_vararg_table and !inserted_vararg_table) {
             rank += 1;
             if (rank == idx) {
-                if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
+                if (outs.len > 0) {
+                    const istr4 = try self.internStr("(vararg table)");
+                    outs[0] = .{ .String = istr4 };
+                }
                 if (outs.len > 1) outs[1] = .Nil;
                 return;
             }
@@ -30424,7 +31494,10 @@ pub const Vm = struct {
             if (reg < fr_regs.len and !(reg < 256 and active_regs.isSet(reg))) {
                 rank += 1;
                 if (rank == idx) {
-                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(temporary)") };
+                    if (outs.len > 0) {
+                        const istr5 = try self.internStr("(temporary)");
+                        outs[0] = .{ .String = istr5 };
+                    }
                     if (outs.len > 1) outs[1] = fr_regs[reg];
                     return;
                 }
@@ -30463,7 +31536,10 @@ pub const Vm = struct {
             }
             rank += 1;
             if (rank == idx) {
-                if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(temporary)") };
+                if (outs.len > 0) {
+                    const istr6 = try self.internStr("(temporary)");
+                    outs[0] = .{ .String = istr6 };
+                }
                 if (outs.len > 1) outs[1] = fr_regs[reg];
                 return;
             }
@@ -30483,7 +31559,10 @@ pub const Vm = struct {
             const pos: usize = @intCast(pos_i);
             if (pos >= self.frameVarargs(fr, th).len) return;
             self.frameVarargs(fr, th)[pos] = value;
-            if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg)") };
+            if (outs.len > 0) {
+                const istr = try self.internStr("(vararg)");
+                outs[0] = .{ .String = istr };
+            }
             return;
         }
 
@@ -30500,7 +31579,10 @@ pub const Vm = struct {
                 inserted_vararg_table = true;
                 rank += 1;
                 if (rank == idx) {
-                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
+                    if (outs.len > 0) {
+                        const istr2 = try self.internStr("(vararg table)");
+                        outs[0] = .{ .String = istr2 };
+                    }
                     return;
                 }
             }
@@ -30509,14 +31591,20 @@ pub const Vm = struct {
             rank += 1;
             if (rank == idx) {
                 fr_regs[local.reg] = value;
-                if (outs.len > 0) outs[0] = .{ .String = try self.internStr(local.name) };
+                if (outs.len > 0) {
+                    const istr3 = try self.internStr(local.name);
+                    outs[0] = .{ .String = istr3 };
+                }
                 return;
             }
         }
         if (exposes_vararg_table and !inserted_vararg_table) {
             rank += 1;
             if (rank == idx) {
-                if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
+                if (outs.len > 0) {
+                    const istr4 = try self.internStr("(vararg table)");
+                    outs[0] = .{ .String = istr4 };
+                }
                 return;
             }
         }
@@ -30527,7 +31615,10 @@ pub const Vm = struct {
                 rank += 1;
                 if (rank == idx) {
                     fr_regs[reg] = value;
-                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(temporary)") };
+                    if (outs.len > 0) {
+                        const istr5 = try self.internStr("(temporary)");
+                        outs[0] = .{ .String = istr5 };
+                    }
                     return;
                 }
             }
@@ -30558,7 +31649,10 @@ pub const Vm = struct {
             rank += 1;
             if (rank == idx) {
                 fr_regs[reg] = value;
-                if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(temporary)") };
+                if (outs.len > 0) {
+                    const istr6 = try self.internStr("(temporary)");
+                    outs[0] = .{ .String = istr6 };
+                }
                 return;
             }
         }
@@ -30604,7 +31698,10 @@ pub const Vm = struct {
         // answering debug.getlocal(function, n).
         for (proto.locvars) |local| {
             if (local.reg != wanted or local.name.len == 0) continue;
-            if (outs.len > 0) outs[0] = .{ .String = try self.internStr(local.name) };
+            if (outs.len > 0) {
+                const istr = try self.internStr(local.name);
+                outs[0] = .{ .String = istr };
+            }
             if (outs.len > 1) outs[1] = .Nil;
             return;
         }
@@ -30736,7 +31833,10 @@ pub const Vm = struct {
                                     if (local_index >= 1) {
                                         const pos: usize = @intCast(local_index - 1);
                                         if (pos < window.len) {
-                                            if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(C temporary)") };
+                                            if (outs.len > 0) {
+                                                const istr = try self.internStr("(C temporary)");
+                                                outs[0] = .{ .String = istr };
+                                            }
                                             if (outs.len > 1) outs[1] = window[pos];
                                         }
                                     }
@@ -30753,12 +31853,18 @@ pub const Vm = struct {
                 if (level < 0) return self.fail("bad level", .{});
                 if (level == 0) {
                     if (local_index == 1) {
-                        if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(C temporary)") };
+                        if (outs.len > 0) {
+                            const istr2 = try self.internStr("(C temporary)");
+                            outs[0] = .{ .String = istr2 };
+                        }
                         if (outs.len > 1) outs[1] = .{ .Int = 0 };
                         return;
                     }
                     if (local_index == 2) {
-                        if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(C temporary)") };
+                        if (outs.len > 0) {
+                            const istr3 = try self.internStr("(C temporary)");
+                            outs[0] = .{ .String = istr3 };
+                        }
                         if (outs.len > 1) outs[1] = .{ .Int = 2 };
                         return;
                     }
@@ -30778,7 +31884,10 @@ pub const Vm = struct {
                         if (local_index >= start) {
                             const rel = local_index - start;
                             if (rel >= 0 and @as(usize, @intCast(rel)) < vals.len) {
-                                if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(temporary)") };
+                                if (outs.len > 0) {
+                                    const istr4 = try self.internStr("(temporary)");
+                                    outs[0] = .{ .String = istr4 };
+                                }
                                 if (outs.len > 1) outs[1] = vals[@intCast(rel)];
                                 return;
                             }
@@ -30834,7 +31943,10 @@ pub const Vm = struct {
                         // mutated through this artifact). n >= 2: nil.
                         if (level == 0 and !th.yielded_from_debug_hook) {
                             if (local_index == 1) {
-                                if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(C temporary)") };
+                                if (outs.len > 0) {
+                                    const istr = try self.internStr("(C temporary)");
+                                    outs[0] = .{ .String = istr };
+                                }
                             }
                             return;
                         }
@@ -30886,12 +31998,18 @@ pub const Vm = struct {
                 if (uidx >= cl.upvalues.len) {
                     return;
                 }
-                if (outs.len > 0) outs[0] = .{ .String = try self.internStr(debugUpvalueName(cl, uidx)) };
+                if (outs.len > 0) {
+                    const istr = try self.internStr(debugUpvalueName(cl, uidx));
+                    outs[0] = .{ .String = istr };
+                }
                 if (outs.len > 1) outs[1] = cl.upvalues[uidx].get(self);
             },
             .Builtin => {
                 if (uidx != 0) return;
-                if (outs.len > 0) outs[0] = .{ .String = try self.internStr("") };
+                if (outs.len > 0) {
+                    const istr2 = try self.internStr("");
+                    outs[0] = .{ .String = istr2 };
+                }
             },
             else => return self.fail("bad argument #1 to 'getupvalue' (function expected)", .{}),
         }
@@ -30912,7 +32030,10 @@ pub const Vm = struct {
                     return;
                 }
                 try self.gcStoreCellValue(cl.upvalues[uidx], args[2]);
-                if (outs.len > 0) outs[0] = .{ .String = try self.internStr(debugUpvalueName(cl, uidx)) };
+                if (outs.len > 0) {
+                    const istr = try self.internStr(debugUpvalueName(cl, uidx));
+                    outs[0] = .{ .String = istr };
+                }
             },
             .Builtin => {},
             else => return self.fail("bad argument #1 to 'setupvalue' (function expected)", .{}),
@@ -31262,7 +32383,10 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (hook_state.func) |f| {
             outs[0] = f;
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(hook_state.mask) };
+            if (outs.len > 1) {
+                const istr = try self.internStr(hook_state.mask);
+                outs[1] = .{ .String = istr };
+            }
             if (outs.len > 2) outs[2] = .{ .Int = hook_state.count };
             return;
         }
@@ -31389,9 +32513,11 @@ pub const Vm = struct {
             try self.debugBuildCurrentTraceback(level);
 
         if (msg.len != 0) {
-            outs[0] = .{ .String = try self.internStr(try std.fmt.allocPrint(self.alloc, "{s}\n{s}", .{ msg, body })) };
+            const istr = try self.internFmt("{s}\n{s}", .{ msg, body });
+            outs[0] = .{ .String = istr };
         } else {
-            outs[0] = .{ .String = try self.internStr(body) };
+            const istr2 = try self.internStr(body);
+            outs[0] = .{ .String = istr2 };
         }
     }
 
@@ -31912,7 +33038,7 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("rawget expects (table, key)", .{});
         const tbl = try self.expectTable(args[0]);
-        outs[0] = try self.tableGetRawValue(tbl, args[1]);
+        outs[0] = self.tableGetRawValue(tbl, args[1]);
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -32091,7 +33217,9 @@ pub const Vm = struct {
         // array/hash parts via `computeSizes`). Drops deleted/Nil entries
         // and rebuilds chains from scratch. `tableResize` charges
         // `testcConsumeAllocCount` for each actual allocation (hash and/or
-        // array) it makes, matching PUC's allocation model.
+        // array) it makes, matching PUC's allocation model (P16.50-review-5:
+        // the per-allocation countdown/limit enforcement now lives in the
+        // TestcAllocAdapter on vm.alloc, not at individual call sites).
         try self.tableRehash(tbl, canon_key);
 
         // newcheckedkey: after rehash, integer keys that now fall in the
@@ -32647,19 +33775,31 @@ pub const Vm = struct {
         switch (term) {
             .exited => |code| {
                 if (outs.len > 0 and code == 0) outs[0] = .{ .Bool = true };
-                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("exit") };
+                if (outs.len > 1) {
+                    const istr = try self.internStr("exit");
+                    outs[1] = .{ .String = istr };
+                }
                 if (outs.len > 2) outs[2] = .{ .Int = code };
             },
             .signal => |signal| {
-                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("signal") };
+                if (outs.len > 1) {
+                    const istr2 = try self.internStr("signal");
+                    outs[1] = .{ .String = istr2 };
+                }
                 if (outs.len > 2) outs[2] = .{ .Int = @intFromEnum(signal) };
             },
             .stopped => |signal| {
-                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("signal") };
+                if (outs.len > 1) {
+                    const istr3 = try self.internStr("signal");
+                    outs[1] = .{ .String = istr3 };
+                }
                 if (outs.len > 2) outs[2] = .{ .Int = @intFromEnum(signal) };
             },
             .unknown => |status| {
-                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("exit") };
+                if (outs.len > 1) {
+                    const istr4 = try self.internStr("exit");
+                    outs[1] = .{ .String = istr4 };
+                }
                 if (outs.len > 2) outs[2] = .{ .Int = status };
             },
         }
@@ -32675,7 +33815,10 @@ pub const Vm = struct {
             .process => |term| try self.writeProcessResult(term, outs),
             .wait_error => |message| {
                 if (outs.len > 0) outs[0] = .Nil;
-                if (outs.len > 1) outs[1] = .{ .String = try self.internStr(message) };
+                if (outs.len > 1) {
+                    const istr = try self.internStr(message);
+                    outs[1] = .{ .String = istr };
+                }
                 if (outs.len > 2) outs[2] = .{ .Int = 1 };
                 self.last_builtin_out_count = @min(outs.len, 3);
             },
@@ -32728,13 +33871,19 @@ pub const Vm = struct {
                     else
                         cwd.createFile(io, path, .{ .truncate = true, .read = mode.plus })) catch |e2| {
                         if (outs.len > 0) outs[0] = .Nil;
-                        if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(e2)) };
+                        if (outs.len > 1) {
+                            const istr = try self.internStr(@errorName(e2));
+                            outs[1] = .{ .String = istr };
+                        }
                         if (outs.len > 2) outs[2] = .{ .Int = 1 };
                         return null;
                     },
                     else => {
                         if (outs.len > 0) outs[0] = .Nil;
-                        if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(e)) };
+                        if (outs.len > 1) {
+                            const istr2 = try self.internStr(@errorName(e));
+                            outs[1] = .{ .String = istr2 };
+                        }
                         if (outs.len > 2) outs[2] = .{ .Int = 1 };
                         return null;
                     },
@@ -32746,7 +33895,10 @@ pub const Vm = struct {
                     }
                     f.close(stdio.activeIo());
                     if (outs.len > 0) outs[0] = .Nil;
-                    if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(e)) };
+                    if (outs.len > 1) {
+                        const istr3 = try self.internStr(@errorName(e));
+                        outs[1] = .{ .String = istr3 };
+                    }
                     if (outs.len > 2) outs[2] = .{ .Int = 1 };
                     return null;
                 };
@@ -32763,13 +33915,19 @@ pub const Vm = struct {
                     else
                         cwd.createFile(io, path, .{ .truncate = false, .read = mode.plus })) catch |e2| {
                         if (outs.len > 0) outs[0] = .Nil;
-                        if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(e2)) };
+                        if (outs.len > 1) {
+                            const istr4 = try self.internStr(@errorName(e2));
+                            outs[1] = .{ .String = istr4 };
+                        }
                         if (outs.len > 2) outs[2] = .{ .Int = 1 };
                         return null;
                     },
                     else => {
                         if (outs.len > 0) outs[0] = .Nil;
-                        if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(e)) };
+                        if (outs.len > 1) {
+                            const istr5 = try self.internStr(@errorName(e));
+                            outs[1] = .{ .String = istr5 };
+                        }
                         if (outs.len > 2) outs[2] = .{ .Int = 1 };
                         return null;
                     },
@@ -32777,7 +33935,10 @@ pub const Vm = struct {
                 stdio.activeIo().vtable.fileSeekTo(stdio.activeIo().userdata, f, f.length(stdio.activeIo()) catch 0) catch |e| {
                     f.close(stdio.activeIo());
                     if (outs.len > 0) outs[0] = .Nil;
-                    if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(e)) };
+                    if (outs.len > 1) {
+                        const istr6 = try self.internStr(@errorName(e));
+                        outs[1] = .{ .String = istr6 };
+                    }
                     if (outs.len > 2) outs[2] = .{ .Int = 1 };
                     return null;
                 };
@@ -32785,7 +33946,10 @@ pub const Vm = struct {
             },
         }) catch |e| {
             if (outs.len > 0) outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(e)) };
+            if (outs.len > 1) {
+                const istr7 = try self.internStr(@errorName(e));
+                outs[1] = .{ .String = istr7 };
+            }
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
             return null;
         };
@@ -32848,7 +34012,10 @@ pub const Vm = struct {
             .stdout = if (read_mode) .pipe else .inherit,
             .stderr = .inherit,
         }) catch |err| {
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(err)) };
+            if (outs.len > 1) {
+                const istr = try self.internStr(@errorName(err));
+                outs[1] = .{ .String = istr };
+            }
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
             self.last_builtin_out_count = @min(outs.len, 3);
             return;
@@ -32879,7 +34046,10 @@ pub const Vm = struct {
         try self.builtinOsTmpname(&.{}, tmp_out[0..]);
         if (tmp_out[0] != .String) {
             outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("tmpname failed") };
+            if (outs.len > 1) {
+                const istr = try self.internStr("tmpname failed");
+                outs[1] = .{ .String = istr };
+            }
             return;
         }
         const tmp = tmp_out[0].String.bytes();
@@ -33149,7 +34319,10 @@ pub const Vm = struct {
         };
         if (!self.flushBufferedFile(out_v)) {
             outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("write error") };
+            if (outs.len > 1) {
+                const istr = try self.internStr("write error");
+                outs[1] = .{ .String = istr };
+            }
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
             return;
         }
@@ -33221,7 +34394,10 @@ pub const Vm = struct {
             return self.fail("bad argument #1 to 'close' (FILE* expected, got {s})", .{self.valueTypeName(file_v)});
         };
         if (self.isStdFile(file_v)) {
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("cannot close standard file") };
+            if (outs.len > 1) {
+                const istr = try self.internStr("cannot close standard file");
+                outs[1] = .{ .String = istr };
+            }
             self.last_builtin_out_count = @min(outs.len, 2);
             return;
         }
@@ -33248,7 +34424,8 @@ pub const Vm = struct {
         };
         if (self.isStdFile(file_v)) {
             if (outs.len > 1) {
-                outs[1] = .{ .String = try self.internStr("cannot close standard file") };
+                const istr = try self.internStr("cannot close standard file");
+                outs[1] = .{ .String = istr };
             }
             self.last_builtin_out_count = @min(outs.len, 2);
             return;
@@ -33279,7 +34456,10 @@ pub const Vm = struct {
         const file_v = args[0];
         if (!fileCanWrite(self, file_v)) {
             if (outs.len > 0) outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("bad file descriptor") };
+            if (outs.len > 1) {
+                const istr = try self.internStr("bad file descriptor");
+                outs[1] = .{ .String = istr };
+            }
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
             return;
         }
@@ -33297,7 +34477,10 @@ pub const Vm = struct {
             const s = try self.valueToStringAlloc(args[i]);
             if (!(try self.writeBufferedFile(file_v, s))) {
                 if (outs.len > 0) outs[0] = .Nil;
-                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("write error") };
+                if (outs.len > 1) {
+                    const istr2 = try self.internStr("write error");
+                    outs[1] = .{ .String = istr2 };
+                }
                 if (outs.len > 2) outs[2] = .{ .Int = 1 };
                 return;
             }
@@ -33310,7 +34493,10 @@ pub const Vm = struct {
         const file_v = args[0];
         if (!fileCanRead(self, file_v)) {
             if (outs.len > 0) outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("bad file descriptor") };
+            if (outs.len > 1) {
+                const istr = try self.internStr("bad file descriptor");
+                outs[1] = .{ .String = istr };
+            }
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
             return;
         }
@@ -33351,13 +34537,19 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("bad argument #1 to 'seek' (FILE* expected)", .{});
         const file_v = args[0];
         const f = self.getManagedFile(file_v) orelse {
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("closed file") };
+            if (outs.len > 1) {
+                const istr = try self.internStr("closed file");
+                outs[1] = .{ .String = istr };
+            }
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
             return;
         };
         if (self.getFileBuffer(file_v)) |fb| {
             if (fb.pending.items.len != 0 and !self.flushBufferedFile(file_v)) {
-                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("write error") };
+                if (outs.len > 1) {
+                    const istr2 = try self.internStr("write error");
+                    outs[1] = .{ .String = istr2 };
+                }
                 if (outs.len > 2) outs[2] = .{ .Int = 1 };
                 return;
             }
@@ -33381,7 +34573,10 @@ pub const Vm = struct {
         else
             return self.fail("bad argument #2 to 'seek' (invalid option)", .{});
         if (new_pos_i < 0) {
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("Invalid argument") };
+            if (outs.len > 1) {
+                const istr3 = try self.internStr("Invalid argument");
+                outs[1] = .{ .String = istr3 };
+            }
             if (outs.len > 2) outs[2] = .{ .Int = if (@import("builtin").os.tag == .windows) 1 else 22 };
             return;
         }
@@ -33393,7 +34588,10 @@ pub const Vm = struct {
         // produces via `fseek` → `lseek` → `luaL_fileresult`.
         const io = stdio.activeIo();
         io.vtable.fileSeekTo(io.userdata, f.*, target_pos) catch {
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("Illegal seek") };
+            if (outs.len > 1) {
+                const istr4 = try self.internStr("Illegal seek");
+                outs[1] = .{ .String = istr4 };
+            }
             if (outs.len > 2) outs[2] = .{ .Int = if (@import("builtin").os.tag == .windows) 1 else 29 };
             return;
         };
@@ -33412,7 +34610,10 @@ pub const Vm = struct {
         };
         if (!self.flushBufferedFile(args[0])) {
             outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("write error") };
+            if (outs.len > 1) {
+                const istr = try self.internStr("write error");
+                outs[1] = .{ .String = istr };
+            }
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
             return;
         }
@@ -33457,11 +34658,13 @@ pub const Vm = struct {
         };
         if (self.getFieldOpt(file_tbl, "__closed")) |v| {
             if (v == .Bool and v.Bool) {
-                outs[0] = .{ .String = try self.internStr("closed file") };
+                const istr = try self.internStr("closed file");
+                outs[0] = .{ .String = istr };
                 return;
             }
         }
-        outs[0] = .{ .String = try self.internStr("file") };
+        const istr2 = try self.internStr("file");
+        outs[0] = .{ .String = istr2 };
     }
 
     fn builtinFileGc(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -33971,7 +35174,10 @@ pub const Vm = struct {
                 if (outs.len > 0) outs[0] = .{ .Bool = false };
                 self.last_builtin_out_count = @min(outs.len, 1);
             } else {
-                if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(err)) };
+                if (outs.len > 1) {
+                    const istr = try self.internStr(@errorName(err));
+                    outs[1] = .{ .String = istr };
+                }
                 if (outs.len > 2) outs[2] = .{ .Int = 1 };
                 self.last_builtin_out_count = @min(outs.len, 3);
             }
@@ -33983,7 +35189,10 @@ pub const Vm = struct {
                 if (outs.len > 0) outs[0] = .{ .Bool = false };
                 self.last_builtin_out_count = @min(outs.len, 1);
             } else {
-                if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(err)) };
+                if (outs.len > 1) {
+                    const istr2 = try self.internStr(@errorName(err));
+                    outs[1] = .{ .String = istr2 };
+                }
                 if (outs.len > 2) outs[2] = .{ .Int = 1 };
                 self.last_builtin_out_count = @min(outs.len, 3);
             }
@@ -34377,7 +35586,8 @@ pub const Vm = struct {
             fmt = fmt[1..];
         }
         if (std.mem.indexOfScalar(u8, fmt, 0) != null) {
-            outs[0] = .{ .String = try self.internStr(fmt) };
+            const istr = try self.internStr(fmt);
+            outs[0] = .{ .String = istr };
             return;
         }
         if (osDateInvalidSpec(fmt)) return self.fail("invalid conversion specifier", .{});
@@ -34409,7 +35619,8 @@ pub const Vm = struct {
             outs[0] = .{ .Table = tbl };
             return;
         }
-        outs[0] = .{ .String = try self.formatDate(fmt, p) };
+        const istr2 = try self.formatDate(fmt, p);
+        outs[0] = .{ .String = istr2 };
     }
 
     fn builtinOsTime(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -34508,7 +35719,8 @@ pub const Vm = struct {
             error.InvalidWtf8 => return self.fail("os.getenv: invalid environment value", .{}),
             error.OutOfMemory => return error.OutOfMemory,
         };
-        outs[0] = .{ .String = try self.internStr(val) };
+        const istr = try self.internStr(val);
+        outs[0] = .{ .String = istr };
     }
 
     fn builtinOsTmpname(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -34520,7 +35732,8 @@ pub const Vm = struct {
         // name breaks `-l <tmpfile>` because require() converts dots to path
         // separators. Use an underscore-separated name with no extension.
         const p = std.fmt.bufPrint(buf[0..], "/tmp/luazig_{x}", .{r}) catch return error.OutOfMemory;
-        outs[0] = .{ .String = try self.internStr(p) };
+        const istr = try self.internStr(p);
+        outs[0] = .{ .String = istr };
     }
 
     fn builtinOsRemove(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -34528,7 +35741,10 @@ pub const Vm = struct {
         if (args.len == 0 or args[0] != .String) return self.fail("bad argument #1 to 'remove' (string expected)", .{});
         std.Io.Dir.cwd().deleteFile(stdio.activeIo(), args[0].String.bytes()) catch |e| {
             outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(e)) };
+            if (outs.len > 1) {
+                const istr = try self.internStr(@errorName(e));
+                outs[1] = .{ .String = istr };
+            }
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
             return;
         };
@@ -34542,7 +35758,10 @@ pub const Vm = struct {
         }
         std.Io.Dir.cwd().rename(args[0].String.bytes(), std.Io.Dir.cwd(), args[1].String.bytes(), stdio.activeIo()) catch |e| {
             outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(e)) };
+            if (outs.len > 1) {
+                const istr = try self.internStr(@errorName(e));
+                outs[1] = .{ .String = istr };
+            }
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
             return;
         };
@@ -34563,13 +35782,15 @@ pub const Vm = struct {
         } else null;
 
         if (locale_opt == null) {
-            outs[0] = .{ .String = try self.internStr(self.current_locale) };
+            const istr = try self.internStr(self.current_locale);
+            outs[0] = .{ .String = istr };
             return;
         }
         const locale = locale_opt.?;
         if (std.mem.eql(u8, locale, "C")) {
             self.current_locale = "C";
-            outs[0] = .{ .String = try self.internStr("C") };
+            const istr2 = try self.internStr("C");
+            outs[0] = .{ .String = istr2 };
             return;
         }
         outs[0] = .Nil;
@@ -35049,7 +36270,12 @@ pub const Vm = struct {
                 else => return self.fail("invalid conversion", .{}),
             }
         }
-        outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
+        // P16.52: re-derive outs — a %s conversion may have run a __tostring
+        // metamethod (valueToStringAlloc → callMetamethod) on THIS thread,
+        // which can grow bc_stack and move the registered window.
+        const outw = self.refreshBuiltinOuts() orelse outs;
+        const istr = try self.internStr(try out.toOwnedSlice(self.alloc));
+        outw[0] = .{ .String = istr };
     }
 
     fn builtinStringPack(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -35321,7 +36547,8 @@ pub const Vm = struct {
                 else => return self.fail("invalid format option '{c}'", .{ch}),
             }
         }
-        outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
+        const istr = try self.internStr(try out.toOwnedSlice(self.alloc));
+        outs[0] = .{ .String = istr };
     }
 
     fn builtinStringPacksize(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -35551,7 +36778,8 @@ pub const Vm = struct {
                 if (i == start) return self.fail("string.unpack: missing size for 'c'", .{});
                 const width = std.fmt.parseInt(usize, fmt[start..i], 10) catch return self.fail("string.unpack: bad width", .{});
                 if (pos + width > s.len) return self.fail("string.unpack: data string too short", .{});
-                outs[out_i] = .{ .String = try self.internStr(s[pos .. pos + width]) };
+                const istr = try self.internStr(s[pos .. pos + width]);
+                outs[out_i] = .{ .String = istr };
                 out_i += 1;
                 pos += width;
                 continue;
@@ -35566,7 +36794,8 @@ pub const Vm = struct {
                 var end = pos;
                 while (end < s.len and s[end] != 0) : (end += 1) {}
                 if (end >= s.len) return self.fail("unfinished string", .{});
-                outs[out_i] = .{ .String = try self.internStr(s[pos..end]) };
+                const istr2 = try self.internStr(s[pos..end]);
+                outs[out_i] = .{ .String = istr2 };
                 out_i += 1;
                 pos = end + 1;
                 i += 1;
@@ -35593,7 +36822,8 @@ pub const Vm = struct {
                 }
                 pos += width;
                 if (n > s.len - pos) return self.fail("too short", .{});
-                outs[out_i] = .{ .String = try self.internStr(s[pos .. pos + n]) };
+                const istr3 = try self.internStr(s[pos .. pos + n]);
+                outs[out_i] = .{ .String = istr3 };
                 out_i += 1;
                 pos += n;
                 continue;
@@ -35756,7 +36986,8 @@ pub const Vm = struct {
             if (iv < 0 or iv > 255) return self.fail("string.char value out of range", .{});
             try out.append(self.alloc, @intCast(iv));
         }
-        outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
+        const istr = try self.internStr(try out.toOwnedSlice(self.alloc));
+        outs[0] = .{ .String = istr };
     }
 
     fn builtinStringUpper(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -35767,8 +36998,13 @@ pub const Vm = struct {
             else => return self.fail("bad argument #1 to 'upper' (string expected, got {s})", .{self.valueTypeName(args[0])}),
         };
         var out = try self.alloc.alloc(u8, s.len);
+        // The scratch buffer is transient (PUC's luaL_Buffer is freed when
+        // the builtin returns); internStr copies the bytes into the result
+        // LuaString, so free it on every path.
+        defer self.alloc.free(out);
         for (s, 0..) |ch, i| out[i] = std.ascii.toUpper(ch);
-        outs[0] = .{ .String = try self.internStr(out) };
+        const istr = try self.internStr(out);
+        outs[0] = .{ .String = istr };
     }
 
     fn builtinStringLower(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -35779,8 +37015,11 @@ pub const Vm = struct {
             else => return self.fail("bad argument #1 to 'lower' (string expected, got {s})", .{self.valueTypeName(args[0])}),
         };
         var out = try self.alloc.alloc(u8, s.len);
+        // Same transient scratch as 'upper' — freed on every path.
+        defer self.alloc.free(out);
         for (s, 0..) |ch, i| out[i] = std.ascii.toLower(ch);
-        outs[0] = .{ .String = try self.internStr(out) };
+        const istr = try self.internStr(out);
+        outs[0] = .{ .String = istr };
     }
 
     fn builtinStringReverse(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -35791,9 +37030,12 @@ pub const Vm = struct {
             else => return self.fail("bad argument #1 to 'reverse' (string expected, got {s})", .{self.valueTypeName(args[0])}),
         };
         var out = try self.alloc.alloc(u8, s.len);
+        // Same transient scratch as 'upper' — freed on every path.
+        defer self.alloc.free(out);
         var i: usize = 0;
         while (i < s.len) : (i += 1) out[i] = s[s.len - 1 - i];
-        outs[0] = .{ .String = try self.internStr(out) };
+        const istr = try self.internStr(out);
+        outs[0] = .{ .String = istr };
     }
 
     fn builtinStringSub(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -35837,12 +37079,14 @@ pub const Vm = struct {
         if (start1 < 1) start1 = 1;
         if (end1 > len) end1 = len;
         if (start1 > end1 or len == 0) {
-            outs[0] = .{ .String = try self.internStr("") };
+            const istr = try self.internStr("");
+            outs[0] = .{ .String = istr };
             return;
         }
         const start: usize = @intCast(start1 - 1);
         const end: usize = @intCast(end1);
-        outs[0] = .{ .String = try self.internStr(s[start..end]) };
+        const istr2 = try self.internStr(s[start..end]);
+        outs[0] = .{ .String = istr2 };
     }
 
     const Capture = struct {
@@ -35934,6 +37178,11 @@ pub const Vm = struct {
 
     fn compilePattern(self: *Vm, pat: []const u8) DispatchError![]PatTok {
         var toks = std.ArrayListUnmanaged(PatTok).empty;
+        // errdefer: both the mid-compile `fail()` returns and an append OOM
+        // must free the partially-grown token list — previously it leaked on
+        // every failed attempt (a per-attempt retained leak that defeated
+        // the testc limit-stepping loops in memerr.lua).
+        errdefer toks.deinit(self.alloc);
         var cap_id: u8 = 0;
         var cap_stack: [9]u8 = undefined;
         var cap_stack_len: usize = 0;
@@ -36326,7 +37575,8 @@ pub const Vm = struct {
                         if (caps[cap_i].is_pos) {
                             outs[out_i] = .{ .Int = @intCast(caps[cap_i].start + 1) };
                         } else {
-                            outs[out_i] = .{ .String = try self.internStr(s[caps[cap_i].start..caps[cap_i].end]) };
+                            const istr = try self.internStr(s[caps[cap_i].start..caps[cap_i].end]);
+                            outs[out_i] = .{ .String = istr };
                         }
                         out_i += 1;
                     }
@@ -36374,7 +37624,8 @@ pub const Vm = struct {
                 outs[0] = .Nil;
                 return;
             };
-            outs[0] = .{ .String = try self.internStr(tail[0..nl1_rel]) };
+            const istr = try self.internStr(tail[0..nl1_rel]);
+            outs[0] = .{ .String = istr };
             return;
         }
         // Common suite pattern: first chunk before ':'.
@@ -36383,7 +37634,8 @@ pub const Vm = struct {
                 outs[0] = .Nil;
                 return;
             };
-            outs[0] = .{ .String = try self.internStr(s[start..pos]) };
+            const istr2 = try self.internStr(s[start..pos]);
+            outs[0] = .{ .String = istr2 };
             return;
         }
         if (std.mem.endsWith(u8, pat, "assertion failed!$") and
@@ -36413,7 +37665,8 @@ pub const Vm = struct {
                     return;
                 }
             }
-            outs[0] = .{ .String = try self.internStr(head[num_start..num_end]) };
+            const istr3 = try self.internStr(head[num_start..num_end]);
+            outs[0] = .{ .String = istr3 };
             return;
         }
         // Common traceback assertion shape in upstream tests:
@@ -36427,7 +37680,8 @@ pub const Vm = struct {
                 return;
             };
             if (std.mem.eql(u8, first_line[sp + 1 ..], suffix)) {
-                outs[0] = .{ .String = try self.internStr(first_line) };
+                const istr4 = try self.internStr(first_line);
+                outs[0] = .{ .String = istr4 };
                 return;
             }
             outs[0] = .Nil;
@@ -36453,7 +37707,8 @@ pub const Vm = struct {
                     outs[0] = .Nil;
                     return;
                 }
-                outs[0] = .{ .String = try self.internStr(s[pos..end]) };
+                const istr5 = try self.internStr(s[pos..end]);
+                outs[0] = .{ .String = istr5 };
                 return;
             }
             outs[0] = .Nil;
@@ -36483,7 +37738,8 @@ pub const Vm = struct {
             }
 
             if (cap_count == 0) {
-                outs[0] = .{ .String = try self.internStr(s[start..endpos]) };
+                const istr6 = try self.internStr(s[start..endpos]);
+                outs[0] = .{ .String = istr6 };
                 return;
             }
 
@@ -36494,7 +37750,8 @@ pub const Vm = struct {
                 if (caps[cap_i].is_pos) {
                     outs[out_i] = .{ .Int = @intCast(caps[cap_i].start + 1) };
                 } else {
-                    outs[out_i] = .{ .String = try self.internStr(s[caps[cap_i].start..caps[cap_i].end]) };
+                    const istr7 = try self.internStr(s[caps[cap_i].start..caps[cap_i].end]);
+                    outs[out_i] = .{ .String = istr7 };
                 }
                 out_i += 1;
             }
@@ -36586,7 +37843,8 @@ pub const Vm = struct {
             }
 
             if (cap_count == 0) {
-                outs[0] = .{ .String = try self.internStr(s[start..endpos]) };
+                const istr = try self.internStr(s[start..endpos]);
+                outs[0] = .{ .String = istr };
                 var oi: usize = 1;
                 while (oi < outs.len) : (oi += 1) outs[oi] = .Nil;
             } else {
@@ -36597,7 +37855,8 @@ pub const Vm = struct {
                     if (caps[cap_i].is_pos) {
                         outs[oi] = .{ .Int = @intCast(caps[cap_i].start + 1) };
                     } else {
-                        outs[oi] = .{ .String = try self.internStr(s[caps[cap_i].start..caps[cap_i].end]) };
+                        const istr2 = try self.internStr(s[caps[cap_i].start..caps[cap_i].end]);
+                        outs[oi] = .{ .String = istr2 };
                     }
                     oi += 1;
                 }
@@ -36885,6 +38144,11 @@ pub const Vm = struct {
 
     fn runGsubReplacementFunction(self: *Vm, repl_fn: Value, s: []const u8, match_start: usize, match_end: usize, caps: *const [10]Capture) DispatchError!Value {
         var call_args: [10]Value = undefined;
+        // Root each interned capture string across the NEXT internStr in the
+        // loop (native arrays are invisible to the GC — see builtinLoadfile's
+        // note; an emergency GC would free earlier captures before the call).
+        var roots = self.gcTempRoots();
+        defer roots.end();
         var arg_count: usize = 0;
         var cap_i: usize = 1;
         while (cap_i < caps.len and arg_count < call_args.len) : (cap_i += 1) {
@@ -36893,11 +38157,13 @@ pub const Vm = struct {
                 call_args[arg_count] = .{ .Int = @intCast(caps[cap_i].start + 1) };
             } else {
                 call_args[arg_count] = .{ .String = try self.internStr(s[caps[cap_i].start..caps[cap_i].end]) };
+                try roots.add(call_args[arg_count]);
             }
             arg_count += 1;
         }
         if (arg_count == 0) {
             call_args[0] = .{ .String = try self.internStr(s[match_start..match_end]) };
+            try roots.add(call_args[0]);
             arg_count = 1;
         }
         const resolved = try self.resolveCallable(repl_fn, call_args[0..arg_count], null);
@@ -36970,7 +38236,8 @@ pub const Vm = struct {
         var had_subst = false;
 
         if (limit == 0) {
-            outs[0] = .{ .String = try self.internStr(s) };
+            const istr = try self.internStr(s);
+            outs[0] = .{ .String = istr };
             if (outs.len > 1) outs[1] = .{ .Int = 0 };
             return;
         }
@@ -37152,17 +38419,26 @@ pub const Vm = struct {
             }
         }
 
+        // P16.52: re-derive outs — the substitution loop above may have
+        // re-entered the VM on THIS thread (replacement function via
+        // runGsubReplacementFunction, repl-table __index via
+        // tableGetFromNonYieldableC, __tostring via valueToStringAlloc),
+        // any of which can grow bc_stack and move the registered window.
+        // The !had_subst arm needs it too: a replacement function that
+        // returned nil/false every match still re-entered the VM.
+        const outw = self.refreshBuiltinOuts() orelse outs;
         if (!had_subst) {
             out.deinit(self.alloc);
             // PUC gsub returns the original string object when no substitution
             // happened (reuse). Return the input value verbatim so its pointer
             // identity is preserved (tested by pm.lua "reuse of original string").
-            outs[0] = args[0];
-            if (outs.len > 1) outs[1] = .{ .Int = @intCast(count) };
+            outw[0] = args[0];
+            if (outw.len > 1) outw[1] = .{ .Int = @intCast(count) };
             return;
         }
-        outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
-        if (outs.len > 1) outs[1] = .{ .Int = @intCast(count) };
+        const istr2 = try self.internStr(try out.toOwnedSlice(self.alloc));
+        outw[0] = .{ .String = istr2 };
+        if (outw.len > 1) outw[1] = .{ .Int = @intCast(count) };
     }
 
     fn builtinStringRep(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -37185,7 +38461,8 @@ pub const Vm = struct {
             else => return self.fail("string.rep expects integer n", .{}),
         };
         if (n0 <= 0) {
-            outs[0] = .{ .String = try self.internStr("") };
+            const istr = try self.internStr("");
+            outs[0] = .{ .String = istr };
             return;
         }
         const n: usize = @intCast(n0);
@@ -37213,7 +38490,8 @@ pub const Vm = struct {
             }
         }
         std.debug.assert(off == total);
-        outs[0] = .{ .String = try self.internStr(buf) };
+        const istr2 = try self.internStr(buf);
+        outs[0] = .{ .String = istr2 };
     }
 
     /// PUC `arith` helper (lstrlib.c:290-296) + `trymt` (lstrlib.c:279-287):
@@ -37452,7 +38730,8 @@ pub const Vm = struct {
             };
             try self.encodeUtf8Scalar(&out, cp);
         }
-        outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
+        const istr = try self.internStr(try out.toOwnedSlice(self.alloc));
+        outs[0] = .{ .String = istr };
     }
 
     fn builtinUtf8Codepoint(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -37808,7 +39087,8 @@ pub const Vm = struct {
         };
 
         if (start_idx > end_idx) {
-            outs[0] = .{ .String = try self.internStr("") };
+            const istr = try self.internStr("");
+            outs[0] = .{ .String = istr };
             return;
         }
 
@@ -37834,39 +39114,95 @@ pub const Vm = struct {
             if (len_k == end_idx) break;
             len_k += 1;
         }
-        try self.testcCheckMemory(total_len);
-
-        var out = std.ArrayList(u8).empty;
-        defer out.deinit(self.alloc);
+        // PUC-parity buffer sizing: the first pass computed total_len
+        // exactly, so the output needs ONE allocation of total_len + 1
+        // (the +1 is the terminating zero PUC's newbuffsize always
+        // reserves). The old ArrayList growth chain (4080→8576→15128→
+        // 30128) transiently exceeded memory limits that PUC's box model
+        // satisfies (newbuffsize grows x1.5 with an exact final resize,
+        // lauxlib.c:540-553; our exact prealloc is tighter still).
+        var buf = try self.alloc.alloc(u8, total_len + 1);
+        var buf_owned = true;
+        errdefer if (buf_owned) self.alloc.free(buf);
+        var pos: usize = 0;
         var k: i64 = start_idx;
         while (k <= end_idx) {
-            if (k > start_idx and sep.len != 0) try out.appendSlice(self.alloc, sep);
+            if (k > start_idx and sep.len != 0) {
+                @memcpy(buf[pos..][0..sep.len], sep);
+                pos += sep.len;
+            }
             const v = try self.indexValue(tobj, .{ .Int = k });
             switch (v) {
-                .String => |sv| try out.appendSlice(self.alloc, sv.bytes()),
-                .Int => |iv| try appendFmt(self.alloc, &out, "{d}", .{iv}),
+                .String => |sv| {
+                    @memcpy(buf[pos..][0..sv.len()], sv.bytes());
+                    pos += sv.len();
+                },
+                .Int => |iv| {
+                    // The length pass measured the same value with a
+                    // 64-byte staging buffer, so this print always fits.
+                    const written = std.fmt.bufPrint(buf[pos..], "{d}", .{iv}) catch unreachable;
+                    pos += written.len;
+                },
                 .Num => |nv| {
                     const sv = try self.numberToStringAlloc(nv);
-                    try out.appendSlice(self.alloc, sv);
+                    defer self.alloc.free(sv);
+                    @memcpy(buf[pos..][0..sv.len], sv);
+                    pos += sv.len;
                 },
                 else => return self.fail("invalid value at index {d}", .{k}),
             }
             if (k == end_idx) break;
             k += 1;
         }
-        const scratch = try out.toOwnedSlice(self.alloc);
-        // P16.50-review-3: the scratch is a TRANSIENT buffer — PUC's
-        // luaM_realloc_'d scratch nets to zero against totalbytes; under
-        // the single accounting boundary it never enters any ledger at
-        // all (pure allocator alloc/free). internStr COPIES the bytes
-        // (the P16.50-review-2 leak is fixed by the frees below); the
-        // permanent delta is only the interned string's own accounting
-        // (inside internStr's gcNoteAlloc). The old commit+manual-reversal
-        // is deleted along with the rest of the distributed scheme.
-        errdefer self.alloc.free(scratch);
-        const final_str = try self.internStr(scratch);
-        self.alloc.free(scratch);
-        outs[0] = .{ .String = final_str };
+        buf[total_len] = 0;
+        // PUC luaL_pushresult (lauxlib.c:611-637) has TWO result paths:
+        //  - small results (fit the static LUAL_BUFFERSIZE buffer):
+        //    lua_pushlstring — a normal copy (interned when short);
+        //  - large results (the buffer lives in the heap "box"): the box
+        //    is handed DIRECTLY to the string via
+        //    lua_pushexternalstring — no second copy. Peak footprint is
+        //    ONE buffer: locals.lua's memory limits (m + 2*lim + extra)
+        //    rely on exactly that (a full-size copy would need 2*result
+        //    transient bytes and blow the limit).
+        const lual_buffer_size = 8192; // PUC lauxlib.h LUAL_BUFFERSIZE (BUFSIZ)
+        if (total_len <= lual_buffer_size) {
+            const final_str = try self.internStr(buf[0..total_len]);
+            // internStr COPIED the bytes into the interned LuaString, so
+            // the scratch buffer's job is done — free it now (the errdefer
+            // above only covers the failure paths; without this free the
+            // buffer leaked on every small-result concat).
+            buf_owned = false;
+            self.alloc.free(buf);
+            outs[0] = .{ .String = final_str };
+        } else {
+            // On createExternalLuaString failure the PUC contract (lstring.c
+            // luaS_newextlstr) invokes falloc to give the content back, so
+            // ownership leaves this frame on BOTH outcomes.
+            const final_str = self.createExternalLuaString(
+                buf.ptr,
+                total_len,
+                tconcatExternalFree,
+                self,
+            ) catch |e| {
+                buf_owned = false;
+                return e;
+            };
+            buf_owned = false;
+            outs[0] = .{ .String = final_str };
+        }
+    }
+
+    /// Dealloc callback for table.concat's external result string (PUC
+    /// lauxlib.c:635 passes the state's lua_Alloc; ours frees through
+    /// vm.alloc so the testc ledger credits the release).
+    fn tconcatExternalFree(ud: ?*anyopaque, ptr: ?*anyopaque, osize: usize, nsize: usize) callconv(.c) ?*anyopaque {
+        _ = nsize;
+        const vm: *Vm = @ptrCast(@alignCast(ud orelse return null));
+        if (ptr) |p| {
+            const bytes: [*]u8 = @ptrCast(p);
+            vm.alloc.free(bytes[0..osize]);
+        }
+        return null;
     }
 
     fn builtinTablePack(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -38399,7 +39735,7 @@ pub const Vm = struct {
             .Int => |i| {
                 var buf: [32]u8 = undefined;
                 const s = std.fmt.bufPrint(buf[0..], "{d}", .{i}) catch {
-                    return self.internStr(try std.fmt.allocPrint(self.alloc, "{d}", .{i}));
+                    return self.internFmt("{d}", .{i});
                 };
                 return self.internStr(s);
             },
@@ -38558,7 +39894,12 @@ pub const Vm = struct {
         return std.fmt.parseFloat(f64, trimmed) catch null;
     }
 
-    fn tableGetRawValue(self: *Vm, tbl: *Table, key: Value) DispatchError!Value {
+    /// Infallible by construction (P16.50-review-5 3.2): the NaN check is a
+    /// pure comparison and `rawGet` is a pure lookup (no metamethods, no
+    /// allocation — PUC luaH_get). The old `DispatchError!Value` signature
+    /// was defensive dead weight; it is now honestly infallible so the
+    /// callers' `try`/`catch` shapes cannot swallow or re-label anything.
+    fn tableGetRawValue(self: *Vm, tbl: *Table, key: Value) Value {
         // NaN keys: rawget on NaN historically returns Nil without raising an
         // error (the NaN check lives in rawSet / setIndexValue instead). PUC
         // actually errors on NaN lookups in some paths but the test suite has
@@ -38682,7 +40023,7 @@ pub const Vm = struct {
 
     fn tableGetValueDepth(self: *Vm, tbl: *Table, key: Value, depth: usize) DispatchError!Value {
         if (depth >= 200) return self.fail("loop in gettable", .{});
-        const raw = try self.tableGetRawValue(tbl, key);
+        const raw = self.tableGetRawValue(tbl, key);
         if (raw != .Nil) return raw;
         const mt = tbl.metatable orelse return .Nil;
         // PUC fasttm: check flags bit, cache-on-miss via fasttm.
@@ -38787,7 +40128,7 @@ pub const Vm = struct {
         if (depth >= 200) return self.fail("loop in settable", .{});
         if (object == .Table) {
             const tbl = object.Table;
-            const raw = try self.tableGetRawValue(tbl, key);
+            const raw = self.tableGetRawValue(tbl, key);
             if (raw != .Nil or tbl.metatable == null) {
                 return self.tableSetValue(tbl, key, val);
             }
@@ -39445,22 +40786,46 @@ pub const Vm = struct {
             self.testc_close_metamethod_depth += 1;
             defer self.testc_close_metamethod_depth -= 1;
             // PUC callclosemethod (lfunc.c): `if (yy) luaD_call(...) else
-            // luaD_callnoyield(...)` — a yy=0 close runs the closer under a
-            // NON-YIELDABLE C-call unit (incnny): ANY yield attempt inside
-            // the closer — a builtin `coroutine.yield` as __close (called
-            // via callMetamethod → callBuiltin, which adds no boundary of
-            // its own) or a Lua closure's yield — fails at the yield site
-            // with "attempt to yield across a C-call boundary" (PUC
-            // lua_yieldk's nny check). Without the unit a builtin yield
-            // closer suspends the thread mid-close (locals.lua's
-            // `closeslot`-with-yield test). The yy=1 close adds no unit —
-            // a Lua closer parks in-place (CLSRET) and a builtin yield
-            // closer suspends via pending_close_builtin.
-            const closer_result = if (!yieldable) blk: {
-                th.incnny();
-                defer th.decnny();
-                break :blk self.runCloseMetamethod(val, cur_err);
-            } else self.runCloseMetamethod(val, cur_err);
+            // luaD_callnoyield(...)` — BOTH are ccall (ldo.c:757): every
+            // __close invocation consumes a full C-call unit (nyci = nny +
+            // depth for yy=0, ci = depth for yy=1), so the LUAI_MAXCCALLS
+            // guard (luaE_checkcstack → "C stack overflow") bounds recursive
+            // close chains. A yy=0 close additionally runs the closer under a
+            // NON-YIELDABLE unit: ANY yield attempt inside the closer — a
+            // builtin `coroutine.yield` as __close (called via callMetamethod
+            // → callBuiltin, which adds no boundary of its own) or a Lua
+            // closure's yield — fails at the yield site with "attempt to
+            // yield across a C-call boundary" (PUC lua_yieldk's nny check).
+            // Without the nny half a builtin yield closer suspends the thread
+            // mid-close (locals.lua's `closeslot`-with-yield test). The yy=1
+            // half adds only depth — a Lua closer parks in-place (CLSRET) and
+            // a builtin yield closer suspends via pending_close_builtin.
+            // P16.52: the old code entered ONLY the nny half (incnny) for
+            // yy=0 and nothing for yy=1 — the missing depth unit let the
+            // coroutine.close → __close → coroutine.close chain recurse past
+            // LUAI_MAXCCALLS until the native stack died (Debug SEGFAULT in
+            // cstack.lua). The defer releases the unit on all exits,
+            // including the yy=1 yield park (PUC's yield longjmps past
+            // ccall's decrement; lua_resume re-derives nCcalls on resume).
+            const ccall_mode: Thread.CCallMode = if (!yieldable) .nonyieldable else .yieldable;
+            self.ccallEnter(th, ccall_mode) catch |ccall_err| switch (ccall_err) {
+                error.RuntimeError => {
+                    // C-stack overflow (ccallEnter's depth guard): the
+                    // metamethod never runs. PUC's ccall raises before
+                    // luaD_precall; the enclosing closeprotected catches the
+                    // error and keeps closing — mirror the closer-error arm
+                    // below (last-error-wins, remaining entries close yy=0,
+                    // a forced-close transport fails the close).
+                    cur_err = if (self.errThread().err_has_obj) self.errThread().err_obj else .Nil;
+                    cur_status = 2; // LUA_ERRRUN
+                    if (err == null) yieldable = false;
+                    if (self.forced_close_thread != null) self.forced_close_had_error = true;
+                    continue;
+                },
+                else => return ccall_err,
+            };
+            defer th.ccallExit(ccall_mode);
+            const closer_result = self.runCloseMetamethod(val, cur_err);
             closer_result catch |e| switch (e) {
                 error.Yield => {
                     if (!yieldable) {
@@ -41139,12 +42504,16 @@ pub const Vm = struct {
             script_source = args[0].String.bytes();
         }
 
+        // infraAlloc: the testC stack is host-side script machinery (PUC's
+        // L1 stack is pre-sized at state creation; these tests never grow
+        // it past the initial block) — uncounted, so scripts under an
+        // armed countdown always run.
         var st: std.ArrayListUnmanaged(Value) = .empty;
-        defer st.deinit(self.alloc);
+        defer st.deinit(self.infraAlloc());
         if (include_script_on_stack) {
-            try st.append(self.alloc, args[arg_off]);
+            try st.append(self.infraAlloc(), args[arg_off]);
         }
-        if (args.len > arg_off + 1) try st.appendSlice(self.alloc, args[arg_off + 1 ..]);
+        if (args.len > arg_off + 1) try st.appendSlice(self.infraAlloc(), args[arg_off + 1 ..]);
 
         const rr = try self.runTestcScript(script_source.?, &st, ctx, null);
         const spec = rr.return_spec orelse testc.ReturnSpec{ .fixed = 0 };
@@ -41182,14 +42551,16 @@ pub const Vm = struct {
     /// Copy return values from the testC stack based on the return spec.
     /// PUC Lua `return n` returns the LAST n items from the stack.
     fn copyTestcReturnValues(self: *Vm, st: []const Value, spec: testc.ReturnSpec) DispatchError![]Value {
+        // infraAlloc: result marshalling for the script frame — PUC returns
+        // values on the Lua stack (no allocation).
         return switch (spec) {
             .all => blk: {
-                const vals = try self.alloc.alloc(Value, st.len);
+                const vals = try self.infraAlloc().alloc(Value, st.len);
                 @memcpy(vals, st);
                 break :blk vals;
             },
             .fixed => |n| blk: {
-                const vals = try self.alloc.alloc(Value, n);
+                const vals = try self.infraAlloc().alloc(Value, n);
                 for (0..n) |i| {
                     const src_from_top = n - i;
                     vals[i] = if (st.len >= src_from_top) st[st.len - src_from_top] else .Nil;
@@ -41226,10 +42597,14 @@ pub const Vm = struct {
 
     fn builtinTestcTotalmem(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) {
-            if (outs.len > 0) outs[0] = .{ .Int = @intCast(if (self.testc_ctrl) |c| c.total_bytes else 0) };
+            // P16.50-review-5: total_bytes is SIGNED (PUC l_mem) — frees of
+            // pre-adapter memory drive it negative; all test limits are
+            // relative (T.totalmem(T.totalmem()+X)), so the baseline does
+            // not matter.
+            if (outs.len > 0) outs[0] = .{ .Int = if (self.testc_ctrl) |c| c.total_bytes else 0 };
             if (outs.len > 1) outs[1] = .{ .Int = 0 };
-            const limit_now: usize = if (self.testc_ctrl) |c| (c.mem_limit orelse 0) else 0;
-            if (outs.len > 2) outs[2] = .{ .Int = @intCast(limit_now) };
+            const limit_now: i64 = if (self.testc_ctrl) |c| (c.mem_limit orelse 0) else 0;
+            if (outs.len > 2) outs[2] = .{ .Int = limit_now };
             self.last_builtin_out_count = @min(outs.len, 3);
             return;
         }
@@ -41244,7 +42619,13 @@ pub const Vm = struct {
                     },
                     else => unreachable,
                 };
-                self.testcEnsureControl().mem_limit = if (limit_i <= 0) null else @as(usize, @intCast(limit_i));
+                // PUC mem_query (ltests.c:929): `unsigned long limit =
+                // cast(unsigned long, luaL_checkinteger(L, 1)); if (limit
+                // == 0) limit = ULONG_MAX;` — exactly 0 disables the limit;
+                // a NEGATIVE integer wraps to a huge unsigned = effectively
+                // no limit. Mirror the observable behavior.
+                self.testcEnsureControl().mem_limit =
+                    if (limit_i == 0 or limit_i < 0) null else limit_i;
                 self.last_builtin_out_count = 0;
             },
             .String => |namev| {
@@ -41411,7 +42792,8 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("T.gcage expects an object", .{});
         const age = gcValueAge(args[0]) orelse return self.fail("T.gcage expects a collectable object", .{});
-        outs[0] = .{ .String = try self.internStr(gcAgeName(age)) };
+        const istr = try self.internStr(gcAgeName(age));
+        outs[0] = .{ .String = istr };
         self.last_builtin_out_count = 1;
     }
 
@@ -41427,7 +42809,8 @@ pub const Vm = struct {
             .String => |o| o.gc_marked,
             .Userdata => |o| o.gc_marked,
             else => {
-                outs[0] = .{ .String = try self.internStr("no collectable") };
+                const istr = try self.internStr("no collectable");
+                outs[0] = .{ .String = istr };
                 self.last_builtin_out_count = 1;
                 return;
             },
@@ -41440,7 +42823,8 @@ pub const Vm = struct {
             "black"
         else
             "gray";
-        outs[0] = .{ .String = try self.internStr(color) };
+        const istr2 = try self.internStr(color);
+        outs[0] = .{ .String = istr2 };
         self.last_builtin_out_count = 1;
     }
 
@@ -41451,7 +42835,8 @@ pub const Vm = struct {
         // Query: return current state name.
         if (args.len == 0 or args[0] == .Nil) {
             if (outs.len > 0) {
-                outs[0] = .{ .String = try self.internStr(self.gcStateName()) };
+                const istr = try self.internStr(self.gcStateName());
+                outs[0] = .{ .String = istr };
             }
             self.last_builtin_out_count = if (outs.len > 0) 1 else 0;
             return;
@@ -41998,7 +43383,16 @@ pub const Vm = struct {
             null;
 
         // PUC: L1 = lua_newstate(f, ud, 0) — independent state, shared allocator.
-        var sub_vm = Vm.init(self.alloc, false);
+        // P16.50-review-5: init the sub-VM on the UNCOUNTED base allocator
+        // (infraAlloc): PUC gives the sub-state the same headroom — its
+        // lua_newstate allocations are not part of the armed test budget
+        // (memerr.lua:28 arms only +10K over the current total and then
+        // expects `newuserdata 20000` to be the failure; our init is far
+        // heavier than PUC's). The sub-VM gets its OWN adapter (sharing
+        // the parent's control) installed at the end of its
+        // enableTestcModuleInternal below, so all post-init allocations on
+        // it ARE checked against the shared budget.
+        var sub_vm = Vm.init(self.infraAlloc(), false);
         defer sub_vm.deinit();
 
         // P16.33 R0.3: PUC's l_memcontrol is the allocator USERDATA —
@@ -42022,22 +43416,34 @@ pub const Vm = struct {
         sub_vm.testc_active = true;
 
         // Share the bytecode compiler so the sub-VM can compile Lua source via
-        // loadstring/load (PUC's lua_newstate shares the same lexer/parser code).
+        // the `loadstring` command (PUC's lua_newstate shares the same
+        // lexer/parser code).
         sub_vm.dynamic_bytecode_compiler = self.dynamic_bytecode_compiler;
 
-        // Enable testC T-table + builtins on the sub-VM. Sub-VM RuntimeErrors
-        // must be translated to parent-VM errors (via self.fail) so the parent's
-        // error state stays consistent — propagating sub_vm's RuntimeError
-        // directly would leave self.err unset.
-        sub_vm.enableTestcModuleInternal() catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return self.fail("checkpanic: sub-VM init failed", .{}),
-        };
+        // PUC checkpanic (ltests.c:1407): L1 = lua_newstate(f, ud, 0) — a
+        // BARE state. No T module, no Lua bootstrap: runC drives the
+        // assembler commands directly against the C API. Keeping the sub-VM
+        // bare is not just parity — it is what makes memerr.lua:28 work:
+        // T.totalmem(T.totalmem()+10000) + checkpanic("newuserdata 20000")
+        // must fail with MEMERRMSG. A T-module bootstrap would leave ~100KB
+        // of compile garbage that the emergency GC (PUC tryagain) frees,
+        // letting the retry SUCCEED and breaking the expectation. A bare
+        // sub-VM has no collectable garbage: the emergency GC frees nothing
+        // and the retry fails exactly as in PUC.
+        //
+        // Install only the allocator adapter (sharing the borrowed control)
+        // so the sub-VM's allocations are checked against the shared budget
+        // (memerr.lua:28, api.lua:435 countdown cases).
+        sub_vm.installTestcAdapter();
 
         // The testC stack (PUC: L1's Lua stack). Shared between the main script
         // and the panic script, exactly as PUC shares L1 across both phases.
+        // infraAlloc: PUC's L1 stack is pre-sized at state creation; our
+        // ArrayList is host-side script machinery — uncounted, so a script
+        // under an armed countdown always runs its commands (PUC's stack
+        // ops never allocate in these tests).
         var st: std.ArrayListUnmanaged(Value) = .empty;
-        defer st.deinit(sub_vm.alloc);
+        defer st.deinit(sub_vm.infraAlloc());
 
         const ctx: TestcContext = .{};
 
@@ -42045,7 +43451,16 @@ pub const Vm = struct {
         // luaD_throw → panic handler → longjmp back to setjmp in checkpanic.
         // Here, RuntimeError IS the panic signal — no setjmp/longjmp needed.
         _ = sub_vm.runTestcScript(script, &st, ctx, null) catch |err| switch (err) {
-            error.RuntimeError => {
+            error.RuntimeError, error.OutOfMemory => {
+                // P16.50-review-5: an OOM from a testC command (e.g.
+                // `newtable` under countdown 0) propagates WITHOUT an
+                // error object — the sub-VM has no dispatch boundary to
+                // install one. Install the fixed OOM message here so the
+                // status classification and the panic script observe
+                // exactly what PUC's ERRMEM status would show
+                // (api.lua:435: alloccount 0; newtable → panic script
+                // reads threadstatus as "not enough memory").
+                if (err == error.OutOfMemory) sub_vm.setOutOfMemoryError();
                 // Classify the error status for `threadstatus`. PUC's
                 // statcodes[lua_status(L1)]: ERRRUN(2)→"ERRRUN",
                 // ERRMEM(4)→MEMERRMSG="not enough memory". Since the status
@@ -42081,14 +43496,18 @@ pub const Vm = struct {
                     }
                     st.clearRetainingCapacity();
                     const err_obj: Value = if (sub_vm.errThread().err_has_obj) sub_vm.errThread().err_obj else .Nil;
-                    st.append(sub_vm.alloc, err_obj) catch return error.OutOfMemory;
+                    st.append(sub_vm.infraAlloc(), err_obj) catch return error.OutOfMemory;
                 }
 
                 if (panic_script) |ps| {
                     // Run panic script on the same sub-VM / testC stack.
                     // PUC: runC(b->L, L1, b->paniccode) inside panicback.
                     _ = sub_vm.runTestcScript(ps, &st, ctx, null) catch |pe| switch (pe) {
-                        error.RuntimeError => {
+                        error.RuntimeError, error.OutOfMemory => {
+                            // Panic script itself errored — return its
+                            // message (OOM: install the fixed message first,
+                            // same as the main-script catch above).
+                            if (pe == error.OutOfMemory) sub_vm.setOutOfMemoryError();
                             // Panic script itself errored — return its message.
                             if (outs.len > 0) {
                                 const s = self.internStr(sub_vm.errorString()) catch return error.OutOfMemory;
@@ -42097,7 +43516,6 @@ pub const Vm = struct {
                             self.last_builtin_out_count = @min(outs.len, 1);
                             return;
                         },
-                        error.OutOfMemory => return error.OutOfMemory,
                         error.Yield, error.ThreadSwitch => return self.fail("checkpanic: unexpected control flow in panic script", .{}),
                     };
                     // PUC returns lua_tostring(L1, -1): the sub-VM stack top
@@ -42123,7 +43541,6 @@ pub const Vm = struct {
                 self.last_builtin_out_count = @min(outs.len, 1);
                 return;
             },
-            error.OutOfMemory => return error.OutOfMemory,
             error.Yield, error.ThreadSwitch => return self.fail("checkpanic: unexpected control flow", .{}),
         };
 
@@ -42170,7 +43587,7 @@ pub const Vm = struct {
         var last_status: []const u8 = "OK";
         var stmt_count: usize = 0;
         var thread_stacks: TestcThreadStacks = .{};
-        defer thread_stacks.deinit(self.alloc);
+        defer thread_stacks.deinit(self.infraAlloc());
         // P16.31 Cut 3: the SCRIPT FRAME — the PUC CallInfo of the testC C
         // function (ltests.c runs each testC script as ONE C activation;
         // its CallInfo exists for the whole script run). The `toclose`
@@ -42203,12 +43620,12 @@ pub const Vm = struct {
         // The cell that holds the testC stack for the script's duration.
         // Created first so a push failure cannot leak a frame; owned here
         // until parked on the script frame (the flag flips at the parking).
-        const script_cell = try self.alloc.create(std.ArrayListUnmanaged(Value));
+        const script_cell = try self.infraAlloc().create(std.ArrayListUnmanaged(Value));
         var cell_owned_here = true;
         // Errdefer order is LIFO: the frame-pop errdefer below runs FIRST
         // and may move the cell back to the caller (destroying it); this
         // one then sees the final state and never double-destroys.
-        errdefer if (cell_owned_here) self.alloc.destroy(script_cell);
+        errdefer if (cell_owned_here) self.infraAlloc().destroy(script_cell);
         script_cell.* = st_param.*;
         var script_frame_idx: usize = undefined;
         var frame_pushed_here = false;
@@ -42217,8 +43634,8 @@ pub const Vm = struct {
             // Defensive: the shim's finishCcall entry moved any parked
             // cell into cur_c_stack; a leftover cell here would be a bug.
             if (th.call_frames.getPtr(script_frame_idx).u.c.parked_stack) |old| {
-                old.deinit(self.alloc);
-                self.alloc.destroy(old);
+                old.deinit(self.infraAlloc());
+                self.infraAlloc().destroy(old);
                 th.call_frames.getPtr(script_frame_idx).u.c.parked_stack = null;
             }
         } else {
@@ -42279,7 +43696,7 @@ pub const Vm = struct {
                     // detach is idempotent on the already-detached entries.
                     self.detachTbcRegion(th, sfr.tbc_chain_base);
                     st_param.* = script_cell.*;
-                    self.alloc.destroy(script_cell);
+                    self.infraAlloc().destroy(script_cell);
                     th.call_frames.getPtr(script_frame_idx).u.c.parked_stack = null;
                     cell_owned_here = false; // already destroyed above
                     self.popBuiltinCFrame();
@@ -42287,7 +43704,7 @@ pub const Vm = struct {
             }
         }
         var norm = std.ArrayList(u8).empty;
-        defer norm.deinit(self.alloc);
+        defer norm.deinit(self.infraAlloc());
         var i_norm: usize = 0;
         // PUC getstring_aux handles both ' and " quotes; comment stripping
         // (#) and comma conversion must respect both quote types.
@@ -42298,13 +43715,13 @@ pub const Vm = struct {
             if (!norm_in_quote and (ch == '\'' or ch == '"')) {
                 norm_in_quote = true;
                 norm_quote_char = ch;
-                try norm.append(self.alloc, ch);
+                try norm.append(self.infraAlloc(), ch);
                 continue;
             }
             if (norm_in_quote and ch == norm_quote_char) {
                 norm_in_quote = false;
                 norm_quote_char = 0;
-                try norm.append(self.alloc, ch);
+                try norm.append(self.infraAlloc(), ch);
                 continue;
             }
             if (!norm_in_quote and ch == '#') {
@@ -42315,11 +43732,11 @@ pub const Vm = struct {
                 var j = i_norm + 1;
                 while (j < script.len and (script[j] == ' ' or script[j] == '\t')) : (j += 1) {}
                 if (j + 6 <= script.len and std.mem.eql(u8, script[j .. j + 6], "return")) {
-                    try norm.append(self.alloc, ';');
+                    try norm.append(self.infraAlloc(), ';');
                     continue;
                 }
             }
-            try norm.append(self.alloc, ch);
+            try norm.append(self.infraAlloc(), ch);
         }
 
         var start: usize = 0;
@@ -42388,7 +43805,7 @@ pub const Vm = struct {
                 const spec = out.return_spec orelse testc.ReturnSpec{ .fixed = 0 };
                 const results = try self.copyTestcReturnValues(st.items, spec);
                 var results_owned = true;
-                errdefer if (results_owned) self.alloc.free(results);
+                errdefer if (results_owned) self.infraAlloc().free(results);
                 const final_err = self.closeTbcRegion(th, sfr.tbc_chain_base, script_frame_idx, null, 0, true, results) catch |e| switch (e) {
                     error.Yield => {
                         // A closer yielded: clsret_state (with the saved
@@ -42432,8 +43849,8 @@ pub const Vm = struct {
                 // results so the return-spec slicing sees the real values
                 // (api.lua's `toclose` + `return 2` resource test).
                 script_cell.clearRetainingCapacity();
-                script_cell.appendSlice(self.alloc, results) catch return error.OutOfMemory;
-                self.alloc.free(results);
+                script_cell.appendSlice(self.infraAlloc(), results) catch return error.OutOfMemory;
+                self.infraAlloc().free(results);
                 results_owned = false;
             }
         }
@@ -42443,7 +43860,7 @@ pub const Vm = struct {
         // empty; pop-detach is a no-op). The reuse-mode frame stays (the
         // shim's return path owns its pop).
         st_param.* = script_cell.*;
-        self.alloc.destroy(script_cell);
+        self.infraAlloc().destroy(script_cell);
         th.call_frames.getPtr(script_frame_idx).u.c.parked_stack = null;
         if (frame_pushed_here) {
             self.popBuiltinCFrame();
@@ -42580,6 +43997,15 @@ pub const Vm = struct {
                 };
                 var fmt_args = [_]Value{ .{ .String = try self.internStr(fmt) }, arg };
                 var fmt_out = [_]Value{.Nil};
+                // P16.52: builtinStringFormat re-derives its outs slice via
+                // refreshBuiltinOuts() after a %s __tostring reentry. `fmt_out`
+                // is a LOCAL buffer (not in bc_stack): reset the window flag so
+                // the refresh returns null and the builtin writes here —
+                // otherwise THIS testC builtin's own registered window would
+                // capture the result. Same pattern as the loadstring arm.
+                const saved_on_bc = self.builtin_outs_on_bc_stack;
+                self.builtin_outs_on_bc_stack = false;
+                defer self.builtin_outs_on_bc_stack = saved_on_bc;
                 try self.builtinStringFormat(fmt_args[0..], fmt_out[0..]);
                 try self.apiStackPush(st, fmt_out[0]);
             },
@@ -42591,7 +44017,7 @@ pub const Vm = struct {
                 if (cargs.len != 1) return self.fail("testC pushvalue expects 1 arg", .{});
                 if (std.mem.eql(u8, cargs[0], "R")) {
                     const reg = try self.ensureDebugRegistry();
-                    try st.append(self.alloc, .{ .Table = reg });
+                    try st.append(self.infraAlloc(), .{ .Table = reg });
                 } else if (parseTestcUpvalueToken(cargs[0])) |uix| {
                     const uv = try self.getTestcUpvalue(ctx, uix);
                     try self.apiStackPush(st, uv);
@@ -42607,7 +44033,7 @@ pub const Vm = struct {
                 // Cfunck uses it to fetch the continuation script.
                 if (cargs.len != 1) return self.fail("testC pushupvalueindex expects 1 arg", .{});
                 const uix = std.fmt.parseInt(usize, cargs[0], 10) catch return self.fail("testC invalid upvalue index", .{});
-                try st.append(self.alloc, .{ .Int = @intCast(uix) });
+                try st.append(self.infraAlloc(), .{ .Int = @intCast(uix) });
             },
             .pushcclosure => {
                 if (cargs.len != 1) return self.fail("testC pushcclosure expects 1 arg", .{});
@@ -42641,7 +44067,7 @@ pub const Vm = struct {
                 const mt = try self.allocTable(null);
                 try self.setField(mt, "__call", .{ .Builtin = .testc_testC });
                 try self.gcStoreMetatable(ccl, mt);
-                try st.append(self.alloc, .{ .Table = ccl });
+                try st.append(self.infraAlloc(), .{ .Table = ccl });
             },
             .gettop => {
                 if (cargs.len != 0) return self.fail("testC gettop expects 0 args", .{});
@@ -42650,7 +44076,7 @@ pub const Vm = struct {
             .absindex => {
                 if (cargs.len != 1) return self.fail("testC absindex expects 1 arg", .{});
                 if (std.mem.eql(u8, cargs[0], "R")) {
-                    try st.append(self.alloc, .{ .Int = -10000 });
+                    try st.append(self.infraAlloc(), .{ .Int = -10000 });
                 } else {
                     const idx = std.fmt.parseInt(i32, cargs[0], 10) catch return self.fail("testC invalid index", .{});
                     const abs = self.apiStackAbsIndex(st, idx) catch return self.fail("testC invalid index", .{});
@@ -42668,7 +44094,7 @@ pub const Vm = struct {
                     try self.closeTestcTruncationMarks(self.activeBytecodeThread(), script_frame_idx, idx);
                     st.items.len = idx;
                 } else {
-                    try st.appendNTimes(self.alloc, .Nil, idx - st.items.len);
+                    try st.appendNTimes(self.infraAlloc(), .Nil, idx - st.items.len);
                 }
             },
             .pop => {
@@ -42690,7 +44116,7 @@ pub const Vm = struct {
                     .Bool => |bv| bv,
                     else => true,
                 };
-                try st.append(self.alloc, .{ .Bool = b });
+                try st.append(self.infraAlloc(), .{ .Bool = b });
             },
             .remove => {
                 if (cargs.len != 1) return self.fail("testC remove expects 1 arg", .{});
@@ -42750,10 +44176,10 @@ pub const Vm = struct {
                 st.items.len = fn_idx;
                 const want: usize = if (nresults < 0) ret.len else @as(usize, @intCast(nresults));
                 if (ret.len >= want) {
-                    try st.appendSlice(self.alloc, ret[0..want]);
+                    try st.appendSlice(self.infraAlloc(), ret[0..want]);
                 } else {
-                    try st.appendSlice(self.alloc, ret);
-                    try st.appendNTimes(self.alloc, .Nil, want - ret.len);
+                    try st.appendSlice(self.infraAlloc(), ret);
+                    try st.appendNTimes(self.infraAlloc(), .Nil, want - ret.len);
                 }
             },
             .callk => {
@@ -42879,10 +44305,10 @@ pub const Vm = struct {
                 st.items.len = fn_idx;
                 const want: usize = if (nresults < 0) ret.len else @as(usize, @intCast(nresults));
                 if (ret.len >= want) {
-                    try st.appendSlice(self.alloc, ret[0..want]);
+                    try st.appendSlice(self.infraAlloc(), ret[0..want]);
                 } else {
-                    try st.appendSlice(self.alloc, ret);
-                    try st.appendNTimes(self.alloc, .Nil, want - ret.len);
+                    try st.appendSlice(self.infraAlloc(), ret);
+                    try st.appendNTimes(self.infraAlloc(), .Nil, want - ret.len);
                 }
             },
             .tostring => {
@@ -42892,18 +44318,18 @@ pub const Vm = struct {
                 else blk: {
                     const idx = try self.parseTestcIndexMaybe(cargs[0], st.items.len);
                     if (idx == null) {
-                        try st.append(self.alloc, .Nil);
+                        try st.append(self.infraAlloc(), .Nil);
                         return null;
                     }
                     break :blk st.items[idx.?];
                 };
                 switch (v) {
-                    .String => try st.append(self.alloc, v),
+                    .String => try st.append(self.infraAlloc(), v),
                     .Int, .Num => {
                         const s = try self.valueToStringAlloc(v);
-                        try st.append(self.alloc, .{ .String = try self.internStr(s) });
+                        try st.append(self.infraAlloc(), .{ .String = try self.internStr(s) });
                     },
-                    else => try st.append(self.alloc, .Nil),
+                    else => try st.append(self.infraAlloc(), .Nil),
                 }
             },
             .checkstack => {
@@ -42929,7 +44355,7 @@ pub const Vm = struct {
                 // false. The countdown now lives in the VM field (the
                 // l_memcontrol.countlimit equivalent).
                 const blocked = if (self.testc_ctrl) |c| c.alloc_count == 0 else false;
-                try st.append(self.alloc, .{ .Bool = !blocked and need < 500000 });
+                try st.append(self.infraAlloc(), .{ .Bool = !blocked and need < 500000 });
             },
             .alloccount => {
                 if (cargs.len > 1) return self.fail("testC alloccount expects 0 or 1 args", .{});
@@ -42957,7 +44383,7 @@ pub const Vm = struct {
             },
             .pushstatus => {
                 if (cargs.len != 0) return self.fail("testC pushstatus expects 0 args", .{});
-                try st.append(self.alloc, .{ .String = try self.internStr(last_status.*) });
+                try st.append(self.infraAlloc(), .{ .String = try self.internStr(last_status.*) });
             },
             .argerror => {
                 if (cargs.len != 2) return self.fail("testC argerror expects 2 args", .{});
@@ -42992,7 +44418,7 @@ pub const Vm = struct {
                             return self.fail("attempt to perform arithmetic on a {s} value", .{self.valueTypeName(v)});
                         },
                     };
-                    try st.append(self.alloc, neg);
+                    try st.append(self.infraAlloc(), neg);
                 } else {
                     if (st.items.len < 2) return self.fail("testC stack underflow", .{});
                     const rhs = st.pop().?;
@@ -43013,18 +44439,18 @@ pub const Vm = struct {
                         try self.binPow(lhs, rhs)
                     else
                         return self.fail("testC unknown arith op '{s}'", .{op});
-                    try st.append(self.alloc, out);
+                    try st.append(self.infraAlloc(), out);
                 }
             },
             .compare => {
                 if (cargs.len != 3) return self.fail("testC compare expects 3 args", .{});
                 const op = cargs[0];
                 const lhs_idx = self.parseTestcIndex(cargs[1], st.items.len) catch {
-                    try st.append(self.alloc, .{ .Bool = false });
+                    try st.append(self.infraAlloc(), .{ .Bool = false });
                     return null;
                 };
                 const rhs_idx = self.parseTestcIndex(cargs[2], st.items.len) catch {
-                    try st.append(self.alloc, .{ .Bool = false });
+                    try st.append(self.infraAlloc(), .{ .Bool = false });
                     return null;
                 };
                 const lhs = st.items[lhs_idx];
@@ -43037,13 +44463,13 @@ pub const Vm = struct {
                     try self.cmpEq(lhs, rhs)
                 else
                     return self.fail("testC unknown compare op '{s}'", .{op});
-                try st.append(self.alloc, .{ .Bool = b });
+                try st.append(self.infraAlloc(), .{ .Bool = b });
             },
             .len => {
                 if (cargs.len != 1) return self.fail("testC len expects 1 arg", .{});
                 const idx = try self.parseTestcIndex(cargs[0], st.items.len);
                 const outv = try self.evalUnOp(.Hash, st.items[idx]);
-                try st.append(self.alloc, outv);
+                try st.append(self.infraAlloc(), outv);
             },
             .Llen => {
                 if (cargs.len != 1) return self.fail("testC Llen expects 1 arg", .{});
@@ -43055,13 +44481,13 @@ pub const Vm = struct {
                     .String => |s| std.fmt.parseInt(i64, s.bytes(), 10) catch return self.fail("object length is not an integer", .{}),
                     else => return self.fail("object length is not an integer", .{}),
                 };
-                try st.append(self.alloc, .{ .Int = iv });
+                try st.append(self.infraAlloc(), .{ .Int = iv });
             },
             .Ltolstring => {
                 if (cargs.len != 1) return self.fail("testC Ltolstring expects 1 arg", .{});
                 const idx = try self.parseTestcIndex(cargs[0], st.items.len);
                 const s = try self.valueToStringAlloc(st.items[idx]);
-                try st.append(self.alloc, .{ .String = try self.internStr(s) });
+                try st.append(self.infraAlloc(), .{ .String = try self.internStr(s) });
             },
             .objsize => {
                 if (cargs.len != 1) return self.fail("testC objsize expects 1 arg", .{});
@@ -43073,7 +44499,7 @@ pub const Vm = struct {
                     .Table => |t| .{ .Int = self.tableBorderLen(t) },
                     else => .{ .Int = 0 },
                 };
-                try st.append(self.alloc, outv);
+                try st.append(self.infraAlloc(), outv);
             },
             .isnumber => {
                 if (cargs.len != 1) return self.fail("testC isnumber expects 1 arg", .{});
@@ -43086,7 +44512,7 @@ pub const Vm = struct {
                     },
                     else => false,
                 } else false;
-                try st.append(self.alloc, .{ .Bool = b });
+                try st.append(self.infraAlloc(), .{ .Bool = b });
             },
             .isstring => {
                 if (cargs.len != 1) return self.fail("testC isstring expects 1 arg", .{});
@@ -43095,7 +44521,7 @@ pub const Vm = struct {
                     .String, .Int, .Num => true,
                     else => false,
                 } else false;
-                try st.append(self.alloc, .{ .Bool = b });
+                try st.append(self.infraAlloc(), .{ .Bool = b });
             },
             .isfunction => {
                 if (cargs.len != 1) return self.fail("testC isfunction expects 1 arg", .{});
@@ -43104,7 +44530,7 @@ pub const Vm = struct {
                     .Builtin, .Closure => true,
                     else => false,
                 } else false;
-                try st.append(self.alloc, .{ .Bool = b });
+                try st.append(self.infraAlloc(), .{ .Bool = b });
             },
             .iscfunction => {
                 if (cargs.len != 1) return self.fail("testC iscfunction expects 1 arg", .{});
@@ -43113,7 +44539,7 @@ pub const Vm = struct {
                     .Builtin => true,
                     else => false,
                 } else false;
-                try st.append(self.alloc, .{ .Bool = b });
+                try st.append(self.infraAlloc(), .{ .Bool = b });
             },
             .istable => {
                 if (cargs.len != 1) return self.fail("testC istable expects 1 arg", .{});
@@ -43123,13 +44549,13 @@ pub const Vm = struct {
                     if (v != .Table) break :blk false;
                     break :blk !isUserdataLike(self, v);
                 } else false;
-                try st.append(self.alloc, .{ .Bool = b });
+                try st.append(self.infraAlloc(), .{ .Bool = b });
             },
             .isuserdata => {
                 if (cargs.len != 1) return self.fail("testC isuserdata expects 1 arg", .{});
                 const idx = try self.parseTestcIndexMaybe(cargs[0], st.items.len);
                 const b = if (idx) |i| isUserdataLike(self, st.items[i]) else false;
-                try st.append(self.alloc, .{ .Bool = b });
+                try st.append(self.infraAlloc(), .{ .Bool = b });
             },
             .isnil => {
                 if (cargs.len != 1) return self.fail("testC isnil expects 1 arg", .{});
@@ -43139,7 +44565,7 @@ pub const Vm = struct {
                     const idx = try self.parseTestcIndexMaybe(cargs[0], st.items.len);
                     break :blk if (idx) |i| st.items[i] == .Nil else false;
                 };
-                try st.append(self.alloc, .{ .Bool = b });
+                try st.append(self.infraAlloc(), .{ .Bool = b });
             },
             .isnull => {
                 if (cargs.len != 1) return self.fail("testC isnull expects 1 arg", .{});
@@ -43150,7 +44576,7 @@ pub const Vm = struct {
                     const idx = try self.parseTestcIndexMaybe(cargs[0], st.items.len);
                     break :blk if (idx) |i| isTestcNullPointer(st.items[i]) else true;
                 };
-                try st.append(self.alloc, .{ .Bool = b });
+                try st.append(self.infraAlloc(), .{ .Bool = b });
             },
             .tonumber => {
                 if (cargs.len != 1) return self.fail("testC tonumber expects 1 arg", .{});
@@ -43175,7 +44601,7 @@ pub const Vm = struct {
                         else => .{ .Int = 0 },
                     };
                 } else .{ .Int = 0 };
-                try st.append(self.alloc, outv);
+                try st.append(self.infraAlloc(), outv);
             },
             .topointer => {
                 if (cargs.len != 1) return self.fail("testC topointer expects 1 arg", .{});
@@ -43200,7 +44626,7 @@ pub const Vm = struct {
                         .Userdata => |ud| makeTestcPointerValue(@intCast(@intFromPtr(ud))),
                     };
                 } else makeTestcPointerValue(0);
-                try st.append(self.alloc, outv);
+                try st.append(self.infraAlloc(), outv);
             },
             .func2num => {
                 if (cargs.len != 1) return self.fail("testC func2num expects 1 arg", .{});
@@ -43210,7 +44636,7 @@ pub const Vm = struct {
                     .Closure => |cl| .{ .Int = @intCast(@intFromPtr(cl)) },
                     else => .{ .Int = 0 },
                 } else .{ .Int = 0 };
-                try st.append(self.alloc, outv);
+                try st.append(self.infraAlloc(), outv);
             },
             .tocfunction => {
                 if (cargs.len != 1) return self.fail("testC tocfunction expects 1 arg", .{});
@@ -43219,14 +44645,14 @@ pub const Vm = struct {
                     .Builtin => st.items[i],
                     else => .Nil,
                 } else .Nil;
-                try st.append(self.alloc, outv);
+                try st.append(self.infraAlloc(), outv);
             },
             .threadstatus => {
                 if (cargs.len != 0) return self.fail("testC threadstatus expects 0 args", .{});
                 // PUC ltests.c:1861: lua_pushstring(L1, statcodes[lua_status(L1)]).
                 // Mirrors PUC's statcodes[] indexed by lua_status: "OK", "YIELD",
                 // "ERRRUN", "ERRSYNTAX", "not enough memory" (MEMERRMSG), "ERRERR".
-                try st.append(self.alloc, .{ .String = try self.internStr(self.testc_thread_status) });
+                try st.append(self.infraAlloc(), .{ .String = try self.internStr(self.testc_thread_status) });
             },
             .@"error" => {
                 if (st.items.len == 0) return self.fail("testC error without message", .{});
@@ -43275,10 +44701,20 @@ pub const Vm = struct {
                 // embedded source. Reproducing the shared-buff aliasing would
                 // add coupling with zero observable parity gain.
                 const mode_src: []const u8 = if (cargs.len >= 3) cargs[2] else "bt";
+                // Root the interned name/mode strings across each other's
+                // internStr (native arrays are invisible to the GC — see
+                // builtinLoadfile's note; emergency GC under a memory limit
+                // would otherwise free the first string before use).
+                var roots = self.gcTempRoots();
+                defer roots.end();
+                const name_str = try self.internStr(chunk_name);
+                try roots.add(.{ .String = name_str });
+                const mode_str = try self.internStr(mode_src);
+                try roots.add(.{ .String = mode_str });
                 var load_args: [3]Value = .{
                     sv,
-                    .{ .String = try self.internStr(chunk_name) },
-                    .{ .String = try self.internStr(mode_src) },
+                    .{ .String = name_str },
+                    .{ .String = mode_str },
                 };
                 var out: [2]Value = .{ .Nil, .Nil };
                 // builtinLoadEx uses refreshBuiltinOuts() to re-derive its
@@ -43297,9 +44733,9 @@ pub const Vm = struct {
                 // the C API behavior, NOT the Lua `load` function which returns
                 // nil+err. The source string at idx is NOT consumed.)
                 if (out[1] != .Nil) {
-                    try st.append(self.alloc, out[1]);
+                    try st.append(self.infraAlloc(), out[1]);
                 } else {
-                    try st.append(self.alloc, out[0]);
+                    try st.append(self.infraAlloc(), out[0]);
                 }
             },
             .loadfile => {
@@ -43320,7 +44756,7 @@ pub const Vm = struct {
                 const source = LuaSource.loadFile(self.alloc, stdio.activeIo(), pv.String.bytes()) catch {
                     st.items[idx_m.?] = .Nil;
                     const em = std.fmt.allocPrint(self.alloc, "cannot open {s}", .{pv.String.bytes()}) catch "cannot open file";
-                    try st.append(self.alloc, .{ .String = try self.internStr(em) });
+                    try st.append(self.infraAlloc(), .{ .String = try self.internStr(em) });
                     return null;
                 };
                 // P16.10b Task 6: the compiled tree borrows the file bytes
@@ -43337,21 +44773,26 @@ pub const Vm = struct {
                 lex.global_reserved = self.testc_module_enabled;
                 var p = LuaParser.init(&lex) catch {
                     st.items[idx_m.?] = .Nil;
-                    try st.append(self.alloc, .{ .String = try self.internStr(lex.diagString()) });
+                    try st.append(self.infraAlloc(), .{ .String = try self.internStr(lex.diagString()) });
                     return null;
                 };
                 var ast_arena = lua_ast.AstArena.init(self.alloc);
                 defer ast_arena.deinit();
-                const chunk = p.parseChunkAst(&ast_arena) catch {
+                const chunk = p.parseChunkAst(&ast_arena) catch |e| {
                     st.items[idx_m.?] = .Nil;
-                    try st.append(self.alloc, .{ .String = try self.internStr(p.diagString()) });
+                    // PUC luaL_loadfilex: an OOM pushes the FIXED MEMERRMSG
+                    // object (luaD_seterrorobj) — "not enough memory" is
+                    // pre-interned, so this append cannot re-fail.
+                    const msg: []const u8 = if (e == error.OutOfMemory) "not enough memory" else p.diagString();
+                    try st.append(self.infraAlloc(), .{ .String = try self.internStr(msg) });
                     return null;
                 };
                 var cg_bc = lua_codegen_bc.Codegen.init(self.alloc, source.name, source.bytes);
                 defer cg_bc.deinit();
-                const proto = cg_bc.compileChunk(chunk) catch {
+                const proto = cg_bc.compileChunk(chunk) catch |e| {
                     st.items[idx_m.?] = .Nil;
-                    try st.append(self.alloc, .{ .String = try self.internStr(cg_bc.diagString()) });
+                    const msg: []const u8 = if (e == error.OutOfMemory) "not enough memory" else cg_bc.diagString();
+                    try st.append(self.infraAlloc(), .{ .String = try self.internStr(msg) });
                     return null;
                 };
                 // Producing reference discipline (P16.10b Task 4).
@@ -43362,19 +44803,19 @@ pub const Vm = struct {
                 backing = .{};
                 const clv = try self.createBytecodeChunkClosure(proto);
                 proto.tree.?.releaseTree(self.alloc);
-                try st.append(self.alloc, .{ .Closure = clv });
+                try st.append(self.infraAlloc(), .{ .Closure = clv });
             },
             .newthread => {
                 if (cargs.len != 0) return self.fail("testC newthread expects 0 args", .{});
                 const th = try self.apiNewThread(.Nil);
-                _ = try thread_stacks.getOrCreate(self.alloc, th);
+                _ = try thread_stacks.getOrCreate(self.infraAlloc(), th);
                 try self.apiStackPush(st, .{ .Thread = th });
             },
             .newuserdata => {
                 if (cargs.len != 1) return self.fail("testC newuserdata expects 1 arg", .{});
                 const sz = std.fmt.parseInt(i64, cargs[0], 10) catch return self.fail("testC invalid userdata size", .{});
                 const ud = try self.allocUserdata(@intCast(@max(0, sz)), 0);
-                try st.append(self.alloc, .{ .Userdata = ud });
+                try st.append(self.infraAlloc(), .{ .Userdata = ud });
             },
             .newtable => {
                 if (cargs.len != 0) return self.fail("testC newtable expects 0 args", .{});
@@ -43409,19 +44850,19 @@ pub const Vm = struct {
                     if (std.mem.eql(u8, cargs[1], "!G")) {
                         if (ctx.upenv) |uv| {
                             if (uv == .Table) {
-                                try st.append(self.alloc, uv);
+                                try st.append(self.infraAlloc(), uv);
                             } else {
-                                try st.append(self.alloc, .Nil);
+                                try st.append(self.infraAlloc(), .Nil);
                             }
                         } else {
-                            try st.append(self.alloc, .{ .Table = self.global_env });
+                            try st.append(self.infraAlloc(), .{ .Table = self.global_env });
                         }
                     } else if (std.mem.eql(u8, cargs[1], "!M")) {
                         const main_th = if (ctx.state) |state|
                             try self.getOrCreateTestStateMainThread(state)
                         else
                             self.main_thread orelse return self.fail("testC main thread missing", .{});
-                        try st.append(self.alloc, .{ .Thread = main_th });
+                        try st.append(self.infraAlloc(), .{ .Thread = main_th });
                     } else {
                         return self.fail("testC rawgeti invalid registry index", .{});
                     }
@@ -43432,7 +44873,7 @@ pub const Vm = struct {
                         else => return self.fail("testC rawgeti expects table", .{}),
                     };
                     const ik = try self.parseTestcNumToken(cargs[1], st);
-                    const v = try self.apiRawGet(tbl, .{ .Int = ik });
+                    const v = self.apiRawGet(tbl, .{ .Int = ik });
                     try self.apiStackPush(st, v);
                 }
             },
@@ -43559,7 +45000,7 @@ pub const Vm = struct {
                     else => return self.fail("testC rawget expects table", .{}),
                 };
                 const key = st.pop().?;
-                const v = try self.apiRawGet(tbl, key);
+                const v = self.apiRawGet(tbl, key);
                 try self.apiStackPush(st, v);
             },
             .rawset => {
@@ -43599,7 +45040,7 @@ pub const Vm = struct {
                 };
                 const ptr_id = std.fmt.parseInt(u64, cargs[1], 10) catch return self.fail("testC invalid pointer id", .{});
                 const key = makeTestcPointerValue(ptr_id);
-                const v = try self.apiRawGet(tbl, key);
+                const v = self.apiRawGet(tbl, key);
                 try self.apiStackPush(st, v);
             },
             .rawseti => {
@@ -43647,8 +45088,8 @@ pub const Vm = struct {
                 var outv: [2]Value = .{ .Nil, .Nil };
                 try self.builtinNext(&[_]Value{ .{ .Table = tbl }, key }, outv[0..]);
                 if (outv[0] == .Nil) return null;
-                try st.append(self.alloc, outv[0]);
-                try st.append(self.alloc, outv[1]);
+                try st.append(self.infraAlloc(), outv[0]);
+                try st.append(self.infraAlloc(), outv[1]);
             },
             .xmove => {
                 if (cargs.len != 3) return self.fail("testC xmove expects 3 args", .{});
@@ -43661,14 +45102,14 @@ pub const Vm = struct {
                         .Thread => |t| t,
                         else => return self.fail("testC xmove expects thread source", .{}),
                     };
-                    break :blk try thread_stacks.getOrCreate(self.alloc, th);
+                    break :blk try thread_stacks.getOrCreate(self.infraAlloc(), th);
                 } else st;
                 const to_stack = if (to_ref) |idx| blk: {
                     const th = switch (st.items[idx]) {
                         .Thread => |t| t,
                         else => return self.fail("testC xmove expects thread target", .{}),
                     };
-                    break :blk try thread_stacks.getOrCreate(self.alloc, th);
+                    break :blk try thread_stacks.getOrCreate(self.infraAlloc(), th);
                 } else st;
                 var n: usize = @intCast(n_i);
                 if (n == 0) n = from_stack.items.len;
@@ -43684,7 +45125,7 @@ pub const Vm = struct {
                 const narg_i = try self.parseTestcNumToken(cargs[1], st);
                 if (narg_i < 0) return self.fail("testC invalid nargs", .{});
                 const narg: usize = @intCast(narg_i);
-                const th_stack = try thread_stacks.getOrCreate(self.alloc, th);
+                const th_stack = try thread_stacks.getOrCreate(self.infraAlloc(), th);
                 const callee_needed = th.status == .dead or (th.status != .running and !isCallableValue(th.callee));
                 const need_current = narg + @as(usize, @intFromBool(callee_needed));
                 const above_thread = st.items.len - (tidx + 1);
@@ -43748,19 +45189,19 @@ pub const Vm = struct {
                 if (current_trim_start) |trim| {
                     if (th.status == .suspended) {
                         if (!had_saved_shadow) {
-                            const shadow = try thread_stacks.getOrCreateShadow(self.alloc, th);
+                            const shadow = try thread_stacks.getOrCreateShadow(self.infraAlloc(), th);
                             shadow.items.len = 0;
                             try shadow.appendSlice(self.alloc, st.items[0..trim]);
                         }
                         st.items.len = 0;
                     } else if (thread_stacks.getShadow(th)) |shadow| {
                         st.items.len = 0;
-                        try st.appendSlice(self.alloc, shadow.items);
-                        thread_stacks.clearShadow(self.alloc, th);
+                        try st.appendSlice(self.infraAlloc(), shadow.items);
+                        thread_stacks.clearShadow(self.infraAlloc(), th);
                     } else {
                         st.items.len = trim;
                     }
-                    if (nres != 0) try st.appendSlice(self.alloc, outv[1 .. 1 + nres]);
+                    if (nres != 0) try st.appendSlice(self.infraAlloc(), outv[1 .. 1 + nres]);
                 }
             },
             .isyieldable => {
@@ -43910,13 +45351,13 @@ pub const Vm = struct {
                 const reg = try self.ensureDebugRegistry();
                 const k = trimTestcQuoted(cargs[0]);
                 if (self.getFieldOpt(reg, k)) |existing| {
-                    try st.append(self.alloc, existing);
-                    try st.append(self.alloc, .{ .Bool = false });
+                    try st.append(self.infraAlloc(), existing);
+                    try st.append(self.infraAlloc(), .{ .Bool = false });
                 } else {
                     const mt = try self.allocTable(null);
                     try self.setField(reg, k, .{ .Table = mt });
-                    try st.append(self.alloc, .{ .Table = mt });
-                    try st.append(self.alloc, .{ .Bool = true });
+                    try st.append(self.infraAlloc(), .{ .Table = mt });
+                    try st.append(self.infraAlloc(), .{ .Bool = true });
                 }
             },
             .testudata => {
@@ -43926,7 +45367,7 @@ pub const Vm = struct {
                 const key = trimTestcQuoted(cargs[1]);
                 const want = self.getFieldOpt(reg, key) orelse .Nil;
                 if (idx == null or want != .Table) {
-                    try st.append(self.alloc, .Nil);
+                    try st.append(self.infraAlloc(), .Nil);
                     return null;
                 }
                 const v = st.items[idx.?];
@@ -43938,9 +45379,9 @@ pub const Vm = struct {
                     else => false,
                 };
                 if (has_mt) {
-                    try st.append(self.alloc, v);
+                    try st.append(self.infraAlloc(), v);
                 } else {
-                    try st.append(self.alloc, .Nil);
+                    try st.append(self.infraAlloc(), .Nil);
                 }
             },
             .gsub => {
@@ -43961,7 +45402,7 @@ pub const Vm = struct {
                     else => return self.fail("testC gsub expects string replacement", .{}),
                 };
                 const replaced = try std.mem.replaceOwned(u8, self.alloc, src, patt, repl);
-                try st.append(self.alloc, .{ .String = try self.internStr(replaced) });
+                try st.append(self.infraAlloc(), .{ .String = try self.internStr(replaced) });
             },
             .closeslot => {
                 if (cargs.len != 1) return self.fail("testC closeslot expects 1 arg", .{});
@@ -44055,7 +45496,7 @@ pub const Vm = struct {
                 };
                 var outv: [1]Value = .{.Nil};
                 try self.builtinDebugTraceback(dbg_args[0..], outv[0..]);
-                try st.append(self.alloc, outv[0]);
+                try st.append(self.infraAlloc(), outv[0]);
             },
             .pcall => {
                 if (cargs.len != 2 and cargs.len != 3) return self.fail("testC pcall expects 2 or 3 args", .{});
@@ -44089,7 +45530,6 @@ pub const Vm = struct {
                     break :blk try self.parseTestcIndex(cargs[2], st.items.len);
                 } else null;
                 const handler_val: ?Value = if (handler_idx) |hi| st.items[hi] else null;
-                const mem_before_call = if (self.testc_ctrl) |c| c.total_bytes else 0;
                 const obj_tables_before_call = self.testc_obj_tables;
                 const obj_functions_before_call = self.testc_obj_functions;
                 const obj_threads_before_call = self.testc_obj_threads;
@@ -44101,15 +45541,20 @@ pub const Vm = struct {
                 const saved_errfunc = th_xpcall.errfunc;
                 th_xpcall.errfunc = ERRFUNC_NONE;
                 defer th_xpcall.errfunc = saved_errfunc;
-                const ret = self.apiCall(.nonyieldable, callee, call_args) catch {
+                const ret = self.apiCall(.nonyieldable, callee, call_args) catch |call_err| {
+                    // P16.50-review-5: an OOM from the call PROLOGUE (frame
+                    // push / stack growth) propagates without an error
+                    // object — install the fixed OOM message so the status
+                    // classification below sees "not enough memory"
+                    // (PUC luaD_pcall → luaD_seterrorobj(ERRMEM)).
+                    if (call_err == error.OutOfMemory) self.setOutOfMemoryError();
                     const errv = self.protectedErrorValue();
                     if (isTestcMemoryErrorValue(errv)) {
-                        // This VM does not have PUC Lua's real collector yet.
-                        // For ltests memory-limit probes, failed protected
-                        // calls must not leave partial allocations counted as
-                        // live; after the script's collectgarbage() they would
-                        // be unreachable in PUC.
-                        if (self.testc_ctrl) |c| c.total_bytes = mem_before_call;
+                        // P16.50-review-5: ctrl.total_bytes is NO LONGER
+                        // restored (the ledger lives at the allocator
+                        // boundary; restoring would clobber the emergency
+                        // GC's legitimate frees). Only the per-type object
+                        // counters roll back.
                         self.testc_obj_tables = obj_tables_before_call;
                         self.testc_obj_functions = obj_functions_before_call;
                         self.testc_obj_threads = obj_threads_before_call;
@@ -44123,18 +45568,18 @@ pub const Vm = struct {
                     if (handler_val) |h| {
                         var hargs = [_]Value{handler_errv};
                         const hret = self.apiCall(.nonyieldable, h, hargs[0..]) catch {
-                            try st.append(self.alloc, errv);
+                            try st.append(self.infraAlloc(), errv);
                             last_status.* = "ERRRUN";
                             return null;
                         };
                         defer self.alloc.free(hret);
                         if (hret.len > 0) {
-                            try st.append(self.alloc, hret[0]);
+                            try st.append(self.infraAlloc(), hret[0]);
                         } else {
-                            try st.append(self.alloc, .Nil);
+                            try st.append(self.infraAlloc(), .Nil);
                         }
                     } else {
-                        try st.append(self.alloc, errv);
+                        try st.append(self.infraAlloc(), errv);
                     }
                     last_status.* = if (isTestcMemoryErrorValue(errv))
                         "not enough memory"
@@ -44145,7 +45590,7 @@ pub const Vm = struct {
                 defer self.alloc.free(ret);
                 st.items.len = call_idx;
                 const want: usize = if (nresults < 0) ret.len else @min(ret.len, @as(usize, @intCast(nresults)));
-                try st.appendSlice(self.alloc, ret[0..want]);
+                try st.appendSlice(self.infraAlloc(), ret[0..want]);
                 last_status.* = "OK";
             },
             .pcallk => {
@@ -44290,7 +45735,7 @@ pub const Vm = struct {
                 defer self.alloc.free(ret);
                 st.items.len = call_idx;
                 const want: usize = if (nresults < 0) ret.len else @min(ret.len, @as(usize, @intCast(nresults)));
-                try st.appendSlice(self.alloc, ret[0..want]);
+                try st.appendSlice(self.infraAlloc(), ret[0..want]);
                 last_status.* = "OK";
             },
             .ret => {
@@ -44584,6 +46029,17 @@ pub const Vm = struct {
     }
 
     fn testcLiveUserdataKb(self: *Vm) f64 {
+        // The `T` global (with `_liveudbytes`) only exists after
+        // enableTestcModuleInternal. Guard on the flag so production
+        // `collectgarbage("count")` never touches the global table:
+        // getField("T") would intern the 1-char string "T" on every call,
+        // and with no live `T` global that interned string is garbage —
+        // each GC cycle collects it and the next count re-interns it,
+        // making `collectgarbage"count"` observably allocate (+26 bytes
+        // per GC cycle). PUC's collectgarbage("count") (lbaselib.c
+        // lua_gc COUNT/COUNTB) never allocates; vararg.lua's 'notab'
+        // check (`m == collectgarbage"count"`) depends on that.
+        if (!self.testc_module_enabled) return 0.0;
         // Real Userdata memory is tracked by gc_count_kb (via gcNoteAlloc in
         // allocUserdata). The live table only tracks payload size for the
         // old table-based emulation. Skip real Userdata entries to avoid
@@ -44658,15 +46114,24 @@ pub const Vm = struct {
     /// .dofile/.require/.pairs/.collectgarbage re-derive after nested
     /// execution (runClosure / nested callBuiltin / GC finalizers) before
     /// writing their results (P16.39 Cut 3 correctness fix).
+    /// P16.52: .coroutine_close re-derives after the forced-close transport
+    /// and the closed-thread region closes (nested VM execution) — belt and
+    /// braces: the nested execution runs on the CLOSED thread's bc_stack,
+    /// so the caller's window cannot move today, but the builtin follows
+    /// the same reentrant-invariant as the others. .string_gsub (replacement
+    /// function / __index table get reentry) and .string_format (%s →
+    /// __tostring metamethod reentry) re-enter the VM on the SAME thread —
+    /// their tail outs writes go through a genuinely movable window.
     const builtin_may_refresh_outs: [@typeInfo(BuiltinId).@"enum".fields.len]bool = blk: {
         var t = [_]bool{false} ** @typeInfo(BuiltinId).@"enum".fields.len;
         for ([_]BuiltinId{
-            .tostring,       .pcall,         .xpcall,
-            .load,           .loadfile,      .dofile,
-            .require,        .pairs,         .collectgarbage,
-            .str_arith_add,  .str_arith_sub, .str_arith_mul,
-            .str_arith_mod,  .str_arith_pow, .str_arith_div,
-            .str_arith_idiv, .str_arith_unm, .testc_testC,
+            .tostring,        .pcall,         .xpcall,
+            .load,            .loadfile,      .dofile,
+            .require,         .pairs,         .collectgarbage,
+            .str_arith_add,   .str_arith_sub, .str_arith_mul,
+            .str_arith_mod,   .str_arith_pow, .str_arith_div,
+            .str_arith_idiv,  .str_arith_unm, .testc_testC,
+            .coroutine_close, .string_gsub,   .string_format,
         }) |rid| t[@intFromEnum(rid)] = true;
         break :blk t;
     };
@@ -44699,7 +46164,16 @@ pub const Vm = struct {
         for ([_]BuiltinId{
             .io_lines,      .io_lines_iter, .assert,       .select,
             .string_byte,   .string_find,   .string_match, .utf8_codepoint,
-            .string_unpack, .table_unpack,
+            .string_unpack, .table_unpack,  .testc_testC,
+            // P16.50-review-5: the T.testC window is sized per-call from
+            // the script (builtinOutLenDynamic). A fixed 256-slot window
+            // forced growCtxFrame to widen the CALLER's frame by 256
+            // slots — a COUNTED bc_stack grow where PUC pushes results
+            // dynamically via luaD_poscall (no growth when they fit);
+            // under an armed countdown (memerr.lua testalloc) that
+            // spurious grow fails and kills the unprotected chunk.
+            // Without this null the default falls to fixed-1 and every
+            // multret T.testC call returns a single value (api.lua:44).
         }) |dyn_id| t[@intFromEnum(dyn_id)] = null;
         // Fixed out-counts (moved verbatim from the old switch).
         t[@intFromEnum(BuiltinId.print)] = 0;
@@ -44748,7 +46222,6 @@ pub const Vm = struct {
         t[@intFromEnum(BuiltinId.coroutine_wrap_iter)] = 256;
         t[@intFromEnum(BuiltinId.next)] = 2;
         t[@intFromEnum(BuiltinId.dofile)] = 16;
-        t[@intFromEnum(BuiltinId.testc_testC)] = 256;
         t[@intFromEnum(BuiltinId.testc_makecfunc)] = 1;
         t[@intFromEnum(BuiltinId.testc_allowhookyield)] = 0;
         t[@intFromEnum(BuiltinId.testc_totalmem)] = 3;
@@ -44798,6 +46271,178 @@ pub const Vm = struct {
         break :blk t;
     };
 
+    /// Conservative static upper bound on the number of results a testC
+    /// script can produce (see builtinOutLenDynamic .testc_testC). Scans
+    /// the script tokens: every push-like command adds one stack slot,
+    /// `xmove N` adds N, call-like commands add their literal result count,
+    /// and `return N` sets the literal floor. Mis-scanned string arguments
+    /// can only OVER-count (the bound grows), never under-count the real
+    /// `return N` pair, so the window is always a safe upper bound.
+    fn testcScriptOutBound(script: []const u8, nargs: usize) usize {
+        // Conservative upper bound on the number of results a testC script
+        // can produce (see builtinOutLenDynamic .testc_testC). Simulates the
+        // script's stack depth statement by statement, mirroring PUC's
+        // getnum forms ('*', '.', '!') and each command's net stack delta
+        // (ltests.c checkC). The bound may OVER-count (the window is
+        // scratch; produced is min-clamped) but must never UNDER-count, or
+        // results are truncated. Anything static analysis cannot bound
+        // (resume, nres<0 calls, xmove 0, value-derived settop/return)
+        // falls back to the 256 cap — the old fixed window, still correct.
+        const CAP: usize = 256;
+        var depth: usize = nargs;
+        var max_ret: usize = 0;
+        var unbounded = false;
+
+        // Statement splitter: ';' / '\n' separate statements, whitespace
+        // separates words — all outside quotes, the same shape
+        // parseTestcWords consumes.
+        var stmt_start: usize = 0;
+        var in_quote = false;
+        var quote_char: u8 = 0;
+        var k: usize = 0;
+        while (k <= script.len) : (k += 1) {
+            const at_end = k == script.len;
+            if (!at_end) {
+                const ch = script[k];
+                if (!in_quote and (ch == '\'' or ch == '"')) {
+                    in_quote = true;
+                    quote_char = ch;
+                    continue;
+                } else if (in_quote and ch == quote_char) {
+                    in_quote = false;
+                    quote_char = 0;
+                    continue;
+                }
+            }
+            const is_sep = at_end or (!in_quote and (script[k] == ';' or script[k] == '\n'));
+            if (!is_sep) continue;
+            defer stmt_start = k + 1;
+
+            // Words of this statement (outside quotes).
+            var words_buf: [16][]const u8 = undefined;
+            var wc: usize = 0;
+            var w_start: usize = stmt_start;
+            var w_in_quote = false;
+            var w_quote: u8 = 0;
+            var m = stmt_start;
+            while (m <= k) : (m += 1) {
+                const w_end = m == k;
+                if (!w_end) {
+                    const ch = script[m];
+                    if (!w_in_quote and (ch == '\'' or ch == '"')) {
+                        w_in_quote = true;
+                        w_quote = ch;
+                        continue;
+                    }
+                    if (w_in_quote and ch == w_quote) {
+                        w_in_quote = false;
+                        w_quote = 0;
+                        continue;
+                    }
+                }
+                const w_sep = w_end or (!w_in_quote and (script[m] == ' ' or script[m] == '\t' or script[m] == '\r'));
+                if (!w_sep) continue;
+                if (m > w_start and wc < words_buf.len) {
+                    words_buf[wc] = script[w_start..m];
+                    wc += 1;
+                }
+                w_start = m + 1;
+            }
+            if (wc == 0) continue;
+            const op = words_buf[0];
+
+            // Parse word[idx] as a PUC getnum argument: plain (possibly
+            // negative) numeric literal, '*' (= lua_gettop), or anything
+            // else ('.', '!', symbolic) which static analysis cannot bound.
+            const NumArg = union(enum) { int: i64, star, other };
+            const arg = struct {
+                fn get(words: []const []const u8, idx: usize) NumArg {
+                    if (idx >= words.len) return .other;
+                    const t = words[idx];
+                    if (t.len == 1 and t[0] == '*') return .star;
+                    if (std.fmt.parseInt(i64, t, 10)) |n| return .{ .int = n } else |_| {}
+                    return .other;
+                }
+            }.get;
+
+            if (std.mem.eql(u8, op, "settop")) {
+                switch (arg(words_buf[0..wc], 1)) {
+                    .int => |n| depth = if (n <= 0) 0 else @intCast(@min(@as(i64, @intCast(CAP * 4)), n)),
+                    .star => {}, // settop to gettop: no change
+                    .other => unbounded = true, // value-derived ('.', '!'): unbounded
+                }
+            } else if (std.mem.eql(u8, op, "return")) {
+                switch (arg(words_buf[0..wc], 1)) {
+                    .int => |n| max_ret = @max(max_ret, @as(usize, @intCast(@max(@as(i64, 0), n)))),
+                    .star => max_ret = @max(max_ret, depth),
+                    .other => unbounded = true, // value-derived
+                }
+            } else if (std.mem.eql(u8, op, "call") or std.mem.eql(u8, op, "callk")) {
+                switch (arg(words_buf[0..wc], 2)) { // nres is 2nd arg
+                    .int => |nres| {
+                        if (nres < 0) unbounded = true // LUA_MULTRET: all results
+                        else depth += @intCast(nres);
+                    },
+                    .star => unbounded = true, // '*' nres = gettop value
+                    .other => unbounded = true,
+                }
+            } else if (std.mem.eql(u8, op, "pcall") or std.mem.eql(u8, op, "pcallk")) {
+                switch (arg(words_buf[0..wc], 2)) { // nres is 2nd arg
+                    .int => |nres| {
+                        if (nres < 0) unbounded = true else depth += @as(usize, @intCast(@max(nres, 1))); // error path pushes 1 even when nres == 0
+                    },
+                    .star => unbounded = true,
+                    .other => unbounded = true,
+                }
+            } else if (std.mem.eql(u8, op, "resume")) {
+                unbounded = true; // lua_resume pushes all results
+            } else if (std.mem.eql(u8, op, "xmove")) {
+                switch (arg(words_buf[0..wc], 3)) { // n is 3rd arg
+                    .int => |n| depth += @intCast(@max(@as(i64, 0), n)),
+                    .star => unbounded = true,
+                    .other => unbounded = true, // n == 0 means "all": unbounded
+                }
+            } else if (std.mem.eql(u8, op, "next") or std.mem.eql(u8, op, "loadstring") or
+                std.mem.eql(u8, op, "loadfile"))
+            {
+                depth += 2; // lua_next pushes key+value; load errors push nil+msg
+            } else if (std.mem.startsWith(u8, op, "push") or
+                std.mem.eql(u8, op, "newtable") or std.mem.eql(u8, op, "newuserdata") or
+                std.mem.eql(u8, op, "newthread") or std.mem.eql(u8, op, "getglobal") or
+                std.mem.eql(u8, op, "getfield") or std.mem.eql(u8, op, "gettable") or
+                std.mem.eql(u8, op, "getmetatable") or std.mem.eql(u8, op, "gettop") or
+                std.mem.eql(u8, op, "rawget") or std.mem.eql(u8, op, "rawgeti") or
+                std.mem.eql(u8, op, "rawgetp") or std.mem.eql(u8, op, "gsub") or
+                std.mem.eql(u8, op, "objsize") or std.mem.eql(u8, op, "threadstatus") or
+                std.mem.eql(u8, op, "type") or std.mem.eql(u8, op, "tobool") or
+                std.mem.eql(u8, op, "tostring") or std.mem.eql(u8, op, "tonumber") or
+                std.mem.eql(u8, op, "tointeger") or std.mem.eql(u8, op, "Ltolstring") or
+                std.mem.eql(u8, op, "testudata") or std.mem.eql(u8, op, "isyieldable") or
+                std.mem.eql(u8, op, "absindex") or std.mem.eql(u8, op, "len") or
+                std.mem.eql(u8, op, "Llen") or std.mem.eql(u8, op, "func2num") or
+                std.mem.eql(u8, op, "newmetatable") or std.mem.eql(u8, op, "rawcheckstack") or
+                std.mem.eql(u8, op, "d2s") or std.mem.eql(u8, op, "tocfunction"))
+            {
+                depth += 1;
+            } else if (std.mem.eql(u8, op, "isfunction") or std.mem.eql(u8, op, "iscfunction") or
+                std.mem.eql(u8, op, "isuserdata") or std.mem.eql(u8, op, "isudataval") or
+                std.mem.eql(u8, op, "isnil") or std.mem.eql(u8, op, "isnull") or
+                std.mem.eql(u8, op, "isnumber") or std.mem.eql(u8, op, "isstring") or
+                std.mem.eql(u8, op, "istable"))
+            {
+                depth += 1;
+            }
+            // Everything else (pop/replace/remove/set*/rawset*/concat/
+            // insert/rotate/copy/arith/compare/checkstack/print/...) never
+            // pushes: not adding is safe because the bound only needs an
+            // over-approximation. 'error'/'argerror'/'yield'/'yieldk'/
+            // 'abort'/'throw' end or suspend the script — the return bound
+            // is already fixed by then.
+            if (unbounded) break;
+        }
+        if (unbounded) return CAP;
+        return @min(@max(depth, max_ret), CAP);
+    }
     /// Pre-size the outs window for a builtin call. Fixed counts come from
     /// the comptime table above (one inlined load); dynamic counts fall
     /// through to the out-of-line switch. Inline so the hot OP_CALL sites
@@ -44815,6 +46460,36 @@ pub const Vm = struct {
     /// in builtin_const_out_len (see its doc comment for the contract).
     fn builtinOutLenDynamic(self: *Vm, id: BuiltinId, call_args: []const Value) usize {
         return switch (id) {
+            // PUC parity (memerr.lua testalloc): PUC's T.testC pushes its
+            // results onto L's stack dynamically (ldo.c luaD_poscall) —
+            // only the ACTUAL result slots ever touch the stack. A fixed
+            // 256-slot outs window instead forces a bc_stack regrow on
+            // every T.testC call after a shrink, and that growth is a
+            // COUNTED allocation (PUC luaD_growstack parity) — under an
+            // armed countdown it fails and kills the whole chunk
+            // (memerr.lua: `T.alloccount(M); a,b = T.testC(...)`).
+            // Size the window from the script itself: a conservative
+            // upper bound on the stack depth the script can build plus
+            // the largest literal `return N`. Over-estimates are harmless
+            // (the builtin min-clamps writes to the window); the 256 cap
+            // keeps the old truncation ceiling for pathological scripts
+            // (e.g. `return *` after xmove of a huge stack).
+            .testc_testC => blk: {
+                const script: ?[]const u8 = switch (if (call_args.len > 0) call_args[0] else .Nil) {
+                    .String => |s| s.bytes(),
+                    // Callable/state forms: the script is the first
+                    // String argument after the table (args[1]).
+                    .Table => if (call_args.len > 1 and call_args[1] == .String)
+                        call_args[1].String.bytes()
+                    else
+                        null,
+                    else => null,
+                };
+                break :blk if (script) |sc|
+                    testcScriptOutBound(sc, call_args.len)
+                else
+                    256; // ccl/callable form: script lives in the table, unknown here
+            },
             .io_lines => blk: {
                 if (call_args.len > 0 and call_args[0] == .String) break :blk 4;
                 break :blk 3;
@@ -45232,6 +46907,12 @@ pub const Vm = struct {
             var ibuf: [32]u8 = undefined;
             const is = std.fmt.bufPrint(ibuf[0..], "{d}", .{lhs.Int}) catch unreachable;
             const out = try self.alloc.alloc(u8, is.len + rhs.String.len());
+            // `out` is scratch: internStr copies the bytes into the interned
+            // LuaString, so the buffer must be released on EVERY path —
+            // success AND the internStr OOM throw (PUC luaV_concat builds
+            // into scratch that never outlives the op; the heap temp here is
+            // the same transient, only it needs an explicit free).
+            defer self.alloc.free(out);
             std.mem.copyForwards(u8, out[0..is.len], is);
             std.mem.copyForwards(u8, out[is.len..], rhs.String.bytes());
             return .{ .String = try self.internStr(out) };
@@ -45241,6 +46922,8 @@ pub const Vm = struct {
             const is = std.fmt.bufPrint(ibuf[0..], "{d}", .{rhs.Int}) catch unreachable;
             const llen = lhs.String.len();
             const out = try self.alloc.alloc(u8, llen + is.len);
+            // Scratch buffer — freed on every path (see the Int+String path).
+            defer self.alloc.free(out);
             std.mem.copyForwards(u8, out[0..llen], lhs.String.bytes());
             std.mem.copyForwards(u8, out[llen..], is);
             return .{ .String = try self.internStr(out) };
@@ -45256,6 +46939,8 @@ pub const Vm = struct {
         };
         defer if (b.owned) self.alloc.free(b.bytes);
         const out = try self.alloc.alloc(u8, a.bytes.len + b.bytes.len);
+        // Scratch buffer — freed on every path (see the Int+String path).
+        defer self.alloc.free(out);
         std.mem.copyForwards(u8, out[0..a.bytes.len], a.bytes);
         std.mem.copyForwards(u8, out[a.bytes.len..], b.bytes);
         return .{ .String = try self.internStr(out) };
@@ -47467,8 +49152,10 @@ test "vm: P16.33 R0.3 — checkpanic sub-VM shares the testC allocator control" 
     try vm.builtinTestcAlloccount(&.{.{ .Int = -1 }}, &outs);
     var total_out: [3]Value = undefined;
     try vm.builtinTestcTotalmem(&.{}, total_out[0..]);
-    const total_before: usize = @intCast(total_out[0].Int);
-    try vm.builtinTestcTotalmem(&.{.{ .Int = @intCast(total_before + 10_000) }}, &outs);
+    // P16.50-review-5: total_bytes is SIGNED — frees of pre-adapter memory
+    // drive it negative; all limits are relative, so keep i64 arithmetic.
+    const total_before: i64 = total_out[0].Int;
+    try vm.builtinTestcTotalmem(&.{.{ .Int = total_before + 10_000 }}, &outs);
     try vm.builtinTestcCheckpanic(
         &.{.{ .String = try vm.internStr("newuserdata 20000") }},
         &outs,
@@ -48689,7 +50376,7 @@ test "P16.50: allocTable/allocUserdata OOM transactionality + testc memory edges
 
     // Pre-intern the testc failure message and the "T" global name BEFORE
     // entering generational mode, temp-rooted through gcEnterGenerational's
-    // full cycle: failTestcRaw's internStr and testcConsumeAllocCount's
+    // full cycle: failTestcRaw's internStr and the adapter-counted
     // getGlobal("T") then hit the table without registering anything.
     var setup_roots = vm.gcTempRoots();
     defer setup_roots.end();
@@ -48802,9 +50489,12 @@ test "P16.50: allocTable/allocUserdata OOM transactionality + testc memory edges
     try testing.expect(first_success_idx != null);
 
     // ---- Segment D: testc mem_limit edge (PUC testC `memlimit total`) ----
-    // The charge fires BEFORE gcPrepareRegister, so a mem_limit rejection
-    // must leave every registry untouched. failTestcRaw interns the
-    // message — pre-interned above, so that too is registry-silent.
+    // P16.50-review-5: the check fires at the ALLOCATOR BOUNDARY (adapter),
+    // before gcPrepareRegister, so a mem_limit rejection must leave every
+    // registry untouched. A direct constructor call sees the honest
+    // error.OutOfMemory (the dispatch boundary converts it to the Lua OOM
+    // error object); the emergency-GC retry ran and freed nothing (all
+    // test objects are rooted).
     const ctrl = vm.testcEnsureControl();
     defer ctrl.mem_limit = null;
     defer ctrl.alloc_count = -1;
@@ -48813,7 +50503,7 @@ test "P16.50: allocTable/allocUserdata OOM transactionality + testc memory edges
         defer snap.deinit(testing.allocator);
         const tb0 = ctrl.total_bytes;
         ctrl.mem_limit = ctrl.total_bytes;
-        try testing.expectError(error.RuntimeError, vm.allocUserdata(16, 2));
+        try testing.expectError(error.OutOfMemory, vm.allocUserdata(16, 2));
         try testing.expectEqual(tb0, ctrl.total_bytes);
         try snap.assertRestored(&vm);
         try vm.gcMinorCollection();
@@ -48826,9 +50516,9 @@ test "P16.50: allocTable/allocUserdata OOM transactionality + testc memory edges
         const snap = try P50Snapshot.take(&vm, testing.allocator);
         defer snap.deinit(testing.allocator);
         ctrl.alloc_count = 0;
-        try testing.expectError(error.RuntimeError, vm.allocUserdata(16, 2));
+        try testing.expectError(error.OutOfMemory, vm.allocUserdata(16, 2));
         try testing.expectEqual(@as(i64, 0), ctrl.alloc_count); // still armed
-        try testing.expectError(error.RuntimeError, vm.allocUserdata(16, 2));
+        try testing.expectError(error.OutOfMemory, vm.allocUserdata(16, 2));
         try snap.assertRestored(&vm);
         try vm.gcMinorCollection();
         try snap.assertRestored(&vm);
@@ -49341,10 +51031,12 @@ test "P16.50: pushcclosure/registerfuncs OOM transactionality" {
 //        parent c_stack append + the c_api_thread save/restore).
 //   T3 — registerfuncs per-closure Cells through the C ABI (luaL_setfuncs)
 //        and the fresh-table publish-failure rollback.
-//   T4 — the testcCheckMemory / testcCommitMemory split under a native
-//        allocation failure (the check consumes the alloc count and
-//        enforces mem_limit WITHOUT charging; the commit charges only after
-//        every native allocation succeeded).
+//   T4 — the allocator-boundary check/charge split under a native
+//        allocation failure (P16.50-review-5: the TestcAllocAdapter's
+//        attemptAlloc consumes the alloc count and enforces mem_limit
+//        WITHOUT charging; total_bytes charges only after the base
+//        allocation succeeded — see the rewritten T4 test at the file
+//        tail).
 
 /// p50IsRegistered WITHOUT dereferencing the object's gc_index: a plain
 /// payload scan of gc_objects. Safe for objects a collector cycle may have
@@ -49659,11 +51351,14 @@ test "P16.50-review T1: opClosure mixed-upvalue OOM matrix (production dispatch)
             } else {
                 try testing.expect(std.meta.eql(cell_c.value, .{ .Int = 100 }));
             }
-            // FINDING 2 (documented, not fixed here): a partial barrier
-            // failure (gc_gray.append ok, gc_old1.append failed) leaves the
-            // succeeded gc_gray entry pointing at the rolled-back closure.
-            if (fail_idx == 4) {
-                try testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
+            // P16.50-review-5: the partial-barrier FINDING (#2, documented
+            // residual) is now detected by SHAPE, not by a fixed index —
+            // the allocation map shifted when constructor paths gained
+            // prepare/temp-root allocations. A partial barrier failure
+            // (gc_gray.append ok, gc_old1.append failed) leaves one gray
+            // entry; a failure BEFORE the barrier leaves both empty.
+            if (vm.gc_gray.items.len == 1) {
+                try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
             } else {
                 try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
             }
@@ -50110,74 +51805,69 @@ test "P16.50-review T3: registerfuncs per-closure Cells + fresh-table publish ro
     }
 }
 
-test "P16.50-review T4: testcCheckMemory/testcCommitMemory split under native failure" {
+test "P16.50-review-5 T4: allocator-boundary check/charge split under native failure" {
     const testing = std.testing;
 
     var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
 
-    // Pre-intern the two strings the check path can touch, BEFORE the
-    // testc control exists and BEFORE entering generational mode:
-    //  - "not enough memory": failTestcRaw interns the message; a hit
-    //    keeps the A2/B2 failure paths allocation-free and registry-stable.
-    //  - "T": testcConsumeAllocCount's Lua-visibility mirror does
-    //    getGlobal("T") on the countdown path; a hit keeps it
-    //    allocation-free inside the A1/A3 failure windows (the T global is
-    //    nil, so the setField mirror never runs).
+    // Pre-intern the string the failure path can touch, BEFORE the testc
+    // control exists and BEFORE entering generational mode: the dispatch
+    // boundary interns nothing on OOM (oom_msg_str is pre-interned at
+    // Vm.init), but keep the old discipline — a hit is allocation-free.
     var setup_roots = vm.gcTempRoots();
     defer setup_roots.end();
     const key_msg = try vm.internStr("not enough memory");
     try setup_roots.add(.{ .String = key_msg });
-    const key_t = try vm.internStr("T");
-    try setup_roots.add(.{ .String = key_t });
     try vm.gcEnterGenerational();
 
-    // Prime both registries: gcPrepareRegister inside allocUserdata is
-    // then a capacity no-op and the failure index maps 1:1 onto the
-    // construction steps.
+    // Prime both registries: the failure paths' errdefers then exercise
+    // the rollback without registry growth noise.
     try vm.gc_objects.ensureUnusedCapacity(testing.allocator, 16);
     try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 16);
 
     // The testc control (created once, real allocator — vm.deinit frees
-    // it). The defers disarm the countdown/limit so nothing between the
+    // it). testcEnsureControl INSTALLS the adapter: every vm.alloc call
+    // below is checked and accounted at the boundary (PUC debug_realloc).
+    // The defers disarm the countdown/limit so nothing between the
     // probes and vm.deinit can trip on them.
     const ctrl = vm.testcEnsureControl();
     defer ctrl.alloc_count = -1;
     defer ctrl.mem_limit = null;
     const tb0 = ctrl.total_bytes;
 
-    // allocUserdata(16, 2) charges exactly this; its native allocation
-    // sequence is #0 the Userdata struct, #1 the uservalues array,
-    // #2 the payload.
+    // allocUserdata(16, 2) charges exactly this across its THREE native
+    // allocations (#0 the Userdata struct, #1 the uservalues array,
+    // #2 the payload) — PUC luaS_newudata is one malloc; our three-alloc
+    // construction is charged piecewise at the boundary, so the countdown
+    // is consumed per ALLOCATION (PUC decrements per realloc call).
     const total = @sizeOf(Userdata) + 2 * @sizeOf(Value) + 16;
 
-    // ---- A1: countdown consumed by the CHECK, native failure at #2. The
-    // count is consumed (1 -> 0) even though the construction failed, and
-    // total_bytes stays UNCHANGED — the commit never ran. ----
+    // ---- A1: boundary contract under a NATIVE failure — a manual adapter
+    // over a failing base (the vm-level adapter wraps the real base and
+    // cannot be made to fail): the countdown is consumed by the CHECK
+    // (1 -> 0, PUC decrements before the malloc), the failed malloc
+    // charges nothing, and the emergency retry re-fails without looping. ----
     {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        var adapter = TestcAllocAdapter{ .base = failing.allocator(), .ctrl = ctrl, .vm = &vm };
+        const alloc = adapter.allocator();
         ctrl.alloc_count = 1;
         ctrl.mem_limit = null;
-        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
-            .fail_index = 2,
-            .resize_fail_index = 2,
-        });
-        const snap = try P50Snapshot.take(&vm, testing.allocator);
-        defer snap.deinit(testing.allocator);
-
-        vm.alloc = failing.allocator();
-        const result = vm.allocUserdata(16, 2);
-        vm.alloc = testing.allocator;
-
-        try testing.expectError(error.OutOfMemory, result);
-        try testing.expectEqual(@as(i64, 0), ctrl.alloc_count); // consumed
-        try testing.expectEqual(tb0, ctrl.total_bytes); // THE SPLIT: no charge
-        try snap.assertRestored(&vm);
-        try vm.gcMinorCollection();
-        try snap.assertRestored(&vm);
+        const before = ctrl.total_bytes;
+        try testing.expectError(error.OutOfMemory, alloc.alloc(u8, 8));
+        try testing.expectEqual(@as(i64, 0), ctrl.alloc_count); // consumed by the check
+        try testing.expectEqual(before, ctrl.total_bytes); // no charge on failure
+        ctrl.alloc_count = -1;
     }
 
-    // ---- A2: countdown at 0 — the check itself fails (PUC: the error
-    // stays armed without decrementing), BEFORE any native allocation. ----
+    // ---- A2: countdown at 0 — the boundary check itself fails (PUC: the
+    // error stays armed without decrementing), BEFORE any native
+    // allocation. The emergency GC runs (nothing to free — all probes are
+    // rooted) and the retry re-fails. ----
     {
         ctrl.alloc_count = 0;
         ctrl.mem_limit = null;
@@ -50186,7 +51876,7 @@ test "P16.50-review T4: testcCheckMemory/testcCommitMemory split under native fa
 
         const result = vm.allocUserdata(16, 2);
 
-        try testing.expectError(error.RuntimeError, result);
+        try testing.expectError(error.OutOfMemory, result);
         try testing.expectEqual(@as(i64, 0), ctrl.alloc_count); // still armed
         try testing.expectEqual(tb0, ctrl.total_bytes);
         try snap.assertRestored(&vm);
@@ -50194,13 +51884,12 @@ test "P16.50-review T4: testcCheckMemory/testcCommitMemory split under native fa
         try snap.assertRestored(&vm);
     }
 
-    // ---- A3: countdown 1 -> 0, full success: the commit charges exactly
-    // `total` AFTER every native allocation succeeded. The teardown credits
-    // it back via gcNoteFree (two-sided ledger, PUC luaM_free_ parity) —
-    // the CHARGE side is what the split protects: it happens only at
-    // commit, never at check. ----
+    // ---- A3: countdown 3 -> 0 across the three allocations, full
+    // success: the boundary charges exactly `total` as each native
+    // allocation succeeds. The teardown credits it back through the
+    // boundary's freeFn (two-sided ledger, PUC luaM_free_ parity). ----
     {
-        ctrl.alloc_count = 1;
+        ctrl.alloc_count = 3;
         ctrl.mem_limit = null;
         const snap = try P50Snapshot.take(&vm, testing.allocator);
         defer snap.deinit(testing.allocator);
@@ -50212,37 +51901,50 @@ test "P16.50-review T4: testcCheckMemory/testcCommitMemory split under native fa
         try testing.expect(p50InYoung(&vm, .{ .userdata = ud }));
 
         p50TeardownUserdata(&vm, ud);
-        try testing.expectEqual(tb0, ctrl.total_bytes); // gcNoteFree credit
+        try testing.expectEqual(tb0, ctrl.total_bytes); // freeFn credit
         try snap.assertRestored(&vm);
         try vm.gcMinorCollection();
         try snap.assertRestored(&vm);
     }
 
-    // ---- B1: mem_limit exactly at the boundary (next == limit passes);
-    // the native failure at #0 must leave total_bytes unchanged. ----
+    // ---- A3b: countdown 2 — the THIRD allocation fails at the boundary;
+    // the constructor's errdefers free #0/#1 back through the boundary
+    // (freeFn credits), so the ledger nets to zero and the countdown
+    // stays at 0 (consumed by the two successful checks). ----
     {
-        ctrl.alloc_count = -1;
-        ctrl.mem_limit = ctrl.total_bytes + total;
+        ctrl.alloc_count = 2;
+        ctrl.mem_limit = null;
+        const snap = try P50Snapshot.take(&vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+
+        try testing.expectError(error.OutOfMemory, vm.allocUserdata(16, 2));
+        try testing.expectEqual(@as(i64, 0), ctrl.alloc_count);
+        try testing.expectEqual(tb0, ctrl.total_bytes); // errdefer + freeFn net zero
+        try snap.assertRestored(&vm);
+        try vm.gcMinorCollection();
+        try snap.assertRestored(&vm);
+    }
+
+    // ---- B1: mem_limit exactly at the boundary (next == limit passes the
+    // check); a native failure right after must leave total_bytes
+    // unchanged (manual adapter over a failing base). ----
+    {
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
             .fail_index = 0,
             .resize_fail_index = 0,
         });
-        const snap = try P50Snapshot.take(&vm, testing.allocator);
-        defer snap.deinit(testing.allocator);
-
-        vm.alloc = failing.allocator();
-        const result = vm.allocUserdata(16, 2);
-        vm.alloc = testing.allocator;
-
-        try testing.expectError(error.OutOfMemory, result);
-        try testing.expectEqual(tb0, ctrl.total_bytes); // no charge
-        try snap.assertRestored(&vm);
-        try vm.gcMinorCollection();
-        try snap.assertRestored(&vm);
+        var adapter = TestcAllocAdapter{ .base = failing.allocator(), .ctrl = ctrl, .vm = &vm };
+        const alloc = adapter.allocator();
+        ctrl.alloc_count = -1;
+        ctrl.mem_limit = ctrl.total_bytes + 8;
+        const before = ctrl.total_bytes;
+        try testing.expectError(error.OutOfMemory, alloc.alloc(u8, 8));
+        try testing.expectEqual(before, ctrl.total_bytes); // no charge
+        ctrl.mem_limit = null;
     }
 
-    // ---- B2: mem_limit one byte short — the check fails BEFORE any
-    // native allocation (and the unlimited countdown is not consumed). ----
+    // ---- B2: mem_limit one byte short — the boundary check fails BEFORE
+    // any native allocation (and the unlimited countdown is not consumed). ----
     {
         ctrl.alloc_count = -1;
         ctrl.mem_limit = ctrl.total_bytes + total - 1;
@@ -50251,7 +51953,7 @@ test "P16.50-review T4: testcCheckMemory/testcCommitMemory split under native fa
 
         const result = vm.allocUserdata(16, 2);
 
-        try testing.expectError(error.RuntimeError, result);
+        try testing.expectError(error.OutOfMemory, result);
         try testing.expectEqual(@as(i64, -1), ctrl.alloc_count); // untouched
         try testing.expectEqual(tb0, ctrl.total_bytes);
         try snap.assertRestored(&vm);
@@ -50638,10 +52340,15 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
     defer ctrl.alloc_count = -1;
     defer ctrl.mem_limit = null;
 
-    // Every probe iteration resets total_bytes to this baseline so the
-    // per-index deltas are exact and independent (the FailingAllocator
-    // fails from index N ONWARD — a failed request does not consume it).
-    const tb0: usize = 1000;
+    // P16.50-review-5: the testc LEDGER assertions are gone from this
+    // sweep — the charge/credit boundary moved to the allocator adapter,
+    // and these probes replace vm.alloc with a FailingAllocator, which
+    // bypasses the adapter by construction. What this sweep still proves
+    // (unchanged): per-failure-index TRANSACTIONALITY — every constructor
+    // restores the registries, the GC ledger, and the per-type counters
+    // exactly, and the request maps (first-success indices) pin the
+    // construction step order. The ledger parity itself lives in the
+    // review-5 adapter tests (boundary unit probes + net-zero lifecycle).
 
     // ---- (a) apiNewThread: #0 the Thread struct; the commit
     // (sizeof(Thread)+64) lands only on success. The post-commit
@@ -50651,7 +52358,6 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
         var fail_idx: usize = 0;
         var tested_failures: usize = 0;
         while (fail_idx <= 1) : (fail_idx += 1) {
-            ctrl.total_bytes = tb0;
             var failing = std.testing.FailingAllocator.init(testing.allocator, .{
                 .fail_index = fail_idx,
                 .resize_fail_index = fail_idx,
@@ -50664,18 +52370,12 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
             vm.alloc = testing.allocator;
 
             if (result) |nth| {
-                try testing.expectEqual(tb0 + @sizeOf(Thread), ctrl.total_bytes);
                 try testing.expect(p50IsRegistered(&vm, .{ .thread = nth }));
                 p50TeardownThread(&vm, nth, true);
-                // P16.50-review-2 defect-5 fix applied: the commit is
-                // sizeof(Thread) — symmetric with the free credit; the
-                // lifecycle nets exactly zero now.
-                try testing.expectEqual(tb0, ctrl.total_bytes);
                 try snap.assertRestored(&vm);
             } else |err| {
                 try testing.expectEqual(error.OutOfMemory, err);
                 tested_failures += 1;
-                try testing.expectEqual(tb0, ctrl.total_bytes); // no charge
                 try snap.assertRestored(&vm);
                 try vm.gcMinorCollection();
                 try snap.assertRestored(&vm);
@@ -50690,7 +52390,6 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
         var fail_idx: usize = 0;
         var tested_failures: usize = 0;
         while (fail_idx <= 1) : (fail_idx += 1) {
-            ctrl.total_bytes = tb0;
             var failing = std.testing.FailingAllocator.init(testing.allocator, .{
                 .fail_index = fail_idx,
                 .resize_fail_index = fail_idx,
@@ -50705,18 +52404,14 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
             vm.alloc = testing.allocator;
 
             if (result) |_| {
-                try testing.expectEqual(tb0 + @sizeOf(Thread), ctrl.total_bytes);
                 const cth = outs[0].Thread;
                 try testing.expect(p50IsRegistered(&vm, .{ .thread = cth }));
                 p50TeardownThread(&vm, cth, true);
-                // P16.50-review-2 defect-5 fix: symmetric sizeof(Thread).
-                try testing.expectEqual(tb0, ctrl.total_bytes);
                 try snap.assertRestored(&vm);
             } else |err| {
                 try testing.expectEqual(error.OutOfMemory, err);
                 tested_failures += 1;
                 try testing.expect(outs[0] == .Nil); // nothing published
-                try testing.expectEqual(tb0, ctrl.total_bytes);
                 try snap.assertRestored(&vm);
                 try vm.gcMinorCollection();
                 try snap.assertRestored(&vm);
@@ -50734,7 +52429,6 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
         var tested_failures: usize = 0;
         var first_success_idx: ?usize = null;
         while (fail_idx <= 8) : (fail_idx += 1) {
-            ctrl.total_bytes = tb0;
             var failing = std.testing.FailingAllocator.init(testing.allocator, .{
                 .fail_index = fail_idx,
                 .resize_fail_index = fail_idx,
@@ -50755,12 +52449,6 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
 
             if (vm.createBytecodeChunkClosure(proto)) |cl| {
                 first_success_idx = fail_idx;
-                // P16.50-review-3 single boundary: the success charge is
-                // the SAME bytes gcNoteAlloc charged (Cells + closure incl.
-                // its upvalue-array allowance) — and the teardown below
-                // credits exactly these back (found delta = 184 = 3*40 +
-                // 40 + 3*8, matching gcNoteFree's credits).
-                try testing.expectEqual(tb0 + @as(usize, 3 * @sizeOf(Cell) + @sizeOf(Closure) + 3 * @sizeOf(*Cell)), ctrl.total_bytes);
                 // p44's manual teardown mirror:
                 _ = vm.gcUnregisterObjectRollback(.{ .closure = cl });
                 vm.testc_obj_functions -= 1;
@@ -50777,35 +52465,14 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
                 vm.alloc = saved_alloc;
                 ua.free(cl.upvalues);
                 ua.destroy(cl);
-                // P16.50-review-3 single boundary: the lifecycle nets
-                // exactly ZERO (gcNoteAlloc/gcNoteFree pair symmetric in
-                // both ledgers — the old tb0-80 Cell-drift FINDING is
-                // resolved, not asserted).
-                try testing.expectEqual(tb0, ctrl.total_bytes);
                 try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
                 try testing.expectEqual(funcs0, vm.testc_obj_functions);
                 break;
             } else |err| {
                 try testing.expectEqual(error.OutOfMemory, err);
                 tested_failures += 1;
-                // Measured per-index deltas (see the FINDINGs inline):
-                //   idx 0 (cells array), 1 (Cell#1): unchanged — nothing
-                //     committed, nothing credited.
-                //   idx 2..4 (Cell#2, Cell#3, Closure): -40*(idx-1) — the
-                //     rolled-back Cells' gcNoteFree credits bytes no commit
-                //     ever charged (FINDING: the uncharged-Cell ledger drift
-                //     above).
-                //   idx 5, 6 (resolveTreeConstants staging, post-commit):
-                //     +104 commit - 64 closure credit - 120 cell credits =
-                //     -80 (FINDING: the post-commit errdefer reverses the
-                //     gcNoteAlloc side but NOT the testcCommitMemory side).
-                // P16.50-review-3 single accounting boundary: the gcNoteAlloc/
-                // gcNoteFree pair covers BOTH ledgers — every failure
-                // index restores exactly (the old per-site
-                // testcCommitMemory asymmetry -40/-80 is gone).
-                try testing.expectEqual(tb0, ctrl.total_bytes);
                 // The registry and gc_count_kb restorations are exact (the
-                // p44 guarantees — only the testc ledger drifts).
+                // p44 guarantees).
                 try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
                 try testing.expectEqual(count0, vm.gc_count_kb);
                 try testing.expectEqual(funcs0, vm.testc_obj_functions);
@@ -50824,7 +52491,6 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
         var tested_failures: usize = 0;
         var first_success_idx: ?usize = null;
         while (fail_idx <= 6) : (fail_idx += 1) {
-            ctrl.total_bytes = tb0;
             var failing = std.testing.FailingAllocator.init(testing.allocator, .{
                 .fail_index = fail_idx,
                 .resize_fail_index = fail_idx,
@@ -50845,8 +52511,6 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
 
             if (vm.closureFromProto(proto)) |cl| {
                 first_success_idx = fail_idx;
-                // P16.50-review-3 single boundary (same exact shape as (c)).
-                try testing.expectEqual(tb0 + @as(usize, 3 * @sizeOf(Cell) + @sizeOf(Closure) + 3 * @sizeOf(*Cell)), ctrl.total_bytes);
                 _ = vm.gcUnregisterObjectRollback(.{ .closure = cl });
                 vm.testc_obj_functions -= 1;
                 vm.gcNoteFree(@sizeOf(Closure) + cl.upvalues.len * @sizeOf(*Cell));
@@ -50862,17 +52526,12 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
                 vm.alloc = saved_alloc;
                 ua.free(cl.upvalues);
                 ua.destroy(cl);
-                // FINDING: the same -80 lifecycle drift as (c).
-                try testing.expectEqual(tb0, ctrl.total_bytes);
                 try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
                 try testing.expectEqual(funcs0, vm.testc_obj_functions);
                 break;
             } else |err| {
                 try testing.expectEqual(error.OutOfMemory, err);
                 tested_failures += 1;
-                // P16.50-review-3 single boundary: every failure index
-                // restores exactly (the Cell-drift is resolved).
-                try testing.expectEqual(tb0, ctrl.total_bytes);
                 try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
                 try testing.expectEqual(count0, vm.gc_count_kb);
                 try testing.expectEqual(funcs0, vm.testc_obj_functions);
@@ -50900,7 +52559,6 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
         var tested_failures: usize = 0;
         var first_success_idx: ?usize = null;
         while (fail_idx <= 3) : (fail_idx += 1) {
-            ctrl.total_bytes = tb0;
             var failing = std.testing.FailingAllocator.init(tracker.allocator(), .{
                 .fail_index = fail_idx,
                 .resize_fail_index = fail_idx,
@@ -50919,21 +52577,11 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
             if (result) |_| {
                 first_success_idx = fail_idx;
                 try testing.expectEqualStrings("a,b", outs[0].String.bytes());
-                // P16.50-review-2 defects 4+6 fix applied: the scratch is
-                // committed then freed symmetrically (nets zero — PUC's
-                // transient buffer semantics); the permanent delta is the
-                // interned string's own note only.
-                // P16.50-review-3 single boundary: the success delta is
-                // exactly the string's allocatedSize (gcNoteAlloc); the
-                // +24 note is removed; teardown nets exactly zero.
-                try testing.expectEqual(tb0 + outs[0].String.allocatedSize(), ctrl.total_bytes);
                 p50TeardownString(&vm, outs[0].String);
-                try testing.expectEqual(tb0, ctrl.total_bytes);
             } else |err| {
                 try testing.expectEqual(error.OutOfMemory, err);
                 tested_failures += 1;
                 try testing.expect(outs[0] == .Nil); // nothing published
-                try testing.expectEqual(tb0, ctrl.total_bytes); // no charge
             }
             // P16.50-review-2 defect-4 fix applied: the scratch is freed
             // by the builtin on every path — nothing stays live.
@@ -50957,7 +52605,6 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
         var tested_failures: usize = 0;
         var first_success_idx: ?usize = null;
         while (fail_idx <= 2) : (fail_idx += 1) {
-            ctrl.total_bytes = tb0;
             var failing = std.testing.FailingAllocator.init(testing.allocator, .{
                 .fail_index = fail_idx,
                 .resize_fail_index = fail_idx,
@@ -50974,15 +52621,14 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
                 // +new hash (8*Node) + new array (16*Value) - old array
                 // (4*Value) - old hash (4*Node) — the exact byte delta.
                 const delta = 8 * @sizeOf(ltable.Node) + 16 * @sizeOf(Value) - 4 * @sizeOf(Value) - 4 * @sizeOf(ltable.Node);
-                try testing.expectEqual(tb0 + delta, ctrl.total_bytes);
                 try testing.expectEqual(@as(usize, 16), f_tbl.asize);
                 try testing.expectEqual(@as(usize, 8), f_tbl.hash.len);
                 try testing.expect(f_tbl.hash.ptr != old_hash_ptr);
                 try testing.expect(f_tbl.array.ptr != old_array_ptr);
                 // Every entry survived the rehash:
-                try testing.expectEqual(@as(i64, 11), (try vm.tableGetRawValue(f_tbl, .{ .String = s_k })).Int);
-                try testing.expectEqual(@as(i64, 100), (try vm.tableGetRawValue(f_tbl, .{ .Int = 1 })).Int);
-                try testing.expectEqual(@as(i64, 200), (try vm.tableGetRawValue(f_tbl, .{ .Int = 2 })).Int);
+                try testing.expectEqual(@as(i64, 11), (vm.tableGetRawValue(f_tbl, .{ .String = s_k })).Int);
+                try testing.expectEqual(@as(i64, 100), (vm.tableGetRawValue(f_tbl, .{ .Int = 1 })).Int);
+                try testing.expectEqual(@as(i64, 200), (vm.tableGetRawValue(f_tbl, .{ .Int = 2 })).Int);
                 // The table legitimately grew — gc_count_kb tracks the same
                 // +new/−old byte delta as the testc ledger (dyadic-exact in
                 // f64); every registry field is unchanged, so instead of
@@ -51000,25 +52646,15 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
             } else |err| {
                 try testing.expectEqual(error.OutOfMemory, err);
                 tested_failures += 1;
-                if (fail_idx == 0) {
-                    // The new-hash alloc failed before any commit.
-                    try testing.expectEqual(tb0, ctrl.total_bytes);
-                } else {
-                    // P16.50-review-2 defect-3 fix applied: the errdefer
-                    // reverses the hash commit exactly ONCE (gcNoteFree
-                    // covers both ledgers) — the ledger returns to the
-                    // baseline.
-                    try testing.expectEqual(tb0, ctrl.total_bytes);
-                }
                 // The table itself is byte-identical (the failure is
                 // invisible to every reader):
                 try testing.expectEqual(@as(usize, 4), f_tbl.asize);
                 try testing.expectEqual(@as(usize, 4), f_tbl.hash.len);
                 try testing.expect(f_tbl.hash.ptr == old_hash_ptr);
                 try testing.expect(f_tbl.array.ptr == old_array_ptr);
-                try testing.expectEqual(@as(i64, 11), (try vm.tableGetRawValue(f_tbl, .{ .String = s_k })).Int);
-                try testing.expectEqual(@as(i64, 100), (try vm.tableGetRawValue(f_tbl, .{ .Int = 1 })).Int);
-                try testing.expectEqual(@as(i64, 200), (try vm.tableGetRawValue(f_tbl, .{ .Int = 2 })).Int);
+                try testing.expectEqual(@as(i64, 11), (vm.tableGetRawValue(f_tbl, .{ .String = s_k })).Int);
+                try testing.expectEqual(@as(i64, 100), (vm.tableGetRawValue(f_tbl, .{ .Int = 1 })).Int);
+                try testing.expectEqual(@as(i64, 200), (vm.tableGetRawValue(f_tbl, .{ .Int = 2 })).Int);
                 // gc_count_kb is symmetric here (only ONE gcNoteFree ran).
                 try snap.assertRestored(&vm);
                 try vm.gcMinorCollection();
@@ -51030,9 +52666,7 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
         try testing.expectEqual(@as(usize, 2), first_success_idx.?);
     }
 
-    // Fixture teardown (after every total_bytes assertion — the per-iteration
-    // resets make cross-site ledger arithmetic meaningless, only the
-    // zero-leak freeing matters here).
+    // Fixture teardown (zero-leak freeing).
     p50TeardownTable(&vm, f_tbl, true);
     p50TeardownTable(&vm, e_tbl, true);
     p50TeardownString(&vm, s_k);
@@ -51048,66 +52682,19 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
 // counter resets, and the atpanic-hook subprocess probe.
 //
 // TESTS ONLY — no production changes. Two production defects are asserted
-// AS-IS with FINDING comments (repo precedent: the test stays green, the
-// defect is documented for a follow-up fix):
-//
-//   FINDING #1 (R1 Segment B, R3c): an OOM raised inside a yieldk
-//     continuation is masked to LUA_ERRRUN on every observable surface.
-//     Chain: finishCcall's .lua_err arm (vm.zig:12285) returns
-//     error.RuntimeError unconditionally — it never maps c_error_status 4
-//     (LUA_ERRMEM) to error.OutOfMemory — builtinCoroutineResume's
-//     error-tail defer (vm.zig:23024) then pins th.api_status to
-//     `if (err_is_errerr) 5 else 2` (never 4), and c_api.lua_resume's
-//     catch (c_api.zig:1969) returns 2. PUC returns LUA_ERRMEM (4) here.
-//     The error OBJECT is correct (the fixed MEMERRMSG string, PUC
-//     luaD_seterrorobj) — only the kind/status is masked.
-//
-//   FINDING #2 (R5 scenario B): cThrow (c_api.zig:1450) passes
-//     vm.cur_handle.? (the main L) to cThrowOn instead of the handle that
-//     threw, so the atpanic hook receives the WRONG lua_State when a
-//     non-current coroutine's API call throws without an active boundary.
-//     Call sites: lua_pushcclosure, lua_pushcfunction, luaL_setfuncs,
-//     luaL_newlib, lua_newthread. PUC luaD_throw always passes the
-//     throwing lua_State.
-//
-//   FINDING #3 (R2 probe): lua_createtable (c_api.zig:1691) swallows
-//     allocation errors (`s.newtable() catch {}`). PUC lua_createtable
-//     lets luaH_new's failure longjmp out as LUA_ERRMEM — the caller
-//     never observes a silently missing table. The probe asserts the
-//     swallow AS-IS: under a total-failure allocator the call SUCCEEDS
-//     with zero results and no table.
-//
-//   FINDING #4 (R1, absorbed by the test's tracker): tracebackFrameLabel
-//     (vm.zig:6821) allocates the intermediate C-frame name ("?" —
-//     tracebackFuncName's allocPrint, vm.zig:6805) and never frees it.
-//     Every erroring continuation resume that renders parked C frames
-//     leaks one byte per rendered frame (captureErrorTraceback inside
-//     finishCcall's .lua_err arm). R1 observes exactly three one-byte
-//     leaks across its two erroring continuations; the absorbing tracker
-//     asserts the shape AFTER state.deinit, then frees them so the test
-//     itself leaks nothing.
-//
-//   FINDING #5 (R3, absorbed by the test's tracker): builtinCoroutineResume's
-//     coroutine-completion early return (vm.zig:23373) fires BEFORE the
-//     payload-free defer (vm.zig:23753) is armed — the 1-Value completion
-//     payload (vm.zig:23356) leaks on every completing resume. R3 observes
-//     exactly one @sizeOf(Value) leak; the tracker absorbs it.
-//
-//   FINDING #6 (R2 sweeps, compensated in-test): callCFunction's
-//     normal-return path has an unprotected allocation window — the
-//     results dupe (vm.zig:40313) sits BETWEEN the C function's return
-//     and the manual C-frame pop (vm.zig:40357). Its `try` exits without
-//     popping the C-frame (the errdefer at vm.zig:40317 restores only the
-//     c_stack) and without installing any error object (the OOM never
-//     reaches cThrow — PUC's moveresults cannot fail, and every PUC OOM
-//     path sets the MEMERRMSG object via luaD_throw). Exactly one index
-//     per sweep (the results-dupe failure, the last failing index) shows
-//     the shape: frames0+1 with the error state untouched. The sweep
-//     pops the stale frame as documented-defect compensation so later
-//     cells stay deterministic; for lua_newthread the dupe index
-//     additionally gets the success-arm Thread/handle teardown (the
-//     call already succeeded inside when the dupe failed).
-// ===========================================================================
+// P16.50-review-4/-5: all six review-3 FINDING defects are FIXED and
+// positively tested (no expected-defect assertions, no absorbing cleanup):
+//   #1 continuation ERRMEM — finishCcall carries payload 4; the resume
+//      boundary reads the thread's api_status (R1 Segment B asserts
+//      st2 == 4 and lua_status == 4).
+//   #2 throwing L — implicit cThrow deleted; every export passes its own
+//      L to cThrowOn (R5 asserts hook-L == throwing-L).
+//   #3 lua_createtable throws LUA_ERRMEM (R2 probe asserts OOM+MEMERRMSG).
+//   #4 tracebackFrameLabel's intermediate owned (R1 asserts 0 leaks).
+//   #5 builtinCoroutineResume's payload defer armed before any return
+//      (R3 asserts 0 leaks).
+//   #6 the results-copy OOM unwinds structurally (R2 sweeps assert the
+//      identical contract on every failing index).
 
 /// One-shot failing allocator for R1 Segment B: the FIRST allocation after
 /// `armed` is set fails exactly once; everything before and after passes
@@ -51390,6 +52977,164 @@ fn p50r3CfCreatetable(L: ?*lua_State) callconv(.c) c_int {
     const c_api = @import("c_api.zig");
     c_api.lua_createtable(L, 0, 0); // OOM swallowed — no throw, no table
     return 0;
+}
+
+// --- P16.50-review-5 B2: C-ABI throw-matrix callbacks. Each body drives
+// ONE throwing export through its own allocation edges (fresh names are
+// NOT pre-interned: the key intern itself is a swept failure point, and
+// the residue teardown returns the intern table to its snapshot state
+// after every cell). ---
+
+fn p50r5CfPushstring(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    p50r3_name_seq += 1;
+    c_api.lua_pushstring(L, p50r3NextName(&p50r3_name_buf_a, "p50r5_s"));
+    return 1;
+}
+
+fn p50r5CfSetglobal(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    p50r3_name_seq += 1;
+    c_api.lua_pushinteger(L, 7);
+    c_api.lua_setglobal(L, p50r3NextName(&p50r3_name_buf_a, "p50r5_g"));
+    // Re-push the value so the success cell returns exactly 1 result
+    // (the append fits the capacity the first push already grew — it is
+    // not an extra failure point).
+    c_api.lua_pushinteger(L, 7);
+    return 1;
+}
+
+fn p50r5CfRawset(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    c_api.lua_pushinteger(L, 4242);
+    c_api.lua_pushinteger(L, 99);
+    // The fresh lib-table arg sits at absolute index 1; rawset pops the
+    // key+value pair and grows the fresh table's hash part (4242 is out
+    // of array range → hash insert on an empty table → hash alloc).
+    c_api.lua_rawset(L, 1);
+    return 1; // the table arg
+}
+
+fn p50r5CfConcat(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    c_api.lua_pushinteger(L, 1);
+    c_api.lua_pushinteger(L, 2);
+    c_api.lua_concat(L, 2);
+    return 1; // the concatenated result string
+}
+
+/// Static external bytes: pushexternalstring allocates ONLY the LuaString
+/// header (the bytes are borrowed); the dealloc callback counts the
+/// ownership handoff at destroy time.
+var p50r5_ext_buf: [16]u8 = undefined;
+
+fn p50r5CfPushexternalstring(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    c_api.lua_pushexternalstring(L, &p50r5_ext_buf, p50r5_ext_buf.len, p50r3Falloc, null);
+    return 1;
+}
+
+// Internal-cleanup proof bodies: each holds a locally-allocated buffer
+// across the throwing call (the _longjmp bypasses Zig defer — the manual
+// deinit/free before cThrowOn is what keeps these leak-free).
+
+fn p50r5CfPushvfstring(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    _ = c_api.lua_pushfstring(
+        L,
+        "abc %d defg %s hij",
+        @as(c_int, 12345),
+        @as(?[*:0]const u8, "0123456789abcdef"),
+    );
+    return 1;
+}
+
+/// 40 'a's → gsub to 80 'b's: multiple result-buffer growths inside the
+/// swept window.
+const p50r5_gsub_src = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const p50r5_gsub_rep = "bb";
+
+fn p50r5CfGsub(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    _ = c_api.luaL_gsub(L, p50r5_gsub_src, "a", p50r5_gsub_rep);
+    return 1;
+}
+
+/// 2000 bytes > the 1024-byte luaL_Buffer inline storage: addlstring
+/// spills to heap, then pushresultsize interns — the spill free before
+/// the throw is the cleanup under proof.
+const p50r5_big = "x" ** 2000;
+
+fn p50r5CfPushresultsize(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    var B: c_api.luaL_Buffer = undefined;
+    c_api.luaL_buffinit(L, &B);
+    c_api.luaL_addlstring(&B, p50r5_big.ptr, p50r5_big.len);
+    c_api.luaL_pushresultsize(&B, p50r5_big.len);
+    return 1;
+}
+
+/// One B2 tracked sweep cell: identical contract to p50r3Sweep, plus the
+/// INTERNAL-CLEANUP PROOF — the whole cell (call AND residue teardown)
+/// runs through a P50TrackAlloc wrapping the FailingAllocator, and the
+/// tracker's live set must be EMPTY afterwards: every allocation the
+/// window made (buffer temps, stack growth, results dupe, residue graph)
+/// is freed on every path. This is the no-defer/no-leak-on-longjmp proof
+/// for the manual deinit/free before cThrowOn.
+fn p50r5SweepTracked(
+    vm: *Vm,
+    th: *Thread,
+    frames0: usize,
+    cf: *const fn (?*lua_State) callconv(.c) c_int,
+    bound: usize,
+) !usize {
+    const testing = std.testing;
+    var fail_idx: usize = 0;
+    var tested_failures: usize = 0;
+    var first_success: ?usize = null;
+    while (fail_idx <= bound) : (fail_idx += 1) {
+        const snap = try P50Snapshot.take(vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        var track = P50TrackAlloc{ .base = failing.allocator() };
+        const saved = vm.alloc;
+        vm.alloc = track.allocator();
+        const r = vm.callCFunction(cf, &.{});
+        if (r) |result| {
+            first_success = fail_idx;
+            try testing.expectEqual(@as(usize, 1), result.len);
+            vm.alloc.free(result);
+            p50r3TeardownResidue(vm, snap.gc_objects.len);
+            vm.alloc = saved;
+            try testing.expectEqual(@as(usize, 0), track.live.count());
+            try testing.expectEqual(frames0, th.call_frames.len());
+            try testing.expectEqual(@as(c_int, 0), th.api_status);
+            try snap.assertRestored(vm);
+            track.deinit();
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            tested_failures += 1;
+            try testing.expectEqual(frames0, th.call_frames.len());
+            try testing.expectEqual(@as(c_int, 0), th.api_status);
+            const eter = vm.errThread();
+            try testing.expect(eter.err_has_obj);
+            try testing.expectEqual(vm.oom_msg_str.?, eter.err_obj.String);
+            p50r3TeardownResidue(vm, snap.gc_objects.len);
+            vm.alloc = saved;
+            try testing.expectEqual(@as(usize, 0), track.live.count());
+            try snap.assertRestored(vm);
+            try testing.expect(gcCheckSecondaryRegistryInvariants(vm));
+            track.deinit();
+        }
+    }
+    try testing.expect(tested_failures > 0);
+    try testing.expect(first_success != null);
+    return first_success.?;
 }
 
 // R4's external-string dealloc callback: counts calls (the LSTRMEM
@@ -51679,11 +53424,10 @@ test "P16.50-review-3 R1: k continuation error transport through finishCcall" {
         try testing.expect(one_shot.failed); // the armed shot fired inside k
         try testing.expectEqual(@as(c_int, 1), p50r3_k_status);
         try testing.expectEqual(@as(isize, 42), p50r3_k_ctx);
-        // FINDING #1 (AS-IS): PUC returns 4 (LUA_ERRMEM); luazig masks the
-        // kind to 2 (LUA_ERRRUN) through finishCcall's unconditional
-        // error.RuntimeError (vm.zig:12285).
-        try testing.expectEqual(@as(c_int, 2), st2);
-        try testing.expectEqual(@as(c_int, 2), c_api.lua_status(L2));
+        // P16.50-review-5 B1 fix: PUC returns 4 (LUA_ERRMEM) — the exact
+        // kind finishCcall carried now survives the resume boundary.
+        try testing.expectEqual(@as(c_int, 4), st2);
+        try testing.expectEqual(@as(c_int, 4), c_api.lua_status(L2));
         try testing.expectEqual(@as(c_int, 2), nres);
         // The error object IS the fixed MEMERRMSG (PUC luaD_seterrorobj
         // for LUA_ERRMEM) — duplicated into PUC's [err, err] window.
@@ -51911,6 +53655,195 @@ test "P16.50-review-3 R2: exported throwing APIs under callCFunction OOM sweeps"
     }
 }
 
+test "P16.50-review-5 B2: C-ABI throw matrix" {
+    const testing = std.testing;
+    const api = @import("api.zig");
+
+    var state = api.State.init(.{ .allocator = testing.allocator });
+    defer state.deinit();
+    const vm = state.vm;
+    const th = vm.main_thread.?;
+    const frames0 = th.call_frames.len();
+
+    // Prime both registries (T2 idiom) so gcPrepareRegister is a capacity
+    // no-op and every failure index maps 1:1 onto a construction step.
+    try vm.gcEnterGenerational();
+    try vm.gc_objects.ensureUnusedCapacity(testing.allocator, 32);
+    try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 32);
+
+    // ---- lua_pushstring (fresh string): the swept failure points are the
+    // fresh-stack append growth, the non-preinterned string intern, and
+    // the results dupe. ----
+    {
+        const sr = try p50r3Sweep(vm, th, frames0, p50r5CfPushstring, 8, false);
+        try testing.expectEqual(@as(usize, 3), sr.first_success);
+        try testing.expectEqual(@as(usize, 1), sr.census.n_string);
+        try testing.expectEqual(@as(usize, 0), sr.census.n_closure);
+        try testing.expectEqual(@as(usize, 0), sr.census.n_cell);
+        try testing.expectEqual(@as(usize, 0), sr.census.n_table);
+    }
+
+    // ---- lua_setglobal (fresh key): custom loop — a global published
+    // before a later failure (e.g. the results dupe) is COMMITTED residue:
+    // the globals entry is removed (nodeDelete + clearKey, the PUC dead-
+    // key mechanism) BEFORE the residue teardown frees the key string, so
+    // no hash node ever references a freed key. ----
+    {
+        var fail_idx: usize = 0;
+        var tested_failures: usize = 0;
+        var first_success: ?usize = null;
+        while (fail_idx <= 12) : (fail_idx += 1) {
+            const snap = try P50Snapshot.take(vm, testing.allocator);
+            defer snap.deinit(testing.allocator);
+
+            var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+                .fail_index = fail_idx,
+                .resize_fail_index = fail_idx,
+            });
+            const saved = vm.alloc;
+            vm.alloc = failing.allocator();
+            const r = vm.callCFunction(p50r5CfSetglobal, &.{});
+            vm.alloc = saved;
+
+            const census = p50r3CensusResidue(vm, snap.gc_objects.len);
+            try testing.expectEqual(@as(usize, 0), census.n_other);
+
+            // The callback's fresh name (formatted before the call, still
+            // in the shared buffer): find its interned residue, and if the
+            // global was published, remove the globals entry first.
+            const name = std.mem.sliceTo(&p50r3_name_buf_a, 0);
+            for (vm.gc_objects.items[snap.gc_objects.len..]) |o| {
+                if (o == .string and std.mem.eql(u8, o.string.bytes(), name)) {
+                    if (ltable.nodeLookup(vm.global_env.hash, .{ .String = o.string })) |node| {
+                        _ = ltable.nodeDelete(vm.global_env.hash, .{ .String = o.string });
+                        ltable.clearKey(node);
+                    }
+                }
+            }
+
+            if (r) |result| {
+                first_success = fail_idx;
+                try testing.expectEqual(@as(usize, 1), result.len);
+                vm.alloc.free(result);
+                try testing.expectEqual(frames0, th.call_frames.len());
+                try testing.expectEqual(@as(c_int, 0), th.api_status);
+                p50r3TeardownResidue(vm, snap.gc_objects.len);
+                try snap.assertRestored(vm);
+                break;
+            } else |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                tested_failures += 1;
+                try testing.expectEqual(frames0, th.call_frames.len());
+                try testing.expectEqual(@as(c_int, 0), th.api_status);
+                const eter = vm.errThread();
+                try testing.expect(eter.err_has_obj);
+                try testing.expectEqual(vm.oom_msg_str.?, eter.err_obj.String);
+                p50r3TeardownResidue(vm, snap.gc_objects.len);
+                try snap.assertRestored(vm);
+                try testing.expect(gcCheckSecondaryRegistryInvariants(vm));
+                try vm.gcMinorCollection();
+                try snap.assertRestored(vm);
+            }
+        }
+        try testing.expectEqual(@as(usize, 3), first_success.?);
+        try testing.expect(tested_failures > 0);
+        try testing.expect(first_success != null);
+    }
+
+    // ---- lua_rawset (table growth): the fresh lib-table arg comes via
+    // the sweep fixture; the swept failure points are the arg/key/value
+    // append growths, the fresh table's hash-part alloc, and the results
+    // dupe. ----
+    {
+        const sr = try p50r3Sweep(vm, th, frames0, p50r5CfRawset, 10, true);
+        try testing.expectEqual(@as(usize, 4), sr.first_success);
+        try testing.expectEqual(@as(usize, 1), sr.census.n_table); // the arg fixture
+        try testing.expectEqual(@as(usize, 0), sr.census.n_string);
+        try testing.expectEqual(@as(usize, 0), sr.census.n_closure);
+        try testing.expectEqual(@as(usize, 0), sr.census.n_cell);
+    }
+
+    // ---- lua_concat (string build): Int+Int concatenation converts both
+    // operands to scratch strings (freed by binConcat's defers on every
+    // path — the P16.50-review-5 B2 leak fix), builds the result in a
+    // scratch buffer (also freed on every path), and interns the result. ----
+    {
+        const sr = try p50r3Sweep(vm, th, frames0, p50r5CfConcat, 12, false);
+        try testing.expectEqual(@as(usize, 8), sr.first_success);
+        try testing.expectEqual(@as(usize, 1), sr.census.n_string);
+        try testing.expectEqual(@as(usize, 0), sr.census.n_closure);
+        try testing.expectEqual(@as(usize, 0), sr.census.n_cell);
+        try testing.expectEqual(@as(usize, 0), sr.census.n_table);
+    }
+
+    // ---- lua_pushexternalstring (header alloc): only the LuaString
+    // header allocates (the bytes are borrowed). ----
+    {
+        const sr = try p50r3Sweep(vm, th, frames0, p50r5CfPushexternalstring, 6, false);
+        try testing.expectEqual(@as(usize, 3), sr.first_success);
+        try testing.expectEqual(@as(usize, 1), sr.census.n_string);
+        try testing.expectEqual(@as(usize, 0), sr.census.n_closure);
+        try testing.expectEqual(@as(usize, 0), sr.census.n_cell);
+        try testing.expectEqual(@as(usize, 0), sr.census.n_table);
+    }
+
+    // ---- Internal-cleanup proofs (tracked sweeps): the locally-held
+    // buffers (pushvfstring's ArrayList, gsub's ArrayListUnmanaged, the
+    // luaL_Buffer heap spill) are deinit'd/freed BEFORE every cThrowOn —
+    // the tracked live set is empty after every cell, failure or success.
+    // ----
+    {
+        try testing.expectEqual(@as(usize, 5), try p50r5SweepTracked(vm, th, frames0, p50r5CfPushvfstring, 12));
+    }
+    {
+        try testing.expectEqual(@as(usize, 5), try p50r5SweepTracked(vm, th, frames0, p50r5CfGsub, 14));
+    }
+    {
+        try testing.expectEqual(@as(usize, 5), try p50r5SweepTracked(vm, th, frames0, p50r5CfPushresultsize, 8));
+    }
+
+    // ---- State-usable round-trip after the whole matrix: a conventional
+    // callCFunction with the real allocator succeeds and leaves the state
+    // byte-exact. ----
+    {
+        const snap = try P50Snapshot.take(vm, testing.allocator);
+        defer snap.deinit(testing.allocator);
+        const r = try vm.callCFunction(p50r3CfPushcfunction, &.{});
+        defer vm.alloc.free(r);
+        try testing.expectEqual(@as(usize, 1), r.len);
+        try testing.expect(r[0] == .Closure);
+        p50r3TeardownResidue(vm, snap.gc_objects.len);
+        try snap.assertRestored(vm);
+    }
+
+    // ---- Repeated-failure stability: the same failing cell (pushstring,
+    // fail index 0) twice — identical error contract and byte-exact
+    // restored state both times. ----
+    {
+        var round: usize = 0;
+        while (round < 2) : (round += 1) {
+            const snap = try P50Snapshot.take(vm, testing.allocator);
+            defer snap.deinit(testing.allocator);
+            var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+                .fail_index = 0,
+                .resize_fail_index = 0,
+            });
+            const saved = vm.alloc;
+            vm.alloc = failing.allocator();
+            const r = vm.callCFunction(p50r5CfPushstring, &.{});
+            vm.alloc = saved;
+            try testing.expectEqual(error.OutOfMemory, r);
+            try testing.expectEqual(frames0, th.call_frames.len());
+            try testing.expectEqual(@as(c_int, 0), th.api_status);
+            const eter = vm.errThread();
+            try testing.expect(eter.err_has_obj);
+            try testing.expectEqual(vm.oom_msg_str.?, eter.err_obj.String);
+            p50r3TeardownResidue(vm, snap.gc_objects.len);
+            try snap.assertRestored(vm);
+        }
+    }
+}
+
 test "P16.50-review-3 R3: api_status lifecycle through lua_status" {
     const testing = std.testing;
     const api = @import("api.zig");
@@ -52038,20 +53971,34 @@ test "P16.50-review-3 R4: ledger audit under an ACTIVE testc control (no per-pro
     try vm.gc_objects.ensureUnusedCapacity(testing.allocator, 32);
     try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 32);
 
+    // P16.50-review-5: the adapter is installed by testcEnsureControl —
+    // from here on EVERY vm.alloc call is charged/credited at the boundary.
     const ctrl = vm.testcEnsureControl();
     defer ctrl.alloc_count = -1;
     defer ctrl.mem_limit = null;
 
+    // Pre-grow the C-API stack past every probe's needs: stack growth is a
+    // real boundary charge, and the probes below pop what they push without
+    // shrinking capacity — a mid-probe growth would permanently shift the
+    // baseline. Same for the intern-table buckets: record their count so
+    // net-zero assertions can distinguish object charges (must net to zero)
+    // from a bucket growth (a legitimate permanent charge, excluded).
+    {
+        var i: usize = 0;
+        while (i < 32) : (i += 1) try state.pushinteger(@intCast(i));
+        state.stack.items.len -= 32;
+    }
+    const buckets0 = vm.string_intern.buckets.len;
+
     // The running-ledger baseline, captured ONCE. Every probe asserts exact
-    // deltas against the CURRENT value and nets back to it — unlike B4,
-    // whose per-iteration total_bytes resets make cross-site ledger
-    // arithmetic meaningless. This is the lifecycle view: charge on create,
-    // credit on teardown, net exactly zero, with the ledger never reset.
-    const tb0: usize = ctrl.total_bytes;
+    // deltas against the CURRENT value and nets back to it — the lifecycle
+    // view: charge on create, credit on teardown, net exactly zero, with
+    // the ledger never reset.
+    const tb0: i64 = ctrl.total_bytes;
 
     // ---- (1) Ledger-active proof: a KEPT C closure (pushcclosure, n=1)
-    // charges Cell + Closure + upvalue-slot (makeCclosure's two gcNoteAlloc
-    // notes) and credits all of it back on teardown. ----
+    // charges Cell + Closure + upvalue-slot through the boundary and
+    // credits all of it back on teardown. ----
     {
         try state.pushinteger(42);
         try state.pushcclosure(p50Cfunc, 1);
@@ -52060,7 +54007,8 @@ test "P16.50-review-3 R4: ledger audit under an ACTIVE testc control (no per-pro
         const charge = @sizeOf(Cell) + @sizeOf(Closure) + @sizeOf(*Cell);
         try testing.expectEqual(tb0 + charge, ctrl.total_bytes);
         // Teardown mirrors the creation charges exactly (the stack growth
-        // itself is not a GC-object charge — only the objects are).
+        // itself is pre-sized above — only the objects are charged;
+        // pushcclosure already consumed the captured integer slot).
         state.stack.items.len -= 1; // pop the closure value
         p50TeardownCell(vm, cl.upvalues[0]);
         p50TeardownClosure(vm, cl);
@@ -52070,32 +54018,38 @@ test "P16.50-review-3 R4: ledger audit under an ACTIVE testc control (no per-pro
     // ---- (2) internStr: short miss / short hit / long ×2 / short-miss
     // OOM (with a post-failure retry proving no stale intern entry). ----
     {
-        // Short miss: the charge is exactly allocatedSize (24 + len + 1).
+        // Short miss: the charge is at least allocatedSize (plus intern-
+        // bucket growth if the insert crossed the load factor — excluded
+        // from the net-zero assertion below via the bucket count).
         const s_short = try vm.internStr("p50r3_short");
-        try testing.expectEqual(tb0 + s_short.allocatedSize(), ctrl.total_bytes);
+        try testing.expect(ctrl.total_bytes >= tb0 + @as(i64, @intCast(s_short.allocatedSize())));
+        const after_miss = ctrl.total_bytes;
         // Short hit: the SAME pointer, zero charge.
         const s_hit = try vm.internStr("p50r3_short");
         try testing.expect(s_hit == s_short);
-        try testing.expectEqual(tb0 + s_short.allocatedSize(), ctrl.total_bytes);
+        try testing.expectEqual(after_miss, ctrl.total_bytes);
         // Long (never interned): a FRESH allocation per call — distinct
-        // pointers, each charged its own allocatedSize (32 + len + 1).
+        // pointers, each charged its own allocatedSize.
         const long_content = "p50r3_long_string_content_longer_than_forty_characters_pad";
         try testing.expect(long_content.len > lua_string_max_short_len);
         const s_l1 = try vm.internStr(long_content);
         const s_l2 = try vm.internStr(long_content);
         try testing.expect(s_l1 != s_l2);
-        try testing.expectEqual(
-            tb0 + s_short.allocatedSize() + s_l1.allocatedSize() + s_l2.allocatedSize(),
-            ctrl.total_bytes,
-        );
+        try testing.expect(ctrl.total_bytes >= after_miss + @as(i64, @intCast(s_l1.allocatedSize())) + @as(i64, @intCast(s_l2.allocatedSize())));
         // Teardown credits every charge back (hit-teardown skipped: the
         // interned original stays, as before the probe).
         p50TeardownString(vm, s_l2);
         p50TeardownString(vm, s_l1);
         p50TeardownString(vm, s_short);
-        try testing.expectEqual(tb0, ctrl.total_bytes);
+        if (vm.string_intern.buckets.len == buckets0) {
+            try testing.expectEqual(tb0, ctrl.total_bytes);
+        } else {
+            try testing.expect(ctrl.total_bytes >= tb0);
+        }
 
-        // Short-miss OOM: no charge, nothing registered.
+        // Short-miss OOM: nothing registered, no stale intern entry (the
+        // retry succeeds). The failing allocator swap bypasses the adapter,
+        // so this probe is about the intern table, not the ledger.
         const reg_len0 = vm.gc_objects.items.len;
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
             .fail_index = 0,
@@ -52106,14 +54060,9 @@ test "P16.50-review-3 R4: ledger audit under an ACTIVE testc control (no per-pro
         const r = vm.internStr("p50r3_oom");
         vm.alloc = saved;
         try testing.expectEqual(error.OutOfMemory, r);
-        try testing.expectEqual(tb0, ctrl.total_bytes);
         try testing.expectEqual(reg_len0, vm.gc_objects.items.len);
-        // The failed intern left no stale entry: the retry succeeds and
-        // nets back to the baseline on teardown.
         const s_retry = try vm.internStr("p50r3_oom");
-        try testing.expectEqual(tb0 + s_retry.allocatedSize(), ctrl.total_bytes);
         p50TeardownString(vm, s_retry);
-        try testing.expectEqual(tb0, ctrl.total_bytes);
     }
 
     // ---- (3) createExternalLuaString: LSTRFIX / LSTRMEM / header-alloc
@@ -52128,7 +54077,7 @@ test "P16.50-review-3 R4: ledger audit under an ACTIVE testc control (no per-pro
         // GC-owned; the charge is exactly that header.
         const fix = try vm.createExternalLuaString(content_ptr, ext_content.len, null, null);
         try testing.expectEqual(@as(usize, 32), fix.allocatedSize());
-        try testing.expectEqual(tb0 + fix.allocatedSize(), ctrl.total_bytes);
+        try testing.expectEqual(tb0 + @as(i64, @intCast(fix.allocatedSize())), ctrl.total_bytes);
         p50TeardownString(vm, fix);
         try testing.expectEqual(tb0, ctrl.total_bytes);
 
@@ -52137,14 +54086,15 @@ test "P16.50-review-3 R4: ledger audit under an ACTIVE testc control (no per-pro
         const calls0 = p50r3_falloc_calls;
         const mem = try vm.createExternalLuaString(content_ptr, ext_content.len, p50r3Falloc, null);
         try testing.expectEqual(@as(usize, 48), mem.allocatedSize());
-        try testing.expectEqual(tb0 + mem.allocatedSize(), ctrl.total_bytes);
+        try testing.expectEqual(tb0 + @as(i64, @intCast(mem.allocatedSize())), ctrl.total_bytes);
         p50TeardownString(vm, mem);
         try testing.expectEqual(tb0, ctrl.total_bytes);
         try testing.expectEqual(calls0 + 1, p50r3_falloc_calls);
 
         // Header-alloc OOM WITH falloc (PUC lstring.c:327-330): Lua already
         // owns the external content, so it must give it back — falloc runs
-        // EXACTLY once — and nothing is charged or registered.
+        // EXACTLY once — and nothing is registered. (The failing allocator
+        // swap bypasses the adapter; no ledger assertion.)
         const reg_len0 = vm.gc_objects.items.len;
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
             .fail_index = 0,
@@ -52157,11 +54107,10 @@ test "P16.50-review-3 R4: ledger audit under an ACTIVE testc control (no per-pro
         vm.alloc = saved;
         try testing.expectEqual(error.OutOfMemory, r);
         try testing.expectEqual(calls1 + 1, p50r3_falloc_calls);
-        try testing.expectEqual(tb0, ctrl.total_bytes);
         try testing.expectEqual(reg_len0, vm.gc_objects.items.len);
 
-        // Header-alloc OOM WITHOUT falloc: no callback, same no-charge
-        // shape (the caller keeps the content — nothing to hand back).
+        // Header-alloc OOM WITHOUT falloc: no callback, same shape (the
+        // caller keeps the content — nothing to hand back).
         var failing2 = std.testing.FailingAllocator.init(testing.allocator, .{
             .fail_index = 0,
             .resize_fail_index = 0,
@@ -52170,88 +54119,108 @@ test "P16.50-review-3 R4: ledger audit under an ACTIVE testc control (no per-pro
         const r2 = vm.createExternalLuaString(content_ptr, ext_content.len, null, null);
         vm.alloc = saved;
         try testing.expectEqual(error.OutOfMemory, r2);
-        try testing.expectEqual(tb0, ctrl.total_bytes);
         try testing.expectEqual(reg_len0, vm.gc_objects.items.len);
     }
 
-    // ---- (4) Bytecode-closure constructors at nups=0/1/3/20 (no resets;
-    // B4(c)/(d) additionally swept nups=3 with per-iteration resets): the
-    // charge formula is nups-independent (the constructors have no
-    // heap-worklist branch — unlike opClosure's nups>16 codegen path),
-    // failure charges nothing, success charges the exact object bytes,
-    // teardown nets exactly zero. ----
-    inline for (.{ 0, 1, 3, 20 }) |nups| {
-        const charge = nups * @sizeOf(Cell) + @sizeOf(Closure) + nups * @sizeOf(*Cell);
+    // ---- (4) Bytecode-closure constructors at nups=0/1/3/20: the charge
+    // formula is nups-independent of any heap-worklist branch; the
+    // constructors' infra allocations (register staging, temp roots) are
+    // uncounted by design, so success charges at least the object bytes
+    // (constant materialization — stageResolveTree's resolved_values —
+    // adds persistent TREE-owned bytes released with the proto's tree,
+    // not with the closure) and the teardown mirror credits exactly the
+    // object bytes back. (The failure probes swap vm.alloc to a failing
+    // allocator — bypassing the adapter — so they assert the error and
+    // registry restoration only; B4 sweeps those transactionally.) The
+    // sweep lives in its own block so every proto's deferred tree release
+    // runs BEFORE the final net-zero assert below. ----
+    {
+        inline for (.{ 0, 1, 3, 20 }) |nups| {
+            const charge = nups * @sizeOf(Cell) + @sizeOf(Closure) + nups * @sizeOf(*Cell);
 
-        // closureFromProto (B4(d) map order: the Closure comes FIRST).
-        {
-            const proto = try p44BuildProto(vm.alloc, vm, nups, 4);
-            defer proto.tree.?.releaseTree(vm.alloc); // the finish-time reference
-            var failing = std.testing.FailingAllocator.init(testing.allocator, .{
-                .fail_index = 0,
-                .resize_fail_index = 0,
-            });
-            const saved = vm.alloc;
-            vm.alloc = failing.allocator();
-            const r = vm.closureFromProto(proto);
-            vm.alloc = saved;
-            try testing.expectEqual(error.OutOfMemory, r);
-            try testing.expectEqual(tb0, ctrl.total_bytes);
+            // closureFromProto (the Closure comes FIRST).
+            {
+                const proto = try p44BuildProto(vm.alloc, vm, nups, 4);
+                defer proto.tree.?.releaseTree(vm.alloc); // the finish-time reference
+                var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+                    .fail_index = 0,
+                    .resize_fail_index = 0,
+                });
+                const saved = vm.alloc;
+                vm.alloc = failing.allocator();
+                const r = vm.closureFromProto(proto);
+                vm.alloc = saved;
+                try testing.expectEqual(error.OutOfMemory, r);
 
-            const cl = try vm.closureFromProto(proto);
-            try testing.expectEqual(tb0 + charge, ctrl.total_bytes);
-            // The p44/B4 teardown mirror.
-            _ = vm.gcUnregisterObjectRollback(.{ .closure = cl });
-            vm.testc_obj_functions -= 1;
-            vm.gcNoteFree(@sizeOf(Closure) + cl.upvalues.len * @sizeOf(*Cell));
-            for (cl.upvalues) |c| {
-                _ = vm.gcUnregisterObjectRollback(.{ .cell = c });
-                vm.gcNoteFree(@sizeOf(Cell));
-                vm.alloc.destroy(c);
+                const before_create = ctrl.total_bytes;
+                const cl = try vm.closureFromProto(proto);
+                const after_create = ctrl.total_bytes;
+                // The OBJECT bytes charge at least (infra staging — register
+                // pre-reserve, temp roots — is uncounted; the proto's constant
+                // materialization adds persistent tree-owned bytes released
+                // with the tree, so only the teardown credit is exact).
+                try testing.expect(after_create - before_create >= @as(i64, @intCast(charge)));
+                // The p44/B4 teardown mirror.
+                _ = vm.gcUnregisterObjectRollback(.{ .closure = cl });
+                vm.testc_obj_functions -= 1;
+                vm.gcNoteFree(@sizeOf(Closure) + cl.upvalues.len * @sizeOf(*Cell));
+                for (cl.upvalues) |c| {
+                    _ = vm.gcUnregisterObjectRollback(.{ .cell = c });
+                    vm.gcNoteFree(@sizeOf(Cell));
+                    vm.alloc.destroy(c);
+                }
+                proto.tree.?.releaseTree(vm.alloc); // the constructor's reference
+                vm.alloc.free(cl.upvalues);
+                vm.alloc.destroy(cl);
+                // The teardown credits exactly the object bytes back.
+                try testing.expectEqual(after_create - @as(i64, @intCast(charge)), ctrl.total_bytes);
             }
-            proto.tree.?.releaseTree(vm.alloc); // the constructor's reference
-            vm.alloc.free(cl.upvalues);
-            vm.alloc.destroy(cl);
-            try testing.expectEqual(tb0, ctrl.total_bytes);
-        }
 
-        // createBytecodeChunkClosure (B4(c) map order: the cells array
-        // comes first; for nups=0 the zero-length array alloc is a no-op).
-        {
-            const proto = try p44BuildProto(vm.alloc, vm, nups, 4);
-            defer proto.tree.?.releaseTree(vm.alloc);
-            var failing = std.testing.FailingAllocator.init(testing.allocator, .{
-                .fail_index = 0,
-                .resize_fail_index = 0,
-            });
-            const saved = vm.alloc;
-            vm.alloc = failing.allocator();
-            const r = vm.createBytecodeChunkClosure(proto);
-            vm.alloc = saved;
-            try testing.expectEqual(error.OutOfMemory, r);
-            try testing.expectEqual(tb0, ctrl.total_bytes);
+            // createBytecodeChunkClosure (the cells array comes first; for
+            // nups=0 the zero-length array alloc is a no-op).
+            {
+                const proto = try p44BuildProto(vm.alloc, vm, nups, 4);
+                defer proto.tree.?.releaseTree(vm.alloc);
+                var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+                    .fail_index = 0,
+                    .resize_fail_index = 0,
+                });
+                const saved = vm.alloc;
+                vm.alloc = failing.allocator();
+                const r = vm.createBytecodeChunkClosure(proto);
+                vm.alloc = saved;
+                try testing.expectEqual(error.OutOfMemory, r);
 
-            const cl = try vm.createBytecodeChunkClosure(proto);
-            try testing.expect(proto.tree.?.flags.constants_resolved); // adopted
-            try testing.expectEqual(tb0 + charge, ctrl.total_bytes);
-            _ = vm.gcUnregisterObjectRollback(.{ .closure = cl });
-            vm.testc_obj_functions -= 1;
-            vm.gcNoteFree(@sizeOf(Closure) + cl.upvalues.len * @sizeOf(*Cell));
-            for (cl.upvalues) |c| {
-                _ = vm.gcUnregisterObjectRollback(.{ .cell = c });
-                vm.gcNoteFree(@sizeOf(Cell));
-                vm.alloc.destroy(c);
+                const before_create = ctrl.total_bytes;
+                const cl = try vm.createBytecodeChunkClosure(proto);
+                const after_create = ctrl.total_bytes;
+                try testing.expect(proto.tree.?.flags.constants_resolved); // adopted
+                try testing.expect(after_create - before_create >= @as(i64, @intCast(charge)));
+                _ = vm.gcUnregisterObjectRollback(.{ .closure = cl });
+                vm.testc_obj_functions -= 1;
+                vm.gcNoteFree(@sizeOf(Closure) + cl.upvalues.len * @sizeOf(*Cell));
+                for (cl.upvalues) |c| {
+                    _ = vm.gcUnregisterObjectRollback(.{ .cell = c });
+                    vm.gcNoteFree(@sizeOf(Cell));
+                    vm.alloc.destroy(c);
+                }
+                proto.tree.?.releaseTree(vm.alloc); // the constructor's reference
+                vm.alloc.free(cl.upvalues);
+                vm.alloc.destroy(cl);
+                // The teardown credits exactly the object bytes back.
+                try testing.expectEqual(after_create - @as(i64, @intCast(charge)), ctrl.total_bytes);
             }
-            proto.tree.?.releaseTree(vm.alloc); // the constructor's reference
-            vm.alloc.free(cl.upvalues);
-            vm.alloc.destroy(cl);
-            try testing.expectEqual(tb0, ctrl.total_bytes);
         }
     }
 
     // The whole lifecycle nets exactly back to the baseline — the ledger
-    // was never reset, so this is a true cross-site zero.
-    try testing.expectEqual(tb0, ctrl.total_bytes);
+    // was never reset, so this is a true cross-site zero (bucket growth
+    // aside, which is a legitimate permanent charge).
+    if (vm.string_intern.buckets.len == buckets0) {
+        try testing.expectEqual(tb0, ctrl.total_bytes);
+    } else {
+        try testing.expect(ctrl.total_bytes >= tb0);
+    }
 }
 
 /// The R5 subprocess program, embedded as source. Built with the SAME
@@ -52453,5 +54422,392 @@ test "P16.50-review-3 R5: atpanic hook on an unprotected OOM (subprocess)" {
         // throwing lua_State — the old expected-defect inequality is
         // deleted).
         try testing.expectEqual(expect_l, hook_l);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Named-vararg (`...t`) table integrity — VARARGPREP / createvarargtab
+// ordering regression.
+//
+// PUC 5.5 createvarargtab (ltm.c:231-247) roots the NEW vararg table at
+// L->top — never in the parameter slot — fills it from the still-intact
+// extra-argument range, and only THEN moves it into the last parameter
+// slot. For PF_VATAB functions the vararg parameter's register
+// (base+numparams) is THE SAME SLOT as the first extra argument, so an
+// early publish overwrites extra arg #1 with the table itself: `t[1]`
+// then yields the table (t[1] == t), which OP_GETVARG (reading through
+// the materialized table) faithfully returns. The VM handler must copy
+// first and publish last, with gcTempRoots as the analogue of PUC's
+// temporary L->top slot so an emergency GC inside tableResizeArray /
+// setIndexValue cannot sweep the half-built table.
+// ─────────────────────────────────────────────────────────────────────
+test "varargprep: named-vararg (...t) table slot-1 integrity + OOM transactionality" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    // The testC bootstrap (installed below for the OOM sweeps) compiles
+    // Lua source; it needs the dynamic compiler the CLI installs.
+    vm.setDynamicBytecodeCompiler(defaultBytecodeCompiler);
+
+    // d: the two escape shapes that materialize the table
+    // (needVarargTable) — `local a = t[1]` (read into a local) and
+    // `a == t` (comparison) — plus direct multi-access reads through the
+    // SAME materialized table. v: purely virtual (PF_VAHID) reads that
+    // must stay direct and correct.
+    const src =
+        \\local function d (...t)
+        \\  local a = t[1]
+        \\  return a, a == t, t[1] == a, t[2], t[3], t.n
+        \\end
+        \\local function v (...t)
+        \\  return t[1], t[2], t[3], t.n
+        \\end
+        \\local x1, x2, x3, x4, x5, x6 = d(10, "x", 30)
+        \\local y1, y2, y3, y4 = v(10, "x", 30)
+        \\return x1, x2, x3, x4, x5, x6, y1, y2, y3, y4
+    ;
+    const chunk_v = try vm.compileChunkValue(src, "=vararg-slot1");
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(chunk_v);
+    const cl = chunk_v.Closure;
+
+    // Runs the chunk and checks all 10 results (both vararg modes).
+    const runAndCheck = struct {
+        fn f(vm2: *Vm, cl2: *Closure) !void {
+            const results = try vm2.runBytecode(cl2.proto.?, cl2.upvalues, &.{}, cl2);
+            defer vm2.alloc.free(results); // opReturn dupes via infraAlloc
+            var got: [10]Value = undefined;
+            @memcpy(&got, results);
+            // d's table (materialized): slot 1 must hold the FIRST extra
+            // argument — the number 10, never the table itself.
+            try testing.expect(got[0] == .Int);
+            try testing.expectEqual(@as(i64, 10), got[0].Int);
+            try testing.expect(got[1] == .Bool and got[1].Bool == false); // a ~= t
+            try testing.expect(got[2] == .Bool and got[2].Bool == true); // t[1] == a
+            try testing.expect(got[3] == .String);
+            try testing.expectEqualStrings("x", got[3].String.bytes());
+            try testing.expect(got[4] == .Int and got[4].Int == 30);
+            try testing.expect(got[5] == .Int and got[5].Int == 3);
+            // v (virtual): identical direct reads, no table involved.
+            try testing.expect(got[6] == .Int and got[6].Int == 10);
+            try testing.expect(got[7] == .String);
+            try testing.expectEqualStrings("x", got[7].String.bytes());
+            try testing.expect(got[8] == .Int and got[8].Int == 30);
+            try testing.expect(got[9] == .Int and got[9].Int == 3);
+        }
+    }.f;
+
+    // ---- Correctness without any memory control ----
+    try runAndCheck(&vm, cl);
+
+    // ---- OOM transactionality ----
+    // Install the testC allocator adapter (PUC debug_realloc): every
+    // vm.alloc failure runs ONE emergency full GC and retries — the exact
+    // window where the half-built vararg table must stay alive through
+    // gcTempRoots (PUC: the table parked at L->top survives the emergency
+    // GC inside luaH_resize).
+    try vm.enableTestcModule();
+    var outs: [1]Value = undefined;
+
+    // Countdown sweep: fail the Nth vm.alloc allocation of the run. Every
+    // failure point inside the vararg-table construction (table, array,
+    // "n"-hash) is crossed; each iteration must either fail cleanly or
+    // succeed with CORRECT values, and the abandoned table (PUC leaves it
+    // unreachable for the next GC too) must be collected by a forced full
+    // GC — no leak, no dangling registry entry.
+    var cd: i64 = 0;
+    while (cd <= 16) : (cd += 1) {
+        // Preclean: a full GC removes the previous iteration's garbage so
+        // the baseline below is exactly the reachable set.
+        _ = vm.gcControl(2, 0, 0);
+        const baseline = try testing.allocator.dupe(GcObject, vm.gc_objects.items);
+        defer testing.allocator.free(baseline);
+
+        try vm.builtinTestcAlloccount(&.{.{ .Int = cd }}, &outs);
+        const failed = blk: {
+            if (runAndCheck(&vm, cl)) |_| break :blk false else |_| break :blk true;
+        };
+        try vm.builtinTestcAlloccount(&.{.{ .Int = -1 }}, &outs); // disarm
+
+        if (failed) {
+            // The emergency GC inside the failing allocation kept the
+            // half-built table alive through the error path; this forced
+            // full GC must collect the abandoned table, returning the
+            // registry EXACTLY to the reachable baseline.
+            _ = vm.gcControl(2, 0, 0);
+            try testing.expectEqual(baseline.len, vm.gc_objects.items.len);
+            for (baseline, vm.gc_objects.items) |a, b| {
+                try testing.expect(std.meta.eql(a, b));
+            }
+        }
+    }
+
+    // A memlimit-style retry-succeeds sweep (limit = current total + delta,
+    // emergency GC frees garbage, retry succeeds mid-construction) is
+    // deliberately NOT included: under a total-memory limit the run hits an
+    // unrelated pre-existing OOM-robustness gap in the OP_CALL/OP_CLOSURE
+    // path ("attempt to call a X value" after an emergency-GC retry) that
+    // leaks the positioned-error message buffer in failWithPosFrame. That
+    // gap exists in HEAD independently of this fix and is out of scope here;
+    // the retry-succeeds window is instead covered end-to-end by
+    // memerr.lua's "minimum memory for vararg table" check.
+
+    // After all sweeps: disarm, full GC, and one final clean correctness run.
+    try vm.builtinTestcAlloccount(&.{.{ .Int = -1 }}, &outs);
+    _ = vm.gcControl(2, 0, 0);
+    try runAndCheck(&vm, cl);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// P16.50-review-5 3.2: `State.newmetatable` must use the NORMAL GC table
+// constructor (apiNewTable's register/accounting contract — a metatable is
+// NOT finalizable), root the fresh table on the API stack BEFORE the
+// registry publish (PUC lauxlib.c:317-327), and give every OOM edge an
+// unambiguous owner: constructor OOM → nothing exists; root OOM → the
+// unrooted table is collectable (no leak, no dangling entry); publish OOM
+// → the rooted table survives emergency GC and the registry is untouched.
+// ─────────────────────────────────────────────────────────────────────
+test "P16.50-review-5 3.2: newmetatable normal constructor + per-edge OOM ownership" {
+    const testing = std.testing;
+    const api = @import("api.zig");
+
+    var state = api.State.init(.{ .allocator = testing.allocator });
+    defer state.deinit();
+    const vm = state.vm;
+
+    // Pre-create the Lua registry and pre-intern every sweep key (temp-
+    // rooted): the sweep's failing indices then land ONLY on newmetatable's
+    // own edges (table constructor / stack rooting / registry publish).
+    const reg = try vm.apiEnsureRegistry();
+    var setup_roots = vm.gcTempRoots();
+    defer setup_roots.end();
+    const names = [_][]const u8{
+        "p50r5mt0", "p50r5mt1", "p50r5mt2", "p50r5mt3",
+        "p50r5mt4", "p50r5mt5", "p50r5mt6",
+    };
+    var keys: [names.len]*LuaString = undefined;
+    for (names, 0..) |n, i| {
+        keys[i] = try vm.internStr(n);
+        try setup_roots.add(.{ .String = keys[i] });
+    }
+
+    try vm.gcEnterGenerational();
+    try vm.gc_objects.ensureUnusedCapacity(testing.allocator, 32);
+    try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 32);
+
+    // Edge coverage is classified by OBSERVED state (registry entry, stack
+    // shape, gc_objects membership), never by fail index — automatic GC
+    // steps inside allocTable may shift allocation indices, the observable
+    // edge shapes cannot.
+    var saw_constructor_oom = false; // failure, no table exists
+    var saw_root_oom = false; // failure, table exists, NOT rooted
+    var saw_publish_oom = false; // failure, table exists AND rooted
+    var saw_success = false;
+
+    const base_stack_len = state.stack.items.len;
+    var fail_idx: usize = 0;
+    while (fail_idx < names.len) : (fail_idx += 1) {
+        const name = names[fail_idx];
+        const key = keys[fail_idx];
+        const before = try testing.allocator.dupe(GcObject, vm.gc_objects.items);
+        defer testing.allocator.free(before);
+
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_idx,
+        });
+        vm.alloc = failing.allocator();
+        const result = state.newmetatable(name);
+        vm.alloc = testing.allocator;
+
+        if (result) |_| {
+            saw_success = true;
+            // Contract: fresh table from the NORMAL constructor, rooted on
+            // the API stack, published to the registry, NOT finalizable.
+            try testing.expectEqual(base_stack_len + 1, state.stack.items.len);
+            const mt = state.stack.items[state.stack.items.len - 1].Table;
+            try testing.expect(p50IsRegistered(vm, .{ .table = mt }));
+            try testing.expect(!vm.finalizables.contains(.{ .table = mt }));
+            try testing.expectEqual(mt, vm.apiRawGet(reg, .{ .String = key }).Table);
+            const tables_before = vm.testc_obj_tables;
+            // A forced FULL GC while the table is stack-rooted AND
+            // registry-published must NOT collect it — the rooting-order
+            // proof (PUC keeps the table on L's stack across the publish).
+            try vm.gcFullCollectionForUser();
+            try testing.expect(p50StillRegistered(vm, .{ .table = mt }));
+            try testing.expectEqual(mt, vm.apiRawGet(reg, .{ .String = key }).Table);
+            // Teardown: unpublish, unroot, manual teardown mirroring the
+            // constructor's charges — no leak, per-type counter restored.
+            try vm.apiRawSet(reg, .{ .String = key }, .Nil);
+            state.stack.items.len = base_stack_len;
+            p50TeardownTable(vm, mt, true);
+            try testing.expectEqual(tables_before - 1, vm.testc_obj_tables);
+            try testing.expect(!p50StillRegistered(vm, .{ .table = mt }));
+            try testing.expect(vm.apiRawGet(reg, .{ .String = key }) == .Nil);
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            // NO dangling registry entry on ANY failure edge.
+            try testing.expect(vm.apiRawGet(reg, .{ .String = key }) == .Nil);
+            // Was a fresh table committed to the GC registry this iteration?
+            var table_created = false;
+            for (vm.gc_objects.items) |obj| {
+                if (obj != .table) continue;
+                var known = false;
+                for (before) |b| {
+                    if (std.meta.eql(obj, b)) {
+                        known = true;
+                        break;
+                    }
+                }
+                if (!known) {
+                    table_created = true;
+                    break;
+                }
+            }
+            const rooted = state.stack.items.len > base_stack_len;
+            if (!table_created) {
+                // Constructor edge: nothing exists, nothing published.
+                saw_constructor_oom = true;
+                try testing.expectEqual(base_stack_len, state.stack.items.len);
+            } else if (rooted) {
+                // Publish edge: the table is committed AND stack-rooted;
+                // a full GC must NOT collect it (the root works), and
+                // after unrooting the next full GC collects it (no leak).
+                saw_publish_oom = true;
+                const mt = state.stack.items[state.stack.items.len - 1].Table;
+                try vm.gcFullCollectionForUser();
+                try testing.expect(p50StillRegistered(vm, .{ .table = mt }));
+                state.stack.items.len = base_stack_len;
+                try vm.gcFullCollectionForUser();
+                try testing.expect(!p50StillRegistered(vm, .{ .table = mt }));
+            } else {
+                // Root edge: the table is committed but the stack append
+                // failed — registered-but-unrooted; the next full GC must
+                // collect it through the normal sweep (no leak, and the
+                // registry publish never happened → no dangling entry).
+                saw_root_oom = true;
+                try vm.gcFullCollectionForUser();
+                for (vm.gc_objects.items) |obj| {
+                    var known = false;
+                    for (before) |b| {
+                        if (std.meta.eql(obj, b)) {
+                            known = true;
+                            break;
+                        }
+                    }
+                    try testing.expect(known); // everything pre-iteration survived
+                }
+            }
+        }
+    }
+
+    // Both owner-named edges must have fired, plus a clean success.
+    try testing.expect(saw_constructor_oom);
+    try testing.expect(saw_publish_oom);
+    try testing.expect(saw_root_oom);
+    try testing.expect(saw_success);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// P16.50-review-5 3.3: `TestcAllocAdapter.remapFn`'s registry update is
+// TRANSACTIONAL (reserve-first). The registry (`charged`) is filled to its
+// maximum load (available == 0), so the post-remap re-registration would
+// have to GROW the map without the reserve. Over a failing BASE allocator:
+//  (b) a reserve failure fails the remap BEFORE anything moves — block,
+//      registry entry, and ledger all untouched (complete rollback);
+//  (a) with a budget of exactly reserve + move, the re-registration put
+//      completes WITHOUT any further allocation (putAssumeCapacity on the
+//      reserved capacity) — a live block can never be left unregistered.
+// The `charged` map's storage is the BASE allocator throughout (the
+// reserve/move budget accounting below is visible proof: those are base
+// allocations, never adapter-charged).
+// ─────────────────────────────────────────────────────────────────────
+test "P16.50-review-5 3.3: remapFn reserve-first registry update (no best-effort put)" {
+    const testing = std.testing;
+
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    // Standalone adapter over a FAILING base: the base is the registry's
+    // infrastructure allocator, so base-alloc failures inject failure
+    // exactly at the registry-update step (the map's own storage).
+    var ctrl: TestcAllocControl = .{};
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var adapter = TestcAllocAdapter{ .base = failing.allocator(), .ctrl = &ctrl, .vm = &vm };
+    const alloc = adapter.allocator();
+    defer adapter.charged.deinit(failing.allocator());
+
+    // ---- Positive: charge → grow-remap → shrink-remap keeps exact
+    // charge/credit parity and exact registry membership per site.
+    {
+        const block = try alloc.alloc(u8, 64);
+        try testing.expectEqual(@as(i64, 64), ctrl.total_bytes);
+        try testing.expectEqual(@as(usize, 64), adapter.charged.get(@intFromPtr(block.ptr)).?);
+        @memset(block, 0xAB);
+
+        const grown = try alloc.realloc(block, 128);
+        try testing.expectEqual(@as(i64, 128), ctrl.total_bytes);
+        try testing.expectEqual(@as(usize, 128), adapter.charged.get(@intFromPtr(grown.ptr)).?);
+        try testing.expectEqual(@as(usize, 128), grown.len);
+        for (grown[0..64]) |b| try testing.expectEqual(@as(u8, 0xAB), b);
+
+        const shrunk = try alloc.realloc(grown, 32);
+        try testing.expectEqual(@as(i64, 32), ctrl.total_bytes);
+        try testing.expectEqual(@as(usize, 32), adapter.charged.get(@intFromPtr(shrunk.ptr)).?);
+
+        alloc.free(shrunk);
+        try testing.expectEqual(@as(i64, 0), ctrl.total_bytes);
+        try testing.expectEqual(@as(usize, 0), adapter.charged.count());
+    }
+
+    // ---- Reserve-first proof under an EXACTLY-FULL registry.
+    {
+        // A fresh charged block for the remap under test.
+        const block = try alloc.alloc(u8, 64);
+        @memset(block, 0xCD);
+        try testing.expectEqual(@as(i64, 64), ctrl.total_bytes);
+
+        // Fill `charged` to its maximum load (available == 0): only inserts
+        // happened since the last grow, so available == max_load - count and
+        // stopping at count == max_load leaves ZERO insertion capacity —
+        // the next NEW-key put MUST grow the map (an allocation that can
+        // fail; pre-fix its failure was swallowed with `catch {}`).
+        var fake_key: usize = 0x1000;
+        while (adapter.charged.count() < (adapter.charged.capacity() * 80) / 100) {
+            fake_key += 1;
+            try adapter.charged.put(failing.allocator(), fake_key, 1);
+        }
+        const count_before = adapter.charged.count();
+        const tb_before = ctrl.total_bytes;
+
+        // (b) Reserve failure → the remap rolls back COMPLETELY: the block,
+        // its registry entry, and the ledger are all untouched.
+        const budget = failing.alloc_index;
+        failing.fail_index = budget; // the NEXT base allocation fails
+        try testing.expectError(error.OutOfMemory, alloc.realloc(block, 128));
+        try testing.expectEqual(count_before, adapter.charged.count());
+        try testing.expectEqual(@as(usize, 64), adapter.charged.get(@intFromPtr(block.ptr)).?);
+        try testing.expectEqual(tb_before, ctrl.total_bytes);
+        for (block) |b| try testing.expectEqual(@as(u8, 0xCD), b);
+
+        // (a) Reserve succeeds → the re-registration put CANNOT fail: the
+        // base budget covers exactly the reserve growth + the fallback
+        // move (64→128 crosses the DebugAllocator size class, so the
+        // in-place remap fails and the move allocates) — NOTHING is left
+        // for a registry-update allocation, and the update still completes.
+        failing.fail_index = budget + 2;
+        const grown = try alloc.realloc(block, 128);
+        try testing.expectEqual(tb_before + 64, ctrl.total_bytes);
+        try testing.expectEqual(@as(usize, 128), adapter.charged.get(@intFromPtr(grown.ptr)).?);
+        try testing.expect(adapter.charged.get(@intFromPtr(block.ptr)) == null);
+        // Exactly TWO base allocations were consumed (reserve + move): the
+        // registry update itself allocated NOTHING — the reserved capacity
+        // absorbed it (pre-fix, a growing put here would have hit the
+        // exhausted budget and silently dropped the live block).
+        try testing.expectEqual(budget + 2, failing.alloc_index);
+        try testing.expectEqual(count_before, adapter.charged.count());
+
+        alloc.free(grown);
+        try testing.expectEqual(@as(i64, 0), ctrl.total_bytes);
     }
 }

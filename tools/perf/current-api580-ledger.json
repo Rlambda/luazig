@@ -1,14 +1,14 @@
 {
-  "created_utc": "2026-09-18T17:32:30.544925+00:00",
+  "created_utc": "2026-09-18T21:16:37.012180+00:00",
   "provenance": {
-    "git_head": "af78512",
-    "measured_source_head": "af78512",
+    "git_head": "ea00d1f",
+    "measured_source_head": "ea00d1f",
     "git_dirty": "dirty",
     "source_dirty": "clean",
     "artifact_dirty": "dirty",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast+Debug",
-    "zig_binary_sha16": "6838de8de259be3d"
+    "zig_binary_sha16": "cd96e9810d8a74b7"
   },
   "gate_threshold": 400,
   "verdict": "GREEN",
@@ -130,18 +130,18 @@
   },
   "evidence": {
     "harness_anchored": {
-      "m1": 68568,
-      "m2": 68952,
+      "m1": 68775,
+      "m2": 69159,
       "delta": 384,
-      "m2_global_crosscheck": 68952,
+      "m2_global_crosscheck": 69159,
       "x_interned_m1": true,
       "y_interned_m1": true,
       "name_interned_m1": false,
       "b_interned_m1": false,
       "x_interned_m2": true,
       "y_interned_m2": true,
-      "l1_outstanding": 647,
-      "l2_outstanding": 654,
+      "l1_outstanding": 646,
+      "l2_outstanding": 653,
       "freed_in_interval_count": 0,
       "freed_in_interval_bytes": 0,
       "sizes": {
@@ -156,11 +156,11 @@
         "Constant": 16
       },
       "code_closure": {
-        "ptr": 140511939856320,
+        "ptr": 139647096915072,
         "tree_is_root": true,
         "upvalues_len": 1,
         "proto": {
-          "ptr": 140511938019840,
+          "ptr": 139647095086848,
           "gc_charged": true,
           "gc_footprint": 264,
           "fixed_arrays": true,
@@ -174,7 +174,7 @@
           "live_reg_top_len": 0,
           "ref_count": 1,
           "source_backing_extra": false,
-          "source_backing_pin_len": 17087,
+          "source_backing_pin_len": 17090,
           "constants": [
             {
               "type": "string",
@@ -196,70 +196,70 @@
       },
       "new_outstanding": [
         {
-          "ptr": 140511941231744,
-          "len": 48,
-          "ret_addr": 18313709,
-          "label": "resolved_values",
-          "symbol": "vm.Vm.loadChunkImpl"
-        },
-        {
-          "ptr": 140511939920480,
-          "len": 32,
-          "ret_addr": 18333897,
-          "label": "external_LuaString_header",
-          "symbol": "vm.Vm.undumpFixedInternCallback"
-        },
-        {
-          "ptr": 140511939856320,
-          "len": 40,
-          "ret_addr": 18306868,
-          "label": "Closure",
-          "symbol": "vm.Vm.builtinLoadEx"
-        },
-        {
-          "ptr": 140511935397912,
-          "len": 8,
-          "ret_addr": 18306868,
-          "label": "Closure.upvalues slice",
-          "symbol": "vm.Vm.builtinLoadEx"
-        },
-        {
-          "ptr": 140511936512128,
+          "ptr": 139647092064256,
           "len": 16,
-          "ret_addr": 18313709,
+          "ret_addr": 18315437,
           "label": "upvalues_desc",
           "symbol": "vm.Vm.loadChunkImpl"
         },
         {
-          "ptr": 140511939856384,
+          "ptr": 139647100584960,
+          "len": 48,
+          "ret_addr": 18315437,
+          "label": "resolved_values",
+          "symbol": "vm.Vm.loadChunkImpl"
+        },
+        {
+          "ptr": 139647096980192,
+          "len": 32,
+          "ret_addr": 18334873,
+          "label": "external_LuaString_header",
+          "symbol": "vm.Vm.undumpFixedInternCallback"
+        },
+        {
+          "ptr": 139647095086848,
+          "len": 200,
+          "ret_addr": 18315437,
+          "label": "Proto",
+          "symbol": "vm.Vm.loadChunkImpl"
+        },
+        {
+          "ptr": 139647096915136,
           "len": 40,
-          "ret_addr": 18306868,
+          "ret_addr": 18308596,
           "label": "Cell",
           "symbol": "vm.Vm.builtinLoadEx"
         },
         {
-          "ptr": 140511938019840,
-          "len": 200,
-          "ret_addr": 18313709,
-          "label": "Proto",
-          "symbol": "vm.Vm.loadChunkImpl"
+          "ptr": 139647096915072,
+          "len": 40,
+          "ret_addr": 18308596,
+          "label": "Closure",
+          "symbol": "vm.Vm.builtinLoadEx"
+        },
+        {
+          "ptr": 139647093506064,
+          "len": 8,
+          "ret_addr": 18308596,
+          "label": "Closure.upvalues slice",
+          "symbol": "vm.Vm.builtinLoadEx"
         }
       ],
       "freed_in_interval": []
     },
     "harness_variance": {
-      "m1": 68412,
-      "m2": 68848,
+      "m1": 68619,
+      "m2": 69055,
       "delta": 436,
-      "m2_global_crosscheck": 68848,
+      "m2_global_crosscheck": 69055,
       "x_interned_m1": false,
       "y_interned_m1": false,
       "name_interned_m1": false,
       "b_interned_m1": false,
       "x_interned_m2": true,
       "y_interned_m2": true,
-      "l1_outstanding": 645,
-      "l2_outstanding": 654,
+      "l1_outstanding": 644,
+      "l2_outstanding": 653,
       "freed_in_interval_count": 0,
       "freed_in_interval_bytes": 0,
       "sizes": {
@@ -274,11 +274,11 @@
         "Constant": 16
       },
       "code_closure": {
-        "ptr": 140211342215104,
+        "ptr": 140033786315776,
         "tree_is_root": true,
         "upvalues_len": 1,
         "proto": {
-          "ptr": 140211340378624,
+          "ptr": 140033784616192,
           "gc_charged": true,
           "gc_footprint": 264,
           "fixed_arrays": true,
@@ -292,7 +292,7 @@
           "live_reg_top_len": 0,
           "ref_count": 1,
           "source_backing_extra": false,
-          "source_backing_pin_len": 17087,
+          "source_backing_pin_len": 17090,
           "constants": [
             {
               "type": "string",
@@ -314,81 +314,81 @@
       },
       "new_outstanding": [
         {
-          "ptr": 140211338870912,
-          "len": 16,
-          "ret_addr": 18313741,
-          "label": "upvalues_desc",
+          "ptr": 140033785791168,
+          "len": 48,
+          "ret_addr": 18315469,
+          "label": "resolved_values",
           "symbol": "vm.Vm.loadChunkImpl"
         },
         {
-          "ptr": 140211344573056,
-          "len": 32,
-          "ret_addr": 18333929,
-          "label": "external_LuaString_header",
-          "symbol": "vm.Vm.undumpFixedInternCallback"
-        },
-        {
-          "ptr": 140211342215168,
-          "len": 40,
-          "ret_addr": 18306900,
-          "label": "Cell",
-          "symbol": "vm.Vm.builtinLoadEx"
-        },
-        {
-          "ptr": 140211344573088,
-          "len": 26,
-          "ret_addr": 18107189,
-          "label": "short_string_Y",
-          "symbol": "vm.Vm.internStrAll"
-        },
-        {
-          "ptr": 140211340378624,
+          "ptr": 140033784616192,
           "len": 200,
-          "ret_addr": 18313741,
+          "ret_addr": 18315469,
           "label": "Proto",
           "symbol": "vm.Vm.loadChunkImpl"
         },
         {
-          "ptr": 140211344573024,
-          "len": 26,
-          "ret_addr": 18107189,
-          "label": "short_string_X",
-          "symbol": "vm.Vm.internStrAll"
+          "ptr": 140033783038016,
+          "len": 16,
+          "ret_addr": 18315469,
+          "label": "upvalues_desc",
+          "symbol": "vm.Vm.loadChunkImpl"
         },
         {
-          "ptr": 140211342215104,
-          "len": 40,
-          "ret_addr": 18306900,
-          "label": "Closure",
-          "symbol": "vm.Vm.builtinLoadEx"
-        },
-        {
-          "ptr": 140211337756696,
+          "ptr": 140033782972432,
           "len": 8,
-          "ret_addr": 18306900,
+          "ret_addr": 18308628,
           "label": "Closure.upvalues slice",
           "symbol": "vm.Vm.builtinLoadEx"
         },
         {
-          "ptr": 140211345884288,
-          "len": 48,
-          "ret_addr": 18313741,
-          "label": "resolved_values",
-          "symbol": "vm.Vm.loadChunkImpl"
+          "ptr": 140033789658560,
+          "len": 26,
+          "ret_addr": 18107461,
+          "label": "short_string_Y",
+          "symbol": "vm.Vm.internStrAll"
+        },
+        {
+          "ptr": 140033789658496,
+          "len": 26,
+          "ret_addr": 18107461,
+          "label": "short_string_X",
+          "symbol": "vm.Vm.internStrAll"
+        },
+        {
+          "ptr": 140033786839872,
+          "len": 40,
+          "ret_addr": 18308628,
+          "label": "Cell",
+          "symbol": "vm.Vm.builtinLoadEx"
+        },
+        {
+          "ptr": 140033786315776,
+          "len": 40,
+          "ret_addr": 18308628,
+          "label": "Closure",
+          "symbol": "vm.Vm.builtinLoadEx"
+        },
+        {
+          "ptr": 140033789658528,
+          "len": 32,
+          "ret_addr": 18334905,
+          "label": "external_LuaString_header",
+          "symbol": "vm.Vm.undumpFixedInternCallback"
         }
       ],
       "freed_in_interval": []
     },
     "driver_anchored": {
       "delta": 384,
-      "m1": 66454,
-      "m2": 66838,
+      "m1": 66651,
+      "m2": 67035,
       "under400": "true"
     },
     "driver_no_xy_root": {
       "delta": 436,
-      "m1": 66334,
-      "m2": 66770,
+      "m1": 66531,
+      "m2": 66967,
       "under400": "false"
     },
     "xy_root_probe_puc": {
@@ -406,49 +406,49 @@
     "ReleaseFast": {
       "driver_anchored": {
         "delta": 384,
-        "m1": 66454,
-        "m2": 66838,
+        "m1": 66651,
+        "m2": 67035,
         "under400": "true"
       },
       "driver_no_xy_root": {
         "delta": 436,
-        "m1": 66334,
-        "m2": 66770,
+        "m1": 66531,
+        "m2": 66967,
         "under400": "false"
       },
       "provenance": {
-        "git_head": "af78512",
-        "measured_source_head": "af78512",
+        "git_head": "ea00d1f",
+        "measured_source_head": "ea00d1f",
         "git_dirty": "dirty",
         "source_dirty": "clean",
         "artifact_dirty": "dirty",
         "zig_version": "0.16.0",
         "optimize_mode": "ReleaseFast",
-        "zig_binary_sha16": "2b30c9a71a25bf59"
+        "zig_binary_sha16": "ad8846c6269ac582"
       }
     },
     "Debug": {
       "driver_anchored": {
         "delta": 384,
-        "m1": 66454,
-        "m2": 66838,
+        "m1": 66651,
+        "m2": 67035,
         "under400": "true"
       },
       "driver_no_xy_root": {
         "delta": 436,
-        "m1": 66334,
-        "m2": 66770,
+        "m1": 66531,
+        "m2": 66967,
         "under400": "false"
       },
       "provenance": {
-        "git_head": "af78512",
-        "measured_source_head": "af78512",
+        "git_head": "ea00d1f",
+        "measured_source_head": "ea00d1f",
         "git_dirty": "dirty",
         "source_dirty": "clean",
         "artifact_dirty": "dirty",
         "zig_version": "0.16.0",
         "optimize_mode": "Debug",
-        "zig_binary_sha16": "6838de8de259be3d"
+        "zig_binary_sha16": "cd96e9810d8a74b7"
       }
     }
   }

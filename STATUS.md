@@ -1,4 +1,4 @@
-> Last updated: 2026-09-18 (P16.50-review-8 ledger-reopen)
+> Last updated: 2026-09-18 (P16.50-review-8)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -36,11 +36,11 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **84/84** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.40x** |
+| Performance (geomean vs PUC) | **1.41x** |
 | Perf gate (paired-seed) | **OK** — 21 published seeds (1..21) |
-| api580 fixed-load footprint | **GREEN** — measured 384/436 B vs threshold 400 B |
+| api580 fixed-load footprint | **GREEN** — anchored gate 384 B < 400 B; no-XY diagnostic 436 B; Measured on the ReleaseFast binary `ad8846c6269ac582`; the ledger's top-level provenance is the Debug binary `cd96e9810d8a74b7` (dual-mode ledger, not one single-RF-binary artifact). |
 
-Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
@@ -109,6 +109,13 @@ Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependen
   git-diff-check clean; perf probe vs 4bf132e max +0.40% (все |delta| < 5%).
   Финальный verdict — объявленной paired-seed clean-C сессией (seeds 1..21)
   + артефактным коммитом D (вердикт дописан в D; см. фазовую запись ниже).
+  Verdict clean-C сессии (2026-09-18T21:23:13Z, дописано артефактным
+  коммитом D): GREEN — RESULT OK, 18/18 workloads OK, worst per-seed
+  +2.62% (coroutine_yield[12]) < WARN 5%, wall-P25 envelope max +7.03%
+  (temp_table_alloc) < 10%, geomean diagnostic 1.41x; binary sha256
+  ad8846c6269ac582dc458502c5cd011152b6611635f0931e5bfde57c24eb2180
+  (полный sha в manifest row; determinism: pre-C build == rebuild ==
+  post-regeneration build == post-session rebuild).
   Open-count 23→22 (TBC-parity пункт остаётся открытым).
 
 - [ ] **Parity: errored coroutine не должна исполнять `<close>` до
@@ -8051,6 +8058,16 @@ paired-seed perf-сессия; source_head сессии = C, source_dirty = clea
   manifest append-only; baselines byte-identical (baseline-approved/
   baseline-p15.37/core_baseline не тронуты). Полное canonical current-*
   перегенерирование на clean C / RF binary — артефактным коммитом D.
+  Verdict clean-C сессии (2026-09-18T21:23:13Z, дописано артефактным
+  коммитом D): GREEN — RESULT OK, 18/18 workloads OK, worst per-seed
+  +2.62% (coroutine_yield[12]) < WARN 5%; wall-P25 envelope max +7.03%
+  (temp_table_alloc) < 10%; geomean diagnostic 1.41x; binary sha256
+  ad8846c6269ac582dc458502c5cd011152b6611635f0931e5bfde57c24eb2180
+  (полный sha в manifest row; determinism: pre-C build == rebuild ==
+  post-regeneration build == post-session rebuild). Manifest append-only,
+  22 строки — обе probe-сессии на dirty worktree 4bf132e (2026-09-18T19:58Z,
+  2026-09-18T20:01Z, source_dirty=dirty, result OK) сохранены как
+  historical, не выданы за измерение C.
 - **Residuals (honest, для владельца)**:
   - HIGH (found by review-8 §2/§3 sweeps, не чинился фазой): emergency-GC
     full-register-window scan + registry-compare safety skip в

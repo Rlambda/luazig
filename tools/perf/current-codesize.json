@@ -1,18 +1,18 @@
 {
- "created_utc": "2026-09-18T17:32:53.481105+00:00",
+ "created_utc": "2026-09-18T21:17:21.557368+00:00",
  "provenance": {
-  "git_head": "af78512cbe49754dfd042b996e8ebe15bd465435",
-  "measured_source_head": "af78512cbe49754dfd042b996e8ebe15bd465435",
+  "git_head": "ea00d1f22830580676d67f98ddab79e2c5c5bfba",
+  "measured_source_head": "ea00d1f22830580676d67f98ddab79e2c5c5bfba",
   "source_dirty": "clean",
-  "zig_binary_sha256": "2b30c9a71a25bf59817a05133642642f6aea6767b933f6a76d631b21afced8a4",
-  "note": "P16.50-review-7 C2 regeneration from clean measured-source commit af78512 (readelf .text + nm -S on the ReleaseFast binary; same method as the review-4 artifact)."
+  "zig_binary_sha256": "ad8846c6269ac582dc458502c5cd011152b6611635f0931e5bfde57c24eb2180",
+  "note": "P16.50-review-8 C regeneration from clean measured-source commit ea00d1f (readelf .text + nm -S on the ReleaseFast binary; same method as the review-4/r7b artifact)."
  },
- "text_bytes": 2623769,
+ "text_bytes": 2625817,
  "symbols": {
   "builtinCoroutineResume": 21414,
   "callBuiltin": 9097,
   "popBuiltinCFrame": 305,
   "pushBuiltinCFrame": 745,
-  "runBytecodeDispatch": 75323
+  "runBytecodeDispatch": 74190
  }
 }

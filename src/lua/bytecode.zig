@@ -436,6 +436,21 @@ pub const Upvaldesc = struct {
         return p[0..self.name_len];
     }
 
+    /// The debug name as a NUL-terminated slice — the runtime query
+    /// contract (debugUpvalueName → C API `lua_getupvalue`/`lua_setupvalue`
+    /// name pointers, P16.50-review-8 §1.3). Valid only on FINISHED protos:
+    /// `ProtoBuilder.finish` and non-fixed `undumpProto` re-point every
+    /// non-empty name into the proto's fused upvalue-name tail (one NUL
+    /// after each name); fixed-buffer `undumpProto` keeps the names aliasing
+    /// the dump buffer, where every string is NUL-terminated in place (the
+    /// PUC dump encoding writes the terminating zero). Builder-time
+    /// descriptors (borrowing source bytes) have no sentinel and must not
+    /// go through this entry point.
+    pub inline fn nameZ(self: Upvaldesc) [:0]const u8 {
+        const p = self.name_ptr orelse return &[_:0]u8{};
+        return p[0..self.name_len :0];
+    }
+
     /// Construct a descriptor from a name slice (empty slice → null ptr,
     /// the stripped representation).
     pub fn make(instack: bool, idx: u8, is_const: bool, name_: []const u8) Upvaldesc {
@@ -642,6 +657,39 @@ pub fn sourceBackingExtraFootprint(extra: SourceBackingExtra) usize {
 /// and `resolved_values` holds the single allocation. When aliased, the
 /// allocation is freed via `resolved_values` below; `k` is skipped (its
 /// zero-length slice shares the allocation ptr — freeing it would
+/// P16.50-review-8 §1.3: grow a tree-owned upvalues allocation to carry a
+/// NUL-terminated name tail and re-point every non-empty descriptor into
+/// it. PUC keeps interned `TString*` names in Upvaldesc; our source- and
+/// buffer-borrowing slices carry no sentinel, and building a NUL copy on
+/// each C-API query allocated per call. Descriptors and tail share ONE
+/// allocation (no separate arena object, no extra Proto field), so
+/// fixed-buffer loads — which skip this — stay allocation-identical to
+/// the pre-§1.3 baseline. The caller re-slices `proto.upvalues` to the
+/// returned slice's first `upvalues.len` descriptors and sets
+/// `flags.upvalue_name_tail`. No-op (returns the input unchanged) when no
+/// descriptor carries a name.
+pub fn fuseUpvalueNameTail(alloc: std.mem.Allocator, upvalues: []Upvaldesc) error{OutOfMemory}![]Upvaldesc {
+    var tail_len: usize = 0;
+    for (upvalues) |d| {
+        if (d.name_len > 0) tail_len += d.name_len + 1;
+    }
+    if (tail_len == 0) return upvalues;
+    const n = upvalues.len;
+    const tail_elems = (tail_len + @sizeOf(Upvaldesc) - 1) / @sizeOf(Upvaldesc);
+    const grown = try alloc.realloc(upvalues, n + tail_elems);
+    const tail = @as([*]u8, @ptrCast(grown.ptr + n))[0..tail_len];
+    var off: usize = 0;
+    for (grown[0..n]) |*d| {
+        if (d.name_len == 0) continue;
+        const nm = d.name();
+        @memcpy(tail[off..][0..nm.len], nm);
+        tail[off + nm.len] = 0;
+        d.name_ptr = tail.ptr + off;
+        off += nm.len + 1;
+    }
+    return grown;
+}
+
 /// double-free).
 pub fn destroyProtoTree(alloc: std.mem.Allocator, root: *Proto, k_strings_vm_owned: bool) void {
     // PUC PF_FIXED parity: when fixed_arrays is set, code and lineinfo are
@@ -669,7 +717,12 @@ pub fn destroyProtoTree(alloc: std.mem.Allocator, root: *Proto, k_strings_vm_own
         destroyProtoTree(alloc, child, k_strings_vm_owned);
     }
     alloc.free(root.p);
-    alloc.free(root.upvalues);
+    // P16.50-review-8 §1.3: the upvalues allocation may carry a fused
+    // NUL-terminated name tail after the descriptors — free the whole
+    // allocation (element count re-derived; see upvaluesAllocElems).
+    if (root.upvalues.len > 0) {
+        alloc.free(root.upvalues.ptr[0..root.upvaluesAllocElems()]);
+    }
     if (!root.flags.fixed_arrays) alloc.free(root.lineinfo);
     alloc.free(root.locvars);
     if (root.live_reg_top.len > 0) alloc.free(root.live_reg_top);
@@ -717,6 +770,9 @@ pub fn protoTreeFootprint(root: *const Proto) usize {
     total += root.k.len * @sizeOf(Constant);
     total += root.p.len * @sizeOf(*Proto);
     total += root.upvalues.len * @sizeOf(Upvaldesc);
+    // P16.50-review-8 §1.3: fused NUL-terminated upvalue-name tail
+    // (tree-owned; PUC charges one TString per name here).
+    total += root.upvalueNameTailBytes();
     total += root.locvars.len * @sizeOf(LocVar);
     total += root.live_reg_top.len * @sizeOf(u8);
     total += root.resolved_values.len * @sizeOf(vm.Value);
@@ -928,10 +984,40 @@ pub const Proto = struct {
         /// `UndumpReader.undumpProto` in fixed mode; text-compiled protos
         /// always own their arrays (flag = false).
         fixed_arrays: bool = false,
+        /// P16.50-review-8 §1.3: the upvalues allocation carries a fused
+        /// NUL-terminated name tail after the descriptor array (see
+        /// `fuseUpvalueNameTail`). Set per-proto by `ProtoBuilder.finish`
+        /// and non-fixed `undumpProto`; fixed-buffer undumps keep the
+        /// names aliasing the (stable, in-place NUL-terminated) dump
+        /// buffer and stay allocation-identical to the pre-§1.3 baseline.
+        upvalue_name_tail: bool = false,
         /// Whether the function accepts varargs (PUC `flags.is_vararg`).
         is_vararg: bool = false,
-        _pad: u3 = 0,
+        _pad: u2 = 0,
     };
+
+    /// P16.50-review-8 §1.3: bytes of the fused NUL-terminated upvalue-name
+    /// tail carried after the descriptor array in the same allocation (0
+    /// unless `flags.upvalue_name_tail`). Re-derived from the descriptors
+    /// — the tail needs no separate pointer/length field, so `Proto`
+    /// stays at its pre-§1.3 size and fixed-buffer loads allocate nothing
+    /// extra.
+    pub fn upvalueNameTailBytes(self: *const Proto) usize {
+        if (!self.flags.upvalue_name_tail) return 0;
+        var tail: usize = 0;
+        for (self.upvalues) |d| {
+            if (d.name_len > 0) tail += d.name_len + 1;
+        }
+        return tail;
+    }
+
+    /// Total element count of the tree-owned upvalues allocation
+    /// (descriptors plus tail padding). The free path must pass exactly
+    /// this length.
+    pub fn upvaluesAllocElems(self: *const Proto) usize {
+        const tail = self.upvalueNameTailBytes();
+        return self.upvalues.len + (tail + @sizeOf(Upvaldesc) - 1) / @sizeOf(Upvaldesc);
+    }
 
     /// "No vararg table register" sentinel (P16.16 C7): register indices
     /// are 0–254 (255 = NO_REG, same value PUC uses), so this is
@@ -1233,8 +1319,13 @@ pub const ProtoBuilder = struct {
             for (p_slice) |child| child.tree.?.releaseTree(alloc);
             alloc.free(p_slice);
         }
-        const upv_slice = try self.upvalues.toOwnedSlice(alloc);
-        errdefer alloc.free(upv_slice);
+        // P16.50-review-8 §1.3: the upvalues allocation may later grow a
+        // fused NUL-terminated name tail (see the fuse pass below) — the
+        // errdefer must free the CURRENT allocation length, tracked in
+        // upv_elems.
+        var upv_slice = try self.upvalues.toOwnedSlice(alloc);
+        var upv_elems = upv_slice.len;
+        errdefer alloc.free(upv_slice.ptr[0..upv_elems]);
         const li_slice = try self.lineinfo.toOwnedSlice(alloc);
         errdefer alloc.free(li_slice);
         const lv_slice = try self.locvars.toOwnedSlice(alloc);
@@ -1260,6 +1351,28 @@ pub const ProtoBuilder = struct {
         // keeps plain slices, the runtime Proto stores ptr+u32 len.
         proto.setName(self.name);
         proto.setSourceName(self.source_name);
+        // P16.50-review-8 §1.3: fuse a NUL-terminated name tail onto the
+        // upvalues allocation. The builder's name slices borrow the source
+        // bytes (no sentinel); the runtime query path (debugUpvalueName →
+        // C API) needs stable proto-lifetime NUL-terminated names without
+        // interning on every query. After this pass `Upvaldesc.nameZ()` is
+        // valid tree-wide.
+        {
+            var has_names = false;
+            for (upv_slice) |d| {
+                if (d.name_len > 0) {
+                    has_names = true;
+                    break;
+                }
+            }
+            if (has_names) {
+                const n = upv_slice.len;
+                upv_slice = try fuseUpvalueNameTail(alloc, upv_slice);
+                upv_elems = upv_slice.len;
+                proto.upvalues = upv_slice[0..n];
+                proto.flags.upvalue_name_tail = true;
+            }
+        }
         // ── Tree binding (CUT2: owner merged into root Proto) ──
         // Every adopted child was finished by its own builder and therefore
         // IS its own root (tree == self, ref_count == 1, its producing

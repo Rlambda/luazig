@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const bc = @import("bytecode.zig");
+const DumpWriter = @import("dump.zig").DumpWriter;
 
 // ---------------------------------------------------------------------------
 // UndumpError — the error set for all reader operations
@@ -191,7 +192,12 @@ pub const UndumpReader = struct {
     }
 
     /// Read a dedup-encoded string (matching DumpWriter.writeStringDedup).
-    /// Format: varint(0)+varint(index) = back-reference; varint(n)+bytes = new.
+    /// Format: varint(0)+varint(index) = back-reference; varint(n+1)+bytes+NUL
+    /// = new (PUC dumpString: the size counts the terminating zero). The
+    /// returned content slice aliases the input buffer and is followed by
+    /// the validated NUL byte in the buffer — every dump string (fresh or
+    /// back-referenced) is NUL-terminated in place, so fixed-buffer loads
+    /// can hand out `[*:0]` names without copying.
     pub fn readStringDedup(self: *UndumpReader) UndumpError![]const u8 {
         const first = try self.readVarint();
         if (first == 0) {
@@ -200,11 +206,13 @@ pub const UndumpReader = struct {
             if (idx > self.string_dedup.items.len) return error.BadConstant;
             return self.string_dedup.items[@intCast(idx - 1)];
         }
-        // New string: length is first-1.
+        // New string: content length is first-1, plus the trailing NUL.
         const str_len: usize = @intCast(first - 1);
-        const bytes = try self.readBlock(str_len);
-        try self.string_dedup.append(self.alloc, bytes);
-        return bytes;
+        const bytes = try self.readBlock(str_len + 1);
+        if (bytes[str_len] != 0) return error.BadConstant;
+        const content = bytes[0..str_len];
+        try self.string_dedup.append(self.alloc, content);
+        return content;
     }
 
     // --- Header validation ---
@@ -423,8 +431,12 @@ pub const UndumpReader = struct {
 
         // 11. Upvalues: length prefix, then each as (instack, idx, is_const, name).
         const upv_len = try self.readU32();
-        const upvalues = try alloc.alloc(bc.Upvaldesc, @intCast(upv_len));
-        errdefer alloc.free(upvalues); // names alias the input buffer
+        // P16.50-review-8 §1.3: non-fixed loads later grow this allocation
+        // with a fused NUL-terminated name tail — the errdefer must free
+        // the CURRENT length, tracked in upv_elems.
+        var upvalues = try alloc.alloc(bc.Upvaldesc, @intCast(upv_len));
+        var upv_elems = upvalues.len;
+        errdefer alloc.free(upvalues.ptr[0..upv_elems]); // names alias the input buffer
         var n_upv: usize = 0;
         while (n_upv < upv_len) : (n_upv += 1) {
             const instack_byte = try self.readByte();
@@ -521,9 +533,9 @@ pub const UndumpReader = struct {
         // undumpProto directly (unit tests) stay owner-less and must be
         // freed via `bc.destroyProtoTree`.
         const proto = try alloc.create(bc.Proto);
-        // verifyProtoCode below is the first fallible operation after the
-        // struct exists — on its failure the slice errdefers above free the
-        // arrays, and this one frees the Proto struct itself.
+        // The slice errdefers above free the arrays on any later failure
+        // (including the fused upvalue-name tail pass and verifyProtoCode
+        // below), and this one frees the Proto struct itself.
         errdefer alloc.destroy(proto);
         proto.* = .{
             .code = code,
@@ -554,6 +566,36 @@ pub const UndumpReader = struct {
         // Packed name fields (P16.16 C7): set via accessors.
         proto.setName(name);
         proto.setSourceName(source_name);
+        // P16.50-review-8 §1.3: fuse a NUL-terminated name tail onto the
+        // upvalues allocation (same pass as ProtoBuilder.finish) — but
+        // only for NON-fixed loads: the input buffer is transient there,
+        // so the aliased names must be copied out. In fixed ('B') mode
+        // the buffer stays alive and unmodified for the Proto's lifetime
+        // (PUC PF_FIXED contract), and every dump string is NUL-
+        // terminated in place (readStringDedup validates the trailing
+        // zero), so the descriptors keep aliasing the buffer and
+        // `nameZ()` is valid tree-wide with zero load-time allocation —
+        // PUC's fixed-buffer budget (api.lua: "load used fewer than 400
+        // bytes") depends on this. (The condition is the fixed MODE, not
+        // `fixed_borrow`: even when a misaligned base forced the code and
+        // lineinfo arrays to be copied, the unaligned string bytes can
+        // still alias the alive fixed buffer.)
+        if (!self.fixed) {
+            var has_names = false;
+            for (upvalues) |d| {
+                if (d.name_len > 0) {
+                    has_names = true;
+                    break;
+                }
+            }
+            if (has_names) {
+                const n = upvalues.len;
+                upvalues = try bc.fuseUpvalueNameTail(alloc, upvalues);
+                upv_elems = upvalues.len;
+                proto.upvalues = upvalues[0..n];
+                proto.flags.upvalue_name_tail = true;
+            }
+        }
         // One-time structural validation of the instruction stream (see
         // verifyProtoCode). Deserialized chunks are the ONLY Proto source
         // that is not proven by codegen construction, so this is the single
@@ -777,6 +819,40 @@ test "UndumpReader: readU64LE little-endian" {
     var r = UndumpReader.init(std.testing.allocator, &data);
     // 0x4024000000000000 = 10.0 as f64 bits
     try std.testing.expectEqual(@as(u64, 0x4024000000000000), try r.readU64LE());
+}
+
+test "UndumpReader: readStringDedup NUL-terminated in place (PUC encoding)" {
+    // PUC dumpString writes size = len+1 counting the terminating zero,
+    // then the content including it. Every string the reader hands out
+    // (fresh or back-referenced) must be followed by a validated NUL in
+    // the buffer — fixed-buffer loads rely on this for [*:0] names.
+    var w = DumpWriter.init(std.testing.allocator);
+    defer w.deinit();
+    try w.writeStringDedup("_ENV");
+    try w.writeStringDedup("x"); // fresh
+    try w.writeStringDedup("_ENV"); // back-reference
+    try w.writeStringDedup(""); // empty/null encoding
+
+    var r = UndumpReader.init(std.testing.allocator, w.buf.items);
+    defer r.deinit();
+    const a = try r.readStringDedup();
+    try std.testing.expectEqualStrings("_ENV", a);
+    try std.testing.expectEqual(@as(u8, 0), a.ptr[a.len]); // NUL in place
+    const b = try r.readStringDedup();
+    try std.testing.expectEqualStrings("x", b);
+    try std.testing.expectEqual(@as(u8, 0), b.ptr[b.len]);
+    const c = try r.readStringDedup(); // back-ref: same bytes, same NUL
+    try std.testing.expectEqual(a.ptr, c.ptr);
+    try std.testing.expectEqualStrings("_ENV", c);
+    try std.testing.expectEqual(@as(u8, 0), c.ptr[c.len]);
+    try std.testing.expectEqualStrings("", try r.readStringDedup());
+
+    // A missing trailing NUL is rejected (the aliasing contract would
+    // otherwise hand out a non-terminated slice).
+    const bad = [_]u8{ 5, 'h', 'i', '!', 'X', 'Y' }; // len 4, no NUL
+    var r2 = UndumpReader.init(std.testing.allocator, &bad);
+    defer r2.deinit();
+    try std.testing.expectError(error.BadConstant, r2.readStringDedup());
 }
 
 test "UndumpReader: readVarint LEB128" {

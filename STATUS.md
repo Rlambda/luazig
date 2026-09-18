@@ -45,7 +45,7 @@ Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [ ] **P16.50-review-8 correction (review-7 не принята)**: завершить C-API
+- [x] **P16.50-review-8 correction (CLOSED by review-8)**: завершить C-API
   upvalue/GC контракт (транзакционные barriers, корректный incremental barrier
   для joined Cell, стабильное время жизни имени); устранить UAF после
   `destroyBytecodeCloseState`; закрыть оставшиеся ownership-окна gsub/result
@@ -53,6 +53,63 @@ Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependen
   paired-seed protocol и исправить вводящие в заблуждение generated формулировки.
   Negative-before, архитектура и обязательные проверки перечислены в `prompt.md`.
   Open-count 21→23.
+
+  ЗАКРЫТО фазой P16.50-review-8 (2026-09-19): §1 — C-API upvalue/GC контракт:
+  `lua_upvaluejoin` барьерит joined CELL, а не только его VALUE (PUC
+  `luaC_objbarrier(L, f1, *up1)`): `CellJoinPlan` +
+  `gcPrepareForwardBarrierCell`/`gcCommitForwardBarrierCell`
+  (vm.zig:26497/26515/26553; call sites c_api.zig:3540+, vm.zig:33355 —
+  debug.upvaluejoin); store/repoint выполняются только после успешного
+  barrier-reserve — двухфазные `CellWritePlan` +
+  `gcPrepareWriteBarrierCell`/`gcCommitWriteBarrierCell` (vm.zig:27288/27304/
+  27374; `gcStoreCellValue` vm.zig:27413 на prepare→mutate→commit): OOM prepare
+  проходит через `cThrowOn` → LUA_ERRMEM ДО observable mutation, после мутации
+  infallible commit, `catch {}` на C-API upvalue-путях убраны; отдельная
+  generational OLD0/old1-семантика сохранена, но маркируется/продвигается сам
+  Cell. Стабильное время жизни имени: `upvalueCName` больше не интернит на
+  query path — `Upvaldesc.nameZ()` (bytecode.zig:449) отдаёт proto-lifetime
+  NUL-terminated bytes: `ProtoBuilder.finish` и non-fixed `undumpProto`
+  наращивают upvalues-аллокацию fused name-tail'ом
+  (`fuseUpvalueNameTail`, bytecode.zig; флаг `upvalue_name_tail`, Proto не
+  растёт), fixed-buffer undump алиасит имена dump-буфера, где каждая строка
+  NUL-terminated in place — dump-энкодинг приведён к PUC `dumpString`
+  (len+1 считает terminating zero; dump.zig `writeStringDedup` пишет NUL,
+  undump.zig `readStringDedup` валидирует его) — PUC-совместимый dump interop.
+  §2 — UAF в `continueBytecodeClose` устранён: все post-destroy чтения
+  (`post`, `had_close_error`, `close_err`, `close_min_reg`, `owner_thread`)
+  сняты в локальные снапшоты ДО `alloc.destroy(state)` (vm.zig:10061+), оба
+  пути после destroy (`had_close_error`, `.unwind_frame`) работают только на
+  снапшотах. §3 — оставшиеся same-class continuation ownership окна:
+  `applyBytecodePendingGsub` транзакционный handover (vm.zig:12022+: pending
+  slot остаётся единственным владельцем state через весь advance, терминальные
+  исходы переиспользуют тот же slot через infallible payload store — атомарный
+  `.gsub`→`.results` swap, state освобождается только после подтверждённой
+  передачи; попутно закрыт pre-existing leak — state struct вообще не
+  освобождался на async gsub completion); `completeBytecodeExecFrame`
+  tagged owner `owned_ret` errdefer (vm.zig:15464+: borrowed_scratch/owned от
+  pop child frame до точной adoption point — pending state, caller frame,
+  beginBytecodeClose post или явный free; companions
+  `applyBytecodePendingClose`/`applyBytecodePendingHook`/
+  `applyBytecodePendingExternalResults`/opCall gsub arm принимают slice по
+  entry); stale ownership-комментарий `tryPushBytecodeDebugHook` исправлен
+  (vm.zig:10789+: caller владеет `post` только при `false`). §4 —
+  `status_summary` принимает только точный опубликованный paired-seed-v1
+  protocol: SEED_LIST и per-workload population validator переиспользуются
+  из `perf_compare.py` через importlib (единый source of truth), `runs ==
+  len(SEED_LIST)` + ровно одна строка каждого seed 1..21 на workload без
+  extras/duplicates; api580 wording: anchored gate (`384 B < 400 B`) отделён
+  от no-XY diagnostic (`436 B`), dual-mode provenance (top-level Debug hash +
+  вложенный ReleaseFast hash) указана честно; fixtures
+  tools/test_status_summary.py (70 проверок: корректный gate, 1..5, 2..22,
+  duplicate+missing, extra, wrong runs, corrupt/missing). Гейты фазы:
+  unit 277/277 Debug+ReleaseFast 0 leaks; c_api test 0 FAIL + test-diff
+  DIFF PASS; matrix --testc 31/32 (zig_fail=0, big.lua both_fail
+  pre-existing); smoke 84/84; 23 heavy testc-лейнов rc=0; gc.lua differential
+  + crash contract 20/20; api580 GREEN (measured 384 < 400); fmt +
+  git-diff-check clean; perf probe vs 4bf132e max +0.40% (все |delta| < 5%).
+  Финальный verdict — объявленной paired-seed clean-C сессией (seeds 1..21)
+  + артефактным коммитом D (вердикт дописан в D; см. фазовую запись ниже).
+  Open-count 23→22 (TBC-parity пункт остаётся открытым).
 
 - [ ] **Parity: errored coroutine не должна исполнять `<close>` до
   `coroutine.close`**: сейчас `coroutine.resume` при ошибке тела уже вызывает
@@ -118,7 +175,7 @@ Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependen
   0/1/255/256/257/300 идентичен; BLOCKER 5 — status_summary.py честно разделяет
   snapshot (runs=5) / gate protocol (validated current-gate.json, 21 seeds) /
   api580 measured_delta_* (384/436) vs charged/model (376/428 reconciled:false) —
-  fixture tools/test_status_summary.py. Гейты фазы: unit 258/258 D+RF 0 leaks;
+  fixture tools/test_status_summary.py. Гейты фазы: unit 259/259 D+RF 0 leaks;
   matrix --testc 31/32 (zig_fail=0, big.lua both_fail pre-existing); smoke 84/84;
   c_api 0 FAIL + test-diff PASS; 23 heavy testc-лейнов rc=0; api580 GREEN;
   fixed-load GREEN; gc.lua differential + crash contract 20/20; fmt +
@@ -7841,7 +7898,7 @@ source_dirty = clean; вердикт сессии — в Perf-блоке ниж�
   2b30c9a71a25bf59817a05133642642f6aea6767b933f6a76d631b21afced8a4
   (полный sha в manifest row; determinism: pre-C2 build == rebuild ==
   post-regeneration build; post-session rebuild верифицируется в D).
-- **Батарея**: 258/258 unit (Debug+ReleaseFast, 0 leaks), 23 heavy testc-лейна
+- **Батарея**: 259/259 unit (Debug+ReleaseFast, 0 leaks), 23 heavy testc-лейна
   rc=0, matrix --testc 31/32 (zig_fail=0, big.lua both_fail pre-existing),
   smoke 84/84, c_api test 0 FAIL + test-diff DIFF PASS (t11 PASS), api580
   GREEN, fixed-load-footprint GREEN, gc.lua differential + crash contract
@@ -7853,9 +7910,171 @@ source_dirty = clean; вердикт сессии — в Perf-блоке ниж�
   (testes/coroutine.lua:186-196 полагается на явный coroutine.close) —
   verified pre-existing; (b) applyBytecodePendingGsub publication window +
   completeBytecodeExecFrame ret-leak class (тот же класс, что BLOCKER 3,
-  unblocked windows); (c) checkTabArg принимает metatable'd non-Tables для
-  table.unpack; (d) pre-existing: big.lua both_fail (matrix), locals.lua
+  unblocked windows); (c) отозвано review-8: differential показывает идентичное
+  поведение (`true 10 20` в luazig и PUC) — ложный residual, checkTabArg
+  metatable'd non-Tables для table.unpack не является расхождением; (d) pre-existing: big.lua both_fail (matrix), locals.lua
   GC-pacing dot diff, cstack.lua Debug native-stack exhaustion edge.
+
+### P16.50-review-8: transactional upvalue barriers, close-UAF, gsub/exec-frame ownership, exact status protocol (2026-09-19)
+
+Фаза по owner-ledger correction item (открыт 4bf132e после ledger-reopen
+review-7; open-count 23→22 — correction закрыт, TBC-parity пункт остаётся
+открытым). Коммиты: C = measured source (настоящий коммит; RF binary sha256
+ad8846c6269ac582dc458502c5cd011152b6611635f0931e5bfde57c24eb2180,
+верифицирован determinism-rebuild после C) → D = wrapper (полное
+canonical current-* перегенерирование на clean C + объявленная clean-C
+paired-seed perf-сессия; source_head сессии = C, source_dirty = clean;
+вердикт сессии — в Perf-блоке ниже, дописан артефактным коммитом D).
+
+- **§1 — C-API upvalue/GC контракт (транзакционные barriers + lifetime имени)**:
+  - `lua_upvaluejoin` барьерил только VALUE внутри joined Cell: после
+    generational arm вызывался `gcWriteBarrier(child.get(self))` — чёрная
+    Closure ссылалась на белый Cell, маркировка значения не сохраняла сам
+    Cell, sweep мог освободить достижимый Cell (dangling `cl1.upvalues[idx]`).
+    Фикс: `CellJoinPlan` + `gcPrepareForwardBarrierCell`/
+    `gcCommitForwardBarrierCell` (vm.zig:26497/26515/26553) — барьер
+    маркирует/продвигает сам CELL (PUC `luaC_objbarrier(L, f1, *up1)`,
+    объект барьера — UpVal); отдельная generational OLD0/old1-семантика
+    сохранена. Call sites: `lua_upvaluejoin` (c_api.zig:3540+) и
+    `builtinDebugUpvaluejoin` (vm.zig:33355).
+  - Store/repoint выполнялись до fallible barrier с `catch {}`: barrier мог
+    частично изменить color/age и упасть на append. Фикс — двухфазный
+    protocol `compute plan → reserve gc_gray/gc_old1 capacity → observable
+    store/repoint → infallible color/age/list commit`: `CellWritePlan` +
+    `gcPrepareWriteBarrierCell`/`gcCommitWriteBarrierCell`
+    (vm.zig:27288/27304/27374), `gcStoreCellValue` (vm.zig:27413) и
+    `gcWriteBarrierCell` (vm.zig:27398) сведены к prepare→mutate→commit;
+    OOM prepare → `cThrowOn` → LUA_ERRMEM ДО pop/store/repoint; между
+    prepare и commit нет ни одной fallible операции. `catch {}` на
+    C-API upvalue-путях убраны. Попутно закрыт pre-existing gap: incremental
+    arm `gcWriteBarrierCell` дропал `.Userdata` (PUC iscollectable включает
+    userdata) — userdata, записанный в чёрный closed cell, оставался белым и
+    мог быть засвип'нут; фиксирован рестракчерингом prepare-arm.
+  - `upvalueCName` интернил proto-name на каждый query и возвращал pointer
+    на неукоренённый weak-interned объект. Фикс: `Upvaldesc.nameZ()`
+    (bytecode.zig:449) — proto-lifetime NUL-terminated имя без аллокации на
+    query path (PUC `Proto.upvalues[i].name` — принадлежащий Proto TString,
+    `traverseproto`-маркируемый): `ProtoBuilder.finish` и non-fixed
+    `undumpProto` наращивают upvalues-аллокацию fused NUL-terminated
+    name-tail'ом (`fuseUpvalueNameTail`, bytecode.zig; дескрипторы и tail в
+    ОДНОЙ аллокации, флаг `upvalue_name_tail`, Proto не растёт,
+    `destroyProtoTree`/`protoTreeFootprint`/`upvalueNameTailBytes`/
+    `upvaluesAllocElems` обновлены); fixed-buffer undump алиасит имена
+    dump-буфера — dump-энкодинг приведён к PUC `dumpString` (size = len+1
+    считает terminating zero): dump.zig `writeStringDedup` пишет NUL,
+    undump.zig `readStringDedup` читает и валидирует его (PUC-совместимый
+    dump interop, zero-alloc fixed loads). `lua_getupvalue`/
+    `lua_setupvalue` возвращают прямой указатель без interning.
+  - Тесты: incremental `.propagate`/`.atomic` (black closure + white joined
+    Cell → завершить collection → identity/value/registry живы), sweep-arm
+    (owner → правильный white/current-white), generational old Cell/Closure →
+    young Value/Cell FailingAllocator per-edge (slot/value/stack/registries
+    byte-exact при ошибке, затем реальный minor/full GC + повторное
+    использование VM), success edge exactly-once gray/old1 publication;
+    C-API name-lifetime тест (уникальное имя → C pointer → убрать pushed
+    value → несколько full GC + allocation churn при rooted closure →
+    pointer и байты валидны; FailingAllocator не находит новой аллокации на
+    query имени).
+- **§2 — UAF в `continueBytecodeClose`**: `destroyBytecodeCloseState(state)`
+  вызывался до двух обращений к `state.owner_thread` — прямой UAF. Фикс:
+  все post-destroy чтения (`post`, `had_close_error`, `close_err`,
+  `close_min_reg`, `owner_thread`) сняты в локальные снапшоты ДО
+  `alloc.destroy(state)` (vm.zig:10061+); оба пути после destroy
+  (`had_close_error`, `.unwind_frame`) работают только на снапшотах.
+  DebugAllocator/poison regression без ручной компенсации: после каждого
+  пути VM проходит GC и выполняет следующий вызов.
+- **§3 — оставшиеся same-class continuation ownership окна**:
+  - `applyBytecodePendingGsub` (vm.zig:12022+): старый pending owner
+    очищался до fallible `advanceBytecodeGsub`, final path создавал
+    result/state и мог упасть на `setPendingCall`. Фикс — транзакционный
+    handover: pending slot ОСТАЁТСЯ установленным владельцем state через
+    весь advance (нет clear→…→re-publish окна); оба терминальных исхода
+    переиспользуют тот же slot через infallible payload store (`.pushed` →
+    атомарный `.gsub`→`.gsub`, только callee меняется; `.final` →
+    атомарный `.gsub`→`.results` swap); state struct освобождается только
+    после подтверждённой передачи. Попутно закрыт pre-existing leak: state
+    struct вообще не освобождался на async gsub completion (каждый async
+    gsub терял struct) + leak owned-буфера gsub-callback результата
+    (vm.zig:11779, `state.out.toOwnedSlice` → internStr копирует, raw буфер
+    освобождается на каждом пути).
+  - `completeBytecodeExecFrame` (vm.zig:15464+): после pop child frame
+    owned return slice оставался без function-level владельца на нескольких
+    fallible операциях (nil padding, protection, temp roots, frame growth).
+    Фикс — tagged owner (`borrowed_scratch`/`owned`) `owned_ret` errdefer от
+    pop до точной adoption point: slice передан pending state/caller frame
+    или освобождён; tag переезжает на каждый re-allocated slice (append_nil
+    extend, protection wrap) и disarm'ится на каждой adoption (pending
+    state, caller frame, beginBytecodeClose post) или явном free.
+    Companions принимают slice по entry: `applyBytecodePendingClose`
+    (ret_owned errdefer от entry, disarm на beginBytecodeClose adoption,
+    vm.zig:11518+), `applyBytecodePendingHook` (store_results),
+    `applyBytecodePendingExternalResults`, opCall gsub arm
+    (callback_ret_owned, vm.zig:11802+), tail_return pcall arm
+    (vm.zig:14351+). FailingAllocator per-edge матрицы: каждый edge +
+    success edge — pending/call_frames, nCcalls, TBC chain, registries и
+    live bytes равны baseline; затем настоящий dispatcher recovery + GC +
+    повторное использование; тест не чинит production state вручную.
+  - Stale ownership-комментарий `tryPushBytecodeDebugHook` исправлен
+    (vm.zig:10789+): caller владеет `post` ТОЛЬКО при `false`; при
+    success/error его уже приняла или освободила функция.
+- **§4 — `status_summary` exact protocol + честные labels**: SEED_LIST и
+  per-workload seed-population validator (`_paired_seed_schema_reason`)
+  переиспользуются из `tools/perf_compare.py` через importlib (ONE source
+  truth — второй literal seed list удалён); `validate_gate` требует
+  одновременно: точный ordered published list 1..21, `runs == len(SEED_LIST)`,
+  ровно одну строку каждого seed на workload без extras/duplicates, и
+  согласованный source/binary + verdict; self-consistent `1..5`/`2..22`
+  больше не проходят. api580 wording: gate относится к anchored
+  `384 < 400`, no-XY-root `436` — диагностическое число, не часть GREEN
+  («api580 anchored gate: GREEN — measured 384 B < 400 B; no-XY diagnostic:
+  436 B»); dual-mode provenance указана честно (top-level Debug hash +
+  вложенный ReleaseFast hash, не «все current-* на одном RF binary»).
+  Fixtures tools/test_status_summary.py (70 проверок): корректный gate,
+  `1..5`, `2..22`, duplicate+missing, extra, wrong runs, corrupt/missing —
+  все некорректные формы печатают unavailable/inconclusive, не bold green.
+- **Попутно (found+fixed за пределами плана)**: 6 pre-existing
+  internStr-toOwnedSlice leaks (gsub final-result vm.zig:11779; string.format
+  tostring-arm vm.zig:37662; string.pack vm.zig:37937; string.char
+  vm.zig:38378; string.gsub result vm.zig:39832; utf8.char vm.zig:40128 —
+  internStr копирует bytes, raw owned буфер освобождается на каждом пути);
+  Userdata inc-arm drop (см. §1); PUC NUL dump interop (см. §1).
+- **Батарея**: 277/277 unit (Debug+ReleaseFast, 0 leaks), 23 heavy
+  testc-лейна rc=0, matrix --testc 31/32 (zig_fail=0, big.lua both_fail
+  pre-existing), smoke 84/84, c_api test 0 FAIL + test-diff DIFF PASS,
+  api580 GREEN (measured 384 < 400), fixed-load-footprint GREEN, gc.lua
+  differential + crash contract 20/20, fmt + git-diff-check clean.
+- **Perf**: measured runtime затронут (barrier machinery, name tails,
+  gsub/exec-frame restructure) — perf probe vs 4bf132e: max +0.40%, все
+  |delta| < 5%. ОДНА объявленная paired-seed clean-C сессия (seeds 1..21,
+  RUNS=21) на commit C (source_head = C, source_dirty = clean) — verdict в
+  tools/perf/current-gate.json + current-gate-manifest.json (commit D);
+  manifest append-only; baselines byte-identical (baseline-approved/
+  baseline-p15.37/core_baseline не тронуты). Полное canonical current-*
+  перегенерирование на clean C / RF binary — артефактным коммитом D.
+- **Residuals (honest, для владельца)**:
+  - HIGH (found by review-8 §2/§3 sweeps, не чинился фазой): emergency-GC
+    full-register-window scan + registry-compare safety skip в
+    `gcMarkValueImpl`/`gcQueueScanObject` (vm.zig:29082+) читают
+    `gc_index`-header потенциально freed объектов (stale pointer в мёртвом
+    register slot): skip звук только под never-unmap аллокаторами —
+    reading gc_index of a stale pointer faults, если allocator unmap'ит
+    или poison'ит freed blocks. Тесты работают вокруг это DebugAllocator
+    `never_unmap = true` (vm.zig:58054+ и др.). Производственный
+    allocator-контракт должен быть зафиксирован, либо skip нуждается в
+    non-dereferencing validation.
+  - Три remaining single-phase `gcWriteBarrierCell(...) catch {}` close-сайта
+    того же класса (vm.zig:5476, 9695, 20240 — close-upvalue paths в
+    pcall-unwind/opCall/opTailcall): same-class, unblocked (барьер после
+    `cell.close` в infallible-цветовом контексте), не блокируют фазу.
+  - Tail-call gsub sync routing: `tryStartBytecodeGsub` wired только в
+    opCall (vm.zig:20880); opTailcall (vm.zig:19964) без gsub fast-path —
+    tail-called gsub с async-capable replacement идёт через synchronous
+    builtin path (behavior идентичен, отличается только continuation
+    machinery).
+  - tools/zig-bin pinned 0.15.2 toolchain drift: `tools/zig` wrapper
+    предпочитает локальный `tools/zig-bin/zig` (0.15.2) перед system zig
+    0.16.0, которым измерены все current-* артефакты; `make zig`/`make
+    test` ушли бы на 0.15.2. Регенерация фазы исполнялась system zig 0.16.0.
 
 ### P16.50-review-5: rescue + completion (2026-09-17)
 

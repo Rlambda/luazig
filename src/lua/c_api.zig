@@ -3398,12 +3398,15 @@ const AuxUpvalue = struct {
     /// The upvalue cell (our UpVal equivalent — the slot PUC's `*val`
     /// points at; open cells read/write through to the owning stack).
     cell: *vm_mod.Cell,
-    /// PUC's name return: `""` for C closures, the proto name for Lua
-    /// closures. `null` never reaches here (handled by the caller).
-    name: []const u8,
+    /// PUC's name return: `""` for C closures, the proto's arena-backed
+    /// NUL-terminated name for Lua closures. `null` never reaches here
+    /// (handled by the caller). P16.50-review-8 §1.3: NUL-terminated and
+    /// proto-lifetime-stable — the C API hands the bytes out directly.
+    name: [:0]const u8,
     /// PUC LUA_VCCL vs LUA_VLCL discrimination: C closures report the
-    /// static `""` name; Lua-closure names are proto source slices that
-    /// need interning to become NUL-terminated C strings.
+    /// static `""` name; Lua-closure names come from the proto's fused
+    /// upvalue-name tail or the fixed dump buffer (no interning on the
+    /// query path).
     c_closure: bool,
 };
 
@@ -3427,16 +3430,15 @@ fn auxUpvalue(s: *api.State, funcindex: c_int, n: c_int) ?AuxUpvalue {
 
 /// Resolve the C-API upvalue name as a NUL-terminated `const char*`.
 /// C closures use the static `""` (PUC aux_upvalue LUA_VCCL arm). Lua
-/// closure names are proto source slices WITHOUT a trailing NUL, so the
-/// canonical INTERNED string (which stores one — LuaString.bytes' contract)
-/// is produced — the same object the debug library hands out. PUC returns
-/// the proto's name pointer without allocating; the intern is our
-/// representation-faithful equivalent (our names are not NUL-terminated),
-/// and its OOM is LUA_ERRMEM like every PUC api_incr_top failure.
-fn upvalueCName(s: *api.State, L: *lua_State, aux: AuxUpvalue) ?[*:0]const u8 {
+/// closure names are the proto's arena-backed bytes (P16.50-review-8
+/// §1.3) — PUC parity: PUC's `lua_getupvalue` returns `getstr(name)`
+/// without allocating, and the pointer stays valid for the closure's
+/// proto lifetime (the arena dies with the proto tree). The old
+/// implementation interned the name on every query — an allocation on a
+/// PUC-allocation-free path whose OOM misreported LUA_ERRMEM.
+fn upvalueCName(aux: AuxUpvalue) [*:0]const u8 {
     if (aux.c_closure) return ""; // PUC's static "" (LUA_VCCL arm)
-    const istr = s.vm.internStr(aux.name) catch cThrowOn(s.vm, L, error.OutOfMemory);
-    return @ptrCast(@constCast(istr.bytes().ptr));
+    return aux.name.ptr;
 }
 
 pub export fn lua_getupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]const u8 {
@@ -3445,8 +3447,8 @@ pub export fn lua_getupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]c
     // and slot; NULL (never an error) for a non-closure or out-of-range n.
     const aux = auxUpvalue(&s, funcindex, n) orelse return null;
     // PUC resolves the name BEFORE the stack mutation (aux_upvalue runs
-    // before setobj2s/api_incr_top).
-    const name = upvalueCName(&s, L.?, aux);
+    // before setobj2s/api_incr_top). Allocation-free (§1.3 arena names).
+    const name = upvalueCName(aux);
     // PUC setobj2s + api_incr_top: push the upvalue's CURRENT value (open
     // cells read through to the owning thread's stack). OOM is LUA_ERRMEM
     // (P16.50-review-5 B2 — the old `catch return null` misreported "no
@@ -3465,18 +3467,21 @@ pub export fn lua_setupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]c
     // PUC api_checknelems(L, 1) is a no-op in release builds; we fail soft
     // (NULL) instead of popping from an empty stack.
     if (s.stack.items.len == 0) return null;
-    const name = upvalueCName(&s, L.?, aux);
+    const name = upvalueCName(aux);
     const v = s.stack.items[s.stack.items.len - 1];
+    // P16.50-review-8 §1.2: reserve the barrier bookkeeping BEFORE the
+    // observable store — PUC's luaC_barrier is infallible; a reserve OOM
+    // after the write commits would leave the store in place with a
+    // missed barrier (the old `catch {}` swallowed exactly that). The
+    // reserve OOM throws BEFORE any mutation (LUA_ERRMEM); nothing
+    // between prepare and commit allocates, so the plan stays valid.
+    const plan = s.vm.gcPrepareWriteBarrierCell(aux.cell, v) catch |e| cThrowOn(s.vm, L.?, e);
     // Store into the slot PUC's `*val` designates: open cells write
     // through to the owning thread's stack slot, closed cells to the
     // cell's own value (Cell.set handles both — PUC writes through *val,
     // which for open upvalues IS the stack slot).
     aux.cell.set(s.vm, v);
-    // PUC luaC_barrier is infallible; our barrier-list append can OOM
-    // AFTER the observable cell write commits — throwing would not restore
-    // the missed barrier (class (d) documented, P16.50-review-5 B2;
-    // architectural fix = pre-reserved lists).
-    s.vm.gcWriteBarrierCell(aux.cell, v) catch {};
+    s.vm.gcCommitWriteBarrierCell(aux.cell, v, plan);
     s.stack.items.len -= 1;
     return name;
 }
@@ -3532,12 +3537,17 @@ pub export fn lua_upvaluejoin(L: ?*lua_State, fidx1: c_int, n1: c_int, fidx2: c_
     // upvalue cell (a setupvalue through one is visible through the
     // other; lua_upvalueid reports the shared identity). The old code
     // copied the current value, breaking exactly that shared identity.
+    //
+    // P16.50-review-8 §1.1/§1.2: reserve the forward-barrier bookkeeping
+    // BEFORE the observable re-point. The barrier targets the joined CELL
+    // (PUC luaC_objbarrier(L, f1, *up1)) — the old code marked only the
+    // cell's VALUE, so a white joined cell reachable solely through the
+    // black owner closure was swept (use-after-free). A reserve OOM
+    // throws BEFORE the re-point (LUA_ERRMEM via the error-jump boundary);
+    // nothing between prepare and commit allocates.
+    const plan = s.vm.gcPrepareForwardBarrierCell(cl1, cl2.upvalues[idx2]) catch |e| cThrowOn(s.vm, L.?, e);
     @constCast(cl1.upvalues)[idx1] = cl2.upvalues[idx2];
-    // PUC luaC_objbarrier(L, f1, *up1) is infallible; a post-commit
-    // barrier-list append OOM follows the documented class-(d) pattern
-    // (see lua_setupvalue — throwing would not restore the missed
-    // barrier; architectural fix = pre-reserved lists).
-    s.vm.gcForwardBarrierCell(cl1, cl2.upvalues[idx2]) catch {};
+    s.vm.gcCommitForwardBarrierCell(cl1, cl2.upvalues[idx2], plan);
 }
 
 /// PUC `lua_sethook` (ldebug.c:133): install/clear a C hook function.
@@ -4360,4 +4370,245 @@ test "c api lua_getupvalue OOM on result push is LUA_ERRMEM" {
     // parity — "not enough memory", not a nil).
     try std.testing.expect(vm.errThread().err_has_obj);
     try std.testing.expectEqualStrings("not enough memory", vm.errThread().err_obj.String.bytes());
+}
+
+// --- review-8 §1.2/§1.3: barrier-reserve OOM throws before the observable
+// mutation (pcallk boundary pattern — vm.alloc keeps pointing at the
+// file-scope failing allocator until the test restores the base after the
+// longjmp), and arena-backed upvalue names are pointer-stable and
+// allocation-free on the query path. ---
+
+var b8_base: std.mem.Allocator = undefined;
+var b8_failing: std.testing.FailingAllocator = undefined;
+var b8_owner: ?*vm_mod.Closure = null;
+var b8_donor: ?*vm_mod.Closure = null;
+var b8_young: ?*vm_mod.Table = null;
+
+/// GcAge.isYoung is vm.zig-private: new|survival (the unpromoted ages).
+fn b8AgeIsYoung(age: vm_mod.GcAge) bool {
+    return age == .new or age == .survival;
+}
+
+/// Stages [owner(1), young_table(2)] on the fresh pcallk stack, forces both
+/// generational reserves to really allocate, then arms fail_index=0: the
+/// ONLY fallible step inside lua_setupvalue is the barrier reserve, which
+/// must throw LUA_ERRMEM BEFORE the store commits.
+fn b8CfSetupvalueOom(L: ?*lua_State) callconv(.c) c_int {
+    var s = api.State.fromHandle(L.?);
+    s.stack.append(s.vm.alloc, .{ .Closure = b8_owner.? }) catch return -1;
+    lua_createtable(L, 0, 0);
+    b8_young = s.stack.items[s.stack.items.len - 1].Table;
+    // Force both reserves to allocate (fresh capacity-less lists).
+    s.vm.gc_gray.deinit(s.vm.alloc);
+    s.vm.gc_gray = .empty;
+    s.vm.gc_old1.deinit(s.vm.alloc);
+    s.vm.gc_old1 = .empty;
+    b8_failing = std.testing.FailingAllocator.init(b8_base, .{
+        .fail_index = 0,
+        .resize_fail_index = 0,
+    });
+    s.vm.alloc = b8_failing.allocator();
+    const name = lua_setupvalue(L, 1, 1); // reserve OOM → LUA_ERRMEM longjmp
+    return if (name != null) 0 else -1;
+}
+
+test "c api lua_setupvalue OOM throws LUA_ERRMEM before the store" {
+    const L = luaL_newstate() orelse return error.OutOfMemory;
+    defer lua_close(L);
+    const vm = L.vm;
+
+    // Owner closure with one named CLOSED upvalue ("x" → a table).
+    try std.testing.expectEqual(@as(c_int, 0), luaL_loadstring(L, "local x = {1} return function() return x end"));
+    try std.testing.expectEqual(@as(c_int, 0), lua_pcallk(L, 0, 1, 0, 0, null));
+    const s = api.State.fromHandle(L);
+    b8_owner = s.stack.items[s.stack.items.len - 1].Closure;
+    const owner_cell = b8_owner.?.upvalues[0];
+    const orig_value = owner_cell.value;
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(.{ .Closure = b8_owner.? });
+
+    // Enter generational mode: the closure + its closed cell become OLD,
+    // so storing a young value fires the gen arm's reserves.
+    _ = luazigGcFixed(L, 7, 0); // LUA_GCGENERATIONAL
+
+    lua_pushcfunction(L, b8CfSetupvalueOom);
+    b8_base = vm.alloc;
+    const status = lua_pcallk(L, 0, 0, 0, 0, null);
+    vm.alloc = b8_base; // restore before any other API use
+
+    // The reserve OOM is LUA_ERRMEM (PUC luaC_barrier is infallible; the
+    // observable store must not commit when the barrier cannot).
+    try std.testing.expectEqual(@as(c_int, 4), status);
+    try std.testing.expect(vm.errThread().err_has_obj);
+    try std.testing.expectEqualStrings("not enough memory", vm.errThread().err_obj.String.bytes());
+    // The store did NOT happen: the cell still holds its original table,
+    // the young table is unpromoted, nothing was published.
+    try std.testing.expect(std.meta.eql(owner_cell.value, orig_value));
+    try std.testing.expect(b8AgeIsYoung(b8_young.?.gc_age));
+    try std.testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
+    try std.testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
+
+    // Reuse with the real allocator: the same store succeeds, returns the
+    // arena-backed name, promotes + publishes the young table exactly
+    // once, and a full collection keeps it alive through the old cell.
+    // (The failed pcallk left the error object on the stack — drop it.)
+    lua_settop(L, 1); // [closure]
+    s.stack.append(vm.alloc, .{ .Table = b8_young.? }) catch return error.OutOfMemory;
+    const name = lua_setupvalue(L, -2, 1);
+    try std.testing.expect(name != null);
+    try std.testing.expectEqualStrings("x", std.mem.span(name.?));
+    try std.testing.expect(std.meta.eql(owner_cell.value, .{ .Table = b8_young.? }));
+    try std.testing.expect(b8_young.?.gc_age == .old0);
+    var old1_count: usize = 0;
+    for (vm.gc_old1.items) |o| {
+        if (std.meta.eql(o, .{ .table = b8_young.? })) old1_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), old1_count);
+    _ = luazigGcFixed(L, 2, 0); // LUA_GCCOLLECT
+    try std.testing.expect(std.meta.eql(owner_cell.value, .{ .Table = b8_young.? }));
+    lua_settop(L, 0);
+}
+
+/// Stages [owner(1), donor(2)] on the fresh pcallk stack (both Lua closures
+/// with one closed upvalue each; the owner is OLD, the donor YOUNG), forces
+/// the generational reserves to allocate, then arms fail_index=0: the join's
+/// barrier reserve must throw LUA_ERRMEM BEFORE the re-point.
+fn b8CfUpvaluejoinOom(L: ?*lua_State) callconv(.c) c_int {
+    var s = api.State.fromHandle(L.?);
+    s.stack.append(s.vm.alloc, .{ .Closure = b8_owner.? }) catch return -1;
+    s.stack.append(s.vm.alloc, .{ .Closure = b8_donor.? }) catch return -1;
+    s.vm.gc_gray.deinit(s.vm.alloc);
+    s.vm.gc_gray = .empty;
+    s.vm.gc_old1.deinit(s.vm.alloc);
+    s.vm.gc_old1 = .empty;
+    b8_failing = std.testing.FailingAllocator.init(b8_base, .{
+        .fail_index = 0,
+        .resize_fail_index = 0,
+    });
+    s.vm.alloc = b8_failing.allocator();
+    lua_upvaluejoin(L, 1, 1, 2, 1); // reserve OOM → LUA_ERRMEM longjmp
+    return 0; // unreachable on the armed failure
+}
+
+test "c api lua_upvaluejoin OOM throws LUA_ERRMEM before the re-point" {
+    const L = luaL_newstate() orelse return error.OutOfMemory;
+    defer lua_close(L);
+    const vm = L.vm;
+
+    // Owner created before entering generational mode (→ OLD), donor after
+    // (→ YOUNG): the join's gen arm reserves for the donor's cell.
+    try std.testing.expectEqual(@as(c_int, 0), luaL_loadstring(L, "local x = {1} return function() return x end"));
+    try std.testing.expectEqual(@as(c_int, 0), lua_pcallk(L, 0, 1, 0, 0, null));
+    const s = api.State.fromHandle(L);
+    b8_owner = s.stack.items[s.stack.items.len - 1].Closure;
+    const owner_cell = b8_owner.?.upvalues[0];
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(.{ .Closure = b8_owner.? });
+    _ = luazigGcFixed(L, 7, 0); // LUA_GCGENERATIONAL
+
+    try std.testing.expectEqual(@as(c_int, 0), luaL_loadstring(L, "local y = {2} return function() return y end"));
+    try std.testing.expectEqual(@as(c_int, 0), lua_pcallk(L, 0, 1, 0, 0, null));
+    b8_donor = s.stack.items[s.stack.items.len - 1].Closure;
+    const donor_cell = b8_donor.?.upvalues[0];
+    try roots.add(.{ .Closure = b8_donor.? });
+    try std.testing.expect(b8AgeIsYoung(donor_cell.gc_age));
+
+    lua_pushcfunction(L, b8CfUpvaluejoinOom);
+    b8_base = vm.alloc;
+    const status = lua_pcallk(L, 0, 0, 0, 0, null);
+    vm.alloc = b8_base;
+
+    try std.testing.expectEqual(@as(c_int, 4), status); // LUA_ERRMEM
+    try std.testing.expect(vm.errThread().err_has_obj);
+    try std.testing.expectEqualStrings("not enough memory", vm.errThread().err_obj.String.bytes());
+    // The re-point did NOT happen: the owner still observes its own cell,
+    // the donor cell is unpromoted, nothing was published.
+    try std.testing.expect(b8_owner.?.upvalues[0] == owner_cell);
+    try std.testing.expect(b8AgeIsYoung(donor_cell.gc_age));
+    try std.testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
+    try std.testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
+
+    // Reuse with the real allocator: the join re-points the owner's slot,
+    // shares identity, and a write through the owner is visible through
+    // the donor (the shared-cell contract). (The failed pcallk left the
+    // error object on the stack — drop it: stack [owner, donor].)
+    lua_settop(L, 2);
+    lua_upvaluejoin(L, -2, 1, -1, 1);
+    try std.testing.expect(b8_owner.?.upvalues[0] == donor_cell);
+    try std.testing.expectEqual(lua_upvalueid(L, -2, 1), lua_upvalueid(L, -1, 1));
+    lua_pushinteger(L, 77);
+    try std.testing.expect(lua_setupvalue(L, -3, 1) != null); // write via owner
+    _ = lua_getupvalue(L, -2, 1); // read via donor
+    try std.testing.expectEqual(@as(i64, 77), intAt(L, -1));
+    lua_settop(L, 0);
+}
+
+test "c api upvalue names are arena-backed: stable pointers, no query allocation" {
+    const L = luaL_newstate() orelse return error.OutOfMemory;
+    defer lua_close(L);
+    const vm = L.vm;
+
+    // PUC parity (lapi.c aux_upvalue → getstr): the name pointer is valid
+    // for the closure's proto lifetime and the query allocates nothing.
+    // The old implementation interned the name per query — an allocation
+    // on a PUC-allocation-free path.
+    try std.testing.expectEqual(@as(c_int, 0), luaL_loadstring(L, "local x = 7 return function() return x end"));
+    try std.testing.expectEqual(@as(c_int, 0), lua_pcallk(L, 0, 1, 0, 0, null));
+    const s = api.State.fromHandle(L);
+    const closure = s.stack.items[s.stack.items.len - 1].Closure;
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(.{ .Closure = closure });
+
+    const name1 = lua_getupvalue(L, -1, 1);
+    try std.testing.expect(name1 != null);
+    try std.testing.expectEqualStrings("x", std.mem.span(name1.?));
+    try std.testing.expectEqual(@as(i64, 7), intAt(L, -1));
+    lua_pop(L, 1); // drop the pushed value → stack [cl]
+
+    // Churn: garbage + full collections. The proto's name arena dies only
+    // with the proto tree (rooted via the rooted closure), so the name
+    // pointer must stay valid across every collection.
+    for (0..8) |_| {
+        try std.testing.expectEqual(@as(c_int, 0), luaL_loadstring(L, "local t = {} for i = 1, 100 do t[i] = {i} end"));
+        try std.testing.expectEqual(@as(c_int, 0), lua_pcallk(L, 0, 0, 0, 0, null));
+        _ = luazigGcFixed(L, 2, 0); // LUA_GCCOLLECT
+    }
+    try std.testing.expect(lua_type(L, -1) == 6); // LUA_TFUNCTION — still the closure
+
+    const name2 = lua_getupvalue(L, -1, 1);
+    try std.testing.expect(name2 != null);
+    try std.testing.expectEqualStrings("x", std.mem.span(name2.?));
+    // SAME pointer: the arena-backed name, not a per-query intern.
+    try std.testing.expect(name1.? == name2.?);
+    lua_pop(L, 1);
+
+    // lua_setupvalue returns the same arena-backed name pointer.
+    lua_pushinteger(L, 9);
+    const setname = lua_setupvalue(L, -2, 1);
+    try std.testing.expect(setname != null);
+    try std.testing.expect(name1.? == setname.?);
+    lua_settop(L, 0);
+
+    // No-alloc proof: with a pre-grown stack (spare capacity — the push
+    // cannot need growth) and fail_index=0, the name query still succeeds
+    // — the name path allocates nothing.
+    {
+        s.stack.append(vm.alloc, .{ .Closure = closure }) catch return error.OutOfMemory;
+        s.stack.ensureUnusedCapacity(vm.alloc, 8) catch return error.OutOfMemory;
+        var failing = std.testing.FailingAllocator.init(vm.alloc, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        const saved = vm.alloc;
+        vm.alloc = failing.allocator();
+        const name = lua_getupvalue(L, -1, 1);
+        vm.alloc = saved;
+        try std.testing.expect(name != null);
+        try std.testing.expectEqualStrings("x", std.mem.span(name.?));
+        try std.testing.expectEqual(@as(i64, 9), intAt(L, -1));
+        lua_settop(L, 0);
+    }
 }

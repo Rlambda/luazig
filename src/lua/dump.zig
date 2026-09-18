@@ -155,9 +155,12 @@ pub const DumpWriter = struct {
 
     /// Write a string with dedup: if the same bytes were already written,
     /// emit a back-reference (varint(0) + varint(index)). Otherwise, write
-    /// varint(len+1) + bytes and register in the dedup table.
+    /// varint(len+1) + bytes + NUL and register in the dedup table.
     /// Used for ALL strings in Proto (source_name, name, constants, etc.)
-    /// to match PUC's dumpString dedup mechanism.
+    /// to match PUC's dumpString dedup mechanism. The trailing NUL matches
+    /// PUC's encoding (dumpString writes size = len+1 counting the
+    /// terminating zero, then the content including it) — it lets the
+    /// undumper alias fixed-buffer strings as NUL-terminated slices.
     pub fn writeStringDedup(self: *DumpWriter, s: []const u8) !void {
         if (s.len == 0) {
             try self.writeVarint(0);
@@ -172,6 +175,7 @@ pub const DumpWriter = struct {
             try self.string_dedup.put(self.alloc, s, self.string_dedup_count);
             try self.writeVarint(@as(u64, @intCast(s.len)) + 1);
             try self.buf.appendSlice(self.alloc, s);
+            try self.buf.append(self.alloc, 0);
         }
     }
 

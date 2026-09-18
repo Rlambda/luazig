@@ -13,7 +13,11 @@ Performance provenance is split by source of truth (P16.50-review-7 BLOCKER 5):
     and are labeled as such; the snapshot run-count is NEVER presented as the
     gate protocol;
   - the paired-seed protocol claim (seed list/runs, verdict) comes from a
-    separately loaded and VALIDATED tools/perf/current-gate.json;
+    separately loaded and VALIDATED tools/perf/current-gate.json; the
+    published seed list and the per-workload population validator are
+    reused from tools/perf_compare.py (ONE source of truth), so only the
+    exact published paired-seed-v1 population (seeds 1..21, one row per
+    seed per workload, runs == 21) counts as a valid gate;
   - the api580 fixed-load footprint comes from tools/perf/current-api580-ledger.json
     and uses the MEASURED fields (measured_delta_anchored/no_xy_root); the
     charged/model totals are explicitly labeled as model charges, never as
@@ -34,11 +38,25 @@ stale number. No timestamps are embedded, so regeneration is idempotent.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
 import re
 import sys
 from pathlib import Path
+
+# The published paired-seed protocol has ONE source of truth:
+# tools/perf_compare.py (SEED_LIST plus the exact per-workload
+# seed-population validator _paired_seed_schema_reason). This generator
+# loads it by file path and reuses both, so the status wording can never
+# drift from the gate's own protocol definition — a second literal seed
+# list here would be a second source of truth.
+_PERF_SPEC = importlib.util.spec_from_file_location(
+    "perf_compare", Path(__file__).resolve().parent / "perf_compare.py")
+pc = importlib.util.module_from_spec(_PERF_SPEC)
+sys.modules["perf_compare"] = pc
+_PERF_SPEC.loader.exec_module(pc)
+SEED_LIST = pc.SEED_LIST
 
 ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
@@ -184,20 +202,34 @@ IDENTITY_KEYS = ("measured_source_head", "git_head",
 
 
 def validate_gate(gate: object) -> tuple[bool, str]:
-    """Validate the paired-seed gate artifact schema.
+    """Validate the paired-seed gate artifact against the published protocol.
 
-    Required: a positive integer ``runs``, a ``result.verdict``, a
-    ``zig_samples`` population where every workload carries exactly one row
-    per published seed (same seed set everywhere, no duplicates, usable
-    seed identities, positive instruction counts), and a ``provenance``
-    block with at least one source/binary identity field. Returns
-    (ok, reason); reason is empty when ok.
+    The seed protocol has ONE source of truth: ``perf_compare.SEED_LIST``
+    (the published paired-seed-v1 list, ordered and contiguous 1..21). A
+    gate artifact is valid only when ALL of the following hold:
+
+      - ``runs == len(SEED_LIST)`` — a self-consistent but unpublished
+        seed count (e.g. ``1..5`` or ``2..22``) is not the protocol;
+      - ``result.verdict`` is present;
+      - EVERY workload's sample population is EXACTLY one row per
+        published seed — no anonymous rows, no null/unusable seeds, no
+        duplicates, no missing, no extras — checked with perf_compare's
+        own ``_paired_seed_schema_reason`` so the generator and the gate
+        itself can never disagree on what a valid session is; every row
+        also carries a positive instruction count;
+      - ``provenance`` carries at least one source/binary identity field.
+
+    Returns (ok, reason); reason is empty when ok.
     """
     if not isinstance(gate, dict):
         return False, "gate artifact is not a JSON object"
     runs = gate.get("runs")
     if isinstance(runs, bool) or not isinstance(runs, int) or runs <= 0:
         return False, "runs must be a positive integer"
+    if runs != len(SEED_LIST):
+        return False, (f"runs={runs} disagrees with the published "
+                       f"paired-seed-v1 protocol ({len(SEED_LIST)} seeds, "
+                       f"1..{len(SEED_LIST)})")
     result = gate.get("result")
     if not isinstance(result, dict):
         return False, "result section missing"
@@ -207,29 +239,19 @@ def validate_gate(gate: object) -> tuple[bool, str]:
     samples = gate.get("zig_samples")
     if not isinstance(samples, dict) or not samples:
         return False, "zig_samples section missing"
-    seed_sets: list[frozenset[int]] = []
     for wl, rows in samples.items():
         if not isinstance(rows, list) or not rows:
             return False, f"zig_samples[{wl}] has no rows"
-        seeds: list[int] = []
         for r in rows:
             if not isinstance(r, dict):
                 return False, f"zig_samples[{wl}] has a malformed row"
-            s = r.get("seed")
-            if isinstance(s, bool) or not isinstance(s, int) or s <= 0:
-                return False, f"zig_samples[{wl}] has a row with an unusable seed"
             ins = r.get("instructions")
             if isinstance(ins, bool) or not isinstance(ins, int) or ins <= 0:
                 return False, f"zig_samples[{wl}] has a row with unusable instructions"
-            seeds.append(s)
-        if len(set(seeds)) != len(seeds):
-            return False, f"zig_samples[{wl}] has duplicate seeds"
-        seed_sets.append(frozenset(seeds))
-    if any(s != seed_sets[0] for s in seed_sets[1:]):
-        return False, "workloads carry different seed populations"
-    if len(seed_sets[0]) != runs:
-        return False, (f"runs={runs} but workloads carry "
-                       f"{len(seed_sets[0])} distinct seeds")
+        reason = pc._paired_seed_schema_reason(rows, SEED_LIST)
+        if reason is not None:
+            return False, (f"zig_samples[{wl}] is not the published seed "
+                           f"population: {reason}")
     prov = gate.get("provenance")
     if not isinstance(prov, dict):
         return False, "provenance section missing"
@@ -338,12 +360,46 @@ def _fmt_tristate(v: object) -> str:
     return "unknown"
 
 
+def _api580_dual_mode_note(doc: dict) -> str:
+    """Honest dual-mode provenance note for the api580 ledger.
+
+    The ledger's top-level provenance carries the Debug-binary hash (the
+    ledger-recording run) while the measured deltas come from the
+    ReleaseFast mode (``per_mode.ReleaseFast``). When the two hashes
+    differ, both are stated explicitly instead of implying one single
+    ReleaseFast-binary artifact; the mode label for the top-level hash is
+    derived from the matching ``per_mode`` entry when present.
+    """
+    top = doc.get("provenance")
+    rf = api580_identity_prov(doc)
+    top_sha = top.get("zig_binary_sha16") if isinstance(top, dict) else None
+    rf_sha = rf.get("zig_binary_sha16") if isinstance(rf, dict) else None
+    if not (isinstance(top_sha, str) and top_sha
+            and isinstance(rf_sha, str) and rf_sha) or top_sha == rf_sha:
+        return ""
+    label = "another-mode"
+    pm = doc.get("per_mode")
+    if isinstance(pm, dict):
+        for mode, blk in pm.items():
+            if (isinstance(blk, dict) and isinstance(blk.get("provenance"), dict)
+                    and blk["provenance"].get("zig_binary_sha16") == top_sha):
+                label = str(mode)
+                break
+    return (f" Measured on the ReleaseFast binary `{rf_sha}`; the ledger's "
+            f"top-level provenance is the {label} binary `{top_sha}` "
+            "(dual-mode ledger, not one single-RF-binary artifact).")
+
+
 def api580_lines(api580: object, perf: dict | None) -> list[str]:
     """Render the api580 fixed-load footprint from the ledger artifact.
 
-    Only the MEASURED fields (measured_delta_anchored/no_xy_root) are ever
-    called measurements; the reconciliation charged totals are explicitly
-    labeled as allocation-model charges.
+    The GATE is the anchored measured delta vs the threshold; the
+    no-XY-root number is a context-variance DIAGNOSTIC and is never part
+    of the green claim. Only the MEASURED fields
+    (measured_delta_anchored/no_xy_root) are ever called measurements; the
+    reconciliation charged totals are explicitly labeled as
+    allocation-model charges, and the ledger's dual-mode provenance
+    (top-level Debug hash + nested ReleaseFast hash) is stated honestly.
     """
     if api580 is None:
         return ["api580 fixed-load footprint: _unavailable — no ledger artifact "
@@ -356,14 +412,19 @@ def api580_lines(api580: object, perf: dict | None) -> list[str]:
     no_xy = api580["measured_delta_no_xy_root"]
     threshold = api580["gate_threshold"]
     verdict = api580["verdict"]
-    line = (f"api580 fixed-load footprint: measured delta **{anchored} B "
-            f"anchored / {no_xy} B no-XY-root** vs threshold {threshold} B")
+    cmp_op = "<" if anchored < threshold else ">="
     rel = identity_relation(api580_identity_prov(api580),
                             (perf or {}).get("provenance"))
     if rel == "match":
-        line += f" — verdict **{verdict}**"
+        line = (f"api580 anchored gate: **{verdict}** — measured {anchored} B "
+                f"{cmp_op} {threshold} B; no-XY diagnostic: {no_xy} B")
     else:
-        line += f" — verdict {verdict} ({_not_green_note(rel)})"
+        line = (f"api580 anchored gate: {verdict} — measured {anchored} B "
+                f"{cmp_op} {threshold} B; no-XY diagnostic: {no_xy} B "
+                f"({_not_green_note(rel)})")
+    note = _api580_dual_mode_note(api580)
+    if note:
+        line += "." + note
     line += " (`tools/perf/current-api580-ledger.json`)."
     rec = api580.get("reconciliation")
     if isinstance(rec, dict):
@@ -460,22 +521,37 @@ def gate_summary_row(gate: object, perf: dict | None) -> str:
 
 
 def api580_summary_row(api580: object, perf: dict | None) -> str:
-    """Compact STATUS.md row for the api580 fixed-load footprint."""
+    """Compact STATUS.md row for the api580 fixed-load footprint.
+
+    Same rules as api580_lines: the anchored delta vs threshold is THE
+    gate, the no-XY-root number is a diagnostic, and the dual-mode
+    provenance (top-level Debug hash + nested ReleaseFast hash) is stated
+    honestly rather than implying a single-RF-binary artifact.
+    """
     if api580 is None:
         return "| api580 fixed-load footprint | _unavailable — no current-api580-ledger.json_ |"
     ok, _ = validate_api580(api580)
     if not ok:
         return "| api580 fixed-load footprint | _inconclusive — ledger failed validation_ |"
     verdict = api580["verdict"]
-    measured = (f"measured {api580['measured_delta_anchored']}/"
-                f"{api580['measured_delta_no_xy_root']} B vs threshold "
-                f"{api580['gate_threshold']} B")
+    anchored = api580["measured_delta_anchored"]
+    no_xy = api580["measured_delta_no_xy_root"]
+    threshold = api580["gate_threshold"]
+    cmp_op = "<" if anchored < threshold else ">="
     rel = identity_relation(api580_identity_prov(api580),
                             (perf or {}).get("provenance"))
     if rel == "match":
-        return f"| api580 fixed-load footprint | **{verdict}** — {measured} |"
-    return (f"| api580 fixed-load footprint | {verdict} — {measured} "
-            f"({_not_green_note(rel)}) |")
+        row = (f"| api580 fixed-load footprint | **{verdict}** — anchored "
+               f"gate {anchored} B {cmp_op} {threshold} B; no-XY diagnostic "
+               f"{no_xy} B |")
+    else:
+        row = (f"| api580 fixed-load footprint | {verdict} — anchored gate "
+               f"{anchored} B {cmp_op} {threshold} B; no-XY diagnostic "
+               f"{no_xy} B ({_not_green_note(rel)}) |")
+    note = _api580_dual_mode_note(api580)
+    if note:
+        row = row[:-2] + "; " + note.strip() + " |"
+    return row
 
 
 def build_status_summary_block(matrix: dict | None, smoke: dict | None,

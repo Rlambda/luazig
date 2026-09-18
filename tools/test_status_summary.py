@@ -1,11 +1,24 @@
 #!/usr/bin/env python3
-"""P16.50-review-7 BLOCKER 5: status-generator provenance-separation tests.
+"""P16.50-review-7 BLOCKER 5 + review-8 §4: status-generator honesty tests.
 
 Covers the snapshot/gate confusion: tools/status_summary.py used to derive
 the "N published seeds" protocol claim from the ordinary measurement
 snapshot (current.json, runs=5) instead of the paired-seed gate artifact
 (current-gate.json, published seeds 1..21), and the api580 wording used to
 present the charged/model totals (376/428) as measured anchored deltas.
+
+Review-8 §4 additions:
+  (f) the published paired-seed-v1 protocol is EXACT — the seed list and
+      the per-workload population validator are reused from
+      perf_compare.py (one source of truth), and a self-consistent but
+      unpublished seed set (1..5, 2..22, 1..20) or a corrupt population
+      (duplicate/missing/extra seed rows, wrong runs) is inconclusive,
+      never a green "published seeds" claim;
+  (g) the api580 GATE is the anchored measured delta vs the threshold;
+      the no-XY-root number is a DIAGNOSTIC and is never part of the
+      green claim;
+  (h) the api580 ledger's dual-mode provenance (top-level Debug hash +
+      nested ReleaseFast hash) is stated honestly.
 
 The generator must:
   (a) label the geomean/run-count as a measurement snapshot;
@@ -79,11 +92,19 @@ def gate_doc(runs: int = 21, verdict: str = "OK", prov: dict | None = None,
 
 def api580_doc(measured_a: int = 111, measured_n: int = 222,
                charged_a: int = 100, charged_n: int = 200,
-               verdict: str = "GREEN", prov: dict | None = None) -> dict:
+               verdict: str = "GREEN", prov: dict | None = None,
+               rf_prov: dict | None = None) -> dict:
+    """Ledger fixture. `prov` is the TOP-LEVEL provenance (the Debug
+    binary in the canonical ledger); `rf_prov` is the per-mode
+    ReleaseFast provenance the identity relation uses. They default to
+    the same identity (single-mode ledger); the dual-mode fixture sets
+    them apart like the canonical artifact does."""
+    top = dict(prov if prov is not None else SNAP_PROV)
+    rf = dict(rf_prov if rf_prov is not None else top)
     return {"verdict": verdict, "gate_threshold": 400,
             "measured_delta_anchored": measured_a,
             "measured_delta_no_xy_root": measured_n,
-            "provenance": dict(prov if prov is not None else SNAP_PROV),
+            "provenance": top,
             "reconciliation": {
                 "anchored": {"measured": measured_a,
                              "charged_total": charged_a,
@@ -91,8 +112,8 @@ def api580_doc(measured_a: int = 111, measured_n: int = 222,
                 "no_xy_root": {"measured": measured_n,
                                "charged_total": charged_n,
                                "reconciled": False}},
-            "per_mode": {"ReleaseFast": {"provenance": dict(
-                prov if prov is not None else SNAP_PROV)}}}
+            "per_mode": {"ReleaseFast": {"provenance": rf},
+                         "Debug": {"provenance": dict(top)}}}
 
 
 def render(gate, api580, perf=None) -> str:
@@ -182,16 +203,32 @@ check("G7 FAIL verdict rendered honestly",
       "Latest gate verdict: **FAIL**" in text)
 
 # ---------------------------------------------------------------------------
-# A1-A5: api580 wording — measured fields vs charged/model totals.
+# A1-A6: api580 wording — anchored gate vs no-XY diagnostic, measured
+# fields vs charged/model totals, dual-mode provenance.
 # ---------------------------------------------------------------------------
 text = render(gate_doc(), api580_doc())
-check("A1 measured deltas come from measured_delta_* fields",
-      "measured delta **111 B anchored / 222 B no-XY-root**" in text)
+check("A1 anchored gate sentence carries the threshold comparison",
+      "api580 anchored gate: **GREEN** — measured 111 B < 400 B" in text)
+check("A1 no-XY number labeled diagnostic, outside the verdict",
+      "; no-XY diagnostic: 222 B" in text
+      and "GREEN** — measured 111 B < 400 B; no-XY diagnostic: 222 B" in text)
 check("A1 charged totals labeled as model charges",
       "Charged/model totals 100/200 B" in text
       and "allocation-model charges, not measurements" in text)
 check("A1 charged totals never called measured",
       "measured delta **100" not in text and "measured 376" not in text)
+
+# A6. Dual-mode ledger: top-level Debug hash + nested ReleaseFast hash are
+# both stated; the green claim still rests on the ReleaseFast identity.
+dual = api580_doc(prov=dict(SNAP_PROV, zig_binary_sha16="aaaabbbbccccdddd"),
+                  rf_prov=dict(SNAP_PROV))
+text = render(gate_doc(), dual)
+check("A6 dual-mode provenance states both binaries",
+      "Measured on the ReleaseFast binary `feedfacefeedface`" in text
+      and "top-level provenance is the Debug binary `aaaabbbbccccdddd`" in text
+      and "dual-mode ledger" in text)
+check("A6 dual-mode ledger green on ReleaseFast identity match",
+      "api580 anchored gate: **GREEN** — measured 111 B < 400 B" in text)
 
 text = render(gate_doc(), None)
 check("A2 missing ledger -> unavailable wording",
@@ -213,7 +250,7 @@ no_rec = api580_doc()
 del no_rec["reconciliation"]
 text = render(gate_doc(), no_rec)
 check("A5 no reconciliation block -> no charged totals invented",
-      "measured delta **111 B anchored / 222 B no-XY-root**" in text
+      "api580 anchored gate: **GREEN** — measured 111 B < 400 B" in text
       and "Charged/model totals" not in text)
 
 # ---------------------------------------------------------------------------
@@ -225,8 +262,17 @@ check("C1 gate row shows 21 published seeds with verdict",
       "**OK** — 21 published seeds (1..21)" in rows)
 check("C1 gate row never shows 5 published seeds",
       "5 published seeds" not in rows)
-check("C1 api580 row uses measured fields",
-      "**GREEN** — measured 111/222 B vs threshold 400 B" in rows)
+check("C1 api580 row uses the anchored gate + diagnostic wording",
+      "**GREEN** — anchored gate 111 B < 400 B; no-XY diagnostic 222 B" in rows)
+
+rows = ss.build_status_summary_block(None, None, snapshot(), gate_doc(),
+                                     api580_doc(
+                                         prov=dict(SNAP_PROV,
+                                                   zig_binary_sha16="aaaabbbbccccdddd"),
+                                         rf_prov=dict(SNAP_PROV)))
+check("C1 api580 dual-mode row states both binaries",
+      "Measured on the ReleaseFast binary `feedfacefeedface`" in rows
+      and "Debug binary `aaaabbbbccccdddd`" in rows)
 
 rows = ss.build_status_summary_block(None, None, snapshot(), None, None)
 check("C2 missing artifacts -> unavailable rows",
@@ -246,6 +292,69 @@ rows = ss.build_status_summary_block(None, None, snapshot(), bad_g,
                                      api580_doc())
 check("C4 invalid gate schema -> inconclusive row",
       "_inconclusive — gate artifact failed validation_" in rows)
+
+# ---------------------------------------------------------------------------
+# P0-P6 (review-8 §4a): the published paired-seed-v1 protocol is EXACT.
+# The seed list and per-workload population validator are reused from
+# perf_compare.py; a self-consistent but unpublished seed set or a corrupt
+# population is inconclusive — never a green "published seeds" claim.
+# ---------------------------------------------------------------------------
+_pc_spec = importlib.util.spec_from_file_location(
+    "perf_compare", REPO / "tools" / "perf_compare.py")
+pc = importlib.util.module_from_spec(_pc_spec)
+sys.modules["perf_compare"] = pc
+_pc_spec.loader.exec_module(pc)
+
+check("P0 generator SEED_LIST is perf_compare's published list",
+      ss.SEED_LIST == pc.SEED_LIST == list(range(1, 22)))
+
+# P1. Canonical shape (seeds 1..21, runs=21) -> green protocol claim.
+text = render(gate_doc(), api580_doc())
+check("P1 canonical 1..21 gate -> green with published seeds",
+      "21 published seeds (1..21)" in text
+      and "Latest gate verdict: **OK**" in text)
+
+# P2. Self-consistent 1..5 (runs=5) -> inconclusive, no seed-count claim.
+text = render(gate_doc(runs=5), api580_doc())
+check("P2 self-consistent 1..5 -> inconclusive",
+      "Gate protocol: _inconclusive" in text)
+check("P2 1..5 -> no published-seeds claim, no bold verdict",
+      "published seeds" not in text
+      and "Latest gate verdict: **OK**" not in text)
+rows = ss.build_status_summary_block(None, None, snapshot(),
+                                     gate_doc(runs=5), api580_doc())
+check("P2 1..5 compact row -> inconclusive",
+      "_inconclusive — gate artifact failed validation_" in rows)
+
+# P3. Self-consistent shifted 2..22 (runs=21) -> inconclusive.
+text = render(gate_doc(seeds=list(range(2, 23))), api580_doc())
+check("P3 shifted 2..22 -> inconclusive",
+      "Gate protocol: _inconclusive" in text
+      and "published seeds" not in text)
+
+# P4. One workload with a duplicate AND a missing seed -> inconclusive.
+g = gate_doc()
+g["zig_samples"]["int_arith"][1]["seed"] = 1  # duplicate of seed 1
+g["zig_samples"]["int_arith"].pop()           # and seed 21 now missing
+text = render(g, api580_doc())
+check("P4 duplicate+missing seeds in one workload -> inconclusive",
+      "Gate protocol: _inconclusive" in text
+      and "published seeds" not in text)
+
+# P5. Extra unexpected seed row (22 alongside the full 1..21) -> inconclusive.
+g = gate_doc()
+g["zig_samples"]["int_arith"].append(
+    {"wall": 0.1, "instructions": 9999, "mode": "mono", "seed": 22})
+text = render(g, api580_doc())
+check("P5 extra seed row -> inconclusive",
+      "Gate protocol: _inconclusive" in text
+      and "published seeds" not in text)
+
+# P6. Self-consistent 1..20 (runs=20) -> wrong runs count -> inconclusive.
+text = render(gate_doc(runs=20), api580_doc())
+check("P6 self-consistent 1..20 -> inconclusive",
+      "Gate protocol: _inconclusive" in text
+      and "published seeds" not in text)
 
 # ---------------------------------------------------------------------------
 # CLI1-CLI4: end-to-end generator runs on temp fixtures (stdout mode only —
@@ -320,9 +429,16 @@ if ss.API580_DEFAULT.exists():
     ok, reason = ss.validate_api580(ledger)
     check("canonical api580 ledger passes validation", ok, reason)
     text = render(gate_doc(), ledger)
-    check("canonical ledger measured fields rendered",
-          f"measured delta **{ledger['measured_delta_anchored']} B anchored / "
-          f"{ledger['measured_delta_no_xy_root']} B no-XY-root**" in text)
+    a = ledger["measured_delta_anchored"]
+    n = ledger["measured_delta_no_xy_root"]
+    t = ledger["gate_threshold"]
+    op = "<" if a < t else ">="
+    check("canonical ledger anchored-gate wording rendered",
+          f"api580 anchored gate:" in text
+          and f"measured {a} B {op} {t} B; no-XY diagnostic: {n} B" in text)
+    check("canonical ledger dual-mode provenance stated",
+          "Measured on the ReleaseFast binary" in text
+          and "dual-mode ledger" in text)
     rec = ledger.get("reconciliation", {})
     ca = rec.get("anchored", {}).get("charged_total")
     cn = rec.get("no_xy_root", {}).get("charged_total")

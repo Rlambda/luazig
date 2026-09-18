@@ -511,7 +511,9 @@ pub const BuiltinId = enum(u8) {
     }
 };
 
-const GcAge = enum(u8) {
+/// Pub: pub structs (Cell/Closure/Table/...) expose `gc_age: GcAge` fields,
+/// so the type is part of the public API surface (c_api tests inspect it).
+pub const GcAge = enum(u8) {
     new,
     survival,
     old0,
@@ -10053,15 +10055,21 @@ pub const Vm = struct {
         }
 
         // Save fields needed after clear/destroy: the close continuation is
-        // heap-allocated (beginBytecodeClose → alloc.create) and must be freed
-        // once the close scan completes. PendingCallSlot.clear() only flips the
-        // active flag (hot-path optimization); it does NOT free heap-allocated
-        // completions. cancelBytecodePendingCall handles the error/cancel path;
+        // heap-allocated (beginBytecodeClose → infraAlloc().create) and
+        // alloc.destroy(state) below RELEASES that memory — every field read
+        // after it is a dangling-pointer read. Snapshot ALL post-destroy
+        // reads (P16.50-review-8 §2): post, had_close_error, close_err,
+        // close_min_reg, and owner_thread (the two popBytecodeExecFrame call
+        // sites in the had_close_error and .unwind_frame arms below).
+        // PendingCallSlot.clear() only flips the active flag (hot-path
+        // optimization); it does NOT free heap-allocated completions.
+        // cancelBytecodePendingCall handles the error/cancel path;
         // this is the normal-completion path.
         const post = state.post;
         const had_close_error = state.had_close_error;
         const close_err = state.current_err;
         const close_min_reg = state.min_reg;
+        const owner_thread = state.owner_thread;
         self.clearPendingCall(exec_frames.getPtr(parent_index));
         self.alloc.destroy(state);
         if (had_close_error) {
@@ -10069,7 +10077,7 @@ pub const Vm = struct {
             if (close_err) |err_value| self.restoreRuntimeErrorValue(err_value);
             if (exec_frames.getPtr(parent_index).hasOpenUpvalues())
                 self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), 0);
-            self.popBytecodeExecFrame(state.owner_thread, exec_frames);
+            self.popBytecodeExecFrame(owner_thread, exec_frames);
             return .propagate_error;
         }
 
@@ -10108,7 +10116,7 @@ pub const Vm = struct {
                 if (close_err) |err_value| self.restoreRuntimeErrorValue(err_value);
                 if (exec_frames.getPtr(parent_index).hasOpenUpvalues())
                     self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), 0);
-                self.popBytecodeExecFrame(state.owner_thread, exec_frames);
+                self.popBytecodeExecFrame(owner_thread, exec_frames);
                 return .propagate_error;
             },
         }
@@ -10282,7 +10290,34 @@ pub const Vm = struct {
         const th = self.activeBytecodeThread();
         const proto = closure.proto orelse unreachable; // caller proves proto != null
         const parent = exec_frames.getPtr(parent_index);
-        std.debug.assert(parent.pending_call_index == INVALID_PENDING);
+        // P16.50-review-8 §3.1: a gsub continuation re-push arrives with the
+        // parent's slot ALREADY holding the very same completion —
+        // applyBytecodePendingGsub keeps the .gsub completion installed as
+        // the state's single owner across advanceBytecodeGsub, and the
+        // nested child push below only refreshes the payload (the callee
+        // field) in place: setPendingCall with a valid index is an
+        // infallible payload store, an atomic .gsub → .gsub swap. Every
+        // other caller must arrive with no pending installed.
+        if (parent.pending_call_index != INVALID_PENDING) {
+            const installed = self.getPendingCallConst(parent.pending_call_index) orelse unreachable;
+            if (mode == .pending) {
+                const p = payload;
+                // Tagged unions have no `==`: same tag, and for pointer
+                // payloads the same continuation object, is "the very same
+                // completion" here.
+                std.debug.assert(std.meta.activeTag(installed.completion) == std.meta.activeTag(p.completion));
+                switch (installed.completion) {
+                    .concat => |s| std.debug.assert(s == p.completion.concat),
+                    .gsub => |s| std.debug.assert(s == p.completion.gsub),
+                    .hook => |s| std.debug.assert(s == p.completion.hook),
+                    .close => |s| std.debug.assert(s == p.completion.close),
+                    .coroutine_resume => |s| std.debug.assert(s == p.completion.coroutine_resume),
+                    .results, .value, .ignore, .compare => {},
+                }
+            } else {
+                unreachable;
+            }
+        }
         // P16.8 Task 1: simple_result and pending_calls are mutually exclusive.
         if (!parent.isC()) {
             std.debug.assert(!parent.hasSimpleResult());
@@ -10749,8 +10784,17 @@ pub const Vm = struct {
 
     /// Push a Lua bytecode debug hook as an ordinary explicit child frame.
     /// Non-bytecode hooks return false and are executed by the existing
-    /// synchronous hook helper. `post` remains caller-owned unless true is
-    /// returned.
+    /// synchronous hook helper.
+    ///
+    /// Ownership contract (P16.50-review-8 §3.3): the caller owns `post`
+    /// ONLY on a `false` return — every early `false` below fires before the
+    /// first fallible operation, with the payload untouched. From the first
+    /// fallible operation on, THIS function owns `post`: on `true` it has
+    /// been adopted by the published pending call (the pending is the single
+    /// owner; cleanup belongs to cancelBytecodePendingCall /
+    /// applyBytecodePendingHook), and on ANY error it has already been freed
+    /// exactly once by the `post_owned` guard — the caller must neither free
+    /// it nor use it again.
     fn tryPushBytecodeDebugHook(
         self: *Vm,
         exec_frames: *FrameStack,
@@ -11460,6 +11504,13 @@ pub const Vm = struct {
         const th = self.activeBytecodeThread();
         const acc = if (ret.len == 0) Value.Nil else ret[0];
 
+        // P16.50-review-8 §3.2: adopt the child's return slice at entry —
+        // the temp-roots reserves below are fallible and until the explicit
+        // free this errdefer is the slice's single owner (the old code
+        // leaked it when a roots.add failed).
+        var ret_owned = true;
+        errdefer if (ret_owned and !self.returnSliceIsOwned(ret)) self.alloc.free(ret);
+
         // Root the continuation while detaching it from the parent.  The next
         // bytecode metamethod, if any, installs a fresh pending owner before
         // this function returns.
@@ -11467,6 +11518,7 @@ pub const Vm = struct {
         defer roots.end();
         for (cont.values) |value| try roots.add(value);
         try roots.add(acc);
+        ret_owned = false;
         if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
 
         self.clearPendingCall(exec_frames.getPtr(parent_index));
@@ -11726,6 +11778,10 @@ pub const Vm = struct {
         } else {
             const bytes = try state.out.toOwnedSlice(self.alloc);
             state.out = .empty;
+            // internStr copies the bytes into the (GC-registered) LuaString —
+            // the raw owned buffer must be freed on every path (same leak
+            // class as the P16.50-review-6 traceback fix).
+            defer self.alloc.free(bytes);
             ret[0] = .{ .String = try self.internStr(bytes) };
         }
         ret[1] = .{ .Int = @intCast(state.count) };
@@ -11746,6 +11802,18 @@ pub const Vm = struct {
             self.alloc.destroy(state);
         };
 
+        // P16.50-review-8 §3.1: adopt the callback return slice from entry —
+        // the gcTempRoots reserves below are fallible, and until
+        // applyBytecodeGsubCallbackReturn takes it (its own defer frees it on
+        // every exit) nothing else owns the slice. Disarmed exactly at that
+        // handover; on .pushed/.final the callee has already consumed it.
+        var callback_ret_owned = true;
+        errdefer if (callback_ret_owned) {
+            if (callback_ret) |values| {
+                if (!self.returnSliceIsOwned(values)) self.alloc.free(values);
+            }
+        };
+
         var roots = self.gcTempRoots();
         defer roots.end();
         try roots.add(state.subject);
@@ -11753,6 +11821,7 @@ pub const Vm = struct {
         try roots.add(state.replacement);
         if (callback_ret) |values| for (values) |value| try roots.add(value);
 
+        callback_ret_owned = false;
         if (callback_ret) |values| try self.applyBytecodeGsubCallbackReturn(state, values);
 
         const s = state.subject.String.bytes();
@@ -11937,7 +12006,16 @@ pub const Vm = struct {
         const state = try self.initBytecodeGsub(args, result);
         return switch (try self.advanceBytecodeGsub(exec_frames, parent_index, state, null)) {
             .pushed => .pushed,
-            .final => |values| .{ .returned = values },
+            .final => |values| blk: {
+                // P16.50-review-8 §3.1: advanceBytecodeGsub's .final contract
+                // leaves the state struct alive for the caller to extract
+                // the handover (here: nothing — the result continuation was
+                // passed in by the caller and `values` carries the results).
+                // Destroy the struct only after the confirmed handover; the
+                // old code leaked it on every synchronous completion.
+                self.alloc.destroy(state);
+                break :blk .{ .returned = values };
+            },
         };
     }
 
@@ -11956,14 +12034,40 @@ pub const Vm = struct {
             self.activeBytecodeThread().ccallExit(.nonyieldable);
             state.cont_ccall_active = false;
         }
-        self.clearPendingCall(exec_frames.getPtr(parent_index));
-        switch (try self.advanceBytecodeGsub(exec_frames, parent_index, state, ret)) {
+        // P16.50-review-8 §3.1: transactional gsub handover — the pending
+        // slot STAYS installed as the state's single owner across the whole
+        // advance; there is no clear→…→re-publish window. Both terminal
+        // outcomes reuse the SAME slot via infallible payload stores
+        // (setPendingCall with a valid index only writes the payload):
+        //   .pushed → the nested child push refreshes the payload in place
+        //             (atomic .gsub → .gsub; only the callee field changes);
+        //   .final  → the .results publish below (atomic .gsub → .results).
+        // On an advance error, advanceBytecodeGsub's own defer destroys the
+        // state; the slot is released here — BEFORE the error escapes — so
+        // no unwind can observe the destroyed state through it. The old
+        // clear-then-set order left the finishBytecodeGsub result and the
+        // state struct ownerless across the fallible setPendingCall
+        // (allocPendingCall append edge) and never destroyed the state
+        // struct at all (pre-existing leak on every async gsub completion).
+        const progress = self.advanceBytecodeGsub(exec_frames, parent_index, state, ret) catch |err| {
+            self.clearPendingCall(exec_frames.getPtr(parent_index));
+            return err;
+        };
+        switch (progress) {
             .pushed => return null,
             .final => |values| {
+                // Infallible: the slot index stayed valid above, so this is
+                // a payload store into the same slot (atomic .gsub →
+                // .results swap).
                 try self.setPendingCall(exec_frames.getPtr(parent_index), .{
                     .callee = .{ .Builtin = .string_gsub },
                     .completion = .{ .results = state.result },
                 });
+                // Confirmed handover: the .results continuation now lives in
+                // the pending payload; the old gsub state struct is dead
+                // (finishBytecodeGsub already consumed `out`). Free it only
+                // NOW — it was the slot's owned object until the publish.
+                self.alloc.destroy(state);
                 return self.completeBytecodePendingExternalResults(
                     exec_frames,
                     boundary_depth,
@@ -14196,15 +14300,23 @@ pub const Vm = struct {
         parent_index: usize,
         ret: []Value,
     ) DispatchError!?[]Value {
+        // P16.50-review-8 §3.2: adopt the wrapped result slice at entry —
+        // the temp-roots reserves and the outer-layer wrap allocs below are
+        // fallible, and until each handover (beginBytecodeClose post /
+        // hook post / applyBytecodePendingResults) this errdefer is the
+        // slice's single owner. The tag moves to each re-wrapped slice and
+        // disarms at the adoption points.
+        var completed_ret = ret;
+        var owned_ret = true;
+        errdefer if (owned_ret and !self.returnSliceIsOwned(completed_ret)) self.alloc.free(completed_ret);
         var result_roots = self.gcTempRoots();
         defer result_roots.end();
-        for (ret) |value| try result_roots.add(value);
+        for (completed_ret) |value| try result_roots.add(value);
 
         const pending = self.getPendingCallConst(exec_frames.getPtr(parent_index).pending_call_index) orelse unreachable;
         // P15.51n: Snapshot callee and completion before reentrant operations.
         const pending_callee = pending.callee;
         const protection = pending.protection orelse unreachable;
-        var completed_ret = ret;
         var outer_index = protection.outer_layers.len;
         while (outer_index > 0) {
             outer_index -= 1;
@@ -14239,6 +14351,9 @@ pub const Vm = struct {
             // tail-call path instead of trying to advance to a non-existent
             // RETURN instruction.
             self.clearPendingCall(exec_frames.getPtr(parent_index));
+            // beginBytecodeClose adopts the post payload on every path —
+            // the exact adoption point for the slice.
+            owned_ret = false;
             return switch (try self.beginBytecodeClose(
                 exec_frames,
                 boundary_depth,
@@ -14256,7 +14371,12 @@ pub const Vm = struct {
         }
 
         self.clearPendingCall(exec_frames.getPtr(parent_index));
-        if (try self.tryPushBytecodeDebugHook(
+        // P16.50-review-8 §3.2/§3.3: tryPushBytecodeDebugHook owns the post
+        // payload (and with it completed_ret) from its first fallible
+        // operation: on `true` the pending adopted it, on error it freed it
+        // exactly once — disarm our mirror owner in both cases. Only on
+        // `false` is the post still ours.
+        const hook_pushed = self.tryPushBytecodeDebugHook(
             exec_frames,
             parent_index,
             "return",
@@ -14268,8 +14388,16 @@ pub const Vm = struct {
                 .continuation = result_cont,
                 .values = completed_ret,
             } },
-        )) return null;
+        ) catch |err| {
+            owned_ret = false;
+            return err;
+        };
+        if (hook_pushed) {
+            owned_ret = false;
+            return null;
+        }
         self.dispatchBytecodeHookWithCallee("return", pending_callee, completed_ret) catch |hook_err| {
+            owned_ret = false;
             self.alloc.free(completed_ret);
             return hook_err;
         };
@@ -14277,6 +14405,9 @@ pub const Vm = struct {
             .callee = pending_callee,
             .completion = .{ .results = result_cont },
         });
+        // applyBytecodePendingResults adopts the slice at entry (its
+        // errdefer frees it on failure).
+        owned_ret = false;
         try self.applyBytecodePendingResults(exec_frames, parent_index, completed_ret, result_cont.dst, result_cont.nresults);
         return null;
     }
@@ -15368,6 +15499,24 @@ pub const Vm = struct {
             self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(child_idx), 0);
         self.popBytecodeExecFrame(th, exec_frames);
 
+        // P16.50-review-8 §3.2: tagged owner for the return slice, acting
+        // from the child-frame pop to the exact adoption point. PUC
+        // luaD_poscall/moveresults has NO fallible publication window — the
+        // results land in the caller's pre-reserved stack slots; the Zig
+        // analogue must prepare all capacity first and publish infallibly.
+        // Until then, this errdefer is the slice's single function-level
+        // owner across every fallible operation below (nil padding alloc,
+        // protection wrap alloc, temp-roots reserve, frame growth):
+        //   - `borrowed_scratch` (bc_return_scratch, OP_RETURN0/1 fast path)
+        //     is statically VM-owned — never freed (owned_ret == null);
+        //   - an owned heap slice is freed exactly once on failure;
+        //   - the tag moves to each re-allocated slice (append_nil extend,
+        //     protection wrap) and disarms at each adoption (pending state,
+        //     caller frame, beginBytecodeClose post) or explicit free.
+        var completed_ret = ret;
+        var owned_ret: ?[]Value = if (self.returnSliceIsOwned(completed_ret)) null else completed_ret;
+        errdefer if (owned_ret) |slice| self.alloc.free(slice);
+
         // P15.78: If the parent frame is a C-frame (pushed by runTestcScript's
         // closer loop or by callk/pcallk/yieldk), return the results to the
         // caller. The trampoline (driveBytecodeCoroutineTrampoline) detects
@@ -15397,9 +15546,13 @@ pub const Vm = struct {
                     // and kill the call instead of returning the result.
                     // Frees stay on self.alloc: the charged-block registry
                     // passes foreign blocks through without accounting.
+                    // Failure is covered by the tag: ret is borrowed
+                    // scratch here, so the errdefer frees nothing.
                     const owned = try self.infraAlloc().dupe(Value, ret);
                     return owned;
                 }
+                // Ownership passes to the caller with the returned slice.
+                owned_ret = null;
                 return ret;
             }
         }
@@ -15421,6 +15574,8 @@ pub const Vm = struct {
                 const owned = try self.infraAlloc().dupe(Value, ret);
                 return owned;
             }
+            // Ownership passes to the external caller.
+            owned_ret = null;
             return ret;
         }
 
@@ -15441,6 +15596,8 @@ pub const Vm = struct {
                     if (result != invert) parent_ptr.u.lua.pc += 1;
                 } else {
                     // Value mode: put 1 result into register, advance pc.
+                    // bcGrowFrame is the fallible edge — the errdefer above
+                    // owns the slice across it.
                     const sr_dst = parent_ptr.u.lua.simple_result_dst;
                     var regs = th.bytecode_stack[parent_ptr.frameBase() .. parent_ptr.frameBase() + parent_ptr.u.lua.frame_cap];
                     try self.bcGrowFrame(th, parent_ptr.frameBase(), @as(usize, sr_dst) + 1, &parent_ptr.u.lua.frame_cap, &regs);
@@ -15448,7 +15605,8 @@ pub const Vm = struct {
                     parent_ptr.u.lua.pc += 1;
                 }
                 parent_ptr.clearSimpleResult();
-                if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
+                if (owned_ret) |slice| self.alloc.free(slice);
+                owned_ret = null;
                 return null;
             }
         }
@@ -15457,17 +15615,21 @@ pub const Vm = struct {
         if (self.getPendingCallConst(exec_frames.getPtr(parent_index).pending_call_index) == null) {
             const parent0 = exec_frames.getConstPtr(parent_index);
             const dst = child_frame.originalFuncSlot() - parent0.frameBase();
+            // applyBytecodeResultsDirect adopts the slice at entry (its
+            // errdefer frees it on failure).
+            owned_ret = null;
             try self.applyBytecodeResultsDirect(exec_frames, parent_index, ret, dst, callee_nresults);
             return null;
         }
         const pending = self.getPendingCallConst(exec_frames.getPtr(parent_index).pending_call_index) orelse unreachable;
-        var completed_ret = ret;
         if (pending.completion == .results and pending.completion.results.append_nil) {
+            // Nil-padding edge: the alloc failure is covered by the tag.
             const extended = try self.alloc.alloc(Value, completed_ret.len + 1);
             @memcpy(extended[0..completed_ret.len], completed_ret);
             extended[completed_ret.len] = .Nil;
-            if (!self.returnSliceIsOwned(completed_ret)) self.alloc.free(completed_ret);
+            if (owned_ret) |slice| self.alloc.free(slice);
             completed_ret = extended;
+            owned_ret = extended;
         }
         // OP_RETURN dispatches the callee's return hook while its frame is
         // still active. Ordinary Lua calls therefore need no second event.
@@ -15477,10 +15639,15 @@ pub const Vm = struct {
         // handler (xpcall) runs inside invokeErrfunc at the throw site, not
         // as a staged child of this protection.
         if (pending.protection != null) {
+            // Protection-wrap edge: the alloc failure is covered by the tag.
             const wrapped = try self.alloc.alloc(Value, completed_ret.len + 1);
             wrapped[0] = .{ .Bool = true };
             @memcpy(wrapped[1..], completed_ret);
-            if (!self.returnSliceIsOwned(completed_ret)) self.alloc.free(completed_ret);
+            if (owned_ret) |slice| self.alloc.free(slice);
+            completed_ret = wrapped;
+            // completeBytecodeProtectedResult adopts the wrapped slice at
+            // entry (its errdefer frees it on failure).
+            owned_ret = null;
             return try self.completeBytecodeProtectedResult(
                 exec_frames,
                 boundary_depth,
@@ -15495,10 +15662,16 @@ pub const Vm = struct {
                     // which can trigger GC via condGcFromDispatch. The child
                     // frame is already popped, so completed_ret's values are
                     // only reachable through this slice — protect them.
+                    // The temp-roots reserve is fallible: the errdefer above
+                    // owns the slice across it.
                     var tail_roots = self.gcTempRoots();
                     defer tail_roots.end();
                     for (completed_ret) |value| try tail_roots.add(value);
                     self.clearPendingCall(exec_frames.getPtr(parent_index));
+                    // beginBytecodeClose adopts the post payload on every
+                    // path (its errdefer frees it pre-publish; the pending
+                    // owns it post-publish) — the exact adoption point.
+                    owned_ret = null;
                     return switch (try self.beginBytecodeClose(
                         exec_frames,
                         boundary_depth,
@@ -15514,18 +15687,44 @@ pub const Vm = struct {
                         .propagate_error => error.RuntimeError,
                     };
                 }
+                // applyBytecodePendingResults adopts the slice at entry
+                // (its errdefer frees it on failure).
+                owned_ret = null;
                 try self.applyBytecodePendingResults(exec_frames, parent_index, completed_ret, cont.dst, callee_nresults);
             },
-            .value => |cont| try self.applyBytecodePendingValue(exec_frames, parent_index, completed_ret, cont),
-            .ignore => self.applyBytecodePendingIgnore(exec_frames, parent_index, completed_ret),
-            .compare => |cont| self.applyBytecodePendingCompare(exec_frames, parent_index, completed_ret, cont),
-            .concat => |cont| try self.applyBytecodePendingConcat(exec_frames, parent_index, completed_ret, cont),
-            .gsub => |cont| return try self.applyBytecodePendingGsub(exec_frames, boundary_depth, parent_index, completed_ret, cont),
-            .hook => |cont| return try self.applyBytecodePendingHook(exec_frames, boundary_depth, parent_index, completed_ret, cont),
-            .close => |cont| switch (try self.applyBytecodePendingClose(exec_frames, boundary_depth, parent_index, completed_ret, cont)) {
-                .resume_dispatch => {},
-                .final => |final| return final,
-                .propagate_error => return error.RuntimeError,
+            // Each remaining arm's apply helper adopts the slice at entry
+            // (entry errdefer/defer or an immediate free).
+            .value => |cont| {
+                owned_ret = null;
+                try self.applyBytecodePendingValue(exec_frames, parent_index, completed_ret, cont);
+            },
+            .ignore => {
+                owned_ret = null;
+                self.applyBytecodePendingIgnore(exec_frames, parent_index, completed_ret);
+            },
+            .compare => |cont| {
+                owned_ret = null;
+                self.applyBytecodePendingCompare(exec_frames, parent_index, completed_ret, cont);
+            },
+            .concat => |cont| {
+                owned_ret = null;
+                try self.applyBytecodePendingConcat(exec_frames, parent_index, completed_ret, cont);
+            },
+            .gsub => |cont| {
+                owned_ret = null;
+                return try self.applyBytecodePendingGsub(exec_frames, boundary_depth, parent_index, completed_ret, cont);
+            },
+            .hook => |cont| {
+                owned_ret = null;
+                return try self.applyBytecodePendingHook(exec_frames, boundary_depth, parent_index, completed_ret, cont);
+            },
+            .close => |cont| {
+                owned_ret = null;
+                switch (try self.applyBytecodePendingClose(exec_frames, boundary_depth, parent_index, completed_ret, cont)) {
+                    .resume_dispatch => {},
+                    .final => |final| return final,
+                    .propagate_error => return error.RuntimeError,
+                }
             },
             .coroutine_resume => unreachable,
         }
@@ -25970,7 +26169,15 @@ pub const Vm = struct {
     /// `LUA_VUPVAL` case — lgc.c:727-740): it is handled INLINE by
     /// `markCell` (open→gray+value, closed→black+value, lgc.c:347-354)
     /// and is structurally excluded from the gray list below.
-    fn gcQueueScanObject(self: *Vm, obj: GcObject) DispatchError!void {
+    ///
+    /// `assume` (comptime): the caller has already reserved one gc_gray
+    /// slot for this call (gcPrepareWriteBarrierCell / gcPrepareForward-
+    /// BarrierCell). The comptime-true instantiation drops the error union
+    /// and uses appendAssumeCapacity — barrier commits stay infallible
+    /// after the observable mutation (P16.50-review-8 §1.2). The comptime
+    /// branch is not analyzed in the other instantiation, so the fallible
+    /// hot path (GC marking) is unchanged.
+    fn gcQueueScanObjectImpl(self: *Vm, obj: GcObject, comptime assume: bool) if (assume) void else DispatchError!void {
         const p = gcPtr(obj);
         // Task 7: invariant — every GcObject passed to gcQueueScanObject is
         // registered in gc_objects. Stale entries (freed objects remaining
@@ -26024,8 +26231,7 @@ pub const Vm = struct {
         // markCell (PUC reallymarkobject LUA_VUPVAL), which sets open→gray
         // or closed→black and marks the value inline — never queues.
         if (obj == .cell) {
-            try self.markCell(obj.cell);
-            return;
+            return self.markCellImpl(obj.cell, assume);
         }
         if (!gcIsWhite(p.marked.*)) return;
         // PUC reallymarkobject: GCmarked += objsize(o). Track marked KB
@@ -26038,8 +26244,25 @@ pub const Vm = struct {
             gcSetBlack(p.marked);
         } else {
             gcSetGray(p.marked);
-            try self.gc_gray.append(self.infraAlloc(), obj);
+            if (assume) {
+                self.gc_gray.appendAssumeCapacity(obj);
+            } else {
+                try self.gc_gray.append(self.infraAlloc(), obj);
+            }
         }
+    }
+
+    /// Fallible entry point (GC marking hot path): the gc_gray append goes
+    /// through the allocator.
+    fn gcQueueScanObject(self: *Vm, obj: GcObject) DispatchError!void {
+        return self.gcQueueScanObjectImpl(obj, false);
+    }
+
+    /// Infallible entry point for barrier commits: the gc_gray slot was
+    /// reserved by the matching gcPrepare* call before the observable
+    /// mutation (P16.50-review-8 §1.2 reserve→mutate→commit protocol).
+    fn gcQueueScanObjectAssume(self: *Vm, obj: GcObject) void {
+        return self.gcQueueScanObjectImpl(obj, true);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -26111,7 +26334,10 @@ pub const Vm = struct {
     /// Accounting preserved: gc_gen_marked_kb (major-cycle marked tracking)
     /// and gc_mark_epoch (ephemeron convergence signal) are bumped when the
     /// cell transitions from white, matching gcQueueScanObject's accounting.
-    fn markCell(self: *Vm, cell: *Cell) DispatchError!void {
+    ///
+    /// `assume` (comptime): the gc_gray slot for the inline value mark was
+    /// reserved by the barrier prepare call — see gcQueueScanObjectImpl.
+    fn markCellImpl(self: *Vm, cell: *Cell, comptime assume: bool) if (assume) void else DispatchError!void {
         if (cell.isOpen()) {
             // Open: PUC reallymarkobject — only process white cells.
             // Non-white open upvalues are already visited (gray from a
@@ -26123,7 +26349,11 @@ pub const Vm = struct {
             // PUC lgc.c:349-350: set2gray(uv) — open upvalues kept gray.
             gcSetGray(&cell.gc_marked);
             // PUC lgc.c:353: markvalue(g, uv->v.p) — mark stack-backed value.
-            try self.gcMarkValue(cell.get(self));
+            if (assume) {
+                self.gcMarkValueImpl(cell.get(self), true);
+            } else {
+                try self.gcMarkValueImpl(cell.get(self), false);
+            }
             self.gc_mark_epoch += 1;
         } else {
             // Closed: mark value unconditionally. Some cells are unregistered
@@ -26141,8 +26371,22 @@ pub const Vm = struct {
                 self.gc_mark_epoch += 1;
             }
             // PUC lgc.c:353: markvalue(g, uv->v.p) — mark inline value.
-            try self.gcMarkValue(cell.value);
+            if (assume) {
+                self.gcMarkValueImpl(cell.value, true);
+            } else {
+                try self.gcMarkValueImpl(cell.value, false);
+            }
         }
+    }
+
+    /// Fallible entry point (GC marking hot path).
+    fn markCell(self: *Vm, cell: *Cell) DispatchError!void {
+        return self.markCellImpl(cell, false);
+    }
+
+    /// Infallible entry point for barrier commits (reserved gc_gray slot).
+    fn markCellAssume(self: *Vm, cell: *Cell) void {
+        return self.markCellImpl(cell, true);
     }
 
     /// PUC `reallymarkobject` called from `markold` (lgc.c:1283) on BLACK
@@ -26168,6 +26412,11 @@ pub const Vm = struct {
     /// (not a GcObject or Value). Delegates to markCell — the single primitive.
     fn gcQueueScanCell(self: *Vm, cell: *Cell) DispatchError!void {
         try self.markCell(cell);
+    }
+
+    /// Infallible variant for barrier commits (reserved gc_gray slot).
+    fn gcQueueScanCellAssume(self: *Vm, cell: *Cell) void {
+        self.markCellAssume(cell);
     }
 
     /// PUC luaC_barrierback_ (lgc.c:208-222) for generational mode.
@@ -26229,20 +26478,95 @@ pub const Vm = struct {
 
     /// PUC luaC_objbarrier(L, f1, *up1) after lua_upvaluejoin (lapi.c:1470):
     /// the closure now references the joined cell — forward barrier. Pub:
-    /// the C-API `lua_upvaluejoin` (c_api.zig) runs the same barrier the
-    /// debug library's upvaluejoin runs.
-    pub fn gcForwardBarrierCell(self: *Vm, owner: *Closure, child: *Cell) DispatchError!void {
+    /// the C-API `lua_upvaluejoin` (c_api.zig) and the debug library's
+    /// upvaluejoin run the same barrier.
+    ///
+    /// P16.50-review-8 §1.1/§1.2: split into a prepare/commit pair so the
+    /// observable re-point (`cl1.upvalues[idx1] = cl2.upvalues[idx2]`)
+    /// happens only when the barrier bookkeeping is already reserved.
+    /// The OLD single-phase fall-through ran `gcWriteBarrier(child.get())`
+    /// — marking only the cell's VALUE, never the CELL itself: a white
+    /// joined cell reachable ONLY through the black owner closure was
+    /// swept (use-after-free). The incremental arm now implements the PUC
+    /// luaC_objbarrier shape exactly (lgc.h:241-243 + lgc.c:246-263):
+    ///   guard: isblack(f1) && iswhite(*up1)
+    ///   keepinvariant (propagate/atomic) → reallymarkobject(*up1)
+    ///     (markCell: open→gray+value, closed→black+value)
+    ///   incremental sweep → makewhite(f1) (the OWNER closure)
+    ///   GENMINOR sweep → no-op (lgc.c:260-261)
+    pub const CellJoinPlan = struct {
+        /// Gen arm: promote the joined CELL to G_OLD0, link it into gc_old1,
+        /// and mark it (PUC luaC_barrier_ keepinvariant + setage(v, G_OLD0)).
+        gen_promote: bool = false,
+        /// Incremental propagate/atomic: mark the joined CELL (markCell).
+        inc_mark: bool = false,
+        /// Incremental sweep: make the OWNER closure white (PUC makewhite(o)
+        /// where o = f1 — the owner is re-traversed next cycle).
+        inc_make_white: bool = false,
+    };
+
+    /// Reserve the barrier bookkeeping for one upvalue join. MUST run
+    /// before the observable re-point; nothing between prepare and commit
+    /// may allocate (the re-point is a pointer store), so the plan stays
+    /// valid at commit time. Reserves an upper bound: gc_gray gets one
+    /// slot iff the cell's value is a collectable non-string (markCell's
+    /// inline value mark), gc_old1 one slot for the cell itself. Spare
+    /// capacity is harmless (the mark may skip white/registry guards).
+    pub fn gcPrepareForwardBarrierCell(self: *Vm, owner: *Closure, child: *Cell) std.mem.Allocator.Error!CellJoinPlan {
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             // PUC luaC_barrier_ sweep arm: GENMINOR sweep → no-op.
-            if (self.gc_state == .sweep) return;
+            if (self.gc_state == .sweep) return .{};
             if (owner.gc_age.isOld() and child.gc_age.isYoung()) {
-                child.gc_age = .old0;
-                try self.gc_old1.append(self.infraAlloc(), .{ .cell = child });
-                try self.gcQueueScanCell(child);
+                const v = if (child.isOpen()) child.get(self) else child.value;
+                switch (v) {
+                    .Table, .Closure, .Thread, .Userdata => try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), 1),
+                    else => {},
+                }
+                try self.gc_old1.ensureUnusedCapacity(self.infraAlloc(), 1);
+                return .{ .gen_promote = true };
             }
+            return .{};
+        }
+        // PUC luaC_objbarrier guard (lgc.h:241): isblack(p) && iswhite(o).
+        if (self.gc_state == .pause) return .{};
+        if (!gcIsBlack(owner.gc_marked) or !gcIsWhite(child.gc_marked)) return .{};
+        switch (self.gc_state) {
+            .propagate, .atomic => {
+                // markCell(child) marks the cell's value inline — one
+                // gc_gray slot iff that value is a collectable non-string
+                // (strings go straight to black; the closed-cell branch
+                // marks its value even when the cell is already black).
+                const v = if (child.isOpen()) child.get(self) else child.value;
+                switch (v) {
+                    .Table, .Closure, .Thread, .Userdata => try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), 1),
+                    else => {},
+                }
+                return .{ .inc_mark = true };
+            },
+            .sweep => return .{ .inc_make_white = true },
+            .pause => return .{},
+        }
+    }
+
+    /// Infallible barrier commit — the matching prepare reserved every
+    /// list slot the plan touches (appendAssumeCapacity contract).
+    pub fn gcCommitForwardBarrierCell(self: *Vm, owner: *Closure, child: *Cell, plan: CellJoinPlan) void {
+        if (plan.gen_promote) {
+            child.gc_age = .old0;
+            self.gc_old1.appendAssumeCapacity(.{ .cell = child });
+            self.gcQueueScanCellAssume(child);
             return;
         }
-        try self.gcWriteBarrier(child.get(self));
+        if (plan.inc_mark) {
+            self.markCellAssume(child);
+            return;
+        }
+        if (plan.inc_make_white) {
+            // PUC luaC_barrier_ sweep arm (lgc.c:261): makewhite(g, o) —
+            // the OWNER closure, so the next cycle re-traverses it and
+            // marks the joined cell properly.
+            gcMakeWhite(&owner.gc_marked, self.gc_current_white);
+        }
     }
 
     /// A6: Clear all generational tracking lists. Called by `gcMakeAllOld`
@@ -26957,12 +27281,32 @@ pub const Vm = struct {
     ///
     /// CLOSED cells: forward barrier. PUC luaC_barrier (lua_setupvalue,
     /// OP_SETUPVAL): isblack(uv) && iswhite(v) → luaC_barrier_ (mark v).
-    pub inline fn gcWriteBarrierCell(self: *Vm, cell: *Cell, value: Value) DispatchError!void {
+    /// P16.50-review-8 §1.2: pre-reserved barrier bookkeeping for one
+    /// closed-cell value store (lua_setupvalue, OP_SETUPVAL). The prepare
+    /// call reserves every gc_gray/gc_old1 slot the commit may touch, so
+    /// the observable store never commits when the barrier cannot.
+    pub const CellWritePlan = struct {
+        /// Gen arm: mark the stored value, promote it to G_OLD0, and link
+        /// it into gc_old1 (PUC luaC_barrier_ keepinvariant + setage).
+        gen_promote: bool = false,
+        /// Incremental propagate/atomic: mark the stored value (PUC
+        /// luaC_barrier_ keepinvariant → reallymarkobject(v)).
+        inc_mark: bool = false,
+        /// Incremental sweep: make the CELL white (PUC makewhite(o) where
+        /// o = the cell — the owner of the stored reference).
+        inc_make_white: bool = false,
+    };
+
+    /// Reserve the barrier bookkeeping for one cell-value store. MUST run
+    /// before the observable store; nothing between prepare and commit may
+    /// allocate (the store is a value write), so the plan stays valid at
+    /// commit time. Reserves an upper bound — spare capacity is harmless.
+    pub fn gcPrepareWriteBarrierCell(self: *Vm, cell: *Cell, value: Value) std.mem.Allocator.Error!CellWritePlan {
         // OPEN cells: no barrier (PUC never barriers open upvalue writes).
         // The stack slot is the authoritative location; thread traversal
         // and remarkupvals handle marking. Early return prevents any
         // black-owner forward barrier invention for open cells.
-        if (cell.isOpen()) return;
+        if (cell.isOpen()) return .{};
         // Generational mode: forward barrier — mark the value and promote
         // it to old0 if the cell is old and the value is young.
         // PUC luaC_barrier (lgc.h:245) → luaC_barrier_ (lgc.c:246):
@@ -26976,7 +27320,7 @@ pub const Vm = struct {
             // traversal; marking/promoting here would allocate inside
             // the young sweep (whose allocation-freedom the pre-reserve
             // guarantees cover only for the promote paths).
-            if (self.gc_state == .sweep) return;
+            if (self.gc_state == .sweep) return .{};
             if (cell.gc_age.isOld()) {
                 if (gcValueAge(value)) |age| {
                     if (age.isYoung()) {
@@ -26988,34 +27332,72 @@ pub const Vm = struct {
                         // Using gcSetBlack here would mark the value BLACK
                         // without traversing its children → children stay
                         // WHITE → freed by sweep → use-after-free.
-                        const child_obj = GcObject.fromValue(value) orelse return;
-                        try self.gcQueueScanObject(child_obj);
-                        gcPtr(child_obj).age.* = .old0;
-                        try self.gc_old1.append(self.infraAlloc(), child_obj);
+                        const child_obj = GcObject.fromValue(value) orelse return .{};
+                        // gcQueueScanObject appends to gc_gray iff the
+                        // value is a non-string (strings go straight to
+                        // black); gc_old1 takes the promoted value itself.
+                        if (child_obj != .string) try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), 1);
+                        try self.gc_old1.ensureUnusedCapacity(self.infraAlloc(), 1);
+                        return .{ .gen_promote = true };
                     }
                 }
             }
-            return;
+            return .{};
         }
-        if (self.gc_state == .pause) return;
-        if (!gcIsBlack(cell.gc_marked)) return;
+        if (self.gc_state == .pause) return .{};
+        if (!gcIsBlack(cell.gc_marked)) return .{};
         // PUC luaC_barrier_: if keepinvariant (propagate/atomic), mark the
         // value to restore the invariant. In sweep phase, make the owner
         // white instead — the value will be visited in the next collection.
         switch (self.gc_state) {
             .propagate, .atomic => {
-                // Forward barrier: mark the value.
+                // Forward barrier: mark the value. PUC luaC_barrier marks
+                // every collectable value (iscollectable, lgc.h:246) —
+                // userdata included; the old arm dropped it, leaving a
+                // userdata stored into a black closed cell white → swept
+                // (pre-existing gap fixed here with the restructuring).
+                // gcMarkValue appends to gc_gray iff the value is a
+                // collectable non-string (strings go straight to black).
                 switch (value) {
-                    .Table, .Closure, .Thread, .String => try self.gcMarkValue(value),
+                    .Table, .Closure, .Thread, .Userdata => try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), 1),
                     else => {},
                 }
+                return .{ .inc_mark = true };
             },
-            .sweep => {
-                // Make owner white (PUC luaC_makewhite in sweep phase).
-                gcMakeWhite(&cell.gc_marked, self.gc_current_white);
-            },
-            .pause => {},
+            .sweep => return .{ .inc_make_white = true },
+            .pause => return .{},
         }
+    }
+
+    /// Infallible barrier commit — the matching prepare reserved every
+    /// list slot the plan touches (appendAssumeCapacity contract).
+    pub fn gcCommitWriteBarrierCell(self: *Vm, cell: *Cell, value: Value, plan: CellWritePlan) void {
+        if (plan.gen_promote) {
+            const child_obj = GcObject.fromValue(value).?;
+            self.gcQueueScanObjectAssume(child_obj);
+            gcPtr(child_obj).age.* = .old0;
+            self.gc_old1.appendAssumeCapacity(child_obj);
+            return;
+        }
+        if (plan.inc_mark) {
+            self.gcMarkValueAssume(value);
+            return;
+        }
+        if (plan.inc_make_white) {
+            // Make owner white (PUC luaC_makewhite in sweep phase).
+            gcMakeWhite(&cell.gc_marked, self.gc_current_white);
+        }
+    }
+
+    /// Single-phase cell write barrier (prepare + commit fused). Kept for
+    /// the upvalue-close sites (closeBytecodeUpvaluesFrom, thread teardown):
+    /// they run inside allocation-free close loops whose own reserve-first
+    /// restructuring is tracked as a separate finding (P16.50-review-8
+    /// report) — the barrier target (the VALUE) is correct there, only the
+    /// post-commit OOM swallowing remains.
+    pub inline fn gcWriteBarrierCell(self: *Vm, cell: *Cell, value: Value) DispatchError!void {
+        const plan = try self.gcPrepareWriteBarrierCell(cell, value);
+        self.gcCommitWriteBarrierCell(cell, value, plan);
     }
 
     /// Legacy barrier that marks any value unconditionally. Kept for sites
@@ -27029,6 +27411,11 @@ pub const Vm = struct {
     }
 
     inline fn gcStoreCellValue(self: *Vm, cell: *Cell, value: Value) DispatchError!void {
+        // P16.50-review-8 §1.2: reserve the barrier bookkeeping BEFORE the
+        // observable store (PUC's barrier is infallible; ours must not fail
+        // after the write commits). Nothing between prepare and commit
+        // allocates, so the plan is still valid at commit time.
+        const plan = try self.gcPrepareWriteBarrierCell(cell, value);
         // Use cell.set() to properly handle open upvalues (writes to stack
         // slot) vs closed upvalues (writes to cell.value).
         cell.set(self, value);
@@ -27037,7 +27424,7 @@ pub const Vm = struct {
         // call luaC_barrierback_ on upvalues. The forward barrier marks
         // the new value and promotes it to OLD0 if the cell is old and
         // the value is young. No backward barrier (no grayagain insertion).
-        try self.gcWriteBarrierCell(cell, value);
+        self.gcCommitWriteBarrierCell(cell, value, plan);
     }
 
     pub inline fn gcStoreMetatable(self: *Vm, table: *Table, metatable: ?*Table) DispatchError!void {
@@ -28693,7 +29080,10 @@ pub const Vm = struct {
     /// instead of a per-type switch on Value. The gc_mark_epoch bump tracks
     /// whether any white→gray/black transition occurred during this call,
     /// which gcPropagateEphemerons uses as its fixpoint convergence signal.
-    fn gcMarkValue(self: *Vm, v: Value) DispatchError!void {
+    ///
+    /// `assume` (comptime): the gc_gray slot was reserved by the barrier
+    /// prepare call — see gcQueueScanObjectImpl.
+    fn gcMarkValueImpl(self: *Vm, v: Value, comptime assume: bool) if (assume) void else DispatchError!void {
         const obj = GcObject.fromValue(v) orelse return;
         // Precise-liveness safety skip — see the full rationale in
         // gcQueueScanObject below. The check must live HERE too (before any
@@ -28713,8 +29103,22 @@ pub const Vm = struct {
         }
         const p = gcPtr(obj);
         const was_white = gcIsWhite(p.marked.*);
-        try self.gcQueueScanObject(obj);
+        if (assume) {
+            self.gcQueueScanObjectImpl(obj, true);
+        } else {
+            try self.gcQueueScanObjectImpl(obj, false);
+        }
         if (was_white) self.gc_mark_epoch += 1;
+    }
+
+    /// Fallible entry point (GC marking hot path).
+    fn gcMarkValue(self: *Vm, v: Value) DispatchError!void {
+        return self.gcMarkValueImpl(v, false);
+    }
+
+    /// Infallible entry point for barrier commits (reserved gc_gray slot).
+    fn gcMarkValueAssume(self: *Vm, v: Value) void {
+        return self.gcMarkValueImpl(v, true);
     }
 
     /// Propagate exactly one gray object. Child references are appended to the
@@ -30182,28 +30586,11 @@ pub const Vm = struct {
         if (proto.name().len > 0) {
             proto.setName(try dupeOwned(self, owner, proto.name()));
         }
-        // upvalue names — upvalues is []const, need mutable copy.
-        // P16.50-review-5: the undumped array is superseded by `uvs`; it
-        // must be freed here, not orphaned (the orphan leaked it in the
-        // testc ledger and in real heap terms on every binary load).
-        // On a mid-loop failure `uvs` itself would be orphaned — errdefer
-        // frees it; `proto.upvalues` is still the intact old array, so the
-        // tree stays consistent for the caller's error cleanup.
-        if (proto.upvalues.len > 0) {
-            const uvs = try self.alloc.alloc(bc.Upvaldesc, proto.upvalues.len);
-            errdefer self.alloc.free(uvs);
-            for (proto.upvalues, 0..) |uv, i| {
-                const nm = uv.name();
-                uvs[i] = bc.Upvaldesc.make(
-                    uv.instack,
-                    uv.idx,
-                    uv.is_const,
-                    if (nm.len > 0) try dupeOwned(self, owner, nm) else nm,
-                );
-            }
-            self.alloc.free(proto.upvalues);
-            proto.upvalues = uvs;
-        }
+        // Upvalue names need NO re-copy here (P16.50-review-8 §1.3):
+        // undumpProto already made them self-contained — non-fixed trees
+        // carry them in the fused upvalue-name tail, fixed 'B' trees alias
+        // the stable dump buffer (NUL-terminated in place by the dump
+        // encoding).
         // locvar names — locvars is []const, need mutable copy.
         // Same supersede discipline as upvalues above (P16.50-review-5).
         if (proto.locvars.len > 0) {
@@ -32833,11 +33220,18 @@ pub const Vm = struct {
     /// no proto). Pub: the C-API upvalue primitives (lua_getupvalue/
     /// lua_setupvalue) resolve names through this — the SAME names the
     /// debug library hands out, never a re-derivation.
-    pub fn debugUpvalueName(cl: *const Closure, uidx: usize) []const u8 {
+    ///
+    /// P16.50-review-8 §1.3: the return is NUL-terminated — proto names
+    /// live in the fused upvalue-name tail (ProtoBuilder.finish /
+    /// non-fixed undumpProto) or alias the stable dump buffer (fixed 'B'
+    /// loads), so the C API hands the bytes out directly (PUC parity:
+    /// `lua_getupvalue` returns `getstr(name)` without allocating). The
+    /// literals below are static and NUL-terminated.
+    pub fn debugUpvalueName(cl: *const Closure, uidx: usize) [:0]const u8 {
         // For bytecode closures, upvalue names live in the Proto.
         if (cl.proto) |p| {
             if (uidx < p.upvalues.len) {
-                const nm = p.upvalues[uidx].name();
+                const nm = p.upvalues[uidx].nameZ();
                 if (nm.len != 0) return nm;
             }
             if (uidx == 0 and p.line_defined == 0) return "_ENV";
@@ -32955,8 +33349,13 @@ pub const Vm = struct {
         const idx1: usize = @intCast(n1 - 1);
         const idx2: usize = @intCast(n2 - 1);
         if (idx1 >= f1.upvalues.len or idx2 >= f2.upvalues.len) return self.fail("invalid upvalue index", .{});
+        // P16.50-review-8 §1.1/§1.2: reserve the forward-barrier bookkeeping
+        // BEFORE the observable re-point; the barrier targets the joined
+        // CELL (PUC luaC_objbarrier(L, f1, *up1)), not just its value.
+        const plan = try self.gcPrepareForwardBarrierCell(f1, f2.upvalues[idx2]);
+        // PUC `*up1 = *up2`: re-point f1's upvalue slot to f2's upvalue cell.
         @constCast(f1.upvalues)[idx1] = f2.upvalues[idx2];
-        try self.gcForwardBarrierCell(f1, f2.upvalues[idx2]);
+        self.gcCommitForwardBarrierCell(f1, f2.upvalues[idx2], plan);
     }
 
     /// PUC `luaD_hook` (ldo.c:439): dispatch a hook event. The `event`
@@ -37260,7 +37659,9 @@ pub const Vm = struct {
         // metamethod (valueToStringAlloc → callMetamethod) on THIS thread,
         // which can grow bc_stack and move the registered window.
         const outw = self.refreshBuiltinOuts() orelse outs;
-        const istr = try self.internStr(try out.toOwnedSlice(self.alloc));
+        const owned = try out.toOwnedSlice(self.alloc);
+        defer self.alloc.free(owned);
+        const istr = try self.internStr(owned);
         outw[0] = .{ .String = istr };
     }
 
@@ -37533,7 +37934,9 @@ pub const Vm = struct {
                 else => return self.fail("invalid format option '{c}'", .{ch}),
             }
         }
-        const istr = try self.internStr(try out.toOwnedSlice(self.alloc));
+        const owned = try out.toOwnedSlice(self.alloc);
+        defer self.alloc.free(owned);
+        const istr = try self.internStr(owned);
         outs[0] = .{ .String = istr };
     }
 
@@ -37972,7 +38375,9 @@ pub const Vm = struct {
             if (iv < 0 or iv > 255) return self.fail("string.char value out of range", .{});
             try out.append(self.alloc, @intCast(iv));
         }
-        const istr = try self.internStr(try out.toOwnedSlice(self.alloc));
+        const owned = try out.toOwnedSlice(self.alloc);
+        defer self.alloc.free(owned);
+        const istr = try self.internStr(owned);
         outs[0] = .{ .String = istr };
     }
 
@@ -39424,7 +39829,9 @@ pub const Vm = struct {
             if (outw.len > 1) outw[1] = .{ .Int = @intCast(count) };
             return;
         }
-        const istr2 = try self.internStr(try out.toOwnedSlice(self.alloc));
+        const owned2 = try out.toOwnedSlice(self.alloc);
+        defer self.alloc.free(owned2);
+        const istr2 = try self.internStr(owned2);
         outw[0] = .{ .String = istr2 };
         if (outw.len > 1) outw[1] = .{ .Int = @intCast(count) };
     }
@@ -39718,7 +40125,9 @@ pub const Vm = struct {
             };
             try self.encodeUtf8Scalar(&out, cp);
         }
-        const istr = try self.internStr(try out.toOwnedSlice(self.alloc));
+        const owned = try out.toOwnedSlice(self.alloc);
+        defer self.alloc.free(owned);
+        const istr = try self.internStr(owned);
         outs[0] = .{ .String = istr };
     }
 
@@ -52154,11 +52563,13 @@ test "P16.50-review T1: opClosure mixed-upvalue OOM matrix (production dispatch)
     // boxed slots only ever hold OPEN cells; a closed occupant is the only
     // shape that reaches opClosure's `gcStoreCellValue(boxed[a])` branch).
     // cell_c is OLD, so the generational forward barrier fires for the
-    // young closure value. Allocation map: #0 the cells array, #1 the Cell,
-    // #2 the Closure, #3 gc_gray.append (gcQueueScanObject), #4 gc_old1
-    // .append (the old0 promotion); success at 5. gc_gray/gc_old1 are
-    // deinit'd per iteration (a minor re-grows their capacity) so the
-    // barrier appends really allocate and the map stays deterministic. ----
+    // young closure value. Allocation map (P16.50-review-8 §1.2 order —
+    // reserve BEFORE the store): #0 the cells array, #1 the Cell, #2 the
+    // Closure, #3 gc_gray.ensureUnusedCapacity, #4 gc_old1
+    // .ensureUnusedCapacity (both in gcPrepareWriteBarrierCell, BEFORE
+    // cell.set); success at 5. gc_gray/gc_old1 are deinit'd per iteration
+    // (a minor re-grows their capacity) so the reserves really allocate
+    // and the map stays deterministic. ----
     th.bytecode_boxed[5] = cell_c;
     fail_idx = 0;
     tested_failures = 0;
@@ -52202,7 +52613,7 @@ test "P16.50-review T1: opClosure mixed-upvalue OOM matrix (production dispatch)
             // undo the barrier's side effects on the SHARED cell_c and the
             // aux lists (they hold the freed closure), then the fresh cell.
             p50TeardownClosure(&vm, cl);
-            cell_c.value = .{ .Int = 100 }; // undo cell.set (see finding 1 below)
+            cell_c.value = .{ .Int = 100 }; // undo the committed cell.set
             vm.gc_gray.clearRetainingCapacity(); // drop the freed closure
             vm.gc_old1.clearRetainingCapacity();
             p50TeardownCell(&vm, cell_y);
@@ -52221,36 +52632,25 @@ test "P16.50-review T1: opClosure mixed-upvalue OOM matrix (production dispatch)
             try testing.expect(p50IsRegistered(&vm, .{ .cell = cell_x }));
             try testing.expect(th.bytecode_boxed[4] == null);
             try testing.expect(std.meta.eql(th.bytecode_stack[4], .{ .Int = 2 }));
-            // FINDING 1 (documented, not fixed here): gcStoreCellValue runs
-            // cell.set BEFORE the fallible barrier, and the errdefer does
-            // not undo it — at fail_idx >= 3 the CLOSED cell_c still holds
-            // the (now dangling) closure value. Unreachable through real
-            // dispatch (production boxed slots only hold OPEN cells, and
-            // cell.set on an open cell writes the stack slot, which the
-            // register restore covers).
-            if (fail_idx >= 3) {
-                try testing.expect(cell_c.value == .Closure);
-            } else {
-                try testing.expect(std.meta.eql(cell_c.value, .{ .Int = 100 }));
-            }
-            // P16.50-review-5: the partial-barrier FINDING (#2, documented
-            // residual) is now detected by SHAPE, not by a fixed index —
-            // the allocation map shifted when constructor paths gained
-            // prepare/temp-root allocations. A partial barrier failure
-            // (gc_gray.append ok, gc_old1.append failed) leaves one gray
-            // entry; a failure BEFORE the barrier leaves both empty.
-            if (vm.gc_gray.items.len == 1) {
-                try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
-            } else {
-                try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
-            }
+            // P16.50-review-8 §1.2 (fixes the old FINDING 1 residual): the
+            // barrier reserve now runs BEFORE cell.set — when the reserve
+            // fails (fail_idx >= 3) the store is SKIPPED entirely, so the
+            // SHARED cell_c never holds the rolled-back closure pointer.
+            // The old order (set, then fallible barrier) committed the
+            // store and left a dangling closure value in cell_c.
+            try testing.expect(std.meta.eql(cell_c.value, .{ .Int = 100 }));
+            // Reserve-first also makes partial barrier states impossible:
+            // both list slots are reserved (or the error is thrown) before
+            // either append runs — a failure never leaves one list holding
+            // the would-be-promoted object.
+            try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
             try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
             // P16.50-review fix applied: the post-commit rollback now
             // destroys the Closure struct too (errdefer closure_committed
-            // branch) — no compensation needed. FINDING 1 (the un-rolled-
-            // back cell.set holding the closure pointer) remains a
-            // documented residual: unreachable via real dispatch (boxed
-            // slots only ever hold OPEN cells in production).
+            // branch) — no compensation needed. P16.50-review-8 §1.2
+            // closed the old FINDING 1 residual: the reserve-first order
+            // means a barrier OOM never leaves a stored (dangling) value
+            // behind — cell_c.value is untouched on every failure index.
             cell_c.value = .{ .Int = 100 };
             vm.gc_gray.clearRetainingCapacity();
             try snap.assertRestored(&vm);
@@ -52274,6 +52674,595 @@ test "P16.50-review T1: opClosure mixed-upvalue OOM matrix (production dispatch)
     // The fill tables and the chunk closure stay registered (old) until
     // vm.deinit — the established fill-table pattern (see the Part B test
     // above).
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// P16.50-review-8 §1.1/§1.2: upvalue-join / setupvalue barrier tests.
+// The fixture compiles+runs a chunk producing two closures with one CLOSED
+// cell each; the tests drive every GC arm the prepare/commit barrier pair
+// has (incremental propagate/atomic/sweep, generational promote) and the
+// OOM edges of each reserve.
+// ═══════════════════════════════════════════════════════════════════════
+
+const P50r8Pair = struct {
+    donor: *Closure,
+    owner: *Closure,
+    donor_cell: *Cell,
+    owner_cell: *Cell,
+    donor_val: *Table,
+    owner_val: *Table,
+};
+
+/// Compile+run `local function mk(v) local x = v return function() return
+/// x end end return mk({}), mk({})`. results[0] is the DONOR (created
+/// FIRST — its cell precedes the owner's in gc_objects, which the
+/// sweep-phase test relies on), results[1] the OWNER (join target). Each
+/// closure has ONE CLOSED cell capturing a distinct table. The chunk
+/// closure stays registered but unrooted — callers decide what survives
+/// via gcTempRoots.
+fn p50r8MkPair(vm: *Vm) !P50r8Pair {
+    const src =
+        \\local function mk (v)
+        \\  local x = v
+        \\  return function() return x end
+        \\end
+        \\return mk({}), mk({})
+    ;
+    const chunk_v = try vm.compileChunkValue(src, "=p50r8-mk");
+    const cl = chunk_v.Closure;
+    const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+    defer vm.alloc.free(results); // opReturn dupes via infraAlloc
+    if (results.len != 2) return error.TestUnexpectedResultCount;
+    const donor = switch (results[0]) {
+        .Closure => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    const owner = switch (results[1]) {
+        .Closure => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    const donor_cell = donor.upvalues[0];
+    const owner_cell = owner.upvalues[0];
+    if (donor_cell.isOpen() or owner_cell.isOpen()) return error.TestUnexpectedResult;
+    const donor_val = switch (donor_cell.value) {
+        .Table => |t| t,
+        else => return error.TestUnexpectedResult,
+    };
+    const owner_val = switch (owner_cell.value) {
+        .Table => |t| t,
+        else => return error.TestUnexpectedResult,
+    };
+    return .{
+        .donor = donor,
+        .owner = owner,
+        .donor_cell = donor_cell,
+        .owner_cell = owner_cell,
+        .donor_val = donor_val,
+        .owner_val = owner_val,
+    };
+}
+
+/// Count how often `obj` appears in a GcObject list (exactly-once
+/// publication checks — count-based, robust to unrelated list traffic).
+fn p50r8Count(list: []const GcObject, obj: GcObject) usize {
+    var n: usize = 0;
+    for (list) |o| {
+        if (std.meta.eql(o, obj)) n += 1;
+    }
+    return n;
+}
+
+test "P16.50-review-8 1.1: joined Cell survives an incremental propagate cycle" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    const fx = try p50r8MkPair(&vm);
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    // Root ONLY the owner: the donor (closure, cell, table) must stay
+    // white so the join's forward barrier has a white child to protect.
+    try roots.add(.{ .Closure = fx.owner });
+
+    try vm.gcStartCycle(true);
+    // Drain until the owner is black and out of the gray list. The donor
+    // is unreachable and stays white.
+    while (true) {
+        const black = gcIsBlack(fx.owner.gc_marked);
+        const in_gray = p50r8Count(vm.gc_gray.items, .{ .closure = fx.owner }) != 0;
+        if (black and !in_gray) break;
+        const more = try vm.gcPropagateOne();
+        try testing.expect(more);
+    }
+    try testing.expect(gcIsBlack(fx.owner.gc_marked));
+    try testing.expect(gcIsWhite(fx.donor_cell.gc_marked));
+
+    // Join: reserve → re-point → commit (the builtinDebugUpvaluejoin order).
+    const plan = try vm.gcPrepareForwardBarrierCell(fx.owner, fx.donor_cell);
+    try testing.expect(plan.inc_mark);
+    @constCast(fx.owner.upvalues)[0] = fx.donor_cell;
+    vm.gcCommitForwardBarrierCell(fx.owner, fx.donor_cell, plan);
+
+    // The §1.1 fix: the barrier marked the CELL itself, not just its value.
+    try testing.expect(gcIsBlack(fx.donor_cell.gc_marked));
+
+    // Finish the cycle (atomic + sweep). The joined cell and its table are
+    // reachable ONLY through the owner: the old code (barrier on the VALUE
+    // alone) left the cell dead-white and the sweep freed it.
+    while (vm.gc_state != .pause) {
+        _ = try vm.gcAdvance(1, false);
+    }
+    try testing.expect(p50IsRegistered(&vm, .{ .cell = fx.donor_cell }));
+    try testing.expect(p50IsRegistered(&vm, .{ .table = fx.donor_val }));
+    try testing.expect(std.meta.eql(fx.donor_cell.value, .{ .Table = fx.donor_val }));
+    try testing.expect(fx.owner.upvalues[0] == fx.donor_cell);
+    try testing.expect(p50IsRegistered(&vm, .{ .closure = fx.owner }));
+}
+
+test "P16.50-review-8 1.1: joined Cell survives at the atomic boundary" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    const fx = try p50r8MkPair(&vm);
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(.{ .Closure = fx.owner });
+
+    try vm.gcStartCycle(true);
+    // Drain the propagate phase completely (gcPropagateOne never changes
+    // gc_state — the builtinTestcGcstate "enteratomic" idiom).
+    while (try vm.gcPropagateOne()) {}
+    try testing.expect(vm.gc_state == .propagate);
+    try testing.expect(gcIsBlack(fx.owner.gc_marked));
+    try testing.expect(gcIsWhite(fx.donor_cell.gc_marked));
+    vm.gc_state = .atomic;
+
+    const plan = try vm.gcPrepareForwardBarrierCell(fx.owner, fx.donor_cell);
+    try testing.expect(plan.inc_mark);
+    @constCast(fx.owner.upvalues)[0] = fx.donor_cell;
+    vm.gcCommitForwardBarrierCell(fx.owner, fx.donor_cell, plan);
+    try testing.expect(gcIsBlack(fx.donor_cell.gc_marked));
+
+    while (vm.gc_state != .pause) {
+        _ = try vm.gcAdvance(1, false);
+    }
+    try testing.expect(p50IsRegistered(&vm, .{ .cell = fx.donor_cell }));
+    try testing.expect(p50IsRegistered(&vm, .{ .table = fx.donor_val }));
+    try testing.expect(fx.owner.upvalues[0] == fx.donor_cell);
+}
+
+test "P16.50-review-8 1.1: join during incremental sweep makewhites the owner" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    // Hand-built scenario (T1 keeper pattern) with a controlled registry:
+    // the sweep frees dead objects with swapRemove, which REORDERS
+    // gc_objects — a compile+run fixture leaves an unreachable staging
+    // closure behind, and its death moves the owner closure before the
+    // donor cell (observed). Registering exactly [donor_val, donor_cell,
+    // owner_cell, owner, keeper] with nothing dead keeps the donor cell
+    // provably ahead of the owner. The propagate/atomic tests above cover
+    // the full production shape; this test stages the sweep arm.
+    const donor_val = try vm.allocTableNoGc();
+    const donor_cell = try vm.alloc.create(Cell);
+    donor_cell.* = .{ .value = .{ .Table = donor_val } }; // closed
+    try vm.gcPrepareRegister(1);
+    vm.gcRegisterCommit(.{ .cell = donor_cell });
+    vm.gcNoteAlloc(@sizeOf(Cell));
+
+    const owner_cell = try vm.alloc.create(Cell);
+    owner_cell.* = .{ .value = .{ .Int = 1 } }; // closed
+    try vm.gcPrepareRegister(1);
+    vm.gcRegisterCommit(.{ .cell = owner_cell });
+    vm.gcNoteAlloc(@sizeOf(Cell));
+
+    const owner_upvs = try vm.alloc.alloc(*Cell, 1);
+    owner_upvs[0] = owner_cell;
+    try vm.gcPrepareRegister(1);
+    const owner = try vm.alloc.create(Closure);
+    owner.* = .{ .upvalues = owner_upvs, .c_func = p50Cfunc };
+    vm.gcRegisterCommit(.{ .closure = owner });
+    vm.gcNoteAlloc(@sizeOf(Closure) + @sizeOf(*Cell));
+
+    // Keeper: roots both cells through the cycle (cells are not Values —
+    // the only temp-root mechanism for them is a closure's upvalue list).
+    const keeper_upvs = try vm.alloc.alloc(*Cell, 2);
+    keeper_upvs[0] = donor_cell;
+    keeper_upvs[1] = owner_cell;
+    try vm.gcPrepareRegister(1);
+    const keeper = try vm.alloc.create(Closure);
+    keeper.* = .{ .upvalues = keeper_upvs, .c_func = p50Cfunc };
+    vm.gcRegisterCommit(.{ .closure = keeper });
+    vm.gcNoteAlloc(@sizeOf(Closure) + 2 * @sizeOf(*Cell));
+
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(.{ .Closure = owner });
+    try roots.add(.{ .Closure = keeper });
+
+    try vm.gcStartCycle(true);
+    while (try vm.gcPropagateOne()) {}
+    vm.gc_state = .atomic;
+    try vm.gcAtomicPhase();
+    try testing.expect(vm.gc_state == .sweep);
+    // A well-formed program reaches the sweep arm only with a current-
+    // white ALIVE child: the donor cell was marked black earlier in the
+    // cycle (rooted through the keeper) and the sweep makewhites it as it
+    // passes.
+    try testing.expect(gcIsBlack(donor_cell.gc_marked));
+    try testing.expect(gcIsBlack(owner.gc_marked));
+
+    // Step the sweep until it makewhites the donor cell. The owner closure
+    // sits LATER in gc_objects (registered after, nothing dead → no
+    // swapRemove reordering) and is still black.
+    while ((donor_cell.gc_marked & WHITEBITS) != (vm.gc_current_white & WHITEBITS)) {
+        const more = try vm.gcSweepOne();
+        try testing.expect(more);
+    }
+    try testing.expect(gcIsBlack(owner.gc_marked));
+
+    // Join during the sweep: PUC luaC_barrier_ (lgc.c:261) makewhites the
+    // OWNER closure — no gray-list pollution mid-sweep. The sweep arm is
+    // allocation-free: a fail_index=0 adapter must never be consulted.
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+        .fail_index = 0,
+        .resize_fail_index = 0,
+    });
+    const saved_alloc = vm.alloc;
+    vm.alloc = failing.allocator();
+    const plan = try vm.gcPrepareForwardBarrierCell(owner, donor_cell);
+    vm.alloc = saved_alloc;
+    try testing.expect(plan.inc_make_white);
+    @constCast(owner.upvalues)[0] = donor_cell;
+    vm.gcCommitForwardBarrierCell(owner, donor_cell, plan);
+
+    try testing.expect((owner.gc_marked & WHITEBITS) == (vm.gc_current_white & WHITEBITS));
+    try testing.expect((owner.gc_marked & BLACKBIT) == 0);
+    try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
+
+    // Finish the sweep: everything survives (all rooted), identity shared.
+    while (try vm.gcSweepOne()) {}
+    try vm.gcFinishCycle();
+    try testing.expect(vm.gc_state == .pause);
+    try testing.expect(p50IsRegistered(&vm, .{ .cell = donor_cell }));
+    try testing.expect(p50IsRegistered(&vm, .{ .table = donor_val }));
+    try testing.expect(p50IsRegistered(&vm, .{ .closure = owner }));
+    try testing.expect(owner.upvalues[0] == donor_cell);
+    try testing.expect(std.meta.eql(donor_cell.value, .{ .Table = donor_val }));
+}
+
+test "P16.50-review-8 1.2: generational join promotes the young Cell exactly once" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    // Owner created BEFORE entering generational mode → OLD after the
+    // enter cycle; donor created AFTER → YOUNG.
+    const owner_pair = try p50r8MkPair(&vm);
+    try roots.add(.{ .Closure = owner_pair.owner });
+    try vm.gcEnterGenerational();
+    try testing.expect(owner_pair.owner.gc_age.isOld());
+    try testing.expect(owner_pair.owner_cell.gc_age.isOld());
+
+    const donor_pair = try p50r8MkPair(&vm);
+    try roots.add(.{ .Closure = donor_pair.donor });
+    try testing.expect(donor_pair.donor_cell.gc_age.isYoung());
+
+    const plan = try vm.gcPrepareForwardBarrierCell(owner_pair.owner, donor_pair.donor_cell);
+    try testing.expect(plan.gen_promote);
+    @constCast(owner_pair.owner.upvalues)[0] = donor_pair.donor_cell;
+    vm.gcCommitForwardBarrierCell(owner_pair.owner, donor_pair.donor_cell, plan);
+
+    // Promotion published exactly once: age G_OLD0, one gc_old1 entry for
+    // the cell, the cell black, its table queued gray exactly once.
+    try testing.expect(donor_pair.donor_cell.gc_age == .old0);
+    try testing.expectEqual(
+        @as(usize, 1),
+        p50r8Count(vm.gc_old1.items, .{ .cell = donor_pair.donor_cell }),
+    );
+    try testing.expect(gcIsBlack(donor_pair.donor_cell.gc_marked));
+    try testing.expectEqual(
+        @as(usize, 1),
+        p50r8Count(vm.gc_gray.items, .{ .table = donor_pair.donor_val }),
+    );
+
+    // A real minor collection keeps the promoted cell + its table alive
+    // (reachable only through the old owner).
+    try vm.gcMinorCollection();
+    try testing.expect(p50IsRegistered(&vm, .{ .cell = donor_pair.donor_cell }));
+    try testing.expect(p50IsRegistered(&vm, .{ .table = donor_pair.donor_val }));
+    try testing.expect(std.meta.eql(donor_pair.donor_cell.value, .{ .Table = donor_pair.donor_val }));
+    try testing.expect(owner_pair.owner.upvalues[0] == donor_pair.donor_cell);
+}
+
+test "P16.50-review-8 1.2: generational setupvalue promotes the young value exactly once" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    const owner_pair = try p50r8MkPair(&vm);
+    try roots.add(.{ .Closure = owner_pair.owner });
+    try vm.gcEnterGenerational();
+    try testing.expect(owner_pair.owner_cell.gc_age.isOld());
+
+    // Fresh young table stored into the OLD closed cell (the lua_setupvalue
+    // / OP_SETUPVAL shape). Unrooted: it must survive only via the barrier.
+    const young = try vm.allocTableNoGc();
+    try testing.expect(young.gc_age.isYoung());
+
+    try vm.gcStoreCellValue(owner_pair.owner_cell, .{ .Table = young });
+
+    try testing.expect(young.gc_age == .old0);
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = young }));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = young }));
+    try testing.expect(std.meta.eql(owner_pair.owner_cell.value, .{ .Table = young }));
+
+    try vm.gcMinorCollection();
+    try testing.expect(p50IsRegistered(&vm, .{ .table = young }));
+    try testing.expect(std.meta.eql(owner_pair.owner_cell.value, .{ .Table = young }));
+}
+
+test "P16.50-review-8 1.2: generational join reserve OOM leaves state byte-exact" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    const owner_pair = try p50r8MkPair(&vm);
+    try roots.add(.{ .Closure = owner_pair.owner });
+    try vm.gcEnterGenerational();
+    const donor_pair = try p50r8MkPair(&vm);
+    try roots.add(.{ .Closure = donor_pair.donor });
+
+    // Force both reserves to really allocate (T1 Segment B idiom).
+    vm.gc_gray.deinit(testing.allocator);
+    vm.gc_gray = .empty;
+    vm.gc_old1.deinit(testing.allocator);
+    vm.gc_old1 = .empty;
+
+    // Edge 0 (gc_gray reserve — the cell's table value) and edge 1
+    // (gc_old1 reserve — the cell itself; the gray reserve succeeded with
+    // capacity only, still zero items). The re-point must NOT have
+    // happened and nothing may be promoted or published.
+    for ([_]usize{ 0, 1 }) |edge| {
+        const cell_age = donor_pair.donor_cell.gc_age;
+        const cell_mark = donor_pair.donor_cell.gc_marked;
+        const uv0 = owner_pair.owner.upvalues[0];
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = edge,
+            .resize_fail_index = edge,
+        });
+        const saved = vm.alloc;
+        vm.alloc = failing.allocator();
+        const plan = vm.gcPrepareForwardBarrierCell(owner_pair.owner, donor_pair.donor_cell);
+        vm.alloc = saved;
+        try testing.expectError(error.OutOfMemory, plan);
+        try testing.expect(donor_pair.donor_cell.gc_age == cell_age);
+        try testing.expect(donor_pair.donor_cell.gc_marked == cell_mark);
+        try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
+        try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
+        try testing.expect(owner_pair.owner.upvalues[0] == uv0);
+    }
+
+    // GENMINOR-sweep arm (PUC lgc.c:260-261): a deliberate no-op — armed
+    // fail_index=0, the plan is empty and nothing allocates. Reached by
+    // entering the sweep state manually (gcMinorCollection is monolithic;
+    // the testc T._gcstate idiom).
+    {
+        vm.gc_state = .sweep;
+        defer vm.gc_state = .pause;
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        const saved = vm.alloc;
+        vm.alloc = failing.allocator();
+        const plan = try vm.gcPrepareForwardBarrierCell(owner_pair.owner, donor_pair.donor_cell);
+        vm.alloc = saved;
+        try testing.expectEqual(Vm.CellJoinPlan{}, plan);
+        try testing.expect(donor_pair.donor_cell.gc_age.isYoung());
+        try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
+    }
+
+    // Reuse after OOM: the same join with the real allocator succeeds,
+    // publishes exactly once, and a real minor collection keeps the joined
+    // cell + its table alive.
+    const plan = try vm.gcPrepareForwardBarrierCell(owner_pair.owner, donor_pair.donor_cell);
+    try testing.expect(plan.gen_promote);
+    @constCast(owner_pair.owner.upvalues)[0] = donor_pair.donor_cell;
+    vm.gcCommitForwardBarrierCell(owner_pair.owner, donor_pair.donor_cell, plan);
+    try testing.expect(donor_pair.donor_cell.gc_age == .old0);
+    try testing.expectEqual(
+        @as(usize, 1),
+        p50r8Count(vm.gc_old1.items, .{ .cell = donor_pair.donor_cell }),
+    );
+    try vm.gcMinorCollection();
+    try testing.expect(p50IsRegistered(&vm, .{ .cell = donor_pair.donor_cell }));
+    try testing.expect(p50IsRegistered(&vm, .{ .table = donor_pair.donor_val }));
+    try testing.expect(owner_pair.owner.upvalues[0] == donor_pair.donor_cell);
+}
+
+test "P16.50-review-8 1.2: generational setupvalue reserve OOM leaves state byte-exact" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    const owner_pair = try p50r8MkPair(&vm);
+    try roots.add(.{ .Closure = owner_pair.owner });
+    try vm.gcEnterGenerational();
+    const young = try vm.allocTableNoGc();
+
+    vm.gc_gray.deinit(testing.allocator);
+    vm.gc_gray = .empty;
+    vm.gc_old1.deinit(testing.allocator);
+    vm.gc_old1 = .empty;
+
+    // Edge 0 (gc_gray reserve) and edge 1 (gc_old1 reserve): the store
+    // must NOT have happened — the cell still holds its original table.
+    for ([_]usize{ 0, 1 }) |edge| {
+        const young_age = young.gc_age;
+        const young_mark = young.gc_marked;
+        const cell_value = owner_pair.owner_cell.value;
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = edge,
+            .resize_fail_index = edge,
+        });
+        const saved = vm.alloc;
+        vm.alloc = failing.allocator();
+        const plan = vm.gcPrepareWriteBarrierCell(owner_pair.owner_cell, .{ .Table = young });
+        vm.alloc = saved;
+        try testing.expectError(error.OutOfMemory, plan);
+        try testing.expect(young.gc_age == young_age);
+        try testing.expect(young.gc_marked == young_mark);
+        try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
+        try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
+        try testing.expect(std.meta.eql(owner_pair.owner_cell.value, cell_value));
+    }
+
+    // Reuse: the real store promotes + publishes exactly once, and a real
+    // minor collection keeps the young table alive through the old cell.
+    try vm.gcStoreCellValue(owner_pair.owner_cell, .{ .Table = young });
+    try testing.expect(young.gc_age == .old0);
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = young }));
+    try testing.expect(std.meta.eql(owner_pair.owner_cell.value, .{ .Table = young }));
+    try vm.gcMinorCollection();
+    try testing.expect(p50IsRegistered(&vm, .{ .table = young }));
+    try testing.expect(std.meta.eql(owner_pair.owner_cell.value, .{ .Table = young }));
+}
+
+test "P16.50-review-8 1.2: incremental join reserve OOM leaves state byte-exact" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    const fx = try p50r8MkPair(&vm);
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(.{ .Closure = fx.owner });
+
+    // Non-firing guard at pause (fresh vm — the owner is still white):
+    // armed fail_index=0, the plan is empty and NOTHING allocates.
+    {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        const saved = vm.alloc;
+        vm.alloc = failing.allocator();
+        const plan = try vm.gcPrepareForwardBarrierCell(fx.owner, fx.donor_cell);
+        vm.alloc = saved;
+        try testing.expectEqual(Vm.CellJoinPlan{}, plan);
+    }
+
+    try vm.gcStartCycle(true);
+    while (true) {
+        const black = gcIsBlack(fx.owner.gc_marked);
+        const in_gray = p50r8Count(vm.gc_gray.items, .{ .closure = fx.owner }) != 0;
+        if (black and !in_gray) break;
+        const more = try vm.gcPropagateOne();
+        try testing.expect(more);
+    }
+    try testing.expect(gcIsWhite(fx.donor_cell.gc_marked));
+
+    // The propagate arm's single reserve edge: the gc_gray slot for the
+    // cell's table value. The re-point must NOT have happened.
+    vm.gc_gray.deinit(testing.allocator);
+    vm.gc_gray = .empty;
+    {
+        const cell_mark = fx.donor_cell.gc_marked;
+        const uv0 = fx.owner.upvalues[0];
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        const saved = vm.alloc;
+        vm.alloc = failing.allocator();
+        const plan = vm.gcPrepareForwardBarrierCell(fx.owner, fx.donor_cell);
+        vm.alloc = saved;
+        try testing.expectError(error.OutOfMemory, plan);
+        try testing.expect(fx.donor_cell.gc_marked == cell_mark);
+        try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
+        try testing.expect(fx.owner.upvalues[0] == uv0);
+    }
+
+    // Reuse: the same join succeeds, and finishing the cycle keeps the
+    // joined cell + its table alive (the §1.1 discriminator).
+    const plan = try vm.gcPrepareForwardBarrierCell(fx.owner, fx.donor_cell);
+    try testing.expect(plan.inc_mark);
+    @constCast(fx.owner.upvalues)[0] = fx.donor_cell;
+    vm.gcCommitForwardBarrierCell(fx.owner, fx.donor_cell, plan);
+    try testing.expect(gcIsBlack(fx.donor_cell.gc_marked));
+    while (vm.gc_state != .pause) {
+        _ = try vm.gcAdvance(1, false);
+    }
+    try testing.expect(p50IsRegistered(&vm, .{ .cell = fx.donor_cell }));
+    try testing.expect(p50IsRegistered(&vm, .{ .table = fx.donor_val }));
+    try testing.expect(fx.owner.upvalues[0] == fx.donor_cell);
+}
+
+test "P16.50-review-8 1.2: incremental setupvalue reserve OOM leaves state byte-exact" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    const fx = try p50r8MkPair(&vm);
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(.{ .Closure = fx.owner });
+    // A dead-white table (created before the cycle, unrooted): the value
+    // the setupvalue store must protect — without the barrier the sweep
+    // frees it.
+    const dead_table = try vm.allocTableNoGc();
+
+    try vm.gcStartCycle(true);
+    while (true) {
+        const black = gcIsBlack(fx.owner.gc_marked);
+        const in_gray = p50r8Count(vm.gc_gray.items, .{ .closure = fx.owner }) != 0;
+        if (black and !in_gray) break;
+        const more = try vm.gcPropagateOne();
+        try testing.expect(more);
+    }
+    // The owner's own cell is reachable through the owner → black.
+    try testing.expect(gcIsBlack(fx.owner_cell.gc_marked));
+    try testing.expect(gcIsWhite(dead_table.gc_marked));
+
+    vm.gc_gray.deinit(testing.allocator);
+    vm.gc_gray = .empty;
+    {
+        const table_mark = dead_table.gc_marked;
+        const cell_value = fx.owner_cell.value;
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        const saved = vm.alloc;
+        vm.alloc = failing.allocator();
+        const plan = vm.gcPrepareWriteBarrierCell(fx.owner_cell, .{ .Table = dead_table });
+        vm.alloc = saved;
+        try testing.expectError(error.OutOfMemory, plan);
+        try testing.expect(dead_table.gc_marked == table_mark);
+        try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
+        try testing.expect(std.meta.eql(fx.owner_cell.value, cell_value));
+    }
+
+    // Reuse: the real store commits, the barrier marks the dead-white
+    // table, and finishing the cycle keeps it alive through the cell.
+    try vm.gcStoreCellValue(fx.owner_cell, .{ .Table = dead_table });
+    try testing.expect(std.meta.eql(fx.owner_cell.value, .{ .Table = dead_table }));
+    while (vm.gc_state != .pause) {
+        _ = try vm.gcAdvance(1, false);
+    }
+    try testing.expect(p50IsRegistered(&vm, .{ .table = dead_table }));
+    try testing.expect(std.meta.eql(fx.owner_cell.value, .{ .Table = dead_table }));
 }
 
 /// Test seam for T2: the inner transaction carries the same cleanup the
@@ -56889,4 +57878,668 @@ test "P16.50-review-7 B3.4c: close continuation parks across yield and resumes e
     try testing.expectEqual(@as(usize, 2), results.len);
     try testing.expect(results[0] == .String and std.mem.eql(u8, results[0].String.bytes(), "yc"));
     try testing.expect(results[1] == .String and std.mem.eql(u8, results[1].String.bytes(), "done"));
+}
+
+// =========================================================================
+// P16.50-review-8 §2: continueBytecodeClose read-after-destroy regression.
+//
+// The close continuation state is heap-allocated and destroyed at the
+// completion point (alloc.destroy releases the memory). The pre-fix code
+// read `state.owner_thread` AFTER the destroy at two sites — the
+// had_close_error arm and the .unwind_frame arm's popBytecodeExecFrame —
+// dangling-pointer reads that happened to "work" only while the freed
+// block kept its stale bytes. The fix snapshots owner_thread (with post,
+// had_close_error, close_err, close_min_reg) BEFORE the destroy.
+//
+// This test runs all three completion arms through the REAL dispatcher
+// under a poison-on-free allocator: every freed block is filled with
+// 0xAA before release, so any post-destroy field read sees garbage (and
+// any dereference of it crashes) instead of stale-but-plausible data.
+//   Arm 1 (.unwind_frame): an error raised in the chunk unwinds through
+//     a <close> var; after the closer completes, the arm reads
+//     owner_thread for popBytecodeExecFrame.
+//   Arm 2 (had_close_error): the __close metamethod itself raises; the
+//     completion records the error and the arm reads owner_thread for
+//     popBytecodeExecFrame.
+//   Arm 3 (.return_frame): a normal return — destroy, then the return
+//     hook + completeBytecodeExecFrame run off the snapshot post.
+// A full GC plus a re-run of arm 3's chunk on the same closure closes
+// the loop (VM reuse after the poisoned frees).
+// =========================================================================
+test "P16.50-review-8 §2: continueBytecodeClose reads no field after destroy (poison-on-free)" {
+    const testing = std.testing;
+
+    // Test-local allocator wrapper: poison every freed block with 0xAA
+    // before forwarding to the backing allocator. Reading freed memory
+    // anywhere on these paths turns into garbage reads / crashes instead
+    // of silently reusing stale bytes.
+    const PoisonOnFreeAllocator = struct {
+        backing: std.mem.Allocator,
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        const vtable: std.mem.Allocator.VTable = .{
+            .alloc = allocFn,
+            .resize = resizeFn,
+            .remap = remapFn,
+            .free = freeFn,
+        };
+
+        fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.backing.rawAlloc(len, alignment, ret_addr);
+        }
+
+        fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+        }
+
+        fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.backing.rawRemap(memory, alignment, new_len, ret_addr);
+        }
+
+        fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            @memset(memory, 0xAA);
+            self.backing.rawFree(memory, alignment, ret_addr);
+        }
+    };
+
+    var poison = PoisonOnFreeAllocator{ .backing = testing.allocator };
+    var vm: Vm = .init(poison.allocator(), false);
+    defer vm.deinit();
+    vm.setDynamicBytecodeCompiler(defaultBytecodeCompiler);
+
+    // Arm 1 — .unwind_frame: chunk error unwinds through the <close> var.
+    {
+        const src =
+            \\g = 0
+            \\local x <close> = setmetatable({}, {__close = function() g = g + 1 end})
+            \\error("boom")
+        ;
+        const chunk_v = try vm.compileChunkValue(src, "=p50r8-s2-unwind");
+        var roots = vm.gcTempRoots();
+        defer roots.end();
+        try roots.add(chunk_v);
+        const cl = chunk_v.Closure;
+        try testing.expectError(error.RuntimeError, vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl));
+        const g = vm.rawGet(vm.global_env, .{ .String = try vm.internStr("g") });
+        try testing.expect(g == .Int and g.Int == 1);
+    }
+
+    // Arm 2 — had_close_error: the __close metamethod itself raises.
+    {
+        const src =
+            \\g = 0
+            \\local x <close> = setmetatable({}, {__close = function() g = g + 1; error("cb") end})
+            \\return "nope"
+        ;
+        const chunk_v = try vm.compileChunkValue(src, "=p50r8-s2-err");
+        var roots = vm.gcTempRoots();
+        defer roots.end();
+        try roots.add(chunk_v);
+        const cl = chunk_v.Closure;
+        try testing.expectError(error.RuntimeError, vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl));
+        const g = vm.rawGet(vm.global_env, .{ .String = try vm.internStr("g") });
+        try testing.expect(g == .Int and g.Int == 1);
+    }
+
+    // Arm 3 — .return_frame: normal return through the <close> var, then
+    // GC + VM reuse on the same closure.
+    {
+        const src =
+            \\g = 0
+            \\local x <close> = setmetatable({}, {__close = function() g = g + 1 end})
+            \\return "done"
+        ;
+        const chunk_v = try vm.compileChunkValue(src, "=p50r8-s2-ret");
+        var roots = vm.gcTempRoots();
+        defer roots.end();
+        try roots.add(chunk_v);
+        const cl = chunk_v.Closure;
+
+        const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+        defer vm.alloc.free(results);
+        try testing.expectEqual(@as(usize, 1), results.len);
+        try testing.expect(results[0] == .String and std.mem.eql(u8, results[0].String.bytes(), "done"));
+        const g = vm.rawGet(vm.global_env, .{ .String = try vm.internStr("g") });
+        try testing.expect(g == .Int and g.Int == 1);
+
+        // Health: full GC, then a fresh run of the same closure.
+        try vm.gcFullCollectionForUser();
+        const results2 = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+        defer vm.alloc.free(results2);
+        try testing.expectEqual(@as(usize, 1), results2.len);
+        try testing.expect(results2[0] == .String and std.mem.eql(u8, results2[0].String.bytes(), "done"));
+        const g2 = vm.rawGet(vm.global_env, .{ .String = try vm.internStr("g") });
+        try testing.expect(g2 == .Int and g2.Int == 1);
+    }
+}
+
+// =========================================================================
+// P16.50-review-8 §3.1: async gsub continuation OOM edges — countdown
+// sweep with byte-exact rollback.
+//
+// The restructured ownership (see applyBytecodePendingGsub /
+// advanceBytecodeGsub): the pending slot stays installed as the gsub
+// state's single owner across advance; the callback return slice is
+// adopted at advance entry; the .final handover swaps the slot payload
+// in place (infallible) and only then destroys the old state struct.
+// Every countdown failure must leave: frames drained, zero active
+// pending slots, empty TBC registries, and — after a full GC — live
+// bytes exactly at the clean-run baseline (the pre-fix code leaked the
+// state struct on .final and the callback slice on advance failures).
+// Any success must carry the exact gsub contract. The sweep crosses the
+// repl-function push edges (stage/frame/hook), the per-match result
+// appends, and the final result build.
+// =========================================================================
+test "P16.50-review-8 §3.1: async gsub (function repl) OOM edges — countdown sweep, byte-exact rollback" {
+    const testing = std.testing;
+    const TrackingAllocator = @import("tracking_alloc.zig").TrackingAllocator;
+
+    // The registry-compare safety skip in gcMarkValueImpl reads the
+    // gc_index header of a possibly-freed object referenced by a dead
+    // register slot (the countdown's emergency GC scans the full register
+    // window, including dead slots above the live range). That read is
+    // only sound under a never-unmap allocator: std.testing.allocator
+    // (DebugAllocator with never_unmap = false) unmaps large freed blocks
+    // and turns the skip's header read into a GPF at deeper countdown
+    // edges. The VM's implicit allocator contract here is "freed GC-object
+    // memory stays readable".
+    var backing = std.heap.DebugAllocator(.{
+        .never_unmap = true,
+        .stack_trace_frames = 0,
+    }){};
+    defer if (backing.deinit() == .leak) @panic("leaked memory");
+    var tracker = TrackingAllocator.init(backing.allocator());
+    const track_alloc = tracker.allocator();
+
+    var vm: Vm = .init(track_alloc, false);
+    defer vm.deinit();
+    vm.setDynamicBytecodeCompiler(defaultBytecodeCompiler);
+    try vm.enableTestcModule();
+
+    const src =
+        \\local function repl(s) return "<" .. s .. ">" end
+        \\local a, b =  ("abc"):gsub("%a", repl)
+        \\return a, b
+    ;
+    const chunk_v = try vm.compileChunkValue(src, "=p50r8-gsub-fn");
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(chunk_v);
+    const cl = chunk_v.Closure;
+
+    var outs: [1]Value = undefined;
+
+    // Prime one-time VM-internal capacity growth. A countdown failure first
+    // runs an emergency GC over the live set as it stands mid-flight (tables
+    // and closures created by the chunk still rooted during unwind), which
+    // can grow GC-internal buffers (gc_marked_tables, the per-thread
+    // bytecode_unwinds list) once; the capacity is retained and reused by
+    // every later cycle — the same one-time-growth class as the B3.4a
+    // pending-pool priming. The deepest failing countdown presents the
+    // maximal live set, so priming there settles every such capacity: run
+    // 96 downward (deeper countdowns succeed cleanly), and the first failure
+    // found is the deepest edge. Every sweep edge below then returns
+    // byte-exact to the baseline.
+    {
+        var pcd: i64 = 96;
+        while (pcd >= 0) : (pcd -= 1) {
+            try vm.builtinTestcAlloccount(&.{.{ .Int = pcd }}, &outs);
+            const p_failed = if (vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl)) |results| blk: {
+                vm.alloc.free(results);
+                break :blk false;
+            } else |_| true;
+            try vm.builtinTestcAlloccount(&.{.{ .Int = -1 }}, &outs);
+            if (p_failed) break;
+        }
+        try vm.gcFullCollectionForUser();
+    }
+
+    // Baseline: one clean run + result free + full GC.
+    {
+        const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+        defer vm.alloc.free(results);
+        try testing.expectEqual(@as(usize, 2), results.len);
+        try testing.expect(results[0] == .String and std.mem.eql(u8, results[0].String.bytes(), "<a><b><c>"));
+        try testing.expect(results[1] == .Int and results[1].Int == 3);
+    }
+    try vm.gcFullCollectionForUser();
+    const baseline = tracker.total_bytes;
+
+    var saw_fail = false;
+    var saw_success = false;
+    var cd: i64 = 0;
+    while (cd <= 96) : (cd += 1) {
+        try vm.builtinTestcAlloccount(&.{.{ .Int = cd }}, &outs);
+        const failed = blk: {
+            if (vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl)) |results| {
+                defer vm.alloc.free(results);
+                try testing.expectEqual(@as(usize, 2), results.len);
+                try testing.expect(results[0] == .String and std.mem.eql(u8, results[0].String.bytes(), "<a><b><c>"));
+                try testing.expect(results[1] == .Int and results[1].Int == 3);
+                break :blk false;
+            } else |e| {
+                try testing.expect(e == error.OutOfMemory or e == error.RuntimeError);
+                break :blk true;
+            }
+        };
+        try vm.builtinTestcAlloccount(&.{.{ .Int = -1 }}, &outs); // disarm
+
+        // Post-failure state: frames drained, no active pending slots,
+        // TBC registries empty.
+        const th = vm.activeBytecodeThread();
+        try testing.expectEqual(@as(usize, 0), th.call_frames.len());
+        var active_pending: usize = 0;
+        for (vm.pending_calls.items) |slot| {
+            if (slot.active) active_pending += 1;
+        }
+        try testing.expectEqual(@as(usize, 0), active_pending);
+        try testing.expectEqual(@as(usize, 0), th.bytecode_tbc_regs.items.len);
+        try testing.expectEqual(@as(usize, 0), th.c_tbc_chain.items.len);
+
+        // Byte-exact rollback: a full GC returns live bytes to the
+        // baseline (every intermediate — gsub state, callback slice,
+        // per-match results — freed on every failure edge).
+        try vm.gcFullCollectionForUser();
+        try testing.expectEqual(baseline, tracker.total_bytes);
+
+        if (failed) saw_fail = true else saw_success = true;
+    }
+    try testing.expect(saw_fail and saw_success);
+
+    // Disarmed, one final clean run: exact contract + VM reuse.
+    const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+    defer vm.alloc.free(results);
+    try testing.expectEqual(@as(usize, 2), results.len);
+    try testing.expect(results[0] == .String and std.mem.eql(u8, results[0].String.bytes(), "<a><b><c>"));
+    try testing.expect(results[1] == .Int and results[1].Int == 3);
+}
+
+// =========================================================================
+// P16.50-review-8 §3.1 (table replacement): the __index-metatable gsub
+// path — tryPushBytecodeGsubTableIndex pushes the __index child while
+// the parent's pending slot stays installed as the gsub state's owner
+// (the relaxed same-completion assert in pushResolvedBytecodeClosure),
+// then applyBytecodePendingGsub re-enters advance on the child's return.
+// Same countdown sweep + byte-exact rollback contract as the function
+// variant.
+// =========================================================================
+test "P16.50-review-8 §3.1: async gsub (table __index repl) OOM edges — countdown sweep, byte-exact rollback" {
+    const testing = std.testing;
+    const TrackingAllocator = @import("tracking_alloc.zig").TrackingAllocator;
+
+    // The registry-compare safety skip in gcMarkValueImpl reads the
+    // gc_index header of a possibly-freed object referenced by a dead
+    // register slot (the countdown's emergency GC scans the full register
+    // window, including dead slots above the live range). That read is
+    // only sound under a never-unmap allocator: std.testing.allocator
+    // (DebugAllocator with never_unmap = false) unmaps large freed blocks
+    // and turns the skip's header read into a GPF at deeper countdown
+    // edges. The VM's implicit allocator contract here is "freed GC-object
+    // memory stays readable".
+    var backing = std.heap.DebugAllocator(.{
+        .never_unmap = true,
+        .stack_trace_frames = 0,
+    }){};
+    defer if (backing.deinit() == .leak) @panic("leaked memory");
+    var tracker = TrackingAllocator.init(backing.allocator());
+    const track_alloc = tracker.allocator();
+
+    var vm: Vm = .init(track_alloc, false);
+    defer vm.deinit();
+    vm.setDynamicBytecodeCompiler(defaultBytecodeCompiler);
+    try vm.enableTestcModule();
+
+    const src =
+        \\local t = setmetatable({}, {__index = function(t, k) return k:upper() end})
+        \\local a, b =  ("abc"):gsub("%a", t)
+        \\return a, b
+    ;
+    const chunk_v = try vm.compileChunkValue(src, "=p50r8-gsub-tbl");
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(chunk_v);
+    const cl = chunk_v.Closure;
+
+    var outs: [1]Value = undefined;
+
+    // Prime one-time VM-internal capacity growth. A countdown failure first
+    // runs an emergency GC over the live set as it stands mid-flight (tables
+    // and closures created by the chunk still rooted during unwind), which
+    // can grow GC-internal buffers (gc_marked_tables, the per-thread
+    // bytecode_unwinds list) once; the capacity is retained and reused by
+    // every later cycle — the same one-time-growth class as the B3.4a
+    // pending-pool priming. The deepest failing countdown presents the
+    // maximal live set, so priming there settles every such capacity: run
+    // 96 downward (deeper countdowns succeed cleanly), and the first failure
+    // found is the deepest edge. Every sweep edge below then returns
+    // byte-exact to the baseline.
+    {
+        var pcd: i64 = 96;
+        while (pcd >= 0) : (pcd -= 1) {
+            try vm.builtinTestcAlloccount(&.{.{ .Int = pcd }}, &outs);
+            const p_failed = if (vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl)) |results| blk: {
+                vm.alloc.free(results);
+                break :blk false;
+            } else |_| true;
+            try vm.builtinTestcAlloccount(&.{.{ .Int = -1 }}, &outs);
+            if (p_failed) break;
+        }
+        try vm.gcFullCollectionForUser();
+    }
+
+    {
+        const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+        defer vm.alloc.free(results);
+        try testing.expectEqual(@as(usize, 2), results.len);
+        try testing.expect(results[0] == .String and std.mem.eql(u8, results[0].String.bytes(), "ABC"));
+        try testing.expect(results[1] == .Int and results[1].Int == 3);
+    }
+    try vm.gcFullCollectionForUser();
+    const baseline = tracker.total_bytes;
+
+    var saw_fail = false;
+    var saw_success = false;
+    var cd: i64 = 0;
+    while (cd <= 96) : (cd += 1) {
+        try vm.builtinTestcAlloccount(&.{.{ .Int = cd }}, &outs);
+        const failed = blk: {
+            if (vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl)) |results| {
+                defer vm.alloc.free(results);
+                try testing.expectEqual(@as(usize, 2), results.len);
+                try testing.expect(results[0] == .String and std.mem.eql(u8, results[0].String.bytes(), "ABC"));
+                try testing.expect(results[1] == .Int and results[1].Int == 3);
+                break :blk false;
+            } else |e| {
+                try testing.expect(e == error.OutOfMemory or e == error.RuntimeError);
+                break :blk true;
+            }
+        };
+        try vm.builtinTestcAlloccount(&.{.{ .Int = -1 }}, &outs); // disarm
+
+        const th = vm.activeBytecodeThread();
+        try testing.expectEqual(@as(usize, 0), th.call_frames.len());
+        var active_pending: usize = 0;
+        for (vm.pending_calls.items) |slot| {
+            if (slot.active) active_pending += 1;
+        }
+        try testing.expectEqual(@as(usize, 0), active_pending);
+
+        try vm.gcFullCollectionForUser();
+        try testing.expectEqual(baseline, tracker.total_bytes);
+
+        if (failed) saw_fail = true else saw_success = true;
+    }
+    try testing.expect(saw_fail and saw_success);
+}
+
+// =========================================================================
+// P16.50-review-8 §3.1 (state-struct leak): the BytecodeGsubContinuation
+// state struct must be destroyed on EVERY completion shape — the .final
+// handover in applyBytecodePendingGsub (function/table repl with
+// matches) AND the synchronous .returned path in tryStartBytecodeGsub
+// (no matches at all / raw table hits). The pre-fix code leaked the
+// struct on every one of these completions. Deterministic success-path
+// check: repeated clean runs + full GC must return live bytes exactly
+// to the baseline.
+// =========================================================================
+test "P16.50-review-8 §3.1: async gsub completion destroys the state struct (no leak)" {
+    const testing = std.testing;
+    const TrackingAllocator = @import("tracking_alloc.zig").TrackingAllocator;
+
+    var tracker = TrackingAllocator.init(std.testing.allocator);
+    const track_alloc = tracker.allocator();
+
+    var vm: Vm = .init(track_alloc, false);
+    defer vm.deinit();
+    vm.setDynamicBytecodeCompiler(defaultBytecodeCompiler);
+
+    // .final handover shape (matches → applyBytecodePendingGsub).
+    const src_match =
+        \\local function repl(s) return "<" .. s .. ">" end
+        \\local a, b =  ("abc"):gsub("%a", repl)
+        \\return a, b
+    ;
+    const match_v = try vm.compileChunkValue(src_match, "=p50r8-gsub-leak1");
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(match_v);
+    const match_cl = match_v.Closure;
+
+    // .returned shape (no matches → tryStartBytecodeGsub).
+    const src_nomatch =
+        \\local function repl(s) return "<" .. s .. ">" end
+        \\local a, b =  ("123"):gsub("%a", repl)
+        \\return a, b
+    ;
+    const nomatch_v = try vm.compileChunkValue(src_nomatch, "=p50r8-gsub-leak2");
+    try roots.add(nomatch_v);
+    const nomatch_cl = nomatch_v.Closure;
+
+    // .returned shape (raw table hits complete synchronously).
+    const src_raw =
+        \\local t = {a = "A", b = "B", c = "C"}
+        \\local a, b =  ("abc"):gsub("%a", t)
+        \\return a, b
+    ;
+    const raw_v = try vm.compileChunkValue(src_raw, "=p50r8-gsub-leak3");
+    try roots.add(raw_v);
+    const raw_cl = raw_v.Closure;
+
+    // Baseline after one round of all three + full GC.
+    {
+        const r1 = try vm.runBytecode(match_cl.proto.?, match_cl.upvalues, &.{}, match_cl);
+        defer vm.alloc.free(r1);
+        try testing.expect(r1[0] == .String and std.mem.eql(u8, r1[0].String.bytes(), "<a><b><c>"));
+        const r2 = try vm.runBytecode(nomatch_cl.proto.?, nomatch_cl.upvalues, &.{}, nomatch_cl);
+        defer vm.alloc.free(r2);
+        try testing.expect(r2[0] == .String and std.mem.eql(u8, r2[0].String.bytes(), "123"));
+        try testing.expect(r2[1] == .Int and r2[1].Int == 0);
+        const r3 = try vm.runBytecode(raw_cl.proto.?, raw_cl.upvalues, &.{}, raw_cl);
+        defer vm.alloc.free(r3);
+        try testing.expect(r3[0] == .String and std.mem.eql(u8, r3[0].String.bytes(), "ABC"));
+    }
+    try vm.gcFullCollectionForUser();
+    const baseline = tracker.total_bytes;
+
+    // Repeated completions of every shape: byte-exact after GC. Results are
+    // freed explicitly BEFORE the GC + byte check — a `defer` would keep the
+    // caller-owned result slices live across the check and produce a false
+    // +32/chunk delta (the check runs inside the loop body).
+    var round: usize = 0;
+    while (round < 4) : (round += 1) {
+        {
+            const r1 = try vm.runBytecode(match_cl.proto.?, match_cl.upvalues, &.{}, match_cl);
+            defer vm.alloc.free(r1);
+            try testing.expect(r1[1] == .Int and r1[1].Int == 3);
+        }
+        {
+            const r2 = try vm.runBytecode(nomatch_cl.proto.?, nomatch_cl.upvalues, &.{}, nomatch_cl);
+            defer vm.alloc.free(r2);
+            try testing.expect(r2[1] == .Int and r2[1].Int == 0);
+        }
+        {
+            const r3 = try vm.runBytecode(raw_cl.proto.?, raw_cl.upvalues, &.{}, raw_cl);
+            defer vm.alloc.free(r3);
+            try testing.expect(r3[1] == .Int and r3[1].Int == 3);
+        }
+
+        try vm.gcFullCollectionForUser();
+        try testing.expectEqual(baseline, tracker.total_bytes);
+    }
+}
+
+// =========================================================================
+// P16.50-review-8 §3.2: completeBytecodeExecFrame / protected-result /
+// pending-concat OOM edges — countdown sweep with byte-exact rollback.
+//
+// The tagged-owner restructure (see completeBytecodeExecFrame): the
+// child's return slice is adopted at entry (null tag = borrowed
+// bc_return_scratch, never freed), the tag moves to each re-wrapped
+// slice (nil padding, protection wrap), and disarms at each adoption
+// point (C-parent return, external boundary, the pending appliers,
+// beginBytecodeClose post). completeBytecodeProtectedResult and
+// applyBytecodePendingConcat adopt at entry the same way.
+//
+// One chunk drives every edge: __pairs returning fewer than three
+// values (nil padding), pcall (protection wrap + result roots), a tail
+// pcall (tail_return → beginBytecodeClose post), and a simple-result
+// builtin call (frame-growth path). Every countdown failure must leave
+// the drained-frames / zero-pending state and byte-exact live bytes
+// after a full GC; any success must carry the exact 7-value contract.
+// The borrowed scratch is never freed (a free of the VM-owned scratch
+// would corrupt the byte accounting / crash on reuse — the repeated
+// clean runs below reuse it).
+// =========================================================================
+test "P16.50-review-8 §3.2: exec-frame completion OOM edges — countdown sweep, byte-exact rollback" {
+    const testing = std.testing;
+    const TrackingAllocator = @import("tracking_alloc.zig").TrackingAllocator;
+
+    // The registry-compare safety skip in gcMarkValueImpl reads the
+    // gc_index header of a possibly-freed object referenced by a dead
+    // register slot (the countdown's emergency GC scans the full register
+    // window, including dead slots above the live range). That read is
+    // only sound under a never-unmap allocator: std.testing.allocator
+    // (DebugAllocator with never_unmap = false) unmaps large freed blocks
+    // and turns the skip's header read into a GPF at deeper countdown
+    // edges. The VM's implicit allocator contract here is "freed GC-object
+    // memory stays readable".
+    var backing = std.heap.DebugAllocator(.{
+        .never_unmap = true,
+        .stack_trace_frames = 0,
+    }){};
+    defer if (backing.deinit() == .leak) @panic("leaked memory");
+    var tracker = TrackingAllocator.init(backing.allocator());
+    const track_alloc = tracker.allocator();
+
+    var vm: Vm = .init(track_alloc, false);
+    defer vm.deinit();
+    vm.setDynamicBytecodeCompiler(defaultBytecodeCompiler);
+    try vm.enableTestcModule();
+
+    const src =
+        \\local t = setmetatable({}, {__pairs = function(o) return next, o end})
+        \\local n = 0
+        \\for k in pairs(t) do n = n + 1 end
+        \\local ok, a, b = pcall(function() return 11, 22 end)
+        \\local function g() return pcall(function() return "x" end) end
+        \\local ok2, x = g()
+        \\local s = tostring(42)
+        \\return ok, a, b, ok2, x, s, n
+    ;
+    const chunk_v = try vm.compileChunkValue(src, "=p50r8-execframe");
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(chunk_v);
+    const cl = chunk_v.Closure;
+
+    var outs: [1]Value = undefined;
+
+    // Prime one-time VM-internal capacity growth. A countdown failure first
+    // runs an emergency GC over the live set as it stands mid-flight (tables
+    // and closures created by the chunk still rooted during unwind), which
+    // can grow GC-internal buffers (gc_marked_tables, the per-thread
+    // bytecode_unwinds list) once; the capacity is retained and reused by
+    // every later cycle — the same one-time-growth class as the B3.4a
+    // pending-pool priming. The deepest failing countdown presents the
+    // maximal live set, so priming there settles every such capacity: run
+    // 96 downward (deeper countdowns succeed cleanly), and the first failure
+    // found is the deepest edge. Every sweep edge below then returns
+    // byte-exact to the baseline.
+    {
+        var pcd: i64 = 96;
+        while (pcd >= 0) : (pcd -= 1) {
+            try vm.builtinTestcAlloccount(&.{.{ .Int = pcd }}, &outs);
+            const p_failed = if (vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl)) |results| blk: {
+                vm.alloc.free(results);
+                break :blk false;
+            } else |_| true;
+            try vm.builtinTestcAlloccount(&.{.{ .Int = -1 }}, &outs);
+            if (p_failed) break;
+        }
+        try vm.gcFullCollectionForUser();
+    }
+
+    {
+        const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+        defer vm.alloc.free(results);
+        try testing.expectEqual(@as(usize, 7), results.len);
+        try testing.expect(results[0] == .Bool and results[0].Bool == true);
+        try testing.expect(results[1] == .Int and results[1].Int == 11);
+        try testing.expect(results[2] == .Int and results[2].Int == 22);
+        try testing.expect(results[3] == .Bool and results[3].Bool == true);
+        try testing.expect(results[4] == .String and std.mem.eql(u8, results[4].String.bytes(), "x"));
+        try testing.expect(results[5] == .String and std.mem.eql(u8, results[5].String.bytes(), "42"));
+        try testing.expect(results[6] == .Int and results[6].Int == 0);
+    }
+    try vm.gcFullCollectionForUser();
+    const baseline = tracker.total_bytes;
+
+    var saw_fail = false;
+    var saw_success = false;
+    var cd: i64 = 0;
+    while (cd <= 96) : (cd += 1) {
+        try vm.builtinTestcAlloccount(&.{.{ .Int = cd }}, &outs);
+        const failed = blk: {
+            if (vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl)) |results| {
+                defer vm.alloc.free(results);
+                try testing.expectEqual(@as(usize, 7), results.len);
+                // A countdown OOM inside a pcall-protected function is
+                // caught by the chunk's own pcall (PUC ERRMEM parity): the
+                // protected-call recovery completes the exec frame inside
+                // pcall and the chunk finishes with ok=false plus the error
+                // object. Only the structural contract (frames drained, no
+                // active pendings, byte-exact rollback — checked below the
+                // arm) applies to such edges; the full value contract is
+                // asserted for clean runs and the final disarmed run.
+                const ok1 = results[0] == .Bool and results[0].Bool == true;
+                const ok2 = results[3] == .Bool and results[3].Bool == true;
+                if (ok1) {
+                    try testing.expect(results[1] == .Int and results[1].Int == 11);
+                    try testing.expect(results[2] == .Int and results[2].Int == 22);
+                } else {
+                    try testing.expect(results[1] == .String);
+                }
+                if (ok2) {
+                    try testing.expect(results[4] == .String and std.mem.eql(u8, results[4].String.bytes(), "x"));
+                } else {
+                    try testing.expect(results[4] == .String);
+                }
+                try testing.expect(results[5] == .String and std.mem.eql(u8, results[5].String.bytes(), "42"));
+                try testing.expect(results[6] == .Int and results[6].Int == 0);
+                break :blk false;
+            } else |e| {
+                try testing.expect(e == error.OutOfMemory or e == error.RuntimeError);
+                break :blk true;
+            }
+        };
+        try vm.builtinTestcAlloccount(&.{.{ .Int = -1 }}, &outs); // disarm
+
+        const th = vm.activeBytecodeThread();
+        try testing.expectEqual(@as(usize, 0), th.call_frames.len());
+        var active_pending: usize = 0;
+        for (vm.pending_calls.items) |slot| {
+            if (slot.active) active_pending += 1;
+        }
+        try testing.expectEqual(@as(usize, 0), active_pending);
+
+        try vm.gcFullCollectionForUser();
+        try testing.expectEqual(baseline, tracker.total_bytes);
+
+        if (failed) saw_fail = true else saw_success = true;
+    }
+    try testing.expect(saw_fail and saw_success);
+
+    // Disarmed, one final clean run: exact contract (scratch reuse OK).
+    const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+    defer vm.alloc.free(results);
+    try testing.expectEqual(@as(usize, 7), results.len);
+    try testing.expect(results[1] == .Int and results[1].Int == 11);
+    try testing.expect(results[5] == .String and std.mem.eql(u8, results[5].String.bytes(), "42"));
 }

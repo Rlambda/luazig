@@ -1,4 +1,4 @@
-> Last updated: 2026-09-18 (P16.50-review-8)
+> Last updated: 2026-09-19 (P16.50-review-9 ledger-reopen)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -44,6 +44,29 @@ Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependen
 <!-- END GENERATED SUMMARY -->
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
+
+- [ ] **P16.50-review-9 correction (review-8 не принята)**: закрыть три
+  оставшихся close-upvalue окна `cell.close` → fallible
+  `gcWriteBarrierCell(...) catch {}` единым reserve-before-close контрактом;
+  обычные return/tailcall/unwind пути обязаны передавать OOM без частично
+  закрытых Cells и missed barrier, а GC-sweep/teardown путь должен быть
+  доказанно allocation-free. Также привести `tools/zig` к правилу system
+  `zig`-first, чтобы Makefile не выбирал локальный stale 0.15.2 вместо
+  установленного 0.16.0. Архитектура и negative tests заданы в `prompt.md`.
+  Open-count 22→24.
+
+- [ ] **Safety: emergency GC не должен разыменовывать stale register
+  pointers**: precise ordinary GC освобождает объекты из мёртвых регистров,
+  тогда как последующий emergency full-window scan проверяет membership через
+  чтение `gc_index` из уже освобождённого объекта. Текущий skip безопасен лишь
+  при never-unmap/неpoisonящем allocator и нарушает публичный allocator
+  contract. Предпочтительный PUC-подобный путь для отдельной фазы: в обычной
+  safe-point collection очищать dead register slots до sweep; emergency
+  mid-instruction по-прежнему сканирует полное окно, которое после такого
+  cleanup не содержит stale pointers. Нужен poison/unmap allocator test и
+  доказательство для чередования ordinary→emergency cycles; если этот путь
+  невозможен, использовать non-dereferencing address registry, а не читать
+  header через подозрительный pointer.
 
 - [x] **P16.50-review-8 correction (CLOSED by review-8)**: завершить C-API
   upvalue/GC контракт (транзакционные barriers, корректный incremental barrier

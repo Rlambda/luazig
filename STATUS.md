@@ -36,9 +36,11 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **84/84** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.41x** |
+| Performance (geomean vs PUC) | **1.40x** |
+| Perf gate (paired-seed) | **OK** — 21 published seeds (1..21) |
+| api580 fixed-load footprint | **GREEN** — measured 384/436 B vs threshold 400 B |
 
-Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
@@ -126,6 +128,9 @@ Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependen
   сессией (seeds 1..21) + артефактным коммитом D (полное canonical current-*
   перегенерирование на C2; STATUS — artifact-class per tools/provenance.py
   ARTIFACT_PATHS; FAIL-сессия C сохранена в manifest как historical).
+  Verdict clean-C2 сессии (2026-09-18T17:38:47Z): GREEN — RESULT OK,
+  18/18 workloads OK, worst per-seed +2.39% (coroutine_yield[1]) < WARN 5%,
+  wall-P25 envelope max +5.92% < 10%, geomean diagnostic 1.40x.
   open-count 22→21.
 
   статический сканер `testcScriptOutBound` полностью удалён (остались только
@@ -7809,6 +7814,16 @@ source_dirty = clean; вердикт сессии — в Perf-блоке ниж�
   clean-C2 сессией (seeds 1..21) + полным canonical current-*
   перегенерированием артефактным коммитом D; baselines byte-identical
   (baseline-approved/baseline-p15.37/core_baseline не тронуты).
+  Verdict clean-C2 сессии (2026-09-18T17:38:47Z, дописано артефактным
+  коммитом D): GREEN — RESULT OK, 18/18 workloads OK, worst per-seed
+  +2.39% (coroutine_yield[1]) < WARN 5%; coroutine_yield вернулся к
+  +0.6..+2.4% vs baseline на всех 21 seeds (recovery подтверждён:
+  ~1.03e9 instructions vs ~1.19e9 на FAIL-сессии C); wall-P25 envelope
+  max +5.92% (float_arith) < 10% (global_arith −11.75% — improvement,
+  не триггер); geomean diagnostic 1.40x; binary sha256
+  2b30c9a71a25bf59817a05133642642f6aea6767b933f6a76d631b21afced8a4
+  (полный sha в manifest row; determinism: pre-C2 build == rebuild ==
+  post-regeneration build; post-session rebuild верифицируется в D).
 - **Батарея**: 258/258 unit (Debug+ReleaseFast, 0 leaks), 23 heavy testc-лейна
   rc=0, matrix --testc 31/32 (zig_fail=0, big.lua both_fail pre-existing),
   smoke 84/84, c_api test 0 FAIL + test-diff DIFF PASS (t11 PASS), api580

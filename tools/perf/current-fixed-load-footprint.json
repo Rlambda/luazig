@@ -1,14 +1,14 @@
 {
-  "created_utc": "2026-09-17T20:35:53.844961+00:00",
+  "created_utc": "2026-09-18T17:32:33.730896+00:00",
   "provenance": {
-    "git_head": "4375f53",
-    "measured_source_head": "4375f53",
+    "git_head": "af78512",
+    "measured_source_head": "af78512",
     "git_dirty": "dirty",
     "source_dirty": "clean",
     "artifact_dirty": "dirty",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "0ba8593b5dbfbb36"
+    "zig_binary_sha16": "2b30c9a71a25bf59"
   },
   "zig_sizes": {
     "Proto": 200,

@@ -31,28 +31,30 @@ Regression lane: `python3 tools/testes_matrix.py --testc` (no `_port`/`_soft` pr
 
 ### Performance
 
-Geomean slowdown vs PUC Lua: **1.41x** (lower is better; 1.0x = parity).
-Method: paired-seed protocol — 5 published seeds per workload per session (`LUAZIG_HASH_SEED` env on the production ReleaseFast binary, pinned CPU core); verdict = per-seed paired instruction deltas; wall time is diagnostic only (`tools/perf_compare.py`).
+Geomean slowdown vs PUC Lua: **1.40x** (measurement snapshot, runs=5 per workload; run-dependent diagnostic; lower is better; 1.0x = parity).
+
+Gate protocol: paired-seed — 21 published seeds (1..21) per workload per session (`LUAZIG_HASH_SEED` env on the production ReleaseFast binary, pinned CPU core); verdict = per-seed paired instruction deltas; wall time is diagnostic only (`tools/perf_compare.py`). Latest gate verdict: **OK** (`tools/perf/current-gate.json`).
+api580 fixed-load footprint: measured delta **384 B anchored / 436 B no-XY-root** vs threshold 400 B — verdict **GREEN** (`tools/perf/current-api580-ledger.json`). Charged/model totals 376/428 B (reconciled: false/false) are allocation-model charges, not measurements.
 
 | Workload | Zig/PUC |
 |----------|--------:|
-| metamethod_call_noalloc | 1.82x |
-| array_access | 1.78x |
-| field_access | 1.66x |
-| branch_loop | 1.65x |
-| hash_access | 1.64x |
-| dynamic_load | 1.53x |
-| coroutine_yield | 1.47x |
-| mixed_arith | 1.45x |
-| comparisons | 1.42x |
+| metamethod_call_noalloc | 1.86x |
+| array_access | 1.74x |
+| field_access | 1.63x |
+| hash_access | 1.62x |
+| branch_loop | 1.61x |
+| dynamic_load | 1.55x |
+| mixed_arith | 1.47x |
+| coroutine_yield | 1.45x |
+| comparisons | 1.41x |
+| metamethod_add | 1.36x |
+| float_arith | 1.36x |
 | global_arith | 1.35x |
-| float_arith | 1.35x |
-| lua_calls | 1.35x |
-| metamethod_add | 1.34x |
+| lua_calls | 1.32x |
 | int_arith | 1.31x |
-| table_alloc_setmetatable | 1.28x |
-| string_loop | 1.16x |
-| temp_table_alloc | 1.12x |
+| table_alloc_setmetatable | 1.18x |
+| string_loop | 1.15x |
+| temp_table_alloc | 1.10x |
 | string_concat | 1.06x |
 <!-- END GENERATED STATUS -->
 

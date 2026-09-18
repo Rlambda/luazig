@@ -1,4 +1,4 @@
-> Last updated: 2026-09-17 (P16.50-review-7)
+> Last updated: 2026-09-18 (P16.50-review-7)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -43,7 +43,7 @@ Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [ ] **P16.50-review correction (REOPENED by review-7)**: rollback ownership + C-closure upvalue semantics — (a) BLOCKER 1: opClosure count-prefix rollback неверен при смешанных дескрипторах (proxy/new instack/уже-boxed) — exact ownership worklist/bitmap, rollback только созданных этим вызовом Cells в reverse-порядке; закрыть post-commit окно (gcStoreCellValue после commit) — либо provably-infallible через preparation/order, либо полный rollback owner для Closure/tree/register/accounting/register-slot; dispatch-driven mixed-upvalue тест ([proxy, new instack] из реального bytecode; existing-boxed; провал на следующем Cell и на Closure alloc; post-commit barrier failure; byte-exact всё + minor collection + repeated + success); negative copy count-prefix rollback детерминированно ловится; (b) BLOCKER 2: lua_newthread errdefer НЕ работает (?*lua_State ≠ error union) — inner error-union transaction / явный cleanup helper, ABI-wrapper маппит в null ПОСЛЕ cleanup; preserve/restore прежний vm.c_api_thread; тест против реального экспортированного lua_newthread (fail на registry prepare / Thread alloc / handle alloc / parent stack growth; registries/stack/handle/counters/live-set + GC после); (c) BLOCKER 3: registerfuncs алиасит C-closure upvalues (общие Cell-объекты: setupvalue(f1) виден f2) — PUC luaL_setfuncs (lauxlib.c:965-978) копирует VALUES на стек + lua_pushcclosure (lapi.c:609+) свежий CClosure с inline slots; один канонический C-closure конструктор для pushcclosure+registerfuncs с per-closure Cells; убрать неверный LClosure rationale; differential-тест (upvalueid differs; setupvalue A не меняет B; сбор в обоих порядках без leaks; OOM на non-preinterned names + table-growth setfield); (d) error propagation: lua_pushcclosure/lua_pushcfunction/luaL_setfuncs/luaL_newlib catch {} — обследовать защищённый механизм (protected call/throw) и маршрутизировать ЛИБО зафиксировать архитектурный blocker (owner решает); (e) HIGH: testcChargeMemory коммитит total_bytes ДО нативных аллокаций — split check/reserve от accounting commit / точный rollback; тест с активным testc_ctrl + провалы registry reserve/Userdata/uservalues/payload; аудит всех testcChargeMemory-сайтов; (f) cleanup: устаревшие BLOCKED/KNOWN-leak комментарии в тестах, skip fail-индексов 2..4 в pushcclosure matrix, smoke provenance prose (84 файла, 85-й номер — один из 84).
+- [x] **P16.50-review correction (REOPENED→CLOSED by review-7)**: rollback ownership + C-closure upvalue semantics — (a) BLOCKER 1: opClosure count-prefix rollback неверен при смешанных дескрипторах (proxy/new instack/уже-boxed) — exact ownership worklist/bitmap, rollback только созданных этим вызовом Cells в reverse-порядке; закрыть post-commit окно (gcStoreCellValue после commit) — либо provably-infallible через preparation/order, либо полный rollback owner для Closure/tree/register/accounting/register-slot; dispatch-driven mixed-upvalue тест ([proxy, new instack] из реального bytecode; existing-boxed; провал на следующем Cell и на Closure alloc; post-commit barrier failure; byte-exact всё + minor collection + repeated + success); negative copy count-prefix rollback детерминированно ловится; (b) BLOCKER 2: lua_newthread errdefer НЕ работает (?*lua_State ≠ error union) — inner error-union transaction / явный cleanup helper, ABI-wrapper маппит в null ПОСЛЕ cleanup; preserve/restore прежний vm.c_api_thread; тест против реального экспортированного lua_newthread (fail на registry prepare / Thread alloc / handle alloc / parent stack growth; registries/stack/handle/counters/live-set + GC после); (c) BLOCKER 3: registerfuncs алиасит C-closure upvalues (общие Cell-объекты: setupvalue(f1) виден f2) — PUC luaL_setfuncs (lauxlib.c:965-978) копирует VALUES на стек + lua_pushcclosure (lapi.c:609+) свежий CClosure с inline slots; один канонический C-closure конструктор для pushcclosure+registerfuncs с per-closure Cells; убрать неверный LClosure rationale; differential-тест (upvalueid differs; setupvalue A не меняет B; сбор в обоих порядках без leaks; OOM на non-preinterned names + table-growth setfield); (d) error propagation: lua_pushcclosure/lua_pushcfunction/luaL_setfuncs/luaL_newlib catch {} — обследовать защищённый механизм (protected call/throw) и маршрутизировать ЛИБО зафиксировать архитектурный blocker (owner решает); (e) HIGH: testcChargeMemory коммитит total_bytes ДО нативных аллокаций — split check/reserve от accounting commit / точный rollback; тест с активным testc_ctrl + провалы registry reserve/Userdata/uservalues/payload; аудит всех testcChargeMemory-сайтов; (f) cleanup: устаревшие BLOCKED/KNOWN-leak комментарии в тестах, skip fail-индексов 2..4 в pushcclosure matrix, smoke provenance prose (84 файла, 85-й номер — один из 84).
 
   ПЕРЕОТКРЫТ фазой P16.50-review-6 (owner-instructed): review-5 не принята —
   BLOCKER 1: testcScriptOutBound не является заявленной conservative upper bound
@@ -79,6 +79,36 @@ Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependen
   no_xy_root=436 vs charged/model 376/428 reconciled:false). Правильные части review-6
   сохраняются (BuiltinResult для T.testC, newMetatableShared, __name до publish,
   clean-C provenance); open-count 21→22.
+
+  ЗАКРЫТО фазой P16.50-review-7 (2026-09-18): BLOCKER 1 — C-API upvalue-примитивы
+  на PUC aux_upvalue-контракте (c_api.zig:3394 AuxUpvalue/auxUpvalue/upvalueCName;
+  getupvalue/setupvalue/upvalueid/upvaluejoin: не-Closure/out-of-range → NULL без
+  debug-library exception, C-closure ''-name/write-through/stable id, push OOM →
+  LUA_ERRMEM; попутный parity-фикс State.pcall raw-status propagation api.zig:801,
+  OOM→LUA_ERRMEM 4+MEMERRMSG); BLOCKER 2 — newMetatableShared tname в gcTempRoots
+  (vm.zig:32720+: roots.ensure(2)+key до allocTable), publish apiRawSet с rooted
+  key — emergency GC не может sweep'нуть __name/registry key; BLOCKER 3 —
+  транзакционная continuation publication в 4 окнах (tryPushBytecodeProtectedCall,
+  tryPushBytecodeDebugHook, applyBytecodePendingHook store_results,
+  beginBytecodeClose/opTailcall): prepare pending capacity → allocate/init →
+  infallible publish → disarm owner; FailingAllocator per-edge матрицы с baseline
+  equality; BLOCKER 4 — все semantically unbounded builtins на BuiltinResult.owned
+  exact slices (pcall/xpcall incl. C-target+continuations, coroutine.resume/yield/
+  wrap-iter, dofile, table.unpack hybrid, T.testC) — нет 256-truncation (repro
+  resume(yield(unpack 1..300)) → 301), differential vs реальный PUC 5.5.0 binary
+  0/1/255/256/257/300 идентичен; BLOCKER 5 — status_summary.py честно разделяет
+  snapshot (runs=5) / gate protocol (validated current-gate.json, 21 seeds) /
+  api580 measured_delta_* (384/436) vs charged/model (376/428 reconciled:false) —
+  fixture tools/test_status_summary.py. Гейты фазы: unit 258/258 D+RF 0 leaks;
+  matrix --testc 31/32 (zig_fail=0, big.lua both_fail pre-existing); smoke 84/84;
+  c_api 0 FAIL + test-diff PASS; 23 heavy testc-лейнов rc=0; api580 GREEN;
+  fixed-load GREEN; gc.lua differential + crash contract 20/20; fmt +
+  git-diff-check clean; owner repros R1 (resume 301)/R2 (pcall settop-300 301)/
+  R3 (newmetatable __name) green. Perf: ОДНА объявленная paired-seed clean-C
+  сессия (seeds 1..21) на commit C + полное canonical current-* перегенерирование —
+  verdict-строка дописана артефактным коммитом D (STATUS — artifact-class per
+  tools/provenance.py ARTIFACT_PATHS; единственный source commit C сохранён).
+  open-count 22→21.
 
   статический сканер `testcScriptOutBound` полностью удалён (остались только
   комментарии-ориентиры vm.zig:46626, vm.zig:55080, документирующие отвергнутый
@@ -7610,6 +7640,151 @@ provenance-расщепления review-5).
   владельца)**: locals.lua stderr GC-pacing dot diff (3 vs 2, HEAD-level);
   Debug-build cstack.lua native-stack exhaustion edge (<1% RF flake,
   HEAD-level); big.lua both_fail (pre-existing, matrix).
+
+### P16.50-review-7: upvalue C-API contract, tname rooting, transactional continuations, exact dynamic results (2026-09-18)
+
+Фаза по owner-ledger item (переоткрыт 77105d6; open-count 21→22→закрыт→21).
+Коммиты: C = measured source (настоящий коммит; RF binary sha256
+eb188358e12f9bbe83752e38f6c569ca68543529c18714ffd827b43b155f1ade,
+верифицирован determinism-rebuild после C) → D = wrapper (полное canonical
+current-* перегенерирование на clean C + объявленная clean-C paired-seed
+perf-сессия; source_head сессии = C, source_dirty = clean).
+
+- **BLOCKER 1 — C-API upvalue-примитивы через Lua debug library**: старые
+  lua_getupvalue/lua_setupvalue делегировали в State.getupvalue/setupvalue →
+  debug.getupvalue, который бросает "function expected" для не-Closure
+  (12_chook t11 c_callee_call_identity — gate красный). Переписаны на PUC
+  aux_upvalue-контракт (lapi.c:1367-1391): новый `AuxUpvalue` +
+  `auxUpvalue` (c_api.zig:3394: normalizeIndex → .Closure switch, else NULL
+  без ошибки; unsigned `n-%1 >= upvalues.len` → NULL) + `upvalueCName`
+  (C-closure → статический `""`; Lua-closure → interned proto-name,
+  OOM → LUA_ERRMEM через cThrowOn).
+  - `lua_getupvalue` (c_api.zig:3439): имя резолвится ДО push (PUC
+    aux_upvalue до setobj2s/api_incr_top); push `cell.get` OOM →
+    LUA_ERRMEM longjmp (не silent NULL — старый `catch return null`
+    мисрепортил "no such upvalue").
+  - `lua_setupvalue` (c_api.zig:3455): pop top → `cell.set` (write-through
+    для open cells) → gcWriteBarrierCell (class-(d) documented) → имя.
+  - `lua_upvalueid` (c_api.zig:3481): Cell-указатель = стабильная identity
+    для обоих видов closures (PUC: UpVal* для LCL, &f->upvalue[n-1] для CCL).
+  - `lua_upvaluejoin` (c_api.zig:3504): только Lua-closures (PUC
+    getupvalref api_check); re-point `cl1.upvalues[idx1] = cl2.upvalues[idx2]`
+    + gcForwardBarrierCell — shared identity (setupvalue через одну видна
+    через другую; upvalueid равны после join), не копия значения.
+  - `vm_mod.Vm.debugUpvalueName` и `gcForwardBarrierCell` сделаны pub
+    (namespaced fn внутри Vm — вызов `vm_mod.Vm.debugUpvalueName(cl, idx)`).
+  - **Попутный parity-фикс (обязательный для OOM-наблюдаемости)**:
+    `State.pcall` (api.zig:801) flattening всех apiCall-ошибок в
+    .runtime_error → PUC luaD_pcall raw-status propagation: OOM →
+    .memory_error (LUA_ERRMEM 4) + безусловный setOutOfMemoryError
+    (fixed MEMERRMSG, luaD_seterrorobj(ERRMEM) parity). Yieldable-путь
+    (luaPcallKShared) уже пропагировал raw error — не тронут.
+  - Тесты (c_api.zig:4174+): contract-тест (non-function NULL/no-push/no-pop
+    для всех четырёх; C-closure name ""/value push/write-through/stable id;
+    index 0 unsigned-wrap → NULL; out-of-range → NULL; Lua-closure name "x"/
+    value 7→8 write-through; upvaluejoin cell-sharing через upvalueid
+    pointer equality + write-through видимость) + OOM-тест (file-scope
+    FailingAllocator armed внутри cf: stage closure на fresh c_stack,
+    fill to exact capacity, arm fail_index=0 + resize_fail_index=0 —
+    ArrayList growth идёт через remap/resize first, оба бюджета должны
+    исчерпаться; lua_getupvalue push → LUA_ERRMEM; err_obj == "not enough
+    memory"). Negative-before: t11 FAIL "bad argument #1 to 'getupvalue'
+    (function expected)" на старом коде.
+- **BLOCKER 2 — newMetatableShared держал interned tname только в Zig-local**:
+  между internStr и allocTable emergency GC мог sweep'нуть short string →
+  dangling __name/registry key. Фикс (vm.zig:32720+): gcTempRoots owner до
+  первого GC-capable шага — roots.ensure(2) + addAssumeCapacity(key) ДО
+  allocTable; allocTable → addAssumeCapacity(mt) → root_stack.append →
+  setField(__name) → publish через apiRawSet(reg, rooted key, mt)
+  (публикация именно ROOTED key, не setField re-intern).
+  - Тесты (vm.zig, после review-6 per-edge теста): emergency-GC тест
+    (P50r7EmergencyAlloc — file-scope allocator, первый Table-sized alloc
+    триггерит testcEmergencyCollect + retry; pre-intern tname UNROOTED как
+    identity oracle: `key_pre == key_post` — clean negative oracle;
+    registry/__name identity, post-publish full GC survival, teardown
+    collection) + roots-reserve OOM тест (fail_index=0 на ensure(2) —
+    ничего не закоммичено, temp-roots snapshot восстановлен). Review-6
+    per-edge тест дополнен dedicated root-edge phase (saw_root_oom
+    перестал стрелять на старом sweep — старый edge был roots.add infra
+    alloc, теперь infallible; новый edge: root_stack.append после
+    teardown). Negative-before: временный revert → LuaString pointer
+    identity mismatch (emergency GC swept unrooted key), фикс восстановлен.
+  - T3 тест (vm.zig:51748) Segment A обновлен с обоснованием: ассерты
+    кодировали старый null-name контракт; PUC-контракт — "" (nm1..nm5
+    non-null, span len 0).
+- **BLOCKER 3 — continuation publication не транзакционна (4 окна)**: единое
+  правило prepare pending capacity → allocate/init continuation → infallible
+  publish → disarm local owner; до publish все side effects откатимы.
+  - `tryPushBytecodeProtectedCall`: errdefer owner на protection_ptr + полный
+    rollback snapshot до мутаций; stack-fallback переносит saved_ncalls/
+    tbc_chain_base — глубина ccallEnter восстанавливается корректно.
+  - `tryPushBytecodeDebugHook`: owner guard ДО первого fallible op;
+    transfer_copy освобождается ровно один раз; callee/tailcall восстановлены
+    до successful publish; после publish cleanup принадлежит pending-call.
+  - `applyBytecodePendingHook(.store_results)`: pending slot переиспользуется
+    (зарезервирован до clear) со infallible completion + deep cleanup
+    freeBytecodeHookPost для payload.
+  - `beginBytecodeClose`/`opTailcall`: явная adoption boundary — pending slot
+    зарезервирован до создания/получения результата, ret_owned снимается
+    только после подтверждённого adoption; freeBytecodeClosePost освобождает
+    только действительно owned slices; bc_return_scratch borrowed — не
+    освобождается.
+  - FailingAllocator per-edge матрицы для всех publish/adoption edges с
+    baseline equality (nCcalls/protected depth/errfunc/pending index/live
+    allocations равны baseline после каждого провала).
+- **BLOCKER 4 — production dynamic results обрезались на 256**: actual-result
+  contract обобщён на все semantically unbounded builtins — BuiltinResult.owned
+  exact slices: pcall/xpcall (incl. C-target и continuation variants),
+  coroutine.resume/yield/wrap-iter, dofile, table.unpack hybrid, T.testC.
+  builtin_const_out_len: pcall/xpcall/resume/yield/wrap_iter 256→0, dofile
+  16→0; io_read/file_read dynamic с exact counts; last_builtin_out_count
+  удалён как transport для migrated paths (сохранён только для доказанно
+  bounded window builtins с комментариями); OP_TAILCALL max(outLen,1)
+  nil-fabrication удалена; tryPushBytecodeProtectedCall pre-region counted
+  allocs → infraAlloc. Differential vs реальный PUC 5.5.0 binary: 0/1/255/
+  256/257/300 результатов идентичны (resume-yield, normal coroutine return,
+  wrap, pcall/xpcall Lua и C target, dofile, tail/multi assignment); return
+  hook, `<close>`, nested coroutine, OOM после получения exact payload.
+  Negative-before: resume(yield(unpack 1..300)) → r.n==256;
+  pcall(T.testC,"settop 300; return *") → 256 вместо 301.
+- **BLOCKER 5 — status generator смешивал snapshot и gate protocol**:
+  tools/status_summary.py переписан — provenance разделён по source of truth:
+  ratios/geomean из ordinary current.json snapshot (помечен как snapshot;
+  run-count никогда не выдаётся за gate protocol); paired-seed protocol
+  (seed list/runs, verdict) из отдельно загруженного и провалидированного
+  current-gate.json (schema-валидация runs/seed population/provenance
+  identity); api580 ledger из measured-полей measured_delta_anchored=384/
+  no_xy_root=436, charged/model totals 376/428 (reconciled:false) явно
+  помечены как model charges; missing/corrupt/identity-mismatch →
+  unavailable/inconclusive, никогда не invented protocol. Fixture-тесты
+  tools/test_status_summary.py (57 проверок): snapshot runs=5 + gate runs=21
+  никогда не создаёт текст «5 published seeds»; mismatch source/binary не
+  даёт green claim.
+- **Попутно (found+fixed за пределами плана)**: два test-side index bug
+  (pushcclosure pops upvalues; non-final truncation в multi-return cf);
+  FailingAllocator resize_fail_index=0 arming (ArrayList growth идёт через
+  remap/resize first — оба бюджета исчерпаются).
+- **Perf**: ОДНА объявленная paired-seed clean-C сессия (seeds 1..21) на
+  commit C (source_head = C, source_dirty = clean) — verdict в
+  tools/perf/current-gate.json + current-gate-manifest.json (commit D);
+  manifest append-only; baselines byte-identical (baseline-approved/
+  baseline-p15.37/core_baseline не тронуты). Полное canonical current-*
+  перегенерирование на clean C / RF binary — артефактным коммитом D.
+- **Батарея**: 258/258 unit (Debug+ReleaseFast, 0 leaks), 23 heavy testc-лейна
+  rc=0, matrix --testc 31/32 (zig_fail=0, big.lua both_fail pre-existing),
+  smoke 84/84, c_api test 0 FAIL + test-diff DIFF PASS (t11 PASS), api580
+  GREEN, fixed-load-footprint GREEN, gc.lua differential + crash contract
+  20/20, fmt + git-diff-check clean; owner repros R1 (coroutine.resume 301)/
+  R2 (pcall settop-300 → 301)/R3 (newmetatable __name) green.
+- **Out-of-scope residuals (задокументированы для владельца, не чинились
+  фазой)**: (a) `__close` выполняется на coroutine-body error unwind, тогда
+  как PUC lua_resume error path не вызывает closeprotected
+  (testes/coroutine.lua:186-196 полагается на явный coroutine.close) —
+  verified pre-existing; (b) applyBytecodePendingGsub publication window +
+  completeBytecodeExecFrame ret-leak class (тот же класс, что BLOCKER 3,
+  unblocked windows); (c) checkTabArg принимает metatable'd non-Tables для
+  table.unpack; (d) pre-existing: big.lua both_fail (matrix), locals.lua
+  GC-pacing dot diff, cstack.lua Debug native-stack exhaustion edge.
 
 ### P16.50-review-5: rescue + completion (2026-09-17)
 

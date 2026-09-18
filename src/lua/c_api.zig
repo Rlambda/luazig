@@ -2121,8 +2121,11 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
         vm.cur_c_stack = saved_cur_c_stack;
     }
 
-    var out: [64]vm_mod.Value = undefined;
-    for (&out) |*v| v.* = .Nil;
+    // P16.50-review-7 BLOCKER 4: apiResumeThread returns the resume's
+    // EXACT tuple ([ok] ++ values) as an owned slice — the old 64-slot
+    // window truncated every C-API resume to 63 results (PUC lua_resume
+    // returns ALL results on the stack). Freed via vm.alloc.free (the
+    // charged-block registry passes infraAlloc'd blocks through).
     // P15.83q: pre-call status snapshot. A thread that is already dead
     // can only produce PUC's `resume_error` boundary ("cannot resume
     // dead coroutine", ldo.c:895-903 + 970): the pushed args are popped,
@@ -2132,7 +2135,7 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
     // from an error raised inside the coroutine, which flows through
     // luaD_seterrorobj (the [err, err] duplicated window below).
     const dead_before_call = co.status == .dead;
-    const produced = vm.apiResumeThread(co, args, out[0..]) catch {
+    const res = vm.apiResumeThread(co, args) catch {
         // Error path (PUC ldo.c:983-988): `L->status = status`, then
         // luaD_seterrorobj(L, status, L->top) and `L->ci->top = L->top`.
         // luaD_seterrorobj (ldo.c:112-122) COPIES the top-1 error object
@@ -2175,7 +2178,8 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
         // kind finishCcall carried), ERRERR (5), ERRRUN (2).
         return if (co.api_status != 0) co.api_status else if (co.err_is_errerr) 5 else 2;
     };
-    const failed = produced > 0 and !(out[0] == .Bool and out[0].Bool);
+    defer vm.alloc.free(res);
+    const failed = res.len > 0 and !(res[0] == .Bool and res[0].Bool);
     if (failed) {
         if (dead_before_call) {
             // PUC resume_error (ldo.c:895-903): pop the pushed args,
@@ -2184,7 +2188,7 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
             // thread is "cannot resume dead coroutine".
             h.c_stack.items.len -= @min(nargs_usize, h.c_stack.items.len);
             // (b): same window-append contract as the error path above.
-            h.c_stack.append(vm.alloc, out[1]) catch {};
+            h.c_stack.append(vm.alloc, res[1]) catch {};
             return 2;
         }
         // Real error inside the coroutine: PUC error window (luaD_seterrorobj
@@ -2199,8 +2203,8 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
         // (b): the [residue?, err, err] window appends — status (below)
         // survives an append OOM; only the observable window is lost.
         if (co.api_err_residue) |r| h.c_stack.append(vm.alloc, r) catch {};
-        h.c_stack.append(vm.alloc, out[1]) catch {};
-        h.c_stack.append(vm.alloc, out[1]) catch {};
+        h.c_stack.append(vm.alloc, res[1]) catch {};
+        h.c_stack.append(vm.alloc, res[1]) catch {};
         if (nres) |p|
             p.* = @intCast(if (h.c_stack.items.len > lua_resume_base)
                 h.c_stack.items.len - lua_resume_base
@@ -2213,8 +2217,7 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
     }
     // Success or yield: replace function+args with results on c_stack.
     h.c_stack.items.len = lua_resume_base;
-    const nres_usize: usize = if (produced > 0) produced - 1 else 0;
-    h.c_stack.appendSlice(vm.alloc, out[1 .. 1 + nres_usize]) catch {
+    h.c_stack.appendSlice(vm.alloc, res[1..]) catch {
         // PUC luaD_poscall moves results within ONE stack (infallible);
         // our append can OOM — report LUA_ERRMEM with the fixed MEMERRMSG
         // object installed instead of silently reporting LUA_OK with
@@ -2223,7 +2226,7 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
         if (nres) |p| p.* = 0;
         return 4;
     };
-    if (nres) |p| p.* = @intCast(nres_usize);
+    if (nres) |p| p.* = @intCast(res.len - 1);
     // Return LUA_YIELD (1) if suspended, LUA_OK (0) if done.
     const st_result: c_int = if (co.status == .suspended) 1 else 0;
     if (st_result == 1) {
@@ -3374,73 +3377,130 @@ pub export fn lua_setlocal(L: ?*lua_State, ar: *lua_Debug, n: c_int) ?[*:0]const
     return null; // no n-th active local
 }
 
-pub export fn lua_getupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]const u8 {
-    var s = api.State.fromHandle(L orelse return null);
+/// PUC `aux_upvalue` (lapi.c:1367-1391) resolved at the C-API layer —
+/// NEVER through the Lua debug library. PUC contract:
+///   - C closure (LUA_VCCL)  → the upvalue slot; the name is `""` (C
+///     closures have unnamed upvalues);
+///   - Lua closure (LUA_VLCL) → the upvalue slot; the name comes from the
+///     proto (PUC returns "(no name)" when the proto records none);
+///   - ANY other value — including light C functions (LUA_VLCF) — → NULL,
+///     with NO error raised (PUC's `default: return NULL` arm).
+/// `n` must be in [1, nupvalues]: PUC's unsigned `cast_uint(n) - 1u <
+/// nupvalues` check — n <= 0 wraps to a huge unsigned and fails the range
+/// test, so index 0 and negatives are out of range by construction.
+///
+/// P16.50-review-7 B1: the old `lua_getupvalue`/`lua_setupvalue` fell
+/// through to `State.getupvalue`/`State.setupvalue`, which invoke the Lua
+/// function `debug.getupvalue` — raising "function expected" for
+/// non-function values (12_chook t11: `lua_getupvalue(L, 1, 1)` on the
+/// integer argument inside a C closure). PUC returns NULL there.
+const AuxUpvalue = struct {
+    /// The upvalue cell (our UpVal equivalent — the slot PUC's `*val`
+    /// points at; open cells read/write through to the owning stack).
+    cell: *vm_mod.Cell,
+    /// PUC's name return: `""` for C closures, the proto name for Lua
+    /// closures. `null` never reaches here (handled by the caller).
+    name: []const u8,
+    /// PUC LUA_VCCL vs LUA_VLCL discrimination: C closures report the
+    /// static `""` name; Lua-closure names are proto source slices that
+    /// need interning to become NUL-terminated C strings.
+    c_closure: bool,
+};
+
+fn auxUpvalue(s: *api.State, funcindex: c_int, n: c_int) ?AuxUpvalue {
     const abs = normalizeIndex(funcindex, s.stack.items.len) orelse return null;
-    // C closures: direct upvalue access
-    if (s.stack.items[abs] == .Closure) {
-        const cl = s.stack.items[abs].Closure;
-        if (cl.c_func != null) {
-            const idx: usize = @intCast(@max(n - 1, 0));
-            if (idx >= cl.upvalues.len) return null;
-            // PUC lua_getupvalue → api_incr_top: OOM is LUA_ERRMEM
-            // (P16.50-review-5 B2 — the old `catch return null`
-            // misreported "no such upvalue").
-            s.stack.append(s.vm.alloc, cl.upvalues[idx].value) catch |e| cThrowOn(s.vm, L.?, e);
-            return null; // C closures have unnamed upvalues
-        }
-    }
-    // Lua closures: use debug module
-    const name = s.getupvalue(funcindex, @intCast(@max(n, 0))) catch |e| switch (e) {
-        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+    const cl = switch (s.stack.items[abs]) {
+        .Closure => |c| c,
+        // PUC aux_upvalue default arm: not a closure → NULL (no error).
         else => return null,
     };
-    if (name) |nm| return @ptrCast(@constCast(nm.ptr));
-    return null;
+    // PUC: `!(cast_uint(n) - 1u < cast_uint(nupvalues))` → NULL.
+    const un: c_uint = @as(c_uint, @bitCast(n)) -% 1;
+    if (un >= cl.upvalues.len) return null;
+    const idx: usize = @intCast(un);
+    return .{
+        .cell = cl.upvalues[idx],
+        .name = if (cl.c_func != null) "" else vm_mod.Vm.debugUpvalueName(cl, idx),
+        .c_closure = cl.c_func != null,
+    };
+}
+
+/// Resolve the C-API upvalue name as a NUL-terminated `const char*`.
+/// C closures use the static `""` (PUC aux_upvalue LUA_VCCL arm). Lua
+/// closure names are proto source slices WITHOUT a trailing NUL, so the
+/// canonical INTERNED string (which stores one — LuaString.bytes' contract)
+/// is produced — the same object the debug library hands out. PUC returns
+/// the proto's name pointer without allocating; the intern is our
+/// representation-faithful equivalent (our names are not NUL-terminated),
+/// and its OOM is LUA_ERRMEM like every PUC api_incr_top failure.
+fn upvalueCName(s: *api.State, L: *lua_State, aux: AuxUpvalue) ?[*:0]const u8 {
+    if (aux.c_closure) return ""; // PUC's static "" (LUA_VCCL arm)
+    const istr = s.vm.internStr(aux.name) catch cThrowOn(s.vm, L, error.OutOfMemory);
+    return @ptrCast(@constCast(istr.bytes().ptr));
+}
+
+pub export fn lua_getupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]const u8 {
+    var s = api.State.fromHandle(L orelse return null);
+    // PUC lua_getupvalue (lapi.c:1396-1405): aux_upvalue resolves the name
+    // and slot; NULL (never an error) for a non-closure or out-of-range n.
+    const aux = auxUpvalue(&s, funcindex, n) orelse return null;
+    // PUC resolves the name BEFORE the stack mutation (aux_upvalue runs
+    // before setobj2s/api_incr_top).
+    const name = upvalueCName(&s, L.?, aux);
+    // PUC setobj2s + api_incr_top: push the upvalue's CURRENT value (open
+    // cells read through to the owning thread's stack). OOM is LUA_ERRMEM
+    // (P16.50-review-5 B2 — the old `catch return null` misreported "no
+    // such upvalue").
+    s.stack.append(s.vm.alloc, aux.cell.get(s.vm)) catch |e| cThrowOn(s.vm, L.?, e);
+    return name;
 }
 
 pub export fn lua_setupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]const u8 {
     var s = api.State.fromHandle(L orelse return null);
-    const abs = normalizeIndex(funcindex, s.stack.items.len) orelse return null;
-    // C closures: direct upvalue write
-    if (s.stack.items[abs] == .Closure) {
-        const cl = s.stack.items[abs].Closure;
-        if (cl.c_func != null) {
-            const idx: usize = @intCast(@max(n - 1, 0));
-            if (idx >= cl.upvalues.len) return null;
-            if (s.stack.items.len < 1) return null;
-            const v = s.stack.items[s.stack.items.len - 1];
-            // P16.50-review (test finding 4): a write into a CLOSED cell
-            // must run the generational barrier (PUC lua_setupvalue →
-            // luaC_barrier for upvalue stores, lapi.c). The old direct
-            // field write skipped it — an old cell storing a young value
-            // missed promotion and the value could be swept.
-            cl.upvalues[idx].value = v;
-            // PUC luaC_barrier is infallible; our barrier-list append can
-            // OOM AFTER the observable cell write commits — throwing
-            // would not restore the missed barrier (class (d) documented,
-            // P16.50-review-5 B2; architectural fix = pre-reserved lists).
-            s.vm.gcWriteBarrierCell(cl.upvalues[idx], v) catch {};
-            s.stack.items.len -= 1;
-            return null;
-        }
-    }
-    // Lua closures: use debug module
-    const name = s.setupvalue(funcindex, @intCast(@max(n, 0))) catch |e| switch (e) {
-        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
-        else => return null,
-    };
-    if (name) |nm| return @ptrCast(@constCast(nm.ptr));
-    return null;
+    // PUC lua_setupvalue (lapi.c:1407-1421): aux_upvalue; NULL (no error)
+    // for a non-closure or out-of-range n; on success pops the value from
+    // the stack top, stores it into the upvalue slot, and runs the write
+    // barrier (luaC_barrier(L, owner, val)).
+    const aux = auxUpvalue(&s, funcindex, n) orelse return null;
+    // PUC api_checknelems(L, 1) is a no-op in release builds; we fail soft
+    // (NULL) instead of popping from an empty stack.
+    if (s.stack.items.len == 0) return null;
+    const name = upvalueCName(&s, L.?, aux);
+    const v = s.stack.items[s.stack.items.len - 1];
+    // Store into the slot PUC's `*val` designates: open cells write
+    // through to the owning thread's stack slot, closed cells to the
+    // cell's own value (Cell.set handles both — PUC writes through *val,
+    // which for open upvalues IS the stack slot).
+    aux.cell.set(s.vm, v);
+    // PUC luaC_barrier is infallible; our barrier-list append can OOM
+    // AFTER the observable cell write commits — throwing would not restore
+    // the missed barrier (class (d) documented, P16.50-review-5 B2;
+    // architectural fix = pre-reserved lists).
+    s.vm.gcWriteBarrierCell(aux.cell, v) catch {};
+    s.stack.items.len -= 1;
+    return name;
 }
 
 pub export fn lua_upvalueid(L: ?*lua_State, fidx: c_int, n: c_int) ?*anyopaque {
     const s = api.State.fromHandle(L orelse return null);
     const abs = normalizeIndex(fidx, s.stack.items.len) orelse return null;
-    if (s.stack.items[abs] != .Closure) return null;
-    const cl = s.stack.items[abs].Closure;
-    const idx: usize = @intCast(@max(n - 1, 0));
-    if (idx >= cl.upvalues.len) return null;
+    const cl = switch (s.stack.items[abs]) {
+        .Closure => |c| c,
+        // PUC lua_upvalueid (lapi.c:1441-1459): light C functions
+        // (LUA_VLCF) and non-functions → NULL (the api_check in the
+        // default arm is a release no-op).
+        else => return null,
+    };
+    // PUC: LCL out-of-range → NULL (getupvalref's nullup); CCL out-of-range
+    // → falls through to NULL.
+    const un: c_uint = @as(c_uint, @bitCast(n)) -% 1;
+    if (un >= cl.upvalues.len) return null;
+    const idx: usize = @intCast(un);
+    // PUC LCL returns the UpVal object pointer; CCL returns &f->upvalue[n-1]
+    // — the address of the closure's own upvalue slot. Our representation
+    // gives both closures heap Cells: the Cell pointer is the stable
+    // per-closure-lifetime identity in both cases (for C closures the Cell
+    // plays the role of PUC's inline upvalue slot).
     return @ptrCast(cl.upvalues[idx]);
 }
 
@@ -3448,13 +3508,36 @@ pub export fn lua_upvaluejoin(L: ?*lua_State, fidx1: c_int, n1: c_int, fidx2: c_
     const s = api.State.fromHandle(L orelse return);
     const abs1 = normalizeIndex(fidx1, s.stack.items.len) orelse return;
     const abs2 = normalizeIndex(fidx2, s.stack.items.len) orelse return;
-    if (s.stack.items[abs1] != .Closure or s.stack.items[abs2] != .Closure) return;
-    const cl1 = s.stack.items[abs1].Closure;
-    const cl2 = s.stack.items[abs2].Closure;
-    const idx1: usize = @intCast(@max(n1 - 1, 0));
-    const idx2: usize = @intCast(@max(n2 - 1, 0));
-    if (idx1 >= cl1.upvalues.len or idx2 >= cl2.upvalues.len) return;
-    cl1.upvalues[idx1].value = cl2.upvalues[idx2].value;
+    // PUC lua_upvaluejoin (lapi.c:1463-1470) via getupvalref: ONLY Lua
+    // closures participate (api_check ttisLclosure — a release no-op; the
+    // manual documents non-Lua-closure input as undefined behavior). We
+    // fail soft: a silent no-op for any non-Lua-closure or out-of-range
+    // index, keeping the C-API contract non-raising (P16.50-review-7 B1).
+    const cl1 = switch (s.stack.items[abs1]) {
+        .Closure => |c| c,
+        else => return,
+    };
+    const cl2 = switch (s.stack.items[abs2]) {
+        .Closure => |c| c,
+        else => return,
+    };
+    if (cl1.proto == null or cl2.proto == null) return; // not Lua closures
+    const un1: c_uint = @as(c_uint, @bitCast(n1)) -% 1;
+    const un2: c_uint = @as(c_uint, @bitCast(n2)) -% 1;
+    if (un1 >= cl1.upvalues.len or un2 >= cl2.upvalues.len) return;
+    const idx1: usize = @intCast(un1);
+    const idx2: usize = @intCast(un2);
+    // PUC `*up1 = *up2`: re-point f1's upvalue slot to f2's UpVal object —
+    // NOT a value copy. After the join both closures observe the SAME
+    // upvalue cell (a setupvalue through one is visible through the
+    // other; lua_upvalueid reports the shared identity). The old code
+    // copied the current value, breaking exactly that shared identity.
+    @constCast(cl1.upvalues)[idx1] = cl2.upvalues[idx2];
+    // PUC luaC_objbarrier(L, f1, *up1) is infallible; a post-commit
+    // barrier-list append OOM follows the documented class-(d) pattern
+    // (see lua_setupvalue — throwing would not restore the missed
+    // barrier; architectural fix = pre-reserved lists).
+    s.vm.gcForwardBarrierCell(cl1, cl2.upvalues[idx2]) catch {};
 }
 
 /// PUC `lua_sethook` (ldebug.c:133): install/clear a C hook function.
@@ -4089,4 +4172,192 @@ test "c api lua_pushexternalstring: pushed string is readable" {
     const got = luaL_checklstring(L, -1, &len);
     try std.testing.expectEqual(@as(usize, content.len), len);
     try std.testing.expectEqualStrings(content, got[0..len]);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// P16.50-review-7 B1: the upvalue primitives follow the PUC C-API
+// contract (aux_upvalue, lapi.c:1367-1391) at the C-API layer — NEVER
+// through the Lua debug library. The old lua_getupvalue/lua_setupvalue
+// fell through to State.getupvalue/setupvalue → debug.getupvalue, which
+// raises "function expected" for non-function values (12_chook t11:
+// lua_getupvalue(L, 1, 1) on the integer argument inside a C closure).
+// PUC returns NULL there — no error, no push.
+// ─────────────────────────────────────────────────────────────────────
+test "c api upvalue primitives follow the PUC aux_upvalue contract" {
+    const L = luaL_newstate() orelse return error.OutOfMemory;
+    defer lua_close(L);
+
+    // ---- Non-function value: NULL, no error, nothing pushed (PUC
+    // aux_upvalue default arm).
+    lua_pushinteger(L, 23);
+    try std.testing.expect(lua_getupvalue(L, 1, 1) == null);
+    try std.testing.expectEqual(@as(c_int, 1), lua_gettop(L));
+    // setupvalue on a non-function: NULL, stack untouched (no pop —
+    // PUC pops only on success).
+    lua_pushinteger(L, 99);
+    try std.testing.expect(lua_setupvalue(L, -2, 1) == null);
+    try std.testing.expectEqual(@as(c_int, 2), lua_gettop(L));
+    try std.testing.expectEqual(@as(i64, 99), intAt(L, -1));
+    // upvalueid on a non-function: NULL (PUC lua_upvalueid default arm).
+    try std.testing.expect(lua_upvalueid(L, 1, 1) == null);
+    // upvaluejoin with non-functions: silent no-op (PUC documents
+    // non-Lua-closure input as UB; we fail soft — see lua_upvaluejoin).
+    lua_upvaluejoin(L, 1, 1, 1, 1);
+    try std.testing.expectEqual(@as(c_int, 2), lua_gettop(L));
+    lua_settop(L, 0);
+
+    // ---- C closure with 1 upvalue: name "" (PUC LUA_VCCL arm — a
+    // non-NULL empty string), value push/pop, write-through, stable id.
+    // lua_pushcclosure POPS the upvalue values and pushes the closure
+    // (PUC lapi.c) — the stack holds exactly the closure afterwards.
+    lua_pushinteger(L, 100);
+    lua_pushcclosure(L, cfuncReturns42, 1);
+    try std.testing.expectEqual(@as(c_int, 1), lua_gettop(L));
+    // Index 0: PUC's unsigned `n - 1u` wraps out of range → NULL.
+    try std.testing.expect(lua_getupvalue(L, -1, 0) == null);
+    // Out of range (2 > nupvalues): NULL.
+    try std.testing.expect(lua_getupvalue(L, -1, 2) == null);
+    try std.testing.expect(lua_setupvalue(L, -1, 2) == null);
+    try std.testing.expect(lua_upvalueid(L, -1, 2) == null);
+    // Valid n=1: name "" and the upvalue value pushed.
+    const cnm = lua_getupvalue(L, -1, 1);
+    try std.testing.expect(cnm != null);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.span(cnm.?).len);
+    try std.testing.expectEqual(@as(i64, 100), intAt(L, -1));
+    lua_pop(L, 1); // drop the pushed upvalue value → stack [cl]
+    // setupvalue: pops the value, returns "", writes the cell.
+    lua_pushinteger(L, 55);
+    const snm = lua_setupvalue(L, -2, 1);
+    try std.testing.expect(snm != null);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.span(snm.?).len);
+    try std.testing.expectEqual(@as(c_int, 1), lua_gettop(L)); // value popped
+    _ = lua_getupvalue(L, -1, 1);
+    try std.testing.expectEqual(@as(i64, 55), intAt(L, -1));
+    lua_pop(L, 1);
+    // upvalueid: non-null, stable across reads/writes; out-of-range NULL.
+    const cid = lua_upvalueid(L, -1, 1);
+    try std.testing.expect(cid != null);
+    try std.testing.expectEqual(cid, lua_upvalueid(L, -1, 1));
+    // upvaluejoin with a C closure participant: no-op (ids unchanged).
+    lua_upvaluejoin(L, -1, 1, -1, 1);
+    try std.testing.expectEqual(cid, lua_upvalueid(L, -1, 1));
+    lua_settop(L, 0);
+
+    // ---- Lua closure: proto name ("x"), value push, write-through.
+    try std.testing.expectEqual(@as(c_int, 0), luaL_loadstring(L, "local x = 7 return function() return x end"));
+    try std.testing.expectEqual(@as(c_int, 0), lua_pcallk(L, 0, 1, 0, 0, null));
+    try std.testing.expectEqual(@as(c_int, 6), lua_type(L, -1)); // LUA_TFUNCTION
+    // Index 0 → NULL (unsigned wrap), out-of-range → NULL.
+    try std.testing.expect(lua_getupvalue(L, -1, 0) == null);
+    try std.testing.expect(lua_getupvalue(L, -1, 2) == null);
+    // Valid n=1: name "x" (the proto-recorded upvalue name), value 7.
+    const lnm = lua_getupvalue(L, -1, 1);
+    try std.testing.expect(lnm != null);
+    try std.testing.expectEqualStrings("x", std.mem.span(lnm.?));
+    try std.testing.expectEqual(@as(i64, 7), intAt(L, -1));
+    lua_pop(L, 1); // drop the pushed upvalue value → stack [cl]
+    // setupvalue writes through the (closed) cell and returns "x".
+    lua_pushinteger(L, 8);
+    const lsnm = lua_setupvalue(L, -2, 1);
+    try std.testing.expectEqualStrings("x", std.mem.span(lsnm.?));
+    _ = lua_getupvalue(L, -1, 1);
+    try std.testing.expectEqual(@as(i64, 8), intAt(L, -1));
+    lua_settop(L, 0);
+    try std.testing.expectEqual(@as(c_int, 0), lua_gettop(L));
+
+    // ---- upvaluejoin: f1's upvalue slot is RE-POINTED to f2's cell
+    // (PUC `*up1 = *up2`, lapi.c:1470) — shared identity, not a value
+    // copy. The old code copied the value: the ids stayed distinct and
+    // a write through one was invisible through the other.
+    try std.testing.expectEqual(@as(c_int, 0), luaL_loadstring(
+        L,
+        "local function mk() local v = 0 return function() return v end, function(nv) v = nv end end local g1, s1 = mk() local g2, s2 = mk() return g1, s1, g2, s2",
+    ));
+    try std.testing.expectEqual(@as(c_int, 0), lua_pcallk(L, 0, 4, 0, 0, null));
+    // Stack: [g1, s1, g2, s2] — g1/s1 share one cell, g2/s2 another.
+    const g1_id = lua_upvalueid(L, -4, 1);
+    const s1_id = lua_upvalueid(L, -3, 1);
+    const g2_id = lua_upvalueid(L, -2, 1);
+    try std.testing.expect(g1_id != null and s1_id != null and g2_id != null);
+    try std.testing.expectEqual(g1_id, s1_id); // same function scope
+    try std.testing.expect(g1_id != g2_id); // independent mk() scopes
+    // Out-of-range join: no-op (ids unchanged).
+    lua_upvaluejoin(L, -4, 2, -2, 1);
+    try std.testing.expectEqual(g1_id, lua_upvalueid(L, -4, 1));
+    // Join g1's upvalue to g2's: g1 now observes g2's cell.
+    lua_upvaluejoin(L, -4, 1, -2, 1);
+    try std.testing.expectEqual(g2_id, lua_upvalueid(L, -4, 1));
+    try std.testing.expect(g1_id != lua_upvalueid(L, -4, 1)); // re-pointed
+    // The join is a slot re-point, not a value copy: a write through s2
+    // (g2's setter) is visible through g1's cell.
+    lua_pushinteger(L, 77);
+    try std.testing.expect(lua_setupvalue(L, -2, 1) != null); // s2 writes
+    _ = lua_getupvalue(L, -4, 1); // read g1's (joined) upvalue
+    try std.testing.expectEqual(@as(i64, 77), intAt(L, -1));
+}
+
+// --- review-7 B1: OOM-on-result-push fixtures (file scope — the
+// FailingAllocator must outlive the LUA_ERRMEM longjmp: vm.alloc keeps
+// pointing at it until the test restores the base after lua_pcallk) ---
+
+var b1_oom_base: std.mem.Allocator = undefined;
+var b1_oom_failing: std.testing.FailingAllocator = undefined;
+var b1_oom_closure: ?*vm_mod.Closure = null;
+
+fn b1CfGetupvaluePushOom(L: ?*lua_State) callconv(.c) c_int {
+    var s = api.State.fromHandle(L.?);
+    // Stage the Lua closure at index 1 on the fresh c_stack (pcallk with
+    // 0 args → the activation reserved LUA_MINSTACK spare slots), then
+    // fill the stack to EXACT capacity so the result push inside
+    // lua_getupvalue MUST allocate (the growth is the armed failure).
+    s.stack.append(s.vm.alloc, .{ .Closure = b1_oom_closure.? }) catch return -1;
+    while (s.stack.capacity > s.stack.items.len) {
+        s.stack.append(s.vm.alloc, .Nil) catch return -1;
+    }
+    // Arm: from here the ONLY fallible step is the result push (the
+    // upvalue name "x" is pre-interned by the test — the name lookup is
+    // an intern-table hit, no allocation). ArrayList growth tries
+    // remap/resize FIRST and falls back to a fresh alloc, so BOTH the
+    // remap and the alloc budgets must fail for the push to OOM.
+    b1_oom_failing = std.testing.FailingAllocator.init(b1_oom_base, .{ .fail_index = 0, .resize_fail_index = 0 });
+    s.vm.alloc = b1_oom_failing.allocator();
+    _ = lua_getupvalue(L, 1, 1); // OOM on the push → LUA_ERRMEM longjmp
+    return 0; // unreachable on the armed failure
+}
+
+test "c api lua_getupvalue OOM on result push is LUA_ERRMEM" {
+    const L = luaL_newstate() orelse return error.OutOfMemory;
+    defer lua_close(L);
+    const vm = L.vm;
+
+    // A Lua closure with one named upvalue; pre-intern "x" so the ONLY
+    // fallible step inside lua_getupvalue is the result push (PUC
+    // api_incr_top → luaD_throw(LUA_ERRMEM)).
+    try std.testing.expectEqual(@as(c_int, 0), luaL_loadstring(L, "local x = 7 return function() return x end"));
+    try std.testing.expectEqual(@as(c_int, 0), lua_pcallk(L, 0, 1, 0, 0, null));
+    const s = api.State.fromHandle(L);
+    b1_oom_closure = s.stack.items[s.stack.items.len - 1].Closure;
+    // Keep the closure and the name alive across the pcall (temp roots —
+    // the swapped-out main stack is not GC-marked during the C call).
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(.{ .Closure = b1_oom_closure.? });
+    const xkey = try vm.internStr("x");
+    try roots.add(.{ .String = xkey });
+
+    lua_settop(L, 0);
+    lua_pushcfunction(L, b1CfGetupvaluePushOom);
+    b1_oom_base = vm.alloc;
+    const status = lua_pcallk(L, 0, 0, 0, 0, null);
+    // Restore the base allocator BEFORE any other API use (the longjmp
+    // left vm.alloc pointing at the (still valid, file-scope) failing
+    // allocator; its single failure budget is already spent).
+    vm.alloc = b1_oom_base;
+
+    // PUC lua_getupvalue → api_incr_top OOM → luaD_throw(LUA_ERRMEM).
+    try std.testing.expectEqual(@as(c_int, 4), status); // LUA_ERRMEM
+    // The fixed MEMERRMSG error object is installed (luaD_seterrorobj
+    // parity — "not enough memory", not a nil).
+    try std.testing.expect(vm.errThread().err_has_obj);
+    try std.testing.expectEqualStrings("not enough memory", vm.errThread().err_obj.String.bytes());
 }

@@ -8,6 +8,20 @@ Reads JSON reports produced by the test/perf lanes:
   --perf-json     `python3 tools/perf_compare.py --json-out <path>`
 plus the C API suite list parsed from tests/c_api/Makefile (TESTS variable).
 
+Performance provenance is split by source of truth (P16.50-review-7 BLOCKER 5):
+  - ratios/geomean come from the ordinary measurement snapshot (current.json)
+    and are labeled as such; the snapshot run-count is NEVER presented as the
+    gate protocol;
+  - the paired-seed protocol claim (seed list/runs, verdict) comes from a
+    separately loaded and VALIDATED tools/perf/current-gate.json;
+  - the api580 fixed-load footprint comes from tools/perf/current-api580-ledger.json
+    and uses the MEASURED fields (measured_delta_anchored/no_xy_root); the
+    charged/model totals are explicitly labeled as model charges, never as
+    measurements.
+A missing or schema-incompatible gate/ledger yields honest unavailable/
+inconclusive wording, never an invented protocol. A gate/ledger recorded on a
+different source/binary than the snapshot is never rendered as a green claim.
+
 Emits a deterministic markdown status block (parity table + performance
 table). With --write-readme the block replaces the content between the
 BEGIN/END GENERATED STATUS markers in README.md; by default the block is
@@ -30,6 +44,8 @@ ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
 CAPI_MAKEFILE = ROOT / "tests" / "c_api" / "Makefile"
 PHASE_FILE = ROOT / "tools" / "status" / "phase.txt"
+GATE_DEFAULT = ROOT / "tools" / "perf" / "current-gate.json"
+API580_DEFAULT = ROOT / "tools" / "perf" / "current-api580-ledger.json"
 
 BEGIN_MARKER = "<!-- BEGIN GENERATED STATUS (tools/status_summary.py) -->"
 END_MARKER = "<!-- END GENERATED STATUS -->"
@@ -57,6 +73,28 @@ def load_json(path: str | None) -> dict | None:
         print(f"note: {path} does not exist, skipping", file=sys.stderr)
         return None
     return json.loads(p.read_text(encoding="utf-8"))
+
+
+def load_artifact(path: str | None) -> object | None:
+    """Load a canonical perf artifact tolerantly.
+
+    Returns None when the file is missing (rendered as "unavailable") and
+    the string "corrupt" when it exists but does not parse (rendered as
+    "inconclusive" by the validators below). Never raises, so a damaged
+    artifact cannot crash the generator.
+    """
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        print(f"note: {path} does not exist, skipping", file=sys.stderr)
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(f"note: {path} is not valid JSON ({e}); treating as corrupt",
+              file=sys.stderr)
+        return "corrupt"
 
 
 def parse_capi_suite_count(makefile: Path) -> int | None:
@@ -134,45 +172,254 @@ def matrix_nonpass_detail(matrix: dict) -> str:
     return "; ".join(f"{cls}: {', '.join(files)}" for cls, files in sorted(by_class.items()))
 
 
-def perf_section(perf: dict | None, versioned: bool = False) -> list[str]:
-    """Build the Performance section: geomean + per-workload table (worst first).
+# ---------------------------------------------------------------------------
+# Performance section: snapshot numbers vs gate protocol vs api580 ledger
+# ---------------------------------------------------------------------------
+
+# Provenance fields that identify the measured source/binary. Two artifacts
+# agree only when every field present in BOTH carries the same value; no
+# shared field means the identity relation is unverifiable.
+IDENTITY_KEYS = ("measured_source_head", "git_head",
+                 "zig_binary_sha16", "puc_binary_sha16")
+
+
+def validate_gate(gate: object) -> tuple[bool, str]:
+    """Validate the paired-seed gate artifact schema.
+
+    Required: a positive integer ``runs``, a ``result.verdict``, a
+    ``zig_samples`` population where every workload carries exactly one row
+    per published seed (same seed set everywhere, no duplicates, usable
+    seed identities, positive instruction counts), and a ``provenance``
+    block with at least one source/binary identity field. Returns
+    (ok, reason); reason is empty when ok.
+    """
+    if not isinstance(gate, dict):
+        return False, "gate artifact is not a JSON object"
+    runs = gate.get("runs")
+    if isinstance(runs, bool) or not isinstance(runs, int) or runs <= 0:
+        return False, "runs must be a positive integer"
+    result = gate.get("result")
+    if not isinstance(result, dict):
+        return False, "result section missing"
+    verdict = result.get("verdict")
+    if not isinstance(verdict, str) or not verdict:
+        return False, "result.verdict missing"
+    samples = gate.get("zig_samples")
+    if not isinstance(samples, dict) or not samples:
+        return False, "zig_samples section missing"
+    seed_sets: list[frozenset[int]] = []
+    for wl, rows in samples.items():
+        if not isinstance(rows, list) or not rows:
+            return False, f"zig_samples[{wl}] has no rows"
+        seeds: list[int] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                return False, f"zig_samples[{wl}] has a malformed row"
+            s = r.get("seed")
+            if isinstance(s, bool) or not isinstance(s, int) or s <= 0:
+                return False, f"zig_samples[{wl}] has a row with an unusable seed"
+            ins = r.get("instructions")
+            if isinstance(ins, bool) or not isinstance(ins, int) or ins <= 0:
+                return False, f"zig_samples[{wl}] has a row with unusable instructions"
+            seeds.append(s)
+        if len(set(seeds)) != len(seeds):
+            return False, f"zig_samples[{wl}] has duplicate seeds"
+        seed_sets.append(frozenset(seeds))
+    if any(s != seed_sets[0] for s in seed_sets[1:]):
+        return False, "workloads carry different seed populations"
+    if len(seed_sets[0]) != runs:
+        return False, (f"runs={runs} but workloads carry "
+                       f"{len(seed_sets[0])} distinct seeds")
+    prov = gate.get("provenance")
+    if not isinstance(prov, dict):
+        return False, "provenance section missing"
+    if not any(k in prov for k in IDENTITY_KEYS):
+        return False, "provenance carries no source/binary identity fields"
+    return True, ""
+
+
+def validate_api580(doc: object) -> tuple[bool, str]:
+    """Validate the api580 fixed-load ledger schema (measured fields only)."""
+    if not isinstance(doc, dict):
+        return False, "ledger is not a JSON object"
+    for key in ("measured_delta_anchored", "measured_delta_no_xy_root",
+                "gate_threshold"):
+        v = doc.get(key)
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            return False, f"{key} must be a non-negative integer"
+    verdict = doc.get("verdict")
+    if not isinstance(verdict, str) or not verdict:
+        return False, "verdict missing"
+    return True, ""
+
+
+def identity_relation(artifact_prov: object, snapshot_prov: object) -> str:
+    """Relate an artifact's measured identity to the snapshot's.
+
+    Returns "match" (every shared identity field agrees), "mismatch" (some
+    shared field differs), or "unverifiable" (no shared identity field, so
+    the artifact cannot be tied to the snapshot's source/binary).
+    """
+    if not isinstance(artifact_prov, dict) or not isinstance(snapshot_prov, dict):
+        return "unverifiable"
+    shared = [k for k in IDENTITY_KEYS
+              if k in artifact_prov and k in snapshot_prov]
+    if not shared:
+        return "unverifiable"
+    if any(artifact_prov[k] != snapshot_prov[k] for k in shared):
+        return "mismatch"
+    return "match"
+
+
+def api580_identity_prov(doc: dict) -> object:
+    """The ledger's ReleaseFast provenance (the mode the perf snapshot uses).
+
+    The ledger's top-level provenance may describe a Debug+ReleaseFast
+    measurement pair; the per-mode block carries the ReleaseFast identity
+    that must match the snapshot.
+    """
+    pm = doc.get("per_mode")
+    if isinstance(pm, dict):
+        rf = pm.get("ReleaseFast")
+        if isinstance(rf, dict) and isinstance(rf.get("provenance"), dict):
+            return rf["provenance"]
+    return doc.get("provenance")
+
+
+def _seed_span(seeds: list[int], runs: int) -> str:
+    """Human form of the published seed list: `1..21` when contiguous."""
+    if seeds == list(range(1, runs + 1)):
+        return f"1..{runs}"
+    return f"{len(seeds)} seeds"
+
+
+def _not_green_note(rel: str) -> str:
+    if rel == "mismatch":
+        return ("recorded on a different source/binary than the snapshot — "
+                "not a green claim for it")
+    return ("recorded without source/binary identity matching the snapshot — "
+            "not a green claim for it")
+
+
+def gate_protocol_lines(gate: object, perf: dict | None) -> list[str]:
+    """Render the paired-seed GATE protocol claim from current-gate.json.
+
+    The claim (seed list, runs, verdict) comes exclusively from the
+    validated gate artifact — never from the ordinary snapshot's run count.
+    """
+    if gate is None:
+        return ["Gate protocol: _unavailable — no paired-seed gate artifact "
+                "(tools/perf/current-gate.json); the snapshot numbers above "
+                "are diagnostics, not a gate claim._"]
+    ok, reason = validate_gate(gate)
+    if not ok:
+        return [f"Gate protocol: _inconclusive — the gate artifact failed "
+                f"validation ({reason}); no protocol claim is made._"]
+    runs = gate["runs"]
+    seeds = sorted({r["seed"] for rows in gate["zig_samples"].values()
+                    for r in rows})
+    verdict = gate["result"]["verdict"]
+    method = (f"Gate protocol: paired-seed — {runs} published seeds "
+              f"({_seed_span(seeds, runs)}) per workload per session "
+              "(`LUAZIG_HASH_SEED` env on the production ReleaseFast binary, "
+              "pinned CPU core); verdict = per-seed paired instruction "
+              "deltas; wall time is diagnostic only (`tools/perf_compare.py`).")
+    rel = identity_relation(gate.get("provenance"), (perf or {}).get("provenance"))
+    if rel == "match":
+        return [method + f" Latest gate verdict: **{verdict}** "
+                "(`tools/perf/current-gate.json`)."]
+    return [method + f" Latest gate verdict: {verdict} "
+            f"({_not_green_note(rel)}; `tools/perf/current-gate.json`)."]
+
+
+def _fmt_tristate(v: object) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return "unknown"
+
+
+def api580_lines(api580: object, perf: dict | None) -> list[str]:
+    """Render the api580 fixed-load footprint from the ledger artifact.
+
+    Only the MEASURED fields (measured_delta_anchored/no_xy_root) are ever
+    called measurements; the reconciliation charged totals are explicitly
+    labeled as allocation-model charges.
+    """
+    if api580 is None:
+        return ["api580 fixed-load footprint: _unavailable — no ledger artifact "
+                "(tools/perf/current-api580-ledger.json)._"]
+    ok, reason = validate_api580(api580)
+    if not ok:
+        return [f"api580 fixed-load footprint: _inconclusive — the ledger "
+                f"failed validation ({reason})._"]
+    anchored = api580["measured_delta_anchored"]
+    no_xy = api580["measured_delta_no_xy_root"]
+    threshold = api580["gate_threshold"]
+    verdict = api580["verdict"]
+    line = (f"api580 fixed-load footprint: measured delta **{anchored} B "
+            f"anchored / {no_xy} B no-XY-root** vs threshold {threshold} B")
+    rel = identity_relation(api580_identity_prov(api580),
+                            (perf or {}).get("provenance"))
+    if rel == "match":
+        line += f" — verdict **{verdict}**"
+    else:
+        line += f" — verdict {verdict} ({_not_green_note(rel)})"
+    line += " (`tools/perf/current-api580-ledger.json`)."
+    rec = api580.get("reconciliation")
+    if isinstance(rec, dict):
+        ra = rec.get("anchored") if isinstance(rec.get("anchored"), dict) else {}
+        rn = rec.get("no_xy_root") if isinstance(rec.get("no_xy_root"), dict) else {}
+        ca, cn = ra.get("charged_total"), rn.get("charged_total")
+        if (isinstance(ca, int) and not isinstance(ca, bool)
+                and isinstance(cn, int) and not isinstance(cn, bool)):
+            line += (f" Charged/model totals {ca}/{cn} B (reconciled: "
+                     f"{_fmt_tristate(ra.get('reconciled'))}/"
+                     f"{_fmt_tristate(rn.get('reconciled'))}) are "
+                     "allocation-model charges, not measurements.")
+    return [line]
+
+
+def perf_section(perf: dict | None, gate: object = None,
+                 api580: object = None, versioned: bool = False) -> list[str]:
+    """Build the Performance section.
+
+    Three provenance-separated parts: the geomean snapshot (current.json,
+    honestly labeled as a snapshot), the paired-seed gate protocol claim
+    (current-gate.json, validated), and the api580 fixed-load footprint
+    (current-api580-ledger.json, measured fields only).
 
     Geomean mirrors perf_compare.py's print_table: exp(mean(log(ratio))).
     """
     lines: list[str] = ["### Performance", ""]
     not_run = "_not run (no versioned artifact)_" if versioned else "_not run — no perf JSON provided._"
+    ratios: dict[str, float] = (perf or {}).get("ratios", {})
     if not perf:
         lines.append(f"Geomean slowdown vs PUC Lua: {not_run}")
-        lines.append("")
-        return lines
-
-    ratios: dict[str, float] = perf.get("ratios", {})
-    if not ratios:
+    elif not ratios:
         lines.append("Geomean slowdown vs PUC Lua: _no ratios in perf JSON._")
-        lines.append("")
-        return lines
-
-    geomean = math.exp(sum(math.log(r) for r in ratios.values()) / len(ratios))
-    runs = perf.get("runs", "?")
-    lines.append(
-        f"Geomean slowdown vs PUC Lua: **{geomean:.2f}x** (lower is better; 1.0x = parity)."
-    )
-    lines.append(
-        "Method: paired-seed protocol — {runs} published seeds per workload "
-        "per session (`LUAZIG_HASH_SEED` env on the production ReleaseFast "
-        "binary, pinned CPU core); verdict = per-seed paired instruction "
-        "deltas; wall time is diagnostic only (`tools/perf_compare.py`)."
-        .format(runs=runs))
+    else:
+        geomean = math.exp(sum(math.log(r) for r in ratios.values()) / len(ratios))
+        runs = perf.get("runs", "?")
+        lines.append(
+            f"Geomean slowdown vs PUC Lua: **{geomean:.2f}x** (measurement "
+            f"snapshot, runs={runs} per workload; run-dependent diagnostic; "
+            "lower is better; 1.0x = parity)."
+        )
     lines.append("")
-    lines.append("| Workload | Zig/PUC |")
-    lines.append("|----------|--------:|")
-    for name, ratio in sorted(ratios.items(), key=lambda kv: kv[1], reverse=True):
-        lines.append(f"| {name} | {ratio:.2f}x |")
+    lines.extend(gate_protocol_lines(gate, perf))
+    lines.extend(api580_lines(api580, perf))
+    if ratios:
+        lines.append("")
+        lines.append("| Workload | Zig/PUC |")
+        lines.append("|----------|--------:|")
+        for name, ratio in sorted(ratios.items(), key=lambda kv: kv[1], reverse=True):
+            lines.append(f"| {name} | {ratio:.2f}x |")
     lines.append("")
     return lines
 
 
 def build_block(matrix: dict | None, smoke: dict | None, perf: dict | None,
+                gate: object = None, api580: object = None,
                 versioned: bool = False) -> str:
     """Assemble the full generated status block (without the markers)."""
     capi_n = parse_capi_suite_count(CAPI_MAKEFILE)
@@ -181,7 +428,7 @@ def build_block(matrix: dict | None, smoke: dict | None, perf: dict | None,
     lines.append("")
     lines.append("Regression lane: `python3 tools/testes_matrix.py --testc` (no `_port`/`_soft` prelude overrides).")
     lines.append("")
-    lines.extend(perf_section(perf, versioned))
+    lines.extend(perf_section(perf, gate, api580, versioned))
     # Trim the trailing blank line; the END marker follows on its own line.
     while lines and lines[-1] == "":
         lines.pop()
@@ -192,8 +439,49 @@ def build_block(matrix: dict | None, smoke: dict | None, perf: dict | None,
 # STATUS.md compact summary rewrite
 # ---------------------------------------------------------------------------
 
+def gate_summary_row(gate: object, perf: dict | None) -> str:
+    """Compact STATUS.md row for the paired-seed gate verdict."""
+    if gate is None:
+        return "| Perf gate (paired-seed) | _unavailable — no current-gate.json_ |"
+    ok, reason = validate_gate(gate)
+    if not ok:
+        return "| Perf gate (paired-seed) | _inconclusive — gate artifact failed validation_ |"
+    runs = gate["runs"]
+    seeds = sorted({r["seed"] for rows in gate["zig_samples"].values()
+                    for r in rows})
+    verdict = gate["result"]["verdict"]
+    span = _seed_span(seeds, runs)
+    rel = identity_relation(gate.get("provenance"), (perf or {}).get("provenance"))
+    if rel == "match":
+        return (f"| Perf gate (paired-seed) | **{verdict}** — "
+                f"{runs} published seeds ({span}) |")
+    return (f"| Perf gate (paired-seed) | {verdict} — "
+            f"{_not_green_note(rel)} |")
+
+
+def api580_summary_row(api580: object, perf: dict | None) -> str:
+    """Compact STATUS.md row for the api580 fixed-load footprint."""
+    if api580 is None:
+        return "| api580 fixed-load footprint | _unavailable — no current-api580-ledger.json_ |"
+    ok, _ = validate_api580(api580)
+    if not ok:
+        return "| api580 fixed-load footprint | _inconclusive — ledger failed validation_ |"
+    verdict = api580["verdict"]
+    measured = (f"measured {api580['measured_delta_anchored']}/"
+                f"{api580['measured_delta_no_xy_root']} B vs threshold "
+                f"{api580['gate_threshold']} B")
+    rel = identity_relation(api580_identity_prov(api580),
+                            (perf or {}).get("provenance"))
+    if rel == "match":
+        return f"| api580 fixed-load footprint | **{verdict}** — {measured} |"
+    return (f"| api580 fixed-load footprint | {verdict} — {measured} "
+            f"({_not_green_note(rel)}) |")
+
+
 def build_status_summary_block(matrix: dict | None, smoke: dict | None,
-                               perf: dict | None, versioned: bool = False) -> str:
+                               perf: dict | None, gate: object = None,
+                               api580: object = None,
+                               versioned: bool = False) -> str:
     """Compact summary for the top of STATUS.md, from the same JSON inputs as
     the README block. One generated source of truth for both files."""
     lines: list[str] = ["| Metric | Result |", "|--------|--------|"]
@@ -230,6 +518,9 @@ def build_status_summary_block(matrix: dict | None, smoke: dict | None,
         lines.append(f"| Performance (geomean vs PUC) | **{geomean:.2f}x** |")
     else:
         lines.append(f"| Performance (geomean vs PUC) | {nr_perf} |")
+
+    lines.append(gate_summary_row(gate, perf))
+    lines.append(api580_summary_row(api580, perf))
 
     lines.append("")
     if ratios:
@@ -315,6 +606,12 @@ def main() -> int:
     ap.add_argument("--matrix-json", default="", help="testes_matrix.py --json-out report")
     ap.add_argument("--smoke-json", default="", help="smoke_compare.py --json-out report")
     ap.add_argument("--perf-json", default="", help="perf_compare.py --json-out report")
+    ap.add_argument("--gate-json", default="",
+                    help="paired-seed gate artifact (default: "
+                         "tools/perf/current-gate.json)")
+    ap.add_argument("--api580-json", default="",
+                    help="api580 fixed-load ledger artifact (default: "
+                         "tools/perf/current-api580-ledger.json)")
     ap.add_argument("--perf-current", action="store_true",
                     help="read the versioned snapshot from tools/perf/current.json "
                          "(takes precedence over --perf-json)")
@@ -341,11 +638,20 @@ def main() -> int:
         else:
             perf = load_json(args.perf_json)
 
-    block = build_block(matrix, smoke, perf, versioned=args.use_current)
+    # Gate protocol + api580 ledger are loaded independently of the snapshot
+    # and validated at render time: a missing/corrupt/incompatible artifact
+    # yields honest unavailable/inconclusive wording, never an invented
+    # protocol and never a snapshot-run-count passed off as the gate's.
+    gate = load_artifact(args.gate_json or str(GATE_DEFAULT))
+    api580 = load_artifact(args.api580_json or str(API580_DEFAULT))
+
+    block = build_block(matrix, smoke, perf, gate, api580,
+                        versioned=args.use_current)
     if args.write_readme:
         write_readme(block)
     if args.write_status:
-        write_status_summary(build_status_summary_block(matrix, smoke, perf, versioned=args.use_current))
+        write_status_summary(build_status_summary_block(
+            matrix, smoke, perf, gate, api580, versioned=args.use_current))
         update_last_updated()
     else:
         print(block)

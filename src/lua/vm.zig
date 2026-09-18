@@ -3466,11 +3466,14 @@ test "rejected resume entry leaves target status unchanged" {
     const th = vm.activeBytecodeThread();
     th.nCcalls = @as(u32, Thread.LUA_MAX_C_CALLS) + 5;
     const args = [_]Value{.{ .Thread = co }};
-    var outs: [4]Value = .{ .Nil, .Nil, .Nil, .Nil };
-    try vm.builtinCoroutineResume(args[0..], outs[0..]);
-    try testing.expect(outs[0] == .Bool and outs[0].Bool == false);
-    try testing.expect(outs[1] == .String);
-    try testing.expectEqualStrings("C stack overflow", outs[1].String.bytes());
+    const res = try vm.builtinCoroutineResume(args[0..]);
+    // P16.50-review-7 BLOCKER 4: resume returns the EXACT tuple as an
+    // owned slice (non-optional — every normal return is a tuple).
+    const r = res;
+    defer vm.infraAlloc().free(r);
+    try testing.expect(r.len == 2 and r[0] == .Bool and r[0].Bool == false);
+    try testing.expect(r[1] == .String);
+    try testing.expectEqualStrings("C stack overflow", r[1].String.bytes());
     // THE INVARIANT: pre-call status (.suspended) intact — the target is
     // NOT dead and remains resumable once depth frees up.
     try testing.expect(co.status == .suspended);
@@ -5598,6 +5601,21 @@ pub const Vm = struct {
         return idx;
     }
 
+    /// P16.50-review-7 BLOCKER 3.4: reserve a pending-call slot for a frame
+    /// WITHOUT publishing a completion into it. This is the "prepare pending
+    /// capacity" step of the transactional publication rule: after a
+    /// successful reservation, `setPendingCall` sees a valid index and only
+    /// stores the payload — the subsequent publish is infallible.
+    ///
+    /// Both allocation paths are rollback-safe by construction:
+    ///   - free-list path: infallible (pops the head, marks active);
+    ///   - append path: atomic on failure (`ArrayList.append` leaves the
+    ///     array untouched), so a failed reservation mutates nothing.
+    fn reservePendingCallSlot(self: *Vm, frame: *CallFrame) error{OutOfMemory}!void {
+        std.debug.assert(frame.pending_call_index == INVALID_PENDING);
+        frame.pending_call_index = try self.allocPendingCall();
+    }
+
     fn getPendingCallPtr(self: *Vm, index: u32) ?*BytecodePendingCall {
         if (index == INVALID_PENDING) return null;
         if (self.pending_calls.items.len == 0) return null;
@@ -6487,14 +6505,19 @@ pub const Vm = struct {
         }
     }
 
-    pub fn apiResumeThread(self: *Vm, th: *Thread, args: []const Value, outs: []Value) Error!usize {
-        if (outs.len == 0) return 0;
+    /// P16.50-review-7 BLOCKER 4: resume a thread and return its EXACT
+    /// result tuple ([true/false] ++ values) as an owned slice (infraAlloc
+    /// — uncounted transport). The caller consumes the values and frees the
+    /// slice (self.alloc.free passes infraAlloc'd blocks through the
+    /// charged-block registry). This replaces the caller-supplied fixed out
+    /// window (the C API's 64-slot buffer truncated every resume to 63
+    /// results — PUC lua_resume returns ALL results on the stack).
+    pub fn apiResumeThread(self: *Vm, th: *Thread, args: []const Value) Error![]Value {
         const resume_args = try self.alloc.alloc(Value, args.len + 1);
         defer self.alloc.free(resume_args);
         resume_args[0] = .{ .Thread = th };
         for (args, 0..) |v, i| resume_args[i + 1] = v;
-        try exposeDispatchResult(void, self.builtinCoroutineResume(resume_args, outs));
-        return self.last_builtin_out_count;
+        return exposeDispatchResult([]Value, self.builtinCoroutineResume(resume_args));
     }
 
     /// PUC hook-yield visibility window (P15.83q). When a coroutine
@@ -8483,7 +8506,9 @@ pub const Vm = struct {
         }
     };
 
-    fn gcTempRoots(self: *Vm) TempRoots {
+    /// Pub (review-7 B1): c_api.zig tests root construction intermediates
+    /// across C-call windows the same way vm.zig constructors do.
+    pub fn gcTempRoots(self: *Vm) TempRoots {
         return .{ .vm = self, .snapshot = self.gc_temp_roots.items.len, .cell_snapshot = self.gc_temp_cell_roots.items.len };
     }
 
@@ -9559,9 +9584,12 @@ pub const Vm = struct {
         // Normal-return closes (.return_frame / .advance_instruction) keep
         // the frame visible — PUC's OP_RETURN runs luaF_close while the
         // frame is still current.
-        if (post == .unwind_frame) {
-            exec_frames.getPtr(parent_index).setHidden();
-        }
+        //
+        // The hide itself is applied AFTER publication (below): nothing
+        // between entry and the first __close metamethod observes the bit,
+        // and a post-publish failure unwinds through the pending-cancel
+        // authority, which pops the dying frame — the hidden bit dies with
+        // it, so no unhide rollback is needed.
         std.debug.assert(!(exec_frames.getPtr(parent_index).pending_call_index != INVALID_PENDING));
         const owner = self.activeBytecodeThread();
         // infraAlloc (PUC C-stack parity): the close continuation is HOST
@@ -9572,7 +9600,36 @@ pub const Vm = struct {
         // (memerr.lua testalloc: countdown-0 pcall with a TBC frame).
         // Destroys stay on self.alloc: the adapter's charged-block registry
         // passes foreign blocks through without accounting.
-        const close_state = try self.infraAlloc().create(BytecodeCloseContinuation);
+        //
+        // P16.50-review-7 BLOCKER 3.4: transactional publication —
+        //   prepare pending capacity (reservePendingCallSlot)
+        //   -> allocate/init the continuation
+        //   -> infallible publish into the reserved slot
+        //   -> the pending owns everything from here on.
+        // The owner guard is registered BEFORE the first fallible
+        // operation (the reservation), so even a failed reservation
+        // frees the adopted post payload exactly once. Every pre-publish
+        // failure rolls back exactly what was taken, exactly once, in
+        // reverse order of acquisition: a failed reservation mutates
+        // nothing (atomic append) but still frees the post; a failed
+        // create also releases the reserved slot. freeBytecodeClosePost
+        // skips borrowed bc_return_scratch slices. Post-publish failures
+        // inside continueBytecodeClose unwind through
+        // cancelBytecodePendingCall, the single cleanup authority.
+        var slot_reserved = false;
+        var state_owned = false;
+        var published = false;
+        var close_state: *BytecodeCloseContinuation = undefined;
+        errdefer if (!published) {
+            // Pre-publish rollback, in reverse order of acquisition.
+            if (state_owned) self.infraAlloc().destroy(close_state);
+            if (slot_reserved) self.clearPendingCall(exec_frames.getPtr(parent_index));
+            self.freeBytecodeClosePost(post);
+        };
+        try self.reservePendingCallSlot(exec_frames.getPtr(parent_index));
+        slot_reserved = true;
+        close_state = try self.infraAlloc().create(BytecodeCloseContinuation);
+        state_owned = true;
         close_state.* = .{
             // P16.27 T1: PUC yy derivation — closes driven by a forced
             // close transport (coroutine.close on a suspended thread;
@@ -9591,10 +9648,18 @@ pub const Vm = struct {
             .return_k = return_k,
             .post = post,
         };
+        // Infallible by construction: the slot was reserved above, so
+        // setPendingCall only stores the payload. The `try` is kept as a
+        // defensive net — if the invariant ever broke, the errdefer above
+        // still rolls back consistently.
         try self.setPendingCall(exec_frames.getPtr(parent_index), .{
             .callee = .Nil,
             .completion = .{ .close = close_state },
         });
+        published = true;
+        // P16.41 Cut 1: hide the dying frame for the close's duration (see
+        // the comment above — first observed inside the closers).
+        if (post == .unwind_frame) exec_frames.getPtr(parent_index).setHidden();
         return self.continueBytecodeClose(exec_frames, boundary_depth, parent_index);
     }
 
@@ -9965,6 +10030,25 @@ pub const Vm = struct {
             // matching destroy in completeBytecodeProtectedResult).
             self.alloc.destroy(protection);
             pending.protection = null;
+        }
+    }
+
+    /// P16.50-review-7 BLOCKER 3.2: cancel a PUBLISHED hook continuation
+    /// through the single cleanup authority. Used at the post-publish
+    /// staging failures (stageBytecodeCall / pushStagedBytecodeExecFrame)
+    /// in tryPushBytecodeDebugHook: after publication the pending owns the
+    /// transfer copy, the post payload, the continuation struct, and the
+    /// parent identity restore — cancelBytecodePendingCall releases all
+    /// four exactly once, then the slot is released. The completion-tag
+    /// guard keeps the helper inert if the pending is not ours (defensive;
+    /// nothing between publish and the staging calls can change it).
+    fn cancelPendingHookCall(self: *Vm, exec_frames: *FrameStack, parent_index: usize) void {
+        const frame = exec_frames.getPtr(parent_index);
+        if (self.getPendingCallPtr(frame.pending_call_index)) |pending| {
+            if (pending.completion == .hook) {
+                self.cancelBytecodePendingCall(pending, frame);
+                self.clearPendingCall(frame);
+            }
         }
     }
 
@@ -10550,8 +10634,16 @@ pub const Vm = struct {
         };
         const proto = cl.proto orelse return false;
 
+        // P16.50-review-7 BLOCKER 3.2: the hook ADOPTS the post payload at
+        // entry to the fallible region — the owner guard is registered
+        // BEFORE the first fallible operation (the transfer dupe below),
+        // so even that failure frees the payload exactly once.
+        var post_owned = true;
+        errdefer if (post_owned) self.freeBytecodeHookPost(post);
+
         const transfer_copy = try self.alloc.dupe(Value, transfer orelse &.{});
-        errdefer self.alloc.free(transfer_copy);
+        var transfer_armed = true;
+        errdefer if (transfer_armed) self.alloc.free(transfer_copy);
 
         var argv: [2]Value = undefined;
         // Root the interned event string across the continuation allocation
@@ -10585,7 +10677,23 @@ pub const Vm = struct {
         if (event_callee) |callee| th.bytecode_stack[parent_frame.func_slot] = callee;
         if (std.mem.eql(u8, event, "tail call")) parent_frame.setTailCall() else if (std.mem.eql(u8, event, "call")) parent_frame.clearTailCall();
 
+        // P16.50-review-7 BLOCKER 3.2: owner guards for everything taken
+        // below, each disarmed at the publish point (setPendingCall
+        // success). Until then, every side effect is rollback-able:
+        //   - identity_armed: restore the parent's callee/tailcall bit;
+        //   - struct_owned: destroy the continuation struct;
+        //   - post_owned (registered above, before the first fallible op)
+        //     and transfer_armed (registered above): freed exactly once.
+        // After publish, cleanup belongs exclusively to the pending-call
+        // path: cancelPendingHookCall -> cancelBytecodePendingCall.
+        var identity_armed = true;
+        errdefer if (identity_armed) {
+            th.bytecode_stack[parent_frame.func_slot] = saved_callee;
+            exec_frames.getPtr(parent_index).setTailCallBool(saved_tailcall);
+        };
         const hook_state_ptr = try self.alloc.create(BytecodeHookContinuation);
+        var struct_owned = true;
+        errdefer if (struct_owned) self.alloc.destroy(hook_state_ptr);
         hook_state_ptr.* = .{
             .transfer = transfer_copy,
             .event_calllike = std.mem.eql(u8, event, "call") or std.mem.eql(u8, event, "tail call"),
@@ -10599,20 +10707,24 @@ pub const Vm = struct {
             .callee = hook,
             .completion = .{ .hook = hook_state_ptr },
         });
+        // Publish complete — the pending is the single owner of the
+        // transfer copy, the post payload, the struct, and the identity
+        // restore. Disarm every local owner guard.
+        transfer_armed = false;
+        post_owned = false;
+        struct_owned = false;
+        identity_armed = false;
         // PUC luaD_hook: the hook function + event/line args are staged on
-        // the stack, then called via luaD_call.
+        // the stack, then called via luaD_call. A staging failure after
+        // publication unwinds through the pending-call authority (the
+        // manual cleanup in the old catch blocks leaked the transfer copy
+        // and bypassed the single-cleanup-owner rule).
         const staged_hook = self.stageBytecodeCall(th, th.bytecode_stack_top, cl, argv[0..argc]) catch |err| {
-            self.clearPendingCall(exec_frames.getPtr(parent_index));
-            self.alloc.destroy(hook_state_ptr);
-            th.bytecode_stack[parent_frame.func_slot] = saved_callee;
-            exec_frames.getPtr(parent_index).setTailCallBool(saved_tailcall);
+            self.cancelPendingHookCall(exec_frames, parent_index);
             return err;
         };
         self.pushStagedBytecodeExecFrame(th, exec_frames, proto, staged_hook.func_slot, staged_hook.nargs, -1) catch |err| {
-            self.clearPendingCall(exec_frames.getPtr(parent_index));
-            self.alloc.destroy(hook_state_ptr);
-            th.bytecode_stack[parent_frame.func_slot] = saved_callee;
-            exec_frames.getPtr(parent_index).setTailCallBool(saved_tailcall);
+            self.cancelPendingHookCall(exec_frames, parent_index);
             return err;
         };
         const hook_runtime = exec_frames.getPtr(exec_frames.len() - 1);
@@ -10999,7 +11111,12 @@ pub const Vm = struct {
         // A hook continuation needs the pending slot, so detach the IR call
         // before possibly pushing the hook child. `store_results` owns `ret`.
         self.clearPendingCall(exec_frames.getPtr(parent_index));
-        if (try self.tryPushBytecodeDebugHook(
+        // P16.50-review-7 BLOCKER 3.2: tryPushBytecodeDebugHook adopts the
+        // post payload when it commits to pushing — it frees it exactly
+        // once on EVERY error path (owner guard before publish,
+        // pending-cancel after). Disarm our mirror owner when it errors;
+        // on `false` the post is untouched and still ours.
+        const hook_pushed = self.tryPushBytecodeDebugHook(
             exec_frames,
             parent_index,
             "return",
@@ -11011,7 +11128,11 @@ pub const Vm = struct {
                 .continuation = cont,
                 .values = ret,
             } },
-        )) {
+        ) catch |err| {
+            ret_owned = false;
+            return err;
+        };
+        if (hook_pushed) {
             ret_owned = false;
             return null;
         }
@@ -11723,8 +11844,19 @@ pub const Vm = struct {
         const runtime = exec_frames.getPtr(parent_index);
         self.activeBytecodeThread().bytecode_stack[runtime.func_slot] = cont.saved_parent_callee;
         runtime.setTailCallBool(cont.saved_parent_tailcall);
-        self.clearPendingCall(exec_frames.getPtr(parent_index));
         self.alloc.free(cont.transfer);
+        // P16.50-review-7 BLOCKER 3.3: for .store_results the pending slot
+        // stays installed — the branch below re-publishes into the SAME
+        // slot, and setPendingCall with a valid index is an infallible
+        // payload store. This closes the old clear→append→set OOM window:
+        // a fresh allocPendingCall could fail after the old pending was
+        // cleared, leaving state.values ownerless (the struct was destroyed
+        // by the defer below, the pending no longer referenced the payload).
+        // Between this point and the re-publish there are NO fallible
+        // operations, so no unwind can observe the still-installed .hook
+        // completion with its freed transfer. Every other post clears the
+        // slot here as before (their branches do not re-publish).
+        if (cont.post != .store_results) self.clearPendingCall(exec_frames.getPtr(parent_index));
         // P16.50-review-6: the hook continuation struct is heap-allocated in
         // tryPushBytecodeDebugHook (alloc.create) and owned by the pending
         // call's .hook completion. This consume path clears that pending and
@@ -11752,6 +11884,9 @@ pub const Vm = struct {
                 return null;
             },
             .store_results => |state| {
+                // Slot-reuse invariant: the prologue kept this frame's
+                // pending slot installed for exactly this re-publish.
+                std.debug.assert(exec_frames.getPtr(parent_index).pending_call_index != INVALID_PENDING);
                 try self.setPendingCall(exec_frames.getPtr(parent_index), .{
                     .callee = cont.saved_parent_callee,
                     .completion = .{ .results = state.continuation },
@@ -12066,17 +12201,21 @@ pub const Vm = struct {
     ///
     /// Skips vs generic callBuiltin:
     /// - pushBuiltinCFrame/popBuiltinCFrame (5.2% of coroutine_yield cycles)
-    /// - Nil-fill of outs (6.9% memset — neither builtin reads outs before
-    ///   writing; the OP_CALL post-call handler Nil-fills result slots)
+    /// - the outs window entirely (P16.50-review-7 BLOCKER 4: resume
+    ///   returns its exact results as an owned slice; yield never returns
+    ///   normally — its values travel via th.yielded to the next resume)
     /// - callBuiltin dispatch switch (part of 7.6%)
     /// - builtin_outs_on_bc_stack tracking (neither builtin uses
     ///   refreshBuiltinOuts — the target thread's bc_stack is separate)
+    ///
+    /// Returns the callee's owned result slice (resume), or null when the
+    /// callee has no normal-return result path (yield — unreachable in
+    /// practice; it always ends in error.Yield or a RuntimeError).
     fn callCoroutineBuiltinDirect(
         self: *Vm,
         id: BuiltinId,
         args: []const Value,
-        outs: []Value,
-    ) DispatchError!void {
+    ) DispatchError!?[]Value {
         // Set active_builtin context — needed by builtinCoroutineYield
         // (th.suspended_builtin = self.active_builtin) and by the coroutine
         // body's yield to detect it's yielding from a builtin.
@@ -12090,8 +12229,13 @@ pub const Vm = struct {
         }
 
         switch (id) {
-            .coroutine_resume => try self.builtinCoroutineResume(args, outs),
-            .coroutine_yield => try self.builtinCoroutineYield(args, outs),
+            .coroutine_resume => return try self.builtinCoroutineResume(args),
+            .coroutine_yield => {
+                // Yield never returns normally (error.Yield or a
+                // RuntimeError); the null is for the type checker only.
+                try self.builtinCoroutineYield(args, &[_]Value{});
+                return null;
+            },
             else => unreachable,
         }
     }
@@ -13687,8 +13831,16 @@ pub const Vm = struct {
         const LayerSpec = struct {
             kind: BytecodeProtectedKind,
         };
+        // P16.50-review-7 BLOCKER 4: PUC lua_pcallk → luaD_pcall performs
+        // ZERO allocations before entering the protected region — pcall's
+        // own setup must be uncounted (infraAlloc) so a countdown/limit
+        // that exhausts at the setup step is caught by the protected call
+        // itself ([false, "not enough memory"]) instead of escaping pcall
+        // (verified divergence: T.alloccount(1) + pcall(f) previously
+        // killed the chunk; PUC catches). The frees below go through
+        // self.alloc, which passes infraAlloc'd (foreign) blocks through.
         var outer_specs = std.ArrayListUnmanaged(LayerSpec).empty;
-        defer outer_specs.deinit(self.alloc);
+        defer outer_specs.deinit(self.infraAlloc());
 
         var active_id = id;
         var active_args = args;
@@ -13707,7 +13859,7 @@ pub const Vm = struct {
                     else => return false,
                 }
             }
-            try outer_specs.append(self.alloc, .{
+            try outer_specs.append(self.infraAlloc(), .{
                 .kind = if (active_id == .pcall) .pcall else .xpcall,
             });
             active_args = if (active_id == .pcall) active_args[1..] else active_args[2..];
@@ -13759,7 +13911,9 @@ pub const Vm = struct {
         };
         const proto = cl.proto orelse return false;
 
-        const outer_layers = try self.alloc.alloc(BytecodeProtectedLayer, outer_specs.items.len);
+        // P16.50-review-7 BLOCKER 4: uncounted (infraAlloc) — see the
+        // outer_specs comment above (PUC pcall setup allocates nothing).
+        const outer_layers = try self.infraAlloc().alloc(BytecodeProtectedLayer, outer_specs.items.len);
         var initialized_outer: usize = 0;
         var outer_armed = true;
         errdefer if (outer_armed) {
@@ -13782,24 +13936,25 @@ pub const Vm = struct {
             initialized_outer += 1;
         }
 
+        // P16.50-review-7 BLOCKER 3.1: transactional publication. The heap
+        // protection struct is created BEFORE any state it restores is
+        // taken, and carries the FULL rollback snapshot (saved_ncalls
+        // captured before ccallEnter, tbc_chain_base, saved_error, outer
+        // layers). The `published` owner guard runs
+        // finishBytecodeProtectedCall on every pre-publish failure — it
+        // releases exactly what was taken (active depth, saved errors,
+        // errfunc, outer layers) and restores nCcalls to the pre-enter
+        // snapshot (idempotent with ccallEnter's own failure rollback).
+        // The old stack-fallback errdefer leaked the heap struct on a
+        // setPendingCall failure and restored nCcalls from a zero default.
+        // P16.50-review-7 BLOCKER 4: uncounted (infraAlloc) — see the
+        // outer_specs comment above (PUC pcall setup allocates nothing).
+        const protection_ptr = try self.infraAlloc().create(BytecodeProtectedCall);
+        var struct_owned = true;
+        errdefer if (struct_owned) self.alloc.destroy(protection_ptr);
+
         const saved_error = self.saveBytecodeProtectedError();
         owner.bytecode_protected_depth += 1;
-        outer_armed = false;
-        var active_armed = true;
-        errdefer if (active_armed) {
-            // Allocation can fail in errdefer; fall back to stack-allocated cleanup.
-            var stack_protection: BytecodeProtectedCall = .{
-                .thread = owner,
-                .kind = if (active_id == .pcall) .pcall else .xpcall,
-                .saved_error = saved_error,
-                .outer_layers = outer_layers,
-            };
-            // This releases both the active layer and all initialized outers.
-            self.finishBytecodeProtectedCall(&stack_protection);
-            initialized_outer = 0;
-        };
-
-        const protection_ptr = try self.alloc.create(BytecodeProtectedCall);
         // P16.23 T6: snapshot BEFORE the target runs — nested ccalls must
         // not leak past a caught recovery (see BytecodeProtectedCall).
         protection_ptr.* = .{
@@ -13813,6 +13968,17 @@ pub const Vm = struct {
             // before any target-side mark can exist.
             .tbc_chain_base = @intCast(owner.c_tbc_chain.items.len),
         };
+        var published = false;
+        errdefer if (!published) {
+            // Pre-publish rollback: release the active layer and all outer
+            // layers through the single completion path, then let the
+            // struct_owned guard destroy the heap struct.
+            self.finishBytecodeProtectedCall(protection_ptr);
+        };
+        // The protection struct now owns the outer layers — disarm the
+        // per-layer guard (the finish guard above covers them).
+        outer_armed = false;
+
         // P16.24 T4/T5: PUC lua_pcallk with a continuation (lbaselib pcall
         // passes finishpcall) → docallK → luaD_call → ccall(ci=1): the
         // target consumes ONE YIELDABLE depth unit. The snapshot above
@@ -13831,12 +13997,15 @@ pub const Vm = struct {
             } },
             .protection = protection_ptr,
         });
+        // Publish complete — the pending owns the protection struct; every
+        // later failure unwinds through cancelBytecodePendingCall, which
+        // destroys it (see the .protection branch there).
+        published = true;
+        struct_owned = false;
         // Once the continuation is installed, every target-start failure is
         // part of the innermost protected call. In particular, a Lua stack or
         // protected-depth limit becomes `false, error`; parked outer pcall/
         // xpcall targets then complete normally and prepend their own `true`.
-        active_armed = false;
-        initialized_outer = 0;
         // PUC lua_pcallk (lapi.c): errfunc != 0 arms L->errfunc for the
         // protected call's duration — for xpcall that is ITS message
         // handler (saveBytecodeProtectedError above cleared the outer one,
@@ -18336,10 +18505,11 @@ pub const Vm = struct {
         const ret = try self.infraAlloc().dupe(Value, ctx.regs[a .. a + nvals]);
         var ret_owned = true;
         errdefer if (ret_owned) self.alloc.free(ret);
-        // beginBytecodeClose takes ownership of `ret` (stored in
-        // close_state.post.return_frame). The errdefer must not free it
-        // if beginBytecodeClose accepted the slice — even on error.Yield,
-        // the close continuation retains the slice for resume.
+        // P16.50-review-7 BLOCKER 3.4: beginBytecodeClose ADOPTS the post
+        // payload at the call boundary — it frees it exactly once on
+        // pre-publish failure (owner guard) and the pending owns it after
+        // publication (even on error.Yield the close continuation retains
+        // the slice for resume). Disarm our mirror owner before the call.
         ret_owned = false;
 
         // Sync pc to the heap CallFrame so GC (which may run
@@ -18564,10 +18734,11 @@ pub const Vm = struct {
         const ret = try self.alloc.alloc(Value, 0);
         var ret_owned = true;
         errdefer if (ret_owned) self.alloc.free(ret);
-        // beginBytecodeClose takes ownership of `ret` (stored in
-        // close_state.post.return_frame). The errdefer must not free it
-        // if beginBytecodeClose accepted the slice — even on error.Yield,
-        // the close continuation retains the slice for resume.
+        // P16.50-review-7 BLOCKER 3.4: beginBytecodeClose ADOPTS the post
+        // payload at the call boundary — it frees it exactly once on
+        // pre-publish failure (owner guard) and the pending owns it after
+        // publication (even on error.Yield the close continuation retains
+        // the slice for resume). Disarm our mirror owner before the call.
         ret_owned = false;
         // Sync pc so GC (which may run inside __close
         // finalizers via collectgarbage()) sees the correct live_reg_top[pc].
@@ -18774,10 +18945,11 @@ pub const Vm = struct {
         var ret_owned = true;
         errdefer if (ret_owned) self.alloc.free(ret);
         ret[0] = ctx.regs[a];
-        // beginBytecodeClose takes ownership of `ret` (stored in
-        // close_state.post.return_frame). The errdefer must not free it
-        // if beginBytecodeClose accepted the slice — even on error.Yield,
-        // the close continuation retains the slice for resume.
+        // P16.50-review-7 BLOCKER 3.4: beginBytecodeClose ADOPTS the post
+        // payload at the call boundary — it frees it exactly once on
+        // pre-publish failure (owner guard) and the pending owns it after
+        // publication (even on error.Yield the close continuation retains
+        // the slice for resume). Disarm our mirror owner before the call.
         ret_owned = false;
         // Sync pc so GC (which may run inside __close
         // finalizers via collectgarbage()) sees the correct live_reg_top[pc].
@@ -19466,7 +19638,12 @@ pub const Vm = struct {
             // the pending call is no longer needed. Without this, beginBytecodeClose
             // would assert pending_call_index == INVALID_PENDING.
             self.clearPendingCall(fr_tc);
-            _ = &vals_owned;
+            // P16.50-review-7 BLOCKER 3.4: beginBytecodeClose ADOPTS the
+            // post payload at the call boundary — it frees it exactly once
+            // on pre-publish failure (owner guard) and the pending owns it
+            // after publication. Disarm our mirror owner before the call;
+            // keeping it armed would double-free on a pre-publish OOM.
+            vals_owned = false;
             return switch (try self.beginBytecodeClose(
                 ctx.exec_frames,
                 ctx.boundary_depth,
@@ -19854,7 +20031,14 @@ pub const Vm = struct {
                     ctx.exec_frames.getPtr(ctx.frame_index).pending_call_index == INVALID_PENDING and
                     self.coroutineBuiltinFastPathEligible(id, call_args);
 
-                const out_len = @max(self.builtinOutLen(id, call_args), 1);
+                // P16.50-review-7 BLOCKER 4: EXACT sizing, no blanket
+                // minimum — the old `@max(..., 1)` fabricated a nil result
+                // for every exact-0 builtin tail call (`return
+                // table.unpack({})` produced one bogus nil; PUC OP_TAILCALL
+                // poscalls the callee's exact results, 0 included). Bodies
+                // of exact-0 paths write no outs (guarded loops / early
+                // errors), matching OP_CALL's unclamped sizing.
+                const out_len = self.builtinOutLen(id, call_args);
                 var outs_small: [8]Value = undefined;
                 var outs_heap: ?[]Value = null;
                 const outs = if (out_len <= outs_small.len) outs_small[0..out_len] else heap: {
@@ -19895,12 +20079,13 @@ pub const Vm = struct {
                 }
                 // P15.51l: reg_top lives directly on the CallFrame.
                 // P16.5b: Use direct call for coroutine fast path.
-                // P16.50-review-6 BLOCKER 1: both paths classify into the
+                // P16.50-review-6 BLOCKER 1 / P16.50-review-7 BLOCKER 4:
+                // both paths classify into the
                 // BuiltinResult contract; the direct path (which bypasses
                 // callBuiltin) mirrors callBuiltin's tail formula.
                 var tc_bres: BuiltinResult = undefined;
                 if (co_fast_path) {
-                    self.callCoroutineBuiltinDirect(id, call_args, outs) catch |call_err| switch (call_err) {
+                    const owned_opt = self.callCoroutineBuiltinDirect(id, call_args) catch |call_err| switch (call_err) {
                         error.Yield => {
                             if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
                                 const th = self.current_thread.?;
@@ -19922,10 +20107,10 @@ pub const Vm = struct {
                         error.RuntimeError => return error.RuntimeError,
                         error.ThreadSwitch => return error.ThreadSwitch,
                     };
-                    tc_bres = .{ .window = if (builtinHasDynamicOutCount(id))
-                        @min(self.last_builtin_out_count, outs.len)
-                    else
-                        outs.len };
+                    // P16.50-review-7 BLOCKER 4: resume's exact owned tuple
+                    // is the tail-call transport (no window bound); yield
+                    // never returns normally (null → empty window, unread).
+                    tc_bres = if (owned_opt) |vals| .{ .owned = vals } else .{ .window = 0 };
                 } else {
                     // P16.41 Cut 3: view frame pushed above for every
                     // C-frame builtin; frameless builtins pass .host (the
@@ -20013,10 +20198,11 @@ pub const Vm = struct {
         };
         var ret_owned = true;
         errdefer if (ret_owned) self.alloc.free(ret);
-        // beginBytecodeClose takes ownership of `ret` (stored in
-        // close_state.post.return_frame). The errdefer must not free it
-        // if beginBytecodeClose accepted the slice — even on error.Yield,
-        // the close continuation retains the slice for resume.
+        // P16.50-review-7 BLOCKER 3.4: beginBytecodeClose ADOPTS the post
+        // payload at the call boundary — it frees it exactly once on
+        // pre-publish failure (owner guard) and the pending owns it after
+        // publication (even on error.Yield the close continuation retains
+        // the slice for resume). Disarm our mirror owner before the call.
         ret_owned = false;
         // P16.32 T2 Cut B: nothing to close and no return hook — complete
         // the frame directly (the .return_frame post's non-close tail,
@@ -20090,7 +20276,10 @@ pub const Vm = struct {
             var vals_owned = true;
             errdefer if (vals_owned) self.alloc.free(vals);
             fr_call.clearHookYield();
-            if (try self.tryPushBytecodeDebugHook(
+            // P16.50-review-7 BLOCKER 3.2: the hook path adopts the post
+            // payload on every error (owner guard / pending-cancel) —
+            // disarm our mirror owner when it errors.
+            const hook_pushed = self.tryPushBytecodeDebugHook(
                 ctx.exec_frames,
                 ctx.frame_index,
                 "return",
@@ -20102,7 +20291,11 @@ pub const Vm = struct {
                     .continuation = .{ .dst = a, .nresults = nresults },
                     .values = vals,
                 } },
-            )) {
+            ) catch |err| {
+                vals_owned = false;
+                return err;
+            };
+            if (hook_pushed) {
                 vals_owned = false;
                 return .continue_frame_loop;
             }
@@ -20121,7 +20314,7 @@ pub const Vm = struct {
             else
                 fr_call.reg_top = @max(fr_call.reg_top, @as(u32, @intCast(a + nstore)));
             self.alloc.free(vals);
-            _ = &vals_owned;
+            vals_owned = false;
             // Original code did `ctx.pc += 1; continue;` — skip dispatcher +1.
             // Returning `.continue_dispatch` adds the +1 from the dispatcher,
             // giving the same final pc.
@@ -20333,7 +20526,10 @@ pub const Vm = struct {
                         .returned => |values| {
                             var values_owned = true;
                             errdefer if (values_owned) self.alloc.free(values);
-                            if (try self.tryPushBytecodeDebugHook(
+                            // P16.50-review-7 BLOCKER 3.2: the hook path
+                            // adopts the post payload on every error —
+                            // disarm our mirror owner when it errors.
+                            const hook_pushed = self.tryPushBytecodeDebugHook(
                                 ctx.exec_frames,
                                 ctx.frame_index,
                                 "return",
@@ -20345,7 +20541,11 @@ pub const Vm = struct {
                                     .continuation = .{ .dst = a, .nresults = nresults },
                                     .values = values,
                                 } },
-                            )) {
+                            ) catch |err| {
+                                values_owned = false;
+                                return err;
+                            };
+                            if (hook_pushed) {
                                 values_owned = false;
                                 return .continue_frame_loop;
                             }
@@ -20401,9 +20601,10 @@ pub const Vm = struct {
                 if (!fr_pre_call.isC()) fr_pre_call.u.lua.frame_cap = ctx.frame_cap;
                 // P16.50-review-6 BLOCKER 1: the builtin's result contract.
                 // Initialized to the 0-window for the coroutine fast path
-                // (callCoroutineBuiltinDirect writes `outs` itself and is
-                // never an owned-result builtin); the generic path assigns
-                // callBuiltin's BuiltinResult below.
+                // (P16.50-review-7 BLOCKER 4: callCoroutineBuiltinDirect
+                // returns resume's owned slice — assigned below; yield never
+                // returns normally); the generic path assigns callBuiltin's
+                // BuiltinResult below.
                 var bres: BuiltinResult = .{ .window = 0 };
                 // P15.83r (PUC ldo.c:642-656 precallC ordering): the C
                 // CallInfo exists BEFORE the CALL hook fires. Push the
@@ -20454,7 +20655,7 @@ pub const Vm = struct {
                 // analogue).
                 const stack_base_before = ctx.th.bytecode_stack.ptr;
                 if (co_fast_path) {
-                    self.callCoroutineBuiltinDirect(id, rargs_fresh, outs) catch |call_err| switch (call_err) {
+                    const owned_opt = self.callCoroutineBuiltinDirect(id, rargs_fresh) catch |call_err| switch (call_err) {
                         error.Yield => {
                             if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
                                 const th = self.current_thread.?;
@@ -20476,14 +20677,12 @@ pub const Vm = struct {
                         error.RuntimeError => return error.RuntimeError,
                         error.ThreadSwitch => return error.ThreadSwitch,
                     };
-                    // callCoroutineBuiltinDirect writes `outs` and reports
-                    // its true count via last_builtin_out_count (resume/
-                    // yield are dynamic-count builtins) — capture it here at
-                    // the call boundary, exactly like callBuiltin does.
-                    bres = .{ .window = if (builtinHasDynamicOutCount(id))
-                        @min(self.last_builtin_out_count, outs.len)
-                    else
-                        out_len };
+                    // P16.50-review-7 BLOCKER 4: resume returns its EXACT
+                    // results as an owned slice ([true/false] ++ values —
+                    // no window bound); yield never returns normally, so
+                    // the null maps to an empty window result that no
+                    // consumer ever reads (the Yield arm above returned).
+                    bres = if (owned_opt) |vals| .{ .owned = vals } else .{ .window = 0 };
                 } else {
                     // P16.41 Cut 3: the view frame was pushed above for every
                     // C-frame builtin; frameless builtins (collectgarbage/
@@ -20553,7 +20752,13 @@ pub const Vm = struct {
                         // P16.35 Cut 3: gate the return-event hook probes by the
                         // cached hooks-active flag (see the window path below).
                         if (self.hooks_active_cached) {
-                            if (try self.tryPushBytecodeDebugHook(
+                            // P16.50-review-7 BLOCKER 3.2: the hook path
+                            // adopts the post payload on every error (owner
+                            // guard before publish, pending-cancel after;
+                            // self.alloc.free passes infraAlloc'd blocks
+                            // through the charged-block registry) — disarm
+                            // our mirror owner when it errors.
+                            const hook_pushed = self.tryPushBytecodeDebugHook(
                                 ctx.exec_frames,
                                 ctx.frame_index,
                                 "return",
@@ -20565,7 +20770,11 @@ pub const Vm = struct {
                                     .continuation = .{ .dst = a, .nresults = nresults },
                                     .values = vals,
                                 } },
-                            )) {
+                            ) catch |err| {
+                                vals_owned = false;
+                                return err;
+                            };
+                            if (hook_pushed) {
                                 // Ownership transferred to the pending hook
                                 // continuation (rooted by gcMarkMutableRoots;
                                 // freed by freeBytecodeHookPost).
@@ -20606,7 +20815,30 @@ pub const Vm = struct {
                         // out-of-line probe when no hooks exist). Identical flag,
                         // no intervening mutation — semantics preserved.
                         if (self.hooks_active_cached) {
-                            if (try self.tryPushBytecodeDebugHook(
+                            // P16.50-review-7 BLOCKER 3.2: the window slice
+                            // points into the value stack (ctx.regs); the
+                            // pending must own a HEAP copy before publication
+                            // (the regs window can be invalidated by a stack
+                            // realloc while the continuation is parked). The
+                            // old post-publish fixup duped only on the success
+                            // path and left a borrowed slice behind on the
+                            // staging-failure path. Materialize the owned copy
+                            // up front; on success the pending owns it, on
+                            // `false` it is our single source for the store
+                            // below (a snapshot — never worse than the old
+                            // potentially-overlapping in-place forward loop).
+                            const owned_vals = try self.alloc.dupe(Value, outs[0..produced]);
+                            var owned_vals_owned = true;
+                            errdefer if (owned_vals_owned) self.alloc.free(owned_vals);
+                            // Root the copy across the hook machinery: the
+                            // hook is Lua code that can allocate and GC; the
+                            // heap slice is invisible to the collector
+                            // without this (TempRoots uses infraAlloc —
+                            // countdown-safe).
+                            var roots = self.gcTempRoots();
+                            defer roots.end();
+                            for (owned_vals) |v| try roots.add(v);
+                            const hook_pushed = self.tryPushBytecodeDebugHook(
                                 ctx.exec_frames,
                                 ctx.frame_index,
                                 "return",
@@ -20616,26 +20848,42 @@ pub const Vm = struct {
                                 1,
                                 .{ .store_results = .{
                                     .continuation = .{ .dst = a, .nresults = nresults },
-                                    .values = outs[0..produced],
+                                    .values = owned_vals,
                                 } },
-                            )) {
-                                const pc2_idx = ctx.exec_frames.getPtr(ctx.frame_index).pending_call_index;
-                                if (self.getPendingCallPtr(pc2_idx)) |pending| {
-                                    if (pending.completion == .hook and pending.completion.hook.post == .store_results) {
-                                        const old_values = pending.completion.hook.post.store_results.values;
-                                        if (self.returnSliceIsOwned(old_values)) {
-                                            // Already scratch-owned, no free needed
-                                        } else if (@intFromPtr(old_values.ptr) >= @intFromPtr(ctx.th.bytecode_stack.ptr) and
-                                            @intFromPtr(old_values.ptr) < @intFromPtr(ctx.th.bytecode_stack.ptr) + ctx.th.bytecode_stack.len * @sizeOf(Value))
-                                        {
-                                            const owned = try self.alloc.dupe(Value, old_values);
-                                            pending.completion.hook.post.store_results.values = owned;
-                                        }
-                                    }
-                                }
+                            ) catch |err| {
+                                // The hook path freed the payload (owner
+                                // guard / pending-cancel) — disarm ours.
+                                owned_vals_owned = false;
+                                return err;
+                            };
+                            if (hook_pushed) {
+                                owned_vals_owned = false;
                                 return .continue_frame_loop;
                             }
-                            try self.dispatchBytecodeHookWithCallee("return", callee_val, outs[0..produced]);
+                            try self.dispatchBytecodeHookWithCallee("return", callee_val, owned_vals);
+                            // The hook is Lua code — it can grow the shared
+                            // value stack; re-derive the register window
+                            // before the store (the store below reads the
+                            // owned_vals snapshot, not the stale outs).
+                            ctx.regs = ctx.th.bytecode_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            // The store below reads the snapshot; the heap
+                            // copy is consumed after it. No growCtxFrame
+                            // here: the window path pre-paid the frame
+                            // capacity up front (see the .owned path's
+                            // comment).
+                            const nstore_w: usize = if (nresults >= 0) @intCast(nresults) else produced;
+                            if (nstore_w == 1) {
+                                ctx.regs[a] = if (produced >= 1) owned_vals[0] else .Nil;
+                            } else {
+                                for (0..nstore_w) |i| {
+                                    ctx.regs[a + i] = if (i < produced) owned_vals[i] else .Nil;
+                                }
+                            }
+                            if (nresults < 0) ctx.exec_frames.getPtr(ctx.frame_index).reg_top = @intCast(@as(usize, a) + produced);
+                            self.alloc.free(owned_vals);
+                            owned_vals_owned = false;
+                            try self.condGcFromDispatch(ctx);
+                            return .continue_dispatch;
                         }
                         const nstore: usize = if (nresults >= 0) @intCast(nresults) else produced;
                         // P16.39 Cut 3: PUC luaD_poscall moveresults (ldo.c:436-440)
@@ -20701,7 +20949,10 @@ pub const Vm = struct {
                 self.clearPendingCall(ctx.exec_frames.getPtr(ctx.frame_index));
                 var ret_owned = true;
                 errdefer if (ret_owned) self.alloc.free(ret);
-                if (try self.tryPushBytecodeDebugHook(
+                // P16.50-review-7 BLOCKER 3.2: the hook path adopts the
+                // post payload on every error — disarm our mirror owner
+                // when it errors.
+                const hook_pushed = self.tryPushBytecodeDebugHook(
                     ctx.exec_frames,
                     ctx.frame_index,
                     "return",
@@ -20713,7 +20964,11 @@ pub const Vm = struct {
                         .continuation = .{ .dst = a, .nresults = nresults },
                         .values = ret,
                     } },
-                )) {
+                ) catch |err| {
+                    ret_owned = false;
+                    return err;
+                };
+                if (hook_pushed) {
                     ret_owned = false;
                     return .continue_frame_loop;
                 }
@@ -20725,7 +20980,7 @@ pub const Vm = struct {
                 }
                 if (nresults < 0) ctx.exec_frames.getPtr(ctx.frame_index).reg_top = @intCast(@as(usize, a) + ret.len);
                 self.alloc.free(ret);
-                _ = &ret_owned;
+                ret_owned = false;
             },
             else => unreachable,
         }
@@ -21223,16 +21478,24 @@ pub const Vm = struct {
     ///     results into the caller-provided `outs` window (a slice into
     ///     bc_stack or a local buffer). `produced` is the number of valid
     ///     results (the window length, or `last_builtin_out_count` for
-    ///     builtins whose true count is smaller than the window — pcall,
-    ///     resume, select, ...; the count is read HERE, at the call
-    ///     boundary, before any further VM execution can clobber it).
+    ///     builtins whose true count is smaller than the window —
+    ///     io_read's early nil, coroutine_close, select, ...; the count is
+    ///     read HERE, at the call boundary, before any further VM execution
+    ///     can clobber it).
     ///
     ///   - `owned`: the builtin could not know its result count before
-    ///     running (today only T.testC: `return *`/`return N` depend on the
-    ///     script's runtime stack). It returns a heap slice with the EXACT
-    ///     results (allocated via infraAlloc — result transport, uncounted,
-    ///     PUC luaD_poscall parity). The caller consumes it under the
-    ///     ordinary nresults contract and frees it (self.alloc.free is safe:
+    ///     running (P16.50-review-7 BLOCKER 4 — generalized beyond T.testC
+    ///     to every semantically unbounded builtin: coroutine.resume /
+    ///     coroutine.wrap's iterator (the next yield's or the body's
+    ///     values), pcall/xpcall (the callee's returns), dofile (the
+    ///     chunk's returns), table.unpack with a __len metamethod (the
+    ///     border is only observable by CALLING the metamethod — sizing
+    ///     would double-call it), and T.testC `return *`/`return N`). It
+    ///     returns a heap slice with the EXACT results (allocated via
+    ///     infraAlloc — result transport, uncounted, PUC luaD_poscall
+    ///     parity: PUC moves results on the stack with no allocation). The
+    ///     caller consumes it under the ordinary nresults contract and
+    ///     frees it via infraAlloc().free (self.alloc.free is also safe:
     ///     the charged-block registry passes foreign blocks through).
     ///
     /// Single-owner invariant: on success, ownership of an `owned` slice
@@ -21403,11 +21666,12 @@ pub const Vm = struct {
             return err;
         };
         // P16.50-review-6 BLOCKER 1: wrap the arm's outcome in the
-        // BuiltinResult contract. An owned slice (T.testC) passes through
-        // as-is — exact results, no window. Otherwise the builtin wrote its
-        // window: the count is the window length, or — for builtins whose
-        // true count is smaller than their window (pcall, resume, select,
-        // ...) — `last_builtin_out_count` as set by the arm. The count is
+        // BuiltinResult contract. An owned slice (T.testC, pcall/xpcall,
+        // coroutine.resume/wrap-iterator, dofile) passes through as-is —
+        // exact results, no window. Otherwise the builtin wrote its window:
+        // the count is the window length, or — for builtins whose true
+        // count is smaller than their window (select, io_read, ...) —
+        // `last_builtin_out_count` as set by the arm. The count is
         // captured HERE, at the call boundary, before any further VM
         // execution can clobber the field (re-entrant safety: an outer
         // dynamic builtin's count is read only after its nested execution
@@ -21439,6 +21703,64 @@ pub const Vm = struct {
                 return n;
             },
         }
+    }
+
+    /// P16.50-review-7 BLOCKER 4: allocate an owned result slice. Always
+    /// infraAlloc — the slice is pure result TRANSPORT (PUC luaD_poscall
+    /// moves results on the stack with no allocation), so it must be
+    /// invisible to the testc countdown/ledger (an armed countdown cannot
+    /// kill result transport). Freed via infraAlloc().free (or
+    /// self.alloc.free — the charged-block registry passes foreign blocks
+    /// through unaccounted).
+    fn allocOwnedResult(self: *Vm, n: usize) std.mem.Allocator.Error![]Value {
+        return self.infraAlloc().alloc(Value, n);
+    }
+
+    /// P16.50-review-7 BLOCKER 4: build the pcall-family success tuple
+    /// `[true] ++ vals` as an owned slice (PUC finishpcall: luaD_poscall
+    /// places `true` above the callee's results on the stack — no bound).
+    /// `vals` is copied (it may be a borrowed window or a foreign-owned
+    /// slice the caller frees separately).
+    fn ownedPcallOk(self: *Vm, vals: []const Value) std.mem.Allocator.Error![]Value {
+        const res = try self.allocOwnedResult(1 + vals.len);
+        res[0] = .{ .Bool = true };
+        @memcpy(res[1..], vals);
+        return res;
+    }
+
+    /// P16.50-review-7 BLOCKER 4: build the pcall-family failure tuple
+    /// `[false, err]` as an owned slice. The error object is complete at
+    /// every catch site (PUC finishpcall: an errerr is transported as the
+    /// "error in error handling" OBJECT set at the throw site, so a pcall
+    /// running INSIDE a message handler still returns the real error it
+    /// caught) — protectedErrorValue() reads it.
+    fn ownedPcallFail(self: *Vm) std.mem.Allocator.Error![]Value {
+        const res = try self.allocOwnedResult(2);
+        res[0] = .{ .Bool = false };
+        res[1] = self.protectedErrorValue();
+        return res;
+    }
+
+    /// P16.50-review-7 BLOCKER 4: build coroutine.resume's success tuple
+    /// `[true] ++ payload` as an owned slice (PUC luaB_coresume: the
+    /// boolean goes above the yielded/returned values — no bound). The
+    /// payload is copied; the caller keeps its own ownership (the payload
+    /// defer frees it).
+    fn ownedResumeOk(self: *Vm, payload: []const Value) std.mem.Allocator.Error![]Value {
+        const res = try self.allocOwnedResult(1 + payload.len);
+        res[0] = .{ .Bool = true };
+        @memcpy(res[1..], payload);
+        return res;
+    }
+
+    /// P16.50-review-7 BLOCKER 4: build coroutine.resume's rejection /
+    /// failure tuple `[false, err]` as an owned slice (PUC resume_error /
+    /// luaB_coresume's error arm).
+    fn ownedResumeFail(self: *Vm, errv: Value) std.mem.Allocator.Error![]Value {
+        const res = try self.allocOwnedResult(2);
+        res[0] = .{ .Bool = false };
+        res[1] = errv;
+        return res;
     }
 
     /// P16.50-review-6 BLOCKER 1: the arm dispatch returns the builtin's
@@ -21587,10 +21909,10 @@ pub const Vm = struct {
             .select => try self.builtinSelect(args, outs),
             .type => try self.builtinType(args, outs),
             .collectgarbage => try self.builtinCollectgarbage(args, outs),
-            .pcall => try self.builtinPcall(args, outs),
-            .xpcall => try self.builtinXpcall(args, outs),
+            .pcall => return try self.builtinPcall(args),
+            .xpcall => return try self.builtinXpcall(args),
             .next => try self.builtinNext(args, outs),
-            .dofile => try self.builtinDofile(args, outs),
+            .dofile => return try self.builtinDofile(args),
             .loadfile => try self.builtinLoadfile(args, outs),
             .load => try self.builtinLoad(args, outs),
             .require => try self.builtinRequire(args, outs),
@@ -21715,13 +22037,13 @@ pub const Vm = struct {
             .table_move => try self.builtinTableMove(args, outs),
             .table_concat => try self.builtinTableConcat(args, outs),
             .table_insert => try self.builtinTableInsert(args, outs),
-            .table_unpack => try self.builtinTableUnpack(args, outs),
+            .table_unpack => return try self.builtinTableUnpack(args, outs),
             .table_remove => try self.builtinTableRemove(args, outs),
             .table_sort => try self.builtinTableSort(args, outs),
             .coroutine_create => try self.builtinCoroutineCreate(args, outs),
             .coroutine_wrap => try self.builtinCoroutineWrap(args, outs),
-            .coroutine_wrap_iter => try self.builtinCoroutineWrapIter(args, outs),
-            .coroutine_resume => try self.builtinCoroutineResume(args, outs),
+            .coroutine_wrap_iter => return try self.builtinCoroutineWrapIter(args),
+            .coroutine_resume => return try self.builtinCoroutineResume(args),
             .coroutine_yield => try self.builtinCoroutineYield(args, outs),
             .coroutine_status => try self.builtinCoroutineStatus(args, outs),
             .coroutine_running => try self.builtinCoroutineRunning(args, outs),
@@ -22829,8 +23151,14 @@ pub const Vm = struct {
         return self.fail("collectgarbage: invalid option '{s}'", .{what});
     }
 
-    fn builtinPcall(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
-        self.last_builtin_out_count = 0;
+    /// P16.50-review-7 BLOCKER 4: pcall returns its results as an OWNED
+    /// slice — `[true] ++ callee_results` on success, `[false, err]` on
+    /// failure (PUC luaB_pcall → lua_pcallk → finishpcall: luaD_poscall
+    /// places the tuple above the callee's results on the stack with NO
+    /// bound; the old 256-slot window truncated every pcall to 255
+    /// results). The `outs` window is gone: the exact count is structural
+    /// in the slice.
+    fn builtinPcall(self: *Vm, args: []const Value) DispatchError!?[]Value {
         if (args.len == 0) return self.fail("pcall expects function", .{});
         if (self.activeProtectedCallDepth() >= 128) {
             self.err = "stack overflow error";
@@ -22840,12 +23168,7 @@ pub const Vm = struct {
             self.errThread().err_source = null;
             self.errThread().err_line = -1;
             self.captureErrorTraceback();
-            if (outs.len > 0) {
-                outs[0] = .{ .Bool = false };
-                if (outs.len > 1) outs[1] = self.protectedErrorValue();
-                self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
-            }
-            return;
+            return try self.ownedPcallFail();
         }
         self.protected_call_depth += 1;
         defer self.protected_call_depth -= 1;
@@ -22948,59 +23271,12 @@ pub const Vm = struct {
             self.errThread().err_traceback = prev_err_traceback;
         }
 
-        if (outs.len == 0) {
-            // Evaluate and swallow any runtime error.
-            const resolved = self.resolveCallable(callee, call_args, null) catch return;
-            defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-            switch (resolved.callee) {
-                .Builtin => |id| {
-                    const bres = self.callBuiltin(id, resolved.args, &[_]Value{}, .host) catch |e| {
-                        // P16.31 Cut 3: pcall recovery-boundary close (PUC
-                        // luaD_closeprotected) — never on a yield (the yield
-                        // propagates through the pre-existing swallow here).
-                        if (e != error.Yield) {
-                            if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_pcall_ef, idx);
-                        }
-                        return;
-                    };
-                    // P16.50-review-6: 0-window swallow — free any owned
-                    // results (T.testC called for side effects).
-                    _ = self.consumeBuiltinResult(bres, &[_]Value{});
-                    return;
-                },
-                .Closure => |cl| {
-                    const ret = self.runClosure(cl, resolved.args) catch |e| {
-                        // P16.31 Cut 3: pcall recovery-boundary close — for
-                        // bytecode-lane errors precover already closed at
-                        // this boundary (empty-region no-op here).
-                        if (e != error.Yield) {
-                            if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_pcall_ef, idx);
-                        }
-                        return;
-                    };
-                    self.alloc.free(ret);
-                },
-                else => unreachable,
-            }
-            return;
-        }
-
-        // Helper to write failure tuple.
-        const setFail = struct {
-            fn f(vm: *Vm, o: []Value) void {
-                o[0] = .{ .Bool = false };
-                if (o.len > 1) {
-                    // PUC finishpcall: the error object is complete here —
-                    // an errerr is transported as the "error in error
-                    // handling" OBJECT (set at the throw site by
-                    // invokeErrfunc / PUC luaD_errerr), so a pcall running
-                    // INSIDE a message handler still returns the real error
-                    // it caught.
-                    o[1] = vm.protectedErrorValue();
-                }
-                vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
-            }
-        }.f;
+        // P16.50-review-7 BLOCKER 4: the old `outs.len == 0` swallow branch
+        // (caller ignores results) is GONE — with owned transport every
+        // caller gets the exact tuple and the OP_CALL consumer applies the
+        // nresults contract (a 0-result call site just frees the slice).
+        // PUC parity: luaD_poscall builds the results on the stack even
+        // when the caller's nresults is 0.
         const obj_tables_before_call = self.testc_obj_tables;
         const obj_functions_before_call = self.testc_obj_functions;
         const obj_threads_before_call = self.testc_obj_threads;
@@ -23032,87 +23308,100 @@ pub const Vm = struct {
             error.OutOfMemory => {
                 self.setOutOfMemoryError();
                 rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
-                setFail(self, outs);
-                return;
+                return try self.ownedPcallFail();
             },
             else => {
                 rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
-                setFail(self, outs);
-                return;
+                return try self.ownedPcallFail();
             },
         };
         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
 
         switch (resolved.callee) {
             .Builtin => |id| {
-                // Call builtin with as many result slots as we can return.
-                const nouts = if (outs.len > 1) outs.len - 1 else 0;
+                // P16.50-review-7 BLOCKER 4: stage the nested builtin's
+                // results in a buffer sized to its EXACT window
+                // (builtinOutLen: arg-derivable for window builtins, 0 for
+                // owned producers — their exact results come back as an
+                // owned slice). PUC parity: precallC reserves exactly the C
+                // callee's needs above L->top (luaD_pcall catches a stack
+                // growth failure as an ordinary error → [false, "not enough
+                // memory"]). The buffer is infraAlloc'd — result transport,
+                // invisible to the testc countdown (PUC reserves stack
+                // slots, no counted allocation).
+                const nouts = builtinOutLen(self, id, resolved.args);
                 var tmp_small: [8]Value = undefined;
                 var tmp: []Value = undefined;
                 var tmp_heap = false;
                 if (nouts <= tmp_small.len) {
                     tmp = tmp_small[0..nouts];
                 } else {
-                    tmp = self.alloc.alloc(Value, nouts) catch |e| switch (e) {
+                    tmp = self.infraAlloc().alloc(Value, nouts) catch |e| switch (e) {
                         error.OutOfMemory => {
                             self.setOutOfMemoryError();
                             rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
-                            setFail(self, outs);
-                            return;
+                            return try self.ownedPcallFail();
                         },
                     };
                     tmp_heap = true;
                 }
-                defer if (tmp_heap) self.alloc.free(tmp);
+                defer if (tmp_heap) self.infraAlloc().free(tmp);
 
                 const pcall_bres = self.callBuiltin(id, resolved.args, tmp, .host) catch |e| switch (e) {
                     error.Yield => return e,
                     error.OutOfMemory => {
                         self.setOutOfMemoryError();
                         // P16.31 Cut 3: pcall recovery-boundary close (PUC
-                        // luaD_closeprotected) — before setFail so a final
-                        // closer error replaces the failure's error object.
+                        // luaD_closeprotected) — before the fail tuple so a
+                        // final closer error replaces the failure's error object.
                         if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_pcall_ef, idx);
                         rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
-                        setFail(self, self.refreshBuiltinOuts() orelse outs);
-                        return;
+                        return try self.ownedPcallFail();
                     },
                     else => {
                         if (id == .@"error") {
                             // P16.31 Cut 3: pcall recovery-boundary close —
                             // no marks can exist above (the callee IS error),
                             // kept for uniformity with PUC luaD_closeprotected.
+                            // No counter rollback: the `error` builtin
+                            // constructs no objects.
                             if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_pcall_ef, idx);
-                            const outs_fresh = self.refreshBuiltinOuts() orelse outs;
-                            outs_fresh[0] = .{ .Bool = false };
-                            if (outs_fresh.len > 1) outs_fresh[1] = self.protectedErrorValue();
-                            self.last_builtin_out_count = @min(@as(usize, 2), outs_fresh.len);
-                            return;
+                            return try self.ownedPcallFail();
                         }
                         // P16.31 Cut 3: pcall recovery-boundary close —
                         // builtin-callee errors (e.g. a testC script that
                         // marked TBC and errored) close HERE.
                         if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_pcall_ef, idx);
                         rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
-                        setFail(self, self.refreshBuiltinOuts() orelse outs);
-                        return;
+                        return try self.ownedPcallFail();
                     },
                 };
 
-                // P15.38i: Re-derive outs — callBuiltin may have triggered
-                // bc_stack realloc via nested re-entry.
-                const outs_fresh = self.refreshBuiltinOuts() orelse outs;
-                outs_fresh[0] = .{ .Bool = true };
-                // P16.50-review-6 BLOCKER 1: obtain the ACTUAL count first
-                // (owned results land in the local tmp buffer, window count
-                // passes through), then apply the pcall result contract.
-                const used_tmp = self.consumeBuiltinResult(pcall_bres, tmp);
-                for (0..used_tmp) |i| {
-                    const v = tmp[i];
-                    if (1 + i >= outs_fresh.len) break;
-                    outs_fresh[1 + i] = v;
+                // P16.50-review-7 BLOCKER 4: build the exact owned tuple
+                // `[true] ++ results`. Owned results are copied then freed;
+                // window results are copied from the staging buffer
+                // (produced ≤ window; callBuiltin nil-fills the window, so
+                // a short produced count still reads valid values).
+                switch (pcall_bres) {
+                    .owned => |vals| {
+                        const res = self.ownedPcallOk(vals) catch {
+                            // Real OOM building the transport tuple (the
+                            // countdown cannot reach infraAlloc). PUC has no
+                            // analog (luaD_poscall moves stack slots and
+                            // cannot fail); the closest precedent is
+                            // lua_pcallk itself failing with LUA_ERRMEM —
+                            // the pcall call site errors, no tuple. No
+                            // counter rollback: the callee SUCCEEDED, its
+                            // objects are live.
+                            self.setOutOfMemoryError();
+                            self.infraAlloc().free(vals);
+                            return error.OutOfMemory;
+                        };
+                        self.infraAlloc().free(vals);
+                        return res;
+                    },
+                    .window => |produced| return try self.ownedPcallOk(tmp[0..produced]),
                 }
-                self.last_builtin_out_count = @min(1 + used_tmp, outs_fresh.len);
             },
             .Closure => |cl| {
                 // PUC luaD_pcall: save old_top (L->top) and old_ci (L->ci)
@@ -23134,8 +23423,7 @@ pub const Vm = struct {
                         self.unwindBytecodeExecFrames(&th_pcall.call_frames, saved_frame_count);
                         th_pcall.bytecode_stack_top = saved_bc_stack_top;
                         rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
-                        setFail(self, self.refreshBuiltinOuts() orelse outs);
-                        return;
+                        return try self.ownedPcallFail();
                     },
                     else => {
                         // P16.31 Cut 3: pcall recovery-boundary close — see
@@ -23144,26 +23432,25 @@ pub const Vm = struct {
                         self.unwindBytecodeExecFrames(&th_pcall.call_frames, saved_frame_count);
                         th_pcall.bytecode_stack_top = saved_bc_stack_top;
                         rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
-                        setFail(self, self.refreshBuiltinOuts() orelse outs);
-                        return;
+                        return try self.ownedPcallFail();
                     },
                 };
                 defer self.alloc.free(ret);
 
-                // P15.38i: Re-derive outs — runClosure may have triggered
-                // bc_stack realloc via nested re-entry.
-                const outs_fresh = self.refreshBuiltinOuts() orelse outs;
-                outs_fresh[0] = .{ .Bool = true };
-                const n = @min(ret.len, outs_fresh.len - 1);
-                for (0..n) |i| outs_fresh[1 + i] = ret[i];
-                self.last_builtin_out_count = 1 + n;
+                // P16.50-review-7 BLOCKER 4: exact owned tuple `[true] ++
+                // ret` (copied — `ret` stays owned by its defer; the copy
+                // is infraAlloc'd transport, uncounted).
+                return try self.ownedPcallOk(ret);
             },
             else => unreachable,
         }
     }
 
-    fn builtinXpcall(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
-        self.last_builtin_out_count = 0;
+    /// P16.50-review-7 BLOCKER 4: xpcall returns its results as an OWNED
+    /// slice — `[true] ++ callee_results` on success, `[false, err]` on
+    /// failure (PUC luaB_xpcall → lua_pcallk → finishpcall; see
+    /// builtinPcall). The `outs` window is gone.
+    fn builtinXpcall(self: *Vm, args: []const Value) DispatchError!?[]Value {
         // PUC lbaselib.c:503 luaL_checktype(L, 2, LUA_TFUNCTION): the
         // message handler MUST be a function (Lua or C closure). A callable
         // table does NOT pass — the check is on the raw type tag, before
@@ -23228,20 +23515,10 @@ pub const Vm = struct {
             if (th_xpcall_ef.bytecode_stack.len < PHYSICAL_LIMIT) {
                 const old_len = th_xpcall_ef.bytecode_stack.len;
                 th_xpcall_ef.bytecode_stack = self.alloc.realloc(th_xpcall_ef.bytecode_stack, PHYSICAL_LIMIT) catch {
-                    if (outs.len > 0) {
-                        outs[0] = .{ .Bool = false };
-                        if (outs.len > 1) outs[1] = self.protectedErrorValue();
-                        self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
-                    }
-                    return;
+                    return try self.ownedPcallFail();
                 };
                 th_xpcall_ef.bytecode_boxed = self.alloc.realloc(th_xpcall_ef.bytecode_boxed, PHYSICAL_LIMIT) catch {
-                    if (outs.len > 0) {
-                        outs[0] = .{ .Bool = false };
-                        if (outs.len > 1) outs[1] = self.protectedErrorValue();
-                        self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
-                    }
-                    return;
+                    return try self.ownedPcallFail();
                 };
                 @memset(th_xpcall_ef.bytecode_stack[old_len..], .Nil);
                 @memset(th_xpcall_ef.bytecode_boxed[old_len..], null);
@@ -23254,17 +23531,10 @@ pub const Vm = struct {
             // site with the raw error object (retry loop inside
             // invokeErrfunc mirrors luaG_errormsg recursion).
             try self.invokeErrfunc();
-            // The PHYSICAL_LIMIT realloc above (and invokeErrfunc's handler
-            // execution) may have moved bc_stack — re-derive the outs
-            // window before writing the failure result (xpcall registered
-            // it via callBuiltin's builtinMayRefreshOuts).
-            const outs_ovf = self.refreshBuiltinOuts() orelse outs;
-            if (outs_ovf.len > 0) {
-                outs_ovf[0] = .{ .Bool = false };
-                if (outs_ovf.len > 1) outs_ovf[1] = self.protectedErrorValue();
-                self.last_builtin_out_count = @min(@as(usize, 2), outs_ovf.len);
-            }
-            return;
+            // P16.50-review-7 BLOCKER 4: exact owned failure tuple (the
+            // PHYSICAL_LIMIT realloc and invokeErrfunc's handler execution
+            // may have moved bc_stack — irrelevant now, no outs window).
+            return try self.ownedPcallFail();
         }
         self.protected_call_depth += 1;
         defer self.protected_call_depth -= 1;
@@ -23328,102 +23598,68 @@ pub const Vm = struct {
             self.errThread().err_traceback = prev_err_traceback;
         }
 
-        if (outs.len == 0) {
-            // Just execute for side effects.
-            const resolved = self.resolveCallable(f, call_args, null) catch return;
-            defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-            switch (resolved.callee) {
-                .Builtin => |id| {
-                    const bres = self.callBuiltin(id, resolved.args, &[_]Value{}, .host) catch |e| switch (e) {
-                        error.Yield => return e,
-                        else => {
-                            // P16.31 Cut 3: xpcall recovery-boundary close (PUC
-                            // luaD_closeprotected).
-                            if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_xpcall_cf, idx);
-                            return;
-                        },
-                    };
-                    // P16.50-review-6: 0-window swallow — free owned results.
-                    _ = self.consumeBuiltinResult(bres, &[_]Value{});
-                    return;
-                },
-                .Closure => |cl| {
-                    const ret = self.runClosure(cl, resolved.args) catch |e| switch (e) {
-                        error.Yield => return e,
-                        else => {
-                            // P16.31 Cut 3: xpcall recovery-boundary close —
-                            // precover may already have popped the frame (no
-                            // YPCALL mark) and closed at the outer boundary.
-                            if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_xpcall_cf, idx);
-                            return;
-                        },
-                    };
-                    self.alloc.free(ret);
-                },
-                else => unreachable,
-            }
-            return;
-        }
-
+        // P16.50-review-7 BLOCKER 4: the old `outs.len == 0` swallow branch
+        // is GONE (see builtinPcall) — every caller gets the exact owned
+        // tuple; the consumer applies the nresults contract.
+        //
         // PUC lua_pcallk error completion (finishpcall): the message
         // handler already ran at the throw site (invokeErrfunc /
         // luaG_errormsg) and its result replaced the error object, so
         // protectedErrorValue() IS the handler-transformed object (or the
         // "error in error handling" object when the handler kept failing).
-        const writeFailure = struct {
-            fn run(vm: *Vm, o: []Value) void {
-                o[0] = .{ .Bool = false };
-                if (o.len > 1) o[1] = vm.protectedErrorValue();
-                vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
-            }
-        }.run;
-
         const resolved = self.resolveCallable(f, call_args, null) catch {
-            writeFailure(self, outs);
-            return;
+            return try self.ownedPcallFail();
         };
         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
 
         switch (resolved.callee) {
             .Builtin => |id| {
-                const nouts = if (outs.len > 1) outs.len - 1 else 0;
+                // P16.50-review-7 BLOCKER 4: exact-window staging buffer —
+                // see builtinPcall (infraAlloc'd transport, invisible to
+                // the testc countdown).
+                const nouts = builtinOutLen(self, id, resolved.args);
                 var tmp_small: [8]Value = undefined;
                 var tmp: []Value = undefined;
                 var tmp_heap = false;
                 if (nouts <= tmp_small.len) {
                     tmp = tmp_small[0..nouts];
                 } else {
-                    tmp = try self.alloc.alloc(Value, nouts);
+                    tmp = self.infraAlloc().alloc(Value, nouts) catch |e| switch (e) {
+                        error.OutOfMemory => {
+                            self.setOutOfMemoryError();
+                            return try self.ownedPcallFail();
+                        },
+                    };
                     tmp_heap = true;
                 }
-                defer if (tmp_heap) self.alloc.free(tmp);
+                defer if (tmp_heap) self.infraAlloc().free(tmp);
 
                 const xpcall_bres = self.callBuiltin(id, resolved.args, tmp, .host) catch |e| switch (e) {
                     error.Yield => return e,
                     else => {
                         // P16.31 Cut 3: xpcall recovery-boundary close (PUC
-                        // luaD_closeprotected) — before writeFailure so a
+                        // luaD_closeprotected) — before the fail tuple so a
                         // final closer error replaces the failure's error
                         // object.
                         if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_xpcall_cf, idx);
-                        writeFailure(self, self.refreshBuiltinOuts() orelse outs);
-                        return;
+                        return try self.ownedPcallFail();
                     },
                 };
 
-                // P15.38i: Re-derive outs — callBuiltin may have triggered
-                // bc_stack realloc via nested re-entry.
-                const outs_fresh = self.refreshBuiltinOuts() orelse outs;
-                outs_fresh[0] = .{ .Bool = true };
-                // P16.50-review-6 BLOCKER 1: actual count first, then the
-                // xpcall result contract (see builtinPcall).
-                const used_tmp = self.consumeBuiltinResult(xpcall_bres, tmp);
-                for (0..used_tmp) |i| {
-                    const v = tmp[i];
-                    if (1 + i >= outs_fresh.len) break;
-                    outs_fresh[1 + i] = v;
+                // P16.50-review-7 BLOCKER 4: exact owned tuple — see
+                // builtinPcall.
+                switch (xpcall_bres) {
+                    .owned => |vals| {
+                        const res = self.ownedPcallOk(vals) catch {
+                            self.setOutOfMemoryError();
+                            self.infraAlloc().free(vals);
+                            return error.OutOfMemory;
+                        };
+                        self.infraAlloc().free(vals);
+                        return res;
+                    },
+                    .window => |produced| return try self.ownedPcallOk(tmp[0..produced]),
                 }
-                self.last_builtin_out_count = @min(1 + used_tmp, outs_fresh.len);
             },
             .Closure => |cl| {
                 // PUC luaD_pcall: save old_top (L->top) and old_ci (L->ci)
@@ -23446,18 +23682,13 @@ pub const Vm = struct {
                         // pointer and unwind call frames.
                         self.unwindBytecodeExecFrames(&th_xpcall.call_frames, saved_frame_count);
                         th_xpcall.bytecode_stack_top = saved_bc_stack_top;
-                        writeFailure(self, self.refreshBuiltinOuts() orelse outs);
-                        return;
+                        return try self.ownedPcallFail();
                     },
                 };
                 defer self.alloc.free(ret);
-                // P15.38i: Re-derive outs — runClosure may have triggered
-                // bc_stack realloc via nested re-entry.
-                const outs_fresh = self.refreshBuiltinOuts() orelse outs;
-                outs_fresh[0] = .{ .Bool = true };
-                const n = @min(ret.len, outs_fresh.len - 1);
-                for (0..n) |i| outs_fresh[1 + i] = ret[i];
-                self.last_builtin_out_count = 1 + n;
+                // P16.50-review-7 BLOCKER 4: exact owned tuple `[true] ++
+                // ret` (copied — `ret` stays owned by its defer).
+                return try self.ownedPcallOk(ret);
             },
             else => unreachable,
         }
@@ -23509,7 +23740,13 @@ pub const Vm = struct {
         outs[0] = .{ .Table = obj };
     }
 
-    fn builtinCoroutineWrapIter(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+    /// P16.50-review-7 BLOCKER 4: the coroutine.wrap iterator returns the
+    /// resumed coroutine's EXACT yielded/returned values as an owned slice
+    /// (PUC auxwrap: luaD_poscall of the resume results minus the boolean
+    /// — no bound; the old 256-slot window truncated every wrap iteration
+    /// to 255 values). On a resume failure it RE-RAISES the error (PUC
+    /// auxwrap: lua_error) — no result.
+    fn builtinCoroutineWrapIter(self: *Vm, args: []const Value) DispatchError!?[]Value {
         var th: *Thread = undefined;
         var call_args: []const Value = args;
         if (args.len > 0 and args[0] == .Table) {
@@ -23526,9 +23763,11 @@ pub const Vm = struct {
         }
         if (th.wrap_repeat_closure) |cl| {
             if (call_args.len == 0 and th.status == .suspended and bumpClosureNumericUpvalues(self, cl, 1)) {
-                if (outs.len > 0) outs[0] = .{ .Closure = cl };
-                self.last_builtin_out_count = if (outs.len > 0) 1 else 0;
-                return;
+                // P16.50-review-7 BLOCKER 4: the fast path returns its one
+                // value as an owned slice (exact-result contract).
+                const res = try self.allocOwnedResult(1);
+                res[0] = .{ .Closure = cl };
+                return res;
             }
             th.wrap_repeat_closure = null;
         }
@@ -23537,20 +23776,23 @@ pub const Vm = struct {
         resume_args[0] = .{ .Thread = th };
         for (call_args, 0..) |v, i| resume_args[i + 1] = v;
 
-        const tmp = try self.alloc.alloc(Value, outs.len + 1);
-        defer self.alloc.free(tmp);
-        for (tmp) |*v| v.* = .Nil;
-        try self.builtinCoroutineResume(resume_args, tmp);
+        // P16.50-review-7 BLOCKER 4: resume returns its EXACT tuple
+        // `[ok] ++ values` as an owned slice; the iterator strips the
+        // boolean. The tuple is infraAlloc'd transport — freed on every
+        // exit below (the returned values are a FRESH copy: a re-based
+        // sub-slice could not be freed safely — shifted pointer).
+        const rres = try self.builtinCoroutineResume(resume_args);
+        defer self.infraAlloc().free(rres);
 
-        const ok = switch (tmp[0]) {
+        const ok = switch (rres[0]) {
             .Bool => |b| b,
             else => false,
         };
         if (!ok) {
-            if (tmp.len > 1 and !(tmp[1] == .Nil)) {
-                if (tmp[1] == .String) return self.fail("{s}", .{tmp[1].String.bytes()});
+            if (rres.len > 1 and !(rres[1] == .Nil)) {
+                if (rres[1] == .String) return self.fail("{s}", .{rres[1].String.bytes()});
                 self.err = null;
-                self.errThread().err_obj = tmp[1];
+                self.errThread().err_obj = rres[1];
                 self.errThread().err_has_obj = true;
                 self.errThread().err_source = null;
                 self.errThread().err_line = -1;
@@ -23559,15 +23801,14 @@ pub const Vm = struct {
             }
             return self.fail("coroutine.wrap resume failed", .{});
         }
-        const resume_out = if (self.last_builtin_out_count > 0) self.last_builtin_out_count - 1 else 0;
-        const n = @min(outs.len, @min(resume_out, if (tmp.len > 1) tmp.len - 1 else 0));
-        for (0..n) |i| outs[i] = tmp[i + 1];
-        self.last_builtin_out_count = n;
+        const vals = rres[1..];
+        const res = try self.allocOwnedResult(vals.len);
+        @memcpy(res, vals);
         th.wrap_repeat_closure = null;
-        if (n == 1 and outs[0] == .Closure and th.status == .suspended and call_args.len == 0 and th.callee == .Closure and th.callee.Closure.proto != null and th.callee.Closure.proto.?.numparams == 0) {
-            th.wrap_repeat_closure = outs[0].Closure;
+        if (res.len == 1 and res[0] == .Closure and th.status == .suspended and call_args.len == 0 and th.callee == .Closure and th.callee.Closure.proto != null and th.callee.Closure.proto.?.numparams == 0) {
+            th.wrap_repeat_closure = res[0].Closure;
         }
-        return;
+        return res;
     }
 
     fn freeThreadWrapBuffers(self: *Vm, th: *Thread) void {
@@ -23765,7 +24006,10 @@ pub const Vm = struct {
             th.suspended_builtin = null;
             th.suspended_builtin_args.deinit(self.alloc);
         }
-        self.last_builtin_out_count = args.len;
+        // P16.50-review-7 BLOCKER 4: no last_builtin_out_count transport —
+        // yield never returns normally (error.Yield below); the parked
+        // values travel via th.yielded to the next resume, which returns
+        // them as its OWNED tuple.
 
         // P15.67: When yielding from an async debug hook frame (count/line hook
         // running as a bytecode closure via tryPushBytecodeDebugHook), the hook
@@ -24013,14 +24257,19 @@ pub const Vm = struct {
         self.activeHookState().allow_yield = true;
     }
 
-    fn builtinCoroutineResume(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+    /// P16.50-review-7 BLOCKER 4: resume returns its EXACT result tuple as
+    /// an owned slice — `[true] ++ yielded_or_returned_values` on a yield
+    /// or completion, `[false, err]` on a rejection or failure (PUC
+    /// luaB_coresume / auxresume: luaD_poscall places the tuple above the
+    /// results with NO bound; the old 256-slot window truncated every
+    /// resume to 255 values). The `outs` window and its `want_out` mode
+    /// are gone: every caller gets the exact tuple; the consumer applies
+    /// the nresults contract.
+    fn builtinCoroutineResume(self: *Vm, args: []const Value) DispatchError![]Value {
         if (args.len == 0) return self.fail("coroutine.resume expects thread", .{});
         const th = try self.expectThread(args[0]);
-        self.last_builtin_out_count = 0;
         defer if (th.close_mode) self.clearForcedClose(th);
 
-        // Default return for resume is a tuple: (ok, ...).
-        const want_out = outs.len > 0;
         // P16.24 T5: the old activeProtectedCallDepth() >= 32 cap was a
         // second implementation of the LUAI_MAXCCALLS resume invariant
         // (cstack "30 vs 195" divergence). Resume nesting is bounded by the
@@ -24036,31 +24285,16 @@ pub const Vm = struct {
         defer th_resume.errfunc = saved_errfunc;
 
         if (th.status == .dead) {
-            if (want_out) outs[0] = .{ .Bool = false };
-            if (outs.len > 1) {
-                const istr = try self.internStr("cannot resume dead coroutine");
-                outs[1] = .{ .String = istr };
-            }
-            self.last_builtin_out_count = if (want_out) @min(@as(usize, 2), outs.len) else 0;
-            return;
+            const istr = try self.internStr("cannot resume dead coroutine");
+            return try self.ownedResumeFail(.{ .String = istr });
         }
         if (th.status == .suspended and self.current_thread != null and self.current_thread.? != th and self.current_thread.?.caller == th) {
-            if (want_out) outs[0] = .{ .Bool = false };
-            if (outs.len > 1) {
-                const istr2 = try self.internStr("cannot resume non-suspended coroutine");
-                outs[1] = .{ .String = istr2 };
-            }
-            self.last_builtin_out_count = if (want_out) @min(@as(usize, 2), outs.len) else 0;
-            return;
+            const istr2 = try self.internStr("cannot resume non-suspended coroutine");
+            return try self.ownedResumeFail(.{ .String = istr2 });
         }
         if (th.status == .running) {
-            if (want_out) outs[0] = .{ .Bool = false };
-            if (outs.len > 1) {
-                const istr3 = try self.internStr("cannot resume non-suspended coroutine");
-                outs[1] = .{ .String = istr3 };
-            }
-            self.last_builtin_out_count = if (want_out) @min(@as(usize, 2), outs.len) else 0;
-            return;
+            const istr3 = try self.internStr("cannot resume non-suspended coroutine");
+            return try self.ownedResumeFail(.{ .String = istr3 });
         }
 
         // P16.25.1 R2: resume-ENTRY ACCEPTANCE FIRST (PUC lua_resume order:
@@ -24072,14 +24306,7 @@ pub const Vm = struct {
             const entry_th = self.activeBytecodeThread();
             const entry = try self.resumeEnterC(th, entry_th);
             if (entry == .rejected) {
-                if (want_out) {
-                    outs[0] = .{ .Bool = false };
-                    if (outs.len > 1) outs[1] = entry.rejected;
-                    self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
-                } else {
-                    self.last_builtin_out_count = 0;
-                }
-                return;
+                return try self.ownedResumeFail(entry.rejected);
             }
         }
 
@@ -24161,7 +24388,6 @@ pub const Vm = struct {
             th.call_frames.ensureTotalCapacity(self.alloc, 64) catch {};
         }
         try self.setThreadResumeInbox(th, call_args);
-        const nouts = if (outs.len > 1) outs.len - 1 else 0;
         const prev_thread = self.current_thread;
         var prev_thread_status: ?@TypeOf(th.status) = null;
         if (prev_thread) |pt| {
@@ -24189,13 +24415,25 @@ pub const Vm = struct {
         var forced_close_ok = false;
         var yielded: bool = false;
         var payload: []Value = &[_]Value{};
+        var payload_n: usize = 0;
         var payload_heap: bool = false;
-        // P16.50-review-4 BLOCKER 4: the free defer was declared at the
+        // P16.50-review-7 BLOCKER 4: the free defer was declared at the
         // function's tail — the coroutine-completion early return (and
         // the yielded return) fired BEFORE it was armed, leaking the
         // 1-Value completion payload on every completing resume. Armed
         // immediately after the declarations: EVERY exit frees it.
+        // (self.alloc.free is safe for infraAlloc'd payload slices too —
+        // the charged-block registry passes foreign blocks through.)
         defer if (payload_heap) self.alloc.free(payload);
+        // P16.50-review-7 BLOCKER 4: payload_n tracks the number of VALID
+        // values in payload — updated alongside EVERY payload assignment.
+        // The old code assumed payload.len == valid count, which only held
+        // when the producer filled the whole window; a window builtin
+        // producing FEWER values than its window (coroutine.close's 1-of-2,
+        // io_read's early nil) left nil padding that the completion tail
+        // copied as bogus extra results (latent bug, masked by the old
+        // caller-window truncation). The completion tail now copies
+        // payload[0..payload_n] — the exact produced count.
 
         // Coroutine-body CALL hook. For a bytecode-Closure body, PUC fires
         // LUA_HOOKCALL when the body's CallInfo starts executing (luaD_call →
@@ -24287,26 +24525,19 @@ pub const Vm = struct {
                         th.api_status = 2; // LUA_ERRRUN
                         th.started = true;
                         th.finished = true;
-                        if (want_out) {
-                            outs[0] = .{ .Bool = false };
-                            if (outs.len > 1) outs[1] = th.close_err;
-                            self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
-                        }
                         self.clearThreadContinuationScratch(th, .{ .clear_yielded = true });
-                        return;
+                        return try self.ownedResumeFail(close_err.?);
                     }
                     th.status = .dead;
                     th.api_status = 0; // LUA_OK
                     th.started = true;
                     th.finished = true;
                     th.close_has_err = false;
-                    if (want_out) {
-                        outs[0] = .{ .Bool = true };
-                        if (outs.len > 1) outs[1] = .Nil;
-                        self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
-                    }
                     self.clearThreadContinuationScratch(th, .{ .clear_yielded = true });
-                    return;
+                    // P16.50-review-7 BLOCKER 4: exact owned tuple
+                    // `[true, nil]` (PUC lua_closethread → LUA_OK with no
+                    // values; the nil keeps the resume tuple shape).
+                    return try self.ownedResumeOk(&[_]Value{.Nil});
                 }
                 // Lua frames remain — set up for resume so the close_mode
                 // branch in runBytecodeInternal runs __close for TBC vars
@@ -24357,6 +24588,7 @@ pub const Vm = struct {
                             const ys = th.yieldedValues() orelse &[_]Value{};
                             if (ys.len > 0) {
                                 payload = try self.alloc.alloc(Value, ys.len);
+                                payload_n = ys.len;
                                 payload_heap = true;
                                 for (ys, 0..) |v, i| payload[i] = v;
                             }
@@ -24442,6 +24674,7 @@ pub const Vm = struct {
                         // continuation's results are in resume_inbox.
                         const ri = th.resume_inbox.slice() orelse &[_]Value{};
                         payload = try self.alloc.alloc(Value, ri.len);
+                        payload_n = ri.len;
                         payload_heap = true;
                         for (ri, 0..) |v, i| payload[i] = v;
                         th.resume_inbox.deinit(self.alloc);
@@ -24453,12 +24686,11 @@ pub const Vm = struct {
                         th.started = true;
                         th.finished = true;
                         th.close_has_err = false;
-                        outs[0] = .{ .Bool = true };
-                        const n = @min(payload.len, if (outs.len > 1) outs.len - 1 else 0);
-                        for (0..n) |i| outs[1 + i] = payload[i];
-                        self.last_builtin_out_count = 1 + n;
                         self.clearThreadContinuationScratch(th, .{});
-                        return;
+                        // P16.50-review-7 BLOCKER 4: exact owned tuple
+                        // `[true] ++ payload[0..payload_n]` — the completion
+                        // payload's exact count, no window truncation.
+                        return try self.ownedResumeOk(payload[0..payload_n]);
                     }
                     // More frames — loop to check if the next one is also C.
                 }
@@ -24470,11 +24702,9 @@ pub const Vm = struct {
                     th.started = true;
                     th.finished = false;
                     th.close_has_err = false;
-                    outs[0] = .{ .Bool = true };
-                    const n = @min(payload.len, if (outs.len > 1) outs.len - 1 else 0);
-                    for (0..n) |i| outs[1 + i] = payload[i];
-                    self.last_builtin_out_count = 1 + n;
-                    return;
+                    // P16.50-review-7 BLOCKER 4: exact owned tuple
+                    // `[true] ++ payload[0..payload_n]`.
+                    return try self.ownedResumeOk(payload[0..payload_n]);
                 }
 
                 // If C-frames were processed but there are still Lua frames,
@@ -24529,6 +24759,7 @@ pub const Vm = struct {
                     const ri = th.resume_inbox.slice() orelse &[_]Value{};
                     if (ri.len > 0) {
                         payload = try self.alloc.alloc(Value, ri.len);
+                        payload_n = ri.len;
                         payload_heap = true;
                         for (ri, 0..) |v, i| payload[i] = v;
                     }
@@ -24677,6 +24908,7 @@ pub const Vm = struct {
                 // parent (the callee's results must feed that C-frame).
                 if (th.call_frames.len() == 0) {
                     payload = ret;
+                    payload_n = ret.len;
                     payload_heap = true;
                     break :unroll_loop;
                 }
@@ -24764,28 +24996,44 @@ pub const Vm = struct {
             switch (resolved.callee) {
                 .Builtin => |id| {
                     // Normal path: first run or no preserved Lua frame.
+                    // P16.50-review-7 BLOCKER 4: stage the body builtin's
+                    // results in a buffer sized to its EXACT window
+                    // (builtinOutLen: arg-derivable for window builtins, 0
+                    // for owned producers — their exact results come back
+                    // as an owned slice). The old caller-window sizing
+                    // (outs.len - 1) both truncated large bodies and padded
+                    // short ones (see the payload_n comment above).
+                    const nouts = builtinOutLen(self, id, resolved.args);
                     if (nouts != 0) {
                         payload = try self.alloc.alloc(Value, nouts);
+                        payload_n = nouts;
                         payload_heap = true;
                     }
                     // P16.50-review-6 BLOCKER 1: capture the result contract.
                     // The catch arms set flags and fall through to the common
                     // tails, which never read the payload on those paths.
                     if (self.callBuiltin(id, resolved.args, payload, .host)) |co_bres| {
-                        // Owned results (a T.testC coroutine body) carry the
-                        // EXACT count — replace the nil-padded nouts payload
-                        // with the owned slice (the tail defer frees it via
-                        // self.alloc.free; foreign blocks pass through). The
-                        // resume tail then reports exactly vals.len results
-                        // instead of the padded window (PUC lua_resume: the
-                        // body's actual returns).
                         switch (co_bres) {
+                            // Owned results (a T.testC coroutine body) carry
+                            // the EXACT count — replace the staging payload
+                            // with the owned slice (the tail defer frees it
+                            // via self.alloc.free; foreign blocks pass
+                            // through). The resume tail then reports exactly
+                            // vals.len results (PUC lua_resume: the body's
+                            // actual returns).
                             .owned => |vals| {
                                 if (payload_heap) self.alloc.free(payload);
                                 payload = vals;
+                                payload_n = vals.len;
                                 payload_heap = true;
                             },
-                            .window => {},
+                            // Window results: the ACTUAL produced count can
+                            // be smaller than the window (coroutine.close's
+                            // 1-of-2, io_read's early nil) — payload_n is
+                            // the produced count, not the window size.
+                            .window => |produced| {
+                                payload_n = produced;
+                            },
                         }
                     } else |e| switch (e) {
                         error.Yield => {
@@ -24807,11 +25055,13 @@ pub const Vm = struct {
                         switch (step) {
                             .returned => |ret| {
                                 payload = ret;
+                                payload_n = ret.len;
                                 payload_heap = true;
                             },
                             .yielded => |ret| {
                                 if (ret.len > 0) {
                                     payload = ret;
+                                    payload_n = ret.len;
                                     payload_heap = true;
                                 }
                                 yielded = true;
@@ -24849,6 +25099,7 @@ pub const Vm = struct {
                         };
                         if (ret_opt) |ret| {
                             payload = ret;
+                            payload_n = ret.len;
                             payload_heap = true;
                         }
                     }
@@ -24869,34 +25120,18 @@ pub const Vm = struct {
             th.err_line = -1;
         }
 
-        if (!want_out) {
-            // Caller ignores results. Still follow resume semantics and do not throw.
-            if (yielded or th.yieldedValues() != null) {
-                th.yielded.deinit(self.alloc);
-                th.status = .suspended;
-                th.api_status = 1; // LUA_YIELD
-                th.started = true;
-                th.finished = false;
-            } else {
-                th.status = .dead;
-                th.api_status = 0; // LUA_OK — completed
-                th.started = true;
-                th.finished = true;
-            }
-            return;
-        }
+        // P16.50-review-7 BLOCKER 4: the old `!want_out` branch (caller
+        // ignores results — follow resume semantics, build no tuple) is
+        // GONE: every caller now receives the exact owned tuple and the
+        // consumer applies the nresults contract (a 0-result call site
+        // just frees the slice). The status transitions it performed are
+        // the same ones the normal tails below perform.
 
         if (!ok) {
-            outs[0] = .{ .Bool = false };
-            if (outs.len > 1) {
-                if (th.err_has_obj) {
-                    outs[1] = th.err_obj;
-                } else {
-                    const istr = try self.internStr(self.errorString());
-                    outs[1] = .{ .String = istr };
-                }
-            }
-            self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
+            const errv: Value = if (th.err_has_obj) th.err_obj else blk: {
+                const istr = try self.internStr(self.errorString());
+                break :blk Value{ .String = istr };
+            };
             th.yielded.deinit(self.alloc);
             th.trace_had_error = true;
             th.status = .dead;
@@ -24918,16 +25153,17 @@ pub const Vm = struct {
             // stack; ours lives here.
             th.api_err_residue = th.err_cframe_residue;
             self.clearThreadContinuationScratch(th, .{});
-            return;
+            // P16.50-review-7 BLOCKER 4: exact owned failure tuple
+            // `[false, err]` (PUC luaB_coresume's error arm).
+            return try self.ownedResumeFail(errv);
         }
 
         // Yield path: return yielded values (set by coroutine.yield).
         if (yielded or th.yieldedValues() != null) {
             const ys = th.yieldedValues() orelse &[_]Value{};
-            outs[0] = .{ .Bool = true };
-            const n = @min(ys.len, outs.len - 1);
-            for (0..n) |i| outs[1 + i] = ys[i];
-            self.last_builtin_out_count = 1 + n;
+            // P16.50-review-7 BLOCKER 4: exact owned tuple `[true] ++ ys`
+            // — copied BEFORE the yielded store is deinit'd below.
+            const res = try self.ownedResumeOk(ys);
             th.yielded.deinit(self.alloc);
             th.trace_yields += 1;
             th.status = .suspended;
@@ -24935,13 +25171,13 @@ pub const Vm = struct {
             th.close_has_err = false;
             th.started = true;
             th.finished = false;
-            return;
+            return res;
         }
 
-        outs[0] = .{ .Bool = true };
-        const n = @min(payload.len, outs.len - 1);
-        for (0..n) |i| outs[1 + i] = payload[i];
-        self.last_builtin_out_count = 1 + n;
+        // P16.50-review-7 BLOCKER 4: exact owned tuple `[true] ++
+        // payload[0..payload_n]` — the body's actual returns, no window
+        // truncation (PUC lua_resume: luaD_poscall of the body's results).
+        const res = try self.ownedResumeOk(payload[0..payload_n]);
         th.trace_had_error = false;
         th.status = .dead;
         th.api_status = 0; // LUA_OK — completed
@@ -24949,6 +25185,7 @@ pub const Vm = struct {
         th.started = true;
         th.finished = true;
         self.clearThreadContinuationScratch(th, .{});
+        return res;
     }
 
     fn builtinCoroutineStatus(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -25238,9 +25475,26 @@ pub const Vm = struct {
                 self.cur_c_stack = saved_cur_c_stack;
             }
             var resume_args = [_]Value{.{ .Thread = th }};
-            var resume_out = [_]Value{ .Nil, .Nil };
-            self.builtinCoroutineResume(resume_args[0..], resume_out[0..]) catch {};
-            const ok = switch (resume_out[0]) {
+            // P16.50-review-7 BLOCKER 4: resume returns its exact tuple as
+            // an owned slice — read the boolean and the close error from
+            // it, then free it (the transport discards the values).
+            const rres = self.builtinCoroutineResume(resume_args[0..]) catch {
+                // The transport's resume runs a forced close (close_mode):
+                // errors are latched onto the thread by the close paths, not
+                // propagated — treat a propagation as a failed close with no
+                // error object (the !ok arm below reports via th state).
+                th.status = .dead;
+                th.errfunc = ERRFUNC_NONE; // PUC luaE_resetthread
+                th.api_status = 0; // LUA_OK — PUC resetCI sets L->status=LUA_OK
+                const outw = self.refreshBuiltinOuts() orelse outs;
+                if (outw.len > 0) outw[0] = .{ .Bool = false };
+                if (outw.len > 1) outw[1] = .Nil;
+                th.close_has_err = false;
+                th.close_err = .Nil;
+                self.last_builtin_out_count = @min(@as(usize, 2), outw.len);
+                return;
+            };
+            const ok = switch (rres[0]) {
                 .Bool => |b| b,
                 else => false,
             };
@@ -25252,14 +25506,16 @@ pub const Vm = struct {
                 // forced-close unwind (nested VM execution).
                 const outw = self.refreshBuiltinOuts() orelse outs;
                 if (outw.len > 0) outw[0] = .{ .Bool = false };
-                if (outw.len > 1) outw[1] = resume_out[1];
+                if (outw.len > 1) outw[1] = if (rres.len > 1) rres[1] else .Nil;
                 // Error is already returned by this close call; do not keep it
                 // latched for subsequent close() calls on the dead coroutine.
                 th.close_has_err = false;
                 th.close_err = .Nil;
                 self.last_builtin_out_count = @min(@as(usize, 2), outw.len);
+                self.infraAlloc().free(rres);
                 return;
             }
+            self.infraAlloc().free(rres);
         }
         // P16.31 Cut 3 ([B2]): a dead-normal thread with lingering chain
         // marks — marks that detached at frame pops and never met a
@@ -25631,7 +25887,11 @@ pub const Vm = struct {
         try self.gcWriteBarrier(child);
     }
 
-    fn gcForwardBarrierCell(self: *Vm, owner: *Closure, child: *Cell) DispatchError!void {
+    /// PUC luaC_objbarrier(L, f1, *up1) after lua_upvaluejoin (lapi.c:1470):
+    /// the closure now references the joined cell — forward barrier. Pub:
+    /// the C-API `lua_upvaluejoin` (c_api.zig) runs the same barrier the
+    /// debug library's upvaluejoin runs.
+    pub fn gcForwardBarrierCell(self: *Vm, owner: *Closure, child: *Cell) DispatchError!void {
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             // PUC luaC_barrier_ sweep arm: GENMINOR sweep → no-op.
             if (self.gc_state == .sweep) return;
@@ -29151,7 +29411,12 @@ pub const Vm = struct {
         return self.fail("no bytecode compiler configured", .{});
     }
 
-    fn builtinDofile(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+    /// P16.50-review-7 BLOCKER 4: dofile returns the chunk's EXACT return
+    /// values as an owned slice (PUC luaB_dofile → docall → luaD_poscall:
+    /// MULTRET, no bound; the old 16-slot window truncated every dofile to
+    /// 16 results). The `outs` window and its refreshBuiltinOuts re-derive
+    /// are gone — the owned slice never points into bc_stack.
+    fn builtinDofile(self: *Vm, args: []const Value) DispatchError!?[]Value {
         var entry_cl: ?*Closure = null;
         if (self.current_thread) |th| {
             if (th.callee == .Builtin and th.callee.Builtin == .dofile) {
@@ -29200,17 +29465,12 @@ pub const Vm = struct {
             else => return error.RuntimeError,
         };
         defer self.alloc.free(ret);
-        // P16.39 Cut 3 (correctness): runClosure may have reallocated
-        // bc_stack (the chunk's frames grow it) — re-derive the outs window
-        // before writing results (refreshBuiltinOuts; .dofile is listed in
-        // builtin_may_refresh_outs). Before this fix the write went through
-        // the stale pre-call slice: a dofile'd chunk deep enough to grow
-        // the stack silently lost its return values (reproduced: results
-        // read back as nil) and wrote into freed memory.
-        const outw = self.refreshBuiltinOuts() orelse outs;
-        const n = @min(outw.len, ret.len);
-        for (0..n) |i| outw[i] = ret[i];
-        self.last_builtin_out_count = ret.len;
+        // P16.50-review-7 BLOCKER 4: exact owned copy of the chunk's
+        // returns (ret is self.alloc'd and stays owned by its defer; the
+        // copy is infraAlloc'd transport, uncounted).
+        const res = try self.allocOwnedResult(ret.len);
+        @memcpy(res, ret);
+        return res;
     }
 
     pub const ChunkPrefix = struct {
@@ -32225,7 +32485,15 @@ pub const Vm = struct {
         }
     }
 
-    fn debugUpvalueName(cl: *const Closure, uidx: usize) []const u8 {
+    /// PUC `p->upvalues[n-1].name` (lapi.c aux_upvalue, LUA_VLCL arm): the
+    /// proto-recorded name of a bytecode closure's upvalue, "(no name)" when
+    /// the proto carries none (PUC's literal), "_ENV" for the main chunk's
+    /// first upvalue (the parser names it only in PUC's debug info; our
+    /// protos record no name there), "(no name)" for C closures (they have
+    /// no proto). Pub: the C-API upvalue primitives (lua_getupvalue/
+    /// lua_setupvalue) resolve names through this — the SAME names the
+    /// debug library hands out, never a re-derivation.
+    pub fn debugUpvalueName(cl: *const Closure, uidx: usize) []const u8 {
         // For bytecode closures, upvalue names live in the Proto.
         if (cl.proto) |p| {
             if (uidx < p.upvalues.len) {
@@ -32681,23 +32949,32 @@ pub const Vm = struct {
     ///      stack, report "not created" (PUC returns 0 — ANY non-nil
     ///      registry value counts as "name already in use", not just a
     ///      table);
-    ///   3. create a NORMAL GC-registered/accounted table (lua_createtable
+    ///   3. ROOT the interned tname key for the whole GC-capable window
+    ///      (PUC never holds an interned key across the window — it
+    ///      re-interns tname at every field access, so the key it stores
+    ///      is always freshly reachable from the call's own arguments;
+    ///      our single-intern shape needs the temp root to give the key
+    ///      the same reachability — see the comment at the root site);
+    ///   4. create a NORMAL GC-registered/accounted table (lua_createtable
     ///      — a metatable is not finalizable);
-    ///   4. ROOT the fresh table on the caller's stack (PUC keeps it on
+    ///   5. ROOT the fresh table on the caller's stack (PUC keeps it on
     ///      L's stack across every later fallible step), plus a
     ///      gcTempRoots safety net: the testC shadow stack is NOT
     ///      GC-marked, so the temp root is what actually protects the
     ///      created-but-unpublished table from an emergency GC inside the
     ///      __name/registry insertions;
-    ///   5. metatable.__name = tname;
-    ///   6. publish registry[tname] = metatable (the registry is itself a
+    ///   6. metatable.__name = tname;
+    ///   7. publish registry[tname] = metatable (the registry is itself a
     ///      GC root, so post-publish the table stays reachable even
     ///      before the caller observes it);
-    ///   7. report "created" (PUC returns 1); the table is on top of
+    ///   8. report "created" (PUC returns 1); the table is on top of
     ///      `root_stack`.
     /// Every OOM edge has exactly one unambiguous owner:
-    ///   - tname-intern / table-constructor OOM → nothing committed,
-    ///     nothing published, stack shape untouched;
+    ///   - tname-intern / roots-reserve / table-constructor OOM → nothing
+    ///     committed, nothing published, stack shape untouched (the
+    ///     roots-reserve edge fires BEFORE the table exists — the old
+    ///     shape reserved roots lazily and could OOM between the table
+    ///     creation and its rooting);
     ///   - stack-root OOM → table committed but unpublished: collectable
     ///     through the normal sweep (no leak, no dangling registry entry);
     ///   - __name-insertion OOM → table committed and stack-rooted,
@@ -32722,17 +32999,34 @@ pub const Vm = struct {
         }
         var roots = self.gcTempRoots();
         defer roots.end();
-        // Edge 2: normal table constructor (register + account).
+        // Edge 2 (review-7 B2): reserve BOTH temp roots up front so the
+        // key and the table push are infallible. The interned key MUST be
+        // rooted BEFORE `allocTable`: allocTable runs condGC, and an
+        // emergency GC there would sweep the key — the intern table is
+        // NOT a GC root and a Zig local is invisible to the emergency
+        // scan's conservative register window. Post-sweep, `mt.__name`
+        // would hold a dangling old key while the publish step re-interns
+        // a fresh one — registry[tname] and mt.__name would disagree.
+        // PUC avoids the window entirely (it re-interns tname at each
+        // field access); rooting the single interned key is our
+        // equivalent reachability guarantee.
+        try roots.ensure(2);
+        roots.addAssumeCapacity(.{ .String = key });
+        // Edge 3: normal table constructor (register + account).
         const mt = try self.allocTable(null);
-        // Edge 3: root — the caller's stack (PUC's L-stack root) plus the
+        roots.addAssumeCapacity(.{ .Table = mt });
+        // Edge 4: root — the caller's stack (PUC's L-stack root) plus the
         // temp-root net for shadow stacks (see the doc comment above).
-        try roots.add(.{ .Table = mt });
         try root_stack.append(root_alloc, .{ .Table = mt });
-        // Edge 4: metatable.__name = tname (PUC lua_setfield on a fresh
+        // Edge 5: metatable.__name = tname (PUC lua_setfield on a fresh
         // plain table — no metamethods possible).
         try self.setField(mt, "__name", .{ .String = key });
-        // Edge 5: publish registry[tname] = metatable.
-        try self.setField(reg, tname, .{ .Table = mt });
+        // Edge 6: publish registry[tname] = metatable — with the ROOTED
+        // key itself (review-7 B2: re-interning inside setField would
+        // depend on the intern-table hit for identity; publishing the
+        // rooted key makes registry[tname] and mt.__name the SAME string
+        // object by construction).
+        try self.apiRawSet(reg, .{ .String = key }, .{ .Table = mt });
         return true;
     }
 
@@ -34559,6 +34853,7 @@ pub const Vm = struct {
         if (!fileCanRead(self, file_v)) return self.fail(" input file is closed", .{});
         if (args.len == 0) {
             if (outs.len > 0) outs[0] = try self.readOneFormat(file_v, .{ .String = try self.internStr("l") });
+            self.last_builtin_out_count = 1;
             return;
         }
         var out_i: usize = 0;
@@ -34838,16 +35133,21 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("bad argument #1 to 'read' (FILE* expected)", .{});
         const file_v = args[0];
         if (!fileCanRead(self, file_v)) {
+            // PUC g_read's failing-fread arm (luaL_fileresult): the triple
+            // nil, msg, errno regardless of the format count — the sizing
+            // pass guarantees a window that covers it.
             if (outs.len > 0) outs[0] = .Nil;
             if (outs.len > 1) {
                 const istr = try self.internStr("bad file descriptor");
                 outs[1] = .{ .String = istr };
             }
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
+            self.last_builtin_out_count = @min(@as(usize, 3), outs.len);
             return;
         }
         if (args.len == 1) {
             if (outs.len > 0) outs[0] = try self.readOneFormat(file_v, .{ .String = try self.internStr("l") });
+            self.last_builtin_out_count = 1;
             return;
         }
         var out_i: usize = 0;
@@ -39254,7 +39554,17 @@ pub const Vm = struct {
         if (outs.len > 1) outs[1] = .{ .Int = d.cp };
     }
 
-    fn builtinTableUnpack(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+    /// P16.50-review-7 BLOCKER 4: hybrid result contract. Plain tables and
+    /// explicit integer indices have an arg-derivable exact count — the
+    /// WINDOW path (outs, exact sizing by builtinOutLen). A __len
+    /// metamethod with a nil/absent end index makes the border observable
+    /// only by CALLING the metamethod — the sizing pass must not
+    /// double-call it (PUC calls __len exactly once, at execution), so the
+    /// builtin returns the exact values as an OWNED slice instead (the
+    /// window path returns null — callBuiltin wraps the window result;
+    /// the old 256-slot window truncated every __len unpack to 256
+    /// values).
+    fn builtinTableUnpack(self: *Vm, args: []const Value, outs: []Value) DispatchError!?[]Value {
         if (args.len == 0) return self.fail("table.unpack expects table", .{});
         try self.checkTabArg(args[0], .{ .read = true, .len = true }, 1, "unpack");
         const tobj = args[0];
@@ -39298,6 +39608,31 @@ pub const Vm = struct {
             if (count_i128 > 100_000) return self.fail("too many results to unpack", .{});
         }
 
+        // P16.50-review-7 BLOCKER 4: __len + nil end → the border came from
+        // the metamethod call above (evalUnOp(.Hash) — the ONE PUC-faithful
+        // call); return the exact values as an owned slice.
+        const end_was_nil = args.len < 3 or args[2] == .Nil;
+        const has_len_meta = switch (args[0]) {
+            .Table => |tbl| if (tbl.metatable) |mt| self.fastTm(mt, .len) != null else false,
+            else => false,
+        };
+        if (end_was_nil and has_len_meta) {
+            const count: usize = if (end_idx0 >= start_idx0) blk: {
+                const c: i128 = (@as(i128, end_idx0) - @as(i128, start_idx0)) + 1;
+                break :blk @intCast(c);
+            } else 0;
+            const res = try self.allocOwnedResult(count);
+            var k2: i64 = start_idx0;
+            var res_i: usize = 0;
+            while (k2 <= end_idx0) {
+                res[res_i] = try self.indexValue(tobj, .{ .Int = k2 });
+                res_i += 1;
+                if (k2 == end_idx0) break;
+                k2 +%= 1;
+            }
+            return res;
+        }
+
         var k: i64 = start_idx0;
         var out_i: usize = 0;
         while (k <= end_idx0 and out_i < outs.len) {
@@ -39306,6 +39641,9 @@ pub const Vm = struct {
             if (k == end_idx0) break;
             k +%= 1;
         }
+        // Window path: outs written; the count is the window length (the
+        // sizing pass computed the EXACT count for this path).
+        return null;
     }
 
     fn tableMoveArgToInt(self: *Vm, v: Value, argn: usize) DispatchError!i64 {
@@ -45535,17 +45873,20 @@ pub const Vm = struct {
                 resume_args[0] = .{ .Thread = th };
                 for (call_args, 0..) |v, i| resume_args[i + 1] = v;
 
-                const outv = try self.alloc.alloc(Value, 257);
-                defer self.alloc.free(outv);
-                for (outv) |*v| v.* = .Nil;
-                try self.builtinCoroutineResume(resume_args, outv);
+                // P16.50-review-7 BLOCKER 4: resume returns its EXACT tuple
+                // as an owned slice — no 257-slot window (the old window
+                // truncated every testC resume to 256 results; cstack.lua's
+                // deep chains need the exact count). Freed via infraAlloc —
+                // the values are copied onto the testC stack below.
+                const rres = try self.builtinCoroutineResume(resume_args);
+                defer self.infraAlloc().free(rres);
 
-                const ok = outv[0] == .Bool and outv[0].Bool;
+                const ok = rres[0] == .Bool and rres[0].Bool;
                 last_status.* = if (!ok) "ERRRUN" else if (th.status == .suspended) "YIELD" else "OK";
 
-                const nres = if (self.last_builtin_out_count > 0) self.last_builtin_out_count - 1 else 0;
+                const nres = rres.len - 1;
                 th_stack.items.len = 0;
-                if (nres != 0) try th_stack.appendSlice(self.alloc, outv[1 .. 1 + nres]);
+                if (nres != 0) try th_stack.appendSlice(self.alloc, rres[1..]);
 
                 if (current_trim_start) |trim| {
                     if (th.status == .suspended) {
@@ -45562,7 +45903,7 @@ pub const Vm = struct {
                     } else {
                         st.items.len = trim;
                     }
-                    if (nres != 0) try st.appendSlice(self.infraAlloc(), outv[1 .. 1 + nres]);
+                    if (nres != 0) try st.appendSlice(self.infraAlloc(), rres[1..]);
                 }
             },
             .isyieldable => {
@@ -46427,9 +46768,22 @@ pub const Vm = struct {
         return if (bytes > 0.0) bytes / 1024.0 else 0.0;
     }
 
+    /// Builtins whose TRUE result count can be smaller than their outs
+    /// window — `produced` comes from `last_builtin_out_count` (set by the
+    /// builtin arm) instead of the window length.
+    ///
+    /// P16.50-review-7 BLOCKER 4: the unbounded-result builtins
+    /// (pcall/xpcall, coroutine.resume/wrap-iterator, dofile) are GONE —
+    /// they return exact owned slices (BuiltinResult.owned); their counts
+    /// are structural, never transported. coroutine.yield never returns
+    /// normally (error.Yield) — no count either. Remaining members:
+    /// window builtins with an arg-derivable window but an early-out
+    /// result (io_read's early nil, file_close's 1-of-3) or a
+    /// smaller-than-window body result (coroutine_close's 1-of-2,
+    /// utf8_codepoint, io_lines family).
     fn builtinHasDynamicOutCount(id: BuiltinId) bool {
         return switch (id) {
-            .coroutine_resume, .coroutine_wrap_iter, .coroutine_yield, .coroutine_close, .pcall, .xpcall, .utf8_codepoint, .io_lines_iter, .io_read, .file_read, .file_close, .io_close, .io_popen, .os_execute, .dofile, .io_lines, .file_lines => true,
+            .coroutine_close, .utf8_codepoint, .io_lines_iter, .io_read, .file_read, .file_close, .io_close, .io_popen, .os_execute, .io_lines, .file_lines => true,
             else => false,
         };
     }
@@ -46470,9 +46824,11 @@ pub const Vm = struct {
     /// builtinLoad → builtinLoadEx; .require also calls builtinLoadfile and
     /// tryCLoad directly; .str_arith_* route through strArithMetamethod;
     /// .testc_testC's loadstring arm calls builtinLoadEx directly.
-    /// .dofile/.require/.pairs/.collectgarbage re-derive after nested
-    /// execution (runClosure / nested callBuiltin / GC finalizers) before
-    /// writing their results (P16.39 Cut 3 correctness fix).
+    /// .require/.pairs/.collectgarbage re-derive after nested execution
+    /// (runClosure / nested callBuiltin / GC finalizers) before writing
+    /// their results (P16.39 Cut 3 correctness fix).
+    /// P16.50-review-7 BLOCKER 4: .pcall/.xpcall/.dofile are GONE — they
+    /// return exact owned slices and never write an outs window.
     /// P16.52: .coroutine_close re-derives after the forced-close transport
     /// and the closed-thread region closes (nested VM execution) — belt and
     /// braces: the nested execution runs on the CLOSED thread's bc_stack,
@@ -46484,8 +46840,7 @@ pub const Vm = struct {
     const builtin_may_refresh_outs: [@typeInfo(BuiltinId).@"enum".fields.len]bool = blk: {
         var t = [_]bool{false} ** @typeInfo(BuiltinId).@"enum".fields.len;
         for ([_]BuiltinId{
-            .tostring,        .pcall,         .xpcall,
-            .load,            .loadfile,      .dofile,
+            .tostring,        .load,          .loadfile,
             .require,         .pairs,         .collectgarbage,
             .str_arith_add,   .str_arith_sub, .str_arith_mul,
             .str_arith_mod,   .str_arith_pow, .str_arith_div,
@@ -46523,7 +46878,7 @@ pub const Vm = struct {
         for ([_]BuiltinId{
             .io_lines,      .io_lines_iter, .assert,       .select,
             .string_byte,   .string_find,   .string_match, .utf8_codepoint,
-            .string_unpack, .table_unpack,
+            .string_unpack, .table_unpack,  .io_read,      .file_read,
         }) |dyn_id| t[@intFromEnum(dyn_id)] = null;
         // Fixed out-counts (moved verbatim from the old switch).
         t[@intFromEnum(BuiltinId.print)] = 0;
@@ -46538,8 +46893,6 @@ pub const Vm = struct {
         t[@intFromEnum(BuiltinId.io_popen)] = 3;
         t[@intFromEnum(BuiltinId.io_tmpfile)] = 3;
         t[@intFromEnum(BuiltinId.os_execute)] = 3;
-        t[@intFromEnum(BuiltinId.io_read)] = 8;
-        t[@intFromEnum(BuiltinId.file_read)] = 8;
         t[@intFromEnum(BuiltinId.file_lines)] = 3;
         t[@intFromEnum(BuiltinId.io_flush)] = 1;
         t[@intFromEnum(BuiltinId.file_flush)] = 1;
@@ -46555,23 +46908,31 @@ pub const Vm = struct {
         t[@intFromEnum(BuiltinId.pairs_iter)] = 2;
         t[@intFromEnum(BuiltinId.ipairs_iter)] = 2;
         t[@intFromEnum(BuiltinId.coroutine_running)] = 2;
-        t[@intFromEnum(BuiltinId.pcall)] = 256;
-        t[@intFromEnum(BuiltinId.xpcall)] = 256;
-        // P16.38 Cut 3: resume/yield results are fundamentally unknowable at
-        // call time (resume returns the NEXT yield's values or the body's
-        // returns; yield returns the NEXT resume's args), so they use the
-        // architecture's unbounded-result convention window (256, like
-        // pcall/xpcall/wrap_iter/testC above). The old 8-slot window
-        // silently truncated every resume/yield to 7 values (PUC returns
-        // all: its C stack IS the outs window, ldo.c luaD_poscall). Both
-        // report the true count via last_builtin_out_count (dynamic set),
-        // so `produced` stays exact up to the window bound.
-        t[@intFromEnum(BuiltinId.coroutine_resume)] = 256;
-        t[@intFromEnum(BuiltinId.coroutine_yield)] = 256;
+        // P16.50-review-7 BLOCKER 4: pcall/xpcall return their EXACT
+        // results as owned slices ([true/false] ++ callee results — PUC
+        // finishpcall: luaD_poscall, no bound; the old 256-slot window
+        // truncated every pcall to 255 results). The 0 here only sizes the
+        // (unused) staging window.
+        t[@intFromEnum(BuiltinId.pcall)] = 0;
+        t[@intFromEnum(BuiltinId.xpcall)] = 0;
+        // P16.50-review-7 BLOCKER 4: resume/wrap-iterator results are
+        // fundamentally unknowable at call time (resume returns the NEXT
+        // yield's values or the body's returns; the wrap iterator strips
+        // the resume boolean) — they return exact owned slices (the old
+        // 256-slot window truncated every resume to 255 values; PUC
+        // returns all: its C stack IS the outs window, ldo.c
+        // luaD_poscall). coroutine.yield never returns normally
+        // (error.Yield; values travel via th.yielded) — window 0, no
+        // count transport.
+        t[@intFromEnum(BuiltinId.coroutine_resume)] = 0;
+        t[@intFromEnum(BuiltinId.coroutine_yield)] = 0;
         t[@intFromEnum(BuiltinId.coroutine_close)] = 2;
-        t[@intFromEnum(BuiltinId.coroutine_wrap_iter)] = 256;
+        t[@intFromEnum(BuiltinId.coroutine_wrap_iter)] = 0;
         t[@intFromEnum(BuiltinId.next)] = 2;
-        t[@intFromEnum(BuiltinId.dofile)] = 16;
+        // P16.50-review-7 BLOCKER 4: dofile returns the chunk's EXACT
+        // returns as an owned slice (PUC luaB_dofile: MULTRET, no bound;
+        // the old 16-slot window truncated every dofile to 16 results).
+        t[@intFromEnum(BuiltinId.dofile)] = 0;
         t[@intFromEnum(BuiltinId.testc_makecfunc)] = 1;
         t[@intFromEnum(BuiltinId.testc_allowhookyield)] = 0;
         t[@intFromEnum(BuiltinId.testc_totalmem)] = 3;
@@ -46650,6 +47011,19 @@ pub const Vm = struct {
                 if (call_args.len > 0 and call_args[0] == .String) break :blk 4;
                 break :blk 3;
             },
+            // P16.50-review-7 BLOCKER 4: io_read/file_read windows are
+            // argument-derivable — one result per format (PUC io_read:
+            // one result per format, fewer on EOF/failure, reported via
+            // last_builtin_out_count). The old fixed 8-slot window
+            // truncated every read with >8 formats (PUC returns all).
+            // io_read: all args are formats (default "*l" when absent).
+            .io_read => if (call_args.len == 0) 1 else call_args.len,
+            // file_read: args[0] is the file handle, the rest are formats
+            // (default "*l" when absent). The bad-descriptor early-out
+            // returns the PUC luaL_fileresult triple (nil, msg, errno) —
+            // the window must cover it (PUC g_read: a failing fread
+            // returns 3 values regardless of the format count).
+            .file_read => if (call_args.len <= 1) 3 else @max(call_args.len - 1, 3),
             .io_lines_iter => blk: {
                 if (call_args.len == 0 or call_args[0] != .Table) break :blk 8;
                 const it = call_args[0].Table;
@@ -46759,8 +47133,18 @@ pub const Vm = struct {
             .table_unpack => blk: {
                 if (call_args.len == 0 or call_args[0] != .Table) break :blk 0;
                 const tbl = call_args[0].Table;
-                if (tbl.metatable) |mt| {
-                    if (self.fastTm(mt, .len) != null) break :blk 256;
+                // P16.50-review-7 BLOCKER 4: with a __len metamethod and a
+                // nil/absent end index the border is only observable by
+                // CALLING the metamethod — sizing must not double-call it
+                // (PUC calls __len exactly once, at execution). The builtin
+                // returns the exact values as an OWNED slice (window 0).
+                // Explicit integer indices never consult __len (PUC unpack
+                // reads j directly) and size exactly below.
+                const end_nil = call_args.len < 3 or call_args[2] == .Nil;
+                if (end_nil) {
+                    if (tbl.metatable) |mt| {
+                        if (self.fastTm(mt, .len) != null) break :blk 0;
+                    }
                 }
                 const start_idx0: i64 = if (call_args.len >= 2) switch (call_args[1]) {
                     .Nil => 1,
@@ -51762,25 +52146,37 @@ test "P16.50-review T3: registerfuncs per-closure Cells + fresh-table publish ro
     try testing.expect(id2 != null);
     try testing.expect(id1 != id2);
 
-    // C-closure getupvalue: pushes the upvalue's VALUE, returns null
-    // (C-closure upvalues are unnamed — PUC aux_upvalue returns "").
-    try testing.expect(c_api.lua_getupvalue(L, 2, 1) == null);
-    try testing.expect(c_api.lua_getupvalue(L, 3, 1) == null);
+    // C-closure getupvalue: pushes the upvalue's VALUE, returns the PUC
+    // C-closure name "" (aux_upvalue LUA_VCCL arm — a non-NULL empty
+    // string; review-7 B1: the old contract returned null, diverging from
+    // PUC lapi.c:1373).
+    const nm1 = c_api.lua_getupvalue(L, 2, 1);
+    try testing.expect(nm1 != null);
+    try testing.expectEqual(@as(usize, 0), std.mem.span(nm1.?).len);
+    const nm2 = c_api.lua_getupvalue(L, 3, 1);
+    try testing.expect(nm2 != null);
+    try testing.expectEqual(@as(usize, 0), std.mem.span(nm2.?).len);
     try testing.expectEqual(@as(usize, 5), L.c_stack.items.len);
     // Both closures' upvalue is the SAME shared table (value identity —
     // the cells are private, the VALUES are copies of one table).
     try testing.expectEqual(@as(c_int, 1), c_api.lua_rawequal(L, -1, -2));
 
-    // setupvalue writes f1's PRIVATE cell only.
+    // setupvalue writes f1's PRIVATE cell only (returns "" — PUC).
     c_api.lua_pushinteger(L, 42);
-    try testing.expect(c_api.lua_setupvalue(L, 2, 1) == null);
+    const nm3 = c_api.lua_setupvalue(L, 2, 1);
+    try testing.expect(nm3 != null);
+    try testing.expectEqual(@as(usize, 0), std.mem.span(nm3.?).len);
     try testing.expectEqual(@as(usize, 5), L.c_stack.items.len);
     // f2 is unaffected (independence):
-    try testing.expect(c_api.lua_getupvalue(L, 3, 1) == null);
+    const nm4 = c_api.lua_getupvalue(L, 3, 1);
+    try testing.expect(nm4 != null);
+    try testing.expectEqual(@as(usize, 0), std.mem.span(nm4.?).len);
     try testing.expect(L.c_stack.items[5] == .Table);
     try testing.expect(L.c_stack.items[5].Table == shared_tbl);
     // f1's write is visible through its own cell:
-    try testing.expect(c_api.lua_getupvalue(L, 2, 1) == null);
+    const nm5 = c_api.lua_getupvalue(L, 2, 1);
+    try testing.expect(nm5 != null);
+    try testing.expectEqual(@as(usize, 0), std.mem.span(nm5.?).len);
     try testing.expect(std.meta.eql(L.c_stack.items[6], .{ .Int = 42 }));
     // The IDs are stable across the write (same cells, mutated in place):
     try testing.expect(c_api.lua_upvalueid(L, 2, 1) == id1);
@@ -54905,12 +55301,255 @@ test "P16.50-review-6 B2: newmetatable shared path + per-edge OOM ownership" {
         }
     }
 
+    // ---- review-7 B2: dedicated ROOT edge (caller-stack append OOM). ----
+    // The old shape's root edge was the `roots.add` infra allocation
+    // (fallible, after the table); review-7 B2 moved it into the
+    // pre-table `roots.ensure(2)` reserve, so the only remaining
+    // "table committed but NOT stack-rooted" OOM is `root_stack.append`.
+    // The index sweep above cannot pin it: persistent capacities (temp
+    // roots, intern table, stack) build up across iterations and shift
+    // the append's allocation index, so the sweep steps over it. Pin it
+    // deterministically instead: one successful call builds EVERY
+    // persistent capacity; teardown; then a single failing call with the
+    // stack at EXACT capacity and fail_index aimed at the append.
+    {
+        const root_name = "p50r6mtroot";
+        // Build persistent capacities (temp roots, intern entry, gc list).
+        const created0 = try state.newmetatable(root_name);
+        try testing.expect(created0);
+        const key0 = try vm.internStr(root_name);
+        // Keep key0 interned-alive for the failing call's Edge-1 lookup
+        // (a HIT — no intern allocation inside the pinned window).
+        try setup_roots.add(.{ .String = key0 });
+        const mt0 = vm.apiRawGet(reg, .{ .String = key0 }).Table;
+        // Teardown: unpublish, unroot, collect the table through the
+        // normal sweep, then shrink the stack back to EXACT capacity.
+        try vm.apiRawSet(reg, .{ .String = key0 }, .Nil);
+        state.stack.items.len = base_stack_len;
+        try vm.gcFullCollectionForUser();
+        try testing.expect(!p50StillRegistered(vm, .{ .table = mt0 }));
+        state.stack.shrinkAndFree(testing.allocator, base_stack_len);
+
+        // Pinned window: intern HIT, roots.ensure no-op (capacity),
+        // Table constructor = alloc #0, root_stack.append = alloc #1
+        // (stack at exact capacity — the growth MUST allocate).
+        const before_root = try testing.allocator.dupe(GcObject, vm.gc_objects.items);
+        defer testing.allocator.free(before_root);
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 1,
+        });
+        vm.alloc = failing.allocator();
+        const result = state.newmetatable(root_name);
+        vm.alloc = testing.allocator;
+        try testing.expectError(error.OutOfMemory, result);
+        // Root-edge shape: table committed, NOT stack-rooted, nothing
+        // published (no dangling registry entry).
+        try testing.expect(vm.apiRawGet(reg, .{ .String = key0 }) == .Nil);
+        try testing.expectEqual(base_stack_len, state.stack.items.len);
+        // Collectable through the normal sweep (no leak): the next full
+        // GC frees the unpublished table and leaves every pre-window
+        // object alive.
+        try vm.gcFullCollectionForUser();
+        for (vm.gc_objects.items) |obj| {
+            var known = false;
+            for (before_root) |b| {
+                if (std.meta.eql(obj, b)) {
+                    known = true;
+                    break;
+                }
+            }
+            try testing.expect(known);
+        }
+        saw_root_oom = true;
+    }
+
     // Every owner-named edge must have fired, plus a clean success.
     try testing.expect(saw_pretable_oom);
     try testing.expect(saw_root_oom);
     try testing.expect(saw_name_oom);
     try testing.expect(saw_publish_oom);
     try testing.expect(saw_success);
+}
+
+/// review-7 B2 test allocator: the FIRST Table-sized allocation runs an
+/// emergency full GC (PUC `tryagain` → `luaC_fullgc(L, 1)`, lmem.c) and
+/// retries — the TestcAllocAdapter emergency-collect-then-retry behavior,
+/// aimed DETERMINISTICALLY at the metatable constructor inside
+/// `newMetatableShared`'s GC-capable window (allocTable). Everything else
+/// passes straight through to the base allocator; the GC's own
+/// infrastructure allocations (via infraAlloc == vm.alloc == this
+/// allocator) also pass through — `fired` makes re-entry impossible.
+const P50r7EmergencyAlloc = struct {
+    base: std.mem.Allocator,
+    vm: *Vm,
+    fired: bool = false,
+
+    fn allocator(self: *P50r7EmergencyAlloc) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = emergAlloc,
+            .resize = emergResize,
+            .remap = emergRemap,
+            .free = emergFree,
+        } };
+    }
+
+    fn emergAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *P50r7EmergencyAlloc = @ptrCast(@alignCast(ctx));
+        if (!self.fired and len == @sizeOf(Table)) {
+            self.fired = true;
+            // Emergency full GC from the failed allocation (PUC tryagain).
+            // The conservative emergency scan never sees Zig locals —
+            // whatever is not in a GC root at this moment is swept.
+            self.vm.testcEmergencyCollect();
+        }
+        return self.base.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn emergResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *P50r7EmergencyAlloc = @ptrCast(@alignCast(ctx));
+        return self.base.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn emergRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *P50r7EmergencyAlloc = @ptrCast(@alignCast(ctx));
+        return self.base.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn emergFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *P50r7EmergencyAlloc = @ptrCast(@alignCast(ctx));
+        self.base.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────
+// P16.50-review-7 B2: the interned tname key must survive an EMERGENCY
+// full GC inside `newMetatableShared`'s GC-capable window (allocTable).
+// Pre-fix the key was held only in a Zig local across the window: the
+// intern table is not a GC root and Zig locals are invisible to the
+// emergency scan's marking, so the emergency GC swept the key and both
+// `mt.__name` and the registry publish received a dangling String (a
+// fresh re-intern disagreed with the dangling `__name` pointer). The fix
+// roots the key (TempRoots ensure(2) + addAssumeCapacity) BEFORE
+// allocTable — PUC's equivalent guarantee (it never holds an interned
+// key across the window; it re-interns at each field access).
+// ─────────────────────────────────────────────────────────────────────
+test "P16.50-review-7 B2: newmetatable key survives emergency GC in allocTable" {
+    const testing = std.testing;
+    const api = @import("api.zig");
+
+    var state = api.State.init(.{ .allocator = testing.allocator });
+    defer state.deinit();
+    const vm = state.vm;
+
+    // Registry + fixed "__name" key pre-created and temp-rooted (the
+    // same setup as the review-6 per-edge test).
+    const reg = try vm.apiEnsureRegistry();
+    var setup_roots = vm.gcTempRoots();
+    defer setup_roots.end();
+    const name_key = try vm.internStr("__name");
+    try setup_roots.add(.{ .String = name_key });
+
+    // Pre-intern the tname WITHOUT rooting it: Edge 1's lookup must be a
+    // HIT (no intern allocation inside the window), and the pre-call
+    // pointer is the identity oracle for the post-call assertions.
+    const tname = "p50r7mt";
+    const key_pre = try vm.internStr(tname);
+
+    // Pre-reserve the caller stack: root_stack.append must not allocate
+    // inside the window (the emergency GC fires at the Table allocation).
+    try state.stack.ensureUnusedCapacity(testing.allocator, 4);
+    const base_stack_len = state.stack.items.len;
+
+    // The emergency allocator: the metatable constructor's Table
+    // allocation runs the emergency full GC, then retries.
+    var emerg = P50r7EmergencyAlloc{ .base = testing.allocator, .vm = vm };
+    vm.alloc = emerg.allocator();
+    defer vm.alloc = testing.allocator;
+
+    const created = try state.newmetatable(tname);
+    try testing.expect(created);
+
+    // Identity contract (the negative oracle): the canonical interned
+    // tname after the call is the SAME object Edge 1 looked up. Pre-fix
+    // this fails first and cleanly: the emergency GC swept key_pre, the
+    // publish re-interned a fresh string, and mt.__name held the
+    // dangling old pointer (registry key and __name disagreed).
+    const key_post = try vm.internStr(tname);
+    try testing.expectEqual(key_pre, key_post);
+
+    // Published + __name set, both with the CANONICAL key object (PUC
+    // lauxlib.c:323 — one interned name for both observations).
+    const mt = vm.apiRawGet(reg, .{ .String = key_post }).Table;
+    try testing.expectEqual(key_post, vm.apiRawGet(mt, .{ .String = name_key }).String);
+    try testing.expectEqual(base_stack_len + 1, state.stack.items.len);
+    try testing.expectEqual(mt, state.stack.items[state.stack.items.len - 1].Table);
+
+    // A post-publish full GC keeps both alive (the registry is a GC
+    // root; the entry's key and mt.__name reference the key object).
+    try vm.gcFullCollectionForUser();
+    try testing.expect(p50StillRegistered(vm, .{ .table = mt }));
+    try testing.expect(p50StillRegistered(vm, .{ .string = key_post }));
+    try testing.expectEqual(mt, vm.apiRawGet(reg, .{ .String = key_post }).Table);
+    try testing.expect(!vm.finalizables.contains(.{ .table = mt }));
+
+    // Teardown: unpublish + unroot; the next full GC collects the table
+    // (unpublished, unrooted) and clears the dead nil-valued registry
+    // node's key — no leak, no dangling registry entry.
+    try vm.apiRawSet(reg, .{ .String = key_post }, .Nil);
+    try testing.expect(vm.apiRawGet(reg, .{ .String = key_post }) == .Nil);
+    state.stack.items.len = base_stack_len;
+    try vm.gcFullCollectionForUser();
+    try testing.expect(!p50StillRegistered(vm, .{ .table = mt }));
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// P16.50-review-7 B2: the roots-RESERVE edge (TempRoots.ensure(2)) is a
+// pre-table owner: its OOM commits NOTHING (no table, no registry entry,
+// no stack shape change) and the temp-roots snapshot discipline restores
+// the lists on the error path. The reserve moved the old post-table
+// `roots.add` infra allocation BEFORE the table — the review-6 sweep
+// classifies it as pre-table; this pins it explicitly.
+// ─────────────────────────────────────────────────────────────────────
+test "P16.50-review-7 B2: newmetatable roots-reserve OOM owns nothing (pre-table edge)" {
+    const testing = std.testing;
+    const api = @import("api.zig");
+
+    var state = api.State.init(.{ .allocator = testing.allocator });
+    defer state.deinit();
+    const vm = state.vm;
+
+    const reg = try vm.apiEnsureRegistry();
+    var setup_roots = vm.gcTempRoots();
+    defer setup_roots.end();
+    const name_key = try vm.internStr("__name");
+    try setup_roots.add(.{ .String = name_key });
+
+    // Pre-intern the tname (Edge 1 = lookup HIT — no intern allocation
+    // in the window) and pin BOTH temp-roots lists at EXACT capacity so
+    // roots.ensure(2) is the FIRST fallible allocation of the window.
+    const tname = "p50r7res";
+    const key = try vm.internStr(tname);
+    try setup_roots.add(.{ .String = key });
+    vm.gc_temp_roots.shrinkAndFree(vm.infraAlloc(), vm.gc_temp_roots.items.len);
+    vm.gc_temp_cell_roots.shrinkAndFree(vm.infraAlloc(), vm.gc_temp_cell_roots.items.len);
+    const gc_objects_before = vm.gc_objects.items.len;
+    const base_stack_len = state.stack.items.len;
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+        .fail_index = 0,
+    });
+    vm.alloc = failing.allocator();
+    const result = state.newmetatable(tname);
+    vm.alloc = testing.allocator;
+
+    // The reserve owns nothing: OOM, nothing committed anywhere.
+    try testing.expectError(error.OutOfMemory, result);
+    try testing.expect(vm.apiRawGet(reg, .{ .String = key }) == .Nil);
+    try testing.expectEqual(base_stack_len, state.stack.items.len);
+    try testing.expectEqual(gc_objects_before, vm.gc_objects.items.len);
+    // Snapshot discipline: the error path's roots.end() restored the
+    // setup-owned temp roots exactly.
+    try testing.expectEqual(@as(usize, 2), vm.gc_temp_roots.items.len);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -55257,4 +55896,655 @@ test "P16.50-review-6 B1: owned-result OOM countdown sweep (before/after results
     defer vm.alloc.free(results);
     try testing.expectEqual(@as(usize, 4), results.len);
     try testing.expect(results[3] == .Bool and results[3].Bool == true);
+}
+
+// =========================================================================
+// P16.50-review-7 BLOCKER 3.1: tryPushBytecodeProtectedCall pre-publish
+// OOM edges roll back exactly.
+//
+// The transactional contract (see the restructure at the function): the
+// protection struct is created BEFORE any state it restores is taken and
+// carries the FULL rollback snapshot; the `published` owner guard runs
+// finishBytecodeProtectedCall on every pre-publish failure. This test
+// sweeps a FailingAllocator across EVERY allocation edge of the path —
+// outer-specs ArrayList growth, the outer-layers slice, the protection
+// struct create, the pending-slot append (setPendingCall), and the
+// post-publish target staging — for both a direct pcall target and a
+// doubly-nested pcall(pcall(target)). After EVERY failure:
+//   1. protected depth (Vm + thread) restored,
+//   2. errfunc unchanged,
+//   3. pending slot INVALID (no leak),
+//   4. frame count unchanged (post-publish staging failures unwind
+//      dispatcher-style: pop child, cancel parent pending),
+//   5. TrackingAllocator live bytes byte-exact vs the pre-call snapshot.
+// The success iteration proves the published contract: pending installed
+// with the protection, depth raised, target frame pushed — and cleans up
+// through the single cleanup authority with the same byte-exact check.
+// The ccallEnter depth-guard variant (RuntimeError "C stack overflow",
+// not OOM) is forced separately and must roll back the same way.
+// =========================================================================
+test "P16.50-review-7 B3.1: protected-call pre-publish OOM edges roll back exactly" {
+    const testing = std.testing;
+    const TrackingAllocator = @import("tracking_alloc.zig").TrackingAllocator;
+
+    // One allocator for everything (protos, closures, VM): the VM's GC
+    // frees registered closures/proto trees through self.alloc, so mixing
+    // an arena for objects with a tracker for the VM would free foreign
+    // blocks. Per-iteration tracker deltas are the leak check; the
+    // persistent proto/closure bytes are reclaimed at deinit.
+    var tracker = TrackingAllocator.init(std.heap.page_allocator);
+    const track_alloc = tracker.allocator();
+
+    // The rollback path runs finishBytecodeProtectedCall, whose
+    // shrinkBcStack (PUC luaD_shrinkstack parity) would otherwise shrink
+    // the 2048-slot initial stack to ~2x the small in-use extent on the
+    // first failure — a legitimate one-time capacity release that would
+    // break the per-iteration byte-exact baseline. PUC's `stackinuse` is
+    // the max extent over all CallInfo frames AND the current stack top;
+    // anchoring ~700 staged values above the parent frame (never popped)
+    // holds that high-water mark at >= 683 slots, so inuse*3 >= 2048 and
+    // the shrink is a structural no-op for the whole test.
+    const parent_proto = try compileTestProto(track_alloc, "return 1\n");
+    const target_proto = try compileTestProto(track_alloc, "return 2\n");
+
+    var vm = Vm.init(track_alloc, false);
+    defer vm.deinit();
+
+    const parent_cl = try track_alloc.create(Closure);
+    parent_cl.* = .{ .proto = parent_proto, .upvalues = &.{} };
+    _ = vm.retainTreeForClosure(parent_proto);
+    try vm.gcRegisterClosure(parent_cl);
+    const target_cl = try track_alloc.create(Closure);
+    target_cl.* = .{ .proto = target_proto, .upvalues = &.{} };
+    _ = vm.retainTreeForClosure(target_proto);
+    try vm.gcRegisterClosure(target_cl);
+    try vm.resolveProtoConstants(parent_proto);
+    try vm.resolveProtoConstants(target_proto);
+
+    const th = vm.activeBytecodeThread();
+    const exec_frames = &th.call_frames;
+    const staged_parent = try vm.stageBytecodeCall(th, 0, parent_cl, &.{});
+    try vm.pushStagedBytecodeExecFrame(th, exec_frames, parent_proto, staged_parent.func_slot, staged_parent.nargs, -1);
+    const parent_index: usize = 0;
+
+    // Pre-warm the FrameStack capacity (push + pop a scratch target
+    // frame): the frame stack is persistent VM state, and the sweep's
+    // per-iteration byte-exact baseline must not be skewed by its one-time
+    // capacity growth on the first target push.
+    {
+        const scratch = try vm.stageBytecodeCall(th, th.bytecode_stack_top, target_cl, &.{.{ .Int = 1 }});
+        try vm.pushStagedBytecodeExecFrame(th, exec_frames, target_proto, scratch.func_slot, scratch.nargs, -1);
+        vm.popBytecodeExecFrame(th, exec_frames);
+    }
+
+    // Stack high-water anchor (see the comment near the protos): stage
+    // ~700 values above the parent frame and deliberately NEVER push or
+    // pop their frame. Staging writes the values but does not move
+    // bytecode_stack_top (only frame activation does), so the top is
+    // raised manually to just above the staged window — every slot in
+    // [old top, new top) now holds an initialized non-GC Int, and
+    // shrinkBcStack's inuse (PUC stackinuse: max over frame extents AND
+    // the stack top) stays high enough that the 2048-slot initial stack
+    // is never shrunk.
+    {
+        var anchor_args: [700]Value = undefined;
+        for (&anchor_args) |*v| v.* = .{ .Int = 1 };
+        const anchor_base = th.bytecode_stack_top;
+        _ = try vm.stageBytecodeCall(th, anchor_base, target_cl, &anchor_args);
+        th.bytecode_stack_top = anchor_base + 1 + anchor_args.len;
+    }
+
+    const base_nccalls = th.nCcalls;
+    const base_depth = vm.protected_call_depth + th.bytecode_protected_depth;
+    const base_errfunc = th.errfunc;
+    const base_frames = exec_frames.len();
+
+    // Two arg shapes: a direct pcall target, and a doubly-nested
+    // pcall(pcall(target)) — the nested shape additionally exercises the
+    // outer-specs ArrayList growth and the outer-layers slice allocation.
+    const arg_shapes = [_][]const Value{
+        &[_]Value{.{ .Closure = target_cl }},
+        &[_]Value{ .{ .Builtin = .pcall }, .{ .Builtin = .pcall }, .{ .Closure = target_cl } },
+    };
+
+    for (arg_shapes) |args| {
+        // Depth the success contract must show: the active layer plus one
+        // saved outer layer per nested wrapper.
+        const expected_depth = base_depth + 1 + (if (args.len == 3) @as(usize, 2) else 0);
+
+        var fail_idx: usize = 0;
+        var saw_success = false;
+        while (fail_idx <= 16) : (fail_idx += 1) {
+            try testing.expectEqual(INVALID_PENDING, exec_frames.getPtr(parent_index).pending_call_index);
+            const bytes_before = tracker.total_bytes;
+            const pool_cap_before = vm.pending_calls.capacity;
+
+            var failing = std.testing.FailingAllocator.init(track_alloc, .{
+                .fail_index = fail_idx,
+                .resize_fail_index = fail_idx,
+            });
+            const saved_alloc = vm.alloc;
+            vm.alloc = failing.allocator();
+            const result = vm.tryPushBytecodeProtectedCall(exec_frames, parent_index, 0, -1, .pcall, args, false);
+            vm.alloc = saved_alloc;
+
+            // The pending-call slot pool is persistent VM state: the
+            // append path's one-time capacity growth is the ONLY
+            // legitimate byte increase across an iteration.
+            const pool_growth = (vm.pending_calls.capacity - pool_cap_before) * @sizeOf(PendingCallSlot);
+
+            if (result) |pushed| {
+                // ── Success contract: pending published with the heap
+                // protection, protected depth raised, target frame pushed.
+                try testing.expect(pushed);
+                const frame = exec_frames.getPtr(parent_index);
+                try testing.expect(frame.pending_call_index != INVALID_PENDING);
+                try testing.expect(vm.getPendingCallPtr(frame.pending_call_index).?.protection != null);
+                try testing.expectEqual(expected_depth, vm.protected_call_depth + th.bytecode_protected_depth);
+                try testing.expectEqual(base_frames + 1, exec_frames.len());
+                // Dispatcher-style completion cleanup: pop the target frame,
+                // then cancel the parent's pending through the single
+                // cleanup authority (discard semantics — the unwind path).
+                vm.popBytecodeExecFrame(th, exec_frames);
+                const pending = vm.getPendingCallPtr(exec_frames.getPtr(parent_index).pending_call_index).?;
+                vm.cancelBytecodePendingCall(pending, exec_frames.getPtr(parent_index));
+                vm.clearPendingCall(exec_frames.getPtr(parent_index));
+                // cancelBytecodePendingCall DISCARDS (unwind semantics) and
+                // does not restore the ccallEnter unit — in production the
+                // outer protection's snapshot or thread teardown reclaims
+                // it. This synthetic direct-call cleanup restores it
+                // explicitly so the next sweep iteration starts clean.
+                th.nCcalls = base_nccalls;
+                try testing.expectEqual(base_depth, vm.protected_call_depth + th.bytecode_protected_depth);
+                try testing.expectEqual(base_errfunc, th.errfunc);
+                try testing.expectEqual(INVALID_PENDING, exec_frames.getPtr(parent_index).pending_call_index);
+                try testing.expectEqual(base_frames, exec_frames.len());
+                try testing.expectEqual(bytes_before + pool_growth, tracker.total_bytes);
+                saw_success = true;
+                break;
+            } else |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                // Simulate the dispatcher's error unwind for POST-publish
+                // staging failures (target stage/push OOM): pop any pushed
+                // child frame, then cancel the parent's pending. For
+                // PRE-publish failures both are no-ops — the errdefers
+                // already rolled everything back.
+                while (exec_frames.len() > base_frames) vm.popBytecodeExecFrame(th, exec_frames);
+                if (vm.getPendingCallPtr(exec_frames.getPtr(parent_index).pending_call_index)) |pending| {
+                    vm.cancelBytecodePendingCall(pending, exec_frames.getPtr(parent_index));
+                    vm.clearPendingCall(exec_frames.getPtr(parent_index));
+                }
+                th.nCcalls = base_nccalls;
+                // ── Full rollback: depth, errfunc, pending slot, frame
+                // count, and byte-exact live allocations.
+                try testing.expectEqual(base_depth, vm.protected_call_depth + th.bytecode_protected_depth);
+                try testing.expectEqual(base_errfunc, th.errfunc);
+                try testing.expectEqual(INVALID_PENDING, exec_frames.getPtr(parent_index).pending_call_index);
+                try testing.expectEqual(base_frames, exec_frames.len());
+                try testing.expectEqual(bytes_before + pool_growth, tracker.total_bytes);
+            }
+        }
+        try testing.expect(saw_success);
+    }
+
+    // ── ccallEnter depth-guard variant: RuntimeError, not OOM. The guard
+    // trips inside the fallible region; the published guard must roll the
+    // depth/saved-error/outer-layers back through finishBytecodeProtected
+    // Call (idempotent with ccallEnter's own increment rollback).
+    {
+        th.nCcalls = Thread.LUA_MAX_C_CALLS - 1; // +1 yieldable unit trips the guard
+        const result = vm.tryPushBytecodeProtectedCall(exec_frames, parent_index, 0, -1, .pcall, arg_shapes[0], false);
+        th.nCcalls = base_nccalls;
+        try testing.expectError(error.RuntimeError, result);
+        try testing.expectEqual(base_depth, vm.protected_call_depth + th.bytecode_protected_depth);
+        try testing.expectEqual(base_errfunc, th.errfunc);
+        try testing.expectEqual(INVALID_PENDING, exec_frames.getPtr(parent_index).pending_call_index);
+        try testing.expectEqual(base_frames, exec_frames.len());
+        // The staged "C stack overflow" message is thread-owned until the
+        // next error or teardown — not a leak, so no byte-exact check here.
+    }
+}
+
+// =========================================================================
+// P16.50-review-7 BLOCKER 3.2: tryPushBytecodeDebugHook pre-publish OOM
+// edges roll back exactly — including the setPendingCall failure AFTER
+// the parent identity (callee slot + tailcall bit) was replaced.
+//
+// Ownership contract: the hook adopts the `post` payload at entry to the
+// fallible region (the transfer dupe); every pre-publish failure frees it
+// exactly once via the owner guards, restores the parent identity, and
+// leaves the pending slot INVALID. Post-publish staging failures
+// (stageBytecodeCall / pushStagedBytecodeExecFrame) unwind exactly like
+// the real callers' catch blocks: cancelPendingHookCall (the single
+// cleanup authority) + the outer frame unwind. The sweep covers every
+// allocation edge: the transfer copy, the event-string intern (pre-interned
+// below so the per-iteration byte check stays exact), the continuation
+// struct create, the pending-slot append, and the hook frame staging.
+// =========================================================================
+test "P16.50-review-7 B3.2: debug-hook pre-publish OOM edges roll back exactly" {
+    const testing = std.testing;
+    const TrackingAllocator = @import("tracking_alloc.zig").TrackingAllocator;
+
+    // One allocator for everything (see the B3.1 note): the VM's GC frees
+    // registered closures/proto trees through self.alloc.
+    var tracker = TrackingAllocator.init(std.heap.page_allocator);
+    const track_alloc = tracker.allocator();
+
+    const parent_proto = try compileTestProto(track_alloc, "return 1\n");
+    const hook_proto = try compileTestProto(track_alloc, "return\n");
+
+    var vm = Vm.init(track_alloc, false);
+    defer vm.deinit();
+
+    const parent_cl = try track_alloc.create(Closure);
+    parent_cl.* = .{ .proto = parent_proto, .upvalues = &.{} };
+    _ = vm.retainTreeForClosure(parent_proto);
+    try vm.gcRegisterClosure(parent_cl);
+    const hook_cl = try track_alloc.create(Closure);
+    hook_cl.* = .{ .proto = hook_proto, .upvalues = &.{} };
+    _ = vm.retainTreeForClosure(hook_proto);
+    try vm.gcRegisterClosure(hook_cl);
+    try vm.resolveProtoConstants(parent_proto);
+    try vm.resolveProtoConstants(hook_proto);
+
+    const th = vm.activeBytecodeThread();
+    const exec_frames = &th.call_frames;
+    const staged_parent = try vm.stageBytecodeCall(th, 0, parent_cl, &.{});
+    try vm.pushStagedBytecodeExecFrame(th, exec_frames, parent_proto, staged_parent.func_slot, staged_parent.nargs, -1);
+    const parent_index: usize = 0;
+
+    // Pre-warm persistent structures so the per-iteration byte-exact
+    // baseline is not skewed by one-time capacity growth: the FrameStack
+    // (scratch hook frame push+pop) and the gc_temp_roots ArrayList (one
+    // add+end — the hook path roots the interned event string on every
+    // call). The pending-call slot pool is handled by the capacity-aware
+    // byte assertion below (its append edge is a sweep target, so it must
+    // NOT be pre-warmed away).
+    {
+        const scratch = try vm.stageBytecodeCall(th, th.bytecode_stack_top, hook_cl, &.{});
+        try vm.pushStagedBytecodeExecFrame(th, exec_frames, hook_proto, scratch.func_slot, scratch.nargs, -1);
+        vm.popBytecodeExecFrame(th, exec_frames);
+        var warm_roots = vm.gcTempRoots();
+        try warm_roots.add(.Nil);
+        warm_roots.end();
+    }
+
+    const base_tailcall = exec_frames.getPtr(parent_index).isTailCall();
+    const base_frames = exec_frames.len();
+
+    // Pre-intern the event string so the sweep's per-iteration byte-exact
+    // assertion is not skewed by a one-time string-table insert.
+    _ = try vm.internStr("tail call");
+    // Arm a tail-call hook (has_call gates the "tail call" event) — this
+    // event exercises BOTH identity replacements: the callee slot AND the
+    // tailcall bit (setTailCall below).
+    const hs = vm.activeHookState();
+    hs.func = .{ .Closure = hook_cl };
+    hs.has_call = true;
+    vm.refreshHooksCached();
+    try testing.expect(vm.hooks_active_cached);
+    defer {
+        hs.func = null;
+        hs.has_call = false;
+        vm.refreshHooksCached();
+    }
+
+    const transfer: []const Value = &.{ .{ .Int = 1 }, .{ .Int = 2 } };
+    const event_callee: Value = .{ .Int = 777 };
+
+    var fail_idx: usize = 0;
+    var saw_success = false;
+    while (fail_idx <= 16) : (fail_idx += 1) {
+        try testing.expectEqual(INVALID_PENDING, exec_frames.getPtr(parent_index).pending_call_index);
+        const bytes_before = tracker.total_bytes;
+        const pool_cap_before = vm.pending_calls.capacity;
+        // Fresh owned post payload per iteration: on failure the owner
+        // guard frees it; on success the pending owns it (freed by the
+        // cancel below).
+        const post_values = try vm.alloc.dupe(Value, &.{.{ .Int = 42 }});
+        const post: BytecodeHookPost = .{ .store_results = .{
+            .continuation = .{ .dst = 0, .nresults = -1 },
+            .values = post_values,
+        } };
+
+        var failing = std.testing.FailingAllocator.init(track_alloc, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        const saved_alloc = vm.alloc;
+        vm.alloc = failing.allocator();
+        const result = vm.tryPushBytecodeDebugHook(exec_frames, parent_index, "tail call", null, event_callee, transfer, 0, post);
+        vm.alloc = saved_alloc;
+
+        // The pending-call slot pool is persistent VM state: the
+        // append path's one-time capacity growth (the setPendingCall
+        // edge this sweep deliberately targets) is the ONLY legitimate
+        // byte increase across an iteration.
+        const pool_growth = (vm.pending_calls.capacity - pool_cap_before) * @sizeOf(PendingCallSlot);
+
+        if (result) |pushed| {
+            // ── Published contract: pending installed (.hook), parent
+            // identity replaced (callee slot = event_callee, tailcall bit
+            // set), hook frame pushed, hook liveness armed.
+            try testing.expect(pushed);
+            const frame = exec_frames.getPtr(parent_index);
+            try testing.expect(frame.pending_call_index != INVALID_PENDING);
+            try testing.expect(vm.getPendingCallPtr(frame.pending_call_index).?.completion == .hook);
+            const slot_val = th.bytecode_stack[frame.func_slot];
+            try testing.expect(slot_val == .Int and slot_val.Int == 777);
+            try testing.expect(frame.isTailCall());
+            try testing.expectEqual(base_frames + 1, exec_frames.len());
+            try testing.expect(vm.activeHookState().in_debug_hook);
+            // Dispatcher-style cleanup: pop the hook frame (clears
+            // in_debug_hook), then cancel the parent's published hook
+            // pending through the single cleanup authority — which also
+            // restores the parent identity from the saved snapshot.
+            vm.popBytecodeExecFrame(th, exec_frames);
+            vm.cancelPendingHookCall(exec_frames, parent_index);
+            th.debug_hook_transfer = null;
+            const restored = th.bytecode_stack[exec_frames.getPtr(parent_index).func_slot];
+            try testing.expect(restored == .Closure and restored.Closure == parent_cl);
+            try testing.expectEqual(base_tailcall, exec_frames.getPtr(parent_index).isTailCall());
+            try testing.expectEqual(INVALID_PENDING, exec_frames.getPtr(parent_index).pending_call_index);
+            try testing.expectEqual(base_frames, exec_frames.len());
+            try testing.expect(!vm.activeHookState().in_debug_hook);
+            try testing.expectEqual(bytes_before + pool_growth, tracker.total_bytes);
+            saw_success = true;
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            // Post-publish staging failures unwind exactly like the real
+            // callers' catch blocks: cancelPendingHookCall first, then the
+            // outer unwind pops any pushed frame. Pre-publish failures:
+            // both are no-ops (errdefers already rolled back).
+            vm.cancelPendingHookCall(exec_frames, parent_index);
+            while (exec_frames.len() > base_frames) vm.popBytecodeExecFrame(th, exec_frames);
+            th.debug_hook_transfer = null;
+            // ── Full rollback: parent identity (callee slot + tailcall
+            // bit), pending slot, frame count, hook liveness, and
+            // byte-exact live allocations (post payload + transfer copy
+            // + continuation struct each freed exactly once).
+            const restored = th.bytecode_stack[exec_frames.getPtr(parent_index).func_slot];
+            try testing.expect(restored == .Closure and restored.Closure == parent_cl);
+            try testing.expectEqual(base_tailcall, exec_frames.getPtr(parent_index).isTailCall());
+            try testing.expectEqual(INVALID_PENDING, exec_frames.getPtr(parent_index).pending_call_index);
+            try testing.expectEqual(base_frames, exec_frames.len());
+            try testing.expect(!vm.activeHookState().in_debug_hook);
+            try testing.expectEqual(bytes_before + pool_growth, tracker.total_bytes);
+        }
+    }
+    try testing.expect(saw_success);
+}
+
+// =========================================================================
+// P16.50-review-7 BLOCKER 3.3: applyBytecodePendingHook(.store_results)
+// re-publishes into the SAME pending slot — the old clear-then-
+// setPendingCall OOM window (pending destroyed, results leaked) is
+// structurally gone: no allocation exists between the old pending's death
+// and the new pending's birth, because they are the same slot.
+//
+// End-to-end countdown sweep over a return-hooked builtin call: every
+// counted allocation failure must surface as a memory error (never a
+// wrong-value success), the sweep must cross failures and reach the
+// success plateau, and the exact result contract must hold on every
+// success. testing.allocator catches any ownership leak at deinit.
+// =========================================================================
+test "P16.50-review-7 B3.3: store_results hook apply is slot-reuse (no clear-then-republish window)" {
+    const testing = std.testing;
+
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    vm.setDynamicBytecodeCompiler(defaultBytecodeCompiler);
+    try vm.enableTestcModule();
+
+    // math.max/math.min called from bytecode under a return hook: each
+    // builtin return pushes a .store_results hook continuation on the
+    // caller frame, and the hook's completion re-publishes into that same
+    // pending slot (applyBytecodePendingHook).
+    const src =
+        \\local h = function() end
+        \\debug.sethook(h, "r")
+        \\local t = table.pack(math.max(1, 2), math.min(3, 4))
+        \\debug.sethook()
+        \\return t.n, t[1], t[2]
+    ;
+    const chunk_v = try vm.compileChunkValue(src, "=p50r7-b33");
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(chunk_v);
+    const cl = chunk_v.Closure;
+
+    var outs: [1]Value = undefined;
+    var saw_fail = false;
+    var saw_success = false;
+    var cd: i64 = 0;
+    while (cd <= 96) : (cd += 1) {
+        try vm.builtinTestcAlloccount(&.{.{ .Int = cd }}, &outs);
+        const failed = blk: {
+            if (vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl)) |results| {
+                defer vm.alloc.free(results);
+                // ANY success must carry the exact contract.
+                try testing.expectEqual(@as(usize, 3), results.len);
+                try testing.expect(results[0] == .Int and results[0].Int == 2);
+                try testing.expect(results[1] == .Int and results[1].Int == 2);
+                try testing.expect(results[2] == .Int and results[2].Int == 3);
+                break :blk false;
+            } else |e| {
+                try testing.expect(e == error.OutOfMemory or e == error.RuntimeError);
+                break :blk true;
+            }
+        };
+        try vm.builtinTestcAlloccount(&.{.{ .Int = -1 }}, &outs); // disarm
+        if (failed) saw_fail = true else saw_success = true;
+    }
+    try testing.expect(saw_fail and saw_success);
+
+    // Disarmed, one final clean run: exact contract.
+    const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+    defer vm.alloc.free(results);
+    try testing.expectEqual(@as(usize, 3), results.len);
+    try testing.expect(results[0] == .Int and results[0].Int == 2);
+    try testing.expect(results[2] == .Int and results[2].Int == 3);
+}
+
+// =========================================================================
+// P16.50-review-7 BLOCKER 3.4a: beginBytecodeClose pre-publish OOM edges
+// roll back exactly.
+//
+// The transactional contract: reserve the pending slot FIRST
+// (reservePendingCallSlot — a failed reservation mutates nothing), then
+// create the close continuation, then infallibly publish into the
+// reserved slot. The sweep covers both pre-publish allocation edges —
+// the pending-slot append (reserve) and the close_state create — with an
+// owned .return_frame payload (the tail-call scenario's result
+// transport). After every failure: pending slot INVALID, frame count
+// unchanged, byte-exact live allocations (the owned payload freed
+// exactly once by the owner guard). The success iteration proves the
+// published contract: with no closers and no hooks the close completes
+// immediately, pops the frame, and returns the payload as .final.
+// =========================================================================
+test "P16.50-review-7 B3.4a: beginBytecodeClose pre-publish OOM edges roll back exactly" {
+    const testing = std.testing;
+    const TrackingAllocator = @import("tracking_alloc.zig").TrackingAllocator;
+
+    // One allocator for everything (see the B3.1 note).
+    var tracker = TrackingAllocator.init(std.heap.page_allocator);
+    const track_alloc = tracker.allocator();
+
+    const parent_proto = try compileTestProto(track_alloc, "return 1\n");
+
+    var vm = Vm.init(track_alloc, false);
+    defer vm.deinit();
+
+    const parent_cl = try track_alloc.create(Closure);
+    parent_cl.* = .{ .proto = parent_proto, .upvalues = &.{} };
+    _ = vm.retainTreeForClosure(parent_proto);
+    try vm.gcRegisterClosure(parent_cl);
+    try vm.resolveProtoConstants(parent_proto);
+
+    const th = vm.activeBytecodeThread();
+    const exec_frames = &th.call_frames;
+    const staged_parent = try vm.stageBytecodeCall(th, 0, parent_cl, &.{});
+    try vm.pushStagedBytecodeExecFrame(th, exec_frames, parent_proto, staged_parent.func_slot, staged_parent.nargs, -1);
+    const parent_index: usize = 0;
+    const base_frames = exec_frames.len();
+
+    var fail_idx: usize = 0;
+    var saw_success = false;
+    while (fail_idx <= 8) : (fail_idx += 1) {
+        try testing.expectEqual(INVALID_PENDING, exec_frames.getPtr(parent_index).pending_call_index);
+        const bytes_before = tracker.total_bytes;
+        const pool_cap_before = vm.pending_calls.capacity;
+        // Fresh owned return payload per iteration — the ownership-critical
+        // transport of the tail-call scenario (freed by freeBytecodeClose
+        // Post on failure, returned as .final on success).
+        const ret_values = try vm.alloc.dupe(Value, &.{.{ .Int = 7 }});
+        const post: BytecodeClosePost = .{ .return_frame = ret_values };
+
+        var failing = std.testing.FailingAllocator.init(track_alloc, .{
+            .fail_index = fail_idx,
+            .resize_fail_index = fail_idx,
+        });
+        const saved_alloc = vm.alloc;
+        vm.alloc = failing.allocator();
+        const progress = vm.beginBytecodeClose(exec_frames, 0, parent_index, 0, null, false, false, post);
+        vm.alloc = saved_alloc;
+
+        // The pending-call slot pool is persistent VM state: the reserve
+        // append's one-time capacity growth (a deliberate sweep target —
+        // the "prepare pending capacity" edge) is the ONLY legitimate byte
+        // increase across an iteration.
+        const pool_growth = (vm.pending_calls.capacity - pool_cap_before) * @sizeOf(PendingCallSlot);
+
+        if (progress) |p| {
+            // ── Published + completed contract: no closers and no hooks,
+            // so the close finishes immediately — the frame is popped and
+            // the payload returns as .final (external boundary).
+            switch (p) {
+                .final => |final| {
+                    try testing.expectEqual(@as(usize, 1), final.len);
+                    try testing.expect(final[0] == .Int and final[0].Int == 7);
+                    // returnSliceIsOwned(final) == true means the slice IS
+                    // the shared bc_return_scratch (borrowed — the caller
+                    // must not free it). Our dupe is heap-owned: free it.
+                    if (!vm.returnSliceIsOwned(final)) vm.alloc.free(final);
+                },
+                else => return testing.expect(false),
+            }
+            try testing.expectEqual(@as(usize, 0), exec_frames.len());
+            try testing.expectEqual(bytes_before + pool_growth, tracker.total_bytes);
+            saw_success = true;
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            // ── Full rollback: the reserved slot released, the frame
+            // untouched, the owned payload freed exactly once.
+            try testing.expectEqual(INVALID_PENDING, exec_frames.getPtr(parent_index).pending_call_index);
+            try testing.expectEqual(base_frames, exec_frames.len());
+            try testing.expectEqual(bytes_before + pool_growth, tracker.total_bytes);
+        }
+    }
+    try testing.expect(saw_success);
+}
+
+// =========================================================================
+// P16.50-review-7 BLOCKER 3.4b: end-to-end tail `T.testC('newtable;
+// return 1')` through a `<close>` variable — the exact production
+// scenario of the opTailcall → builtin → beginBytecodeClose window.
+//
+// Countdown sweep: every counted allocation failure (including the
+// pending-slot reserve inside beginBytecodeClose — the close_state
+// create rides the uncounted infraAlloc by PUC C-stack parity and is
+// covered by the 3.4a direct sweep) must surface as a memory error,
+// never a wrong-value success. On success the __close metamethod ran
+// exactly once (global g == 1) and the tail result is the testC table.
+// testing.allocator catches any ownership leak at deinit.
+// =========================================================================
+test "P16.50-review-7 B3.4b: tail testC through <close> — countdown sweep + exact close semantics" {
+    const testing = std.testing;
+
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    vm.setDynamicBytecodeCompiler(defaultBytecodeCompiler);
+    try vm.enableTestcModule();
+
+    const src =
+        \\g = 0
+        \\local x <close> = setmetatable({}, {__close = function() g = g + 1 end})
+        \\return T.testC('newtable; return 1')
+    ;
+    const chunk_v = try vm.compileChunkValue(src, "=p50r7-b34b");
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(chunk_v);
+    const cl = chunk_v.Closure;
+
+    var outs: [1]Value = undefined;
+    var saw_fail = false;
+    var saw_success = false;
+    var cd: i64 = 0;
+    while (cd <= 96) : (cd += 1) {
+        try vm.builtinTestcAlloccount(&.{.{ .Int = cd }}, &outs);
+        const failed = blk: {
+            if (vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl)) |results| {
+                defer vm.alloc.free(results);
+                try testing.expectEqual(@as(usize, 1), results.len);
+                try testing.expect(results[0] == .Table);
+                // The closer ran exactly once on the success path.
+                const g = vm.rawGet(vm.global_env, .{ .String = try vm.internStr("g") });
+                try testing.expect(g == .Int and g.Int == 1);
+                break :blk false;
+            } else |e| {
+                try testing.expect(e == error.OutOfMemory or e == error.RuntimeError);
+                break :blk true;
+            }
+        };
+        try vm.builtinTestcAlloccount(&.{.{ .Int = -1 }}, &outs); // disarm
+        if (failed) saw_fail = true else saw_success = true;
+    }
+    try testing.expect(saw_fail and saw_success);
+
+    // Disarmed, one final clean run: the tail result is the testC table
+    // and the closer ran exactly once.
+    const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+    defer vm.alloc.free(results);
+    try testing.expectEqual(@as(usize, 1), results.len);
+    try testing.expect(results[0] == .Table);
+    const g = vm.rawGet(vm.global_env, .{ .String = try vm.internStr("g") });
+    try testing.expect(g == .Int and g.Int == 1);
+}
+
+// =========================================================================
+// P16.50-review-7 BLOCKER 3.4c: the close continuation parks across a
+// yield inside __close and resumes to the exact final result — the
+// yield/resume close path of the same publication window (success
+// semantics; the OOM edges are covered by 3.4a/3.4b).
+// =========================================================================
+test "P16.50-review-7 B3.4c: close continuation parks across yield and resumes exactly" {
+    const testing = std.testing;
+
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    vm.setDynamicBytecodeCompiler(defaultBytecodeCompiler);
+
+    const src =
+        \\local co = coroutine.wrap(function()
+        \\  local y <close> = setmetatable({}, {__close = function() coroutine.yield("yc") end})
+        \\  return "done"
+        \\end)
+        \\local a = co()
+        \\local b = co()
+        \\return a, b
+    ;
+    const chunk_v = try vm.compileChunkValue(src, "=p50r7-b34c");
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(chunk_v);
+    const cl = chunk_v.Closure;
+
+    const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+    defer vm.alloc.free(results);
+    try testing.expectEqual(@as(usize, 2), results.len);
+    try testing.expect(results[0] == .String and std.mem.eql(u8, results[0].String.bytes(), "yc"));
+    try testing.expect(results[1] == .String and std.mem.eql(u8, results[1].String.bytes(), "done"));
 }

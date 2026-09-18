@@ -7588,11 +7588,14 @@ test "codegen+vm: direct bytecode yield parks thread-owned continuation" {
     try testing.expect(th.bytecode_inplace_suspended);
     try testing.expect(th.call_frames.len() != 0);
 
-    var resume_out: [3]vm.Value = .{ .Nil, .Nil, .Nil };
-    const resume_count = try v.apiResumeThread(th, &[_]vm.Value{.{ .Int = 42 }}, resume_out[0..]);
-    try testing.expectEqual(@as(usize, 2), resume_count);
-    try testing.expect(resume_out[0] == .Bool and resume_out[0].Bool);
-    try testing.expect(resume_out[1] == .Int and resume_out[1].Int == 42);
+    // P16.50-review-7 BLOCKER 4: apiResumeThread returns the resume's EXACT
+    // tuple ([ok] ++ values) as an owned slice (freed via the vm allocator,
+    // which passes infraAlloc'd blocks through).
+    const rres = try v.apiResumeThread(th, &[_]vm.Value{.{ .Int = 42 }});
+    defer testing.allocator.free(rres);
+    try testing.expectEqual(@as(usize, 2), rres.len);
+    try testing.expect(rres[0] == .Bool and rres[0].Bool);
+    try testing.expect(rres[1] == .Int and rres[1].Int == 42);
     try testing.expect(!th.bytecode_inplace_suspended);
     try testing.expectEqual(@as(usize, 0), th.call_frames.len());
 }
@@ -7646,17 +7649,19 @@ test "codegen+vm: yielding generic iterator stays on explicit frame stack" {
     try testing.expect(th.bytecode_inplace_suspended);
     try testing.expect(th.call_frames.len() >= 2);
 
-    var resume_out: [4]vm.Value = .{ .Nil, .Nil, .Nil, .Nil };
-    const resume_count = try v.apiResumeThread(
+    // P16.50-review-7 BLOCKER 4: apiResumeThread returns the resume's EXACT
+    // tuple ([ok] ++ values) as an owned slice (freed via the vm allocator,
+    // which passes infraAlloc'd blocks through).
+    const rres = try v.apiResumeThread(
         th,
         &[_]vm.Value{.{ .String = try v.internStr("resume-value") }},
-        resume_out[0..],
     );
-    try testing.expectEqual(@as(usize, 3), resume_count);
-    try testing.expect(resume_out[0] == .Bool and resume_out[0].Bool);
-    try testing.expect(resume_out[1] == .Int and resume_out[1].Int == 1);
-    try testing.expect(resume_out[2] == .String);
-    try testing.expectEqualStrings("resume-value", resume_out[2].String.bytes());
+    defer testing.allocator.free(rres);
+    try testing.expectEqual(@as(usize, 3), rres.len);
+    try testing.expect(rres[0] == .Bool and rres[0].Bool);
+    try testing.expect(rres[1] == .Int and rres[1].Int == 1);
+    try testing.expect(rres[2] == .String);
+    try testing.expectEqualStrings("resume-value", rres[2].String.bytes());
     try testing.expect(!th.bytecode_inplace_suspended);
     try testing.expectEqual(@as(usize, 0), th.call_frames.len());
 }

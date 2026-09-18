@@ -558,19 +558,21 @@ pub const State = struct {
         const arg_start = if (callee_needed) base + 1 else base;
         const args = th_stack.items[arg_start .. arg_start + nargs];
 
-        var out: [64]vm_mod.Value = undefined;
-        for (&out) |*v| v.* = .Nil;
-        const produced = self.vm.apiResumeThread(th, args, out[0..]) catch return .runtime_error;
-        const ok = produced > 0 and out[0] == .Bool and out[0].Bool;
+        // P16.50-review-7 BLOCKER 4: apiResumeThread returns the resume's
+        // EXACT tuple ([ok] ++ values) as an owned slice — no 64-slot
+        // window (the old window truncated every host resume to 63
+        // results; PUC lua_resume returns ALL results on the stack).
+        const res = self.vm.apiResumeThread(th, args) catch return .runtime_error;
+        defer self.vm.alloc.free(res);
+        const ok = res.len > 0 and res[0] == .Bool and res[0].Bool;
 
         th_stack.items.len = base;
         if (!ok) {
-            if (produced > 1) th_stack.append(self.vm.alloc, out[1]) catch return .memory_error;
+            if (res.len > 1) th_stack.append(self.vm.alloc, res[1]) catch return .memory_error;
             return .runtime_error;
         }
 
-        const nres = if (produced > 0) produced - 1 else 0;
-        th_stack.appendSlice(self.vm.alloc, out[1 .. 1 + nres]) catch return .memory_error;
+        th_stack.appendSlice(self.vm.alloc, res[1..]) catch return .memory_error;
         return if (th.status == .suspended) .yielded else .ok;
     }
 
@@ -798,7 +800,7 @@ pub const State = struct {
         // (luaD_closeprotected) before building the error object.
         const th = self.vm.activeBytecodeThread();
         const tbc_base = th.c_tbc_chain.items.len;
-        const ret = self.vm.apiCall(.nonyieldable, callee, args) catch {
+        const ret = self.vm.apiCall(.nonyieldable, callee, args) catch |e| {
             // PUC luaD_pcall (ldo.c:1090-1095): on error, restore the
             // stack to the base, run luaD_closeprotected(old_top, status)
             // — every TBC mark above the pcall entry closes WITH the
@@ -807,6 +809,14 @@ pub const State = struct {
             // object (luaD_seterrorobj) and propagate status.
             self.vm.apiCloseConventionalPcallBoundary(th, tbc_base);
             self.stack.items.len = fn_idx;
+            // PUC luaD_pcall propagates the RAW protected-run status:
+            // LUA_ERRMEM stays LUA_ERRMEM (the old code flattened every
+            // error to ERRRUN here, so a C-API OOM longjmp — e.g.
+            // lua_getupvalue's result push — surfaced as status 2).
+            // luaD_seterrorobj(LUA_ERRMEM) unconditionally installs the
+            // FIXED MEMERRMSG literal (allocation-free) — matching PUC,
+            // which replaces whatever the thrower carried.
+            if (e == error.OutOfMemory) self.vm.setOutOfMemoryError();
             // Push the error object onto the stack (PUC luaD_seterrorobj).
             // apiCloseConventionalPcallBoundary already replaced err_obj
             // with the final closer error when a closer errored.
@@ -816,8 +826,11 @@ pub const State = struct {
             const errval: vm_mod.Value = if (th.err_has_obj) th.err_obj else .Nil;
             self.stack.append(self.vm.alloc, errval) catch return .memory_error;
             // PUC: status is LUA_ERRERR (5) if the message handler errored,
-            // LUA_ERRRUN (2) otherwise.
-            return if (th.err_is_errerr) .error_handler_error else .runtime_error;
+            // LUA_ERRMEM (4) for OOM, LUA_ERRRUN (2) otherwise.
+            return switch (e) {
+                error.OutOfMemory => .memory_error,
+                else => if (th.err_is_errerr) .error_handler_error else .runtime_error,
+            };
         };
         defer self.vm.alloc.free(ret);
 

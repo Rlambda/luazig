@@ -3,7 +3,7 @@ name: luazig-review
 description: >
   Review a luazig phase or repository snapshot against PUC Lua 5.5 with strict
   correctness, architecture, performance, provenance, and regression-gate
-  discipline. Use for reviewing phase reports, luazig source codes,
+  discipline. Use for reviewing phase reports, luazig source code,
   measured artifacts, proposed next-phase queues, and generating the next
   agent prompt.
 ---
@@ -221,28 +221,50 @@ Treat `AGENTS.md` as binding project policy.
 
 Determine:
 
-```text
-reported input SHA
-reported final SHA
-reported measured source SHA
-actual snapshot source state
-```
+- reported input SHA;
+- reported final/wrapper SHA;
+- reported measured-source SHA;
+- actual checked-out HEAD and source state.
 
-If `.git` is available:
+If `.git` is available, inspect the relevant commits and run at least:
 
 ```bash
 git rev-parse HEAD
 git status --short
-git diff <measured-source>..HEAD -- src/
+git diff <measured-source>..HEAD -- src build.zig tests tools/*.py
 ```
 
-If `.git` is not available:
+If `.git` is unavailable:
 
 - use provenance artifacts;
 - inspect source directly;
 - clearly state what cannot be independently proven.
 
 Do not claim a wrapper commit contains no runtime change unless verified.
+
+### Provenance is evidence, not boilerplate
+
+The checks above are mandatory internal review work. They do **not** imply that
+the final response or the generated `prompt.md` should contain a routine
+"Verified input" / "Input truth" section listing HEAD, measured-source SHA,
+toolchain hash, binary hashes, gate artifact hashes, and every successful lane.
+
+Assume the implementation agent starts in the current reviewed repository and
+can discover its ordinary HEAD/toolchain locally. Mention provenance only when
+it is material to a finding or necessary to make an exceptional handoff
+unambiguous, for example:
+
+- the report SHA and checked-out source disagree;
+- the worktree is dirty and ownership of overlapping changes is unclear;
+- the C/D wrapper scope is not empty;
+- canonical artifacts contain mixed or stale source/binary identities;
+- the active toolchain differs from the required one or cannot be verified;
+- an immutable A/B binary identity is necessary to reproduce a performance
+  conclusion;
+- the next agent must start from a snapshot other than the current checkout.
+
+Even in those cases, put the minimum relevant provenance next to the affected
+finding or task. Do not emit a standalone inventory of values that all agree.
 
 ## Step 2 — Check formatting immediately
 
@@ -663,6 +685,22 @@ major cuts.
 
 ---
 
+# Code comments review
+
+Reject comments that describe deleted branches, empty locations, obsolete
+ownership, or behavior no longer implemented by the adjacent code.
+
+Production comments should explain the current invariant, ownership, ordering,
+or non-obvious reason for the implementation. Phase numbers, review history,
+negative-before narratives, and descriptions of removed alternatives normally
+belong in `STATUS.md`, `report.md`, or git history, not inside runtime functions.
+
+Do not request more comments merely by volume. Prefer the smallest comment that
+makes the current mechanism independently understandable and remains true after
+the phase name is forgotten.
+
+---
+
 # Builtin-call review
 
 When builtin paths are hot, decompose:
@@ -919,6 +957,118 @@ Do not overstate a LOW issue as a runtime failure.
 
 ---
 
+# Actionable remediation contract
+
+A review is incomplete if it only says that code is wrong and tells the next
+agent to fix it. For every material BLOCKER, HIGH, or MEDIUM finding, provide
+an implementation route detailed enough that a strong agent can begin without
+re-deriving the architecture from scratch.
+
+Each finding should cover, as applicable:
+
+1. **Location and first invalid operation** — name the file, function/type,
+   relevant branch, and the earliest operation that violates the contract.
+2. **Invariant** — state the semantic or ownership rule that should hold.
+3. **PUC mechanism** — identify the corresponding PUC Lua subsystem and,
+   when known, the relevant function/file and why that design avoids the bug.
+4. **luazig design** — specify the intended owner, data flow, ordering, error
+   propagation, rollback, or fast/slow-path boundary in the current Zig
+   architecture.
+5. **Implementation sketch** — include concise Zig-oriented pseudocode or a
+   small code sketch. Verify existing names/types first; label a sketch as
+   illustrative when it is not directly compilable.
+6. **Change surface** — identify affected callers, signatures, state fields,
+   or generated artifacts. If all call sites must change, say so explicitly.
+7. **Proof** — prescribe focused positive tests, a negative-before check, and
+   relevant regression gates. Tests must distinguish the old behavior from
+   the proposed behavior and must not repair production state themselves.
+8. **KEEP/REMOVE** — say which existing mechanisms remain valid and which
+   workaround, duplicate state, stale comment, or compensation must disappear.
+
+If multiple sound designs exist, recommend one and explain the decisive
+tradeoff. Do not leave an implementation agent with an unresolved architecture
+choice unless that choice genuinely requires owner input.
+
+Bad:
+
+```text
+ERRMEM propagation is wrong. Fix it and add tests.
+```
+
+Good (illustrative; exact local types must be verified first):
+
+```text
+The continuation boundary carries LUA_ERRMEM=4, but the resume wrapper folds
+all non-ERRERR failures to LUA_ERRRUN=2. Keep the status on the catching
+Thread/boundary owner, mirroring PUC luaD_throw -> finishCcall -> lua_resume,
+and switch on the original error kind instead of message text:
+
+const status: c_int = switch (err) {
+    error.OutOfMemory => LUA_ERRMEM,
+    error.RuntimeError => LUA_ERRRUN,
+    error.ErrorInHandler => LUA_ERRERR,
+};
+thread.api_status = status;
+return status;
+
+Update both the internal resume result and exported lua_resume consumer. Add a
+continuation OOM test that observes 4 at lua_resume and lua_status, preserves
+the fixed MEMERRMSG object, and goes red as 4->2 when either mapping is reverted.
+```
+
+Ownership findings need the same concreteness. Specify the single owner and
+handoff point, show the intended `errdefer`/transaction shape, and state the
+cleanup order when registries are involved, for example:
+
+```text
+prepare capacity -> allocate -> initialize -> infallible publish/commit
+rollback: unregister secondary registries -> reverse accounting -> destroy
+```
+
+Tie that sketch to a FailingAllocator/DebugAllocator matrix covering every
+failure edge and a success edge. Do not merely request "better cleanup".
+
+Use the minimum subset of this contract needed to make the repair executable.
+Group findings that violate one invariant into one architectural task. Do not
+repeat the same PUC mechanism, gate matrix, or KEEP list for every call site,
+and do not inflate a straightforward MEDIUM documentation correction into a
+full runtime redesign.
+
+---
+
+# Scope discipline and preservation of findings
+
+Review scope discipline must never hide a discovered problem.
+
+For every confirmed issue found during review, require the implementation
+report to record:
+
+- severity and reproducible evidence;
+- first invalid operation when known;
+- PUC behavior/mechanism;
+- whether the issue was introduced by the phase or is pre-existing;
+- the disposition: fixed now, blocks acceptance, or recorded in backlog;
+- the recommended architectural direction.
+
+An issue belongs in the current correction scope when it:
+
+- was introduced by the reviewed phase;
+- is on the changed path and makes the claimed fix incomplete;
+- fails a mandatory gate;
+- creates crash, UAF, corruption, double-free, or data loss;
+- invalidates the phase's measurements or provenance.
+
+A confirmed independent pre-existing issue must still appear in `report.md`.
+BLOCKER/HIGH issues must also become durable open `STATUS.md` items, because the
+next iteration replaces `report.md`. Such an issue does not automatically
+expand the current correction phase; rank it when selecting the next task.
+
+Do not classify an unverified suspicion as a confirmed blocker. Preserve it as
+an unconfirmed finding with the checks already performed and the next decisive
+experiment.
+
+---
+
 # Deciding whether to accept a phase
 
 ## Accept
@@ -1004,11 +1154,11 @@ prompt.md
 
 The prompt must include:
 
-- verified input source SHA;
-- measured baseline;
-- toolchain;
 - corrections found during review;
 - explicit blocking tasks;
+- confirmed deferred findings and their durable `STATUS.md` disposition;
+- concrete repair designs, including PUC analogues and Zig-oriented sketches;
+- affected owners/interfaces/call sites;
 - architecture invariants;
 - perf methodology;
 - focused tests;
@@ -1020,6 +1170,10 @@ The prompt must include:
 Do not only write the prompt inline in chat.
 
 Provide the file as a downloadable artifact.
+
+Do not add a routine "Verified input" / "Input truth" section. Include a SHA,
+baseline identity, toolchain, or binary hash only under the exceptional
+provenance policy above, and place it next to the task that needs it.
 
 ---
 
@@ -1055,6 +1209,22 @@ Bad:
 refresh artifacts.
 ```
 
+Good:
+
+```text
+finishCcall already preserves the BoundaryResult status, but lua_resume's
+catch discards the error kind. Carry the status through the Thread-owned
+resume boundary (PUC luaD_throw/finishCcall model), map OOM to LUA_ERRMEM=4,
+and update the continuation test to distinguish 4 from ERRRUN=2. Keep the
+existing fixed MEMERRMSG object and C-frame parking logic.
+```
+
+Bad:
+
+```text
+Error handling is wrong. Make it PUC-compatible.
+```
+
 ---
 
 # Final review response format
@@ -1080,6 +1250,9 @@ Explain the main reason.
 ## 2. Confirmed findings
 
 Summarize the important claims independently supported by source/artifacts.
+Do not turn this into a routine list of matching SHAs, hashes, toolchain data,
+and successful commands. State those only when they materially qualify the
+verdict.
 
 ## 3. Review findings
 
@@ -1092,6 +1265,12 @@ List only material discrepancies:
 - hidden correctness issue.
 
 Distinguish severity.
+
+For each material finding, include the actionable remediation contract:
+first invalid operation, target invariant, PUC analogue, recommended luazig
+design, concise Zig-oriented sketch when useful, affected change surface, and
+tests that distinguish old from corrected behavior. A bare "fix this" is not
+an acceptable review finding.
 
 ## 4. Next-phase recommendation
 

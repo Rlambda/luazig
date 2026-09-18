@@ -2239,6 +2239,47 @@ pub const YieldedValues = union(enum) {
     }
 };
 
+/// P16.50-review-8 (coroutine_yield +16% perf recovery): resume's borrowed
+/// result transport. On the hot yield/resume round-trip the yielded values
+/// ALREADY live in the yielding (now suspended) thread's bc_stack —
+/// builtinCoroutineYield parked them there as a `YieldedValues.span` (the
+/// yield call's argument window). Instead of heap-copying them into an
+/// owned tuple (PUC parity violation: PUC's auxresume/luaD_poscall moves
+/// the values between the two EXISTING stacks via lua_xmove/moveresults —
+/// zero allocation), resume hands the window to its caller as
+/// realloc-stable INDICES and the consumer copies under the ordinary
+/// nresults contract.
+///
+/// Tuple semantics: `[true] ++ th.bytecode_stack[base..base+len]`
+/// (resume's success tuple; only the success/yield path produces a span).
+///
+/// Lifetime invariant (extends the YieldSpan proof,
+/// p16.38-yield-value-lifetime.md §3): nothing may resume `th`, overwrite
+/// its parked argument window, or free the thread between span creation
+/// (resume's yield tail) and consumption. The direct fast path guarantees
+/// this: no debug hooks are active (coroutineBuiltinFastPathEligible
+/// rejects hooks), no Lua runs between the resume epilogue and the
+/// consumer's store, and GC can only fire at growCtxFrame/condGcFromDispatch
+/// — where `th` and the window values stay rooted: the caller frame is
+/// parked at its OP_CALL (its `th` argument register is within
+/// live_reg_top[pc]), and gcPropagateOne's inactive-thread walk scans the
+/// suspended frame's registers up to live_reg_top[pc] — which includes the
+/// yield call's arguments (vm.zig gcPropagateOne `.thread` case). Re-entry
+/// paths (return-event hooks, tail-call transport, generic dispatch, C API,
+/// wrap iterator) materialize an owned copy via materializeResumeSpan
+/// BEFORE any re-entry — cold fallback, same as PUC's single xmove.
+const ResumeSpan = struct { th: *Thread, base: u32, len: u32 };
+
+/// builtinCoroutineResume's outcome: the exact result tuple
+/// `[true] ++ yielded/returned values` or `[false, err]`, as an owned slice
+/// (cold paths: rejection/failure tuples, completion payloads, non-span
+/// yield forms) or — on the hot yield round-trip — as a borrowed
+/// `ResumeSpan` into the suspended thread's parked argument window.
+const ResumeResult = union(enum) {
+    owned: []Value,
+    span: ResumeSpan,
+};
+
 pub const Thread = struct {
     gc_age: GcAge = .new,
     /// Position in `Vm.gc_objects` (P16.16 C1: u32; see Cell.gc_index).
@@ -3466,10 +3507,11 @@ test "rejected resume entry leaves target status unchanged" {
     const th = vm.activeBytecodeThread();
     th.nCcalls = @as(u32, Thread.LUA_MAX_C_CALLS) + 5;
     const args = [_]Value{.{ .Thread = co }};
-    const res = try vm.builtinCoroutineResume(args[0..]);
+    // P16.50-review-8: normalize the ResumeResult (this rejection path is
+    // owned; the normalizer keeps the unit test shape-agnostic).
+    const r = try vm.resumeResultOwned(try vm.builtinCoroutineResume(args[0..]));
     // P16.50-review-7 BLOCKER 4: resume returns the EXACT tuple as an
     // owned slice (non-optional — every normal return is a tuple).
-    const r = res;
     defer vm.infraAlloc().free(r);
     try testing.expect(r.len == 2 and r[0] == .Bool and r[0].Bool == false);
     try testing.expect(r[1] == .String);
@@ -3478,6 +3520,96 @@ test "rejected resume entry leaves target status unchanged" {
     // NOT dead and remains resumable once depth frees up.
     try testing.expect(co.status == .suspended);
     th.nCcalls = 0;
+}
+
+// P16.50-review-8: the hot yield/resume round-trip hands the caller a
+// BORROWED ResumeSpan into the suspended thread's parked argument window
+// (zero allocation — PUC luaD_poscall moveresults parity) instead of an
+// owned `[true] ++ values` tuple. Distinguishes the old owned transport
+// from the span: the result IS a span, its window holds the exact yielded
+// values, the window stays GC-rooted while the span is outstanding (the
+// consumer's growCtxFrame may GC), and materializeResumeSpan yields the
+// exact tuple.
+test "resume yield round-trip returns borrowed span rooted across GC" {
+    const testing = std.testing;
+    const Source = @import("source.zig").Source;
+    const Lexer = @import("lexer.zig").Lexer;
+    const Parser = @import("parser.zig").Parser;
+    const ast = @import("ast.zig");
+    const CodegenBc = @import("codegen_bc.zig").Codegen;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const src = Source{
+        .name = "<test>",
+        .bytes =
+        \\local co = coroutine.create(function()
+        \\  while true do coroutine.yield(10, "spankey", true) end
+        \\end)
+        \\coroutine.resume(co) -- first round-trip: parks the span window
+        \\return co
+        \\
+        ,
+    };
+
+    var lex = Lexer.init(src);
+    var p = try Parser.init(&lex);
+
+    var ast_arena = ast.AstArena.init(aalloc);
+    defer ast_arena.deinit();
+    const chunk = try p.parseChunkAst(&ast_arena);
+
+    var cg_bc = CodegenBc.init(aalloc, src.name, src.bytes);
+    defer cg_bc.deinit();
+    const proto = try cg_bc.compileChunk(chunk);
+
+    var vm = Vm.init(aalloc, false);
+    defer vm.deinit();
+    // Source reads globals (`coroutine.*` — GETTABUP on the _ENV upvalue).
+    var env_cell = Cell{ .value = .{ .Table = vm.global_env } };
+    const upvals = [_]*Cell{&env_cell};
+    const ret = try vm.runBytecode(proto, &upvals, &.{}, null);
+    try testing.expect(ret.len == 1);
+    const co = switch (ret[0]) {
+        .Thread => |t| t,
+        else => return testing.expect(false),
+    };
+
+    // Root the suspended thread across the GC below (a bare registered
+    // thread is only reachable through this root here — the chunk's local
+    // is gone).
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(.{ .Thread = co });
+
+    // Second round-trip: the body hits the next yield — the result must be
+    // the BORROWED span (the old transport was an owned [true,10,...] tuple).
+    const rr = try vm.builtinCoroutineResume(&[_]Value{.{ .Thread = co }});
+    try testing.expect(rr == .span);
+    const sp = rr.span;
+    try testing.expect(sp.th == co);
+    try testing.expect(sp.len == 3);
+
+    // The consumer's contract: a GC may fire between span creation and the
+    // store (growCtxFrame). The parked window must stay rooted and intact —
+    // the suspended frame's live_reg_top[pc] scan covers the yield args.
+    vm.gcFullCollectionForUser() catch unreachable;
+    const vals = co.bytecode_stack[sp.base .. sp.base + sp.len];
+    try testing.expect(vals.len == 3);
+    try testing.expect(vals[0] == .Int and vals[0].Int == 10);
+    try testing.expect(vals[1] == .String and std.mem.eql(u8, vals[1].String.bytes(), "spankey"));
+    try testing.expect(vals[2] == .Bool and vals[2].Bool);
+
+    // Materialization (the cold re-entry path) produces the exact tuple.
+    const tuple = try vm.materializeResumeSpan(sp);
+    defer vm.infraAlloc().free(tuple);
+    try testing.expect(tuple.len == 4);
+    try testing.expect(tuple[0] == .Bool and tuple[0].Bool);
+    try testing.expect(tuple[1] == .Int and tuple[1].Int == 10);
+    try testing.expect(tuple[2] == .String and std.mem.eql(u8, tuple[2].String.bytes(), "spankey"));
+    try testing.expect(tuple[3] == .Bool and tuple[3].Bool);
 }
 
 test "string allocated-size rule: per-kind table (PUC parity)" {
@@ -6498,6 +6630,14 @@ pub const Vm = struct {
                         self.alloc.free(outs);
                         return ret;
                     },
+                    // P16.50-review-8: defensive — callBuiltin's generic arm
+                    // materializes spans before returning, so a span cannot
+                    // reach this public boundary (the dispatch invariant
+                    // forbids it); copy the borrowed window if one ever does.
+                    .span => |sp| {
+                        self.alloc.free(outs);
+                        return try self.materializeResumeSpan(sp);
+                    },
                 }
             },
             .Closure => |cl| return exposeDispatchResult([]Value, self.runClosure(cl, resolved.args)),
@@ -6517,7 +6657,10 @@ pub const Vm = struct {
         defer self.alloc.free(resume_args);
         resume_args[0] = .{ .Thread = th };
         for (args, 0..) |v, i| resume_args[i + 1] = v;
-        return exposeDispatchResult([]Value, self.builtinCoroutineResume(resume_args));
+        // P16.50-review-8: the C API holds the result across further VM
+        // execution — materialize a borrowed span to the owned contract.
+        const rr = try exposeDispatchResult(ResumeResult, self.builtinCoroutineResume(resume_args));
+        return try self.resumeResultOwned(rr);
     }
 
     /// PUC hook-yield visibility window (P15.83q). When a coroutine
@@ -12211,11 +12354,14 @@ pub const Vm = struct {
     /// Returns the callee's owned result slice (resume), or null when the
     /// callee has no normal-return result path (yield — unreachable in
     /// practice; it always ends in error.Yield or a RuntimeError).
+    /// P16.50-review-8: returns the resume's ResumeResult verbatim (owned or
+    /// borrowed span) — the direct fast-path consumer (opCall) stores a span
+    /// with zero allocation; every other caller materializes it.
     fn callCoroutineBuiltinDirect(
         self: *Vm,
         id: BuiltinId,
         args: []const Value,
-    ) DispatchError!?[]Value {
+    ) DispatchError!?ResumeResult {
         // Set active_builtin context — needed by builtinCoroutineYield
         // (th.suspended_builtin = self.active_builtin) and by the coroutine
         // body's yield to detect it's yielding from a builtin.
@@ -19355,6 +19501,11 @@ pub const Vm = struct {
                 // registry), replacing the infraAlloc dupe. PUC poscall
                 // moves the C results in place; no intermediate copy.
                 if (tfc_bres == .owned) break :blk tfc_bres.owned;
+                // P16.50-review-8: defensive — callBuiltin's generic arm
+                // materializes spans before returning, so a span cannot
+                // reach here; treat one as the callee's exact results if
+                // it ever does.
+                if (tfc_bres == .span) break :blk try self.materializeResumeSpan(tfc_bres.span);
                 const produced: usize = tfc_bres.window;
                 // PUC luaD_poscall moves the C results into the caller's
                 // pre-reserved stack slots — pure transport, never a
@@ -20085,7 +20236,7 @@ pub const Vm = struct {
                 // callBuiltin) mirrors callBuiltin's tail formula.
                 var tc_bres: BuiltinResult = undefined;
                 if (co_fast_path) {
-                    const owned_opt = self.callCoroutineBuiltinDirect(id, call_args) catch |call_err| switch (call_err) {
+                    const rr_opt = self.callCoroutineBuiltinDirect(id, call_args) catch |call_err| switch (call_err) {
                         error.Yield => {
                             if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
                                 const th = self.current_thread.?;
@@ -20110,7 +20261,15 @@ pub const Vm = struct {
                     // P16.50-review-7 BLOCKER 4: resume's exact owned tuple
                     // is the tail-call transport (no window bound); yield
                     // never returns normally (null → empty window, unread).
-                    tc_bres = if (owned_opt) |vals| .{ .owned = vals } else .{ .window = 0 };
+                    // P16.50-review-8: a span is materialized here — the
+                    // tail transport frees non-scratch slices at handoff,
+                    // so it must carry an owned slice (a foreign free of a
+                    // bc_stack window would be catastrophic). Cold relative
+                    // to the opCall direct path (tail-called resumes).
+                    tc_bres = if (rr_opt) |rr| switch (rr) {
+                        .owned => |vals| .{ .owned = vals },
+                        .span => |sp| .{ .owned = try self.materializeResumeSpan(sp) },
+                    } else .{ .window = 0 };
                 } else {
                     // P16.41 Cut 3: view frame pushed above for every
                     // C-frame builtin; frameless builtins pass .host (the
@@ -20153,6 +20312,10 @@ pub const Vm = struct {
                 // dupe, no bc_return_scratch staging: PUC's poscall moves
                 // the C results on the shared stack in place.
                 if (tc_bres == .owned) break :blk tc_bres.owned;
+                // P16.50-review-8: defensive — the co_fast_path arm above
+                // materializes spans; the generic callBuiltin arm does too.
+                // Treat a stray span as the callee's exact results.
+                if (tc_bres == .span) break :blk try self.materializeResumeSpan(tc_bres.span);
                 const used = tc_bres.window;
                 // P16.32 T2 Cut B: on the nothing-to-close fast path, stash
                 // the results in bc_return_scratch (borrowed, detected by
@@ -20655,7 +20818,7 @@ pub const Vm = struct {
                 // analogue).
                 const stack_base_before = ctx.th.bytecode_stack.ptr;
                 if (co_fast_path) {
-                    const owned_opt = self.callCoroutineBuiltinDirect(id, rargs_fresh) catch |call_err| switch (call_err) {
+                    const rr_opt = self.callCoroutineBuiltinDirect(id, rargs_fresh) catch |call_err| switch (call_err) {
                         error.Yield => {
                             if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
                                 const th = self.current_thread.?;
@@ -20682,7 +20845,15 @@ pub const Vm = struct {
                     // no window bound); yield never returns normally, so
                     // the null maps to an empty window result that no
                     // consumer ever reads (the Yield arm above returned).
-                    bres = if (owned_opt) |vals| .{ .owned = vals } else .{ .window = 0 };
+                    // P16.50-review-8: a span passes through VERBATIM —
+                    // this is the hot yield round-trip's zero-alloc
+                    // consumer path (the .span arm of the bres switch
+                    // below stores directly from the suspended thread's
+                    // window; PUC luaD_poscall moveresults parity).
+                    bres = if (rr_opt) |rr| switch (rr) {
+                        .owned => |vals| .{ .owned = vals },
+                        .span => |sp| .{ .span = sp },
+                    } else .{ .window = 0 };
                 } else {
                     // P16.41 Cut 3: the view frame was pushed above for every
                     // C-frame builtin; frameless builtins (collectgarbage/
@@ -20732,6 +20903,41 @@ pub const Vm = struct {
                 // multret), growing the caller's frame only when the results
                 // exceed it.
                 switch (bres) {
+                    // P16.50-review-8 (perf recovery): the hot yield
+                    // round-trip's zero-alloc consumer. A span reaches here
+                    // ONLY from the coroutine.resume direct fast path
+                    // (co_fast_path guards: no debug hooks active — so no
+                    // return-event hook probes here; no re-entry between
+                    // the resume tail and this store). Store the exact
+                    // tuple `[true] ++ window` under the ordinary nresults
+                    // contract, reading directly from the suspended
+                    // thread's parked argument window — PUC luaD_poscall
+                    // moveresults moves the values between the two
+                    // existing stacks with zero allocation; this is the
+                    // same shape (borrowed source, counted destination).
+                    // growCtxFrame may GC: `th` and the window stay rooted
+                    // (caller frame parked at its OP_CALL — the `th`
+                    // argument register is within live_reg_top[pc];
+                    // gcPropagateOne's inactive-thread walk scans the
+                    // suspended frame's registers up to live_reg_top[pc],
+                    // which includes the yield call's arguments — see
+                    // ResumeSpan's lifetime invariant).
+                    .span => |sp| {
+                        const vals = sp.th.bytecode_stack[sp.base .. sp.base + sp.len];
+                        const total = 1 + vals.len;
+                        const nstore: usize = if (nresults >= 0) @intCast(nresults) else total;
+                        try self.growCtxFrame(ctx, a + nstore);
+                        // nstore == 0 (statement call): nothing to store.
+                        if (nstore >= 1) ctx.regs[a] = .{ .Bool = true };
+                        if (nstore > 1) {
+                            for (1..nstore) |i| {
+                                ctx.regs[a + i] = if (i - 1 < vals.len) vals[i - 1] else .Nil;
+                            }
+                        }
+                        if (nresults < 0) ctx.exec_frames.getPtr(ctx.frame_index).reg_top = @intCast(@as(usize, a) + total);
+                        try self.condGcFromDispatch(ctx);
+                        return .continue_dispatch;
+                    },
                     .owned => |vals| {
                         // Single owner: this scope. Freed on every exit — the
                         // errdefer on error unwind, the explicit free on the
@@ -21502,9 +21708,19 @@ pub const Vm = struct {
     /// passes to the CALLER of callBuiltin; on error/Yield/ThreadSwitch the
     /// builtin keeps it (nothing is returned). `last_builtin_out_count`
     /// never transports owned results — the count is structural here.
+    ///
+    ///   - `span`: P16.50-review-8 — a BORROWED resume result. The tuple is
+    ///     `[true] ++ span.th.bytecode_stack[base..base+len]` (see
+    ///     ResumeSpan). Produced only by the coroutine.resume direct fast
+    ///     path (no hooks, no re-entry between creation and consumption);
+    ///     the consumer stores under the nresults contract directly from
+    ///     the suspended thread's window — PUC luaD_poscall moveresults
+    ///     parity, zero allocation. Never freed; re-entry consumers
+    ///     materialize via materializeResumeSpan (cold).
     const BuiltinResult = union(enum) {
         window: usize,
         owned: []Value,
+        span: ResumeSpan,
     };
 
     fn callBuiltin(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value, origin: BuiltinCallOrigin) DispatchError!BuiltinResult {
@@ -21702,6 +21918,19 @@ pub const Vm = struct {
                 self.infraAlloc().free(vals);
                 return n;
             },
+            // P16.50-review-8: defensive — a span never reaches this helper
+            // (the direct fast path consumes it at the opCall/opTailcall
+            // sites; the generic dispatch arm materializes before
+            // callBuiltin returns). Copy from the source window under the
+            // same min-clamped contract; nothing is freed (borrowed).
+            .span => |sp| {
+                const vals = sp.th.bytecode_stack[sp.base .. sp.base + sp.len];
+                const total = 1 + vals.len;
+                const n = @min(total, out.len);
+                if (n > 0) out[0] = .{ .Bool = true };
+                if (n > 1) @memcpy(out[1..n], vals[0 .. n - 1]);
+                return n;
+            },
         }
     }
 
@@ -21761,6 +21990,27 @@ pub const Vm = struct {
         res[0] = .{ .Bool = false };
         res[1] = errv;
         return res;
+    }
+
+    /// P16.50-review-8: materialize a borrowed ResumeSpan as the exact
+    /// owned tuple `[true] ++ values`. The cold-path counterpart of the
+    /// span transport: re-entry consumers (return-event hooks, tail-call
+    /// transport, generic callBuiltin dispatch, C API, wrap iterator) run
+    /// Lua or hold the result across further VM execution and must not
+    /// depend on the suspended thread's window staying put.
+    fn materializeResumeSpan(self: *Vm, sp: ResumeSpan) std.mem.Allocator.Error![]Value {
+        const vals = sp.th.bytecode_stack[sp.base .. sp.base + sp.len];
+        return self.ownedResumeOk(vals);
+    }
+
+    /// P16.50-review-8: normalize a ResumeResult to the owned form (span →
+    /// materialized copy). For cold resume callers that keep the []Value
+    /// contract.
+    fn resumeResultOwned(self: *Vm, rr: ResumeResult) std.mem.Allocator.Error![]Value {
+        return switch (rr) {
+            .owned => |vals| vals,
+            .span => |sp| try self.materializeResumeSpan(sp),
+        };
     }
 
     /// P16.50-review-6 BLOCKER 1: the arm dispatch returns the builtin's
@@ -22043,7 +22293,14 @@ pub const Vm = struct {
             .coroutine_create => try self.builtinCoroutineCreate(args, outs),
             .coroutine_wrap => try self.builtinCoroutineWrap(args, outs),
             .coroutine_wrap_iter => return try self.builtinCoroutineWrapIter(args),
-            .coroutine_resume => return try self.builtinCoroutineResume(args),
+            // P16.50-review-8: materialize a borrowed span before returning
+            // to callBuiltin's generic contract — this arm is the cold path
+            // (hooks active, trampoline dispatch, close/testc re-entry); the
+            // hot round-trip consumes the span at the opCall direct site.
+            .coroutine_resume => {
+                const rr = try self.builtinCoroutineResume(args);
+                return try self.resumeResultOwned(rr);
+            },
             .coroutine_yield => try self.builtinCoroutineYield(args, outs),
             .coroutine_status => try self.builtinCoroutineStatus(args, outs),
             .coroutine_running => try self.builtinCoroutineRunning(args, outs),
@@ -23401,6 +23658,12 @@ pub const Vm = struct {
                         return res;
                     },
                     .window => |produced| return try self.ownedPcallOk(tmp[0..produced]),
+                    // P16.50-review-8: defensive — callBuiltin's generic arm
+                    // materializes spans before returning (a pcall target
+                    // that is coroutine.resume goes through it), so a span
+                    // cannot reach here; treat it as the callee's exact
+                    // results if one ever does.
+                    .span => |sp| return try self.ownedPcallOk(try self.materializeResumeSpan(sp)),
                 }
             },
             .Closure => |cl| {
@@ -23659,6 +23922,8 @@ pub const Vm = struct {
                         return res;
                     },
                     .window => |produced| return try self.ownedPcallOk(tmp[0..produced]),
+                    // P16.50-review-8: defensive — see builtinPcall.
+                    .span => |sp| return try self.ownedPcallOk(try self.materializeResumeSpan(sp)),
                 }
             },
             .Closure => |cl| {
@@ -23771,39 +24036,62 @@ pub const Vm = struct {
             }
             th.wrap_repeat_closure = null;
         }
-        var resume_args = try self.alloc.alloc(Value, call_args.len + 1);
-        defer self.alloc.free(resume_args);
-        resume_args[0] = .{ .Thread = th };
-        for (call_args, 0..) |v, i| resume_args[i + 1] = v;
-
-        // P16.50-review-7 BLOCKER 4: resume returns its EXACT tuple
-        // `[ok] ++ values` as an owned slice; the iterator strips the
-        // boolean. The tuple is infraAlloc'd transport — freed on every
-        // exit below (the returned values are a FRESH copy: a re-based
-        // sub-slice could not be freed safely — shifted pointer).
-        const rres = try self.builtinCoroutineResume(resume_args);
-        defer self.infraAlloc().free(rres);
-
-        const ok = switch (rres[0]) {
-            .Bool => |b| b,
-            else => false,
+        // P16.50-review-8: the dominant 0-arg iteration passes the thread
+        // argument from a stack-local array — builtinCoroutineResume only
+        // READS its arguments during the synchronous call (entry_args and
+        // the resume inbox are heap copies), so no staging allocation is
+        // needed. Multi-arg iterations keep the heap staging slice.
+        const rres: ResumeResult = if (call_args.len == 0) blk: {
+            const sargs = [_]Value{.{ .Thread = th }};
+            break :blk try self.builtinCoroutineResume(sargs[0..]);
+        } else blk: {
+            const resume_args = try self.alloc.alloc(Value, call_args.len + 1);
+            defer self.alloc.free(resume_args);
+            resume_args[0] = .{ .Thread = th };
+            for (call_args, 0..) |v, i| resume_args[i + 1] = v;
+            break :blk try self.builtinCoroutineResume(resume_args);
         };
-        if (!ok) {
-            if (rres.len > 1 and !(rres[1] == .Nil)) {
-                if (rres[1] == .String) return self.fail("{s}", .{rres[1].String.bytes()});
-                self.err = null;
-                self.errThread().err_obj = rres[1];
-                self.errThread().err_has_obj = true;
-                self.errThread().err_source = null;
-                self.errThread().err_line = -1;
-                self.captureErrorTraceback();
-                return error.RuntimeError;
-            }
-            return self.fail("coroutine.wrap resume failed", .{});
-        }
-        const vals = rres[1..];
-        const res = try self.allocOwnedResult(vals.len);
-        @memcpy(res, vals);
+
+        // P16.50-review-7 BLOCKER 4 / P16.50-review-8: resume returns its
+        // EXACT tuple `[ok] ++ values`; the iterator strips the boolean.
+        // The owned tuple is infraAlloc'd transport — freed on every exit
+        // of its arm (the returned values are a FRESH copy: a re-based
+        // sub-slice could not be freed safely — shifted pointer). A span
+        // (the hot yield round-trip) skips the tuple entirely: ONE copy
+        // straight from the suspended thread's parked window (a span is
+        // always the success tuple — the boolean is structural).
+        const res: []Value = switch (rres) {
+            .span => |sp| blk: {
+                const vals = sp.th.bytecode_stack[sp.base .. sp.base + sp.len];
+                const r = try self.allocOwnedResult(vals.len);
+                @memcpy(r, vals);
+                break :blk r;
+            },
+            .owned => |tuple| blk: {
+                defer self.infraAlloc().free(tuple);
+                const ok = switch (tuple[0]) {
+                    .Bool => |b| b,
+                    else => false,
+                };
+                if (!ok) {
+                    if (tuple.len > 1 and !(tuple[1] == .Nil)) {
+                        if (tuple[1] == .String) return self.fail("{s}", .{tuple[1].String.bytes()});
+                        self.err = null;
+                        self.errThread().err_obj = tuple[1];
+                        self.errThread().err_has_obj = true;
+                        self.errThread().err_source = null;
+                        self.errThread().err_line = -1;
+                        self.captureErrorTraceback();
+                        return error.RuntimeError;
+                    }
+                    return self.fail("coroutine.wrap resume failed", .{});
+                }
+                const vals = tuple[1..];
+                const r = try self.allocOwnedResult(vals.len);
+                @memcpy(r, vals);
+                break :blk r;
+            },
+        };
         th.wrap_repeat_closure = null;
         if (res.len == 1 and res[0] == .Closure and th.status == .suspended and call_args.len == 0 and th.callee == .Closure and th.callee.Closure.proto != null and th.callee.Closure.proto.?.numparams == 0) {
             th.wrap_repeat_closure = res[0].Closure;
@@ -24265,7 +24553,7 @@ pub const Vm = struct {
     /// resume to 255 values). The `outs` window and its `want_out` mode
     /// are gone: every caller gets the exact tuple; the consumer applies
     /// the nresults contract.
-    fn builtinCoroutineResume(self: *Vm, args: []const Value) DispatchError![]Value {
+    fn builtinCoroutineResume(self: *Vm, args: []const Value) DispatchError!ResumeResult {
         if (args.len == 0) return self.fail("coroutine.resume expects thread", .{});
         const th = try self.expectThread(args[0]);
         defer if (th.close_mode) self.clearForcedClose(th);
@@ -24286,15 +24574,15 @@ pub const Vm = struct {
 
         if (th.status == .dead) {
             const istr = try self.internStr("cannot resume dead coroutine");
-            return try self.ownedResumeFail(.{ .String = istr });
+            return .{ .owned = try self.ownedResumeFail(.{ .String = istr }) };
         }
         if (th.status == .suspended and self.current_thread != null and self.current_thread.? != th and self.current_thread.?.caller == th) {
             const istr2 = try self.internStr("cannot resume non-suspended coroutine");
-            return try self.ownedResumeFail(.{ .String = istr2 });
+            return .{ .owned = try self.ownedResumeFail(.{ .String = istr2 }) };
         }
         if (th.status == .running) {
             const istr3 = try self.internStr("cannot resume non-suspended coroutine");
-            return try self.ownedResumeFail(.{ .String = istr3 });
+            return .{ .owned = try self.ownedResumeFail(.{ .String = istr3 }) };
         }
 
         // P16.25.1 R2: resume-ENTRY ACCEPTANCE FIRST (PUC lua_resume order:
@@ -24306,7 +24594,7 @@ pub const Vm = struct {
             const entry_th = self.activeBytecodeThread();
             const entry = try self.resumeEnterC(th, entry_th);
             if (entry == .rejected) {
-                return try self.ownedResumeFail(entry.rejected);
+                return .{ .owned = try self.ownedResumeFail(entry.rejected) };
             }
         }
 
@@ -24526,7 +24814,7 @@ pub const Vm = struct {
                         th.started = true;
                         th.finished = true;
                         self.clearThreadContinuationScratch(th, .{ .clear_yielded = true });
-                        return try self.ownedResumeFail(close_err.?);
+                        return .{ .owned = try self.ownedResumeFail(close_err.?) };
                     }
                     th.status = .dead;
                     th.api_status = 0; // LUA_OK
@@ -24537,7 +24825,7 @@ pub const Vm = struct {
                     // P16.50-review-7 BLOCKER 4: exact owned tuple
                     // `[true, nil]` (PUC lua_closethread → LUA_OK with no
                     // values; the nil keeps the resume tuple shape).
-                    return try self.ownedResumeOk(&[_]Value{.Nil});
+                    return .{ .owned = try self.ownedResumeOk(&[_]Value{.Nil}) };
                 }
                 // Lua frames remain — set up for resume so the close_mode
                 // branch in runBytecodeInternal runs __close for TBC vars
@@ -24690,7 +24978,7 @@ pub const Vm = struct {
                         // P16.50-review-7 BLOCKER 4: exact owned tuple
                         // `[true] ++ payload[0..payload_n]` — the completion
                         // payload's exact count, no window truncation.
-                        return try self.ownedResumeOk(payload[0..payload_n]);
+                        return .{ .owned = try self.ownedResumeOk(payload[0..payload_n]) };
                     }
                     // More frames — loop to check if the next one is also C.
                 }
@@ -24704,7 +24992,7 @@ pub const Vm = struct {
                     th.close_has_err = false;
                     // P16.50-review-7 BLOCKER 4: exact owned tuple
                     // `[true] ++ payload[0..payload_n]`.
-                    return try self.ownedResumeOk(payload[0..payload_n]);
+                    return .{ .owned = try self.ownedResumeOk(payload[0..payload_n]) };
                 }
 
                 // If C-frames were processed but there are still Lua frames,
@@ -25034,6 +25322,19 @@ pub const Vm = struct {
                             .window => |produced| {
                                 payload_n = produced;
                             },
+                            // P16.50-review-8: defensive — callBuiltin's
+                            // generic arm materializes spans before
+                            // returning, so a span cannot reach this
+                            // staging switch; treat it as the callee's
+                            // exact results (owned replacement) if one
+                            // ever does.
+                            .span => |sp| {
+                                const vals = try self.materializeResumeSpan(sp);
+                                if (payload_heap) self.alloc.free(payload);
+                                payload = vals;
+                                payload_n = vals.len;
+                                payload_heap = true;
+                            },
                         }
                     } else |e| switch (e) {
                         error.Yield => {
@@ -25155,11 +25456,35 @@ pub const Vm = struct {
             self.clearThreadContinuationScratch(th, .{});
             // P16.50-review-7 BLOCKER 4: exact owned failure tuple
             // `[false, err]` (PUC luaB_coresume's error arm).
-            return try self.ownedResumeFail(errv);
+            return .{ .owned = try self.ownedResumeFail(errv) };
         }
 
         // Yield path: return yielded values (set by coroutine.yield).
         if (yielded or th.yieldedValues() != null) {
+            // P16.50-review-8 (perf recovery): the hot yield round-trip.
+            // builtinCoroutineYield parked the values as a span into th's
+            // bc_stack (the yield call's argument window) — hand that
+            // window to the caller as a BORROWED ResumeSpan instead of
+            // heap-copying `[true] ++ ys` per round-trip (the +16%
+            // coroutine_yield regression; PUC moves the values between
+            // the two existing stacks — luaD_poscall/moveresults — with
+            // zero allocation). The direct fast-path consumer stores
+            // under the nresults contract directly from the window;
+            // re-entry consumers materialize via materializeResumeSpan.
+            if (th.yielded == .span) {
+                const ysp = th.yielded.span;
+                // Clear the yielded store WITHOUT deinit: the values stay
+                // parked in the window (they are the span's source; the
+                // frame's live_reg_top[pc] scan keeps them GC-rooted).
+                th.yielded = .none;
+                th.trace_yields += 1;
+                th.status = .suspended;
+                th.api_status = 1; // LUA_YIELD
+                th.close_has_err = false;
+                th.started = true;
+                th.finished = false;
+                return .{ .span = .{ .th = th, .base = ysp.base, .len = ysp.len } };
+            }
             const ys = th.yieldedValues() orelse &[_]Value{};
             // P16.50-review-7 BLOCKER 4: exact owned tuple `[true] ++ ys`
             // — copied BEFORE the yielded store is deinit'd below.
@@ -25171,7 +25496,7 @@ pub const Vm = struct {
             th.close_has_err = false;
             th.started = true;
             th.finished = false;
-            return res;
+            return .{ .owned = res };
         }
 
         // P16.50-review-7 BLOCKER 4: exact owned tuple `[true] ++
@@ -25185,7 +25510,7 @@ pub const Vm = struct {
         th.started = true;
         th.finished = true;
         self.clearThreadContinuationScratch(th, .{});
-        return res;
+        return .{ .owned = res };
     }
 
     fn builtinCoroutineStatus(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -25364,6 +25689,23 @@ pub const Vm = struct {
         return self.closeTbcRegion(th, 0, null, err, err_status, false, &.{});
     }
 
+    /// P16.50-review-8: the close transport's failed-close report — a
+    /// propagated error or an OOM while normalizing the resume result is
+    /// reported as a failed close with no error object (the transport's
+    /// resume runs a forced close: real errors are latched onto the thread
+    /// by the close paths, not propagated).
+    fn closeTransportReportFail(self: *Vm, th: *Thread, outs: []Value) void {
+        th.status = .dead;
+        th.errfunc = ERRFUNC_NONE; // PUC luaE_resetthread
+        th.api_status = 0; // LUA_OK — PUC resetCI sets L->status=LUA_OK
+        const outw = self.refreshBuiltinOuts() orelse outs;
+        if (outw.len > 0) outw[0] = .{ .Bool = false };
+        if (outw.len > 1) outw[1] = .Nil;
+        th.close_has_err = false;
+        th.close_err = .Nil;
+        self.last_builtin_out_count = @min(@as(usize, 2), outw.len);
+    }
+
     fn builtinCoroutineClose(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         self.last_builtin_out_count = 0;
         // P16.27 T1: PUC lua_closethread -> luaD_closeprotected(yy=0) ->
@@ -25475,23 +25817,21 @@ pub const Vm = struct {
                 self.cur_c_stack = saved_cur_c_stack;
             }
             var resume_args = [_]Value{.{ .Thread = th }};
-            // P16.50-review-7 BLOCKER 4: resume returns its exact tuple as
-            // an owned slice — read the boolean and the close error from
-            // it, then free it (the transport discards the values).
-            const rres = self.builtinCoroutineResume(resume_args[0..]) catch {
-                // The transport's resume runs a forced close (close_mode):
-                // errors are latched onto the thread by the close paths, not
-                // propagated — treat a propagation as a failed close with no
-                // error object (the !ok arm below reports via th state).
-                th.status = .dead;
-                th.errfunc = ERRFUNC_NONE; // PUC luaE_resetthread
-                th.api_status = 0; // LUA_OK — PUC resetCI sets L->status=LUA_OK
-                const outw = self.refreshBuiltinOuts() orelse outs;
-                if (outw.len > 0) outw[0] = .{ .Bool = false };
-                if (outw.len > 1) outw[1] = .Nil;
-                th.close_has_err = false;
-                th.close_err = .Nil;
-                self.last_builtin_out_count = @min(@as(usize, 2), outw.len);
+            // P16.50-review-7 BLOCKER 4 / P16.50-review-8: resume returns
+            // its exact tuple; the close transport re-enters VM execution
+            // (the forced-close unwind) and discards the values, so the
+            // result is normalized to the owned form up front (a span is
+            // materialized; the transport reads the boolean and the close
+            // error from the tuple, then frees it).
+            const rr = self.builtinCoroutineResume(resume_args[0..]) catch {
+                self.closeTransportReportFail(th, outs);
+                return;
+            };
+            const rres = self.resumeResultOwned(rr) catch {
+                // resumeResultOwned only fails on OOM (the span copy);
+                // report as a failed close with no error object, matching
+                // the propagation arm above.
+                self.closeTransportReportFail(th, outs);
                 return;
             };
             const ok = switch (rres[0]) {
@@ -45874,11 +46214,13 @@ pub const Vm = struct {
                 for (call_args, 0..) |v, i| resume_args[i + 1] = v;
 
                 // P16.50-review-7 BLOCKER 4: resume returns its EXACT tuple
-                // as an owned slice — no 257-slot window (the old window
-                // truncated every testC resume to 256 results; cstack.lua's
-                // deep chains need the exact count). Freed via infraAlloc —
-                // the values are copied onto the testC stack below.
-                const rres = try self.builtinCoroutineResume(resume_args);
+                // — no 257-slot window (the old window truncated every
+                // testC resume to 256 results; cstack.lua's deep chains
+                // need the exact count). P16.50-review-8: normalized to
+                // the owned form (the testC re-entry copies values onto
+                // the testC stack below; a span is materialized). Freed
+                // via infraAlloc.
+                const rres = try self.resumeResultOwned(try self.builtinCoroutineResume(resume_args));
                 defer self.infraAlloc().free(rres);
 
                 const ok = rres[0] == .Bool and rres[0].Bool;

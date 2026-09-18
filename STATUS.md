@@ -104,10 +104,28 @@ Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependen
   c_api 0 FAIL + test-diff PASS; 23 heavy testc-лейнов rc=0; api580 GREEN;
   fixed-load GREEN; gc.lua differential + crash contract 20/20; fmt +
   git-diff-check clean; owner repros R1 (resume 301)/R2 (pcall settop-300 301)/
-  R3 (newmetatable __name) green. Perf: ОДНА объявленная paired-seed clean-C
-  сессия (seeds 1..21) на commit C + полное canonical current-* перегенерирование —
-  verdict-строка дописана артефактным коммитом D (STATUS — artifact-class per
-  tools/provenance.py ARTIFACT_PATHS; единственный source commit C сохранён).
+  R3 (newmetatable __name) green. Perf: первая объявленная paired-seed clean-C
+  сессия (seeds 1..21) на commit C — FAIL: coroutine_yield +15.29..+17.31% на
+  всех 21 seeds (per-seed paired instruction deltas vs baseline-approved);
+  сессия честно записана в current-gate.json + append-only manifest
+  (2026-09-18T16:48Z, historical), артефактный коммит D на C не создавался.
+  Perf recovery (source commit C2): root cause — per-call owned-slice alloc на
+  yield round-trip (builtinCoroutineResume копировал yielded values в
+  heap-слайс на каждый resume); фикс = borrowed ResumeSpan/thread-window
+  transport: yield паркует значения как YieldedValues.span в parked argument
+  window приостановленного thread (vm.zig:2217+), ResumeSpan/ResumeResult
+  (vm.zig:2271-2290), builtinCoroutineResume (vm.zig:24556) возвращает
+  ResumeResult, zero-alloc opCall .span arm (vm.zig:20925: `[true] ++ window`
+  под обычным nresults-контрактом — PUC luaD_poscall/moveresults parity,
+  перемещение между двумя существующими стеками без аллокации), cold paths
+  (host C-API, pcall/xpcall, wrap-iter, debug-hook) материализуют owned-копию
+  через materializeResumeSpan (vm.zig:22001), wrap_iter single-copy
+  (vm.zig:24014). Повторная paired-верификация recovery-дерева:
+  coroutine_yield −12.63% vs C (seeds 1-5), +0.4..+1.6% vs approved baseline,
+  соседние workload'ы ±0%. Финальный verdict фазы — объявленной clean-C2
+  сессией (seeds 1..21) + артефактным коммитом D (полное canonical current-*
+  перегенерирование на C2; STATUS — artifact-class per tools/provenance.py
+  ARTIFACT_PATHS; FAIL-сессия C сохранена в manifest как historical).
   open-count 22→21.
 
   статический сканер `testcScriptOutBound` полностью удалён (остались только
@@ -7644,11 +7662,15 @@ provenance-расщепления review-5).
 ### P16.50-review-7: upvalue C-API contract, tname rooting, transactional continuations, exact dynamic results (2026-09-18)
 
 Фаза по owner-ledger item (переоткрыт 77105d6; open-count 21→22→закрыт→21).
-Коммиты: C = measured source (настоящий коммит; RF binary sha256
-eb188358e12f9bbe83752e38f6c569ca68543529c18714ffd827b43b155f1ade,
-верифицирован determinism-rebuild после C) → D = wrapper (полное canonical
-current-* перегенерирование на clean C + объявленная clean-C paired-seed
-perf-сессия; source_head сессии = C, source_dirty = clean).
+Коммиты: C = measured source (RF binary sha256
+eb188358e12f9bbe83752e38f6c569ca68543529c18714ffd827b43b155f1ade) →
+объявленная clean-C paired-seed сессия FAIL (coroutine_yield
++15.29..+17.31% на всех 21 seeds; записана в current-gate.json +
+append-only manifest как historical, D на C не создавался) → C2 = measured
+source (perf recovery: borrowed ResumeSpan/thread-window transport) →
+D = wrapper (полное canonical current-* перегенерирование на clean C2 +
+объявленная clean-C2 paired-seed perf-сессия; source_head сессии = C2,
+source_dirty = clean; вердикт сессии — в Perf-блоке ниже).
 
 - **BLOCKER 1 — C-API upvalue-примитивы через Lua debug library**: старые
   lua_getupvalue/lua_setupvalue делегировали в State.getupvalue/setupvalue →
@@ -7764,12 +7786,29 @@ perf-сессия; source_head сессии = C, source_dirty = clean).
   (pushcclosure pops upvalues; non-final truncation в multi-return cf);
   FailingAllocator resize_fail_index=0 arming (ArrayList growth идёт через
   remap/resize first — оба бюджета исчерпаются).
-- **Perf**: ОДНА объявленная paired-seed clean-C сессия (seeds 1..21) на
-  commit C (source_head = C, source_dirty = clean) — verdict в
-  tools/perf/current-gate.json + current-gate-manifest.json (commit D);
-  manifest append-only; baselines byte-identical (baseline-approved/
-  baseline-p15.37/core_baseline не тронуты). Полное canonical current-*
-  перегенерирование на clean C / RF binary — артефактным коммитом D.
+- **Perf**: первая объявленная paired-seed clean-C сессия (seeds 1..21) на
+  commit C (source_head = C, source_dirty = clean) — FAIL: coroutine_yield
+  +15.29..+17.31% на всех 21 seeds (per-seed paired instruction deltas vs
+  baseline-approved); root cause — per-call owned-slice alloc на yield
+  round-trip (builtinCoroutineResume копировал yielded values в heap-слайс на
+  каждый resume). Сессия честно записана в tools/perf/current-gate.json +
+  current-gate-manifest.json (2026-09-18T16:48Z, historical; manifest
+  append-only), артефактный коммит D на C не создавался.
+  **Perf recovery (C2)**: borrowed ResumeSpan/thread-window transport —
+  yield паркует значения как YieldedValues.span в parked argument window
+  приостановленного thread (vm.zig:2217+), ResumeSpan/ResumeResult
+  (vm.zig:2271-2290), builtinCoroutineResume (vm.zig:24556) возвращает
+  ResumeResult, zero-alloc opCall .span arm (vm.zig:20925: `[true] ++ window`
+  под обычным nresults-контрактом — PUC luaD_poscall/moveresults parity,
+  значения перемещаются между двумя существующими стеками без аллокации),
+  cold paths (host C-API, pcall/xpcall, wrap-iter, debug-hook) материализуют
+  owned-копию через materializeResumeSpan (vm.zig:22001), wrap_iter
+  single-copy (vm.zig:24014). Повторная paired-верификация recovery-дерева:
+  coroutine_yield −12.63% vs C (seeds 1-5), +0.4..+1.6% vs approved
+  baseline, соседние workload'ы ±0%. Финальный verdict фазы — объявленной
+  clean-C2 сессией (seeds 1..21) + полным canonical current-*
+  перегенерированием артефактным коммитом D; baselines byte-identical
+  (baseline-approved/baseline-p15.37/core_baseline не тронуты).
 - **Батарея**: 258/258 unit (Debug+ReleaseFast, 0 leaks), 23 heavy testc-лейна
   rc=0, matrix --testc 31/32 (zig_fail=0, big.lua both_fail pre-existing),
   smoke 84/84, c_api test 0 FAIL + test-diff DIFF PASS (t11 PASS), api580

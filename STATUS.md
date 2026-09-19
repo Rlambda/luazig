@@ -1,4 +1,4 @@
-> Last updated: 2026-09-19 (Architecture A1 research принят с redesign порядка; A1.0 RootScope implementation открыт)
+> Last updated: 2026-09-20 (A1.0)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -67,7 +67,7 @@ Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependen
   persistent `tobefnz`, Cell v-union отложить; первый implementation milestone
   — A1.0 RootScope + protected-boundary checkpoints. Research-пункт закрыт.
 
-- [ ] **Architecture A1.0 implementation: единый RootScope и nested protected-
+- [x] **Architecture A1.0 implementation: единый RootScope и nested protected-
   boundary checkpoints**. Заменить `TempRoots` одним scoped LIFO API для Value и
   Cell roots с typed handles, exact reserve до MayGC, debug token/depth checks и
   zero-cost NoGC path. Каждая `_setjmp` boundary сохраняет относительный root
@@ -78,6 +78,45 @@ Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependen
   Constructor/allgc/finalizer/callable semantics не менять в этом slice. После
   A1.0 следующий milestone — GC safepoints/stale-slot safety перед intrusive
   allgc cut. Open-count остаётся 26: завершённый research заменён implementation.
+
+  ЗАКРЫТО фазой A1.0 (2026-09-20): единый `RootScope` API (vm.zig:8818-8990:
+  `RootMark{values_len, cells_len, depth, token}`, `ValueRoot`/`CellRoot`
+  index-handles с read/replace, `openRootScope` reserve-first (vm.zig:8962,
+  failure — root state byte-exact), `close` LIFO через `isValidClose`,
+  `restoreRoots` относительный restore (vm.zig:9000); VM vectors
+  `gc_root_values`/`gc_root_cells` (vm.zig:4628/4637), `infraAlloc`
+  документирован NoGC-fallible/not-Lua-accounted) полностью заменил
+  `TempRoots`/`gcTempRoots` — нулевые ссылки в `src/` (grep
+  `TempRoots|gcTempRoots|gc_temp` = 0): 36 production call sites vm.zig
+  (43 scope opens: builtinRequire/opCall double-scope sites) + 97 test sites
+  vm.zig + 8 test sites c_api.zig мигрированы; hot NoGC fast paths не открывают
+  scope. Обе реальные `_setjmp` boundary — `callCFunctionWithBoundary`
+  (vm.zig:44528) и protected debug-hook boundary (vm.zig:34919) — переведены на
+  единый `ProtectedBoundary` контракт (vm.zig:44465: `protect`[mark+prev
+  boundary] → `enter`[inline, setjmp в кадре владельца] → `finish`[comptime-
+  gated assert вне ReleaseFast + безусловный defensive restoreRoots] →
+  `land`[payload-persistent → restoreRoots → prev boundary → только затем
+  status transport]); аудит всех `_longjmp`-сайтов c_api/auxwrap:
+  publish-then-jump чист; вводящий в заблуждение unwind-комментарий в шапке
+  vm.zig исправлен (`_longjmp` обходит произвольные Zig defers между callback и
+  landing pad, не только frame `lua_error`). Focused-тесты 1-10 (vm.zig:58543+:
+  LIFO nesting, stable handles across reallocation, reserve-failure byte-exact,
+  out-of-order/double close safe oracle, runtime-error/OOM/yield jump, nested
+  boundary, normal leaked scope Debug-discriminator + RF defensive restore, GC
+  visibility через оба вида handles); negative-befores (a) repeated error/yield
+  без landing `restoreRoots` — root lengths растут, (b) absolute
+  truncate-to-zero ломает nested outer root, (c) отсутствие Cell checkpoint
+  оставляет Cell root после jump — все наблюдались RED. Батарея (независимая
+  проверка): unit 326/326 Debug+ReleaseFast последовательно, 0 leaks; c_api
+  0 FAIL + DIFF PASS; matrix --testc 31/32 (zig_fail=0, big.lua both_fail
+  pre-existing); smoke 84/84; 22 тяжёлых testc-лейна rc=0; crash contract
+  0/40+; api580 GREEN 384<400 (layout gate: RootScope не добавляет полей
+  GC-объектам); owner repros 301/301/__name green. Perf: readiness-пробы
+  (interleaved, /tmp only) — centers −1.01..+0.90%, систематической ≥+3%
+  instruction-регрессии нет; вердикт обязательной объявленной paired-seed
+  clean-C сессии (seeds 1..21) — в фазовой записи A1.0 ниже (дописан
+  артефактным коммитом D). Open-count 26→25; следующий milestone — GC
+  safepoints/stale-slot safety (A1.next), не локальные симптомы review-15.
 
 - [x] **P16.50-review-15 correction (CLOSED by review-15)**: сохранить доказанный type-metatable
   lifecycle и forward-only transaction review-14, но исправить изменённые
@@ -8494,6 +8533,119 @@ source_dirty = clean; вердикт сессии — в Perf-блоке ниж�
   поведение (`true 10 20` в luazig и PUC) — ложный residual, checkTabArg
   metatable'd non-Tables для table.unpack не является расхождением; (d) pre-existing: big.lua both_fail (matrix), locals.lua
   GC-pacing dot diff, cstack.lua Debug native-stack exhaustion edge.
+
+### A1.0: единый RootScope и protected-boundary checkpoints (2026-09-20)
+
+Первый architecture-first implementation milestone (owner-approved A1
+research, redesign порядка: nested checkpoints вместо absolute запрета roots
+вокруг `_longjmp`). Коммиты: C = measured source (RF binary sha256
+2afba94f9e25ac34121b4305c8b5268a868096f0c66d91ba788e7965e90d6283 — plain
+`zig build -Doptimize=ReleaseFast`, wipe-free: sha установлен после свежей
+пересборки (rm zig-out → rebuild), последующие rebuilds воспроизводят тот же
+artifact byte-identical) → D = wrapper (полное canonical current-*
+перегенерирование на clean C + объявленная clean-C paired-seed perf-сессия;
+source_head сессии = C, source_dirty = clean; вердикт сессии — в Perf-блоке
+ниже, дописан артефактным коммитом D).
+
+- **Единый RootScope API** (vm.zig:8818-8990): `RootMark{values_len,
+  cells_len, depth, token}` (token — снапшот `gc_root_top`; глобально
+  монотонные `gc_root_seq`-токены делают один снапшот достаточным для
+  идентификации закрываемого scope), `ValueRoot`/`CellRoot` — index-handles
+  (не указатели в vector: backing vectors могут realloc между nested scopes)
+  с `read`/`replace` (replace обновляет именно укоренённый слот), `RootScope`
+  с infallible `protectValue/protectCellAssumeCapacity` (после reserve),
+  `isValidClose` (active + innermost token — тестируемый discriminator
+  double-close/out-of-order без порчи процесса) и `close` (exact LIFO,
+  восстанавливает обе длины, depth и `gc_root_top`). `openRootScope`
+  (vm.zig:8962) снимает mark и резервирует ОБЕ capacity до возврата через
+  `infraAlloc` (документирован NoGC-fallible, не Lua-accounted — reserve root
+  metadata, не Lua-visible payload); failure оставляет root state
+  byte-exact. `restoreRoots` (vm.zig:9000) — относительный restore для
+  non-local exits: инвалидирует abandoned inner scopes (их токены больше
+  никогда не валидируются как innermost — stray close детерминированно ловится
+  LIFO-проверкой), не трогает outer roots ниже mark. GC продолжает маркировать
+  оба backing vectors (`gcMarkMutableRoots`); hot NoGC path не открывает scope
+  и ничего не платит.
+- **ProtectedBoundary** (vm.zig:44465) — единый контракт на обоих реальных
+  `_setjmp` landing pads: `callCFunctionWithBoundary` (vm.zig:44528) и
+  protected debug-hook boundary (vm.zig:34919). `protect` снапшотит root mark
+  и prev `c_error_jmp` (nested C→C вызовы получают собственный landing pad);
+  `enter` — inline в кадре владельца boundary (`_setjmp` захватывает контекст
+  ВЫЗЫВАЮЩЕГО кадра — см. finding 1 ниже); `finish` (normal return): Debug
+  проверяет exact equality с boundary mark, production безусловно
+  defensively восстанавливает mark (comptime-gate, не bare assert — см.
+  finding 2 ниже) и возвращает prev boundary; `land` (`_longjmp`): до
+  декодирования `.yield`/`.thread_switch`/`.lua_err` и Runtime/OOM статуса —
+  payload уже в persistent owner (thrower's publish-then-jump), затем
+  `restoreRoots(boundary_mark)`, затем prev boundary, только затем status
+  transport. Boundary checkpoint — cleanup metadata, не второй error
+  transport. Аудит всех `_longjmp`-сайтов `c_api.zig`/auxwrap: publish-then-jump
+  везде, единственной ссылки на payload в RootScope перед прыжком нет.
+  Вводящий в заблуждение комментарий в шапке vm.zig (будто `_longjmp` обходит
+  только frame `lua_error`) заменён на точную модель: прыжок обходит
+  произвольные Zig defers между callback/API и landing pad.
+- **Миграция и delete list**: 36 production call sites vm.zig (43 scope
+  opens — `builtinRequire`/`opCall` открывают по два scope) + 97 test sites
+  vm.zig + 8 test sites c_api.zig переведены на новый API (c_api.zig
+  production-surface пуст — только миграция тестовых сайтов и переформулировка
+  одного комментария). Старый механизм удалён целиком: `TempRoots`/
+  `gcTempRoots` struct+methods, VM-поля, stats-counter
+  (`gc_temp_root_sessions` → `gc_root_scope_sessions`); нулевые ссылки:
+  `grep 'TempRoots|gcTempRoots|gc_temp' src/` = 0.
+- **Focused-тесты 1-10** (vm.zig:58543-59143+): (1) LIFO nesting — обе длины
+  точно восстановлены, slot reuse после LIFO-усечения, монотонный
+  `gc_root_seq`; (2) stable handles — nested reserve принуждает realloc
+  backing-массива (pointer inequality asserted), index-handles читают
+  корректно, `replace` перетаргетирует именно handled слот; (3) reserve
+  failure — FailingAllocator на первом reserve, root state byte-exact
+  (длины/depth/`gc_root_top`/`gc_root_seq`), VM пригодна; (4) out-of-order/
+  double close — safe oracle (`isValidClose`); (5) runtime-error jump —
+  landing восстанавливает baseline, error object сохранён, настоящий GC и
+  повторный API call проходят; (6) OOM jump — fixed MEMERRMSG identity, state
+  usable; (7) yield jump — abandoned roots очищены, payload переживает GC,
+  resume/continuation корректны; (8) nested boundary — inner roots удалены,
+  outer handles и identity сохранены; (9) normal leaked scope — Debug
+  invariant различает незакрытый scope, ReleaseFast defensive restore доказан
+  отдельно; (10) GC visibility — объект, достижимый только через каждый вид
+  handle, переживает настоящий full/minor cycle и собирается после close.
+  Negative-befores наблюдались RED: (a) без landing `restoreRoots` root
+  lengths растут после repeated error/yield; (b) absolute truncate-to-zero
+  ломает nested outer root; (c) отсутствие Cell checkpoint оставляет Cell
+  root после jump.
+- **Findings-of-the-phase (найдены и исправлены in-flight)**: (1) setjmp
+  captured-frame — `enter` обязан быть inline в кадре владельца boundary:
+  `_setjmp` захватывает SP/PC вызывающего кадра, и real call оставил бы
+  landing в мёртвом (переиспользованном) кадре `enter` к моменту прыжка;
+  (2) ReleaseFast assert UB — bare `std.debug.assert` в `finish` понижается
+  до `unreachable`, и ложный assert позволял оптимизатору удалить
+  defensive `restoreRoots` как dead code — assert comptime-gated вне
+  ReleaseFast, restore безусловен в production. Оба задокументированы в
+  коде как действующие инварианты контракта.
+- **INFO от независимой проверки (не дефекты)**: значение может быть
+  одновременно укоренено в RootScope и принадлежать постоянному владельцу —
+  двойная маркировка безвредна (mark idempotent, GC-корректность не
+  зависит от единственности пути); production-surface c_api.zig пуст (см.
+  миграцию выше).
+- **Батарея** (независимый S3): unit 326/326 Debug+ReleaseFast
+  последовательно, 0 leaks; c_api make test 0 FAIL + test-diff DIFF PASS;
+  matrix --testc 31/32 (zig_fail=0, big.lua both_fail pre-existing); smoke
+  84/84; 22 тяжёлых testc-лейна rc=0; crash contract 0/40+; api580 GREEN
+  384<400 — layout gate: RootScope не добавляет полей GC-объектам (Closure
+  40 B, Cell 40 B, CallFrame 88 B стабильны); owner repros 301/301/__name
+  green; `zig fmt --check` + `git diff --check` clean.
+- **Perf**: measured runtime затронут (root-механизм на constructor/builtin
+  путях) — readiness-пробы (interleaved vs 0a25d5a, /tmp only): centers
+  −1.01..+0.90%, систематической ≥+3% instruction-регрессии нет; canonical
+  manifest пробами не мутирован. Вердикт обязательной объявленной
+  paired-seed clean-C сессии (seeds 1..21, RUNS=21) — в Perf-блоке ниже
+  (дописан артефактным коммитом D).
+- **Residuals (honest)**: TBC-parity BLOCKER, emergency-GC HIGH
+  (stale-register deref), emergency-rescue HIGH (rescued-never-finalized),
+  table_alloc_setmetatable perf WARN и остальные пункты остаются открытыми
+  не тронутыми. Следующий milestone — **GC safepoints / stale-slot safety
+  (A1.next)** перед intrusive allgc cut, НЕ локальные симптомы review-15
+  (discarded-result/tail-call `coroutine.wrap`, `c_active_closure`,
+  emergency-rescue — acceptance cases последующих milestones по roadmap A1).
 
 ### P16.50-review-15: PUC callable ownership (2026-09-19)
 

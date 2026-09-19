@@ -458,7 +458,7 @@ pub export fn lua_error(L: ?*lua_State) noreturn {
     eth.err_is_errerr = false;
     // (d) internal cleanup, unobservable: the thrown object is ALREADY
     // installed on eth (the fold above); invokeErrfunc's error return can
-    // only be an OOM from its gcTempRoots bookkeeping — PUC's equivalent
+    // only be an OOM from its RootScope reserve — PUC's equivalent
     // root-push is a stack-slot store (infallible). A failure here skips
     // only the message handler and the SAME object still longjmps below,
     // which is exactly what PUC throws when its (infallible) setup exists.
@@ -4352,11 +4352,11 @@ test "c api lua_getupvalue OOM on result push is LUA_ERRMEM" {
     b1_oom_closure = s.stack.items[s.stack.items.len - 1].Closure;
     // Keep the closure and the name alive across the pcall (temp roots —
     // the swapped-out main stack is not GC-marked during the C call).
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(.{ .Closure = b1_oom_closure.? });
+    var scope = try vm.openRootScope(2, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(.{ .Closure = b1_oom_closure.? });
     const xkey = try vm.internStr("x");
-    try roots.add(.{ .String = xkey });
+    _ = scope.protectValueAssumeCapacity(.{ .String = xkey });
 
     lua_settop(L, 0);
     lua_pushcfunction(L, b1CfGetupvaluePushOom);
@@ -4427,9 +4427,9 @@ test "c api lua_setupvalue OOM throws LUA_ERRMEM before the store" {
     b8_owner = s.stack.items[s.stack.items.len - 1].Closure;
     const owner_cell = b8_owner.?.upvalues[0];
     const orig_value = owner_cell.value;
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(.{ .Closure = b8_owner.? });
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(.{ .Closure = b8_owner.? });
 
     // Enter generational mode: the closure + its closed cell become OLD,
     // so storing a young value fires the gen arm's reserves.
@@ -4506,16 +4506,16 @@ test "c api lua_upvaluejoin OOM throws LUA_ERRMEM before the re-point" {
     const s = api.State.fromHandle(L);
     b8_owner = s.stack.items[s.stack.items.len - 1].Closure;
     const owner_cell = b8_owner.?.upvalues[0];
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(.{ .Closure = b8_owner.? });
+    var scope = try vm.openRootScope(2, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(.{ .Closure = b8_owner.? });
     _ = luazigGcFixed(L, 7, 0); // LUA_GCGENERATIONAL
 
     try std.testing.expectEqual(@as(c_int, 0), luaL_loadstring(L, "local y = {2} return function() return y end"));
     try std.testing.expectEqual(@as(c_int, 0), lua_pcallk(L, 0, 1, 0, 0, null));
     b8_donor = s.stack.items[s.stack.items.len - 1].Closure;
     const donor_cell = b8_donor.?.upvalues[0];
-    try roots.add(.{ .Closure = b8_donor.? });
+    _ = scope.protectValueAssumeCapacity(.{ .Closure = b8_donor.? });
     try std.testing.expect(b8AgeIsYoung(donor_cell.gc_age));
 
     lua_pushcfunction(L, b8CfUpvaluejoinOom);
@@ -4561,9 +4561,9 @@ test "c api upvalue names are arena-backed: stable pointers, no query allocation
     try std.testing.expectEqual(@as(c_int, 0), lua_pcallk(L, 0, 1, 0, 0, null));
     const s = api.State.fromHandle(L);
     const closure = s.stack.items[s.stack.items.len - 1].Closure;
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(.{ .Closure = closure });
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(.{ .Closure = closure });
 
     const name1 = lua_getupvalue(L, -1, 1);
     try std.testing.expect(name1 != null);
@@ -4682,9 +4682,9 @@ fn r13StageUserdata(L: ?*lua_State) callconv(.c) c_int {
 /// metatable). __gc is the `type` builtin — deliberately silent: registered
 /// finalizers run at lua_close, and a printing __gc would write to raw
 /// stdout (corrupting the zig-build-test RPC stream in listen mode).
-fn r13NewMt(vm: *vm_mod.Vm, roots: anytype) !*vm_mod.Table {
+fn r13NewMt(vm: *vm_mod.Vm, scope: *vm_mod.Vm.RootScope) !*vm_mod.Table {
     const mt = try vm.apiNewTable();
-    try roots.add(.{ .Table = mt });
+    _ = scope.protectValueAssumeCapacity(.{ .Table = mt });
     try vm.apiSetTable(.{ .Table = mt }, .{ .String = try vm.internStr("__gc") }, .{ .Builtin = .type });
     return mt;
 }
@@ -4721,14 +4721,14 @@ test "c api lua_setmetatable OOM transaction matrix (table + userdata, every res
         const L = luaL_newstate() orelse return error.OutOfMemory;
         defer lua_close(L);
         const vm = L.vm;
-        var roots = vm.gcTempRoots();
-        defer roots.end();
+        var scope = try vm.openRootScope(1, 0);
+        defer scope.close();
         // Generational mode; a full collect promotes the rooted owner
         // OLD/black so every gen reserve arms for a young/white metatable.
         _ = luazigGcFixed(L, 7, 0); // LUA_GCGENERATIONAL
         _ = luazigGcFixed(L, 2, 0); // LUA_GCCOLLECT
         const owner = try vm.apiNewTable();
-        try roots.add(.{ .Table = owner });
+        _ = scope.protectValueAssumeCapacity(.{ .Table = owner });
         _ = luazigGcFixed(L, 2, 0); // promote the owner OLD/black
         _ = luazigGcFixed(L, 7, 0); // generational MINOR phase (non-sweep)
         r13_owner_table = owner;
@@ -4737,7 +4737,7 @@ test "c api lua_setmetatable OOM transaction matrix (table + userdata, every res
         // The real infra base (pre-arming) — restored after each edge probe.
         r13_base = vm.testc_alloc_base orelse vm.alloc;
 
-        const mt_a = try r13NewMt(vm, &roots);
+        const mt_a = try r13NewMt(vm, &scope);
         r13_mt = mt_a;
         for (0..3) |fi| {
             r13_fail_idx = fi;
@@ -4786,12 +4786,12 @@ test "c api lua_setmetatable OOM transaction matrix (table + userdata, every res
         defer lua_close(L);
         const vm = L.vm;
         const s = api.State.fromHandle(L);
-        var roots = vm.gcTempRoots();
-        defer roots.end();
+        var scope = try vm.openRootScope(1, 0);
+        defer scope.close();
         _ = luazigGcFixed(L, 7, 0); // LUA_GCGENERATIONAL
         _ = luazigGcFixed(L, 2, 0); // LUA_GCCOLLECT
         const ud = try vm.allocUserdata(0, 0);
-        try roots.add(.{ .Userdata = ud });
+        _ = scope.protectValueAssumeCapacity(.{ .Userdata = ud });
         _ = luazigGcFixed(L, 2, 0); // promote the owner OLD/black
         _ = luazigGcFixed(L, 7, 0); // generational MINOR phase (non-sweep)
         r13_owner_ud = ud;
@@ -4799,7 +4799,7 @@ test "c api lua_setmetatable OOM transaction matrix (table + userdata, every res
 
         r13_base = vm.testc_alloc_base orelse vm.alloc;
 
-        const mt_b = try r13NewMt(vm, &roots);
+        const mt_b = try r13NewMt(vm, &scope);
         r13_mt = mt_b;
         for (0..3) |fi| {
             r13_fail_idx = fi;
@@ -4865,8 +4865,8 @@ test "c api debug.setmetatable protected Lua call OOM matrix (shared transaction
         const vm = L.vm;
         const s = api.State.fromHandle(L);
 
-        var roots = vm.gcTempRoots();
-        defer roots.end();
+        var scope = try vm.openRootScope(4, 0);
+        defer scope.close();
         // Generational mode: full collects promote fresh owners OLD, arming the
         // forward barrier for a later young/white metatable.
         _ = luazigGcFixed(L, 7, 0); // LUA_GCGENERATIONAL
@@ -4877,7 +4877,7 @@ test "c api debug.setmetatable protected Lua call OOM matrix (shared transaction
         try std.testing.expectEqual(@as(c_int, 0), luaL_loadstring(L, "return function(o, m) return debug.setmetatable(o, m) end"));
         try std.testing.expectEqual(@as(c_int, 0), lua_pcallk(L, 0, 1, 0, 0, null));
         const closure = s.stack.items[s.stack.items.len - 1].Closure;
-        try roots.add(.{ .Closure = closure });
+        _ = scope.protectValueAssumeCapacity(.{ .Closure = closure });
         lua_settop(L, 0);
 
         const base = vm.testc_alloc_base orelse vm.alloc;
@@ -4885,12 +4885,12 @@ test "c api debug.setmetatable protected Lua call OOM matrix (shared transaction
         r13_fail_idx = fi;
         // Fresh OLD owner (full collect promotes the rooted table OLD).
         const owner = try vm.apiNewTable();
-        try roots.add(.{ .Table = owner });
+        _ = scope.protectValueAssumeCapacity(.{ .Table = owner });
         _ = luazigGcFixed(L, 2, 0); // LUA_GCCOLLECT → owner OLD/black
         r13_owner_table = owner;
         r13_owner_ud = null;
         // Fresh young/white metatable AFTER the owner is OLD.
-        const mt = try r13NewMt(vm, &roots);
+        const mt = try r13NewMt(vm, &scope);
         r13_mt = mt;
         // Fresh worklists + finalizer map force the transaction's reserves
         // (safe: this fresh VM holds no live registration yet).
@@ -4976,9 +4976,9 @@ test "c api lua_setmetatable type-level default arm matches PUC" {
     const vm = L.vm;
     const s = api.State.fromHandle(L);
     const mt = try vm.apiNewTable();
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(.{ .Table = mt });
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(.{ .Table = mt });
     // nil, boolean, number, string, function, thread, lightuserdata.
     lua_pushnil(L);
     lua_pushboolean(L, 1);

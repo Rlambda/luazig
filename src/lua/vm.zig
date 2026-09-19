@@ -99,19 +99,35 @@ const TmsEvent = tag_method.TmsEvent;
 //     [Zig: callCFunction → callCFunctionWithBoundary]
 //         → _setjmp(jb)                ← _longjmp lands here, returns nonzero
 //         → f(L)                       ← the C extension runs
-//             → lua_error(L)           ← Zig, defer-free; calls _longjmp
-//                 → _longjmp(jb, 1)    ← unwinds only f() and lua_error()
+//             → [arbitrary Zig depth: apiCall, resume machinery, ...]
+//                 → lua_error(L)       ← Zig; publishes the payload, then jumps
+//                     → _longjmp(jb,1) ← abandons EVERY frame below _setjmp
 //
-// The ONLY Zig frame `_longjmp` ever unwinds is `lua_error`'s own frame, which
-// is defer-free by construction. The Zig frames that own resources
-// (`callCFunctionWithBoundary`, `callCFunction`) are NOT unwound: when
-// `_longjmp` lands back at `_setjmp`, control resumes inside
-// `callCFunctionWithBoundary` on the normal code path (the `else` branch that
-// `return -1`), and every `defer`/`errdefer` in those frames runs exactly as it
-// would for an ordinary return. A separate C wrapper file would only restate
-// these two lines (`_setjmp` + `f(L)`) and add build-system indirection, so we
-// inline the boundary in Zig instead. This is the PUC-faithful shape:
-// `luaD_rawrunprotected` in PUC is itself just `setjmp` + call + return.
+// `_longjmp` restores the stack pointer and callee-saved registers to the
+// `_setjmp` point: EVERY Zig frame between the thrower and the landing pad
+// is abandoned WITHOUT running its `defer`s — not just `lua_error`'s own
+// frame. A callback that calls deeper Zig helpers (a nested pcall, the
+// coroutine resume machinery, an error handler) can jump out from
+// arbitrarily deep, skipping every defer in between. Two rules make this
+// safe:
+//
+// 1. Publish-then-jump: every `_longjmp` site must move the payload to a
+//    persistent owner (the thread err state, `th.yielded`, a parked frame)
+//    BEFORE jumping — never leave the only reference in a stack local or a
+//    RootScope (RootScope cleanup is deferred and therefore bypassed).
+// 2. Boundary checkpoints: the landing pad itself is NOT unwound — control
+//    resumes at `_setjmp` on the normal code path, and every `defer`/
+//    `errdefer` in the boundary-owning frames (`callCFunctionWithBoundary`,
+//    `callCFunction`) runs exactly as it would for an ordinary return. The
+//    shared `ProtectedBoundary` helper therefore runs at the landing
+//    FIRST — dropping abandoned inner RootScopes (`restoreRoots`, a
+//    relative restore) and reinstating the previous C boundary — BEFORE
+//    the error/yield status is decoded.
+//
+// A separate C wrapper file would only restate these two lines (`_setjmp`
+// + `f(L)`) and add build-system indirection, so we inline the boundary in
+// Zig instead. This is the PUC-faithful shape: `luaD_rawrunprotected` in
+// PUC is itself just `setjmp` + call + return.
 //
 // We use `_setjmp`/`_longjmp` rather than `setjmp`/`longjmp`: PUC Lua calls
 // `__sigsetjmp(env, 0)` (savemask = 0) so the boundary never pays for saving
@@ -3524,11 +3540,11 @@ test "string keys survive rehash+GC; equal longs compare by content" {
     const tbl = try vm.allocTableNoGc(); // GC-registered so its keys trace
     // Root the table (+ its long-key strings) across the GC cycle below —
     // a bare registered table is not otherwise reachable and would be swept.
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(.{ .Table = tbl });
-    try roots.add(.{ .String = la });
-    try roots.add(.{ .String = lb });
+    var scope = try vm.openRootScope(3, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(.{ .Table = tbl });
+    _ = scope.protectValueAssumeCapacity(.{ .String = la });
+    _ = scope.protectValueAssumeCapacity(.{ .String = lb });
     var i: usize = 0;
     while (i < 200) : (i += 1) {
         var kb: [8]u8 = undefined;
@@ -3641,9 +3657,9 @@ test "resume yield round-trip returns borrowed span rooted across GC" {
     // Root the suspended thread across the GC below (a bare registered
     // thread is only reachable through this root here — the chunk's local
     // is gone).
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(.{ .Thread = co });
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(.{ .Thread = co });
 
     // Second round-trip: the body hits the next yield — the result must be
     // the BORROWED span (the old transport was an owned [true,10,...] tuple).
@@ -4160,11 +4176,12 @@ pub const VmStats = struct {
     gc_steps_auto: u64 = 0,
     gc_steps_manual: u64 = 0,
 
-    /// TempRoots sessions opened (gcTempRoots() calls). The rawSet hot-path
-    /// rooting discipline (P16.50-review-14): a no-rehash new-key insert
-    /// must open ZERO sessions — the counter is the observable micro-proof
-    /// (default-off like every stats counter; execution never reads it).
-    gc_temp_root_sessions: u64 = 0,
+    /// RootScope sessions opened (openRootScope calls). The rawSet
+    /// hot-path rooting discipline (P16.50-review-14): a no-rehash
+    /// new-key insert must open ZERO scopes — the counter is the
+    /// observable micro-proof (default-off like every stats counter;
+    /// execution never reads it).
+    gc_root_scope_sessions: u64 = 0,
 
     // ── GC stale-entry debug counters (Task 7) ──
     // Count hits at the gcQueueScanObject/gcDrainGrayagain stale-entry
@@ -4602,21 +4619,32 @@ pub const Vm = struct {
     // traversal (gcMarkBytecodeProto), like PUC's traverseLClosure. Pins
     // therefore die with their trees instead of accumulating for the VM's
     // whole lifetime.
-    /// Temporary GC roots (Handle API). Builtins push Values here to protect
-    /// newly-allocated objects held in Zig locals across subsequent allocations
-    /// that may trigger GC. The scope helper `gcTempRoots()` snapshots the
-    /// length; `defer .end()` restores it. GC mark phase traverses this list
-    /// in `gcMarkVmRoots`. Non-moving GC → no indirection needed (unlike V8's
-    /// HandleScope), just root registration.
-    gc_temp_roots: std.ArrayListUnmanaged(Value) = .empty,
+    /// Native GC roots (RootScope API): Values held in Zig locals by
+    /// builtins across subsequent allocations that may trigger GC.
+    /// `openRootScope` reserves capacity here up front; `close`
+    /// truncates back to the open-time mark. GC mark phase traverses
+    /// this list in gcMarkMutableRoots. Non-moving GC → no indirection
+    /// needed (unlike V8's HandleScope), just root registration.
+    gc_root_values: std.ArrayListUnmanaged(Value) = .empty,
 
-    /// Temporary GC roots for CELLS (upvalue boxes). Cells are not Values
-    /// (PUC UpVal is its own object type), so they get a parallel list with
-    /// the same scope discipline. PUC anchors open upvalues on the thread
-    /// stack (they are reachable through the frame's stack slots); during
-    /// closure construction our cells live only in Zig locals, so they are
-    /// explicitly temp-rooted here until the closure owns them.
-    gc_temp_cell_roots: std.ArrayListUnmanaged(*Cell) = .empty,
+    /// Native GC roots for CELLS (upvalue boxes). Cells are not Values
+    /// (PUC UpVal is its own object type), so they get a parallel list
+    /// with the same scope discipline. PUC anchors open upvalues on the
+    /// thread stack (they are reachable through the frame's stack
+    /// slots); during closure construction our cells live only in Zig
+    /// locals, so they are explicitly rooted here until the closure
+    /// owns them.
+    gc_root_cells: std.ArrayListUnmanaged(*Cell) = .empty,
+
+    /// RootScope LIFO bookkeeping: open-scope depth (0 = no open scope),
+    /// monotonic token generator (every opened scope gets a fresh token,
+    /// so stale/abandoned scope copies can never validate as closable),
+    /// and the token of the innermost open scope (0 = none). Maintained
+    /// only by openRootScope/close/restoreRoots — never read on hot
+    /// no-scope paths.
+    gc_root_depth: usize = 0,
+    gc_root_seq: u64 = 0,
+    gc_root_top: u64 = 0,
 
     gc_running: bool = true,
     gc_mode: enum { incremental, generational } = .incremental,
@@ -6435,8 +6463,8 @@ pub const Vm = struct {
         self.gc_old1.deinit(self.alloc);
         self.gc_grayagain.deinit(self.alloc);
         self.gc_gen_threads.deinit(self.alloc);
-        self.gc_temp_roots.deinit(self.alloc);
-        self.gc_temp_cell_roots.deinit(self.alloc);
+        self.gc_root_values.deinit(self.alloc);
+        self.gc_root_cells.deinit(self.alloc);
         // Now safe to deinit string_intern — all GC objects (including
         // short strings) have been freed by drainGcRegistries above.
         self.string_intern.deinit(self.alloc);
@@ -8297,9 +8325,13 @@ pub const Vm = struct {
         // before any nil normalization; `error(nil)` hands nil to the
         // handler, only the protected RESULT becomes "<no error object>").
         var emsg: Value = if (self.errThread().err_has_obj) self.errThread().err_obj else .Nil;
-        var handler_roots = self.gcTempRoots();
-        defer handler_roots.end();
-        try handler_roots.add(emsg);
+        // One rooted slot for the CURRENT error object; each retry rebases
+        // it via replace (only the current message must stay reachable —
+        // the retry count is unbounded, so pre-reserving per retry is not
+        // expressible; the handle keeps the slot stable across reserves).
+        var handler_scope = try self.openRootScope(1, 0);
+        defer handler_scope.close();
+        const emsg_root = handler_scope.protectValueAssumeCapacity(emsg);
 
         var depth: usize = 0;
         var on_error_stack = false;
@@ -8309,7 +8341,7 @@ pub const Vm = struct {
                 // Give the handler one final chance with the C-stack-overflow
                 // object; if that call also errors, terminate with LUA_ERRERR.
                 emsg = .{ .String = try self.internStr("C stack overflow") };
-                try handler_roots.add(emsg);
+                emsg_root.replace(emsg);
                 on_error_stack = true;
             }
             depth += 1;
@@ -8331,7 +8363,7 @@ pub const Vm = struct {
                 // goes through luaG_errormsg again — retry the handler with
                 // the new (raw) error object.
                 emsg = if (self.errThread().err_has_obj) self.errThread().err_obj else .Nil;
-                try handler_roots.add(emsg);
+                emsg_root.replace(emsg);
                 continue;
             };
             // Handler succeeded — its first result replaces the error object
@@ -8777,63 +8809,202 @@ pub const Vm = struct {
         return v == .String and std.mem.indexOf(u8, v.String.bytes(), "not enough memory") != null;
     }
 
-    /// Scoped temporary GC root registration (Handle API).
-    ///
-    /// Usage:
-    ///   var roots = self.gcTempRoots();
-    ///   defer roots.end();
-    ///   try roots.add(.{ .Table = tbl });
-    ///
-    /// `add()` pushes a Value onto `gc_temp_roots`; `end()` truncates back to
-    /// the snapshot length. GC mark phase traverses all entries in
-    /// `gc_temp_roots` (via gcMarkVmRoots), so pushed objects survive sweep.
-    /// This is the non-moving-GC analog of PUC Lua's `L->stack[0..top]` —
-    /// builtins register their Zig-local temporaries as GC roots.
-    const TempRoots = struct {
-        vm: *Vm,
-        snapshot: usize,
-        cell_snapshot: usize,
+    /// Snapshot of the native root state: both backing vector lengths,
+    /// the open-scope depth, and the LIFO identity (token) of the
+    /// innermost open scope at snapshot time (0 = no open scope).
+    /// `openRootScope` stores it as the scope's close mark; protected C
+    /// boundaries take it via `rootMark()` before user code runs and
+    /// reinstate it with `restoreRoots()` on a `_longjmp` landing.
+    pub const RootMark = struct {
+        values_len: usize,
+        cells_len: usize,
+        depth: usize,
+        token: u64,
 
-        pub fn add(self: *TempRoots, v: Value) std.mem.Allocator.Error!void {
-            // infraAlloc: temp roots have no PUC allocation counterpart —
-            // PUC anchors construction intermediates on the Lua stack
-            // (allocation-free push).
-            try self.vm.gc_temp_roots.append(self.vm.infraAlloc(), v);
-        }
-
-        /// P16.50-review-5: pre-reserve capacity for `n` infallible pushes
-        /// (infra allocator — cannot re-enter the failing adapter path).
-        /// Constructors with multi-object emergency-GC windows call this
-        /// up front so every subsequent addAssumeCapacity is infallible.
-        pub fn ensure(self: *TempRoots, n: usize) std.mem.Allocator.Error!void {
-            try self.vm.gc_temp_roots.ensureUnusedCapacity(self.vm.infraAlloc(), n);
-            try self.vm.gc_temp_cell_roots.ensureUnusedCapacity(self.vm.infraAlloc(), n);
-        }
-
-        /// Infallible push after a successful `ensure`. The value is marked
-        /// as a root by gcMarkMutableRoots, so an emergency full GC at any
-        /// LATER allocation of the constructor cannot sweep it.
-        pub fn addAssumeCapacity(self: *TempRoots, v: Value) void {
-            self.vm.gc_temp_roots.appendAssumeCapacity(v);
-        }
-
-        /// Infallible cell push after a successful `ensure` (cells are not
-        /// Values — parallel list, same discipline).
-        pub fn addCellAssumeCapacity(self: *TempRoots, cell: *Cell) void {
-            self.vm.gc_temp_cell_roots.appendAssumeCapacity(cell);
-        }
-
-        pub fn end(self: *TempRoots) void {
-            self.vm.gc_temp_roots.shrinkRetainingCapacity(self.snapshot);
-            self.vm.gc_temp_cell_roots.shrinkRetainingCapacity(self.cell_snapshot);
+        /// Exact-equality test against another snapshot: the protected
+        /// boundaries' normal-return Debug invariant (a callback must
+        /// leave the root state EXACTLY at the mark it started from).
+        pub fn eql(self: RootMark, other: RootMark) bool {
+            return self.values_len == other.values_len and
+                self.cells_len == other.cells_len and
+                self.depth == other.depth and
+                self.token == other.token;
         }
     };
 
-    /// Pub (review-7 B1): c_api.zig tests root construction intermediates
-    /// across C-call windows the same way vm.zig constructors do.
-    pub fn gcTempRoots(self: *Vm) TempRoots {
-        if (self.stats.enabled) self.stats.gc_temp_root_sessions += 1;
-        return .{ .vm = self, .snapshot = self.gc_temp_roots.items.len, .cell_snapshot = self.gc_temp_cell_roots.items.len };
+    /// Handle to one rooted value slot: an INDEX into the VM's root
+    /// vector plus the owning scope's token — never a pointer into the
+    /// vector, because a nested scope's reserve may reallocate the
+    /// backing storage between this handle's creation and use. The
+    /// rooted copy does NOT track later writes to the original Zig
+    /// local: a call site that rebinds its local must `replace` the
+    /// slot explicitly.
+    pub const ValueRoot = struct {
+        vm: *Vm,
+        scope_token: u64,
+        index: usize,
+
+        pub fn read(self: ValueRoot) Value {
+            return self.vm.gc_root_values.items[self.index];
+        }
+
+        /// Update exactly this rooted slot (e.g. an error-handler
+        /// message rebased on each retry — only the current object needs
+        /// to stay reachable, one slot suffices).
+        pub fn replace(self: ValueRoot, v: Value) void {
+            self.vm.gc_root_values.items[self.index] = v;
+        }
+    };
+
+    /// Handle to one rooted cell slot (cells are not Values — parallel
+    /// backing vector, same index+identity contract as ValueRoot).
+    pub const CellRoot = struct {
+        vm: *Vm,
+        scope_token: u64,
+        index: usize,
+
+        pub fn read(self: CellRoot) *Cell {
+            return self.vm.gc_root_cells.items[self.index];
+        }
+
+        pub fn replace(self: CellRoot, cell: *Cell) void {
+            self.vm.gc_root_cells.items[self.index] = cell;
+        }
+    };
+
+    /// Scoped native GC root registration (RootScope API).
+    ///
+    /// Usage:
+    ///   var scope = try self.openRootScope(2, 0);
+    ///   defer scope.close();
+    ///   _ = scope.protectValueAssumeCapacity(v);
+    ///
+    /// `openRootScope` snapshots the root state AND reserves capacity in
+    /// BOTH backing vectors before returning, so every `protect*` after
+    /// it is infallible — a construction sequence can never lose an
+    /// intermediate to a fallible push. `close` restores both lengths and
+    /// the scope depth (strict LIFO). GC mark traverses both vectors
+    /// (gcMarkMutableRoots), so protected objects survive sweep. This is
+    /// the non-moving-GC analog of PUC Lua's `L->stack[0..top]`
+    /// anchoring: PUC pushes construction intermediates onto the Lua
+    /// stack (an allocation-free push); we register them in a VM-owned
+    /// vector instead.
+    ///
+    /// Scopes are synchronous and strictly LIFO: a scope must not be
+    /// carried across a yield, a thread switch, or an error jump — a
+    /// C-boundary landing pad cleans up abandoned inner scopes with
+    /// `restoreRoots(boundary_mark)` (a relative restore: outer roots
+    /// below the mark are untouched).
+    pub const RootScope = struct {
+        vm: *Vm,
+        mark: RootMark,
+        token: u64,
+        active: bool = true,
+
+        /// Infallible value root; requires the capacity reserved by
+        /// `openRootScope`. The value is marked by gcMarkMutableRoots, so
+        /// an emergency full GC at any LATER allocation cannot sweep it.
+        pub fn protectValueAssumeCapacity(self: *RootScope, v: Value) ValueRoot {
+            const index = self.vm.gc_root_values.items.len;
+            self.vm.gc_root_values.appendAssumeCapacity(v);
+            return .{ .vm = self.vm, .scope_token = self.token, .index = index };
+        }
+
+        /// Infallible cell root (cells are not Values — parallel vector,
+        /// same discipline).
+        pub fn protectCellAssumeCapacity(self: *RootScope, cell: *Cell) CellRoot {
+            const index = self.vm.gc_root_cells.items.len;
+            self.vm.gc_root_cells.appendAssumeCapacity(cell);
+            return .{ .vm = self.vm, .scope_token = self.token, .index = index };
+        }
+
+        /// Debug discriminator for close-order violations: true iff this
+        /// scope is active and is currently the innermost open scope.
+        /// Exposed so tests can CHECK a double-close / out-of-order
+        /// close WITHOUT triggering the close panic (a panic would take
+        /// down the whole unit process).
+        pub fn isValidClose(self: *const RootScope) bool {
+            return self.active and
+                self.vm.gc_root_depth == self.mark.depth + 1 and
+                self.vm.gc_root_top == self.token;
+        }
+
+        /// Close the scope: restore both vector lengths and the depth to
+        /// the open-time mark, then invalidate the scope. Debug builds
+        /// deterministically catch double-close and out-of-order close
+        /// (isValidClose); ReleaseFast restores without the checks — an
+        /// order violation is a caller bug caught in Debug, and the hot
+        /// no-scope paths never reach this function.
+        pub fn close(self: *RootScope) void {
+            std.debug.assert(self.isValidClose()); // double-close / LIFO violation
+            self.vm.gc_root_values.shrinkRetainingCapacity(self.mark.values_len);
+            self.vm.gc_root_cells.shrinkRetainingCapacity(self.mark.cells_len);
+            self.vm.gc_root_depth = self.mark.depth;
+            // Reinstate the token that was innermost when this scope
+            // opened (recorded in its mark): the enclosing scope (if
+            // any) becomes closable again, this token never validates
+            // again (monotonic gc_root_seq).
+            self.vm.gc_root_top = self.mark.token;
+            self.active = false;
+        }
+    };
+
+    /// Open a RootScope: snapshot the mark, then reserve
+    /// `value_capacity` value slots and `cell_capacity` cell slots
+    /// BEFORE the caller's first managed allocation / MayGC window, so
+    /// every subsequent `protect*` is infallible. The reserves go
+    /// through `infraAlloc` — NoGC (cannot re-enter the collector) but
+    /// fallible and NOT Lua-accounted: allowed for root metadata,
+    /// never for Lua-visible payload (`vm.alloc` counts as MayGC unless
+    /// proven otherwise). On failure the root state is byte-exact
+    /// (lengths, depth and tokens untouched; only unobservable capacity
+    /// may have grown).
+    pub fn openRootScope(self: *Vm, value_capacity: usize, cell_capacity: usize) std.mem.Allocator.Error!RootScope {
+        if (self.stats.enabled) self.stats.gc_root_scope_sessions += 1;
+        const mark = RootMark{
+            .values_len = self.gc_root_values.items.len,
+            .cells_len = self.gc_root_cells.items.len,
+            .depth = self.gc_root_depth,
+            .token = self.gc_root_top,
+        };
+        try self.gc_root_values.ensureUnusedCapacity(self.infraAlloc(), value_capacity);
+        try self.gc_root_cells.ensureUnusedCapacity(self.infraAlloc(), cell_capacity);
+        const token = self.gc_root_seq + 1;
+        self.gc_root_seq = token;
+        self.gc_root_depth += 1;
+        self.gc_root_top = token;
+        return .{ .vm = self, .mark = mark, .token = token };
+    }
+
+    /// Read-only root-state snapshot for protected C boundaries: taken
+    /// BEFORE the user C code runs (a boundary mark sits on top of any
+    /// outer roots); the `_longjmp` landing pad calls
+    /// `restoreRoots(mark)` before decoding the status.
+    pub fn rootMark(self: *const Vm) RootMark {
+        return .{
+            .values_len = self.gc_root_values.items.len,
+            .cells_len = self.gc_root_cells.items.len,
+            .depth = self.gc_root_depth,
+            .token = self.gc_root_top,
+        };
+    }
+
+    /// Non-local-exit cleanup (C `_longjmp` landing): restore both
+    /// vector lengths and the depth to `mark`, abandoning every scope
+    /// opened above it. The abandoned scopes' Zig frames were bypassed
+    /// by the jump; their tokens can never validate as innermost again
+    /// (gc_root_top is reinstated to the mark's token and tokens are
+    /// monotonic), so a stray `close` of an abandoned scope fails the
+    /// LIFO check deterministically. Outer roots below the mark are
+    /// untouched.
+    pub fn restoreRoots(self: *Vm, mark: RootMark) void {
+        std.debug.assert(self.gc_root_values.items.len >= mark.values_len);
+        std.debug.assert(self.gc_root_cells.items.len >= mark.cells_len);
+        std.debug.assert(self.gc_root_depth >= mark.depth);
+        self.gc_root_values.shrinkRetainingCapacity(mark.values_len);
+        self.gc_root_cells.shrinkRetainingCapacity(mark.cells_len);
+        self.gc_root_depth = mark.depth;
+        self.gc_root_top = mark.token;
     }
 
     // === FINALIZER REGISTRATION INVARIANT ===
@@ -9239,7 +9410,7 @@ pub const Vm = struct {
     /// construction: api.State.makeCclosure (lua_pushcclosure /
     /// luaL_setfuncs) delegates here, and coroutine.wrap's auxwrap
     /// closure is built by it too. The CALLER roots the `values` across
-    /// this call (gcTempRoots / stack slots — PUC roots them on L->stack).
+    /// this call (RootScope / stack slots — PUC roots them on L->stack).
     pub fn allocCclosure(
         self: *Vm,
         fn_: ?*const fn (?*lua_State) callconv(.c) c_int,
@@ -9252,16 +9423,15 @@ pub const Vm = struct {
         // emergency GC, and until the closure exists the cells are
         // reachable only from this Zig frame (PUC anchors them on
         // L->stack for the whole construction).
-        var roots = self.gcTempRoots();
-        defer roots.end();
-        try roots.ensure(n + 1);
+        var scope = try self.openRootScope(1, n);
+        defer scope.close();
         if (n == 0) {
             const cl = try self.alloc.create(Closure);
             cl.* = .{ .upvalues = &.{}, .c_func = fn_ };
             self.gcRegisterCommit(.{ .closure = cl });
             self.gcNoteAlloc(@sizeOf(Closure));
             self.testc_obj_functions += 1;
-            roots.addAssumeCapacity(.{ .Closure = cl });
+            _ = scope.protectValueAssumeCapacity(.{ .Closure = cl });
             return cl;
         }
         const upv_cells = try self.alloc.alloc(*Cell, n);
@@ -9282,7 +9452,7 @@ pub const Vm = struct {
             cell.* = .{ .value = v };
             self.gcRegisterCommit(.{ .cell = cell });
             self.gcNoteAlloc(@sizeOf(Cell));
-            roots.addCellAssumeCapacity(cell);
+            _ = scope.protectCellAssumeCapacity(cell);
             upv_cells[i] = cell;
             created += 1;
         }
@@ -9291,7 +9461,7 @@ pub const Vm = struct {
         self.gcRegisterCommit(.{ .closure = cl });
         self.gcNoteAlloc(@sizeOf(Closure) + n * @sizeOf(*Cell));
         self.testc_obj_functions += 1;
-        roots.addAssumeCapacity(.{ .Closure = cl });
+        _ = scope.protectValueAssumeCapacity(.{ .Closure = cl });
         return cl;
     }
     /// PUC `checkGC(L,c)` analogue: conditionally run a GC step after an
@@ -9354,9 +9524,9 @@ pub const Vm = struct {
             // not yet been returned to the caller and therefore is not in
             // a Lua root. This is the non-moving equivalent of keeping it
             // on L's stack while the collector runs.
-            var roots = self.gcTempRoots();
-            defer roots.end();
-            try roots.add(.{ .Table = t });
+            var scope = try self.openRootScope(1, 0);
+            defer scope.close();
+            _ = scope.protectValueAssumeCapacity(.{ .Table = t });
             // PUC checkGC(L,c): `savepc(ci)` is the `p` argument of
             // luaC_condGC — evaluated ONLY when a GC step will actually
             // run (this branch). Publish the dispatch pc to the heap
@@ -11070,10 +11240,10 @@ pub const Vm = struct {
         // Root the interned event string across the continuation allocation
         // below (native arrays are invisible to the GC — see builtinLoadfile's
         // note; an emergency GC during alloc.create would free it).
-        var roots = self.gcTempRoots();
-        defer roots.end();
+        var scope = try self.openRootScope(1, 0);
+        defer scope.close();
         argv[0] = .{ .String = try self.internStr(event) };
-        try roots.add(argv[0]);
+        _ = scope.protectValueAssumeCapacity(argv[0]);
         var argc: usize = 1;
         var hook_line = line;
         if (hook_line == null and std.mem.eql(u8, event, "line") and exec_frames.len() != 0) {
@@ -11637,10 +11807,14 @@ pub const Vm = struct {
         remaining_in: usize,
         acc_in: Value,
     ) DispatchError!BytecodeConcatOutcome {
-        var roots = self.gcTempRoots();
-        defer roots.end();
-        for (values) |value| try roots.add(value);
-        try roots.add(acc_in);
+        // Capacity: every operand + the accumulator + one slot per direct
+        // concat step (each step consumes one operand, so at most
+        // values.len steps) — the same accumulate-until-close rooting the
+        // old fallible adds provided, reserved up front.
+        var scope = try self.openRootScope(2 * values.len + 1, 0);
+        defer scope.close();
+        for (values) |value| _ = scope.protectValueAssumeCapacity(value);
+        _ = scope.protectValueAssumeCapacity(acc_in);
 
         var owns_values = true;
         defer if (owns_values) self.alloc.free(values);
@@ -11652,7 +11826,7 @@ pub const Vm = struct {
             if (isDirectConcatOperand(lhs) and isDirectConcatOperand(acc)) {
                 var pair = [_]Value{ lhs, acc };
                 acc = try self.concatValuesDirect(pair[0..]);
-                try roots.add(acc);
+                _ = scope.protectValueAssumeCapacity(acc);
                 remaining -= 1;
                 continue;
             }
@@ -11718,7 +11892,7 @@ pub const Vm = struct {
                 },
                 else => unreachable,
             };
-            try roots.add(acc);
+            _ = scope.protectValueAssumeCapacity(acc);
             remaining -= 1;
         }
 
@@ -11739,7 +11913,7 @@ pub const Vm = struct {
         const acc = if (ret.len == 0) Value.Nil else ret[0];
 
         // P16.50-review-8 §3.2: adopt the child's return slice at entry —
-        // the temp-roots reserves below are fallible and until the explicit
+        // the RootScope reserve below is fallible and until the explicit
         // free this errdefer is the slice's single owner (the old code
         // leaked it when a roots.add failed).
         var ret_owned = true;
@@ -11748,10 +11922,10 @@ pub const Vm = struct {
         // Root the continuation while detaching it from the parent.  The next
         // bytecode metamethod, if any, installs a fresh pending owner before
         // this function returns.
-        var roots = self.gcTempRoots();
-        defer roots.end();
-        for (cont.values) |value| try roots.add(value);
-        try roots.add(acc);
+        var scope = try self.openRootScope(cont.values.len + 1, 0);
+        defer scope.close();
+        for (cont.values) |value| _ = scope.protectValueAssumeCapacity(value);
+        _ = scope.protectValueAssumeCapacity(acc);
         ret_owned = false;
         if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
 
@@ -12037,7 +12211,7 @@ pub const Vm = struct {
         };
 
         // P16.50-review-8 §3.1: adopt the callback return slice from entry —
-        // the gcTempRoots reserves below are fallible, and until
+        // the RootScope reserve below is fallible, and until
         // applyBytecodeGsubCallbackReturn takes it (its own defer frees it on
         // every exit) nothing else owns the slice. Disarmed exactly at that
         // handover; on .pushed/.final the callee has already consumed it.
@@ -12048,12 +12222,14 @@ pub const Vm = struct {
             }
         };
 
-        var roots = self.gcTempRoots();
-        defer roots.end();
-        try roots.add(state.subject);
-        try roots.add(state.pattern);
-        try roots.add(state.replacement);
-        if (callback_ret) |values| for (values) |value| try roots.add(value);
+        var scope = try self.openRootScope(3 + (if (callback_ret) |values| values.len else 0), 0);
+        defer scope.close();
+        _ = scope.protectValueAssumeCapacity(state.subject);
+        _ = scope.protectValueAssumeCapacity(state.pattern);
+        _ = scope.protectValueAssumeCapacity(state.replacement);
+        if (callback_ret) |values| {
+            for (values) |value| _ = scope.protectValueAssumeCapacity(value);
+        }
 
         callback_ret_owned = false;
         if (callback_ret) |values| try self.applyBytecodeGsubCallbackReturn(state, values);
@@ -12957,9 +13133,9 @@ pub const Vm = struct {
         ret: []Value,
         cont: *BytecodeCoroutineContinuation,
     ) DispatchError!?[]Value {
-        var result_roots = self.gcTempRoots();
-        defer result_roots.end();
-        for (ret) |value| try result_roots.add(value);
+        var result_scope = try self.openRootScope(ret.len, 0);
+        defer result_scope.close();
+        for (ret) |value| _ = result_scope.protectValueAssumeCapacity(value);
 
         const pending = self.getPendingCallConst(exec_frames.getPtr(parent_index).pending_call_index) orelse unreachable;
         // P15.51n: Snapshot callee before reentrant operations.
@@ -14612,7 +14788,7 @@ pub const Vm = struct {
         ret: []Value,
     ) DispatchError!?[]Value {
         // P16.50-review-8 §3.2: adopt the wrapped result slice at entry —
-        // the temp-roots reserves and the outer-layer wrap allocs below are
+        // the RootScope reserve and the outer-layer wrap allocs below are
         // fallible, and until each handover (beginBytecodeClose post /
         // hook post / applyBytecodePendingResults) this errdefer is the
         // slice's single owner. The tag moves to each re-wrapped slice and
@@ -14620,14 +14796,18 @@ pub const Vm = struct {
         var completed_ret = ret;
         var owned_ret = true;
         errdefer if (owned_ret and !self.returnSliceIsOwned(completed_ret)) self.alloc.free(completed_ret);
-        var result_roots = self.gcTempRoots();
-        defer result_roots.end();
-        for (completed_ret) |value| try result_roots.add(value);
-
         const pending = self.getPendingCallConst(exec_frames.getPtr(parent_index).pending_call_index) orelse unreachable;
         // P15.51n: Snapshot callee and completion before reentrant operations.
         const pending_callee = pending.callee;
         const protection = pending.protection orelse unreachable;
+        // Capacity: the initial slice + every re-wrapped slice (after layer
+        // i the slice has ret.len + i values, all re-protected) — the exact
+        // accumulate semantics of the old fallible adds, reserved up front:
+        // ret.len + L*ret.len + L*(L+1)/2.
+        const nlayers = protection.outer_layers.len;
+        var result_scope = try self.openRootScope(completed_ret.len + nlayers * ret.len + nlayers * (nlayers + 1) / 2, 0);
+        defer result_scope.close();
+        for (completed_ret) |value| _ = result_scope.protectValueAssumeCapacity(value);
         var outer_index = protection.outer_layers.len;
         while (outer_index > 0) {
             outer_index -= 1;
@@ -14636,7 +14816,7 @@ pub const Vm = struct {
             @memcpy(wrapped[1..], completed_ret);
             self.alloc.free(completed_ret);
             completed_ret = wrapped;
-            for (completed_ret) |value| try result_roots.add(value);
+            for (completed_ret) |value| _ = result_scope.protectValueAssumeCapacity(value);
         }
         self.finishBytecodeProtectedCall(protection);
         // P16.50-review-6: the protection struct is heap-allocated in
@@ -14730,9 +14910,9 @@ pub const Vm = struct {
         parent_index: usize,
         error_value: Value,
     ) DispatchError!?[]Value {
-        var error_root = self.gcTempRoots();
-        defer error_root.end();
-        try error_root.add(error_value);
+        var error_scope = try self.openRootScope(2, 0);
+        defer error_scope.close();
+        _ = error_scope.protectValueAssumeCapacity(error_value);
         // P16.31 Cut 3: pcall recovery-boundary close (PUC luaD_pcall's
         // catch: luaD_closeprotected(L, old_top, status), ldo.c:1092). The
         // error unwind already popped every frame above the protected
@@ -14753,7 +14933,7 @@ pub const Vm = struct {
                 const final_err = try self.closeTbcRegion(owner, protection.tbc_chain_base, null, err_arg, 2, false, &.{});
                 var effective_error = error_value;
                 if (final_err) |fe| effective_error = fe;
-                try error_root.add(effective_error);
+                _ = error_scope.protectValueAssumeCapacity(effective_error);
                 // infraAlloc (PUC stack-slot parity): the pcall FAILURE tuple
                 // is recovery transport — PUC's luaD_poscall moves the error
                 // object into the caller's pre-reserved stack slots, so the
@@ -15782,7 +15962,7 @@ pub const Vm = struct {
         // the active thread's frames (a coroutine switch makes the
         // target active before re-driving continuations). Return completions run on the active thread.
         const th = self.activeBytecodeThread();
-        // P15.51j: gcTempRoots is NOT needed on the common path. After
+        // P15.51j: a RootScope is NOT needed on the common path. After
         // popBytecodeExecFrame the child's register window is dead, but:
         //  - closeBytecodeUpvaluesFrom fires write barriers only (gcMarkValue
         //    queues objects; it does not run a full GC cycle).
@@ -15791,11 +15971,11 @@ pub const Vm = struct {
         //  - applyBytecodeResultsDirect copies ret into the parent's registers
         //    (a GC root via bc_stack) before any Lua code can run.
         //  - Paths that DO run Lua code (concat, gsub, protection) have their
-        //    own gcTempRoots. Paths that free ret before running Lua (hook,
+        //    own RootScope. Paths that free ret before running Lua (hook,
         //    close) don't need protection either.
-        //  - The ONLY path that needs gcTempRoots is tail_return, where
+        //  - The ONLY path that needs a RootScope is tail_return, where
         //    beginBytecodeClose runs __close metamethods while ret is still
-        //    alive. gcTempRoots is added there.
+        //    alive. A RootScope is opened there.
         //
         const child_idx = exec_frames.len() - 1;
         const child_frame = exec_frames.getConstPtr(child_idx);
@@ -15808,7 +15988,7 @@ pub const Vm = struct {
         // publish infallibly. Until then, this errdefer is the slice's
         // single function-level owner across every fallible operation
         // below (the P16.50-review-9 close reserve, nil padding alloc,
-        // protection wrap alloc, temp-roots reserve, frame growth):
+        // protection wrap alloc, RootScope reserve, frame growth):
         //   - `borrowed_scratch` (bc_return_scratch, OP_RETURN0/1 fast path)
         //     is statically VM-owned — never freed (owned_ret == null);
         //   - an owned heap slice is freed exactly once on failure;
@@ -15979,11 +16159,11 @@ pub const Vm = struct {
                     // which can trigger GC via condGcFromDispatch. The child
                     // frame is already popped, so completed_ret's values are
                     // only reachable through this slice — protect them.
-                    // The temp-roots reserve is fallible: the errdefer above
+                    // The RootScope reserve is fallible: the errdefer above
                     // owns the slice across it.
-                    var tail_roots = self.gcTempRoots();
-                    defer tail_roots.end();
-                    for (completed_ret) |value| try tail_roots.add(value);
+                    var tail_scope = try self.openRootScope(completed_ret.len, 0);
+                    defer tail_scope.close();
+                    for (completed_ret) |value| _ = tail_scope.protectValueAssumeCapacity(value);
                     self.clearPendingCall(exec_frames.getPtr(parent_index));
                     // beginBytecodeClose adopts the post payload on every
                     // path (its errdefer frees it pre-publish; the pending
@@ -19053,15 +19233,15 @@ pub const Vm = struct {
                             // would overwrite extra arg #1 with the table
                             // itself (the `...t` slot-1 corruption:
                             // t[1] == t). Our analogue of PUC's temporary
-                            // L->top slot is gcTempRoots: the table survives
+                            // L->top slot is a RootScope: the table survives
                             // every emergency GC from creation on
-                            // (gcMarkVmRoots marks gc_temp_roots), while the
+                            // (gcMarkMutableRoots marks gc_root_values), while the
                             // source argument range stays intact until the
                             // copy is done.
                             const t = try self.allocTableEphemeral();
-                            var roots = self.gcTempRoots();
-                            defer roots.end();
-                            try roots.add(.{ .Table = t });
+                            var scope = try self.openRootScope(1, 0);
+                            defer scope.close();
+                            _ = scope.protectValueAssumeCapacity(.{ .Table = t });
                             // PUC model (VATAB): extra args at base+numparams
                             // P15.51l: nextraargs/reg_top are rare fields,
                             // read from / written to the CallFrame.
@@ -21479,11 +21659,11 @@ pub const Vm = struct {
                         // Root the values across the sync return-hook portion:
                         // the hook is Lua code that can allocate and GC; the
                         // heap slice is invisible to the collector without this
-                        // (TempRoots uses infraAlloc — countdown-safe, so an
+                        // (RootScope uses infraAlloc — countdown-safe, so an
                         // armed countdown cannot kill the hook arm itself).
-                        var roots = self.gcTempRoots();
-                        defer roots.end();
-                        for (vals) |v| try roots.add(v);
+                        var scope = try self.openRootScope(vals.len, 0);
+                        defer scope.close();
+                        for (vals) |v| _ = scope.protectValueAssumeCapacity(v);
                         // P16.35 Cut 3: gate the return-event hook probes by the
                         // cached hooks-active flag (see the window path below).
                         if (self.hooks_active_cached) {
@@ -21568,11 +21748,11 @@ pub const Vm = struct {
                             // Root the copy across the hook machinery: the
                             // hook is Lua code that can allocate and GC; the
                             // heap slice is invisible to the collector
-                            // without this (TempRoots uses infraAlloc —
+                            // without this (RootScope uses infraAlloc —
                             // countdown-safe).
-                            var roots = self.gcTempRoots();
-                            defer roots.end();
-                            for (owned_vals) |v| try roots.add(v);
+                            var scope = try self.openRootScope(owned_vals.len, 0);
+                            defer scope.close();
+                            for (owned_vals) |v| _ = scope.protectValueAssumeCapacity(v);
                             const hook_pushed = self.tryPushBytecodeDebugHook(
                                 ctx.exec_frames,
                                 ctx.frame_index,
@@ -24570,7 +24750,7 @@ pub const Vm = struct {
     /// makes the thread collectable.
     ///
     /// Transactional (P16.50-review-15 BLOCKER 1): the thread is created
-    /// and rooted (gcTempRoots — PUC roots it on L->stack between
+    /// and rooted (RootScope — PUC roots it on L->stack between
     /// cocreate and pushcclosure), the closure is built by the canonical
     /// `allocCclosure`, and a closure-construction failure rolls the
     /// thread back (unregister + free — registries and accounting return
@@ -24593,10 +24773,9 @@ pub const Vm = struct {
         // allocation inside allocCclosure can fire an emergency GC, and
         // the thread is otherwise only in a Zig local (PUC: it sits on
         // L->stack the whole time).
-        var roots = self.gcTempRoots();
-        defer roots.end();
-        try roots.ensure(1);
-        roots.addAssumeCapacity(.{ .Thread = th });
+        var scope = try self.openRootScope(1, 0);
+        defer scope.close();
+        _ = scope.protectValueAssumeCapacity(.{ .Thread = th });
         errdefer {
             self.gcUnregisterObjectRollback(.{ .thread = th });
             self.gcNoteFree(@sizeOf(Thread));
@@ -27693,9 +27872,9 @@ pub const Vm = struct {
             }
         }
 
-        for (self.gc_temp_roots.items) |value| try self.gcMarkValue(value);
-        // Cells (upvalue boxes) under construction — parallel temp-root list.
-        for (self.gc_temp_cell_roots.items) |cell| try self.gcQueueScanCell(cell);
+        for (self.gc_root_values.items) |value| try self.gcMarkValue(value);
+        // Cells (upvalue boxes) under construction — parallel root list.
+        for (self.gc_root_cells.items) |cell| try self.gcQueueScanCell(cell);
         if (self.debug_transfer_values) |values| for (values) |value| try self.gcMarkValue(value);
         if (self.errThread().err_has_obj) try self.gcMarkValue(self.errThread().err_obj);
         // c_error_value holds the object thrown by lua_error between the
@@ -30113,7 +30292,7 @@ pub const Vm = struct {
 
         // Temporary GC roots (Handle API): Values held in Zig locals by
         // builtins. These are the analog of PUC Lua's L->stack temporaries.
-        for (self.gc_temp_roots.items) |rv| {
+        for (self.gc_root_values.items) |rv| {
             try self.gcMarkValue(rv);
         }
 
@@ -31132,15 +31311,14 @@ pub const Vm = struct {
         // them and the errdefers then double-freed. The PUC-faithful fix
         // mirrors luaF_newLclosure/luaF_initupvals running with the closure
         // anchored on the caller's Lua stack: reserve ALL registry capacity
-        // and temp-root space up front (infra allocator — PUC's allgc link
+        // and root space up front (infra allocator — PUC's allgc link
         // and stack push are allocation-free), then create → root →
         // register each object with every step infallible until the caller
         // anchors the result.
         const nups = proto.upvalues.len;
         try self.gcPrepareRegister(nups + 1);
-        var roots = self.gcTempRoots();
-        defer roots.end();
-        try roots.ensure(nups + 1);
+        var scope = try self.openRootScope(1, nups);
+        defer scope.close();
 
         const cells = try self.alloc.alloc(*Cell, nups);
         var n_cells: usize = 0;
@@ -31155,9 +31333,9 @@ pub const Vm = struct {
                 // created so far — unregister from the GC list, credit the
                 // accounting, free the object — then the array. No leak, no
                 // dangling registry entry. (Cells created here are
-                // temp-ROOTED, so an emergency GC at a later allocation
-                // cannot have swept them; the stale root entries are
-                // truncated by roots.end().)
+                // root-SCOPED, so an emergency GC at a later allocation
+                // cannot have swept them; the scope close truncates the
+                // stale root entries.)
                 for (cells[0..n_cells]) |c| {
                     self.gcUnregisterObjectRollback(.{ .cell = c });
                     self.gcNoteFree(@sizeOf(Cell));
@@ -31173,9 +31351,9 @@ pub const Vm = struct {
             // links into the intrusive allgc list — allocation-free).
             self.gcRegisterCommit(.{ .cell = cell });
             self.gcNoteAlloc(@sizeOf(Cell));
-            // Infallible: temp-root space reserved above. From this point
+            // Infallible: root space reserved above. From this point
             // the cell survives any emergency GC.
-            roots.addCellAssumeCapacity(cell);
+            _ = scope.protectCellAssumeCapacity(cell);
             slot.* = cell;
             n_cells += 1;
         }
@@ -31214,12 +31392,12 @@ pub const Vm = struct {
         // Retain the tree owner (P16.16 C2/T4.2: derived from proto, no
         // separate field — see the Closure doc comment).
         _ = self.retainTreeForClosure(proto);
-        // Infallible (capacity reserved above). The closure is temp-rooted
+        // Infallible (capacity reserved above). The closure is root-scoped
         // immediately after, so the fallible resolveTreeConstants below —
         // the old emergency-GC window — can no longer sweep it or its cells.
         self.gcRegisterCommit(.{ .closure = cl });
         cl_registered = true;
-        roots.addAssumeCapacity(.{ .Closure = cl });
+        _ = scope.protectValueAssumeCapacity(.{ .Closure = cl });
         self.testc_obj_functions += 1;
         // Charge the FULL closure allocation: struct + upvalue pointer
         // array (PUC luaF_newLclosure allocates LClosure + nupvals*Upval*
@@ -31478,13 +31656,13 @@ pub const Vm = struct {
         // "minimum allocations for dofile" — stripChunkPrefix then read
         // the freed string's poison bytes). Root both strings for the
         // duration, exactly PUC's stack-rooting.
-        var roots = self.gcTempRoots();
-        defer roots.end();
+        var scope = try self.openRootScope(2, 0);
+        defer scope.close();
         var load_args: [4]Value = .{ .Nil, .Nil, .Nil, .Nil };
         load_args[0] = .{ .String = try self.internStr(source.bytes) };
-        try roots.add(load_args[0]);
+        _ = scope.protectValueAssumeCapacity(load_args[0]);
         load_args[1] = .{ .String = try self.internStr(source.name) };
-        try roots.add(load_args[1]);
+        _ = scope.protectValueAssumeCapacity(load_args[1]);
         var n: usize = 2;
         if (args.len > 1) {
             load_args[2] = args[1];
@@ -31663,13 +31841,12 @@ pub const Vm = struct {
         // createBytecodeChunkClosure (see the full rationale there): any
         // vm.alloc failure can run an emergency full GC that sweeps
         // registered-but-unrooted objects, so ALL registry capacity and
-        // temp-root space is reserved up front (infra allocator) and every
+        // root space is reserved up front (infra allocator) and every
         // create → root → register step after that is infallible.
         const nups: usize = proto.upvalues.len;
         try self.gcPrepareRegister(nups + 1);
-        var roots = self.gcTempRoots();
-        defer roots.end();
-        try roots.ensure(nups + 1);
+        var scope = try self.openRootScope(1, nups);
+        defer scope.close();
 
         const cl = try self.alloc.create(Closure);
         var cl_registered = false;
@@ -31700,8 +31877,8 @@ pub const Vm = struct {
             // Infallible: registry capacity reserved above.
             self.gcRegisterCommit(.{ .cell = c });
             self.gcNoteAlloc(@sizeOf(Cell));
-            // Infallible: temp-root space reserved above.
-            roots.addCellAssumeCapacity(c);
+            // Infallible: root space reserved by the scope above.
+            _ = scope.protectCellAssumeCapacity(c);
             cells[i] = c;
             n_cells += 1;
         }
@@ -31711,10 +31888,10 @@ pub const Vm = struct {
         };
         // Retain the tree owner (P16.16 C2/T4.2: derived from proto).
         _ = self.retainTreeForClosure(proto);
-        // Infallible (capacity reserved above); temp-rooted right after.
+        // Infallible (capacity reserved above); root-scoped right after.
         self.gcRegisterCommit(.{ .closure = cl });
         cl_registered = true;
-        roots.addAssumeCapacity(.{ .Closure = cl });
+        _ = scope.protectValueAssumeCapacity(.{ .Closure = cl });
         self.testc_obj_functions += 1;
         // Full closure allocation: struct + upvalue array (PUC
         // luaF_newLclosure; must match gcFreeObject's credit — see the
@@ -32208,12 +32385,12 @@ pub const Vm = struct {
         const chunk_name_val: Value = if (args.len > 1) args[1] else .Nil;
         const mode_val: Value = if (args.len > 2) args[2] else .Nil;
         const env_val: Value = if (args.len > 3) args[3] else .{ .Table = self.global_env };
-        var roots = self.gcTempRoots();
-        defer roots.end();
-        try roots.add(reader_val);
-        try roots.add(chunk_name_val);
-        try roots.add(mode_val);
-        try roots.add(env_val);
+        var scope = try self.openRootScope(5, 0);
+        defer scope.close();
+        _ = scope.protectValueAssumeCapacity(reader_val);
+        _ = scope.protectValueAssumeCapacity(chunk_name_val);
+        _ = scope.protectValueAssumeCapacity(mode_val);
+        _ = scope.protectValueAssumeCapacity(env_val);
         const mode = switch (mode_val) {
             .Nil => @as(?[]const u8, null),
             .String => |m| m.bytes(),
@@ -32395,7 +32572,7 @@ pub const Vm = struct {
         };
         switch (result) {
             .closure => |cl| {
-                try roots.add(.{ .Closure = cl });
+                _ = scope.protectValueAssumeCapacity(.{ .Closure = cl });
                 const o = self.refreshBuiltinOuts() orelse outs;
                 o[0] = .{ .Closure = cl };
                 if (o.len > 1) o[1] = .Nil;
@@ -32471,12 +32648,12 @@ pub const Vm = struct {
             // Root the interned strings across each other's internStr and
             // the loader call (native arrays are invisible to the GC — see
             // builtinLoadfile's note).
-            var roots = self.gcTempRoots();
-            defer roots.end();
+            var scope = try self.openRootScope(2, 0);
+            defer scope.close();
             const preload_str = try self.internStr(":preload:");
-            try roots.add(.{ .String = preload_str });
+            _ = scope.protectValueAssumeCapacity(.{ .String = preload_str });
             const name_str = try self.internStr(name);
-            try roots.add(.{ .String = name_str });
+            _ = scope.protectValueAssumeCapacity(.{ .String = name_str });
             switch (loader) {
                 .Builtin => |id| {
                     var loader_args = [_]Value{ .{ .String = name_str }, .{ .String = preload_str } };
@@ -32564,9 +32741,9 @@ pub const Vm = struct {
             // Pin the loaded closure against GC: the internStr calls below
             // can trigger a cycle, and the closure in tmp[0] is a Zig-local,
             // not a GC root.
-            var roots = self.gcTempRoots();
-            defer roots.end();
-            try roots.add(tmp[0]);
+            var scope = try self.openRootScope(1, 0);
+            defer scope.close();
+            _ = scope.protectValueAssumeCapacity(tmp[0]);
 
             const run_args = [_]Value{ .{ .String = try self.internStr(name) }, .{ .String = try self.internStr(file_path) } };
             const ret = try self.runClosure(cl, run_args[0..]);
@@ -32718,9 +32895,9 @@ pub const Vm = struct {
         if (loadlib_outs[0] != .Closure) return false;
 
         // Pin the C closure against GC (internStr calls below can trigger a cycle).
-        var roots = self.gcTempRoots();
-        defer roots.end();
-        try roots.add(loadlib_outs[0]);
+        var scope = try self.openRootScope(1, 0);
+        defer scope.close();
+        _ = scope.protectValueAssumeCapacity(loadlib_outs[0]);
 
         // PUC ll_require: calls the loader with (modname, filepath).
         const call_args = [_]Value{
@@ -33519,11 +33696,11 @@ pub const Vm = struct {
 
         // Temp roots: protect `t` across calls to debugFillInfoFromIrFunction
         // which internally allocates an activelines table (triggering GC).
-        var roots = self.gcTempRoots();
-        defer roots.end();
+        var scope = try self.openRootScope(1, 0);
+        defer scope.close();
 
         const t = try self.allocTable(null);
-        try roots.add(.{ .Table = t });
+        _ = scope.protectValueAssumeCapacity(.{ .Table = t });
 
         try self.setField(t, "currentline", .{ .Int = 0 });
 
@@ -34732,35 +34909,53 @@ pub const Vm = struct {
                     // loop's catch block calls parkBytecodeIrHookYield (sets
                     // bytecode_inplace_suspended + skip flag). On error (sj==1):
                     // propagate error.RuntimeError.
+                    //
+                    // A1.0: ONE shared protected-boundary contract — the SAME
+                    // ProtectedBoundary helper callCFunctionWithBoundary uses
+                    // (root mark before the hook runs; landing restores it and
+                    // the previous C boundary before the status is decoded;
+                    // normal return checks and defensively restores it).
                     const hook_ptr: *const fn (?*anyopaque, ?*anyopaque) callconv(.c) void = hook_fn;
-                    var jb: JmpBuf = undefined;
-                    const prev_jmp = self.c_error_jmp;
-                    self.c_error_jmp = @ptrCast(&jb);
-                    defer self.c_error_jmp = prev_jmp;
+                    var b = ProtectedBoundary.protect(self);
 
                     // Record the interrupted frame for the yield path (see
                     // DebugHookState.sync_hook_frame_idx). Cleared by this
                     // defer on BOTH paths: normal hook return and the
-                    // error.Yield propagation after a hook yield.
+                    // error.Yield propagation after a hook yield (the
+                    // `_longjmp` landing resumes in THIS frame, so its own
+                    // defers run on the ordinary return path).
                     hook_state_for_flag.sync_hook_frame_idx = ci_frame_idx;
                     defer hook_state_for_flag.sync_hook_frame_idx = null;
 
-                    const sj = _setjmp(@ptrCast(&jb));
+                    const sj = b.enter();
                     if (sj == 0) {
                         hook_ptr(@ptrCast(self.cur_handle.?), @ptrCast(&ar));
-                    } else if (sj == 2) {
+                        // Normal-return checkpoint: the hook must have
+                        // closed every scope it opened; the production
+                        // restore keeps a leaked hook scope from becoming
+                        // permanent roots.
+                        b.finish();
+                        return;
+                    }
+                    // `_longjmp` landing — BEFORE decoding the status: a
+                    // hook yield already published its values to
+                    // `th.yielded` (builtinCoroutineYield) and a hook
+                    // error published the object to the thread err state
+                    // (`lua_error`); drop the hook's abandoned scopes
+                    // relative to the boundary mark and reinstate the
+                    // previous C boundary, then propagate.
+                    b.land();
+                    if (sj == 2) {
                         // Hook yielded via lua_yieldk: the yield values are
                         // already stored in th.yielded by builtinCoroutineYield.
                         // Propagate error.Yield so the bytecode loop parks the
                         // hook yield (parkBytecodeIrHookYield sets
                         // bytecode_inplace_suspended + skip flag).
                         return error.Yield;
-                    } else {
-                        // Hook errored via lua_error: the error object is in
-                        // self.err / self.errThread().err_obj. Propagate as RuntimeError.
-                        return error.RuntimeError;
                     }
-                    return;
+                    // Hook errored via lua_error: the error object is in
+                    // self.err / self.errThread().err_obj. Propagate as RuntimeError.
+                    return error.RuntimeError;
                 }
             }
             // C hook is set but mask doesn't match this event — no dispatch.
@@ -34868,24 +35063,23 @@ pub const Vm = struct {
 
     fn ensureDebugRegistry(self: *Vm) DispatchError!*Table {
         if (self.debug_registry) |r| return r;
-        var roots = self.gcTempRoots();
-        defer roots.end();
+        var scope = try self.openRootScope(3, 0);
+        defer scope.close();
         // P16.50-review-14 HIGH 2: every fresh table here (reg, hookkey and
         // especially mt — the audit's unrooted one) must be rooted with an
-        // INFALLIBLE add: the next setField/intern/metatable-prepare can
+        // INFALLIBLE protect: the next setField/intern/metatable-prepare can
         // fire an emergency GC, and a table living only in a Zig local is
-        // invisible to the emergency scan. ensure(3) reserves all slots
-        // before any object exists (review-7 discipline).
-        try roots.ensure(3);
+        // invisible to the emergency scan. The scope reserves all three
+        // slots before any object exists (review-7 discipline).
 
         const reg = try self.allocTable(null);
-        roots.addAssumeCapacity(.{ .Table = reg });
+        _ = scope.protectValueAssumeCapacity(.{ .Table = reg });
 
         const hookkey = try self.allocTable(null);
-        roots.addAssumeCapacity(.{ .Table = hookkey });
+        _ = scope.protectValueAssumeCapacity(.{ .Table = hookkey });
 
         const mt = try self.allocTable(null);
-        roots.addAssumeCapacity(.{ .Table = mt });
+        _ = scope.protectValueAssumeCapacity(.{ .Table = mt });
         try self.setField(mt, "__mode", .{ .String = try self.internStr("k") });
         try self.gcStoreMetatable(hookkey, mt);
         try self.setField(reg, "_HOOKKEY", .{ .Table = hookkey });
@@ -34914,7 +35108,7 @@ pub const Vm = struct {
     ///      — a metatable is not finalizable);
     ///   5. ROOT the fresh table on the caller's stack (PUC keeps it on
     ///      L's stack across every later fallible step), plus a
-    ///      gcTempRoots safety net: the testC shadow stack is NOT
+    ///      RootScope safety net: the testC shadow stack is NOT
     ///      GC-marked, so the temp root is what actually protects the
     ///      created-but-unpublished table from an emergency GC inside the
     ///      __name/registry insertions;
@@ -34952,26 +35146,25 @@ pub const Vm = struct {
             try root_stack.append(root_alloc, existing);
             return false;
         }
-        var roots = self.gcTempRoots();
-        defer roots.end();
-        // Edge 2 (review-7 B2): reserve BOTH temp roots up front so the
-        // key and the table push are infallible. The interned key MUST be
-        // rooted BEFORE `allocTable`: allocTable runs condGC, and an
-        // emergency GC there would sweep the key — the intern table is
-        // NOT a GC root and a Zig local is invisible to the emergency
-        // scan's conservative register window. Post-sweep, `mt.__name`
-        // would hold a dangling old key while the publish step re-interns
-        // a fresh one — registry[tname] and mt.__name would disagree.
-        // PUC avoids the window entirely (it re-interns tname at each
-        // field access); rooting the single interned key is our
-        // equivalent reachability guarantee.
-        try roots.ensure(2);
-        roots.addAssumeCapacity(.{ .String = key });
+        var scope = try self.openRootScope(2, 0);
+        defer scope.close();
+        // Edge 2 (review-7 B2): the scope reserves BOTH root slots up
+        // front so the key and the table protects are infallible. The
+        // interned key MUST be rooted BEFORE `allocTable`: allocTable
+        // runs condGC, and an emergency GC there would sweep the key —
+        // the intern table is NOT a GC root and a Zig local is invisible
+        // to the emergency scan's conservative register window.
+        // Post-sweep, `mt.__name` would hold a dangling old key while the
+        // publish step re-interns a fresh one — registry[tname] and
+        // mt.__name would disagree. PUC avoids the window entirely (it
+        // re-interns tname at each field access); rooting the single
+        // interned key is our equivalent reachability guarantee.
+        _ = scope.protectValueAssumeCapacity(.{ .String = key });
         // Edge 3: normal table constructor (register + account).
         const mt = try self.allocTable(null);
-        roots.addAssumeCapacity(.{ .Table = mt });
+        _ = scope.protectValueAssumeCapacity(.{ .Table = mt });
         // Edge 4: root — the caller's stack (PUC's L-stack root) plus the
-        // temp-root net for shadow stacks (see the doc comment above).
+        // root net for shadow stacks (see the doc comment above).
         try root_stack.append(root_alloc, .{ .Table = mt });
         // Edge 5: metatable.__name = tname (PUC lua_setfield on a fresh
         // plain table — no metamethods possible).
@@ -35799,7 +35992,7 @@ pub const Vm = struct {
         // memory surgery (no allocation → no GC window), so nothing between
         // the prepares and the store can sweep canon_key/val. PUC anchors
         // t/key/val on the Lua stack across luaH_newkey (~3 pointer writes
-        // into a preallocated stack); the gc_temp_roots analog of that
+        // into a preallocated stack); the gc_root_values analog of that
         // anchoring would be pure waste on this path, so it is opened only
         // in the rehash branch below. This is the path every pre-sized
         // constructor insert takes (OP_NEWTABLE pre-allocates the hinted
@@ -35834,14 +36027,13 @@ pub const Vm = struct {
         // insert below would publish a dangling pointer. Root the table,
         // key and value BEFORE the first fallible op of this branch (the
         // rehash allocation) and keep the session open until the insert
-        // publishes them — the gc_temp_roots analog of PUC's stack
+        // publishes them — the gc_root_values analog of PUC's stack
         // anchoring (same discipline as the luaL_newmetatable tname root).
-        var roots = self.gcTempRoots();
-        defer roots.end();
-        try roots.ensure(3);
-        roots.addAssumeCapacity(.{ .Table = tbl });
-        roots.addAssumeCapacity(canon_key);
-        roots.addAssumeCapacity(val);
+        var scope = try self.openRootScope(3, 0);
+        defer scope.close();
+        _ = scope.protectValueAssumeCapacity(.{ .Table = tbl });
+        _ = scope.protectValueAssumeCapacity(canon_key);
+        _ = scope.protectValueAssumeCapacity(val);
 
         // Rehash (PUC `rehash` — grow table, redistribute keys between
         // array/hash parts via `computeSizes`). Drops deleted/Nil entries
@@ -36371,10 +36563,10 @@ pub const Vm = struct {
         // allocate strings/tables internally, which can trigger a GC step.
         // tbl is not yet in any Lua root (not in outs, not in a register),
         // so it must be explicitly protected — PUC keeps newly allocated
-        // objects on L->top; we use gcTempRoots as the equivalent.
-        var roots = self.gcTempRoots();
-        defer roots.end();
-        try roots.add(.{ .Table = tbl });
+        // objects on L->top; we use a RootScope as the equivalent.
+        var scope = try self.openRootScope(1, 0);
+        defer scope.close();
+        _ = scope.protectValueAssumeCapacity(.{ .Table = tbl });
         try self.setField(tbl, "close", .{ .Builtin = .file_close });
         try self.setField(tbl, "write", .{ .Builtin = .file_write });
         try self.setField(tbl, "read", .{ .Builtin = .file_read });
@@ -36878,17 +37070,16 @@ pub const Vm = struct {
         // add is infallible (review-7 discipline); inputs go in first,
         // each allocation is added immediately, and the roots are released
         // only after the fully-published iterator is returned.
-        var roots = self.gcTempRoots();
-        defer roots.end();
-        try roots.ensure(3 + 1 + fmts.len);
-        roots.addAssumeCapacity(file_v);
-        for (fmts) |f| roots.addAssumeCapacity(f);
+        var scope = try self.openRootScope(3 + 1 + fmts.len, 0);
+        defer scope.close();
+        _ = scope.protectValueAssumeCapacity(file_v);
+        for (fmts) |f| _ = scope.protectValueAssumeCapacity(f);
         const obj = try self.allocTableNoGc();
-        roots.addAssumeCapacity(.{ .Table = obj });
+        _ = scope.protectValueAssumeCapacity(.{ .Table = obj });
         const mt = try self.allocTableNoGc();
-        roots.addAssumeCapacity(.{ .Table = mt });
+        _ = scope.protectValueAssumeCapacity(.{ .Table = mt });
         const fmts_tbl = try self.allocTableNoGc();
-        roots.addAssumeCapacity(.{ .Table = fmts_tbl });
+        _ = scope.protectValueAssumeCapacity(.{ .Table = fmts_tbl });
         try self.setField(mt, "__call", .{ .Builtin = .io_lines_iter });
         try self.gcStoreMetatable(obj, mt);
         try self.setField(obj, "__file", file_v);
@@ -40817,8 +41008,8 @@ pub const Vm = struct {
         // Root each interned capture string across the NEXT internStr in the
         // loop (native arrays are invisible to the GC — see builtinLoadfile's
         // note; an emergency GC would free earlier captures before the call).
-        var roots = self.gcTempRoots();
-        defer roots.end();
+        var scope = try self.openRootScope(call_args.len, 0);
+        defer scope.close();
         var arg_count: usize = 0;
         var cap_i: usize = 1;
         while (cap_i < caps.len and arg_count < call_args.len) : (cap_i += 1) {
@@ -40827,13 +41018,13 @@ pub const Vm = struct {
                 call_args[arg_count] = .{ .Int = @intCast(caps[cap_i].start + 1) };
             } else {
                 call_args[arg_count] = .{ .String = try self.internStr(s[caps[cap_i].start..caps[cap_i].end]) };
-                try roots.add(call_args[arg_count]);
+                _ = scope.protectValueAssumeCapacity(call_args[arg_count]);
             }
             arg_count += 1;
         }
         if (arg_count == 0) {
             call_args[0] = .{ .String = try self.internStr(s[match_start..match_end]) };
-            try roots.add(call_args[0]);
+            _ = scope.protectValueAssumeCapacity(call_args[0]);
             arg_count = 1;
         }
         const resolved = try self.resolveCallable(repl_fn, call_args[0..arg_count], null);
@@ -40875,9 +41066,9 @@ pub const Vm = struct {
         // callbacks may run arbitrary Lua and trigger GC. PUC keeps arguments
         // on the Lua stack; mirror that by rooting all arguments for the whole
         // builtin call.
-        var roots = self.gcTempRoots();
-        defer roots.end();
-        for (args) |arg| try roots.add(arg);
+        var scope = try self.openRootScope(args.len, 0);
+        defer scope.close();
+        for (args) |arg| _ = scope.protectValueAssumeCapacity(arg);
         const s = switch (args[0]) {
             .String => |x| x.bytes(),
             else => return self.fail("string.gsub expects string", .{}),
@@ -44232,24 +44423,121 @@ pub const Vm = struct {
         lua_err: c_int,
     };
 
+    /// ONE shared protected-C-boundary contract for both `_setjmp`
+    /// landing pads that run user C code: `callCFunctionWithBoundary`
+    /// and the protected debug-hook boundary in
+    /// `debugDispatchHookTransfer`. Both must behave identically — no
+    /// second, slightly different scheme.
+    ///
+    /// `protect` snapshots the previous C boundary and the native-root
+    /// mark BEFORE the user C code runs (a boundary mark sits on top of
+    /// any outer roots; a nested boundary takes its own mark on top of
+    /// them). Every field is assigned before `_setjmp` and never
+    /// modified after, so its stack slot is reliably preserved across
+    /// the `_longjmp` restore — the well-defined case in the
+    /// setjmp/longjmp local-variable model.
+    ///
+    /// `enter` installs the landing pad (`c_error_jmp` + `_setjmp`).
+    ///
+    /// `finish` is the NORMAL-return checkpoint: Debug proves the
+    /// callback closed every scope it opened (exact equality with the
+    /// boundary mark — a leaked scope is a caller bug caught
+    /// deterministically), and the production path defensively restores
+    /// the mark so an inner bug cannot leave permanent roots. Outer
+    /// roots below the mark always survive (a relative restore, never a
+    /// truncate-to-zero).
+    ///
+    /// `land` is the `_longjmp` landing checkpoint, run BEFORE the
+    /// status is decoded. `_longjmp` bypasses every Zig `defer` in the
+    /// frames between the thrower and this landing pad (the callback's
+    /// own frame, nested Zig helpers — see the boundary comment at the
+    /// top of this file), so cleanup cannot rely on defers. The contract
+    /// instead requires the thrower to PUBLISH the payload to its
+    /// persistent owner BEFORE jumping (error → `c_error_value` / the
+    /// thread err state; yield → `th.yielded`; thread switch → the
+    /// parked frame / trampoline state), and only then, at the landing:
+    /// (1) drop every scope opened above the boundary mark with
+    /// `restoreRoots(mark)` — abandoned scopes' tokens can never validate
+    /// as innermost again, so a stray `close` fails the LIFO check
+    /// deterministically — and (2) reinstate the previous C boundary.
+    /// The boundary checkpoint is cleanup metadata only, never a second
+    /// error transport.
+    const ProtectedBoundary = struct {
+        vm: *Vm,
+        /// The C boundary that was active when this one was installed
+        /// (`c_error_jmp` save/restore so nested C→C calls — a
+        /// `lua_CFunction` that lua_pcall's another C closure — each get
+        /// their own landing pad).
+        prev: ?*anyopaque,
+        /// Native-root checkpoint taken before the user C code ran.
+        mark: RootMark,
+        /// Opaque C `jmp_buf` storage (see the top-of-file boundary
+        /// comment). Lives in the caller's stack frame; its address is
+        /// what `c_error_jmp` holds for the duration of the callback.
+        jb: JmpBuf,
+
+        fn protect(vm: *Vm) ProtectedBoundary {
+            return .{
+                .vm = vm,
+                .prev = vm.c_error_jmp,
+                .mark = vm.rootMark(),
+                .jb = undefined,
+            };
+        }
+
+        /// Installs the landing pad. MUST be inlined into the boundary
+        /// owner's frame: `_setjmp` captures the CALLING frame's context
+        /// (SP/PC), and `_longjmp` later restores it — if this were a
+        /// real call, the landing would resume inside `enter`'s frame,
+        /// which is dead (and its stack memory reused by the callback's
+        /// deeper frames) by the time the jump fires.
+        inline fn enter(self: *ProtectedBoundary) c_int {
+            self.vm.c_error_jmp = @ptrCast(&self.jb);
+            return _setjmp(@ptrCast(&self.jb));
+        }
+
+        /// Normal-return checkpoint (the callback returned without
+        /// jumping). Runs before the caller decodes the raw C return.
+        fn finish(self: *ProtectedBoundary) void {
+            // Debug discriminator: the callback must have closed every
+            // scope it opened — the root state must be EXACTLY at the
+            // boundary mark (lengths, depth and innermost token). In
+            // ReleaseFast the assert is comptime-eliminated (NOT merely
+            // unchecked): `std.debug.assert` lowers to `unreachable`,
+            // and a false assert would let the optimizer delete the
+            // defensive restore below as unreachable code — the restore
+            // must run unconditionally in production.
+            if (@import("builtin").mode != .ReleaseFast) {
+                std.debug.assert(self.vm.rootMark().eql(self.mark));
+            }
+            // Defensive production restore: a leaked inner scope must
+            // not outlive the boundary as permanent roots. A no-op when
+            // the callback was well-behaved.
+            self.vm.restoreRoots(self.mark);
+            self.vm.c_error_jmp = self.prev;
+        }
+
+        /// `_longjmp` landing checkpoint — run BEFORE decoding the
+        /// status (payload owner is already established by the thrower).
+        fn land(self: *ProtectedBoundary) void {
+            self.vm.restoreRoots(self.mark);
+            self.vm.c_error_jmp = self.prev;
+        }
+    };
+
     fn callCFunctionWithBoundary(
         self: *Vm,
         f: *const fn (?*lua_State) callconv(.c) c_int,
     ) BoundaryResult {
-        // The `jmp_buf` lives in THIS stack frame; its address is stored in
-        // `c_error_jmp` so `lua_error` can `_longjmp` to it.
-        var jb: JmpBuf = undefined;
-        // Save/restore the surrounding boundary so nested C→C calls (a
-        // `lua_CFunction` that lua_pcall's another C closure) each get their
-        // own landing pad. `prev` is assigned BEFORE `_setjmp` and never
-        // modified after, so its storage (stack slot / callee-saved register)
-        // is reliably preserved across the `_longjmp` restore — this is the
-        // well-defined case in the setjmp/longjmp local-variable model.
-        const prev = self.c_error_jmp;
-        self.c_error_jmp = @ptrCast(&jb);
-        defer self.c_error_jmp = prev;
-
-        const sj = _setjmp(@ptrCast(&jb));
+        // The shared protected-boundary contract (ProtectedBoundary):
+        // the root mark is snapshotted before the user C code runs, the
+        // `_longjmp` landing restores it (and the previous C boundary)
+        // before the status is decoded, and the normal-return path
+        // checks and defensively restores it. The `jmp_buf` lives in
+        // THIS stack frame; its address is stored in `c_error_jmp` so
+        // `lua_error` can `_longjmp` to it.
+        var b = ProtectedBoundary.protect(self);
+        const sj = b.enter();
         if (sj == 0) {
             // No longjmp: decode the raw C return. PUC C functions return
             // a non-negative result count; NEGATIVE returns are the
@@ -44262,10 +44550,25 @@ pub const Vm = struct {
             // plain negatives; the union maps them to the same outcomes
             // without colliding with ThreadSwitch.
             const raw = f(self.cur_handle.?);
+            // Normal-return checkpoint: the callback must have closed
+            // every scope it opened (Debug proves exact equality with
+            // the boundary mark); the production restore keeps an inner
+            // bug from leaving permanent roots. Outer roots below the
+            // mark survive.
+            b.finish();
             if (raw >= 0) return .{ .ok = @intCast(raw) };
             if (raw == -2) return .yield;
             return .{ .lua_err = 2 }; // LUA_ERRRUN (testC error sentinel)
         }
+        // `_longjmp` landing — BEFORE decoding the status: the payload
+        // is already in its persistent owner (yield → `th.yielded`,
+        // stored by `builtinCoroutineYield` before the jump; thread
+        // switch → the parked frame / trampoline state; error →
+        // `c_error_value` / the thread err state — the thrower's
+        // publish-then-jump contract, see ProtectedBoundary), the
+        // abandoned inner scopes are dropped relative to the boundary
+        // mark, and the previous C boundary is reinstated.
+        b.land();
         // `_longjmp` with value 2 = `lua_yieldk` yield (P15.78). The yield
         // values are already stored in `th.yielded` by `builtinCoroutineYield`
         // before the `_longjmp`; no error object is carried.
@@ -45316,23 +45619,23 @@ pub const Vm = struct {
 
     fn builtinTestcMakeCfunc(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
-        var roots = self.gcTempRoots();
-        defer roots.end();
+        var scope = try self.openRootScope(3, 0);
+        defer scope.close();
 
         const upvals = try self.allocTable(null);
-        try roots.add(.{ .Table = upvals });
+        _ = scope.protectValueAssumeCapacity(.{ .Table = upvals });
 
         for (args, 0..) |v, i| {
             try self.tableSetValue(upvals, .{ .Int = @intCast(i + 1) }, v);
         }
         const ccl = try self.allocTable(null);
-        try roots.add(.{ .Table = ccl });
+        _ = scope.protectValueAssumeCapacity(.{ .Table = ccl });
 
         try self.setField(ccl, "__testc_upvalues", .{ .Table = upvals });
         try self.setField(ccl, "__testc_upenv", self.currentCallableEnvValue());
         try self.setField(ccl, "__testc_script_upvalue", .{ .Bool = true });
         const mt = try self.allocTable(null);
-        try roots.add(.{ .Table = mt });
+        _ = scope.protectValueAssumeCapacity(.{ .Table = mt });
         try self.setField(mt, "__call", .{ .Builtin = .testc_testC });
         try self.gcStoreMetatable(ccl, mt);
         outs[0] = .{ .Table = ccl };
@@ -45450,29 +45753,29 @@ pub const Vm = struct {
         // each is linked into `root` (and `root` itself until it lands in
         // outs[0]), while every allocTable below carries an inline GC step —
         // the P16.42-T3 crash shape (a step fired mid-stats and swept the
-        // not-yet-linked tables). gcTempRoots is the non-moving analogue of
+        // not-yet-linked tables). The RootScope is the non-moving analogue of
         // the C-stack rooting (same pattern as builtinDebugGetinfo's info
         // table): each table is rooted from the moment it exists until
         // `root` is stored into the caller's outs window (the defer runs
         // after outs[0] is set; the outs window is then itself protected —
         // direct path: no Lua runs before the caller's R[A] store; hook
         // path: debug_transfer_values marks the transfer slice).
-        var roots = self.gcTempRoots();
-        defer roots.end();
+        var scope = try self.openRootScope(7, 0);
+        defer scope.close();
 
         const root = try self.allocTable(null);
-        try roots.add(.{ .Table = root });
+        _ = scope.protectValueAssumeCapacity(.{ .Table = root });
         try self.setField(root, "instructions", statVal(s.instructions_total));
 
         const ops = try self.allocTable(null);
-        try roots.add(.{ .Table = ops });
+        _ = scope.protectValueAssumeCapacity(.{ .Table = ops });
         inline for (@typeInfo(bc.Op).@"enum".fields) |f| {
             try self.setField(ops, f.name, statVal(s.instructions_by_op[f.value]));
         }
         try self.setField(root, "op_histogram", .{ .Table = ops });
 
         const calls = try self.allocTable(null);
-        try roots.add(.{ .Table = calls });
+        _ = scope.protectValueAssumeCapacity(.{ .Table = calls });
         try self.setField(calls, "fast", statVal(s.calls_fast));
         try self.setField(calls, "slow", statVal(s.calls_slow));
         try self.setField(calls, "lua_frames", statVal(s.calls_lua_frames));
@@ -45482,7 +45785,7 @@ pub const Vm = struct {
         try self.setField(root, "calls", .{ .Table = calls });
 
         const tables = try self.allocTable(null);
-        try roots.add(.{ .Table = tables });
+        _ = scope.protectValueAssumeCapacity(.{ .Table = tables });
         try self.setField(tables, "get_fast_int", statVal(s.tbl_get_fast_int));
         try self.setField(tables, "get_fast_str", statVal(s.tbl_get_fast_str));
         try self.setField(tables, "get_generic", statVal(s.tbl_get_generic));
@@ -45495,7 +45798,7 @@ pub const Vm = struct {
         try self.setField(root, "tables", .{ .Table = tables });
 
         const allocs = try self.allocTable(null);
-        try roots.add(.{ .Table = allocs });
+        _ = scope.protectValueAssumeCapacity(.{ .Table = allocs });
         inline for (@typeInfo(GcObject).@"union".fields, 0..) |f, i| {
             try self.setField(allocs, f.name, statVal(s.alloc_by_type[i]));
         }
@@ -45503,13 +45806,13 @@ pub const Vm = struct {
         try self.setField(root, "allocs", .{ .Table = allocs });
 
         const gc = try self.allocTable(null);
-        try roots.add(.{ .Table = gc });
+        _ = scope.protectValueAssumeCapacity(.{ .Table = gc });
         try self.setField(gc, "steps_auto", statVal(s.gc_steps_auto));
         try self.setField(gc, "steps_manual", statVal(s.gc_steps_manual));
         try self.setField(root, "gc", .{ .Table = gc });
 
         const yr = try self.allocTable(null);
-        try roots.add(.{ .Table = yr });
+        _ = scope.protectValueAssumeCapacity(.{ .Table = yr });
         try self.setField(yr, "yields", statVal(s.yields));
         try self.setField(yr, "resumes", statVal(s.resumes));
         try self.setField(yr, "yield_allocs", statVal(s.yield_allocs));
@@ -46787,14 +47090,13 @@ pub const Vm = struct {
                 if (cargs.len != 1) return self.fail("testC pushcclosure expects 1 arg", .{});
                 const n = std.fmt.parseInt(usize, cargs[0], 10) catch return self.fail("testC invalid upvalue count", .{});
                 if (n > st.items.len) return self.fail("testC stack underflow", .{});
-                var roots = self.gcTempRoots();
-                defer roots.end();
+                var scope = try self.openRootScope(3, 0);
+                defer scope.close();
                 // P16.50-review-14 HIGH 2: upvals/ccl/mt live only in Zig
                 // locals until publication (ccl's metatable / the stack
                 // append); the setField/prepare steps below can fire an
-                // emergency GC. ensure(3) + infallible addAssumeCapacity
-                // closes every window (review-7 discipline).
-                try roots.ensure(3);
+                // emergency GC. The scope's up-front reserve + infallible
+                // protects close every window (review-7 discipline).
                 // P16.50-review-15 HIGH 1: PUC lua_pushcclosure (lapi.c:609+)
                 // builds the CClosure FIRST and only then — infallibly —
                 // replaces the top n stack values with it; a construction
@@ -46808,14 +47110,14 @@ pub const Vm = struct {
                 try st.ensureUnusedCapacity(self.infraAlloc(), 1);
 
                 const upvals = try self.allocTable(null);
-                roots.addAssumeCapacity(.{ .Table = upvals });
+                _ = scope.protectValueAssumeCapacity(.{ .Table = upvals });
 
                 const base = st.items.len - n;
                 for (0..n) |i| {
                     try self.tableSetValue(upvals, .{ .Int = @intCast(i + 1) }, st.items[base + i]);
                 }
                 const ccl = try self.allocTable(null);
-                roots.addAssumeCapacity(.{ .Table = ccl });
+                _ = scope.protectValueAssumeCapacity(.{ .Table = ccl });
 
                 try self.setField(ccl, "__testc_upvalues", .{ .Table = upvals });
                 // PUC CClosure has `nupvalues`; the array part of `upvals`
@@ -46829,7 +47131,7 @@ pub const Vm = struct {
                 try self.setField(ccl, "__testc_upenv", envv);
                 try self.setField(ccl, "__testc_script_upvalue", .{ .Bool = false });
                 const mt = try self.allocTable(null);
-                roots.addAssumeCapacity(.{ .Table = mt });
+                _ = scope.protectValueAssumeCapacity(.{ .Table = mt });
                 try self.setField(mt, "__call", .{ .Builtin = .testc_testC });
                 try self.gcStoreMetatable(ccl, mt);
                 // Infallible commit (PUC lua_pushcclosure's atomic
@@ -47475,12 +47777,12 @@ pub const Vm = struct {
                 // internStr (native arrays are invisible to the GC — see
                 // builtinLoadfile's note; emergency GC under a memory limit
                 // would otherwise free the first string before use).
-                var roots = self.gcTempRoots();
-                defer roots.end();
+                var scope = try self.openRootScope(2, 0);
+                defer scope.close();
                 const name_str = try self.internStr(chunk_name);
-                try roots.add(.{ .String = name_str });
+                _ = scope.protectValueAssumeCapacity(.{ .String = name_str });
                 const mode_str = try self.internStr(mode_src);
-                try roots.add(.{ .String = mode_str });
+                _ = scope.protectValueAssumeCapacity(.{ .String = mode_str });
                 var load_args: [3]Value = .{
                     sv,
                     .{ .String = name_str },
@@ -52177,20 +52479,20 @@ test "P16.49-review-2: OLD0 promotion charges added-old exactly once (PUC sweepg
     // by the mode-transition full collection (temp-rooted so it survives).
     const owner = try vm.allocTable(null);
     {
-        var roots = vm.gcTempRoots();
-        try roots.add(.{ .Table = owner });
+        var scope = try vm.openRootScope(1, 0);
+        defer scope.close();
+        _ = scope.protectValueAssumeCapacity(.{ .Table = owner });
         try vm.gcEnterGenerational();
         try testing.expect(owner.gc_age.isOld());
-        roots.end();
     }
     // Young child (registered in gen-minor → age .new, in young list).
     const child = try vm.allocTable(null);
     try testing.expect(child.gc_age == .new);
 
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(.{ .Table = owner });
-    try roots.add(.{ .Table = child });
+    var scope = try vm.openRootScope(3, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(.{ .Table = owner });
+    _ = scope.protectValueAssumeCapacity(.{ .Table = child });
 
     // Real forward barrier: old owner stores young child.
     const added_old_before_barrier = vm.gc_gen_added_old_kb;
@@ -52235,7 +52537,7 @@ test "P16.49-review-2: OLD0 promotion charges added-old exactly once (PUC sweepg
     // OLD0 charge stays minor here — the negative validation. Uses a
     // FRESH young child: the first one is already OLD by now (markold).
     const child2 = try vm.allocTable(null);
-    try roots.add(.{ .Table = child2 });
+    _ = scope.protectValueAssumeCapacity(.{ .Table = child2 });
     try vm.gcForwardBarrierValue(.{ .Table = owner }, .{ .Table = child2 });
     try testing.expect(child2.gc_age == .old0);
     vm.gc_gen_major_base_kb = 10.0;
@@ -52831,11 +53133,11 @@ test "P16.50: opClosure-equivalent OOM transactionality (generational + incremen
     // live, collection-safe state.
     var vm2: Vm = .init(testing.allocator, false);
     defer vm2.deinit();
-    var fill_roots = vm2.gcTempRoots();
-    defer fill_roots.end();
+    var fill_scope = try vm2.openRootScope(vm2.gc_objects.capacity - vm2.gc_objects.items.len, 0);
+    defer fill_scope.close();
     while (vm2.gc_objects.capacity - vm2.gc_objects.items.len >= 5) {
         const t = try vm2.allocTableNoGc();
-        try fill_roots.add(.{ .Table = t });
+        _ = fill_scope.protectValueAssumeCapacity(.{ .Table = t });
     }
     const len0 = vm2.gc_objects.items.len;
     const cap0 = vm2.gc_objects.capacity;
@@ -52956,17 +53258,19 @@ test "P16.50: internStr OOM transactionality (short miss, long, dead-old re-inte
 
     const raw_c = "p50-hazard-string-cccccccccc";
     const ls = try vm_c.internStr(raw_c);
-    var roots = vm_c.gcTempRoots();
-    defer roots.end();
-    try roots.add(.{ .String = ls });
-    // Cycle 1 (rooted): the string is marked and survives the sweep as
-    // white (the sweep's makewhite — the ONLY thing that makes an old
-    // survivor white again).
-    try vm_c.gcCycleFull();
-    // Cycle 2 (unrooted): start a real incremental cycle and stop right
-    // after the atomic→sweep transition — the white flip has happened, so
-    // the unmarked string is now dead, but the sweep has not reached it.
-    roots.end();
+    {
+        var scope = try vm_c.openRootScope(1, 0);
+        defer scope.close();
+        _ = scope.protectValueAssumeCapacity(.{ .String = ls });
+        // Cycle 1 (rooted): the string is marked and survives the sweep as
+        // white (the sweep's makewhite — the ONLY thing that makes an old
+        // survivor white again).
+        try vm_c.gcCycleFull();
+        // Cycle 2 (unrooted): the block exit releases the root; start a
+        // real incremental cycle and stop right after the atomic→sweep
+        // transition — the white flip has happened, so the unmarked
+        // string is now dead, but the sweep has not reached it.
+    }
     try vm_c.gcStartCycle(true);
     // A single advance with break_after_atomic runs propagate + atomic and
     // returns exactly at the atomic→sweep transition: the white flip inside
@@ -53004,12 +53308,12 @@ test "P16.50: allocTable/allocUserdata OOM transactionality + testc memory edges
     // entering generational mode, temp-rooted through gcEnterGenerational's
     // full cycle: failTestcRaw's internStr and the adapter-counted
     // getGlobal("T") then hit the table without registering anything.
-    var setup_roots = vm.gcTempRoots();
-    defer setup_roots.end();
+    var scope = try vm.openRootScope(2, 0);
+    defer scope.close();
     const msg_str = try vm.internStr("not enough memory");
-    try setup_roots.add(.{ .String = msg_str });
+    _ = scope.protectValueAssumeCapacity(.{ .String = msg_str });
     const t_str = try vm.internStr("T");
-    try setup_roots.add(.{ .String = t_str });
+    _ = scope.protectValueAssumeCapacity(.{ .String = t_str });
     try vm.gcEnterGenerational();
 
     // ---- Segment A: allocTableNoGc ----
@@ -53156,10 +53460,10 @@ test "P16.50: thread constructor OOM transactionality" {
     var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
 
-    var setup_roots = vm.gcTempRoots();
-    defer setup_roots.end();
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
     const key_mainthread = try vm.internStr("_mainthread");
-    try setup_roots.add(.{ .String = key_mainthread });
+    _ = scope.protectValueAssumeCapacity(.{ .String = key_mainthread });
     try vm.gcEnterGenerational();
 
     // ---- Segment A: builtinCoroutineCreate ----
@@ -53300,14 +53604,14 @@ test "P16.50: pushcclosure/registerfuncs OOM transactionality" {
     // Pre-intern the library names BEFORE entering generational mode,
     // temp-rooted through its full cycle: every per-entry internStr in
     // registerfuncs then hits the table without allocating.
-    var setup_roots = vm.gcTempRoots();
-    defer setup_roots.end();
+    var scope = try vm.openRootScope(3, 0);
+    defer scope.close();
     const key_alpha = try vm.internStr("p50alpha");
-    try setup_roots.add(.{ .String = key_alpha });
+    _ = scope.protectValueAssumeCapacity(.{ .String = key_alpha });
     const key_beta = try vm.internStr("p50beta");
-    try setup_roots.add(.{ .String = key_beta });
+    _ = scope.protectValueAssumeCapacity(.{ .String = key_beta });
     const key_gamma = try vm.internStr("p50gamma");
-    try setup_roots.add(.{ .String = key_gamma });
+    _ = scope.protectValueAssumeCapacity(.{ .String = key_gamma });
     try vm.gcEnterGenerational();
 
     // Deterministic allocation maps for the failure loops below: reserve
@@ -53685,8 +53989,10 @@ test "P16.50-review T1: opClosure mixed-upvalue OOM matrix (production dispatch)
     // ---- Base state (everything BEFORE gcEnterGenerational becomes OLD;
     // the failure branches' gcMinorCollection then never promotes or sweeps
     // any of it, keeping the byte-exact young-list assertions stable) ----
-    var setup_roots = vm.gcTempRoots();
-    defer setup_roots.end();
+    // No defer: the explicit close below releases the roots mid-test
+    // (before the OOM probes); an error path leaves the scope open, which
+    // only outlives the test's own vm.
+    var setup_scope = try vm.openRootScope(18, 0);
 
     // 16 fill tables: keep gc_objects non-empty so the opClosure rollback's
     // gcUnregisterObjectRollback swapRemoves exercise the swap-with-last +
@@ -53695,7 +54001,7 @@ test "P16.50-review T1: opClosure mixed-upvalue OOM matrix (production dispatch)
     var fill_tables: [16]*Table = undefined;
     for (&fill_tables) |*slot| {
         const t = try vm.allocTableNoGc();
-        try setup_roots.add(.{ .Table = t });
+        _ = setup_scope.protectValueAssumeCapacity(.{ .Table = t });
         slot.* = t;
     }
 
@@ -53709,7 +54015,7 @@ test "P16.50-review T1: opClosure mixed-upvalue OOM matrix (production dispatch)
         "local x = 1 return function() local y = 2 return function() return x + y end end",
         "=p50r-t1",
     );
-    try setup_roots.add(chunk_v);
+    _ = setup_scope.protectValueAssumeCapacity(chunk_v);
     {
         const middle = chunk_v.Closure.proto.?.p[0];
         const inner = middle.p[0];
@@ -53760,16 +54066,14 @@ test "P16.50-review T1: opClosure mixed-upvalue OOM matrix (production dispatch)
     // the two cells through the enter cycle) — temp-root it too, or the
     // full cycle inside gcEnterGenerational frees it (and the cells with
     // it) before the teardown below can run.
-    try setup_roots.add(.{ .Closure = keeper });
+    _ = setup_scope.protectValueAssumeCapacity(.{ .Closure = keeper });
 
     try vm.gcEnterGenerational();
     p50TeardownClosure(&vm, keeper); // cells stay registered + old
     // Release ALL setup roots here: everything pre-enter is OLD now and
     // the gcMinorCollection calls below never sweep old objects — but the
     // roots list must not keep pointing at the just-destroyed keeper.
-    // (end() truncates back to the snapshot; the deferred end() at scope
-    // exit re-truncates to the same point — a no-op.)
-    setup_roots.end();
+    setup_scope.close();
 
     // Prime both registries so gcPrepareRegister inside the probes is a
     // capacity no-op (the failure index then maps 1:1 onto construction
@@ -54035,7 +54339,7 @@ const P50r8Pair = struct {
 /// sweep-phase test relies on), results[1] the OWNER (join target). Each
 /// closure has ONE CLOSED cell capturing a distinct table. The chunk
 /// closure stays registered but unrooted — callers decide what survives
-/// via gcTempRoots.
+/// via a RootScope.
 fn p50r8MkPair(vm: *Vm) !P50r8Pair {
     const src =
         \\local function mk (v)
@@ -54094,11 +54398,11 @@ test "P16.50-review-8 1.1: joined Cell survives an incremental propagate cycle" 
     defer vm.deinit();
 
     const fx = try p50r8MkPair(&vm);
-    var roots = vm.gcTempRoots();
-    defer roots.end();
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
     // Root ONLY the owner: the donor (closure, cell, table) must stay
     // white so the join's forward barrier has a white child to protect.
-    try roots.add(.{ .Closure = fx.owner });
+    _ = scope.protectValueAssumeCapacity(.{ .Closure = fx.owner });
 
     try vm.gcStartCycle(true);
     // Drain until the owner is black and out of the gray list. The donor
@@ -54141,9 +54445,9 @@ test "P16.50-review-8 1.1: joined Cell survives at the atomic boundary" {
     defer vm.deinit();
 
     const fx = try p50r8MkPair(&vm);
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(.{ .Closure = fx.owner });
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(.{ .Closure = fx.owner });
 
     try vm.gcStartCycle(true);
     // Drain the propagate phase completely (gcPropagateOne never changes
@@ -54213,10 +54517,10 @@ test "P16.50-review-8 1.1: join during incremental sweep makewhites the owner" {
     vm.gcRegisterCommit(.{ .closure = keeper });
     vm.gcNoteAlloc(@sizeOf(Closure) + 2 * @sizeOf(*Cell));
 
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(.{ .Closure = owner });
-    try roots.add(.{ .Closure = keeper });
+    var scope = try vm.openRootScope(2, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(.{ .Closure = owner });
+    _ = scope.protectValueAssumeCapacity(.{ .Closure = keeper });
 
     try vm.gcStartCycle(true);
     while (try vm.gcPropagateOne()) {}
@@ -54274,18 +54578,18 @@ test "P16.50-review-8 1.2: generational join promotes the young Cell exactly onc
     var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
 
-    var roots = vm.gcTempRoots();
-    defer roots.end();
+    var scope = try vm.openRootScope(2, 0);
+    defer scope.close();
     // Owner created BEFORE entering generational mode → OLD after the
     // enter cycle; donor created AFTER → YOUNG.
     const owner_pair = try p50r8MkPair(&vm);
-    try roots.add(.{ .Closure = owner_pair.owner });
+    _ = scope.protectValueAssumeCapacity(.{ .Closure = owner_pair.owner });
     try vm.gcEnterGenerational();
     try testing.expect(owner_pair.owner.gc_age.isOld());
     try testing.expect(owner_pair.owner_cell.gc_age.isOld());
 
     const donor_pair = try p50r8MkPair(&vm);
-    try roots.add(.{ .Closure = donor_pair.donor });
+    _ = scope.protectValueAssumeCapacity(.{ .Closure = donor_pair.donor });
     try testing.expect(donor_pair.donor_cell.gc_age.isYoung());
 
     const plan = try vm.gcPrepareForwardBarrierCell(owner_pair.owner, donor_pair.donor_cell);
@@ -54320,10 +54624,10 @@ test "P16.50-review-8 1.2: generational setupvalue promotes the young value exac
     var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
 
-    var roots = vm.gcTempRoots();
-    defer roots.end();
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
     const owner_pair = try p50r8MkPair(&vm);
-    try roots.add(.{ .Closure = owner_pair.owner });
+    _ = scope.protectValueAssumeCapacity(.{ .Closure = owner_pair.owner });
     try vm.gcEnterGenerational();
     try testing.expect(owner_pair.owner_cell.gc_age.isOld());
 
@@ -54349,13 +54653,13 @@ test "P16.50-review-8 1.2: generational join reserve OOM leaves state byte-exact
     var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
 
-    var roots = vm.gcTempRoots();
-    defer roots.end();
+    var scope = try vm.openRootScope(2, 0);
+    defer scope.close();
     const owner_pair = try p50r8MkPair(&vm);
-    try roots.add(.{ .Closure = owner_pair.owner });
+    _ = scope.protectValueAssumeCapacity(.{ .Closure = owner_pair.owner });
     try vm.gcEnterGenerational();
     const donor_pair = try p50r8MkPair(&vm);
-    try roots.add(.{ .Closure = donor_pair.donor });
+    _ = scope.protectValueAssumeCapacity(.{ .Closure = donor_pair.donor });
 
     // Force both reserves to really allocate (T1 Segment B idiom).
     vm.gc_gray.deinit(testing.allocator);
@@ -54430,10 +54734,10 @@ test "P16.50-review-8 1.2: generational setupvalue reserve OOM leaves state byte
     var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
 
-    var roots = vm.gcTempRoots();
-    defer roots.end();
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
     const owner_pair = try p50r8MkPair(&vm);
-    try roots.add(.{ .Closure = owner_pair.owner });
+    _ = scope.protectValueAssumeCapacity(.{ .Closure = owner_pair.owner });
     try vm.gcEnterGenerational();
     const young = try vm.allocTableNoGc();
 
@@ -54481,9 +54785,9 @@ test "P16.50-review-8 1.2: incremental join reserve OOM leaves state byte-exact"
     defer vm.deinit();
 
     const fx = try p50r8MkPair(&vm);
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(.{ .Closure = fx.owner });
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(.{ .Closure = fx.owner });
 
     // Non-firing guard at pause (fresh vm — the owner is still white):
     // armed fail_index=0, the plan is empty and NOTHING allocates.
@@ -54551,9 +54855,9 @@ test "P16.50-review-8 1.2: incremental setupvalue reserve OOM leaves state byte-
     defer vm.deinit();
 
     const fx = try p50r8MkPair(&vm);
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(.{ .Closure = fx.owner });
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(.{ .Closure = fx.owner });
     // A dead-white table (created before the cycle, unrooted): the value
     // the setupvalue store must protect — without the barrier the sweep
     // frees it.
@@ -54713,11 +55017,11 @@ test "P16.50-review T2: lua_newthread C-ABI OOM transaction" {
     // the transaction — it must fail BEFORE the Thread exists, leaving
     // every piece of state untouched (the pre-P16.50 shape failed later,
     // mid-construction). ----
-    var fill_roots = vm.gcTempRoots();
-    defer fill_roots.end();
+    var fill_scope = try vm.openRootScope(vm.gc_objects.capacity - vm.gc_objects.items.len, 0);
+    defer fill_scope.close();
     while (vm.gc_objects.capacity - vm.gc_objects.items.len >= 1) {
         const t = try vm.allocTableNoGc();
-        try fill_roots.add(.{ .Table = t });
+        _ = fill_scope.protectValueAssumeCapacity(.{ .Table = t });
     }
     // The fill tables registered YOUNG (post-gcEnterGenerational); promote
     // them out of the young list so the post-probe gcMinorCollection never
@@ -54754,8 +55058,8 @@ test "P16.50-review T2: lua_newthread C-ABI OOM transaction" {
         try vm.gcMinorCollection();
         try snap.assertRestored(vm);
     }
-    // The fill tables stay registered (old) + temp-rooted until
-    // fill_roots.end() / state.deinit — the established fill-table pattern.
+    // The fill tables stay registered (old) + root-scoped until
+    // fill_scope.close() / state.deinit — the established fill-table pattern.
 }
 
 test "P16.50-review T3: registerfuncs per-closure Cells + fresh-table publish rollback" {
@@ -54771,12 +55075,12 @@ test "P16.50-review T3: registerfuncs per-closure Cells + fresh-table publish ro
     // Pre-intern the library names BEFORE entering generational mode,
     // temp-rooted through its full cycle: every per-entry internStr in
     // registerfuncs then hits the table without allocating.
-    var setup_roots = vm.gcTempRoots();
-    defer setup_roots.end();
+    var scope = try vm.openRootScope(2, 0);
+    defer scope.close();
     const key_f1a = try vm.internStr("p50r3_f1a");
-    try setup_roots.add(.{ .String = key_f1a });
+    _ = scope.protectValueAssumeCapacity(.{ .String = key_f1a });
     const key_f1b = try vm.internStr("p50r3_f1b");
-    try setup_roots.add(.{ .String = key_f1b });
+    _ = scope.protectValueAssumeCapacity(.{ .String = key_f1b });
     try vm.gcEnterGenerational();
 
     const c_api0 = @import("c_api.zig");
@@ -55034,10 +55338,10 @@ test "P16.50-review-5 T4: allocator-boundary check/charge split under native fai
     // control exists and BEFORE entering generational mode: the dispatch
     // boundary interns nothing on OOM (oom_msg_str is pre-interned at
     // Vm.init), but keep the old discipline — a hit is allocation-free.
-    var setup_roots = vm.gcTempRoots();
-    defer setup_roots.end();
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
     const key_msg = try vm.internStr("not enough memory");
-    try setup_roots.add(.{ .String = key_msg });
+    _ = scope.protectValueAssumeCapacity(.{ .String = key_msg });
     try vm.gcEnterGenerational();
 
     // Prime both registries: the failure paths' errdefers then exercise
@@ -55228,15 +55532,18 @@ test "P16.50-review-2 B1: opClosure heap worklist (nups=20) mixed OOM matrix" {
 
     // ---- Base state: everything created before gcEnterGenerational is OLD,
     // so the failure branches' gcMinorCollection never touches it. ----
-    var setup_roots = vm.gcTempRoots();
-    defer setup_roots.end();
+    var borrowed: [10]*Cell = undefined;
+    // No defer: the explicit close below releases the roots mid-test
+    // (before the OOM probes); an error path leaves the scope open, which
+    // only outlives the test's own vm.
+    var setup_scope = try vm.openRootScope(5, 0);
 
     // Fill tables: keep gc_objects non-empty so the rollback's
     // gcUnregisterObjectRollback swapRemoves exercise the swap-with-last path.
     var fill_tables: [4]*Table = undefined;
     for (&fill_tables) |*slot| {
         const t = try vm.allocTableNoGc();
-        try setup_roots.add(.{ .Table = t });
+        _ = setup_scope.protectValueAssumeCapacity(.{ .Table = t });
         slot.* = t;
     }
 
@@ -55244,7 +55551,6 @@ test "P16.50-review-2 B1: opClosure heap worklist (nups=20) mixed OOM matrix" {
     // window [16..28)) — the foreign live cells the child's 10 proxy
     // descriptors resolve to through cur_upvalues. The exact-ownership
     // worklist rollback must never touch them.
-    var borrowed: [10]*Cell = undefined;
     for (0..10) |i| {
         th.bytecode_stack[i] = .{ .Int = @intCast(100 + i) };
         const cell = try vm.alloc.create(Cell);
@@ -55267,11 +55573,11 @@ test "P16.50-review-2 B1: opClosure heap worklist (nups=20) mixed OOM matrix" {
     vm.gcRegisterCommit(.{ .closure = keeper });
     vm.gcNoteAlloc(@sizeOf(Closure) + 10 * @sizeOf(*Cell));
     vm.testc_obj_functions += 1; // balances p50TeardownClosure's decrement
-    try setup_roots.add(.{ .Closure = keeper });
+    _ = setup_scope.protectValueAssumeCapacity(.{ .Closure = keeper });
 
     try vm.gcEnterGenerational();
     p50TeardownClosure(&vm, keeper); // cells stay registered + old
-    setup_roots.end(); // fill tables stay registered (old) until vm.deinit
+    setup_scope.close(); // fill tables stay registered (old) until vm.deinit
 
     // Prime both registries so opClosure's gcPrepareRegister(21) is a
     // capacity no-op — the failure index then maps 1:1 onto the construction
@@ -55447,8 +55753,8 @@ test "P16.50-review-2 B3: callCFunction ERRMEM/ERRRUN status transport" {
     var state = api.State.init(.{ .allocator = testing.allocator });
     defer state.deinit();
     const vm = state.vm;
-    var roots = vm.gcTempRoots();
-    defer roots.end();
+    var scope = try vm.openRootScope(0, 0);
+    defer scope.close();
     const th = vm.main_thread.?;
     const frames0 = th.call_frames.len();
 
@@ -55525,28 +55831,28 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
     var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
 
-    var setup_roots = vm.gcTempRoots();
-    defer setup_roots.end();
+    var scope = try vm.openRootScope(6, 0);
+    defer scope.close();
 
     // ---- Fixtures for (e)/(f), created BEFORE gcEnterGenerational and
     // BEFORE the testc control exists: OLD, temp-rooted, and their testc
     // charges (if any) never land in the per-iteration baseline. ----
     const e_tbl = try vm.allocTableNoGc();
-    try setup_roots.add(.{ .Table = e_tbl });
+    _ = scope.protectValueAssumeCapacity(.{ .Table = e_tbl });
     const s_a = try vm.internStr("a");
-    try setup_roots.add(.{ .String = s_a });
+    _ = scope.protectValueAssumeCapacity(.{ .String = s_a });
     const s_b = try vm.internStr("b");
-    try setup_roots.add(.{ .String = s_b });
+    _ = scope.protectValueAssumeCapacity(.{ .String = s_b });
     const s_sep = try vm.internStr(",");
-    try setup_roots.add(.{ .String = s_sep });
+    _ = scope.protectValueAssumeCapacity(.{ .String = s_sep });
     try vm.tableSetValue(e_tbl, .{ .Int = 1 }, .{ .String = s_a });
     try vm.tableSetValue(e_tbl, .{ .Int = 2 }, .{ .String = s_b });
 
     const f_tbl = try vm.allocTableNoGc();
-    try setup_roots.add(.{ .Table = f_tbl });
+    _ = scope.protectValueAssumeCapacity(.{ .Table = f_tbl });
     try vm.tableResize(f_tbl, 4, 4);
     const s_k = try vm.internStr("k1");
-    try setup_roots.add(.{ .String = s_k });
+    _ = scope.protectValueAssumeCapacity(.{ .String = s_k });
     try vm.tableSetValue(f_tbl, .{ .String = s_k }, .{ .Int = 11 });
     try vm.tableSetValue(f_tbl, .{ .Int = 1 }, .{ .Int = 100 });
     try vm.tableSetValue(f_tbl, .{ .Int = 2 }, .{ .Int = 200 });
@@ -56537,8 +56843,6 @@ test "P16.50-review-3 R1: k continuation error transport through finishCcall" {
     const main_th = vm.main_thread.?;
     const frames0 = main_th.call_frames.len();
 
-    var roots = vm.gcTempRoots();
-
     // ---- Segment A: k raises a plain runtime error via lua_error. The
     // ERRRUN kind must survive the whole transport: lua_resume returns 2,
     // the window is PUC's duplicated pair [err, err] (luaD_seterrorobj),
@@ -56675,10 +56979,9 @@ test "P16.50-review-3 R1: k continuation error transport through finishCcall" {
     }
 
     // Ordered teardown (explicit, no defers — the leak assertions must run
-    // AFTER state.deinit): temp roots first (they reference vm-owned
-    // objects), then the state. Everything legitimately owned is freed
+    // AFTER state.deinit): no root scope is open (nothing was rooted), so
+    // only the state remains. Everything legitimately owned is freed
     // through the tracker; what remains in `live` is exactly FINDING #4.
-    roots.end();
     state.deinit();
 
     // P16.50-review-4 BLOCKER 4 fix applied: the tracebackFrameLabel
@@ -57090,8 +57393,6 @@ test "P16.50-review-3 R3: api_status lifecycle through lua_status" {
     const main_th = vm.main_thread.?;
     const frames0 = main_th.call_frames.len();
 
-    var roots = vm.gcTempRoots();
-
     // (a) A fresh coroutine: PUC lua_newthread leaves L->status == LUA_OK
     // (the thread is suspended internally, but no error/yield status is
     // latched yet).
@@ -57177,8 +57478,8 @@ test "P16.50-review-3 R3: api_status lifecycle through lua_status" {
     try testing.expectEqual(frames0, main_th.call_frames.len());
 
     // Ordered teardown (explicit, no defers — the leak assertion must run
-    // AFTER state.deinit): temp roots first, then the state.
-    roots.end();
+    // AFTER state.deinit): no root scope is open (nothing was rooted), so
+    // only the state remains.
     state.deinit();
 
     // P16.50-review-4 BLOCKER 4 fix: the completion payload's free defer
@@ -57665,7 +57966,7 @@ test "P16.50-review-3 R5: atpanic hook on an unprotected OOM (subprocess)" {
 // early publish overwrites extra arg #1 with the table itself: `t[1]`
 // then yields the table (t[1] == t), which OP_GETVARG (reading through
 // the materialized table) faithfully returns. The VM handler must copy
-// first and publish last, with gcTempRoots as the analogue of PUC's
+// first and publish last, with a RootScope as the analogue of PUC's
 // temporary L->top slot so an emergency GC inside tableResizeArray /
 // setIndexValue cannot sweep the half-built table.
 // ─────────────────────────────────────────────────────────────────────
@@ -57695,9 +57996,9 @@ test "varargprep: named-vararg (...t) table slot-1 integrity + OOM transactional
         \\return x1, x2, x3, x4, x5, x6, y1, y2, y3, y4
     ;
     const chunk_v = try vm.compileChunkValue(src, "=vararg-slot1");
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(chunk_v);
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(chunk_v);
     const cl = chunk_v.Closure;
 
     // Runs the chunk and checks all 10 results (both vararg modes).
@@ -57733,7 +58034,7 @@ test "varargprep: named-vararg (...t) table slot-1 integrity + OOM transactional
     // Install the testC allocator adapter (PUC debug_realloc): every
     // vm.alloc failure runs ONE emergency full GC and retries — the exact
     // window where the half-built vararg table must stay alive through
-    // gcTempRoots (PUC: the table parked at L->top survives the emergency
+    // the RootScope (PUC: the table parked at L->top survives the emergency
     // GC inside luaH_resize).
     try vm.enableTestcModule();
     var outs: [1]Value = undefined;
@@ -57810,10 +58111,10 @@ test "P16.50-review-6 B2: newmetatable shared path + per-edge OOM ownership" {
     // (temp-rooted). The per-iteration names are deliberately NOT
     // pre-interned: the tname-intern edge must be inside the swept window.
     const reg = try vm.apiEnsureRegistry();
-    var setup_roots = vm.gcTempRoots();
-    defer setup_roots.end();
+    var setup_scope = try vm.openRootScope(2, 0);
+    defer setup_scope.close();
     const name_key = try vm.internStr("__name");
-    try setup_roots.add(.{ .String = name_key });
+    _ = setup_scope.protectValueAssumeCapacity(.{ .String = name_key });
 
     // Fill the registry's hash part to EXACTLY full (no empty node slots):
     // the publish edge (registry insertion) must ALLOCATE (rehash) during
@@ -57978,9 +58279,9 @@ test "P16.50-review-6 B2: newmetatable shared path + per-edge OOM ownership" {
     }
 
     // ---- review-7 B2: dedicated ROOT edge (caller-stack append OOM). ----
-    // The old shape's root edge was the `roots.add` infra allocation
-    // (fallible, after the table); review-7 B2 moved it into the
-    // pre-table `roots.ensure(2)` reserve, so the only remaining
+    // The root edge's infra allocation is the RootScope's up-front
+    // reserve (before the table); with the persistent capacity built by
+    // the warm call below it is allocation-free, so the only remaining
     // "table committed but NOT stack-rooted" OOM is `root_stack.append`.
     // The index sweep above cannot pin it: persistent capacities (temp
     // roots, intern table, stack) build up across iterations and shift
@@ -57996,7 +58297,7 @@ test "P16.50-review-6 B2: newmetatable shared path + per-edge OOM ownership" {
         const key0 = try vm.internStr(root_name);
         // Keep key0 interned-alive for the failing call's Edge-1 lookup
         // (a HIT — no intern allocation inside the pinned window).
-        try setup_roots.add(.{ .String = key0 });
+        _ = setup_scope.protectValueAssumeCapacity(.{ .String = key0 });
         const mt0 = vm.apiRawGet(reg, .{ .String = key0 }).Table;
         // Teardown: unpublish, unroot, collect the table through the
         // normal sweep, then shrink the stack back to EXACT capacity.
@@ -58006,9 +58307,10 @@ test "P16.50-review-6 B2: newmetatable shared path + per-edge OOM ownership" {
         try testing.expect(!p50StillRegistered(vm, .{ .table = mt0 }));
         state.stack.shrinkAndFree(testing.allocator, base_stack_len);
 
-        // Pinned window: intern HIT, roots.ensure no-op (capacity),
-        // Table constructor = alloc #0, root_stack.append = alloc #1
-        // (stack at exact capacity — the growth MUST allocate).
+        // Pinned window: intern HIT, RootScope reserve no-op (persistent
+        // capacity from the warm call above), Table constructor = alloc
+        // #0, root_stack.append = alloc #1 (stack at exact capacity —
+        // the growth MUST allocate).
         const before_root = try testing.allocator.dupe(GcObject, vm.gc_objects.items);
         defer testing.allocator.free(before_root);
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
@@ -58105,7 +58407,7 @@ const P50r7EmergencyAlloc = struct {
 // emergency scan's marking, so the emergency GC swept the key and both
 // `mt.__name` and the registry publish received a dangling String (a
 // fresh re-intern disagreed with the dangling `__name` pointer). The fix
-// roots the key (TempRoots ensure(2) + addAssumeCapacity) BEFORE
+// roots the key (RootScope reserve + protectValueAssumeCapacity) BEFORE
 // allocTable — PUC's equivalent guarantee (it never holds an interned
 // key across the window; it re-interns at each field access).
 // ─────────────────────────────────────────────────────────────────────
@@ -58120,10 +58422,10 @@ test "P16.50-review-7 B2: newmetatable key survives emergency GC in allocTable" 
     // Registry + fixed "__name" key pre-created and temp-rooted (the
     // same setup as the review-6 per-edge test).
     const reg = try vm.apiEnsureRegistry();
-    var setup_roots = vm.gcTempRoots();
-    defer setup_roots.end();
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
     const name_key = try vm.internStr("__name");
-    try setup_roots.add(.{ .String = name_key });
+    _ = scope.protectValueAssumeCapacity(.{ .String = name_key });
 
     // Pre-intern the tname WITHOUT rooting it: Edge 1's lookup must be a
     // HIT (no intern allocation inside the window), and the pre-call
@@ -58179,12 +58481,13 @@ test "P16.50-review-7 B2: newmetatable key survives emergency GC in allocTable" 
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// P16.50-review-7 B2: the roots-RESERVE edge (TempRoots.ensure(2)) is a
-// pre-table owner: its OOM commits NOTHING (no table, no registry entry,
-// no stack shape change) and the temp-roots snapshot discipline restores
-// the lists on the error path. The reserve moved the old post-table
-// `roots.add` infra allocation BEFORE the table — the review-6 sweep
-// classifies it as pre-table; this pins it explicitly.
+// P16.50-review-7 B2: the roots-RESERVE edge (the RootScope's up-front
+// ensureUnusedCapacity) is a pre-table owner: its OOM commits NOTHING
+// (no table, no registry entry, no stack shape change) and the scope's
+// open-failure discipline leaves the root lists byte-exact on the error
+// path. The reserve moved the old post-table `roots.add` infra
+// allocation BEFORE the table — the review-6 sweep classifies it as
+// pre-table; this pins it explicitly.
 // ─────────────────────────────────────────────────────────────────────
 test "P16.50-review-7 B2: newmetatable roots-reserve OOM owns nothing (pre-table edge)" {
     const testing = std.testing;
@@ -58195,21 +58498,23 @@ test "P16.50-review-7 B2: newmetatable roots-reserve OOM owns nothing (pre-table
     const vm = state.vm;
 
     const reg = try vm.apiEnsureRegistry();
-    var setup_roots = vm.gcTempRoots();
-    defer setup_roots.end();
+    var scope = try vm.openRootScope(2, 0);
+    defer scope.close();
     const name_key = try vm.internStr("__name");
-    try setup_roots.add(.{ .String = name_key });
+    _ = scope.protectValueAssumeCapacity(.{ .String = name_key });
 
     // Pre-intern the tname (Edge 1 = lookup HIT — no intern allocation
-    // in the window) and pin BOTH temp-roots lists at EXACT capacity so
-    // roots.ensure(2) is the FIRST fallible allocation of the window.
+    // in the window) and pin BOTH root lists at EXACT capacity so the
+    // production RootScope's reserve is the FIRST fallible allocation of
+    // the window.
     const tname = "p50r7res";
     const key = try vm.internStr(tname);
-    try setup_roots.add(.{ .String = key });
-    vm.gc_temp_roots.shrinkAndFree(vm.infraAlloc(), vm.gc_temp_roots.items.len);
-    vm.gc_temp_cell_roots.shrinkAndFree(vm.infraAlloc(), vm.gc_temp_cell_roots.items.len);
+    _ = scope.protectValueAssumeCapacity(.{ .String = key });
+    vm.gc_root_values.shrinkAndFree(vm.infraAlloc(), vm.gc_root_values.items.len);
+    vm.gc_root_cells.shrinkAndFree(vm.infraAlloc(), vm.gc_root_cells.items.len);
     const gc_objects_before = vm.gc_objects.items.len;
     const base_stack_len = state.stack.items.len;
+    const depth_before = vm.gc_root_depth;
 
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{
         .fail_index = 0,
@@ -58223,9 +58528,659 @@ test "P16.50-review-7 B2: newmetatable roots-reserve OOM owns nothing (pre-table
     try testing.expect(vm.apiRawGet(reg, .{ .String = key }) == .Nil);
     try testing.expectEqual(base_stack_len, state.stack.items.len);
     try testing.expectEqual(gc_objects_before, vm.gc_objects.items.len);
-    // Snapshot discipline: the error path's roots.end() restored the
-    // setup-owned temp roots exactly.
-    try testing.expectEqual(@as(usize, 2), vm.gc_temp_roots.items.len);
+    // Open-failure discipline: the failed reserve left the setup-owned
+    // root list byte-exact (length, depth, token untouched — the depth
+    // still counts only this test's own setup scope).
+    try testing.expectEqual(@as(usize, 2), vm.gc_root_values.items.len);
+    try testing.expectEqual(depth_before, vm.gc_root_depth);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// A1.0 RootScope API §4 tests 1–3: LIFO nesting discipline, stable
+// handles across a nested reserve-driven reallocation, and the
+// open-failure byte-exact contract.
+// ─────────────────────────────────────────────────────────────────────
+test "A1.0 roots 1: RootScope LIFO nesting restores both vectors exactly" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    const t_outer = try vm.allocTableNoGc();
+    const t_mid = try vm.allocTableNoGc();
+    const t_inner = try vm.allocTableNoGc();
+    const cell = try vm.alloc.create(Cell);
+    defer vm.alloc.destroy(cell);
+    cell.* = .{ .value = .Nil, .bc_stack_idx = 0, .bc_stack_thread = null };
+
+    try testing.expectEqual(@as(usize, 0), vm.gc_root_depth);
+    // Outer scope: 1 value.
+    var outer = try vm.openRootScope(1, 0);
+    {
+        try testing.expect(outer.isValidClose());
+        _ = outer.protectValueAssumeCapacity(.{ .Table = t_outer });
+        // Mid scope nested inside outer: 1 value + 1 cell.
+        var mid = try vm.openRootScope(1, 1);
+        {
+            try testing.expect(mid.isValidClose());
+            try testing.expect(!outer.isValidClose()); // LIFO: mid is innermost
+            _ = mid.protectValueAssumeCapacity(.{ .Table = t_mid });
+            _ = mid.protectCellAssumeCapacity(cell);
+            try testing.expectEqual(@as(usize, 2), vm.gc_root_values.items.len);
+            try testing.expectEqual(@as(usize, 1), vm.gc_root_cells.items.len);
+            try testing.expectEqual(@as(usize, 2), vm.gc_root_depth);
+        }
+        mid.close();
+        try testing.expect(!mid.isValidClose()); // closed: never valid again
+        try testing.expect(outer.isValidClose()); // outer is innermost again
+        try testing.expectEqual(@as(usize, 1), vm.gc_root_values.items.len);
+        try testing.expectEqual(@as(usize, 0), vm.gc_root_cells.items.len);
+        try testing.expectEqual(@as(usize, 1), vm.gc_root_depth);
+        // Inner scope opened AFTER mid closed reuses mid's slots (LIFO
+        // truncation) — depth and token discipline still hold.
+        var inner = try vm.openRootScope(1, 0);
+        _ = inner.protectValueAssumeCapacity(.{ .Table = t_inner });
+        try testing.expectEqual(@as(usize, 2), vm.gc_root_values.items.len);
+        inner.close();
+        try testing.expectEqual(@as(usize, 1), vm.gc_root_values.items.len);
+    }
+    outer.close();
+    try testing.expect(!outer.isValidClose());
+    try testing.expectEqual(@as(usize, 0), vm.gc_root_values.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.gc_root_cells.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.gc_root_depth);
+    // Monotonic token: every open (even a reused-slot one) advanced it.
+    try testing.expect(vm.gc_root_seq >= 3);
+}
+
+test "A1.0 roots 2: ValueRoot/CellRoot handles stay stable across a nested reserve reallocation" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    const t1 = try vm.allocTableNoGc();
+    const t2 = try vm.allocTableNoGc();
+    const cell1 = try vm.alloc.create(Cell);
+    defer vm.alloc.destroy(cell1);
+    cell1.* = .{ .value = .Nil, .bc_stack_idx = 0, .bc_stack_thread = null };
+
+    // Pin both vectors at EXACT capacity so the nested scope's reserve
+    // MUST reallocate (move) the backing storage.
+    var outer = try vm.openRootScope(1, 1);
+    const h1 = outer.protectValueAssumeCapacity(.{ .Table = t1 });
+    const c1 = outer.protectCellAssumeCapacity(cell1);
+    vm.gc_root_values.shrinkAndFree(vm.infraAlloc(), vm.gc_root_values.items.len);
+    vm.gc_root_cells.shrinkAndFree(vm.infraAlloc(), vm.gc_root_cells.items.len);
+    const values_ptr_before = vm.gc_root_values.items.ptr;
+    const cells_ptr_before = vm.gc_root_cells.items.ptr;
+
+    // Nested scope: its reserve grows both vectors past capacity — the
+    // backing arrays move. Index-based handles must survive the move.
+    var inner = try vm.openRootScope(1, 1);
+    const h2 = inner.protectValueAssumeCapacity(.{ .Table = t2 });
+    try testing.expect(vm.gc_root_values.items.ptr != values_ptr_before);
+    try testing.expect(vm.gc_root_cells.items.ptr != cells_ptr_before);
+
+    // Handles read the CURRENT vector contents (post-move storage).
+    try testing.expect(h1.read().Table == t1);
+    try testing.expect(h2.read().Table == t2);
+    try testing.expect(c1.read() == cell1);
+
+    // replace retargets exactly the handled slot: h1's slot now roots
+    // t2, h2's slot still roots t2 — both readable through the handles.
+    h1.replace(.{ .Table = t2 });
+    try testing.expect(h1.read().Table == t2);
+    try testing.expect(h2.read().Table == t2);
+    try testing.expectEqual(@as(usize, 2), vm.gc_root_values.items.len);
+
+    inner.close();
+    outer.close();
+    try testing.expectEqual(@as(usize, 0), vm.gc_root_values.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.gc_root_cells.items.len);
+}
+
+test "A1.0 roots 3: openRootScope reserve failure leaves root state byte-exact" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    // Baseline scope with one live root (the state a failure must not
+    // disturb) — pinned at exact capacity so the next reserve must
+    // allocate.
+    var base = try vm.openRootScope(1, 0);
+    const t = try vm.allocTableNoGc();
+    _ = base.protectValueAssumeCapacity(.{ .Table = t });
+    vm.gc_root_values.shrinkAndFree(vm.infraAlloc(), vm.gc_root_values.items.len);
+    vm.gc_root_cells.shrinkAndFree(vm.infraAlloc(), vm.gc_root_cells.items.len);
+    const values_len0 = vm.gc_root_values.items.len;
+    const cells_len0 = vm.gc_root_cells.items.len;
+    const depth0 = vm.gc_root_depth;
+    const top0 = vm.gc_root_top;
+    const seq0 = vm.gc_root_seq;
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+        .fail_index = 0,
+        .resize_fail_index = 0,
+    });
+    vm.testc_alloc_base = failing.allocator();
+    defer vm.testc_alloc_base = null;
+
+    // The reserve itself fails: the scope never opens.
+    try testing.expectError(error.OutOfMemory, vm.openRootScope(1, 1));
+
+    // Byte-exact: lengths, depth, innermost token, and the monotonic
+    // sequence are all untouched (no half-open scope, no token burn).
+    try testing.expectEqual(values_len0, vm.gc_root_values.items.len);
+    try testing.expectEqual(cells_len0, vm.gc_root_cells.items.len);
+    try testing.expectEqual(depth0, vm.gc_root_depth);
+    try testing.expectEqual(top0, vm.gc_root_top);
+    try testing.expectEqual(seq0, vm.gc_root_seq);
+    // The baseline scope is still the innermost valid scope.
+    try testing.expect(base.isValidClose());
+
+    // Recovery: with a healthy infra allocator the same open succeeds
+    // and the LIFO discipline continues from the untouched state.
+    vm.testc_alloc_base = null;
+    var inner = try vm.openRootScope(1, 1);
+    _ = inner.protectValueAssumeCapacity(.{ .Table = t });
+    inner.close();
+    base.close();
+    try testing.expectEqual(@as(usize, 0), vm.gc_root_values.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.gc_root_depth);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// A1.0 protected boundaries §4 tests 4–10: the ONE shared
+// ProtectedBoundary contract proven at both real `_setjmp` landing pads
+// (callCFunctionWithBoundary and the protected debug-hook boundary) —
+// out-of-order/double close (safe oracle), error/OOM/yield jumps with
+// abandoned inner scopes, nested boundaries, the normal-return
+// leaked-scope invariant, and GC visibility of both root kinds.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Fresh registered Cell — a REAL GC object (the root vectors are
+/// scanned by every cycle, so a cell that enters gc_root_cells must be
+/// registry-owned, never a test-only unregistered allocation).
+fn a10MakeCell(vm: *Vm) std.mem.Allocator.Error!*Cell {
+    const cell = try vm.alloc.create(Cell);
+    errdefer vm.alloc.destroy(cell);
+    cell.* = .{ .value = .Nil, .bc_stack_idx = Cell.bc_stack_closed, .bc_stack_thread = null };
+    try vm.gcRegisterCell(cell);
+    return cell;
+}
+
+/// Callback-failure helper: push a distinctive message and throw through
+/// the boundary (the setup allocations these guard never fail under the
+/// testing allocator; the arms exist so a failure is observable, not
+/// silent).
+fn a10CbFail(L: ?*lua_State, msg: [*:0]const u8) c_int {
+    const c_api = @import("c_api.zig");
+    _ = c_api.lua_pushstring(L, msg);
+    return c_api.lua_error(L);
+}
+
+/// C callback: opens a scope, roots a fresh collectable table + cell,
+/// then throws via lua_error — the scope is DELIBERATELY abandoned at
+/// the jump (its own defer is bypassed by the _longjmp; the landing's
+/// restoreRoots must drop both roots).
+fn a10ThrowWithScopeCf(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    const vm = L.?.vm;
+    var scope = vm.openRootScope(1, 1) catch return a10CbFail(L, "a10 scope OOM");
+    const t = vm.allocTableEphemeral() catch return a10CbFail(L, "a10 table OOM");
+    const cell = a10MakeCell(vm) catch return a10CbFail(L, "a10 cell OOM");
+    _ = scope.protectValueAssumeCapacity(.{ .Table = t });
+    _ = scope.protectCellAssumeCapacity(cell);
+    _ = c_api.lua_pushstring(L, "a10 runtime!");
+    return c_api.lua_error(L);
+}
+
+/// C callback: opens a scope, roots a table + cell, then performs a push
+/// whose allocation fails under the ARMED one-shot allocator —
+/// cThrowOn's OOM arm installs the fixed MEMERRMSG and longjmps with
+/// LUA_ERRMEM (status 4).
+fn a10OomWithScopeCf(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    const vm = L.?.vm;
+    var scope = vm.openRootScope(1, 1) catch return a10CbFail(L, "a10 scope OOM");
+    const t = vm.allocTableEphemeral() catch return a10CbFail(L, "a10 table OOM");
+    const cell = a10MakeCell(vm) catch return a10CbFail(L, "a10 cell OOM");
+    _ = scope.protectValueAssumeCapacity(.{ .Table = t });
+    _ = scope.protectCellAssumeCapacity(cell);
+    // Arm INSIDE the callback: every allocation before this point ran
+    // unarmed (pass-through); the next allocation — the payload string's
+    // intern — fails deterministically.
+    a10_oneshot.?.armed = true;
+    _ = c_api.lua_pushstring(L, "a10 oom payload"); // throws LUA_ERRMEM
+    return 1; // unreachable: the push never returns on the armed shot
+}
+
+/// Coroutine body: opens a scope (roots a table + cell — deliberately
+/// left open), publishes the yielded value (a fresh table via
+/// lua_createtable on the C stack), then lua_yieldk jumps. The payload's
+/// persistent owner is th.yielded (builtinCoroutineYield stores it
+/// BEFORE the _longjmp) — never the abandoned scope.
+fn a10YieldWithScopeCf(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    const vm = L.?.vm;
+    var scope = vm.openRootScope(1, 1) catch return a10CbFail(L, "a10 scope OOM");
+    const t = vm.allocTableEphemeral() catch return a10CbFail(L, "a10 table OOM");
+    const cell = a10MakeCell(vm) catch return a10CbFail(L, "a10 cell OOM");
+    _ = scope.protectValueAssumeCapacity(.{ .Table = t });
+    _ = scope.protectCellAssumeCapacity(cell);
+    // Publish-then-jump: the yielded table goes on the C stack top;
+    // lua_yieldk hands the top nresults values to builtinCoroutineYield
+    // (th.yielded — persistent) before _longjmp(2).
+    c_api.lua_createtable(L, 0, 0);
+    return c_api.lua_yieldk(L, 1, 4242, a10KComplete);
+}
+
+/// Continuation for a10YieldWithScopeCf: records its arguments and
+/// completes the coroutine with one result.
+fn a10KComplete(L: ?*lua_State, status: c_int, ctx: isize) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    a10_k_entered = true;
+    a10_k_status = status;
+    a10_k_ctx = ctx;
+    _ = c_api.lua_pushinteger(L, 99);
+    return 1;
+}
+
+/// Control callback: opens a scope, roots a value, CLOSES it, returns
+/// one result — the well-behaved normal-return path through the boundary.
+fn a10CleanCf(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    const vm = L.?.vm;
+    var scope = vm.openRootScope(1, 0) catch return a10CbFail(L, "a10 scope OOM");
+    const t = vm.allocTableEphemeral() catch return a10CbFail(L, "a10 table OOM");
+    _ = scope.protectValueAssumeCapacity(.{ .Table = t });
+    scope.close();
+    _ = c_api.lua_pushinteger(L, 5);
+    return 1;
+}
+
+/// C callback: opens a scope, roots a table + cell, and returns NORMALLY
+/// without closing — the boundary's normal-return checkpoint must catch
+/// this (Debug: the exact-equality assert IS the discriminator;
+/// ReleaseFast: the defensive restore drops the leaked roots).
+fn a10LeakScopeCf(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    const vm = L.?.vm;
+    var scope = vm.openRootScope(1, 1) catch return a10CbFail(L, "a10 scope OOM");
+    const t = vm.allocTableEphemeral() catch return a10CbFail(L, "a10 table OOM");
+    const cell = a10MakeCell(vm) catch return a10CbFail(L, "a10 cell OOM");
+    _ = scope.protectValueAssumeCapacity(.{ .Table = t });
+    _ = scope.protectCellAssumeCapacity(cell);
+    _ = c_api.lua_pushinteger(L, 7);
+    return 1;
+}
+
+// File-scope channels for the C-ABI callbacks (they cannot capture test
+// locals — the same discipline as the p50r3 continuation globals).
+var a10_oneshot: ?*P50r3OneShot = null; // armed inside a10OomWithScopeCf
+var a10_k_entered: bool = false;
+var a10_k_status: c_int = -1;
+var a10_k_ctx: isize = -1;
+
+test "A1.0 boundary 4: out-of-order and double close are caught by the safe oracle" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    const t = try vm.allocTableNoGc();
+    const cell = try vm.alloc.create(Cell);
+    defer vm.alloc.destroy(cell);
+    cell.* = .{ .value = .Nil, .bc_stack_idx = Cell.bc_stack_closed, .bc_stack_thread = null };
+
+    var outer = try vm.openRootScope(1, 1);
+    _ = outer.protectValueAssumeCapacity(.{ .Table = t });
+    _ = outer.protectCellAssumeCapacity(cell);
+    var inner = try vm.openRootScope(1, 0);
+    _ = inner.protectValueAssumeCapacity(.{ .Table = t });
+
+    // OUT-OF-ORDER close: closing `outer` while `inner` is still open
+    // would corrupt the LIFO discipline (the production close()
+    // Debug-asserts on it and would kill the unit process). The
+    // isValidClose oracle detects the violation WITHOUT the panic.
+    try testing.expect(!outer.isValidClose()); // inner is innermost
+    try testing.expect(inner.isValidClose());
+    inner.close();
+    try testing.expect(outer.isValidClose()); // legal now
+    outer.close();
+
+    // DOUBLE CLOSE: a closed scope can never validate again (monotonic
+    // tokens) — the oracle proves a second close() would be caught.
+    try testing.expect(!outer.isValidClose());
+    try testing.expect(!inner.isValidClose());
+
+    // ABANDONED scope (the non-local-exit analogue): a scope dropped by
+    // restoreRoots can never validate either — its token was superseded
+    // by the mark's reinstated token.
+    const mark = vm.rootMark();
+    var abandoned = try vm.openRootScope(1, 0);
+    _ = abandoned.protectValueAssumeCapacity(.{ .Table = t });
+    vm.restoreRoots(mark);
+    try testing.expect(!abandoned.isValidClose());
+
+    try testing.expectEqual(@as(usize, 0), vm.gc_root_values.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.gc_root_cells.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.gc_root_depth);
+}
+
+test "A1.0 boundary 5: runtime-error jump drops the abandoned scope and keeps the error object" {
+    const testing = std.testing;
+    const api = @import("api.zig");
+    var state = api.State.init(.{ .allocator = testing.allocator });
+    defer state.deinit();
+    const vm = state.vm;
+    const th = vm.main_thread.?;
+    const frames0 = th.call_frames.len();
+    const roots_v0 = vm.gc_root_values.items.len;
+    const roots_c0 = vm.gc_root_cells.items.len;
+    const depth0 = vm.gc_root_depth;
+
+    const r = vm.callCFunction(a10ThrowWithScopeCf, &.{});
+    try testing.expectEqual(error.RuntimeError, r);
+    // The landing restored the boundary mark: the callback's abandoned
+    // Value AND Cell roots are gone, and the depth is back.
+    try testing.expectEqual(roots_v0, vm.gc_root_values.items.len);
+    try testing.expectEqual(roots_c0, vm.gc_root_cells.items.len);
+    try testing.expectEqual(depth0, vm.gc_root_depth);
+    // The ORIGINAL error object survived the transport (identity: the
+    // exact string the callback threw).
+    const msg = vm.errThread().err_obj;
+    try testing.expect(msg == .String);
+    try testing.expectEqualStrings("a10 runtime!", msg.String.bytes());
+    // Structural unwind: the C-frame is popped, no residue.
+    try testing.expectEqual(frames0, th.call_frames.len());
+
+    // A REAL full GC works after the landing — the abandoned, now
+    // unrooted callback objects (table + cell) are collectable, so the
+    // registry actually shrinks (no permanent-root leak).
+    const gc0 = vm.gc_objects.items.len;
+    try vm.gcFullCollectionForUser();
+    try testing.expect(vm.gc_objects.items.len < gc0);
+
+    // A repeat API call through the same boundary works.
+    const r2 = try vm.callCFunction(a10CleanCf, &.{});
+    defer vm.alloc.free(r2);
+    try testing.expectEqual(@as(usize, 1), r2.len);
+    try testing.expectEqual(frames0, th.call_frames.len());
+    try testing.expectEqual(roots_v0, vm.gc_root_values.items.len);
+    try testing.expectEqual(roots_c0, vm.gc_root_cells.items.len);
+}
+
+test "A1.0 boundary 6: OOM jump drops the abandoned scope; fixed MEMERRMSG identity; state usable" {
+    const testing = std.testing;
+    const api = @import("api.zig");
+    var state = api.State.init(.{ .allocator = testing.allocator });
+    defer state.deinit();
+    const vm = state.vm;
+    const th = vm.main_thread.?;
+    const frames0 = th.call_frames.len();
+    const roots_v0 = vm.gc_root_values.items.len;
+    const roots_c0 = vm.gc_root_cells.items.len;
+    const depth0 = vm.gc_root_depth;
+
+    var one_shot = P50r3OneShot{ .inner = testing.allocator };
+    a10_oneshot = &one_shot;
+    defer a10_oneshot = null;
+    const saved_alloc = vm.alloc;
+    vm.alloc = one_shot.allocator();
+    const r = vm.callCFunction(a10OomWithScopeCf, &.{});
+    vm.alloc = saved_alloc;
+
+    try testing.expect(one_shot.failed); // the armed shot fired inside the callback
+    try testing.expectEqual(error.OutOfMemory, r);
+    // The landing restored the boundary mark (both root kinds + depth).
+    try testing.expectEqual(roots_v0, vm.gc_root_values.items.len);
+    try testing.expectEqual(roots_c0, vm.gc_root_cells.items.len);
+    try testing.expectEqual(depth0, vm.gc_root_depth);
+    // LUA_ERRMEM's error object IS the fixed MEMERRMSG (pointer identity
+    // with the literal interned once at Vm init — PUC luaD_seterrorobj).
+    try testing.expect(vm.errThread().err_has_obj);
+    try testing.expectEqual(vm.oom_msg_str.?, vm.errThread().err_obj.String);
+    // Structural unwind: the C-frame is popped.
+    try testing.expectEqual(frames0, th.call_frames.len());
+
+    // The state is genuinely usable after the OOM jump: a repeat API
+    // call through the same boundary succeeds on the healthy allocator.
+    const r2 = try vm.callCFunction(a10CleanCf, &.{});
+    defer vm.alloc.free(r2);
+    try testing.expectEqual(@as(usize, 1), r2.len);
+    try testing.expectEqual(frames0, th.call_frames.len());
+}
+
+test "A1.0 boundary 7: yield jump clears abandoned roots; payload survives GC; continuation correct" {
+    const testing = std.testing;
+    const api = @import("api.zig");
+    const c_api = @import("c_api.zig");
+    var state = api.State.init(.{ .allocator = testing.allocator });
+    defer state.deinit();
+    const vm = state.vm;
+    const L = vm.main_handle.?;
+    const main_th = vm.main_thread.?;
+    const frames0 = main_th.call_frames.len();
+    const roots_v0 = vm.gc_root_values.items.len;
+    const roots_c0 = vm.gc_root_cells.items.len;
+    const depth0 = vm.gc_root_depth;
+
+    a10_k_entered = false;
+    a10_k_status = -1;
+    a10_k_ctx = -1;
+
+    const main_len0 = L.c_stack.items.len;
+    const L2 = c_api.lua_newthread(L).?;
+    const th2 = L2.thread.?;
+    c_api.lua_pushcfunction(L2, a10YieldWithScopeCf);
+
+    var nres: c_int = -1;
+    const st1 = c_api.lua_resume(L2, L, 0, &nres);
+    try testing.expectEqual(@as(c_int, 1), st1); // LUA_YIELD
+    try testing.expectEqual(@as(c_int, 1), nres);
+    try testing.expectEqual(@as(c_int, 1), c_api.lua_status(L2)); // LUA_YIELD
+    try testing.expect(th2.status == .suspended);
+    // The landing cleared the body's abandoned roots: the VM-global root
+    // vectors are back at the pre-resume baseline (the payload lives in
+    // th2.yielded / the delivered window — never in the abandoned scope).
+    try testing.expectEqual(roots_v0, vm.gc_root_values.items.len);
+    try testing.expectEqual(roots_c0, vm.gc_root_cells.items.len);
+    try testing.expectEqual(depth0, vm.gc_root_depth);
+
+    // The yielded payload was delivered onto the coroutine's window and
+    // survives a REAL full GC while the coroutine is suspended.
+    try testing.expectEqual(@as(usize, 1), L2.c_stack.items.len);
+    const payload = L2.c_stack.items[0];
+    try testing.expect(payload == .Table);
+    try vm.gcFullCollectionForUser();
+    try testing.expect(L2.c_stack.items.len >= 1);
+    try testing.expect(L2.c_stack.items[0].Table == payload.Table); // identity intact
+
+    // Resume: the continuation runs with the exact status/ctx.
+    const st2 = c_api.lua_resume(L2, L, 0, &nres);
+    try testing.expect(a10_k_entered);
+    try testing.expectEqual(@as(c_int, 1), a10_k_status); // LUA_YIELD
+    try testing.expectEqual(@as(isize, 4242), a10_k_ctx);
+    try testing.expectEqual(@as(c_int, 0), st2); // LUA_OK
+    try testing.expectEqual(@as(c_int, 1), nres);
+    try testing.expect(std.meta.eql(L2.c_stack.items[0], .{ .Int = 99 }));
+    try testing.expect(th2.status == .dead);
+
+    // Teardown (T2 idiom): the dead coroutine's frames/buffers are freed
+    // through the thread; the handle is recycled.
+    L.c_stack.shrinkRetainingCapacity(main_len0);
+    vm.c_api_thread = null;
+    p50TeardownThread(vm, th2, false);
+    vm.freeStateHandle(L2);
+    try testing.expectEqual(frames0, main_th.call_frames.len());
+    try testing.expectEqual(roots_v0, vm.gc_root_values.items.len);
+    try testing.expectEqual(roots_c0, vm.gc_root_cells.items.len);
+    try testing.expectEqual(depth0, vm.gc_root_depth);
+}
+
+test "A1.0 boundary 8: nested boundary drops only inner roots; outer handles and identity intact" {
+    const testing = std.testing;
+    const api = @import("api.zig");
+    const c_api = @import("c_api.zig");
+    var state = api.State.init(.{ .allocator = testing.allocator });
+    defer state.deinit();
+    const vm = state.vm;
+    const L = vm.main_handle.?;
+    const main_th = vm.main_thread.?;
+    const frames0 = main_th.call_frames.len();
+
+    // OUTER scope: lives ACROSS the inner protected call — an outer scope
+    // legitimately surrounds a nested protected C call; the inner
+    // boundary's mark sits ON TOP of these roots.
+    const t_outer = try vm.allocTableEphemeral();
+    const cell_outer = try a10MakeCell(vm);
+    var outer = try vm.openRootScope(1, 1);
+    const vr = outer.protectValueAssumeCapacity(.{ .Table = t_outer });
+    const cr = outer.protectCellAssumeCapacity(cell_outer);
+    const mark_outer = vm.rootMark();
+
+    // ── Error variant: the inner protected callback opens its OWN scope
+    // on top and throws — the inner landing must drop ONLY the inner
+    // roots (a relative restore, never a truncate-to-zero). ──
+    const r = vm.callCFunction(a10ThrowWithScopeCf, &.{});
+    try testing.expectEqual(error.RuntimeError, r);
+    try testing.expectEqual(mark_outer.values_len, vm.gc_root_values.items.len);
+    try testing.expectEqual(mark_outer.cells_len, vm.gc_root_cells.items.len);
+    try testing.expectEqual(mark_outer.depth, vm.gc_root_depth);
+    try testing.expect(outer.isValidClose()); // outer is innermost again
+    try testing.expect(vr.read().Table == t_outer); // identity intact
+    try testing.expect(cr.read() == cell_outer);
+
+    // ── Yield variant: the same outer scope survives a coroutine-body
+    // yield jump (the body's inner scope is dropped at ITS landing). ──
+    a10_k_entered = false;
+    a10_k_status = -1;
+    a10_k_ctx = -1;
+    const main_len0 = L.c_stack.items.len;
+    const L2 = c_api.lua_newthread(L).?;
+    const th2 = L2.thread.?;
+    c_api.lua_pushcfunction(L2, a10YieldWithScopeCf);
+    var nres: c_int = -1;
+    const st1 = c_api.lua_resume(L2, L, 0, &nres);
+    try testing.expectEqual(@as(c_int, 1), st1); // LUA_YIELD
+    // Outer roots survived the coroutine's yield landing untouched.
+    try testing.expectEqual(mark_outer.values_len, vm.gc_root_values.items.len);
+    try testing.expectEqual(mark_outer.cells_len, vm.gc_root_cells.items.len);
+    try testing.expect(outer.isValidClose());
+    try testing.expect(vr.read().Table == t_outer);
+    try testing.expect(cr.read() == cell_outer);
+    // Drive the coroutine to completion (the continuation runs), then
+    // tear it down.
+    const st2 = c_api.lua_resume(L2, L, 0, &nres);
+    try testing.expect(a10_k_entered);
+    try testing.expectEqual(@as(c_int, 0), st2); // LUA_OK
+    L.c_stack.shrinkRetainingCapacity(main_len0);
+    vm.c_api_thread = null;
+    p50TeardownThread(vm, th2, false);
+    vm.freeStateHandle(L2);
+
+    // After the outer close the baseline is restored exactly.
+    outer.close();
+    try testing.expectEqual(@as(usize, 0), vm.gc_root_values.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.gc_root_cells.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.gc_root_depth);
+    try testing.expectEqual(frames0, main_th.call_frames.len());
+}
+
+test "A1.0 boundary 9: normal-return leaked scope — Debug invariant discriminates, ReleaseFast restores defensively" {
+    const testing = std.testing;
+    const api = @import("api.zig");
+    var state = api.State.init(.{ .allocator = testing.allocator });
+    defer state.deinit();
+    const vm = state.vm;
+    const roots_v0 = vm.gc_root_values.items.len;
+    const roots_c0 = vm.gc_root_cells.items.len;
+    const depth0 = vm.gc_root_depth;
+
+    if (@import("builtin").mode == .Debug) {
+        // Debug: the boundary's normal-return check IS the discriminator
+        // (ProtectedBoundary.finish asserts rootMark().eql(mark)), so the
+        // leaking callback cannot run through the real boundary here —
+        // the assert would abort the unit process. Prove the SAME
+        // invariant with the identical oracle the boundary uses: a
+        // callback that returns with an unclosed scope leaves the root
+        // state OFF the boundary mark, and the check detects it.
+        const mark = vm.rootMark(); // what the boundary would snapshot
+        var leaked = try vm.openRootScope(1, 1);
+        const t = try vm.allocTableEphemeral();
+        const cell = try a10MakeCell(vm);
+        _ = leaked.protectValueAssumeCapacity(.{ .Table = t });
+        _ = leaked.protectCellAssumeCapacity(cell);
+        // The boundary's exact-equality check (rootMark().eql(mark))
+        // detects the leak — both vector lengths moved off the mark.
+        try testing.expect(!vm.rootMark().eql(mark));
+        // Close the test's own deliberately leaked scope (test cleanup,
+        // not a production repair): the state returns to the mark.
+        leaked.close();
+        try testing.expect(vm.rootMark().eql(mark));
+    } else {
+        // ReleaseFast: the REAL boundary path — the leaking callback
+        // runs through callCFunction and finish's DEFENSIVE restore
+        // brings the root state back to the boundary mark (no permanent
+        // roots), with the call itself succeeding normally.
+        const r = try vm.callCFunction(a10LeakScopeCf, &.{});
+        defer vm.alloc.free(r);
+        try testing.expectEqual(@as(usize, 1), r.len);
+        try testing.expect(std.meta.eql(r[0], .{ .Int = 7 }));
+        try testing.expectEqual(roots_v0, vm.gc_root_values.items.len);
+        try testing.expectEqual(roots_c0, vm.gc_root_cells.items.len);
+        try testing.expectEqual(depth0, vm.gc_root_depth);
+    }
+
+    // Both modes: a subsequent clean call passes the boundary unchanged.
+    const r2 = try vm.callCFunction(a10CleanCf, &.{});
+    defer vm.alloc.free(r2);
+    try testing.expectEqual(@as(usize, 1), r2.len);
+    try testing.expectEqual(roots_v0, vm.gc_root_values.items.len);
+    try testing.expectEqual(roots_c0, vm.gc_root_cells.items.len);
+    try testing.expectEqual(depth0, vm.gc_root_depth);
+}
+
+test "A1.0 boundary 10: objects reachable only through each root kind survive cycles and are collected after close" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    // Generational mode first, so the objects are YOUNG and a minor
+    // cycle's nursery sweep is a real reachability test (an unreachable
+    // young object is swept; the rooted ones must survive).
+    try vm.gcEnterGenerational();
+
+    var scope = try vm.openRootScope(1, 1);
+    // ValueRoot payload: a table reachable ONLY through the scope.
+    const t = try vm.allocTableEphemeral();
+    const vr = scope.protectValueAssumeCapacity(.{ .Table = t });
+    // CellRoot payload: a cell reachable ONLY through the scope.
+    const cell = try a10MakeCell(&vm);
+    const cr = scope.protectCellAssumeCapacity(cell);
+    // Control: an UNROOTED young table proves the minor cycle really
+    // sweeps unreachable nursery objects (the survival proofs below are
+    // then meaningful).
+    const garbage = try vm.allocTableEphemeral();
+
+    // REAL minor cycle: the rooted pair survives, the control is swept.
+    try vm.gcMinorCollection();
+    try testing.expect(p50StillRegistered(&vm, .{ .table = t }));
+    try testing.expect(p50StillRegistered(&vm, .{ .cell = cell }));
+    try testing.expect(!p50StillRegistered(&vm, .{ .table = garbage }));
+    try testing.expect(vr.read().Table == t);
+    try testing.expect(cr.read() == cell);
+
+    // REAL full cycle: still survives while rooted.
+    try vm.gcFullCollectionForUser();
+    try testing.expect(p50StillRegistered(&vm, .{ .table = t }));
+    try testing.expect(p50StillRegistered(&vm, .{ .cell = cell }));
+
+    // Close: both payloads become unreachable — the next full cycle
+    // collects them (the root was the ONLY reference).
+    scope.close();
+    try vm.gcFullCollectionForUser();
+    try testing.expect(!p50StillRegistered(&vm, .{ .table = t }));
+    try testing.expect(!p50StillRegistered(&vm, .{ .cell = cell }));
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -58264,9 +59219,9 @@ test "P16.50-review-6 B2: testC newmetatable shares the luaL_newmetatable path" 
         \\return true
     ;
     const chunk_v = try vm.compileChunkValue(src, "=p50r6b2-testc-newmetatable");
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(chunk_v);
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(chunk_v);
     const cl = chunk_v.Closure;
     const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
     defer vm.alloc.free(results);
@@ -58495,9 +59450,9 @@ test "P16.50-review-6 B1: T.testC runtime-dynamic result contract (real dispatch
         \\return true
     ;
     const chunk_v = try vm.compileChunkValue(src, "=p50r6-contract");
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(chunk_v);
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(chunk_v);
     const cl = chunk_v.Closure;
     const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
     defer vm.alloc.free(results);
@@ -58531,9 +59486,9 @@ test "P16.50-review-6 B1: owned-result OOM countdown sweep (before/after results
         \\return r.n, r[2], r[3], r[4]
     ;
     const chunk_v = try vm.compileChunkValue(src, "=p50r6-oom");
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(chunk_v);
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(chunk_v);
     const cl = chunk_v.Closure;
 
     var outs: [1]Value = undefined;
@@ -58831,7 +59786,7 @@ test "P16.50-review-7 B3.2: debug-hook pre-publish OOM edges roll back exactly" 
 
     // Pre-warm persistent structures so the per-iteration byte-exact
     // baseline is not skewed by one-time capacity growth: the FrameStack
-    // (scratch hook frame push+pop) and the gc_temp_roots ArrayList (one
+    // (scratch hook frame push+pop) and the gc_root_values ArrayList (one
     // add+end — the hook path roots the interned event string on every
     // call). The pending-call slot pool is handled by the capacity-aware
     // byte assertion below (its append edge is a sweep target, so it must
@@ -58840,9 +59795,9 @@ test "P16.50-review-7 B3.2: debug-hook pre-publish OOM edges roll back exactly" 
         const scratch = try vm.stageBytecodeCall(th, th.bytecode_stack_top, hook_cl, &.{});
         try vm.pushStagedBytecodeExecFrame(th, exec_frames, hook_proto, scratch.func_slot, scratch.nargs, -1);
         vm.popBytecodeExecFrame(th, exec_frames);
-        var warm_roots = vm.gcTempRoots();
-        try warm_roots.add(.Nil);
-        warm_roots.end();
+        var warm_scope = try vm.openRootScope(1, 0);
+        defer warm_scope.close();
+        _ = warm_scope.protectValueAssumeCapacity(.Nil);
     }
 
     const base_tailcall = exec_frames.getPtr(parent_index).isTailCall();
@@ -58985,9 +59940,9 @@ test "P16.50-review-7 B3.3: store_results hook apply is slot-reuse (no clear-the
         \\return t.n, t[1], t[2]
     ;
     const chunk_v = try vm.compileChunkValue(src, "=p50r7-b33");
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(chunk_v);
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(chunk_v);
     const cl = chunk_v.Closure;
 
     var outs: [1]Value = undefined;
@@ -59150,9 +60105,9 @@ test "P16.50-review-7 B3.4b: tail testC through <close> — countdown sweep + ex
         \\return T.testC('newtable; return 1')
     ;
     const chunk_v = try vm.compileChunkValue(src, "=p50r7-b34b");
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(chunk_v);
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(chunk_v);
     const cl = chunk_v.Closure;
 
     var outs: [1]Value = undefined;
@@ -59220,9 +60175,9 @@ test "P16.50-review-7 B3.4c: close continuation parks across yield and resumes e
         \\return a, b
     ;
     const chunk_v = try vm.compileChunkValue(src, "=p50r7-b34c");
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(chunk_v);
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(chunk_v);
     const cl = chunk_v.Closure;
 
     const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
@@ -59314,9 +60269,9 @@ test "P16.50-review-8 §2: continueBytecodeClose reads no field after destroy (p
             \\error("boom")
         ;
         const chunk_v = try vm.compileChunkValue(src, "=p50r8-s2-unwind");
-        var roots = vm.gcTempRoots();
-        defer roots.end();
-        try roots.add(chunk_v);
+        var scope = try vm.openRootScope(1, 0);
+        defer scope.close();
+        _ = scope.protectValueAssumeCapacity(chunk_v);
         const cl = chunk_v.Closure;
         try testing.expectError(error.RuntimeError, vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl));
         const g = vm.rawGet(vm.global_env, .{ .String = try vm.internStr("g") });
@@ -59331,9 +60286,9 @@ test "P16.50-review-8 §2: continueBytecodeClose reads no field after destroy (p
             \\return "nope"
         ;
         const chunk_v = try vm.compileChunkValue(src, "=p50r8-s2-err");
-        var roots = vm.gcTempRoots();
-        defer roots.end();
-        try roots.add(chunk_v);
+        var scope = try vm.openRootScope(1, 0);
+        defer scope.close();
+        _ = scope.protectValueAssumeCapacity(chunk_v);
         const cl = chunk_v.Closure;
         try testing.expectError(error.RuntimeError, vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl));
         const g = vm.rawGet(vm.global_env, .{ .String = try vm.internStr("g") });
@@ -59349,9 +60304,9 @@ test "P16.50-review-8 §2: continueBytecodeClose reads no field after destroy (p
             \\return "done"
         ;
         const chunk_v = try vm.compileChunkValue(src, "=p50r8-s2-ret");
-        var roots = vm.gcTempRoots();
-        defer roots.end();
-        try roots.add(chunk_v);
+        var scope = try vm.openRootScope(1, 0);
+        defer scope.close();
+        _ = scope.protectValueAssumeCapacity(chunk_v);
         const cl = chunk_v.Closure;
 
         const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
@@ -59421,9 +60376,9 @@ test "P16.50-review-8 §3.1: async gsub (function repl) OOM edges — countdown 
         \\return a, b
     ;
     const chunk_v = try vm.compileChunkValue(src, "=p50r8-gsub-fn");
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(chunk_v);
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(chunk_v);
     const cl = chunk_v.Closure;
 
     var outs: [1]Value = undefined;
@@ -59554,9 +60509,9 @@ test "P16.50-review-8 §3.1: async gsub (table __index repl) OOM edges — count
         \\return a, b
     ;
     const chunk_v = try vm.compileChunkValue(src, "=p50r8-gsub-tbl");
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(chunk_v);
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(chunk_v);
     const cl = chunk_v.Closure;
 
     var outs: [1]Value = undefined;
@@ -59659,9 +60614,9 @@ test "P16.50-review-8 §3.1: async gsub completion destroys the state struct (no
         \\return a, b
     ;
     const match_v = try vm.compileChunkValue(src_match, "=p50r8-gsub-leak1");
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(match_v);
+    var scope = try vm.openRootScope(3, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(match_v);
     const match_cl = match_v.Closure;
 
     // .returned shape (no matches → tryStartBytecodeGsub).
@@ -59671,7 +60626,7 @@ test "P16.50-review-8 §3.1: async gsub completion destroys the state struct (no
         \\return a, b
     ;
     const nomatch_v = try vm.compileChunkValue(src_nomatch, "=p50r8-gsub-leak2");
-    try roots.add(nomatch_v);
+    _ = scope.protectValueAssumeCapacity(nomatch_v);
     const nomatch_cl = nomatch_v.Closure;
 
     // .returned shape (raw table hits complete synchronously).
@@ -59681,7 +60636,7 @@ test "P16.50-review-8 §3.1: async gsub completion destroys the state struct (no
         \\return a, b
     ;
     const raw_v = try vm.compileChunkValue(src_raw, "=p50r8-gsub-leak3");
-    try roots.add(raw_v);
+    _ = scope.protectValueAssumeCapacity(raw_v);
     const raw_cl = raw_v.Closure;
 
     // Baseline after one round of all three + full GC.
@@ -59786,9 +60741,9 @@ test "P16.50-review-8 §3.2: exec-frame completion OOM edges — countdown sweep
         \\return ok, a, b, ok2, x, s, n
     ;
     const chunk_v = try vm.compileChunkValue(src, "=p50r8-execframe");
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(chunk_v);
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(chunk_v);
     const cl = chunk_v.Closure;
 
     var outs: [1]Value = undefined;
@@ -59968,11 +60923,10 @@ test "P16.50-review-10 1: sticky reserve rejection still closes; overflow drain 
     const child = try vm.allocTableNoGc();
 
     const cell = try p50r9MkOpenCell(&vm, th, slot);
-    var roots = vm.gcTempRoots();
-    defer roots.end();
+    var scope = try vm.openRootScope(0, 1);
+    defer scope.close();
     // Root ONLY the cell: the child's sole protection is the close barrier.
-    try roots.ensure(1);
-    roots.addCellAssumeCapacity(cell);
+    _ = scope.protectCellAssumeCapacity(cell);
 
     try vm.gcStartCycle(true);
     // Drain propagate. The root scan marks the open cell GRAY (open cells
@@ -60043,10 +60997,9 @@ test "P16.50-review-10 1: sticky reserve rejection at the atomic boundary; drain
     const slot: usize = 16;
     const child = try vm.allocTableNoGc();
     const cell = try p50r9MkOpenCell(&vm, th, slot);
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.ensure(1);
-    roots.addCellAssumeCapacity(cell);
+    var scope = try vm.openRootScope(0, 1);
+    defer scope.close();
+    _ = scope.protectCellAssumeCapacity(cell);
 
     try vm.gcStartCycle(true);
     // Drain propagate completely, then cross into atomic manually (the
@@ -60097,10 +61050,9 @@ test "P16.50-review-10 2: gen-minor sticky close — old gray cell overflows gra
     // OLD cell: created (and rooted) before entering generational mode —
     // gcEnterGenerational's full collection + gcMakeAllOld age it.
     const cell = try p50r9MkOpenCell(&vm, th, slot);
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.ensure(1);
-    roots.addCellAssumeCapacity(cell);
+    var scope = try vm.openRootScope(0, 1);
+    defer scope.close();
+    _ = scope.protectCellAssumeCapacity(cell);
 
     try vm.gcEnterGenerational();
     try testing.expect(vm.gc_mode == .generational);
@@ -60193,10 +61145,9 @@ test "P16.50-review-9 2: gen-minor close — young gray cell marks the value wit
     // Young cell + young child, both created after the mode switch.
     const cell = try p50r9MkOpenCell(&vm, th, slot);
     const child = try vm.allocTableNoGc();
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.ensure(1);
-    roots.addCellAssumeCapacity(cell);
+    var scope = try vm.openRootScope(0, 1);
+    defer scope.close();
+    _ = scope.protectCellAssumeCapacity(cell);
 
     try vm.gcQueueScanCell(cell);
     try testing.expect(!gcIsWhite(cell.gc_marked) and !gcIsBlack(cell.gc_marked));
@@ -60331,10 +61282,9 @@ test "P16.50-review-10 3: sticky failure at the ordinary-return seam closes imme
 
     const child = try vm.allocTableNoGc();
     const cell = try p50r9MkOpenCell(&vm, th, slot);
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.ensure(1);
-    roots.addCellAssumeCapacity(cell);
+    var scope = try vm.openRootScope(0, 1);
+    defer scope.close();
+    _ = scope.protectCellAssumeCapacity(cell);
 
     try vm.gcStartCycle(true);
     while (try vm.gcPropagateOne()) {}
@@ -60464,11 +61414,10 @@ test "P16.50-review-10 3: sticky failure at the tailcall seam closes immediately
     vm.gcRegisterCommit(.{ .closure = callee_cl });
     vm.gcNoteAlloc(@sizeOf(Closure));
 
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.ensure(2);
-    roots.addAssumeCapacity(.{ .Closure = callee_cl });
-    roots.addCellAssumeCapacity(cell);
+    var scope = try vm.openRootScope(1, 1);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(.{ .Closure = callee_cl });
+    _ = scope.protectCellAssumeCapacity(cell);
 
     try vm.gcStartCycle(true);
     while (try vm.gcPropagateOne()) {}
@@ -60552,10 +61501,9 @@ test "P16.50-review-10 3: sticky failure at the abort-unwind seam unwinds fully;
 
     const child = try vm.allocTableNoGc();
     const cell = try p50r9MkOpenCell(&vm, th, slot);
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.ensure(1);
-    roots.addCellAssumeCapacity(cell);
+    var scope = try vm.openRootScope(0, 1);
+    defer scope.close();
+    _ = scope.protectCellAssumeCapacity(cell);
 
     try vm.gcStartCycle(true);
     while (try vm.gcPropagateOne()) {}
@@ -60753,12 +61701,11 @@ test "P16.50-review-10 5: end-to-end sticky-failing resume unwinds fully; VM reu
         else => return error.TestUnexpectedResult,
     };
 
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.ensure(3);
-    roots.addAssumeCapacity(.{ .Thread = co });
-    roots.addAssumeCapacity(.{ .Closure = g });
-    roots.addCellAssumeCapacity(cell);
+    var scope = try vm.openRootScope(2, 1);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(.{ .Thread = co });
+    _ = scope.protectValueAssumeCapacity(.{ .Closure = g });
+    _ = scope.protectCellAssumeCapacity(cell);
 
     // Stage a cycle in propagate (the close's barrier plan is inc_mark —
     // the child is painted gray with the overflow fallback under the
@@ -60850,15 +61797,14 @@ test "P16.50-review-10 6: N-child overflow drain terminates; every child survive
 
     var cells: [n]*Cell = undefined;
     var children: [n]*Table = undefined;
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.ensure(n);
+    var scope = try vm.openRootScope(0, n);
+    defer scope.close();
 
     for (0..n) |i| {
         const slot = base_slot + i;
         children[i] = try vm.allocTableNoGc();
         cells[i] = try p50r9MkOpenCell(&vm, th, slot);
-        roots.addCellAssumeCapacity(cells[i]);
+        _ = scope.protectCellAssumeCapacity(cells[i]);
     }
     // Stage the cycle AFTER rooting: the root scan marks every cell gray
     // (open cells are never traversed), every child stays white.
@@ -60934,11 +61880,10 @@ test "P16.50-review-11 1: incremental close over an already-BLACK child is a byt
 
     const child = try vm.allocTableNoGc();
     const cell = try p50r9MkOpenCell(&vm, th, slot);
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.ensure(2);
-    roots.addCellAssumeCapacity(cell);
-    roots.addAssumeCapacity(.{ .Table = child });
+    var scope = try vm.openRootScope(1, 1);
+    defer scope.close();
+    _ = scope.protectCellAssumeCapacity(cell);
+    _ = scope.protectValueAssumeCapacity(.{ .Table = child });
 
     // Stage an incremental cycle; gc_gen_phase = .major is the real
     // gen-major state (gc_mode stays incremental) — it arms the close
@@ -60997,11 +61942,10 @@ test "P16.50-review-11 2: close over a GRAY child already in gc_gray — no dupl
 
     const child = try vm.allocTableNoGc();
     const cell = try p50r9MkOpenCell(&vm, th, slot);
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.ensure(2);
-    roots.addCellAssumeCapacity(cell);
-    roots.addAssumeCapacity(.{ .Table = child });
+    var scope = try vm.openRootScope(1, 1);
+    defer scope.close();
+    _ = scope.protectCellAssumeCapacity(cell);
+    _ = scope.protectValueAssumeCapacity(.{ .Table = child });
 
     try vm.gcStartCycle(true);
     vm.gc_gen_phase = .major;
@@ -61056,13 +62000,12 @@ test "P16.50-review-11 3: gen-minor close over BLACK children of every old age i
         cells[i] = try p50r9MkOpenCell(&vm, th, base_slot + i);
     }
     const child_old = try vm.allocTableNoGc();
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.ensure(6);
+    var scope = try vm.openRootScope(1, 4);
+    defer scope.close();
     for (0..4) |i| {
-        roots.addCellAssumeCapacity(cells[i]);
+        _ = scope.protectCellAssumeCapacity(cells[i]);
     }
-    roots.addAssumeCapacity(.{ .Table = child_old });
+    _ = scope.protectValueAssumeCapacity(.{ .Table = child_old });
 
     try vm.gcEnterGenerational();
     for (0..4) |i| {
@@ -61075,7 +62018,7 @@ test "P16.50-review-11 3: gen-minor close over BLACK children of every old age i
     // .old1 child: two real minor cycles take it new→survival→old1
     // (listed in gc_old1, BLACK — the production OLD1 shape).
     const child_old1 = try vm.allocTableNoGc();
-    roots.addAssumeCapacity(.{ .Table = child_old1 });
+    _ = scope.protectValueAssumeCapacity(.{ .Table = child_old1 });
     try vm.gcMinorCollection();
     try vm.gcMinorCollection();
     try testing.expect(child_old1.gc_age == .old1);
@@ -61169,17 +62112,16 @@ test "P16.50-review-11 4: overflow requeue selects the missed marker, not grayag
 
     const child = try vm.allocTableNoGc();
     const cell = try p50r9MkOpenCell(&vm, th, slot);
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.ensure(2);
-    roots.addCellAssumeCapacity(cell);
+    var scope = try vm.openRootScope(1, 1);
+    defer scope.close();
+    _ = scope.protectCellAssumeCapacity(cell);
 
     // grayagain member: a table that goes BLACK through propagate, then a
     // backward barrier (gcWriteBarrierTable over a fresh WHITE value)
     // re-grays it with gc_grayagain membership ONLY — gray by color, but
     // NOT a missed-gray marker bearer.
     const ga = try vm.allocTableNoGc();
-    roots.addAssumeCapacity(.{ .Table = ga });
+    _ = scope.protectValueAssumeCapacity(.{ .Table = ga });
     try vm.gcStartCycle(true);
     while (try vm.gcPropagateOne()) {}
     try testing.expect(gcIsBlack(ga.gc_marked));
@@ -61246,13 +62188,12 @@ test "P16.50-review-11 5: partial overflow requeue keeps only unprocessed marker
 
     var cells: [n]*Cell = undefined;
     var children: [n]*Table = undefined;
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.ensure(n);
+    var scope = try vm.openRootScope(0, n);
+    defer scope.close();
     for (0..n) |i| {
         children[i] = try vm.allocTableNoGc();
         cells[i] = try p50r9MkOpenCell(&vm, th, base_slot + i);
-        roots.addCellAssumeCapacity(cells[i]);
+        _ = scope.protectCellAssumeCapacity(cells[i]);
     }
     try vm.gcStartCycle(true);
     while (try vm.gcPropagateOne()) {}
@@ -61392,17 +62333,17 @@ test "P16.50-review-12 1: gcMarkOld1 reserve OOM is byte-exact; success re-trave
     // 2), then dropped from grayagain by gcCorrectGrayAgain (black
     // non-thread OLD1: gcMarkOld1 owns its per-cycle re-traversal).
     const owner = try vm.allocTableNoGc();
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.ensure(1);
-    roots.addAssumeCapacity(.{ .Table = owner });
-    try vm.gcMinorCollection();
-    try vm.gcMinorCollection();
-    try testing.expect(owner.gc_age == .old1);
-    try testing.expect(gcIsBlack(owner.gc_marked));
-    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = owner }));
-    try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_grayagain.items, .{ .table = owner }));
-    roots.end();
+    {
+        var scope = try vm.openRootScope(1, 0);
+        defer scope.close();
+        _ = scope.protectValueAssumeCapacity(.{ .Table = owner });
+        try vm.gcMinorCollection();
+        try vm.gcMinorCollection();
+        try testing.expect(owner.gc_age == .old1);
+        try testing.expect(gcIsBlack(owner.gc_marked));
+        try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = owner }));
+        try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_grayagain.items, .{ .table = owner }));
+    }
 
     // A young child written into the owner's array part WITHOUT a barrier
     // (the pre-review-12 world): only gcMarkOld1's forced re-traversal of
@@ -61474,13 +62415,13 @@ test "P16.50-review-12 2: negative-before — the old markold order loses the re
 
     try vm.gcEnterGenerational();
     const owner = try vm.allocTableNoGc();
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.ensure(1);
-    roots.addAssumeCapacity(.{ .Table = owner });
-    try vm.gcMinorCollection();
-    try vm.gcMinorCollection();
-    roots.end();
+    {
+        var scope = try vm.openRootScope(1, 0);
+        defer scope.close();
+        _ = scope.protectValueAssumeCapacity(.{ .Table = owner });
+        try vm.gcMinorCollection();
+        try vm.gcMinorCollection();
+    }
 
     const child = try vm.allocTableNoGc();
     try vm.tableResizeArray(owner, 1);
@@ -61532,11 +62473,10 @@ test "P16.50-review-12 3: back-barrier reserve OOM precedes the observable store
 
     const owner = try vm.allocTableNoGc();
     const ud = try vm.allocUserdata(16, 2);
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.ensure(2);
-    roots.addAssumeCapacity(.{ .Table = owner });
-    roots.addAssumeCapacity(.{ .Userdata = ud });
+    var scope = try vm.openRootScope(2, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(.{ .Table = owner });
+    _ = scope.protectValueAssumeCapacity(.{ .Userdata = ud });
     try vm.gcEnterGenerational();
     try testing.expect(owner.gc_age == .old and gcIsBlack(owner.gc_marked));
     try testing.expect(ud.gc_age == .old and gcIsBlack(ud.gc_marked));
@@ -61630,10 +62570,9 @@ test "P16.50-review-12 4: gcStoreMetatable fail indices publish nothing; success
     defer vm.deinit();
 
     const owner = try vm.allocTableNoGc();
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.ensure(1);
-    roots.addAssumeCapacity(.{ .Table = owner });
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(.{ .Table = owner });
     try vm.gcEnterGenerational();
 
     // Gen arm: fwd (black owner, white metatable) needs gc_gray + gc_old1
@@ -61751,14 +62690,14 @@ test "P16.50-review-12 5: gcDrainGrayagain reserve OOM keeps the source membersh
 
     const t1 = try vm.allocTableNoGc();
     const t2 = try vm.allocTableNoGc();
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.ensure(3);
-    roots.addAssumeCapacity(.{ .Table = t1 });
-    roots.addAssumeCapacity(.{ .Table = t2 });
-    roots.addAssumeCapacity(.{ .Thread = th });
-    try vm.gcEnterGenerational();
-    roots.end();
+    {
+        var scope = try vm.openRootScope(3, 0);
+        defer scope.close();
+        _ = scope.protectValueAssumeCapacity(.{ .Table = t1 });
+        _ = scope.protectValueAssumeCapacity(.{ .Table = t2 });
+        _ = scope.protectValueAssumeCapacity(.{ .Thread = th });
+        try vm.gcEnterGenerational();
+    }
 
     // Hand-arranged grayagain population (the state backward barriers
     // publish): a TOUCHED1 table, a TOUCHED2 table, and an OLD thread.
@@ -61945,10 +62884,9 @@ test "P16.50-review-12 7: sticky fail-everything minor cycle recovers; invariant
     defer vm.deinit();
 
     const owner = try vm.allocTableNoGc();
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.ensure(1);
-    roots.addAssumeCapacity(.{ .Table = owner });
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(.{ .Table = owner });
     try vm.gcEnterGenerational();
 
     // Young values published through the owner (new-key rawSet barriers —
@@ -62049,12 +62987,12 @@ test "P16.50-review-14 B1: type-level metatable stored mid-cycle survives the re
     // loop closes that window without weakening the proof: the test's
     // subject is the mid-cycle metatable slot, not the carrier's own
     // reachability.
-    var carrier_roots = vm.gcTempRoots();
-    defer carrier_roots.end();
+    var scope = try vm.openRootScope(2, 0);
+    defer scope.close();
     const str_val: Value = .{ .String = try vm.internStr("r14str") };
-    try carrier_roots.add(str_val);
+    _ = scope.protectValueAssumeCapacity(str_val);
     const th = try vm.apiNewThread(.Nil);
-    try carrier_roots.add(.{ .Thread = th });
+    _ = scope.protectValueAssumeCapacity(.{ .Thread = th });
 
     // One representative value per type-level slot (Int and Num share the
     // number slot; both arms are exercised).
@@ -62071,12 +63009,14 @@ test "P16.50-review-14 B1: type-level metatable stored mid-cycle survives the re
 
     for (targets, 0..) |target, ti| {
         // Fresh metatable, rooted only during construction.
-        var roots = vm.gcTempRoots();
         const mt = try vm.apiNewTable();
-        try roots.add(.{ .Table = mt });
-        try vm.apiSetTable(.{ .Table = mt }, field_key, .{ .Int = 42 + @as(i64, @intCast(ti)) });
-        try vm.apiSetTable(.{ .Table = mt }, len_key, .{ .Builtin = .string_len });
-        roots.end();
+        {
+            var mt_scope = try vm.openRootScope(1, 0);
+            defer mt_scope.close();
+            _ = mt_scope.protectValueAssumeCapacity(.{ .Table = mt });
+            try vm.apiSetTable(.{ .Table = mt }, field_key, .{ .Int = 42 + @as(i64, @intCast(ti)) });
+            try vm.apiSetTable(.{ .Table = mt }, len_key, .{ .Builtin = .string_len });
+        }
 
         // Start a REAL cycle: roots are marked now; the metatable is in no
         // slot yet, so it is NOT marked (it is white garbage from this
@@ -62118,12 +63058,14 @@ test "P16.50-review-14 B1: lightuserdata metatable is a GC root (markmt covers L
     var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
 
-    var roots = vm.gcTempRoots();
-    const mt = try vm.apiNewTable();
-    try roots.add(.{ .Table = mt });
     const field_key: Value = .{ .String = try vm.internStr("r14lud") };
-    try vm.apiSetTable(.{ .Table = mt }, field_key, .{ .Int = 7 });
-    roots.end();
+    const mt = try vm.apiNewTable();
+    {
+        var mt_scope = try vm.openRootScope(1, 0);
+        defer mt_scope.close();
+        _ = mt_scope.protectValueAssumeCapacity(.{ .Table = mt });
+        try vm.apiSetTable(.{ .Table = mt }, field_key, .{ .Int = 7 });
+    }
 
     const lud: Value = .{ .LightUserdata = @ptrFromInt(0x1234) };
     try testing.expect(vm.setTypeMetatableValue(lud, mt));
@@ -62143,12 +63085,12 @@ test "P16.50-review-14 B1: disabling the string metatable releases the old graph
 
     // Outer roots: the weak table W and its mode metatable stay rooted for
     // the whole test (they are the observation instrument).
-    var roots = vm.gcTempRoots();
-    defer roots.end();
+    var scope = try vm.openRootScope(2, 0);
+    defer scope.close();
     const w = try vm.apiNewTable();
-    try roots.add(.{ .Table = w });
+    _ = scope.protectValueAssumeCapacity(.{ .Table = w });
     const wmt = try vm.apiNewTable();
-    try roots.add(.{ .Table = wmt });
+    _ = scope.protectValueAssumeCapacity(.{ .Table = wmt });
     const mode_key: Value = .{ .String = try vm.internStr("__mode") };
     const mode_v: Value = .{ .String = try vm.internStr("v") };
     try vm.apiSetTable(.{ .Table = wmt }, mode_key, mode_v);
@@ -62157,17 +63099,19 @@ test "P16.50-review-14 B1: disabling the string metatable releases the old graph
     // Inner roots: the new string metatable mt and its strongly-referenced
     // object obj — both reachable ONLY through the string slot after the
     // inner scope ends.
-    var inner = vm.gcTempRoots();
     const mt = try vm.apiNewTable();
-    try inner.add(.{ .Table = mt });
     const obj = try vm.apiNewTable();
-    try inner.add(.{ .Table = obj });
-    const field_key: Value = .{ .String = try vm.internStr("r14w") };
-    try vm.apiSetTable(.{ .Table = mt }, field_key, .{ .Table = obj });
-    // Weak references: W[1] = mt, W[2] = obj.
-    try vm.apiSetTable(.{ .Table = w }, .{ .Int = 1 }, .{ .Table = mt });
-    try vm.apiSetTable(.{ .Table = w }, .{ .Int = 2 }, .{ .Table = obj });
-    inner.end();
+    {
+        var inner_scope = try vm.openRootScope(2, 0);
+        defer inner_scope.close();
+        _ = inner_scope.protectValueAssumeCapacity(.{ .Table = mt });
+        _ = inner_scope.protectValueAssumeCapacity(.{ .Table = obj });
+        const field_key: Value = .{ .String = try vm.internStr("r14w") };
+        try vm.apiSetTable(.{ .Table = mt }, field_key, .{ .Table = obj });
+        // Weak references: W[1] = mt, W[2] = obj.
+        try vm.apiSetTable(.{ .Table = w }, .{ .Int = 1 }, .{ .Table = mt });
+        try vm.apiSetTable(.{ .Table = w }, .{ .Int = 2 }, .{ .Table = obj });
+    }
 
     const str_val: Value = .{ .String = try vm.internStr("r14s3") };
     // Publish mt as THE string metatable (PUC lua_setmetatable default arm).
@@ -62220,10 +63164,12 @@ test "P16.50-review-14 2a: testC setmetatable runs the full lua_setmetatable pat
             .{ .LightUserdata = @ptrFromInt(16) },
         };
         for (targets) |target| {
-            var roots = vm.gcTempRoots();
             const mt = try vm.apiNewTable();
-            try roots.add(.{ .Table = mt });
-            roots.end();
+            {
+                var scope = try vm.openRootScope(1, 0);
+                defer scope.close();
+                _ = scope.protectValueAssumeCapacity(.{ .Table = mt });
+            }
             var st: std.ArrayListUnmanaged(Value) = .empty;
             defer st.deinit(vm.alloc);
             try st.append(vm.alloc, .Nil); // script slot (testC index 1)
@@ -62258,18 +63204,18 @@ test "P16.50-review-14 2a: testC setmetatable runs the full lua_setmetatable pat
             var vm_b: Vm = .init(testing.allocator, false);
             defer vm_b.deinit();
 
-            var roots = vm_b.gcTempRoots();
-            defer roots.end();
+            var scope = try vm_b.openRootScope(2, 0);
+            defer scope.close();
             // OLD black owner + young white __gc metatable in generational
             // minor mode (r13 setup): arms every transaction reserve
             // (finalizables, gray, old1).
             _ = vm_b.gcControl(7, 0, -1); // LUA_GCGENERATIONAL
             _ = vm_b.gcControl(2, 0, -1); // LUA_GCCOLLECT
             const owner = try vm_b.apiNewTable();
-            try roots.add(.{ .Table = owner });
+            _ = scope.protectValueAssumeCapacity(.{ .Table = owner });
             _ = vm_b.gcControl(2, 0, -1); // promote the owner OLD/black
             const mt = try vm_b.apiNewTable();
-            try roots.add(.{ .Table = mt });
+            _ = scope.protectValueAssumeCapacity(.{ .Table = mt });
             try vm_b.apiSetTable(.{ .Table = mt }, .{ .String = try vm_b.internStr("__gc") }, .{ .Builtin = .type });
             try testing.expect(owner.metatable == null);
 
@@ -62361,24 +63307,23 @@ test "P16.50-review-14 HIGH 1: table setmetatable is forward-barrier-only (no gr
     // young/white metatable arms the FORWARD barrier (PUC luaC_barrier_).
     _ = vm.gcControl(7, 0, -1); // LUA_GCGENERATIONAL
     _ = vm.gcControl(2, 0, -1); // LUA_GCCOLLECT
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.ensure(1);
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
     const owner = try vm.apiNewTable();
-    roots.addAssumeCapacity(.{ .Table = owner });
+    _ = scope.protectValueAssumeCapacity(.{ .Table = owner });
     _ = vm.gcControl(2, 0, -1); // full collect → owner OLD/black
 
     // Young/white metatable carrying a young child table in a field. Both
     // stay rooted through the transaction (PUC roots mt on the L stack);
     // they are unrooted AFTER the commit so the minor cycle below proves
     // survival through owner.metatable alone.
-    var mtroots = vm.gcTempRoots();
-    defer mtroots.end();
-    try mtroots.ensure(2);
     const mt = try vm.apiNewTable();
-    mtroots.addAssumeCapacity(.{ .Table = mt });
     const child = try vm.apiNewTable();
-    mtroots.addAssumeCapacity(.{ .Table = child });
+    // No defer: the explicit close below unroots mt/child before the
+    // minor-cycle survival proof.
+    var mt_scope = try vm.openRootScope(2, 0);
+    _ = mt_scope.protectValueAssumeCapacity(.{ .Table = mt });
+    _ = mt_scope.protectValueAssumeCapacity(.{ .Table = child });
     const field_key: Value = .{ .String = try vm.internStr("r14h1child") };
     try vm.apiSetTable(.{ .Table = mt }, field_key, .{ .Table = child });
 
@@ -62410,7 +63355,7 @@ test "P16.50-review-14 HIGH 1: table setmetatable is forward-barrier-only (no gr
     try testing.expect(gcIsBlack(owner.gc_marked));
 
     // Unroot mt + child: reachable ONLY through owner.metatable now.
-    mtroots.end();
+    mt_scope.close();
 
     // A generational MINOR cycle must keep mt (and child through its
     // field): the forward barrier's gray/old1 publication is what makes
@@ -62427,9 +63372,9 @@ test "P16.50-review-14 HIGH 1: table setmetatable is forward-barrier-only (no gr
 // pushcclosure) used to leave freshly allocated tables only in Zig locals
 // across GC-capable steps (setField/intern/resize/metatable-prepare can
 // each fire an emergency GC, and the emergency scan never sees Zig
-// locals). The fix is the review-7 root discipline: TempRoots.ensure(n)
-// BEFORE the first allocation, then an infallible addAssumeCapacity
-// immediately after every table allocation.
+// locals). The fix is the review-7 root discipline: a RootScope reserve
+// BEFORE the first allocation, then an infallible
+// protectValueAssumeCapacity immediately after every table allocation.
 // ═══════════════════════════════════════════════════════════════════════
 
 /// review-14 HIGH 2 test allocator: fires ONE emergency full GC (PUC
@@ -62625,7 +63570,7 @@ test "P16.50-review-15 BLOCKER 1: coroutine.wrap C-closure construction survives
 
     // ── (A) emergency-GC matrix: fire at the first allocation after the
     // k-th constructed object — every inter-object window must keep the
-    // construction alive (the thread is rooted via gcTempRoots; the
+    // construction alive (the thread is rooted via a RootScope; the
     // cell/closure are rooted inside allocCclosure). The construction
     // performs exactly three counted allocations (thread, cell, closure)
     // and NOTHING after the closure, so the real windows are k=1 (after
@@ -62659,9 +63604,9 @@ test "P16.50-review-15 BLOCKER 1: coroutine.wrap C-closure construction survives
 
         // A REAL full cycle after the emergency: the rooted closure (and
         // cell + thread through it) survives.
-        var roots = vm.gcTempRoots();
-        defer roots.end();
-        try roots.add(.{ .Closure = cl });
+        var scope = try vm.openRootScope(1, 0);
+        defer scope.close();
+        _ = scope.protectValueAssumeCapacity(.{ .Closure = cl });
         try vm.gcCycleFull();
         try testing.expect(p50StillRegistered(&vm, .{ .closure = cl }));
         try testing.expect(p50StillRegistered(&vm, .{ .cell = cl.upvalues[0] }));
@@ -62694,9 +63639,9 @@ test "P16.50-review-15 BLOCKER 1: coroutine.wrap C-closure construction survives
                 const cl = outs[0].Closure;
                 try testing.expect(cl.c_func.? == Vm.coroutineWrapAuxwrap);
                 try testing.expect(cl.upvalues[0].value == .Thread);
-                var roots = vm.gcTempRoots();
-                defer roots.end();
-                try roots.add(.{ .Closure = cl });
+                var scope = try vm.openRootScope(1, 0);
+                defer scope.close();
+                _ = scope.protectValueAssumeCapacity(.{ .Closure = cl });
                 try vm.gcCycleFull();
                 try testing.expect(p50StillRegistered(&vm, .{ .closure = cl }));
                 try testing.expect(p50StillRegistered(&vm, .{ .cell = cl.upvalues[0] }));
@@ -62828,16 +63773,15 @@ fn r15b2EdgeIteration(path: []const u8, edge: usize, regular: bool) !bool {
     var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
 
-    // Pre-warm the temp-roots buffers so makeLinesIter's own
-    // roots.ensure() allocates nothing: the matrix then covers exactly
+    // Pre-warm the root buffers so makeLinesIter's own RootScope
+    // reserve allocates nothing: the matrix then covers exactly
     // the construction window (every allocation AFTER the inputs are
-    // rooted). The residual cold-buffer ensure edge is a TempRoots
+    // rooted). The residual cold-buffer reserve edge is a RootScope
     // mechanism property shared by every constructor, not this defect —
     // see the report finding.
     {
-        var warm = vm.gcTempRoots();
-        defer warm.end();
-        try warm.ensure(8);
+        var warm = try vm.openRootScope(8, 8);
+        defer warm.close();
     }
 
     // Fresh managed file via the REAL opener (finalizer registered,
@@ -62898,9 +63842,9 @@ fn r15b2EdgeIteration(path: []const u8, edge: usize, regular: bool) !bool {
     // file is condemned mid-construction and finalized by a regular
     // cycle despite the live iterator).
     {
-        var roots = vm.gcTempRoots();
-        defer roots.end();
-        try roots.add(objv);
+        var scope = try vm.openRootScope(1, 0);
+        defer scope.close();
+        _ = scope.protectValueAssumeCapacity(objv);
         try vm.gcCycleFull();
     }
     try testing.expect(p50StillRegistered(&vm, .{ .table = obj }));
@@ -62977,9 +63921,8 @@ test "P16.50-review-15 BLOCKER 2: io.lines roots the fresh file and formats acro
         var vm: Vm = .init(testing.allocator, false);
         defer vm.deinit();
         {
-            var warm = vm.gcTempRoots();
-            defer warm.end();
-            try warm.ensure(8);
+            var warm = try vm.openRootScope(8, 8);
+            defer warm.close();
         }
         const snap0 = try P50Snapshot.take(&vm, testing.allocator);
         defer snap0.deinit(testing.allocator);
@@ -62999,9 +63942,9 @@ test "P16.50-review-15 BLOCKER 2: io.lines roots the fresh file and formats acro
                 boundary = fi;
                 // The one success edge publishes a fully-wired iterator.
                 try testing.expect(objv == .Table);
-                var roots = vm.gcTempRoots();
-                defer roots.end();
-                try roots.add(objv);
+                var scope = try vm.openRootScope(1, 0);
+                defer scope.close();
+                _ = scope.protectValueAssumeCapacity(objv);
                 try vm.gcCycleFull();
                 try testing.expect(p50StillRegistered(&vm, .{ .table = objv.Table }));
                 break;
@@ -63070,9 +64013,9 @@ test "P16.50-review-15 HIGH 1: testC pushcclosure is stack-transactional across 
 
         // A REAL full cycle: the rooted ccl (and upvals/mt through it)
         // survives with the upvalues intact.
-        var roots = vm.gcTempRoots();
-        defer roots.end();
-        try roots.add(.{ .Table = ccl });
+        var scope = try vm.openRootScope(1, 0);
+        defer scope.close();
+        _ = scope.protectValueAssumeCapacity(.{ .Table = ccl });
         try vm.gcCycleFull();
         try testing.expect(p50StillRegistered(&vm, .{ .table = ccl }));
         try testing.expect(p50StillRegistered(&vm, .{ .table = upvals }));
@@ -63117,9 +64060,9 @@ test "P16.50-review-15 HIGH 1: testC pushcclosure is stack-transactional across 
                 const upv = vm.getFieldOpt(ccl, "__testc_upvalues").?;
                 const uv1 = vm.apiRawGet(upv.Table, .{ .Int = 1 });
                 try testing.expect(uv1 == .Table and uv1.Table == up_tbl);
-                var roots = vm.gcTempRoots();
-                defer roots.end();
-                try roots.add(.{ .Table = ccl });
+                var scope = try vm.openRootScope(1, 0);
+                defer scope.close();
+                _ = scope.protectValueAssumeCapacity(.{ .Table = ccl });
                 try vm.gcCycleFull();
                 try testing.expect(p50StillRegistered(&vm, .{ .table = ccl }));
                 break;
@@ -63192,9 +64135,9 @@ test "P16.50-review-14 2b: debug.getmetatable is raw; global getmetatable honors
         \\return true
     ;
     const chunk_v = try vm.compileChunkValue(src, "=r14-2b-debug-getmetatable");
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try roots.add(chunk_v);
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(chunk_v);
     const cl = chunk_v.Closure;
     const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
     defer vm.alloc.free(results);
@@ -63206,7 +64149,7 @@ test "P16.50-review-14 2b: debug.getmetatable is raw; global getmetatable honors
 // rooting fix (tbl/canon_key/val across the rehash window) must cost the
 // no-rehash fast path NOTHING: PUC anchors t/key/val on the preallocated
 // Lua stack (~3 pointer writes); the restructured rawSet opens the
-// gc_temp_roots session ONLY in the rehash branch — the one GC-capable
+// RootScope session ONLY in the rehash branch — the one GC-capable
 // window (tableRehash → tableResize allocates through vm.alloc, whose
 // armed testc adapter runs the emergency full GC on the failure path).
 // ─────────────────────────────────────────────────────────────────────
@@ -63224,35 +64167,38 @@ test "P16.50-review-14 D: rawSet rehash window roots tbl/key/val across the emer
     // the only protection: removing any single production root
     // (tbl/canon_key/val addAssumeCapacity in rawSet) must redden the
     // matching registration oracle below.
-    var setup_roots = vm.gcTempRoots();
-    defer setup_roots.end();
+    var tbl: *Table = undefined;
+    var key_tbl: *Table = undefined;
+    var val_tbl: *Table = undefined;
+    // No defer: the explicit close below unroots tbl/key_tbl/val_tbl so
+    // only rawSet's production RootScope protects them in the window.
+    var setup_scope = try vm.openRootScope(3, 0);
 
     // tbl with an EMPTY hash part (PUC dummy node): the first new-key
     // insert deterministically takes the rehash branch (nodeInsert has no
     // free slot to offer).
-    const tbl = try vm.allocTable(null);
-    try setup_roots.add(.{ .Table = tbl });
+    tbl = try vm.allocTable(null);
+    _ = setup_scope.protectValueAssumeCapacity(.{ .Table = tbl });
 
-    // key/val are FRESH tables — after setup_roots.end() below they live
+    // key/val are FRESH tables — after setup_scope.close() below they live
     // ONLY in Zig locals, invisible to the emergency scan unless rawSet
     // roots them across the rehash window. Pre-fix shape: the emergency
     // GC at the rehash allocation swept them and the post-rehash insert
     // published dangling pointers.
-    const key_tbl = try vm.allocTable(null);
-    try setup_roots.add(.{ .Table = key_tbl });
-    const val_tbl = try vm.allocTable(null);
-    try setup_roots.add(.{ .Table = val_tbl });
+    key_tbl = try vm.allocTable(null);
+    _ = setup_scope.protectValueAssumeCapacity(.{ .Table = key_tbl });
+    val_tbl = try vm.allocTable(null);
+    _ = setup_scope.protectValueAssumeCapacity(.{ .Table = val_tbl });
 
-    // Pre-reserve the temp-root capacity the production session's
-    // ensure(3) will need, on the still-plain allocator: the session's
+    // Pre-reserve the root-vector capacity the production RootScope's
+    // reserve will need, on the still-plain allocator: the scope's
     // reserve must be allocation-free so the emergency adapter can only
     // fire inside tableRehash→tableResize — the rehash branch's single
     // GC-capable op (barrier prepares are no-op plans in the pause state
     // and also run on infraAlloc, the uncounted base allocator).
     {
-        var pre = vm.gcTempRoots();
-        try pre.ensure(3);
-        pre.end();
+        var pre = try vm.openRootScope(3, 3);
+        pre.close();
     }
 
     // Emergency allocator (k=0: fire at the FIRST allocation after
@@ -63262,11 +64208,11 @@ test "P16.50-review-14 D: rawSet rehash window roots tbl/key/val across the emer
     defer vm.alloc = testing.allocator;
 
     // REMOVE all setup roots: tbl/key_tbl/val_tbl now have NO root other
-    // than what rawSet's production session adds inside the rehash
+    // than what rawSet's production RootScope adds inside the rehash
     // branch. This is what makes each production root independently
     // observable: the emergency GC at the rehash allocation sweeps
     // exactly the objects whose production root is missing.
-    setup_roots.end();
+    setup_scope.close();
 
     try vm.rawSet(tbl, .{ .Table = key_tbl }, .{ .Table = val_tbl });
     try testing.expect(emerg.fired);
@@ -63274,9 +64220,9 @@ test "P16.50-review-14 D: rawSet rehash window roots tbl/key/val across the emer
     // Re-root ONLY tbl for the post-publication full cycle: key_tbl and
     // val_tbl are now reachable exclusively through the published entry
     // inside tbl.
-    var hold_roots = vm.gcTempRoots();
-    defer hold_roots.end();
-    try hold_roots.add(.{ .Table = tbl });
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(.{ .Table = tbl });
 
     // The insert published the SURVIVORS (pointer identity — not
     // re-allocated lookalikes), and all three are still registered (a
@@ -63305,14 +64251,14 @@ test "P16.50-review-14 D: rawSet no-rehash insert opens ZERO temp-root sessions"
     defer vm.deinit();
     vm.stats.enabled = true;
 
-    var setup_roots = vm.gcTempRoots();
-    defer setup_roots.end();
+    var scope = try vm.openRootScope(8, 0);
+    defer scope.close();
 
     // Pre-sized constructor shape (OP_NEWTABLE pre-allocates the hinted
     // hash part — the `{v = i}` workload): 8 hash slots, no array part.
     // Every insert below fits → nodeInsert succeeds → no rehash.
     const tbl = try vm.allocTable(null);
-    try setup_roots.add(.{ .Table = tbl });
+    _ = scope.protectValueAssumeCapacity(.{ .Table = tbl });
     try vm.tableResize(tbl, 0, 8);
 
     // GC-object key/val — the exact case the temp-root session exists to
@@ -63320,23 +64266,23 @@ test "P16.50-review-14 D: rawSet no-rehash insert opens ZERO temp-root sessions"
     // setup allocations may legitimately open their own sessions).
     const key_a = try vm.allocTable(null);
     const val_a = try vm.allocTable(null);
-    try setup_roots.add(.{ .Table = key_a });
-    try setup_roots.add(.{ .Table = val_a });
+    _ = scope.protectValueAssumeCapacity(.{ .Table = key_a });
+    _ = scope.protectValueAssumeCapacity(.{ .Table = val_a });
 
     const rehash_before = vm.stats.tbl_rehash;
-    const sessions_before = vm.stats.gc_temp_root_sessions;
+    const sessions_before = vm.stats.gc_root_scope_sessions;
     try vm.rawSet(tbl, .{ .Table = key_a }, .{ .Table = val_a });
     try testing.expectEqual(rehash_before, vm.stats.tbl_rehash); // fast path taken
-    try testing.expectEqual(sessions_before, vm.stats.gc_temp_root_sessions); // ZERO session work
+    try testing.expectEqual(sessions_before, vm.stats.gc_root_scope_sessions); // ZERO session work
 
     // A second fitting insert (distinct fresh key/val) — same proof.
     const key_b = try vm.allocTable(null);
     const val_b = try vm.allocTable(null);
-    try setup_roots.add(.{ .Table = key_b });
-    try setup_roots.add(.{ .Table = val_b });
+    _ = scope.protectValueAssumeCapacity(.{ .Table = key_b });
+    _ = scope.protectValueAssumeCapacity(.{ .Table = val_b });
     try vm.rawSet(tbl, .{ .Table = key_b }, .{ .Table = val_b });
     try testing.expectEqual(rehash_before, vm.stats.tbl_rehash);
-    try testing.expectEqual(sessions_before, vm.stats.gc_temp_root_sessions);
+    try testing.expectEqual(sessions_before, vm.stats.gc_root_scope_sessions);
     const got_a = vm.rawGet(tbl, .{ .Table = key_a });
     const got_b = vm.rawGet(tbl, .{ .Table = key_b });
     try testing.expect(got_a == .Table and got_a.Table == val_a);
@@ -63345,16 +64291,16 @@ test "P16.50-review-14 D: rawSet no-rehash insert opens ZERO temp-root sessions"
     // Control: the rehash branch (empty hash part — PUC dummy) opens
     // exactly ONE session around the resize + re-insert window.
     const tbl2 = try vm.allocTable(null);
-    try setup_roots.add(.{ .Table = tbl2 });
+    _ = scope.protectValueAssumeCapacity(.{ .Table = tbl2 });
     const key_c = try vm.allocTable(null);
     const val_c = try vm.allocTable(null);
-    try setup_roots.add(.{ .Table = key_c });
-    try setup_roots.add(.{ .Table = val_c });
-    const sessions_control = vm.stats.gc_temp_root_sessions;
+    _ = scope.protectValueAssumeCapacity(.{ .Table = key_c });
+    _ = scope.protectValueAssumeCapacity(.{ .Table = val_c });
+    const sessions_control = vm.stats.gc_root_scope_sessions;
     const rehash_control = vm.stats.tbl_rehash;
     try vm.rawSet(tbl2, .{ .Table = key_c }, .{ .Table = val_c });
     try testing.expectEqual(rehash_control + 1, vm.stats.tbl_rehash); // rehash branch taken
-    try testing.expectEqual(sessions_control + 1, vm.stats.gc_temp_root_sessions); // exactly one session
+    try testing.expectEqual(sessions_control + 1, vm.stats.gc_root_scope_sessions); // exactly one session
     const got_c = vm.rawGet(tbl2, .{ .Table = key_c });
     try testing.expect(got_c == .Table and got_c.Table == val_c);
 }

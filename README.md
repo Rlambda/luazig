@@ -31,31 +31,31 @@ Regression lane: `python3 tools/testes_matrix.py --testc` (no `_port`/`_soft` pr
 
 ### Performance
 
-Geomean slowdown vs PUC Lua: **1.41x** (measurement snapshot, runs=5 per workload; run-dependent diagnostic; lower is better; 1.0x = parity).
+Geomean slowdown vs PUC Lua: **1.43x** (measurement snapshot, runs=5 per workload; run-dependent diagnostic; lower is better; 1.0x = parity).
 
 Gate protocol: paired-seed — 21 published seeds (1..21) per workload per session (`LUAZIG_HASH_SEED` env on the production ReleaseFast binary, pinned CPU core); verdict = per-seed paired instruction deltas; wall time is diagnostic only (`tools/perf_compare.py`). Latest gate verdict: **OK** (`tools/perf/current-gate.json`).
-api580 anchored gate: **GREEN** — measured 384 B < 400 B; no-XY diagnostic: 436 B. Measured on the ReleaseFast binary `22fd46f2a15596cd`; the ledger's top-level provenance is the Debug binary `b4ab5f032dbd3026` (dual-mode ledger, not one single-RF-binary artifact). (`tools/perf/current-api580-ledger.json`). Charged/model totals 376/428 B (reconciled: false/false) are allocation-model charges, not measurements.
+api580 anchored gate: **GREEN** — measured 384 B < 400 B; no-XY diagnostic: 436 B (`tools/perf/current-api580-ledger.json`). Charged/model totals 376/428 B (reconciled: false/false) are allocation-model charges, not measurements.
 
 | Workload | Zig/PUC |
 |----------|--------:|
-| metamethod_call_noalloc | 1.86x |
-| array_access | 1.73x |
-| field_access | 1.70x |
-| branch_loop | 1.64x |
-| hash_access | 1.62x |
-| dynamic_load | 1.57x |
-| metamethod_add | 1.44x |
-| coroutine_yield | 1.43x |
+| metamethod_call_noalloc | 1.87x |
+| array_access | 1.79x |
+| field_access | 1.72x |
+| hash_access | 1.61x |
+| branch_loop | 1.61x |
+| dynamic_load | 1.56x |
+| global_arith | 1.56x |
+| coroutine_yield | 1.47x |
+| comparisons | 1.41x |
 | mixed_arith | 1.41x |
-| comparisons | 1.39x |
-| global_arith | 1.38x |
-| lua_calls | 1.33x |
+| metamethod_add | 1.36x |
+| lua_calls | 1.35x |
 | int_arith | 1.32x |
-| float_arith | 1.31x |
-| table_alloc_setmetatable | 1.22x |
-| string_loop | 1.16x |
-| temp_table_alloc | 1.09x |
-| string_concat | 1.04x |
+| float_arith | 1.32x |
+| table_alloc_setmetatable | 1.23x |
+| string_loop | 1.18x |
+| temp_table_alloc | 1.14x |
+| string_concat | 1.06x |
 <!-- END GENERATED STATUS -->
 
 See [STATUS.md](STATUS.md) for detailed profiling methodology, hotspot analysis, and optimization history.

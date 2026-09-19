@@ -1,4 +1,4 @@
-> Last updated: 2026-09-19 (P16.50-review-9 ledger-reopen)
+> Last updated: 2026-09-19 (P16.50-review-9)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -45,7 +45,7 @@ Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [ ] **P16.50-review-9 correction (review-8 не принята)**: закрыть три
+- [x] **P16.50-review-9 correction (CLOSED by review-9)**: закрыть три
   оставшихся close-upvalue окна `cell.close` → fallible
   `gcWriteBarrierCell(...) catch {}` единым reserve-before-close контрактом;
   обычные return/tailcall/unwind пути обязаны передавать OOM без частично
@@ -54,6 +54,73 @@ Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependen
   `zig`-first, чтобы Makefile не выбирал локальный stale 0.15.2 вместо
   установленного 0.16.0. Архитектура и negative tests заданы в `prompt.md`.
   Open-count 22→24.
+
+  ЗАКРЫТО фазой P16.50-review-9 (2026-09-19): BLOCKER 1 — единый close
+  contract вместо трёх локальных окон: `closeBoxedUpvaluesReserved`
+  (vm.zig:27587) — двухпроходный reserve→close→commit (PUC `luaF_closeupval`
+  lfunc.c:197-210 с infallible-барьером PUC, сделанным двухфазным): pass 1
+  (pure) планирует per-cell close-barrier (`gcPlanCloseBarrierCell`,
+  vm.zig:27524) и считает верхние границы gc_gray/gc_old1, reserve обеих
+  списков ДО первой observable close-мутации; pass 2 закрывает каждый Cell
+  (`cell.close`), делает PUC nw2black color fix и коммитит барьер
+  infallible (`gcCommitCloseBarrierCell` vm.zig:27553 +
+  appendAssumeCapacity); между reserve и коммитами нет аллокаций/GC, поэтому
+  pass-2 планы равны pass-1 бит-в-бит; частичный провал первого reserve
+  (gray получена, old1 упал) меняет только внутреннюю capacity — semantic
+  state (Cells/boxed/frame) не тронут. `CellClosePlan` (vm.zig:27505)
+  моделирует переход open→closed теми же color/age правилами, что
+  `CellWritePlan`, но gen-arm маркирует для ЛЮБОГО non-white Cell (PUC
+  `reallymarkobject` без isold-guard на mark; isold гейтит только setage).
+  Контексты разделены явно: execution close (`closeBytecodeUpvaluesFrom`
+  vm.zig:9724 теперь `Allocator.Error!void`; все call sites обновлены с
+  сохранением исходного error kind: continueBytecodeClose 10110/10118/10153,
+  completeBytecodeExecFrame vm.zig:15502+ — close перенесён ПОСЛЕ armed
+  owned_ret errdefer (15560), opTailcall vm.zig:20315,
+  unwindBytecodeExecFrames vm.zig:15777 (15812), pcall/xpcall recovery
+  23967/23981/24242, runBytecodeInternal abort-unwind 16060 с явной
+  abandon-семантикой parked frames); GC-sweep arm — provably
+  allocation-free (`ThreadUpvalueCloseContext` vm.zig:5463: `.sweep` =
+  чистый color write makewhite по PUC lgc.c:257-260, план необходимо
+  пуст, debug assert; `gcFreeObject` ctx-параметр vm.zig:28847, sweep call
+  sites 28403/28804); VM final teardown — явный barrier-skip semantics
+  (drainGcRegistries vm.zig:6342, p50TeardownThread vm.zig:51543: Values
+  могут dangle в drain order, любой барьер = UAF — PUC `lua_close` не
+  запускает барьеры). `gcWriteBarrierCell` полностью удалён из production
+  (единственное упоминание — doc-comment vm.zig:27576 о удалённой форме);
+  аудит оставшихся `catch {}` в vm.zig: 44 вхождения (33 исполняемых сайта
+  + 11 comment-ссылок на удалённые/отвергнутые формы) — каждый
+  классифицирован по owner/order: I/O (warnf/stderr/file write/seek) или
+  emergency best-effort bookkeeping (capacity hints, GC-mode entry,
+  error-path диагностика, tracking-allocator счётчики); ни один не является
+  post-mutation barrier swallow. 10 новых focused тестов (vm.zig:58809+,
+  fixture `p50r9MkOpenCell` vm.zig:58794 — production opClosure shape):
+  incremental propagate/atomic reserve-OOM byte-exact + committed-barrier
+  survival, gen-minor old gray cell (gray+old1 reserves, partial failure,
+  exactly-one publication) и young gray cell (mark-only, реальный minor
+  GC), три реальных dispatcher seam (ordinary return, bytecode tailcall,
+  abort unwind) под injected OOM с retry, thread-sweep allocation-free
+  (DebugAllocator/FailingAllocator доказывает ноль аллокаций, стек-указатели
+  запечатаны), teardown no-barrier над dangling value, end-to-end
+  resume-close OOM → pcall-visible «not enough memory» (LUA_ERRMEM
+  transport, не RuntimeError). Negative-before: временный возврат old-shape
+  (`cell.close` → swallowed fallible barrier) детерминированно валит
+  focused тесты (byte-exact discriminator «expected 1, found 0» —
+  exactly-one publication/byte-exact нарушены), restore → 287/287 зелёные.
+  BLOCKER 2 — `tools/zig` system-first: system `zig` предпочитается,
+  `tools/zig-bin/zig` — только bootstrap fallback при отсутствии system
+  zig; `./tools/zig version == zig version == 0.16.0`; `make test` /
+  `make test-smoke` реально идут на system toolchain 0.16.0; ignored
+  `tools/zig-bin` не закоммичен, policy/CI guard не добавлялся. Гейты фазы:
+  287/287 unit Debug+ReleaseFast 0 leaks; c_api test 0 FAIL + test-diff
+  DIFF PASS; tools/test_status_summary.py ALL OK; matrix --testc 31/32
+  (zig_fail=0, big.lua both_fail pre-existing); smoke 84/84; 23 heavy
+  testc-лейнов rc=0; gc.lua differential + crash contract 20/20 (+40
+  confirm byte-identical); api580 GREEN (measured 384 < 400); owner repros
+  301/301/__name; fmt + git-diff-check clean. Финальный verdict —
+  объявленной paired-seed clean-C сессией (seeds 1..21) + артефактным
+  коммитом D (вердикт дописан в D; см. фазовую запись ниже).
+  Open-count 24→23 (TBC-parity BLOCKER и emergency-GC HIGH остаются
+  открытыми).
 
 - [ ] **Safety: emergency GC не должен разыменовывать stale register
   pointers**: precise ordinary GC освобождает объекты из мёртвых регистров,
@@ -7944,6 +8011,154 @@ source_dirty = clean; вердикт сессии — в Perf-блоке ниж�
   поведение (`true 10 20` в luazig и PUC) — ложный residual, checkTabArg
   metatable'd non-Tables для table.unpack не является расхождением; (d) pre-existing: big.lua both_fail (matrix), locals.lua
   GC-pacing dot diff, cstack.lua Debug native-stack exhaustion edge.
+
+### P16.50-review-9: close-upvalue barrier transaction, sweep/teardown context split, system-first toolchain (2026-09-19)
+
+Фаза по owner-ledger correction item (открыт da4e3ef после ledger-reopen
+review-8; open-count 22→24 — correction закрыт, TBC-parity BLOCKER и
+emergency-GC HIGH остаются открытыми; open-count 24→23). Коммиты: C =
+measured source (настоящий коммит; RF binary sha256 верифицирован
+determinism-rebuild после C — см. D) → D = wrapper (полное canonical
+current-* перегенерирование на clean C + объявленная clean-C paired-seed
+perf-сессия; source_head сессии = C, source_dirty = clean; вердикт сессии —
+в Perf-блоке ниже, дописан артефактным коммитом D).
+
+- **BLOCKER 1 — единый close-upvalue barrier contract**: три оставшихся
+  окна `cell.close` → `gcWriteBarrierCell(...) catch {}` (бывшие vm.zig:5476/
+  9695/20240 — closeBytecodeUpvaluesFrom, tailcall loop, thread close)
+  закрываются одним общим механизмом, а не тремя локальными патчами:
+  `closeBoxedUpvaluesReserved` (vm.zig:27587) — двухпроходный
+  reserve→close→commit: pass 1 (pure, без мутаций) вычисляет per-cell
+  `CellClosePlan` (`gcPlanCloseBarrierCell` vm.zig:27524) и верхние границы
+  gc_gray/gc_old1 appends, оба списка резервируются ДО первой observable
+  close-мутации; pass 2 на каждый Cell: plan из неизменного pre-close
+  state → `cell.close` → PUC nw2black color fix → infallible
+  `gcCommitCloseBarrierCell` (vm.zig:27553, appendAssumeCapacity) →
+  boxed slot очищается. Между bulk reserve и коммитами нет ни одной
+  аллокации/GC-шага, поэтому pass-2 планы равны pass-1 бит-в-бит; частичный
+  провал reserve (gray capacity получена, old1 упала) меняет только
+  внутреннюю capacity списков — Cells/boxed/frame не тронуты (тест
+  partial-failure доказывает byte-exact semantic state). `CellClosePlan`
+  (vm.zig:27505) использует те же color/age правила, что `CellWritePlan`,
+  но моделирует переход open→closed: open Cell до close серый (не
+  traversed), после nw2black — владелец copied value; gen-arm маркирует
+  для ЛЮБОГО non-white Cell (PUC `reallymarkobject` без isold-guard на
+  mark), не old-only как store-arm. `gcPrepareWriteBarrierCell` после
+  `cell.close` не вызывается нигде (окно не recreated).
+- **Context split (execution vs sweep vs teardown)**:
+  `ThreadUpvalueCloseContext` (vm.zig:5463) разделяет два infallible
+  контекста явно. Execution close: `closeBytecodeUpvaluesFrom`
+  (vm.zig:9724) возвращает `std.mem.Allocator.Error!void`; ВСЕ call sites
+  обновлены с сохранением исходного error kind/status —
+  continueBytecodeClose arms (vm.zig:10110/10118/10153),
+  completeBytecodeExecFrame (vm.zig:15502+: close перенесён после armed
+  owned_ret errdefer — owned slice освобождается ровно один раз на каждой
+  failure, включая close reserve; 15560), opTailcall (vm.zig:20315),
+  unwindBytecodeExecFrames (vm.zig:15777, call site 15812), pcall/xpcall
+  recovery (vm.zig:23967/23981/24242: close-OOM заменяет in-flight error и
+  escapes protected call — PUC luaD_pcall recovery не глотает вторую
+  ошибку; двойной real-OOM зафиксирован как residual note в report),
+  runBytecodeInternal abort-unwind (vm.zig:16060: Zig errdefer не может
+  propagate вторую ошибку — close OOM проглатывается с reserve-first
+  failure-семантикой: cells остаются OPEN, stack slot остаётся
+  authoritative storage, GC-safe; parked suffix легитимен на error-exit —
+  invariant-assert расширен `abort_unwind_abandoned`).
+  `gcFreeObject(.thread)` sweep arm — provably allocation-free:
+  `ThreadUpvalueCloseContext.sweep` = чистый color write (PUC
+  luaC_barrier_ sweep arm makewhite(owner), lgc.c:257-260; GENMINOR sweep
+  no-op), план необходимо пуст (`gcPlanCloseBarrierCell` возвращает `{}`
+  для gc_state == .sweep в обоих режимах — оба sweep-цикла форсируют это
+  состояние; debug assert в closeThreadOpenUpvalues vm.zig:5485);
+  allocation-freedom contract sweep-циклов (gcSweepOne/gcSweepYoungObjects
+  резервируют всё заранее) сохранён; call sites vm.zig:28403/28804.
+  VM final teardown — явный barrier-skip semantics: `drainGcRegistries`
+  (vm.zig:6342) и `p50TeardownThread` (vm.zig:51543) передают `.teardown`
+  — Values в registries могут dangle в drain order, любой barrier plan/
+  commit разыменовал бы freed object (UAF); запускается только
+  stack-pointer fixup (`cell.close`); PUC-аналог: `lua_close` никогда не
+  запускает барьеры. Никаких `catch {}`/`catch unreachable` без
+  state-assertion не осталось: `gcWriteBarrierCell` удалён из production
+  целиком (единственное упоминание — doc-comment vm.zig:27576,
+  документирующий удалённую форму).
+- **catch{}-classification audit**: 44 оставшихся вхождения `catch {}` в
+  vm.zig (33 исполняемых сайта + 11 comment-ссылок на удалённые/отвергнутые
+  формы) классифицированы каждый по owner/order: I/O best-effort
+  (warnfHandler, stderr diagnostics, file write/seek в io-библиотеке),
+  emergency best-effort bookkeeping (call_frames capacity hints,
+  gcEnterGenerational/gcFullCollectionForUser emergency arm, cur_c_stack
+  error-object append, tracking-allocator charged.put), error-path
+  диагностика (`fail()` внутри уже падающего пути, `__closed` setField в
+  close-обработке io-объектов) — ни один не является post-mutation barrier
+  swallow или проглатыванием OOM на semantic path.
+- **BLOCKER 2 — tools/zig system-first**: wrapper инвертирован — system
+  `zig` (command -v) предпочитается, `tools/zig-bin/zig` остаётся только
+  bootstrap fallback при отсутствии system zig; stale локальный 0.15.2
+  больше не может затенить установленный 0.16.0. Проверено:
+  `./tools/zig version == zig version == 0.16.0`; `make test` и
+  `make test-smoke` реально исполняются system toolchain (unit/c_api
+  гейты фазы прогнаны через `./tools/zig`); ignored `tools/zig-bin` не
+  закоммичен (`git check-ignore` подтверждает), policy/CI guard не
+  добавлялся (запрещён AGENTS.md).
+- **Тесты**: 10 новых focused тестов (vm.zig:58809+, fixture
+  `p50r9MkOpenCell` vm.zig:58794 — production opClosure shape: open cell
+  published в owning thread's boxed window): (1) incremental propagate и
+  (2) atomic — non-white open Cell с белой Table: reserve failure до
+  close оставляет cell open, stack value, boxed slot, colors byte-exact;
+  success закрывает Cell, full GC сохраняет ребёнка (дискриминатор, на
+  котором old shape детерминированно падает); (3) gen-minor old gray Cell
+  + young child: fail indices для gray и old1 reserves по отдельности
+  (partial failure byte-exact), success с exactly-one old1 publication и
+  реальный minor GC; (4) gen-minor young gray Cell: mark-only arm без
+  promote, реальный minor survival; (5)-(7) три реальных dispatcher seam
+  (ordinary return completeBytecodeExecFrame, bytecode tailcall, abort
+  unwind) под injected OOM: frame/pc остаются parked, retry закрывает и
+  барьер спасает ребёнка; (8) thread-sweep close allocation-free
+  (FailingAllocator/DebugAllocator: ноль аллокаций от первого free),
+  стек-указатели запечатаны без dangling; (9) teardown close без барьера
+  над dangling value; (10) end-to-end: resume-time close OOM транспортируется
+  как pcall-visible «not enough memory» (LUA_ERRMEM), не RuntimeError, без
+  partially closed frame. Negative-before: временный возврат old-shape
+  (`cell.close` → swallowed fallible barrier) детерминированно валит
+  focused тесты («expected 1, found 0» — byte-exact/publication
+  discriminator), restore → 287/287 зелёные.
+- **Батарея**: 287/287 unit (Debug+ReleaseFast, 0 leaks), 23 heavy
+  testc-лейна rc=0, matrix --testc 31/32 (zig_fail=0, big.lua both_fail
+  pre-existing), smoke 84/84, c_api test 0 FAIL + test-diff DIFF PASS,
+  api580 GREEN (measured 384 < 400), fixed-load-footprint GREEN, gc.lua
+  differential + crash contract 20/20 (+40 confirm runs byte-identical),
+  owner repros 301/301/__name, fmt + git-diff-check clean,
+  tools/test_status_summary.py ALL OK.
+- **Perf**: measured runtime затронут (close contract на каждом
+  upvalue-return path + wrapper) — pre-check probe implementation-агента
+  (полные paired seeds 1..21) направлен в ОТДЕЛЬНЫЕ /tmp outputs
+  (--gate-out/--manifest-out под /tmp/opencode), canonical manifest не
+  мутирован; результат probe: OK, geomean 1.40x. ОДНА объявленная
+  paired-seed clean-C сессия (seeds 1..21, RUNS=21) на commit C
+  (source_head = C, source_dirty = clean) — verdict в
+  tools/perf/current-gate.json + current-gate-manifest.json (commit D);
+  manifest append-only; baselines byte-identical (baseline-approved/
+  baseline-p15.37/core_baseline не тронуты). Полное canonical current-*
+  перегенерирование на clean C / RF binary — артефактным коммитом D.
+- **Manifest honesty caveat (review-8 history)**: manifest review-8
+  содержит, помимо её финальной объявленной clean-C сессии
+  (2026-09-18T21:23:13Z), ДВЕ дополнительные ПОЛНЫЕ 21-seed historical
+  gate-сессии на dirty worktree 4bf132e (2026-09-18T19:58Z и
+  2026-09-18T20:01Z, result OK, из verification-probes реализации) —
+  история измерений review-8 НЕ является «ровно одной сессией»;
+  единственной DECLARED сессией фазы была clean-C. Pre-check probe фазы
+  review-9 (см. Perf выше) шёл только в отдельные /tmp outputs и никогда
+  не касался canonical manifest.
+- **Residuals (honest, для владельца)**:
+  - TBC-parity BLOCKER остаётся открытым (errored coroutine не должна
+    исполнять `<close>` до `coroutine.close`) — следующий semantic
+    advancement.
+  - emergency-GC HIGH остаётся открытым (stale register pointer
+    разыменование в full-window scan) — отдельная фаза, PUC-подобный
+    вариант описан в пункте.
+  - Tailcall gsub sync routing — INFO, не blocker (см. review-8 entry).
+  - pcall/xpcall recovery: unwind close-OOM заменяет in-flight runtime
+    error (double real-OOM) — оба являются реальными allocator failures;
+    PUC luaD_pcall также не может вернуть обе; зафиксировано как note.
 
 ### P16.50-review-8: transactional upvalue barriers, close-UAF, gsub/exec-frame ownership, exact status protocol (2026-09-19)
 

@@ -8,12 +8,15 @@ root_dir="$(CDPATH= cd -- "$script_dir/.." && pwd)"
 export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$root_dir/.zig-global-cache}"
 export ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-$root_dir/zig-cache}"
 
-if [ -x "$script_dir/zig-bin/zig" ]; then
-  exec "$script_dir/zig-bin/zig" "$@"
-fi
-
+# System toolchain first: the project targets the installed zig; a stale
+# tools/zig-bin checkout must not shadow it (P16.50-review-9 BLOCKER 2).
 if command -v zig >/dev/null 2>&1; then
   exec zig "$@"
+fi
+
+# Bootstrap fallback: local toolchain only when the system zig is absent.
+if [ -x "$script_dir/zig-bin/zig" ]; then
+  exec "$script_dir/zig-bin/zig" "$@"
 fi
 
 cat >&2 <<'EOF'

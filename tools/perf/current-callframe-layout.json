@@ -1,24 +1,24 @@
 {
- "created_utc": "2026-09-19T00:16:12.374243+00:00",
+ "created_utc": "2026-09-19T01:32:11.195266+00:00",
  "provenance": {
-  "git_head": "892b6ee2c55a97dbd0a9c689eea730d6ab212df7",
-  "measured_source_head": "892b6ee2c55a97dbd0a9c689eea730d6ab212df7",
+  "git_head": "d02270f28f880a628bc13760df5b4d4ad3140825",
+  "measured_source_head": "d02270f28f880a628bc13760df5b4d4ad3140825",
   "source_dirty": "clean",
   "zig_version": "0.16.0",
-  "probe_rf_path": "/tmp/opencode/r9a_layout_rf",
-  "probe_debug_path": "/tmp/opencode/r9a_layout_dbg",
-  "probe_rf_sha256_16": "603b75637f29d864",
-  "probe_debug_sha256_16": "0c02275b1459c07c",
+  "probe_rf_path": "/tmp/opencode/r10a_layout_rf",
+  "probe_debug_path": "/tmp/opencode/r10a_layout_dbg",
+  "probe_rf_sha256_16": "d39fe4e35db23be2",
+  "probe_debug_sha256_16": "f8be80a207ae34a5",
   "probe_build_commands": [
-   "zig build-exe -O ReleaseFast --dep lua -Mroot=/tmp/opencode/r9a_layout_probe.zig --dep util -Mlua=src/lua/root.zig -Mutil=src/util/root.zig -lc -femit-bin=/tmp/opencode/r9a_layout_rf",
-   "zig build-exe -O Debug --dep lua -Mroot=/tmp/opencode/r9a_layout_probe.zig --dep util -Mlua=src/lua/root.zig -Mutil=src/util/root.zig -lc -femit-bin=/tmp/opencode/r9a_layout_dbg"
+   "zig build-exe -O ReleaseFast --dep lua -Mroot=/tmp/opencode/r10a_layout_probe.zig --dep util -Mlua=src/lua/root.zig -Mutil=src/util/root.zig -lc -femit-bin=/tmp/opencode/r10a_layout_rf",
+   "zig build-exe -O Debug --dep lua -Mroot=/tmp/opencode/r10a_layout_probe.zig --dep util -Mlua=src/lua/root.zig -Mutil=src/util/root.zig -lc -femit-bin=/tmp/opencode/r10a_layout_dbg"
   ],
-  "zig_binary_sha256": "c7db91486fb6588a674f7fd9ecac205adcd0705b6d9ac31e0a37dd3c9b935c2b",
-  "note": "P16.50-review-9 C: probe binaries REBUILT from clean measured-source commit 892b6ee \u2014 fresh copies, hashes above, single regeneration timestamp; no relabeling, no nested timestamps."
+  "zig_binary_sha256": "ca90e3db800dc93bdcb71de6e30eedb8736e31d96768db80ab5f9e28e19c8362",
+  "note": "P16.50-review-10 C: probe binaries REBUILT from clean measured-source commit d02270f \u2014 fresh copies, hashes above, single regeneration timestamp; no relabeling, no nested timestamps."
  },
  "layout": {
   "ReleaseFast": {
-   "Vm": 5472,
+   "Vm": 5480,
    "Thread": 3736,
    "CallFrame": 88,
    "LuaFrameState": 48,
@@ -29,7 +29,7 @@
    "CallFrame_u_offset": 32
   },
   "Debug": {
-   "Vm": 5576,
+   "Vm": 5584,
    "Thread": 3736,
    "CallFrame": 88,
    "LuaFrameState": 48,

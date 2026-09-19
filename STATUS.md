@@ -1,4 +1,4 @@
-> Last updated: 2026-09-19 (P16.50-review-10 correction closed)
+> Last updated: 2026-09-19 (P16.50-review-10)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -38,7 +38,7 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | C API suites (`tests/c_api`) | 23 suites |
 | Performance (geomean vs PUC) | **1.43x** |
 | Perf gate (paired-seed) | **OK** — 21 published seeds (1..21) |
-| api580 fixed-load footprint | **GREEN** — anchored gate 384 B < 400 B; no-XY diagnostic 436 B; Measured on the ReleaseFast binary `c7db91486fb6588a`; the ledger's top-level provenance is the Debug binary `7cd92e6b1139d745` (dual-mode ledger, not one single-RF-binary artifact). |
+| api580 fixed-load footprint | **GREEN** — anchored gate 384 B < 400 B; no-XY diagnostic 436 B; Measured on the ReleaseFast binary `ca90e3db800dc93b`; the ledger's top-level provenance is the Debug binary `d51215c5d94eb263` (dual-mode ledger, not one single-RF-binary artifact). |
 
 Geomean замедления vs PUC Lua: **1.43x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
@@ -90,6 +90,22 @@ Geomean замедления vs PUC Lua: **1.43x** (цель: 1.0x; run-dependen
   (dirname/cat заменены shell builtins, loud 127 failure); все 5 layout
   cases проверены. Open-count 24→23 (TBC-parity BLOCKER и emergency-GC HIGH
   остаются открытыми).
+
+  Verdict clean-C сессии (2026-09-19T01:36:52Z, дописано артефактным
+  коммитом D): GREEN — RESULT OK, 18/18 workloads OK, worst per-seed
+  +2.806% (table_alloc_setmetatable[10]) < WARN 5%, wall-P25 envelope max
+  +4.098% (temp_table_alloc) < 10%, geomean diagnostic 1.43x (snapshot
+  current.json); binary sha256
+  ca90e3db800dc93bdcb71de6e30eedb8736e31d96768db80ab5f9e28e19c8362
+  (plain `zig build -Doptimize=ReleaseFast`; determinism: pre-C build ==
+  post-C rebuild == session binary == post-regeneration rebuild; commit C
+  message quotes тот же plain-build sha — расхождения режимов в этой фазе
+  нет); source_head d02270f = C, source_dirty = clean; manifest
+  append-only 23→24 строки. Коррекция battery-числа из commit C message:
+  фактический канонический matrix capture — 31/32 (zig_fail=0, big.lua
+  both_fail pre-existing), «33 pass» в сообщении C было ошибкой переноса
+  из черновика батареи; канонический артефакт
+  tools/status/current-matrix.json фиксирует 31/32.
 
 - [x] **P16.50-review-9 correction (CLOSED by review-9)**: закрыть три
   оставшихся close-upvalue окна `cell.close` → fallible
@@ -8160,12 +8176,22 @@ perf-сессия; source_head сессии = C, source_dirty = clean; верд�
   (bc_stack_idx != bc_stack_closed — лишний frame/open Cell видим),
   restore → зелёные.
 - **Батарея**: 288/288 unit (Debug+ReleaseFast, 0 leaks), matrix --testc
-  33 pass (zig_fail=0, big.lua both_fail pre-existing), smoke 84/84, c_api
-  test 0 FAIL + test-diff DIFF PASS, api580 GREEN (measured 384 < 400),
-  23 heavy testc-лейнов rc=0, crash contract 0/20, owner repros
-  301/301/__name, wrapper layouts (0.16.0 во всех внешних cases), grep
-  audits 0 hits (abort_unwind_abandoned/parked), fmt + git-diff-check
-  clean.
+  31/32 (zig_fail=0, big.lua both_fail pre-existing; канонический capture —
+  см. ниже note о flake), smoke 84/84, c_api test 0 FAIL + test-diff
+  DIFF PASS, api580 GREEN (measured 384 < 400), 23 heavy testc-лейнов
+  rc=0, crash contract 0/20, owner repros 301/301/__name, wrapper layouts
+  (0.16.0 во всех внешних cases), grep audits 0 hits
+  (abort_unwind_abandoned/parked), fmt + git-diff-check clean.
+  Flake note (environmental, unconfirmed): в двух полных
+  status_snapshot-прогонах matrix-лейн зафиксировал files.lua both_fail
+  (обе engine с одинаковым «assertion failed», zig_fail=0/output_diff=0) и
+  smoke-лейн — эфемерный DIFF на 29_platform_process_io.lua (kill -HUP
+  assertion, обе engine идентично); 30+ прямых прогонов files.lua (обе
+  engine, включая 3 полных matrix-лейна с точной командой snapshot) и
+  повторный smoke-лейн — чистые. Паритет не нарушен (обе engine падают
+  идентично), канонические артефакты — из чистых capture-прогонов на том
+  же binary sha ca90e3db / clean C; поиск решающего evidence не завершён —
+  подозрение на environmental flake в process/io подсистеме test-хоста.
 - **Perf**: measured runtime затронут (GC worklist/close hot path) —
   pre-check probe implementation-агента (полные paired seeds 1..21)
   направлен в ОТДЕЛЬНЫЕ /tmp outputs (/tmp/opencode/r10_perf/), canonical
@@ -8176,6 +8202,21 @@ perf-сессия; source_head сессии = C, source_dirty = clean; верд�
   manifest append-only; baselines byte-identical (baseline-approved/
   baseline-p15.37/core_baseline не тронуты). Полное canonical current-*
   перегенерирование на clean C / RF binary — артефактным коммитом D.
+  Verdict clean-C сессии (2026-09-19T01:36:52Z, дописано артефактным
+  коммитом D): GREEN — RESULT OK, 18/18 workloads OK, worst per-seed
+  +2.806% (table_alloc_setmetatable[10]) < WARN 5%; wall-P25 envelope max
+  +4.098% (temp_table_alloc) < 10%; geomean diagnostic 1.43x (snapshot
+  current.json); binary sha256
+  ca90e3db800dc93bdcb71de6e30eedb8736e31d96768db80ab5f9e28e19c8362
+  (полный sha в manifest row; determinism: plain `zig build` pre-C ==
+  post-C rebuild == session binary == post-regeneration rebuild; commit C
+  message quotes тот же plain-build sha — расхождения режимов нет; в
+  сообщении C неточно указано «matrix 33 pass» — фактический канонический
+  capture 31/32, см. Батарею выше). Manifest append-only, 24 строки — все
+  23 исторических строки (включая обе probe-сессии review-8 на dirty
+  4bf132e и финальную clean-C сессию review-8, clean-C сессию review-9)
+  сохранены как historical; pre-check probe фазы review-10 шёл только в
+  отдельные /tmp outputs и не касался canonical manifest.
 - **Residuals (honest, для владельца)**:
   - TBC-parity BLOCKER остаётся открытым (errored coroutine не должна
     исполнять `<close>` до `coroutine.close`) — следующий semantic

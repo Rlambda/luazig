@@ -1,4 +1,4 @@
-> Last updated: 2026-09-19 (P16.50-review-13)
+> Last updated: 2026-09-19 (P16.50-review-14 correction opened by review)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -44,6 +44,22 @@ Geomean замедления vs PUC Lua: **1.42x** (цель: 1.0x; run-dependen
 <!-- END GENERATED SUMMARY -->
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
+
+- [ ] **P16.50-review-14 correction**: сохранить общий metatable
+  prepare→store→infallible-commit review-13, но завершить PUC lifecycle.
+  BLOCKER: type-level metatables не перемаркируются в atomic, а
+  `light_userdata_metatable` вообще отсутствует в root scan; снятый string
+  metatable остаётся вечным root. BLOCKER/HIGH публичной семантики: testC
+  снимает mt до fallible prepare и не поддерживает type slots;
+  `debug.getmetatable` ошибочно уважает `__metatable`; `luaL_getmetafield`
+  игнорирует type-level slots и возвращает literal 1 вместо type tag. HIGH:
+  удалить непредусмотренный PUC `table_remember`/grayagain arm и укоренить
+  fresh metatable-конструкторы (`coroutine.wrap`, debug registry, io.lines,
+  testC pushcclosure) до GC-capable publication. Focused tests не должны
+  разрушать `finalizables` registry при живых FINALIZEDBIT объектах. Исправить
+  perf prose (`+0.698%` — mode-blind geomean workload medians, не “geomean
+  centers”); canonical WARN history сохранить, baseline не обновлять.
+  Подробный исполнимый план — `prompt.md`. Open-count 23→24.
 
 - [x] **P16.50-review-13 correction (CLOSED by review-13)**: сохранить доказанные batch-reserve и
   worklist-инварианты review-12, но завершить транзакцию установки metatable.

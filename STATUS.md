@@ -1,4 +1,4 @@
-> Last updated: 2026-09-19 (P16.50-review-14)
+> Last updated: 2026-09-19 (P16.50-review-15 correction opened by review)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -44,6 +44,26 @@ Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependen
 <!-- END GENERATED SUMMARY -->
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
+
+- [ ] **P16.50-review-15 correction**: сохранить доказанный type-metatable
+  lifecycle и forward-only transaction review-14, но исправить изменённые
+  constructor paths. BLOCKER: `coroutine.wrap` возвращает изменяемую Table
+  вместо PUC CClosure/function и публикует `wrap_thread` как permanent root до
+  fallible construction; OOM удерживает Thread. BLOCKER: `io.lines(filename)`
+  не root-ит свежий managed file до трёх GC-capable allocations. HIGH: testC
+  `pushcclosure` снимает upvalues до fallible construction, а тест разрешает
+  consumed-but-unpublished stack. Усилить rawSet/root-lifecycle proofs и
+  исправить неверную perf-атрибуцию: 4.79% — `gcMarkValueImpl`, не
+  `gcMarkTypeMetatables`; self-percent profile не доказывает заявленные
+  absolute deltas. Исполнимый план — `prompt.md`. Open-count 23→24.
+
+- [ ] **P16.50 table_alloc_setmetatable perf WARN (HIGH)**: canonical
+  review-14 gate имеет matched center +4.0305% и seeds 9/10/15 выше +5%.
+  Причина пока НЕ установлена: опубликованная markmt-декомпозиция опровергнута
+  symbol audit. После correctness correction нужен isolated interleaved A/B
+  по causal instructions; закрытие — финальный paired-seed OK либо отдельное
+  owner-approved baseline decision с доказанной причинностью. Baseline сейчас
+  не менять. Open-count 24→25.
 
 - [x] **P16.50-review-14 correction (CLOSED by review-14)**: сохранить общий metatable
   prepare→store→infallible-commit review-13, но завершить PUC lifecycle.

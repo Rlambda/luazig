@@ -1,4 +1,4 @@
-> Last updated: 2026-09-19 (architecture-first A1 research opened; локальная review-16 correction отменена владельцем)
+> Last updated: 2026-09-19 (Architecture A1 research принят с redesign порядка; A1.0 RootScope implementation открыт)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -45,7 +45,7 @@ Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [ ] **Architecture A1 research: единая GC lifetime/rooting/constructor
+- [x] **Architecture A1 research (COMPLETED): единая GC lifetime/rooting/constructor
   модель**. Локальная `P16.50-review-16 correction`, ошибочно открытая ревьюером
   после review-15, отменена владельцем: новые симптомы не должны продолжать
   цепочку мини-фиксов. Исследовать и спроектировать staged hybrid migration:
@@ -58,7 +58,26 @@ Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependen
   callable/call-frame milestone; emergency-rescue — persistent finalizer
   ownership внутри GC roadmap. Research не меняет product-код и не обязан
   закрывать пункт; после отчёта дизайн утверждается владельцем перед
-  implementation prompt. Open-count остаётся 26: correction-пункт заменён A1.
+  implementation prompt. Исследование завершено без product-изменений. End-state
+  подтверждён, но migration order переработан: absolute запрет roots вокруг
+  `_longjmp` заменён nested checkpoints; RootScope должен предшествовать
+  constructor survive-to-sweep; lossy dense accelerator отвергнут; удаление
+  `gc_index` требует отдельной stale-slot safety. Решения владельца: dormant
+  `long_literals` удалить отдельным string-срезом, emergency-rescue ждать
+  persistent `tobefnz`, Cell v-union отложить; первый implementation milestone
+  — A1.0 RootScope + protected-boundary checkpoints. Research-пункт закрыт.
+
+- [ ] **Architecture A1.0 implementation: единый RootScope и nested protected-
+  boundary checkpoints**. Заменить `TempRoots` одним scoped LIFO API для Value и
+  Cell roots с typed handles, exact reserve до MayGC, debug token/depth checks и
+  zero-cost NoGC path. Каждая `_setjmp` boundary сохраняет относительный root
+  checkpoint; normal return проверяет баланс, `_longjmp` landing явно удаляет
+  только roots выше своего checkpoint, сохраняя outer scopes. Error/yield payload
+  публикуется в persistent root до прыжка. Мигрировать все production call sites,
+  удалить `TempRoots`/`gcTempRoots`, исправить ложный комментарий об unwind.
+  Constructor/allgc/finalizer/callable semantics не менять в этом slice. После
+  A1.0 следующий milestone — GC safepoints/stale-slot safety перед intrusive
+  allgc cut. Open-count остаётся 26: завершённый research заменён implementation.
 
 - [x] **P16.50-review-15 correction (CLOSED by review-15)**: сохранить доказанный type-metatable
   lifecycle и forward-only transaction review-14, но исправить изменённые

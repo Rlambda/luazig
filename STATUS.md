@@ -1,4 +1,4 @@
-> Last updated: 2026-09-19 (P16.50-review-12)
+> Last updated: 2026-09-19 (P16.50-review-13 correction opened)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -44,6 +44,25 @@ Geomean замедления vs PUC Lua: **1.43x** (цель: 1.0x; run-dependen
 <!-- END GENERATED SUMMARY -->
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
+
+- [ ] **P16.50-review-13 correction**: сохранить доказанные batch-reserve и
+  worklist-инварианты review-12, но завершить транзакцию установки metatable.
+  `State.setmetatable` всё ещё глотает OOM (`gcStoreMetatable catch {}` для
+  Table, `gcPrepareUserdataBarrierBack catch return` для Userdata), после чего
+  может продолжить fallible `registerFinalizable`; `lua_setmetatable` выдаёт
+  обычный `0` вместо LUA_ERRMEM. `builtinDebugSetmetatable` для Userdata
+  публикует `ud.metatable` до fallible forward barrier и finalizer registration.
+  Кроме того, API-arm использует backward barrier для userdata metatable,
+  тогда как PUC `lua_setmetatable` применяет `luaC_objbarrier`, и default-arm
+  PUC для type-level metatables в `State.setmetatable` отсутствует. Нужен один
+  shared prepare→store→infallible barrier/finalizer commit с точным error
+  transport и PUC type-level semantics; focused FailingAllocator/C-API
+  differential должен покрыть barrier и finalizables capacity edges. Также
+  исправить phase prose review-12: canonical final gate имеет raw worst
+  table_alloc_setmetatable seed 10 +4.1596%, field_access raw worst +1.9012%
+  (matched center ≈+1.277%), а не записанные pre-check extrema. TBC-parity
+  BLOCKER и emergency-GC HIGH остаются вне correction scope. Open-count
+  23→24.
 
 - [x] **P16.50-review-12 correction (CLOSED by review-12)**: сохранить white-child guard и
   `MISSEDGRAYBIT` review-11, но закрыть оставшиеся post-mutation publication

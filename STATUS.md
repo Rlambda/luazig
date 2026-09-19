@@ -1,4 +1,4 @@
-> Last updated: 2026-09-19 (P16.50-review-9)
+> Last updated: 2026-09-19 (P16.50-review-10 correction opened)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -44,6 +44,19 @@ Geomean замедления vs PUC Lua: **1.43x** (цель: 1.0x; run-dependen
 <!-- END GENERATED SUMMARY -->
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
+
+- [ ] **P16.50-review-10 correction**: сохранить двухпроходный
+  reserve-before-close контракт review-9, но убрать `abort_unwind_abandoned`:
+  реальный повторный OOM в `runBytecodeInternal` сейчас оставляет suffix
+  `CallFrame` припаркованным выше `boundary_depth`, а production-path не
+  выполняет ручной retry из focused-теста. Close/barrier и аварийный unwind
+  должны завершаться без аллокации после начала cleanup, как infallible
+  `luaF_closeupval`/`luaC_barrier` в PUC; running main state должен оставаться
+  пригодным к следующему вызову без скрытых фреймов и открытых Cell. Также
+  сделать system-first поиск `tools/zig` устойчивым к `PATH`, содержащему сам
+  `tools/`: текущий `command -v zig` находит wrapper и бесконечно `exec`-ит
+  себя. TBC-parity BLOCKER и emergency-GC HIGH остаются отдельными открытыми
+  задачами и в correction scope не входят. Open-count 23→24.
 
 - [x] **P16.50-review-9 correction (CLOSED by review-9)**: закрыть три
   оставшихся close-upvalue окна `cell.close` → fallible

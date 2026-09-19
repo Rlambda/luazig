@@ -36,11 +36,11 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **84/84** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.40x** |
+| Performance (geomean vs PUC) | **1.41x** |
 | Perf gate (paired-seed) | **WARN** — 21 published seeds (1..21) |
-| api580 fixed-load footprint | **GREEN** — anchored gate 384 B < 400 B; no-XY diagnostic 436 B; Measured on the ReleaseFast binary `44112debfb2a2d27`; the ledger's top-level provenance is the Debug binary `e11bd09ddd7d26ab` (dual-mode ledger, not one single-RF-binary artifact). |
+| api580 fixed-load footprint | **GREEN** — anchored gate 384 B < 400 B; no-XY diagnostic 436 B; Measured on the ReleaseFast binary `ab6e8faf5982df90`; the ledger's top-level provenance is the Debug binary `77a347383d81c348` (dual-mode ledger, not one single-RF-binary artifact). |
 
-Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
@@ -8618,9 +8618,32 @@ source_head сессии = C, source_dirty = clean; вердикт сессии 
   ab6e8faf5982df9020251cf1daedf4756ae1e714421c637165018b60b2985ece).
   Ожидание: table_alloc_setmetatable вероятно ВСЁ ЕЩЁ WARN — фаза не
   таргетила тот путь (review-14 WARN center +4.03%; probe vs
-  baseline-approved +0.3%). Verdict дописывается артефактным коммитом D.
-  Полное canonical current-* перегенерирование на clean C / RF binary —
-  артефактным коммитом D.
+  baseline-approved +0.3%).
+  **Verdict (сессия исполнена на clean C, binary S): WARN** —
+  table_alloc_setmetatable matched-mode (mono/mono) center +4.073%, 3 seeds
+  ≥ +5% (seed 9 +5.088%, seed 10 +5.027%, seed 15 +5.230%); остальные 17
+  workloads OK, wall-P25 safeguard green на всех. WARN остаётся WARN
+  (review-14: center +4.031%, те же seeds 9/10/15 +5.028/+5.033/+5.164) —
+  фаза не таргетила тот путь; стоящий открытый perf-пункт не меняется (до
+  любых causal-claims — isolated interleaved A/B по реальному кандидату
+  оптимизации; без guesswork, dirty-slot работы и baseline update).
+  Полное canonical current-* перегенерирование на clean C / RF binary S:
+  current.json (runs=5 snapshot, geomean 1.41x), current-counters.json,
+  current-profile-index.json, current-dispatch-floor.json (additivity
+  sum +15.0 vs all-removed +14.0, residual −1.0), current-api580-ledger.json
+  (GREEN: anchored 384 < 400, no-XY diagnostic 436; dual-mode ledger),
+  current-fixed-load-footprint.json (GREEN: honest 344 vs PUC 272),
+  current-codesize.json (text 2649993 B), current-callframe-layout.json
+  (CallFrame 88 B; Closure 40 B и Cell 40 B re-measured — RF/DBG совпадают),
+  current-differential-profile.json (10 workloads, perf-сэмплы в
+  /tmp/opencode/r15a/), current-matrix.json (31/32: zig_fail=0, big.lua
+  both_fail pre-existing), current-smoke.json (84/84), phase.txt
+  P16.50-review-15; README/STATUS generated-блоки обновлены status_summary.py
+  (verdict line WARN на текущем source/binary — caveat «different source»
+  снят). Manifest row #32 appended (append-only, artifact_sha256
+  6ff62ae28fa871c56dea531212b28a57abed0200d937e6d3f7bd20dda10b2a8c);
+  baseline-approved.json / baseline-p15.37.json / core_baseline.json
+  byte-identical до/после (sha256 совпадают, baseline не обновлялся).
 - **Residuals (honest, для владельца)**:
   - **emergency-rescue HIGH (новый ОТКРЫТЫЙ пункт — см. выше)**:
     rescued-never-finalized vs PUC tobefnz carry-over — luazig перевыводит

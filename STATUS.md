@@ -1,4 +1,4 @@
-> Last updated: 2026-09-19 (P16.50-review-16 correction opened after review-15; architecture-first A1 follows it)
+> Last updated: 2026-09-19 (architecture-first A1 research opened; локальная review-16 correction отменена владельцем)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -45,20 +45,20 @@ Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [ ] **P16.50-review-16 correction: завершить callable-контракт review-15 без
-  расширения scope**. Три `FIX-NOW`: (1) `builtinCoroutineWrap` при
-  `outs.len == 0` сейчас возвращает до проверки аргумента и создания wrapper,
-  тогда как PUC исполняет discarded-result call полностью; (2) cold
-  `TempRoots.ensure(1)` расположен после регистрации Thread, но до rollback-
-  owner, поэтому его OOM оставляет registered/unrooted Thread и дрейф
-  accounting; (3) OP_TAILCALL не использует уже реализованный closure-keyed
-  wrap trampoline и глубокая tail-wrap рекурсия может переполнить host stack.
-  Исправить также документальную точность review-15: mode-center ratio
-  `+4.030%`, а `+4.073%` — median paired-seed delta; injected regular full GC
-  в io.lines-тесте является adversarial root oracle, а не доказанным production
-  auto-GC path. Не брать в scope A1/A2 и independent backlog. После этой
-  correction следующий этап — architecture-first A1 research по intrusive GC
-  lifetime authority, RootScope и constructor protocol. Open-count 25→26.
+- [ ] **Architecture A1 research: единая GC lifetime/rooting/constructor
+  модель**. Локальная `P16.50-review-16 correction`, ошибочно открытая ревьюером
+  после review-15, отменена владельцем: новые симптомы не должны продолжать
+  цепочку мини-фиксов. Исследовать и спроектировать staged hybrid migration:
+  intrusive `allgc` как единственный lifetime authority; существующие dense
+  registries временно только accelerators; безопасная пустая оболочка каждого
+  GC-типа; единый synchronous LIFO `RootScope`; один constructor protocol и
+  delete list старых registration/root helpers. Findings review-15 включаются
+  в архитектурные acceptance criteria: cold `TempRoots.ensure` — A1;
+  discarded-result/tail-wrap и VM-global `c_active_closure` — следующий
+  callable/call-frame milestone; emergency-rescue — persistent finalizer
+  ownership внутри GC roadmap. Research не меняет product-код и не обязан
+  закрывать пункт; после отчёта дизайн утверждается владельцем перед
+  implementation prompt. Open-count остаётся 26: correction-пункт заменён A1.
 
 - [x] **P16.50-review-15 correction (CLOSED by review-15)**: сохранить доказанный type-metatable
   lifecycle и forward-only transaction review-14, но исправить изменённые

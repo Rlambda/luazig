@@ -1,4 +1,4 @@
-> Last updated: 2026-09-19 (P16.50-review-11)
+> Last updated: 2026-09-19 (P16.50-review-12 correction opened)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -44,6 +44,19 @@ Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependen
 <!-- END GENERATED SUMMARY -->
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
+
+- [ ] **P16.50-review-12 correction**: сохранить white-child guard и
+  `MISSEDGRAYBIT` review-11, но закрыть оставшиеся post-mutation publication
+  окна generational GC. В `gcMarkOld1` age/color меняются до fallible
+  `gc_gray`/`gc_grayagain` append: после OOM retry пропускает объект, потому
+  что он уже не `OLD1`. В `gcRememberObject` и incremental backward barriers
+  owner становится `touched1`/gray до fallible `gc_grayagain.append`, поэтому
+  повторный barrier также не восстанавливает membership. Это не MEDIUM, а
+  тот же BLOCKER-класс lost GC work: reachable young child может остаться
+  непромаркированным. Все GC-internal batch transitions должны резервировать
+  capacity до первой age/color/list мутации и затем использовать infallible
+  commits; observable stores — prepare→store→commit. TBC-parity BLOCKER и
+  emergency-GC HIGH остаются вне correction scope. Open-count 23→24.
 
 - [x] **P16.50-review-11 correction (CLOSED by review-11)**: сохранить infallible close/unwind и
   PATH-safe wrapper review-10, но исправить два связанных GC-инварианта.

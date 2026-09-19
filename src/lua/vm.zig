@@ -27871,88 +27871,201 @@ pub const Vm = struct {
     }
 
     pub inline fn gcStoreMetatable(self: *Vm, table: *Table, metatable: ?*Table) DispatchError!void {
-        // P16.50-review-12 BLOCKER 2: prepare→store→commit. The old shape
-        // stored `table.metatable` FIRST, then ran fallible barrier
-        // bookkeeping (gcQueueScanObject append, gc_old1 append, grayagain
-        // append) — an OOM after the store left the metatable published
-        // with unreserved re-traversal debt. Every slot the commits may
-        // touch is reserved BEFORE the store; the commits append with
-        // appendAssumeCapacity. The window between reserve and commit
-        // contains only the plain pointer store (no allocation — no
-        // emergency GC can intervene).
-        if (metatable) |mt| {
-            if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
-                // Gen arm reserves (PUC luaC_barrier_ lgc.c:246-260):
-                //  - gc_gray: the metatable is a Table — when white, the
-                //    forward-barrier commit queues it via
-                //    gcQueueScanObjectAssume (exactly 1 slot; a Table is
-                //    never a string, so the queue arm always appends).
-                //  - gc_old1: the OLD0 publication when the table is old.
-                //  - gc_grayagain: the table's own re-traversal membership
-                //    unless it is already touched1.
-                const fwd = gcIsBlack(table.gc_marked) and gcIsWhite(mt.gc_marked);
-                var gray_need: usize = 0;
-                var old1_need: usize = 0;
-                var grayagain_need: usize = 0;
-                if (fwd) {
-                    gray_need = 1;
-                    if (table.gc_age.isOld()) old1_need = 1;
-                }
-                if (gcIsBlack(table.gc_marked) and table.gc_age != .touched1) grayagain_need = 1;
-                if (gray_need > 0) try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), gray_need);
-                if (old1_need > 0) try self.gc_old1.ensureUnusedCapacity(self.infraAlloc(), old1_need);
-                if (grayagain_need > 0) try self.gc_grayagain.ensureUnusedCapacity(self.infraAlloc(), grayagain_need);
-                table.metatable = metatable;
-                if (fwd) {
-                    // PUC luaC_barrier_ (lgc.c:246-260): forward barrier —
-                    // mark the metatable if table is BLACK and metatable is
-                    // WHITE. gcQueueScanObject queues non-string objects
-                    // for traversal by gcDrainGray, ensuring the metatable's
-                    // children are marked. Using gcSetBlack here would mark
-                    // the metatable BLACK without traversing its children →
-                    // children stay WHITE → freed by sweep → use-after-free.
-                    self.gcQueueScanObjectAssume(.{ .table = mt });
-                    if (table.gc_age.isOld()) {
-                        mt.gc_age = .old0;
-                        self.gc_old1.appendAssumeCapacity(.{ .table = mt });
+        // P16.50-review-13: thin wrapper over the ONE shared metatable
+        // transaction (gcPrepareSetMetatable/gcCommitSetMetatable) — every
+        // internal table-metatable site (bootstrap, wrap/io iterators,
+        // debug hooks, testC, file metatables) and the public entry points
+        // (State.setmetatable, lua_setmetatable, debug.setmetatable) now
+        // commit through the same prepare→store→commit contract.
+        const plan = try self.gcPrepareSetMetatable(.{ .table = table }, metatable);
+        self.gcCommitSetMetatable(.{ .table = table }, metatable, plan);
+    }
+
+    /// PUC lua_setmetatable (lapi.c:964-1000) — ONE shared prepare/commit
+    /// contract for every metatable store. PUC resolves the metatable while
+    /// it is rooted on the L stack, stores `object.metatable`, then runs two
+    /// INFALLIBLE steps: `luaC_objbarrier(obj, mt)` (FORWARD barrier
+    /// owner→metatable — for Tables AND Userdata; backward barriers are for
+    /// value stores like lua_setiuservalue, never for the metatable pointer)
+    /// and `luaC_checkfinalizer(obj, mt)`. The Zig equivalent prepares every
+    /// fallible capacity (barrier worklist slots + the finalizables map)
+    /// BEFORE the observable store; commit performs only infallible
+    /// pointer/color/age/list surgery. On prepare failure nothing changed —
+    /// stack, metatable, age/color, worklists, finalizables, FINALIZEDBIT
+    /// and accounting are byte-exact.
+    pub const SetMetatablePlan = struct {
+        barrier: MetatableBarrierPlan = .{},
+        /// luaC_checkfinalizer: __gc present in the new metatable, object
+        /// not already registered (PUC `tofinalize(o)` early-exit), state
+        /// not closing (GCSTPCLS). Type-level arms never set this.
+        needs_finalizer: bool = false,
+        /// review-12 table semantics (KEEP): a black Table not yet touched1
+        /// is conservatively re-queued into grayagain so the (possibly
+        /// young) metatable is re-marked next cycle.
+        table_remember: bool = false,
+    };
+
+    /// Forward-barrier arms mirroring PUC luaC_barrier_ (lgc.c:246-263) for
+    /// owner Table/Userdata → child metatable:
+    ///   gen-minor, non-sweep, black owner + white child:
+    ///     mark child; owner old → child OLD0 + old1 publication;
+    ///   incremental propagate/atomic, black owner + white child: mark child;
+    ///   incremental sweep, black owner: make the OWNER white;
+    ///   pause / gen-minor sweep: no-op.
+    const MetatableBarrierPlan = struct {
+        gen_mark: bool = false,
+        gen_promote: bool = false,
+        inc_mark: bool = false,
+        inc_make_white: bool = false,
+    };
+
+    pub inline fn gcPrepareSetMetatable(self: *Vm, owner: GcObject, mt: ?*Table) std.mem.Allocator.Error!SetMetatablePlan {
+        var plan = SetMetatablePlan{};
+        const gen_minor = self.gc_mode == .generational and self.gc_gen_phase == .minor;
+
+        if (mt) |m| {
+            // luaC_checkfinalizer pre-checks (Table/Userdata owners only):
+            // mt != NULL, __gc present, not already registered, not closing.
+            switch (owner) {
+                .table, .userdata => {
+                    plan.needs_finalizer = self.fastTm(m, .gc) != null and
+                        (gcPtr(owner).marked.* & FINALIZEDBIT) == 0 and
+                        !self.is_closing;
+                },
+                else => {},
+            }
+            if (plan.needs_finalizer) {
+                try self.finalizables.ensureUnusedCapacity(self.infraAlloc(), 1);
+            }
+
+            if (gen_minor and self.gc_state != .sweep) {
+                // PUC luaC_barrier_ guard: isblack(p) && iswhite(o).
+                if (gcIsBlack(gcPtr(owner).marked.*) and gcIsWhite(m.gc_marked)) {
+                    plan.barrier.gen_mark = true;
+                    // gcQueueScanObjectAssume queues the Table child — exactly
+                    // one gc_gray slot.
+                    try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), 1);
+                    if (gcPtr(owner).age.*.isOld()) {
+                        plan.barrier.gen_promote = true;
+                        try self.gc_old1.ensureUnusedCapacity(self.infraAlloc(), 1);
                     }
                 }
-                // Also add the table to grayagain (backward barrier) so it's
-                // re-traversed next cycle. This ensures the metatable (which
-                // may be reset to white by the sweep) is re-marked. Without
-                // this, an OLD table with a YOUNG metatable that was set when
-                // the table was young+black won't have its metatable marked
-                // in subsequent cycles → metatable freed → use-after-free.
-                // Bypass the remember plan's age check: YOUNG BLACK tables
-                // also need re-traversal if they were already traversed
-                // this cycle.
-                if (gcIsBlack(table.gc_marked) and table.gc_age != .touched1) {
-                    table.gc_age = .touched1;
-                    gcSetGray(&table.gc_marked);
-                    self.gc_grayagain.appendAssumeCapacity(.{ .table = table });
+                switch (owner) {
+                    .table => |t| {
+                        // review-12 conservative re-traversal (KEEP).
+                        if (gcIsBlack(t.gc_marked) and t.gc_age != .touched1) {
+                            plan.table_remember = true;
+                            try self.gc_grayagain.ensureUnusedCapacity(self.infraAlloc(), 1);
+                        }
+                    },
+                    else => {},
                 }
-                return;
+            } else if (!gen_minor) {
+                if (self.gc_state != .pause and
+                    gcIsBlack(gcPtr(owner).marked.*) and gcIsWhite(m.gc_marked))
+                {
+                    switch (self.gc_state) {
+                        .propagate, .atomic => {
+                            plan.barrier.inc_mark = true;
+                            try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), 1);
+                        },
+                        .sweep => plan.barrier.inc_make_white = true,
+                        .pause => {},
+                    }
+                }
             }
-            // Incremental mode: forward barrier (luaC_objbarrier). The
-            // propagate/atomic arm marks the metatable — PUC's
-            // reallymarkobject cannot fail, but our gc_gray side-list
-            // append can, and a lost mark after a published store is a
-            // sweep UAF. Reserve the single possible append BEFORE the
-            // store (a Table value queues exactly 1 slot).
-            const inc_mark = self.gc_state != .pause and
-                gcIsBlack(table.gc_marked) and gcIsWhite(mt.gc_marked) and
-                (self.gc_state == .propagate or self.gc_state == .atomic);
-            if (inc_mark) try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), 1);
-            table.metatable = metatable;
-            if (self.gc_state == .pause or !gcIsBlack(table.gc_marked) or !gcIsWhite(mt.gc_marked)) return;
-            switch (self.gc_state) {
-                .propagate, .atomic => self.gcMarkValueAssume(.{ .Table = mt }),
-                .sweep => gcMakeWhite(&table.gc_marked, self.gc_current_white),
-                .pause => {},
-            }
-            return;
         }
-        table.metatable = null;
+        return plan;
+    }
+
+    /// Infallible commit: the OBSERVABLE store plus every reserved
+    /// publication. No allocation, no Lua, no GC between a successful
+    /// prepare and this commit.
+    pub inline fn gcCommitSetMetatable(self: *Vm, owner: GcObject, mt: ?*Table, plan: SetMetatablePlan) void {
+        switch (owner) {
+            .table => |t| t.metatable = mt,
+            .userdata => |u| u.metatable = mt,
+            else => unreachable, // type-level arms use setTypeMetatableValue
+        }
+        if (mt) |m| {
+            if (plan.barrier.gen_mark) {
+                // PUC luaC_barrier_ (lgc.c:246-260): forward barrier — mark
+                // the metatable (queue for traversal; marking it black
+                // without traversal would strand its children white).
+                self.gcQueueScanObjectAssume(.{ .table = m });
+                if (plan.barrier.gen_promote) {
+                    m.gc_age = .old0;
+                    self.gc_old1.appendAssumeCapacity(.{ .table = m });
+                }
+            }
+            if (plan.barrier.inc_mark) {
+                self.gcMarkValueAssume(.{ .Table = m });
+            }
+            if (plan.barrier.inc_make_white) {
+                gcMakeWhite(gcPtr(owner).marked, self.gc_current_white);
+            }
+            if (plan.table_remember) {
+                if (owner == .table) {
+                    const t = owner.table;
+                    t.gc_age = .touched1;
+                    gcSetGray(&t.gc_marked);
+                    self.gc_grayagain.appendAssumeCapacity(owner);
+                }
+            }
+            if (plan.needs_finalizer) {
+                // registerFinalizable's commit half — every fallible part
+                // (map capacity) was reserved by prepare.
+                self.finalizables.putAssumeCapacity(owner, {});
+                gcPtr(owner).marked.* |= FINALIZEDBIT;
+                self.gc_finalizer_epoch +%= 1;
+            }
+        }
+        // mt == null: no new reference → no barrier (PUC luaC_objbarrier on
+        // a NULL child is a no-op); luaC_checkfinalizer with mt == NULL
+        // returns early — an existing registration is never removed.
+    }
+
+    /// PUC lua_setmetatable default arm (lapi.c:983-987): a metatable set on
+    /// a nil/boolean/number/string/function/thread/lightuserdata value
+    /// updates the corresponding TYPE-LEVEL metatable slot. No barrier, no
+    /// finalizer (PUC arm is a plain store into G(L)->mt[ttype(o)] — the
+    /// slots are GC roots via the state). Returns false for owner kinds
+    /// handled by gcPrepareSetMetatable/gcCommitSetMetatable.
+    pub fn setTypeMetatableValue(self: *Vm, target: Value, mt: ?*Table) bool {
+        return switch (target) {
+            .String => blk: {
+                // Non-optional field + enabled flag (existing repr): a null
+                // metatable disables the slot, keeping the table GC-rooted.
+                if (mt) |m| self.string_metatable = m;
+                self.string_metatable_enabled = mt != null;
+                break :blk true;
+            },
+            .Int, .Num => blk: {
+                self.number_metatable = mt;
+                break :blk true;
+            },
+            .Bool => blk: {
+                self.boolean_metatable = mt;
+                break :blk true;
+            },
+            .Nil => blk: {
+                self.nil_metatable = mt;
+                break :blk true;
+            },
+            .Builtin, .Closure => blk: {
+                self.function_metatable = mt;
+                break :blk true;
+            },
+            .Thread => blk: {
+                self.thread_metatable = mt;
+                break :blk true;
+            },
+            .LightUserdata => blk: {
+                self.light_userdata_metatable = mt;
+                break :blk true;
+            },
+            else => false,
+        };
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -32519,12 +32632,13 @@ pub const Vm = struct {
                 try self.gcStoreMetatable(tbl, null);
             },
             .Table => |mt| {
+                // The shared transaction performs the finalizer half too
+                // (PUC lua_setmetatable → luaC_checkfinalizer, lapi.c:981:
+                // registers when the new metatable has __gc, never
+                // deregisters) — the old separate fastTm +
+                // registerFinalizable re-ran the same lookup after the
+                // commit on every setmetatable call.
                 try self.gcStoreMetatable(tbl, mt);
-                // PUC lua_setmetatable → luaC_checkfinalizer (lapi.c:981):
-                // only registers when __gc is present; never deregisters.
-                if (self.fastTm(mt, .gc) != null) {
-                    try self.registerFinalizable(.{ .table = tbl });
-                }
             },
             else => return self.fail("bad argument #2 to 'setmetatable' (nil or table expected)", .{}),
         }
@@ -34547,38 +34661,19 @@ pub const Vm = struct {
             .Table => |t| t,
             else => return self.fail("bad argument #2 to 'setmetatable' (nil or table expected)", .{}),
         };
+        // P16.50-review-13: ONE shared metatable transaction (the same
+        // primitive State.setmetatable / lua_setmetatable / testC use) —
+        // the old userdata arm wrote ud.metatable BEFORE fallible
+        // gcForwardBarrierValue/registerFinalizable (the review-12 window).
         switch (args[0]) {
-            .Table => |tbl| {
-                try self.gcStoreMetatable(tbl, mt);
-                // PUC lua_setmetatable → luaC_checkfinalizer: only registers
-                // when __gc is present; never deregisters.
-                if (mt) |m| {
-                    if (self.fastTm(m, .gc) != null) {
-                        try self.registerFinalizable(.{ .table = tbl });
-                    }
-                }
+            .Table, .Userdata => {
+                const owner = GcObject.fromValue(args[0]).?;
+                const plan = try self.gcPrepareSetMetatable(owner, mt);
+                self.gcCommitSetMetatable(owner, mt, plan);
             },
-            .String => {
-                if (mt) |m| {
-                    self.string_metatable = m;
-                    self.string_metatable_enabled = true;
-                } else {
-                    self.string_metatable_enabled = false;
-                }
-            },
-            .Int, .Num => self.number_metatable = mt,
-            .Bool => self.boolean_metatable = mt,
-            .Nil => self.nil_metatable = mt,
-            .Builtin, .Closure => self.function_metatable = mt,
-            .Thread => self.thread_metatable = mt,
-            .LightUserdata => self.light_userdata_metatable = mt,
-            .Userdata => |ud| {
-                ud.metatable = mt;
-                if (mt) |m| {
-                    try self.gcForwardBarrierValue(.{ .Userdata = ud }, .{ .Table = m });
-                    if (self.fastTm(m, .gc) != null) {
-                        try self.registerFinalizable(.{ .userdata = ud });
-                    }
+            else => {
+                if (!self.setTypeMetatableValue(args[0], mt)) {
+                    return self.fail("bad argument #1 to 'setmetatable' (value expected)", .{});
                 }
             },
         }
@@ -35876,8 +35971,10 @@ pub const Vm = struct {
 
         const file_mt = self.file_metatable orelse return self.fail("file metatable missing", .{});
         const tbl = try self.allocTableNoGc();
+        // The shared transaction registers the finalizer (file_mt has __gc,
+        // vm.zig ensureFileMetatable) — the old separate registerFinalizable
+        // re-ran the same registration after the commit.
         try self.gcStoreMetatable(tbl, file_mt);
-        try self.registerFinalizable(.{ .table = tbl });
         // Protect tbl from GC while setField populates it. setField may
         // allocate strings/tables internally, which can trigger a GC step.
         // tbl is not yet in any Lua root (not in outs, not in a register),
@@ -42388,7 +42485,7 @@ pub const Vm = struct {
         }
     }
 
-    fn valueMetatable(self: *Vm, v: Value) ?*Table {
+    pub fn valueMetatable(self: *Vm, v: Value) ?*Table {
         return switch (v) {
             .Table => |t| t.metatable,
             .String => if (self.string_metatable_enabled) self.string_metatable else null,
@@ -47563,18 +47660,17 @@ pub const Vm = struct {
                     else => return self.fail("testC setmetatable expects table|nil metatable", .{}),
                 };
                 switch (obj) {
-                    .Table => |t| try self.gcStoreMetatable(t, mt),
-                    .Userdata => |u| {
-                        // Prepare → store → commit (P16.50-review-12
-                        // BLOCKER 2): the metatable store happens only when
-                        // the barrier publication is already reserved.
-                        if (mt) |m| {
-                            const barrier = try self.gcPrepareUserdataBarrierBack(u, .{ .Table = m });
-                            u.metatable = mt;
-                            self.gcCommitUserdataBarrierBack(u, barrier);
-                        } else {
-                            u.metatable = null;
-                        }
+                    .Table, .Userdata => {
+                        // P16.50-review-13: the shared metatable primitive —
+                        // PUC ltests setmetatable runs the FULL
+                        // lua_setmetatable path, including
+                        // luaC_checkfinalizer (the old testC arm skipped
+                        // finalizer registration) and the FORWARD
+                        // owner→metatable barrier (the old userdata arm used
+                        // the backward one).
+                        const owner = GcObject.fromValue(obj).?;
+                        const plan = try self.gcPrepareSetMetatable(owner, mt);
+                        self.gcCommitSetMetatable(owner, mt, plan);
                     },
                     else => return self.fail("testC setmetatable expects table/userdata", .{}),
                 }

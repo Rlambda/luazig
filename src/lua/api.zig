@@ -845,11 +845,12 @@ pub const State = struct {
 
     pub fn getmetatable(self: *State, idx: i32) ApiError!bool {
         const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
-        const mt: ?*vm_mod.Table = switch (self.stack.items[abs]) {
-            .Table => |t| t.metatable,
-            .Userdata => |ud| ud.metatable,
-            else => null,
-        };
+        // PUC lua_getmetatable (lapi.c:951-960): tables/userdata read
+        // their own metatable; every other type reads the TYPE-LEVEL slot
+        // G(L)->mt[ttype(o)] (P16.50-review-13 — the C-API get previously
+        // returned nothing for type-level metatables while the Lua-level
+        // getmetatable already did).
+        const mt: ?*vm_mod.Table = self.vm.valueMetatable(self.stack.items[abs]);
         if (mt) |m| {
             try self.stack.append(self.vm.alloc, .{ .Table = m });
             return true;
@@ -860,36 +861,38 @@ pub const State = struct {
     pub fn setmetatable(self: *State, idx: i32) ApiError!void {
         if (self.stack.items.len < 1) return error.InvalidState;
         const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
+        // P16.50-review-13: PUC lua_setmetatable (lapi.c:964-1000) — the
+        // metatable stays ROOTED on the stack until the transaction
+        // commits, api_check requires table-or-nil, and the default arm
+        // updates TYPE-LEVEL metatables. The old shape popped the value
+        // before the fallible prepare (a prepare failure lost it), swallowed
+        // the table-arm barrier OOM (`catch {}`), silently "succeeded" the
+        // userdata arm on a reserve failure, registered finalizers after a
+        // failed store, and used the (wrong) BACKWARD barrier for userdata.
         const mt_val = self.stack.items[self.stack.items.len - 1];
-        self.stack.items.len -= 1;
-        const mt = if (mt_val == .Table) mt_val.Table else null;
-        switch (self.stack.items[abs]) {
-            .Table => |t| {
-                self.vm.gcStoreMetatable(t, mt) catch {};
-                if (mt) |m| {
-                    if (self.vm.getTmByObj(.{ .Table = m }, .gc) != null) {
-                        self.vm.registerFinalizable(.{ .table = t }) catch {};
-                    }
+        const mt: ?*vm_mod.Table = switch (mt_val) {
+            .Table => |t| t,
+            .Nil => null,
+            else => return error.Type, // PUC api_check: table or nil
+        };
+        const target = self.stack.items[abs];
+        switch (target) {
+            .Table, .Userdata => {
+                const owner = vm_mod.GcObject.fromValue(target).?;
+                const plan = self.vm.gcPrepareSetMetatable(owner, mt) catch {
+                    return error.OutOfMemory;
+                };
+                self.vm.gcCommitSetMetatable(owner, mt, plan);
+            },
+            else => {
+                if (!self.vm.setTypeMetatableValue(target, mt)) {
+                    return error.Type; // unreachable: setTypeMetatableValue
                 }
             },
-            .Userdata => |ud| {
-                if (mt) |m| {
-                    // Prepare → store → commit (P16.50-review-12 BLOCKER 2):
-                    // on a reserve failure the metatable store is skipped
-                    // entirely (byte-exact pre-store state) — the old shape
-                    // stored first and swallowed the barrier OOM.
-                    const barrier = self.vm.gcPrepareUserdataBarrierBack(ud, .{ .Table = m }) catch return;
-                    ud.metatable = mt;
-                    self.vm.gcCommitUserdataBarrierBack(ud, barrier);
-                    if (self.vm.getTmByObj(.{ .Table = m }, .gc) != null) {
-                        self.vm.registerFinalizable(.{ .userdata = ud }) catch {};
-                    }
-                } else {
-                    ud.metatable = null;
-                }
-            },
-            else => {},
         }
+        // Pop only AFTER the infallible commit — a prepare failure leaves
+        // the stack byte-exact (PUC pops at the end of lua_setmetatable).
+        self.stack.items.len -= 1;
     }
 
     pub fn getregistry(self: *State) ApiError!void {

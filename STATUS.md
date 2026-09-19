@@ -1,4 +1,4 @@
-> Last updated: 2026-09-19 (P16.50-review-13 correction opened)
+> Last updated: 2026-09-19 (P16.50-review-13)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -45,7 +45,7 @@ Geomean замедления vs PUC Lua: **1.43x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [ ] **P16.50-review-13 correction**: сохранить доказанные batch-reserve и
+- [x] **P16.50-review-13 correction (CLOSED by review-13)**: сохранить доказанные batch-reserve и
   worklist-инварианты review-12, но завершить транзакцию установки metatable.
   `State.setmetatable` всё ещё глотает OOM (`gcStoreMetatable catch {}` для
   Table, `gcPrepareUserdataBarrierBack catch return` для Userdata), после чего
@@ -63,6 +63,65 @@ Geomean замедления vs PUC Lua: **1.43x** (цель: 1.0x; run-dependen
   (matched center ≈+1.277%), а не записанные pre-check extrema. TBC-parity
   BLOCKER и emergency-GC HIGH остаются вне correction scope. Open-count
   23→24.
+
+  ЗАКРЫТО фазой P16.50-review-13 (2026-09-19): BLOCKER 1 — единый
+  семантический примитив установки metatable: `SetMetatablePlan` /
+  `MetatableBarrierPlan` (vm.zig:27896/27915) +
+  `gcPrepareSetMetatable`/`gcCommitSetMetatable` (vm.zig:27922/27984, pub
+  inline) по PUC `lua_setmetatable` (lapi.c:964-1000): mt rooted на stack →
+  prepare всех fallible capacity → observable store → infallible
+  barrier/finalizer commit → pop. Barrier-план — только forward-arms PUC
+  `luaC_barrier_` (lgc.c:246-263): gen-minor black owner + white child →
+  mark child (+ OLD0/old1 publication при old owner); incremental
+  propagate/atomic → mark child; incremental sweep → owner white;
+  pause/gen-sweep — пустой план; backward barrier для userdata metatable
+  удалён (PUC `luaC_objbarrier`; backward остался только для uservalue).
+  Finalizer half — pre-checks в prepare (`fastTm(mt,.gc)` + FINALIZEDBIT +
+  `is_closing` → reserve finalizables capacity), commit — только
+  `putAssumeCapacity` + FINALIZEDBIT + epoch (PUC
+  `luaC_checkfinalizer`/`tofinalize` no-op для уже зарегистрированного).
+  Type-level default-arm PUC (lapi.c:983-987): `setTypeMetatableValue`
+  (vm.zig:28034) — nil/bool/number/string/function/thread/lightuserdata →
+  существующие VM slots, без второго хранилища. Сходимость всех точек в
+  один примитив: `gcStoreMetatable` — тонкий wrapper над транзакцией
+  (vm.zig:27873, 12 внутренних сайтов), `State.setmetatable` (api.zig:861:
+  mt rooted до commit, api_check table-or-nil → error.Type, type-level
+  default arm, pop ПОСЛЕ infallible commit, точный error kind),
+  `lua_setmetatable` (c_api.zig:2568: OOM → `cThrowOn` LUA_ERRMEM +
+  MEMERRMSG; lenient api_check-остаток → 0), `builtinDebugSetmetatable`
+  (vm.zig:34657), testC setmetatable (vm.zig:47652 — полный
+  lua_setmetatable-путь ltests, включая finalizer registration и forward
+  barrier), `builtinSetmetatable` (vm.zig:32620) и `allocManagedFileObject`
+  (vm.zig:35968) — отдельные fastTm/registerFinalizable вызовы ПОСЛЕ
+  транзакции удалены (pre-checks живут в prepare). `State.getmetatable`
+  (api.zig:846) — через pub `vm.valueMetatable` (vm.zig:42488): C-API get
+  читает TYPE-LEVEL slots (PUC lapi.c:951-960). 3 новых focused теста
+  (c_api.zig:4723+): (1) OOM-матрица `lua_setmetatable` table+userdata
+  через настоящий C-call под `lua_pcallk` boundary (testc_alloc_base seam,
+  fail_index sweep): каждый reserve edge (table: finalizables/gray/old1/
+  grayagain; userdata: finalizables/gray/old1) → LUA_ERRMEM + MEMERRMSG с
+  byte-exact состоянием (stack, metatable, age/color, worklists,
+  finalizables, FINALIZEDBIT), success публикует всё ровно один раз +
+  настоящий full cycle survival; (2) `debug.setmetatable` в protected Lua
+  call — fail_index sweep 0..16: reserve-failure ничего не меняет,
+  post-commit transport-failure сохраняет атомарную publication (PUC
+  сохраняет эффект setmetatable при позднейшем OOM); (3) type-level
+  round-trip 7 типов (set/get → тот же mt, включая lightuserdata из C).
+  Negative-befores: возврат старого userdata-swallow → детерминированно
+  `expected 4, found 0` (c_api.zig:4784); возврат `lua_setmetatable`
+  catch-return-0 → `expected 4, found 0` (c_api.zig:4746). PUC
+  differential type-level metatables — идентичен обоим binary. MEDIUM:
+  phase prose review-12 исправлена на canonical finals (raw worst
+  table_alloc_setmetatable seed 10 +4.1596%, field_access raw worst
+  +1.9012%, matched center ≈+1.277%; manifest history не менялась).
+  Гейты: unit 303/303 Debug+ReleaseFast последовательно 0 leaks; c_api
+  0 FAIL + DIFF PASS; matrix --testc 31/32 (zig_fail=0, big.lua
+  both_fail pre-existing); smoke 84/84; api580 GREEN 384<400;
+  test_perf_gate + validate_noise_lanes ALL OK; perf probe после фикса
+  worst +1.327% (table_alloc_setmetatable; было +5.788% — закрыто
+  конвергенцией сайтов + inline prepare/commit; подробности в фазовой
+  записи review-13). Open-count 24→23 (TBC-parity BLOCKER и emergency-GC
+  HIGH остаются открытыми).
 
 - [x] **P16.50-review-12 correction (CLOSED by review-12)**: сохранить white-child guard и
   `MISSEDGRAYBIT` review-11, но закрыть оставшиеся post-mutation publication
@@ -121,8 +180,11 @@ Geomean замедления vs PUC Lua: **1.43x** (цель: 1.0x; run-dependen
   300/300 Debug+RF; c_api 0 FAIL + DIFF PASS; matrix --testc 31/32
   (zig_fail=0, big.lua both_fail pre-existing); smoke 84/84; wrapper PATH
   sanity; fmt + git-diff-check clean; paired-seed perf gate OK (18/18
-  workloads, worst per-seed +4.048% (table_alloc_setmetatable[21]) < 5%,
-  field_access worst +1.946%). Open-count 24→23 (TBC-parity BLOCKER и
+  workloads; CANONICAL finals из current-gate.json (исправлено
+  P16.50-review-13 MEDIUM — ранее здесь цитировались pre-check-экстремы):
+  raw worst table_alloc_setmetatable[10] +4.1596% < 5%; field_access raw
+  worst +1.9012%, matched center ≈ +1.277%). Open-count 24→23 (TBC-parity
+  BLOCKER и
   emergency-GC HIGH остаются открытыми).
 
 - [x] **P16.50-review-11 correction (CLOSED by review-11)**: сохранить infallible close/unwind и
@@ -8252,6 +8314,133 @@ source_dirty = clean; вердикт сессии — в Perf-блоке ниж�
   поведение (`true 10 20` в luazig и PUC) — ложный residual, checkTabArg
   metatable'd non-Tables для table.unpack не является расхождением; (d) pre-existing: big.lua both_fail (matrix), locals.lua
   GC-pacing dot diff, cstack.lua Debug native-stack exhaustion edge.
+
+### P16.50-review-13: unified PUC metatable transaction (2026-09-19)
+
+Фаза по owner-ledger correction item (открыт 0db5f65 после ledger-reopen
+review-12; open-count 23→24 — correction закрыт, TBC-parity BLOCKER и
+emergency-GC HIGH остаются открытыми; open-count 24→23). Коммиты: C =
+measured source (настоящий коммит; RF binary sha256
+3ca14c417e01de071ddf9344909caafbccae90fb7b87e186a09608f27e4e4769 —
+plain `zig build -Doptimize=ReleaseFast`, режим canonical-генераторов;
+sha установлен ПОСЛЕ полной чистой пересборки (wipe .zig-cache → cold
+rebuild — урок review-11/12 о warm/cold DWARF-дрейфе), последующие warm
+rebuilds переустанавливают тот же cached compile-artifact byte-identical)
+→ D = wrapper (полное canonical current-* перегенерирование на clean C +
+объявленная clean-C paired-seed perf-сессия; source_head сессии = C,
+source_dirty = clean; вердикт сессии — в Perf-блоке ниже, дописан
+артефактным коммитом D).
+
+- **BLOCKER 1 — единая PUC-транзакция установки metatable**: один
+  семантический примитив `gcPrepareSetMetatable`/`gcCommitSetMetatable`
+  (vm.zig:27922/27984, pub inline; `SetMetatablePlan`/
+  `MetatableBarrierPlan` vm.zig:27896/27915) по PUC `lua_setmetatable`
+  (lapi.c:964-1000): metatable rooted на stack до commit, prepare всех
+  fallible capacity (barrier worklist slots + finalizables map) ДО
+  observable store, commit — только infallible pointer/color/age/list
+  surgery + `putAssumeCapacity`, pop ПОСЛЕ commit. Prepare-failure:
+  stack, metatable, age/color, worklists, finalizables, FINALIZEDBIT и
+  accounting byte-exact. Barrier-план — только forward-arms PUC
+  `luaC_barrier_` (lgc.c:246-263) для owner Table/Userdata → child
+  metatable: gen-minor black owner + white child → mark child (+ OLD0 +
+  old1 publication при old owner); incremental propagate/atomic → mark
+  child; incremental sweep → owner white; pause/gen-minor-sweep — пустой
+  план. Отклонение review-12 (userdata metatable через backward barrier)
+  удалено — PUC применяет `luaC_objbarrier` (forward); backward остался
+  только для uservalue-сторов (`lua_setiuservalue`). Finalizer half:
+  pre-checks в prepare (`fastTm(mt,.gc)` + FINALIZEDBIT + `is_closing`),
+  reserve finalizables capacity, commit — `putAssumeCapacity` +
+  FINALIZEDBIT + epoch; уже зарегистрированный объект — no-op (PUC
+  `tofinalize(o)`). Type-level default-arm PUC (lapi.c:983-987):
+  `setTypeMetatableValue` (vm.zig:28034) — nil/bool/number/string/
+  function/thread/lightuserdata → существующие VM slots (второго
+  хранилища нет); `State.getmetatable` (api.zig:846) через pub
+  `vm.valueMetatable` (vm.zig:42488) — C-API get читает TYPE-LEVEL slots
+  (PUC lapi.c:951-960; раньше возвращал ничего для type-level, пока
+  Lua-level getmetatable уже читал). Сходимость ВСЕХ точек в примитив:
+  `gcStoreMetatable` — тонкий wrapper (vm.zig:27873; 12 внутренних
+  сайтов: bootstrap, wrap/io iterators, debug hooks, testC, file
+  metatables), `State.setmetatable` (api.zig:861: api_check table-or-nil
+  → error.Type, точный error kind), `lua_setmetatable` (c_api.zig:2568:
+  OOM → `cThrowOn` LUA_ERRMEM + MEMERRMSG — PUC не имеет обычного
+  failure-return, его barrier/`luaC_checkfinalizer` infallible, наш
+  allocation failure идёт protected-транспортом; lenient api_check-остаток
+  → 0), `builtinDebugSetmetatable` (vm.zig:34657), testC setmetatable
+  (vm.zig:47652 — полный lua_setmetatable-путь ltests: раньше пропускал
+  finalizer registration и использовал backward barrier), поздние
+  сходимости `builtinSetmetatable` (vm.zig:32620) и `allocManagedFileObject`
+  (vm.zig:35968) — отдельные fastTm/registerFinalizable вызовы ПОСЛЕ
+  транзакции удалены (pre-checks живут в prepare; дублированный __gc
+  lookup после commit убран).
+- **Perf-arc +5.788% → +1.327% (table_alloc_setmetatable)**: hot path
+  изменён; pre-check probe implementation-агента (interleaved paired
+  instruction deltas, /tmp/opencode — canonical manifest не мутирован)
+  на первом варианте дал worst +5.788%. Два root cause: (1)
+  расслоение точек входа — public-пути не сходились в общий примитив,
+  сходимые сайты повторяли fastTm-lookup + отдельную
+  registerFinalizable publication после commit; (2) out-of-line
+  prepare/commit вызовы в hot path. Исправлено полной конвергенцией
+  всех сайтов в один inline-примитив (pub inline fn + удаление
+  дублированной finalizer-логики после транзакции) → worst +1.327%
+  (table_alloc_setmetatable; соседние workload'ы в шуме). Authoritative
+  verdict — только объявленной сессией (ниже).
+- **MEDIUM — ложные числа финальной сессии review-12**: phase prose
+  review-12 цитировала pre-check-экстремы как финальные; исправлена на
+  canonical finals из current-gate.json: raw worst
+  table_alloc_setmetatable seed 10 +4.1596% < WARN 5%; field_access raw
+  worst +1.9012%, matched center ≈ +1.277%. Baseline и manifest history
+  не менялись.
+- **Тесты**: 3 новых focused теста (c_api.zig:4723+): (1) OOM-матрица
+  `lua_setmetatable` table+userdata через настоящий C-call под
+  `lua_pcallk` boundary (FailingAllocator по testc_alloc_base seam —
+  резервы транзакции идут через infraAlloc; fail_index sweep): table —
+  ровно 4 reserve-края (finalizables/gray/old1/grayagain), userdata —
+  ровно 3 (finalizables/gray/old1; metatable-указатель — только forward
+  barrier, grayagain-края нет); каждый край → LUA_ERRMEM (4) + MEMERRMSG
+  byte-exact, boundary (первый success-index) публикует store +
+  forward-barrier (gray+old1) + conservative table re-traversal
+  (grayagain) + finalizer registration ровно один раз; real-allocator
+  success + настоящий full cycle survival; (2) `debug.setmetatable` в
+  protected Lua call — fail_index sweep 0..16 со свежим OLD owner +
+  young/white mt на каждый probe: reserve-failure — ничего не изменилось
+  (byte-exact), post-commit transport-failure — атомарная publication
+  сохранена (PUC сохраняет эффект setmetatable при позднейшем OOM);
+  (3) type-level round-trip 7 типов (nil/bool/number/string/function/
+  thread/lightuserdata — set/get → тот же mt; lightuserdata из C, вне
+  PUC-differential). Negative-befores задокументированы: возврат старого
+  userdata-swallow → `expected 4, found 0` (c_api.zig:4784); возврат
+  `lua_setmetatable` catch-return-0 → `expected 4, found 0`
+  (c_api.zig:4746). PUC differential type-level metatables
+  (/tmp/opencode/puc_type_mt_c.c) — вывод идентичен PUC и luazig.
+- **Батарея**: 303/303 unit (Debug+ReleaseFast последовательно, 0 leaks;
+  финализатор re-verified на свежем .zig-cache после wipe), c_api test
+  0 FAIL + test-diff DIFF PASS, matrix --testc 31/32 (zig_fail=0,
+  big.lua both_fail pre-existing), smoke 84/84, 11 heavy testc-лейнов
+  rc=0 (implementation-агент; gc/gengc/api/memerr), api580 GREEN
+  (measured 384 < 400), test_perf_gate + validate_noise_lanes ALL OK,
+  wrapper 5 layouts + make test/test-smoke, fmt + git-diff-check clean.
+- **Perf**: measured runtime затронут (table/metatable hot path) —
+  pre-check probes шли в ОТДЕЛЬНЫЕ /tmp/opencode outputs, canonical
+  manifest не мутирован; ОДНА объявленная paired-seed clean-C сессия
+  (seeds 1..21, RUNS=21) на commit C (source_head = C, source_dirty =
+  clean) — verdict в tools/perf/current-gate.json +
+  current-gate-manifest.json (commit D); manifest append-only; baselines
+  byte-identical (baseline-approved/baseline-p15.37/core_baseline не
+  тронуты). Полное canonical current-* перегенерирование на clean C /
+  RF binary — артефактным коммитом D.
+- **Residuals (honest, для владельца; новые пункты НЕ открываются —
+  решение за владельцем)**:
+  - Subagent-infra outage (процессный, не product): 4 dispatch-попытки
+    с auth-failure за ~25 мин в начале фазы → координатор выполнил
+    implementation fallback-ом сам (задокументировано в phase-record);
+    владелец затем добавил в AGENTS.md правило, запрещающее продолжение
+    через основного агента при сбое сабагентов — правило приземлилось
+    ПОСЛЕ fallback (не ретроактивно нарушено), работа независимо
+    верифицирована сабагентом (все gates re-verified). Diagnosis
+    size-dependence сбоя: small/medium dispatch OK, large reject;
+    gateway улучшен владельцем. Dispatch-protocol урок: большие briefs
+    через /tmp-файлы + короткие pointer-промпты (настоящий brief —
+    /tmp/opencode/r13_final_brief.md).
 
 ### P16.50-review-11: exact white-child close barrier, per-object missed-gray marker (2026-09-19)
 

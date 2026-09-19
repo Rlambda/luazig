@@ -178,6 +178,7 @@ pub const BuiltinId = enum(u8) {
     debug_sethook,
     debug_getregistry,
     debug_traceback,
+    debug_getmetatable,
     debug_setmetatable,
     debug_getuservalue,
     debug_setuservalue,
@@ -367,6 +368,7 @@ pub const BuiltinId = enum(u8) {
             .debug_sethook => "debug.sethook",
             .debug_getregistry => "debug.getregistry",
             .debug_traceback => "debug.traceback",
+            .debug_getmetatable => "debug.getmetatable",
             .debug_setmetatable => "debug.setmetatable",
             .debug_getuservalue => "debug.getuservalue",
             .debug_setuservalue => "debug.setuservalue",
@@ -4158,6 +4160,12 @@ pub const VmStats = struct {
     gc_steps_auto: u64 = 0,
     gc_steps_manual: u64 = 0,
 
+    /// TempRoots sessions opened (gcTempRoots() calls). The rawSet hot-path
+    /// rooting discipline (P16.50-review-14): a no-rehash new-key insert
+    /// must open ZERO sessions — the counter is the observable micro-proof
+    /// (default-off like every stats counter; execution never reads it).
+    gc_temp_root_sessions: u64 = 0,
+
     // ── GC stale-entry debug counters (Task 7) ──
     // Count hits at the gcQueueScanObject/gcDrainGrayagain stale-entry
     // asserts. These should ALWAYS be zero: with the correct grayagain
@@ -4476,8 +4484,11 @@ pub const Vm = struct {
     dynamic_ast_arena: lua_ast.AstArena,
     dynamic_bytecode_compiler: ?DynamicBytecodeCompiler = null,
     global_env: *Table,
-    string_metatable: *Table,
-    string_metatable_enabled: bool = true,
+    // PUC mt[LUA_TSTRING]: the type-level string metatable. Optional like
+    // every other type slot (PUC G(L)->mt[] is NULL-able); "disabled" IS
+    // null — there is no separate enabled flag in PUC. Set at bootstrap
+    // (luaopen_string) and replaceable per lua_setmetatable's default arm.
+    string_metatable: ?*Table = null,
     number_metatable: ?*Table = null,
     boolean_metatable: ?*Table = null,
     nil_metatable: ?*Table = null,
@@ -8770,6 +8781,7 @@ pub const Vm = struct {
     /// Pub (review-7 B1): c_api.zig tests root construction intermediates
     /// across C-call windows the same way vm.zig constructors do.
     pub fn gcTempRoots(self: *Vm) TempRoots {
+        if (self.stats.enabled) self.stats.gc_temp_root_sessions += 1;
         return .{ .vm = self, .snapshot = self.gc_temp_roots.items.len, .cell_snapshot = self.gc_temp_cell_roots.items.len };
     }
 
@@ -22508,6 +22520,7 @@ pub const Vm = struct {
             .debug_sethook => try self.builtinDebugSethook(args, outs),
             .debug_getregistry => try self.builtinDebugGetregistry(args, outs),
             .debug_traceback => try self.builtinDebugTraceback(args, outs),
+            .debug_getmetatable => try self.builtinDebugGetmetatable(args, outs),
             .debug_setmetatable => try self.builtinDebugSetmetatable(args, outs),
             .debug_getuservalue => try self.builtinDebugGetuservalue(args, outs),
             .debug_setuservalue => try self.builtinDebugSetuservalue(args, outs),
@@ -23174,7 +23187,7 @@ pub const Vm = struct {
         try self.setField(string_tbl, "gsub", .{ .Builtin = .string_gsub });
         try self.setField(string_tbl, "rep", .{ .Builtin = .string_rep });
         try self.setGlobal("string", .{ .Table = string_tbl });
-        try self.setField(self.string_metatable, "__index", .{ .Table = string_tbl });
+        try self.setField(self.string_metatable.?, "__index", .{ .Table = string_tbl });
 
         // PUC lstrlib.c:332-343 stringmetamethods: register __add/__sub/__mul/
         // __mod/__pow/__div/__idiv/__unm on the string metatable. These are
@@ -23182,14 +23195,14 @@ pub const Vm = struct {
         // helper: tonum both operands → lua_arith; else trymt two-operand
         // error. Bitwise metamethods are NOT registered (PUC does not register
         // them), so "x" & 1 falls through to luaG_opinterror.
-        try self.setField(self.string_metatable, "__add", .{ .Builtin = .str_arith_add });
-        try self.setField(self.string_metatable, "__sub", .{ .Builtin = .str_arith_sub });
-        try self.setField(self.string_metatable, "__mul", .{ .Builtin = .str_arith_mul });
-        try self.setField(self.string_metatable, "__mod", .{ .Builtin = .str_arith_mod });
-        try self.setField(self.string_metatable, "__pow", .{ .Builtin = .str_arith_pow });
-        try self.setField(self.string_metatable, "__div", .{ .Builtin = .str_arith_div });
-        try self.setField(self.string_metatable, "__idiv", .{ .Builtin = .str_arith_idiv });
-        try self.setField(self.string_metatable, "__unm", .{ .Builtin = .str_arith_unm });
+        try self.setField(self.string_metatable.?, "__add", .{ .Builtin = .str_arith_add });
+        try self.setField(self.string_metatable.?, "__sub", .{ .Builtin = .str_arith_sub });
+        try self.setField(self.string_metatable.?, "__mul", .{ .Builtin = .str_arith_mul });
+        try self.setField(self.string_metatable.?, "__mod", .{ .Builtin = .str_arith_mod });
+        try self.setField(self.string_metatable.?, "__pow", .{ .Builtin = .str_arith_pow });
+        try self.setField(self.string_metatable.?, "__div", .{ .Builtin = .str_arith_div });
+        try self.setField(self.string_metatable.?, "__idiv", .{ .Builtin = .str_arith_idiv });
+        try self.setField(self.string_metatable.?, "__unm", .{ .Builtin = .str_arith_unm });
 
         // table = { unpack = builtin }
         const table_tbl = try self.allocTableNoGc();
@@ -23314,7 +23327,10 @@ pub const Vm = struct {
         try self.setField(mod, "traceback", .{ .Builtin = .debug_traceback });
         try self.setField(mod, "getuservalue", .{ .Builtin = .debug_getuservalue });
         try self.setField(mod, "setmetatable", .{ .Builtin = .debug_setmetatable });
-        try self.setField(mod, "getmetatable", .{ .Builtin = .getmetatable });
+        // PUC dblib.c:48-54 db_getmetatable is a RAW lua_getmetatable —
+        // unlike the global getmetatable (lbaselib.c:134) it does NOT
+        // honor the __metatable protection field.
+        try self.setField(mod, "getmetatable", .{ .Builtin = .debug_getmetatable });
         try self.setField(mod, "setuservalue", .{ .Builtin = .debug_setuservalue });
         try self.setField(mod, "debug", .{ .Builtin = .debug_debug });
     }
@@ -24336,8 +24352,19 @@ pub const Vm = struct {
         try self.builtinCoroutineCreate(args, tmp[0..]);
         const th = try self.expectThread(tmp[0]);
         self.wrap_thread = th;
+        // P16.50-review-14 HIGH 2: obj/mt live only in Zig locals between
+        // their allocation and publication (outs[0] / obj.metatable) — the
+        // next setField/metatable-prepare can fire an emergency GC. Reserve
+        // both temp-root slots up front (review-7 ensure discipline) so each
+        // addAssumeCapacity is infallible: no GC-capable step can run between
+        // an allocation and its rooting.
+        var roots = self.gcTempRoots();
+        defer roots.end();
+        try roots.ensure(2);
         const obj = try self.allocTableNoGc();
+        roots.addAssumeCapacity(.{ .Table = obj });
         const mt = try self.allocTableNoGc();
+        roots.addAssumeCapacity(.{ .Table = mt });
         try self.setField(mt, "__call", .{ .Builtin = .coroutine_wrap_iter });
         try self.gcStoreMetatable(obj, mt);
         try self.setField(obj, "__thread", .{ .Thread = th });
@@ -27899,10 +27926,6 @@ pub const Vm = struct {
         /// not already registered (PUC `tofinalize(o)` early-exit), state
         /// not closing (GCSTPCLS). Type-level arms never set this.
         needs_finalizer: bool = false,
-        /// review-12 table semantics (KEEP): a black Table not yet touched1
-        /// is conservatively re-queued into grayagain so the (possibly
-        /// young) metatable is re-marked next cycle.
-        table_remember: bool = false,
     };
 
     /// Forward-barrier arms mirroring PUC luaC_barrier_ (lgc.c:246-263) for
@@ -27950,16 +27973,6 @@ pub const Vm = struct {
                         try self.gc_old1.ensureUnusedCapacity(self.infraAlloc(), 1);
                     }
                 }
-                switch (owner) {
-                    .table => |t| {
-                        // review-12 conservative re-traversal (KEEP).
-                        if (gcIsBlack(t.gc_marked) and t.gc_age != .touched1) {
-                            plan.table_remember = true;
-                            try self.gc_grayagain.ensureUnusedCapacity(self.infraAlloc(), 1);
-                        }
-                    },
-                    else => {},
-                }
             } else if (!gen_minor) {
                 if (self.gc_state != .pause and
                     gcIsBlack(gcPtr(owner).marked.*) and gcIsWhite(m.gc_marked))
@@ -28004,14 +28017,6 @@ pub const Vm = struct {
             if (plan.barrier.inc_make_white) {
                 gcMakeWhite(gcPtr(owner).marked, self.gc_current_white);
             }
-            if (plan.table_remember) {
-                if (owner == .table) {
-                    const t = owner.table;
-                    t.gc_age = .touched1;
-                    gcSetGray(&t.gc_marked);
-                    self.gc_grayagain.appendAssumeCapacity(owner);
-                }
-            }
             if (plan.needs_finalizer) {
                 // registerFinalizable's commit half — every fallible part
                 // (map capacity) was reserved by prepare.
@@ -28034,10 +28039,11 @@ pub const Vm = struct {
     pub fn setTypeMetatableValue(self: *Vm, target: Value, mt: ?*Table) bool {
         return switch (target) {
             .String => blk: {
-                // Non-optional field + enabled flag (existing repr): a null
-                // metatable disables the slot, keeping the table GC-rooted.
-                if (mt) |m| self.string_metatable = m;
-                self.string_metatable_enabled = mt != null;
+                // PUC lapi.c:993-994 default arm: a plain store into
+                // G(L)->mt[LUA_TSTRING] — null IS "no metatable". The slot
+                // is a GC root (markmt), so the old table is released when
+                // the slot is nulled.
+                self.string_metatable = mt;
                 break :blk true;
             },
             .Int, .Num => blk: {
@@ -28566,6 +28572,15 @@ pub const Vm = struct {
         // because no mutations occur between gcMarkMutableRoots and
         // gcDrainGrayagain.]
         try self.gcMarkMutableRoots();
+
+        // PUC atomic Step 1 ends with markmt(g) (lgc.c:1554): re-mark the
+        // type-level metatable slots. The API can store a fresh table into
+        // G(L)->mt[t] at any point mid-cycle (lua_setmetatable's default
+        // arm is a plain store, lapi.c:993-994), so a table that was white
+        // at cycle start but is now slot-reachable must be marked BEFORE
+        // the sweep decides liveness. Without this, the slot keeps a
+        // swept (freed) table — a dangling GC root.
+        try self.gcMarkTypeMetatables();
 
         // ── Step 2 (lgc.c:1555): propagateall(g) — drain gray list ──
         try self.gcDrainGray();
@@ -29694,26 +29709,42 @@ pub const Vm = struct {
         self.gcScheduleNextAutomaticCycle();
     }
 
-    /// Mark all GC roots that live directly on the Vm struct and are NOT
-    /// reachable through Lua-value traversal from global_env/frames.
-    fn gcMarkVmRoots(self: *Vm) DispatchError!void {
-        // Type metatables: every string/number/boolean/etc. value's metamethod
-        // lookup routes through these.
-        try self.gcMarkValue(.{ .Table = self.string_metatable });
-        // P16.50-review-3: the fixed OOM message literal is a VM-lifetime
-        // root (the OOM path must never allocate — see setOutOfMemoryError).
-        if (self.oom_msg_str) |s| try self.gcMarkValue(.{ .String = s });
-        const optional_mts = [_]?*Table{
+    /// PUC markmt (lgc.c:379-382, called from restartcollection lgc.c:443
+    /// and atomic lgc.c:1552-1554): mark every non-null G(L)->mt[] slot.
+    /// The type-level slots are GC roots because the API can store a fresh
+    /// table into any of them at ANY point — including mid-cycle, through
+    /// lua_setmetatable's default arm (lapi.c:993-994, a plain store with
+    /// no barrier). Marking at cycle start alone cannot see a store that
+    /// happens after the start, so atomic re-marks the slots before the
+    /// sweep flips colors.
+    fn gcMarkTypeMetatables(self: *Vm) DispatchError!void {
+        const mts = [_]?*Table{
+            self.string_metatable,
             self.number_metatable,
             self.boolean_metatable,
             self.nil_metatable,
             self.function_metatable,
             self.thread_metatable,
-            self.file_metatable,
+            self.light_userdata_metatable,
         };
-        for (optional_mts) |mt| {
+        for (mts) |mt| {
             if (mt) |t| try self.gcMarkValue(.{ .Table = t });
         }
+    }
+
+    /// Mark all GC roots that live directly on the Vm struct and are NOT
+    /// reachable through Lua-value traversal from global_env/frames.
+    fn gcMarkVmRoots(self: *Vm) DispatchError!void {
+        // Type metatables: every string/number/boolean/etc. value's metamethod
+        // lookup routes through these (PUC markmt).
+        try self.gcMarkTypeMetatables();
+        // P16.50-review-3: the fixed OOM message literal is a VM-lifetime
+        // root (the OOM path must never allocate — see setOutOfMemoryError).
+        if (self.oom_msg_str) |s| try self.gcMarkValue(.{ .String = s });
+        // file_metatable is NOT a PUC mt[] slot (there is no LUA_TFILE in
+        // PUC's mt array); it is set once at bootstrap and read by the file
+        // userdata library, so a start-of-cycle mark suffices.
+        if (self.file_metatable) |t| try self.gcMarkValue(.{ .Table = t });
         // PUC markmt (lgc.c:381-382): mark pre-interned metamethod name
         // strings (g->tmname[]). These strings ("__index", "__newindex",
         // "__len", etc.) are used for pointer-identity key comparison in
@@ -34526,14 +34557,22 @@ pub const Vm = struct {
         if (self.debug_registry) |r| return r;
         var roots = self.gcTempRoots();
         defer roots.end();
+        // P16.50-review-14 HIGH 2: every fresh table here (reg, hookkey and
+        // especially mt — the audit's unrooted one) must be rooted with an
+        // INFALLIBLE add: the next setField/intern/metatable-prepare can
+        // fire an emergency GC, and a table living only in a Zig local is
+        // invisible to the emergency scan. ensure(3) reserves all slots
+        // before any object exists (review-7 discipline).
+        try roots.ensure(3);
 
         const reg = try self.allocTable(null);
-        try roots.add(.{ .Table = reg });
+        roots.addAssumeCapacity(.{ .Table = reg });
 
         const hookkey = try self.allocTable(null);
-        try roots.add(.{ .Table = hookkey });
+        roots.addAssumeCapacity(.{ .Table = hookkey });
 
         const mt = try self.allocTable(null);
+        roots.addAssumeCapacity(.{ .Table = mt });
         try self.setField(mt, "__mode", .{ .String = try self.internStr("k") });
         try self.gcStoreMetatable(hookkey, mt);
         try self.setField(reg, "_HOOKKEY", .{ .Table = hookkey });
@@ -34652,6 +34691,17 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         const reg = try self.ensureDebugRegistry();
         outs[0] = .{ .Table = reg };
+    }
+
+    /// PUC db_getmetatable (ldblib.c:48-54): a RAW lua_getmetatable —
+    /// pushes the object's metatable with NO __metatable protection
+    /// (that field is honored only by the global getmetatable,
+    /// lbaselib.c:134). Works for every value kind, including the
+    /// type-level slots (lua_getmetatable's G(L)->mt[ttype(o)] arm).
+    fn builtinDebugGetmetatable(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        if (args.len < 1) return self.fail("bad argument #1 to 'getmetatable' (value expected)", .{});
+        if (outs.len == 0) return;
+        outs[0] = if (valueMetatable(self, args[0])) |mt| .{ .Table = mt } else .Nil;
     }
 
     fn builtinDebugSetmetatable(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -35424,20 +35474,27 @@ pub const Vm = struct {
         // Both barrier the same table; both plans are prepared BEFORE the
         // insert and each commit re-validates, so the second of the pair is
         // a no-op when the first published (PUC idempotence via the
-        // touched1/gray guard). tableRehash between prepare and commit is
-        // collector-free (see its invariant comment) but MAY run an
-        // emergency full GC via the testc allocation adapter — the commit's
-        // re-validation makes every outcome safe (see BackBarrierPlan); an
-        // OOM from the rehash returns before any commit with nothing
-        // mutated but the reserved spare capacity (harmless).
+        // touched1/gray guard). The prepares reserve grayagain capacity via
+        // infraAlloc — the UNCOUNTED base allocator that never routes
+        // through the testc adapter, so no prepare can run a GC; a prepare
+        // failure returns with nothing mutated but the reserved spare
+        // capacity (harmless).
         const key_barrier = try self.gcPrepareTableBarrierBackNewKey(tbl, canon_key); // KEY barrier
         const val_barrier = try self.gcPrepareTableBarrierBackValue(tbl, val); // VALUE barrier (idempotent commit)
 
-        // Try insertkey (PUC `insertkey`). If the hash part is empty
-        // (PUC "dummy"), insertkey returns null (no free place) — this
-        // forces a rehash, which is exactly what PUC does: the first insert
-        // into a table triggers rehash so `computeSizes` can decide whether
-        // the key belongs in the array part (e.g. `t[1]=x` → asize=1 → array).
+        // Fast path: the hash part has a free slot — nodeInsert is pure
+        // memory surgery (no allocation → no GC window), so nothing between
+        // the prepares and the store can sweep canon_key/val. PUC anchors
+        // t/key/val on the Lua stack across luaH_newkey (~3 pointer writes
+        // into a preallocated stack); the gc_temp_roots analog of that
+        // anchoring would be pure waste on this path, so it is opened only
+        // in the rehash branch below. This is the path every pre-sized
+        // constructor insert takes (OP_NEWTABLE pre-allocates the hinted
+        // hash part, so `{v = i}` never rehashes). An empty hash part
+        // (PUC "dummy") also falls through: insertkey has no free place,
+        // forcing the rehash PUC performs on the first insert so
+        // `computeSizes` can decide whether the key belongs in the array
+        // part (e.g. `t[1]=x` → asize=1 → array).
         if (tbl.hash.len != 0) {
             if (ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, canon_key, val)) |_| {
                 if (self.stats.enabled) self.stats.tbl_insert += 1;
@@ -35450,6 +35507,28 @@ pub const Vm = struct {
             }
             // Hash full: fall through to rehash.
         }
+
+        // Rehash branch — the ONLY GC-capable window in rawSet: tableRehash
+        // → tableResize allocates through vm.alloc, whose armed testc
+        // adapter runs the emergency full GC on the failure path (PUC
+        // luaM_reallocvector → tryagain → luaC_fullgc). PUC roots t/key/val
+        // on the Lua stack across luaH_newkey — traversethread marks
+        // L->stack[0..top] wholesale, so the pending key and value survive
+        // it. Here they live in Zig locals (canon_key, val) that the
+        // emergency scan cannot see; with no other referent (e.g. the value
+        // string reachable only from superseded bootstrap garbage) the
+        // emergency GC at the rehash allocation would sweep them and the
+        // insert below would publish a dangling pointer. Root the table,
+        // key and value BEFORE the first fallible op of this branch (the
+        // rehash allocation) and keep the session open until the insert
+        // publishes them — the gc_temp_roots analog of PUC's stack
+        // anchoring (same discipline as the luaL_newmetatable tname root).
+        var roots = self.gcTempRoots();
+        defer roots.end();
+        try roots.ensure(3);
+        roots.addAssumeCapacity(.{ .Table = tbl });
+        roots.addAssumeCapacity(canon_key);
+        roots.addAssumeCapacity(val);
 
         // Rehash (PUC `rehash` — grow table, redistribute keys between
         // array/hash parts via `computeSizes`). Drops deleted/Nil entries
@@ -36472,9 +36551,20 @@ pub const Vm = struct {
     }
 
     fn makeLinesIter(self: *Vm, file_v: Value, auto_close: bool, fmts: []const Value) DispatchError!Value {
+        // P16.50-review-14 HIGH 2: obj/mt/fmts_tbl live only in Zig locals
+        // between their allocation and publication — the setField/resize/
+        // metatable-prepare steps below can each fire an emergency GC.
+        // ensure(3) + infallible addAssumeCapacity closes every window
+        // (review-7 discipline).
+        var roots = self.gcTempRoots();
+        defer roots.end();
+        try roots.ensure(3);
         const obj = try self.allocTableNoGc();
+        roots.addAssumeCapacity(.{ .Table = obj });
         const mt = try self.allocTableNoGc();
+        roots.addAssumeCapacity(.{ .Table = mt });
         const fmts_tbl = try self.allocTableNoGc();
+        roots.addAssumeCapacity(.{ .Table = fmts_tbl });
         try self.setField(mt, "__call", .{ .Builtin = .io_lines_iter });
         try self.gcStoreMetatable(obj, mt);
         try self.setField(obj, "__file", file_v);
@@ -42488,7 +42578,7 @@ pub const Vm = struct {
     pub fn valueMetatable(self: *Vm, v: Value) ?*Table {
         return switch (v) {
             .Table => |t| t.metatable,
-            .String => if (self.string_metatable_enabled) self.string_metatable else null,
+            .String => self.string_metatable,
             .Int, .Num => self.number_metatable,
             .Bool => self.boolean_metatable,
             .Nil => self.nil_metatable,
@@ -46358,9 +46448,16 @@ pub const Vm = struct {
                 if (n > st.items.len) return self.fail("testC stack underflow", .{});
                 var roots = self.gcTempRoots();
                 defer roots.end();
+                // P16.50-review-14 HIGH 2: upvals/ccl/mt live only in Zig
+                // locals until publication (ccl's metatable / the stack
+                // append); the setField/prepare steps below can fire an
+                // emergency GC. ensure(3) + infallible addAssumeCapacity
+                // closes every window (review-7 discipline; upvals/ccl were
+                // previously rooted with fallible adds — mt not at all).
+                try roots.ensure(3);
 
                 const upvals = try self.allocTable(null);
-                try roots.add(.{ .Table = upvals });
+                roots.addAssumeCapacity(.{ .Table = upvals });
 
                 const base = st.items.len - n;
                 for (0..n) |i| {
@@ -46368,7 +46465,7 @@ pub const Vm = struct {
                 }
                 st.items.len = base;
                 const ccl = try self.allocTable(null);
-                try roots.add(.{ .Table = ccl });
+                roots.addAssumeCapacity(.{ .Table = ccl });
 
                 try self.setField(ccl, "__testc_upvalues", .{ .Table = upvals });
                 // PUC CClosure has `nupvalues`; the array part of `upvals`
@@ -46382,6 +46479,7 @@ pub const Vm = struct {
                 try self.setField(ccl, "__testc_upenv", envv);
                 try self.setField(ccl, "__testc_script_upvalue", .{ .Bool = false });
                 const mt = try self.allocTable(null);
+                roots.addAssumeCapacity(.{ .Table = mt });
                 try self.setField(mt, "__call", .{ .Builtin = .testc_testC });
                 try self.gcStoreMetatable(ccl, mt);
                 try st.append(self.infraAlloc(), .{ .Table = ccl });
@@ -47653,7 +47751,17 @@ pub const Vm = struct {
                 if (st.items.len == 0) return self.fail("testC stack underflow", .{});
                 const idx = try self.parseTestcIndex(cargs[0], st.items.len);
                 const obj = st.items[idx];
-                const mtv = st.pop().?;
+                // PUC ltests.c:1907-1910: plain lua_setmetatable(L1, idx) —
+                // the FULL path. Table/userdata owners run the review-13
+                // prepare/commit transaction (luaC_objbarrier +
+                // luaC_checkfinalizer); every other type runs the DEFAULT
+                // arm (lapi.c:993-994: a plain store into
+                // G(L)->mt[ttype(obj)] — the type-level slots). The
+                // metatable is validated up front (lapi.c:970-975
+                // api_check) and popped (lapi.c:998 L->top.p--) only AFTER
+                // the store commits, so a reserve failure inside the
+                // transaction leaves the stack byte-exact.
+                const mtv = st.items[st.items.len - 1];
                 const mt: ?*Table = switch (mtv) {
                     .Nil => null,
                     .Table => |t| t,
@@ -47661,19 +47769,16 @@ pub const Vm = struct {
                 };
                 switch (obj) {
                     .Table, .Userdata => {
-                        // P16.50-review-13: the shared metatable primitive —
-                        // PUC ltests setmetatable runs the FULL
-                        // lua_setmetatable path, including
-                        // luaC_checkfinalizer (the old testC arm skipped
-                        // finalizer registration) and the FORWARD
-                        // owner→metatable barrier (the old userdata arm used
-                        // the backward one).
                         const owner = GcObject.fromValue(obj).?;
                         const plan = try self.gcPrepareSetMetatable(owner, mt);
                         self.gcCommitSetMetatable(owner, mt, plan);
                     },
-                    else => return self.fail("testC setmetatable expects table/userdata", .{}),
+                    else => {
+                        if (!self.setTypeMetatableValue(obj, mt))
+                            return self.fail("testC setmetatable unsupported target", .{});
+                    },
                 }
+                _ = st.pop();
             },
             .newmetatable => {
                 if (cargs.len != 1) return self.fail("testC newmetatable expects 1 arg", .{});
@@ -61171,11 +61276,13 @@ test "P16.50-review-12 4: gcStoreMetatable fail indices publish nothing; success
     try vm.gcEnterGenerational();
 
     // Gen arm: fwd (black owner, white metatable) needs gc_gray + gc_old1
-    // + gc_grayagain — three reserves in order before the single pointer
-    // store. Each edge pre-satisfies the earlier reserves so the failing
-    // one is exactly the edge's index; fail_index = 0 rejects every
-    // allocation, so the first reserve that must grow is the abort point.
-    for (0..3) |edge| {
+    // — two reserves in order before the single pointer store (HIGH 1
+    // removed the PUC-unintended grayagain re-queue: PUC lua_setmetatable
+    // runs only the forward luaC_objbarrier). Each edge pre-satisfies the
+    // earlier reserves so the failing one is exactly the edge's index;
+    // fail_index = 0 rejects every allocation, so the first reserve that
+    // must grow is the abort point.
+    for (0..2) |edge| {
         vm.gc_gray.deinit(testing.allocator);
         vm.gc_gray = .empty;
         vm.gc_old1.deinit(testing.allocator);
@@ -61183,7 +61290,6 @@ test "P16.50-review-12 4: gcStoreMetatable fail indices publish nothing; success
         vm.gc_grayagain.deinit(testing.allocator);
         vm.gc_grayagain = .empty;
         if (edge >= 1) try vm.gc_gray.ensureUnusedCapacity(testing.allocator, 1);
-        if (edge >= 2) try vm.gc_old1.ensureUnusedCapacity(testing.allocator, 1);
         const mt = try vm.allocTableNoGc();
         const added_old_kb = vm.gc_gen_added_old_kb;
 
@@ -61210,7 +61316,9 @@ test "P16.50-review-12 4: gcStoreMetatable fail indices publish nothing; success
     }
 
     // Success: forward-barrier publication (metatable gray + gc_gray +
-    // OLD0 + gc_old1) plus the owner's own touched1 + grayagain membership.
+    // OLD0 + gc_old1). The owner keeps its OLD/black age/color — HIGH 1:
+    // no touched1, no grayagain re-queue (PUC runs no backward barrier for
+    // the metatable pointer).
     const mt = try vm.allocTableNoGc();
     const added_old_kb = vm.gc_gen_added_old_kb;
     try vm.gcStoreMetatable(owner, mt);
@@ -61218,17 +61326,17 @@ test "P16.50-review-12 4: gcStoreMetatable fail indices publish nothing; success
     try testing.expect(mt.gc_age == .old0 and gcIsGray(mt.gc_marked));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = mt }));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = mt }));
-    try testing.expect(owner.gc_age == .touched1 and gcIsGray(owner.gc_marked));
-    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .table = owner }));
+    try testing.expect(owner.gc_age == .old and gcIsBlack(owner.gc_marked));
+    try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
 
     // Real minor cycle: the metatable is drained black and promoted
     // OLD0→OLD1 exactly once (no duplicate gc_old1 entry — the store
-    // already linked it), the owner advances to TOUCHED2, and the
-    // accounting charges the promotion exactly once.
+    // already linked it); the owner stays OLD/black (never re-traversed),
+    // and the accounting charges the promotion exactly once.
     try vm.gcMinorCollection();
     try testing.expect(mt.gc_age == .old1 and gcIsBlack(mt.gc_marked));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = mt }));
-    try testing.expect(owner.gc_age == .touched2);
+    try testing.expect(owner.gc_age == .old and gcIsBlack(owner.gc_marked));
     const expect_delta = @as(f64, @floatFromInt(gcObjectBytes(.{ .table = mt }))) / 1024.0;
     try testing.expectApproxEqAbs(expect_delta, vm.gc_gen_added_old_kb - added_old_kb, 1e-9);
     try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
@@ -61542,4 +61650,956 @@ test "P16.50-review-12 7: sticky fail-everything minor cycle recovers; invariant
         try testing.expect((gcPtr(obj).marked.* & MISSEDGRAYBIT) == 0);
     }
     try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// P16.50-review-14 BLOCKER 1: type-level metatables are GC roots with the
+// full PUC markmt lifecycle — marked at cycle START (gcMarkVmRoots) AND
+// re-marked in the ATOMIC step (PUC lgc.c:1552-1554 `markmt(g)` inside
+// atomic(), because the API can store a fresh table into G(L)->mt[t] at
+// any point mid-cycle via lua_setmetatable's default arm, lapi.c:993).
+// ═══════════════════════════════════════════════════════════════════════
+
+fn r14GcObjectsHasTable(vm: *Vm, t: *Table) bool {
+    for (vm.gc_objects.items) |o| {
+        switch (o) {
+            .table => |tt| if (tt == t) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+test "P16.50-review-14 B1: type-level metatable stored mid-cycle survives the real cycle (all 7 slots)" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    // Pre-intern every key once so no allocation happens between the
+    // un-rooting of the metatable and the controlled mid-cycle store.
+    const field_key: Value = .{ .String = try vm.internStr("r14field") };
+    const len_key: Value = .{ .String = try vm.internStr("__len") };
+    const str_val: Value = .{ .String = try vm.internStr("r14str") };
+    const th = try vm.apiNewThread(.Nil);
+
+    // One representative value per type-level slot (Int and Num share the
+    // number slot; both arms are exercised).
+    const targets = [_]Value{
+        .Nil,
+        .{ .Bool = true },
+        .{ .Int = 42 },
+        .{ .Num = 4.5 },
+        str_val,
+        .{ .Builtin = .type },
+        .{ .Thread = th },
+        .{ .LightUserdata = @ptrFromInt(0xcafebabe) },
+    };
+
+    for (targets, 0..) |target, ti| {
+        // Fresh metatable, rooted only during construction.
+        var roots = vm.gcTempRoots();
+        const mt = try vm.apiNewTable();
+        try roots.add(.{ .Table = mt });
+        try vm.apiSetTable(.{ .Table = mt }, field_key, .{ .Int = 42 + @as(i64, @intCast(ti)) });
+        try vm.apiSetTable(.{ .Table = mt }, len_key, .{ .Builtin = .string_len });
+        roots.end();
+
+        // Start a REAL cycle: roots are marked now; the metatable is in no
+        // slot yet, so it is NOT marked (it is white garbage from this
+        // cycle's point of view).
+        try vm.gcStartCycle(true);
+        try testing.expect(vm.gc_state == .propagate);
+
+        // Mid-cycle store into the type slot — PUC lua_setmetatable's
+        // default arm is a plain store with no barrier (lapi.c:993-994).
+        try testing.expect(vm.setTypeMetatableValue(target, mt));
+
+        // Complete the REAL cycle (atomic + sweep). PUC re-marks mt[] in
+        // atomic (lgc.c:1552-1554) precisely so this table survives.
+        while (vm.gc_state != .pause) _ = try vm.gcAdvance(std.math.maxInt(usize), false);
+
+        // The slot must reference a LIVE table (membership in gc_objects is
+        // the liveness oracle — sweep removes freed objects).
+        try testing.expect(vm.valueMetatable(target) == mt);
+        try testing.expect(r14GcObjectsHasTable(&vm, mt));
+
+        // ...and it must survive the NEXT full collection too (the slot is
+        // now the only root).
+        try vm.gcCycleFull();
+        try testing.expect(vm.valueMetatable(target) == mt);
+        try testing.expect(r14GcObjectsHasTable(&vm, mt));
+
+        // Identity of contents after collection: field and metamethod.
+        const got = vm.apiRawGet(mt, field_key);
+        try testing.expect(got == .Int and got.Int == 42 + @as(i64, @intCast(ti)));
+        try testing.expect(vm.fastTm(mt, .len) != null);
+
+        // Clear the slot so iterations don't cross-root each other.
+        _ = vm.setTypeMetatableValue(target, null);
+    }
+}
+
+test "P16.50-review-14 B1: lightuserdata metatable is a GC root (markmt covers LUA_TLIGHTUSERDATA)" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    var roots = vm.gcTempRoots();
+    const mt = try vm.apiNewTable();
+    try roots.add(.{ .Table = mt });
+    const field_key: Value = .{ .String = try vm.internStr("r14lud") };
+    try vm.apiSetTable(.{ .Table = mt }, field_key, .{ .Int = 7 });
+    roots.end();
+
+    const lud: Value = .{ .LightUserdata = @ptrFromInt(0x1234) };
+    try testing.expect(vm.setTypeMetatableValue(lud, mt));
+
+    // A REAL full cycle: the slot is the ONLY root — the table must survive.
+    try vm.gcCycleFull();
+    try testing.expect(vm.valueMetatable(lud) == mt);
+    try testing.expect(r14GcObjectsHasTable(&vm, mt));
+    const got = vm.apiRawGet(mt, field_key);
+    try testing.expect(got == .Int and got.Int == 7);
+}
+
+test "P16.50-review-14 B1: disabling the string metatable releases the old graph (weak-table oracle)" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    // Outer roots: the weak table W and its mode metatable stay rooted for
+    // the whole test (they are the observation instrument).
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    const w = try vm.apiNewTable();
+    try roots.add(.{ .Table = w });
+    const wmt = try vm.apiNewTable();
+    try roots.add(.{ .Table = wmt });
+    const mode_key: Value = .{ .String = try vm.internStr("__mode") };
+    const mode_v: Value = .{ .String = try vm.internStr("v") };
+    try vm.apiSetTable(.{ .Table = wmt }, mode_key, mode_v);
+    try vm.gcStoreMetatable(w, wmt);
+
+    // Inner roots: the new string metatable mt and its strongly-referenced
+    // object obj — both reachable ONLY through the string slot after the
+    // inner scope ends.
+    var inner = vm.gcTempRoots();
+    const mt = try vm.apiNewTable();
+    try inner.add(.{ .Table = mt });
+    const obj = try vm.apiNewTable();
+    try inner.add(.{ .Table = obj });
+    const field_key: Value = .{ .String = try vm.internStr("r14w") };
+    try vm.apiSetTable(.{ .Table = mt }, field_key, .{ .Table = obj });
+    // Weak references: W[1] = mt, W[2] = obj.
+    try vm.apiSetTable(.{ .Table = w }, .{ .Int = 1 }, .{ .Table = mt });
+    try vm.apiSetTable(.{ .Table = w }, .{ .Int = 2 }, .{ .Table = obj });
+    inner.end();
+
+    const str_val: Value = .{ .String = try vm.internStr("r14s3") };
+    // Publish mt as THE string metatable (PUC lua_setmetatable default arm).
+    try testing.expect(vm.setTypeMetatableValue(str_val, mt));
+
+    // REAL full cycle with the slot LIVE: mt survives through the slot, and
+    // obj survives through mt's field — both weak entries stay.
+    try vm.gcCycleFull();
+    try testing.expect(vm.apiRawGet(w, .{ .Int = 1 }) == .Table);
+    try testing.expect(vm.apiRawGet(w, .{ .Int = 2 }) == .Table);
+
+    // Disable the slot (PUC: G(L)->mt[LUA_TSTRING] = NULL). The old graph
+    // must be COLLECTED — the weak entries are pruned to nil.
+    _ = vm.setTypeMetatableValue(str_val, null);
+    try vm.gcCycleFull();
+    try testing.expect(vm.apiRawGet(w, .{ .Int = 1 }) == .Nil);
+    try testing.expect(vm.apiRawGet(w, .{ .Int = 2 }) == .Nil);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// P16.50-review-14 BLOCKER 2a: testC 'setmetatable' is a plain
+// lua_setmetatable(L1, idx) (ltests.c:1907-1910) — the FULL path,
+// including the type-level default arm (lapi.c:993-994) and the
+// pop-after-commit (lapi.c:998). The old arm rejected every primitive
+// owner ("testC setmetatable expects table/userdata") and popped the
+// metatable BEFORE the fallible transaction.
+// ═══════════════════════════════════════════════════════════════════════
+
+test "P16.50-review-14 2a: testC setmetatable runs the full lua_setmetatable path (all slots + OOM edges)" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    const script = "setmetatable 2";
+
+    // ── (A) every type-level slot succeeds through testC ──
+    // PUC's default arm covers ALL primitive types; success consumes
+    // exactly the metatable (lapi.c:998 pops after the store).
+    {
+        const th = try vm.apiNewThread(.Nil);
+        const str_val: Value = .{ .String = try vm.internStr("r14a") };
+        const targets = [_]Value{
+            .Nil,
+            .{ .Bool = true },
+            .{ .Int = 1 },
+            .{ .Num = 1.5 },
+            str_val,
+            .{ .Builtin = .type },
+            .{ .Thread = th },
+            .{ .LightUserdata = @ptrFromInt(16) },
+        };
+        for (targets) |target| {
+            var roots = vm.gcTempRoots();
+            const mt = try vm.apiNewTable();
+            try roots.add(.{ .Table = mt });
+            roots.end();
+            var st: std.ArrayListUnmanaged(Value) = .empty;
+            defer st.deinit(vm.alloc);
+            try st.append(vm.alloc, .Nil); // script slot (testC index 1)
+            try st.append(vm.alloc, target);
+            try st.append(vm.alloc, .{ .Table = mt });
+            _ = try vm.runTestcScript(script, &st, .{}, null);
+            try testing.expectEqual(@as(usize, 2), st.items.len);
+            try testing.expect(vm.valueMetatable(target) == mt);
+            _ = vm.setTypeMetatableValue(target, null);
+        }
+    }
+
+    // ── (B) table owner: OOM matrix over every machinery + transaction
+    // reserve edge. Each failure must leave the caller's testC stack
+    // byte-exact (3 items) with NOTHING published; the first success
+    // commits the store AND pops exactly the metatable ──
+    {
+        var roots = vm.gcTempRoots();
+        defer roots.end();
+        // OLD black owner + young white __gc metatable in generational
+        // minor mode (r13 setup): arms every transaction reserve
+        // (finalizables, gray, old1).
+        _ = vm.gcControl(7, 0, -1); // LUA_GCGENERATIONAL
+        _ = vm.gcControl(2, 0, -1); // LUA_GCCOLLECT
+        const owner = try vm.apiNewTable();
+        try roots.add(.{ .Table = owner });
+        _ = vm.gcControl(2, 0, -1); // promote the owner OLD/black
+        const mt = try vm.apiNewTable();
+        try roots.add(.{ .Table = mt });
+        try vm.apiSetTable(.{ .Table = mt }, .{ .String = try vm.internStr("__gc") }, .{ .Builtin = .type });
+        try testing.expect(owner.metatable == null);
+
+        const base = vm.testc_alloc_base orelse vm.alloc;
+        var boundary: ?usize = null;
+        for (0..16) |fi| {
+            // Fresh lists force every reserve to actually allocate (r13).
+            vm.gc_gray.deinit(vm.alloc);
+            vm.gc_gray = .empty;
+            vm.gc_old1.deinit(vm.alloc);
+            vm.gc_old1 = .empty;
+            vm.gc_grayagain.deinit(vm.alloc);
+            vm.gc_grayagain = .empty;
+            vm.finalizables.deinit(vm.alloc);
+            vm.finalizables = .empty;
+            var st: std.ArrayListUnmanaged(Value) = .empty;
+            defer st.deinit(vm.alloc);
+            try st.append(vm.alloc, .Nil);
+            try st.append(vm.alloc, .{ .Table = owner });
+            try st.append(vm.alloc, .{ .Table = mt });
+            var failing = std.testing.FailingAllocator.init(base, .{
+                .fail_index = fi,
+                .resize_fail_index = 0,
+            });
+            vm.testc_alloc_base = failing.allocator();
+            const result = vm.runTestcScript(script, &st, .{}, null);
+            vm.testc_alloc_base = base;
+            if (result) |_| {
+                boundary = fi;
+                // Success: the transaction committed AND the pop happened
+                // (lapi.c:998) — the script and owner remain.
+                try testing.expectEqual(@as(usize, 2), st.items.len);
+                try testing.expect(owner.metatable == mt);
+                break;
+            } else |e| {
+                try testing.expect(e == error.OutOfMemory);
+                // Byte-exact: the caller's stack is restored with all 3
+                // items — the pop must NOT precede the commit.
+                try testing.expectEqual(@as(usize, 3), st.items.len);
+                try testing.expect(st.items[1] == .Table and st.items[1].Table == owner);
+                try testing.expect(st.items[2] == .Table and st.items[2].Table == mt);
+                // Nothing published pre-commit.
+                try testing.expect(owner.metatable == null);
+                try testing.expectEqual(@as(usize, 0), vm.finalizables.count());
+            }
+        }
+        try testing.expect(boundary != null);
+        // Post-success publications exactly once (r13 boundary contract):
+        // the store, the forward barrier (gray + old1) and the __gc
+        // registration — NO grayagain re-queue (HIGH 1: PUC
+        // lua_setmetatable runs only the forward luaC_objbarrier).
+        try testing.expect(vm.finalizables.contains(.{ .table = owner }));
+        try testing.expectEqual(@as(usize, 1), vm.finalizables.count());
+        try testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
+        try testing.expectEqual(@as(usize, 1), vm.gc_old1.items.len);
+        try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
+        // REAL full cycle after the boundary success (review-14 test
+        // honesty): the rooted owner + metatable survive and the __gc
+        // registration persists (registered, not run).
+        _ = vm.gcControl(2, 0, -1); // LUA_GCCOLLECT — real full cycle
+        try testing.expect(owner.metatable == mt);
+        try testing.expect(vm.finalizables.contains(.{ .table = owner }));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// P16.50-review-14 HIGH 1: PUC lua_setmetatable (lapi.c:964-1000) runs
+// ONLY the forward luaC_objbarrier(obj, mt) + luaC_checkfinalizer — there
+// is NO backward barrier for the metatable pointer. The deleted
+// `table_remember` arm used to re-queue the OLD owner into gc_grayagain
+// (touched1/gray), mutating its age/color and adding a fallible reserve
+// edge PUC never takes.
+// ═══════════════════════════════════════════════════════════════════════
+
+test "P16.50-review-14 HIGH 1: table setmetatable is forward-barrier-only (no grayagain re-queue)" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    // Generational minor (non-sweep): an OLD/black rooted owner meeting a
+    // young/white metatable arms the FORWARD barrier (PUC luaC_barrier_).
+    _ = vm.gcControl(7, 0, -1); // LUA_GCGENERATIONAL
+    _ = vm.gcControl(2, 0, -1); // LUA_GCCOLLECT
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.ensure(1);
+    const owner = try vm.apiNewTable();
+    roots.addAssumeCapacity(.{ .Table = owner });
+    _ = vm.gcControl(2, 0, -1); // full collect → owner OLD/black
+
+    // Young/white metatable carrying a young child table in a field. Both
+    // stay rooted through the transaction (PUC roots mt on the L stack);
+    // they are unrooted AFTER the commit so the minor cycle below proves
+    // survival through owner.metatable alone.
+    var mtroots = vm.gcTempRoots();
+    defer mtroots.end();
+    try mtroots.ensure(2);
+    const mt = try vm.apiNewTable();
+    mtroots.addAssumeCapacity(.{ .Table = mt });
+    const child = try vm.apiNewTable();
+    mtroots.addAssumeCapacity(.{ .Table = child });
+    const field_key: Value = .{ .String = try vm.internStr("r14h1child") };
+    try vm.apiSetTable(.{ .Table = mt }, field_key, .{ .Table = child });
+
+    // Pre-state: owner OLD/black, mt/child young/white, worklists empty.
+    try testing.expect(owner.gc_age.isOld());
+    try testing.expect(gcIsBlack(owner.gc_marked));
+    try testing.expect(gcIsWhite(mt.gc_marked));
+    try testing.expect(gcIsWhite(child.gc_marked));
+    try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
+
+    // The shared transaction (lua_setmetatable's core).
+    const plan = try vm.gcPrepareSetMetatable(.{ .table = owner }, mt);
+    vm.gcCommitSetMetatable(.{ .table = owner }, mt, plan);
+
+    // FORWARD barrier only: mt is queued into gc_gray and published OLD0
+    // via gc_old1; the owner is NOT re-queued — gc_grayagain stays empty
+    // and the owner keeps its age/color (no touched1, no re-traversal).
+    try testing.expect(plan.barrier.gen_mark);
+    try testing.expect(plan.barrier.gen_promote);
+    try testing.expect(!plan.needs_finalizer); // no __gc in mt
+    try testing.expect(owner.metatable == mt);
+    try testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
+    try testing.expectEqual(@as(usize, 1), vm.gc_old1.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
+    try testing.expect(mt.gc_age == .old0);
+    try testing.expect(owner.gc_age.isOld());
+    try testing.expect(gcIsBlack(owner.gc_marked));
+
+    // Unroot mt + child: reachable ONLY through owner.metatable now.
+    mtroots.end();
+
+    // A generational MINOR cycle must keep mt (and child through its
+    // field): the forward barrier's gray/old1 publication is what makes
+    // the OLD owner's young metatable survive the minor sweep.
+    try vm.gcMinorCollection();
+    try testing.expect(owner.metatable == mt);
+    try testing.expect(vm.apiRawGet(mt, field_key) == .Table); // child intact
+    try testing.expect(vm.apiRawGet(mt, field_key).Table == child);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// P16.50-review-14 HIGH 2: the four fresh-object constructors
+// (coroutine.wrap, ensureDebugRegistry, io lines iterators, testC
+// pushcclosure) used to leave freshly allocated tables only in Zig locals
+// across GC-capable steps (setField/intern/resize/metatable-prepare can
+// each fire an emergency GC, and the emergency scan never sees Zig
+// locals). The fix is the review-7 root discipline: TempRoots.ensure(n)
+// BEFORE the first allocation, then an infallible addAssumeCapacity
+// immediately after every table allocation.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// review-14 HIGH 2 test allocator: fires ONE emergency full GC (PUC
+/// `tryagain` → `luaC_fullgc(L, 1)`) at the FIRST allocation that comes
+/// after the k-th Table-sized allocation — deterministically inside a
+/// constructor's table-publication window (between a fresh table's
+/// allocation and its rooting/publication). Everything else passes
+/// straight through to the base allocator; the GC's own infrastructure
+/// allocations also pass through — `fired` makes re-entry impossible.
+const R14High2EmergencyAlloc = struct {
+    base: std.mem.Allocator,
+    vm: *Vm,
+    k: usize,
+    tables_seen: usize = 0,
+    fired: bool = false,
+
+    fn allocator(self: *R14High2EmergencyAlloc) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = emergAlloc,
+            .resize = emergResize,
+            .remap = emergRemap,
+            .free = emergFree,
+        } };
+    }
+
+    fn emergAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *R14High2EmergencyAlloc = @ptrCast(@alignCast(ctx));
+        if (!self.fired and self.tables_seen >= self.k) {
+            self.fired = true;
+            // Emergency full GC from the failed allocation (PUC tryagain).
+            // The conservative emergency scan never sees Zig locals —
+            // whatever is not in a GC root at this moment is swept.
+            self.vm.testcEmergencyCollect();
+        }
+        const r = self.base.rawAlloc(len, alignment, ret_addr);
+        if (r != null and len == @sizeOf(Table)) self.tables_seen += 1;
+        return r;
+    }
+
+    fn emergResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *R14High2EmergencyAlloc = @ptrCast(@alignCast(ctx));
+        return self.base.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn emergRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *R14High2EmergencyAlloc = @ptrCast(@alignCast(ctx));
+        return self.base.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn emergFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *R14High2EmergencyAlloc = @ptrCast(@alignCast(ctx));
+        self.base.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "P16.50-review-14 HIGH 2: coroutine.wrap intermediates survive emergency GC and OOM edges" {
+    const testing = std.testing;
+
+    // ── (A) emergency-GC matrix: fire at the first allocation after the
+    // k-th Table (obj, mt) — every inter-table window must keep the
+    // construction alive ──
+    for (1..3) |k| {
+        var vm: Vm = .init(testing.allocator, false);
+        defer vm.deinit();
+        var emerg = R14High2EmergencyAlloc{ .base = testing.allocator, .vm = &vm, .k = k };
+        vm.alloc = emerg.allocator();
+        var outs: [1]Value = .{.Nil};
+        const r = vm.builtinCoroutineWrap(&.{.{ .Builtin = .type }}, outs[0..]);
+        vm.alloc = testing.allocator;
+        try r; // tryagain semantics: collect, retry, succeed
+        try testing.expect(emerg.fired);
+
+        // Identity: the published wrapper is fully wired.
+        try testing.expect(outs[0] == .Table);
+        const obj = outs[0].Table;
+        const mt = obj.metatable.?;
+        const callv = vm.getFieldOpt(mt, "__call").?;
+        try testing.expect(callv == .Builtin and callv.Builtin == .coroutine_wrap_iter);
+        const thv = vm.getFieldOpt(obj, "__thread").?;
+        try testing.expect(thv == .Thread and vm.wrap_thread == thv.Thread);
+
+        // A REAL full cycle after the emergency: the rooted wrapper (and
+        // mt + thread through it) survives.
+        var roots = vm.gcTempRoots();
+        defer roots.end();
+        try roots.add(.{ .Table = obj });
+        try vm.gcCycleFull();
+        try testing.expect(p50StillRegistered(&vm, .{ .table = obj }));
+        try testing.expect(p50StillRegistered(&vm, .{ .table = mt }));
+        try testing.expect(vm.getFieldOpt(obj, "__thread").? == .Thread);
+    }
+
+    // ── (B) OOM edge sweep: every allocation edge fails once; each
+    // failure publishes NOTHING and leaves a REAL-full-cycle-clean state;
+    // the first success publishes the full wrapper ──
+    {
+        var vm: Vm = .init(testing.allocator, false);
+        defer vm.deinit();
+        var boundary: ?usize = null;
+        for (0..32) |fi| {
+            var outs: [1]Value = .{.Nil};
+            var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+                .fail_index = fi,
+                .resize_fail_index = 0,
+            });
+            vm.alloc = failing.allocator();
+            const r = vm.builtinCoroutineWrap(&.{.{ .Builtin = .type }}, outs[0..]);
+            vm.alloc = testing.allocator;
+            if (r) |_| {
+                boundary = fi;
+                try testing.expect(outs[0] == .Table);
+                const obj = outs[0].Table;
+                const mt = obj.metatable.?;
+                const callv = vm.getFieldOpt(mt, "__call").?;
+                try testing.expect(callv == .Builtin and callv.Builtin == .coroutine_wrap_iter);
+                var roots = vm.gcTempRoots();
+                defer roots.end();
+                try roots.add(.{ .Table = obj });
+                try vm.gcCycleFull();
+                try testing.expect(p50StillRegistered(&vm, .{ .table = obj }));
+                try testing.expect(p50StillRegistered(&vm, .{ .table = mt }));
+                break;
+            } else |e| {
+                try testing.expect(e == error.OutOfMemory);
+                // Nothing published: outs[0] untouched.
+                try testing.expect(outs[0] == .Nil);
+                // REAL full cycle after the failure: the partial garbage
+                // (thread/tables that never got published) is swept with no
+                // crash and no dangling publication.
+                try vm.gcCycleFull();
+                try testing.expect(outs[0] == .Nil);
+            }
+        }
+        try testing.expect(boundary != null);
+    }
+}
+
+test "P16.50-review-14 HIGH 2: ensureDebugRegistry intermediates survive emergency GC and OOM edges" {
+    const testing = std.testing;
+
+    // ── (A) emergency-GC matrix over the three fresh tables (reg,
+    // hookkey, mt) ──
+    for (1..4) |k| {
+        var vm: Vm = .init(testing.allocator, false);
+        defer vm.deinit();
+        // bootstrapGlobals pre-creates the registry; reset the slot so the
+        // construction path under test actually runs (the bootstrap
+        // registry's tables become unreachable garbage — fair game for the
+        // emergency sweep).
+        vm.debug_registry = null;
+        var emerg = R14High2EmergencyAlloc{ .base = testing.allocator, .vm = &vm, .k = k };
+        vm.alloc = emerg.allocator();
+        const r = vm.ensureDebugRegistry();
+        vm.alloc = testing.allocator;
+        const reg = try r;
+        try testing.expect(emerg.fired);
+
+        // Identity: the registry is published fully wired.
+        try testing.expect(vm.debug_registry == reg);
+        const hookkeyv = vm.getFieldOpt(reg, "_HOOKKEY").?;
+        try testing.expect(hookkeyv == .Table);
+        const hookkey = hookkeyv.Table;
+        const mt = hookkey.metatable.?;
+        const modev = vm.getFieldOpt(mt, "__mode").?;
+        try testing.expect(modev == .String and std.mem.eql(u8, "k", modev.String.bytes()));
+
+        // A REAL full cycle: the registry is a GC root — everything
+        // survives through it.
+        try vm.gcCycleFull();
+        try testing.expect(vm.debug_registry == reg);
+        try testing.expect(p50StillRegistered(&vm, .{ .table = reg }));
+        try testing.expect(p50StillRegistered(&vm, .{ .table = hookkey }));
+        try testing.expect(p50StillRegistered(&vm, .{ .table = mt }));
+    }
+
+    // ── (B) OOM edge sweep ──
+    {
+        var vm: Vm = .init(testing.allocator, false);
+        defer vm.deinit();
+        vm.debug_registry = null; // bootstrap pre-creates it — run the construction
+        var boundary: ?usize = null;
+        for (0..32) |fi| {
+            var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+                .fail_index = fi,
+                .resize_fail_index = 0,
+            });
+            vm.alloc = failing.allocator();
+            const r = vm.ensureDebugRegistry();
+            vm.alloc = testing.allocator;
+            if (r) |reg| {
+                boundary = fi;
+                try testing.expect(vm.debug_registry == reg);
+                try vm.gcCycleFull();
+                try testing.expect(vm.debug_registry == reg);
+                break;
+            } else |e| {
+                try testing.expect(e == error.OutOfMemory);
+                // Nothing published: the registry slot stays empty.
+                try testing.expect(vm.debug_registry == null);
+                // REAL full cycle after the failure: partial garbage swept.
+                try vm.gcCycleFull();
+                try testing.expect(vm.debug_registry == null);
+            }
+        }
+        try testing.expect(boundary != null);
+    }
+}
+
+test "P16.50-review-14 HIGH 2: io lines iterator intermediates survive emergency GC and OOM edges" {
+    const testing = std.testing;
+
+    // ── (A) emergency-GC matrix over the three fresh tables (obj, mt,
+    // fmts_tbl) ──
+    for (1..4) |k| {
+        var vm: Vm = .init(testing.allocator, false);
+        defer vm.deinit();
+        var emerg = R14High2EmergencyAlloc{ .base = testing.allocator, .vm = &vm, .k = k };
+        vm.alloc = emerg.allocator();
+        const r = vm.makeLinesIter(.{ .Int = 42 }, true, &.{ .{ .Int = 7 }, .{ .Int = 8 } });
+        vm.alloc = testing.allocator;
+        const objv = try r;
+        try testing.expect(emerg.fired);
+
+        // Identity: the iterator is fully wired.
+        try testing.expect(objv == .Table);
+        const obj = objv.Table;
+        const mt = obj.metatable.?;
+        const callv = vm.getFieldOpt(mt, "__call").?;
+        try testing.expect(callv == .Builtin and callv.Builtin == .io_lines_iter);
+        const filev = vm.getFieldOpt(obj, "__file").?;
+        try testing.expect(filev == .Int and filev.Int == 42);
+        const acv = vm.getFieldOpt(obj, "__auto_close").?;
+        try testing.expect(acv == .Bool and acv.Bool);
+        const cev = vm.getFieldOpt(obj, "__closed_error").?;
+        try testing.expect(cev == .Bool and !cev.Bool);
+        const fmtsv = vm.getFieldOpt(obj, "__fmts").?;
+        try testing.expect(fmtsv == .Table);
+        const fmts_tbl = fmtsv.Table;
+        try testing.expectEqual(@as(usize, 2), fmts_tbl.array.len);
+        try testing.expect(fmts_tbl.array[0] == .Int and fmts_tbl.array[0].Int == 7);
+        try testing.expect(fmts_tbl.array[1] == .Int and fmts_tbl.array[1].Int == 8);
+
+        // A REAL full cycle: the rooted iterator (and mt/fmts through it)
+        // survives with every field intact.
+        var roots = vm.gcTempRoots();
+        defer roots.end();
+        try roots.add(.{ .Table = obj });
+        try vm.gcCycleFull();
+        try testing.expect(p50StillRegistered(&vm, .{ .table = obj }));
+        try testing.expect(p50StillRegistered(&vm, .{ .table = mt }));
+        try testing.expect(p50StillRegistered(&vm, .{ .table = fmts_tbl }));
+        try testing.expect(vm.getFieldOpt(obj, "__file").? == .Int);
+    }
+
+    // ── (B) OOM edge sweep ──
+    {
+        var vm: Vm = .init(testing.allocator, false);
+        defer vm.deinit();
+        var boundary: ?usize = null;
+        for (0..32) |fi| {
+            var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+                .fail_index = fi,
+                .resize_fail_index = 0,
+            });
+            vm.alloc = failing.allocator();
+            const r = vm.makeLinesIter(.{ .Int = 42 }, true, &.{ .{ .Int = 7 }, .{ .Int = 8 } });
+            vm.alloc = testing.allocator;
+            if (r) |objv| {
+                boundary = fi;
+                try testing.expect(objv == .Table);
+                const obj = objv.Table;
+                var roots = vm.gcTempRoots();
+                defer roots.end();
+                try roots.add(.{ .Table = obj });
+                try vm.gcCycleFull();
+                try testing.expect(p50StillRegistered(&vm, .{ .table = obj }));
+                break;
+            } else |_| {
+                // Nothing to publish on failure (the result is the only
+                // output); a REAL full cycle after each failure sweeps the
+                // partial garbage with no crash.
+                try vm.gcCycleFull();
+            }
+        }
+        try testing.expect(boundary != null);
+    }
+}
+
+test "P16.50-review-14 HIGH 2: testC pushcclosure intermediates survive emergency GC and OOM edges" {
+    const testing = std.testing;
+
+    // ── (A) emergency-GC matrix over the three fresh tables (upvals, ccl,
+    // mt), driven through the real testC script path ──
+    for (1..4) |k| {
+        var vm: Vm = .init(testing.allocator, false);
+        defer vm.deinit();
+        var st: std.ArrayListUnmanaged(Value) = .empty;
+        defer st.deinit(testing.allocator);
+        try st.append(testing.allocator, .Nil); // script slot (testC index 1)
+        try st.append(testing.allocator, .{ .Int = 5 });
+        try st.append(testing.allocator, .{ .Int = 6 });
+        var emerg = R14High2EmergencyAlloc{ .base = testing.allocator, .vm = &vm, .k = k };
+        vm.alloc = emerg.allocator();
+        const r = vm.runTestcScript("pushcclosure 2", &st, .{}, null);
+        vm.alloc = testing.allocator;
+        _ = try r;
+        try testing.expect(emerg.fired);
+
+        // Identity: the closure consumed the two upvalues and appended a
+        // fully-wired ccl.
+        try testing.expectEqual(@as(usize, 2), st.items.len);
+        try testing.expect(st.items[0] == .Nil);
+        try testing.expect(st.items[1] == .Table);
+        const ccl = st.items[1].Table;
+        const mt = ccl.metatable.?;
+        const callv = vm.getFieldOpt(mt, "__call").?;
+        try testing.expect(callv == .Builtin and callv.Builtin == .testc_testC);
+        const nv = vm.getFieldOpt(ccl, "__testc_nupvalues").?;
+        try testing.expect(nv == .Int and nv.Int == 2);
+        const upv = vm.getFieldOpt(ccl, "__testc_upvalues").?;
+        try testing.expect(upv == .Table);
+        const upvals = upv.Table;
+        const uv1 = vm.apiRawGet(upvals, .{ .Int = 1 });
+        try testing.expect(uv1 == .Int and uv1.Int == 5);
+        const uv2 = vm.apiRawGet(upvals, .{ .Int = 2 });
+        try testing.expect(uv2 == .Int and uv2.Int == 6);
+
+        // A REAL full cycle: the rooted ccl (and upvals/mt through it)
+        // survives with the upvalues intact.
+        var roots = vm.gcTempRoots();
+        defer roots.end();
+        try roots.add(.{ .Table = ccl });
+        try vm.gcCycleFull();
+        try testing.expect(p50StillRegistered(&vm, .{ .table = ccl }));
+        try testing.expect(p50StillRegistered(&vm, .{ .table = upvals }));
+        try testing.expect(p50StillRegistered(&vm, .{ .table = mt }));
+        const uv1b = vm.apiRawGet(upvals, .{ .Int = 1 });
+        try testing.expect(uv1b == .Int and uv1b.Int == 5);
+    }
+
+    // ── (B) OOM edge sweep through the real script path ──
+    {
+        var vm: Vm = .init(testing.allocator, false);
+        defer vm.deinit();
+        var boundary: ?usize = null;
+        for (0..48) |fi| {
+            var st: std.ArrayListUnmanaged(Value) = .empty;
+            defer st.deinit(testing.allocator);
+            try st.append(testing.allocator, .Nil);
+            try st.append(testing.allocator, .{ .Int = 5 });
+            try st.append(testing.allocator, .{ .Int = 6 });
+            var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+                .fail_index = fi,
+                .resize_fail_index = 0,
+            });
+            vm.alloc = failing.allocator();
+            const r = vm.runTestcScript("pushcclosure 2", &st, .{}, null);
+            vm.alloc = testing.allocator;
+            if (r) |_| {
+                boundary = fi;
+                try testing.expectEqual(@as(usize, 2), st.items.len);
+                try testing.expect(st.items[1] == .Table);
+                const ccl = st.items[1].Table;
+                const nv = vm.getFieldOpt(ccl, "__testc_nupvalues").?;
+                try testing.expect(nv == .Int and nv.Int == 2);
+                var roots = vm.gcTempRoots();
+                defer roots.end();
+                try roots.add(.{ .Table = ccl });
+                try vm.gcCycleFull();
+                try testing.expect(p50StillRegistered(&vm, .{ .table = ccl }));
+                break;
+            } else |e| {
+                try testing.expect(e == error.OutOfMemory);
+                // No dangling publication: the caller's stack is either
+                // untouched (machinery/pre-consumption failure: 3 items) or
+                // consumed-but-unpublished (post-consumption failure: 1
+                // item — the script slot); a closure is never half-appended.
+                try testing.expect(st.items.len == 3 or st.items.len == 1);
+                if (st.items.len == 1) {
+                    try testing.expect(st.items[0] == .Nil);
+                } else {
+                    try testing.expect(st.items[1] == .Int and st.items[1].Int == 5);
+                    try testing.expect(st.items[2] == .Int and st.items[2].Int == 6);
+                }
+                // REAL full cycle after the failure: partial garbage swept.
+                try vm.gcCycleFull();
+            }
+        }
+        try testing.expect(boundary != null);
+    }
+}
+
+test "P16.50-review-14 2b: debug.getmetatable is raw; global getmetatable honors __metatable (differential)" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    vm.setDynamicBytecodeCompiler(defaultBytecodeCompiler);
+    try vm.enableTestcModule();
+
+    const src =
+        \\local pack = table.pack
+        \\
+        \\-- (1) __metatable protection: the GLOBAL getmetatable returns the
+        \\-- sentinel (lbaselib.c:134); debug.getmetatable is a RAW
+        \\-- lua_getmetatable (ldblib.c:48-54) and returns the ORIGINAL.
+        \\local sentinel = {'sentinel'}
+        \\local mt = {__metatable = sentinel}
+        \\local t = setmetatable({}, mt)
+        \\assert(getmetatable(t) == sentinel, 'global honors __metatable')
+        \\assert(debug.getmetatable(t) == mt, 'debug.getmetatable is raw')
+        \\
+        \\-- (2) no __metatable: both return the same table.
+        \\local plain = {}
+        \\local t2 = setmetatable({}, plain)
+        \\assert(getmetatable(t2) == plain and debug.getmetatable(t2) == plain)
+        \\
+        \\-- (3) type-level slot through testC — the FULL lua_setmetatable
+        \\-- path (the old testC arm rejected primitive owners).
+        \\local nummt = {__metatable = 'numlock'}
+        \\local r = pack(T.testC('setmetatable 2; return 1', 42, nummt))
+        \\assert(r.n == 1 and r[1] == 42, 'testC consumed exactly the metatable')
+        \\assert(getmetatable(42) == 'numlock', 'global honors __metatable on type slot')
+        \\assert(debug.getmetatable(42) == nummt, 'debug.getmetatable raw on type slot')
+        \\
+        \\-- (4) clearing the type-level slot through testC (nil metatable).
+        \\r = pack(T.testC('setmetatable 2; return 1', 42, nil))
+        \\assert(r.n == 1 and r[1] == 42)
+        \\assert(getmetatable(42) == nil and debug.getmetatable(42) == nil)
+        \\
+        \\-- (5) unset slots: raw nil for both, on a fresh function value.
+        \\assert(debug.getmetatable(print) == nil and getmetatable(print) == nil)
+        \\
+        \\-- (6) string slot (bootstrap metatable, no __metatable): both
+        \\-- return the same table.
+        \\assert(debug.getmetatable('x') == getmetatable('x'))
+        \\assert(type(debug.getmetatable('x')) == 'table')
+        \\
+        \\return true
+    ;
+    const chunk_v = try vm.compileChunkValue(src, "=r14-2b-debug-getmetatable");
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.add(chunk_v);
+    const cl = chunk_v.Closure;
+    const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+    defer vm.alloc.free(results);
+    try testing.expect(results[0] == .Bool and results[0].Bool == true);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// P16.50-review-14 D: rawSet hot-path rooting discipline. The emergency-GC
+// rooting fix (tbl/canon_key/val across the rehash window) must cost the
+// no-rehash fast path NOTHING: PUC anchors t/key/val on the preallocated
+// Lua stack (~3 pointer writes); the restructured rawSet opens the
+// gc_temp_roots session ONLY in the rehash branch — the one GC-capable
+// window (tableRehash → tableResize allocates through vm.alloc, whose
+// armed testc adapter runs the emergency full GC on the failure path).
+// ─────────────────────────────────────────────────────────────────────
+
+test "P16.50-review-14 D: rawSet rehash window roots tbl/key/val across the emergency GC" {
+    const testing = std.testing;
+
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    var setup_roots = vm.gcTempRoots();
+    defer setup_roots.end();
+
+    // tbl with an EMPTY hash part (PUC dummy node): the first new-key
+    // insert deterministically takes the rehash branch (nodeInsert has no
+    // free slot to offer).
+    const tbl = try vm.allocTable(null);
+    try setup_roots.add(.{ .Table = tbl });
+
+    // key/val are FRESH tables held ONLY in Zig locals until the insert
+    // publishes them — invisible to the emergency scan unless rawSet roots
+    // them across the rehash window. Pre-fix shape: the emergency GC at the
+    // rehash allocation swept both and the post-rehash insert published
+    // dangling pointers.
+    const key_tbl = try vm.allocTable(null);
+    const val_tbl = try vm.allocTable(null);
+
+    // Emergency allocator (k=0: fire at the FIRST allocation after
+    // arming) — inside tableRehash→tableResize, the only GC-capable op of
+    // the rehash branch. The barrier prepares and the roots reserve run on
+    // infraAlloc (the uncounted base allocator) and must NOT trigger it.
+    var emerg = R14High2EmergencyAlloc{ .base = testing.allocator, .vm = &vm, .k = 0 };
+    vm.alloc = emerg.allocator();
+    defer vm.alloc = testing.allocator;
+
+    try vm.rawSet(tbl, .{ .Table = key_tbl }, .{ .Table = val_tbl });
+    try testing.expect(emerg.fired);
+
+    // The insert published the SURVIVORS (pointer identity — not
+    // re-allocated lookalikes), and both are still registered (a swept
+    // object is removed from gc_objects: the negative oracle).
+    const got = vm.rawGet(tbl, .{ .Table = key_tbl });
+    try testing.expect(got == .Table and got.Table == val_tbl);
+    try testing.expect(p50StillRegistered(&vm, .{ .table = key_tbl }));
+    try testing.expect(p50StillRegistered(&vm, .{ .table = val_tbl }));
+
+    // A REAL full cycle afterwards: key_tbl/val_tbl are deliberately NOT
+    // in setup_roots — they survive only through the published entry in
+    // the rooted tbl.
+    try vm.gcCycleFull();
+    try testing.expect(p50StillRegistered(&vm, .{ .table = tbl }));
+    try testing.expect(p50StillRegistered(&vm, .{ .table = key_tbl }));
+    try testing.expect(p50StillRegistered(&vm, .{ .table = val_tbl }));
+    const got2 = vm.rawGet(tbl, .{ .Table = key_tbl });
+    try testing.expect(got2 == .Table and got2.Table == val_tbl);
+}
+
+test "P16.50-review-14 D: rawSet no-rehash insert opens ZERO temp-root sessions" {
+    const testing = std.testing;
+
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    vm.stats.enabled = true;
+
+    var setup_roots = vm.gcTempRoots();
+    defer setup_roots.end();
+
+    // Pre-sized constructor shape (OP_NEWTABLE pre-allocates the hinted
+    // hash part — the `{v = i}` workload): 8 hash slots, no array part.
+    // Every insert below fits → nodeInsert succeeds → no rehash.
+    const tbl = try vm.allocTable(null);
+    try setup_roots.add(.{ .Table = tbl });
+    try vm.tableResize(tbl, 0, 8);
+
+    // GC-object key/val — the exact case the temp-root session exists to
+    // protect. Sessions are counted across ONLY the rawSet call (the
+    // setup allocations may legitimately open their own sessions).
+    const key_a = try vm.allocTable(null);
+    const val_a = try vm.allocTable(null);
+    try setup_roots.add(.{ .Table = key_a });
+    try setup_roots.add(.{ .Table = val_a });
+
+    const rehash_before = vm.stats.tbl_rehash;
+    const sessions_before = vm.stats.gc_temp_root_sessions;
+    try vm.rawSet(tbl, .{ .Table = key_a }, .{ .Table = val_a });
+    try testing.expectEqual(rehash_before, vm.stats.tbl_rehash); // fast path taken
+    try testing.expectEqual(sessions_before, vm.stats.gc_temp_root_sessions); // ZERO session work
+
+    // A second fitting insert (distinct fresh key/val) — same proof.
+    const key_b = try vm.allocTable(null);
+    const val_b = try vm.allocTable(null);
+    try setup_roots.add(.{ .Table = key_b });
+    try setup_roots.add(.{ .Table = val_b });
+    try vm.rawSet(tbl, .{ .Table = key_b }, .{ .Table = val_b });
+    try testing.expectEqual(rehash_before, vm.stats.tbl_rehash);
+    try testing.expectEqual(sessions_before, vm.stats.gc_temp_root_sessions);
+    const got_a = vm.rawGet(tbl, .{ .Table = key_a });
+    const got_b = vm.rawGet(tbl, .{ .Table = key_b });
+    try testing.expect(got_a == .Table and got_a.Table == val_a);
+    try testing.expect(got_b == .Table and got_b.Table == val_b);
+
+    // Control: the rehash branch (empty hash part — PUC dummy) opens
+    // exactly ONE session around the resize + re-insert window.
+    const tbl2 = try vm.allocTable(null);
+    try setup_roots.add(.{ .Table = tbl2 });
+    const key_c = try vm.allocTable(null);
+    const val_c = try vm.allocTable(null);
+    try setup_roots.add(.{ .Table = key_c });
+    try setup_roots.add(.{ .Table = val_c });
+    const sessions_control = vm.stats.gc_temp_root_sessions;
+    const rehash_control = vm.stats.tbl_rehash;
+    try vm.rawSet(tbl2, .{ .Table = key_c }, .{ .Table = val_c });
+    try testing.expectEqual(rehash_control + 1, vm.stats.tbl_rehash); // rehash branch taken
+    try testing.expectEqual(sessions_control + 1, vm.stats.gc_temp_root_sessions); // exactly one session
+    const got_c = vm.rawGet(tbl2, .{ .Table = key_c });
+    try testing.expect(got_c == .Table and got_c.Table == val_c);
 }

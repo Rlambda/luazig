@@ -2991,22 +2991,22 @@ pub export fn luaL_gsub(L: ?*lua_State, s_str: [*:0]const u8, p: [*:0]const u8, 
 pub export fn luaL_getmetafield(L: ?*lua_State, obj: c_int, event: [*:0]const u8) c_int {
     var s = api.State.fromHandle(L orelse return 0);
     const abs = normalizeIndex(obj, s.stack.items.len) orelse return 0;
-    const mt: ?*vm_mod.Table = switch (s.stack.items[abs]) {
-        .Table => |t| t.metatable,
-        .Userdata => |ud| ud.metatable,
-        else => null,
-    };
-    if (mt) |m| {
-        // PUC luaL_getmetafield: lua_getfield on the metatable — OOM is
-        // LUA_ERRMEM (P16.50-review-5 B2 — the old `catch return 0`
-        // misreported "no metamethod").
-        const key = s.vm.internStr(std.mem.span(event)) catch |e| cThrowOn(s.vm, L.?, e);
-        const val = s.vm.apiRawGet(m, .{ .String = key });
-        if (val == .Nil) return 0;
-        s.stack.append(s.vm.alloc, val) catch |e| cThrowOn(s.vm, L.?, e);
-        return 1;
-    }
-    return 0;
+    // PUC lauxlib.c:884-897: lua_getmetatable covers EVERY value kind —
+    // including the type-level slots (G(L)->mt[ttype(o)]) — not just
+    // table/userdata. No metatable → LUA_TNIL, stack unchanged.
+    const mt: *vm_mod.Table = s.vm.valueMetatable(s.stack.items[abs]) orelse return 0;
+    // lua_pushstring + lua_rawget on the metatable — OOM is LUA_ERRMEM
+    // (P16.50-review-5 B2 — the old `catch return 0` misreported "no
+    // metamethod").
+    const key = s.vm.internStr(std.mem.span(event)) catch |e| cThrowOn(s.vm, L.?, e);
+    const val = s.vm.apiRawGet(mt, .{ .String = key });
+    // Nil metafield: PUC pops metatable+metafield (stack unchanged) and
+    // returns LUA_TNIL.
+    if (val == .Nil) return 0;
+    s.stack.append(s.vm.alloc, val) catch |e| cThrowOn(s.vm, L.?, e);
+    // PUC returns the metafield's REAL type tag (lauxlib.c:895 `return tt`),
+    // not a boolean.
+    return api.typeCode(api.valueType(val));
 }
 
 pub export fn luaL_callmeta(L: ?*lua_State, obj: c_int, event: [*:0]const u8) c_int {
@@ -4677,22 +4677,6 @@ fn r13StageUserdata(L: ?*lua_State) callconv(.c) c_int {
     return 0;
 }
 
-/// Builds the OLD owners (table + userdata), rooted via the caller's temp
-/// roots: generational mode + full collects promote them OLD/black, so a
-/// later young/white metatable arms every gen reserve (gray + old1 +
-/// grayagain for the table arm + the finalizer map).
-fn r13SetupGenOwners(L: ?*lua_State, vm: *vm_mod.Vm, roots: anytype) !void {
-    _ = luazigGcFixed(L, 7, 0); // LUA_GCGENERATIONAL
-    _ = luazigGcFixed(L, 2, 0); // LUA_GCCOLLECT
-    const t = try vm.apiNewTable();
-    const ud = try vm.allocUserdata(0, 0);
-    try roots.add(.{ .Table = t });
-    try roots.add(.{ .Userdata = ud });
-    _ = luazigGcFixed(L, 2, 0); // promote the owners OLD via full collect
-    r13_owner_table = t;
-    r13_owner_ud = ud;
-}
-
 /// A fresh YOUNG/WHITE metatable with __gc, created AFTER the owners were
 /// promoted OLD so the forward barrier arms (black OLD owner + white young
 /// metatable). __gc is the `type` builtin — deliberately silent: registered
@@ -4721,155 +4705,195 @@ fn r13AssertByteExact(vm: *vm_mod.Vm, table_arm: bool) !void {
 }
 
 test "c api lua_setmetatable OOM transaction matrix (table + userdata, every reserve edge)" {
-    const L = luaL_newstate() orelse return error.OutOfMemory;
-    defer lua_close(L);
-    const vm = L.vm;
-    const s = api.State.fromHandle(L);
+    // P16.50-review-14: one FRESH VM per arm. The boundary success of an
+    // arm registers its owner (FINALIZEDBIT + finalizables entry); the
+    // other arm's per-probe worklist resets must never deinit that live
+    // registration (test honesty: FINALIZEDBIT ⟺ registered must stay
+    // checkable). Each arm ends with a REAL full cycle after its
+    // failure-sweep + boundary success.
 
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    try r13SetupGenOwners(L, vm, &roots);
-    // Enter a generational MINOR phase (non-sweep) so the barriers arm.
-    _ = luazigGcFixed(L, 7, 0);
-
-    // The real infra base (pre-arming) — restored after each edge probe.
-    r13_base = vm.testc_alloc_base orelse vm.alloc;
-
-    // ── TABLE arm ── exactly FOUR reserve edges (finalizables, gray,
-    // old1, grayagain): each fail_index 0..=3 must abort the transaction
-    // with LUA_ERRMEM/MEMERRMSG before ANY observable change.
-    const mt_a = try r13NewMt(vm, &roots);
-    r13_mt = mt_a;
-    for (0..4) |fi| {
-        r13_fail_idx = fi;
-        lua_settop(L, 0);
-        lua_pushcfunction(L, r13StageTable);
-        const st = lua_pcallk(L, 0, 0, 0, 0, null);
-        vm.testc_alloc_base = r13_base;
-        try std.testing.expectEqual(@as(c_int, 4), st);
-        try std.testing.expectEqualStrings("not enough memory", vm.errThread().err_obj.String.bytes());
-        try r13AssertByteExact(vm, true);
-    }
-    // Boundary: fail_index == 4 (past the last edge) — the transaction
-    // succeeds and publishes EVERYTHING exactly once: the store, the
-    // forward-barrier publications (gray + old1), the conservative table
-    // re-traversal (grayagain) and the finalizer registration.
+    // ── TABLE arm ── exactly THREE reserve edges (finalizables, gray,
+    // old1 — HIGH 1 removed the PUC-unintended grayagain re-queue, so the
+    // Table arm has the SAME forward-barrier-only contract as Userdata):
+    // each fail_index 0..=2 must abort the transaction with
+    // LUA_ERRMEM/MEMERRMSG before ANY observable change.
     {
-        r13_fail_idx = 4;
-        lua_settop(L, 0);
-        lua_pushcfunction(L, r13StageTable);
-        const st = lua_pcallk(L, 0, 0, 0, 0, null);
-        vm.testc_alloc_base = r13_base;
-        try std.testing.expectEqual(@as(c_int, 0), st);
+        const L = luaL_newstate() orelse return error.OutOfMemory;
+        defer lua_close(L);
+        const vm = L.vm;
+        var roots = vm.gcTempRoots();
+        defer roots.end();
+        // Generational mode; a full collect promotes the rooted owner
+        // OLD/black so every gen reserve arms for a young/white metatable.
+        _ = luazigGcFixed(L, 7, 0); // LUA_GCGENERATIONAL
+        _ = luazigGcFixed(L, 2, 0); // LUA_GCCOLLECT
+        const owner = try vm.apiNewTable();
+        try roots.add(.{ .Table = owner });
+        _ = luazigGcFixed(L, 2, 0); // promote the owner OLD/black
+        _ = luazigGcFixed(L, 7, 0); // generational MINOR phase (non-sweep)
+        r13_owner_table = owner;
+        r13_owner_ud = null;
+
+        // The real infra base (pre-arming) — restored after each edge probe.
+        r13_base = vm.testc_alloc_base orelse vm.alloc;
+
+        const mt_a = try r13NewMt(vm, &roots);
+        r13_mt = mt_a;
+        for (0..3) |fi| {
+            r13_fail_idx = fi;
+            lua_settop(L, 0);
+            lua_pushcfunction(L, r13StageTable);
+            const st = lua_pcallk(L, 0, 0, 0, 0, null);
+            vm.testc_alloc_base = r13_base;
+            try std.testing.expectEqual(@as(c_int, 4), st);
+            try std.testing.expectEqualStrings("not enough memory", vm.errThread().err_obj.String.bytes());
+            try r13AssertByteExact(vm, true);
+        }
+        // Boundary: fail_index == 3 (past the last edge) — the transaction
+        // succeeds and publishes EVERYTHING exactly once: the store, the
+        // forward-barrier publications (gray + old1) and the finalizer
+        // registration. NO grayagain re-queue (HIGH 1: PUC lua_setmetatable
+        // runs only the forward luaC_objbarrier — the owner stays old/black
+        // and is NOT re-traversed).
+        {
+            r13_fail_idx = 3;
+            lua_settop(L, 0);
+            lua_pushcfunction(L, r13StageTable);
+            const st = lua_pcallk(L, 0, 0, 0, 0, null);
+            vm.testc_alloc_base = r13_base;
+            try std.testing.expectEqual(@as(c_int, 0), st);
+            try std.testing.expect(r13_owner_table.?.metatable == mt_a);
+            try std.testing.expect(vm.finalizables.contains(.{ .table = r13_owner_table.? }));
+            try std.testing.expectEqual(@as(usize, 1), vm.finalizables.count());
+            try std.testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
+            try std.testing.expectEqual(@as(usize, 1), vm.gc_old1.items.len);
+            try std.testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
+        }
+        // REAL full cycle after failure + success: the rooted owner keeps
+        // the store; the registration persists (registered, not run).
+        _ = luazigGcFixed(L, 2, 0);
         try std.testing.expect(r13_owner_table.?.metatable == mt_a);
         try std.testing.expect(vm.finalizables.contains(.{ .table = r13_owner_table.? }));
-        try std.testing.expectEqual(@as(usize, 1), vm.finalizables.count());
-        try std.testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
-        try std.testing.expectEqual(@as(usize, 1), vm.gc_old1.items.len);
-        try std.testing.expectEqual(@as(usize, 1), vm.gc_grayagain.items.len);
+        lua_settop(L, 0);
     }
 
-    // ── USERDATA arm ── exactly THREE reserve edges (finalizables, gray,
-    // old1 — the metatable pointer takes the FORWARD barrier only, never
-    // the backward one, so there is no grayagain edge): fail_index 0..=2
-    // each aborts byte-exact.
-    const mt_b = try r13NewMt(vm, &roots);
-    r13_mt = mt_b;
-    for (0..3) |fi| {
-        r13_fail_idx = fi;
-        lua_settop(L, 0);
-        lua_pushcfunction(L, r13StageUserdata);
-        const st = lua_pcallk(L, 0, 0, 0, 0, null);
-        vm.testc_alloc_base = r13_base;
-        try std.testing.expectEqual(@as(c_int, 4), st);
-        try std.testing.expectEqualStrings("not enough memory", vm.errThread().err_obj.String.bytes());
-        try r13AssertByteExact(vm, false);
-    }
-    // Boundary: fail_index == 3 — success with the userdata publications
-    // (gray + old1; NO grayagain — the owner is not re-queued).
+    // ── USERDATA arm ── (fresh VM) exactly THREE reserve edges
+    // (finalizables, gray, old1 — the metatable pointer takes the FORWARD
+    // barrier only, never the backward one): fail_index 0..=2 each aborts
+    // byte-exact.
     {
-        r13_fail_idx = 3;
+        const L = luaL_newstate() orelse return error.OutOfMemory;
+        defer lua_close(L);
+        const vm = L.vm;
+        const s = api.State.fromHandle(L);
+        var roots = vm.gcTempRoots();
+        defer roots.end();
+        _ = luazigGcFixed(L, 7, 0); // LUA_GCGENERATIONAL
+        _ = luazigGcFixed(L, 2, 0); // LUA_GCCOLLECT
+        const ud = try vm.allocUserdata(0, 0);
+        try roots.add(.{ .Userdata = ud });
+        _ = luazigGcFixed(L, 2, 0); // promote the owner OLD/black
+        _ = luazigGcFixed(L, 7, 0); // generational MINOR phase (non-sweep)
+        r13_owner_ud = ud;
+        r13_owner_table = null;
+
+        r13_base = vm.testc_alloc_base orelse vm.alloc;
+
+        const mt_b = try r13NewMt(vm, &roots);
+        r13_mt = mt_b;
+        for (0..3) |fi| {
+            r13_fail_idx = fi;
+            lua_settop(L, 0);
+            lua_pushcfunction(L, r13StageUserdata);
+            const st = lua_pcallk(L, 0, 0, 0, 0, null);
+            vm.testc_alloc_base = r13_base;
+            try std.testing.expectEqual(@as(c_int, 4), st);
+            try std.testing.expectEqualStrings("not enough memory", vm.errThread().err_obj.String.bytes());
+            try r13AssertByteExact(vm, false);
+        }
+        // Boundary: fail_index == 3 — success with the userdata publications
+        // (gray + old1; NO grayagain — the owner is not re-queued).
+        {
+            r13_fail_idx = 3;
+            lua_settop(L, 0);
+            lua_pushcfunction(L, r13StageUserdata);
+            const st = lua_pcallk(L, 0, 0, 0, 0, null);
+            vm.testc_alloc_base = r13_base;
+            try std.testing.expectEqual(@as(c_int, 0), st);
+            try std.testing.expect(r13_owner_ud.?.metatable == mt_b);
+            try std.testing.expect(vm.finalizables.contains(.{ .userdata = r13_owner_ud.? }));
+            try std.testing.expectEqual(@as(usize, 1), vm.finalizables.count());
+            try std.testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
+            try std.testing.expectEqual(@as(usize, 1), vm.gc_old1.items.len);
+            try std.testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
+        }
+
+        // ── Real-allocator success + full-cycle survival ── re-setting the
+        // already-published metatable is a no-op transaction (registered → no
+        // finalizer edge; gray child → no barrier edge) that still pops
+        // exactly the metatable, and a real full cycle keeps the store and
+        // the exactly-once registration.
         lua_settop(L, 0);
-        lua_pushcfunction(L, r13StageUserdata);
-        const st = lua_pcallk(L, 0, 0, 0, 0, null);
-        vm.testc_alloc_base = r13_base;
-        try std.testing.expectEqual(@as(c_int, 0), st);
+        s.stack.append(vm.alloc, .{ .Userdata = r13_owner_ud.? }) catch return error.OutOfMemory;
+        s.stack.append(vm.alloc, .{ .Table = mt_b }) catch return error.OutOfMemory;
+        try std.testing.expectEqual(@as(c_int, 1), lua_setmetatable(L, 1));
+        // A SUCCESSFUL transaction pops exactly the metatable (one value) —
+        // the owner remains on the stack.
+        try std.testing.expectEqual(@as(usize, 1), s.stack.items.len);
         try std.testing.expect(r13_owner_ud.?.metatable == mt_b);
         try std.testing.expect(vm.finalizables.contains(.{ .userdata = r13_owner_ud.? }));
         try std.testing.expectEqual(@as(usize, 1), vm.finalizables.count());
-        try std.testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
-        try std.testing.expectEqual(@as(usize, 1), vm.gc_old1.items.len);
-        try std.testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
+        _ = luazigGcFixed(L, 2, 0); // real full cycle — everything rooted survives
+        try std.testing.expect(r13_owner_ud.?.metatable == mt_b);
+        // The registration survives the collect (registered, not run).
+        try std.testing.expect(vm.finalizables.contains(.{ .userdata = r13_owner_ud.? }));
+        lua_settop(L, 0);
     }
-
-    // ── Real-allocator success + full-cycle survival ── re-setting the
-    // already-published metatable is a no-op transaction (registered → no
-    // finalizer edge; gray child → no barrier edge) that still pops
-    // exactly the metatable, and a real full cycle keeps the store and
-    // the exactly-once registration.
-    lua_settop(L, 0);
-    s.stack.append(vm.alloc, .{ .Userdata = r13_owner_ud.? }) catch return error.OutOfMemory;
-    s.stack.append(vm.alloc, .{ .Table = mt_b }) catch return error.OutOfMemory;
-    try std.testing.expectEqual(@as(c_int, 1), lua_setmetatable(L, 1));
-    // A SUCCESSFUL transaction pops exactly the metatable (one value) —
-    // the owner remains on the stack.
-    try std.testing.expectEqual(@as(usize, 1), s.stack.items.len);
-    try std.testing.expect(r13_owner_ud.?.metatable == mt_b);
-    try std.testing.expect(vm.finalizables.contains(.{ .userdata = r13_owner_ud.? }));
-    try std.testing.expectEqual(@as(usize, 1), vm.finalizables.count());
-    _ = luazigGcFixed(L, 2, 0); // real full cycle — everything rooted survives
-    try std.testing.expect(r13_owner_ud.?.metatable == mt_b);
-    try std.testing.expect(r13_owner_table.?.metatable == mt_a);
-    // The registration survives the collect (registered, not run).
-    try std.testing.expect(vm.finalizables.contains(.{ .userdata = r13_owner_ud.? }));
-    lua_settop(L, 0);
 }
 
 test "c api debug.setmetatable protected Lua call OOM matrix (shared transaction)" {
-    const L = luaL_newstate() orelse return error.OutOfMemory;
-    defer lua_close(L);
-    const vm = L.vm;
-    const s = api.State.fromHandle(L);
-
-    var roots = vm.gcTempRoots();
-    defer roots.end();
-    // Generational mode: full collects promote fresh owners OLD, arming the
-    // forward barrier for a later young/white metatable.
-    _ = luazigGcFixed(L, 7, 0); // LUA_GCGENERATIONAL
-
-    // Build the Lua closure `function(o, m) return debug.setmetatable(o,
-    // m) end` under the REAL allocator (the chunk compile must not see the
-    // seam) and root it for re-use across the sweep.
-    try std.testing.expectEqual(@as(c_int, 0), luaL_loadstring(L, "return function(o, m) return debug.setmetatable(o, m) end"));
-    try std.testing.expectEqual(@as(c_int, 0), lua_pcallk(L, 0, 1, 0, 0, null));
-    const closure = s.stack.items[s.stack.items.len - 1].Closure;
-    try roots.add(.{ .Closure = closure });
-    lua_settop(L, 0);
-
-    r13_base = vm.testc_alloc_base orelse vm.alloc;
-
-    // Sweep EVERY infra allocation edge on the protected-Lua-call path
-    // with a FRESH OLD owner + young/white metatable per probe (a probe
-    // that publishes changes the next probe's edge count): the builtin's
-    // transaction reserves, then the builtin result transport. Each
-    // failure must surface as LUA_ERRMEM/MEMERRMSG in a CONSISTENT state —
-    // either nothing changed (reserve failure) or the atomic commit
-    // published everything exactly once (post-commit transport failure —
-    // PUC keeps the setmetatable effect when a LATER allocation fails).
+    // P16.50-review-14: one FRESH VM per probe. A probe that publishes
+    // registers its owner (FINALIZEDBIT + finalizables entry); the next
+    // probe's worklist resets must never deinit that live registration
+    // (test honesty: FINALIZEDBIT ⟺ registered must stay checkable). Every
+    // probe — failure OR boundary success — ends with a REAL full cycle in
+    // a consistent state.
     var boundary: ?usize = null;
-    var owner_final: ?*vm_mod.Table = null;
-    var mt_final: ?*vm_mod.Table = null;
     for (0..16) |fi| {
+        const L = luaL_newstate() orelse return error.OutOfMemory;
+        defer lua_close(L);
+        const vm = L.vm;
+        const s = api.State.fromHandle(L);
+
+        var roots = vm.gcTempRoots();
+        defer roots.end();
+        // Generational mode: full collects promote fresh owners OLD, arming the
+        // forward barrier for a later young/white metatable.
+        _ = luazigGcFixed(L, 7, 0); // LUA_GCGENERATIONAL
+
+        // Build the Lua closure `function(o, m) return debug.setmetatable(o,
+        // m) end` under the REAL allocator (the chunk compile must not see
+        // the seam) and root it for this probe.
+        try std.testing.expectEqual(@as(c_int, 0), luaL_loadstring(L, "return function(o, m) return debug.setmetatable(o, m) end"));
+        try std.testing.expectEqual(@as(c_int, 0), lua_pcallk(L, 0, 1, 0, 0, null));
+        const closure = s.stack.items[s.stack.items.len - 1].Closure;
+        try roots.add(.{ .Closure = closure });
+        lua_settop(L, 0);
+
+        const base = vm.testc_alloc_base orelse vm.alloc;
+
         r13_fail_idx = fi;
         // Fresh OLD owner (full collect promotes the rooted table OLD).
         const owner = try vm.apiNewTable();
         try roots.add(.{ .Table = owner });
         _ = luazigGcFixed(L, 2, 0); // LUA_GCCOLLECT → owner OLD/black
         r13_owner_table = owner;
+        r13_owner_ud = null;
         // Fresh young/white metatable AFTER the owner is OLD.
         const mt = try r13NewMt(vm, &roots);
         r13_mt = mt;
-        // Fresh worklists + finalizer map force the transaction's reserves.
+        // Fresh worklists + finalizer map force the transaction's reserves
+        // (safe: this fresh VM holds no live registration yet).
         vm.gc_gray.deinit(vm.alloc);
         vm.gc_gray = .empty;
         vm.gc_old1.deinit(vm.alloc);
@@ -4881,22 +4905,41 @@ test "c api debug.setmetatable protected Lua call OOM matrix (shared transaction
         s.stack.append(vm.alloc, .{ .Closure = closure }) catch return error.OutOfMemory;
         s.stack.append(vm.alloc, .{ .Table = owner }) catch return error.OutOfMemory;
         s.stack.append(vm.alloc, .{ .Table = mt }) catch return error.OutOfMemory;
-        r13_failing = std.testing.FailingAllocator.init(r13_base, .{
+        var failing = std.testing.FailingAllocator.init(base, .{
             .fail_index = r13_fail_idx,
             .resize_fail_index = 0,
         });
-        vm.testc_alloc_base = r13_failing.allocator();
+        vm.testc_alloc_base = failing.allocator();
         const st = lua_pcallk(L, 2, 0, 0, 0, null);
-        vm.testc_alloc_base = r13_base;
+        vm.testc_alloc_base = base;
         if (st == 0) {
+            // Boundary success: the shared transaction published everything
+            // exactly once — the store, the forward barrier (gray + old1)
+            // and the __gc registration. NO grayagain re-queue (HIGH 1: PUC
+            // lua_setmetatable runs only the forward luaC_objbarrier).
+            try std.testing.expect(owner.metatable == mt);
+            try std.testing.expect(vm.finalizables.contains(.{ .table = owner }));
+            try std.testing.expectEqual(@as(usize, 1), vm.finalizables.count());
+            try std.testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
+            try std.testing.expectEqual(@as(usize, 1), vm.gc_old1.items.len);
+            try std.testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
+            // REAL full cycle after the boundary success: stack-rooted
+            // owner + metatable survive and the registration persists
+            // (registered, not run).
+            lua_settop(L, 0);
+            s.stack.append(vm.alloc, .{ .Table = owner }) catch return error.OutOfMemory;
+            s.stack.append(vm.alloc, .{ .Table = mt }) catch return error.OutOfMemory;
+            _ = luazigGcFixed(L, 2, 0);
+            try std.testing.expect(owner.metatable == mt);
+            try std.testing.expect(vm.finalizables.contains(.{ .table = owner }));
+            try std.testing.expectEqual(@as(usize, 1), vm.finalizables.count());
             boundary = fi;
-            owner_final = owner;
-            mt_final = mt;
             break;
         }
         try std.testing.expectEqual(@as(c_int, 4), st);
         try std.testing.expectEqualStrings("not enough memory", vm.errThread().err_obj.String.bytes());
-        if (owner.metatable != null) {
+        const published = owner.metatable != null;
+        if (published) {
             // Post-commit failure: the atomic transaction published
             // EVERYTHING exactly once before the failing allocation.
             try std.testing.expect(owner.metatable == mt);
@@ -4904,27 +4947,27 @@ test "c api debug.setmetatable protected Lua call OOM matrix (shared transaction
             try std.testing.expectEqual(@as(usize, 1), vm.finalizables.count());
             try std.testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
             try std.testing.expectEqual(@as(usize, 1), vm.gc_old1.items.len);
-            try std.testing.expectEqual(@as(usize, 1), vm.gc_grayagain.items.len);
+            try std.testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
         } else {
             // Reserve failure: NOTHING changed.
             try r13AssertByteExact(vm, true);
         }
+        // REAL full cycle after the failure: the rooted owner + metatable
+        // survive and the state stays consistent with what the failure
+        // published (or did not publish).
+        _ = luazigGcFixed(L, 2, 0);
+        if (published) {
+            try std.testing.expect(owner.metatable == mt);
+            try std.testing.expect(vm.finalizables.contains(.{ .table = owner }));
+        } else {
+            try std.testing.expect(owner.metatable == null);
+            try std.testing.expectEqual(@as(usize, 0), vm.finalizables.count());
+        }
+        lua_settop(L, 0);
     }
     // The boundary MUST exist within the sweep bound — otherwise the
     // protected path never reached the real allocator's success case.
     try std.testing.expect(boundary != null);
-    // Success: the shared transaction published everything exactly once —
-    // the store, the forward barrier (gray + old1), the conservative table
-    // re-traversal (grayagain) and the __gc registration.
-    const owner = owner_final.?;
-    const mt = mt_final.?;
-    try std.testing.expect(owner.metatable == mt);
-    try std.testing.expect(vm.finalizables.contains(.{ .table = owner }));
-    try std.testing.expectEqual(@as(usize, 1), vm.finalizables.count());
-    try std.testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
-    try std.testing.expectEqual(@as(usize, 1), vm.gc_old1.items.len);
-    try std.testing.expectEqual(@as(usize, 1), vm.gc_grayagain.items.len);
-    lua_settop(L, 0);
 }
 
 test "c api lua_setmetatable type-level default arm matches PUC" {
@@ -4962,6 +5005,99 @@ test "c api lua_setmetatable type-level default arm matches PUC" {
         try std.testing.expectEqual(@as(c_int, 1), lua_getmetatable(L, @intCast(slot)));
         try std.testing.expect(s.stack.items[s.stack.items.len - 1].Table == mt);
         s.stack.items.len -= 1;
+    }
+    lua_settop(L, 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// P16.50-review-14 BLOCKER 2c: luaL_getmetafield (lauxlib.c:884-897) —
+// covers EVERY value kind (lua_getmetatable's type-level slots included)
+// and returns the metafield's REAL type tag, not a boolean; a nil
+// metafield returns LUA_TNIL with the stack unchanged.
+// ═══════════════════════════════════════════════════════════════════════
+
+fn r14SilentCfun(L: ?*lua_State) callconv(.c) c_int {
+    _ = L;
+    return 0;
+}
+
+test "c api luaL_getmetafield: every value kind + real type tags (lauxlib.c:884-897)" {
+    const L = luaL_newstate() orelse return error.OutOfMemory;
+    defer lua_close(L);
+
+    // ── (1) no metatable → LUA_TNIL, stack unchanged ──
+    lua_settop(L, 0);
+    lua_pushinteger(L, 42);
+    try std.testing.expectEqual(@as(c_int, 0), luaL_getmetafield(L, 1, "__index"));
+    try std.testing.expectEqual(@as(c_int, 1), lua_gettop(L));
+
+    // ── (2) table owner: the REAL type tag of each metafield, and the
+    // value pushed on top of the stack ──
+    lua_settop(L, 0);
+    lua_createtable(L, 0, 0); // owner at 1
+    lua_createtable(L, 0, 7); // mt at 2
+    lua_pushcfunction(L, r14SilentCfun);
+    lua_setfield(L, 2, "f");
+    lua_pushstring(L, "str");
+    lua_setfield(L, 2, "s");
+    lua_pushnumber(L, 1.5);
+    lua_setfield(L, 2, "n");
+    lua_pushboolean(L, 1);
+    lua_setfield(L, 2, "b");
+    lua_createtable(L, 0, 0);
+    lua_setfield(L, 2, "t");
+    _ = lua_newthread(L);
+    lua_setfield(L, 2, "th");
+    lua_pushlightuserdata(L, @ptrFromInt(0xcafe));
+    lua_setfield(L, 2, "lu");
+    try std.testing.expectEqual(@as(c_int, 1), lua_setmetatable(L, 1)); // pops mt
+
+    const cases = [_]struct { name: [*:0]const u8, want: c_int }{
+        .{ .name = "f", .want = 6 }, // LUA_TFUNCTION
+        .{ .name = "s", .want = 4 }, // LUA_TSTRING
+        .{ .name = "n", .want = 3 }, // LUA_TNUMBER
+        .{ .name = "b", .want = 1 }, // LUA_TBOOLEAN
+        .{ .name = "t", .want = 5 }, // LUA_TTABLE
+        .{ .name = "th", .want = 8 }, // LUA_TTHREAD
+        .{ .name = "lu", .want = 2 }, // LUA_TLIGHTUSERDATA
+    };
+    for (cases) |c| {
+        const top_before = lua_gettop(L);
+        try std.testing.expectEqual(c.want, luaL_getmetafield(L, 1, c.name));
+        try std.testing.expectEqual(c.want, lua_type(L, -1));
+        try std.testing.expectEqual(top_before + 1, lua_gettop(L));
+        lua_pop(L, 1);
+    }
+    // Nil/absent metafield → LUA_TNIL with the stack unchanged.
+    const top_before = lua_gettop(L);
+    try std.testing.expectEqual(@as(c_int, 0), luaL_getmetafield(L, 1, "absent"));
+    try std.testing.expectEqual(top_before, lua_gettop(L));
+
+    // ── (3) TYPE-LEVEL slots: luaL_getmetafield resolves them through
+    // lua_getmetatable (the old implementation saw only table/userdata
+    // owners and returned 0 for every primitive) ──
+    lua_settop(L, 0);
+    lua_createtable(L, 0, 1); // shared mt
+    lua_pushinteger(L, 7);
+    lua_setfield(L, 1, "answer");
+    // Targets at slot 1..7: nil, boolean, number, string, function,
+    // thread, lightuserdata (mt re-pushed before each setmetatable — a
+    // successful setmetatable pops it).
+    lua_pushnil(L);
+    lua_pushboolean(L, 1);
+    lua_pushinteger(L, 42);
+    lua_pushstring(L, "x");
+    lua_pushcfunction(L, r14SilentCfun);
+    _ = lua_newthread(L);
+    lua_pushlightuserdata(L, @ptrFromInt(0xbeef));
+    for (1..8) |slot| {
+        lua_pushvalue(L, 1); // the shared mt
+        try std.testing.expectEqual(@as(c_int, 1), lua_setmetatable(L, @intCast(slot)));
+    }
+    for (1..8) |slot| {
+        try std.testing.expectEqual(@as(c_int, 3), luaL_getmetafield(L, @intCast(slot), "answer")); // LUA_TNUMBER
+        try std.testing.expectEqual(@as(c_int, 3), lua_type(L, -1));
+        lua_pop(L, 1);
     }
     lua_settop(L, 0);
 }

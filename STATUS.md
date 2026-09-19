@@ -1,4 +1,4 @@
-> Last updated: 2026-09-19 (P16.50-review-14 correction opened by review)
+> Last updated: 2026-09-19 (P16.50-review-14 correction closed by review-14; TBC-parity BLOCKER и emergency-GC HIGH открыты)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -45,7 +45,7 @@ Geomean замедления vs PUC Lua: **1.42x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [ ] **P16.50-review-14 correction**: сохранить общий metatable
+- [x] **P16.50-review-14 correction (CLOSED by review-14)**: сохранить общий metatable
   prepare→store→infallible-commit review-13, но завершить PUC lifecycle.
   BLOCKER: type-level metatables не перемаркируются в atomic, а
   `light_userdata_metatable` вообще отсутствует в root scan; снятый string
@@ -60,6 +60,69 @@ Geomean замедления vs PUC Lua: **1.42x** (цель: 1.0x; run-dependen
   perf prose (`+0.698%` — mode-blind geomean workload medians, не “geomean
   centers”); canonical WARN history сохранить, baseline не обновлять.
   Подробный исполнимый план — `prompt.md`. Open-count 23→24.
+
+  ЗАКРЫТО фазой P16.50-review-14 (2026-09-19): BLOCKER 1 — полный GC-root
+  lifecycle type-level metatables: единый root-owner `gcMarkTypeMetatables`
+  (vm.zig:29720) для всех 7 slots (nil/bool/number/string/function/thread/
+  lightuserdata), вызываемый из initial root marking И из `gcAtomicCommon`
+  Step 1 до sweep — модель PUC `atomic()` → `markmt(g)` (lgc.c:1552-1554;
+  API может записать свежую таблицу в `G(L)->mt[t]` в любой момент цикла
+  через default arm `lua_setmetatable`, lapi.c:993); string slot унифицирован
+  в `string_metatable: ?*Table` (vm.zig:4491), параллельный
+  `string_metatable_enabled` удалён (non-null slot — единственный switch,
+  как PUC), снятие string metatable обнуляет slot и освобождает старый граф
+  (weak-table oracle тест), bootstrap string library использует тот же slot
+  без GC-исключения. Focused тесты (vm.zig:61673+): все 7 slots — свежий mt
+  в mid-cycle (propagate/перед atomic) переживает настоящий cycle с
+  сохранением identity/поля/metamethod; отдельный lightuserdata root-тест;
+  string-mt release oracle. Оба negative-before: lightuserdata-тест краснел
+  на pre-fix коде (slot не маркировался вовсе); временное удаление atomic
+  `gcMarkTypeMetatables` вызова детерминированно ловится mid-cycle тестом
+  (dangling/collect). BLOCKER 2 — три конвергенции в PUC semantics: testC
+  `setmetatable` (vm.zig:47749) — plain `lua_setmetatable` путь ltests
+  (peek→validate→prepare shared transaction или type-slot select→
+  infallible commit→pop только после success), включая type-level default
+  arm и OOM-матрицу stack/state byte-exact на каждом reserve edge, success
+  покрывает все primitive slots; `debug.getmetatable` — отдельный
+  `builtinDebugGetmetatable` (vm.zig:34701, BuiltinId `debug_getmetatable`)
+  через pub `valueMetatable` — raw getter БЕЗ `__metatable` (PUC
+  `db_getmetatable` → raw `lua_getmetatable`; защита — только глобальный
+  getmetatable), differential: глобальный getter отдаёт sentinel, debug —
+  исходный mt по identity; `luaL_getmetafield` (c_api.zig:2991) — через
+  `valueMetatable` (type-level slots), raw field lookup и реальный Lua type
+  tag найденного значения (nil → удаляет temporaries → LUA_TNIL). PUC-
+  verified C tests: tests/c_api/05_auxlib.c (luaL_getmetafield: все виды
+  значений + реальные type tags) и tests/c_api/08_debug.c (raw
+  debug.getmetatable). HIGH 1 — `table_remember` удалён из
+  `SetMetatablePlan` (reserve + commit arm): Table и Userdata имеют
+  идентичный forward-barrier контракт (PUC `lua_setmetatable` — только
+  forward `luaC_objbarrier` + `luaC_checkfinalizer`); generational тест
+  (vm.zig:61956): old black Table после store остаётся old/black и
+  отсутствует в grayagain, белый mt получает ровно один mark/OLD0
+  publication, оба переживают настоящий minor cycle; OOM edge-count тести
+  пере-выведены по смыслу (table теперь 3 reserve-края:
+  finalizables/gray/old1). HIGH 2 — 4 fresh-конструктора укоренены через
+  `TempRoots.ensure` немедленно после allocation (builtinCoroutineWrap
+  vm.zig:24355, ensureDebugRegistry vm.zig:34560, makeLinesIter vm.zig:36554,
+  testC pushcclosure vm.zig:46451) с per-edge FailingAllocator/emergency-GC
+  матрицами (failure — без dangling registries/mt-указателей и без leak;
+  success переживает full GC с сохранением identity; настоящий GC cycle
+  после failure и success). Попутный pre-existing-HIGH rawSet emergency-GC
+  rooting (fresh key/val в Zig locals через rehash window) — исправлен и
+  затем reworked: fast path без rehash — zero-cost (barrier prepares через
+  infraAlloc до insert, `nodeInsert` — чистая memory surgery без GC-window),
+  session (tbl+canon_key+val) открывается только в rehash-ветке до первого
+  fallible `tableRehash`; counter `VmStats.gc_temp_root_sessions`
+  (vm.zig:4167, default-off) + focused тесты (rehash window survival,
+  zero-sessions на no-rehash insert; negative-befores оба). Test honesty:
+  `finalizables.deinit` на живой VM убран из r13/r14 тестов — fresh VM per
+  scenario + настоящий GC cycle после failure и success. Perf prose
+  review-13 исправлена (см. фазовую запись review-14). Гейты: unit 316/316
+  Debug+ReleaseFast последовательно 0 leaks; c_api 0 FAIL + DIFF PASS;
+  matrix --testc 31/32 (zig_fail=0, big.lua both_fail pre-existing); smoke
+  84/84; 12+23 heavy testc-лейнов rc=0; crash contract 0/40; api580 GREEN
+  384<400; tool self-tests ALL OK; fmt + git-diff-check clean. Open-count
+  24→23 (TBC-parity BLOCKER и emergency-GC HIGH остаются открытыми).
 
 - [x] **P16.50-review-13 correction (CLOSED by review-13)**: сохранить доказанные batch-reserve и
   worklist-инварианты review-12, но завершить транзакцию установки metatable.
@@ -8336,6 +8399,138 @@ source_dirty = clean; вердикт сессии — в Perf-блоке ниж�
   metatable'd non-Tables для table.unpack не является расхождением; (d) pre-existing: big.lua both_fail (matrix), locals.lua
   GC-pacing dot diff, cstack.lua Debug native-stack exhaustion edge.
 
+### P16.50-review-14: PUC lifecycle metatables (2026-09-19)
+
+Фаза по owner-ledger correction item (открыт 02859be после ledger-reopen
+review-13; open-count 23→24 — correction закрыт, TBC-parity BLOCKER и
+emergency-GC HIGH остаются открытыми; open-count 24→23). Коммиты: C =
+measured source (настоящий коммит; RF binary sha256
+44112debfb2a2d278fb0a00478ecb67411611c0da208c1e8af35bba8fb4ada6b —
+plain `zig build -Doptimize=ReleaseFast`, wipe-free; sha установлен после
+свежей пересборки и воспроизводится последующими warm rebuilds
+byte-identical) → D = wrapper (полное canonical current-* перегенерирование
+на clean C + объявленная clean-C paired-seed perf-сессия; source_head
+сессии = C, source_dirty = clean; вердикт сессии — в Perf-блоке ниже,
+дописан артефактным коммитом D).
+
+- **BLOCKER 1 — GC-root lifecycle type-level metatables**: единый
+  root-owner `gcMarkTypeMetatables` (vm.zig:29720) для всех 7 type slots
+  (nil/bool/number/string/function/thread/lightuserdata), вызываемый из
+  initial root marking И из `gcAtomicCommon` Step 1 до sweep — модель PUC
+  `atomic()` → `markmt(g)` (lgc.c:1552-1554): API может записать свежую
+  таблицу в `G(L)->mt[t]` в любой момент mid-cycle через default arm
+  `lua_setmetatable` (lapi.c:993), поэтому atomic перемаркирует type
+  slots. String slot унифицирован в `string_metatable: ?*Table`
+  (vm.zig:4491); параллельный `string_metatable_enabled` удалён — non-null
+  slot является единственным switch (как PUC `G(L)->mt[LUA_TSTRING]`);
+  `setTypeMetatableValue(.String, null)` обнуляет slot, бывший metatable
+  перестаёт быть root; bootstrap string library использует тот же slot
+  без особого GC-исключения. Focused тесты (vm.zig:61673+): (1) все 7
+  slots — свежий mt устанавливается mid-cycle (propagate/перед atomic),
+  прочие roots убираются, настоящий cycle завершается, identity/поле/
+  metamethod проверяются ПОСЛЕ следующей collection; (2) отдельный
+  lightuserdata root-тест; (3) string-mt release oracle: объект держится
+  только через string mt, затем mt снимается — weak/finalizer oracle
+  доказывает сборку старого graph. Оба negative-before: lightuserdata-тест
+  краснел на pre-fix коде (slot вообще не маркировался); временное
+  удаление atomic-вызова `gcMarkTypeMetatables` детерминированно валит
+  mid-cycle тест (dangling/collect); restore → зелёные.
+- **BLOCKER 2 — три конвергенции metatable API/testC путей**: (2a) testC
+  `setmetatable` (vm.zig:47749) — plain `lua_setmetatable` путь ltests
+  (ltests.c:1907-1910): peek metatable → validate → prepare shared
+  transaction или type-slot select → infallible commit → pop только
+  после success; включает type-level default arm (раньше arm принимал
+  только Table/Userdata и делал pop ДО fallible prepare — OOM терял
+  stack value/root); FailingAllocator-матрица: stack/state byte-exact на
+  каждом reserve edge, success покрывает все primitive slots; (2b)
+  `debug.getmetatable` — отдельный `builtinDebugGetmetatable`
+  (vm.zig:34701, BuiltinId `debug_getmetatable`, vm.zig:181) через pub
+  `valueMetatable` — raw getter БЕЗ `__metatable` (PUC `db_getmetatable`
+  → raw `lua_getmetatable`, ldblib.c:48-54; защита действует только на
+  глобальный getmetatable, lbaselib.c:134); differential-тест: глобальный
+  getter возвращает `__metatable` sentinel, debug getter — исходный
+  metatable по identity; (2c) `luaL_getmetafield` (c_api.zig:2991) —
+  через `valueMetatable` (type-level slots), raw field lookup и реальный
+  Lua type tag найденного значения (PUC lauxlib.c:884-897): nil → удаляет
+  temporaries → LUA_TNIL; найденное значение остаётся на stack, функция
+  возвращает его настоящий tag. PUC-verified C tests:
+  tests/c_api/05_auxlib.c (luaL_getmetafield: каждый вид значения +
+  реальные type tags — boolean/number/string/lightuserdata/function/
+  table/thread) и tests/c_api/08_debug.c (raw debug.getmetatable при
+  установленном `__metatable`).
+- **HIGH 1 — удалён непредусмотренный PUC backward barrier для Table**:
+  `table_remember` удалён из `SetMetatablePlan` (вместе с grayagain
+  reserve и commit arm) — Table и Userdata имеют идентичный
+  forward-barrier контракт (PUC `lua_setmetatable` — только forward
+  `luaC_objbarrier` + `luaC_checkfinalizer`; mark/promotion нового
+  metatable уже сохраняет ребро). Focused generational тест
+  (vm.zig:61956): old black Table + молодой белый mt → после store
+  таблица остаётся old/black и отсутствует в grayagain, белый mt получает
+  ровно один mark/OLD0 publication, оба переживают настоящий minor cycle.
+  OOM edge-count тесты пере-выведены по смыслу (table-транзакция теперь 3
+  reserve-края: finalizables/gray/old1 — раньше 4 с grayagain), не
+  подгонкой числа. gengc/gc lanes зелёные (age-инварианты).
+- **HIGH 2 — укоренены fresh metatable-конструкторы**: 4 конструктора
+  добавляют каждый fresh объект в существующий `gcTempRoots`
+  немедленно после allocation, owner снимается только после полной
+  publication: `builtinCoroutineWrap` (obj+mt, vm.zig:24355),
+  `ensureDebugRegistry` (mt, vm.zig:34560), `makeLinesIter`
+  (obj+mt+fmts_tbl, vm.zig:36554), testC `pushcclosure` (mt, vm.zig:46451;
+  образец — укоренённый testC makeCfunc). Per-edge
+  FailingAllocator/emergency-GC матрицы на каждый конструктор
+  (vm.zig:62089+): failure на каждом edge — без dangling registries/mt-
+  указателей и без leak; success переживает full GC с сохранением
+  identity; настоящий GC cycle после failure И success.
+- **rawSet pre-existing-HIGH: найден → исправлен → reworked**: audit
+  нашёл fresh key/val в Zig locals через rehash window rawSet (emergency
+  GC на `tableResize` может sweep'нуть их). Первый фикс (безусловная
+  TempRoots session на каждом new-key insert) закрыл hazard, но стоил
+  +11.41% center на table_alloc_setmetatable (probe seeds 1..5 vs
+  baseline-approved) — perf-readiness blocker для фазы. Rework:
+  fast path без rehash — zero-cost (barrier prepares идут через
+  infraAlloc — uncounted base allocator без testc-адаптера, `nodeInsert`
+  — чистая memory surgery без GC-window); session (tbl+canon_key+val)
+  открывается только в rehash-ветке ДО первого fallible `tableRehash`
+  (vm.zig:35464+). Counter `VmStats.gc_temp_root_sessions` (vm.zig:4167,
+  default-off, never-taken-branch pattern) + focused тесты: rehash
+  window survival (emergency GC на resize — key/val выживают только
+  через published entry) и zero-sessions на no-rehash insert
+  (OP_NEWTABLE-шейп); negative-befores оба (отключение adds в rehash-ветке
+  → emergency-GC тест красный; возврат безусловной session →
+  zero-sessions тест красный). Итог probe: +3.41% center (seeds
+  2.90..4.07, все < +5% WARN) — ниже уровня review-13 (+4.42% center).
+- **Test honesty**: `finalizables.deinit` на живой VM (разрушающий
+  проверяемый production invariant при живых FINALIZEDBIT объектах)
+  убран из r13/r14 focused тестов — fresh VM per scenario + нормальный
+  lifecycle/teardown; настоящий GC cycle после failure и success.
+- **Батарея**: 316/316 unit (Debug+ReleaseFast последовательно, 0 leaks),
+  c_api test 0 FAIL + test-diff DIFF PASS, matrix --testc 31/32
+  (zig_fail=0, big.lua both_fail pre-existing), smoke 84/84, 12 + 23
+  heavy testc-лейнов rc=0, crash contract 0/40, api580 GREEN (measured
+  384 < 400), test_status_summary + test_perf_gate + validate_noise_lanes
+  ALL OK, fmt + git-diff-check clean.
+- **Perf**: measured runtime затронут (удалён table_remember arm из
+  table-транзакции; rawSet rooting reworked) — pre-check probes (r14c,
+  r14_d) шли в ОТДЕЛЬНЫЕ /tmp/opencode outputs, canonical manifest не
+  мутирован; ОДНА объявленная paired-seed clean-C сессия (seeds 1..21,
+  RUNS=21) исполняется на commit C (source_head = C, source_dirty =
+  clean; binary sha256
+  44112debfb2a2d278fb0a00478ecb67411611c0da208c1e8af35bba8fb4ada6b).
+  Ожидание по probe: OK (center +3.41%, все probe seeds < +5% WARN;
+  review-13 WARN был driven этим workload'ом — center +4.42%). Verdict
+  дописывается артефактным коммитом D. Полное canonical current-*
+  перегенерирование на clean C / RF binary — артефактным коммитом D.
+- **Residuals (honest, для владельца; новые пункты НЕ открываются —
+  решение за владельцем)**:
+  - arg-evaluation-window (unproven, тот же hazard-class): свежие
+    вычисленные аргументы вызова, живущие только в Zig locals (builtin
+    `args`/`tmp` слоты, не Lua-stack-anchored) через GC-capable windows в
+    builtin dispatch — решающего evidence нет, может ли emergency GC в
+    этом окне их sweep'нуть. Следующий эксперимент: emergency-GC матрица
+    над OP_CALL argument evaluation (в стиле HIGH 2 constructor
+    matrices).
+  - TBC-parity BLOCKER и emergency-GC HIGH остаются открытыми.
+
 ### P16.50-review-13: unified PUC metatable transaction (2026-09-19)
 
 Фаза по owner-ledger correction item (открыт 0db5f65 после ledger-reopen
@@ -8393,10 +8588,12 @@ source_dirty = clean; вердикт сессии — в Perf-блоке ниж�
   (vm.zig:35968) — отдельные fastTm/registerFinalizable вызовы ПОСЛЕ
   транзакции удалены (pre-checks живут в prepare; дублированный __gc
   lookup после commit убран).
-- **Perf-arc +5.788% → +1.327% (table_alloc_setmetatable)**: hot path
-  изменён; pre-check probe implementation-агента (interleaved paired
-  instruction deltas, /tmp/opencode — canonical manifest не мутирован)
-  на первом варианте дал worst +5.788%. Два root cause: (1)
+- **Perf-arc +5.788% → +1.327% (table_alloc_setmetatable; noncanonical
+  diagnostic)**: hot path изменён; pre-check probe implementation-агента
+  (interleaved paired instruction deltas, /tmp/opencode — canonical manifest
+  не мутирован; raw outputs не сохранены как committed artifact — числа
+  невоспроизводимы независимо, relabeling P16.50-review-14) на первом
+  варианте дал worst +5.788%. Два root cause: (1)
   расслоение точек входа — public-пути не сходились в общий примитив,
   сходимые сайты повторяли fastTm-lookup + отдельную
   registerFinalizable publication после commit; (2) out-of-line
@@ -8452,7 +8649,9 @@ source_dirty = clean; вердикт сессии — в Perf-блоке ниж�
   Сессия WARN (фактический исход, дописано артефактным коммитом D):
   table_alloc_setmetatable[9] +5.322%, [15] +5.451% (2/378 paired
   seeds > +5% WARN line; FAIL нет — все < +10%), matched center
-  +4.42%, geomean centers +0.698%. Разбор: ~+1.3% — собственная цена
+  +4.42%, mode-blind geomean workload-wide instruction medians +0.698%
+  (уточнение P16.50-review-14: «geomean centers» — неточное описание).
+  Разбор: ~+1.3% — собственная цена
   транзакции фазы (probe vs 0db5f65, interleaved), остальное —
   накопленный drift двух фаз против baseline P16.49-review-2
   (review-12 уже мерил +4.16% worst на том же workload). Residual:

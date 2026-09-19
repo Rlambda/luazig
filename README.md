@@ -33,29 +33,29 @@ Regression lane: `python3 tools/testes_matrix.py --testc` (no `_port`/`_soft` pr
 
 Geomean slowdown vs PUC Lua: **1.41x** (measurement snapshot, runs=5 per workload; run-dependent diagnostic; lower is better; 1.0x = parity).
 
-Gate protocol: paired-seed — 21 published seeds (1..21) per workload per session (`LUAZIG_HASH_SEED` env on the production ReleaseFast binary, pinned CPU core); verdict = per-seed paired instruction deltas; wall time is diagnostic only (`tools/perf_compare.py`). Latest gate verdict: **WARN** (`tools/perf/current-gate.json`).
-api580 anchored gate: **GREEN** — measured 384 B < 400 B; no-XY diagnostic: 436 B. Measured on the ReleaseFast binary `ab6e8faf5982df90`; the ledger's top-level provenance is the Debug binary `77a347383d81c348` (dual-mode ledger, not one single-RF-binary artifact). (`tools/perf/current-api580-ledger.json`). Charged/model totals 376/428 B (reconciled: false/false) are allocation-model charges, not measurements.
+Gate protocol: paired-seed — 21 published seeds (1..21) per workload per session (`LUAZIG_HASH_SEED` env on the production ReleaseFast binary, pinned CPU core); verdict = per-seed paired instruction deltas; wall time is diagnostic only (`tools/perf_compare.py`). Latest gate verdict: **OK** (`tools/perf/current-gate.json`).
+api580 anchored gate: **GREEN** — measured 384 B < 400 B; no-XY diagnostic: 436 B. Measured on the ReleaseFast binary `2afba94f9e25ac34`; the ledger's top-level provenance is the Debug binary `39fcfae5cf214af6` (dual-mode ledger, not one single-RF-binary artifact). (`tools/perf/current-api580-ledger.json`). Charged/model totals 376/428 B (reconciled: false/false) are allocation-model charges, not measurements.
 
 | Workload | Zig/PUC |
 |----------|--------:|
-| metamethod_call_noalloc | 1.76x |
-| array_access | 1.74x |
-| field_access | 1.63x |
-| hash_access | 1.61x |
-| branch_loop | 1.61x |
-| global_arith | 1.55x |
+| metamethod_call_noalloc | 1.79x |
+| array_access | 1.73x |
+| field_access | 1.65x |
+| hash_access | 1.63x |
+| branch_loop | 1.60x |
 | dynamic_load | 1.54x |
-| coroutine_yield | 1.48x |
-| mixed_arith | 1.42x |
+| coroutine_yield | 1.52x |
+| global_arith | 1.51x |
+| mixed_arith | 1.41x |
 | comparisons | 1.41x |
-| metamethod_add | 1.38x |
-| lua_calls | 1.31x |
-| int_arith | 1.31x |
-| float_arith | 1.31x |
-| table_alloc_setmetatable | 1.22x |
-| string_loop | 1.17x |
-| temp_table_alloc | 1.11x |
-| string_concat | 1.08x |
+| metamethod_add | 1.34x |
+| int_arith | 1.32x |
+| lua_calls | 1.32x |
+| float_arith | 1.30x |
+| table_alloc_setmetatable | 1.23x |
+| string_loop | 1.14x |
+| temp_table_alloc | 1.10x |
+| string_concat | 1.06x |
 <!-- END GENERATED STATUS -->
 
 See [STATUS.md](STATUS.md) for detailed profiling methodology, hotspot analysis, and optimization history.

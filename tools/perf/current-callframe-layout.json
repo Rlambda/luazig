@@ -1,20 +1,20 @@
 {
- "created_utc": "2026-09-19T17:52:10.898745+00:00",
+ "created_utc": "2026-09-19T22:28:20.775646+00:00",
  "provenance": {
-  "git_head": "00a5498a68a1b813b412c3ad645c093c8dd77fcd",
-  "measured_source_head": "00a5498a68a1b813b412c3ad645c093c8dd77fcd",
+  "git_head": "bb98184ce58099f83ef93c3df7c9a082bf1bb8d1",
+  "measured_source_head": "bb98184ce58099f83ef93c3df7c9a082bf1bb8d1",
   "source_dirty": "clean",
   "zig_version": "0.16.0",
-  "probe_rf_path": "/tmp/opencode/r15a/layout_probe.zig (-O ReleaseFast)",
-  "probe_debug_path": "/tmp/opencode/r15a/layout_probe.zig (-O Debug)",
-  "probe_rf_sha256_16": "400f8fdb50bbf8c7",
-  "probe_debug_sha256_16": "030aabc05da8fa23",
-  "zig_binary_sha256": "ab6e8faf5982df9020251cf1daedf4756ae1e714421c637165018b60b2985ece",
-  "note": "P16.50-review-15 C regeneration from clean measured-source commit 00a5498; probe binaries freshly built from the same tree in both modes, outputs embedded verbatim; Closure/Cell sizes re-measured (review-15 changed the Closure representation: c_func field, PUC C-closure model)."
+  "probe_rf_path": "/tmp/opencode/a10a/layout_probe.zig (-O ReleaseFast)",
+  "probe_debug_path": "/tmp/opencode/a10a/layout_probe.zig (-O Debug)",
+  "probe_rf_sha256_16": "8cafc9362045fced",
+  "probe_debug_sha256_16": "7230041dae137dcf",
+  "zig_binary_sha256": "2afba94f9e25ac34121b4305c8b5268a868096f0c66d91ba788e7965e90d6283",
+  "note": "A1.0 C regeneration from clean measured-source commit bb98184; probe binaries freshly built from the same tree in both modes, outputs embedded verbatim; Vm re-measured (A1.0 replaced the TempRoots fields with the unified RootScope state: gc_root_values/gc_root_cells vectors + gc_root_depth/gc_root_seq/gc_root_top \u2014 Vm 5472->5600 RF, 5576->5600 DBG, RF/DBG now equal); GC-object layouts unchanged (Closure 40 B, Cell 40 B, CallFrame 88 B \u2014 RootScope adds no GC-object fields)."
  },
  "layout": {
   "ReleaseFast": {
-   "Vm": 5472,
+   "Vm": 5600,
    "Thread": 3736,
    "CallFrame": 88,
    "LuaFrameState": 48,
@@ -29,7 +29,7 @@
    "Cell_align": 8
   },
   "Debug": {
-   "Vm": 5576,
+   "Vm": 5600,
    "Thread": 3736,
    "CallFrame": 88,
    "LuaFrameState": 48,

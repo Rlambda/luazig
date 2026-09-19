@@ -37,8 +37,8 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Smoke tests (`tests/smoke/*.lua`) | **84/84** pass |
 | C API suites (`tests/c_api`) | 23 suites |
 | Performance (geomean vs PUC) | **1.41x** |
-| Perf gate (paired-seed) | **WARN** — 21 published seeds (1..21) |
-| api580 fixed-load footprint | **GREEN** — anchored gate 384 B < 400 B; no-XY diagnostic 436 B; Measured on the ReleaseFast binary `ab6e8faf5982df90`; the ledger's top-level provenance is the Debug binary `77a347383d81c348` (dual-mode ledger, not one single-RF-binary artifact). |
+| Perf gate (paired-seed) | **OK** — 21 published seeds (1..21) |
+| api580 fixed-load footprint | **GREEN** — anchored gate 384 B < 400 B; no-XY diagnostic 436 B; Measured on the ReleaseFast binary `2afba94f9e25ac34`; the ledger's top-level provenance is the Debug binary `39fcfae5cf214af6` (dual-mode ledger, not one single-RF-binary artifact). |
 
 Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
@@ -8639,6 +8639,22 @@ source_head сессии = C, source_dirty = clean; вердикт сессии 
   manifest пробами не мутирован. Вердикт обязательной объявленной
   paired-seed clean-C сессии (seeds 1..21, RUNS=21) — в Perf-блоке ниже
   (дописан артефактным коммитом D).
+  Verdict clean-C сессии (2026-09-19T22:34:55Z, дописано артефактным
+  коммитом D): GREEN — RESULT OK, 18/18 workloads OK, worst per-seed
+  +4.640% (table_alloc_setmetatable[10]) < WARN 5%; wall-P25 envelope max
+  +5.33% (coroutine_yield) < 10%; geomean diagnostic 1.41x (snapshot
+  current.json); binary sha256
+  2afba94f9e25ac34121b4305c8b5268a868096f0c66d91ba788e7965e90d6283
+  (полный sha в manifest row 33; determinism: plain `zig build` pre-C ==
+  session binary == post-regeneration rebuild, commit C message quotes тот
+  же plain-build sha). Manifest append-only, 33 строки — все 32
+  исторических строк сохранены; все три baseline-файла byte-identical
+  (sha256 до/после сессии совпадают). table_alloc_setmetatable WARN
+  предшествующих фаз НЕ воспроизведён: matched center +3.422% (mono/mono),
+  все seeds < +5% (бывшие WARN-seeds: 9 → +3.503%, 10 → +4.640%, 15 →
+  +4.178%); открытый пункт фазой не таргетился, его закрытие по
+  собственному критерию («финальный paired-seed OK» достигнут этой
+  сессией) остаётся owner-решением.
 - **Residuals (honest)**: TBC-parity BLOCKER, emergency-GC HIGH
   (stale-register deref), emergency-rescue HIGH (rescued-never-finalized),
   table_alloc_setmetatable perf WARN и остальные пункты остаются открытыми

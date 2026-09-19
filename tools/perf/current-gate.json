@@ -1,14 +1,14 @@
 {
-  "created_utc": "2026-09-18T21:23:13.265698+00:00",
+  "created_utc": "2026-09-19T00:29:11.925386+00:00",
   "provenance": {
-    "git_head": "ea00d1f",
-    "measured_source_head": "ea00d1f",
+    "git_head": "892b6ee",
+    "measured_source_head": "892b6ee",
     "git_dirty": "dirty",
     "source_dirty": "clean",
     "artifact_dirty": "dirty",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "ad8846c6269ac582",
+    "zig_binary_sha16": "c7db91486fb6588a",
     "puc_binary_sha16": "d54bc45e1757b216"
   },
   "runs": 21,
@@ -20,2304 +20,2304 @@
   "zig_samples": {
     "int_arith": [
       {
-        "wall": 0.233032,
-        "instructions": 5122511128,
+        "wall": 0.23469,
+        "instructions": 5111567574,
         "mode": "mono",
         "seed": 1
       },
       {
-        "wall": 0.230441,
-        "instructions": 5111852894,
+        "wall": 0.230287,
+        "instructions": 5111567911,
         "mode": "mono",
         "seed": 2
       },
       {
-        "wall": 0.230817,
-        "instructions": 5120176182,
+        "wall": 0.228139,
+        "instructions": 5111565505,
         "mode": "mono",
         "seed": 3
       },
       {
-        "wall": 0.229757,
-        "instructions": 5121942623,
+        "wall": 0.23002,
+        "instructions": 5111568558,
         "mode": "mono",
         "seed": 4
       },
       {
-        "wall": 0.230842,
-        "instructions": 5120609727,
+        "wall": 0.230261,
+        "instructions": 5112295526,
         "mode": "mono",
         "seed": 5
       },
       {
-        "wall": 0.229981,
-        "instructions": 5111571897,
+        "wall": 0.227695,
+        "instructions": 5120675321,
         "mode": "mono",
         "seed": 6
       },
       {
-        "wall": 0.231555,
-        "instructions": 5121433540,
+        "wall": 0.228684,
+        "instructions": 5111567079,
         "mode": "mono",
         "seed": 7
       },
       {
-        "wall": 0.230361,
-        "instructions": 5111569267,
+        "wall": 0.229345,
+        "instructions": 5121157653,
         "mode": "mono",
         "seed": 8
       },
       {
-        "wall": 0.230091,
-        "instructions": 5111568577,
+        "wall": 0.228986,
+        "instructions": 5122095986,
         "mode": "mono",
         "seed": 9
       },
       {
-        "wall": 0.246071,
-        "instructions": 5111570512,
+        "wall": 0.228274,
+        "instructions": 5111568968,
         "mode": "mono",
         "seed": 10
       },
       {
-        "wall": 0.231525,
-        "instructions": 5111568993,
+        "wall": 0.231285,
+        "instructions": 5122427331,
         "mode": "mono",
         "seed": 11
       },
       {
-        "wall": 0.229296,
-        "instructions": 5121693943,
+        "wall": 0.229475,
+        "instructions": 5122359700,
         "mode": "mono",
         "seed": 12
       },
       {
-        "wall": 0.229993,
-        "instructions": 5111569204,
+        "wall": 0.228432,
+        "instructions": 5111567090,
         "mode": "mono",
         "seed": 13
       },
       {
-        "wall": 0.230047,
-        "instructions": 5121376796,
+        "wall": 0.228884,
+        "instructions": 5121407509,
         "mode": "mono",
         "seed": 14
       },
       {
-        "wall": 0.23007,
-        "instructions": 5111568694,
+        "wall": 0.229062,
+        "instructions": 5121046331,
         "mode": "mono",
         "seed": 15
       },
       {
-        "wall": 0.240803,
-        "instructions": 5121503831,
+        "wall": 0.229084,
+        "instructions": 5111566830,
         "mode": "mono",
         "seed": 16
       },
       {
-        "wall": 0.240651,
-        "instructions": 5120415582,
+        "wall": 0.22862,
+        "instructions": 5120885200,
         "mode": "mono",
         "seed": 17
       },
       {
-        "wall": 0.242658,
-        "instructions": 5120990395,
+        "wall": 0.22814,
+        "instructions": 5121422016,
         "mode": "mono",
         "seed": 18
       },
       {
-        "wall": 0.240223,
-        "instructions": 5115176926,
+        "wall": 0.230469,
+        "instructions": 5111569559,
         "mode": "mono",
         "seed": 19
       },
       {
-        "wall": 0.238708,
-        "instructions": 5119525142,
+        "wall": 0.228861,
+        "instructions": 5121028513,
         "mode": "mono",
         "seed": 20
       },
       {
-        "wall": 0.238973,
-        "instructions": 5122181599,
+        "wall": 0.228715,
+        "instructions": 5121856819,
         "mode": "mono",
         "seed": 21
       }
     ],
     "global_arith": [
       {
-        "wall": 0.889085,
-        "instructions": 14201585241,
+        "wall": 0.860798,
+        "instructions": 14208650228,
         "mode": "high",
         "seed": 1
       },
       {
-        "wall": 0.884976,
-        "instructions": 14203293070,
+        "wall": 0.96179,
+        "instructions": 14208191103,
         "mode": "high",
         "seed": 2
       },
       {
-        "wall": 0.854344,
-        "instructions": 14201583835,
+        "wall": 0.872418,
+        "instructions": 14202113101,
         "mode": "high",
         "seed": 3
       },
       {
-        "wall": 0.7531,
-        "instructions": 12787585970,
+        "wall": 0.742973,
+        "instructions": 12795802856,
         "mode": "low",
         "seed": 4
       },
       {
-        "wall": 0.960246,
-        "instructions": 14206099273,
+        "wall": 0.856016,
+        "instructions": 14209644868,
         "mode": "high",
         "seed": 5
       },
       {
-        "wall": 0.871403,
-        "instructions": 14209283806,
+        "wall": 0.857668,
+        "instructions": 14208408802,
         "mode": "high",
         "seed": 6
       },
       {
-        "wall": 0.987541,
-        "instructions": 14209207909,
+        "wall": 0.867339,
+        "instructions": 14209397358,
         "mode": "high",
         "seed": 7
       },
       {
-        "wall": 0.781558,
-        "instructions": 12795101563,
+        "wall": 0.753589,
+        "instructions": 12796556374,
         "mode": "low",
         "seed": 8
       },
       {
-        "wall": 0.790033,
-        "instructions": 12796488172,
+        "wall": 0.758647,
+        "instructions": 12795673038,
         "mode": "low",
         "seed": 9
       },
       {
-        "wall": 0.878309,
-        "instructions": 14201586982,
+        "wall": 0.948578,
+        "instructions": 14208061241,
         "mode": "high",
         "seed": 10
       },
       {
-        "wall": 0.781133,
-        "instructions": 12794944140,
+        "wall": 0.852695,
+        "instructions": 12794556925,
         "mode": "low",
         "seed": 11
       },
       {
-        "wall": 0.749683,
-        "instructions": 12796349920,
+        "wall": 0.741776,
+        "instructions": 12796360656,
         "mode": "low",
         "seed": 12
       },
       {
-        "wall": 0.752017,
-        "instructions": 12787585001,
+        "wall": 0.754395,
+        "instructions": 12795805574,
         "mode": "low",
         "seed": 13
       },
       {
-        "wall": 0.750331,
-        "instructions": 12787583555,
+        "wall": 0.75269,
+        "instructions": 12795811191,
         "mode": "low",
         "seed": 14
       },
       {
-        "wall": 0.750643,
-        "instructions": 12787584584,
+        "wall": 0.764126,
+        "instructions": 12794384547,
         "mode": "low",
         "seed": 15
       },
       {
-        "wall": 0.851609,
-        "instructions": 14201585039,
+        "wall": 0.877124,
+        "instructions": 14208472211,
         "mode": "high",
         "seed": 16
       },
       {
-        "wall": 0.932476,
-        "instructions": 14209526042,
+        "wall": 0.879791,
+        "instructions": 14209855142,
         "mode": "high",
         "seed": 17
       },
       {
-        "wall": 1.037409,
-        "instructions": 14208315668,
+        "wall": 0.85116,
+        "instructions": 14209126874,
         "mode": "high",
         "seed": 18
       },
       {
-        "wall": 0.846807,
-        "instructions": 14205772367,
+        "wall": 0.961421,
+        "instructions": 14209290766,
         "mode": "high",
         "seed": 19
       },
       {
-        "wall": 0.834071,
-        "instructions": 12795257723,
+        "wall": 0.833014,
+        "instructions": 12794458648,
         "mode": "low",
         "seed": 20
       },
       {
-        "wall": 0.751331,
-        "instructions": 12795504165,
+        "wall": 0.823874,
+        "instructions": 12795413767,
         "mode": "low",
         "seed": 21
       }
     ],
     "branch_loop": [
       {
-        "wall": 0.85369,
-        "instructions": 11045319695,
+        "wall": 0.856684,
+        "instructions": 11051162812,
         "mode": "mono",
         "seed": 1
       },
       {
-        "wall": 0.851403,
-        "instructions": 11051315556,
+        "wall": 0.875735,
+        "instructions": 11050691644,
         "mode": "mono",
         "seed": 2
       },
       {
-        "wall": 0.870937,
-        "instructions": 11045318156,
+        "wall": 0.889612,
+        "instructions": 11051273829,
         "mode": "mono",
         "seed": 3
       },
       {
-        "wall": 0.854005,
-        "instructions": 11051935251,
+        "wall": 0.867468,
+        "instructions": 11045318828,
         "mode": "mono",
         "seed": 4
       },
       {
-        "wall": 0.839525,
-        "instructions": 11048584301,
+        "wall": 0.864998,
+        "instructions": 11050457017,
         "mode": "mono",
         "seed": 5
       },
       {
-        "wall": 0.842109,
-        "instructions": 11051616554,
+        "wall": 0.870484,
+        "instructions": 11051352747,
         "mode": "mono",
         "seed": 6
       },
       {
-        "wall": 0.834055,
-        "instructions": 11051851866,
+        "wall": 0.848069,
+        "instructions": 11045317925,
         "mode": "mono",
         "seed": 7
       },
       {
-        "wall": 0.837106,
-        "instructions": 11045320011,
+        "wall": 0.871983,
+        "instructions": 11051215811,
         "mode": "mono",
         "seed": 8
       },
       {
-        "wall": 0.852041,
-        "instructions": 11051438896,
+        "wall": 0.874037,
+        "instructions": 11053039462,
         "mode": "mono",
         "seed": 9
       },
       {
-        "wall": 0.841281,
-        "instructions": 11051439283,
+        "wall": 0.870271,
+        "instructions": 11052892836,
         "mode": "mono",
         "seed": 10
       },
       {
-        "wall": 0.850584,
-        "instructions": 11050700443,
+        "wall": 0.860005,
+        "instructions": 11051309698,
         "mode": "mono",
         "seed": 11
       },
       {
-        "wall": 0.849365,
-        "instructions": 11045321438,
+        "wall": 0.870686,
+        "instructions": 11050831283,
         "mode": "mono",
         "seed": 12
       },
       {
-        "wall": 0.850675,
-        "instructions": 11054271663,
+        "wall": 0.87515,
+        "instructions": 11050605175,
         "mode": "mono",
         "seed": 13
       },
       {
-        "wall": 0.848919,
-        "instructions": 11051157163,
+        "wall": 0.871639,
+        "instructions": 11051790120,
         "mode": "mono",
         "seed": 14
       },
       {
-        "wall": 0.85661,
-        "instructions": 11051253174,
+        "wall": 0.876573,
+        "instructions": 11051259691,
         "mode": "mono",
         "seed": 15
       },
       {
-        "wall": 0.854583,
-        "instructions": 11051597381,
+        "wall": 0.89286,
+        "instructions": 11045317589,
         "mode": "mono",
         "seed": 16
       },
       {
-        "wall": 0.86332,
-        "instructions": 11051818484,
+        "wall": 0.85263,
+        "instructions": 11051349429,
         "mode": "mono",
         "seed": 17
       },
       {
-        "wall": 0.853899,
-        "instructions": 11051767279,
+        "wall": 0.863977,
+        "instructions": 11045319242,
         "mode": "mono",
         "seed": 18
       },
       {
-        "wall": 0.851579,
-        "instructions": 11045321748,
+        "wall": 0.873649,
+        "instructions": 11050986824,
         "mode": "mono",
         "seed": 19
       },
       {
-        "wall": 0.840745,
-        "instructions": 11045317877,
+        "wall": 0.86175,
+        "instructions": 11051687206,
         "mode": "mono",
         "seed": 20
       },
       {
-        "wall": 0.848811,
-        "instructions": 11045319212,
+        "wall": 0.865055,
+        "instructions": 11045317669,
         "mode": "mono",
         "seed": 21
       }
     ],
     "lua_calls": [
       {
-        "wall": 0.121564,
-        "instructions": 2253269033,
+        "wall": 0.130596,
+        "instructions": 2258243679,
         "mode": "mono",
         "seed": 1
       },
       {
-        "wall": 0.12021,
-        "instructions": 2253269560,
+        "wall": 0.123611,
+        "instructions": 2261944853,
         "mode": "mono",
         "seed": 2
       },
       {
-        "wall": 0.125416,
-        "instructions": 2262726602,
+        "wall": 0.1251,
+        "instructions": 2263236211,
         "mode": "mono",
         "seed": 3
       },
       {
-        "wall": 0.12123,
-        "instructions": 2265791988,
+        "wall": 0.127089,
+        "instructions": 2261078538,
         "mode": "mono",
         "seed": 4
       },
       {
-        "wall": 0.123952,
-        "instructions": 2261121905,
+        "wall": 0.120791,
+        "instructions": 2261914177,
         "mode": "mono",
         "seed": 5
       },
       {
-        "wall": 0.122271,
-        "instructions": 2262535280,
+        "wall": 0.119836,
+        "instructions": 2262590147,
         "mode": "mono",
         "seed": 6
       },
       {
-        "wall": 0.121087,
-        "instructions": 2261823264,
+        "wall": 0.120484,
+        "instructions": 2261778488,
         "mode": "mono",
         "seed": 7
       },
       {
-        "wall": 0.120469,
-        "instructions": 2260723836,
+        "wall": 0.120118,
+        "instructions": 2261905244,
         "mode": "mono",
         "seed": 8
       },
       {
-        "wall": 0.126791,
-        "instructions": 2255233084,
+        "wall": 0.122197,
+        "instructions": 2260786665,
         "mode": "mono",
         "seed": 9
       },
       {
-        "wall": 0.123481,
-        "instructions": 2260403829,
+        "wall": 0.120752,
+        "instructions": 2262172263,
         "mode": "mono",
         "seed": 10
       },
       {
-        "wall": 0.119991,
-        "instructions": 2263224816,
+        "wall": 0.1227,
+        "instructions": 2262958597,
         "mode": "mono",
         "seed": 11
       },
       {
-        "wall": 0.122745,
-        "instructions": 2261783647,
+        "wall": 0.120771,
+        "instructions": 2260711004,
         "mode": "mono",
         "seed": 12
       },
       {
-        "wall": 0.1236,
-        "instructions": 2257088028,
+        "wall": 0.120761,
+        "instructions": 2260587378,
         "mode": "mono",
         "seed": 13
       },
       {
-        "wall": 0.120533,
-        "instructions": 2262396625,
+        "wall": 0.123265,
+        "instructions": 2261183144,
         "mode": "mono",
         "seed": 14
       },
       {
-        "wall": 0.120493,
-        "instructions": 2262041857,
+        "wall": 0.120916,
+        "instructions": 2253267114,
         "mode": "mono",
         "seed": 15
       },
       {
-        "wall": 0.121376,
-        "instructions": 2261777754,
+        "wall": 0.121015,
+        "instructions": 2263713246,
         "mode": "mono",
         "seed": 16
       },
       {
-        "wall": 0.12268,
-        "instructions": 2261552116,
+        "wall": 0.120867,
+        "instructions": 2261775170,
         "mode": "mono",
         "seed": 17
       },
       {
-        "wall": 0.120272,
-        "instructions": 2261207573,
+        "wall": 0.120715,
+        "instructions": 2262535233,
         "mode": "mono",
         "seed": 18
       },
       {
-        "wall": 0.120425,
-        "instructions": 2253271431,
+        "wall": 0.121214,
+        "instructions": 2261712810,
         "mode": "mono",
         "seed": 19
       },
       {
-        "wall": 0.123966,
-        "instructions": 2261229435,
+        "wall": 0.133265,
+        "instructions": 2262121742,
         "mode": "mono",
         "seed": 20
       },
       {
-        "wall": 0.121491,
-        "instructions": 2262014431,
+        "wall": 0.121399,
+        "instructions": 2261588553,
         "mode": "mono",
         "seed": 21
       }
     ],
     "array_access": [
       {
-        "wall": 0.079837,
-        "instructions": 1241067219,
+        "wall": 0.082085,
+        "instructions": 1235834277,
         "mode": "mono",
         "seed": 1
       },
       {
-        "wall": 0.081663,
-        "instructions": 1240018473,
+        "wall": 0.080196,
+        "instructions": 1240903489,
         "mode": "mono",
         "seed": 2
       },
       {
-        "wall": 0.083326,
-        "instructions": 1240033352,
+        "wall": 0.081103,
+        "instructions": 1240083633,
         "mode": "mono",
         "seed": 3
       },
       {
-        "wall": 0.082747,
-        "instructions": 1240487885,
+        "wall": 0.080488,
+        "instructions": 1237954438,
         "mode": "mono",
         "seed": 4
       },
       {
-        "wall": 0.080565,
-        "instructions": 1233171743,
+        "wall": 0.083541,
+        "instructions": 1239796102,
         "mode": "mono",
         "seed": 5
       },
       {
-        "wall": 0.081092,
-        "instructions": 1233171945,
+        "wall": 0.082454,
+        "instructions": 1233170145,
         "mode": "mono",
         "seed": 6
       },
       {
-        "wall": 0.082125,
-        "instructions": 1233169243,
+        "wall": 0.081622,
+        "instructions": 1240246501,
         "mode": "mono",
         "seed": 7
       },
       {
-        "wall": 0.082041,
-        "instructions": 1239062759,
+        "wall": 0.081856,
+        "instructions": 1240186301,
         "mode": "mono",
         "seed": 8
       },
       {
-        "wall": 0.082021,
-        "instructions": 1240093271,
+        "wall": 0.082022,
+        "instructions": 1239650119,
         "mode": "mono",
         "seed": 9
       },
       {
-        "wall": 0.081384,
-        "instructions": 1241992623,
+        "wall": 0.082216,
+        "instructions": 1239279948,
         "mode": "mono",
         "seed": 10
       },
       {
-        "wall": 0.081879,
-        "instructions": 1243338844,
+        "wall": 0.085527,
+        "instructions": 1238804905,
         "mode": "mono",
         "seed": 11
       },
       {
-        "wall": 0.080744,
-        "instructions": 1239448807,
+        "wall": 0.084632,
+        "instructions": 1239239598,
         "mode": "mono",
         "seed": 12
       },
       {
-        "wall": 0.082211,
-        "instructions": 1233169095,
+        "wall": 0.085382,
+        "instructions": 1239663816,
         "mode": "mono",
         "seed": 13
       },
       {
-        "wall": 0.080568,
-        "instructions": 1233167258,
+        "wall": 0.084823,
+        "instructions": 1237801539,
         "mode": "mono",
         "seed": 14
       },
       {
-        "wall": 0.083135,
-        "instructions": 1240311629,
+        "wall": 0.083569,
+        "instructions": 1241877881,
         "mode": "mono",
         "seed": 15
       },
       {
-        "wall": 0.080888,
-        "instructions": 1240343905,
+        "wall": 0.084178,
+        "instructions": 1233166911,
         "mode": "mono",
         "seed": 16
       },
       {
-        "wall": 0.081107,
-        "instructions": 1243676723,
+        "wall": 0.084495,
+        "instructions": 1239747314,
         "mode": "mono",
         "seed": 17
       },
       {
-        "wall": 0.081052,
-        "instructions": 1239820551,
+        "wall": 0.083205,
+        "instructions": 1241109335,
         "mode": "mono",
         "seed": 18
       },
       {
-        "wall": 0.08337,
-        "instructions": 1240357841,
+        "wall": 0.083722,
+        "instructions": 1240041613,
         "mode": "mono",
         "seed": 19
       },
       {
-        "wall": 0.082636,
-        "instructions": 1237693923,
+        "wall": 0.085273,
+        "instructions": 1239786793,
         "mode": "mono",
         "seed": 20
       },
       {
-        "wall": 0.08387,
-        "instructions": 1239893185,
+        "wall": 0.084405,
+        "instructions": 1240009707,
         "mode": "mono",
         "seed": 21
       }
     ],
     "hash_access": [
       {
-        "wall": 0.111197,
-        "instructions": 1576568776,
+        "wall": 0.115279,
+        "instructions": 1582983652,
         "mode": "mono",
         "seed": 1
       },
       {
-        "wall": 0.111611,
-        "instructions": 1582646281,
+        "wall": 0.11645,
+        "instructions": 1579311355,
         "mode": "mono",
         "seed": 2
       },
       {
-        "wall": 0.11163,
-        "instructions": 1582650594,
+        "wall": 0.114996,
+        "instructions": 1583880208,
         "mode": "mono",
         "seed": 3
       },
       {
-        "wall": 0.112362,
-        "instructions": 1584531534,
+        "wall": 0.117184,
+        "instructions": 1583877921,
         "mode": "mono",
         "seed": 4
       },
       {
-        "wall": 0.111218,
-        "instructions": 1576571012,
+        "wall": 0.116094,
+        "instructions": 1583091842,
         "mode": "mono",
         "seed": 5
       },
       {
-        "wall": 0.110629,
-        "instructions": 1585962520,
+        "wall": 0.116063,
+        "instructions": 1579969186,
         "mode": "mono",
         "seed": 6
       },
       {
-        "wall": 0.11062,
-        "instructions": 1576568520,
+        "wall": 0.115899,
+        "instructions": 1583524656,
         "mode": "mono",
         "seed": 7
       },
       {
-        "wall": 0.110589,
-        "instructions": 1582976966,
+        "wall": 0.114459,
+        "instructions": 1583695093,
         "mode": "mono",
         "seed": 8
       },
       {
-        "wall": 0.111552,
-        "instructions": 1581228434,
+        "wall": 0.116188,
+        "instructions": 1576566707,
         "mode": "mono",
         "seed": 9
       },
       {
-        "wall": 0.11163,
-        "instructions": 1582112654,
+        "wall": 0.115505,
+        "instructions": 1583111480,
         "mode": "mono",
         "seed": 10
       },
       {
-        "wall": 0.112178,
-        "instructions": 1576569017,
+        "wall": 0.115472,
+        "instructions": 1583083361,
         "mode": "mono",
         "seed": 11
       },
       {
-        "wall": 0.111399,
-        "instructions": 1582705487,
+        "wall": 0.116675,
+        "instructions": 1582444813,
         "mode": "mono",
         "seed": 12
       },
       {
-        "wall": 0.111341,
-        "instructions": 1578749239,
+        "wall": 0.115912,
+        "instructions": 1576566676,
         "mode": "mono",
         "seed": 13
       },
       {
-        "wall": 0.115958,
-        "instructions": 1576567017,
+        "wall": 0.115575,
+        "instructions": 1582803533,
         "mode": "mono",
         "seed": 14
       },
       {
-        "wall": 0.112233,
-        "instructions": 1583159203,
+        "wall": 0.116744,
+        "instructions": 1582333022,
         "mode": "mono",
         "seed": 15
       },
       {
-        "wall": 0.110669,
-        "instructions": 1576568777,
+        "wall": 0.115553,
+        "instructions": 1582126798,
         "mode": "mono",
         "seed": 16
       },
       {
-        "wall": 0.110694,
-        "instructions": 1584069209,
+        "wall": 0.115505,
+        "instructions": 1582944392,
         "mode": "mono",
         "seed": 17
       },
       {
-        "wall": 0.112215,
-        "instructions": 1576570578,
+        "wall": 0.115838,
+        "instructions": 1582684695,
         "mode": "mono",
         "seed": 18
       },
       {
-        "wall": 0.111989,
-        "instructions": 1582785854,
+        "wall": 0.114255,
+        "instructions": 1576568821,
         "mode": "mono",
         "seed": 19
       },
       {
-        "wall": 0.11281,
-        "instructions": 1582932946,
+        "wall": 0.112028,
+        "instructions": 1583751007,
         "mode": "mono",
         "seed": 20
       },
       {
-        "wall": 0.111178,
-        "instructions": 1583127339,
+        "wall": 0.112487,
+        "instructions": 1583658132,
         "mode": "mono",
         "seed": 21
       }
     ],
     "temp_table_alloc": [
       {
-        "wall": 0.033798,
-        "instructions": 530725955,
+        "wall": 0.033823,
+        "instructions": 539050306,
         "mode": "mono",
         "seed": 1
       },
       {
-        "wall": 0.035475,
-        "instructions": 537630120,
+        "wall": 0.034019,
+        "instructions": 538624913,
         "mode": "mono",
         "seed": 2
       },
       {
-        "wall": 0.035208,
-        "instructions": 539586979,
+        "wall": 0.033241,
+        "instructions": 538795113,
         "mode": "mono",
         "seed": 3
       },
       {
-        "wall": 0.036926,
-        "instructions": 536731152,
+        "wall": 0.033823,
+        "instructions": 533232258,
         "mode": "mono",
         "seed": 4
       },
       {
-        "wall": 0.035396,
-        "instructions": 538863827,
+        "wall": 0.03368,
+        "instructions": 531734504,
         "mode": "mono",
         "seed": 5
       },
       {
-        "wall": 0.036126,
-        "instructions": 537873525,
+        "wall": 0.033204,
+        "instructions": 538892216,
         "mode": "mono",
         "seed": 6
       },
       {
-        "wall": 0.03738,
-        "instructions": 533163536,
+        "wall": 0.03391,
+        "instructions": 537926143,
         "mode": "mono",
         "seed": 7
       },
       {
-        "wall": 0.034647,
-        "instructions": 537799548,
+        "wall": 0.033193,
+        "instructions": 538594776,
         "mode": "mono",
         "seed": 8
       },
       {
-        "wall": 0.035878,
-        "instructions": 533149072,
+        "wall": 0.033431,
+        "instructions": 539364316,
         "mode": "mono",
         "seed": 9
       },
       {
-        "wall": 0.034795,
-        "instructions": 530727281,
+        "wall": 0.03354,
+        "instructions": 538244796,
         "mode": "mono",
         "seed": 10
       },
       {
-        "wall": 0.036488,
-        "instructions": 530726365,
+        "wall": 0.039742,
+        "instructions": 537423208,
         "mode": "mono",
         "seed": 11
       },
       {
-        "wall": 0.036149,
-        "instructions": 537675224,
+        "wall": 0.033496,
+        "instructions": 538845155,
         "mode": "mono",
         "seed": 12
       },
       {
-        "wall": 0.037538,
-        "instructions": 537155674,
+        "wall": 0.033257,
+        "instructions": 531734979,
         "mode": "mono",
         "seed": 13
       },
       {
-        "wall": 0.034603,
-        "instructions": 537602684,
+        "wall": 0.033906,
+        "instructions": 534552421,
         "mode": "mono",
         "seed": 14
       },
       {
-        "wall": 0.038279,
-        "instructions": 536370135,
+        "wall": 0.037976,
+        "instructions": 538448553,
         "mode": "mono",
         "seed": 15
       },
       {
-        "wall": 0.038,
-        "instructions": 537165247,
+        "wall": 0.033393,
+        "instructions": 538698604,
         "mode": "mono",
         "seed": 16
       },
       {
-        "wall": 0.035208,
-        "instructions": 537528262,
+        "wall": 0.033628,
+        "instructions": 539513895,
         "mode": "mono",
         "seed": 17
       },
       {
-        "wall": 0.038975,
-        "instructions": 537473749,
+        "wall": 0.033247,
+        "instructions": 539633520,
         "mode": "mono",
         "seed": 18
       },
       {
-        "wall": 0.035616,
-        "instructions": 539113983,
+        "wall": 0.033428,
+        "instructions": 537839089,
         "mode": "mono",
         "seed": 19
       },
       {
-        "wall": 0.034304,
-        "instructions": 538101637,
+        "wall": 0.033843,
+        "instructions": 531731228,
         "mode": "mono",
         "seed": 20
       },
       {
-        "wall": 0.036349,
-        "instructions": 530724793,
+        "wall": 0.033373,
+        "instructions": 538598058,
         "mode": "mono",
         "seed": 21
       }
     ],
     "string_loop": [
       {
-        "wall": 0.11243,
-        "instructions": 1553448620,
+        "wall": 0.109881,
+        "instructions": 1546017695,
         "mode": "mono",
         "seed": 1
       },
       {
-        "wall": 0.119501,
-        "instructions": 1553581260,
+        "wall": 0.110419,
+        "instructions": 1546036724,
         "mode": "mono",
         "seed": 2
       },
       {
-        "wall": 0.116259,
-        "instructions": 1559335482,
+        "wall": 0.110733,
+        "instructions": 1560418006,
         "mode": "mono",
         "seed": 3
       },
       {
-        "wall": 0.116643,
-        "instructions": 1547693788,
+        "wall": 0.110324,
+        "instructions": 1552433413,
         "mode": "mono",
         "seed": 4
       },
       {
-        "wall": 0.116416,
-        "instructions": 1554283731,
+        "wall": 0.110968,
+        "instructions": 1553478714,
         "mode": "mono",
         "seed": 5
       },
       {
-        "wall": 0.116559,
-        "instructions": 1560711409,
+        "wall": 0.111045,
+        "instructions": 1559419159,
         "mode": "mono",
         "seed": 6
       },
       {
-        "wall": 0.116844,
-        "instructions": 1554809160,
+        "wall": 0.109727,
+        "instructions": 1553017196,
         "mode": "mono",
         "seed": 7
       },
       {
-        "wall": 0.119822,
-        "instructions": 1561072856,
+        "wall": 0.111773,
+        "instructions": 1559628952,
         "mode": "mono",
         "seed": 8
       },
       {
-        "wall": 0.117059,
-        "instructions": 1547706514,
+        "wall": 0.112385,
+        "instructions": 1551865017,
         "mode": "mono",
         "seed": 9
       },
       {
-        "wall": 0.110517,
-        "instructions": 1554497163,
+        "wall": 0.109877,
+        "instructions": 1552373950,
         "mode": "mono",
         "seed": 10
       },
       {
-        "wall": 0.112286,
-        "instructions": 1554345364,
+        "wall": 0.110073,
+        "instructions": 1546078258,
         "mode": "mono",
         "seed": 11
       },
       {
-        "wall": 0.111387,
-        "instructions": 1553972783,
+        "wall": 0.110139,
+        "instructions": 1552488930,
         "mode": "mono",
         "seed": 12
       },
       {
-        "wall": 0.110492,
-        "instructions": 1554193060,
+        "wall": 0.110728,
+        "instructions": 1552323251,
         "mode": "mono",
         "seed": 13
       },
       {
-        "wall": 0.111275,
-        "instructions": 1554412739,
+        "wall": 0.110547,
+        "instructions": 1551908944,
         "mode": "mono",
         "seed": 14
       },
       {
-        "wall": 0.111492,
-        "instructions": 1561707634,
+        "wall": 0.110642,
+        "instructions": 1560009835,
         "mode": "mono",
         "seed": 15
       },
       {
-        "wall": 0.111427,
-        "instructions": 1553547036,
+        "wall": 0.111667,
+        "instructions": 1552788798,
         "mode": "mono",
         "seed": 16
       },
       {
-        "wall": 0.113586,
-        "instructions": 1553639561,
+        "wall": 0.112756,
+        "instructions": 1552008846,
         "mode": "mono",
         "seed": 17
       },
       {
-        "wall": 0.121521,
-        "instructions": 1553442116,
+        "wall": 0.109863,
+        "instructions": 1552185006,
         "mode": "mono",
         "seed": 18
       },
       {
-        "wall": 0.114422,
-        "instructions": 1554526659,
+        "wall": 0.110756,
+        "instructions": 1549094070,
         "mode": "mono",
         "seed": 19
       },
       {
-        "wall": 0.111136,
-        "instructions": 1554256016,
+        "wall": 0.110404,
+        "instructions": 1546021659,
         "mode": "mono",
         "seed": 20
       },
       {
-        "wall": 0.110583,
-        "instructions": 1552888460,
+        "wall": 0.111222,
+        "instructions": 1551902410,
         "mode": "mono",
         "seed": 21
       }
     ],
     "coroutine_yield": [
       {
-        "wall": 0.063509,
-        "instructions": 1050853874,
+        "wall": 0.064561,
+        "instructions": 1041812762,
         "mode": "mono",
         "seed": 1
       },
       {
-        "wall": 0.065339,
-        "instructions": 1050403305,
+        "wall": 0.064982,
+        "instructions": 1055265535,
         "mode": "mono",
         "seed": 2
       },
       {
-        "wall": 0.064197,
-        "instructions": 1043331170,
+        "wall": 0.063191,
+        "instructions": 1050037879,
         "mode": "mono",
         "seed": 3
       },
       {
-        "wall": 0.063099,
-        "instructions": 1043333446,
+        "wall": 0.064294,
+        "instructions": 1048728034,
         "mode": "mono",
         "seed": 4
       },
       {
-        "wall": 0.061844,
-        "instructions": 1044025995,
+        "wall": 0.061519,
+        "instructions": 1042182355,
         "mode": "mono",
         "seed": 5
       },
       {
-        "wall": 0.066626,
-        "instructions": 1065491468,
+        "wall": 0.065393,
+        "instructions": 1055955013,
         "mode": "mono",
         "seed": 6
       },
       {
-        "wall": 0.062336,
-        "instructions": 1043501214,
+        "wall": 0.062036,
+        "instructions": 1034742136,
         "mode": "mono",
         "seed": 7
       },
       {
-        "wall": 0.063385,
-        "instructions": 1044230425,
+        "wall": 0.062036,
+        "instructions": 1034742377,
         "mode": "mono",
         "seed": 8
       },
       {
-        "wall": 0.066123,
-        "instructions": 1058247264,
+        "wall": 0.065663,
+        "instructions": 1055305317,
         "mode": "mono",
         "seed": 9
       },
       {
-        "wall": 0.064526,
-        "instructions": 1051491544,
+        "wall": 0.063765,
+        "instructions": 1048803182,
         "mode": "mono",
         "seed": 10
       },
       {
-        "wall": 0.064107,
-        "instructions": 1036262645,
+        "wall": 0.063253,
+        "instructions": 1042033010,
         "mode": "mono",
         "seed": 11
       },
       {
-        "wall": 0.063305,
-        "instructions": 1044091154,
+        "wall": 0.064237,
+        "instructions": 1041247281,
         "mode": "mono",
         "seed": 12
       },
       {
-        "wall": 0.065099,
-        "instructions": 1050402611,
+        "wall": 0.065117,
+        "instructions": 1056063212,
         "mode": "mono",
         "seed": 13
       },
       {
-        "wall": 0.063291,
-        "instructions": 1043184198,
+        "wall": 0.063119,
+        "instructions": 1042167709,
         "mode": "mono",
         "seed": 14
       },
       {
-        "wall": 0.065434,
-        "instructions": 1043280213,
+        "wall": 0.063354,
+        "instructions": 1034742544,
         "mode": "mono",
         "seed": 15
       },
       {
-        "wall": 0.063362,
-        "instructions": 1041645945,
+        "wall": 0.067218,
+        "instructions": 1045569014,
         "mode": "mono",
         "seed": 16
       },
       {
-        "wall": 0.066137,
-        "instructions": 1057476330,
+        "wall": 0.068673,
+        "instructions": 1062650719,
         "mode": "mono",
         "seed": 17
       },
       {
-        "wall": 0.062133,
-        "instructions": 1043007585,
+        "wall": 0.062781,
+        "instructions": 1041425746,
         "mode": "mono",
         "seed": 18
       },
       {
-        "wall": 0.064431,
-        "instructions": 1043696987,
+        "wall": 0.064872,
+        "instructions": 1041866650,
         "mode": "mono",
         "seed": 19
       },
       {
-        "wall": 0.063093,
-        "instructions": 1051150788,
+        "wall": 0.064972,
+        "instructions": 1048220959,
         "mode": "mono",
         "seed": 20
       },
       {
-        "wall": 0.06213,
-        "instructions": 1036262145,
+        "wall": 0.06294,
+        "instructions": 1041134203,
         "mode": "mono",
         "seed": 21
       }
     ],
     "dynamic_load": [
       {
-        "wall": 0.19468,
-        "instructions": 2331374698,
+        "wall": 0.200965,
+        "instructions": 2336337362,
         "mode": "mono",
         "seed": 1
       },
       {
-        "wall": 0.193846,
-        "instructions": 2335152452,
+        "wall": 0.198847,
+        "instructions": 2336811099,
         "mode": "mono",
         "seed": 2
       },
       {
-        "wall": 0.19557,
-        "instructions": 2338519040,
+        "wall": 0.199326,
+        "instructions": 2337862181,
         "mode": "mono",
         "seed": 3
       },
       {
-        "wall": 0.194737,
-        "instructions": 2331374231,
+        "wall": 0.202413,
+        "instructions": 2336269962,
         "mode": "mono",
         "seed": 4
       },
       {
-        "wall": 0.193683,
-        "instructions": 2337630985,
+        "wall": 0.2013,
+        "instructions": 2336628492,
         "mode": "mono",
         "seed": 5
       },
       {
-        "wall": 0.194469,
-        "instructions": 2336648318,
+        "wall": 0.201575,
+        "instructions": 2335397433,
         "mode": "mono",
         "seed": 6
       },
       {
-        "wall": 0.193729,
-        "instructions": 2337865750,
+        "wall": 0.199075,
+        "instructions": 2331471823,
         "mode": "mono",
         "seed": 7
       },
       {
-        "wall": 0.206373,
-        "instructions": 2336003360,
+        "wall": 0.201402,
+        "instructions": 2336898009,
         "mode": "mono",
         "seed": 8
       },
       {
-        "wall": 0.2006,
-        "instructions": 2336734168,
+        "wall": 0.196867,
+        "instructions": 2330765219,
         "mode": "mono",
         "seed": 9
       },
       {
-        "wall": 0.202912,
-        "instructions": 2335996587,
+        "wall": 0.197629,
+        "instructions": 2336669539,
         "mode": "mono",
         "seed": 10
       },
       {
-        "wall": 0.194155,
-        "instructions": 2336793050,
+        "wall": 0.19955,
+        "instructions": 2335796212,
         "mode": "mono",
         "seed": 11
       },
       {
-        "wall": 0.195762,
-        "instructions": 2332082321,
+        "wall": 0.198083,
+        "instructions": 2337559127,
         "mode": "mono",
         "seed": 12
       },
       {
-        "wall": 0.192799,
-        "instructions": 2335843807,
+        "wall": 0.197785,
+        "instructions": 2335489698,
         "mode": "mono",
         "seed": 13
       },
       {
-        "wall": 0.194394,
-        "instructions": 2337409886,
+        "wall": 0.20035,
+        "instructions": 2332178974,
         "mode": "mono",
         "seed": 14
       },
       {
-        "wall": 0.194833,
-        "instructions": 2336981097,
+        "wall": 0.202601,
+        "instructions": 2334549745,
         "mode": "mono",
         "seed": 15
       },
       {
-        "wall": 0.193285,
-        "instructions": 2337050149,
+        "wall": 0.197576,
+        "instructions": 2336806551,
         "mode": "mono",
         "seed": 16
       },
       {
-        "wall": 0.19906,
-        "instructions": 2335907493,
+        "wall": 0.197863,
+        "instructions": 2335998245,
         "mode": "mono",
         "seed": 17
       },
       {
-        "wall": 0.193255,
-        "instructions": 2337896561,
+        "wall": 0.197878,
+        "instructions": 2337498472,
         "mode": "mono",
         "seed": 18
       },
       {
-        "wall": 0.202949,
-        "instructions": 2332082555,
+        "wall": 0.198538,
+        "instructions": 2337019943,
         "mode": "mono",
         "seed": 19
       },
       {
-        "wall": 0.20339,
-        "instructions": 2336570451,
+        "wall": 0.199438,
+        "instructions": 2336112404,
         "mode": "mono",
         "seed": 20
       },
       {
-        "wall": 0.203775,
-        "instructions": 2336146230,
+        "wall": 0.199402,
+        "instructions": 2335506817,
         "mode": "mono",
         "seed": 21
       }
     ],
     "mixed_arith": [
       {
-        "wall": 0.270765,
-        "instructions": 5676775555,
+        "wall": 0.249813,
+        "instructions": 5667066670,
         "mode": "mono",
         "seed": 1
       },
       {
-        "wall": 0.270751,
-        "instructions": 5676798561,
+        "wall": 0.246122,
+        "instructions": 5671171544,
         "mode": "mono",
         "seed": 2
       },
       {
-        "wall": 0.271225,
-        "instructions": 5677245940,
+        "wall": 0.246795,
+        "instructions": 5667065775,
         "mode": "mono",
         "seed": 3
       },
       {
-        "wall": 0.261931,
-        "instructions": 5675579823,
+        "wall": 0.247589,
+        "instructions": 5676461292,
         "mode": "mono",
         "seed": 4
       },
       {
-        "wall": 0.250386,
-        "instructions": 5679218436,
+        "wall": 0.246233,
+        "instructions": 5677138238,
         "mode": "mono",
         "seed": 5
       },
       {
-        "wall": 0.258932,
-        "instructions": 5676547587,
+        "wall": 0.246249,
+        "instructions": 5667069837,
         "mode": "mono",
         "seed": 6
       },
       {
-        "wall": 0.253619,
-        "instructions": 5676768127,
+        "wall": 0.247494,
+        "instructions": 5667067009,
         "mode": "mono",
         "seed": 7
       },
       {
-        "wall": 0.252592,
-        "instructions": 5667069345,
+        "wall": 0.247048,
+        "instructions": 5667067815,
         "mode": "mono",
         "seed": 8
       },
       {
-        "wall": 0.250727,
-        "instructions": 5679030428,
+        "wall": 0.248369,
+        "instructions": 5667067056,
         "mode": "mono",
         "seed": 9
       },
       {
-        "wall": 0.276656,
-        "instructions": 5676855131,
+        "wall": 0.245921,
+        "instructions": 5676609858,
         "mode": "mono",
         "seed": 10
       },
       {
-        "wall": 0.252636,
-        "instructions": 5676915389,
+        "wall": 0.248753,
+        "instructions": 5667066943,
         "mode": "mono",
         "seed": 11
       },
       {
-        "wall": 0.250697,
-        "instructions": 5677412989,
+        "wall": 0.246216,
+        "instructions": 5676402323,
         "mode": "mono",
         "seed": 12
       },
       {
-        "wall": 0.254105,
-        "instructions": 5677142159,
+        "wall": 0.24621,
+        "instructions": 5677294474,
         "mode": "mono",
         "seed": 13
       },
       {
-        "wall": 0.263143,
-        "instructions": 5677118441,
+        "wall": 0.247778,
+        "instructions": 5678663064,
         "mode": "mono",
         "seed": 14
       },
       {
-        "wall": 0.255638,
-        "instructions": 5677848478,
+        "wall": 0.247371,
+        "instructions": 5677076490,
         "mode": "mono",
         "seed": 15
       },
       {
-        "wall": 0.252193,
-        "instructions": 5667068880,
+        "wall": 0.246895,
+        "instructions": 5667067159,
         "mode": "mono",
         "seed": 16
       },
       {
-        "wall": 0.254546,
-        "instructions": 5667309872,
+        "wall": 0.246927,
+        "instructions": 5677386978,
         "mode": "mono",
         "seed": 17
       },
       {
-        "wall": 0.250823,
-        "instructions": 5676265094,
+        "wall": 0.246999,
+        "instructions": 5677934220,
         "mode": "mono",
         "seed": 18
       },
       {
-        "wall": 0.249983,
-        "instructions": 5678804376,
+        "wall": 0.252631,
+        "instructions": 5676278000,
         "mode": "mono",
         "seed": 19
       },
       {
-        "wall": 0.250631,
-        "instructions": 5677579621,
+        "wall": 0.247965,
+        "instructions": 5677110751,
         "mode": "mono",
         "seed": 20
       },
       {
-        "wall": 0.255289,
-        "instructions": 5678052239,
+        "wall": 0.253563,
+        "instructions": 5677943634,
         "mode": "mono",
         "seed": 21
       }
     ],
     "float_arith": [
       {
-        "wall": 0.233824,
-        "instructions": 5322213100,
+        "wall": 0.235973,
+        "instructions": 5313567288,
         "mode": "mono",
         "seed": 1
       },
       {
-        "wall": 0.230869,
-        "instructions": 5324488396,
+        "wall": 0.230462,
+        "instructions": 5323344947,
         "mode": "mono",
         "seed": 2
       },
       {
-        "wall": 0.232089,
-        "instructions": 5323476379,
+        "wall": 0.235626,
+        "instructions": 5313565468,
         "mode": "mono",
         "seed": 3
       },
       {
-        "wall": 0.233485,
-        "instructions": 5324381978,
+        "wall": 0.236335,
+        "instructions": 5323083834,
         "mode": "mono",
         "seed": 4
       },
       {
-        "wall": 0.2359,
-        "instructions": 5323616236,
+        "wall": 0.231029,
+        "instructions": 5313569551,
         "mode": "mono",
         "seed": 5
       },
       {
-        "wall": 0.231829,
-        "instructions": 5324304119,
+        "wall": 0.230232,
+        "instructions": 5313569827,
         "mode": "mono",
         "seed": 6
       },
       {
-        "wall": 0.23278,
-        "instructions": 5323745279,
+        "wall": 0.230138,
+        "instructions": 5317472886,
         "mode": "mono",
         "seed": 7
       },
       {
-        "wall": 0.233693,
-        "instructions": 5323287572,
+        "wall": 0.229754,
+        "instructions": 5313567399,
         "mode": "mono",
         "seed": 8
       },
       {
-        "wall": 0.234519,
-        "instructions": 5323887704,
+        "wall": 0.230001,
+        "instructions": 5313566633,
         "mode": "mono",
         "seed": 9
       },
       {
-        "wall": 0.23149,
-        "instructions": 5324526920,
+        "wall": 0.230424,
+        "instructions": 5313568705,
         "mode": "mono",
         "seed": 10
       },
       {
-        "wall": 0.231906,
-        "instructions": 5313569366,
+        "wall": 0.235739,
+        "instructions": 5323716853,
         "mode": "mono",
         "seed": 11
       },
       {
-        "wall": 0.236301,
-        "instructions": 5317711243,
+        "wall": 0.237602,
+        "instructions": 5324326319,
         "mode": "mono",
         "seed": 12
       },
       {
-        "wall": 0.237621,
-        "instructions": 5324070396,
+        "wall": 0.237416,
+        "instructions": 5322493793,
         "mode": "mono",
         "seed": 13
       },
       {
-        "wall": 0.238115,
-        "instructions": 5313567493,
+        "wall": 0.236558,
+        "instructions": 5322677047,
         "mode": "mono",
         "seed": 14
       },
       {
-        "wall": 0.234652,
-        "instructions": 5323840980,
+        "wall": 0.230156,
+        "instructions": 5323876444,
         "mode": "mono",
         "seed": 15
       },
       {
-        "wall": 0.232814,
-        "instructions": 5313569061,
+        "wall": 0.229074,
+        "instructions": 5322989852,
         "mode": "mono",
         "seed": 16
       },
       {
-        "wall": 0.234787,
-        "instructions": 5323571077,
+        "wall": 0.2299,
+        "instructions": 5313571133,
         "mode": "mono",
         "seed": 17
       },
       {
-        "wall": 0.232918,
-        "instructions": 5313570721,
+        "wall": 0.229741,
+        "instructions": 5313568849,
         "mode": "mono",
         "seed": 18
       },
       {
-        "wall": 0.232534,
-        "instructions": 5322631758,
+        "wall": 0.23057,
+        "instructions": 5313569238,
         "mode": "mono",
         "seed": 19
       },
       {
-        "wall": 0.232213,
-        "instructions": 5322522282,
+        "wall": 0.229866,
+        "instructions": 5325502692,
         "mode": "mono",
         "seed": 20
       },
       {
-        "wall": 0.235561,
-        "instructions": 5313568950,
+        "wall": 0.230166,
+        "instructions": 5313567200,
         "mode": "mono",
         "seed": 21
       }
     ],
     "string_concat": [
       {
-        "wall": 0.085086,
-        "instructions": 1061881516,
+        "wall": 0.084837,
+        "instructions": 1062840055,
         "mode": "mono",
         "seed": 1
       },
       {
-        "wall": 0.088177,
-        "instructions": 1056715649,
+        "wall": 0.084453,
+        "instructions": 1062643555,
         "mode": "mono",
         "seed": 2
       },
       {
-        "wall": 0.08597,
-        "instructions": 1061948914,
+        "wall": 0.084827,
+        "instructions": 1062896936,
         "mode": "mono",
         "seed": 3
       },
       {
-        "wall": 0.085741,
-        "instructions": 1062154188,
+        "wall": 0.084201,
+        "instructions": 1062461223,
         "mode": "mono",
         "seed": 4
       },
       {
-        "wall": 0.08525,
-        "instructions": 1062804238,
+        "wall": 0.084685,
+        "instructions": 1062829459,
         "mode": "mono",
         "seed": 5
       },
       {
-        "wall": 0.088399,
-        "instructions": 1056677141,
+        "wall": 0.084179,
+        "instructions": 1063467687,
         "mode": "mono",
         "seed": 6
       },
       {
-        "wall": 0.08515,
-        "instructions": 1061956070,
+        "wall": 0.085027,
+        "instructions": 1062687388,
         "mode": "mono",
         "seed": 7
       },
       {
-        "wall": 0.084971,
-        "instructions": 1063368459,
+        "wall": 0.084522,
+        "instructions": 1062737014,
         "mode": "mono",
         "seed": 8
       },
       {
-        "wall": 0.085822,
-        "instructions": 1062479158,
+        "wall": 0.085137,
+        "instructions": 1062588674,
         "mode": "mono",
         "seed": 9
       },
       {
-        "wall": 0.084214,
-        "instructions": 1062290042,
+        "wall": 0.084646,
+        "instructions": 1063206478,
         "mode": "mono",
         "seed": 10
       },
       {
-        "wall": 0.084661,
-        "instructions": 1062081708,
+        "wall": 0.085059,
+        "instructions": 1062478379,
         "mode": "mono",
         "seed": 11
       },
       {
-        "wall": 0.084233,
-        "instructions": 1056693254,
+        "wall": 0.085006,
+        "instructions": 1064153827,
         "mode": "mono",
         "seed": 12
       },
       {
-        "wall": 0.084735,
-        "instructions": 1062951900,
+        "wall": 0.085074,
+        "instructions": 1062876419,
         "mode": "mono",
         "seed": 13
       },
       {
-        "wall": 0.083567,
-        "instructions": 1061933454,
+        "wall": 0.084168,
+        "instructions": 1061229633,
         "mode": "mono",
         "seed": 14
       },
       {
-        "wall": 0.084525,
-        "instructions": 1062636423,
+        "wall": 0.084534,
+        "instructions": 1063017625,
         "mode": "mono",
         "seed": 15
       },
       {
-        "wall": 0.08558,
-        "instructions": 1062114053,
+        "wall": 0.08515,
+        "instructions": 1063357818,
         "mode": "mono",
         "seed": 16
       },
       {
-        "wall": 0.085606,
-        "instructions": 1061984332,
+        "wall": 0.083967,
+        "instructions": 1063371140,
         "mode": "mono",
         "seed": 17
       },
       {
-        "wall": 0.085637,
-        "instructions": 1062268832,
+        "wall": 0.084863,
+        "instructions": 1063662006,
         "mode": "mono",
         "seed": 18
       },
       {
-        "wall": 0.086924,
-        "instructions": 1061588857,
+        "wall": 0.085269,
+        "instructions": 1057651093,
         "mode": "mono",
         "seed": 19
       },
       {
-        "wall": 0.08642,
-        "instructions": 1056698661,
+        "wall": 0.084695,
+        "instructions": 1063037425,
         "mode": "mono",
         "seed": 20
       },
       {
-        "wall": 0.08689,
-        "instructions": 1062419521,
+        "wall": 0.084982,
+        "instructions": 1062109580,
         "mode": "mono",
         "seed": 21
       }
     ],
     "metamethod_add": [
       {
-        "wall": 0.086708,
-        "instructions": 1323238471,
+        "wall": 0.082477,
+        "instructions": 1333333536,
         "mode": "mono",
         "seed": 1
       },
       {
-        "wall": 0.086414,
-        "instructions": 1331230959,
+        "wall": 0.085493,
+        "instructions": 1346553038,
         "mode": "mono",
         "seed": 2
       },
       {
-        "wall": 0.090249,
-        "instructions": 1323801836,
+        "wall": 0.083921,
+        "instructions": 1332254648,
         "mode": "mono",
         "seed": 3
       },
       {
-        "wall": 0.088657,
-        "instructions": 1338437388,
+        "wall": 0.086208,
+        "instructions": 1347323422,
         "mode": "mono",
         "seed": 4
       },
       {
-        "wall": 0.086415,
-        "instructions": 1318753369,
+        "wall": 0.083513,
+        "instructions": 1327451419,
         "mode": "mono",
         "seed": 5
       },
       {
-        "wall": 0.085823,
-        "instructions": 1324164292,
+        "wall": 0.082659,
+        "instructions": 1340116667,
         "mode": "mono",
         "seed": 6
       },
       {
-        "wall": 0.090436,
-        "instructions": 1318607547,
+        "wall": 0.085368,
+        "instructions": 1337692103,
         "mode": "mono",
         "seed": 7
       },
       {
-        "wall": 0.085727,
-        "instructions": 1323855209,
+        "wall": 0.083304,
+        "instructions": 1332444000,
         "mode": "mono",
         "seed": 8
       },
       {
-        "wall": 0.088816,
-        "instructions": 1337187087,
+        "wall": 0.086641,
+        "instructions": 1346458966,
         "mode": "mono",
         "seed": 9
       },
       {
-        "wall": 0.086669,
-        "instructions": 1317819244,
+        "wall": 0.082085,
+        "instructions": 1326131444,
         "mode": "mono",
         "seed": 10
       },
       {
-        "wall": 0.088378,
-        "instructions": 1344260413,
+        "wall": 0.083752,
+        "instructions": 1354830567,
         "mode": "mono",
         "seed": 11
       },
       {
-        "wall": 0.086287,
-        "instructions": 1331592745,
+        "wall": 0.083051,
+        "instructions": 1332746370,
         "mode": "mono",
         "seed": 12
       },
       {
-        "wall": 0.086564,
-        "instructions": 1330367344,
+        "wall": 0.085785,
+        "instructions": 1339866094,
         "mode": "mono",
         "seed": 13
       },
       {
-        "wall": 0.087847,
-        "instructions": 1317896540,
+        "wall": 0.081512,
+        "instructions": 1320119123,
         "mode": "mono",
         "seed": 14
       },
       {
-        "wall": 0.083611,
-        "instructions": 1324645659,
+        "wall": 0.082815,
+        "instructions": 1325675430,
         "mode": "mono",
         "seed": 15
       },
       {
-        "wall": 0.08388,
-        "instructions": 1323563220,
+        "wall": 0.083158,
+        "instructions": 1332778364,
         "mode": "mono",
         "seed": 16
       },
       {
-        "wall": 0.085669,
-        "instructions": 1324620977,
+        "wall": 0.083123,
+        "instructions": 1333683853,
         "mode": "mono",
         "seed": 17
       },
       {
-        "wall": 0.083865,
-        "instructions": 1317092332,
+        "wall": 0.085261,
+        "instructions": 1331895485,
         "mode": "mono",
         "seed": 18
       },
       {
-        "wall": 0.084914,
-        "instructions": 1317693165,
+        "wall": 0.081726,
+        "instructions": 1326930840,
         "mode": "mono",
         "seed": 19
       },
       {
-        "wall": 0.083543,
-        "instructions": 1324127095,
+        "wall": 0.083428,
+        "instructions": 1325674029,
         "mode": "mono",
         "seed": 20
       },
       {
-        "wall": 0.085057,
-        "instructions": 1333960237,
+        "wall": 0.084147,
+        "instructions": 1347107282,
         "mode": "mono",
         "seed": 21
       }
     ],
     "field_access": [
       {
-        "wall": 0.092562,
-        "instructions": 1633965700,
+        "wall": 0.093025,
+        "instructions": 1645259792,
         "mode": "mono",
         "seed": 1
       },
       {
-        "wall": 0.092994,
-        "instructions": 1640221736,
+        "wall": 0.095185,
+        "instructions": 1645125117,
         "mode": "mono",
         "seed": 2
       },
       {
-        "wall": 0.092782,
-        "instructions": 1638683293,
+        "wall": 0.096071,
+        "instructions": 1644647636,
         "mode": "mono",
         "seed": 3
       },
       {
-        "wall": 0.096101,
-        "instructions": 1711058370,
+        "wall": 0.09931,
+        "instructions": 1707868849,
         "mode": "mono",
         "seed": 4
       },
       {
-        "wall": 0.093838,
-        "instructions": 1639813539,
+        "wall": 0.096685,
+        "instructions": 1637169645,
         "mode": "mono",
         "seed": 5
       },
       {
-        "wall": 0.097373,
-        "instructions": 1710230053,
+        "wall": 0.1003,
+        "instructions": 1715646554,
         "mode": "mono",
         "seed": 6
       },
       {
-        "wall": 0.092887,
-        "instructions": 1639729658,
+        "wall": 0.096169,
+        "instructions": 1645701173,
         "mode": "mono",
         "seed": 7
       },
       {
-        "wall": 0.092789,
-        "instructions": 1640551055,
+        "wall": 0.095209,
+        "instructions": 1644587090,
         "mode": "mono",
         "seed": 8
       },
       {
-        "wall": 0.095928,
-        "instructions": 1710715038,
+        "wall": 0.099451,
+        "instructions": 1715869611,
         "mode": "mono",
         "seed": 9
       },
       {
-        "wall": 0.093253,
-        "instructions": 1639560153,
+        "wall": 0.096451,
+        "instructions": 1644926327,
         "mode": "mono",
         "seed": 10
       },
       {
-        "wall": 0.09314,
-        "instructions": 1641112826,
+        "wall": 0.096529,
+        "instructions": 1644449436,
         "mode": "mono",
         "seed": 11
       },
       {
-        "wall": 0.092692,
-        "instructions": 1639810057,
+        "wall": 0.093067,
+        "instructions": 1644799465,
         "mode": "mono",
         "seed": 12
       },
       {
-        "wall": 0.095881,
-        "instructions": 1710849366,
+        "wall": 0.096632,
+        "instructions": 1716123883,
         "mode": "mono",
         "seed": 13
       },
       {
-        "wall": 0.092765,
-        "instructions": 1639375941,
+        "wall": 0.092514,
+        "instructions": 1645122669,
         "mode": "mono",
         "seed": 14
       },
       {
-        "wall": 0.093498,
-        "instructions": 1640649345,
+        "wall": 0.096339,
+        "instructions": 1645529653,
         "mode": "mono",
         "seed": 15
       },
       {
-        "wall": 0.098038,
-        "instructions": 1710011609,
+        "wall": 0.098638,
+        "instructions": 1719363338,
         "mode": "mono",
         "seed": 16
       },
       {
-        "wall": 0.095321,
-        "instructions": 1639422915,
+        "wall": 0.093282,
+        "instructions": 1644030382,
         "mode": "mono",
         "seed": 17
       },
       {
-        "wall": 0.098023,
-        "instructions": 1710133571,
+        "wall": 0.098763,
+        "instructions": 1707869136,
         "mode": "mono",
         "seed": 18
       },
       {
-        "wall": 0.098105,
-        "instructions": 1710152751,
+        "wall": 0.099995,
+        "instructions": 1712476263,
         "mode": "mono",
         "seed": 19
       },
       {
-        "wall": 0.098189,
-        "instructions": 1702817901,
+        "wall": 0.099085,
+        "instructions": 1715405680,
         "mode": "mono",
         "seed": 20
       },
       {
-        "wall": 0.095582,
-        "instructions": 1632119290,
+        "wall": 0.095774,
+        "instructions": 1645244469,
         "mode": "mono",
         "seed": 21
       }
     ],
     "comparisons": [
       {
-        "wall": 0.822358,
-        "instructions": 12339702199,
+        "wall": 0.83524,
+        "instructions": 12340888230,
         "mode": "mono",
         "seed": 1
       },
       {
-        "wall": 0.826746,
-        "instructions": 12333070000,
+        "wall": 0.838759,
+        "instructions": 12340153388,
         "mode": "mono",
         "seed": 2
       },
       {
-        "wall": 0.84522,
-        "instructions": 12340144776,
+        "wall": 0.823401,
+        "instructions": 12333066017,
         "mode": "mono",
         "seed": 3
       },
       {
-        "wall": 0.836969,
-        "instructions": 12333070693,
+        "wall": 0.838174,
+        "instructions": 12339357234,
         "mode": "mono",
         "seed": 4
       },
       {
-        "wall": 0.828296,
-        "instructions": 12340549173,
+        "wall": 0.822663,
+        "instructions": 12340780894,
         "mode": "mono",
         "seed": 5
       },
       {
-        "wall": 0.832391,
-        "instructions": 12339676353,
+        "wall": 0.840261,
+        "instructions": 12340318619,
         "mode": "mono",
         "seed": 6
       },
       {
-        "wall": 0.844687,
-        "instructions": 12340104181,
+        "wall": 0.852194,
+        "instructions": 12339997429,
         "mode": "mono",
         "seed": 7
       },
       {
-        "wall": 0.837607,
-        "instructions": 12340250614,
+        "wall": 0.825015,
+        "instructions": 12339786928,
         "mode": "mono",
         "seed": 8
       },
       {
-        "wall": 0.836972,
-        "instructions": 12339678713,
+        "wall": 0.955893,
+        "instructions": 12339099440,
         "mode": "mono",
         "seed": 9
       },
       {
-        "wall": 0.848071,
-        "instructions": 12339298866,
+        "wall": 0.828634,
+        "instructions": 12339852946,
         "mode": "mono",
         "seed": 10
       },
       {
-        "wall": 0.854042,
-        "instructions": 12338168008,
+        "wall": 0.818789,
+        "instructions": 12340281784,
         "mode": "mono",
         "seed": 11
       },
       {
-        "wall": 0.842095,
-        "instructions": 12339185448,
+        "wall": 0.84177,
+        "instructions": 12339899539,
         "mode": "mono",
         "seed": 12
       },
       {
-        "wall": 0.850245,
-        "instructions": 12340689155,
+        "wall": 0.822644,
+        "instructions": 12340498210,
         "mode": "mono",
         "seed": 13
       },
       {
-        "wall": 0.841369,
-        "instructions": 12339833018,
+        "wall": 0.827371,
+        "instructions": 12340999726,
         "mode": "mono",
         "seed": 14
       },
       {
-        "wall": 0.831689,
-        "instructions": 12340504401,
+        "wall": 0.828422,
+        "instructions": 12337738244,
         "mode": "mono",
         "seed": 15
       },
       {
-        "wall": 0.835908,
-        "instructions": 12340473519,
+        "wall": 0.818544,
+        "instructions": 12340572520,
         "mode": "mono",
         "seed": 16
       },
       {
-        "wall": 0.829238,
-        "instructions": 12339733077,
+        "wall": 0.839056,
+        "instructions": 12338691299,
         "mode": "mono",
         "seed": 17
       },
       {
-        "wall": 0.827277,
-        "instructions": 12340244305,
+        "wall": 0.843951,
+        "instructions": 12340788413,
         "mode": "mono",
         "seed": 18
       },
       {
-        "wall": 0.829886,
-        "instructions": 12339307841,
+        "wall": 0.840458,
+        "instructions": 12338937888,
         "mode": "mono",
         "seed": 19
       },
       {
-        "wall": 0.84091,
-        "instructions": 12340014461,
+        "wall": 0.840711,
+        "instructions": 12340043100,
         "mode": "mono",
         "seed": 20
       },
       {
-        "wall": 0.831541,
-        "instructions": 12333069677,
+        "wall": 0.835455,
+        "instructions": 12340502842,
         "mode": "mono",
         "seed": 21
       }
     ],
     "metamethod_call_noalloc": [
       {
-        "wall": 0.015748,
-        "instructions": 297908814,
+        "wall": 0.015607,
+        "instructions": 306101176,
         "mode": "mono",
         "seed": 1
       },
       {
-        "wall": 0.015627,
-        "instructions": 297909217,
+        "wall": 0.016081,
+        "instructions": 306152745,
         "mode": "mono",
         "seed": 2
       },
       {
-        "wall": 0.016786,
-        "instructions": 304747074,
+        "wall": 0.015926,
+        "instructions": 298410400,
         "mode": "mono",
         "seed": 3
       },
       {
-        "wall": 0.015664,
-        "instructions": 306132879,
+        "wall": 0.016233,
+        "instructions": 305558457,
         "mode": "mono",
         "seed": 4
       },
       {
-        "wall": 0.015624,
-        "instructions": 305370201,
+        "wall": 0.015745,
+        "instructions": 307806205,
         "mode": "mono",
         "seed": 5
       },
       {
-        "wall": 0.016475,
-        "instructions": 305267143,
+        "wall": 0.015801,
+        "instructions": 306266521,
         "mode": "mono",
         "seed": 6
       },
       {
-        "wall": 0.015926,
-        "instructions": 306744769,
+        "wall": 0.015744,
+        "instructions": 298411319,
         "mode": "mono",
         "seed": 7
       },
       {
-        "wall": 0.015768,
-        "instructions": 305466037,
+        "wall": 0.016235,
+        "instructions": 298411533,
         "mode": "mono",
         "seed": 8
       },
       {
-        "wall": 0.016352,
-        "instructions": 297908393,
+        "wall": 0.015639,
+        "instructions": 306702489,
         "mode": "mono",
         "seed": 9
       },
       {
-        "wall": 0.015956,
-        "instructions": 297910039,
+        "wall": 0.015699,
+        "instructions": 306443832,
         "mode": "mono",
         "seed": 10
       },
       {
-        "wall": 0.015737,
-        "instructions": 305741030,
+        "wall": 0.015782,
+        "instructions": 298411683,
         "mode": "mono",
         "seed": 11
       },
       {
-        "wall": 0.015952,
-        "instructions": 297909658,
+        "wall": 0.015644,
+        "instructions": 301729706,
         "mode": "mono",
         "seed": 12
       },
       {
-        "wall": 0.01617,
-        "instructions": 305806684,
+        "wall": 0.015739,
+        "instructions": 306006797,
         "mode": "mono",
         "seed": 13
       },
       {
-        "wall": 0.015782,
-        "instructions": 305570817,
+        "wall": 0.015612,
+        "instructions": 298409843,
         "mode": "mono",
         "seed": 14
       },
       {
-        "wall": 0.015689,
-        "instructions": 297908459,
+        "wall": 0.015823,
+        "instructions": 306781680,
         "mode": "mono",
         "seed": 15
       },
       {
-        "wall": 0.015743,
-        "instructions": 305669446,
+        "wall": 0.015848,
+        "instructions": 306802574,
         "mode": "mono",
         "seed": 16
       },
       {
-        "wall": 0.015743,
-        "instructions": 297912641,
+        "wall": 0.015577,
+        "instructions": 298415302,
         "mode": "mono",
         "seed": 17
       },
       {
-        "wall": 0.015787,
-        "instructions": 297910282,
+        "wall": 0.015721,
+        "instructions": 306300899,
         "mode": "mono",
         "seed": 18
       },
       {
-        "wall": 0.015919,
-        "instructions": 306435804,
+        "wall": 0.015837,
+        "instructions": 306181896,
         "mode": "mono",
         "seed": 19
       },
       {
-        "wall": 0.015662,
-        "instructions": 306483366,
+        "wall": 0.015795,
+        "instructions": 305876130,
         "mode": "mono",
         "seed": 20
       },
       {
-        "wall": 0.015746,
-        "instructions": 305310580,
+        "wall": 0.015766,
+        "instructions": 305415983,
         "mode": "mono",
         "seed": 21
       }
     ],
     "table_alloc_setmetatable": [
       {
-        "wall": 0.05358,
-        "instructions": 901152250,
+        "wall": 0.052907,
+        "instructions": 898447648,
         "mode": "mono",
         "seed": 1
       },
       {
-        "wall": 0.053701,
-        "instructions": 900580156,
+        "wall": 0.052721,
+        "instructions": 898628000,
         "mode": "mono",
         "seed": 2
       },
       {
-        "wall": 0.05285,
-        "instructions": 901284409,
+        "wall": 0.053089,
+        "instructions": 890729288,
         "mode": "mono",
         "seed": 3
       },
       {
-        "wall": 0.054993,
-        "instructions": 900330530,
+        "wall": 0.055064,
+        "instructions": 904485931,
         "mode": "mono",
         "seed": 4
       },
       {
-        "wall": 0.053208,
-        "instructions": 900954962,
+        "wall": 0.053252,
+        "instructions": 898991747,
         "mode": "mono",
         "seed": 5
       },
       {
-        "wall": 0.054599,
-        "instructions": 901019367,
+        "wall": 0.054016,
+        "instructions": 897511953,
         "mode": "mono",
         "seed": 6
       },
       {
-        "wall": 0.056721,
-        "instructions": 907737591,
+        "wall": 0.053572,
+        "instructions": 906511953,
         "mode": "mono",
         "seed": 7
       },
       {
-        "wall": 0.053432,
-        "instructions": 900939049,
+        "wall": 0.054341,
+        "instructions": 890731204,
         "mode": "mono",
         "seed": 8
       },
       {
-        "wall": 0.05665,
-        "instructions": 907399333,
+        "wall": 0.054336,
+        "instructions": 912837239,
         "mode": "mono",
         "seed": 9
       },
       {
-        "wall": 0.052223,
-        "instructions": 901104713,
+        "wall": 0.053717,
+        "instructions": 899038277,
         "mode": "mono",
         "seed": 10
       },
       {
-        "wall": 0.052225,
-        "instructions": 901495676,
+        "wall": 0.054413,
+        "instructions": 897584754,
         "mode": "mono",
         "seed": 11
       },
       {
-        "wall": 0.052984,
-        "instructions": 901534132,
+        "wall": 0.057127,
+        "instructions": 898060589,
         "mode": "mono",
         "seed": 12
       },
       {
-        "wall": 0.054858,
-        "instructions": 900329512,
+        "wall": 0.056155,
+        "instructions": 897801023,
         "mode": "mono",
         "seed": 13
       },
       {
-        "wall": 0.055277,
-        "instructions": 899894964,
+        "wall": 0.055833,
+        "instructions": 898444331,
         "mode": "mono",
         "seed": 14
       },
       {
-        "wall": 0.05476,
-        "instructions": 900408204,
+        "wall": 0.054745,
+        "instructions": 897843171,
         "mode": "mono",
         "seed": 15
       },
       {
-        "wall": 0.052468,
-        "instructions": 901133347,
+        "wall": 0.056234,
+        "instructions": 897372612,
         "mode": "mono",
         "seed": 16
       },
       {
-        "wall": 0.053189,
-        "instructions": 900443247,
+        "wall": 0.058014,
+        "instructions": 890734291,
         "mode": "mono",
         "seed": 17
       },
       {
-        "wall": 0.053173,
-        "instructions": 901500930,
+        "wall": 0.057068,
+        "instructions": 898103779,
         "mode": "mono",
         "seed": 18
       },
       {
-        "wall": 0.053533,
-        "instructions": 900865389,
+        "wall": 0.055226,
+        "instructions": 897279939,
         "mode": "mono",
         "seed": 19
       },
       {
-        "wall": 0.052529,
-        "instructions": 900850969,
+        "wall": 0.05493,
+        "instructions": 897652857,
         "mode": "mono",
         "seed": 20
       },
       {
-        "wall": 0.055219,
-        "instructions": 900327605,
+        "wall": 0.053577,
+        "instructions": 905179877,
         "mode": "mono",
         "seed": 21
       }
@@ -2326,129 +2326,129 @@
   "mode_evidence": {
     "int_arith": {
       "centers": {
-        "mono": 5120176182
+        "mono": 5120675321
       },
-      "split_rel_gap": 0.000850061701267535,
+      "split_rel_gap": 0.0016391452640760345,
       "n": 21
     },
     "global_arith": {
       "centers": {
-        "low": 12795022851.5,
-        "high": 14205772367
+        "low": 12795737947.0,
+        "high": 14208650228
       },
-      "split_rel_gap": 0.10980322445610431,
+      "split_rel_gap": 0.10983866955455339,
       "n": 21
     },
     "branch_loop": {
       "centers": {
-        "mono": 11051253174
+        "mono": 11051162812
       },
-      "split_rel_gap": 0.0002953787200079307,
+      "split_rel_gap": 0.000465154051904949,
       "n": 21
     },
     "lua_calls": {
       "centers": {
-        "mono": 2261552116
+        "mono": 2261778488
       },
-      "split_rel_gap": 0.0014690614450416995,
+      "split_rel_gap": 0.00220859966804628,
       "n": 21
     },
     "array_access": {
       "centers": {
-        "mono": 1240018473
+        "mono": 1239747314
       },
-      "split_rel_gap": 0.0036669484886797357,
+      "split_rel_gap": 0.002160392879118883,
       "n": 21
     },
     "hash_access": {
       "centers": {
-        "mono": 1582646281
+        "mono": 1582944392
       },
-      "split_rel_gap": 0.0015703538844271138,
+      "split_rel_gap": 0.00173955869446945,
       "n": 21
     },
     "temp_table_alloc": {
       "centers": {
-        "mono": 537473749
+        "mono": 538594776
       },
-      "split_rel_gap": 0.006014287893836761,
+      "split_rel_gap": 0.005370449907662096,
       "n": 21
     },
     "string_loop": {
       "centers": {
-        "mono": 1554256016
+        "mono": 1552323251
       },
-      "split_rel_gap": 0.0033481451122199,
+      "split_rel_gap": 0.003823962920421451,
       "n": 21
     },
     "coroutine_yield": {
       "centers": {
-        "mono": 1044025995
+        "mono": 1042182355
       },
-      "split_rel_gap": 0.006845473875942853,
+      "split_rel_gap": 0.006237796114045491,
       "n": 21
     },
     "dynamic_load": {
       "centers": {
-        "mono": 2336570451
+        "mono": 2336269962
       },
-      "split_rel_gap": 0.001316375783274962,
+      "split_rel_gap": 0.001016547626245772,
       "n": 21
     },
     "mixed_arith": {
       "centers": {
-        "mono": 5676915389
+        "mono": 5676402323
       },
-      "split_rel_gap": 0.0014592374842354481,
+      "split_rel_gap": 0.0009004234769449958,
       "n": 21
     },
     "float_arith": {
       "centers": {
-        "mono": 5323476379
+        "mono": 5313571133
       },
-      "split_rel_gap": 0.0008465779344311043,
+      "split_rel_gap": 0.0009442280398305731,
       "n": 21
     },
     "string_concat": {
       "centers": {
-        "mono": 1062081708
+        "mono": 1062840055
       },
-      "split_rel_gap": 0.004611654994048451,
+      "split_rel_gap": 0.0033834787518155574,
       "n": 21
     },
     "metamethod_add": {
       "centers": {
-        "mono": 1324127095
+        "mono": 1332778364
       },
-      "split_rel_gap": 0.004350614419626479,
+      "split_rel_gap": 0.005571895268365638,
       "n": 21
     },
     "field_access": {
       "centers": {
-        "mono": 1640551055
+        "mono": 1645259792
       },
-      "split_rel_gap": 0.03759953247723871,
+      "split_rel_gap": 0.037775798559268575,
       "n": 21
     },
     "comparisons": {
       "centers": {
-        "mono": 12339733077
+        "mono": 12340043100
       },
-      "split_rel_gap": 0.00041330461219955,
+      "split_rel_gap": 0.0003788374272512418,
       "n": 21
     },
     "metamethod_call_noalloc": {
       "centers": {
-        "mono": 305310580
+        "mono": 306006797
       },
-      "split_rel_gap": 0.022941064122216956,
+      "split_rel_gap": 0.012217149742624282,
       "n": 21
     },
     "table_alloc_setmetatable": {
       "centers": {
-        "mono": 900954962
+        "mono": 898060589
       },
-      "split_rel_gap": 0.006505800270687921,
+      "split_rel_gap": 0.007348597742488843,
       "n": 21
     }
   },
@@ -2589,7 +2589,7 @@
         "mono": 1241441966
       },
       "candidate_centers": {
-        "mono": 1240018473
+        "mono": 1239747314
       },
       "weights": {
         "baseline_low_frac": 0.0,
@@ -2597,8 +2597,8 @@
       },
       "wall_p25": {
         "baseline": 0.08161,
-        "candidate": 0.081052,
-        "shift": -0.0068373973777723675
+        "candidate": 0.082022,
+        "shift": 0.005048400931258371
       }
     },
     "branch_loop": {
@@ -2608,7 +2608,7 @@
         "mono": 11052245111
       },
       "candidate_centers": {
-        "mono": 11051253174
+        "mono": 11051162812
       },
       "weights": {
         "baseline_low_frac": 0.0,
@@ -2616,8 +2616,8 @@
       },
       "wall_p25": {
         "baseline": 0.868841,
-        "candidate": 0.842109,
-        "shift": -0.030767424649619412
+        "candidate": 0.863977,
+        "shift": -0.005598262512933874
       }
     },
     "comparisons": {
@@ -2627,7 +2627,7 @@
         "mono": 12341260488
       },
       "candidate_centers": {
-        "mono": 12339733077
+        "mono": 12340043100
       },
       "weights": {
         "baseline_low_frac": 0.0,
@@ -2635,8 +2635,8 @@
       },
       "wall_p25": {
         "baseline": 0.832039,
-        "candidate": 0.829886,
-        "shift": -0.002587619089970495
+        "candidate": 0.825015,
+        "shift": -0.008441911977683642
       }
     },
     "coroutine_yield": {
@@ -2646,7 +2646,7 @@
         "mono": 1026508416
       },
       "candidate_centers": {
-        "mono": 1044025995
+        "mono": 1042182355
       },
       "weights": {
         "baseline_low_frac": 0.0,
@@ -2654,8 +2654,8 @@
       },
       "wall_p25": {
         "baseline": 0.063052,
-        "candidate": 0.063099,
-        "shift": 0.0007454164816342918
+        "candidate": 0.063119,
+        "shift": 0.0010626149844572357
       }
     },
     "dynamic_load": {
@@ -2665,7 +2665,7 @@
         "mono": 2304079968
       },
       "candidate_centers": {
-        "mono": 2336570451
+        "mono": 2336269962
       },
       "weights": {
         "baseline_low_frac": 0.0,
@@ -2673,8 +2673,8 @@
       },
       "wall_p25": {
         "baseline": 0.198317,
-        "candidate": 0.193846,
-        "shift": -0.0225447137663438
+        "candidate": 0.197878,
+        "shift": -0.0022136276769010974
       }
     },
     "field_access": {
@@ -2684,7 +2684,7 @@
         "mono": 1632338958
       },
       "candidate_centers": {
-        "mono": 1640551055
+        "mono": 1645259792
       },
       "weights": {
         "baseline_low_frac": 0.0,
@@ -2692,8 +2692,8 @@
       },
       "wall_p25": {
         "baseline": 0.09294,
-        "candidate": 0.092887,
-        "shift": -0.0005702603830427964
+        "candidate": 0.095209,
+        "shift": 0.024413600172154156
       }
     },
     "float_arith": {
@@ -2703,7 +2703,7 @@
         "mono": 5326787325
       },
       "candidate_centers": {
-        "mono": 5323476379
+        "mono": 5313571133
       },
       "weights": {
         "baseline_low_frac": 0.0,
@@ -2711,8 +2711,8 @@
       },
       "wall_p25": {
         "baseline": 0.229014,
-        "candidate": 0.232213,
-        "shift": 0.013968578340188841
+        "candidate": 0.230001,
+        "shift": 0.004309780188110839
       }
     },
     "global_arith": {
@@ -2723,8 +2723,8 @@
         "high": 14109364253
       },
       "candidate_centers": {
-        "low": 12795022851.5,
-        "high": 14205772367
+        "low": 12795737947.0,
+        "high": 14208650228
       },
       "weights": {
         "baseline_low_frac": 0.47619047619047616,
@@ -2732,8 +2732,8 @@
       },
       "wall_p25": {
         "baseline": 0.84793,
-        "candidate": 0.7531,
-        "shift": -0.11183706202162912
+        "candidate": 0.758647,
+        "shift": -0.10529524842852594
       }
     },
     "hash_access": {
@@ -2743,7 +2743,7 @@
         "mono": 1584412470
       },
       "candidate_centers": {
-        "mono": 1582646281
+        "mono": 1582944392
       },
       "weights": {
         "baseline_low_frac": 0.0,
@@ -2751,8 +2751,8 @@
       },
       "wall_p25": {
         "baseline": 0.1095,
-        "candidate": 0.111178,
-        "shift": 0.015324200913241999
+        "candidate": 0.115279,
+        "shift": 0.052776255707762613
       }
     },
     "int_arith": {
@@ -2762,7 +2762,7 @@
         "mono": 5123872458
       },
       "candidate_centers": {
-        "mono": 5120176182
+        "mono": 5120675321
       },
       "weights": {
         "baseline_low_frac": 0.0,
@@ -2770,8 +2770,8 @@
       },
       "wall_p25": {
         "baseline": 0.229564,
-        "candidate": 0.23007,
-        "shift": 0.002204178355491307
+        "candidate": 0.22862,
+        "shift": -0.004112143018940254
       }
     },
     "lua_calls": {
@@ -2781,7 +2781,7 @@
         "mono": 2263740739
       },
       "candidate_centers": {
-        "mono": 2261552116
+        "mono": 2261778488
       },
       "weights": {
         "baseline_low_frac": 0.0,
@@ -2789,8 +2789,8 @@
       },
       "wall_p25": {
         "baseline": 0.120296,
-        "candidate": 0.120493,
-        "shift": 0.0016376271862738804
+        "candidate": 0.120761,
+        "shift": 0.0038654651858747854
       }
     },
     "metamethod_add": {
@@ -2800,7 +2800,7 @@
         "mono": 1320548936
       },
       "candidate_centers": {
-        "mono": 1324127095
+        "mono": 1332778364
       },
       "weights": {
         "baseline_low_frac": 0.0,
@@ -2808,8 +2808,8 @@
       },
       "wall_p25": {
         "baseline": 0.087194,
-        "candidate": 0.085057,
-        "shift": -0.02450856710324105
+        "candidate": 0.082815,
+        "shift": -0.05022134550542462
       }
     },
     "metamethod_call_noalloc": {
@@ -2819,7 +2819,7 @@
         "mono": 308105018
       },
       "candidate_centers": {
-        "mono": 305310580
+        "mono": 306006797
       },
       "weights": {
         "baseline_low_frac": 0.0,
@@ -2827,8 +2827,8 @@
       },
       "wall_p25": {
         "baseline": 0.015745,
-        "candidate": 0.015737,
-        "shift": -0.0005080978088280465
+        "candidate": 0.015699,
+        "shift": -0.002921562400761984
       }
     },
     "mixed_arith": {
@@ -2838,7 +2838,7 @@
         "mono": 5680317516
       },
       "candidate_centers": {
-        "mono": 5676915389
+        "mono": 5676402323
       },
       "weights": {
         "baseline_low_frac": 0.0,
@@ -2846,8 +2846,8 @@
       },
       "wall_p25": {
         "baseline": 0.24575,
-        "candidate": 0.250823,
-        "shift": 0.02064292980671423
+        "candidate": 0.246249,
+        "shift": 0.0020305188199389603
       }
     },
     "string_concat": {
@@ -2857,7 +2857,7 @@
         "mono": 1057204173
       },
       "candidate_centers": {
-        "mono": 1062081708
+        "mono": 1062840055
       },
       "weights": {
         "baseline_low_frac": 0.0,
@@ -2865,8 +2865,8 @@
       },
       "wall_p25": {
         "baseline": 0.083292,
-        "candidate": 0.084735,
-        "shift": 0.017324592998127067
+        "candidate": 0.084522,
+        "shift": 0.014767324592998066
       }
     },
     "string_loop": {
@@ -2876,7 +2876,7 @@
         "mono": 1541378201
       },
       "candidate_centers": {
-        "mono": 1554256016
+        "mono": 1552323251
       },
       "weights": {
         "baseline_low_frac": 0.0,
@@ -2884,8 +2884,8 @@
       },
       "wall_p25": {
         "baseline": 0.108107,
-        "candidate": 0.111387,
-        "shift": 0.030340310988187676
+        "candidate": 0.110139,
+        "shift": 0.01879619266097483
       }
     },
     "table_alloc_setmetatable": {
@@ -2895,7 +2895,7 @@
         "mono": 888350287
       },
       "candidate_centers": {
-        "mono": 900954962
+        "mono": 898060589
       },
       "weights": {
         "baseline_low_frac": 0.0,
@@ -2903,8 +2903,8 @@
       },
       "wall_p25": {
         "baseline": 0.053805,
-        "candidate": 0.052984,
-        "shift": -0.015258804943778374
+        "candidate": 0.053577,
+        "shift": -0.004237524393643695
       }
     },
     "temp_table_alloc": {
@@ -2914,7 +2914,7 @@
         "mono": 534232782
       },
       "candidate_centers": {
-        "mono": 537473749
+        "mono": 538594776
       },
       "weights": {
         "baseline_low_frac": 0.0,
@@ -2922,8 +2922,8 @@
       },
       "wall_p25": {
         "baseline": 0.032896,
-        "candidate": 0.035208,
-        "shift": 0.07028210116731522
+        "candidate": 0.033373,
+        "shift": 0.014500243190661425
       }
     }
   }

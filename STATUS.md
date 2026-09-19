@@ -36,11 +36,11 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **84/84** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.41x** |
+| Performance (geomean vs PUC) | **1.43x** |
 | Perf gate (paired-seed) | **OK** — 21 published seeds (1..21) |
-| api580 fixed-load footprint | **GREEN** — anchored gate 384 B < 400 B; no-XY diagnostic 436 B; Measured on the ReleaseFast binary `ad8846c6269ac582`; the ledger's top-level provenance is the Debug binary `cd96e9810d8a74b7` (dual-mode ledger, not one single-RF-binary artifact). |
+| api580 fixed-load footprint | **GREEN** — anchored gate 384 B < 400 B; no-XY diagnostic 436 B; Measured on the ReleaseFast binary `c7db91486fb6588a`; the ledger's top-level provenance is the Debug binary `7cd92e6b1139d745` (dual-mode ledger, not one single-RF-binary artifact). |
 
-Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.43x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
@@ -119,6 +119,20 @@ Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependen
   301/301/__name; fmt + git-diff-check clean. Финальный verdict —
   объявленной paired-seed clean-C сессией (seeds 1..21) + артефактным
   коммитом D (вердикт дописан в D; см. фазовую запись ниже).
+  Verdict clean-C сессии (2026-09-19T00:29:11Z, дописано артефактным
+  коммитом D): GREEN — RESULT OK, 18/18 workloads OK, worst per-seed
+  +2.375% (coroutine_yield[13]) < WARN 5%, wall-P25 envelope max +5.28%
+  (hash_access) < 10%, geomean diagnostic 1.43x (snapshot current.json);
+  binary sha256
+  c7db91486fb6588a674f7fd9ecac205adcd0705b6d9ac31e0a37dd3c9b935c2b
+  (полный sha в manifest row; determinism: plain `zig build` pre-C ==
+  post-C rebuild == session binary == post-session rebuild; commit C
+  message quotes wrapper-mode `./tools/zig build` sha
+  5ce1d1a107bb53414851436714414597e549720a68105ef1133212df8cbc9517 —
+  оба режима детерминированы порознь, loadable code + debug_info
+  byte-identical, различие только в ELF e_shoff и .debug_pubnames onward
+  (embedded cache-dir path metadata); все canonical current-* артефакты
+  и сессия измерены на c7db9148).
   Open-count 24→23 (TBC-parity BLOCKER и emergency-GC HIGH остаются
   открытыми).
 
@@ -8139,6 +8153,25 @@ perf-сессия; source_head сессии = C, source_dirty = clean; верд�
   manifest append-only; baselines byte-identical (baseline-approved/
   baseline-p15.37/core_baseline не тронуты). Полное canonical current-*
   перегенерирование на clean C / RF binary — артефактным коммитом D.
+  Verdict clean-C сессии (2026-09-19T00:29:11Z, дописано артефактным
+  коммитом D): GREEN — RESULT OK, 18/18 workloads OK, worst per-seed
+  +2.375% (coroutine_yield[13]) < WARN 5%; wall-P25 envelope max +5.28%
+  (hash_access) < 10%; geomean diagnostic 1.43x (snapshot current.json);
+  binary sha256
+  c7db91486fb6588a674f7fd9ecac205adcd0705b6d9ac31e0a37dd3c9b935c2b
+  (полный sha в manifest row; determinism: plain `zig build` pre-C ==
+  post-C rebuild == session binary == post-session rebuild; commit C
+  message quotes wrapper-mode `./tools/zig build` sha
+  5ce1d1a107bb53414851436714414597e549720a68105ef1133212df8cbc9517 —
+  оба режима детерминированы порознь, loadable code + debug_info
+  byte-identical, различие только в ELF e_shoff и .debug_pubnames onward
+  (embedded cache-dir path metadata); все canonical current-* артефакты
+  и сессия измерены на c7db9148). Manifest append-only, 23 строки — обе
+  probe-сессии review-8 на dirty worktree 4bf132e (2026-09-18T19:58Z,
+  2026-09-18T20:01Z, source_dirty=dirty, result OK) и финальная
+  clean-C сессия review-8 (ea00d1f, 2026-09-18T21:23:13Z) сохранены как
+  historical; pre-check probe фазы review-9 шёл только в отдельные
+  /tmp outputs и не касался canonical manifest.
 - **Manifest honesty caveat (review-8 history)**: manifest review-8
   содержит, помимо её финальной объявленной clean-C сессии
   (2026-09-18T21:23:13Z), ДВЕ дополнительные ПОЛНЫЕ 21-seed historical

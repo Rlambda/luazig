@@ -1,4 +1,4 @@
-> Last updated: 2026-09-19 (P16.50-review-10 correction opened)
+> Last updated: 2026-09-19 (P16.50-review-10 correction closed)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -45,7 +45,7 @@ Geomean замедления vs PUC Lua: **1.43x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [ ] **P16.50-review-10 correction**: сохранить двухпроходный
+- [x] **P16.50-review-10 correction (CLOSED by review-10)**: сохранить двухпроходный
   reserve-before-close контракт review-9, но убрать `abort_unwind_abandoned`:
   реальный повторный OOM в `runBytecodeInternal` сейчас оставляет suffix
   `CallFrame` припаркованным выше `boundary_depth`, а production-path не
@@ -57,6 +57,39 @@ Geomean замедления vs PUC Lua: **1.43x** (цель: 1.0x; run-dependen
   `tools/`: текущий `command -v zig` находит wrapper и бесконечно `exec`-ит
   себя. TBC-parity BLOCKER и emergency-GC HIGH остаются отдельными открытыми
   задачами и в correction scope не входят. Open-count 23→24.
+
+  ЗАКРЫТО фазой P16.50-review-10 (2026-09-19): BLOCKER 1 — close/unwind
+  сделан infallible по owner-схеме «color/age — каноническое состояние,
+  gc_gray/gc_old1 — ускоряющие worklists»: флаги `gc_gray_overflow`/
+  `gc_old1_overflow` (vm.zig:4626/4627); `closeBoxedUpvaluesReserved`
+  (vm.zig:27683) теперь `void` — commit при нехватке зарезервированной
+  capacity ставит overflow-флаг (gray vm.zig:27639, old1 vm.zig:27660) вместо
+  ошибки; GC обрабатывает overflow сканом `gc_objects`, не register windows:
+  `gcRequeueOverflowGray` по color (vm.zig:27955; hooks в `gcDrainGray`
+  vm.zig:27936, gcAdvance-propagate vm.zig:27311, enteratomic-probe
+  vm.zig:44743) и `gcDrainOverflowOld1` по age (vm.zig:27979; hooks на входе
+  `gcMinorCollection` vm.zig:28813 и `gcSweepYoungGeneration` vm.zig:28786);
+  `abort_unwind_abandoned`, его assert-exception и parked-комментарии
+  удалены (0 grep-вхождений); `closeBytecodeUpvaluesFrom` (vm.zig:9767) →
+  `void`, call sites de-try (continueBytecodeClose vm.zig:10154/10162/10197,
+  completeBytecodeExecFrame vm.zig:15605, unwindBytecodeExecFrames
+  vm.zig:15857, opTailcall vm.zig:20335, abort-unwind vm.zig:16084,
+  pcall/xpcall recovery vm.zig:23986/23999/24256) с сохранением in-flight
+  error/status исходной ошибки; 8 focused sticky-тестов (vm.zig:59005+):
+  sticky reserve rejection (incremental propagate + atomic boundary),
+  gen-minor old gray cell с overflow gray AND old1 (exactly-once
+  publication), три dispatcher seam (ordinary return / tailcall /
+  abort-unwind) без parked frame и без retry, end-to-end sticky-failing
+  resume + VM reuse после восстановления, N=8 termination drain;
+  negative-before: временный возврат abandon-семантики детерминированно
+  валит focused тест (bc_stack_idx != bc_stack_closed), restore → зелёные.
+  BLOCKER 2 — `tools/zig` PATH-итерация: кандидаты ищутся по элементам PATH,
+  wrapper сам и локальный `tools/zig-bin/zig` исключаются по file identity
+  (`-ef`) во ВСЕХ PATH layouts, локальный binary — bootstrap fallback только
+  после исчерпания внешних кандидатов; ноль внешних command-зависимостей
+  (dirname/cat заменены shell builtins, loud 127 failure); все 5 layout
+  cases проверены. Open-count 24→23 (TBC-parity BLOCKER и emergency-GC HIGH
+  остаются открытыми).
 
 - [x] **P16.50-review-9 correction (CLOSED by review-9)**: закрыть три
   оставшихся close-upvalue окна `cell.close` → fallible
@@ -8038,6 +8071,118 @@ source_dirty = clean; вердикт сессии — в Perf-блоке ниж�
   поведение (`true 10 20` в luazig и PUC) — ложный residual, checkTabArg
   metatable'd non-Tables для table.unpack не является расхождением; (d) pre-existing: big.lua both_fail (matrix), locals.lua
   GC-pacing dot diff, cstack.lua Debug native-stack exhaustion edge.
+
+### P16.50-review-10: infallible close cleanup, registry-overflow GC worklists, PATH-safe toolchain wrapper (2026-09-19)
+
+Фаза по owner-ledger correction item (открыт 33af65b после ledger-reopen
+review-9; open-count 23→24 — correction закрыт, TBC-parity BLOCKER и
+emergency-GC HIGH остаются открытыми; open-count 24→23). Коммиты: C =
+measured source (настоящий коммит; RF binary sha256
+ca90e3db800dc93bdcb71de6e30eedb8736e31d96768db80ab5f9e28e19c8362 —
+plain `zig build -Doptimize=ReleaseFast`, режим canonical-генераторов;
+determinism-rebuild верифицируется в D) → D = wrapper (полное canonical
+current-* перегенерирование на clean C + объявленная clean-C paired-seed
+perf-сессия; source_head сессии = C, source_dirty = clean; вердикт сессии —
+в Perf-блоке ниже, дописан артефактным коммитом D).
+
+- **Honesty о review-9 (owner-required)**: direct-retry focused-тест review-9
+  (диспетчерские seam-тесты с ручным повторным вызовом
+  `unwindBytecodeExecFrames`) НЕ доказывал production retry: production
+  abort-path в `runBytecodeInternal` не выполнял второй unwind, а parked
+  suffix выше `boundary_depth` был реальным состоянием (легитимизированным
+  `abort_unwind_abandoned` assert-exception). Исторический review-9
+  report/commit/entry не переписываются; настоящая фаза закрывает разрыв
+  фактическим infallible close/unwind.
+- **BLOCKER 1 — infallible close/unwind через registry-overflow worklists**:
+  owner-схема реализована без retry-циклов, preallocation с неограниченным
+  cap, `catch {}`, panic и новых parked/replay state: color/age объекта —
+  каноническое GC-состояние, `gc_gray`/`gc_old1` — ускоряющие worklists с
+  infallible overflow fallback. Флаги `gc_gray_overflow`/`gc_old1_overflow`
+  (vm.zig:4626/4627). `closeBoxedUpvaluesReserved` (vm.zig:27683) стала
+  `void`: двухпроходный reserve→close→commit контракт review-9 сохранён, но
+  commit при нехватке зарезервированной capacity не падает — ставит
+  overflow-флаг (gray append vm.zig:27639, old1 append vm.zig:27660):
+  canonical mark/age уже применены, работа завершается GC-дрейном. GC
+  обрабатывает overflow сканом `gc_objects` (registry), не register windows:
+  `gcRequeueOverflowGray` (vm.zig:27955) находит gray-объекты по color,
+  re-queue держит цикл в .propagate; hooks: `gcDrainGray` vm.zig:27936,
+  gcAdvance-propagate vm.zig:27311 (перед переходом в .atomic),
+  enteratomic-probe vm.zig:44743 (перед объявлением boundary);
+  `gcDrainOverflowOld1` (vm.zig:27979) находит OLD0-кандидатов по age;
+  hooks на входе `gcMinorCollection` vm.zig:28813 и
+  `gcSweepYoungGeneration` vm.zig:28786. Обработанный объект переводится в
+  обычное последующее состояние — scan не повторяет его бесконечно
+  (termination доказана N=8 тестом); строки сохраняют существующий
+  terminal-mark путь; emergency full-window scan и разыменование
+  потенциально stale register pointers не используются (открытый HIGH не
+  тронут). `abort_unwind_abandoned`, его assert-exception и комментарии про
+  «legitimately parked» error suffix удалены целиком (0 grep-вхождений в
+  дереве). `closeBytecodeUpvaluesFrom` (vm.zig:9767) → `void`; все call
+  sites de-try с сохранением in-flight error/status исходной ошибки:
+  continueBytecodeClose vm.zig:10154/10162/10197,
+  completeBytecodeExecFrame vm.zig:15605, unwindBytecodeExecFrames
+  vm.zig:15857, opTailcall vm.zig:20335, runBytecodeInternal abort-unwind
+  vm.zig:16084, pcall/xpcall recovery vm.zig:23986/23999/24256. Capacity
+  reserve меняет только capacity; commit состояния завершается даже при
+  allocator, отвергающем все запросы.
+- **BLOCKER 2 — tools/zig PATH-устойчивость**: system candidate search
+  итерирует элементы PATH по порядку и exec-ит первый внешний zig;
+  кандидаты, обозначающие тот же файл, что wrapper сам (`-ef $self`), и
+  локальный `tools/zig-bin/zig` (`-ef $local_zig`), исключаются по file
+  identity (device+inode, разрешает symlinks — в отличие от строкового
+  сравнения путей) во ВСЕХ PATH layouts; локальный binary — bootstrap
+  fallback только после исчерпания внешних кандидатов; ноль внешних
+  command-зависимостей (dirname/cat заменены shell builtins — case-паттерн
+  для self_dir, printf для диагностики); отсутствие zig — loud 127 failure
+  с инструкцией установки. Проверены все 5 layout cases: обычный PATH,
+  `tools/` первым, `tools/`+`tools/zig-bin/` перед system directories,
+  restricted PATH без system directories (bootstrap fallback), PATH без
+  zig вовсе (127) — во всех с внешним zig выбирается он, без hang/рекурсии.
+  Не hardcode `/usr/bin/zig`, `tools/zig-bin` не закоммичен, CI guard не
+  добавлялся.
+- **Тесты**: 8 новых focused тестов (vm.zig:59005+): (1) sticky
+  reject-everything reserve в incremental propagate — close завершается,
+  overflow-marked child переживает полный цикл, после обработки не остаётся
+  серого объекта без владельца work; (2) sticky reserve на atomic boundary
+  — drain внутри atomic steps; (3) gen-minor old gray cell: overflow gray
+  AND old1 одновременно, drain завершает publication exactly once,
+  следующий minor/major проходит registry invariants; (4)-(6) три реальных
+  dispatcher seam (ordinary return, bytecode tailcall, abort/error unwind)
+  под sticky allocator: немедленный возврат `call_frames.len ==
+  boundary_depth`, закрытые Cells, пустые boxed slots — без ручного
+  production-state repair и без второго вызова unwind; (7) end-to-end:
+  sticky-failing resume errors out с полностью unwound state, после
+  восстановления allocator тот же main state выполняет независимый
+  chunk/API call — старые frames/PC/open Cells не видны (VM reuse); (8)
+  N-child overflow drain terminates, каждый ребёнок выживает.
+  Negative-before: временный возврат abandon-семантики
+  (`abort_unwind_abandoned`-shape) детерминированно валит focused тест
+  (bc_stack_idx != bc_stack_closed — лишний frame/open Cell видим),
+  restore → зелёные.
+- **Батарея**: 288/288 unit (Debug+ReleaseFast, 0 leaks), matrix --testc
+  33 pass (zig_fail=0, big.lua both_fail pre-existing), smoke 84/84, c_api
+  test 0 FAIL + test-diff DIFF PASS, api580 GREEN (measured 384 < 400),
+  23 heavy testc-лейнов rc=0, crash contract 0/20, owner repros
+  301/301/__name, wrapper layouts (0.16.0 во всех внешних cases), grep
+  audits 0 hits (abort_unwind_abandoned/parked), fmt + git-diff-check
+  clean.
+- **Perf**: measured runtime затронут (GC worklist/close hot path) —
+  pre-check probe implementation-агента (полные paired seeds 1..21)
+  направлен в ОТДЕЛЬНЫЕ /tmp outputs (/tmp/opencode/r10_perf/), canonical
+  manifest не мутирован; результат probe: OK. ОДНА объявленная
+  paired-seed clean-C сессия (seeds 1..21, RUNS=21) на commit C
+  (source_head = C, source_dirty = clean) — verdict в
+  tools/perf/current-gate.json + current-gate-manifest.json (commit D);
+  manifest append-only; baselines byte-identical (baseline-approved/
+  baseline-p15.37/core_baseline не тронуты). Полное canonical current-*
+  перегенерирование на clean C / RF binary — артефактным коммитом D.
+- **Residuals (honest, для владельца)**:
+  - TBC-parity BLOCKER остаётся открытым (errored coroutine не должна
+    исполнять `<close>` до `coroutine.close`) — следующий semantic
+    advancement.
+  - emergency-GC HIGH остаётся открытым (stale register pointer
+    разыменование в full-window scan) — отдельная фаза; настоящая фаза его
+    не трогала (overflow drain сканирует gc_objects, не registers).
 
 ### P16.50-review-9: close-upvalue barrier transaction, sweep/teardown context split, system-first toolchain (2026-09-19)
 

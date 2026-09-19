@@ -1,31 +1,56 @@
 #!/bin/sh
 set -eu
 
-script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+# Resolve the wrapper's directory without external commands (dirname is not
+# visible when PATH excludes system directories), so restricted-PATH
+# bootstrap layouts still reach the fallback below.
+case $0 in
+  */*)
+    self_dir=${0%/*}
+    [ -n "$self_dir" ] || self_dir=/
+    ;;
+  *) self_dir=. ;;
+esac
+script_dir="$(CDPATH= cd -- "$self_dir" && pwd)"
 root_dir="$(CDPATH= cd -- "$script_dir/.." && pwd)"
 
 # In some sandboxed environments $HOME may be read-only; keep Zig caches in-repo by default.
 export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$root_dir/.zig-global-cache}"
 export ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-$root_dir/zig-cache}"
 
-# System toolchain first: the project targets the installed zig; a stale
-# tools/zig-bin checkout must not shadow it (P16.50-review-9 BLOCKER 2).
-if command -v zig >/dev/null 2>&1; then
-  exec zig "$@"
+self="$script_dir/zig"
+local_zig="$script_dir/zig-bin/zig"
+
+# System toolchain first: scan PATH elements in order and exec the first
+# external zig. Candidates denoting the wrapper itself or the local
+# tools/zig-bin/zig checkout are skipped so neither can shadow the system
+# zig or recurse into us (P16.50-review-10 BLOCKER 2). `-ef` (same device
+# and inode) is not strictly POSIX but is supported by GNU/BSD/dash test
+# and resolves through symlinks, unlike string path comparison.
+old_ifs=${IFS:-}
+IFS=:
+for dir in ${PATH:-}; do
+  [ -n "$dir" ] || dir=.
+  candidate="$dir/zig"
+  [ -x "$candidate" ] || continue
+  [ "$candidate" -ef "$self" ] && continue
+  [ "$candidate" -ef "$local_zig" ] && continue
+  IFS=$old_ifs
+  exec "$candidate" "$@"
+done
+IFS=$old_ifs
+
+# Bootstrap fallback: local toolchain only after external candidates are exhausted.
+if [ -x "$local_zig" ]; then
+  exec "$local_zig" "$@"
 fi
 
-# Bootstrap fallback: local toolchain only when the system zig is absent.
-if [ -x "$script_dir/zig-bin/zig" ]; then
-  exec "$script_dir/zig-bin/zig" "$@"
-fi
-
-cat >&2 <<'EOF'
-error: zig not found
-
-Install zig (Arch):
-  sudo pacman -S --needed zig
-
-Or place a local toolchain at:
-  tools/zig-bin/zig
-EOF
+printf '%s\n' \
+  'error: zig not found' \
+  '' \
+  'Install zig (Arch):' \
+  '  sudo pacman -S --needed zig' \
+  '' \
+  'Or place a local toolchain at:' \
+  '  tools/zig-bin/zig' >&2
 exit 127

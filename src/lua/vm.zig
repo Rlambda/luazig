@@ -603,6 +603,15 @@ fn gcIsBlack(marked: u8) bool {
     return (marked & BLACKBIT) != 0;
 }
 
+/// Check if object is gray (no color bit set — PUC `set2gray` clears all
+/// color bits). Gray is the canonical "owes traversal" state: an object
+/// painted gray but not sitting in `gc_gray` (an overflowed close-barrier
+/// commit, or a `gc_gray` append that failed mid-mark) is found by COLOR
+/// in the overflow drain.
+fn gcIsGray(marked: u8) bool {
+    return (marked & MASKCOLORS) == 0;
+}
+
 /// Check if object is dead: its white bits don't match currentwhite.
 /// PUC lgc.h:100: `isdead(g,v) = isdeadm(otherwhite(g), v->marked)`
 /// `otherwhite(g) = currentwhite ^ WHITEBITS` (the OTHER white bit).
@@ -625,6 +634,27 @@ fn gcSetGray(marked: *u8) void {
 /// Set object to black: clear white bits, set BLACKBIT (PUC lgc.c:59: `set2black`).
 fn gcSetBlack(marked: *u8) void {
     marked.* = (marked.* & ~WHITEBITS) | BLACKBIT;
+}
+
+/// P16.50-review-10 BLOCKER 1: tolerated-failure worklist reserve for the
+/// infallible close path. The reserve is an OPTIMIZATION (spare capacity
+/// lets the commits use appendAssumeCapacity); a rejection changes only
+/// capacity — the commits paint the canonical color/age and set the
+/// overflow flags instead, and the GC's overflow drain completes the work
+/// by scanning `gc_objects`. Unlike the review-8/9 reserve→mutate→commit
+/// barriers (where a failed reserve aborts BEFORE any mutation), the close
+/// mutation must proceed regardless, so the failure is consumed here as
+/// an explicit "no spare capacity" outcome, never propagated.
+fn gcTryReserveWorklist(
+    list: *std.ArrayListUnmanaged(GcObject),
+    alloc: std.mem.Allocator,
+    n: usize,
+) void {
+    list.ensureUnusedCapacity(alloc, n) catch {
+        // Tolerated: the overflow flags make the commits complete without
+        // capacity; the drain re-queues by canonical color/age later.
+        return;
+    };
 }
 
 /// PUC `ll_accessible` (loadlib.c): the no-op C function returned by
@@ -4380,7 +4410,7 @@ pub const Vm = struct {
     fn gcStateName(self: *const Vm) []const u8 {
         return switch (self.gc_state) {
             .pause => "pause",
-            .propagate => if (self.gc_gray.items.len == 0) "enteratomic" else "propagate",
+            .propagate => if (self.gc_gray.items.len == 0 and !self.gc_gray_overflow) "enteratomic" else "propagate",
             .atomic => "atomic",
             .sweep => "sweepallgc",
         };
@@ -4582,6 +4612,19 @@ pub const Vm = struct {
     /// PUC lgc.c uses a single gclist per object; we mirror that by keeping
     /// one list per role.
     gc_old1: std.ArrayListUnmanaged(GcObject) = .empty,
+    /// P16.50-review-10 BLOCKER 1: overflow fallback state for the
+    /// infallible close-barrier commit. `gc_gray`/`gc_old1` are
+    /// ACCELERATING worklists — the canonical state is the object's
+    /// color/age. A close-barrier commit whose capacity reserve failed
+    /// paints the canonical state (gray / G_OLD0) and sets the flag
+    /// instead of appending; the GC drains the overflow by scanning
+    /// `gc_objects` (gray objects by COLOR, OLD0 candidates by AGE) when
+    /// the normal worklist is exhausted. Also set when a fallible
+    /// `gc_gray` append fails after the object was painted gray, so an
+    /// aborted GC step never leaves gray-by-color work unknown to the
+    /// drain.
+    gc_gray_overflow: bool = false,
+    gc_old1_overflow: bool = false,
     gc_grayagain: std.ArrayListUnmanaged(GcObject) = .empty,
     gc_gen_threads: std.ArrayListUnmanaged(*Thread) = .empty,
     gc_gen_last_minor_visited: usize = 0,
@@ -9721,13 +9764,14 @@ pub const Vm = struct {
         self.errThread().err_line = -1;
     }
 
-    fn closeBytecodeUpvaluesFrom(self: *Vm, frame: *CallFrame, min_reg: u8) std.mem.Allocator.Error!void {
+    fn closeBytecodeUpvaluesFrom(self: *Vm, frame: *CallFrame, min_reg: u8) void {
         const boxed = self.activeBytecodeThread().bytecode_boxed[frame.frameBase() .. frame.frameBase() + frame.u.lua.frame_cap];
-        // P16.50-review-9 BLOCKER 1: reserve→close→commit (see
-        // closeBoxedUpvaluesReserved). The old shape closed the cell and
-        // then swallowed a barrier OOM (`catch {}`), leaving a black cell
-        // owning a white value the next sweep could free while reachable.
-        try self.closeBoxedUpvaluesReserved(boxed[min_reg..]);
+        // P16.50-review-10 BLOCKER 1: infallible close (see
+        // closeBoxedUpvaluesReserved). PUC luaF_closeupval never allocates
+        // during cleanup — a close that has begun must complete even under
+        // an allocator that rejects every request; the barrier bookkeeping
+        // falls back to the overflow flags, never to an error.
+        self.closeBoxedUpvaluesReserved(boxed[min_reg..]);
     }
 
     fn recordBytecodeCloseError(self: *Vm, state: *BytecodeCloseContinuation) DispatchError!void {
@@ -10107,7 +10151,7 @@ pub const Vm = struct {
             self.freeBytecodeClosePost(post);
             if (close_err) |err_value| self.restoreRuntimeErrorValue(err_value);
             if (exec_frames.getPtr(parent_index).hasOpenUpvalues())
-                try self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), 0);
+                self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), 0);
             self.popBytecodeExecFrame(owner_thread, exec_frames);
             return .propagate_error;
         }
@@ -10115,7 +10159,7 @@ pub const Vm = struct {
         switch (post) {
             .advance_instruction => {
                 if (exec_frames.getPtr(parent_index).hasOpenUpvalues())
-                    try self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), close_min_reg);
+                    self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), close_min_reg);
                 // PUC-faithful: the caller (OP_CLOSE handler) increments its
                 // local `ctx.pc` directly. We must NOT write to the frame's
                 // `pc` here — the dispatch loop's defer will sync `ctx.pc`
@@ -10150,7 +10194,7 @@ pub const Vm = struct {
             .unwind_frame => {
                 if (close_err) |err_value| self.restoreRuntimeErrorValue(err_value);
                 if (exec_frames.getPtr(parent_index).hasOpenUpvalues())
-                    try self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), 0);
+                    self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), 0);
                 self.popBytecodeExecFrame(owner_thread, exec_frames);
                 return .propagate_error;
             },
@@ -14779,7 +14823,7 @@ pub const Vm = struct {
                 }
 
                 if (frame.hasOpenUpvalues())
-                    try self.closeBytecodeUpvaluesFrom(frame, 0);
+                    self.closeBytecodeUpvaluesFrom(frame, 0);
                 self.popBytecodeExecFrame(owner, exec_frames);
             }
 
@@ -15552,12 +15596,13 @@ pub const Vm = struct {
         // and would be corrupted when a new frame reuses this stack space.
         // Double-close is safe: closeBytecodeUpvaluesFrom checks boxed[i] for
         // non-null and clears it after closing, so a second call is a no-op.
-        // P16.50-review-9 BLOCKER 1: the close is fallible (reserve-first);
-        // on failure the owned_ret errdefer above frees the slice exactly
-        // once — the caller-side pending was already consumed, so this
-        // completion is the slice's sole owner from entry.
+        // P16.50-review-10 BLOCKER 1: the close is infallible (overflow
+        // fallback — see closeBoxedUpvaluesReserved). The owned_ret errdefer
+        // above still frees the slice on any LATER failure in this
+        // completion — the caller-side pending was already consumed, so
+        // this completion is the slice's sole owner from entry.
         if (exec_frames.getPtr(child_idx).hasOpenUpvalues())
-            try self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(child_idx), 0);
+            self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(child_idx), 0);
         self.popBytecodeExecFrame(th, exec_frames);
 
         // P15.78: If the parent frame is a C-frame (pushed by runTestcScript's
@@ -15778,17 +15823,17 @@ pub const Vm = struct {
         self: *Vm,
         exec_frames: *FrameStack,
         boundary_depth: usize,
-    ) std.mem.Allocator.Error!void {
+    ) void {
         // Normal runtime/OOM propagation is handled by
         // continueBytecodeErrorUnwind, including all yielding __close
         // continuations. Direct yields and coroutine thread switches park the
         // authoritative Thread-owned suffix and bypass this defer. Reaching
         // this fallback therefore means frame construction/dispatch aborted
         // before a semantic unwind could start; release only the owned suffix.
-        // P16.50-review-9 BLOCKER 1: the upvalue close inside this abort
-        // unwind is now fallible (reserve-first, see
-        // closeBoxedUpvaluesReserved). Only error.OutOfMemory can escape —
-        // every other operation here is infallible pointer surgery.
+        // P16.50-review-10 BLOCKER 1: the upvalue close inside this abort
+        // unwind is INFALLIBLE (closeBoxedUpvaluesReserved's overflow
+        // fallback) — the suffix is always fully released, exactly once,
+        // with no parked-error residual and no retry.
         while (exec_frames.len() > boundary_depth) {
             const frame = exec_frames.getPtr(exec_frames.len() - 1);
             // PUC precover: a C-frame with CIST_YPCALL is a recovery barrier.
@@ -15809,7 +15854,7 @@ pub const Vm = struct {
                 self.detachTbcRegion(self.activeBytecodeThread(), frame.tbc_chain_base);
             }
             if (!frame.isC() and frame.hasOpenUpvalues())
-                try self.closeBytecodeUpvaluesFrom(frame, 0);
+                self.closeBytecodeUpvaluesFrom(frame, 0);
             self.popBytecodeExecFrame(self.activeBytecodeThread(), exec_frames);
         }
     }
@@ -15968,16 +16013,6 @@ pub const Vm = struct {
         }
 
         var yielded_in_place = false;
-        // P16.50-review-9 BLOCKER 1: set by the abort-unwind errdefer below
-        // when the fallible close reserve fails — the owned suffix stays
-        // parked above boundary_depth with its cells OPEN (GC-safe: the
-        // stack slot remains the authoritative storage). This is the
-        // error-exit analogue of a suspension, not stale re-execution state:
-        // the thread is exiting with error.OutOfMemory and never re-enters
-        // dispatch on these frames (a dead thread cannot resume; the host
-        // boundary surfaces the error; coroutine.close's forced close
-        // re-drives the parked frames).
-        var abort_unwind_abandoned = false;
         // Register the invariant first so the error-unwind defer runs before
         // it (defer execution is LIFO). A direct bytecode yield deliberately
         // leaves the suffix resident in the thread instead of unwinding it.
@@ -15995,11 +16030,7 @@ pub const Vm = struct {
                 // above boundary_depth) to catch stack corruption where Lua
                 // frames are left above a C-frame.
                 (exec_frames.len() > boundary_depth and
-                    exec_frames.getConstPtr(exec_frames.len() - 1).isC()) or
-                // P16.50-review-9: an OOM-abandoned abort unwind (see
-                // abort_unwind_abandoned above) legitimately parks the
-                // suffix above boundary_depth on an error exit.
-                abort_unwind_abandoned,
+                    exec_frames.getConstPtr(exec_frames.len() - 1).isC()),
         );
         // P15.70: When bytecode_inplace_suspended is true (set by a C-frame
         // with testc_state during callk/yieldk/pcallk/yield, or by
@@ -16044,25 +16075,13 @@ pub const Vm = struct {
             const is_suspension_owner = exec_thread.bytecode_inplace_suspended and
                 (boundary_depth == 0 or boundary_depth == exec_thread.bytecode_resume_boundary or has_testc_cframes_above);
             if (!is_suspension_owner) {
-                // P16.50-review-9 BLOCKER 1: the abort unwind's upvalue
-                // close is now fallible (reserve-first). A Zig errdefer
-                // cannot propagate a second error, and the owned suffix
-                // MUST still be released — swallow the close OOM with the
-                // reserve-first contract's failure semantics: on REAL OOM
-                // the cells stay OPEN (GC-safe: the stack slot stays the
-                // authoritative storage, no black-cell/white-value break)
-                // and whichever protected boundary owns the semantic
-                // unwind retries the close with the error in flight. The
-                // only possible error is error.OutOfMemory; under the
-                // testc adapter (memerr.lua arming) infraAlloc reserves
-                // are uncounted, so this is reachable only under a real
-                // allocator failure.
-                self.unwindBytecodeExecFrames(exec_frames, boundary_depth) catch {
-                    abort_unwind_abandoned = true;
-                    if (stdio.activeEnviron().containsConstant("LUAZIG_TRACE_OOM")) {
-                        std.debug.print("luazig oom: runBytecodeInternal abort-unwind close reserve failed; cells left open\n", .{});
-                    }
-                };
+                // P16.50-review-10 BLOCKER 1: the abort unwind's upvalue
+                // close is infallible (overflow fallback — see
+                // closeBoxedUpvaluesReserved): the owned suffix is always
+                // fully released here, exactly once, with no parked-error
+                // residual. The thread never re-enters dispatch on these
+                // frames; the host boundary surfaces the original error.
+                self.unwindBytecodeExecFrames(exec_frames, boundary_depth);
             }
         };
 
@@ -20309,10 +20328,11 @@ pub const Vm = struct {
                 }
 
                 // 1. Close all boxed upvalues (derived locally, P16.19 T3).
-                // P16.50-review-9 BLOCKER 1: reserve→close→commit (see
-                // closeBoxedUpvaluesReserved) — the old inline loop closed
-                // the cell and then swallowed a barrier OOM (`catch {}`).
-                try self.closeBoxedUpvaluesReserved(ctx.th.bytecode_boxed[ctx.base .. ctx.base + ctx.frame_cap]);
+                // P16.50-review-10 BLOCKER 1: infallible close (overflow
+                // fallback — see closeBoxedUpvaluesReserved) — the old
+                // inline loop closed the cell and then swallowed a barrier
+                // OOM (`catch {}`).
+                self.closeBoxedUpvaluesReserved(ctx.th.bytecode_boxed[ctx.base .. ctx.base + ctx.frame_cap]);
 
                 // 2. Grow frame if needed.
                 const new_max = new_proto.maxstacksize;
@@ -20646,9 +20666,11 @@ pub const Vm = struct {
         // (opReturn0/1 fast arms use the same contract).
         if (tail_fast_complete) {
             // P16.50-review-9 BLOCKER 1: completeBytecodeExecFrame owns the
-            // slice from entry (owned_ret errdefer armed before the fallible
-            // close) — borrowed scratch is skipped, infraAlloc'd blocks pass
-            // through — so a close-reserve failure needs no call-site free.
+            // slice from entry (owned_ret errdefer armed at completion
+            // entry) — borrowed scratch is skipped, infraAlloc'd blocks pass
+            // through — so any later failure needs no call-site free. (The
+            // close itself is infallible since review-10 — overflow
+            // fallback.)
             if (try self.completeBytecodeExecFrame(ctx.exec_frames, ctx.boundary_depth, ret)) |final|
                 return .{ .return_results = final };
             return .continue_frame_loop;
@@ -23957,14 +23979,11 @@ pub const Vm = struct {
                         // normal error path precover already closed at this
                         // boundary (empty-region no-op here).
                         if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_pcall_ef, idx);
-                        // P16.50-review-9 BLOCKER 1: a close failure during
-                        // recovery escapes the protected call itself (PUC
-                        // luaD_pcall → luaD_closeprotected: the recovery
-                        // cannot swallow a second error). The OOM state is
-                        // already set; remaining frames stay for the next
-                        // protected boundary's semantic unwind. Only
-                        // error.OutOfMemory can escape here.
-                        self.unwindBytecodeExecFrames(&th_pcall.call_frames, saved_frame_count) catch return error.OutOfMemory;
+                        // P16.50-review-10 BLOCKER 1: the unwind close is
+                        // infallible (overflow fallback) — the frame suffix
+                        // is fully released here; the in-flight OOM error
+                        // is preserved and surfaces the protected call.
+                        self.unwindBytecodeExecFrames(&th_pcall.call_frames, saved_frame_count);
                         th_pcall.bytecode_stack_top = saved_bc_stack_top;
                         rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
                         return try self.ownedPcallFail();
@@ -23973,15 +23992,11 @@ pub const Vm = struct {
                         // P16.31 Cut 3: pcall recovery-boundary close — see
                         // the OOM arm above.
                         if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_pcall_ef, idx);
-                        // P16.50-review-9 BLOCKER 1: an unwind close OOM
-                        // replaces the in-flight error and escapes the
-                        // protected call (both are real allocator failures
-                        // — a RuntimeError/OOM double failure; see the
-                        // review-9 report residual note).
-                        self.unwindBytecodeExecFrames(&th_pcall.call_frames, saved_frame_count) catch {
-                            self.setOutOfMemoryError();
-                            return error.OutOfMemory;
-                        };
+                        // P16.50-review-10 BLOCKER 1: the unwind close is
+                        // infallible (overflow fallback) — the frame suffix
+                        // is fully released; the in-flight runtime error is
+                        // preserved and surfaces the protected call.
+                        self.unwindBytecodeExecFrames(&th_pcall.call_frames, saved_frame_count);
                         th_pcall.bytecode_stack_top = saved_bc_stack_top;
                         rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
                         return try self.ownedPcallFail();
@@ -24234,15 +24249,11 @@ pub const Vm = struct {
                         if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_xpcall_cf, idx);
                         // PUC luaD_pcall: L->ci = old_ci; restore stack
                         // pointer and unwind call frames.
-                        // P16.50-review-9 BLOCKER 1: an unwind close OOM
-                        // escapes the protected call (PUC luaD_pcall: a
-                        // recovery failure is not swallowable) and replaces
-                        // the in-flight error (double real-OOM residual —
-                        // see the review-9 report).
-                        self.unwindBytecodeExecFrames(&th_xpcall.call_frames, saved_frame_count) catch {
-                            self.setOutOfMemoryError();
-                            return error.OutOfMemory;
-                        };
+                        // P16.50-review-10 BLOCKER 1: the unwind close is
+                        // infallible (overflow fallback) — the frame suffix
+                        // is fully released; the in-flight error is
+                        // preserved and surfaces the protected call.
+                        self.unwindBytecodeExecFrames(&th_xpcall.call_frames, saved_frame_count);
                         th_xpcall.bytecode_stack_top = saved_bc_stack_top;
                         return try self.ownedPcallFail();
                     },
@@ -26345,7 +26356,18 @@ pub const Vm = struct {
             if (assume) {
                 self.gc_gray.appendAssumeCapacity(obj);
             } else {
-                try self.gc_gray.append(self.infraAlloc(), obj);
+                self.gc_gray.append(self.infraAlloc(), obj) catch |e| {
+                    // P16.50-review-10 BLOCKER 1: the object is already
+                    // painted gray (canonical state) — the append is an
+                    // accelerator only. Record the overflow instead of
+                    // propagating: the drain re-queues gray-by-color
+                    // objects from gc_objects when gc_gray empties, so an
+                    // aborted mark step never loses the work. The caller
+                    // still sees the OOM (the GC step aborts), but the
+                    // next cycle recovers without a full re-mark.
+                    self.gc_gray_overflow = true;
+                    return e;
+                };
             }
         }
     }
@@ -26399,9 +26421,11 @@ pub const Vm = struct {
     // │ gcForwardBarrierCell        │ N/A      │ closure→cell fwd    │ gc_old1(gen)│ marks cell.get     │
     // │ gcStoreCellValue            │ open     │ stack write+noop   │ NONE         │ no (stack author.) │
     // │ gcStoreCellValue            │ closed   │ value write+fwd barr│ NONE        │ via barrier        │
-    // │ closeBoxedUpvaluesReserved  │ open→cld │ reserve→close→     │ gc_gray/    │ YES (commit)       │
-    // │                             │          │ commit (nw2black +  │ gc_old1(gen)│                    │
-    // │                             │          │ barrier, reserved)  │              │                    │
+    // │ closeBoxedUpvaluesReserved  │ open→cld │ plan→(tolerated     │ gc_gray/    │ YES (commit)       │
+    // │                             │          │ reserve)→close→     │ gc_old1(gen)│                    │
+    // │                             │          │ commit (nw2black +  │ or OVERFLOW  │                    │
+    // │                             │          │ barrier, overflow-  │ flags (drain │                   │
+    // │                             │          │ aware, infallible)  │ re-queues)  │                    │
     // │ closeThreadOpenUpvalues     │ open→cld │ sweep: nw2black+   │ NONE         │ no (sweep arm)     │
     // │                             │          │ makewhite (no alloc)│              │                    │
     // │                             │ open→cld │ teardown: close only│ NONE        │ no (values dangle) │
@@ -27278,6 +27302,15 @@ pub const Vm = struct {
                 .pause => unreachable,
                 .propagate => {
                     if (!try self.gcPropagateOne()) {
+                        // P16.50-review-10 BLOCKER 1: gc_gray exhausted —
+                        // consume the gray overflow (close-barrier commits
+                        // or failed appends under a rejecting allocator)
+                        // before declaring the mark phase done. Re-queued
+                        // objects keep the cycle in .propagate; a completed
+                        // pass with no gray-by-color work advances.
+                        if (self.gc_gray_overflow and try self.gcRequeueOverflowGray()) {
+                            break;
+                        }
                         self.gc_state = .atomic;
                     }
                 },
@@ -27545,46 +27578,109 @@ pub const Vm = struct {
         return .{};
     }
 
-    /// Infallible close-barrier commit — the matching bulk reserve covered
-    /// every list slot the plan touches (appendAssumeCapacity contract).
-    /// Runs AFTER cell.close; the caller performs the PUC nw2black color
-    /// fix (luaF_closeupval lfunc.c:206) around it. The cell itself is not
-    /// touched: every plan arm acts on the copied VALUE only.
+    /// Infallible close-barrier commit (P16.50-review-10 BLOCKER 1: the
+    /// close mutation must complete even under an allocator that rejects
+    /// every request). Runs AFTER cell.close; the caller performs the PUC
+    /// nw2black color fix (luaF_closeupval lfunc.c:206) around it. The
+    /// cell itself is not touched: every plan arm acts on the copied VALUE
+    /// only. Color/age are canonical — a commit without spare worklist
+    /// capacity paints the canonical state and sets the matching overflow
+    /// flag; the GC's overflow drain re-queues the child by color/age when
+    /// the normal worklist is exhausted.
     pub fn gcCommitCloseBarrierCell(self: *Vm, value: Value, plan: CellClosePlan) void {
         if (plan.gen_mark) {
             const child_obj = GcObject.fromValue(value).?;
-            self.gcQueueScanObjectAssume(child_obj);
+            self.gcQueueScanObjectCloseCommit(child_obj);
             if (plan.gen_promote) {
                 gcPtr(child_obj).age.* = .old0;
-                self.gc_old1.appendAssumeCapacity(child_obj);
+                self.gcLinkOld1CloseCommit(child_obj);
             }
             return;
         }
         if (plan.inc_mark) {
-            self.gcMarkValueAssume(value);
+            self.gcMarkValueCloseCommit(value);
         }
     }
 
-    /// P16.50-review-9 BLOCKER 1: allocation-safe upvalue close for a boxed
-    /// window (PUC luaF_closeupval, lfunc.c:197-210, with PUC's infallible
-    /// barrier made two-phase: reserve every barrier list slot BEFORE the
-    /// first cell.close, then close+commit each cell infallibly). A close
-    /// mutates the cell BEFORE the barrier runs, so a failure between the
-    /// two would leave a black cell owning a white value that the next
-    /// sweep frees while still reachable — the exact hazard the
-    /// reserve→mutate→commit protocol exists to prevent. The old shape
-    /// (`cell.close` then a swallowed `gcWriteBarrierCell(...) catch {}`)
-    /// had precisely that window.
+    /// Infallible overflow-aware reallymarkobject for a close-barrier
+    /// child (PUC lgc.c reallymarkobject). The child is painted gray (or
+    /// black-terminal for strings — no outgoing edges) unconditionally;
+    /// the `gc_gray` append is an accelerator only: without spare capacity
+    /// the commit sets `gc_gray_overflow` and the drain re-queues the
+    /// child by color. Never called with a `.cell` — `GcObject.fromValue`
+    /// cannot produce one (cells are not first-class Values).
+    fn gcQueueScanObjectCloseCommit(self: *Vm, obj: GcObject) void {
+        std.debug.assert(obj != .cell);
+        // Registry-validity skip — same rationale as gcQueueScanObjectImpl:
+        // a stale pointer to a freed object must not be marked.
+        {
+            const p = gcPtr(obj);
+            const idx = p.index.*;
+            if (idx >= self.gc_objects.items.len or
+                !std.meta.eql(self.gc_objects.items[idx], obj))
+            {
+                return;
+            }
+        }
+        const p = gcPtr(obj);
+        // PUC reallymarkobject: GCmarked += objsize(o).
+        if (self.gc_gen_phase == .major) {
+            self.gc_gen_marked_kb += @as(f64, @floatFromInt(gcObjectBytes(obj))) / 1024.0;
+        }
+        if (obj == .string) {
+            // Strings have no children — go straight to black (the
+            // existing terminal-mark path; never queued, never flagged).
+            gcSetBlack(p.marked);
+        } else {
+            gcSetGray(p.marked);
+            if (self.gc_gray.items.len < self.gc_gray.capacity) {
+                self.gc_gray.appendAssumeCapacity(obj);
+            } else {
+                self.gc_gray_overflow = true;
+            }
+        }
+    }
+
+    /// Infallible overflow-aware markvalue for the incremental close-barrier
+    /// arm — see gcQueueScanObjectCloseCommit.
+    fn gcMarkValueCloseCommit(self: *Vm, v: Value) void {
+        const obj = GcObject.fromValue(v) orelse return;
+        self.gcQueueScanObjectCloseCommit(obj);
+    }
+
+    /// Infallible overflow-aware G_OLD0 publication (PUC luaC_barrier_
+    /// setage + link into the old1 list). Age is canonical: without spare
+    /// `gc_old1` capacity the commit sets `gc_old1_overflow` and the drain
+    /// completes the publication by AGE (linking every OLD0-by-age object
+    /// missing from the list).
+    fn gcLinkOld1CloseCommit(self: *Vm, obj: GcObject) void {
+        if (self.gc_old1.items.len < self.gc_old1.capacity) {
+            self.gc_old1.appendAssumeCapacity(obj);
+        } else {
+            self.gc_old1_overflow = true;
+        }
+    }
+
+    /// P16.50-review-10 BLOCKER 1: INFALLIBLE upvalue close for a boxed
+    /// window (PUC luaF_closeupval, lfunc.c:197-210 — PUC's close barrier
+    /// never allocates, so no allocator failure may abort or park a close
+    /// that has begun). Two passes:
     ///
     /// Pass 1 (pure): plan each cell's close barrier and count the
     /// gc_gray/gc_old1 slots the commits may append (upper bound — a
     /// non-white value commits as a no-op, spare capacity is harmless).
+    ///
+    /// Reserve: an OPTIMIZATION only — capacity may grow, but the semantic
+    /// commit must not depend on it. A rejected reserve changes nothing
+    /// but capacity; the commits below complete regardless (conditional
+    /// appendAssumeCapacity, overflow flags otherwise).
+    ///
     /// Pass 2: close each cell (copy the stack value, seal bc_stack_idx),
-    /// apply the PUC nw2black color fix, and commit the barrier with
-    /// appendAssumeCapacity. Nothing between the reserve and the commits
-    /// allocates or triggers GC, so the pass-2 plans equal the pass-1
-    /// plans. Each closed cell's boxed slot is nulled as it closes.
-    fn closeBoxedUpvaluesReserved(self: *Vm, boxed: []?*Cell) std.mem.Allocator.Error!void {
+    /// apply the PUC nw2black color fix, and commit the barrier
+    /// overflow-aware. Nothing in pass 2 allocates or triggers GC, so the
+    /// pass-2 plans equal the pass-1 plans. Each closed cell's boxed slot
+    /// is nulled as it closes.
+    fn closeBoxedUpvaluesReserved(self: *Vm, boxed: []?*Cell) void {
         var gray_need: usize = 0;
         var old1_need: usize = 0;
         for (boxed) |maybe_cell| {
@@ -27597,8 +27693,8 @@ pub const Vm = struct {
             }
             if (plan.gen_promote) old1_need += 1;
         }
-        if (gray_need > 0) try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), gray_need);
-        if (old1_need > 0) try self.gc_old1.ensureUnusedCapacity(self.infraAlloc(), old1_need);
+        if (gray_need > 0) gcTryReserveWorklist(&self.gc_gray, self.infraAlloc(), gray_need);
+        if (old1_need > 0) gcTryReserveWorklist(&self.gc_old1, self.infraAlloc(), old1_need);
         for (boxed) |*slot| {
             const cell = slot.* orelse continue;
             const value = cell.get(self);
@@ -27607,7 +27703,7 @@ pub const Vm = struct {
             // PUC luaF_closeupval (lfunc.c:205-208): if (!iswhite(uv)) {
             //   nw2black(uv); luaC_barrier(L, uv, slot); }
             // Closed upvalues cannot be gray — fix color to black, then
-            // commit the (reserved) forward barrier on the copied value.
+            // commit the forward barrier on the copied value.
             if (!gcIsWhite(cell.gc_marked)) {
                 gcSetBlack(&cell.gc_marked);
                 self.gcCommitCloseBarrierCell(value, plan);
@@ -27829,6 +27925,73 @@ pub const Vm = struct {
 
     fn gcDrainGray(self: *Vm) DispatchError!void {
         while (try self.gcPropagateOne()) {}
+        // P16.50-review-10 BLOCKER 1: overflow fallback drain. Gray-by-
+        // color objects that never made it into gc_gray (close-barrier
+        // commits or a failed append under a rejecting allocator) are
+        // re-queued from the registry by COLOR and propagated here, so
+        // every drain point that empties gc_gray also empties the gray
+        // overflow. Loop: the re-queued objects' propagation may itself
+        // overflow-append (flag set again) — repeat until a full registry
+        // scan finds no gray-by-color work.
+        while (self.gc_gray_overflow) {
+            if (!try self.gcRequeueOverflowGray()) break;
+            while (try self.gcPropagateOne()) {}
+        }
+    }
+
+    /// P16.50-review-10 BLOCKER 1: one overflow re-queue pass. Scans the
+    /// full registry and re-appends every gray-by-COLOR object missing
+    /// from gc_gray (the canonical "owes traversal" state — see gcIsGray).
+    /// Returns true if any object was re-queued (the caller drains gc_gray
+    /// and repeats while the flag is set). A completed pass clears the
+    /// flag: every gray-by-color object is now in gc_gray. The append is
+    /// best-effort: if even the re-queue allocation fails, the flag stays
+    /// set and the NEXT drain retries (the work is never lost — color is
+    /// canonical). Duplicate appends are harmless: gcPropagateOne's
+    /// traversal is idempotent on already-marked children. Cells are
+    /// skipped: open cells are gray by design but never gc_gray work
+    /// items (PUC propagatemark has no LUA_VUPVAL case; remarkupvals
+    /// excludes them). Strings are never gray (terminal black on mark).
+    fn gcRequeueOverflowGray(self: *Vm) DispatchError!bool {
+        var requeued = false;
+        for (self.gc_objects.items) |obj| {
+            if (obj == .cell or obj == .string) continue;
+            const p = gcPtr(obj);
+            if (!gcIsGray(p.marked.*)) continue;
+            try self.gc_gray.append(self.infraAlloc(), obj);
+            requeued = true;
+        }
+        self.gc_gray_overflow = false;
+        return requeued;
+    }
+
+    /// P16.50-review-10 BLOCKER 1: OLD0 overflow drain. Completes the
+    /// G_OLD0 publication for close-barrier promotes that could not append
+    /// to gc_old1: scans the full registry by AGE and links every OLD0
+    /// object missing from the list (membership-checked — gcPromoteYoung-
+    /// Object's sweep arm may already have linked some, and its KB charge
+    /// is age-gated so a duplicate append would double-count). Runs at
+    /// generational minor-collection and sweep-generation entry, BEFORE
+    /// gcPromoteYoungObject's OLD0→OLD1 advance (which assumes list
+    /// membership). A completed pass clears the flag: every OLD0 object
+    /// is then linked. Best-effort appends: a failed append leaves the
+    /// flag set for the next drain.
+    fn gcDrainOverflowOld1(self: *Vm) DispatchError!void {
+        for (self.gc_objects.items) |obj| {
+            if (obj == .cell) continue;
+            const p = gcPtr(obj);
+            if (p.age.* != .old0) continue;
+            var listed = false;
+            for (self.gc_old1.items) |o| {
+                if (std.meta.eql(o, obj)) {
+                    listed = true;
+                    break;
+                }
+            }
+            if (listed) continue;
+            try self.gc_old1.append(self.infraAlloc(), obj);
+        }
+        self.gc_old1_overflow = false;
     }
 
     /// Drain the grayagain list: traverse each grayagain object and drain
@@ -28613,6 +28776,14 @@ pub const Vm = struct {
         const saved_state = self.gc_state;
         self.gc_state = .sweep;
         defer self.gc_state = saved_state;
+        // P16.50-review-10 BLOCKER 1: complete any OLD0 overflow publication
+        // BEFORE gcSweepYoungObjects — gcPromoteYoungObject's OLD0 arm
+        // advances OLD0→OLD1 assuming the object is already linked into
+        // gc_old1. Covers the same-cycle case: a finalizer or __close
+        // continuation promoted an object (overflowing gc_old1) after the
+        // minor-collection entry drain above. Flag-gated (see the entry
+        // drain): a clear flag means no unlinked OLD0 object exists.
+        if (self.gc_old1_overflow) try self.gcDrainOverflowOld1();
         self.gcClearDeadFrameRegisters();
         try self.gcSweepYoungObjects();
         self.gcCorrectOld1();
@@ -28630,6 +28801,16 @@ pub const Vm = struct {
         }
 
         self.gc_cycle_finalizer_epoch = self.gc_finalizer_epoch;
+        // P16.50-review-10 BLOCKER 1: complete any OLD0 overflow publication
+        // BEFORE the gc_old1 snapshot — an overflowed close-barrier promote
+        // (age already OLD0, list append rejected) must be in gc_old1 for
+        // the markold loop below and for sweepgen's OLD0→OLD1 advance.
+        // Flag-gated: the only OLD0 producers that can skip the list append
+        // are close-barrier commits (gcLinkOld1CloseCommit sets the flag);
+        // every other OLD0 path (gcForwardBarrierValue/Cell, the reserved
+        // commit arms) links at promote time by the reserve-first contract,
+        // so a clear flag means no unlinked OLD0 object exists — no scan.
+        if (self.gc_old1_overflow) try self.gcDrainOverflowOld1();
         // A6: single unified young list replaces the five per-type young lists.
         self.gc_young_objects_snapshot_len = self.gc_young_objects.items.len;
         self.gc_old1_snapshot_len = self.gc_old1.items.len;
@@ -44556,6 +44737,10 @@ pub const Vm = struct {
         if (std.mem.eql(u8, target, "enteratomic")) {
             while (self.gc_state == .propagate) {
                 if (!try self.gcPropagateOne()) {
+                    // Gray list empty — consume the gray overflow (P16.50-
+                    // review-10 BLOCKER 1) before declaring the boundary;
+                    // re-queued work keeps the loop propagating.
+                    if (self.gc_gray_overflow and try self.gcRequeueOverflowGray()) continue;
                     // Gray list empty — we're at the enteratomic boundary.
                     // Don't advance to atomic; stay in propagate with empty gray.
                     break;
@@ -58761,29 +58946,40 @@ test "P16.50-review-8 §3.2: exec-frame completion OOM edges — countdown sweep
 }
 
 // ===========================================================================
-// P16.50-review-9 BLOCKER 1: allocation-safe upvalue close.
+// P16.50-review-9 BLOCKER 1 / P16.50-review-10 BLOCKER 1: allocation-safe
+// upvalue close.
 //
 // PUC luaF_closeupval (lfunc.c:197-210) closes a cell then runs an
-// INFALLIBLE barrier. Our barrier is fallible (gc_gray/gc_old1 appends),
-// so the close is a reserve→close→commit transaction
-// (closeBoxedUpvaluesReserved): every barrier list slot is reserved BEFORE
-// the first cell.close, so a failure leaves the cell, its boxed slot, the
-// stack slot and both colors byte-exact — never a black cell owning a
+// INFALLIBLE barrier. Our barrier's list appends are fallible, so the
+// close is a plan→(tolerated reserve)→close→commit transaction
+// (closeBoxedUpvaluesReserved): the reserve is an OPTIMIZATION only —
+// a rejected reserve changes nothing but capacity. The commit is
+// INFALLIBLE: color/age are canonical, and a commit without spare
+// gc_gray/gc_old1 capacity sets the matching overflow flag instead of
+// appending; the GC's overflow drain (gcRequeueOverflowGray by COLOR,
+// gcDrainOverflowOld1 by AGE over gc_objects) completes the work when
+// the normal worklist is exhausted. A close that has begun ALWAYS
+// completes — never a parked frame suffix, never a black cell owning a
 // white value the next sweep would free while still reachable.
 //
 // Fixtures: p50r9MkOpenCell stages the production opClosure shape (open
 // cell published in the owning thread's boxed window). The tests cover:
-//   1. unit reserve-OOM byte-exactness + committed-barrier survival in
-//      incremental propagate and atomic, and generational minor (old gray
-//      cell: gray+old1 reserves, partial failure, exactly-one publication;
-//      young gray cell: mark-only arm);
-//   2. the three real dispatcher seams (ordinary-return
+//   1. sticky reserve rejection: the close completes anyway (overflow
+//      flags + canonical color/age), and the child survives a full
+//      incremental cycle (propagate and atomic) via the drain;
+//   2. generational minor: overflow gray + OLD0 paths preserve the
+//      child through a real minor collection (exactly-one publication),
+//      and the young-cell mark-only arm;
+//   3. the three real dispatcher seams (ordinary-return
 //      completeBytecodeExecFrame, opTailcall, abort unwind
-//      unwindBytecodeExecFrames) under injected OOM;
-//   3. the thread-sweep close (allocation-free, seals stack pointers) and
+//      unwindBytecodeExecFrames) under a sticky reject-everything
+//      allocator: the close completes at every seam with no parked
+//      suffix and no manual repair;
+//   4. the thread-sweep close (allocation-free, seals stack pointers) and
 //      the teardown close (no barrier — Values may dangle in drain order);
-//   4. end-to-end transport: a resume-time close OOM surfaces as a
-//      pcall-visible "not enough memory" error with consistent state.
+//   5. end-to-end: a sticky-failing resume errors out with the frames
+//      fully unwound and the cell closed; after allocator recovery the
+//      SAME VM runs an independent chunk with no stale state.
 // ===========================================================================
 
 /// P16.50-review-9 fixture: one OPEN upvalue cell published at `slot` of
@@ -58806,7 +59002,7 @@ fn p50r9MkOpenCell(vm: *Vm, th: *Thread, slot: usize) !*Cell {
     return cell;
 }
 
-test "P16.50-review-9 1: close reserve OOM is byte-exact; the committed barrier saves the child (incremental propagate)" {
+test "P16.50-review-10 1: sticky reserve rejection still closes; overflow drain saves the child (incremental propagate)" {
     const testing = std.testing;
     var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
@@ -58839,68 +59035,54 @@ test "P16.50-review-9 1: close reserve OOM is byte-exact; the committed barrier 
     // the inline markCell did not cover it — only the close barrier can.
     th.bytecode_stack[slot] = .{ .Table = child };
 
-    // Empty the gray list so the close's reserve demand is exactly one and
-    // the commit's append is observable (pending entries stay gray and
-    // sweep-alive — the review-8 Segment B technique).
+    // Zero the gray list's capacity so the close's reserve cannot be
+    // satisfied without an allocation (the review-8 Segment B technique).
     vm.gc_gray.deinit(testing.allocator);
     vm.gc_gray = .empty;
 
-    // gray_need = 1 (the child table), old1_need = 0: fail_index 0 fails
-    // the gray reserve between the two passes; fail_index 1 succeeds.
-    var saw_oom = false;
-    var saw_success = false;
-    var fail_idx: usize = 0;
-    while (fail_idx <= 1) : (fail_idx += 1) {
+    // P16.50-review-10 BLOCKER 1: sticky reject-everything allocator. The
+    // reserve is rejected, but the close MUST complete anyway: the commit
+    // paints the child gray (canonical) and sets gc_gray_overflow instead
+    // of appending. The old review-9 contract (reserve failure = byte-
+    // exact no-op with the cell left open) is gone — a begun close always
+    // finishes.
+    {
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
-            .fail_index = fail_idx,
-            .resize_fail_index = fail_idx,
+            .fail_index = 0,
+            .resize_fail_index = 0,
         });
         vm.alloc = failing.allocator();
-        const err = vm.closeBoxedUpvaluesReserved(th.bytecode_boxed[slot .. slot + 1]);
+        vm.closeBoxedUpvaluesReserved(th.bytecode_boxed[slot .. slot + 1]);
         vm.alloc = testing.allocator;
 
-        if (err) |_| {
-            try testing.expectEqual(@as(usize, 1), fail_idx);
-            saw_success = true;
-            // PUC luaF_closeupval: closed, black, barrier committed.
-            try testing.expectEqual(Cell.bc_stack_closed, cell.bc_stack_idx);
-            try testing.expect(cell.bc_stack_thread == null);
-            try testing.expect(th.bytecode_boxed[slot] == null);
-            try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
-            try testing.expect(gcIsBlack(cell.gc_marked));
-            try testing.expect(!gcIsWhite(child.gc_marked));
-            try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = child }));
-        } else |e| {
-            try testing.expect(e == error.OutOfMemory);
-            try testing.expectEqual(@as(usize, 0), fail_idx);
-            saw_oom = true;
-            // Byte-exact: the reserve failed before the first cell.close —
-            // cell, boxed slot, stack slot and both colors are exactly the
-            // pre-call state (the old shape had already closed the cell).
-            try testing.expectEqual(@as(u32, @intCast(slot)), cell.bc_stack_idx);
-            try testing.expect(cell.bc_stack_thread == th);
-            try testing.expect(th.bytecode_boxed[slot] == cell);
-            try testing.expect(std.meta.eql(th.bytecode_stack[slot], .{ .Table = child }));
-            try testing.expect(!gcIsWhite(cell.gc_marked) and !gcIsBlack(cell.gc_marked));
-            try testing.expect(gcIsWhite(child.gc_marked));
-            try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
-            try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
-        }
+        // PUC luaF_closeupval: closed, black, barrier committed — with the
+        // overflow fallback carrying the barrier bookkeeping.
+        try testing.expectEqual(Cell.bc_stack_closed, cell.bc_stack_idx);
+        try testing.expect(cell.bc_stack_thread == null);
+        try testing.expect(th.bytecode_boxed[slot] == null);
+        try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
+        try testing.expect(gcIsBlack(cell.gc_marked));
+        // Canonical color: the child owes traversal, recorded by the flag.
+        try testing.expect(gcIsGray(child.gc_marked));
+        try testing.expect(vm.gc_gray_overflow);
+        try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
+        try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
     }
-    try testing.expect(saw_oom and saw_success);
 
-    // Finish the cycle (atomic + sweep): the barrier-marked child survives.
-    // Under the old shape the reserve failure left the child white inside
-    // the snapshot and the sweep freed it while still reachable.
+    // Finish the cycle (propagate → atomic → sweep) with a healthy
+    // allocator: the propagate step's overflow drain re-queues the child
+    // by color, propagation blackens it, the sweep keeps it. The drain
+    // terminates (flag cleared, no gray-by-color work left).
     while (vm.gc_state != .pause) {
         _ = try vm.gcAdvance(1, false);
     }
+    try testing.expect(!vm.gc_gray_overflow);
     try testing.expect(p50IsRegistered(&vm, .{ .cell = cell }));
     try testing.expect(p50IsRegistered(&vm, .{ .table = child }));
     try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
 }
 
-test "P16.50-review-9 1: close reserve OOM is byte-exact at the atomic boundary" {
+test "P16.50-review-10 1: sticky reserve rejection at the atomic boundary; drain inside the atomic steps" {
     const testing = std.testing;
     var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
@@ -58926,45 +59108,33 @@ test "P16.50-review-9 1: close reserve OOM is byte-exact at the atomic boundary"
     vm.gc_gray.deinit(testing.allocator);
     vm.gc_gray = .empty;
 
-    var saw_oom = false;
-    var saw_success = false;
-    var fail_idx: usize = 0;
-    while (fail_idx <= 1) : (fail_idx += 1) {
+    {
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
-            .fail_index = fail_idx,
-            .resize_fail_index = fail_idx,
+            .fail_index = 0,
+            .resize_fail_index = 0,
         });
         vm.alloc = failing.allocator();
-        const err = vm.closeBoxedUpvaluesReserved(th.bytecode_boxed[slot .. slot + 1]);
+        vm.closeBoxedUpvaluesReserved(th.bytecode_boxed[slot .. slot + 1]);
         vm.alloc = testing.allocator;
 
-        if (err) |_| {
-            try testing.expectEqual(@as(usize, 1), fail_idx);
-            saw_success = true;
-            try testing.expectEqual(Cell.bc_stack_closed, cell.bc_stack_idx);
-            try testing.expect(th.bytecode_boxed[slot] == null);
-            try testing.expect(gcIsBlack(cell.gc_marked));
-            try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = child }));
-        } else |e| {
-            try testing.expect(e == error.OutOfMemory);
-            try testing.expectEqual(@as(usize, 0), fail_idx);
-            saw_oom = true;
-            try testing.expectEqual(@as(u32, @intCast(slot)), cell.bc_stack_idx);
-            try testing.expect(th.bytecode_boxed[slot] == cell);
-            try testing.expect(std.meta.eql(th.bytecode_stack[slot], .{ .Table = child }));
-            try testing.expect(gcIsWhite(child.gc_marked));
-            try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
-        }
+        try testing.expectEqual(Cell.bc_stack_closed, cell.bc_stack_idx);
+        try testing.expect(th.bytecode_boxed[slot] == null);
+        try testing.expect(gcIsBlack(cell.gc_marked));
+        try testing.expect(gcIsGray(child.gc_marked));
+        try testing.expect(vm.gc_gray_overflow);
+        try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
     }
-    try testing.expect(saw_oom and saw_success);
 
+    // The atomic phase's gcDrainGray call sites consume the overflow.
     while (vm.gc_state != .pause) {
         _ = try vm.gcAdvance(1, false);
     }
+    try testing.expect(!vm.gc_gray_overflow);
     try testing.expect(p50IsRegistered(&vm, .{ .table = child }));
+    try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
 }
 
-test "P16.50-review-9 2: gen-minor close — old gray cell reserves gray AND old1; partial failure byte-exact; exactly-one publication" {
+test "P16.50-review-10 2: gen-minor sticky close — old gray cell overflows gray AND old1; drain completes the publication exactly once" {
     const testing = std.testing;
     var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
@@ -58998,66 +59168,64 @@ test "P16.50-review-9 2: gen-minor close — old gray cell reserves gray AND old
     th.bytecode_stack[slot] = .{ .Table = child };
 
     // Force both reserves to allocate: retained list capacity would
-    // otherwise satisfy ensureUnusedCapacity without an allocation. The
-    // dropped gc_old1 linkage is safe in this fixture — every other
-    // object is old with old children, nothing young depends on markold.
+    // otherwise satisfy ensureUnusedCapacity without an allocation.
     vm.gc_gray.deinit(testing.allocator);
     vm.gc_gray = .empty;
     vm.gc_old1.deinit(testing.allocator);
     vm.gc_old1 = .empty;
 
-    // gray_need = 1, old1_need = 1 (old cell, young table child):
-    // fail 0 → the gray reserve fails; fail 1 → gray reserved, the old1
-    // reserve fails (the partial shape); fail 2 → success.
-    var saw_oom = false;
-    var saw_success = false;
-    var fail_idx: usize = 0;
-    while (fail_idx <= 2) : (fail_idx += 1) {
+    // P16.50-review-10 BLOCKER 1: sticky reject-everything allocator —
+    // BOTH reserves are rejected. The close completes anyway: the child
+    // is painted gray + aged G_OLD0 (canonical), with both overflow flags
+    // carrying the list publication.
+    {
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
-            .fail_index = fail_idx,
-            .resize_fail_index = fail_idx,
+            .fail_index = 0,
+            .resize_fail_index = 0,
         });
         vm.alloc = failing.allocator();
-        const err = vm.closeBoxedUpvaluesReserved(th.bytecode_boxed[slot .. slot + 1]);
+        vm.closeBoxedUpvaluesReserved(th.bytecode_boxed[slot .. slot + 1]);
         vm.alloc = testing.allocator;
 
-        if (err) |_| {
-            try testing.expectEqual(@as(usize, 2), fail_idx);
-            saw_success = true;
-            try testing.expectEqual(Cell.bc_stack_closed, cell.bc_stack_idx);
-            try testing.expect(th.bytecode_boxed[slot] == null);
-            try testing.expect(gcIsBlack(cell.gc_marked));
-            // Exactly-once publication: the child is queued for traversal
-            // once and linked into gc_old1 once, promoted to G_OLD0
-            // (PUC luaC_barrier_ setage for an old owner).
-            try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = child }));
-            try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child }));
-            try testing.expect(child.gc_age == .old0);
-        } else |e| {
-            try testing.expect(e == error.OutOfMemory);
-            try testing.expect(fail_idx < 2);
-            saw_oom = true;
-            // Byte-exact — including the partial shape (fail 1): the gray
-            // capacity was reserved but NOTHING was appended (the commit
-            // never ran), so both lists are still empty.
-            try testing.expectEqual(@as(u32, @intCast(slot)), cell.bc_stack_idx);
-            try testing.expect(cell.bc_stack_thread == th);
-            try testing.expect(th.bytecode_boxed[slot] == cell);
-            try testing.expect(std.meta.eql(th.bytecode_stack[slot], .{ .Table = child }));
-            try testing.expect(gcIsWhite(child.gc_marked));
-            try testing.expect(child.gc_age == .new);
-            try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
-            try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
-            try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
-        }
+        try testing.expectEqual(Cell.bc_stack_closed, cell.bc_stack_idx);
+        try testing.expect(cell.bc_stack_thread == null);
+        try testing.expect(th.bytecode_boxed[slot] == null);
+        try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
+        try testing.expect(gcIsBlack(cell.gc_marked));
+        // Canonical state: gray by color, OLD0 by age, flags set, lists
+        // untouched.
+        try testing.expect(gcIsGray(child.gc_marked));
+        try testing.expect(child.gc_age == .old0);
+        try testing.expect(vm.gc_gray_overflow);
+        try testing.expect(vm.gc_old1_overflow);
+        try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
+        try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
+        try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
     }
-    try testing.expect(saw_oom and saw_success);
 
-    // A real minor cycle keeps the child alive through the closed cell
-    // (the queued gray entry is drained by the minor's propagate).
+    // A real minor cycle with a healthy allocator: the entry OLD0 drain
+    // links the child into gc_old1 BEFORE the snapshot (exactly-once
+    // publication — the membership check skips nothing here), the gray
+    // overflow drain re-queues and propagates it, and sweepgen advances
+    // OLD0→OLD1 over the linked entry.
     try vm.gcMinorCollection();
+    try testing.expect(!vm.gc_gray_overflow);
+    try testing.expect(!vm.gc_old1_overflow);
     try testing.expect(p50IsRegistered(&vm, .{ .table = child }));
     try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child }));
+    try testing.expect(child.gc_age == .old1);
+    try testing.expect(gcIsBlack(child.gc_marked));
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+
+    // A second minor cycle: markold advances OLD1→OLD and re-traverses;
+    // the child leaves gc_old1 (the list holds only G_OLD1 objects — the
+    // normal PUC lifecycle) and stays alive with intact registry links.
+    try vm.gcMinorCollection();
+    try testing.expect(p50IsRegistered(&vm, .{ .table = child }));
+    try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_old1.items, .{ .table = child }));
+    try testing.expect(child.gc_age == .old);
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
 }
 
 test "P16.50-review-9 2: gen-minor close — young gray cell marks the value without promote; real minor survival" {
@@ -59092,7 +59260,7 @@ test "P16.50-review-9 2: gen-minor close — young gray cell marks the value wit
     try testing.expect(!plan.gen_promote);
     try testing.expect(!plan.inc_mark);
 
-    try vm.closeBoxedUpvaluesReserved(th.bytecode_boxed[slot .. slot + 1]);
+    vm.closeBoxedUpvaluesReserved(th.bytecode_boxed[slot .. slot + 1]);
     try testing.expectEqual(Cell.bc_stack_closed, cell.bc_stack_idx);
     try testing.expect(th.bytecode_boxed[slot] == null);
     try testing.expect(gcIsBlack(cell.gc_marked));
@@ -59201,7 +59369,7 @@ const P50r9NoResizeFailing = struct {
     }
 };
 
-test "P16.50-review-9 3: ordinary-return close OOM keeps the frame parked; retry closes and the barrier saves the child" {
+test "P16.50-review-10 3: sticky failure at the ordinary-return seam closes immediately; no parked frame, no retry" {
     const testing = std.testing;
     var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
@@ -59241,61 +59409,62 @@ test "P16.50-review-9 3: ordinary-return close OOM keeps the frame parked; retry
     };
     frames.inline_count = 1;
 
-    // OOM arm: the close reserve is the FIRST fallible operation of the
-    // return completion (decodeNresults/hasOpenUpvalues are pure). The
-    // errdefer frees the heap ret exactly once (leak-checked at deinit).
+    // P16.50-review-10 BLOCKER 1: sticky reject-everything allocator. The
+    // close (the first fallible operation of the return completion) is
+    // now INFALLIBLE — it completes via the overflow fallback regardless.
+    // Whatever the completion's LATER operations do (succeed or OOM on
+    // this allocator), the cell is closed and the boxed slot released the
+    // moment the close ran; the owned_ret errdefer still frees the heap
+    // ret exactly once on failure (leak-checked at deinit).
+    const ret = try testing.allocator.alloc(Value, 1);
+    ret[0] = .{ .Int = 5 };
+    var frames_after: usize = undefined;
     {
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
             .fail_index = 0,
             .resize_fail_index = 0,
         });
         vm.alloc = failing.allocator();
-        const ret = try testing.allocator.alloc(Value, 1);
-        ret[0] = .{ .Int = 5 };
-        const err = vm.completeBytecodeExecFrame(&frames, 0, ret);
+        const result = vm.completeBytecodeExecFrame(&frames, 0, ret);
         vm.alloc = testing.allocator;
-        try testing.expectError(error.OutOfMemory, err);
-        // The completion owns `ret` from entry (owned_ret errdefer armed
-        // before the fallible close) — it freed the slice exactly once via
-        // the failing allocator's backing (leak-checked at test end).
-        // Frame NOT popped; cell byte-exact open; colors unchanged.
-        try testing.expectEqual(@as(usize, 1), frames.len());
-        try testing.expectEqual(@as(u32, @intCast(slot)), cell.bc_stack_idx);
-        try testing.expect(cell.bc_stack_thread == th);
-        try testing.expect(th.bytecode_boxed[slot] == cell);
-        try testing.expect(std.meta.eql(th.bytecode_stack[slot], .{ .Table = child }));
-        try testing.expect(!gcIsWhite(cell.gc_marked) and !gcIsBlack(cell.gc_marked));
-        try testing.expect(gcIsWhite(child.gc_marked));
-        try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
-        try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+        frames_after = frames.len();
+        if (result) |res| {
+            // The whole completion succeeded without allocating: the
+            // frame popped and the caller-owned slice passes through.
+            try testing.expectEqual(@as(usize, 0), frames_after);
+            const adopted = res.?;
+            try testing.expect(adopted.ptr == ret.ptr and adopted.len == 1);
+            vm.alloc.free(adopted); // == ret: the caller-owned adoption
+        } else |_| {
+            // A post-close allocation failed: the frame state is wherever
+            // the failure hit it, but the CLOSE itself completed — the
+            // discriminator the old parked-frame contract failed.
+        }
     }
-    // Clean retry: the frame pops, the cell closes black, the barrier
-    // queues the child exactly once, and the heap ret passes through as
-    // the caller-owned result slice (external boundary, len == boundary).
-    {
-        const ret2 = try vm.alloc.alloc(Value, 1);
-        ret2[0] = .{ .Int = 5 };
-        const result = try vm.completeBytecodeExecFrame(&frames, 0, ret2);
-        try testing.expectEqual(@as(usize, 0), frames.len());
-        try testing.expectEqual(Cell.bc_stack_closed, cell.bc_stack_idx);
-        try testing.expect(cell.bc_stack_thread == null);
-        try testing.expect(th.bytecode_boxed[slot] == null);
-        try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
-        try testing.expect(gcIsBlack(cell.gc_marked));
-        try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = child }));
-        const res = result.?;
-        try testing.expect(res.ptr == ret2.ptr and res.len == 1);
-        vm.alloc.free(res); // == ret2: the caller-owned adoption
-    }
-    // Finish the cycle: the barrier-marked child survives the sweep.
+    // The close completed at the seam — no parked open cell, no retry.
+    try testing.expectEqual(Cell.bc_stack_closed, cell.bc_stack_idx);
+    try testing.expect(cell.bc_stack_thread == null);
+    try testing.expect(th.bytecode_boxed[slot] == null);
+    try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
+    try testing.expect(gcIsBlack(cell.gc_marked));
+    try testing.expect(gcIsGray(child.gc_marked));
+    try testing.expect(vm.gc_gray_overflow);
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+
+    // Release any frame the post-close failure left parked (the abort
+    // path's owner — void, infallible), then finish the cycle: the drain
+    // saves the child.
+    vm.unwindBytecodeExecFrames(&frames, 0);
+    try testing.expectEqual(@as(usize, 0), frames.len());
     while (vm.gc_state != .pause) {
         _ = try vm.gcAdvance(1, false);
     }
+    try testing.expect(!vm.gc_gray_overflow);
     try testing.expect(p50IsRegistered(&vm, .{ .table = child }));
     try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
 }
 
-test "P16.50-review-9 3: tailcall close OOM keeps the frame and pc parked; retry closes and the barrier saves the child" {
+test "P16.50-review-10 3: sticky failure at the tailcall seam closes immediately; no parked frame, no retry" {
     const testing = std.testing;
     var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
@@ -59381,8 +59550,11 @@ test "P16.50-review-9 3: tailcall close OOM keeps the frame and pc parked; retry
         .pc = 0,
     };
 
-    // OOM arm: with hooks off and a .Closure callee, the boxed-window close
-    // reserve is the first fallible operation of OP_TAILCALL.
+    // P16.50-review-10 BLOCKER 1: sticky reject-everything allocator. The
+    // boxed-window close (the first fallible operation of OP_TAILCALL) is
+    // now INFALLIBLE — it completes via the overflow fallback regardless.
+    // Later tailcall operations may still OOM on this allocator; whatever
+    // happens, the cell is closed and the boxed slot released.
     {
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
             .fail_index = 0,
@@ -59391,38 +59563,34 @@ test "P16.50-review-9 3: tailcall close OOM keeps the frame and pc parked; retry
         vm.alloc = failing.allocator();
         const res = vm.opTailcall(&ctx);
         vm.alloc = testing.allocator;
-        try testing.expectError(error.OutOfMemory, res);
-        // The frame is intact and the pc parked AT the TAILCALL; the cell
-        // is byte-exact open with both colors unchanged.
-        try testing.expectEqual(@as(usize, 1), frames.len());
-        try testing.expectEqual(@as(usize, 0), frames.inline_frames[0].u.lua.pc);
-        try testing.expectEqual(@as(u32, @intCast(cell_slot)), cell.bc_stack_idx);
-        try testing.expect(cell.bc_stack_thread == th);
-        try testing.expect(th.bytecode_boxed[cell_slot] == cell);
-        try testing.expect(std.meta.eql(th.bytecode_stack[cell_slot], .{ .Table = child }));
-        try testing.expect(!gcIsWhite(cell.gc_marked) and !gcIsBlack(cell.gc_marked));
-        try testing.expect(gcIsWhite(child.gc_marked));
-        try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
-        try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+        if (res) |_| {
+            // The whole tailcall step succeeded without allocating: the
+            // frame was reused over the callee.
+            try testing.expectEqual(@as(usize, 1), frames.len());
+        } else |_| {
+            // A post-close allocation failed; the frame/pc state is
+            // wherever the failure hit it — the CLOSE still completed.
+        }
     }
-    // Clean retry: the tail call proceeds (frame reuse over the callee),
-    // the cell closed black, the child queued exactly once.
-    _ = try vm.opTailcall(&ctx);
+    // The close completed at the seam — no parked open cell, no retry.
     try testing.expectEqual(Cell.bc_stack_closed, cell.bc_stack_idx);
     try testing.expect(cell.bc_stack_thread == null);
     try testing.expect(th.bytecode_boxed[cell_slot] == null);
     try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
     try testing.expect(gcIsBlack(cell.gc_marked));
-    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = child }));
+    try testing.expect(gcIsGray(child.gc_marked));
+    try testing.expect(vm.gc_gray_overflow);
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
 
     while (vm.gc_state != .pause) {
         _ = try vm.gcAdvance(1, false);
     }
+    try testing.expect(!vm.gc_gray_overflow);
     try testing.expect(p50IsRegistered(&vm, .{ .table = child }));
     try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
 }
 
-test "P16.50-review-9 3: abort-unwind close OOM leaves the frame in place; retry unwinds and the barrier saves the child" {
+test "P16.50-review-10 3: sticky failure at the abort-unwind seam unwinds fully; no parked suffix, no retry" {
     const testing = std.testing;
     var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
@@ -59460,41 +59628,34 @@ test "P16.50-review-9 3: abort-unwind close OOM leaves the frame in place; retry
     };
     frames.inline_count = 1;
 
-    // OOM arm: the unwind's per-frame close fails on its reserve; the
-    // frame stays in place for the retry (the abort path's contract).
+    // P16.50-review-10 BLOCKER 1: sticky reject-everything allocator. The
+    // abort unwind is INFALLIBLE: the frame suffix is fully released —
+    // exactly the runBytecodeInternal errdefer's new contract. The old
+    // review-9 contract (close OOM = parked suffix + abandoned flag, with
+    // a manual retry) is gone.
     {
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
             .fail_index = 0,
             .resize_fail_index = 0,
         });
         vm.alloc = failing.allocator();
-        const err = vm.unwindBytecodeExecFrames(&frames, 0);
+        vm.unwindBytecodeExecFrames(&frames, 0);
         vm.alloc = testing.allocator;
-        try testing.expectError(error.OutOfMemory, err);
-        try testing.expectEqual(@as(usize, 1), frames.len());
-        try testing.expectEqual(@as(u32, @intCast(slot)), cell.bc_stack_idx);
-        try testing.expect(cell.bc_stack_thread == th);
-        try testing.expect(th.bytecode_boxed[slot] == cell);
-        try testing.expect(std.meta.eql(th.bytecode_stack[slot], .{ .Table = child }));
-        try testing.expect(!gcIsWhite(cell.gc_marked) and !gcIsBlack(cell.gc_marked));
-        try testing.expect(gcIsWhite(child.gc_marked));
-        try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
-        try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
     }
-    // Clean retry: the frame unwinds, the cell closes black, the child is
-    // queued exactly once.
-    try vm.unwindBytecodeExecFrames(&frames, 0);
     try testing.expectEqual(@as(usize, 0), frames.len());
     try testing.expectEqual(Cell.bc_stack_closed, cell.bc_stack_idx);
     try testing.expect(cell.bc_stack_thread == null);
     try testing.expect(th.bytecode_boxed[slot] == null);
     try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
     try testing.expect(gcIsBlack(cell.gc_marked));
-    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = child }));
+    try testing.expect(gcIsGray(child.gc_marked));
+    try testing.expect(vm.gc_gray_overflow);
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
 
     while (vm.gc_state != .pause) {
         _ = try vm.gcAdvance(1, false);
     }
+    try testing.expect(!vm.gc_gray_overflow);
     try testing.expect(p50IsRegistered(&vm, .{ .table = child }));
     try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
 }
@@ -59594,20 +59755,21 @@ test "P16.50-review-9 4: teardown close runs no barrier over a dangling value" {
     gcSetGray(&cell.gc_marked);
 }
 
-test "P16.50-review-9 5: end-to-end resume close OOM transports as pcall-visible 'not enough memory'" {
+test "P16.50-review-10 5: end-to-end sticky-failing resume unwinds fully; VM reuse after recovery" {
     const testing = std.testing;
     var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
     vm.setDynamicBytecodeCompiler(defaultBytecodeCompiler);
 
     const src1 =
-        \\local co = coroutine.create(function()
-        \\  local t = {}
+        \\local co = coroutine.create(function(a)
+        \\  local t = a
         \\  local g = function() return t end
         \\  coroutine.yield(g)
-        \\  return t
+        \\  local t2 = {}
+        \\  return t2
         \\end)
-        \\local ok, g = coroutine.resume(co)
+        \\local ok, g = coroutine.resume(co, {})
         \\return co, g
     ;
     const src2 =
@@ -59615,133 +59777,180 @@ test "P16.50-review-9 5: end-to-end resume close OOM transports as pcall-visible
         \\return pcall(coroutine.resume, co)
     ;
 
-    var saw_pcall_oom = false;
-    var saw_success = false;
+    // First resume (healthy allocator): the body runs to the yield; g's
+    // upvalue cell is OPEN, watching co's stack slot that holds t.
+    const chunk1 = try vm.compileChunkValue(src1, "=r10j1");
+    const cl1 = chunk1.Closure;
+    const results1 = try vm.runBytecode(cl1.proto.?, cl1.upvalues, &.{}, cl1);
+    defer testing.allocator.free(results1);
+    if (results1.len != 2) return error.TestUnexpectedResult;
+    const co = switch (results1[0]) {
+        .Thread => |t| t,
+        else => return error.TestUnexpectedResult,
+    };
+    const g = switch (results1[1]) {
+        .Closure => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    const cell = g.upvalues[0];
+    try testing.expect(cell.isOpen());
+    try testing.expect(cell.bc_stack_thread == co);
+    const watched_slot = cell.bc_stack_idx;
+    const t = switch (cell.get(&vm)) {
+        .Table => |tab| tab,
+        else => return error.TestUnexpectedResult,
+    };
 
-    var fail_idx: usize = 0;
-    while (fail_idx <= 16) : (fail_idx += 1) {
-        // Settle the previous iteration's staged cycle (its dead threads
-        // and closures are swept here, allocation-free for their open
-        // cells — the sweep close contract).
-        while (vm.gc_state != .pause) {
-            _ = try vm.gcAdvance(1, false);
-        }
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.ensure(3);
+    roots.addAssumeCapacity(.{ .Thread = co });
+    roots.addAssumeCapacity(.{ .Closure = g });
+    roots.addCellAssumeCapacity(cell);
 
-        // First resume: the body runs to the yield; g's upvalue cell is
-        // OPEN, watching co's stack slot that holds t.
-        const chunk1 = try vm.compileChunkValue(src1, "=r9j1");
-        const cl1 = chunk1.Closure;
-        const results1 = try vm.runBytecode(cl1.proto.?, cl1.upvalues, &.{}, cl1);
-        defer testing.allocator.free(results1);
-        if (results1.len != 2) return error.TestUnexpectedResult;
-        const co = switch (results1[0]) {
-            .Thread => |t| t,
+    // Stage a cycle in propagate (the close's barrier plan is inc_mark —
+    // the child is painted gray with the overflow fallback under the
+    // sticky allocator), frozen by GCSTPUSR so no auto-step interferes.
+    try vm.gcStartCycle(true);
+    try testing.expect(vm.gc_state == .propagate);
+    vm.gc_stp = GCSTPUSR;
+    vm.gc_running = false;
+
+    // Second resume INSIDE pcall under a sticky reject-everything
+    // allocator: the body's `local t2 = {}` allocation fails, the OOM
+    // propagates out of dispatch, and the abort unwind must close g's
+    // cell INFALLIBLY — no parked frame suffix, no abandoned unwind, no
+    // manual repair. The transport may surface as pcall's false +
+    // "not enough memory" (if the message string needs no allocation) or
+    // escape raw as error.OutOfMemory (if it does) — both are consistent.
+    const chunk2 = try vm.compileChunkValue(src2, "=r10j2");
+    const cl2 = chunk2.Closure;
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+        .fail_index = 0,
+        .resize_fail_index = 0,
+    });
+    vm.alloc = failing.allocator();
+    const outcome = vm.runBytecode(cl2.proto.?, cl2.upvalues, &.{.{ .Thread = co }}, cl2);
+    vm.alloc = testing.allocator;
+    vm.gc_stp = 0;
+    vm.gc_running = true;
+
+    if (outcome) |results| {
+        defer testing.allocator.free(results);
+        const ok2 = switch (results[0]) {
+            .Bool => |b| b,
             else => return error.TestUnexpectedResult,
         };
-        const g = switch (results1[1]) {
-            .Closure => |c| c,
+        // The only reachable outcome: pcall(false) with the OOM message
+        // (a cached string transports without allocating).
+        try testing.expect(!ok2);
+        if (results.len < 2) return error.TestUnexpectedResult;
+        const msg = switch (results[1]) {
+            .String => |s| s,
             else => return error.TestUnexpectedResult,
         };
-        const cell = g.upvalues[0];
-        try testing.expect(cell.isOpen());
-        try testing.expect(cell.bc_stack_thread == co);
-
-        var roots = vm.gcTempRoots();
-        defer roots.end();
-        try roots.ensure(3);
-        roots.addAssumeCapacity(.{ .Thread = co });
-        roots.addAssumeCapacity(.{ .Closure = g });
-        roots.addCellAssumeCapacity(cell);
-
-        // Stage: a cycle in propagate with the cell root-queued NON-WHITE
-        // (open cells are never traversed, so it stays exactly as queued).
-        // The queued roots stay IN the gray list (dropping them mid-cycle
-        // would leave every unmarked object dead-colored for the next
-        // sweep); instead the list's capacity is shrunk to its exact length
-        // so the incremental close plan's reserve (gcPlanCloseBarrierCell
-        // reserves a gray slot for ANY non-white cell in propagate/atomic)
-        // must GROW the list — the barrier allocation whose OOM transport
-        // this test pins.
-        try vm.gcStartCycle(true);
-        try testing.expect(!gcIsWhite(cell.gc_marked));
-        try testing.expect(vm.gc_state == .propagate);
-        try testing.expect(vm.gc_gray.items.len > 0);
-        vm.gc_gray.shrinkAndFree(testing.allocator, vm.gc_gray.items.len);
-
-        // Second resume INSIDE pcall: the completing `return t` closes the
-        // cell; a reserve OOM there must surface as pcall's false +
-        // "not enough memory" (LUAERRMEM transport), never as a corrupted
-        // cell/stack state.
-        const chunk2 = try vm.compileChunkValue(src2, "=r9j2");
-        const cl2 = chunk2.Closure;
-        var failing = P50r9NoResizeFailing{ .base = testing.allocator, .fail_index = fail_idx };
-        // PUC lua_gc(LUA_GCSTOP): freeze the staged cycle in propagate so
-        // the resume's close cannot land in the sweep phase (whose
-        // allocation-free sweep close would bypass the reserve this test
-        // pins) and no auto-GC step can advance the state mid-resume.
-        vm.gc_stp = GCSTPUSR;
-        vm.gc_running = false;
-        vm.alloc = failing.allocator();
-        const outcome = vm.runBytecode(cl2.proto.?, cl2.upvalues, &.{.{ .Thread = co }}, cl2);
-        vm.alloc = testing.allocator;
-        vm.gc_stp = 0;
-        vm.gc_running = true;
-
-        if (outcome) |results| {
-            defer testing.allocator.free(results);
-            const ok2 = switch (results[0]) {
-                .Bool => |b| b,
-                else => return error.TestUnexpectedResult,
-            };
-            if (ok2) {
-                // pcall(resume) success: [true] ++ resume's [true, t].
-                if (results.len != 3) return error.TestUnexpectedResult;
-                saw_success = true;
-                try testing.expect(!cell.isOpen());
-                try testing.expect(co.status == .dead);
-                const t = switch (results[2]) {
-                    .Table => |tab| tab,
-                    else => return error.TestUnexpectedResult,
-                };
-                const cv = switch (cell.value) {
-                    .Table => |tab| tab,
-                    else => return error.TestUnexpectedResult,
-                };
-                try testing.expect(cv == t);
-            } else {
-                saw_pcall_oom = true;
-                const msg = switch (results[1]) {
-                    .String => |s| s,
-                    else => return error.TestUnexpectedResult,
-                };
-                try testing.expect(std.mem.eql(u8, msg.bytes(), "not enough memory"));
-                if (cell.isOpen()) {
-                    // The failing allocation preceded the close (or the
-                    // recovery unwind's single retry also failed): the cell
-                    // is still open and consistently published in co's
-                    // boxed window.
-                    try testing.expect(cell.bc_stack_thread == co);
-                    try testing.expect(co.bytecode_boxed[cell.bc_stack_idx] == cell);
-                } else {
-                    // PUC luaD_closeprotected re-runs luaF_close at the
-                    // recovery boundary; with a single-shot failure the
-                    // retry is funded and completes the close — closed
-                    // with the snapshot value, never a torn state.
-                    try testing.expect(cell.bc_stack_thread == null);
-                    switch (cell.value) {
-                        .Table => {},
-                        else => return error.TestUnexpectedResult,
-                    }
-                }
-            }
-        } else |err| {
-            try testing.expect(err == error.OutOfMemory);
-            if (cell.isOpen()) {
-                try testing.expect(cell.bc_stack_thread == co);
-                try testing.expect(co.bytecode_boxed[cell.bc_stack_idx] == cell);
-            }
-        }
+        try testing.expect(std.mem.eql(u8, msg.bytes(), "not enough memory"));
+    } else |err| {
+        try testing.expect(err == error.OutOfMemory);
     }
-    try testing.expect(saw_pcall_oom);
-    try testing.expect(saw_success);
+
+    // The discriminator (review-10 BLOCKER 1): IMMEDIATELY after the
+    // failed resume — no retry, no repair — the coroutine's frame suffix
+    // is fully released and the cell is closed.
+    try testing.expectEqual(@as(usize, 0), co.call_frames.len());
+    try testing.expect(co.status == .dead);
+    try testing.expect(!cell.isOpen());
+    try testing.expect(cell.bc_stack_thread == null);
+    try testing.expect(co.bytecode_boxed[watched_slot] == null);
+    try testing.expect(std.meta.eql(cell.value, .{ .Table = t }));
+
+    // Drain the staged cycle with the recovered allocator: the overflow
+    // flag's gray child survives, the drain terminates.
+    while (vm.gc_state != .pause) {
+        _ = try vm.gcAdvance(1, false);
+    }
+    try testing.expect(!vm.gc_gray_overflow);
+    try testing.expect(p50IsRegistered(&vm, .{ .table = t }));
+
+    // VM reuse after recovery: the SAME VM (main thread, no stale frames
+    // or PCs) compiles and runs an independent chunk, and a full
+    // collection keeps every registry invariant.
+    const chunk3 = try vm.compileChunkValue("local x = {} return 42, x ~= nil", "=r10j3");
+    const cl3 = chunk3.Closure;
+    const results3 = try vm.runBytecode(cl3.proto.?, cl3.upvalues, &.{}, cl3);
+    defer testing.allocator.free(results3);
+    try testing.expectEqual(@as(usize, 2), results3.len);
+    try testing.expect(results3[0] == .Int and results3[0].Int == 42);
+    try testing.expect(results3[1] == .Bool and results3[1].Bool);
+    try vm.gcFullCollectionForUser();
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+    try testing.expect(p50IsRegistered(&vm, .{ .table = t }));
+}
+
+test "P16.50-review-10 6: N-child overflow drain terminates; every child survives" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    const th = vm.main_thread.?;
+    const n = 8;
+    const base_slot: usize = 16;
+
+    var cells: [n]*Cell = undefined;
+    var children: [n]*Table = undefined;
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.ensure(n);
+
+    for (0..n) |i| {
+        const slot = base_slot + i;
+        children[i] = try vm.allocTableNoGc();
+        cells[i] = try p50r9MkOpenCell(&vm, th, slot);
+        roots.addCellAssumeCapacity(cells[i]);
+    }
+    // Stage the cycle AFTER rooting: the root scan marks every cell gray
+    // (open cells are never traversed), every child stays white.
+    try vm.gcStartCycle(true);
+    while (try vm.gcPropagateOne()) {}
+    for (0..n) |i| {
+        th.bytecode_stack[base_slot + i] = .{ .Table = children[i] };
+    }
+    vm.gc_gray.deinit(testing.allocator);
+    vm.gc_gray = .empty;
+
+    // Sticky rejection: closing the whole window overflows every child
+    // into the flag (capacity 0 for all n commits).
+    {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        vm.alloc = failing.allocator();
+        vm.closeBoxedUpvaluesReserved(th.bytecode_boxed[base_slot .. base_slot + n]);
+        vm.alloc = testing.allocator;
+    }
+    for (0..n) |i| {
+        try testing.expectEqual(Cell.bc_stack_closed, cells[i].bc_stack_idx);
+        try testing.expect(th.bytecode_boxed[base_slot + i] == null);
+        try testing.expect(gcIsBlack(cells[i].gc_marked));
+        try testing.expect(gcIsGray(children[i].gc_marked));
+    }
+    try testing.expect(vm.gc_gray_overflow);
+    try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
+
+    // Full cycle with a healthy allocator: the drain re-queues and
+    // propagates every child (each exactly once — outcome-checked: all
+    // alive, no gray-by-color residue, flag cleared, list empty at pause;
+    // survivors are current-white at the completed cycle's pause).
+    while (vm.gc_state != .pause) {
+        _ = try vm.gcAdvance(1, false);
+    }
+    try testing.expect(!vm.gc_gray_overflow);
+    try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
+    for (0..n) |i| {
+        try testing.expect(p50IsRegistered(&vm, .{ .table = children[i] }));
+        try testing.expect(!gcIsGray(children[i].gc_marked));
+        try testing.expect(std.meta.eql(cells[i].value, .{ .Table = children[i] }));
+    }
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
 }

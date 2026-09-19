@@ -60,7 +60,8 @@ end)
 local ok, r = coroutine.resume(co_a)
 assert(not ok and r:find("caught from b") ~= nil, "outer should fail")
 
--- 4. coroutine.wrap inside a coroutine (uses coroutine_wrap_iter builtin).
+-- 4. coroutine.wrap inside a coroutine (wrap returns a C closure whose
+--    closed upvalue holds the thread, PUC luaB_cowrap).
 co_a = coroutine.create(function()
   local wrap = coroutine.wrap(function()
     coroutine.yield("w1")

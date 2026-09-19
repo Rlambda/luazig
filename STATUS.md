@@ -1,4 +1,4 @@
-> Last updated: 2026-09-19 (P16.50-review-15 correction opened by review)
+> Last updated: 2026-09-19 (P16.50-review-15 correction closed by review-15; emergency-rescue HIGH открыт фазой; TBC-parity BLOCKER и emergency-GC HIGH открыты)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -45,7 +45,7 @@ Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [ ] **P16.50-review-15 correction**: сохранить доказанный type-metatable
+- [x] **P16.50-review-15 correction (CLOSED by review-15)**: сохранить доказанный type-metatable
   lifecycle и forward-only transaction review-14, но исправить изменённые
   constructor paths. BLOCKER: `coroutine.wrap` возвращает изменяемую Table
   вместо PUC CClosure/function и публикует `wrap_thread` как permanent root до
@@ -56,6 +56,48 @@ Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependen
   исправить неверную perf-атрибуцию: 4.79% — `gcMarkValueImpl`, не
   `gcMarkTypeMetatables`; self-percent profile не доказывает заявленные
   absolute deltas. Исполнимый план — `prompt.md`. Open-count 23→24.
+
+  ЗАКРЫТО фазой P16.50-review-15 (2026-09-19): BLOCKER 1 — `coroutine.wrap`
+  возвращает настоящий C-closure (PUC `luaB_cowrap`: cocreate +
+  `lua_pushcclosure(luaB_auxwrap, 1)`): `builtinCoroutineWrap` (vm.zig:24581)
+  строит замыкание через канонический `allocCclosure` (vm.zig:9243 — единственный
+  владелец C-closure конструкций, делегирован и из `api.State.makeCclosure`),
+  `c_func = coroutineWrapAuxwrap` (vm.zig:24626), единственный закрытый Cell-
+  upvalue держит Thread; wrapper-Table/`__thread`-фасада, BuiltinId
+  `coroutine_wrap_iter` и VM-global `wrap_thread` permanent root удалены;
+  failure = exact rollback (старый root удерживал Thread проваленной
+  конструкции до следующего успешного wrap). Trampoline diversion для
+  closure-keyed wrap-вызовов (`tryRequestBytecodeCoroutineWrapSwitch`,
+  vm.zig:12520) ограничивает глубокую wrap-рекурсию как PUC nCcalls;
+  re-raise через `raiseAuxwrapError` (vm.zig:7960) с heap-префиксами
+  luaL_where. BLOCKER 2 — `makeLinesIter` (vm.zig:36866) укореняет 3+1+fmts
+  значений до первого VM-allocation; 12-edge emergency + regular-cycle
+  матрицы. HIGH 1 — testC `pushcclosure` (vm.zig:46786) reserve-first: слот
+  результата резервируется до fallible construction, upvalues остаются на
+  parked script stack, commit — единственная stack-мутация; strict 3-item
+  assert, len-allowance удалён. HIGH 2 — proof restructures: rawSet-тест с 3
+  различимыми negative mutations, type-mt carrier roots, fresh-VM per
+  iteration с относительными baselines. HIGH 3 — perf-атрибуция review-14
+  отозвана (profile evidence — qualitative-only), perf-пункт остаётся
+  открытым. Open-count 24→23 (TBC-parity BLOCKER и emergency-GC HIGH остаются
+  открытыми); emergency-rescue HIGH (rescued-never-finalized) открыт фазой —
+  open-count 23→24.
+
+- [ ] **Parity: emergency-GC rescue снимает finalization (rescued-never-
+  finalized)**: [review-15 HIGH, origin: BLOCKER 2 regular-cycle matrix] объект,
+  отделённый в tobefnz (`gc_to_finalize`) в atomic emergency-GC (finalizers
+  подавлены — PUC GCScallfin guard, lgc.c), остаётся marked и с FINALIZEDBIT,
+  но luazig перевыводит tobefnz каждый cycle по whiteness
+  (`gcCollectFinalizables`, vm.zig:30942): если объект между emergency GC и
+  следующим regular cycle снова стал достижим (rescued — укоренён
+  конструктором/стеком), он чёрный у следующего separation и НЕ отделяется —
+  finalizer не исполняется никогда. PUC несёт `tobefnz` как персистентный
+  intrusive list: после первого separation finalizer обязан исполниться ровно
+  один раз (callfin безусловен для tobefnz), независимо от повторной
+  достижимости. Комментарий Step 12 (vm.zig:28975+) заявляет «exactly PUC's
+  tobefnz carry-over semantics» — заявление опровергнуто rescue-сценарием.
+  Нужен persistent separated-set (или эквивалент) с differential-доказательством
+  carry-over/rescue-семантики против PUC. Open-count 23→24.
 
 - [ ] **P16.50 table_alloc_setmetatable perf WARN (HIGH)**: canonical
   review-14 gate имеет matched center +4.0305% и seeds 9/10/15 выше +5%.
@@ -8419,6 +8461,202 @@ source_dirty = clean; вердикт сессии — в Perf-блоке ниж�
   metatable'd non-Tables для table.unpack не является расхождением; (d) pre-existing: big.lua both_fail (matrix), locals.lua
   GC-pacing dot diff, cstack.lua Debug native-stack exhaustion edge.
 
+### P16.50-review-15: PUC callable ownership (2026-09-19)
+
+Фаза по owner-ledger correction item (открыт 275bc16 после ledger-reopen
+review-14; open-count 23→24 — correction закрыт, TBC-parity BLOCKER и
+emergency-GC HIGH остаются открытыми; open-count 24→23; фаза открыла новый
+emergency-rescue HIGH — open-count 23→24). Коммиты: C = measured source
+(настоящий коммит; RF binary sha256
+ab6e8faf5982df9020251cf1daedf4756ae1e714421c637165018b60b2985ece —
+plain `zig build -Doptimize=ReleaseFast`, wipe-free; sha установлен после
+свежей пересборки (rm zig-out → rebuild) и воспроизводится последующими
+rebuilds byte-identical) → D = wrapper (полное canonical current-*
+перегенерирование на clean C + объявленная clean-C paired-seed perf-сессия;
+source_head сессии = C, source_dirty = clean; вердикт сессии — в Perf-блоке
+ниже, дописан артефактным коммитом D).
+
+- **BLOCKER 1 — coroutine.wrap = настоящий PUC C-closure**:
+  `builtinCoroutineWrap` (vm.zig:24581) — модель PUC `luaB_cowrap`
+  (lcorolib.c:100-105): cocreate (Thread с callee = аргумент) затем
+  `lua_pushcclosure(L, luaB_auxwrap, 1)` — обёртка является НАСТОЯЩИМ
+  C-closure (`c_func = coroutineWrapAuxwrap`, vm.zig:24626), чей единственный
+  закрытый Cell-upvalue держит Thread. Thread достижим ТОЛЬКО через upvalue
+  замыкания (PUC ownership): drop последней ссылки на обёртку собирает
+  Closure + Cell + Thread (lifecycle-тест). Удалены: wrapper-Table с
+  `__thread`-фасадой, BuiltinId `coroutine_wrap_iter` (+ dispatch arm +
+  bytecodeCoroutineTarget arm), VM-global `wrap_thread` permanent root
+  (включая его `gcMarkMutableRoots`-arm) — старый failure-режим (OOM
+  удерживал Thread проваленной конструкции в root до следующего успешного
+  wrap) заменён exact rollback (errdefer: unregister + free + counter).
+  Канонизация `allocCclosure` (vm.zig:9243): ОДИН владелец каждой
+  C-closure конструкции — свежий CClosure per call с собственными Cell-
+  upvalues (значения копируются; PUC lapi.c:609+), prepared-then-committed с
+  exact per-object rollback, каждый committed intermediate укоренён
+  TempRoots'ом (roots.ensure(n+1) до первой аллокации — infallible adds);
+  `api.State.makeCclosure` (api.zig; lua_pushcclosure/luaL_setfuncs)
+  делегирует сюда. Error path: `raiseAuxwrapError` (vm.zig:7960) — re-raise
+  PUC `luaB_auxwrap`: префикс `luaL_where(L, 1)` через heap `allocPrint`
+  БЕЗ length-cap (nested wrap recursion аккумулирует ~200 префиксов ≈ 6 KB —
+  truncating buffer молча терял бы префиксы), error()-shape (позиция запечена
+  в объект, err_source/err_line очищены — protected-boundary materialization
+  проходит as-is вместо re-derivation); ERRMEM (api_status 4) re-raise as-is
+  без префикса; не-string объекты as-is (PUC lua_error на moved object).
+  `auxwrapResume` (vm.zig:24685) — тело auxwrap поверх c_stack-конвенции;
+  OP_CALL wrap-completion: сырые значения без boolean, failure re-raises на
+  call site (vm.zig:14301, `.failed` arm). Trampoline diversion:
+  `tryRequestBytecodeCoroutineWrapSwitch` (vm.zig:12520) — closure-keyed
+  (c_func == &coroutineWrapAuxwrap + единственный Thread-upvalue), дивертирует
+  resume под активным trampoline, чья drive-iteration есть запрашивающий
+  loop: глубокая wrap-рекурсия (coroutine.lua `a = function(a)
+  coroutine.wrap(a)(a) end`) ограничена, как PUC nCcalls внутри одного
+  C-stack; общая eligibility `bytecodeCoroutineSwitchEligible` (vm.zig:12546,
+  все проверки до любого commit — rejected request не оставляет residue);
+  отклонённые запросы идут вложенным путём (PUC nested lua_resume).
+  `callCFunction` thread_switch arm (vm.zig:44374): __close-метаметод в
+  dynamic extent C-функции → park c_stack + сохранение C-frame +
+  error.ThreadSwitch на trampoline. Focused тесты (vm.zig:62623+): (A)
+  emergency-GC матрица (R15B1EmergencyAlloc: один emergency full GC на k-м
+  сконструированном GC-объекте последовательности Thread/Cell/Closure,
+  tryagain-retry) с identity-asserts настоящего C-closure; (B) OOM edge sweep:
+  каждая failure публикует ничего, exact rollback (registries/young list/
+  per-type counters = pre-call snapshot — старый wrap_thread root удерживал
+  здесь Thread проваленной конструкции: honest negative), настоящий full
+  cycle после failure и success; (C) lifecycle: drop последней ссылки →
+  Closure+Cell+Thread собираются. Negative-befores: pre-fix Table-фасада
+  краснеет на Closure identity-asserts; pre-fix wrap_thread retention
+  краснеет на assertRestored.
+- **BLOCKER 2 — io.lines укореняет свежий file и formats**: `makeLinesIter`
+  (vm.zig:36866) — roots 3+1+fmts значений (obj/mt/fmts_tbl + file_v + каждый
+  format) резервируются ДО первого VM-allocation (`ensure(3 + 1 + fmts.len)`
+  — infallible adds, review-7 discipline); PUC держит file userdata и format
+  arguments на L->stack всё construction-окно (io_lines оставляет их ниже
+  iterator closure). Каждая аллокация конструкции (таблицы, interned field
+  keys, array resize, metatable barrier prep) может запустить emergency GC,
+  который иначе финализирует/закрывает file (теряя OS handle) или собирает
+  format string, оставляя iterator с dangling/закрывающимся указателем.
+  Тесты (vm.zig:62931+): 12-edge матрица — R15B2EdgeEmergencyAlloc запускает
+  ОДИН full GC на edge-й аллокации ЛЮБОГО размера (construction edges
+  включают interned field-name strings и array/hash growth, не только три
+  таблицы), в обоих режимах: emergency (finalizers подавлены — PUC
+  gcemergency) И regular (finalizers исполняются — production-аналог:
+  allocation-triggered incremental cycle достигает atomic separation +
+  finalization, пока mutator держит неукоренённые Zig locals); настоящий
+  file через настоящий opener, FRESH interns asserted (pre-existing intern
+  обесценил бы fmts-proof); identity (тот же file table по указателю, те же
+  format strings), file OPEN и registered, ИСПОЛНЕНИЕ iterator, полный
+  GC-lifecycle (rooted → переживает открытым; dropped → obj/mt/fmts_tbl
+  собираются cycle 1, file финализируется (закрывается) cycle 1 и
+  освобождается cycle 2 — two-cycle finalization contract). Negative-before:
+  pre-fix `roots.ensure(3)` (только таблицы) — file-OPEN/identity asserts
+  краснеют, когда GC стреляет на любом pre-publication edge (file
+  финализирован/закрыт или format string собрана).
+- **HIGH 1 — testC pushcclosure reserve-first** (vm.zig:46786): PUC
+  `lua_pushcclosure` строит CClosure ПЕРВЫМ и только затем — infallibly —
+  заменяет top-n stack values; reserve слота результата up front
+  (единственная fallible stack-операция — сами items не тронуты), upvalues
+  остаются на parked script stack (GC root — gcMarkMutableRoots, non-moving
+  аналог PUC traversethread по L->stack) на всю конструкцию; commit
+  (`st.items.len = base; appendAssumeCapacity`) — ЕДИНСТВЕННАЯ stack-мутация:
+  каждая failure оставляет stack вызывающего byte-identical. Review-14
+  len-allowance (`len == 3 or len == 1` — consumed-but-unpublished) удалена:
+  STRICT 3-item assert; upvalue identity усилена (Table по указателю, не Int
+  value). Тесты (vm.zig:63026+): emergency-GC survival (upvalue Table
+  переживает по POINTER identity — parked, не re-created) + OOM edge sweep с
+  per-iteration P50Snapshot relative baseline (r15b2CompareRegistry) +
+  настоящий full cycle после failure. Negative-before: pre-fix потреблял
+  upvalues до fallible builds — strict 3-item assert краснеет на
+  first-invalid-op (`st.items.len = base` до construction).
+- **HIGH 2 — proof restructures (test honesty, без product-изменений)**:
+  (a) rawSet rehash-window тест (vm.zig:63214): setup roots защищают
+  key_tbl/val_tbl через их СОБСТВЕННОЕ construction-окно и снимаются до
+  rawSet — с этого момента production rehash-branch session единственная
+  защита; TempRoots capacity pre-reserved, чтобы session ensure(3) не
+  аллоцировал (emergency adapter стреляет только внутри
+  tableRehash→tableResize); 3 различимых negative mutations — удаление
+  любого единственного production root (tbl/canon_key/val
+  addAssumeCapacity) краснеет на соответствующем registration oracle;
+  post-publication держится только tbl (key/val достижимы исключительно
+  через опубликованный entry). (b) review-14 B1 type-mt тест: carrier roots
+  на весь loop (Thread + representative string были целями поздних итераций,
+  но держались только в Zig locals через несколько НАСТОЯЩИХ full
+  collections — unrooted-lifetime window закрыт без ослабления proof:
+  subject — mid-cycle metatable slot, не достижимость carrier). (c)
+  review-14 2a testC setmetatable OOM-матрица: FRESH VM per iteration
+  (r13/r14 форма deinit'ила GC-списки живой VM, включая finalizables —
+  prose review-14 ошибочно заявляла их полное удаление); fresh VM стартует
+  с действительно пустыми worklists; publication counts asserted
+  RELATIVELY к pre-script baseline каждой итерации (bootstrap регистрирует
+  3 стандартных io file в finalizables — абсолютные 0/1 asserts были бы
+  неверны). (d) stale comment исправлен («the iterator strips the boolean»
+  → «the wrapper strips» — wrap больше не iterator).
+- **HIGH 3 — perf-атрибуция review-14 отозвана** (правка фазы в
+  review-14 session-блоке выше): causal-claim «driven rawSet-rework»
+  отозван — одиночные unseeded self-percent profiles не доказывают absolute
+  instruction deltas, изолированного A/B не было; строка 4.79% —
+  `gcMarkValueImpl__anon_59207` (семантически тот же helper уже был в
+  review-13 на 4.47%), `gcMarkTypeMetatables` отсутствует в top-15 текущего
+  профиля; «gcMinor +0.75%» и количественная декомпозиция остатка
+  (~+1.3pp транзакция / ~+1pp markmt) отозваны. Профильная evidence —
+  ТОЛЬКО qualitative hotspot/composition. Perf-пункт остаётся ОТКРЫТЫМ:
+  до любого causal-claim или dirty-slot работы требуется isolated
+  interleaved A/B по реальному кандидату оптимизации.
+- **Батарея**: 316/316 unit (Debug+ReleaseFast последовательно, 0 leaks),
+  c_api make test 0 FAIL + test-diff DIFF PASS, matrix --testc 31/32
+  (zig_fail=0, big.lua both_fail pre-existing), smoke 84/84, 23 heavy
+  testc-лейна rc=0, PUC differentials byte-identical, crash contract 0/40,
+  api580 GREEN (anchored 384 < 400 — изменение Closure representation
+  проходит layout gate), fmt + git-diff-check clean.
+- **Perf**: measured runtime затронут (Closure representation: c_func-поле;
+  wrap construction path) — pre-check probes (r15d, interleaved A/B vs
+  worktree baseline 275bc16, seeds 1..7) только в /tmp/opencode outputs:
+  centers −0.632%..+0.437%, все |delta| < 1.6%
+  (table_alloc_setmetatable center +0.296%); canonical manifest не
+  мутирован. ОДНА объявленная paired-seed clean-C сессия (seeds 1..21,
+  RUNS=21) исполняется на commit C (source_head = C, source_dirty = clean;
+  binary sha256
+  ab6e8faf5982df9020251cf1daedf4756ae1e714421c637165018b60b2985ece).
+  Ожидание: table_alloc_setmetatable вероятно ВСЁ ЕЩЁ WARN — фаза не
+  таргетила тот путь (review-14 WARN center +4.03%; probe vs
+  baseline-approved +0.3%). Verdict дописывается артефактным коммитом D.
+  Полное canonical current-* перегенерирование на clean C / RF binary —
+  артефактным коммитом D.
+- **Residuals (honest, для владельца)**:
+  - **emergency-rescue HIGH (новый ОТКРЫТЫЙ пункт — см. выше)**:
+    rescued-never-finalized vs PUC tobefnz carry-over — luazig перевыводит
+    tobefnz по whiteness каждый cycle (gcCollectFinalizables, vm.zig:30942),
+    PUC несёт tobefnz персистентно: после первого separation finalizer
+    исполняется безусловно; rescue (повторная достижимость) объекта,
+    отделённого emergency-GC atomic, навсегда снимает finalization в luazig.
+    Origin: BLOCKER 2 regular-cycle matrix.
+  - **TempRoots cold-buffer MEDIUM**: ПЕРВЫЙ `ensure()` на холодном
+    TempRoots-буфере аллоцирует backing store — GC-capable edge вне
+    root-дисциплины конструкторов (значения ещё не в буфере); свойство
+    механизма, общее для всех конструкторов; r15b2-матрица pre-warm'ит
+    буфер, чтобы покрыть ровно construction-окно. Нужен pre-reserved/
+    embedded буфер или аудит ensure-before-window дисциплины.
+  - **testc counter drift LOW**: per-type testc counters
+    (testc_obj_functions/testc_obj_threads) учитывают allocation/rollback
+    sites, но не GC-frees — дрейф от live-object counts на длинных скриптах
+    (PUC ltests считает live objects). Ordinary-backlog.
+  - **pre-existing ORDINARY-BACKLOG notes (зафиксированы фазой, пункты не
+    открываются)**: CLI-nCcalls-head — граничная глубина C-stack overflow на
+    CLI entry расходится с PUC (deep wrap-рекурсия: PUC 199 уровней vs
+    luazig 202 — разный headroom стартовых CLI-обёрток); argerror-text —
+    отдельные bad-argument тексты расходятся с PUC 5.5 (например
+    `string.rep()`/`("x"):byte("a")`/`math.max("x")`/`io.read(-2)` —
+    не-PUC формулировки); pairs-on-function — PUC 5.5 не отвергает не-Table
+    аргумент в `pairs` (итератор ошибается позже: «bad argument #1 to 'for
+    iterator' (table expected, got function)»; `__pairs` на type-level mt
+    через debug.setmetatable работает), luazig отвергает в `pairs` сразу.
+  - **OP_TAILCALL wrap non-diversion — accepted-design residual**: diversion
+    реализован только в OP_CALL C-closure arm (vm.zig:21659); OP_TAILCALL
+    wrap-замыкания идут вложенным runClosure (host recursion). Глубокая
+    tail-рекурсия через wrap может переполнить host stack там, где
+    diverted OP_CALL не переполняет; принято как design на этой фазе
+    (diversion в OP_TAILCALL — отдельная работа при реальном evidence).
+  - TBC-parity BLOCKER и emergency-GC HIGH остаются открытыми.
+
 ### P16.50-review-14: PUC lifecycle metatables (2026-09-19)
 
 Фаза по owner-ledger correction item (открыт 02859be после ledger-reopen
@@ -8553,9 +8791,24 @@ byte-identical) → D = wrapper (полное canonical current-* переген
   всех). Probe-прогноз (seeds 1..5: center +3.41%, все < +5%) не
   подтвердился на полной 21-seed матрице — записано честно, без
   ретроспективной правки probe. Сравнение с review-13 WARN на том же
-  workload: center +4.42% → +4.03% (улучшение ~0.4 п.п., driven
-  rawSet-rework: безусловная session → rehash-only); WARN остаётся
-  WARN — green-claim нет. Manifest: row #31 appended (append-only),
+  workload: center +4.42% → +4.03% — улучшение ~0.33% (owner audit)
+  при нескольких одновременных изменениях фазы; causal-атрибуция
+  «driven rawSet-rework» отозвана review-15 (HIGH 3): одиночные
+  unseeded self-percent profiles не доказывают absolute instruction
+  deltas, изолированного A/B не было. WARN остаётся WARN — green-claim
+  нет. [review-15 HIGH 3] Профильная evidence сессии — ТОЛЬКО
+  qualitative hotspot/composition: опубликованная review-14 атрибуция
+  «новые 4.79% = gcMarkTypeMetatables/markmt» ошибочна (строка 4.79% —
+  `gcMarkValueImpl__anon_59207`; семантически тот же helper уже был в
+  review-13 на 4.47%; `gcMarkTypeMetatables` отсутствует в top-15
+  текущего профиля), «gcMinor +0.75%» (inference от отсутствующей
+  строки top-15) и количественная декомпозиция остатка
+  (~+1.3pp транзакция / ~+1pp markmt) отозваны — без isolated
+  interleaved A/B не доказуемы. Perf-пункт остаётся ОТКРЫТЫМ
+  вопросом: до любого causal-claim или dirty-slot работы требуется
+  isolated interleaved A/B по реальному кандидату оптимизации; пункт
+  не закрывается догадкой (см. открытый пункт «P16.50
+  table_alloc_setmetatable perf WARN»). Manifest: row #31 appended (append-only),
   current-gate.json обновлён атомарно сессией; baseline-approved.json /
   baseline-p15.37.json / core_baseline.json byte-identical (sha256
   до/после совпадают). Canonical current-* артефакты (current.json

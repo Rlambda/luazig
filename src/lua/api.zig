@@ -964,44 +964,11 @@ pub const State = struct {
     /// per-closure Cells + Closure out, prepared-then-committed.
     /// Returns the closure WITHOUT touching the stack (callers own the
     /// push/pop ordering).
+    /// P16.50-review-15 BLOCKER 1: the construction itself lives in
+    /// `Vm.allocCclosure` — the ONE owner shared with every other
+    /// C-closure builder (coroutine.wrap's auxwrap closure).
     fn makeCclosure(self: *State, fn_: ?*const fn (?*vm_mod.lua_State) callconv(.c) c_int, values: []const vm_mod.Value) ApiError!*vm_mod.Closure {
-        const n = values.len;
-        try self.vm.gcPrepareRegister(n + 1);
-        if (n == 0) {
-            const cl = try self.vm.alloc.create(vm_mod.Closure);
-            cl.* = .{ .upvalues = &.{}, .c_func = fn_ };
-            self.vm.gcRegisterCommit(.{ .closure = cl });
-            self.vm.gcNoteAlloc(@sizeOf(vm_mod.Closure));
-            self.vm.testc_obj_functions += 1;
-            return cl;
-        }
-        const upv_cells = try self.vm.alloc.alloc(*vm_mod.Cell, n);
-        var created: usize = 0;
-        errdefer {
-            // Roll back BEFORE freeing the array (the array holds the
-            // rollback worklist — read-after-free otherwise).
-            while (created > 0) {
-                created -= 1;
-                self.vm.gcUnregisterObjectRollback(.{ .cell = upv_cells[created] });
-                self.vm.gcNoteFree(@sizeOf(vm_mod.Cell));
-                self.vm.alloc.destroy(upv_cells[created]);
-            }
-            self.vm.alloc.free(upv_cells);
-        }
-        for (values, 0..) |v, i| {
-            const cell = try self.vm.alloc.create(vm_mod.Cell);
-            cell.* = .{ .value = v };
-            self.vm.gcRegisterCommit(.{ .cell = cell });
-            self.vm.gcNoteAlloc(@sizeOf(vm_mod.Cell));
-            upv_cells[i] = cell;
-            created += 1;
-        }
-        const cl = try self.vm.alloc.create(vm_mod.Closure);
-        cl.* = .{ .upvalues = upv_cells, .c_func = fn_ };
-        self.vm.gcRegisterCommit(.{ .closure = cl });
-        self.vm.gcNoteAlloc(@sizeOf(vm_mod.Closure) + n * @sizeOf(*vm_mod.Cell));
-        self.vm.testc_obj_functions += 1;
-        return cl;
+        return self.vm.allocCclosure(fn_, values);
     }
 
     pub fn pushcclosure(self: *State, fn_: ?*const fn (?*vm_mod.lua_State) callconv(.c) c_int, n: usize) ApiError!void {

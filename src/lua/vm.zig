@@ -294,7 +294,6 @@ pub const BuiltinId = enum(u8) {
     table_sort,
     coroutine_create,
     coroutine_wrap,
-    coroutine_wrap_iter,
     coroutine_resume,
     coroutine_yield,
     coroutine_status,
@@ -480,7 +479,6 @@ pub const BuiltinId = enum(u8) {
             .table_sort => "table.sort",
             .coroutine_create => "coroutine.create",
             .coroutine_wrap => "coroutine.wrap",
-            .coroutine_wrap_iter => "coroutine.wrap_iter",
             .coroutine_resume => "coroutine.resume",
             .coroutine_yield => "coroutine.yield",
             .coroutine_status => "coroutine.status",
@@ -1047,11 +1045,13 @@ const BytecodeGsubStart = union(enum) {
     returned: []Value,
 };
 
-const BytecodeCoroutineKind = enum { resume_call, wrap_call };
-
 const BytecodeCoroutineContinuation = struct {
     target: *Thread,
-    kind: BytecodeCoroutineKind,
+    /// PUC luaB_auxwrap vs luaB_coresume completion: a wrap call's
+    /// OP_CALL results are the raw resume values (no boolean) and a
+    /// child failure RE-RAISES at the call site (auxwrap's lua_error)
+    /// instead of returning a (false, err) tuple.
+    wrap_call: bool = false,
     result: BytecodeResultContinuation,
     saved_error: BytecodeSavedError,
 };
@@ -1065,7 +1065,7 @@ const BytecodeCoroutineSwitchRequest = struct {
 const BytecodeCoroutineTarget = struct {
     thread: *Thread,
     args: []const Value,
-    kind: BytecodeCoroutineKind,
+    wrap_call: bool = false,
 };
 
 const BytecodeCoroutineStep = union(enum) {
@@ -5176,7 +5176,6 @@ pub const Vm = struct {
     active_builtin: ?BuiltinId = null,
     active_builtin_args: ?[]const Value = null,
     gmatch_state: ?GmatchState = null,
-    wrap_thread: ?*Thread = null,
     main_thread: ?*Thread = null,
     forced_close_thread: ?*Thread = null,
     forced_close_had_error: bool = false,
@@ -7946,6 +7945,58 @@ pub const Vm = struct {
         return error.RuntimeError;
     }
 
+    /// PUC luaB_auxwrap's re-raise (lcorolib.c): `luaL_where(L, 1) .. msg`
+    /// concatenated, then `lua_error` — the concatenated string IS the final
+    /// error object. This is error()'s raise shape, NOT fail()'s: the where
+    /// info is baked into the object and `err_source`/`err_line` stay
+    /// cleared, so the protected-boundary materialization
+    /// (currentRuntimeErrorValue → protectedErrorString) passes the object
+    /// through as-is instead of re-deriving a prefix (failWithPosFrame's
+    /// raw-message + err_source shape loses the prefix there when the
+    /// message itself contains ':', e.g. an already-positioned inner error
+    /// on nested wrap recursion). A null pos_frame (C caller — pcall — or
+    /// no position) re-raises the message unchanged (PUC luaL_where pushes
+    /// "" for those and the concat is a no-op).
+    noinline fn raiseAuxwrapError(self: *Vm, pos_frame: ?*const Frame, msg: []const u8) Error {
+        // Fresh error: reset LUA_ERRERR signal before invokeErrfunc.
+        self.errThread().err_is_errerr = false;
+        var full: []const u8 = msg;
+        if (pos_frame) |fr| {
+            const line = self.frameCurrentLine(fr);
+            if (line > 0) {
+                const src = fr.sourceName();
+                // PUC luaG_addinfo uses luaO_chunkid for the source name.
+                var id_buf: [59]u8 = undefined;
+                const chunk = diag.chunkId(id_buf[0..], src);
+                // PUC luaL_where → luaO_pushfstring: heap-built, NO length
+                // cap. Nested wrap recursion accumulates one prefix per
+                // level (~200 levels × ~30 bytes ≈ 6 KB) — far beyond any
+                // fixed buffer; a truncating buffer would silently drop
+                // prefixes and diverge from PUC's accumulated message.
+                full = std.fmt.allocPrint(self.alloc, "{s}:{d}: {s}", .{ chunk, line, msg }) catch {
+                    self.setOutOfMemoryError();
+                    return error.OutOfMemory;
+                };
+            }
+        }
+        defer if (full.ptr != msg.ptr) self.alloc.free(full);
+        // The interned string is GC-owned and rooted via err_obj — self.err
+        // points at its stable bytes (same shape as restoreRuntimeErrorValue).
+        const istr = self.internStr(full) catch {
+            self.setOutOfMemoryError();
+            return error.OutOfMemory;
+        };
+        self.err = istr.bytes();
+        self.errThread().err_obj = .{ .String = istr };
+        self.errThread().err_has_obj = true;
+        // error()-shape raise: the position lives in the object only.
+        self.errThread().err_source = null;
+        self.errThread().err_line = -1;
+        self.captureErrorTraceback();
+        try self.invokeErrfunc();
+        return error.RuntimeError;
+    }
+
     /// C-function variant of `fail`. Use this for errors that originate from
     /// a C builtin (e.g. `coroutine.yield`), matching PUC's `luaG_runerror`
     /// when `isLua(ci)` is false: `luaG_addinfo` is NOT called, so the error
@@ -9177,6 +9228,71 @@ pub const Vm = struct {
         self.gcNoteAlloc(@sizeOf(Table));
         self.testc_obj_tables += 1;
         return t;
+    }
+
+    /// Canonical C-closure constructor (P16.50-review-15 BLOCKER 1): PUC
+    /// `lua_pushcclosure` (lapi.c:609+) — a FRESH CClosure per call whose
+    /// upvalue slots are that closure's OWN Cells (the values are copied
+    /// in; closures never share Cell objects). Prepared-then-committed
+    /// with exact per-object rollback: a failure leaves zero registered
+    /// objects and zero accounting drift. ONE owner for every C-closure
+    /// construction: api.State.makeCclosure (lua_pushcclosure /
+    /// luaL_setfuncs) delegates here, and coroutine.wrap's auxwrap
+    /// closure is built by it too. The CALLER roots the `values` across
+    /// this call (gcTempRoots / stack slots — PUC roots them on L->stack).
+    pub fn allocCclosure(
+        self: *Vm,
+        fn_: ?*const fn (?*lua_State) callconv(.c) c_int,
+        values: []const Value,
+    ) std.mem.Allocator.Error!*Closure {
+        const n = values.len;
+        try self.gcPrepareRegister(n + 1);
+        // Root every committed intermediate (each cell, then the closure)
+        // across the remaining allocations: any of them can fire an
+        // emergency GC, and until the closure exists the cells are
+        // reachable only from this Zig frame (PUC anchors them on
+        // L->stack for the whole construction).
+        var roots = self.gcTempRoots();
+        defer roots.end();
+        try roots.ensure(n + 1);
+        if (n == 0) {
+            const cl = try self.alloc.create(Closure);
+            cl.* = .{ .upvalues = &.{}, .c_func = fn_ };
+            self.gcRegisterCommit(.{ .closure = cl });
+            self.gcNoteAlloc(@sizeOf(Closure));
+            self.testc_obj_functions += 1;
+            roots.addAssumeCapacity(.{ .Closure = cl });
+            return cl;
+        }
+        const upv_cells = try self.alloc.alloc(*Cell, n);
+        var created: usize = 0;
+        errdefer {
+            // Roll back BEFORE freeing the array (the array holds the
+            // rollback worklist — read-after-free otherwise).
+            while (created > 0) {
+                created -= 1;
+                self.gcUnregisterObjectRollback(.{ .cell = upv_cells[created] });
+                self.gcNoteFree(@sizeOf(Cell));
+                self.alloc.destroy(upv_cells[created]);
+            }
+            self.alloc.free(upv_cells);
+        }
+        for (values, 0..) |v, i| {
+            const cell = try self.alloc.create(Cell);
+            cell.* = .{ .value = v };
+            self.gcRegisterCommit(.{ .cell = cell });
+            self.gcNoteAlloc(@sizeOf(Cell));
+            roots.addCellAssumeCapacity(cell);
+            upv_cells[i] = cell;
+            created += 1;
+        }
+        const cl = try self.alloc.create(Closure);
+        cl.* = .{ .upvalues = upv_cells, .c_func = fn_ };
+        self.gcRegisterCommit(.{ .closure = cl });
+        self.gcNoteAlloc(@sizeOf(Closure) + n * @sizeOf(*Cell));
+        self.testc_obj_functions += 1;
+        roots.addAssumeCapacity(.{ .Closure = cl });
+        return cl;
     }
     /// PUC `checkGC(L,c)` analogue: conditionally run a GC step after an
     /// allocation site. Called from OP_CONCAT, OP_CLOSURE, and string
@@ -12297,14 +12413,12 @@ pub const Vm = struct {
             .xpcall,
             .string_gsub,
             .coroutine_resume,
-            .coroutine_wrap_iter,
             => return true,
             else => return false,
         }
     }
 
     fn bytecodeCoroutineTarget(
-        self: *Vm,
         id: BuiltinId,
         args: []const Value,
     ) ?BytecodeCoroutineTarget {
@@ -12314,17 +12428,6 @@ pub const Vm = struct {
                 return .{
                     .thread = args[0].Thread,
                     .args = args[1..],
-                    .kind = .resume_call,
-                };
-            },
-            .coroutine_wrap_iter => {
-                if (args.len == 0 or args[0] != .Table) return null;
-                const thread_value = self.getFieldOpt(args[0].Table, "__thread") orelse return null;
-                if (thread_value != .Thread) return null;
-                return .{
-                    .thread = thread_value.Thread,
-                    .args = args[1..],
-                    .kind = .wrap_call,
                 };
             },
             else => return null,
@@ -12398,7 +12501,54 @@ pub const Vm = struct {
         // trampoline would destroy it. Only the drive iteration (boundary 0
         // on the drive thread) may switch.
         if (boundary_depth != 0) return false;
-        const target = self.bytecodeCoroutineTarget(id, args) orelse return false;
+        const target = bytecodeCoroutineTarget(id, args) orelse return false;
+        if (!self.bytecodeCoroutineSwitchEligible(exec_frames, parent_index, target.thread)) return false;
+        return self.commitBytecodeCoroutineSwitch(exec_frames, parent_index, dst, nresults, tail_return, target, .{ .Builtin = id });
+    }
+
+    /// PUC luaD_precall for a coroutine.wrap C closure (luaB_auxwrap): the
+    /// call is a resume of the wrapped thread (upvalue 1). Under an active
+    /// trampoline whose drive iteration is the requesting loop, divert the
+    /// resume to the trampoline exactly like a coroutine.resume call: a
+    /// nested runClosure per wrap level (callCFunction → auxwrapResume →
+    /// builtinCoroutineResume → runClosure) overflows the host stack on deep
+    /// wrap recursion (coroutine.lua's `a = function(a) coroutine.wrap(a)(a)
+    /// end`), where PUC bounds the SAME recursion with nCcalls inside one C
+    /// stack. Rejected requests take the ordinary nested path (the OP_CALL
+    /// C-closure arm's runClosure) — exactly PUC's nested lua_resume under
+    /// any native state.
+    fn tryRequestBytecodeCoroutineWrapSwitch(
+        self: *Vm,
+        exec_frames: *FrameStack,
+        parent_index: usize,
+        dst: u8,
+        nresults: i32,
+        th: *Thread,
+        args: []const Value,
+        tail_return: bool,
+        boundary_depth: usize,
+        cl: *Closure,
+    ) DispatchError!bool {
+        if (!self.bytecode_coroutine_trampoline_active) return false;
+        if (boundary_depth != 0) return false;
+        if (!self.bytecodeCoroutineSwitchEligible(exec_frames, parent_index, th)) return false;
+        return self.commitBytecodeCoroutineSwitch(exec_frames, parent_index, dst, nresults, tail_return, .{
+            .thread = th,
+            .args = args,
+            .wrap_call = true,
+        }, .{ .Closure = cl });
+    }
+
+    /// Shared eligibility for both trampoline diversion sites (the
+    /// coroutine.resume builtin call and the coroutine.wrap C-closure
+    /// call). Every check runs BEFORE any state commit: a rejected request
+    /// leaves zero residue.
+    fn bytecodeCoroutineSwitchEligible(
+        self: *Vm,
+        exec_frames: *FrameStack,
+        parent_index: usize,
+        target_thread: *Thread,
+    ) bool {
         const caller = self.activeBytecodeThread();
         // T12: the requesting loop must be the trampoline's own drive
         // iteration. A sync-fallback child or c_api-resumed thread enters
@@ -12410,12 +12560,29 @@ pub const Vm = struct {
         // resumable. Let the ordinary builtin produce `(false, message)`;
         // switching the trampoline back into an ancestor would create a cycle
         // and turn a non-throwing resume failure into a coroutine error.
-        if (target.thread.status == .suspended and caller != target.thread and caller.caller == target.thread) return false;
-        if (!canTrampolineBytecodeThread(target.thread)) return false;
-        if (target.thread == caller) return false;
+        if (target_thread.status == .suspended and caller != target_thread and caller.caller == target_thread) return false;
+        if (!canTrampolineBytecodeThread(target_thread)) return false;
+        if (target_thread == caller) return false;
         if (self.bytecode_coroutine_switch_request != null) return false;
         if (exec_frames.getPtr(parent_index).pending_call_index != INVALID_PENDING) return false;
+        return true;
+    }
 
+    /// Commit a trampoline diversion: the continuation (pending call with
+    /// .coroutine_resume completion) plus the switch request the drive loop
+    /// consumes. The caller suspends in place at its OP_CALL; the trampoline
+    /// resumes the target on its flat drive loop.
+    fn commitBytecodeCoroutineSwitch(
+        self: *Vm,
+        exec_frames: *FrameStack,
+        parent_index: usize,
+        dst: u8,
+        nresults: i32,
+        tail_return: bool,
+        target: BytecodeCoroutineTarget,
+        callee: Value,
+    ) DispatchError!bool {
+        const caller = self.activeBytecodeThread();
         const args_copy = try self.alloc.dupe(Value, target.args);
         if (self.stats.enabled) self.stats.resume_allocs += 1; // P16.0b (trampoline resume args)
         errdefer self.alloc.free(args_copy);
@@ -12427,7 +12594,7 @@ pub const Vm = struct {
         if (self.stats.enabled) self.stats.resume_allocs += 1; // P16.0b (trampoline continuation)
         co_state.* = .{
             .target = target.thread,
-            .kind = target.kind,
+            .wrap_call = target.wrap_call,
             .result = .{
                 .dst = dst,
                 .nresults = nresults,
@@ -12436,7 +12603,7 @@ pub const Vm = struct {
             .saved_error = saved_error,
         };
         try self.setPendingCall(exec_frames.getPtr(parent_index), .{
-            .callee = .{ .Builtin = id },
+            .callee = callee,
             .completion = .{ .coroutine_resume = co_state },
         });
         self.bytecode_coroutine_switch_request = .{
@@ -12844,13 +13011,19 @@ pub const Vm = struct {
         return null;
     }
 
+    /// coroutine.resume's OP_CALL completion: prepend the boolean status
+    /// to the resume results (PUC luaB_coresume: `false` + error object on
+    /// failure, `true` + results on success).
+    /// PUC completion shapes: a coroutine.resume call's OP_CALL results are
+    /// `[ok] ++ values` (luaB_coresume's return tuple); a coroutine.wrap
+    /// call's are the RAW resume values (luaB_auxwrap strips the boolean).
     fn wrapBytecodeCoroutineValues(
         self: *Vm,
-        kind: BytecodeCoroutineKind,
+        wrap_call: bool,
         ok: bool,
         values: []Value,
     ) DispatchError![]Value {
-        if (kind == .wrap_call) return values;
+        if (wrap_call) return values;
         const wrapped = try self.alloc.alloc(Value, values.len + 1);
         wrapped[0] = .{ .Bool = ok };
         @memcpy(wrapped[1..], values);
@@ -14128,25 +14301,42 @@ pub const Vm = struct {
                 var applied: DispatchError!?[]Value = undefined;
                 switch (child_step) {
                     .returned => |values| {
-                        const call_values = try self.wrapBytecodeCoroutineValues(cont.kind, true, values);
+                        const call_values = try self.wrapBytecodeCoroutineValues(cont.wrap_call, true, values);
                         applied = self.completeBytecodeCoroutineResult(exec_frames, parent_index, call_values, cont);
                     },
                     .yielded => |values| {
-                        const call_values = try self.wrapBytecodeCoroutineValues(cont.kind, true, values);
+                        const call_values = try self.wrapBytecodeCoroutineValues(cont.wrap_call, true, values);
                         applied = self.completeBytecodeCoroutineResult(exec_frames, parent_index, call_values, cont);
                     },
                     .failed => |error_value| {
-                        if (cont.kind == .resume_call) {
-                            const one = try self.alloc.alloc(Value, 1);
-                            one[0] = error_value;
-                            const call_values = try self.wrapBytecodeCoroutineValues(cont.kind, false, one);
-                            applied = self.completeBytecodeCoroutineResult(exec_frames, parent_index, call_values, cont);
-                        } else {
+                        if (cont.wrap_call) {
+                            // PUC luaB_auxwrap error path: re-raise at the
+                            // wrap call site — the parent frame parked at the
+                            // OP_CALL. A STRING error gets luaL_where(1)
+                            // (the call position) prepended — each bubble
+                            // level prepends its own position, the PUC
+                            // accumulated-prefix behavior on nested wrap
+                            // recursion — unless the child died of ERRMEM
+                            // (the fixed "not enough memory" object,
+                            // re-raised as-is). Any other object re-raises
+                            // as-is (PUC lua_error on the moved object).
                             self.discardBytecodeSavedError(cont.saved_error);
                             self.alloc.destroy(cont);
                             self.clearPendingCall(exec_frames.getPtr(parent_index));
-                            self.restoreRuntimeErrorValue(error_value);
-                            applied = error.RuntimeError;
+                            if (error_value == .String and error_value.String != self.oom_msg_str) {
+                                applied = self.raiseAuxwrapError(
+                                    exec_frames.getConstPtr(parent_index),
+                                    error_value.String.bytes(),
+                                );
+                            } else {
+                                self.restoreRuntimeErrorValue(error_value);
+                                applied = error.RuntimeError;
+                            }
+                        } else {
+                            const one = try self.alloc.alloc(Value, 1);
+                            one[0] = error_value;
+                            const call_values = try self.wrapBytecodeCoroutineValues(cont.wrap_call, false, one);
+                            applied = self.completeBytecodeCoroutineResult(exec_frames, parent_index, call_values, cont);
                         }
                     },
                     .forced_close => unreachable,
@@ -21469,6 +21659,32 @@ pub const Vm = struct {
                 // IR closure: host-recursion via runClosure. (Frozen IR
                 // closures are equivalent to PUC's C-function calls — they
                 // cross the C/Lua boundary and DO use host recursion.)
+                //
+                // A coroutine.wrap closure (c_func == coroutineWrapAuxwrap,
+                // PUC luaB_auxwrap) resumes the wrapped thread (upvalue 1).
+                // Under an active trampoline whose drive iteration is THIS
+                // loop, divert the resume to the trampoline like a
+                // coroutine.resume call — the nested path costs one full
+                // interpreter frame per wrap level and overflows the host
+                // stack on deep wrap recursion (PUC bounds the same
+                // recursion with nCcalls). Rejected requests (nested host
+                // recursion, sync-fallback children, ineligible targets)
+                // take the ordinary nested path below.
+                if (cl.c_func != null and cl.c_func.? == &coroutineWrapAuxwrap and
+                    cl.upvalues.len == 1 and cl.upvalues[0].value == .Thread)
+                {
+                    if (try self.tryRequestBytecodeCoroutineWrapSwitch(
+                        ctx.exec_frames,
+                        ctx.frame_index,
+                        a,
+                        nresults,
+                        cl.upvalues[0].value.Thread,
+                        rargs,
+                        false,
+                        ctx.boundary_depth,
+                        cl,
+                    )) return error.ThreadSwitch;
+                }
                 try self.setPendingCall(ctx.exec_frames.getPtr(ctx.frame_index), .{
                     .callee = callee_val,
                     .completion = .{ .results = .{
@@ -22632,7 +22848,6 @@ pub const Vm = struct {
             .table_sort => try self.builtinTableSort(args, outs),
             .coroutine_create => try self.builtinCoroutineCreate(args, outs),
             .coroutine_wrap => try self.builtinCoroutineWrap(args, outs),
-            .coroutine_wrap_iter => return try self.builtinCoroutineWrapIter(args),
             // P16.50-review-8: materialize a borrowed span before returning
             // to callBuiltin's generic contract — this arm is the cold path
             // (hooks active, trampoline dispatch, close/testc re-entry); the
@@ -24346,49 +24561,128 @@ pub const Vm = struct {
         outs[0] = .{ .Thread = th };
     }
 
+    /// PUC `luaB_cowrap` (lcorolib.c:100-105): cocreate (a Thread whose
+    /// callee is the argument) then `lua_pushcclosure(L, luaB_auxwrap, 1)`
+    /// — the wrapper is a REAL C closure whose single CLOSED upvalue holds
+    /// the thread. No wrapper Table, no metatable, no VM-global side
+    /// channel: the thread is reachable ONLY through the closure's
+    /// upvalue (PUC ownership), so dropping the last wrapper reference
+    /// makes the thread collectable.
+    ///
+    /// Transactional (P16.50-review-15 BLOCKER 1): the thread is created
+    /// and rooted (gcTempRoots — PUC roots it on L->stack between
+    /// cocreate and pushcclosure), the closure is built by the canonical
+    /// `allocCclosure`, and a closure-construction failure rolls the
+    /// thread back (unregister + free — registries and accounting return
+    /// to the pre-call baseline). `outs[0]` is published only after every
+    /// object exists; the old `self.wrap_thread` permanent root (which
+    /// retained the thread of a FAILED construction and leaked it until
+    /// the next successful wrap) is gone.
     fn builtinCoroutineWrap(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
-        var tmp: [1]Value = .{.Nil};
-        try self.builtinCoroutineCreate(args, tmp[0..]);
-        const th = try self.expectThread(tmp[0]);
-        self.wrap_thread = th;
-        // P16.50-review-14 HIGH 2: obj/mt live only in Zig locals between
-        // their allocation and publication (outs[0] / obj.metatable) — the
-        // next setField/metatable-prepare can fire an emergency GC. Reserve
-        // both temp-root slots up front (review-7 ensure discipline) so each
-        // addAssumeCapacity is infallible: no GC-capable step can run between
-        // an allocation and its rooting.
+        if (args.len == 0) return self.fail("coroutine.create expects function", .{});
+        const callee = args[0];
+        if (!isCallableValue(callee)) return self.fail("coroutine.create expects function", .{});
+        try self.gcPrepareRegister(1);
+        const th = try self.alloc.create(Thread);
+        th.* = .{ .status = .suspended, .callee = callee };
+        self.gcRegisterCommit(.{ .thread = th });
+        self.gcNoteAlloc(@sizeOf(Thread));
+        self.testc_obj_threads += 1;
+        // Root the thread across the closure construction: every
+        // allocation inside allocCclosure can fire an emergency GC, and
+        // the thread is otherwise only in a Zig local (PUC: it sits on
+        // L->stack the whole time).
         var roots = self.gcTempRoots();
         defer roots.end();
-        try roots.ensure(2);
-        const obj = try self.allocTableNoGc();
-        roots.addAssumeCapacity(.{ .Table = obj });
-        const mt = try self.allocTableNoGc();
-        roots.addAssumeCapacity(.{ .Table = mt });
-        try self.setField(mt, "__call", .{ .Builtin = .coroutine_wrap_iter });
-        try self.gcStoreMetatable(obj, mt);
-        try self.setField(obj, "__thread", .{ .Thread = th });
-        outs[0] = .{ .Table = obj };
+        try roots.ensure(1);
+        roots.addAssumeCapacity(.{ .Thread = th });
+        errdefer {
+            self.gcUnregisterObjectRollback(.{ .thread = th });
+            self.gcNoteFree(@sizeOf(Thread));
+            self.testc_obj_threads -= 1;
+            self.alloc.destroy(th);
+        }
+        const cl = try self.allocCclosure(&coroutineWrapAuxwrap, &.{.{ .Thread = th }});
+        outs[0] = .{ .Closure = cl };
     }
 
-    /// P16.50-review-7 BLOCKER 4: the coroutine.wrap iterator returns the
-    /// resumed coroutine's EXACT yielded/returned values as an owned slice
-    /// (PUC auxwrap: luaD_poscall of the resume results minus the boolean
-    /// — no bound; the old 256-slot window truncated every wrap iteration
-    /// to 255 values). On a resume failure it RE-RAISES the error (PUC
-    /// auxwrap: lua_error) — no result.
-    fn builtinCoroutineWrapIter(self: *Vm, args: []const Value) DispatchError!?[]Value {
-        var th: *Thread = undefined;
-        var call_args: []const Value = args;
-        if (args.len > 0 and args[0] == .Table) {
-            const obj = args[0].Table;
-            const thv = self.getFieldOpt(obj, "__thread") orelse return self.fail("coroutine.wrap iterator missing thread", .{});
-            if (thv != .Thread) return self.fail("coroutine.wrap iterator missing thread", .{});
-            th = thv.Thread;
-            call_args = args[1..];
-        } else {
-            th = self.wrap_thread orelse return self.fail("coroutine.wrap iterator missing thread", .{});
+    /// PUC `luaB_auxwrap` (lcorolib.c:74-96) — the C target of a
+    /// coroutine.wrap closure, bridged onto the c_stack convention of
+    /// `callCFunction`: the arguments are `cur_c_stack` slots 0..n, the
+    /// results are pushed back onto `cur_c_stack`. The wrapped thread is
+    /// read from upvalue 1 of the ACTIVE closure (`c_active_closure`,
+    /// set by `runClosure` before `callCFunction` — PUC
+    /// `lua_tothread(L, lua_upvalueindex(1))`).
+    ///
+    /// Error mapping across the C boundary (PUC `lua_error` /
+    /// `luaD_throw`): a RuntimeError is already installed in the VM error
+    /// state by `auxwrapResume` (return -1 — the plain C-return error
+    /// signal); an OOM installs the fixed MEMERRMSG and longjmps with
+    /// status 4 (the `cThrowOn` OOM arm); a ThreadSwitch (a __close
+    /// metamethod in the target's graph switched threads) longjmps with
+    /// signal 3 — `callCFunction`'s `.thread_switch` arm parks the frame
+    /// and propagates the switch to the trampoline.
+    fn coroutineWrapAuxwrap(L: ?*lua_State) callconv(.c) c_int {
+        const h = L orelse return 0;
+        const self = h.vm;
+        const cl = self.c_active_closure orelse {
+            _ = self.failC("coroutine.wrap: missing active closure", .{}) catch {};
+            return -1;
+        };
+        if (cl.upvalues.len != 1 or cl.upvalues[0].value != .Thread) {
+            _ = self.failC("coroutine.wrap: missing thread upvalue", .{}) catch {};
+            return -1;
         }
+        const th = cl.upvalues[0].value.Thread;
+        const res = self.auxwrapResume(th, self.cur_c_stack.items) catch |e| switch (e) {
+            error.RuntimeError => return -1,
+            error.OutOfMemory => {
+                if (self.c_error_jmp) |jb| {
+                    self.setOutOfMemoryError();
+                    self.c_error_value = self.errThread().err_obj;
+                    self.c_error_status = 4; // LUA_ERRMEM
+                    _longjmp(@ptrCast(jb), 1);
+                }
+                std.process.abort();
+            },
+            error.ThreadSwitch => {
+                if (self.c_error_jmp) |jb| {
+                    _longjmp(@ptrCast(jb), 3);
+                }
+                std.process.abort();
+            },
+            error.Yield => {
+                // builtinCoroutineResume converts every internal yield to
+                // a ResumeResult; a Yield here is an invariant breach.
+                _ = self.failC("coroutine.wrap: unexpected yield", .{}) catch {};
+                return -1;
+            },
+        };
+        self.cur_c_stack.appendSlice(self.alloc, res) catch {
+            self.alloc.free(res);
+            if (self.c_error_jmp) |jb| {
+                self.setOutOfMemoryError();
+                self.c_error_value = self.errThread().err_obj;
+                self.c_error_status = 4; // LUA_ERRMEM
+                _longjmp(@ptrCast(jb), 1);
+            }
+            std.process.abort();
+        };
+        const n: c_int = @intCast(res.len);
+        self.alloc.free(res);
+        return n;
+    }
+
+    /// PUC `luaB_auxwrap` body: resume the wrapped thread with the wrap
+    /// call's arguments; on success return the resume results MINUS the
+    /// boolean as an owned slice (PUC auxresume: luaD_poscall of the
+    /// results); on failure re-raise the coroutine's error (PUC
+    /// `lua_error`), prepending `luaL_where(L, 1)` — the position of the
+    /// frame immediately below auxwrap's C-frame — to STRING error
+    /// objects unless the coroutine died of ERRMEM (PUC checks
+    /// `stat != LUA_ERRMEM`); non-string objects re-raise as-is.
+    fn auxwrapResume(self: *Vm, th: *Thread, call_args: []const Value) DispatchError![]Value {
         if (th.status == .running) {
             return self.fail("cannot resume non-suspended coroutine", .{});
         }
@@ -24419,7 +24713,7 @@ pub const Vm = struct {
         };
 
         // P16.50-review-7 BLOCKER 4 / P16.50-review-8: resume returns its
-        // EXACT tuple `[ok] ++ values`; the iterator strips the boolean.
+        // EXACT tuple `[ok] ++ values`; the wrapper strips the boolean.
         // The owned tuple is infraAlloc'd transport — freed on every exit
         // of its arm (the returned values are a FRESH copy: a re-based
         // sub-slice could not be freed safely — shifted pointer). A span
@@ -24440,17 +24734,34 @@ pub const Vm = struct {
                     else => false,
                 };
                 if (!ok) {
-                    if (tuple.len > 1 and !(tuple[1] == .Nil)) {
-                        if (tuple[1] == .String) return self.fail("{s}", .{tuple[1].String.bytes()});
-                        self.err = null;
-                        self.errThread().err_obj = tuple[1];
-                        self.errThread().err_has_obj = true;
-                        self.errThread().err_source = null;
-                        self.errThread().err_line = -1;
-                        self.captureErrorTraceback();
-                        return error.RuntimeError;
+                    // PUC luaB_auxwrap error path: the coroutine's status
+                    // (th.api_status, mapped by the resume dead-defer)
+                    // distinguishes ERRMEM (4) — which re-raises the fixed
+                    // "not enough memory" object with NO position prefix —
+                    // from ordinary errors. A STRING object gets
+                    // luaL_where(L, 1) prepended: the position of the
+                    // frame immediately below auxwrap's C-frame (a C
+                    // caller — pcall, another C function — yields no
+                    // position; a Lua caller yields its call line). Any
+                    // other object re-raises as-is (PUC lua_error on the
+                    // moved object).
+                    const errval: Value = if (tuple.len > 1) tuple[1] else .Nil;
+                    if (errval == .Nil) {
+                        return self.fail("coroutine.wrap resume failed", .{});
                     }
-                    return self.fail("coroutine.wrap resume failed", .{});
+                    if (errval == .String and th.api_status != 4) {
+                        return self.raiseAuxwrapError(
+                            self.immediateCallerOfTopCFrame(),
+                            errval.String.bytes(),
+                        );
+                    }
+                    self.err = null;
+                    self.errThread().err_obj = errval;
+                    self.errThread().err_has_obj = true;
+                    self.errThread().err_source = null;
+                    self.errThread().err_line = -1;
+                    self.captureErrorTraceback();
+                    return error.RuntimeError;
                 }
                 const vals = tuple[1..];
                 const r = try self.allocOwnedResult(vals.len);
@@ -27246,8 +27557,8 @@ pub const Vm = struct {
     ///    including dead registers) — live_reg_top[pc] excludes dead
     ///    registers that hold no live references.
     ///
-    /// 2. gcMarkMutableRoots also marks all parked threads (wrap_thread,
-    ///    current_thread, forced_close_thread) via gcMarkValue. Parked
+    /// 2. gcMarkMutableRoots also marks all parked threads
+    ///    (current_thread, forced_close_thread) via gcMarkValue. Parked
     ///    threads' stacks do not change during atomic (they are not
     ///    running), so no re-traversal is needed.
     ///
@@ -27288,7 +27599,6 @@ pub const Vm = struct {
         // frames (the inactive-coroutine path below).
         if (self.main_thread) |mt| try self.gcMarkValue(.{ .Thread = mt });
         if (self.debug_hook_main.func) |hook| try self.gcMarkValue(hook);
-        if (self.wrap_thread) |thread| try self.gcMarkValue(.{ .Thread = thread });
         if (self.current_thread) |thread| try self.gcMarkValue(.{ .Thread = thread });
         if (self.forced_close_thread) |thread| try self.gcMarkValue(.{ .Thread = thread });
 
@@ -28553,10 +28863,13 @@ pub const Vm = struct {
     fn gcAtomicCommon(self: *Vm) DispatchError!void {
         // ── Step 1 (lgc.c:1551-1554): mark roots ──
         // PUC: markobject(g, L) + markvalue(g, &g->l_registry) + markmt(g).
-        // luazig: gcMarkMutableRoots covers all three PUC operations AND
-        // re-scans the active thread's live registers (live_reg_top[pc])
+        // luazig: gcMarkMutableRoots covers the first two PUC operations
+        // AND re-scans the active thread's live registers (live_reg_top[pc])
         // and parked threads' stacks. This is the equivalent of PUC's
-        // traversethread, which runs during propagateall (Step 2).
+        // traversethread, which runs during propagateall (Step 2). The
+        // third PUC operation, markmt(g), is NOT here: it is performed by
+        // the separate gcMarkTypeMetatables helper called immediately
+        // below.
         //
         // [PUC lgc.c:1546-1547 saves+clears grayagain HERE, before
         // markobject. luazig defers the save+clear to gcDrainGrayagain
@@ -36551,14 +36864,25 @@ pub const Vm = struct {
     }
 
     fn makeLinesIter(self: *Vm, file_v: Value, auto_close: bool, fmts: []const Value) DispatchError!Value {
-        // P16.50-review-14 HIGH 2: obj/mt/fmts_tbl live only in Zig locals
-        // between their allocation and publication — the setField/resize/
-        // metatable-prepare steps below can each fire an emergency GC.
-        // ensure(3) + infallible addAssumeCapacity closes every window
-        // (review-7 discipline).
+        // P16.50-review-15 BLOCKER 2: until `obj.__file = file_v` (and
+        // `obj.__fmts`) are published, the fresh managed file and the format
+        // values live ONLY in this Zig frame — PUC keeps them on L->stack
+        // for the whole construction window (io_lines leaves the file
+        // userdata and the format arguments below the iterator closure).
+        // Every allocation below (tables, interned field keys, array
+        // resize, metatable barrier prep) can fire an emergency GC, which
+        // would otherwise finalize/sweep the file (closing the OS handle)
+        // or reclaim a format string, leaving the iterator with a
+        // dangling/closing pointer. Root the inputs AND the fresh tables
+        // in ONE owner, reserved before the first VM-allocation so every
+        // add is infallible (review-7 discipline); inputs go in first,
+        // each allocation is added immediately, and the roots are released
+        // only after the fully-published iterator is returned.
         var roots = self.gcTempRoots();
         defer roots.end();
-        try roots.ensure(3);
+        try roots.ensure(3 + 1 + fmts.len);
+        roots.addAssumeCapacity(file_v);
+        for (fmts) |f| roots.addAssumeCapacity(f);
         const obj = try self.allocTableNoGc();
         roots.addAssumeCapacity(.{ .Table = obj });
         const mt = try self.allocTableNoGc();
@@ -44050,6 +44374,23 @@ pub const Vm = struct {
             return error.Yield;
         }
 
+        if (nret_signed == .thread_switch) {
+            // A __close metamethod in the C function's dynamic extent
+            // triggered a coroutine switch (longjmp signal 3). Mirror the
+            // yield arm: park the frame's c_stack (live TBC slots survive)
+            // and keep the C-frame on `call_frames` — `finishCcall`'s
+            // k==NULL path delivers the switch-back values as this call's
+            // results on the next resume. The switch itself is processed
+            // by the active trampoline (error.ThreadSwitch).
+            {
+                const cur_th = self.activeBytecodeThread();
+                const cur_fr = cur_th.call_frames.getPtr(my_cframe_idx);
+                self.parkCStack(cur_fr, saved_stack) catch return error.OutOfMemory;
+            }
+            stack_parked = true;
+            return error.ThreadSwitch;
+        }
+
         if (nret_signed == .lua_err) {
             // A protected Lua error (lua_error or cThrow). Fold the thrown
             // object into the VM error state first — both the YPCALL and
@@ -46452,9 +46793,19 @@ pub const Vm = struct {
                 // locals until publication (ccl's metatable / the stack
                 // append); the setField/prepare steps below can fire an
                 // emergency GC. ensure(3) + infallible addAssumeCapacity
-                // closes every window (review-7 discipline; upvals/ccl were
-                // previously rooted with fallible adds — mt not at all).
+                // closes every window (review-7 discipline).
                 try roots.ensure(3);
+                // P16.50-review-15 HIGH 1: PUC lua_pushcclosure (lapi.c:609+)
+                // builds the CClosure FIRST and only then — infallibly —
+                // replaces the top n stack values with it; a construction
+                // failure leaves the stack untouched. Reserve the result
+                // slot up front (the only fallible stack operation; the
+                // items themselves are not touched) and keep the upvalues
+                // on the parked script stack — a GC root (gcMarkMutableRoots
+                // marks every parked value, the non-moving analog of PUC's
+                // traversethread marking L->stack[0..top]) — for the whole
+                // construction. The commit below is the ONLY stack mutation.
+                try st.ensureUnusedCapacity(self.infraAlloc(), 1);
 
                 const upvals = try self.allocTable(null);
                 roots.addAssumeCapacity(.{ .Table = upvals });
@@ -46463,7 +46814,6 @@ pub const Vm = struct {
                 for (0..n) |i| {
                     try self.tableSetValue(upvals, .{ .Int = @intCast(i + 1) }, st.items[base + i]);
                 }
-                st.items.len = base;
                 const ccl = try self.allocTable(null);
                 roots.addAssumeCapacity(.{ .Table = ccl });
 
@@ -46482,7 +46832,12 @@ pub const Vm = struct {
                 roots.addAssumeCapacity(.{ .Table = mt });
                 try self.setField(mt, "__call", .{ .Builtin = .testc_testC });
                 try self.gcStoreMetatable(ccl, mt);
-                try st.append(self.infraAlloc(), .{ .Table = ccl });
+                // Infallible commit (PUC lua_pushcclosure's atomic
+                // replacement of the top n values with the closure): every
+                // failure path above returns with the caller's stack
+                // byte-identical — upvalues intact, nothing half-appended.
+                st.items.len = base;
+                st.appendAssumeCapacity(.{ .Table = ccl });
             },
             .gettop => {
                 if (cargs.len != 0) return self.fail("testC gettop expects 0 args", .{});
@@ -48659,7 +49014,6 @@ pub const Vm = struct {
         t[@intFromEnum(BuiltinId.coroutine_resume)] = 0;
         t[@intFromEnum(BuiltinId.coroutine_yield)] = 0;
         t[@intFromEnum(BuiltinId.coroutine_close)] = 2;
-        t[@intFromEnum(BuiltinId.coroutine_wrap_iter)] = 0;
         t[@intFromEnum(BuiltinId.next)] = 2;
         // P16.50-review-7 BLOCKER 4: dofile returns the chunk's EXACT
         // returns as an owned slice (PUC luaB_dofile: MULTRET, no bound;
@@ -52820,7 +53174,7 @@ test "P16.50: thread constructor OOM transactionality" {
         const snap = try P50Snapshot.take(&vm, testing.allocator);
         defer snap.deinit(testing.allocator);
 
-        var args = [_]Value{.{ .Builtin = .coroutine_wrap_iter }};
+        var args = [_]Value{.{ .Builtin = .type }};
         var outs = [_]Value{.Nil};
         vm.alloc = failing.allocator();
         const result = vm.builtinCoroutineCreate(args[0..], outs[0..]);
@@ -55262,7 +55616,7 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
             const snap = try P50Snapshot.take(&vm, testing.allocator);
             defer snap.deinit(testing.allocator);
 
-            var args = [_]Value{.{ .Builtin = .coroutine_wrap_iter }};
+            var args = [_]Value{.{ .Builtin = .type }};
             var outs = [_]Value{.Nil};
             vm.alloc = failing.allocator();
             const result = vm.builtinCoroutineCreate(args[0..], outs[0..]);
@@ -58847,6 +59201,13 @@ test "P16.50-review-7 B3.4c: close continuation parks across yield and resumes e
 
     var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
+    // The chunk calls the coroutine.wrap closure — a REAL C closure since
+    // P16.50-review-15 — so the dispatcher reaches callCFunction, whose
+    // contract requires an active lua_State handle (cur_handle). vm.deinit
+    // does not free the main handle (lua_close/api.State.deinit owns that),
+    // so free it explicitly to keep this test on the leak-checked allocator.
+    const main_h = try vm.setupMainHandle();
+    defer vm.freeStateHandle(main_h);
     vm.setDynamicBytecodeCompiler(defaultBytecodeCompiler);
 
     const src =
@@ -61679,8 +62040,21 @@ test "P16.50-review-14 B1: type-level metatable stored mid-cycle survives the re
     // un-rooting of the metatable and the controlled mid-cycle store.
     const field_key: Value = .{ .String = try vm.internStr("r14field") };
     const len_key: Value = .{ .String = try vm.internStr("__len") };
+
+    // Carrier roots for the WHOLE loop (review-15 HIGH 2): the Thread and
+    // the representative string are targets of later iterations, but the
+    // loop runs several REAL full collections before their iteration —
+    // held only in Zig locals they had an unrooted-lifetime window and
+    // could be swept by any of those cycles. Rooting them for the whole
+    // loop closes that window without weakening the proof: the test's
+    // subject is the mid-cycle metatable slot, not the carrier's own
+    // reachability.
+    var carrier_roots = vm.gcTempRoots();
+    defer carrier_roots.end();
     const str_val: Value = .{ .String = try vm.internStr("r14str") };
+    try carrier_roots.add(str_val);
     const th = try vm.apiNewThread(.Nil);
+    try carrier_roots.add(.{ .Thread = th });
 
     // One representative value per type-level slot (Int and Num share the
     // number slot; both arms are exercised).
@@ -61866,52 +62240,87 @@ test "P16.50-review-14 2a: testC setmetatable runs the full lua_setmetatable pat
     // reserve edge. Each failure must leave the caller's testC stack
     // byte-exact (3 items) with NOTHING published; the first success
     // commits the store AND pops exactly the metatable ──
+    // review-15 HIGH 2 (test honesty): a FRESH VM per iteration. The
+    // r13/r14 form deinit'd the live VM's GC lists (including
+    // `finalizables`) between iterations to force every reserve to
+    // allocate — a live-VM `finalizables.deinit` that review-14's prose
+    // wrongly claimed was fully removed. A fresh VM starts with all
+    // worklists genuinely empty (the exact state the manual resets
+    // simulated), so the same reserve edges are armed with no live-VM
+    // registry destruction at all. One honest consequence, asserted
+    // RELATIVELY below: a fresh VM's bootstrap registers the 3 standard
+    // io files (stdin/stdout/stderr managed file objects with __gc) in
+    // `finalizables`, so publication counts are checked against each
+    // iteration's own pre-script baseline, not as absolute 0/1.
     {
-        var roots = vm.gcTempRoots();
-        defer roots.end();
-        // OLD black owner + young white __gc metatable in generational
-        // minor mode (r13 setup): arms every transaction reserve
-        // (finalizables, gray, old1).
-        _ = vm.gcControl(7, 0, -1); // LUA_GCGENERATIONAL
-        _ = vm.gcControl(2, 0, -1); // LUA_GCCOLLECT
-        const owner = try vm.apiNewTable();
-        try roots.add(.{ .Table = owner });
-        _ = vm.gcControl(2, 0, -1); // promote the owner OLD/black
-        const mt = try vm.apiNewTable();
-        try roots.add(.{ .Table = mt });
-        try vm.apiSetTable(.{ .Table = mt }, .{ .String = try vm.internStr("__gc") }, .{ .Builtin = .type });
-        try testing.expect(owner.metatable == null);
-
-        const base = vm.testc_alloc_base orelse vm.alloc;
         var boundary: ?usize = null;
-        for (0..16) |fi| {
-            // Fresh lists force every reserve to actually allocate (r13).
-            vm.gc_gray.deinit(vm.alloc);
-            vm.gc_gray = .empty;
-            vm.gc_old1.deinit(vm.alloc);
-            vm.gc_old1 = .empty;
-            vm.gc_grayagain.deinit(vm.alloc);
-            vm.gc_grayagain = .empty;
-            vm.finalizables.deinit(vm.alloc);
-            vm.finalizables = .empty;
+        for (0..24) |fi| {
+            var vm_b: Vm = .init(testing.allocator, false);
+            defer vm_b.deinit();
+
+            var roots = vm_b.gcTempRoots();
+            defer roots.end();
+            // OLD black owner + young white __gc metatable in generational
+            // minor mode (r13 setup): arms every transaction reserve
+            // (finalizables, gray, old1).
+            _ = vm_b.gcControl(7, 0, -1); // LUA_GCGENERATIONAL
+            _ = vm_b.gcControl(2, 0, -1); // LUA_GCCOLLECT
+            const owner = try vm_b.apiNewTable();
+            try roots.add(.{ .Table = owner });
+            _ = vm_b.gcControl(2, 0, -1); // promote the owner OLD/black
+            const mt = try vm_b.apiNewTable();
+            try roots.add(.{ .Table = mt });
+            try vm_b.apiSetTable(.{ .Table = mt }, .{ .String = try vm_b.internStr("__gc") }, .{ .Builtin = .type });
+            try testing.expect(owner.metatable == null);
+
+            // The failing allocator rides the infraAlloc seam
+            // (testc_alloc_base): the transaction reserves and the script
+            // machinery allocate through infraAlloc, exactly as in the
+            // r13/r14 form.
+            const base = vm_b.testc_alloc_base orelse vm_b.alloc;
             var st: std.ArrayListUnmanaged(Value) = .empty;
-            defer st.deinit(vm.alloc);
-            try st.append(vm.alloc, .Nil);
-            try st.append(vm.alloc, .{ .Table = owner });
-            try st.append(vm.alloc, .{ .Table = mt });
+            defer st.deinit(vm_b.alloc);
+            try st.append(vm_b.alloc, .Nil);
+            try st.append(vm_b.alloc, .{ .Table = owner });
+            try st.append(vm_b.alloc, .{ .Table = mt });
+            // Pre-script baseline: every publication count below is
+            // relative to THIS fresh VM's state (bootstrap io files are
+            // already in `finalizables`; the two setup collects left the
+            // mark worklists drained).
+            const fin_base = vm_b.finalizables.count();
+            const gray_base = vm_b.gc_gray.items.len;
+            const old1_base = vm_b.gc_old1.items.len;
+            const grayagain_base = vm_b.gc_grayagain.items.len;
             var failing = std.testing.FailingAllocator.init(base, .{
                 .fail_index = fi,
                 .resize_fail_index = 0,
             });
-            vm.testc_alloc_base = failing.allocator();
-            const result = vm.runTestcScript(script, &st, .{}, null);
-            vm.testc_alloc_base = base;
+            vm_b.testc_alloc_base = failing.allocator();
+            const result = vm_b.runTestcScript(script, &st, .{}, null);
+            vm_b.testc_alloc_base = base;
             if (result) |_| {
                 boundary = fi;
                 // Success: the transaction committed AND the pop happened
                 // (lapi.c:998) — the script and owner remain.
                 try testing.expectEqual(@as(usize, 2), st.items.len);
                 try testing.expect(owner.metatable == mt);
+                // Post-success publications exactly once (r13 boundary
+                // contract): the store, the forward barrier (gray + old1)
+                // and the __gc registration — NO grayagain re-queue (HIGH 1:
+                // PUC lua_setmetatable runs only the forward
+                // luaC_objbarrier). Exactly +1 over the fresh VM's own
+                // baseline (the bootstrap io files stay registered).
+                try testing.expect(vm_b.finalizables.contains(.{ .table = owner }));
+                try testing.expectEqual(fin_base + 1, vm_b.finalizables.count());
+                try testing.expectEqual(gray_base + 1, vm_b.gc_gray.items.len);
+                try testing.expectEqual(old1_base + 1, vm_b.gc_old1.items.len);
+                try testing.expectEqual(grayagain_base, vm_b.gc_grayagain.items.len);
+                // REAL full cycle after the boundary success (review-14
+                // test honesty): the rooted owner + metatable survive and
+                // the __gc registration persists (registered, not run).
+                _ = vm_b.gcControl(2, 0, -1); // LUA_GCCOLLECT — real full cycle
+                try testing.expect(owner.metatable == mt);
+                try testing.expect(vm_b.finalizables.contains(.{ .table = owner }));
                 break;
             } else |e| {
                 try testing.expect(e == error.OutOfMemory);
@@ -61920,27 +62329,17 @@ test "P16.50-review-14 2a: testC setmetatable runs the full lua_setmetatable pat
                 try testing.expectEqual(@as(usize, 3), st.items.len);
                 try testing.expect(st.items[1] == .Table and st.items[1].Table == owner);
                 try testing.expect(st.items[2] == .Table and st.items[2].Table == mt);
-                // Nothing published pre-commit.
+                // Nothing published pre-commit: the owner is absent and
+                // every worklist is back at its own baseline.
                 try testing.expect(owner.metatable == null);
-                try testing.expectEqual(@as(usize, 0), vm.finalizables.count());
+                try testing.expect(!vm_b.finalizables.contains(.{ .table = owner }));
+                try testing.expectEqual(fin_base, vm_b.finalizables.count());
+                try testing.expectEqual(gray_base, vm_b.gc_gray.items.len);
+                try testing.expectEqual(old1_base, vm_b.gc_old1.items.len);
+                try testing.expectEqual(grayagain_base, vm_b.gc_grayagain.items.len);
             }
         }
         try testing.expect(boundary != null);
-        // Post-success publications exactly once (r13 boundary contract):
-        // the store, the forward barrier (gray + old1) and the __gc
-        // registration — NO grayagain re-queue (HIGH 1: PUC
-        // lua_setmetatable runs only the forward luaC_objbarrier).
-        try testing.expect(vm.finalizables.contains(.{ .table = owner }));
-        try testing.expectEqual(@as(usize, 1), vm.finalizables.count());
-        try testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
-        try testing.expectEqual(@as(usize, 1), vm.gc_old1.items.len);
-        try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
-        // REAL full cycle after the boundary success (review-14 test
-        // honesty): the rooted owner + metatable survive and the __gc
-        // registration persists (registered, not run).
-        _ = vm.gcControl(2, 0, -1); // LUA_GCCOLLECT — real full cycle
-        try testing.expect(owner.metatable == mt);
-        try testing.expect(vm.finalizables.contains(.{ .table = owner }));
     }
 }
 
@@ -62086,16 +62485,156 @@ const R14High2EmergencyAlloc = struct {
     }
 };
 
-test "P16.50-review-14 HIGH 2: coroutine.wrap intermediates survive emergency GC and OOM edges" {
+/// Emergency-GC allocator for the wrap C-closure construction: fires one
+/// emergency full GC at the first allocation AFTER the k-th constructed
+/// GC object (Thread/Cell/Closure — the wrap construction's object
+/// sequence), then retries (PUC luaM_realloc_ tryagain).
+const R15B1EmergencyAlloc = struct {
+    base: std.mem.Allocator,
+    vm: *Vm,
+    k: usize,
+    objects_seen: usize = 0,
+    fired: bool = false,
+
+    fn allocator(self: *R15B1EmergencyAlloc) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = emergAlloc,
+            .resize = emergResize,
+            .remap = emergRemap,
+            .free = emergFree,
+        } };
+    }
+
+    fn isObjectSize(len: usize) bool {
+        return len == @sizeOf(Thread) or len == @sizeOf(Cell) or len == @sizeOf(Closure);
+    }
+
+    fn emergAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *R15B1EmergencyAlloc = @ptrCast(@alignCast(ctx));
+        if (!self.fired and self.objects_seen >= self.k) {
+            self.fired = true;
+            // Emergency full GC from the failed allocation (PUC tryagain).
+            // The conservative emergency scan never sees Zig locals —
+            // whatever is not in a GC root at this moment is swept.
+            self.vm.testcEmergencyCollect();
+        }
+        const r = self.base.rawAlloc(len, alignment, ret_addr);
+        if (r != null and isObjectSize(len)) self.objects_seen += 1;
+        return r;
+    }
+
+    fn emergResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *R15B1EmergencyAlloc = @ptrCast(@alignCast(ctx));
+        return self.base.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn emergRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *R15B1EmergencyAlloc = @ptrCast(@alignCast(ctx));
+        return self.base.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn emergFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *R15B1EmergencyAlloc = @ptrCast(@alignCast(ctx));
+        self.base.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+/// Emergency-GC allocator for the io.lines construction (review-15
+/// BLOCKER 2): fires ONE full GC at the `edge`-th allocation through
+/// vm.alloc of ANY size — the construction's GC-capable edges include
+/// interned field-name strings and array/hash growth, not just the three
+/// tables — then retries (PUC luaM_realloc_ tryagain). `regular` selects
+/// WHICH full GC fires: an emergency one (finalizers suppressed — PUC
+/// gcemergency) or a REGULAR one (finalizers run — the production
+/// auto-cycle analog: an allocation-triggered incremental cycle can
+/// reach atomic separation + finalization while the mutator holds
+/// unrooted Zig locals).
+const R15B2EdgeEmergencyAlloc = struct {
+    base: std.mem.Allocator,
+    vm: *Vm,
+    edge: usize,
+    regular: bool = false,
+    allocs_seen: usize = 0,
+    fired: bool = false,
+
+    fn allocator(self: *R15B2EdgeEmergencyAlloc) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = edgeAlloc,
+            .resize = edgeResize,
+            .remap = edgeRemap,
+            .free = edgeFree,
+        } };
+    }
+
+    fn edgeAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *R15B2EdgeEmergencyAlloc = @ptrCast(@alignCast(ctx));
+        self.allocs_seen += 1;
+        if (!self.fired and self.allocs_seen >= self.edge) {
+            self.fired = true;
+            // One full GC from the failed allocation (PUC tryagain). The
+            // conservative emergency scan never sees Zig locals — whatever
+            // is not in a GC root at this moment is condemned. The regular
+            // variant additionally RUNS the finalizers (the auto-cycle
+            // shape that actually closes a condemned fresh file
+            // mid-construction).
+            if (self.regular) {
+                self.vm.gcCycleFull() catch {};
+            } else {
+                self.vm.testcEmergencyCollect();
+            }
+        }
+        return self.base.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn edgeResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *R15B2EdgeEmergencyAlloc = @ptrCast(@alignCast(ctx));
+        return self.base.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn edgeRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *R15B2EdgeEmergencyAlloc = @ptrCast(@alignCast(ctx));
+        return self.base.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn edgeFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *R15B2EdgeEmergencyAlloc = @ptrCast(@alignCast(ctx));
+        self.base.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+/// Order-independent registry/accounting comparison for constructions
+/// whose failure garbage is swept by a post-failure full cycle (review-15
+/// BLOCKER 2 / HIGH 1 OOM segments). Compares the GC registry size, every
+/// baseline object's continued registration, the young list and the exact
+/// gc_count_kb ledger. The per-type testc_obj_* counters are deliberately
+/// NOT compared: they are rollback-only diagnostics that sweep never
+/// decrements (pre-existing behavior), so any swept garbage leaves them
+/// permanently elevated.
+fn r15b2CompareRegistry(snap: *const P50Snapshot, vm: *Vm) !void {
+    const testing = std.testing;
+    try testing.expectEqual(snap.gc_objects.len, vm.gc_objects.items.len);
+    for (snap.gc_objects) |o| try testing.expect(p50StillRegistered(vm, o));
+    try testing.expectEqual(snap.young.len, vm.gc_young_objects.items.len);
+    for (snap.young) |o| try testing.expect(p50StillRegistered(vm, o));
+    // gc_count_kb arithmetic is exact in f64 (dyadic-rational charges).
+    try testing.expectEqual(snap.gc_count_kb, vm.gc_count_kb);
+}
+
+test "P16.50-review-15 BLOCKER 1: coroutine.wrap C-closure construction survives emergency GC and OOM edges" {
     const testing = std.testing;
 
     // ── (A) emergency-GC matrix: fire at the first allocation after the
-    // k-th Table (obj, mt) — every inter-table window must keep the
-    // construction alive ──
+    // k-th constructed object — every inter-object window must keep the
+    // construction alive (the thread is rooted via gcTempRoots; the
+    // cell/closure are rooted inside allocCclosure). The construction
+    // performs exactly three counted allocations (thread, cell, closure)
+    // and NOTHING after the closure, so the real windows are k=1 (after
+    // the thread: the cell or a thread-buffer allocation) and k=2 (after
+    // the cell: the closure allocation itself). ──
     for (1..3) |k| {
         var vm: Vm = .init(testing.allocator, false);
         defer vm.deinit();
-        var emerg = R14High2EmergencyAlloc{ .base = testing.allocator, .vm = &vm, .k = k };
+        var emerg = R15B1EmergencyAlloc{ .base = testing.allocator, .vm = &vm, .k = k };
         vm.alloc = emerg.allocator();
         var outs: [1]Value = .{.Nil};
         const r = vm.builtinCoroutineWrap(&.{.{ .Builtin = .type }}, outs[0..]);
@@ -62103,34 +62642,44 @@ test "P16.50-review-14 HIGH 2: coroutine.wrap intermediates survive emergency GC
         try r; // tryagain semantics: collect, retry, succeed
         try testing.expect(emerg.fired);
 
-        // Identity: the published wrapper is fully wired.
-        try testing.expect(outs[0] == .Table);
-        const obj = outs[0].Table;
-        const mt = obj.metatable.?;
-        const callv = vm.getFieldOpt(mt, "__call").?;
-        try testing.expect(callv == .Builtin and callv.Builtin == .coroutine_wrap_iter);
-        const thv = vm.getFieldOpt(obj, "__thread").?;
-        try testing.expect(thv == .Thread and vm.wrap_thread == thv.Thread);
+        // Identity: the published wrapper is a REAL C closure (PUC
+        // luaB_cowrap: cocreate + lua_pushcclosure(luaB_auxwrap, 1)) whose
+        // single CLOSED upvalue holds the thread — no wrapper Table, no
+        // metatable, no VM-global side channel.
+        try testing.expect(outs[0] == .Closure);
+        const cl = outs[0].Closure;
+        try testing.expect(cl.proto == null);
+        try testing.expect(cl.c_func != null);
+        try testing.expect(cl.c_func.? == Vm.coroutineWrapAuxwrap);
+        try testing.expectEqual(@as(usize, 1), cl.upvalues.len);
+        try testing.expect(cl.upvalues[0].value == .Thread);
+        const th = cl.upvalues[0].value.Thread;
+        try testing.expect(th.callee == .Builtin and th.callee.Builtin == .type);
+        try testing.expect(th.status == .suspended);
 
-        // A REAL full cycle after the emergency: the rooted wrapper (and
-        // mt + thread through it) survives.
+        // A REAL full cycle after the emergency: the rooted closure (and
+        // cell + thread through it) survives.
         var roots = vm.gcTempRoots();
         defer roots.end();
-        try roots.add(.{ .Table = obj });
+        try roots.add(.{ .Closure = cl });
         try vm.gcCycleFull();
-        try testing.expect(p50StillRegistered(&vm, .{ .table = obj }));
-        try testing.expect(p50StillRegistered(&vm, .{ .table = mt }));
-        try testing.expect(vm.getFieldOpt(obj, "__thread").? == .Thread);
+        try testing.expect(p50StillRegistered(&vm, .{ .closure = cl }));
+        try testing.expect(p50StillRegistered(&vm, .{ .cell = cl.upvalues[0] }));
+        try testing.expect(p50StillRegistered(&vm, .{ .thread = th }));
     }
 
     // ── (B) OOM edge sweep: every allocation edge fails once; each
-    // failure publishes NOTHING and leaves a REAL-full-cycle-clean state;
-    // the first success publishes the full wrapper ──
+    // failure publishes NOTHING, rolls every intermediate back (the old
+    // `wrap_thread` root retained a failed construction's thread forever)
+    // and leaves a REAL-full-cycle-clean state; the first success
+    // publishes the full wrapper ──
     {
         var vm: Vm = .init(testing.allocator, false);
         defer vm.deinit();
+        const snap0 = try P50Snapshot.take(&vm, testing.allocator);
+        defer snap0.deinit(testing.allocator);
         var boundary: ?usize = null;
-        for (0..32) |fi| {
+        for (0..16) |fi| {
             var outs: [1]Value = .{.Nil};
             var failing = std.testing.FailingAllocator.init(testing.allocator, .{
                 .fail_index = fi,
@@ -62141,30 +62690,57 @@ test "P16.50-review-14 HIGH 2: coroutine.wrap intermediates survive emergency GC
             vm.alloc = testing.allocator;
             if (r) |_| {
                 boundary = fi;
-                try testing.expect(outs[0] == .Table);
-                const obj = outs[0].Table;
-                const mt = obj.metatable.?;
-                const callv = vm.getFieldOpt(mt, "__call").?;
-                try testing.expect(callv == .Builtin and callv.Builtin == .coroutine_wrap_iter);
+                try testing.expect(outs[0] == .Closure);
+                const cl = outs[0].Closure;
+                try testing.expect(cl.c_func.? == Vm.coroutineWrapAuxwrap);
+                try testing.expect(cl.upvalues[0].value == .Thread);
                 var roots = vm.gcTempRoots();
                 defer roots.end();
-                try roots.add(.{ .Table = obj });
+                try roots.add(.{ .Closure = cl });
                 try vm.gcCycleFull();
-                try testing.expect(p50StillRegistered(&vm, .{ .table = obj }));
-                try testing.expect(p50StillRegistered(&vm, .{ .table = mt }));
+                try testing.expect(p50StillRegistered(&vm, .{ .closure = cl }));
+                try testing.expect(p50StillRegistered(&vm, .{ .cell = cl.upvalues[0] }));
+                try testing.expect(p50StillRegistered(&vm, .{ .thread = cl.upvalues[0].value.Thread }));
                 break;
             } else |e| {
                 try testing.expect(e == error.OutOfMemory);
                 // Nothing published: outs[0] untouched.
                 try testing.expect(outs[0] == .Nil);
-                // REAL full cycle after the failure: the partial garbage
-                // (thread/tables that never got published) is swept with no
-                // crash and no dangling publication.
+                // Exact rollback: registries, young list, and per-type
+                // counters match the pre-call snapshot (the old global
+                // wrap_thread root kept the failed construction's thread
+                // registered here — this assert is the honest negative).
+                try snap0.assertRestored(&vm);
+                // REAL full cycle after the failure: clean, no crash, and
+                // still nothing retained.
                 try vm.gcCycleFull();
-                try testing.expect(outs[0] == .Nil);
+                try snap0.assertRestored(&vm);
             }
         }
         try testing.expect(boundary != null);
+    }
+
+    // ── (C) lifecycle: dropping the last wrapper reference collects the
+    // Closure, its upvalue Cell, AND the wrapped Thread — the thread is
+    // reachable ONLY through the closure's closed upvalue (PUC ownership;
+    // the old Table/__thread façade had the same graph, but the old
+    // wrap_thread global retained the most recent thread unconditionally).
+    {
+        var vm: Vm = .init(testing.allocator, false);
+        defer vm.deinit();
+        var outs: [1]Value = .{.Nil};
+        try vm.builtinCoroutineWrap(&.{.{ .Builtin = .type }}, outs[0..]);
+        const cl = outs[0].Closure;
+        const cell = cl.upvalues[0];
+        const th = cell.value.Thread;
+        try testing.expect(p50StillRegistered(&vm, .{ .closure = cl }));
+        try testing.expect(p50StillRegistered(&vm, .{ .cell = cell }));
+        try testing.expect(p50StillRegistered(&vm, .{ .thread = th }));
+        outs[0] = .Nil; // drop the last reference
+        try vm.gcCycleFull();
+        try testing.expect(!p50StillRegistered(&vm, .{ .closure = cl }));
+        try testing.expect(!p50StillRegistered(&vm, .{ .cell = cell }));
+        try testing.expect(!p50StillRegistered(&vm, .{ .thread = th }));
     }
 }
 
@@ -62239,98 +62815,230 @@ test "P16.50-review-14 HIGH 2: ensureDebugRegistry intermediates survive emergen
     }
 }
 
-test "P16.50-review-14 HIGH 2: io lines iterator intermediates survive emergency GC and OOM edges" {
+/// One edge iteration of the review-15 BLOCKER 2 matrix: fresh VM, real
+/// file, fresh format interns, ONE full GC (emergency or regular) fired
+/// at allocation `edge` of the makeLinesIter construction, then the full
+/// verification: iterator identity (same file table, same format
+/// strings), file OPEN and registered, iterator EXECUTION, and the
+/// full-GC lifecycle (rooted → survives open; dropped → finalized then
+/// freed). Returns whether the GC fired (false ⇒ the construction used
+/// fewer allocations — the matrix is complete).
+fn r15b2EdgeIteration(path: []const u8, edge: usize, regular: bool) !bool {
     const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
 
-    // ── (A) emergency-GC matrix over the three fresh tables (obj, mt,
-    // fmts_tbl) ──
-    for (1..4) |k| {
-        var vm: Vm = .init(testing.allocator, false);
-        defer vm.deinit();
-        var emerg = R14High2EmergencyAlloc{ .base = testing.allocator, .vm = &vm, .k = k };
-        vm.alloc = emerg.allocator();
-        const r = vm.makeLinesIter(.{ .Int = 42 }, true, &.{ .{ .Int = 7 }, .{ .Int = 8 } });
-        vm.alloc = testing.allocator;
-        const objv = try r;
-        try testing.expect(emerg.fired);
-
-        // Identity: the iterator is fully wired.
-        try testing.expect(objv == .Table);
-        const obj = objv.Table;
-        const mt = obj.metatable.?;
-        const callv = vm.getFieldOpt(mt, "__call").?;
-        try testing.expect(callv == .Builtin and callv.Builtin == .io_lines_iter);
-        const filev = vm.getFieldOpt(obj, "__file").?;
-        try testing.expect(filev == .Int and filev.Int == 42);
-        const acv = vm.getFieldOpt(obj, "__auto_close").?;
-        try testing.expect(acv == .Bool and acv.Bool);
-        const cev = vm.getFieldOpt(obj, "__closed_error").?;
-        try testing.expect(cev == .Bool and !cev.Bool);
-        const fmtsv = vm.getFieldOpt(obj, "__fmts").?;
-        try testing.expect(fmtsv == .Table);
-        const fmts_tbl = fmtsv.Table;
-        try testing.expectEqual(@as(usize, 2), fmts_tbl.array.len);
-        try testing.expect(fmts_tbl.array[0] == .Int and fmts_tbl.array[0].Int == 7);
-        try testing.expect(fmts_tbl.array[1] == .Int and fmts_tbl.array[1].Int == 8);
-
-        // A REAL full cycle: the rooted iterator (and mt/fmts through it)
-        // survives with every field intact.
-        var roots = vm.gcTempRoots();
-        defer roots.end();
-        try roots.add(.{ .Table = obj });
-        try vm.gcCycleFull();
-        try testing.expect(p50StillRegistered(&vm, .{ .table = obj }));
-        try testing.expect(p50StillRegistered(&vm, .{ .table = mt }));
-        try testing.expect(p50StillRegistered(&vm, .{ .table = fmts_tbl }));
-        try testing.expect(vm.getFieldOpt(obj, "__file").? == .Int);
+    // Pre-warm the temp-roots buffers so makeLinesIter's own
+    // roots.ensure() allocates nothing: the matrix then covers exactly
+    // the construction window (every allocation AFTER the inputs are
+    // rooted). The residual cold-buffer ensure edge is a TempRoots
+    // mechanism property shared by every constructor, not this defect —
+    // see the report finding.
+    {
+        var warm = vm.gcTempRoots();
+        defer warm.end();
+        try warm.ensure(8);
     }
 
-    // ── (B) OOM edge sweep ──
+    // Fresh managed file via the REAL opener (finalizer registered,
+    // file_metatable from bootstrapGlobals).
+    var open_out = [_]Value{ .Nil, .Nil, .Nil };
+    const file_v = (try vm.ioOpenPath(path, "r", open_out[0..])).?;
+    try testing.expect(vm.getManagedFile(file_v) != null);
+
+    // Collectable format values: interned short strings are sweepable
+    // (string_intern is not a marking root), so they are genuine rooting
+    // inputs. Assert they are FRESH interns — a pre-existing intern
+    // reachable from bootstrap state would make the fmts rooting proof
+    // vacuous.
+    try testing.expect(vm.string_intern.lookup("*l", p50InternHash(&vm, "*l")) == null);
+    try testing.expect(vm.string_intern.lookup("*L", p50InternHash(&vm, "*L")) == null);
+    const fmts = [_]Value{ .{ .String = try vm.internStr("*l") }, .{ .String = try vm.internStr("*L") } };
+
+    var emerg = R15B2EdgeEmergencyAlloc{ .base = testing.allocator, .vm = &vm, .edge = edge, .regular = regular };
+    vm.alloc = emerg.allocator();
+    const r = vm.makeLinesIter(file_v, true, fmts[0..]);
+    vm.alloc = testing.allocator;
+    const objv = try r;
+
+    // Identity: the iterator is fully wired with the SAME file table and
+    // the SAME format strings (pointer identity — a swept-and-recreated
+    // input would differ).
+    try testing.expect(objv == .Table);
+    const obj = objv.Table;
+    const mt = obj.metatable.?;
+    const callv = vm.getFieldOpt(mt, "__call").?;
+    try testing.expect(callv == .Builtin and callv.Builtin == .io_lines_iter);
+    const fv = vm.getFieldOpt(obj, "__file").?;
+    try testing.expect(fv == .Table and fv.Table == file_v.Table);
+    const acv = vm.getFieldOpt(obj, "__auto_close").?;
+    try testing.expect(acv == .Bool and acv.Bool);
+    const cev = vm.getFieldOpt(obj, "__closed_error").?;
+    try testing.expect(cev == .Bool and !cev.Bool);
+    const fmtsv = vm.getFieldOpt(obj, "__fmts").?;
+    try testing.expect(fmtsv == .Table);
+    const fmts_tbl = fmtsv.Table;
+    try testing.expectEqual(@as(usize, 2), fmts_tbl.array.len);
+    try testing.expect(fmts_tbl.array[0] == .String and fmts_tbl.array[0].String == fmts[0].String);
+    try testing.expect(fmts_tbl.array[1] == .String and fmts_tbl.array[1].String == fmts[1].String);
+    // The file survived the fired edge OPEN and registered.
+    try testing.expect(vm.getManagedFile(file_v) != null);
+    try testing.expect(p50StillRegistered(&vm, .{ .table = obj }));
+    try testing.expect(p50StillRegistered(&vm, .{ .table = file_v.Table }));
+
+    // EXECUTE the iterator: "*l" strips the newline, "*L" keeps it.
+    var outs = [_]Value{ .Nil, .Nil };
+    try vm.builtinIoLinesIter(&.{objv}, outs[0..]);
+    try testing.expect(outs[0] == .String and std.mem.eql(u8, outs[0].String.bytes(), "l1"));
+    try testing.expect(outs[1] == .String and std.mem.eql(u8, outs[1].String.bytes(), "l2\n"));
+
+    // Full-GC lifecycle, iterator rooted: everything survives and the
+    // file stays OPEN — it was never white at a cycle's separation point,
+    // so no finalizer ever ran (the BLOCKER 2 failure mode: an unrooted
+    // file is condemned mid-construction and finalized by a regular
+    // cycle despite the live iterator).
+    {
+        var roots = vm.gcTempRoots();
+        defer roots.end();
+        try roots.add(objv);
+        try vm.gcCycleFull();
+    }
+    try testing.expect(p50StillRegistered(&vm, .{ .table = obj }));
+    try testing.expect(p50StillRegistered(&vm, .{ .table = mt }));
+    try testing.expect(p50StillRegistered(&vm, .{ .table = fmts_tbl }));
+    try testing.expect(p50StillRegistered(&vm, .{ .table = file_v.Table }));
+    try testing.expect(vm.getManagedFile(file_v) != null);
+    var outs2 = [_]Value{ .Nil, .Nil };
+    try vm.builtinIoLinesIter(&.{objv}, outs2[0..]);
+    try testing.expect(outs2[0] == .String and std.mem.eql(u8, outs2[0].String.bytes(), "l3"));
+    try testing.expect(outs2[1] == .Nil);
+
+    // Drop the iterator: cycle 1 sweeps obj/mt/fmts_tbl and finalizes
+    // (closes) the file — which stays registered (two-cycle finalization
+    // contract) — cycle 2 frees it.
+    try vm.gcCycleFull();
+    try testing.expect(!p50StillRegistered(&vm, .{ .table = obj }));
+    try testing.expect(!p50StillRegistered(&vm, .{ .table = mt }));
+    try testing.expect(!p50StillRegistered(&vm, .{ .table = fmts_tbl }));
+    try testing.expect(vm.getManagedFile(file_v) == null);
+    try testing.expect(p50StillRegistered(&vm, .{ .table = file_v.Table }));
+    try vm.gcCycleFull();
+    try testing.expect(!p50StillRegistered(&vm, .{ .table = file_v.Table }));
+
+    return emerg.fired;
+}
+
+test "P16.50-review-15 BLOCKER 2: io.lines roots the fresh file and formats across every construction edge" {
+    const testing = std.testing;
+
+    // Real temp file: the defect shape is io.lines(filename) — a FRESH
+    // managed file held only in a Zig local (builtinIoLines' ioOpenPath
+    // result) across makeLinesIter's construction allocations. The
+    // iterator must read real lines back after every fired edge.
+    const io = stdio.activeIo();
+    var path_buf: [128]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/tmp/opencode/r15b2_lines_{d}.txt", .{std.c.getpid()}) catch unreachable;
+    {
+        const f = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "l1\nl2\nl3\n");
+    }
+    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+
+    // ── (A) emergency-GC matrix: fire ONE emergency full GC (finalizers
+    // suppressed — PUC gcemergency) at EVERY allocation edge of the
+    // construction (any size) ──
+    var any_fired = false;
+    var edge: usize = 1;
+    while (edge <= 64) : (edge += 1) {
+        if (try r15b2EdgeIteration(path, edge, false)) any_fired = true else break;
+    }
+    try testing.expect(any_fired);
+
+    // ── (A2) regular-cycle matrix: fire ONE REGULAR full GC (finalizers
+    // RUN) at EVERY allocation edge — the production auto-cycle analog.
+    // This is the path that actually closes a condemned unrooted fresh
+    // file mid-construction: an allocation-triggered incremental cycle
+    // reaching atomic separation + finalization while the mutator holds
+    // the file only in a Zig local. ──
+    any_fired = false;
+    edge = 1;
+    while (edge <= 64) : (edge += 1) {
+        if (try r15b2EdgeIteration(path, edge, true)) any_fired = true else break;
+    }
+    try testing.expect(any_fired);
+
+    // ── (B) OOM edge sweep: every allocation edge fails once; each
+    // failure publishes NOTHING, the fresh file (held only in this Zig
+    // local, construction abandoned) is finalized by the post-failure
+    // cycles — no fd leak — and the registry/accounting return to the
+    // pre-construction baseline ──
     {
         var vm: Vm = .init(testing.allocator, false);
         defer vm.deinit();
+        {
+            var warm = vm.gcTempRoots();
+            defer warm.end();
+            try warm.ensure(8);
+        }
+        const snap0 = try P50Snapshot.take(&vm, testing.allocator);
+        defer snap0.deinit(testing.allocator);
         var boundary: ?usize = null;
-        for (0..32) |fi| {
+        for (0..48) |fi| {
+            var open_out = [_]Value{ .Nil, .Nil, .Nil };
+            const file_v = (try vm.ioOpenPath(path, "r", open_out[0..])).?;
+            const fmts = [_]Value{ .{ .String = try vm.internStr("*l") }, .{ .String = try vm.internStr("*L") } };
             var failing = std.testing.FailingAllocator.init(testing.allocator, .{
                 .fail_index = fi,
                 .resize_fail_index = 0,
             });
             vm.alloc = failing.allocator();
-            const r = vm.makeLinesIter(.{ .Int = 42 }, true, &.{ .{ .Int = 7 }, .{ .Int = 8 } });
+            const r = vm.makeLinesIter(file_v, true, fmts[0..]);
             vm.alloc = testing.allocator;
             if (r) |objv| {
                 boundary = fi;
+                // The one success edge publishes a fully-wired iterator.
                 try testing.expect(objv == .Table);
-                const obj = objv.Table;
                 var roots = vm.gcTempRoots();
                 defer roots.end();
-                try roots.add(.{ .Table = obj });
+                try roots.add(objv);
                 try vm.gcCycleFull();
-                try testing.expect(p50StillRegistered(&vm, .{ .table = obj }));
+                try testing.expect(p50StillRegistered(&vm, .{ .table = objv.Table }));
                 break;
-            } else |_| {
-                // Nothing to publish on failure (the result is the only
-                // output); a REAL full cycle after each failure sweeps the
-                // partial garbage with no crash.
+            } else |e| {
+                try testing.expect(e == error.OutOfMemory);
+                // Nothing published; the abandoned file is finalized
+                // (closed — no fd leak) in cycle 1 — still registered
+                // (two-cycle finalization contract) — and freed together
+                // with the partial garbage in cycle 2.
                 try vm.gcCycleFull();
+                try testing.expect(vm.getManagedFile(file_v) == null);
+                try testing.expect(p50StillRegistered(&vm, .{ .table = file_v.Table }));
+                try vm.gcCycleFull();
+                try testing.expect(!p50StillRegistered(&vm, .{ .table = file_v.Table }));
+                try r15b2CompareRegistry(&snap0, &vm);
             }
         }
         try testing.expect(boundary != null);
     }
 }
 
-test "P16.50-review-14 HIGH 2: testC pushcclosure intermediates survive emergency GC and OOM edges" {
+test "P16.50-review-15 HIGH 1: testC pushcclosure is stack-transactional across emergency GC and OOM edges" {
     const testing = std.testing;
 
     // ── (A) emergency-GC matrix over the three fresh tables (upvals, ccl,
-    // mt), driven through the real testC script path ──
+    // mt), driven through the real testC script path, with a COLLECTABLE
+    // Table upvalue: the unconsumed upvalues stay on the parked script
+    // stack (a GC root — the non-moving analog of PUC's traversethread
+    // marking L->stack[0..top]) for the whole construction ──
     for (1..4) |k| {
         var vm: Vm = .init(testing.allocator, false);
         defer vm.deinit();
+        const up_tbl = try vm.allocTableNoGc();
         var st: std.ArrayListUnmanaged(Value) = .empty;
         defer st.deinit(testing.allocator);
         try st.append(testing.allocator, .Nil); // script slot (testC index 1)
-        try st.append(testing.allocator, .{ .Int = 5 });
+        try st.append(testing.allocator, .{ .Table = up_tbl });
         try st.append(testing.allocator, .{ .Int = 6 });
         var emerg = R14High2EmergencyAlloc{ .base = testing.allocator, .vm = &vm, .k = k };
         vm.alloc = emerg.allocator();
@@ -62353,8 +63061,10 @@ test "P16.50-review-14 HIGH 2: testC pushcclosure intermediates survive emergenc
         const upv = vm.getFieldOpt(ccl, "__testc_upvalues").?;
         try testing.expect(upv == .Table);
         const upvals = upv.Table;
+        // The Table upvalue survived the emergency GC by POINTER identity
+        // (it was parked on the script stack, not re-created).
         const uv1 = vm.apiRawGet(upvals, .{ .Int = 1 });
-        try testing.expect(uv1 == .Int and uv1.Int == 5);
+        try testing.expect(uv1 == .Table and uv1.Table == up_tbl);
         const uv2 = vm.apiRawGet(upvals, .{ .Int = 2 });
         try testing.expect(uv2 == .Int and uv2.Int == 6);
 
@@ -62368,19 +63078,27 @@ test "P16.50-review-14 HIGH 2: testC pushcclosure intermediates survive emergenc
         try testing.expect(p50StillRegistered(&vm, .{ .table = upvals }));
         try testing.expect(p50StillRegistered(&vm, .{ .table = mt }));
         const uv1b = vm.apiRawGet(upvals, .{ .Int = 1 });
-        try testing.expect(uv1b == .Int and uv1b.Int == 5);
+        try testing.expect(uv1b == .Table and uv1b.Table == up_tbl);
     }
 
-    // ── (B) OOM edge sweep through the real script path ──
+    // ── (B) OOM edge sweep through the real script path: PUC
+    // lua_pushcclosure builds the CClosure first and only then atomically
+    // replaces the top n values — a construction failure must leave the
+    // caller's stack EXACTLY untouched (the review-14 allowance
+    // `len == 3 or len == 1` masked the first-invalid op:
+    // st.items.len = base before the fallible builds) ──
     {
         var vm: Vm = .init(testing.allocator, false);
         defer vm.deinit();
+        const snap0 = try P50Snapshot.take(&vm, testing.allocator);
+        defer snap0.deinit(testing.allocator);
         var boundary: ?usize = null;
         for (0..48) |fi| {
+            const up_tbl = try vm.allocTableNoGc();
             var st: std.ArrayListUnmanaged(Value) = .empty;
             defer st.deinit(testing.allocator);
             try st.append(testing.allocator, .Nil);
-            try st.append(testing.allocator, .{ .Int = 5 });
+            try st.append(testing.allocator, .{ .Table = up_tbl });
             try st.append(testing.allocator, .{ .Int = 6 });
             var failing = std.testing.FailingAllocator.init(testing.allocator, .{
                 .fail_index = fi,
@@ -62396,6 +63114,9 @@ test "P16.50-review-14 HIGH 2: testC pushcclosure intermediates survive emergenc
                 const ccl = st.items[1].Table;
                 const nv = vm.getFieldOpt(ccl, "__testc_nupvalues").?;
                 try testing.expect(nv == .Int and nv.Int == 2);
+                const upv = vm.getFieldOpt(ccl, "__testc_upvalues").?;
+                const uv1 = vm.apiRawGet(upv.Table, .{ .Int = 1 });
+                try testing.expect(uv1 == .Table and uv1.Table == up_tbl);
                 var roots = vm.gcTempRoots();
                 defer roots.end();
                 try roots.add(.{ .Table = ccl });
@@ -62404,19 +63125,19 @@ test "P16.50-review-14 HIGH 2: testC pushcclosure intermediates survive emergenc
                 break;
             } else |e| {
                 try testing.expect(e == error.OutOfMemory);
-                // No dangling publication: the caller's stack is either
-                // untouched (machinery/pre-consumption failure: 3 items) or
-                // consumed-but-unpublished (post-consumption failure: 1
-                // item — the script slot); a closure is never half-appended.
-                try testing.expect(st.items.len == 3 or st.items.len == 1);
-                if (st.items.len == 1) {
-                    try testing.expect(st.items[0] == .Nil);
-                } else {
-                    try testing.expect(st.items[1] == .Int and st.items[1].Int == 5);
-                    try testing.expect(st.items[2] == .Int and st.items[2].Int == 6);
-                }
-                // REAL full cycle after the failure: partial garbage swept.
+                // STRICT: the original 3 items, byte-identical — the
+                // upvalues were never consumed before full success.
+                try testing.expectEqual(@as(usize, 3), st.items.len);
+                try testing.expect(st.items[0] == .Nil);
+                try testing.expect(st.items[1] == .Table and st.items[1].Table == up_tbl);
+                try testing.expect(st.items[2] == .Int and st.items[2].Int == 6);
+                // REAL full cycle after the failure: the partial garbage
+                // (upvals/ccl/mt tables + freshly interned field-name
+                // strings + this iteration's upvalue table, now reachable
+                // from nothing) is swept and the registry/accounting
+                // return to the pre-call baseline.
                 try vm.gcCycleFull();
+                try r15b2CompareRegistry(&snap0, &vm);
             }
         }
         try testing.expect(boundary != null);
@@ -62496,6 +63217,13 @@ test "P16.50-review-14 D: rawSet rehash window roots tbl/key/val across the emer
     var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
 
+    // SETUP roots: tbl/key_tbl/val_tbl are protected ONLY while being
+    // constructed — this also closes the key_tbl window across the
+    // val_tbl allocation (review-15 HIGH 2). All three are REMOVED before
+    // rawSet, so from that point the PRODUCTION rehash-branch session is
+    // the only protection: removing any single production root
+    // (tbl/canon_key/val addAssumeCapacity in rawSet) must redden the
+    // matching registration oracle below.
     var setup_roots = vm.gcTempRoots();
     defer setup_roots.end();
 
@@ -62505,36 +63233,63 @@ test "P16.50-review-14 D: rawSet rehash window roots tbl/key/val across the emer
     const tbl = try vm.allocTable(null);
     try setup_roots.add(.{ .Table = tbl });
 
-    // key/val are FRESH tables held ONLY in Zig locals until the insert
-    // publishes them — invisible to the emergency scan unless rawSet roots
-    // them across the rehash window. Pre-fix shape: the emergency GC at the
-    // rehash allocation swept both and the post-rehash insert published
-    // dangling pointers.
+    // key/val are FRESH tables — after setup_roots.end() below they live
+    // ONLY in Zig locals, invisible to the emergency scan unless rawSet
+    // roots them across the rehash window. Pre-fix shape: the emergency
+    // GC at the rehash allocation swept them and the post-rehash insert
+    // published dangling pointers.
     const key_tbl = try vm.allocTable(null);
+    try setup_roots.add(.{ .Table = key_tbl });
     const val_tbl = try vm.allocTable(null);
+    try setup_roots.add(.{ .Table = val_tbl });
+
+    // Pre-reserve the temp-root capacity the production session's
+    // ensure(3) will need, on the still-plain allocator: the session's
+    // reserve must be allocation-free so the emergency adapter can only
+    // fire inside tableRehash→tableResize — the rehash branch's single
+    // GC-capable op (barrier prepares are no-op plans in the pause state
+    // and also run on infraAlloc, the uncounted base allocator).
+    {
+        var pre = vm.gcTempRoots();
+        try pre.ensure(3);
+        pre.end();
+    }
 
     // Emergency allocator (k=0: fire at the FIRST allocation after
-    // arming) — inside tableRehash→tableResize, the only GC-capable op of
-    // the rehash branch. The barrier prepares and the roots reserve run on
-    // infraAlloc (the uncounted base allocator) and must NOT trigger it.
+    // arming) — armed only now, after all construction is complete.
     var emerg = R14High2EmergencyAlloc{ .base = testing.allocator, .vm = &vm, .k = 0 };
     vm.alloc = emerg.allocator();
     defer vm.alloc = testing.allocator;
 
+    // REMOVE all setup roots: tbl/key_tbl/val_tbl now have NO root other
+    // than what rawSet's production session adds inside the rehash
+    // branch. This is what makes each production root independently
+    // observable: the emergency GC at the rehash allocation sweeps
+    // exactly the objects whose production root is missing.
+    setup_roots.end();
+
     try vm.rawSet(tbl, .{ .Table = key_tbl }, .{ .Table = val_tbl });
     try testing.expect(emerg.fired);
 
+    // Re-root ONLY tbl for the post-publication full cycle: key_tbl and
+    // val_tbl are now reachable exclusively through the published entry
+    // inside tbl.
+    var hold_roots = vm.gcTempRoots();
+    defer hold_roots.end();
+    try hold_roots.add(.{ .Table = tbl });
+
     // The insert published the SURVIVORS (pointer identity — not
-    // re-allocated lookalikes), and both are still registered (a swept
-    // object is removed from gc_objects: the negative oracle).
+    // re-allocated lookalikes), and all three are still registered (a
+    // swept object is removed from gc_objects: the negative oracle —
+    // each arm reddens when its own production root is removed).
     const got = vm.rawGet(tbl, .{ .Table = key_tbl });
     try testing.expect(got == .Table and got.Table == val_tbl);
+    try testing.expect(p50StillRegistered(&vm, .{ .table = tbl }));
     try testing.expect(p50StillRegistered(&vm, .{ .table = key_tbl }));
     try testing.expect(p50StillRegistered(&vm, .{ .table = val_tbl }));
 
-    // A REAL full cycle afterwards: key_tbl/val_tbl are deliberately NOT
-    // in setup_roots — they survive only through the published entry in
-    // the rooted tbl.
+    // A REAL full cycle afterwards: key_tbl/val_tbl survive only through
+    // the published entry in the rooted tbl.
     try vm.gcCycleFull();
     try testing.expect(p50StillRegistered(&vm, .{ .table = tbl }));
     try testing.expect(p50StillRegistered(&vm, .{ .table = key_tbl }));

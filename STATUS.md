@@ -1,4 +1,4 @@
-> Last updated: 2026-09-19 (P16.50-review-11 correction opened)
+> Last updated: 2026-09-19 (P16.50-review-11 correction closed)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -45,7 +45,7 @@ Geomean замедления vs PUC Lua: **1.43x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [ ] **P16.50-review-11 correction**: сохранить infallible close/unwind и
+- [x] **P16.50-review-11 correction (CLOSED by review-11)**: сохранить infallible close/unwind и
   PATH-safe wrapper review-10, но исправить два связанных GC-инварианта.
   `gcCommitCloseBarrierCell` сейчас повторно маркирует любой collectable child
   и для old Cell безусловно переводит его в `OLD0`, хотя PUC
@@ -58,6 +58,63 @@ Geomean замедления vs PUC Lua: **1.43x** (цель: 1.0x; run-dependen
   PUC-подобная intrusive очередь, а не трактовка color как принадлежности к
   конкретному worklist. TBC-parity BLOCKER и emergency-GC HIGH остаются вне
   correction scope. Open-count 23→24.
+
+  ЗАКРЫТО фазой P16.50-review-11 (2026-09-19): BLOCKER 1 — white-child
+  condition стала частью pure plan: `gcPlanCloseBarrierCell` (vm.zig:27606)
+  возвращает пустой план для white Cell (vm.zig:27609), primitive value
+  (`GcObject.fromValue` orelse, vm.zig:27611) и — главное — для non-white
+  child (vm.zig:27619): PUC `luaC_barrier_` (lgc.c:246-263) выполняет
+  `reallymarkobject + setage(G_OLD0)` только под `isblack(owner) &&
+  iswhite(child)`; между pass 1 и pass 2 нет GC/аллокаций, поэтому white
+  condition стабильна; commit `gcQueueScanObjectCloseCommit`
+  (vm.zig:27674) re-check-ает её assert-ом `gcIsWhite` (vm.zig:27690):
+  black/gray/old child никогда не re-mark-ается, не re-account-ается в
+  `gc_gen_marked_kb`, не регрессирует в OLD0 и не публикуется повторно в
+  old1; capacity для primitive/non-white value не резервируется.
+  BLOCKER 2 — per-object missed-gray marker `MISSEDGRAYBIT` (bit 7
+  `gc_marked`, vm.zig:614): аудит bit-layout — bits 0-2 свободны (`GcAge`
+  в отдельном поле), bits 3-6 = WHITE0/WHITE1/BLACK/FINALIZED, все color
+  helpers трогают только MASKCOLORS; marker ставится ровно на 2 сайтах —
+  fallible `gc_gray` append в `gcQueueScanObjectImpl` catch (vm.zig:26398)
+  и infallible close-barrier commit overflow (vm.zig:27705), всегда вместе
+  с `gc_gray_overflow`; `gcRequeueOverflowGray` (vm.zig:28033) сканирует
+  gc_objects по MARKER, не по color (assert-ы gray + не Cell/String),
+  чистит marker только после успешного append, глобальный флаг — только
+  после полного успешного scan (partial OOM scan не теряет и не дублирует
+  work); grayagain-объекты без marker не крадутся в gc_gray. `gc_old1_overflow`
+  остаётся age+membership drain: все OLD0-продюсеры теперь flag-нуты —
+  `gcForwardBarrierValue` (vm.zig:26637) и `gcStoreMetatable`
+  (vm.zig:27829) ставят флаг при провале append (OOM распространяется,
+  publication debt не теряется); proof в `gcDrainOverflowOld1`
+  (vm.zig:28080): flag clear ⇒ каждый OLD0 listed, второй marker не нужен.
+  Lifecycle-аудит marker — cycle-boundary asserts: `gcSweepYoungObjects`
+  top (vm.zig:28668), `gcFinishCycle` entry (vm.zig:29330),
+  `gcMinorCollection` end (vm.zig:29055), atomic2gen post-sweep
+  (vm.zig:28431) — завершённый цикл не несёт unrecorded worklist entry.
+  5 focused тестов (vm.zig:60106+): (1) incremental close над BLACK child —
+  byte-exact no-op (color/gc_gray/marker/flag/`gc_gen_marked_kb`/registry);
+  (2) close над GRAY child, уже находящимся в gc_gray, — ровно одна
+  membership, без повторного accounting; (3) gen-minor old Cell + BLACK
+  children `.old`/`.old1`/`.old0` — age/color/exactly-once old1 listing
+  сохранены, никаких новых overflow-флагов/markers/added-old charges,
+  white young control получает ровно один mark+OLD0 lifecycle; (4)
+  grayagain discriminator: grayagain member (gray по color, без marker) не
+  попадает в gc_gray при чужом overflow, marker-bearing child re-queue-ится,
+  оба переживают настоящий cycle; (5) sticky partial requeue N=4: markers
+  остаются только у необработанных объектов, recovery drain завершает без
+  дублей, все reachable children выживают настоящий cycle. Negative-before
+  BOTH: временный убор white guard — age/list/accounting тест красный;
+  временный возврат color-only scan — grayagain discriminator красный;
+  restore → зелёные. Гейты: 293/293 unit Debug+ReleaseFast последовательно,
+  0 leaks; c_api test 0 FAIL + test-diff DIFF PASS; matrix --testc 31/32
+  (zig_fail=0, big.lua both_fail pre-existing); smoke 84/84; 23 heavy
+  testc-лейнов rc=0; crash contract 0/20; api580 GREEN (measured 384 <
+  400); owner repros 301/301/__name; grep audits; fmt + git-diff-check
+  clean. Perf: GC barrier/worklist path изменён — ОДНА объявленная
+  paired-seed clean-C сессия (seeds 1..21) исполняется на clean C; verdict
+  дописывается артефактным коммитом D (см. фазовую запись ниже).
+  Open-count 24→23 (TBC-parity BLOCKER и emergency-GC HIGH остаются
+  открытыми).
 
 - [x] **P16.50-review-10 correction (CLOSED by review-10)**: сохранить двухпроходный
   reserve-before-close контракт review-9, но убрать `abort_unwind_abandoned`:
@@ -8101,6 +8158,137 @@ source_dirty = clean; вердикт сессии — в Perf-блоке ниж�
   поведение (`true 10 20` в luazig и PUC) — ложный residual, checkTabArg
   metatable'd non-Tables для table.unpack не является расхождением; (d) pre-existing: big.lua both_fail (matrix), locals.lua
   GC-pacing dot diff, cstack.lua Debug native-stack exhaustion edge.
+
+### P16.50-review-11: exact white-child close barrier, per-object missed-gray marker (2026-09-19)
+
+Фаза по owner-ledger correction item (открыт c423541 после ledger-reopen
+review-10; open-count 23→24 — correction закрыт, TBC-parity BLOCKER и
+emergency-GC HIGH остаются открытыми; open-count 24→23). Коммиты: C =
+measured source (настоящий коммит; RF binary sha256
+bdca0aa50f049cb29568236f684a963d711f27746224012780b249fdac184bbd —
+plain `zig build -Doptimize=ReleaseFast`, режим canonical-генераторов;
+determinism-rebuild верифицируется в D) → D = wrapper (полное canonical
+current-* перегенерирование на clean C + объявленная clean-C paired-seed
+perf-сессия; source_head сессии = C, source_dirty = clean; вердикт сессии —
+в Perf-блоке ниже, дописан артефактным коммитом D).
+
+- **BLOCKER 1 — white-child close barrier по PUC `luaC_barrier_`**:
+  условие `isblack(owner) && iswhite(child)` (lgc.c:246-263) стало частью
+  pure plan: `gcPlanCloseBarrierCell` (vm.zig:27606) возвращает пустой
+  план для white Cell (nw2black ещё не применён — vm.zig:27609),
+  primitive value (`GcObject.fromValue` orelse — vm.zig:27611) и для
+  non-white child (vm.zig:27619). Между pass 1 (plan) и pass 2 (close +
+  commit) нет GC/аллокаций, поэтому white condition стабильна оба прохода;
+  commit `gcQueueScanObjectCloseCommit` (vm.zig:27674) re-check-ает её
+  assert-ом `gcIsWhite` (vm.zig:27690). Уже-black/gray/old child больше не
+  re-mark-ается (gray paint), не re-account-ается в `gc_gen_marked_kb`,
+  не регрессирует в OLD0 и не публикуется повторно в old1; для
+  primitive/non-white value capacity вообще не резервируется. Unconditional
+  «reallymarkobject» helper не оставлен: сам PUC никогда не вызывает
+  `reallymarkobject` на non-white child из barrier.
+- **BLOCKER 2 — per-object missed-gray marker `MISSEDGRAYBIT`**: gray
+  color — mark-state, НЕ принадлежность worklist (grayagain members
+  backward-barrier-ов и open cells тоже gray; PUC держит membership в
+  intrusive `gclist`-ссылках). Marker = bit 7 `gc_marked` (vm.zig:614):
+  аудит bit-layout доказал свободу бита — bits 0-2 не используются
+  (`GcAge` в отдельном поле, у PUC там G_NEW..G_TOUCHED2), bits 3-6 =
+  WHITE0/WHITE1/BLACK/FINALIZED, все color helpers (gcMakeWhite/
+  gcSetGray/gcSetBlack/gcIs*) трогают/тестируют только MASKCOLORS-биты;
+  wholesale `marked`-записи, чистящие бит 7 (gcRegisterCommit, interning,
+  new-state init), идут только по свежесозданным объектам без marker.
+  Marker ставится ровно на 2 сайтах — fallible `gc_gray` append в
+  `gcQueueScanObjectImpl` catch (vm.zig:26398) и infallible close-barrier
+  commit overflow (vm.zig:27705), всегда вместе с `gc_gray_overflow`
+  (флаг — быстрый указатель «в registry есть marker»). Drain
+  `gcRequeueOverflowGray` (vm.zig:28033) сканирует gc_objects по MARKER,
+  не по color; assert-ы: объект gray и не Cell/String (cells идут inline
+  markCell-путём, strings — terminal-black); marker чистится ТОЛЬКО после
+  успешного append, глобальный флаг — ТОЛЬКО после полного успешного scan:
+  OOM mid-scan оставляет обработанные markers чистыми (их queue entries
+  записаны), необработанные — отмеченными, retry не дублирует и не теряет
+  work. Grayagain-объект без marker не крадётся в gc_gray при чужом
+  overflow.
+- **`gc_old1_overflow` — age+membership drain остаётся, второй marker не
+  нужен**: все OLD0-продюсеры теперь flag-нуты. (a)
+  gcCommitWriteBarrierCell/gcCommitForwardBarrierCell — appendAssumeCapacity
+  под prior reserve: всегда listed; (b) gcCommitCloseBarrierCell — overflow
+  commit, ставит флаг; (c) `gcForwardBarrierValue` (vm.zig:26637) и
+  `gcStoreMetatable` (vm.zig:27829) — с review-11 ставят флаг при провале
+  append до распространения OOM. Инвариант «flag clear ⇒ каждый OLD0
+  listed» доказан в doc-proof `gcDrainOverflowOld1` (vm.zig:28080) и
+  проверяется assert-ом на входе OLD0→OLD1 promote-цикла
+  (`gcSweepYoungObjects` vm.zig:28668); membership-check исключает дубли.
+- **Lifecycle-аудит marker**: cycle-boundary asserts — `gcFinishCycle`
+  entry (vm.zig:29330), `gcMinorCollection` end (vm.zig:29055), atomic2gen
+  post-sweep перед gcMakeAllOld (vm.zig:28431), `gcSweepYoungObjects`
+  promote-loop entry (vm.zig:28668): завершённый цикл не несёт unrecorded
+  worklist entry (флаги всегда ставятся вместе с marker; abort mid-cycle
+  не достигает этих границ — drains следующего цикла retry).
+- **Тесты**: 5 новых focused тестов (vm.zig:60106+): (1) incremental close
+  над уже-BLACK child — byte-exact no-op: color, gc_gray, marker, флаг,
+  `gc_gen_marked_kb`, registry invariants; (2) close над GRAY child, уже
+  находящимся в gc_gray, — ровно одна membership (нет duplicate append),
+  нет повторного accounting, единственный owed traversal доводит child до
+  black через обычный propagate; (3) gen-minor old Cell + BLACK children
+  всех old ages (`.old`, listed `.old1`, listed `.old0`) — каждый сохраняет
+  age/color/exactly-once listing, никаких новых флагов/markers/added-old
+  charges, white young control получает ровно один mark+OLD0 publication и
+  ровно один old0→old1 charge на следующем minor; (4) grayagain
+  discriminator: grayagain member (gray по color, membership только в
+  gc_grayagain) не попадает в gc_gray при overflow close ДРУГОГО white
+  child, marker-bearing child re-queue-ится, оба переживают настоящий
+  cycle через свои lifecycle-пути; (5) sticky partial requeue N=4:
+  capacity ровно на один append + single-shot failing allocator — первый
+  marker-bearing child appended (marker чист), scan abort с OOM, markers
+  остаются ровно у n-1 необработанных; recovery drain завершает без
+  дублей, все дети выживают настоящий cycle, ни один registry-объект не
+  несёт marker на границе завершённого цикла. Negative-before BOTH:
+  временный убор white guard — age/list/accounting тест (3) детерминированно
+  красный; временный возврат color-only scan в drain — grayagain
+  discriminator (4) детерминированно красный; restore → зелёные.
+- **Батарея**: 293/293 unit (Debug+ReleaseFast последовательно, 0 leaks;
+  параллельный запуск D+RF даёт взаимное вмешание через subprocess path
+  теста P16.50-review-3 R5 — см. residuals), c_api test 0 FAIL + test-diff
+  DIFF PASS, matrix --testc 31/32 (zig_fail=0, big.lua both_fail
+  pre-existing), smoke 84/84, 23 heavy testc-лейнов rc=0 (locals/cstack
+  first-run green — единичный rc=1 report implementation-агента был
+  transient, coordinator + независимая батария re-verified), crash contract
+  0/20, api580 GREEN (measured 384 < 400), owner repros 301/301/__name,
+  grep audits, wrapper 5 layouts + make test/test-smoke, fmt +
+  git-diff-check clean.
+- **Perf**: measured runtime затронут (GC barrier/worklist path) —
+  pre-check probes implementation-агента шли в ОТДЕЛЬНЫЕ /tmp/opencode
+  outputs, canonical manifest не мутирован; single-run probes показали
+  machine noise floor ±10-23% в обе стороны, interleaved best-of-8 не
+  выявил detectable regression (cold/error-path + один branch + flag-gated
+  drains) — authoritative verdict только объявленной сессией. ОДНА
+  объявленная paired-seed clean-C сессия (seeds 1..21, RUNS=21) на commit C
+  (source_head = C, source_dirty = clean) — verdict в
+  tools/perf/current-gate.json + current-gate-manifest.json (commit D);
+  manifest append-only; baselines byte-identical (baseline-approved/
+  baseline-p15.37/core_baseline не тронуты). Полное canonical current-*
+  перегенерирование на clean C / RF binary — артефактным коммитом D.
+- **Residuals (honest, для владельца; новые пункты НЕ открываются —
+  решение за владельцем)**:
+  - MEDIUM (pre-existing, тот же класс, что настоящий фикс):
+    `gcMarkOld1` (vm.zig:28843) и `gcMinorCollection`'s `gc_gen_threads`
+    append (vm.zig:28580/28604) делают fallible gray-appends без overflow
+    флага/marker — OOM прерывает minor с unrecorded gray work (drain по
+    color/marker её не найдёт; следующий цикл full re-mark компенсирует,
+    но инвариант «flag clear ⇒ no unrecorded work» на этих путях не
+    доказан).
+  - MEDIUM (pre-existing): grayagain appends в `gcRememberObject`
+    (vm.zig:26603) и backward barriers (vm.zig:27416/27444/27845/27997/
+    28183/28192) не имеют overflow fallback — grayagain не имеет drain,
+    OOM на append теряет re-traversal до следующего барьера/cycle.
+  - LOW/test-infra: P16.50-review-3 R5 subprocess path взаимно мешает при
+    ПАРАЛЛЕЛЬНОМ запуске Debug+ReleaseFast unit suites (последовательные
+    прогоны зелёные 293/293; R5 не менять без доказательства
+    нестабильности последовательного gate).
+  - INFO: второй transient locals/cstack flake-report инцидент (review-8
+    §1, review-11 implementation) — оба re-verified green координатором +
+    независимой батареей; machine noise floor ±10-23% на single perf runs
+    задокументирован, probes идут interleaved-протоколом.
 
 ### P16.50-review-10: infallible close cleanup, registry-overflow GC worklists, PATH-safe toolchain wrapper (2026-09-19)
 

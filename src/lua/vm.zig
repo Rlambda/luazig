@@ -588,6 +588,31 @@ const FINALIZEDBIT: u8 = 1 << 6;
 const WHITEBITS: u8 = WHITE0BIT | WHITE1BIT;
 const MASKCOLORS: u8 = BLACKBIT | WHITEBITS;
 
+/// P16.50-review-11 BLOCKER 2: per-object missed-gray marker.
+///
+/// Bit-layout audit of `gc_marked` (u8): bit 3 WHITE0, bit 4 WHITE1,
+/// bit 5 BLACK, bit 6 FINALIZED. PUC stores G_NEW..G_TOUCHED2 in bits 0-2;
+/// we store `GcAge` in a separate field, so bits 0-2 are unused and
+/// bit 7 is free. Chosen: bit 7 — the highest free bit, disjoint from
+/// WHITE/BLACK/FINALIZED and from every color helper's mask:
+///   gcMakeWhite/gcSetGray/gcSetBlack touch only MASKCOLORS bits;
+///   gcIsWhite/gcIsBlack/gcIsGray/gcIsDead test only color bits;
+///   sweep repaints go through gcMakeWhite (preserves bit 7).
+/// Wholesale `marked` writes that clear it (gcRegisterCommit's
+/// `= current_white & WHITEBITS`, string interning, new-state init) all
+/// run on freshly created objects, which never bear a marker.
+///
+/// Semantics: the marker is the ONLY owner of an unrecorded ordinary
+/// `gc_gray` queue entry. Color is mark-state, NOT queue membership —
+/// gray is also worn by grayagain-published objects (backward barriers)
+/// and by open cells (never gc_gray work items), so the overflow drain
+/// must select by MARKER, never by color. Set exactly where an object
+/// was painted gray but the `gc_gray` append did not happen (the
+/// fallible mark commit and the infallible close-barrier commit), always
+/// together with `gc_gray_overflow`. Cleared only by the overflow drain,
+/// after the successful append that records the queue entry.
+const MISSEDGRAYBIT: u8 = 1 << 7;
+
 /// PUC lgc.h:213-215: GC stop bits for `g->gcstp`.
 const GCSTPUSR: u8 = 1; // stopped by user
 const GCSTPGC: u8 = 2; // stopped by GC itself
@@ -604,10 +629,12 @@ fn gcIsBlack(marked: u8) bool {
 }
 
 /// Check if object is gray (no color bit set — PUC `set2gray` clears all
-/// color bits). Gray is the canonical "owes traversal" state: an object
-/// painted gray but not sitting in `gc_gray` (an overflowed close-barrier
-/// commit, or a `gc_gray` append that failed mid-mark) is found by COLOR
-/// in the overflow drain.
+/// color bits). Gray is a MARK-STATE, not a queue membership: an object
+/// painted gray may owe an ordinary `gc_gray` append (recorded by the
+/// MISSEDGRAYBIT marker), may sit in `gc_grayagain` (backward barrier),
+/// or may be an open cell (never a gc_gray work item). PUC keeps
+/// membership in intrusive `gclist` links; our membership owner for an
+/// unrecorded `gc_gray` entry is the marker, never the color.
 fn gcIsGray(marked: u8) bool {
     return (marked & MASKCOLORS) == 0;
 }
@@ -4612,17 +4639,17 @@ pub const Vm = struct {
     /// PUC lgc.c uses a single gclist per object; we mirror that by keeping
     /// one list per role.
     gc_old1: std.ArrayListUnmanaged(GcObject) = .empty,
-    /// P16.50-review-10 BLOCKER 1: overflow fallback state for the
-    /// infallible close-barrier commit. `gc_gray`/`gc_old1` are
-    /// ACCELERATING worklists — the canonical state is the object's
-    /// color/age. A close-barrier commit whose capacity reserve failed
-    /// paints the canonical state (gray / G_OLD0) and sets the flag
-    /// instead of appending; the GC drains the overflow by scanning
-    /// `gc_objects` (gray objects by COLOR, OLD0 candidates by AGE) when
-    /// the normal worklist is exhausted. Also set when a fallible
-    /// `gc_gray` append fails after the object was painted gray, so an
-    /// aborted GC step never leaves gray-by-color work unknown to the
-    /// drain.
+    /// P16.50-review-10 BLOCKER 1 / P16.50-review-11 BLOCKER 2: overflow
+    /// fallback state. `gc_gray`/`gc_old1` are ACCELERATING worklists —
+    /// the canonical state is the object's color/age. A commit whose
+    /// capacity reserve failed paints the canonical state and sets the
+    /// flag instead of appending; the GC drains the overflow when the
+    /// normal worklist is exhausted. The gray drain selects by the
+    /// per-object MISSEDGRAYBIT marker (color is mark-state, NOT queue
+    /// membership — grayagain members and open cells are also gray); the
+    /// old1 drain selects by age + list membership. `gc_gray_overflow`
+    /// is the fast "a marker exists" pointer: flag clear ⇒ no marker and
+    /// no unlisted OLD0 (the drains' complete-scan contract).
     gc_gray_overflow: bool = false,
     gc_old1_overflow: bool = false,
     gc_grayagain: std.ArrayListUnmanaged(GcObject) = .empty,
@@ -26358,13 +26385,17 @@ pub const Vm = struct {
             } else {
                 self.gc_gray.append(self.infraAlloc(), obj) catch |e| {
                     // P16.50-review-10 BLOCKER 1: the object is already
-                    // painted gray (canonical state) — the append is an
-                    // accelerator only. Record the overflow instead of
-                    // propagating: the drain re-queues gray-by-color
+                    // painted gray (mark-state) — the append is an
+                    // accelerator only. Record the missed queue entry in
+                    // the per-object MISSEDGRAYBIT marker (P16.50-review-11
+                    // BLOCKER 2: color is NOT membership — grayagain
+                    // objects and open cells are also gray) instead of
+                    // propagating bare: the drain re-queues marker-bearing
                     // objects from gc_objects when gc_gray empties, so an
                     // aborted mark step never loses the work. The caller
                     // still sees the OOM (the GC step aborts), but the
                     // next cycle recovers without a full re-mark.
+                    p.marked.* |= MISSEDGRAYBIT;
                     self.gc_gray_overflow = true;
                     return e;
                 };
@@ -26595,7 +26626,17 @@ pub const Vm = struct {
             if (owner_age.isOld() and child_age.isYoung()) {
                 const child_obj = GcObject.fromValue(child).?;
                 gcPtr(child_obj).age.* = .old0;
-                try self.gc_old1.append(self.infraAlloc(), child_obj);
+                self.gc_old1.append(self.infraAlloc(), child_obj) catch |e| {
+                    // P16.50-review-11 (gc_old1 overflow proof): the age is
+                    // canonical — an OLD0 whose list append failed is an
+                    // overflow commit. Record it in the flag so the age+
+                    // membership drain completes the publication; the OOM
+                    // still propagates (the caller's step aborts), but the
+                    // publication debt is never lost. This keeps the drain
+                    // invariant: flag clear ⇒ every OLD0 is listed.
+                    self.gc_old1_overflow = true;
+                    return e;
+                };
                 try self.gcQueueScanValue(child);
             }
             return;
@@ -27535,6 +27576,14 @@ pub const Vm = struct {
     /// (PUC luaC_barrier_ reallymarkobject has no isold guard on the mark;
     /// isold(o) only gates setage), not old-only like
     /// gcPrepareWriteBarrierCell's gen arm.
+    ///
+    /// P16.50-review-11 BLOCKER 1: the plan is non-empty only for a WHITE
+    /// child (PUC lgc.h luaC_barrier: `iscollectable(v) && isblack(p) &&
+    /// iswhite(gcvalue(v))` — after luaF_closeupval's nw2black the owner
+    /// Cell is black, and luaC_barrier_ (lgc.c:246-263) runs
+    /// reallymarkobject + setage(G_OLD0) ONLY on a white child). An
+    /// already-black/gray child is never re-marked, never re-accounted,
+    /// never re-promoted; a primitive value never reserves capacity.
     pub const CellClosePlan = struct {
         /// Gen minor: queue the copied value for traversal
         /// (gcQueueScanObject — PUC reallymarkobject(v)).
@@ -27558,13 +27607,22 @@ pub const Vm = struct {
         // PUC luaF_closeupval (lfunc.c:205): the barrier runs only when the
         // cell is NOT white (nw2black(uv) precedes luaC_barrier).
         if (gcIsWhite(cell.gc_marked)) return .{};
+        // PUC luaC_barrier (lgc.h): iscollectable(v) — primitive values
+        // (Int/Num/Bool/Nil/...) have no heap object to mark.
+        const child = GcObject.fromValue(value) orelse return .{};
+        // PUC luaC_barrier (lgc.h): && iswhite(gcvalue(v)) — the whole
+        // luaC_barrier_ body (reallymarkobject + setage(G_OLD0)) is gated
+        // on a WHITE child. An already-black/gray child owes nothing: no
+        // re-mark, no gc_gen_marked_kb charge, no OLD0 regression, no
+        // old1 publication. The white condition is stable across both
+        // passes (nothing between them allocates or runs GC).
+        if (!gcIsWhite(gcPtr(child).marked.*)) return .{};
         // Generational minor (PUC luaC_barrier_, lgc.c:246-263): mark the
         // copied value for ANY non-white cell. The GENMINOR sweep-phase
         // no-op (lgc.c:257-260) is handled by the sweep caller, which never
         // plans a barrier at all (allocation-free sweep contract).
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             if (self.gc_state == .sweep) return .{};
-            if (GcObject.fromValue(value) == null) return .{};
             var plan = CellClosePlan{ .gen_mark = true };
             if (cell.gc_age.isOld()) plan.gen_promote = true;
             return plan;
@@ -27603,11 +27661,15 @@ pub const Vm = struct {
     }
 
     /// Infallible overflow-aware reallymarkobject for a close-barrier
-    /// child (PUC lgc.c reallymarkobject). The child is painted gray (or
-    /// black-terminal for strings — no outgoing edges) unconditionally;
-    /// the `gc_gray` append is an accelerator only: without spare capacity
-    /// the commit sets `gc_gray_overflow` and the drain re-queues the
-    /// child by color. Never called with a `.cell` — `GcObject.fromValue`
+    /// child (PUC lgc.c reallymarkobject). Reached only through a
+    /// non-empty CellClosePlan, i.e. for a WHITE child (PUC luaC_barrier
+    /// gates the whole body on iswhite(gcvalue(v))); the commit asserts
+    /// it — nothing between the plan pass and the commit mutates color.
+    /// The child is painted gray (or black-terminal for strings — no
+    /// outgoing edges); the `gc_gray` append is an accelerator only:
+    /// without spare capacity the commit sets `gc_gray_overflow` plus the
+    /// child's MISSEDGRAYBIT marker, and the drain re-queues the child by
+    /// MARKER. Never called with a `.cell` — `GcObject.fromValue`
     /// cannot produce one (cells are not first-class Values).
     fn gcQueueScanObjectCloseCommit(self: *Vm, obj: GcObject) void {
         std.debug.assert(obj != .cell);
@@ -27623,6 +27685,9 @@ pub const Vm = struct {
             }
         }
         const p = gcPtr(obj);
+        // PUC luaC_barrier_ (lgc.c:246): the body runs only for a white
+        // child — the plan guaranteed it, the commit re-checks it.
+        std.debug.assert(gcIsWhite(p.marked.*));
         // PUC reallymarkobject: GCmarked += objsize(o).
         if (self.gc_gen_phase == .major) {
             self.gc_gen_marked_kb += @as(f64, @floatFromInt(gcObjectBytes(obj))) / 1024.0;
@@ -27636,6 +27701,8 @@ pub const Vm = struct {
             if (self.gc_gray.items.len < self.gc_gray.capacity) {
                 self.gc_gray.appendAssumeCapacity(obj);
             } else {
+                // The queue entry is owned by the marker, not the color.
+                p.marked.* |= MISSEDGRAYBIT;
                 self.gc_gray_overflow = true;
             }
         }
@@ -27754,7 +27821,14 @@ pub const Vm = struct {
                     try self.gcQueueScanObject(.{ .table = mt });
                     if (table.gc_age.isOld()) {
                         mt.gc_age = .old0;
-                        try self.gc_old1.append(self.infraAlloc(), .{ .table = mt });
+                        self.gc_old1.append(self.infraAlloc(), .{ .table = mt }) catch |e| {
+                            // P16.50-review-11 (gc_old1 overflow proof):
+                            // overflow commit — the canonical age is set,
+                            // the flag records the unlisted OLD0 for the
+                            // age+membership drain; the OOM propagates.
+                            self.gc_old1_overflow = true;
+                            return e;
+                        };
                     }
                 }
                 // Also add the table to grayagain (backward barrier) so it's
@@ -27925,57 +27999,84 @@ pub const Vm = struct {
 
     fn gcDrainGray(self: *Vm) DispatchError!void {
         while (try self.gcPropagateOne()) {}
-        // P16.50-review-10 BLOCKER 1: overflow fallback drain. Gray-by-
-        // color objects that never made it into gc_gray (close-barrier
-        // commits or a failed append under a rejecting allocator) are
-        // re-queued from the registry by COLOR and propagated here, so
-        // every drain point that empties gc_gray also empties the gray
-        // overflow. Loop: the re-queued objects' propagation may itself
-        // overflow-append (flag set again) — repeat until a full registry
-        // scan finds no gray-by-color work.
+        // P16.50-review-10 BLOCKER 1: overflow fallback drain. Objects
+        // whose ordinary `gc_gray` append did not happen (close-barrier
+        // commits or a failed append under a rejecting allocator) carry
+        // the MISSEDGRAYBIT marker; they are re-queued from the registry
+        // by MARKER and propagated here, so every drain point that
+        // empties gc_gray also empties the gray overflow. Loop: the
+        // re-queued objects' propagation may itself overflow-append
+        // (marker set again) — repeat until a full registry scan finds
+        // no marker-bearing work.
         while (self.gc_gray_overflow) {
             if (!try self.gcRequeueOverflowGray()) break;
             while (try self.gcPropagateOne()) {}
         }
     }
 
-    /// P16.50-review-10 BLOCKER 1: one overflow re-queue pass. Scans the
-    /// full registry and re-appends every gray-by-COLOR object missing
-    /// from gc_gray (the canonical "owes traversal" state — see gcIsGray).
-    /// Returns true if any object was re-queued (the caller drains gc_gray
-    /// and repeats while the flag is set). A completed pass clears the
-    /// flag: every gray-by-color object is now in gc_gray. The append is
-    /// best-effort: if even the re-queue allocation fails, the flag stays
-    /// set and the NEXT drain retries (the work is never lost — color is
-    /// canonical). Duplicate appends are harmless: gcPropagateOne's
-    /// traversal is idempotent on already-marked children. Cells are
-    /// skipped: open cells are gray by design but never gc_gray work
-    /// items (PUC propagatemark has no LUA_VUPVAL case; remarkupvals
-    /// excludes them). Strings are never gray (terminal black on mark).
+    /// P16.50-review-11 BLOCKER 2: one overflow re-queue pass. Scans the
+    /// full registry and re-appends every MISSEDGRAYBIT-marked object
+    /// missing from gc_gray. The marker — not the gray COLOR — identifies
+    /// the work: gray is also worn by grayagain-published objects
+    /// (backward barriers; their membership is gc_grayagain and their
+    /// lifecycle is the atomic/genlink drain) and by open cells (never
+    /// gc_gray work items), so a color scan would steal grayagain
+    /// members into gc_gray. Returns true if any object was re-queued
+    /// (the caller drains gc_gray and repeats while the flag is set).
+    /// A marker's marker is cleared ONLY after its successful append;
+    /// the global flag is cleared ONLY after a complete successful scan
+    /// — an OOM mid-scan leaves processed markers cleared (their queue
+    /// entries recorded) and unprocessed markers set, so the retry
+    /// neither duplicates nor loses work. Cells and strings never bear
+    /// markers (cells take the inline markCell path, strings the
+    /// terminal-black path) — asserted, not silently skipped.
     fn gcRequeueOverflowGray(self: *Vm) DispatchError!bool {
         var requeued = false;
         for (self.gc_objects.items) |obj| {
-            if (obj == .cell or obj == .string) continue;
             const p = gcPtr(obj);
-            if (!gcIsGray(p.marked.*)) continue;
+            if ((p.marked.* & MISSEDGRAYBIT) == 0) continue;
+            std.debug.assert(obj != .cell and obj != .string);
+            // The marker is only ever set on a freshly painted-gray
+            // object that never entered gc_gray or grayagain; nothing
+            // re-colors it before the drain (white guards skip it,
+            // grayagain/old1 paths require other memberships/colors).
+            std.debug.assert(gcIsGray(p.marked.*));
             try self.gc_gray.append(self.infraAlloc(), obj);
+            // Clear the marker only after the append recorded the entry.
+            p.marked.* &= ~MISSEDGRAYBIT;
             requeued = true;
         }
+        // Complete successful scan: no marker remains, no unrecorded
+        // gc_gray entry exists.
         self.gc_gray_overflow = false;
         return requeued;
     }
 
     /// P16.50-review-10 BLOCKER 1: OLD0 overflow drain. Completes the
-    /// G_OLD0 publication for close-barrier promotes that could not append
-    /// to gc_old1: scans the full registry by AGE and links every OLD0
-    /// object missing from the list (membership-checked — gcPromoteYoung-
-    /// Object's sweep arm may already have linked some, and its KB charge
-    /// is age-gated so a duplicate append would double-count). Runs at
-    /// generational minor-collection and sweep-generation entry, BEFORE
+    /// G_OLD0 publication for promotes that could not append to gc_old1:
+    /// scans the full registry by AGE and links every OLD0 object missing
+    /// from the list (membership-checked — gcPromoteYoungObject's sweep
+    /// arm may already have linked some, and its KB charge is age-gated
+    /// so a duplicate append would double-count). Runs at generational
+    /// minor-collection and sweep-generation entry, BEFORE
     /// gcPromoteYoungObject's OLD0→OLD1 advance (which assumes list
     /// membership). A completed pass clears the flag: every OLD0 object
     /// is then linked. Best-effort appends: a failed append leaves the
     /// flag set for the next drain.
+    ///
+    /// P16.50-review-11 (proof that age+membership remains sound, no
+    /// second marker needed): every OLD0 producer is one of
+    ///   (a) gcCommitWriteBarrierCell / gcCommitForwardBarrierCell —
+    ///       appendAssumeCapacity under a prior reserve: always listed;
+    ///   (b) gcCommitCloseBarrierCell — gcLinkOld1CloseCommit: overflow
+    ///       commit, sets the flag;
+    ///   (c) gcForwardBarrierValue / gcStoreMetatable — overflow commits
+    ///       since review-11: a failed append sets the flag before the
+    ///       OOM propagates.
+    /// Hence flag clear ⇒ every OLD0 is listed; the entry drains run
+    /// flag-gated before every OLD0→OLD1 advance, and the membership
+    /// check excludes duplicates. gcSweepYoungObjects asserts the flag
+    /// is clear when the promote loop runs.
     fn gcDrainOverflowOld1(self: *Vm) DispatchError!void {
         for (self.gc_objects.items) |obj| {
             if (obj == .cell) continue;
@@ -28323,6 +28424,11 @@ pub const Vm = struct {
                 self.gc_sweep_objects_cursor = 0;
                 self.gc_state = .sweep;
                 while (try self.gcSweepOne()) {}
+                // P16.50-review-11 BLOCKER 2 lifecycle audit: this path
+                // bypasses gcFinishCycle (PUC finishgencycle restarts a
+                // propagate cycle directly) — check the same no-unrecorded-
+                // work invariant before gcMakeAllOld repaints everything.
+                std.debug.assert(!self.gc_gray_overflow and !self.gc_old1_overflow);
                 // Set all surviving objects to OLD+BLACK, return to gen mode
                 self.gc_mode = .generational;
                 try self.gcMakeAllOld();
@@ -28553,6 +28659,13 @@ pub const Vm = struct {
         try self.gc_old1.ensureUnusedCapacity(self.infraAlloc(), snapshot);
         try self.gc_grayagain.ensureUnusedCapacity(self.infraAlloc(), snapshot);
         try self.gc_gen_threads.ensureUnusedCapacity(self.infraAlloc(), snapshot);
+        // P16.50-review-11 (gc_old1 overflow proof): the OLD0→OLD1 promote
+        // arm below assumes list membership. The entry drains (flag-gated)
+        // completed the publication of every overflow-committed OLD0
+        // before this loop, and no barrier runs mid-sweep (the GENMINOR
+        // sweep arm is a no-op), so a clear flag means every OLD0 is
+        // listed — the proof's invariant, checked here.
+        std.debug.assert(!self.gc_old1_overflow);
         var write: usize = 0;
         for (self.gc_young_objects.items[0..snapshot]) |obj| {
             const p = gcPtr(obj);
@@ -28934,6 +29047,12 @@ pub const Vm = struct {
             const stepsize_kb: f64 = @as(f64, @floatFromInt(gcApplyParam(self.gcparams[5], 100))) / 1024.0;
             self.gc_step_debt_kb = @max(stepsize_kb, 1.0);
         } else {
+            // P16.50-review-11 BLOCKER 2 lifecycle audit: the gen-minor
+            // cycle is monolithic — this is its completion boundary. Same
+            // invariant as gcFinishCycle: the atomic drains consumed every
+            // marker, the young-sweep barriers are no-ops, the OLD0 entry
+            // drains completed every overflow publication.
+            std.debug.assert(!self.gc_gray_overflow and !self.gc_old1_overflow);
             self.gcScheduleNextAutomaticCycle();
         }
     }
@@ -29198,6 +29317,17 @@ pub const Vm = struct {
     }
 
     fn gcFinishCycle(self: *Vm) DispatchError!void {
+        // P16.50-review-11 BLOCKER 2 lifecycle audit: a completed cycle
+        // carries no unrecorded worklist entry. Every marker set during
+        // propagate/atomic was consumed by a gcDrainGray call site (the
+        // atomic phase drains after every marking step, including the
+        // post-finalizer drain), and barriers during sweep take the
+        // no-op/makewhite arms — so both overflow flags are clear and no
+        // MISSEDGRAYBIT marker remains (flag clear ⇒ no marker: the two
+        // are always set together and only the drain's complete scan
+        // clears the flag). An abort mid-cycle (OOM) never reaches here —
+        // the next cycle's drains retry.
+        std.debug.assert(!self.gc_gray_overflow and !self.gc_old1_overflow);
         self.gc_state = .pause;
         // Reset sweep cursor for the next cycle.
         self.gc_sweep_objects_cursor = 0;
@@ -58955,8 +59085,9 @@ test "P16.50-review-8 §3.2: exec-frame completion OOM edges — countdown sweep
 // (closeBoxedUpvaluesReserved): the reserve is an OPTIMIZATION only —
 // a rejected reserve changes nothing but capacity. The commit is
 // INFALLIBLE: color/age are canonical, and a commit without spare
-// gc_gray/gc_old1 capacity sets the matching overflow flag instead of
-// appending; the GC's overflow drain (gcRequeueOverflowGray by COLOR,
+// gc_gray/gc_old1 capacity sets the matching overflow flag (and, for the
+// gray side, the per-object MISSEDGRAYBIT marker) instead of appending;
+// the GC's overflow drain (gcRequeueOverflowGray by MISSEDGRAYBIT marker,
 // gcDrainOverflowOld1 by AGE over gc_objects) completes the work when
 // the normal worklist is exhausted. A close that has begun ALWAYS
 // completes — never a parked frame suffix, never a black cell owning a
@@ -59953,4 +60084,432 @@ test "P16.50-review-10 6: N-child overflow drain terminates; every child survive
         try testing.expect(std.meta.eql(cells[i].value, .{ .Table = children[i] }));
     }
     try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+}
+
+// ===========================================================================
+// P16.50-review-11 BLOCKER 1 + BLOCKER 2 focused proofs.
+//
+// BLOCKER 1 (PUC luaC_barrier_, lgc.c:246-260: `isblack(o) && iswhite(v)`):
+// the close barrier must apply ONLY to a WHITE child. A BLACK child is
+// already fully traversed; a GRAY child already owes exactly one traversal
+// through gc_gray. Re-planning either duplicates the worklist entry and
+// re-charges gc_gen_marked_kb.
+//
+// BLOCKER 2: the gray overflow drain selects objects by the per-object
+// MISSEDGRAYBIT marker, NOT by gray color — gray is mark-state, not queue
+// membership (grayagain members and open cells are also gray). The marker
+// is set ONLY at the two overflow commit sites, consumed only by the
+// drain's complete scan, and a partial (OOM) scan keeps every unprocessed
+// marker so the next drain retries — no lost child, no duplicate.
+// ===========================================================================
+
+test "P16.50-review-11 1: incremental close over an already-BLACK child is a byte-exact no-op" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    const th = vm.main_thread.?;
+    const slot: usize = 16;
+
+    const child = try vm.allocTableNoGc();
+    const cell = try p50r9MkOpenCell(&vm, th, slot);
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.ensure(2);
+    roots.addCellAssumeCapacity(cell);
+    roots.addAssumeCapacity(.{ .Table = child });
+
+    // Stage an incremental cycle; gc_gen_phase = .major is the real
+    // gen-major state (gc_mode stays incremental) — it arms the close
+    // commit's gc_gen_marked_kb charge gate, so the no-accounting
+    // assertion below is non-vacuous.
+    try vm.gcStartCycle(true);
+    vm.gc_gen_phase = .major;
+    // Mark AND traverse the child: root it, then drain propagate — the
+    // child ends the drain BLACK (fully traversed), the cell stays GRAY
+    // (open cells are never traversed).
+    while (try vm.gcPropagateOne()) {}
+    try testing.expect(gcIsBlack(child.gc_marked));
+    try testing.expect(gcIsGray(cell.gc_marked));
+
+    th.bytecode_stack[slot] = .{ .Table = child };
+    const gray_len = vm.gc_gray.items.len;
+    const marked_kb = vm.gc_gen_marked_kb;
+
+    // BLOCKER 1: the plan over a BLACK child is EMPTY (PUC luaC_barrier_
+    // requires iswhite(v)).
+    const plan = vm.gcPlanCloseBarrierCell(cell, .{ .Table = child });
+    try testing.expect(!plan.gen_mark and !plan.gen_promote and !plan.inc_mark);
+    vm.closeBoxedUpvaluesReserved(th.bytecode_boxed[slot .. slot + 1]);
+
+    try testing.expectEqual(Cell.bc_stack_closed, cell.bc_stack_idx);
+    try testing.expect(th.bytecode_boxed[slot] == null);
+    try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
+    // Byte-exact no-op: child stays BLACK, no gc_gray entry, no marker,
+    // no flag, no re-accounting, registry invariants intact.
+    try testing.expect(gcIsBlack(child.gc_marked));
+    try testing.expectEqual(gray_len, vm.gc_gray.items.len);
+    try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_gray.items, .{ .table = child }));
+    try testing.expect((child.gc_marked & MISSEDGRAYBIT) == 0);
+    try testing.expect(!vm.gc_gray_overflow);
+    try testing.expectEqual(marked_kb, vm.gc_gen_marked_kb);
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+
+    // Finish the cycle: the child survives via its own mark; nothing
+    // re-queued, no residue.
+    while (vm.gc_state != .pause) {
+        _ = try vm.gcAdvance(1, false);
+    }
+    try testing.expect(!vm.gc_gray_overflow);
+    try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
+    try testing.expect(p50IsRegistered(&vm, .{ .table = child }));
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+}
+
+test "P16.50-review-11 2: close over a GRAY child already in gc_gray — no duplicate append, no re-accounting" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    const th = vm.main_thread.?;
+    const slot: usize = 16;
+
+    const child = try vm.allocTableNoGc();
+    const cell = try p50r9MkOpenCell(&vm, th, slot);
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.ensure(2);
+    roots.addCellAssumeCapacity(cell);
+    roots.addAssumeCapacity(.{ .Table = child });
+
+    try vm.gcStartCycle(true);
+    vm.gc_gen_phase = .major;
+    while (try vm.gcPropagateOne()) {}
+    try testing.expect(gcIsBlack(cell.gc_marked) or gcIsGray(cell.gc_marked));
+
+    // The owed-traversal state: the child is GRAY and already holds ONE
+    // ordinary gc_gray membership (marked, traversal pending).
+    gcSetGray(&child.gc_marked);
+    try vm.gc_gray.append(testing.allocator, .{ .table = child });
+    const marked_kb = vm.gc_gen_marked_kb;
+
+    th.bytecode_stack[slot] = .{ .Table = child };
+    const plan = vm.gcPlanCloseBarrierCell(cell, .{ .Table = child });
+    try testing.expect(!plan.gen_mark and !plan.gen_promote and !plan.inc_mark);
+    vm.closeBoxedUpvaluesReserved(th.bytecode_boxed[slot .. slot + 1]);
+
+    try testing.expectEqual(Cell.bc_stack_closed, cell.bc_stack_idx);
+    try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
+    // Exactly one membership (no duplicate append), no marker, no flag,
+    // no re-accounting.
+    try testing.expect(gcIsGray(child.gc_marked));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = child }));
+    try testing.expect((child.gc_marked & MISSEDGRAYBIT) == 0);
+    try testing.expect(!vm.gc_gray_overflow);
+    try testing.expectEqual(marked_kb, vm.gc_gen_marked_kb);
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+
+    // The single owed traversal runs once: the child goes BLACK through
+    // the normal propagate, survives the sweep.
+    while (vm.gc_state != .pause) {
+        _ = try vm.gcAdvance(1, false);
+    }
+    try testing.expect(gcIsBlack(child.gc_marked) or !gcIsGray(child.gc_marked));
+    try testing.expect(p50IsRegistered(&vm, .{ .table = child }));
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+}
+
+test "P16.50-review-11 3: gen-minor close over BLACK children of every old age is a no-op; white control still promoted exactly once" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    const th = vm.main_thread.?;
+    const base_slot: usize = 16;
+
+    // Four OLD cells (created + rooted before entering generational mode —
+    // gcEnterGenerational's full collection + gcMakeAllOld age them) and
+    // the .old child (same window).
+    var cells: [4]*Cell = undefined;
+    for (0..4) |i| {
+        cells[i] = try p50r9MkOpenCell(&vm, th, base_slot + i);
+    }
+    const child_old = try vm.allocTableNoGc();
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.ensure(6);
+    for (0..4) |i| {
+        roots.addCellAssumeCapacity(cells[i]);
+    }
+    roots.addAssumeCapacity(.{ .Table = child_old });
+
+    try vm.gcEnterGenerational();
+    for (0..4) |i| {
+        try testing.expect(cells[i].gc_age == .old);
+        try testing.expect(gcIsBlack(cells[i].gc_marked));
+    }
+    try testing.expect(child_old.gc_age == .old);
+    try testing.expect(gcIsBlack(child_old.gc_marked));
+
+    // .old1 child: two real minor cycles take it new→survival→old1
+    // (listed in gc_old1, BLACK — the production OLD1 shape).
+    const child_old1 = try vm.allocTableNoGc();
+    roots.addAssumeCapacity(.{ .Table = child_old1 });
+    try vm.gcMinorCollection();
+    try vm.gcMinorCollection();
+    try testing.expect(child_old1.gc_age == .old1);
+    try testing.expect(gcIsBlack(child_old1.gc_marked));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child_old1 }));
+
+    // .old0 child: hand-construct the production OLD0 shape (BLACK +
+    // .old0 + listed) — the transient state of a forward-barrier-promoted
+    // object inside a minor cycle, after its gray drain, before sweepgen.
+    const child_old0 = try vm.allocTableNoGc();
+    child_old0.gc_age = .old0;
+    gcSetBlack(&child_old0.gc_marked);
+    try vm.gc_old1.append(testing.allocator, .{ .table = child_old0 });
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child_old0 }));
+
+    // White young control: its only protection is the close barrier.
+    const child_white = try vm.allocTableNoGc();
+    try testing.expect(!child_white.gc_age.isOld());
+    try testing.expect(gcIsWhite(child_white.gc_marked));
+
+    for (0..4) |i| {
+        th.bytecode_stack[base_slot + i] = .{ .Table = childrenByAge(i, child_old, child_old1, child_old0, child_white) };
+    }
+    const added_old_before = vm.gc_gen_added_old_kb;
+    try testing.expect(!vm.gc_gray_overflow and !vm.gc_old1_overflow);
+
+    // Healthy close over the whole window: three empty plans (BLACK
+    // children of every old age) + one gen_mark+gen_promote (white).
+    vm.closeBoxedUpvaluesReserved(th.bytecode_boxed[base_slot .. base_slot + 4]);
+    for (0..4) |i| {
+        try testing.expectEqual(Cell.bc_stack_closed, cells[i].bc_stack_idx);
+        try testing.expect(gcIsBlack(cells[i].gc_marked));
+    }
+    // BLOCKER 1: every BLACK child keeps its exact age, color, and
+    // exactly-once listing; no flags, no markers, no added-old charge.
+    try testing.expect(child_old.gc_age == .old);
+    try testing.expect(gcIsBlack(child_old.gc_marked));
+    try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_old1.items, .{ .table = child_old }));
+    try testing.expect(child_old1.gc_age == .old1);
+    try testing.expect(gcIsBlack(child_old1.gc_marked));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child_old1 }));
+    try testing.expect(child_old0.gc_age == .old0);
+    try testing.expect(gcIsBlack(child_old0.gc_marked));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child_old0 }));
+    try testing.expect(!vm.gc_gray_overflow and !vm.gc_old1_overflow);
+    try testing.expect((child_old.gc_marked & MISSEDGRAYBIT) == 0);
+    try testing.expect((child_old1.gc_marked & MISSEDGRAYBIT) == 0);
+    try testing.expect((child_old0.gc_marked & MISSEDGRAYBIT) == 0);
+    try testing.expectEqual(added_old_before, vm.gc_gen_added_old_kb);
+    // White control: exactly one mark + OLD0 publication (both lists).
+    try testing.expect(gcIsGray(child_white.gc_marked));
+    try testing.expect(child_white.gc_age == .old0);
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = child_white }));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child_white }));
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+
+    // A real minor cycle: markold advances the OLD1 child to .old (out of
+    // the list), sweepgen advances both OLD0 children to .old1 — each
+    // charged exactly once at the old0→old1 transition, each listed
+    // exactly once (the promote arm does not re-append linked objects).
+    try vm.gcMinorCollection();
+    try testing.expect(child_old.gc_age == .old);
+    try testing.expect(gcIsBlack(child_old.gc_marked));
+    try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_old1.items, .{ .table = child_old }));
+    try testing.expect(child_old1.gc_age == .old);
+    try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_old1.items, .{ .table = child_old1 }));
+    try testing.expect(child_old0.gc_age == .old1);
+    try testing.expect(gcIsBlack(child_old0.gc_marked));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child_old0 }));
+    try testing.expect(child_white.gc_age == .old1);
+    try testing.expect(gcIsBlack(child_white.gc_marked));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child_white }));
+    const added_old_delta = vm.gc_gen_added_old_kb - added_old_before;
+    const expect_delta = (@as(f64, @floatFromInt(gcObjectBytes(.{ .table = child_old0 }))) +
+        @as(f64, @floatFromInt(gcObjectBytes(.{ .table = child_white })))) / 1024.0;
+    try testing.expectApproxEqAbs(expect_delta, added_old_delta, 1e-9);
+    try testing.expect(!vm.gc_gray_overflow and !vm.gc_old1_overflow);
+    for ([_]*Table{ child_old, child_old1, child_old0, child_white }) |c| {
+        try testing.expect(p50IsRegistered(&vm, .{ .table = c }));
+    }
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+}
+
+test "P16.50-review-11 4: overflow requeue selects the missed marker, not grayagain members" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    const th = vm.main_thread.?;
+    const slot: usize = 16;
+
+    const child = try vm.allocTableNoGc();
+    const cell = try p50r9MkOpenCell(&vm, th, slot);
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.ensure(2);
+    roots.addCellAssumeCapacity(cell);
+
+    // grayagain member: a table that goes BLACK through propagate, then a
+    // backward barrier (gcWriteBarrierTable over a fresh WHITE value)
+    // re-grays it with gc_grayagain membership ONLY — gray by color, but
+    // NOT a missed-gray marker bearer.
+    const ga = try vm.allocTableNoGc();
+    roots.addAssumeCapacity(.{ .Table = ga });
+    try vm.gcStartCycle(true);
+    while (try vm.gcPropagateOne()) {}
+    try testing.expect(gcIsBlack(ga.gc_marked));
+    const ga_young = try vm.allocTableNoGc();
+    try vm.gcWriteBarrierTable(ga, .{ .Table = ga_young });
+    try testing.expect(gcIsGray(ga.gc_marked));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .table = ga }));
+    try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_gray.items, .{ .table = ga }));
+
+    // Overflow close over a DIFFERENT white child: gray + marker + flag.
+    th.bytecode_stack[slot] = .{ .Table = child };
+    vm.gc_gray.deinit(testing.allocator);
+    vm.gc_gray = .empty;
+    {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        vm.alloc = failing.allocator();
+        vm.closeBoxedUpvaluesReserved(th.bytecode_boxed[slot .. slot + 1]);
+        vm.alloc = testing.allocator;
+    }
+    try testing.expectEqual(Cell.bc_stack_closed, cell.bc_stack_idx);
+    try testing.expect(gcIsGray(child.gc_marked));
+    try testing.expect((child.gc_marked & MISSEDGRAYBIT) != 0);
+    try testing.expect(vm.gc_gray_overflow);
+    // The discriminator: the grayagain member is gray but carries NO
+    // marker.
+    try testing.expect((ga.gc_marked & MISSEDGRAYBIT) == 0);
+
+    // One drain pass: ONLY the marker-bearing child is re-queued; the
+    // grayagain member keeps its gc_grayagain membership and its normal
+    // atomic lifecycle.
+    const requeued = try vm.gcRequeueOverflowGray();
+    try testing.expect(requeued);
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = child }));
+    try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_gray.items, .{ .table = ga }));
+    try testing.expect((child.gc_marked & MISSEDGRAYBIT) == 0);
+    try testing.expect(!vm.gc_gray_overflow);
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .table = ga }));
+    try testing.expect(gcIsGray(ga.gc_marked));
+
+    // Finish the cycle: the close's child survives via the requeue, the
+    // grayagain member goes through the atomic grayagain drain (marking
+    // its young value), both alive with intact registries.
+    while (vm.gc_state != .pause) {
+        _ = try vm.gcAdvance(1, false);
+    }
+    try testing.expect(!vm.gc_gray_overflow);
+    try testing.expect(p50IsRegistered(&vm, .{ .table = child }));
+    try testing.expect(p50IsRegistered(&vm, .{ .table = ga }));
+    try testing.expect(p50IsRegistered(&vm, .{ .table = ga_young }));
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+}
+
+test "P16.50-review-11 5: partial overflow requeue keeps only unprocessed markers; recovery drain completes without duplicates" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    const th = vm.main_thread.?;
+    const n = 4;
+    const base_slot: usize = 16;
+
+    var cells: [n]*Cell = undefined;
+    var children: [n]*Table = undefined;
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.ensure(n);
+    for (0..n) |i| {
+        children[i] = try vm.allocTableNoGc();
+        cells[i] = try p50r9MkOpenCell(&vm, th, base_slot + i);
+        roots.addCellAssumeCapacity(cells[i]);
+    }
+    try vm.gcStartCycle(true);
+    while (try vm.gcPropagateOne()) {}
+    for (0..n) |i| {
+        th.bytecode_stack[base_slot + i] = .{ .Table = children[i] };
+    }
+    vm.gc_gray.deinit(testing.allocator);
+    vm.gc_gray = .empty;
+
+    // Overflow close: every child gray + marker + flag, gc_gray empty.
+    {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        vm.alloc = failing.allocator();
+        vm.closeBoxedUpvaluesReserved(th.bytecode_boxed[base_slot .. base_slot + n]);
+        vm.alloc = testing.allocator;
+    }
+    for (0..n) |i| {
+        try testing.expect(gcIsGray(children[i].gc_marked));
+        try testing.expect((children[i].gc_marked & MISSEDGRAYBIT) != 0);
+    }
+    try testing.expect(vm.gc_gray_overflow);
+
+    // Sticky partial requeue: capacity for exactly ONE append, then a
+    // single-shot failing allocator — the first marker-bearing child is
+    // appended (marker cleared), the second append's growth fails, the
+    // scan aborts with OOM keeping every unprocessed marker.
+    try vm.gc_gray.ensureTotalCapacityPrecise(testing.allocator, 1);
+    {
+        var failing = P50r9NoResizeFailing{ .base = testing.allocator, .fail_index = 0 };
+        vm.alloc = failing.allocator();
+        const result = vm.gcRequeueOverflowGray();
+        vm.alloc = testing.allocator;
+        try testing.expectError(error.OutOfMemory, result);
+    }
+    var markers_left: usize = 0;
+    for (0..n) |i| {
+        if ((children[i].gc_marked & MISSEDGRAYBIT) != 0) markers_left += 1;
+    }
+    try testing.expectEqual(@as(usize, n - 1), markers_left);
+    try testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
+    try testing.expect(vm.gc_gray_overflow);
+
+    // Recovery with a healthy allocator: finishing the cycle drains the
+    // remaining markers (each appended exactly once — the processed one
+    // has no marker left to re-queue), every child survives, and NO
+    // registry object carries a marker at the completed boundary.
+    while (vm.gc_state != .pause) {
+        _ = try vm.gcAdvance(1, false);
+    }
+    try testing.expect(!vm.gc_gray_overflow);
+    try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
+    for (vm.gc_objects.items) |obj| {
+        try testing.expect((gcPtr(obj).marked.* & MISSEDGRAYBIT) == 0);
+    }
+    for (0..n) |i| {
+        try testing.expect(p50IsRegistered(&vm, .{ .table = children[i] }));
+        try testing.expect(!gcIsGray(children[i].gc_marked));
+        try testing.expect(std.meta.eql(cells[i].value, .{ .Table = children[i] }));
+    }
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+}
+
+/// test-3 helper: the child table for cell `i` by age class.
+fn childrenByAge(
+    i: usize,
+    child_old: *Table,
+    child_old1: *Table,
+    child_old0: *Table,
+    child_white: *Table,
+) *Table {
+    return switch (i) {
+        0 => child_old,
+        1 => child_old1,
+        2 => child_old0,
+        3 => child_white,
+        else => unreachable,
+    };
 }

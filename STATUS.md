@@ -1,4 +1,4 @@
-> Last updated: 2026-09-19 (P16.50-review-14 correction closed by review-14; TBC-parity BLOCKER и emergency-GC HIGH открыты)
+> Last updated: 2026-09-19 (P16.50-review-14)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -36,11 +36,11 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **84/84** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.42x** |
+| Performance (geomean vs PUC) | **1.40x** |
 | Perf gate (paired-seed) | **WARN** — 21 published seeds (1..21) |
-| api580 fixed-load footprint | **GREEN** — anchored gate 384 B < 400 B; no-XY diagnostic 436 B; Measured on the ReleaseFast binary `3ca14c417e01de07`; the ledger's top-level provenance is the Debug binary `e20a4e2fe6c495b0` (dual-mode ledger, not one single-RF-binary artifact). |
+| api580 fixed-load footprint | **GREEN** — anchored gate 384 B < 400 B; no-XY diagnostic 436 B; Measured on the ReleaseFast binary `44112debfb2a2d27`; the ledger's top-level provenance is the Debug binary `e11bd09ddd7d26ab` (dual-mode ledger, not one single-RF-binary artifact). |
 
-Geomean замедления vs PUC Lua: **1.42x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.40x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
@@ -8520,6 +8520,33 @@ byte-identical) → D = wrapper (полное canonical current-* переген
   review-13 WARN был driven этим workload'ом — center +4.42%). Verdict
   дописывается артефактным коммитом D. Полное canonical current-*
   перегенерирование на clean C / RF binary — артефактным коммитом D.
+
+  Сессия исполнена (D, 2026-09-19): plain `python3 tools/perf_compare.py`
+  (canonical, seeds 1..21, RUNS=21, core 0) на clean C `7ea014e`
+  (source_head = measured_source_head = C, source_dirty = clean; session
+  build воспроизвёл RF binary sha256
+  44112debfb2a2d278fb0a00478ecb67411611c0da208c1e8af35bba8fb4ada6b
+  byte-identical). **Verdict: WARN** — table_alloc_setmetatable
+  matched-mode center **+4.031%**, 3 seeds ≥ +5% WARN (+5.028% seed 9,
+  +5.033% seed 10, +5.164% seed 15); остальные 17 workloads OK
+  (matched-mode centers −3.711%..+2.457%, wall-P25 safeguard green на
+  всех). Probe-прогноз (seeds 1..5: center +3.41%, все < +5%) не
+  подтвердился на полной 21-seed матрице — записано честно, без
+  ретроспективной правки probe. Сравнение с review-13 WARN на том же
+  workload: center +4.42% → +4.03% (улучшение ~0.4 п.п., driven
+  rawSet-rework: безусловная session → rehash-only); WARN остаётся
+  WARN — green-claim нет. Manifest: row #31 appended (append-only),
+  current-gate.json обновлён атомарно сессией; baseline-approved.json /
+  baseline-p15.37.json / core_baseline.json byte-identical (sha256
+  до/после совпадают). Canonical current-* артефакты (current.json
+  runs=5 snapshot geomean 1.40x, current-counters.json,
+  current-profile-index.json, current-dispatch-floor.json,
+  current-api580-ledger.json GREEN 384<400, current-fixed-load-footprint
+  .json GREEN, current-codesize.json, current-callframe-layout.json,
+  current-differential-profile.json, current-matrix.json 31/32,
+  current-smoke.json 84/84) перегенерированы на clean C / binary S;
+  README/STATUS generated-блоки обновлены status_summary.py (verdict
+  line: WARN на текущем source/binary — caveat «different source» снят).
 - **Residuals (honest, для владельца; новые пункты НЕ открываются —
   решение за владельцем)**:
   - arg-evaluation-window (unproven, тот же hazard-class): свежие

@@ -1,16 +1,16 @@
 {
- "created_utc": "2026-09-19T11:41:35.584319+00:00",
+ "created_utc": "2026-09-19T14:38:28.109793+00:00",
  "provenance": {
-  "git_head": "67702bd127679ead014deecaef561381290412e8",
-  "measured_source_head": "67702bd127679ead014deecaef561381290412e8",
+  "git_head": "7ea014e0c82c2f99c997d2b987bf8292b80f97b1",
+  "measured_source_head": "7ea014e0c82c2f99c997d2b987bf8292b80f97b1",
   "source_dirty": "clean",
   "zig_version": "0.16.0",
-  "probe_rf_path": "/tmp/opencode/r13a/layout_probe.zig (-O ReleaseFast)",
-  "probe_debug_path": "/tmp/opencode/r13a/layout_probe.zig (-O Debug)",
-  "probe_rf_sha256_16": "0142e3e3f241439b",
-  "probe_debug_sha256_16": "b28fa2cea8cf4bbb",
-  "zig_binary_sha256": "3ca14c417e01de071ddf9344909caafbccae90fb7b87e186a09608f27e4e4769",
-  "note": "P16.50-review-13 C regeneration from clean measured-source commit 67702bd; probe binaries freshly built from the same tree in both modes, outputs embedded verbatim."
+  "probe_rf_path": "/tmp/opencode/r14a/layout_probe.zig (-O ReleaseFast)",
+  "probe_debug_path": "/tmp/opencode/r14a/layout_probe.zig (-O Debug)",
+  "probe_rf_sha256_16": "941d2b204cff3e8c",
+  "probe_debug_sha256_16": "8c492c088daa4f43",
+  "zig_binary_sha256": "44112debfb2a2d278fb0a00478ecb67411611c0da208c1e8af35bba8fb4ada6b",
+  "note": "P16.50-review-14 C regeneration from clean measured-source commit 7ea014e; probe binaries freshly built from the same tree in both modes, outputs embedded verbatim."
  },
  "layout": {
   "ReleaseFast": {

@@ -1,18 +1,18 @@
 {
- "created_utc": "2026-09-19T11:38:19.972981+00:00",
+ "created_utc": "2026-09-19T14:36:53.969883+00:00",
  "provenance": {
-  "git_head": "67702bd127679ead014deecaef561381290412e8",
-  "measured_source_head": "67702bd127679ead014deecaef561381290412e8",
+  "git_head": "7ea014e0c82c2f99c997d2b987bf8292b80f97b1",
+  "measured_source_head": "7ea014e0c82c2f99c997d2b987bf8292b80f97b1",
   "source_dirty": "clean",
-  "zig_binary_sha256": "3ca14c417e01de071ddf9344909caafbccae90fb7b87e186a09608f27e4e4769",
-  "note": "P16.50-review-13 C regeneration from clean measured-source commit 67702bd (plain zig build -Doptimize=ReleaseFast; readelf .text + nm -S)."
+  "zig_binary_sha256": "44112debfb2a2d278fb0a00478ecb67411611c0da208c1e8af35bba8fb4ada6b",
+  "note": "P16.50-review-14 C regeneration from clean measured-source commit 7ea014e (plain zig build -Doptimize=ReleaseFast; readelf .text + nm -S)."
  },
- "text_bytes": 2641753,
+ "text_bytes": 2630121,
  "symbols": {
-  "builtinCoroutineResume": 21414,
-  "callBuiltin": 9097,
+  "builtinCoroutineResume": 21005,
+  "callBuiltin": 9131,
   "popBuiltinCFrame": 305,
-  "pushBuiltinCFrame": 745,
-  "runBytecodeDispatch": 74724
+  "pushBuiltinCFrame": 742,
+  "runBytecodeDispatch": 75989
  }
 }

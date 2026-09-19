@@ -36,11 +36,11 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **84/84** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.43x** |
-| Perf gate (paired-seed) | **OK** — 21 published seeds (1..21) |
-| api580 fixed-load footprint | **GREEN** — anchored gate 384 B < 400 B; no-XY diagnostic 436 B |
+| Performance (geomean vs PUC) | **1.42x** |
+| Perf gate (paired-seed) | **WARN** — 21 published seeds (1..21) |
+| api580 fixed-load footprint | **GREEN** — anchored gate 384 B < 400 B; no-XY diagnostic 436 B; Measured on the ReleaseFast binary `3ca14c417e01de07`; the ledger's top-level provenance is the Debug binary `e20a4e2fe6c495b0` (dual-mode ledger, not one single-RF-binary artifact). |
 
-Geomean замедления vs PUC Lua: **1.43x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.42x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
@@ -120,8 +120,13 @@ Geomean замедления vs PUC Lua: **1.43x** (цель: 1.0x; run-dependen
   test_perf_gate + validate_noise_lanes ALL OK; perf probe после фикса
   worst +1.327% (table_alloc_setmetatable; было +5.788% — закрыто
   конвергенцией сайтов + inline prepare/commit; подробности в фазовой
-  записи review-13). Open-count 24→23 (TBC-parity BLOCKER и emergency-GC
-  HIGH остаются открытыми).
+  записи review-13). Объявленная clean-C сессия (seeds 1..21,
+  RUNS=21) — WARN (фактический исход, дописано артефактным коммитом
+  D): table_alloc_setmetatable[9] +5.322%, [15] +5.451% (2/378
+  paired seeds > +5% WARN line; FAIL нет — все < +10%), matched
+  center +4.42%, geomean centers +0.698%; разбор и residual — в
+  фазовой записи review-13 (Perf-блок). Open-count 24→23 (TBC-parity
+  BLOCKER и emergency-GC HIGH остаются открытыми).
 
 - [x] **P16.50-review-12 correction (CLOSED by review-12)**: сохранить white-child guard и
   `MISSEDGRAYBIT` review-11, но закрыть оставшиеся post-mutation publication
@@ -8389,7 +8394,10 @@ source_dirty = clean; вердикт сессии — в Perf-блоке ниж�
   canonical finals из current-gate.json: raw worst
   table_alloc_setmetatable seed 10 +4.1596% < WARN 5%; field_access raw
   worst +1.9012%, matched center ≈ +1.277%. Baseline и manifest history
-  не менялись.
+  не менялись. (Уточнение, дописано артефактным коммитом D: seed 10
+  +4.1596% — финал сессии review-12, НЕ ожидаемый worst этой фазы;
+  фактический worst сессии review-13 — seed 15 +5.451%, WARN — см.
+  Perf-блок ниже; конвенция artifact-class, прецедент review-6.)
 - **Тесты**: 3 новых focused теста (c_api.zig:4723+): (1) OOM-матрица
   `lua_setmetatable` table+userdata через настоящий C-call под
   `lua_pcallk` boundary (FailingAllocator по testc_alloc_base seam —
@@ -8423,10 +8431,21 @@ source_dirty = clean; вердикт сессии — в Perf-блоке ниж�
   pre-check probes шли в ОТДЕЛЬНЫЕ /tmp/opencode outputs, canonical
   manifest не мутирован; ОДНА объявленная paired-seed clean-C сессия
   (seeds 1..21, RUNS=21) на commit C (source_head = C, source_dirty =
-  clean) — verdict в tools/perf/current-gate.json +
-  current-gate-manifest.json (commit D); manifest append-only; baselines
-  byte-identical (baseline-approved/baseline-p15.37/core_baseline не
-  тронуты). Полное canonical current-* перегенерирование на clean C /
+  clean; binary sha256
+  3ca14c417e01de071ddf9344909caafbccae90fb7b87e186a09608f27e4e4769).
+  Сессия WARN (фактический исход, дописано артефактным коммитом D):
+  table_alloc_setmetatable[9] +5.322%, [15] +5.451% (2/378 paired
+  seeds > +5% WARN line; FAIL нет — все < +10%), matched center
+  +4.42%, geomean centers +0.698%. Разбор: ~+1.3% — собственная цена
+  транзакции фазы (probe vs 0db5f65, interleaved), остальное —
+  накопленный drift двух фаз против baseline P16.49-review-2
+  (review-12 уже мерил +4.16% worst на том же workload). Residual:
+  кандидаты на оптимизацию/owner-approved baseline update — решение
+  владельца. Verdict в tools/perf/current-gate.json +
+  current-gate-manifest.json (commit D; manifest row #30); manifest
+  append-only; baselines byte-identical
+  (baseline-approved/baseline-p15.37/core_baseline не тронуты).
+  Полное canonical current-* перегенерирование на clean C /
   RF binary — артефактным коммитом D.
 - **Residuals (honest, для владельца; новые пункты НЕ открываются —
   решение за владельцем)**:

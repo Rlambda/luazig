@@ -31,30 +31,30 @@ Regression lane: `python3 tools/testes_matrix.py --testc` (no `_port`/`_soft` pr
 
 ### Performance
 
-Geomean slowdown vs PUC Lua: **1.43x** (measurement snapshot, runs=5 per workload; run-dependent diagnostic; lower is better; 1.0x = parity).
+Geomean slowdown vs PUC Lua: **1.42x** (measurement snapshot, runs=5 per workload; run-dependent diagnostic; lower is better; 1.0x = parity).
 
-Gate protocol: paired-seed — 21 published seeds (1..21) per workload per session (`LUAZIG_HASH_SEED` env on the production ReleaseFast binary, pinned CPU core); verdict = per-seed paired instruction deltas; wall time is diagnostic only (`tools/perf_compare.py`). Latest gate verdict: **OK** (`tools/perf/current-gate.json`).
-api580 anchored gate: **GREEN** — measured 384 B < 400 B; no-XY diagnostic: 436 B (`tools/perf/current-api580-ledger.json`). Charged/model totals 376/428 B (reconciled: false/false) are allocation-model charges, not measurements.
+Gate protocol: paired-seed — 21 published seeds (1..21) per workload per session (`LUAZIG_HASH_SEED` env on the production ReleaseFast binary, pinned CPU core); verdict = per-seed paired instruction deltas; wall time is diagnostic only (`tools/perf_compare.py`). Latest gate verdict: **WARN** (`tools/perf/current-gate.json`).
+api580 anchored gate: **GREEN** — measured 384 B < 400 B; no-XY diagnostic: 436 B. Measured on the ReleaseFast binary `3ca14c417e01de07`; the ledger's top-level provenance is the Debug binary `e20a4e2fe6c495b0` (dual-mode ledger, not one single-RF-binary artifact). (`tools/perf/current-api580-ledger.json`). Charged/model totals 376/428 B (reconciled: false/false) are allocation-model charges, not measurements.
 
 | Workload | Zig/PUC |
 |----------|--------:|
-| metamethod_call_noalloc | 1.87x |
-| array_access | 1.79x |
-| field_access | 1.72x |
-| hash_access | 1.61x |
-| branch_loop | 1.61x |
-| dynamic_load | 1.56x |
-| global_arith | 1.56x |
+| metamethod_call_noalloc | 1.88x |
+| array_access | 1.75x |
+| field_access | 1.65x |
+| hash_access | 1.63x |
+| branch_loop | 1.60x |
+| dynamic_load | 1.59x |
+| global_arith | 1.54x |
 | coroutine_yield | 1.47x |
-| comparisons | 1.41x |
-| mixed_arith | 1.41x |
-| metamethod_add | 1.36x |
-| lua_calls | 1.35x |
-| int_arith | 1.32x |
-| float_arith | 1.32x |
-| table_alloc_setmetatable | 1.23x |
-| string_loop | 1.18x |
-| temp_table_alloc | 1.14x |
+| mixed_arith | 1.42x |
+| comparisons | 1.42x |
+| int_arith | 1.34x |
+| metamethod_add | 1.33x |
+| lua_calls | 1.33x |
+| float_arith | 1.31x |
+| table_alloc_setmetatable | 1.25x |
+| string_loop | 1.17x |
+| temp_table_alloc | 1.11x |
 | string_concat | 1.06x |
 <!-- END GENERATED STATUS -->
 

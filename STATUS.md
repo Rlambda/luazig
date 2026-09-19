@@ -1,4 +1,4 @@
-> Last updated: 2026-09-19 (P16.50-review-11 correction closed)
+> Last updated: 2026-09-19 (P16.50-review-11)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -36,11 +36,11 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **84/84** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.43x** |
+| Performance (geomean vs PUC) | **1.41x** |
 | Perf gate (paired-seed) | **OK** — 21 published seeds (1..21) |
-| api580 fixed-load footprint | **GREEN** — anchored gate 384 B < 400 B; no-XY diagnostic 436 B; Measured on the ReleaseFast binary `ca90e3db800dc93b`; the ledger's top-level provenance is the Debug binary `d51215c5d94eb263` (dual-mode ledger, not one single-RF-binary artifact). |
+| api580 fixed-load footprint | **GREEN** — anchored gate 384 B < 400 B; no-XY diagnostic 436 B; Measured on the ReleaseFast binary `22fd46f2a15596cd`; the ledger's top-level provenance is the Debug binary `b4ab5f032dbd3026` (dual-mode ledger, not one single-RF-binary artifact). |
 
-Geomean замедления vs PUC Lua: **1.43x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
@@ -115,6 +115,20 @@ Geomean замедления vs PUC Lua: **1.43x** (цель: 1.0x; run-dependen
   дописывается артефактным коммитом D (см. фазовую запись ниже).
   Open-count 24→23 (TBC-parity BLOCKER и emergency-GC HIGH остаются
   открытыми).
+
+  Verdict clean-C сессии (2026-09-19T03:27:32Z, дописано артефактным
+  коммитом D): GREEN — RESULT OK, 18/18 workloads OK, worst per-seed
+  +3.090% (temp_table_alloc[14]) < WARN 5%, wall-P25 envelope max +5.54%
+  (temp_table_alloc) < 10%, geomean diagnostic 1.41x (snapshot
+  current.json); binary sha256
+  22fd46f2a15596cdd58317a0369e1da3b5a325d4620f6a0fc661b90f7964a12a
+  (plain `zig build -Doptimize=ReleaseFast`; warm-cache determinism:
+  post-C rebuild == session binary == post-regeneration rebuild ==
+  post-session rebuild; sha из сообщения C (bdca0aa5) был warm-cache
+  артефактом, уничтоженным при determinism-wipe — cold recompiles
+  byte-identical кроме 29 байт .debug_line, канонический binary фазы
+  22fd46f2, подробности в фазовой записи); source_head 3edc852 = C,
+  source_dirty = clean; manifest append-only 24→25 строк.
 
 - [x] **P16.50-review-10 correction (CLOSED by review-10)**: сохранить двухпроходный
   reserve-before-close контракт review-9, но убрать `abort_unwind_abandoned`:
@@ -8165,12 +8179,17 @@ source_dirty = clean; вердикт сессии — в Perf-блоке ниж�
 review-10; open-count 23→24 — correction закрыт, TBC-parity BLOCKER и
 emergency-GC HIGH остаются открытыми; open-count 24→23). Коммиты: C =
 measured source (настоящий коммит; RF binary sha256
-bdca0aa50f049cb29568236f684a963d711f27746224012780b249fdac184bbd —
+22fd46f2a15596cdd58317a0369e1da3b5a325d4620f6a0fc661b90f7964a12a —
 plain `zig build -Doptimize=ReleaseFast`, режим canonical-генераторов;
-determinism-rebuild верифицируется в D) → D = wrapper (полное canonical
-current-* перегенерирование на clean C + объявленная clean-C paired-seed
-perf-сессия; source_head сессии = C, source_dirty = clean; вердикт сессии —
-в Perf-блоке ниже, дописан артефактным коммитом D).
+sha уточнён коммитом D: в сообщении C значился
+bdca0aa50f049cb29568236f684a963d711f27746224012780b249fdac184bbd —
+warm-cache plain-артефакт, уничтоженный при wipe кэша на
+determinism-проверке финализирующим агентом; cold recompile того же
+source byte-identical кроме 29 байт .debug_line — см. Perf-блок) →
+D = wrapper (полное canonical current-* перегенерирование на clean C +
+объявленная clean-C paired-seed perf-сессия; source_head сессии = C,
+source_dirty = clean; вердикт сессии — в Perf-блоке ниже, дописан
+артефактным коммитом D).
 
 - **BLOCKER 1 — white-child close barrier по PUC `luaC_barrier_`**:
   условие `isblack(owner) && iswhite(child)` (lgc.c:246-263) стало частью
@@ -8268,6 +8287,31 @@ perf-сессия; source_head сессии = C, source_dirty = clean; верд�
   manifest append-only; baselines byte-identical (baseline-approved/
   baseline-p15.37/core_baseline не тронуты). Полное canonical current-*
   перегенерирование на clean C / RF binary — артефактным коммитом D.
+  Verdict clean-C сессии (2026-09-19T03:27:32Z, дописано артефактным
+  коммитом D): GREEN — RESULT OK, 18/18 workloads OK, worst per-seed
+  +3.090% (temp_table_alloc[14]) < WARN 5%; wall-P25 envelope max +5.54%
+  (temp_table_alloc) < 10%; geomean diagnostic 1.41x (snapshot
+  current.json); binary sha256
+  22fd46f2a15596cdd58317a0369e1da3b5a325d4620f6a0fc661b90f7964a12a
+  (полный sha в manifest row). Determinism-цепочка: plain-артефакт
+  22fd46f2 (compiled post-C из идентичного source) переустанавливается
+  одним и тем же cached compile-artifact на каждом warm rebuild —
+  post-generators rebuild == session binary == post-session rebuild ==
+  22fd46f2; все canonical current-* артефакты и сессия измерены на этом
+  одном binary. Honest determinism note: cold recompile того же source
+  даёт другой sha — различие ТОЛЬКО в .debug_line (embedded
+  ~/.cache/zig/b/<hash> build-dir path в DWARF file-name table, 29 байт
+  из 15149632; section tables и все прочие секции, включая loadable
+  code, byte-identical — проверено сравнением двух cold-сборок); sha
+  bdca0aa5 из сообщения C был warm-cache артефакт того же класса,
+  уничтоженным при wipe .zig-cache на determinism-проверке — потому
+  каноническим binary фазы назначен 22fd46f2 с верифицированной
+  warm-цепочкой. Manifest append-only, 25 строк — все 24 исторических
+  (обе probe-сессии review-8 на dirty 4bf132e, финальная clean-C
+  review-8 ea00d1f, clean-C review-9 892b6ee, clean-C review-10
+  d02270f) сохранены как historical; pre-check probes фазы review-11
+  шли только в отдельные /tmp/opencode outputs и не касались canonical
+  manifest.
 - **Residuals (honest, для владельца; новые пункты НЕ открываются —
   решение за владельцем)**:
   - MEDIUM (pre-existing, тот же класс, что настоящий фикс):

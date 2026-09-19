@@ -1,20 +1,20 @@
 {
- "created_utc": "2026-09-19T01:32:11.195266+00:00",
+ "created_utc": "2026-09-19T03:23:03.223056+00:00",
  "provenance": {
-  "git_head": "d02270f28f880a628bc13760df5b4d4ad3140825",
-  "measured_source_head": "d02270f28f880a628bc13760df5b4d4ad3140825",
+  "git_head": "3edc8522ea98f33f80f3642a15ab054004d5f220",
+  "measured_source_head": "3edc8522ea98f33f80f3642a15ab054004d5f220",
   "source_dirty": "clean",
   "zig_version": "0.16.0",
-  "probe_rf_path": "/tmp/opencode/r10a_layout_rf",
-  "probe_debug_path": "/tmp/opencode/r10a_layout_dbg",
-  "probe_rf_sha256_16": "d39fe4e35db23be2",
-  "probe_debug_sha256_16": "f8be80a207ae34a5",
+  "probe_rf_path": "/tmp/opencode/r11a_layout_rf",
+  "probe_debug_path": "/tmp/opencode/r11a_layout_dbg",
+  "probe_rf_sha256_16": "61b86364601c06d7",
+  "probe_debug_sha256_16": "6f3d33f5d71e9f34",
   "probe_build_commands": [
-   "zig build-exe -O ReleaseFast --dep lua -Mroot=/tmp/opencode/r10a_layout_probe.zig --dep util -Mlua=src/lua/root.zig -Mutil=src/util/root.zig -lc -femit-bin=/tmp/opencode/r10a_layout_rf",
-   "zig build-exe -O Debug --dep lua -Mroot=/tmp/opencode/r10a_layout_probe.zig --dep util -Mlua=src/lua/root.zig -Mutil=src/util/root.zig -lc -femit-bin=/tmp/opencode/r10a_layout_dbg"
+   "zig build-exe -O ReleaseFast --dep lua -Mroot=/tmp/opencode/r11a_layout_probe.zig --dep util -Mlua=src/lua/root.zig -Mutil=src/util/root.zig -lc -femit-bin=/tmp/opencode/r11a_layout_rf",
+   "zig build-exe -O Debug --dep lua -Mroot=/tmp/opencode/r11a_layout_probe.zig --dep util -Mlua=src/lua/root.zig -Mutil=src/util/root.zig -lc -femit-bin=/tmp/opencode/r11a_layout_dbg"
   ],
-  "zig_binary_sha256": "ca90e3db800dc93bdcb71de6e30eedb8736e31d96768db80ab5f9e28e19c8362",
-  "note": "P16.50-review-10 C: probe binaries REBUILT from clean measured-source commit d02270f \u2014 fresh copies, hashes above, single regeneration timestamp; no relabeling, no nested timestamps."
+  "zig_binary_sha256": "22fd46f2a15596cdd58317a0369e1da3b5a325d4620f6a0fc661b90f7964a12a",
+  "note": "P16.50-review-11 C: probe binaries REBUILT from clean measured-source commit d02270f \u2014 fresh copies, hashes above, single regeneration timestamp; no relabeling, no nested timestamps."
  },
  "layout": {
   "ReleaseFast": {

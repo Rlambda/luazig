@@ -1,23 +1,23 @@
 {
   "meta": {
-    "created_utc": "2026-09-19T01:39:21.249496+00:00",
+    "created_utc": "2026-09-19T03:28:21.178205+00:00",
     "lane": "smoke_compare",
     "argv": [
       "/home/boss/codes/luazig/tools/smoke_compare.py",
       "--json-out",
-      "/home/boss/codes/luazig/tools/status/.tmp.smoke.dxmchrcs.json"
+      "/home/boss/codes/luazig/tools/status/.tmp.smoke.flekscq8.json"
     ],
     "zig_version": "0.16.0"
   },
   "provenance": {
-    "git_head": "d02270f",
-    "measured_source_head": "d02270f",
+    "git_head": "3edc852",
+    "measured_source_head": "3edc852",
     "git_dirty": "dirty",
     "source_dirty": "clean",
     "artifact_dirty": "dirty",
     "zig_version": "0.16.0",
     "optimize_mode": "ReleaseFast",
-    "zig_binary_sha16": "ca90e3db800dc93b",
+    "zig_binary_sha16": "22fd46f2a15596cd",
     "puc_binary_sha16": "d54bc45e1757b216"
   },
   "total": 84,

@@ -1,4 +1,4 @@
-> Last updated: 2026-09-19 (P16.50-review-10)
+> Last updated: 2026-09-19 (P16.50-review-11 correction opened)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -44,6 +44,20 @@ Geomean замедления vs PUC Lua: **1.43x** (цель: 1.0x; run-dependen
 <!-- END GENERATED SUMMARY -->
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
+
+- [ ] **P16.50-review-11 correction**: сохранить infallible close/unwind и
+  PATH-safe wrapper review-10, но исправить два связанных GC-инварианта.
+  `gcCommitCloseBarrierCell` сейчас повторно маркирует любой collectable child
+  и для old Cell безусловно переводит его в `OLD0`, хотя PUC
+  `luaC_barrier_` выполняет `reallymarkobject + setage(G_OLD0)` только под
+  `iswhite(value)`; black/gray/old child должен остаться byte-exact, без
+  повторного marked-accounting и old1 publication. Кроме того,
+  `gcRequeueOverflowGray` восстанавливает missed `gc_gray` work по одному
+  gray color и поэтому не отличает его от объектов, намеренно находящихся в
+  `gc_grayagain`; нужен отдельный per-object overflow marker либо
+  PUC-подобная intrusive очередь, а не трактовка color как принадлежности к
+  конкретному worklist. TBC-parity BLOCKER и emergency-GC HIGH остаются вне
+  correction scope. Open-count 23→24.
 
 - [x] **P16.50-review-10 correction (CLOSED by review-10)**: сохранить двухпроходный
   reserve-before-close контракт review-9, но убрать `abort_unwind_abandoned`:

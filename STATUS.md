@@ -1,4 +1,4 @@
-> Last updated: 2026-09-19 (P16.50-review-12 correction opened)
+> Last updated: 2026-09-19 (P16.50-review-12 correction closed)
 
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
@@ -45,7 +45,7 @@ Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [ ] **P16.50-review-12 correction**: сохранить white-child guard и
+- [x] **P16.50-review-12 correction (CLOSED by review-12)**: сохранить white-child guard и
   `MISSEDGRAYBIT` review-11, но закрыть оставшиеся post-mutation publication
   окна generational GC. В `gcMarkOld1` age/color меняются до fallible
   `gc_gray`/`gc_grayagain` append: после OOM retry пропускает объект, потому
@@ -57,6 +57,54 @@ Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependen
   capacity до первой age/color/list мутации и затем использовать infallible
   commits; observable stores — prepare→store→commit. TBC-parity BLOCKER и
   emergency-GC HIGH остаются вне correction scope. Open-count 23→24.
+
+  ЗАКРЫТО фазой P16.50-review-12 (2026-09-19): BLOCKER 1 — `gcMarkOld1`
+  (vm.zig:29075) переведён на batch-prepare: чистый bound-pass по snapshot
+  `gc_old1[0..snapshot_len]` считает OLD1-entries (color-independent upper
+  bound), резервирует `gc_gray` ДО первой мутации; loop мутации
+  (`.old1→.old`, markCellForceAssume / gcSetGray+appendAssumeCapacity)
+  полностью infallible. Bound proof: non-Cell OLD1 → ровно 1 ordinary-gray
+  append; Cell → никогда в gc_gray (inline mark), его Value-mark appends
+  максимум 1 GcObject (Value ссылается максимум на один GcObject, strings —
+  terminal-black, primitives — ничего); grayagain bound = 0 (threads держат
+  promotion-time membership из gcPromoteYoungObject/gcCorrectGrayAgain/
+  gcDrainGrayagain + gc_gen_threads re-traversal каждый cycle — append был бы
+  чистым дублем; устаревший inline-дубликат в gcMinorCollection удалён).
+  BLOCKER 2 — все backward barriers переведены на транзакционную схему:
+  `BackBarrierPlan` (vm.zig:26615) + `gcPrepareRememberObject`/
+  `gcCommitRememberObject` (reserve grayagain slot до мутации; commit
+  re-validates age/color, appendAssumeCapacity); prepare→store→commit на
+  rawSet new-key (steps 2/3/5, включая rehash window), `gcStoreMetatable`,
+  userdata uservalue/metatable (api.zig setmetatable arm: store пропускается
+  целиком при reserve OOM), `gcWriteBarrierTable` composition; windowless
+  dispatch fast paths (SETTABUP/SETTABLE/SETI/SETFIELD existing-slot +
+  SETLIST array fill, 9 сайтов) используют fused single-call
+  `gcTableBarrierBackValue` (vm.zig:28053) — та же транзакция одним вызовом
+  до infallible store (доказанный инвариант: между barrier и store нет
+  failure point; perf: split-форма стоила +5.025% retired instructions на
+  field_access gate-WARN, fused = baseline parity, gate OK).
+  `gcDrainGrayagain` — bulk reserve re-link upper bound до
+  clearRetainingCapacity; young sweep promote loop — appendAssumeCapacity
+  под существующим bulk reserve (доказательство явное). Аудит inventory: 0
+  fallible grayagain-append после мутации; gc_gray 26390 и gc_old1 26699 —
+  marker/flag-backed overflow drains review-10/11 (KEEP); gcRequeueOverflowGray
+  28201 / gcDrainOverflowOld1 28250 — marker/membership-checked drains
+  (marker чистится только после успешного append). 7 focused тестов
+  (vm.zig:60821+): markold reserve-OOM byte-exact + success re-traversal;
+  negative-before (старый mutate→append порядок детерминированно ловится);
+  table/userdata barrier reserve-OOM до store byte-exact + success ровно
+  одна touched1+grayagain; gcStoreMetatable fail-indices без partial
+  publication; gcDrainGrayagain reserve-OOM сохраняет membership; young
+  sweep под rejecting-allocator после успешного bulk reserve; sticky
+  fail-everything minor cycle recovery + инварианты после настоящих
+  minor/major cycles. Review-5 B2 test-contract update: setglobal sweep
+  expectation 3→4 (4-я publication из нового barrier-пути). Гейты: unit
+  300/300 Debug+RF; c_api 0 FAIL + DIFF PASS; matrix --testc 31/32
+  (zig_fail=0, big.lua both_fail pre-existing); smoke 84/84; wrapper PATH
+  sanity; fmt + git-diff-check clean; paired-seed perf gate OK (18/18
+  workloads, worst per-seed +4.048% (table_alloc_setmetatable[21]) < 5%,
+  field_access worst +1.946%). Open-count 24→23 (TBC-parity BLOCKER и
+  emergency-GC HIGH остаются открытыми).
 
 - [x] **P16.50-review-11 correction (CLOSED by review-11)**: сохранить infallible close/unwind и
   PATH-safe wrapper review-10, но исправить два связанных GC-инварианта.

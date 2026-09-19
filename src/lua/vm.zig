@@ -16918,7 +16918,9 @@ pub const Vm = struct {
                                     node.value = .Nil;
                                 } else {
                                     // Existing-slot update: VALUE barrier only
-                                    // (key already owned), BEFORE store.
+                                    // (key already owned) — fused transactional
+                                    // form (P16.50-review-12 BLOCKER 2; see
+                                    // gcTableBarrierBackValue).
                                     try self.gcTableBarrierBackValue(tbl, val);
                                     if (node.value == .Nil) {
                                         tbl.flags &= ~TableFlags.MASK;
@@ -17251,7 +17253,8 @@ pub const Vm = struct {
                                     node.value = .Nil;
                                 } else {
                                     // Existing-slot update: VALUE barrier only
-                                    // (key already owned), BEFORE store.
+                                    // (key already owned) — fused transactional
+                                    // form (see the SETTABUP fast path).
                                     try self.gcTableBarrierBackValue(tbl, val);
                                     if (node.value == .Nil) {
                                         tbl.flags &= ~TableFlags.MASK;
@@ -19049,8 +19052,9 @@ pub const Vm = struct {
                 }
                 for (0..count) |i| {
                     const idx = start + i;
-                    // Value-barrier BEFORE store (OOM safety: if barrier
-                    // fails, the store must not happen).
+                    // Value barrier — fused transactional form (OOM safety:
+                    // reserve→mutate→publish completes before the store;
+                    // the loop body itself never allocates).
                     try self.gcTableBarrierBackValue(tbl, ctx.regs[a + 1 + i]);
                     tbl.array[idx] = ctx.regs[a + 1 + i];
                 }
@@ -26439,8 +26443,8 @@ pub const Vm = struct {
     // ├─────────────────────────────┼──────────┼─────────────────────┼──────────────┼────────────────────┤
     // │ markCell (reallymarkobject) │ open     │ white→gray          │ NONE         │ YES (cell.get)     │
     // │ markCell (reallymarkobject) │ closed   │ white→black         │ NONE         │ YES (cell.value)   │
-    // │ markCellForce (markold)     │ open     │ black→gray          │ NONE         │ YES (cell.get)     │
-    // │ markCellForce (markold)     │ closed   │ black→black         │ NONE         │ YES (cell.value)   │
+    // │ markCellForceAssume(markold)│ open     │ black→gray          │ NONE         │ YES (cell.get)     │
+    // │ markCellForceAssume(markold)│ closed   │ black→black         │ NONE         │ YES (cell.value)   │
     // │ gcQueueScanObject(.cell)    │ both     │ delegates to markCell│ NONE        │ (via markCell)     │
     // │ gcQueueScanCell             │ both     │ delegates to markCell│ NONE        │ (via markCell)     │
     // │ gcPropagateOne(.cell)       │ N/A      │ unreachable         │ N/A          │ N/A                │
@@ -26464,13 +26468,11 @@ pub const Vm = struct {
     // │ SETUPVAL (gcStoreCellValue) │ closed   │ value write+barrier │ NONE         │ via barrier        │
     // │ gcFreeObject(.cell)         │ both     │ freed               │ NONE         │ N/A                │
     // │ gcCorrectGrayAgain          │ N/A      │ unreachable         │ N/A          │ N/A                │
-    // │ gcRememberCell              │ N/A      │ dead code (never    │ N/A          │ N/A                │
-    // │                             │          │ called)             │              │                    │
     // └─────────────────────────────┴──────────┴─────────────────────┴──────────────┴────────────────────┘
     //
     // Can Cell enter gc_gray?      NO — markCell never appends; gcQueueScanObject(.cell) delegates to markCell.
-    // Can Cell enter gc_grayagain? NO — gcRememberCell is never called; gcPromoteYoungObject skips cells for
-    //                                 grayagain (cells processed by markold via markCellForce, not grayagain).
+    // Can Cell enter gc_grayagain? NO — no remember path appends a Cell; gcPromoteYoungObject skips cells for
+    //                                 grayagain (cells processed by markold via markCellForceAssume, not grayagain).
     //
     // Every call site that marks a Cell delegates to markCell:
     //   - gcQueueScanObject(.cell) at ~line 20194
@@ -26551,18 +26553,23 @@ pub const Vm = struct {
     /// OLD1 objects. Unlike `markCell`, this has NO white guard — markold
     /// re-traverses already-marked objects to catch young children added
     /// after the initial mark. Matches PUC exactly: set color (open→gray,
-    /// closed→black) + markvalue inline. Never appends to gc_gray.
-    fn markCellForce(self: *Vm, cell: *Cell) DispatchError!void {
+    /// closed→black) + markvalue inline. Never appends to gc_gray for the
+    /// cell itself.
+    ///
+    /// Infallible: every gc_gray slot the inline value mark may append was
+    /// reserved by gcMarkOld1's batch prepare (bound proof there) — the
+    /// value mark goes through gcMarkValueImpl's assume path.
+    fn markCellForceAssume(self: *Vm, cell: *Cell) void {
         if (cell.isOpen()) {
             // PUC lgc.c:349-350: set2gray(uv) — open upvalues kept gray.
             gcSetGray(&cell.gc_marked);
             // PUC lgc.c:353: markvalue(g, uv->v.p) — mark stack-backed value.
-            try self.gcMarkValue(cell.get(self));
+            self.gcMarkValueImpl(cell.get(self), true);
         } else {
             // PUC lgc.c:352: set2black(uv) — closed upvalues visited here.
             gcSetBlack(&cell.gc_marked);
             // PUC lgc.c:353: markvalue(g, uv->v.p) — mark inline value.
-            try self.gcMarkValue(cell.value);
+            self.gcMarkValueImpl(cell.value, true);
         }
     }
 
@@ -26577,40 +26584,103 @@ pub const Vm = struct {
         self.markCellAssume(cell);
     }
 
-    /// PUC luaC_barrierback_ (lgc.c:208-222) for generational mode.
-    /// When a black (old) object is mutated, it must be re-traversed in the
-    /// next minor cycle. The age state machine:
+    /// PUC luaC_barrierback_ (lgc.c:208-222) prepare/commit split
+    /// (P16.50-review-12 BLOCKER 2): the old single-phase helpers mutated
+    /// the owner's age/color BEFORE the fallible grayagain append — an OOM
+    /// at the append left a touched1/gray owner with NO grayagain
+    /// membership, and the next minor cycle never re-traversed it (its
+    /// young children were swept — use-after-free). The prepare call
+    /// classifies the barrier and reserves the grayagain slot; the commit
+    /// runs AFTER the observable store, re-validates the current state and
+    /// appends with appendAssumeCapacity.
+    ///
+    /// Window contract: between prepare and commit only the observable
+    /// store (plus, at rawSet's new-key path, the collector-free
+    /// tableRehash — which MAY run an emergency full GC via the testc
+    /// allocation adapter) may execute. The commit's re-validation makes
+    /// every emergency-GC outcome safe: a gen-path emergency GC collapses
+    /// all ages to .old and clears grayagain (the .old1/.old commit arm
+    /// re-publishes into the reserved slot); an incremental-path emergency
+    /// GC leaves survivors white (the black-guard no-op is correct — the
+    /// next cycle traverses the owner wholesale).
+    pub const BackBarrierPlan = struct {
+        /// A commit is pending: run it after the observable store.
+        active: bool = false,
+        /// Gen arm: the commit runs the remember age state machine below;
+        /// the incremental arm paints gray + appends instead.
+        gen_age: bool = false,
+    };
+
+    /// Gen arm of PUC luaC_barrierback_ (lgc.c:208-222). Age state machine:
     ///   .old/.old1 → .touched1 (link into grayagain, paint gray)
     ///   .touched2  → .touched1 (already in grayagain, just re-gray)
     ///   .touched1  → no-op (already queued)
     ///   .new/.survival/.old0 → no-op (young, handled by minor sweep)
     /// A4: operates on GcObject so Cell folds into the same path.
-    fn gcRememberObject(self: *Vm, owner: GcObject) DispatchError!void {
-        if (self.gc_mode != .generational or self.gc_gen_phase != .minor) return;
+    ///
+    /// Invariant: every ACTIVE plan reserves exactly one gc_grayagain slot
+    /// — including touched2 (its commit usually re-grays without appending,
+    /// but a mid-window emergency full GC advances touched2→.old and
+    /// REMOVES it from grayagain, so the commit must re-publish).
+    fn gcPrepareRememberObject(self: *Vm, owner: GcObject) std.mem.Allocator.Error!BackBarrierPlan {
+        if (self.gc_mode != .generational or self.gc_gen_phase != .minor) return .{};
         const p = gcPtr(owner);
         switch (p.age.*) {
-            .new, .survival, .old0, .touched1 => return,
+            .new, .survival, .old0, .touched1 => return .{},
             // PUC luaC_barrierback_: if already TOUCHED2 (already in
             // grayagain), just set gray. Otherwise, link to grayagain.
             .touched2 => {
-                p.age.* = .touched1;
-                gcSetGray(p.marked);
+                try self.gc_grayagain.ensureUnusedCapacity(self.infraAlloc(), 1);
+                return .{ .active = true, .gen_age = true };
             },
             .old1, .old => {
-                p.age.* = .touched1;
-                // PUC linkobjgclist: paint gray and add to grayagain.
-                gcSetGray(p.marked);
-                try self.gc_grayagain.append(self.infraAlloc(), owner);
+                try self.gc_grayagain.ensureUnusedCapacity(self.infraAlloc(), 1);
+                return .{ .active = true, .gen_age = true };
             },
         }
     }
 
-    /// Cell-specific wrapper around gcRememberObject. Kept as a named
-    /// entry point because call sites identify the operand as a *Cell
-    /// (not a Value), and routing through gcRememberObject keeps the
-    /// age-transition logic in exactly one place.
-    fn gcRememberCell(self: *Vm, cell: *Cell) DispatchError!void {
-        try self.gcRememberObject(.{ .cell = cell });
+    /// Commit half of the remember barrier. Re-validates the CURRENT age:
+    /// between prepare and commit only a sibling commit (the double
+    /// key+value barrier of one new-key insert) or a mid-window emergency
+    /// full GC can change it. A sibling commit only moves the state toward
+    /// published (touched1 — needs nothing); an emergency GC collapses to
+    /// .old with grayagain cleared (needs re-publication — reserved).
+    fn gcCommitRememberObject(self: *Vm, owner: GcObject, plan: BackBarrierPlan) void {
+        if (!plan.active) return;
+        const p = gcPtr(owner);
+        if (plan.gen_age) {
+            switch (p.age.*) {
+                // Already published (sibling commit) — the second commit of
+                // a key+value pair is a no-op (PUC linkobjgclist
+                // idempotence by the touched1 guard).
+                .touched1 => return,
+                // Still in grayagain from correctgraylist — just re-gray.
+                .touched2 => {
+                    p.age.* = .touched1;
+                    gcSetGray(p.marked);
+                },
+                .old1, .old => {
+                    p.age.* = .touched1;
+                    // PUC linkobjgclist: paint gray and add to grayagain.
+                    gcSetGray(p.marked);
+                    self.gc_grayagain.appendAssumeCapacity(owner);
+                },
+                // Young ages need no grayagain membership (minor sweep
+                // owns them); unreachable given the prepare classification
+                // and the emergency-GC collapse-to-.old, but a defensive
+                // no-op is the correct action if ever observed.
+                else => return,
+            }
+        } else {
+            // Incremental arm: the owner was BLACK at prepare. If it is no
+            // longer black now, a sibling commit already published it (gray
+            // = owed traversal) or an emergency GC reset it to white (the
+            // next cycle traverses it wholesale) — either way a no-op.
+            if (!gcIsBlack(p.marked.*)) return;
+            gcSetGray(p.marked);
+            self.gc_grayagain.appendAssumeCapacity(owner);
+        }
     }
 
     fn gcForwardBarrierValue(self: *Vm, owner: Value, child: Value) DispatchError!void {
@@ -26802,6 +26872,19 @@ pub const Vm = struct {
         defer self.gc_busy = was_busy;
 
         self.gcClearGenerationalLists();
+        // P16.50-review-12 BLOCKER 2: reserve the gc_gen_threads appends
+        // BEFORE the mutation loop — the old fallible append ran AFTER
+        // `o.age.* = .old`, so an OOM left an OLD thread with no root-loop
+        // membership (its stack never re-scanned → young objects on it
+        // swept). Bound: one append per thread in gc_objects (pure pre-pass
+        // count; the long-literal loop below appends none). This site is
+        // outside gcSweepYoungObjects' snapshot reserve, so it owns its
+        // reservation.
+        var thread_need: usize = 0;
+        for (self.gc_objects.items) |obj| {
+            if (obj == .thread) thread_need += 1;
+        }
+        if (thread_need > 0) try self.gc_gen_threads.ensureUnusedCapacity(self.infraAlloc(), thread_need);
         for (self.gc_objects.items) |obj| {
             const o = gcPtr(obj);
             o.age.* = .old;
@@ -26811,7 +26894,7 @@ pub const Vm = struct {
             // handle that separately if it becomes an issue.
             gcSetBlack(o.marked);
             if (obj == .thread) {
-                try self.gc_gen_threads.append(self.infraAlloc(), obj.thread);
+                self.gc_gen_threads.appendAssumeCapacity(obj.thread);
             }
         }
         // Short strings are now in gc_objects. Only long literals separate.
@@ -27380,7 +27463,7 @@ pub const Vm = struct {
     /// to grayagain. The value is NOT marked, allowing weak value pruning
     /// and keeping newly created objects white.
     inline fn gcWriteBarrierTable(self: *Vm, owner: *Table, value: Value) DispatchError!void {
-        // Generational mode: backward barrier via gcRememberObject.
+        // Generational mode: backward barrier via the remember plan.
         // When an old (black) table stores a reference to a young (white)
         // object, the table must be re-traversed in the next minor cycle
         // so the young value gets marked. Without this, the young value
@@ -27390,58 +27473,39 @@ pub const Vm = struct {
         // && iswhite(gcvalue(v)) → luaC_barrierback_(L, p). In gen mode all
         // old objects are black, so isOld(owner) + isYoung(value) is the
         // equivalent check.
-        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
-            if (owner.gc_age.isOld()) {
-                if (gcValueAge(value)) |age| {
-                    if (age.isYoung()) {
-                        try self.gcRememberObject(.{ .table = owner });
-                    }
-                }
-            }
-            return;
-        }
-        if (self.gc_state == .pause) return;
-        if (!gcIsBlack(owner.gc_marked)) return;
-        // Only fire if value is collectable and white.
-        switch (value) {
-            .Table => |t| if (!gcIsWhite(t.gc_marked)) return,
-            .Closure => |c| if (!gcIsWhite(c.gc_marked)) return,
-            .Thread => |th| if (!gcIsWhite(th.gc_marked)) return,
-            .String => |s| if (!gcIsWhite(s.gc_marked)) return,
-            .Userdata => |ud| if (!gcIsWhite(ud.gc_marked)) return,
-            else => return,
-        }
-        // Backward barrier: turn owner gray, add to grayagain.
-        gcSetGray(&owner.gc_marked);
-        try self.gc_grayagain.append(self.infraAlloc(), .{ .table = owner });
+        //
+        // P16.50-review-12 BLOCKER 2: prepare→commit composition (the
+        // store stays with the caller, after this call — same order as the
+        // old single-phase barrier). The prepare reserves the grayagain
+        // slot BEFORE any age/color mutation; the commit publishes with
+        // appendAssumeCapacity. See BackBarrierPlan.
+        const plan = try self.gcPrepareTableBarrierBackValue(owner, value);
+        self.gcCommitTableBarrierBack(owner, plan);
     }
 
-    /// PUC luaC_barrierback_ (lgc.c:268) for userdata uservalue writes.
-    /// Same backward barrier as table writes: turn the userdata gray and
-    /// add to grayagain. Used by debug.setuservalue (PUC lapi.c:1015).
-    pub inline fn gcWriteBarrierUserdata(self: *Vm, owner: *Userdata, value: Value) DispatchError!void {
-        // Generational mode: use gcRememberObject (sets age to touched1).
-        // This fires even when GC is paused — in gen mode, paused objects
-        // are old (black), and mutations must be tracked for the next
-        // minor cycle.
+    /// PUC luaC_barrierback_ (lgc.c:268) for userdata uservalue/metatable
+    /// writes — prepare half. Used by debug.setuservalue (PUC lapi.c:1015)
+    /// and the setmetatable paths (C-API, testc).
+    ///
+    /// Gen arm fires on the age state machine UNCONDITIONALLY (no child
+    /// check — existing behavior): in gen mode paused objects are old
+    /// (black) and every mutation must be tracked for the next minor
+    /// cycle, even a primitive value store.
+    pub fn gcPrepareUserdataBarrierBack(self: *Vm, owner: *Userdata, value: Value) std.mem.Allocator.Error!BackBarrierPlan {
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
-            try self.gcRememberObject(.{ .userdata = owner });
-            return;
+            return self.gcPrepareRememberObject(.{ .userdata = owner });
         }
-        if (self.gc_state == .pause) return;
-        if (!gcIsBlack(owner.gc_marked)) return;
-        // Only fire if value is collectable and white.
-        switch (value) {
-            .Table => |t| if (!gcIsWhite(t.gc_marked)) return,
-            .Closure => |c| if (!gcIsWhite(c.gc_marked)) return,
-            .Thread => |th| if (!gcIsWhite(th.gc_marked)) return,
-            .String => |s| if (!gcIsWhite(s.gc_marked)) return,
-            .Userdata => |ud| if (!gcIsWhite(ud.gc_marked)) return,
-            else => return,
-        }
-        // Backward barrier: turn owner gray, add to grayagain.
-        gcSetGray(&owner.gc_marked);
-        try self.gc_grayagain.append(self.infraAlloc(), .{ .userdata = owner });
+        const child = GcObject.fromValue(value) orelse return .{}; // PUC iscollectable(v)
+        if (self.gc_state == .pause) return .{};
+        if (!gcIsBlack(owner.gc_marked)) return .{};
+        if (!gcIsWhite(gcPtr(child).marked.*)) return .{};
+        try self.gc_grayagain.ensureUnusedCapacity(self.infraAlloc(), 1);
+        return .{ .active = true };
+    }
+
+    /// Commit half of the userdata back barrier — see BackBarrierPlan.
+    pub fn gcCommitUserdataBarrierBack(self: *Vm, owner: *Userdata, plan: BackBarrierPlan) void {
+        self.gcCommitRememberObject(.{ .userdata = owner }, plan);
     }
 
     /// PUC forward barrier for cell/upvalue writes (lgc.h:245 `luaC_barrier`):
@@ -27807,28 +27871,50 @@ pub const Vm = struct {
     }
 
     pub inline fn gcStoreMetatable(self: *Vm, table: *Table, metatable: ?*Table) DispatchError!void {
-        table.metatable = metatable;
+        // P16.50-review-12 BLOCKER 2: prepare→store→commit. The old shape
+        // stored `table.metatable` FIRST, then ran fallible barrier
+        // bookkeeping (gcQueueScanObject append, gc_old1 append, grayagain
+        // append) — an OOM after the store left the metatable published
+        // with unreserved re-traversal debt. Every slot the commits may
+        // touch is reserved BEFORE the store; the commits append with
+        // appendAssumeCapacity. The window between reserve and commit
+        // contains only the plain pointer store (no allocation — no
+        // emergency GC can intervene).
         if (metatable) |mt| {
             if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
-                // PUC luaC_barrier_ (lgc.c:246-260): forward barrier — mark
-                // the metatable if table is BLACK and metatable is WHITE.
-                // gcQueueScanObject queues non-string objects for traversal
-                // by gcDrainGray, ensuring the metatable's children are
-                // marked. Using gcSetBlack here would mark the metatable
-                // BLACK without traversing its children → children stay
-                // WHITE → freed by sweep → use-after-free.
-                if (gcIsBlack(table.gc_marked) and gcIsWhite(mt.gc_marked)) {
-                    try self.gcQueueScanObject(.{ .table = mt });
+                // Gen arm reserves (PUC luaC_barrier_ lgc.c:246-260):
+                //  - gc_gray: the metatable is a Table — when white, the
+                //    forward-barrier commit queues it via
+                //    gcQueueScanObjectAssume (exactly 1 slot; a Table is
+                //    never a string, so the queue arm always appends).
+                //  - gc_old1: the OLD0 publication when the table is old.
+                //  - gc_grayagain: the table's own re-traversal membership
+                //    unless it is already touched1.
+                const fwd = gcIsBlack(table.gc_marked) and gcIsWhite(mt.gc_marked);
+                var gray_need: usize = 0;
+                var old1_need: usize = 0;
+                var grayagain_need: usize = 0;
+                if (fwd) {
+                    gray_need = 1;
+                    if (table.gc_age.isOld()) old1_need = 1;
+                }
+                if (gcIsBlack(table.gc_marked) and table.gc_age != .touched1) grayagain_need = 1;
+                if (gray_need > 0) try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), gray_need);
+                if (old1_need > 0) try self.gc_old1.ensureUnusedCapacity(self.infraAlloc(), old1_need);
+                if (grayagain_need > 0) try self.gc_grayagain.ensureUnusedCapacity(self.infraAlloc(), grayagain_need);
+                table.metatable = metatable;
+                if (fwd) {
+                    // PUC luaC_barrier_ (lgc.c:246-260): forward barrier —
+                    // mark the metatable if table is BLACK and metatable is
+                    // WHITE. gcQueueScanObject queues non-string objects
+                    // for traversal by gcDrainGray, ensuring the metatable's
+                    // children are marked. Using gcSetBlack here would mark
+                    // the metatable BLACK without traversing its children →
+                    // children stay WHITE → freed by sweep → use-after-free.
+                    self.gcQueueScanObjectAssume(.{ .table = mt });
                     if (table.gc_age.isOld()) {
                         mt.gc_age = .old0;
-                        self.gc_old1.append(self.infraAlloc(), .{ .table = mt }) catch |e| {
-                            // P16.50-review-11 (gc_old1 overflow proof):
-                            // overflow commit — the canonical age is set,
-                            // the flag records the unlisted OLD0 for the
-                            // age+membership drain; the OOM propagates.
-                            self.gc_old1_overflow = true;
-                            return e;
-                        };
+                        self.gc_old1.appendAssumeCapacity(.{ .table = mt });
                     }
                 }
                 // Also add the table to grayagain (backward barrier) so it's
@@ -27837,23 +27923,36 @@ pub const Vm = struct {
                 // this, an OLD table with a YOUNG metatable that was set when
                 // the table was young+black won't have its metatable marked
                 // in subsequent cycles → metatable freed → use-after-free.
-                // Bypass gcRememberObject's age check: YOUNG BLACK tables also
-                // need re-traversal if they were already traversed this cycle.
+                // Bypass the remember plan's age check: YOUNG BLACK tables
+                // also need re-traversal if they were already traversed
+                // this cycle.
                 if (gcIsBlack(table.gc_marked) and table.gc_age != .touched1) {
                     table.gc_age = .touched1;
                     gcSetGray(&table.gc_marked);
-                    try self.gc_grayagain.append(self.infraAlloc(), .{ .table = table });
+                    self.gc_grayagain.appendAssumeCapacity(.{ .table = table });
                 }
                 return;
             }
-            // Incremental mode: forward barrier (luaC_objbarrier).
+            // Incremental mode: forward barrier (luaC_objbarrier). The
+            // propagate/atomic arm marks the metatable — PUC's
+            // reallymarkobject cannot fail, but our gc_gray side-list
+            // append can, and a lost mark after a published store is a
+            // sweep UAF. Reserve the single possible append BEFORE the
+            // store (a Table value queues exactly 1 slot).
+            const inc_mark = self.gc_state != .pause and
+                gcIsBlack(table.gc_marked) and gcIsWhite(mt.gc_marked) and
+                (self.gc_state == .propagate or self.gc_state == .atomic);
+            if (inc_mark) try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), 1);
+            table.metatable = metatable;
             if (self.gc_state == .pause or !gcIsBlack(table.gc_marked) or !gcIsWhite(mt.gc_marked)) return;
             switch (self.gc_state) {
-                .propagate, .atomic => try self.gcMarkValue(.{ .Table = mt }),
+                .propagate, .atomic => self.gcMarkValueAssume(.{ .Table = mt }),
                 .sweep => gcMakeWhite(&table.gc_marked, self.gc_current_white),
                 .pause => {},
             }
+            return;
         }
+        table.metatable = null;
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -27929,6 +28028,53 @@ pub const Vm = struct {
 
     /// PUC `luaV_finishfastset(L, t, v)` = `luaC_barrierback(L, gcvalue(t), v)`.
     /// Existing-slot update barrier: barrier the TABLE (backward) based on the
+    /// PUC luaC_barrierback (lgc.h:251) for table VALUE stores — the fused
+    /// single-call transactional form used by the bytecode dispatch fast
+    /// paths (SETTABUP/SETTABLE/SETI/SETFIELD existing-slot updates and the
+    /// SETLIST array fill).
+    ///
+    /// P16.50-review-12 BLOCKER 2 contract in single-call form: these sites
+    /// have NO failure point between the barrier and the store (the dispatch
+    /// fast paths allocate nothing in between — the long-standing invariant
+    /// that keeps these stores inline), so the whole reserve→mutate→publish
+    /// transaction completes BEFORE the infallible store:
+    ///   - reserve OOM → nothing mutated, the store never runs — identical
+    ///     observable outcome to the prepare→store→commit split;
+    ///   - success → exactly one touched1 + grayagain publication, then the
+    ///     store; no allocation between → no GC and no observer can run.
+    /// The split prepare/commit pair remains for the sites with a real
+    /// window between reserve and publication (rawSet's new-key rehash,
+    /// gcStoreMetatable, the userdata uservalue/metatable paths).
+    ///
+    /// Perf: the split pair materializes an errunion plan and re-checks it
+    /// in the commit on EVERY store (~+5% retired instructions on the
+    /// field_access workload, 10M stores — perf gate WARN); this fused form
+    /// measures at baseline parity (paired seeds 1..21).
+    inline fn gcTableBarrierBackValue(self: *Vm, table: *Table, value: Value) DispatchError!void {
+        const child = GcObject.fromValue(value) orelse return; // PUC iscollectable(v)
+        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
+            // PUC luaC_barrierback → luaC_objbarrierback → luaC_barrierback_
+            // (lgc.c:268): old table + young child → remember the table for
+            // the next minor cycle. The child stays white (weak value
+            // pruning needs it unmarked).
+            if (table.gc_age.isOld()) {
+                const child_age = gcPtr(child).age.*;
+                if (child_age.isYoung()) {
+                    const plan = try self.gcPrepareRememberObject(.{ .table = table });
+                    self.gcCommitRememberObject(.{ .table = table }, plan);
+                }
+            }
+            return;
+        }
+        // Incremental mode: PUC luaC_objbarrierback — isblack(p) && iswhite(o).
+        if (self.gc_state == .pause) return;
+        if (!gcIsBlack(table.gc_marked)) return;
+        if (!gcIsWhite(gcPtr(child).marked.*)) return;
+        try self.gc_grayagain.ensureUnusedCapacity(self.infraAlloc(), 1);
+        gcSetGray(&table.gc_marked);
+        self.gc_grayagain.appendAssumeCapacity(.{ .table = table });
+    }
+
     /// VALUE only. The key is already owned by the table (found by lookup),
     /// so no key barrier is needed.
     ///
@@ -27937,11 +28083,18 @@ pub const Vm = struct {
     /// or phase check. No gcValueAge call, no gcIsBlack check, no phase
     /// comparison. This is the PUC `iscollectable(v)` fast exit.
     ///
-    /// OOM safety: the barrier (grayagain append) is called BEFORE the store.
-    /// If it fails, the store must not happen. See the invariant comment above.
-    inline fn gcTableBarrierBackValue(self: *Vm, table: *Table, value: Value) DispatchError!void {
-        const child = GcObject.fromValue(value) orelse return; // PUC iscollectable(v)
-        try self.gcTableBarrierBackSlow(table, child);
+    /// OOM safety (P16.50-review-12 BLOCKER 2): prepare → store → commit at
+    /// every call site with a failure point between the reserve and the
+    /// store (rawSet's new-key rehash path; the userdata/metatable paths).
+    /// The prepare call reserves the grayagain slot BEFORE the observable
+    /// store; the commit re-validates the current state (idempotent for the
+    /// double key+value barrier of one new-key insert) and publishes with
+    /// appendAssumeCapacity. The windowless dispatch fast paths use the
+    /// fused gcTableBarrierBackValue instead (same transaction, single
+    /// call before the infallible store).
+    inline fn gcPrepareTableBarrierBackValue(self: *Vm, table: *Table, value: Value) std.mem.Allocator.Error!BackBarrierPlan {
+        const child = GcObject.fromValue(value) orelse return .{}; // PUC iscollectable(v)
+        return self.gcPrepareTableBarrierBackSlow(table, child);
     }
 
     /// PUC `luaH_newkey` → `luaC_barrierback(L, obj2gco(t), key)`.
@@ -27949,17 +28102,26 @@ pub const Vm = struct {
     /// KEY. The key is a NEW reference into the table — if the table is old/
     /// black and the key is young/white, the table must be re-traversed.
     ///
-    /// Same fast-exit and OOM-safety semantics as gcTableBarrierBackValue.
-    inline fn gcTableBarrierBackNewKey(self: *Vm, table: *Table, key: Value) DispatchError!void {
-        const child = GcObject.fromValue(key) orelse return; // PUC iscollectable(v)
-        try self.gcTableBarrierBackSlow(table, child);
+    /// Same fast-exit and OOM-safety semantics as
+    /// gcPrepareTableBarrierBackValue.
+    inline fn gcPrepareTableBarrierBackNewKey(self: *Vm, table: *Table, key: Value) std.mem.Allocator.Error!BackBarrierPlan {
+        const child = GcObject.fromValue(key) orelse return .{}; // PUC iscollectable(v)
+        return self.gcPrepareTableBarrierBackSlow(table, child);
     }
 
-    /// Shared slow path for both gcTableBarrierBackValue and
-    /// gcTableBarrierBackNewKey. This is the ONE place where gray/age
-    /// mutation + grayagain append happens for table write barriers. PUC
-    /// `luaC_objbarrierback` → `luaC_barrierback_` (incremental) or
-    /// `luaC_barrierback_` (generational).
+    /// Commit half for both table back barriers: re-validate the current
+    /// age/color and publish. See BackBarrierPlan for the window contract
+    /// and the re-validation proof.
+    inline fn gcCommitTableBarrierBack(self: *Vm, table: *Table, plan: BackBarrierPlan) void {
+        self.gcCommitRememberObject(.{ .table = table }, plan);
+    }
+
+    /// Shared slow path for both gcPrepareTableBarrierBackValue and
+    /// gcPrepareTableBarrierBackNewKey. This is the ONE place where the
+    /// table back-barrier classification + grayagain reservation happens.
+    /// PUC `luaC_objbarrierback` → `luaC_barrierback_` (incremental) or
+    /// `luaC_barrierback_` (generational). The age/color mutation +
+    /// grayagain append live in gcCommitRememberObject only.
     ///
     /// `inline` (not `noinline`): noinline was measured and caused a code-
     /// layout regression on the comparisons workload (+18%; see STATUS P16.9).
@@ -27967,11 +28129,7 @@ pub const Vm = struct {
     /// compiler cold-outline when profitable. The slow path is only reached
     /// when the value/key is collectable AND the table is old/black AND the
     /// child is young/white (a rare event in steady state).
-    ///
-    /// Uses the DIRECT *Table owner: `gcRememberObject(.{ .table = table })`
-    /// — no Value→GcObject→Table round-trip (Task 7). Age/transition logic
-    /// is centralized here and in `gcRememberObject` only.
-    inline fn gcTableBarrierBackSlow(self: *Vm, table: *Table, child: GcObject) DispatchError!void {
+    inline fn gcPrepareTableBarrierBackSlow(self: *Vm, table: *Table, child: GcObject) std.mem.Allocator.Error!BackBarrierPlan {
         // Generational mode: PUC luaC_barrierback → luaC_objbarrierback →
         // luaC_barrierback_ (lgc.c:268). When an old table gets a young
         // value/key, remember the table for re-traversal in the next minor
@@ -27981,20 +28139,19 @@ pub const Vm = struct {
             if (table.gc_age.isOld()) {
                 const child_age = gcPtr(child).age.*;
                 if (child_age.isYoung()) {
-                    try self.gcRememberObject(.{ .table = table });
+                    return self.gcPrepareRememberObject(.{ .table = table });
                 }
             }
-            return;
+            return .{};
         }
         // Incremental mode: PUC luaC_objbarrierback — isblack(p) && iswhite(o).
         // The value is NOT marked — this keeps newly created objects white and
         // allows weak value pruning (same as gcWriteBarrierTable).
-        if (self.gc_state == .pause) return;
-        if (!gcIsBlack(table.gc_marked)) return;
-        if (!gcIsWhite(gcPtr(child).marked.*)) return;
-        // Backward barrier: turn owner gray, add to grayagain.
-        gcSetGray(&table.gc_marked);
-        try self.gc_grayagain.append(self.infraAlloc(), .{ .table = table });
+        if (self.gc_state == .pause) return .{};
+        if (!gcIsBlack(table.gc_marked)) return .{};
+        if (!gcIsWhite(gcPtr(child).marked.*)) return .{};
+        try self.gc_grayagain.ensureUnusedCapacity(self.infraAlloc(), 1);
+        return .{ .active = true };
     }
 
     fn gcDrainGray(self: *Vm) DispatchError!void {
@@ -28122,8 +28279,21 @@ pub const Vm = struct {
         // PUC re-links the intrusive list without allocating.
         const saved = self.infraAlloc().dupe(GcObject, self.gc_grayagain.items) catch return error.OutOfMemory;
         defer self.infraAlloc().free(saved);
+        // P16.50-review-12 BLOCKER 2: reserve the publication bounds BEFORE
+        // clearRetainingCapacity. Bound proof: every saved entry re-links at
+        // most once (touched1 → 1, touched2 → 0, thread → 1, else → 0), so
+        // the re-link appends total ≤ saved.len; each loop iteration also
+        // appends its object to gc_gray exactly once, and every gcDrainGray
+        // success ends with gc_gray empty (gcPropagateOne pops until the
+        // list is empty; the overflow drain re-queues and drains to empty),
+        // so len(0) < capacity(saved.len) holds for every
+        // appendAssumeCapacity. The old fallible appends ran AFTER the
+        // gcSetBlack mutation — an OOM lost the entry's membership (and,
+        // for the re-links, left a touched1 object out of grayagain).
+        try self.gc_grayagain.ensureUnusedCapacity(self.infraAlloc(), saved.len);
+        try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), saved.len);
         self.gc_grayagain.clearRetainingCapacity();
-        for (saved) |obj| {
+        for (saved, 0..) |obj, i| {
             // Task 7: invariant — all grayagain entries are valid (registered
             // in gc_objects). The lifecycle guarantee:
             //   1. gcDrainGrayagain saves+clears grayagain at atomic start.
@@ -28150,8 +28320,10 @@ pub const Vm = struct {
                 .cell => {
                     // PUC never puts upvalues in grayagain: luaC_barrierback_
                     // (lgc.c:268) is used for tables/userdata, never upvalues.
-                    // gcRememberCell is dead code (never called). If we reach
-                    // here, a Cell was illegally appended to gc_grayagain.
+                    // No remember path appends a Cell (cells are processed by
+                    // markold via markCellForceAssume, not grayagain). If we
+                    // reach here, a Cell was illegally appended to
+                    // gc_grayagain.
                     if (@import("builtin").mode == .Debug) {
                         @panic("Cell must never enter gc_grayagain");
                     }
@@ -28163,8 +28335,21 @@ pub const Vm = struct {
                     // PUC propagatemark: nw2black(o) — set BLACK before
                     // traversing, then genlink after.
                     gcSetBlack(p.marked);
-                    try self.gc_gray.append(self.infraAlloc(), obj);
-                    try self.gcDrainGray();
+                    self.gc_gray.appendAssumeCapacity(obj);
+                    self.gcDrainGray() catch |e| {
+                        // Rollback (P16.50-review-12 BLOCKER 2): restore
+                        // the unprocessed tail — including this entry (it
+                        // is black and queued in gc_gray, but its grayagain
+                        // membership must survive the abort; the next drain
+                        // re-processes it, at worst traversing it twice,
+                        // never losing it). Capacity: re-links done ≤ i,
+                        // so re-links_done + (saved.len - i) ≤ saved.len
+                        // stays within the reserve above.
+                        for (saved[i..]) |rest| {
+                            self.gc_grayagain.appendAssumeCapacity(rest);
+                        }
+                        return e;
+                    };
                     // PUC genlink (lgc.c:470-477): after traversal, if the
                     // object is TOUCHED1, link it back to grayagain WITHOUT
                     // advancing the age. correctgraylist (gcCorrectGrayAgain,
@@ -28180,7 +28365,7 @@ pub const Vm = struct {
                     // currentwhite) are not re-marked and get collected.
                     switch (p.age.*) {
                         .touched1 => {
-                            try self.gc_grayagain.append(self.infraAlloc(), obj);
+                            self.gc_grayagain.appendAssumeCapacity(obj);
                         },
                         .touched2 => {
                             p.age.* = .old;
@@ -28189,7 +28374,7 @@ pub const Vm = struct {
                             // Threads and other objects kept in grayagain
                             // by correctgraylist. Keep them.
                             if (obj == .thread) {
-                                try self.gc_grayagain.append(self.infraAlloc(), obj);
+                                self.gc_grayagain.appendAssumeCapacity(obj);
                             }
                         },
                     }
@@ -28552,7 +28737,14 @@ pub const Vm = struct {
     ///     equivalent of PUC's `twups` list (threads with upvalues/open
     ///     variables that need re-traversal). Without this, promoted
     ///     threads would be missed by minor marking → use-after-free.
-    fn gcPromoteYoungObject(self: *Vm, obj: GcObject) DispatchError!bool {
+    /// Infallible (P16.50-review-12 BLOCKER 2): gcSweepYoungObjects reserves
+    /// snapshot-sized capacity for gc_old1/gc_grayagain/gc_gen_threads
+    /// BEFORE freeing anything, and each call appends at most ONE entry to
+    /// each list (bound proof at the reserve site), so every append below
+    /// is appendAssumeCapacity. The old fallible appends ran AFTER the age
+    /// mutation — an OOM left an OLD1 object with no gc_old1/grayagain
+    /// membership (lost re-traversal → young children swept → UAF).
+    fn gcPromoteYoungObject(self: *Vm, obj: GcObject) bool {
         // PUC sweepgen (lgc.c:1145-1167): makewhite + nextage + if OLD1 →
         // linkobjgclist(o, grayagain). Objects promoted to OLD1 MUST be
         // added to grayagain so correctgraylist makes them BLACK. Without
@@ -28566,18 +28758,18 @@ pub const Vm = struct {
             },
             .survival => {
                 p.age.* = .old1;
-                try self.gc_old1.append(self.infraAlloc(), obj);
+                self.gc_old1.appendAssumeCapacity(obj);
                 // PUC sweepgen adds OLD1 to the old1 list only, NOT to
                 // grayagain. Cells are NEVER added to grayagain — PUC never
                 // puts upvalues in grayagain, and markold handles them via
-                // markCellForce (inline mark). Non-cell OLD1 objects are
-                // added to grayagain so correctgraylist makes them BLACK.
+                // markCellForceAssume (inline mark). Non-cell OLD1 objects
+                // are added to grayagain so correctgraylist makes them BLACK.
                 if (obj != .cell) {
-                    try self.gc_grayagain.append(self.infraAlloc(), obj);
+                    self.gc_grayagain.appendAssumeCapacity(obj);
                 }
                 self.gc_gen_added_old_kb += @as(f64, @floatFromInt(gcObjectBytes(obj))) / 1024.0;
                 if (obj == .thread) {
-                    try self.gc_gen_threads.append(self.infraAlloc(), obj.thread);
+                    self.gc_gen_threads.appendAssumeCapacity(obj.thread);
                 }
                 return false;
             },
@@ -28598,10 +28790,10 @@ pub const Vm = struct {
                 p.age.* = .old1;
                 self.gc_gen_added_old_kb += @as(f64, @floatFromInt(gcObjectBytes(obj))) / 1024.0;
                 if (obj != .cell) {
-                    try self.gc_grayagain.append(self.infraAlloc(), obj);
+                    self.gc_grayagain.appendAssumeCapacity(obj);
                 }
                 if (obj == .thread) {
-                    try self.gc_gen_threads.append(self.infraAlloc(), obj.thread);
+                    self.gc_gen_threads.appendAssumeCapacity(obj.thread);
                 }
                 return false;
             },
@@ -28659,6 +28851,18 @@ pub const Vm = struct {
         try self.gc_old1.ensureUnusedCapacity(self.infraAlloc(), snapshot);
         try self.gc_grayagain.ensureUnusedCapacity(self.infraAlloc(), snapshot);
         try self.gc_gen_threads.ensureUnusedCapacity(self.infraAlloc(), snapshot);
+        // Bound proof (P16.50-review-12 BLOCKER 2): the loop calls
+        // gcPromoteYoungObject at most once per snapshot entry and each
+        // call appends at most ONE entry to each reserved list
+        // (survival→old1: gc_old1+1, gc_grayagain+1 iff non-cell,
+        // gc_gen_threads+1 iff thread; old0→old1: gc_old1+0 — already
+        // linked by the forward barrier — plus the same grayagain/
+        // gen_threads bounds; new→survival: none), so the snapshot-sized
+        // reserves cover every appendAssumeCapacity. Nothing between the
+        // reserve and the appends consumes that capacity: the loop's frees
+        // (gcFreeObject → thread teardown → barriers take the GENMINOR
+        // sweep no-op arm) and gcUnregisterObjectSweep append to none of
+        // the three lists.
         // P16.50-review-11 (gc_old1 overflow proof): the OLD0→OLD1 promote
         // arm below assumes list membership. The entry drains (flag-gated)
         // completed the publication of every overflow-committed OLD0
@@ -28685,7 +28889,7 @@ pub const Vm = struct {
             if (p.age.* == .new) {
                 gcMakeWhite(&p.marked.*, self.gc_current_white);
             }
-            if (try self.gcPromoteYoungObject(obj)) {
+            if (self.gcPromoteYoungObject(obj)) {
                 self.gc_young_objects.items[write] = obj;
                 write += 1;
             }
@@ -28706,10 +28910,11 @@ pub const Vm = struct {
         // PUC sweepgen (lgc.c:1188-1201): advances G_OLD0 → G_OLD1 via
         // nextage[]. G_OLD1 objects are NOT advanced here — they stay OLD1
         // until the NEXT cycle's gcMarkOld1 (PUC markold, lgc.c:1276)
-        // transitions them to G_OLD and re-traverses them. This is critical:
-        // gcMarkOld1 adds OLD1 threads to grayagain so they are re-traversed
-        // every cycle. If we advance OLD1→OLD here, gcMarkOld1 never runs
-        // and OLD threads are never added to grayagain.
+        // transitions them to G_OLD and re-traverses the black ones (their
+        // young children must be re-marked every cycle). Advancing OLD1→OLD
+        // here would skip that re-traversal. Threads are re-traversed via
+        // their gc_gen_threads root-loop membership plus the grayagain
+        // membership gcPromoteYoungObject gave them at promotion.
         //
         // IMPORTANT: Only advance OLD0→OLD1 here. Do NOT advance OLD1→OLD.
         // Objects promoted to OLD1 by gcPromoteYoungObject (from gc_young_objects)
@@ -28840,37 +29045,59 @@ pub const Vm = struct {
     /// `.old` objects are not re-traversed: in PUC their invariant is that
     /// all their referenced objects are also old (promoted together across
     /// cycles), so they have no young children to mark.
-    fn gcMarkOld1(self: *Vm) DispatchError!void {
+    ///
+    /// P16.50-review-12 BLOCKER 1: batch-prepare contract. The old shape
+    /// (this function's stale duplicate, plus the inline copy in
+    /// gcMinorCollection — now removed) mutated `p.age.* = .old` and painted
+    /// gray BEFORE the fallible gc_gray/markCellForceAssume appends — an OOM
+    /// at the append left an .old object whose re-traversal was lost: a
+    /// retry skips it (`age != .old1`), so its young children were never
+    /// marked and the minor sweep freed them (use-after-free).
+    ///
+    /// Bound proof (reserve BEFORE any mutation): each snapshot OLD1 entry
+    /// contributes at most ONE ordinary gc_gray append —
+    ///   non-Cell: the object itself (gcSetGray + append);
+    ///   Cell: never appended (markCellForceAssume marks inline), but its
+    ///     VALUE mark (gcMarkValueImpl assume → gcQueueScanObjectAssume)
+    ///     appends the value's single GcObject iff collectable and
+    ///     non-string (strings go straight to black; primitives mark
+    ///     nothing). A Value references at most one GcObject, so the
+    ///     per-Cell bound is exactly 1.
+    /// grayagain bound: ZERO. Threads keep their promotion-time grayagain
+    /// membership (gcPromoteYoungObject's survival→old1 and old0→old1 arms
+    /// append every non-cell OLD1 — threads included),
+    /// gcCorrectGrayAgain keeps non-white threads, and gcDrainGrayagain
+    /// re-links them; the gc_gen_threads root loop in gcMinorCollection
+    /// re-traverses every old thread each cycle regardless. A markold
+    /// grayagain append would only duplicate that membership (one extra
+    /// stable entry per OLD1 thread — pure double traversal). The stale
+    /// duplicate's thread append is therefore NOT reproduced here.
+    fn gcMarkOld1(self: *Vm) std.mem.Allocator.Error!void {
         const snapshot = @min(self.gc_old1_snapshot_len, self.gc_old1.items.len);
+        // Pure bound pass: count OLD1 entries (color-independent upper
+        // bound — gray/white OLD1 contribute 0, the spare capacity is
+        // harmless).
+        var gray_need: usize = 0;
+        for (self.gc_old1.items[0..snapshot]) |obj| {
+            if (gcPtr(obj).age.* == .old1) gray_need += 1;
+        }
+        if (gray_need > 0) try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), gray_need);
         for (self.gc_old1.items[0..snapshot]) |obj| {
             const p = gcPtr(obj);
             if (p.age.* != .old1) continue;
             // PUC markold: setage(p, G_OLD); if (isblack(p)) reallymarkobject(g, p);
             p.age.* = .old;
-            // PUC markold: if (isblack(p)) reallymarkobject(g, p);
-            // PUC asserts !iswhite(p) for OLD1 objects — after the sweepgen
-            // fix, non-NEW survivors keep their BLACK mark, so OLD1 objects
-            // should never be white. But during the first cycle after the
-            // fix, OLD1 objects from the broken previous sweep (which set
-            // ALL survivors to white) may still be white. Force-queue them
-            // too, ensuring their young children are marked. After the
-            // transition, this white check is a no-op (OLD1 is always black).
-            if (gcIsBlack(p.marked.*) or gcIsWhite(p.marked.*)) {
+            if (gcIsBlack(p.marked.*)) {
                 // PUC markold calls reallymarkobject(g, p) which for cells
                 // does inline marking (set color + markvalue) — NEVER adds
                 // to gc_gray (propagatemark has no LUA_VUPVAL case). For all
                 // other types, reallymarkobject adds to the gray list.
                 if (obj == .cell) {
-                    try self.markCellForce(obj.cell);
+                    self.markCellForceAssume(obj.cell);
                 } else {
                     // Force re-traversal: set gray + append to gray list.
                     gcSetGray(p.marked);
-                    try self.gc_gray.append(self.infraAlloc(), obj);
-                }
-                // Threads are linked into grayagain so they are re-traversed
-                // every cycle. correctgraylist keeps them there permanently.
-                if (obj == .thread) {
-                    try self.gc_grayagain.append(self.infraAlloc(), obj);
+                    self.gc_gray.appendAssumeCapacity(obj);
                 }
             }
         }
@@ -28950,23 +29177,11 @@ pub const Vm = struct {
         // this forced re-traversal, young children of OLD1 objects are not
         // marked → freed during minor sweep → use-after-free.
         // PUC markold also advances age G_OLD1 → G_OLD here.
-        for (self.gc_old1.items[0..self.gc_old1_snapshot_len]) |obj| {
-            const p = gcPtr(obj);
-            if (p.age.* == .old1) {
-                p.age.* = .old;
-                if (gcIsBlack(p.marked.*)) {
-                    // PUC markold: reallymarkobject(g, p). For cells, this
-                    // does inline marking — never adds to gc_gray. For other
-                    // types, it adds to the gray list for propagation.
-                    if (obj == .cell) {
-                        try self.markCellForce(obj.cell);
-                    } else {
-                        gcSetGray(p.marked);
-                        try self.gc_gray.append(self.infraAlloc(), obj);
-                    }
-                }
-            }
-        }
+        // P16.50-review-12 BLOCKER 1: gcMarkOld1 is the single markold —
+        // the old inline duplicate (same mutate-before-append window, no
+        // thread grayagain append) is removed; see gcMarkOld1's bound
+        // proof.
+        try self.gcMarkOld1();
         // PUC atomic (lgc.c:1546-1560): grayagain items are saved and cleared
         // at the START of atomic, then drained AFTER the gray list. PUC does
         // NOT re-queue grayagain items before atomic — they are only processed
@@ -28988,10 +29203,18 @@ pub const Vm = struct {
         // Instead, force each thread GRAY and add to gc_gray, matching
         // PUC's direct traversethread call. gcDrainGray will then traverse
         // the thread's stack and mark all reachable objects.
+        //
+        // P16.50-review-12 BLOCKER 2: reserve the loop's gc_gray appends
+        // BEFORE the first gcSetGray mutation — the old fallible append
+        // after the gray paint lost the re-traversal on OOM (black thread,
+        // no gc_gray entry — its stack's young objects swept). Bound:
+        // exactly one append per gc_gen_threads entry; nothing between the
+        // reserve and the appends consumes the capacity.
+        try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), self.gc_gen_threads.items.len);
         for (self.gc_gen_threads.items) |thread| {
             const p = gcPtr(.{ .thread = thread });
             gcSetGray(p.marked);
-            try self.gc_gray.append(self.infraAlloc(), .{ .thread = thread });
+            self.gc_gray.appendAssumeCapacity(.{ .thread = thread });
         }
 
         try self.gcDrainGray();
@@ -34801,10 +35024,13 @@ pub const Vm = struct {
                 return;
             }
             const val = if (args.len >= 2) args[1] else .Nil;
-            ud.uservalues[@intCast(idx - 1)] = val;
             // PUC luaC_barrierback (lapi.c:1015): backward barrier — turn
             // the userdata gray if it is black and the value is white.
-            try self.gcWriteBarrierUserdata(ud, val);
+            // Prepare → store → commit (P16.50-review-12 BLOCKER 2): the
+            // grayagain publication is reserved BEFORE the uservalue store.
+            const barrier = try self.gcPrepareUserdataBarrierBack(ud, val);
+            ud.uservalues[@intCast(idx - 1)] = val;
+            self.gcCommitUserdataBarrierBack(ud, barrier);
             if (outs.len > 0) outs[0] = .{ .Bool = true };
             return;
         }
@@ -35017,16 +35243,17 @@ pub const Vm = struct {
     ///   5. Genuine new key → key+value barriers exactly once → insert/rehash.
     ///
     /// Barrier semantics per PUC:
-    ///   - Existing-slot update → gcTableBarrierBackValue(table, VALUE only).
-    ///     No key barrier (key already owned).
-    ///   - New-key insertion → gcTableBarrierBackNewKey(table, KEY) +
-    ///     gcTableBarrierBackValue(table, VALUE). Both barrier the same table;
-    ///     the second is idempotent (table already in grayagain/touched1).
+    ///   - Existing-slot update → gcPrepareTableBarrierBackValue(table,
+    ///     VALUE only). No key barrier (key already owned).
+    ///   - New-key insertion → gcPrepareTableBarrierBackNewKey(table, KEY)
+    ///     + gcPrepareTableBarrierBackValue(table, VALUE). Both barrier the
+    ///     same table; the second commit is idempotent (re-validation).
     ///   - Nil/absent → no barrier at all (no new reference).
     ///
-    /// OOM safety: every barrier (fallible grayagain append) is called BEFORE
-    /// the store. If the barrier fails, the store does not happen. See the
-    /// invariant comment at gcTableBarrierBackValue.
+    /// OOM safety (P16.50-review-12 BLOCKER 2): every barrier prepare
+    /// (fallible grayagain reservation) runs BEFORE the store and its
+    /// commit runs AFTER — if the prepare fails, the store does not
+    /// happen. See BackBarrierPlan.
     fn rawSet(self: *Vm, tbl: *Table, key: Value, val: Value) DispatchError!void {
         if (self.stats.enabled) self.stats.tbl_set_generic += 1;
 
@@ -35052,14 +35279,15 @@ pub const Vm = struct {
             else => key,
         };
 
-        // Step 2: Array slot in range → value-barrier(prepare)→store.
+        // Step 2: Array slot in range → value-barrier prepare→store→commit.
         // PUC keyinarray fast path (ltable.c:329-339), used by luaH_set
         // before calling luaH_newkey.
         if (canon_key == .Int) {
             const k = canon_key.Int;
             if (k >= 1 and @as(u64, @intCast(k)) <= tbl.asize) {
-                try self.gcTableBarrierBackValue(tbl, val); // VALUE only, BEFORE store
+                const barrier = try self.gcPrepareTableBarrierBackValue(tbl, val); // VALUE only
                 tbl.array[@intCast(k - 1)] = val;
+                self.gcCommitTableBarrierBack(tbl, barrier);
                 return;
             }
         }
@@ -35075,7 +35303,7 @@ pub const Vm = struct {
             } else {
                 // Existing-slot update: VALUE barrier only (key already owned).
                 // PUC luaV_finishfastset(L, t, val) = luaC_barrierback(L, t, val).
-                try self.gcTableBarrierBackValue(tbl, val); // BEFORE store
+                try self.gcTableBarrierBackValue(tbl, val);
                 // PUC luaV_finishset (lvm.c:347) calls invalidateTMcache
                 // after luaH_finishset. Invalidate when reviving a dead node
                 // (old value was nil → new non-nil value). Non-nil→non-nil
@@ -35098,10 +35326,17 @@ pub const Vm = struct {
         // Step 5: Genuine new key → key+value barriers exactly once → insert/rehash.
         // PUC luaH_newkey → luaC_barrierback(L, obj2gco(t), key) — KEY barrier.
         // PUC luaV_finishset → luaC_barrierback(L, obj2gco(h), val) — VALUE barrier.
-        // Both barrier the same table; the second is idempotent (table already
-        // in grayagain/touched1 after the first).
-        try self.gcTableBarrierBackNewKey(tbl, canon_key); // KEY barrier, BEFORE insert
-        try self.gcTableBarrierBackValue(tbl, val); // VALUE barrier (idempotent), BEFORE insert
+        // Both barrier the same table; both plans are prepared BEFORE the
+        // insert and each commit re-validates, so the second of the pair is
+        // a no-op when the first published (PUC idempotence via the
+        // touched1/gray guard). tableRehash between prepare and commit is
+        // collector-free (see its invariant comment) but MAY run an
+        // emergency full GC via the testc allocation adapter — the commit's
+        // re-validation makes every outcome safe (see BackBarrierPlan); an
+        // OOM from the rehash returns before any commit with nothing
+        // mutated but the reserved spare capacity (harmless).
+        const key_barrier = try self.gcPrepareTableBarrierBackNewKey(tbl, canon_key); // KEY barrier
+        const val_barrier = try self.gcPrepareTableBarrierBackValue(tbl, val); // VALUE barrier (idempotent commit)
 
         // Try insertkey (PUC `insertkey`). If the hash part is empty
         // (PUC "dummy"), insertkey returns null (no free place) — this
@@ -35114,6 +35349,8 @@ pub const Vm = struct {
                 // P15.37c: new key inserted — invalidate metamethod cache.
                 // (PUC ltable.c:1112 calls invalidateTMcache after insertkey.)
                 tbl.flags &= ~TableFlags.MASK;
+                self.gcCommitTableBarrierBack(tbl, key_barrier);
+                self.gcCommitTableBarrierBack(tbl, val_barrier);
                 return;
             }
             // Hash full: fall through to rehash.
@@ -35136,6 +35373,8 @@ pub const Vm = struct {
             if (k >= 1 and @as(u64, @intCast(k)) <= tbl.asize) {
                 tbl.array[@intCast(k - 1)] = val;
                 tbl.flags &= ~TableFlags.MASK;
+                self.gcCommitTableBarrierBack(tbl, key_barrier);
+                self.gcCommitTableBarrierBack(tbl, val_barrier);
                 return;
             }
         }
@@ -35146,6 +35385,8 @@ pub const Vm = struct {
         std.debug.assert(inserted != null);
         if (self.stats.enabled) self.stats.tbl_insert += 1; // post-rehash insert
         tbl.flags &= ~TableFlags.MASK;
+        self.gcCommitTableBarrierBack(tbl, key_barrier);
+        self.gcCommitTableBarrierBack(tbl, val_barrier);
     }
 
     // PUC luaH_next: given a control key (Nil for the start of iteration),
@@ -47324,8 +47565,16 @@ pub const Vm = struct {
                 switch (obj) {
                     .Table => |t| try self.gcStoreMetatable(t, mt),
                     .Userdata => |u| {
-                        u.metatable = mt;
-                        if (mt) |m| try self.gcWriteBarrierUserdata(u, .{ .Table = m });
+                        // Prepare → store → commit (P16.50-review-12
+                        // BLOCKER 2): the metatable store happens only when
+                        // the barrier publication is already reserved.
+                        if (mt) |m| {
+                            const barrier = try self.gcPrepareUserdataBarrierBack(u, .{ .Table = m });
+                            u.metatable = mt;
+                            self.gcCommitUserdataBarrierBack(u, barrier);
+                        } else {
+                            u.metatable = null;
+                        }
                     },
                     else => return self.fail("testC setmetatable expects table/userdata", .{}),
                 }
@@ -52624,7 +52873,8 @@ test "P16.50: pushcclosure/registerfuncs OOM transactionality" {
     // the library table is YOUNG and its three keys are PRE-INSERTED, so
     // every per-entry apiRawSet takes the existing-node update path — for
     // a young table in generational mode the back barrier is a complete
-    // no-op (gcTableBarrierBackSlow returns before any grayagain append),
+    // no-op (gcPrepareTableBarrierBackSlow returns an inactive plan before
+    // any grayagain reservation),
     // making the post-commit publish allocation-free and infallible.
     //
     // Allocation map (capacities primed above; keys pre-interned so the
@@ -56101,7 +56351,16 @@ test "P16.50-review-5 B2: C-ABI throw matrix" {
     // before a later failure (e.g. the results dupe) is COMMITTED residue:
     // the globals entry is removed (nodeDelete + clearKey, the PUC dead-
     // key mechanism) BEFORE the residue teardown frees the key string, so
-    // no hash node ever references a freed key. ----
+    // no hash node ever references a freed key.
+    // P16.50-review-12: the key back barrier is transactional — the
+    // grayagain RESERVE (edge 2, after the stack growth and the fresh-key
+    // intern) precedes every age/color/list mutation, so its failure
+    // leaves the old globals table byte-exact (.old black, no grayagain
+    // membership); the pre-review-12 mutate-then-append ordering instead
+    // left it touched1/gray with NO membership and made the NEXT cell's
+    // barrier a touched1 no-op (first_success 3 encoded that lost
+    // re-traversal). The first post-publication failure is the results
+    // dupe (edge 3) — the committed-residue handling above. ----
     {
         var fail_idx: usize = 0;
         var tested_failures: usize = 0;
@@ -56159,7 +56418,7 @@ test "P16.50-review-5 B2: C-ABI throw matrix" {
                 try snap.assertRestored(vm);
             }
         }
-        try testing.expectEqual(@as(usize, 3), first_success.?);
+        try testing.expectEqual(@as(usize, 4), first_success.?);
         try testing.expect(tested_failures > 0);
         try testing.expect(first_success != null);
     }
@@ -60512,4 +60771,679 @@ fn childrenByAge(
         3 => child_white,
         else => unreachable,
     };
+}
+
+// ===========================================================================
+// P16.50-review-12: transactional secondary-worklist publications —
+// focused proofs 1-7 (gcMarkOld1 reserve, back-barrier grayagain
+// membership, gcStoreMetatable, gcDrainGrayagain, young-sweep promotion
+// loop, sticky recovery).
+// ===========================================================================
+
+/// Negative control (focused proof 2): the pre-review-12 markold order —
+/// mutate age/color FIRST, fallible gc_gray append after — as it lived in
+/// the removed gcMinorCollection inline duplicate. Reproduced here to
+/// prove the ORDERING loses the forced re-traversal on append OOM: the
+/// owner is left .old GRAY with no gc_gray membership, and the next minor
+/// cycle sweeps its young children.
+fn p50r12OldMarkOld1(vm: *Vm) std.mem.Allocator.Error!void {
+    const snapshot = @min(vm.gc_old1_snapshot_len, vm.gc_old1.items.len);
+    for (vm.gc_old1.items[0..snapshot]) |obj| {
+        const p = gcPtr(obj);
+        if (p.age.* != .old1) continue;
+        p.age.* = .old;
+        if (gcIsBlack(p.marked.*)) {
+            if (obj == .cell) {
+                vm.markCellForceAssume(obj.cell);
+            } else {
+                gcSetGray(p.marked);
+                try vm.gc_gray.append(vm.infraAlloc(), obj);
+            }
+        }
+    }
+}
+
+/// test-5 helper: the hand-arranged grayagain population is intact after a
+/// failed gcDrainGrayagain — same three entries in the same order, same
+/// ages/colors, gc_gray untouched.
+fn p50r12GrayagainIntact(vm: *Vm, t1: *Table, t2: *Table, th: *Thread) !void {
+    const testing = std.testing;
+    try testing.expectEqual(@as(usize, 3), vm.gc_grayagain.items.len);
+    try testing.expect(std.meta.eql(vm.gc_grayagain.items[0], .{ .table = t1 }));
+    try testing.expect(std.meta.eql(vm.gc_grayagain.items[1], .{ .table = t2 }));
+    try testing.expect(std.meta.eql(vm.gc_grayagain.items[2], .{ .thread = th }));
+    try testing.expect(t1.gc_age == .touched1 and gcIsBlack(t1.gc_marked));
+    try testing.expect(t2.gc_age == .touched2 and gcIsBlack(t2.gc_marked));
+    try testing.expect(th.gc_age == .old and gcIsBlack(th.gc_marked));
+    try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
+}
+
+test "P16.50-review-12 1: gcMarkOld1 reserve OOM is byte-exact; success re-traversal keeps the young child" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    try vm.gcEnterGenerational();
+
+    // Owner: young at entry, rooted through two minor cycles —
+    // NEW→SURVIVAL (cycle 1), SURVIVAL→OLD1 + gc_old1 + grayagain (cycle
+    // 2), then dropped from grayagain by gcCorrectGrayAgain (black
+    // non-thread OLD1: gcMarkOld1 owns its per-cycle re-traversal).
+    const owner = try vm.allocTableNoGc();
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.ensure(1);
+    roots.addAssumeCapacity(.{ .Table = owner });
+    try vm.gcMinorCollection();
+    try vm.gcMinorCollection();
+    try testing.expect(owner.gc_age == .old1);
+    try testing.expect(gcIsBlack(owner.gc_marked));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = owner }));
+    try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_grayagain.items, .{ .table = owner }));
+    roots.end();
+
+    // A young child written into the owner's array part WITHOUT a barrier
+    // (the pre-review-12 world): only gcMarkOld1's forced re-traversal of
+    // the OLD1 owner can mark it in the coming cycle.
+    const child = try vm.allocTableNoGc();
+    try vm.tableResizeArray(owner, 1);
+    owner.array[0] = .{ .Table = child };
+
+    vm.gc_old1_snapshot_len = vm.gc_old1.items.len;
+    vm.gc_gray.deinit(testing.allocator);
+    vm.gc_gray = .empty;
+    const marked_kb = vm.gc_gen_marked_kb;
+    const added_old_kb = vm.gc_gen_added_old_kb;
+    const mark_epoch = vm.gc_mark_epoch;
+    const gen_threads_len = vm.gc_gen_threads.items.len;
+
+    // Reserve OOM (gc_gray growth is gcMarkOld1's only fallible step): the
+    // mutate loop is never reached — age, color, gc_gray, gc_grayagain,
+    // gc_old1, accounting and the children all stay byte-exact.
+    {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        vm.alloc = failing.allocator();
+        const result = vm.gcMarkOld1();
+        vm.alloc = testing.allocator;
+        try testing.expectError(error.OutOfMemory, result);
+    }
+    try testing.expect(owner.gc_age == .old1);
+    try testing.expect(gcIsBlack(owner.gc_marked));
+    try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
+    try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_grayagain.items, .{ .table = owner }));
+    try testing.expectEqual(@as(usize, 1), vm.gc_old1.items.len);
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = owner }));
+    try testing.expect(child.gc_age == .new);
+    try testing.expect(gcIsWhite(child.gc_marked));
+    try testing.expect(p50IsRegistered(&vm, .{ .table = child }));
+    try testing.expect(p50InYoung(&vm, .{ .table = child }));
+    try testing.expectEqual(gen_threads_len, vm.gc_gen_threads.items.len);
+    try testing.expectEqual(marked_kb, vm.gc_gen_marked_kb);
+    try testing.expectEqual(added_old_kb, vm.gc_gen_added_old_kb);
+    try testing.expectEqual(mark_epoch, vm.gc_mark_epoch);
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+
+    // Success: OLD1→OLD + forced gray + exactly one gc_gray entry.
+    try vm.gcMarkOld1();
+    try testing.expect(owner.gc_age == .old);
+    try testing.expect(gcIsGray(owner.gc_marked));
+    try testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = owner }));
+
+    // Real minor cycle: the forced re-traversal drains the owner and marks
+    // the child through owner.array[0] — it survives as SURVIVAL, still
+    // owned by the slot; the owner settles as OLD black.
+    try vm.gcMinorCollection();
+    try testing.expect(child.gc_age == .survival);
+    try testing.expect(p50IsRegistered(&vm, .{ .table = child }));
+    try testing.expect(std.meta.eql(owner.array[0], .{ .Table = child }));
+    try testing.expect(owner.gc_age == .old);
+    try testing.expect(gcIsBlack(owner.gc_marked));
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+}
+
+test "P16.50-review-12 2: negative-before — the old markold order loses the re-traversal on append OOM" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    try vm.gcEnterGenerational();
+    const owner = try vm.allocTableNoGc();
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.ensure(1);
+    roots.addAssumeCapacity(.{ .Table = owner });
+    try vm.gcMinorCollection();
+    try vm.gcMinorCollection();
+    roots.end();
+
+    const child = try vm.allocTableNoGc();
+    try vm.tableResizeArray(owner, 1);
+    owner.array[0] = .{ .Table = child };
+
+    vm.gc_old1_snapshot_len = vm.gc_old1.items.len;
+    vm.gc_gray.deinit(testing.allocator);
+    vm.gc_gray = .empty;
+
+    // The OLD order: age/color mutate first, fallible append after — the
+    // append OOM leaves the owner .old GRAY with NO gc_gray membership
+    // (the exact state the transactional gcMarkOld1 makes unreachable).
+    {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        vm.alloc = failing.allocator();
+        const result = p50r12OldMarkOld1(&vm);
+        vm.alloc = testing.allocator;
+        try testing.expectError(error.OutOfMemory, result);
+    }
+    try testing.expect(owner.gc_age == .old);
+    try testing.expect(gcIsGray(owner.gc_marked));
+    try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
+    try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_gray.items, .{ .table = owner }));
+    try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_grayagain.items, .{ .table = owner }));
+
+    // The next real minor cycle catches the loss: nothing re-traverses the
+    // owner (not in gc_gray, not in grayagain, not a root), so the child
+    // reachable ONLY through owner.array[0] is never marked — swept.
+    try vm.gcMinorCollection();
+    var child_registered = false;
+    for (vm.gc_objects.items) |o| {
+        if (std.meta.eql(o, .{ .table = child })) child_registered = true;
+    }
+    try testing.expect(!child_registered);
+    try testing.expect(p50IsRegistered(&vm, .{ .table = owner }));
+    // Teardown hygiene: the slot references the freed child (the UAF the
+    // transactional markold prevents); drop it before deinit.
+    owner.array[0] = .Nil;
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+}
+
+test "P16.50-review-12 3: back-barrier reserve OOM precedes the observable store; success publishes exactly one touched1" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    const owner = try vm.allocTableNoGc();
+    const ud = try vm.allocUserdata(16, 2);
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.ensure(2);
+    roots.addAssumeCapacity(.{ .Table = owner });
+    roots.addAssumeCapacity(.{ .Userdata = ud });
+    try vm.gcEnterGenerational();
+    try testing.expect(owner.gc_age == .old and gcIsBlack(owner.gc_marked));
+    try testing.expect(ud.gc_age == .old and gcIsBlack(ud.gc_marked));
+
+    // ── Table arm: existing-key overwrite through rawSet (step 3:
+    // prepare→store→commit over the hash node). ──
+    // Pre-insert under a healthy allocator (the new-key path's rehash
+    // allocates); the Int value is non-collectable — no barrier.
+    try vm.rawSet(owner, .{ .Int = 100 }, .{ .Int = 1 });
+    const val_tab = try vm.allocTableNoGc();
+    // Force the grayagain reserve to actually allocate (cap == len == 0).
+    vm.gc_grayagain.deinit(testing.allocator);
+    vm.gc_grayagain = .empty;
+
+    {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        vm.alloc = failing.allocator();
+        const result = vm.rawSet(owner, .{ .Int = 100 }, .{ .Table = val_tab });
+        vm.alloc = testing.allocator;
+        try testing.expectError(error.OutOfMemory, result);
+    }
+    // Byte-exact: the store never happened — the slot still holds the old
+    // Int value; owner/val_tab age/color untouched; no partial publication.
+    const node = ltable.nodeLookup(owner.hash, .{ .Int = 100 }).?;
+    try testing.expect(std.meta.eql(node.value, .{ .Int = 1 }));
+    try testing.expect(owner.gc_age == .old and gcIsBlack(owner.gc_marked));
+    try testing.expect(val_tab.gc_age == .new and gcIsWhite(val_tab.gc_marked));
+    try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
+
+    // Success: exactly one touched1 + one grayagain membership, and the
+    // store is visible.
+    try vm.rawSet(owner, .{ .Int = 100 }, .{ .Table = val_tab });
+    try testing.expect(owner.gc_age == .touched1 and gcIsGray(owner.gc_marked));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .table = owner }));
+    try testing.expect(std.meta.eql(ltable.nodeLookup(owner.hash, .{ .Int = 100 }).?.value, .{ .Table = val_tab }));
+
+    // Real minor cycle: the grayagain drain re-traverses the owner, marks
+    // the stored value (SURVIVAL), advances the owner to TOUCHED2.
+    try vm.gcMinorCollection();
+    try testing.expect(val_tab.gc_age == .survival);
+    try testing.expect(p50IsRegistered(&vm, .{ .table = val_tab }));
+    try testing.expect(owner.gc_age == .touched2);
+
+    // ── Userdata arm: prepare→store→commit over uservalues[0]. ──
+    const val_ud = try vm.allocTableNoGc();
+    // grayagain holds [owner (TOUCHED2)] — force cap == len so the
+    // prepare's reserve must allocate (and fail).
+    vm.gc_grayagain.deinit(testing.allocator);
+    vm.gc_grayagain = .empty;
+    try vm.gc_grayagain.ensureTotalCapacityPrecise(testing.allocator, 1);
+    vm.gc_grayagain.appendAssumeCapacity(.{ .table = owner });
+
+    {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        vm.alloc = failing.allocator();
+        const plan = vm.gcPrepareUserdataBarrierBack(ud, .{ .Table = val_ud });
+        vm.alloc = testing.allocator;
+        try testing.expectError(error.OutOfMemory, plan);
+    }
+    try testing.expect(std.meta.eql(ud.uservalues[0], .Nil));
+    try testing.expect(ud.gc_age == .old and gcIsBlack(ud.gc_marked));
+    try testing.expect(val_ud.gc_age == .new and gcIsWhite(val_ud.gc_marked));
+
+    // Success: prepare reserves, the caller stores, the commit publishes
+    // exactly one touched1 + grayagain membership.
+    const plan = try vm.gcPrepareUserdataBarrierBack(ud, .{ .Table = val_ud });
+    ud.uservalues[0] = .{ .Table = val_ud };
+    vm.gcCommitUserdataBarrierBack(ud, plan);
+    try testing.expect(ud.gc_age == .touched1 and gcIsGray(ud.gc_marked));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .userdata = ud }));
+
+    // Real minor cycle: the drain traverses the userdata, marks the stored
+    // uservalue (SURVIVAL), advances the userdata to TOUCHED2.
+    try vm.gcMinorCollection();
+    try testing.expect(val_ud.gc_age == .survival);
+    try testing.expect(p50IsRegistered(&vm, .{ .table = val_ud }));
+    try testing.expect(ud.gc_age == .touched2);
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+}
+
+test "P16.50-review-12 4: gcStoreMetatable fail indices publish nothing; success is PUC-identical" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    const owner = try vm.allocTableNoGc();
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.ensure(1);
+    roots.addAssumeCapacity(.{ .Table = owner });
+    try vm.gcEnterGenerational();
+
+    // Gen arm: fwd (black owner, white metatable) needs gc_gray + gc_old1
+    // + gc_grayagain — three reserves in order before the single pointer
+    // store. Each edge pre-satisfies the earlier reserves so the failing
+    // one is exactly the edge's index; fail_index = 0 rejects every
+    // allocation, so the first reserve that must grow is the abort point.
+    for (0..3) |edge| {
+        vm.gc_gray.deinit(testing.allocator);
+        vm.gc_gray = .empty;
+        vm.gc_old1.deinit(testing.allocator);
+        vm.gc_old1 = .empty;
+        vm.gc_grayagain.deinit(testing.allocator);
+        vm.gc_grayagain = .empty;
+        if (edge >= 1) try vm.gc_gray.ensureUnusedCapacity(testing.allocator, 1);
+        if (edge >= 2) try vm.gc_old1.ensureUnusedCapacity(testing.allocator, 1);
+        const mt = try vm.allocTableNoGc();
+        const added_old_kb = vm.gc_gen_added_old_kb;
+
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        vm.alloc = failing.allocator();
+        const result = vm.gcStoreMetatable(owner, mt);
+        vm.alloc = testing.allocator;
+        try testing.expectError(error.OutOfMemory, result);
+
+        // No partial publication: the store never happened, no age/color/
+        // list/flag/accounting change on either side.
+        try testing.expect(owner.metatable == null);
+        try testing.expect(owner.gc_age == .old and gcIsBlack(owner.gc_marked));
+        try testing.expect(mt.gc_age == .new and gcIsWhite(mt.gc_marked));
+        try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
+        try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
+        try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
+        try testing.expect(!vm.gc_old1_overflow and !vm.gc_gray_overflow);
+        try testing.expectEqual(added_old_kb, vm.gc_gen_added_old_kb);
+        try testing.expect(p50IsRegistered(&vm, .{ .table = mt }));
+    }
+
+    // Success: forward-barrier publication (metatable gray + gc_gray +
+    // OLD0 + gc_old1) plus the owner's own touched1 + grayagain membership.
+    const mt = try vm.allocTableNoGc();
+    const added_old_kb = vm.gc_gen_added_old_kb;
+    try vm.gcStoreMetatable(owner, mt);
+    try testing.expect(owner.metatable == mt);
+    try testing.expect(mt.gc_age == .old0 and gcIsGray(mt.gc_marked));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = mt }));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = mt }));
+    try testing.expect(owner.gc_age == .touched1 and gcIsGray(owner.gc_marked));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .table = owner }));
+
+    // Real minor cycle: the metatable is drained black and promoted
+    // OLD0→OLD1 exactly once (no duplicate gc_old1 entry — the store
+    // already linked it), the owner advances to TOUCHED2, and the
+    // accounting charges the promotion exactly once.
+    try vm.gcMinorCollection();
+    try testing.expect(mt.gc_age == .old1 and gcIsBlack(mt.gc_marked));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = mt }));
+    try testing.expect(owner.gc_age == .touched2);
+    const expect_delta = @as(f64, @floatFromInt(gcObjectBytes(.{ .table = mt }))) / 1024.0;
+    try testing.expectApproxEqAbs(expect_delta, vm.gc_gen_added_old_kb - added_old_kb, 1e-9);
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+
+    // Incremental arm (fresh VM, propagate state): the single gc_gray
+    // reserve precedes the store; a failure leaves both sides untouched.
+    var vm2: Vm = .init(testing.allocator, false);
+    defer vm2.deinit();
+    const owner2 = try vm2.allocTableNoGc();
+    gcSetBlack(&owner2.gc_marked);
+    const mt2 = try vm2.allocTableNoGc();
+    vm2.gc_state = .propagate;
+    vm2.gc_gray.deinit(testing.allocator);
+    vm2.gc_gray = .empty;
+    {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        vm2.alloc = failing.allocator();
+        const result = vm2.gcStoreMetatable(owner2, mt2);
+        vm2.alloc = testing.allocator;
+        try testing.expectError(error.OutOfMemory, result);
+    }
+    try testing.expect(owner2.metatable == null);
+    try testing.expect(gcIsBlack(owner2.gc_marked) and gcIsWhite(mt2.gc_marked));
+    try vm2.gcStoreMetatable(owner2, mt2);
+    try testing.expect(owner2.metatable == mt2);
+    try testing.expect(gcIsGray(mt2.gc_marked));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm2.gc_gray.items, .{ .table = mt2 }));
+    vm2.gc_state = .pause;
+}
+
+test "P16.50-review-12 5: gcDrainGrayagain reserve OOM keeps the source membership; success completes the touched lifecycle" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    // A hand-made coroutine-shaped thread (review-9 pattern): pre-entry,
+    // so gcEnterGenerational makes it OLD black with a gc_gen_threads
+    // membership.
+    const th = try vm.alloc.create(Thread);
+    th.* = .{ .status = .suspended, .callee = .Nil };
+    try vm.gcPrepareRegister(1);
+    vm.gcRegisterCommit(.{ .thread = th });
+    vm.gcNoteAlloc(@sizeOf(Thread));
+    th.bytecode_stack = try vm.alloc.alloc(Value, 2);
+    @memset(th.bytecode_stack, .Nil);
+    th.bytecode_boxed = try vm.alloc.alloc(?*Cell, 2);
+    @memset(th.bytecode_boxed, null);
+
+    const t1 = try vm.allocTableNoGc();
+    const t2 = try vm.allocTableNoGc();
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.ensure(3);
+    roots.addAssumeCapacity(.{ .Table = t1 });
+    roots.addAssumeCapacity(.{ .Table = t2 });
+    roots.addAssumeCapacity(.{ .Thread = th });
+    try vm.gcEnterGenerational();
+    roots.end();
+
+    // Hand-arranged grayagain population (the state backward barriers
+    // publish): a TOUCHED1 table, a TOUCHED2 table, and an OLD thread.
+    t1.gc_age = .touched1;
+    t2.gc_age = .touched2;
+    try vm.gc_grayagain.appendSlice(testing.allocator, &.{
+        .{ .table = t1 }, .{ .table = t2 }, .{ .thread = th },
+    });
+
+    // Edge 1 — the save dupe itself fails: the source list is untouched.
+    {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        vm.alloc = failing.allocator();
+        const result = vm.gcDrainGrayagain();
+        vm.alloc = testing.allocator;
+        try testing.expectError(error.OutOfMemory, result);
+    }
+    try p50r12GrayagainIntact(&vm, t1, t2, th);
+
+    // Edge 2 — grayagain at cap == len: the dupe succeeds (allocation 1),
+    // the re-link reserve must grow and fails (allocation 2) — still
+    // before the clear, membership intact.
+    vm.gc_grayagain.deinit(testing.allocator);
+    vm.gc_grayagain = .empty;
+    try vm.gc_grayagain.ensureTotalCapacityPrecise(testing.allocator, 3);
+    vm.gc_grayagain.appendSliceAssumeCapacity(&.{
+        .{ .table = t1 }, .{ .table = t2 }, .{ .thread = th },
+    });
+    {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 1,
+            .resize_fail_index = 1,
+        });
+        vm.alloc = failing.allocator();
+        const result = vm.gcDrainGrayagain();
+        vm.alloc = testing.allocator;
+        try testing.expectError(error.OutOfMemory, result);
+    }
+    try p50r12GrayagainIntact(&vm, t1, t2, th);
+
+    // Edge 3 — grayagain spare, gc_gray empty: the gc_gray reserve fails
+    // (allocation 2) before the clear, membership intact.
+    vm.gc_grayagain.deinit(testing.allocator);
+    vm.gc_grayagain = .empty;
+    try vm.gc_grayagain.ensureTotalCapacity(testing.allocator, 6);
+    vm.gc_grayagain.appendSliceAssumeCapacity(&.{
+        .{ .table = t1 }, .{ .table = t2 }, .{ .thread = th },
+    });
+    vm.gc_gray.deinit(testing.allocator);
+    vm.gc_gray = .empty;
+    {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 1,
+            .resize_fail_index = 1,
+        });
+        vm.alloc = failing.allocator();
+        const result = vm.gcDrainGrayagain();
+        vm.alloc = testing.allocator;
+        try testing.expectError(error.OutOfMemory, result);
+    }
+    try p50r12GrayagainIntact(&vm, t1, t2, th);
+
+    // Success: TOUCHED1 relinked (age unchanged — correctgraylist advances
+    // it), TOUCHED2 advanced to OLD and dropped, the thread kept; gc_gray
+    // fully drained after every per-entry drain.
+    try vm.gcDrainGrayagain();
+    try testing.expect(t1.gc_age == .touched1 and gcIsBlack(t1.gc_marked));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .table = t1 }));
+    try testing.expect(t2.gc_age == .old and gcIsBlack(t2.gc_marked));
+    try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_grayagain.items, .{ .table = t2 }));
+    try testing.expect(th.gc_age == .old and gcIsBlack(th.gc_marked));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .thread = th }));
+    try testing.expectEqual(@as(usize, 2), vm.gc_grayagain.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
+
+    // correctgraylist advances TOUCHED1→TOUCHED2 (kept); the second drain
+    // completes the lifecycle: TOUCHED2→OLD, dropped — no duplicates, the
+    // thread still kept.
+    vm.gcCorrectGrayAgain();
+    try testing.expect(t1.gc_age == .touched2);
+    try vm.gcDrainGrayagain();
+    try testing.expect(t1.gc_age == .old);
+    try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_grayagain.items, .{ .table = t1 }));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .thread = th }));
+    try testing.expectEqual(@as(usize, 1), vm.gc_grayagain.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+}
+
+test "P16.50-review-12 6: young sweep completes under a rejecting allocator once the bulk reserve succeeded" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    try vm.gcEnterGenerational();
+
+    // Young population (gcRegisterCommit appends to the young list in
+    // gen-minor mode): two SURVIVAL BLACK survivors (one a thread), one
+    // NEW BLACK survivor, one NEW WHITE dead object.
+    const th = try vm.alloc.create(Thread);
+    th.* = .{ .status = .suspended, .callee = .Nil };
+    try vm.gcPrepareRegister(1);
+    vm.gcRegisterCommit(.{ .thread = th });
+    vm.gcNoteAlloc(@sizeOf(Thread));
+    th.bytecode_stack = try vm.alloc.alloc(Value, 2);
+    @memset(th.bytecode_stack, .Nil);
+    th.bytecode_boxed = try vm.alloc.alloc(?*Cell, 2);
+    @memset(th.bytecode_boxed, null);
+
+    const t_surv = try vm.allocTableNoGc();
+    const t_new_surv = try vm.allocTableNoGc();
+    const t_dead = try vm.allocTableNoGc();
+    try testing.expectEqual(@as(usize, 4), vm.gc_young_objects.items.len);
+
+    // Post-atomic sweep-entry state: survivors BLACK (marked this cycle),
+    // the dead object left at the pre-flip white; the flip makes that
+    // white the OTHER white (dead).
+    gcSetBlack(&t_surv.gc_marked);
+    t_surv.gc_age = .survival;
+    gcSetBlack(&th.gc_marked);
+    th.gc_age = .survival;
+    gcSetBlack(&t_new_surv.gc_marked);
+    vm.gc_current_white ^= WHITEBITS;
+    try testing.expect(gcIsDead(t_dead.gc_marked, vm.gc_current_white));
+
+    vm.gc_young_objects_snapshot_len = vm.gc_young_objects.items.len;
+    const added_old_kb = vm.gc_gen_added_old_kb;
+
+    // The healthy equivalent of the bulk reserve (spare capacity for every
+    // promote-time append), then EVERY allocation rejected: the promotion
+    // loop must complete on appendAssumeCapacity alone.
+    try vm.gc_old1.ensureUnusedCapacity(testing.allocator, 4);
+    try vm.gc_grayagain.ensureUnusedCapacity(testing.allocator, 4);
+    try vm.gc_gen_threads.ensureUnusedCapacity(testing.allocator, 4);
+    {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        vm.alloc = failing.allocator();
+        try vm.gcSweepYoungObjects();
+        vm.alloc = testing.allocator;
+    }
+
+    // t_dead: freed and unregistered (pointer scan — no deref).
+    var dead_registered = false;
+    for (vm.gc_objects.items) |o| {
+        if (std.meta.eql(o, .{ .table = t_dead })) dead_registered = true;
+    }
+    try testing.expect(!dead_registered);
+    // Exact promotions: t_surv and th → OLD1, each listed exactly once in
+    // gc_old1 and grayagain; th gains exactly one gc_gen_threads entry;
+    // t_new_surv stays young as SURVIVAL with the current white.
+    try testing.expect(t_surv.gc_age == .old1 and gcIsBlack(t_surv.gc_marked));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = t_surv }));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .table = t_surv }));
+    try testing.expect(th.gc_age == .old1 and gcIsBlack(th.gc_marked));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .thread = th }));
+    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .thread = th }));
+    var th_roots: usize = 0;
+    for (vm.gc_gen_threads.items) |t| {
+        if (t == th) th_roots += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), th_roots);
+    try testing.expect(t_new_surv.gc_age == .survival and gcIsWhite(t_new_surv.gc_marked));
+    try testing.expectEqual(@as(usize, 1), vm.gc_young_objects.items.len);
+    try testing.expect(std.meta.eql(vm.gc_young_objects.items[0], .{ .table = t_new_surv }));
+    // Accounting: exactly the two OLD1 promotions, charged exactly once.
+    const expect_delta = (@as(f64, @floatFromInt(gcObjectBytes(.{ .table = t_surv }))) +
+        @as(f64, @floatFromInt(gcObjectBytes(.{ .thread = th })))) / 1024.0;
+    try testing.expectApproxEqAbs(expect_delta, vm.gc_gen_added_old_kb - added_old_kb, 1e-9);
+    try testing.expect(p50IsRegistered(&vm, .{ .table = t_surv }));
+    try testing.expect(p50IsRegistered(&vm, .{ .thread = th }));
+    try testing.expect(p50IsRegistered(&vm, .{ .table = t_new_surv }));
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
+}
+
+test "P16.50-review-12 7: sticky fail-everything minor cycle recovers; invariants hold after real minor and major cycles" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    const owner = try vm.allocTableNoGc();
+    var roots = vm.gcTempRoots();
+    defer roots.end();
+    try roots.ensure(1);
+    roots.addAssumeCapacity(.{ .Table = owner });
+    try vm.gcEnterGenerational();
+
+    // Young values published through the owner (new-key rawSet barriers —
+    // the owner goes TOUCHED1 with grayagain membership), plus unreachable
+    // young garbage.
+    const v1 = try vm.allocTableNoGc();
+    const v2 = try vm.allocTableNoGc();
+    try vm.rawSet(owner, .{ .Int = 100 }, .{ .Table = v1 });
+    try vm.rawSet(owner, .{ .Int = 200 }, .{ .Table = v2 });
+    try testing.expect(owner.gc_age == .touched1);
+    const g1 = try vm.allocTableNoGc();
+    const g2 = try vm.allocTableNoGc();
+    const g3 = try vm.allocTableNoGc();
+
+    // Sticky failure: EVERY allocation rejected — the cycle aborts at its
+    // first fallible step (a prepare-only reserve or the grayagain save),
+    // wherever that is, with every publication either unstarted or intact.
+    {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = 0,
+            .resize_fail_index = 0,
+        });
+        vm.alloc = failing.allocator();
+        const result = vm.gcMinorCollection();
+        vm.alloc = testing.allocator;
+        try testing.expectError(error.OutOfMemory, result);
+    }
+
+    // Recovery: two healthy minor cycles — the first sweeps the garbage
+    // and marks the values through the owner's surviving grayagain
+    // re-traversal; the second completes the owner's TOUCHED1→TOUCHED2→OLD
+    // lifecycle and promotes the values to OLD1.
+    try vm.gcMinorCollection();
+    try vm.gcMinorCollection();
+    var garbage_left = false;
+    for (vm.gc_objects.items) |o| {
+        if (std.meta.eql(o, .{ .table = g1 }) or
+            std.meta.eql(o, .{ .table = g2 }) or
+            std.meta.eql(o, .{ .table = g3 })) garbage_left = true;
+    }
+    try testing.expect(!garbage_left);
+    try testing.expect(p50IsRegistered(&vm, .{ .table = owner }));
+    try testing.expect(p50IsRegistered(&vm, .{ .table = v1 }));
+    try testing.expect(p50IsRegistered(&vm, .{ .table = v2 }));
+    try testing.expect(owner.gc_age == .old);
+    try testing.expect(v1.gc_age == .old1 and v2.gc_age == .old1);
+
+    // A real major cycle (full collection) in generational mode: everyone
+    // reachable survives as OLD black, the worklists settle empty, and no
+    // registry object carries a missed-gray marker.
+    try vm.gcFullCollectionForUser();
+    try testing.expect(p50IsRegistered(&vm, .{ .table = owner }));
+    try testing.expect(p50IsRegistered(&vm, .{ .table = v1 }));
+    try testing.expect(p50IsRegistered(&vm, .{ .table = v2 }));
+    try testing.expect(owner.gc_age == .old and v1.gc_age == .old and v2.gc_age == .old);
+    try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
+    try testing.expect(!vm.gc_gray_overflow and !vm.gc_old1_overflow);
+    for (vm.gc_objects.items) |obj| {
+        try testing.expect((gcPtr(obj).marked.* & MISSEDGRAYBIT) == 0);
+    }
+    try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
 }

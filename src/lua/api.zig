@@ -873,12 +873,19 @@ pub const State = struct {
                 }
             },
             .Userdata => |ud| {
-                ud.metatable = mt;
                 if (mt) |m| {
-                    self.vm.gcWriteBarrierUserdata(ud, .{ .Table = m }) catch {};
+                    // Prepare → store → commit (P16.50-review-12 BLOCKER 2):
+                    // on a reserve failure the metatable store is skipped
+                    // entirely (byte-exact pre-store state) — the old shape
+                    // stored first and swallowed the barrier OOM.
+                    const barrier = self.vm.gcPrepareUserdataBarrierBack(ud, .{ .Table = m }) catch return;
+                    ud.metatable = mt;
+                    self.vm.gcCommitUserdataBarrierBack(ud, barrier);
                     if (self.vm.getTmByObj(.{ .Table = m }, .gc) != null) {
                         self.vm.registerFinalizable(.{ .userdata = ud }) catch {};
                     }
+                } else {
+                    ud.metatable = null;
                 }
             },
             else => {},

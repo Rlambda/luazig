@@ -4623,18 +4623,23 @@ pub const Vm = struct {
     /// builtins across subsequent allocations that may trigger GC.
     /// `openRootScope` reserves capacity here up front; `close`
     /// truncates back to the open-time mark. GC mark phase traverses
-    /// this list in gcMarkMutableRoots. Non-moving GC → no indirection
-    /// needed (unlike V8's HandleScope), just root registration.
-    gc_root_values: std.ArrayListUnmanaged(Value) = .empty,
+    /// this list in gcMarkMutableRoots (marking `slot.value`, never the
+    /// slot struct itself). Non-moving GC → no indirection needed
+    /// (unlike V8's HandleScope), just root registration. Each slot
+    /// carries the owning scope's token so a handle copied out of a
+    /// dead scope can never validate against a reused index
+    /// (ValueRoot.isValid).
+    gc_root_values: std.ArrayListUnmanaged(ValueRootSlot) = .empty,
 
     /// Native GC roots for CELLS (upvalue boxes). Cells are not Values
     /// (PUC UpVal is its own object type), so they get a parallel list
-    /// with the same scope discipline. PUC anchors open upvalues on the
+    /// with the same scope discipline and the same per-slot owner-token
+    /// identity (CellRoot.isValid). PUC anchors open upvalues on the
     /// thread stack (they are reachable through the frame's stack
     /// slots); during closure construction our cells live only in Zig
     /// locals, so they are explicitly rooted here until the closure
     /// owns them.
-    gc_root_cells: std.ArrayListUnmanaged(*Cell) = .empty,
+    gc_root_cells: std.ArrayListUnmanaged(CellRootSlot) = .empty,
 
     /// RootScope LIFO bookkeeping: open-scope depth (0 = no open scope),
     /// monotonic token generator (every opened scope gets a fresh token,
@@ -8832,6 +8837,24 @@ pub const Vm = struct {
         }
     };
 
+    /// One rooted-value slot: the payload PLUS the identity of the scope
+    /// that owns it. The token is what makes a copied handle honest: after
+    /// `close`/`restoreRoots` truncates the slot away, a later scope may
+    /// REUSE the same index — the new publish writes a FRESH token there,
+    /// so a stale handle (carrying the old token) fails `isValid` and can
+    /// never silently read or overwrite the foreign payload.
+    pub const ValueRootSlot = struct {
+        value: Value,
+        owner_token: u64,
+    };
+
+    /// One rooted-cell slot (cells are not Values — parallel vector, same
+    /// payload+token identity contract as ValueRootSlot).
+    pub const CellRootSlot = struct {
+        cell: *Cell,
+        owner_token: u64,
+    };
+
     /// Handle to one rooted value slot: an INDEX into the VM's root
     /// vector plus the owning scope's token — never a pointer into the
     /// vector, because a nested scope's reserve may reallocate the
@@ -8844,15 +8867,54 @@ pub const Vm = struct {
         scope_token: u64,
         index: usize,
 
+        /// Identity discriminator: true iff this handle's index is in
+        /// range AND the slot at that index still belongs to the scope
+        /// that issued the handle (same token). False after the owning
+        /// scope's close/restoreRoots truncation, and after a later
+        /// scope reuses the index with a fresh token. Safe to call on
+        /// any copied/stale handle — the pub test discriminator for
+        /// read/replace misuse (the Debug assert below checks the SAME
+        /// predicate, so a false isValid is exactly what read/replace
+        /// would catch).
+        pub fn isValid(self: ValueRoot) bool {
+            return self.index < self.vm.gc_root_values.items.len and
+                self.vm.gc_root_values.items[self.index].owner_token == self.scope_token;
+        }
+
         pub fn read(self: ValueRoot) Value {
-            return self.vm.gc_root_values.items[self.index];
+            const valid = self.isValid();
+            // Misuse (stale/foreign handle) is a caller bug: Debug
+            // catches it deterministically at the exact failing access.
+            // The assert is comptime-gated OUT of ReleaseFast (NOT
+            // merely unchecked — `std.debug.assert` lowers to
+            // `unreachable` there, and a provably-false assert would
+            // let the optimizer delete the defensive branch below as
+            // dead code, the S2-verified pattern).
+            if (@import("builtin").mode != .ReleaseFast) {
+                std.debug.assert(valid); // stale/foreign ValueRoot
+            }
+            // Defensive ReleaseFast path: a stale handle must not read
+            // a foreign payload (and never indexes out of bounds) —
+            // degrade to nil instead of UB.
+            if (!valid) return .Nil;
+            return self.vm.gc_root_values.items[self.index].value;
         }
 
         /// Update exactly this rooted slot (e.g. an error-handler
         /// message rebased on each retry — only the current object needs
         /// to stay reachable, one slot suffices).
         pub fn replace(self: ValueRoot, v: Value) void {
-            self.vm.gc_root_values.items[self.index] = v;
+            const valid = self.isValid();
+            if (@import("builtin").mode != .ReleaseFast) {
+                std.debug.assert(valid); // stale/foreign ValueRoot
+            }
+            // Defensive ReleaseFast path: a stale handle must not
+            // overwrite a foreign scope's payload at a reused index.
+            if (!valid) return;
+            self.vm.gc_root_values.items[self.index] = .{
+                .value = v,
+                .owner_token = self.scope_token,
+            };
         }
     };
 
@@ -8863,12 +8925,39 @@ pub const Vm = struct {
         scope_token: u64,
         index: usize,
 
-        pub fn read(self: CellRoot) *Cell {
-            return self.vm.gc_root_cells.items[self.index];
+        /// Identity discriminator — same contract as ValueRoot.isValid.
+        pub fn isValid(self: CellRoot) bool {
+            return self.index < self.vm.gc_root_cells.items.len and
+                self.vm.gc_root_cells.items[self.index].owner_token == self.scope_token;
         }
 
+        pub fn read(self: CellRoot) *Cell {
+            const valid = self.isValid();
+            if (@import("builtin").mode != .ReleaseFast) {
+                std.debug.assert(valid); // stale/foreign CellRoot
+            }
+            // Unlike ValueRoot.read (nil default), a cell pointer has NO
+            // safe payload default: returning the foreign slot's cell
+            // would be exactly the silent foreign read the token check
+            // exists to prevent. Misuse is a caller bug — Debug catches
+            // it at the assert; ReleaseFast degrades to a deterministic
+            // panic (never UB, never a foreign payload).
+            if (!valid) @panic("CellRoot.read on stale/foreign handle");
+            return self.vm.gc_root_cells.items[self.index].cell;
+        }
+
+        /// Update exactly this rooted slot — same validated-access
+        /// contract as ValueRoot.replace.
         pub fn replace(self: CellRoot, cell: *Cell) void {
-            self.vm.gc_root_cells.items[self.index] = cell;
+            const valid = self.isValid();
+            if (@import("builtin").mode != .ReleaseFast) {
+                std.debug.assert(valid); // stale/foreign CellRoot
+            }
+            if (!valid) return;
+            self.vm.gc_root_cells.items[self.index] = .{
+                .cell = cell,
+                .owner_token = self.scope_token,
+            };
         }
     };
 
@@ -8902,19 +8991,28 @@ pub const Vm = struct {
         active: bool = true,
 
         /// Infallible value root; requires the capacity reserved by
-        /// `openRootScope`. The value is marked by gcMarkMutableRoots, so
-        /// an emergency full GC at any LATER allocation cannot sweep it.
+        /// `openRootScope`. Publishes the payload AND the owning
+        /// scope's token in ONE infallible append (the slot's identity
+        /// is never observable half-published). The value is marked by
+        /// gcMarkMutableRoots (slot.value), so an emergency full GC at
+        /// any LATER allocation cannot sweep it.
         pub fn protectValueAssumeCapacity(self: *RootScope, v: Value) ValueRoot {
             const index = self.vm.gc_root_values.items.len;
-            self.vm.gc_root_values.appendAssumeCapacity(v);
+            self.vm.gc_root_values.appendAssumeCapacity(.{
+                .value = v,
+                .owner_token = self.token,
+            });
             return .{ .vm = self.vm, .scope_token = self.token, .index = index };
         }
 
         /// Infallible cell root (cells are not Values — parallel vector,
-        /// same discipline).
+        /// same discipline; payload + token in one append).
         pub fn protectCellAssumeCapacity(self: *RootScope, cell: *Cell) CellRoot {
             const index = self.vm.gc_root_cells.items.len;
-            self.vm.gc_root_cells.appendAssumeCapacity(cell);
+            self.vm.gc_root_cells.appendAssumeCapacity(.{
+                .cell = cell,
+                .owner_token = self.token,
+            });
             return .{ .vm = self.vm, .scope_token = self.token, .index = index };
         }
 
@@ -27872,9 +27970,12 @@ pub const Vm = struct {
             }
         }
 
-        for (self.gc_root_values.items) |value| try self.gcMarkValue(value);
+        // Root slots carry payload + owner token; the GC cares only
+        // about the payload (slot.value / slot.cell — never the slot
+        // struct itself: the token is bookkeeping, not a GC object).
+        for (self.gc_root_values.items) |slot| try self.gcMarkValue(slot.value);
         // Cells (upvalue boxes) under construction — parallel root list.
-        for (self.gc_root_cells.items) |cell| try self.gcQueueScanCell(cell);
+        for (self.gc_root_cells.items) |slot| try self.gcQueueScanCell(slot.cell);
         if (self.debug_transfer_values) |values| for (values) |value| try self.gcMarkValue(value);
         if (self.errThread().err_has_obj) try self.gcMarkValue(self.errThread().err_obj);
         // c_error_value holds the object thrown by lua_error between the
@@ -30292,8 +30393,11 @@ pub const Vm = struct {
 
         // Temporary GC roots (Handle API): Values held in Zig locals by
         // builtins. These are the analog of PUC Lua's L->stack temporaries.
-        for (self.gc_root_values.items) |rv| {
-            try self.gcMarkValue(rv);
+        // (Known harmless duplicate of the gcMarkMutableRoots loop — the
+        // root-scan ownership question is recorded for the next milestone;
+        // both sites mark slot.value only.)
+        for (self.gc_root_values.items) |slot| {
+            try self.gcMarkValue(slot.value);
         }
 
         // Debug hook transfer values: a slice into frame registers set up for
@@ -58089,6 +58193,902 @@ test "varargprep: named-vararg (...t) table slot-1 integrity + OOM transactional
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// A1.0c correction §2–§4: REAL nested-boundary, debug-hook boundary,
+// and subprocess proofs for the ONE shared ProtectedBoundary contract.
+//
+// Boundary 8 above proved the landing's relative restore with a HOST
+// scope as the outer layer — but the production nesting shape is a C
+// callback that lua_pcall's another C closure: TWO real
+// callCFunctionWithBoundary frames (A = the outer callback, B = the
+// inner closure), each with its own mark and its own saved c_error_jmp.
+// The tests below drive exactly that shape through the production C
+// API, then the protected debug-hook boundary (error + the PUC-valid
+// count-hook yield, ldo.c:1006-1034), then a subprocess proof that
+// finish()'s Debug assert is a real discriminator.
+// ─────────────────────────────────────────────────────────────────────
+
+// §2 channels: the C callbacks run inside the boundary machinery and
+// cannot capture test locals — the file scope is the only shared
+// channel (the established a10_/p50r3_ idiom).
+var a10n_jb_entry: ?*anyopaque = null; // c_error_jmp at outer-callback entry (== A's pad)
+var a10n_jb_after_inner: ?*anyopaque = null; // c_error_jmp after B's landing (must be A again)
+var a10n_pcall_status: c_int = -1; // the pcall status the outer callback observed
+var a10n_inner_err_val: Value = .Nil; // the error object B transported to the outer callback
+var a10n_outer_entry_roots_v: usize = 0; // root state at outer-callback entry (before its open)
+var a10n_outer_entry_roots_c: usize = 0;
+var a10n_outer_entry_depth: usize = 0;
+var a10n_outer_roots_v: usize = 0; // root state observed INSIDE A after B's landing
+var a10n_outer_roots_c: usize = 0;
+var a10n_outer_depth: usize = 0;
+var a10n_outer_handles_ok = false; // outer ValueRoot/CellRoot valid + identity after B's landing
+var a10n_outer_table: ?*Table = null; // for host-side post-call GC checks
+var a10n_outer_cell: ?*Cell = null;
+var a10n_inner_table: ?*Table = null;
+var a10n_inner_cell: ?*Cell = null;
+var a10n_outer_vr: ?Vm.ValueRoot = null; // stashed outer handles (yield variant: the host
+var a10n_outer_cr: ?Vm.CellRoot = null; //  checks A's landing really invalidated them)
+var a10n_k_seq: usize = 0; // continuation order counter (innerK = 1, outerK = 2)
+var a10n_ik_seq: usize = 0;
+var a10n_ok_seq: usize = 0;
+var a10n_ik_entered = false;
+var a10n_ik_status: c_int = -1;
+var a10n_ik_ctx: isize = -1;
+var a10n_ok_entered = false;
+var a10n_ok_status: c_int = -1;
+var a10n_ok_ctx: isize = -1;
+
+/// §2 inner callback (error variant): opens its OWN scope above A's
+/// mark, roots a fresh table + cell, then throws via lua_error — the
+/// _longjmp lands on boundary B, which must drop ONLY these roots and
+/// reinstate A's pad before the status is decoded.
+fn a10nInnerThrowCf(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    const vm = L.?.vm;
+    var scope = vm.openRootScope(1, 1) catch return a10CbFail(L, "a10n inner open oom");
+    const t = vm.allocTableEphemeral() catch {
+        scope.close();
+        return a10CbFail(L, "a10n inner table oom");
+    };
+    const cell = a10MakeCell(vm) catch {
+        scope.close();
+        return a10CbFail(L, "a10n inner cell oom");
+    };
+    _ = scope.protectValueAssumeCapacity(.{ .Table = t });
+    _ = scope.protectCellAssumeCapacity(cell);
+    a10n_inner_table = t;
+    a10n_inner_cell = cell;
+    // Intentional leak past this point: lua_error _longjmps past
+    // scope.close — B's landing must drop the abandoned roots.
+    _ = c_api.lua_pushstring(L, "a10n inner!");
+    return c_api.lua_error(L);
+}
+
+/// §2 outer callback (error variant): the REAL production nesting — a C
+/// callback that lua_pcall's another C closure. Boundary A protects
+/// THIS callback; the conventional pcall drives the inner closure
+/// through boundary B (api.State.pcall → apiCall → runClosure →
+/// callCFunction). After B's landing the pcall catches the error and
+/// this callback observes the transport from INSIDE frame A.
+fn a10nOuterThrowCf(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    const vm = L.?.vm;
+    // At entry, c_error_jmp is exactly A's landing pad.
+    a10n_jb_entry = vm.c_error_jmp;
+    a10n_outer_entry_roots_v = vm.gc_root_values.items.len;
+    a10n_outer_entry_roots_c = vm.gc_root_cells.items.len;
+    a10n_outer_entry_depth = vm.gc_root_depth;
+    var scope = vm.openRootScope(1, 1) catch return a10CbFail(L, "a10n outer open oom");
+    const t = vm.allocTableEphemeral() catch {
+        scope.close();
+        return a10CbFail(L, "a10n outer table oom");
+    };
+    const cell = a10MakeCell(vm) catch {
+        scope.close();
+        return a10CbFail(L, "a10n outer cell oom");
+    };
+    const vr = scope.protectValueAssumeCapacity(.{ .Table = t });
+    const cr = scope.protectCellAssumeCapacity(cell);
+    a10n_outer_table = t;
+    a10n_outer_cell = cell;
+    // Conventional pcall (k == NULL): the inner throw lands on B, which
+    // restores c_error_jmp to A before the status is decoded — so the
+    // pcall machinery below runs inside A's protection, exactly like
+    // PUC's nested luaD_pcall setjmp chain (ldo.c luaD_pcall →
+    // luaD_callnoyield inside the outer C frame's boundary).
+    c_api.lua_pushcfunction(L, a10nInnerThrowCf);
+    const st = c_api.lua_pcallk(L, 0, 0, 0, 0, null);
+    a10n_pcall_status = st;
+    // Observations from INSIDE frame A, after B's landing:
+    a10n_jb_after_inner = vm.c_error_jmp;
+    a10n_outer_roots_v = vm.gc_root_values.items.len;
+    a10n_outer_roots_c = vm.gc_root_cells.items.len;
+    a10n_outer_depth = vm.gc_root_depth;
+    a10n_outer_handles_ok = vr.isValid() and cr.isValid() and
+        vr.read().Table == t and cr.read() == cell;
+    if (st != 0) {
+        // The ORIGINAL error object the inner callback threw, transported
+        // through B's landing and the pcall catch onto THIS working stack.
+        a10n_inner_err_val = L.?.c_stack.items[L.?.c_stack.items.len - 1];
+    }
+    scope.close();
+    _ = c_api.lua_pushinteger(L, 55);
+    return 1;
+}
+
+/// §2 inner continuation: records its arguments and completes with one
+/// result. Runs through callContShim's own protected boundary on resume
+/// (finishCcall's k path), so its landing is exercised too.
+fn a10nInnerK(L: ?*lua_State, status: c_int, ctx: isize) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    a10n_k_seq += 1;
+    a10n_ik_seq = a10n_k_seq;
+    a10n_ik_entered = true;
+    a10n_ik_status = status;
+    a10n_ik_ctx = ctx;
+    _ = c_api.lua_pushinteger(L, 777);
+    return 1;
+}
+
+/// §2 outer continuation (the pcallk's k): same contract. PUC
+/// finishpcallk promotes a plain-yield interruption to LUA_YIELD
+/// (ldo.c:804-810), so outerK must see status == LUA_YIELD, and PUC
+/// finishCcall drives the frames top-down, so innerK runs FIRST.
+fn a10nOuterK(L: ?*lua_State, status: c_int, ctx: isize) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    a10n_k_seq += 1;
+    a10n_ok_seq = a10n_k_seq;
+    a10n_ok_entered = true;
+    a10n_ok_status = status;
+    a10n_ok_ctx = ctx;
+    _ = c_api.lua_pushinteger(L, 888);
+    return 1;
+}
+
+/// §2 inner callback (yield variant): opens its own scope above the
+/// outer callback's roots and yields with a continuation — lua_yieldk
+/// _longjmp(2)s to boundary B; B's landing drops the inner roots and
+/// reinstates A's pad, then lua_pcallk's yield arm _longjmp(2)s to A.
+fn a10nInnerYieldCf(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    const vm = L.?.vm;
+    var scope = vm.openRootScope(1, 1) catch return a10CbFail(L, "a10n inner open oom");
+    const t = vm.allocTableEphemeral() catch {
+        scope.close();
+        return a10CbFail(L, "a10n inner table oom");
+    };
+    const cell = a10MakeCell(vm) catch {
+        scope.close();
+        return a10CbFail(L, "a10n inner cell oom");
+    };
+    _ = scope.protectValueAssumeCapacity(.{ .Table = t });
+    _ = scope.protectCellAssumeCapacity(cell);
+    a10n_inner_table = t;
+    a10n_inner_cell = cell;
+    _ = c_api.lua_pushinteger(L, 4242);
+    // Intentional leak past this point: the yield jumps past
+    // scope.close — B's landing must drop the abandoned roots.
+    return c_api.lua_yieldk(L, 1, 5151, @ptrCast(&a10nInnerK));
+}
+
+/// §2 outer callback (yield variant): the coroutine BODY. Boundary A
+/// protects it; it opens the outer scope and pcallk's the inner closure
+/// with a continuation. The inner yield chains B's landing into A's
+/// landing (lua_pcallk's yield arm), so this frame never returns — on
+/// resume the continuation chain (innerK → finishpcallk → outerK)
+/// completes the coroutine, exactly like PUC's unroll/finishCcall
+/// (ldo.c:837-871).
+fn a10nOuterYieldBodyCf(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    const vm = L.?.vm;
+    a10n_jb_entry = vm.c_error_jmp;
+    var scope = vm.openRootScope(1, 1) catch return a10CbFail(L, "a10n outer open oom");
+    const t = vm.allocTableEphemeral() catch {
+        scope.close();
+        return a10CbFail(L, "a10n outer table oom");
+    };
+    const cell = a10MakeCell(vm) catch {
+        scope.close();
+        return a10CbFail(L, "a10n outer cell oom");
+    };
+    const vr = scope.protectValueAssumeCapacity(.{ .Table = t });
+    const cr = scope.protectCellAssumeCapacity(cell);
+    a10n_outer_table = t;
+    a10n_outer_cell = cell;
+    a10n_outer_vr = vr;
+    a10n_outer_cr = cr;
+    c_api.lua_pushcfunction(L, a10nInnerYieldCf);
+    // Yieldable pcallk (a coroutine body inside lua_resume): saves
+    // outerK/ctx on THIS C-frame (CIST_YPCALL) before boundary B runs
+    // the callee. On the inner yield this call never returns — the
+    // _longjmp chain B → (lua_pcallk's yield arm) → A suspends the
+    // coroutine right here, abandoning this frame's scope at A's
+    // landing (PUC: the body's ci stays for finishCcall/finishpcallk).
+    _ = c_api.lua_pcallk(L, 0, 1, 0, 7001, @ptrCast(&a10nOuterK));
+    // Unreachable on the yield path; reached only if the yield were lost
+    // (the host asserts the suspension shape, so that bug fails loudly).
+    scope.close();
+    return 0;
+}
+
+test "A1.0c boundary 8b: real nested C→C boundaries — inner landing restores A's pad and drops only inner roots" {
+    const testing = std.testing;
+    const api = @import("api.zig");
+    var state = api.State.init(.{ .allocator = testing.allocator });
+    defer state.deinit();
+    const vm = state.vm;
+    const main_th = vm.main_thread.?;
+    const frames0 = main_th.call_frames.len();
+    const roots_v0 = vm.gc_root_values.items.len;
+    const roots_c0 = vm.gc_root_cells.items.len;
+    const depth0 = vm.gc_root_depth;
+
+    // Reset the §2 channels.
+    a10n_jb_entry = null;
+    a10n_jb_after_inner = null;
+    a10n_pcall_status = -1;
+    a10n_inner_err_val = .Nil;
+    a10n_outer_entry_roots_v = 0;
+    a10n_outer_entry_roots_c = 0;
+    a10n_outer_entry_depth = 0;
+    a10n_outer_roots_v = 0;
+    a10n_outer_roots_c = 0;
+    a10n_outer_depth = 0;
+    a10n_outer_handles_ok = false;
+    a10n_outer_table = null;
+    a10n_outer_cell = null;
+    a10n_inner_table = null;
+    a10n_inner_cell = null;
+    a10n_outer_vr = null;
+    a10n_outer_cr = null;
+
+    // The REAL production nesting: boundary A protects this call, and
+    // the pcall inside drives the inner closure through boundary B.
+    const r = try vm.callCFunction(a10nOuterThrowCf, &.{});
+    defer vm.alloc.free(r);
+    try testing.expectEqual(@as(usize, 1), r.len);
+    try testing.expect(std.meta.eql(r[0], .{ .Int = 55 }));
+
+    // The pcall caught the inner throw as LUA_ERRRUN (PUC parity).
+    try testing.expectEqual(@as(c_int, 2), a10n_pcall_status);
+    // B's landing reinstated EXACTLY A's pad (pointer identity with the
+    // boundary that was active at outer-callback entry — the production
+    // nested C→C contract; a stale or null pad would misroute every
+    // later lua_error/lua_yieldk in frame A).
+    try testing.expect(a10n_jb_entry != null);
+    try testing.expectEqual(a10n_jb_entry, a10n_jb_after_inner);
+    // The ORIGINAL error object survived the transport (pointer identity
+    // with the pre-interned literal — lua_pushstring interns, so the
+    // thrown object IS this interned string).
+    const inner_str = try vm.internStr("a10n inner!");
+    try testing.expect(a10n_inner_err_val == .String);
+    try testing.expectEqual(inner_str, a10n_inner_err_val.String);
+    // Observed INSIDE frame A after B's landing: only the INNER roots
+    // were dropped — the outer scope is still open with exactly its own
+    // +1/+1/+1 on top of the entry baseline, and its handles are valid
+    // with payload identity intact.
+    try testing.expect(a10n_outer_handles_ok);
+    try testing.expectEqual(a10n_outer_entry_roots_v + 1, a10n_outer_roots_v);
+    try testing.expectEqual(a10n_outer_entry_roots_c + 1, a10n_outer_roots_c);
+    try testing.expectEqual(a10n_outer_entry_depth + 1, a10n_outer_depth);
+    // After A's finish: the outer callback closed its scope, so the
+    // baseline is exact and the pad is back to the host's (null).
+    try testing.expectEqual(roots_v0, vm.gc_root_values.items.len);
+    try testing.expectEqual(roots_c0, vm.gc_root_cells.items.len);
+    try testing.expectEqual(depth0, vm.gc_root_depth);
+    try testing.expect(vm.c_error_jmp == null);
+    try testing.expectEqual(frames0, main_th.call_frames.len());
+
+    // REAL full GC: both pairs (the inner dropped at B's landing, the
+    // outer closed by the callback) are unrooted and collected — no
+    // permanent roots leaked through either landing.
+    try vm.gcFullCollectionForUser();
+    try testing.expect(!p50StillRegistered(vm, .{ .table = a10n_inner_table.? }));
+    try testing.expect(!p50StillRegistered(vm, .{ .cell = a10n_inner_cell.? }));
+    try testing.expect(!p50StillRegistered(vm, .{ .table = a10n_outer_table.? }));
+    try testing.expect(!p50StillRegistered(vm, .{ .cell = a10n_outer_cell.? }));
+
+    // The state is usable: a repeat protected call through a fresh
+    // boundary works and leaves the baseline exact.
+    const r2 = try vm.callCFunction(a10CleanCf, &.{});
+    defer vm.alloc.free(r2);
+    try testing.expectEqual(@as(usize, 1), r2.len);
+    try testing.expectEqual(roots_v0, vm.gc_root_values.items.len);
+    try testing.expectEqual(roots_c0, vm.gc_root_cells.items.len);
+    try testing.expectEqual(depth0, vm.gc_root_depth);
+}
+
+test "A1.0c boundary 8c: nested yield chains B→A landings; continuation chain innerK→outerK completes" {
+    const testing = std.testing;
+    const api = @import("api.zig");
+    const c_api = @import("c_api.zig");
+    var state = api.State.init(.{ .allocator = testing.allocator });
+    defer state.deinit();
+    const vm = state.vm;
+    const L = vm.main_handle.?;
+    const main_th = vm.main_thread.?;
+    const frames0 = main_th.call_frames.len();
+    const roots_v0 = vm.gc_root_values.items.len;
+    const roots_c0 = vm.gc_root_cells.items.len;
+    const depth0 = vm.gc_root_depth;
+
+    // Reset the §2 channels (yield-variant subset).
+    a10n_jb_entry = null;
+    a10n_outer_table = null;
+    a10n_outer_cell = null;
+    a10n_inner_table = null;
+    a10n_inner_cell = null;
+    a10n_outer_vr = null;
+    a10n_outer_cr = null;
+    a10n_k_seq = 0;
+    a10n_ik_seq = 0;
+    a10n_ok_seq = 0;
+    a10n_ik_entered = false;
+    a10n_ik_status = -1;
+    a10n_ik_ctx = -1;
+    a10n_ok_entered = false;
+    a10n_ok_status = -1;
+    a10n_ok_ctx = -1;
+
+    const main_len0 = L.c_stack.items.len;
+    const L2 = c_api.lua_newthread(L).?;
+    const th2 = L2.thread.?;
+    c_api.lua_pushcfunction(L2, a10nOuterYieldBodyCf);
+
+    var nres: c_int = -1;
+    const st1 = c_api.lua_resume(L2, L, 0, &nres);
+    // The coroutine suspended on the inner yield: the payload the inner
+    // callback handed to lua_yieldk is the resume window.
+    try testing.expectEqual(@as(c_int, 1), st1); // LUA_YIELD
+    try testing.expectEqual(@as(c_int, 1), nres);
+    try testing.expectEqual(@as(c_int, 1), c_api.lua_status(L2)); // LUA_YIELD
+    try testing.expect(th2.status == .suspended);
+    try testing.expectEqual(@as(usize, 1), L2.c_stack.items.len);
+    try testing.expect(std.meta.eql(L2.c_stack.items[0], .{ .Int = 4242 }));
+    // BOTH landings ran: B dropped the inner roots, then lua_pcallk's
+    // yield arm jumped to A, whose landing dropped the OUTER roots (the
+    // body frame is bypassed by the jump chain, exactly like PUC's
+    // yield through a pcallk — the frame stays for finishCcall, the
+    // scope does not). The VM-global root state is back at the
+    // pre-resume baseline and the pad is the host's (null).
+    try testing.expect(a10n_jb_entry != null); // A's pad was active for the body
+    try testing.expectEqual(roots_v0, vm.gc_root_values.items.len);
+    try testing.expectEqual(roots_c0, vm.gc_root_cells.items.len);
+    try testing.expectEqual(depth0, vm.gc_root_depth);
+    try testing.expect(vm.c_error_jmp == null);
+    // The stashed outer handles were invalidated by A's landing
+    // truncation (dropped, not closed — the token no longer validates).
+    try testing.expect(!a10n_outer_vr.?.isValid());
+    try testing.expect(!a10n_outer_cr.?.isValid());
+    // Not a hook yield: the plain lua_yieldk path.
+    try testing.expect(th2.yielded_from_debug_hook == false);
+
+    // REAL full GC while suspended: both abandoned pairs are unrooted
+    // and collected (no permanent roots through either landing).
+    try vm.gcFullCollectionForUser();
+    try testing.expect(!p50StillRegistered(vm, .{ .table = a10n_inner_table.? }));
+    try testing.expect(!p50StillRegistered(vm, .{ .cell = a10n_inner_cell.? }));
+    try testing.expect(!p50StillRegistered(vm, .{ .table = a10n_outer_table.? }));
+    try testing.expect(!p50StillRegistered(vm, .{ .cell = a10n_outer_cell.? }));
+
+    // Resume: PUC unroll drives the frames top-down — innerK first
+    // (finishCcall, status LUA_YIELD), then the pcallk frame
+    // (finishpcallk promotes the plain yield to LUA_YIELD, ldo.c:807)
+    // → outerK — and outerK's results are the coroutine body's results.
+    const st2 = c_api.lua_resume(L2, L, 0, &nres);
+    try testing.expectEqual(@as(c_int, 0), st2); // LUA_OK
+    try testing.expectEqual(@as(c_int, 1), nres);
+    try testing.expect(a10n_ik_entered);
+    try testing.expectEqual(@as(c_int, 1), a10n_ik_status); // LUA_YIELD
+    try testing.expectEqual(@as(isize, 5151), a10n_ik_ctx);
+    try testing.expectEqual(@as(usize, 1), a10n_ik_seq); // innerK ran FIRST
+    try testing.expect(a10n_ok_entered);
+    try testing.expectEqual(@as(c_int, 1), a10n_ok_status); // LUA_YIELD (finishpcallk)
+    try testing.expectEqual(@as(isize, 7001), a10n_ok_ctx);
+    try testing.expectEqual(@as(usize, 2), a10n_ok_seq); // ...then outerK
+    try testing.expect(th2.status == .dead);
+    try testing.expectEqual(@as(usize, 1), L2.c_stack.items.len);
+    try testing.expect(std.meta.eql(L2.c_stack.items[0], .{ .Int = 888 }));
+    // The continuation boundaries (callContShim) left the baseline exact.
+    try testing.expectEqual(roots_v0, vm.gc_root_values.items.len);
+    try testing.expectEqual(roots_c0, vm.gc_root_cells.items.len);
+    try testing.expectEqual(depth0, vm.gc_root_depth);
+
+    // Teardown (the T2 idiom) + final baseline.
+    L.c_stack.shrinkRetainingCapacity(main_len0);
+    vm.c_api_thread = null;
+    p50TeardownThread(vm, th2, false);
+    vm.freeStateHandle(L2);
+    try testing.expectEqual(frames0, main_th.call_frames.len());
+    try testing.expectEqual(roots_v0, vm.gc_root_values.items.len);
+    try testing.expectEqual(roots_c0, vm.gc_root_cells.items.len);
+    try testing.expectEqual(depth0, vm.gc_root_depth);
+}
+
+// §3 channels: the C hook runs inside the boundary machinery and cannot
+// capture test locals.
+var a10h_err_armed = false;
+var a10h_err_event: c_int = -1;
+var a10h_err_table: ?*Table = null;
+var a10h_err_cell: ?*Cell = null;
+var a10h_yield_armed = false;
+var a10h_yield_fires: usize = 0;
+var a10h_yield_table: ?*Table = null;
+var a10h_yield_cell: ?*Cell = null;
+
+/// §3 error-variant hook: a COUNT hook that opens its own scope above
+/// the host's roots and raises lua_error — the _longjmp(1) lands on the
+/// protected hook boundary in debugDispatchHookTransfer (the SAME
+/// ProtectedBoundary contract as callCFunctionWithBoundary), which must
+/// drop the hook's abandoned roots and reinstate the previous pad
+/// before the error is propagated as error.RuntimeError.
+fn a10hErrHook(Lp: ?*anyopaque, arp: ?*anyopaque) callconv(.c) void {
+    const c_api = @import("c_api.zig");
+    const L: ?*lua_State = @ptrCast(@alignCast(Lp.?));
+    const ar: *c_api.lua_Debug = @ptrCast(@alignCast(arp.?));
+    if (!a10h_err_armed) return; // count=1 keeps firing; only the first raises
+    a10h_err_armed = false;
+    a10h_err_event = ar.event;
+    const vm = L.?.vm;
+    var scope = vm.openRootScope(1, 1) catch {
+        _ = c_api.lua_pushstring(L, "a10h hook open oom");
+        c_api.lua_error(L);
+    };
+    const t = vm.allocTableEphemeral() catch {
+        scope.close();
+        _ = c_api.lua_pushstring(L, "a10h hook table oom");
+        c_api.lua_error(L);
+    };
+    const cell = a10MakeCell(vm) catch {
+        scope.close();
+        _ = c_api.lua_pushstring(L, "a10h hook cell oom");
+        c_api.lua_error(L);
+    };
+    _ = scope.protectValueAssumeCapacity(.{ .Table = t });
+    _ = scope.protectCellAssumeCapacity(cell);
+    a10h_err_table = t;
+    a10h_err_cell = cell;
+    // Intentional leak past this point: lua_error jumps past
+    // scope.close — the hook boundary's landing must drop the abandoned
+    // roots (PUC luaD_hook relies on luaD_throw unwinding to the resume
+    // boundary; the scope analogue is the landing's relative restore).
+    _ = c_api.lua_pushstring(L, "a10h hook boom!");
+    c_api.lua_error(L);
+}
+
+/// §3 yield-variant hook: the PUC-VALID hook yield (ldo.c:1021-1024:
+/// nresults == 0 and k == NULL — count/line hooks may yield,
+/// luaG_traceexec's CIST_HOOKYIELD). Armed once: the first count event
+/// opens a scope above the host's roots and yields; later events are
+/// plain returns through the boundary's normal-return checkpoint.
+fn a10hYieldHook(Lp: ?*anyopaque, arp: ?*anyopaque) callconv(.c) void {
+    const c_api = @import("c_api.zig");
+    const L: ?*lua_State = @ptrCast(@alignCast(Lp.?));
+    _ = arp;
+    a10h_yield_fires += 1;
+    if (!a10h_yield_armed) return;
+    a10h_yield_armed = false;
+    const vm = L.?.vm;
+    var scope = vm.openRootScope(1, 1) catch return;
+    const t = vm.allocTableEphemeral() catch {
+        scope.close();
+        return;
+    };
+    const cell = a10MakeCell(vm) catch {
+        scope.close();
+        return;
+    };
+    _ = scope.protectValueAssumeCapacity(.{ .Table = t });
+    _ = scope.protectCellAssumeCapacity(cell);
+    a10h_yield_table = t;
+    a10h_yield_cell = cell;
+    // Intentional leak past this point: the hook yield jumps past
+    // scope.close — the landing must drop the abandoned roots.
+    _ = c_api.lua_yieldk(L, 0, 0, null);
+    // Unreachable on the yield path; a plain return here would leak the
+    // scope into finish()'s Debug assert (the test would fail loudly).
+}
+
+test "A1.0c hook boundary 11: count-hook lua_error lands on the hook boundary — hook roots dropped, host roots intact" {
+    const testing = std.testing;
+    const api = @import("api.zig");
+    const c_api = @import("c_api.zig");
+    var state = api.State.init(.{ .allocator = testing.allocator });
+    defer state.deinit();
+    const vm = state.vm;
+    const L = vm.main_handle.?;
+    const main_th = vm.main_thread.?;
+    const frames0 = main_th.call_frames.len();
+    const c_stack0 = L.c_stack.items.len;
+
+    vm.setDynamicBytecodeCompiler(defaultBytecodeCompiler);
+    const src =
+        \\local s = 0
+        \\for i = 1, 10 do s = s + i end
+        \\return s
+    ;
+    const chunk_v = try vm.compileChunkValue(src, "=a10h-err-hook");
+    // HOST scope BELOW the hook boundary mark: the chunk closure plus an
+    // outer table/cell pair must survive the hook's error landing
+    // untouched (a relative restore, never a truncate-to-zero).
+    var scope = try vm.openRootScope(2, 1);
+    _ = scope.protectValueAssumeCapacity(chunk_v);
+    const t_outer = try vm.allocTableEphemeral();
+    const vr = scope.protectValueAssumeCapacity(.{ .Table = t_outer });
+    const cell_outer = try a10MakeCell(vm);
+    const cr = scope.protectCellAssumeCapacity(cell_outer);
+    const mark = vm.rootMark();
+    const cl = chunk_v.Closure;
+
+    a10h_err_armed = true;
+    a10h_err_event = -1;
+    a10h_err_table = null;
+    a10h_err_cell = null;
+    c_api.lua_sethook(L, a10hErrHook, 8, 1); // LUA_MASKCOUNT, count = 1
+
+    // The hook fires on the chunk's first count event and raises.
+    const r = vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+    try testing.expectError(error.RuntimeError, r);
+
+    // The hook really ran at a COUNT event (lua.h: LUA_HOOKCOUNT == 3).
+    try testing.expectEqual(@as(c_int, 3), a10h_err_event);
+    // The landing restored the hook boundary's mark: the hook's
+    // abandoned roots are gone; the host scope below is the innermost
+    // again, with its handles valid and payloads identical.
+    try testing.expectEqual(mark.values_len, vm.gc_root_values.items.len);
+    try testing.expectEqual(mark.cells_len, vm.gc_root_cells.items.len);
+    try testing.expectEqual(mark.depth, vm.gc_root_depth);
+    try testing.expect(scope.isValidClose());
+    try testing.expect(vr.read().Table == t_outer);
+    try testing.expect(cr.read() == cell_outer);
+    // The sync hook state was cleared on the landing path (the defers in
+    // debugDispatchHookTransfer run on the error propagation too).
+    try testing.expect(main_th.debug_hook.sync_hook_frame_idx == null);
+    try testing.expect(main_th.debug_hook.in_debug_hook == false);
+    try testing.expect(vm.debug_hook_allow_yield == false);
+    try testing.expect(vm.c_error_jmp == null);
+    // The hook's ORIGINAL error object survived the transport.
+    const msg = vm.errThread().err_obj;
+    try testing.expect(msg == .String);
+    try testing.expectEqualStrings("a10h hook boom!", msg.String.bytes());
+    // Structural unwind: no frame residue.
+    try testing.expectEqual(frames0, main_th.call_frames.len());
+    // The hook's error string left residue on the main working stack —
+    // clean it (the host owns the stack outside any protected call).
+    L.c_stack.shrinkRetainingCapacity(c_stack0);
+
+    // REAL full GC: the hook's abandoned pair is unrooted and collected;
+    // the host's rooted pair survives.
+    try vm.gcFullCollectionForUser();
+    try testing.expect(!p50StillRegistered(vm, .{ .table = a10h_err_table.? }));
+    try testing.expect(!p50StillRegistered(vm, .{ .cell = a10h_err_cell.? }));
+    try testing.expect(p50StillRegistered(vm, .{ .table = t_outer }));
+    try testing.expect(p50StillRegistered(vm, .{ .cell = cell_outer }));
+
+    // The VM survives a REPEATED hook dispatch and a repeat protected
+    // call: the (now disarmed) hook returns through the boundary's
+    // normal-return checkpoint on every count event and the chunk runs
+    // to completion with the exact result.
+    const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+    defer vm.alloc.free(results);
+    try testing.expectEqual(@as(usize, 1), results.len);
+    try testing.expect(results[0] == .Int and results[0].Int == 55);
+    try testing.expectEqual(mark.values_len, vm.gc_root_values.items.len);
+    try testing.expectEqual(mark.cells_len, vm.gc_root_cells.items.len);
+    try testing.expectEqual(mark.depth, vm.gc_root_depth);
+
+    const r2 = try vm.callCFunction(a10CleanCf, &.{});
+    defer vm.alloc.free(r2);
+    try testing.expectEqual(@as(usize, 1), r2.len);
+
+    c_api.lua_sethook(L, null, 0, 0);
+    scope.close();
+    try testing.expectEqual(frames0, main_th.call_frames.len());
+}
+
+test "A1.0c hook boundary 12: PUC-valid count-hook yield suspends the coroutine; hook roots dropped, host roots survive" {
+    const testing = std.testing;
+    const api = @import("api.zig");
+    const c_api = @import("c_api.zig");
+    var state = api.State.init(.{ .allocator = testing.allocator });
+    defer state.deinit();
+    const vm = state.vm;
+    const L = vm.main_handle.?;
+    const main_th = vm.main_thread.?;
+    const frames0 = main_th.call_frames.len();
+    const roots_v0 = vm.gc_root_values.items.len;
+    const roots_c0 = vm.gc_root_cells.items.len;
+    const depth0 = vm.gc_root_depth;
+
+    vm.setDynamicBytecodeCompiler(defaultBytecodeCompiler);
+    const src =
+        \\local s = 0
+        \\for i = 1, 10 do s = s + i end
+        \\return s
+    ;
+    const chunk_v = try vm.compileChunkValue(src, "=a10h-yield-hook");
+    // HOST scope BELOW the hook boundary mark: the chunk closure plus an
+    // outer table/cell pair must survive the hook-yield landing and the
+    // suspension GC.
+    var scope = try vm.openRootScope(2, 1);
+    _ = scope.protectValueAssumeCapacity(chunk_v);
+    const t_outer = try vm.allocTableEphemeral();
+    const vr = scope.protectValueAssumeCapacity(.{ .Table = t_outer });
+    const cell_outer = try a10MakeCell(vm);
+    const cr = scope.protectCellAssumeCapacity(cell_outer);
+    const mark = vm.rootMark();
+    const main_len0 = L.c_stack.items.len;
+
+    const L2 = c_api.lua_newthread(L).?;
+    const th2 = L2.thread.?;
+    try L2.c_stack.append(vm.alloc, chunk_v);
+    a10h_yield_armed = true;
+    a10h_yield_fires = 0;
+    a10h_yield_table = null;
+    a10h_yield_cell = null;
+    c_api.lua_sethook(L2, a10hYieldHook, 8, 1); // LUA_MASKCOUNT, count = 1
+
+    var nres: c_int = -1;
+    const st1 = c_api.lua_resume(L2, L, 0, &nres);
+    try testing.expectEqual(@as(c_int, 1), st1); // LUA_YIELD
+    try testing.expectEqual(@as(c_int, 0), nres); // hooks cannot yield values
+    try testing.expectEqual(@as(c_int, 1), c_api.lua_status(L2)); // LUA_YIELD
+    try testing.expect(th2.status == .suspended);
+    try testing.expect(a10h_yield_fires >= 1);
+    // The landing dropped the hook's abandoned roots; the host scope
+    // below the hook boundary mark is intact (handles + identity).
+    try testing.expectEqual(mark.values_len, vm.gc_root_values.items.len);
+    try testing.expectEqual(mark.cells_len, vm.gc_root_cells.items.len);
+    try testing.expectEqual(mark.depth, vm.gc_root_depth);
+    try testing.expect(scope.isValidClose());
+    try testing.expect(vr.read().Table == t_outer);
+    try testing.expect(cr.read() == cell_outer);
+    // Sync hook state cleared on the yield landing path (the defers run
+    // when debugDispatchHookTransfer returns through error.Yield).
+    try testing.expect(th2.debug_hook.sync_hook_frame_idx == null);
+    try testing.expect(th2.debug_hook.in_debug_hook == false);
+    try testing.expect(vm.debug_hook_allow_yield == false);
+    try testing.expect(vm.c_error_jmp == null);
+    // It was a HOOK yield (the CIST_HOOKYIELD analogue), not a body yield.
+    try testing.expect(th2.yielded_from_debug_hook == true);
+
+    // REAL full GC while suspended: the hook's abandoned pair is
+    // collected; the host's rooted pair and the chunk closure survive.
+    try vm.gcFullCollectionForUser();
+    try testing.expect(!p50StillRegistered(vm, .{ .table = a10h_yield_table.? }));
+    try testing.expect(!p50StillRegistered(vm, .{ .cell = a10h_yield_cell.? }));
+    try testing.expect(p50StillRegistered(vm, .{ .table = t_outer }));
+    try testing.expect(p50StillRegistered(vm, .{ .cell = cell_outer }));
+
+    // Resume to completion: the count hook keeps firing (plain returns
+    // through the boundary's normal-return checkpoint) and the chunk
+    // result is exact.
+    const st2 = c_api.lua_resume(L2, L, 0, &nres);
+    try testing.expectEqual(@as(c_int, 0), st2); // LUA_OK
+    try testing.expect(a10h_yield_fires > 1);
+    try testing.expectEqual(@as(c_int, 1), nres);
+    try testing.expect(L2.c_stack.items.len >= 1);
+    const top = L2.c_stack.items[L2.c_stack.items.len - 1];
+    try testing.expect(top == .Int and top.Int == 55);
+    try testing.expect(th2.status == .dead);
+    try testing.expectEqual(mark.values_len, vm.gc_root_values.items.len);
+    try testing.expectEqual(mark.cells_len, vm.gc_root_cells.items.len);
+    try testing.expectEqual(mark.depth, vm.gc_root_depth);
+
+    c_api.lua_sethook(L2, null, 0, 0);
+    L.c_stack.shrinkRetainingCapacity(main_len0);
+    vm.c_api_thread = null;
+    p50TeardownThread(vm, th2, false);
+    vm.freeStateHandle(L2);
+    scope.close();
+    try testing.expectEqual(frames0, main_th.call_frames.len());
+    try testing.expectEqual(roots_v0, vm.gc_root_values.items.len);
+    try testing.expectEqual(roots_c0, vm.gc_root_cells.items.len);
+    try testing.expectEqual(depth0, vm.gc_root_depth);
+}
+
+/// The §4 subprocess program, embedded as source. Built with the SAME
+/// module graph as `zig build test` (util + lua) and executed for two
+/// scenarios: "leak" (the callback returns with its RootScope still
+/// open — the production finish() checkpoint must catch it) and
+/// "control" (the callback closes its scope — the checkpoint passes).
+/// In Debug the leak scenario must ABORT at finish()'s exact-equality
+/// assert (SIGABRT + the unreachable panic, never reaching the
+/// "survived" marker); in ReleaseFast the comptime-eliminated assert
+/// gives way to the defensive restoreRoots, which must POSITIVELY
+/// restore the root state (the restored=1 marker) — deleting the
+/// assert from finish() turns the Debug expectation RED, which is
+/// exactly what the old in-process test 9 could not prove.
+const a10c_s4_child_src =
+    \\// A1.0c §4 subprocess: leaked RootScope through the production
+    \\// C-API boundary path. Scenario from argv[1]: "leak" (default) or
+    \\// "control". All diagnostics go to stderr.
+    \\const std = @import("std");
+    \\const lua = @import("lua");
+    \\
+    \\fn leakCf(L: ?*lua.c_api.lua_State) callconv(.c) c_int {
+    \\    const vm = L.?.vm;
+    \\    var scope = vm.openRootScope(1, 1) catch return 0;
+    \\    lua.c_api.lua_createtable(L, 0, 0);
+    \\    const t = L.?.c_stack.items[L.?.c_stack.items.len - 1].Table;
+    \\    const cell = vm.alloc.create(lua.internal.vm.Cell) catch {
+    \\        scope.close();
+    \\        return 0;
+    \\    };
+    \\    cell.* = .{ .value = .Nil };
+    \\    vm.gcRegisterCell(cell) catch {
+    \\        vm.alloc.destroy(cell);
+    \\        scope.close();
+    \\        return 0;
+    \\    };
+    \\    _ = scope.protectValueAssumeCapacity(.{ .Table = t });
+    \\    _ = scope.protectCellAssumeCapacity(cell);
+    \\    _ = lua.c_api.lua_pushinteger(L, 7);
+    \\    return 1; // LEAK: the scope is never closed — finish() must catch it
+    \\}
+    \\
+    \\fn controlCf(L: ?*lua.c_api.lua_State) callconv(.c) c_int {
+    \\    const vm = L.?.vm;
+    \\    var scope = vm.openRootScope(1, 1) catch return 0;
+    \\    lua.c_api.lua_createtable(L, 0, 0);
+    \\    const t = L.?.c_stack.items[L.?.c_stack.items.len - 1].Table;
+    \\    const cell = vm.alloc.create(lua.internal.vm.Cell) catch {
+    \\        scope.close();
+    \\        return 0;
+    \\    };
+    \\    cell.* = .{ .value = .Nil };
+    \\    vm.gcRegisterCell(cell) catch {
+    \\        vm.alloc.destroy(cell);
+    \\        scope.close();
+    \\        return 0;
+    \\    };
+    \\    _ = scope.protectValueAssumeCapacity(.{ .Table = t });
+    \\    _ = scope.protectCellAssumeCapacity(cell);
+    \\    scope.close(); // well-behaved: the checkpoint must pass
+    \\    _ = lua.c_api.lua_pushinteger(L, 5);
+    \\    return 1;
+    \\}
+    \\
+    \\pub fn main(init: std.process.Init) u8 {
+    \\    const argv = init.minimal.args.vector;
+    \\    const scenario: []const u8 = if (argv.len > 1) std.mem.span(argv[1]) else "leak";
+    \\    const leak = std.mem.eql(u8, scenario, "leak");
+    \\
+    \\    var state = lua.api.State.init(.{ .allocator = std.heap.c_allocator });
+    \\    defer state.deinit();
+    \\    const vm = state.vm;
+    \\    const L = vm.main_handle.?;
+    \\
+    \\    const roots_v0 = vm.gc_root_values.items.len;
+    \\    const roots_c0 = vm.gc_root_cells.items.len;
+    \\    const depth0 = vm.gc_root_depth;
+    \\
+    \\    // Drive the callback through the REAL production C-API boundary
+    \\    // path: lua_pushcfunction + lua_pcallk → apiCall → runClosure →
+    \\    // callCFunction → callCFunctionWithBoundary (the finish()
+    \\    // checkpoint at the normal C return).
+    \\    lua.c_api.lua_pushcfunction(L, if (leak) leakCf else controlCf);
+    \\    std.debug.print("A10C-CHILD-ARMED {s}\n", .{scenario});
+    \\    const st = lua.c_api.lua_pcallk(L, 0, 1, 0, 0, null);
+    \\    if (st != 0) {
+    \\        std.debug.print("A10C-CHILD-PCALL-FAIL {d}\n", .{st});
+    \\        return 3;
+    \\    }
+    \\    // Reached only when finish() accepted the return: in Debug the
+    \\    // leak scenario aborts AT the checkpoint, so this "survived"
+    \\    // marker's absence narrows the abort to the assert; in
+    \\    // ReleaseFast the defensive restore must have brought the root
+    \\    // state back exactly (restored=1).
+    \\    const restored = vm.gc_root_values.items.len == roots_v0 and
+    \\        vm.gc_root_cells.items.len == roots_c0 and
+    \\        vm.gc_root_depth == depth0;
+    \\    std.debug.print("A10C-CHILD-AFTER restored={d}\n", .{@intFromBool(restored)});
+    \\    if (!restored) return 4;
+    \\    const n = L.c_stack.items[L.c_stack.items.len - 1].Int;
+    \\    std.debug.print("A10C-CHILD-OK n={d}\n", .{n});
+    \\    return 0;
+    \\}
+    \\
+;
+
+test "A1.0c boundary 13: leaked-scope finish() assert is real (subprocess; Debug aborts, ReleaseFast restores)" {
+    const testing = std.testing;
+
+    // Threaded Io with the parent's libc environ (the R5 pattern — the
+    // child zig needs a real environment for its cache directories).
+    const c_environ = std.c.environ;
+    var env_count: usize = 0;
+    while (c_environ[env_count] != null) : (env_count += 1) {}
+    var io_threaded = std.Io.Threaded.init(testing.allocator, .{
+        .environ = .{ .block = .{ .slice = c_environ[0..env_count :null] } },
+    });
+    defer io_threaded.deinit();
+    const io = io_threaded.io();
+
+    // UNIQUE per-process paths: the Debug and ReleaseFast suites may run
+    // concurrently — a shared /tmp path (the R5 flaw) would collide.
+    const pid = std.c.getpid();
+    const src_path = try std.fmt.allocPrint(testing.allocator, "/tmp/opencode/a10c_s4_child_{d}.zig", .{pid});
+    defer testing.allocator.free(src_path);
+    const bin_path = try std.fmt.allocPrint(testing.allocator, "/tmp/opencode/a10c_s4_bin_{d}", .{pid});
+    defer testing.allocator.free(bin_path);
+    const root_arg = try std.fmt.allocPrint(testing.allocator, "-Mroot={s}", .{src_path});
+    defer testing.allocator.free(root_arg);
+    const emit_arg = try std.fmt.allocPrint(testing.allocator, "-femit-bin={s}", .{bin_path});
+    defer testing.allocator.free(emit_arg);
+
+    // The test binary's CWD is the build root, so the relative module
+    // paths resolve; the source lives at the absolute /tmp path.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = src_path, .data = a10c_s4_child_src });
+
+    // Build against the SAME module graph as `zig build test` (util +
+    // lua, libc linked). Per-module CLI settings attach to the NEXT
+    // `-M` argument and reset after it: the optimize flag must precede
+    // EVERY module (root, lua, util) — a trailing `-O` applies to no
+    // module and silently builds an all-Debug child. Matching the
+    // current test mode also shares the lua module's cache entry with
+    // this test binary's compile.
+    const opt_flag = if (@import("builtin").mode == .ReleaseFast) "-OReleaseFast" else "-ODebug";
+    const build_result = try std.process.run(testing.allocator, io, .{
+        .argv = &.{
+            "/usr/bin/zig", "build-exe",
+            opt_flag,       "--dep",
+            "lua",          root_arg,
+            "--dep",        "util",
+            opt_flag,       "-Mlua=src/lua/root.zig",
+            opt_flag,       "-Mutil=src/util/root.zig",
+            "-lc",          emit_arg,
+        },
+    });
+    defer testing.allocator.free(build_result.stdout);
+    defer testing.allocator.free(build_result.stderr);
+    if (build_result.term != .exited or build_result.term.exited != 0) {
+        std.debug.print("a10c §4 build failed:\n{s}\n{s}\n", .{
+            build_result.stdout,
+            build_result.stderr,
+        });
+        return error.TestUnexpectedResult;
+    }
+
+    for ([_][]const u8{ "leak", "control" }) |scenario| {
+        const run = try std.process.run(testing.allocator, io, .{
+            .argv = &.{ bin_path, scenario },
+        });
+        defer testing.allocator.free(run.stdout);
+        defer testing.allocator.free(run.stderr);
+
+        // The child reached the protected call in every scenario.
+        try testing.expect(std.mem.indexOf(u8, run.stderr, "A10C-CHILD-ARMED") != null);
+
+        if (std.mem.eql(u8, scenario, "control")) {
+            // Well-behaved callback: the checkpoint passes in BOTH modes.
+            try testing.expect(run.term == .exited and run.term.exited == 0);
+            try testing.expect(std.mem.indexOf(u8, run.stderr, "A10C-CHILD-AFTER restored=1") != null);
+            try testing.expect(std.mem.indexOf(u8, run.stderr, "A10C-CHILD-OK n=5") != null);
+            continue;
+        }
+
+        if (@import("builtin").mode == .ReleaseFast) {
+            // The assert is comptime-eliminated; the DEFENSIVE restore
+            // must positively bring the root state back (the production
+            // guarantee against permanent roots) and the call completes.
+            try testing.expect(run.term == .exited and run.term.exited == 0);
+            try testing.expect(std.mem.indexOf(u8, run.stderr, "A10C-CHILD-AFTER restored=1") != null);
+            try testing.expect(std.mem.indexOf(u8, run.stderr, "A10C-CHILD-OK n=7") != null);
+        } else {
+            // Debug: the leaked scope trips finish()'s exact-equality
+            // assert — the child aborts AT the checkpoint (SIGABRT, the
+            // unreachable panic) and never reaches the "survived" marker.
+            try testing.expect(run.term == .signal and run.term.signal == .ABRT);
+            try testing.expect(std.mem.indexOf(u8, run.stderr, "reached unreachable code") != null);
+            try testing.expect(std.mem.indexOf(u8, run.stderr, "A10C-CHILD-AFTER") == null);
+            // Narrow to the boundary checkpoint: the panic trace passes
+            // through the VM module (the assert's compilation unit).
+            try testing.expect(std.mem.indexOf(u8, run.stderr, "vm.zig") != null);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // P16.50-review-6 B2: luaL_newmetatable is ONE shared semantic path
 // (`Vm.newMetatableShared`) for the C-API wrapper (`api.State.newmetatable`
 // / c_api `luaL_newmetatable`) and the testC `newmetatable` command, with
@@ -58625,6 +59625,13 @@ test "A1.0 roots 2: ValueRoot/CellRoot handles stay stable across a nested reser
     try testing.expect(h2.read().Table == t2);
     try testing.expect(c1.read() == cell1);
 
+    // A1.0c proof 1: every handle — including the OUTER pair across the
+    // nested reserve-driven reallocation — still VALIDATES (index in
+    // range + owner token intact in the moved backing storage).
+    try testing.expect(h1.isValid());
+    try testing.expect(c1.isValid());
+    try testing.expect(h2.isValid());
+
     // replace retargets exactly the handled slot: h1's slot now roots
     // t2, h2's slot still roots t2 — both readable through the handles.
     h1.replace(.{ .Table = t2 });
@@ -58633,9 +59640,93 @@ test "A1.0 roots 2: ValueRoot/CellRoot handles stay stable across a nested reser
     try testing.expectEqual(@as(usize, 2), vm.gc_root_values.items.len);
 
     inner.close();
+    // A1.0c proof 2 (inner half): the closed scope's handle died with
+    // the truncation; the OUTER pair is still valid (LIFO keeps their
+    // slots below the inner mark).
+    try testing.expect(!h2.isValid());
+    try testing.expect(h1.isValid());
+    try testing.expect(c1.isValid());
     outer.close();
+    // A1.0c proof 2 (outer half): after the ordinary outer close the
+    // outer handles are invalid too.
+    try testing.expect(!h1.isValid());
+    try testing.expect(!c1.isValid());
     try testing.expectEqual(@as(usize, 0), vm.gc_root_values.items.len);
     try testing.expectEqual(@as(usize, 0), vm.gc_root_cells.items.len);
+}
+
+test "A1.0c roots 2b: handle identity — close/restore invalidation and slot-reuse rejection (both root kinds)" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    const t_a = try vm.allocTableNoGc();
+    const t_b = try vm.allocTableNoGc();
+    const t_stale = try vm.allocTableNoGc();
+    const cell_a = try a10MakeCell(&vm);
+    const cell_b = try a10MakeCell(&vm);
+
+    // ── Proof 2: an ORDINARY close truncates the slots away — the
+    // abandoned handles stop validating immediately.
+    var scope_a = try vm.openRootScope(1, 1);
+    const hv_a = scope_a.protectValueAssumeCapacity(.{ .Table = t_a });
+    const hc_a = scope_a.protectCellAssumeCapacity(cell_a);
+    try testing.expect(hv_a.isValid());
+    try testing.expect(hc_a.isValid());
+    scope_a.close();
+    try testing.expect(!hv_a.isValid());
+    try testing.expect(!hc_a.isValid());
+
+    // ── Proof 3: restoreRoots — the non-local-exit (_longjmp landing)
+    // checkpoint — invalidates the abandoned scope's handles the same
+    // way (relative truncation to the mark).
+    const mark = vm.rootMark();
+    var scope_j = try vm.openRootScope(1, 1);
+    const hv_j = scope_j.protectValueAssumeCapacity(.{ .Table = t_a });
+    const hc_j = scope_j.protectCellAssumeCapacity(cell_a);
+    try testing.expect(hv_j.isValid());
+    try testing.expect(hc_j.isValid());
+    vm.restoreRoots(mark); // exactly what a boundary landing does
+    try testing.expect(!hv_j.isValid());
+    try testing.expect(!hc_j.isValid());
+
+    // ── Proof 4: slot REUSE. The next scope reuses the truncated
+    // indices, but each publish writes a FRESH owner token — the OLD
+    // handles fail the identity check (this IS the predicate read/
+    // replace assert on in Debug: misuse is caught there without this
+    // test ever triggering UB/OOB), while the NEW handles work.
+    var scope_b = try vm.openRootScope(1, 1);
+    const hv_b = scope_b.protectValueAssumeCapacity(.{ .Table = t_b });
+    const hc_b = scope_b.protectCellAssumeCapacity(cell_b);
+    try testing.expectEqual(hv_a.index, hv_b.index); // value slot reused
+    try testing.expectEqual(hc_a.index, hc_b.index); // cell slot reused
+    try testing.expect(hv_b.isValid());
+    try testing.expect(hc_b.isValid());
+    try testing.expect(!hv_a.isValid()); // stale: old token, new slot
+    try testing.expect(!hc_a.isValid());
+
+    if (@import("builtin").mode == .ReleaseFast) {
+        // ReleaseFast defensive contract, exercised for real: a stale
+        // ValueRoot.read degrades to nil (never the foreign payload),
+        // stale replaces are no-ops (scope B's payloads untouched). A
+        // stale CellRoot.read has no safe default and panics
+        // deterministically — established by design + isValid, not
+        // triggered here.
+        try testing.expect(std.meta.eql(hv_a.read(), .Nil));
+        hv_a.replace(.{ .Table = t_stale });
+        hc_a.replace(cell_a);
+        try testing.expect(hv_b.read().Table == t_b); // untouched
+        try testing.expect(hc_b.read() == cell_b); // untouched
+    }
+
+    // Both modes: the NEW handles read exactly what they published.
+    try testing.expect(hv_b.read().Table == t_b);
+    try testing.expect(hc_b.read() == cell_b);
+
+    scope_b.close();
+    try testing.expectEqual(@as(usize, 0), vm.gc_root_values.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.gc_root_cells.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.gc_root_depth);
 }
 
 test "A1.0 roots 3: openRootScope reserve failure leaves root state byte-exact" {
@@ -59163,10 +60254,14 @@ test "A1.0 boundary 10: objects reachable only through each root kind survive cy
     const garbage = try vm.allocTableEphemeral();
 
     // REAL minor cycle: the rooted pair survives, the control is swept.
+    // (A1.0c proof 5: the cycle sees the payload THROUGH the slot —
+    // slot.value/slot.cell — and the handles still validate afterwards.)
     try vm.gcMinorCollection();
     try testing.expect(p50StillRegistered(&vm, .{ .table = t }));
     try testing.expect(p50StillRegistered(&vm, .{ .cell = cell }));
     try testing.expect(!p50StillRegistered(&vm, .{ .table = garbage }));
+    try testing.expect(vr.isValid());
+    try testing.expect(cr.isValid());
     try testing.expect(vr.read().Table == t);
     try testing.expect(cr.read() == cell);
 
@@ -59174,10 +60269,15 @@ test "A1.0 boundary 10: objects reachable only through each root kind survive cy
     try vm.gcFullCollectionForUser();
     try testing.expect(p50StillRegistered(&vm, .{ .table = t }));
     try testing.expect(p50StillRegistered(&vm, .{ .cell = cell }));
+    try testing.expect(vr.isValid());
+    try testing.expect(cr.isValid());
 
     // Close: both payloads become unreachable — the next full cycle
-    // collects them (the root was the ONLY reference).
+    // collects them (the root was the ONLY reference) — and the
+    // handles are invalid from the truncation alone.
     scope.close();
+    try testing.expect(!vr.isValid());
+    try testing.expect(!cr.isValid());
     try vm.gcFullCollectionForUser();
     try testing.expect(!p50StillRegistered(&vm, .{ .table = t }));
     try testing.expect(!p50StillRegistered(&vm, .{ .cell = cell }));

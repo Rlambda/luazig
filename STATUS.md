@@ -87,10 +87,18 @@ Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependen
   `gc_root_values`/`gc_root_cells` (vm.zig:4628/4637), `infraAlloc`
   документирован NoGC-fallible/not-Lua-accounted) полностью заменил
   `TempRoots`/`gcTempRoots` — нулевые ссылки в `src/` (grep
-  `TempRoots|gcTempRoots|gc_temp` = 0): 36 production call sites vm.zig
-  (43 scope opens: builtinRequire/opCall double-scope sites) + 97 test sites
-  vm.zig + 8 test sites c_api.zig мигрированы; hot NoGC fast paths не открывают
-  scope. Обе реальные `_setjmp` boundary — `callCFunctionWithBoundary`
+  `TempRoots|gcTempRoots|gc_temp` = 0). Миграция (инвентарь уточнён
+  A1.0-correction; воспроизводимо на measured source C bb98184):
+  production-открытия — 34 реальных вызова, все в методах Vm (self-форма;
+  `git show bb98184:src/lua/vm.zig | grep -c 'self\.openRootScope('` → 35
+  строк, из которых 1 — doc-comment-пример API; двойные scope-открытия у
+  builtinRequire/opCall/execTestcCommand — 31 дистинктный сайт) и 0 в
+  c_api.zig (`git show bb98184:src/lua/c_api.zig | grep -c
+  'self\.openRootScope('` → 0; все 8 открытий там test-bound); test-открытия
+  — 97 в test-блоках vm.zig + 7 в test-only helper'ах vm.zig (a10*
+  C-callbacks, r15b2EdgeIteration) + 8 в test-блоках c_api.zig; hot NoGC
+  fast paths не открывают scope. Обе реальные `_setjmp` boundary —
+  `callCFunctionWithBoundary`
   (vm.zig:44528) и protected debug-hook boundary (vm.zig:34919) — переведены на
   единый `ProtectedBoundary` контракт (vm.zig:44465: `protect`[mark+prev
   boundary] → `enter`[inline, setjmp в кадре владельца] → `finish`[comptime-
@@ -172,13 +180,26 @@ Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependen
   Нужен persistent separated-set (или эквивалент) с differential-доказательством
   carry-over/rescue-семантики против PUC. Open-count 23→24.
 
-- [ ] **P16.50 table_alloc_setmetatable perf WARN (HIGH)**: canonical
+- [x] **P16.50 table_alloc_setmetatable perf WARN (HIGH)**: canonical
   review-14 gate имеет matched center +4.0305% и seeds 9/10/15 выше +5%.
   Причина пока НЕ установлена: опубликованная markmt-декомпозиция опровергнута
   symbol audit. После correctness correction нужен isolated interleaved A/B
   по causal instructions; закрытие — финальный paired-seed OK либо отдельное
   owner-approved baseline decision с доказанной причинностью. Baseline сейчас
   не менять. Open-count 24→25.
+
+  ЗАКРЫТО по собственному критерию объявленной сессией фазы A1.0 (2026-09-20,
+  подтверждено A1.0-correction): финальный paired-seed OK достигнут —
+  canonical clean-C сессия A1.0 (manifest row #33 / `tools/perf/current-gate.json`,
+  seeds 1..21, RUNS=21, source_head = measured_source_head = A1.0 commit C
+  bb98184, source_dirty = clean) дала RESULT OK, 18/18 workloads OK; бывшие
+  WARN-seeds 9/10/15 → +3.503/+4.640/+4.178%, все < WARN 5%; matched center
+  table_alloc_setmetatable (mono/mono) +3.422%; wall-P25 envelope max +5.33%
+  < 10%. Текущее состояние НЕ является активным WARN; объявленная paired-seed
+  сессия A1.0-correction на скорректированном source (identity slots)
+  подтвердила GREEN — вердикт в Perf-блоке коррекции (фазовая запись A1.0
+  ниже). Baseline не обновлялся: baseline-approved.json /
+  baseline-p15.37.json / core_baseline.json byte-identical до/после сессии.
 
 - [x] **P16.50-review-14 correction (CLOSED by review-14)**: сохранить общий metatable
   prepare→store→infallible-commit review-13, но завершить PUC lifecycle.
@@ -8584,9 +8605,15 @@ source_head сессии = C, source_dirty = clean; вердикт сессии 
   Вводящий в заблуждение комментарий в шапке vm.zig (будто `_longjmp` обходит
   только frame `lua_error`) заменён на точную модель: прыжок обходит
   произвольные Zig defers между callback/API и landing pad.
-- **Миграция и delete list**: 36 production call sites vm.zig (43 scope
-  opens — `builtinRequire`/`opCall` открывают по два scope) + 97 test sites
-  vm.zig + 8 test sites c_api.zig переведены на новый API (c_api.zig
+- **Миграция и delete list** (инвентарь уточнён A1.0-correction; воспроизводимо
+  на measured source C bb98184): production-открытия — 34 реальных вызова в
+  vm.zig, все в методах Vm (self-форма; `git show bb98184:src/lua/vm.zig |
+  grep -c 'self\.openRootScope('` → 35 строк, 1 из которых — doc-comment-пример
+  API; двойные scope-открытия у builtinRequire/opCall/execTestcCommand — 31
+  дистинктный сайт) и 0 в c_api.zig (`git show bb98184:src/lua/c_api.zig |
+  grep -c 'self\.openRootScope('` → 0 — все 8 открытий там test-bound);
+  test-открытия — 97 в test-блоках vm.zig + 7 в test-only helper'ах vm.zig
+  (a10* C-callbacks, r15b2EdgeIteration) + 8 в test-блоках c_api.zig (c_api.zig
   production-surface пуст — только миграция тестовых сайтов и переформулировка
   одного комментария). Старый механизм удалён целиком: `TempRoots`/
   `gcTempRoots` struct+methods, VM-поля, stats-counter
@@ -8662,6 +8689,91 @@ source_head сессии = C, source_dirty = clean; вердикт сессии 
   (A1.next)** перед intrusive allgc cut, НЕ локальные симптомы review-15
   (discarded-result/tail-call `coroutine.wrap`, `c_active_closure`,
   emergency-rescue — acceptance cases последующих milestones по roadmap A1).
+
+#### A1.0-correction (RootHandle identity и реальные boundary proofs), 2026-09-20
+
+Correction к фазе A1.0 (owner prompt.md; режим correction, без нового
+checkbox): собственный контракт фазы был реализован/доказан не полностью —
+dead `scope_token` не защищал handle, тест 8 не создавал настоящую nested
+boundary, shared debug-hook boundary не имела focused proof, Debug assert
+проверялся копией predicate. Коммиты: C = measured source (RF binary
+sha256 — в сообщении C; plain `zig build -Doptimize=ReleaseFast`,
+wipe-free) → D = wrapper (canonical current-* перегенерирование на clean C
++ объявленная clean-C paired-seed сессия; вердикт — в Perf-блоке коррекции
+ниже).
+
+- **Identity slots + validated accessors (§1)**: `ValueRootSlot{value,
+  owner_token}` / `CellRootSlot{cell, owner_token}` (vm.zig:8846/8853) —
+  `protect*AssumeCapacity` публикует payload+token одним infallible append;
+  `ValueRoot.isValid`/`CellRoot.isValid` (vm.zig:8879/8929) — pub-
+  discriminator index+token (тот же predicate, что проверяют read/replace);
+  `read`/`replace` валидируют identity до доступа: Debug — comptime-gated
+  assert на точной ошибочной операции (не bare assert: в ReleaseFast
+  `std.debug.assert` понижается до `unreachable`, и доказуемо-ложный assert
+  позволил бы оптимизатору удалить defensive-ветку — finding-of-phase A1.0),
+  ReleaseFast defensive: stale ValueRoot read → `.Nil`, replace → no-op;
+  stale CellRoot read → deterministic `@panic` (у cell-указателя нет
+  безопасного payload-умолчания — возврат чужого слота был бы именно тем
+  silent foreign read, ради которого существует token), replace → no-op.
+  GC маркирует payload слота (`slot.value`/`slot.cell`), не слот.
+  Focused proofs: расширенный roots-2 + новый roots-2b (vm.zig:59658 —
+  invalidation по close/restoreRoots, slot-reuse rejection для обоих видов,
+  stale RF-пути read/replace). Negative-before на старой репрезентации:
+  stale `replace` наблюдаемо портил payload нового scope по повторно
+  использованному index; полный suite был зелёным С багом — существующие
+  тесты дефект не ловили (обоснование identity-контракта).
+- **Настоящие nested boundaries (§2, тесты 8b/8c)**: 8b (vm.zig:58413) —
+  host → pcallk(outerCb) → boundary A → outer roots → pcallk(innerCf) →
+  boundary B → inner roots + payload publish → lua_error: landing B
+  сбрасывает ТОЛЬКО inner roots и восстанавливает `c_error_jmp` на пад A
+  (channel-asserted), outer handles/identity живы, последующий outer
+  lua_error действительно попадает в boundary A. 8c (vm.zig:58500) —
+  nested yield chain: продолжение finishCcall → finishpcallk (vm.zig:13360)
+  соответствует PUC ldo.c:804-871 (k-return, закрытие yieldable pcall на
+  уровне callee).
+- **Hook boundary proofs (§3, тесты 11/12)**: настоящий dispatch
+  LUA_MASKCOUNT (mask 8, count 1) через production-пад
+  `debugDispatchHookTransfer` (protected debug-hook boundary vm.zig:34919),
+  не прямой вызов helper'а. 11 (vm.zig:58691) — hook открывает Value+Cell
+  RootScope и вызывает lua_error: landing (`land()`, не finish) сбрасывает
+  hook roots относительно mark, host roots/payload identity сохранены,
+  `sync_hook_frame_idx` очищен (vm.zig:58745), VM пригодна для повторного
+  hook/API вызова + настоящего GC. 12 (vm.zig:58788) — PUC-valid hook-yield
+  (ldo.c:1021-1024: nresults=0, k=NULL — yield из count-hook в кадре
+  caller'а); PUC-invalid формы (yield с continuation/ненулевыми results из
+  hook event) дизъюнктивно опровергнуты (t1-t5) — семантика ради теста не
+  ослаблялась. Negative-befores RED: без `land()` растут длины root vectors
+  / ломается outer identity.
+- **Subprocess assert proof (§4, тест 13; vm.zig:58993)**: Debug-child
+  вызывает настоящий `a10LeakScopeCf` через production boundary
+  `callCFunctionWithBoundary` и завершается SIGABRT ровно на exact-equality
+  assert `finish()` (vm.zig:44615) — реальный путь, не копия predicate;
+  control-child (закрытый scope) exit 0; ReleaseFast — отдельный
+  positive-proof defensive `restoreRoots`. Per-pid /tmp-пути
+  (`a10c_s4_child_{pid}.zig`) — нет коллизии параллельных Debug/RF suites
+  (урок R5). In-stage finding (найден, исправлен, задокументирован в коде):
+  порядок `-O` ПЕРЕД каждым `-M` — per-module CLI-настройки относятся к
+  следующему `-M` и сбрасываются после него; завершающий `-O` не относится
+  ни к одному модулю и молча собирает all-Debug child.
+- **Независимый S3-обзор**: чист — одна non-defect observation записана:
+  pre-existing ungated asserts в `close()`/`restoreRoots` (protects-then-UB
+  класс; удаляемого defensive-кода там нет — класс уже покрыт аудитом 99
+  assert'ов A1.0), маршрутизирована в backlog A1.next. Батарея 13/13 GREEN:
+  unit 332/332 Debug+ReleaseFast последовательно, 0 leaks; direct test
+  binary 332/332 rc=0; matrix --testc 31/32 (zig_fail=0, big.lua both_fail
+  pre-existing); smoke 84/84; api580 GREEN — GC-object layouts неизменны
+  (root-slot metadata живёт в VM-векторах, не в GC-объектах); interleaved
+  probes: worst systematic +0.100% (стоимость §1 owner_token на
+  coroutine_yield).
+- **§5 (STATUS truth)**: открытый пункт «P16.50 table_alloc_setmetatable
+  perf WARN (HIGH)» закрыт объявленной сессией фазы A1.0 (manifest row #33 /
+  `tools/perf/current-gate.json`: RESULT OK 18/18; бывшие WARN-seeds 9/10/15
+  → +3.503/+4.640/+4.178% < 5%) — собственный критерий пункта («финальный
+  paired-seed OK») исполнен той сессией; текущее состояние активным WARN не
+  называется; baseline не обновлялся (byte-identical). Формулировка
+  «132 migrated call-sites» заменена воспроизводимым инвентарём (см.
+  «Миграция и delete list» выше). Open-count 25→24.
+
 
 ### P16.50-review-15: PUC callable ownership (2026-09-19)
 

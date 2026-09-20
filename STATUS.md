@@ -36,11 +36,11 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests (`tests/smoke/*.lua`) | **84/84** pass |
 | C API suites (`tests/c_api`) | 23 suites |
-| Performance (geomean vs PUC) | **1.41x** |
+| Performance (geomean vs PUC) | **1.44x** |
 | Perf gate (paired-seed) | **OK** — 21 published seeds (1..21) |
-| api580 fixed-load footprint | **GREEN** — anchored gate 384 B < 400 B; no-XY diagnostic 436 B; Measured on the ReleaseFast binary `2afba94f9e25ac34`; the ledger's top-level provenance is the Debug binary `39fcfae5cf214af6` (dual-mode ledger, not one single-RF-binary artifact). |
+| api580 fixed-load footprint | **GREEN** — anchored gate 384 B < 400 B; no-XY diagnostic 436 B; Measured on the ReleaseFast binary `42de853aa3e35029`; the ledger's top-level provenance is the Debug binary `788377ee8ee1ff1c` (dual-mode ledger, not one single-RF-binary artifact). |
 
-Geomean замедления vs PUC Lua: **1.41x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
+Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependent). Подробная таблица workload'ов — в generated status-блоке [README.md](README.md).
 <!-- END GENERATED SUMMARY -->
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
@@ -8773,6 +8773,26 @@ wipe-free) → D = wrapper (canonical current-* перегенерировани
   называется; baseline не обновлялся (byte-identical). Формулировка
   «132 migrated call-sites» заменена воспроизводимым инвентарём (см.
   «Миграция и delete list» выше). Open-count 25→24.
+- **§5 verdict (объявленная clean-C сессия коррекции, artifact wrapper D)**:
+  manifest row #34 / `tools/perf/current-gate.json` — source_head = C
+  7f742a0, measured_source_head = C, source_dirty = clean, RF binary
+  sha256 42de853a… (S): **RESULT OK 18/18**, все per-seed deltas < 5%
+  (coroutine_yield +0.7..+2.8%, table_alloc_setmetatable +2.4..+4.6% vs
+  baseline — центр бывшего WARN-workload ниже порога). Стоимость самой
+  коррекции (mode_centers row #33→#34, A1.0 → correction): coroutine_yield
+  +0.120% (§1 owner_token — совпадает с S3-пробой ≈+0.1%),
+  table_alloc_setmetatable −0.075%, остальные workload'ы flat —
+  систематической регрессии нет. Baseline не обновлялся (byte-identical:
+  baseline-approved.json 22dad91d…, baseline-p15.37.json 2067a13b…,
+  core_baseline.json b7a46a16…). Артефакты D: codesize — .text
+  2649593→2651513 (+1920 B), runBytecodeDispatch 77104→77184 (+80 B),
+  остальные 4 hotspot-символа неизменны; callframe-layout — Vm 5496 B RF /
+  5600 B DBG, GC-object layouts неизменны (Closure 40 B, Cell 40 B,
+  CallFrame 88 B); in-flight finding: A1.0-артефакт ошибочно записал
+  «Vm 5600 RF, RF/DBG equal» — mis-built RF probe (свежий RF rebuild на
+  source A1.0 bb98184/b763770 печатает те же 5496), исправлен этой
+  регенерацией; differential-profile — top-символы стабильны
+  (runBytecodeDispatch доминирует, coroutine-цепочка прежнего профиля).
 
 
 ### P16.50-review-15: PUC callable ownership (2026-09-19)

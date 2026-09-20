@@ -1,20 +1,20 @@
 {
- "created_utc": "2026-09-19T22:28:20.775646+00:00",
+ "created_utc": "2026-09-20T00:36:16.952320+00:00",
  "provenance": {
-  "git_head": "bb98184ce58099f83ef93c3df7c9a082bf1bb8d1",
-  "measured_source_head": "bb98184ce58099f83ef93c3df7c9a082bf1bb8d1",
+  "git_head": "7f742a061939bbd0dd378b9d1bbe6bdae641d12e",
+  "measured_source_head": "7f742a061939bbd0dd378b9d1bbe6bdae641d12e",
   "source_dirty": "clean",
   "zig_version": "0.16.0",
-  "probe_rf_path": "/tmp/opencode/a10a/layout_probe.zig (-O ReleaseFast)",
-  "probe_debug_path": "/tmp/opencode/a10a/layout_probe.zig (-O Debug)",
-  "probe_rf_sha256_16": "8cafc9362045fced",
-  "probe_debug_sha256_16": "7230041dae137dcf",
-  "zig_binary_sha256": "2afba94f9e25ac34121b4305c8b5268a868096f0c66d91ba788e7965e90d6283",
-  "note": "A1.0 C regeneration from clean measured-source commit bb98184; probe binaries freshly built from the same tree in both modes, outputs embedded verbatim; Vm re-measured (A1.0 replaced the TempRoots fields with the unified RootScope state: gc_root_values/gc_root_cells vectors + gc_root_depth/gc_root_seq/gc_root_top \u2014 Vm 5472->5600 RF, 5576->5600 DBG, RF/DBG now equal); GC-object layouts unchanged (Closure 40 B, Cell 40 B, CallFrame 88 B \u2014 RootScope adds no GC-object fields)."
+  "probe_rf_path": "/tmp/opencode/a10c_layout_probe.zig (-O ReleaseFast)",
+  "probe_debug_path": "/tmp/opencode/a10c_layout_probe.zig (-O Debug)",
+  "probe_rf_sha256_16": "111a23fca5e10a20",
+  "probe_debug_sha256_16": "a8b931441fdcc5a2",
+  "zig_binary_sha256": "42de853aa3e350293e0d4597e64253792619036a4ff28befa7f20ae3586cb65f",
+  "note": "A1.0-correction C regeneration from clean measured-source commit 7f742a0; probe binaries freshly built from the same tree in both modes, outputs embedded verbatim. The RootHandle identity correction does NOT change Vm: the identity-carrying ValueRootSlot/CellRootSlot element types live in the heap-allocated root vectors, and ArrayListUnmanaged's in-struct footprint is mode- and element-independent. Vm 5496 B RF / 5600 B DBG \u2014 same at the A1.0 source (fresh RF probe rebuild at bb98184/b763770 prints the same 5496): the previous artifact's 'Vm 5600 RF, RF/DBG equal' was a mis-built RF probe binary, corrected here. GC-object layouts unchanged (Closure 40 B, Cell 40 B, CallFrame 88 B \u2014 identity slots add no GC-object fields)."
  },
  "layout": {
   "ReleaseFast": {
-   "Vm": 5600,
+   "Vm": 5496,
    "Thread": 3736,
    "CallFrame": 88,
    "LuaFrameState": 48,

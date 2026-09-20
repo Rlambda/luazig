@@ -678,6 +678,67 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   невозможен, использовать non-dereferencing address registry, а не читать
   header через подозрительный pointer.
 
+- [ ] **Safety: constructor→push OOM UAF-окна (W1; A1.1R3 M1, CONFIRMED dyn)**:
+  зарегистрированный-но-неопубликованный GC-объект живёт во время fallible
+  `c_stack` append (representative: api.zig:941 append после internStr:940; класс:
+  newtable:522, newuserdatauv:1023, pushexternalString:1009, load appends c_api
+  869/1211, group C/D/E). Emergency GC внутри append сметает объект, retry
+  публикует dangling. Динамически подтверждено (A1.1R3 SA4-P5a): pushlstring с
+  mem_limit на append успешно пушит сметённую строку; контент слота мутирует
+  A→B через reuse блока. PUC-иммунитет: lapi.c:543/792/1353 (construction →
+  api_incr_top, аллокаций между нет). Архитектурный фикс — A1.1 unified stack
+  reserve-before-create + infallible publish на всех constructor→push путях.
+
+- [ ] **Safety: internStrAll put-after-registration UAF (A1.1R3 M2, CONFIRMED
+  dyn, BLOCKER-grade)**: vm.zig:22301 `try long_string_cache.put` после commit
+  internStr (22154) — emergency GC на росте кэша сметает свежую long-строку,
+  retry публикует освобождённый указатель в GC-root `long_string_cache`.
+  Динамически подтверждено (SA4-P5b): load+pcall возвращают сметённый
+  long-констант; GC + `lua_close` — SEGFAULT. PUC: luaS_createlngstrobj один
+  проход, post-commit publication-шага нет. Фикс — A1.1: counted capacity
+  reserve кэша ДО создания строки + `putAssumeCapacity` (не counted→infraAlloc).
+
+- [ ] **Safety: api.State.thread_stacks не является GC-root (A1.1R3 M3,
+  CONFIRMED dyn, оба ребра)**: каждое значение, живущее только в
+  `thread_stacks[th]` (api.zig:81), сметается любым GC (getOrPut:1326 из
+  resume:547/apiStackFor:533, put:527 newthread, post-resume 571/575, xmove
+  temps 541-542). Динамически подтверждено (SA4-P4): (a) only-in-Zig-stack
+  значение сметается и возвращается xmove'ом; (b) stale map entry переживает
+  GC и алиасит новый Thread по тому же адресу (детерминированный reuse) —
+  dangling items[0]. PUC: один L->stack на lua_State, wholesale traversethread.
+  Фикс — A1.1 draft decision #1: thread_stacks и per-handle c_stack исчезают.
+
+- [ ] **Safety: Thread.entry_args — stale unread copy с UAF-capable читателями
+  (A1.1R3 M4, CONFIRMED dyn)**: поле (vm.zig:2441) unmarked, пишется после
+  blacken, переживает yields, может остаться единственной живой копией;
+  читатели 14236/14371/25698 читают stale после GC. Динамически подтверждено
+  (SA4-P1): only-ref shape — после GC указатель unregistered, thread resumable;
+  ordinary shapes выживают через resume_inbox/live-reg keepers. PUC-расхождения
+  нет (аргументы корутины в PUC живут в слотах L->stack). Фикс — A1.1: поле
+  удаляется unified-моделью; 3 read-сайта обязаны читать реальные stack-окна.
+
+- [ ] **Safety: lua_copy pseudo-upvalue write — нет GC barrier + lost write для
+  open cells (A1.1R3 M5, CONFIRMED dyn)**: c_api.zig:1387-1399 plain `.value =`
+  store без barrier (PUC lapi.c:253-263 применяет luaC_barrier); для open cells
+  запись попадает не туда — `cell.set` (vm.zig:800) пишет stack slot, значение
+  теряется. Динамически подтверждено (SA4-P3): old C closure + young table через
+  upvalue pseudo-index — minor GC сметает значение; контроль lua_setupvalue
+  выживает. Фикс — A1.1: маршрут через OP_SETUPVAL-эквивалент (gcStoreCellValue
+  28473) — общий write-barrier path, чинящий оба дефекта; тот же путь —
+  setiuservalue (M28, UNCONFIRMED, свой decisive corner до заявления fixed).
+
+- [ ] **Safety: lua_newthread post-commit окна, C и Zig (A1.1R3 M6, CONFIRMED
+  static; класс dyn-подтверждён в M1)**: C — c_api.zig:227 `try allocStateHandle`
+  и 231 parent append после gcRegisterCommit (215); errdefer rollback 218-221
+  трогает возможно-swept объекты; `c_api_thread` не GC-root. Zig-зеркало —
+  api.zig:527 put + 528 append (double window). PUC: lstate.c:273 luaE_extendCI
+  (всё fallible) ДО allgc-link; push = in-stack store. Фикс — A1.1: всё fallible
+  до GC registration/publication; новый Thread публикуется на parent stack;
+  отдельный `c_api_thread` root не вводится.
+
+  (Зарегистрировано фазой A1.1R3 research-correction; подробности и master-ID —
+  в report.md A1.1R3. Open-count 24→30: +6 подтверждённых HIGH, закрытий нет.)
+
 - [x] **P16.50-review-8 correction (CLOSED by review-8)**: завершить C-API
   upvalue/GC контракт (транзакционные barriers, корректный incremental barrier
   для joined Cell, стабильное время жизни имени); устранить UAF после

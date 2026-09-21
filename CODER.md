@@ -62,6 +62,23 @@ Implementation-итерация закрывает минимум один пу�
 документов не обязаны закрывать пункт. Новые findings нельзя скрывать ради
 уменьшения open-count.
 
+## Правила комментирования кода
+
+-  Не оставляй комментарии вместо удалённого кода.
+-  При комментировании кода не нужно оставлять в комментариях ссылки на этапы и секции,
+   например, вместо:
+```
+    // A1.1 Stage 3: a base-only frame stack is "no frames" here (the
+    // base frame is not parked execution state) — a fresh coroutine
+    // still needs the bytecode-body callee check below.
+```
+   комментируй так:
+```
+    // A base-only frame stack is "no frames" here (the
+    // base frame is not parked execution state) — a fresh coroutine
+    // still needs the bytecode-body callee check below.
+
+
 ## Делегирование сабагентам
 
 Глубокое product-исследование, реализация и независимая тяжёлая проверка

@@ -678,9 +678,10 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   невозможен, использовать non-dereferencing address registry, а не читать
   header через подозрительный pointer.
 
-- [ ] **Safety: constructor→push OOM UAF-окна (W1; A1.1R3 M1, CONFIRMED dyn)**:
-  зарегистрированный-но-неопубликованный GC-объект живёт во время fallible
-  `c_stack` append (representative: api.zig:941 append после internStr:940; класс:
+- [ ] **Safety: constructor→push OOM UAF-окна (W1; A1.1R3 M1, R4-severity
+  BLOCKER, CONFIRMED dyn)**: first invalid op — construction/registration
+  GC-объекта до reserve destination capacity (representative: api.zig:940
+  internStr → 941 `try stack.append`; класс:
   newtable:522, newuserdatauv:1023, pushexternalString:1009, load appends c_api
   869/1211, group C/D/E). Emergency GC внутри append сметает объект, retry
   публикует dangling. Динамически подтверждено (A1.1R3 SA4-P5a): pushlstring с
@@ -689,9 +690,10 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   api_incr_top, аллокаций между нет). Архитектурный фикс — A1.1 unified stack
   reserve-before-create + infallible publish на всех constructor→push путях.
 
-- [ ] **Safety: internStrAll put-after-registration UAF (A1.1R3 M2, CONFIRMED
-  dyn, BLOCKER-grade)**: vm.zig:22301 `try long_string_cache.put` после commit
-  internStr (22154) — emergency GC на росте кэша сметает свежую long-строку,
+- [ ] **Safety: internStrAll put-after-registration UAF (A1.1R3 M2, R4-severity
+  BLOCKER, CONFIRMED dyn)**: first invalid op — commit unrooted long string до
+  prepared cache capacity: vm.zig:22154 commit internStr → 22301 `try
+  long_string_cache.put`; emergency GC на росте кэша сметает свежую long-строку,
   retry публикует освобождённый указатель в GC-root `long_string_cache`.
   Динамически подтверждено (SA4-P5b): load+pcall возвращают сметённый
   long-констант; GC + `lua_close` — SEGFAULT. PUC: luaS_createlngstrobj один
@@ -699,7 +701,8 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   reserve кэша ДО создания строки + `putAssumeCapacity` (не counted→infraAlloc).
 
 - [ ] **Safety: api.State.thread_stacks не является GC-root (A1.1R3 M3,
-  CONFIRMED dyn, оба ребра)**: каждое значение, живущее только в
+  R4-severity BLOCKER, CONFIRMED dyn, оба ребра)**: first invalid op — публикация
+  unrooted Values в не-GC-root map; каждое значение, живущее только в
   `thread_stacks[th]` (api.zig:81), сметается любым GC (getOrPut:1326 из
   resume:547/apiStackFor:533, put:527 newthread, post-resume 571/575, xmove
   temps 541-542). Динамически подтверждено (SA4-P4): (a) only-in-Zig-stack
@@ -709,7 +712,8 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   Фикс — A1.1 draft decision #1: thread_stacks и per-handle c_stack исчезают.
 
 - [ ] **Safety: Thread.entry_args — stale unread copy с UAF-capable читателями
-  (A1.1R3 M4, CONFIRMED dyn)**: поле (vm.zig:2441) unmarked, пишется после
+  (A1.1R3 M4, R4-severity HIGH, CONFIRMED dyn)**: first invalid op — публикация
+  unmarked persistent copy без root coverage; поле (vm.zig:2441) unmarked, пишется после
   blacken, переживает yields, может остаться единственной живой копией;
   читатели 14236/14371/25698 читают stale после GC. Динамически подтверждено
   (SA4-P1): only-ref shape — после GC указатель unregistered, thread resumable;
@@ -717,27 +721,41 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   нет (аргументы корутины в PUC живут в слотах L->stack). Фикс — A1.1: поле
   удаляется unified-моделью; 3 read-сайта обязаны читать реальные stack-окна.
 
-- [ ] **Safety: lua_copy pseudo-upvalue write — нет GC barrier + lost write для
-  open cells (A1.1R3 M5, CONFIRMED dyn)**: c_api.zig:1387-1399 plain `.value =`
-  store без barrier (PUC lapi.c:253-263 применяет luaC_barrier); для open cells
-  запись попадает не туда — `cell.set` (vm.zig:800) пишет stack slot, значение
-  теряется. Динамически подтверждено (SA4-P3): old C closure + young table через
-  upvalue pseudo-index — minor GC сметает значение; контроль lua_setupvalue
-  выживает. Фикс — A1.1: маршрут через OP_SETUPVAL-эквивалент (gcStoreCellValue
-  28473) — общий write-barrier path, чинящий оба дефекта; тот же путь —
-  setiuservalue (M28, UNCONFIRMED, свой decisive corner до заявления fixed).
+- [ ] **Safety: lua_copy pseudo-upvalue write — отсутствует GC write barrier
+  (A1.1R3 M5 + R4-correction, R4-severity BLOCKER, CONFIRMED dyn; ЕДИНСТВЕННЫЙ
+  дефект)**: c_api.zig:1387-1399 plain `.value =` store в upvalue Cell без
+  write barrier. PUC-механизм (lapi.c:253-263): inline store в C-closure
+  upvalue + `luaC_barrier(L, clCvalue(L->ci->func.p), fr)` — НЕ OP_SETUPVAL-семантика.
+  R4 снял прежний второй «дефект» (lost write для open cells): pseudo-upvalue
+  канал `c_active_closure` устанавливается только для C-closure (vm.zig:44163-44177),
+  canonical `allocCclosure` создаёт собственные закрытые Cell `bc_stack_closed`
+  (739-768, 9512-9563) — open Cell через production `lua_copy` недостижим.
+  Динамически подтверждено (SA4-P3): old C closure + young table через
+  upvalue pseudo-index — gen minor GC сметает значение при живом dangling
+  upvalue; контроль lua_setupvalue выживает. Фикс — A1.1: barriered store;
+  текущая C-closure из frame `func_slot` (без VM-global side channel);
+  `gcStoreCellValue` (28473) — рекомендуемый Zig helper закрытой C-upvalue
+  representation; тот же barrier-путь — setiuservalue (M28, UNCONFIRMED, свой
+  decisive corner до заявления fixed).
 
-- [ ] **Safety: lua_newthread post-commit окна, C и Zig (A1.1R3 M6, CONFIRMED
-  static; класс dyn-подтверждён в M1)**: C — c_api.zig:227 `try allocStateHandle`
-  и 231 parent append после gcRegisterCommit (215); errdefer rollback 218-221
-  трогает возможно-swept объекты; `c_api_thread` не GC-root. Zig-зеркало —
-  api.zig:527 put + 528 append (double window). PUC: lstate.c:273 luaE_extendCI
-  (всё fallible) ДО allgc-link; push = in-stack store. Фикс — A1.1: всё fallible
-  до GC registration/publication; новый Thread публикуется на parent stack;
-  отдельный `c_api_thread` root не вводится.
+- [ ] **Safety: lua_newthread — registration/publication до root и до конца
+  fallible prepare, C и Zig (A1.1R3 M6 + R4-correction, R4-severity HIGH,
+  CONFIRMED static; класс dyn-подтверждён в M1)**: first invalid op — C:
+  c_api.zig:215 gcRegisterCommit → 227 `try allocStateHandle` → 231 parent
+  append (errdefer rollback 218-221 трогает возможно-swept объекты;
+  `c_api_thread` не GC-root); Zig-зеркало — api.zig:525-528 (registered Thread
+  возвращается до fallible `put`+`append`). PUC-механизм (lstate.c:273-295,
+  R4-исправление): create+link → НЕМЕДЛЕННАЯ allocation-free публикация на
+  parent stack (280-284) → fallible `stack_init` уже ПОСЛЕ укоренения (294).
+  Фикс — A1.1: reserve/prepare → registration + немедленная infallible
+  parent-stack publication; отдельный `c_api_thread` root не вводится.
 
-  (Зарегистрировано фазой A1.1R3 research-correction; подробности и master-ID —
-  в report.md A1.1R3. Open-count 24→30: +6 подтверждённых HIGH, закрытий нет.)
+  (Зарегистрировано фазой A1.1R3 research-correction; severity/first-op/prose
+  нормализованы фазой A1.1R4 correction по вердикту ревью — подробности и
+  master-ID в report.md A1.1R4. Open-count: 24→30 (A1.1R3, +6), 30→30 (A1.1R4:
+  M1/M2/M3/M5 → BLOCKER, M4/M6 → HIGH явно; M14 dangling опровергнут decisive
+  probe'ом — keeper = regs suspended-фрейма в окне live_reg_top[pc]; новых
+  пунктов и закрытий нет.)
 
 - [x] **P16.50-review-8 correction (CLOSED by review-8)**: завершить C-API
   upvalue/GC контракт (транзакционные barriers, корректный incremental barrier

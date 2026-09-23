@@ -836,7 +836,17 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   выполняет closer только при `coroutine.close` (`false, 1`). Нужен PUC-faithful
   error/unwind lifecycle без test-specific guard и differential-тест обоих
   моментов наблюдения. Это независимый pre-existing BLOCKER, найденный review-7;
-  исправлять после correction, не терять как prose-residual.
+  исправлять после correction, не терять как prose-residual. A1.1R4 M32 — ещё
+  один симптом того же first-invalid-op (преждевременный вызов closer):
+  `__close=coroutine.yield; error("boom")` даёт в PUC на первом resume
+  `false, "...boom"`, `dead`, а в luazig — `true, table, "...boom"`,
+  `suspended`. Независимый прямой контроль с `__close`-маркером: PUC вызывает
+  его только при `coroutine.close` после failed resume, luazig — во время
+  resume. PUC `ldo.c:closepaux` → `luaF_close(..., 0)` и
+  `lfunc.c:callclosemethod(yy=0)` → `luaD_callnoyield`: отложенный close при
+  `coroutine.close` non-yieldable; обычный close (`yy=1`) yieldable. Для
+  A1.1 transport/TBC migration это обязательный parity acceptance; сохранять
+  pending TBC, status и error object между resume и close.
 
 - [x] **P16.50-review correction (REOPENED→CLOSED by review-7)**: rollback ownership + C-closure upvalue semantics — (a) BLOCKER 1: opClosure count-prefix rollback неверен при смешанных дескрипторах (proxy/new instack/уже-boxed) — exact ownership worklist/bitmap, rollback только созданных этим вызовом Cells в reverse-порядке; закрыть post-commit окно (gcStoreCellValue после commit) — либо provably-infallible через preparation/order, либо полный rollback owner для Closure/tree/register/accounting/register-slot; dispatch-driven mixed-upvalue тест ([proxy, new instack] из реального bytecode; existing-boxed; провал на следующем Cell и на Closure alloc; post-commit barrier failure; byte-exact всё + minor collection + repeated + success); negative copy count-prefix rollback детерминированно ловится; (b) BLOCKER 2: lua_newthread errdefer НЕ работает (?*lua_State ≠ error union) — inner error-union transaction / явный cleanup helper, ABI-wrapper маппит в null ПОСЛЕ cleanup; preserve/restore прежний vm.c_api_thread; тест против реального экспортированного lua_newthread (fail на registry prepare / Thread alloc / handle alloc / parent stack growth; registries/stack/handle/counters/live-set + GC после); (c) BLOCKER 3: registerfuncs алиасит C-closure upvalues (общие Cell-объекты: setupvalue(f1) виден f2) — PUC luaL_setfuncs (lauxlib.c:965-978) копирует VALUES на стек + lua_pushcclosure (lapi.c:609+) свежий CClosure с inline slots; один канонический C-closure конструктор для pushcclosure+registerfuncs с per-closure Cells; убрать неверный LClosure rationale; differential-тест (upvalueid differs; setupvalue A не меняет B; сбор в обоих порядках без leaks; OOM на non-preinterned names + table-growth setfield); (d) error propagation: lua_pushcclosure/lua_pushcfunction/luaL_setfuncs/luaL_newlib catch {} — обследовать защищённый механизм (protected call/throw) и маршрутизировать ЛИБО зафиксировать архитектурный blocker (owner решает); (e) HIGH: testcChargeMemory коммитит total_bytes ДО нативных аллокаций — split check/reserve от accounting commit / точный rollback; тест с активным testc_ctrl + провалы registry reserve/Userdata/uservalues/payload; аудит всех testcChargeMemory-сайтов; (f) cleanup: устаревшие BLOCKED/KNOWN-leak комментарии в тестах, skip fail-индексов 2..4 в pushcclosure matrix, smoke provenance prose (84 файла, 85-й номер — один из 84).
 

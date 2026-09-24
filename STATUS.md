@@ -1042,6 +1042,19 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   TBC owner остаётся подтверждённым долгом (ARCHITECTURE_DEBT.md), не
   скрыт коррекцией.
 
+- [ ] **Safety BLOCKER (pre-existing, найден A1.next research): emergency-GC
+  во время вычисления аргументов вызова глобала зануляет живой слот**:
+  воспроизводимая форма (Debug+RF, /tmp/opencode/anext/t2.lua + бисекция
+  t5/t6): под реальной memory pressure вызов `pcall(...)` с табличным
+  аргументом даёт `attempt to call a nil value (global 'pcall')` при живом
+  глобале (PUC на том же чанке: `pcall result: true 1`). Отказ
+  таблицей/локальной closure — согласие; значит, падёт именно staging-слот
+  глобала при emergency collect в окне вычисления аргументов. Root-cause и
+  фикс — отдельная задача (кандидат: emergency full-window scan/mark пишет
+  в live окно ниже top); не входит в finalizer-milestone. Плюс мелкое
+  расхождение класса ошибки `string.rep` 1GiB (PUC "not enough memory" vs
+  luazig "result too large"). Open-count 24→25 (stale-slot пункт закрыт ревью до фазы; здесь +1).
+
 - [ ] **Parity HIGH (pre-existing, REDESIGN-констрейнт): yieldability
   pcall-recovery close (16118-ветка) расходится с PUC finishpcallk**:
   bytecode-lane pcall recovery (finishBytecodeProtectedFailure, close с

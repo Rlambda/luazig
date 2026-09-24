@@ -16,10 +16,21 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
    precise `live_reg_top`; stale-`gc_index` skip удалён. A1.1s1 C10
    poison/unmap oracle проверяет ordinary→emergency переход. Старый
    открытый Safety-пункт `STATUS.md` закрыт по этому evidence.
-2. **Persistent finalizer ownership — подтверждено, следующий GC milestone.** `gc_to_finalize`
-   не эквивалентен PUC `tobefnz`: rescued-объект после emergency GC
-   может навсегда потерять finalizer. Нужен persistent separated-set
-   с exactly-once execution. Открытый Parity-пункт в `STATUS.md`.
+2. **Persistent finalizer ownership — подтверждено differential-эвиденцией
+   (research A1.next), следующий GC milestone.** Корень: `gc_to_finalize`
+   не персистентен (`gcResetCycleState` чистит на старте цикла) +
+   ре-сепарация white-only/age-filtered + abort списка на не-RuntimeError.
+   Подтверждённые расхождения (PUC 5.5 oracle + ltests vs luazig, Debug+RF):
+   rescue-after-emergency теряет `__gc` (table/userdata; сильнейшая форма —
+   real ulimit на stock-бинарях, без адаптера); GCSTOP-окно теряет pending;
+   OOM в теле `__gc` обрывает остаток списка (PUC: warn+continue); обрыв +
+   retry даёт двойной `__gc`; gen minor-цикл теряет leftover pending.
+   Контроли без rescue/ordinary — байт-идентичное согласие (разрыв изолирован
+   в carry-over). Целевой дизайн: персистентная FIFO-очередь
+   `gc_to_finalize` (membership-driven, как PUC `tobefnz`) как bounded
+   intermediate; критерий удаления — замена на intrusive finalizer link при
+   миграции `allgc` (п.3). Открытый Parity-пункт в `STATUS.md`; полный
+   research-handoff — report.md фазы A1.next research.
 3. **Intrusive `allgc` lifetime authority — утверждённый end-state.**
    `gc_objects`/`gc_index` пока остаются dense lifetime registry. После
    persistent-finalizer milestone перейти к PUC-подобному intrusive `allgc` как

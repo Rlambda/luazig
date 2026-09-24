@@ -42,9 +42,9 @@
 ** UNWRAPPED (yy=0, no closeprotected), so a closer error escapes
 ** immediately and the remaining marks defer; luazig continues eagerly
 ** and the apiSettop call site swallows the error (pcall observes
-** success). (b) forced close of a coroutine suspended INSIDE a C call
-** with lua_toclose marks — luazig closes only the oldest mark (with a
-** nil error) and reports an error status even when no closer errors.
+** success). (The former exclusion (b) — forced close of a coroutine
+** suspended inside a C call with lua_toclose marks — is fixed and
+** covered by 26_tbc_forced_close_cbody.)
 **
 ** Determinism rules (same as 22/23/24): only fixed labels, statuses and
 ** controlled strings are printed; error objects are strings raised from

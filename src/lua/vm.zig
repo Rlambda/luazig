@@ -15321,10 +15321,10 @@ pub const Vm = struct {
     ///
     /// In luazig, `lua_closethread` (close_mode) must mirror this: discard
     /// C-frames (free owned state + pop) WITHOUT calling `finishCcall`/k.
-    /// P16.30 Stage C: the C frame's TBC chain entries are closed by the
-    /// CALLER (`closeAndDiscardCFrame`) before this runs — the chain, not
-    /// the CallInfo, carries the close obligation (PUC tbclist). The
-    /// Lua-frame TBC variables are closed by the existing forced-close
+    /// The C frame's TBC chain entries are closed by the CALLER
+    /// (`forcedCloseResetCChain`: detach-then-discard-then-close-all) — the
+    /// chain, not the CallInfo, carries the close obligation (PUC tbclist).
+    /// The Lua-frame TBC variables are closed by the existing forced-close
     /// unwind (`appendBytecodeForcedCloseUnwind` in `runBytecodeInternal`'s
     /// `resume_in_place and close_mode` branch), which runs `__close` for
     /// each Lua frame's TBC variables.
@@ -27552,27 +27552,15 @@ pub const Vm = struct {
                     th.top = yb;
                     th.yield_window_base = null;
                 }
-                // P16.30 Stage C (G2): close each discarded C frame's TBC
-                // chain entries with the thread's close error (PUC
-                // luaE_resetthread: resetCI drops the CallInfos, then ONE
-                // luaD_closeprotected(L, 1, status) pass closes ALL TBC —
-                // non-yieldable, last-error-wins across frames). A
-                // suspended thread closes with err=nil (LUA_YIELD→LUA_OK);
-                // an error-status thread closes with its error.
-                var close_err: ?Value = if (th.close_has_err) th.close_err else null;
-                while (th.call_frames.len() > 0) {
-                    const top_fr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
-                    if (!top_fr.isC()) break;
-                    // Stop AT the base frame after closing its
-                    // TBC region (PUC luaD_closeprotected(L, 1, ...) closes
-                    // ALL tbclist entries, including base-window marks;
-                    // resetCI keeps base_ci itself).
-                    if (top_fr.isBase()) {
-                        close_err = try self.closeTbcRegion(th, top_fr.tbc_chain_base, th.call_frames.len() - 1, close_err, 2, false, &.{});
-                        break;
-                    }
-                    close_err = try self.closeAndDiscardCFrame(th, close_err);
-                }
+                // PUC luaE_resetthread: resetCI + ONE closeprotected pass
+                // over the whole tbclist — a suspended thread closes with
+                // err=nil (LUA_YIELD→LUA_OK); an error-status thread
+                // closes with its error; a closer error replaces the
+                // running error for the older entries (last-error-wins).
+                const close_err = try self.forcedCloseResetCChain(
+                    th,
+                    if (th.close_has_err) th.close_err else null,
+                );
                 if (close_err) |ce| {
                     // A closer errored: the VM error state was set by fail()
                     // inside the close. Latch the running error onto the
@@ -27710,23 +27698,15 @@ pub const Vm = struct {
                             // loop process Lua frames (which runs __close via
                             // the close_mode branch in runBytecodeInternal).
                             if (th.close_mode) {
-                                // P16.30 Stage C (G2): close the discarded
-                                // C frames' TBC chain entries with the
-                                // in-flight error (PUC: one closeprotected
-                                // pass, last-error-wins), then discard.
-                                var close_err: ?Value = if (th.err_has_obj) th.err_obj else null;
-                                while (th.call_frames.len() > 0 and
-                                    th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
-                                {
-                                    // Stop AT the base frame after
-                                    // closing its TBC region (PUC closeprotected
-                                    // closes ALL entries; resetCI keeps base_ci).
-                                    if (th.call_frames.getConstPtr(th.call_frames.len() - 1).isBase()) {
-                                        close_err = try self.closeTbcRegion(th, th.call_frames.getConstPtr(th.call_frames.len() - 1).tbc_chain_base, th.call_frames.len() - 1, close_err, 2, false, &.{});
-                                        break;
-                                    }
-                                    close_err = try self.closeAndDiscardCFrame(th, close_err);
-                                }
+                                // PUC luaE_resetthread: resetCI + ONE
+                                // closeprotected pass over the whole
+                                // tbclist with the in-flight error
+                                // (last-error-wins), then the unroll loop
+                                // processes any remaining Lua frames.
+                                const close_err = try self.forcedCloseResetCChain(
+                                    th,
+                                    if (th.err_has_obj) th.err_obj else null,
+                                );
                                 if (close_err) |ce| {
                                     th.close_has_err = true;
                                     th.close_err = ce;
@@ -27885,15 +27865,15 @@ pub const Vm = struct {
                     // C-frames WITHOUT calling k (finishCcall). PUC's resetCI
                     // drops all CallInfos; the TBC variables are closed by
                     // luaF_close (the forced-close unwind in runBytecodeInternal).
-                    // P16.30 Stage C (G2): close the frame's TBC chain entries
-                    // with the running close error (PUC: one closeprotected
-                    // pass, last-error-wins; suspended → nil) before
-                    // discarding it. The running error lives in
-                    // th.close_err/close_has_err so it threads across loop
-                    // iterations into the Lua-frame close below.
+                    // The thread-owned reset closes the whole chain (the
+                    // close-mode arm already did at resume entry; a non-empty
+                    // chain here means marks made by closers since) and
+                    // discards the surfaced C frames; the running error lives
+                    // in th.close_err/close_has_err so it threads into the
+                    // Lua-frame close below.
                     if (th.close_mode) {
                         const err_arg: ?Value = if (th.close_has_err) th.close_err else null;
-                        const final_err = try self.closeAndDiscardCFrame(th, err_arg);
+                        const final_err = try self.forcedCloseResetCChain(th, err_arg);
                         if (final_err) |ce| {
                             th.close_has_err = true;
                             th.close_err = ce;
@@ -27922,23 +27902,15 @@ pub const Vm = struct {
                             // frames (which runs __close via the close_mode
                             // branch in runBytecodeInternal).
                             if (th.close_mode) {
-                                // P16.30 Stage C (G2): close the discarded
-                                // C frames' TBC chain entries with the
-                                // in-flight error (PUC: one closeprotected
-                                // pass, last-error-wins), then discard.
-                                var close_err: ?Value = if (th.err_has_obj) th.err_obj else null;
-                                while (th.call_frames.len() > 0 and
-                                    th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
-                                {
-                                    // Stop AT the base frame after
-                                    // closing its TBC region (PUC closeprotected
-                                    // closes ALL entries; resetCI keeps base_ci).
-                                    if (th.call_frames.getConstPtr(th.call_frames.len() - 1).isBase()) {
-                                        close_err = try self.closeTbcRegion(th, th.call_frames.getConstPtr(th.call_frames.len() - 1).tbc_chain_base, th.call_frames.len() - 1, close_err, 2, false, &.{});
-                                        break;
-                                    }
-                                    close_err = try self.closeAndDiscardCFrame(th, close_err);
-                                }
+                                // PUC luaE_resetthread: resetCI + ONE
+                                // closeprotected pass over the whole
+                                // tbclist with the in-flight error
+                                // (last-error-wins), then the unroll loop
+                                // processes any remaining Lua frames.
+                                const close_err = try self.forcedCloseResetCChain(
+                                    th,
+                                    if (th.err_has_obj) th.err_obj else null,
+                                );
                                 if (close_err) |ce| {
                                     th.close_has_err = true;
                                     th.close_err = ce;
@@ -45722,23 +45694,56 @@ pub const Vm = struct {
         return cur_err;
     }
 
-    /// P16.30 Stage C: close a C frame's TBC chain entries NON-yieldably
-    /// (PUC `luaD_closeprotected`, yy=0 — last-error-wins, a yield
-    /// attempt is an error) and discard the frame (PUC `resetCI` — no k,
-    /// no results). Used by the thread-close discard sites. Returns the
-    /// final error so the caller can thread it into subsequent closes
-    /// and the failure reporting.
-    /// P16.31 Cut 3: region close — the top C frame's region
-    /// [tbc_chain_base, len) = every mark above the frame's base (its own
-    /// live marks plus detached marks of frames already popped above it).
-    fn closeAndDiscardCFrame(self: *Vm, th: *Thread, err: ?Value) DispatchError!?Value {
-        const cur_len = th.call_frames.len();
-        if (cur_len == 0) return err;
-        const fr = th.call_frames.getConstPtr(cur_len - 1);
-        if (!fr.isC()) return err;
-        const final = try self.closeTbcRegion(th, fr.tbc_chain_base, cur_len - 1, err, 2, false, &.{});
-        self.discardCFrame(th);
-        return final;
+    /// Forced-close C-lane reset (PUC `luaE_resetthread`: `resetCI` + the
+    /// C-lane half of `luaD_closeprotected(L, 1, status)`). ONE owner for
+    /// the whole operation, in the PUC order:
+    ///
+    /// 1. Detach every live `frame_slot` mark to its captured value while
+    ///    the owning frames' slots are still valid — in-place, no
+    ///    allocation, chain order unchanged (the detached value is the GC
+    ///    root from here on; the slot is nil'd like PUC `preclose`).
+    /// 2. Discard ALL C frames above the base frame WITHOUT calling their
+    ///    continuations (PUC `resetCI`: `ci->u.c.k = NULL` — no k, no
+    ///    results; the base frame is never discarded). Owned continuation
+    ///    state is released exactly once via discardCFrame.
+    /// 3. Close the whole chain as ONE thread-owned region (base 0, LIFO,
+    ///    yy=0): one running error threads through every entry — a
+    ///    suspended thread starts with nil; a closer error replaces the
+    ///    error for the older entries; the last error decides the return
+    ///    value (last-error-wins). The region owner is the THREAD (the
+    ///    whole `c_tbc_chain`), never a frame-local `tbc_chain_base`.
+    ///
+    /// The closers run as FRESH calls on the target thread: the stale
+    /// in-place suspension state left by the interrupted execution would
+    /// make runBytecodeInternal take its resume_in_place path and hijack
+    /// each closer call into the forced-close unwind instead of executing
+    /// the metamethod body. It is cleared here; the Lua-frame unwind
+    /// setup at the call sites re-establishes it afterwards.
+    fn forcedCloseResetCChain(self: *Vm, th: *Thread, err: ?Value) DispatchError!?Value {
+        // (1) Detach all live marks while the slots are valid.
+        for (th.c_tbc_chain.items) |*entry| {
+            switch (entry.*) {
+                .frame_slot => |fs| {
+                    const v = self.cFrameTbcSlotValue(th, fs.cframe_idx, fs.slot_idx) orelse .Nil;
+                    self.setCFrameTbcSlotNil(th, fs.cframe_idx, fs.slot_idx);
+                    entry.* = .{ .detached = v };
+                },
+                .detached => {},
+            }
+        }
+        // (2) resetCI: discard every C frame above the base, no k.
+        while (th.call_frames.len() > 0) {
+            const top = th.call_frames.getConstPtr(th.call_frames.len() - 1);
+            if (!top.isC() or top.isBase()) break;
+            self.discardCFrame(th);
+        }
+        // (3) One thread-owned close-all (base 0 = every surviving mark:
+        // detached values of the discarded frames + live marks of frames
+        // that stay pushed — the base frame's window marks included).
+        // clsret_frame=null: close-all is non-yieldable (yy=0), so no
+        // CLSRET can be installed.
+        th.bytecode_inplace_suspended = false;
+        return self.closeTbcRegion(th, 0, null, err, 2, false, &.{});
     }
 
     /// P16.31 Cut 3: the pcall/xpcall recovery-boundary close — PUC

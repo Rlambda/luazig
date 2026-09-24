@@ -987,7 +987,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   apiSettop обязан распространять escape + unwrapped-yy=0 семантика.
   Найдено TBC-escape stage (F2).
 
-- [ ] **Parity BLOCKER (pre-existing): forced close C-suspended корутины с
+- [x] **Parity BLOCKER (pre-existing): forced close C-suspended корутины с
   lua_toclose marks закрывает только старейший mark**: lua_closethread на
   корутине, suspended внутри C-body с lua_toclose(+lua_yieldk) marks: PUC
   закрывает все LIFO (closeprotected continue, last-error-wins); luazig —
@@ -997,6 +997,25 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   st=0; ZIG `o1:nil` st=2); pre-existing (без closer-ошибок вообще — не
   тронуто error-arm'ами stage). Fix-зона: region base/order в forced-close
   unwind C-suspended фрейма. Найдено TBC-escape stage (F3).
+  CLOSED (forced-close close-all implementation): PUC luaE_resetthread-
+  эквивалент — новый единый owner `forcedCloseResetCChain` (заменил УДАЛЁННЫЙ
+  closeAndDiscardCFrame и все 4 дубля frame-local close-циклов в
+  builtinCoroutineResume): безаллокационный detach всех живых frame_slot
+  marks до удаления frames → discard C-frames выше base БЕЗ вызова k
+  (owned state ровно один раз) → сброс stale bytecode_inplace_suspended
+  (root cause глубже frame-local баз: stale флаг угонял каждый вызов
+  closer'а в forced-close unwind вместо исполнения тела метаметода) →
+  ОДНА thread-owned closeTbcRegion(th, 0, ...) LIFO, yy=0,
+  last-error-wins; suspended стартует с nil; closers на целевом thread;
+  caller error state чист. Variant A: st=0, log=o2:nil,o1:nil; variant B:
+  st=2, o1:ferr — оба = PUC дословно (diff пуст). Canonical suite
+  tests/c_api/26_tbc_forced_close_cbody (9 кейсов: LIFO, error threading
+  (newest/middle/cross-frame), non-string identity, GC survival, alias,
+  k-never-runs, nested C + Lua <close>) DIFF-PASS Debug+RF; 25-сьют:
+  exclusion-(b) снят (комментарий обновлён). Mutation: старый цикл без
+  сброса флага → FC-1 RED; frame-local цикл с флагом → FC-9/FC-5 RED.
+  Battery 355/355 Debug+RF; matrix --testc (RF) zig_fail=0; smoke 86/86;
+  fmt/diff-check clean.
 
 - [ ] **Parity HIGH (pre-existing, REDESIGN-констрейнт): yieldability
   pcall-recovery close (16118-ветка) расходится с PUC finishpcallk**:
@@ -1172,7 +1191,8 @@ IR VM полностью удалена из кодовой базы.
 `big.lua` — `both_fail` (pre-existing: требует `coroutine.wrap` harness из
 `all.lua`).
 
-Архитектурные решения и находки — [DESIGN.md](DESIGN.md).
+Долгоживущий архитектурный backlog —
+[ARCHITECTURE_DEBT.md](ARCHITECTURE_DEBT.md).
 
 ### Методика
 

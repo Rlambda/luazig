@@ -11395,6 +11395,22 @@ pub const Vm = struct {
             const mm = self.getTmByObj(obj, .close);
             if (mm == null) {
                 _ = self.fail("metamethod 'close' is nil", .{}) catch {};
+                // Policy split (PUC yy table): nonyieldable (closeprotected
+                // / forced close) records the error and keeps closing —
+                // last-error-wins. Yieldable: the error longjmps OUT of
+                // luaF_close — abort the close HERE (the failing entry's
+                // mark is already popped), cancel the close continuation
+                // and propagate the error; the remaining entries stay
+                // registered and close at the recovery boundary (an outer
+                // pcall's region close or coroutine.close). The error state
+                // is installed by fail() above.
+                if (state.policy == .yieldable) {
+                    const frame = exec_frames.getPtr(parent_index);
+                    const pending = self.getPendingCallPtr(frame.pending_call_index).?;
+                    self.cancelBytecodePendingCall(pending, frame);
+                    self.clearPendingCall(frame);
+                    return .propagate_error;
+                }
                 try self.recordBytecodeCloseError(state);
                 continue;
             }
@@ -11409,6 +11425,17 @@ pub const Vm = struct {
 
             const resolved = self.resolveCallable(mmv, argv[0..argc], null) catch |resolve_err| switch (resolve_err) {
                 error.RuntimeError => {
+                    // Policy split as the missing-metamethod arm above:
+                    // yieldable aborts the close (error state installed by
+                    // fail() inside resolveCallable); nonyieldable records
+                    // and continues.
+                    if (state.policy == .yieldable) {
+                        const frame = exec_frames.getPtr(parent_index);
+                        const pending = self.getPendingCallPtr(frame.pending_call_index).?;
+                        self.cancelBytecodePendingCall(pending, frame);
+                        self.clearPendingCall(frame);
+                        return .propagate_error;
+                    }
                     try self.recordBytecodeCloseError(state);
                     continue;
                 },
@@ -11453,10 +11480,20 @@ pub const Vm = struct {
                     error.RuntimeError => {
                         // C-stack overflow (ccallEnter's depth guard): the
                         // metamethod never runs. PUC's ccall raises before
-                        // luaD_precall and the enclosing closeprotected
-                        // catches it and keeps closing — mirror the
-                        // missing-metamethod path: record the error and
-                        // continue with the remaining TBC variables.
+                        // luaD_precall. Policy split (PUC yy table):
+                        // nonyieldable (closeprotected) catches and keeps
+                        // closing — record and continue. Yieldable: the
+                        // raise longjmps OUT of luaF_close — abort the close
+                        // (failRunerror inside ccallEnter installed the
+                        // error state); the remaining entries close at the
+                        // recovery boundary.
+                        if (state.policy == .yieldable) {
+                            const frame = exec_frames.getPtr(parent_index);
+                            const pending = self.getPendingCallPtr(frame.pending_call_index).?;
+                            self.cancelBytecodePendingCall(pending, frame);
+                            self.clearPendingCall(frame);
+                            return .propagate_error;
+                        }
                         try self.recordBytecodeCloseError(state);
                         continue;
                     },
@@ -11513,16 +11550,43 @@ pub const Vm = struct {
             };
             self.ccallEnter(state.owner_thread, ccall_mode) catch |ccall_err| switch (ccall_err) {
                 error.RuntimeError => {
-                    // C-stack overflow: metamethod never runs; closeprotected
-                    // catches and keeps closing (same as the staged arm).
+                    // C-stack overflow: metamethod never runs. Policy split
+                    // as the staged arm above (yieldable aborts — the defer
+                    // below is not yet registered, so no unit is held;
+                    // nonyieldable records and continues).
+                    if (state.policy == .yieldable) {
+                        const frame = exec_frames.getPtr(parent_index);
+                        const pending = self.getPendingCallPtr(frame.pending_call_index).?;
+                        self.cancelBytecodePendingCall(pending, frame);
+                        self.clearPendingCall(frame);
+                        return .propagate_error;
+                    }
                     try self.recordBytecodeCloseError(state);
                     continue;
                 },
                 else => return ccall_err,
             };
-            defer state.owner_thread.ccallExit(ccall_mode);
+            // The unit is released manually on the yieldable error escape
+            // below (before cancelBytecodePendingCall destroys `state`) —
+            // the flag keeps this defer from reading the destroyed state.
+            var ccall_unit_held = true;
+            defer if (ccall_unit_held) state.owner_thread.ccallExit(ccall_mode);
             self.runCloseMetamethod(obj, state.current_err) catch |close_err| switch (close_err) {
                 error.RuntimeError => {
+                    // Policy split as the arms above: yieldable aborts the
+                    // close. Release the C-call unit FIRST (the defer must
+                    // not touch the destroyed state), then cancel and
+                    // propagate; nonyieldable records and continues (the
+                    // defer releases the unit at the iteration exit).
+                    if (state.policy == .yieldable) {
+                        state.owner_thread.ccallExit(ccall_mode);
+                        ccall_unit_held = false;
+                        const frame = exec_frames.getPtr(parent_index);
+                        const pending = self.getPendingCallPtr(frame.pending_call_index).?;
+                        self.cancelBytecodePendingCall(pending, frame);
+                        self.clearPendingCall(frame);
+                        return .propagate_error;
+                    }
                     try self.recordBytecodeCloseError(state);
                     continue;
                 },
@@ -14736,18 +14800,46 @@ pub const Vm = struct {
         // (CLSRET — it is now the top frame, so the resume machinery's
         // finishCcall finds it; detached entries carry their captured
         // values, so the frame's own window state is irrelevant).
-        {
+        // PUC precover is a LOOP: a closer error under yy=1 longjmps out
+        // of finishpcallk's luaF_close, precover re-saves the NEW status
+        // (setcistrecst) and re-enters unroll, and finishpcallk's
+        // luaF_close closes the REMAINING entries with the new error —
+        // last-error-wins across re-drives. closeTbcRegion's yy=1 escape
+        // (first closer error stops the close) mirrors the longjmp; this
+        // loop is the re-drive: re-read the live error state (installed by
+        // the closer's fail()), refresh CIST_RECST, and close again until
+        // the region is empty.
+        const pcallk_chain_base = fr.u.c.aux.pcallk.chain_base;
+        while (true) {
             const err_arg: ?Value = if (self.errThread().err_has_obj) self.errThread().err_obj else null;
             const err_status_i: i32 = if (self.errThread().err_is_errerr) 5 else 2;
             _ = try self.closeTbcRegion(
                 th,
-                fr.u.c.aux.pcallk.chain_base,
+                pcallk_chain_base,
                 ci_idx,
                 err_arg,
                 err_status_i,
                 true,
                 &.{},
             );
+            // Drain gate, NOT the return value: closeTbcRegion echoes the
+            // initial error back on a CLEAN completion (PUC
+            // luaD_closeprotected returns the incoming status when no
+            // closer fails), so a non-null return alone does not mean a
+            // stop. A non-empty region after the call is the abort signal:
+            // a closer errored under yy=1 and the close stopped (the
+            // remaining entries stay in the chain) — re-drive with the
+            // freshly installed error state, like PUC precover's re-entry
+            // into unroll. An empty region is full completion (or the last
+            // closer errored with nothing left — the installed error state
+            // carries it; no re-drive needed).
+            if (th.c_tbc_chain.items.len <= pcallk_chain_base) break;
+            // Re-fetch the frame pointer: the closer ran Lua code (frames
+            // above ci_idx grew and possibly reallocated the stack), so the
+            // saved `fr` may dangle. ci_idx itself is stable — nothing below
+            // it changes during the close.
+            const fr_now = th.call_frames.getPtr(ci_idx);
+            fr_now.callstatus = setcistrecst(fr_now.callstatus, if (self.errThread().err_is_errerr) 5 else 2);
         }
         // PUC: luaD_rawrunprotected(L, unroll, NULL) — re-enter unroll.
         // luazig: the drive loop IS unroll. Return true to signal the
@@ -14822,6 +14914,30 @@ pub const Vm = struct {
             };
             switch (cs.mode) {
                 .return_close => {
+                    if (final_err != null) {
+                        // A closer errored under the yy=1 resumed close
+                        // (PUC: finishCcall redoes poscall → moveresults →
+                        // luaF_close(res, LUA_OK, yy=1) — the closer error
+                        // longjmps OUT; nothing catches it inside the
+                        // close). The saved results are DISCARDED (the
+                        // poscall never completes) and the error escapes to
+                        // the recovery boundary — the remaining entries
+                        // stay in the chain and close at an outer pcall's
+                        // region close or coroutine.close. The error state
+                        // is already installed by the closer's fail().
+                        self.alloc.free(cs.results);
+                        self.alloc.destroy(cs);
+                        // Re-fetch the frame: the closer ran Lua code above
+                        // this frame (possible FrameStack growth/realloc —
+                        // the saved `fr` may dangle; my_idx is stable).
+                        const fr_err = th_bc.getPtr(my_idx);
+                        fr_err.u.c.clsret_state = null;
+                        fr_err.clearClsret();
+                        // Frame stays (unpopped): the error machinery pops
+                        // it (precover detaches its region / the failed
+                        // resume leaves it for coroutine.close).
+                        return error.RuntimeError;
+                    }
                     const saved_results = cs.results;
                     self.alloc.destroy(cs);
                     fr.u.c.clsret_state = null;
@@ -14989,10 +15105,14 @@ pub const Vm = struct {
                     else => return e,
                 };
                 if (final_err != null) {
-                    // A closer errored: the remaining entries were closed
-                    // with the new error (last-error-wins; err_obj was set
-                    // by fail()). PUC: the error escapes to the pcall
-                    // boundary. The frame stays for the error machinery.
+                    // A closer errored under the yy=1 close: the close
+                    // STOPPED at the failing closer (PUC: the error longjmps
+                    // out of luaF_close — nothing closes the rest inside);
+                    // the remaining entries stay in the chain and close at
+                    // the recovery boundary (an outer pcall's region close
+                    // or coroutine.close). The frame stays for the error
+                    // machinery; the error state is installed by the
+                    // closer's fail().
                     return error.RuntimeError;
                 }
             }
@@ -15052,9 +15172,14 @@ pub const Vm = struct {
                     else => return e,
                 };
                 if (final_err != null) {
-                    // A closer errored (remaining entries were closed with
-                    // the new error — last-error-wins; err_obj was set by
-                    // fail()). The frame stays for the error machinery.
+                    // A closer errored under the yy=1 close: the close
+                    // STOPPED at the failing closer (PUC: the error longjmps
+                    // out of luaF_close — nothing closes the rest inside);
+                    // the remaining entries stay in the chain and close at
+                    // the recovery boundary (an outer pcall's region close
+                    // or coroutine.close). The frame stays for the error
+                    // machinery; the error state is installed by the
+                    // closer's fail().
                     return error.RuntimeError;
                 }
                 // Close complete: deliver the same values (replace the
@@ -16468,6 +16593,38 @@ pub const Vm = struct {
                         .close => |cont| cont,
                         else => unreachable,
                     };
+                    if (close_state.policy == .yieldable) {
+                        // The erroring closer ABORTED this yy=1 close (PUC:
+                        // the error longjmps out of luaF_close — nothing
+                        // closes the rest inside the close). Cancel the
+                        // continuation through the single cleanup authority
+                        // (releases the child's C-call unit, frees the post,
+                        // destroys the state) and re-arm the unwind with the
+                        // closer's error: the loop pops the parent frame
+                        // below, and its remaining marks close through the
+                        // standard pop path (.unwind_frame close with this
+                        // error under a protected parent; detach →
+                        // coroutine.close on the escape path) — exactly the
+                        // recovery-boundary close PUC defers them to. The
+                        // error state is installed by the closer's fail()
+                        // (state.error_value, restored above).
+                        self.cancelBytecodePendingCall(pending, exec_frames.getPtr(parent_index));
+                        self.clearPendingCall(exec_frames.getPtr(parent_index));
+                        const replacement = try self.currentRuntimeErrorValue();
+                        if (owner.bytecode_unwinds.items.len != 0) {
+                            const outer_index = owner.bytecode_unwinds.items.len - 1;
+                            owner.bytecode_unwinds.items[outer_index].error_value = replacement;
+                            owner.bytecode_unwinds.items[outer_index].fault = .runtime;
+                            continue :unwind_loop;
+                        }
+                        try self.appendBytecodeUnwind(
+                            exec_frames,
+                            state.boundary_depth,
+                            .runtime,
+                            replacement,
+                        );
+                        continue :unwind_loop;
+                    }
                     self.releaseBytecodeCloseChild(close_state);
                     close_state.had_close_error = true;
                     if (self.forced_close_thread != null) self.forced_close_had_error = true;
@@ -45408,7 +45565,10 @@ pub const Vm = struct {
         const chain = &th.c_tbc_chain;
         var cur_err = err;
         var cur_status = err_status;
-        var yieldable = yieldable_close;
+        // Loop-invariant (PUC yy table): the close's yieldability is fixed
+        // by its ORIGIN (finishpcallk/moveresults yy=1; closeprotected /
+        // settop / forced close yy=0) — a mid-close error never flips it.
+        const yieldable = yieldable_close;
         while (chain.items.len > base) {
             const entry = chain.items[chain.items.len - 1];
             // Capture the object BEFORE the closer runs. frame_slot: the
@@ -45468,14 +45628,17 @@ pub const Vm = struct {
                 error.RuntimeError => {
                     // C-stack overflow (ccallEnter's depth guard): the
                     // metamethod never runs. PUC's ccall raises before
-                    // luaD_precall; the enclosing closeprotected catches the
-                    // error and keeps closing — mirror the closer-error arm
-                    // below (last-error-wins, remaining entries close yy=0,
-                    // a forced-close transport fails the close).
+                    // luaD_precall. yy=0 (closeprotected): the enclosing
+                    // recovery catches the error and keeps closing —
+                    // last-error-wins, remaining entries close yy=0. yy=1:
+                    // the raise longjmps OUT of luaF_close — the remaining
+                    // entries stay in the chain and close at the recovery
+                    // boundary (an outer pcall's region close or
+                    // coroutine.close).
                     cur_err = if (self.errThread().err_has_obj) self.errThread().err_obj else .Nil;
                     cur_status = 2; // LUA_ERRRUN
-                    if (err == null) yieldable = false;
                     if (self.forced_close_thread != null) self.forced_close_had_error = true;
+                    if (yieldable) return cur_err;
                     continue;
                 },
                 else => return ccall_err,
@@ -45529,14 +45692,17 @@ pub const Vm = struct {
                     return error.Yield;
                 },
                 else => {
-                    // Closer error: last-error-wins, continue closing the
-                    // remaining entries with the NEW error (self.errThread().err_obj
-                    // was set by fail() inside the metamethod call).
+                    // Closer error (self.errThread().err_obj was set by
+                    // fail() inside the metamethod call). yy=0
+                    // (closeprotected): keep closing the remaining entries
+                    // with the NEW error — last-error-wins. yy=1: the error
+                    // longjmps OUT of luaF_close (nothing catches inside) —
+                    // STOP here and return the error as the final error;
+                    // the remaining entries stay in the chain and close at
+                    // the recovery boundary (an outer pcall's region close
+                    // re-drive or coroutine.close).
                     cur_err = if (self.errThread().err_has_obj) self.errThread().err_obj else .Nil;
                     cur_status = 2; // LUA_ERRRUN
-                    // A return-close that started clean now closes through
-                    // the error-escape regime (PUC closeprotected, yy=0).
-                    if (err == null) yieldable = false;
                     // PUC luaD_closeprotected returns the error status to
                     // lua_closethread: during a forced-close transport
                     // (coroutine.close driving this close via
@@ -45545,8 +45711,10 @@ pub const Vm = struct {
                     // would otherwise swallow the error and report the
                     // close as clean (p31a [B2]: close must return false +
                     // the closer's error). Mirrors recordBytecodeCloseError
-                    // for the bytecode-path close.
+                    // for the bytecode-path close. (Forced close always
+                    // runs yy=0, so the escape below is unreachable there.)
                     if (self.forced_close_thread != null) self.forced_close_had_error = true;
+                    if (yieldable) return cur_err;
                     continue;
                 },
             };

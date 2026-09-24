@@ -201,8 +201,9 @@ test "api580 interval allocation ledger" {
     if (st.loadbuffer(SETUP_SRC, "setup") != .ok) return error.SetupCompile;
     try st.pushvalue(-1);
     if (st.pcall(0, 0) != .ok) return error.SetupRun;
-    // Pre-grow the C stack so interval pushes never allocate.
-    try st.stack.ensureUnusedCapacity(vm.alloc, 64);
+    // Pre-grow the API window's backing stack so interval pushes never
+    // allocate (the window lives on the thread's own stack).
+    try vm.cWindowEnsure(vm.main_thread.?, 64);
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -228,11 +229,11 @@ test "api580 interval allocation ledger" {
 
     // Cross-check: the Lua-computed M2 global must equal the native m2.
     _ = st.getglobal("M2") catch return error.GetM2;
-    const m2g = numOrNeg(st.stack.items[st.stack.items.len - 1]);
+    const m2g = numOrNeg(st.valueAt(-1) orelse .Nil);
 
     // --- walk the CODE closure for pointer-identity labels ---
     _ = st.getglobal("CODE") catch return error.GetCode;
-    const codev = st.stack.items[st.stack.items.len - 1];
+    const codev = st.valueAt(-1) orelse .Nil;
     const cl = switch (codev) {
         .Closure => |c| c,
         else => return error.CodeNotClosure,
@@ -327,7 +328,6 @@ test "api580 interval allocation ledger" {
     w("      \"code_len\": {d},\n", .{proto.code.len});
     w("      \"lineinfo_len\": {d},\n", .{proto.lineinfo.len});
     w("      \"locvars_len\": {d},\n", .{proto.locvars.len});
-    w("      \"live_reg_top_len\": {d},\n", .{proto.live_reg_top.len});
     w("      \"ref_count\": {d},\n", .{proto.ref_count});
     w("      \"source_backing_extra\": {},\n", .{proto.source_backing.extra != null});
     w("      \"source_backing_pin_len\": {d},\n", .{if (proto.source_backing.pin) |p| p.len() else 0});

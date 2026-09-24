@@ -678,7 +678,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   невозможен, использовать non-dereferencing address registry, а не читать
   header через подозрительный pointer.
 
-- [ ] **Safety: constructor→push OOM UAF-окна (W1; A1.1R3 M1, R4-severity
+- [x] **Safety: constructor→push OOM UAF-окна (W1; A1.1R3 M1, R4-severity
   BLOCKER, CONFIRMED dyn)**: first invalid op — construction/registration
   GC-объекта до reserve destination capacity (representative: api.zig:940
   internStr → 941 `try stack.append`; класс:
@@ -689,8 +689,15 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   A→B через reuse блока. PUC-иммунитет: lapi.c:543/792/1353 (construction →
   api_incr_top, аллокаций между нет). Архитектурный фикс — A1.1 unified stack
   reserve-before-create + infallible publish на всех constructor→push путях.
+  A1.1 final-closure (A1.1-final correction): **CLOSED**. Основание:
+  unified window-модель — все constructor→push пути пушат в pre-reserved
+  окно infallible-слотом (PUC luaC_newobj-форма); S6-аудит нашёл и закрыл
+  остаточный dangling-on-growth BLOCKER (`reservePushSlot`/`cWindowEnsure` до
+  конструирования в 9 конструкторах api.zig + concat acc-rooting + 12 c_api
+  сайтов). Evidence: A1.1s1 class-1 тест GREEN (one-shot OOM на каждом k,
+  все 6 видов; loadbuffer/newuserdatauv расширены); battery 353/353.
 
-- [ ] **Safety: internStrAll put-after-registration UAF (A1.1R3 M2, R4-severity
+- [x] **Safety: internStrAll put-after-registration UAF (A1.1R3 M2, R4-severity
   BLOCKER, CONFIRMED dyn)**: first invalid op — commit unrooted long string до
   prepared cache capacity: vm.zig:22154 commit internStr → 22301 `try
   long_string_cache.put`; emergency GC на росте кэша сметает свежую long-строку,
@@ -699,8 +706,13 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   long-констант; GC + `lua_close` — SEGFAULT. PUC: luaS_createlngstrobj один
   проход, post-commit publication-шага нет. Фикс — A1.1: counted capacity
   reserve кэша ДО создания строки + `putAssumeCapacity` (не counted→infraAlloc).
+  A1.1 final-closure (A1.1-final correction): **CLOSED**. Основание:
+  counted capacity reserve кэша ДО создания long-строки + infallible
+  `putAssumeCapacityNoClobber` (prepare→create→infallible publish; НЕ
+  counted→infraAlloc). Evidence: A1.1s1 class-2 тест GREEN (one-shot OOM на
+  put-росте — строка жива/зарегистрирована); battery 353/353.
 
-- [ ] **Safety: api.State.thread_stacks не является GC-root (A1.1R3 M3,
+- [x] **Safety: api.State.thread_stacks не является GC-root (A1.1R3 M3,
   R4-severity BLOCKER, CONFIRMED dyn, оба ребра)**: first invalid op — публикация
   unrooted Values в не-GC-root map; каждое значение, живущее только в
   `thread_stacks[th]` (api.zig:81), сметается любым GC (getOrPut:1326 из
@@ -710,8 +722,15 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   GC и алиасит новый Thread по тому же адресу (детерминированный reuse) —
   dangling items[0]. PUC: один L->stack на lua_State, wholesale traversethread.
   Фикс — A1.1 draft decision #1: thread_stacks и per-handle c_stack исчезают.
+  A1.1 final-closure (A1.1-final correction): **CLOSED**. Основание:
+  второй stack-authority удалён — `api.State.stack`/`thread_stacks`,
+  `StateHandle.c_stack`, `Vm.cur_c_stack`, `CFrameState.parked_stack`,
+  `TestcThreadStacks` grep-clean (production 0); оба API работают на
+  stack/top соответствующего Thread (PUC: один L->stack на lua_State,
+  wholesale traversethread [0..top)). Evidence: grep-evidence в отчёте
+  A1.1; battery/matrix/smoke зелёные.
 
-- [ ] **Safety: Thread.entry_args — stale unread copy с UAF-capable читателями
+- [x] **Safety: Thread.entry_args — stale unread copy с UAF-capable читателями
   (A1.1R3 M4, R4-severity HIGH, CONFIRMED dyn)**: first invalid op — публикация
   unmarked persistent copy без root coverage; поле (vm.zig:2441) unmarked, пишется после
   blacken, переживает yields, может остаться единственной живой копией;
@@ -720,8 +739,13 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   ordinary shapes выживают через resume_inbox/live-reg keepers. PUC-расхождения
   нет (аргументы корутины в PUC живут в слотах L->stack). Фикс — A1.1: поле
   удаляется unified-моделью; 3 read-сайта обязаны читать реальные stack-окна.
+  A1.1 final-closure (A1.1-final correction): **CLOSED**. Основание: поле
+  удалено; все читатели (first-run/re-entry) читают реальные stack-окна
+  unified-модели. Evidence: S4 proof'ы GREEN — sole-ref GC-форма (create+wrap
+  пути, аргументы — единственная ссылка — выживают precise GC) + poison-oracle
+  emergency-GC в suspended-окне; battery 353/353.
 
-- [ ] **Safety: lua_copy pseudo-upvalue write — отсутствует GC write barrier
+- [x] **Safety: lua_copy pseudo-upvalue write — отсутствует GC write barrier
   (A1.1R3 M5 + R4-correction, R4-severity BLOCKER, CONFIRMED dyn; ЕДИНСТВЕННЫЙ
   дефект)**: c_api.zig:1387-1399 plain `.value =` store в upvalue Cell без
   write barrier. PUC-механизм (lapi.c:253-263): inline store в C-closure
@@ -737,8 +761,15 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   `gcStoreCellValue` (28473) — рекомендуемый Zig helper закрытой C-upvalue
   representation; тот же barrier-путь — setiuservalue (M28, UNCONFIRMED, свой
   decisive corner до заявления fixed).
+  A1.1 final-closure (A1.1-final correction): **CLOSED**. Основание:
+  barriered store через func_slot-closure верхнего C frame (PUC lapi.c:253-263:
+  setobj + luaC_barrier(clCvalue(L->ci->func))); VM-global side channel
+  удалён (grep 0); `gcStoreCellValue`-подобный путь закрытой C-upvalue.
+  Evidence: A1.1s1 class-13 тест GREEN (gen-mode: young table в upvalue
+  выживает minor GC; setupvalue-контроль); proof «CClosure upvalues без
+  side channel» GREEN; battery 353/353.
 
-- [ ] **Safety: lua_newthread — registration/publication до root и до конца
+- [x] **Safety: lua_newthread — registration/publication до root и до конца
   fallible prepare, C и Zig (A1.1R3 M6 + R4-correction, R4-severity HIGH,
   CONFIRMED static; класс dyn-подтверждён в M1)**: first invalid op — C:
   c_api.zig:215 gcRegisterCommit → 227 `try allocStateHandle` → 231 parent
@@ -749,6 +780,13 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   parent stack (280-284) → fallible `stack_init` уже ПОСЛЕ укоренения (294).
   Фикс — A1.1: reserve/prepare → registration + немедленная infallible
   parent-stack publication; отдельный `c_api_thread` root не вводится.
+  A1.1 final-closure (A1.1-final correction): **CLOSED**. Основание:
+  reserve-first transaction (`luaNewThreadTx`): parent-window ensureWindow(+1)
+  до создания; всё fallible (включая initThreadBaseFrame и handle) до
+  gcRegisterCommit; publication = infallible запись в зарезервированный слот
+  (PUC lstate.c:280-284 — публикация на parent stack до fallible stack_init);
+  `c_api_thread` root не вводится. Evidence: T2 C-ABI OOM-transaction тест
+  GREEN (measured allocation map); battery 353/353.
 
   (Зарегистрировано фазой A1.1R3 research-correction; severity/first-op/prose
   нормализованы фазой A1.1R4 correction по вердикту ревью — подробности и
@@ -830,7 +868,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   post-regeneration build == post-session rebuild).
   Open-count 23→22 (TBC-parity пункт остаётся открытым).
 
-- [ ] **Parity: errored coroutine не должна исполнять `<close>` до
+- [x] **Parity: errored coroutine не должна исполнять `<close>` до
   `coroutine.close`**: сейчас `coroutine.resume` при ошибке тела уже вызывает
   closer (`false, 1`), тогда как PUC Lua 5.5 оставляет TBC pending (`false, 0`) и
   выполняет closer только при `coroutine.close` (`false, 1`). Нужен PUC-faithful
@@ -847,6 +885,19 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   `coroutine.close` non-yieldable; обычный close (`yy=1`) yieldable. Для
   A1.1 transport/TBC migration это обязательный parity acceptance; сохранять
   pending TBC, status и error object между resume и close.
+  A1.1 final-closure (A1.1-final correction): **CLOSED**. Основание:
+  PUC-faithful lifecycle: failed resume НЕ запускает closers (detach без
+  close — PUC lua_resume не вызывает luaF_close); отложенный close при
+  `coroutine.close`/wrap-закрытии — non-yieldable (ldo.c closepaux →
+  luaF_close(..., 0) → lfunc.c callclosemethod yy=0 → luaD_callnoyield);
+  обычный yieldable close сохранён; embedder-boundary closeprotected.
+  pending_close_builtin* — сохранены как continuation state yieldable-close
+  суспензии с terminal-cleanup на всех путях завершения (4 clear-сайта +
+  focused single-TBC proof: после resume#2 поля очищены, LIFO/error-семантика
+  сохранена, re-close proof). Evidence: 17/17 дифференциальных кейсов
+  дословно = PUC 5.5 (M32-чанк: `false,"...boom"`,`dead`; yield-closer →
+  "attempt to yield across a C-call boundary"; wrap re-raise; GC-путь);
+  battery 353/353.
 
 - [x] **P16.50-review correction (REOPENED→CLOSED by review-7)**: rollback ownership + C-closure upvalue semantics — (a) BLOCKER 1: opClosure count-prefix rollback неверен при смешанных дескрипторах (proxy/new instack/уже-boxed) — exact ownership worklist/bitmap, rollback только созданных этим вызовом Cells в reverse-порядке; закрыть post-commit окно (gcStoreCellValue после commit) — либо provably-infallible через preparation/order, либо полный rollback owner для Closure/tree/register/accounting/register-slot; dispatch-driven mixed-upvalue тест ([proxy, new instack] из реального bytecode; existing-boxed; провал на следующем Cell и на Closure alloc; post-commit barrier failure; byte-exact всё + minor collection + repeated + success); negative copy count-prefix rollback детерминированно ловится; (b) BLOCKER 2: lua_newthread errdefer НЕ работает (?*lua_State ≠ error union) — inner error-union transaction / явный cleanup helper, ABI-wrapper маппит в null ПОСЛЕ cleanup; preserve/restore прежний vm.c_api_thread; тест против реального экспортированного lua_newthread (fail на registry prepare / Thread alloc / handle alloc / parent stack growth; registries/stack/handle/counters/live-set + GC после); (c) BLOCKER 3: registerfuncs алиасит C-closure upvalues (общие Cell-объекты: setupvalue(f1) виден f2) — PUC luaL_setfuncs (lauxlib.c:965-978) копирует VALUES на стек + lua_pushcclosure (lapi.c:609+) свежий CClosure с inline slots; один канонический C-closure конструктор для pushcclosure+registerfuncs с per-closure Cells; убрать неверный LClosure rationale; differential-тест (upvalueid differs; setupvalue A не меняет B; сбор в обоих порядках без leaks; OOM на non-preinterned names + table-growth setfield); (d) error propagation: lua_pushcclosure/lua_pushcfunction/luaL_setfuncs/luaL_newlib catch {} — обследовать защищённый механизм (protected call/throw) и маршрутизировать ЛИБО зафиксировать архитектурный blocker (owner решает); (e) HIGH: testcChargeMemory коммитит total_bytes ДО нативных аллокаций — split check/reserve от accounting commit / точный rollback; тест с активным testc_ctrl + провалы registry reserve/Userdata/uservalues/payload; аудит всех testcChargeMemory-сайтов; (f) cleanup: устаревшие BLOCKED/KNOWN-leak комментарии в тестах, skip fail-индексов 2..4 в pushcclosure matrix, smoke provenance prose (84 файла, 85-й номер — один из 84).
 
@@ -1035,6 +1086,42 @@ IR VM полностью удалена из кодовой базы.
 ## История разработки
 
 Выполненные задачи по номерам (P15.xx). Полные детали — в `git log` и коде.
+
+## A1.1 — единый Thread.stack/top: unified stack migration (2026-09-20..24, A1.1-final closure)
+
+Архитектурная миграция: один канонический стек на `Thread`; C/Zig API на
+window-модели (`handle → thread → top frame`); base C frames (PUC base_ci);
+testc-адаптер на едином стеке; удалены второй stack-authority
+(`c_stack`/`cur_c_stack`/`parked_stack`/`thread_stacks`/`TestcThreadStacks`/
+`c_active_closure`/`c_api_thread`), transport-копии (`entry_args`,
+`suspended_builtin_args`, `pending_close_err*`, `suspended_pc`,
+`debug_hook_transfer`) и параллельные GC-liveness-авторитеты
+(`Proto.live_reg_top`, `min_reg_top`, `gcClearDeadFrameRegisters`,
+stale-gc_index-скипы, tail-clear deviation); marking — PUC-плоская форма
+`stack[0..top)` + `boxed[0..top)` (lgc.c traversethread) + интрузивный
+atomic-clear список (gclist-эквивалент; канонический unlink в
+gcUnregisterObjectRollback — закрыл найденный при proof'е rollback-UAF).
+Закрыты пункты: M1, M2, M3, M4, M5, M6, TBC error-unwind parity (все —
+выше, с основаниями). Попутно в фазе: M28 (setiuservalue barrier) —
+CONFIRMED и исправлена (prepare→store→commit; тест GREEN); M25 — stale
+RootHandle-доступы переведены на детерминированный panic во всех режимах
+(ValueRoot.read + оба replace; CellRoot.read уже паниковал); M14-инвариант
+пере-доказан на wholesale-модели (poison-проба). Perf trade-off (принят
+владельцем, NOT gate): table_alloc_setmetatable ≈+5.1%, coroutine_yield
+≈+5.5%, temp_table_alloc ≈+4.9% vs baseline 66cd438 — причинно
+атрибутированы контрактам unified-модели (BuiltinResult/ResumeResult,
+reserve/prepare publication, protected boundaries, PUC final-traversal
+nil-fill); GC-гипотеза опровергнута (шаги GC == baseline); полный
+диагностический след — gate-прогоны фазы (/tmp evidence) + отчёты A1.1.
+Residuals (backlog, без новых пунктов): big.lua both_fail (pre-existing);
+locals.lua tracegc-dot divergence (pre-existing, stash-verified);
+GC-cycles +1.2% (S7 accounting, корректен); M18 gmatch (UNCONFIRMED),
+M29-остаток (мёртвые testhelper-функции); NEW UNCONFIRMED (найден в
+A1.1-final): один объект в двух TBC-переменных одной области — guard
+пропускает второй close, PUC исполняет `__close` дважды (решающий
+эксперимент: `local a <close> = o; local b <close> = o` + маркерный
+__close, дифференциал против PUC 5.5); candidate: пер-переменная
+идентичность вместо per-object guard. Open-count 30→23 (7 закрытий).
 
 ### P16.42 Iteration 2b — builtinTestcStats rooting hole CLOSED (2026-09-13)
 

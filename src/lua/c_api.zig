@@ -80,12 +80,13 @@ const mapCompileError = api.mapCompileError;
 
 /// Resolve a C API index that may be an upvalue pseudo-index.
 /// Returns the Value pointer for the upvalue, or null if not an upvalue index.
-fn upvalueAt(vm: *Vm, idx: c_int) ?Value {
+fn upvalueAt(h: *lua_State, idx: c_int) ?Value {
     // Upvalue indices are LUA_REGISTRYINDEX - n (n=1,2,...)
     // LUA_REGISTRYINDEX = -1001000
     if (idx < -1001000 and idx >= -1001255) {
         const upv_n: usize = @intCast(-1001000 - idx); // 1-based
-        if (vm.c_active_closure) |cl| {
+        // PUC: the running closure is the top C-frame's callee (ci->func).
+        if (Vm.runningCClosureOnThread(Vm.handleThread(h))) |cl| {
             if (upv_n >= 1 and upv_n <= cl.upvalues.len) {
                 return cl.upvalues[upv_n - 1].value;
             }
@@ -183,8 +184,7 @@ pub export fn lua_newstate(
 ///
 /// The handle is allocated on the heap and its lifetime is tied to the
 /// Thread's GC lifetime: `gcFreeObject(.thread)` frees the handle via
-/// `Thread.api_handle`. Each handle has its own `c_stack`, and
-/// `Vm.cur_c_stack` points to the active handle's stack.
+/// `Thread.api_handle`.
 pub export fn lua_newthread(L: ?*lua_State) ?*lua_State {
     // P16.50-review-2 BLOCKER 2: PUC lua_newthread (lua.h:165,
     // lstate.c:273-291) has NO nullable failure result — an allocation
@@ -196,22 +196,48 @@ pub export fn lua_newthread(L: ?*lua_State) ?*lua_State {
     // protected transport (cThrow, LUA_ERRMEM) — never a NULL return.
     const parent = L orelse return null;
     const vm = parent.vm;
-    const saved_c_api_thread = vm.c_api_thread;
     const result = luaNewThreadTx(parent, vm) catch |err| {
-        vm.c_api_thread = saved_c_api_thread;
-        cThrowOn(vm, parent, err);
+        switch (err) {
+            error.OutOfMemory => cThrowOn(vm, parent, error.OutOfMemory),
+            // The reserve's stack-overflow (fail() inside cWindowEnsure)
+            // already installed err_obj — surface it as LUA_ERRRUN.
+            error.RuntimeError => cThrowOn(vm, parent, error.Runtime),
+        }
     };
     return result;
 }
 
 /// Inner transaction for lua_newthread (P16.50-review): every failure
 /// returns an ERROR so the errdefer actually fires.
-pub fn luaNewThreadTx(parent: *vm_mod.lua_State, vmp: *Vm) error{OutOfMemory}!*vm_mod.lua_State {
+pub fn luaNewThreadTx(parent: *vm_mod.lua_State, vmp: *Vm) error{ OutOfMemory, RuntimeError }!*vm_mod.lua_State {
+    // Reserve the parent window's push slot BEFORE the
+    // fallible creation work (PUC lua_newthread pushes the new thread on
+    // L->top after the object exists; the window growth must not fail
+    // after publication — reserve/prepare → allocate → initialize →
+    // infallible commit). cWindowEnsure only grows capacity; it does not
+    // move top, so no uninitialized slot is exposed to the collector.
+    const parent_th = Vm.handleThread(parent);
+    vmp.cWindowEnsure(parent_th, 1) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.RuntimeError => return error.RuntimeError,
+        // The growth path (growBcStackCapSlow → reallocBcStackArrays) is
+        // pure allocation — no dispatch, no Lua code, no GC step — so
+        // error.Yield is unreachable here (same provably-non-yieldable
+        // contract as lua_closeslot's apiCall arm).
+        error.Yield => unreachable,
+    };
     // Prepare-first: after this, registration cannot fail.
     try vmp.gcPrepareRegister(1);
     const th = try vmp.alloc.create(vm_mod.Thread);
-    errdefer vmp.alloc.destroy(th);
+    // Full teardown — the allocStateHandle failure window
+    // below runs AFTER initThreadBaseFrame committed the
+    // base-frame arrays to the thread (plain destroy would orphan them).
+    errdefer vmp.destroyUnregisteredThread(th);
     th.* = .{ .status = .suspended, .callee = .Nil };
+    // Base C frame + initial stack (PUC luaE_newthread →
+    // stack_init + base_ci) while UNREGISTERED — transactional, so the
+    // destroy errdefer above is safe.
+    try vmp.initThreadBaseFrame(th);
     vmp.gcRegisterCommit(.{ .thread = th });
     vmp.gcNoteAlloc(@sizeOf(vm_mod.Thread));
     var committed = false;
@@ -220,19 +246,15 @@ pub fn luaNewThreadTx(parent: *vm_mod.lua_State, vmp: *Vm) error{OutOfMemory}!*v
         vmp.gcNoteFree(@sizeOf(vm_mod.Thread));
     };
     committed = true;
-    vmp.c_api_thread = th;
-    // Create the coroutine handle with its own c_stack (and its
-    // LUA_EXTRASPACE extra space in front, inheriting the main thread's
-    // extra-space contents — PUC lstate.c:291-293).
+    // Create the coroutine handle (with its LUA_EXTRASPACE extra space
+    // in front, inheriting the main thread's extra-space contents — PUC
+    // lstate.c:291-293).
     const handle = try vmp.allocStateHandle(false);
     handle.* = .{ .vm = vmp, .thread = th, .is_main = false };
     th.api_handle = handle;
-    // Push the thread value on the parent's c_stack (PUC pushes it on L->top).
-    parent.c_stack.append(vmp.alloc, .{ .Thread = th }) catch {
-        vmp.freeStateHandle(handle);
-        th.api_handle = null;
-        return error.OutOfMemory;
-    };
+    // Push the thread value on the parent's window (PUC pushes it on
+    // L->top). Infallible: the slot was reserved before creation.
+    vmp.cWindowPush(parent_th, .{ .Thread = th }) catch unreachable;
     return handle;
 }
 
@@ -286,12 +308,16 @@ pub export fn lua_closethread(L: ?*lua_State, from: ?*lua_State) c_int {
     // returns APIstatus(status) VERBATIM (no kind conversion; PUC's
     // resetthread also installs the error object via luaD_seterrorobj at
     // stack.p+1 — mirrored below with the fixed MEMERRMSG object,
-    // best-effort: the c_stack append can itself OOM).
+    // best-effort: the window push can itself OOM).
     const result = vm.apiCloseThread(th) catch |err| switch (err) {
         error.OutOfMemory => {
             vm.setOutOfMemoryError();
-            h.c_stack.clearRetainingCapacity();
-            h.c_stack.append(vm.alloc, vm.errThread().err_obj) catch {};
+            // PUC luaE_resetthread: L->top = L->stack + 1 — window count 0,
+            // then seterrorobj installs the object at the (reserved) slot.
+            // Best-effort push: the status (4) is still returned, only the
+            // object push is lost on a nested OOM.
+            th.top = Vm.cWindowBase(th);
+            vm.cWindowPush(th, vm.errThread().err_obj) catch {};
             return 4; // LUA_ERRMEM (PUC APIstatus, P16.50-review-5 B2)
         },
         error.RuntimeError => {
@@ -348,19 +374,19 @@ pub export fn lua_closethread(L: ?*lua_State, from: ?*lua_State) c_int {
 
     if (result.status == 0) {
         // PUC luaE_resetthread: L->top = L->stack + 1 (only the function
-        // slot). lua_gettop(co) == 0 after close. Clear the handle's c_stack.
-        h.c_stack.clearRetainingCapacity();
+        // slot). lua_gettop(co) == 0 after close.
+        th.top = Vm.cWindowBase(th);
         return 0; // LUA_OK
     }
 
-    // Error: push the error object on c_stack (PUC luaD_seterrorobj).
-    h.c_stack.clearRetainingCapacity();
+    // Error: push the error object on the window (PUC luaD_seterrorobj).
     // (b) status-returning API: lua_closethread returns the close status;
     // PUC's seterrorobj moves the object WITHIN one stack (infallible), our
-    // c_stack append can OOM — the status (2) is still returned, only the
+    // window push can OOM — the status (2) is still returned, only the
     // object push is lost (P16.50-review-5 B2 inventory; architectural fix
-    // = reserved c_stack slots, same family as the LUA_MINSTACK reserve).
-    h.c_stack.append(vm.alloc, result.err) catch {};
+    // = reserved window slots, same family as the LUA_MINSTACK reserve).
+    th.top = Vm.cWindowBase(th);
+    vm.cWindowPush(th, result.err) catch {};
     return 2; // LUA_ERRRUN
 }
 
@@ -397,8 +423,8 @@ pub export fn lua_getextraspace(L: ?*lua_State) ?*anyopaque {
 /// stack to the top of `to`'s stack. Both states must share the same global
 /// state (i.e., `to` was created by `lua_newthread(from)`).
 ///
-/// Operates on the per-handle C-API stacks (`c_stack`). Negative `n` is
-/// clamped to zero. Self-move (from == to) is a no-op.
+/// Operates on the anchored C-API windows of the two threads' stacks.
+/// Negative `n` is clamped to zero. Self-move (from == to) is a no-op.
 pub export fn lua_xmove(from: ?*lua_State, to: ?*lua_State, n: c_int) void {
     const src_h = from orelse return;
     const dst_h = to orelse return;
@@ -410,28 +436,40 @@ pub export fn lua_xmove(from: ?*lua_State, to: ?*lua_State, n: c_int) void {
     // Self-move: PUC lua_xmove handles this by copying in-place, which is
     // a no-op for value semantics. Skip to avoid duplicating items.
     if (src_h == dst_h) return;
-    if (count > src_h.c_stack.items.len) return;
-    const start = src_h.c_stack.items.len - count;
-    // Copy top `count` items from src to dst, then truncate src.
+    const src_th = Vm.handleThread(src_h);
+    const dst_th = Vm.handleThread(dst_h);
+    if (count > Vm.cWindowCount(src_th)) return;
+    const start = src_th.top - count;
+    // Copy top `count` values from src to dst (alias-safe push: the source
+    // offset is captured before any growth), then truncate src plainly
+    // (PUC: `from->top.p -= n`).
     // PUC lua_xmove → luaD_growstack on dst: OOM is LUA_ERRMEM thrown on
     // the DESTINATION state (P16.50-review-5 B2 — the old `catch return`
     // silently dropped the move).
-    dst_h.c_stack.appendSlice(vm.alloc, src_h.c_stack.items[start..]) catch |e|
-        cThrowOn(vm, dst_h, e);
-    src_h.c_stack.items.len = start;
+    vm.cWindowPushSlice(dst_th, src_th.stack[start..src_th.top]) catch |e|
+        cThrowOn(vm, dst_h, api.mapVmError(e));
+    src_th.top = start;
+    // xmove safepoint — both windows must still hold
+    // their live anchors (see api.State.xmove's twin check).
+    if (Vm.WINDOW_DEBUG_CHECKS) {
+        vm.debugCheckWindowAt(src_th, .xmove);
+        vm.debugCheckWindowAt(dst_th, .xmove);
+    }
 }
 
 // `_longjmp` from libc. Using `_longjmp` (not `longjmp`) matches PUC's
 // `__sigsetjmp(env, 0)` no-savemask choice.
 extern fn _longjmp(jb: *anyopaque, val: c_int) noreturn;
 
-/// PUC `lua_error` (noreturn): captures the error object from c_stack top into
-/// `c_error_value`, then `_longjmp` to the nearest C-function boundary.
+/// PUC `lua_error` (noreturn): captures the error object from the window
+/// top into `c_error_value`, then `_longjmp` to the nearest C-function
+/// boundary.
 pub export fn lua_error(L: ?*lua_State) noreturn {
     const h = L orelse @panic("lua_error: null state");
     const vm = h.vm;
-    if (h.c_stack.items.len > 0) {
-        vm.c_error_value = h.c_stack.items[h.c_stack.items.len - 1];
+    const th = Vm.handleThread(h);
+    if (Vm.cWindowCount(th) > 0) {
+        vm.c_error_value = th.stack[th.top - 1];
     } else {
         @panic("lua_error: no error object on stack");
     }
@@ -509,18 +547,29 @@ pub export fn lua_callk(
         return;
     };
 
-    // Read callee/args from c_stack (PUC: func = L->top - (nargs+1)).
+    // Read callee/args from the anchored window (PUC: func = L->top -
+    // (nargs+1)). The args are DUPED across the call boundary: the slice
+    // would alias th.stack, which the nested execution may grow (realloc),
+    // and a yield longjmps past any `defer` — the copy is freed explicitly
+    // in every arm below.
+    const wth = Vm.handleThread(h);
     const nargs_usize: usize = @intCast(@max(nargs, 0));
-    if (h.c_stack.items.len < nargs_usize + 1) {
+    if (Vm.cWindowCount(wth) < nargs_usize + 1) {
         if (vm.c_error_jmp) |jb| {
             vm.c_error_value = .Nil;
             _longjmp(jb, 1);
         }
         @panic("lua_call without an active C-function boundary");
     }
-    const fn_idx = h.c_stack.items.len - nargs_usize - 1;
-    const callee = h.c_stack.items[fn_idx];
-    const call_args = h.c_stack.items[fn_idx + 1 ..];
+    const func_slot = wth.top - nargs_usize - 1;
+    const callee = wth.stack[func_slot];
+    const call_args = vm.alloc.dupe(vm_mod.Value, wth.stack[func_slot + 1 .. wth.top]) catch {
+        if (vm.c_error_jmp) |jb| {
+            vm.c_error_value = .Nil;
+            _longjmp(jb, 1);
+        }
+        @panic("lua_call OOM without an active C-function boundary");
+    };
 
     // Delegate k/ctx saving + apiCall to the shared helper (PUC lapi.c:1047-1053).
     const kfn: ?*const fn (?*vm_mod.lua_State, c_int, isize) callconv(.c) c_int = if (k) |kf|
@@ -528,32 +577,36 @@ pub export fn lua_callk(
     else
         null;
 
-    const ret = vm.luaCallKShared(th, callee, call_args, kfn, ctx) catch |err| switch (err) {
-        error.Yield => {
-            if (vm.c_error_jmp) |jb| {
-                _longjmp(jb, 2);
-            }
-            @panic("lua_call yield without an active C-function boundary");
-        },
-        error.RuntimeError => {
-            if (vm.c_error_jmp) |jb| {
-                vm.c_error_value = vm.errThread().err_obj;
-                _longjmp(jb, 1);
-            }
-            @panic("lua_call without an active C-function boundary");
-        },
-        error.OutOfMemory => {
-            if (vm.c_error_jmp) |jb| {
-                vm.c_error_value = .Nil;
-                _longjmp(jb, 1);
-            }
-            @panic("lua_call OOM without an active C-function boundary");
-        },
+    const ret = vm.luaCallKShared(th, callee, call_args, kfn, ctx) catch |err| {
+        vm.alloc.free(call_args);
+        switch (err) {
+            error.Yield => {
+                if (vm.c_error_jmp) |jb| {
+                    _longjmp(jb, 2);
+                }
+                @panic("lua_call yield without an active C-function boundary");
+            },
+            error.RuntimeError => {
+                if (vm.c_error_jmp) |jb| {
+                    vm.c_error_value = vm.errThread().err_obj;
+                    _longjmp(jb, 1);
+                }
+                @panic("lua_call without an active C-function boundary");
+            },
+            error.OutOfMemory => {
+                if (vm.c_error_jmp) |jb| {
+                    vm.c_error_value = .Nil;
+                    _longjmp(jb, 1);
+                }
+                @panic("lua_call OOM without an active C-function boundary");
+            },
+        }
     };
+    vm.alloc.free(call_args);
     defer vm.alloc.free(ret);
-    h.c_stack.items.len = fn_idx;
-    const want: usize = if (nresults < 0) ret.len else @min(ret.len, @as(usize, @intCast(nresults)));
-    h.c_stack.appendSlice(vm.alloc, ret[0..want]) catch {
+    // PUC poscall moveresults to the callee's func slot: fixed nresults
+    // nil-fills (class 3), MULTRET copies all, 0 drops all.
+    vm.cWindowMoveResults(wth, func_slot, ret, nresults) catch {
         if (vm.c_error_jmp) |jb| {
             vm.c_error_value = .Nil;
             _longjmp(jb, 1);
@@ -564,7 +617,7 @@ pub export fn lua_callk(
 
 /// Unprotected call: on failure, rethrows through the active C-function
 /// boundary via longjmp (PUC `luaD_throw`). The success path delegates to
-/// `apiCall`, which marshals results on `c_stack`.
+/// `apiCall`, which marshals results on the window.
 ///
 /// P15.78: When the callee yields (error.Yield), we longjmp with value 2
 /// (yield) instead of value 1 (error). This allows `callCFunction` to
@@ -573,8 +626,9 @@ pub export fn lua_callk(
 fn lua_callkImpl(L: ?*lua_State, nargs: c_int, nresults: c_int) void {
     const h = L orelse return;
     const vm = h.vm;
+    const th = Vm.handleThread(h);
     const nargs_usize: usize = @intCast(@max(nargs, 0));
-    if (h.c_stack.items.len < nargs_usize + 1) {
+    if (Vm.cWindowCount(th) < nargs_usize + 1) {
         // Stack underflow — treat as error
         if (vm.c_error_jmp) |jb| {
             vm.c_error_value = .Nil;
@@ -582,39 +636,50 @@ fn lua_callkImpl(L: ?*lua_State, nargs: c_int, nresults: c_int) void {
         }
         @panic("lua_call without an active C-function boundary");
     }
-    const fn_idx = h.c_stack.items.len - nargs_usize - 1;
-    const callee = h.c_stack.items[fn_idx];
-    const args = h.c_stack.items[fn_idx + 1 ..];
-    const ret = vm.apiCall(.nonyieldable, callee, args) catch |err| switch (err) {
-        error.Yield => {
-            // P15.78: Callee yielded. Longjmp with value 2 (yield) so
-            // callCFunction can propagate error.Yield and leave the C-frame
-            // in place for finishCcall on resume.
-            if (vm.c_error_jmp) |jb| {
-                _longjmp(jb, 2);
-            }
-            @panic("lua_call yield without an active C-function boundary");
-        },
-        error.RuntimeError => {
-            // Error: propagate through boundary via longjmp
-            if (vm.c_error_jmp) |jb| {
-                vm.c_error_value = vm.errThread().err_obj;
-                _longjmp(jb, 1);
-            }
-            @panic("lua_call without an active C-function boundary");
-        },
-        error.OutOfMemory => {
-            if (vm.c_error_jmp) |jb| {
-                vm.c_error_value = .Nil;
-                _longjmp(jb, 1);
-            }
-            @panic("lua_call OOM without an active C-function boundary");
-        },
+    const func_slot = th.top - nargs_usize - 1;
+    const callee = th.stack[func_slot];
+    // Dupe the args across the call boundary (the slice would alias
+    // th.stack, which the nested execution may grow).
+    const args = vm.alloc.dupe(vm_mod.Value, th.stack[func_slot + 1 .. th.top]) catch {
+        if (vm.c_error_jmp) |jb| {
+            vm.c_error_value = .Nil;
+            _longjmp(jb, 1);
+        }
+        @panic("lua_call OOM without an active C-function boundary");
     };
+    const ret = vm.apiCall(.nonyieldable, callee, args) catch |err| {
+        vm.alloc.free(args);
+        switch (err) {
+            error.Yield => {
+                // P15.78: Callee yielded. Longjmp with value 2 (yield) so
+                // callCFunction can propagate error.Yield and leave the C-frame
+                // in place for finishCcall on resume.
+                if (vm.c_error_jmp) |jb| {
+                    _longjmp(jb, 2);
+                }
+                @panic("lua_call yield without an active C-function boundary");
+            },
+            error.RuntimeError => {
+                // Error: propagate through boundary via longjmp
+                if (vm.c_error_jmp) |jb| {
+                    vm.c_error_value = vm.errThread().err_obj;
+                    _longjmp(jb, 1);
+                }
+                @panic("lua_call without an active C-function boundary");
+            },
+            error.OutOfMemory => {
+                if (vm.c_error_jmp) |jb| {
+                    vm.c_error_value = .Nil;
+                    _longjmp(jb, 1);
+                }
+                @panic("lua_call OOM without an active C-function boundary");
+            },
+        }
+    };
+    vm.alloc.free(args);
     defer vm.alloc.free(ret);
-    h.c_stack.items.len = fn_idx;
-    const want: usize = if (nresults < 0) ret.len else @min(ret.len, @as(usize, @intCast(nresults)));
-    h.c_stack.appendSlice(vm.alloc, ret[0..want]) catch {
+    // PUC poscall moveresults: fixed nresults nil-fills (class 3).
+    vm.cWindowMoveResults(th, func_slot, ret, nresults) catch {
         if (vm.c_error_jmp) |jb| {
             vm.c_error_value = .Nil;
             _longjmp(jb, 1);
@@ -739,8 +804,15 @@ pub export fn lua_pushvfstring(
     }
 
     // PUC luaO_pushvfstring → luaS_new: OOM is LUA_ERRMEM (never "").
+    // Reserve the slot BEFORE the string exists — the
+    // push then hits reserved capacity and cannot sweep the constructed
+    // unrooted string at a full window (emergency GC + retry).
+    vm.cWindowEnsure(Vm.handleThread(h), 1) catch |e| {
+        buf.deinit(vm.alloc);
+        cThrowOn(vm, h, api.mapVmError(e));
+    };
     const ls = vm.internStr(buf.items) catch cThrowOomBuf(vm, h, &buf);
-    h.c_stack.append(vm.alloc, .{ .String = ls }) catch cThrowOomBuf(vm, h, &buf);
+    vm.cWindowPush(Vm.handleThread(h), .{ .String = ls }) catch cThrowOomBuf(vm, h, &buf);
     buf.deinit(vm.alloc);
     return @ptrCast(@constCast(ls.bytes().ptr));
 }
@@ -842,6 +914,14 @@ pub export fn lua_load(
     const h = L orelse return 2; // LUA_ERRRUN
     const vm = h.vm;
 
+    // Reserve the result slot BEFORE the load — the
+    // closure (or error string) push then hits reserved capacity and
+    // cannot sweep the constructed unrooted object at a full window.
+    vm.cWindowEnsure(Vm.handleThread(h), 1) catch |e| switch (api.mapVmError(e)) {
+        error.OutOfMemory => return statusCode(.memory_error),
+        else => return statusCode(.runtime_error),
+    };
+
     // Collect all chunks from the reader into a contiguous buffer (PUC's
     // `luaD_protectedparser` does the same via `luaZ_read` into a growable
     // buffer before parsing). The buffer is owned by us and transferred to
@@ -866,13 +946,13 @@ pub export fn lua_load(
     };
     switch (result) {
         .closure => |cl| {
-            h.c_stack.append(vm.alloc, .{ .Closure = cl }) catch return statusCode(.memory_error);
+            vm.cWindowPush(Vm.handleThread(h), .{ .Closure = cl }) catch return statusCode(.memory_error);
             return 0; // LUA_OK
         },
         .err_msg => |msg| {
             defer vm.alloc.free(msg);
             const errval = vm.internStr(msg) catch return statusCode(.memory_error);
-            h.c_stack.append(vm.alloc, .{ .String = errval }) catch return statusCode(.memory_error);
+            vm.cWindowPush(Vm.handleThread(h), .{ .String = errval }) catch return statusCode(.memory_error);
             return statusCode(.syntax_error); // LUA_ERRSYNTAX
         },
     }
@@ -896,9 +976,10 @@ pub export fn lua_dump(
     const vm = h.vm;
     if (writer == null) return 1;
 
-    // Get the function at the top of c_stack (PUC uses index2value(L, -1)).
-    if (h.c_stack.items.len == 0) return 1;
-    const val = h.c_stack.items[h.c_stack.items.len - 1];
+    // Get the function at the top of the window (PUC uses index2value(L, -1)).
+    const dump_th = Vm.handleThread(h);
+    if (Vm.cWindowCount(dump_th) == 0) return 1;
+    const val = dump_th.stack[dump_th.top - 1];
     const cl = switch (val) {
         .Closure => |c| c,
         else => return 1, // not a Lua function
@@ -974,13 +1055,13 @@ pub export fn lua_stringtonumber(L: ?*lua_State, s: [*:0]const u8) usize {
         // PUC lua_stringtonumber → lua_pushinteger → api_incr_top: OOM is
         // LUA_ERRMEM (P16.50-review-5 B2 — the old `catch return 0` masked
         // the push failure as "not a number").
-        h.c_stack.append(vm.alloc, .{ .Int = i }) catch |e| cThrowOn(vm, h, e);
+        vm.cWindowPush(Vm.handleThread(h), .{ .Int = i }) catch |e| cThrowOn(vm, h, api.mapVmError(e));
         return str.len + 1; // PUC returns strlen(s) + 1 (including NUL)
     } else |_| {}
 
     // Try float (PUC's `l_str2d`): handles decimal, hex floats, inf, nan.
     if (std.fmt.parseFloat(f64, trimmed)) |n| {
-        h.c_stack.append(vm.alloc, .{ .Num = n }) catch |e| cThrowOn(vm, h, e);
+        vm.cWindowPush(Vm.handleThread(h), .{ .Num = n }) catch |e| cThrowOn(vm, h, api.mapVmError(e));
         return str.len + 1;
     } else |_| {}
 
@@ -997,8 +1078,9 @@ pub export fn lua_stringtonumber(L: ?*lua_State, s: [*:0]const u8) usize {
 /// Zig's `{d}` format, which produces the shortest round-trip representation.
 pub export fn lua_numbertocstring(L: ?*lua_State, idx: c_int, buff: [*]u8) c_uint {
     const h = L orelse return 0;
-    const abs = normalizeIndex(idx, h.c_stack.items.len) orelse return 0;
-    const val = h.c_stack.items[abs];
+    const n2s_th = Vm.handleThread(h);
+    const abs = Vm.cWindowSlot(n2s_th, idx) orelse return 0;
+    const val = n2s_th.stack[abs];
 
     switch (val) {
         .Int => |i| {
@@ -1049,7 +1131,7 @@ pub export fn lua_numbertocstring(L: ?*lua_State, idx: c_int, buff: [*]u8) c_uin
 /// PUC marks `L->ci` — ALWAYS the topmost CallInfo of the state running the
 /// C code. Two lanes reach here:
 ///   * a C function (called via lua_call/OP_CALL): its own C CallInfo is
-///     topmost — the frame_slot path (live slot on the frame's c_stack);
+///     topmost — the frame_slot path (live slot on th.stack);
 ///   * a debug hook (PUC `luaD_hook` runs hooks with NO CallInfo of their
 ///     own, keeping `L->ci` = the interrupted frame): the topmost frame is
 ///     the interrupted LUA frame — the hook path below.
@@ -1064,14 +1146,22 @@ pub export fn lua_numbertocstring(L: ?*lua_State, idx: c_int, buff: [*]u8) c_uin
 pub export fn lua_toclose(L: ?*lua_State, idx: c_int) void {
     const h = L orelse return;
     const vm = h.vm;
-    const abs = normalizeIndex(idx, h.c_stack.items.len) orelse return;
+    // Resolve `idx` against the CURRENT EXECUTION's window
+    // on Thread.stack (PUC index2value on the shared L->stack) — the
+    // topmost frame of the thread that owns the current execution. Both
+    // lanes (C function / debug hook) read the same window: a C
+    // function's window is its own frame's [frameBase, th.top); a hook's
+    // window is the interrupted Lua frame's registers (the hook transport
+    // raises th.top to the frame's windowTop while the hook runs, and the
+    // hook's own C-API pushes land above th.top).
+    const th = vm.current_thread orelse vm.main_thread orelse return;
+    const abs_slot = Vm.cWindowSlot(th, idx) orelse return;
     // The mark goes on the topmost frame of the thread that owns the
     // current execution (PUC: L->ci — the running activation). While a C
     // function runs, that is always its own callCFunction frame; while a
     // debug hook runs (hooks get no frame of their own — PUC luaD_hook
     // keeps L->ci = the interrupted frame), it is the interrupted Lua
     // frame.
-    const th = vm.current_thread orelse vm.main_thread orelse return;
     const th_bc = th.call_frames;
     if (th_bc.len() == 0) return; // no activation: PUC api_check-fail; lenient no-op
     const fi = th_bc.len() - 1;
@@ -1080,34 +1170,35 @@ pub export fn lua_toclose(L: ?*lua_State, idx: c_int) void {
     // pairs (detached entries arise from pop-detach and the hook lane).
     const chain = &th.c_tbc_chain;
     if (f.isC()) {
-        // C-function lane: the slot lives on this frame's (parked) c_stack.
+        // C-function lane: the slot is an ABSOLUTE Thread.stack index in
+        // this frame's window (PUC: a stack LEVEL on the shared L->stack).
         // Within-frame LIFO: a mark at or below the frame's chain top is a
         // PUC api_check violation — lenient ignore (idempotent re-mark).
         if (chain.items.len > 0) {
             const top = chain.items[chain.items.len - 1];
             if (top == .frame_slot and top.frame_slot.cframe_idx == fi and
-                top.frame_slot.slot_idx >= abs) return;
+                top.frame_slot.slot_idx >= abs_slot) return;
         }
         // PUC lua_toclose → luaF_newtbcmark → luaM_error: OOM is
         // LUA_ERRMEM (P16.50-review-5 B2 — the old `catch {}` silently
         // dropped the __close mark).
         chain.append(vm.alloc, .{ .frame_slot = .{
             .cframe_idx = fi,
-            .slot_idx = abs,
+            .slot_idx = abs_slot,
         } }) catch |e| cThrowOn(vm, h, e);
     } else {
         // Hook lane (PUC luaD_hook: L->ci = the interrupted Lua frame).
         // PUC marks the frame (CIST_TBC) + the slot's LEVEL in tbclist; the
         // close later reads the LIVE slot at that level. luazig captures
-        // the value NOW as a detached entry: the hook's c_stack slot is
+        // the value NOW as a detached entry: the hook's window slot is
         // unstable across later C-API operations, and Lua execution uses
-        // the bc_stack — so nothing between the hook and the close observes
-        // that c_stack slot. This is equivalent to PUC's live-level read
+        // the stack — so nothing between the hook and the close observes
+        // that window slot. This is equivalent to PUC's live-level read
         // for every shape where the mark's stack level is not reused
         // before the close (a second hook event or a C call reusing the
         // level is a PUC shared-stack quirk luazig's split stacks cannot
         // — and need not — reproduce).
-        const value = if (abs < h.c_stack.items.len) h.c_stack.items[abs] else .Nil;
+        const value = th.stack[abs_slot];
         // Same luaF_newtbcmark OOM contract as the frame_slot lane above.
         chain.append(vm.alloc, .{ .detached = value }) catch |e| cThrowOn(vm, h, e);
     }
@@ -1131,8 +1222,10 @@ pub export fn lua_toclose(L: ?*lua_State, idx: c_int) void {
 pub export fn lua_closeslot(L: ?*lua_State, idx: c_int) void {
     const h = L orelse return;
     const vm = h.vm;
-    const abs = normalizeIndex(idx, h.c_stack.items.len) orelse return;
+    // Window slot on Thread.stack (same resolution as
+    // lua_toclose — the current execution's topmost C frame's window).
     const th = vm.current_thread orelse vm.main_thread orelse return;
+    const abs = Vm.cWindowSlot(th, idx) orelse return;
     const th_bc = th.call_frames;
     // The current C activation: the topmost C-frame of this thread.
     var fi = th_bc.len();
@@ -1153,9 +1246,9 @@ pub export fn lua_closeslot(L: ?*lua_State, idx: c_int) void {
     // closer error must not re-close this entry). Ordered pop — it IS the
     // top entry.
     _ = chain.pop();
-    const val = if (abs < h.c_stack.items.len) h.c_stack.items[abs] else .Nil;
+    const val = th.stack[abs];
     // PUC preclose(CLOSEKTOP): the closed slot becomes nil immediately.
-    if (abs < h.c_stack.items.len) h.c_stack.items[abs] = .Nil;
+    th.stack[abs] = .Nil;
 
     const mm = vm.getTmByObj(val, .close);
     if (mm == null) {
@@ -1199,6 +1292,13 @@ pub export fn lua_closeslot(L: ?*lua_State, idx: c_int) void {
 pub export fn luaL_loadbufferx(L: ?*lua_State, buff: [*]const u8, sz: usize, name: [*:0]const u8, mode: ?[*:0]const u8) c_int {
     const h = L orelse return 2; // LUA_ERRRUN
     const vm = h.vm;
+    // Reserve the result slot BEFORE the load — the
+    // closure (or error string) push then hits reserved capacity and
+    // cannot sweep the constructed unrooted object at a full window.
+    vm.cWindowEnsure(Vm.handleThread(h), 1) catch |e| switch (api.mapVmError(e)) {
+        error.OutOfMemory => return statusCode(.memory_error),
+        else => return statusCode(.runtime_error),
+    };
     const mode_slice: ?[]const u8 = if (mode) |m| std.mem.span(m) else null;
     const env: Value = .{ .Table = vm.global_env };
 
@@ -1208,13 +1308,13 @@ pub export fn luaL_loadbufferx(L: ?*lua_State, buff: [*]const u8, sz: usize, nam
     };
     switch (result) {
         .closure => |cl| {
-            h.c_stack.append(vm.alloc, .{ .Closure = cl }) catch return statusCode(.memory_error);
+            vm.cWindowPush(Vm.handleThread(h), .{ .Closure = cl }) catch return statusCode(.memory_error);
             return 0; // LUA_OK
         },
         .err_msg => |msg| {
             defer vm.alloc.free(msg);
             const errval = vm.internStr(msg) catch return statusCode(.memory_error);
-            h.c_stack.append(vm.alloc, .{ .String = errval }) catch return statusCode(.memory_error);
+            vm.cWindowPush(Vm.handleThread(h), .{ .String = errval }) catch return statusCode(.memory_error);
             return statusCode(.syntax_error); // LUA_ERRSYNTAX
         },
     }
@@ -1239,6 +1339,13 @@ pub export fn luaL_loadbufferx(L: ?*lua_State, buff: [*]const u8, sz: usize, nam
 pub export fn luaL_loadfilex(L: ?*lua_State, filename: [*:0]const u8, mode: ?[*:0]const u8) c_int {
     const h = L orelse return 2; // LUA_ERRRUN
     const vm = h.vm;
+    // Reserve the result slot BEFORE the load — the
+    // closure (or error string) push then hits reserved capacity and
+    // cannot sweep the constructed unrooted object at a full window.
+    vm.cWindowEnsure(Vm.handleThread(h), 1) catch |e| switch (api.mapVmError(e)) {
+        error.OutOfMemory => return statusCode(.memory_error),
+        else => return statusCode(.runtime_error),
+    };
     // (b) status-returning: luaL_loadfilex reports failures as a status.
     // Residual divergence (B2 inventory, not a swallow): PUC maps a missing
     // file to LUA_ERRFILE; loadFile's error set is undifferentiated here, so
@@ -1312,13 +1419,13 @@ pub export fn luaL_loadfilex(L: ?*lua_State, filename: [*:0]const u8, mode: ?[*:
 
     switch (result) {
         .closure => |cl| {
-            h.c_stack.append(vm.alloc, .{ .Closure = cl }) catch return statusCode(.memory_error);
+            vm.cWindowPush(Vm.handleThread(h), .{ .Closure = cl }) catch return statusCode(.memory_error);
             return 0; // LUA_OK
         },
         .err_msg => |msg| {
             defer vm.alloc.free(msg);
             const errval = vm.internStr(msg) catch return statusCode(.memory_error);
-            h.c_stack.append(vm.alloc, .{ .String = errval }) catch return statusCode(.memory_error);
+            vm.cWindowPush(Vm.handleThread(h), .{ .String = errval }) catch return statusCode(.memory_error);
             return statusCode(.syntax_error); // LUA_ERRSYNTAX
         },
     }
@@ -1384,25 +1491,36 @@ pub export fn lua_rotate(L: ?*lua_State, idx: c_int, n: c_int) void {
 pub export fn lua_copy(L: ?*lua_State, fromidx: c_int, toidx: c_int) void {
     const h = L orelse return;
     const vm = h.vm;
+    const th = Vm.handleThread(h);
     // Handle upvalue pseudo-index as destination (write to upvalue)
     if (toidx < -1001000 and toidx >= -1001255) {
-        const src = upvalueAt(vm, fromidx) orelse blk: {
-            const abs = normalizeIndex(fromidx, h.c_stack.items.len) orelse return;
-            break :blk h.c_stack.items[abs];
+        const src = upvalueAt(h, fromidx) orelse blk: {
+            const slot = Vm.cWindowSlot(th, fromidx) orelse return;
+            break :blk th.stack[slot];
         };
         const upv_n: usize = @intCast(-1001000 - toidx);
-        if (vm.c_active_closure) |cl| {
+        if (Vm.runningCClosureOnThread(th)) |cl| {
             if (upv_n >= 1 and upv_n <= cl.upvalues.len) {
-                cl.upvalues[upv_n - 1].value = src;
+                const cell = cl.upvalues[upv_n - 1];
+                // Class 13 (F7): PUC lua_copy's upvalue arm runs luaC_barrier
+                // (lapi.c) — the old direct `.value` store missed the
+                // generational barrier: a young value written into an old
+                // closed cell was swept → use-after-free. Reserve BEFORE the
+                // observable store (lua_setupvalue's prepare/commit contract).
+                const plan = vm.gcPrepareWriteBarrierCell(cell, src) catch |e| cThrowOn(vm, h, e);
+                // PUC: open cells write through to the owning stack slot,
+                // closed cells to the cell's own value (Cell.set = both).
+                cell.set(vm, src);
+                vm.gcCommitWriteBarrierCell(cell, src, plan);
             }
         }
         return;
     }
     // Handle upvalue pseudo-index as source (read from upvalue)
     if (fromidx < -1001000 and fromidx >= -1001255) {
-        const src = upvalueAt(vm, fromidx) orelse return;
-        const abs = normalizeIndex(toidx, h.c_stack.items.len) orelse return;
-        h.c_stack.items[abs] = src;
+        const src = upvalueAt(h, fromidx) orelse return;
+        const slot = Vm.cWindowSlot(th, toidx) orelse return;
+        th.stack[slot] = src;
         return;
     }
     var s = api.State.fromHandle(h);
@@ -1569,7 +1687,7 @@ fn cPanicOn(vm: *Vm, throwing: *vm_mod.lua_State, msg: ?[]const u8) noreturn {
         // PUC's in-stack luaD_seterrorobj (infallible there); if the append
         // itself OOMs, the hook sees a stale top — observable only by the
         // hook, which runs once immediately before the terminal abort.
-        throwing.c_stack.append(vm.alloc, .{ .String = vm.internStrAssume(m) }) catch {};
+        vm.cWindowPush(Vm.handleThread(throwing), .{ .String = vm.internStrAssume(m) }) catch {};
     }
     if (vm.c_panicf) |pf| {
         _ = pf(throwing);
@@ -1608,16 +1726,14 @@ pub export fn lua_pushexternalstring(
 
 pub export fn lua_type(L: ?*lua_State, idx: c_int) c_int {
     const h = L orelse return -1;
-    const vm = h.vm;
-    if (upvalueAt(vm, idx)) |v| return typeCode(api.valueType(v));
+    if (upvalueAt(h, idx)) |v| return typeCode(api.valueType(v));
     var s = api.State.fromHandle(h);
     return if (s.typeOf(idx)) |t| typeCode(t) else -1;
 }
 
 pub export fn lua_toboolean(L: ?*lua_State, idx: c_int) c_int {
     const h = L orelse return 0;
-    const vm = h.vm;
-    if (upvalueAt(vm, idx)) |v| return switch (v) {
+    if (upvalueAt(h, idx)) |v| return switch (v) {
         .Nil => 0,
         .Bool => |b| if (b) 1 else 0,
         else => 1,
@@ -1631,8 +1747,7 @@ pub export fn lua_tointegerx(L: ?*lua_State, idx: c_int, isnum: ?*c_int) i64 {
         if (isnum) |p| p.* = 0;
         return 0;
     };
-    const vm = h.vm;
-    if (upvalueAt(vm, idx)) |v| {
+    if (upvalueAt(h, idx)) |v| {
         const result: ?i64 = switch (v) {
             .Int => |i| i,
             .Num => |n| if (n == @round(n)) @as(i64, @intFromFloat(n)) else null,
@@ -1657,8 +1772,7 @@ pub export fn lua_tonumberx(L: ?*lua_State, idx: c_int, isnum: ?*c_int) f64 {
         if (isnum) |p| p.* = 0;
         return 0;
     };
-    const vm = h.vm;
-    if (upvalueAt(vm, idx)) |v| {
+    if (upvalueAt(h, idx)) |v| {
         const result: ?f64 = switch (v) {
             .Int => |i| @floatFromInt(i),
             .Num => |n| n,
@@ -2075,50 +2189,59 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
     // builtinCoroutineResume in apiResumeThread) is the single writer of
     // inherited depth, the LUAI_MAXCCALLS entry check, and the one resume
     // unit (PUC lua_resume).
-    // Base index in c_stack for truncating after resume (function position on
-    // first resume, or args position on subsequent resumes).
-    var lua_resume_base: usize = 0;
-    // P15.82b: On first resume (co.started == false), the function is on
-    // c_stack at position len-nargs-1, followed by nargs arguments.
-    // On subsequent resumes (co.started == true, status == suspended),
-    // the function was already consumed; c_stack top has only the resume
-    // arguments (nargs values). This mirrors PUC's `resume()` which uses
-    // `L->ci->func` (already set) and reads nargs from `L->top`.
+    //
+    // Unified window model (mirrors api.zig @"resume"). First resume: the function and
+    // args are the window's top need values; the func is consumed into
+    // co.callee and the window is truncated to F (the func slot) so the
+    // trampoline stages the body there (PUC resume: ccall(L, firstArg - 1,
+    // ...) uses func+args in place; there is NO base_ci repositioning in
+    // PUC 5.5 — verified: ldo.c has only the ccall and L->top.p =
+    // firstArg). Re-resume: the args are the window's top nargs values
+    // (PUC: firstArg = L->top - n); F is the remembered func slot (PUC
+    // ci->func, which stays valid across suspensions).
+    const first_resume = !co.started;
+    const th = Vm.handleThread(h);
+    var func_slot: usize = undefined;
+    var args: []const vm_mod.Value = undefined;
     const nargs_usize: usize = @intCast(@max(nargs, 0));
-    const args: []vm_mod.Value = blk: {
-        if (!co.started and co.callee == .Nil) {
-            // First resume: function + args on c_stack.
-            if (h.c_stack.items.len < nargs_usize + 1) return 2;
-            const fi = h.c_stack.items.len - nargs_usize - 1;
-            co.callee = h.c_stack.items[fi];
-            // P15.83j: remember the function position (PUC ci->func). Every
-            // later resume truncates back to it before pushing results, so
-            // stale yielded values never remain under the new results.
-            h.resume_func_base = fi;
-            break :blk h.c_stack.items[fi + 1 ..];
-        } else {
-            // Subsequent resume: args sit on top of the stack (above any
-            // stale values left by the previous yield). PUC `resume()` reads
-            // `firstArg = L->top - n` the same way; results are later moved
-            // down to ci->func + 1 by luaD_poscall. Use the remembered
-            // func base as the truncation target (PUC ci->func).
-            if (h.c_stack.items.len < nargs_usize) return 2;
-            lua_resume_base = h.resume_func_base orelse (h.c_stack.items.len - nargs_usize);
-            break :blk h.c_stack.items[h.c_stack.items.len - nargs_usize ..];
+    if (first_resume) {
+        const callee_needed = !api.isCallableValue(vm, co.callee);
+        const need = nargs_usize + @as(usize, @intFromBool(callee_needed));
+        const cnt = Vm.cWindowCount(th);
+        if (cnt < need) return 2;
+        func_slot = Vm.cWindowBase(th) + cnt - need;
+        if (callee_needed) {
+            const callee = th.stack[func_slot];
+            if (!api.isCallableValue(vm, callee)) return 2;
+            co.callee = callee;
         }
-    };
-    // Switch cur_handle and cur_c_stack to the coroutine's handle so that
-    // C functions called during the coroutine's execution see the coroutine's
-    // handle as their L parameter and operate on the coroutine's c_stack.
-    // This mirrors PUC Lua where lua_resume operates on the coroutine's L,
-    // and C functions called within the coroutine use that same L.
+        // P15.83j: remember the function position (PUC ci->func). Every
+        // later resume anchors its result/error window at it.
+        co.resume_func_slot = func_slot;
+        args = th.stack[func_slot + need - nargs_usize .. func_slot + need];
+        // Consume func+args: the trampoline stages the body at the lowered
+        // top = F (PUC precall uses them in place).
+        th.top = func_slot;
+    } else {
+        const cnt = Vm.cWindowCount(th);
+        if (cnt < nargs_usize) return 2;
+        func_slot = co.resume_func_slot orelse (Vm.cWindowBase(th) + cnt - nargs_usize);
+        args = th.stack[th.top - nargs_usize .. th.top];
+    }
+    // PUC resume: only a suspended (or never-started) thread resumes;
+    // anything else is resume_error (ldo.c:970-977: pop the arguments,
+    // append the message once, return BEFORE the *nresults assignment).
+    const reject_before_call = !first_resume and co.status != .suspended;
+
+    // Switch cur_handle to the coroutine's handle so that C functions
+    // called during the coroutine's execution see the coroutine's handle
+    // as their L parameter. This mirrors PUC Lua where lua_resume
+    // operates on the coroutine's L, and C functions called within it use
+    // that same L.
     const saved_cur_handle = vm.cur_handle;
-    const saved_cur_c_stack = vm.cur_c_stack;
     vm.cur_handle = h;
-    vm.cur_c_stack = &h.c_stack;
     defer {
         vm.cur_handle = saved_cur_handle;
-        vm.cur_c_stack = saved_cur_c_stack;
     }
 
     // P16.50-review-7 BLOCKER 4: apiResumeThread returns the resume's
@@ -2126,69 +2249,32 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
     // window truncated every C-API resume to 63 results (PUC lua_resume
     // returns ALL results on the stack). Freed via vm.alloc.free (the
     // charged-block registry passes infraAlloc'd blocks through).
-    // P15.83q: pre-call status snapshot. A thread that is already dead
-    // can only produce PUC's `resume_error` boundary ("cannot resume
-    // dead coroutine", ldo.c:895-903 + 970): the pushed args are popped,
-    // the message is APPENDED to the existing stack window, and
-    // *nresults is left UNTOUCHED (resume_error returns before
-    // lua_resume's *nresults assignment). This is structurally distinct
-    // from an error raised inside the coroutine, which flows through
-    // luaD_seterrorobj (the [err, err] duplicated window below).
-    const dead_before_call = co.status == .dead;
     const res = vm.apiResumeThread(co, args) catch {
-        // Error path (PUC ldo.c:983-988): `L->status = status`, then
-        // luaD_seterrorobj(L, status, L->top) and `L->ci->top = L->top`.
-        // luaD_seterrorobj (ldo.c:112-122) COPIES the top-1 error object
-        // to oldtop == L->top — i.e. it DUPLICATES the error object on
-        // top of the stack residue — leaving [.., err, err].
-        // `*nresults = top - (ci->func + 1)` with ci = the innermost
-        // CallInfo at throw time. For errors surfacing from a C-function
-        // frame (error(), assert(), metamethod failures, ...) the
-        // innermost frame is that C call's frame, so the visible window
-        // is exactly the duplicated pair: [err, err], nres == 2 (verified
-        // against PUC 5.5.0 with /tmp probes: plain, deeper-Lua-call,
-        // table error object, and pcall-recovered-then-error variants).
-        // Known divergence (documented in STATUS.md P15.83q): errors
-        // raised from a LUA frame via luaG_runerror (index/call nil, ...)
-        // keep the frame's register + varinfo residue in PUC's window;
-        // luazig's message building does not use the Lua-visible stack,
-        // so it exposes the [err, err] pair only.
-        h.c_stack.items.len = lua_resume_base;
-        // P16.36 Cut 1b: the error was raised inside the resumed thread
-        // and — with per-thread error state — STAYS there (the old
-        // Vm-global was restored to the caller's pre-resume state by
-        // builtinCoroutineResume's bundle defer, relying on latches;
-        // the raising thread is now the direct, by-construction owner).
-        const ev: vm_mod.Value = if (co.err_has_obj) co.err_obj else .Nil;
-        // (b) status-returning API: the status below (co.api_status — 4 for
-        // OOM since B1) is returned regardless; PUC's seterrorobj builds
-        // the [err, err] window within one stack (infallible), our appends
-        // can OOM — the window is lost, the status is not.
-        h.c_stack.append(vm.alloc, ev) catch {};
-        h.c_stack.append(vm.alloc, ev) catch {};
-        if (nres) |p|
-            p.* = @intCast(if (h.c_stack.items.len > lua_resume_base)
-                h.c_stack.items.len - lua_resume_base
-            else
-                0);
-        // PUC: the status flows from the resumed thread's own status
-        // (set by the catching boundary — L->status = status in
-        // ldo.c:983-988): LUA_ERRMEM (4) for OOM (P16.50-review-5 B1 —
-        // the old unconditional 2/5 mapping discarded the OutOfMemory
-        // kind finishCcall carried), ERRERR (5), ERRRUN (2).
-        return if (co.api_status != 0) co.api_status else if (co.err_is_errerr) 5 else 2;
+        // apiResumeThread itself failed (owned-slice OOM): consume the
+        // staging and install the FIXED pre-interned MEMERRMSG (PUC
+        // luaD_seterrorobj with status ERRMEM; the intern is a no-alloc
+        // lookup, only the window growth can fail — best-effort).
+        th.top = func_slot;
+        if (vm.oom_msg_str) |ms| vm.cWindowPush(th, .{ .String = ms }) catch {};
+        if (nres) |p| p.* = @intCast(Vm.cWindowCount(th));
+        return 4; // LUA_ERRMEM
     };
     defer vm.alloc.free(res);
-    const failed = res.len > 0 and !(res[0] == .Bool and res[0].Bool);
-    if (failed) {
-        if (dead_before_call) {
-            // PUC resume_error (ldo.c:895-903): pop the pushed args,
-            // append the message to the existing window, leave *nresults
-            // untouched. The engine's only failure for an already-dead
-            // thread is "cannot resume dead coroutine".
-            h.c_stack.items.len -= @min(nargs_usize, h.c_stack.items.len);
-            // (b): same window-append contract as the error path above.
-            h.c_stack.append(vm.alloc, res[1]) catch {};
+    const ok = res.len > 0 and res[0] == .Bool and res[0].Bool;
+
+    if (!ok) {
+        if (res.len < 2) {
+            if (nres) |p| p.* = @intCast(Vm.cWindowCount(th));
+            return 2;
+        }
+        if (reject_before_call) {
+            // PUC resume_error (ldo.c:895-903): pop the pushed args
+            // (plain pop — the engine rejected before running), append
+            // the message once, leave *nresults untouched.
+            th.top -= @min(nargs_usize, th.top - Vm.cWindowBase(th));
+            // (b) status-returning API: the status (2) is returned
+            // regardless; only the observable window is lost on OOM.
+            vm.cWindowPush(th, res[1]) catch {};
             return 2;
         }
         // Real error inside the coroutine: PUC error window (luaD_seterrorobj
@@ -2198,60 +2284,65 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
         // level >= 1 leave the ORIGINAL unprefixed string there (PUC
         // lbaselib luaB_error pushes where + a copy of the argument, then
         // concatenates). builtinCoroutineResume snapshots it onto the thread
-        // as api_err_residue. nres = window size.
-        h.c_stack.items.len = lua_resume_base;
-        // (b): the [residue?, err, err] window appends — status (below)
+        // as api_err_residue. Raw top — the thread is dead; PUC never closes
+        // TBC at the error boundary (verified against PUC 5.5.0 probes:
+        // plain, deeper-Lua-call, table error object, and
+        // pcall-recovered-then-error variants; known divergence documented
+        // in STATUS.md P15.83q: errors raised from a LUA frame via
+        // luaG_runerror expose the [err, err] pair only).
+        // The window anchors at the TOP frame's base
+        // (PUC *nresults = L->top - (L->ci->func + 1) with L->ci = the
+        // frame the throw left in place). A C-continuation error keeps
+        // k's C-frame on top, so the anchor is ITS func slot + 1 — not
+        // the body's func slot F (which sits one below and hid the first
+        // err under the window base). For Lua-body errors the unwind
+        // leaves the base frame, whose base == F: the probed shapes are
+        // preserved.
+        th.top = Vm.cWindowBase(th);
+        // (b): the [residue?, err, err] window appends — the status below
         // survives an append OOM; only the observable window is lost.
-        if (co.api_err_residue) |r| h.c_stack.append(vm.alloc, r) catch {};
-        h.c_stack.append(vm.alloc, res[1]) catch {};
-        h.c_stack.append(vm.alloc, res[1]) catch {};
-        if (nres) |p|
-            p.* = @intCast(if (h.c_stack.items.len > lua_resume_base)
-                h.c_stack.items.len - lua_resume_base
-            else
-                0);
+        if (co.api_err_residue) |r| vm.cWindowPush(th, r) catch {};
+        vm.cWindowPush(th, res[1]) catch {};
+        vm.cWindowPush(th, res[1]) catch {};
+        // PUC: *nresults = L->top - (L->ci->func + 1) — the visible window
+        // (== lua_gettop(L) after the return; the class-6 pin is tolerant:
+        // nres >= 2 with the top two values equal).
+        if (nres) |p| p.* = @intCast(Vm.cWindowCount(th));
         // PUC APIstatus: the thread's own status (mirrored by
         // builtinCoroutineResume's error tail — ERRMEM=4 included since
         // P16.50-review-5 B1), ERRERR (5), else ERRRUN (2).
-        return if (co.api_status != 0) co.api_status else 2;
+        return if (co.api_status != 0) co.api_status else if (co.err_is_errerr) 5 else 2;
     }
-    // Success or yield: replace function+args with results on c_stack.
-    h.c_stack.items.len = lua_resume_base;
-    h.c_stack.appendSlice(vm.alloc, res[1..]) catch {
+
+    if (co.status == .suspended) {
+        // Yield: the yielded values are already parked at the suspended
+        // frame's window top — the dynamically anchored window (top
+        // frame's func, PUC L->ci->func) IS the host-visible result, so
+        // the window is left untouched (any materialization below F would
+        // overwrite the parked frame's registers). *nresults = nyield
+        // (PUC ldo.c:996: L->ci->u2.nyield — NOT a stack-derived count;
+        // hook yields report 0 while the window shows the register file).
+        if (nres) |p| p.* = @intCast(res.len - 1);
+        return 1; // LUA_YIELD
+    }
+    // Completion: PUC poscall moves the results to the body frame's func
+    // slot F (MULTRET — all results; fixed counts nil-fill, class 3).
+    vm.cWindowMoveResults(th, func_slot, res[1..], -1) catch {
         // PUC luaD_poscall moves results within ONE stack (infallible);
-        // our append can OOM — report LUA_ERRMEM with the fixed MEMERRMSG
+        // our move can OOM — report LUA_ERRMEM with the fixed MEMERRMSG
         // object installed instead of silently reporting LUA_OK with
         // missing results (P16.50-review-5 B2).
         vm.setOutOfMemoryError();
         if (nres) |p| p.* = 0;
         return 4;
     };
-    if (nres) |p| p.* = @intCast(res.len - 1);
-    // Return LUA_YIELD (1) if suspended, LUA_OK (0) if done.
-    const st_result: c_int = if (co.status == .suspended) 1 else 0;
-    if (st_result == 1) {
-        // Hook-yield visibility (P15.83q): a suspension caused by a debug
-        // hook yielding reports *nresults = nyield = 0, but PUC's one-stack
-        // model still exposes the suspended Lua frame's ENTIRE register
-        // window (luaG_traceexec raised L->top to ci->top before the hook,
-        // ldebug.c:954, and the yield longjmp skips luaD_hook's restore).
-        // Materialize the register window onto the handle stack above the
-        // (empty) results. The values are a snapshot-copy: PUC would show
-        // the live registers, but between suspends nothing can observe
-        // mutations, and the next resume truncates to lua_resume_base
-        // before pushing results, so stale window values can never leak
-        // into a later resume's results or be mistaken for its arguments
-        // (args are read from the top; the window sits below them).
-        if (vm.apiHookYieldWindow(co)) |window|
-            // (b): diagnostic-only visibility window (the yield itself is
-            // already reported); an append OOM loses just the window.
-            h.c_stack.appendSlice(vm.alloc, window) catch {};
-    }
-    return st_result;
+    // PUC: *nresults = L->top - (base_ci->func + 1) == lua_gettop(L).
+    if (nres) |p| p.* = @intCast(Vm.cWindowCount(th));
+    return 0; // LUA_OK
 }
 
 /// PUC `lua_yieldk` (ldo.c:1006-1034): yield from a coroutine.
-/// nresults values on c_stack are returned to the resume caller.
+/// nresults values on the window are returned to the resume caller.
 /// k/ctx are saved in the current C-frame's u.c union for continuation
 /// on resume (finishCcall invokes k from the next lua_resume).
 ///
@@ -2266,25 +2357,25 @@ pub export fn lua_yieldk(L: ?*lua_State, nresults: c_int, ctx: isize, k: ?*const
     const h = L orelse return 2;
     const vm = h.vm;
 
-    // Read the yielded values from c_stack (PUC: api_checkpop + L->top - nresults).
+    // Read the yielded values from the anchored window (PUC: api_checkpop
+    // + L->top - nresults). The values stay in place: builtinCoroutineYield
+    // parks a stack-resident SPAN (PUC lua_yieldk saves only the count; the
+    // values remain on the yielding thread's stack).
+    const th = Vm.handleThread(h);
     const nresults_usize: usize = @intCast(@max(nresults, 0));
-    if (nresults_usize > h.c_stack.items.len) return 2;
-    const base = h.c_stack.items.len - nresults_usize;
+    if (nresults_usize > Vm.cWindowCount(th)) return 2;
+    const base = th.top - nresults_usize;
 
     // Delegate nyield + k/ctx saving + apiYield to the shared helper
     // (PUC ldo.c:1019-1029). The helper saves nyield on the top C-frame,
     // saves k/ctx (unless a debug hook), and calls apiYield which calls
     // builtinCoroutineYield. On success, apiYield returns error.Yield.
-    const th = vm.current_thread orelse {
-        // No thread — can't yield. Match PUC: luaG_runerror.
-        return 2;
-    };
     const kfn: ?*const fn (?*vm_mod.lua_State, c_int, isize) callconv(.c) c_int = if (k) |kf|
         @ptrCast(@alignCast(kf))
     else
         null;
 
-    vm.luaYieldKShared(th, h.c_stack.items[base..], nresults, kfn, ctx) catch |err| switch (err) {
+    vm.luaYieldKShared(th, th.stack[base..th.top], nresults, kfn, ctx) catch |err| switch (err) {
         // Yield succeeded: builtinCoroutineYield stored the values in
         // th.yielded and returned error.Yield. Now longjmp to the
         // callCFunctionWithBoundary setjmp point (value 2 = yield).
@@ -2347,7 +2438,7 @@ pub export fn lua_pushthread(L: ?*lua_State) c_int {
     // PUC api_incr_top: OOM is LUA_ERRMEM (P16.50-review-5 B2 — the old
     // `catch return 0` misreported "not the main thread" and pushed
     // nothing).
-    h.c_stack.append(h.vm.alloc, .{ .Thread = th }) catch |e| cThrowOn(h.vm, h, e);
+    h.vm.cWindowPush(Vm.handleThread(h), .{ .Thread = th }) catch |e| cThrowOn(h.vm, h, api.mapVmError(e));
     return if (h.is_main) 1 else 0;
 }
 
@@ -2379,7 +2470,7 @@ pub export fn luazigGcParam(L: ?*lua_State, param: c_int, value: c_int) c_int {
 /// PUC `lua_pcallk` (lapi.c:1076-1117): protected call with continuation.
 ///
 /// If k == NULL or not yieldable: conventional pcall (setjmp/longjmp
-/// boundary). If errfunc != 0, the error handler is pushed onto bc_stack
+/// boundary). If errfunc != 0, the error handler is pushed onto stack
 /// via `setErrfuncValue` for the duration of the call so `invokeErrfunc`
 /// can find it, then restored afterwards.
 ///
@@ -2426,8 +2517,9 @@ pub export fn lua_pcallk(
         // be honored. PUC lapi.c: lua_pcallk always sets L->errfunc = func
         // before calling luaD_call, regardless of thread state.
         if (errfunc != 0) {
-            const abs = api.normalizeIndex(errfunc, h.c_stack.items.len) orelse return 2;
-            const errfunc_val = h.c_stack.items[abs];
+            const wth0 = Vm.handleThread(h);
+            const abs0 = Vm.cWindowSlot(wth0, errfunc) orelse return 2;
+            const errfunc_val = wth0.stack[abs0];
             vm.setErrfuncValue(errfunc_val);
             defer vm.setErrfuncValue(null);
             var s = api.State.fromHandle(h);
@@ -2440,15 +2532,17 @@ pub export fn lua_pcallk(
     if (k == null or !th.yieldable()) {
         // ── Conventional pcall (setjmp/longjmp boundary) ──
         // PUC: if errfunc != 0, set L->errfunc = func for the duration.
-        // In luazig, th.errfunc is a bc_stack index, so we push the errfunc
-        // Value (read from c_stack by index) onto bc_stack via setErrfuncValue.
+        // In luazig, th.errfunc is a stack index, so we push the errfunc
+        // Value (read from the window by index) onto stack via
+        // setErrfuncValue.
         if (errfunc != 0) {
-            const abs = api.normalizeIndex(errfunc, h.c_stack.items.len) orelse return 2;
-            const errfunc_val = h.c_stack.items[abs];
+            const wth1 = Vm.handleThread(h);
+            const abs1 = Vm.cWindowSlot(wth1, errfunc) orelse return 2;
+            const errfunc_val = wth1.stack[abs1];
             const saved_errfunc = th.errfunc;
             vm.setErrfuncValue(errfunc_val);
             defer {
-                // Pop the errfunc from bc_stack and restore the old index.
+                // Pop the errfunc from stack and restore the old index.
                 vm.setErrfuncValue(null);
                 th.errfunc = saved_errfunc;
             }
@@ -2466,77 +2560,91 @@ pub export fn lua_pcallk(
     // return, clear CIST_YPCALL + restore errfunc. On error/yield, C-frame
     // stays for precover.
     //
-    // Read callee/args from c_stack and compute errfunc_val, then delegate
+    // Read callee/args from the window and compute errfunc_val, then delegate
     // the production lifecycle (k/ctx/funcidx/old_errfunc/OAH/YPCALL saving
     // + apiCall + normal-return cleanup) to luaPcallKShared.
+    const wth = Vm.handleThread(h);
     const nargs_usize: usize = @intCast(@max(nargs, 0));
-    if (h.c_stack.items.len < nargs_usize + 1) return 2;
-    const fn_idx = h.c_stack.items.len - nargs_usize - 1;
-    const callee = h.c_stack.items[fn_idx];
-    const call_args = h.c_stack.items[fn_idx + 1 ..];
+    if (Vm.cWindowCount(wth) < nargs_usize + 1) return 2;
+    const fn_idx = Vm.cWindowCount(wth) - nargs_usize - 1;
+    const func_slot = Vm.cWindowBase(wth) + fn_idx;
+    const callee = wth.stack[func_slot];
+    // Dupe the args across the call boundary (the slice would alias
+    // th.stack, which the nested execution may grow); a yield/error
+    // longjmp bypasses `defer`, so every arm below frees it explicitly.
+    const call_args = vm.alloc.dupe(vm_mod.Value, wth.stack[func_slot + 1 .. wth.top]) catch {
+        vm.setOutOfMemoryError();
+        return 4; // LUA_ERRMEM
+    };
     const errfunc_val: ?Value = if (errfunc != 0) blk: {
-        const abs = api.normalizeIndex(errfunc, h.c_stack.items.len) orelse return 2;
-        break :blk h.c_stack.items[abs];
+        const abs = Vm.cWindowSlot(wth, errfunc) orelse {
+            vm.alloc.free(call_args);
+            return 2;
+        };
+        break :blk wth.stack[abs];
     } else null;
 
     const kfn: *const fn (?*vm_mod.lua_State, c_int, isize) callconv(.c) c_int =
         @ptrCast(@alignCast(k.?));
 
-    const ret = vm.luaPcallKShared(th, callee, call_args, errfunc_val, fn_idx, kfn, ctx) catch |err| switch (err) {
-        error.Yield => {
-            // P15.78: Callee yielded. Longjmp with value 2 (yield) so
-            // callCFunction can propagate error.Yield and leave the C-frame
-            // (with CIST_YPCALL set) in place for finishCcall/finishpcallk
-            // on resume.
-            if (vm.c_error_jmp) |jb| {
-                _longjmp(jb, 2);
-            }
-            // No C-function boundary — can't yield. Fallback cleanup.
-            const fr2 = th.call_frames.getPtr(th.call_frames.len() - 1);
-            fr2.clearYpcall();
-            if (errfunc_val != null) {
-                vm.setErrfuncValue(null);
-            }
-            th.errfunc = fr2.u.c.old_errfunc;
-            return 2;
-        },
-        error.RuntimeError => {
-            // PUC: lua_pcallk's yieldable path does NOT catch errors locally.
-            // The C-frame (with CIST_YPCALL set) stays in place for precover.
-            if (vm.c_error_jmp) |jb| {
-                _longjmp(jb, 1);
-            }
-            // No C-function boundary — fallback cleanup.
-            const fr2 = th.call_frames.getPtr(th.call_frames.len() - 1);
-            fr2.clearYpcall();
-            if (errfunc_val != null) {
-                vm.setErrfuncValue(null);
-            }
-            th.errfunc = fr2.u.c.old_errfunc;
-            return if (vm.errThread().err_is_errerr) 5 else 2;
-        },
-        error.OutOfMemory => {
-            const fr2 = th.call_frames.getPtr(th.call_frames.len() - 1);
-            fr2.clearYpcall();
-            if (errfunc_val != null) {
-                vm.setErrfuncValue(null);
-            }
-            th.errfunc = fr2.u.c.old_errfunc;
-            // (b) status-returning: LUA_ERRMEM is the specified OOM status.
-            // Install the FIXED MEMERRMSG object (allocation-free) so the
-            // error state is observable — the raw `try` OOMs inside apiCall
-            // do not install it themselves (P16.50-review-5 B2).
-            vm.setOutOfMemoryError();
-            return 4; // LUA_ERRMEM
-        },
+    const ret = vm.luaPcallKShared(th, callee, call_args, errfunc_val, fn_idx, kfn, ctx) catch |err| {
+        vm.alloc.free(call_args);
+        switch (err) {
+            error.Yield => {
+                // P15.78: Callee yielded. Longjmp with value 2 (yield) so
+                // callCFunction can propagate error.Yield and leave the C-frame
+                // (with CIST_YPCALL set) in place for finishCcall/finishpcallk
+                // on resume.
+                if (vm.c_error_jmp) |jb| {
+                    _longjmp(jb, 2);
+                }
+                // No C-function boundary — can't yield. Fallback cleanup.
+                const fr2 = th.call_frames.getPtr(th.call_frames.len() - 1);
+                fr2.clearYpcall();
+                if (errfunc_val != null) {
+                    vm.setErrfuncValue(null);
+                }
+                th.errfunc = fr2.u.c.old_errfunc;
+                return 2;
+            },
+            error.RuntimeError => {
+                // PUC: lua_pcallk's yieldable path does NOT catch errors locally.
+                // The C-frame (with CIST_YPCALL set) stays in place for precover.
+                if (vm.c_error_jmp) |jb| {
+                    _longjmp(jb, 1);
+                }
+                // No C-function boundary — fallback cleanup.
+                const fr2 = th.call_frames.getPtr(th.call_frames.len() - 1);
+                fr2.clearYpcall();
+                if (errfunc_val != null) {
+                    vm.setErrfuncValue(null);
+                }
+                th.errfunc = fr2.u.c.old_errfunc;
+                return if (vm.errThread().err_is_errerr) 5 else 2;
+            },
+            error.OutOfMemory => {
+                const fr2 = th.call_frames.getPtr(th.call_frames.len() - 1);
+                fr2.clearYpcall();
+                if (errfunc_val != null) {
+                    vm.setErrfuncValue(null);
+                }
+                th.errfunc = fr2.u.c.old_errfunc;
+                // (b) status-returning: LUA_ERRMEM is the specified OOM status.
+                // Install the FIXED MEMERRMSG object (allocation-free) so the
+                // error state is observable — the raw `try` OOMs inside apiCall
+                // do not install it themselves.
+                vm.setOutOfMemoryError();
+                return 4; // LUA_ERRMEM
+            },
+        }
     };
+    vm.alloc.free(call_args);
     defer vm.alloc.free(ret);
 
-    // Put results on c_stack
-    h.c_stack.items.len = fn_idx;
-    const want: usize = if (nresults < 0) ret.len else @min(ret.len, @as(usize, @intCast(nresults)));
-    h.c_stack.appendSlice(vm.alloc, ret[0..want]) catch {
-        // PUC moves results within one stack (infallible); our append can
+    // Put results on the window at the callee's func slot (PUC poscall:
+    // fixed nresults nil-fills, class 3; MULTRET copies all).
+    vm.cWindowMoveResults(wth, func_slot, ret, nresults) catch {
+        // PUC moves results within one stack (infallible); our move can
         // OOM — install the fixed MEMERRMSG object so the error state is
         // observable, then return LUA_ERRMEM (P16.50-review-5 B2 — the old
         // bare `return 4` left no error object installed).
@@ -2593,10 +2701,14 @@ pub export fn lua_getmetatable(L: ?*lua_State, objindex: c_int) c_int {
 
 pub export fn lua_setiuservalue(L: ?*lua_State, idx: c_int, n: c_int) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    // (c) infallible w.r.t. allocation: setiuservalue's error set is
-    // InvalidState/InvalidIndex only (an in-place uservalue write) — the
-    // catch is the lenient api_check answer for a bad index.
-    return if (s.setiuservalue(idx, @intCast(@max(n, 0))) catch false) 1 else 0;
+    // setiuservalue runs the PUC backward barrier
+    // (luaC_barrierback) around the uservalue store — its grayagain
+    // reservation can fail, so OOM → LUA_ERRMEM;
+    // InvalidState/InvalidIndex remain PUC api_check — lenient false.
+    return if (s.setiuservalue(idx, @intCast(@max(n, 0))) catch |e| switch (e) {
+        error.OutOfMemory => cThrowOn(s.vm, L.?, e),
+        else => false,
+    }) 1 else 0;
 }
 
 pub export fn lua_getiuservalue(L: ?*lua_State, idx: c_int, n: c_int) c_int {
@@ -2717,7 +2829,7 @@ pub export fn luaL_checkany(L: ?*lua_State, arg: c_int) void {
 pub export fn luaL_checkstack(L: ?*lua_State, sz: c_int, msg: ?[*:0]const u8) void {
     const h = L orelse return;
     const vm = h.vm;
-    h.c_stack.ensureUnusedCapacity(vm.alloc, @intCast(@max(sz, 0))) catch {
+    vm.cWindowEnsure(Vm.handleThread(h), @intCast(@max(sz, 0))) catch {
         lua_pushstring(L, if (msg) |m| m else "stack overflow");
         lua_error(L);
     };
@@ -2796,6 +2908,10 @@ pub export fn luaL_checkoption(L: ?*lua_State, arg: c_int, def: ?[*:0]const u8, 
 pub export fn luaL_where(L: ?*lua_State, lvl: c_int) void {
     const h = L orelse return;
     const vm = h.vm;
+    // Reserve the result slot BEFORE the string exists —
+    // the push then hits reserved capacity and cannot sweep the constructed
+    // unrooted string at a full window.
+    vm.cWindowEnsure(Vm.handleThread(h), 1) catch |e| cThrowOn(vm, h, api.mapVmError(e));
     var ar: lua_Debug = .{};
     if (lua_getstack(L, lvl, &ar) != 0) {
         _ = lua_getinfo(L, "Sl", &ar);
@@ -2818,13 +2934,13 @@ pub export fn luaL_where(L: ?*lua_State, lvl: c_int) void {
             // PUC lua_pushfstring: OOM is LUA_ERRMEM (P16.50-review-5 B2
             // — the old `catch return` silently pushed nothing).
             const ls = vm.internStr(formatted) catch |e| cThrowOn(vm, h, e);
-            h.c_stack.append(vm.alloc, .{ .String = ls }) catch |e| cThrowOn(vm, h, e);
+            vm.cWindowPush(Vm.handleThread(h), .{ .String = ls }) catch |e| cThrowOn(vm, h, api.mapVmError(e));
             return;
         }
     }
     // Fallback: empty string (PUC pushes "" when no info is available)
     const ls = vm.internStr("") catch |e| cThrowOn(vm, h, e);
-    h.c_stack.append(vm.alloc, .{ .String = ls }) catch |e| cThrowOn(vm, h, e);
+    vm.cWindowPush(Vm.handleThread(h), .{ .String = ls }) catch |e| cThrowOn(vm, h, api.mapVmError(e));
 }
 
 pub export fn luaL_typeerror(L: ?*lua_State, arg: c_int, tname: [*:0]const u8) c_int {
@@ -2879,9 +2995,16 @@ pub export fn luaL_traceback(L: ?*lua_State, L1: ?*lua_State, msg: ?[*:0]const u
 
     // NO defer: _longjmp bypasses it — every failure path deinits the
     // buffer manually via cThrowOomBufU before throwing LUA_ERRMEM
-    // (P16.50-review-5 B2 — the old `catch return`/`catch {}` sites
-    // leaked the buffer and/or silently dropped the traceback push).
+    // (a `catch return`/`catch {}` site would leak the buffer and/or
+    // silently drop the traceback push).
     var buf: std.ArrayListUnmanaged(u8) = .empty;
+    // Reserve the result slot BEFORE the buffer is
+    // interned — the push then hits reserved capacity and cannot sweep
+    // the constructed unrooted string at a full window.
+    vm.cWindowEnsure(Vm.handleThread(h), 1) catch |e| {
+        buf.deinit(vm.alloc);
+        cThrowOn(vm, h, api.mapVmError(e));
+    };
 
     if (msg) |m| {
         buf.appendSlice(vm.alloc, std.mem.span(m)) catch cThrowOomBufU(vm, h, &buf);
@@ -2912,7 +3035,7 @@ pub export fn luaL_traceback(L: ?*lua_State, L1: ?*lua_State, msg: ?[*:0]const u
     }
 
     const ls = vm.internStr(buf.items) catch cThrowOomBufU(vm, h, &buf);
-    h.c_stack.append(vm.alloc, .{ .String = ls }) catch cThrowOomBufU(vm, h, &buf);
+    vm.cWindowPush(Vm.handleThread(h), .{ .String = ls }) catch cThrowOomBufU(vm, h, &buf);
     buf.deinit(vm.alloc);
 }
 
@@ -2940,7 +3063,7 @@ pub export fn luaL_tolstring(L: ?*lua_State, idx: c_int, l: ?*usize) [*:0]const 
             .number, .string => "value",
         };
         const ls = s.vm.internStr(name) catch |e| cThrowOn(s.vm, L.?, e);
-        s.stack.append(s.vm.alloc, .{ .String = ls }) catch |e| cThrowOn(s.vm, L.?, e);
+        s.push(.{ .String = ls }) catch |e| cThrowOn(s.vm, L.?, e);
         if (l) |p| p.* = name.len;
         return @ptrCast(@constCast(ls.bytes().ptr));
     }
@@ -2957,20 +3080,24 @@ pub export fn luaL_len(L: ?*lua_State, idx: c_int) i64 {
         else => return 0,
     };
     const result = s.tointeger(-1) orelse 0;
-    s.stack.items.len -= 1;
+    s.curThread().top -= 1; // PUC luaL_len: plain pop of the length value
     return result;
 }
 
 pub export fn luaL_gsub(L: ?*lua_State, s_str: [*:0]const u8, p: [*:0]const u8, r: [*:0]const u8) [*:0]const u8 {
     const h = L orelse return s_str;
     const vm = h.vm;
+    // Reserve the result slot BEFORE the string exists —
+    // the push then hits reserved capacity and cannot sweep the constructed
+    // unrooted string at a full window.
+    vm.cWindowEnsure(Vm.handleThread(h), 1) catch |e| cThrowOn(vm, h, api.mapVmError(e));
     const src = std.mem.span(s_str);
     const pat = std.mem.span(p);
     const rep = std.mem.span(r);
     // NO defer: _longjmp bypasses it — every failure path deinits the
     // buffer via cThrowOomBufU before throwing LUA_ERRMEM
-    // (P16.50-review-5 B2 — the old `catch return s_str` leaked the
-    // buffer and silently returned the UNSUBSTITUTED input).
+    // (a `catch return s_str` would leak the buffer and silently
+    // return the UNSUBSTITUTED input).
     var result: std.ArrayListUnmanaged(u8) = .empty;
     var i: usize = 0;
     while (i < src.len) {
@@ -2983,18 +3110,18 @@ pub export fn luaL_gsub(L: ?*lua_State, s_str: [*:0]const u8, p: [*:0]const u8, 
         }
     }
     const ls = vm.internStr(result.items) catch cThrowOomBufU(vm, h, &result);
-    h.c_stack.append(vm.alloc, .{ .String = ls }) catch cThrowOomBufU(vm, h, &result);
+    vm.cWindowPush(Vm.handleThread(h), .{ .String = ls }) catch cThrowOomBufU(vm, h, &result);
     result.deinit(vm.alloc);
     return @ptrCast(@constCast(ls.bytes().ptr));
 }
 
 pub export fn luaL_getmetafield(L: ?*lua_State, obj: c_int, event: [*:0]const u8) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    const abs = normalizeIndex(obj, s.stack.items.len) orelse return 0;
+    const abs = s.slot(obj) orelse return 0;
     // PUC lauxlib.c:884-897: lua_getmetatable covers EVERY value kind —
     // including the type-level slots (G(L)->mt[ttype(o)]) — not just
     // table/userdata. No metatable → LUA_TNIL, stack unchanged.
-    const mt: *vm_mod.Table = s.vm.valueMetatable(s.stack.items[abs]) orelse return 0;
+    const mt: *vm_mod.Table = s.vm.valueMetatable(s.curThread().stack[abs]) orelse return 0;
     // lua_pushstring + lua_rawget on the metatable — OOM is LUA_ERRMEM
     // (P16.50-review-5 B2 — the old `catch return 0` misreported "no
     // metamethod").
@@ -3003,7 +3130,7 @@ pub export fn luaL_getmetafield(L: ?*lua_State, obj: c_int, event: [*:0]const u8
     // Nil metafield: PUC pops metatable+metafield (stack unchanged) and
     // returns LUA_TNIL.
     if (val == .Nil) return 0;
-    s.stack.append(s.vm.alloc, val) catch |e| cThrowOn(s.vm, L.?, e);
+    s.push(val) catch |e| cThrowOn(s.vm, L.?, e);
     // PUC returns the metafield's REAL type tag (lauxlib.c:895 `return tt`),
     // not a boolean.
     return api.typeCode(api.valueType(val));
@@ -3049,9 +3176,9 @@ pub export fn luaL_requiref(L: ?*lua_State, modname: [*:0]const u8, openf: ?*con
                 else => {},
             };
         };
-        s.stack.items.len -= 1;
+        s.curThread().top -= 1; // PUC auxsetstr-family: plain pop
     };
-    s.stack.items.len -= 1;
+    s.curThread().top -= 1; // PUC auxsetstr-family: plain pop
     if (glb != 0) {
         _ = s.pushvalue(-1) catch |e| switch (e) {
             error.OutOfMemory => cThrowOn(s.vm, L.?, e),
@@ -3100,6 +3227,23 @@ pub export fn luaL_fileresult(L: ?*lua_State, stat: c_int, fname: ?[*:0]const u8
 /// - `@file`:   use the basename of `file[1..]` (up to 59 chars; prefix
 ///              "..." if truncated).
 /// - other:     wrap as `[string "..."]` (first line, up to 59 chars total).
+/// The fixed namewhat vocabulary of PUC
+/// auxgetinfo/getfuncname (ldebug.c) — every value is a C string literal.
+/// Maps a runtime namewhat slice back to the static literal so
+/// lua_getinfo 'n' hands out a `[*:0]` with static lifetime and no
+/// interning per query (PUC shape). Returns null for a slice outside the
+/// vocabulary (defensive: the current producers only emit these values).
+fn namewhatLiteralZ(nw: []const u8) ?[*:0]const u8 {
+    const vocab = [_][:0]const u8{
+        "",       "hook",  "metamethod", "local",    "upvalue",
+        "global", "field", "method",     "constant", "for iterator",
+    };
+    for (vocab) |t| {
+        if (std.mem.eql(u8, nw, t)) return t.ptr;
+    }
+    return null;
+}
+
 fn fillShortSrc(buf: *[60]u8, source: []const u8) void {
     if (source.len == 0) {
         buf[0] = 0;
@@ -3219,15 +3363,40 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
                     // Lua function: fill source info from Proto.
                     const what_str: [*:0]const u8 = if (p.line_defined == 0) "main" else "Lua";
                     ar.what = what_str;
-                    // Intern source_name to get a NUL-terminated LuaString.
-                    // Proto.source_name is []const u8 (not NUL-terminated);
-                    // LuaString storage IS NUL-terminated (createLuaString).
-                    // PUC pushes the source via lua_pushstring — OOM is
-                    // LUA_ERRMEM (P16.50-review-5 B2).
-                    const src_ls = vm.internStr(p.sourceName()) catch |e| cThrowOn(vm, h, e);
-                    const src_bytes = src_ls.bytes();
-                    ar.source = @ptrCast(@constCast(src_bytes.ptr));
-                    ar.srclen = src_bytes.len;
+                    // PUC ldebug.c funcinfo (ldebug.c:358): ar->source =
+                    // svalue(p->source) — a PROTO-LIFETIME NUL-terminated
+                    // pointer, no fresh allocation per query. Protos
+                    // carrying the debug_names_z
+                    // contract (builder-fused tail, fixed undump, cloned
+                    // non-fixed undump) hand the pointer out directly; a
+                    // fresh internStr would leave an UNROOTED string that a
+                    // collection between getinfo and the caller's read
+                    // can sweep.
+                    if (p.flags.debug_names_z) {
+                        if (p.sourceName().len == 0) {
+                            ar.source = "";
+                        } else {
+                            ar.source = @ptrCast(@constCast(p.sourceName().ptr));
+                        }
+                        ar.srclen = @intCast(p.sourceName().len);
+                    } else {
+                        // Fallback (protos without the contract — hand-built
+                        // test protos, un-cloned non-fixed undump): intern
+                        // and root the string on the C window so it survives
+                        // any collection until the caller pops the window —
+                        // the closest PUC-parity lifetime available without
+                        // the contract. OOM is LUA_ERRMEM.
+                        // Reserve the slot BEFORE the
+                        // intern — the push then hits reserved capacity and
+                        // cannot sweep the fresh unrooted string at a full
+                        // window.
+                        vm.cWindowEnsure(Vm.handleThread(h), 1) catch |e| cThrowOn(vm, h, api.mapVmError(e));
+                        const src_ls = vm.internStr(p.sourceName()) catch |e| cThrowOn(vm, h, e);
+                        vm.cWindowPush(Vm.handleThread(h), .{ .String = src_ls }) catch |e| cThrowOn(vm, h, api.mapVmError(e));
+                        const src_bytes = src_ls.bytes();
+                        ar.source = @ptrCast(@constCast(src_bytes.ptr));
+                        ar.srclen = src_bytes.len;
+                    }
                     ar.linedefined = @intCast(p.line_defined);
                     ar.lastlinedefined = @intCast(p.last_line_defined);
                     fillShortSrc(&ar.short_src, p.sourceName());
@@ -3254,8 +3423,8 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
                     // nups = nupvalues of the called function (0 for light C
                     // functions / builtins), nparams = 0, isvararg = 1 — C
                     // functions accept any number of arguments.
-                    const func = if (frame.func_slot < th.bytecode_stack.len)
-                        th.bytecode_stack[frame.func_slot]
+                    const func = if (frame.func_slot < th.stack.len)
+                        th.stack[frame.func_slot]
                     else
                         .Nil;
                     ar.nups = if (func == .Closure)
@@ -3281,11 +3450,49 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
                     resolved_namewhat = dn.namewhat;
                     resolved_name = dn.name;
                 }
-                const nw_ls = vm.internStr(resolved_namewhat) catch |e| cThrowOn(vm, h, e);
-                ar.namewhat = @ptrCast(@constCast(nw_ls.bytes().ptr));
+                // PUC hands out C string
+                // LITERALS for namewhat (ldebug.c) — no allocation per
+                // query. Map the runtime slice back to the static literal;
+                // the defensive intern fallback covers a value outside the
+                // vocabulary (cannot happen with the current producers).
+                if (namewhatLiteralZ(resolved_namewhat)) |nw_z| {
+                    ar.namewhat = nw_z;
+                } else {
+                    // Reserve the slot BEFORE the intern
+                    // (same window discipline as the 'S' fallback above).
+                    vm.cWindowEnsure(Vm.handleThread(h), 1) catch |e| cThrowOn(vm, h, api.mapVmError(e));
+                    const nw_ls = vm.internStr(resolved_namewhat) catch |e| cThrowOn(vm, h, e);
+                    vm.cWindowPush(Vm.handleThread(h), .{ .String = nw_ls }) catch |e| cThrowOn(vm, h, api.mapVmError(e));
+                    ar.namewhat = @ptrCast(@constCast(nw_ls.bytes().ptr));
+                }
                 if (resolved_name) |nm| {
-                    const ls = vm.internStr(nm) catch |e| cThrowOn(vm, h, e);
-                    ar.name = @ptrCast(@constCast(ls.bytes().ptr));
+                    // The name's provenance (getFuncNameForFrame): the
+                    // naming PARENT proto's locvars/upvalues/constants
+                    // (proto-lifetime; NUL-terminated when the parent
+                    // carries the debug_names_z contract — upvalue tails
+                    // and LuaString constants are NUL regardless), or a
+                    // static literal when there is no naming parent proto
+                    // (hook "?", finalizer "__gc", "for iterator",
+                    // metamethod opnames). Both shapes allow handing the
+                    // pointer out directly, PUC auxgetinfo style; the
+                    // intern+window-root fallback covers parent protos
+                    // without the contract (hand-built test protos).
+                    const parent_has_contract = blk: {
+                        if (frame_idx == 0) break :blk true; // no naming parent: literal-only sources
+                        const parent = th.call_frames.getConstPtr(frame_idx - 1);
+                        if (parent.proto()) |pp| break :blk pp.flags.debug_names_z;
+                        break :blk true; // C/hook/fin caller: literal-only sources
+                    };
+                    if (parent_has_contract) {
+                        ar.name = @ptrCast(@constCast(nm.ptr));
+                    } else {
+                        // Reserve the slot BEFORE the
+                        // intern (same window discipline as the 'S' fallback).
+                        vm.cWindowEnsure(Vm.handleThread(h), 1) catch |e| cThrowOn(vm, h, api.mapVmError(e));
+                        const ls = vm.internStr(nm) catch |e| cThrowOn(vm, h, e);
+                        vm.cWindowPush(Vm.handleThread(h), .{ .String = ls }) catch |e| cThrowOn(vm, h, api.mapVmError(e));
+                        ar.name = @ptrCast(@constCast(ls.bytes().ptr));
+                    }
                 } else {
                     ar.name = null;
                 }
@@ -3303,7 +3510,7 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
 /// Mirrors PUC's `luaF_getlocalname` (lfunc.c): iterate forward through
 /// `Proto.locvars`, counting locals whose `[startpc, endpc)` range contains
 /// the frame's current `pc`. The n-th active local's value lives at
-/// `bc_stack[frame.base + locvar.reg]` — pushed onto `c_stack` for C access.
+/// `stack[frame.base + locvar.reg]` — pushed onto the window for C access.
 pub export fn lua_getlocal(L: ?*lua_State, ar: *lua_Debug, n: c_int) ?[*:0]const u8 {
     const h = L orelse return null;
     const vm = h.vm;
@@ -3326,13 +3533,31 @@ pub export fn lua_getlocal(L: ?*lua_State, ar: *lua_Debug, n: c_int) ?[*:0]const
             if (count == n) {
                 // Push the local's value from the bytecode register file.
                 const reg_idx = frame.frameBase() + lv.reg;
-                if (reg_idx >= th.bytecode_stack.len) return null;
-                const val = th.bytecode_stack[reg_idx];
+                if (reg_idx >= th.stack.len) return null;
+                const val = th.stack[reg_idx];
                 // PUC lua_getlocal pushes via api_incr_top: OOM is
-                // LUA_ERRMEM (P16.50-review-5 B2 — the old `catch return
-                // null` misreported "no such local").
-                h.c_stack.append(vm.alloc, val) catch |e| cThrowOn(vm, h, e);
-                return @ptrCast(@constCast(lv.name.ptr));
+                // LUA_ERRMEM (a `catch return null` would misreport
+                // "no such local").
+                vm.cWindowPush(Vm.handleThread(h), val) catch |e| cThrowOn(vm, h, api.mapVmError(e));
+                // PUC luaF_getlocalname returns the locvar's proto-owned
+                // TString — a proto-lifetime NUL-terminated name. Protos
+                // with the debug_names_z
+                // contract (fused tail / fixed undump / cloned undump)
+                // hand the pointer out directly; for protos whose locvar
+                // names borrow un-terminated source bytes the direct
+                // cast would hand out a non-NUL-terminated slice.
+                // Fallback: intern and
+                // root on the C window (same lifetime discipline as
+                // lua_getinfo 'S'/'n').
+                if (proto.flags.debug_names_z) {
+                    return @ptrCast(@constCast(lv.name.ptr));
+                }
+                // Reserve the slot BEFORE the intern
+                // (same window discipline as lua_getinfo 'S'/'n').
+                vm.cWindowEnsure(Vm.handleThread(h), 1) catch |e| cThrowOn(vm, h, api.mapVmError(e));
+                const ls = vm.internStr(lv.name) catch |e| cThrowOn(vm, h, e);
+                vm.cWindowPush(Vm.handleThread(h), .{ .String = ls }) catch |e| cThrowOn(vm, h, api.mapVmError(e));
+                return @ptrCast(@constCast(ls.bytes().ptr));
             }
         }
     }
@@ -3343,12 +3568,13 @@ pub export fn lua_getlocal(L: ?*lua_State, ar: *lua_Debug, n: c_int) ?[*:0]const
 /// in the frame identified by `ar` to the value on top of the C stack.
 /// Returns the local's name, or null if `n` is out of range.
 ///
-/// Pops the value from `c_stack` and writes it to the bytecode register at
-/// `bc_stack[frame.base + locvar.reg]`, mirroring PUC's `setobjs2s(L, pos, --L->top)`.
+/// Pops the value from the window and writes it to the bytecode register at
+/// `stack[frame.base + locvar.reg]`, mirroring PUC's `setobjs2s(L, pos, --L->top)`.
 pub export fn lua_setlocal(L: ?*lua_State, ar: *lua_Debug, n: c_int) ?[*:0]const u8 {
     const h = L orelse return null;
     const vm = h.vm;
-    if (h.c_stack.items.len < 1) return null; // need a value on the stack
+    const setlocal_th = Vm.handleThread(h);
+    if (Vm.cWindowCount(setlocal_th) < 1) return null; // need a value on the stack
 
     // Recover the frame index from ar.i_ci (1-based, stored by lua_getstack).
     const ci_raw = @intFromPtr(ar.i_ci orelse return null);
@@ -3367,12 +3593,13 @@ pub export fn lua_setlocal(L: ?*lua_State, ar: *lua_Debug, n: c_int) ?[*:0]const
         if (pc >= lv.startpc and pc < lv.endpc) {
             count += 1;
             if (count == n) {
-                // Pop the value from c_stack, write to the bytecode register.
-                const val = h.c_stack.items[h.c_stack.items.len - 1];
-                h.c_stack.items.len -= 1;
+                // Pop the value from the window (plain pop — PUC
+                // setobjs2s(L, pos, --L->top)), write to the register.
+                const val = setlocal_th.stack[setlocal_th.top - 1];
+                setlocal_th.top -= 1;
                 const reg_idx = frame.frameBase() + lv.reg;
-                if (reg_idx >= th.bytecode_stack.len) return null;
-                th.bytecode_stack[reg_idx] = val;
+                if (reg_idx >= th.stack.len) return null;
+                th.stack[reg_idx] = val;
                 return @ptrCast(@constCast(lv.name.ptr));
             }
         }
@@ -3414,8 +3641,8 @@ const AuxUpvalue = struct {
 };
 
 fn auxUpvalue(s: *api.State, funcindex: c_int, n: c_int) ?AuxUpvalue {
-    const abs = normalizeIndex(funcindex, s.stack.items.len) orelse return null;
-    const cl = switch (s.stack.items[abs]) {
+    const abs = s.slot(funcindex) orelse return null;
+    const cl = switch (s.curThread().stack[abs]) {
         .Closure => |c| c,
         // PUC aux_upvalue default arm: not a closure → NULL (no error).
         else => return null,
@@ -3456,7 +3683,7 @@ pub export fn lua_getupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]c
     // cells read through to the owning thread's stack). OOM is LUA_ERRMEM
     // (P16.50-review-5 B2 — the old `catch return null` misreported "no
     // such upvalue").
-    s.stack.append(s.vm.alloc, aux.cell.get(s.vm)) catch |e| cThrowOn(s.vm, L.?, e);
+    s.push(aux.cell.get(s.vm)) catch |e| cThrowOn(s.vm, L.?, e);
     return name;
 }
 
@@ -3469,9 +3696,9 @@ pub export fn lua_setupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]c
     const aux = auxUpvalue(&s, funcindex, n) orelse return null;
     // PUC api_checknelems(L, 1) is a no-op in release builds; we fail soft
     // (NULL) instead of popping from an empty stack.
-    if (s.stack.items.len == 0) return null;
+    if (s.count() == 0) return null;
     const name = upvalueCName(aux);
-    const v = s.stack.items[s.stack.items.len - 1];
+    const v = s.curThread().stack[s.curThread().top - 1];
     // P16.50-review-8 §1.2: reserve the barrier bookkeeping BEFORE the
     // observable store — PUC's luaC_barrier is infallible; a reserve OOM
     // after the write commits would leave the store in place with a
@@ -3485,14 +3712,14 @@ pub export fn lua_setupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]c
     // which for open upvalues IS the stack slot).
     aux.cell.set(s.vm, v);
     s.vm.gcCommitWriteBarrierCell(aux.cell, v, plan);
-    s.stack.items.len -= 1;
+    s.curThread().top -= 1; // PUC lua_setupvalue: plain pop of the value
     return name;
 }
 
 pub export fn lua_upvalueid(L: ?*lua_State, fidx: c_int, n: c_int) ?*anyopaque {
     const s = api.State.fromHandle(L orelse return null);
-    const abs = normalizeIndex(fidx, s.stack.items.len) orelse return null;
-    const cl = switch (s.stack.items[abs]) {
+    const abs = s.slot(fidx) orelse return null;
+    const cl = switch (s.curThread().stack[abs]) {
         .Closure => |c| c,
         // PUC lua_upvalueid (lapi.c:1441-1459): light C functions
         // (LUA_VLCF) and non-functions → NULL (the api_check in the
@@ -3514,18 +3741,18 @@ pub export fn lua_upvalueid(L: ?*lua_State, fidx: c_int, n: c_int) ?*anyopaque {
 
 pub export fn lua_upvaluejoin(L: ?*lua_State, fidx1: c_int, n1: c_int, fidx2: c_int, n2: c_int) void {
     const s = api.State.fromHandle(L orelse return);
-    const abs1 = normalizeIndex(fidx1, s.stack.items.len) orelse return;
-    const abs2 = normalizeIndex(fidx2, s.stack.items.len) orelse return;
+    const abs1 = s.slot(fidx1) orelse return;
+    const abs2 = s.slot(fidx2) orelse return;
     // PUC lua_upvaluejoin (lapi.c:1463-1470) via getupvalref: ONLY Lua
     // closures participate (api_check ttisLclosure — a release no-op; the
     // manual documents non-Lua-closure input as undefined behavior). We
     // fail soft: a silent no-op for any non-Lua-closure or out-of-range
     // index, keeping the C-API contract non-raising (P16.50-review-7 B1).
-    const cl1 = switch (s.stack.items[abs1]) {
+    const cl1 = switch (s.curThread().stack[abs1]) {
         .Closure => |c| c,
         else => return,
     };
-    const cl2 = switch (s.stack.items[abs2]) {
+    const cl2 = switch (s.curThread().stack[abs2]) {
         .Closure => |c| c,
         else => return,
     };
@@ -3656,7 +3883,7 @@ pub export fn luaopen_base(L: ?*lua_State) c_int {
     const vm = h.vm;
     // PUC lua_pushglobaltable → api_incr_top: OOM is LUA_ERRMEM
     // (P16.50-review-5 B2 — the old `catch return 0` pushed nothing).
-    h.c_stack.append(vm.alloc, .{ .Table = vm.global_env }) catch |e| cThrowOn(vm, h, e);
+    vm.cWindowPush(Vm.handleThread(h), .{ .Table = vm.global_env }) catch |e| cThrowOn(vm, h, api.mapVmError(e));
     return 1;
 }
 
@@ -3801,7 +4028,7 @@ pub export fn luaL_openselectedlibs(L: ?*lua_State, load: c_int, preload: c_int)
 
     // PUC: lua_pop(L, 1) — remove PRELOAD table.
     // We also pop the registry table that was pushed above.
-    s.stack.items.len -= 2;
+    s.curThread().top -= 2; // plain pop (auxsetstr-family contract)
 }
 
 // ===========================================================================
@@ -3868,11 +4095,12 @@ pub export fn luaL_addstring(B: *luaL_Buffer, s: [*c]const u8) void {
 /// convert to string (via lua_tolstring), and append to B.
 pub export fn luaL_addvalue(B: *luaL_Buffer) void {
     const h = B.L orelse return;
-    if (h.c_stack.items.len == 0) return;
+    const av_th = Vm.handleThread(h);
+    if (Vm.cWindowCount(av_th) == 0) return;
     var l: usize = 0;
     const s = lua_tolstring(h, -1, &l);
     luaL_addlstring(B, s, l);
-    h.c_stack.items.len -= 1;
+    av_th.top -= 1; // PUC luaL_addvalue: plain pop of the converted value
 }
 
 /// PUC `luaL_pushresult` (lauxlib.c:601): push the buffer content as a Lua
@@ -3887,15 +4115,22 @@ pub export fn luaL_pushresultsize(B: *luaL_Buffer, sz: usize) void {
     const h = B.L orelse return;
     const vm = h.vm;
     B.n = sz;
+    // Reserve the result slot BEFORE the string exists —
+    // the push then hits reserved capacity and cannot sweep the constructed
+    // unrooted string at a full window.
+    vm.cWindowEnsure(Vm.handleThread(h), 1) catch |e| {
+        if (B.b != &B.init[0]) vm.alloc.free(B.b[0..B.size]);
+        cThrowOn(vm, h, api.mapVmError(e));
+    };
     // PUC luaL_pushresultsize → lua_pushlstring: OOM is LUA_ERRMEM, with
-    // the spilled heap buffer freed BEFORE the throw (P16.50-review-5
-    // B2 — the old `catch return`/`catch {}` leaked the heap spill
-    // and/or silently skipped the push).
+    // the spilled heap buffer freed BEFORE the throw (a
+    // `catch return`/`catch {}` would leak the heap spill
+    // and/or silently skip the push).
     const ls = vm.internStr(B.b[0..sz]) catch {
         if (B.b != &B.init[0]) vm.alloc.free(B.b[0..B.size]);
         cThrowOn(vm, h, error.OutOfMemory);
     };
-    h.c_stack.append(vm.alloc, .{ .String = ls }) catch {
+    vm.cWindowPush(Vm.handleThread(h), .{ .String = ls }) catch {
         if (B.b != &B.init[0]) vm.alloc.free(B.b[0..B.size]);
         cThrowOn(vm, h, error.OutOfMemory);
     };
@@ -4319,13 +4554,18 @@ var b1_oom_closure: ?*vm_mod.Closure = null;
 
 fn b1CfGetupvaluePushOom(L: ?*lua_State) callconv(.c) c_int {
     var s = api.State.fromHandle(L.?);
-    // Stage the Lua closure at index 1 on the fresh c_stack (pcallk with
+    // Stage the Lua closure at index 1 on the fresh window (pcallk with
     // 0 args → the activation reserved LUA_MINSTACK spare slots), then
     // fill the stack to EXACT capacity so the result push inside
     // lua_getupvalue MUST allocate (the growth is the armed failure).
-    s.stack.append(s.vm.alloc, .{ .Closure = b1_oom_closure.? }) catch return -1;
-    while (s.stack.capacity > s.stack.items.len) {
-        s.stack.append(s.vm.alloc, .Nil) catch return -1;
+    s.push(.{ .Closure = b1_oom_closure.? }) catch return -1;
+    // Fill the window to the stack buffer's EXACT capacity (no growth:
+    // top never passes the captured len) so the result push inside
+    // lua_getupvalue MUST grow (the growth is the armed failure).
+    {
+        const fill_th = s.curThread();
+        const cap = fill_th.stack.len;
+        while (fill_th.top < cap) s.push(.Nil) catch return -1;
     }
     // Arm: from here the ONLY fallible step is the result push (the
     // upvalue name "x" is pre-interned by the test — the name lookup is
@@ -4349,7 +4589,7 @@ test "c api lua_getupvalue OOM on result push is LUA_ERRMEM" {
     try std.testing.expectEqual(@as(c_int, 0), luaL_loadstring(L, "local x = 7 return function() return x end"));
     try std.testing.expectEqual(@as(c_int, 0), lua_pcallk(L, 0, 1, 0, 0, null));
     const s = api.State.fromHandle(L);
-    b1_oom_closure = s.stack.items[s.stack.items.len - 1].Closure;
+    b1_oom_closure = s.curThread().stack[s.curThread().top - 1].Closure;
     // Keep the closure and the name alive across the pcall (temp roots —
     // the swapped-out main stack is not GC-marked during the C call).
     var scope = try vm.openRootScope(2, 0);
@@ -4398,9 +4638,9 @@ fn b8AgeIsYoung(age: vm_mod.GcAge) bool {
 /// must throw LUA_ERRMEM BEFORE the store commits.
 fn b8CfSetupvalueOom(L: ?*lua_State) callconv(.c) c_int {
     var s = api.State.fromHandle(L.?);
-    s.stack.append(s.vm.alloc, .{ .Closure = b8_owner.? }) catch return -1;
+    s.push(.{ .Closure = b8_owner.? }) catch return -1;
     lua_createtable(L, 0, 0);
-    b8_young = s.stack.items[s.stack.items.len - 1].Table;
+    b8_young = s.curThread().stack[s.curThread().top - 1].Table;
     // Force both reserves to allocate (fresh capacity-less lists).
     s.vm.gc_gray.deinit(s.vm.alloc);
     s.vm.gc_gray = .empty;
@@ -4423,8 +4663,8 @@ test "c api lua_setupvalue OOM throws LUA_ERRMEM before the store" {
     // Owner closure with one named CLOSED upvalue ("x" → a table).
     try std.testing.expectEqual(@as(c_int, 0), luaL_loadstring(L, "local x = {1} return function() return x end"));
     try std.testing.expectEqual(@as(c_int, 0), lua_pcallk(L, 0, 1, 0, 0, null));
-    const s = api.State.fromHandle(L);
-    b8_owner = s.stack.items[s.stack.items.len - 1].Closure;
+    var s = api.State.fromHandle(L);
+    b8_owner = s.curThread().stack[s.curThread().top - 1].Closure;
     const owner_cell = b8_owner.?.upvalues[0];
     const orig_value = owner_cell.value;
     var scope = try vm.openRootScope(1, 0);
@@ -4457,7 +4697,7 @@ test "c api lua_setupvalue OOM throws LUA_ERRMEM before the store" {
     // once, and a full collection keeps it alive through the old cell.
     // (The failed pcallk left the error object on the stack — drop it.)
     lua_settop(L, 1); // [closure]
-    s.stack.append(vm.alloc, .{ .Table = b8_young.? }) catch return error.OutOfMemory;
+    s.push(.{ .Table = b8_young.? }) catch return error.OutOfMemory;
     const name = lua_setupvalue(L, -2, 1);
     try std.testing.expect(name != null);
     try std.testing.expectEqualStrings("x", std.mem.span(name.?));
@@ -4479,8 +4719,8 @@ test "c api lua_setupvalue OOM throws LUA_ERRMEM before the store" {
 /// barrier reserve must throw LUA_ERRMEM BEFORE the re-point.
 fn b8CfUpvaluejoinOom(L: ?*lua_State) callconv(.c) c_int {
     var s = api.State.fromHandle(L.?);
-    s.stack.append(s.vm.alloc, .{ .Closure = b8_owner.? }) catch return -1;
-    s.stack.append(s.vm.alloc, .{ .Closure = b8_donor.? }) catch return -1;
+    s.push(.{ .Closure = b8_owner.? }) catch return -1;
+    s.push(.{ .Closure = b8_donor.? }) catch return -1;
     s.vm.gc_gray.deinit(s.vm.alloc);
     s.vm.gc_gray = .empty;
     s.vm.gc_old1.deinit(s.vm.alloc);
@@ -4504,7 +4744,7 @@ test "c api lua_upvaluejoin OOM throws LUA_ERRMEM before the re-point" {
     try std.testing.expectEqual(@as(c_int, 0), luaL_loadstring(L, "local x = {1} return function() return x end"));
     try std.testing.expectEqual(@as(c_int, 0), lua_pcallk(L, 0, 1, 0, 0, null));
     const s = api.State.fromHandle(L);
-    b8_owner = s.stack.items[s.stack.items.len - 1].Closure;
+    b8_owner = s.curThread().stack[s.curThread().top - 1].Closure;
     const owner_cell = b8_owner.?.upvalues[0];
     var scope = try vm.openRootScope(2, 0);
     defer scope.close();
@@ -4513,7 +4753,7 @@ test "c api lua_upvaluejoin OOM throws LUA_ERRMEM before the re-point" {
 
     try std.testing.expectEqual(@as(c_int, 0), luaL_loadstring(L, "local y = {2} return function() return y end"));
     try std.testing.expectEqual(@as(c_int, 0), lua_pcallk(L, 0, 1, 0, 0, null));
-    b8_donor = s.stack.items[s.stack.items.len - 1].Closure;
+    b8_donor = s.curThread().stack[s.curThread().top - 1].Closure;
     const donor_cell = b8_donor.?.upvalues[0];
     _ = scope.protectValueAssumeCapacity(.{ .Closure = b8_donor.? });
     try std.testing.expect(b8AgeIsYoung(donor_cell.gc_age));
@@ -4559,8 +4799,8 @@ test "c api upvalue names are arena-backed: stable pointers, no query allocation
     // on a PUC-allocation-free path.
     try std.testing.expectEqual(@as(c_int, 0), luaL_loadstring(L, "local x = 7 return function() return x end"));
     try std.testing.expectEqual(@as(c_int, 0), lua_pcallk(L, 0, 1, 0, 0, null));
-    const s = api.State.fromHandle(L);
-    const closure = s.stack.items[s.stack.items.len - 1].Closure;
+    var s = api.State.fromHandle(L);
+    const closure = s.curThread().stack[s.curThread().top - 1].Closure;
     var scope = try vm.openRootScope(1, 0);
     defer scope.close();
     _ = scope.protectValueAssumeCapacity(.{ .Closure = closure });
@@ -4599,8 +4839,8 @@ test "c api upvalue names are arena-backed: stable pointers, no query allocation
     // cannot need growth) and fail_index=0, the name query still succeeds
     // — the name path allocates nothing.
     {
-        s.stack.append(vm.alloc, .{ .Closure = closure }) catch return error.OutOfMemory;
-        s.stack.ensureUnusedCapacity(vm.alloc, 8) catch return error.OutOfMemory;
+        s.push(.{ .Closure = closure }) catch return error.OutOfMemory;
+        s.checkstack(8) catch return error.OutOfMemory; // spare capacity: the push cannot need growth
         var failing = std.testing.FailingAllocator.init(vm.alloc, .{
             .fail_index = 0,
             .resize_fail_index = 0,
@@ -4637,8 +4877,8 @@ fn r13StageTable(L: ?*lua_State) callconv(.c) c_int {
     s.vm.gc_grayagain = .empty;
     s.vm.finalizables.deinit(s.vm.alloc);
     s.vm.finalizables = .empty;
-    s.stack.append(s.vm.alloc, .{ .Table = r13_owner_table.? }) catch return -1;
-    s.stack.append(s.vm.alloc, .{ .Table = r13_mt.? }) catch return -1;
+    s.push(.{ .Table = r13_owner_table.? }) catch return -1;
+    s.push(.{ .Table = r13_mt.? }) catch return -1;
     r13_failing = std.testing.FailingAllocator.init(r13_base, .{
         .fail_index = r13_fail_idx,
         .resize_fail_index = 0,
@@ -4663,8 +4903,8 @@ fn r13StageUserdata(L: ?*lua_State) callconv(.c) c_int {
     s.vm.gc_grayagain = .empty;
     s.vm.finalizables.deinit(s.vm.alloc);
     s.vm.finalizables = .empty;
-    s.stack.append(s.vm.alloc, .{ .Userdata = r13_owner_ud.? }) catch return -1;
-    s.stack.append(s.vm.alloc, .{ .Table = r13_mt.? }) catch return -1;
+    s.push(.{ .Userdata = r13_owner_ud.? }) catch return -1;
+    s.push(.{ .Table = r13_mt.? }) catch return -1;
     r13_failing = std.testing.FailingAllocator.init(r13_base, .{
         .fail_index = r13_fail_idx,
         .resize_fail_index = 0,
@@ -4785,7 +5025,7 @@ test "c api lua_setmetatable OOM transaction matrix (table + userdata, every res
         const L = luaL_newstate() orelse return error.OutOfMemory;
         defer lua_close(L);
         const vm = L.vm;
-        const s = api.State.fromHandle(L);
+        var s = api.State.fromHandle(L);
         var scope = try vm.openRootScope(1, 0);
         defer scope.close();
         _ = luazigGcFixed(L, 7, 0); // LUA_GCGENERATIONAL
@@ -4834,12 +5074,12 @@ test "c api lua_setmetatable OOM transaction matrix (table + userdata, every res
         // exactly the metatable, and a real full cycle keeps the store and
         // the exactly-once registration.
         lua_settop(L, 0);
-        s.stack.append(vm.alloc, .{ .Userdata = r13_owner_ud.? }) catch return error.OutOfMemory;
-        s.stack.append(vm.alloc, .{ .Table = mt_b }) catch return error.OutOfMemory;
+        s.push(.{ .Userdata = r13_owner_ud.? }) catch return error.OutOfMemory;
+        s.push(.{ .Table = mt_b }) catch return error.OutOfMemory;
         try std.testing.expectEqual(@as(c_int, 1), lua_setmetatable(L, 1));
         // A SUCCESSFUL transaction pops exactly the metatable (one value) —
         // the owner remains on the stack.
-        try std.testing.expectEqual(@as(usize, 1), s.stack.items.len);
+        try std.testing.expectEqual(@as(usize, 1), s.count());
         try std.testing.expect(r13_owner_ud.?.metatable == mt_b);
         try std.testing.expect(vm.finalizables.contains(.{ .userdata = r13_owner_ud.? }));
         try std.testing.expectEqual(@as(usize, 1), vm.finalizables.count());
@@ -4863,7 +5103,7 @@ test "c api debug.setmetatable protected Lua call OOM matrix (shared transaction
         const L = luaL_newstate() orelse return error.OutOfMemory;
         defer lua_close(L);
         const vm = L.vm;
-        const s = api.State.fromHandle(L);
+        var s = api.State.fromHandle(L);
 
         var scope = try vm.openRootScope(4, 0);
         defer scope.close();
@@ -4876,7 +5116,7 @@ test "c api debug.setmetatable protected Lua call OOM matrix (shared transaction
         // the seam) and root it for this probe.
         try std.testing.expectEqual(@as(c_int, 0), luaL_loadstring(L, "return function(o, m) return debug.setmetatable(o, m) end"));
         try std.testing.expectEqual(@as(c_int, 0), lua_pcallk(L, 0, 1, 0, 0, null));
-        const closure = s.stack.items[s.stack.items.len - 1].Closure;
+        const closure = s.curThread().stack[s.curThread().top - 1].Closure;
         _ = scope.protectValueAssumeCapacity(.{ .Closure = closure });
         lua_settop(L, 0);
 
@@ -4902,9 +5142,9 @@ test "c api debug.setmetatable protected Lua call OOM matrix (shared transaction
         vm.gc_grayagain = .empty;
         vm.finalizables.deinit(vm.alloc);
         vm.finalizables = .empty;
-        s.stack.append(vm.alloc, .{ .Closure = closure }) catch return error.OutOfMemory;
-        s.stack.append(vm.alloc, .{ .Table = owner }) catch return error.OutOfMemory;
-        s.stack.append(vm.alloc, .{ .Table = mt }) catch return error.OutOfMemory;
+        s.push(.{ .Closure = closure }) catch return error.OutOfMemory;
+        s.push(.{ .Table = owner }) catch return error.OutOfMemory;
+        s.push(.{ .Table = mt }) catch return error.OutOfMemory;
         var failing = std.testing.FailingAllocator.init(base, .{
             .fail_index = r13_fail_idx,
             .resize_fail_index = 0,
@@ -4927,8 +5167,8 @@ test "c api debug.setmetatable protected Lua call OOM matrix (shared transaction
             // owner + metatable survive and the registration persists
             // (registered, not run).
             lua_settop(L, 0);
-            s.stack.append(vm.alloc, .{ .Table = owner }) catch return error.OutOfMemory;
-            s.stack.append(vm.alloc, .{ .Table = mt }) catch return error.OutOfMemory;
+            s.push(.{ .Table = owner }) catch return error.OutOfMemory;
+            s.push(.{ .Table = mt }) catch return error.OutOfMemory;
             _ = luazigGcFixed(L, 2, 0);
             try std.testing.expect(owner.metatable == mt);
             try std.testing.expect(vm.finalizables.contains(.{ .table = owner }));
@@ -4974,7 +5214,7 @@ test "c api lua_setmetatable type-level default arm matches PUC" {
     const L = luaL_newstate() orelse return error.OutOfMemory;
     defer lua_close(L);
     const vm = L.vm;
-    const s = api.State.fromHandle(L);
+    var s = api.State.fromHandle(L);
     const mt = try vm.apiNewTable();
     var scope = try vm.openRootScope(1, 0);
     defer scope.close();
@@ -4996,15 +5236,15 @@ test "c api lua_setmetatable type-level default arm matches PUC" {
     // 7=lightuserdata. Positive indices; a SUCCESSFUL setmetatable pops
     // its metatable.
     for (1..8) |slot| {
-        s.stack.append(vm.alloc, .{ .Table = mt }) catch return error.OutOfMemory;
+        s.push(.{ .Table = mt }) catch return error.OutOfMemory;
         try std.testing.expectEqual(@as(c_int, 1), lua_setmetatable(L, @intCast(slot)));
-        try std.testing.expectEqual(@as(usize, 7), s.stack.items.len);
+        try std.testing.expectEqual(@as(usize, 7), s.count());
     }
     // getmetatable round-trips each type slot to the SAME table.
     for (1..8) |slot| {
         try std.testing.expectEqual(@as(c_int, 1), lua_getmetatable(L, @intCast(slot)));
-        try std.testing.expect(s.stack.items[s.stack.items.len - 1].Table == mt);
-        s.stack.items.len -= 1;
+        try std.testing.expect(s.curThread().stack[s.curThread().top - 1].Table == mt);
+        s.curThread().top -= 1; // plain pop
     }
     lua_settop(L, 0);
 }

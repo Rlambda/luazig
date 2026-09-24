@@ -690,6 +690,60 @@ pub fn fuseUpvalueNameTail(alloc: std.mem.Allocator, upvalues: []Upvaldesc) erro
     return grown;
 }
 
+/// Grow a tree-owned locvars allocation to
+/// carry a NUL-terminated debug-name tail — the proto's source name plus
+/// every non-empty locvar name — and re-point `source_name` and each name
+/// into it. Same shape and rationale as `fuseUpvalueNameTail`: the
+/// builder's name slices borrow the source bytes (no sentinel), while the
+/// C-API debug queries (`lua_getinfo` 'S'/'n', `lua_getlocal`) must hand
+/// out proto-lifetime `[*:0]` pointers without interning on every query —
+/// PUC's Proto keeps interned `TString*` names; the fused tail is the
+/// zero-query-cost equivalent. Descriptors and tail share ONE allocation,
+/// so `Proto.locvarsAllocElems` re-derives the free length. The caller
+/// re-slices `proto.locvars` to the first `locvars.len` entries, points
+/// `proto.source_name` at the returned copy (when non-empty), and sets
+/// `flags.debug_name_tail` + `flags.debug_names_z`. Returns the grown
+/// allocation and the NUL-terminated source-name copy (empty when the
+/// proto carries no source name).
+pub fn fuseDebugNameTail(
+    alloc: std.mem.Allocator,
+    locvars: []LocVar,
+    source_name: []const u8,
+) error{OutOfMemory}!struct { grown: []LocVar, source_z: []const u8 } {
+    var tail_len: usize = 0;
+    if (source_name.len > 0) tail_len += source_name.len + 1;
+    for (locvars) |lv| {
+        if (lv.name.len > 0) tail_len += lv.name.len + 1;
+    }
+    if (tail_len == 0) return .{ .grown = locvars, .source_z = "" };
+    const n = locvars.len;
+    const tail_elems = (tail_len + @sizeOf(LocVar) - 1) / @sizeOf(LocVar);
+    // locvars may be a zero-length slice with no allocation behind it
+    // (proto with no locals but a source name) — grow from a fresh
+    // allocation in that case.
+    const grown = if (n > 0)
+        try alloc.realloc(locvars, n + tail_elems)
+    else
+        try alloc.alloc(LocVar, tail_elems);
+    const tail = @as([*]u8, @ptrCast(grown.ptr + n))[0..tail_len];
+    var off: usize = 0;
+    var src_z: []const u8 = "";
+    if (source_name.len > 0) {
+        @memcpy(tail[0..source_name.len], source_name);
+        tail[source_name.len] = 0;
+        src_z = tail[0..source_name.len];
+        off = source_name.len + 1;
+    }
+    for (grown[0..n]) |*lv| {
+        if (lv.name.len == 0) continue;
+        @memcpy(tail[off..][0..lv.name.len], lv.name);
+        tail[off + lv.name.len] = 0;
+        lv.name = tail[off..][0..lv.name.len];
+        off += lv.name.len + 1;
+    }
+    return .{ .grown = grown, .source_z = src_z };
+}
+
 /// double-free).
 pub fn destroyProtoTree(alloc: std.mem.Allocator, root: *Proto, k_strings_vm_owned: bool) void {
     // PUC PF_FIXED parity: when fixed_arrays is set, code and lineinfo are
@@ -724,8 +778,15 @@ pub fn destroyProtoTree(alloc: std.mem.Allocator, root: *Proto, k_strings_vm_own
         alloc.free(root.upvalues.ptr[0..root.upvaluesAllocElems()]);
     }
     if (!root.flags.fixed_arrays) alloc.free(root.lineinfo);
-    alloc.free(root.locvars);
-    if (root.live_reg_top.len > 0) alloc.free(root.live_reg_top);
+    // The locvars allocation may carry a
+    // fused NUL-terminated debug-name tail (source name + locvar names)
+    // after the entries — free the whole allocation (element count
+    // re-derived; see locvarsAllocElems). The tail can exist with ZERO
+    // LocVar entries (a proto with no locals but a source name fuses a
+    // fresh tail-only allocation), so the guard is the flag, not the len.
+    if (root.locvars.len > 0 or root.flags.debug_name_tail) {
+        alloc.free(root.locvars.ptr[0..root.locvarsAllocElems()]);
+    }
     if (root.resolved_values.len > 0) alloc.free(root.resolved_values);
     // CUT2: source_backing is now on the root proto. Deinit it before
     // destroying the struct. For non-root protos (recursive calls),
@@ -740,7 +801,7 @@ pub fn destroyProtoTree(alloc: std.mem.Allocator, root: *Proto, k_strings_vm_own
 
 /// Compute the native memory footprint of a Proto tree: all Proto structs
 /// plus every owned array (code, k, p, upvalues, lineinfo, locvars,
-/// live_reg_top, resolved_values). Recursively sums children.
+/// resolved_values). Recursively sums children.
 ///
 /// Does NOT include:
 ///   - Interned LuaStrings (owned by the VM string table, already charged
@@ -773,8 +834,11 @@ pub fn protoTreeFootprint(root: *const Proto) usize {
     // P16.50-review-8 §1.3: fused NUL-terminated upvalue-name tail
     // (tree-owned; PUC charges one TString per name here).
     total += root.upvalueNameTailBytes();
+    // Fused NUL-terminated debug-name tail
+    // on the locvars allocation (source name + locvar names; PUC charges
+    // one TString per name here).
+    total += root.debugNameTailBytes();
     total += root.locvars.len * @sizeOf(LocVar);
-    total += root.live_reg_top.len * @sizeOf(u8);
     total += root.resolved_values.len * @sizeOf(vm.Value);
     for (root.p) |child| {
         total += protoTreeFootprint(child);
@@ -926,11 +990,6 @@ pub const Proto = struct {
     lineinfo: []const u32,
     /// Local variable debug info (name, start PC, end PC).
     locvars: []const LocVar,
-    /// P15.32: High-water mark of allocated registers at each instruction.
-    /// The GC uses this to mark only live registers instead of the full
-    /// maxstacksize window, eliminating the need for codegen-emitted LOADNIL
-    /// at statement boundaries. Indexed by PC; one byte per instruction.
-    live_reg_top: []const u8 = &.{},
 
     /// Maximum register count (frame capacity). 0–254 valid (255 = NO_REG).
     maxstacksize: u8,
@@ -985,15 +1044,31 @@ pub const Proto = struct {
         /// always own their arrays (flag = false).
         fixed_arrays: bool = false,
         /// P16.50-review-8 §1.3: the upvalues allocation carries a fused
-        /// NUL-terminated name tail after the descriptor array (see
+        /// NUL-terminated name tail after the descriptors (see
         /// `fuseUpvalueNameTail`). Set per-proto by `ProtoBuilder.finish`
         /// and non-fixed `undumpProto`; fixed-buffer undumps keep the
         /// names aliasing the (stable, in-place NUL-terminated) dump
         /// buffer and stay allocation-identical to the pre-§1.3 baseline.
         upvalue_name_tail: bool = false,
+        /// The locvars allocation carries a
+        /// fused NUL-terminated debug-name tail (the source name plus every
+        /// non-empty locvar name, see `fuseDebugNameTail`). Set per-proto by
+        /// `ProtoBuilder.finish`. Drives `locvarsAllocElems` (the free path)
+        /// and `protoTreeFootprint`. Implies `debug_names_z`.
+        debug_name_tail: bool = false,
+        /// `source_name` and every non-empty
+        /// locvar name are NUL-terminated with proto lifetime, so the C-API
+        /// debug queries (`lua_getinfo` 'S'/'n', `lua_getlocal`) can hand
+        /// out `[*:0]` pointers directly — PUC ldebug.c auxgetinfo shape
+        /// (ar->source = svalue(p->source), proto-lifetime, no fresh
+        /// allocation). Set by `ProtoBuilder.finish` (fused tail), by
+        /// fixed `undumpProto` (names alias the dump buffer, where every
+        /// string is NUL-terminated in place), and by
+        /// `cloneUndumpedStrings` (NUL-terminated name_copies).
+        debug_names_z: bool = false,
         /// Whether the function accepts varargs (PUC `flags.is_vararg`).
         is_vararg: bool = false,
-        _pad: u2 = 0,
+        _pad: u0 = 0,
     };
 
     /// P16.50-review-8 §1.3: bytes of the fused NUL-terminated upvalue-name
@@ -1017,6 +1092,29 @@ pub const Proto = struct {
     pub fn upvaluesAllocElems(self: *const Proto) usize {
         const tail = self.upvalueNameTailBytes();
         return self.upvalues.len + (tail + @sizeOf(Upvaldesc) - 1) / @sizeOf(Upvaldesc);
+    }
+
+    /// Bytes of the fused NUL-terminated
+    /// debug-name tail carried after the LocVar array in the same
+    /// allocation (0 unless `flags.debug_name_tail`). Re-derived from the
+    /// proto's own fields — the tail needs no separate pointer/length
+    /// field, mirroring `upvalueNameTailBytes`.
+    pub fn debugNameTailBytes(self: *const Proto) usize {
+        if (!self.flags.debug_name_tail) return 0;
+        var tail: usize = 0;
+        if (self.source_name_len > 0) tail += self.source_name_len + 1;
+        for (self.locvars) |lv| {
+            if (lv.name.len > 0) tail += lv.name.len + 1;
+        }
+        return tail;
+    }
+
+    /// Total element count of the tree-owned locvars allocation (LocVars
+    /// plus debug-name-tail padding). The free path must pass exactly this
+    /// length.
+    pub fn locvarsAllocElems(self: *const Proto) usize {
+        const tail = self.debugNameTailBytes();
+        return self.locvars.len + (tail + @sizeOf(LocVar) - 1) / @sizeOf(LocVar);
     }
 
     /// "No vararg table register" sentinel (P16.16 C7): register indices
@@ -1098,22 +1196,6 @@ pub const ProtoBuilder = struct {
     protos: std.ArrayListUnmanaged(*Proto) = .empty,
     upvalues: std.ArrayListUnmanaged(Upvaldesc) = .empty,
     locvars: std.ArrayListUnmanaged(LocVar) = .empty,
-    /// Per-PC register boundary. Records the "before" high-water mark:
-    /// the live top BEFORE the instruction at this PC writes its destination.
-    /// GC uses this to scan only registers actually written by previous
-    /// instructions, avoiding stale pointers from prior frames.
-    /// (P15.36: changed from "after" to "before" semantics to eliminate
-    /// the per-call @memset in pushBytecodeExecFrame.)
-    live_reg_top: std.ArrayListUnmanaged(u8) = .empty,
-    /// Current live register top (the "after" boundary for the instruction
-    /// being emitted). Updated by reserveRegs/syncLiveTop.
-    current_live_top: u8 = 0,
-    /// P15.36: Snapshot of current_live_top captured BEFORE the first
-    /// register allocation for the instruction being emitted. emit() records
-    /// this value. The has_live_top_before flag prevents multiple reserveRegs
-    /// calls within one instruction from overwriting the snapshot.
-    live_top_before: u8 = 0,
-    has_live_top_before: bool = false,
 
     maxstacksize: u8 = 2, // PUC starts at 2 (regs 0 and 1 always valid)
     numparams: u8 = 0,
@@ -1144,7 +1226,6 @@ pub const ProtoBuilder = struct {
         }
         self.upvalues.deinit(self.alloc);
         self.locvars.deinit(self.alloc);
-        self.live_reg_top.deinit(self.alloc);
     }
 
     /// Current PC (index of the next instruction to emit).
@@ -1153,26 +1234,10 @@ pub const ProtoBuilder = struct {
     }
 
     /// Emit an instruction at the current PC, recording the source line.
-    /// P15.36: Records live_top_before (the "before" boundary) rather than
-    /// current_live_top (the "after" boundary). This ensures GC safepoints
-    /// only scan registers written by PREVIOUS instructions.
     pub fn emit(self: *ProtoBuilder, inst: Instruction, line: u32) !u32 {
         const result_pc: u32 = @intCast(self.code.items.len);
         try self.code.append(self.alloc, inst);
         try self.lineinfo.append(self.alloc, line);
-        // P15.38: Record the "after" boundary (current_live_top). This
-        // includes the destination register of the instruction being emitted.
-        // The "before" boundary (P15.36) caused GC to clear the destination
-        // register of allocation instructions (OP_CLOSURE, OP_CONCAT) when GC
-        // ran during the allocation (via gcNoteAlloc) but before the result
-        // was stored. The "after" boundary correctly preserves the destination.
-        // Stale objects in result registers of OP_CALL may be leaked (not
-        // cleared), but this is a minor leak, not a crash.
-        try self.live_reg_top.append(self.alloc, self.current_live_top);
-        // Reset for the next instruction: default live_top_before to the
-        // current "after" boundary (covers instructions with no allocations).
-        self.has_live_top_before = false;
-        self.live_top_before = self.current_live_top;
         return result_pc;
     }
 
@@ -1328,10 +1393,13 @@ pub const ProtoBuilder = struct {
         errdefer alloc.free(upv_slice.ptr[0..upv_elems]);
         const li_slice = try self.lineinfo.toOwnedSlice(alloc);
         errdefer alloc.free(li_slice);
-        const lv_slice = try self.locvars.toOwnedSlice(alloc);
-        errdefer alloc.free(lv_slice);
-        const lrt_slice = try self.live_reg_top.toOwnedSlice(alloc);
-        errdefer if (lrt_slice.len > 0) alloc.free(lrt_slice);
+        // The locvars allocation may later
+        // grow a fused NUL-terminated debug-name tail (see the fuse pass
+        // below) — the errdefer must free the CURRENT allocation length,
+        // tracked in lv_elems.
+        var lv_slice = try self.locvars.toOwnedSlice(alloc);
+        var lv_elems = lv_slice.len;
+        errdefer alloc.free(lv_slice.ptr[0..lv_elems]);
         proto.* = .{
             .code = code_slice,
             .k = k_slice,
@@ -1339,7 +1407,6 @@ pub const ProtoBuilder = struct {
             .upvalues = upv_slice,
             .lineinfo = li_slice,
             .locvars = lv_slice,
-            .live_reg_top = lrt_slice,
             .maxstacksize = self.maxstacksize,
             .numparams = self.numparams,
             .flags = .{ .is_vararg = self.is_vararg },
@@ -1373,6 +1440,36 @@ pub const ProtoBuilder = struct {
                 proto.flags.upvalue_name_tail = true;
             }
         }
+        // Fuse a NUL-terminated debug-name
+        // tail (the source name plus every non-empty locvar name) onto the
+        // locvars allocation — same pass shape as the upvalue fuse above.
+        // The builder's source_name/locvar-name slices borrow the source
+        // bytes (no sentinel); the C-API query paths (lua_getinfo 'S'/'n',
+        // lua_getlocal) need stable proto-lifetime NUL-terminated pointers
+        // without interning on every query (PUC auxgetinfo hands out
+        // proto-owned TString pointers directly). After this pass
+        // `flags.debug_names_z` holds and the pointers are tree-owned.
+        {
+            var tail_needed = proto.sourceName().len > 0;
+            if (!tail_needed) for (lv_slice) |lv| {
+                if (lv.name.len > 0) {
+                    tail_needed = true;
+                    break;
+                }
+            };
+            if (tail_needed) {
+                const n = lv_slice.len;
+                const fused = try fuseDebugNameTail(alloc, lv_slice, proto.sourceName());
+                lv_slice = fused.grown;
+                lv_elems = lv_slice.len;
+                proto.locvars = lv_slice[0..n];
+                if (fused.source_z.len > 0) proto.setSourceName(fused.source_z);
+                proto.flags.debug_name_tail = true;
+            }
+        }
+        // Vacuously true when no name was fused (all names empty — nothing
+        // to terminate); the flag is the query paths' contract marker.
+        proto.flags.debug_names_z = true;
         // ── Tree binding (CUT2: owner merged into root Proto) ──
         // Every adopted child was finished by its own builder and therefore
         // IS its own root (tree == self, ref_count == 1, its producing

@@ -1433,6 +1433,17 @@ fn writeVmStatsJson(alloc: std.mem.Allocator, io: std.Io, out_path: []const u8, 
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = aw.writer.buffered() });
 }
 
+const InterpreterThreadContext = struct {
+    init: std.process.Init,
+    result: ?anyerror = null,
+};
+
+fn interpreterThread(ctx: *InterpreterThreadContext) void {
+    interpreterMain(ctx.init) catch |err| {
+        ctx.result = err;
+    };
+}
+
 pub fn main(init: std.process.Init) !void {
     // P15.83c: Verify CallFrame size stays within budget.
     // Adding yielded_tbc (?[]Value = 17 bytes on 64-bit) to CFrameState
@@ -1441,8 +1452,26 @@ pub fn main(init: std.process.Init) !void {
         const cs = @sizeOf(lua.internal.vm.CallFrame);
         if (cs > 104) @compileError("CallFrame grew beyond 104B: " ++ std.fmt.comptimePrint("{d}", .{cs}));
     }
-    // Bytecode execution owns Lua activations in Thread.bytecode_frames. The
-    // interpreter no longer needs a giant host stack to survive Lua-controlled
-    // recursion, so run directly on the process' normal stack.
-    try interpreterMain(init);
+    // Lua-to-Lua calls are iterative (bytecode dispatch owns Lua
+    // activations in Thread.bytecode_frames), but C-BOUNDARY recursion
+    // still nests in Zig: each coroutine resume/yield level costs one
+    // host frame chain (runBytecodeDispatch ~44.9K + resume ~16.9K +
+    // opCall ~8.6K Debug dynamic sub, ~84.2 KB/level measured). The
+    // semantic limit is PUC's LUAI_MAXCCALLS (200,
+    // nCcalls guard in resumeEnterC) — PUC recurses in C on the same
+    // path with ~1 KB frames, so 200 levels fit any host stack; our
+    // Debug frames need 200 x 84.2 KB ~= 16.8 MB, which exceeds this
+    // environment's fixed ~16 MB main-thread ceiling (ulimit -s is not
+    // enforced here). The host therefore provides a
+    // dedicated interpreter thread with a stack large enough for the
+    // full semantic depth; the observable limit stays exactly 200
+    // ("C stack overflow"), PUC parity, in Debug and ReleaseFast alike.
+    var ctx = InterpreterThreadContext{ .init = init };
+    const thread = try std.Thread.spawn(
+        .{ .stack_size = 256 * 1024 * 1024 },
+        interpreterThread,
+        .{&ctx},
+    );
+    thread.join();
+    if (ctx.result) |err| return err;
 }

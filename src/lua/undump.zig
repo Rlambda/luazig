@@ -544,9 +544,6 @@ pub const UndumpReader = struct {
             .upvalues = upvalues,
             .lineinfo = lineinfo,
             .locvars = locvars,
-            // live_reg_top is a codegen-only artifact; the undump path
-            // leaves it empty and lets the VM compute it lazily.
-            .live_reg_top = &.{},
             .maxstacksize = maxstacksize,
             .numparams = numparams,
             .vararg_table_reg = vararg_table_reg,
@@ -595,6 +592,13 @@ pub const UndumpReader = struct {
                 proto.upvalues = upvalues[0..n];
                 proto.flags.upvalue_name_tail = true;
             }
+        } else {
+            // In fixed ('B') mode the source name and locvar names keep
+            // aliasing the alive dump buffer, where every string is
+            // NUL-terminated in place (readStringDedup validates the
+            // trailing zero) — the proto-lifetime NUL contract for the
+            // C-API debug queries holds with zero load-time allocation.
+            proto.flags.debug_names_z = true;
         }
         // One-time structural validation of the instruction stream (see
         // verifyProtoCode). Deserialized chunks are the ONLY Proto source
@@ -995,7 +999,6 @@ test "UndumpReader: undumpProto round-trips a simple Proto" {
     // undumpChunk binds the tree / the VM resolves constants.
     try std.testing.expect(out.tree == null);
     try std.testing.expectEqual(@as(usize, 0), out.resolved_values.len);
-    try std.testing.expectEqual(@as(usize, 0), out.live_reg_top.len);
 }
 
 test "UndumpReader: undumpProto round-trips vararg + upvalues + locvars" {

@@ -352,17 +352,8 @@ pub const Codegen = struct {
             return error.CodegenError;
         }
         const new_top: u8 = @intCast(new_top_wide);
-        // P15.36: Snapshot the live top BEFORE bumping peak_freereg. This
-        // captures the "before" boundary for the instruction being emitted.
-        // The has_live_top_before flag ensures multiple reserveRegs calls
-        // within one instruction don't overwrite the first snapshot.
-        if (!self.builder.has_live_top_before) {
-            self.builder.live_top_before = self.builder.current_live_top;
-            self.builder.has_live_top_before = true;
-        }
         self.freereg = new_top;
         if (new_top > self.peak_freereg) self.peak_freereg = new_top;
-        self.builder.current_live_top = self.peak_freereg;
         self.builder.checkStack(self.freereg);
     }
 
@@ -403,28 +394,8 @@ pub const Codegen = struct {
     /// sub-expression temps untracked. Without nil'ing those, stale pointers
     /// survive GC and prevent weak table entry pruning.
     fn resetRegs(self: *Codegen) void {
-        // P15.32: Instead of emitting LOADNIL to clear stale temp registers,
-        // we record the live register boundary in live_reg_top. The GC uses
-        // this per-PC table to mark only live registers, and the atomic phase
-        // clears dead slots. This is the PUC Lua traversestack approach.
         self.freereg = self.nvarstack;
         self.peak_freereg = self.nvarstack;
-        self.builder.current_live_top = self.nvarstack;
-        // P15.36: Reset "before" snapshot for the next instruction.
-        self.builder.live_top_before = self.nvarstack;
-        self.builder.has_live_top_before = false;
-    }
-
-    /// Sync builder's current_live_top to the current peak_freereg.
-    /// Called whenever peak_freereg changes outside reserveRegs (e.g. direct
-    /// assignments in popScope, genCall, genExplistFixed).
-    /// P15.36: Also snapshots the "before" boundary if not already set.
-    fn syncLiveTop(self: *Codegen) void {
-        if (!self.builder.has_live_top_before) {
-            self.builder.live_top_before = self.builder.current_live_top;
-            self.builder.has_live_top_before = true;
-        }
-        self.builder.current_live_top = self.peak_freereg;
     }
 
     // -----------------------------------------------------------------------
@@ -755,16 +726,6 @@ pub const Codegen = struct {
                 // Patch the instruction's A field to target `reg`.
                 const pc: usize = @intCast(pc_i);
                 self.builder.code.items[pc].a = reg;
-                // P15.36: The instruction was emitted before allocReg
-                // (reloc pattern), so live_top_before was snapshotted
-                // before the bump. The snapshot correctly reflects the
-                // "before" boundary for the patched instruction itself,
-                // but it must NOT persist to the NEXT instruction.
-                // Clear the flag and update live_top_before to the
-                // current "after" boundary so the next instruction
-                // sees the newly allocated register as live.
-                self.builder.has_live_top_before = false;
-                self.builder.live_top_before = self.builder.current_live_top;
             },
             .non_reloc => |src| {
                 if (reg != src) {
@@ -1164,9 +1125,9 @@ pub const Codegen = struct {
 
         // Restore nvarstack to the scope entry point.
         if (mark < self.bindings.items.len) {
-            // P15.32: No LOADNIL needed — live_reg_top tracks the boundary
-            // and GC marks only live registers. Dead locals above the new
-            // nvarstack will be cleared by the atomic phase.
+            // No LOADNIL needed — GC marks the whole register window
+            // (wholesale, PUC traversethread), so dead locals above the new
+            // nvarstack need no codegen-side clearing.
             // Clear attribute markers for departing locals.
             for (self.bindings.items[mark..]) |b| {
                 _ = self.const_locals.remove(b.reg);
@@ -1183,7 +1144,6 @@ pub const Codegen = struct {
         }
         self.freereg = self.nvarstack;
         self.peak_freereg = self.nvarstack;
-        self.syncLiveTop();
         self.bindings.items.len = mark;
         try self.popGlobalScope();
     }
@@ -1226,7 +1186,6 @@ pub const Codegen = struct {
         }
         self.freereg = self.nvarstack;
         self.peak_freereg = self.nvarstack;
-        self.syncLiveTop();
         self.bindings.items.len = mark;
         try self.popGlobalScope();
     }
@@ -1515,8 +1474,6 @@ pub const Codegen = struct {
                     const new_l: u8 = @max(pl, l);
                     self.builder.code.items[prev_idx] =
                         bc.Instruction.make(.loadnil, new_from, new_l - new_from, 0);
-                    if (self.builder.current_live_top > self.builder.live_reg_top.items[prev_idx])
-                        self.builder.live_reg_top.items[prev_idx] = self.builder.current_live_top;
                     return;
                 }
             }
@@ -1719,13 +1676,6 @@ pub const Codegen = struct {
     fn removeLastInstruction(self: *Codegen) void {
         self.builder.code.items.len -= 1;
         self.builder.lineinfo.items.len -= 1;
-        self.builder.live_reg_top.items.len -= 1;
-        // The removed instruction's emit set has_live_top_before=false
-        // and live_top_before=current_live_top. Since OP_NOT (A=0) does
-        // not change current_live_top, these values remain correct for
-        // the next emit after removal.
-        self.builder.has_live_top_before = false;
-        self.builder.live_top_before = self.builder.current_live_top;
     }
 
     /// Default "materialize to register, TESTSET, JMP" path for goIfTrue/
@@ -4619,7 +4569,6 @@ pub const Codegen = struct {
         }
         self.freereg = obj_reg + 2;
         if (obj_reg + 2 > self.peak_freereg) self.peak_freereg = obj_reg + 2;
-        self.syncLiveTop();
 
         // Compile args.  Args must be in consecutive registers after
         // obj_reg+1 (self).  genExp can return a local register directly,
@@ -4676,7 +4625,6 @@ pub const Codegen = struct {
             self.freereg = obj_reg + 1;
         }
         if (self.freereg > self.peak_freereg) self.peak_freereg = self.freereg;
-        self.syncLiveTop();
         return obj_reg;
     }
 
@@ -5126,7 +5074,6 @@ pub const Codegen = struct {
                         _ = try self.builder.emitABC(.vararg, va_reg, 0, @intCast(remaining + 1), exp.span.line);
                         self.freereg = base + wanted;
                         if (base + wanted > self.peak_freereg) self.peak_freereg = base + wanted;
-                        self.syncLiveTop();
                     },
                     else => {
                         _ = try self.genExpNextReg(exp);
@@ -5187,11 +5134,10 @@ pub const Codegen = struct {
         defer self.line_hint = old_line;
         // P15.72g: Don't resetRegs after a return statement. The RETURN
         // instruction places return values in registers above nvarstack
-        // (e.g. R2-R4 for `return f()`). The subsequent CLOSE instructions
-        // (emitted by popScope for <close> variables) must inherit a
-        // live_reg_top that covers those return values. If we reset here,
-        // live_reg_top[close_pc] = nvarstack, and GC can collect the return
-        // values while the coroutine is parked at a yield inside __close.
+        // (e.g. R2-R4 for `return f()`), and the subsequent CLOSE
+        // instructions (emitted by popScope for <close> variables) must
+        // not clobber them. resetRegs would move freereg back to nvarstack
+        // and the CLOSE emission could reuse those registers.
         const is_return = st.node == .Return;
         defer {
             if (!is_return) self.resetRegs();
@@ -5623,11 +5569,7 @@ pub const Codegen = struct {
                 if (reg >= self.nvarstack) {
                     self.nvarstack = reg + 1;
                     self.freereg = @max(self.freereg, self.nvarstack);
-                    // PUC-faithful: nvarstack growth must update live_top
-                    // so GC marks the new local. Without this, live_reg_top
-                    // stays at the old value and GC clears the local.
                     self.peak_freereg = @max(self.peak_freereg, self.nvarstack);
-                    self.syncLiveTop();
                 }
                 try self.appendBinding(dn.name.slice(self.source), reg);
                 if (dn.prefix_attr orelse dn.suffix_attr) |attr| {
@@ -5656,7 +5598,6 @@ pub const Codegen = struct {
                     self.nvarstack = reg + 1;
                     self.freereg = @max(self.freereg, self.nvarstack);
                     self.peak_freereg = @max(self.peak_freereg, self.nvarstack);
-                    self.syncLiveTop();
                     try self.appendBinding(dn.name.slice(self.source), reg);
                     if (dn.prefix_attr orelse dn.suffix_attr) |attr| {
                         if (attr.kind == .Const) {
@@ -5683,7 +5624,6 @@ pub const Codegen = struct {
                 const reg = first_reg + @as(u8, @intCast(i));
                 self.nvarstack = @max(self.nvarstack, reg + 1);
                 self.peak_freereg = @max(self.peak_freereg, self.nvarstack);
-                self.syncLiveTop();
                 try self.appendBinding(dn.name.slice(self.source), reg);
                 if (dn.prefix_attr orelse dn.suffix_attr) |attr| {
                     // PUC: nvars(1) != nexps(0), so a `<const>` here stays a
@@ -6483,7 +6423,6 @@ pub const Codegen = struct {
             }
             self.freereg = obj_reg + 2;
             if (obj_reg + 2 > self.peak_freereg) self.peak_freereg = obj_reg + 2;
-            self.syncLiveTop();
             // Args must be consecutive after obj_reg+1 (self).
             for (mc.args, 0..) |arg, i| {
                 const expected: u8 = @intCast(@as(usize, obj_reg) + 2 + i);
@@ -6898,7 +6837,6 @@ pub const Codegen = struct {
         self.freereg = base + 3;
         self.nvarstack = base + 3;
         if (self.peak_freereg < base + 3) self.peak_freereg = base + 3;
-        self.syncLiveTop();
         const loop_binding_mark = self.bindings.items.len;
         const loop_var = try self.declareLocal(n.name.slice(self.source));
         try self.markReadonlyLocal(loop_var);
@@ -6973,7 +6911,6 @@ pub const Codegen = struct {
         self.freereg = base + 4;
         self.nvarstack = base + 4;
         if (self.peak_freereg < base + 4) self.peak_freereg = base + 4;
-        self.syncLiveTop();
 
         // PUC Lua records three hidden generic-for locals: iterator, state,
         // and the closing value.  The internal control register at base+2 is
@@ -6995,7 +6932,6 @@ pub const Codegen = struct {
         self.freereg = base + 4;
         self.nvarstack = base + 4;
         if (self.peak_freereg < base + 4) self.peak_freereg = base + 4;
-        self.syncLiveTop();
         const loop_binding_mark = self.bindings.items.len;
         for (n.names) |nm| {
             _ = try self.declareLocal(nm.slice(self.source));
@@ -7597,7 +7533,10 @@ test "codegen+vm: direct bytecode yield parks thread-owned continuation" {
     try testing.expect(rres[0] == .Bool and rres[0].Bool);
     try testing.expect(rres[1] == .Int and rres[1].Int == 42);
     try testing.expect(!th.bytecode_inplace_suspended);
-    try testing.expectEqual(@as(usize, 0), th.call_frames.len());
+    // The main thread's base frame (initThreadBaseFrame in Vm.init)
+    // survives the unwind — "fully unwound" is "no frames ABOVE the
+    // base" (PUC: ci == &L->base_ci after unroll), not len == 0.
+    try testing.expect(th.call_frames.len() == 1 and th.call_frames.getConstPtr(0).isBase());
 }
 
 test "codegen+vm: yielding generic iterator stays on explicit frame stack" {
@@ -7663,5 +7602,7 @@ test "codegen+vm: yielding generic iterator stays on explicit frame stack" {
     try testing.expect(rres[2] == .String);
     try testing.expectEqualStrings("resume-value", rres[2].String.bytes());
     try testing.expect(!th.bytecode_inplace_suspended);
-    try testing.expectEqual(@as(usize, 0), th.call_frames.len());
+    // Base frame remains after the unwind — "no frames ABOVE the
+    // base" (PUC: ci == &L->base_ci), not len == 0.
+    try testing.expect(th.call_frames.len() == 1 and th.call_frames.getConstPtr(0).isBase());
 }

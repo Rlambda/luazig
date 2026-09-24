@@ -240,7 +240,7 @@ def main() -> int:
     # Per-component breakdown for the api.lua fixed-load shape:
     # k_len ~ 3 (X string, 1 int, Y string or aaa string)
     # upvalues_len = 1 (_ENV)
-    # p_len = 0, locvars = 0 (stripped), live_reg_top = 0 (undump)
+    # p_len = 0, locvars = 0 (stripped)
     k_len = 3
     upvalues_len = 1
 

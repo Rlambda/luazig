@@ -68,17 +68,80 @@ pub const Options = struct {
 
 pub const State = struct {
     // BORROWS *Vm — same pointer c_api.zig uses. State no longer owns a Vm by
-    // value; it wraps a heap-allocated *Vm so that api.State and c_api.zig share
-    // the same stack (vm.c_stack), eliminating the dual-stack problem.
+    // value; it wraps a heap-allocated *Vm so that api.State and c_api.zig
+    // share the same execution state.
     vm: *vm_mod.Vm,
-    /// Pointer to the active handle's `c_stack` — resolved from the `lua_State`
-    /// handle in `fromHandle`, or from `vm.cur_c_stack` in `fromVm`. All stack
-    /// operations go through this pointer rather than `vm.cur_c_stack` directly,
-    /// so that a State created from a specific handle always operates on that
-    /// handle's stack even if `vm.cur_c_stack` is later reassigned (e.g. during
-    /// coroutine resume).
-    stack: *std.ArrayListUnmanaged(vm_mod.Value) = undefined,
-    thread_stacks: std.AutoHashMapUnmanaged(*vm_mod.Thread, std.ArrayListUnmanaged(vm_mod.Value)) = .empty,
+    /// The lua_State handle this State operates on. Every stack operation
+    /// resolves `handle → thread → TOP frame window` on `thread.stack` —
+    /// the single stack authority: the C-API window lives directly on the
+    /// thread's stack.
+    /// `init` uses the main handle, `fromVm` the active handle, `fromHandle`
+    /// the given one (PUC: the lua_State IS the thread).
+    handle: *vm_mod.lua_State,
+
+    /// The thread whose anchored C-API window this State addresses.
+    pub fn curThread(self: *const State) *vm_mod.Thread {
+        return vm_mod.Vm.handleThread(self.handle);
+    }
+
+    /// PUC `lua_gettop`: visible slots in the anchored window.
+    pub fn count(self: *const State) usize {
+        return vm_mod.Vm.cWindowCount(self.curThread());
+    }
+
+    /// PUC `index2value`: resolve `idx` to an ABSOLUTE `th.stack` slot in
+    /// the anchored window, or null for an invalid index. Pseudo-indices
+    /// (registry/upvalues) are resolved by the call sites that accept them.
+    pub fn slot(self: *const State, idx: i32) ?usize {
+        return vm_mod.Vm.cWindowSlot(self.curThread(), idx);
+    }
+
+    /// The value at `idx` as a COPY. Callers may run nested execution (which
+    /// can grow — and therefore move — `th.stack`): a pointer into the stack
+    /// would dangle across growth, a copy cannot.
+    pub fn valueAt(self: *const State, idx: i32) ?vm_mod.Value {
+        const s = self.slot(idx) orelse return null;
+        return self.curThread().stack[s];
+    }
+
+    /// PUC `api_incr_top`: push one value onto the anchored window.
+    pub fn push(self: *State, v: vm_mod.Value) ApiError!void {
+        self.vm.cWindowPush(self.curThread(), v) catch |e| return mapVmError(e);
+    }
+
+    /// Reserve one window slot for a value
+    /// that does not exist yet. PUC shape: the C stack slot is reserved
+    /// BEFORE the constructor runs (luaD_checkstack at C entry —
+    /// `api_incr_top` itself never allocates), so a constructed-but-not-
+    /// yet-rooted object never crosses a fallible operation before its
+    /// rooting store. Every construct-then-push constructor calls this
+    /// FIRST; the subsequent `push` then hits the reserved capacity and
+    /// cannot allocate — without it, a push at a FULL window grows the
+    /// stack (a counted allocation), and the testc adapter's emergency
+    /// GC + retry (PUC luaM_realloc_ tryagain) sweeps the constructed
+    /// unrooted object and the retried push stores a dangling pointer
+    /// (full window + pushlstring, dangling at fail k=3).
+    fn reservePushSlot(self: *State) ApiError!void {
+        self.vm.cWindowEnsure(self.curThread(), 1) catch |e| return mapVmError(e);
+    }
+
+    /// Push a slice of values onto the anchored window (alias-safe source).
+    pub fn pushSlice(self: *State, vs: []const vm_mod.Value) ApiError!void {
+        self.vm.cWindowPushSlice(self.curThread(), vs) catch |e| return mapVmError(e);
+    }
+
+    /// PUC `lua_settop`-based count change (TBC close on lowering — the
+    /// class-5 contract; nil-fill on raising).
+    pub fn setCount(self: *State, n: usize) ApiError!void {
+        self.vm.cWindowSetCount(self.curThread(), n) catch |e| return mapDispatchError(e);
+    }
+
+    /// PUC `lua_pop` = `lua_settop(-n-1)`: close-then-lower.
+    pub fn popN(self: *State, n: usize) ApiError!void {
+        const c = self.count();
+        if (n > c) return error.InvalidIndex;
+        try self.setCount(c - n);
+    }
 
     /// Create a new VM (heap-allocated) and wrap it.
     pub fn init(opts: Options) State {
@@ -86,17 +149,14 @@ pub const State = struct {
         const ptr = alloc.create(vm_mod.Vm) catch @panic("api.State.init: out of memory");
         ptr.* = vm_mod.Vm.init(alloc, false);
         _ = ptr.setupMainHandle() catch @panic("api.State.init: out of memory");
-        return .{ .vm = ptr, .stack = &ptr.main_handle.?.c_stack };
+        return .{ .vm = ptr, .handle = ptr.main_handle.? };
     }
 
     /// Clean up the VM and free its heap allocation.
     pub fn deinit(self: *State) void {
-        var it = self.thread_stacks.iterator();
-        while (it.next()) |entry| entry.value_ptr.deinit(self.vm.alloc);
-        self.thread_stacks.deinit(self.vm.alloc);
         // Tear the Vm down FIRST (matching lua_close in c_api.zig): finalizers
         // running inside vm.deinit may touch main_thread.api_handle (whose
-        // c_stack is a GC root), so the main handle must stay alive until
+        // window is a GC root), so the main handle must stay alive until
         // then. gcFreeObject(.thread) skips main handles (P15.83k), so the
         // handle is freed exactly once, here.
         self.vm.deinit();
@@ -116,63 +176,59 @@ pub const State = struct {
 
     /// Wrap an existing *Vm without taking ownership.
     /// Used by c_api.zig to create a State from a lua_State*.
-    /// `stack` resolves to `vm.cur_c_stack` — the currently active handle's stack.
+    /// The handle resolves to `vm.cur_handle` — the currently active
+    /// handle (falling back to the main handle).
     pub fn fromVm(vm: *vm_mod.Vm) State {
-        return .{ .vm = vm, .stack = vm.cur_c_stack };
+        return .{ .vm = vm, .handle = vm.cur_handle orelse vm.main_handle.? };
     }
 
     /// Wrap an existing `*lua_State` handle without taking ownership.
     /// Used by c_api.zig to create a State from a `?*lua_State` parameter.
-    /// `stack` resolves to `&h.c_stack` — this specific handle's stack, which
-    /// stays valid even if `vm.cur_c_stack` is later reassigned.
+    /// All operations address THIS handle's thread window even if
+    /// `vm.cur_handle` is later reassigned (e.g. during coroutine resume).
     pub fn fromHandle(h: *vm_mod.lua_State) State {
-        return .{ .vm = h.vm, .stack = &h.c_stack };
+        return .{ .vm = h.vm, .handle = h };
     }
 
     pub fn gettop(self: *const State) usize {
-        return self.stack.items.len;
+        return self.count();
     }
 
     pub fn settop(self: *State, idx: i32) ApiError!void {
-        const top = self.stack.items.len;
-        var new_top: usize = 0;
+        const c = self.count();
+        var new_count: usize = 0;
         if (idx >= 0) {
-            new_top = @intCast(idx);
+            new_count = @intCast(idx);
         } else {
-            const top_i: i64 = @intCast(top);
+            const c_i: i64 = @intCast(c);
             const idx_i: i64 = @intCast(idx);
-            const nt = top_i + idx_i + 1;
+            const nt = c_i + idx_i + 1;
             if (nt < 0) return error.InvalidIndex;
-            new_top = @intCast(nt);
+            new_count = @intCast(nt);
         }
-        if (new_top < top) {
-            self.stack.items.len = new_top;
-            return;
-        }
-        const add = new_top - top;
-        try self.stack.appendNTimes(self.vm.alloc, .Nil, add);
+        try self.setCount(new_count);
     }
 
     pub fn pop(self: *State, n: usize) ApiError!void {
-        if (n > self.stack.items.len) return error.InvalidIndex;
-        self.stack.items.len -= n;
+        try self.popN(n);
     }
 
     pub fn absindex(self: *State, idx: i32) ApiError!i32 {
         if (idx == 0) return error.InvalidIndex;
+        const c = self.count();
         if (idx > 0) {
-            if (normalizeIndex(idx, self.stack.items.len) == null) return error.InvalidIndex;
+            if (normalizeIndex(idx, c) == null) return error.InvalidIndex;
             return idx;
         }
-        if (normalizeIndex(idx, self.stack.items.len) == null) return error.InvalidIndex;
-        return @intCast(@as(i64, @intCast(self.stack.items.len)) + @as(i64, idx) + 1);
+        if (normalizeIndex(idx, c) == null) return error.InvalidIndex;
+        return @intCast(@as(i64, @intCast(c)) + @as(i64, idx) + 1);
     }
 
     /// PUC `lua_checkstack` (lapi.c:lua_checkstack): ensure at least `n`
     /// extra stack slots are available. Returns void on success; the C shim
     /// translates the error into a 0 return value.
     pub fn checkstack(self: *State, n: usize) ApiError!void {
-        try self.stack.ensureUnusedCapacity(self.vm.alloc, n);
+        self.vm.cWindowEnsure(self.curThread(), n) catch |e| return mapVmError(e);
     }
 
     pub fn insert(self: *State, idx: i32) ApiError!void {
@@ -184,23 +240,29 @@ pub const State = struct {
         try self.pop(1);
     }
 
+    /// PUC 5.5 removed `lua_replace` (replaced by `lua_copy` + `lua_pop`);
+    /// this Zig-level convenience keeps the old shape: copy the top value
+    /// to `idx`, then pop the top (close-then-lower, like `lua_pop`).
     pub fn replace(self: *State, idx: i32) ApiError!void {
-        if (self.stack.items.len == 0) return error.InvalidState;
-        const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
-        const top = self.stack.items.len - 1;
-        self.stack.items[abs] = self.stack.items[top];
-        self.stack.items.len = top;
+        const c = self.count();
+        if (c == 0) return error.InvalidState;
+        const s = self.slot(idx) orelse return error.InvalidIndex;
+        const th = self.curThread();
+        th.stack[s] = th.stack[th.top - 1];
+        try self.popN(1);
     }
 
     pub fn copy(self: *State, from_idx: i32, to_idx: i32) ApiError!void {
-        const from = normalizeIndex(from_idx, self.stack.items.len) orelse return error.InvalidIndex;
-        const to = normalizeIndex(to_idx, self.stack.items.len) orelse return error.InvalidIndex;
-        self.stack.items[to] = self.stack.items[from];
+        const from = self.slot(from_idx) orelse return error.InvalidIndex;
+        const to = self.slot(to_idx) orelse return error.InvalidIndex;
+        const th = self.curThread();
+        th.stack[to] = th.stack[from];
     }
 
     pub fn rotate(self: *State, idx: i32, n: i32) ApiError!void {
-        const start = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
-        const slice = self.stack.items[start..];
+        const s = self.slot(idx) orelse return error.InvalidIndex;
+        const th = self.curThread();
+        const slice = th.stack[s..th.top];
         if (slice.len <= 1) return;
 
         var nmod = @mod(@as(i64, n), @as(i64, @intCast(slice.len)));
@@ -213,48 +275,66 @@ pub const State = struct {
     }
 
     pub fn concat(self: *State, n: usize) ApiError!void {
-        if (n > self.stack.items.len) return error.InvalidIndex;
+        const c = self.count();
+        if (n > c) return error.InvalidIndex;
         if (n == 0) {
             try self.pushstring("");
             return;
         }
         if (n == 1) return;
 
-        const start = self.stack.items.len - n;
-        var acc = self.stack.items[start];
+        const th = self.curThread();
+        const start = th.top - n;
+        // Indexed reads: apiConcat dispatches metamethods (nested execution
+        // may grow th.stack); re-deriving th.stack[i] each iteration stays
+        // valid across the realloc, and the source values stay rooted on
+        // the stack below the metamethod frame for the whole loop.
+        // M1: the accumulated result lives in th.stack[start] (PUC
+        // luaV_concat shape — intermediates occupy the operand slot), so
+        // each fresh result string is STACK-ROOTED across the NEXT
+        // iteration's fallible apiConcat (a Zig local is invisible to the
+        // emergency GC; the old local-only acc could be swept mid-loop).
+        var acc = th.stack[start];
         var i = start + 1;
-        while (i < self.stack.items.len) : (i += 1) {
-            acc = self.vm.apiConcat(acc, self.stack.items[i]) catch |e| return mapVmError(e);
+        while (i < th.top) : (i += 1) {
+            acc = self.vm.apiConcat(acc, th.stack[i]) catch |e| return mapVmError(e);
+            th.stack[start] = acc;
         }
-        self.stack.items.len = start;
-        try self.stack.append(self.vm.alloc, acc);
+        // PUC luaV_concat (lvm.c): plain truncation — no TBC close in the
+        // concat loop.
+        th.top = start;
+        // The push lands in the slot the operands vacated (capacity is
+        // guaranteed: start+1 <= the pre-truncation top <= stack.len).
+        try self.push(acc);
     }
 
     /// PUC `lua_arith` (lapi.c:lua_arith): perform an arithmetic operation
-    /// on the top 1–2 stack values. For binary ops (ADD..SHR): operands at
-    /// -2 and -1, pop both, push result. For unary ops (UNM, BNOT): operand
-    /// at -1, pop, push result. Handles Int/Num directly; falls back to
-    /// metamethods for tables/userdata.
+    /// on the top 1–2 stack values. Unary ops (UNM, BNOT) duplicate the top
+    /// as both operands (PUC: `setobjs2s(L, top, top-1); api_incr_top`) and
+    /// leave the result in place; binary ops write the result at top-2 and
+    /// lower top by one (PUC: plain `L->top.p--`). Handles Int/Num directly;
+    /// falls back to metamethods for tables/userdata.
     pub fn arith(self: *State, op: ArithOp) ApiError!void {
-        const top = self.stack.items.len;
+        const th = self.curThread();
         const is_unary = (op == .unm or op == .bnot);
         const need: usize = if (is_unary) 1 else 2;
-        if (top < need) return error.InvalidState;
+        if (self.count() < need) return error.InvalidState;
 
         const result: vm_mod.Value = if (is_unary) blk: {
-            // PUC lua_arith: for unary ops, duplicate the top value as both
-            // operands. The result is computed from the single operand.
-            const v = self.stack.items[top - 1];
+            const v = th.stack[th.top - 1];
             break :blk self.vm.apiArith(@intFromEnum(op), v, v) catch |e| return mapVmError(e);
         } else blk: {
-            const b = self.stack.items[top - 1];
-            const a = self.stack.items[top - 2];
+            const b = th.stack[th.top - 1];
+            const a = th.stack[th.top - 2];
             break :blk self.vm.apiArith(@intFromEnum(op), a, b) catch |e| return mapVmError(e);
         };
 
-        // Pop operands: 1 for unary, 2 for binary.
-        self.stack.items.len -= if (is_unary) 1 else 2;
-        try self.stack.append(self.vm.alloc, result);
+        if (is_unary) {
+            th.stack[th.top - 1] = result;
+        } else {
+            th.top -= 1;
+            th.stack[th.top - 1] = result;
+        }
     }
 
     /// PUC `lua_rawequal` (lapi.c:lua_rawequal): raw equality without
@@ -262,9 +342,9 @@ pub const State = struct {
     /// same type and equal value (pointer identity for tables/closures,
     /// byte comparison for strings, numeric cross-comparison for Int/Num).
     pub fn rawequal(self: *State, idx1: i32, idx2: i32) bool {
-        const abs1 = normalizeIndex(idx1, self.stack.items.len) orelse return false;
-        const abs2 = normalizeIndex(idx2, self.stack.items.len) orelse return false;
-        return vm_mod.Vm.apiRawEqual(self.stack.items[abs1], self.stack.items[abs2]);
+        const v1 = self.valueAt(idx1) orelse return false;
+        const v2 = self.valueAt(idx2) orelse return false;
+        return vm_mod.Vm.apiRawEqual(v1, v2);
     }
 
     /// PUC `lua_compare` (lapi.c:lua_compare): comparison with metamethods.
@@ -272,10 +352,8 @@ pub const State = struct {
     /// tries __eq/__lt/__le metamethods. Returns false if either index is
     /// invalid or the comparison is not possible.
     pub fn compare(self: *State, idx1: i32, idx2: i32, op: CompareOp) ApiError!bool {
-        const abs1 = normalizeIndex(idx1, self.stack.items.len) orelse return false;
-        const abs2 = normalizeIndex(idx2, self.stack.items.len) orelse return false;
-        const a = self.stack.items[abs1];
-        const b = self.stack.items[abs2];
+        const a = self.valueAt(idx1) orelse return false;
+        const b = self.valueAt(idx2) orelse return false;
         return self.vm.apiCompare(@intFromEnum(op), a, b) catch |e| return mapVmError(e);
     }
 
@@ -283,10 +361,9 @@ pub const State = struct {
     /// For strings: byte length. For tables: border length (or __len
     /// metamethod). For other types: tries __len metamethod, errors if none.
     pub fn len(self: *State, idx: i32) ApiError!void {
-        const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
-        const v = self.stack.items[abs];
+        const v = self.valueAt(idx) orelse return error.InvalidIndex;
         const result = self.vm.apiLen(v) catch |e| return mapVmError(e);
-        try self.stack.append(self.vm.alloc, result);
+        try self.push(result);
     }
 
     /// PUC `lua_gc` (lapi.c:lua_gc): garbage collector control. Maps
@@ -301,15 +378,11 @@ pub const State = struct {
     /// codes when dead-with-error.
     ///
     /// luazig stores the PUC status code in `Thread.api_status` (mirroring
-    /// PUC's `L->status`), updated at every lifecycle transition. This
-    /// Zig API resolves the thread from `vm.c_api_thread` (the Zig API's
-    /// thread); the C API (`lua_status` in c_api.zig) resolves from the
-    /// handle's `thread` field for per-handle correctness.
+    /// PUC's `L->status`), updated at every lifecycle transition. Resolved
+    /// per-handle from this State's thread (PUC: the lua_State IS the
+    /// thread).
     pub fn status(self: *State) c_int {
-        if (self.vm.c_api_thread) |th| {
-            return th.api_status;
-        }
-        return 0; // LUA_OK — main thread
+        return self.curThread().api_status;
     }
 
     /// PUC `lua_pushthread` (lapi.c:lua_pushthread): push the current thread
@@ -317,45 +390,44 @@ pub const State = struct {
     /// the main thread, 0 otherwise (PUC: `cast_int(L == mainthread(G(L)))`).
     ///
     /// P15.83k: threads are first-class Values for every state, including
-    /// the main one (`Vm.main_thread`). This Zig-level API has no handle
-    /// context, so it resolves the "current" thread like `status` above
-    /// (c_api_thread, else main_thread). The C API (`lua_pushthread` in
-    /// c_api.zig) uses the handle's own Thread directly.
+    /// the main one (`Vm.main_thread`). Resolved per-handle from this
+    /// State's thread.
     pub fn pushthread(self: *State) c_int {
-        const th = self.vm.c_api_thread orelse self.vm.main_thread orelse return 0;
+        const th = self.curThread();
         const is_main = self.vm.main_thread == th;
-        self.stack.append(self.vm.alloc, .{ .Thread = th }) catch return 0;
+        self.push(.{ .Thread = th }) catch return 0;
         return if (is_main) 1 else 0;
     }
 
     pub fn pushnil(self: *State) ApiError!void {
-        try self.stack.append(self.vm.alloc, .Nil);
+        try self.push(.Nil);
     }
 
     pub fn pushboolean(self: *State, v: bool) ApiError!void {
-        try self.stack.append(self.vm.alloc, .{ .Bool = v });
+        try self.push(.{ .Bool = v });
     }
 
     pub fn pushinteger(self: *State, v: i64) ApiError!void {
-        try self.stack.append(self.vm.alloc, .{ .Int = v });
+        try self.push(.{ .Int = v });
     }
 
     pub fn pushnumber(self: *State, v: f64) ApiError!void {
-        try self.stack.append(self.vm.alloc, .{ .Num = v });
+        try self.push(.{ .Num = v });
     }
 
     pub fn pushstring(self: *State, s: []const u8) ApiError!void {
-        try self.stack.append(self.vm.alloc, .{ .String = try self.vm.internStr(s) });
+        try self.reservePushSlot();
+        try self.push(.{ .String = try self.vm.internStr(s) });
     }
 
     pub fn pushvalue(self: *State, idx: i32) ApiError!void {
-        const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
-        try self.stack.append(self.vm.alloc, self.stack.items[abs]);
+        const v = self.valueAt(idx) orelse return error.InvalidIndex;
+        try self.push(v);
     }
 
     pub fn typeOf(self: *const State, idx: i32) ?Type {
-        const abs = self.normalizeIndexConst(idx, self.stack.items.len) orelse return null;
-        return valueType(self.stack.items[abs]);
+        const v = self.valueAt(idx) orelse return null;
+        return valueType(v);
     }
 
     pub fn isuserdata(self: *const State, idx: i32) bool {
@@ -365,8 +437,8 @@ pub const State = struct {
     }
 
     pub fn toboolean(self: *const State, idx: i32) bool {
-        const v = self.valueAtConst(idx) orelse return false;
-        return switch (v.*) {
+        const v = self.valueAt(idx) orelse return false;
+        return switch (v) {
             .Nil => false,
             .Bool => |b| b,
             else => true,
@@ -374,8 +446,8 @@ pub const State = struct {
     }
 
     pub fn tointeger(self: *const State, idx: i32) ?i64 {
-        const v = self.valueAtConst(idx) orelse return null;
-        return switch (v.*) {
+        const v = self.valueAt(idx) orelse return null;
+        return switch (v) {
             .Int => |i| i,
             .Num => |n| if (n == @round(n)) @as(i64, @intFromFloat(n)) else null,
             else => null,
@@ -383,8 +455,8 @@ pub const State = struct {
     }
 
     pub fn tonumber(self: *const State, idx: i32) ?f64 {
-        const v = self.valueAtConst(idx) orelse return null;
-        return switch (v.*) {
+        const v = self.valueAt(idx) orelse return null;
+        return switch (v) {
             .Int => |i| @floatFromInt(i),
             .Num => |n| n,
             else => null,
@@ -392,8 +464,8 @@ pub const State = struct {
     }
 
     pub fn tostring(self: *const State, idx: i32) ?[]const u8 {
-        const v = self.valueAtConst(idx) orelse return null;
-        return switch (v.*) {
+        const v = self.valueAt(idx) orelse return null;
+        return switch (v) {
             .String => |s| s.bytes(),
             else => null,
         };
@@ -407,8 +479,8 @@ pub const State = struct {
     /// convertible to a number. Currently checks Int/Num only; string-to-number
     /// conversion will be added when `lua_tonumberx` supports it.
     pub fn isnumber(self: *const State, idx: i32) bool {
-        const v = self.valueAtConst(idx) orelse return false;
-        return switch (v.*) {
+        const v = self.valueAt(idx) orelse return false;
+        return switch (v) {
             .Int, .Num => true,
             else => false,
         };
@@ -417,8 +489,8 @@ pub const State = struct {
     /// PUC `lua_isstring` (lapi.c): true if the value is a string or a number
     /// (both are "string-convertible" in PUC's cvt2str sense).
     pub fn isstring(self: *const State, idx: i32) bool {
-        const v = self.valueAtConst(idx) orelse return false;
-        return switch (v.*) {
+        const v = self.valueAt(idx) orelse return false;
+        return switch (v) {
             .String, .Int, .Num => true,
             else => false,
         };
@@ -427,16 +499,16 @@ pub const State = struct {
     /// PUC `lua_isinteger` (lapi.c): true if the value is specifically an
     /// integer (not a float).
     pub fn isinteger(self: *const State, idx: i32) bool {
-        const v = self.valueAtConst(idx) orelse return false;
-        return v.* == .Int;
+        const v = self.valueAt(idx) orelse return false;
+        return v == .Int;
     }
 
     /// PUC `lua_iscfunction` (lapi.c): true if the value is a C closure
     /// (a Closure with `c_func != null`). Lua closures (bytecode protos)
     /// return false.
     pub fn iscfunction(self: *const State, idx: i32) bool {
-        const v = self.valueAtConst(idx) orelse return false;
-        return switch (v.*) {
+        const v = self.valueAt(idx) orelse return false;
+        return switch (v) {
             .Closure => |c| c.c_func != null,
             else => false,
         };
@@ -460,16 +532,17 @@ pub const State = struct {
     /// luaS_new (an allocation) — an OOM there is LUA_ERRMEM, not a silent
     /// null. The signature is now fallible: `ApiError!?[]const u8`.
     pub fn tolstring(self: *State, idx: i32) ApiError!?[]const u8 {
-        const abs = normalizeIndex(idx, self.stack.items.len) orelse return null;
-        switch (self.stack.items[abs]) {
-            .String => |s| return s.bytes(),
+        const s = self.slot(idx) orelse return null;
+        const th = self.curThread();
+        switch (th.stack[s]) {
+            .String => |st| return st.bytes(),
             .Int, .Num => {
                 // PUC lua_tolstring: convert number to string in place on stack.
                 // valueToInternedStr uses the same formatting as PUC's
                 // luaO_tostringbuff (%.14g equivalent + ".0" for integer floats).
-                const ls = self.vm.valueToInternedStr(self.stack.items[abs]) catch |e| return mapDispatchError(e);
-                self.stack.items[abs] = .{ .String = ls };
-                return self.stack.items[abs].String.bytes();
+                const ls = self.vm.valueToInternedStr(th.stack[s]) catch |e| return mapDispatchError(e);
+                th.stack[s] = .{ .String = ls };
+                return th.stack[s].String.bytes();
             },
             else => return null,
         }
@@ -479,8 +552,8 @@ pub const State = struct {
     /// String: byte length. Table: border length (luaH_getn). Userdata:
     /// payload size. Returns 0 for other types.
     pub fn rawlen(self: *State, idx: i32) usize {
-        const abs = normalizeIndex(idx, self.stack.items.len) orelse return 0;
-        return switch (self.stack.items[abs]) {
+        const v = self.valueAt(idx) orelse return 0;
+        return switch (v) {
             .String => |s| s.bytes().len,
             .Table => |t| @intCast(self.vm.tableBorderLen(t)),
             .Userdata => |ud| ud.payload.len,
@@ -491,8 +564,8 @@ pub const State = struct {
     /// PUC `lua_tocfunction` (lapi.c:lua_tocfunction): return the C function
     /// pointer from a Closure, or null if the value is not a C closure.
     pub fn tocfunction(self: *const State, idx: i32) ?*const fn (?*vm_mod.lua_State) callconv(.c) c_int {
-        const v = self.valueAtConst(idx) orelse return null;
-        return switch (v.*) {
+        const v = self.valueAt(idx) orelse return null;
+        return switch (v) {
             .Closure => |c| c.c_func,
             else => null,
         };
@@ -506,80 +579,153 @@ pub const State = struct {
 
     pub fn getglobal(self: *State, name: []const u8) ApiError!Type {
         const v = self.vm.apiGetGlobal(name);
-        try self.stack.append(self.vm.alloc, v);
+        try self.push(v);
         return valueType(v);
     }
 
     pub fn setglobal(self: *State, name: []const u8) ApiError!void {
-        if (self.stack.items.len == 0) return error.InvalidState;
-        const v = self.stack.items[self.stack.items.len - 1];
-        self.stack.items.len -= 1;
+        const th = self.curThread();
+        if (self.count() == 0) return error.InvalidState;
+        const v = th.stack[th.top - 1];
+        // PUC auxsetstr: the set runs first (the value stays rooted on the
+        // stack across the fallible table write), the pop is plain.
         self.vm.apiSetGlobal(name, v) catch |e| return mapVmError(e);
+        th.top -= 1;
     }
 
     pub fn newtable(self: *State) ApiError!void {
+        try self.reservePushSlot();
         const t = self.vm.apiNewTable() catch |e| return mapVmError(e);
-        try self.stack.append(self.vm.alloc, .{ .Table = t });
+        try self.push(.{ .Table = t });
     }
 
     pub fn newthread(self: *State) ApiError!void {
+        try self.reservePushSlot();
         const th = self.vm.apiNewThread(.Nil) catch |e| return mapVmError(e);
-        try self.thread_stacks.put(self.vm.alloc, th, .empty);
-        try self.stack.append(self.vm.alloc, .{ .Thread = th });
+        try self.push(.{ .Thread = th });
     }
 
+    /// PUC `lua_xmove` (lapi.c:lua_xmove): move `n` values between the
+    /// windows of two threads. A null thread index addresses this State's
+    /// own thread. Same-thread moves are a no-op (PUC). The destination
+    /// push happens while the source values are still live (the
+    /// alias-safe cWindowPushSlice captures the source offset before any
+    /// growth); the source truncation is plain (PUC: `from->top.p -= n`).
     pub fn xmove(self: *State, from_thread_idx: ?i32, to_thread_idx: ?i32, n: usize) ApiError!void {
-        var from_stack = try self.apiStackFor(from_thread_idx);
-        var to_stack = try self.apiStackFor(to_thread_idx);
-        if (n > from_stack.items.len) return error.InvalidIndex;
+        const from_th = if (from_thread_idx) |idx| (self.threadAt(idx) orelse return error.Type) else self.curThread();
+        const to_th = if (to_thread_idx) |idx| (self.threadAt(idx) orelse return error.Type) else self.curThread();
+        if (from_th == to_th) return;
+        if (n > vm_mod.Vm.cWindowCount(from_th)) return error.InvalidIndex;
         if (n == 0) return;
 
-        const start = from_stack.items.len - n;
-        const moved = try self.vm.alloc.alloc(vm_mod.Value, n);
-        defer self.vm.alloc.free(moved);
-        for (0..n) |i| moved[i] = from_stack.items[start + i];
-        from_stack.items.len = start;
-        try to_stack.appendSlice(self.vm.alloc, moved);
+        const start = from_th.top - n;
+        self.vm.cWindowPushSlice(to_th, from_th.stack[start..from_th.top]) catch |e| return mapVmError(e);
+        from_th.top = start;
+        // xmove safepoint — both windows must still
+        // hold their live anchors (the source truncation cannot cross
+        // the window base; the destination push stays within its stack).
+        if (vm_mod.Vm.WINDOW_DEBUG_CHECKS) {
+            self.vm.debugCheckWindowAt(from_th, .xmove);
+            self.vm.debugCheckWindowAt(to_th, .xmove);
+        }
     }
 
+    /// PUC `lua_resume` (ldo.c:lua_resume) over the coroutine's anchored
+    /// window. First resume: the host-pushed function takes slot F
+    /// (`firstArg - 1`); the function and arguments are consumed here and
+    /// the trampoline stages the body AT F (PUC `ccall(firstArg - 1,
+    /// MULTRET, 0)` — the body CallInfo's func is the host function's
+    /// slot; base_ci itself is never repositioned). F is remembered on the
+    /// thread so every later resume's results land at [F, F+nres) via
+    /// cWindowMoveResults (PUC poscall's moveresults dst = func slot).
+    ///
+    /// Error windows (verified against PUC 5.5.0 — class 6): a rejection of
+    /// a non-resumable thread pops the arguments and appends the message
+    /// once (PUC resume_error); a real error leaves [residue?, err, err] —
+    /// the error object duplicated on top of the raiser's residue
+    /// (PUC luaD_seterrorobj at the resume boundary). Yield: the yielded
+    /// values are already parked at the suspended frame's window top.
     pub fn @"resume"(self: *State, thread_idx: i32, nargs: usize) Status {
         const th = self.threadAt(thread_idx) orelse return .runtime_error;
-        const th_stack = self.threadStack(th) catch return .memory_error;
-        const callee_needed = !isCallableValue(self.vm, th.callee);
-        const need = nargs + @as(usize, @intFromBool(callee_needed));
-        if (th_stack.items.len < need) return .runtime_error;
-
-        const base = th_stack.items.len - need;
-        if (callee_needed) {
-            const callee = th_stack.items[base];
-            if (!isCallableValue(self.vm, callee)) return .runtime_error;
-            th.callee = callee;
+        const vm = self.vm;
+        const first_resume = !th.started;
+        var func_slot: usize = undefined;
+        var args: []const vm_mod.Value = undefined;
+        if (first_resume) {
+            const callee_needed = !isCallableValue(vm, th.callee);
+            const need = nargs + @as(usize, @intFromBool(callee_needed));
+            const cnt = vm_mod.Vm.cWindowCount(th);
+            if (cnt < need) return .runtime_error;
+            func_slot = vm_mod.Vm.cWindowBase(th) + cnt - need;
+            if (callee_needed) {
+                const callee = th.stack[func_slot];
+                if (!isCallableValue(vm, callee)) return .runtime_error;
+                th.callee = callee;
+            }
+            th.resume_func_slot = func_slot;
+            args = th.stack[func_slot + need - nargs .. func_slot + need];
+            // Consume func+args: the trampoline stages the body at the
+            // lowered top = F (PUC precall uses them in place).
+            th.top = func_slot;
+        } else {
+            const cnt = vm_mod.Vm.cWindowCount(th);
+            if (cnt < nargs) return .runtime_error;
+            func_slot = th.resume_func_slot orelse (vm_mod.Vm.cWindowBase(th) + cnt - nargs);
+            args = th.stack[th.top - nargs .. th.top];
         }
-        const arg_start = if (callee_needed) base + 1 else base;
-        const args = th_stack.items[arg_start .. arg_start + nargs];
+        // PUC resume: only a suspended (or never-started) thread resumes;
+        // anything else is resume_error (pop the arguments, append the
+        // message once).
+        const reject_before_call = !first_resume and th.status != .suspended;
 
         // P16.50-review-7 BLOCKER 4: apiResumeThread returns the resume's
         // EXACT tuple ([ok] ++ values) as an owned slice — no 64-slot
         // window (the old window truncated every host resume to 63
         // results; PUC lua_resume returns ALL results on the stack).
-        const res = self.vm.apiResumeThread(th, args) catch return .runtime_error;
-        defer self.vm.alloc.free(res);
+        const res = vm.apiResumeThread(th, args) catch {
+            // apiResumeThread itself failed (owned-slice OOM): consume the
+            // staging. PUC would install the fixed MEMERRMSG here — an
+            // allocation we cannot trust on this path; the window stays
+            // empty at F.
+            th.top = func_slot;
+            return .memory_error;
+        };
+        defer vm.alloc.free(res);
         const ok = res.len > 0 and res[0] == .Bool and res[0].Bool;
 
-        th_stack.items.len = base;
         if (!ok) {
-            if (res.len > 1) th_stack.append(self.vm.alloc, res[1]) catch return .memory_error;
+            if (res.len < 2) return .runtime_error;
+            if (reject_before_call) {
+                // PUC resume_error: pop the arguments, append the message
+                // once (plain pop — the engine rejected before running).
+                th.top -= @min(nargs, th.top - vm_mod.Vm.cWindowBase(th));
+                vm.cWindowPush(th, res[1]) catch return .memory_error;
+                return .runtime_error;
+            }
+            // Real error: [residue?, err, err] anchored at F. Raw top — the
+            // thread is dead; PUC never closes TBC at the error boundary.
+            th.top = func_slot;
+            if (th.api_err_residue) |r| vm.cWindowPush(th, r) catch return .memory_error;
+            vm.cWindowPush(th, res[1]) catch return .memory_error;
+            vm.cWindowPush(th, res[1]) catch return .memory_error;
             return .runtime_error;
         }
 
-        th_stack.appendSlice(self.vm.alloc, res[1..]) catch return .memory_error;
-        return if (th.status == .suspended) .yielded else .ok;
+        if (th.status == .suspended) {
+            // Yield: the yielded values are already parked at the suspended
+            // frame's window top — the window IS the result.
+            return .yielded;
+        }
+        // Completion: PUC poscall to the body frame's func slot F.
+        vm.cWindowMoveResults(th, func_slot, res[1..], -1) catch return .memory_error;
+        return .ok;
     }
 
     pub fn yield(self: *State, nresults: usize) ApiError!void {
-        if (nresults > self.stack.items.len) return error.InvalidIndex;
-        const base = self.stack.items.len - nresults;
-        self.vm.apiYield(self.stack.items[base..]) catch |err| switch (err) {
+        const th = self.curThread();
+        if (nresults > self.count()) return error.InvalidIndex;
+        const base = th.top - nresults;
+        self.vm.apiYield(th.stack[base..th.top]) catch |err| switch (err) {
             error.RuntimeError, error.Yield => return error.Runtime,
             error.OutOfMemory => return error.OutOfMemory,
         };
@@ -591,24 +737,26 @@ pub const State = struct {
     }
 
     pub fn gettable(self: *State, idx: i32) ApiError!Type {
-        if (self.stack.items.len == 0) return error.InvalidState;
-        const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
-        const key = self.stack.items[self.stack.items.len - 1];
-        const object = self.stack.items[abs];
+        const th = self.curThread();
+        if (self.count() == 0) return error.InvalidState;
+        const s = self.slot(idx) orelse return error.InvalidIndex;
+        const key = th.stack[th.top - 1];
+        const object = th.stack[s];
         const out = self.vm.apiGetTable(object, key) catch |e| return mapVmError(e);
-        self.stack.items.len -= 1;
-        try self.stack.append(self.vm.alloc, out);
+        th.top -= 1; // PUC lua_gettable: plain pop of the key
+        try self.push(out);
         return valueType(out);
     }
 
     pub fn settable(self: *State, idx: i32) ApiError!void {
-        if (self.stack.items.len < 2) return error.InvalidState;
-        const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
-        const value = self.stack.items[self.stack.items.len - 1];
-        const key = self.stack.items[self.stack.items.len - 2];
-        const object = self.stack.items[abs];
+        const th = self.curThread();
+        if (self.count() < 2) return error.InvalidState;
+        const s = self.slot(idx) orelse return error.InvalidIndex;
+        const value = th.stack[th.top - 1];
+        const key = th.stack[th.top - 2];
+        const object = th.stack[s];
         self.vm.apiSetTable(object, key, value) catch |e| return mapVmError(e);
-        self.stack.items.len -= 2;
+        th.top -= 2; // PUC lua_settable: plain pop of value and key
     }
 
     pub fn getfield(self: *State, idx: i32, key: []const u8) ApiError!Type {
@@ -617,94 +765,97 @@ pub const State = struct {
             const reg = self.vm.apiEnsureRegistry() catch |e| return mapVmError(e);
             break :blk .{ .Table = reg };
         } else blk: {
-            const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
-            break :blk self.stack.items[abs];
+            break :blk self.valueAt(idx) orelse return error.InvalidIndex;
         };
         const out = self.vm.apiGetTable(object, .{ .String = try self.vm.internStr(key) }) catch |e| return mapVmError(e);
-        try self.stack.append(self.vm.alloc, out);
+        try self.push(out);
         return valueType(out);
     }
 
     pub fn setfield(self: *State, idx: i32, key: []const u8) ApiError!void {
-        if (self.stack.items.len == 0) return error.InvalidState;
+        const th = self.curThread();
+        if (self.count() == 0) return error.InvalidState;
         const registry_idx: c_int = -1001000;
         const object: vm_mod.Value = if (idx == registry_idx) blk: {
             const reg = self.vm.apiEnsureRegistry() catch |e| return mapVmError(e);
             break :blk .{ .Table = reg };
         } else blk: {
-            const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
-            break :blk self.stack.items[abs];
+            const s = self.slot(idx) orelse return error.InvalidIndex;
+            break :blk th.stack[s];
         };
-        const value = self.stack.items[self.stack.items.len - 1];
+        const value = th.stack[th.top - 1];
         self.vm.apiSetTable(object, .{ .String = try self.vm.internStr(key) }, value) catch |e| return mapVmError(e);
-        self.stack.items.len -= 1;
+        th.top -= 1; // PUC auxsetstr: plain pop of the value
     }
 
     pub fn geti(self: *State, idx: i32, n: i64) ApiError!Type {
-        const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
-        const object = self.stack.items[abs];
+        const object = self.valueAt(idx) orelse return error.InvalidIndex;
         const out = self.vm.apiGetTable(object, .{ .Int = n }) catch |e| return mapVmError(e);
-        try self.stack.append(self.vm.alloc, out);
+        try self.push(out);
         return valueType(out);
     }
 
     pub fn seti(self: *State, idx: i32, n: i64) ApiError!void {
-        if (self.stack.items.len == 0) return error.InvalidState;
-        const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
-        const object = self.stack.items[abs];
-        const value = self.stack.items[self.stack.items.len - 1];
+        const th = self.curThread();
+        if (self.count() == 0) return error.InvalidState;
+        const s = self.slot(idx) orelse return error.InvalidIndex;
+        const object = th.stack[s];
+        const value = th.stack[th.top - 1];
         self.vm.apiSetTable(object, .{ .Int = n }, value) catch |e| return mapVmError(e);
-        self.stack.items.len -= 1;
+        th.top -= 1; // PUC lua_seti: plain pop of the value
     }
 
     pub fn rawget(self: *State, idx: i32) ApiError!Type {
-        if (self.stack.items.len == 0) return error.InvalidState;
-        const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
-        const tbl = switch (self.stack.items[abs]) {
+        const th = self.curThread();
+        if (self.count() == 0) return error.InvalidState;
+        const s = self.slot(idx) orelse return error.InvalidIndex;
+        const tbl = switch (th.stack[s]) {
             .Table => |t| t,
             else => return error.Type,
         };
-        const key = self.stack.items[self.stack.items.len - 1];
+        const key = th.stack[th.top - 1];
         const out = self.vm.apiRawGet(tbl, key);
-        self.stack.items.len -= 1;
-        try self.stack.append(self.vm.alloc, out);
+        th.top -= 1; // PUC lua_rawget: plain pop of the key
+        try self.push(out);
         return valueType(out);
     }
 
     pub fn rawset(self: *State, idx: i32) ApiError!void {
-        if (self.stack.items.len < 2) return error.InvalidState;
-        const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
-        const tbl = switch (self.stack.items[abs]) {
+        const th = self.curThread();
+        if (self.count() < 2) return error.InvalidState;
+        const s = self.slot(idx) orelse return error.InvalidIndex;
+        const tbl = switch (th.stack[s]) {
             .Table => |t| t,
             else => return error.Type,
         };
-        const value = self.stack.items[self.stack.items.len - 1];
-        const key = self.stack.items[self.stack.items.len - 2];
+        const value = th.stack[th.top - 1];
+        const key = th.stack[th.top - 2];
         self.vm.apiRawSet(tbl, key, value) catch |e| return mapVmError(e);
-        self.stack.items.len -= 2;
+        th.top -= 2; // PUC lua_rawset: plain pop of index and value
     }
 
     pub fn rawgeti(self: *State, idx: i32, n: i64) ApiError!Type {
-        const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
-        const tbl = switch (self.stack.items[abs]) {
+        const object = self.valueAt(idx) orelse return error.InvalidIndex;
+        const tbl = switch (object) {
             .Table => |t| t,
             else => return error.Type,
         };
         const out = self.vm.apiRawGet(tbl, .{ .Int = n });
-        try self.stack.append(self.vm.alloc, out);
+        try self.push(out);
         return valueType(out);
     }
 
     pub fn rawseti(self: *State, idx: i32, n: i64) ApiError!void {
-        if (self.stack.items.len == 0) return error.InvalidState;
-        const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
-        const tbl = switch (self.stack.items[abs]) {
+        const th = self.curThread();
+        if (self.count() == 0) return error.InvalidState;
+        const s = self.slot(idx) orelse return error.InvalidIndex;
+        const tbl = switch (th.stack[s]) {
             .Table => |t| t,
             else => return error.Type,
         };
-        const value = self.stack.items[self.stack.items.len - 1];
+        const value = th.stack[th.top - 1];
         self.vm.apiRawSet(tbl, .{ .Int = n }, value) catch |e| return mapVmError(e);
-        self.stack.items.len -= 1;
+        th.top -= 1; // PUC lua_rawseti: plain pop of the value
     }
 
     /// PUC `lua_rawgetp` (lapi.c): raw table access with a light userdata
@@ -714,14 +865,14 @@ pub const State = struct {
     /// `error.InvalidIndex` — a justified deviation since no real C code uses
     /// NULL pointer keys.
     pub fn rawgetp(self: *State, idx: i32, p: ?*anyopaque) ApiError!Type {
-        const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
-        const tbl = switch (self.stack.items[abs]) {
+        const object = self.valueAt(idx) orelse return error.InvalidIndex;
+        const tbl = switch (object) {
             .Table => |t| t,
             else => return error.Type,
         };
         const key: *anyopaque = p orelse return error.InvalidIndex;
         const out = self.vm.apiRawGet(tbl, .{ .LightUserdata = key });
-        try self.stack.append(self.vm.alloc, out);
+        try self.push(out);
         return valueType(out);
     }
 
@@ -729,37 +880,48 @@ pub const State = struct {
     /// pointer key. Performs `t[p] = v` (no metamethods). Pops the value.
     /// See `rawgetp` for the null-`p` deviation note.
     pub fn rawsetp(self: *State, idx: i32, p: ?*anyopaque) ApiError!void {
-        if (self.stack.items.len == 0) return error.InvalidState;
-        const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
-        const tbl = switch (self.stack.items[abs]) {
+        const th = self.curThread();
+        if (self.count() == 0) return error.InvalidState;
+        const s = self.slot(idx) orelse return error.InvalidIndex;
+        const tbl = switch (th.stack[s]) {
             .Table => |t| t,
             else => return error.Type,
         };
         const key: *anyopaque = p orelse return error.InvalidIndex;
-        const value = self.stack.items[self.stack.items.len - 1];
+        const value = th.stack[th.top - 1];
         self.vm.apiRawSet(tbl, .{ .LightUserdata = key }, value) catch |e| return mapVmError(e);
-        self.stack.items.len -= 1;
+        th.top -= 1; // PUC lua_rawsetp: plain pop of the value
     }
 
     pub fn next(self: *State, idx: i32) ApiError!bool {
-        if (self.stack.items.len == 0) return error.InvalidState;
-        const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
-        const tbl = switch (self.stack.items[abs]) {
+        const th = self.curThread();
+        if (self.count() == 0) return error.InvalidState;
+        const s = self.slot(idx) orelse return error.InvalidIndex;
+        const tbl = switch (th.stack[s]) {
             .Table => |t| t,
             else => return error.Type,
         };
-        const key = self.stack.items[self.stack.items.len - 1];
+        const key = th.stack[th.top - 1];
         var out: [2]vm_mod.Value = .{ .Nil, .Nil };
         const produced = self.vm.apiNext(tbl, key, out[0..]) catch |e| return mapVmError(e);
-        self.stack.items.len -= 1;
+        th.top -= 1; // PUC lua_next: plain pop of the key
         if (produced == 0) return false;
-        try self.stack.appendSlice(self.vm.alloc, out[0..2]);
+        try self.pushSlice(out[0..2]);
         return true;
     }
 
     pub fn loadbuffer(self: *State, chunk: []const u8, chunk_name: []const u8) Status {
+        // M1: reserve the closure's slot BEFORE the (long, fallible)
+        // compile — after compileChunk the push hits reserved capacity,
+        // so the constructed closure never crosses a fallible operation
+        // before its rooting store. Kind-preserving: OOM → LUA_ERRMEM,
+        // stack overflow → LUA_ERRRUN.
+        self.reservePushSlot() catch |e| switch (e) {
+            error.OutOfMemory => return .memory_error,
+            else => return .runtime_error,
+        };
         const compiled = self.compileChunk(chunk, chunk_name) catch |e| return mapCompileError(e);
-        self.stack.append(self.vm.alloc, compiled) catch return .memory_error;
+        self.push(compiled) catch return .memory_error;
         return .ok;
     }
 
@@ -771,10 +933,15 @@ pub const State = struct {
     }
 
     pub fn pcall(self: *State, nargs: usize, nresults: i32) Status {
-        if (self.stack.items.len < nargs + 1) return .runtime_error;
-        const fn_idx = self.stack.items.len - nargs - 1;
-        const callee = self.stack.items[fn_idx];
-        const args = self.stack.items[fn_idx + 1 ..];
+        const th = self.curThread();
+        if (self.count() < nargs + 1) return .runtime_error;
+        const func_slot = th.top - nargs - 1;
+        const callee = th.stack[func_slot];
+        // The argument slice would alias th.stack, which the nested
+        // execution may grow (realloc) — dupe it across the apiCall
+        // boundary (PUC precall reads the args in place on the one stack).
+        const args = self.vm.alloc.dupe(vm_mod.Value, th.stack[func_slot + 1 .. th.top]) catch return .memory_error;
+        defer self.vm.alloc.free(args);
         // P16.31 Cut 1 (PUC lapi.c:1095-1097 + ldo.c f_call): every caller of
         // this method is a CONVENTIONAL pcall — lua_pcallk's `k == NULL ||
         // !yieldable(L)` branch (c_api lua_pcallk, the lua_pcall macro,
@@ -798,8 +965,8 @@ pub const State = struct {
         // luaD_pcall's old_top (the callee's func level, lapi.c f_call's
         // savestack). The catch below closes every chain entry above it
         // (luaD_closeprotected) before building the error object.
-        const th = self.vm.activeBytecodeThread();
-        const tbc_base = th.c_tbc_chain.items.len;
+        const act = self.vm.activeBytecodeThread();
+        const tbc_base = act.c_tbc_chain.items.len;
         const ret = self.vm.apiCall(.nonyieldable, callee, args) catch |e| {
             // PUC luaD_pcall (ldo.c:1090-1095): on error, restore the
             // stack to the base, run luaD_closeprotected(old_top, status)
@@ -807,8 +974,10 @@ pub const State = struct {
             // in-flight error, non-yieldable, last-error-wins (a closer
             // error REPLACES the error object) — then set the error
             // object (luaD_seterrorobj) and propagate status.
-            self.vm.apiCloseConventionalPcallBoundary(th, tbc_base);
-            self.stack.items.len = fn_idx;
+            self.vm.apiCloseConventionalPcallBoundary(act, tbc_base);
+            // Raw top restore: the close above already ran (PUC restores
+            // old_top only after closeprotected).
+            th.top = func_slot;
             // PUC luaD_pcall propagates the RAW protected-run status:
             // LUA_ERRMEM stays LUA_ERRMEM (the old code flattened every
             // error to ERRRUN here, so a C-API OOM longjmp — e.g.
@@ -817,50 +986,49 @@ pub const State = struct {
             // FIXED MEMERRMSG literal (allocation-free) — matching PUC,
             // which replaces whatever the thrower carried.
             if (e == error.OutOfMemory) self.vm.setOutOfMemoryError();
-            // Push the error object onto the stack (PUC luaD_seterrorobj).
+            // Push the error object onto the window (PUC luaD_seterrorobj).
             // apiCloseConventionalPcallBoundary already replaced err_obj
             // with the final closer error when a closer errored.
             // P16.36 Cut 1b: the pcall'd call raised on the active
             // thread (same-thread protected call) — read its error state
             // directly.
-            const errval: vm_mod.Value = if (th.err_has_obj) th.err_obj else .Nil;
-            self.stack.append(self.vm.alloc, errval) catch return .memory_error;
+            const errval: vm_mod.Value = if (act.err_has_obj) act.err_obj else .Nil;
+            self.vm.cWindowPush(th, errval) catch return .memory_error;
             // PUC: status is LUA_ERRERR (5) if the message handler errored,
             // LUA_ERRMEM (4) for OOM, LUA_ERRRUN (2) otherwise.
             return switch (e) {
                 error.OutOfMemory => .memory_error,
-                else => if (th.err_is_errerr) .error_handler_error else .runtime_error,
+                else => if (act.err_is_errerr) .error_handler_error else .runtime_error,
             };
         };
         defer self.vm.alloc.free(ret);
 
-        self.stack.items.len = fn_idx;
-        const want: usize = if (nresults < 0)
-            ret.len
-        else
-            @min(ret.len, @as(usize, @intCast(nresults)));
-        self.stack.appendSlice(self.vm.alloc, ret[0..want]) catch return .memory_error;
+        // PUC poscall moveresults to the callee's func slot: honors the
+        // fixed-nresults promise with nil-fill (class 3), MULTRET copies
+        // all, 0 drops all.
+        self.vm.cWindowMoveResults(th, func_slot, ret, nresults) catch return .memory_error;
         return .ok;
     }
 
     pub fn getmetatable(self: *State, idx: i32) ApiError!bool {
-        const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
+        const v = self.valueAt(idx) orelse return error.InvalidIndex;
         // PUC lua_getmetatable (lapi.c:951-960): tables/userdata read
         // their own metatable; every other type reads the TYPE-LEVEL slot
         // G(L)->mt[ttype(o)] (P16.50-review-13 — the C-API get previously
         // returned nothing for type-level metatables while the Lua-level
         // getmetatable already did).
-        const mt: ?*vm_mod.Table = self.vm.valueMetatable(self.stack.items[abs]);
+        const mt: ?*vm_mod.Table = self.vm.valueMetatable(v);
         if (mt) |m| {
-            try self.stack.append(self.vm.alloc, .{ .Table = m });
+            try self.push(.{ .Table = m });
             return true;
         }
         return false;
     }
 
     pub fn setmetatable(self: *State, idx: i32) ApiError!void {
-        if (self.stack.items.len < 1) return error.InvalidState;
-        const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
+        const th = self.curThread();
+        if (self.count() < 1) return error.InvalidState;
+        const s = self.slot(idx) orelse return error.InvalidIndex;
         // P16.50-review-13: PUC lua_setmetatable (lapi.c:964-1000) — the
         // metatable stays ROOTED on the stack until the transaction
         // commits, api_check requires table-or-nil, and the default arm
@@ -869,13 +1037,13 @@ pub const State = struct {
         // the table-arm barrier OOM (`catch {}`), silently "succeeded" the
         // userdata arm on a reserve failure, registered finalizers after a
         // failed store, and used the (wrong) BACKWARD barrier for userdata.
-        const mt_val = self.stack.items[self.stack.items.len - 1];
+        const mt_val = th.stack[th.top - 1];
         const mt: ?*vm_mod.Table = switch (mt_val) {
             .Table => |t| t,
             .Nil => null,
             else => return error.Type, // PUC api_check: table or nil
         };
-        const target = self.stack.items[abs];
+        const target = th.stack[s];
         switch (target) {
             .Table, .Userdata => {
                 const owner = vm_mod.GcObject.fromValue(target).?;
@@ -891,8 +1059,9 @@ pub const State = struct {
             },
         }
         // Pop only AFTER the infallible commit — a prepare failure leaves
-        // the stack byte-exact (PUC pops at the end of lua_setmetatable).
-        self.stack.items.len -= 1;
+        // the window byte-exact (PUC pops at the end of lua_setmetatable,
+        // plainly: `L->top.p--`).
+        th.top -= 1;
     }
 
     pub fn getregistry(self: *State) ApiError!void {
@@ -900,32 +1069,33 @@ pub const State = struct {
         // (P16.50-review-5 B2 — the old `catch return error.Runtime`
         // surfaced ERRRUN for an allocation failure).
         const reg = self.vm.apiEnsureRegistry() catch |e| return mapVmError(e);
-        try self.stack.append(self.vm.alloc, .{ .Table = reg });
+        try self.push(.{ .Table = reg });
     }
 
     pub fn getupvalue(self: *State, func_idx: i32, n: usize) ApiError!?[]const u8 {
-        const fv = self.valueAtConst(func_idx) orelse return error.InvalidIndex;
+        const fv = self.valueAt(func_idx) orelse return error.InvalidIndex;
         const dbg = try self.requireDebugModule();
         const f = self.vm.apiGetTable(dbg, .{ .String = try self.vm.internStr("getupvalue") }) catch |e| return mapVmError(e);
-        var args = [_]vm_mod.Value{ fv.*, .{ .Int = @intCast(n) } };
+        var args = [_]vm_mod.Value{ fv, .{ .Int = @intCast(n) } };
         const ret = self.vm.apiCall(.nonyieldable, f, args[0..]) catch |e| return mapVmError(e);
         defer self.vm.alloc.free(ret);
         if (ret.len == 0 or ret[0] == .Nil) return null;
         if (ret[0] != .String) return error.Type;
-        if (ret.len > 1) try self.stack.append(self.vm.alloc, ret[1]);
+        if (ret.len > 1) try self.push(ret[1]);
         return ret[0].String.bytes();
     }
 
     pub fn setupvalue(self: *State, func_idx: i32, n: usize) ApiError!?[]const u8 {
-        if (self.stack.items.len == 0) return error.InvalidState;
-        const fv = self.valueAtConst(func_idx) orelse return error.InvalidIndex;
-        const set_val = self.stack.items[self.stack.items.len - 1];
+        const th = self.curThread();
+        if (self.count() == 0) return error.InvalidState;
+        const fv = self.valueAt(func_idx) orelse return error.InvalidIndex;
+        const set_val = th.stack[th.top - 1];
         const dbg = try self.requireDebugModule();
         const f = self.vm.apiGetTable(dbg, .{ .String = try self.vm.internStr("setupvalue") }) catch |e| return mapVmError(e);
-        var args = [_]vm_mod.Value{ fv.*, .{ .Int = @intCast(n) }, set_val };
+        var args = [_]vm_mod.Value{ fv, .{ .Int = @intCast(n) }, set_val };
         const ret = self.vm.apiCall(.nonyieldable, f, args[0..]) catch |e| return mapVmError(e);
         defer self.vm.alloc.free(ret);
-        self.stack.items.len -= 1;
+        th.top -= 1; // PUC lua_setupvalue: plain pop of the value
         if (ret.len == 0 or ret[0] == .Nil) return null;
         if (ret[0] != .String) return error.Type;
         return ret[0].String.bytes();
@@ -937,16 +1107,17 @@ pub const State = struct {
 
     /// Push an arbitrary-length string (bytes may contain embedded NULs).
     pub fn pushlstring(self: *State, s: []const u8) ApiError!void {
+        try self.reservePushSlot();
         const ls = try self.vm.internStr(s);
-        try self.stack.append(self.vm.alloc, .{ .String = ls });
+        try self.push(.{ .String = ls });
     }
 
     /// Push a light userdata (raw pointer). Pushes nil if p is null.
     pub fn pushlightuserdata(self: *State, p: ?*anyopaque) ApiError!void {
         if (p) |ptr| {
-            try self.stack.append(self.vm.alloc, .{ .LightUserdata = ptr });
+            try self.push(.{ .LightUserdata = ptr });
         } else {
-            try self.stack.append(self.vm.alloc, .Nil);
+            try self.push(.Nil);
         }
     }
 
@@ -972,24 +1143,27 @@ pub const State = struct {
     }
 
     pub fn pushcclosure(self: *State, fn_: ?*const fn (?*vm_mod.lua_State) callconv(.c) c_int, n: usize) ApiError!void {
-        // P16.50 transactional: the stack mutation (pop the consumed
-        // upvalues, push the closure) commits only AFTER every object
-        // exists — a failure never loses values.
-        try self.stack.ensureUnusedCapacity(self.vm.alloc, 1);
+        const th = self.curThread();
+        // M1: reserve the closure's slot BEFORE construction (the reserve
+        // may grow + move the stack, so the upvalue slice is captured
+        // after it). After makeCclosure the push hits reserved capacity —
+        // the constructed closure never crosses a fallible operation
+        // before its rooting store.
+        try self.reservePushSlot();
         if (n == 0) {
             const cl = try self.makeCclosure(fn_, &.{});
-            self.stack.appendAssumeCapacity(.{ .Closure = cl });
+            try self.push(.{ .Closure = cl });
             return;
         }
-        // Read the n upvalue values from the stack top (WITHOUT popping:
-        // the pop commits only after every object exists).
-        if (self.stack.items.len < n) return error.InvalidState;
-        const vals = self.stack.items[self.stack.items.len - n ..];
+        // Read the n upvalue values from the window top (WITHOUT popping:
+        // the pop commits only after the closure exists — PUC
+        // lua_pushcclosure copies into the fresh closure first, then does
+        // the plain `L->top.p -= n`).
+        if (self.count() < n) return error.InvalidState;
+        const vals = th.stack[th.top - n .. th.top];
         const cl = try self.makeCclosure(fn_, vals);
-        // Commit the stack mutation only now: pop the consumed upvalues
-        // and push the closure (capacity reserved above — infallible).
-        self.stack.items.len -= n;
-        self.stack.appendAssumeCapacity(.{ .Closure = cl });
+        th.top -= n;
+        try self.push(.{ .Closure = cl });
     }
 
     /// Convenience: push a C function as a closure with 0 upvalues.
@@ -1005,8 +1179,9 @@ pub const State = struct {
         falloc: ?*const fn (?*anyopaque, ?*anyopaque, usize, usize) callconv(.c) ?*anyopaque,
         ud: ?*anyopaque,
     ) ApiError!void {
+        try self.reservePushSlot();
         const ls = try self.vm.createExternalLuaString(s, str_len, falloc, ud);
-        try self.stack.append(self.vm.alloc, .{ .String = ls });
+        try self.push(.{ .String = ls });
     }
 
     // -----------------------------------------------------------------------
@@ -1019,16 +1194,17 @@ pub const State = struct {
         // Kind-preserving: allocUserdata OOM stays OOM (LUA_ERRMEM via
         // cThrowOn — P16.50-review-5 B2; the old `catch return
         // error.Runtime` misreported it as ERRRUN).
+        try self.reservePushSlot();
         const ud = self.vm.allocUserdata(sz, nuvalue) catch |e| return mapDispatchError(e);
-        try self.stack.append(self.vm.alloc, .{ .Userdata = ud });
+        try self.push(.{ .Userdata = ud });
         return if (ud.payload.len > 0) @ptrCast(ud.payload.ptr) else @ptrCast(ud);
     }
 
     /// Return payload pointer for full userdata at `idx`, or lightuserdata
     /// pointer, or null.
     pub fn touserdata(self: *State, idx: i32) ?*anyopaque {
-        const abs = normalizeIndex(idx, self.stack.items.len) orelse return null;
-        return switch (self.stack.items[abs]) {
+        const v = self.valueAt(idx) orelse return null;
+        return switch (v) {
             .Userdata => |ud| if (ud.payload.len > 0) @ptrCast(ud.payload.ptr) else @ptrCast(ud),
             .LightUserdata => |p| p,
             else => null,
@@ -1037,8 +1213,8 @@ pub const State = struct {
 
     /// Return raw pointer for GC objects (userdata, table, thread, string).
     pub fn topointer(self: *State, idx: i32) ?*anyopaque {
-        const abs = normalizeIndex(idx, self.stack.items.len) orelse return null;
-        return switch (self.stack.items[abs]) {
+        const v = self.valueAt(idx) orelse return null;
+        return switch (v) {
             .Userdata => |ud| @ptrCast(ud),
             .LightUserdata => |p| p,
             .Table => |t| @ptrCast(t),
@@ -1050,36 +1226,57 @@ pub const State = struct {
 
     /// Pop a value and store it as the n-th uservalue on the userdata at `idx`.
     pub fn setiuservalue(self: *State, idx: i32, n: usize) ApiError!bool {
-        if (self.stack.items.len < 1) return error.InvalidState;
-        const abs = normalizeIndex(idx, self.stack.items.len) orelse return error.InvalidIndex;
-        const val = self.stack.items[self.stack.items.len - 1];
-        self.stack.items.len -= 1;
-        switch (self.stack.items[abs]) {
+        const th = self.curThread();
+        if (self.count() < 1) return error.InvalidState;
+        const s = self.slot(idx) orelse return error.InvalidIndex;
+        const val = th.stack[th.top - 1];
+        switch (th.stack[s]) {
             .Userdata => |ud| {
                 const n_idx = n - 1;
-                if (n_idx >= ud.uservalues.len) return false;
+                if (n_idx >= ud.uservalues.len) {
+                    th.top -= 1; // PUC lua_setiuservalue: plain pop of the value
+                    return false;
+                }
+                // PUC lua_setiuservalue (lapi.c) runs
+                // luaC_barrierback(L, obj2gco(o), s2v(L->top - 1)) after the
+                // uservalue store — a BACKWARD barrier (the value store may
+                // hide a white value inside an already-black userdata; the
+                // owner goes to grayagain for re-traversal). Without it a
+                // black userdata + fresh white value leaves the value
+                // unreachable for the marker and swept while still
+                // referenced (UAF). Same prepare→store→commit
+                // contract as builtinDebugSetuservalue: the grayagain
+                // publication is reserved BEFORE
+                // the observable store; prepare failure (OOM) leaves the
+                // uservalue unwritten.
+                const barrier = try self.vm.gcPrepareUserdataBarrierBack(ud, val);
                 ud.uservalues[n_idx] = val;
+                self.vm.gcCommitUserdataBarrierBack(ud, barrier);
+                th.top -= 1; // PUC lua_setiuservalue: plain pop of the value
                 return true;
             },
-            else => return false,
+            else => {
+                th.top -= 1; // PUC lua_setiuservalue: plain pop of the value
+                return false;
+            },
         }
     }
 
     /// Push the n-th uservalue from the userdata at `idx`.
     pub fn getiuservalue(self: *State, idx: i32, n: usize) ApiError!Type {
-        const abs = normalizeIndex(idx, self.stack.items.len) orelse {
-            try self.stack.append(self.vm.alloc, .Nil);
+        const v = self.valueAt(idx) orelse {
+            try self.push(.Nil);
             return .nil;
         };
-        switch (self.stack.items[abs]) {
+        switch (v) {
             .Userdata => |ud| {
                 const n_idx = n - 1;
                 const val = if (n_idx < ud.uservalues.len) ud.uservalues[n_idx] else .Nil;
-                try self.stack.append(self.vm.alloc, val);
+                try self.push(val);
                 return valueType(val);
             },
             else => {
-                try self.stack.append(self.vm.alloc, .Nil);
+                try self.push(.Nil);
                 return .nil;
             },
         }
@@ -1093,15 +1290,19 @@ pub const State = struct {
     /// OOM — LUA_ERRMEM via cThrowOn; P16.50-review-5 B2). The actual
     /// longjmp boundary logic stays in c_api.zig for C callers.
     pub fn call(self: *State, nargs: usize, nresults: i32) ApiError!void {
-        if (self.stack.items.len < nargs + 1) return error.InvalidState;
-        const fn_idx = self.stack.items.len - nargs - 1;
-        const callee = self.stack.items[fn_idx];
-        const args = self.stack.items[fn_idx + 1 ..];
+        const th = self.curThread();
+        if (self.count() < nargs + 1) return error.InvalidState;
+        const func_slot = th.top - nargs - 1;
+        const callee = th.stack[func_slot];
+        // Dupe the args across the apiCall boundary (the slice would alias
+        // th.stack, which the nested execution may grow).
+        const args = self.vm.alloc.dupe(vm_mod.Value, th.stack[func_slot + 1 .. th.top]) catch return error.OutOfMemory;
+        defer self.vm.alloc.free(args);
         const ret = self.vm.apiCall(.nonyieldable, callee, args) catch |e| return mapVmError(e);
         defer self.vm.alloc.free(ret);
-        self.stack.items.len = fn_idx;
-        const want: usize = if (nresults < 0) ret.len else @min(ret.len, @as(usize, @intCast(nresults)));
-        try self.stack.appendSlice(self.vm.alloc, ret[0..want]);
+        // PUC poscall moveresults: fixed nresults nil-fills (class 3),
+        // MULTRET copies all, 0 drops all.
+        self.vm.cWindowMoveResults(th, func_slot, ret, nresults) catch |e| return mapVmError(e);
     }
 
     // -----------------------------------------------------------------------
@@ -1116,8 +1317,8 @@ pub const State = struct {
 
     /// Return the bytes of the string at `arg`, or "" on type mismatch.
     pub fn checklstring(self: *State, arg: i32) []const u8 {
-        const abs = normalizeIndex(arg, self.stack.items.len) orelse return "";
-        return switch (self.stack.items[abs]) {
+        const v = self.valueAt(arg) orelse return "";
+        return switch (v) {
             .String => |s| s.bytes(),
             else => "",
         };
@@ -1126,26 +1327,32 @@ pub const State = struct {
     /// Store the top value in table `t` under a fresh integer key and return
     /// that key. Returns -1 (LUA_REFNIL) for nil, -2 (LUA_NOREF) on error.
     pub fn ref(self: *State, t: i32) i32 {
-        const top = self.stack.items.len;
+        const th = self.curThread();
+        const top = self.count();
         if (top == 0) return -2;
-        const val = self.stack.items[top - 1];
-        self.stack.items.len -= 1;
-        if (val == .Nil) return -1;
+        const val = th.stack[th.top - 1];
+        if (val == .Nil) {
+            th.top -= 1; // plain: nil is never referenced (PUC lua_pop of a nil)
+            return -1;
+        }
 
         const registry_idx: c_int = -1001000;
         const tbl = if (t == registry_idx) blk: {
             const reg = self.vm.apiEnsureRegistry() catch return -2;
             break :blk reg;
         } else blk: {
-            const tbl_idx = normalizeIndex(t, top) orelse return -2;
-            break :blk switch (self.stack.items[tbl_idx]) {
+            const s = self.slot(t) orelse return -2;
+            break :blk switch (th.stack[s]) {
                 .Table => |tt| tt,
                 else => return -2,
             };
         };
         const ref_key: i64 = self.vm.c_ref_counter;
         self.vm.c_ref_counter += 1;
+        // PUC luaL_ref: lua_rawseti pops the value (plain) after the store —
+        // the value stays rooted on the window across the fallible store.
         self.vm.apiRawSet(tbl, .{ .Int = ref_key }, val) catch return -2;
+        th.top -= 1;
         return @intCast(ref_key);
     }
 
@@ -1155,8 +1362,8 @@ pub const State = struct {
         const tbl = if (t == registry_idx) blk: {
             break :blk self.vm.apiEnsureRegistry() catch return;
         } else blk: {
-            const i = normalizeIndex(t, self.stack.items.len) orelse return;
-            break :blk switch (self.stack.items[i]) {
+            const v = self.valueAt(t) orelse return;
+            break :blk switch (v) {
                 .Table => |tt| tt,
                 else => return,
             };
@@ -1172,10 +1379,11 @@ pub const State = struct {
     /// (`Vm.newMetatableShared`) used by both the C API here and the testC
     /// `newmetatable` command — same registry, same PUC order (lookup →
     /// existing-value-on-top + false | create normal GC table → root on
-    /// the API stack → `__name = tname` → publish to registry → true).
-    /// Per-edge OOM ownership is documented and proven at the primitive.
+    /// the resumed thread's window → `__name = tname` → publish to
+    /// registry → true). Per-edge OOM ownership is documented and proven
+    /// at the primitive.
     pub fn newmetatable(self: *State, tname: []const u8) ApiError!bool {
-        return self.vm.apiNewMetatable(tname, self.stack, self.vm.alloc) catch |e| mapVmError(e);
+        return self.vm.apiNewMetatable(tname, self.curThread()) catch |e| mapVmError(e);
     }
 
     /// Push the metatable registered under `tname`, or nil.
@@ -1186,7 +1394,7 @@ pub const State = struct {
         const reg = self.vm.apiEnsureRegistry() catch |e| return mapVmError(e);
         const key = try self.vm.internStr(tname);
         const val = self.vm.apiRawGet(reg, .{ .String = key });
-        try self.stack.append(self.vm.alloc, val);
+        try self.push(val);
     }
 
     /// Get metatable from registry by name, set on value at top.
@@ -1197,13 +1405,13 @@ pub const State = struct {
 
     /// Check if value at `ud` is a userdata with metatable `tname`.
     pub fn testudata(self: *State, ud: i32, tname: []const u8) ?*anyopaque {
-        const abs = normalizeIndex(ud, self.stack.items.len) orelse return null;
-        if (self.stack.items[abs] != .Userdata) return null;
+        const v = self.valueAt(ud) orelse return null;
+        if (v != .Userdata) return null;
         const reg = self.vm.apiEnsureRegistry() catch return null;
         const key = self.vm.internStr(tname) catch return null;
         const expected = self.vm.apiRawGet(reg, .{ .String = key });
         if (expected != .Table) return null;
-        const ud_val = self.stack.items[abs].Userdata;
+        const ud_val = v.Userdata;
         if (ud_val.metatable != expected.Table) return null;
         return if (ud_val.payload.len > 0) @ptrCast(ud_val.payload.ptr) else @ptrCast(ud_val);
     }
@@ -1215,11 +1423,11 @@ pub const State = struct {
 
     /// Return integer at `arg` or error.
     pub fn checkinteger(self: *State, arg: i32) ApiError!i64 {
-        const abs = normalizeIndex(arg, self.stack.items.len) orelse return error.InvalidIndex;
-        return switch (self.stack.items[abs]) {
-            .Int => |v| v,
-            .Num => |v| if (std.math.floor(v) == v and v >= -9.2233720368548e18 and v <= 9.2233720368548e18)
-                @intFromFloat(v)
+        const v = self.valueAt(arg) orelse return error.InvalidIndex;
+        return switch (v) {
+            .Int => |i| i,
+            .Num => |n| if (std.math.floor(n) == n and n >= -9.2233720368548e18 and n <= 9.2233720368548e18)
+                @intFromFloat(n)
             else
                 error.Type,
             else => error.Type,
@@ -1228,10 +1436,9 @@ pub const State = struct {
 
     /// Return integer at `arg` or `def` if nil/absent.
     pub fn optinteger(self: *State, arg: i32, def: i64) ApiError!i64 {
-        const abs = normalizeIndex(arg, self.stack.items.len) orelse return def;
-        return switch (self.stack.items[abs]) {
-            .Int => |v| v,
-            .Nil => def,
+        const v = self.valueAt(arg) orelse return def;
+        return switch (v) {
+            .Int => |i| i,
             else => def,
         };
     }
@@ -1243,10 +1450,11 @@ pub const State = struct {
 
     /// Register every {name, func} in `reg` into the table at top of stack.
     pub fn registerfuncs(self: *State, reg: [*]const Reg, nup: usize) ApiError!void {
-        const top = self.stack.items.len;
+        const th = self.curThread();
+        const top = self.count();
         if (top < nup + 1) return error.InvalidState;
-        const tbl_idx: usize = top - nup - 1;
-        const tbl = switch (self.stack.items[tbl_idx]) {
+        const tbl_slot = th.top - nup - 1;
+        const tbl = switch (th.stack[tbl_slot]) {
             .Table => |t| t,
             else => return error.Type,
         };
@@ -1267,9 +1475,14 @@ pub const State = struct {
         // failure stay published — valid, fully-registered objects; the
         // caller sees the error (PUC luaL_setfuncs aborts via luaD_throw
         // on the first failure; our error return is the Zig-native form).
-        const upv_start = tbl_idx + 1;
+        //
+        // The shared-values slice aliases th.stack; nothing in the loop
+        // grows the stack (makeCclosure allocates off-stack, apiRawSet
+        // writes the table), so the alias stays valid — the same exposure
+        // as PUC reading the values per closure.
+        const upv_start = tbl_slot + 1;
         const shared_values: []const vm_mod.Value =
-            self.stack.items[upv_start .. upv_start + nup];
+            th.stack[upv_start .. upv_start + nup];
         var i: usize = 0;
         while (reg[i].name != null) : (i += 1) {
             const name = std.mem.span(reg[i].name.?);
@@ -1296,7 +1509,8 @@ pub const State = struct {
                 return mapVmError(e);
             };
         }
-        self.stack.items.len -= nup;
+        // PUC luaL_setfuncs ends with lua_pop(L, nup) — close-then-lower.
+        try self.popN(nup);
     }
 
     /// Convenience: create a fresh table and register `reg` into it.
@@ -1309,35 +1523,12 @@ pub const State = struct {
         return self.vm.compileChunkValue(bytes, chunk_name);
     }
 
-    fn valueAtConst(self: *const State, idx: i32) ?*const vm_mod.Value {
-        const abs = self.normalizeIndexConst(idx, self.stack.items.len) orelse return null;
-        return &self.stack.items[abs];
-    }
-
     fn threadAt(self: *const State, idx: i32) ?*vm_mod.Thread {
-        const v = self.valueAtConst(idx) orelse return null;
-        return switch (v.*) {
+        const v = self.valueAt(idx) orelse return null;
+        return switch (v) {
             .Thread => |th| th,
             else => null,
         };
-    }
-
-    fn threadStack(self: *State, th: *vm_mod.Thread) ApiError!*std.ArrayListUnmanaged(vm_mod.Value) {
-        const gop = try self.thread_stacks.getOrPut(self.vm.alloc, th);
-        if (!gop.found_existing) gop.value_ptr.* = .empty;
-        return gop.value_ptr;
-    }
-
-    fn apiStackFor(self: *State, thread_idx: ?i32) ApiError!*std.ArrayListUnmanaged(vm_mod.Value) {
-        if (thread_idx) |idx| {
-            const th = self.threadAt(idx) orelse return error.Type;
-            return try self.threadStack(th);
-        }
-        return self.stack;
-    }
-
-    fn normalizeIndexConst(_: *const State, idx: i32, top: usize) ?usize {
-        return normalizeIndex(idx, top);
     }
 
     fn callGlobal(self: *State, name: []const u8, args: []const vm_mod.Value) ![]vm_mod.Value {
@@ -1355,7 +1546,7 @@ pub const State = struct {
     }
 };
 
-fn isCallableValue(vm: *vm_mod.Vm, v: vm_mod.Value) bool {
+pub fn isCallableValue(vm: *vm_mod.Vm, v: vm_mod.Value) bool {
     return switch (v) {
         .Builtin, .Closure => true,
         .Table => |t| t.metatable != null and vm.getFieldOpt(t.metatable.?, "__call") != null,

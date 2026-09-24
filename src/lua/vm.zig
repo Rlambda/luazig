@@ -2528,27 +2528,6 @@ pub const Thread = struct {
     /// (freeThreadWrapBuffers). Distinct from err_dead_traceback above
     /// (that one is the P16.28 dead-thread replay artifact).
     err_traceback: ?[]u8 = null,
-    /// Parking state for a __close metamethod that IS the direct
-    /// `coroutine.yield` builtin and genuinely suspended the thread
-    /// (yy=1). Owner: the thread running the close region (the fields
-    /// live here, not on any frame). Writers: runCloseMetamethod's Yield
-    /// arms — only a direct builtin yield closer that returned
-    /// error.Yield (a yy=0 yield attempt fails at the yield site as a
-    /// RuntimeError, so the writer never fires there). Readers: the
-    /// runCloseMetamethod entry guard (a matching obj means the yielded
-    /// closer is being resumed — skip the call) and
-    /// clearPendingCloseBuiltinForObject. Validity window: from the yield
-    /// until the close region's TERMINAL exit — the yielded closer is
-    /// never re-run (its TBC entry was popped before it ran), so the
-    /// fields must not outlive the region. Terminal clears: the C-lane
-    /// region exit (closeTbcRegion's return / its CClsretState OOM arm)
-    /// and the bytecode-lane resume entry
-    /// (continueBytecodeClose's waiting_builtin_yield consume) and
-    /// cancellation (cancelBytecodePendingCall's .close arm). Without a
-    /// terminal clear the entry guard mis-fires on a later legitimate
-    /// close of the same object.
-    pending_close_builtin: bool = false,
-    pending_close_builtin_obj: Value = .Nil,
     dofile_entry_closure: ?*Closure = null,
     /// Authoritative explicit bytecode activation stack for this Lua thread.
     /// Calls, metamethods, hooks, closers, protected calls, and coroutine
@@ -11306,12 +11285,10 @@ pub const Vm = struct {
         if (state.waiting_builtin_yield) {
             state.waiting_builtin_yield = false;
             // Consuming the parked builtin-yield closer suspension: the
-            // region continues from here to its terminal exit (another
-            // yield re-sets both flags; completion/error leaves them
-            // cleared), so the thread's parking fields must not outlive
-            // the suspension — clear them with the flag.
-            state.owner_thread.pending_close_builtin = false;
-            state.owner_thread.pending_close_builtin_obj = .Nil;
+            // region continues from the next entry below (the yielded
+            // closer's own entry was popped before it ran), so a second
+            // yield re-sets the flag and completion/error leaves it
+            // cleared.
         }
 
         while (true) {
@@ -11438,6 +11415,21 @@ pub const Vm = struct {
                 else => return resolve_err,
             };
             defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+            // PUC luaF_close → luaT_callTM stages func+obj(+err) at L->top,
+            // then luaD_call/luaD_callnoyield activates. Both activation
+            // arms below stage the callee at th.top (the Lua-closure arm
+            // via stageBytecodeCall; the direct builtin/sync arm via
+            // callMetamethod → callBuiltin's C-frame push), so th.top must
+            // sit at the parent frame's window top, above every live
+            // register of the closing frame (PUC Protect parity,
+            // lvm.c:1151) — otherwise the staging overwrites a live TBC
+            // register that a later entry in this region still has to
+            // read.
+            if (!parent.isC()) {
+                const close_window = parent.windowTop();
+                if (state.owner_thread.top < close_window)
+                    state.owner_thread.top = close_window;
+            }
             if (resolved.callee == .Closure and resolved.callee.Closure.proto != null) {
                 // P16.52: PUC callclosemethod (lfunc.c:107) → luaD_call(yy=1)
                 // / luaD_callnoyield(yy=0) → ccall(ci / nyci) — EVERY __close
@@ -11478,22 +11470,9 @@ pub const Vm = struct {
                     .callee = resolved.callee,
                     .completion = .{ .close = state },
                 });
-                // PUC luaF_close → luaT_callTM stages func+obj(+err) at
-                // L->top, then luaD_callnoyield activates. On any failure
-                // between continuation install and activation, roll the
-                // __close continuation back to its exact prior state.
-                // PUC Protect parity (lvm.c:1151): stage at the parent
-                // frame's window top, above every live register of the
-                // closing frame (see
-                // pushResolvedBytecodeClosure).
-                {
-                    const close_parent = exec_frames.getPtr(parent_index);
-                    if (!close_parent.isC()) {
-                        const close_window = close_parent.windowTop();
-                        if (state.owner_thread.top < close_window)
-                            state.owner_thread.top = close_window;
-                    }
-                }
+                // On any failure between continuation install and
+                // activation, roll the __close continuation back to its
+                // exact prior state.
                 const staged = self.stageBytecodeCall(
                     state.owner_thread,
                     state.owner_thread.top,
@@ -11670,15 +11649,6 @@ pub const Vm = struct {
             },
             .close => |cont| {
                 const state = cont;
-                if (state.waiting_builtin_yield) {
-                    // Cancelling a parked builtin-yield closer
-                    // suspension: the region is destroyed without a
-                    // resume, so the thread's parking fields must not
-                    // outlive it (same terminal-clear contract as the
-                    // resume entry).
-                    state.owner_thread.pending_close_builtin = false;
-                    state.owner_thread.pending_close_builtin_obj = .Nil;
-                }
                 self.releaseBytecodeCloseChild(state);
                 self.freeBytecodeClosePost(state.post);
                 self.alloc.destroy(state);
@@ -45171,13 +45141,6 @@ pub const Vm = struct {
         // false/nil are explicitly allowed as non-closable sentinels.
         if (obj == .Nil) return;
         if (obj == .Bool and !obj.Bool) return;
-        if (self.current_thread) |th| {
-            if (th.pending_close_builtin and valuesEqual(th.pending_close_builtin_obj, obj)) {
-                th.pending_close_builtin = false;
-                th.pending_close_builtin_obj = .Nil;
-                return;
-            }
-        }
         const mm = self.getTmByObj(obj, .close);
         if (mm == null) {
             return self.fail("metamethod 'close' is nil", .{});
@@ -45193,43 +45156,16 @@ pub const Vm = struct {
             var call_args = [_]Value{ obj, e };
             _ = self.callMetamethod(mmv, "__close", call_args[0..]) catch |e2| switch (e2) {
                 error.RuntimeError => return error.RuntimeError,
-                error.Yield => {
-                    if (mmv == .Builtin and mmv.Builtin == .coroutine_yield) {
-                        if (self.current_thread) |th| {
-                            th.pending_close_builtin = true;
-                            th.pending_close_builtin_obj = obj;
-                        }
-                    }
-                    return error.Yield;
-                },
+                error.Yield => return error.Yield,
                 else => return e2,
             };
-            self.clearPendingCloseBuiltinForObject(obj);
         } else {
             var call_args = [_]Value{obj};
             _ = self.callMetamethod(mmv, "__close", call_args[0..]) catch |e2| switch (e2) {
                 error.RuntimeError => return error.RuntimeError,
-                error.Yield => {
-                    if (mmv == .Builtin and mmv.Builtin == .coroutine_yield) {
-                        if (self.current_thread) |th| {
-                            th.pending_close_builtin = true;
-                            th.pending_close_builtin_obj = obj;
-                        }
-                    }
-                    return error.Yield;
-                },
+                error.Yield => return error.Yield,
                 else => return e2,
             };
-            self.clearPendingCloseBuiltinForObject(obj);
-        }
-    }
-
-    fn clearPendingCloseBuiltinForObject(self: *Vm, obj: Value) void {
-        if (self.current_thread) |th| {
-            if (th.pending_close_builtin and valuesEqual(th.pending_close_builtin_obj, obj)) {
-                th.pending_close_builtin = false;
-                th.pending_close_builtin_obj = .Nil;
-            }
         }
     }
 
@@ -45518,7 +45454,8 @@ pub const Vm = struct {
             // Without the nny half a builtin yield closer suspends the thread
             // mid-close (locals.lua's `closeslot`-with-yield test). The yy=1
             // half adds only depth — a Lua closer parks in-place (CLSRET) and
-            // a builtin yield closer suspends via pending_close_builtin.
+            // a builtin yield closer suspends through the thread's yield
+            // machinery with the CClsretState continuation.
             // P16.52: the old code entered ONLY the nny half (incnny) for
             // yy=0 and nothing for yy=1 — the missing depth unit let the
             // coroutine.close → __close → coroutine.close chain recurse past
@@ -45576,12 +45513,7 @@ pub const Vm = struct {
                         const cs = self.alloc.create(CClsretState) catch {
                             // The suspension is NOT established (no
                             // clsret_state installed) and the yield
-                            // propagates as OOM — the region is terminal
-                            // and the closer never re-runs, so the parking
-                            // fields (just set by the Yield writer) must
-                            // not outlive it.
-                            th.pending_close_builtin = false;
-                            th.pending_close_builtin_obj = .Nil;
+                            // propagates as OOM.
                             return error.OutOfMemory;
                         };
                         cs.* = .{
@@ -45619,16 +45551,6 @@ pub const Vm = struct {
                 },
             };
         }
-        // Region terminal exit. A live suspension always left via
-        // `return error.Yield` above and the resume pass re-enters here,
-        // so reaching the return means no close-region suspension is
-        // live on th — clear the builtin-closer parking fields
-        // unconditionally (a yield this pass or a resumed pass left them
-        // set; the yielded closer is never re-run, and a residue would
-        // make the runCloseMetamethod entry guard mis-fire on a later
-        // legitimate close of the same object).
-        th.pending_close_builtin = false;
-        th.pending_close_builtin_obj = .Nil;
         return cur_err;
     }
 
@@ -68887,11 +68809,7 @@ test "A1.1s1 class 8: post-blackening err_obj write — root-mark tripwire (GREE
     // is owned
     // and root-marked by the pending .hook continuation (gcPropagateOne's
     // .hook case); the sync path's values are root-marked via
-    // debug_transfer_values (~30623); pending_close_builtin_obj (~43713/
-    // 43729) has NO root-mark site — UNCONFIRMED candidate (likely covered
-    // by the TBC chain during the yield-inside-closer window; needs a
-    // dedicated yield/replay GC test, stage-gated on the unified stack
-    // model).
+    // debug_transfer_values (~30623).
     var state = api.State.init(.{ .allocator = testing.allocator });
     defer state.deinit();
     const vm = state.vm;
@@ -69506,7 +69424,7 @@ test "gcUnregisterObjectRollback unlinks a linked thread from the atomic-clear l
     try testing.expect(vm.gc_atomic_clear_head == null);
 }
 
-test "builtin yield closer parking fields clear at the close region's terminal exit" {
+test "builtin yield closer: LIFO suspension, region completion, and re-close of the same object" {
     const testing = std.testing;
 
     var vm: Vm = .init(testing.allocator, false);
@@ -69545,7 +69463,8 @@ test "builtin yield closer parking fields clear at the close region's terminal e
     _ = scope.protectValueAssumeCapacity(.{ .Thread = co });
 
     // Resume #1: the body returns, x's __close = coroutine.yield(obj)
-    // suspends the coroutine INSIDE the close — [true, obj].
+    // suspends the coroutine INSIDE the close — [true, obj]. The Lua
+    // closer below has NOT run yet (LIFO closed the yield closer first).
     const r1 = try vm.resumeResultOwned(try vm.builtinCoroutineResume(&[_]Value{.{ .Thread = co }}));
     try testing.expect(r1.len >= 2);
     try testing.expect(r1[0] == .Bool and r1[0].Bool);
@@ -69555,12 +69474,6 @@ test "builtin yield closer parking fields clear at the close region's terminal e
     };
     _ = scope.protectValueAssumeCapacity(.{ .Table = obj });
     vm.infraAlloc().free(r1);
-
-    // Mid-suspension: the parking fields are SET (the writer fired for
-    // the genuine yy=1 builtin-closer yield) and the Lua closer below
-    // has NOT run yet — LIFO closed the yield closer first.
-    try testing.expect(co.pending_close_builtin);
-    try testing.expect(co.pending_close_builtin_obj == .Table and co.pending_close_builtin_obj.Table == obj);
     const g1 = vm.getGlobal("g");
     try testing.expect(g1 == .String and std.mem.eql(u8, g1.String.bytes(), ""));
 
@@ -69574,17 +69487,9 @@ test "builtin yield closer parking fields clear at the close region's terminal e
     const g2 = vm.getGlobal("g");
     try testing.expect(g2 == .String and std.mem.eql(u8, g2.String.bytes(), "y"));
 
-    // Terminal-exit contract: the region completed, so the parking
-    // fields must be cleared — the yielded closer is never re-run, and a
-    // residue would make the runCloseMetamethod entry guard skip a
-    // later legitimate close of the same object.
-    try testing.expect(!co.pending_close_builtin);
-    try testing.expect(co.pending_close_builtin_obj == .Nil);
-
     // Re-close proof: a second coroutine closing the SAME object must
-    // RUN the metamethod again (yield a second time), not skip it. With
-    // a residue the entry guard would skip the call and co2 would
-    // complete without ever suspending.
+    // RUN the metamethod again (yield a second time), not skip it —
+    // completion identity is the close continuation, never the object.
     const src2 =
         \\local obj = ...
         \\local co2 = coroutine.create(function()
@@ -69608,18 +69513,153 @@ test "builtin yield closer parking fields clear at the close region's terminal e
     const r3 = try vm.resumeResultOwned(try vm.builtinCoroutineResume(&[_]Value{.{ .Thread = co2 }}));
     try testing.expect(r3.len >= 2);
     try testing.expect(r3[0] == .Bool and r3[0].Bool);
-    // The metamethod RAN: co2 yielded the object itself (a guard skip
-    // would return the completed body value "done2" instead).
+    // The metamethod RAN: co2 yielded the object itself (a skip would
+    // return the completed body value "done2" instead).
     try testing.expect(r3[1] == .Table and r3[1].Table == obj);
     vm.infraAlloc().free(r3);
-    try testing.expect(co2.pending_close_builtin);
-    try testing.expect(co2.pending_close_builtin_obj == .Table and co2.pending_close_builtin_obj.Table == obj);
 
     const r4 = try vm.resumeResultOwned(try vm.builtinCoroutineResume(&[_]Value{.{ .Thread = co2 }}));
     defer vm.infraAlloc().free(r4);
     try testing.expect(r4.len == 2);
     try testing.expect(r4[0] == .Bool and r4[0].Bool);
     try testing.expect(r4[1] == .String and std.mem.eql(u8, r4[1].String.bytes(), "done2"));
-    try testing.expect(!co2.pending_close_builtin);
-    try testing.expect(co2.pending_close_builtin_obj == .Nil);
+}
+
+test "one object in N to-be-closed variables runs the builtin yield closer N times" {
+    const testing = std.testing;
+
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    const main_h = try vm.setupMainHandle();
+    defer vm.freeStateHandle(main_h);
+    vm.setDynamicBytecodeCompiler(defaultBytecodeCompiler);
+
+    // PUC luaF_close walks the tbclist per MARK, not per object: the same
+    // object bound to N <close> variables is closed N times, LIFO. With
+    // __close = coroutine.yield each close suspends the coroutine exactly
+    // once, so N aliases must produce N [true, obj] suspensions before
+    // the body return completes.
+    const src =
+        \\local o = setmetatable({}, {__close = coroutine.yield})
+        \\local co = coroutine.create(function(x)
+        \\  local a <close> = x
+        \\  local b <close> = x
+        \\  local c <close> = x
+        \\  return "done"
+        \\end)
+        \\return co, o
+    ;
+    const chunk_v = try vm.compileChunkValue(src, "=builtin-yield-closer-alias");
+    var scope = try vm.openRootScope(6, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(chunk_v);
+    const cl = chunk_v.Closure;
+
+    const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+    defer vm.alloc.free(results);
+    try testing.expectEqual(@as(usize, 2), results.len);
+    const co = switch (results[0]) {
+        .Thread => |t| t,
+        else => return testing.expect(false),
+    };
+    const obj = switch (results[1]) {
+        .Table => |t| t,
+        else => return testing.expect(false),
+    };
+    _ = scope.protectValueAssumeCapacity(.{ .Thread = co });
+    _ = scope.protectValueAssumeCapacity(.{ .Table = obj });
+
+    // Resume #1 passes the object as the body argument; the body returns
+    // and LIFO closes c first — suspension #1 with the object itself.
+    const r1 = try vm.resumeResultOwned(try vm.builtinCoroutineResume(&[_]Value{ .{ .Thread = co }, .{ .Table = obj } }));
+    try testing.expect(r1.len >= 2);
+    try testing.expect(r1[0] == .Bool and r1[0].Bool);
+    try testing.expect(r1[1] == .Table and r1[1].Table == obj);
+    vm.infraAlloc().free(r1);
+
+    // Resumes #2 and #3 close b and a — one suspension per remaining
+    // alias, each yielding the same object again.
+    const r2 = try vm.resumeResultOwned(try vm.builtinCoroutineResume(&[_]Value{.{ .Thread = co }}));
+    try testing.expect(r2.len >= 2);
+    try testing.expect(r2[0] == .Bool and r2[0].Bool);
+    try testing.expect(r2[1] == .Table and r2[1].Table == obj);
+    vm.infraAlloc().free(r2);
+
+    const r3 = try vm.resumeResultOwned(try vm.builtinCoroutineResume(&[_]Value{.{ .Thread = co }}));
+    try testing.expect(r3.len >= 2);
+    try testing.expect(r3[0] == .Bool and r3[0].Bool);
+    try testing.expect(r3[1] == .Table and r3[1].Table == obj);
+    vm.infraAlloc().free(r3);
+
+    // Resume #4: the region is exhausted; the body return completes.
+    const r4 = try vm.resumeResultOwned(try vm.builtinCoroutineResume(&[_]Value{.{ .Thread = co }}));
+    defer vm.infraAlloc().free(r4);
+    try testing.expect(r4.len == 2);
+    try testing.expect(r4[0] == .Bool and r4[0].Bool);
+    try testing.expect(r4[1] == .String and std.mem.eql(u8, r4[1].String.bytes(), "done"));
+}
+
+test "builtin yield closer: local alias shape keeps the callee above live close registers" {
+    const testing = std.testing;
+
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    const main_h = try vm.setupMainHandle();
+    defer vm.freeStateHandle(main_h);
+    vm.setDynamicBytecodeCompiler(defaultBytecodeCompiler);
+
+    // The same object bound to two <close> locals declared from a local
+    // value inside the body (no parameter): the builtin callee for the
+    // first (LIFO) close is staged at the thread top, which sits BELOW
+    // the still-live TBC registers of the remaining entry. PUC raises
+    // the top to the closing frame's window before staging
+    // (luaF_close/luaT_callTM); without that raise the staged callee
+    // clobbers the second entry's register and the close is lost with
+    // "metamethod 'close' is nil".
+    const src =
+        \\local co = coroutine.create(function()
+        \\  local o = setmetatable({}, {__close = coroutine.yield})
+        \\  local a <close> = o
+        \\  local b <close> = o
+        \\  return "done"
+        \\end)
+        \\return co
+    ;
+    const chunk_v = try vm.compileChunkValue(src, "=builtin-yield-closer-local-alias");
+    var scope = try vm.openRootScope(5, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(chunk_v);
+    const cl = chunk_v.Closure;
+
+    const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+    defer vm.alloc.free(results);
+    try testing.expectEqual(@as(usize, 1), results.len);
+    const co = switch (results[0]) {
+        .Thread => |t| t,
+        else => return testing.expect(false),
+    };
+    _ = scope.protectValueAssumeCapacity(.{ .Thread = co });
+
+    // Resume #1: the body returns; LIFO closes b first — suspension with
+    // the object itself.
+    const r1 = try vm.resumeResultOwned(try vm.builtinCoroutineResume(&[_]Value{.{ .Thread = co }}));
+    try testing.expect(r1.len >= 2);
+    try testing.expect(r1[0] == .Bool and r1[0].Bool);
+    try testing.expect(r1[1] == .Table);
+    vm.infraAlloc().free(r1);
+
+    // Resume #2: a's register must still hold the object (not the staged
+    // builtin callee) — the second close of the SAME object suspends too.
+    const r2 = try vm.resumeResultOwned(try vm.builtinCoroutineResume(&[_]Value{.{ .Thread = co }}));
+    try testing.expect(r2.len >= 2);
+    try testing.expect(r2[0] == .Bool and r2[0].Bool);
+    try testing.expect(r2[1] == .Table);
+    vm.infraAlloc().free(r2);
+
+    // Resume #3: the region is exhausted; the body return completes.
+    const r3 = try vm.resumeResultOwned(try vm.builtinCoroutineResume(&[_]Value{.{ .Thread = co }}));
+    defer vm.infraAlloc().free(r3);
+    try testing.expect(r3.len == 2);
+    try testing.expect(r3[0] == .Bool and r3[0].Bool);
+    try testing.expect(r3[1] == .String and std.mem.eql(u8, r3[1].String.bytes(), "done"));
 }

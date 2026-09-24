@@ -899,6 +899,61 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   "attempt to yield across a C-call boundary"; wrap re-raise; GC-путь);
   battery 353/353.
 
+- [x] **Parity BLOCKER: один объект в двух TBC-переменных теряет второй
+  builtin-yield closer**: валидная форма
+  `local a <close> = o; local b <close> = o` с
+  `getmetatable(o).__close = coroutine.yield` в PUC Lua 5.5 даёт два
+  последовательных успешных yield одного объекта и затем завершает coroutine;
+  luazig даёт первый yield, а на втором `resume` завершает coroutine ошибкой
+  `metamethod 'close' is nil`. Первая неправильная операция —
+  `runCloseMetamethod` распознаёт завершение прошлого closer по
+  `valuesEqual(pending_close_builtin_obj, obj)`: следующая отдельная TBC-запись
+  того же объекта ошибочно принимается за re-entry уже исполненного closer и
+  пропускается, после чего state machine повторно пытается разрешить close на
+  неверном continuation edge. PUC хранит прогресс конкретного `tbclist` level /
+  CallInfo invocation, а не identity закрываемого TValue. Исправление должно
+  привязать builtin-yield completion к конкретной close-continuation/entry и не
+  вводить новый глобальный replay authority; проверить bytecode и C-chain,
+  одинаковые и разные объекты, два и три alias-entry, normal/error/forced close,
+  GC между resume. Найдено A1.1-final как UNCONFIRMED, подтверждено reviewer
+  differential; origin — дефект изменённого TBC continuation path, fate
+  FIX-NOW. Open-count 23→24.
+  CLOSED (TBC-alias correction, bounded): (1) root cause фактического
+  наблюдения глубже guard'а: прямой builtin-arm `continueBytecodeClose`
+  стадировал callee по th.top НИЖЕ живых TBC-регистров закрываемого фрейма —
+  калящий alias-слот (trace: после первого yield второй entry читал значение
+  metamethod'а вместо объекта); fix — единый window-raise до стадии обоих
+  arm'ов (PUC callclosemethod/luaT_callTM staging-at-top). (2)
+  Архитектурно: `Thread.pending_close_builtin/_obj` и object-equality guard
+  УДАЛЕНЫ (grep 0); completion identity — per-entry: pop ДО вызова closer
+  (PUC poptbclist) в обоих lanes; re-entry продолжает со следующей entry
+  через `waiting_builtin_yield` (bytecode) и popped-chain/CClsretState (C);
+  новых replay-owner нет. Один объект в N TBC-слотах → closer N раз LIFO.
+  Evidence: репро-чанк `true,o`×2 → `true,"done"` dead (= PUC дословно);
+  новый differential-сьют tests/c_api/24_tbc_alias (byte-identical vs PUC
+  5.5 ltests, RED на pre-fix); differential matrix 8 кейсов (2/3 alias,
+  controls, GC между resume, C-lane testc toclose×2) — match; оба
+  mutation-дискриминатора RED (unraised arm; restored guard); battery
+  355/355 Debug+RF; matrix --testc (RF) zig_fail=0; smoke 85/85.
+
+- [ ] **Parity BLOCKER: ошибка Lua-closer в yieldable close во время
+  clean-return должна останавливать close-region и переносить оставшиеся
+  TBC на recovery-границу**: PUC 5.5 при ошибке `__close` (Lua-закрытие,
+  yy=1) без pcall-границы над region позволяет ошибке покинуть `luaF_close`
+  (longjmp мимо region) — оставшиеся marks закрываются на границе
+  восстановления (в корутине это `coroutine.close`: verified PUC log после
+  failed resume `v2:nil`, после явного `coroutine.close` `v2:nil,v1:e2`);
+  luazig bytecode-lane продолжает закрывать eagerly (`v2:nil,v1:e2` сразу).
+  Observable divergence close-timing/set валидной Lua-программы (найдено
+  differential-кейсом 07 TBC-alias correction; воспроизводится
+  byte-identical на pre-fix дереве и в варианте 07b без builtin-yield
+  closer — pre-existing к ac3e2b7). Fix-направление: error-escape из
+  close-loop обязан прерывать region (PUC luaD_throw мимо luaF_close) и
+  оставлять оставшиеся entries (bc_tbc_regs/chain) для границы
+  coroutine.close/pcall; eager-continue допустим только внутри protected
+  close (yy=0 forced close — там PUC closeprotected сам продолжает).
+  Open-count: TBC-alias closed (−1), этот пункт открыт (+1) = 24.
+
 - [x] **P16.50-review correction (REOPENED→CLOSED by review-7)**: rollback ownership + C-closure upvalue semantics — (a) BLOCKER 1: opClosure count-prefix rollback неверен при смешанных дескрипторах (proxy/new instack/уже-boxed) — exact ownership worklist/bitmap, rollback только созданных этим вызовом Cells в reverse-порядке; закрыть post-commit окно (gcStoreCellValue после commit) — либо provably-infallible через preparation/order, либо полный rollback owner для Closure/tree/register/accounting/register-slot; dispatch-driven mixed-upvalue тест ([proxy, new instack] из реального bytecode; existing-boxed; провал на следующем Cell и на Closure alloc; post-commit barrier failure; byte-exact всё + minor collection + repeated + success); negative copy count-prefix rollback детерминированно ловится; (b) BLOCKER 2: lua_newthread errdefer НЕ работает (?*lua_State ≠ error union) — inner error-union transaction / явный cleanup helper, ABI-wrapper маппит в null ПОСЛЕ cleanup; preserve/restore прежний vm.c_api_thread; тест против реального экспортированного lua_newthread (fail на registry prepare / Thread alloc / handle alloc / parent stack growth; registries/stack/handle/counters/live-set + GC после); (c) BLOCKER 3: registerfuncs алиасит C-closure upvalues (общие Cell-объекты: setupvalue(f1) виден f2) — PUC luaL_setfuncs (lauxlib.c:965-978) копирует VALUES на стек + lua_pushcclosure (lapi.c:609+) свежий CClosure с inline slots; один канонический C-closure конструктор для pushcclosure+registerfuncs с per-closure Cells; убрать неверный LClosure rationale; differential-тест (upvalueid differs; setupvalue A не меняет B; сбор в обоих порядках без leaks; OOM на non-preinterned names + table-growth setfield); (d) error propagation: lua_pushcclosure/lua_pushcfunction/luaL_setfuncs/luaL_newlib catch {} — обследовать защищённый механизм (protected call/throw) и маршрутизировать ЛИБО зафиксировать архитектурный blocker (owner решает); (e) HIGH: testcChargeMemory коммитит total_bytes ДО нативных аллокаций — split check/reserve от accounting commit / точный rollback; тест с активным testc_ctrl + провалы registry reserve/Userdata/uservalues/payload; аудит всех testcChargeMemory-сайтов; (f) cleanup: устаревшие BLOCKED/KNOWN-leak комментарии в тестах, skip fail-индексов 2..4 в pushcclosure matrix, smoke provenance prose (84 файла, 85-й номер — один из 84).
 
   ПЕРЕОТКРЫТ фазой P16.50-review-6 (owner-instructed): review-5 не принята —
@@ -1113,15 +1168,12 @@ RootHandle-доступы переведены на детерминирован
 reserve/prepare publication, protected boundaries, PUC final-traversal
 nil-fill); GC-гипотеза опровергнута (шаги GC == baseline); полный
 диагностический след — gate-прогоны фазы (/tmp evidence) + отчёты A1.1.
-Residuals (backlog, без новых пунктов): big.lua both_fail (pre-existing);
+Residuals (backlog): big.lua both_fail (pre-existing);
 locals.lua tracegc-dot divergence (pre-existing, stash-verified);
 GC-cycles +1.2% (S7 accounting, корректен); M18 gmatch (UNCONFIRMED),
-M29-остаток (мёртвые testhelper-функции); NEW UNCONFIRMED (найден в
-A1.1-final): один объект в двух TBC-переменных одной области — guard
-пропускает второй close, PUC исполняет `__close` дважды (решающий
-эксперимент: `local a <close> = o; local b <close> = o` + маркерный
-__close, дифференциал против PUC 5.5); candidate: пер-переменная
-идентичность вместо per-object guard. Open-count 30→23 (7 закрытий).
+M29-остаток (мёртвые testhelper-функции). Новый TBC alias BLOCKER вынесен
+отдельным открытым пунктом после reviewer differential. Open-count фазы
+30→23 (7 закрытий), затем 23→24 (подтверждение residual).
 
 ### P16.42 Iteration 2b — builtinTestcStats rooting hole CLOSED (2026-09-13)
 

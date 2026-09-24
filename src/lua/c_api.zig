@@ -4688,7 +4688,7 @@ test "c api lua_setupvalue OOM throws LUA_ERRMEM before the store" {
     // The store did NOT happen: the cell still holds its original table,
     // the young table is unpromoted, nothing was published.
     try std.testing.expect(std.meta.eql(owner_cell.value, orig_value));
-    try std.testing.expect(b8AgeIsYoung(b8_young.?.gc_age));
+    try std.testing.expect(b8AgeIsYoung(b8_young.?.gc.age));
     try std.testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
     try std.testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
 
@@ -4702,7 +4702,7 @@ test "c api lua_setupvalue OOM throws LUA_ERRMEM before the store" {
     try std.testing.expect(name != null);
     try std.testing.expectEqualStrings("x", std.mem.span(name.?));
     try std.testing.expect(std.meta.eql(owner_cell.value, .{ .Table = b8_young.? }));
-    try std.testing.expect(b8_young.?.gc_age == .old0);
+    try std.testing.expect(b8_young.?.gc.age == .old0);
     var old1_count: usize = 0;
     for (vm.gc_old1.items) |o| {
         if (std.meta.eql(o, .{ .table = b8_young.? })) old1_count += 1;
@@ -4756,7 +4756,7 @@ test "c api lua_upvaluejoin OOM throws LUA_ERRMEM before the re-point" {
     b8_donor = s.curThread().stack[s.curThread().top - 1].Closure;
     const donor_cell = b8_donor.?.upvalues[0];
     _ = scope.protectValueAssumeCapacity(.{ .Closure = b8_donor.? });
-    try std.testing.expect(b8AgeIsYoung(donor_cell.gc_age));
+    try std.testing.expect(b8AgeIsYoung(donor_cell.gc.age));
 
     lua_pushcfunction(L, b8CfUpvaluejoinOom);
     b8_base = vm.alloc;
@@ -4769,7 +4769,7 @@ test "c api lua_upvaluejoin OOM throws LUA_ERRMEM before the re-point" {
     // The re-point did NOT happen: the owner still observes its own cell,
     // the donor cell is unpromoted, nothing was published.
     try std.testing.expect(b8_owner.?.upvalues[0] == owner_cell);
-    try std.testing.expect(b8AgeIsYoung(donor_cell.gc_age));
+    try std.testing.expect(b8AgeIsYoung(donor_cell.gc.age));
     try std.testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
     try std.testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
 

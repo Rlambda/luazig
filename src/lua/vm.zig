@@ -549,6 +549,53 @@ pub const GcAge = enum(u8) {
     }
 };
 
+/// PUC `tt`-analog: the dispatch key that identifies a GC object's type
+/// from its header alone (PUC gco2t/gco2cl/... switch over `tt`). It is
+/// the only way to downcast a `*GcHeader` from a heterogeneous chain.
+pub const GcTag = enum(u8) {
+    table,
+    closure,
+    thread,
+    string,
+    cell,
+    userdata,
+};
+
+/// PUC `CommonHeader` analog (lobject.h:301). extern so the prefix
+/// next@0 / marked@8 / age@9 / tag@10 is byte-identical across every GC
+/// type: the five plain types (Table/Closure/Thread/Cell/Userdata) embed
+/// `gc: GcHeader` and downcast via `@fieldParentPtr("gc", ...)`; LuaString
+/// (extern, 48 B pinned) declares the same prefix bytes directly, with
+/// srkind@11 and hash(u32)@12 occupying the tail of the block instead of
+/// `index`.
+///
+/// `next` is the lifetime link: shadow of the dense `gc_objects` registry,
+/// maintained as the linked form of that list (identical order) — link at
+/// commit, unlink at unregister. It becomes the canonical allgc chain.
+///
+/// `index` is the object's position in `Vm.gc_objects` — the dense-side
+/// O(1) handle for sweep/rollback removals. It lives inside the header
+/// block (the bytes were padding) and is deleted together with the dense
+/// registry. A LuaString's bytes 12..16 are its hash: `index` must never
+/// be accessed through a string's header (use the typed paths in
+/// `gcPtr`/`gcUnregisterObject*`).
+pub const GcHeader = extern struct {
+    next: ?*GcHeader = null,
+    marked: u8 = 0,
+    age: GcAge = .new,
+    tag: GcTag,
+    index: u32 = 0,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(GcHeader) == 16);
+    std.debug.assert(@offsetOf(GcHeader, "next") == 0);
+    std.debug.assert(@offsetOf(GcHeader, "marked") == 8);
+    std.debug.assert(@offsetOf(GcHeader, "age") == 9);
+    std.debug.assert(@offsetOf(GcHeader, "tag") == 10);
+    std.debug.assert(@offsetOf(GcHeader, "index") == 12);
+}
+
 /// PUC lgc.h:79-86 — per-object mark bits stored in `gc_marked`.
 ///
 /// Bit layout (matching PUC's `marked` byte, bits 3-7; bits 0-2 are
@@ -630,6 +677,15 @@ const MASKCOLORS: u8 = BLACKBIT | WHITEBITS;
 /// together with `gc_gray_overflow`. Cleared only by the overflow drain,
 /// after the successful append that records the queue entry.
 const MISSEDGRAYBIT: u8 = 1 << 7;
+
+/// Transient young-sweep marker (bit 0 of `marked`): a dead young STRING
+/// whose registry removal + free is deferred to the post-sweep compaction
+/// pass (`gcSweepDropPendingStrings`). Strings carry no dense index, so
+/// their O(1) inline removal is unavailable; batching keeps the young
+/// sweep linear. Set only between the young-sweep death check and the
+/// compaction pass, on objects already dead this cycle — invisible to
+/// every color helper (they mask bits 3..7) and to the free path.
+const STRING_PENDING_SWEEP: u8 = 1 << 0;
 
 /// PUC lgc.h:213-215: GC stop bits for `g->gcstp`.
 const GCSTPUSR: u8 = 1; // stopped by user
@@ -746,15 +802,10 @@ pub const Cell = struct {
     pub const stack_closed: u32 = std.math.maxInt(u32);
 
     value: Value,
-    gc_age: GcAge = .new,
-    /// Position of this object in `Vm.gc_objects` (P16.16 C1: u32 — the
-    /// list can never exceed 4G entries). Used by `gcUnregisterObject`
-    /// for O(1) swapRemove; corrupted by the swap, never reused for
-    /// ordering.
-    gc_index: u32 = 0,
-    /// PUC `marked` byte — tri-color mark bits (WHITE0/WHITE1/BLACK/
-    /// FINALIZED/TEST). See constants above.
-    gc_marked: u8 = 0,
+    /// GC header (marked/age/tag/index + the allgc lifetime link).
+    /// `gc.index` is this object's position in `Vm.gc_objects` — the
+    /// O(1) handle for `gcUnregisterObject*` removals.
+    gc: GcHeader = .{ .tag = .cell },
     /// When != stack_closed, this is an "open" upvalue that directly
     /// references the owning thread's bytecode stack at this index
     /// (P16.16 C5: u32 + sentinel instead of ?usize — 8B → 4B; slot 0 is
@@ -868,11 +919,10 @@ pub const Lx = struct {
 };
 
 pub const Closure = struct {
-    gc_age: GcAge = .new,
-    /// Position in `Vm.gc_objects` (P16.16 C1: u32; see Cell.gc_index).
-    gc_index: u32 = 0,
-    /// PUC `marked` byte — tri-color mark bits. See constants above.
-    gc_marked: u8 = 0,
+    /// GC header (marked/age/tag/index + the allgc lifetime link).
+    /// `gc.index` is this object's position in `Vm.gc_objects` — the
+    /// O(1) handle for `gcUnregisterObject*` removals.
+    gc: GcHeader = .{ .tag = .closure },
     proto: ?*const bc.Proto = null, // bytecode proto (non-null for bytecode closures)
     /// The proto tree's lifetime (P16.10b Task 4/5) is DERIVED from the
     /// proto (P16.16 C2/T4.2): every bytecode closure RETAINS the tree
@@ -2386,11 +2436,10 @@ const ResumeResult = union(enum) {
 };
 
 pub const Thread = struct {
-    gc_age: GcAge = .new,
-    /// Position in `Vm.gc_objects` (P16.16 C1: u32; see Cell.gc_index).
-    gc_index: u32 = 0,
-    /// PUC `marked` byte — tri-color mark bits. See constants above.
-    gc_marked: u8 = 0,
+    /// GC header (marked/age/tag/index + the allgc lifetime link).
+    /// `gc.index` is this object's position in `Vm.gc_objects` — the
+    /// O(1) handle for `gcUnregisterObject*` removals.
+    gc: GcHeader = .{ .tag = .thread },
     /// PUC traversethread's `gclist` link (lgc.c:699-700: every traversal
     /// `linkgclist(th, g->grayagain)` for the atomic-phase final traversal).
     /// Intrusive singly-linked list through Thread objects — the zero-alloc
@@ -2882,19 +2931,20 @@ const TestcContState = struct {
 // Header layout (explicit extern struct — build-mode-stable, no hidden
 // tags; identical offsets in Debug and ReleaseFast):
 //
-//   0..8   hash: u64                (every kind)
-//   8..12  gc_index: u32            (every kind)
-//   12     srkind: i8               (every kind; PUC `shrlen`)
-//   13     gc_marked: u8            (every kind)
-//   14     gc_age: u8               (every kind)
-//   15     padding (never read)
+//   0..8   next: ?*GcHeader        (every kind; GC lifetime link —
+//                                   byte-compatible with GcHeader prefix)
+//   8      marked: u8              (every kind)
+//   9      age: GcAge (u8)         (every kind)
+//   10     tag: GcTag (u8)         (every kind; always .string)
+//   11     srkind: i8              (every kind; PUC `shrlen`)
+//   12..16 hash: u32               (every kind; PUC-parity — l_uint32)
 //   16..24 u: hnext (short) | lnglen (all long kinds)
 //   24..32 c: extptr (external kinds) | inline content start (short)
 //   32..40 falloc (LSTRMEM only)
 //   40..48 ud     (LSTRMEM only)
 //
-// GC metadata (hash/index/srkind/marked/age) lives within the first 16 B,
-// so it is inside EVERY variant's allocation, including the 32-B
+// GC metadata (next/marked/age/tag/srkind/hash) lives within the first
+// 16 B, so it is inside EVERY variant's allocation, including the 32-B
 // truncated LSTRFIX header. Short content may extend past offset 48 (a
 // 40-byte short allocates 65 B), exactly like PUC's flexible `contents`.
 // P16.20 T1 invariant: CallFrame layout is build-mode-stable (extern
@@ -2910,19 +2960,26 @@ comptime {
 }
 
 pub const LuaString = extern struct {
-    hash: u64,
-    /// Position in `Vm.gc_objects` (P16.16 C1: u32).
-    gc_index: u32 = 0,
+    /// GC lifetime link — the shared intrusive-chain field. Bytes 0..16
+    /// are the byte-compatible GcHeader prefix (next/marked/age/tag);
+    /// srkind and the u32 hash occupy the block's tail where plain types
+    /// carry their dense index, so a LuaString has NO registry index.
+    next: ?*GcHeader = null,
+    /// PUC `marked` byte — tri-color mark bits. See constants above.
+    marked: u8 = 0,
+    age: GcAge = .new,
+    tag: GcTag = .string,
     /// PUC `shrlen` — ONE byte that is BOTH the kind discriminator and,
     /// for shorts, the length (lobject.h: `>= 0` short of that length;
     /// `LSTRREG -1`, `LSTRFIX -2`, `LSTRMEM -3`). This is the byte
     /// `luaS_sizelngstr` switches on; keeping the PUC encoding makes the
     /// allocated-size rule a single switch on this field.
     srkind: i8,
-    /// PUC `marked` byte — tri-color mark bits. See constants above.
-    gc_marked: u8 = 0,
-    gc_age: GcAge = .new,
-    _pad: u8 = 0,
+    /// PUC-parity hash width (`l_uint32` in lobject.h): truncated from
+    /// the seeded Wyhash at creation. Bucket selection only ever reads
+    /// low bits (pow2 masks), so the truncation is deterministic and the
+    /// intern identity is unchanged.
+    hash: u32,
     /// Offset 16: PUC unions `u.sh.hnext` (short chain link) with
     /// `u.lng.lnglen` (long length) — mutually exclusive by kind. The two
     /// arms are 8 B each; no hidden tag (extern union, P16.17 T1 lesson).
@@ -3051,7 +3108,20 @@ comptime {
     std.debug.assert(LuaString.long_content_offset == 32);
     std.debug.assert(LuaString.lstrfix_header_size == 32);
     // GC metadata must be inside every variant's allocation prefix.
-    std.debug.assert(@offsetOf(LuaString, "gc_age") < LuaString.short_content_offset);
+    std.debug.assert(@offsetOf(LuaString, "age") < LuaString.short_content_offset);
+    // Shared GC-header prefix (GcHeader): a *LuaString reinterpreted as
+    // *GcHeader must read next/marked/age/tag correctly. Bytes 11..16
+    // differ (srkind/hash vs a plain type's dense index).
+    std.debug.assert(@offsetOf(LuaString, "next") == @offsetOf(GcHeader, "next"));
+    std.debug.assert(@offsetOf(LuaString, "marked") == @offsetOf(GcHeader, "marked"));
+    std.debug.assert(@offsetOf(LuaString, "age") == @offsetOf(GcHeader, "age"));
+    std.debug.assert(@offsetOf(LuaString, "tag") == @offsetOf(GcHeader, "tag"));
+    std.debug.assert(@offsetOf(LuaString, "hash") == 12);
+    // Pinned content offsets: u@16, c@24, falloc@32, ud@40.
+    std.debug.assert(@offsetOf(LuaString, "u") == 16);
+    std.debug.assert(@offsetOf(LuaString, "c") == 24);
+    std.debug.assert(@offsetOf(LuaString, "falloc") == 32);
+    std.debug.assert(@offsetOf(LuaString, "ud") == 40);
 }
 
 // PUC Lua's LUAI_MAXSHORTLEN (lstring.h): strings up to this many bytes are
@@ -3072,7 +3142,7 @@ pub fn luaStringEq(a: *const LuaString, b: *const LuaString) bool {
 // Exposed (`pub`) so the experimental bytecode const pool (bytecode.zig) can
 // pre-intern string constants at chunk-build time, keeping the VM consistent
 // with the main VM's interned-string model.
-pub fn createLuaString(alloc: std.mem.Allocator, raw: []const u8, hash: u64) !*LuaString {
+pub fn createLuaString(alloc: std.mem.Allocator, raw: []const u8, hash: u32) !*LuaString {
     // PUC allocates PER KIND from the moment of creation (this is the whole
     // point of sizestrshr / luaS_sizelngstr):
     //   short  -> 24 + len + 1  (content inline at offset 24)
@@ -3091,13 +3161,15 @@ pub fn createLuaString(alloc: std.mem.Allocator, raw: []const u8, hash: u64) !*L
     );
     errdefer alloc.free(buf);
     const ls: *LuaString = @ptrCast(@alignCast(buf.ptr));
+    // Field-wise init of the GC prefix: next is unlinked until the
+    // registration commit links the header into the allgc chain.
+    ls.next = null;
+    ls.marked = 0;
+    ls.age = .new;
+    ls.tag = .string;
     ls.hash = hash;
     // PUC shrlen: the byte IS the short length (or the long-kind code).
     ls.srkind = if (is_short) @intCast(raw.len) else LuaString.lstrreg;
-    ls.gc_index = 0;
-    ls.gc_marked = 0;
-    ls.gc_age = .new;
-    ls._pad = 0;
     // Variant slot: shorts carry the intern-chain link (null until
     // StringTable.insert links them); regular longs carry the length.
     // Inline content at `content_off` in the SAME allocation (the c-union
@@ -3164,15 +3236,15 @@ pub const StringTable = struct {
     buckets: []?*LuaString = &.{},
     nuse: u32 = 0,
 
-    fn bucketOf(self: *const StringTable, hash: u64) usize {
+    fn bucketOf(self: *const StringTable, hash: u32) usize {
         // PUC lmod(h, size): power-of-two modulo (size is always a pow2).
-        return @intCast(hash & (self.buckets.len - 1));
+        return @as(usize, hash) & (self.buckets.len - 1);
     }
 
     /// PUC internshrstr lookup: walk the bucket chain comparing length and
     /// content (lstring.c:219-229). The cached hash need not be compared —
     /// content equality implies hash equality.
-    pub fn lookup(self: *const StringTable, raw: []const u8, hash: u64) ?*LuaString {
+    pub fn lookup(self: *const StringTable, raw: []const u8, hash: u32) ?*LuaString {
         if (self.buckets.len == 0) return null;
         var cur = self.buckets[self.bucketOf(hash)];
         while (cur) |ls| : (cur = ls.nextShort()) {
@@ -3197,7 +3269,7 @@ pub const StringTable = struct {
             var p = head;
             while (p) |ls| {
                 const save_next = ls.nextShort();
-                const b: usize = @intCast(ls.hash & (new_size - 1));
+                const b: usize = @as(usize, ls.hash) & (new_size - 1);
                 ls.setNextShort(fresh[b]);
                 fresh[b] = ls;
                 p = save_next;
@@ -3320,7 +3392,7 @@ pub const StringIntern = struct {
         defer to_remove.deinit(temp_alloc);
         var it = self.table.iterator();
         while (it.next()) |entry| {
-            if (gcIsDead(entry.value_ptr.*.gc_marked, current_white)) {
+            if (gcIsDead(entry.value_ptr.*.marked, current_white)) {
                 try to_remove.append(temp_alloc, entry.value_ptr.*);
             }
         }
@@ -3333,7 +3405,7 @@ pub const StringIntern = struct {
     // Return the canonical *LuaString for `raw`, creating+inserting it if absent.
     // `hash` is the caller-computed content hash (random-seeded at the Vm level),
     // cached on the LuaString so the Table's own hash and all later uses are free.
-    fn intern(self: *StringIntern, alloc: std.mem.Allocator, raw: []const u8, hash: u64) !*LuaString {
+    fn intern(self: *StringIntern, alloc: std.mem.Allocator, raw: []const u8, hash: u32) !*LuaString {
         if (self.table.get(raw)) |existing| return existing;
         const ls = try createLuaString(alloc, raw, hash);
         try self.table.put(alloc, ls.bytes(), ls);
@@ -3349,7 +3421,7 @@ pub const StringIntern = struct {
 
 test "LuaString stores inline bytes and cached hash" {
     const alloc = std.testing.allocator;
-    const h: u64 = 0xdeadbeef;
+    const h: u32 = 0xdeadbeef;
     const ls = try createLuaString(alloc, "hello", h);
     defer destroyLuaString(alloc, ls);
     try std.testing.expectEqual(@as(usize, 5), ls.len());
@@ -3357,10 +3429,10 @@ test "LuaString stores inline bytes and cached hash" {
     try std.testing.expectEqualStrings("hello", ls.bytes());
 }
 
-fn hashStringForTest(s: []const u8) u64 {
+fn hashStringForTest(s: []const u8) u32 {
     var h = std.hash.Wyhash.init(0);
     h.update(s);
-    return h.final();
+    return @truncate(h.final());
 }
 
 test "StringIntern dedups equal content to same pointer" {
@@ -3553,7 +3625,7 @@ test "StringTable: grow OOM keeps old table, still interns, identity holds" {
     for (0..129) |i| {
         var content: [6]u8 = undefined;
         _ = std.fmt.bufPrint(&content, "s{d:0>5}", .{i}) catch unreachable;
-        strings[i] = try createLuaString(alloc, &content, (i + 1) *% 0x9E3779B97F4A7C15);
+        strings[i] = try createLuaString(alloc, &content, @truncate((i + 1) *% 0x9E3779B97F4A7C15));
     }
     for (strings[0..128]) |s| try t.insert(fa, s);
     try std.testing.expectEqual(@as(usize, 128), t.buckets.len);
@@ -3602,7 +3674,7 @@ test "string keys survive rehash+GC; equal longs compare by content" {
     const long_content = "long-key-with-equal-content-AAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     // Equal content MUST hash identically (VM invariant: per-VM seed), or
     // content-equality lookups would land in different buckets.
-    const long_hash = std.hash.Wyhash.hash(vm.hash_seed, long_content);
+    const long_hash: u32 = @truncate(std.hash.Wyhash.hash(vm.hash_seed, long_content));
     const la = try createLuaString(vm.alloc, long_content, long_hash);
     const lb = try createLuaString(vm.alloc, long_content, long_hash);
     defer destroyLuaString(vm.alloc, la);
@@ -3870,12 +3942,10 @@ pub const Value = union(enum) {
     }
 };
 
-/// Tagged union of all GC-managed heap objects. Replaces PUC's intrusive
-/// `GCObject.next` singly-linked `allgc` list with a type-safe Zig union.
-/// Each variant is a pointer to a struct with flat `gc_marked: u8`,
-/// `gc_age: GcAge`, `gc_index: usize` fields (no layout change needed).
-/// Generic GC code accesses these through `gcPtr()` which returns a
-/// struct of pointers to the flat fields.
+/// Tagged union of all GC-managed heap objects. The uniform GC header is
+/// reached through `gcHeaderOf` (embedded `gc` field for the five plain
+/// types, byte-compatible prefix for LuaString) and generic GC code reads
+/// marked/age via `gcPtr()`.
 pub const GcObject = union(enum) {
     table: *Table,
     closure: *Closure,
@@ -3910,29 +3980,58 @@ pub const GcObject = union(enum) {
     }
 };
 
-/// Pointer bundle to the flat GC header fields on any GC-managed struct.
-/// Returned by `gcPtr()`, used by generic GC code to access marked/age/index
+/// Pointer bundle to the GC header fields on any GC-managed object.
+/// Returned by `gcPtr()`, used by generic GC code to access marked/age
 /// without switching on GcObject variant at every access site.
+/// `index` is null for strings: their header bytes 12..16 are the hash,
+/// and only the typed dense-removal paths may locate a string's registry
+/// position (sweep cursor / deferred compaction / linear rollback scan).
 /// P16.16 C1: no `seq` here — only the finalizable types (Table, Userdata)
 /// carry a creation sequence, accessed via `gcFinalizableSeq` at the single
 /// finalizer-sort site. No fake uniform field for non-finalizable types.
 const GcPtr = struct {
     marked: *u8,
     age: *GcAge,
-    index: *u32,
+    index: ?*u32,
 };
 
-/// Access the flat GC header fields (gc_marked, gc_age, gc_index) of any
-/// GC-managed object through its GcObject tag. This is the single dispatch
-/// point that lets generic GC code operate on all types uniformly.
+/// Access the GC header fields (marked, age, index) of any GC-managed
+/// object through its GcObject tag. This is the single dispatch point
+/// that lets generic GC code operate on all types uniformly.
 fn gcPtr(obj: GcObject) GcPtr {
     return switch (obj) {
-        .table => |t| .{ .marked = &t.gc_marked, .age = &t.gc_age, .index = &t.gc_index },
-        .closure => |c| .{ .marked = &c.gc_marked, .age = &c.gc_age, .index = &c.gc_index },
-        .thread => |t| .{ .marked = &t.gc_marked, .age = &t.gc_age, .index = &t.gc_index },
-        .string => |s| .{ .marked = &s.gc_marked, .age = &s.gc_age, .index = &s.gc_index },
-        .cell => |c| .{ .marked = &c.gc_marked, .age = &c.gc_age, .index = &c.gc_index },
-        .userdata => |u| .{ .marked = &u.gc_marked, .age = &u.gc_age, .index = &u.gc_index },
+        .table => |t| .{ .marked = &t.gc.marked, .age = &t.gc.age, .index = &t.gc.index },
+        .closure => |c| .{ .marked = &c.gc.marked, .age = &c.gc.age, .index = &c.gc.index },
+        .thread => |t| .{ .marked = &t.gc.marked, .age = &t.gc.age, .index = &t.gc.index },
+        .string => |s| .{ .marked = &s.marked, .age = &s.age, .index = null },
+        .cell => |c| .{ .marked = &c.gc.marked, .age = &c.gc.age, .index = &c.gc.index },
+        .userdata => |u| .{ .marked = &u.gc.marked, .age = &u.gc.age, .index = &u.gc.index },
+    };
+}
+
+/// obj -> header (PUC obj2gco): the embedded `gc` field for the five
+/// plain types; a byte-compatible prefix reinterpretation for LuaString.
+fn gcHeaderOf(obj: GcObject) *GcHeader {
+    return switch (obj) {
+        .table => |t| &t.gc,
+        .closure => |c| &c.gc,
+        .thread => |t| &t.gc,
+        .string => |s| @ptrCast(s),
+        .cell => |c| &c.gc,
+        .userdata => |u| &u.gc,
+    };
+}
+
+/// header -> obj (PUC gco2t/gco2cl/... dispatch over `tt`): the single
+/// downcast point from a heterogeneous chain node to the typed object.
+fn gcFromHeader(h: *GcHeader) GcObject {
+    return switch (h.tag) {
+        .table => .{ .table = @fieldParentPtr("gc", h) },
+        .closure => .{ .closure = @fieldParentPtr("gc", h) },
+        .thread => .{ .thread = @fieldParentPtr("gc", h) },
+        .string => .{ .string = @ptrCast(h) },
+        .cell => .{ .cell = @fieldParentPtr("gc", h) },
+        .userdata => .{ .userdata = @fieldParentPtr("gc", h) },
     };
 }
 
@@ -4029,17 +4128,16 @@ const TableFlags = struct {
 };
 
 pub const Table = struct {
-    gc_age: GcAge = .new,
-    /// Position in `Vm.gc_objects` (P16.16 C1: u32; see Cell.gc_index).
-    gc_index: u32 = 0,
+    /// GC header (marked/age/tag/index + the allgc lifetime link).
+    /// `gc.index` is this object's position in `Vm.gc_objects` — the
+    /// O(1) handle for `gcUnregisterObject*` removals.
+    gc: GcHeader = .{ .tag = .table },
     /// Monotonic creation sequence — never changes after allocation.
     /// Used for PUC LIFO finalization order (independent of gc_index,
     /// which is corrupted by swapRemove during sweep). P16.16 C1: only
     /// the finalizable types (Table, Userdata) carry a sequence — the
     /// finalizer sort never sees other types, so they carry no seq field.
     gc_seq: u64 = 0,
-    /// PUC `marked` byte — tri-color mark bits. See constants above.
-    gc_marked: u8 = 0,
 
     // Array part: keys 1..n stored contiguously. A nil entry inside the array
     // is a "hole"; next()/length skip holes by scanning. Mirrors PUC Lua's
@@ -4104,10 +4202,10 @@ pub const Table = struct {
 /// preserving PUC semantics: per-object metatable, `nuvalue` user values
 /// (1-indexed from Lua via `debug.setiuservalue`), and `len` raw bytes.
 pub const Userdata = struct {
-    gc_marked: u8 = 0,
-    gc_age: GcAge = .new,
-    /// Position in `Vm.gc_objects` (P16.16 C1: u32; see Cell.gc_index).
-    gc_index: u32 = 0,
+    /// GC header (marked/age/tag/index + the allgc lifetime link).
+    /// `gc.index` is this object's position in `Vm.gc_objects` — the
+    /// O(1) handle for `gcUnregisterObject*` removals.
+    gc: GcHeader = .{ .tag = .userdata },
     /// Monotonic creation sequence for PUC LIFO finalization order
     /// (P16.16 C1: finalizable-types-only; see Table.gc_seq).
     gc_seq: u64 = 0,
@@ -4120,6 +4218,22 @@ pub const Userdata = struct {
     /// The testC `newuserdata` command allocates this as zero-filled.
     payload: []u8 = &.{},
 };
+
+// Uniform GC-header contract for the five plain types: each embeds
+// `gc: GcHeader` (the compiler chooses its offset — downcast goes through
+// @fieldParentPtr, so no position is pinned) and the measured sizes are
+// pinned so any layout drift fails the build in EVERY mode (the P16.17 T1
+// lesson: Debug/RF must agree).
+comptime {
+    for (.{ Table, Closure, Thread, Cell, Userdata }) |T| {
+        std.debug.assert(@TypeOf(@as(T, undefined).gc) == GcHeader);
+    }
+    std.debug.assert(@sizeOf(Table) == 88);
+    std.debug.assert(@sizeOf(Closure) == 48);
+    std.debug.assert(@sizeOf(Cell) == 48);
+    std.debug.assert(@sizeOf(Userdata) == 64);
+    std.debug.assert(@sizeOf(Thread) == 3368);
+}
 
 /// Result of compiling a text chunk through the host-selected bytecode
 /// frontend. Diagnostic slices are allocated with the supplied allocator and
@@ -4837,6 +4951,17 @@ pub const Vm = struct {
     // with zero layout change to the managed types, type-safe iteration, and
     // no pointer-juggling during sweep (`swapRemove` is O(1)).
     gc_objects: std.ArrayListUnmanaged(GcObject) = .empty,
+    /// Shadow intrusive allgc chain — the linked form of `gc_objects`
+    /// (identical order, link at commit, unlink at unregister) carried in
+    /// every object's GcHeader.next. The dense registry remains the only
+    /// owner; the chain owns nothing and exists to prove the intrusive
+    /// layout losslessly mirrors the registry (Debug checker) before the
+    /// registry is retired and the chain becomes canonical.
+    gc_allgc_head: ?*GcHeader = null,
+    /// Count of STRING_PENDING_SWEEP-marked strings accumulated by the
+    /// running young sweep — nonzero only between the death checks and
+    /// the deferred compaction pass.
+    gc_pending_string_sweep: usize = 0,
     gc_objects_snapshot_len: usize = 0,
     /// Monotonic creation counter — never decreases. Used for PUC LIFO
     /// finalization order. Unlike `gc_index` (which is corrupted by
@@ -5832,11 +5957,11 @@ pub const Vm = struct {
                     //   nw2black + luaC_barrier. The barrier's sweep arm
                     //   (lgc.c:257-260): makewhite(owner) — except the
                     //   GENMINOR sweep no-op.
-                    if (!gcIsWhite(cell.gc_marked)) {
-                        gcSetBlack(&cell.gc_marked);
+                    if (!gcIsWhite(cell.gc.marked)) {
+                        gcSetBlack(&cell.gc.marked);
                         self.gcCommitCloseBarrierCell(value, plan);
                         if (self.gc_mode != .generational or self.gc_gen_phase != .minor) {
-                            gcMakeWhite(&cell.gc_marked, self.gc_current_white);
+                            gcMakeWhite(&cell.gc.marked, self.gc_current_white);
                         }
                     }
                 },
@@ -6714,6 +6839,9 @@ pub const Vm = struct {
         for (self.gc_objects.items) |obj| {
             self.gcFreeObject(obj, .teardown);
         }
+        // Teardown destroys every registry member without per-object
+        // unregistration — the shadow chain dies with the registry.
+        self.gc_allgc_head = null;
         self.gc_objects.deinit(self.alloc);
         self.gc_young_objects.deinit(self.alloc);
         self.gc_gray.deinit(self.alloc);
@@ -10283,7 +10411,7 @@ pub const Vm = struct {
         // P16.16 C1: gc_index is u32 — the list can never exceed 4G entries
         // (each entry is 16B, so 4G entries = 64GB of list alone).
         std.debug.assert(self.gc_objects.items.len <= std.math.maxInt(u32));
-        p.index.* = @intCast(self.gc_objects.items.len);
+        if (p.index) |i| i.* = @intCast(self.gc_objects.items.len);
         // Creation sequence: only the finalizable types (Table/Userdata)
         // carry one — it exists solely for the finalizer LIFO sort, which
         // never sees another type (see gcFinalizableSeq).
@@ -10293,6 +10421,16 @@ pub const Vm = struct {
                 self.gc_creation_seq += 1;
             },
             else => {},
+        }
+        // Shadow allgc link at the tail: the chain is the linked form of
+        // gc_objects (same order), so the new object links after the
+        // previous last entry (or becomes the head of an empty chain).
+        const hdr = gcHeaderOf(obj);
+        hdr.next = null;
+        if (self.gc_objects.items.len == 0) {
+            self.gc_allgc_head = hdr;
+        } else {
+            gcHeaderOf(self.gc_objects.items[self.gc_objects.items.len - 1]).next = hdr;
         }
         self.gc_objects.appendAssumeCapacity(obj);
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
@@ -10312,26 +10450,57 @@ pub const Vm = struct {
         self.gcRegisterCommit(obj);
     }
 
-    /// Sweep-time unregistration. swapRemoves from gc_objects using the
-    /// object's `gc_index` field for O(1) lookup. Does NOT remove from
-    /// gc_young_objects (filtered during sweep via snapshot/write-pointer).
+    /// Sweep-time unregistration. swapRemoves from gc_objects at the given
+    /// dense position. Does NOT remove from gc_young_objects (filtered
+    /// during sweep via snapshot/write-pointer).
     ///
-    /// PUC lgc.c `sweepstep` unlinks from `allgc`; our `swapRemove` is the
-    /// equivalent, with the swapped object's `gc_index` updated to maintain
-    /// the position invariant.
+    /// `dense_index` is the caller's known registry position: the
+    /// incremental sweep passes its cursor, the young sweep and rollbacks
+    /// pass the stored `gc.index` (strings carry no index — see
+    /// gcUnregisterObjectRollback for their paths).
     ///
     /// P16.49-review CONTRACT: this variant may ONLY be called by the
     /// sweeps themselves (gcSweepYoungObjects / gcSweepOne) — the caller
     /// owns the secondary-registry compaction that drops the entry.
-    fn gcUnregisterObjectSweep(self: *Vm, obj: GcObject) void {
-        const p = gcPtr(obj);
-        const index = p.index.*;
-        std.debug.assert(index < self.gc_objects.items.len and
-            std.meta.eql(self.gc_objects.items[index], obj));
-        _ = self.gc_objects.swapRemove(index);
-        if (index < self.gc_objects.items.len) {
-            const swapped = self.gc_objects.items[index];
-            gcPtr(swapped).index.* = index;
+    fn gcUnregisterObjectSweep(self: *Vm, obj: GcObject, dense_index: usize) void {
+        std.debug.assert(dense_index < self.gc_objects.items.len and
+            std.meta.eql(self.gc_objects.items[dense_index], obj));
+        // Shadow unlink: the removed node's slot is the predecessor's
+        // `next` field (or the chain head); `succ` is dense_index+1's node.
+        // PUC lgc.c sweepstep: the same one-slot write `*p = curr->next`.
+        const hdr = gcHeaderOf(obj);
+        const succ = hdr.next;
+        if (dense_index == 0) {
+            self.gc_allgc_head = succ;
+        } else {
+            gcHeaderOf(self.gc_objects.items[dense_index - 1]).next = succ;
+        }
+        _ = self.gc_objects.swapRemove(dense_index);
+        if (dense_index < self.gc_objects.items.len) {
+            // The former tail moved into dense_index: re-link it between
+            // the predecessor and its new successor (the post-swap entry
+            // at dense_index+1 — never the pre-captured `succ`, which is
+            // the swapped node itself when it was the removed node's
+            // immediate successor, the second-to-last position).
+            const swapped = self.gc_objects.items[dense_index];
+            const shdr = gcHeaderOf(swapped);
+            shdr.next = if (dense_index + 1 < self.gc_objects.items.len)
+                gcHeaderOf(self.gc_objects.items[dense_index + 1])
+            else
+                null;
+            if (dense_index == 0) {
+                self.gc_allgc_head = shdr;
+            } else {
+                gcHeaderOf(self.gc_objects.items[dense_index - 1]).next = shdr;
+            }
+            if (gcPtr(swapped).index) |i| i.* = @intCast(dense_index);
+        }
+        // The moved node vacated the tail slot: the node now at the end of
+        // the registry still links to it from its commit-time tail-link.
+        // The chain is the linked form of the registry, so the last entry's
+        // next is always null — restore that invariant here.
+        if (self.gc_objects.items.len > 0) {
+            gcHeaderOf(self.gc_objects.items[self.gc_objects.items.len - 1]).next = null;
         }
     }
 
@@ -10354,7 +10523,16 @@ pub const Vm = struct {
     /// scan is acceptable: this path runs at most once per failed
     /// constructor (OOM), never on a hot loop.
     pub fn gcUnregisterObjectRollback(self: *Vm, obj: GcObject) void {
-        self.gcUnregisterObjectSweep(obj);
+        // Dense position: plain types carry it in the header; strings have
+        // no index (their header bytes 12..16 are the hash), and a string
+        // rollback is a cold manual-teardown path — linear identity search.
+        const dense_index: usize = if (gcPtr(obj).index) |i| i.* else blk: {
+            for (self.gc_objects.items, 0..) |item, di| {
+                if (std.meta.eql(item, obj)) break :blk di;
+            }
+            unreachable; // rollback of an unregistered object
+        };
+        self.gcUnregisterObjectSweep(obj, dense_index);
         removeGcObjectFromList(&self.gc_young_objects, obj);
         // Purge the object from every GC carry-over work list. The failing
         // allocation that triggered this rollback ran an EMERGENCY full GC
@@ -23631,7 +23809,10 @@ pub const Vm = struct {
         const seed = self.hash_seed;
         var h = std.hash.Wyhash.init(seed);
         h.update(raw);
-        const hash = h.final();
+        // PUC-parity hash width: luaS_hash returns l_uint32 — truncate once,
+        // at creation; every later consumer (intern buckets, table keys,
+        // T.hash) reads the stored u32.
+        const hash: u32 = @truncate(h.final());
         // Short strings are interned (dedup => pointer identity) in the
         // string_intern table, matching PUC's internshrstr.
         // Long strings are allocated fresh every time, matching PUC
@@ -23641,8 +23822,8 @@ pub const Vm = struct {
                 // PUC internshrstr (lstring.c:223-226): a dead-but-not-yet-
                 // swept string found in the table is resurrected (changewhite)
                 // instead of re-creating an identical copy.
-                if (gcIsDead(existing.gc_marked, self.gc_current_white)) {
-                    existing.gc_marked = self.gc_current_white & WHITEBITS;
+                if (gcIsDead(existing.marked, self.gc_current_white)) {
+                    existing.marked = self.gc_current_white & WHITEBITS;
                 }
                 return existing;
             }
@@ -23657,8 +23838,8 @@ pub const Vm = struct {
             try self.gcPrepareRegister(1);
             const ls = try createLuaString(self.alloc, raw, hash);
             // PUC luaC_newobj: set current=white on all new objects.
-            ls.gc_marked = self.gc_current_white & WHITEBITS;
-            if (self.gc_mode == .generational and self.gc_gen_phase == .minor) ls.gc_age = .old;
+            ls.marked = self.gc_current_white & WHITEBITS;
+            if (self.gc_mode == .generational and self.gc_gen_phase == .minor) ls.age = .old;
             try self.string_intern.insert(self.alloc, ls);
             errdefer {
                 self.string_intern.removeString(ls);
@@ -23769,15 +23950,15 @@ pub const Vm = struct {
         // Field-wise init: every write below stays within `header_size`
         // (for LSTRFIX that is 32 B — writing the whole struct would run
         // past the allocation).
-        ls.hash = h.final();
+        ls.next = null;
+        ls.marked = 0;
+        ls.age = .new;
+        ls.tag = .string;
+        ls.hash = @truncate(h.final());
         ls.u.lnglen = len;
         // External strings are always "long" (PUC VLNGSTR), never interned.
         // PUC shrlen encodes the kind: LSTRFIX -2 / LSTRMEM -3.
         ls.srkind = if (fixed) LuaString.lstrfix else LuaString.lstrmem;
-        ls.gc_marked = 0;
-        ls.gc_age = .new;
-        ls.gc_index = 0;
-        ls._pad = 0;
         ls.c = .{ .extptr = content }; // offset 24 — inside the LSTRFIX prefix
         if (!fixed) {
             // LSTRMEM only: falloc/ud live past the LSTRFIX prefix (offsets
@@ -23867,7 +24048,7 @@ pub const Vm = struct {
     pub fn internLiteral(self: *Vm, raw: []const u8) std.mem.Allocator.Error!*LuaString {
         if (raw.len <= lua_string_max_short_len) return self.internStr(raw);
         if (self.long_literals.table.get(raw)) |existing| {
-            if (self.gc_mode == .generational and self.gc_gen_phase == .minor) existing.gc_age = .old;
+            if (self.gc_mode == .generational and self.gc_gen_phase == .minor) existing.age = .old;
             return existing;
         }
         // PUC luaS_hash uses g->seed — fixed for the state's lifetime and
@@ -23879,8 +24060,8 @@ pub const Vm = struct {
         const seed = self.hash_seed;
         var h = std.hash.Wyhash.init(seed);
         h.update(raw);
-        const ls = try createLuaString(self.alloc, raw, h.final());
-        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) ls.gc_age = .old;
+        const ls = try createLuaString(self.alloc, raw, @truncate(h.final()));
+        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) ls.age = .old;
         // P16.50: a failed store put must not leak the created string
         // (it is in no registry until the put succeeds — the long-literals
         // store is its ONLY lifetime owner, mirroring string_intern for
@@ -28723,11 +28904,11 @@ pub const Vm = struct {
 
     fn gcValueAge(value: Value) ?GcAge {
         return switch (value) {
-            .Table => |object| object.gc_age,
-            .Closure => |object| object.gc_age,
-            .Thread => |object| object.gc_age,
-            .String => |object| object.gc_age,
-            .Userdata => |object| object.gc_age,
+            .Table => |object| object.gc.age,
+            .Closure => |object| object.gc.age,
+            .Thread => |object| object.gc.age,
+            .String => |object| object.age,
+            .Userdata => |object| object.gc.age,
             else => null,
         };
     }
@@ -28745,23 +28926,23 @@ pub const Vm = struct {
     /// is needed: FINALIZEDBIT means "registered for finalization" (set at
     /// registration, cleared after finalizer runs), NOT "finalizer-reachable".
     fn gcTableDead(self: *const Vm, table: *Table) bool {
-        if (self.gc_minor_cycle and !gcMinorCandidate(table.gc_age)) return false;
-        return !gcIsBlack(table.gc_marked);
+        if (self.gc_minor_cycle and !gcMinorCandidate(table.gc.age)) return false;
+        return !gcIsBlack(table.gc.marked);
     }
 
     fn gcClosureDead(self: *const Vm, closure: *Closure) bool {
-        if (self.gc_minor_cycle and !gcMinorCandidate(closure.gc_age)) return false;
-        return !gcIsBlack(closure.gc_marked);
+        if (self.gc_minor_cycle and !gcMinorCandidate(closure.gc.age)) return false;
+        return !gcIsBlack(closure.gc.marked);
     }
 
     fn gcThreadDead(self: *const Vm, thread: *Thread) bool {
-        if (self.gc_minor_cycle and !gcMinorCandidate(thread.gc_age)) return false;
-        return !gcIsBlack(thread.gc_marked);
+        if (self.gc_minor_cycle and !gcMinorCandidate(thread.gc.age)) return false;
+        return !gcIsBlack(thread.gc.marked);
     }
 
     fn gcUserdataDead(self: *const Vm, ud: *Userdata) bool {
-        if (self.gc_minor_cycle and !gcMinorCandidate(ud.gc_age)) return false;
-        return !gcIsBlack(ud.gc_marked);
+        if (self.gc_minor_cycle and !gcMinorCandidate(ud.gc.age)) return false;
+        return !gcIsBlack(ud.gc.marked);
     }
 
     /// PUC lgc.c `reallymarkobject`: mark a Value's referent gray (or black
@@ -28802,12 +28983,14 @@ pub const Vm = struct {
         // pointer to read gc_index, providing no real dangling-pointer
         // protection) has been replaced with a stats-gated assert.
         if (self.stats.enabled) {
-            const idx = p.index.*;
-            if (idx >= self.gc_objects.items.len or
-                !std.meta.eql(self.gc_objects.items[idx], obj))
-            {
-                self.stats.gc_stale_queue_scan += 1;
-                std.debug.assert(false);
+            if (p.index) |ip| {
+                const idx = ip.*;
+                if (idx >= self.gc_objects.items.len or
+                    !std.meta.eql(self.gc_objects.items[idx], obj))
+                {
+                    self.stats.gc_stale_queue_scan += 1;
+                    std.debug.assert(false);
+                }
             }
         }
         // Precise-liveness safety skip — removed. The skip
@@ -28958,12 +29141,12 @@ pub const Vm = struct {
             // Open: PUC reallymarkobject — only process white cells.
             // Non-white open upvalues are already visited (gray from a
             // previous mark). Their values are re-marked by gcRemarkUpvals.
-            if (!gcIsWhite(cell.gc_marked)) return;
+            if (!gcIsWhite(cell.gc.marked)) return;
             if (self.gc_gen_phase == .major) {
                 self.gc_gen_marked_kb += @as(f64, @floatFromInt(gcObjectBytes(.{ .cell = cell }))) / 1024.0;
             }
             // PUC lgc.c:349-350: set2gray(uv) — open upvalues kept gray.
-            gcSetGray(&cell.gc_marked);
+            gcSetGray(&cell.gc.marked);
             // PUC lgc.c:353: markvalue(g, uv->v.p) — mark stack-backed value.
             if (assume) {
                 self.gcMarkValueImpl(cell.get(self), true);
@@ -28978,12 +29161,12 @@ pub const Vm = struct {
             // their value must be marked here regardless of the cell's color.
             // Color transition and accounting only for white cells (PUC
             // reallymarkobject: set2black + GCmarked += objsize).
-            if (gcIsWhite(cell.gc_marked)) {
+            if (gcIsWhite(cell.gc.marked)) {
                 if (self.gc_gen_phase == .major) {
                     self.gc_gen_marked_kb += @as(f64, @floatFromInt(gcObjectBytes(.{ .cell = cell }))) / 1024.0;
                 }
                 // PUC lgc.c:352: set2black(uv) — closed upvalues visited here.
-                gcSetBlack(&cell.gc_marked);
+                gcSetBlack(&cell.gc.marked);
                 self.gc_mark_epoch += 1;
             }
             // PUC lgc.c:353: markvalue(g, uv->v.p) — mark inline value.
@@ -29018,12 +29201,12 @@ pub const Vm = struct {
     fn markCellForceAssume(self: *Vm, cell: *Cell) void {
         if (cell.isOpen()) {
             // PUC lgc.c:349-350: set2gray(uv) — open upvalues kept gray.
-            gcSetGray(&cell.gc_marked);
+            gcSetGray(&cell.gc.marked);
             // PUC lgc.c:353: markvalue(g, uv->v.p) — mark stack-backed value.
             self.gcMarkValueImpl(cell.get(self), true);
         } else {
             // PUC lgc.c:352: set2black(uv) — closed upvalues visited here.
-            gcSetBlack(&cell.gc_marked);
+            gcSetBlack(&cell.gc.marked);
             // PUC lgc.c:353: markvalue(g, uv->v.p) — mark inline value.
             self.gcMarkValueImpl(cell.value, true);
         }
@@ -29210,7 +29393,7 @@ pub const Vm = struct {
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             // PUC luaC_barrier_ sweep arm: GENMINOR sweep → no-op.
             if (self.gc_state == .sweep) return .{};
-            if (owner.gc_age.isOld() and child.gc_age.isYoung()) {
+            if (owner.gc.age.isOld() and child.gc.age.isYoung()) {
                 const v = if (child.isOpen()) child.get(self) else child.value;
                 switch (v) {
                     .Table, .Closure, .Thread, .Userdata => try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), 1),
@@ -29223,7 +29406,7 @@ pub const Vm = struct {
         }
         // PUC luaC_objbarrier guard (lgc.h:241): isblack(p) && iswhite(o).
         if (self.gc_state == .pause) return .{};
-        if (!gcIsBlack(owner.gc_marked) or !gcIsWhite(child.gc_marked)) return .{};
+        if (!gcIsBlack(owner.gc.marked) or !gcIsWhite(child.gc.marked)) return .{};
         switch (self.gc_state) {
             .propagate, .atomic => {
                 // markCell(child) marks the cell's value inline — one
@@ -29246,7 +29429,7 @@ pub const Vm = struct {
     /// list slot the plan touches (appendAssumeCapacity contract).
     pub fn gcCommitForwardBarrierCell(self: *Vm, owner: *Closure, child: *Cell, plan: CellJoinPlan) void {
         if (plan.gen_promote) {
-            child.gc_age = .old0;
+            child.gc.age = .old0;
             self.gc_old1.appendAssumeCapacity(.{ .cell = child });
             self.gcQueueScanCellAssume(child);
             return;
@@ -29259,7 +29442,7 @@ pub const Vm = struct {
             // PUC luaC_barrier_ sweep arm (lgc.c:261): makewhite(g, o) —
             // the OWNER closure, so the next cycle re-traverses it and
             // marks the joined cell properly.
-            gcMakeWhite(&owner.gc_marked, self.gc_current_white);
+            gcMakeWhite(&owner.gc.marked, self.gc_current_white);
         }
     }
 
@@ -29296,7 +29479,7 @@ pub const Vm = struct {
         // Short strings are now in gc_objects (registered via gcRegisterString).
         // Only long literals remain in a separate store.
         var literal_it = self.long_literals.table.iterator();
-        while (literal_it.next()) |entry| entry.value_ptr.*.gc_marked = w;
+        while (literal_it.next()) |entry| entry.value_ptr.*.marked = w;
     }
 
     /// A6: Unified `gcMakeAllOld`. Iterates `gc_objects` instead of
@@ -29356,8 +29539,8 @@ pub const Vm = struct {
         // Short strings are now in gc_objects. Only long literals separate.
         var literal_it = self.long_literals.table.iterator();
         while (literal_it.next()) |entry| {
-            entry.value_ptr.*.gc_age = .old;
-            entry.value_ptr.*.gc_marked = (entry.value_ptr.*.gc_marked & ~WHITEBITS) | BLACKBIT;
+            entry.value_ptr.*.age = .old;
+            entry.value_ptr.*.marked = (entry.value_ptr.*.marked & ~WHITEBITS) | BLACKBIT;
         }
         self.gc_gen_phase = .minor;
         self.gc_gen_major_base_kb = self.gc_count_kb;
@@ -29917,7 +30100,7 @@ pub const Vm = struct {
         }
         const child = GcObject.fromValue(value) orelse return .{}; // PUC iscollectable(v)
         if (self.gc_state == .pause) return .{};
-        if (!gcIsBlack(owner.gc_marked)) return .{};
+        if (!gcIsBlack(owner.gc.marked)) return .{};
         if (!gcIsWhite(gcPtr(child).marked.*)) return .{};
         try self.gc_grayagain.ensureUnusedCapacity(self.infraAlloc(), 1);
         return .{ .active = true };
@@ -29982,7 +30165,7 @@ pub const Vm = struct {
             // the young sweep (whose allocation-freedom the pre-reserve
             // guarantees cover only for the promote paths).
             if (self.gc_state == .sweep) return .{};
-            if (cell.gc_age.isOld()) {
+            if (cell.gc.age.isOld()) {
                 if (gcValueAge(value)) |age| {
                     if (age.isYoung()) {
                         // PUC luaC_barrier_ (lgc.c:246-260): reallymarkobject
@@ -30006,7 +30189,7 @@ pub const Vm = struct {
             return .{};
         }
         if (self.gc_state == .pause) return .{};
-        if (!gcIsBlack(cell.gc_marked)) return .{};
+        if (!gcIsBlack(cell.gc.marked)) return .{};
         // PUC luaC_barrier_: if keepinvariant (propagate/atomic), mark the
         // value to restore the invariant. In sweep phase, make the owner
         // white instead — the value will be visited in the next collection.
@@ -30046,7 +30229,7 @@ pub const Vm = struct {
         }
         if (plan.inc_make_white) {
             // Make owner white (PUC luaC_makewhite in sweep phase).
-            gcMakeWhite(&cell.gc_marked, self.gc_current_white);
+            gcMakeWhite(&cell.gc.marked, self.gc_current_white);
         }
     }
 
@@ -30090,7 +30273,7 @@ pub const Vm = struct {
     pub fn gcPlanCloseBarrierCell(self: *Vm, cell: *Cell, value: Value) CellClosePlan {
         // PUC luaF_closeupval (lfunc.c:205): the barrier runs only when the
         // cell is NOT white (nw2black(uv) precedes luaC_barrier).
-        if (gcIsWhite(cell.gc_marked)) return .{};
+        if (gcIsWhite(cell.gc.marked)) return .{};
         // PUC luaC_barrier (lgc.h): iscollectable(v) — primitive values
         // (Int/Num/Bool/Nil/...) have no heap object to mark.
         const child = GcObject.fromValue(value) orelse return .{};
@@ -30108,7 +30291,7 @@ pub const Vm = struct {
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             if (self.gc_state == .sweep) return .{};
             var plan = CellClosePlan{ .gen_mark = true };
-            if (cell.gc_age.isOld()) plan.gen_promote = true;
+            if (cell.gc.age.isOld()) plan.gen_promote = true;
             return plan;
         }
         // Incremental (PUC luaC_barrier_ keepinvariant: gcstate <= atomic):
@@ -30249,8 +30432,8 @@ pub const Vm = struct {
             //   nw2black(uv); luaC_barrier(L, uv, slot); }
             // Closed upvalues cannot be gray — fix color to black, then
             // commit the forward barrier on the copied value.
-            if (!gcIsWhite(cell.gc_marked)) {
-                gcSetBlack(&cell.gc_marked);
+            if (!gcIsWhite(cell.gc.marked)) {
+                gcSetBlack(&cell.gc.marked);
                 self.gcCommitCloseBarrierCell(value, plan);
             }
             slot.* = null;
@@ -30368,7 +30551,7 @@ pub const Vm = struct {
 
             if (gen_minor and self.gc_state != .sweep) {
                 // PUC luaC_barrier_ guard: isblack(p) && iswhite(o).
-                if (gcIsBlack(gcPtr(owner).marked.*) and gcIsWhite(m.gc_marked)) {
+                if (gcIsBlack(gcPtr(owner).marked.*) and gcIsWhite(m.gc.marked)) {
                     plan.barrier.gen_mark = true;
                     // gcQueueScanObjectAssume queues the Table child — exactly
                     // one gc_gray slot.
@@ -30380,7 +30563,7 @@ pub const Vm = struct {
                 }
             } else if (!gen_minor) {
                 if (self.gc_state != .pause and
-                    gcIsBlack(gcPtr(owner).marked.*) and gcIsWhite(m.gc_marked))
+                    gcIsBlack(gcPtr(owner).marked.*) and gcIsWhite(m.gc.marked))
                 {
                     switch (self.gc_state) {
                         .propagate, .atomic => {
@@ -30412,7 +30595,7 @@ pub const Vm = struct {
                 // without traversal would strand its children white).
                 self.gcQueueScanObjectAssume(.{ .table = m });
                 if (plan.barrier.gen_promote) {
-                    m.gc_age = .old0;
+                    m.gc.age = .old0;
                     self.gc_old1.appendAssumeCapacity(.{ .table = m });
                 }
             }
@@ -30581,7 +30764,7 @@ pub const Vm = struct {
             // (lgc.c:268): old table + young child → remember the table for
             // the next minor cycle. The child stays white (weak value
             // pruning needs it unmarked).
-            if (table.gc_age.isOld()) {
+            if (table.gc.age.isOld()) {
                 const child_age = gcPtr(child).age.*;
                 if (child_age.isYoung()) {
                     const plan = try self.gcPrepareRememberObject(.{ .table = table });
@@ -30592,10 +30775,10 @@ pub const Vm = struct {
         }
         // Incremental mode: PUC luaC_objbarrierback — isblack(p) && iswhite(o).
         if (self.gc_state == .pause) return;
-        if (!gcIsBlack(table.gc_marked)) return;
+        if (!gcIsBlack(table.gc.marked)) return;
         if (!gcIsWhite(gcPtr(child).marked.*)) return;
         try self.gc_grayagain.ensureUnusedCapacity(self.infraAlloc(), 1);
-        gcSetGray(&table.gc_marked);
+        gcSetGray(&table.gc.marked);
         self.gc_grayagain.appendAssumeCapacity(.{ .table = table });
     }
 
@@ -30660,7 +30843,7 @@ pub const Vm = struct {
         // cycle. Do NOT mark the child — weak value pruning needs it to
         // stay white.
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
-            if (table.gc_age.isOld()) {
+            if (table.gc.age.isOld()) {
                 const child_age = gcPtr(child).age.*;
                 if (child_age.isYoung()) {
                     return self.gcPrepareRememberObject(.{ .table = table });
@@ -30672,7 +30855,7 @@ pub const Vm = struct {
         // The value is NOT marked — this keeps newly created objects white and
         // allows weak value pruning (same as gcWriteBarrierTable).
         if (self.gc_state == .pause) return .{};
-        if (!gcIsBlack(table.gc_marked)) return .{};
+        if (!gcIsBlack(table.gc.marked)) return .{};
         if (!gcIsWhite(gcPtr(child).marked.*)) return .{};
         try self.gc_grayagain.ensureUnusedCapacity(self.infraAlloc(), 1);
         return .{ .active = true };
@@ -30832,12 +31015,16 @@ pub const Vm = struct {
             // has been replaced with a stats-gated assert.
             if (self.stats.enabled) {
                 const p = gcPtr(obj);
-                const idx = p.index.*;
-                if (idx >= self.gc_objects.items.len or
-                    !std.meta.eql(self.gc_objects.items[idx], obj))
-                {
-                    self.stats.gc_stale_grayagain += 1;
-                    std.debug.assert(false);
+                // Strings carry no dense index (header bytes 12..16 are the
+                // hash) — the membership assert runs for plain types only.
+                if (p.index) |ip| {
+                    const idx = ip.*;
+                    if (idx >= self.gc_objects.items.len or
+                        !std.meta.eql(self.gc_objects.items[idx], obj))
+                    {
+                        self.stats.gc_stale_grayagain += 1;
+                        std.debug.assert(false);
+                    }
                 }
             }
             switch (obj) {
@@ -30930,7 +31117,7 @@ pub const Vm = struct {
         for (self.gc_objects.items) |obj| {
             switch (obj) {
                 .cell => |cell| {
-                    if (cell.isOpen() and !gcIsWhite(cell.gc_marked)) {
+                    if (cell.isOpen() and !gcIsWhite(cell.gc.marked)) {
                         // PUC lgc.c:420-421: lua_assert(upisopen(uv) && isgray(uv));
                         // markvalue(g, uv->v.p) — re-mark the stack-backed value.
                         // Does NOT set black — PUC keeps open upvalues gray.
@@ -31216,6 +31403,7 @@ pub const Vm = struct {
                 // propagate cycle directly) — check the same no-unrecorded-
                 // work invariant before gcMakeAllOld repaints everything.
                 std.debug.assert(!self.gc_gray_overflow and !self.gc_old1_overflow);
+                self.gcAllgcAssertSync();
                 // Set all surviving objects to OLD+BLACK, return to gen mode
                 self.gc_mode = .generational;
                 try self.gcMakeAllOld();
@@ -31412,8 +31600,16 @@ pub const Vm = struct {
                 p.age.* == .old0 or
                 (gcCanFinalize(obj) and self.gcHasFinalizer(obj));
             if (!alive) {
+                if (obj == .string) {
+                    // Strings carry no dense index: defer registry removal
+                    // and free to one compaction pass after the loop (keeps
+                    // the sweep linear instead of per-string dense scans).
+                    obj.string.marked |= STRING_PENDING_SWEEP;
+                    self.gc_pending_string_sweep += 1;
+                    continue;
+                }
                 // Remove from gc_objects first (swapRemove), then free memory.
-                self.gcUnregisterObjectSweep(obj);
+                self.gcUnregisterObjectSweep(obj, gcPtr(obj).index.?.*);
                 self.gcFreeObject(obj, .sweep);
                 continue;
             }
@@ -31438,6 +31634,59 @@ pub const Vm = struct {
             write += 1;
         }
         self.gc_young_objects.items.len = write;
+        self.gcSweepDropPendingStrings();
+        self.gcAllgcAssertSync();
+    }
+
+    /// Deferred young-sweep string removal (see STRING_PENDING_SWEEP):
+    /// order-preserving compaction of the registry dropping the marked
+    /// dead strings. Dense positions of the surviving plain objects are
+    /// renumbered inline; the shadow chain is rebuilt in the same pass
+    /// (same order, fewer nodes). O(registry size), once per young sweep.
+    fn gcSweepDropPendingStrings(self: *Vm) void {
+        if (self.gc_pending_string_sweep == 0) return;
+        self.gc_pending_string_sweep = 0;
+        var write: usize = 0;
+        var slot: *?*GcHeader = &self.gc_allgc_head;
+        for (self.gc_objects.items) |obj| {
+            if (obj == .string and (obj.string.marked & STRING_PENDING_SWEEP) != 0) {
+                self.gcFreeObject(obj, .sweep);
+                continue;
+            }
+            if (gcPtr(obj).index) |i| i.* = @intCast(write);
+            self.gc_objects.items[write] = obj;
+            slot.* = gcHeaderOf(obj);
+            slot = &gcHeaderOf(obj).next;
+            write += 1;
+        }
+        self.gc_objects.items.len = write;
+        slot.* = null;
+    }
+
+    /// Debug-only lossless-sync checker for the shadow allgc chain: walks
+    /// the chain against the dense registry and proves — member by member,
+    /// in order — that the chain is exactly the linked form of
+    /// `gc_objects`: equal lengths, no duplicates, no losses, and every
+    /// header's tag dispatch (`gcFromHeader`, the @fieldParentPtr downcast)
+    /// resolves back to the registry entry at the same position. Runs at
+    /// cycle boundaries (every finished incremental cycle and every young
+    /// sweep) on the whole battery in Debug; compiled to a no-op in
+    /// non-Debug builds.
+    fn gcAllgcAssertSync(self: *Vm) void {
+        if (@import("builtin").mode != .Debug) return;
+        const items = self.gc_objects.items;
+        var cur = self.gc_allgc_head;
+        var i: usize = 0;
+        while (cur) |hdr| : ({
+            cur = hdr.next;
+            i += 1;
+        }) {
+            if (i >= items.len) @panic("gc allgc shadow: chain longer than registry");
+            const expect = items[i];
+            if (hdr != gcHeaderOf(expect)) @panic("gc allgc shadow: chain/registry order mismatch");
+            if (!std.meta.eql(gcFromHeader(hdr), expect)) @panic("gc allgc shadow: header tag downcast mismatch");
+        }
+        if (i != items.len) @panic("gc allgc shadow: chain shorter than registry");
     }
 
     fn gcCorrectOld1(self: *Vm) void {
@@ -31855,7 +32104,7 @@ pub const Vm = struct {
                 // (swapRemove moves the last element into this slot), then
                 // free its memory. We must NOT advance the cursor so the
                 // swapped-in element gets examined next iteration.
-                self.gcUnregisterObjectSweep(obj);
+                self.gcUnregisterObjectSweep(obj, self.gc_sweep_objects_cursor);
                 self.gcFreeObject(obj, .sweep);
             } else {
                 // Object is alive (or has a finalizer to run) — reset its
@@ -32039,10 +32288,10 @@ pub const Vm = struct {
                 if (@import("builtin").mode == .Debug) {
                     if (stdio.activeEnviron().containsConstant("LUAZIG_CELL_SWEEP_DEBUG")) {
                         const color: []const u8 =
-                            if ((c.gc_marked & BLACKBIT) != 0) "black" else if ((c.gc_marked & WHITEBITS) != 0) "white" else "gray";
+                            if ((c.gc.marked & BLACKBIT) != 0) "black" else if ((c.gc.marked & WHITEBITS) != 0) "white" else "gray";
                         std.debug.print(
                             "cell sweep: open={} color={s} age={s} gc_index={}\n",
-                            .{ c.isOpen(), color, @tagName(c.gc_age), c.gc_index },
+                            .{ c.isOpen(), color, @tagName(c.gc.age), c.gc.index },
                         );
                     }
                 }
@@ -32083,6 +32332,7 @@ pub const Vm = struct {
         // the next cycle's drains retry.
         std.debug.assert(!self.gc_gray_overflow and !self.gc_old1_overflow);
         self.gc_state = .pause;
+        self.gcAllgcAssertSync();
         // Reset sweep cursor for the next cycle.
         self.gc_sweep_objects_cursor = 0;
         self.gc_gray.clearRetainingCapacity();
@@ -32162,14 +32412,14 @@ pub const Vm = struct {
         // them via luaC_fix in luaT_init only for tmname[] entries. Our
         // metafield_names are pinned here the same way.
         for (self.tm_names) |s| {
-            if (gcIsWhite(s.gc_marked)) {
-                gcSetBlack(&s.gc_marked);
+            if (gcIsWhite(s.marked)) {
+                gcSetBlack(&s.marked);
                 self.gc_mark_epoch += 1;
             }
         }
         for (self.metafield_names) |s| {
-            if (gcIsWhite(s.gc_marked)) {
-                gcSetBlack(&s.gc_marked);
+            if (gcIsWhite(s.marked)) {
+                gcSetBlack(&s.marked);
                 self.gc_mark_epoch += 1;
             }
         }
@@ -32195,8 +32445,8 @@ pub const Vm = struct {
         var lsc_it = self.long_string_cache.iterator();
         while (lsc_it.next()) |entry| {
             const s = entry.value_ptr.*;
-            if (gcIsWhite(s.gc_marked)) {
-                gcSetBlack(&s.gc_marked);
+            if (gcIsWhite(s.marked)) {
+                gcSetBlack(&s.marked);
                 self.gc_mark_epoch += 1;
             }
         }
@@ -32249,12 +32499,12 @@ pub const Vm = struct {
         // gmatch iterator state: holds *LuaString pointers for the subject string
         // and pattern, kept alive between iterator calls.
         if (self.gmatch_state) |gs| {
-            if (gcIsWhite(gs.s.gc_marked)) {
-                gcSetBlack(&gs.s.gc_marked);
+            if (gcIsWhite(gs.s.marked)) {
+                gcSetBlack(&gs.s.marked);
                 self.gc_mark_epoch += 1;
             }
-            if (gcIsWhite(gs.p.gc_marked)) {
-                gcSetBlack(&gs.p.gc_marked);
+            if (gcIsWhite(gs.p.marked)) {
+                gcSetBlack(&gs.p.marked);
                 self.gc_mark_epoch += 1;
             }
         }
@@ -32288,7 +32538,7 @@ pub const Vm = struct {
             const tbl = entry.key_ptr.*;
             // Only tables that survived marking (not white) can have live
             // entries worth scanning for dead keys.
-            if (gcIsWhite(tbl.gc_marked)) continue;
+            if (gcIsWhite(tbl.gc.marked)) continue;
             // Check if this is a weak-key table — dead collectable keys in
             // weak-key tables must be deadened even with non-Nil values,
             // because the key can be collected while the value survives.
@@ -32332,15 +32582,15 @@ pub const Vm = struct {
             // CUT2: source_backing is now compact (inline pin + extra).
             // Mark the inline pin and any extra pins.
             if (owner.source_backing.pin) |s| {
-                if (gcIsWhite(s.gc_marked)) {
-                    gcSetBlack(&s.gc_marked);
+                if (gcIsWhite(s.marked)) {
+                    gcSetBlack(&s.marked);
                     self.gc_mark_epoch += 1;
                 }
             }
             if (owner.source_backing.extra) |e| {
                 for (e.pinned.items) |s| {
-                    if (gcIsWhite(s.gc_marked)) {
-                        gcSetBlack(&s.gc_marked);
+                    if (gcIsWhite(s.marked)) {
+                        gcSetBlack(&s.marked);
                         self.gc_mark_epoch += 1;
                     }
                 }
@@ -32355,8 +32605,8 @@ pub const Vm = struct {
         if (proto.k.len > 0) {
             for (proto.k) |k| {
                 if (k == .str) {
-                    if (gcIsWhite(k.str.gc_marked)) {
-                        gcSetBlack(&k.str.gc_marked);
+                    if (gcIsWhite(k.str.marked)) {
+                        gcSetBlack(&k.str.marked);
                         self.gc_mark_epoch += 1;
                     }
                 }
@@ -32364,8 +32614,8 @@ pub const Vm = struct {
         } else {
             for (proto.resolved_values) |v| {
                 if (v == .String) {
-                    if (gcIsWhite(v.String.gc_marked)) {
-                        gcSetBlack(&v.String.gc_marked);
+                    if (gcIsWhite(v.String.marked)) {
+                        gcSetBlack(&v.String.marked);
                         self.gc_mark_epoch += 1;
                     }
                 }
@@ -32880,13 +33130,13 @@ pub const Vm = struct {
         // PUC propagatemark ends with gray2black(o): the object is fully
         // traversed, all children marked, so it becomes black.
         switch (cur) {
-            .table => |t| gcSetBlack(&t.gc_marked),
-            .closure => |c| gcSetBlack(&c.gc_marked),
-            .thread => |th| gcSetBlack(&th.gc_marked),
+            .table => |t| gcSetBlack(&t.gc.marked),
+            .closure => |c| gcSetBlack(&c.gc.marked),
+            .thread => |th| gcSetBlack(&th.gc.marked),
             .string => {}, // already set black in gcQueueScanObject
             // Cell never reaches here (gcPropagateOne .cell arm is unreachable).
             .cell => {},
-            .userdata => |u| gcSetBlack(&u.gc_marked),
+            .userdata => |u| gcSetBlack(&u.gc.marked),
         }
         // Reverted: do NOT add threads to grayagain after traversal
         return true;
@@ -32921,15 +33171,15 @@ pub const Vm = struct {
                     const key_marked = switch (node.key_tt) {
                         .table => blk: {
                             const table = node.key_val.table;
-                            break :blk (self.gc_minor_cycle and !gcMinorCandidate(table.gc_age)) or !gcIsWhite(table.gc_marked);
+                            break :blk (self.gc_minor_cycle and !gcMinorCandidate(table.gc.age)) or !gcIsWhite(table.gc.marked);
                         },
                         .closure => blk: {
                             const closure = node.key_val.closure;
-                            break :blk (self.gc_minor_cycle and !gcMinorCandidate(closure.gc_age)) or !gcIsWhite(closure.gc_marked);
+                            break :blk (self.gc_minor_cycle and !gcMinorCandidate(closure.gc.age)) or !gcIsWhite(closure.gc.marked);
                         },
                         .thread => blk: {
                             const thread = node.key_val.thread;
-                            break :blk (self.gc_minor_cycle and !gcMinorCandidate(thread.gc_age)) or !gcIsWhite(thread.gc_marked);
+                            break :blk (self.gc_minor_cycle and !gcMinorCandidate(thread.gc.age)) or !gcIsWhite(thread.gc.marked);
                         },
                         else => true,
                     };
@@ -47996,11 +48246,11 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("T.gccolor expects an object", .{});
         const marked: u8 = switch (args[0]) {
-            .Table => |o| o.gc_marked,
-            .Closure => |o| o.gc_marked,
-            .Thread => |o| o.gc_marked,
-            .String => |o| o.gc_marked,
-            .Userdata => |o| o.gc_marked,
+            .Table => |o| o.gc.marked,
+            .Closure => |o| o.gc.marked,
+            .Thread => |o| o.gc.marked,
+            .String => |o| o.marked,
+            .Userdata => |o| o.gc.marked,
             else => {
                 const istr = try self.internStr("no collectable");
                 outs[0] = .{ .String = istr };
@@ -48217,7 +48467,7 @@ pub const Vm = struct {
         // One-arg form: string hash.
         switch (args[0]) {
             .String => |s| {
-                if (outs.len > 0) outs[0] = .{ .Int = @bitCast(s.hash) };
+                if (outs.len > 0) outs[0] = .{ .Int = @intCast(s.hash) };
             },
             else => {
                 return self.fail("bad argument #1 to 'T.hash' (string expected)", .{});
@@ -53021,7 +53271,7 @@ test "vm: incremental GC advances real phases and preserves barrier writes" {
                 break;
             }
         }
-        if (!gcIsWhite(holder.gc_marked) and !holder_is_gray) break;
+        if (!gcIsWhite(holder.gc.marked) and !holder_is_gray) break;
         _ = try vm.gcAdvance(1, false);
     }
 
@@ -53064,34 +53314,34 @@ test "vm: generational GC ages barriers and nursery scope match PUC" {
     }
 
     try vm.gcEnterGenerational();
-    try testing.expectEqual(GcAge.old, holder.gc_age);
-    try testing.expectEqual(GcAge.old, old_heap.gc_age);
+    try testing.expectEqual(GcAge.old, holder.gc.age);
+    try testing.expectEqual(GcAge.old, old_heap.gc.age);
 
     const child = try vm.allocTableNoGc();
     const grandchild = try vm.allocTableNoGc();
     try vm.rawSet(child, .{ .String = try vm.internStr("nested") }, .{ .Table = grandchild });
     try vm.rawSet(holder, .{ .String = try vm.internStr("child") }, .{ .Table = child });
 
-    try testing.expectEqual(GcAge.touched1, holder.gc_age);
-    try testing.expectEqual(GcAge.new, child.gc_age);
-    try testing.expectEqual(GcAge.new, grandchild.gc_age);
+    try testing.expectEqual(GcAge.touched1, holder.gc.age);
+    try testing.expectEqual(GcAge.new, child.gc.age);
+    try testing.expectEqual(GcAge.new, grandchild.gc.age);
 
     try vm.gcMinorCollection();
-    try testing.expectEqual(GcAge.touched2, holder.gc_age);
-    try testing.expectEqual(GcAge.survival, child.gc_age);
-    try testing.expectEqual(GcAge.survival, grandchild.gc_age);
+    try testing.expectEqual(GcAge.touched2, holder.gc.age);
+    try testing.expectEqual(GcAge.survival, child.gc.age);
+    try testing.expectEqual(GcAge.survival, grandchild.gc.age);
     // Old threads and the remembered holder are visited, but the 512-table
     // old graph itself is outside the nursery/remembered sets.
     try testing.expect(vm.gc_gen_last_minor_old_visited < 32);
 
     try vm.gcMinorCollection();
-    try testing.expectEqual(GcAge.old, holder.gc_age);
-    try testing.expectEqual(GcAge.old1, child.gc_age);
-    try testing.expectEqual(GcAge.old1, grandchild.gc_age);
+    try testing.expectEqual(GcAge.old, holder.gc.age);
+    try testing.expectEqual(GcAge.old1, child.gc.age);
+    try testing.expectEqual(GcAge.old1, grandchild.gc.age);
 
     try vm.gcMinorCollection();
-    try testing.expectEqual(GcAge.old, child.gc_age);
-    try testing.expectEqual(GcAge.old, grandchild.gc_age);
+    try testing.expectEqual(GcAge.old, child.gc.age);
+    try testing.expectEqual(GcAge.old, grandchild.gc.age);
     const kept = vm.rawGet(holder, .{ .String = try vm.internStr("child") });
     try testing.expect(kept == .Table and kept.Table == child);
 }
@@ -54604,11 +54854,11 @@ test "P16.49-review-2: OLD0 promotion charges added-old exactly once (PUC sweepg
         defer scope.close();
         _ = scope.protectValueAssumeCapacity(.{ .Table = owner });
         try vm.gcEnterGenerational();
-        try testing.expect(owner.gc_age.isOld());
+        try testing.expect(owner.gc.age.isOld());
     }
     // Young child (registered in gen-minor → age .new, in young list).
     const child = try vm.allocTable(null);
-    try testing.expect(child.gc_age == .new);
+    try testing.expect(child.gc.age == .new);
 
     var scope = try vm.openRootScope(3, 0);
     defer scope.close();
@@ -54618,7 +54868,7 @@ test "P16.49-review-2: OLD0 promotion charges added-old exactly once (PUC sweepg
     // Real forward barrier: old owner stores young child.
     const added_old_before_barrier = vm.gc_gen_added_old_kb;
     try vm.gcForwardBarrierValue(.{ .Table = owner }, .{ .Table = child });
-    try testing.expect(child.gc_age == .old0);
+    try testing.expect(child.gc.age == .old0);
     // Barrier LINKS into gc_old1 (exactly once) but does NOT charge:
     var in_old1: usize = 0;
     for (vm.gc_old1.items) |o| {
@@ -54632,7 +54882,7 @@ test "P16.49-review-2: OLD0 promotion charges added-old exactly once (PUC sweepg
     const expected_charge = @as(f64, @floatFromInt(gcObjectBytes(.{ .table = child }))) / 1024.0;
     const before = vm.gc_gen_added_old_kb;
     try vm.gcMinorCollection();
-    try testing.expect(child.gc_age == .old1);
+    try testing.expect(child.gc.age == .old1);
     try testing.expectApproxEqAbs(expected_charge, vm.gc_gen_added_old_kb - before, 1e-9);
     in_old1 = 0;
     for (vm.gc_old1.items) |o| {
@@ -54645,7 +54895,7 @@ test "P16.49-review-2: OLD0 promotion charges added-old exactly once (PUC sweepg
     const before2 = vm.gc_gen_added_old_kb;
     try vm.gcMinorCollection();
     try testing.expectEqual(before2, vm.gc_gen_added_old_kb);
-    try testing.expect(child.gc_age == .old);
+    try testing.expect(child.gc.age == .old);
     in_old1 = 0;
     for (vm.gc_old1.items) |o| {
         if (o == .table and o.table == child) in_old1 += 1;
@@ -54660,7 +54910,7 @@ test "P16.49-review-2: OLD0 promotion charges added-old exactly once (PUC sweepg
     const child2 = try vm.allocTable(null);
     _ = scope.protectValueAssumeCapacity(.{ .Table = child2 });
     try vm.gcForwardBarrierValue(.{ .Table = owner }, .{ .Table = child2 });
-    try testing.expect(child2.gc_age == .old0);
+    try testing.expect(child2.gc.age == .old0);
     vm.gc_gen_major_base_kb = 10.0;
     // Mirror the checkminormajor limit: limit = base * pct(gcparams[2]);
     // query the same helper the runtime uses (Vm method scope).
@@ -54669,7 +54919,7 @@ test "P16.49-review-2: OLD0 promotion charges added-old exactly once (PUC sweepg
     // Make added-old sit exactly one child2-charge below the limit.
     vm.gc_gen_added_old_kb = 10.0 * pct - expected_charge2;
     try vm.gcMinorCollection();
-    try testing.expect(child2.gc_age == .old1);
+    try testing.expect(child2.gc.age == .old1);
     try testing.expect(vm.gc_gen_phase == .major);
 }
 
@@ -54753,19 +55003,19 @@ test "P16.49-review-2: generational closureFromProto rollback keeps every regist
 fn gcCheckSecondaryRegistryInvariants(vm: *Vm) bool {
     for (vm.gc_young_objects.items) |obj| {
         const p = gcPtr(obj);
-        const i = p.index.*;
+        const i = (p.index orelse continue).*; // strings carry no dense index
         if (i >= vm.gc_objects.items.len) return false;
         if (!std.meta.eql(vm.gc_objects.items[i], obj)) return false;
     }
     for (vm.gc_old1.items) |obj| {
         const p = gcPtr(obj);
-        const i = p.index.*;
+        const i = (p.index orelse continue).*; // strings carry no dense index
         if (i >= vm.gc_objects.items.len) return false;
         if (!std.meta.eql(vm.gc_objects.items[i], obj)) return false;
     }
     for (vm.gc_gen_threads.items) |th| {
         const p = gcPtr(.{ .thread = th });
-        const i = p.index.*;
+        const i = (p.index orelse continue).*; // strings carry no dense index
         if (i >= vm.gc_objects.items.len) return false;
         if (!std.meta.eql(vm.gc_objects.items[i], .{ .thread = th })) return false;
     }
@@ -54914,16 +55164,16 @@ const P50Snapshot = struct {
 
 /// internStr's exact hash (std.hash.Wyhash over the VM-wide hash_seed) so
 /// the tests can query the intern table the same way internStr does.
-fn p50InternHash(vm: *Vm, raw: []const u8) u64 {
+fn p50InternHash(vm: *Vm, raw: []const u8) u32 {
     var h = std.hash.Wyhash.init(vm.hash_seed);
     h.update(raw);
-    return h.final();
+    return @truncate(h.final());
 }
 
 /// The object's gc_index resolves back to itself in gc_objects.
 fn p50IsRegistered(vm: *Vm, obj: GcObject) bool {
     const p = gcPtr(obj);
-    const i = p.index.*;
+    const i = (p.index orelse return true).*; // strings carry no dense index
     return i < vm.gc_objects.items.len and std.meta.eql(vm.gc_objects.items[i], obj);
 }
 
@@ -55403,13 +55653,13 @@ test "P16.50: internStr OOM transactionality (short miss, long, dead-old re-inte
     // would never observe the .sweep window.)
     _ = try vm_c.gcAdvance(std.math.maxInt(usize), true);
     try testing.expect(vm_c.gc_state == .sweep);
-    try testing.expect(gcIsDead(ls.gc_marked, vm_c.gc_current_white));
+    try testing.expect(gcIsDead(ls.marked, vm_c.gc_current_white));
 
     const snap_dead = try P50Snapshot.take(&vm_c, testing.allocator);
     defer snap_dead.deinit(testing.allocator);
     const ls2 = try vm_c.internStr(raw_c);
     try testing.expectEqual(ls, ls2); // same pointer — resurrected, not duplicated
-    try testing.expect(!gcIsDead(ls.gc_marked, vm_c.gc_current_white));
+    try testing.expect(!gcIsDead(ls.marked, vm_c.gc_current_white));
     // The resurrect path is registry-silent: lookup hit + mark flip only —
     // no allocation, no registration, no counter or count drift.
     try snap_dead.assertRestored(&vm_c);
@@ -56378,7 +56628,7 @@ test "P16.50-review T1: opClosure mixed-upvalue OOM matrix (production dispatch)
             const cell_y = cl.upvalues[1]; // capture before the teardown frees the array
             try testing.expect(p50IsRegistered(&vm, .{ .closure = cl }));
             try testing.expect(p50InYoung(&vm, .{ .closure = cl }));
-            try testing.expectEqual(GcAge.old0, cl.gc_age); // the barrier promoted it
+            try testing.expectEqual(GcAge.old0, cl.gc.age); // the barrier promoted it
             try testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
             try testing.expectEqual(@as(usize, 1), vm.gc_old1.items.len);
             try testing.expect(cell_c.value == .Closure); // cell.set committed
@@ -56542,14 +56792,14 @@ test "P16.50-review-8 1.1: joined Cell survives an incremental propagate cycle" 
     // Drain until the owner is black and out of the gray list. The donor
     // is unreachable and stays white.
     while (true) {
-        const black = gcIsBlack(fx.owner.gc_marked);
+        const black = gcIsBlack(fx.owner.gc.marked);
         const in_gray = p50r8Count(vm.gc_gray.items, .{ .closure = fx.owner }) != 0;
         if (black and !in_gray) break;
         const more = try vm.gcPropagateOne();
         try testing.expect(more);
     }
-    try testing.expect(gcIsBlack(fx.owner.gc_marked));
-    try testing.expect(gcIsWhite(fx.donor_cell.gc_marked));
+    try testing.expect(gcIsBlack(fx.owner.gc.marked));
+    try testing.expect(gcIsWhite(fx.donor_cell.gc.marked));
 
     // Join: reserve → re-point → commit (the builtinDebugUpvaluejoin order).
     const plan = try vm.gcPrepareForwardBarrierCell(fx.owner, fx.donor_cell);
@@ -56558,7 +56808,7 @@ test "P16.50-review-8 1.1: joined Cell survives an incremental propagate cycle" 
     vm.gcCommitForwardBarrierCell(fx.owner, fx.donor_cell, plan);
 
     // The §1.1 fix: the barrier marked the CELL itself, not just its value.
-    try testing.expect(gcIsBlack(fx.donor_cell.gc_marked));
+    try testing.expect(gcIsBlack(fx.donor_cell.gc.marked));
 
     // Finish the cycle (atomic + sweep). The joined cell and its table are
     // reachable ONLY through the owner: the old code (barrier on the VALUE
@@ -56588,15 +56838,15 @@ test "P16.50-review-8 1.1: joined Cell survives at the atomic boundary" {
     // gc_state — the builtinTestcGcstate "enteratomic" idiom).
     while (try vm.gcPropagateOne()) {}
     try testing.expect(vm.gc_state == .propagate);
-    try testing.expect(gcIsBlack(fx.owner.gc_marked));
-    try testing.expect(gcIsWhite(fx.donor_cell.gc_marked));
+    try testing.expect(gcIsBlack(fx.owner.gc.marked));
+    try testing.expect(gcIsWhite(fx.donor_cell.gc.marked));
     vm.gc_state = .atomic;
 
     const plan = try vm.gcPrepareForwardBarrierCell(fx.owner, fx.donor_cell);
     try testing.expect(plan.inc_mark);
     @constCast(fx.owner.upvalues)[0] = fx.donor_cell;
     vm.gcCommitForwardBarrierCell(fx.owner, fx.donor_cell, plan);
-    try testing.expect(gcIsBlack(fx.donor_cell.gc_marked));
+    try testing.expect(gcIsBlack(fx.donor_cell.gc.marked));
 
     while (vm.gc_state != .pause) {
         _ = try vm.gcAdvance(1, false);
@@ -56665,17 +56915,17 @@ test "P16.50-review-8 1.1: join during incremental sweep makewhites the owner" {
     // white ALIVE child: the donor cell was marked black earlier in the
     // cycle (rooted through the keeper) and the sweep makewhites it as it
     // passes.
-    try testing.expect(gcIsBlack(donor_cell.gc_marked));
-    try testing.expect(gcIsBlack(owner.gc_marked));
+    try testing.expect(gcIsBlack(donor_cell.gc.marked));
+    try testing.expect(gcIsBlack(owner.gc.marked));
 
     // Step the sweep until it makewhites the donor cell. The owner closure
     // sits LATER in gc_objects (registered after, nothing dead → no
     // swapRemove reordering) and is still black.
-    while ((donor_cell.gc_marked & WHITEBITS) != (vm.gc_current_white & WHITEBITS)) {
+    while ((donor_cell.gc.marked & WHITEBITS) != (vm.gc_current_white & WHITEBITS)) {
         const more = try vm.gcSweepOne();
         try testing.expect(more);
     }
-    try testing.expect(gcIsBlack(owner.gc_marked));
+    try testing.expect(gcIsBlack(owner.gc.marked));
 
     // Join during the sweep: PUC luaC_barrier_ (lgc.c:261) makewhites the
     // OWNER closure — no gray-list pollution mid-sweep. The sweep arm is
@@ -56692,8 +56942,8 @@ test "P16.50-review-8 1.1: join during incremental sweep makewhites the owner" {
     @constCast(owner.upvalues)[0] = donor_cell;
     vm.gcCommitForwardBarrierCell(owner, donor_cell, plan);
 
-    try testing.expect((owner.gc_marked & WHITEBITS) == (vm.gc_current_white & WHITEBITS));
-    try testing.expect((owner.gc_marked & BLACKBIT) == 0);
+    try testing.expect((owner.gc.marked & WHITEBITS) == (vm.gc_current_white & WHITEBITS));
+    try testing.expect((owner.gc.marked & BLACKBIT) == 0);
     try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
 
     // Finish the sweep: everything survives (all rooted), identity shared.
@@ -56719,12 +56969,12 @@ test "P16.50-review-8 1.2: generational join promotes the young Cell exactly onc
     const owner_pair = try p50r8MkPair(&vm);
     _ = scope.protectValueAssumeCapacity(.{ .Closure = owner_pair.owner });
     try vm.gcEnterGenerational();
-    try testing.expect(owner_pair.owner.gc_age.isOld());
-    try testing.expect(owner_pair.owner_cell.gc_age.isOld());
+    try testing.expect(owner_pair.owner.gc.age.isOld());
+    try testing.expect(owner_pair.owner_cell.gc.age.isOld());
 
     const donor_pair = try p50r8MkPair(&vm);
     _ = scope.protectValueAssumeCapacity(.{ .Closure = donor_pair.donor });
-    try testing.expect(donor_pair.donor_cell.gc_age.isYoung());
+    try testing.expect(donor_pair.donor_cell.gc.age.isYoung());
 
     const plan = try vm.gcPrepareForwardBarrierCell(owner_pair.owner, donor_pair.donor_cell);
     try testing.expect(plan.gen_promote);
@@ -56733,12 +56983,12 @@ test "P16.50-review-8 1.2: generational join promotes the young Cell exactly onc
 
     // Promotion published exactly once: age G_OLD0, one gc_old1 entry for
     // the cell, the cell black, its table queued gray exactly once.
-    try testing.expect(donor_pair.donor_cell.gc_age == .old0);
+    try testing.expect(donor_pair.donor_cell.gc.age == .old0);
     try testing.expectEqual(
         @as(usize, 1),
         p50r8Count(vm.gc_old1.items, .{ .cell = donor_pair.donor_cell }),
     );
-    try testing.expect(gcIsBlack(donor_pair.donor_cell.gc_marked));
+    try testing.expect(gcIsBlack(donor_pair.donor_cell.gc.marked));
     try testing.expectEqual(
         @as(usize, 1),
         p50r8Count(vm.gc_gray.items, .{ .table = donor_pair.donor_val }),
@@ -56763,16 +57013,16 @@ test "P16.50-review-8 1.2: generational setupvalue promotes the young value exac
     const owner_pair = try p50r8MkPair(&vm);
     _ = scope.protectValueAssumeCapacity(.{ .Closure = owner_pair.owner });
     try vm.gcEnterGenerational();
-    try testing.expect(owner_pair.owner_cell.gc_age.isOld());
+    try testing.expect(owner_pair.owner_cell.gc.age.isOld());
 
     // Fresh young table stored into the OLD closed cell (the lua_setupvalue
     // / OP_SETUPVAL shape). Unrooted: it must survive only via the barrier.
     const young = try vm.allocTableNoGc();
-    try testing.expect(young.gc_age.isYoung());
+    try testing.expect(young.gc.age.isYoung());
 
     try vm.gcStoreCellValue(owner_pair.owner_cell, .{ .Table = young });
 
-    try testing.expect(young.gc_age == .old0);
+    try testing.expect(young.gc.age == .old0);
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = young }));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = young }));
     try testing.expect(std.meta.eql(owner_pair.owner_cell.value, .{ .Table = young }));
@@ -56806,8 +57056,8 @@ test "P16.50-review-8 1.2: generational join reserve OOM leaves state byte-exact
     // capacity only, still zero items). The re-point must NOT have
     // happened and nothing may be promoted or published.
     for ([_]usize{ 0, 1 }) |edge| {
-        const cell_age = donor_pair.donor_cell.gc_age;
-        const cell_mark = donor_pair.donor_cell.gc_marked;
+        const cell_age = donor_pair.donor_cell.gc.age;
+        const cell_mark = donor_pair.donor_cell.gc.marked;
         const uv0 = owner_pair.owner.upvalues[0];
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
             .fail_index = edge,
@@ -56818,8 +57068,8 @@ test "P16.50-review-8 1.2: generational join reserve OOM leaves state byte-exact
         const plan = vm.gcPrepareForwardBarrierCell(owner_pair.owner, donor_pair.donor_cell);
         vm.alloc = saved;
         try testing.expectError(error.OutOfMemory, plan);
-        try testing.expect(donor_pair.donor_cell.gc_age == cell_age);
-        try testing.expect(donor_pair.donor_cell.gc_marked == cell_mark);
+        try testing.expect(donor_pair.donor_cell.gc.age == cell_age);
+        try testing.expect(donor_pair.donor_cell.gc.marked == cell_mark);
         try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
         try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
         try testing.expect(owner_pair.owner.upvalues[0] == uv0);
@@ -56841,7 +57091,7 @@ test "P16.50-review-8 1.2: generational join reserve OOM leaves state byte-exact
         const plan = try vm.gcPrepareForwardBarrierCell(owner_pair.owner, donor_pair.donor_cell);
         vm.alloc = saved;
         try testing.expectEqual(Vm.CellJoinPlan{}, plan);
-        try testing.expect(donor_pair.donor_cell.gc_age.isYoung());
+        try testing.expect(donor_pair.donor_cell.gc.age.isYoung());
         try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
     }
 
@@ -56852,7 +57102,7 @@ test "P16.50-review-8 1.2: generational join reserve OOM leaves state byte-exact
     try testing.expect(plan.gen_promote);
     @constCast(owner_pair.owner.upvalues)[0] = donor_pair.donor_cell;
     vm.gcCommitForwardBarrierCell(owner_pair.owner, donor_pair.donor_cell, plan);
-    try testing.expect(donor_pair.donor_cell.gc_age == .old0);
+    try testing.expect(donor_pair.donor_cell.gc.age == .old0);
     try testing.expectEqual(
         @as(usize, 1),
         p50r8Count(vm.gc_old1.items, .{ .cell = donor_pair.donor_cell }),
@@ -56883,8 +57133,8 @@ test "P16.50-review-8 1.2: generational setupvalue reserve OOM leaves state byte
     // Edge 0 (gc_gray reserve) and edge 1 (gc_old1 reserve): the store
     // must NOT have happened — the cell still holds its original table.
     for ([_]usize{ 0, 1 }) |edge| {
-        const young_age = young.gc_age;
-        const young_mark = young.gc_marked;
+        const young_age = young.gc.age;
+        const young_mark = young.gc.marked;
         const cell_value = owner_pair.owner_cell.value;
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
             .fail_index = edge,
@@ -56895,8 +57145,8 @@ test "P16.50-review-8 1.2: generational setupvalue reserve OOM leaves state byte
         const plan = vm.gcPrepareWriteBarrierCell(owner_pair.owner_cell, .{ .Table = young });
         vm.alloc = saved;
         try testing.expectError(error.OutOfMemory, plan);
-        try testing.expect(young.gc_age == young_age);
-        try testing.expect(young.gc_marked == young_mark);
+        try testing.expect(young.gc.age == young_age);
+        try testing.expect(young.gc.marked == young_mark);
         try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
         try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
         try testing.expect(std.meta.eql(owner_pair.owner_cell.value, cell_value));
@@ -56905,7 +57155,7 @@ test "P16.50-review-8 1.2: generational setupvalue reserve OOM leaves state byte
     // Reuse: the real store promotes + publishes exactly once, and a real
     // minor collection keeps the young table alive through the old cell.
     try vm.gcStoreCellValue(owner_pair.owner_cell, .{ .Table = young });
-    try testing.expect(young.gc_age == .old0);
+    try testing.expect(young.gc.age == .old0);
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = young }));
     try testing.expect(std.meta.eql(owner_pair.owner_cell.value, .{ .Table = young }));
     try vm.gcMinorCollection();
@@ -56939,20 +57189,20 @@ test "P16.50-review-8 1.2: incremental join reserve OOM leaves state byte-exact"
 
     try vm.gcStartCycle(true);
     while (true) {
-        const black = gcIsBlack(fx.owner.gc_marked);
+        const black = gcIsBlack(fx.owner.gc.marked);
         const in_gray = p50r8Count(vm.gc_gray.items, .{ .closure = fx.owner }) != 0;
         if (black and !in_gray) break;
         const more = try vm.gcPropagateOne();
         try testing.expect(more);
     }
-    try testing.expect(gcIsWhite(fx.donor_cell.gc_marked));
+    try testing.expect(gcIsWhite(fx.donor_cell.gc.marked));
 
     // The propagate arm's single reserve edge: the gc_gray slot for the
     // cell's table value. The re-point must NOT have happened.
     vm.gc_gray.deinit(testing.allocator);
     vm.gc_gray = .empty;
     {
-        const cell_mark = fx.donor_cell.gc_marked;
+        const cell_mark = fx.donor_cell.gc.marked;
         const uv0 = fx.owner.upvalues[0];
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
             .fail_index = 0,
@@ -56963,7 +57213,7 @@ test "P16.50-review-8 1.2: incremental join reserve OOM leaves state byte-exact"
         const plan = vm.gcPrepareForwardBarrierCell(fx.owner, fx.donor_cell);
         vm.alloc = saved;
         try testing.expectError(error.OutOfMemory, plan);
-        try testing.expect(fx.donor_cell.gc_marked == cell_mark);
+        try testing.expect(fx.donor_cell.gc.marked == cell_mark);
         try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
         try testing.expect(fx.owner.upvalues[0] == uv0);
     }
@@ -56974,7 +57224,7 @@ test "P16.50-review-8 1.2: incremental join reserve OOM leaves state byte-exact"
     try testing.expect(plan.inc_mark);
     @constCast(fx.owner.upvalues)[0] = fx.donor_cell;
     vm.gcCommitForwardBarrierCell(fx.owner, fx.donor_cell, plan);
-    try testing.expect(gcIsBlack(fx.donor_cell.gc_marked));
+    try testing.expect(gcIsBlack(fx.donor_cell.gc.marked));
     while (vm.gc_state != .pause) {
         _ = try vm.gcAdvance(1, false);
     }
@@ -56999,20 +57249,20 @@ test "P16.50-review-8 1.2: incremental setupvalue reserve OOM leaves state byte-
 
     try vm.gcStartCycle(true);
     while (true) {
-        const black = gcIsBlack(fx.owner.gc_marked);
+        const black = gcIsBlack(fx.owner.gc.marked);
         const in_gray = p50r8Count(vm.gc_gray.items, .{ .closure = fx.owner }) != 0;
         if (black and !in_gray) break;
         const more = try vm.gcPropagateOne();
         try testing.expect(more);
     }
     // The owner's own cell is reachable through the owner → black.
-    try testing.expect(gcIsBlack(fx.owner_cell.gc_marked));
-    try testing.expect(gcIsWhite(dead_table.gc_marked));
+    try testing.expect(gcIsBlack(fx.owner_cell.gc.marked));
+    try testing.expect(gcIsWhite(dead_table.gc.marked));
 
     vm.gc_gray.deinit(testing.allocator);
     vm.gc_gray = .empty;
     {
-        const table_mark = dead_table.gc_marked;
+        const table_mark = dead_table.gc.marked;
         const cell_value = fx.owner_cell.value;
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
             .fail_index = 0,
@@ -57023,7 +57273,7 @@ test "P16.50-review-8 1.2: incremental setupvalue reserve OOM leaves state byte-
         const plan = vm.gcPrepareWriteBarrierCell(fx.owner_cell, .{ .Table = dead_table });
         vm.alloc = saved;
         try testing.expectError(error.OutOfMemory, plan);
-        try testing.expect(dead_table.gc_marked == table_mark);
+        try testing.expect(dead_table.gc.marked == table_mark);
         try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
         try testing.expect(std.meta.eql(fx.owner_cell.value, cell_value));
     }
@@ -64156,8 +64406,8 @@ test "P16.50-review-10 1: sticky reserve rejection still closes; overflow drain 
     // ends with the cell gray and the child still white.
     while (try vm.gcPropagateOne()) {}
     try testing.expect(vm.gc_state == .propagate);
-    try testing.expect(!gcIsWhite(cell.gc_marked) and !gcIsBlack(cell.gc_marked));
-    try testing.expect(gcIsWhite(child.gc_marked));
+    try testing.expect(!gcIsWhite(cell.gc.marked) and !gcIsBlack(cell.gc.marked));
+    try testing.expect(gcIsWhite(child.gc.marked));
 
     // Publish the child into the watched slot AFTER the cell was marked:
     // the inline markCell did not cover it — only the close barrier can.
@@ -64189,9 +64439,9 @@ test "P16.50-review-10 1: sticky reserve rejection still closes; overflow drain 
         try testing.expect(cell.stack_thread == null);
         try testing.expect(th.boxed[slot] == null);
         try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
-        try testing.expect(gcIsBlack(cell.gc_marked));
+        try testing.expect(gcIsBlack(cell.gc.marked));
         // Canonical color: the child owes traversal, recorded by the flag.
-        try testing.expect(gcIsGray(child.gc_marked));
+        try testing.expect(gcIsGray(child.gc.marked));
         try testing.expect(vm.gc_gray_overflow);
         try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
         try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
@@ -64229,7 +64479,7 @@ test "P16.50-review-10 1: sticky reserve rejection at the atomic boundary; drain
     // the child written below stays white).
     while (try vm.gcPropagateOne()) {}
     vm.gc_state = .atomic;
-    try testing.expect(!gcIsWhite(cell.gc_marked) and !gcIsBlack(cell.gc_marked));
+    try testing.expect(!gcIsWhite(cell.gc.marked) and !gcIsBlack(cell.gc.marked));
 
     th.stack[slot] = .{ .Table = child };
     vm.gc_gray.deinit(testing.allocator);
@@ -64246,8 +64496,8 @@ test "P16.50-review-10 1: sticky reserve rejection at the atomic boundary; drain
 
         try testing.expectEqual(Cell.stack_closed, cell.stack_idx);
         try testing.expect(th.boxed[slot] == null);
-        try testing.expect(gcIsBlack(cell.gc_marked));
-        try testing.expect(gcIsGray(child.gc_marked));
+        try testing.expect(gcIsBlack(cell.gc.marked));
+        try testing.expect(gcIsGray(child.gc.marked));
         try testing.expect(vm.gc_gray_overflow);
         try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
     }
@@ -64283,13 +64533,13 @@ test "P16.50-review-10 2: gen-minor sticky close — old gray cell overflows gra
     // (markCell is a no-op on a non-white open cell, so nothing re-grays
     // it; the gen arm of gcPlanCloseBarrierCell marks for ANY non-white
     // cell, black included.)
-    try testing.expect(cell.gc_age == .old);
-    try testing.expect(gcIsBlack(cell.gc_marked));
+    try testing.expect(cell.gc.age == .old);
+    try testing.expect(gcIsBlack(cell.gc.marked));
 
     // YOUNG white child: its only protection is the close barrier.
     const child = try vm.allocTableNoGc();
-    try testing.expect(!child.gc_age.isOld());
-    try testing.expect(gcIsWhite(child.gc_marked));
+    try testing.expect(!child.gc.age.isOld());
+    try testing.expect(gcIsWhite(child.gc.marked));
 
     th.stack[slot] = .{ .Table = child };
 
@@ -64317,11 +64567,11 @@ test "P16.50-review-10 2: gen-minor sticky close — old gray cell overflows gra
         try testing.expect(cell.stack_thread == null);
         try testing.expect(th.boxed[slot] == null);
         try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
-        try testing.expect(gcIsBlack(cell.gc_marked));
+        try testing.expect(gcIsBlack(cell.gc.marked));
         // Canonical state: gray by color, OLD0 by age, flags set, lists
         // untouched.
-        try testing.expect(gcIsGray(child.gc_marked));
-        try testing.expect(child.gc_age == .old0);
+        try testing.expect(gcIsGray(child.gc.marked));
+        try testing.expect(child.gc.age == .old0);
         try testing.expect(vm.gc_gray_overflow);
         try testing.expect(vm.gc_old1_overflow);
         try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
@@ -64340,8 +64590,8 @@ test "P16.50-review-10 2: gen-minor sticky close — old gray cell overflows gra
     try testing.expect(p50IsRegistered(&vm, .{ .table = child }));
     try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child }));
-    try testing.expect(child.gc_age == .old1);
-    try testing.expect(gcIsBlack(child.gc_marked));
+    try testing.expect(child.gc.age == .old1);
+    try testing.expect(gcIsBlack(child.gc.marked));
     try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
 
     // A second minor cycle: markold advances OLD1→OLD and re-traverses;
@@ -64350,7 +64600,7 @@ test "P16.50-review-10 2: gen-minor sticky close — old gray cell overflows gra
     try vm.gcMinorCollection();
     try testing.expect(p50IsRegistered(&vm, .{ .table = child }));
     try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_old1.items, .{ .table = child }));
-    try testing.expect(child.gc_age == .old);
+    try testing.expect(child.gc.age == .old);
     try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
 }
 
@@ -64372,7 +64622,7 @@ test "P16.50-review-9 2: gen-minor close — young gray cell marks the value wit
     _ = scope.protectCellAssumeCapacity(cell);
 
     try vm.gcQueueScanCell(cell);
-    try testing.expect(!gcIsWhite(cell.gc_marked) and !gcIsBlack(cell.gc_marked));
+    try testing.expect(!gcIsWhite(cell.gc.marked) and !gcIsBlack(cell.gc.marked));
     th.stack[slot] = .{ .Table = child };
     vm.gc_gray.deinit(testing.allocator);
     vm.gc_gray = .empty;
@@ -64388,10 +64638,10 @@ test "P16.50-review-9 2: gen-minor close — young gray cell marks the value wit
     vm.closeBoxedUpvaluesReserved(th.boxed[slot .. slot + 1]);
     try testing.expectEqual(Cell.stack_closed, cell.stack_idx);
     try testing.expect(th.boxed[slot] == null);
-    try testing.expect(gcIsBlack(cell.gc_marked));
+    try testing.expect(gcIsBlack(cell.gc.marked));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = child }));
     try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_old1.items, .{ .table = child }));
-    try testing.expect(child.gc_age == .new);
+    try testing.expect(child.gc.age == .new);
 
     // The marked child survives a real minor collection.
     try vm.gcMinorCollection();
@@ -64510,7 +64760,7 @@ test "P16.50-review-10 3: sticky failure at the ordinary-return seam closes imme
 
     try vm.gcStartCycle(true);
     while (try vm.gcPropagateOne()) {}
-    try testing.expect(!gcIsWhite(cell.gc_marked) and !gcIsBlack(cell.gc_marked));
+    try testing.expect(!gcIsWhite(cell.gc.marked) and !gcIsBlack(cell.gc.marked));
     th.stack[slot] = .{ .Table = child };
     vm.gc_gray.deinit(testing.allocator);
     vm.gc_gray = .empty;
@@ -64571,8 +64821,8 @@ test "P16.50-review-10 3: sticky failure at the ordinary-return seam closes imme
     try testing.expect(cell.stack_thread == null);
     try testing.expect(th.boxed[slot] == null);
     try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
-    try testing.expect(gcIsBlack(cell.gc_marked));
-    try testing.expect(gcIsGray(child.gc_marked));
+    try testing.expect(gcIsBlack(cell.gc.marked));
+    try testing.expect(gcIsGray(child.gc.marked));
     try testing.expect(vm.gc_gray_overflow);
     try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
 
@@ -64644,7 +64894,7 @@ test "P16.50-review-10 3: sticky failure at the tailcall seam closes immediately
 
     try vm.gcStartCycle(true);
     while (try vm.gcPropagateOne()) {}
-    try testing.expect(!gcIsWhite(cell.gc_marked) and !gcIsBlack(cell.gc_marked));
+    try testing.expect(!gcIsWhite(cell.gc.marked) and !gcIsBlack(cell.gc.marked));
     th.stack[cell_slot] = .{ .Table = child };
     th.stack[slot] = .{ .Closure = callee_cl }; // regs[0]: the callee
     th.stack[slot + 1] = .{ .Int = 9 }; // regs[1]: the argument
@@ -64701,8 +64951,8 @@ test "P16.50-review-10 3: sticky failure at the tailcall seam closes immediately
     try testing.expect(cell.stack_thread == null);
     try testing.expect(th.boxed[cell_slot] == null);
     try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
-    try testing.expect(gcIsBlack(cell.gc_marked));
-    try testing.expect(gcIsGray(child.gc_marked));
+    try testing.expect(gcIsBlack(cell.gc.marked));
+    try testing.expect(gcIsGray(child.gc.marked));
     try testing.expect(vm.gc_gray_overflow);
     try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
 
@@ -64730,7 +64980,7 @@ test "P16.50-review-10 3: sticky failure at the abort-unwind seam unwinds fully;
 
     try vm.gcStartCycle(true);
     while (try vm.gcPropagateOne()) {}
-    try testing.expect(!gcIsWhite(cell.gc_marked) and !gcIsBlack(cell.gc_marked));
+    try testing.expect(!gcIsWhite(cell.gc.marked) and !gcIsBlack(cell.gc.marked));
     th.stack[slot] = .{ .Table = child };
     vm.gc_gray.deinit(testing.allocator);
     vm.gc_gray = .empty;
@@ -64771,8 +65021,8 @@ test "P16.50-review-10 3: sticky failure at the abort-unwind seam unwinds fully;
     try testing.expect(cell.stack_thread == null);
     try testing.expect(th.boxed[slot] == null);
     try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
-    try testing.expect(gcIsBlack(cell.gc_marked));
-    try testing.expect(gcIsGray(child.gc_marked));
+    try testing.expect(gcIsBlack(cell.gc.marked));
+    try testing.expect(gcIsGray(child.gc.marked));
     try testing.expect(vm.gc_gray_overflow);
     try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
 
@@ -64818,7 +65068,7 @@ test "P16.50-review-9 4: thread-sweep close is allocation-free and seals the sta
     // behind the watched slots).
     const cell_white = try p50r9MkOpenCell(vm, th2, 2);
     const cell_gray = try p50r9MkOpenCell(vm, th2, 5);
-    gcSetGray(&cell_gray.gc_marked);
+    gcSetGray(&cell_gray.gc.marked);
 
     // The sweep loop's exact pair, under a counting allocator: the sweep
     // state forces an empty close plan (both modes), so the close cannot
@@ -64826,7 +65076,7 @@ test "P16.50-review-9 4: thread-sweep close is allocation-free and seals the sta
     vm.gc_state = .sweep;
     var counting = P50r9CountingAlloc{ .base = testing.allocator };
     vm.alloc = counting.allocator();
-    vm.gcUnregisterObjectSweep(.{ .thread = th2 });
+    vm.gcUnregisterObjectSweep(.{ .thread = th2 }, th2.gc.index);
     vm.gcFreeObject(.{ .thread = th2 }, .sweep);
     vm.alloc = testing.allocator;
     vm.gc_state = .pause;
@@ -64838,8 +65088,8 @@ test "P16.50-review-9 4: thread-sweep close is allocation-free and seals the sta
     }
     // PUC luaC_barrier_ sweep arm: the white cell was never touched; the
     // gray cell took nw2black + makewhite(current white).
-    try testing.expect(gcIsWhite(cell_white.gc_marked));
-    try testing.expect(gcIsWhite(cell_gray.gc_marked));
+    try testing.expect(gcIsWhite(cell_white.gc.marked));
+    try testing.expect(gcIsWhite(cell_gray.gc.marked));
     try testing.expect(gcCheckSecondaryRegistryInvariants(vm));
     // The cells stay registered; state.deinit's drain frees them (closed,
     // Int values — leak-checked).
@@ -64883,7 +65133,7 @@ test "P16.50-review-9 4: teardown close runs no barrier over a dangling value" {
     vm.gcRegisterCommit(.{ .cell = cell });
     vm.gcNoteAlloc(@sizeOf(Cell));
     th2.boxed[0] = cell;
-    gcSetGray(&cell.gc_marked);
+    gcSetGray(&cell.gc.marked);
 }
 
 test "P16.50-review-10 5: end-to-end sticky-failing resume unwinds fully; VM reuse after recovery" {
@@ -65064,8 +65314,8 @@ test "P16.50-review-10 6: N-child overflow drain terminates; every child survive
     for (0..n) |i| {
         try testing.expectEqual(Cell.stack_closed, cells[i].stack_idx);
         try testing.expect(th.boxed[base_slot + i] == null);
-        try testing.expect(gcIsBlack(cells[i].gc_marked));
-        try testing.expect(gcIsGray(children[i].gc_marked));
+        try testing.expect(gcIsBlack(cells[i].gc.marked));
+        try testing.expect(gcIsGray(children[i].gc.marked));
     }
     try testing.expect(vm.gc_gray_overflow);
     try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
@@ -65081,7 +65331,7 @@ test "P16.50-review-10 6: N-child overflow drain terminates; every child survive
     try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
     for (0..n) |i| {
         try testing.expect(p50IsRegistered(&vm, .{ .table = children[i] }));
-        try testing.expect(!gcIsGray(children[i].gc_marked));
+        try testing.expect(!gcIsGray(children[i].gc.marked));
         try testing.expect(std.meta.eql(cells[i].value, .{ .Table = children[i] }));
     }
     try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
@@ -65129,8 +65379,8 @@ test "P16.50-review-11 1: incremental close over an already-BLACK child is a byt
     // child ends the drain BLACK (fully traversed), the cell stays GRAY
     // (open cells are never traversed).
     while (try vm.gcPropagateOne()) {}
-    try testing.expect(gcIsBlack(child.gc_marked));
-    try testing.expect(gcIsGray(cell.gc_marked));
+    try testing.expect(gcIsBlack(child.gc.marked));
+    try testing.expect(gcIsGray(cell.gc.marked));
 
     th.stack[slot] = .{ .Table = child };
     const gray_len = vm.gc_gray.items.len;
@@ -65147,10 +65397,10 @@ test "P16.50-review-11 1: incremental close over an already-BLACK child is a byt
     try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
     // Byte-exact no-op: child stays BLACK, no gc_gray entry, no marker,
     // no flag, no re-accounting, registry invariants intact.
-    try testing.expect(gcIsBlack(child.gc_marked));
+    try testing.expect(gcIsBlack(child.gc.marked));
     try testing.expectEqual(gray_len, vm.gc_gray.items.len);
     try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_gray.items, .{ .table = child }));
-    try testing.expect((child.gc_marked & MISSEDGRAYBIT) == 0);
+    try testing.expect((child.gc.marked & MISSEDGRAYBIT) == 0);
     try testing.expect(!vm.gc_gray_overflow);
     try testing.expectEqual(marked_kb, vm.gc_gen_marked_kb);
     try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
@@ -65184,11 +65434,11 @@ test "P16.50-review-11 2: close over a GRAY child already in gc_gray — no dupl
     try vm.gcStartCycle(true);
     vm.gc_gen_phase = .major;
     while (try vm.gcPropagateOne()) {}
-    try testing.expect(gcIsBlack(cell.gc_marked) or gcIsGray(cell.gc_marked));
+    try testing.expect(gcIsBlack(cell.gc.marked) or gcIsGray(cell.gc.marked));
 
     // The owed-traversal state: the child is GRAY and already holds ONE
     // ordinary gc_gray membership (marked, traversal pending).
-    gcSetGray(&child.gc_marked);
+    gcSetGray(&child.gc.marked);
     try vm.gc_gray.append(testing.allocator, .{ .table = child });
     const marked_kb = vm.gc_gen_marked_kb;
 
@@ -65201,9 +65451,9 @@ test "P16.50-review-11 2: close over a GRAY child already in gc_gray — no dupl
     try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
     // Exactly one membership (no duplicate append), no marker, no flag,
     // no re-accounting.
-    try testing.expect(gcIsGray(child.gc_marked));
+    try testing.expect(gcIsGray(child.gc.marked));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = child }));
-    try testing.expect((child.gc_marked & MISSEDGRAYBIT) == 0);
+    try testing.expect((child.gc.marked & MISSEDGRAYBIT) == 0);
     try testing.expect(!vm.gc_gray_overflow);
     try testing.expectEqual(marked_kb, vm.gc_gen_marked_kb);
     try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
@@ -65213,7 +65463,7 @@ test "P16.50-review-11 2: close over a GRAY child already in gc_gray — no dupl
     while (vm.gc_state != .pause) {
         _ = try vm.gcAdvance(1, false);
     }
-    try testing.expect(gcIsBlack(child.gc_marked) or !gcIsGray(child.gc_marked));
+    try testing.expect(gcIsBlack(child.gc.marked) or !gcIsGray(child.gc.marked));
     try testing.expect(p50IsRegistered(&vm, .{ .table = child }));
     try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
 }
@@ -65243,11 +65493,11 @@ test "P16.50-review-11 3: gen-minor close over BLACK children of every old age i
 
     try vm.gcEnterGenerational();
     for (0..4) |i| {
-        try testing.expect(cells[i].gc_age == .old);
-        try testing.expect(gcIsBlack(cells[i].gc_marked));
+        try testing.expect(cells[i].gc.age == .old);
+        try testing.expect(gcIsBlack(cells[i].gc.marked));
     }
-    try testing.expect(child_old.gc_age == .old);
-    try testing.expect(gcIsBlack(child_old.gc_marked));
+    try testing.expect(child_old.gc.age == .old);
+    try testing.expect(gcIsBlack(child_old.gc.marked));
 
     // .old1 child: two real minor cycles take it new→survival→old1
     // (listed in gc_old1, BLACK — the production OLD1 shape).
@@ -65255,23 +65505,23 @@ test "P16.50-review-11 3: gen-minor close over BLACK children of every old age i
     _ = scope.protectValueAssumeCapacity(.{ .Table = child_old1 });
     try vm.gcMinorCollection();
     try vm.gcMinorCollection();
-    try testing.expect(child_old1.gc_age == .old1);
-    try testing.expect(gcIsBlack(child_old1.gc_marked));
+    try testing.expect(child_old1.gc.age == .old1);
+    try testing.expect(gcIsBlack(child_old1.gc.marked));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child_old1 }));
 
     // .old0 child: hand-construct the production OLD0 shape (BLACK +
     // .old0 + listed) — the transient state of a forward-barrier-promoted
     // object inside a minor cycle, after its gray drain, before sweepgen.
     const child_old0 = try vm.allocTableNoGc();
-    child_old0.gc_age = .old0;
-    gcSetBlack(&child_old0.gc_marked);
+    child_old0.gc.age = .old0;
+    gcSetBlack(&child_old0.gc.marked);
     try vm.gc_old1.append(testing.allocator, .{ .table = child_old0 });
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child_old0 }));
 
     // White young control: its only protection is the close barrier.
     const child_white = try vm.allocTableNoGc();
-    try testing.expect(!child_white.gc_age.isOld());
-    try testing.expect(gcIsWhite(child_white.gc_marked));
+    try testing.expect(!child_white.gc.age.isOld());
+    try testing.expect(gcIsWhite(child_white.gc.marked));
 
     for (0..4) |i| {
         th.stack[base_slot + i] = .{ .Table = childrenByAge(i, child_old, child_old1, child_old0, child_white) };
@@ -65284,27 +65534,27 @@ test "P16.50-review-11 3: gen-minor close over BLACK children of every old age i
     vm.closeBoxedUpvaluesReserved(th.boxed[base_slot .. base_slot + 4]);
     for (0..4) |i| {
         try testing.expectEqual(Cell.stack_closed, cells[i].stack_idx);
-        try testing.expect(gcIsBlack(cells[i].gc_marked));
+        try testing.expect(gcIsBlack(cells[i].gc.marked));
     }
     // BLOCKER 1: every BLACK child keeps its exact age, color, and
     // exactly-once listing; no flags, no markers, no added-old charge.
-    try testing.expect(child_old.gc_age == .old);
-    try testing.expect(gcIsBlack(child_old.gc_marked));
+    try testing.expect(child_old.gc.age == .old);
+    try testing.expect(gcIsBlack(child_old.gc.marked));
     try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_old1.items, .{ .table = child_old }));
-    try testing.expect(child_old1.gc_age == .old1);
-    try testing.expect(gcIsBlack(child_old1.gc_marked));
+    try testing.expect(child_old1.gc.age == .old1);
+    try testing.expect(gcIsBlack(child_old1.gc.marked));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child_old1 }));
-    try testing.expect(child_old0.gc_age == .old0);
-    try testing.expect(gcIsBlack(child_old0.gc_marked));
+    try testing.expect(child_old0.gc.age == .old0);
+    try testing.expect(gcIsBlack(child_old0.gc.marked));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child_old0 }));
     try testing.expect(!vm.gc_gray_overflow and !vm.gc_old1_overflow);
-    try testing.expect((child_old.gc_marked & MISSEDGRAYBIT) == 0);
-    try testing.expect((child_old1.gc_marked & MISSEDGRAYBIT) == 0);
-    try testing.expect((child_old0.gc_marked & MISSEDGRAYBIT) == 0);
+    try testing.expect((child_old.gc.marked & MISSEDGRAYBIT) == 0);
+    try testing.expect((child_old1.gc.marked & MISSEDGRAYBIT) == 0);
+    try testing.expect((child_old0.gc.marked & MISSEDGRAYBIT) == 0);
     try testing.expectEqual(added_old_before, vm.gc_gen_added_old_kb);
     // White control: exactly one mark + OLD0 publication (both lists).
-    try testing.expect(gcIsGray(child_white.gc_marked));
-    try testing.expect(child_white.gc_age == .old0);
+    try testing.expect(gcIsGray(child_white.gc.marked));
+    try testing.expect(child_white.gc.age == .old0);
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = child_white }));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child_white }));
     try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
@@ -65314,16 +65564,16 @@ test "P16.50-review-11 3: gen-minor close over BLACK children of every old age i
     // charged exactly once at the old0→old1 transition, each listed
     // exactly once (the promote arm does not re-append linked objects).
     try vm.gcMinorCollection();
-    try testing.expect(child_old.gc_age == .old);
-    try testing.expect(gcIsBlack(child_old.gc_marked));
+    try testing.expect(child_old.gc.age == .old);
+    try testing.expect(gcIsBlack(child_old.gc.marked));
     try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_old1.items, .{ .table = child_old }));
-    try testing.expect(child_old1.gc_age == .old);
+    try testing.expect(child_old1.gc.age == .old);
     try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_old1.items, .{ .table = child_old1 }));
-    try testing.expect(child_old0.gc_age == .old1);
-    try testing.expect(gcIsBlack(child_old0.gc_marked));
+    try testing.expect(child_old0.gc.age == .old1);
+    try testing.expect(gcIsBlack(child_old0.gc.marked));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child_old0 }));
-    try testing.expect(child_white.gc_age == .old1);
-    try testing.expect(gcIsBlack(child_white.gc_marked));
+    try testing.expect(child_white.gc.age == .old1);
+    try testing.expect(gcIsBlack(child_white.gc.marked));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child_white }));
     const added_old_delta = vm.gc_gen_added_old_kb - added_old_before;
     const expect_delta = (@as(f64, @floatFromInt(gcObjectBytes(.{ .table = child_old0 }))) +
@@ -65358,10 +65608,10 @@ test "P16.50-review-11 4: overflow requeue selects the missed marker, not grayag
     _ = scope.protectValueAssumeCapacity(.{ .Table = ga });
     try vm.gcStartCycle(true);
     while (try vm.gcPropagateOne()) {}
-    try testing.expect(gcIsBlack(ga.gc_marked));
+    try testing.expect(gcIsBlack(ga.gc.marked));
     const ga_young = try vm.allocTableNoGc();
     try vm.gcWriteBarrierTable(ga, .{ .Table = ga_young });
-    try testing.expect(gcIsGray(ga.gc_marked));
+    try testing.expect(gcIsGray(ga.gc.marked));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .table = ga }));
     try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_gray.items, .{ .table = ga }));
 
@@ -65379,12 +65629,12 @@ test "P16.50-review-11 4: overflow requeue selects the missed marker, not grayag
         vm.alloc = testing.allocator;
     }
     try testing.expectEqual(Cell.stack_closed, cell.stack_idx);
-    try testing.expect(gcIsGray(child.gc_marked));
-    try testing.expect((child.gc_marked & MISSEDGRAYBIT) != 0);
+    try testing.expect(gcIsGray(child.gc.marked));
+    try testing.expect((child.gc.marked & MISSEDGRAYBIT) != 0);
     try testing.expect(vm.gc_gray_overflow);
     // The discriminator: the grayagain member is gray but carries NO
     // marker.
-    try testing.expect((ga.gc_marked & MISSEDGRAYBIT) == 0);
+    try testing.expect((ga.gc.marked & MISSEDGRAYBIT) == 0);
 
     // One drain pass: ONLY the marker-bearing child is re-queued; the
     // grayagain member keeps its gc_grayagain membership and its normal
@@ -65393,10 +65643,10 @@ test "P16.50-review-11 4: overflow requeue selects the missed marker, not grayag
     try testing.expect(requeued);
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = child }));
     try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_gray.items, .{ .table = ga }));
-    try testing.expect((child.gc_marked & MISSEDGRAYBIT) == 0);
+    try testing.expect((child.gc.marked & MISSEDGRAYBIT) == 0);
     try testing.expect(!vm.gc_gray_overflow);
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .table = ga }));
-    try testing.expect(gcIsGray(ga.gc_marked));
+    try testing.expect(gcIsGray(ga.gc.marked));
 
     // Finish the cycle: the close's child survives via the requeue, the
     // grayagain member goes through the atomic grayagain drain (marking
@@ -65448,8 +65698,8 @@ test "P16.50-review-11 5: partial overflow requeue keeps only unprocessed marker
         vm.alloc = testing.allocator;
     }
     for (0..n) |i| {
-        try testing.expect(gcIsGray(children[i].gc_marked));
-        try testing.expect((children[i].gc_marked & MISSEDGRAYBIT) != 0);
+        try testing.expect(gcIsGray(children[i].gc.marked));
+        try testing.expect((children[i].gc.marked & MISSEDGRAYBIT) != 0);
     }
     try testing.expect(vm.gc_gray_overflow);
 
@@ -65467,7 +65717,7 @@ test "P16.50-review-11 5: partial overflow requeue keeps only unprocessed marker
     }
     var markers_left: usize = 0;
     for (0..n) |i| {
-        if ((children[i].gc_marked & MISSEDGRAYBIT) != 0) markers_left += 1;
+        if ((children[i].gc.marked & MISSEDGRAYBIT) != 0) markers_left += 1;
     }
     try testing.expectEqual(@as(usize, n - 1), markers_left);
     try testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
@@ -65487,7 +65737,7 @@ test "P16.50-review-11 5: partial overflow requeue keeps only unprocessed marker
     }
     for (0..n) |i| {
         try testing.expect(p50IsRegistered(&vm, .{ .table = children[i] }));
-        try testing.expect(!gcIsGray(children[i].gc_marked));
+        try testing.expect(!gcIsGray(children[i].gc.marked));
         try testing.expect(std.meta.eql(cells[i].value, .{ .Table = children[i] }));
     }
     try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
@@ -65549,9 +65799,9 @@ fn p50r12GrayagainIntact(vm: *Vm, t1: *Table, t2: *Table, th: *Thread) !void {
     try testing.expect(std.meta.eql(vm.gc_grayagain.items[0], .{ .table = t1 }));
     try testing.expect(std.meta.eql(vm.gc_grayagain.items[1], .{ .table = t2 }));
     try testing.expect(std.meta.eql(vm.gc_grayagain.items[2], .{ .thread = th }));
-    try testing.expect(t1.gc_age == .touched1 and gcIsBlack(t1.gc_marked));
-    try testing.expect(t2.gc_age == .touched2 and gcIsBlack(t2.gc_marked));
-    try testing.expect(th.gc_age == .old and gcIsBlack(th.gc_marked));
+    try testing.expect(t1.gc.age == .touched1 and gcIsBlack(t1.gc.marked));
+    try testing.expect(t2.gc.age == .touched2 and gcIsBlack(t2.gc.marked));
+    try testing.expect(th.gc.age == .old and gcIsBlack(th.gc.marked));
     try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
 }
 
@@ -65573,8 +65823,8 @@ test "P16.50-review-12 1: gcMarkOld1 reserve OOM is byte-exact; success re-trave
         _ = scope.protectValueAssumeCapacity(.{ .Table = owner });
         try vm.gcMinorCollection();
         try vm.gcMinorCollection();
-        try testing.expect(owner.gc_age == .old1);
-        try testing.expect(gcIsBlack(owner.gc_marked));
+        try testing.expect(owner.gc.age == .old1);
+        try testing.expect(gcIsBlack(owner.gc.marked));
         try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = owner }));
         try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_grayagain.items, .{ .table = owner }));
     }
@@ -65607,14 +65857,14 @@ test "P16.50-review-12 1: gcMarkOld1 reserve OOM is byte-exact; success re-trave
         vm.alloc = testing.allocator;
         try testing.expectError(error.OutOfMemory, result);
     }
-    try testing.expect(owner.gc_age == .old1);
-    try testing.expect(gcIsBlack(owner.gc_marked));
+    try testing.expect(owner.gc.age == .old1);
+    try testing.expect(gcIsBlack(owner.gc.marked));
     try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
     try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_grayagain.items, .{ .table = owner }));
     try testing.expectEqual(@as(usize, 1), vm.gc_old1.items.len);
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = owner }));
-    try testing.expect(child.gc_age == .new);
-    try testing.expect(gcIsWhite(child.gc_marked));
+    try testing.expect(child.gc.age == .new);
+    try testing.expect(gcIsWhite(child.gc.marked));
     try testing.expect(p50IsRegistered(&vm, .{ .table = child }));
     try testing.expect(p50InYoung(&vm, .{ .table = child }));
     try testing.expectEqual(gen_threads_len, vm.gc_gen_threads.items.len);
@@ -65625,8 +65875,8 @@ test "P16.50-review-12 1: gcMarkOld1 reserve OOM is byte-exact; success re-trave
 
     // Success: OLD1→OLD + forced gray + exactly one gc_gray entry.
     try vm.gcMarkOld1();
-    try testing.expect(owner.gc_age == .old);
-    try testing.expect(gcIsGray(owner.gc_marked));
+    try testing.expect(owner.gc.age == .old);
+    try testing.expect(gcIsGray(owner.gc.marked));
     try testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = owner }));
 
@@ -65634,11 +65884,11 @@ test "P16.50-review-12 1: gcMarkOld1 reserve OOM is byte-exact; success re-trave
     // the child through owner.array[0] — it survives as SURVIVAL, still
     // owned by the slot; the owner settles as OLD black.
     try vm.gcMinorCollection();
-    try testing.expect(child.gc_age == .survival);
+    try testing.expect(child.gc.age == .survival);
     try testing.expect(p50IsRegistered(&vm, .{ .table = child }));
     try testing.expect(std.meta.eql(owner.array[0], .{ .Table = child }));
-    try testing.expect(owner.gc_age == .old);
-    try testing.expect(gcIsBlack(owner.gc_marked));
+    try testing.expect(owner.gc.age == .old);
+    try testing.expect(gcIsBlack(owner.gc.marked));
     try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
 }
 
@@ -65678,8 +65928,8 @@ test "P16.50-review-12 2: negative-before — the old markold order loses the re
         vm.alloc = testing.allocator;
         try testing.expectError(error.OutOfMemory, result);
     }
-    try testing.expect(owner.gc_age == .old);
-    try testing.expect(gcIsGray(owner.gc_marked));
+    try testing.expect(owner.gc.age == .old);
+    try testing.expect(gcIsGray(owner.gc.marked));
     try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
     try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_gray.items, .{ .table = owner }));
     try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_grayagain.items, .{ .table = owner }));
@@ -65712,8 +65962,8 @@ test "P16.50-review-12 3: back-barrier reserve OOM precedes the observable store
     _ = scope.protectValueAssumeCapacity(.{ .Table = owner });
     _ = scope.protectValueAssumeCapacity(.{ .Userdata = ud });
     try vm.gcEnterGenerational();
-    try testing.expect(owner.gc_age == .old and gcIsBlack(owner.gc_marked));
-    try testing.expect(ud.gc_age == .old and gcIsBlack(ud.gc_marked));
+    try testing.expect(owner.gc.age == .old and gcIsBlack(owner.gc.marked));
+    try testing.expect(ud.gc.age == .old and gcIsBlack(ud.gc.marked));
 
     // ── Table arm: existing-key overwrite through rawSet (step 3:
     // prepare→store→commit over the hash node). ──
@@ -65739,24 +65989,24 @@ test "P16.50-review-12 3: back-barrier reserve OOM precedes the observable store
     // Int value; owner/val_tab age/color untouched; no partial publication.
     const node = ltable.nodeLookup(owner.hash, .{ .Int = 100 }).?;
     try testing.expect(std.meta.eql(node.value, .{ .Int = 1 }));
-    try testing.expect(owner.gc_age == .old and gcIsBlack(owner.gc_marked));
-    try testing.expect(val_tab.gc_age == .new and gcIsWhite(val_tab.gc_marked));
+    try testing.expect(owner.gc.age == .old and gcIsBlack(owner.gc.marked));
+    try testing.expect(val_tab.gc.age == .new and gcIsWhite(val_tab.gc.marked));
     try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
     try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
 
     // Success: exactly one touched1 + one grayagain membership, and the
     // store is visible.
     try vm.rawSet(owner, .{ .Int = 100 }, .{ .Table = val_tab });
-    try testing.expect(owner.gc_age == .touched1 and gcIsGray(owner.gc_marked));
+    try testing.expect(owner.gc.age == .touched1 and gcIsGray(owner.gc.marked));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .table = owner }));
     try testing.expect(std.meta.eql(ltable.nodeLookup(owner.hash, .{ .Int = 100 }).?.value, .{ .Table = val_tab }));
 
     // Real minor cycle: the grayagain drain re-traverses the owner, marks
     // the stored value (SURVIVAL), advances the owner to TOUCHED2.
     try vm.gcMinorCollection();
-    try testing.expect(val_tab.gc_age == .survival);
+    try testing.expect(val_tab.gc.age == .survival);
     try testing.expect(p50IsRegistered(&vm, .{ .table = val_tab }));
-    try testing.expect(owner.gc_age == .touched2);
+    try testing.expect(owner.gc.age == .touched2);
 
     // ── Userdata arm: prepare→store→commit over uservalues[0]. ──
     const val_ud = try vm.allocTableNoGc();
@@ -65778,23 +66028,23 @@ test "P16.50-review-12 3: back-barrier reserve OOM precedes the observable store
         try testing.expectError(error.OutOfMemory, plan);
     }
     try testing.expect(std.meta.eql(ud.uservalues[0], .Nil));
-    try testing.expect(ud.gc_age == .old and gcIsBlack(ud.gc_marked));
-    try testing.expect(val_ud.gc_age == .new and gcIsWhite(val_ud.gc_marked));
+    try testing.expect(ud.gc.age == .old and gcIsBlack(ud.gc.marked));
+    try testing.expect(val_ud.gc.age == .new and gcIsWhite(val_ud.gc.marked));
 
     // Success: prepare reserves, the caller stores, the commit publishes
     // exactly one touched1 + grayagain membership.
     const plan = try vm.gcPrepareUserdataBarrierBack(ud, .{ .Table = val_ud });
     ud.uservalues[0] = .{ .Table = val_ud };
     vm.gcCommitUserdataBarrierBack(ud, plan);
-    try testing.expect(ud.gc_age == .touched1 and gcIsGray(ud.gc_marked));
+    try testing.expect(ud.gc.age == .touched1 and gcIsGray(ud.gc.marked));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .userdata = ud }));
 
     // Real minor cycle: the drain traverses the userdata, marks the stored
     // uservalue (SURVIVAL), advances the userdata to TOUCHED2.
     try vm.gcMinorCollection();
-    try testing.expect(val_ud.gc_age == .survival);
+    try testing.expect(val_ud.gc.age == .survival);
     try testing.expect(p50IsRegistered(&vm, .{ .table = val_ud }));
-    try testing.expect(ud.gc_age == .touched2);
+    try testing.expect(ud.gc.age == .touched2);
     try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
 }
 
@@ -65839,8 +66089,8 @@ test "P16.50-review-12 4: gcStoreMetatable fail indices publish nothing; success
         // No partial publication: the store never happened, no age/color/
         // list/flag/accounting change on either side.
         try testing.expect(owner.metatable == null);
-        try testing.expect(owner.gc_age == .old and gcIsBlack(owner.gc_marked));
-        try testing.expect(mt.gc_age == .new and gcIsWhite(mt.gc_marked));
+        try testing.expect(owner.gc.age == .old and gcIsBlack(owner.gc.marked));
+        try testing.expect(mt.gc.age == .new and gcIsWhite(mt.gc.marked));
         try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
         try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
         try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
@@ -65857,10 +66107,10 @@ test "P16.50-review-12 4: gcStoreMetatable fail indices publish nothing; success
     const added_old_kb = vm.gc_gen_added_old_kb;
     try vm.gcStoreMetatable(owner, mt);
     try testing.expect(owner.metatable == mt);
-    try testing.expect(mt.gc_age == .old0 and gcIsGray(mt.gc_marked));
+    try testing.expect(mt.gc.age == .old0 and gcIsGray(mt.gc.marked));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = mt }));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = mt }));
-    try testing.expect(owner.gc_age == .old and gcIsBlack(owner.gc_marked));
+    try testing.expect(owner.gc.age == .old and gcIsBlack(owner.gc.marked));
     try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
 
     // Real minor cycle: the metatable is drained black and promoted
@@ -65868,9 +66118,9 @@ test "P16.50-review-12 4: gcStoreMetatable fail indices publish nothing; success
     // already linked it); the owner stays OLD/black (never re-traversed),
     // and the accounting charges the promotion exactly once.
     try vm.gcMinorCollection();
-    try testing.expect(mt.gc_age == .old1 and gcIsBlack(mt.gc_marked));
+    try testing.expect(mt.gc.age == .old1 and gcIsBlack(mt.gc.marked));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = mt }));
-    try testing.expect(owner.gc_age == .old and gcIsBlack(owner.gc_marked));
+    try testing.expect(owner.gc.age == .old and gcIsBlack(owner.gc.marked));
     const expect_delta = @as(f64, @floatFromInt(gcObjectBytes(.{ .table = mt }))) / 1024.0;
     try testing.expectApproxEqAbs(expect_delta, vm.gc_gen_added_old_kb - added_old_kb, 1e-9);
     try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
@@ -65880,7 +66130,7 @@ test "P16.50-review-12 4: gcStoreMetatable fail indices publish nothing; success
     var vm2: Vm = .init(testing.allocator, false);
     defer vm2.deinit();
     const owner2 = try vm2.allocTableNoGc();
-    gcSetBlack(&owner2.gc_marked);
+    gcSetBlack(&owner2.gc.marked);
     const mt2 = try vm2.allocTableNoGc();
     vm2.gc_state = .propagate;
     vm2.gc_gray.deinit(testing.allocator);
@@ -65896,10 +66146,10 @@ test "P16.50-review-12 4: gcStoreMetatable fail indices publish nothing; success
         try testing.expectError(error.OutOfMemory, result);
     }
     try testing.expect(owner2.metatable == null);
-    try testing.expect(gcIsBlack(owner2.gc_marked) and gcIsWhite(mt2.gc_marked));
+    try testing.expect(gcIsBlack(owner2.gc.marked) and gcIsWhite(mt2.gc.marked));
     try vm2.gcStoreMetatable(owner2, mt2);
     try testing.expect(owner2.metatable == mt2);
-    try testing.expect(gcIsGray(mt2.gc_marked));
+    try testing.expect(gcIsGray(mt2.gc.marked));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm2.gc_gray.items, .{ .table = mt2 }));
     vm2.gc_state = .pause;
 }
@@ -65935,8 +66185,8 @@ test "P16.50-review-12 5: gcDrainGrayagain reserve OOM keeps the source membersh
 
     // Hand-arranged grayagain population (the state backward barriers
     // publish): a TOUCHED1 table, a TOUCHED2 table, and an OLD thread.
-    t1.gc_age = .touched1;
-    t2.gc_age = .touched2;
+    t1.gc.age = .touched1;
+    t2.gc.age = .touched2;
     try vm.gc_grayagain.appendSlice(testing.allocator, &.{
         .{ .table = t1 }, .{ .table = t2 }, .{ .thread = th },
     });
@@ -66001,11 +66251,11 @@ test "P16.50-review-12 5: gcDrainGrayagain reserve OOM keeps the source membersh
     // it), TOUCHED2 advanced to OLD and dropped, the thread kept; gc_gray
     // fully drained after every per-entry drain.
     try vm.gcDrainGrayagain();
-    try testing.expect(t1.gc_age == .touched1 and gcIsBlack(t1.gc_marked));
+    try testing.expect(t1.gc.age == .touched1 and gcIsBlack(t1.gc.marked));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .table = t1 }));
-    try testing.expect(t2.gc_age == .old and gcIsBlack(t2.gc_marked));
+    try testing.expect(t2.gc.age == .old and gcIsBlack(t2.gc.marked));
     try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_grayagain.items, .{ .table = t2 }));
-    try testing.expect(th.gc_age == .old and gcIsBlack(th.gc_marked));
+    try testing.expect(th.gc.age == .old and gcIsBlack(th.gc.marked));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .thread = th }));
     try testing.expectEqual(@as(usize, 2), vm.gc_grayagain.items.len);
     try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
@@ -66014,9 +66264,9 @@ test "P16.50-review-12 5: gcDrainGrayagain reserve OOM keeps the source membersh
     // completes the lifecycle: TOUCHED2→OLD, dropped — no duplicates, the
     // thread still kept.
     vm.gcCorrectGrayAgain();
-    try testing.expect(t1.gc_age == .touched2);
+    try testing.expect(t1.gc.age == .touched2);
     try vm.gcDrainGrayagain();
-    try testing.expect(t1.gc_age == .old);
+    try testing.expect(t1.gc.age == .old);
     try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_grayagain.items, .{ .table = t1 }));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .thread = th }));
     try testing.expectEqual(@as(usize, 1), vm.gc_grayagain.items.len);
@@ -66052,13 +66302,13 @@ test "P16.50-review-12 6: young sweep completes under a rejecting allocator once
     // Post-atomic sweep-entry state: survivors BLACK (marked this cycle),
     // the dead object left at the pre-flip white; the flip makes that
     // white the OTHER white (dead).
-    gcSetBlack(&t_surv.gc_marked);
-    t_surv.gc_age = .survival;
-    gcSetBlack(&th.gc_marked);
-    th.gc_age = .survival;
-    gcSetBlack(&t_new_surv.gc_marked);
+    gcSetBlack(&t_surv.gc.marked);
+    t_surv.gc.age = .survival;
+    gcSetBlack(&th.gc.marked);
+    th.gc.age = .survival;
+    gcSetBlack(&t_new_surv.gc.marked);
     vm.gc_current_white ^= WHITEBITS;
-    try testing.expect(gcIsDead(t_dead.gc_marked, vm.gc_current_white));
+    try testing.expect(gcIsDead(t_dead.gc.marked, vm.gc_current_white));
 
     vm.gc_young_objects_snapshot_len = vm.gc_young_objects.items.len;
     const added_old_kb = vm.gc_gen_added_old_kb;
@@ -66088,10 +66338,10 @@ test "P16.50-review-12 6: young sweep completes under a rejecting allocator once
     // Exact promotions: t_surv and th → OLD1, each listed exactly once in
     // gc_old1 and grayagain; th gains exactly one gc_gen_threads entry;
     // t_new_surv stays young as SURVIVAL with the current white.
-    try testing.expect(t_surv.gc_age == .old1 and gcIsBlack(t_surv.gc_marked));
+    try testing.expect(t_surv.gc.age == .old1 and gcIsBlack(t_surv.gc.marked));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = t_surv }));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .table = t_surv }));
-    try testing.expect(th.gc_age == .old1 and gcIsBlack(th.gc_marked));
+    try testing.expect(th.gc.age == .old1 and gcIsBlack(th.gc.marked));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .thread = th }));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .thread = th }));
     var th_roots: usize = 0;
@@ -66099,7 +66349,7 @@ test "P16.50-review-12 6: young sweep completes under a rejecting allocator once
         if (t == th) th_roots += 1;
     }
     try testing.expectEqual(@as(usize, 1), th_roots);
-    try testing.expect(t_new_surv.gc_age == .survival and gcIsWhite(t_new_surv.gc_marked));
+    try testing.expect(t_new_surv.gc.age == .survival and gcIsWhite(t_new_surv.gc.marked));
     try testing.expectEqual(@as(usize, 1), vm.gc_young_objects.items.len);
     try testing.expect(std.meta.eql(vm.gc_young_objects.items[0], .{ .table = t_new_surv }));
     // Accounting: exactly the two OLD1 promotions, charged exactly once.
@@ -66130,7 +66380,7 @@ test "P16.50-review-12 7: sticky fail-everything minor cycle recovers; invariant
     const v2 = try vm.allocTableNoGc();
     try vm.rawSet(owner, .{ .Int = 100 }, .{ .Table = v1 });
     try vm.rawSet(owner, .{ .Int = 200 }, .{ .Table = v2 });
-    try testing.expect(owner.gc_age == .touched1);
+    try testing.expect(owner.gc.age == .touched1);
     const g1 = try vm.allocTableNoGc();
     const g2 = try vm.allocTableNoGc();
     const g3 = try vm.allocTableNoGc();
@@ -66165,8 +66415,8 @@ test "P16.50-review-12 7: sticky fail-everything minor cycle recovers; invariant
     try testing.expect(p50IsRegistered(&vm, .{ .table = owner }));
     try testing.expect(p50IsRegistered(&vm, .{ .table = v1 }));
     try testing.expect(p50IsRegistered(&vm, .{ .table = v2 }));
-    try testing.expect(owner.gc_age == .old);
-    try testing.expect(v1.gc_age == .old1 and v2.gc_age == .old1);
+    try testing.expect(owner.gc.age == .old);
+    try testing.expect(v1.gc.age == .old1 and v2.gc.age == .old1);
 
     // A real major cycle (full collection) in generational mode: everyone
     // reachable survives as OLD black, the worklists settle empty, and no
@@ -66175,7 +66425,7 @@ test "P16.50-review-12 7: sticky fail-everything minor cycle recovers; invariant
     try testing.expect(p50IsRegistered(&vm, .{ .table = owner }));
     try testing.expect(p50IsRegistered(&vm, .{ .table = v1 }));
     try testing.expect(p50IsRegistered(&vm, .{ .table = v2 }));
-    try testing.expect(owner.gc_age == .old and v1.gc_age == .old and v2.gc_age == .old);
+    try testing.expect(owner.gc.age == .old and v1.gc.age == .old and v2.gc.age == .old);
     try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
     try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
     try testing.expect(!vm.gc_gray_overflow and !vm.gc_old1_overflow);
@@ -66564,10 +66814,10 @@ test "P16.50-review-14 HIGH 1: table setmetatable is forward-barrier-only (no gr
     try vm.apiSetTable(.{ .Table = mt }, field_key, .{ .Table = child });
 
     // Pre-state: owner OLD/black, mt/child young/white, worklists empty.
-    try testing.expect(owner.gc_age.isOld());
-    try testing.expect(gcIsBlack(owner.gc_marked));
-    try testing.expect(gcIsWhite(mt.gc_marked));
-    try testing.expect(gcIsWhite(child.gc_marked));
+    try testing.expect(owner.gc.age.isOld());
+    try testing.expect(gcIsBlack(owner.gc.marked));
+    try testing.expect(gcIsWhite(mt.gc.marked));
+    try testing.expect(gcIsWhite(child.gc.marked));
     try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
     try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
     try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
@@ -66586,9 +66836,9 @@ test "P16.50-review-14 HIGH 1: table setmetatable is forward-barrier-only (no gr
     try testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
     try testing.expectEqual(@as(usize, 1), vm.gc_old1.items.len);
     try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
-    try testing.expect(mt.gc_age == .old0);
-    try testing.expect(owner.gc_age.isOld());
-    try testing.expect(gcIsBlack(owner.gc_marked));
+    try testing.expect(mt.gc.age == .old0);
+    try testing.expect(owner.gc.age.isOld());
+    try testing.expect(gcIsBlack(owner.gc.marked));
 
     // Unroot mt + child: reachable ONLY through owner.metatable now.
     mt_scope.close();

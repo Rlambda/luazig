@@ -458,7 +458,7 @@ pub inline fn mainPosition(len: usize, key: Value) usize {
     return switch (key) {
         .Int => |i| intIndex(len, i),
         .Num => |n| floatIndex(len, n),
-        .String => |s| pow2Index(len, @truncate(s.hash)),
+        .String => |s| pow2Index(len, s.hash),
         .Bool => |b| pow2Index(len, if (b) 1 else 0),
         .Table => |t| pointerIndex(len, @intFromPtr(t)),
         .Closure => |c| pointerIndex(len, @intFromPtr(c)),
@@ -480,7 +480,7 @@ inline fn mainPositionOfNode(len: usize, n: *const Node) usize {
         .empty, .dead => 0,
         .int => intIndex(len, n.key_val.int),
         .num => floatIndex(len, n.key_val.num),
-        .short_string, .long_string => pow2Index(len, @truncate(n.key_val.string.hash)),
+        .short_string, .long_string => pow2Index(len, n.key_val.string.hash),
         .table => pointerIndex(len, @intFromPtr(n.key_val.table)),
         .closure => pointerIndex(len, @intFromPtr(n.key_val.closure)),
         .thread => pointerIndex(len, @intFromPtr(n.key_val.thread)),
@@ -684,7 +684,7 @@ test "nodeLookupStr agrees with nodeLookup for string keys" {
     var keys: [15]LuaString = undefined;
     var i: usize = 0;
     while (i < 15) : (i += 1) {
-        keys[i] = .{ .hash = (i + 1) *% 0x9E3779B97F4A7C15, .srkind = @intCast(i) };
+        keys[i] = .{ .hash = @truncate((i + 1) *% 0x9E3779B97F4A7C15), .srkind = @intCast(i) };
         _ = nodeInsert(nodes, &lastfree, .{ .String = &keys[i] }, .{ .Int = @intCast(i * 10) });
     }
     // Every key must be found by BOTH paths, with identical results.
@@ -900,7 +900,7 @@ test "nodeLookupShortStrIdentity agrees with nodeLookupStr for valid interned-sh
     var keys: [15]LuaString = undefined;
     var i: usize = 0;
     while (i < 15) : (i += 1) {
-        keys[i] = .{ .hash = (i + 1) *% 0x9E3779B97F4A7C15, .srkind = @intCast(i) };
+        keys[i] = .{ .hash = @truncate((i + 1) *% 0x9E3779B97F4A7C15), .srkind = @intCast(i) };
         _ = nodeInsert(nodes, &lastfree, .{ .String = &keys[i] }, .{ .Int = @intCast(i * 10) });
     }
     var k: usize = 0;

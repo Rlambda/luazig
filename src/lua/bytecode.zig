@@ -383,7 +383,7 @@ pub const ConstPool = struct {
         if (self.str_index.get(s)) |id| return id;
         var h = std.hash.Wyhash.init(0);
         h.update(s);
-        const ls = try vm.createLuaString(alloc, s, h.final());
+        const ls = try vm.createLuaString(alloc, s, @truncate(h.final()));
         errdefer vm.destroyLuaString(alloc, ls);
         const id = try self.append(alloc, .{ .str = ls });
         // Undo the append if the index put fails below: otherwise the

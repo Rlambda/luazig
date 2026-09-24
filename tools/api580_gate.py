@@ -58,10 +58,13 @@ test "representation sizes are build-mode stable" {
     const bc = @import("lua").bytecode;
     try std.testing.expectEqual(@as(usize, 48), @sizeOf(vm.LuaString));
     try std.testing.expectEqual(@as(usize, 32), vm.LuaString.lstrfix_header_size);
-    try std.testing.expectEqual(@as(usize, 40), @sizeOf(vm.Closure));
-    try std.testing.expectEqual(@as(usize, 40), @sizeOf(vm.Cell));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(vm.GcHeader));
+    try std.testing.expectEqual(@as(usize, 48), @sizeOf(vm.Closure));
+    try std.testing.expectEqual(@as(usize, 48), @sizeOf(vm.Cell));
+    try std.testing.expectEqual(@as(usize, 88), @sizeOf(vm.Table));
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(vm.Userdata));
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(bc.Upvaldesc));
-    try std.testing.expectEqual(@as(usize, 200), @sizeOf(bc.Proto));
+    try std.testing.expectEqual(@as(usize, 184), @sizeOf(bc.Proto));
     try std.testing.expect(@sizeOf(vm.CallFrame) <= 104);
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(@import("lua").ltable.Node));
 }
@@ -119,8 +122,9 @@ def run_size_probe() -> int:
                 print(f"SIZES FAIL [{mode}]:\n{r.stderr[-2000:]}")
                 return 1
             print(f"PASS [{mode}]: comptime size invariants hold "
-                  "(LuaString=48, LSTRFIX=32, Closure=40, Cell=40, "
-                  "Upvaldesc=16, Proto=200, CallFrame<=104, Node=32)")
+                  "(LuaString=48, LSTRFIX=32, GcHeader=16, Closure=48, "
+                  "Cell=48, Table=88, Userdata=64, "
+                  "Upvaldesc=16, Proto=184, CallFrame<=104, Node=32)")
     return 0
 
 

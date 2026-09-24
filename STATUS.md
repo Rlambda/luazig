@@ -183,9 +183,14 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   stock-бинарями под реальным allocator failure. Reviewer дополнительно
   подтвердил неверный порядок регистрации: создание `a,b`, затем установка
   `__gc` на `b,a` даёт PUC `a,b`, luazig `b,a` (сортировка по creation
-  `gc_seq`). Реализация persistent owner должна переносить membership из
-  `finalizables` в pending-очередь ровно один раз и соблюдать порядок
-  регистрации внутри новой партии; это тот же открытый finalizer milestone.
+  `gc_seq`). Для исправления нужен эксклюзивный перенос из
+  зарегистрированных в pending ровно один раз и порядок регистрации внутри
+  новой партии; это тот же открытый finalizer milestone.
+  Решение владельца после review A1.next: финалайзерный owner мигрирует
+  вместе с `allgc` на эксклюзивные intrusive списки `allgc`/`finobj`/
+  `tobefnz`; промежуточная dense FIFO-очередь не внедряется. Следующая
+  итерация — research полного constructor/sweep/generational/rollback cut;
+  этот пункт остаётся открытым, open-count не меняется.
 
 - [x] **P16.50 table_alloc_setmetatable perf WARN (HIGH)**: canonical
   review-14 gate имеет matched center +4.0305% и seeds 9/10/15 выше +5%.

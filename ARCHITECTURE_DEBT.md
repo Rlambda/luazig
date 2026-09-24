@@ -7,7 +7,8 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
 `подтверждено`, `отклонено`, `разбито` или `закрыто` со ссылкой
 на `STATUS.md`, commit или decisive evidence.
 
-Последняя сверка: review research `091afe2`.
+Последняя сверка: решение владельца после review research `091afe2` —
+объединить persistent finalizers и intrusive `allgc` в один milestone.
 
 ## Утверждённый GC roadmap
 
@@ -16,8 +17,9 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
    precise `live_reg_top`; stale-`gc_index` skip удалён. A1.1s1 C10
    poison/unmap oracle проверяет ordinary→emergency переход. Старый
    открытый Safety-пункт `STATUS.md` закрыт по этому evidence.
-2. **Persistent finalizer ownership — подтверждено differential-эвиденцией
-   (research A1.next), следующий GC milestone.** Корень: `gc_to_finalize`
+2. **Единый intrusive GC lifetime/finalizer owner — утверждённый следующий
+   архитектурный milestone.** Persistent-finalizer gap подтверждён
+   differential-эвиденцией (research A1.next). Корень: `gc_to_finalize`
    не персистентен (`gcResetCycleState` чистит на старте цикла) +
    ре-сепарация white-only/age-filtered + abort списка на не-RuntimeError.
    Подтверждённые расхождения (PUC 5.5 oracle + ltests vs luazig, Debug+RF):
@@ -28,21 +30,20 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
    Контроли без rescue/ordinary — байт-идентичное согласие (разрыв изолирован
    в carry-over). Reviewer подтвердил дополнительный order-gap: PUC
    упорядочивает внутри партии по регистрации `__gc`, luazig — по созданию.
-   Целевой дизайн: эксклюзивный перенос `finalizables` → персистентная FIFO
-   `gc_to_finalize` с reserve-before-commit и порядком регистрации; объект
-   не может одновременно оставаться в обоих pending-источниках. Очередь —
-   bounded intermediate; критерий удаления — intrusive finalizer link при
-   миграции `allgc` (п.3). Открытый Parity-пункт в `STATUS.md`; полный
-   research-handoff — report.md фазы A1.next research.
+   Решение владельца: НЕ вводить dense FIFO как промежуточную production-модель.
+   Целевой PUC-подобный owner — эксклюзивные intrusive `allgc` → `finobj` →
+   персистентный `tobefnz` → `allgc`; registration и separation сохраняют
+   PUC-порядок без fallible append. `gc_objects`/`gc_index` не остаются вторым
+   lifetime authority; secondary dense-списки допустимы только как lossless
+   accelerators с доказанной синхронизацией. `RootScope` и unified
+   `Thread.stack/top` уже выполненные prerequisites. Перед implementation
+   нужен bounded research всех constructor/rollback, sweep cursor,
+   incremental/generational age и shutdown переходов; stage не закрывается
+   одним исправлением finalizer-очереди. Открытый Parity-пункт в `STATUS.md`;
+   полный finalizer research-handoff — report.md фазы A1.next research.
    Отдельный подтверждённый Safety-BLOCKER: emergency-путь теряет callee
    value при вычислении аргументов `pcall`; первая неверная запись пока
    не локализована (открытый пункт `STATUS.md`).
-3. **Intrusive `allgc` lifetime authority — утверждённый end-state.**
-   `gc_objects`/`gc_index` пока остаются dense lifetime registry. После
-   persistent-finalizer milestone перейти к PUC-подобному intrusive `allgc` как
-   единственному lifetime owner; dense structures допустимы только
-   как lossless accelerators. `RootScope` и unified `Thread.stack/top` уже
-   выполненные prerequisites.
 
 ## TBC, calls и protected boundaries
 

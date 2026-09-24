@@ -7,7 +7,7 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
 `подтверждено`, `отклонено`, `разбито` или `закрыто` со ссылкой
 на `STATUS.md`, commit или decisive evidence.
 
-Последняя сверка: решение владельца после review research `091afe2` —
+Последняя сверка: review research `89f92bb`; решение владельца —
 объединить persistent finalizers и intrusive `allgc` в один milestone.
 
 ## Утверждённый GC roadmap
@@ -40,9 +40,9 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
    нужен bounded research всех constructor/rollback, sweep cursor,
    incremental/generational age и shutdown переходов; stage не закрывается
    одним исправлением finalizer-очереди. Research выполнен (A1.next-2,
-   4 параллельных исследования): выбран layout — extern
-   `GcHeader{next,marked,age,tag}` 16B (поле пяти типов + байт-совместимый
-   префикс LuaString 48B с hash u64→u32 PUC-parity; api580 368→384 <400);
+   4 параллельных исследования): кандидат layout — extern
+   `GcHeader{next,marked,age,tag}` 16B (поле пяти типов + прямой префикс
+   LuaString 48B с hash u64→u32; оценка api580 368→384 <400);
    порядок `__gc` — PUC REVERSE-registration (finobj-LIFO), не FIFO;
    финализаторы переносятся за sweep (PUC-фаза) — заодно закрывает
    finalizable-внутри-__gc corruption BLOCKER; инвентарь 30+ структур
@@ -51,9 +51,17 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
    migration = 4 атомарных cut'а без публичного dense-FIFO промежутка
    (подробности — report.md A1.next-2). Открытый Parity-пункт в `STATUS.md`;
    полный finalizer research-handoff — report.md фазы A1.next research.
-   Отдельный подтверждённый Safety-BLOCKER: emergency-путь теряет callee
-   value при вычислении аргументов `pcall`; первая неверная запись пока
-   не локализована (открытый пункт `STATUS.md`).
+   Reviewer correction к layout: предложенный строковый префикс
+   `next,hash,srkind,marked,age,tag` НЕ байт-совместим с GcHeader —
+   `marked/age/tag` надо разместить по тем же смещениям, например
+   `next@0,marked@8,age@9,tag@10,srkind@11,hash@12`; это условие
+   implementation, не доказанный в research размер. Кроме того, все
+   бывшие full-scan `gc_objects` должны охватывать эксклюзивные списки
+   `allgc/finobj/tobefnz`, а `long_literals` сейчас отдельно владеет
+   GC-строками и не может остаться вторым lifetime owner. Отдельный
+   Safety-BLOCKER потери callee при emergency локализован в atomic
+   Step 15 nil-fill живого operand-слота; он не предпосылка миграции
+   (открытый пункт `STATUS.md`).
 
 ## TBC, calls и protected boundaries
 

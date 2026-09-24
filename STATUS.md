@@ -1054,6 +1054,26 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   TBC owner остаётся подтверждённым долгом (ARCHITECTURE_DEBT.md), не
   скрыт коррекцией.
 
+- [ ] **Safety BLOCKER (pre-existing, найден A1.next-2 research):
+  finalizable, созданный внутри `__gc`, теряет metatable в том же цикле** —
+  corruption/GPF на close, паника на 3-м цикле, или потеря финализатора
+  (PUC: `inner` финализируется во 2-м цикле). Механизм: финализаторы
+  исполняются внутри atomic ДО white-flip (vm.zig:31070-31084 vs 31229+) —
+  новорождённый получает dead-цвет после flip; его граф никем не маркирован
+  (Step 10 уже прошёл); sweep защищает mid-cycle объекты лишь позиционно
+  (Phase 2), но swapRemove (10326-10333) затягивает dead-colored metatable
+  в death-check Phase 1, пока owner экранирован FINALIZEDBIT. gdb-трейс и 6
+  repro-вариантов (/tmp/opencode/anext2/). Закрывается переносом callfin за
+  sweep (PUC-фаза) и/или intrusive-списками GC-миграции; точечное лечение
+  (маркировка графа при регистрации в atomic) PUC-аналога не имеет. Тот же
+  milestone, что finalizer parity.
+
+- [ ] **Safety HIGH (UNCONFIRMED, найден A1.next-2 research): rooted-пауза в
+  `applyLoadEnv`** (vm.zig:33626-33652): cells коммитятся до публикации в
+  `cl.upvalues` без root. Решающий эксперимент: caller с cl коротких
+  upvalues + armed-adapter countdown на Cell-аллокациях между commit и
+  публикацией. При подтверждении — в constructor/rollback-часть GC-миграции.
+
 - [ ] **Safety BLOCKER (pre-existing, найден A1.next research): emergency-GC
   во время вычисления аргументов вызова глобала теряет callee value**:
   воспроизводимая форма (Debug+RF, /tmp/opencode/anext/t2.lua + бисекция
@@ -1067,6 +1087,17 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   callee-слота и `th.top` на входе в emergency, после Step 15 и перед
   OP_CALL; сравнить с PUC staging. Отдельная задача, вне finalizer milestone.
   Open-count 24→25 (stale-slot пункт закрыт ревью до фазы; здесь +1).
+  A1.next-2 research: эксперимент ВЫПОЛНЕН — первая неверная операция
+  локализована decisive-трейсом: nil-fill живого operand-слота в atomic
+  Step 15 (vm.zig:31177-31179) при th.top=4 и живом окне кадра [4..15):
+  callee (глобал pcall) жив на входе в emergency collect, зануляется
+  dead-slice clear'ом, OP_CALL видит Nil. Корень — отсутствие PUC-подъёма
+  окна до MayGC (halfProtect → L->top=ci->top, lvm.c:1151/1167);
+  комментарий vm.zig:9602-9605 о «conservative full register window» коду
+  не соответствует. Классификация: НЕЗАВИСИМЫЙ call-window BLOCKER, не
+  предпосылка GC-миграции (оракульная evidence миграции достоверна).
+  Fix-направление: вход в emergency поднимает th.top до окна кадра;
+  OP_CLOSURE — поднимает до аллокаций (как OP_NEWTABLE).
 
 - [ ] **Parity HIGH (pre-existing, REDESIGN-констрейнт): yieldability
   pcall-recovery close (16118-ветка) расходится с PUC finishpcallk**:

@@ -39,7 +39,17 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
    `Thread.stack/top` уже выполненные prerequisites. Перед implementation
    нужен bounded research всех constructor/rollback, sweep cursor,
    incremental/generational age и shutdown переходов; stage не закрывается
-   одним исправлением finalizer-очереди. Открытый Parity-пункт в `STATUS.md`;
+   одним исправлением finalizer-очереди. Research выполнен (A1.next-2,
+   4 параллельных исследования): выбран layout — extern
+   `GcHeader{next,marked,age,tag}` 16B (поле пяти типов + байт-совместимый
+   префикс LuaString 48B с hash u64→u32 PUC-parity; api580 368→384 <400);
+   порядок `__gc` — PUC REVERSE-registration (finobj-LIFO), не FIFO;
+   финализаторы переносятся за sweep (PUC-фаза) — заодно закрывает
+   finalizable-внутри-__gc corruption BLOCKER; инвентарь 30+ структур
+   классифицирован (intrusive/accelerator/delete); 11 конструктор-семейств
+   уже в reserve→alloc→init→commit форме (intrusive link = commit-сайт);
+   migration = 4 атомарных cut'а без публичного dense-FIFO промежутка
+   (подробности — report.md A1.next-2). Открытый Parity-пункт в `STATUS.md`;
    полный finalizer research-handoff — report.md фазы A1.next research.
    Отдельный подтверждённый Safety-BLOCKER: emergency-путь теряет callee
    value при вычислении аргументов `pcall`; первая неверная запись пока

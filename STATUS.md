@@ -179,6 +179,13 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   tobefnz carry-over semantics» — заявление опровергнуто rescue-сценарием.
   Нужен persistent separated-set (или эквивалент) с differential-доказательством
   carry-over/rescue-семантики против PUC. Open-count 23→24.
+  A1.next research подтвердил разрыв table/userdata differential, в том числе
+  stock-бинарями под реальным allocator failure. Reviewer дополнительно
+  подтвердил неверный порядок регистрации: создание `a,b`, затем установка
+  `__gc` на `b,a` даёт PUC `a,b`, luazig `b,a` (сортировка по creation
+  `gc_seq`). Реализация persistent owner должна переносить membership из
+  `finalizables` в pending-очередь ровно один раз и соблюдать порядок
+  регистрации внутри новой партии; это тот же открытый finalizer milestone.
 
 - [x] **P16.50 table_alloc_setmetatable perf WARN (HIGH)**: canonical
   review-14 gate имеет matched center +4.0305% и seeds 9/10/15 выше +5%.
@@ -1043,17 +1050,18 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   скрыт коррекцией.
 
 - [ ] **Safety BLOCKER (pre-existing, найден A1.next research): emergency-GC
-  во время вычисления аргументов вызова глобала зануляет живой слот**:
+  во время вычисления аргументов вызова глобала теряет callee value**:
   воспроизводимая форма (Debug+RF, /tmp/opencode/anext/t2.lua + бисекция
   t5/t6): под реальной memory pressure вызов `pcall(...)` с табличным
   аргументом даёт `attempt to call a nil value (global 'pcall')` при живом
   глобале (PUC на том же чанке: `pcall result: true 1`). Отказ
-  таблицей/локальной closure — согласие; значит, падёт именно staging-слот
-  глобала при emergency collect в окне вычисления аргументов. Root-cause и
-  фикс — отдельная задача (кандидат: emergency full-window scan/mark пишет
-  в live окно ниже top); не входит в finalizer-milestone. Плюс мелкое
-  расхождение класса ошибки `string.rep` 1GiB (PUC "not enough memory" vs
-  luazig "result too large"). Open-count 24→25 (stale-slot пункт закрыт ревью до фазы; здесь +1).
+  таблицей/локальной closure — согласие. Наблюдаемая неверная семантика
+  подтверждена; первая неверная запись ещё не локализована. Гипотеза —
+  atomic dead-slice clear по неверному `th.top` либо непубликация staging
+  callee перед MayGC. Следующий решающий эксперимент: трассировать индекс
+  callee-слота и `th.top` на входе в emergency, после Step 15 и перед
+  OP_CALL; сравнить с PUC staging. Отдельная задача, вне finalizer milestone.
+  Open-count 24→25 (stale-slot пункт закрыт ревью до фазы; здесь +1).
 
 - [ ] **Parity HIGH (pre-existing, REDESIGN-констрейнт): yieldability
   pcall-recovery close (16118-ветка) расходится с PUC finishpcallk**:

@@ -7,7 +7,7 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
 `подтверждено`, `отклонено`, `разбито` или `закрыто` со ссылкой
 на `STATUS.md`, commit или decisive evidence.
 
-Последняя сверка: review `9b1bad7`.
+Последняя сверка: review research `091afe2`.
 
 ## Утверждённый GC roadmap
 
@@ -26,11 +26,17 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
    OOM в теле `__gc` обрывает остаток списка (PUC: warn+continue); обрыв +
    retry даёт двойной `__gc`; gen minor-цикл теряет leftover pending.
    Контроли без rescue/ordinary — байт-идентичное согласие (разрыв изолирован
-   в carry-over). Целевой дизайн: персистентная FIFO-очередь
-   `gc_to_finalize` (membership-driven, как PUC `tobefnz`) как bounded
-   intermediate; критерий удаления — замена на intrusive finalizer link при
+   в carry-over). Reviewer подтвердил дополнительный order-gap: PUC
+   упорядочивает внутри партии по регистрации `__gc`, luazig — по созданию.
+   Целевой дизайн: эксклюзивный перенос `finalizables` → персистентная FIFO
+   `gc_to_finalize` с reserve-before-commit и порядком регистрации; объект
+   не может одновременно оставаться в обоих pending-источниках. Очередь —
+   bounded intermediate; критерий удаления — intrusive finalizer link при
    миграции `allgc` (п.3). Открытый Parity-пункт в `STATUS.md`; полный
    research-handoff — report.md фазы A1.next research.
+   Отдельный подтверждённый Safety-BLOCKER: emergency-путь теряет callee
+   value при вычислении аргументов `pcall`; первая неверная запись пока
+   не локализована (открытый пункт `STATUS.md`).
 3. **Intrusive `allgc` lifetime authority — утверждённый end-state.**
    `gc_objects`/`gc_index` пока остаются dense lifetime registry. После
    persistent-finalizer milestone перейти к PUC-подобному intrusive `allgc` как

@@ -144,6 +144,94 @@ static int c_body_callk(lua_State *L) {
     return 1;
 }
 
+/* FC-10..13 middle C body: mark OBJ2, then lua_callk LUA_MID3 (its
+** local <close> obligation sits BETWEEN this C frame's mark and the
+** innermost C mark in the global LIFO order). */
+static int c_ilv_mid2(lua_State *L) {
+    lua_getglobal(L, "OBJ2");
+    lua_toclose(L, -1);
+    lua_getglobal(L, "LUA_MID3");
+    lua_callk(L, 0, 0, (lua_KContext)0, k_never);
+    return 0;
+}
+
+/* FC-10..13 outer C body: mark OBJ1, then lua_callk LUA_MID (a LIVE
+** Lua frame with a <close> local sits between this C frame and the
+** inner C frames at the suspension point). */
+static int c_ilv_outer(lua_State *L) {
+    lua_getglobal(L, "OBJ1");
+    lua_toclose(L, -1);
+    lua_getglobal(L, "LUA_MID");
+    lua_callk(L, 0, 0, (lua_KContext)0, k_never);
+    return 0;
+}
+
+/* Interleaved-case runner: registers the C bodies the alternation
+** shapes need (CBODY outer, NESTED innermost marker, NESTED2 middle
+** caller); the Lua middle functions come from objsrc as LUA_MID /
+** LUA_MID3. gcflag: two full GCs between the suspension and the close. */
+static int run_il(const char *objsrc, const char *cosrc, int gcflag) {
+    lua_State *L = luaL_newstate();
+    if (!L) {
+        printf("FAIL: newstate\n");
+        return 1;
+    }
+    luaL_openlibs(L);
+    if (luaL_dostring(L, objsrc) != 0) {
+        printf("FAIL: setup: %s\n",
+               lua_isstring(L, -1) ? lua_tostring(L, -1) : "?");
+        lua_close(L);
+        return 1;
+    }
+    lua_pushcfunction(L, c_ilv_outer);
+    lua_setglobal(L, "CBODY");
+    lua_pushcfunction(L, c_nested);
+    lua_setglobal(L, "NESTED");
+    lua_pushcfunction(L, c_ilv_mid2);
+    lua_setglobal(L, "NESTED2");
+    if (luaL_dostring(L, cosrc) != 0) {
+        printf("FAIL: create: %s\n",
+               lua_isstring(L, -1) ? lua_tostring(L, -1) : "?");
+        lua_close(L);
+        return 1;
+    }
+    lua_getglobal(L, "co");
+    lua_State *co = lua_tothread(L, -1);
+    if (!co) {
+        printf("FAIL: not a thread\n");
+        lua_close(L);
+        return 1;
+    }
+    {
+        int nres = 0;
+        int st = lua_resume(co, L, 0, &nres);
+        printf("resume1: st=%d nres=%d\n", st, nres);
+        if (gcflag) {
+            lua_gc(L, LUA_GCCOLLECT, 0);
+            lua_gc(L, LUA_GCCOLLECT, 0);
+        }
+        st = lua_closethread(co, L);
+        printf("closethread: st=%d\n", st);
+        st = lua_closethread(co, L);
+        printf("closethread2: st=%d\n", st);
+    }
+    lua_getglobal(L, "table");
+    lua_getfield(L, -1, "concat");
+    lua_remove(L, -2);
+    lua_getglobal(L, "LOG");
+    lua_pushliteral(L, ",");
+    if (lua_pcall(L, 2, 1, 0) != 0) {
+        printf("FAIL: log: %s\n",
+               lua_isstring(L, -1) ? lua_tostring(L, -1) : "?");
+        lua_close(L);
+        return 1;
+    }
+    printf("log: %s\n", lua_tostring(L, -1));
+    lua_pop(L, 2);
+    lua_close(L);
+    return 0;
+}
+
 /* Run one coroutine case: objsrc defines the LOG/OBJ globals, cosrc is
 ** the coroutine.create body source (references CBODY/NESTED), body is
 ** the C entry. gcflag: run two full GCs between the suspension and the
@@ -385,6 +473,134 @@ int main(void) {
             "end})\n",
             "co = coroutine.create(function() return CBODY() end)",
             c_body_callk, 0))
+        return 1;
+
+    /* FC-10: INTERLEAVED obligations — C mark, a LIVE Lua frame with a
+    ** <close> local (via lua_callk), a newer C mark, yield. The forced
+    ** close must run the closers in the GLOBAL LIFO order c2, lua2, c1
+    ** (PUC's single tbclist), not c2, c1, lua2. Statuses alone do not
+    ** distinguish the orders — the log does. */
+    if (run_il(
+            "local log = {}\n"
+            "LOG = log\n"
+            "KRAN = function() log[#log+1] = 'K-RAN' end\n"
+            "OBJ1 = setmetatable({}, {__close = function(_, err)\n"
+            "  log[#log+1] = 'c1:'..tostring(err)\n"
+            "end})\n"
+            "OBJ2 = setmetatable({}, {__close = function(_, err)\n"
+            "  log[#log+1] = 'c2:'..tostring(err)\n"
+            "end})\n"
+            "LUA_MID = function()\n"
+            "  local x2 <close> = setmetatable({}, {__close = function(_, err)\n"
+            "    log[#log+1] = 'lua2:'..tostring(err)\n"
+            "  end})\n"
+            "  return NESTED()\n"
+            "end\n",
+            "co = coroutine.create(function() return CBODY() end)",
+            0))
+        return 1;
+    printf("\n");
+
+    /* FC-11: TWO alternations — C1, Lua2, C2, Lua3, C3, yield. Order
+    ** must be c3, lua3, c2, lua2, c1. */
+    if (run_il(
+            "local log = {}\n"
+            "LOG = log\n"
+            "KRAN = function() log[#log+1] = 'K-RAN' end\n"
+            "OBJ1 = setmetatable({}, {__close = function(_, err)\n"
+            "  log[#log+1] = 'c1:'..tostring(err)\n"
+            "end})\n"
+            "OBJ2 = setmetatable({}, {__close = function(_, err)\n"
+            "  log[#log+1] = 'c2:'..tostring(err)\n"
+            "end})\n"
+            "OBJ3 = setmetatable({}, {__close = function(_, err)\n"
+            "  log[#log+1] = 'c3:'..tostring(err)\n"
+            "end})\n"
+            "LUA_MID = function()\n"
+            "  local x2 <close> = setmetatable({}, {__close = function(_, err)\n"
+            "    log[#log+1] = 'lua2:'..tostring(err)\n"
+            "  end})\n"
+            "  return NESTED2()\n"
+            "end\n"
+            "LUA_MID3 = function()\n"
+            "  local x3 <close> = setmetatable({}, {__close = function(_, err)\n"
+            "    log[#log+1] = 'lua3:'..tostring(err)\n"
+            "  end})\n"
+            "  return NESTED()\n"
+            "end\n",
+            "co = coroutine.create(function() return CBODY() end)",
+            0))
+        return 1;
+    printf("\n");
+
+    /* FC-12a: the interleaved LUA closer errors — the close continues
+    ** through the older C obligation with the new error object
+    ** (last-error-wins; final status LUA_ERRRUN). */
+    if (run_il(
+            "local log = {}\n"
+            "LOG = log\n"
+            "OBJ1 = setmetatable({}, {__close = function(_, err)\n"
+            "  log[#log+1] = 'c1:'..tostring(err)\n"
+            "end})\n"
+            "OBJ2 = setmetatable({}, {__close = function(_, err)\n"
+            "  log[#log+1] = 'c2:'..tostring(err)\n"
+            "end})\n"
+            "LUA_MID = function()\n"
+            "  local x2 <close> = setmetatable({}, {__close = function(_, err)\n"
+            "    log[#log+1] = 'lua2:'..tostring(err)\n"
+            "    error('lerr', 0)\n"
+            "  end})\n"
+            "  return NESTED()\n"
+            "end\n",
+            "co = coroutine.create(function() return CBODY() end)",
+            0))
+        return 1;
+    printf("\n");
+
+    /* FC-12b: the interleaved INNER C closer errors — the Lua and the
+    ** older C obligations receive the error object in order. */
+    if (run_il(
+            "local log = {}\n"
+            "LOG = log\n"
+            "OBJ1 = setmetatable({}, {__close = function(_, err)\n"
+            "  log[#log+1] = 'c1:'..tostring(err)\n"
+            "end})\n"
+            "OBJ2 = setmetatable({}, {__close = function(_, err)\n"
+            "  log[#log+1] = 'c2:'..tostring(err)\n"
+            "  error('cerr', 0)\n"
+            "end})\n"
+            "LUA_MID = function()\n"
+            "  local x2 <close> = setmetatable({}, {__close = function(_, err)\n"
+            "    log[#log+1] = 'lua2:'..tostring(err)\n"
+            "  end})\n"
+            "  return NESTED()\n"
+            "end\n",
+            "co = coroutine.create(function() return CBODY() end)",
+            0))
+        return 1;
+    printf("\n");
+
+    /* FC-13: interleaved + GC between suspension and close + non-string
+    ** error object identity through the alternation. */
+    if (run_il(
+            "local log = {}\n"
+            "LOG = log\n"
+            "EOTBL = setmetatable({}, {__tostring = function() return 'ET' end})\n"
+            "OBJ1 = setmetatable({}, {__close = function(_, err)\n"
+            "  log[#log+1] = 'c1:'..tostring(err)\n"
+            "end})\n"
+            "OBJ2 = setmetatable({}, {__close = function(_, err)\n"
+            "  log[#log+1] = 'c2:'..tostring(err)\n"
+            "end})\n"
+            "LUA_MID = function()\n"
+            "  local x2 <close> = setmetatable({}, {__close = function(_, err)\n"
+            "    log[#log+1] = 'lua2:'..tostring(err)\n"
+            "    error(EOTBL, 0)\n"
+            "  end})\n"
+            "  return NESTED()\n"
+            "end\n",
+            "co = coroutine.create(function() return CBODY() end)",
+            1))
         return 1;
 
     printf("=== 26_tbc_forced_close_cbody DONE ===\n");

@@ -15321,13 +15321,13 @@ pub const Vm = struct {
     ///
     /// In luazig, `lua_closethread` (close_mode) must mirror this: discard
     /// C-frames (free owned state + pop) WITHOUT calling `finishCcall`/k.
-    /// The C frame's TBC chain entries are closed by the CALLER
-    /// (`forcedCloseResetCChain`: detach-then-discard-then-close-all) — the
-    /// chain, not the CallInfo, carries the close obligation (PUC tbclist).
-    /// The Lua-frame TBC variables are closed by the existing forced-close
-    /// unwind (`appendBytecodeForcedCloseUnwind` in `runBytecodeInternal`'s
-    /// `resume_in_place and close_mode` branch), which runs `__close` for
-    /// each Lua frame's TBC variables.
+    /// The C frame's TBC chain region is closed by the CALLER
+    /// (`forcedCloseResetCChain`: close-region-then-discard, per frame,
+    /// top-down) — the chain, not the CallInfo, carries the close
+    /// obligation (PUC tbclist). The Lua-frame TBC variables are closed by
+    /// the existing forced-close unwind (`appendBytecodeForcedCloseUnwind`
+    /// in `runBytecodeInternal`'s `resume_in_place and close_mode`
+    /// branch), which runs `__close` for each Lua frame's TBC variables.
     fn discardCFrame(self: *Vm, th: *Thread) void {
         const th_bc = &th.call_frames;
         const cur_len = th_bc.len();
@@ -17930,14 +17930,22 @@ pub const Vm = struct {
         // runBytecodeInternal is the outermost one — preserve its frame but
         // unwind any leftover nested frames above boundary_depth + 1.
         errdefer if (!yielded_in_place) {
-            // P15.70: The "owner" of the suspension is the runBytecodeInternal
-            // that should preserve its frame for resume. The outermost call
+            // P15.70: The "owner" of the suspension is a runBytecodeInternal
+            // whose frames must be preserved for resume. The outermost call
             // (the thread's outer boundary — 0 pre-base-frame, 1 with the
             // base frame, i.e. the coroutine body) is always the owner.
-            // Nested calls (e.g. f-closures from apiCall → runClosure) are
-            // owners only if their boundary matches bytecode_resume_boundary
-            // (set by parkDirectBytecodeYield for __close metamethod yields).
-            // Non-owners unwind their frames to prevent stale re-execution.
+            // A park marks the resume boundary at the topmost frame of the
+            // suspended continuation; every nested run at or below that
+            // boundary is part of the SAME suspended continuation (PUC: a
+            // yield suspends every CallInfo of the thread — lua_yield's
+            // longjmp unwinds nothing). This includes intermediate nested
+            // runs between the outer boundary and the resume boundary
+            // (e.g. a Lua frame called via lua_callk from a C function
+            // called from an outer Lua frame): their frames belong to the
+            // parked continuation and must survive, or the resume re-drive
+            // and a forced close lose the continuation's TBC obligations.
+            // Non-owners (frames above the resume boundary pushed by the
+            // park machinery itself) unwind to prevent stale re-execution.
             //
             // P15.78 Task 13: When callk/pcallk/yieldk pushes C-frames with
             // testc_state above this boundary, those C-frames MUST be preserved
@@ -17955,7 +17963,7 @@ pub const Vm = struct {
                 break :blk false;
             };
             const is_suspension_owner = exec_thread.bytecode_inplace_suspended and
-                (boundary_depth == bytecodeOuterBoundary(exec_frames) or boundary_depth == exec_thread.bytecode_resume_boundary or has_testc_cframes_above);
+                (boundary_depth == bytecodeOuterBoundary(exec_frames) or boundary_depth <= exec_thread.bytecode_resume_boundary or has_testc_cframes_above);
             if (!is_suspension_owner) {
                 // P16.50-review-10 BLOCKER 1: the abort unwind's upvalue
                 // close is infallible (overflow fallback — see
@@ -22723,6 +22731,13 @@ pub const Vm = struct {
             var vals_owned = true;
             errdefer if (vals_owned) self.alloc.free(vals);
             fr_call.clearHookYield();
+            // Clear the in-flight pending call installed by the original
+            // OP_CALL before the callee yielded. The replayed results are in
+            // `vals` and stored below per the same dst/nresults the pending
+            // carried — the pending is completed. Without this, a later
+            // OP_RETURN's beginBytecodeClose asserts on the stale pending
+            // (the OP_TAILCALL replay path clears its pending the same way).
+            self.clearPendingCall(fr_call);
             // P16.50-review-7 BLOCKER 3.2: the hook path adopts the post
             // payload on every error (owner guard / pending-cancel) —
             // disarm our mirror owner when it errors.
@@ -27838,12 +27853,33 @@ pub const Vm = struct {
                 // unwound TO the base (PUC unroll: `while (ci != &L->base_ci)`)
                 // — the base frame itself remains and is never finished.
                 if (framesAtBase(th)) {
-                    // P16.30 Stage C: a C-frame discard closer errored
-                    // (latched in th.close_err) — the close failed; report
-                    // via the !ok tail (the VM error state was set by
-                    // fail() inside the close).
-                    if (th.close_mode and th.close_has_err) {
-                        ok = false;
+                    if (th.close_mode) {
+                        // The base frame's region — every mark below the
+                        // frames the forced-close unwind popped — closes
+                        // LAST, with the running error (PUC
+                        // luaE_resetthread's single closeprotected pass
+                        // reaches them last; a closer error replaces the
+                        // running error, last-error-wins). Non-yieldable
+                        // (yy=0): clsret_frame=null.
+                        if (th.c_tbc_chain.items.len > 0) {
+                            const err_arg: ?Value = if (th.close_has_err) th.close_err else null;
+                            const final_err = try self.closeTbcRegion(th, 0, null, err_arg, 2, false, &.{});
+                            if (final_err) |fe| {
+                                th.close_has_err = true;
+                                th.close_err = fe;
+                                self.forced_close_had_error = true;
+                            }
+                        }
+                        // A closer errored (latched in th.close_err) — the
+                        // close failed; report via the !ok tail (the VM
+                        // error state was set by fail() inside the close).
+                        if (th.close_has_err) {
+                            ok = false;
+                            break :unroll_loop;
+                        }
+                        // The close succeeded; the unwound frames' results
+                        // are discarded (the transport reports the close
+                        // outcome, not the body's return values).
                         break :unroll_loop;
                     }
                     const ri = th.resume_inbox.slice() orelse &[_]Value{};
@@ -27865,12 +27901,12 @@ pub const Vm = struct {
                     // C-frames WITHOUT calling k (finishCcall). PUC's resetCI
                     // drops all CallInfos; the TBC variables are closed by
                     // luaF_close (the forced-close unwind in runBytecodeInternal).
-                    // The thread-owned reset closes the whole chain (the
-                    // close-mode arm already did at resume entry; a non-empty
-                    // chain here means marks made by closers since) and
-                    // discards the surfaced C frames; the running error lives
-                    // in th.close_err/close_has_err so it threads into the
-                    // Lua-frame close below.
+                    // The C-lane reset closes each surfaced C frame's region
+                    // and stops at the first Lua frame (the resume entry
+                    // already consumed the C frames above it; a non-empty
+                    // chain here means marks made by closers since); the
+                    // running error lives in th.close_err/close_has_err so it
+                    // threads into the Lua-frame close below.
                     if (th.close_mode) {
                         const err_arg: ?Value = if (th.close_has_err) th.close_err else null;
                         const final_err = try self.forcedCloseResetCChain(th, err_arg);
@@ -45560,6 +45596,24 @@ pub const Vm = struct {
             // Pop the mark BEFORE the closer runs (PUC poptbclist): a
             // closer error/yield must not re-close this entry.
             _ = chain.pop();
+            // Staging discipline: the closer invocation stages its callee
+            // and arguments at th.top, so every not-yet-read mark slot of
+            // this region must sit strictly BELOW that staging area —
+            // raise top above the highest live mark (PUC callclosemethod
+            // stages above the whole closing level, never inside it).
+            // Pure bound move within the allocated stack: no allocation,
+            // no mark reordering (the raised slots stay GC-visible, which
+            // only conservatively keeps them alive).
+            {
+                var need = th.top;
+                for (chain.items[base..]) |rest| switch (rest) {
+                    .frame_slot => |rfs| {
+                        if (rfs.slot_idx + 1 > need) need = rfs.slot_idx + 1;
+                    },
+                    .detached => {},
+                };
+                if (need > th.top) th.top = need;
+            }
             // P16.31 Cut 3: the testc close-metamethod depth (formerly
             // runTestcCloseMetamethod's wrapper, used by every testC/c_api
             // close lane before the unification) — a coroutine.yield from
@@ -45698,20 +45752,24 @@ pub const Vm = struct {
     /// C-lane half of `luaD_closeprotected(L, 1, status)`). ONE owner for
     /// the whole operation, in the PUC order:
     ///
-    /// 1. Detach every live `frame_slot` mark to its captured value while
-    ///    the owning frames' slots are still valid — in-place, no
-    ///    allocation, chain order unchanged (the detached value is the GC
-    ///    root from here on; the slot is nil'd like PUC `preclose`).
-    /// 2. Discard ALL C frames above the base frame WITHOUT calling their
-    ///    continuations (PUC `resetCI`: `ci->u.c.k = NULL` — no k, no
-    ///    results; the base frame is never discarded). Owned continuation
+    /// 1. Walk the frame stack top-down. Each non-base C frame's chain
+    ///    region (every mark newer than the frame) closes WITH the
+    ///    running error while the frame is still pushed — live
+    ///    `frame_slot` marks are read and nil'd like PUC `preclose`
+    ///    (yy=0, last-error-wins: a closer error replaces the running
+    ///    error for the older entries) — then the frame is discarded
+    ///    WITHOUT calling its continuation (PUC `resetCI`:
+    ///    `ci->u.c.k = NULL` — no k, no results). Owned continuation
     ///    state is released exactly once via discardCFrame.
-    /// 3. Close the whole chain as ONE thread-owned region (base 0, LIFO,
-    ///    yy=0): one running error threads through every entry — a
-    ///    suspended thread starts with nil; a closer error replaces the
-    ///    error for the older entries; the last error decides the return
-    ///    value (last-error-wins). The region owner is the THREAD (the
-    ///    whole `c_tbc_chain`), never a frame-local `tbc_chain_base`.
+    /// 2. The walk STOPS at the first Lua frame: that frame's region —
+    ///    and every frame below it — is owned by the forced-close unwind
+    ///    driven through the resume machinery (the close_mode branch in
+    ///    runBytecodeInternal), which closes each frame's region in the
+    ///    same top-down LIFO order (C frames and Lua frames interleaved
+    ///    by frame chronology, matching PUC's single tbclist walk).
+    /// 3. When no Lua frame remains above the base, the base frame's
+    ///    region (every surviving mark) closes here, LAST (the base
+    ///    frame itself is never discarded — PUC resetCI keeps base_ci).
     ///
     /// The closers run as FRESH calls on the target thread: the stale
     /// in-place suspension state left by the interrupted execution would
@@ -45720,30 +45778,31 @@ pub const Vm = struct {
     /// the metamethod body. It is cleared here; the Lua-frame unwind
     /// setup at the call sites re-establishes it afterwards.
     fn forcedCloseResetCChain(self: *Vm, th: *Thread, err: ?Value) DispatchError!?Value {
-        // (1) Detach all live marks while the slots are valid.
-        for (th.c_tbc_chain.items) |*entry| {
-            switch (entry.*) {
-                .frame_slot => |fs| {
-                    const v = self.cFrameTbcSlotValue(th, fs.cframe_idx, fs.slot_idx) orelse .Nil;
-                    self.setCFrameTbcSlotNil(th, fs.cframe_idx, fs.slot_idx);
-                    entry.* = .{ .detached = v };
-                },
-                .detached => {},
-            }
-        }
-        // (2) resetCI: discard every C frame above the base, no k.
+        var cur_err = err;
+        th.bytecode_inplace_suspended = false;
         while (th.call_frames.len() > 0) {
             const top = th.call_frames.getConstPtr(th.call_frames.len() - 1);
-            if (!top.isC() or top.isBase()) break;
+            // The base frame is never discarded; its region closes below.
+            if (top.isBase()) break;
+            // A Lua frame hands the remaining frames (and their regions)
+            // to the forced-close unwind driven through the resume
+            // machinery — the close_mode branch in runBytecodeInternal.
+            if (!top.isC()) break;
+            // This C frame's region: every mark newer than the frame.
+            // clsret_frame=null: the forced close is non-yieldable
+            // (yy=0), so no CLSRET can be installed.
+            const final_err = try self.closeTbcRegion(th, top.tbc_chain_base, null, cur_err, 2, false, &.{});
+            if (final_err) |fe| cur_err = fe;
             self.discardCFrame(th);
         }
-        // (3) One thread-owned close-all (base 0 = every surviving mark:
-        // detached values of the discarded frames + live marks of frames
-        // that stay pushed — the base frame's window marks included).
-        // clsret_frame=null: close-all is non-yieldable (yy=0), so no
-        // CLSRET can be installed.
-        th.bytecode_inplace_suspended = false;
-        return self.closeTbcRegion(th, 0, null, err, 2, false, &.{});
+        // No Lua frame above the base: the surviving marks are the base
+        // frame's region — close them with the running error (PUC
+        // luaE_resetthread's closeprotected pass reaches them last).
+        if (framesAtBase(th)) {
+            const final_err = try self.closeTbcRegion(th, 0, null, cur_err, 2, false, &.{});
+            if (final_err) |fe| cur_err = fe;
+        }
+        return cur_err;
     }
 
     /// P16.31 Cut 3: the pcall/xpcall recovery-boundary close — PUC

@@ -1015,7 +1015,22 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   exclusion-(b) снят (комментарий обновлён). Mutation: старый цикл без
   сброса флага → FC-1 RED; frame-local цикл с флагом → FC-9/FC-5 RED.
   Battery 355/355 Debug+RF; matrix --testc (RF) zig_fail=0; smoke 86/86;
-  fmt/diff-check clean.
+  fmt/diff-check clean. REVIEWER-CORRECTION (после 12d69fb не принят):
+  whole-chain drain ломал ГЛОБАЛЬНЫЙ C/Lua LIFO-порядок (C1→Lua2→C2→yield
+  давал c2,c1,lua2 вместо PUC c2,lua2,c1) — исправлено сегментированным
+  forcedCloseResetCChain (per-C-frame region close yy=0 → discard без k →
+  stop на первом Lua frame → существующий forced-close unwind закрывает
+  свой C-suffix затем bytecode_tbc_regs → чередование до base; ОДИН
+  running error, last-error-wins; stale-флаг сброс с
+  re-establishment). Попутно закрыт C-lane staging-дефект (closer
+  стейджился по th.top НИЖЕ непрочитанных mark-слотов — 12d69fb маскировал
+  его предварительным detach; FC-5 double-close regression): window-raise
+  над живыми marks в closeTbcRegion. Suite 26 расширен FC-10..FC-13
+  (interleaved c2,lua2,c1; 2-alternation c3,lua3,c2,lua2,c1; inner-error
+  C/Lua; GC+non-string interleaved) — все DIFF-PASS = PUC дословно;
+  mutation whole-drain → FC-10/11 RED при зелёном FC-5. Единый ordered
+  TBC owner остаётся подтверждённым долгом (ARCHITECTURE_DEBT.md), не
+  скрыт коррекцией.
 
 - [ ] **Parity HIGH (pre-existing, REDESIGN-констрейнт): yieldability
   pcall-recovery close (16118-ветка) расходится с PUC finishpcallk**:

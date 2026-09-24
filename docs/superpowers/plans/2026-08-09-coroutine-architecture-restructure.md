@@ -1,7 +1,7 @@
 # Coroutine Architecture Restructure Implementation Plan
 
 > **STATUS:** Phase 0 complete. Phase 1 (host recursion) CANCELLED — PUC uses
-> `goto startfunc` (iterative), not recursion (see DESIGN.md). Phases 1-4
+> `goto startfunc` (iterative), not recursion. Phases 1-4
 > based on wrong assumption. Phase 6 (zero-alloc) partially done.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

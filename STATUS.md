@@ -665,7 +665,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   Open-count 24→23 (TBC-parity BLOCKER и emergency-GC HIGH остаются
   открытыми).
 
-- [ ] **Safety: emergency GC не должен разыменовывать stale register
+- [x] **Safety: emergency GC не должен разыменовывать stale register
   pointers**: precise ordinary GC освобождает объекты из мёртвых регистров,
   тогда как последующий emergency full-window scan проверяет membership через
   чтение `gc_index` из уже освобождённого объекта. Текущий skip безопасен лишь
@@ -677,6 +677,16 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   доказательство для чередования ordinary→emergency cycles; если этот путь
   невозможен, использовать non-dereferencing address registry, а не читать
   header через подозрительный pointer.
+  CLOSED по evidence A1.1 unified stack (`ac3e2b7`): оба GC-прохода теперь
+  маркируют занятое окно `Thread.stack[0..top)` целиком; precise
+  `live_reg_top` и stale-`gc_index` membership skip удалены. Объект,
+  находящийся в сканируемом слоте, не может быть освобождён обычным циклом
+  перед emergency scan. Poison/unmap oracle A1.1s1 C10 проверяет
+  ordinary→emergency последовательность с PROT_NONE на освобождённых
+  блоках, включая no-poison/no-sweep controls; M14 повторно доказан на
+  wholesale-модели. На review `9b1bad7` пункт сверен с текущим
+  `gcMarkMutableRoots`, `gcMarkValueImpl` и poison-тестом; open-count
+  25→24 (устаревший открытый пункт, без новой product-правки).
 
 - [x] **Safety: constructor→push OOM UAF-окна (W1; A1.1R3 M1, R4-severity
   BLOCKER, CONFIRMED dyn)**: first invalid op — construction/registration

@@ -164,7 +164,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   открытыми); emergency-rescue HIGH (rescued-never-finalized) открыт фазой —
   open-count 23→24.
 
-- [ ] **Parity: emergency-GC rescue снимает finalization (rescued-never-
+- [x] **Parity: emergency-GC rescue снимает finalization (rescued-never-
   finalized)**: [review-15 HIGH, origin: BLOCKER 2 regular-cycle matrix] объект,
   отделённый в tobefnz (`gc_to_finalize`) в atomic emergency-GC (finalizers
   подавлены — PUC GCScallfin guard, lgc.c), остаётся marked и с FINALIZEDBIT,
@@ -191,6 +191,19 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   `tobefnz`; промежуточная dense FIFO-очередь не внедряется. Следующая
   итерация — research полного constructor/sweep/generational/rollback cut;
   этот пункт остаётся открытым, open-count не меняется.
+  CLOSED (GC-milestone Cut 3, 19faf56): единая intrusive
+  lifetime/finalizer authority — finobj (head-link на регистрации,
+  REVERSE-registration), персистентный tobefnz (tail-append separation без
+  аллокаций; переживает emergency/GCSTOP/mode-switch), dequeue ДО lookup с
+  bit-clear (exactly-once), callfin ПОСЛЕ sweep (GCTM-контракт; OOM/ошибка
+  тела → warn+continue). Порядок регистрации: PUC REVERSE-confirmed
+  (create a,b + __gc на b,a → fin a,fin b = PUC дословно; gc_seq-сорт
+  удалён). Evidence: canonical tests/c_api/27_finalizer_owners (формы
+  a-k) DIFF-PASS побайтово Debug+RF (adapter+real-alloc, gen carry-over,
+  retry no-double, GCSTOP, shutdown pending-first, re-registration,
+  current-metatable, finalizable-in-__gc survival); мутации
+  l1/l2/l3 RED. Cut 4 (4ca07d2): временный слой/вторые authority удалены
+  (grep=0); чекер 3-списковой эксклюзивности.
 
 - [x] **P16.50 table_alloc_setmetatable perf WARN (HIGH)**: canonical
   review-14 gate имеет matched center +4.0305% и seeds 9/10/15 выше +5%.
@@ -1054,7 +1067,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   TBC owner остаётся подтверждённым долгом (ARCHITECTURE_DEBT.md), не
   скрыт коррекцией.
 
-- [ ] **Safety BLOCKER (pre-existing, найден A1.next-2 research):
+- [x] **Safety BLOCKER (pre-existing, найден A1.next-2 research):
   finalizable, созданный внутри `__gc`, теряет metatable в том же цикле** —
   corruption/GPF на close, паника на 3-м цикле, или потеря финализатора
   (PUC: `inner` финализируется во 2-м цикле). Механизм: финализаторы
@@ -1067,12 +1080,23 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   sweep (PUC-фаза) и/или intrusive-списками GC-миграции; точечное лечение
   (маркировка графа при регистрации в atomic) PUC-аналога не имеет. Тот же
   milestone, что finalizer parity.
+  CLOSED (GC-milestone Cut 3): финализаторы перенесены из atomic в
+  post-sweep .callfin-фазу (PUC GCTM/GCScallfin) — newborn-объекты из
+  __gc встречают white-flip следующего цикла корректно; atomic Steps 12/13
+  удалены. Evidence: suite 27 форма (j) DIFF-PASS; mutation l2
+  (callfin-в-atomic) RED; battery/matrix/smoke зелёные; валгринд-чисто.
 
-- [ ] **Safety HIGH (UNCONFIRMED, найден A1.next-2 research): rooted-пауза в
+- [x] **Safety HIGH (UNCONFIRMED, найден A1.next-2 research): rooted-пауза в
   `applyLoadEnv`** (vm.zig:33626-33652): cells коммитятся до публикации в
   `cl.upvalues` без root. Решающий эксперимент: caller с cl коротких
   upvalues + armed-adapter countdown на Cell-аллокациях между commit и
   публикацией. При подтверждении — в constructor/rollback-часть GC-миграции.
+  CLOSED as REFUTED (GC-milestone Cut 4 decisive-эксперимент): ветка
+  коротких upvalues недостижима — panic-инструментация на battery
+  D+RF/matrix/smoke/sweep = 0 срабатываний; все 6 caller'ов дают полные
+  root-scoped cells (между commit и protect нет fallible операций);
+  countdown-sweep 524 индекса × 2 режима — только ok/oom. Мёртвая ветка
+  удалена (PUC-паритет load_aux восстановлен).
 
 - [ ] **Safety BLOCKER (pre-existing, найден A1.next research): emergency-GC
   во время вычисления аргументов вызова глобала теряет callee value**:

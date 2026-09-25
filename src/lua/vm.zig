@@ -567,24 +567,22 @@ pub const GcTag = enum(u8) {
 /// `gc: GcHeader` and downcast via `@fieldParentPtr("gc", ...)`; LuaString
 /// (extern, 48 B pinned) declares the same prefix bytes directly, with
 /// srkind@11 and hash(u32)@12 occupying the tail of the block instead of
-/// `index`.
+/// `_pad`.
 ///
-/// `next` is the lifetime link: shadow of the dense `gc_objects` registry,
-/// maintained as the linked form of that list (identical order) — link at
-/// commit, unlink at unregister. It becomes the canonical allgc chain.
-///
-/// `index` is the object's position in `Vm.gc_objects` — the dense-side
-/// O(1) handle for sweep/rollback removals. It lives inside the header
-/// block (the bytes were padding) and is deleted together with the dense
-/// registry. A LuaString's bytes 12..16 are its hash: `index` must never
-/// be accessed through a string's header (use the typed paths in
-/// `gcPtr`/`gcUnregisterObject*`).
+/// `next` is the CANONICAL lifetime link: the allgc chain (creation order,
+/// tail-appended — a documented divergence from PUC's head-inserted
+/// newest-first chain; the sweep order oldest→newest is not observable as
+/// a semantic contract, and the age machinery below is built on this
+/// orientation). Link at commit, unlink at unregister; every lifetime
+/// decision (sweep, rollback, teardown, full passes) walks this chain.
+/// A LuaString's bytes 12..16 are its hash: `_pad` must never be accessed
+/// through a string's header.
 pub const GcHeader = extern struct {
     next: ?*GcHeader = null,
     marked: u8 = 0,
     age: GcAge = .new,
     tag: GcTag,
-    index: u32 = 0,
+    _pad: u32 = 0,
 };
 
 comptime {
@@ -593,7 +591,7 @@ comptime {
     std.debug.assert(@offsetOf(GcHeader, "marked") == 8);
     std.debug.assert(@offsetOf(GcHeader, "age") == 9);
     std.debug.assert(@offsetOf(GcHeader, "tag") == 10);
-    std.debug.assert(@offsetOf(GcHeader, "index") == 12);
+    std.debug.assert(@offsetOf(GcHeader, "_pad") == 12);
 }
 
 /// PUC lgc.h:79-86 — per-object mark bits stored in `gc_marked`.
@@ -677,15 +675,6 @@ const MASKCOLORS: u8 = BLACKBIT | WHITEBITS;
 /// together with `gc_gray_overflow`. Cleared only by the overflow drain,
 /// after the successful append that records the queue entry.
 const MISSEDGRAYBIT: u8 = 1 << 7;
-
-/// Transient young-sweep marker (bit 0 of `marked`): a dead young STRING
-/// whose registry removal + free is deferred to the post-sweep compaction
-/// pass (`gcSweepDropPendingStrings`). Strings carry no dense index, so
-/// their O(1) inline removal is unavailable; batching keeps the young
-/// sweep linear. Set only between the young-sweep death check and the
-/// compaction pass, on objects already dead this cycle — invisible to
-/// every color helper (they mask bits 3..7) and to the free path.
-const STRING_PENDING_SWEEP: u8 = 1 << 0;
 
 /// PUC lgc.h:213-215: GC stop bits for `g->gcstp`.
 const GCSTPUSR: u8 = 1; // stopped by user
@@ -802,9 +791,7 @@ pub const Cell = struct {
     pub const stack_closed: u32 = std.math.maxInt(u32);
 
     value: Value,
-    /// GC header (marked/age/tag/index + the allgc lifetime link).
-    /// `gc.index` is this object's position in `Vm.gc_objects` — the
-    /// O(1) handle for `gcUnregisterObject*` removals.
+    /// GC header (marked/age/tag + the allgc lifetime link).
     gc: GcHeader = .{ .tag = .cell },
     /// When != stack_closed, this is an "open" upvalue that directly
     /// references the owning thread's bytecode stack at this index
@@ -919,9 +906,7 @@ pub const Lx = struct {
 };
 
 pub const Closure = struct {
-    /// GC header (marked/age/tag/index + the allgc lifetime link).
-    /// `gc.index` is this object's position in `Vm.gc_objects` — the
-    /// O(1) handle for `gcUnregisterObject*` removals.
+    /// GC header (marked/age/tag + the allgc lifetime link).
     gc: GcHeader = .{ .tag = .closure },
     proto: ?*const bc.Proto = null, // bytecode proto (non-null for bytecode closures)
     /// The proto tree's lifetime (P16.10b Task 4/5) is DERIVED from the
@@ -2436,9 +2421,7 @@ const ResumeResult = union(enum) {
 };
 
 pub const Thread = struct {
-    /// GC header (marked/age/tag/index + the allgc lifetime link).
-    /// `gc.index` is this object's position in `Vm.gc_objects` — the
-    /// O(1) handle for `gcUnregisterObject*` removals.
+    /// GC header (marked/age/tag + the allgc lifetime link).
     gc: GcHeader = .{ .tag = .thread },
     /// PUC traversethread's `gclist` link (lgc.c:699-700: every traversal
     /// `linkgclist(th, g->grayagain)` for the atomic-phase final traversal).
@@ -3377,31 +3360,6 @@ pub const StringIntern = struct {
 
     table: Map = .empty,
 
-    /// Sweep: remove and free entries whose LuaString is dead (not marked
-    /// during this GC cycle). Safe to call during GC — collects entries to
-    /// remove first, then removes+frees one at a time (key is valid until the
-    /// LuaString is freed).
-    pub fn sweep(self: *StringIntern, temp_alloc: std.mem.Allocator, free_alloc: std.mem.Allocator, current_white: u8) !void {
-        // temp_alloc (infra) backs the removal list — GC-internal bookkeeping
-        // that must not fail under an armed test memory limit (PUC's string
-        // sweep is allocation-free pointer surgery). free_alloc (the counted
-        // adapter) backs the destroys: dead strings were charged at creation,
-        // so their frees must subtract from the ledger (adapter frees never
-        // fail — PUC freeblock does no checks).
-        var to_remove = std.ArrayListUnmanaged(*LuaString).empty;
-        defer to_remove.deinit(temp_alloc);
-        var it = self.table.iterator();
-        while (it.next()) |entry| {
-            if (gcIsDead(entry.value_ptr.*.marked, current_white)) {
-                try to_remove.append(temp_alloc, entry.value_ptr.*);
-            }
-        }
-        for (to_remove.items) |ls| {
-            _ = self.table.remove(ls.bytes());
-            destroyLuaString(free_alloc, ls);
-        }
-    }
-
     // Return the canonical *LuaString for `raw`, creating+inserting it if absent.
     // `hash` is the caller-computed content hash (random-seeded at the Vm level),
     // cached on the LuaString so the Table's own hash and all later uses are free.
@@ -3412,10 +3370,13 @@ pub const StringIntern = struct {
         return ls;
     }
 
-    fn deinit(self: *StringIntern, alloc: std.mem.Allocator) void {
-        var it = self.table.valueIterator();
-        while (it.next()) |ls_ptr| destroyLuaString(alloc, ls_ptr.*);
+    /// Free the map storage only. The strings themselves are members of
+    /// the allgc chain and are destroyed by the GC teardown walk; their
+    /// frees remove the map entries, so by the time this runs the map is
+    /// empty (a bare HashMap deinit never touches keys or values).
+    fn deinitMap(self: *StringIntern, alloc: std.mem.Allocator) void {
         self.table.deinit(alloc);
+        self.* = .{};
     }
 };
 
@@ -3437,19 +3398,23 @@ fn hashStringForTest(s: []const u8) u32 {
 
 test "StringIntern dedups equal content to same pointer" {
     var intern = StringIntern{};
-    defer intern.deinit(std.testing.allocator);
+    defer intern.deinitMap(std.testing.allocator);
     const a = try intern.intern(std.testing.allocator, "foo", hashStringForTest("foo"));
     const b = try intern.intern(std.testing.allocator, "foo", hashStringForTest("foo"));
     try std.testing.expect(a == b); // pointer identity
     try std.testing.expectEqualStrings("foo", a.bytes());
+    var it = intern.table.valueIterator();
+    while (it.next()) |ls| destroyLuaString(std.testing.allocator, ls.*);
 }
 
 test "StringIntern keeps distinct content distinct" {
     var intern = StringIntern{};
-    defer intern.deinit(std.testing.allocator);
+    defer intern.deinitMap(std.testing.allocator);
     const a = try intern.intern(std.testing.allocator, "foo", hashStringForTest("foo"));
     const c = try intern.intern(std.testing.allocator, "bar", hashStringForTest("bar"));
     try std.testing.expect(a != c);
+    var it = intern.table.valueIterator();
+    while (it.next()) |ls| destroyLuaString(std.testing.allocator, ls.*);
 }
 
 // PUC Lua has two string variants: short (<= LUAI_MAXSHORTLEN=40) interned in
@@ -3727,7 +3692,7 @@ test "rejected resume entry leaves target status unchanged" {
     // matches coroutine.create; the body kind is irrelevant to ENTRY).
     const co = try vm.alloc.create(Thread);
     co.* = .{ .callee = .Nil };
-    try vm.gcRegisterThread(co);
+    vm.gcRegisterThread(co);
     co.status = .suspended;
     co.started = false;
     // Push the active thread to the C-call limit.
@@ -3989,23 +3954,22 @@ pub const GcObject = union(enum) {
 /// P16.16 C1: no `seq` here — only the finalizable types (Table, Userdata)
 /// carry a creation sequence, accessed via `gcFinalizableSeq` at the single
 /// finalizer-sort site. No fake uniform field for non-finalizable types.
+/// Access the GC header fields (marked, age) of any GC-managed object
+/// through its GcObject tag. This is the single dispatch point that lets
+/// generic GC code operate on all types uniformly.
 const GcPtr = struct {
     marked: *u8,
     age: *GcAge,
-    index: ?*u32,
 };
 
-/// Access the GC header fields (marked, age, index) of any GC-managed
-/// object through its GcObject tag. This is the single dispatch point
-/// that lets generic GC code operate on all types uniformly.
 fn gcPtr(obj: GcObject) GcPtr {
     return switch (obj) {
-        .table => |t| .{ .marked = &t.gc.marked, .age = &t.gc.age, .index = &t.gc.index },
-        .closure => |c| .{ .marked = &c.gc.marked, .age = &c.gc.age, .index = &c.gc.index },
-        .thread => |t| .{ .marked = &t.gc.marked, .age = &t.gc.age, .index = &t.gc.index },
-        .string => |s| .{ .marked = &s.marked, .age = &s.age, .index = null },
-        .cell => |c| .{ .marked = &c.gc.marked, .age = &c.gc.age, .index = &c.gc.index },
-        .userdata => |u| .{ .marked = &u.gc.marked, .age = &u.gc.age, .index = &u.gc.index },
+        .table => |t| .{ .marked = &t.gc.marked, .age = &t.gc.age },
+        .closure => |c| .{ .marked = &c.gc.marked, .age = &c.gc.age },
+        .thread => |t| .{ .marked = &t.gc.marked, .age = &t.gc.age },
+        .string => |s| .{ .marked = &s.marked, .age = &s.age },
+        .cell => |c| .{ .marked = &c.gc.marked, .age = &c.gc.age },
+        .userdata => |u| .{ .marked = &u.gc.marked, .age = &u.gc.age },
     };
 }
 
@@ -4038,7 +4002,7 @@ fn gcFromHeader(h: *GcHeader) GcObject {
 /// Creation sequence of a finalizable object (Table/Userdata only — the
 /// only types `gcCanFinalize` admits, hence the only types ever present in
 /// the `finalizables` set and its LIFO sort). Used by `gcFinalizeLessThan`
-/// for PUC LIFO finalization order and by `gcRegisterObject` to stamp the
+/// for PUC LIFO finalization order and by `gcRegisterCommit` to stamp the
 /// sequence at creation. Returns null for non-finalizable types (they carry
 /// no seq field — no fake uniform value).
 fn gcFinalizableSeqPtr(obj: GcObject) ?*u64 {
@@ -4128,14 +4092,11 @@ const TableFlags = struct {
 };
 
 pub const Table = struct {
-    /// GC header (marked/age/tag/index + the allgc lifetime link).
-    /// `gc.index` is this object's position in `Vm.gc_objects` — the
-    /// O(1) handle for `gcUnregisterObject*` removals.
+    /// GC header (marked/age/tag + the allgc lifetime link).
     gc: GcHeader = .{ .tag = .table },
     /// Monotonic creation sequence — never changes after allocation.
-    /// Used for PUC LIFO finalization order (independent of gc_index,
-    /// which is corrupted by swapRemove during sweep). P16.16 C1: only
-    /// the finalizable types (Table, Userdata) carry a sequence — the
+    /// Used for PUC LIFO finalization order. P16.16 C1: only the
+    /// finalizable types (Table, Userdata) carry a sequence — the
     /// finalizer sort never sees other types, so they carry no seq field.
     gc_seq: u64 = 0,
 
@@ -4202,9 +4163,7 @@ pub const Table = struct {
 /// preserving PUC semantics: per-object metatable, `nuvalue` user values
 /// (1-indexed from Lua via `debug.setiuservalue`), and `len` raw bytes.
 pub const Userdata = struct {
-    /// GC header (marked/age/tag/index + the allgc lifetime link).
-    /// `gc.index` is this object's position in `Vm.gc_objects` — the
-    /// O(1) handle for `gcUnregisterObject*` removals.
+    /// GC header (marked/age/tag + the allgc lifetime link).
     gc: GcHeader = .{ .tag = .userdata },
     /// Monotonic creation sequence for PUC LIFO finalization order
     /// (P16.16 C1: finalizable-types-only; see Table.gc_seq).
@@ -4375,15 +4334,6 @@ pub const VmStats = struct {
     /// execution never reads it).
     gc_root_scope_sessions: u64 = 0,
 
-    // ── GC stale-entry debug counters (Task 7) ──
-    // Count hits at the gcQueueScanObject/gcDrainGrayagain stale-entry
-    // asserts. These should ALWAYS be zero: with the correct grayagain
-    // lifecycle (save+clear at atomic, gcCorrectGrayAgain after sweep),
-    // no freed object can remain in any GC aux list. Non-zero indicates
-    // a lifecycle bug.
-    gc_stale_queue_scan: u64 = 0,
-    gc_stale_grayagain: u64 = 0,
-
     // ── Coroutines ──
     yields: u64 = 0,
     resumes: u64 = 0,
@@ -4416,9 +4366,8 @@ const TestcAllocControl = struct {
     /// while armed, every charged block the adapter allocates lives in a
     /// private anonymous mapping, and freeFn TRAPS it with
     /// mprotect(PROT_NONE) instead of returning it to the base allocator.
-    /// Any read of a freed object's header — e.g. the gc_index membership
-    /// check in gcMarkValueImpl during an emergency-GC full register
-    /// window — faults deterministically, and the trapped address is never
+    /// Any read of a freed object's header — e.g. a stale chain traversal
+    /// during an emergency-GC pass — faults deterministically, and the trapped address is never
     /// handed out again (unlike a plain unmap, where the base allocator
     /// may immediately reuse the address and let a stale read silently
     /// succeed). Blocks allocated BEFORE arming keep the ordinary
@@ -4939,34 +4888,23 @@ pub const Vm = struct {
     /// `resolveEnvPath` so env vars are never read when `-E` is set.
     noenv: bool = false,
 
-    // Universal registry of every GC-able object allocated during the VM's
-    // lifetime. Each object is appended exactly once at its allocation site;
-    // the GC sweep phase enumerates this list to find and free unreachable
-    // objects. `Vm.deinit` drains it as the single ownership point for object
-    // destruction at teardown.
-    //
-    // This replaces PUC Lua's intrusive `GCObject.next` singly-linked list
-    // (`g->allgc`) with a single `ArrayList(GcObject)` living on the Vm.
-    // Overhead is one pointer per object — identical to PUC's intrusive node —
-    // with zero layout change to the managed types, type-safe iteration, and
-    // no pointer-juggling during sweep (`swapRemove` is O(1)).
-    gc_objects: std.ArrayListUnmanaged(GcObject) = .empty,
-    /// Shadow intrusive allgc chain — the linked form of `gc_objects`
-    /// (identical order, link at commit, unlink at unregister) carried in
-    /// every object's GcHeader.next. The dense registry remains the only
-    /// owner; the chain owns nothing and exists to prove the intrusive
-    /// layout losslessly mirrors the registry (Debug checker) before the
-    /// registry is retired and the chain becomes canonical.
+    // Canonical allgc chain: every GC object is linked at commit
+    // (tail-append, creation order) and unlinked at unregister. This is
+    // the single lifetime authority — sweep, rollback, teardown and every
+    // full pass walk it. `gc_objects` below is a Debug-only mirror for the
+    // sync checker and carries no authority in any mode.
     gc_allgc_head: ?*GcHeader = null,
-    /// Count of STRING_PENDING_SWEEP-marked strings accumulated by the
-    /// running young sweep — nonzero only between the death checks and
-    /// the deferred compaction pass.
-    gc_pending_string_sweep: usize = 0,
-    gc_objects_snapshot_len: usize = 0,
+    gc_allgc_tail: ?*GcHeader = null,
+    /// Debug-only order-preserving mirror of the chain
+    /// (`builtin.mode == .Debug` maintenance): appended at commit,
+    /// identity-removed (orderedRemove) at unlink. Exists solely so
+    /// `gcAllgcAssertSync` can cross-validate the chain against an
+    /// independently maintained dense sequence (equal lengths, member
+    //  order, no losses/duplicates). Never compiled into hot paths of
+    /// non-Debug builds.
+    gc_objects: std.ArrayListUnmanaged(GcObject) = .empty,
     /// Monotonic creation counter — never decreases. Used for PUC LIFO
-    /// finalization order. Unlike `gc_index` (which is corrupted by
-    /// `swapRemove` during sweep), `gc_seq` is set once at allocation
-    /// and never changed.
+    /// finalization order; set once at allocation and never changed.
     gc_creation_seq: u64 = 0,
     // (P16.10b Task 6) The old VM-global `pinned_source_strings` list is
     // RETIRED: source pins now live on each tree's root Proto (CUT2)
@@ -5029,28 +4967,42 @@ pub const Vm = struct {
     /// tobecollected = total - marked.
     gc_gen_marked_kb: f64 = 0.0,
 
-    // Generational registries mirror PUC's nursery/survival/old1 and
-    // grayagain lists without requiring intrusive links in every object.
-    // Minor collections walk only these lists, not the complete old heap.
-    /// Unified young list for generational GC.
-    gc_young_objects: std.ArrayListUnmanaged(GcObject) = .empty,
-    gc_young_objects_snapshot_len: usize = 0,
+    // Generational state. Ages live in each object's header (the canonical
+    // generational state — PUC model); the boundaries below are POSITIONS
+    // in the allgc chain (head = oldest, tail = newest):
+    //   [chain head .. gc_gen_old1_scan)   — old region: every node's age
+    //                                        is .old/.touched* (≥ old)
+    //   [gc_gen_old1_scan .. young region) — the fresh OLD1 cohort (last
+    //                                        minor cycle's promotions)
+    //   [gc_gen_young_first .. tail]       — young region: nursery,
+    //                                        survival cohort and barrier
+    //                                        OLD0s, in creation order; the
+    //                                        walk filters by age (aged-out
+    //                                        stragglers inside the region
+    //                                        are skipped, mirroring the
+    //                                        eternal young-list membership
+    //                                        of the previous registry form)
+    // gc_gen_young_prev is the chain node before gc_gen_young_first (null
+    // when the young region starts at the chain head); together they form
+    // the unlinkable slot of the region start. PUC equivalents (reversed
+    // orientation): reallyold=gc_gen_old1_scan, survival-boundary=young
+    // region start; gc_gen_firstold1 is PUC's firstold1 — the TAILmost
+    // OLD1 node, the stop marker of the markold walk [old1_scan..
+    // firstold1]. All are node pointers; every unlink fixes them up
+    // (== victim → successor), which conservatively over-covers scans but
+    // never under-covers them (proof at gcChainUnlinkAt).
+    gc_gen_old1_scan: ?*GcHeader = null,
+    gc_gen_firstold1: ?*GcHeader = null,
+    gc_gen_young_first: ?*GcHeader = null,
+    gc_gen_young_prev: ?*GcHeader = null,
+    /// Tail node at minor-cycle start: nodes strictly beyond it were
+    /// allocated during the cycle (finalizers run in our atomic) and are
+    /// unconditionally kept by the young sweep — the pointer form of the
+    /// retired young-list snapshot tail.
+    gc_gen_snapshot: ?*GcHeader = null,
     /// PUC lgc.c uses a single gclist per object; we mirror that by keeping
     /// one list per role.
-    gc_old1: std.ArrayListUnmanaged(GcObject) = .empty,
-    /// P16.50-review-10 BLOCKER 1 / P16.50-review-11 BLOCKER 2: overflow
-    /// fallback state. `gc_gray`/`gc_old1` are ACCELERATING worklists —
-    /// the canonical state is the object's color/age. A commit whose
-    /// capacity reserve failed paints the canonical state and sets the
-    /// flag instead of appending; the GC drains the overflow when the
-    /// normal worklist is exhausted. The gray drain selects by the
-    /// per-object MISSEDGRAYBIT marker (color is mark-state, NOT queue
-    /// membership — grayagain members and open cells are also gray); the
-    /// old1 drain selects by age + list membership. `gc_gray_overflow`
-    /// is the fast "a marker exists" pointer: flag clear ⇒ no marker and
-    /// no unlisted OLD0 (the drains' complete-scan contract).
     gc_gray_overflow: bool = false,
-    gc_old1_overflow: bool = false,
     gc_grayagain: std.ArrayListUnmanaged(GcObject) = .empty,
     /// Head of the intrusive threads-final-traversal list (PUC grayagain's
     /// thread links, lgc.c:699-700). Threads are pushed by gcPropagateOne's
@@ -5067,8 +5019,6 @@ pub const Vm = struct {
     gc_gen_last_minor_visited: usize = 0,
     gc_gen_last_minor_old_visited: usize = 0,
     gc_minor_cycle: bool = false,
-    gc_old1_snapshot_len: usize = 0,
-    gc_grayagain_snapshot_len: usize = 0,
 
     // Persistent incremental collector state. Mark sets and gray/weak queues
     // are retained between steps, so each step performs bounded real work
@@ -5119,10 +5069,14 @@ pub const Vm = struct {
     gc_fin_closures: std.AutoHashMapUnmanaged(*Closure, void) = .{},
     gc_fin_threads: std.AutoHashMapUnmanaged(*Thread, void) = .{},
     gc_to_finalize: std.ArrayListUnmanaged(GcObject) = .empty,
-    /// Incremental sweep cursor over `gc_objects`. Walks from 0 to
-    /// `gc_objects_snapshot_len` (set at cycle start in `gcStartCycle`).
-    /// PUC-faithful: sweeps `allgc` in allocation order.
-    gc_sweep_objects_cursor: usize = 0,
+    /// Incremental sweep cursor: the last node examined and KEPT alive
+    /// (null = the sweep starts at the chain head). The next victim is
+    /// always `last.next` (or the head), so the step's unlink is the
+    /// one-slot write `last.next = victim.next` — PUC sweeplist form.
+    /// A newborn tail-append lands beyond the cursor; its current-white
+    /// color keeps it alive through this cycle's death check, replacing
+    /// the retired snapshot bound.
+    gc_sweep_last: ?*GcHeader = null,
     gc_alloc_tables: usize = 0,
     // Allocation sites and the dispatch loop periodically *check* this debt
     // threshold. They no longer run a full collection merely because a fixed
@@ -5696,8 +5650,8 @@ pub const Vm = struct {
             .hash_seed = hash_seed,
         };
         vm.oom_msg_str = vm.internStr("not enough memory") catch @panic("oom");
-        vm.gcRegisterTable(env) catch @panic("oom");
-        vm.gcRegisterTable(str_mt) catch @panic("oom");
+        vm.gcRegisterTable(env);
+        vm.gcRegisterTable(str_mt);
         const main_th = alloc.create(Thread) catch @panic("oom");
         main_th.* = .{
             .callee = .Nil,
@@ -5708,7 +5662,7 @@ pub const Vm = struct {
         // first activation does for coroutines). The main thread is always
         // activated, so this is unconditional.
         main_th.call_frames.ensureTotalCapacity(alloc, 64) catch @panic("oom");
-        vm.gcRegisterThread(main_th) catch @panic("oom");
+        vm.gcRegisterThread(main_th);
         vm.gcNoteAlloc(@sizeOf(Thread));
         // Allocate the main thread's bytecode stack (P16.37 Cut 2: the Thread
         // owns its runtime from creation — Vm.init allocates INTO the owner;
@@ -6761,8 +6715,12 @@ pub const Vm = struct {
         // freeThreadWrapBuffers releases it for EVERY thread during
         // drainGcRegistries below (main thread included).
         // Note: string_intern.deinit is deferred to AFTER drainGcRegistries,
-        // because gcFreeObject for short strings calls string_intern.table.remove.
-        self.long_literals.deinit(self.alloc);
+        // because gcFreeObject for short strings calls string_intern.remove.
+        // long_literals strings are freed by the same chain walk; only the
+        // map STORAGE remains here (its keys point into freed string bytes
+        // but a bare HashMap deinit never touches keys) — it is released
+        // after the drain, through the same allocator the puts used
+        // (infraAlloc owns the map storage).
         self.finalizables.deinit(self.alloc);
         self.dynamic_ast_arena.deinit();
         // P16.37 Cut 2: the main thread's bytecode stack/boxed arrays are NO
@@ -6791,9 +6749,13 @@ pub const Vm = struct {
         }
         self.c_libs.deinit(self.alloc);
         // Drain GC registries — destroy every object allocated during the VM's
-        // lifetime. Mid-run sweep (when implemented) frees unreachable objects
-        // during execution; this catches the survivors at teardown.
+        // lifetime (chain walk; includes long literals). Mid-run sweep frees
+        // unreachable objects during execution; this catches the survivors
+        // at teardown.
         self.drainGcRegistries();
+        // The long-literals map storage outlives the drain (frees remove
+        // entries through it) and dies here.
+        self.long_literals.deinitMap(self.infraAlloc());
         // P15.51n: Free pending call storage AFTER drainGcRegistries, which
         // calls freeThreadBytecodeFrames → getPendingCallPtr on each thread.
         self.pending_calls.deinit(self.alloc);
@@ -6825,25 +6787,33 @@ pub const Vm = struct {
         }
     }
 
-    /// Single ownership point for GC-able object destruction. Iterates the
-    /// unified `gc_objects` list, freeing each object's type-specific memory.
-    /// No need to call `gcUnregisterObject` — the list itself is being
-    /// deinit'd. Order is irrelevant: each type's cleanup only touches its
-    /// own memory, never dereferencing Values (which may be dangling by
-    /// this point).
+    /// Single ownership point for GC-able object destruction. Walks the
+    /// canonical allgc chain, freeing each object's type-specific memory.
+    /// No per-object unlink is needed — the whole chain dies here (the
+    /// position pointers are reset alongside). Order is head→tail
+    /// (oldest-first); each type's cleanup only touches its own memory,
+    /// never dereferencing Values (which may dangle by this point).
     fn drainGcRegistries(self: *Vm) void {
         // Unified destruction: free every GC object via the generic dispatcher.
         // P16.50-review-9 BLOCKER 1: teardown context — Values in the
         // registries may already dangle (drain order), so the thread close
         // must not run any barrier (see ThreadUpvalueCloseContext.teardown).
-        for (self.gc_objects.items) |obj| {
-            self.gcFreeObject(obj, .teardown);
+        var cur = self.gc_allgc_head;
+        while (cur) |hdr| {
+            const next = hdr.next;
+            self.gcFreeObject(gcFromHeader(hdr), .teardown);
+            cur = next;
         }
-        // Teardown destroys every registry member without per-object
-        // unregistration — the shadow chain dies with the registry.
         self.gc_allgc_head = null;
+        self.gc_allgc_tail = null;
+        self.gc_gen_old1_scan = null;
+        self.gc_gen_firstold1 = null;
+        self.gc_gen_young_first = null;
+        self.gc_gen_young_prev = null;
+        self.gc_gen_snapshot = null;
+        self.gc_sweep_last = null;
+        if (@import("builtin").mode == .Debug) self.gc_objects.clearRetainingCapacity();
         self.gc_objects.deinit(self.alloc);
-        self.gc_young_objects.deinit(self.alloc);
         self.gc_gray.deinit(self.alloc);
         self.gc_marked_tables.deinit(self.alloc);
         self.gc_marked_closures.deinit(self.alloc);
@@ -6853,13 +6823,13 @@ pub const Vm = struct {
         self.gc_fin_closures.deinit(self.alloc);
         self.gc_fin_threads.deinit(self.alloc);
         self.gc_to_finalize.deinit(self.alloc);
-        self.gc_old1.deinit(self.alloc);
         self.gc_grayagain.deinit(self.alloc);
         self.gc_gen_threads.deinit(self.alloc);
         self.gc_root_values.deinit(self.alloc);
         self.gc_root_cells.deinit(self.alloc);
         // Now safe to deinit string_intern — all GC objects (including
-        // short strings) have been freed by drainGcRegistries above.
+        // short strings) have been freed by the walk above; their frees
+        // removed the intern-table entries.
         self.string_intern.deinit(self.alloc);
     }
 
@@ -6895,7 +6865,6 @@ pub const Vm = struct {
         // list (both on the caller's stack). Mirror that: do ALL fallible
         // work while the object is still UNREGISTERED (invisible to the
         // collector), then commit the infallible registration.
-        try self.gcPrepareRegister(1);
         const th = try self.alloc.create(Thread);
         th.* = .{ .status = .suspended, .callee = callee };
         // destroyUnregisteredThread also frees the base-frame
@@ -10325,93 +10294,57 @@ pub const Vm = struct {
         self.gc_step_debt_kb += kb;
     }
 
-    /// Register a Table in the unified GC list. Thin wrapper for call-site
-    /// type safety; delegates to the generic `gcRegisterObject`.
-    fn gcRegisterTable(self: *Vm, table: *Table) std.mem.Allocator.Error!void {
-        try self.gcRegisterObject(.{ .table = table });
+    /// Register a Table in the allgc chain. Thin wrapper for call-site
+    /// type safety; delegates to the generic `gcRegisterCommit`.
+    fn gcRegisterTable(self: *Vm, table: *Table) void {
+        self.gcRegisterCommit(.{ .table = table });
     }
 
-    /// Register a Closure in the unified GC list.
+    /// Register a Closure in the allgc chain.
     ///
     /// Public so the C-ABI shim (`c_api.zig`) can register C closures created
     /// by `luaL_setfuncs` / `lua_pushcfunction`. Mirrors PUC's `luaC_newclosure`
     /// linking a new GC object into `g->allgc`.
-    pub fn gcRegisterClosure(self: *Vm, closure: *Closure) std.mem.Allocator.Error!void {
-        try self.gcRegisterObject(.{ .closure = closure });
+    pub fn gcRegisterClosure(self: *Vm, closure: *Closure) void {
+        self.gcRegisterCommit(.{ .closure = closure });
     }
 
-    /// Register a Thread in the unified GC list.
-    pub fn gcRegisterThread(self: *Vm, thread: *Thread) std.mem.Allocator.Error!void {
-        try self.gcRegisterObject(.{ .thread = thread });
+    /// Register a Thread in the allgc chain.
+    pub fn gcRegisterThread(self: *Vm, thread: *Thread) void {
+        self.gcRegisterCommit(.{ .thread = thread });
     }
 
-    /// Register a Cell in the unified GC list.
-    pub fn gcRegisterCell(self: *Vm, cell: *Cell) std.mem.Allocator.Error!void {
-        try self.gcRegisterObject(.{ .cell = cell });
+    /// Register a Cell in the allgc chain.
+    pub fn gcRegisterCell(self: *Vm, cell: *Cell) void {
+        self.gcRegisterCommit(.{ .cell = cell });
     }
 
-    /// Register a LuaString in the unified GC list.
-    fn gcRegisterString(self: *Vm, string: *LuaString) std.mem.Allocator.Error!void {
-        try self.gcRegisterObject(.{ .string = string });
+    /// Register a LuaString in the allgc chain.
+    fn gcRegisterString(self: *Vm, string: *LuaString) void {
+        self.gcRegisterCommit(.{ .string = string });
     }
 
-    /// Generic GC registration for any GcObject. Appends to both
-    /// `gc_objects` (the unified list) and `gc_young_objects` (if in
-    /// generational minor mode). Sets gc_marked to current white and
-    /// gc_age to .new (if generational).
+    /// Generic GC registration for any GcObject — PUC `luaC_newobj`'s
+    /// link into `allgc`. Registration is INFALLIBLE pointer surgery
+    /// (tail-append to the canonical chain), so a constructor can never
+    /// fail between creating an object and registering it:
     ///
-    /// PUC lgc.c:301: new objects get the current white bit.
-    /// `gc_index` is the object's position in `gc_objects`, used by
-    /// `gcUnregisterObject` for O(1) `swapRemove`.
-    /// P16.50: FALLIBLE capacity preparation, separated from the
-    /// infallible commit. PUC `luaC_newobj` links a new object into the
-    /// intrusive `allgc` list — allocation-free and infallible — so a PUC
-    /// constructor can never fail BETWEEN creating an object and
-    /// registering it. Our ArrayList registries must grow, and growth can
-    /// fail; the transactional contract restores the PUC shape:
-    ///
-    ///   try vm.gcPrepareRegister(n);     // fallible, BEFORE allocating
     ///   const obj = try alloc.create(T); // failure leaves nothing
     ///   obj.* = ...;
-    ///   vm.gcRegisterCommit(.{ ... });   // INFALLIBLE
+    ///   vm.gcRegisterCommit(.{ ... });   // cannot fail
     ///
-    /// After a successful prepare, exactly n commits must follow (across
-    /// the objects of this construction); each commit is appendAssume-
-    /// Capacity on both registries — no allocation, no failure. Callers
-    /// that cannot order prepare before their allocations keep using the
-    /// legacy `gcRegisterObject` (prepare+commit fused) and must own the
-    /// rollback of the allocated object on failure.
-    ///
-    /// In steady state both ensureUnusedCapacity calls are amortized no-ops
-    /// (the capacity check is a comparison), so the hot path (opClosure)
-    /// pays one predictable branch per construction, not per object.
-    pub fn gcPrepareRegister(self: *Vm, n: usize) std.mem.Allocator.Error!void {
-        // infraAlloc (P16.50-review-5): PUC's allgc/gray links are
-        // intrusive — registration never allocates in PUC, so counting our
-        // registry growth would diverge from PUC allocation counts (and
-        // would re-enter the failing adapter during emergency GC).
-        try self.gc_objects.ensureUnusedCapacity(self.infraAlloc(), n);
-        if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
-            try self.gc_young_objects.ensureUnusedCapacity(self.infraAlloc(), n);
-    }
-
-    /// P16.50: infallible registry commit (see gcPrepareRegister). The
-    /// accounting runs here — exactly at commit, symmetric with
-    /// gcNoteFree/gcUnregisterObjectRollback on the rollback side.
+    /// Sets the color to the current white (PUC lgc.c:301) and, in
+    /// generational minor mode, the age to `.new` — a fresh young object
+    /// at the chain tail is inside the young region by position, so no
+    /// young bookkeeping happens here beyond opening the region when it
+    /// was empty.
     pub fn gcRegisterCommit(self: *Vm, obj: GcObject) void {
         // P16.0b: per-type allocation counts. GcObject is a tagged union,
         // so @intFromEnum yields the active tag (declaration order: table,
         // closure, thread, string, cell, userdata — matches alloc_by_type).
-        // P16.49-review-2: count the registration only AFTER capacity
-        // preparation succeeded — a rolled-back object must never drift
-        // the per-type counters. (PUC luaC_newobj has no such counter.)
         if (self.stats.enabled) self.stats.alloc_by_type[@intFromEnum(obj)] += 1;
         const p = gcPtr(obj);
         p.marked.* = self.gc_current_white & WHITEBITS;
-        // P16.16 C1: gc_index is u32 — the list can never exceed 4G entries
-        // (each entry is 16B, so 4G entries = 64GB of list alone).
-        std.debug.assert(self.gc_objects.items.len <= std.math.maxInt(u32));
-        if (p.index) |i| i.* = @intCast(self.gc_objects.items.len);
         // Creation sequence: only the finalizable types (Table/Userdata)
         // carry one — it exists solely for the finalizer LIFO sort, which
         // never sees another type (see gcFinalizableSeq).
@@ -10422,135 +10355,102 @@ pub const Vm = struct {
             },
             else => {},
         }
-        // Shadow allgc link at the tail: the chain is the linked form of
-        // gc_objects (same order), so the new object links after the
-        // previous last entry (or becomes the head of an empty chain).
+        // Tail-link into the canonical chain (creation order).
         const hdr = gcHeaderOf(obj);
+        const prev_tail = self.gc_allgc_tail;
         hdr.next = null;
-        if (self.gc_objects.items.len == 0) {
-            self.gc_allgc_head = hdr;
+        if (prev_tail) |t| {
+            t.next = hdr;
         } else {
-            gcHeaderOf(self.gc_objects.items[self.gc_objects.items.len - 1]).next = hdr;
+            self.gc_allgc_head = hdr;
         }
-        self.gc_objects.appendAssumeCapacity(obj);
+        self.gc_allgc_tail = hdr;
+        if (@import("builtin").mode == .Debug) self.gcDebugMirrorAdd(obj);
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             p.age.* = .new;
-            self.gc_young_objects.appendAssumeCapacity(obj);
-        }
-    }
-
-    /// Legacy fused registration (prepare + commit in one fallible step).
-    /// P16.50: transactional constructors call gcPrepareRegister BEFORE
-    /// allocating and gcRegisterCommit after — for them registration can
-    /// no longer fail. This wrapper remains for sites whose ownership
-    /// analysis is still pending; on error the registries are untouched
-    /// and the CALLER owns the rollback of any already-created object.
-    fn gcRegisterObject(self: *Vm, obj: GcObject) std.mem.Allocator.Error!void {
-        try self.gcPrepareRegister(1);
-        self.gcRegisterCommit(obj);
-    }
-
-    /// Sweep-time unregistration. swapRemoves from gc_objects at the given
-    /// dense position. Does NOT remove from gc_young_objects (filtered
-    /// during sweep via snapshot/write-pointer).
-    ///
-    /// `dense_index` is the caller's known registry position: the
-    /// incremental sweep passes its cursor, the young sweep and rollbacks
-    /// pass the stored `gc.index` (strings carry no index — see
-    /// gcUnregisterObjectRollback for their paths).
-    ///
-    /// P16.49-review CONTRACT: this variant may ONLY be called by the
-    /// sweeps themselves (gcSweepYoungObjects / gcSweepOne) — the caller
-    /// owns the secondary-registry compaction that drops the entry.
-    fn gcUnregisterObjectSweep(self: *Vm, obj: GcObject, dense_index: usize) void {
-        std.debug.assert(dense_index < self.gc_objects.items.len and
-            std.meta.eql(self.gc_objects.items[dense_index], obj));
-        // Shadow unlink: the removed node's slot is the predecessor's
-        // `next` field (or the chain head); `succ` is dense_index+1's node.
-        // PUC lgc.c sweepstep: the same one-slot write `*p = curr->next`.
-        const hdr = gcHeaderOf(obj);
-        const succ = hdr.next;
-        if (dense_index == 0) {
-            self.gc_allgc_head = succ;
-        } else {
-            gcHeaderOf(self.gc_objects.items[dense_index - 1]).next = succ;
-        }
-        _ = self.gc_objects.swapRemove(dense_index);
-        if (dense_index < self.gc_objects.items.len) {
-            // The former tail moved into dense_index: re-link it between
-            // the predecessor and its new successor (the post-swap entry
-            // at dense_index+1 — never the pre-captured `succ`, which is
-            // the swapped node itself when it was the removed node's
-            // immediate successor, the second-to-last position).
-            const swapped = self.gc_objects.items[dense_index];
-            const shdr = gcHeaderOf(swapped);
-            shdr.next = if (dense_index + 1 < self.gc_objects.items.len)
-                gcHeaderOf(self.gc_objects.items[dense_index + 1])
-            else
-                null;
-            if (dense_index == 0) {
-                self.gc_allgc_head = shdr;
-            } else {
-                gcHeaderOf(self.gc_objects.items[dense_index - 1]).next = shdr;
+            // The young region extends to the tail; opening an empty
+            // region here is the only positional work a commit does.
+            if (self.gc_gen_young_first == null) {
+                self.gc_gen_young_first = hdr;
+                self.gc_gen_young_prev = prev_tail;
             }
-            if (gcPtr(swapped).index) |i| i.* = @intCast(dense_index);
-        }
-        // The moved node vacated the tail slot: the node now at the end of
-        // the registry still links to it from its commit-time tail-link.
-        // The chain is the linked form of the registry, so the last entry's
-        // next is always null — restore that invariant here.
-        if (self.gc_objects.items.len > 0) {
-            gcHeaderOf(self.gc_objects.items[self.gc_objects.items.len - 1]).next = null;
         }
     }
 
-    /// Rollback-time unregistration (P16.49-review). Constructor rollbacks
+    /// The ONE unlink primitive: removes `victim` from the canonical
+    /// chain through its containing slot `ps` (`&gc_allgc_head`, or the
+    /// predecessor's `next` field the caller derived) and repairs every
+    /// stored chain-position pointer. PUC's correctpointers equivalent.
+    ///
+    /// Stored pointers into the chain (the complete inventory — proof
+    /// that no other view aliases chain nodes):
+    ///   - `gc_sweep_last` — node form. If it IS the victim, the node the
+    ///     cursor claimed swept is dying outside the sweep (rollback or a
+    ///     foreign free); advancing to the successor conservatively SKIPS
+    ///     the successor's death check for the rest of THIS cycle: it
+    ///     stays linked, its memory stays valid, and the next cycle's
+    ///     flip makes its white current — it is then examined normally.
+    ///     No use-after-free, no double free, at most one object lives
+    ///     one extra cycle.
+    ///   - `gc_gen_old1_scan` / `gc_gen_firstold1` / `gc_gen_snapshot` —
+    ///     node form, scan bounds. victim == bound -> successor: for
+    ///     region-start bounds this is exact (the region loses its first
+    ///     node); for the `firstold1` stop marker it conservatively
+    ///     over-covers the markold walk (the remaining OLD1 nodes are all
+    ///     headward of the successor, so coverage is never lost).
+    ///   - `gc_gen_young_first` / `gc_gen_young_prev` — the decomposed
+    ///     slot of the young region start. If the victim IS the region
+    ///     start, the through-write `ps.* = succ` already advanced the
+    ///     region (young_first is re-derived below); if the victim was
+    ///     `young_prev` (the node before the region start), the new pred
+    ///     is `prev`, which the caller passes alongside `ps`.
+    fn gcChainUnlinkAt(self: *Vm, ps: *?*GcHeader, victim: *GcHeader, prev: ?*GcHeader) void {
+        const succ = victim.next;
+        ps.* = succ;
+        if (self.gc_allgc_tail == victim) self.gc_allgc_tail = prev;
+        if (self.gc_sweep_last == victim) self.gc_sweep_last = succ;
+        if (self.gc_gen_old1_scan == victim) self.gc_gen_old1_scan = succ;
+        if (self.gc_gen_firstold1 == victim) self.gc_gen_firstold1 = succ;
+        if (self.gc_gen_snapshot == victim) self.gc_gen_snapshot = succ;
+        if (self.gc_gen_young_first == victim) self.gc_gen_young_first = succ;
+        if (self.gc_gen_young_prev == victim) self.gc_gen_young_prev = prev;
+        if (@import("builtin").mode == .Debug) self.gcDebugMirrorRemove(gcFromHeader(victim));
+    }
+
+    /// Rollback-time unregistration (α destroy-now). Constructor rollbacks
     /// and manual test teardown destroy objects OUTSIDE any sweep, so the
-    /// sweep-owned compaction will never clean their registry entries:
-    /// this variant additionally removes the object from
-    /// `gc_young_objects` with an ORDER-PRESERVING removal. Order matters:
-    /// the young list's post-snapshot tail must stay after the snapshot
-    /// region (mid-cycle allocations are unconditionally kept by the
-    /// sweep), so swapRemove — which would scramble that boundary — is
-    /// forbidden here.
+    /// sweep will never free them: unlink from the canonical chain now
+    /// (predecessor search from the head — the PUC checkfinalizer form;
+    /// cold path, once per failed constructor) and purge every work list
+    /// the object may have entered.
     ///
     /// PUC parity: PUC frees an object only by unlinking it from the one
     /// intrusive `allgc` list (lgc.c:1172-1213, sweepgen: `*p = curr->next;
     /// freeobj(...)`), so "freed while linked" cannot exist there. Our
-    /// young list is a Zig-native secondary registry with no PUC
-    /// counterpart; this removal restores the PUC invariant "an object is
-    /// never freed while linked in a registry it belongs to". The linear
-    /// scan is acceptable: this path runs at most once per failed
-    /// constructor (OOM), never on a hot loop.
+    /// rollback frees the object NOW, so every list that may still hold it
+    /// must drop it too — otherwise the NEXT cycle propagates freed memory
+    /// (memerr.lua testalloc: OP_CLOSURE rollback under countdown,
+    /// closure/cells queued by the emergency collect, next testbytes
+    /// emergency GC crashes in gcPropagateOne).
     pub fn gcUnregisterObjectRollback(self: *Vm, obj: GcObject) void {
-        // Dense position: plain types carry it in the header; strings have
-        // no index (their header bytes 12..16 are the hash), and a string
-        // rollback is a cold manual-teardown path — linear identity search.
-        const dense_index: usize = if (gcPtr(obj).index) |i| i.* else blk: {
-            for (self.gc_objects.items, 0..) |item, di| {
-                if (std.meta.eql(item, obj)) break :blk di;
-            }
+        const victim = gcHeaderOf(obj);
+        var ps: *?*GcHeader = &self.gc_allgc_head;
+        var prev: ?*GcHeader = null;
+        while (ps.*) |cur| {
+            if (cur == victim) break;
+            prev = cur;
+            ps = &cur.next;
+        } else {
             unreachable; // rollback of an unregistered object
-        };
-        self.gcUnregisterObjectSweep(obj, dense_index);
-        removeGcObjectFromList(&self.gc_young_objects, obj);
+        }
+        self.gcChainUnlinkAt(ps, victim, prev);
         // Purge the object from every GC carry-over work list. The failing
         // allocation that triggered this rollback ran an EMERGENCY full GC
         // first (allocFn retry, PUC luaM_realloc_ tryagain) — that cycle
-        // may have queued this object into gray/grayagain/old1/gen-threads
-        // via barriers or propagation. PUC cannot hit this: it has no
-        // rollback (a failed constructor's objects stay linked in allgc
-        // and are swept later, lgc.c sweepgen), so "freed while queued"
-        // cannot exist there. Our rollback frees the object NOW, so every
-        // list that may still hold it must drop it too — otherwise the
-        // NEXT cycle propagates freed memory (memerr.lua testalloc:
-        // OP_CLOSURE rollback under countdown, closure/cells queued by the
-        // emergency collect, next testbytes emergency GC crashes in
-        // gcPropagateOne). Linear scans, cold path (once per failed
-        // constructor), mirroring the gc_young_objects scan above.
+        // may have queued this object into gray/grayagain/gen-threads
+        // via barriers or propagation. Linear scans, cold path.
         removeGcObjectFromList(&self.gc_gray, obj);
         removeGcObjectFromList(&self.gc_grayagain, obj);
-        removeGcObjectFromList(&self.gc_old1, obj);
         if (obj == .thread) {
             var ti: usize = 0;
             while (ti < self.gc_gen_threads.items.len) {
@@ -10565,11 +10465,8 @@ pub const Vm = struct {
             // traversed this thread and linked it (gcPropagateOne's thread
             // arm); the rollback frees the thread NOW, so a surviving link
             // would make the next cycle's Step-15 walk dereference freed
-            // memory. PUC cannot hit this: it has no rollback (a failed
-            // constructor's objects stay linked in allgc and are swept
-            // later). Same contract as the work-list purges above — cold
-            // path, once per failed constructor. Invariant: next != null
-            // iff the thread is linked; the tail self-points.
+            // memory. Invariant: next != null iff the thread is linked;
+            // the tail self-points.
             const th = obj.thread;
             if (th.gc_atomic_clear_next != null) {
                 if (self.gc_atomic_clear_head == th) {
@@ -10613,7 +10510,6 @@ pub const Vm = struct {
         // allocation so registration cannot fail once the object exists.
         // P16.50-review-5: byte accounting happens at the allocator
         // boundary (TestcAllocAdapter) — no manual note needed here.
-        try self.gcPrepareRegister(1);
         const t = try self.alloc.create(Table);
         t.* = .{};
         self.gcRegisterCommit(.{ .table = t });
@@ -10638,7 +10534,6 @@ pub const Vm = struct {
         values: []const Value,
     ) std.mem.Allocator.Error!*Closure {
         const n = values.len;
-        try self.gcPrepareRegister(n + 1);
         // Root every committed intermediate (each cell, then the closure)
         // across the remaining allocations: any of them can fire an
         // emergency GC, and until the closure exists the cells are
@@ -10794,7 +10689,6 @@ pub const Vm = struct {
         // gcNoteAlloc charge the old path skipped: gcFreeObject credits
         // every swept table unconditionally, so an uncharged construction
         // drifted gc_count_kb downward.
-        try self.gcPrepareRegister(1);
         const t = try self.alloc.create(Table);
         t.* = .{};
         self.gcRegisterCommit(.{ .table = t });
@@ -10818,7 +10712,6 @@ pub const Vm = struct {
         // registry capacity BEFORE the allocations; the userdata stays
         // UNREGISTERED (invisible to an emergency GC) until every part
         // exists, so every failure below rolls back with plain errdefers.
-        try self.gcPrepareRegister(1);
         const ud = try self.alloc.create(Userdata);
         errdefer self.alloc.destroy(ud);
         const uvs: []Value = if (nuvalue > 0) try self.alloc.alloc(Value, nuvalue) else &.{};
@@ -18010,7 +17903,6 @@ pub const Vm = struct {
             // P16.50 transactional: prepare-first so registration cannot
             // fail after the tree retain (the old order leaked the tree
             // reference on a registration failure).
-            try self.gcPrepareRegister(1);
             const cl = try self.alloc.create(Closure);
             errdefer self.alloc.destroy(cl);
             cl.* = .{
@@ -21603,7 +21495,6 @@ pub const Vm = struct {
         // half-built closure can never fail BETWEEN creation and
         // registration. In steady state both capacity checks are amortized
         // no-ops; the commit path adds no work.
-        try self.gcPrepareRegister(nups + 1);
         // P16.50-review-2 BLOCKER 1: ownership order fixed. The old order
         // allocated `cells` FIRST and the heap fallback SECOND, with the
         // cells-freeing errdefer declared after both — a fallback-allocation
@@ -23827,15 +23718,13 @@ pub const Vm = struct {
                 }
                 return existing;
             }
-            // P16.50 transactional: reserve registry capacity BEFORE the
-            // string exists; publish into the intern table with an errdefer
-            // that removes the entry (and destroys the string) if anything
-            // after the publish fails. The old order (insert THEN register,
-            // no rollback) left the string interned-but-unregistered on a
-            // registration failure — an immortal leak: the intern table is
-            // a GC root, but the string was in no registry, so no sweep
-            // could ever free it.
-            try self.gcPrepareRegister(1);
+            // P16.50 transactional: publish into the intern table with an
+            // errdefer that removes the entry (and destroys the string) if
+            // anything after the publish fails. The old order (insert THEN
+            // register, no rollback) left the string interned-but-
+            // unregistered on a registration failure — an immortal leak:
+            // the intern table is a GC root, but the string was in no
+            // registry, so no sweep could ever free it.
             const ls = try createLuaString(self.alloc, raw, hash);
             // PUC luaC_newobj: set current=white on all new objects.
             ls.marked = self.gc_current_white & WHITEBITS;
@@ -23845,9 +23734,8 @@ pub const Vm = struct {
                 self.string_intern.removeString(ls);
                 destroyLuaString(self.alloc, ls);
             }
-            // Register in gc_objects (PUC allgc) so the normal per-object
-            // incremental sweep handles short string collection. This is the
-            // PUC-faithful approach: PUC keeps all short strings in allgc.
+            // Link into allgc (PUC keeps all short strings there) so the
+            // normal per-object incremental sweep handles collection.
             self.gcRegisterCommit(.{ .string = ls });
             // PUC sizestrshr/luaS_sizelngstr(LSTRREG) include the NUL;
             // T7: single per-kind rule via allocatedSize().
@@ -23859,10 +23747,8 @@ pub const Vm = struct {
             self.testc_obj_strings += 1;
             return ls;
         }
-        // P16.50 transactional: prepare-first; long strings are never
-        // interned, so the only fallible step after creation was the
-        // registration itself — now impossible to fail.
-        try self.gcPrepareRegister(1);
+        // Long strings are never interned; registration is infallible
+        // tail-linking (PUC luaC_newobj).
         const ls = try createLuaString(self.alloc, raw, hash);
         self.gcRegisterCommit(.{ .string = ls });
         self.gcNoteAlloc(ls.allocatedSize());
@@ -23922,7 +23808,6 @@ pub const Vm = struct {
         const fixed = falloc == null;
         const header_size: usize =
             if (fixed) LuaString.lstrfix_header_size else @sizeOf(LuaString);
-        try self.gcPrepareRegister(1);
         const buf = self.alloc.alignedAlloc(
             u8,
             std.mem.Alignment.fromByteUnits(@alignOf(LuaString)),
@@ -23939,8 +23824,9 @@ pub const Vm = struct {
             return e;
         };
         const ls: *LuaString = @ptrCast(@alignCast(buf.ptr));
-        // If GC registration fails after the header was allocated, free both
-        // the header and the external content (same ownership-transfer logic).
+        // If a later failure occurs after the header was allocated, free
+        // both the header and the external content (same ownership-transfer
+        // logic).
         errdefer {
             if (falloc) |fa| {
                 _ = fa(ud, @ptrCast(@constCast(content)), len + 1, 0);
@@ -23967,9 +23853,8 @@ pub const Vm = struct {
             ls.falloc = falloc;
             ls.ud = ud;
         }
-        // P16.50: capacity prepared before the header allocation — the
-        // commit is infallible (the errdefer below still owns every
-        // pre-commit failure).
+        // Registration is infallible tail-linking; the errdefer above
+        // still owns every pre-commit failure.
         self.gcRegisterCommit(.{ .string = ls });
         // Only the header is owned by the GC; the external content is accounted
         // for by the caller (and released via `falloc` for LSTRMEM).
@@ -24048,7 +23933,12 @@ pub const Vm = struct {
     pub fn internLiteral(self: *Vm, raw: []const u8) std.mem.Allocator.Error!*LuaString {
         if (raw.len <= lua_string_max_short_len) return self.internStr(raw);
         if (self.long_literals.table.get(raw)) |existing| {
-            if (self.gc_mode == .generational and self.gc_gen_phase == .minor) existing.age = .old;
+            // PUC internshrstr resurrection (lstring.c:223-226): a dead-
+            // but-not-yet-swept string still present in the table is
+            // re-whitened instead of being replaced by an identical copy.
+            if (gcIsDead(existing.marked, self.gc_current_white)) {
+                existing.marked = self.gc_current_white & WHITEBITS;
+            }
             return existing;
         }
         // PUC luaS_hash uses g->seed — fixed for the state's lifetime and
@@ -24061,17 +23951,22 @@ pub const Vm = struct {
         var h = std.hash.Wyhash.init(seed);
         h.update(raw);
         const ls = try createLuaString(self.alloc, raw, @truncate(h.final()));
-        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) ls.age = .old;
-        // P16.50: a failed store put must not leak the created string
-        // (it is in no registry until the put succeeds — the long-literals
-        // store is its ONLY lifetime owner, mirroring string_intern for
-        // short strings).
-        errdefer destroyLuaString(self.alloc, ls);
+        // Long literals are ordinary allgc members (PUC keeps its chunk
+        // constants in allgc like any object): infallible tail-link FIRST,
+        // then the errdefer owns BOTH the chain unlink and the destroy for
+        // a failed map put — the string is a rooted chain member from the
+        // link until the cache-key publication completes.
+        self.gcRegisterCommit(.{ .string = ls });
+        errdefer self.gcUnregisterObjectRollback(.{ .string = ls });
         // infraAlloc (P16.50-review-5): the long-literals MAP is host-side
         // dedup bookkeeping with no PUC allocation counterpart (PUC dedups
         // per-Proto in the constant table); only the string itself is
         // counted (via self.alloc above), matching PUC's luaS_createlstr.
         try self.long_literals.table.put(self.infraAlloc(), ls.bytes(), ls);
+        // PUC luaC_newobj charges sizelngstr at creation; the free side
+        // (gcFreeObject .string arm) credits it back — the ledger pair is
+        // symmetric like every other GC object.
+        self.gcNoteAlloc(ls.allocatedSize());
         self.testc_obj_strings += 1;
         return ls;
     }
@@ -26675,7 +26570,6 @@ pub const Vm = struct {
         // boundary (TestcAllocAdapter). Transactional: prepare-first,
         // infallible commit; no allocation follows the commit, so the
         // registered thread is anchored in outs[0] before any GC can run.
-        try self.gcPrepareRegister(1);
         const th = try self.alloc.create(Thread);
         th.* = .{ .status = .suspended, .callee = callee };
         var registered = false;
@@ -26722,7 +26616,6 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("coroutine.create expects function", .{});
         const callee = args[0];
         if (!isCallableValue(callee)) return self.fail("coroutine.create expects function", .{});
-        try self.gcPrepareRegister(1);
         const th = try self.alloc.create(Thread);
         th.* = .{ .status = .suspended, .callee = callee };
         var registered = false;
@@ -28972,27 +28865,6 @@ pub const Vm = struct {
     /// branch is not analyzed in the other instantiation, so the fallible
     /// hot path (GC marking) is unchanged.
     fn gcQueueScanObjectImpl(self: *Vm, obj: GcObject, comptime assume: bool) if (assume) void else DispatchError!void {
-        const p = gcPtr(obj);
-        // Task 7: invariant — every GcObject passed to gcQueueScanObject is
-        // registered in gc_objects. Stale entries (freed objects remaining
-        // in gc_grayagain or other aux lists) are impossible with the correct
-        // lifecycle: gcDrainGrayagain saves+clears grayagain at atomic, all
-        // entries are force-marked black (survive sweep), and
-        // gcCorrectGrayAgain compacts the list after sweep removing dead
-        // entries. The old defensive skip (which dereferenced the entry
-        // pointer to read gc_index, providing no real dangling-pointer
-        // protection) has been replaced with a stats-gated assert.
-        if (self.stats.enabled) {
-            if (p.index) |ip| {
-                const idx = ip.*;
-                if (idx >= self.gc_objects.items.len or
-                    !std.meta.eql(self.gc_objects.items[idx], obj))
-                {
-                    self.stats.gc_stale_queue_scan += 1;
-                    std.debug.assert(false);
-                }
-            }
-        }
         // Precise-liveness safety skip — removed. The skip
         // compensated for precise-liveness cycles freeing objects held in
         // DEAD register slots above live_reg_top[pc], whose stale pointers
@@ -29012,6 +28884,7 @@ pub const Vm = struct {
         if (obj == .cell) {
             return self.markCellImpl(obj.cell, assume);
         }
+        const p = gcPtr(obj);
         if (!gcIsWhite(p.marked.*)) return;
         // PUC reallymarkobject: GCmarked += objsize(o). Track marked KB
         // for checkmajorminor (tobecollected = total - marked).
@@ -29334,18 +29207,10 @@ pub const Vm = struct {
             const child_age = gcValueAge(child) orelse return;
             if (owner_age.isOld() and child_age.isYoung()) {
                 const child_obj = GcObject.fromValue(child).?;
+                // PUC luaC_barrier_ setage(v, G_OLD0): the age is the whole
+                // generational publication (OLD0 objects live in the young
+                // region by position; the next young sweep advances them).
                 gcPtr(child_obj).age.* = .old0;
-                self.gc_old1.append(self.infraAlloc(), child_obj) catch |e| {
-                    // P16.50-review-11 (gc_old1 overflow proof): the age is
-                    // canonical — an OLD0 whose list append failed is an
-                    // overflow commit. Record it in the flag so the age+
-                    // membership drain completes the publication; the OOM
-                    // still propagates (the caller's step aborts), but the
-                    // publication debt is never lost. This keeps the drain
-                    // invariant: flag clear ⇒ every OLD0 is listed.
-                    self.gc_old1_overflow = true;
-                    return e;
-                };
                 try self.gcQueueScanValue(child);
             }
             return;
@@ -29372,8 +29237,9 @@ pub const Vm = struct {
     ///   incremental sweep → makewhite(f1) (the OWNER closure)
     ///   GENMINOR sweep → no-op (lgc.c:260-261)
     pub const CellJoinPlan = struct {
-        /// Gen arm: promote the joined CELL to G_OLD0, link it into gc_old1,
-        /// and mark it (PUC luaC_barrier_ keepinvariant + setage(v, G_OLD0)).
+        /// Gen arm: promote the joined CELL to G_OLD0 and mark it (PUC
+        /// luaC_barrier_ keepinvariant + setage(v, G_OLD0) — the age alone
+        /// is the publication; OLD0 objects live in the young region).
         gen_promote: bool = false,
         /// Incremental propagate/atomic: mark the joined CELL (markCell).
         inc_mark: bool = false,
@@ -29387,8 +29253,8 @@ pub const Vm = struct {
     /// may allocate (the re-point is a pointer store), so the plan stays
     /// valid at commit time. Reserves an upper bound: gc_gray gets one
     /// slot iff the cell's value is a collectable non-string (markCell's
-    /// inline value mark), gc_old1 one slot for the cell itself. Spare
-    /// capacity is harmless (the mark may skip white/registry guards).
+    /// inline value mark). Spare capacity is harmless (the mark may skip
+    /// white guards).
     pub fn gcPrepareForwardBarrierCell(self: *Vm, owner: *Closure, child: *Cell) std.mem.Allocator.Error!CellJoinPlan {
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             // PUC luaC_barrier_ sweep arm: GENMINOR sweep → no-op.
@@ -29399,7 +29265,6 @@ pub const Vm = struct {
                     .Table, .Closure, .Thread, .Userdata => try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), 1),
                     else => {},
                 }
-                try self.gc_old1.ensureUnusedCapacity(self.infraAlloc(), 1);
                 return .{ .gen_promote = true };
             }
             return .{};
@@ -29430,7 +29295,6 @@ pub const Vm = struct {
     pub fn gcCommitForwardBarrierCell(self: *Vm, owner: *Closure, child: *Cell, plan: CellJoinPlan) void {
         if (plan.gen_promote) {
             child.gc.age = .old0;
-            self.gc_old1.appendAssumeCapacity(.{ .cell = child });
             self.gcQueueScanCellAssume(child);
             return;
         }
@@ -29446,13 +29310,17 @@ pub const Vm = struct {
         }
     }
 
-    /// A6: Clear all generational tracking lists. Called by `gcMakeAllOld`
-    /// (entering generational mode after a full collection) and
-    /// `gcLeaveGenerational` (leaving generational mode).
-    /// A4/A6: all lists are now GcObject-typed (or *Thread for gc_gen_threads).
+    /// A6: Reset every generational boundary and tracking list. Called by
+    /// `gcMakeAllOld` (entering generational mode after a full collection)
+    /// and `gcLeaveGenerational` (leaving generational mode): after
+    /// gcMakeAllOld every object is .old, so all positional regions are
+    /// empty; commits in gen-minor reopen the young region at the tail.
     fn gcClearGenerationalLists(self: *Vm) void {
-        self.gc_young_objects.clearRetainingCapacity();
-        self.gc_old1.clearRetainingCapacity();
+        self.gc_gen_old1_scan = null;
+        self.gc_gen_firstold1 = null;
+        self.gc_gen_young_first = null;
+        self.gc_gen_young_prev = null;
+        self.gc_gen_snapshot = null;
         self.gc_grayagain.clearRetainingCapacity();
         self.gc_gen_threads.clearRetainingCapacity();
     }
@@ -29464,41 +29332,29 @@ pub const Vm = struct {
     /// after the white flip and are swept). Old objects that were BLACK
     /// in generational mode would otherwise survive sweep without being
     /// visited, leaving dangling references to freed young objects.
-    /// A6: Unified `gcMakeAllWhite`. Iterates `gc_objects` (the unified
-    /// list) instead of per-type lists. Short strings and long literals
-    /// remain in their separate intern stores (`string_intern`,
-    /// `long_literals`) because they are keyed by content, not appended
-    /// to `gc_objects` during migration.
     fn gcMakeAllWhite(self: *Vm) void {
         // gcMakeWhite preserves FINALIZEDBIT (PUC maskmarks), so registered
         // objects keep their finalization flag across the mode switch.
+        // The chain walk covers every live object, long literals included.
         const w = self.gc_current_white;
-        for (self.gc_objects.items) |obj| {
-            gcMakeWhite(&gcPtr(obj).marked.*, w);
+        var cur = self.gc_allgc_head;
+        while (cur) |hdr| : (cur = hdr.next) {
+            gcMakeWhite(&gcPtr(gcFromHeader(hdr)).marked.*, w);
         }
-        // Short strings are now in gc_objects (registered via gcRegisterString).
-        // Only long literals remain in a separate store.
-        var literal_it = self.long_literals.table.iterator();
-        while (literal_it.next()) |entry| entry.value_ptr.*.marked = w;
     }
 
-    /// A6: Unified `gcMakeAllOld`. Iterates `gc_objects` instead of
-    /// per-type lists. Preserves the `gc_busy` guard (prevents spurious
-    /// minor collections during the transition) and the generational
-    /// phase/KB resets that the per-type predecessor performed.
-    ///
-    /// PUC `atomic2gen` → `sweep2old` (lgc.c:1136-1158): after the atomic
-    /// phase marks all reachable objects BLACK, `sweep2old` frees dead
-    /// (white) objects and sets surviving objects to age=G_OLD. For most
-    /// types it calls `nw2black` (a no-op since they're already BLACK from
-    /// atomic). Threads are linked to grayagain for re-traversal. Open
-    /// upvalues are set to gray.
+    /// Unified `gcMakeAllOld` — PUC `atomic2gen` → `sweep2old`
+    /// (lgc.c:1136-1158): after the atomic phase marks all reachable
+    /// objects BLACK, surviving objects become .old (+BLACK; threads join
+    /// gc_gen_threads for per-minor re-traversal). Runs over the whole
+    /// chain — long literals included — and resets the generational
+    /// boundaries: everything is old, all positional regions are empty.
     ///
     /// In our architecture, `gcMakeAllOld` is called AFTER a full cycle
     /// (gcCycleFull or gcFullCollectionForUser), where the sweep phase has
     /// already reset alive objects to current white. To match PUC's
-    /// post-atomic2gen state (OLD + BLACK), we must explicitly set objects
-    /// to BLACK here. Without this, forward barriers (e.g., gcStoreMetatable
+    /// post-atomic2gen state (OLD + BLACK), objects are explicitly set to
+    /// BLACK here. Without this, forward barriers (e.g., gcStoreMetatable
     /// checking `gcIsBlack`) never fire after entering gen mode, breaking
     /// metatable age promotion (gengc.lua:48).
     fn gcMakeAllOld(self: *Vm) std.mem.Allocator.Error!void {
@@ -29515,32 +29371,26 @@ pub const Vm = struct {
         // BEFORE the mutation loop — the old fallible append ran AFTER
         // `o.age.* = .old`, so an OOM left an OLD thread with no root-loop
         // membership (its stack never re-scanned → young objects on it
-        // swept). Bound: one append per thread in gc_objects (pure pre-pass
-        // count; the long-literal loop below appends none). This site is
-        // outside gcSweepYoungObjects' snapshot reserve, so it owns its
-        // reservation.
+        // swept). Bound: one append per thread in the chain (pure pre-pass
+        // count).
         var thread_need: usize = 0;
-        for (self.gc_objects.items) |obj| {
-            if (obj == .thread) thread_need += 1;
+        {
+            var cur = self.gc_allgc_head;
+            while (cur) |hdr| : (cur = hdr.next) {
+                if (hdr.tag == .thread) thread_need += 1;
+            }
         }
         if (thread_need > 0) try self.gc_gen_threads.ensureUnusedCapacity(self.infraAlloc(), thread_need);
-        for (self.gc_objects.items) |obj| {
+        var cur = self.gc_allgc_head;
+        while (cur) |hdr| : (cur = hdr.next) {
+            const obj = gcFromHeader(hdr);
             const o = gcPtr(obj);
             o.age.* = .old;
             // Match PUC sweep2old: surviving objects become BLACK.
-            // Threads are also BLACK (PUC keeps their color, just links
-            // to grayagain). Open upvalues would need set2gray, but we
-            // handle that separately if it becomes an issue.
             gcSetBlack(o.marked);
             if (obj == .thread) {
                 self.gc_gen_threads.appendAssumeCapacity(obj.thread);
             }
-        }
-        // Short strings are now in gc_objects. Only long literals separate.
-        var literal_it = self.long_literals.table.iterator();
-        while (literal_it.next()) |entry| {
-            entry.value_ptr.*.age = .old;
-            entry.value_ptr.*.marked = (entry.value_ptr.*.marked & ~WHITEBITS) | BLACKBIT;
         }
         self.gc_gen_phase = .minor;
         self.gc_gen_major_base_kb = self.gc_count_kb;
@@ -29802,10 +29652,6 @@ pub const Vm = struct {
 
         self.gc_do_sweep = do_sweep;
         self.gc_cycle_finalizer_epoch = self.gc_finalizer_epoch;
-        // PUC lgc.c: snapshot `allgc` length at cycle start. Objects allocated
-        // during the cycle are appended beyond this point and handled
-        // separately (marks reset, not swept for death).
-        self.gc_objects_snapshot_len = self.gc_objects.items.len;
 
         self.gcResetCycleState();
         // PUC startcycle (lgc.c:963): g->gray = NULL. Only incremental mode
@@ -30127,11 +29973,12 @@ pub const Vm = struct {
     /// OP_SETUPVAL): isblack(uv) && iswhite(v) → luaC_barrier_ (mark v).
     /// P16.50-review-8 §1.2: pre-reserved barrier bookkeeping for one
     /// closed-cell value store (lua_setupvalue, OP_SETUPVAL). The prepare
-    /// call reserves every gc_gray/gc_old1 slot the commit may touch, so
+    /// call reserves every gc_gray slot the commit may touch, so
     /// the observable store never commits when the barrier cannot.
     pub const CellWritePlan = struct {
-        /// Gen arm: mark the stored value, promote it to G_OLD0, and link
-        /// it into gc_old1 (PUC luaC_barrier_ keepinvariant + setage).
+        /// Gen arm: mark the stored value and promote it to G_OLD0 (PUC
+        /// luaC_barrier_ keepinvariant + setage — the age alone is the
+        /// publication; OLD0 objects live in the young region).
         gen_promote: bool = false,
         /// Incremental propagate/atomic: mark the stored value (PUC
         /// luaC_barrier_ keepinvariant → reallymarkobject(v)).
@@ -30179,9 +30026,8 @@ pub const Vm = struct {
                         const child_obj = GcObject.fromValue(value) orelse return .{};
                         // gcQueueScanObject appends to gc_gray iff the
                         // value is a non-string (strings go straight to
-                        // black); gc_old1 takes the promoted value itself.
+                        // black).
                         if (child_obj != .string) try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), 1);
-                        try self.gc_old1.ensureUnusedCapacity(self.infraAlloc(), 1);
                         return .{ .gen_promote = true };
                     }
                 }
@@ -30220,7 +30066,6 @@ pub const Vm = struct {
             const child_obj = GcObject.fromValue(value).?;
             self.gcQueueScanObjectAssume(child_obj);
             gcPtr(child_obj).age.* = .old0;
-            self.gc_old1.appendAssumeCapacity(child_obj);
             return;
         }
         if (plan.inc_mark) {
@@ -30255,8 +30100,9 @@ pub const Vm = struct {
         /// Gen minor: queue the copied value for traversal
         /// (gcQueueScanObject — PUC reallymarkobject(v)).
         gen_mark: bool = false,
-        /// Gen minor: promote the copied value to G_OLD0 + link into
-        /// gc_old1 (PUC luaC_barrier_ setage(v, G_OLD0) for an old cell).
+        /// Gen minor: promote the copied value to G_OLD0 (PUC
+        /// luaC_barrier_ setage(v, G_OLD0) for an old cell — the age
+        /// alone is the publication).
         gen_promote: bool = false,
         /// Incremental propagate/atomic: mark the copied value (PUC
         /// luaC_barrier_ keepinvariant → reallymarkobject(v)).
@@ -30266,7 +30112,7 @@ pub const Vm = struct {
     /// Pure planner for one upvalue close: computes the barrier plan for
     /// closing `cell` (which holds `value` — the stack-backed value read
     /// BEFORE cell.close) without mutating anything. Callers reserve every
-    /// gc_gray/gc_old1 slot a batch of plans may touch BEFORE the first
+    /// gc_gray slot a batch of plans may touch BEFORE the first
     /// cell.close, then re-plan per cell at commit time: nothing between
     /// the bulk reserve and the commits allocates or triggers GC, so the
     /// pass-2 plans equal the pass-1 plans bit-for-bit.
@@ -30317,8 +30163,10 @@ pub const Vm = struct {
             const child_obj = GcObject.fromValue(value).?;
             self.gcQueueScanObjectCloseCommit(child_obj);
             if (plan.gen_promote) {
+                // PUC luaC_barrier_ setage(v, G_OLD0): the age alone is the
+                // generational publication — OLD0 objects are young-region
+                // members by position; the next young sweep advances them.
                 gcPtr(child_obj).age.* = .old0;
-                self.gcLinkOld1CloseCommit(child_obj);
             }
             return;
         }
@@ -30376,26 +30224,13 @@ pub const Vm = struct {
         self.gcQueueScanObjectCloseCommit(obj);
     }
 
-    /// Infallible overflow-aware G_OLD0 publication (PUC luaC_barrier_
-    /// setage + link into the old1 list). Age is canonical: without spare
-    /// `gc_old1` capacity the commit sets `gc_old1_overflow` and the drain
-    /// completes the publication by AGE (linking every OLD0-by-age object
-    /// missing from the list).
-    fn gcLinkOld1CloseCommit(self: *Vm, obj: GcObject) void {
-        if (self.gc_old1.items.len < self.gc_old1.capacity) {
-            self.gc_old1.appendAssumeCapacity(obj);
-        } else {
-            self.gc_old1_overflow = true;
-        }
-    }
-
     /// P16.50-review-10 BLOCKER 1: INFALLIBLE upvalue close for a boxed
     /// window (PUC luaF_closeupval, lfunc.c:197-210 — PUC's close barrier
     /// never allocates, so no allocator failure may abort or park a close
     /// that has begun). Two passes:
     ///
     /// Pass 1 (pure): plan each cell's close barrier and count the
-    /// gc_gray/gc_old1 slots the commits may append (upper bound — a
+    /// gc_gray slots the commits may append (upper bound — a
     /// non-white value commits as a no-op, spare capacity is harmless).
     ///
     /// Reserve: an OPTIMIZATION only — capacity may grow, but the semantic
@@ -30410,7 +30245,6 @@ pub const Vm = struct {
     /// is nulled as it closes.
     fn closeBoxedUpvaluesReserved(self: *Vm, boxed: []?*Cell) void {
         var gray_need: usize = 0;
-        var old1_need: usize = 0;
         for (boxed) |maybe_cell| {
             const cell = maybe_cell orelse continue;
             const plan = self.gcPlanCloseBarrierCell(cell, cell.get(self));
@@ -30419,10 +30253,8 @@ pub const Vm = struct {
                     if (obj != .string) gray_need += 1;
                 }
             }
-            if (plan.gen_promote) old1_need += 1;
         }
         if (gray_need > 0) gcTryReserveWorklist(&self.gc_gray, self.infraAlloc(), gray_need);
-        if (old1_need > 0) gcTryReserveWorklist(&self.gc_old1, self.infraAlloc(), old1_need);
         for (boxed) |*slot| {
             const cell = slot.* orelse continue;
             const value = cell.get(self);
@@ -30550,15 +30382,17 @@ pub const Vm = struct {
             }
 
             if (gen_minor and self.gc_state != .sweep) {
-                // PUC luaC_barrier_ guard: isblack(p) && iswhite(o).
+                // PUC luaC_barrier_ guard: isblack(p) && iswhite(o); the
+                // setage(v, G_OLD0) arm additionally requires a YOUNG child
+                // (PUC asserts !isold(v)) — an OLD0 outside the young region
+                // would break the positional generational boundaries.
                 if (gcIsBlack(gcPtr(owner).marked.*) and gcIsWhite(m.gc.marked)) {
                     plan.barrier.gen_mark = true;
                     // gcQueueScanObjectAssume queues the Table child — exactly
                     // one gc_gray slot.
                     try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), 1);
-                    if (gcPtr(owner).age.*.isOld()) {
+                    if (gcPtr(owner).age.*.isOld() and m.gc.age.isYoung()) {
                         plan.barrier.gen_promote = true;
-                        try self.gc_old1.ensureUnusedCapacity(self.infraAlloc(), 1);
                     }
                 }
             } else if (!gen_minor) {
@@ -30595,8 +30429,9 @@ pub const Vm = struct {
                 // without traversal would strand its children white).
                 self.gcQueueScanObjectAssume(.{ .table = m });
                 if (plan.barrier.gen_promote) {
+                    // PUC luaC_barrier_ setage(v, G_OLD0): the age alone is
+                    // the publication (young-region member by position).
                     m.gc.age = .old0;
-                    self.gc_old1.appendAssumeCapacity(.{ .table = m });
                 }
             }
             if (plan.barrier.inc_mark) {
@@ -30878,8 +30713,8 @@ pub const Vm = struct {
         }
     }
 
-    /// P16.50-review-11 BLOCKER 2: one overflow re-queue pass. Scans the
-    /// full registry and re-appends every MISSEDGRAYBIT-marked object
+    /// P16.50-review-11 BLOCKER 2: one overflow re-queue pass. Walks the
+    /// full allgc chain and re-appends every MISSEDGRAYBIT-marked object
     /// missing from gc_gray. The marker — not the gray COLOR — identifies
     /// the work: gray is also worn by grayagain-published objects
     /// (backward barriers; their membership is gc_grayagain and their
@@ -30896,14 +30731,17 @@ pub const Vm = struct {
     /// terminal-black path) — asserted, not silently skipped.
     fn gcRequeueOverflowGray(self: *Vm) DispatchError!bool {
         var requeued = false;
-        for (self.gc_objects.items) |obj| {
+        var cur = self.gc_allgc_head;
+        while (cur) |hdr| : (cur = hdr.next) {
+            const obj = gcFromHeader(hdr);
             const p = gcPtr(obj);
             if ((p.marked.* & MISSEDGRAYBIT) == 0) continue;
             std.debug.assert(obj != .cell and obj != .string);
             // The marker is only ever set on a freshly painted-gray
             // object that never entered gc_gray or grayagain; nothing
             // re-colors it before the drain (white guards skip it,
-            // grayagain/old1 paths require other memberships/colors).
+            // grayagain members owe their lifecycle to the genlink
+            // drain).
             std.debug.assert(gcIsGray(p.marked.*));
             try self.gc_gray.append(self.infraAlloc(), obj);
             // Clear the marker only after the append recorded the entry.
@@ -30914,49 +30752,6 @@ pub const Vm = struct {
         // gc_gray entry exists.
         self.gc_gray_overflow = false;
         return requeued;
-    }
-
-    /// P16.50-review-10 BLOCKER 1: OLD0 overflow drain. Completes the
-    /// G_OLD0 publication for promotes that could not append to gc_old1:
-    /// scans the full registry by AGE and links every OLD0 object missing
-    /// from the list (membership-checked — gcPromoteYoungObject's sweep
-    /// arm may already have linked some, and its KB charge is age-gated
-    /// so a duplicate append would double-count). Runs at generational
-    /// minor-collection and sweep-generation entry, BEFORE
-    /// gcPromoteYoungObject's OLD0→OLD1 advance (which assumes list
-    /// membership). A completed pass clears the flag: every OLD0 object
-    /// is then linked. Best-effort appends: a failed append leaves the
-    /// flag set for the next drain.
-    ///
-    /// P16.50-review-11 (proof that age+membership remains sound, no
-    /// second marker needed): every OLD0 producer is one of
-    ///   (a) gcCommitWriteBarrierCell / gcCommitForwardBarrierCell —
-    ///       appendAssumeCapacity under a prior reserve: always listed;
-    ///   (b) gcCommitCloseBarrierCell — gcLinkOld1CloseCommit: overflow
-    ///       commit, sets the flag;
-    ///   (c) gcForwardBarrierValue / gcStoreMetatable — overflow commits
-    ///       since review-11: a failed append sets the flag before the
-    ///       OOM propagates.
-    /// Hence flag clear ⇒ every OLD0 is listed; the entry drains run
-    /// flag-gated before every OLD0→OLD1 advance, and the membership
-    /// check excludes duplicates. gcSweepYoungObjects asserts the flag
-    /// is clear when the promote loop runs.
-    fn gcDrainOverflowOld1(self: *Vm) DispatchError!void {
-        for (self.gc_objects.items) |obj| {
-            if (obj == .cell) continue;
-            const p = gcPtr(obj);
-            if (p.age.* != .old0) continue;
-            var listed = false;
-            for (self.gc_old1.items) |o| {
-                if (std.meta.eql(o, obj)) {
-                    listed = true;
-                    break;
-                }
-            }
-            if (listed) continue;
-            try self.gc_old1.append(self.infraAlloc(), obj);
-        }
-        self.gc_old1_overflow = false;
     }
 
     /// Drain the grayagain list: traverse each grayagain object and drain
@@ -31001,32 +30796,6 @@ pub const Vm = struct {
         try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), saved.len);
         self.gc_grayagain.clearRetainingCapacity();
         for (saved, 0..) |obj, i| {
-            // Task 7: invariant — all grayagain entries are valid (registered
-            // in gc_objects). The lifecycle guarantee:
-            //   1. gcDrainGrayagain saves+clears grayagain at atomic start.
-            //   2. All saved entries are force-marked black (survive sweep).
-            //   3. gcCorrectGrayAgain (after sweep) compacts grayagain,
-            //      removing dead entries and advancing ages.
-            //   4. No object is freed while it's in grayagain: sweep frees
-            //      only dead (unmarked) objects, but grayagain entries were
-            //      all marked black in step 2.
-            // The old defensive skip (which dereferenced the entry pointer
-            // to read gc_index — not a real dangling-pointer protection)
-            // has been replaced with a stats-gated assert.
-            if (self.stats.enabled) {
-                const p = gcPtr(obj);
-                // Strings carry no dense index (header bytes 12..16 are the
-                // hash) — the membership assert runs for plain types only.
-                if (p.index) |ip| {
-                    const idx = ip.*;
-                    if (idx >= self.gc_objects.items.len or
-                        !std.meta.eql(self.gc_objects.items[idx], obj))
-                    {
-                        self.stats.gc_stale_grayagain += 1;
-                        std.debug.assert(false);
-                    }
-                }
-            }
             switch (obj) {
                 .cell => {
                     // PUC never puts upvalues in grayagain: luaC_barrierback_
@@ -31102,9 +30871,9 @@ pub const Vm = struct {
     /// upvalues are Cells with `isOpen() == true`. Cells are separate GC
     /// objects, so they survive even if their referencing closure is freed.
     /// Instead of accessing closures (which may have been freed by a previous
-    /// sweep), we iterate all Cells in gc_objects and mark values of open,
-    /// non-white Cells. This is O(total objects) but correct and avoids
-    /// use-after-free on freed closure memory.
+    /// sweep), we walk the allgc chain and mark values of open, non-white
+    /// Cells. This is O(chain) but correct and avoids use-after-free on
+    /// freed closure memory.
     ///
     /// Key invariant (PUC lgc.c:419): only mark the value if the upvalue
     /// itself is NOT white (was reached by normal traversal). A white upvalue
@@ -31114,17 +30883,15 @@ pub const Vm = struct {
         // threads; for each non-white open upvalue (assert isgray), markvalue
         // (re-mark the stack-backed value). Does NOT change the upvalue's
         // color — it stays gray. Open upvalues are never set black by PUC.
-        for (self.gc_objects.items) |obj| {
-            switch (obj) {
-                .cell => |cell| {
-                    if (cell.isOpen() and !gcIsWhite(cell.gc.marked)) {
-                        // PUC lgc.c:420-421: lua_assert(upisopen(uv) && isgray(uv));
-                        // markvalue(g, uv->v.p) — re-mark the stack-backed value.
-                        // Does NOT set black — PUC keeps open upvalues gray.
-                        try self.gcMarkValue(cell.get(self));
-                    }
-                },
-                else => {},
+        var cur = self.gc_allgc_head;
+        while (cur) |hdr| : (cur = hdr.next) {
+            if (hdr.tag != .cell) continue;
+            const cell = gcFromHeader(hdr).cell;
+            if (cell.isOpen() and !gcIsWhite(cell.gc.marked)) {
+                // PUC lgc.c:420-421: lua_assert(upisopen(uv) && isgray(uv));
+                // markvalue(g, uv->v.p) — re-mark the stack-backed value.
+                // Does NOT set black — PUC keeps open upvalues gray.
+                try self.gcMarkValue(cell.get(self));
             }
         }
     }
@@ -31394,15 +31161,14 @@ pub const Vm = struct {
                 // PUC atomic2gen: flip white, sweep all (free dead), set OLD+BLACK
                 self.gc_current_white ^= WHITEBITS;
                 self.gcClearDeadKeys();
-                self.gc_objects_snapshot_len = self.gc_objects.items.len;
-                self.gc_sweep_objects_cursor = 0;
+                self.gc_sweep_last = null;
                 self.gc_state = .sweep;
                 while (try self.gcSweepOne()) {}
                 // P16.50-review-11 BLOCKER 2 lifecycle audit: this path
                 // bypasses gcFinishCycle (PUC finishgencycle restarts a
                 // propagate cycle directly) — check the same no-unrecorded-
                 // work invariant before gcMakeAllOld repaints everything.
-                std.debug.assert(!self.gc_gray_overflow and !self.gc_old1_overflow);
+                std.debug.assert(!self.gc_gray_overflow);
                 self.gcAllgcAssertSync();
                 // Set all surviving objects to OLD+BLACK, return to gen mode
                 self.gc_mode = .generational;
@@ -31425,53 +31191,40 @@ pub const Vm = struct {
         // After the flip, alive tables have BLACKBIT (gcIsWhite=false), dead
         // tables have the old white bit (gcIsWhite=true → skipped). Running
         // before sweep avoids use-after-free: no table memory has been freed
-        // yet, so all gc_objects table pointers are valid.
+        // yet, so every chain table pointer is valid.
         self.gcClearDeadKeys();
 
-        // PUC entersweep: start sweeping `allgc` from the beginning.
-        // The snapshot length was captured in `gcStartCycle`.
-        self.gc_sweep_objects_cursor = 0;
+        // PUC entersweep: start sweeping the chain from its head. The
+        // cursor (last kept node) starts null; newborn tail-appends stay
+        // beyond it and survive on their current-white color.
+        self.gc_sweep_last = null;
         self.gc_state = .sweep;
     }
 
-    /// A6: Unified young-object age promotion. Replaces the per-type
-    /// `gcPromoteYoungValue`/`gcPromoteYoungCell` pair. `gcPtr` gives uniform
-    /// access to `.age` regardless of variant, so a single switch covers all
-    /// GC-managed types (tables, closures, threads, strings, cells).
+    /// Unified young-object age promotion (PUC sweepgen's nextage step).
     ///
-    /// Returns `true` if the object stays in the young list (age `.new` →
-    /// `.survival`, or already `.old1`/`.old`/`.touched*`), `false` if it
-    /// leaves the young list (promoted to `.old0`/`.old1`).
+    /// Returns `true` if the object stays in the young region (age `.new`
+    /// → `.survival`, or already `.old1`/`.old`/`.touched*` — aged-out
+    /// stragglers keep their eternal young-region membership, mirroring
+    /// the previous registry form), `false` if it leaves the young set
+    /// (promoted to `.old1`).
     ///
-    /// PUC-faithful age transitions (lgc.c `genstep` → `youngcollection`):
+    /// PUC-faithful age transitions (lgc.c `sweepgen`):
     ///   new       → survival  (survives first minor cycle, stays young)
-    ///   survival  → old1      (survives second cycle, joins gc_old1 list)
-    ///   old0      → old1      (forward-barrier-promoted; gcCorrectOld1
-    ///                          advances old0→old1 after the cycle)
+    ///   survival  → old1      (survives second cycle, joins the OLD1 cohort)
+    ///   old0      → old1      (forward-barrier-promoted young object)
     ///
-    /// Side effects preserved from the per-type predecessors:
-    ///   - `gc_gen_added_old_kb`: tracks bytes promoted to old gen, used by
-    ///     `gcMinorCollection` to decide minor→major threshold (PUC
-    ///     `GCmajorminor` equivalent). Without this, the major-cycle
-    ///     trigger would never fire from young promotions.
-    ///   - `gc_gen_threads`: threads promoted to old must be scanned as
-    ///     roots in subsequent minor cycles (line ~14326). This is our
-    ///     equivalent of PUC's `twups` list (threads with upvalues/open
-    ///     variables that need re-traversal). Without this, promoted
-    ///     threads would be missed by minor marking → use-after-free.
-    /// Infallible (P16.50-review-12 BLOCKER 2): gcSweepYoungObjects reserves
-    /// snapshot-sized capacity for gc_old1/gc_grayagain/gc_gen_threads
-    /// BEFORE freeing anything, and each call appends at most ONE entry to
-    /// each list (bound proof at the reserve site), so every append below
-    /// is appendAssumeCapacity. The old fallible appends ran AFTER the age
-    /// mutation — an OOM left an OLD1 object with no gc_old1/grayagain
-    /// membership (lost re-traversal → young children swept → UAF).
+    /// Side effects:
+    ///   - `gc_gen_added_old_kb`: bytes promoted to the old generation,
+    ///     the minor→major threshold input (PUC `addedold`).
+    ///   - `gc_gen_threads`: threads promoted to old are re-traversed as
+    ///     roots in subsequent minor cycles (our `twups` equivalent).
+    ///   - grayagain: non-cell OLD1 promotions are linked for
+    ///     correctgraylist (PUC sweepgen links OLD1 objects it passes).
+    /// Infallible: gcSweepYoungObjects reserves the walk's promote-time
+    /// grayagain/gen_threads capacity BEFORE freeing anything (bound
+    /// proof at the reserve site).
     fn gcPromoteYoungObject(self: *Vm, obj: GcObject) bool {
-        // PUC sweepgen (lgc.c:1145-1167): makewhite + nextage + if OLD1 →
-        // linkobjgclist(o, grayagain). Objects promoted to OLD1 MUST be
-        // added to grayagain so correctgraylist makes them BLACK. Without
-        // this, markold in the next cycle sees them as WHITE (reset by
-        // sweep) and skips re-traversal → young children not marked → freed.
         const p = gcPtr(obj);
         switch (p.age.*) {
             .new => {
@@ -31480,12 +31233,11 @@ pub const Vm = struct {
             },
             .survival => {
                 p.age.* = .old1;
-                self.gc_old1.appendAssumeCapacity(obj);
-                // PUC sweepgen adds OLD1 to the old1 list only, NOT to
-                // grayagain. Cells are NEVER added to grayagain — PUC never
-                // puts upvalues in grayagain, and markold handles them via
-                // markCellForceAssume (inline mark). Non-cell OLD1 objects
-                // are added to grayagain so correctgraylist makes them BLACK.
+                // PUC sweepgen adds OLD1 to the old1 cohort (positional)
+                // and, for non-cells, to grayagain so correctgraylist
+                // makes them BLACK. Cells are NEVER added to grayagain —
+                // PUC never puts upvalues in grayagain, and markold
+                // handles them via markCellForceAssume (inline mark).
                 if (obj != .cell) {
                     self.gc_grayagain.appendAssumeCapacity(obj);
                 }
@@ -31496,19 +31248,14 @@ pub const Vm = struct {
                 return false;
             },
             .old0 => {
-                // PUC nextage (lgc.c:1175-1205): G_OLD0 → G_OLD1.
-                // P16.49-review-2: the forward barrier that set .old0
-                // already LINKED the object into gc_old1
-                // (gcForwardBarrierValue/Cell, gcCommitCloseBarrierCell) — do
-                // not append again (duplicate entries). It did NOT,
-                // however, charge the accounting: PUC sweepgen increments
-                // `addedold` for EVERY object becoming G_OLD1 — both
-                // G_SURVIVAL→G_OLD1 and G_OLD0→G_OLD1 (lgc.c:1172-1212) —
-                // while luaC_barrier_ (lgc.c:246-260) only sets the age.
-                // The charge therefore belongs HERE, exactly once, at the
-                // actual age transition (the P16.49-review removal of it
-                // undercounted OLD0 promotions and wrongly deferred the
-                // minor→major transition).
+                // PUC nextage: G_OLD0 → G_OLD1. The forward barrier that
+                // set .old0 only wrote the age (the age IS the canonical
+                // publication — the object is a young-region member by
+                // position); the OLD1 cohort membership is positional too.
+                // The KB charge belongs HERE, exactly once, at the actual
+                // age transition (PUC sweepgen increments `addedold` for
+                // every object becoming G_OLD1 — both SURVIVAL→OLD1 and
+                // OLD0→OLD1 — while luaC_barrier_ only sets the age).
                 p.age.* = .old1;
                 self.gc_gen_added_old_kb += @as(f64, @floatFromInt(gcObjectBytes(obj))) / 1024.0;
                 if (obj != .cell) {
@@ -31525,153 +31272,141 @@ pub const Vm = struct {
         }
     }
 
-    /// A6: Unified generational young-object sweep. Replaces the five
-    /// per-type `gcSweepYoung{Tables,Closures,Threads,Strings,Cells}`
-    /// functions with a single pass over `gc_young_objects`.
+    /// Unified generational young-object sweep: ONE walk over the young
+    /// chain region [gc_gen_young_first .. tail] (creation order), freeing
+    /// dead objects and promoting survivors (PUC `youngcollection` →
+    /// `sweepgen`, adapted to the tail-append orientation).
     ///
-    /// PUC-faithful (lgc.c `youngcollection` → `sweepgen`): walks the young
-    /// list up to the snapshot taken at cycle start, freeing dead objects
-    /// and promoting survivors. Objects allocated mid-cycle (beyond the
-    /// snapshot) are unconditionally kept and their marks reset.
+    /// Region semantics: every node with age `.new`/`.survival`/`.old0`
+    /// lives inside the region (the invariant maintained by commit and
+    /// boundary updates); aged-out stragglers inside the region are
+    /// skipped by the age filters below, mirroring the previous young
+    /// registry's eternal membership.
+    ///
+    /// Nodes strictly beyond `gc_gen_snapshot` (the cycle-start tail —
+    /// allocated by finalizers inside our atomic, a documented divergence
+    /// from PUC's post-sweep callfin) are unconditionally kept and reset
+    /// to the current white.
     ///
     /// Liveness check (PUC `isdead` + `testbit(FINALIZEDBIT)`):
     ///   alive = !gcIsDead(marked, current_white)   // marked this cycle
     ///        or (marked & FINALIZEDBIT) != 0        // registered for finalization
     ///        or age == .old0                        // forward-barrier promoted
     ///
-    /// FINALIZEDBIT is set at registration time (registerFinalizable, mirroring
-    /// PUC luaC_checkfinalizer lgc.c:1088) and preserved across sweeps (PUC
-    /// maskmarks). It is the fast-check for "registered for finalization"
-    /// (PUC tofinalize(o)), NOT a recursive visited-bit for finalizer-reach.
-    ///
-    /// `gcFreeObject` (A2/A5) dispatches per-type teardown uniformly;
-    /// `gcUnregisterObject` removes from `gc_objects` via `gc_index`.
+    /// FINALIZEDBIT is set at registration time (registerFinalizable,
+    /// mirroring PUC luaC_checkfinalizer) and preserved across sweeps
+    /// (PUC maskmarks).
     fn gcSweepYoungObjects(self: *Vm) DispatchError!void {
-        // PUC sweepgen (lgc.c:1172-1213): walks young objects, freeing dead
-        // ones and promoting survivors. Only G_NEW objects are reset to white;
-        // all other survivors KEEP their color (BLACK stays BLACK). This is
-        // critical: OLD0 objects (forward-barrier promoted) must remain BLACK
-        // after sweep so the next cycle's markold can distinguish them from
-        // dead objects.
-        const snapshot = @min(self.gc_young_objects_snapshot_len, self.gc_young_objects.items.len);
-        // P16.49-review: make the sweep loop allocation-free (PUC sweepgen
-        // is infallible pointer surgery, lgc.c:1172-1213). Every promote-time
-        // append (gc_old1 / gc_grayagain / gc_gen_threads) is bounded by the
-        // snapshot length, so reserving that much capacity BEFORE any object
-        // is freed guarantees the loop cannot fail mid-way — a mid-loop
-        // failure would leave already-freed objects in the uncompacted young
-        // list, the same dangling-entry poisoning as the constructor
-        // rollback (a reserve failure here happens before any free, leaving
-        // every registry untouched).
-        // infraAlloc (PUC sweepgen parity): PUC's generational sweep is
-        // infallible pointer surgery on intrusive lists (lgc.c:1172-1213)
-        // — it allocates nothing, so a test memory limit can never make it
-        // fail. These list-growth reservations are host-registry machinery
-        // (the side-table analogue of PUC's intrusive lists); a counted
-        // reservation would let an armed memlimit kill the GC mid-cycle
-        // (memerr.lua testbytes: emergency collect under totalmem limit).
-        try self.gc_old1.ensureUnusedCapacity(self.infraAlloc(), snapshot);
-        try self.gc_grayagain.ensureUnusedCapacity(self.infraAlloc(), snapshot);
-        try self.gc_gen_threads.ensureUnusedCapacity(self.infraAlloc(), snapshot);
-        // Bound proof (P16.50-review-12 BLOCKER 2): the loop calls
-        // gcPromoteYoungObject at most once per snapshot entry and each
-        // call appends at most ONE entry to each reserved list
-        // (survival→old1: gc_old1+1, gc_grayagain+1 iff non-cell,
-        // gc_gen_threads+1 iff thread; old0→old1: gc_old1+0 — already
-        // linked by the forward barrier — plus the same grayagain/
-        // gen_threads bounds; new→survival: none), so the snapshot-sized
-        // reserves cover every appendAssumeCapacity. Nothing between the
-        // reserve and the appends consumes that capacity: the loop's frees
-        // (gcFreeObject → thread teardown → barriers take the GENMINOR
-        // sweep no-op arm) and gcUnregisterObjectSweep append to none of
-        // the three lists.
-        // P16.50-review-11 (gc_old1 overflow proof): the OLD0→OLD1 promote
-        // arm below assumes list membership. The entry drains (flag-gated)
-        // completed the publication of every overflow-committed OLD0
-        // before this loop, and no barrier runs mid-sweep (the GENMINOR
-        // sweep arm is a no-op), so a clear flag means every OLD0 is
-        // listed — the proof's invariant, checked here.
-        std.debug.assert(!self.gc_old1_overflow);
-        var write: usize = 0;
-        for (self.gc_young_objects.items[0..snapshot]) |obj| {
+        // PUC sweepgen (lgc.c:1172-1213): only G_NEW objects are reset to
+        // white; all other survivors KEEP their color (BLACK stays BLACK).
+        // This is critical: OLD0 objects (forward-barrier promoted) must
+        // remain BLACK after sweep so the next cycle's markold can
+        // distinguish them from dead objects.
+        // Empty young region (no young-eligible node exists): nothing to
+        // sweep, no boundary motion (a commit reopens the region at the
+        // tail). young_first is the region authority — NOT the chain head,
+        // which may hold any number of old nodes.
+        if (self.gc_gen_young_first == null) {
+            self.gcAllgcAssertSync();
+            return;
+        }
+        var link: *?*GcHeader = if (self.gc_gen_young_prev) |pv| &pv.next else &self.gc_allgc_head;
+        std.debug.assert(link.* == self.gc_gen_young_first);
+        // markold has aged the previous OLD1 cohort to .old — everything
+        // headward of the young region is now >= .old, so the fresh OLD1
+        // cohort starts exactly at the region head.
+        self.gc_gen_old1_scan = link.*;
+        // Pre-count pass (pure): the promote-time appends are bounded by
+        // the death-checked prefix — non-cell survival/old0 nodes
+        // (grayagain) and survival/old0 threads (gc_gen_threads). Dead
+        // nodes never promote, so this is an upper bound; spare capacity
+        // is harmless. Reserving BEFORE the first free keeps the walk
+        // allocation-free past this point (PUC sweepgen parity: a test
+        // memory limit must not be able to kill the sweep mid-walk —
+        // memerr.lua testbytes).
+        var grayagain_need: usize = 0;
+        var threads_need: usize = 0;
+        {
+            var beyond = self.gc_gen_snapshot == null;
+            var cur = link.*;
+            while (cur) |hdr| {
+                if (!beyond) {
+                    const p = gcPtr(gcFromHeader(hdr));
+                    if (p.age.* == .survival or p.age.* == .old0) {
+                        if (hdr.tag != .cell) grayagain_need += 1;
+                        if (hdr.tag == .thread) threads_need += 1;
+                    }
+                    if (hdr == self.gc_gen_snapshot) beyond = true;
+                }
+                cur = hdr.next;
+            }
+        }
+        try self.gc_grayagain.ensureUnusedCapacity(self.infraAlloc(), grayagain_need);
+        if (threads_need > 0) try self.gc_gen_threads.ensureUnusedCapacity(self.infraAlloc(), threads_need);
+        // Main walk. `prev` is the node owning `link` (null = the chain
+        // head field); both feed gcChainUnlinkAt's boundary repairs.
+        var prev: ?*GcHeader = self.gc_gen_young_prev;
+        var new_young_first: ?*GcHeader = null;
+        var new_young_prev: ?*GcHeader = null;
+        var beyond = self.gc_gen_snapshot == null;
+        while (link.*) |hdr| {
+            const obj = gcFromHeader(hdr);
             const p = gcPtr(obj);
-            const alive = !gcIsDead(p.marked.*, self.gc_current_white) or
-                (p.marked.* & FINALIZEDBIT) != 0 or
-                p.age.* == .old0 or
-                (gcCanFinalize(obj) and self.gcHasFinalizer(obj));
-            if (!alive) {
-                if (obj == .string) {
-                    // Strings carry no dense index: defer registry removal
-                    // and free to one compaction pass after the loop (keeps
-                    // the sweep linear instead of per-string dense scans).
-                    obj.string.marked |= STRING_PENDING_SWEEP;
-                    self.gc_pending_string_sweep += 1;
+            if (!beyond) {
+                const alive = !gcIsDead(p.marked.*, self.gc_current_white) or
+                    (p.marked.* & FINALIZEDBIT) != 0 or
+                    p.age.* == .old0 or
+                    (gcCanFinalize(obj) and self.gcHasFinalizer(obj));
+                if (!alive) {
+                    self.gcChainUnlinkAt(link, hdr, prev);
+                    self.gcFreeObject(obj, .sweep);
                     continue;
                 }
-                // Remove from gc_objects first (swapRemove), then free memory.
-                self.gcUnregisterObjectSweep(obj, gcPtr(obj).index.?.*);
-                self.gcFreeObject(obj, .sweep);
-                continue;
-            }
-            // PUC sweepgen: only G_NEW objects are reset to white + promoted
-            // to G_SURVIVAL. All other survivors keep their color (BLACK).
-            // gcMakeWhite preserves FINALIZEDBIT (PUC maskmarks).
-            if (p.age.* == .new) {
+                if (p.age.* == .new) {
+                    gcMakeWhite(&p.marked.*, self.gc_current_white);
+                }
+                if (self.gcPromoteYoungObject(obj)) {
+                    if (new_young_first == null) {
+                        new_young_first = hdr;
+                        new_young_prev = prev;
+                    }
+                } else {
+                    // Promoted to OLD1: the walk runs head→tail, so the
+                    // last promotion seen is the TAILmost fresh OLD1 —
+                    // PUC's firstold1 stop marker for the next markold.
+                    self.gc_gen_firstold1 = hdr;
+                }
+            } else {
                 gcMakeWhite(&p.marked.*, self.gc_current_white);
+                if (new_young_first == null) {
+                    new_young_first = hdr;
+                    new_young_prev = prev;
+                }
             }
-            if (self.gcPromoteYoungObject(obj)) {
-                self.gc_young_objects.items[write] = obj;
-                write += 1;
-            }
+            if (hdr == self.gc_gen_snapshot) beyond = true;
+            prev = hdr;
+            link = &hdr.next;
         }
-        // Compact post-snapshot entries (mid-cycle allocations).
-        // They may have been marked while on the stack; reset their marks
-        // so the next cycle starts with a clean white slate, then keep
-        // them in the young list (they haven't been age-promoted yet).
-        for (self.gc_young_objects.items[snapshot..]) |obj| {
-            gcMakeWhite(&gcPtr(obj).marked.*, self.gc_current_white);
-            self.gc_young_objects.items[write] = obj;
-            write += 1;
-        }
-        self.gc_young_objects.items.len = write;
-        self.gcSweepDropPendingStrings();
+        // Young-region boundary update: the region now starts at the
+        // first kept node (stayer or beyond-snapshot newborn); when
+        // nothing was kept, the region is empty and reopens at the tail
+        // on the next commit (young_prev = the final walk position).
+        self.gc_gen_young_first = new_young_first;
+        self.gc_gen_young_prev = if (new_young_first != null) new_young_prev else prev;
+        self.gc_gen_snapshot = null;
         self.gcAllgcAssertSync();
     }
 
-    /// Deferred young-sweep string removal (see STRING_PENDING_SWEEP):
-    /// order-preserving compaction of the registry dropping the marked
-    /// dead strings. Dense positions of the surviving plain objects are
-    /// renumbered inline; the shadow chain is rebuilt in the same pass
-    /// (same order, fewer nodes). O(registry size), once per young sweep.
-    fn gcSweepDropPendingStrings(self: *Vm) void {
-        if (self.gc_pending_string_sweep == 0) return;
-        self.gc_pending_string_sweep = 0;
-        var write: usize = 0;
-        var slot: *?*GcHeader = &self.gc_allgc_head;
-        for (self.gc_objects.items) |obj| {
-            if (obj == .string and (obj.string.marked & STRING_PENDING_SWEEP) != 0) {
-                self.gcFreeObject(obj, .sweep);
-                continue;
-            }
-            if (gcPtr(obj).index) |i| i.* = @intCast(write);
-            self.gc_objects.items[write] = obj;
-            slot.* = gcHeaderOf(obj);
-            slot = &gcHeaderOf(obj).next;
-            write += 1;
-        }
-        self.gc_objects.items.len = write;
-        slot.* = null;
-    }
-
-    /// Debug-only lossless-sync checker for the shadow allgc chain: walks
-    /// the chain against the dense registry and proves — member by member,
-    /// in order — that the chain is exactly the linked form of
-    /// `gc_objects`: equal lengths, no duplicates, no losses, and every
-    /// header's tag dispatch (`gcFromHeader`, the @fieldParentPtr downcast)
-    /// resolves back to the registry entry at the same position. Runs at
-    /// cycle boundaries (every finished incremental cycle and every young
-    /// sweep) on the whole battery in Debug; compiled to a no-op in
-    /// non-Debug builds.
+    /// Debug-only checker: proves the canonical chain and its dense
+    /// mirror are the same sequence, member by member and in order —
+    /// equal lengths (no losses, no duplicates: a duplicate in a
+    /// null-terminated singly-linked list is a cycle, which the
+    /// walk-to-null plus the per-element index comparison catches),
+    /// and every header's tag dispatch (`gcFromHeader`, the
+    /// @fieldParentPtr downcast) resolves back to the mirror entry at
+    /// the same position. Runs at cycle boundaries (every finished
+    /// incremental cycle and every young sweep) on the whole battery in
+    /// Debug; compiled to a no-op in non-Debug builds.
     fn gcAllgcAssertSync(self: *Vm) void {
         if (@import("builtin").mode != .Debug) return;
         const items = self.gc_objects.items;
@@ -31681,53 +31416,91 @@ pub const Vm = struct {
             cur = hdr.next;
             i += 1;
         }) {
-            if (i >= items.len) @panic("gc allgc shadow: chain longer than registry");
+            if (i >= items.len) @panic("gc allgc: chain longer than mirror");
             const expect = items[i];
-            if (hdr != gcHeaderOf(expect)) @panic("gc allgc shadow: chain/registry order mismatch");
-            if (!std.meta.eql(gcFromHeader(hdr), expect)) @panic("gc allgc shadow: header tag downcast mismatch");
+            if (hdr != gcHeaderOf(expect)) @panic("gc allgc: chain/mirror order mismatch");
+            if (!std.meta.eql(gcFromHeader(hdr), expect)) @panic("gc allgc: header tag downcast mismatch");
         }
-        if (i != items.len) @panic("gc allgc shadow: chain shorter than registry");
+        if (i != items.len) @panic("gc allgc: chain shorter than mirror");
+        // Tail invariant: the stored tail is the walk's last node and its
+        // link is null (or both are empty).
+        if (self.gc_allgc_tail) |t| {
+            if (t.next != null) @panic("gc allgc: tail link is not null");
+        } else if (self.gc_allgc_head != null) {
+            @panic("gc allgc: tail null but head set");
+        }
     }
 
-    fn gcCorrectOld1(self: *Vm) void {
-        // PUC sweepgen (lgc.c:1188-1201): advances G_OLD0 → G_OLD1 via
-        // nextage[]. G_OLD1 objects are NOT advanced here — they stay OLD1
-        // until the NEXT cycle's gcMarkOld1 (PUC markold, lgc.c:1276)
-        // transitions them to G_OLD and re-traverses the black ones (their
-        // young children must be re-marked every cycle). Advancing OLD1→OLD
-        // here would skip that re-traversal. Threads are re-traversed via
-        // their gc_gen_threads root-loop membership plus the grayagain
-        // membership gcPromoteYoungObject gave them at promotion.
-        //
-        // IMPORTANT: Only advance OLD0→OLD1 here. Do NOT advance OLD1→OLD.
-        // Objects promoted to OLD1 by gcPromoteYoungObject (from gc_young_objects)
-        // are also in this list (added by forward barriers). Advancing them to
-        // OLD in the same cycle skips the OLD1 state, breaking age assertions
-        // (gengc.lua:50 expects OLD1 after collectgarbage("step")).
-        // OLD1→OLD is handled by markold at the START of the next cycle.
-        const snapshot = @min(self.gc_old1_snapshot_len, self.gc_old1.items.len);
-        var write: usize = 0;
-        for (self.gc_old1.items[0..snapshot]) |obj| {
-            const p = gcPtr(obj);
-            switch (p.age.*) {
-                .old0 => {
-                    p.age.* = .old1;
-                    self.gc_old1.items[write] = obj;
-                    write += 1;
-                },
-                .old1 => {
-                    // Keep OLD1 objects in the list for next cycle's markold.
-                    self.gc_old1.items[write] = obj;
-                    write += 1;
-                },
-                else => {},
+    /// Debug-only mirror maintenance (see `gc_objects`): append at commit,
+    /// identity orderedRemove at unlink. Both run only in Debug builds —
+    /// the mirror exists solely to feed `gcAllgcAssertSync`.
+    fn gcDebugMirrorAdd(self: *Vm, obj: GcObject) void {
+        self.gc_objects.append(self.infraAlloc(), obj) catch @panic("oom: gc debug mirror");
+    }
+
+    fn gcDebugMirrorRemove(self: *Vm, obj: GcObject) void {
+        const items = self.gc_objects.items;
+        for (items, 0..) |item, i| {
+            if (std.meta.eql(item, obj)) {
+                _ = self.gc_objects.orderedRemove(i);
+                return;
             }
         }
-        for (self.gc_old1.items[snapshot..]) |obj| {
-            self.gc_old1.items[write] = obj;
-            write += 1;
+        unreachable; // mirror/unlink divergence — checker invariant broken
+    }
+
+    /// Test-only census helpers over the canonical chain (work in every
+    /// build mode; the dense mirror exists only in Debug).
+    pub fn testGcChainLen(self: *Vm) usize {
+        var n: usize = 0;
+        var cur = self.gc_allgc_head;
+        while (cur) |hdr| : (cur = hdr.next) n += 1;
+        return n;
+    }
+
+    /// Duplicate the chain's members (creation order) into `alloc`-backed
+    /// storage — the order-exact observable registry form for tests.
+    pub fn testGcChainDupe(self: *Vm, alloc: std.mem.Allocator) std.mem.Allocator.Error![]GcObject {
+        var list = std.ArrayListUnmanaged(GcObject).empty;
+        errdefer list.deinit(alloc);
+        var cur = self.gc_allgc_head;
+        while (cur) |hdr| : (cur = hdr.next) {
+            try list.append(alloc, gcFromHeader(hdr));
         }
-        self.gc_old1.items.len = write;
+        return list.toOwnedSlice(alloc);
+    }
+
+    /// Count of young-REGION members (the minor-sweep walk set: from the
+    /// young boundary to the tail, aged-out stragglers included — the
+    /// positional equivalent of the retired young registry).
+    pub fn testGcYoungRegionLen(self: *Vm) usize {
+        var n: usize = 0;
+        var cur = self.gc_gen_young_first;
+        while (cur) |hdr| : (cur = hdr.next) n += 1;
+        return n;
+    }
+
+    /// Count of chain members carrying a given age (the retired worklist
+    /// membership checks are age-bit checks now).
+    pub fn testGcCountAge(self: *Vm, age: GcAge) usize {
+        var n: usize = 0;
+        var cur = self.gc_allgc_head;
+        while (cur) |hdr| : (cur = hdr.next) {
+            if (gcPtr(gcFromHeader(hdr)).age.* == age) n += 1;
+        }
+        return n;
+    }
+
+    /// Duplicate the young-region members (chain order) into `alloc`-backed
+    /// storage — the order-exact young-registry form for tests.
+    pub fn testGcYoungRegionDupe(self: *Vm, alloc: std.mem.Allocator) std.mem.Allocator.Error![]GcObject {
+        var list = std.ArrayListUnmanaged(GcObject).empty;
+        errdefer list.deinit(alloc);
+        var cur = self.gc_gen_young_first;
+        while (cur) |hdr| : (cur = hdr.next) {
+            try list.append(alloc, gcFromHeader(hdr));
+        }
+        return list.toOwnedSlice(alloc);
     }
 
     fn gcCorrectGrayAgain(self: *Vm) void {
@@ -31822,50 +31595,37 @@ pub const Vm = struct {
     /// transition `.old1 → .old`, and for black objects, force gray + append
     /// to `gc_gray` (bypassing `gcQueueScanObject`'s white-only guard).
     ///
-    /// Only `.old1` objects are processed (matching PUC). `.old0` objects
-    /// (forward-barrier-promoted) are transitioned to `.old1` by
-    /// `gcCorrectOld1` during sweep, then processed here next cycle.
-    /// `.old` objects are not re-traversed: in PUC their invariant is that
-    /// all their referenced objects are also old (promoted together across
-    /// cycles), so they have no young children to mark.
+    /// Walk region: [gc_gen_old1_scan .. gc_gen_firstold1] — the reversed
+    /// mirror of PUC's [firstold1..reallyold) range. The OLD1 cohort is
+    /// positional (last cycle's survival/old0 promotions occupy the chain
+    /// prefix of what was the young region); OLD1 stragglers tailward of
+    /// the cohort are covered because `firstold1` is the TAILmost OLD1
+    /// node (its unlink repair only ever over-covers, never under-covers).
     ///
-    /// P16.50-review-12 BLOCKER 1: batch-prepare contract. The old shape
-    /// (this function's stale duplicate, plus the inline copy in
-    /// gcMinorCollection — now removed) mutated `p.age.* = .old` and painted
-    /// gray BEFORE the fallible gc_gray/markCellForceAssume appends — an OOM
-    /// at the append left an .old object whose re-traversal was lost: a
-    /// retry skips it (`age != .old1`), so its young children were never
-    /// marked and the minor sweep freed them (use-after-free).
-    ///
-    /// Bound proof (reserve BEFORE any mutation): each snapshot OLD1 entry
-    /// contributes at most ONE ordinary gc_gray append —
+    /// Bound proof (reserve BEFORE any mutation): each OLD1 node in the
+    /// walk contributes at most ONE gc_gray append —
     ///   non-Cell: the object itself (gcSetGray + append);
     ///   Cell: never appended (markCellForceAssume marks inline), but its
-    ///     VALUE mark (gcMarkValueImpl assume → gcQueueScanObjectAssume)
-    ///     appends the value's single GcObject iff collectable and
-    ///     non-string (strings go straight to black; primitives mark
-    ///     nothing). A Value references at most one GcObject, so the
-    ///     per-Cell bound is exactly 1.
+    ///     VALUE mark (gcQueueScanObjectAssume) appends the value's single
+    ///     GcObject iff collectable and non-string. A Value references at
+    ///     most one GcObject, so the per-Cell bound is exactly 1.
     /// grayagain bound: ZERO. Threads keep their promotion-time grayagain
-    /// membership (gcPromoteYoungObject's survival→old1 and old0→old1 arms
-    /// append every non-cell OLD1 — threads included),
-    /// gcCorrectGrayAgain keeps non-white threads, and gcDrainGrayagain
-    /// re-links them; the gc_gen_threads root loop in gcMinorCollection
-    /// re-traverses every old thread each cycle regardless. A markold
-    /// grayagain append would only duplicate that membership (one extra
-    /// stable entry per OLD1 thread — pure double traversal). The stale
-    /// duplicate's thread append is therefore NOT reproduced here.
+    /// membership, gcCorrectGrayAgain keeps non-white threads, and the
+    /// gc_gen_threads root loop re-traverses every old thread each cycle.
     fn gcMarkOld1(self: *Vm) std.mem.Allocator.Error!void {
-        const snapshot = @min(self.gc_old1_snapshot_len, self.gc_old1.items.len);
-        // Pure bound pass: count OLD1 entries (color-independent upper
-        // bound — gray/white OLD1 contribute 0, the spare capacity is
-        // harmless).
+        const stop = self.gc_gen_firstold1;
+        // Pure bound pass: count OLD1 nodes in the walk region.
         var gray_need: usize = 0;
-        for (self.gc_old1.items[0..snapshot]) |obj| {
-            if (gcPtr(obj).age.* == .old1) gray_need += 1;
+        {
+            var cur = self.gc_gen_old1_scan;
+            while (cur) |hdr| : (cur = if (hdr == stop) null else hdr.next) {
+                if (gcPtr(gcFromHeader(hdr)).age.* == .old1) gray_need += 1;
+            }
         }
         if (gray_need > 0) try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), gray_need);
-        for (self.gc_old1.items[0..snapshot]) |obj| {
+        var cur = self.gc_gen_old1_scan;
+        while (cur) |hdr| : (cur = if (hdr == stop) null else hdr.next) {
+            const obj = gcFromHeader(hdr);
             const p = gcPtr(obj);
             if (p.age.* != .old1) continue;
             // PUC markold: setage(p, G_OLD); if (isblack(p)) reallymarkobject(g, p);
@@ -31893,22 +31653,13 @@ pub const Vm = struct {
         // luaC_barrier_ (lgc.c:257-260) is a deliberate NO-OP in the
         // KGC_GENMINOR sweep phase (the value of a surviving cell was
         // already marked in atomic through the live closure's traversal).
-        // This is what makes the young sweep genuinely allocation-free:
-        // the barrier family takes its sweep arm instead of the marking /
-        // promoting / gc_old1-append path.
+        // This is what makes the young sweep genuinely allocation-free
+        // past its entry reserve: the barrier family takes its sweep arm
+        // instead of the marking/promoting path.
         const saved_state = self.gc_state;
         self.gc_state = .sweep;
         defer self.gc_state = saved_state;
-        // P16.50-review-10 BLOCKER 1: complete any OLD0 overflow publication
-        // BEFORE gcSweepYoungObjects — gcPromoteYoungObject's OLD0 arm
-        // advances OLD0→OLD1 assuming the object is already linked into
-        // gc_old1. Covers the same-cycle case: a finalizer or __close
-        // continuation promoted an object (overflowing gc_old1) after the
-        // minor-collection entry drain above. Flag-gated (see the entry
-        // drain): a clear flag means no unlinked OLD0 object exists.
-        if (self.gc_old1_overflow) try self.gcDrainOverflowOld1();
         try self.gcSweepYoungObjects();
-        self.gcCorrectOld1();
         self.gcCorrectGrayAgain();
     }
 
@@ -31923,22 +31674,12 @@ pub const Vm = struct {
         }
 
         self.gc_cycle_finalizer_epoch = self.gc_finalizer_epoch;
-        // P16.50-review-10 BLOCKER 1: complete any OLD0 overflow publication
-        // BEFORE the gc_old1 snapshot — an overflowed close-barrier promote
-        // (age already OLD0, list append rejected) must be in gc_old1 for
-        // the markold loop below and for sweepgen's OLD0→OLD1 advance.
-        // Flag-gated: the only OLD0 producers that can skip the list append
-        // are close-barrier commits (gcLinkOld1CloseCommit sets the flag);
-        // every other OLD0 path (gcForwardBarrierValue/Cell, the reserved
-        // commit arms) links at promote time by the reserve-first contract,
-        // so a clear flag means no unlinked OLD0 object exists — no scan.
-        if (self.gc_old1_overflow) try self.gcDrainOverflowOld1();
-        // A6: single unified young list replaces the five per-type young lists.
-        self.gc_young_objects_snapshot_len = self.gc_young_objects.items.len;
-        self.gc_old1_snapshot_len = self.gc_old1.items.len;
-        self.gc_grayagain_snapshot_len = self.gc_grayagain.items.len;
+        // Pointer-form snapshots: the cycle-start tail bounds the
+        // death-checked prefix of the young sweep (finalizers run inside
+        // our atomic — a documented divergence — so their allocations
+        // must survive this cycle's young sweep unconditionally).
+        self.gc_gen_snapshot = self.gc_allgc_tail;
         self.gc_gen_last_minor_visited = 0;
-        self.gc_gen_last_minor_old_visited = 0;
         self.gcResetCycleState();
 
         // PUC youngcollection does NOT reset young objects' marks to
@@ -31959,11 +31700,11 @@ pub const Vm = struct {
         // this forced re-traversal, young children of OLD1 objects are not
         // marked → freed during minor sweep → use-after-free.
         // PUC markold also advances age G_OLD1 → G_OLD here.
-        // P16.50-review-12 BLOCKER 1: gcMarkOld1 is the single markold —
-        // the old inline duplicate (same mutate-before-append window, no
-        // thread grayagain append) is removed; see gcMarkOld1's bound
-        // proof.
         try self.gcMarkOld1();
+        // markold consumed the OLD1 set and its stop marker; the young
+        // sweep below re-establishes `firstold1` from this cycle's
+        // promotions (PUC: firstold1 = NULL between markold and sweepgen).
+        self.gc_gen_firstold1 = null;
         // PUC atomic (lgc.c:1546-1560): grayagain items are saved and cleared
         // at the START of atomic, then drained AFTER the gray list. PUC does
         // NOT re-queue grayagain items before atomic — they are only processed
@@ -32025,7 +31766,7 @@ pub const Vm = struct {
         // PUC minor2inc (lgc.c:1306): sets gckind, clears generational
         // list pointers, calls entersweep(L) which starts sweeping allgc
         // from the beginning. We mirror this by entering sweep state
-        // directly, with gc_objects_snapshot_len covering all objects.
+        // directly, with the pointer cursor covering the whole chain.
         // PUC youngcollection (lgc.c:1350-1379): sweep young generation FIRST,
         // then check checkminormajor. sweepgen promotes SURVIVAL→OLD1 and
         // increments addedold1, which checkminormajor uses to decide the
@@ -32042,9 +31783,8 @@ pub const Vm = struct {
             // PUC entersweep: start sweeping ALL objects from the beginning.
             // The snapshot covers all objects that existed at this point;
             // objects allocated during sweep (by finalizers) are beyond it
-            // and handled by gcSweepOne Phase 2 (marks reset, not death-checked).
-            self.gc_objects_snapshot_len = self.gc_objects.items.len;
-            self.gc_sweep_objects_cursor = 0;
+            // and survive the sweep on their current-white color.
+            self.gc_sweep_last = null;
             self.gc_state = .sweep;
             // PUC minor2inc: luaE_setdebt(g, stepsize). Set debt so the
             // next gcAutomaticStep runs gcAdvance to drive the sweep.
@@ -32056,96 +31796,69 @@ pub const Vm = struct {
             // invariant as gcFinishCycle: the atomic drains consumed every
             // marker, the young-sweep barriers are no-ops, the OLD0 entry
             // drains completed every overflow publication.
-            std.debug.assert(!self.gc_gray_overflow and !self.gc_old1_overflow);
+            std.debug.assert(!self.gc_gray_overflow);
             self.gcScheduleNextAutomaticCycle();
         }
     }
 
-    /// Incremental sweep: walk `gc_objects` up to snapshot length, freeing
-    /// dead objects. Returns true if there are more objects to sweep.
-    /// PUC-faithful: sweeps `allgc` in allocation order (lgc.c `sweepstep`).
+    /// Incremental sweep step: examines ONE chain node and returns true if
+    /// the sweep has more work. PUC `sweeplist` (lgc.c:1128-1152) in the
+    /// tail-append orientation: the cursor (`gc_sweep_last`) is the last
+    /// node examined and KEPT alive — the next victim is always
+    /// `last.next` (or the chain head), so a free is the one-slot write
+    /// `last.next = victim.next` with the cursor holding still.
     ///
-    /// Dead objects are removed via `gcUnregisterObject` (O(1) `swapRemove`
-    /// on `gc_objects` using `gc_index`), then freed via `gcFreeObject`.
-    /// Because `swapRemove` moves the last element into the freed slot, and
-    /// we walk forward, the swapped-in element (from beyond the cursor) has
-    /// not been examined yet — so we do NOT advance the cursor to re-examine it.
+    /// Death check (PUC `isdead` + `tofinalize`): the object has the OTHER
+    /// white bit and is not registered for finalization. FINALIZEDBIT
+    /// objects are kept alive until their finalizer runs and clears the
+    /// bit (the fast-check equivalent of PUC's finobj/tobefnz lists that
+    /// the sweep never touches).
+    ///
+    /// There is no snapshot bound: a newborn tail-append lands beyond the
+    /// cursor holding the CURRENT white — the death check passes it and
+    /// the repaint normalizes it — exactly PUC sweeplist semantics for
+    /// mid-cycle allocations (mid-MARK unmarked garbage dies this cycle;
+    /// mid-SWEEP newborns survive).
     fn gcSweepOne(self: *Vm) DispatchError!bool {
-        // Phase 1: sweep objects within the snapshot (captured at cycle start).
-        // The snapshot length is the bound for death-checking: objects beyond
-        // it were allocated during this cycle and survive.
-        //
-        // IMPORTANT: `gcUnregisterObject` uses `swapRemove`, which shrinks
-        // `gc_objects`. When enough objects are freed, the list can become
-        // shorter than the cursor (even though cursor < snapshot). In that
-        // case, all snapshot objects at [cursor, snapshot) have been swapped
-        // into earlier positions and examined — we fall through to Phase 2/3.
-        if (self.gc_sweep_objects_cursor < self.gc_objects_snapshot_len and
-            self.gc_sweep_objects_cursor < self.gc_objects.items.len)
-        {
-            const obj = self.gc_objects.items[self.gc_sweep_objects_cursor];
-            const p = gcPtr(obj);
-            // PUC isdead: object has the OTHER white bit (created in a
-            // previous cycle, never marked in this one).
-            // FINALIZEDBIT prevents sweeping — objects registered for
-            // finalization (PUC tofinalize(o), lgc.h:96) are kept alive
-            // until their finalizer runs and clears the bit (udata2finalize,
-            // lgc.c:953). This is the fast-check equivalent of PUC keeping
-            // finobj/tobefnz objects in separate lists that the sweep never
-            // touches.
-            const is_dead = gcIsDead(p.marked.*, self.gc_current_white) and
-                (p.marked.* & FINALIZEDBIT) == 0;
-            // `gcCanFinalize` is the type-level check; `gcHasFinalizer` is
-            // the instance-level check (registered in `finalizables` set).
-            const has_finalizer = gcCanFinalize(obj) and self.gcHasFinalizer(obj);
-
-            if (is_dead and !has_finalizer) {
-                // Object is dead with no finalizer — remove from gc_objects
-                // (swapRemove moves the last element into this slot), then
-                // free its memory. We must NOT advance the cursor so the
-                // swapped-in element gets examined next iteration.
-                self.gcUnregisterObjectSweep(obj, self.gc_sweep_objects_cursor);
-                self.gcFreeObject(obj, .sweep);
-            } else {
-                // Object is alive (or has a finalizer to run) — reset its
-                // mark to the current white for the next cycle.
-                // PUC sweeplist (lgc.c): `curr->marked = (marked & maskmarks) | white`
-                // where maskmarks = ~(BLACKBIT|WHITEBITS) preserves FINALIZEDBIT.
-                // gcMakeWhite does the same: clears color bits, preserves
-                // FINALIZEDBIT, sets current white.
-                gcMakeWhite(&p.marked.*, self.gc_current_white);
-                self.gc_sweep_objects_cursor += 1;
-            }
-            return true;
+        const link: *?*GcHeader = if (self.gc_sweep_last) |l| &l.next else &self.gc_allgc_head;
+        const hdr = link.* orelse return false;
+        const obj = gcFromHeader(hdr);
+        const p = gcPtr(obj);
+        const is_dead = gcIsDead(p.marked.*, self.gc_current_white) and
+            (p.marked.* & FINALIZEDBIT) == 0;
+        // `gcCanFinalize` is the type-level check; `gcHasFinalizer` is
+        // the instance-level check (registered in `finalizables` set).
+        const has_finalizer = gcCanFinalize(obj) and self.gcHasFinalizer(obj);
+        if (is_dead and !has_finalizer) {
+            // Dead: unlink through the cursor's own slot (the predecessor
+            // link) and free. The cursor does not move — the successor
+            // gets examined by the next step.
+            self.gcChainUnlinkAt(link, hdr, self.gc_sweep_last);
+            self.gcFreeObject(obj, .sweep);
+        } else {
+            // Alive (or has a finalizer to run): reset the mark to the
+            // current white for the next cycle.
+            // PUC sweeplist (lgc.c): `curr->marked = (marked & maskmarks) | white`
+            // where maskmarks = ~(BLACKBIT|WHITEBITS) preserves FINALIZEDBIT.
+            // gcMakeWhite does the same: clears color bits, preserves
+            // FINALIZEDBIT, sets current white.
+            gcMakeWhite(&p.marked.*, self.gc_current_white);
+            self.gc_sweep_last = hdr;
         }
-
-        // Phase 2: reset marks for objects allocated DURING the sweep (beyond
-        // the snapshot). These survive this cycle; their marks must be reset
-        // so the next cycle starts clean. PUC: `sweepstep` handles new objects
-        // appended to `allgc` during sweep the same way.
-        if (self.gc_sweep_objects_cursor < self.gc_objects.items.len) {
-            const obj = self.gc_objects.items[self.gc_sweep_objects_cursor];
-            gcMakeWhite(&gcPtr(obj).marked.*, self.gc_current_white);
-            self.gc_sweep_objects_cursor += 1;
-            return true;
-        }
-
-        // Phase 3: sweep long string literals. (The chained intern table
-        // needs no rehash: removals unlink in O(1) and never degrade.)
-        try self.long_literals.sweep(self.infraAlloc(), self.alloc, self.gc_current_white);
-        return false;
+        return true;
     }
 
     /// Free a GC object's memory. Centralizes type-specific teardown that was
     /// previously spread across per-type sweep branches.
     ///
     /// This function ONLY frees the object's allocation and internal buffers.
-    /// It does NOT remove the object from `gc_objects` — the caller (sweep
-    /// function or `drainGcRegistries`) is responsible for that:
-    ///   - `gcSweepOne` / `gcSweepYoungObjects` call `gcUnregisterObject`
-    ///     before `gcFreeObject` to remove from `gc_objects` via `swapRemove`.
-    ///   - `drainGcRegistries` iterates `gc_objects` and frees each, then
-    ///     deinit's the list — no per-object removal needed.
+    /// It does NOT unlink the object from the canonical chain — the caller
+    /// (sweep step, rollback, teardown) owns the unlink:
+    ///   - `gcSweepOne` / `gcSweepYoungObjects` unlink through their walk
+    ///     slot before freeing.
+    ///   - `gcUnregisterObjectRollback` unlinks via the predecessor search.
+    ///   - `drainGcRegistries` frees the whole chain without per-object
+    ///     unlinks.
     ///
     /// `gcNoteFree` updates the GC memory counter so `testbytes` converges.
     fn gcFreeObject(self: *Vm, obj: GcObject, thread_close_ctx: ThreadUpvalueCloseContext) void {
@@ -32224,13 +31937,17 @@ pub const Vm = struct {
                 self.alloc.destroy(th);
             },
             .string => |s| {
-                // PUC luaS_remove: remove from intern table BEFORE freeing
-                // (s.bytes() must be valid for the hashmap key lookup).
-                // Short strings are in string_intern; long literals in
-                // long_literals. HashMap.remove is a no-op if not found.
+                // PUC luaS_remove: remove from the intern/cache table
+                // BEFORE freeing (s.bytes() must be valid for the hashmap
+                // key lookup). Short strings live in string_intern; long
+                // literals in long_literals. HashMap.remove is a no-op if
+                // not found (long runtime and external strings hit that
+                // no-op).
                 if (s.isShort()) {
                     // PUC luaS_remove: O(1) chain unlink.
                     self.string_intern.removeString(s);
+                } else {
+                    _ = self.long_literals.table.remove(s.bytes());
                 }
                 // External strings only own the header; regular strings own
                 // header + inline content. `destroyLuaString` handles the
@@ -32271,7 +31988,7 @@ pub const Vm = struct {
                 }
                 // P16.10c verifier Task 6: Debug-only, env-gated sweep
                 // diagnostic. Captures WHY the cell died — open/closed state,
-                // tri-color, age, gc_index — so a reachable Cell dying at
+                // tri-color, age — so a reachable Cell dying at
                 // sweep (an invariant violation) is observable. A Cell freed
                 // here MUST be genuinely unreachable: the closure(s) holding
                 // it were already swept, and no live frame's boxed[]/open
@@ -32290,8 +32007,8 @@ pub const Vm = struct {
                         const color: []const u8 =
                             if ((c.gc.marked & BLACKBIT) != 0) "black" else if ((c.gc.marked & WHITEBITS) != 0) "white" else "gray";
                         std.debug.print(
-                            "cell sweep: open={} color={s} age={s} gc_index={}\n",
-                            .{ c.isOpen(), color, @tagName(c.gc.age), c.gc.index },
+                            "cell sweep: open={} color={s} age={s}\n",
+                            .{ c.isOpen(), color, @tagName(c.gc.age) },
                         );
                     }
                 }
@@ -32330,11 +32047,11 @@ pub const Vm = struct {
         // are always set together and only the drain's complete scan
         // clears the flag). An abort mid-cycle (OOM) never reaches here —
         // the next cycle's drains retry.
-        std.debug.assert(!self.gc_gray_overflow and !self.gc_old1_overflow);
+        std.debug.assert(!self.gc_gray_overflow);
         self.gc_state = .pause;
         self.gcAllgcAssertSync();
-        // Reset sweep cursor for the next cycle.
-        self.gc_sweep_objects_cursor = 0;
+        // Reset the sweep cursor for the next cycle.
+        self.gc_sweep_last = null;
         self.gc_gray.clearRetainingCapacity();
         // PUC does not force a follow-up collection when finalizers ran
         // during a cycle; the next cycle is paced solely by GCdebt (PUC
@@ -32665,9 +32382,7 @@ pub const Vm = struct {
         const cur = self.gc_gray.pop() orelse return false;
         if (self.gc_minor_cycle) {
             self.gc_gen_last_minor_visited += 1;
-            // A3: cur is now GcObject; read age through gcPtr.
-            const age = gcPtr(cur).age.*;
-            if (age.isOld()) self.gc_gen_last_minor_old_visited += 1;
+            if (gcPtr(cur).age.*.isOld()) self.gc_gen_last_minor_old_visited += 1;
         }
         switch (cur) {
             .table => |tbl| {
@@ -33371,7 +33086,8 @@ pub const Vm = struct {
         if (lr != rr) return lr > rr;
         // Same rank: sort by creation sequence descending (LIFO creation
         // order). The sequence is set once at creation and never changed,
-        // unlike gc_index which is corrupted by swapRemove. Only the
+        // (the sequence is stable — it is never rewritten after
+        // allocation). Only the
         // finalizable types carry a sequence (P16.16 C1); the sort never
         // sees another type, so the null case is unreachable in practice.
         const lseq = gcFinalizableSeqPtr(lhs) orelse return false;
@@ -33463,7 +33179,6 @@ pub const Vm = struct {
         // register each object with every step infallible until the caller
         // anchors the result.
         const nups = proto.upvalues.len;
-        try self.gcPrepareRegister(nups + 1);
         var scope = try self.openRootScope(1, nups);
         defer scope.close();
 
@@ -33877,7 +33592,6 @@ pub const Vm = struct {
             // P16.50 transactional: prepare for ALL cells upfront; on any
             // failure roll back the created cells (they are not yet
             // referenced by the closure, so nothing roots them).
-            try self.gcPrepareRegister(num_upvalues);
             const cells = try self.alloc.alloc(*Cell, num_upvalues);
             var created: usize = 0;
             errdefer {
@@ -33991,7 +33705,6 @@ pub const Vm = struct {
         // root space is reserved up front (infra allocator) and every
         // create → root → register step after that is infallible.
         const nups: usize = proto.upvalues.len;
-        try self.gcPrepareRegister(nups + 1);
         var scope = try self.openRootScope(1, nups);
         defer scope.close();
 
@@ -35255,7 +34968,6 @@ pub const Vm = struct {
         // Return a no-op closure (PUC's ll_accessible).
         if (is_probe) {
             // P16.50 transactional + symmetric charge (see llAccessible note).
-            try self.gcPrepareRegister(1);
             const cl = try self.alloc.create(Closure);
             cl.* = .{ .upvalues = &.{}, .c_func = &llAccessible };
             self.gcRegisterCommit(.{ .closure = cl });
@@ -35290,7 +35002,6 @@ pub const Vm = struct {
         // Wrap the C function pointer in a Closure so it can be called via
         // the normal runClosure → callCFunction dispatch path.
         // P16.50 transactional + symmetric charge.
-        try self.gcPrepareRegister(1);
         const cl = try self.alloc.create(Closure);
         cl.* = .{ .upvalues = &.{}, .c_func = c_func };
         self.gcRegisterCommit(.{ .closure = cl });
@@ -47782,7 +47493,6 @@ pub const Vm = struct {
         // P16.50 transactional: prepare-first; the post-commit publish
         // (setField) failure rolls the thread back completely instead of
         // leaving a charged orphan.
-        try self.gcPrepareRegister(1);
         const th = try self.alloc.create(Thread);
         // Full teardown — the setField failure window below
         // runs AFTER initThreadBaseFrame committed the base-frame arrays.
@@ -52311,7 +52021,7 @@ test "vm: callCFunction dispatches a c_func closure" {
     // luaL_setfuncs/lua_pushcfunction do.
     const cl = try vm.alloc.create(Closure);
     cl.* = .{ .upvalues = &.{}, .c_func = doubler };
-    try vm.gcRegisterClosure(cl);
+    vm.gcRegisterClosure(cl);
 
     // apiCall (pub) -> resolveCallable -> runClosure -> callCFunction.
     const args = [_]Value{.{ .Int = 21 }};
@@ -52349,7 +52059,7 @@ test "vm: callCFunction with zero results" {
 
     const cl = try vm.alloc.create(Closure);
     cl.* = .{ .upvalues = &.{}, .c_func = noop };
-    try vm.gcRegisterClosure(cl);
+    vm.gcRegisterClosure(cl);
 
     const ret = try vm.apiCall(.nonyieldable, .{ .Closure = cl }, &.{});
     defer vm.alloc.free(ret);
@@ -53255,7 +52965,7 @@ test "vm: incremental GC advances real phases and preserves barrier writes" {
     // Add enough dead objects that sweep cannot finish in the same work unit.
     var i: usize = 0;
     while (i < 64) : (i += 1) _ = try vm.allocTableNoGc();
-    const before = vm.gc_objects.items.len;
+    const before = vm.testGcChainLen();
 
     try vm.gcStartCycle(true);
     try testing.expectEqual(Vm.GcState.propagate, vm.gc_state);
@@ -53282,15 +52992,15 @@ test "vm: incremental GC advances real phases and preserves barrier writes" {
     var saw_sweep = false;
     var freed_before_completion = false;
     while (vm.gc_state != .pause) {
-        const old_len = vm.gc_objects.items.len;
+        const old_len = vm.testGcChainLen();
         const completed = try vm.gcAdvance(1, false);
         if (vm.gc_state == .sweep) saw_sweep = true;
-        if (!completed and vm.gc_objects.items.len < old_len) freed_before_completion = true;
+        if (!completed and vm.testGcChainLen() < old_len) freed_before_completion = true;
     }
 
     try testing.expect(saw_sweep);
     try testing.expect(freed_before_completion);
-    try testing.expect(vm.gc_objects.items.len < before);
+    try testing.expect(vm.testGcChainLen() < before);
     try testing.expect(vm.rawGet(holder, .{ .String = try vm.internStr("value") }) == .Table);
     try testing.expect(vm.rawGet(holder, .{ .String = try vm.internStr("value") }).Table == target);
 }
@@ -53379,8 +53089,216 @@ test "vm: generational GC enters and leaves incremental major mode" {
     vm.gcparams[1] = Vm.gcCodeParam(0);
     try vm.gcCycleFull();
     try testing.expectEqual(Vm.GcGenPhase.minor, vm.gc_gen_phase);
-    try testing.expectEqual(@as(usize, 0), vm.gc_young_objects.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.testGcYoungRegionLen());
     try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
+}
+
+// =========================================================================
+// GC Cut 2 focused tests: pointer sweep cursor semantics, α-rollback at
+// the three cursor-relative positions, and long-literal chain membership.
+// =========================================================================
+
+test "GC Cut 2: mid-cycle allocations relative to the sweep cursor" {
+    const testing = std.testing;
+
+    // ── A (mid-SWEEP newborn): an allocation between sweep steps lands at
+    // the tail, beyond the cursor, holding the CURRENT white — the death
+    // check passes it and the repaint normalizes it. It survives its
+    // birth cycle even though nothing references it, and dies in the
+    // NEXT cycle (the pointer-cursor replacement for the retired
+    // snapshot tail). ──
+    {
+        var vm = Vm.init(testing.allocator, false);
+        defer vm.deinit();
+        var scope = try vm.openRootScope(1, 0);
+        defer scope.close();
+        const survivor = try vm.allocTableNoGc();
+        _ = scope.protectValueAssumeCapacity(.{ .Table = survivor });
+        const garbage = try vm.allocTableNoGc();
+
+        while (vm.gc_state != .sweep) {
+            _ = try vm.gcAdvance(1, false);
+        }
+        const newborn = try vm.allocTableNoGc();
+        while (vm.gc_state != .pause) {
+            _ = try vm.gcAdvance(1, false);
+        }
+        try testing.expect(p50IsRegistered(&vm, .{ .table = newborn }));
+        try testing.expect(!p50IsRegistered(&vm, .{ .table = garbage }));
+        try testing.expect(p50IsRegistered(&vm, .{ .table = survivor }));
+
+        // Next full cycle: the unreferenced newborn dies.
+        try vm.gcCycleFull();
+        try testing.expect(!p50IsRegistered(&vm, .{ .table = newborn }));
+        try testing.expect(p50IsRegistered(&vm, .{ .table = survivor }));
+    }
+
+    // ── B (mid-MARK allocation, PUC sweeplist semantics): an allocation
+    // during the propagate phase holds the pre-flip white; after the flip
+    // it is old-white garbage and — with no snapshot bound — dies in its
+    // BIRTH cycle, exactly like PUC's sweeplist (the retired snapshot
+    // kept such allocations one extra cycle). ──
+    {
+        var vm = Vm.init(testing.allocator, false);
+        defer vm.deinit();
+        var scope = try vm.openRootScope(1, 0);
+        defer scope.close();
+        const survivor = try vm.allocTableNoGc();
+        _ = scope.protectValueAssumeCapacity(.{ .Table = survivor });
+
+        while (vm.gc_state == .pause) {
+            _ = try vm.gcAdvance(1, false);
+        }
+        try testing.expect(vm.gc_state == .propagate);
+        const stillborn = try vm.allocTableNoGc();
+        while (vm.gc_state != .pause) {
+            _ = try vm.gcAdvance(1, false);
+        }
+        try testing.expect(!p50IsRegistered(&vm, .{ .table = stillborn }));
+        try testing.expect(p50IsRegistered(&vm, .{ .table = survivor }));
+    }
+}
+
+test "GC Cut 2: rollback unlink at the three cursor positions + real next cycle (poison oracle)" {
+    const testing = std.testing;
+
+    var vm = Vm.init(testing.allocator, false);
+    defer vm.deinit();
+    // The poison/unmap oracle traps every freed block (PROT_NONE): a
+    // freed-but-linked node faults loudly in the cycle's marking/sweep
+    // walks instead of silently reading freed memory; Vm.deinit releases
+    // the trapped regions, keeping the ledger leak-free.
+    vm.testcInstallAdapterOverBase(testing.allocator);
+    vm.testcArmPoisonUnmap();
+
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    const survivor = try vm.allocTableNoGc();
+    _ = scope.protectValueAssumeCapacity(.{ .Table = survivor });
+
+    // The cursor (last kept node) only ever lands on SURVIVORS, so the
+    // batch is rooted for the positioning pass: the sweep keeps w1..w4 and
+    // the cursor can sit exactly on w2 (w1 before it, w3/w4 after it).
+    var batch = try vm.openRootScope(4, 0);
+    const w1 = try vm.allocTableNoGc();
+    const w2 = try vm.allocTableNoGc();
+    const w3 = try vm.allocTableNoGc();
+    const w4 = try vm.allocTableNoGc();
+    _ = batch.protectValueAssumeCapacity(.{ .Table = w1 });
+    _ = batch.protectValueAssumeCapacity(.{ .Table = w2 });
+    _ = batch.protectValueAssumeCapacity(.{ .Table = w3 });
+    _ = batch.protectValueAssumeCapacity(.{ .Table = w4 });
+    const chain0 = vm.testGcChainLen();
+
+    // Enter the sweep and step until the cursor sits exactly on w2: the
+    // rooted batch survives, so gc_sweep_last advances onto each of them
+    // in chain order.
+    while (vm.gc_state != .sweep) {
+        _ = try vm.gcAdvance(1, false);
+    }
+    while (vm.gc_sweep_last != gcHeaderOf(.{ .table = w2 })) {
+        _ = try vm.gcAdvance(1, false);
+    }
+
+    // α destroy-now at all three positions. The unlink repairs the
+    // cursor (victim == cursor → successor; the successor's death check
+    // is conservatively skipped for the rest of this cycle).
+    p50TeardownTable(&vm, w1, true); // BEFORE the cursor
+    p50TeardownTable(&vm, w2, true); // ON the cursor node
+    p50TeardownTable(&vm, w3, true); // AFTER the cursor
+    try testing.expect(!p50IsRegistered(&vm, .{ .table = w1 }));
+    try testing.expect(!p50IsRegistered(&vm, .{ .table = w2 }));
+    try testing.expect(!p50IsRegistered(&vm, .{ .table = w3 }));
+
+    // Unroot w4 (batch.close also releases the scope's protections on
+    // the already-destroyed w1..w3 — their root slots are stale Values,
+    // but the poison oracle never walks them: teardown left the chain).
+    batch.close();
+
+    // Finish the aborted-by-teardown cycle: the sweep continues from the
+    // repaired cursor through w4 (dead garbage once unrooted — freed by
+    // the sweep itself) without touching the three freed nodes.
+    while (vm.gc_state != .pause) {
+        _ = try vm.gcAdvance(1, false);
+    }
+    // w4 was rooted during THIS cycle's mark, so the finishing sweep
+    // keeps it (marked) — it becomes garbage only for the NEXT cycle.
+    try testing.expect(p50IsRegistered(&vm, .{ .table = w4 }));
+    try testing.expect(p50IsRegistered(&vm, .{ .table = survivor }));
+
+    // A REAL full cycle under the oracle: every chain walk (roots,
+    // propagation, sweep, checker) dereferences only live nodes. The
+    // conservative skip (cursor repair at a torn-down cursor node) lets
+    // w4 live exactly ONE extra cycle (gcChainUnlinkAt contract); it
+    // dies in the second cycle, not the aborted one.
+    try vm.gcCycleFull();
+    try testing.expect(p50IsRegistered(&vm, .{ .table = w4 }));
+    try vm.gcCycleFull();
+    try testing.expect(!p50IsRegistered(&vm, .{ .table = w4 }));
+    try testing.expect(p50IsRegistered(&vm, .{ .table = survivor }));
+    try testing.expectEqual(chain0 - 4, vm.testGcChainLen());
+    vm.gcAllgcAssertSync();
+}
+
+test "GC Cut 2: long literals are chain members — GC death, cache eviction, deinit" {
+    const testing = std.testing;
+    const raw = "gc2-long-literal-abcdefghijklmnopqrstuvwxyz-0123456789-END";
+
+    var vm = Vm.init(testing.allocator, false);
+    defer vm.deinit();
+    // Unreferenced literal: a chain member from creation; a full cycle
+    // frees it and removes the cache entry at free time.
+    const lit = try vm.internLiteral(raw);
+    try testing.expect(lit.bytes().len > 40);
+    try testing.expect(p50IsRegistered(&vm, .{ .string = lit }));
+    try vm.gcCycleFull();
+    try testing.expect(!p50IsRegistered(&vm, .{ .string = lit }));
+    try testing.expect(vm.long_literals.table.get(raw) == null);
+
+    // Re-intern after death: a FRESH string (no resurrection of freed
+    // memory), cached again.
+    const lit2 = try vm.internLiteral(raw);
+    try testing.expect(lit2 != lit);
+    try testing.expect(vm.long_literals.table.get(raw).? == lit2);
+
+    // Rooted literal: survives cycles and stays readable.
+    var scope = try vm.openRootScope(1, 0);
+    _ = scope.protectValueAssumeCapacity(.{ .String = lit2 });
+    try vm.gcCycleFull();
+    try testing.expect(p50IsRegistered(&vm, .{ .string = lit2 }));
+    try testing.expectEqualStrings(raw, lit2.bytes());
+    try vm.gcCycleFull();
+    try testing.expect(p50IsRegistered(&vm, .{ .string = lit2 }));
+
+    // Generational mode: a fresh literal is a normal young object (age
+    // .new, minor-cycle death when unreferenced) — the retired .old
+    // pinning existed only because literals were outside the registry.
+    try vm.gcEnterGenerational();
+    // A DISTINCT literal: interning `raw` again would cache-hit the
+    // entergen-aged lit2.
+    const raw3 = "gc2-long-literal-GEN-qrstuvwxyz-9876543210-END";
+    const lit3 = try vm.internLiteral(raw3);
+    try testing.expect(lit3.age == .new);
+    // The literals cache is NOT a GC root: an unrooted newborn literal
+    // is ordinary young garbage and dies in its FIRST minor collection
+    // (the cache entry goes at free time). This is the anti-pinning
+    // proof: pre-Cut 2 literals were outside the registry and immortal.
+    try vm.gcMinorCollection();
+    try testing.expect(!p50IsRegistered(&vm, .{ .string = lit3 }));
+    try testing.expect(vm.long_literals.table.get(raw3) == null);
+    // The ROOTED lit2 survives minors; drop the reference first (a major
+    // cycle frees it: entergen aged it old, minors touch only young).
+    scope.close();
+    try vm.gcMinorCollection();
+    try testing.expect(p50IsRegistered(&vm, .{ .string = lit2 }));
+    // A gen-mode full collect is a major: leave the minor regime and run
+    // a full cycle (PUC collectgarbage() in generational mode).
+    vm.gcLeaveGenerational();
+    try vm.gcCycleFull();
+    try testing.expect(!p50IsRegistered(&vm, .{ .string = lit2 }));
+
+    // Teardown (defer) frees every remaining chain member, literals
+    // included — the leak check is the testing allocator itself.
 }
 
 // =========================================================================
@@ -53506,12 +53424,12 @@ test "vm: P16.8a transactional simple_result setup — errdefer rollback on push
     const parent_cl = try aalloc.create(Closure);
     parent_cl.* = .{ .proto = parent_proto, .upvalues = &.{} };
     _ = vm.retainTreeForClosure(parent_proto);
-    try vm.gcRegisterClosure(parent_cl);
+    vm.gcRegisterClosure(parent_cl);
 
     const mm_cl = try aalloc.create(Closure);
     mm_cl.* = .{ .proto = mm_proto, .upvalues = &.{} };
     _ = vm.retainTreeForClosure(mm_proto);
-    try vm.gcRegisterClosure(mm_cl);
+    vm.gcRegisterClosure(mm_cl);
 
     // P16.10b: constants are adopted at closure creation in production;
     // this hand-built-frame test adopts both trees explicitly so the
@@ -53683,11 +53601,11 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
     const parent_cl = try aalloc.create(Closure);
     parent_cl.* = .{ .proto = parent_proto, .upvalues = &.{} };
     _ = vm.retainTreeForClosure(parent_proto);
-    try vm.gcRegisterClosure(parent_cl);
+    vm.gcRegisterClosure(parent_cl);
     const mm_cl = try aalloc.create(Closure);
     mm_cl.* = .{ .proto = mm_proto, .upvalues = &.{} };
     _ = vm.retainTreeForClosure(mm_proto);
-    try vm.gcRegisterClosure(mm_cl);
+    vm.gcRegisterClosure(mm_cl);
     try vm.resolveProtoConstants(parent_proto);
     try vm.resolveProtoConstants(mm_proto);
 
@@ -54556,7 +54474,7 @@ test "P16.44: createBytecodeChunkClosure fully transactional (every fail index)"
         }
 
         // Full observable state BEFORE the constructor probe.
-        const gc_len0 = vm.gc_objects.items.len;
+        const gc_len0 = vm.testGcChainLen();
         const count0 = vm.gc_count_kb;
         const funcs0 = vm.testc_obj_functions;
 
@@ -54591,7 +54509,7 @@ test "P16.44: createBytecodeChunkClosure fully transactional (every fail index)"
             // not grow (the P16.43 bug left 3 Cell entries per failing
             // post-registration index), the accounting must return to the
             // byte-exact pre-call value, and the tree ref must balance.
-            try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
+            try testing.expectEqual(gc_len0, vm.testGcChainLen());
             try testing.expectEqual(count0, vm.gc_count_kb);
             try testing.expectEqual(funcs0, vm.testc_obj_functions);
             try testing.expectEqual(tree_ref0, proto.tree.?.ref_count);
@@ -54622,11 +54540,11 @@ test "P16.44: createBytecodeChunkClosure fully transactional (every fail index)"
             proto.tree.?.releaseTree(saved_alloc);
             proto.tree.?.releaseTree(saved_alloc);
         }
-        const gc_len0 = vm.gc_objects.items.len;
+        const gc_len0 = vm.testGcChainLen();
         const count0 = vm.gc_count_kb;
         const funcs0 = vm.testc_obj_functions;
         try testing.expectError(error.OutOfMemory, vm.createBytecodeChunkClosure(proto));
-        try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
+        try testing.expectEqual(gc_len0, vm.testGcChainLen());
         try testing.expectEqual(count0, vm.gc_count_kb);
         try testing.expectEqual(funcs0, vm.testc_obj_functions);
         // Resolution did not complete (the failure was inside it).
@@ -54657,7 +54575,7 @@ test "P16.44: closureFromProto fully transactional (every fail index)" {
             proto.tree.?.releaseTree(saved_alloc);
             proto.tree.?.releaseTree(saved_alloc);
         }
-        const gc_len0 = vm.gc_objects.items.len;
+        const gc_len0 = vm.testGcChainLen();
         const count0 = vm.gc_count_kb;
         const funcs0 = vm.testc_obj_functions;
         if (vm.closureFromProto(proto)) |cl| {
@@ -54679,7 +54597,7 @@ test "P16.44: closureFromProto fully transactional (every fail index)" {
         } else |err| {
             try testing.expectEqual(error.OutOfMemory, err);
             tested_failures += 1;
-            try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
+            try testing.expectEqual(gc_len0, vm.testGcChainLen());
             try testing.expectEqual(count0, vm.gc_count_kb);
             try testing.expectEqual(funcs0, vm.testc_obj_functions);
         }
@@ -54693,7 +54611,7 @@ test "P16.44: repeated constructor failures leave zero registry/accounting growt
     const testing = std.testing;
     var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
-    const gc_len0 = vm.gc_objects.items.len;
+    const gc_len0 = vm.testGcChainLen();
     const count0 = vm.gc_count_kb;
     const funcs0 = vm.testc_obj_functions;
     var round: usize = 0;
@@ -54736,20 +54654,20 @@ test "P16.44: repeated constructor failures leave zero registry/accounting growt
             try testing.expectEqual(error.OutOfMemory, err);
         }
         // Fail fast with full context on the first drifting round.
-        if (vm.gc_objects.items.len != gc_len0) {
-            std.debug.print("DRIFT round={d} idx={d} gc={d}->{d} funcs={d}->{d}\n", .{ round, 3 + (round % 6), gc_len0, vm.gc_objects.items.len, funcs0, vm.testc_obj_functions });
+        if (vm.testGcChainLen() != gc_len0) {
+            std.debug.print("DRIFT round={d} idx={d} gc={d}->{d} funcs={d}->{d}\n", .{ round, 3 + (round % 6), gc_len0, vm.testGcChainLen(), funcs0, vm.testc_obj_functions });
             return error.TestUnexpectedResult;
         }
     }
-    try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
+    try testing.expectEqual(gc_len0, vm.testGcChainLen());
     try testing.expectEqual(count0, vm.gc_count_kb);
     try testing.expectEqual(funcs0, vm.testc_obj_functions);
 }
 
 test "P16.49-review: generational rollback keeps every GC registry exact" {
     // The latent OOM defect: gcRegisterObject in generational-minor links
-    // a new object into BOTH gc_objects and gc_young_objects, but the
-    // constructor rollbacks removed it only from gc_objects — a freed
+    // a new object into BOTH the allgc chain and the young region, but the
+    // constructor rollbacks removed it only from the chain — a freed
     // Cell/Closure stayed as a dangling young-list entry, and the next
     // gcMinorCollection dereferenced/double-freed it. This test proves the
     // rollback restores BYTE-EXACT pre-call contents of the young registry
@@ -54784,9 +54702,9 @@ test "P16.49-review: generational rollback keeps every GC registry exact" {
         }
 
         // EXACT pre-call state of every affected registry.
-        const young0 = try testing.allocator.dupe(GcObject, vm.gc_young_objects.items);
+        const young0 = try vm.testGcYoungRegionDupe(testing.allocator);
         defer testing.allocator.free(young0);
-        const gc_len0 = vm.gc_objects.items.len;
+        const gc_len0 = vm.testGcChainLen();
         const count0 = vm.gc_count_kb;
         const funcs0 = vm.testc_obj_functions;
 
@@ -54815,13 +54733,15 @@ test "P16.49-review: generational rollback keeps every GC registry exact" {
             try testing.expectEqual(error.OutOfMemory, err);
             tested_failures += 1;
             // Restoration of the unified registry...
-            try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
+            try testing.expectEqual(gc_len0, vm.testGcChainLen());
             try testing.expectEqual(count0, vm.gc_count_kb);
             try testing.expectEqual(funcs0, vm.testc_obj_functions);
-            // ...AND of the young registry: same length, same order,
+            // ...AND of the young region: same length, same order,
             // same objects (a dangling or reordered entry fails here).
-            try testing.expectEqual(young0.len, vm.gc_young_objects.items.len);
-            for (young0, vm.gc_young_objects.items) |a, b| {
+            const young_now = try vm.testGcYoungRegionDupe(testing.allocator);
+            defer testing.allocator.free(young_now);
+            try testing.expectEqual(young0.len, young_now.len);
+            for (young0, young_now) |a, b| {
                 try testing.expect(std.meta.eql(a, b));
             }
             // The decisive probe: run a real young collection over the
@@ -54829,7 +54749,9 @@ test "P16.49-review: generational rollback keeps every GC registry exact" {
             // were dereferenced here (gcPtr on freed memory → garbage
             // liveness → double free caught by the testing allocator).
             try vm.gcMinorCollection();
-            try testing.expectEqual(young0.len, vm.gc_young_objects.items.len);
+            const young_post = try vm.testGcYoungRegionDupe(testing.allocator);
+            defer testing.allocator.free(young_post);
+            try testing.expectEqual(young0.len, young_post.len);
         }
     }
     try testing.expect(tested_failures > 0);
@@ -54869,38 +54791,26 @@ test "P16.49-review-2: OLD0 promotion charges added-old exactly once (PUC sweepg
     const added_old_before_barrier = vm.gc_gen_added_old_kb;
     try vm.gcForwardBarrierValue(.{ .Table = owner }, .{ .Table = child });
     try testing.expect(child.gc.age == .old0);
-    // Barrier LINKS into gc_old1 (exactly once) but does NOT charge:
-    var in_old1: usize = 0;
-    for (vm.gc_old1.items) |o| {
-        if (o == .table and o.table == child) in_old1 += 1;
-    }
-    try testing.expectEqual(@as(usize, 1), in_old1);
+    // The barrier's whole publication is the age bit (exactly one by
+    // construction — there is no list entry to duplicate); it does NOT
+    // charge:
+    try testing.expect(child.gc.age == .old0);
     try testing.expectEqual(added_old_before_barrier, vm.gc_gen_added_old_kb);
 
     // Minor sweep: OLD0 → OLD1 with EXACTLY-ONE charge of the child's
-    // byte size; still exactly one gc_old1 entry.
+    // byte size (the OLD1 cohort membership is the age bit itself).
     const expected_charge = @as(f64, @floatFromInt(gcObjectBytes(.{ .table = child }))) / 1024.0;
     const before = vm.gc_gen_added_old_kb;
     try vm.gcMinorCollection();
     try testing.expect(child.gc.age == .old1);
     try testing.expectApproxEqAbs(expected_charge, vm.gc_gen_added_old_kb - before, 1e-9);
-    in_old1 = 0;
-    for (vm.gc_old1.items) |o| {
-        if (o == .table and o.table == child) in_old1 += 1;
-    }
-    try testing.expectEqual(@as(usize, 1), in_old1);
 
     // Next cycle (PUC markold, lgc.c:1276): the OLD1 object advances to
-    // OLD and leaves the old1 registry — no second charge, no duplicate.
+    // OLD — no second charge, no duplicate cohort membership.
     const before2 = vm.gc_gen_added_old_kb;
     try vm.gcMinorCollection();
     try testing.expectEqual(before2, vm.gc_gen_added_old_kb);
     try testing.expect(child.gc.age == .old);
-    in_old1 = 0;
-    for (vm.gc_old1.items) |o| {
-        if (o == .table and o.table == child) in_old1 += 1;
-    }
-    try testing.expectEqual(@as(usize, 0), in_old1);
 
     // Threshold edge: with the OLD0 contribution the minor→major
     // decision must trip exactly at the PUC checkminormajor boundary
@@ -54954,9 +54864,9 @@ test "P16.49-review-2: generational closureFromProto rollback keeps every regist
             proto.tree.?.releaseTree(saved_alloc);
         }
 
-        const young0 = try testing.allocator.dupe(GcObject, vm.gc_young_objects.items);
+        const young0 = try vm.testGcYoungRegionDupe(testing.allocator);
         defer testing.allocator.free(young0);
-        const gc_len0 = vm.gc_objects.items.len;
+        const gc_len0 = vm.testGcChainLen();
         const count0 = vm.gc_count_kb;
         const funcs0 = vm.testc_obj_functions;
 
@@ -54980,17 +54890,21 @@ test "P16.49-review-2: generational closureFromProto rollback keeps every regist
         } else |err| {
             try testing.expectEqual(error.OutOfMemory, err);
             tested_failures += 1;
-            try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
+            try testing.expectEqual(gc_len0, vm.testGcChainLen());
             try testing.expectEqual(count0, vm.gc_count_kb);
             try testing.expectEqual(funcs0, vm.testc_obj_functions);
-            try testing.expectEqual(young0.len, vm.gc_young_objects.items.len);
-            for (young0, vm.gc_young_objects.items) |a, b| {
+            const young_now = try vm.testGcYoungRegionDupe(testing.allocator);
+            defer testing.allocator.free(young_now);
+            try testing.expectEqual(young0.len, young_now.len);
+            for (young0, young_now) |a, b| {
                 try testing.expect(std.meta.eql(a, b));
             }
             // Real young collection over the restored state (DebugAllocator
             // catches any dangling/double-free).
             try vm.gcMinorCollection();
-            try testing.expectEqual(young0.len, vm.gc_young_objects.items.len);
+            const young_post = try vm.testGcYoungRegionDupe(testing.allocator);
+            defer testing.allocator.free(young_post);
+            try testing.expectEqual(young0.len, young_post.len);
         }
     }
     try testing.expect(tested_failures > 0);
@@ -54998,26 +54912,11 @@ test "P16.49-review-2: generational closureFromProto rollback keeps every regist
 }
 
 // Registry invariant helper used by the generational tests: every entry
-// of every live secondary registry must point at an object that is still
-// registered in gc_objects (i.e. its gc_index resolves back to itself).
+// of every live secondary work list must point at an object that is still
+// a member of the canonical chain.
 fn gcCheckSecondaryRegistryInvariants(vm: *Vm) bool {
-    for (vm.gc_young_objects.items) |obj| {
-        const p = gcPtr(obj);
-        const i = (p.index orelse continue).*; // strings carry no dense index
-        if (i >= vm.gc_objects.items.len) return false;
-        if (!std.meta.eql(vm.gc_objects.items[i], obj)) return false;
-    }
-    for (vm.gc_old1.items) |obj| {
-        const p = gcPtr(obj);
-        const i = (p.index orelse continue).*; // strings carry no dense index
-        if (i >= vm.gc_objects.items.len) return false;
-        if (!std.meta.eql(vm.gc_objects.items[i], obj)) return false;
-    }
     for (vm.gc_gen_threads.items) |th| {
-        const p = gcPtr(.{ .thread = th });
-        const i = (p.index orelse continue).*; // strings carry no dense index
-        if (i >= vm.gc_objects.items.len) return false;
-        if (!std.meta.eql(vm.gc_objects.items[i], .{ .thread = th })) return false;
+        if (!p50IsRegistered(vm, .{ .thread = th })) return false;
     }
     return true;
 }
@@ -55072,8 +54971,8 @@ test "P16.49-review: secondary registry invariants hold across minor cycles" {
 // and the restored state must survive a real gcMinorCollection (the
 // DebugAllocator panics on any dangling dereference or double free).
 //
-// Observable state per probe (P50Snapshot): gc_objects (order-exact),
-// gc_young_objects (order-exact), gc_count_kb, the five testc_obj_*
+// Observable state per probe (P50Snapshot): the allgc chain (order-exact),
+// the young region (order-exact), gc_count_kb, the five testc_obj_*
 // counters and — when a main C-API handle exists — its stack.
 // gc_grayagain is deliberately NOT snapshotted: write barriers
 // legitimately append live old tables there (a conservative keep-alive,
@@ -55094,7 +54993,7 @@ test "P16.49-review: secondary registry invariants hold across minor cycles" {
 // incremented.
 
 const P50Snapshot = struct {
-    gc_objects: []GcObject,
+    chain: []GcObject,
     young: []GcObject,
     stack: ?[]Value,
     gc_count_kb: f64,
@@ -55105,8 +55004,8 @@ const P50Snapshot = struct {
     obj_userdata: usize,
 
     fn take(vm: *Vm, alloc: std.mem.Allocator) std.mem.Allocator.Error!P50Snapshot {
-        const gc_objects = try alloc.dupe(GcObject, vm.gc_objects.items);
-        const young = try alloc.dupe(GcObject, vm.gc_young_objects.items);
+        const chain = try vm.testGcChainDupe(alloc);
+        const young = try vm.testGcYoungRegionDupe(alloc);
         // The snapshot covers the main handle's anchored
         // window on main_thread.stack (the old per-handle c_stack copy).
         const stack: ?[]Value = if (vm.main_handle) |h| blk: {
@@ -55114,7 +55013,7 @@ const P50Snapshot = struct {
             break :blk try alloc.dupe(Value, th.stack[Vm.cWindowBase(th)..th.top]);
         } else null;
         return .{
-            .gc_objects = gc_objects,
+            .chain = chain,
             .young = young,
             .stack = stack,
             .gc_count_kb = vm.gc_count_kb,
@@ -55127,19 +55026,23 @@ const P50Snapshot = struct {
     }
 
     fn deinit(self: *const P50Snapshot, alloc: std.mem.Allocator) void {
-        alloc.free(self.gc_objects);
+        alloc.free(self.chain);
         alloc.free(self.young);
         if (self.stack) |s| alloc.free(s);
     }
 
     fn assertRestored(self: *const P50Snapshot, vm: *Vm) !void {
         const testing = std.testing;
-        try testing.expectEqual(self.gc_objects.len, vm.gc_objects.items.len);
-        for (self.gc_objects, vm.gc_objects.items) |a, b| {
+        const chain_now = try vm.testGcChainDupe(testing.allocator);
+        defer testing.allocator.free(chain_now);
+        try testing.expectEqual(self.chain.len, chain_now.len);
+        for (self.chain, chain_now) |a, b| {
             try testing.expect(std.meta.eql(a, b));
         }
-        try testing.expectEqual(self.young.len, vm.gc_young_objects.items.len);
-        for (self.young, vm.gc_young_objects.items) |a, b| {
+        const young_now = try vm.testGcYoungRegionDupe(testing.allocator);
+        defer testing.allocator.free(young_now);
+        try testing.expectEqual(self.young.len, young_now.len);
+        for (self.young, young_now) |a, b| {
             try testing.expect(std.meta.eql(a, b));
         }
         // gc_count_kb arithmetic is exact in f64 here: every charge/credit
@@ -55170,16 +55073,21 @@ fn p50InternHash(vm: *Vm, raw: []const u8) u32 {
     return @truncate(h.final());
 }
 
-/// The object's gc_index resolves back to itself in gc_objects.
+/// The object is a member of the canonical chain (identity by header).
 fn p50IsRegistered(vm: *Vm, obj: GcObject) bool {
-    const p = gcPtr(obj);
-    const i = (p.index orelse return true).*; // strings carry no dense index
-    return i < vm.gc_objects.items.len and std.meta.eql(vm.gc_objects.items[i], obj);
+    const want = gcHeaderOf(obj);
+    var cur = vm.gc_allgc_head;
+    while (cur) |hdr| : (cur = hdr.next) {
+        if (hdr == want) return true;
+    }
+    return false;
 }
 
 fn p50InYoung(vm: *Vm, obj: GcObject) bool {
-    for (vm.gc_young_objects.items) |o| {
-        if (std.meta.eql(o, obj)) return true;
+    const want = gcHeaderOf(obj);
+    var cur = vm.gc_gen_young_first;
+    while (cur) |hdr| : (cur = hdr.next) {
+        if (hdr == want) return true;
     }
     return false;
 }
@@ -55223,7 +55131,6 @@ fn p50OpClosureEquivalent(
     child_proto: *bc.Proto,
 ) std.mem.Allocator.Error!*Closure {
     const nups = child_proto.upvalues.len;
-    try vm.gcPrepareRegister(nups + 1);
     const cells = try vm.alloc.alloc(*Cell, nups);
     var created_cells: usize = 0;
     // Rollback order: roll the created cells back FIRST, free the array
@@ -55496,39 +55403,38 @@ test "P16.50: opClosure-equivalent OOM transactionality (generational + incremen
         try snap.assertRestored(&vm);
     }
 
-    // ---- Part B: incremental mode, registry-capacity exhaustion edge ----
-    // gcPrepareRegister's ensureUnusedCapacity is the ONLY fallible step
-    // that can fail with the registries completely untouched; force it to
-    // actually grow by filling gc_objects until fewer than 5 slots are
-    // spare (a `len == capacity` loop would never terminate — prepare(1)
-    // itself grows the capacity whenever it fills up). The fill tables are
-    // temp-rooted so the post-failure gcMinorCollection below sees them as
-    // live, collection-safe state.
+    // ---- Part B: incremental mode, allocator-boundary rejection edge ----
+    // The 16 fill tables below keep the registry non-trivial; the root
+    // scope temp-roots exactly them so the post-failure gcMinorCollection
+    // sees live, collection-safe state.
     var vm2: Vm = .init(testing.allocator, false);
     defer vm2.deinit();
-    var fill_scope = try vm2.openRootScope(vm2.gc_objects.capacity - vm2.gc_objects.items.len, 0);
+    var fill_scope = try vm2.openRootScope(16, 0);
     defer fill_scope.close();
-    while (vm2.gc_objects.capacity - vm2.gc_objects.items.len >= 5) {
-        const t = try vm2.allocTableNoGc();
-        _ = fill_scope.protectValueAssumeCapacity(.{ .Table = t });
+    {
+        var i: usize = 0;
+        while (i < 16) : (i += 1) {
+            const t = try vm2.allocTableNoGc();
+            _ = fill_scope.protectValueAssumeCapacity(.{ .Table = t });
+        }
     }
-    const len0 = vm2.gc_objects.items.len;
-    const cap0 = vm2.gc_objects.capacity;
+    const len0 = vm2.testGcChainLen();
+    // Registration no longer has a fallible capacity step (the retired
+    // prepare probed exactly that). The surviving semantic: an allocation
+    // rejection under a full allocator must leave the chain untouched.
     var failing2 = std.testing.FailingAllocator.init(testing.allocator, .{
         .fail_index = 0,
         .resize_fail_index = 0,
     });
     vm2.alloc = failing2.allocator();
-    const prep = vm2.gcPrepareRegister(5);
+    try testing.expectError(error.OutOfMemory, vm2.allocTableNoGc());
     vm2.alloc = testing.allocator;
-    try testing.expectError(error.OutOfMemory, prep);
-    try testing.expectEqual(len0, vm2.gc_objects.items.len);
-    try testing.expectEqual(cap0, vm2.gc_objects.capacity);
+    try testing.expectEqual(len0, vm2.testGcChainLen());
     // The untouched state must be collection-safe. In incremental mode
-    // gcMinorCollection sweeps only the (empty) young list; nothing in
-    // gc_objects is death-checked, and Vm.deinit frees everything.
+    // gcMinorCollection sweeps only the (empty) young region; nothing in
+    // the chain is death-checked, and Vm.deinit frees everything.
     try vm2.gcMinorCollection();
-    try testing.expectEqual(len0, vm2.gc_objects.items.len);
+    try testing.expectEqual(len0, vm2.testGcChainLen());
 }
 
 test "P16.50: internStr OOM transactionality (short miss, long, dead-old re-intern)" {
@@ -55987,14 +55893,11 @@ test "P16.50: pushcclosure/registerfuncs OOM transactionality" {
     _ = scope.protectValueAssumeCapacity(.{ .String = key_gamma });
     try vm.gcEnterGenerational();
 
-    // Deterministic allocation maps for the failure loops below: reserve
-    // spare capacity in every structure gcPrepareRegister / pushcclosure
-    // / the stack appends touch, so the ONLY allocations during a probe
-    // are the object creations themselves (shared-cell array, cells,
-    // closures) — the failure index then maps 1:1 onto a construction
+    // Deterministic allocation maps for the failure loops below: the
+    // ONLY allocations during a probe are the object creations themselves
+    // (shared-cell array, cells, closures) — registration is infallible
+    // pointer surgery — so the failure index maps 1:1 onto a construction
     // step.
-    try vm.gc_objects.ensureUnusedCapacity(testing.allocator, 16);
-    try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 16);
     // Pre-reserve the main window so window pushes cannot allocate.
     try vm.cWindowEnsure(state.curThread(), 16);
 
@@ -56175,8 +56078,14 @@ test "P16.50: pushcclosure/registerfuncs OOM transactionality" {
         // the failing entry. Nothing else may leak into the registries.
         var residue: [16]GcObject = undefined;
         var residue_n: usize = 0;
-        for (vm.gc_objects.items[snap_full.gc_objects.len..]) |o| {
-            residue[residue_n] = o;
+        var skip = snap_full.chain.len;
+        var cur = vm.gc_allgc_head;
+        while (cur) |hdr| : (cur = hdr.next) {
+            if (skip > 0) {
+                skip -= 1;
+                continue;
+            }
+            residue[residue_n] = gcFromHeader(hdr);
             residue_n += 1;
         }
         var n_cell: usize = 0;
@@ -56301,8 +56210,14 @@ test "P16.50: pushcclosure/registerfuncs OOM transactionality" {
         // by assumption.
         var residue: [16]GcObject = undefined;
         var residue_n: usize = 0;
-        for (vm.gc_objects.items[snap.gc_objects.len..]) |o| {
-            residue[residue_n] = o;
+        var skip = snap.chain.len;
+        var cur = vm.gc_allgc_head;
+        while (cur) |hdr| : (cur = hdr.next) {
+            if (skip > 0) {
+                skip -= 1;
+                continue;
+            }
+            residue[residue_n] = gcFromHeader(hdr);
             residue_n += 1;
         }
         for (residue[0..residue_n]) |o| {
@@ -56343,15 +56258,11 @@ test "P16.50: pushcclosure/registerfuncs OOM transactionality" {
 //        allocation succeeded — see the rewritten T4 test at the file
 //        tail).
 
-/// p50IsRegistered WITHOUT dereferencing the object's gc_index: a plain
-/// payload scan of gc_objects. Safe for objects a collector cycle may have
-/// already freed (a freed object is simply not found); used by T3's
-/// post-collection assertions.
+/// Freed-object-safe membership probe: identity by header, no payload
+/// dereference, so an object a collector cycle may have already swept is
+/// simply not found; used by T3's post-collection assertions.
 fn p50StillRegistered(vm: *Vm, obj: GcObject) bool {
-    for (vm.gc_objects.items) |o| {
-        if (std.meta.eql(o, obj)) return true;
-    }
-    return false;
+    return p50IsRegistered(vm, obj);
 }
 
 test "P16.50-review T1: opClosure mixed-upvalue OOM matrix (production dispatch)" {
@@ -56368,10 +56279,10 @@ test "P16.50-review T1: opClosure mixed-upvalue OOM matrix (production dispatch)
     // only outlives the test's own vm.
     var setup_scope = try vm.openRootScope(18, 0);
 
-    // 16 fill tables: keep gc_objects non-empty so the opClosure rollback's
-    // gcUnregisterObjectRollback swapRemoves exercise the swap-with-last +
-    // gc_index fixup path (not just the trivial pop-last). Temp-rooted so
-    // gcEnterGenerational's full cycle sees them live.
+    // 16 fill tables: keep the allgc chain non-empty so the opClosure
+    // rollback's gcUnregisterObjectRollback exercises the mid-chain unlink
+    // (predecessor search plus boundary repair), not just the trivial tail
+    // pop. Temp-rooted so gcEnterGenerational's full cycle sees them live.
     var fill_tables: [16]*Table = undefined;
     for (&fill_tables) |*slot| {
         const t = try vm.allocTableNoGc();
@@ -56411,13 +56322,11 @@ test "P16.50-review T1: opClosure mixed-upvalue OOM matrix (production dispatch)
     const cell_x = try vm.alloc.create(Cell);
     cell_x.* = .{ .value = .{ .Int = 1 }, .stack_idx = 0, .stack_thread = th };
     th.boxed[0] = cell_x;
-    try vm.gcPrepareRegister(1);
     vm.gcRegisterCommit(.{ .cell = cell_x });
     vm.gcNoteAlloc(@sizeOf(Cell));
 
     const cell_c = try vm.alloc.create(Cell);
     cell_c.* = .{ .value = .{ .Int = 100 } }; // closed
-    try vm.gcPrepareRegister(1);
     vm.gcRegisterCommit(.{ .cell = cell_c });
     vm.gcNoteAlloc(@sizeOf(Cell));
 
@@ -56429,7 +56338,6 @@ test "P16.50-review T1: opClosure mixed-upvalue OOM matrix (production dispatch)
     const keeper_upvs = try vm.alloc.alloc(*Cell, 2);
     keeper_upvs[0] = cell_x;
     keeper_upvs[1] = cell_c;
-    try vm.gcPrepareRegister(1);
     const keeper = try vm.alloc.create(Closure);
     keeper.* = .{ .upvalues = keeper_upvs, .c_func = p50Cfunc };
     vm.gcRegisterCommit(.{ .closure = keeper });
@@ -56449,11 +56357,8 @@ test "P16.50-review T1: opClosure mixed-upvalue OOM matrix (production dispatch)
     // roots list must not keep pointing at the just-destroyed keeper.
     setup_scope.close();
 
-    // Prime both registries so gcPrepareRegister inside the probes is a
-    // capacity no-op (the failure index then maps 1:1 onto construction
-    // steps).
-    try vm.gc_objects.ensureUnusedCapacity(testing.allocator, 16);
-    try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 16);
+    // Registration is infallible (no registry capacity to prime), so
+    // the failure index maps 1:1 onto the construction steps.
 
     // Hand-built protos (real allocator, outside every failure loop —
     // refcounted tree nodes, never registry state):
@@ -56591,9 +56496,9 @@ test "P16.50-review T1: opClosure mixed-upvalue OOM matrix (production dispatch)
     // reserve BEFORE the store): #0 the cells array, #1 the Cell, #2 the
     // Closure, #3 gc_gray.ensureUnusedCapacity, #4 gc_old1
     // .ensureUnusedCapacity (both in gcPrepareWriteBarrierCell, BEFORE
-    // cell.set); success at 5. gc_gray/gc_old1 are deinit'd per iteration
-    // (a minor re-grows their capacity) so the reserves really allocate
-    // and the map stays deterministic. ----
+    // cell.set); success at 5. gc_gray is deinit'd per iteration (a minor
+    // re-grows its capacity) so the reserve really allocates and the map
+    // stays deterministic. ----
     th.boxed[5] = cell_c;
     fail_idx = 0;
     tested_failures = 0;
@@ -56605,10 +56510,7 @@ test "P16.50-review T1: opClosure mixed-upvalue OOM matrix (production dispatch)
         // allocate through the failing allocator).
         vm.gc_gray.deinit(testing.allocator);
         vm.gc_gray = .empty;
-        vm.gc_old1.deinit(testing.allocator);
-        vm.gc_old1 = .empty;
         try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
-        try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
 
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
             .fail_index = fail_idx,
@@ -56630,7 +56532,7 @@ test "P16.50-review T1: opClosure mixed-upvalue OOM matrix (production dispatch)
             try testing.expect(p50InYoung(&vm, .{ .closure = cl }));
             try testing.expectEqual(GcAge.old0, cl.gc.age); // the barrier promoted it
             try testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
-            try testing.expectEqual(@as(usize, 1), vm.gc_old1.items.len);
+            try testing.expectEqual(@as(usize, 1), vm.testGcCountAge(.old0));
             try testing.expect(cell_c.value == .Closure); // cell.set committed
             try testing.expectEqual(snap.obj_functions + 1, vm.testc_obj_functions);
             // Teardown: the closure first (frees the upvalue array), then
@@ -56639,7 +56541,6 @@ test "P16.50-review T1: opClosure mixed-upvalue OOM matrix (production dispatch)
             p50TeardownClosure(&vm, cl);
             cell_c.value = .{ .Int = 100 }; // undo the committed cell.set
             vm.gc_gray.clearRetainingCapacity(); // drop the freed closure
-            vm.gc_old1.clearRetainingCapacity();
             p50TeardownCell(&vm, cell_y);
             th.stack[5] = .{ .Int = 7 }; // un-publish the freed closure
             try snap.assertRestored(&vm);
@@ -56664,11 +56565,11 @@ test "P16.50-review T1: opClosure mixed-upvalue OOM matrix (production dispatch)
             // store and left a dangling closure value in cell_c.
             try testing.expect(std.meta.eql(cell_c.value, .{ .Int = 100 }));
             // Reserve-first also makes partial barrier states impossible:
-            // both list slots are reserved (or the error is thrown) before
-            // either append runs — a failure never leaves one list holding
-            // the would-be-promoted object.
+            // the gray slot is reserved (or the error is thrown) before the
+            // append runs — a failure never leaves the list holding the
+            // would-be-promoted object.
             try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
-            try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
+            try testing.expectEqual(@as(usize, 0), vm.testGcCountAge(.old0));
             // P16.50-review fix applied: the post-commit rollback now
             // destroys the Closure struct too (errdefer closure_committed
             // branch) — no compensation needed. P16.50-review-8 §1.2
@@ -56719,7 +56620,7 @@ const P50r8Pair = struct {
 
 /// Compile+run `local function mk(v) local x = v return function() return
 /// x end end return mk({}), mk({})`. results[0] is the DONOR (created
-/// FIRST — its cell precedes the owner's in gc_objects, which the
+/// FIRST — its cell precedes the owner's in the allgc chain, which the
 /// sweep-phase test relies on), results[1] the OWNER (join target). Each
 /// closure has ONE CLOSED cell capturing a distinct table. The chunk
 /// closure stays registered but unrooted — callers decide what survives
@@ -56862,29 +56763,24 @@ test "P16.50-review-8 1.1: join during incremental sweep makewhites the owner" {
     defer vm.deinit();
 
     // Hand-built scenario (T1 keeper pattern) with a controlled registry:
-    // the sweep frees dead objects with swapRemove, which REORDERS
-    // gc_objects — a compile+run fixture leaves an unreachable staging
-    // closure behind, and its death moves the owner closure before the
-    // donor cell (observed). Registering exactly [donor_val, donor_cell,
-    // owner_cell, owner, keeper] with nothing dead keeps the donor cell
-    // provably ahead of the owner. The propagate/atomic tests above cover
-    // the full production shape; this test stages the sweep arm.
+    // registering exactly [donor_val, donor_cell, owner_cell, owner,
+    // keeper] with nothing dead keeps the donor cell provably ahead of the
+    // owner in the chain — the sweep makewhites it first while the owner
+    // stays black. The propagate/atomic tests above cover the full
+    // production shape; this test stages the sweep arm.
     const donor_val = try vm.allocTableNoGc();
     const donor_cell = try vm.alloc.create(Cell);
     donor_cell.* = .{ .value = .{ .Table = donor_val } }; // closed
-    try vm.gcPrepareRegister(1);
     vm.gcRegisterCommit(.{ .cell = donor_cell });
     vm.gcNoteAlloc(@sizeOf(Cell));
 
     const owner_cell = try vm.alloc.create(Cell);
     owner_cell.* = .{ .value = .{ .Int = 1 } }; // closed
-    try vm.gcPrepareRegister(1);
     vm.gcRegisterCommit(.{ .cell = owner_cell });
     vm.gcNoteAlloc(@sizeOf(Cell));
 
     const owner_upvs = try vm.alloc.alloc(*Cell, 1);
     owner_upvs[0] = owner_cell;
-    try vm.gcPrepareRegister(1);
     const owner = try vm.alloc.create(Closure);
     owner.* = .{ .upvalues = owner_upvs, .c_func = p50Cfunc };
     vm.gcRegisterCommit(.{ .closure = owner });
@@ -56895,7 +56791,6 @@ test "P16.50-review-8 1.1: join during incremental sweep makewhites the owner" {
     const keeper_upvs = try vm.alloc.alloc(*Cell, 2);
     keeper_upvs[0] = donor_cell;
     keeper_upvs[1] = owner_cell;
-    try vm.gcPrepareRegister(1);
     const keeper = try vm.alloc.create(Closure);
     keeper.* = .{ .upvalues = keeper_upvs, .c_func = p50Cfunc };
     vm.gcRegisterCommit(.{ .closure = keeper });
@@ -56918,9 +56813,9 @@ test "P16.50-review-8 1.1: join during incremental sweep makewhites the owner" {
     try testing.expect(gcIsBlack(donor_cell.gc.marked));
     try testing.expect(gcIsBlack(owner.gc.marked));
 
-    // Step the sweep until it makewhites the donor cell. The owner closure
-    // sits LATER in gc_objects (registered after, nothing dead → no
-    // swapRemove reordering) and is still black.
+    // Step the sweep until it makewhites the donor cell. The sweep walks
+    // the chain in registration order, so the owner closure (registered
+    // after the donor cell, nothing dead in between) is still black.
     while ((donor_cell.gc.marked & WHITEBITS) != (vm.gc_current_white & WHITEBITS)) {
         const more = try vm.gcSweepOne();
         try testing.expect(more);
@@ -56981,13 +56876,10 @@ test "P16.50-review-8 1.2: generational join promotes the young Cell exactly onc
     @constCast(owner_pair.owner.upvalues)[0] = donor_pair.donor_cell;
     vm.gcCommitForwardBarrierCell(owner_pair.owner, donor_pair.donor_cell, plan);
 
-    // Promotion published exactly once: age G_OLD0, one gc_old1 entry for
-    // the cell, the cell black, its table queued gray exactly once.
+    // Promotion published exactly once: the age bit G_OLD0 (the whole
+    // publication — no list entry to duplicate), the cell black, its
+    // table queued gray exactly once.
     try testing.expect(donor_pair.donor_cell.gc.age == .old0);
-    try testing.expectEqual(
-        @as(usize, 1),
-        p50r8Count(vm.gc_old1.items, .{ .cell = donor_pair.donor_cell }),
-    );
     try testing.expect(gcIsBlack(donor_pair.donor_cell.gc.marked));
     try testing.expectEqual(
         @as(usize, 1),
@@ -57023,7 +56915,6 @@ test "P16.50-review-8 1.2: generational setupvalue promotes the young value exac
     try vm.gcStoreCellValue(owner_pair.owner_cell, .{ .Table = young });
 
     try testing.expect(young.gc.age == .old0);
-    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = young }));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = young }));
     try testing.expect(std.meta.eql(owner_pair.owner_cell.value, .{ .Table = young }));
 
@@ -57045,17 +56936,14 @@ test "P16.50-review-8 1.2: generational join reserve OOM leaves state byte-exact
     const donor_pair = try p50r8MkPair(&vm);
     _ = scope.protectValueAssumeCapacity(.{ .Closure = donor_pair.donor });
 
-    // Force both reserves to really allocate (T1 Segment B idiom).
+    // Force the reserve to really allocate (T1 Segment B idiom).
     vm.gc_gray.deinit(testing.allocator);
     vm.gc_gray = .empty;
-    vm.gc_old1.deinit(testing.allocator);
-    vm.gc_old1 = .empty;
 
-    // Edge 0 (gc_gray reserve — the cell's table value) and edge 1
-    // (gc_old1 reserve — the cell itself; the gray reserve succeeded with
-    // capacity only, still zero items). The re-point must NOT have
-    // happened and nothing may be promoted or published.
-    for ([_]usize{ 0, 1 }) |edge| {
+    // Edge 0 (the gc_gray reserve — the cell's table value; the OLD0
+    // promotion itself is an infallible age store). The re-point must NOT
+    // have happened and nothing may be promoted or published.
+    for ([_]usize{0}) |edge| {
         const cell_age = donor_pair.donor_cell.gc.age;
         const cell_mark = donor_pair.donor_cell.gc.marked;
         const uv0 = owner_pair.owner.upvalues[0];
@@ -57071,7 +56959,7 @@ test "P16.50-review-8 1.2: generational join reserve OOM leaves state byte-exact
         try testing.expect(donor_pair.donor_cell.gc.age == cell_age);
         try testing.expect(donor_pair.donor_cell.gc.marked == cell_mark);
         try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
-        try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
+        try testing.expectEqual(@as(usize, 0), vm.testGcCountAge(.old0));
         try testing.expect(owner_pair.owner.upvalues[0] == uv0);
     }
 
@@ -57092,7 +56980,7 @@ test "P16.50-review-8 1.2: generational join reserve OOM leaves state byte-exact
         vm.alloc = saved;
         try testing.expectEqual(Vm.CellJoinPlan{}, plan);
         try testing.expect(donor_pair.donor_cell.gc.age.isYoung());
-        try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
+        try testing.expectEqual(@as(usize, 0), vm.testGcCountAge(.old0));
     }
 
     // Reuse after OOM: the same join with the real allocator succeeds,
@@ -57103,10 +56991,6 @@ test "P16.50-review-8 1.2: generational join reserve OOM leaves state byte-exact
     @constCast(owner_pair.owner.upvalues)[0] = donor_pair.donor_cell;
     vm.gcCommitForwardBarrierCell(owner_pair.owner, donor_pair.donor_cell, plan);
     try testing.expect(donor_pair.donor_cell.gc.age == .old0);
-    try testing.expectEqual(
-        @as(usize, 1),
-        p50r8Count(vm.gc_old1.items, .{ .cell = donor_pair.donor_cell }),
-    );
     try vm.gcMinorCollection();
     try testing.expect(p50IsRegistered(&vm, .{ .cell = donor_pair.donor_cell }));
     try testing.expect(p50IsRegistered(&vm, .{ .table = donor_pair.donor_val }));
@@ -57127,12 +57011,11 @@ test "P16.50-review-8 1.2: generational setupvalue reserve OOM leaves state byte
 
     vm.gc_gray.deinit(testing.allocator);
     vm.gc_gray = .empty;
-    vm.gc_old1.deinit(testing.allocator);
-    vm.gc_old1 = .empty;
 
-    // Edge 0 (gc_gray reserve) and edge 1 (gc_old1 reserve): the store
-    // must NOT have happened — the cell still holds its original table.
-    for ([_]usize{ 0, 1 }) |edge| {
+    // Edge 0 (the gc_gray reserve; the OLD0 promotion is an infallible
+    // age store): the store must NOT have happened — the cell still holds
+    // its original table.
+    for ([_]usize{0}) |edge| {
         const young_age = young.gc.age;
         const young_mark = young.gc.marked;
         const cell_value = owner_pair.owner_cell.value;
@@ -57148,7 +57031,7 @@ test "P16.50-review-8 1.2: generational setupvalue reserve OOM leaves state byte
         try testing.expect(young.gc.age == young_age);
         try testing.expect(young.gc.marked == young_mark);
         try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
-        try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
+        try testing.expectEqual(@as(usize, 0), vm.testGcCountAge(.old0));
         try testing.expect(std.meta.eql(owner_pair.owner_cell.value, cell_value));
     }
 
@@ -57156,7 +57039,6 @@ test "P16.50-review-8 1.2: generational setupvalue reserve OOM leaves state byte
     // minor collection keeps the young table alive through the old cell.
     try vm.gcStoreCellValue(owner_pair.owner_cell, .{ .Table = young });
     try testing.expect(young.gc.age == .old0);
-    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = young }));
     try testing.expect(std.meta.eql(owner_pair.owner_cell.value, .{ .Table = young }));
     try vm.gcMinorCollection();
     try testing.expect(p50IsRegistered(&vm, .{ .table = young }));
@@ -57314,11 +57196,8 @@ test "P16.50-review T2: lua_newthread C-ABI OOM transaction" {
 
     try vm.gcEnterGenerational();
 
-    // Prime both registries: gcPrepareRegister inside luaNewThreadTx is
-    // then a capacity no-op and the failure index maps 1:1 onto the
-    // construction steps.
-    try vm.gc_objects.ensureUnusedCapacity(testing.allocator, 16);
-    try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 16);
+    // Registration is infallible (no registry capacity to prime), so
+    // the failure index maps 1:1 onto the construction steps.
 
     // ---- Part 1: per-step failure matrix. Allocation map (registries
     // primed; the window model): #0-#1 the parent window growth
@@ -57401,32 +57280,16 @@ test "P16.50-review T2: lua_newthread C-ABI OOM transaction" {
     // append growth (see the measured map above).
     try testing.expectEqual(@as(usize, 6), first_success_idx.?);
 
-    // ---- Part 2: registry-full probe. Fill gc_objects to zero spare so
-    // gcPrepareRegister's ensureUnusedCapacity is the FIRST allocation of
-    // the transaction — it must fail BEFORE the Thread exists, leaving
-    // every piece of state untouched (the pre-P16.50 shape failed later,
-    // mid-construction). ----
-    var fill_scope = try vm.openRootScope(vm.gc_objects.capacity - vm.gc_objects.items.len, 0);
-    defer fill_scope.close();
-    while (vm.gc_objects.capacity - vm.gc_objects.items.len >= 1) {
-        const t = try vm.allocTableNoGc();
-        _ = fill_scope.protectValueAssumeCapacity(.{ .Table = t });
-    }
-    // The fill tables registered YOUNG (post-gcEnterGenerational); promote
-    // them out of the young list so the post-probe gcMinorCollection never
-    // sweeps them (old objects are immune to minor sweeps). Temp roots
-    // keep them live through the promotion cycles.
-    var rounds: usize = 0;
-    while (vm.gc_young_objects.items.len != 0 and rounds < 8) : (rounds += 1) {
-        try vm.gcMinorCollection();
-    }
-    try testing.expectEqual(@as(usize, 0), vm.gc_young_objects.items.len);
-    try testing.expectEqual(vm.gc_objects.capacity, vm.gc_objects.items.len);
-
+    // ---- Part 2: first-allocation probe. The retired registry-capacity
+    // prepare used to be the transaction's first allocation; with
+    // registration being infallible pointer surgery, the Thread creation
+    // itself is now the first fallible step — it must fail BEFORE anything
+    // is published, leaving every piece of state untouched (the
+    // pre-P16.50 shape failed later, mid-construction). ----
     {
         // The window has spare capacity after Part 1's last growth, so
-        // cWindowEnsure is a no-op and gcPrepareRegister's
-        // ensureUnusedCapacity is the FIRST allocation of the transaction.
+        // cWindowEnsure is a no-op and the Thread create is the FIRST
+        // allocation of the transaction.
         const part2_window_count = Vm.cWindowCount(parent_th);
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
             .fail_index = 0,
@@ -57450,8 +57313,6 @@ test "P16.50-review T2: lua_newthread C-ABI OOM transaction" {
         try vm.gcMinorCollection();
         try snap.assertRestored(vm);
     }
-    // The fill tables stay registered (old) + root-scoped until
-    // fill_scope.close() / state.deinit — the established fill-table pattern.
 }
 
 test "P16.50-review T3: registerfuncs per-closure Cells + fresh-table publish rollback" {
@@ -57576,8 +57437,6 @@ test "P16.50-review T3: registerfuncs per-closure Cells + fresh-table publish ro
     // (registries + stack primed; keys pre-interned): per entry — the
     // upvalue array, the Cell, the Closure, the publish rehash; entry 0
     // owns #0-#3, entry 1 #4-#7; success at 8. ----
-    try vm.gc_objects.ensureUnusedCapacity(testing.allocator, 16);
-    try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 16);
     // Pre-reserve the main window so window pushes cannot allocate.
     try vm.cWindowEnsure(state.curThread(), 16);
 
@@ -57608,8 +57467,14 @@ test "P16.50-review T3: registerfuncs per-closure Cells + fresh-table publish ro
         // construction, including its publish, must be fully rolled back.
         var residue: [16]GcObject = undefined;
         var residue_n: usize = 0;
-        for (vm.gc_objects.items[snap_full.gc_objects.len..]) |o| {
-            residue[residue_n] = o;
+        var skip = snap_full.chain.len;
+        var cur = vm.gc_allgc_head;
+        while (cur) |hdr| : (cur = hdr.next) {
+            if (skip > 0) {
+                skip -= 1;
+                continue;
+            }
+            residue[residue_n] = gcFromHeader(hdr);
             residue_n += 1;
         }
         var n_cell: usize = 0;
@@ -57708,8 +57573,14 @@ test "P16.50-review T3: registerfuncs per-closure Cells + fresh-table publish ro
         // Tear down defensively by shape, not by assumption.
         var residue: [16]GcObject = undefined;
         var residue_n: usize = 0;
-        for (vm.gc_objects.items[snap.gc_objects.len..]) |o| {
-            residue[residue_n] = o;
+        var skip = snap.chain.len;
+        var cur = vm.gc_allgc_head;
+        while (cur) |hdr| : (cur = hdr.next) {
+            if (skip > 0) {
+                skip -= 1;
+                continue;
+            }
+            residue[residue_n] = gcFromHeader(hdr);
             residue_n += 1;
         }
         for (residue[0..residue_n]) |o| {
@@ -57744,8 +57615,6 @@ test "P16.50-review-5 T4: allocator-boundary check/charge split under native fai
 
     // Prime both registries: the failure paths' errdefers then exercise
     // the rollback without registry growth noise.
-    try vm.gc_objects.ensureUnusedCapacity(testing.allocator, 16);
-    try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 16);
 
     // The testc control (created once, real allocator — vm.deinit frees
     // it). testcEnsureControl INSTALLS the adapter: every vm.alloc call
@@ -57936,8 +57805,8 @@ test "P16.50-review-2 B1: opClosure heap worklist (nups=20) mixed OOM matrix" {
     // only outlives the test's own vm.
     var setup_scope = try vm.openRootScope(5, 0);
 
-    // Fill tables: keep gc_objects non-empty so the rollback's
-    // gcUnregisterObjectRollback swapRemoves exercise the swap-with-last path.
+    // Fill tables: keep the allgc chain non-empty so the rollback's
+    // gcUnregisterObjectRollback exercises the mid-chain unlink.
     var fill_tables: [4]*Table = undefined;
     for (&fill_tables) |*slot| {
         const t = try vm.allocTableNoGc();
@@ -57954,7 +57823,6 @@ test "P16.50-review-2 B1: opClosure heap worklist (nups=20) mixed OOM matrix" {
         const cell = try vm.alloc.create(Cell);
         cell.* = .{ .value = .{ .Int = @intCast(100 + i) }, .stack_idx = @intCast(i), .stack_thread = th };
         th.boxed[i] = cell;
-        try vm.gcPrepareRegister(1);
         vm.gcRegisterCommit(.{ .cell = cell });
         vm.gcNoteAlloc(@sizeOf(Cell));
         borrowed[i] = cell;
@@ -57965,7 +57833,6 @@ test "P16.50-review-2 B1: opClosure heap worklist (nups=20) mixed OOM matrix" {
     // torn down (the cells stay registered + old).
     const keeper_upvs = try vm.alloc.alloc(*Cell, 10);
     for (0..10) |i| keeper_upvs[i] = borrowed[i];
-    try vm.gcPrepareRegister(1);
     const keeper = try vm.alloc.create(Closure);
     keeper.* = .{ .upvalues = keeper_upvs, .c_func = p50Cfunc };
     vm.gcRegisterCommit(.{ .closure = keeper });
@@ -57980,8 +57847,6 @@ test "P16.50-review-2 B1: opClosure heap worklist (nups=20) mixed OOM matrix" {
     // Prime both registries so opClosure's gcPrepareRegister(21) is a
     // capacity no-op — the failure index then maps 1:1 onto the construction
     // steps.
-    try vm.gc_objects.ensureUnusedCapacity(testing.allocator, 32);
-    try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 32);
 
     // Hand-built protos (real allocator, outside every failure loop):
     //   child:  20 upvalues — even i: proxy(idx = i/2) → cur_upvalues[i/2]
@@ -58262,8 +58127,6 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
     try vm.tableSetValue(f_tbl, .{ .Int = 2 }, .{ .Int = 200 });
 
     try vm.gcEnterGenerational();
-    try vm.gc_objects.ensureUnusedCapacity(testing.allocator, 16);
-    try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 16);
 
     const ctrl = vm.testcEnsureControl();
     defer ctrl.alloc_count = -1;
@@ -58372,7 +58235,7 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
                 proto.tree.?.releaseTree(saved_alloc);
             }
 
-            const gc_len0 = vm.gc_objects.items.len;
+            const gc_len0 = vm.testGcChainLen();
             const count0 = vm.gc_count_kb;
             const funcs0 = vm.testc_obj_functions;
 
@@ -58394,7 +58257,7 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
                 vm.alloc = saved_alloc;
                 ua.free(cl.upvalues);
                 ua.destroy(cl);
-                try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
+                try testing.expectEqual(gc_len0, vm.testGcChainLen());
                 try testing.expectEqual(funcs0, vm.testc_obj_functions);
                 break;
             } else |err| {
@@ -58402,7 +58265,7 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
                 tested_failures += 1;
                 // The registry and gc_count_kb restorations are exact (the
                 // p44 guarantees).
-                try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
+                try testing.expectEqual(gc_len0, vm.testGcChainLen());
                 try testing.expectEqual(count0, vm.gc_count_kb);
                 try testing.expectEqual(funcs0, vm.testc_obj_functions);
             }
@@ -58434,7 +58297,7 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
                 proto.tree.?.releaseTree(saved_alloc);
             }
 
-            const gc_len0 = vm.gc_objects.items.len;
+            const gc_len0 = vm.testGcChainLen();
             const count0 = vm.gc_count_kb;
             const funcs0 = vm.testc_obj_functions;
 
@@ -58455,13 +58318,13 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
                 vm.alloc = saved_alloc;
                 ua.free(cl.upvalues);
                 ua.destroy(cl);
-                try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
+                try testing.expectEqual(gc_len0, vm.testGcChainLen());
                 try testing.expectEqual(funcs0, vm.testc_obj_functions);
                 break;
             } else |err| {
                 try testing.expectEqual(error.OutOfMemory, err);
                 tested_failures += 1;
-                try testing.expectEqual(gc_len0, vm.gc_objects.items.len);
+                try testing.expectEqual(gc_len0, vm.testGcChainLen());
                 try testing.expectEqual(count0, vm.gc_count_kb);
                 try testing.expectEqual(funcs0, vm.testc_obj_functions);
             }
@@ -58564,8 +58427,8 @@ test "P16.50-review-2 B4: testc total_bytes charge/credit parity per site" {
                 // snap.assertRestored (which pins gc_count_kb) assert the
                 // exact growth plus the untouched registries.
                 try testing.expectEqual(snap.gc_count_kb + @as(f64, @floatFromInt(delta)) / 1024.0, vm.gc_count_kb);
-                try testing.expectEqual(snap.gc_objects.len, vm.gc_objects.items.len);
-                try testing.expectEqual(snap.young.len, vm.gc_young_objects.items.len);
+                try testing.expectEqual(snap.chain.len, vm.testGcChainLen());
+                try testing.expectEqual(snap.young.len, vm.testGcYoungRegionLen());
                 try testing.expectEqual(snap.obj_tables, vm.testc_obj_tables);
                 try testing.expectEqual(snap.obj_functions, vm.testc_obj_functions);
                 try testing.expectEqual(snap.obj_strings, vm.testc_obj_strings);
@@ -59037,7 +58900,7 @@ fn p50r5SweepTracked(
             first_success = fail_idx;
             try testing.expectEqual(@as(usize, 1), result.len);
             vm.alloc.free(result);
-            p50r3TeardownResidue(vm, snap.gc_objects.len);
+            p50r3TeardownResidue(vm, snap.chain.len);
             vm.alloc = saved;
             try testing.expectEqual(@as(usize, 0), track.live.count());
             try testing.expectEqual(frames0, th.call_frames.len());
@@ -59053,7 +58916,7 @@ fn p50r5SweepTracked(
             const eter = vm.errThread();
             try testing.expect(eter.err_has_obj);
             try testing.expectEqual(vm.oom_msg_str.?, eter.err_obj.String);
-            p50r3TeardownResidue(vm, snap.gc_objects.len);
+            p50r3TeardownResidue(vm, snap.chain.len);
             vm.alloc = saved;
             try testing.expectEqual(@as(usize, 0), track.live.count());
             try snap.assertRestored(vm);
@@ -59082,7 +58945,7 @@ fn p50r3Falloc(ud: ?*anyopaque, ptr: ?*anyopaque, osize: usize, nsize: usize) ca
 const P50r3SweepResult = struct { first_success: usize, census: P50r3ResidueCensus };
 
 /// Residue census by GC type: everything registered ABOVE a snapshot's
-/// gc_objects prefix (the call window's registrations). `n_other` must be
+/// chain prefix (the call window's registrations). `n_other` must be
 /// zero in every R2 sweep — only closures, cells, interned strings, and
 /// (for setfuncs/newlib) the lib table are created there.
 const P50r3ResidueCensus = struct {
@@ -59095,26 +58958,34 @@ const P50r3ResidueCensus = struct {
 
 fn p50r3CensusResidue(vm: *Vm, above: usize) P50r3ResidueCensus {
     var c: P50r3ResidueCensus = .{};
-    for (vm.gc_objects.items[above..]) |o| switch (o) {
-        .closure => c.n_closure += 1,
-        .cell => c.n_cell += 1,
-        .string => c.n_string += 1,
-        .table => c.n_table += 1,
-        else => c.n_other += 1,
-    };
+    var skip = above;
+    var cur = vm.gc_allgc_head;
+    while (cur) |hdr| : (cur = hdr.next) {
+        if (skip > 0) {
+            skip -= 1;
+            continue;
+        }
+        switch (gcFromHeader(hdr)) {
+            .closure => c.n_closure += 1,
+            .cell => c.n_cell += 1,
+            .string => c.n_string += 1,
+            .table => c.n_table += 1,
+            else => c.n_other += 1,
+        }
+    }
     return c;
 }
 
 /// Tear down everything registered above the snapshot prefix (the whole
-/// tail region), tail-first: every removal is a TAIL swapRemove, so the
-/// prefix order — what assertRestored pins — is untouched. registerfuncs
-/// documents published-entries-survive-failure as by-design residue; the
-/// SUCCESS run's graph is torn down the same way so nothing stays young —
-/// later segments' gcMinorCollection calls must stay no-ops for the
-/// young-list pin to hold.
+/// tail region), tail-first: every removal unlinks the chain's tail, so
+/// the prefix order — what assertRestored pins — is untouched.
+/// registerfuncs documents published-entries-survive-failure as by-design
+/// residue; the SUCCESS run's graph is torn down the same way so nothing
+/// stays young — later segments' gcMinorCollection calls must stay no-ops
+/// for the young-list pin to hold.
 fn p50r3TeardownResidue(vm: *Vm, above: usize) void {
-    while (vm.gc_objects.items.len > above) {
-        const obj = vm.gc_objects.items[vm.gc_objects.items.len - 1];
+    while (vm.testGcChainLen() > above) {
+        const obj = gcFromHeader(vm.gc_allgc_tail.?);
         switch (obj) {
             .closure => p50TeardownClosure(vm, obj.closure),
             .cell => p50TeardownCell(vm, obj.cell),
@@ -59167,7 +59038,7 @@ fn p50r3Sweep(
         const r = vm.callCFunction(cf, .Nil, args);
         vm.alloc = saved;
 
-        const census = p50r3CensusResidue(vm, snap.gc_objects.len);
+        const census = p50r3CensusResidue(vm, snap.chain.len);
         try testing.expectEqual(@as(usize, 0), census.n_other);
 
         if (r) |result| {
@@ -59179,7 +59050,7 @@ fn p50r3Sweep(
             // stale error status (the B3 BLOCKER 1/4 contract on success).
             try testing.expectEqual(frames0, th.call_frames.len());
             try testing.expectEqual(@as(c_int, 0), th.api_status);
-            p50r3TeardownResidue(vm, snap.gc_objects.len);
+            p50r3TeardownResidue(vm, snap.chain.len);
             try snap.assertRestored(vm);
             break;
         } else |err| {
@@ -59202,7 +59073,7 @@ fn p50r3Sweep(
             // The by-design residue (registerfuncs: published entries
             // survive a failure) is torn down by registry diff; the state
             // is then byte-exact, before and after a minor collection.
-            p50r3TeardownResidue(vm, snap.gc_objects.len);
+            p50r3TeardownResidue(vm, snap.chain.len);
             try snap.assertRestored(vm);
             try testing.expect(gcCheckSecondaryRegistryInvariants(vm));
             try vm.gcMinorCollection();
@@ -59411,8 +59282,6 @@ test "P16.50-review-3 R2: exported throwing APIs under callCFunction OOM sweeps"
     // callCFunction invocation, so the per-API request maps are
     // deterministic and the first-success indices are pinnable.
     try vm.gcEnterGenerational();
-    try vm.gc_objects.ensureUnusedCapacity(testing.allocator, 32);
-    try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 32);
 
     // The setfuncs/newlib entry names are NOT pre-interned (unlike T3):
     // every iteration interns a UNIQUE pair, so the key intern itself is a
@@ -59546,7 +59415,9 @@ test "P16.50-review-3 R2: exported throwing APIs under callCFunction OOM sweeps"
                 // remaining reference is the GC registry — the window
                 // push was popped by the C-frame's structural unwind.
                 var th2_opt: ?*Thread = null;
-                for (vm.gc_objects.items) |o| {
+                var cur = vm.gc_allgc_head;
+                while (cur) |hdr| : (cur = hdr.next) {
+                    const o = gcFromHeader(hdr);
                     if (o == .thread and o.thread != vm.main_thread.?) th2_opt = o.thread;
                 }
                 if (th2_opt) |th2| {
@@ -59614,8 +59485,6 @@ test "P16.50-review-5 B2: C-ABI throw matrix" {
     // Prime both registries (T2 idiom) so gcPrepareRegister is a capacity
     // no-op and every failure index maps 1:1 onto a construction step.
     try vm.gcEnterGenerational();
-    try vm.gc_objects.ensureUnusedCapacity(testing.allocator, 32);
-    try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 32);
 
     // ---- lua_pushstring (fresh string): the swept failure points are the
     // non-preinterned string intern and the results dupe — first success
@@ -59661,14 +59530,21 @@ test "P16.50-review-5 B2: C-ABI throw matrix" {
             const r = vm.callCFunction(p50r5CfSetglobal, .Nil, &.{});
             vm.alloc = saved;
 
-            const census = p50r3CensusResidue(vm, snap.gc_objects.len);
+            const census = p50r3CensusResidue(vm, snap.chain.len);
             try testing.expectEqual(@as(usize, 0), census.n_other);
 
             // The callback's fresh name (formatted before the call, still
             // in the shared buffer): find its interned residue, and if the
             // global was published, remove the globals entry first.
             const name = std.mem.sliceTo(&p50r3_name_buf_a, 0);
-            for (vm.gc_objects.items[snap.gc_objects.len..]) |o| {
+            var skip = snap.chain.len;
+            var cur = vm.gc_allgc_head;
+            while (cur) |hdr| : (cur = hdr.next) {
+                if (skip > 0) {
+                    skip -= 1;
+                    continue;
+                }
+                const o = gcFromHeader(hdr);
                 if (o == .string and std.mem.eql(u8, o.string.bytes(), name)) {
                     if (ltable.nodeLookup(vm.global_env.hash, .{ .String = o.string })) |node| {
                         _ = ltable.nodeDelete(vm.global_env.hash, .{ .String = o.string });
@@ -59683,7 +59559,7 @@ test "P16.50-review-5 B2: C-ABI throw matrix" {
                 vm.alloc.free(result);
                 try testing.expectEqual(frames0, th.call_frames.len());
                 try testing.expectEqual(@as(c_int, 0), th.api_status);
-                p50r3TeardownResidue(vm, snap.gc_objects.len);
+                p50r3TeardownResidue(vm, snap.chain.len);
                 try snap.assertRestored(vm);
                 break;
             } else |err| {
@@ -59694,7 +59570,7 @@ test "P16.50-review-5 B2: C-ABI throw matrix" {
                 const eter = vm.errThread();
                 try testing.expect(eter.err_has_obj);
                 try testing.expectEqual(vm.oom_msg_str.?, eter.err_obj.String);
-                p50r3TeardownResidue(vm, snap.gc_objects.len);
+                p50r3TeardownResidue(vm, snap.chain.len);
                 try snap.assertRestored(vm);
                 try testing.expect(gcCheckSecondaryRegistryInvariants(vm));
                 try vm.gcMinorCollection();
@@ -59775,7 +59651,7 @@ test "P16.50-review-5 B2: C-ABI throw matrix" {
         defer vm.alloc.free(r);
         try testing.expectEqual(@as(usize, 1), r.len);
         try testing.expect(r[0] == .Closure);
-        p50r3TeardownResidue(vm, snap.gc_objects.len);
+        p50r3TeardownResidue(vm, snap.chain.len);
         try snap.assertRestored(vm);
     }
 
@@ -59801,7 +59677,7 @@ test "P16.50-review-5 B2: C-ABI throw matrix" {
             const eter = vm.errThread();
             try testing.expect(eter.err_has_obj);
             try testing.expectEqual(vm.oom_msg_str.?, eter.err_obj.String);
-            p50r3TeardownResidue(vm, snap.gc_objects.len);
+            p50r3TeardownResidue(vm, snap.chain.len);
             try snap.assertRestored(vm);
         }
     }
@@ -59933,8 +59809,6 @@ test "P16.50-review-3 R4: ledger audit under an ACTIVE testc control (no per-pro
     const vm = state.vm;
 
     try vm.gcEnterGenerational();
-    try vm.gc_objects.ensureUnusedCapacity(testing.allocator, 32);
-    try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 32);
 
     // P16.50-review-5: the adapter is installed by testcEnsureControl —
     // from here on EVERY vm.alloc call is charged/credited at the boundary.
@@ -60015,7 +59889,7 @@ test "P16.50-review-3 R4: ledger audit under an ACTIVE testc control (no per-pro
         // Short-miss OOM: nothing registered, no stale intern entry (the
         // retry succeeds). The failing allocator swap bypasses the adapter,
         // so this probe is about the intern table, not the ledger.
-        const reg_len0 = vm.gc_objects.items.len;
+        const reg_len0 = vm.testGcChainLen();
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
             .fail_index = 0,
             .resize_fail_index = 0,
@@ -60025,7 +59899,7 @@ test "P16.50-review-3 R4: ledger audit under an ACTIVE testc control (no per-pro
         const r = vm.internStr("p50r3_oom");
         vm.alloc = saved;
         try testing.expectEqual(error.OutOfMemory, r);
-        try testing.expectEqual(reg_len0, vm.gc_objects.items.len);
+        try testing.expectEqual(reg_len0, vm.testGcChainLen());
         const s_retry = try vm.internStr("p50r3_oom");
         p50TeardownString(vm, s_retry);
     }
@@ -60060,7 +59934,7 @@ test "P16.50-review-3 R4: ledger audit under an ACTIVE testc control (no per-pro
         // owns the external content, so it must give it back — falloc runs
         // EXACTLY once — and nothing is registered. (The failing allocator
         // swap bypasses the adapter; no ledger assertion.)
-        const reg_len0 = vm.gc_objects.items.len;
+        const reg_len0 = vm.testGcChainLen();
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
             .fail_index = 0,
             .resize_fail_index = 0,
@@ -60072,7 +59946,7 @@ test "P16.50-review-3 R4: ledger audit under an ACTIVE testc control (no per-pro
         vm.alloc = saved;
         try testing.expectEqual(error.OutOfMemory, r);
         try testing.expectEqual(calls1 + 1, p50r3_falloc_calls);
-        try testing.expectEqual(reg_len0, vm.gc_objects.items.len);
+        try testing.expectEqual(reg_len0, vm.testGcChainLen());
 
         // Header-alloc OOM WITHOUT falloc: no callback, same shape (the
         // caller keeps the content — nothing to hand back).
@@ -60084,7 +59958,7 @@ test "P16.50-review-3 R4: ledger audit under an ACTIVE testc control (no per-pro
         const r2 = vm.createExternalLuaString(content_ptr, ext_content.len, null, null);
         vm.alloc = saved;
         try testing.expectEqual(error.OutOfMemory, r2);
-        try testing.expectEqual(reg_len0, vm.gc_objects.items.len);
+        try testing.expectEqual(reg_len0, vm.testGcChainLen());
     }
 
     // ---- (4) Bytecode-closure constructors at nups=0/1/3/20: the charge
@@ -60486,7 +60360,7 @@ test "varargprep: named-vararg (...t) table slot-1 integrity + OOM transactional
         // Preclean: a full GC removes the previous iteration's garbage so
         // the baseline below is exactly the reachable set.
         _ = vm.gcControl(2, 0, 0);
-        const baseline = try testing.allocator.dupe(GcObject, vm.gc_objects.items);
+        const baseline = try vm.testGcChainDupe(testing.allocator);
         defer testing.allocator.free(baseline);
 
         try vm.builtinTestcAlloccount(&.{.{ .Int = cd }}, &outs);
@@ -60501,8 +60375,10 @@ test "varargprep: named-vararg (...t) table slot-1 integrity + OOM transactional
             // full GC must collect the abandoned table, returning the
             // registry EXACTLY to the reachable baseline.
             _ = vm.gcControl(2, 0, 0);
-            try testing.expectEqual(baseline.len, vm.gc_objects.items.len);
-            for (baseline, vm.gc_objects.items) |a, b| {
+            const now = try vm.testGcChainDupe(testing.allocator);
+            defer testing.allocator.free(now);
+            try testing.expectEqual(baseline.len, now.len);
+            for (baseline, now) |a, b| {
                 try testing.expect(std.meta.eql(a, b));
             }
         }
@@ -61261,11 +61137,7 @@ const a10c_s4_child_src =
     \\        return 0;
     \\    };
     \\    cell.* = .{ .value = .Nil };
-    \\    vm.gcRegisterCell(cell) catch {
-    \\        vm.alloc.destroy(cell);
-    \\        scope.close();
-    \\        return 0;
-    \\    };
+    \\    vm.gcRegisterCell(cell);
     \\    _ = scope.protectValueAssumeCapacity(.{ .Table = t });
     \\    _ = scope.protectCellAssumeCapacity(cell);
     \\    _ = lua.c_api.lua_pushinteger(L, 7);
@@ -61284,11 +61156,7 @@ const a10c_s4_child_src =
     \\        return 0;
     \\    };
     \\    cell.* = .{ .value = .Nil };
-    \\    vm.gcRegisterCell(cell) catch {
-    \\        vm.alloc.destroy(cell);
-    \\        scope.close();
-    \\        return 0;
-    \\    };
+    \\    vm.gcRegisterCell(cell);
     \\    _ = scope.protectValueAssumeCapacity(.{ .Table = t });
     \\    _ = scope.protectCellAssumeCapacity(cell);
     \\    scope.close(); // well-behaved: the checkpoint must pass
@@ -61497,11 +61365,9 @@ test "P16.50-review-6 B2: newmetatable shared path + per-edge OOM ownership" {
     }
 
     try vm.gcEnterGenerational();
-    try vm.gc_objects.ensureUnusedCapacity(testing.allocator, 32);
-    try vm.gc_young_objects.ensureUnusedCapacity(testing.allocator, 32);
 
     // Edge coverage is classified by OBSERVED state (registry entry, stack
-    // shape, __name presence, gc_objects membership), never by fail index —
+    // shape, __name presence, chain membership), never by fail index —
     // automatic GC steps inside the constructors may shift allocation
     // indices, the observable edge shapes cannot.
     var saw_pretable_oom = false; // intern/constructor: nothing committed
@@ -61521,7 +61387,7 @@ test "P16.50-review-6 B2: newmetatable shared path + per-edge OOM ownership" {
     var fail_idx: usize = 0;
     while (fail_idx < names.len) : (fail_idx += 1) {
         const name = names[fail_idx];
-        const before = try testing.allocator.dupe(GcObject, vm.gc_objects.items);
+        const before = try vm.testGcChainDupe(testing.allocator);
         defer testing.allocator.free(before);
 
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
@@ -61568,7 +61434,9 @@ test "P16.50-review-6 B2: newmetatable shared path + per-edge OOM ownership" {
             try testing.expect(vm.apiRawGet(reg, .{ .String = key }) == .Nil);
             // Was a fresh table committed to the GC registry this iteration?
             var table_created = false;
-            for (vm.gc_objects.items) |obj| {
+            var cur = vm.gc_allgc_head;
+            while (cur) |hdr| : (cur = hdr.next) {
+                const obj = gcFromHeader(hdr);
                 if (obj != .table) continue;
                 var known = false;
                 for (before) |b| {
@@ -61596,7 +61464,9 @@ test "P16.50-review-6 B2: newmetatable shared path + per-edge OOM ownership" {
                 // the publish never happened → no dangling entry).
                 saw_root_oom = true;
                 try vm.gcFullCollectionForUser();
-                for (vm.gc_objects.items) |obj| {
+                var it = vm.gc_allgc_head;
+                while (it) |hdr| : (it = hdr.next) {
+                    const obj = gcFromHeader(hdr);
                     var known = false;
                     for (before) |b| {
                         if (std.meta.eql(obj, b)) {
@@ -61679,7 +61549,7 @@ test "P16.50-review-6 B2: newmetatable shared path + per-edge OOM ownership" {
         // capacity from the warm call above), Table constructor = alloc
         // #0, root_stack.append = alloc #1 (stack at exact capacity —
         // the growth MUST allocate).
-        const before_root = try testing.allocator.dupe(GcObject, vm.gc_objects.items);
+        const before_root = try vm.testGcChainDupe(testing.allocator);
         defer testing.allocator.free(before_root);
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
             .fail_index = 1,
@@ -61697,7 +61567,9 @@ test "P16.50-review-6 B2: newmetatable shared path + per-edge OOM ownership" {
         // GC frees the unpublished table and leaves every pre-window
         // object alive.
         try vm.gcFullCollectionForUser();
-        for (vm.gc_objects.items) |obj| {
+        var cur = vm.gc_allgc_head;
+        while (cur) |hdr| : (cur = hdr.next) {
+            const obj = gcFromHeader(hdr);
             var known = false;
             for (before_root) |b| {
                 if (std.meta.eql(obj, b)) {
@@ -61881,7 +61753,7 @@ test "P16.50-review-7 B2: newmetatable roots-reserve OOM owns nothing (pre-table
     _ = scope.protectValueAssumeCapacity(.{ .String = key });
     vm.gc_root_values.shrinkAndFree(vm.infraAlloc(), vm.gc_root_values.items.len);
     vm.gc_root_cells.shrinkAndFree(vm.infraAlloc(), vm.gc_root_cells.items.len);
-    const gc_objects_before = vm.gc_objects.items.len;
+    const chain_before = vm.testGcChainLen();
     const base_stack_len = Vm.cWindowCount(state.curThread());
     const depth_before = vm.gc_root_depth;
 
@@ -61896,7 +61768,7 @@ test "P16.50-review-7 B2: newmetatable roots-reserve OOM owns nothing (pre-table
     try testing.expectError(error.OutOfMemory, result);
     try testing.expect(vm.apiRawGet(reg, .{ .String = key }) == .Nil);
     try testing.expectEqual(base_stack_len, Vm.cWindowCount(state.curThread()));
-    try testing.expectEqual(gc_objects_before, vm.gc_objects.items.len);
+    try testing.expectEqual(chain_before, vm.testGcChainLen());
     // Open-failure discipline: the failed reserve left the setup-owned
     // root list byte-exact (length, depth, token untouched — the depth
     // still counts only this test's own setup scope).
@@ -62157,7 +62029,7 @@ fn a10MakeCell(vm: *Vm) std.mem.Allocator.Error!*Cell {
     const cell = try vm.alloc.create(Cell);
     errdefer vm.alloc.destroy(cell);
     cell.* = .{ .value = .Nil, .stack_idx = Cell.stack_closed, .stack_thread = null };
-    try vm.gcRegisterCell(cell);
+    vm.gcRegisterCell(cell);
     return cell;
 }
 
@@ -62349,9 +62221,9 @@ test "A1.0 boundary 5: runtime-error jump drops the abandoned scope and keeps th
     // A REAL full GC works after the landing — the abandoned, now
     // unrooted callback objects (table + cell) are collectable, so the
     // registry actually shrinks (no permanent-root leak).
-    const gc0 = vm.gc_objects.items.len;
+    const gc0 = vm.testGcChainLen();
     try vm.gcFullCollectionForUser();
-    try testing.expect(vm.gc_objects.items.len < gc0);
+    try testing.expect(vm.testGcChainLen() < gc0);
 
     // A repeat API call through the same boundary works.
     const r2 = try vm.callCFunction(a10CleanCf, .Nil, &.{});
@@ -63046,11 +62918,11 @@ test "P16.50-review-7 B3.1: protected-call pre-publish OOM edges roll back exact
     const parent_cl = try track_alloc.create(Closure);
     parent_cl.* = .{ .proto = parent_proto, .upvalues = &.{} };
     _ = vm.retainTreeForClosure(parent_proto);
-    try vm.gcRegisterClosure(parent_cl);
+    vm.gcRegisterClosure(parent_cl);
     const target_cl = try track_alloc.create(Closure);
     target_cl.* = .{ .proto = target_proto, .upvalues = &.{} };
     _ = vm.retainTreeForClosure(target_proto);
-    try vm.gcRegisterClosure(target_cl);
+    vm.gcRegisterClosure(target_cl);
     try vm.resolveProtoConstants(parent_proto);
     try vm.resolveProtoConstants(target_proto);
 
@@ -63232,11 +63104,11 @@ test "P16.50-review-7 B3.2: debug-hook pre-publish OOM edges roll back exactly" 
     const parent_cl = try track_alloc.create(Closure);
     parent_cl.* = .{ .proto = parent_proto, .upvalues = &.{} };
     _ = vm.retainTreeForClosure(parent_proto);
-    try vm.gcRegisterClosure(parent_cl);
+    vm.gcRegisterClosure(parent_cl);
     const hook_cl = try track_alloc.create(Closure);
     hook_cl.* = .{ .proto = hook_proto, .upvalues = &.{} };
     _ = vm.retainTreeForClosure(hook_proto);
-    try vm.gcRegisterClosure(hook_cl);
+    vm.gcRegisterClosure(hook_cl);
     try vm.resolveProtoConstants(parent_proto);
     try vm.resolveProtoConstants(hook_proto);
 
@@ -63470,7 +63342,7 @@ test "P16.50-review-7 B3.4a: beginBytecodeClose pre-publish OOM edges roll back 
     const parent_cl = try track_alloc.create(Closure);
     parent_cl.* = .{ .proto = parent_proto, .upvalues = &.{} };
     _ = vm.retainTreeForClosure(parent_proto);
-    try vm.gcRegisterClosure(parent_cl);
+    vm.gcRegisterClosure(parent_cl);
     try vm.resolveProtoConstants(parent_proto);
 
     const th = vm.activeBytecodeThread();
@@ -64336,7 +64208,7 @@ test "P16.50-review-8 §3.2: exec-frame completion OOM edges — countdown sweep
 // gc_gray/gc_old1 capacity sets the matching overflow flag (and, for the
 // gray side, the per-object MISSEDGRAYBIT marker) instead of appending;
 // the GC's overflow drain (gcRequeueOverflowGray by MISSEDGRAYBIT marker,
-// gcDrainOverflowOld1 by AGE over gc_objects) completes the work when
+// gcDrainOverflowOld1 by AGE over the allgc chain) completes the work when
 // the normal worklist is exhausted. A close that has begun ALWAYS
 // completes — never a parked frame suffix, never a black cell owning a
 // white value the next sweep would free while still reachable.
@@ -64374,7 +64246,6 @@ fn p50r9MkOpenCell(vm: *Vm, th: *Thread, slot: usize) !*Cell {
         .stack_idx = @intCast(slot),
         .stack_thread = th,
     };
-    try vm.gcPrepareRegister(1);
     vm.gcRegisterCommit(.{ .cell = cell });
     vm.gcNoteAlloc(@sizeOf(Cell));
     th.boxed[slot] = cell;
@@ -64543,17 +64414,16 @@ test "P16.50-review-10 2: gen-minor sticky close — old gray cell overflows gra
 
     th.stack[slot] = .{ .Table = child };
 
-    // Force both reserves to allocate: retained list capacity would
+    // Force the reserve to allocate: retained list capacity would
     // otherwise satisfy ensureUnusedCapacity without an allocation.
     vm.gc_gray.deinit(testing.allocator);
     vm.gc_gray = .empty;
-    vm.gc_old1.deinit(testing.allocator);
-    vm.gc_old1 = .empty;
 
     // P16.50-review-10 BLOCKER 1: sticky reject-everything allocator —
-    // BOTH reserves are rejected. The close completes anyway: the child
-    // is painted gray + aged G_OLD0 (canonical), with both overflow flags
-    // carrying the list publication.
+    // the reserve is rejected. The close completes anyway: the child is
+    // painted gray + aged G_OLD0 (both canonical; the gray queue entry
+    // is carried by the MISSEDGRAYBIT overflow flag, the OLD0 by the age
+    // bit itself).
     {
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
             .fail_index = 0,
@@ -64568,38 +64438,32 @@ test "P16.50-review-10 2: gen-minor sticky close — old gray cell overflows gra
         try testing.expect(th.boxed[slot] == null);
         try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
         try testing.expect(gcIsBlack(cell.gc.marked));
-        // Canonical state: gray by color, OLD0 by age, flags set, lists
-        // untouched.
+        // Canonical state: gray by color, OLD0 by age, the gray-overflow
+        // flag set, the list itself untouched.
         try testing.expect(gcIsGray(child.gc.marked));
         try testing.expect(child.gc.age == .old0);
         try testing.expect(vm.gc_gray_overflow);
-        try testing.expect(vm.gc_old1_overflow);
         try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
-        try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
         try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
     }
 
-    // A real minor cycle with a healthy allocator: the entry OLD0 drain
-    // links the child into gc_old1 BEFORE the snapshot (exactly-once
-    // publication — the membership check skips nothing here), the gray
-    // overflow drain re-queues and propagates it, and sweepgen advances
-    // OLD0→OLD1 over the linked entry.
+    // A real minor cycle with a healthy allocator: the gray overflow drain
+    // re-queues and propagates the child, and the young sweep advances
+    // OLD0→OLD1 (the positional cohort — exactly-once publication by
+    // construction).
     try vm.gcMinorCollection();
     try testing.expect(!vm.gc_gray_overflow);
-    try testing.expect(!vm.gc_old1_overflow);
     try testing.expect(p50IsRegistered(&vm, .{ .table = child }));
     try testing.expect(std.meta.eql(cell.value, .{ .Table = child }));
-    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child }));
     try testing.expect(child.gc.age == .old1);
     try testing.expect(gcIsBlack(child.gc.marked));
     try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
 
     // A second minor cycle: markold advances OLD1→OLD and re-traverses;
-    // the child leaves gc_old1 (the list holds only G_OLD1 objects — the
-    // normal PUC lifecycle) and stays alive with intact registry links.
+    // the child leaves the OLD1 cohort (only G_OLD1 objects are cohort
+    // members — the normal PUC lifecycle) and stays alive in the chain.
     try vm.gcMinorCollection();
     try testing.expect(p50IsRegistered(&vm, .{ .table = child }));
-    try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_old1.items, .{ .table = child }));
     try testing.expect(child.gc.age == .old);
     try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
 }
@@ -64640,7 +64504,6 @@ test "P16.50-review-9 2: gen-minor close — young gray cell marks the value wit
     try testing.expect(th.boxed[slot] == null);
     try testing.expect(gcIsBlack(cell.gc.marked));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = child }));
-    try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_old1.items, .{ .table = child }));
     try testing.expect(child.gc.age == .new);
 
     // The marked child survives a real minor collection.
@@ -64883,7 +64746,6 @@ test "P16.50-review-10 3: sticky failure at the tailcall seam closes immediately
     // closure so the drain's release is balanced against the caller tree's
     // child ref.
     _ = vm.retainTreeForClosure(callee_proto);
-    try vm.gcPrepareRegister(1);
     vm.gcRegisterCommit(.{ .closure = callee_cl });
     vm.gcNoteAlloc(@sizeOf(Closure));
 
@@ -65076,7 +64938,7 @@ test "P16.50-review-9 4: thread-sweep close is allocation-free and seals the sta
     vm.gc_state = .sweep;
     var counting = P50r9CountingAlloc{ .base = testing.allocator };
     vm.alloc = counting.allocator();
-    vm.gcUnregisterObjectSweep(.{ .thread = th2 }, th2.gc.index);
+    vm.gcUnregisterObjectRollback(.{ .thread = th2 });
     vm.gcFreeObject(.{ .thread = th2 }, .sweep);
     vm.alloc = testing.allocator;
     vm.gc_state = .pause;
@@ -65110,7 +64972,6 @@ test "P16.50-review-9 4: teardown close runs no barrier over a dangling value" {
     const child = try vm.allocTableNoGc();
     const th2 = try vm.alloc.create(Thread);
     th2.* = .{ .status = .suspended, .callee = .Nil };
-    try vm.gcPrepareRegister(1);
     vm.gcRegisterCommit(.{ .thread = th2 });
     vm.gcNoteAlloc(@sizeOf(Thread));
 
@@ -65129,7 +64990,6 @@ test "P16.50-review-9 4: teardown close runs no barrier over a dangling value" {
         .stack_idx = 0,
         .stack_thread = th2,
     };
-    try vm.gcPrepareRegister(1);
     vm.gcRegisterCommit(.{ .cell = cell });
     vm.gcNoteAlloc(@sizeOf(Cell));
     th2.boxed[0] = cell;
@@ -65500,23 +65360,21 @@ test "P16.50-review-11 3: gen-minor close over BLACK children of every old age i
     try testing.expect(gcIsBlack(child_old.gc.marked));
 
     // .old1 child: two real minor cycles take it new→survival→old1
-    // (listed in gc_old1, BLACK — the production OLD1 shape).
+    // (the positional OLD1 cohort, BLACK — the production shape).
     const child_old1 = try vm.allocTableNoGc();
     _ = scope.protectValueAssumeCapacity(.{ .Table = child_old1 });
     try vm.gcMinorCollection();
     try vm.gcMinorCollection();
     try testing.expect(child_old1.gc.age == .old1);
     try testing.expect(gcIsBlack(child_old1.gc.marked));
-    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child_old1 }));
 
     // .old0 child: hand-construct the production OLD0 shape (BLACK +
-    // .old0 + listed) — the transient state of a forward-barrier-promoted
-    // object inside a minor cycle, after its gray drain, before sweepgen.
+    // .old0 — the age alone is the publication) — the transient state of
+    // a forward-barrier-promoted object inside a minor cycle, after its
+    // gray drain, before sweepgen.
     const child_old0 = try vm.allocTableNoGc();
     child_old0.gc.age = .old0;
     gcSetBlack(&child_old0.gc.marked);
-    try vm.gc_old1.append(testing.allocator, .{ .table = child_old0 });
-    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child_old0 }));
 
     // White young control: its only protection is the close barrier.
     const child_white = try vm.allocTableNoGc();
@@ -65527,7 +65385,7 @@ test "P16.50-review-11 3: gen-minor close over BLACK children of every old age i
         th.stack[base_slot + i] = .{ .Table = childrenByAge(i, child_old, child_old1, child_old0, child_white) };
     }
     const added_old_before = vm.gc_gen_added_old_kb;
-    try testing.expect(!vm.gc_gray_overflow and !vm.gc_old1_overflow);
+    try testing.expect(!vm.gc_gray_overflow);
 
     // Healthy close over the whole window: three empty plans (BLACK
     // children of every old age) + one gen_mark+gen_promote (white).
@@ -65536,50 +65394,43 @@ test "P16.50-review-11 3: gen-minor close over BLACK children of every old age i
         try testing.expectEqual(Cell.stack_closed, cells[i].stack_idx);
         try testing.expect(gcIsBlack(cells[i].gc.marked));
     }
-    // BLOCKER 1: every BLACK child keeps its exact age, color, and
-    // exactly-once listing; no flags, no markers, no added-old charge.
+    // BLOCKER 1: every BLACK child keeps its exact age and color; no
+    // flags, no markers, no added-old charge.
     try testing.expect(child_old.gc.age == .old);
     try testing.expect(gcIsBlack(child_old.gc.marked));
-    try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_old1.items, .{ .table = child_old }));
     try testing.expect(child_old1.gc.age == .old1);
     try testing.expect(gcIsBlack(child_old1.gc.marked));
-    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child_old1 }));
     try testing.expect(child_old0.gc.age == .old0);
     try testing.expect(gcIsBlack(child_old0.gc.marked));
-    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child_old0 }));
-    try testing.expect(!vm.gc_gray_overflow and !vm.gc_old1_overflow);
+    try testing.expect(!vm.gc_gray_overflow);
     try testing.expect((child_old.gc.marked & MISSEDGRAYBIT) == 0);
     try testing.expect((child_old1.gc.marked & MISSEDGRAYBIT) == 0);
     try testing.expect((child_old0.gc.marked & MISSEDGRAYBIT) == 0);
     try testing.expectEqual(added_old_before, vm.gc_gen_added_old_kb);
-    // White control: exactly one mark + OLD0 publication (both lists).
+    // White control: exactly one mark + the OLD0 age publication.
     try testing.expect(gcIsGray(child_white.gc.marked));
     try testing.expect(child_white.gc.age == .old0);
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = child_white }));
-    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child_white }));
     try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
 
-    // A real minor cycle: markold advances the OLD1 child to .old (out of
-    // the list), sweepgen advances both OLD0 children to .old1 — each
-    // charged exactly once at the old0→old1 transition, each listed
-    // exactly once (the promote arm does not re-append linked objects).
+    // A real minor cycle: markold advances the OLD1 child to .old, the
+    // young sweep advances both OLD0 children to .old1 — each charged
+    // exactly once at the old0→old1 transition (the cohort membership is
+    // the age bit; there is no list entry to duplicate).
     try vm.gcMinorCollection();
     try testing.expect(child_old.gc.age == .old);
     try testing.expect(gcIsBlack(child_old.gc.marked));
-    try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_old1.items, .{ .table = child_old }));
     try testing.expect(child_old1.gc.age == .old);
-    try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_old1.items, .{ .table = child_old1 }));
     try testing.expect(child_old0.gc.age == .old1);
     try testing.expect(gcIsBlack(child_old0.gc.marked));
-    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child_old0 }));
     try testing.expect(child_white.gc.age == .old1);
     try testing.expect(gcIsBlack(child_white.gc.marked));
-    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = child_white }));
+    try testing.expectEqual(@as(usize, 2), vm.testGcCountAge(.old1));
     const added_old_delta = vm.gc_gen_added_old_kb - added_old_before;
     const expect_delta = (@as(f64, @floatFromInt(gcObjectBytes(.{ .table = child_old0 }))) +
         @as(f64, @floatFromInt(gcObjectBytes(.{ .table = child_white })))) / 1024.0;
     try testing.expectApproxEqAbs(expect_delta, added_old_delta, 1e-9);
-    try testing.expect(!vm.gc_gray_overflow and !vm.gc_old1_overflow);
+    try testing.expect(!vm.gc_gray_overflow);
     for ([_]*Table{ child_old, child_old1, child_old0, child_white }) |c| {
         try testing.expect(p50IsRegistered(&vm, .{ .table = c }));
     }
@@ -65610,7 +65461,12 @@ test "P16.50-review-11 4: overflow requeue selects the missed marker, not grayag
     while (try vm.gcPropagateOne()) {}
     try testing.expect(gcIsBlack(ga.gc.marked));
     const ga_young = try vm.allocTableNoGc();
-    try vm.gcWriteBarrierTable(ga, .{ .Table = ga_young });
+    // The store is REAL: the value must live in the table for the atomic
+    // grayagain re-traversal to mark it. (A barrier without the store
+    // kept the allocation alive only under the retired snapshot tail; the
+    // chain sweep death-checks unreferenced mid-mark allocations like PUC
+    // sweeplist.)
+    try vm.rawSet(ga, .{ .String = try vm.internStr("r11_4_ga_val") }, .{ .Table = ga_young });
     try testing.expect(gcIsGray(ga.gc.marked));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .table = ga }));
     try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_gray.items, .{ .table = ga }));
@@ -65732,8 +65588,9 @@ test "P16.50-review-11 5: partial overflow requeue keeps only unprocessed marker
     }
     try testing.expect(!vm.gc_gray_overflow);
     try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
-    for (vm.gc_objects.items) |obj| {
-        try testing.expect((gcPtr(obj).marked.* & MISSEDGRAYBIT) == 0);
+    var cur = vm.gc_allgc_head;
+    while (cur) |hdr| : (cur = hdr.next) {
+        try testing.expect((gcPtr(gcFromHeader(hdr)).marked.* & MISSEDGRAYBIT) == 0);
     }
     for (0..n) |i| {
         try testing.expect(p50IsRegistered(&vm, .{ .table = children[i] }));
@@ -65774,8 +65631,10 @@ fn childrenByAge(
 /// owner is left .old GRAY with no gc_gray membership, and the next minor
 /// cycle sweeps its young children.
 fn p50r12OldMarkOld1(vm: *Vm) std.mem.Allocator.Error!void {
-    const snapshot = @min(vm.gc_old1_snapshot_len, vm.gc_old1.items.len);
-    for (vm.gc_old1.items[0..snapshot]) |obj| {
+    var cur = vm.gc_gen_old1_scan;
+    const stop = vm.gc_gen_firstold1;
+    while (cur) |hdr| : (cur = if (hdr == stop) null else hdr.next) {
+        const obj = gcFromHeader(hdr);
         const p = gcPtr(obj);
         if (p.age.* != .old1) continue;
         p.age.* = .old;
@@ -65825,7 +65684,6 @@ test "P16.50-review-12 1: gcMarkOld1 reserve OOM is byte-exact; success re-trave
         try vm.gcMinorCollection();
         try testing.expect(owner.gc.age == .old1);
         try testing.expect(gcIsBlack(owner.gc.marked));
-        try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = owner }));
         try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_grayagain.items, .{ .table = owner }));
     }
 
@@ -65836,7 +65694,6 @@ test "P16.50-review-12 1: gcMarkOld1 reserve OOM is byte-exact; success re-trave
     try vm.tableResizeArray(owner, 1);
     owner.array[0] = .{ .Table = child };
 
-    vm.gc_old1_snapshot_len = vm.gc_old1.items.len;
     vm.gc_gray.deinit(testing.allocator);
     vm.gc_gray = .empty;
     const marked_kb = vm.gc_gen_marked_kb;
@@ -65861,8 +65718,7 @@ test "P16.50-review-12 1: gcMarkOld1 reserve OOM is byte-exact; success re-trave
     try testing.expect(gcIsBlack(owner.gc.marked));
     try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
     try testing.expectEqual(@as(usize, 0), p50r8Count(vm.gc_grayagain.items, .{ .table = owner }));
-    try testing.expectEqual(@as(usize, 1), vm.gc_old1.items.len);
-    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = owner }));
+    try testing.expectEqual(@as(usize, 1), vm.testGcCountAge(.old1));
     try testing.expect(child.gc.age == .new);
     try testing.expect(gcIsWhite(child.gc.marked));
     try testing.expect(p50IsRegistered(&vm, .{ .table = child }));
@@ -65911,7 +65767,6 @@ test "P16.50-review-12 2: negative-before — the old markold order loses the re
     try vm.tableResizeArray(owner, 1);
     owner.array[0] = .{ .Table = child };
 
-    vm.gc_old1_snapshot_len = vm.gc_old1.items.len;
     vm.gc_gray.deinit(testing.allocator);
     vm.gc_gray = .empty;
 
@@ -65938,11 +65793,7 @@ test "P16.50-review-12 2: negative-before — the old markold order loses the re
     // owner (not in gc_gray, not in grayagain, not a root), so the child
     // reachable ONLY through owner.array[0] is never marked — swept.
     try vm.gcMinorCollection();
-    var child_registered = false;
-    for (vm.gc_objects.items) |o| {
-        if (std.meta.eql(o, .{ .table = child })) child_registered = true;
-    }
-    try testing.expect(!child_registered);
+    try testing.expect(!p50IsRegistered(&vm, .{ .table = child }));
     try testing.expect(p50IsRegistered(&vm, .{ .table = owner }));
     // Teardown hygiene: the slot references the freed child (the UAF the
     // transactional markold prevents); drop it before deinit.
@@ -66059,21 +65910,17 @@ test "P16.50-review-12 4: gcStoreMetatable fail indices publish nothing; success
     _ = scope.protectValueAssumeCapacity(.{ .Table = owner });
     try vm.gcEnterGenerational();
 
-    // Gen arm: fwd (black owner, white metatable) needs gc_gray + gc_old1
-    // — two reserves in order before the single pointer store (HIGH 1
-    // removed the PUC-unintended grayagain re-queue: PUC lua_setmetatable
-    // runs only the forward luaC_objbarrier). Each edge pre-satisfies the
-    // earlier reserves so the failing one is exactly the edge's index;
-    // fail_index = 0 rejects every allocation, so the first reserve that
-    // must grow is the abort point.
-    for (0..2) |edge| {
+    // Gen arm: fwd (black owner, white metatable) needs one gc_gray
+    // reserve before the single pointer store (HIGH 1 removed the
+    // PUC-unintended grayagain re-queue: PUC lua_setmetatable runs only
+    // the forward luaC_objbarrier; the OLD0 promotion is an infallible
+    // age store). fail_index = 0 rejects every allocation, so the first
+    // reserve that must grow is the abort point.
+    for (0..1) |_| {
         vm.gc_gray.deinit(testing.allocator);
         vm.gc_gray = .empty;
-        vm.gc_old1.deinit(testing.allocator);
-        vm.gc_old1 = .empty;
         vm.gc_grayagain.deinit(testing.allocator);
         vm.gc_grayagain = .empty;
-        if (edge >= 1) try vm.gc_gray.ensureUnusedCapacity(testing.allocator, 1);
         const mt = try vm.allocTableNoGc();
         const added_old_kb = vm.gc_gen_added_old_kb;
 
@@ -66092,15 +65939,14 @@ test "P16.50-review-12 4: gcStoreMetatable fail indices publish nothing; success
         try testing.expect(owner.gc.age == .old and gcIsBlack(owner.gc.marked));
         try testing.expect(mt.gc.age == .new and gcIsWhite(mt.gc.marked));
         try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
-        try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
         try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
-        try testing.expect(!vm.gc_old1_overflow and !vm.gc_gray_overflow);
+        try testing.expect(!vm.gc_gray_overflow);
         try testing.expectEqual(added_old_kb, vm.gc_gen_added_old_kb);
         try testing.expect(p50IsRegistered(&vm, .{ .table = mt }));
     }
 
     // Success: forward-barrier publication (metatable gray + gc_gray +
-    // OLD0 + gc_old1). The owner keeps its OLD/black age/color — HIGH 1:
+    // OLD0). The owner keeps its OLD/black age/color — HIGH 1:
     // no touched1, no grayagain re-queue (PUC runs no backward barrier for
     // the metatable pointer).
     const mt = try vm.allocTableNoGc();
@@ -66109,17 +65955,15 @@ test "P16.50-review-12 4: gcStoreMetatable fail indices publish nothing; success
     try testing.expect(owner.metatable == mt);
     try testing.expect(mt.gc.age == .old0 and gcIsGray(mt.gc.marked));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_gray.items, .{ .table = mt }));
-    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = mt }));
     try testing.expect(owner.gc.age == .old and gcIsBlack(owner.gc.marked));
     try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
 
     // Real minor cycle: the metatable is drained black and promoted
-    // OLD0→OLD1 exactly once (no duplicate gc_old1 entry — the store
-    // already linked it); the owner stays OLD/black (never re-traversed),
-    // and the accounting charges the promotion exactly once.
+    // OLD0→OLD1 exactly once (the age transition itself); the owner stays
+    // OLD/black (never re-traversed), and the accounting charges the
+    // promotion exactly once.
     try vm.gcMinorCollection();
     try testing.expect(mt.gc.age == .old1 and gcIsBlack(mt.gc.marked));
-    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = mt }));
     try testing.expect(owner.gc.age == .old and gcIsBlack(owner.gc.marked));
     const expect_delta = @as(f64, @floatFromInt(gcObjectBytes(.{ .table = mt }))) / 1024.0;
     try testing.expectApproxEqAbs(expect_delta, vm.gc_gen_added_old_kb - added_old_kb, 1e-9);
@@ -66164,7 +66008,6 @@ test "P16.50-review-12 5: gcDrainGrayagain reserve OOM keeps the source membersh
     // membership.
     const th = try vm.alloc.create(Thread);
     th.* = .{ .status = .suspended, .callee = .Nil };
-    try vm.gcPrepareRegister(1);
     vm.gcRegisterCommit(.{ .thread = th });
     vm.gcNoteAlloc(@sizeOf(Thread));
     th.stack = try vm.alloc.alloc(Value, 2);
@@ -66286,7 +66129,6 @@ test "P16.50-review-12 6: young sweep completes under a rejecting allocator once
     // NEW BLACK survivor, one NEW WHITE dead object.
     const th = try vm.alloc.create(Thread);
     th.* = .{ .status = .suspended, .callee = .Nil };
-    try vm.gcPrepareRegister(1);
     vm.gcRegisterCommit(.{ .thread = th });
     vm.gcNoteAlloc(@sizeOf(Thread));
     th.stack = try vm.alloc.alloc(Value, 2);
@@ -66297,7 +66139,7 @@ test "P16.50-review-12 6: young sweep completes under a rejecting allocator once
     const t_surv = try vm.allocTableNoGc();
     const t_new_surv = try vm.allocTableNoGc();
     const t_dead = try vm.allocTableNoGc();
-    try testing.expectEqual(@as(usize, 4), vm.gc_young_objects.items.len);
+    try testing.expectEqual(@as(usize, 4), vm.testGcYoungRegionLen());
 
     // Post-atomic sweep-entry state: survivors BLACK (marked this cycle),
     // the dead object left at the pre-flip white; the flip makes that
@@ -66310,13 +66152,14 @@ test "P16.50-review-12 6: young sweep completes under a rejecting allocator once
     vm.gc_current_white ^= WHITEBITS;
     try testing.expect(gcIsDead(t_dead.gc.marked, vm.gc_current_white));
 
-    vm.gc_young_objects_snapshot_len = vm.gc_young_objects.items.len;
     const added_old_kb = vm.gc_gen_added_old_kb;
+    // Pointer-form snapshot: the whole current region is death-checked
+    // (no mid-cycle tail to keep unconditionally).
+    vm.gc_gen_snapshot = vm.gc_allgc_tail;
 
     // The healthy equivalent of the bulk reserve (spare capacity for every
-    // promote-time append), then EVERY allocation rejected: the promotion
-    // loop must complete on appendAssumeCapacity alone.
-    try vm.gc_old1.ensureUnusedCapacity(testing.allocator, 4);
+    // promote-time append), then EVERY allocation rejected: the walk must
+    // complete on the pre-counted reserves alone.
     try vm.gc_grayagain.ensureUnusedCapacity(testing.allocator, 4);
     try vm.gc_gen_threads.ensureUnusedCapacity(testing.allocator, 4);
     {
@@ -66329,20 +66172,15 @@ test "P16.50-review-12 6: young sweep completes under a rejecting allocator once
         vm.alloc = testing.allocator;
     }
 
-    // t_dead: freed and unregistered (pointer scan — no deref).
-    var dead_registered = false;
-    for (vm.gc_objects.items) |o| {
-        if (std.meta.eql(o, .{ .table = t_dead })) dead_registered = true;
-    }
-    try testing.expect(!dead_registered);
-    // Exact promotions: t_surv and th → OLD1, each listed exactly once in
-    // gc_old1 and grayagain; th gains exactly one gc_gen_threads entry;
-    // t_new_surv stays young as SURVIVAL with the current white.
+    // t_dead: freed and unregistered.
+    try testing.expect(!p50IsRegistered(&vm, .{ .table = t_dead }));
+    // Exact promotions: t_surv and th → OLD1 (the positional cohort), each
+    // listed exactly once in grayagain; th gains exactly one
+    // gc_gen_threads entry; t_new_surv stays young as SURVIVAL with the
+    // current white.
     try testing.expect(t_surv.gc.age == .old1 and gcIsBlack(t_surv.gc.marked));
-    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .table = t_surv }));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .table = t_surv }));
     try testing.expect(th.gc.age == .old1 and gcIsBlack(th.gc.marked));
-    try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_old1.items, .{ .thread = th }));
     try testing.expectEqual(@as(usize, 1), p50r8Count(vm.gc_grayagain.items, .{ .thread = th }));
     var th_roots: usize = 0;
     for (vm.gc_gen_threads.items) |t| {
@@ -66350,8 +66188,10 @@ test "P16.50-review-12 6: young sweep completes under a rejecting allocator once
     }
     try testing.expectEqual(@as(usize, 1), th_roots);
     try testing.expect(t_new_surv.gc.age == .survival and gcIsWhite(t_new_surv.gc.marked));
-    try testing.expectEqual(@as(usize, 1), vm.gc_young_objects.items.len);
-    try testing.expect(std.meta.eql(vm.gc_young_objects.items[0], .{ .table = t_new_surv }));
+    const young_left = try vm.testGcYoungRegionDupe(testing.allocator);
+    defer testing.allocator.free(young_left);
+    try testing.expectEqual(@as(usize, 1), young_left.len);
+    try testing.expect(std.meta.eql(young_left[0], .{ .table = t_new_surv }));
     // Accounting: exactly the two OLD1 promotions, charged exactly once.
     const expect_delta = (@as(f64, @floatFromInt(gcObjectBytes(.{ .table = t_surv }))) +
         @as(f64, @floatFromInt(gcObjectBytes(.{ .thread = th })))) / 1024.0;
@@ -66405,13 +66245,9 @@ test "P16.50-review-12 7: sticky fail-everything minor cycle recovers; invariant
     // lifecycle and promotes the values to OLD1.
     try vm.gcMinorCollection();
     try vm.gcMinorCollection();
-    var garbage_left = false;
-    for (vm.gc_objects.items) |o| {
-        if (std.meta.eql(o, .{ .table = g1 }) or
-            std.meta.eql(o, .{ .table = g2 }) or
-            std.meta.eql(o, .{ .table = g3 })) garbage_left = true;
-    }
-    try testing.expect(!garbage_left);
+    try testing.expect(!p50IsRegistered(&vm, .{ .table = g1 }));
+    try testing.expect(!p50IsRegistered(&vm, .{ .table = g2 }));
+    try testing.expect(!p50IsRegistered(&vm, .{ .table = g3 }));
     try testing.expect(p50IsRegistered(&vm, .{ .table = owner }));
     try testing.expect(p50IsRegistered(&vm, .{ .table = v1 }));
     try testing.expect(p50IsRegistered(&vm, .{ .table = v2 }));
@@ -66428,9 +66264,12 @@ test "P16.50-review-12 7: sticky fail-everything minor cycle recovers; invariant
     try testing.expect(owner.gc.age == .old and v1.gc.age == .old and v2.gc.age == .old);
     try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
     try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
-    try testing.expect(!vm.gc_gray_overflow and !vm.gc_old1_overflow);
-    for (vm.gc_objects.items) |obj| {
-        try testing.expect((gcPtr(obj).marked.* & MISSEDGRAYBIT) == 0);
+    try testing.expect(!vm.gc_gray_overflow);
+    {
+        var cur = vm.gc_allgc_head;
+        while (cur) |hdr| : (cur = hdr.next) {
+            try testing.expect((gcPtr(gcFromHeader(hdr)).marked.* & MISSEDGRAYBIT) == 0);
+        }
     }
     try testing.expect(gcCheckSecondaryRegistryInvariants(&vm));
 }
@@ -66444,13 +66283,7 @@ test "P16.50-review-12 7: sticky fail-everything minor cycle recovers; invariant
 // ═══════════════════════════════════════════════════════════════════════
 
 fn r14GcObjectsHasTable(vm: *Vm, t: *Table) bool {
-    for (vm.gc_objects.items) |o| {
-        switch (o) {
-            .table => |tt| if (tt == t) return true,
-            else => {},
-        }
-    }
-    return false;
+    return p50IsRegistered(vm, .{ .table = t });
 }
 
 test "P16.50-review-14 B1: type-level metatable stored mid-cycle survives the real cycle (all 7 slots)" {
@@ -66516,8 +66349,8 @@ test "P16.50-review-14 B1: type-level metatable stored mid-cycle survives the re
         // atomic (lgc.c:1552-1554) precisely so this table survives.
         while (vm.gc_state != .pause) _ = try vm.gcAdvance(std.math.maxInt(usize), false);
 
-        // The slot must reference a LIVE table (membership in gc_objects is
-        // the liveness oracle — sweep removes freed objects).
+        // The slot must reference a LIVE table (membership in the allgc
+        // chain is the liveness oracle — sweep unlinks freed objects).
         try testing.expect(vm.valueMetatable(target) == mt);
         try testing.expect(r14GcObjectsHasTable(&vm, mt));
 
@@ -66721,7 +66554,7 @@ test "P16.50-review-14 2a: testC setmetatable runs the full lua_setmetatable pat
             // mark worklists drained).
             const fin_base = vm_b.finalizables.count();
             const gray_base = vm_b.gc_gray.items.len;
-            const old1_base = vm_b.gc_old1.items.len;
+            const old1_base = vm_b.testGcCountAge(.old0);
             const grayagain_base = vm_b.gc_grayagain.items.len;
             var failing = std.testing.FailingAllocator.init(base, .{
                 .fail_index = fi,
@@ -66737,15 +66570,16 @@ test "P16.50-review-14 2a: testC setmetatable runs the full lua_setmetatable pat
                 try testing.expectEqual(@as(usize, 2), win.count());
                 try testing.expect(owner.metatable == mt);
                 // Post-success publications exactly once (r13 boundary
-                // contract): the store, the forward barrier (gray + old1)
-                // and the __gc registration — NO grayagain re-queue (HIGH 1:
+                // contract): the store, the forward barrier (gray + the
+                // metatable's OLD0 promotion) and the __gc registration —
+                // NO grayagain re-queue (HIGH 1:
                 // PUC lua_setmetatable runs only the forward
                 // luaC_objbarrier). Exactly +1 over the fresh VM's own
                 // baseline (the bootstrap io files stay registered).
                 try testing.expect(vm_b.finalizables.contains(.{ .table = owner }));
                 try testing.expectEqual(fin_base + 1, vm_b.finalizables.count());
                 try testing.expectEqual(gray_base + 1, vm_b.gc_gray.items.len);
-                try testing.expectEqual(old1_base + 1, vm_b.gc_old1.items.len);
+                try testing.expectEqual(old1_base + 1, vm_b.testGcCountAge(.old0));
                 try testing.expectEqual(grayagain_base, vm_b.gc_grayagain.items.len);
                 // REAL full cycle after the boundary success (review-14
                 // test honesty): the rooted owner + metatable survive and
@@ -66767,7 +66601,7 @@ test "P16.50-review-14 2a: testC setmetatable runs the full lua_setmetatable pat
                 try testing.expect(!vm_b.finalizables.contains(.{ .table = owner }));
                 try testing.expectEqual(fin_base, vm_b.finalizables.count());
                 try testing.expectEqual(gray_base, vm_b.gc_gray.items.len);
-                try testing.expectEqual(old1_base, vm_b.gc_old1.items.len);
+                try testing.expectEqual(old1_base, vm_b.testGcCountAge(.old0));
                 try testing.expectEqual(grayagain_base, vm_b.gc_grayagain.items.len);
             }
         }
@@ -66819,7 +66653,7 @@ test "P16.50-review-14 HIGH 1: table setmetatable is forward-barrier-only (no gr
     try testing.expect(gcIsWhite(mt.gc.marked));
     try testing.expect(gcIsWhite(child.gc.marked));
     try testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
-    try testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.testGcCountAge(.old0));
     try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
 
     // The shared transaction (lua_setmetatable's core).
@@ -66827,14 +66661,13 @@ test "P16.50-review-14 HIGH 1: table setmetatable is forward-barrier-only (no gr
     vm.gcCommitSetMetatable(.{ .table = owner }, mt, plan);
 
     // FORWARD barrier only: mt is queued into gc_gray and published OLD0
-    // via gc_old1; the owner is NOT re-queued — gc_grayagain stays empty
-    // and the owner keeps its age/color (no touched1, no re-traversal).
+    // (the age bit alone); the owner is NOT re-queued — gc_grayagain stays
+    // empty and the owner keeps its age/color (no touched1, no re-traversal).
     try testing.expect(plan.barrier.gen_mark);
     try testing.expect(plan.barrier.gen_promote);
     try testing.expect(!plan.needs_finalizer); // no __gc in mt
     try testing.expect(owner.metatable == mt);
     try testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
-    try testing.expectEqual(@as(usize, 1), vm.gc_old1.items.len);
     try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
     try testing.expect(mt.gc.age == .old0);
     try testing.expect(owner.gc.age.isOld());
@@ -66844,7 +66677,7 @@ test "P16.50-review-14 HIGH 1: table setmetatable is forward-barrier-only (no gr
     mt_scope.close();
 
     // A generational MINOR cycle must keep mt (and child through its
-    // field): the forward barrier's gray/old1 publication is what makes
+    // field): the forward barrier's gray + OLD0 publication is what makes
     // the OLD owner's young metatable survive the minor sweep.
     try vm.gcMinorCollection();
     try testing.expect(owner.metatable == mt);
@@ -67043,9 +66876,9 @@ const R15B2EdgeEmergencyAlloc = struct {
 /// permanently elevated.
 fn r15b2CompareRegistry(snap: *const P50Snapshot, vm: *Vm) !void {
     const testing = std.testing;
-    try testing.expectEqual(snap.gc_objects.len, vm.gc_objects.items.len);
-    for (snap.gc_objects) |o| try testing.expect(p50StillRegistered(vm, o));
-    try testing.expectEqual(snap.young.len, vm.gc_young_objects.items.len);
+    try testing.expectEqual(snap.chain.len, vm.testGcChainLen());
+    for (snap.chain) |o| try testing.expect(p50StillRegistered(vm, o));
+    try testing.expectEqual(snap.young.len, vm.testGcYoungRegionLen());
     for (snap.young) |o| try testing.expect(p50StillRegistered(vm, o));
     // gc_count_kb arithmetic is exact in f64 (dyadic-rational charges).
     try testing.expectEqual(snap.gc_count_kb, vm.gc_count_kb);
@@ -67719,7 +67552,7 @@ test "P16.50-review-14 D: rawSet rehash window roots tbl/key/val across the emer
 
     // The insert published the SURVIVORS (pointer identity — not
     // re-allocated lookalikes), and all three are still registered (a
-    // swept object is removed from gc_objects: the negative oracle —
+    // swept object is unlinked from the allgc chain: the negative oracle —
     // each arm reddens when its own production root is removed).
     const got = vm.rawGet(tbl, .{ .Table = key_tbl });
     try testing.expect(got == .Table and got.Table == val_tbl);
@@ -69804,7 +69637,6 @@ test "gcUnregisterObjectRollback unlinks a linked thread from the atomic-clear l
         /// Transactional thread construction — builtinCoroutineCreate's
         /// exact pattern (prepare, create, base frame, commit, accounting).
         fn makeThread(v: *Vm) !*Thread {
-            try v.gcPrepareRegister(1);
             const th = try v.alloc.create(Thread);
             th.* = .{ .status = .suspended, .callee = .{ .Builtin = .coroutine_resume } };
             errdefer v.destroyUnregisteredThread(th);

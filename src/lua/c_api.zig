@@ -226,8 +226,6 @@ pub fn luaNewThreadTx(parent: *vm_mod.lua_State, vmp: *Vm) error{ OutOfMemory, R
         // contract as lua_closeslot's apiCall arm).
         error.Yield => unreachable,
     };
-    // Prepare-first: after this, registration cannot fail.
-    try vmp.gcPrepareRegister(1);
     const th = try vmp.alloc.create(vm_mod.Thread);
     // Full teardown — the allocStateHandle failure window
     // below runs AFTER initThreadBaseFrame committed the
@@ -4644,8 +4642,6 @@ fn b8CfSetupvalueOom(L: ?*lua_State) callconv(.c) c_int {
     // Force both reserves to allocate (fresh capacity-less lists).
     s.vm.gc_gray.deinit(s.vm.alloc);
     s.vm.gc_gray = .empty;
-    s.vm.gc_old1.deinit(s.vm.alloc);
-    s.vm.gc_old1 = .empty;
     b8_failing = std.testing.FailingAllocator.init(b8_base, .{
         .fail_index = 0,
         .resize_fail_index = 0,
@@ -4689,7 +4685,7 @@ test "c api lua_setupvalue OOM throws LUA_ERRMEM before the store" {
     // the young table is unpromoted, nothing was published.
     try std.testing.expect(std.meta.eql(owner_cell.value, orig_value));
     try std.testing.expect(b8AgeIsYoung(b8_young.?.gc.age));
-    try std.testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
+    try std.testing.expectEqual(@as(usize, 0), vm.testGcCountAge(.old0));
     try std.testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
 
     // Reuse with the real allocator: the same store succeeds, returns the
@@ -4702,12 +4698,9 @@ test "c api lua_setupvalue OOM throws LUA_ERRMEM before the store" {
     try std.testing.expect(name != null);
     try std.testing.expectEqualStrings("x", std.mem.span(name.?));
     try std.testing.expect(std.meta.eql(owner_cell.value, .{ .Table = b8_young.? }));
+    // Promotion is the age bit itself (published exactly once by
+    // construction — there is no list entry to duplicate).
     try std.testing.expect(b8_young.?.gc.age == .old0);
-    var old1_count: usize = 0;
-    for (vm.gc_old1.items) |o| {
-        if (std.meta.eql(o, .{ .table = b8_young.? })) old1_count += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 1), old1_count);
     _ = luazigGcFixed(L, 2, 0); // LUA_GCCOLLECT
     try std.testing.expect(std.meta.eql(owner_cell.value, .{ .Table = b8_young.? }));
     lua_settop(L, 0);
@@ -4723,8 +4716,6 @@ fn b8CfUpvaluejoinOom(L: ?*lua_State) callconv(.c) c_int {
     s.push(.{ .Closure = b8_donor.? }) catch return -1;
     s.vm.gc_gray.deinit(s.vm.alloc);
     s.vm.gc_gray = .empty;
-    s.vm.gc_old1.deinit(s.vm.alloc);
-    s.vm.gc_old1 = .empty;
     b8_failing = std.testing.FailingAllocator.init(b8_base, .{
         .fail_index = 0,
         .resize_fail_index = 0,
@@ -4770,7 +4761,7 @@ test "c api lua_upvaluejoin OOM throws LUA_ERRMEM before the re-point" {
     // the donor cell is unpromoted, nothing was published.
     try std.testing.expect(b8_owner.?.upvalues[0] == owner_cell);
     try std.testing.expect(b8AgeIsYoung(donor_cell.gc.age));
-    try std.testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
+    try std.testing.expectEqual(@as(usize, 0), vm.testGcCountAge(.old0));
     try std.testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
 
     // Reuse with the real allocator: the join re-points the owner's slot,
@@ -4871,8 +4862,6 @@ fn r13StageTable(L: ?*lua_State) callconv(.c) c_int {
     // Fresh lists force every reserve to actually allocate.
     s.vm.gc_gray.deinit(s.vm.alloc);
     s.vm.gc_gray = .empty;
-    s.vm.gc_old1.deinit(s.vm.alloc);
-    s.vm.gc_old1 = .empty;
     s.vm.gc_grayagain.deinit(s.vm.alloc);
     s.vm.gc_grayagain = .empty;
     s.vm.finalizables.deinit(s.vm.alloc);
@@ -4897,8 +4886,6 @@ fn r13StageUserdata(L: ?*lua_State) callconv(.c) c_int {
     var s = api.State.fromHandle(L.?);
     s.vm.gc_gray.deinit(s.vm.alloc);
     s.vm.gc_gray = .empty;
-    s.vm.gc_old1.deinit(s.vm.alloc);
-    s.vm.gc_old1 = .empty;
     s.vm.gc_grayagain.deinit(s.vm.alloc);
     s.vm.gc_grayagain = .empty;
     s.vm.finalizables.deinit(s.vm.alloc);
@@ -4940,7 +4927,6 @@ fn r13AssertByteExact(vm: *vm_mod.Vm, table_arm: bool) !void {
     }
     try std.testing.expectEqual(@as(usize, 0), vm.finalizables.count());
     try std.testing.expectEqual(@as(usize, 0), vm.gc_gray.items.len);
-    try std.testing.expectEqual(@as(usize, 0), vm.gc_old1.items.len);
     try std.testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
 }
 
@@ -4952,11 +4938,12 @@ test "c api lua_setmetatable OOM transaction matrix (table + userdata, every res
     // checkable). Each arm ends with a REAL full cycle after its
     // failure-sweep + boundary success.
 
-    // ── TABLE arm ── exactly THREE reserve edges (finalizables, gray,
-    // old1 — HIGH 1 removed the PUC-unintended grayagain re-queue, so the
-    // Table arm has the SAME forward-barrier-only contract as Userdata):
-    // each fail_index 0..=2 must abort the transaction with
-    // LUA_ERRMEM/MEMERRMSG before ANY observable change.
+    // ── TABLE arm ── exactly TWO reserve edges (finalizables, gray —
+    // HIGH 1 removed the PUC-unintended grayagain re-queue and the OLD0
+    // promotion is an infallible age store, so the Table arm has the SAME
+    // forward-barrier-only contract as Userdata): each fail_index 0..=1
+    // must abort the transaction with LUA_ERRMEM/MEMERRMSG before ANY
+    // observable change.
     {
         const L = luaL_newstate() orelse return error.OutOfMemory;
         defer lua_close(L);
@@ -4979,7 +4966,7 @@ test "c api lua_setmetatable OOM transaction matrix (table + userdata, every res
 
         const mt_a = try r13NewMt(vm, &scope);
         r13_mt = mt_a;
-        for (0..3) |fi| {
+        for (0..2) |fi| {
             r13_fail_idx = fi;
             lua_settop(L, 0);
             lua_pushcfunction(L, r13StageTable);
@@ -4989,14 +4976,14 @@ test "c api lua_setmetatable OOM transaction matrix (table + userdata, every res
             try std.testing.expectEqualStrings("not enough memory", vm.errThread().err_obj.String.bytes());
             try r13AssertByteExact(vm, true);
         }
-        // Boundary: fail_index == 3 (past the last edge) — the transaction
+        // Boundary: fail_index == 2 (past the last edge) — the transaction
         // succeeds and publishes EVERYTHING exactly once: the store, the
-        // forward-barrier publications (gray + old1) and the finalizer
-        // registration. NO grayagain re-queue (HIGH 1: PUC lua_setmetatable
-        // runs only the forward luaC_objbarrier — the owner stays old/black
-        // and is NOT re-traversed).
+        // forward-barrier publications (gray + the metatable's OLD0) and
+        // the finalizer registration. NO grayagain re-queue (HIGH 1: PUC
+        // lua_setmetatable runs only the forward luaC_objbarrier — the
+        // owner stays old/black and is NOT re-traversed).
         {
-            r13_fail_idx = 3;
+            r13_fail_idx = 2;
             lua_settop(L, 0);
             lua_pushcfunction(L, r13StageTable);
             const st = lua_pcallk(L, 0, 0, 0, 0, null);
@@ -5006,7 +4993,7 @@ test "c api lua_setmetatable OOM transaction matrix (table + userdata, every res
             try std.testing.expect(vm.finalizables.contains(.{ .table = r13_owner_table.? }));
             try std.testing.expectEqual(@as(usize, 1), vm.finalizables.count());
             try std.testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
-            try std.testing.expectEqual(@as(usize, 1), vm.gc_old1.items.len);
+            try std.testing.expectEqual(@as(usize, 1), vm.testGcCountAge(.old0));
             try std.testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
         }
         // REAL full cycle after failure + success: the rooted owner keeps
@@ -5017,10 +5004,10 @@ test "c api lua_setmetatable OOM transaction matrix (table + userdata, every res
         lua_settop(L, 0);
     }
 
-    // ── USERDATA arm ── (fresh VM) exactly THREE reserve edges
-    // (finalizables, gray, old1 — the metatable pointer takes the FORWARD
-    // barrier only, never the backward one): fail_index 0..=2 each aborts
-    // byte-exact.
+    // ── USERDATA arm ── (fresh VM) exactly TWO reserve edges
+    // (finalizables, gray — the metatable pointer takes the FORWARD
+    // barrier only, never the backward one; the OLD0 promotion is an
+    // infallible age store): fail_index 0..=1 each aborts byte-exact.
     {
         const L = luaL_newstate() orelse return error.OutOfMemory;
         defer lua_close(L);
@@ -5041,7 +5028,7 @@ test "c api lua_setmetatable OOM transaction matrix (table + userdata, every res
 
         const mt_b = try r13NewMt(vm, &scope);
         r13_mt = mt_b;
-        for (0..3) |fi| {
+        for (0..2) |fi| {
             r13_fail_idx = fi;
             lua_settop(L, 0);
             lua_pushcfunction(L, r13StageUserdata);
@@ -5051,10 +5038,11 @@ test "c api lua_setmetatable OOM transaction matrix (table + userdata, every res
             try std.testing.expectEqualStrings("not enough memory", vm.errThread().err_obj.String.bytes());
             try r13AssertByteExact(vm, false);
         }
-        // Boundary: fail_index == 3 — success with the userdata publications
-        // (gray + old1; NO grayagain — the owner is not re-queued).
+        // Boundary: fail_index == 2 — success with the userdata
+        // publications (gray + OLD0; NO grayagain — the owner is not
+        // re-queued).
         {
-            r13_fail_idx = 3;
+            r13_fail_idx = 2;
             lua_settop(L, 0);
             lua_pushcfunction(L, r13StageUserdata);
             const st = lua_pcallk(L, 0, 0, 0, 0, null);
@@ -5064,7 +5052,7 @@ test "c api lua_setmetatable OOM transaction matrix (table + userdata, every res
             try std.testing.expect(vm.finalizables.contains(.{ .userdata = r13_owner_ud.? }));
             try std.testing.expectEqual(@as(usize, 1), vm.finalizables.count());
             try std.testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
-            try std.testing.expectEqual(@as(usize, 1), vm.gc_old1.items.len);
+            try std.testing.expectEqual(@as(usize, 1), vm.testGcCountAge(.old0));
             try std.testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
         }
 
@@ -5136,8 +5124,6 @@ test "c api debug.setmetatable protected Lua call OOM matrix (shared transaction
         // (safe: this fresh VM holds no live registration yet).
         vm.gc_gray.deinit(vm.alloc);
         vm.gc_gray = .empty;
-        vm.gc_old1.deinit(vm.alloc);
-        vm.gc_old1 = .empty;
         vm.gc_grayagain.deinit(vm.alloc);
         vm.gc_grayagain = .empty;
         vm.finalizables.deinit(vm.alloc);
@@ -5154,14 +5140,15 @@ test "c api debug.setmetatable protected Lua call OOM matrix (shared transaction
         vm.testc_alloc_base = base;
         if (st == 0) {
             // Boundary success: the shared transaction published everything
-            // exactly once — the store, the forward barrier (gray + old1)
-            // and the __gc registration. NO grayagain re-queue (HIGH 1: PUC
-            // lua_setmetatable runs only the forward luaC_objbarrier).
+            // exactly once — the store, the forward barrier (gray + the
+            // metatable's OLD0 promotion) and the __gc registration. NO
+            // grayagain re-queue (HIGH 1: PUC lua_setmetatable runs only
+            // the forward luaC_objbarrier).
             try std.testing.expect(owner.metatable == mt);
             try std.testing.expect(vm.finalizables.contains(.{ .table = owner }));
             try std.testing.expectEqual(@as(usize, 1), vm.finalizables.count());
             try std.testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
-            try std.testing.expectEqual(@as(usize, 1), vm.gc_old1.items.len);
+            try std.testing.expectEqual(@as(usize, 1), vm.testGcCountAge(.old0));
             try std.testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
             // REAL full cycle after the boundary success: stack-rooted
             // owner + metatable survive and the registration persists
@@ -5186,7 +5173,7 @@ test "c api debug.setmetatable protected Lua call OOM matrix (shared transaction
             try std.testing.expect(vm.finalizables.contains(.{ .table = owner }));
             try std.testing.expectEqual(@as(usize, 1), vm.finalizables.count());
             try std.testing.expectEqual(@as(usize, 1), vm.gc_gray.items.len);
-            try std.testing.expectEqual(@as(usize, 1), vm.gc_old1.items.len);
+            try std.testing.expectEqual(@as(usize, 1), vm.testGcCountAge(.old0));
             try std.testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
         } else {
             // Reserve failure: NOTHING changed.

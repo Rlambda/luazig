@@ -63,6 +63,19 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
    Step 15 nil-fill живого operand-слота; он не предпосылка миграции
    (открытый пункт `STATUS.md`).
 
+   ВЫПОЛНЕН (4 cut'а: c1febb8 layout+shadow; e3d98d8 chain=authority;
+   19faf56 finobj/tobefnz+post-sweep callfin; 4ca07d2 удаление временного
+   слоя и мёртвых полей): все расхождения закрыты canonical differential
+   (tests/c_api/27_finalizer_owners — побайтово оба режима; мутации
+   l1/l2/l3 RED); вторых lifetime-authority нет; long_literals включены в
+   цепочку; applyLoadEnv-гипотеза опровергнута decisive-экспериментом.
+   Perf A/B (9b1bad7↔4ca07d2, cpu_core/instructions): table-alloc −2.9%,
+   string −1.8%, GC-core без finalizers −19.6%, 10%-finalizable −14.1%;
+   finalizer-saturated форма +75.5% при остающемся 24%-преимуществе vs
+   PUC (3.28B vs 4.33B insn) — цена принятия PUC-семантики
+   (markbeingfnz pending-графа каждый цикл + post-sweep callfin);
+   speed-preservation gate не действовал.
+
 ## TBC, calls и protected boundaries
 
 1. **F1: yieldable `finishpcallk` recovery — подтверждено,

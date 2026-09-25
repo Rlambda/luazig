@@ -3999,20 +3999,6 @@ fn gcFromHeader(h: *GcHeader) GcObject {
     };
 }
 
-/// Creation sequence of a finalizable object (Table/Userdata only — the
-/// only types `gcCanFinalize` admits, hence the only types ever present in
-/// the `finalizables` set and its LIFO sort). Used by `gcFinalizeLessThan`
-/// for PUC LIFO finalization order and by `gcRegisterCommit` to stamp the
-/// sequence at creation. Returns null for non-finalizable types (they carry
-/// no seq field — no fake uniform value).
-fn gcFinalizableSeqPtr(obj: GcObject) ?*u64 {
-    return switch (obj) {
-        .table => |t| &t.gc_seq,
-        .userdata => |u| &u.gc_seq,
-        else => null,
-    };
-}
-
 /// Byte size of a GC-managed object (for memory accounting).
 fn gcObjectBytes(obj: GcObject) usize {
     return switch (obj) {
@@ -4094,11 +4080,6 @@ const TableFlags = struct {
 pub const Table = struct {
     /// GC header (marked/age/tag + the allgc lifetime link).
     gc: GcHeader = .{ .tag = .table },
-    /// Monotonic creation sequence — never changes after allocation.
-    /// Used for PUC LIFO finalization order. P16.16 C1: only the
-    /// finalizable types (Table, Userdata) carry a sequence — the
-    /// finalizer sort never sees other types, so they carry no seq field.
-    gc_seq: u64 = 0,
 
     // Array part: keys 1..n stored contiguously. A nil entry inside the array
     // is a "hole"; next()/length skip holes by scanning. Mirrors PUC Lua's
@@ -4165,9 +4146,6 @@ pub const Table = struct {
 pub const Userdata = struct {
     /// GC header (marked/age/tag + the allgc lifetime link).
     gc: GcHeader = .{ .tag = .userdata },
-    /// Monotonic creation sequence for PUC LIFO finalization order
-    /// (P16.16 C1: finalizable-types-only; see Table.gc_seq).
-    gc_seq: u64 = 0,
     /// Per-object metatable (PUC `Udata.metatable`). Null = no metatable.
     metatable: ?*Table = null,
     /// User values array (PUC `Udata.uv[]`). `nuvalue` elements, all
@@ -4187,10 +4165,10 @@ comptime {
     for (.{ Table, Closure, Thread, Cell, Userdata }) |T| {
         std.debug.assert(@TypeOf(@as(T, undefined).gc) == GcHeader);
     }
-    std.debug.assert(@sizeOf(Table) == 88);
+    std.debug.assert(@sizeOf(Table) == 80);
     std.debug.assert(@sizeOf(Closure) == 48);
     std.debug.assert(@sizeOf(Cell) == 48);
-    std.debug.assert(@sizeOf(Userdata) == 64);
+    std.debug.assert(@sizeOf(Userdata) == 56);
     std.debug.assert(@sizeOf(Thread) == 3368);
 }
 
@@ -4376,6 +4354,83 @@ const TestcAllocControl = struct {
     poison_unmap: bool = false,
 };
 
+/// PUC `lua_newstate`'s allocator contract for C-created states: route
+/// every post-init VM allocation through the caller's `lua_Alloc` AND run
+/// the core `luaM_realloc_` tryagain (lmem.c:156-168) — on allocation
+/// failure, `cantryagain` → one emergency full GC → retry. This is the
+/// allocation boundary PUC gives every C host; the emergency path is what
+/// makes a failing custom allocator observable as "separate pending
+/// finalizations, suppress their calls, retry" instead of a plain
+/// LUA_ERRMEM. Installed ONLY when the state was created with an explicit
+/// allocator function (`luaL_newstate` and internal states keep the plain
+/// allocator). Alignment: C `realloc` guarantees `max_align_t` (16 on the
+/// supported ABIs) suitability; the VM never requests a larger alignment
+/// through this path (natural object alignments only), so a larger
+/// request is a build-time-detectable contract violation — assert it.
+pub const CAllocBridge = struct {
+    alloc_fn: *const fn (?*anyopaque, ?*anyopaque, usize, usize) callconv(.c) ?*anyopaque,
+    ud: ?*anyopaque,
+    vm: *Vm,
+
+    pub fn allocator(self: *CAllocBridge) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = allocFn,
+                .resize = resizeFn,
+                .remap = remapFn,
+                .free = freeFn,
+            },
+        };
+    }
+
+    fn cCall(self: *CAllocBridge, ptr: ?*anyopaque, osize: usize, nsize: usize) ?[*]u8 {
+        const p = self.alloc_fn(self.ud, ptr, osize, nsize);
+        return if (p) |q| @ptrCast(q) else null;
+    }
+
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        _ = ra;
+        const self: *CAllocBridge = @ptrCast(@alignCast(ctx));
+        std.debug.assert(alignment.toByteUnits() <= @alignOf(std.c.max_align_t));
+        if (self.cCall(null, 0, len)) |mem| return mem;
+        // PUC luaM_realloc_ tryagain: one emergency full GC, then retry.
+        if (self.vm.emergencyCollectAllowed()) {
+            self.vm.emergencyCollect();
+            if (self.cCall(null, 0, len)) |mem| return mem;
+        }
+        return null;
+    }
+
+    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        _ = alignment;
+        _ = ra;
+        const self: *CAllocBridge = @ptrCast(@alignCast(ctx));
+        _ = self.cCall(memory.ptr, memory.len, 0);
+    }
+
+    /// The C allocator protocol has no in-place resize portability
+    /// contract; report failure so the caller takes its alloc+copy+free
+    /// fallback through the same bridge.
+    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        _ = ctx;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ra;
+        return false;
+    }
+
+    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        _ = ctx;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ra;
+        return null;
+    }
+};
+
 /// P16.50-review-5: PUC `debug_realloc` (ltests.c:195-265) as a Zig
 /// allocator vtable — the allocator-boundary implementation of testC memory
 /// control. Installed on `vm.alloc` at the END of `enableTestcModuleInternal`
@@ -4551,8 +4606,8 @@ const TestcAllocAdapter = struct {
         // FULL check path. `cantryagain` = completestate && !gcstopem:
         // completeness is structural (the adapter is installed only after
         // init), gcstopem maps to gc_busy/testc_emergency_active.
-        if (self.vm.testcEmergencyCollectAllowed()) {
-            self.vm.testcEmergencyCollect();
+        if (self.vm.emergencyCollectAllowed()) {
+            self.vm.emergencyCollect();
             if (self.attemptAlloc(len, alignment, ra)) |mem| return mem;
         }
         return null;
@@ -4750,7 +4805,7 @@ pub const Vm = struct {
     ///   sweep → maps to PUC's sweepallgc/sweepfinobj/sweeptobefnz/sweepend/callfin
     /// When queried, sweep returns "sweepallgc" (the first sweep sub-state).
     /// `enteratomic` is reported when in propagate phase and close to atomic.
-    const GcState = enum { pause, propagate, atomic, sweep };
+    const GcState = enum { pause, propagate, atomic, sweep, callfin };
 
     fn gcStateName(self: *const Vm) []const u8 {
         return switch (self.gc_state) {
@@ -4758,6 +4813,7 @@ pub const Vm = struct {
             .propagate => if (self.gc_gray.items.len == 0 and !self.gc_gray_overflow) "enteratomic" else "propagate",
             .atomic => "atomic",
             .sweep => "sweepallgc",
+            .callfin => "callfin",
         };
     }
     const GcGenPhase = enum { minor, major };
@@ -4872,11 +4928,6 @@ pub const Vm = struct {
     // So a separate table is needed: a long literal and a long runtime string
     // with the same content must have distinct pointers.
     long_literals: StringIntern = .{},
-    /// Set of objects (tables and userdata) that have a __gc metamethod.
-    /// During the atomic phase, white (unreachable) objects in this set
-    /// are queued for finalization. PUC uses the FINALIZEDBIT on each
-    /// object + the tobefnz list; we use a HashSet for the same purpose.
-    finalizables: std.AutoHashMapUnmanaged(GcObject, void) = .{},
     debug_registry: ?*Table = null,
 
     /// PUC `-E` flag (lua.c:720-723): when true, the VM ignores LUA_PATH /
@@ -4888,24 +4939,37 @@ pub const Vm = struct {
     /// `resolveEnvPath` so env vars are never read when `-E` is set.
     noenv: bool = false,
 
-    // Canonical allgc chain: every GC object is linked at commit
-    // (tail-append, creation order) and unlinked at unregister. This is
-    // the single lifetime authority — sweep, rollback, teardown and every
-    // full pass walk it. `gc_objects` below is a Debug-only mirror for the
-    // sync checker and carries no authority in any mode.
+    // Canonical allgc chain: every GC object starts here at commit
+    // (tail-append, creation order). This is the single lifetime authority
+    // — sweep, rollback, teardown and every full pass walk it. Registered
+    // finalizable objects LEAVE the chain (allgc → finobj → tobefnz →
+    // back to the chain at finalizer dequeue); the three lists partition
+    // the live set (checker-proven). `gc_objects` below is a Debug-only
+    // mirror of the LIVE SET in chain order for the sync checker and
+    // carries no authority in any mode.
     gc_allgc_head: ?*GcHeader = null,
     gc_allgc_tail: ?*GcHeader = null,
-    /// Debug-only order-preserving mirror of the chain
-    /// (`builtin.mode == .Debug` maintenance): appended at commit,
-    /// identity-removed (orderedRemove) at unlink. Exists solely so
-    /// `gcAllgcAssertSync` can cross-validate the chain against an
-    /// independently maintained dense sequence (equal lengths, member
-    //  order, no losses/duplicates). Never compiled into hot paths of
-    /// non-Debug builds.
+    // Finalizer ownership lists (PUC lstate.h g->finobj/g->tobefnz): the
+    // same GcHeader.next field re-linked on each transition, so every live
+    // GC object is a member of EXACTLY ONE of {allgc, finobj, tobefnz}
+    // (checker-proven at cycle boundaries). finobj holds REGISTERED
+    // objects (setmetatable with __gc); its head is the LAST registered
+    // (PUC prepends, lgc.c:1086-1087) — dequeue order below is reverse
+    // registration. tobefnz holds separated pending finalizations; it is
+    // PERSISTENT: cycle boundaries, emergency collections, GCSTOP windows
+    // and mode switches never clear it — only a completed finalizer (or
+    // the state-close drain) removes its head.
+    gc_finobj_head: ?*GcHeader = null,
+    gc_tobefnz_head: ?*GcHeader = null,
+    gc_tobefnz_tail: ?*GcHeader = null,
+    /// Debug-only order-preserving mirror of the live set (chain order;
+    /// `builtin.mode == .Debug` maintenance): appended at commit, removed
+    /// at death, re-queued at the tail on finalizer dequeue. Exists solely
+    /// so `gcAllgcAssertSync` can cross-validate the three intrusive
+    //  lists against an independently maintained dense sequence (full
+    //  coverage, no losses/duplicates). Never compiled into hot paths of
+    //  non-Debug builds.
     gc_objects: std.ArrayListUnmanaged(GcObject) = .empty,
-    /// Monotonic creation counter — never decreases. Used for PUC LIFO
-    /// finalization order; set once at allocation and never changed.
-    gc_creation_seq: u64 = 0,
     // (P16.10b Task 6) The old VM-global `pinned_source_strings` list is
     // RETIRED: source pins now live on each tree's root Proto (CUT2)
     // (`source_backing.pinned`) and are marked through the closure
@@ -5068,7 +5132,6 @@ pub const Vm = struct {
     gc_fin_tables: std.AutoHashMapUnmanaged(*Table, void) = .{},
     gc_fin_closures: std.AutoHashMapUnmanaged(*Closure, void) = .{},
     gc_fin_threads: std.AutoHashMapUnmanaged(*Thread, void) = .{},
-    gc_to_finalize: std.ArrayListUnmanaged(GcObject) = .empty,
     /// Incremental sweep cursor: the last node examined and KEPT alive
     /// (null = the sweep starts at the chain head). The next victim is
     /// always `last.next` (or the head), so the step's unlink is the
@@ -5116,12 +5179,6 @@ pub const Vm = struct {
     /// cases (the minor2inc threshold write mid-sweep; the count clamped
     /// at 0 drifting the debt upward — the safe, later-firing direction).
     gc_step_debt_kb: f64 = 32768.0,
-    gc_finalizer_epoch: usize = 0,
-    gc_cycle_finalizer_epoch: usize = 0,
-    /// Number of finalizers called in the most recent atomic phase.
-    /// Used by gcFullCollectionForUser to decide if a second cycle is needed
-    /// to free the finalized objects (PUC sweeptobefnz).
-    gc_finalizers_ran_count: usize = 0,
     gc_tick: usize = 0,
     gc_inst: usize = 0,
     gc_last_table_inst: usize = 0,
@@ -5168,7 +5225,7 @@ pub const Vm = struct {
     testc_alloc_adapter: ?*TestcAllocAdapter = null,
     /// PUC `gcstopem` for the emergency collector: set while an emergency
     /// full GC runs, so an allocation failure INSIDE the emergency GC does
-    /// not re-enter it (adapter checks `testcEmergencyCollectAllowed`).
+    /// not re-enter it (adapter checks `emergencyCollectAllowed`).
     testc_emergency_active: bool = false,
 
     /// PUC `gcemergency` (lgc.c): set during an emergency full GC. Switches
@@ -5351,6 +5408,10 @@ pub const Vm = struct {
     /// vtable that would complicate every allocation site.
     c_alloc_fn: ?*const fn (?*anyopaque, ?*anyopaque, usize, usize) callconv(.c) ?*anyopaque = null,
     c_alloc_ud: ?*anyopaque = null,
+    /// The C-allocator bridge installed by `lua_newstate` when the state
+    /// was created with an explicit `lua_Alloc` (see `CAllocBridge`).
+    /// Teardown restores the backing allocator before destroying it.
+    c_alloc_bridge: ?*CAllocBridge = null,
 
     /// Monotonic counter backing `luaL_ref` (PUC lauxlib's `t->alref`).
     /// Each successful ref allocates the next integer key in the registry
@@ -6721,7 +6782,6 @@ pub const Vm = struct {
         // but a bare HashMap deinit never touches keys) — it is released
         // after the drain, through the same allocator the puts used
         // (infraAlloc owns the map storage).
-        self.finalizables.deinit(self.alloc);
         self.dynamic_ast_arena.deinit();
         // P16.37 Cut 2: the main thread's bytecode stack/boxed arrays are NO
         // LONGER freed here — the Thread owns them permanently, and
@@ -6766,6 +6826,16 @@ pub const Vm = struct {
         // it exactly once here. Both objects were allocated via the BASE
         // allocator (uncounted — PUC's l_memcontrol lives in static memory),
         // so they are destroyed through base after the restore.
+        // C-allocator bridge teardown: every VM-owned allocation has been
+        // freed through the bridge by now; restore the backing allocator
+        // (the one that allocated the bridge object itself) and destroy
+        // the bridge.
+        if (self.c_alloc_bridge) |bridge| {
+            const backing = std.heap.c_allocator;
+            self.alloc = backing;
+            backing.destroy(bridge);
+            self.c_alloc_bridge = null;
+        }
         if (self.testc_alloc_adapter) |adapter| {
             const base = self.testc_alloc_base.?;
             self.alloc = base;
@@ -6804,6 +6874,18 @@ pub const Vm = struct {
             self.gcFreeObject(gcFromHeader(hdr), .teardown);
             cur = next;
         }
+        // The close sequence (gcFinalizeAtClose) separated every finobj
+        // member into tobefnz and drained the queue, so both finalizer
+        // lists are empty here — PUC asserts the same before deletelist
+        // (lgc.c:1534, 1537). A surviving member would be an ownership
+        // leak: free it exactly like the chain and flag it in Debug.
+        if (@import("builtin").mode == .Debug) {
+            if (self.gc_finobj_head != null or self.gc_tobefnz_head != null)
+                @panic("gc teardown: finalizer lists not drained");
+        }
+        self.gc_finobj_head = null;
+        self.gc_tobefnz_head = null;
+        self.gc_tobefnz_tail = null;
         self.gc_allgc_head = null;
         self.gc_allgc_tail = null;
         self.gc_gen_old1_scan = null;
@@ -6822,7 +6904,6 @@ pub const Vm = struct {
         self.gc_fin_tables.deinit(self.alloc);
         self.gc_fin_closures.deinit(self.alloc);
         self.gc_fin_threads.deinit(self.alloc);
-        self.gc_to_finalize.deinit(self.alloc);
         self.gc_grayagain.deinit(self.alloc);
         self.gc_gen_threads.deinit(self.alloc);
         self.gc_root_values.deinit(self.alloc);
@@ -8211,18 +8292,23 @@ pub const Vm = struct {
     }
 
     fn gcFinalizeAtClose(self: *Vm) void {
-        // PUC `close_state` → `luaC_freeallobjects` → `callallpendingfinalizers`.
-        // Runs all pending __gc finalizers at state close time. Finalizers are
-        // called in LIFO order (most recently created first), matching PUC's
-        // `tobefnz` list which is prepended to by `separatetobefnz`.
-        //
-        // PUC sets `g->gcstp = GCSTPCLS` before running finalizers, which:
-        //   - prevents new objects from being queued for finalization
-        //   - makes `collectgarbage()` return false
-        //   - prevents re-entrant finalization
-        // We set `is_closing` here to handle all three behaviors. This covers
-        // both the `os.exit(_, true)` path (via `closeStateForExit`) and the
-        // `Vm.deinit()` path (normal teardown).
+        // PUC `luaC_freeallobjects` (lgc.c:1529-1541) — the state-close
+        // sequence:
+        //   1. `g->gcstp = GCSTPCLS` — no new finalizer registrations,
+        //      `collectgarbage()` returns false, no re-entrant
+        //      finalization. Covers both the `Vm.deinit()` path and the
+        //      `os.exit(_, true)` path (closeStateForExit).
+        //   2. `separatetobefnz(g, 1)` — ALL remaining finobj members
+        //      move to the tobefnz TAIL: entries already pending from
+        //      earlier cycles (emergency/GCSTOP windows) keep their place
+        //      AHEAD of the newly separated registered objects —
+        //      pending-first, each batch in reverse-registration order.
+        //   3. `callallpendingfinalizers` — drain from the head, one GCTM
+        //      at a time; ANY error (including memory errors) becomes a
+        //      warning and the drain continues.
+        // The drain is allocation-free queue surgery; objects created by
+        // close-time finalizer bodies are never themselves registered
+        // (GCSTPCLS gate).
         self.is_closing = true;
         self.gc_stp |= GCSTPCLS; // PUC: gcstp = GCSTPCLS
         // Keep the collector non-reentrant while registry ownership is being
@@ -8232,61 +8318,8 @@ pub const Vm = struct {
         self.gc_busy = true;
         defer self.gc_busy = was_busy;
 
-        // Snapshot all objects currently marked as finalizable. PUC's
-        // `separatetobefnz(g, 1)` separates ALL finalizable objects into
-        // `tobefnz` in one pass; we snapshot the `finalizables` set.
-        // Objects created by finalizers during the close sequence are NOT
-        // included (PUC GCSTPCLS prevents queuing).
-        var to_finalize = std.ArrayListUnmanaged(GcObject).empty;
-        defer to_finalize.deinit(self.alloc);
-
-        var it = self.finalizables.iterator();
-        while (it.next()) |entry| {
-            to_finalize.append(self.alloc, entry.key_ptr.*) catch return;
-        }
-
-        // Sort by gc_seq descending (LIFO creation order), matching PUC's
-        // `tobefnz` list order. Reuses the same comparator as the GC path.
-        std.sort.block(GcObject, to_finalize.items, self, gcFinalizeLessThan);
-
-        for (to_finalize.items) |obj| {
-            // PUC udata2finalize (lgc.c:947-960): dequeue and clear
-            // FINALIZEDBIT BEFORE resolving __gc on the current metatable.
-            self.takeFinalizable(obj);
-            const mt: ?*Table = switch (obj) {
-                .table => |t| t.metatable,
-                .userdata => |u| u.metatable,
-                else => null,
-            };
-            const m = mt orelse continue;
-            const gc = self.fastTm(m, .gc) orelse continue;
-            const self_val: Value = obj.toValue() orelse continue;
-            const call_args = &[_]Value{self_val};
-            _ = self.callFinalizer(gc, call_args) catch |e| switch (e) {
-                // PUC lgc.c:988-991 (GCTM): errors in __gc finalizers are
-                // reported through the warning channel via
-                // `luaE_warnerror(L, "__gc")`, producing
-                // "error in __gc (<error message>)". The error object is
-                // then popped and closing continues with the next finalizer.
-                error.RuntimeError => {
-                    const err_obj = self.protectedErrorValue();
-                    const err_msg: []const u8 = switch (err_obj) {
-                        .String => |s| s.bytes(),
-                        else => "error object is not a string",
-                    };
-                    var warn_buf: std.ArrayListUnmanaged(u8) = .empty;
-                    defer warn_buf.deinit(self.alloc);
-                    warn_buf.appendSlice(self.alloc, "error in __gc (") catch return;
-                    warn_buf.appendSlice(self.alloc, err_msg) catch return;
-                    warn_buf.append(self.alloc, ')') catch return;
-                    self.warnfHandler(warn_buf.items, false) catch {};
-                    self.err = null;
-                    self.errThread().err_has_obj = false;
-                    self.errThread().err_obj = .Nil;
-                },
-                else => return,
-            };
-        }
+        self.gcSeparateTobefnz(true);
+        self.gcDrainTobefnzAll(true);
     }
 
     fn callFinalizer(self: *Vm, gc: Value, args: []const Value) DispatchError!Value {
@@ -9688,24 +9721,26 @@ pub const Vm = struct {
     }
 
     /// PUC `cantryagain` (lmem.c): completestate && !gcstopem. Completeness
-    /// is structural — the adapter is installed only after init completes.
-    /// gcstopem maps to our gc_busy (any GC step in flight on this VM,
-    /// including finalizer-driven Lua) plus testc_emergency_active (the
-    /// emergency collector itself).
-    fn testcEmergencyCollectAllowed(self: *Vm) bool {
+    /// is structural — the allocation boundaries that can run the emergency
+    /// are installed only after init completes. gcstopem maps to our
+    /// gc_busy (any GC step in flight on this VM, including finalizer-driven
+    /// Lua) plus testc_emergency_active (the emergency collector itself).
+    fn emergencyCollectAllowed(self: *Vm) bool {
         return !self.gc_busy and !self.testc_emergency_active;
     }
 
     /// PUC `tryagain` → `luaC_fullgc(L, 1)` (lmem.c): the emergency full GC
-    /// run from a failed allocation, best-effort. gc_emergency switches
-    /// root marking to the conservative full register window (the heap pc
-    /// is stale mid-instruction) and suppresses finalizer calls (GCScallfin
-    /// guard) and the string-table shrink (checkSizes guard) — PUC lgc.c
-    /// fullinc under gcemergency=1. The collection itself allocates only
-    /// through infraAlloc (GC-internal queues), so it cannot re-enter the
-    /// failing adapter path; failures are swallowed (the retry that follows
+    /// run from a failed allocation boundary, best-effort. gc_emergency
+    /// switches root marking to the conservative full register window (the
+    /// heap pc is stale mid-instruction) and suppresses finalizer calls
+    /// (GCScallfin / finishgencycle guards) and the string-table shrink
+    /// (checkSizes guard) — PUC lgc.c fullinc under gcemergency=1; the
+    /// persistent tobefnz keeps every pending finalization alive across the
+    /// emergency. The collection itself allocates only through infraAlloc
+    /// (GC-internal queues) under the emergency flags, so it cannot re-enter
+    /// the failing boundary; failures are swallowed (the retry that follows
     /// may still fail → the caller reports OOM, as PUC's NULL return does).
-    fn testcEmergencyCollect(self: *Vm) void {
+    fn emergencyCollect(self: *Vm) void {
         self.testc_emergency_active = true;
         defer self.testc_emergency_active = false;
         self.gc_emergency = true;
@@ -10124,101 +10159,290 @@ pub const Vm = struct {
         self.gc_root_top = mark.token;
     }
 
-    // === FINALIZER REGISTRATION INVARIANT ===
+    // === FINALIZER OWNERSHIP (PUC lgc.c, intrusive lists) ===
     //
-    // FINALIZEDBIT set ⟺ object is in the registered-finalizable lifecycle
-    // (PUC `finobj`/`tobefnz` equivalent). The bit is the O(1) semantic
-    // membership test (PUC `tofinalize(o)`, lgc.h:96); the `finalizables`
-    // HashSet is the iterable container (insert at registration, remove at
-    // dequeue). They MUST agree at every boundary:
-    //
-    //   registerFinalizable(obj):  set bit  ⟺  set.insert(obj)
-    //   takeFinalizable(obj):      clear bit ⟺  set.remove(obj)
-    //
-    // Registration is PERSISTENT (PUC luaC_checkfinalizer, lgc.c:1068-1090):
-    // changing or removing the metatable NEVER deregisters. The __gc
-    // metamethod is resolved DYNAMICALLY at finalization time (PUC GCTM,
-    // lgc.c:968, calls luaT_gettmbyobj on the CURRENT metatable).
-    // lua_setmetatable(nil) does not call checkfinalizer at all (lapi.c:964).
-    //
-    // Dequeue (takeFinalizable) clears the bit BEFORE resolving __gc (PUC
-    // udata2finalize, lgc.c:947-960, resets FINALIZEDBIT before GCTM looks
-    // up the metamethod). If the current metatable is nil or has no __gc,
-    // no callback fires, but the object is "normal" again and will be
-    // collected on the next cycle.
+    // FINALIZEDBIT set ⟺ the object is a member of `finobj` or `tobefnz`
+    // (PUC `tofinalize(o)`, lgc.h:96) — the O(1) membership test used by
+    // liveness checks; the lists are the iterable container and the ORDER
+    // authority. Registration is PERSISTENT (PUC luaC_checkfinalizer,
+    // lgc.c:1068-1090): changing or removing the metatable NEVER
+    // deregisters. The __gc metamethod is resolved DYNAMICALLY at
+    // finalization time (PUC GCTM, lgc.c:974, luaT_gettmbyobj on the
+    // CURRENT metatable); lua_setmetatable(nil) does not call
+    // checkfinalizer at all (lapi.c:964). Dequeue clears the bit BEFORE
+    // the lookup (PUC udata2finalize, lgc.c:947-962) — exactly-once per
+    // registration; a metatable without __gc at dequeue time means a
+    // quiet skip, never a re-queue.
 
-    /// Register an object (table or userdata) for finalization.
-    /// PUC `luaC_checkfinalizer` (lgc.c:1068-1090): moves the object from
-    /// `allgc` to `finobj` and sets FINALIZEDBIT. We use a HashSet
-    /// (`finalizables`) as the non-intrusive equivalent of `finobj`, and set
-    /// FINALIZEDBIT on the object's `marked` byte as PUC does — the bit is the
-    /// fast-check for "is this object registered for finalization?" (PUC
-    /// `tofinalize(o)`, lgc.h:96), used by the sweep and weak-key pruning to
-    /// avoid a HashMap lookup on every object.
-    /// During the atomic phase, white (unreachable) objects in this set are
-    /// queued for __gc finalization.
-    pub fn registerFinalizable(self: *Vm, obj: GcObject) std.mem.Allocator.Error!void {
-        // PUC GCSTPCLS: when the state is closing (lua_close →
-        // luaC_freeallobjects sets g->gcstp = GCSTPCLS), `luaC_checkfinalizer`
-        // returns early via `gcstopp(g)` — new objects are NOT queued for
-        // finalization. This prevents objects created during the close
-        // sequence (e.g. inside a __gc finalizer) from having their own
-        // finalizers called (main.lua:324-326: object 3 created during
-        // object 2's finalizer must NOT be finalized).
-        if (self.is_closing) return;
-        // PUC luaC_checkfinalizer (lgc.c:1072): `if (tofinalize(o) || ...) return;`
-        // The bit test IS the PUC `tofinalize(o)` check — if already
-        // registered, keep the registration untouched (PUC returns early).
-        if ((gcPtr(obj).marked.* & FINALIZEDBIT) != 0) return;
-        // infraAlloc (PUC luaC_checkfinalizer parity): finalizer
-        // registration is intrusive pointer surgery in PUC — it allocates
-        // nothing, so it must not consume countdown/limit budget here.
-        try self.finalizables.put(self.infraAlloc(), obj, {});
-        // PUC luaC_checkfinalizer (lgc.c:1088): l_setbit(o->marked, FINALIZEDBIT)
+    /// PUC `luaC_checkfinalizer` (lgc.c:1068-1090) — commit half: move an
+    /// object (table or userdata) from `allgc` to `finobj`. INFALLIBLE
+    /// pointer surgery, exactly like PUC: prepend to finobj so the head is
+    /// the LAST registered object, which makes the later separation +
+    /// head-dequeue finalize objects in REVERSE registration order (PUC
+    /// manual: "finalizers are called in the reverse order that the
+    /// objects were marked for finalization"). Callers have already
+    /// checked the PUC gates: __gc present in the new metatable, bit
+    /// clear (not `tofinalize`), state not closing (GCSTPCLS).
+    ///
+    /// The sweep-phase arm (lgc.c:1076-1079): `makewhite` keeps the
+    /// object alive through the running sweep (it may sit ahead of the
+    /// sweep cursor with the old/dead white). PUC additionally needs
+    /// `sweeptolive` because its cursor is a GCObject** that may point
+    /// AT the victim's own link field; our cursor is the kept NODE
+    /// (`gc_sweep_last`), and the unlink below rewrites the predecessor's
+    /// link in place, so every position of the object relative to the
+    /// cursor is handled by the same through-write (proof: the three
+    /// positional cases in the Cut-2 cursor contract). The non-sweep
+    /// correctpointers arm is centralized in gcChainUnlinkAt.
+    fn gcLinkFinalizable(self: *Vm, obj: GcObject) void {
+        const hdr = gcHeaderOf(obj);
+        if (self.gc_state == .sweep) {
+            // PUC lgc.c:1077: makewhite(g, o) — "sweep" the object now.
+            gcMakeWhite(gcPtr(obj).marked, self.gc_current_white);
+        }
+        // Linear predecessor search (PUC lgc.c:1084-1085). Cold path: once
+        // per registration, PUC-faithful.
+        var ps: *?*GcHeader = &self.gc_allgc_head;
+        var prev: ?*GcHeader = null;
+        while (ps.*) |cur| {
+            if (cur == hdr) break;
+            prev = cur;
+            ps = &cur.next;
+        } else {
+            unreachable; // registering an object that is not in allgc
+        }
+        self.gcChainUnlinkAt(ps, hdr, prev);
+        // PUC lgc.c:1086-1088: o->next = g->finobj; g->finobj = o;
+        // l_setbit(o->marked, FINALIZEDBIT).
+        hdr.next = self.gc_finobj_head;
+        self.gc_finobj_head = hdr;
         gcPtr(obj).marked.* |= FINALIZEDBIT;
-        self.gc_finalizer_epoch +%= 1;
-        // In PUC Lua, registering a finalizer does not force the next GC
-        // step to run; the finalizer will run when the object is collected.
-        // Forcing a step at registration causes spurious automatic minor
-        // collections that promote young objects' ages prematurely,
-        // breaking gengc.lua age assertions.
     }
 
-    /// PUC `udata2finalize` (lgc.c:947-960): atomic semantic transition that
-    /// dequeues a finalizable object for finalization. Removes from the
-    /// `finalizables` set (our finobj/tobefnz equivalent) and clears
-    /// FINALIZEDBIT — the object is "normal" again. Called BEFORE resolving
-    /// the current __gc metamethod (PUC GCTM does the lookup AFTER
-    /// udata2finalize returns). If the current metatable is nil or has no
-    /// __gc, no callback fires, but the bit is already cleared so the object
-    /// will be collected on the next cycle.
+    /// PUC `separatetobefnz` (lgc.c:1023-1040): move unreachable (white)
+    /// finalizable objects from `finobj` to `tobefnz`, APPENDING at the
+    /// tail — old pending from previous cycles keep their place ahead of
+    /// the new batch, and the batch's internal order (reverse
+    /// registration) is preserved. Pure pointer surgery: no allocation,
+    /// so separation can never fail inside an emergency cycle.
     ///
-    /// ARCHITECTURE NOTE: luazig runs finalizers during the atomic phase
-    /// (BEFORE sweep), while PUC runs them AFTER sweep. To prevent the
-    /// sweep from freeing the just-finalized object in the current cycle
-    /// (PUC's sweep has already passed when finalizers run), we call
-    /// `gcMakeWhite` to set the object to the current white — making it
-    /// "not dead" for this sweep. This mirrors PUC's `makewhite(g, o)` in
-    /// `udata2finalize` when `issweepphase(g)` is true. The object is
-    /// collected on the NEXT cycle if still unreachable.
-    fn takeFinalizable(self: *Vm, obj: GcObject) void {
-        _ = self.finalizables.remove(obj);
+    /// In generational minor cycles only young candidates are checked
+    /// (`gcMinorCandidate`: new/survival/old0) — the age-filter
+    /// equivalent of PUC's positional `finobjold1` cutoff ("objects
+    /// after 'finobjold1' cannot be white"): old registered objects wait
+    /// for a major (incremental) cycle's `all=true`-shaped full
+    /// separation.
+    fn gcSeparateTobefnz(self: *Vm, all: bool) void {
+        var p: *?*GcHeader = &self.gc_finobj_head;
+        while (p.*) |curr| {
+            const obj = gcFromHeader(curr);
+            const q = gcPtr(obj);
+            // Gen-minor separation checks only young candidates (the
+            // age-filter equivalent of PUC's finobjold1 cutoff);
+            // incremental cycles traverse the whole list.
+            const young_candidate = !self.gc_minor_cycle or gcMinorCandidate(q.age.*);
+            if (!(all or (young_candidate and gcIsWhite(q.marked.*)))) {
+                p = &curr.next;
+            } else {
+                p.* = curr.next; // unlink from finobj
+                curr.next = null; // append at tobefnz tail
+                if (self.gc_tobefnz_tail) |t| {
+                    t.next = curr;
+                } else {
+                    self.gc_tobefnz_head = curr;
+                }
+                self.gc_tobefnz_tail = curr;
+            }
+        }
+    }
+
+    /// PUC `markbeingfnz` (lgc.c:388-392): mark every object pending
+    /// finalization — the WHOLE persistent tobefnz list, including
+    /// entries separated by earlier cycles (emergency carry-over,
+    /// GCSTOP windows). Callers follow with a gray drain (PUC atomic:
+    /// `markbeingfnz(g); propagateall(g)`, lgc.c:1568-1569), which also
+    /// resurrects each pending object's reachable graph.
+    fn gcMarkBeingFnz(self: *Vm) DispatchError!void {
+        var cur = self.gc_tobefnz_head;
+        while (cur) |hdr| : (cur = hdr.next) {
+            if (gcIsWhite(gcPtr(gcFromHeader(hdr)).marked.*)) {
+                if (gcFromHeader(hdr).toValue()) |v| try self.gcMarkValue(v);
+            }
+        }
+    }
+
+    /// PUC `udata2finalize` (lgc.c:947-962): dequeue the tobefnz head and
+    /// return it to the regular heap. The allgc tail is our "newest"
+    /// end — PUC prepends to the allgc head, which in its head-inserted
+    /// orientation is the same position (beyond the sweep cursor, inside
+    /// the generational young end). FINALIZEDBIT is cleared BEFORE the
+    /// caller resolves __gc (exactly-once). `makewhite` follows the PUC
+    /// `issweepphase` arm: true for the generational drain (PUC
+    /// youngcollection leaves gcstate in the sweep range through
+    /// finishgencycle, lgc.c:1351) and the close drain; false for the
+    /// incremental callfin state (issweepphase is false in GCScallfin —
+    /// the object stays black and the next cycle's sweep repaints it).
+    fn gcDequeueTobefnzHead(self: *Vm, makewhite: bool) GcObject {
+        const hdr = self.gc_tobefnz_head.?;
+        self.gc_tobefnz_head = hdr.next;
+        if (self.gc_tobefnz_tail == hdr) self.gc_tobefnz_tail = null;
+        hdr.next = null;
+        const prev_tail = self.gc_allgc_tail;
+        if (prev_tail) |t| {
+            t.next = hdr;
+        } else {
+            self.gc_allgc_head = hdr;
+        }
+        self.gc_allgc_tail = hdr;
+        if (self.gc_mode == .generational and self.gc_gen_phase == .minor and self.gc_gen_young_first == null) {
+            // A dequeued object re-enters the heap at the young end; open
+            // the young region at the tail if it was empty (the commit
+            // form: the region's slot is the predecessor of its first
+            // node).
+            self.gc_gen_young_first = hdr;
+            self.gc_gen_young_prev = prev_tail;
+        }
+        const obj = gcFromHeader(hdr);
         gcPtr(obj).marked.* &= ~FINALIZEDBIT;
-        // PUC udata2finalize (lgc.c:953-955): resetbit + makewhite-if-sweep.
-        // In PUC, finalizers run AFTER sweep (callfin phase), so
-        // issweepphase(g) is true and makewhite is called to make the
-        // object white for the NEXT cycle's sweep.
-        // In luazig, finalizers run DURING atomic (BEFORE sweep). The
-        // object was marked BLACK in atomic Step 10 (gcMarkValue on each
-        // to-finalize object). We must NOT call gcMakeWhite here: the
-        // white flip happens after atomic (line ~20868), so gcMakeWhite
-        // would set the object to the PRE-flip white, which becomes the
-        // "other" (dead) white after the flip — causing the sweep to free
-        // it in the SAME cycle (breaking the two-cycle finalization
-        // contract). Instead, leave the object BLACK: gcIsDead returns
-        // false for black objects, so it survives the sweep. The sweep's
-        // own gcMakeWhite (gcSweepOne line ~21422) then resets it to the
-        // new current white for the next cycle.
+        if (makewhite) gcMakeWhite(gcPtr(obj).marked, self.gc_current_white);
+        if (@import("builtin").mode == .Debug) self.gcDebugMirrorRequeue(obj);
+        return obj;
+    }
+
+    /// PUC lgc.c:988-991 + `luaE_warnerror` (lstate.c:408-419): report a
+    /// failed finalizer body through the warning channel as
+    /// "error in __gc (<error message>)"; the error object is dropped and
+    /// the pending list continues. A non-string error object reports as
+    /// "error object is not a string" (PUC luaE_warnerror). Formatting
+    /// failures are swallowed: a warning must never abort the list.
+    fn gcWarnFinalizerError(self: *Vm, err_obj: Value) void {
+        const err_msg: []const u8 = switch (err_obj) {
+            .String => |s| s.bytes(),
+            else => "error object is not a string",
+        };
+        var warn_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer warn_buf.deinit(self.alloc);
+        warn_buf.appendSlice(self.alloc, "error in __gc (") catch return;
+        warn_buf.appendSlice(self.alloc, err_msg) catch return;
+        warn_buf.append(self.alloc, ')') catch return;
+        self.warnfHandler(warn_buf.items, false) catch {};
+        self.err = null;
+        self.errThread().err_has_obj = false;
+        self.errThread().err_obj = .Nil;
+    }
+
+    /// PUC `GCTM` (lgc.c:968-993): dequeue FIRST, then resolve __gc on
+    /// the CURRENT metatable; a missing metamethod is a quiet skip. The
+    /// body runs under GCSTPGC with debug hooks suppressed (callFinalizer
+    /// also flags CIST_FIN). ANY error the body raises — including
+    /// LUA_ERRMEM / OutOfMemory — goes to the warning channel and the
+    /// caller continues with the rest of the list (lgc.c:988-991 +
+    /// lstate.c luaE_warnerror); GCTM does not distinguish error classes.
+    ///
+    /// Yield/ThreadSwitch out of a finalizer body is structurally
+    /// impossible in the callfin phase (PUC GCTM runs the body through
+    /// luaD_callnoyield, lgc.c:983; finalizers are non-yieldable). A
+    /// yield crossing this boundary would be a VM bug — panic rather
+    /// than mask it.
+    fn gcRunOneFinalizer(self: *Vm) void {
+        const obj = self.gcDequeueTobefnzHead(false);
+        const mt: ?*Table = switch (obj) {
+            .table => |t| t.metatable,
+            .userdata => |u| u.metatable,
+            else => null,
+        };
+        const m = mt orelse return;
+        const gc = self.fastTm(m, .gc) orelse return;
+        const self_val: Value = obj.toValue() orelse return;
+        const call_args = &[_]Value{self_val};
+        // PUC lgc.c:978-987: set GCSTPGC during finalizer execution to
+        // prevent reentrant GC (`collectgarbage()` from __gc returns
+        // false).
+        const old_gcstp = self.gc_stp;
+        self.gc_stp |= GCSTPGC;
+        defer self.gc_stp = old_gcstp;
+        _ = self.callFinalizer(gc, call_args) catch |e| switch (e) {
+            error.RuntimeError => self.gcWarnFinalizerError(self.protectedErrorValue()),
+            error.OutOfMemory => self.gcWarnFinalizerError(.{
+                .String = self.oom_msg_str orelse self.internStrAssume("not enough memory"),
+            }),
+            error.Yield, error.ThreadSwitch => @panic(
+                "yield crossed the finalizer boundary (non-yieldable GCTM)",
+            ),
+        };
+    }
+
+    /// PUC GCScallfin step (lgc.c:1669-1681): one finalizer per work
+    /// unit; when the queue is empty — or under an emergency collection,
+    /// which never runs finalizers (GCScallfin guard `!g->gcemergency`)
+    /// — finish the cycle with the pending list INTACT (carry-over).
+    /// The `luaD_checkminstack` gate has no equivalent here: stacks grow
+    /// on demand in this VM, so the "not enough stack to run a
+    /// finalizer" outcome cannot occur.
+    fn gcCallfinStep(self: *Vm) DispatchError!void {
+        if (self.gc_tobefnz_head != null and !self.gc_emergency) {
+            self.gcRunOneFinalizer();
+        } else {
+            try self.gcFinishCycle();
+        }
+    }
+
+    /// End of the incremental allgc sweep: repaint the finobj/tobefnz
+    /// members to the current white (PUC GCSswpfinobj/GCSswptobefnz,
+    /// lgc.c:1652-1661 — sweeplist over the two lists). No member can
+    /// die here: every entry is either marked (markbeingfnz or ordinary
+    /// marking) or was made current-white at registration during the
+    /// sweep; the pass exists to leave every live object white for the
+    /// next cycle, FINALIZEDBIT preserved (maskmarks).
+    fn gcSweepFinListsIncremental(self: *Vm) void {
+        const w = self.gc_current_white;
+        inline for (.{ &self.gc_finobj_head, &self.gc_tobefnz_head }) |list| {
+            var cur = list.*;
+            while (cur) |hdr| : (cur = hdr.next) {
+                const p = gcPtr(gcFromHeader(hdr));
+                std.debug.assert((p.marked.* & FINALIZEDBIT) != 0);
+                gcMakeWhite(&p.marked.*, w);
+            }
+        }
+    }
+
+    /// Sweep-end transition into the finalizer phase (PUC GCSswpend →
+    /// GCScallfin).
+    fn gcSweepEnterCallfin(self: *Vm) void {
+        self.gcSweepFinListsIncremental();
+        self.gc_state = .callfin;
+    }
+
+    /// PUC `callallpendingfinalizers` (lgc.c:999-1003) — the
+    /// finishgencycle/close drain: run GCTM over the whole tobefnz list,
+    /// head first, old pending ahead of newer batches. `makewhite`
+    /// mirrors the PUC issweepphase-true arm of udata2finalize during
+    /// generational young-collection finals and the close sequence.
+    fn gcDrainTobefnzAll(self: *Vm, makewhite: bool) void {
+        while (self.gc_tobefnz_head != null) {
+            const obj = self.gcDequeueTobefnzHead(makewhite);
+            const mt: ?*Table = switch (obj) {
+                .table => |t| t.metatable,
+                .userdata => |u| u.metatable,
+                else => null,
+            };
+            const m = mt orelse continue;
+            const gc = self.fastTm(m, .gc) orelse continue;
+            const self_val: Value = obj.toValue() orelse continue;
+            const call_args = &[_]Value{self_val};
+            const old_gcstp = self.gc_stp;
+            self.gc_stp |= GCSTPGC;
+            defer self.gc_stp = old_gcstp;
+            _ = self.callFinalizer(gc, call_args) catch |e| switch (e) {
+                error.RuntimeError => self.gcWarnFinalizerError(self.protectedErrorValue()),
+                error.OutOfMemory => self.gcWarnFinalizerError(.{
+                    .String = self.oom_msg_str orelse self.internStrAssume("not enough memory"),
+                }),
+                error.Yield, error.ThreadSwitch => @panic(
+                    "yield crossed the finalizer boundary (non-yieldable GCTM)",
+                ),
+            };
+        }
     }
 
     /// PUC luaC_condGC pacing: decrement GC debt at Lua-object allocation
@@ -10345,16 +10569,6 @@ pub const Vm = struct {
         if (self.stats.enabled) self.stats.alloc_by_type[@intFromEnum(obj)] += 1;
         const p = gcPtr(obj);
         p.marked.* = self.gc_current_white & WHITEBITS;
-        // Creation sequence: only the finalizable types (Table/Userdata)
-        // carry one — it exists solely for the finalizer LIFO sort, which
-        // never sees another type (see gcFinalizableSeq).
-        switch (obj) {
-            .table, .userdata => {
-                gcFinalizableSeqPtr(obj).?.* = self.gc_creation_seq;
-                self.gc_creation_seq += 1;
-            },
-            else => {},
-        }
         // Tail-link into the canonical chain (creation order).
         const hdr = gcHeaderOf(obj);
         const prev_tail = self.gc_allgc_tail;
@@ -10414,7 +10628,6 @@ pub const Vm = struct {
         if (self.gc_gen_snapshot == victim) self.gc_gen_snapshot = succ;
         if (self.gc_gen_young_first == victim) self.gc_gen_young_first = succ;
         if (self.gc_gen_young_prev == victim) self.gc_gen_young_prev = prev;
-        if (@import("builtin").mode == .Debug) self.gcDebugMirrorRemove(gcFromHeader(victim));
     }
 
     /// Rollback-time unregistration (α destroy-now). Constructor rollbacks
@@ -10444,6 +10657,7 @@ pub const Vm = struct {
             unreachable; // rollback of an unregistered object
         }
         self.gcChainUnlinkAt(ps, victim, prev);
+        if (@import("builtin").mode == .Debug) self.gcDebugMirrorRemove(obj);
         // Purge the object from every GC carry-over work list. The failing
         // allocation that triggered this rollback ran an EMERGENCY full GC
         // first (allocFn retry, PUC luaM_realloc_ tryagain) — that cycle
@@ -29204,12 +29418,14 @@ pub const Vm = struct {
             // thread teardown runs this barrier.
             if (self.gc_state == .sweep) return;
             const owner_age = gcValueAge(owner) orelse return;
-            const child_age = gcValueAge(child) orelse return;
-            if (owner_age.isOld() and child_age.isYoung()) {
-                const child_obj = GcObject.fromValue(child).?;
-                // PUC luaC_barrier_ setage(v, G_OLD0): the age is the whole
-                // generational publication (OLD0 objects live in the young
-                // region by position; the next young sweep advances them).
+            const child_obj = GcObject.fromValue(child) orelse return;
+            // PUC luaC_barrier_ (lgc.c:246-260): keepinvariant (gen minor
+            // included) → reallymarkobject(v) — mark the WHITE child of an
+            // old owner regardless of its age, then setage(v, G_OLD0) to
+            // restore the generational invariant. A WHITE OLD child is
+            // reachable after a finalizer dequeue (makewhite preserves
+            // age); an age-filtered arm would leave it unmarked.
+            if (owner_age.isOld() and gcIsWhite(gcPtr(child_obj).marked.*)) {
                 gcPtr(child_obj).age.* = .old0;
                 try self.gcQueueScanValue(child);
             }
@@ -29259,7 +29475,10 @@ pub const Vm = struct {
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             // PUC luaC_barrier_ sweep arm: GENMINOR sweep → no-op.
             if (self.gc_state == .sweep) return .{};
-            if (owner.gc.age.isOld() and child.gc.age.isYoung()) {
+            // PUC luaC_barrier_ (lgc.c:246-260): mark the WHITE child of
+            // an old owner regardless of age (a WHITE OLD child is the
+            // finalizer-dequeue shape), then setage(G_OLD0).
+            if (owner.gc.age.isOld() and gcIsWhite(child.gc.marked)) {
                 const v = if (child.isOpen()) child.get(self) else child.value;
                 switch (v) {
                     .Table, .Closure, .Thread, .Userdata => try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), 1),
@@ -29285,7 +29504,9 @@ pub const Vm = struct {
                 }
                 return .{ .inc_mark = true };
             },
-            .sweep => return .{ .inc_make_white = true },
+            // PUC keepinvariant(g) is false from the sweep states through
+            // GCScallfin (lgc.h): make the owner white, not the child.
+            .sweep, .callfin => return .{ .inc_make_white = true },
             .pause => return .{},
         }
     }
@@ -29335,11 +29556,18 @@ pub const Vm = struct {
     fn gcMakeAllWhite(self: *Vm) void {
         // gcMakeWhite preserves FINALIZEDBIT (PUC maskmarks), so registered
         // objects keep their finalization flag across the mode switch.
-        // The chain walk covers every live object, long literals included.
+        // The chain walk covers every live object, long literals included;
+        // the finalizer lists hold the rest of the live set.
         const w = self.gc_current_white;
         var cur = self.gc_allgc_head;
         while (cur) |hdr| : (cur = hdr.next) {
             gcMakeWhite(&gcPtr(gcFromHeader(hdr)).marked.*, w);
+        }
+        inline for (.{ &self.gc_finobj_head, &self.gc_tobefnz_head }) |list| {
+            var fin = list.*;
+            while (fin) |hdr| : (fin = hdr.next) {
+                gcMakeWhite(&gcPtr(gcFromHeader(hdr)).marked.*, w);
+            }
         }
     }
 
@@ -29347,7 +29575,9 @@ pub const Vm = struct {
     /// (lgc.c:1136-1158): after the atomic phase marks all reachable
     /// objects BLACK, surviving objects become .old (+BLACK; threads join
     /// gc_gen_threads for per-minor re-traversal). Runs over the whole
-    /// chain — long literals included — and resets the generational
+    /// chain — long literals included — and over the finalizer lists
+    /// (PUC atomic2gen: `sweep2old(L, &g->finobj); sweep2old(L,
+    /// &g->tobefnz)`, lgc.c:1400-1402), and resets the generational
     /// boundaries: everything is old, all positional regions are empty.
     ///
     /// In our architecture, `gcMakeAllOld` is called AFTER a full cycle
@@ -29390,6 +29620,17 @@ pub const Vm = struct {
             gcSetBlack(o.marked);
             if (obj == .thread) {
                 self.gc_gen_threads.appendAssumeCapacity(obj.thread);
+            }
+        }
+        // Finalizer lists: registered/pending members turn OLD+BLACK in
+        // place (they never re-enter the main chain here; a later dequeue
+        // re-whitens them per the issweepphase arm).
+        inline for (.{ &self.gc_finobj_head, &self.gc_tobefnz_head }) |list| {
+            var fin = list.*;
+            while (fin) |hdr| : (fin = hdr.next) {
+                const o = gcPtr(gcFromHeader(hdr));
+                o.age.* = .old;
+                gcSetBlack(o.marked);
             }
         }
         self.gc_gen_phase = .minor;
@@ -29635,6 +29876,10 @@ pub const Vm = struct {
         // and are freed by sweep → use-after-free.
         // gcStartCycle (incremental mode) clears gc_gray separately, matching
         // PUC's startcycle which does g->gray = NULL.
+        // The PENDING tobefnz queue is deliberately NOT touched: it is
+        // persistent state of the collector (PUC keeps g->tobefnz across
+        // cycle starts, emergency aborts, GCSTOP windows and mode switches;
+        // only a completed finalizer dequeues from it).
         self.gc_marked_tables.clearRetainingCapacity();
         self.gc_marked_closures.clearRetainingCapacity();
         self.gc_marked_threads.clearRetainingCapacity();
@@ -29642,7 +29887,6 @@ pub const Vm = struct {
         self.gc_fin_tables.clearRetainingCapacity();
         self.gc_fin_closures.clearRetainingCapacity();
         self.gc_fin_threads.clearRetainingCapacity();
-        self.gc_to_finalize.clearRetainingCapacity();
         // Reset marked KB counter for checkmajorminor (PUC GCmarked per cycle).
         self.gc_gen_marked_kb = 0;
     }
@@ -29651,7 +29895,6 @@ pub const Vm = struct {
         if (self.gc_state != .pause) return;
 
         self.gc_do_sweep = do_sweep;
-        self.gc_cycle_finalizer_epoch = self.gc_finalizer_epoch;
 
         self.gcResetCycleState();
         // PUC startcycle (lgc.c:963): g->gray = NULL. Only incremental mode
@@ -29889,8 +30132,17 @@ pub const Vm = struct {
                 },
                 .atomic => try self.gcAtomicPhase(),
                 .sweep => {
-                    if (!try self.gcSweepOne()) try self.gcFinishCycle();
+                    // PUC sweeps three lists in order (GCSswpallgc →
+                    // GCSswpfinobj → GCSswptobefnz, lgc.c:1648-1661) and
+                    // then enters the finalizer phase (GCSswpend →
+                    // GCScallfin). The allgc chain is walked one node per
+                    // work unit; the finobj/tobefnz repaint passes are a
+                    // single transition step (death is structurally
+                    // impossible there — every member is marked or
+                    // bit-screened — so no pacing is observable).
+                    if (!try self.gcSweepOne()) self.gcSweepEnterCallfin();
                 },
+                .callfin => try self.gcCallfinStep(),
             }
             // PUC incstep (lgc.c:1719): `else if (stres == atomicstep && !fast) break;`
             // Stop after the atomic phase transitions to sweep so that the
@@ -30013,23 +30265,23 @@ pub const Vm = struct {
             // guarantees cover only for the promote paths).
             if (self.gc_state == .sweep) return .{};
             if (cell.gc.age.isOld()) {
-                if (gcValueAge(value)) |age| {
-                    if (age.isYoung()) {
-                        // PUC luaC_barrier_ (lgc.c:246-260): reallymarkobject
-                        // (mark + queue for traversal) + setage(v, G_OLD0).
-                        // gcQueueScanObject sets GRAY and queues non-string
-                        // objects for traversal by gcDrainGray, ensuring
-                        // their children (e.g., metatables) are marked.
-                        // Using gcSetBlack here would mark the value BLACK
-                        // without traversing its children → children stay
-                        // WHITE → freed by sweep → use-after-free.
-                        const child_obj = GcObject.fromValue(value) orelse return .{};
-                        // gcQueueScanObject appends to gc_gray iff the
-                        // value is a non-string (strings go straight to
-                        // black).
-                        if (child_obj != .string) try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), 1);
-                        return .{ .gen_promote = true };
-                    }
+                const child_obj = GcObject.fromValue(value) orelse return .{};
+                // PUC luaC_barrier_ (lgc.c:246-260): reallymarkobject
+                // (mark + queue for traversal) + setage(v, G_OLD0) — for
+                // the WHITE child of an old owner regardless of age (a
+                // WHITE OLD child is the finalizer-dequeue shape).
+                // gcQueueScanObject sets GRAY and queues non-string
+                // objects for traversal by gcDrainGray, ensuring
+                // their children (e.g., metatables) are marked.
+                // Using gcSetBlack here would mark the value BLACK
+                // without traversing its children → children stay
+                // WHITE → freed by sweep → use-after-free.
+                if (gcIsWhite(gcPtr(child_obj).marked.*)) {
+                    // gcQueueScanObject appends to gc_gray iff the
+                    // value is a non-string (strings go straight to
+                    // black).
+                    if (child_obj != .string) try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), 1);
+                    return .{ .gen_promote = true };
                 }
             }
             return .{};
@@ -30054,7 +30306,10 @@ pub const Vm = struct {
                 }
                 return .{ .inc_mark = true };
             },
-            .sweep => return .{ .inc_make_white = true },
+            // PUC keepinvariant(g) is false from the sweep states through
+            // GCScallfin (lgc.h: gcstate >= GCSswpallgc): the barrier makes
+            // the OWNER white instead of marking the child.
+            .sweep, .callfin => return .{ .inc_make_white = true },
             .pause => return .{},
         }
     }
@@ -30324,12 +30579,12 @@ pub const Vm = struct {
     /// INFALLIBLE steps: `luaC_objbarrier(obj, mt)` (FORWARD barrier
     /// owner→metatable — for Tables AND Userdata; backward barriers are for
     /// value stores like lua_setiuservalue, never for the metatable pointer)
-    /// and `luaC_checkfinalizer(obj, mt)`. The Zig equivalent prepares every
-    /// fallible capacity (barrier worklist slots + the finalizables map)
-    /// BEFORE the observable store; commit performs only infallible
-    /// pointer/color/age/list surgery. On prepare failure nothing changed —
-    /// stack, metatable, age/color, worklists, finalizables, FINALIZEDBIT
-    /// and accounting are byte-exact.
+    /// and `luaC_checkfinalizer(obj, mt)` — pure pointer surgery in both
+    /// collectors. The Zig equivalent prepares every fallible capacity
+    /// (barrier worklist slots) BEFORE the observable store; commit performs
+    /// only infallible pointer/color/age/list surgery. On prepare failure
+    /// nothing changed — stack, metatable, age/color, worklists, list
+    /// membership, FINALIZEDBIT and accounting are byte-exact.
     pub const SetMetatablePlan = struct {
         barrier: MetatableBarrierPlan = .{},
         /// luaC_checkfinalizer: __gc present in the new metatable, object
@@ -30377,9 +30632,6 @@ pub const Vm = struct {
                 },
                 else => {},
             }
-            if (plan.needs_finalizer) {
-                try self.finalizables.ensureUnusedCapacity(self.infraAlloc(), 1);
-            }
 
             if (gen_minor and self.gc_state != .sweep) {
                 // PUC luaC_barrier_ guard: isblack(p) && iswhite(o); the
@@ -30404,7 +30656,10 @@ pub const Vm = struct {
                             plan.barrier.inc_mark = true;
                             try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), 1);
                         },
-                        .sweep => plan.barrier.inc_make_white = true,
+                        // PUC keepinvariant(g) is false from the sweep
+                        // states through GCScallfin (lgc.h): make the
+                        // owner white, not the child.
+                        .sweep, .callfin => plan.barrier.inc_make_white = true,
                         .pause => {},
                     }
                 }
@@ -30441,11 +30696,9 @@ pub const Vm = struct {
                 gcMakeWhite(gcPtr(owner).marked, self.gc_current_white);
             }
             if (plan.needs_finalizer) {
-                // registerFinalizable's commit half — every fallible part
-                // (map capacity) was reserved by prepare.
-                self.finalizables.putAssumeCapacity(owner, {});
-                gcPtr(owner).marked.* |= FINALIZEDBIT;
-                self.gc_finalizer_epoch +%= 1;
+                // luaC_checkfinalizer commit half: allgc → finobj is
+                // infallible pointer surgery (no capacity to reserve).
+                self.gcLinkFinalizable(owner);
             }
         }
         // mt == null: no new reference → no barrier (PUC luaC_objbarrier on
@@ -30596,12 +30849,12 @@ pub const Vm = struct {
         const child = GcObject.fromValue(value) orelse return; // PUC iscollectable(v)
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             // PUC luaC_barrierback → luaC_objbarrierback → luaC_barrierback_
-            // (lgc.c:268): old table + young child → remember the table for
-            // the next minor cycle. The child stays white (weak value
-            // pruning needs it unmarked).
+            // (lgc.c:268): old table + WHITE child (any age — lgc.h:248-249
+            // has no age test) → remember the table for the next minor
+            // cycle. The child stays white (weak value pruning needs it
+            // unmarked).
             if (table.gc.age.isOld()) {
-                const child_age = gcPtr(child).age.*;
-                if (child_age.isYoung()) {
+                if (gcIsWhite(gcPtr(child).marked.*)) {
                     const plan = try self.gcPrepareRememberObject(.{ .table = table });
                     self.gcCommitRememberObject(.{ .table = table }, plan);
                 }
@@ -30673,14 +30926,18 @@ pub const Vm = struct {
     /// child is young/white (a rare event in steady state).
     inline fn gcPrepareTableBarrierBackSlow(self: *Vm, table: *Table, child: GcObject) std.mem.Allocator.Error!BackBarrierPlan {
         // Generational mode: PUC luaC_barrierback → luaC_objbarrierback →
-        // luaC_barrierback_ (lgc.c:268). When an old table gets a young
+        // luaC_barrierback_ (lgc.c:268). When an old table gets a white
         // value/key, remember the table for re-traversal in the next minor
         // cycle. Do NOT mark the child — weak value pruning needs it to
-        // stay white.
+        // stay white. The guard is PUC's `isblack(p) && iswhite(o)`
+        // (lgc.h:248-249) — NO age test on the child: a WHITE OLD child
+        // is reachable in gen mode after a finalizer dequeue (makewhite
+        // preserves age); an age-filtered remember would leave it
+        // unmarked while the young sweep's positional region covers it —
+        // a live object freed.
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             if (table.gc.age.isOld()) {
-                const child_age = gcPtr(child).age.*;
-                if (child_age.isYoung()) {
+                if (gcIsWhite(gcPtr(child).marked.*)) {
                     return self.gcPrepareRememberObject(.{ .table = table });
                 }
             }
@@ -30923,8 +31180,8 @@ pub const Vm = struct {
         // [PUC lgc.c:1546-1547 saves+clears grayagain HERE, before
         // markobject. luazig defers the save+clear to gcDrainGrayagain
         // (Step 6). This is semantically equivalent because no backward
-        // barriers fire during Steps 1-5: atomic is mutator-paused, and
-        // only finalizers (Step 12, after Step 6) run mutator code.]
+        // barriers fire during Steps 1-5: atomic is mutator-paused and
+        // runs no finalizer bodies (they run post-sweep, in callfin).]
         //
         // [PUC lgc.c:1546: linkgclist(&L->gclist, g->grayagain) — the
         // running thread is linked to grayagain for re-traversal. luazig
@@ -30986,28 +31243,24 @@ pub const Vm = struct {
         try self.gcPruneWeakValues(self.gc_weak_tables.items);
 
         // ── Step 9 (lgc.c:1567): separatetobefnz(g, 0) ──
-        // Separate finalizable objects into gc_to_finalize (PUC's tobefnz).
-        // infraAlloc: PUC's tobefnz is an intrusive list — the separation
-        // never allocates; our temporary slice + queue append are host-side
-        // bookkeeping and must not re-enter the (possibly failing) adapter
-        // during an emergency GC.
-        const to_finalize = try self.gcCollectFinalizables();
-        defer self.infraAlloc().free(to_finalize);
-        try self.gc_to_finalize.appendSlice(self.infraAlloc(), to_finalize);
+        // Move unreachable (white) registered objects from finobj to the
+        // PERSISTENT tobefnz queue, appending at the tail — pure pointer
+        // surgery, exactly like PUC (the separation never allocates, so it
+        // cannot re-enter a failing allocator during an emergency GC).
+        // Entries already pending from earlier cycles stay AHEAD of the
+        // new batch (carry-over ordering).
+        self.gcSeparateTobefnz(false);
 
         // ── Step 10 (lgc.c:1568-1569): markbeingfnz(g) + propagateall(g) ──
-        // Mark to-be-finalized objects with ORDINARY GC marking. This is
-        // PUC's markbeingfnz (lgc.c:388: markobject on each tobefnz object)
-        // followed by propagateall. The "visited" mechanism for the
-        // finalizer-reachable graph IS the ordinary GC mark: marking the
-        // to-finalize objects and draining gray propagates through their
-        // entire reachable graph, keeping it alive for finalization.
-        // FINALIZEDBIT only means "registered for finalization" (set at
-        // registration, cleared after finalizer runs) — NOT a recursive
+        // Mark every PENDING object — the whole persistent tobefnz list,
+        // not just this cycle's batch — with ORDINARY GC marking, then
+        // drain gray. The "visited" mechanism for the finalizer-reachable
+        // graph IS the ordinary GC mark: marking the pending objects and
+        // draining gray propagates through their entire reachable graph,
+        // keeping it alive for finalization (resurrection). FINALIZEDBIT
+        // only means "registered for finalization" — NOT a recursive
         // visited-bit.
-        for (self.gc_to_finalize.items) |obj| {
-            if (obj.toValue()) |v| try self.gcMarkValue(v);
-        }
+        try self.gcMarkBeingFnz();
         try self.gcDrainGray();
 
         // ── Step 11 (lgc.c:1570-1577): post-resurrection convergence ──
@@ -31021,38 +31274,12 @@ pub const Vm = struct {
         try self.gcPruneWeakValues(self.gc_weak_tables.items);
         try self.gcPruneWeakKeys(self.gc_weak_tables.items);
 
-        // ── Step 12 (luazig-specific): run finalizers during atomic ──
-        // PUC runs finalizers in the callfin phase AFTER sweep. luazig
-        // runs them during atomic (architectural choice). Finalizers are
-        // mutator code and can trigger backward barriers that add to
-        // grayagain.
-        //
-        // PUC emergency GC (gcemergency=1) skips the callfin phase
-        // entirely (GCScallfin guard, lgc.c) — finalizers are arbitrary
-        // Lua that allocates and would re-enter the failing allocator.
-        // The separated objects stay marked (step 10 above) and keep
-        // their FINALIZEDBIT, so the NEXT regular cycle re-separates and
-        // finalizes them — exactly PUC's tobefnz carry-over semantics.
-        if (!self.gc_emergency) {
-            try self.gcFinalizeList(self.gc_to_finalize.items);
-        }
-
-        // ── Step 13 (luazig-specific): post-finalizer grayagain drain ──
-        // Drain grayagain entries created by finalizer barriers. PUC does
-        // not need this because finalizers run in a separate phase.
-        // Skip gcDrainGrayagain during minor cycles: grayagain is needed by
-        // gcCorrectGrayAgain for age promotion in gcSweepYoungGeneration.
-        // Finalizer-created young objects survive this cycle's sweep
-        // (they are beyond the young-objects snapshot) and will be
-        // marked when the grayagain entry is drained in the next cycle.
-        if (!self.gc_minor_cycle) {
-            try self.gcDrainGrayagain();
-        }
-        // Always drain gc_gray: finalizers may have added entries via
-        // forward barriers or gcMarkValue. Without this drain, objects
-        // queued by finalizer-triggered barriers would not be traversed
-        // until the next cycle, leaving their children unmarked.
-        try self.gcDrainGray();
+        // Finalizers do NOT run here: they run in the callfin phase after
+        // the sweep (PUC GCScallfin, lgc.c:1669-1681) — see gcCallfinStep
+        // and the generational finishgencycle drain. Objects created by
+        // finalizer bodies are therefore born AFTER this cycle's white
+        // flip and sweep, and can never be death-checked by the cycle
+        // that is running their creator.
 
         // ── Step 14 (lgc.c:1578): luaS_clearcache(g) ──
         // Shrink the interned-string table when it is less than a quarter
@@ -31173,6 +31400,14 @@ pub const Vm = struct {
                 // Set all surviving objects to OLD+BLACK, return to gen mode
                 self.gc_mode = .generational;
                 try self.gcMakeAllOld();
+                // PUC atomic2gen ends with finishgencycle (lgc.c:1407):
+                // callallpendingfinalizers drains the whole tobefnz
+                // (suppressed under an emergency collection — the queue
+                // persists for the next minor cycle's drain).
+                if (!self.gc_emergency) {
+                    self.gcDrainTobefnzAll(true);
+                    self.gcAllgcAssertSync();
+                }
                 self.gc_state = .propagate; // PUC finishgencycle: GCSpropagate
                 return;
             }
@@ -31355,10 +31590,10 @@ pub const Vm = struct {
             if (!beyond) {
                 const alive = !gcIsDead(p.marked.*, self.gc_current_white) or
                     (p.marked.* & FINALIZEDBIT) != 0 or
-                    p.age.* == .old0 or
-                    (gcCanFinalize(obj) and self.gcHasFinalizer(obj));
+                    p.age.* == .old0;
                 if (!alive) {
                     self.gcChainUnlinkAt(link, hdr, prev);
+                    if (@import("builtin").mode == .Debug) self.gcDebugMirrorRemove(obj);
                     self.gcFreeObject(obj, .sweep);
                     continue;
                 }
@@ -31397,31 +31632,40 @@ pub const Vm = struct {
         self.gcAllgcAssertSync();
     }
 
-    /// Debug-only checker: proves the canonical chain and its dense
-    /// mirror are the same sequence, member by member and in order —
-    /// equal lengths (no losses, no duplicates: a duplicate in a
-    /// null-terminated singly-linked list is a cycle, which the
-    /// walk-to-null plus the per-element index comparison catches),
-    /// and every header's tag dispatch (`gcFromHeader`, the
-    /// @fieldParentPtr downcast) resolves back to the mirror entry at
-    /// the same position. Runs at cycle boundaries (every finished
-    /// incremental cycle and every young sweep) on the whole battery in
-    /// Debug; compiled to a no-op in non-Debug builds.
+    /// Debug-only checker: proves the finalizer-ownership invariant —
+    /// every live GC object (the dense mirror) is a member of EXACTLY
+    /// ONE of {allgc, finobj, tobefnz} — using an allocation-free
+    /// census:
+    ///   1. mirror split: entries with FINALIZEDBIT set (count b) vs
+    ///      clear (count c); every clear entry must match the next
+    ///      allgc chain node in order (merge), and the chain must
+    ///      consume exactly c nodes — a registered object linked in
+    ///      the chain, a chain cycle or a lost node all break this;
+    ///   2. the finobj/tobefnz walks count their members (F, T) and
+    ///      require the bit SET on every member; F + T == b — a
+    ///      cross-list duplicate over-counts, a member without the
+    ///      bit fails direction, and a bit-set mirror entry missing
+    ///      from both lists under-counts.
+    /// Also re-proves the tag dispatch (`gcFromHeader`) on every
+    /// chain node and the tail invariants of all three lists. Runs at
+    /// cycle boundaries on the whole battery in Debug; compiled to a
+    /// no-op in non-Debug builds.
     fn gcAllgcAssertSync(self: *Vm) void {
         if (@import("builtin").mode != .Debug) return;
         const items = self.gc_objects.items;
         var cur = self.gc_allgc_head;
-        var i: usize = 0;
-        while (cur) |hdr| : ({
-            cur = hdr.next;
-            i += 1;
-        }) {
-            if (i >= items.len) @panic("gc allgc: chain longer than mirror");
-            const expect = items[i];
+        var bit_set: usize = 0;
+        for (items) |expect| {
+            if ((gcPtr(expect).marked.* & FINALIZEDBIT) != 0) {
+                bit_set += 1;
+                continue;
+            }
+            const hdr = cur orelse @panic("gc allgc: chain shorter than mirror");
             if (hdr != gcHeaderOf(expect)) @panic("gc allgc: chain/mirror order mismatch");
             if (!std.meta.eql(gcFromHeader(hdr), expect)) @panic("gc allgc: header tag downcast mismatch");
+            cur = hdr.next;
         }
-        if (i != items.len) @panic("gc allgc: chain shorter than mirror");
+        if (cur != null) @panic("gc allgc: chain longer than mirror");
         // Tail invariant: the stored tail is the walk's last node and its
         // link is null (or both are empty).
         if (self.gc_allgc_tail) |t| {
@@ -31429,11 +31673,30 @@ pub const Vm = struct {
         } else if (self.gc_allgc_head != null) {
             @panic("gc allgc: tail null but head set");
         }
+        var fin_members: usize = 0;
+        inline for (.{ &self.gc_finobj_head, &self.gc_tobefnz_head }) |list| {
+            var fin = list.*;
+            while (fin) |hdr| : (fin = hdr.next) {
+                if ((gcPtr(gcFromHeader(hdr)).marked.* & FINALIZEDBIT) == 0)
+                    @panic("gc finobj/tobefnz: member without FINALIZEDBIT");
+                fin_members += 1;
+            }
+        }
+        if (fin_members != bit_set)
+            @panic("gc finobj/tobefnz: live set partition mismatch");
+        if (self.gc_tobefnz_tail) |t| {
+            if (t.next != null) @panic("gc tobefnz: tail link is not null");
+        } else if (self.gc_tobefnz_head != null) {
+            @panic("gc tobefnz: tail null but head set");
+        }
     }
 
-    /// Debug-only mirror maintenance (see `gc_objects`): append at commit,
-    /// identity orderedRemove at unlink. Both run only in Debug builds —
-    /// the mirror exists solely to feed `gcAllgcAssertSync`.
+    /// Debug-only mirror maintenance (see `gc_objects`): the mirror is the
+    /// dense LIVE-set census in chain order — appended at commit, removed
+    /// only at an object's death (sweep/rollback), and re-queued at the
+    /// tail when a finalizer dequeue returns an object to the allgc chain.
+    /// Runs only in Debug builds — the mirror exists solely to feed
+    /// `gcAllgcAssertSync`.
     fn gcDebugMirrorAdd(self: *Vm, obj: GcObject) void {
         self.gc_objects.append(self.infraAlloc(), obj) catch @panic("oom: gc debug mirror");
     }
@@ -31446,7 +31709,12 @@ pub const Vm = struct {
                 return;
             }
         }
-        unreachable; // mirror/unlink divergence — checker invariant broken
+        unreachable; // mirror/death divergence — checker invariant broken
+    }
+
+    fn gcDebugMirrorRequeue(self: *Vm, obj: GcObject) void {
+        self.gcDebugMirrorRemove(obj);
+        self.gcDebugMirrorAdd(obj);
     }
 
     /// Test-only census helpers over the canonical chain (work in every
@@ -31454,6 +31722,29 @@ pub const Vm = struct {
     pub fn testGcChainLen(self: *Vm) usize {
         var n: usize = 0;
         var cur = self.gc_allgc_head;
+        while (cur) |hdr| : (cur = hdr.next) n += 1;
+        return n;
+    }
+
+    /// Test-only: FINALIZEDBIT membership — the object is registered for
+    /// finalization (a member of finobj or tobefnz).
+    pub fn testGcRegistered(self: *Vm, obj: GcObject) bool {
+        _ = self;
+        return (gcPtr(obj).marked.* & FINALIZEDBIT) != 0;
+    }
+
+    /// Test-only census of the registered list (finobj).
+    pub fn testGcFinobjLen(self: *Vm) usize {
+        var n: usize = 0;
+        var cur = self.gc_finobj_head;
+        while (cur) |hdr| : (cur = hdr.next) n += 1;
+        return n;
+    }
+
+    /// Test-only census of the pending-finalization queue (tobefnz).
+    pub fn testGcTobefnzLen(self: *Vm) usize {
+        var n: usize = 0;
+        var cur = self.gc_tobefnz_head;
         while (cur) |hdr| : (cur = hdr.next) n += 1;
         return n;
     }
@@ -31646,6 +31937,72 @@ pub const Vm = struct {
         }
     }
 
+    /// PUC markold over the finalizer lists (lgc.c:1345-1346:
+    /// `markold(g, g->finobj, g->finobjrold); markold(g, g->tobefnz,
+    /// NULL)`): age every OLD1 registered/pending member to OLD and
+    /// force re-traversal of the black ones, so young children stored in
+    /// a registered table (or touched by a pending object's graph)
+    /// survive the minor sweep. The whole-list walk with an .old1 filter
+    /// covers the same set as PUC's positional [finobj..finobjrold)
+    /// segment — old members simply fail the filter.
+    fn gcFinListsMarkOld(self: *Vm) std.mem.Allocator.Error!void {
+        var gray_need: usize = 0;
+        inline for (.{ &self.gc_finobj_head, &self.gc_tobefnz_head }) |list| {
+            var cur = list.*;
+            while (cur) |hdr| : (cur = hdr.next) {
+                if (gcPtr(gcFromHeader(hdr)).age.* == .old1) gray_need += 1;
+            }
+        }
+        if (gray_need > 0) try self.gc_gray.ensureUnusedCapacity(self.infraAlloc(), gray_need);
+        inline for (.{ &self.gc_finobj_head, &self.gc_tobefnz_head }) |list| {
+            var cur = list.*;
+            while (cur) |hdr| : (cur = hdr.next) {
+                const obj = gcFromHeader(hdr);
+                const p = gcPtr(obj);
+                if (p.age.* != .old1) continue;
+                p.age.* = .old;
+                if (gcIsBlack(p.marked.*)) {
+                    gcSetGray(p.marked);
+                    self.gc_gray.appendAssumeCapacity(obj);
+                }
+            }
+        }
+    }
+
+    /// PUC sweepgen over the finalizer lists (lgc.c:1361-1368: youngcollection
+    /// runs sweepgen over the finobj segments and the whole tobefnz):
+    /// advance the ages of the survivors — `.new` → `.survival` and back
+    /// to the current white; `.survival`/`.old0` → `.old1` with the
+    /// addedold accounting — keeping all other colors (BLACK) and ages.
+    /// No member can die here: after the atomic separation every list
+    /// member is marked (markbeingfnz or ordinary marking) or was made
+    /// current-white at registration during this cycle's sweep phase.
+    /// The grayagain linking of the main-chain promote arm does not
+    /// apply to these lists (PUC 5.5 sweepgen links nothing here, and
+    /// re-traversal coverage comes from gcFinListsMarkOld above).
+    fn gcFinListsSweepGen(self: *Vm) void {
+        const w = self.gc_current_white;
+        inline for (.{ &self.gc_finobj_head, &self.gc_tobefnz_head }) |list| {
+            var cur = list.*;
+            while (cur) |hdr| : (cur = hdr.next) {
+                const obj = gcFromHeader(hdr);
+                const p = gcPtr(obj);
+                std.debug.assert((p.marked.* & FINALIZEDBIT) != 0);
+                switch (p.age.*) {
+                    .new => {
+                        p.age.* = .survival;
+                        gcMakeWhite(&p.marked.*, w);
+                    },
+                    .survival, .old0 => {
+                        p.age.* = .old1;
+                        self.gc_gen_added_old_kb += @as(f64, @floatFromInt(gcObjectBytes(obj))) / 1024.0;
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+
     fn gcSweepYoungGeneration(self: *Vm) DispatchError!void {
         // PUC youngcollection (lgc.c:1351): `g->gcstate = GCSswpallgc`
         // BEFORE running sweepgen, so issweepphase() is true for any
@@ -31673,11 +32030,11 @@ pub const Vm = struct {
             self.gc_busy = false;
         }
 
-        self.gc_cycle_finalizer_epoch = self.gc_finalizer_epoch;
         // Pointer-form snapshots: the cycle-start tail bounds the
-        // death-checked prefix of the young sweep (finalizers run inside
-        // our atomic — a documented divergence — so their allocations
-        // must survive this cycle's young sweep unconditionally).
+        // death-checked prefix of the young sweep (finalizers run AFTER
+        // the sweep — the callfin/finishgencycle contract — but this
+        // monolithic window covers any mid-cycle allocation source, so
+        // beyond-snapshot nodes are kept unconditionally).
         self.gc_gen_snapshot = self.gc_allgc_tail;
         self.gc_gen_last_minor_visited = 0;
         self.gcResetCycleState();
@@ -31701,6 +32058,11 @@ pub const Vm = struct {
         // marked → freed during minor sweep → use-after-free.
         // PUC markold also advances age G_OLD1 → G_OLD here.
         try self.gcMarkOld1();
+        // PUC markold also covers the finalizer lists — markold(g, finobj,
+        // finobjrold) + markold(g, tobefnz, NULL), lgc.c:1345-1346: OLD1
+        // registered/pending objects are aged to OLD and re-traversed so
+        // their young children survive the minor sweep.
+        try self.gcFinListsMarkOld();
         // markold consumed the OLD1 set and its stop marker; the young
         // sweep below re-establishes `firstold1` from this cycle's
         // promotions (PUC: firstold1 = NULL between markold and sweepgen).
@@ -31773,6 +32135,14 @@ pub const Vm = struct {
         // minor→major transition. Checking before the sweep would see
         // addedold1=0 and never trigger the transition.
         try self.gcSweepYoungGeneration();
+        // PUC youngcollection sweeps the finalizer lists after the young
+        // generation (lgc.c:1361-1368: sweepgen over finobj segments and
+        // the whole tobefnz): advance the ages of registered/pending
+        // survivors — new → survival (+white), survival/old0 → old1
+        // (+addedold accounting) — so old registered objects eventually
+        // age out of the minor separation filter and wait for a major
+        // cycle, exactly like the positional PUC boundaries do.
+        self.gcFinListsSweepGen();
         const limit = self.gc_gen_major_base_kb * @as(f64, @floatFromInt(@max(gcApplyParam(self.gcparams[2], 100), 0))) / 100.0;
         if (limit > 0 and self.gc_gen_added_old_kb >= limit) {
             // PUC minor2inc: transition to incremental mode.
@@ -31780,10 +32150,10 @@ pub const Vm = struct {
             self.gc_mode = .incremental;
             self.gc_gen_major_start_kb = self.gc_count_kb;
             self.gc_auto_threshold_kb = self.gc_count_kb;
-            // PUC entersweep: start sweeping ALL objects from the beginning.
-            // The snapshot covers all objects that existed at this point;
-            // objects allocated during sweep (by finalizers) are beyond it
-            // and survive the sweep on their current-white color.
+            // PUC entersweep: start sweeping ALL objects from the
+            // beginning. Objects allocated during the sweep (by
+            // finalizers, which run in callfin after it) land beyond the
+            // cursor and survive on their current-white color.
             self.gc_sweep_last = null;
             self.gc_state = .sweep;
             // PUC minor2inc: luaE_setdebt(g, stepsize). Set debt so the
@@ -31797,6 +32167,15 @@ pub const Vm = struct {
             // marker, the young-sweep barriers are no-ops, the OLD0 entry
             // drains completed every overflow publication.
             std.debug.assert(!self.gc_gray_overflow);
+            // PUC finishgencycle (lgc.c:1292-1298): callallpendingfinalizers
+            // at the end of every (non-emergency) minor collection — the
+            // whole persistent tobefnz drains here, head first. Under an
+            // emergency collection finalizers never run (guard
+            // `!g->gcemergency`); the queue persists for the next cycle.
+            if (!self.gc_emergency) {
+                self.gcDrainTobefnzAll(true);
+            }
+            self.gcAllgcAssertSync();
             self.gcScheduleNextAutomaticCycle();
         }
     }
@@ -31809,10 +32188,12 @@ pub const Vm = struct {
     /// `last.next = victim.next` with the cursor holding still.
     ///
     /// Death check (PUC `isdead` + `tofinalize`): the object has the OTHER
-    /// white bit and is not registered for finalization. FINALIZEDBIT
-    /// objects are kept alive until their finalizer runs and clears the
-    /// bit (the fast-check equivalent of PUC's finobj/tobefnz lists that
-    /// the sweep never touches).
+    /// white bit and is not registered for finalization. Registered
+    /// objects never appear in the allgc chain (they live in
+    /// finobj/tobefnz until dequeued), so a set FINALIZEDBIT here would
+    /// be an ownership invariant violation — the checker proves
+    /// exclusivity; treating such a node as alive keeps a hypothetical
+    /// leak deterministic instead of a double-owned free.
     ///
     /// There is no snapshot bound: a newborn tail-append lands beyond the
     /// cursor holding the CURRENT white — the death check passes it and
@@ -31826,18 +32207,16 @@ pub const Vm = struct {
         const p = gcPtr(obj);
         const is_dead = gcIsDead(p.marked.*, self.gc_current_white) and
             (p.marked.* & FINALIZEDBIT) == 0;
-        // `gcCanFinalize` is the type-level check; `gcHasFinalizer` is
-        // the instance-level check (registered in `finalizables` set).
-        const has_finalizer = gcCanFinalize(obj) and self.gcHasFinalizer(obj);
-        if (is_dead and !has_finalizer) {
+        if (is_dead) {
             // Dead: unlink through the cursor's own slot (the predecessor
             // link) and free. The cursor does not move — the successor
             // gets examined by the next step.
             self.gcChainUnlinkAt(link, hdr, self.gc_sweep_last);
+            if (@import("builtin").mode == .Debug) self.gcDebugMirrorRemove(obj);
             self.gcFreeObject(obj, .sweep);
         } else {
-            // Alive (or has a finalizer to run): reset the mark to the
-            // current white for the next cycle.
+            // Alive: reset the mark to the current white for the next
+            // cycle.
             // PUC sweeplist (lgc.c): `curr->marked = (marked & maskmarks) | white`
             // where maskmarks = ~(BLACKBIT|WHITEBITS) preserves FINALIZEDBIT.
             // gcMakeWhite does the same: clears color bits, preserves
@@ -32028,9 +32407,8 @@ pub const Vm = struct {
     /// Check if an object has a registered finalizer (__gc metamethod).
     /// PUC: only tables and userdata can be registered for finalization
     /// (via lua_setmetatable → luaC_checkfinalizer, lapi.c:981,989).
-    /// Uses FINALIZEDBIT as the O(1) semantic membership test (PUC
-    /// `tofinalize(o)`, lgc.h:96). The `finalizables` HashSet is the
-    /// iterable container only — the bit is the single truth for membership.
+    /// FINALIZEDBIT is the O(1) semantic membership test (PUC
+    /// `tofinalize(o)`, lgc.h:96): set ⟺ member of finobj/tobefnz.
     fn gcHasFinalizer(self: *Vm, obj: GcObject) bool {
         _ = self;
         return (gcPtr(obj).marked.* & FINALIZEDBIT) != 0;
@@ -32978,129 +33356,6 @@ pub const Vm = struct {
                 if (drop) node.value = .Nil;
             }
         }
-    }
-
-    fn gcCollectFinalizables(self: *Vm) DispatchError![]GcObject {
-        // PUC separatetobefnz (lgc.c:1023): move dead (white) finalizable
-        // objects from finobj to tobefnz. We iterate the finalizables set
-        // (our finobj equivalent) and collect white (unreachable) objects
-        // into the result (our tobefnz equivalent).
-        // FINALIZEDBIT is set on ALL registered objects (at registration time,
-        // mirroring PUC luaC_checkfinalizer lgc.c:1088). It does NOT mean
-        // "already queued" — it means "registered for finalization". The
-        // white check is the sole liveness criterion, exactly as PUC's
-        // separatetobefnz uses iswhite(curr).
-        var to_finalize = std.ArrayListUnmanaged(GcObject).empty;
-        var it = self.finalizables.iterator();
-        while (it.next()) |entry| {
-            const obj = entry.key_ptr.*;
-            const p = gcPtr(obj);
-            if (self.gc_minor_cycle and !gcMinorCandidate(p.age.*)) continue;
-            // After atomic-phase drain, all reachable objects are black.
-            // A white object here is unreachable — queue it for __gc.
-            if (gcIsWhite(p.marked.*)) {
-                // infraAlloc: PUC's tobefnz is an intrusive list — the
-                // separation never allocates.
-                try to_finalize.append(self.infraAlloc(), obj);
-            }
-        }
-        return to_finalize.toOwnedSlice(self.infraAlloc());
-    }
-
-    fn gcFinalizeList(self: *Vm, to_finalize: []const GcObject) DispatchError!void {
-        self.gc_finalizers_ran_count = to_finalize.len;
-        // infraAlloc: the sort copy is host-side bookkeeping (PUC sorts the
-        // intrusive tobefnz list in place).
-        const ordered = try self.infraAlloc().dupe(GcObject, to_finalize);
-        defer self.infraAlloc().free(ordered);
-        std.sort.block(GcObject, ordered, self, gcFinalizeLessThan);
-        // PUC lgc.c:978-987: set GCSTPGC during finalizer execution to
-        // prevent reentrant GC. `collectgarbage()` called from __gc returns
-        // false (lua_gc returns -1, checkvalres pushes fail).
-        const old_gcstp = self.gc_stp;
-        self.gc_stp |= GCSTPGC;
-        defer self.gc_stp = old_gcstp;
-        for (ordered) |obj| {
-            // PUC udata2finalize (lgc.c:947-960): dequeue from tobefnz,
-            // return to allgc, reset FINALIZEDBIT, and makewhite — BEFORE
-            // GCTM resolves __gc on the current metatable. This ensures
-            // the bit is cleared even if the metatable is nil or has no
-            // __gc at finalization time. The makewhite prevents the sweep
-            // (which runs after atomic in luazig) from freeing the object
-            // in the current cycle — matching PUC where finalizers run
-            // after sweep and the object survives to the next cycle.
-            self.takeFinalizable(obj);
-            // Get the metatable and __gc metamethod for this object type.
-            const mt: ?*Table = switch (obj) {
-                .table => |t| t.metatable,
-                .userdata => |u| u.metatable,
-                else => null,
-            };
-            const m = mt orelse continue;
-            const gc = self.fastTm(m, .gc) orelse continue;
-            // The self argument is the object being finalized.
-            const self_val: Value = obj.toValue() orelse continue;
-            const call_args = &[_]Value{self_val};
-            _ = self.callFinalizer(gc, call_args) catch |e| switch (e) {
-                // PUC lgc.c:988-991: errors in __gc finalizers are reported
-                // through the warning channel via luaE_warnerror(L, "__gc"),
-                // which produces "error in __gc (<error message>)". In @store
-                // mode, this warning is saved in _WARN for the test to check.
-                error.RuntimeError => {
-                    const err_obj = self.protectedErrorValue();
-                    const err_msg: []const u8 = switch (err_obj) {
-                        .String => |s| s.bytes(),
-                        else => "error object is not a string",
-                    };
-                    // Build "error in __gc (<msg>)" and pass to warn.
-                    // PUC lstate.c:408-418 `luaE_warnerror` calls the warnf
-                    // handler per piece ("error in ", where, " (", msg, ")").
-                    // We build the full message and call `warnfHandler` once
-                    // with tocont=false — equivalent output for both default
-                    // and testC warnf (testC concatenates pieces into `buff`).
-                    var warn_buf: std.ArrayListUnmanaged(u8) = .empty;
-                    defer warn_buf.deinit(self.alloc);
-                    warn_buf.appendSlice(self.alloc, "error in __gc (") catch return error.OutOfMemory;
-                    warn_buf.appendSlice(self.alloc, err_msg) catch return error.OutOfMemory;
-                    warn_buf.append(self.alloc, ')') catch return error.OutOfMemory;
-                    self.warnfHandler(warn_buf.items, false) catch {};
-                    self.err = null;
-                    self.errThread().err_has_obj = false;
-                    self.errThread().err_obj = .Nil;
-                    continue;
-                },
-                else => return e,
-            };
-        }
-    }
-
-    /// PUC finalization order: objects are prepended to 'finobj' (LIFO),
-    /// then moved to 'tobefnz' preserving that order, and finalized from
-    /// the beginning. So the most recently created finalizable object is
-    /// finalized first. We use gc_seq (monotonic creation counter) descending.
-    fn gcFinalizeLessThan(self: *Vm, lhs: GcObject, rhs: GcObject) bool {
-        // For testC userdata rank (currently all objects return min rank,
-        // so this is a no-op until Userdata rank support is added).
-        const lr = self.testcFinalizeRankObj(lhs);
-        const rr = self.testcFinalizeRankObj(rhs);
-        if (lr != rr) return lr > rr;
-        // Same rank: sort by creation sequence descending (LIFO creation
-        // order). The sequence is set once at creation and never changed,
-        // (the sequence is stable — it is never rewritten after
-        // allocation). Only the
-        // finalizable types carry a sequence (P16.16 C1); the sort never
-        // sees another type, so the null case is unreachable in practice.
-        const lseq = gcFinalizableSeqPtr(lhs) orelse return false;
-        const rseq = gcFinalizableSeqPtr(rhs) orelse return true;
-        return lseq.* > rseq.*;
-    }
-
-    /// Rank helper for testC GC finalization ordering. Table-based userdata
-    /// emulation has been removed — real Userdata and LightUserdata are not
-    /// GcObject tables, so there is no table-ud ranking to do. All GcObject
-    /// types return min (no special rank).
-    fn testcFinalizeRankObj(_: *Vm, _: GcObject) i64 {
-        return std.math.minInt(i64);
     }
 
     const TextCompileResult = union(enum) {
@@ -38423,9 +38678,10 @@ pub const Vm = struct {
         // PUC separation of concerns: explicit close (f:close() / io.close)
         // only closes the OS resource — it does NOT touch the finalizer
         // registration. The userdata STAYS in the finalization lifecycle
-        // (FINALIZEDBIT remains set, stays in `finalizables`). The bit is
-        // cleared only at the GC finalization event via `takeFinalizable`
-        // (lgc.c:947-960 udata2finalize), which runs BEFORE resolving __gc.
+        // (FINALIZEDBIT remains set, membership in finobj/tobefnz is
+        // kept). The bit is cleared only at the GC finalization event by
+        // the tobefnz dequeue (lgc.c:947-960 udata2finalize), which runs
+        // BEFORE resolving __gc.
         //
         // This mirrors PUC's architecture: `aux_close` (liolib.c:213-218)
         // sets `closef = NULL` (marking the stream as closed) but does NOT
@@ -44322,9 +44578,16 @@ pub const Vm = struct {
     fn warnfHandler(self: *Vm, message: []const u8, tocont: bool) DispatchError!void {
         if (self.testc_warn_enabled) {
             return self.testcWarnf(message, tocont);
-        } else {
-            return self.defaultWarnf(message, tocont);
         }
+        if (self.c_warnf) |wf| {
+            // PUC luaE_warning (lstate.c): the state-level warnf installed
+            // through lua_setwarnf receives NUL-terminated pieces.
+            const z = self.alloc.dupeZ(u8, message) catch return;
+            defer self.alloc.free(z);
+            wf(self.c_warn_ud, z.ptr, if (tocont) 1 else 0);
+            return;
+        }
+        return self.defaultWarnf(message, tocont);
     }
 
     /// PUC lauxlib.c:1089-1099 `checkcontrol`. A control message is one where
@@ -48010,7 +48273,7 @@ pub const Vm = struct {
             if (std.mem.eql(u8, target, "sweepfinobj")) break :blk .sweep;
             if (std.mem.eql(u8, target, "sweeptobefnz")) break :blk .sweep;
             if (std.mem.eql(u8, target, "sweepend")) break :blk .sweep;
-            if (std.mem.eql(u8, target, "callfin")) break :blk .sweep;
+            if (std.mem.eql(u8, target, "callfin")) break :blk .callfin;
             if (std.mem.eql(u8, target, "pause")) break :blk .pause;
             return self.fail("T.gcstate: unknown state '{s}'", .{target});
         };
@@ -48022,12 +48285,14 @@ pub const Vm = struct {
             .propagate => 1,
             .atomic => 2,
             .sweep => 3,
+            .callfin => 4,
         };
         const target_rank: u3 = switch (want_state) {
             .pause => 0,
             .propagate => 1,
             .atomic => 2,
             .sweep => 3,
+            .callfin => 4,
         };
         if (target_rank < current_rank) {
             // Must cross pause first.
@@ -48062,6 +48327,7 @@ pub const Vm = struct {
             if (want_state == .propagate and self.gc_state == .propagate) break;
             if (want_state == .atomic and self.gc_state == .atomic) break;
             if (want_state == .sweep and self.gc_state == .sweep) break;
+            if (want_state == .callfin and self.gc_state == .callfin) break;
             if (want_state == .pause and self.gc_state == .pause) break;
 
             if (self.gc_state == .pause) break; // safety
@@ -48073,7 +48339,9 @@ pub const Vm = struct {
             } else if (self.gc_state == .atomic) {
                 try self.gcAtomicPhase();
             } else if (self.gc_state == .sweep) {
-                if (!try self.gcSweepOne()) try self.gcFinishCycle();
+                if (!try self.gcSweepOne()) self.gcSweepEnterCallfin();
+            } else if (self.gc_state == .callfin) {
+                try self.gcCallfinStep();
             }
         }
     }
@@ -55080,6 +55348,13 @@ fn p50IsRegistered(vm: *Vm, obj: GcObject) bool {
     while (cur) |hdr| : (cur = hdr.next) {
         if (hdr == want) return true;
     }
+    // Finalizer-ownership lists hold the registered/pending live objects.
+    inline for (.{ &vm.gc_finobj_head, &vm.gc_tobefnz_head }) |list| {
+        var fin = list.*;
+        while (fin) |hdr| : (fin = hdr.next) {
+            if (hdr == want) return true;
+        }
+    }
     return false;
 }
 
@@ -61408,7 +61683,7 @@ test "P16.50-review-6 B2: newmetatable shared path + per-edge OOM ownership" {
             try testing.expectEqual(base_stack_len + 1, Vm.cWindowCount(state.curThread()));
             const mt = state.curThread().stack[state.curThread().top - 1].Table;
             try testing.expect(p50IsRegistered(vm, .{ .table = mt }));
-            try testing.expect(!vm.finalizables.contains(.{ .table = mt }));
+            try testing.expect(!vm.testGcRegistered(.{ .table = mt }));
             try testing.expectEqual(mt, vm.apiRawGet(reg, .{ .String = key }).Table);
             // B2: metatable.__name == tname (PUC lauxlib.c:323) — the
             // interned name string, not a fresh copy.
@@ -61619,7 +61894,7 @@ const P50r7EmergencyAlloc = struct {
             // Emergency full GC from the failed allocation (PUC tryagain).
             // The conservative emergency scan never sees Zig locals —
             // whatever is not in a GC root at this moment is swept.
-            self.vm.testcEmergencyCollect();
+            self.vm.emergencyCollect();
         }
         return self.base.rawAlloc(len, alignment, ret_addr);
     }
@@ -61709,7 +61984,7 @@ test "P16.50-review-7 B2: newmetatable key survives emergency GC in allocTable" 
     try testing.expect(p50StillRegistered(vm, .{ .table = mt }));
     try testing.expect(p50StillRegistered(vm, .{ .string = key_post }));
     try testing.expectEqual(mt, vm.apiRawGet(reg, .{ .String = key_post }).Table);
-    try testing.expect(!vm.finalizables.contains(.{ .table = mt }));
+    try testing.expect(!vm.testGcRegistered(.{ .table = mt }));
 
     // Teardown: unpublish + unroot; the next full GC collects the table
     // (unpublished, unrooted) and clears the dead nil-valued registry
@@ -66505,16 +66780,14 @@ test "P16.50-review-14 2a: testC setmetatable runs the full lua_setmetatable pat
     // byte-exact (3 items) with NOTHING published; the first success
     // commits the store AND pops exactly the metatable ──
     // review-15 HIGH 2 (test honesty): a FRESH VM per iteration. The
-    // r13/r14 form deinit'd the live VM's GC lists (including
-    // `finalizables`) between iterations to force every reserve to
-    // allocate — a live-VM `finalizables.deinit` that review-14's prose
-    // wrongly claimed was fully removed. A fresh VM starts with all
-    // worklists genuinely empty (the exact state the manual resets
-    // simulated), so the same reserve edges are armed with no live-VM
-    // registry destruction at all. One honest consequence, asserted
-    // RELATIVELY below: a fresh VM's bootstrap registers the 3 standard
-    // io files (stdin/stdout/stderr managed file objects with __gc) in
-    // `finalizables`, so publication counts are checked against each
+    // r13/r14 form deinit'd the live VM's GC worklists between
+    // iterations to force every reserve to allocate. A fresh VM starts
+    // with all worklists genuinely empty (the exact state the manual
+    // resets simulated), so the same reserve edges are armed with no
+    // live-VM registry destruction at all. One honest consequence,
+    // asserted RELATIVELY below: a fresh VM's bootstrap registers the 3
+    // standard io files (stdin/stdout/stderr managed file objects with
+    // __gc) in finobj, so publication counts are checked against each
     // iteration's own pre-script baseline, not as absolute 0/1.
     {
         var boundary: ?usize = null;
@@ -66525,8 +66798,8 @@ test "P16.50-review-14 2a: testC setmetatable runs the full lua_setmetatable pat
             var scope = try vm_b.openRootScope(2, 0);
             defer scope.close();
             // OLD black owner + young white __gc metatable in generational
-            // minor mode (r13 setup): arms every transaction reserve
-            // (finalizables, gray, old1).
+            // minor mode (r13 setup): arms the transaction's reserve
+            // (gray; the registration move is infallible pointer surgery).
             _ = vm_b.gcControl(7, 0, -1); // LUA_GCGENERATIONAL
             _ = vm_b.gcControl(2, 0, -1); // LUA_GCCOLLECT
             const owner = try vm_b.apiNewTable();
@@ -66550,9 +66823,9 @@ test "P16.50-review-14 2a: testC setmetatable runs the full lua_setmetatable pat
             const win = Vm.TestcWin{ .vm = &vm_b, .th = mth, .off = 0 };
             // Pre-script baseline: every publication count below is
             // relative to THIS fresh VM's state (bootstrap io files are
-            // already in `finalizables`; the two setup collects left the
-            // mark worklists drained).
-            const fin_base = vm_b.finalizables.count();
+            // already registered; the two setup collects left the mark
+            // worklists drained).
+            const fin_base = vm_b.testGcFinobjLen();
             const gray_base = vm_b.gc_gray.items.len;
             const old1_base = vm_b.testGcCountAge(.old0);
             const grayagain_base = vm_b.gc_grayagain.items.len;
@@ -66576,8 +66849,8 @@ test "P16.50-review-14 2a: testC setmetatable runs the full lua_setmetatable pat
                 // PUC lua_setmetatable runs only the forward
                 // luaC_objbarrier). Exactly +1 over the fresh VM's own
                 // baseline (the bootstrap io files stay registered).
-                try testing.expect(vm_b.finalizables.contains(.{ .table = owner }));
-                try testing.expectEqual(fin_base + 1, vm_b.finalizables.count());
+                try testing.expect(vm_b.testGcRegistered(.{ .table = owner }));
+                try testing.expectEqual(fin_base + 1, vm_b.testGcFinobjLen());
                 try testing.expectEqual(gray_base + 1, vm_b.gc_gray.items.len);
                 try testing.expectEqual(old1_base + 1, vm_b.testGcCountAge(.old0));
                 try testing.expectEqual(grayagain_base, vm_b.gc_grayagain.items.len);
@@ -66586,7 +66859,7 @@ test "P16.50-review-14 2a: testC setmetatable runs the full lua_setmetatable pat
                 // the __gc registration persists (registered, not run).
                 _ = vm_b.gcControl(2, 0, -1); // LUA_GCCOLLECT — real full cycle
                 try testing.expect(owner.metatable == mt);
-                try testing.expect(vm_b.finalizables.contains(.{ .table = owner }));
+                try testing.expect(vm_b.testGcRegistered(.{ .table = owner }));
                 break;
             } else |e| {
                 try testing.expect(e == error.OutOfMemory);
@@ -66598,8 +66871,8 @@ test "P16.50-review-14 2a: testC setmetatable runs the full lua_setmetatable pat
                 // Nothing published pre-commit: the owner is absent and
                 // every worklist is back at its own baseline.
                 try testing.expect(owner.metatable == null);
-                try testing.expect(!vm_b.finalizables.contains(.{ .table = owner }));
-                try testing.expectEqual(fin_base, vm_b.finalizables.count());
+                try testing.expect(!vm_b.testGcRegistered(.{ .table = owner }));
+                try testing.expectEqual(fin_base, vm_b.testGcFinobjLen());
                 try testing.expectEqual(gray_base, vm_b.gc_gray.items.len);
                 try testing.expectEqual(old1_base, vm_b.testGcCountAge(.old0));
                 try testing.expectEqual(grayagain_base, vm_b.gc_grayagain.items.len);
@@ -66726,7 +66999,7 @@ const R14High2EmergencyAlloc = struct {
             // Emergency full GC from the failed allocation (PUC tryagain).
             // The conservative emergency scan never sees Zig locals —
             // whatever is not in a GC root at this moment is swept.
-            self.vm.testcEmergencyCollect();
+            self.vm.emergencyCollect();
         }
         const r = self.base.rawAlloc(len, alignment, ret_addr);
         if (r != null and len == @sizeOf(Table)) self.tables_seen += 1;
@@ -66780,7 +67053,7 @@ const R15B1EmergencyAlloc = struct {
             // Emergency full GC from the failed allocation (PUC tryagain).
             // The conservative emergency scan never sees Zig locals —
             // whatever is not in a GC root at this moment is swept.
-            self.vm.testcEmergencyCollect();
+            self.vm.emergencyCollect();
         }
         const r = self.base.rawAlloc(len, alignment, ret_addr);
         if (r != null and isObjectSize(len)) self.objects_seen += 1;
@@ -66844,7 +67117,7 @@ const R15B2EdgeEmergencyAlloc = struct {
             if (self.regular) {
                 self.vm.gcCycleFull() catch {};
             } else {
-                self.vm.testcEmergencyCollect();
+                self.vm.emergencyCollect();
             }
         }
         return self.base.rawAlloc(len, alignment, ret_addr);
@@ -68288,7 +68561,7 @@ fn a11s12Cf(L: ?*@import("c_api.zig").lua_State) callconv(.c) c_int {
     var nw_before: [32]u8 = undefined;
     @memcpy(nm_before[0..nm_len], nm[0..nm_len]);
     @memcpy(nw_before[0..nw_len], nw[0..nw_len]);
-    // Full collection with sweep — the same cycle testcEmergencyCollect
+    // Full collection with sweep — the same cycle emergencyCollect
     // runs (the emergency-GC path a C caller can trigger between
     // lua_getinfo and reading ar.source/ar.name).
     vm.gcFullCollectionForUser() catch return 0;
@@ -69468,7 +69741,7 @@ test "A1.1s4 proof b: poison oracle — emergency GC during suspension keeps ent
     // coroutine is parked at the yield: the conservative emergency scan
     // must mark the suspended body frame's parameter registers — the
     // tables' only reference — or the sweep traps them.
-    vm.testcEmergencyCollect();
+    vm.emergencyCollect();
 
     // Re-resume: the body derefs both tables (`a.x + b.x`). Alive →
     // [true, 30]; swept → the poison trap makes the deref fault loudly
@@ -69561,7 +69834,7 @@ test "A1.1s7 M14: wholesale window keeps the close-keeper alive across close-yie
             // object's only reference — or the sweep frees (and
             // poison-traps) it.
             switch (gc_form) {
-                .emergency => vm.testcEmergencyCollect(),
+                .emergency => vm.emergencyCollect(),
                 .full_gc => _ = vm.gcControl(2, 0, -1), // LUA_GCCOLLECT
             }
 

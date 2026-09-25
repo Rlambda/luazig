@@ -9911,11 +9911,27 @@ pub const Vm = struct {
     /// (GC-internal queues) under the emergency flags, so it cannot re-enter
     /// the failing boundary; failures are swallowed (the retry that follows
     /// may still fail → the caller reports OOM, as PUC's NULL return does).
+    ///
+    /// The nested collection is ALWAYS a full cycle. When it runs from
+    /// inside a generational minor's direct drain (the GCTM window), PUC's
+    /// fullgen → minor2inc (lgc.c:1306-1314, 1458-1460) clears the
+    /// finobjold1/finobjsur/finobjrold cutoffs before the cycle, so its
+    /// separatetobefnz traverses the WHOLE finobj list — an OLD finalizable
+    /// is separated exactly like a young one, and the weak/ephemeron
+    /// deadness checks see every object. gc_minor_cycle is this VM's
+    /// age-filter equivalent of those cutoffs, so it is dropped for the
+    /// nested collection's duration and restored afterwards: the outer
+    /// minor is still in flight, but its remaining work (the direct drain
+    /// and the post-drain reschedule) re-reads live state and never
+    /// consults the minor filters.
     fn emergencyCollect(self: *Vm) void {
         self.testc_emergency_active = true;
         defer self.testc_emergency_active = false;
         self.gc_emergency = true;
         defer self.gc_emergency = false;
+        const was_minor_cycle = self.gc_minor_cycle;
+        self.gc_minor_cycle = false;
+        defer self.gc_minor_cycle = was_minor_cycle;
         self.gcFullCollectionForUser() catch return;
     }
 
@@ -31638,15 +31654,29 @@ pub const Vm = struct {
                 // Set all surviving objects to OLD+BLACK, return to gen mode
                 self.gc_mode = .generational;
                 try self.gcMakeAllOld();
-                // PUC atomic2gen ends with finishgencycle (lgc.c:1407):
+                // PUC atomic2gen ends with finishgencycle (lgc.c:1292-1298,
+                // 1407): GCSpropagate is published BEFORE the direct drain,
+                // so finalizer-body barriers take the keepinvariant arm
+                // (luaC_barrier_ marks the white child of an old owner and
+                // promotes it to OLD0 instead of the GENMINOR-sweep no-op).
+                self.gc_state = .propagate;
                 // callallpendingfinalizers drains the whole tobefnz
                 // (suppressed under an emergency collection — the queue
                 // persists for the next minor cycle's drain).
                 if (!self.gc_emergency) {
                     self.gcDrainTobefnzAll(true);
                     self.gcAllgcAssertSync();
+                    // A nested emergency collection from a drain body owns
+                    // gc_state for its duration (PUC fullgen overwrites
+                    // gcstate the same way). On success it ends at pause —
+                    // a COMPLETED cycle, not live state — so re-publish the
+                    // gen-minor resting state (PUC's own finishgencycle
+                    // leaves GCSpropagate). An OOM-aborted nested cycle
+                    // leaves live mid-cycle state: leave it untouched; the
+                    // driving gcAdvance pass re-reads gc_state and finishes
+                    // the partial cycle.
+                    if (self.gc_state == .pause) self.gc_state = .propagate;
                 }
-                self.gc_state = .propagate; // PUC finishgencycle: GCSpropagate
                 return;
             }
             // Not enough collected: stay in major mode for another cycle

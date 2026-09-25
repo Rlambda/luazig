@@ -37,6 +37,17 @@
 ** every request and covers exactly one warning emission (warnf unfreezes
 ** on the closing piece); the deny-once window refuses a single request so
 ** the emergency retry succeeds and the body completes without any error.
+**
+** q8-q11 add the generational OLD-finalizable class: an object made OLD
+** by GCGEN + a full collect (PUC fullgen → atomic2gen sweep2old), its
+** root dropped, plus a young finalizable batch. The young minor's direct
+** drain hosts the nested emergency collection, which in PUC is ALWAYS a
+** full cycle (luaC_fullgc → fullgen → minor2inc clears the finobjold1/
+** finobjsur/finobjrold cutoffs, lgc.c:1306-1314): it separates the OLD
+** finalizable too (appending at the tobefnz tail, after the young batch)
+** and applies full weak/ephemeron semantics — no minor age filter. The
+** outer direct drain re-reads the head and runs the whole queue in the
+** same window: young newest-first, then the OLD object.
 */
 #include <stdio.h>
 #include <string.h>
@@ -160,21 +171,50 @@ static lua_State *case_state(void) {
     return L;
 }
 
-/* Arm `n` userdata objects with __gc = fin, each carrying its 1-based
-** payload byte, then drop them all as garbage. */
-static void arm_garbage(lua_State *L, lua_CFunction fin, int n) {
+/* Arm `n` userdata objects with __gc = fin, payloads `first`..
+** `first+n-1`, then drop them all as garbage. */
+static void arm_garbage_at(lua_State *L, lua_CFunction fin, int first, int n) {
     lua_newtable(L);
     lua_pushcfunction(L, fin);
     lua_setfield(L, -2, "__gc");
     int mt = lua_gettop(L);
-    for (int i = 1; i <= n; ++i) {
+    for (int i = 0; i < n; ++i) {
         lua_newuserdatauv(L, 1, 0);
-        *(unsigned char *)lua_touserdata(L, -1) = (unsigned char)i;
+        *(unsigned char *)lua_touserdata(L, -1) = (unsigned char)(first + i);
         lua_pushvalue(L, mt);
         lua_setmetatable(L, -2);
         lua_pop(L, 1);
     }
     lua_pop(L, 1);
+}
+
+static void arm_garbage(lua_State *L, lua_CFunction fin, int n) {
+    arm_garbage_at(L, fin, 1, n);
+}
+
+/* One finalizable userdata with the given payload, left on the stack. */
+static void arm_one(lua_State *L, lua_CFunction fin, int payload) {
+    lua_newuserdatauv(L, 1, 0);
+    *(unsigned char *)lua_touserdata(L, -1) = (unsigned char)payload;
+    lua_newtable(L);
+    lua_pushcfunction(L, fin);
+    lua_setfield(L, -2, "__gc");
+    lua_setmetatable(L, -2);
+}
+
+/* The q8 shape: an OLD finalizable (payload 9) aged by GCGEN + a full
+** collect with its root dropped, plus a young finalizable batch (1..n).
+** Runs one LUA_GCSTEP (the generational minor) and returns its rc. */
+static int gen_old_plus_young_step(lua_State *L, lua_CFunction fin, int n) {
+    arm_one(L, fin, 9);
+    lua_setglobal(L, "old");
+    lua_gc(L, LUA_GCGEN, 0);
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    lua_pushnil(L);
+    lua_setglobal(L, "old");
+    arm_garbage(L, fin, n);
+    if (!lua_checkstack(L, 100)) exit(3);
+    return lua_gc(L, LUA_GCSTEP, 0);
 }
 
 static void drain_seen(void) {
@@ -396,6 +436,166 @@ int main(void) {
                rc2, calls, seen, warn_pieces, warn_ends);
         if (rc2 != 0 || calls != 2 || strcmp(seen, "21") != 0)
             return fail("q7 second drain");
+    }
+
+    /* q8: the OLD finalizable in the generational minor drain. The old
+    ** object (9) is aged by GCGEN + a full collect, its root dropped;
+    ** the young pair (1, 2) is garbage. The step's minor separates only
+    ** the young pair (PUC finobjold1 cutoff); the drain runs 2 first,
+    ** whose body hits a real OOM — the nested emergency collection is a
+    ** FULL cycle (fullgen → minor2inc clears the cutoffs), so it
+    ** separates the OLD finalizable too and appends it at the tobefnz
+    ** tail; the outer direct drain re-reads the head and finishes the
+    ** whole queue in the same window: 2, 1, then 9. Later steps and the
+    ** close change nothing — exactly once, no late close. */
+    {
+        reset_case();
+        lua_State *L = case_state();
+        int rc1 = gen_old_plus_young_step(L, fin_oom, 2);
+        drain_seen();
+        printf("q8 step1: rc=%d calls=%d seen=%s pieces=%d ends=%d denied=%d frozen=%d\n",
+               rc1, calls, seen, warn_pieces, warn_ends, freeze_hits, frozen);
+        if (rc1 != 0) return fail("q8 step1 rc");
+        if (calls != 3 || strcmp(seen, "219") != 0) return fail("q8 step1 drain");
+        if (warn_pieces != 5 || warn_ends != 1) return fail("q8 warning pieces");
+        if (freeze_hits != 2) return fail("q8 denials");
+        if (frozen != 0) return fail("q8 unfreeze");
+        warn_reset();
+        for (int i = 2; i <= 4; ++i) {
+            int rc = lua_gc(L, LUA_GCSTEP, 0);
+            drain_seen();
+            printf("q8 step%d: rc=%d calls=%d seen=%s pieces=%d ends=%d\n",
+                   i, rc, calls, seen, warn_pieces, warn_ends);
+            if (rc != 0 || calls != 3 || strcmp(seen, "219") != 0)
+                return fail("q8 later step changed state");
+        }
+        lua_close(L);
+        drain_seen();
+        printf("q8 close: calls=%d seen=%s pieces=%d ends=%d\n",
+               calls, seen, warn_pieces, warn_ends);
+        if (calls != 3 || strcmp(seen, "219") != 0) return fail("q8 close drain");
+    }
+
+    /* q9: the OLD finalizable in a weak-VALUE graph. The old object is
+    ** dead (root dropped; only a weak table references it); a strongly
+    ** rooted control table sits in the same weak table. The outer minor
+    ** keeps both (the old object is black, and its weak table is old —
+    ** not re-traversed by a minor). The nested emergency FULL cycle
+    ** applies full weak semantics with no age filter: the dead old
+    ** value is cleared from the weak table, the live control survives,
+    ** and the old object is separated and finalized exactly once, after
+    ** the young pair. */
+    {
+        reset_case();
+        lua_State *L = case_state();
+        lua_newtable(L);                       /* w */
+        lua_newtable(L);                       /* w's mt: __mode="v" */
+        lua_pushstring(L, "v");
+        lua_setfield(L, -2, "__mode");
+        lua_setmetatable(L, -2);
+        lua_newtable(L);                       /* live control */
+        lua_setglobal(L, "live");
+        lua_getglobal(L, "live");
+        lua_setfield(L, -2, "live");           /* w.live = live */
+        lua_setglobal(L, "w");
+        arm_one(L, fin_oom, 9);
+        lua_setglobal(L, "old");
+        lua_gc(L, LUA_GCGEN, 0);
+        lua_gc(L, LUA_GCCOLLECT, 0);
+        lua_getglobal(L, "w");
+        lua_getglobal(L, "old");
+        lua_setfield(L, -2, "old");            /* w.old = old (weak value) */
+        lua_pop(L, 1);
+        lua_pushnil(L);
+        lua_setglobal(L, "old");               /* root dropped */
+        arm_garbage(L, fin_oom, 2);
+        if (!lua_checkstack(L, 100)) return 3;
+        int rc = lua_gc(L, LUA_GCSTEP, 0);
+        drain_seen();
+        printf("q9 step1: rc=%d calls=%d seen=%s pieces=%d ends=%d denied=%d\n",
+               rc, calls, seen, warn_pieces, warn_ends, freeze_hits);
+        if (rc != 0) return fail("q9 step1 rc");
+        if (calls != 3 || strcmp(seen, "219") != 0) return fail("q9 step1 drain");
+        lua_getglobal(L, "w");
+        lua_getfield(L, -1, "old");
+        int old_cleared = lua_isnil(L, -1);
+        lua_getfield(L, -2, "live");
+        int live_alive = !lua_isnil(L, -1);
+        lua_pop(L, 3);
+        printf("q9 weak: old_cleared=%d live_alive=%d\n", old_cleared, live_alive);
+        if (!old_cleared) return fail("q9 dead old weak value not cleared");
+        if (!live_alive) return fail("q9 live control lost");
+        lua_close(L);
+        drain_seen();
+        printf("q9 close: calls=%d seen=%s\n", calls, seen);
+        if (calls != 3 || strcmp(seen, "219") != 0) return fail("q9 close drain");
+    }
+
+    /* q10: the nested retry SUCCEEDS (deny-once). The single denial
+    ** runs the same nested emergency FULL collection — the OLD
+    ** finalizable is separated regardless of the body's eventual error
+    ** class — and the retried request succeeds, so the body completes
+    ** with NO error and NO warning. The whole queue still drains in
+    ** the same window. */
+    {
+        reset_case();
+        lua_State *L = case_state();
+        int rc1 = gen_old_plus_young_step(L, fin_oom_retry_ok, 2);
+        drain_seen();
+        printf("q10 step1: rc=%d calls=%d seen=%s pieces=%d ends=%d denied=%d\n",
+               rc1, calls, seen, warn_pieces, warn_ends, freeze_hits);
+        if (rc1 != 0) return fail("q10 step1 rc");
+        if (calls != 3 || strcmp(seen, "219") != 0) return fail("q10 step1 drain");
+        if (warn_pieces != 0 || warn_ends != 0) return fail("q10 no warning expected");
+        if (freeze_hits != 1) return fail("q10 single denial");
+        lua_close(L);
+        drain_seen();
+        printf("q10 close: calls=%d seen=%s pieces=%d ends=%d\n",
+               calls, seen, warn_pieces, warn_ends);
+        if (calls != 3 || strcmp(seen, "219") != 0) return fail("q10 close drain");
+    }
+
+    /* q11: after the nested emergency returns, the collector keeps
+    ** working. A rooted table survives the following minors AND a full
+    ** collect; new young finalizable garbage is separated and drained
+    ** by the next minor (exactly once, newest first); close adds
+    ** nothing. */
+    {
+        reset_case();
+        lua_State *L = case_state();
+        int rc1 = gen_old_plus_young_step(L, fin_oom, 2);
+        drain_seen();
+        printf("q11 step1: rc=%d calls=%d seen=%s pieces=%d ends=%d\n",
+               rc1, calls, seen, warn_pieces, warn_ends);
+        if (rc1 != 0 || calls != 3 || strcmp(seen, "219") != 0)
+            return fail("q11 step1 drain");
+        warn_reset();
+        lua_newtable(L);
+        lua_pushinteger(L, 42);
+        lua_setfield(L, -2, "x");
+        lua_setglobal(L, "keep");
+        arm_garbage_at(L, fin_ok, 3, 2);       /* young 3, 4 */
+        int rc2 = lua_gc(L, LUA_GCSTEP, 0);
+        drain_seen();
+        printf("q11 step2: rc=%d calls=%d seen=%s pieces=%d ends=%d\n",
+               rc2, calls, seen, warn_pieces, warn_ends);
+        if (rc2 != 0 || calls != 5 || strcmp(seen, "21943") != 0)
+            return fail("q11 next minor drain");
+        int rc3 = lua_gc(L, LUA_GCCOLLECT, 0);
+        lua_getglobal(L, "keep");
+        lua_getfield(L, -1, "x");
+        int keep_ok = (lua_isinteger(L, -1) && lua_tointeger(L, -1) == 42);
+        lua_pop(L, 2);
+        drain_seen();
+        printf("q11 collect: rc=%d calls=%d seen=%s keep_ok=%d\n",
+               rc3, calls, seen, keep_ok);
+        if (rc3 != 0 || calls != 5 || strcmp(seen, "21943") != 0)
+            return fail("q11 full collect drain");
+        if (!keep_ok) return fail("q11 rooted table lost");
+        lua_close(L);
+        drain_seen();
+        printf("q11 close: calls=%d seen=%s\n", calls, seen);
+        if (calls != 5 || strcmp(seen, "21943") != 0) return fail("q11 close drain");
     }
 
     printf("=== 29_finalizer_oom_queue DONE ===\n");

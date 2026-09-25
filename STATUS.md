@@ -135,6 +135,45 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   Residuals (backlog): growing-buffer-сайты (format/gsub/concat) и
   external-string-пути не переведены на resizebox-форму.
 
+- [x] **Parity BLOCKER, FIX-NOW: вложенная full-GC из generational
+  `__gc` наследует `gc_minor_cycle=true` внешнего цикла** (review
+  `fc06e65`). Внешний `gcMinorCollection` держит minor-context до
+  выхода; `gcDrainTobefnzAll` теперь разрешает emergency-retry в теле
+  финализатора, и вложенный `gcFullCollectionForUser` переключает
+  `gc_mode` на incremental, но не отключает `gc_minor_cycle`.
+  Поэтому `gcSeparateTobefnz` во вложенном *полном* цикле ошибочно
+  применяет age-фильтр minor и не переносит старый белый объект из
+  `finobj`; также minor-фильтры влияют на weak/ephemeron обработку.
+  PUC `fullgen` сначала делает `minor2inc(..., KGC_INC)`, затем
+  `entergen`: вложенный полный цикл не наследует minor-срез.
+  Независимый C-differential `/tmp/opencode/review_gen_nested.c`
+  (Debug+RF): старый недостижимый userdata `9`, молодые `1/2`,
+  первый молодой `__gc` вызывает реальный OOM. PUC после первого
+  `LUA_GCSTEP`: `calls=3 seen=219`; luazig: `calls=2 seen=21`,
+  старый `9` вызывается лишь при `lua_close`. Исправление должно
+  изолировать контекст вложенного full-cycle с корректным восстановлением
+  outer minor после возврата и проверить roots/возраст/weak ownership.
+  Прежний закрытый пункт nested-emergency остаётся закрыт для
+  incremental q1; этот дефект возник в открытом им gen-пути.
+  Open-count 25→26.
+  CLOSED (gen-nested correction): вложенный emergency full-cycle из
+  generational финализатора — ПОЛНЫЙ цикл (PUC fullgen = minor2inc→entergen,
+  lgc.c:1458+): (1) emergencyCollect save/clear/restore gc_minor_cycle —
+  вложенный цикл не наследует minor age-filter (gcSeparateTobefnz
+  young_candidate + weak/ephemeron фильтры видят полный контекст);
+  (2) atomic2gen: `.propagate` публикуется ДО drain (PUC finishgencycle
+  порядок — барьеры в теле берут keepinvariant-ветку) + условный
+  re-publish после успешной вложенной (pause→propagate); OOM-aborted
+  оставляет live state — устаревший outer state не перезаписывает
+  вложенный. Evidence: suite 29 q8 (reviewer-oracle: старый `9` + young
+  `1/2` + real-OOM в `2` → step1 calls=3 seen=219 warns=1 = PUC дословно,
+  все шаги + close) + q9/q10 (weak-граф; retry-успешен без warning;
+  следующий minor+full после возврата) — byte-identical PUC оба режима;
+  RED на fc06e65; mutation (drop сброса) RED→revert→GREEN.
+  Reviewer-oracle пересобран идентичен. Гейты: 358/358 D+RF; matrix
+  zig_fail=0; smoke 86/86; c_api 24-29 PASS оба режима; api580 GREEN
+  (Thread=3824 неизменен); fmt/diff-check clean.
+
 - [ ] **C API: `lua_pushvalue(lua_upvalueindex(n))` возвращает не upvalue
   (BLOCKER, ORDINARY-BACKLOG)**. Независимый C-оракул
   `/tmp/opencode/review_upvalue_push.c`: C closure захватывает строку

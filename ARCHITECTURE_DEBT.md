@@ -101,6 +101,21 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
 F2 (`lua_settop`/`lua_closeslot` error transport) остаётся открытым bounded
 parity-дефектом; F3 (forced-close region ownership) закрыт `9b1bad7`.
 
+4. **t2 call-window top-publication — research завершён (A1.next-t2),
+   готов к implementation-cut.** Класс 1: emergency-GC из fallible
+   аллокации при неопубликованном `th.top` (живые staged operands выше
+   top → nil-fill/UAF; PUC halfProtect lvm.c:1151+ поднимает L->top до
+   ci->top до MayGC). Рекомендован вариант B: единый MayGC-примитив
+   `publishFrameWindowForMayGC` (th.top = windowTop активного Lua-кадра;
+   обобщение protectSyncMetamethodWindow vm.zig:12726) на 6 emergency-
+   сайтах (opClosure/opConcat/opCall chain+growth/fast-spill/opTforcall/
+   opSetlist); debt-сайты сохраняют rolling limit (PUC checkGC-parity);
+   fast path не тронут; opCall slow +3–5 instr (cold). Ложные
+   комментарии-«доказательства» к удалению: vm.zig:9905, 31586, 30229,
+   ~46420, 17903 (класс 2). Отдельный класс 2: unrooted heap-ret staging
+   поперёк emergency-способного bcGrowFrame (RootScope-фикс, ортогонален
+   top-publication). Полный отчёт: /tmp/opencode/t2res_report.md.
+
 ## Embedding и stdlib ownership
 
 1. **Настоящий `lua_Alloc` bridge — confirmed design divergence, research

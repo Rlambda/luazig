@@ -174,6 +174,33 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   zig_fail=0; smoke 86/86; c_api 24-29 PASS оба режима; api580 GREEN
   (Thread=3824 неизменен); fmt/diff-check clean.
 
+- [ ] **Parity BLOCKER, ORDINARY-BACKLOG: timing финализаторов при
+  gen major→minor + вложенном OOM** (независимое ревью `5605b39`,
+  причина ещё не локализована). C-oracle
+  `/tmp/opencode/review_atomic2gen_nested.c`: generational mode,
+  два minor-step после массива из 256 таблиц, удаление root,
+  `majorminor=0`, два finalizable userdata; первый `__gc`
+  вызывает реальный allocator-OOM. PUC 5.5.0 после
+  `LUA_GCCOLLECT`: `calls=1 seen=2 warns=1`, после следующего
+  `LUA_GCSTEP`: `calls=2 seen=21`. Luazig Debug:
+  `calls=2 seen=21 warns=1` уже после `LUA_GCCOLLECT`.
+  Важная атрибуция: immutable `fc06e65` и `5605b39`
+  дают побайтово одинаковый вывод, следовательно эта correction
+  расхождение не внесла. Следующий решающий эксперимент: фиксировать
+  фактическую фазу/ветку `gcAtomicPhase` на обоих движках (PUC
+  `checkmajorminor/atomic2gen`, Zig `gc_gen_phase`) и отбор
+  `tobefnz` перед/после вложенной emergency, затем сделать focused
+  differential без предположения о конкретной ветке. Open-count 25→26.
+
+- [ ] **Safety BLOCKER (latent, класс 2 t2-research): unrooted heap-ret
+  staging поперёк emergency-способного `bcGrowFrame` в apply-путях**
+  (найдено A1.next-t2 research, bt-доказательство t2v_grow crash):
+  комментарии-доказательства «growth никогда не триггерит GC»
+  (vm.zig:17903) опровергнуты — heap-`ret` незакоренён поперёк
+  fallible-роста кадра. Fix-направение: RootScope вокруг staging;
+  ортогонален top-publication (класс 1); замер/proof в t2res_report
+  §класс-2. Open-count: 26 (после пункта gen major→minor) → 27.
+
 - [ ] **C API: `lua_pushvalue(lua_upvalueindex(n))` возвращает не upvalue
   (BLOCKER, ORDINARY-BACKLOG)**. Независимый C-оракул
   `/tmp/opencode/review_upvalue_push.c`: C closure захватывает строку
@@ -1266,6 +1293,25 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   предпосылка GC-миграции (оракульная evidence миграции достоверна).
   Fix-направление: вход в emergency поднимает th.top до окна кадра;
   OP_CLOSURE — поднимает до аллокаций (как OP_NEWTABLE).
+  A1.next-t2 research (read-only, /tmp/opencode/t2res_report.md):
+  negative-before воспроизведён на 5605b39 в Debug+RF (gdb: opClosure →
+  emergencyCollect при th.top=4, живое окно [4..15), slot 4 = pcall;
+  Step 15 nil-fill → OP_CALL видит Nil; PUC oracle true 1). Разбиение
+  классов: КЛАСС 1 (этот пункт, подтверждён) — emergency-GC из fallible
+  alloc при неопубликованном th.top; сайты opClosure/opConcat/opCall
+  chain+growth (crash!)/opCall fast-spill/opTforcall/opSetlist;
+  debt/gen-minor входы структурно безопасны (проверено). Рекомендованный
+  дизайн: вариант B — единый MayGC-примитив publishFrameWindowForMayGC
+  (halfProtect-форма: th.top = windowTop активного Lua-кадра;
+  обобщение protectSyncMetamethodWindow vm.zig:12726) на 6 emergency-
+  сайтах; debt-сайты сохраняют rolling limit; opCall slow +3-5 instr
+  (cold), fast path нетронут. КЛАСС 2 (НОВЫЙ, отдельный BLOCKER,
+  latent): unrooted heap-ret staging поперёк emergency-способного
+  bcGrowFrame в apply-путях — доказательство-комментарий vm.zig:17903
+  опровергнут bt (t2v_grow crash) → см. отдельный пункт ниже. Опровергнуты:
+  newborn Cells/Closure unrooting в opClosure (freereg+boxed-scan
+  безопасны); nested-finalizer timing — отдельный закрытый класс.
+  Готов к implementation-cut по варианту B + класс 2 отдельно.
 
 - [ ] **Parity HIGH (pre-existing, REDESIGN-констрейнт): yieldability
   pcall-recovery close (16118-ветка) расходится с PUC finishpcallk**:

@@ -676,6 +676,16 @@ const MASKCOLORS: u8 = BLACKBIT | WHITEBITS;
 /// after the successful append that records the queue entry.
 const MISSEDGRAYBIT: u8 = 1 << 7;
 
+/// Debug checker's transient VISITED flag: marked-byte bit 0 (bits 0-2
+/// carry no color semantics — see the layout comment above; every color
+/// helper masks bits 3-7). Set and cleared strictly within one
+/// `gcAllgcAssertSync` invocation: the entry invariant (clear on every
+/// live object) holds because the previous invocation cleared every bit
+/// it set, and objects created since got the full
+/// `marked = current_white & WHITEBITS` write at commit. No other code
+/// tests or writes bit 0.
+const GCVISITEDBIT: u8 = 1 << 0;
+
 /// PUC lgc.h:213-215: GC stop bits for `g->gcstp`.
 const GCSTPUSR: u8 = 1; // stopped by user
 const GCSTPGC: u8 = 2; // stopped by GC itself
@@ -731,7 +741,7 @@ fn gcSetBlack(marked: *u8) void {
 /// lets the commits use appendAssumeCapacity); a rejection changes only
 /// capacity — the commits paint the canonical color/age and set the
 /// overflow flags instead, and the GC's overflow drain completes the work
-/// by scanning `gc_objects`. Unlike the review-8/9 reserve→mutate→commit
+/// by scanning the canonical chain. Unlike the review-8/9 reserve→mutate→commit
 /// barriers (where a failed reserve aborts BEFORE any mutation), the close
 /// mutation must proceed regardless, so the failure is consumed here as
 /// an explicit "no spare capacity" outcome, never propagated.
@@ -3948,15 +3958,6 @@ pub const GcObject = union(enum) {
 /// Pointer bundle to the GC header fields on any GC-managed object.
 /// Returned by `gcPtr()`, used by generic GC code to access marked/age
 /// without switching on GcObject variant at every access site.
-/// `index` is null for strings: their header bytes 12..16 are the hash,
-/// and only the typed dense-removal paths may locate a string's registry
-/// position (sweep cursor / deferred compaction / linear rollback scan).
-/// P16.16 C1: no `seq` here — only the finalizable types (Table, Userdata)
-/// carry a creation sequence, accessed via `gcFinalizableSeq` at the single
-/// finalizer-sort site. No fake uniform field for non-finalizable types.
-/// Access the GC header fields (marked, age) of any GC-managed object
-/// through its GcObject tag. This is the single dispatch point that lets
-/// generic GC code operate on all types uniformly.
 const GcPtr = struct {
     marked: *u8,
     age: *GcAge,
@@ -4312,6 +4313,11 @@ pub const VmStats = struct {
     /// execution never reads it).
     gc_root_scope_sessions: u64 = 0,
 
+    /// OLD objects propagated during minor cycles (gcPropagateOne's
+    /// stats-gated arm). Regression oracle for "a minor collection
+    /// traverses only young + remembered objects"; default-off.
+    gc_minor_old_visited: u64 = 0,
+
     // ── Coroutines ──
     yields: u64 = 0,
     resumes: u64 = 0,
@@ -4361,12 +4367,22 @@ const TestcAllocControl = struct {
 /// allocation boundary PUC gives every C host; the emergency path is what
 /// makes a failing custom allocator observable as "separate pending
 /// finalizations, suppress their calls, retry" instead of a plain
-/// LUA_ERRMEM. Installed ONLY when the state was created with an explicit
-/// allocator function (`luaL_newstate` and internal states keep the plain
-/// allocator). Alignment: C `realloc` guarantees `max_align_t` (16 on the
-/// supported ABIs) suitability; the VM never requests a larger alignment
-/// through this path (natural object alignments only), so a larger
-/// request is a build-time-detectable contract violation — assert it.
+/// LUA_ERRMEM.
+///
+/// Installation boundary (contract): the bridge is installed by
+/// `lua_newstate` ONLY when the state was created with an explicit
+/// allocator function; `luaL_newstate`, internal VMs and every
+/// Zig-creation path (`Vm.init`, checkpanic sub-VMs, the CLI) keep the
+/// plain allocator — the bridge is never a second allocator for
+/// Zig-created states. If the testc adapter is later installed over a
+/// bridged state, the adapter wraps the bridge (its base is the bridge's
+/// allocator); teardown unwraps outermost-first (adapter → shared
+/// control → bridge — see Vm.deinit).
+///
+/// Alignment: C `realloc` guarantees `max_align_t` (16 on the supported
+/// ABIs) suitability; the VM never requests a larger alignment through
+/// this path (natural object alignments only), so a larger request is a
+/// build-time-detectable contract violation — assert it.
 pub const CAllocBridge = struct {
     alloc_fn: *const fn (?*anyopaque, ?*anyopaque, usize, usize) callconv(.c) ?*anyopaque,
     ud: ?*anyopaque,
@@ -4944,9 +4960,7 @@ pub const Vm = struct {
     // — sweep, rollback, teardown and every full pass walk it. Registered
     // finalizable objects LEAVE the chain (allgc → finobj → tobefnz →
     // back to the chain at finalizer dequeue); the three lists partition
-    // the live set (checker-proven). `gc_objects` below is a Debug-only
-    // mirror of the LIVE SET in chain order for the sync checker and
-    // carries no authority in any mode.
+    // the live set (checker-proven).
     gc_allgc_head: ?*GcHeader = null,
     gc_allgc_tail: ?*GcHeader = null,
     // Finalizer ownership lists (PUC lstate.h g->finobj/g->tobefnz): the
@@ -4962,14 +4976,6 @@ pub const Vm = struct {
     gc_finobj_head: ?*GcHeader = null,
     gc_tobefnz_head: ?*GcHeader = null,
     gc_tobefnz_tail: ?*GcHeader = null,
-    /// Debug-only order-preserving mirror of the live set (chain order;
-    /// `builtin.mode == .Debug` maintenance): appended at commit, removed
-    /// at death, re-queued at the tail on finalizer dequeue. Exists solely
-    /// so `gcAllgcAssertSync` can cross-validate the three intrusive
-    //  lists against an independently maintained dense sequence (full
-    //  coverage, no losses/duplicates). Never compiled into hot paths of
-    //  non-Debug builds.
-    gc_objects: std.ArrayListUnmanaged(GcObject) = .empty,
     // (P16.10b Task 6) The old VM-global `pinned_source_strings` list is
     // RETIRED: source pins now live on each tree's root Proto (CUT2)
     // (`source_backing.pinned`) and are marked through the closure
@@ -5080,8 +5086,6 @@ pub const Vm = struct {
     /// no reset needed at cycle start.
     gc_atomic_clear_head: ?*Thread = null,
     gc_gen_threads: std.ArrayListUnmanaged(*Thread) = .empty,
-    gc_gen_last_minor_visited: usize = 0,
-    gc_gen_last_minor_old_visited: usize = 0,
     gc_minor_cycle: bool = false,
 
     // Persistent incremental collector state. Mark sets and gray/weak queues
@@ -5125,13 +5129,14 @@ pub const Vm = struct {
     /// tables/closures/threads/strings. PUC has a single gray list with a
     /// tagged-union GCObject; this is the Zig-idiomatic equivalent.
     gc_gray: std.ArrayListUnmanaged(GcObject) = .empty,
+    /// Lossless accelerator over the canonical lists (no ownership):
+    /// every table painted non-white by the mark phase is inserted here
+    /// (dedup put in gcPropagateOne's table arm, infraAlloc — PUC's mark
+    /// phase allocates nothing). Consumed by gcClearDeadKeys so the
+    /// dead-key pass visits only marked tables (O(marked), not
+    /// O(live-set)); cleared at cycle start alongside the other mark sets.
     gc_marked_tables: std.AutoHashMapUnmanaged(*Table, void) = .{},
-    gc_marked_closures: std.AutoHashMapUnmanaged(*Closure, void) = .{},
-    gc_marked_threads: std.AutoHashMapUnmanaged(*Thread, void) = .{},
     gc_weak_tables: std.ArrayListUnmanaged(*Table) = .empty,
-    gc_fin_tables: std.AutoHashMapUnmanaged(*Table, void) = .{},
-    gc_fin_closures: std.AutoHashMapUnmanaged(*Closure, void) = .{},
-    gc_fin_threads: std.AutoHashMapUnmanaged(*Thread, void) = .{},
     /// Incremental sweep cursor: the last node examined and KEPT alive
     /// (null = the sweep starts at the chain head). The next victim is
     /// always `last.next` (or the head), so the step's unlink is the
@@ -5140,15 +5145,6 @@ pub const Vm = struct {
     /// color keeps it alive through this cycle's death check, replacing
     /// the retired snapshot bound.
     gc_sweep_last: ?*GcHeader = null,
-    gc_alloc_tables: usize = 0,
-    // Allocation sites and the dispatch loop periodically *check* this debt
-    // threshold. They no longer run a full collection merely because a fixed
-    // number of VM instructions elapsed: doing so repeatedly rescanned a large
-    // live heap and made repeated dynamic-load workloads quadratic. Like PUC's
-    // pause/debt model,
-    // the next automatic cycle is scheduled from the live heap size left by the
-    // previous cycle.
-    gc_alloc_threshold: usize = 20000,
     gc_auto_threshold_kb: f64 = 32768.0,
     /// PUC GCdebt analogue — kept on Vm (not tracker) for exact behavioral
     /// match with the pre-tracking-allocator code.
@@ -5179,9 +5175,6 @@ pub const Vm = struct {
     /// cases (the minor2inc threshold write mid-sweep; the count clamped
     /// at 0 drifting the debt upward — the safe, later-firing direction).
     gc_step_debt_kb: f64 = 32768.0,
-    gc_tick: usize = 0,
-    gc_inst: usize = 0,
-    gc_last_table_inst: usize = 0,
     /// Approximate GC memory counter for GC PACING ONLY.
     /// `collectgarbage("count")` reads the accurate `tracker.total_bytes`
     /// instead. This counter is kept for threshold calculations because
@@ -5270,10 +5263,6 @@ pub const Vm = struct {
     testc_obj_threads: usize = 0,
     testc_obj_strings: usize = 0,
     testc_obj_userdata: usize = 0,
-    // "Allocation-based" triggering is too limited (strings/functions also
-    // allocate). To keep the upstream GC tests progressing, also run a
-    // best-effort cycle periodically based on VM instruction count.
-    gc_tick_threshold: usize = 20000,
 
     /// P15.33: Cached hook-active flag. Updated by `refreshHooksCached()`
     /// whenever debug.sethook modifies hook state, so the dispatch loop only
@@ -6819,23 +6808,16 @@ pub const Vm = struct {
         // P15.51n: Free pending call storage AFTER drainGcRegistries, which
         // calls freeThreadBytecodeFrames → getPendingCallPtr on each thread.
         self.pending_calls.deinit(self.alloc);
-        // P16.50-review-5: teardown tail — restore the pre-adapter base
-        // allocator, then release the adapter and the shared control LAST.
-        // A checkpanic sub-VM BORROWS the parent's control (borrowed=true)
-        // and must not free it — the parent, as the allocation owner, frees
-        // it exactly once here. Both objects were allocated via the BASE
-        // allocator (uncounted — PUC's l_memcontrol lives in static memory),
-        // so they are destroyed through base after the restore.
-        // C-allocator bridge teardown: every VM-owned allocation has been
-        // freed through the bridge by now; restore the backing allocator
-        // (the one that allocated the bridge object itself) and destroy
-        // the bridge.
-        if (self.c_alloc_bridge) |bridge| {
-            const backing = std.heap.c_allocator;
-            self.alloc = backing;
-            backing.destroy(bridge);
-            self.c_alloc_bridge = null;
-        }
+        // P16.50-review-5: teardown tail. Layered-allocator discipline:
+        // the testc adapter (when present) is the OUTER wrapper — it may
+        // wrap the C-allocator bridge as its base — so it must be
+        // released BEFORE the bridge it wraps; each layer restores the
+        // allocator to the one below it. A checkpanic sub-VM BORROWS the
+        // parent's control (borrowed=true) and must not free it — the
+        // parent, as the allocation owner, frees it exactly once here.
+        // Both objects were allocated via the BASE allocator (uncounted —
+        // PUC's l_memcontrol lives in static memory), so they are
+        // destroyed through base after the restore.
         if (self.testc_alloc_adapter) |adapter| {
             const base = self.testc_alloc_base.?;
             self.alloc = base;
@@ -6851,9 +6833,22 @@ pub const Vm = struct {
             self.testc_alloc_adapter = null;
             self.testc_alloc_base = null;
         }
+        // The shared control dies through the allocator that created it
+        // (infraAlloc — the pre-adapter base, which is also the restored
+        // allocator now), BEFORE the bridge that base may wrap.
         if (self.testc_ctrl) |c| {
             if (!self.testc_ctrl_borrowed) self.alloc.destroy(c);
             self.testc_ctrl = null;
+        }
+        // C-allocator bridge teardown: every VM-owned allocation has been
+        // freed through the bridge by now; restore the backing allocator
+        // (the one that allocated the bridge object itself) and destroy
+        // the bridge.
+        if (self.c_alloc_bridge) |bridge| {
+            const backing = std.heap.c_allocator;
+            self.alloc = backing;
+            backing.destroy(bridge);
+            self.c_alloc_bridge = null;
         }
     }
 
@@ -6894,16 +6889,9 @@ pub const Vm = struct {
         self.gc_gen_young_prev = null;
         self.gc_gen_snapshot = null;
         self.gc_sweep_last = null;
-        if (@import("builtin").mode == .Debug) self.gc_objects.clearRetainingCapacity();
-        self.gc_objects.deinit(self.alloc);
         self.gc_gray.deinit(self.alloc);
         self.gc_marked_tables.deinit(self.alloc);
-        self.gc_marked_closures.deinit(self.alloc);
-        self.gc_marked_threads.deinit(self.alloc);
         self.gc_weak_tables.deinit(self.alloc);
-        self.gc_fin_tables.deinit(self.alloc);
-        self.gc_fin_closures.deinit(self.alloc);
-        self.gc_fin_threads.deinit(self.alloc);
         self.gc_grayagain.deinit(self.alloc);
         self.gc_gen_threads.deinit(self.alloc);
         self.gc_root_values.deinit(self.alloc);
@@ -10305,7 +10293,6 @@ pub const Vm = struct {
         const obj = gcFromHeader(hdr);
         gcPtr(obj).marked.* &= ~FINALIZEDBIT;
         if (makewhite) gcMakeWhite(gcPtr(obj).marked, self.gc_current_white);
-        if (@import("builtin").mode == .Debug) self.gcDebugMirrorRequeue(obj);
         return obj;
     }
 
@@ -10579,7 +10566,6 @@ pub const Vm = struct {
             self.gc_allgc_head = hdr;
         }
         self.gc_allgc_tail = hdr;
-        if (@import("builtin").mode == .Debug) self.gcDebugMirrorAdd(obj);
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             p.age.* = .new;
             // The young region extends to the tail; opening an empty
@@ -10657,7 +10643,6 @@ pub const Vm = struct {
             unreachable; // rollback of an unregistered object
         }
         self.gcChainUnlinkAt(ps, victim, prev);
-        if (@import("builtin").mode == .Debug) self.gcDebugMirrorRemove(obj);
         // Purge the object from every GC carry-over work list. The failing
         // allocation that triggered this rollback ran an EMERGENCY full GC
         // first (allocFn retry, PUC luaM_realloc_ tryagain) — that cycle
@@ -10848,8 +10833,6 @@ pub const Vm = struct {
     /// savedpc already saved by the interpreter's savestate).
     fn allocTable(self: *Vm, ctx: ?*BytecodeDispatchCtx) DispatchError!*Table {
         const t = try self.allocTableNoGc();
-        self.gc_alloc_tables += 1;
-        self.gc_last_table_inst = self.gc_inst;
 
         // PUC luaC_condGC: if GCdebt <= 0, run a step. gc_step_debt_kb is
         // decremented by gcNoteAlloc on every allocation. The gcAutoCycleDue
@@ -10859,7 +10842,6 @@ pub const Vm = struct {
         if (self.gc_running and !self.gc_busy and
             (self.gc_step_debt_kb <= 0 or self.gcAutoCycleDue()))
         {
-            self.gc_alloc_tables = 0;
             // Protect the just-allocated table: it is registered but has
             // not yet been returned to the caller and therefore is not in
             // a Lua root. This is the non-moving equivalent of keeping it
@@ -29121,10 +29103,11 @@ pub const Vm = struct {
                     // BLOCKER 2: color is NOT membership — grayagain
                     // objects and open cells are also gray) instead of
                     // propagating bare: the drain re-queues marker-bearing
-                    // objects from gc_objects when gc_gray empties, so an
-                    // aborted mark step never loses the work. The caller
-                    // still sees the OOM (the GC step aborts), but the
-                    // next cycle recovers without a full re-mark.
+                    // objects by walking the canonical chain when gc_gray
+                    // empties, so an aborted mark step never loses the
+                    // work. The caller still sees the OOM (the GC step
+                    // aborts), but the next cycle recovers without a full
+                    // re-mark.
                     p.marked.* |= MISSEDGRAYBIT;
                     self.gc_gray_overflow = true;
                     return e;
@@ -29881,12 +29864,7 @@ pub const Vm = struct {
         // cycle starts, emergency aborts, GCSTOP windows and mode switches;
         // only a completed finalizer dequeues from it).
         self.gc_marked_tables.clearRetainingCapacity();
-        self.gc_marked_closures.clearRetainingCapacity();
-        self.gc_marked_threads.clearRetainingCapacity();
         self.gc_weak_tables.clearRetainingCapacity();
-        self.gc_fin_tables.clearRetainingCapacity();
-        self.gc_fin_closures.clearRetainingCapacity();
-        self.gc_fin_threads.clearRetainingCapacity();
         // Reset marked KB counter for checkmajorminor (PUC GCmarked per cycle).
         self.gc_gen_marked_kb = 0;
     }
@@ -31313,9 +31291,9 @@ pub const Vm = struct {
         // queued gray and drained; generational old threads are queued by
         // the gc_gen_threads root loop) — exactly PUC's grayagain-linked
         // threads. Unreachable threads are never traversed, never linked:
-        // their stacks die whole in the sweep (the old form scanned all of
-        // gc_objects for them — clearing soon-freed garbage was pure
-        // waste). Runs after all marking (Step 13) and
+        // their stacks die whole in the sweep (a full live-set scan for
+        // them would only clear soon-freed garbage — pure waste). Runs
+        // after all marking (Step 13) and
         // finalizers (Step 12) and before every sweep path that leaves
         // gcAtomicCommon (incremental sweep, gen atomic2gen sweep, minor
         // young sweep).
@@ -31593,7 +31571,6 @@ pub const Vm = struct {
                     p.age.* == .old0;
                 if (!alive) {
                     self.gcChainUnlinkAt(link, hdr, prev);
-                    if (@import("builtin").mode == .Debug) self.gcDebugMirrorRemove(obj);
                     self.gcFreeObject(obj, .sweep);
                     continue;
                 }
@@ -31632,40 +31609,38 @@ pub const Vm = struct {
         self.gcAllgcAssertSync();
     }
 
-    /// Debug-only checker: proves the finalizer-ownership invariant —
-    /// every live GC object (the dense mirror) is a member of EXACTLY
-    /// ONE of {allgc, finobj, tobefnz} — using an allocation-free
-    /// census:
-    ///   1. mirror split: entries with FINALIZEDBIT set (count b) vs
-    ///      clear (count c); every clear entry must match the next
-    ///      allgc chain node in order (merge), and the chain must
-    ///      consume exactly c nodes — a registered object linked in
-    ///      the chain, a chain cycle or a lost node all break this;
-    ///   2. the finobj/tobefnz walks count their members (F, T) and
-    ///      require the bit SET on every member; F + T == b — a
-    ///      cross-list duplicate over-counts, a member without the
-    ///      bit fails direction, and a bit-set mirror entry missing
-    ///      from both lists under-counts.
-    /// Also re-proves the tag dispatch (`gcFromHeader`) on every
-    /// chain node and the tail invariants of all three lists. Runs at
-    /// cycle boundaries on the whole battery in Debug; compiled to a
-    /// no-op in non-Debug builds.
+    /// Debug-only checker: proves the three-list lifetime partition
+    /// self-sufficiently, with no auxiliary census structure. Walks each
+    /// of {allgc, finobj, tobefnz} using GCVISITEDBIT as a per-run
+    /// membership flag: a second arrival at an already-flagged node is a
+    /// cross-list duplicate or a cycle within one list — both are
+    /// ownership violations, and the flag also bounds every walk (a
+    /// cyclic list re-arrives at its first node instead of looping
+    /// forever). FINALIZEDBIT direction is proven per member (clear in
+    /// allgc, set in finobj/tobefnz), and the tag dispatch is re-proven
+    /// on every node via the gcFromHeader/gcHeaderOf round trip. Tail
+    /// invariants: a stored tail has a null link, and head/tail are both
+    /// empty or both set. Runs at cycle boundaries on the whole battery
+    /// in Debug; compiled to a no-op in non-Debug builds.
     fn gcAllgcAssertSync(self: *Vm) void {
         if (@import("builtin").mode != .Debug) return;
-        const items = self.gc_objects.items;
-        var cur = self.gc_allgc_head;
-        var bit_set: usize = 0;
-        for (items) |expect| {
-            if ((gcPtr(expect).marked.* & FINALIZEDBIT) != 0) {
-                bit_set += 1;
-                continue;
+        inline for (.{ &self.gc_allgc_head, &self.gc_finobj_head, &self.gc_tobefnz_head }, .{ false, true, true }) |list, fin_bit| {
+            var cur = list.*;
+            while (cur) |hdr| : (cur = hdr.next) {
+                if ((hdr.marked & GCVISITEDBIT) != 0)
+                    @panic("gc lifetime lists: duplicate membership (cross-list duplicate or cycle)");
+                hdr.marked |= GCVISITEDBIT;
+                const obj = gcFromHeader(hdr);
+                if (gcHeaderOf(obj) != hdr) @panic("gc lifetime lists: header tag downcast mismatch");
+                const has_bit = (gcPtr(obj).marked.* & FINALIZEDBIT) != 0;
+                if (has_bit != fin_bit)
+                    @panic("gc lifetime lists: FINALIZEDBIT direction mismatch");
             }
-            const hdr = cur orelse @panic("gc allgc: chain shorter than mirror");
-            if (hdr != gcHeaderOf(expect)) @panic("gc allgc: chain/mirror order mismatch");
-            if (!std.meta.eql(gcFromHeader(hdr), expect)) @panic("gc allgc: header tag downcast mismatch");
-            cur = hdr.next;
         }
-        if (cur != null) @panic("gc allgc: chain longer than mirror");
+        inline for (.{ &self.gc_allgc_head, &self.gc_finobj_head, &self.gc_tobefnz_head }) |list| {
+            var cur = list.*;
+            while (cur) |hdr| : (cur = hdr.next) hdr.marked &= ~GCVISITEDBIT;
+        }
         // Tail invariant: the stored tail is the walk's last node and its
         // link is null (or both are empty).
         if (self.gc_allgc_tail) |t| {
@@ -31673,17 +31648,6 @@ pub const Vm = struct {
         } else if (self.gc_allgc_head != null) {
             @panic("gc allgc: tail null but head set");
         }
-        var fin_members: usize = 0;
-        inline for (.{ &self.gc_finobj_head, &self.gc_tobefnz_head }) |list| {
-            var fin = list.*;
-            while (fin) |hdr| : (fin = hdr.next) {
-                if ((gcPtr(gcFromHeader(hdr)).marked.* & FINALIZEDBIT) == 0)
-                    @panic("gc finobj/tobefnz: member without FINALIZEDBIT");
-                fin_members += 1;
-            }
-        }
-        if (fin_members != bit_set)
-            @panic("gc finobj/tobefnz: live set partition mismatch");
         if (self.gc_tobefnz_tail) |t| {
             if (t.next != null) @panic("gc tobefnz: tail link is not null");
         } else if (self.gc_tobefnz_head != null) {
@@ -31691,34 +31655,8 @@ pub const Vm = struct {
         }
     }
 
-    /// Debug-only mirror maintenance (see `gc_objects`): the mirror is the
-    /// dense LIVE-set census in chain order — appended at commit, removed
-    /// only at an object's death (sweep/rollback), and re-queued at the
-    /// tail when a finalizer dequeue returns an object to the allgc chain.
-    /// Runs only in Debug builds — the mirror exists solely to feed
-    /// `gcAllgcAssertSync`.
-    fn gcDebugMirrorAdd(self: *Vm, obj: GcObject) void {
-        self.gc_objects.append(self.infraAlloc(), obj) catch @panic("oom: gc debug mirror");
-    }
-
-    fn gcDebugMirrorRemove(self: *Vm, obj: GcObject) void {
-        const items = self.gc_objects.items;
-        for (items, 0..) |item, i| {
-            if (std.meta.eql(item, obj)) {
-                _ = self.gc_objects.orderedRemove(i);
-                return;
-            }
-        }
-        unreachable; // mirror/death divergence — checker invariant broken
-    }
-
-    fn gcDebugMirrorRequeue(self: *Vm, obj: GcObject) void {
-        self.gcDebugMirrorRemove(obj);
-        self.gcDebugMirrorAdd(obj);
-    }
-
     /// Test-only census helpers over the canonical chain (work in every
-    /// build mode; the dense mirror exists only in Debug).
+    /// build mode).
     pub fn testGcChainLen(self: *Vm) usize {
         var n: usize = 0;
         var cur = self.gc_allgc_head;
@@ -32036,7 +31974,6 @@ pub const Vm = struct {
         // monolithic window covers any mid-cycle allocation source, so
         // beyond-snapshot nodes are kept unconditionally).
         self.gc_gen_snapshot = self.gc_allgc_tail;
-        self.gc_gen_last_minor_visited = 0;
         self.gcResetCycleState();
 
         // PUC youngcollection does NOT reset young objects' marks to
@@ -32212,7 +32149,6 @@ pub const Vm = struct {
             // link) and free. The cursor does not move — the successor
             // gets examined by the next step.
             self.gcChainUnlinkAt(link, hdr, self.gc_sweep_last);
-            if (@import("builtin").mode == .Debug) self.gcDebugMirrorRemove(obj);
             self.gcFreeObject(obj, .sweep);
         } else {
             // Alive: reset the mark to the current white for the next
@@ -32758,16 +32694,19 @@ pub const Vm = struct {
     /// persistent gray list and will be processed by later work units.
     fn gcPropagateOne(self: *Vm) DispatchError!bool {
         const cur = self.gc_gray.pop() orelse return false;
-        if (self.gc_minor_cycle) {
-            self.gc_gen_last_minor_visited += 1;
-            if (gcPtr(cur).age.*.isOld()) self.gc_gen_last_minor_old_visited += 1;
+        if (self.stats.enabled and self.gc_minor_cycle) {
+            // Default-off observability: counts OLD objects propagated
+            // during a minor cycle — the regression oracle proving minors
+            // do not re-walk the whole old graph (test below). Execution
+            // never reads it.
+            if (gcPtr(cur).age.*.isOld()) self.stats.gc_minor_old_visited += 1;
         }
         switch (cur) {
             .table => |tbl| {
                 // gcClearDeadKeys can iterate only marked tables
-                // (O(marked)) instead of all gc_objects (O(total)). The
-                // HashMap dedupes via put — repeated references to the same
-                // table are a no-op.
+                // (O(marked)) instead of the whole live set (O(total)).
+                // The HashMap dedupes via put — repeated references to
+                // the same table are a no-op.
                 // infraAlloc (PUC intrusive-list parity): the marked-tables
                 // side table is GC bookkeeping — PUC's mark phase allocates
                 // nothing. A counted put can fail under an armed memlimit
@@ -33837,38 +33776,15 @@ pub const Vm = struct {
         // stored ONLY into the closure's upvalue cell — upvalue #1 for a
         // main chunk, which is _ENV whenever the chunk touches globals.
         // A chunk with no upvalues simply DROPS the env (lua_setupvalue
-        // returns NULL, the value is popped) — no hidden retention slot.
-        // P16.16 C2/T4.1: the old `env_override` field was pure redundant
-        // liveness (the _ENV Cell owns the edge; nothing ever read it for
-        // env resolution) and diverged from PUC in the no-upvalue case.
+        // returns NULL, the value is popped) — no hidden retention slot;
+        // the _ENV Cell owns the edge. Every cell already exists here:
+        // the chunk constructors (createBytecodeChunkClosure /
+        // closureFromProto) create all `proto.upvalues.len` cells
+        // root-scoped and publish `cl.upvalues` before returning, so this
+        // function performs no allocation of its own — exactly PUC's
+        // luaF_newLclosure/luaF_initupvals shape.
         const num_upvalues: usize = if (cl.proto) |proto| proto.upvalues.len else 0;
         if (num_upvalues == 0) return;
-        if (cl.upvalues.len < num_upvalues) {
-            // P16.50 transactional: prepare for ALL cells upfront; on any
-            // failure roll back the created cells (they are not yet
-            // referenced by the closure, so nothing roots them).
-            const cells = try self.alloc.alloc(*Cell, num_upvalues);
-            var created: usize = 0;
-            errdefer {
-                self.alloc.free(cells);
-                while (created > 0) {
-                    created -= 1;
-                    self.gcUnregisterObjectRollback(.{ .cell = cells[created] });
-                    self.gcNoteFree(@sizeOf(Cell));
-                    self.alloc.destroy(cells[created]);
-                }
-            }
-            var i: usize = 0;
-            while (i < num_upvalues) : (i += 1) {
-                const c = try self.alloc.create(Cell);
-                c.* = .{ .value = .Nil };
-                self.gcRegisterCommit(.{ .cell = c });
-                self.gcNoteAlloc(@sizeOf(Cell));
-                cells[i] = c;
-                created += 1;
-            }
-            cl.upvalues = cells;
-        }
         if (cl.proto) |proto| {
             for (proto.upvalues, 0..) |uv, i| {
                 if (i >= cl.upvalues.len) break;
@@ -53278,6 +53194,9 @@ test "vm: generational GC ages barriers and nursery scope match PUC" {
 
     var vm = Vm.init(testing.allocator, false);
     defer vm.deinit();
+    // Enable the default-off stats oracle for the old-graph scope proof
+    // below (before any execution, per the stats contract).
+    vm.stats.enabled = true;
 
     // Build and root a sizeable old heap before entering generational mode.
     // A minor collection must not traverse every table in this graph.
@@ -53309,8 +53228,9 @@ test "vm: generational GC ages barriers and nursery scope match PUC" {
     try testing.expectEqual(GcAge.survival, child.gc.age);
     try testing.expectEqual(GcAge.survival, grandchild.gc.age);
     // Old threads and the remembered holder are visited, but the 512-table
-    // old graph itself is outside the nursery/remembered sets.
-    try testing.expect(vm.gc_gen_last_minor_old_visited < 32);
+    // old graph itself is outside the nursery/remembered sets (stats
+    // oracle: OLD propagations during this minor cycle).
+    try testing.expect(vm.stats.gc_minor_old_visited < 32);
 
     try vm.gcMinorCollection();
     try testing.expectEqual(GcAge.old, holder.gc.age);

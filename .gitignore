@@ -45,3 +45,9 @@ tools/perf/profiles/
 prompt.md
 report.md
 report2.md
+
+# Root debris (purged from history; never commit again)
+/luac.out
+/*.o
+/*.a
+/a.out

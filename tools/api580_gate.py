@@ -10,7 +10,8 @@ is the real, permanent gate:
   2. runs the EXACT upstream api.lua:576-586 fixed-buffer shape via --testc;
   3. asserts 0 < m2-m1 < 400 (upstream: `m2 > m1 and m2 - m1 < 400`);
   4. executes the loaded closure and verifies X == N and Y == the constant;
-  5. additionally prints @sizeOf-probe results for representation tracking;
+  5. runs `zig build test` in both modes, which compiles the library's own
+     comptime size asserts (the canonical representation fixation);
   6. exits nonzero on ANY failure (delta, assertion, execution, build).
 
 Exit code 0 = gate green in both modes.
@@ -47,28 +48,6 @@ X = 0; code(); assert(X == N and Y == string.rep("a", N))
 io.write("EXEC=OK\n")
 """
 
-# Optional struct-size probe compiled as a tiny Zig unit using the library's
-# own comptime asserts (LuaString == 48 both modes; lstrfix prefix == 32).
-# Keeping sizes in the gate catches future build-mode layout drift.
-SIZE_TEST = r"""
-const std = @import("std");
-const lua = @import("lua");
-test "representation sizes are build-mode stable" {
-    const vm = @import("lua").vm;
-    const bc = @import("lua").bytecode;
-    try std.testing.expectEqual(@as(usize, 48), @sizeOf(vm.LuaString));
-    try std.testing.expectEqual(@as(usize, 32), vm.LuaString.lstrfix_header_size);
-    try std.testing.expectEqual(@as(usize, 16), @sizeOf(vm.GcHeader));
-    try std.testing.expectEqual(@as(usize, 48), @sizeOf(vm.Closure));
-    try std.testing.expectEqual(@as(usize, 48), @sizeOf(vm.Cell));
-    try std.testing.expectEqual(@as(usize, 88), @sizeOf(vm.Table));
-    try std.testing.expectEqual(@as(usize, 64), @sizeOf(vm.Userdata));
-    try std.testing.expectEqual(@as(usize, 16), @sizeOf(bc.Upvaldesc));
-    try std.testing.expectEqual(@as(usize, 184), @sizeOf(bc.Proto));
-    try std.testing.expect(@sizeOf(vm.CallFrame) <= 104);
-    try std.testing.expectEqual(@as(usize, 32), @sizeOf(@import("lua").ltable.Node));
-}
-"""
 
 
 def run_mode(mode: str) -> int:
@@ -112,7 +91,8 @@ def run_size_probe() -> int:
     print("=== representation sizes (unit-test path) ===")
     with tempfile.TemporaryDirectory() as td:
         # Reuse the library's own test build: `zig build test` compiles the
-        # comptime asserts (LuaString 48 / lstrfix 32) in the given mode.
+        # comptime size asserts in vm.zig (the single canonical fixation,
+        # executed in the given mode).
         for mode in ("Debug", "ReleaseFast"):
             r = subprocess.run(
                 ["zig", "build", "test", f"-Doptimize={mode}"],
@@ -123,7 +103,7 @@ def run_size_probe() -> int:
                 return 1
             print(f"PASS [{mode}]: comptime size invariants hold "
                   "(LuaString=48, LSTRFIX=32, GcHeader=16, Closure=48, "
-                  "Cell=48, Table=80, Userdata=56, "
+                  "Cell=48, Table=80, Userdata=56, Thread=3824, "
                   "Upvaldesc=16, Proto=184, CallFrame<=104, Node=32)")
     return 0
 

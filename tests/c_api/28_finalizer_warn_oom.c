@@ -2,12 +2,16 @@
 **
 ** Semantic class (PUC lgc.c GCTM + lstate.c luaE_warnerror): when a __gc
 ** body raises ANY error, the VM emits the warning "error in __gc (<msg>)"
-** as FIVE tocont pieces straight to the warning channel and CONTINUES with
-** the rest of the pending finalizers. PUC runs this path with zero core
-** allocations (luaE_warnerror passes the pieces without formatting; the
-** message is a literal or the error object's own C string), so a finalizer
-** that exhausted memory still produces its warning with the ORIGINAL error
-** object, and the queue keeps draining.
+** as FIVE tocont pieces straight to the warning channel; GCTM does not
+** distinguish error classes. PUC runs this path with zero core allocations
+** (luaE_warnerror passes the pieces without formatting; the message is a
+** literal or the error object's own C string), so a finalizer that
+** exhausted memory still produces its warning with the ORIGINAL error
+** object. What happens to the REST of the pending queue is a separate,
+** phase-dependent contract (see 29_finalizer_oom_queue): the direct drain
+** loops (generational finish, lua_close) continue in the same window,
+** while a paced incremental pass may defer the rest to a later cycle when
+** the body's real OOM ran a nested emergency collection.
 **
 ** The allocator is frozen from INSIDE the __gc body (after everything the
 ** body needs has been pushed/created), so every allocation between "body
@@ -227,10 +231,9 @@ int main(void) {
 
     /* w2: real OOM inside the body — the denied userdata allocation raises
     ** LUA_ERRMEM and the warning carries the fixed message. Single erroring
-    ** finalizer: after a real-OOM finalizer error PUC's emergency GC leaves
-    ** the cycle at pause, so the REST of the pending queue runs in a later
-    ** cycle or at close, not in this one (see the report's OOM-QUEUE
-    ** finding for the luazig divergence on that continuation). */
+    ** finalizer: with one pending object there is no rest-of-queue
+    ** continuation to observe, so this case stays independent of the
+    ** phase-dependent queue contract (covered by 29_finalizer_oom_queue). */
     {
         reset_case();
         lua_State *L = case_state();

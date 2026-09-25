@@ -5554,6 +5554,15 @@ pub const Vm = struct {
     /// Bytecode hooks carry the same bit on RuntimeFrame instead.
     debug_hook_allow_yield: bool = false,
     debug_hooks_suppressed: usize = 0,
+    /// Finalizer-body nesting depth (callFinalizer window). Errors raised
+    /// inside a __gc body carry no traceback in PUC — GCTM's pcall has no
+    /// message handler and the error goes straight to the warning channel
+    /// (luaE_warnerror), so PUC's transport for them allocates nothing.
+    /// captureErrorTraceback skips its allocating writer while any
+    /// finalizer body is on the stack: the capture would be discarded by
+    /// the warning path anyway, and under an exhausted allocator its
+    /// failed allocation would run a spurious emergency collection.
+    finalizer_body_depth: usize = 0,
 
     /// P15.38i: PUC-style builtin results on stack. When callBuiltin is
     /// invoked from the bytecode dispatch loop, results are written directly
@@ -8368,9 +8377,16 @@ pub const Vm = struct {
         // (GCSTPCLS gate).
         self.is_closing = true;
         self.gc_stp |= GCSTPCLS; // PUC: gcstp = GCSTPCLS
-        // Keep the collector non-reentrant while registry ownership is being
-        // torn down; allocations remain owned by the registries and are
-        // drained immediately after all closing finalizers return.
+        // Keep the collector non-reentrant BETWEEN close-time finalizer
+        // bodies (automatic steps stay blocked while registry ownership
+        // is being torn down; allocations remain owned by the registries
+        // and are drained immediately after all closing finalizers
+        // return). Each body itself runs with gc_busy cleared — the GCTM
+        // window (see gcDrainTobefnzAll) — so a real allocation failure
+        // inside a closing finalizer may run the nested emergency
+        // collection, exactly like PUC's callallpendingfinalizers under
+        // luaC_freeallobjects (gcstopem is 0 there; the roots are still
+        // intact at this point of the close sequence).
         const was_busy = self.gc_busy;
         self.gc_busy = true;
         defer self.gc_busy = was_busy;
@@ -8385,6 +8401,11 @@ pub const Vm = struct {
         // finalizer call itself.
         self.debug_hooks_suppressed += 1;
         defer self.debug_hooks_suppressed -= 1;
+        // PUC GCTM error-transport parity: mark the finalizer window so
+        // captureErrorTraceback skips its allocating writer (see
+        // finalizer_body_depth).
+        self.finalizer_body_depth += 1;
+        defer self.finalizer_body_depth -= 1;
         // PUC GCTM (lgc.c:983): flags the CURRENT CallInfo (L->ci — the
         // frame the GC stepped from, which becomes the finalizer body's
         // direct caller) with CIST_FIN around luaD_pcall, so
@@ -8873,6 +8894,10 @@ pub const Vm = struct {
     /// from the traceback builtin called BY the handler).
     fn captureErrorTraceback(self: *Vm) void {
         self.clearErrorTraceback();
+        // PUC GCTM parity: no traceback inside a finalizer body (see
+        // finalizer_body_depth) — the whole raise-to-warning transport
+        // stays allocation-free there.
+        if (self.finalizer_body_depth > 0) return;
         var aw: std.Io.Writer.Allocating = .init(self.alloc);
         // defer (not errdefer): the OOM paths below exit via `catch return`
         // and `catch null` — NORMAL returns that would skip an errdefer and
@@ -9790,6 +9815,54 @@ pub const Vm = struct {
         return self.testc_alloc_base orelse self.alloc;
     }
 
+    /// PUC `resizebox` (lauxlib.c) allocation shape for EXACT-SIZE
+    /// auxiliary boxes (string.char/rep/upper/lower/reverse buffers —
+    /// every `luaL_buffinitsize` site in lstrlib.c): ONE direct call
+    /// through the state allocator — no luaM tryagain, no emergency
+    /// retry — and on failure a plain `lua_error("not enough memory")`:
+    /// a LUA_ERRRUN RuntimeError, NOT LUA_ERRMEM (see raiseAuxBoxOom).
+    /// The direct call bypasses the adapter/bridge retry wrappers
+    /// (attemptAlloc / cCall) exactly like PUC's resizebox calling the
+    /// state allocf directly. Growing-buffer sites (format/gsub/concat)
+    /// keep their Zig-side growth path — see the OOM-queue correction
+    /// report for the residual class.
+    fn allocAuxBox(self: *Vm, comptime T: type, len: usize) std.mem.Allocator.Error![]T {
+        const byte_len = len * @sizeOf(T);
+        if (byte_len == 0) return &[_]T{};
+        const maybe: ?[*]u8 = if (self.testc_alloc_adapter) |adapter|
+            adapter.attemptAlloc(byte_len, .@"1", @returnAddress())
+        else if (self.c_alloc_bridge) |bridge|
+            bridge.cCall(null, 0, byte_len)
+        else
+            @as(?[*]u8, @ptrCast(
+                (self.alloc.alloc(u8, byte_len) catch return error.OutOfMemory).ptr,
+            ));
+        const bytes = maybe orelse return error.OutOfMemory;
+        return @as([*]T, @ptrCast(@alignCast(bytes)))[0..len];
+    }
+
+    /// Raise the PUC resizebox failure: a plain "not enough memory"
+    /// error with no position prefix — the no-position branch of
+    /// failRunerror, mirrored — but with a FRESH interned message,
+    /// distinct from oom_msg_str, so the C boundary reports LUA_ERRRUN
+    /// (it maps oom_msg_str identity to LUA_ERRMEM). If even the intern
+    /// fails, fall back to the true OOM transport.
+    fn raiseAuxBoxOom(self: *Vm) Error {
+        self.errThread().err_is_errerr = false;
+        self.err = "not enough memory";
+        self.errThread().err_source = null;
+        self.errThread().err_line = -1;
+        const istr = self.internStr(self.err.?) catch {
+            self.setOutOfMemoryError();
+            return error.OutOfMemory;
+        };
+        self.errThread().err_obj = .{ .String = istr };
+        self.errThread().err_has_obj = true;
+        self.captureErrorTraceback();
+        try self.invokeErrfunc();
+        return error.RuntimeError;
+    }
+
     /// P16.50-review-5: wrap `vm.alloc` with the testC allocator adapter —
     /// PUC installs `debug_realloc` as the state allocator at lua_newstate
     /// time; we install at the END of `enableTestcModuleInternal` (the
@@ -9814,10 +9887,15 @@ pub const Vm = struct {
     }
 
     /// PUC `cantryagain` (lmem.c): completestate && !gcstopem. Completeness
-    /// is structural — the allocation boundaries that can run the emergency
-    /// are installed only after init completes. gcstopem maps to our
-    /// gc_busy (any GC step in flight on this VM, including finalizer-driven
-    /// Lua) plus testc_emergency_active (the emergency collector itself).
+    /// is structural — the allocation boundaries that can run the
+    /// emergency are installed only after init completes. gcstopem maps
+    /// to gc_busy (collector step machinery in flight on this VM) plus
+    /// testc_emergency_active (the emergency collector itself); gc_busy
+    /// is cleared around every finalizer body execution (the PUC
+    /// singlestep GCScallfin arm clears gcstopem before GCTM, and PUC's
+    /// callallpendingfinalizers drains run outside any singlestep), so
+    /// an allocation failure inside a __gc body may run the emergency
+    /// retry exactly like in PUC.
     fn emergencyCollectAllowed(self: *Vm) bool {
         return !self.gc_busy and !self.testc_emergency_active;
     }
@@ -10437,8 +10515,14 @@ pub const Vm = struct {
     /// body runs under GCSTPGC with debug hooks suppressed (callFinalizer
     /// also flags CIST_FIN). ANY error the body raises — including
     /// LUA_ERRMEM / OutOfMemory — goes to the warning channel and the
-    /// caller continues with the rest of the list (lgc.c:988-991 +
-    /// lstate.c luaE_warnerror); GCTM does not distinguish error classes.
+    /// pending list is never lost (lgc.c:988-991 + lstate.c
+    /// luaE_warnerror); GCTM does not distinguish error classes. A REAL
+    /// allocation failure inside the body may run a nested emergency
+    /// collection (see the gc_busy window below); that collection skips
+    /// finalizers and can finish the outer cycle at pause with the
+    /// remaining tobefnz preserved — the rest of the queue then runs in
+    /// a later cycle (or at close), and the outer pass re-reads
+    /// gc_state after the body instead of assuming it.
     ///
     /// Yield/ThreadSwitch out of a finalizer body is structurally
     /// impossible in the callfin phase (PUC GCTM runs the body through
@@ -10458,10 +10542,25 @@ pub const Vm = struct {
         const call_args = &[_]Value{self_val};
         // PUC lgc.c:978-987: set GCSTPGC during finalizer execution to
         // prevent reentrant GC (`collectgarbage()` from __gc returns
-        // false).
+        // false). PUC singlestep's GCScallfin arm (lgc.c:1670-1672)
+        // clears gcstopem around GCTM, so the allocator's emergency
+        // retry (lmem.c tryagain → luaC_fullgc(L,1)) may run a nested
+        // emergency full collection from inside the body. gc_busy is
+        // this VM's gcstopem equivalent, so it is cleared for the body
+        // window and restored after; gc_running is kept paired with the
+        // gc_stp write (the hot-path cache invariant) so allocation-site
+        // automatic steps stay blocked during the body exactly like
+        // PUC's gcrunning-under-GCSTPGC.
         const old_gcstp = self.gc_stp;
+        const was_busy = self.gc_busy;
         self.gc_stp |= GCSTPGC;
-        defer self.gc_stp = old_gcstp;
+        self.gc_running = false;
+        self.gc_busy = false;
+        defer {
+            self.gc_busy = was_busy;
+            self.gc_stp = old_gcstp;
+            self.gc_running = (old_gcstp == 0);
+        }
         _ = self.callFinalizer(gc, call_args) catch |e| switch (e) {
             error.RuntimeError => self.gcWarnFinalizerError(self.protectedErrorValue()),
             error.OutOfMemory => self.gcWarnFinalizerError(.{
@@ -10477,14 +10576,23 @@ pub const Vm = struct {
     /// unit; when the queue is empty — or under an emergency collection,
     /// which never runs finalizers (GCScallfin guard `!g->gcemergency`)
     /// — finish the cycle with the pending list INTACT (carry-over).
+    /// Returns true when a finalizer ran (PUC GCTM arm, stepresult
+    /// CWUFIN) and false when the cycle was finished instead (PUC else
+    /// arm, stepresult step2pause) — gcAdvance needs the distinction
+    /// because a finalizer body's nested emergency collection can move
+    /// gc_state to pause under the outer pass, which must then keep
+    /// stepping (incstep shape) rather than treat the pause as its own
+    /// cycle end.
     /// The `luaD_checkminstack` gate has no equivalent here: stacks grow
     /// on demand in this VM, so the "not enough stack to run a
     /// finalizer" outcome cannot occur.
-    fn gcCallfinStep(self: *Vm) DispatchError!void {
+    fn gcCallfinStep(self: *Vm) DispatchError!bool {
         if (self.gc_tobefnz_head != null and !self.gc_emergency) {
             self.gcRunOneFinalizer();
+            return true;
         } else {
             try self.gcFinishCycle();
+            return false;
         }
     }
 
@@ -10516,9 +10624,17 @@ pub const Vm = struct {
 
     /// PUC `callallpendingfinalizers` (lgc.c:999-1003) — the
     /// finishgencycle/close drain: run GCTM over the whole tobefnz list,
-    /// head first, old pending ahead of newer batches. `makewhite`
-    /// mirrors the PUC issweepphase-true arm of udata2finalize during
-    /// generational young-collection finals and the close sequence.
+    /// head first — linkgclist PREPENDS, so the head is the newest
+    /// pending object and a multi-object batch drains newest-first.
+    /// `makewhite` mirrors the PUC issweepphase-true arm of
+    /// udata2finalize during generational young-collection finals and
+    /// the close sequence. Each body runs in the GCTM window: gc_stp
+    /// keeps GCSTPGC (no reentrant collectgarbage) but gc_busy is
+    /// cleared, so a real allocation failure inside a draining
+    /// finalizer may run the nested emergency collection exactly like
+    /// PUC (gcstopem is 0 in callallpendingfinalizers); the drain
+    /// itself always continues to the end of the list regardless of
+    /// body errors.
     fn gcDrainTobefnzAll(self: *Vm, makewhite: bool) void {
         while (self.gc_tobefnz_head != null) {
             const obj = self.gcDequeueTobefnzHead(makewhite);
@@ -10532,8 +10648,15 @@ pub const Vm = struct {
             const self_val: Value = obj.toValue() orelse continue;
             const call_args = &[_]Value{self_val};
             const old_gcstp = self.gc_stp;
+            const was_busy = self.gc_busy;
             self.gc_stp |= GCSTPGC;
-            defer self.gc_stp = old_gcstp;
+            self.gc_running = false;
+            self.gc_busy = false;
+            defer {
+                self.gc_busy = was_busy;
+                self.gc_stp = old_gcstp;
+                self.gc_running = (old_gcstp == 0);
+            }
             _ = self.callFinalizer(gc, call_args) catch |e| switch (e) {
                 error.RuntimeError => self.gcWarnFinalizerError(self.protectedErrorValue()),
                 error.OutOfMemory => self.gcWarnFinalizerError(.{
@@ -30187,6 +30310,15 @@ pub const Vm = struct {
     /// gray object; a sweep unit examines and possibly frees one registry entry.
     /// The atomic transition is intentionally one unit, matching PUC's bounded
     /// `singlestep` loop while keeping weak/finalizer semantics indivisible.
+    ///
+    /// Re-entrancy: a finalizer body runs in the GCTM window (gc_busy
+    /// cleared — see gcRunOneFinalizer/gcDrainTobefnzAll), so a real
+    /// allocation failure inside the body can run a NESTED emergency
+    /// collection that finishes this cycle at pause mid-pass. The step
+    /// loop re-reads gc_state after every arm and never assumes the
+    /// state it entered the arm with; a pause reached that way ends the
+    /// pass (incstep shape) with the remaining tobefnz preserved for a
+    /// later cycle or the close drain.
     fn gcAdvance(self: *Vm, budget: usize, break_after_atomic: bool) DispatchError!bool {
         if (self.gc_busy) return false;
         self.gc_busy = true;
@@ -30232,7 +30364,18 @@ pub const Vm = struct {
                     // bit-screened — so no pacing is observable).
                     if (!try self.gcSweepOne()) self.gcSweepEnterCallfin();
                 },
-                .callfin => try self.gcCallfinStep(),
+                .callfin => {
+                    // gcCallfinStep reports whether a finalizer ran
+                    // (PUC CWUFIN) or the cycle finished instead
+                    // (step2pause — queue empty or emergency
+                    // carry-over). Either way the loop condition
+                    // re-reads gc_state after the arm: a finalizer
+                    // body's nested emergency collection can finish
+                    // this cycle at pause under the pass, and the pass
+                    // must not assume the state it entered the arm
+                    // with.
+                    _ = try self.gcCallfinStep();
+                },
             }
             // PUC incstep (lgc.c:1719): `else if (stres == atomicstep && !fast) break;`
             // Stop after the atomic phase transitions to sweep so that the
@@ -31271,7 +31414,12 @@ pub const Vm = struct {
         // markobject. luazig defers the save+clear to gcDrainGrayagain
         // (Step 6). This is semantically equivalent because no backward
         // barriers fire during Steps 1-5: atomic is mutator-paused and
-        // runs no finalizer bodies (they run post-sweep, in callfin).]
+        // runs no finalizer bodies (they run post-sweep, in callfin). A
+        // finalizer body's nested emergency collection (the GCTM window)
+        // cannot interleave with an in-progress atomic either: it runs
+        // from callfin with gc_emergency set (no finalizers, tobefnz
+        // preserved), and atomic-phase allocations cannot retry the
+        // emergency at all — the pass holds gc_busy here.]
         //
         // [PUC lgc.c:1546: linkgclist(&L->gclist, g->grayagain) — the
         // running thread is linked to grayagain for re-traversal. luazig
@@ -42021,11 +42169,14 @@ pub const Vm = struct {
 
     fn builtinStringChar(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
-        var out = std.ArrayList(u8).empty;
-        defer out.deinit(self.alloc);
-        for (args) |v| {
+        // PUC str_char: the exact-size box (luaL_buffinitsize(n)) is
+        // allocated BEFORE the argument checks — resizebox shape, see
+        // allocAuxBox.
+        var out = self.allocAuxBox(u8, args.len) catch return self.raiseAuxBoxOom();
+        defer self.alloc.free(out);
+        for (args, 0..) |v, i| {
             const iv: i64 = switch (v) {
-                .Int => |i| i,
+                .Int => |x| x,
                 .Num => |n| blk: {
                     if (!std.math.isFinite(n)) return self.fail("string.char expects integers", .{});
                     const t = std.math.trunc(n);
@@ -42035,11 +42186,9 @@ pub const Vm = struct {
                 else => return self.fail("string.char expects integers", .{}),
             };
             if (iv < 0 or iv > 255) return self.fail("string.char value out of range", .{});
-            try out.append(self.alloc, @intCast(iv));
+            out[i] = @intCast(iv);
         }
-        const owned = try out.toOwnedSlice(self.alloc);
-        defer self.alloc.free(owned);
-        const istr = try self.internStr(owned);
+        const istr = try self.internStr(out);
         outs[0] = .{ .String = istr };
     }
 
@@ -42050,10 +42199,11 @@ pub const Vm = struct {
             .String => |x| x.bytes(),
             else => return self.fail("bad argument #1 to 'upper' (string expected, got {s})", .{self.valueTypeName(args[0])}),
         };
-        var out = try self.alloc.alloc(u8, s.len);
-        // The scratch buffer is transient (PUC's luaL_Buffer is freed when
-        // the builtin returns); internStr copies the bytes into the result
-        // LuaString, so free it on every path.
+        // PUC str_upper: exact-size box (luaL_buffinitsize(l)) — the
+        // resizebox allocation shape (see allocAuxBox); internStr then
+        // copies the bytes into the result LuaString, so the box is
+        // freed on every path.
+        var out = self.allocAuxBox(u8, s.len) catch return self.raiseAuxBoxOom();
         defer self.alloc.free(out);
         for (s, 0..) |ch, i| out[i] = std.ascii.toUpper(ch);
         const istr = try self.internStr(out);
@@ -42067,8 +42217,8 @@ pub const Vm = struct {
             .String => |x| x.bytes(),
             else => return self.fail("bad argument #1 to 'lower' (string expected, got {s})", .{self.valueTypeName(args[0])}),
         };
-        var out = try self.alloc.alloc(u8, s.len);
-        // Same transient scratch as 'upper' — freed on every path.
+        // PUC str_lower: exact-size box — same resizebox shape as 'upper'.
+        var out = self.allocAuxBox(u8, s.len) catch return self.raiseAuxBoxOom();
         defer self.alloc.free(out);
         for (s, 0..) |ch, i| out[i] = std.ascii.toLower(ch);
         const istr = try self.internStr(out);
@@ -42082,8 +42232,8 @@ pub const Vm = struct {
             .String => |x| x.bytes(),
             else => return self.fail("bad argument #1 to 'reverse' (string expected, got {s})", .{self.valueTypeName(args[0])}),
         };
-        var out = try self.alloc.alloc(u8, s.len);
-        // Same transient scratch as 'upper' — freed on every path.
+        // PUC str_reverse: exact-size box — same resizebox shape as 'upper'.
+        var out = self.allocAuxBox(u8, s.len) catch return self.raiseAuxBoxOom();
         defer self.alloc.free(out);
         var i: usize = 0;
         while (i < s.len) : (i += 1) out[i] = s[s.len - 1 - i];
@@ -43533,7 +43683,10 @@ pub const Vm = struct {
         const total0 = std.math.mul(usize, s.len, n) catch return self.fail("string.rep: result too large", .{});
         const total = std.math.add(usize, total0, std.math.mul(usize, sep.len, sep_total) catch return self.fail("string.rep: result too large", .{})) catch return self.fail("string.rep: result too large", .{});
         if (total > 1_000_000_000) return self.fail("string.rep: result too large", .{});
-        var buf = try self.alloc.alloc(u8, total);
+        // PUC str_rep: exact-size box (luaL_buffinitsize(totallen)) — the
+        // resizebox allocation shape (see allocAuxBox); internStr copies
+        // into the result LuaString, so the box is freed on every path.
+        var buf = self.allocAuxBox(u8, total) catch return self.raiseAuxBoxOom();
         defer self.alloc.free(buf); // temp copy; internStr copies into the string object
         var off: usize = 0;
         for (0..n) |i| {
@@ -48377,7 +48530,11 @@ pub const Vm = struct {
             } else if (self.gc_state == .sweep) {
                 if (!try self.gcSweepOne()) self.gcSweepEnterCallfin();
             } else if (self.gc_state == .callfin) {
-                try self.gcCallfinStep();
+                // Bool result discarded: this loop re-reads gc_state
+                // every iteration, so a cycle finished inside the arm
+                // (or by a finalizer body's nested emergency collection)
+                // is picked up by the conditions above.
+                _ = try self.gcCallfinStep();
             }
         }
     }

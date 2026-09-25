@@ -89,16 +89,51 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   (2086 строк, нулевые ссылки, счёт тестов неизменен). NEW residual →
   отдельный пункт ниже (OOM-queue divergence).
 
-- [ ] **Parity MEDIUM: после real-OOM финализатора PUC пропускает
-  остальные финализаторы этого цикла, luazig дренирует eagerly**
-  (найдено finalizer-warning correction, форма w2 canonical 28-сьюта
-  обходит одиночным финализатором): PUC GCTM после LUA_ERRMEM в теле
-  оставляет очередь (emergency-GC контракт), luazig продолжает вызывать
-  остальные pending в том же цикле. Дифференциальный кейс: два
-  finalizable, первый реально исчерпывает память → PUC: 1 вызов +
-  1 warning, второй pending остаётся; luazig: оба вызываются. Fix —
-  отдельная bounded correction (GCTM errmem-arm контракт); canonical
-  расширение w2 до двух объектов после фикса. Open-count: 26 → 25 (закрытие warning-пункта) → 26 (этот пункт).
+- [x] **Parity BLOCKER, FIX-NOW: вложенная emergency-GC из `__gc` не меняет
+  фазу внешнего цикла; остальные pending финализируются преждевременно**
+  (review `324feb0`; затронутый warning/OOM-путь): при реальном отказе
+  аллокатора в теле первого из двух pending `__gc` PUC выдаёт warning и
+  оставляет второй pending до следующего GC-цикла; luazig выдаёт warning,
+  но исполняет второй `__gc` сразу. Независимый differential oracle
+  `/tmp/opencode/review_oom_queue.c`: PUC `first calls=1; second calls=2`,
+  luazig `first calls=2; second calls=2` (оба `rc=0`, `warns=1`). На
+  committed baseline `4613a93` преждевременный drain уже был, но warning
+  терялся; предыдущий prompt ошибочно требовал продолжать очередь после
+  *любого* OOM. Первая неверная операция: `gcAdvance` держит `gc_busy=true`
+  на всём `.callfin`, а `emergencyCollectAllowed` из-за этого запрещает
+  emergency-retry аллокатора в финализаторе. PUC `singlestep` в
+  `GCScallfin` сбрасывает `gcstopem` перед `GCTM`, разрешая вложенную
+  emergency full-GC; та может перевести общий `gcstate` в pause и тем
+  самым завершить внешний проход с сохранённой `tobefnz`. Нужна bounded
+  correction общего контракта GC/reentrancy, не специальное прерывание
+  списка по тексту ошибки или безусловно при `OutOfMemory`. Canonical suite
+  должен включить два pending и проверить оба цикла. Open-count: 26 → 25
+  (закрытие warning-пункта) → 26 (этот пункт).
+  CLOSED (OOM-queue correction): PUC-подобное разделение смыслов «GC step
+  исполняется» и «emergency-retry разрешён финализатору» — gc_busy снимается
+  вокруг КАЖДОГО тела финализатора (эквивалент обнуления gcstopem перед GCTM,
+  PUC singlestep GCScallfin lgc.c:1669+); реальный отказ аллокатора в теле
+  запускает вложенный emergency-цикл (без финализаторов; tobefnz персистентен;
+  roots держатся); внешний paced-проход пере-читает gc_state после тела и
+  останавливается по изменённому состоянию (pause) — оставшийся pending
+  до следующего цикла; ПРЯМЫЕ drain-сайты (gen finishgencycle, shutdown
+  callallpendingfinalizers) продолжают в том же окне. Никакого
+  break-by-error-class. Попутно закрыт gate-блокер: aux-box-пути
+  (string.rep/upper/lower/reverse/char) подключены к PUC resizebox-форме
+  allocAuxBox (один прямой вызов allocf, без tryagain; отказ → plain
+  LUA_ERRRUN "not enough memory") — пять exact-size сайтов
+  (LUA_ERRMEM-класс для growing-буферов остался). BytecodeUnwindStack
+  (inline-8) — root-marking/unwind-префикс, Thread=3824 (+456B),
+  comptime-ассерт + api580 sizes-список. Evidence: canonical
+  tests/c_api/29_finalizer_oom_queue (q1-q7: paced-defer/retry-ok/
+  GCSTOP-GCSTEP/gen/close + контроли) — byte-identical vs PUC 5.5 оба
+  режима; RED на baseline 2e33755 (q1 first calls=2 — преждевременный
+  drain); mutation «stop-on-any-error» → RED (q1 second calls=1);
+  reviewer-oracle пересобран, byte-identical. Гейты: 358/358 D+RF;
+  matrix zig_fail=0; smoke 86/86; c_api 24-29 DIFF PASS оба режима;
+  api580 GREEN 384<400 (Thread=3824 честно); fmt/diff-check clean.
+  Residuals (backlog): growing-buffer-сайты (format/gsub/concat) и
+  external-string-пути не переведены на resizebox-форму.
 
 - [ ] **C API: `lua_pushvalue(lua_upvalueindex(n))` возвращает не upvalue
   (BLOCKER, ORDINARY-BACKLOG)**. Независимый C-оракул

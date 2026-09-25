@@ -45,6 +45,76 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
+- [x] **A1.next review correction — warning финализатора при OOM (BLOCKER,
+  FIX-NOW)**. Intrusive `allgc/finobj/tobefnz` и post-sweep `callfin`
+  сохраняются: найденный дефект находится в новом error-path, а не в
+  lifetime-owner. `gcWarnFinalizerError` (`src/lua/vm.zig`) собирает
+  `"error in __gc (...)"` через fallible `ArrayListUnmanaged` и на любом
+  `append catch return` выходит до вызова warning callback и до очистки
+  `err`/`err_obj`. При исчерпанной памяти после ошибки `__gc` нарушаются
+  наблюдаемое warning-поведение и cleanup error state. PUC
+  `luaE_warnerror` (`lstate.c`) посылает пять частей без промежуточной
+  аллокации ядра. Отдельно `warnfHandler` делает `dupeZ` для C callback и
+  молча теряет warning при его OOM; этот вход следует проверить в той же
+  correction. Нужны отрицательный C allocator-oracle с callback без
+  аллокаций, PUC-differential для OOM/RuntimeError, проверка продолжения
+  очереди и отсутствия stale error state. Reviewer negative-before:
+  `/tmp/opencode/review_gc_warn.c`, frozen allocator после публикации
+  строкового `boom` на обычном C stack slot, два `__gc`; PUC 5.5.0:
+  `closes=2 calls=10 ends=2`, warning=`error in __gc (boom)` ×2;
+  immutable product `4613a93`: `closes=2 denied=2 calls=0 ends=0`,
+  warning пуст. Диагностический исходный текст вне дерева — перенести
+  semantic class в canonical C-suite. Предыдущее 24 открытых → 25.
+  CLOSED (finalizer-warning OOM correction): allocation-free
+  PUC-формы предупреждения. (1) gcWarnFinalizerError — 5 tocont-частей
+  ("error in "/"__gc"/" ("/message/")") без форматирования/ArrayList;
+  очистка transient error state безусловно на каждом выходе.
+  (2) warnfHandler — sentinel-срез [:0]const u8: LuaString.cstr()-хелпер
+  с NUL-контрактом (inline по построению; external — PUC api_check
+  precondition s[len]==0, Debug-assert в lua_pushexternalstring); C-ветка
+  без dupeZ; покрывает short/long/external + embedded NUL. (3) Fidelity:
+  currentRuntimeErrorValue возвращает err_obj as-is при err_has_obj
+  (значение финализировано в точке raise) — под freeze RuntimeError больше
+  не превращается в OOM; интернирование только для legacy-путей без
+  err_obj. (4) Оба call-сайта (incremental callfin + gen/shutdown drain),
+  default/testC/C handlers; Yield/ThreadSwitch — паника-контракт.
+  Evidence: canonical tests/c_api/28_finalizer_warn_oom (w1 = reviewer
+  oracle: closes=2 calls=10 ends=2 'error in __gc (boom)'×2; w2 real-OOM
+  'not enough memory'; w3 non-string; w4a/b/c short/long/external+embedded
+  NUL; w5/w6 shutdown/gen; l1-l3 Lua-forms) — byte-identical vs PUC 5.5
+  Debug+RF; RED на committed 4613a93 (frozen-panic + потеря warning);
+  mutation dupeZ→RED. Гейты: 358/358 D+RF 0 leaks; matrix RF zig_fail=0;
+  smoke 86/86; c_api 24-28 DIFF-PASS оба режима; fmt/diff-check clean.
+  Попутно (owner-requested): удалён мёртвый корневой src/ltable.zig
+  (2086 строк, нулевые ссылки, счёт тестов неизменен). NEW residual →
+  отдельный пункт ниже (OOM-queue divergence).
+
+- [ ] **Parity MEDIUM: после real-OOM финализатора PUC пропускает
+  остальные финализаторы этого цикла, luazig дренирует eagerly**
+  (найдено finalizer-warning correction, форма w2 canonical 28-сьюта
+  обходит одиночным финализатором): PUC GCTM после LUA_ERRMEM в теле
+  оставляет очередь (emergency-GC контракт), luazig продолжает вызывать
+  остальные pending в том же цикле. Дифференциальный кейс: два
+  finalizable, первый реально исчерпывает память → PUC: 1 вызов +
+  1 warning, второй pending остаётся; luazig: оба вызываются. Fix —
+  отдельная bounded correction (GCTM errmem-arm контракт); canonical
+  расширение w2 до двух объектов после фикса. Open-count: 26 → 25 (закрытие warning-пункта) → 26 (этот пункт).
+
+- [ ] **C API: `lua_pushvalue(lua_upvalueindex(n))` возвращает не upvalue
+  (BLOCKER, ORDINARY-BACKLOG)**. Независимый C-оракул
+  `/tmp/opencode/review_upvalue_push.c`: C closure захватывает строку
+  `"upvalue"`, затем `lua_pushvalue(L, lua_upvalueindex(1))`; PUC 5.5.0
+  возвращает `status=0 type=4 value=upvalue`, luazig —
+  `status=0 type=0 value=<null>`. Первая неправильная операция:
+  `c_api.zig:lua_pushvalue` вызывает `api.State.pushvalue` → `valueAt` →
+  `cWindowSlot`, который по контракту не разрешает pseudo-indices, хотя
+  `upvalueAt` существует для других C API входов. Дефект не вызван
+  intrusive GC migration; в A1.next warning-correction не входит, если
+  только не обесценит её focused oracle (использовать обычный стековый
+  error object). Нужен общий index2value/pseudo-index contract для всех
+  принимающих индекс C API функций, не точечный guard в финализаторе.
+  Open-count 25→26.
+
 - [x] **Architecture A1 research (COMPLETED): единая GC lifetime/rooting/constructor
   модель**. Локальная `P16.50-review-16 correction`, ошибочно открытая ревьюером
   после review-15, отменена владельцем: новые симптомы не должны продолжать

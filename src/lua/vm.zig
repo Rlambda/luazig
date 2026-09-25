@@ -1206,6 +1206,58 @@ const BytecodeUnwindState = struct {
     disposition: BytecodeUnwindDisposition,
 };
 
+/// LIFO stack of error-unwind records. PUC's recovery records are C stack
+/// frames (ldo.c luaD_pcall/rawrunprotected) — pre-allocated, allocator-
+/// independent storage that never fails while an error is in flight. The
+/// first `inline_capacity` records mirror that property: they live in the
+/// thread-owned inline array and their push touches NO allocator, so an
+/// error raised under an exhausted allocator (a finalizer body after
+/// memory ran out) still unwinds and reports its original object instead of
+/// being remapped to OutOfMemory. Deeper nesting (an erroring __close while
+/// an older error is already unwinding, recursively) spills to the heap via
+/// infraAlloc; a spill failure under exhaustion propagates OutOfMemory —
+/// the documented bound where PUC would instead overflow its own C stack.
+const BytecodeUnwindStack = struct {
+    const inline_capacity = 8;
+
+    inline_storage: [inline_capacity]BytecodeUnwindState = undefined,
+    inline_len: usize = 0,
+    spill: std.ArrayListUnmanaged(BytecodeUnwindState) = .empty,
+
+    fn count(self: *const BytecodeUnwindStack) usize {
+        return self.inline_len + self.spill.items.len;
+    }
+
+    /// Push one record; allocation-free while inline storage remains.
+    fn push(self: *BytecodeUnwindStack, alloc: std.mem.Allocator, record: BytecodeUnwindState) std.mem.Allocator.Error!void {
+        if (self.inline_len < inline_capacity) {
+            self.inline_storage[self.inline_len] = record;
+            self.inline_len += 1;
+            return;
+        }
+        try self.spill.append(alloc, record);
+    }
+
+    /// Mutably address record `i` (i < count). Inline records form the
+    /// prefix [0..inline_len); spilled records continue after them, so
+    /// indices stay stable across pushes and pops at the top.
+    fn at(self: *BytecodeUnwindStack, i: usize) *BytecodeUnwindState {
+        if (i < self.inline_len) return &self.inline_storage[i];
+        return &self.spill.items[i - self.inline_len];
+    }
+
+    fn pop(self: *BytecodeUnwindStack) BytecodeUnwindState {
+        if (self.spill.items.len != 0) return self.spill.pop().?;
+        self.inline_len -= 1;
+        return self.inline_storage[self.inline_len];
+    }
+
+    fn clearAndFree(self: *BytecodeUnwindStack, alloc: std.mem.Allocator) void {
+        self.inline_len = 0;
+        self.spill.clearAndFree(alloc);
+    }
+};
+
 const BytecodeDispatchRecovery = union(enum) {
     resumed,
     completed: []Value,
@@ -2637,7 +2689,8 @@ pub const Thread = struct {
     bytecode_protected_depth: usize = 0,
     /// Nested unwind states are possible when a yielding __close handler
     /// raises while an older error is already closing another frame.
-    bytecode_unwinds: std.ArrayListUnmanaged(BytecodeUnwindState) = .empty,
+    /// Inline-prefix storage: see BytecodeUnwindStack.
+    bytecode_unwinds: BytecodeUnwindStack = .{},
     bytecode_close_metamethod_depth: usize = 0,
     bytecode_close_metamethod_err_depth: usize = 0,
     resume_inbox: InlineValues = .{},
@@ -3068,6 +3121,21 @@ pub const LuaString = extern struct {
         const off: usize = if (self.srkind >= 0) short_content_offset else long_content_offset;
         const body = header + off;
         return body[0..self.len()];
+    }
+
+    /// Content as a C string. The NUL-termination contract is PUC's
+    /// (lstring/lapi): inline kinds store the trailing NUL at
+    /// `content[len]` by construction; EXTERNAL kinds receive
+    /// caller-owned memory that must already be NUL-terminated at
+    /// `[len]` — the same contract `lua_pushexternalstring` enforces
+    /// with its api_check in PUC (lapi.c: "string not ending with
+    /// zero"). The C-API entry asserts the contract in Debug builds;
+    /// every consumer of this helper relies on it exactly like PUC's
+    /// `getstr` consumers do.
+    pub inline fn cstr(self: *const LuaString) [:0]const u8 {
+        const b = self.bytes();
+        if (std.debug.runtime_safety) std.debug.assert(b.ptr[b.len] == 0);
+        return b.ptr[0..b.len :0];
     }
 
     /// P16.18 T7: THE single allocated-size rule — the exact counterpart
@@ -4170,7 +4238,7 @@ comptime {
     std.debug.assert(@sizeOf(Closure) == 48);
     std.debug.assert(@sizeOf(Cell) == 48);
     std.debug.assert(@sizeOf(Userdata) == 56);
-    std.debug.assert(@sizeOf(Thread) == 3368);
+    std.debug.assert(@sizeOf(Thread) == 3824);
 }
 
 /// Result of compiling a text chunk through the host-selected bytecode
@@ -5066,7 +5134,8 @@ pub const Vm = struct {
     gc_gen_young_first: ?*GcHeader = null,
     gc_gen_young_prev: ?*GcHeader = null,
     /// Tail node at minor-cycle start: nodes strictly beyond it were
-    /// allocated during the cycle (finalizers run in our atomic) and are
+    /// allocated during the cycle (including by finalizer bodies, which
+    /// run in the cycle's post-sweep callfin/drain) and are
     /// unconditionally kept by the young sweep — the pointer form of the
     /// retired young-list snapshot tail.
     gc_gen_snapshot: ?*GcHeader = null,
@@ -8324,6 +8393,15 @@ pub const Vm = struct {
         // NOTE: the defer must be function-scoped — a block-scoped defer
         // would clear the flag before the finalizer body runs.
         const fin_thread = self.activeBytecodeThread();
+        // PUC GCTM (lgc.c:983) runs the body through luaD_pcall(..., ef=0):
+        // the finalizer body executes with NO message handler — an ambient
+        // xpcall/pcallk handler must not intercept __gc errors; the error
+        // goes straight to the protected boundary and the warning channel.
+        // Disarm errfunc for the whole body (a pcall INSIDE the body arms
+        // and restores its own) and restore the ambient value afterwards.
+        const old_errfunc = fin_thread.errfunc;
+        fin_thread.errfunc = ERRFUNC_NONE;
+        defer fin_thread.errfunc = old_errfunc;
         const fin_caller_idx: ?usize =
             if (fin_thread.call_frames.len() > 0) fin_thread.call_frames.len() - 1 else null;
         if (fin_caller_idx) |i| fin_thread.call_frames.getPtr(i).setFin();
@@ -9289,7 +9367,15 @@ pub const Vm = struct {
     /// (`"error in error handling"`).
     pub fn invokeErrfunc(self: *Vm) !void {
         const th = self.activeBytecodeThread();
-        if (th.errfunc == ERRFUNC_NONE) return;
+        if (th.errfunc == ERRFUNC_NONE) {
+            // PUC luaG_errormsg (ldebug.c:849-852): with no handler, a nil
+            // error object still becomes the "<no error object>" literal
+            // before the throw. luaS_newliteral is fallible: under exhausted
+            // memory the OOM replaces the error (ERRMEM), exactly like every
+            // raise-site string construction.
+            try self.finalizeNilErrorObject();
+            return;
+        }
         const ef = th.stack[th.errfunc];
         // Re-entrancy guard (see Thread.errfunc_running_idx): a raise while
         // the SAME handler window is running is handled by the retry loop
@@ -9358,9 +9444,6 @@ pub const Vm = struct {
             // as-is (PUC luaG_errormsg: no tostring coercion). nil → the
             // literal "<no error object>" (PUC luaD_seterrorobj semantics).
             var value = if (result.len > 0) result[0] else .Nil;
-            if (value == .Nil) {
-                value = .{ .String = try self.internStr("<no error object>") };
-            }
             self.errThread().err_obj = value;
             self.err = if (value == .String) value.String.bytes() else null;
             self.errThread().err_has_obj = true;
@@ -9371,8 +9454,30 @@ pub const Vm = struct {
             // when the error crosses a protected/coroutine boundary.
             self.errThread().err_source = null;
             self.errThread().err_line = -1;
+            // PUC luaG_errormsg: the handler's nil result becomes the
+            // "<no error object>" literal before the throw (same fallible
+            // construction as the no-handler path).
+            try self.finalizeNilErrorObject();
             return;
         }
+    }
+
+    /// PUC luaG_errormsg (ldebug.c:849-852): a nil error object is replaced
+    /// by the "<no error object>" literal at the throw site. The
+    /// construction is fallible (luaS_newliteral): under exhausted memory
+    /// the OOM error object (setOutOfMemoryError — the pre-interned fixed
+    /// literal, no allocation) replaces the original and the caller
+    /// propagates OutOfMemory, exactly like PUC's luaM_error(ERRMEM).
+    fn finalizeNilErrorObject(self: *Vm) !void {
+        const et = self.errThread();
+        if (et.err_obj != .Nil) return;
+        const lit = self.internStr("<no error object>") catch {
+            self.setOutOfMemoryError();
+            return error.OutOfMemory;
+        };
+        et.err_obj = .{ .String = lit };
+        et.err_has_obj = true;
+        self.err = lit.bytes();
     }
 
     /// PUC luaD_errerr (ldo.c:215): throw "error in error handling" as
@@ -10302,17 +10407,26 @@ pub const Vm = struct {
     /// the pending list continues. A non-string error object reports as
     /// "error object is not a string" (PUC luaE_warnerror). Formatting
     /// failures are swallowed: a warning must never abort the list.
+    /// PUC `luaE_warnerror` (lstate.c:408-419): emit the finalizer-error
+    /// warning as FIVE `tocont` pieces — "error in ", "__gc", " (",
+    /// message, ")" — straight to the warning channel. The core path is
+    /// ALLOCATION-FREE (PUC passes the pieces without formatting), so a
+    /// finalizer that exhausted memory still produces its warning: the
+    /// message is either a compile-time literal or the error object's
+    /// LuaString through its NUL contract. The transient error state is
+    /// cleared UNCONDITIONALLY after the emission attempt (the handler's
+    /// own failure semantics belong to the handler, never to the error
+    /// state transport).
     fn gcWarnFinalizerError(self: *Vm, err_obj: Value) void {
-        const err_msg: []const u8 = switch (err_obj) {
-            .String => |s| s.bytes(),
+        const err_msg: [:0]const u8 = switch (err_obj) {
+            .String => |s| s.cstr(),
             else => "error object is not a string",
         };
-        var warn_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer warn_buf.deinit(self.alloc);
-        warn_buf.appendSlice(self.alloc, "error in __gc (") catch return;
-        warn_buf.appendSlice(self.alloc, err_msg) catch return;
-        warn_buf.append(self.alloc, ')') catch return;
-        self.warnfHandler(warn_buf.items, false) catch {};
+        self.warnfHandler("error in ", true) catch {};
+        self.warnfHandler("__gc", true) catch {};
+        self.warnfHandler(" (", true) catch {};
+        self.warnfHandler(err_msg, true) catch {};
+        self.warnfHandler(")", false) catch {};
         self.err = null;
         self.errThread().err_has_obj = false;
         self.errThread().err_obj = .Nil;
@@ -11384,25 +11498,21 @@ pub const Vm = struct {
     }
 
     fn currentRuntimeErrorValue(self: *Vm) DispatchError!Value {
-        // PUC luaD_seterrorobj (ldo.c): the ERRMEM error object is the FIXED
-        // statMsg literal — no source position, no allocation. The OOM
-        // message is pre-interned at Vm init (oom_msg_str); return it as-is.
-        // Re-materializing it below would intern the POSITIONED message
-        // ("chunk:line: not enough memory") — an allocation that itself
-        // fails under the armed countdown/limit that caused the OOM, and
-        // whose failure escapes the recovery path (memerr.lua testalloc:
-        // countdown-0 pcall must return exactly "not enough memory").
-        if (self.oom_msg_str) |oom| {
-            const obj = self.errThread().err_obj;
-            if (self.errThread().err_has_obj and obj == .String and obj.String == oom)
-                return obj;
-        }
-        // PUC prefixes string errors before stack unwinding. Our fail helpers
-        // keep source/line separately until an error crosses a protected,
-        // coroutine, or __close boundary, so materialize that normalized value
-        // before the frame carrying the location is popped. Non-string error
-        // objects keep their original identity.
-        if (self.errThread().err_has_obj and self.errThread().err_obj != .String) return self.errThread().err_obj;
+        // The error object is FINALIZED at the raise site (error() builtin,
+        // fail()/luaG_runerror baking "source:line:" into the object,
+        // lua_error's C object, setOutOfMemoryError's fixed literal) and is
+        // carried as-is through recovery — PUC luaD_seterrorobj moves the
+        // existing object; it never re-formats it. Re-materializing a String
+        // object here would re-intern the message: an allocation that fails
+        // under the very memory exhaustion being transported (a long-string
+        // object allocates on EVERY intern attempt — long strings are never
+        // deduplicated), remapping the original error to OutOfMemory.
+        if (self.errThread().err_has_obj) return self.errThread().err_obj;
+        // Legacy paths without a finalized object (err/err_source/err_line
+        // pending): compose the positioned message now, before the frame
+        // carrying the location is popped. This intern is deliberately
+        // fallible: PUC's own raise-site string construction (luaO_pushfstring)
+        // fails the same way under exhaustion.
         return .{ .String = try self.internStr(self.protectedErrorString()) };
     }
 
@@ -16645,13 +16755,15 @@ pub const Vm = struct {
                 }
             }
         }
-        // P16.50-review-5: infraAlloc — PUC's error-recovery records are
-        // C stack frames (ldo.c), never heap; a COUNTED allocation here
-        // made the error path itself fail under an armed countdown
-        // (memerr.lua: pcall catches the memerr, then the unwind record
-        // alloc is rejected by the still-armed countdown and kills the
-        // unprotected chunk).
-        try self.activeBytecodeThread().bytecode_unwinds.append(self.infraAlloc(), .{
+        // The record goes into the thread-owned inline prefix first (no
+        // allocator — see BytecodeUnwindStack); only nesting deeper than the
+        // inline capacity reaches infraAlloc. The spill stays on infraAlloc:
+        // PUC's recovery records are C stack frames, never lua_Alloc heap,
+        // so a counted (testc) allocation there would make the error path
+        // itself fail under an armed countdown (memerr.lua: pcall catches
+        // the memerr, then the unwind record alloc is rejected by the
+        // still-armed countdown and kills the unprotected chunk).
+        try self.activeBytecodeThread().bytecode_unwinds.push(self.infraAlloc(), .{
             .boundary_depth = boundary_depth,
             .target_depth = recovery.target_depth,
             .fault = fault,
@@ -16669,7 +16781,7 @@ pub const Vm = struct {
         boundary_depth: usize,
         error_value: Value,
     ) DispatchError!void {
-        try self.activeBytecodeThread().bytecode_unwinds.append(self.infraAlloc(), .{
+        try self.activeBytecodeThread().bytecode_unwinds.push(self.infraAlloc(), .{
             .boundary_depth = boundary_depth,
             .target_depth = boundary_depth,
             .fault = .runtime,
@@ -16683,9 +16795,9 @@ pub const Vm = struct {
         exec_frames: *FrameStack,
     ) DispatchError!BytecodeDispatchRecovery {
         const owner = self.activeBytecodeThread();
-        unwind_loop: while (owner.bytecode_unwinds.items.len != 0) {
-            const state_index = owner.bytecode_unwinds.items.len - 1;
-            var state = owner.bytecode_unwinds.items[state_index];
+        unwind_loop: while (owner.bytecode_unwinds.count() != 0) {
+            const state_index = owner.bytecode_unwinds.count() - 1;
+            var state = owner.bytecode_unwinds.at(state_index).*;
             self.restoreRuntimeErrorValue(state.error_value);
 
             while (exec_frames.len() > state.target_depth) {
@@ -16766,7 +16878,7 @@ pub const Vm = struct {
                             // replaces the unwind's error for the remaining
                             // frames and the final failure reporting.
                             state.error_value = fe;
-                            owner.bytecode_unwinds.items[state_index] = state;
+                            owner.bytecode_unwinds.at(state_index).* = state;
                         }
                     } else {
                         self.detachTbcRegion(owner, frame.tbc_chain_base);
@@ -16794,7 +16906,7 @@ pub const Vm = struct {
                         // replaces the unwind's error for the remaining
                         // frames and the final failure reporting.
                         state.error_value = fe;
-                        owner.bytecode_unwinds.items[state_index] = state;
+                        owner.bytecode_unwinds.at(state_index).* = state;
                     }
                 }
                 // The ESCAPE case — no protected parent
@@ -16817,7 +16929,7 @@ pub const Vm = struct {
                 if (escapes_dispatch) {
                     try self.detachLuaFrameTbcMarks(owner, frame);
                 } else if (owner.bytecode_tbc_regs.items.len > frame.tbc_mark) {
-                    owner.bytecode_unwinds.items[state_index] = state;
+                    owner.bytecode_unwinds.at(state_index).* = state;
                     switch (try self.beginBytecodeClose(
                         exec_frames,
                         state.boundary_depth,
@@ -16833,7 +16945,7 @@ pub const Vm = struct {
                         .propagate_error => {
                             state.error_value = try self.currentRuntimeErrorValue();
                             state.fault = .runtime;
-                            owner.bytecode_unwinds.items[state_index] = state;
+                            owner.bytecode_unwinds.at(state_index).* = state;
                             continue;
                         },
                     }
@@ -16878,10 +16990,10 @@ pub const Vm = struct {
                         self.cancelBytecodePendingCall(pending, exec_frames.getPtr(parent_index));
                         self.clearPendingCall(exec_frames.getPtr(parent_index));
                         const replacement = try self.currentRuntimeErrorValue();
-                        if (owner.bytecode_unwinds.items.len != 0) {
-                            const outer_index = owner.bytecode_unwinds.items.len - 1;
-                            owner.bytecode_unwinds.items[outer_index].error_value = replacement;
-                            owner.bytecode_unwinds.items[outer_index].fault = .runtime;
+                        if (owner.bytecode_unwinds.count() != 0) {
+                            const outer_index = owner.bytecode_unwinds.count() - 1;
+                            owner.bytecode_unwinds.at(outer_index).error_value = replacement;
+                            owner.bytecode_unwinds.at(outer_index).fault = .runtime;
                             continue :unwind_loop;
                         }
                         try self.appendBytecodeUnwind(
@@ -16908,10 +17020,10 @@ pub const Vm = struct {
                         .final => |final| return .{ .completed = final },
                         .propagate_error => {
                             const replacement = try self.currentRuntimeErrorValue();
-                            if (owner.bytecode_unwinds.items.len != 0) {
-                                const outer_index = owner.bytecode_unwinds.items.len - 1;
-                                owner.bytecode_unwinds.items[outer_index].error_value = replacement;
-                                owner.bytecode_unwinds.items[outer_index].fault = .runtime;
+                            if (owner.bytecode_unwinds.count() != 0) {
+                                const outer_index = owner.bytecode_unwinds.count() - 1;
+                                owner.bytecode_unwinds.at(outer_index).error_value = replacement;
+                                owner.bytecode_unwinds.at(outer_index).fault = .runtime;
                                 continue :unwind_loop;
                             }
                             try self.appendBytecodeUnwind(
@@ -33110,7 +33222,13 @@ pub const Vm = struct {
                         }
                     }
                 }
-                for (th.bytecode_unwinds.items) |unwind| {
+                for (th.bytecode_unwinds.inline_storage[0..th.bytecode_unwinds.inline_len]) |unwind| {
+                    const value = unwind.error_value;
+                    if (GcObject.fromValue(value) != null) {
+                        try self.gcMarkValue(value);
+                    }
+                }
+                for (th.bytecode_unwinds.spill.items) |unwind| {
                     const value = unwind.error_value;
                     if (GcObject.fromValue(value) != null) {
                         try self.gcMarkValue(value);
@@ -44481,9 +44599,9 @@ pub const Vm = struct {
         // Compose warning: call warnfHandler per piece with tocont=1 for all
         // but the last, tocont=0 for the last (closes the warning).
         for (args[0 .. args.len - 1]) |piece| {
-            try self.warnfHandler(piece.String.bytes(), true);
+            try self.warnfHandler(piece.String.cstr(), true);
         }
-        try self.warnfHandler(args[args.len - 1].String.bytes(), false);
+        try self.warnfHandler(args[args.len - 1].String.cstr(), false);
     }
 
     /// Dispatch to the active warnf handler, mirroring PUC's `lua_warning`
@@ -44491,16 +44609,18 @@ pub const Vm = struct {
     /// When testC is enabled (`luaB_opentests` replaced the default warnf),
     /// route to `testcWarnf`; otherwise route to `defaultWarnf` (the 3-state
     /// machine from lauxlib.c:1074-1128).
-    fn warnfHandler(self: *Vm, message: []const u8, tocont: bool) DispatchError!void {
+    fn warnfHandler(self: *Vm, message: [:0]const u8, tocont: bool) DispatchError!void {
         if (self.testc_warn_enabled) {
             return self.testcWarnf(message, tocont);
         }
         if (self.c_warnf) |wf| {
             // PUC luaE_warning (lstate.c): the state-level warnf installed
-            // through lua_setwarnf receives NUL-terminated pieces.
-            const z = self.alloc.dupeZ(u8, message) catch return;
-            defer self.alloc.free(z);
-            wf(self.c_warn_ud, z.ptr, if (tocont) 1 else 0);
+            // through lua_setwarnf receives NUL-terminated pieces. The
+            // sentinel comes from the caller's NUL contract (literals, or
+            // the LuaString content contract) — no per-warning copy, so
+            // the emission stays allocation-free under memory pressure
+            // exactly like PUC's getstr-based path.
+            wf(self.c_warn_ud, message.ptr, if (tocont) 1 else 0);
             return;
         }
         return self.defaultWarnf(message, tocont);
@@ -59012,12 +59132,13 @@ fn p50r5CfConcat(L: ?*lua_State) callconv(.c) c_int {
 
 /// Static external bytes: pushexternalstring allocates ONLY the LuaString
 /// header (the bytes are borrowed); the dealloc callback counts the
-/// ownership handoff at destroy time.
-var p50r5_ext_buf: [16]u8 = undefined;
+/// ownership handoff at destroy time. The buffer keeps the
+/// lua_pushexternalstring content contract (a NUL at s[len]).
+var p50r5_ext_buf: [17]u8 = .{0} ** 17;
 
 fn p50r5CfPushexternalstring(L: ?*lua_State) callconv(.c) c_int {
     const c_api = @import("c_api.zig");
-    c_api.lua_pushexternalstring(L, &p50r5_ext_buf, p50r5_ext_buf.len, p50r3Falloc, null);
+    c_api.lua_pushexternalstring(L, &p50r5_ext_buf, p50r5_ext_buf.len - 1, p50r3Falloc, null);
     return 1;
 }
 

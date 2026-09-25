@@ -7,7 +7,7 @@ CFLAGS = -I$(LUA_DIR) -Wall -Wextra
 LDFLAGS = -L$(LIB_DIR) -llua -lm -ldl -Wl,-rpath,$(abspath $(LIB_DIR))
 PUC_LDFLAGS = -L$(PUC_DIR) -llua -lm -ldl -Wl,-rpath,$(abspath $(PUC_DIR))
 
-TESTS = 00_smoke 01_core 02_tables 03_arith 04_misc 05_auxlib 06_buffer 07_libs 08_debug 09_upvalues 10_continuations 11_closethread 12_chook 13_p15_completion 15_stress_leak 14_state_handles 16_apicheck 17_gccontrol 18_dump 19_load 20_ccall_depth 22_tbc_lifecycle 23_tbc_semantics 24_tbc_alias 25_tbc_closer_escape 26_tbc_forced_close_cbody 27_finalizer_owners
+TESTS = 00_smoke 01_core 02_tables 03_arith 04_misc 05_auxlib 06_buffer 07_libs 08_debug 09_upvalues 10_continuations 11_closethread 12_chook 13_p15_completion 15_stress_leak 14_state_handles 16_apicheck 17_gccontrol 18_dump 19_load 20_ccall_depth 22_tbc_lifecycle 23_tbc_semantics 24_tbc_alias 25_tbc_closer_escape 26_tbc_forced_close_cbody 27_finalizer_owners 28_finalizer_warn_oom
 
 all: $(TESTS)
 
@@ -38,7 +38,8 @@ DIFF_TESTS = \
     24_tbc_alias \
     25_tbc_closer_escape \
     26_tbc_forced_close_cbody \
-    27_finalizer_owners
+    27_finalizer_owners \
+    28_finalizer_warn_oom
 
 # 16_apicheck is intentionally ZIG-ONLY (runs in `make test`, excluded from
 # DIFF_TESTS): its invalid-call tests assert the api_check violations raise

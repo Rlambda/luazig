@@ -1730,6 +1730,11 @@ pub export fn lua_pushexternalstring(
     ud: ?*anyopaque,
 ) void {
     var st = api.State.fromHandle(L orelse return);
+    // PUC api_check parity (lapi.c): external content must be
+    // NUL-terminated at s[len] — the contract every LuaString consumer
+    // of `cstr()` relies on (warnings, C-API tostring). Debug-enforced
+    // assumption, exactly like PUC's api_check.
+    if (std.debug.runtime_safety) std.debug.assert(s[len] == 0);
     // PUC lua_pushfstring-family: any string-construction OOM is LUA_ERRMEM
     // (P16.50-review-5 B2 — the old `catch {}` silently dropped the push).
     st.pushexternalString(s, len, falloc, ud) catch |e| cThrowOn(st.vm, L.?, e);
